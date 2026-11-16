@@ -248,6 +248,8 @@ pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(),
     new.spec.node = None;
     new.spec.power = PowerState::Stopped;
     new.spec.snapshot_schedule = None;
+    // 복제 대상과 그 복제본은 원본 VM의 것이다. 새 VM은 복제 없이 만든다.
+    new.spec.replication.clear();
     // 원본(또는 스냅샷)이 가리키던 HA 그룹이 그새 지워졌으면 그룹만 빼고 정책은 남긴다.
     if let Some(group) = new.spec.ha.as_ref().and_then(|ha| ha.group.clone())
         && ctx

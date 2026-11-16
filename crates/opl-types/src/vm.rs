@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::replication::{
+    MAX_REPLICATION_TARGETS, ReplicaStatus, ReplicationTarget, parse_interval,
+};
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::runtime::{HotplugLayout, ImageFormat};
 
@@ -61,6 +64,11 @@ pub struct VmSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub placement: Option<VmPlacement>,
+    /// 로컬 디스크 복제 대상(계획 55, 셋까지). 노드 로컬 풀의 디스크를 이 노드들에 주기적으로 복제한다. 비면 쓰지
+    /// 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub replication: Vec<ReplicationTarget>,
 }
 
 /// VM의 최적 배치 옵션
@@ -323,6 +331,21 @@ impl VmSpec {
                 return Err(ValidationError::GuestWatch);
             }
         }
+        if self.replication.len() > MAX_REPLICATION_TARGETS {
+            return Err(ValidationError::ReplicationTargets);
+        }
+        let mut targets = BTreeSet::new();
+        for target in &self.replication {
+            if !targets.insert(target.node) {
+                return Err(ValidationError::ReplicationDuplicate(target.node));
+            }
+            if parse_interval(&target.schedule).is_err() {
+                return Err(ValidationError::ReplicationSchedule);
+            }
+            if self.node == Some(target.node) {
+                return Err(ValidationError::ReplicationOwnNode);
+            }
+        }
         Ok(())
     }
 
@@ -388,6 +411,14 @@ pub enum ValidationError {
         "ha.guest_watch.timeout_secs must be between {MIN_GUEST_WATCH_SECS} and {MAX_GUEST_WATCH_SECS}"
     )]
     GuestWatch,
+    #[error("replication: at most {MAX_REPLICATION_TARGETS} targets")]
+    ReplicationTargets,
+    #[error("replication: node {0} is listed twice")]
+    ReplicationDuplicate(Uuid),
+    #[error("replication schedule must look like */N with N minutes from 1 to 1440")]
+    ReplicationSchedule,
+    #[error("replication target cannot be the VM's own node")]
+    ReplicationOwnNode,
 }
 
 /// 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다.
@@ -608,6 +639,11 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub hardware: Option<RunningHardware>,
+    /// 로컬 디스크 복제 대상마다의 상태(계획 55). 원본 노드의 복제 Task, 리더의 HA 복구·스케줄러, 마이그레이션
+    /// 확정이 쓴다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub replication: Vec<ReplicaStatus>,
 }
 
 /// 도는 QEMU의 하드웨어. CPU 토폴로지·메모리·펌웨어·머신은 켤 때 값이고, 핫플러그로 바뀐 것은 `layout`에 있다.
@@ -736,6 +772,15 @@ pub struct DiskMove {
     pub volume: Uuid,
     pub pool: String,
     pub format: ImageFormat,
+    /// 대상 노드에 이미 이 볼륨의 복제본이 있다(계획 55): 새로 만들지 않고 복제 뒤 바뀐 것만 보낸다. false면
+    /// 빼고 써서 옛 노드도 읽는다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub existing: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
@@ -1084,6 +1129,7 @@ mod tests {
                 volume,
                 pool: "fast".into(),
                 format: ImageFormat::Raw,
+                existing: false,
             }],
         };
         let json = serde_json::to_value(&m).unwrap();
@@ -1096,6 +1142,23 @@ mod tests {
             })
         );
         assert_eq!(serde_json::from_value::<MigrationStatus>(json).unwrap(), m);
+    }
+
+    /// 복제본이 있는 디스크(`existing`)만 그 표시를 쓰고, 없으면 옛 모양 그대로다.
+    #[test]
+    fn disk_moves_mark_existing_replicas_only_when_set() {
+        let volume = Uuid::now_v7();
+        let old = serde_json::json!({ "volume": volume, "pool": "b", "format": "qcow2" });
+        let m: DiskMove = serde_json::from_value(old.clone()).unwrap();
+        assert!(!m.existing);
+        assert_eq!(serde_json::to_value(&m).unwrap(), old);
+        let m = DiskMove {
+            existing: true,
+            ..m
+        };
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["existing"], true);
+        assert_eq!(serde_json::from_value::<DiskMove>(json).unwrap(), m);
     }
 
     #[test]
@@ -1180,6 +1243,98 @@ mod tests {
         assert!(!spec.pinned());
         json["placement"] = serde_json::json!({ "pinned": true, "weight": 1 });
         assert!(serde_json::from_value::<VmSpec>(json).is_err());
+    }
+
+    /// 복제 대상이 없으면 옛 VM 그대로 쓰고, 있으면 왕복한다(주기 기본 `*/15`).
+    #[test]
+    fn replication_is_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert!(spec.replication.is_empty());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+
+        let node = Uuid::now_v7();
+        let mut json = sample_json();
+        json["replication"] = serde_json::json!([{ "node": node, "pool": "b" }]);
+        let spec: VmSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            spec.replication,
+            [ReplicationTarget {
+                node,
+                schedule: "*/15".into(),
+                pool: Some("b".into()),
+            }]
+        );
+        let back = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            back["replication"],
+            serde_json::json!([{ "node": node, "schedule": "*/15", "pool": "b" }])
+        );
+        assert_eq!(serde_json::from_value::<VmSpec>(back).unwrap(), spec);
+    }
+
+    #[test]
+    fn validate_checks_replication_targets() {
+        let target = |node: Uuid, schedule: &str| ReplicationTarget {
+            node,
+            schedule: schedule.into(),
+            pool: None,
+        };
+        let (a, b, c, d) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let mut s = sample();
+        s.replication = vec![target(a, "*/1"), target(b, "*/1440"), target(c, "*/15")];
+        assert_eq!(s.validate(), Ok(()));
+
+        s.replication.push(target(d, "*/15"));
+        assert_eq!(s.validate(), Err(ValidationError::ReplicationTargets));
+        assert_eq!(
+            s.validate().unwrap_err().to_string(),
+            "replication: at most 3 targets"
+        );
+
+        s.replication = vec![target(a, "*/5"), target(a, "*/10")];
+        assert_eq!(s.validate(), Err(ValidationError::ReplicationDuplicate(a)));
+        assert_eq!(
+            s.validate().unwrap_err().to_string(),
+            format!("replication: node {a} is listed twice")
+        );
+
+        for bad in ["*/0", "15", "*/1441"] {
+            s.replication = vec![target(a, bad)];
+            assert_eq!(s.validate(), Err(ValidationError::ReplicationSchedule));
+            assert_eq!(
+                s.validate().unwrap_err().to_string(),
+                "replication schedule must look like */N with N minutes from 1 to 1440"
+            );
+        }
+
+        s.replication = vec![target(a, "*/15")];
+        s.node = Some(a);
+        assert_eq!(s.validate(), Err(ValidationError::ReplicationOwnNode));
+        assert_eq!(
+            s.validate().unwrap_err().to_string(),
+            "replication target cannot be the VM's own node"
+        );
+        s.node = Some(b);
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    /// 복제 상태가 없으면 옛 상태 그대로 쓰고, 있으면 왕복한다.
+    #[test]
+    fn status_replication_is_written_only_when_set() {
+        let json = serde_json::to_value(VmStatus::default()).unwrap();
+        assert!(json.get("replication").is_none(), "{json}");
+        let st = VmStatus {
+            replication: vec![ReplicaStatus::pending(Uuid::now_v7())],
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["replication"][0]["state"], "pending");
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
     }
 
     #[test]

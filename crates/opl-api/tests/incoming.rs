@@ -673,6 +673,7 @@ impl Setup {
             volume,
             pool: "local".into(),
             format: ImageFormat::Qcow2,
+            existing: false,
         }];
         self.env
             .cluster

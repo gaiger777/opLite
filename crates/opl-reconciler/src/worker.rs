@@ -1465,10 +1465,12 @@ impl Worker {
     /// 저장소의 것을 지킨다(스냅샷 되돌리기가 쓴다). `rule_violations`는 리더가 쓰므로 늘, `ha`(HA 기록)는
     /// 이 작업자가 바꾼 필드만 저장소의 값 위에 다시 적용한다([`merge_ha`]). 나머지 필드는 전처럼 이 작업자가
     /// 계산한 값으로 덮는다. 실행 중 하드웨어 기록(`hardware`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다
-    /// (핫플러그 Task가 쓴다).
+    /// (핫플러그 Task가 쓴다). 복제 상태(`replication`)도 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다(복제 Task와
+    /// 리더가 쓴다).
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
         let keep_hardware = status.hardware == vm.status.hardware;
+        let keep_replication = status.replication == vm.status.replication;
         let read_ha = vm.status.ha.clone().unwrap_or_default();
         let mine = status.ha.clone().unwrap_or_default();
         loop {
@@ -1479,6 +1481,9 @@ impl Worker {
             }
             if keep_hardware {
                 status.hardware = vm.status.hardware.clone();
+            }
+            if keep_replication {
+                status.replication = vm.status.replication.clone();
             }
             status.rule_violations = vm.status.rule_violations.clone();
             status.ha = merge_ha(&read_ha, &mine, vm.status.ha.clone());
@@ -1532,6 +1537,7 @@ impl Worker {
             rule_violations: vm.status.rule_violations.clone(),
             ha: vm.status.ha.clone(),
             hardware: None,
+            replication: vm.status.replication.clone(),
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

@@ -11,6 +11,7 @@ use opl_api::{SnapshotScheduler, SnapshotSchedulerConfig};
 use opl_driver::DriverError;
 use opl_qemu::QmpError;
 use opl_types::node::NodeSpec;
+use opl_types::replication::ReplicationTarget;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
@@ -371,4 +372,34 @@ async fn revert_keeps_the_current_schedule() {
             memory: false,
         })
     );
+}
+
+/// 복제하는 VM의 예약 스냅샷은 거절되어 `schedule_error`에 남는다(API는 둘을 함께 받지 않으므로 저장소에 직접
+/// 적는다).
+#[tokio::test]
+async fn scheduled_snapshots_of_a_replicated_vm_are_refused() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let schedule = json!({ "every": "hourly", "keep": 2 });
+    let vm = running_vm(&admin, "web", &[], schedule).await;
+    let mut stored = get_vm(&env, vm);
+    stored.spec.replication = vec![ReplicationTarget {
+        node: Uuid::now_v7(),
+        schedule: "*/15".into(),
+        pool: None,
+    }];
+    env.cluster
+        .update_spec(vm, None, stored.labels.clone(), &stored.spec)
+        .await
+        .unwrap();
+
+    let scheduler = fast_scheduler(&env);
+    until("replication refusal", || {
+        get_vm(&env, vm).status.schedule_error.is_some_and(|e| {
+            e.code == "snapshot_unsupported" && e.message.contains("is replicated to other nodes")
+        })
+    })
+    .await;
+    scheduler.shutdown().await;
+    assert!(snapshots(&env, vm).is_empty());
 }

@@ -862,6 +862,25 @@ async fn hotplug_maximums_are_kept_only_when_every_node_knows_hotplug() {
     assert_eq!((spec.cpu.cores, spec.memory_mib), (1, 256));
 }
 
+/// 복제 대상은 원본 클러스터의 노드다: 모든 노드가 `node-replication`을 알아도 늘 버린다.
+#[tokio::test]
+async fn received_copies_drop_the_replication_targets() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let mut m = manifest();
+    m["vm_spec"]["replication"] = json!([{ "node": Uuid::now_v7(), "schedule": "*/5" }]);
+    let id = receive_ok(&admin, receive_body(&m)).await;
+    assert!(
+        get_backup(&env, id)
+            .unwrap()
+            .spec
+            .vm_spec
+            .replication
+            .is_empty()
+    );
+}
+
 /// 받기 요청 `body`로 받기를 시작해 파일을 모두 보내고 완료한 `ready` 사본의 id
 async fn ready_copy(client: &Client, body: Value) -> Uuid {
     let id = receive_ok(client, body).await;

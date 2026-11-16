@@ -1006,6 +1006,7 @@ mod tests {
                 ha: None,
                 placement: None,
                 max_memory_mib: None,
+                replication: Vec::new(),
             },
         );
         v.status.phase = VmPhase::Running;

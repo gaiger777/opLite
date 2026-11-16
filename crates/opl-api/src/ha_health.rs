@@ -1288,6 +1288,7 @@ mod tests {
                 ha: ha.then(VmHa::default),
                 placement: None,
                 max_memory_mib: None,
+                replication: Vec::new(),
             },
         )
     }

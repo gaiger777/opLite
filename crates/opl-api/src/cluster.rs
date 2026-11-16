@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::IntoResponse;
-use opl_cluster::types::{LeaderRequest, NodeId};
+use opl_cluster::types::{LeaderRequest, NodeId, Rejection};
 use opl_cluster::{ClusterError, MULTI_LINK};
 use opl_peer::pki::{ClusterCa, fingerprint};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, JoinToken, JoinTokenSpec};
@@ -22,6 +22,7 @@ use opl_types::host::{same_link, valid_host};
 use opl_types::node::{Fencing, NodeSpec, NodeStatus};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::version;
+use opl_types::vm::VmSpec;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -761,7 +762,7 @@ fn via_voter(members: &opl_cluster::Members, me: NodeId) -> Option<String> {
 }
 
 /// 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
-/// 그 노드에 배정된 VM은 그대로 남는다.
+/// 그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다.
 #[utoipa::path(delete, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 204, description = "Removed"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -793,8 +794,52 @@ pub async fn delete_node(
     }
     // 노드의 전원 끄기 펜싱 설정(BMC 비밀번호)도 남기지 않는다.
     crate::node_fence::delete_with_node(&state, &node).await?;
+    drop_replication_target(&state, node.id).await?;
     tracing::info!(node = %node.name, "node removed from the cluster");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 지운 노드 `node`를 모든 VM의 복제 대상(`spec.replication`)과 복제 상태(`status.replication`)에서 뺀다. 남겨 두면
+/// 없는 노드가 대상이라 그 VM의 수정이 모두 400이 된다. 읽은 revision을 확인한다.
+async fn drop_replication_target(state: &AppState, node: Uuid) -> Result<(), ApiError> {
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    for vm in vms {
+        if !vm.spec.replication.iter().any(|t| t.node == node)
+            && !vm.status.replication.iter().any(|r| r.node == node)
+        {
+            continue;
+        }
+        loop {
+            let Some(current) = state.cluster.get::<VmSpec>(vm.id)? else {
+                break;
+            };
+            let mut spec = current.spec.clone();
+            spec.replication.retain(|t| t.node != node);
+            let written = if spec != current.spec {
+                state
+                    .cluster
+                    .update_spec(vm.id, Some(current.revision), current.labels.clone(), &spec)
+                    .await
+            } else {
+                let mut status = current.status.clone();
+                status.replication.retain(|r| r.node != node);
+                if status == current.status {
+                    break;
+                }
+                state
+                    .cluster
+                    .update_status_checked::<VmSpec>(vm.id, current.revision, &status)
+                    .await
+            };
+            match written {
+                Ok(_) => {}
+                Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        tracing::info!(vm = %vm.name, node = %node, "removed a deleted node from the replication targets");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

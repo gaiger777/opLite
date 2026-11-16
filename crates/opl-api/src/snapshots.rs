@@ -496,6 +496,16 @@ pub(crate) async fn start_create(
     memory: Option<bool>,
     scheduled: bool,
 ) -> Result<Task, ApiError> {
+    // 복제본은 활성 층만 담아 승격·마이그레이션 뒤 스냅샷 기록이 매달린다.
+    if !vm.spec.replication.is_empty() {
+        return Err(ApiError::conflict(
+            "snapshot_unsupported",
+            format!(
+                "VM {:?} is replicated to other nodes; replicas do not keep snapshots, remove the replication first",
+                vm.name
+            ),
+        ));
+    }
     check_not_busy(state, vm)?;
     let block = check_disks(state, vm)?;
     let running = vm.status.phase == VmPhase::Running;

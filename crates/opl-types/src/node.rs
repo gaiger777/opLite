@@ -339,6 +339,7 @@ pub const FEATURES: &[&str] = &[
     HA_CHECKS,
     PLACEMENT,
     HOTPLUG,
+    NODE_REPLICATION,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -357,6 +358,10 @@ pub const PLACEMENT: &str = "placement";
 /// VM 무중단 유형 변경(계획 54): VM `cpu.max_vcpus`·`max_memory_mib`, Task `vm-hotplug`, 켤 때의 핫플러그 배치.
 /// 모든 노드가 알릴 때만 쓴다.
 pub const HOTPLUG: &str = "hotplug";
+
+/// 로컬 디스크 복제(계획 55): VM `spec.replication`, Task `vm-replicate`, 복제 peer RPC, 복제본으로 하는 HA 복구와
+/// 마이그레이션. 모든 노드가 알릴 때만 쓴다.
+pub const NODE_REPLICATION: &str = "node-replication";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -828,7 +833,8 @@ mod tests {
                 "fast-ha",
                 "ha-checks",
                 "placement",
-                "hotplug"
+                "hotplug",
+                "node-replication"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

@@ -15,6 +15,7 @@ use opl_driver::{
 };
 use opl_reconciler::ReconcilerConfig;
 use opl_types::node::{Node, NodeSpec, PoolState};
+use opl_types::replication::{ReplicaStatus, ReplicationState};
 use opl_types::resource::{Kind, Resource};
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
@@ -53,6 +54,7 @@ async fn starts_assigned_vm_and_records_status() {
             ha: None,
             // 노드 기록이 없으면(`hotplug` 기능 없음) 핫플러그 배치 없이 켠다.
             hardware: Some(RunningHardware::legacy(&vm.spec)),
+            replication: Vec::new(),
         }
     );
 }
@@ -409,6 +411,48 @@ async fn status_writes_keep_rule_violations_and_ha_record() {
         .await;
     assert_eq!(got.status.rule_violations, ["keep-apart"]);
     assert_eq!(got.status.ha, Some(record));
+}
+
+/// 복제 상태(복제 Task·리더가 씀)는 작업자가 VM을 읽고 status를 쓰는 사이에 바뀌어도 덮지 않는다.
+#[tokio::test]
+async fn status_writes_keep_replication_written_meanwhile() {
+    let env = Env::start().await;
+    let mut vm = vm("web", env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.create(&vm).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+
+    // 작업자가 VM을 읽고 시작하는 사이에 쓴다.
+    env.hv.delay_starts(Duration::from_millis(300));
+    env.set_power(vm.id, PowerState::Running).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let current = env.get(vm.id);
+    assert_ne!(current.status.phase, VmPhase::Running);
+    let replica = ReplicaStatus {
+        state: ReplicationState::Ready,
+        generation: Some(Uuid::now_v7()),
+        synced_at: Some(100),
+        ..ReplicaStatus::pending(Uuid::now_v7())
+    };
+    let mut status = current.status.clone();
+    status.replication = vec![replica.clone()];
+    env.cluster
+        .update_status_checked::<VmSpec>(vm.id, current.revision, &status)
+        .await
+        .unwrap();
+
+    let got = env.wait(vm.id, "running", running).await;
+    assert_eq!(got.status.replication, std::slice::from_ref(&replica));
+
+    // 끄면서 쓰는 status도 지킨다.
+    env.hv.guest_shutdown(vm.id);
+    let got = env
+        .wait(vm.id, "powered off", |v| {
+            v.spec.power == PowerState::Stopped && v.status.phase == VmPhase::Stopped
+        })
+        .await;
+    assert_eq!(got.status.replication, [replica]);
 }
 
 #[tokio::test]

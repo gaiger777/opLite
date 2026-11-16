@@ -9,14 +9,17 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
-use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, Node, NodeSpec, PLACEMENT, ha_capable};
+use opl_types::node::{
+    FAST_HA, HA_PLACEMENT, HOTPLUG, NODE_REPLICATION, Node, NodeSpec, PLACEMENT, ha_capable,
+};
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
-use opl_types::storage::VolumePhase;
+use opl_types::storage::{VolumePhase, is_shared, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{
-    HaState, MacAddr, PowerState, RunningHardware, Vm, VmHa, VmPhase, VmSpec, VmStatus,
+    HaState, MacAddr, PowerState, RunningHardware, ValidationError, Vm, VmHa, VmPhase, VmSpec,
+    VmStatus,
 };
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
@@ -160,6 +163,10 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     if spec.cpu.max_vcpus.is_some() || spec.max_memory_mib.is_some() {
         require_feature(&state.cluster, HOTPLUG)?;
     }
+    // 복제 대상은 옛 노드가 풀지 못한다.
+    if !spec.replication.is_empty() {
+        require_feature(&state.cluster, NODE_REPLICATION)?;
+    }
     // 기본과 다른 HA 정책은 객체로 저장되어 옛 노드가 VM을 읽지 못한다.
     if spec.ha.as_ref().is_some_and(|ha| *ha != VmHa::default()) {
         require_feature(&state.cluster, HA_PLACEMENT)?;
@@ -221,6 +228,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
             ));
         }
     }
+    check_replication(state, vm, &inv)?;
     // 이미 그 노드에 있는 VM(실행 중이거나 고정된 채 꺼진 VM)의 다른 고치기는 유지보수로 막지 않는다.
     let current = inv.vms.iter().find(|v| v.id == id);
     if let Some(node_id) = vm.spec.node {
@@ -255,6 +263,17 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     }
     if vm.spec.power == PowerState::Running && vm.spec.node.is_none() {
         vm.spec.node = Some(schedule_with(vm, &inv, scorer).map_err(schedule_error)?);
+        // 스케줄러가 고른 노드도 복제 대상이면 안 된다.
+        if vm
+            .spec
+            .replication
+            .iter()
+            .any(|t| Some(t.node) == vm.spec.node)
+        {
+            return Err(ApiError::bad_request(
+                ValidationError::ReplicationOwnNode.to_string(),
+            ));
+        }
     }
     // 켜진 채 만들거나, 켜진 채로 바꾸거나 메모리를 늘리면 HA 용량 예약을 본다. 이미 켜진 HA VM의 다른
     // 고치기는 예약이 넘친 때(노드 장애 뒤)에도 막지 않는다.
@@ -268,6 +287,84 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     let adds = current.is_none_or(|c| !started(c) || c.spec.memory_mib < vm.spec.memory_mib);
     if started(vm) && adds {
         check_ha_capacity(state, &inv, vm)?;
+    }
+    Ok(())
+}
+
+/// 복제 대상(계획 55)이 클러스터에 맞는지: 대상 노드가 있고 위트니스가 아니며(400), VM에 노드 로컬 풀의 디스크가
+/// 있고(400) 그 디스크마다 대상 풀(`pool`, 없으면 같은 이름)이 노드 로컬 풀이고 대상 노드에서 쓸 수 있으며(400),
+/// 스냅샷과 예약 스냅샷이 없다(409 `replication_unsupported` — 복제본은 스냅샷을 담지 않는다). 복제가 없으면 보지
+/// 않는다. 이미 저장된 대상(노드와 풀이 같음)은 다시 보지 않는다 — 대상 노드를 지웠거나 바뀌어도 VM의 다른
+/// 고치기를 막지 않게(복제 회차가 그 오류를 알린다).
+fn check_replication(state: &AppState, vm: &Vm, inv: &Inventory) -> Result<(), ApiError> {
+    let spec = &vm.spec;
+    if spec.replication.is_empty() {
+        return Ok(());
+    }
+    let stored = inv
+        .vms
+        .iter()
+        .find(|v| v.id == vm.id)
+        .map_or(&[][..], |v| &v.spec.replication[..]);
+    let mut targets = Vec::new();
+    for target in spec
+        .replication
+        .iter()
+        .filter(|t| !stored.iter().any(|s| s.node == t.node && s.pool == t.pool))
+    {
+        let Some(node) = inv.nodes.iter().find(|n| n.id == target.node) else {
+            return Err(ApiError::bad_request(format!(
+                "replication target node {} not found",
+                target.node
+            )));
+        };
+        if node.spec.witness {
+            return Err(ApiError::bad_request(format!(
+                "node {:?} is a witness and cannot hold replicas",
+                node.name
+            )));
+        }
+        targets.push((target, node));
+    }
+    // 공유 풀의 디스크는 대상 노드도 그대로 열므로 복제하지 않는다.
+    let local = disk_moves(spec, inv, None);
+    if local.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "VM {:?} has no disks on node-local pools; replication applies only to them",
+            vm.name
+        )));
+    }
+    for (target, node) in targets {
+        for disk in &local {
+            let pool = target.pool.as_ref().unwrap_or(&disk.pool);
+            let found = inv.pools.iter().find(|p| &p.name == pool);
+            if found.is_some_and(is_shared) {
+                return Err(ApiError::bad_request(format!(
+                    "replica pool {pool:?} is shared; replication needs a node-local pool"
+                )));
+            }
+            let usable = found.is_some_and(|p| pool_usable_on(p, node));
+            if !usable {
+                let volume = inv
+                    .volumes
+                    .iter()
+                    .find(|v| v.id == disk.volume)
+                    .map_or_else(|| disk.volume.to_string(), |v| v.name.clone());
+                return Err(ApiError::bad_request(format!(
+                    "node {:?} cannot use storage pool {pool:?} for the replica of disk {volume:?}",
+                    node.name
+                )));
+            }
+        }
+    }
+    if spec.snapshot_schedule.is_some() || count_snapshots(state, vm.id)? > 0 {
+        return Err(ApiError::conflict(
+            "replication_unsupported",
+            format!(
+                "VM {:?} has snapshots (or a snapshot schedule); replicas do not keep snapshots, delete them first",
+                vm.name
+            ),
+        ));
     }
     Ok(())
 }

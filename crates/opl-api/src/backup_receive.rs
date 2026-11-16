@@ -274,6 +274,8 @@ pub async fn receive_backup(
         manifest.vm_spec.cpu.max_vcpus = None;
         manifest.vm_spec.max_memory_mib = None;
     }
+    // 복제 대상은 원본 클러스터의 노드다: 늘 버린다.
+    manifest.vm_spec.replication.clear();
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
     if let Some(copy) = backups.iter().find(|b| {
         // 같은 원본이라도 다른 풀에 받은 것은 다른 사본이다.

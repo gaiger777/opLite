@@ -1266,6 +1266,7 @@ async fn local_disks_are_copied_to_the_other_node() {
             volume,
             pool: "local".into(),
             format: ImageFormat::Qcow2,
+            existing: false,
         }]
     );
     assert!(disk_record(&root, &a, &task).exists());

@@ -10,6 +10,7 @@ use common::{Client, Env, FakeStorage, vm_request};
 use opl_driver::uefi_vars_path;
 use opl_types::node::{NodeSpec, PLACEMENT, PoolState};
 use opl_types::placement::{HaGroupNode, HaGroupSpec, HaGroupStatus};
+use opl_types::replication::ReplicationTarget;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
@@ -668,6 +669,32 @@ async fn a_clone_keeps_the_pinning_only_when_every_node_knows_placement() {
         .unwrap();
     succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-3" })).await);
     assert_eq!(get_vm(&env, "web-3").unwrap().spec.placement, None);
+}
+
+/// 복제 대상과 그 복제본은 원본 VM의 것이다: 복제한 VM은 복제 없이 만든다.
+#[tokio::test]
+async fn a_clone_does_not_take_the_replication_targets() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    let root = volume(&env, "root").await;
+    fake_storage(&mut env, &[root]).await;
+    let id = vm_with_disks(&admin, "web", &["root"]).await;
+    // 저장소에 직접 적는다(API는 대상 노드를 확인한다).
+    let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    vm.spec.replication = vec![ReplicationTarget {
+        node: Uuid::now_v7(),
+        schedule: "*/15".into(),
+        pool: Some("b".into()),
+    }];
+    env.cluster
+        .update_spec(id, None, vm.labels.clone(), &vm.spec)
+        .await
+        .unwrap();
+
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-2" })).await);
+    assert!(get_vm(&env, "web-2").unwrap().spec.replication.is_empty());
+    assert_eq!(get_vm(&env, "web").unwrap().spec.replication.len(), 1);
 }
 
 #[tokio::test]

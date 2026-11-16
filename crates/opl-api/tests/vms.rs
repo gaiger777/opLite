@@ -12,11 +12,16 @@ use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DriverError;
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{HaConfig, HaGuard};
-use opl_types::node::{FAST_HA, Fencing, HA_PLACEMENT, HOTPLUG, Node, NodeHa, NodeSpec, PLACEMENT};
+use opl_types::node::{
+    FAST_HA, FEATURES, Fencing, HA_PLACEMENT, HOTPLUG, NODE_REPLICATION, Node, NodeHa, NodeSpec,
+    NodeStatus, PLACEMENT,
+};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
+use opl_types::replication::ReplicaStatus;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{VolumePhase, VolumeSpec};
+use opl_types::snapshot::SnapshotSpec;
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::vm::{Arch, PowerState, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -1555,4 +1560,348 @@ async fn list_returns_revision_and_items() {
         .collect();
     names.sort();
     assert_eq!(names, ["a", "b"]);
+}
+
+/// 모든 기능을 알리는 노드(실행기 없음)를 저장소에만 만든다. `witness`면 위트니스다.
+async fn add_full_node(env: &Env, name: &str, witness: bool) -> Uuid {
+    let mut node: Node = Resource::new(
+        name,
+        NodeSpec {
+            address: "127.0.0.2:0".into(),
+            maintenance: false,
+            witness,
+            roles: None,
+        },
+    );
+    node.status.online = true;
+    node.status.memory_mib = 8192;
+    node.status.arch = Some(Arch::Aarch64);
+    node.status.features = FEATURES.iter().map(|f| f.to_string()).collect();
+    env.cluster.create(&node).await.unwrap();
+    node.id
+}
+
+/// 디렉터리 풀 `name`(공유 여부 `shared`, 노드 목록 `nodes`)을 저장소에 만든다.
+async fn dir_pool(env: &Env, name: &str, shared: bool, nodes: Vec<Uuid>) {
+    let pool = Resource::new(
+        name,
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: env.dir.path().join(name),
+            },
+            nodes,
+            shared,
+            backups: false,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+}
+
+/// 풀 `pool`에 이 노드에 있는 Ready 볼륨 `name`을 저장소에 만든다(파일 없음).
+async fn volume_in(env: &Env, name: &str, pool: &str) {
+    let mut volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: pool.into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+}
+
+/// 볼륨 `volume`을 붙이고 복제 대상 `replication`을 둔 VM 요청
+fn replicated_request(name: &str, volume: &str, replication: Value) -> Value {
+    let mut req = vm_request(name);
+    req["spec"]["disks"] = json!([{ "volume": volume, "bus": "virtio-blk" }]);
+    req["spec"]["replication"] = replication;
+    req
+}
+
+fn assert_bad_request((status, body): (StatusCode, Value), message: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], message, "{body}");
+}
+
+/// 복제 대상(계획 55)은 클러스터에 맞아야 한다: 대상 노드가 있고 위트니스가 아니며, VM에 노드 로컬 풀의 디스크가
+/// 있고, 대상 노드에서 대상 풀을 쓸 수 있다. 자기 노드(정한 노드나 스케줄러가 고른 노드)는 대상이 될 수 없다.
+#[tokio::test]
+async fn replication_targets_must_fit_the_cluster() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_full_node(&env, "node2", false).await;
+    let witness = add_full_node(&env, "w", true).await;
+    // a는 이 노드만, b는 node2만 쓰는 로컬 풀이다.
+    dir_pool(&env, "a", false, vec![env.node]).await;
+    dir_pool(&env, "b", false, vec![node2]).await;
+    dir_pool(&env, "shared", true, vec![]).await;
+    volume_in(&env, "root", "a").await;
+    volume_in(&env, "nfs-root", "shared").await;
+
+    let missing = Uuid::now_v7();
+    assert_bad_request(
+        admin
+            .post(
+                "/vms",
+                replicated_request("web", "root", json!([{ "node": missing }])),
+            )
+            .await,
+        &format!("replication target node {missing} not found"),
+    );
+    assert_bad_request(
+        admin
+            .post(
+                "/vms",
+                replicated_request("web", "root", json!([{ "node": witness }])),
+            )
+            .await,
+        "node \"w\" is a witness and cannot hold replicas",
+    );
+    let mut own = replicated_request("web", "root", json!([{ "node": env.node }]));
+    own["spec"]["node"] = json!(env.node);
+    assert_bad_request(
+        admin.post("/vms", own).await,
+        "replication target cannot be the VM's own node",
+    );
+    // 공유 풀의 디스크는 복제하지 않는다.
+    assert_bad_request(
+        admin
+            .post(
+                "/vms",
+                replicated_request("web", "nfs-root", json!([{ "node": node2 }])),
+            )
+            .await,
+        "VM \"web\" has no disks on node-local pools; replication applies only to them",
+    );
+    let mut diskless = vm_request("web");
+    diskless["spec"]["replication"] = json!([{ "node": node2 }]);
+    assert_bad_request(
+        admin.post("/vms", diskless).await,
+        "VM \"web\" has no disks on node-local pools; replication applies only to them",
+    );
+    // node2는 같은 이름의 풀 a를 쓸 수 없다. 풀 b를 주면 된다.
+    assert_bad_request(
+        admin
+            .post(
+                "/vms",
+                replicated_request("web", "root", json!([{ "node": node2 }])),
+            )
+            .await,
+        "node \"node2\" cannot use storage pool \"a\" for the replica of disk \"root\"",
+    );
+    assert_bad_request(
+        admin
+            .post(
+                "/vms",
+                replicated_request("web", "root", json!([{ "node": node2, "pool": "nope" }])),
+            )
+            .await,
+        "node \"node2\" cannot use storage pool \"nope\" for the replica of disk \"root\"",
+    );
+    // 복제본은 대상 노드만의 풀에 둔다(공유 풀이면 원본과 같은 볼륨 id가 같은 곳을 가리킨다).
+    assert_bad_request(
+        admin
+            .post(
+                "/vms",
+                replicated_request("web", "root", json!([{ "node": node2, "pool": "shared" }])),
+            )
+            .await,
+        "replica pool \"shared\" is shared; replication needs a node-local pool",
+    );
+    // 켜진 채 만들면 스케줄러가 디스크가 있는 이 노드를 고른다: 그 노드가 대상이면 안 된다.
+    let mut scheduled = replicated_request("web", "root", json!([{ "node": env.node }]));
+    scheduled["spec"]["power"] = json!("running");
+    assert_bad_request(
+        admin.post("/vms", scheduled).await,
+        "replication target cannot be the VM's own node",
+    );
+
+    let (status, body) = admin
+        .post(
+            "/vms",
+            replicated_request(
+                "web",
+                "root",
+                json!([{ "node": node2, "schedule": "*/5", "pool": "b" }]),
+            ),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["spec"]["replication"],
+        json!([{ "node": node2, "schedule": "*/5", "pool": "b" }])
+    );
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let stored = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    assert_eq!(stored.spec.replication[0].pool.as_deref(), Some("b"));
+    // 순수 검증의 400이 먼저다.
+    let mut spec = body["spec"].clone();
+    spec["replication"] = json!([{ "node": node2, "schedule": "15" }]);
+    assert_bad_request(
+        admin.put("/vms/web", json!({ "spec": spec }), None).await,
+        "replication schedule must look like */N with N minutes from 1 to 1440",
+    );
+}
+
+/// 저장된 복제 대상은 다시 보지 않아 대상 노드가 사라져도 VM의 다른 고치기는 된다(바꾼 대상은 본다). 죽은 노드를
+/// 지우면 VM들의 복제 대상과 상태에서 그 노드가 빠진다.
+#[tokio::test]
+async fn a_removed_target_node_does_not_block_vm_changes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_full_node(&env, "node2", false).await;
+    let node3 = add_full_node(&env, "node3", false).await;
+    dir_pool(&env, "a", false, vec![env.node]).await;
+    dir_pool(&env, "b", false, vec![node2, node3]).await;
+    volume_in(&env, "root", "a").await;
+    let targets = json!([{ "node": node2, "pool": "b" }, { "node": node3, "pool": "b" }]);
+    let (status, body) = admin
+        .post("/vms", replicated_request("web", "root", targets.clone()))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    vm.status.replication = vec![ReplicaStatus::pending(node2), ReplicaStatus::pending(node3)];
+    env.cluster
+        .update_status::<VmSpec>(id, &vm.status)
+        .await
+        .unwrap();
+
+    // node2가 저장소에서 사라졌다(지우기가 대상을 고치기 전에 끊김 등).
+    env.cluster.delete::<NodeSpec>(node2, None).await.unwrap();
+    let mut spec = body["spec"].clone();
+    spec["memory_mib"] = json!(1024);
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    spec["replication"] = json!([{ "node": node2, "pool": "a" }, { "node": node3, "pool": "b" }]);
+    assert_bad_request(
+        admin.put("/vms/web", json!({ "spec": spec }), None).await,
+        &format!("replication target node {node2} not found"),
+    );
+
+    // 죽은 node3을 지우면 대상과 상태에서 빠진다.
+    env.cluster
+        .update_status::<NodeSpec>(node3, &NodeStatus::default())
+        .await
+        .unwrap();
+    let (status, body) = admin.delete("/nodes/node3").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    assert_eq!(vm.spec.replication.len(), 1);
+    assert_eq!(vm.spec.replication[0].node, node2);
+    assert_eq!(vm.spec.memory_mib, 1024);
+    let nodes: Vec<Uuid> = vm.status.replication.iter().map(|r| r.node).collect();
+    assert_eq!(nodes, [node2]);
+}
+
+/// 복제 대상은 모든 노드가 `node-replication`을 알 때만 받는다. 범위 밖은 기능보다 먼저 400이다.
+#[tokio::test]
+async fn replication_waits_for_all_nodes() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_full_node(&env, "node2", false).await;
+    dir_pool(&env, "local", false, vec![]).await;
+    volume_in(&env, "root", "local").await;
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != NODE_REPLICATION);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+
+    let req = replicated_request("web", "root", json!([{ "node": node2 }]));
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("node replication"),
+        "{body}"
+    );
+    let mut bad = req.clone();
+    bad["spec"]["replication"] = json!([{ "node": node2, "schedule": "*/0" }]);
+    assert_eq!(admin.post("/vms", bad).await.0, StatusCode::BAD_REQUEST);
+    // 복제가 없으면 그대로 받는다.
+    let (status, body) = admin
+        .post("/vms", replicated_request("web", "root", json!([])))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["spec"].get("replication").is_none(), "{body}");
+}
+
+/// 스냅샷(또는 예약 스냅샷)이 있는 VM은 복제할 수 없고(409 `replication_unsupported`), 복제하는 VM은 스냅샷을 만들
+/// 수 없다(409 `snapshot_unsupported`).
+#[tokio::test]
+async fn replication_and_snapshots_exclude_each_other() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_full_node(&env, "node2", false).await;
+    dir_pool(&env, "local", false, vec![]).await;
+    volume_in(&env, "root", "local").await;
+    volume_in(&env, "data", "local").await;
+
+    let (status, vm) = admin
+        .post("/vms", replicated_request("web", "root", json!([])))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let id: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let stored = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+    let snapshot = Resource::new(
+        "before",
+        SnapshotSpec {
+            vm: id,
+            name: "before".into(),
+            parent: None,
+            memory: false,
+            description: String::new(),
+            scheduled: false,
+            vm_spec: stored.spec.clone(),
+            hardware: None,
+        },
+    );
+    env.cluster.create(&snapshot).await.unwrap();
+    let mut spec = vm["spec"].clone();
+    spec["replication"] = json!([{ "node": node2 }]);
+    let (status, body) = admin
+        .put("/vms/web", json!({ "spec": spec.clone() }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "replication_unsupported");
+    assert_eq!(
+        body["message"],
+        "VM \"web\" has snapshots (or a snapshot schedule); replicas do not keep snapshots, delete them first"
+    );
+
+    // 예약 스냅샷도 막는다.
+    let mut req = replicated_request("db", "data", json!([{ "node": node2 }]));
+    req["spec"]["snapshot_schedule"] = json!({ "every": "hourly", "keep": 2 });
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "replication_unsupported");
+
+    req["spec"]["snapshot_schedule"] = Value::Null;
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin
+        .post("/vms/db/snapshots", json!({ "name": "s1" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "snapshot_unsupported");
+    assert_eq!(
+        body["message"],
+        "VM \"db\" is replicated to other nodes; replicas do not keep snapshots, remove the replication first"
+    );
 }

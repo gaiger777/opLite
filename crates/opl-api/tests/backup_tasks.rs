@@ -18,6 +18,7 @@ use opl_types::backup::{
     Backup, BackupManifest, BackupPhase, BackupSpec, MANIFEST_FILE, MANIFEST_VERSION,
     MANIFEST_VERSION_INCREMENTAL,
 };
+use opl_types::replication::ReplicationTarget;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{PoolBackend, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
@@ -519,7 +520,19 @@ async fn restore_makes_a_stopped_vm_from_the_backup() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let (vm, root, _) = setup(&env, &admin).await;
+    // 복제 대상은 원본 VM의 것이라 복원한 VM에는 없다(저장소에 직접 적는다).
+    let mut old = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    old.spec.replication = vec![ReplicationTarget {
+        node: Uuid::now_v7(),
+        schedule: "*/15".into(),
+        pool: None,
+    }];
+    env.cluster
+        .update_spec(vm, None, old.labels.clone(), &old.spec)
+        .await
+        .unwrap();
     let b = backed_up(&env, &admin).await;
+    assert_eq!(b.spec.vm_spec.replication.len(), 1);
     // 백업 뒤에 바뀐 원본 디스크는 복원에 들어가지 않는다.
     assert!(qemu_io(&root, "qcow2", "write -P 0xcc 0 64k"));
     create_pool(&env, "other", false).await;
@@ -537,6 +550,7 @@ async fn restore_makes_a_stopped_vm_from_the_backup() {
     assert_eq!(new.spec.power, PowerState::Stopped);
     assert_eq!(new.spec.node, None);
     assert_eq!(new.spec.ha, None);
+    assert!(new.spec.replication.is_empty());
     assert_eq!(new.spec.memory_mib, old.spec.memory_mib);
     let disks: Vec<&str> = new.spec.disks.iter().map(|d| d.volume.as_str()).collect();
     assert_eq!(disks, ["web-2-disk0", "web-2-disk1"]);

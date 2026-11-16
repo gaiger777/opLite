@@ -168,6 +168,7 @@ pub fn disk_moves(spec: &VmSpec, inv: &Inventory, pool: Option<&StoragePool>) ->
                 volume: volume.id,
                 pool: target.name.clone(),
                 format,
+                existing: false,
             })
         })
         .collect()
@@ -443,6 +444,7 @@ mod tests {
             ha: None,
             placement: None,
             max_memory_mib: None,
+            replication: Vec::new(),
         }
     }
 
@@ -1117,6 +1119,7 @@ mod tests {
             volume: v.id,
             pool: pool.into(),
             format,
+            existing: false,
         };
         // 공유 풀의 디스크는 옮기지 않는다. 풀을 주지 않으면 같은 이름의 풀, 같은 형식이다.
         assert_eq!(

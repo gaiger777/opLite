@@ -851,6 +851,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::NodeDrain => drain::drain(ctx, id).await,
         // 성공해도 다음 재시작 때 적용할 변경이 있으면 경고로 남긴다.
         TaskOp::VmHotplug => return hotplug::hotplug(ctx, task).await,
+        TaskOp::VmReplicate { .. } => Err("this node cannot run replication tasks yet".into()),
     };
     done.map(|()| None)
 }

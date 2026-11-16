@@ -202,6 +202,7 @@ async fn taking_over_a_copied_disk_moves_the_volume_record_first() {
             volume: volume.id,
             pool: "fast".into(),
             format: ImageFormat::Raw,
+            existing: false,
         }],
     });
     env.cluster

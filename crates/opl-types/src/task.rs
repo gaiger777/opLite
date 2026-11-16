@@ -150,6 +150,10 @@ pub enum TaskOp {
     /// 실행 중인 대상 VM의 하드웨어(vCPU·메모리·디스크·NIC)를 지금 스펙에 맞춘다(핫플러그). 실행 중에 할 수
     /// 없는 것은 VM `status.hardware.pending`에 남긴다. VM의 노드에서 돈다.
     VmHotplug,
+    /// 실행 중인 대상 VM의 로컬 디스크를 복제 대상 노드 `node`로 복제한다(한 회차). VM의 노드에서 돈다.
+    VmReplicate {
+        node: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -541,6 +545,20 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TaskOp>(json).unwrap(),
             TaskOp::VmHotplug
+        );
+    }
+
+    #[test]
+    fn vm_replicate_op_is_tagged_by_kind() {
+        let node = Uuid::now_v7();
+        let json = serde_json::json!({ "kind": "vm-replicate", "node": node });
+        assert_eq!(
+            serde_json::to_value(TaskOp::VmReplicate { node }).unwrap(),
+            json
+        );
+        assert_eq!(
+            serde_json::from_value::<TaskOp>(json).unwrap(),
+            TaskOp::VmReplicate { node }
         );
     }
 

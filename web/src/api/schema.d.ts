@@ -640,7 +640,7 @@ export interface paths {
         post?: never;
         /**
          * 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
-         *     그 노드에 배정된 VM은 그대로 남는다.
+         *     그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다.
          */
         delete: operations["delete_node"];
         options?: never;
@@ -2460,6 +2460,11 @@ export interface components {
                 /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                 placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
+                /**
+                 * @description 로컬 디스크 복제 대상(계획 55, 셋까지). 노드 로컬 풀의 디스크를 이 노드들에 주기적으로 복제한다. 비면 쓰지
+                 *     않아 옛 노드도 VM을 푼다.
+                 */
+                replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
@@ -2516,6 +2521,11 @@ export interface components {
          *     원본 풀·형식은 볼륨 기록에 그대로 있다(확정 전에는 바꾸지 않는다).
          */
         DiskMove: {
+            /**
+             * @description 대상 노드에 이미 이 볼륨의 복제본이 있다(계획 55): 새로 만들지 않고 복제 뒤 바뀐 것만 보낸다. false면
+             *     빼고 써서 옛 노드도 읽는다.
+             */
+            existing?: boolean;
             format: components["schemas"]["ImageFormat"];
             pool: string;
             /** Format: uuid */
@@ -3856,6 +3866,11 @@ export interface components {
                     /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                     placement?: components["schemas"]["VmPlacement"];
                     power?: components["schemas"]["PowerState"];
+                    /**
+                     * @description 로컬 디스크 복제 대상(계획 55, 셋까지). 노드 로컬 풀의 디스크를 이 노드들에 주기적으로 복제한다. 비면 쓰지
+                     *     않아 옛 노드도 VM을 푼다.
+                     */
+                    replication?: components["schemas"]["ReplicationTarget"][];
                     restart?: components["schemas"]["RestartPolicy"];
                     snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
                 };
@@ -3890,6 +3905,11 @@ export interface components {
                      * @default null
                      */
                     pid: number | null;
+                    /**
+                     * @description 로컬 디스크 복제 대상마다의 상태(계획 55). 원본 노드의 복제 Task, 리더의 HA 복구·스케줄러, 마이그레이션
+                     *     확정이 쓴다. 옛 노드는 이 필드를 무시한다.
+                     */
+                    replication?: components["schemas"]["ReplicaStatus"][];
                     /** @description 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다. */
                     rule_violations?: string[];
                     /** @default null */
@@ -4890,6 +4910,61 @@ export interface components {
         };
         /** @enum {string} */
         ReplicaState: "copying" | "ready" | "failed";
+        /** @description VM `status.replication`의 대상 하나 */
+        ReplicaStatus: {
+            /** @description 마지막 회차가 실패한 이유. 성공하면 지운다. */
+            error?: string;
+            /**
+             * Format: uuid
+             * @description 마지막으로 끝난 회차의 id(그 회차 Task의 id)
+             */
+            generation?: string;
+            /**
+             * Format: int64
+             * @description 마지막 회차가 보낸 바이트
+             */
+            last_bytes?: number;
+            /** @description 마지막 회차가 전체 복사였는지 */
+            last_full?: boolean;
+            /**
+             * Format: int64
+             * @description 마지막 회차가 걸린 시간(초)
+             */
+            last_secs?: number;
+            /**
+             * Format: int64
+             * @description 마지막으로 회차를 시작한 때(유닉스 초)
+             */
+            last_try?: number;
+            /**
+             * Format: uuid
+             * @description 대상 노드의 id
+             */
+            node: string;
+            /** @description HA 복구가 이 복제본으로 VM을 켜라고 한 표시. 대상 노드가 복제본을 승격한 뒤 지운다. */
+            promote?: boolean;
+            state: components["schemas"]["ReplicationState"];
+            /**
+             * Format: int64
+             * @description 그 회차의 시점(유닉스 초)
+             */
+            synced_at?: number;
+            /** @description 그 회차가 담은 로컬 디스크 */
+            volumes?: components["schemas"]["ReplicaVolume"][];
+        };
+        /** @description 복제 회차가 담은 로컬 디스크 하나 */
+        ReplicaVolume: {
+            /**
+             * Format: uuid
+             * @description 볼륨 id(복제본도 같은 id다)
+             */
+            id: string;
+            /**
+             * Format: int64
+             * @description 그 회차의 볼륨 크기(볼륨의 `spec.size_bytes` — 백엔드가 맞춘 이미지의 가상 크기가 아니다)
+             */
+            size_bytes: number;
+        };
         ReplicateRequest: {
             /** @description 원격 클러스터의 백업 풀 이름 */
             pool: string;
@@ -4902,6 +4977,26 @@ export interface components {
             pool: string;
             /** @description 원격 이름 */
             remote: string;
+        };
+        /**
+         * @description 복제 대상 하나의 상태
+         * @enum {string}
+         */
+        ReplicationState: "pending" | "ready" | "syncing" | "stale";
+        /** @description VM의 복제 대상 하나 */
+        ReplicationTarget: {
+            /**
+             * Format: uuid
+             * @description 복제본을 둘 노드의 id
+             */
+            node: string;
+            /** @description 그 노드에서 이 VM의 로컬 디스크를 모두 둘 풀. 없으면 디스크마다 같은 이름의 풀이다. */
+            pool?: string;
+            /**
+             * @description 주기 `*\/N`(분). 앞 시도를 시작한 때에서 N분 뒤에 다시 한다(시계에 맞추지 않는다).
+             * @default *\/15
+             */
+            schedule: string;
         };
         ResizeRequest: {
             /**
@@ -5593,6 +5688,11 @@ export interface components {
                 /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                 placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
+                /**
+                 * @description 로컬 디스크 복제 대상(계획 55, 셋까지). 노드 로컬 풀의 디스크를 이 노드들에 주기적으로 복제한다. 비면 쓰지
+                 *     않아 옛 노드도 VM을 푼다.
+                 */
+                replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
@@ -5627,6 +5727,11 @@ export interface components {
                  * @default null
                  */
                 pid: number | null;
+                /**
+                 * @description 로컬 디스크 복제 대상마다의 상태(계획 55). 원본 노드의 복제 Task, 리더의 HA 복구·스케줄러, 마이그레이션
+                 *     확정이 쓴다. 옛 노드는 이 필드를 무시한다.
+                 */
+                replication?: components["schemas"]["ReplicaStatus"][];
                 /** @description 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다. */
                 rule_violations?: string[];
                 /** @default null */
@@ -6134,6 +6239,11 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "vm-hotplug";
+        } | {
+            /** @enum {string} */
+            kind: "vm-replicate";
+            /** Format: uuid */
+            node: string;
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -6397,6 +6507,11 @@ export interface components {
                 /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                 placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
+                /**
+                 * @description 로컬 디스크 복제 대상(계획 55, 셋까지). 노드 로컬 풀의 디스크를 이 노드들에 주기적으로 복제한다. 비면 쓰지
+                 *     않아 옛 노드도 VM을 푼다.
+                 */
+                replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             };
@@ -6618,6 +6733,11 @@ export interface components {
             /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
             placement?: components["schemas"]["VmPlacement"];
             power?: components["schemas"]["PowerState"];
+            /**
+             * @description 로컬 디스크 복제 대상(계획 55, 셋까지). 노드 로컬 풀의 디스크를 이 노드들에 주기적으로 복제한다. 비면 쓰지
+             *     않아 옛 노드도 VM을 푼다.
+             */
+            replication?: components["schemas"]["ReplicationTarget"][];
             restart?: components["schemas"]["RestartPolicy"];
             snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
         };
@@ -6652,6 +6772,11 @@ export interface components {
              * @default null
              */
             pid: number | null;
+            /**
+             * @description 로컬 디스크 복제 대상마다의 상태(계획 55). 원본 노드의 복제 Task, 리더의 HA 복구·스케줄러, 마이그레이션
+             *     확정이 쓴다. 옛 노드는 이 필드를 무시한다.
+             */
+            replication?: components["schemas"]["ReplicaStatus"][];
             /** @description 지금 배치가 어기는 배치 규칙의 이름. 리더의 HA 관리자가 쓴다. */
             rule_violations?: string[];
             /** @default null */

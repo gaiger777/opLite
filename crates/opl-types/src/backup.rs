@@ -29,6 +29,14 @@ pub fn bitmap_name(backup: Uuid) -> String {
     format!("{BITMAP_PREFIX}{}", backup.simple())
 }
 
+/// 백업 비트맵([`bitmap_name`] 모양: `opl-` 뒤가 소문자 16진 32자)인지. 같은 `opl-` 무리의 복제·마이그레이션
+/// 비트맵(`opl-repl-…`, `opl-mig-…`)은 백업 비트맵이 아니다.
+pub fn is_backup_bitmap(name: &str) -> bool {
+    name.strip_prefix(BITMAP_PREFIX)
+        .and_then(crate::replication::parse_simple)
+        .is_some()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -630,6 +638,27 @@ mod tests {
         let id: Uuid = "0190a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b".parse().unwrap();
         assert_eq!(bitmap_name(id), "opl-0190a2b3c4d57e6f8a9b0c1d2e3f4a5b");
         assert!(bitmap_name(id).starts_with(BITMAP_PREFIX));
+    }
+
+    /// 백업 비트맵만 참이다. 같은 `opl-` 무리의 복제·마이그레이션 비트맵은 백업이 지우거나 부모로 쓰지 않는다.
+    #[test]
+    fn only_backup_bitmaps_are_backup_bitmaps() {
+        let id = Uuid::now_v7();
+        assert!(is_backup_bitmap(&bitmap_name(id)));
+        let replica = crate::replication::replica_bitmap(Uuid::now_v7(), id);
+        assert!(!is_backup_bitmap(&replica));
+        assert!(!is_backup_bitmap(&crate::replication::migration_bitmap(
+            id, 1
+        )));
+        for name in [
+            "opl-x",
+            "opl-",
+            "user-bitmap",
+            &bitmap_name(id).to_uppercase(),
+        ] {
+            assert!(!is_backup_bitmap(name), "{name}");
+        }
+        assert!(!is_backup_bitmap(&format!("{}0", bitmap_name(id))));
     }
 
     #[test]

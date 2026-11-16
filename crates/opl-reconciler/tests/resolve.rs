@@ -437,6 +437,7 @@ async fn incoming_spec_activates_the_copied_disks_in_the_planned_pool() {
             volume: data.id,
             pool: "fast".into(),
             format: ImageFormat::Raw,
+            existing: false,
         }],
     });
 
@@ -489,11 +490,13 @@ async fn apply_disk_moves_rewrites_the_volumes_once_committed() {
                 volume: root.id,
                 pool: "local".into(),
                 format: ImageFormat::Qcow2,
+                existing: false,
             },
             DiskMove {
                 volume: data.id,
                 pool: "fast".into(),
                 format: ImageFormat::Raw,
+                existing: false,
             },
         ],
     });

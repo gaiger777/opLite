@@ -800,6 +800,7 @@ pub(crate) fn import_spec(
         ha: None,
         placement: None,
         max_memory_mib: None,
+        replication: Vec::new(),
     })
 }
 
