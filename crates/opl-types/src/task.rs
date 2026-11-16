@@ -154,6 +154,47 @@ pub enum TaskOp {
     VmReplicate {
         node: Uuid,
     },
+    /// 이 노드에 Ceph를 설치하고 첫 mon·mgr을 세운다(부트스트랩). 대상은 `Ceph` 리소스다.
+    CephInit,
+    /// 이 노드에 Ceph mon을 더한다. 대상은 `Ceph` 리소스다.
+    CephMonAdd,
+    /// 이 노드에 Ceph mgr을 더한다. 대상은 `Ceph` 리소스다.
+    CephMgrAdd,
+    /// 이 노드의 디스크 `device`에 OSD를 만든다. `wipe`면 디스크를 먼저 지운다. 대상은 `Ceph` 리소스다.
+    CephOsdAdd {
+        device: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        wipe: bool,
+    },
+    /// Ceph 풀 `pool`을 복제 수 `size`로 만들어 Orbivisor RBD 풀 `name`으로 등록한다. mon 노드에서 돈다.
+    /// 대상은 `Ceph` 리소스다.
+    CephPoolCreate {
+        name: String,
+        pool: String,
+        size: u8,
+    },
+    /// 이 노드에 Ceph 클라이언트 꾸러미를 설치한다. 대상은 `Ceph` 리소스다.
+    CephClientInstall,
+}
+
+impl TaskOp {
+    /// Ceph 자동 구성 Task(대상이 `Ceph` 리소스)
+    pub fn is_ceph(&self) -> bool {
+        matches!(
+            self,
+            TaskOp::CephInit
+                | TaskOp::CephMonAdd
+                | TaskOp::CephMgrAdd
+                | TaskOp::CephOsdAdd { .. }
+                | TaskOp::CephPoolCreate { .. }
+                | TaskOp::CephClientInstall
+        )
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -546,6 +587,57 @@ mod tests {
             serde_json::from_value::<TaskOp>(json).unwrap(),
             TaskOp::VmHotplug
         );
+    }
+
+    /// Ceph Task 여섯 가지. OSD 더하기의 `wipe`는 false면 쓰지 않는다.
+    #[test]
+    fn ceph_ops_are_tagged_by_kind() {
+        for (op, json) in [
+            (TaskOp::CephInit, serde_json::json!({ "kind": "ceph-init" })),
+            (
+                TaskOp::CephMonAdd,
+                serde_json::json!({ "kind": "ceph-mon-add" }),
+            ),
+            (
+                TaskOp::CephMgrAdd,
+                serde_json::json!({ "kind": "ceph-mgr-add" }),
+            ),
+            (
+                TaskOp::CephOsdAdd {
+                    device: "/dev/sdb".into(),
+                    wipe: false,
+                },
+                serde_json::json!({ "kind": "ceph-osd-add", "device": "/dev/sdb" }),
+            ),
+            (
+                TaskOp::CephOsdAdd {
+                    device: "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4".into(),
+                    wipe: true,
+                },
+                serde_json::json!({ "kind": "ceph-osd-add",
+                                    "device": "/dev/disk/by-id/wwn-0x5000c500a1b2c3d4",
+                                    "wipe": true }),
+            ),
+            (
+                TaskOp::CephPoolCreate {
+                    name: "vmpool".into(),
+                    pool: "rbd-vm".into(),
+                    size: 3,
+                },
+                serde_json::json!({ "kind": "ceph-pool-create", "name": "vmpool",
+                                    "pool": "rbd-vm", "size": 3 }),
+            ),
+            (
+                TaskOp::CephClientInstall,
+                serde_json::json!({ "kind": "ceph-client-install" }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+            assert!(op.is_ceph(), "{op:?}");
+        }
+        assert!(!TaskOp::VmHotplug.is_ceph());
+        assert!(!TaskOp::NodeUpgrade.is_ceph());
     }
 
     #[test]

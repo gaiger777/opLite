@@ -4,6 +4,7 @@ pub mod audit;
 pub mod auth;
 pub mod backup;
 pub mod backup_job;
+pub mod ceph;
 pub mod cluster;
 pub mod fence;
 pub mod ha_check;

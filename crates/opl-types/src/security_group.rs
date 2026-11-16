@@ -229,6 +229,20 @@ impl Cidr {
         Ok(())
     }
 
+    /// 주소 `addr`이 든 `/prefix` 망(호스트 비트를 지운 범위). 접두사가 주소보다 길면 None.
+    pub fn network(addr: IpAddr, prefix: u8) -> Option<Cidr> {
+        if prefix > Self::max_prefix(addr) {
+            return None;
+        }
+        let mask = Cidr { addr, prefix }.host_mask();
+        let bits = Self::bits(addr) & !mask;
+        let addr = match addr {
+            IpAddr::V4(_) => IpAddr::V4((bits as u32).into()),
+            IpAddr::V6(_) => IpAddr::V6(bits.into()),
+        };
+        Some(Cidr { addr, prefix })
+    }
+
     /// `ip`가 이 범위 안에 있다. IPv4에 대응한 IPv6 주소(`::ffff:a.b.c.d`)는 IPv4로 본다.
     pub fn contains(&self, ip: IpAddr) -> bool {
         let ip = ip.to_canonical();
@@ -465,6 +479,24 @@ mod tests {
         assert!(v6.contains(ip("2001:db8:ffff::1")));
         assert!(!v6.contains(ip("2001:db9::1")));
         assert!("::/0".parse::<Cidr>().unwrap().contains(ip("fe80::1")));
+    }
+
+    /// 주소와 접두사로 그 주소가 든 망을 만든다(호스트 비트를 지움).
+    #[test]
+    fn network_of_an_address_clears_host_bits() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let net = |a: &str, p| Cidr::network(ip(a), p).map(|c| c.to_string());
+        assert_eq!(net("10.0.0.5", 24).as_deref(), Some("10.0.0.0/24"));
+        assert_eq!(net("10.0.0.5", 32).as_deref(), Some("10.0.0.5/32"));
+        assert_eq!(net("10.0.0.5", 0).as_deref(), Some("0.0.0.0/0"));
+        assert_eq!(net("fd00::1:5", 64).as_deref(), Some("fd00::/64"));
+        assert_eq!(net("fd00::1:5", 128).as_deref(), Some("fd00::1:5/128"));
+        assert_eq!(net("10.0.0.5", 33), None);
+        assert!(
+            Cidr::network(ip("10.0.0.5"), 24)
+                .unwrap()
+                .contains(ip("10.0.0.9"))
+        );
     }
 
     #[test]

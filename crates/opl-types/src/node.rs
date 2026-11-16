@@ -340,6 +340,7 @@ pub const FEATURES: &[&str] = &[
     PLACEMENT,
     HOTPLUG,
     NODE_REPLICATION,
+    CEPH_SETUP,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -362,6 +363,9 @@ pub const HOTPLUG: &str = "hotplug";
 /// 로컬 디스크 복제(계획 55): VM `spec.replication`, Task `vm-replicate`, 복제 peer RPC, 복제본으로 하는 HA 복구와
 /// 마이그레이션. 모든 노드가 알릴 때만 쓴다.
 pub const NODE_REPLICATION: &str = "node-replication";
+
+/// Ceph 자동 구성(계획 56): `Ceph` 리소스, Task `ceph-*`, 디스크·Ceph 상태 peer RPC. 모든 노드가 알릴 때만 쓴다.
+pub const CEPH_SETUP: &str = "ceph-setup";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -834,7 +838,8 @@ mod tests {
                 "ha-checks",
                 "placement",
                 "hotplug",
-                "node-replication"
+                "node-replication",
+                "ceph-setup"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

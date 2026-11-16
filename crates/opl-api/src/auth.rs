@@ -638,6 +638,14 @@ mod tests {
         assert!(!a.check(&op, Action::Operate, Kind::NodeFence));
         assert!(a.check(&admin, Action::Read, Kind::NodeFence));
         assert!(a.check(&admin, Action::Write, Kind::NodeFence));
+
+        // Ceph(키는 응답에서 뺀다)는 누구나 읽고 admin만 바꾼다.
+        assert!(a.check(&viewer, Action::Read, Kind::Ceph));
+        assert!(a.check(&op, Action::Read, Kind::Ceph));
+        assert!(!a.check(&viewer, Action::Write, Kind::Ceph));
+        assert!(!a.check(&op, Action::Write, Kind::Ceph));
+        assert!(!a.check(&op, Action::Operate, Kind::Ceph));
+        assert!(a.check(&admin, Action::Write, Kind::Ceph));
     }
 
     #[test]

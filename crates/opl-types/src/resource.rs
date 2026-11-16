@@ -60,6 +60,7 @@ pub enum Kind {
     PlacementRule,
     NodeFence,
     HaCheck,
+    Ceph,
 }
 
 impl Kind {
@@ -89,6 +90,7 @@ impl Kind {
             Kind::PlacementRule => "placement-rule",
             Kind::NodeFence => "node-fence",
             Kind::HaCheck => "ha-check",
+            Kind::Ceph => "ceph",
         }
     }
 }
@@ -174,6 +176,7 @@ mod tests {
             Kind::PlacementRule,
             Kind::NodeFence,
             Kind::HaCheck,
+            Kind::Ceph,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

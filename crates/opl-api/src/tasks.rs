@@ -567,7 +567,8 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// (복원 Task의 대상은 새 VM이다). 복제도 그 백업의 줄에 서서 보내는 동안 지우기가 파일을 지우지
 /// 않는다. VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기 Task의 대상은 새 VM이다).
 /// 노드 비우기는 그 노드의 줄에 서서 한 노드를 한 번에 하나만 비운다. 로컬 디스크 복제도 VM의 줄에 서서 백업·스냅샷·
-/// 핫플러그·마이그레이션과 차례로 돈다(디스크를 읽는 중에 장치가 바뀌거나 VM이 옮겨 가면 안 된다).
+/// 핫플러그·마이그레이션과 차례로 돈다(디스크를 읽는 중에 장치가 바뀌거나 VM이 옮겨 가면 안 된다). Ceph Task는
+/// `Ceph` 리소스의 줄에 서서 한 노드 안에서 차례로 돈다(같은 노드의 apt·`/etc/ceph`를 함께 만지지 않게).
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     match task.spec.op {
@@ -593,8 +594,9 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
             || is_snapshot_op(&task.spec.op)
             || vm_queue
             || backup_queue
-            || node_queue)
-            .then_some(target);
+            || node_queue
+            || task.spec.op.is_ceph())
+        .then_some(target);
     }
     let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(target) else {
         return Some(target);
@@ -657,7 +659,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // (설계 §2.3, 복제는 원격 클라이언트가 조각 사이 60초를 본다).
     // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다. 노드 비우기는 마이그레이션을 여럿
     // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`). 로컬 디스크 복제는 전체 회차가 디스크 크기만큼
-    // 걸리므로 보낸 양이 늘지 않는 시간만 본다(`replication_stall`).
+    // 걸리므로 보낸 양이 늘지 않는 시간만 본다(`replication_stall`). Ceph Task는 꾸러미 설치·디스크 지우기처럼
+    // 오래 걸리는 단계마다 한도가 따로 있다.
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
@@ -668,7 +671,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::NodeUpgrade
             | TaskOp::NodeDrain
             | TaskOp::VmReplicate { .. }
-    );
+    ) || task.spec.op.is_ceph();
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -872,6 +875,12 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::VmHotplug => return hotplug::hotplug(ctx, task).await,
         // VM이 이 노드에서 돌지 않아 건너뛴 회차는 경고로 남긴다.
         TaskOp::VmReplicate { .. } => return vm_replicate::replicate(ctx, task).await,
+        TaskOp::CephInit
+        | TaskOp::CephMonAdd
+        | TaskOp::CephMgrAdd
+        | TaskOp::CephOsdAdd { .. }
+        | TaskOp::CephPoolCreate { .. }
+        | TaskOp::CephClientInstall => Err("this node cannot run Ceph tasks yet".into()),
     };
     done.map(|()| None)
 }

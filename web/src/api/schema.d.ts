@@ -6299,6 +6299,30 @@ export interface components {
             kind: "vm-replicate";
             /** Format: uuid */
             node: string;
+        } | {
+            /** @enum {string} */
+            kind: "ceph-init";
+        } | {
+            /** @enum {string} */
+            kind: "ceph-mon-add";
+        } | {
+            /** @enum {string} */
+            kind: "ceph-mgr-add";
+        } | {
+            device: string;
+            /** @enum {string} */
+            kind: "ceph-osd-add";
+            wipe?: boolean;
+        } | {
+            /** @enum {string} */
+            kind: "ceph-pool-create";
+            name: string;
+            pool: string;
+            /** Format: int32 */
+            size: number;
+        } | {
+            /** @enum {string} */
+            kind: "ceph-client-install";
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

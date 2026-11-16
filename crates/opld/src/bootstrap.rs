@@ -783,7 +783,8 @@ pub(crate) mod tests {
                 "ha-checks",
                 "placement",
                 "hotplug",
-                "node-replication"
+                "node-replication",
+                "ceph-setup"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -815,7 +816,8 @@ pub(crate) mod tests {
                 "ha-checks",
                 "placement",
                 "hotplug",
-                "node-replication"
+                "node-replication",
+                "ceph-setup"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -866,7 +868,8 @@ pub(crate) mod tests {
                 "ha-checks",
                 "placement",
                 "hotplug",
-                "node-replication"
+                "node-replication",
+                "ceph-setup"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1092,6 +1095,7 @@ pub(crate) mod tests {
                     "placement".into(),
                     "hotplug".into(),
                     "node-replication".into(),
+                    "ceph-setup".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()
