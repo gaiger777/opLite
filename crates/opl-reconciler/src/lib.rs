@@ -7,15 +7,20 @@ mod backoff;
 mod config;
 mod firewall;
 mod firmware;
+mod guest;
 pub mod ha;
 mod reconciler;
 pub mod replicas;
 pub mod resolve;
 mod worker;
 
-pub use config::{GUEST_PING_INTERVAL, ReconcilerConfig, RestartBackoff};
+pub use config::{
+    FIRMWARE_SYNC_INTERVAL, GUEST_INFO_INTERVAL, GUEST_PING_INTERVAL, ReconcilerConfig,
+    RestartBackoff,
+};
 pub use firewall::FirewallGate;
-pub use firmware::{FirmwareError, FirmwareFetcher};
+pub use firmware::{FirmwareCopy, FirmwareError, FirmwareFetcher};
+pub use guest::GuestInfoSink;
 pub use ha::{HaConfig, HaGuard};
 pub use reconciler::{Reconciler, ReconcilerHandle};
 pub use worker::TEMPLATE_NOT_STARTED;

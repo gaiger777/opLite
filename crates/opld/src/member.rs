@@ -31,8 +31,12 @@ use opl_driver::{
 };
 use opl_peer::pki::{ClusterCa, NodeTls, PKI_DIR, cert_names, csr_for_key, fingerprint};
 use opl_peer::tls::{ApiCert, TlsListener, api_server_config_with};
-use opl_peer::{GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers, renew_liveness};
-use opl_reconciler::{FirewallGate, FirmwareFetcher, HaGuard, Reconciler, ReconcilerConfig};
+use opl_peer::{
+    GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers, VarsTemplates, renew_liveness,
+};
+use opl_reconciler::{
+    FirewallGate, FirmwareFetcher, GuestInfoSink, HaGuard, Reconciler, ReconcilerConfig,
+};
 use opl_types::cluster::ClusterSpec;
 use opl_types::host::same_host;
 use opl_types::node::{NodeShutdown, NodeSpec, ShutdownAction};
@@ -49,6 +53,7 @@ use crate::checks::{CheckerConfig, HealthChecker};
 use crate::config::Config;
 use crate::fence_watch::FenceWatch;
 use crate::firewall::{FirewallAgent, FirewallRules};
+use crate::guest::GuestInfoStore;
 use crate::host::Host;
 use crate::metrics::host as metrics_host;
 use crate::metrics::sampler::MetricsSampler;
@@ -418,6 +423,9 @@ impl Member {
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;
+        // TPM·Secure Boot 능력(계획 59, swtpm·`-tpmdev help`·Secure Boot 펌웨어)도 등록 전에 살핀다.
+        host.firmware_caps = hv.firmware_caps().await;
+        let firmware_caps = host.firmware_caps;
         // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
         let tls_dir = migration_tls_dir(&config.data_dir);
         if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
@@ -510,7 +518,18 @@ impl Member {
         // Ceph Task·에이전트와 API(디스크 목록, Ceph 상태), 다른 노드(노드 간 서버)가 같은 단계들을 쓴다.
         let ceph = Arc::new(config.ceph.host());
         let ceph_source = Arc::new(CephPeerSource::new(cluster.clone(), node, ceph.clone()));
-        // UEFI 변수 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
+        // 게스트 정보 캐시(계획 59): reconciler가 모아 넣고 API와 다른 노드가 읽는다.
+        let guest = Arc::new(GuestInfoStore::new(cluster.clone(), hv.clone()));
+        // 밀어 둔 펌웨어 사본의 변수 크기를 이 노드의 템플릿과 견준다.
+        let vars_templates = VarsTemplates {
+            uefi: host.profile.uefi_vars_template.clone(),
+            secure_boot: host
+                .profile
+                .secure_boot
+                .as_ref()
+                .map(|p| p.vars_template.clone()),
+        };
+        // UEFI 변수·TPM 상태 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
         let service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(
                 incoming
@@ -519,6 +538,8 @@ impl Member {
             ))
             .with_replicas(Arc::new(replicas.clone()))
             .with_uefi_vars(config.data_dir.clone())
+            .with_firmware_copies(vars_templates)
+            .with_guest_agent(guest.clone())
             .with_audit(audit.clone())
             .with_metrics(metrics_source.clone())
             .with_fence(fence_source)
@@ -615,6 +636,11 @@ impl Member {
         let qemu_binary = host.profile.qemu_binary.clone();
         // 받은 UEFI 변수 파일의 크기를 이 노드의 템플릿과 견준다.
         let uefi_vars_template = host.profile.uefi_vars_template.clone();
+        let secure_boot_vars = host
+            .profile
+            .secure_boot
+            .as_ref()
+            .map(|p| p.vars_template.clone());
         // 장치를 만들거나 지우면 곧바로 브리지 목록을 기록한다(아래 주기 갱신을 기다리지 않는다).
         let overlay = on(&rt.work, || {
             OverlayAgent::spawn(cluster.clone(), config, &host, tag)
@@ -625,13 +651,19 @@ impl Member {
         reconciler_config.replica_dir = config.data_dir.join(REPLICAS_DIR);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
         // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다(시작, 스냅샷, 복제).
-        let firmware: Arc<dyn FirmwareFetcher> = Arc::new(UefiVarsFetcher::new(
-            cluster.clone(),
-            peers.clone(),
-            config.data_dir.clone(),
-            uefi_vars_template,
-        ));
+        let firmware: Arc<dyn FirmwareFetcher> = Arc::new(
+            UefiVarsFetcher::new(
+                cluster.clone(),
+                peers.clone(),
+                config.data_dir.clone(),
+                uefi_vars_template,
+            )
+            .with_secure_boot_template(secure_boot_vars),
+        );
         reconciler_config.firmware = Some(firmware.clone());
+        // TPM 상태 파일의 해시를 셈한다(드라이버의 state_dir). 게스트 정보는 노드 메모리 캐시에 둔다.
+        reconciler_config.state_dir = Some(config.data_dir.clone());
+        reconciler_config.guest_info = Some(guest.clone() as Arc<dyn GuestInfoSink>);
         // 펜싱이 켜져 있으면 지금부터 리스를 갱신한다(지금이 stale을 세는 기준점이다).
         let ha = config
             .ha
@@ -775,6 +807,7 @@ impl Member {
                         .map(String::from)
                         .collect(),
                     hotplug: Some(hotplug),
+                    firmware_caps: Some(firmware_caps),
                 },
                 state.audit.clone(),
             )

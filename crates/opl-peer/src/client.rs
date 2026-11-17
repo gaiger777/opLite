@@ -37,7 +37,11 @@ use uuid::Uuid;
 
 use crate::ceph::{CephStatusRequest, NodeDisksRequest};
 use crate::fence::FenceStatusRequest;
-use crate::firmware::{UefiVarsError, UefiVarsRequest};
+use crate::firmware::{
+    Expect, MAX_TPM_BYTES, PushFirmwareRequest, TpmStateError, TpmStateRequest, UefiVarsError,
+    UefiVarsRequest,
+};
+use crate::guest::{GuestAgentError, GuestAgentReply, GuestAgentRequest};
 use crate::metrics::MetricsReply;
 use crate::migration::{
     IncomingError, IncomingMigration, MigrateIncomingRequest, MigrateIncomingResponse,
@@ -96,6 +100,12 @@ const REPLICA_ABORT_TIMEOUT: Duration = Duration::from_secs(60);
 /// UEFI 변수 파일 받기(`UefiVars`)를 기다리는 최대 시간. AAVMF 변수 파일은 64 MiB지만 대부분 0이라
 /// 길이만 온다.
 const UEFI_VARS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TPM 상태 받기(`TpmState`)를 기다리는 최대 시간. 수십 KiB다.
+const TPM_STATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 펌웨어 사본 밀어 두기(`PushFirmware`)를 기다리는 최대 시간. 변수 파일의 0 조각은 길이만 간다.
+const PUSH_FIRMWARE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 다른 노드로 가는 연결. 주소마다 채널 하나를 만들어 다시 쓴다(끊기면 tonic이 다시 잇는다).
 /// 연결할 때 이 노드의 인증서를 내밀고, 상대 인증서는 클러스터 CA로 확인한다.
@@ -607,6 +617,79 @@ impl Peers {
             .await;
         let chunks = reply?.into_inner();
         crate::firmware::write_file(chunks, dest, expect_len).await
+    }
+}
+
+impl Peers {
+    /// 노드 `from`(첫 링크 `addr`)에서 VM의 TPM 상태 파일을 받아 `dest`를 바꾼다(디렉터리 0700, 파일 0600, 임시
+    /// 파일에 받아 fsync한 뒤 이름을 바꾼다). 받은 파일의 SHA-256이 `sha256`과 다르거나 실패하면 `dest`는 그대로다.
+    pub async fn tpm_state(
+        &self,
+        from: NodeId,
+        addr: &str,
+        vm: Uuid,
+        dest: &Path,
+        sha256: &str,
+    ) -> Result<u64, TpmStateError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(TpmStateRequest { vm });
+                req.set_timeout(TPM_STATE_TIMEOUT);
+                addressed(&mut req, Some(from));
+                async move { client.tpm_state(req).await }
+            })
+            .await;
+        let chunks = reply?.into_inner();
+        let expect = Expect {
+            sha256: Some(sha256),
+            max: Some(MAX_TPM_BYTES),
+            private: true,
+            ..Default::default()
+        };
+        Ok(crate::firmware::write_checked(chunks, dest, expect).await?)
+    }
+
+    /// 노드 `to`(첫 링크 `addr`)에 VM의 펌웨어 사본(TPM 상태 + UEFI 변수)을 밀어 둔다. 그 노드에서 VM이 돌거나 그
+    /// 노드가 `firmware_node`면 거절한다(`Invalid`). 이 RPC를 모르는 노드는 `Unsupported`다.
+    pub async fn push_firmware(
+        &self,
+        to: NodeId,
+        addr: &str,
+        req: PushFirmwareRequest,
+    ) -> Result<(), TpmStateError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                req.set_timeout(PUSH_FIRMWARE_TIMEOUT);
+                addressed(&mut req, Some(to));
+                async move { client.push_firmware(req).await }
+            })
+            .await;
+        reply.map(|_| ()).map_err(Into::into)
+    }
+
+    /// 노드 `node`(첫 링크 `addr`)에서 도는 VM의 게스트 에이전트에 `req`를 보낸다. 그 노드가 이 RPC를 모르면
+    /// `Unsupported`, 닿지 못하면 `Unreachable`이다.
+    pub async fn guest_agent(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: GuestAgentRequest,
+        timeout: Duration,
+    ) -> Result<GuestAgentReply, GuestAgentError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(node));
+                async move { within(timeout, client.guest_agent(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(reply.into_inner()),
+            Err(s) if s.code() == Code::Unimplemented => Err(GuestAgentError::Unsupported),
+            Err(s) => Err(GuestAgentError::Unreachable(s.message().to_string())),
+        }
     }
 }
 

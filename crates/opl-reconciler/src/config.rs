@@ -6,11 +6,18 @@ use opl_driver::Storage;
 
 use crate::firewall::FirewallGate;
 use crate::firmware::FirmwareFetcher;
+use crate::guest::GuestInfoSink;
 use crate::ha::HaGuard;
 use uuid::Uuid;
 
 /// 게스트 감시가 게스트 에이전트를 부르는 기본 간격
 pub const GUEST_PING_INTERVAL: Duration = Duration::from_secs(5);
+
+/// TPM VM을 돌리는 노드가 TPM 상태 파일의 해시를 다시 보고 펌웨어 사본을 밀어 두는 간격(계획 59 §5)
+pub const FIRMWARE_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// 게스트 에이전트에서 게스트 정보를 모으는 간격(계획 59 §8)
+pub const GUEST_INFO_INTERVAL: Duration = Duration::from_secs(60);
 
 /// reconciler 설정. 기본값은 설계 문서 5.3절을 따른다.
 #[derive(Clone)]
@@ -31,8 +38,17 @@ pub struct ReconcilerConfig {
     pub restart: RestartBackoff,
     /// 게스트 감시(`ha.guest_watch`)가 게스트 에이전트에 `guest-ping`을 보내는 간격
     pub guest_ping_interval: Duration,
-    /// 다른 노드에 있는 UEFI 변수 파일을 받아 온다. 없으면 받지 않고 이 노드의 파일로 켠다.
+    /// 다른 노드에 있는 UEFI 변수 파일을 받아 온다. 없으면 받지 않고 이 노드의 파일로 켠다. TPM VM(계획 59)의 TPM
+    /// 상태도 받아 오고 사본을 밀어 둔다. 없으면 다른 노드의 TPM 상태가 필요한 VM은 켜지 않는다.
     pub firmware: Option<Arc<dyn FirmwareFetcher>>,
+    /// 드라이버의 `state_dir`(TPM 상태 파일이 있는 곳). 없으면 TPM 상태의 해시를 셈하지 않는다.
+    pub state_dir: Option<PathBuf>,
+    /// TPM 상태의 해시를 다시 보고 사본을 밀어 두는 간격
+    pub firmware_sync_interval: Duration,
+    /// 게스트 정보를 둘 곳(opld의 캐시). 없으면 모으지 않는다(에이전트 종료를 고르려고 답했는지만 본다).
+    pub guest_info: Option<Arc<dyn GuestInfoSink>>,
+    /// 게스트 에이전트에서 게스트 정보를 모으는 간격
+    pub guest_info_interval: Duration,
     /// 이 노드의 HA 리스와 watchdog. None이면 펜싱이 꺼져 있어 HA VM을 켜지 않는다.
     pub ha: Option<Arc<HaGuard>>,
     /// 이 노드의 방화벽. None이면 방화벽이 없어 보안 그룹을 건 NIC가 있는 VM을 켜지 않는다.
@@ -71,6 +87,10 @@ impl ReconcilerConfig {
             },
             guest_ping_interval: GUEST_PING_INTERVAL,
             firmware: None,
+            state_dir: None,
+            firmware_sync_interval: FIRMWARE_SYNC_INTERVAL,
+            guest_info: None,
+            guest_info_interval: GUEST_INFO_INTERVAL,
             ha: None,
             firewall: None,
         }

@@ -345,6 +345,67 @@ async fn only_guest_watched_vms_get_a_guest_agent_channel() {
     assert!(incoming.guest_agent);
 }
 
+/// TPM(계획 59)은 이 노드의 상태로(새로 만들지 않고) VM의 회차와 함께 켠다. 다시 붙을 때는 도는 QEMU의 장치(기록)를
+/// 따른다: 실행 중에 TPM·에이전트를 더했으면 없다. 계획 59 전 기록(채널 칸 없음)의 게스트 감시 채널은 그대로다.
+#[tokio::test]
+async fn tpm_secure_boot_and_agent_channel_follow_the_running_hardware() {
+    use opl_types::runtime::RuntimeTpm;
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let mut vm = common::vm("win", node);
+    vm.spec.tpm = true;
+    vm.spec.secure_boot = true;
+    vm.status.firmware_epoch = 4;
+    let start = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    assert_eq!(
+        start.tpm,
+        Some(RuntimeTpm {
+            fresh: false,
+            epoch: 4
+        })
+    );
+    assert!(start.secure_boot);
+
+    // 켤 때는 장치가 없었다(보류): 다시 붙을 때도 도는 QEMU의 장치다(받는 쪽은 장치가 다르면 받지 않는다).
+    let mut hw = RunningHardware::legacy(&vm.spec);
+    hw.tpm = false;
+    hw.secure_boot = false;
+    vm.spec.guest_agent = Some(Default::default());
+    vm.status.hardware = Some(hw.clone());
+    let storage = Activations::default();
+    let incoming = running_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(incoming.tpm, None);
+    assert!(!incoming.secure_boot);
+    assert!(!incoming.guest_agent);
+    // 기록에만 TPM이 있다(실행 중에 뺐다).
+    vm.spec.tpm = false;
+    hw.tpm = true;
+    vm.status.hardware = Some(hw.clone());
+    let incoming = running_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(
+        incoming.tpm,
+        Some(RuntimeTpm {
+            fresh: false,
+            epoch: 4
+        })
+    );
+    // 계획 59 전 기록(guest_agent 없음)의 게스트 감시 채널은 지킨다.
+    vm.spec.guest_agent = None;
+    vm.spec.ha = Some(VmHa {
+        guest_watch: Some(GuestWatch::default()),
+        ..Default::default()
+    });
+    let incoming = running_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert!(incoming.guest_agent);
+}
+
 /// 풀다가 실패하면 그때까지 활성화한 볼륨을 끈다(VM을 시작하지 않으니 켜 둘 까닭이 없다).
 /// 성공하면 끄지 않는다.
 #[tokio::test]
@@ -1403,7 +1464,7 @@ async fn incoming_spec_starts_the_running_hardware() {
     assert_eq!(start.hotplug, None);
 
     let mut applied = start.clone();
-    apply_hardware(&mut applied, &hw);
+    apply_hardware(&mut applied, &hw, &vm.spec);
     assert_eq!(applied, incoming);
 
     // 스펙의 디스크가 원본 QEMU의 장치와 다르면(떼는 중인 디스크) 볼륨을 켜지 않고 받지 않는다.
@@ -1727,7 +1788,7 @@ async fn incoming_spec_starts_the_running_cdroms() {
         .unwrap();
     assert_eq!(order(&start), (vec![Some(2)], vec![Some(3), Some(1)]));
     let mut applied = start.clone();
-    apply_hardware(&mut applied, &hw);
+    apply_hardware(&mut applied, &hw, &vm.spec);
     assert_eq!(applied, incoming);
 
     // 매체를 바꾸는 중: 받지 않는다. 다시 붙을 때는 도는 QEMU의 매체다.

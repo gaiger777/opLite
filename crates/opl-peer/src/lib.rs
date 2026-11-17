@@ -3,7 +3,7 @@
 //! 노드는 gRPC(HTTP/2) over mTLS로 이야기한다. 클러스터 CA가 서명한 인증서를 가진 노드만 연결할 수
 //! 있고, 서버는 상대 인증서의 노드 id가 지금 멤버인지도 확인한다. 메시지는 Rust 타입을 serde JSON으로
 //! 보낸다(`build.rs`). 서비스는 Raft RPC, 리더 전달, 생존 확인, 관찰 노드의 Follow, VM 콘솔 중계, 라이브 마이그레이션
-//! 받기, 로컬 디스크 복제 받기, UEFI 변수 파일 보내기, 감사 로그 읽기, 지표 읽기, 펜싱 방법으로 전원 읽기, 리더의 최적 배치 상태 읽기,
+//! 받기, 로컬 디스크 복제 받기, UEFI 변수·TPM 상태 파일 보내기와 펌웨어 사본 받기, 게스트 에이전트, 감사 로그 읽기, 지표 읽기, 펜싱 방법으로 전원 읽기, 리더의 최적 배치 상태 읽기,
 //! Ceph를 세울 노드의 디스크 목록과 Ceph 상태 읽기다.
 
 pub mod audit;
@@ -14,6 +14,7 @@ mod codec;
 pub mod fault;
 pub mod fence;
 pub mod firmware;
+pub mod guest;
 pub mod metrics;
 pub mod migration;
 pub mod monitor;
@@ -28,7 +29,13 @@ pub use audit::{AuditReply, AuditSource};
 pub use ceph::{CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, NodeDisksRequest};
 pub use client::{ConsoleError, ConsoleReceiver, ConsoleSender, ConsoleStream, GrpcNetwork, Peers};
 pub use fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
-pub use firmware::UefiVarsError;
+pub use firmware::{
+    PushFirmwareRequest, TpmStateError, UefiVarsChunk, UefiVarsError, VarsTemplates, read_chunks,
+    sha256_hex,
+};
+pub use guest::{
+    GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
+};
 pub use metrics::{MetricsReply, MetricsSource};
 pub use migration::{
     IncomingDisk, IncomingError, IncomingMigration, MigrateIncomingRequest,

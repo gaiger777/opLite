@@ -19,7 +19,7 @@ use opl_driver::{NetFs, PING_TIMEOUT, PROBE_TIMEOUT, ProbeError};
 use opl_types::audit::AuditTarget;
 use opl_types::ha_check::{AUTO_PREFIX, CheckReport, CheckState, HaCheckSpec, HaCheckTarget};
 use opl_types::node::{
-    BondState, BondStatus, HA_CHECKS, NodeHotplug, NodeInterface, NodeSpec, PortState,
+    BondState, BondStatus, FirmwareCaps, HA_CHECKS, NodeHotplug, NodeInterface, NodeSpec, PortState,
 };
 use opl_types::resource::Resource;
 use opl_types::storage::{IscsiTarget, PoolBackend, StoragePool, StoragePoolSpec};
@@ -60,6 +60,9 @@ pub struct CheckerConfig {
     /// 이 노드의 핫플러그 능력(계획 54). 노드 상태의 값이 다르면(이 필드를 모르는 옛 리더가 상태를 다시 써 지웠으면)
     /// 결과를 쓸 때 다시 쓴다. None이면 건드리지 않는다.
     pub hotplug: Option<NodeHotplug>,
+    /// 이 노드의 TPM·Secure Boot 능력(계획 59). 핫플러그 능력처럼 노드 상태의 값이 다르면 다시 쓴다. None이면 건드리지
+    /// 않는다.
+    pub firmware_caps: Option<FirmwareCaps>,
 }
 
 /// 디렉터리 풀 probe. 시험은 멈추는 가짜로 바꾼다.
@@ -538,7 +541,7 @@ impl State {
         }
     }
 
-    /// `NodeStatus.checks`·`interfaces`·`hotplug`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이 있을 때만,
+    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이 있을 때만,
     /// 64개까지).
     async fn write_status(&self, checks: &[CheckReport]) {
         let interfaces = self
@@ -563,6 +566,12 @@ impl State {
                 && status.hotplug != Some(hotplug)
             {
                 status.hotplug = Some(hotplug);
+                changed = true;
+            }
+            if let Some(caps) = self.config.firmware_caps
+                && status.firmware_caps != Some(caps)
+            {
+                status.firmware_caps = Some(caps);
                 changed = true;
             }
             changed
@@ -1001,6 +1010,7 @@ mod tests {
                     mount_root: self.dir.path().join("pools"),
                     hosts: hosts.iter().map(|h| h.to_string()).collect(),
                     hotplug: None,
+                    firmware_caps: None,
                 },
                 self.audit.clone(),
             );
@@ -1095,20 +1105,28 @@ mod tests {
         };
         let mut state = s.state(&[]);
         state.config.hotplug = Some(caps);
+        let firmware = FirmwareCaps {
+            tpm: true,
+            secure_boot: false,
+        };
+        state.config.firmware_caps = Some(firmware);
         run_once(&mut state).await;
         assert_eq!(s.node().status.hotplug, Some(caps));
+        assert_eq!(s.node().status.firmware_caps, Some(firmware));
         let revision = s.node().revision;
         run_once(&mut state).await;
         assert_eq!(s.node().revision, revision);
 
         bootstrap::update_node_status(&s.cluster, |status| {
             status.hotplug = None;
+            status.firmware_caps = None;
             true
         })
         .await
         .unwrap();
         run_once(&mut state).await;
         assert_eq!(s.node().status.hotplug, Some(caps));
+        assert_eq!(s.node().status.firmware_caps, Some(firmware));
     }
 
     /// 링크 검사: carrier가 0이 되면 다음 회차에 실패이고 시작 시각이 붙으며 노드 상태에 쓴다. 결과가 같으면 다시

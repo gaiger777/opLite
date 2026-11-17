@@ -1611,6 +1611,7 @@ name = "opl-reconciler"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "hex",
  "openraft",
  "opl-cluster",
  "opl-driver",
@@ -1620,6 +1621,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

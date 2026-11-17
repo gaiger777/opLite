@@ -33,6 +33,7 @@ use async_trait::async_trait;
 use opl_cluster::types::{Command, LeaderRequest, NodeId, Rejection};
 use opl_cluster::{Cluster, ClusterError, Leases, Typed};
 use opl_types::fence::NodeFenceSpec;
+use opl_types::firmware::tpm_unavailable;
 use opl_types::node::{FAST_HA, HA_CHECKS, Node, NodeSpec, ha_capable};
 use opl_types::replication::{ReplicaRecovery, ReplicaStatus, ReplicationState, ReplicationTarget};
 use opl_types::resource::{Resource, ResourceSpec};
@@ -1626,6 +1627,15 @@ fn recovery_pick(
     failed: &Node,
 ) -> Pick {
     let replicas = !stays_stopped(vm);
+    // 계획 59: TPM 상태를 가진 노드가 죽었으면 지금 것의 사본을 가진 노드에서만 켠다. 없으면 켜지 않는다(새 TPM으로
+    // 몰래 켜면 게스트가 복구 키를 묻고 멈추거나 봉인한 비밀을 잃는다 — 사람이 고른다).
+    if replicas && let Some((holder, copies)) = tpm_copies(vm, inv, failed) {
+        let eligible = |n: &Node| eligible(n) && copies.contains(&n.id);
+        return match pick(vm, inv, assign, eligible, scorer, replicas) {
+            Pick::NoNode(_) => Pick::NoNode(Some(tpm_unavailable(&vm.name, Some(&holder)))),
+            other => other,
+        };
+    }
     match pick(vm, inv, assign, eligible, scorer, replicas) {
         Pick::NoNode(None) if !replicas && !disk_moves(&vm.spec, inv, None).is_empty() => {
             Pick::NoNode(Some(format!(
@@ -1635,6 +1645,21 @@ fn recovery_pick(
         }
         other => other,
     }
+}
+
+/// TPM VM의 지금 TPM 상태를 가진 노드(`firmware_node`)가 죽은 노드 `failed`이거나 오프라인이면 그 노드의 이름과 사본을
+/// 가진 노드(`firmware_copies`)다. 기록된 TPM 상태가 없거나(어디서든 새로 만든다) 그 노드가 살아 있으면(받아 온다) None이다.
+fn tpm_copies(vm: &Vm, inv: &Inventory, failed: &Node) -> Option<(String, Vec<Uuid>)> {
+    if !vm.spec.tpm || vm.status.tpm_sha256.is_none() {
+        return None;
+    }
+    let holder = vm.status.firmware_node?;
+    let node = inv.nodes.iter().find(|n| n.id == holder);
+    if holder != failed.id && node.is_some_and(|n| n.status.online) {
+        return None;
+    }
+    let name = node.map_or_else(|| holder.to_string(), |n| n.name.clone());
+    Some((name, vm.status.firmware_copies.clone()))
 }
 
 /// VM을 노드 `node`에서 켜려면 복제본이 있어야 한다: 노드 로컬 풀 디스크가 있고 그 가운데 다른 노드에 있는 것이 있다.
@@ -2560,6 +2585,58 @@ mod tests {
             }],
             ..ReplicaStatus::pending(node.id)
         }
+    }
+
+    /// TPM VM의 상태를 가진 노드가 죽으면 지금 사본을 가진 노드로만 옮기고, 없으면 켜지 않고 그 이유를 남긴다. 상태를
+    /// 가진 노드가 살아 있거나 기록된 TPM 상태가 없으면 어디로든 옮긴다(켜는 노드가 받아 오거나 새로 만든다).
+    #[test]
+    fn a_tpm_vm_is_recovered_only_on_a_node_with_a_current_copy() {
+        use opl_types::node::FirmwareCaps;
+        let caps = |mut n: Node| {
+            n.status.firmware_caps = Some(FirmwareCaps {
+                tpm: true,
+                secure_boot: false,
+            });
+            n
+        };
+        let (failed, a, b) = (
+            caps(ha_node("failed")),
+            caps(ha_node("a")),
+            caps(ha_node("b")),
+        );
+        let mut web = vm("web", Some(50), failed.id);
+        web.spec.firmware = opl_types::vm::Firmware::Uefi;
+        web.spec.tpm = true;
+        web.status.firmware_node = Some(failed.id);
+        web.status.tpm_sha256 = Some("ab".repeat(32));
+        web.status.firmware_copies = vec![b.id];
+        let inv = Inventory {
+            nodes: vec![failed.clone(), a.clone(), b.clone()],
+            vms: vec![web],
+            ..Default::default()
+        };
+        let eligible = |n: &Node| n.id != failed.id;
+        let scorer = Scorer::default();
+        let recover = |inv: &Inventory| {
+            recovery_pick(
+                &inv.vms[0],
+                inv,
+                &Assign::default(),
+                eligible,
+                &scorer,
+                &failed,
+            )
+        };
+        assert_eq!(recover(&inv), Pick::Node(b.id));
+        let mut none = inv.clone();
+        none.vms[0].status.firmware_copies.clear();
+        assert_eq!(
+            recover(&none),
+            Pick::NoNode(Some(tpm_unavailable("web", Some("failed"))))
+        );
+        // 기록된 TPM 상태가 없으면 어디든(메모리가 같으면 이름순 등 배치 순서) 된다.
+        none.vms[0].status.tpm_sha256 = None;
+        assert!(matches!(recover(&none), Pick::Node(_)));
     }
 
     /// 노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는 노드로만 옮기고, 둘이면 시점이 새로운 쪽이다. 복사

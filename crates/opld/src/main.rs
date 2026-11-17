@@ -19,6 +19,7 @@ mod control;
 mod fault;
 mod fence_watch;
 mod firewall;
+mod guest;
 mod host;
 mod join;
 mod member;

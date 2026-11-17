@@ -131,6 +131,31 @@ fn main() {
         )
         .method(
             Method::builder()
+                .name("tpm_state")
+                .route_name("TpmState")
+                .input_type("crate::firmware::TpmStateRequest")
+                .output_type("crate::firmware::UefiVarsChunk")
+                .codec_path("crate::codec::BinaryCodec")
+                .server_streaming()
+                .build(),
+        )
+        .method(
+            Method::builder()
+                .name("push_firmware")
+                .route_name("PushFirmware")
+                .input_type("crate::firmware::PushFirmwareRequest")
+                .output_type("crate::firmware::PushFirmwareReply")
+                .codec_path("crate::codec::BinaryCodec")
+                .build(),
+        )
+        .method(json(
+            "guest_agent",
+            "GuestAgent",
+            "crate::guest::GuestAgentRequest",
+            "crate::guest::GuestAgentReply",
+        ))
+        .method(
+            Method::builder()
                 .name("follow")
                 .route_name("Follow")
                 .input_type("crate::wire::FollowRequest")

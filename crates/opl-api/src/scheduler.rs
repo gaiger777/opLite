@@ -342,6 +342,18 @@ pub fn node_fits_with(
             "node {name:?} does not have a firewall (nftables) for the VM's security groups"
         ));
     }
+    // 계획 59: TPM·Secure Boot 능력. 능력을 알리지 않은 노드(옛 노드)는 없는 것으로 본다.
+    let caps = node.status.firmware_caps.unwrap_or_default();
+    if spec.tpm && !caps.tpm {
+        return Err(format!(
+            "node {name:?} has no swtpm for the VM's TPM (install swtpm and swtpm-tools)"
+        ));
+    }
+    if spec.secure_boot && !caps.secure_boot {
+        return Err(format!(
+            "node {name:?} has no Secure Boot firmware for the VM (install ovmf with Secure Boot keys)"
+        ));
+    }
     Ok(())
 }
 
@@ -1339,6 +1351,39 @@ mod tests {
         // 로컬 디스크가 없으면 계획이 비고, 풀을 줘도 그렇다.
         me.disks.clear();
         assert_eq!(disk_moves(&me, &inv, Some(&nas)), []);
+    }
+
+    /// TPM·Secure Boot VM은 그 능력을 알린 노드에만 놓는다(옛 노드는 능력이 없는 것으로 본다).
+    #[test]
+    fn tpm_and_secure_boot_vms_need_the_node_capabilities() {
+        use opl_types::node::FirmwareCaps;
+        let mut n = node(4096);
+        n.name = "a".into();
+        let inv = Inventory::default();
+        let mut me = spec(512, None, PowerState::Running);
+        me.firmware = opl_types::vm::Firmware::Uefi;
+        assert_eq!(node_fits(&me, &inv, &n), Ok(()));
+        me.tpm = true;
+        assert_eq!(
+            node_fits(&me, &inv, &n),
+            Err("node \"a\" has no swtpm for the VM's TPM (install swtpm and swtpm-tools)".into())
+        );
+        n.status.firmware_caps = Some(FirmwareCaps {
+            tpm: true,
+            secure_boot: false,
+        });
+        assert_eq!(node_fits(&me, &inv, &n), Ok(()));
+        me.secure_boot = true;
+        assert!(
+            node_fits(&me, &inv, &n)
+                .unwrap_err()
+                .contains("has no Secure Boot firmware"),
+        );
+        n.status.firmware_caps = Some(FirmwareCaps {
+            tpm: true,
+            secure_boot: true,
+        });
+        assert_eq!(node_fits(&me, &inv, &n), Ok(()));
     }
 
     #[test]

@@ -11,14 +11,14 @@ use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::runtime::{
     DiskKind, ImageFormat, NicBackend, RuntimeCdrom, RuntimeDisk, RuntimeMedium, RuntimeNic,
-    VmRuntimeSpec,
+    RuntimeTpm, VmRuntimeSpec,
 };
 use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, VolumeContent, VolumeSpec, pool_error_on,
     pool_holds_isos, pool_listed_on, pool_state_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{DiskMove, DiskSpec, RunningHardware, Vm, effective_boot};
+use opl_types::vm::{DiskMove, DiskSpec, RunningHardware, Vm, VmSpec, effective_boot};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -330,14 +330,18 @@ async fn resolve(
             let nics = hardware.map_or(&vm.spec.nics[..], |hw| hw.boot_nics());
             cloud_init::render(vm.id, &vm.name, ci, nics)
         }),
-        // TPM 상태를 얻는 곳(계획 59 `firmware::tpm_source`)은 뒤 스테이지에서 정한다.
-        tpm: None,
+        // TPM(계획 59)은 이 노드에 있는 상태로 켠다(`fresh: false` — 몰래 새로 만들지 않는다). 새로 켤 때는 작업자가 켜기
+        // 규칙(`firmware::tpm_source`)으로 상태를 얻은 뒤 바꾼다. 다시 붙거나 받을 때는 기록의 장치를 따른다.
+        tpm: (vm.spec.tpm || hardware.is_some_and(|hw| hw.tpm)).then_some(RuntimeTpm {
+            fresh: false,
+            epoch: vm.status.firmware_epoch,
+        }),
         secure_boot: vm.spec.secure_boot,
         freeze_fs: vm.spec.guest_agent.is_some_and(|g| g.freeze_fs),
     };
     set_boot_order(&mut spec);
     if let Some(hw) = hardware {
-        apply_hardware(&mut spec, hw);
+        apply_hardware(&mut spec, hw, &vm.spec);
     }
     Ok(spec)
 }
@@ -357,15 +361,31 @@ fn set_boot_order(spec: &mut VmRuntimeSpec) {
 }
 
 /// 런타임 정의를 실행 중 하드웨어 기록의 모양(켤 때의 cpu·메모리·펌웨어·머신과 핫플러그 배치, CD-ROM 부팅 순서,
-/// cloud-init 씨앗 드라이브 유무)으로 덮는다. 스펙은 실행 중에 바뀌어도(다음 재시작 때 적용) 마이그레이션 대상은 원본
+/// cloud-init 씨앗 드라이브 유무, TPM·Secure Boot·게스트 에이전트 채널)으로 덮는다. 스펙은 실행 중에 바뀌어도(다음 재시작 때 적용) 마이그레이션 대상은 원본
 /// QEMU와 같은 장치로 켜야 한다. CD 매체는 [`runtime_spec`]이 기록의 것으로 이미 풀었다(드라이브 수가 다르면 부팅
 /// 순서는 덮지 않는다).
-pub fn apply_hardware(spec: &mut VmRuntimeSpec, hw: &RunningHardware) {
+///
+/// 게스트 에이전트 채널: 계획 59 전 기록에는 `guest_agent`가 없다. VM 스펙에 `guest_agent`가 없고 기록이 거짓이면
+/// 채널은 실행 중에 바꿀 수 없는 `ha.guest_watch`가 정한 그대로라 `vm`의 채널로 본다(`hotplug::devices_match`와 같은 규칙).
+pub fn apply_hardware(spec: &mut VmRuntimeSpec, hw: &RunningHardware, vm: &VmSpec) {
     spec.cpu = hw.cpu.clone();
     spec.memory_mib = hw.memory_mib;
     spec.firmware = hw.firmware;
     spec.machine = hw.machine;
     spec.hotplug = hw.layout.clone();
+    // 장치 셋(계획 59). TPM이 기록에만 있으면 이 노드의 상태로 켠다(회차는 스펙에서 정한 값, 없으면 0).
+    spec.tpm = hw.tpm.then(|| {
+        spec.tpm.unwrap_or(RuntimeTpm {
+            fresh: false,
+            epoch: 0,
+        })
+    });
+    spec.secure_boot = hw.secure_boot;
+    spec.guest_agent = if vm.guest_agent.is_none() && !hw.guest_agent {
+        vm.agent_channel()
+    } else {
+        hw.guest_agent
+    };
     if !hw.cdroms.is_empty()
         && hw.cdroms.len() == spec.cdroms.len()
         && hw.disks.len() == spec.disks.len()

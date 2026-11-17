@@ -4,14 +4,16 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use opl_types::firmware::{TpmSource, firmware_copy_nodes, tpm_source, tpm_unavailable};
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
-use opl_types::runtime::VmRuntimeSpec;
+use opl_types::placement::HaGroupSpec;
+use opl_types::runtime::{RuntimeTpm, VmRuntimeSpec};
 use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::vm::{
-    Firmware, HaEvict, HaState, PendingChange, PendingReason, PowerState, RestartPolicy,
-    RunningHardware, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
+    AgentShutdown, Firmware, HaEvict, HaState, PendingChange, PendingReason, PowerState,
+    RestartPolicy, RunningHardware, Vm, VmHaStatus, VmPhase, VmSpec, VmStatus,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -20,6 +22,7 @@ use uuid::Uuid;
 
 use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
+use crate::firmware::FirmwareCopy;
 use crate::ha::ArmError;
 use crate::reconciler::{Held, Restores};
 use crate::replicas;
@@ -110,6 +113,23 @@ struct GuestAgent {
     next_ping: Instant,
 }
 
+/// 게스트 정보 수집(계획 59 §8)의 상태. 이 QEMU(`pid`)에서 에이전트가 답했는지는 에이전트 종료를 고를 때도 쓴다.
+struct GuestPoll {
+    /// 모으는 QEMU. 바뀌면(새로 띄움) 앞 정보를 지우고 처음부터 다시 모은다.
+    pid: u32,
+    /// 이 QEMU에서 에이전트가 한 번이라도 답했다.
+    answered: bool,
+    /// 다음으로 모을 때
+    next: Instant,
+}
+
+/// 이 노드의 TPM 상태 파일을 마지막으로 본 모습(크기·mtime)과 그 SHA-256
+struct TpmSeen {
+    len: u64,
+    modified: std::time::SystemTime,
+    sha256: String,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum StepError {
     #[error(transparent)]
@@ -178,6 +198,13 @@ pub(crate) struct Worker {
     agent: Option<GuestAgent>,
     /// 이 작업자가 켠 QEMU의 하드웨어(계획 54). status에 기록이 없는 도는 VM에 쓴다. QEMU가 없으면 None.
     started: Option<RunningHardware>,
+    /// 이 노드의 TPM 상태 파일을 마지막으로 본 모습(계획 59). 같으면 해시를 다시 셈하지 않는다.
+    tpm_seen: Option<TpmSeen>,
+    /// 다음으로 TPM 상태의 해시를 보고 펌웨어 사본을 밀어 둘 때([`Worker::sync_firmware`]). VM이 켜지거나 멈추면
+    /// 곧바로 본다.
+    firmware_sync_at: Instant,
+    /// 게스트 정보 수집 상태([`Worker::poll_guest`]). 에이전트 채널이 없거나 QEMU가 없으면 None.
+    guest: Option<GuestPoll>,
     wake_at: Option<Instant>,
 }
 
@@ -215,6 +242,9 @@ impl Worker {
             syncing: None,
             agent: None,
             started: None,
+            tpm_seen: None,
+            firmware_sync_at: Instant::now(),
+            guest: None,
             wake_at: None,
         }
     }
@@ -260,6 +290,10 @@ impl Worker {
     /// 뺀다. QEMU가 아직 돌면 남겨 리스가 끝났을 때 watchdog가 시간을 지키게 한다. reconciler가 멈춰
     /// 끝날 때는 그대로 둔다. VM은 계속 돌고, guard는 정상 종료 때 이 목록으로 watchdog를 멈출지 정한다.
     async fn exit(&self) {
+        // 게스트 정보는 다시 맡는 작업자가 다시 모은다(VM이 이 노드를 떠났으면 지운 채로 둔다).
+        if let Some(sink) = &self.config.guest_info {
+            sink.remove(self.id);
+        }
         let Some(guard) = &self.config.ha else { return };
         match self.cluster.get::<VmSpec>(self.id) {
             Ok(Some(vm)) if vm.spec.node == Some(self.config.node) => {}
@@ -329,7 +363,11 @@ impl Worker {
         if self.power_off.is_none() {
             let mut status = match self.evict(&vm).await? {
                 Some(status) => status,
-                None => self.reconcile(&mut vm).await?,
+                None => {
+                    let mut status = self.reconcile(&mut vm).await?;
+                    self.sync_firmware(&vm, &mut status).await;
+                    status
+                }
             };
             drop_stale_evict(&mut status, node, &vm.spec);
             if self.power_off.is_none() {
@@ -509,6 +547,7 @@ impl Worker {
     /// HA VM에서 뺀다.
     async fn unassigned(&mut self) -> Result<(), StepError> {
         self.started = None;
+        self.forget_guest();
         let mut actual = self.hv.inspect(self.id).await?;
         let fenced = actual.is_some()
             && self.ha_running
@@ -714,6 +753,7 @@ impl Worker {
         self.report_running(vm, actual.is_some());
         if actual.is_none() {
             self.agent = None;
+            self.forget_guest();
         }
         let mut status = vm.status.clone();
         status.node = Some(self.config.node);
@@ -725,6 +765,8 @@ impl Worker {
         let now = Instant::now();
         if std::mem::replace(&mut self.was_running, actual.is_some()) && actual.is_none() {
             self.awaiting_event = Some(now + EVENT_GRACE);
+            // 멈춘 VM의 TPM 상태를 곧바로 해시로 남긴다(계획 59 §5).
+            self.firmware_sync_at = now;
         }
         if actual.is_some() {
             self.disks_active = true;
@@ -827,6 +869,7 @@ impl Worker {
                 if self.guest_hung(vm, &state).await {
                     return self.restart_hung(vm, status).await;
                 }
+                self.poll_guest(vm, &state).await;
             }
             // 방금까지 돌던 VM이 사라졌다. 왜 꺼졌는지(게스트 종료, 크래시) 이벤트로 안 뒤에 움직인다.
             // 기다려도 오지 않으면(이벤트 유실) 원하는 상태대로 다시 시작한다.
@@ -920,12 +963,14 @@ impl Worker {
                         return Ok(status);
                     }
                     None => {
-                        // 요청이 실패해도(QMP로 다룰 수 없는 VM) acpi_timeout 뒤 강제 종료한다.
+                        // 요청이 실패해도(QMP로 다룰 수 없는 VM) acpi_timeout 뒤 강제 종료한다. 에이전트로 끄기로 했고
+                        // 에이전트가 이 QEMU에서 답한 적이 있으면 에이전트로 끈다(안 되면 드라이버가 ACPI로 넘어간다).
+                        let mode = self.stop_mode(vm, state.pid);
                         self.stop_requested = Some(now);
                         self.stopped_by_us = Some(now);
                         self.wake(now + self.config.acpi_timeout);
-                        if let Err(e) = self.hv.stop(self.id, StopMode::Acpi).await {
-                            tracing::warn!(vm = %self.id, error = %e, "ACPI shutdown request failed; will force after timeout");
+                        if let Err(e) = self.hv.stop(self.id, mode).await {
+                            tracing::warn!(vm = %self.id, error = %e, ?mode, "shutdown request failed; will force after timeout");
                         }
                     }
                     Some(at) if now >= at + self.config.acpi_timeout => {
@@ -1016,6 +1061,8 @@ impl Worker {
         self.was_running = true;
         self.fenced = false;
         self.report_running(vm, true);
+        // 새로 만든 TPM(`fresh`)이나 받아 온 상태의 해시를 곧바로 남긴다.
+        self.firmware_sync_at = Instant::now();
         // 이 노드의 변수 파일(받아 왔거나 로컬, 없으면 템플릿)로 켰다.
         self.own_firmware(vm, status);
         match self.hv.inspect(self.id).await? {
@@ -1104,7 +1151,16 @@ impl Worker {
         self.disks_active = true;
         // 방금 이 노드에서 켰다(배타).
         self.disks_shared = false;
-        self.fetch_firmware(vm).await;
+        // TPM 상태를 얻지 못하면(지금 것을 가진 노드가 모두 오프라인) 실패로 세지 않고 켜지 않은 채 다시 본다.
+        let tpm = match self.prepare_firmware(vm).await {
+            Ok(tpm) => tpm,
+            Err(reason) => {
+                tracing::warn!(vm = %self.id, error = %reason, "TPM state unavailable; not starting");
+                self.deactivate_disks(vm).await;
+                self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
+                return Ok(Start::NotStarted);
+            }
+        };
         // 켜기 문턱을 지난 뒤 여기까지 오는 사이 리스가 끝났거나 VM이 바뀌었을 수 있다.
         match self.ha_recheck(vm)? {
             Recheck::Go => {}
@@ -1141,7 +1197,14 @@ impl Worker {
             Some(tag) => self.snapshot_hardware(vm, tag),
             None => self.hardware_at_start(vm),
         };
-        apply_hardware(&mut spec, &hardware);
+        apply_hardware(&mut spec, &hardware, &vm.spec);
+        // 켜기 규칙으로 얻은 TPM 상태로 켠다(스냅샷 하드웨어에만 TPM이 있으면 이 노드의 상태 그대로).
+        if spec.tpm.is_some() {
+            spec.tpm = Some(tpm.unwrap_or(RuntimeTpm {
+                fresh: false,
+                epoch: vm.status.firmware_epoch,
+            }));
+        }
         let started = self.hv.start(&spec, restore.as_deref()).await;
         if started.is_err() {
             self.deactivate_disks(vm).await;
@@ -1327,6 +1390,262 @@ impl Worker {
             Err(e) => {
                 tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
             }
+        }
+    }
+
+    /// 멈춘 VM을 새로 켜기 전에 펌웨어 파일을 맞춘다(계획 59 §5의 켜기 규칙). TPM이 없는 VM은 UEFI 변수만 받아 온다
+    /// ([`Self::fetch_firmware`], 받지 못해도 켠다). TPM VM은 [`tpm_source`]를 따른다.
+    ///
+    /// - 이 노드의 상태가 지금 것이면(`firmware_node`이거나 해시가 같음) 그것으로 켜고, 변수는 지금처럼 받아 온다.
+    /// - 아니면 `firmware_node`, 그다음 온라인 사본 노드에서 TPM 상태(해시 확인)와 그 노드의 변수를 받는다.
+    /// - 기록된 TPM 상태가 없으면 새로 만든다(`fresh`, 이 노드에 파일이 있으면 그대로 쓴다).
+    /// - 그 밖이면 켜지 않는다: 남길 문구를 돌려준다(몰래 새 TPM으로 켜지 않는다).
+    async fn prepare_firmware(&mut self, vm: &Vm) -> Result<Option<RuntimeTpm>, String> {
+        if !vm.spec.tpm {
+            self.fetch_firmware(vm).await;
+            return Ok(None);
+        }
+        let epoch = vm.status.firmware_epoch;
+        let nodes = self
+            .cluster
+            .list::<NodeSpec>()
+            .map(|(_, nodes)| nodes)
+            .unwrap_or_default();
+        let local = match self.config.state_dir.clone() {
+            Some(dir) => self.tpm_hash(&dir).await.unwrap_or_else(|e| {
+                tracing::warn!(vm = %self.id, error = %e, "cannot read the TPM state on this node");
+                None
+            }),
+            None => None,
+        };
+        let from = match tpm_source(vm, self.config.node, local.as_deref(), &nodes) {
+            TpmSource::Local => {
+                self.fetch_firmware(vm).await;
+                return Ok(Some(RuntimeTpm {
+                    fresh: false,
+                    epoch,
+                }));
+            }
+            TpmSource::Fresh => {
+                self.fetch_firmware(vm).await;
+                return Ok(Some(RuntimeTpm { fresh: true, epoch }));
+            }
+            TpmSource::Unavailable(reason) => return Err(reason),
+            TpmSource::Fetch(from) => from,
+        };
+        let hash = vm.status.tpm_sha256.clone().unwrap_or_default();
+        if let Some(fetcher) = &self.config.firmware {
+            for node in from {
+                match fetcher.fetch_tpm(self.id, node, &hash, epoch).await {
+                    Ok(()) => {
+                        tracing::info!(vm = %self.id, from = %node, "fetched the TPM state");
+                        // 변수도 TPM 상태를 준 노드에서 받는다(사본은 둘을 함께 둔다).
+                        if vm.spec.firmware == Firmware::Uefi
+                            && let Err(e) = fetcher.fetch(self.id, node).await
+                        {
+                            tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
+                        }
+                        return Ok(Some(RuntimeTpm {
+                            fresh: false,
+                            epoch,
+                        }));
+                    }
+                    Err(e) => {
+                        tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch the TPM state");
+                    }
+                }
+            }
+        }
+        let holder = vm.status.firmware_node.map(|id| {
+            nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map_or_else(|| id.to_string(), |n| n.name.clone())
+        });
+        Err(tpm_unavailable(&vm.name, holder.as_deref()))
+    }
+
+    /// 이 노드에 있는 VM의 TPM 상태 파일의 SHA-256. 없으면 None이다. 크기·mtime이 지난번과 같으면 다시 셈하지 않는다.
+    async fn tpm_hash(&mut self, dir: &std::path::Path) -> std::io::Result<Option<String>> {
+        use sha2::{Digest, Sha256};
+        let path = opl_driver::tpm_state_path(dir, self.id);
+        let meta = match tokio::fs::metadata(&path).await {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.tpm_seen = None;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let (len, modified) = (meta.len(), meta.modified()?);
+        if let Some(seen) = &self.tpm_seen
+            && seen.len == len
+            && seen.modified == modified
+        {
+            return Ok(Some(seen.sha256.clone()));
+        }
+        let sha256 = hex::encode(Sha256::digest(tokio::fs::read(&path).await?));
+        self.tpm_seen = Some(TpmSeen {
+            len,
+            modified,
+            sha256: sha256.clone(),
+        });
+        Ok(Some(sha256))
+    }
+
+    /// TPM VM의 상태 파일을 가진 노드(`firmware_node`가 이 노드)에서 해시를 기록하고 사본을 밀어 둔다(계획 59 §5).
+    /// VM이 도는 동안은 `firmware_sync_interval`마다, 멈추거나 켜면 곧바로 본다. 해시가 바뀌면 `tpm_sha256`을 쓰고
+    /// `firmware_copies`를 비운 뒤 사본 대상([`firmware_copy_nodes`])에 다시 밀어 둔다. 꺼진 VM은 사본이 모두 있으면
+    /// 깨우지 않는다(파일이 바뀌지 않는다).
+    async fn sync_firmware(&mut self, vm: &Vm, status: &mut VmStatus) {
+        let node = self.config.node;
+        let tpm = vm.spec.tpm || status.hardware.as_ref().is_some_and(|hw| hw.tpm);
+        if !tpm || vm.spec.node != Some(node) || status.firmware_node != Some(node) {
+            return;
+        }
+        let Some(dir) = self.config.state_dir.clone() else {
+            return;
+        };
+        let now = Instant::now();
+        if now < self.firmware_sync_at {
+            if self.was_running {
+                self.wake(self.firmware_sync_at);
+            }
+            return;
+        }
+        self.firmware_sync_at = now + self.config.firmware_sync_interval;
+        match self.tpm_hash(&dir).await {
+            Ok(Some(hash)) if status.tpm_sha256.as_deref() != Some(hash.as_str()) => {
+                tracing::info!(vm = %self.id, sha256 = %hash, "recording the TPM state");
+                status.tpm_sha256 = Some(hash);
+                status.firmware_copies.clear();
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(vm = %self.id, error = %e, "cannot read the TPM state on this node");
+            }
+        }
+        let complete = self.push_copies(vm, status).await;
+        if self.was_running || !complete {
+            self.wake(self.firmware_sync_at);
+        }
+    }
+
+    /// 아직 사본이 없는 사본 대상에 이 노드의 펌웨어 파일을 밀어 두고 `firmware_copies`에 더한다. 모두 있으면 true다.
+    async fn push_copies(&self, vm: &Vm, status: &mut VmStatus) -> bool {
+        let (Some(fetcher), Some(hash)) = (&self.config.firmware, status.tpm_sha256.clone()) else {
+            return true;
+        };
+        let Ok((_, nodes)) = self.cluster.list::<NodeSpec>() else {
+            return false;
+        };
+        let group = vm
+            .spec
+            .ha
+            .as_ref()
+            .and_then(|ha| ha.group.as_deref())
+            .and_then(|name| self.cluster.get_by_name::<HaGroupSpec>(name).ok().flatten());
+        let mut current = vm.clone();
+        current.status = status.clone();
+        let targets = firmware_copy_nodes(&current, &nodes, group.as_ref().map(|g| &g.spec));
+        let mut complete = true;
+        for to in targets {
+            if status.firmware_copies.contains(&to) {
+                continue;
+            }
+            let copy = FirmwareCopy {
+                vm: self.id,
+                to,
+                sha256: hash.clone(),
+                epoch: status.firmware_epoch,
+                secure_boot: vm.spec.secure_boot,
+            };
+            match fetcher.push(&copy).await {
+                Ok(()) => {
+                    tracing::info!(vm = %self.id, to = %to, "pushed a firmware copy");
+                    status.firmware_copies.push(to);
+                }
+                Err(e) => {
+                    tracing::warn!(vm = %self.id, to = %to, error = %e, "cannot push a firmware copy; will retry");
+                    complete = false;
+                }
+            }
+        }
+        complete
+    }
+
+    /// 게스트 정보 수집(계획 59 §8): 에이전트 채널이 있는 VM의 에이전트에서 `guest_info_interval`마다 정보를 모아 캐시에
+    /// 둔다. 답하지 않으면 앞 정보를 그대로 둔다. VM이 실행 중이 아닌 동안(일시 정지 등)은 묻지 않는다.
+    async fn poll_guest(&mut self, vm: &Vm, state: &ActualState) {
+        if !vm.spec.agent_channel() {
+            self.forget_guest();
+            return;
+        }
+        let now = Instant::now();
+        let mut poll = match self.guest.take() {
+            Some(poll) if poll.pid == state.pid => poll,
+            stale => {
+                // 새 QEMU다: 앞 QEMU의 정보와 답한 기록을 버린다.
+                if stale.is_some()
+                    && let Some(sink) = &self.config.guest_info
+                {
+                    sink.remove(self.id);
+                }
+                GuestPoll {
+                    pid: state.pid,
+                    answered: false,
+                    next: now,
+                }
+            }
+        };
+        if now >= poll.next {
+            poll.next = now + self.config.guest_info_interval;
+            if state.status == RuntimeStatus::Running {
+                match self.hv.guest_info(self.id).await {
+                    Ok(info) => {
+                        poll.answered = true;
+                        if let Some(sink) = &self.config.guest_info {
+                            sink.put(self.id, info);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(vm = %self.id, error = %e, "cannot read guest information");
+                    }
+                }
+            }
+        }
+        self.wake(poll.next);
+        self.guest = Some(poll);
+    }
+
+    /// QEMU가 없거나 이 노드를 떠났다: 게스트 정보를 지운다.
+    fn forget_guest(&mut self) {
+        if self.guest.take().is_some()
+            && let Some(sink) = &self.config.guest_info
+        {
+            sink.remove(self.id);
+        }
+    }
+
+    /// 도는 VM(`pid`)을 끌 방법: `guest_agent.shutdown`이 에이전트이고 에이전트가 이 QEMU에서 답한 적이 있으면(게스트 정보
+    /// 수집이나 게스트 감시) 에이전트, 아니면 ACPI다.
+    fn stop_mode(&self, vm: &Vm, pid: u32) -> StopMode {
+        let agent = vm
+            .spec
+            .guest_agent
+            .is_some_and(|g| g.shutdown == AgentShutdown::Agent);
+        let answered = self
+            .guest
+            .as_ref()
+            .is_some_and(|g| g.pid == pid && g.answered)
+            || self
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.pid == pid && a.answered_once);
+        if agent && answered {
+            StopMode::Agent
+        } else {
+            StopMode::Acpi
         }
     }
 
@@ -1553,6 +1872,11 @@ impl Worker {
     /// 리더가 쓴다). 복제본으로 한 HA 복구 기록(`last_recovery`)은 리더만 쓰므로 늘 저장소의 것이다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
+        // TPM 해시와 사본은 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다(사본 밀어 두기·마이그레이션 확정·초기화가
+        // 쓴다). 그 사이 초기화됐으면(회차가 바뀜) 이 작업자가 바꿨어도 저장소의 것이다. 회차는 늘 저장소의 것이다.
+        let keep_tpm = status.tpm_sha256 == vm.status.tpm_sha256
+            && status.firmware_copies == vm.status.firmware_copies;
+        let read_epoch = vm.status.firmware_epoch;
         let keep_hardware = status.hardware == vm.status.hardware;
         let keep_replication = status.replication == vm.status.replication;
         let read_ha = vm.status.ha.clone().unwrap_or_default();
@@ -1563,6 +1887,11 @@ impl Worker {
             if keep_firmware {
                 status.firmware_node = vm.status.firmware_node;
             }
+            if keep_tpm || vm.status.firmware_epoch != read_epoch {
+                status.tpm_sha256 = vm.status.tpm_sha256.clone();
+                status.firmware_copies = vm.status.firmware_copies.clone();
+            }
+            status.firmware_epoch = vm.status.firmware_epoch;
             if keep_hardware {
                 status.hardware = vm.status.hardware.clone();
             }

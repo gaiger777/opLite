@@ -125,6 +125,14 @@ pub struct HypervisorSection {
     /// QEMU를 `systemd-run --scope`로 감싼다(VM마다 cgroup). Linux에서 기본으로 켠다.
     #[serde(default = "default_systemd_scope")]
     pub systemd_scope: bool,
+    /// swtpm 실행 파일(계획 59, VM의 TPM). 기본은 `PATH`의 `swtpm`이다.
+    pub swtpm: Option<PathBuf>,
+    /// swtpm_setup 실행 파일(새 TPM의 EK·인증서). 기본은 `PATH`의 `swtpm_setup`이다.
+    pub swtpm_setup: Option<PathBuf>,
+    /// Secure Boot 펌웨어 코드와 MS 키를 등록한 변수 템플릿(둘 다 주거나 둘 다 생략). 기본은 QEMU 펌웨어 descriptor로
+    /// 찾은 것이다.
+    pub secure_boot_code: Option<PathBuf>,
+    pub secure_boot_vars: Option<PathBuf>,
 }
 
 impl Default for HypervisorSection {
@@ -135,6 +143,10 @@ impl Default for HypervisorSection {
             uefi_code: None,
             uefi_vars: None,
             systemd_scope: default_systemd_scope(),
+            swtpm: None,
+            swtpm_setup: None,
+            secure_boot_code: None,
+            secure_boot_vars: None,
         }
     }
 }
@@ -1345,6 +1357,12 @@ impl Config {
         if self.hypervisor.systemd_scope && !linux {
             anyhow::bail!("systemd_scope needs Linux; set it to false");
         }
+        if self.hypervisor.secure_boot_code.is_some() != self.hypervisor.secure_boot_vars.is_some()
+        {
+            anyhow::bail!(
+                "hypervisor.secure_boot_code and hypervisor.secure_boot_vars go together; set both or neither"
+            );
+        }
         if self.schedule.tick_secs == 0 || self.schedule.hour_secs == 0 {
             anyhow::bail!("schedule.tick_secs and schedule.hour_secs must be at least 1");
         }
@@ -1487,7 +1505,25 @@ impl Config {
         if let Some(vars) = &h.uefi_vars {
             profile.uefi_vars_template = vars.clone();
         }
+        if let (Some(code), Some(vars)) = (&h.secure_boot_code, &h.secure_boot_vars) {
+            profile.secure_boot = Some(opl_qemu::FirmwarePair {
+                code: code.clone(),
+                vars_template: vars.clone(),
+            });
+        }
         Ok(profile)
+    }
+
+    /// swtpm 실행 파일(`[hypervisor] swtpm`·`swtpm_setup`, 없으면 `PATH`의 이름)
+    pub fn swtpm(&self) -> opl_driver::SwtpmConfig {
+        let mut swtpm = opl_driver::SwtpmConfig::default();
+        if let Some(path) = &self.hypervisor.swtpm {
+            swtpm.swtpm = path.clone();
+        }
+        if let Some(path) = &self.hypervisor.swtpm_setup {
+            swtpm.swtpm_setup = path.clone();
+        }
+        swtpm
     }
 
     /// 클러스터에 알리는 API 주소
@@ -2450,6 +2486,33 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// swtpm 경로와 Secure Boot 펌웨어(둘 다 주거나 둘 다 생략)를 고칠 수 있다.
+    #[test]
+    fn hypervisor_section_sets_swtpm_and_secure_boot_firmware() {
+        let c = parse("name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = false");
+        assert_eq!(c.swtpm(), opl_driver::SwtpmConfig::default());
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = false\n\
+             swtpm = \"/opt/swtpm/bin/swtpm\"\nswtpm_setup = \"/opt/swtpm/bin/swtpm_setup\"\n\
+             secure_boot_code = \"/fw/code.secboot.fd\"\nsecure_boot_vars = \"/fw/vars.ms.fd\"",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.swtpm().swtpm, Path::new("/opt/swtpm/bin/swtpm"));
+        assert_eq!(
+            c.swtpm().swtpm_setup,
+            Path::new("/opt/swtpm/bin/swtpm_setup")
+        );
+        let sb = c.host_profile().unwrap().secure_boot.unwrap();
+        assert_eq!(sb.code, Path::new("/fw/code.secboot.fd"));
+        assert_eq!(sb.vars_template, Path::new("/fw/vars.ms.fd"));
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[hypervisor]\nsystemd_scope = false\n\
+             secure_boot_code = \"/fw/code.secboot.fd\"",
+        );
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("set both or neither"), "{err}");
     }
 
     #[test]

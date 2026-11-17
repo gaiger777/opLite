@@ -241,8 +241,8 @@ async fn record_node(
             interfaces: std::mem::take(&mut status.interfaces),
             checks: std::mem::take(&mut status.checks),
             hotplug: Some(host.hotplug),
-            // 펌웨어 능력(계획 59)은 아직 살피지 않는다(뒤 스테이지에서 채운다).
-            firmware_caps: None,
+            // 드라이버가 살핀 TPM·Secure Boot 능력(계획 59). 위트니스는 없다.
+            firmware_caps: Some(host.firmware_caps),
         };
         true
     })
@@ -677,6 +677,24 @@ pub(crate) mod tests {
         register_node(&cluster, &config, &host).await.unwrap();
         let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
         assert_eq!(node.status.hotplug, Some(host.hotplug));
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 드라이버가 읽은 TPM·Secure Boot 능력을 기록한다(계획 59).
+    #[tokio::test]
+    async fn registration_records_the_firmware_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        host.firmware_caps = opl_types::node::FirmwareCaps {
+            tpm: true,
+            secure_boot: false,
+        };
+        register_node(&cluster, &config, &host).await.unwrap();
+        let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
+        assert_eq!(node.status.firmware_caps, Some(host.firmware_caps));
         cluster.shutdown().await.unwrap();
     }
 

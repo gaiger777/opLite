@@ -10,10 +10,11 @@ use futures_util::stream::BoxStream;
 use openraft::Raft;
 use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_cluster::{Cluster, FollowFrame, FollowGate};
-use opl_driver::{DriverError, Hypervisor, uefi_vars_path};
+use opl_driver::{DriverError, Hypervisor, tpm_state_path, uefi_vars_path};
 use opl_types::audit::AuditQuery;
 use opl_types::metrics::MetricsQuery;
 use opl_types::placement::PlacementStatus;
+use opl_types::vm::VmSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixStream};
 use tokio::runtime::Handle;
@@ -28,7 +29,13 @@ use crate::ceph::{
     CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, NodeDisksRequest,
 };
 use crate::fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
-use crate::firmware::{UefiVarsChunk, UefiVarsRequest};
+use crate::firmware::{
+    PushFirmwareReply, PushFirmwareRequest, TpmStateRequest, UefiVarsChunk, UefiVarsRequest,
+    VarsTemplates,
+};
+use crate::guest::{
+    GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
+};
 use crate::metrics::{MetricsReply, MetricsSource};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
@@ -59,8 +66,12 @@ pub struct PeerService {
     fence: Option<Arc<dyn FenceSource>>,
     placement: Option<Arc<dyn PlacementSource>>,
     ceph: Option<Arc<dyn CephSource>>,
-    /// 드라이버의 `state_dir`. UEFI 변수 파일을 여기서 찾아 보낸다.
+    /// 드라이버의 `state_dir`. UEFI 변수·TPM 상태 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
+    /// 펌웨어 사본(`PushFirmware`)을 받을 때 변수 파일의 크기를 견줄 템플릿. 없으면 받지 않는다.
+    firmware_copies: Option<VarsTemplates>,
+    /// 이 노드에서 도는 VM의 게스트 에이전트(계획 59). 없으면 `unimplemented`로 거부한다(옛 노드와 같다).
+    guest: Option<Arc<dyn GuestAgentSource>>,
     /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
     /// 실행기. 없으면 서버의 실행기에서 돈다.
     work: Option<Handle>,
@@ -80,6 +91,8 @@ impl PeerService {
             placement: None,
             ceph: None,
             state_dir: None,
+            firmware_copies: None,
+            guest: None,
             work: None,
         }
     }
@@ -94,6 +107,19 @@ impl PeerService {
     /// 드라이버의 `state_dir`에 있는 VM의 UEFI 변수 파일을 보낸다. 없으면 보내기 요청을 거부한다.
     pub fn with_uefi_vars(mut self, state_dir: impl Into<PathBuf>) -> Self {
         self.state_dir = Some(state_dir.into());
+        self
+    }
+
+    /// 다른 노드가 밀어 두는 펌웨어 사본(TPM 상태 + UEFI 변수)을 `with_uefi_vars`의 `state_dir`에 받는다. 변수 파일의
+    /// 크기는 `templates`와 견준다. 없으면 받기 요청을 `unimplemented`로 거부한다.
+    pub fn with_firmware_copies(mut self, templates: VarsTemplates) -> Self {
+        self.firmware_copies = Some(templates);
+        self
+    }
+
+    /// 이 노드에서 도는 VM의 게스트 정보 읽기·비밀번호 설정을 `source`로 한다. 없으면 `unimplemented`로 거부한다.
+    pub fn with_guest_agent(mut self, source: Arc<dyn GuestAgentSource>) -> Self {
+        self.guest = Some(source);
         self
     }
 
@@ -467,6 +493,116 @@ impl Peer for PeerService {
             })
             .await??;
         Ok(Response::new(stream))
+    }
+
+    type TpmStateStream = ReceiverStream<Result<UefiVarsChunk, Status>>;
+
+    async fn tpm_state(
+        &self,
+        req: Request<TpmStateRequest>,
+    ) -> Result<Response<Self::TpmStateStream>, Status> {
+        self.authorize(&req)?;
+        let dir = self
+            .state_dir
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not serve TPM state"))?;
+        let vm = req.into_inner().vm;
+        let stream = self
+            .offload(async move {
+                let file = match tokio::fs::File::open(tpm_state_path(&dir, vm)).await {
+                    Ok(file) => file,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(Status::not_found(format!(
+                            "no TPM state for VM {vm} on this node"
+                        )));
+                    }
+                    Err(e) => {
+                        return Err(Status::internal(format!(
+                            "cannot open the TPM state of VM {vm}: {e}"
+                        )));
+                    }
+                };
+                let (tx, rx) = mpsc::channel(4);
+                tokio::spawn(crate::firmware::send_file(file, tx));
+                Ok(ReceiverStream::new(rx))
+            })
+            .await??;
+        Ok(Response::new(stream))
+    }
+
+    async fn push_firmware(
+        &self,
+        req: Request<PushFirmwareRequest>,
+    ) -> Result<Response<PushFirmwareReply>, Status> {
+        self.authorize(&req)?;
+        let (Some(dir), Some(templates)) = (self.state_dir.clone(), self.firmware_copies.clone())
+        else {
+            return Err(Status::unimplemented(
+                "this node does not keep firmware copies",
+            ));
+        };
+        let req = req.into_inner();
+        let vm = req.vm;
+        // 이 노드가 지금 것을 가졌으면(VM이 여기서 돌거나 `firmware_node`) 낡을 수 있는 사본으로 덮지 않는다.
+        let me = self.cluster.id().0;
+        let holder = self
+            .cluster
+            .get::<VmSpec>(vm)
+            .map_err(|e| Status::unavailable(e.to_string()))?
+            .and_then(|v| v.status.firmware_node);
+        if holder == Some(me) {
+            return Err(Status::failed_precondition(format!(
+                "this node holds the current firmware files of VM {vm}"
+            )));
+        }
+        let hv = self.hv.clone();
+        self.offload(async move {
+            if let Some(hv) = hv
+                && hv
+                    .inspect(vm)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .is_some()
+            {
+                return Err(Status::failed_precondition(format!(
+                    "VM {vm} is running on this node"
+                )));
+            }
+            crate::firmware::receive_push(&dir, &templates, req).await
+        })
+        .await??;
+        Ok(Response::new(PushFirmwareReply))
+    }
+
+    async fn guest_agent(
+        &self,
+        req: Request<GuestAgentRequest>,
+    ) -> Result<Response<GuestAgentReply>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .guest
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not serve the guest agent"))?;
+        let GuestAgentRequest { vm, op } = req.into_inner();
+        let reply = self
+            .offload(async move {
+                match op {
+                    GuestAgentOp::Info { refresh } => GuestAgentReply {
+                        info: Some(source.info(vm, refresh).await),
+                        error: None,
+                    },
+                    GuestAgentOp::SetPassword { user, password } => {
+                        let error =
+                            match opl_types::guest::validate_guest_password(&user, &password) {
+                                Err(e) => Some(GuestAgentError::Invalid(e.to_string())),
+                                Ok(()) => source.set_password(vm, &user, &password).await.err(),
+                            };
+                        GuestAgentReply { info: None, error }
+                    }
+                }
+            })
+            .await?;
+        Ok(Response::new(reply))
     }
 
     type FollowStream = BoxStream<'static, Result<FollowFrame, Status>>;

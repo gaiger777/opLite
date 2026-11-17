@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use opl_driver::{Firewall, HostNet, IpRoute, Nft, QemuConfig};
 use opl_qemu::{Accel, HostProfile};
-use opl_types::node::{BridgeInfo, NodeHotplug};
+use opl_types::node::{BridgeInfo, FirmwareCaps, NodeHotplug};
 
 use crate::config::{AccelSetting, Config};
 
@@ -22,6 +22,13 @@ pub struct Host {
     ///
     /// [`Hypervisor::hotplug_caps`]: opl_driver::Hypervisor::hotplug_caps
     pub hotplug: NodeHotplug,
+    /// 이 노드의 TPM·Secure Boot 능력(계획 59). 드라이버를 만든 뒤 한 번 읽는다([`Hypervisor::firmware_caps`]). 그 전에는
+    /// 아무것도 없다.
+    ///
+    /// [`Hypervisor::firmware_caps`]: opl_driver::Hypervisor::firmware_caps
+    pub firmware_caps: FirmwareCaps,
+    /// swtpm 실행 파일(`[hypervisor] swtpm`·`swtpm_setup`)
+    pub swtpm: opl_driver::SwtpmConfig,
 }
 
 impl Host {
@@ -46,6 +53,8 @@ impl Host {
             firewall: None,
             systemd_scope: config.hypervisor.systemd_scope,
             hotplug: NodeHotplug::default(),
+            firmware_caps: FirmwareCaps::default(),
+            swtpm: config.swtpm(),
         })
     }
 
@@ -65,7 +74,7 @@ impl Host {
             state_dir: config.data_dir.clone(),
             net: self.net.clone(),
             systemd_scope: self.systemd_scope,
-            swtpm: Default::default(),
+            swtpm: self.swtpm.clone(),
         }
     }
 

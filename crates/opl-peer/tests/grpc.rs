@@ -11,7 +11,7 @@ use openraft::raft::VoteRequest;
 use openraft::{ServerState, Vote};
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{Cluster, ClusterConfig, FollowClient, FollowFrame, Forwarder, NodeRole};
-use opl_driver::{Hypervisor, MockHypervisor, uefi_vars_path};
+use opl_driver::{Hypervisor, MockHypervisor, read_firmware_epoch, tpm_state_path, uefi_vars_path};
 use opl_peer::pki::{ClusterCa, NodeTls, api_cert, node_key_and_csr};
 use opl_peer::{
     AuditSource, CephSource, FenceSource, GrpcNetwork, IncomingDisk, IncomingError,
@@ -20,6 +20,10 @@ use opl_peer::{
     PlacementSource, PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError,
     ReplicaFinishRequest, ReplicaPrepareRequest, ReplicaPrepareResponse, ReplicaReceiver,
     UefiVarsError, renew_liveness,
+};
+use opl_peer::{
+    GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
+    PushFirmwareRequest, TpmStateError, UefiVarsChunk, VarsTemplates, sha256_hex,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::ceph::{CephReport, DiskState, NodeDisk};
@@ -2584,4 +2588,332 @@ async fn a_forwarded_write_fails_over_from_a_link_that_never_connects() {
         )
         .await
         .unwrap();
+}
+
+/// 노드 둘(`nodes[0]`은 멤버, `target`은 `configure`로 고친 서비스로 learner로 더한 노드)
+async fn with_target(
+    configure: impl FnOnce(PeerService) -> PeerService,
+) -> (ClusterCa, TempDir, Vec<Node>, Node) {
+    let (ca, root, nodes) = start(1).await;
+    let target = Node::start_serving(&ca, &root, configure).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let source = nodes[0].id();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(source) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    (ca, root, nodes, target)
+}
+
+/// TPM 상태는 해시가 맞을 때만 0600으로 바꾸고, 다르면 받는 쪽 파일은 그대로다.
+#[tokio::test]
+async fn tpm_state_is_fetched_only_when_its_hash_matches() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_ca, _root, nodes) = start(2).await;
+    let (from, to) = (&nodes[1], &nodes[0]);
+    let vm = Uuid::now_v7();
+    let state = b"permall-bytes".repeat(1000);
+    let src = tpm_state_path(&from.state_dir, vm);
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    std::fs::write(&src, &state).unwrap();
+    let dest = tpm_state_path(&to.state_dir, vm);
+
+    let len = to
+        .peers
+        .tpm_state(from.id(), &from.addr, vm, &dest, &sha256_hex(&state))
+        .await
+        .unwrap();
+    assert_eq!(len, state.len() as u64);
+    assert_eq!(std::fs::read(&dest).unwrap(), state);
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&dest), 0o600);
+    assert_eq!(mode(dest.parent().unwrap()), 0o700);
+
+    // 해시가 다르면 버린다.
+    std::fs::write(&src, b"changed").unwrap();
+    let err = to
+        .peers
+        .tpm_state(from.id(), &from.addr, vm, &dest, &sha256_hex(&state))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, TpmStateError::Invalid(m) if m.contains("SHA-256")),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), state);
+    assert_eq!(
+        std::fs::read_dir(dest.parent().unwrap()).unwrap().count(),
+        1
+    );
+
+    // 없으면 NotFound다.
+    let err = to
+        .peers
+        .tpm_state(
+            from.id(),
+            &from.addr,
+            Uuid::now_v7(),
+            &dest,
+            &sha256_hex(b""),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, TpmStateError::NotFound);
+}
+
+/// 밀어 둔 사본은 TPM 해시와 변수 크기가 맞을 때 두고 회차를 적는다. 해시가 다르거나 VM이 그 노드에서 돌면 거절한다.
+#[tokio::test]
+async fn firmware_copies_are_checked_before_they_are_kept() {
+    let templates = TempDir::new().unwrap();
+    let uefi = templates.path().join("vars.fd");
+    std::fs::write(&uefi, vec![0u8; 4096]).unwrap();
+    let t = VarsTemplates {
+        uefi: uefi.clone(),
+        secure_boot: None,
+    };
+    let (_ca, _root, nodes, target) = with_target(|s| s.with_firmware_copies(t)).await;
+    let vm = Uuid::now_v7();
+    let tpm = bytes::Bytes::from_static(b"tpm-state");
+    let mut vars = vec![0u8; 4096];
+    vars[10] = 1;
+    let push =
+        |sha256: String, vars: Option<Vec<UefiVarsChunk>>, secure_boot: bool| PushFirmwareRequest {
+            vm,
+            epoch: 3,
+            secure_boot,
+            sha256,
+            tpm: tpm.clone(),
+            vars,
+        };
+    let peers = &nodes[0].peers;
+    peers
+        .push_firmware(
+            target.id(),
+            &target.addr,
+            push(
+                sha256_hex(&tpm),
+                Some(vec![UefiVarsChunk::of(&vars)]),
+                false,
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(tpm_state_path(&target.state_dir, vm)).unwrap(),
+        &tpm[..]
+    );
+    assert_eq!(
+        std::fs::read(uefi_vars_path(&target.state_dir, vm)).unwrap(),
+        vars
+    );
+    assert_eq!(read_firmware_epoch(&target.state_dir, vm).unwrap(), 3);
+
+    // 해시가 다르다.
+    let err = peers
+        .push_firmware(
+            target.id(),
+            &target.addr,
+            push(sha256_hex(b"other"), None, false),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, TpmStateError::Invalid(m) if m.contains("SHA-256")),
+        "{err:?}"
+    );
+    // 변수 크기가 이 노드의 템플릿과 다르다. Secure Boot 펌웨어가 없는 노드는 그 변수를 받지 않는다.
+    let err = peers
+        .push_firmware(
+            target.id(),
+            &target.addr,
+            push(sha256_hex(&tpm), Some(vec![UefiVarsChunk::Zero(10)]), false),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, TpmStateError::Invalid(m) if m.contains("4096")),
+        "{err:?}"
+    );
+    let err = peers
+        .push_firmware(
+            target.id(),
+            &target.addr,
+            push(
+                sha256_hex(&tpm),
+                Some(vec![UefiVarsChunk::Zero(4096)]),
+                true,
+            ),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, TpmStateError::Invalid(m) if m.contains("Secure Boot")),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read(uefi_vars_path(&target.state_dir, vm)).unwrap(),
+        vars
+    );
+
+    // 그 노드에서 도는 VM에는 두지 않는다.
+    let spec: VmRuntimeSpec = serde_json::from_value(serde_json::json!({
+        "id": vm, "name": "win", "cpu": {"sockets": 1, "cores": 1}, "memory_mib": 256,
+        "firmware": "uefi", "machine": "virt", "disks": [], "nics": []
+    }))
+    .unwrap();
+    target.hv.start(&spec, None).await.unwrap();
+    let err = peers
+        .push_firmware(
+            target.id(),
+            &target.addr,
+            push(sha256_hex(&tpm), None, false),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, TpmStateError::Invalid(m) if m.contains("running")),
+        "{err:?}"
+    );
+
+    // 사본을 받지 않는 노드(옛 노드)는 Unsupported다.
+    let err = target
+        .peers
+        .push_firmware(
+            nodes[0].id(),
+            &nodes[0].addr,
+            push(sha256_hex(&tpm), None, false),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, TpmStateError::Unsupported);
+}
+
+/// 받은 요청을 적는 게스트 에이전트
+#[derive(Default)]
+struct FakeGuest {
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl GuestAgentSource for FakeGuest {
+    async fn info(&self, vm: Uuid, refresh: bool) -> opl_types::guest::GuestInfoResponse {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("info {vm} {refresh}"));
+        opl_types::guest::GuestInfoResponse {
+            state: opl_types::guest::GuestInfoState::Answered,
+            info: Some(opl_types::guest::GuestInfo {
+                hostname: Some("win".into()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn set_password(
+        &self,
+        _vm: Uuid,
+        user: &str,
+        _password: &str,
+    ) -> Result<(), GuestAgentError> {
+        self.calls.lock().unwrap().push(format!("password {user}"));
+        if user == "nobody" {
+            return Err(GuestAgentError::Unavailable("timed out".into()));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn guest_agent_requests_reach_the_node_running_the_vm() {
+    let guest = Arc::new(FakeGuest::default());
+    let g = guest.clone();
+    let (_ca, _root, nodes, target) =
+        with_target(move |s| s.with_guest_agent(g as Arc<dyn GuestAgentSource>)).await;
+    let vm = Uuid::now_v7();
+    let peers = &nodes[0].peers;
+    let ask = |op| GuestAgentRequest { vm, op };
+    let reply = peers
+        .guest_agent(
+            target.id(),
+            &target.addr,
+            ask(GuestAgentOp::Info { refresh: true }),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.info.unwrap().info.unwrap().hostname.as_deref(),
+        Some("win")
+    );
+    let set = |user: &str, password: &str| {
+        ask(GuestAgentOp::SetPassword {
+            user: user.into(),
+            password: password.into(),
+        })
+    };
+    assert_eq!(
+        peers
+            .guest_agent(
+                target.id(),
+                &target.addr,
+                set("Administrator", "s3cret"),
+                WAIT
+            )
+            .await
+            .unwrap(),
+        GuestAgentReply {
+            info: None,
+            error: None
+        }
+    );
+    let reply = peers
+        .guest_agent(target.id(), &target.addr, set("nobody", "s3cret"), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.error,
+        Some(GuestAgentError::Unavailable("timed out".into()))
+    );
+    // 잘못된 비밀번호는 받는 쪽이 에이전트에 보내기 전에 거절한다.
+    let reply = peers
+        .guest_agent(target.id(), &target.addr, set("Administrator", ""), WAIT)
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply.error, Some(GuestAgentError::Invalid(_))),
+        "{reply:?}"
+    );
+    assert_eq!(
+        *guest.calls.lock().unwrap(),
+        [
+            format!("info {vm} true"),
+            "password Administrator".into(),
+            "password nobody".into()
+        ]
+    );
+    // 게스트 에이전트를 모르는 노드는 Unsupported다.
+    let err = target
+        .peers
+        .guest_agent(
+            nodes[0].id(),
+            &nodes[0].addr,
+            ask(GuestAgentOp::Info { refresh: false }),
+            WAIT,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, GuestAgentError::Unsupported);
 }
