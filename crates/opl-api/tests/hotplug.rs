@@ -73,6 +73,7 @@ async fn setup_with(
                 size_bytes: 1 << 20,
                 format: ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         volume.status.phase = VolumePhase::Ready;
@@ -1394,6 +1395,7 @@ async fn iso(env: &Env, name: &str) -> Uuid {
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: VolumeContent::Iso,
+            base: None,
         },
     );
     volume.status.phase = VolumePhase::Ready;

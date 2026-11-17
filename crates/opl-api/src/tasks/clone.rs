@@ -171,6 +171,7 @@ pub(super) async fn clone(
                 size_bytes: source.spec.size_bytes,
                 format,
                 content: Default::default(),
+                base: None,
             },
         );
         copy.status.node = Some(ctx.config.node);

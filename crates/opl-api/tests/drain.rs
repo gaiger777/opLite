@@ -108,6 +108,7 @@ async fn running_vm(env: &Env, admin: &Client, name: &str, pool: &str, shared: b
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(env.node);
@@ -561,6 +562,7 @@ async fn vms_with_a_local_iso_are_reported() {
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: VolumeContent::Iso,
+            base: None,
         },
     );
     iso.status.node = Some(env.node);

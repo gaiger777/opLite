@@ -1011,6 +1011,7 @@ mod tests {
                 replication: Vec::new(),
                 cdroms: vec![],
                 cloud_init: None,
+                template: false,
             },
         );
         v.status.phase = VmPhase::Running;
@@ -1049,6 +1050,7 @@ mod tests {
                 size_bytes: 1,
                 format: ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         )
     }

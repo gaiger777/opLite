@@ -78,6 +78,11 @@ pub struct VmSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cloud_init: Option<CloudInit>,
+    /// 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
+    /// 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub template: bool,
 }
 
 /// VM의 최적 배치 옵션
@@ -2225,5 +2230,25 @@ mod tests {
             effective_boot(&[None], &[Some(255)]),
             (vec![None], vec![Some(255)])
         );
+    }
+
+    /// `template`이 거짓이면 옛 VM 그대로 쓰고, 참이면 왕복한다.
+    #[test]
+    fn template_is_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert!(!spec.template);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+
+        let mut json = sample_json();
+        json["power"] = "stopped".into();
+        json["template"] = true.into();
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert!(spec.template);
+        assert_eq!(serde_json::to_value(&spec).unwrap()["template"], true);
+        let back: VmSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back, spec);
+
+        json["template"] = "yes".into();
+        assert!(serde_json::from_value::<VmSpec>(json).is_err());
     }
 }

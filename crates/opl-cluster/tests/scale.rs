@@ -466,6 +466,7 @@ fn volume(i: usize) -> Typed<VolumeSpec> {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     )
 }

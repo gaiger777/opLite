@@ -71,6 +71,7 @@ async fn setup() -> Setup {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(source.id);
@@ -655,6 +656,7 @@ impl Setup {
                 size_bytes: LOCAL_SIZE,
                 format: ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         volume.status.node = Some(self.source);

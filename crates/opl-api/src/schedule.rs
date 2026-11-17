@@ -427,6 +427,7 @@ mod tests {
                 replication: Vec::new(),
                 cdroms: vec![],
                 cloud_init: None,
+                template: false,
             },
         );
         vm.status.phase = VmPhase::Running;
@@ -748,6 +749,8 @@ mod tests {
                 name: "copy".into(),
                 snapshot: None,
                 pool: None,
+                linked: None,
+                overrides: None,
             },
         ] {
             for state in [TaskState::Pending, TaskState::Running] {

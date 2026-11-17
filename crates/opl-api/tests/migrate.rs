@@ -96,6 +96,7 @@ async fn ready_volume(env: &Env, pool: &str, name: &str) {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(env.node);
@@ -772,6 +773,7 @@ async fn ready_iso(env: &Env, pool: &str, name: &str) {
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: VolumeContent::Iso,
+            base: None,
         },
     );
     volume.status.node = Some(env.node);

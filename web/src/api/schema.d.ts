@@ -2431,6 +2431,29 @@ export interface components {
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
         };
+        /** @description 카탈로그 이미지 하나 */
+        CatalogImage: {
+            arch: components["schemas"]["Arch"];
+            checksum: components["schemas"]["Checksum"];
+            /** @description cloud-init 기본 사용자 이름(예: `ubuntu`) */
+            default_user?: string;
+            firmware: components["schemas"]["Firmware"];
+            /** @description 항목 id(소문자·숫자·`.`·`_`·`-`, 63자까지). 아키텍처마다 같은 id를 쓴다. */
+            id: string;
+            /**
+             * Format: int64
+             * @description 이미지의 디스크 크기(가상 크기, 바이트). 모르면 0이다.
+             */
+            min_size_bytes?: number;
+            /** @description 배포판(예: `ubuntu`) */
+            os: string;
+            /** @description `qcow2` 또는 `raw` */
+            source_format: components["schemas"]["SourceFormat"];
+            title: string;
+            /** @description 이미지 URL(`http`·`https`) */
+            url: string;
+            version: string;
+        };
         CdromMediaRequest: {
             /**
              * Format: int32
@@ -2638,6 +2661,43 @@ export interface components {
          * @enum {string}
          */
         CheckState: "ok" | "degraded" | "failing" | "unknown";
+        /** @description 받은 이미지를 확인하는 방법 */
+        Checksum: {
+            /** @enum {string} */
+            kind: "sha256";
+            value: string;
+        } | {
+            /** @enum {string} */
+            kind: "sha512";
+            value: string;
+        } | {
+            /** @enum {string} */
+            kind: "sums";
+            url: string;
+        };
+        /** @description 배포(복제) 때 원본 스펙에서 바꾸는 값. 비어 있는 칸은 원본 그대로다. */
+        CloneOverrides: {
+            /** @description 주어진·비지 않은 칸만 원본의 cloud-init 설정을 바꾼다. 비밀번호는 crypt 해시다. */
+            cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 디스크 순번별 새 크기(바이트, 늘리기만). null은 그대로다. */
+            disks?: (number | null)[];
+            /** Format: int32 */
+            memory_mib?: number;
+            /** @description NIC 순번별 새 네트워크 이름. null은 그대로다. */
+            nics?: (string | null)[];
+            /**
+             * Format: uuid
+             * @description 새 VM을 켤 노드(`spec.node`). 디스크가 닿아야 한다.
+             */
+            node?: string;
+            /** @description 만든 뒤 켠다(`power: running`). */
+            start?: boolean;
+            /**
+             * Format: int32
+             * @description vCPU 수(소켓 하나에 코어로 둔다)
+             */
+            vcpus?: number;
+        };
         CloneRequest: {
             /** @description 새 VM의 이름 */
             name: string;
@@ -2934,6 +2994,11 @@ export interface components {
                 replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
+                /**
+                 * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
+                 *     않아 옛 노드도 VM을 푼다.
+                 */
+                template?: boolean;
             };
         };
         CreateRequest_VolumeSpec: {
@@ -2942,6 +3007,12 @@ export interface components {
             };
             name: string;
             spec: {
+                /**
+                 * Format: uuid
+                 * @description 연결 복제(계획 58)면 기반(템플릿 디스크) 볼륨의 id. 기반은 늘 같은 풀에 있다. 없으면 쓰지 않아 옛 노드도
+                 *     볼륨을 푼다.
+                 */
+                base?: string;
                 /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
                 content?: components["schemas"]["VolumeContent"];
                 format: components["schemas"]["ImageFormat"];
@@ -4373,6 +4444,11 @@ export interface components {
                     replication?: components["schemas"]["ReplicationTarget"][];
                     restart?: components["schemas"]["RestartPolicy"];
                     snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
+                    /**
+                     * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
+                     *     않아 옛 노드도 VM을 푼다.
+                     */
+                    template?: boolean;
                 };
                 /** @description VM의 실제 상태. reconciler만 기록한다. */
                 status: {
@@ -4445,6 +4521,12 @@ export interface components {
                  */
                 revision: number;
                 spec: {
+                    /**
+                     * Format: uuid
+                     * @description 연결 복제(계획 58)면 기반(템플릿 디스크) 볼륨의 id. 기반은 늘 같은 풀에 있다. 없으면 쓰지 않아 옛 노드도
+                     *     볼륨을 푼다.
+                     */
+                    base?: string;
                     /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
                     content?: components["schemas"]["VolumeContent"];
                     format: components["schemas"]["ImageFormat"];
@@ -6093,6 +6175,11 @@ export interface components {
                  */
                 ha_start_concurrency?: number;
                 /**
+                 * @description 이미지 라이브러리의 관리자 항목(계획 58, 200개까지, 내장 id와 겹치지 않게). 비어 있으면 쓰지 않아 옛 노드도
+                 *     설정을 계속 푼다.
+                 */
+                image_catalog?: components["schemas"]["CatalogImage"][];
+                /**
                  * @description 최적 배치(계획 53): 점수 정책과 균형 조정기. 없으면 기본값(`balance`, `recommend`, 15%)이고 쓰지 않아 옛
                  *     노드도 설정을 계속 푼다.
                  */
@@ -6343,6 +6430,11 @@ export interface components {
                 replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
+                /**
+                 * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
+                 *     않아 옛 노드도 VM을 푼다.
+                 */
+                template?: boolean;
             };
             /** @description VM의 실제 상태. reconciler만 기록한다. */
             status: {
@@ -6411,6 +6503,12 @@ export interface components {
              */
             revision: number;
             spec: {
+                /**
+                 * Format: uuid
+                 * @description 연결 복제(계획 58)면 기반(템플릿 디스크) 볼륨의 id. 기반은 늘 같은 풀에 있다. 없으면 쓰지 않아 옛 노드도
+                 *     볼륨을 푼다.
+                 */
+                base?: string;
                 /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
                 content?: components["schemas"]["VolumeContent"];
                 format: components["schemas"]["ImageFormat"];
@@ -6589,6 +6687,11 @@ export interface components {
              * @description 리더가 HA 복구 때 대상 노드 하나에 한꺼번에 옮겨 켜는 VM 수(1~32). 없으면 4이고 쓰지 않는다.
              */
             ha_start_concurrency?: number;
+            /**
+             * @description 이미지 라이브러리의 관리자 항목(계획 58, 200개까지, 내장 id와 겹치지 않게). 비어 있으면 쓰지 않아 옛 노드도
+             *     설정을 계속 푼다.
+             */
+            image_catalog?: components["schemas"]["CatalogImage"][];
             /**
              * @description 최적 배치(계획 53): 점수 정책과 균형 조정기. 없으면 기본값(`balance`, `recommend`, 15%)이고 쓰지 않아 옛
              *     노드도 설정을 계속 푼다.
@@ -6797,15 +6900,24 @@ export interface components {
             source: string;
             source_format: components["schemas"]["SourceFormat"];
         } | {
+            /** @description 체크섬 파일 URL(계획 58). 받기 전에 이 파일에서 이미지 파일 이름의 해시를 찾아 확인한다. */
+            checksum_url?: string;
             /** @enum {string} */
             kind: "volume-download";
             /** @description 받은 파일의 SHA-256(소문자 16진 64자). 없으면 확인하지 않는다. */
             sha256?: string;
+            /** @description 받은 파일의 SHA-512(소문자 16진 128자, 계획 58). `sha256`·`checksum_url`과 함께 쓰지 않는다. */
+            sha512?: string;
             source_format: components["schemas"]["SourceFormat"];
+            /** @description 가져오기가 끝나면 이 볼륨으로 만들 템플릿 VM(계획 58) */
+            template?: components["schemas"]["TemplateDraft"];
             url: string;
         } | {
             /** @enum {string} */
             kind: "volume-delete";
+        } | {
+            /** @enum {string} */
+            kind: "volume-flatten";
         } | {
             /** @enum {string} */
             kind: "snapshot-create";
@@ -6831,7 +6943,14 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "vm-clone";
+            /**
+             * @description 연결 복제(계획 58, 템플릿에서만): 없음 = 되는 디스크는 연결하고 안 되는 디스크는 전체 복사, 참 = 모두
+             *     연결(안 되면 실패), 거짓 = 전체 복사. 없으면 쓰지 않는다.
+             */
+            linked?: boolean;
             name: string;
+            /** @description 배포 때 바꾸는 값(계획 58). 없으면 쓰지 않는다. */
+            overrides?: components["schemas"]["CloneOverrides"];
             pool?: string | null;
             /** Format: uuid */
             snapshot?: string | null;
@@ -6937,6 +7056,9 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "ceph-client-install";
+        } | {
+            /** @enum {string} */
+            kind: "vm-untemplate";
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -7056,6 +7178,34 @@ export interface components {
              * @description 마지막으로 보낸 시각(유닉스 초)
              */
             last_sent_at?: number;
+        };
+        /** @description 카탈로그 이미지를 받은 뒤 만들 템플릿 VM의 초안(`POST /image-catalog/{id}/download`의 `template`). */
+        TemplateDraft: {
+            /** @description 없으면 빈 설정(cloud-init 기본)이다. 비밀번호는 crypt 해시다. */
+            cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 펌웨어. API가 카탈로그 항목의 것으로 채운다(없으면 UEFI). */
+            firmware?: components["schemas"]["Firmware"];
+            /** @description 머신 타입. API가 카탈로그 항목의 아키텍처로 채운다(없으면 이 노드의 것). */
+            machine?: components["schemas"]["MachineType"];
+            /**
+             * Format: int32
+             * @default 2048
+             */
+            memory_mib: number;
+            /** @description 템플릿 VM 이름 */
+            name: string;
+            /** @description NIC 하나의 네트워크 이름 */
+            network: string;
+            /**
+             * Format: int64
+             * @description 받은 디스크를 이 크기로 늘린다(바이트). 없으면 이미지 크기 그대로다.
+             */
+            size_bytes?: number;
+            /**
+             * Format: int32
+             * @default 2
+             */
+            vcpus: number;
         };
         TokenView: {
             /** Format: uuid */
@@ -7211,6 +7361,11 @@ export interface components {
                 replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
+                /**
+                 * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
+                 *     않아 옛 노드도 VM을 푼다.
+                 */
+                template?: boolean;
             };
         };
         /** @description 노드 업데이트 설정 */
@@ -7462,6 +7617,11 @@ export interface components {
             replication?: components["schemas"]["ReplicationTarget"][];
             restart?: components["schemas"]["RestartPolicy"];
             snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
+            /**
+             * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
+             *     않아 옛 노드도 VM을 푼다.
+             */
+            template?: boolean;
         };
         /** @description VM의 실제 상태. reconciler만 기록한다. */
         VmStatus: {
@@ -7541,6 +7701,12 @@ export interface components {
          */
         VolumePhase: "pending" | "ready";
         VolumeSpec: {
+            /**
+             * Format: uuid
+             * @description 연결 복제(계획 58)면 기반(템플릿 디스크) 볼륨의 id. 기반은 늘 같은 풀에 있다. 없으면 쓰지 않아 옛 노드도
+             *     볼륨을 푼다.
+             */
+            base?: string;
             /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
             content?: components["schemas"]["VolumeContent"];
             format: components["schemas"]["ImageFormat"];

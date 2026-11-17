@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
+use crate::image_catalog::CatalogImage;
 use crate::resource::{Kind, Resource, ResourceSpec};
 
 pub type Settings = Resource<SettingsSpec, SettingsStatus>;
@@ -67,6 +68,11 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub placement: Option<PlacementSettings>,
+    /// 이미지 라이브러리의 관리자 항목(계획 58, 200개까지, 내장 id와 겹치지 않게). 비어 있으면 쓰지 않아 옛 노드도
+    /// 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub image_catalog: Vec<CatalogImage>,
 }
 
 /// 최적 배치 설정. 모든 값이 기본이면 [`SettingsSpec::placement`]를 쓰지 않는다.
@@ -394,6 +400,7 @@ mod tests {
             ha_reserve: None,
             ha_start_concurrency: None,
             placement: None,
+            image_catalog: vec![],
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -694,5 +701,27 @@ mod tests {
     fn settings_kind_is_settings() {
         assert_eq!(SettingsSpec::KIND, Kind::Settings);
         assert_eq!(serde_json::to_value(Kind::Settings).unwrap(), "settings");
+    }
+
+    #[test]
+    fn image_catalog_is_written_only_when_set() {
+        let old = r#"{"updates":{"channel":"stable"}}"#;
+        let spec: SettingsSpec = serde_json::from_str(old).unwrap();
+        assert!(spec.image_catalog.is_empty());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+
+        let image = crate::image_catalog::builtin()[0].clone();
+        let image = CatalogImage {
+            id: "corp-ubuntu".into(),
+            ..image
+        };
+        let spec = SettingsSpec {
+            image_catalog: vec![image],
+            ..SettingsSpec::default()
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["image_catalog"][0]["id"], "corp-ubuntu");
+        assert_eq!(json["image_catalog"][0]["checksum"]["kind"], "sums");
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
     }
 }

@@ -654,6 +654,7 @@ async fn nfs_disk_on_a_node_without_nfs_powers_off() {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -722,6 +723,7 @@ async fn unavailable_pool_is_retried_without_powering_off() {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -1149,6 +1151,7 @@ async fn disk_vm_with(
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&root).await.unwrap();

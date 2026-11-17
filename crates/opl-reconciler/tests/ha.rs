@@ -795,6 +795,7 @@ async fn ha_vm_reassigned_while_reattaching_is_not_started() {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -1543,6 +1544,7 @@ async fn start_with_disk(storage: &Arc<GateStorage>) -> (Env, Ha, Vm) {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();

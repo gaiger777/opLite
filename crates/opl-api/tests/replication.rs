@@ -403,6 +403,7 @@ async fn local_volume(a: &Node, name: &str) -> Uuid {
             size_bytes: SIZE,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(a.id);

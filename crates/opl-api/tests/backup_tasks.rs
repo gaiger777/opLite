@@ -597,6 +597,7 @@ async fn restore_empties_cdrom_drives_whose_iso_is_gone() {
                 size_bytes: MIB,
                 format: ImageFormat::Raw,
                 content: VolumeContent::Iso,
+                base: None,
             },
         );
         iso.status.phase = VolumePhase::Ready;

@@ -438,6 +438,7 @@ async fn run_checks_the_request() {
             size_bytes: 1 << 20,
             format: opl_types::runtime::ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();

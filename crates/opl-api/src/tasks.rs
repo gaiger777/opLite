@@ -858,10 +858,15 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
         TaskOp::SnapshotDelete { snapshot, .. } => snapshot::delete(ctx, id, *snapshot).await,
         TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
+        // 연결 복제·배포 덮어쓰기(계획 58)는 뒤 스테이지에서 실행한다.
+        op @ TaskOp::VmClone { .. } if op.needs_templates() => {
+            Err("this node cannot make linked clones or deploy templates yet".into())
+        }
         TaskOp::VmClone {
             name,
             snapshot,
             pool,
+            ..
         } => return clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
         TaskOp::VmMigrate { node, pool } => {
             migrate::migrate(ctx, task, *node, pool.as_deref()).await
@@ -907,11 +912,18 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
         | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
+        op @ TaskOp::VolumeDownload { .. } if op.needs_templates() => Err(
+            "this node cannot check SHA-512 or checksum files or make templates from downloads yet"
+                .into(),
+        ),
         TaskOp::VolumeDownload {
             url,
             sha256,
             source_format,
+            ..
         } => download::download(ctx, task, url, sha256.as_deref(), *source_format).await,
+        TaskOp::VolumeFlatten => Err("this node cannot flatten volumes yet".into()),
+        TaskOp::VmUntemplate => Err("this node cannot convert templates back to VMs yet".into()),
     };
     done.map(|()| None)
 }

@@ -997,6 +997,7 @@ pub(super) async fn restore(
                 size_bytes: disk.virtual_bytes,
                 format,
                 content: Default::default(),
+                base: None,
             },
         );
         copy.status.node = Some(ctx.config.node);

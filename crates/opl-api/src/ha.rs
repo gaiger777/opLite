@@ -2281,6 +2281,7 @@ mod tests {
                 replication: Vec::new(),
                 cdroms: vec![],
                 cloud_init: None,
+                template: false,
             },
         )
     }
@@ -2517,6 +2518,7 @@ mod tests {
                 size_bytes: 1 << 30,
                 format: opl_types::runtime::ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         root.status.node = Some(failed.id);

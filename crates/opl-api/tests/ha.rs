@@ -406,6 +406,7 @@ async fn replicated_vm(env: &Env, name: &str, on: Uuid, targets: &[(Uuid, Option
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(on);
@@ -3039,6 +3040,7 @@ async fn nas(env: &Env, vms: &[&str]) {
                 size_bytes: 1 << 30,
                 format: ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         env.cluster.create(&volume).await.unwrap();

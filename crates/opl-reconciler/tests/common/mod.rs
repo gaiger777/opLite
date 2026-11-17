@@ -132,6 +132,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             replication: Vec::new(),
             cdroms: vec![],
             cloud_init: None,
+            template: false,
         },
     )
 }

@@ -785,7 +785,8 @@ pub(crate) mod tests {
                 "hotplug",
                 "node-replication",
                 "ceph-setup",
-                "install-media"
+                "install-media",
+                "templates"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -819,7 +820,8 @@ pub(crate) mod tests {
                 "hotplug",
                 "node-replication",
                 "ceph-setup",
-                "install-media"
+                "install-media",
+                "templates"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -872,7 +874,8 @@ pub(crate) mod tests {
                 "hotplug",
                 "node-replication",
                 "ceph-setup",
-                "install-media"
+                "install-media",
+                "templates"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1100,6 +1103,7 @@ pub(crate) mod tests {
                     "node-replication".into(),
                     "ceph-setup".into(),
                     "install-media".into(),
+                    "templates".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

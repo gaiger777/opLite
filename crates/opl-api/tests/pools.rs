@@ -774,6 +774,7 @@ async fn patch_to_local_needs_vms_on_their_volume_nodes() {
                 size_bytes: 1 << 20,
                 format: ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         v.status.node = Some(env.node);

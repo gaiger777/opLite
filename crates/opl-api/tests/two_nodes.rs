@@ -1121,6 +1121,7 @@ async fn running_vm_with_disk(a: &Node, admin: &common::Client) -> (opl_types::v
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(a.id);
@@ -1215,6 +1216,7 @@ async fn running_vm_with_local_disk(a: &Node, admin: &common::Client) -> (opl_ty
             size_bytes: LOCAL_SIZE,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(a.id);
@@ -1735,6 +1737,7 @@ async fn running_vm_on_pool(
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(on);

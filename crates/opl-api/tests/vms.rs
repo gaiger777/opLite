@@ -100,6 +100,7 @@ async fn disks_must_exist_and_belong_to_one_vm() {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -150,6 +151,7 @@ async fn ready_volume(env: &Env, admin: &common::Client, name: &str) {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -217,6 +219,7 @@ async fn volume_being_created_cannot_be_deleted() {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -1610,6 +1613,7 @@ async fn volume_in(env: &Env, name: &str, pool: &str) {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -1920,6 +1924,7 @@ async fn iso_in(env: &Env, name: &str, pool: &str, phase: VolumePhase) {
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: VolumeContent::Iso,
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();

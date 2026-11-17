@@ -44,6 +44,7 @@ async fn pool_and_root(env: &Env) {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -481,6 +482,7 @@ async fn ready_volume(env: &Env, name: &str) -> Uuid {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -982,6 +984,7 @@ async fn block_volumes(
                     size_bytes: 1 << 20,
                     format: ImageFormat::Raw,
                     content: Default::default(),
+                    base: None,
                 },
             );
             env.cluster.create(&volume).await.unwrap();

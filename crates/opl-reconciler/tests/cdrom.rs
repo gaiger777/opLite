@@ -44,6 +44,7 @@ async fn iso_pool(env: &Env) -> Volume {
             size_bytes: 1 << 20,
             format: ImageFormat::Raw,
             content: opl_types::storage::VolumeContent::Iso,
+            base: None,
         },
     );
     env.cluster.create(&iso).await.unwrap();

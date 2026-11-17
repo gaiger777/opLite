@@ -787,6 +787,7 @@ async fn reads_wait_for_the_min_revision_header() {
                     size_bytes: 1 << 20,
                     format: opl_types::runtime::ImageFormat::Qcow2,
                     content: Default::default(),
+                    base: None,
                 },
             ))
             .await

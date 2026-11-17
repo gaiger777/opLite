@@ -798,6 +798,8 @@ pub async fn clone_vm(
         name: req.name,
         snapshot,
         pool: req.pool,
+        linked: None,
+        overrides: None,
     };
     let task = create_task(&state.cluster, op, vm.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))

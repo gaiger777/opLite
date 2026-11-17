@@ -342,6 +342,7 @@ pub const FEATURES: &[&str] = &[
     NODE_REPLICATION,
     CEPH_SETUP,
     INSTALL_MEDIA,
+    TEMPLATES,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -371,6 +372,11 @@ pub const CEPH_SETUP: &str = "ceph-setup";
 /// 설치 매체와 cloud-init(계획 57): `content: iso` 볼륨, Task `volume-download`, VM `cdroms`·`cloud_init`, CD 매체
 /// 넣기·빼기. 모든 노드가 알릴 때만 쓴다.
 pub const INSTALL_MEDIA: &str = "install-media";
+
+/// 템플릿·연결 복제·이미지 라이브러리(계획 58): VM `template`, 볼륨 `base`, `vm-clone`의 `linked`·`overrides`,
+/// `volume-download`의 `sha512`·`checksum_url`·`template`, Task `volume-flatten`·`vm-untemplate`, 설정
+/// `image_catalog`. 모든 노드가 알릴 때만 쓴다.
+pub const TEMPLATES: &str = "templates";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -845,7 +851,8 @@ mod tests {
                 "hotplug",
                 "node-replication",
                 "ceph-setup",
-                "install-media"
+                "install-media",
+                "templates"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

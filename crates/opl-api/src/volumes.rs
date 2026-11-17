@@ -375,6 +375,7 @@ pub async fn import_volume(
             size_bytes: 0,
             format,
             content: q.content,
+            base: None,
         },
     );
     volume.status.node = Some(state.node);
@@ -501,6 +502,7 @@ pub async fn download_volume(
             size_bytes: 0,
             format,
             content: req.content,
+            base: None,
         },
     );
     volume.status.node = Some(node);
@@ -514,6 +516,9 @@ pub async fn download_volume(
         url: req.url,
         sha256,
         source_format: req.source_format.unwrap_or(SourceFormat::Raw),
+        sha512: None,
+        checksum_url: None,
+        template: None,
     };
     let mut task = create_task(&state.cluster, op, volume.id, node).await?;
     public_task(&mut task);

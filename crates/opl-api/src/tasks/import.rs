@@ -183,6 +183,7 @@ pub(super) async fn import(
                 size_bytes: disk.capacity_bytes,
                 format,
                 content: Default::default(),
+                base: None,
             },
         );
         volume.status.node = Some(ctx.config.node);

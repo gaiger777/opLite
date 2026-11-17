@@ -376,6 +376,7 @@ mod tests {
                 replication: Vec::new(),
                 cdroms: vec![],
                 cloud_init: None,
+                template: false,
             },
         )
     }
@@ -388,6 +389,7 @@ mod tests {
                 size_bytes: 1 << 30,
                 format: ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         v.status.node = Some(node);

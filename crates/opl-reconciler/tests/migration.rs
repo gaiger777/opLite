@@ -191,6 +191,7 @@ async fn taking_over_a_copied_disk_moves_the_volume_record_first() {
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(source);

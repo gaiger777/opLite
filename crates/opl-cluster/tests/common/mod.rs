@@ -39,6 +39,7 @@ pub fn volume(name: &str) -> Volume {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     )
 }

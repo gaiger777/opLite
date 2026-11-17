@@ -342,6 +342,7 @@ mod tests {
                 replication: Vec::new(),
                 cdroms: vec![],
                 cloud_init: None,
+                template: false,
             },
         )
     }

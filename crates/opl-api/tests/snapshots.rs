@@ -66,6 +66,7 @@ async fn volume(env: &Env, name: &str, format: ImageFormat) -> Uuid {
             size_bytes: MIB,
             format,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -358,6 +359,7 @@ async fn block_volume(
             size_bytes: MIB,
             format,
             content: Default::default(),
+            base: None,
         },
     );
     env.cluster.create(&volume).await.unwrap();

@@ -2313,6 +2313,7 @@ mod tests {
                 size_bytes: 1 << 20,
                 format: opl_types::runtime::ImageFormat::Qcow2,
                 content: Default::default(),
+                base: None,
             },
         );
         s.cluster.create(&volume).await.unwrap();

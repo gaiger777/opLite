@@ -7,6 +7,7 @@ use crate::fence::FenceKind;
 use crate::ha_check::HaCheckAction;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::storage::SourceFormat;
+use crate::template::{CloneOverrides, TemplateDraft};
 use crate::vm_import::ImportRun;
 
 /// 오래 걸리는 작업. API가 만들고 `node`의 작업 실행기가 실행해 status를 기록한다.
@@ -56,8 +57,22 @@ pub enum TaskOp {
         #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
         sha256: Option<String>,
         source_format: SourceFormat,
+        /// 받은 파일의 SHA-512(소문자 16진 128자, 계획 58). `sha256`·`checksum_url`과 함께 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        sha512: Option<String>,
+        /// 체크섬 파일 URL(계획 58). 받기 전에 이 파일에서 이미지 파일 이름의 해시를 찾아 확인한다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        checksum_url: Option<String>,
+        /// 가져오기가 끝나면 이 볼륨으로 만들 템플릿 VM(계획 58)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        template: Option<Box<TemplateDraft>>,
     },
     VolumeDelete,
+    /// 연결 복제 볼륨(대상)을 기반과 떼어 독립 볼륨으로 만들고 `base`를 지운다(계획 58). 볼륨을 쓰는 VM은 꺼져 있다.
+    VolumeFlatten,
     SnapshotCreate {
         snapshot: Uuid,
     },
@@ -81,6 +96,15 @@ pub enum TaskOp {
         name: String,
         snapshot: Option<Uuid>,
         pool: Option<String>,
+        /// 연결 복제(계획 58, 템플릿에서만): 없음 = 되는 디스크는 연결하고 안 되는 디스크는 전체 복사, 참 = 모두
+        /// 연결(안 되면 실패), 거짓 = 전체 복사. 없으면 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        linked: Option<bool>,
+        /// 배포 때 바꾸는 값(계획 58). 없으면 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        overrides: Option<Box<CloneOverrides>>,
     },
     /// 실행 중인 대상 VM을 `node`로 라이브 마이그레이션한다. 원본 노드(VM의 `spec.node`)에서 돈다.
     /// 노드 로컬 풀의 디스크는 `node`에 새로 만들어 복사한다.
@@ -186,6 +210,9 @@ pub enum TaskOp {
     },
     /// 이 노드에 Ceph 클라이언트 꾸러미를 설치한다. 대상은 `Ceph` 리소스다.
     CephClientInstall,
+    /// 템플릿(대상 VM)을 보통 VM으로 되돌린다(계획 58): 디스크마다 기반 스냅샷을 풀고 마지막에 `template: false`를
+    /// 쓴다. VM의 노드에서 돈다.
+    VmUntemplate,
 }
 
 impl TaskOp {
@@ -200,6 +227,24 @@ impl TaskOp {
                 | TaskOp::CephPoolCreate { .. }
                 | TaskOp::CephClientInstall
         )
+    }
+
+    /// 템플릿 기능(계획 58, `node::TEMPLATES`)을 모르는 노드가 풀지 못하는 Task인지: 새 Task 종류와, 새 칸을 쓴
+    /// `vm-clone`·`volume-download`
+    pub fn needs_templates(&self) -> bool {
+        match self {
+            TaskOp::VolumeFlatten | TaskOp::VmUntemplate => true,
+            TaskOp::VmClone {
+                linked, overrides, ..
+            } => linked.is_some() || overrides.is_some(),
+            TaskOp::VolumeDownload {
+                sha512,
+                checksum_url,
+                template,
+                ..
+            } => sha512.is_some() || checksum_url.is_some() || template.is_some(),
+            _ => false,
+        }
     }
 }
 
@@ -285,6 +330,9 @@ mod tests {
                 url: "https://x/a.iso".into(),
                 sha256: None,
                 source_format: SourceFormat::Raw,
+                sha512: None,
+                checksum_url: None,
+                template: None,
             }
         );
         assert_eq!(serde_json::to_value(&op).unwrap(), json);
@@ -294,6 +342,9 @@ mod tests {
             url: "https://x/a.qcow2".into(),
             sha256: Some(sum.clone()),
             source_format: SourceFormat::Qcow2,
+            sha512: None,
+            checksum_url: None,
+            template: None,
         };
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(json["sha256"], sum);
@@ -353,6 +404,8 @@ mod tests {
             name: "web-02".into(),
             snapshot: Some(snapshot),
             pool: Some("fast".into()),
+            linked: None,
+            overrides: None,
         };
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(
@@ -369,6 +422,8 @@ mod tests {
             name: "web-02".into(),
             snapshot: None,
             pool: None,
+            linked: None,
+            overrides: None,
         };
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
@@ -698,5 +753,87 @@ mod tests {
         assert_eq!(TaskStatus::default().state, TaskState::Pending);
         assert!(!TaskState::Running.is_finished());
         assert!(TaskState::Failed.is_finished());
+    }
+
+    #[test]
+    fn plain_clone_and_download_stay_byte_identical_and_need_no_templates() {
+        // 계획 57이 만든 모양 그대로 읽고 쓴다.
+        for old in [
+            r#"{"kind":"vm-clone","name":"web-02","snapshot":null,"pool":null}"#,
+            r#"{"kind":"volume-download","url":"https://x/a.iso","sha256":"ab","source_format":"raw"}"#,
+        ] {
+            let op: TaskOp = serde_json::from_str(old).unwrap();
+            assert_eq!(serde_json::to_string(&op).unwrap(), old);
+            assert!(!op.needs_templates());
+        }
+        assert!(!TaskOp::VolumeDelete.needs_templates());
+    }
+
+    #[test]
+    fn template_fields_round_trip_and_need_templates() {
+        let clone = TaskOp::VmClone {
+            name: "web-1".into(),
+            snapshot: None,
+            pool: None,
+            linked: Some(true),
+            overrides: Some(Box::new(CloneOverrides {
+                vcpus: Some(4),
+                start: true,
+                ..CloneOverrides::default()
+            })),
+        };
+        let json = serde_json::to_value(&clone).unwrap();
+        assert_eq!(json["linked"], true);
+        assert_eq!(
+            json["overrides"],
+            serde_json::json!({ "vcpus": 4, "start": true })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), clone);
+        assert!(clone.needs_templates());
+        let full = TaskOp::VmClone {
+            name: "web-1".into(),
+            snapshot: None,
+            pool: None,
+            linked: Some(false),
+            overrides: None,
+        };
+        assert!(full.needs_templates());
+
+        let download = TaskOp::VolumeDownload {
+            url: "https://x/a.qcow2".into(),
+            sha256: None,
+            source_format: SourceFormat::Qcow2,
+            sha512: None,
+            checksum_url: Some("https://x/SHA256SUMS".into()),
+            template: Some(Box::new(
+                serde_json::from_value(serde_json::json!({ "name": "t", "network": "lan" }))
+                    .unwrap(),
+            )),
+        };
+        let json = serde_json::to_value(&download).unwrap();
+        assert_eq!(json["checksum_url"], "https://x/SHA256SUMS");
+        assert_eq!(json["template"]["name"], "t");
+        assert!(json.get("sha512").is_none());
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), download);
+        assert!(download.needs_templates());
+        let sha512 = TaskOp::VolumeDownload {
+            url: "https://x/a.qcow2".into(),
+            sha256: None,
+            source_format: SourceFormat::Qcow2,
+            sha512: Some("cd".repeat(64)),
+            checksum_url: None,
+            template: None,
+        };
+        assert!(sha512.needs_templates());
+
+        for (op, kind) in [
+            (TaskOp::VolumeFlatten, "volume-flatten"),
+            (TaskOp::VmUntemplate, "vm-untemplate"),
+        ] {
+            let json = serde_json::to_value(&op).unwrap();
+            assert_eq!(json, serde_json::json!({ "kind": kind }));
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+            assert!(op.needs_templates());
+        }
     }
 }

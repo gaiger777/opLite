@@ -244,6 +244,7 @@ async fn setup(promote: bool) -> Setup {
             size_bytes: SIZE,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(source);

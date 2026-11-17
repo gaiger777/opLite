@@ -440,6 +440,59 @@ pub struct VolumeSpec {
     #[serde(default, skip_serializing_if = "VolumeContent::is_disk")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub content: VolumeContent,
+    /// 연결 복제(계획 58)면 기반(템플릿 디스크) 볼륨의 id. 기반은 늘 같은 풀에 있다. 없으면 쓰지 않아 옛 노드도
+    /// 볼륨을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub base: Option<Uuid>,
+}
+
+/// 연결 복제의 기반 스냅샷 태그(RBD `opl-{id}@opl-base`, ZFS `…/opl-{id}@opl-base`). UUID가 아니므로 남은 블록
+/// 스냅샷 정리와 VM 스냅샷 목록이 건드리지 않는다.
+pub const BASE_TAG: &str = "opl-base";
+
+/// 이 백엔드의 `format` 볼륨을 기반으로 같은 풀에 연결 복제를 만들 수 있는지. 파일 풀(dir, nfs)은 qcow2·raw
+/// 기반 모두 qcow2 겹층으로, LVM-thin·ZFS·RBD 풀은 raw 볼륨의 네이티브 복제(thin 스냅샷, ZFS clone, RBD clone)로
+/// 된다. 공유 LVM 풀은 두꺼운 LV라 되지 않는다.
+pub fn pool_supports_linked_clones(backend: &PoolBackend, format: ImageFormat) -> bool {
+    match backend {
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => true,
+        PoolBackend::LvmThin { .. } | PoolBackend::Zfs { .. } | PoolBackend::Rbd { .. } => {
+            format == ImageFormat::Raw
+        }
+        PoolBackend::LvmShared { .. } => false,
+    }
+}
+
+/// 연결 복제 볼륨 기록의 잘못
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum VolumeError {
+    #[error("a linked clone must be in the pool of its base volume {base:?} ({pool:?})")]
+    BaseInOtherPool { base: String, pool: String },
+    #[error("volume {0:?} is a linked clone itself and cannot be a base; flatten it first")]
+    BaseIsLinkedClone(String),
+    #[error("volume {0:?} is not a disk and cannot be a base")]
+    BaseNotDisk(String),
+}
+
+impl VolumeSpec {
+    /// 이 볼륨이 `base`(이름 `base_name`)의 연결 복제로 맞는지: 같은 풀, 디스크, 사슬은 1단(기반이 다시 연결
+    /// 복제가 아님).
+    pub fn check_base(&self, base_name: &str, base: &VolumeSpec) -> Result<(), VolumeError> {
+        if base.content != VolumeContent::Disk {
+            return Err(VolumeError::BaseNotDisk(base_name.into()));
+        }
+        if base.base.is_some() {
+            return Err(VolumeError::BaseIsLinkedClone(base_name.into()));
+        }
+        if base.pool != self.pool {
+            return Err(VolumeError::BaseInOtherPool {
+                base: base_name.into(),
+                pool: base.pool.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// 볼륨의 내용 종류
@@ -1351,6 +1404,7 @@ mod tests {
             size_bytes: 10 << 30,
             format: ImageFormat::Qcow2,
             content: VolumeContent::Disk,
+            base: None,
         };
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["format"], "qcow2");
@@ -1410,5 +1464,92 @@ mod tests {
         assert_eq!(p, StoragePoolStatus::default());
         let v: VolumeStatus = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(v, VolumeStatus::default());
+    }
+
+    #[test]
+    fn volume_base_is_written_only_for_linked_clones() {
+        // 옛 볼륨 JSON은 기반 없이 읽고 바이트까지 그대로 쓴다.
+        let old = r#"{"pool":"local","size_bytes":1024,"format":"qcow2"}"#;
+        let disk: VolumeSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(disk.base, None);
+        assert_eq!(serde_json::to_string(&disk).unwrap(), old);
+
+        let base = Uuid::now_v7();
+        let clone = VolumeSpec {
+            base: Some(base),
+            ..disk
+        };
+        let json = serde_json::to_value(&clone).unwrap();
+        assert_eq!(json["base"], base.to_string());
+        assert_eq!(serde_json::from_value::<VolumeSpec>(json).unwrap(), clone);
+    }
+
+    #[test]
+    fn base_tag_is_not_a_uuid() {
+        assert!(BASE_TAG.parse::<Uuid>().is_err());
+    }
+
+    #[test]
+    fn linked_clones_need_a_backend_that_shares_data() {
+        let backend =
+            |json: serde_json::Value| -> PoolBackend { serde_json::from_value(json).unwrap() };
+        for file in [
+            serde_json::json!({ "kind": "dir", "path": "/p" }),
+            serde_json::json!({ "kind": "nfs", "server": "nas", "export": "/vm" }),
+        ] {
+            let file = backend(file);
+            assert!(pool_supports_linked_clones(&file, ImageFormat::Qcow2));
+            assert!(pool_supports_linked_clones(&file, ImageFormat::Raw));
+        }
+        for block in [
+            serde_json::json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" }),
+            serde_json::json!({ "kind": "zfs", "dataset": "tank/opl" }),
+            serde_json::json!({ "kind": "rbd", "pool": "rbd" }),
+        ] {
+            let block = backend(block);
+            assert!(pool_supports_linked_clones(&block, ImageFormat::Raw));
+            assert!(!pool_supports_linked_clones(&block, ImageFormat::Qcow2));
+        }
+        let shared = backend(serde_json::json!({ "kind": "lvm-shared", "vg": "vg0" }));
+        assert!(!pool_supports_linked_clones(&shared, ImageFormat::Raw));
+    }
+
+    #[test]
+    fn a_base_must_be_an_independent_disk_in_the_same_pool() {
+        let spec = |pool: &str| VolumeSpec {
+            pool: pool.into(),
+            size_bytes: 1 << 30,
+            format: ImageFormat::Raw,
+            content: VolumeContent::Disk,
+            base: None,
+        };
+        let clone = VolumeSpec {
+            base: Some(Uuid::now_v7()),
+            ..spec("local")
+        };
+        assert_eq!(clone.check_base("tmpl-disk0", &spec("local")), Ok(()));
+        assert_eq!(
+            clone.check_base("tmpl-disk0", &spec("nfs")),
+            Err(VolumeError::BaseInOtherPool {
+                base: "tmpl-disk0".into(),
+                pool: "nfs".into()
+            })
+        );
+        let linked = VolumeSpec {
+            base: Some(Uuid::now_v7()),
+            ..spec("local")
+        };
+        assert_eq!(
+            clone.check_base("web-1-disk0", &linked),
+            Err(VolumeError::BaseIsLinkedClone("web-1-disk0".into()))
+        );
+        let iso = VolumeSpec {
+            content: VolumeContent::Iso,
+            ..spec("local")
+        };
+        assert_eq!(
+            clone.check_base("debian.iso", &iso),
+            Err(VolumeError::BaseNotDisk("debian.iso".into()))
+        );
     }
 }

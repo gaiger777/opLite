@@ -124,6 +124,7 @@ async fn vm_on(env: &Env, name: &str, node: Uuid, pool: &str) -> Vm {
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
             content: Default::default(),
+            base: None,
         },
     );
     volume.status.node = Some(node);
