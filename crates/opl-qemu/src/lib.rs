@@ -15,5 +15,5 @@ pub use paths::{PathError, RuntimePaths};
 pub use qmp::{
     BackupSync, BitmapInfo, BlockNode, BlockStats, HotpluggableCpu, JobInfo, MigrationInfo,
     MigrationParameters, MigrationState, NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState,
-    TlsEndpoint, TransactionAction,
+    TlsEndpoint, TransactionAction, change_medium,
 };

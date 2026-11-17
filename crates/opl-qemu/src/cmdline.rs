@@ -3,14 +3,13 @@ use std::path::Path;
 use opl_types::runtime::{
     DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RbdTarget, VmRuntimeSpec,
 };
-use opl_types::vm::{Arch, CpuModel, DiskBus, Firmware, MachineType, NicModel};
+use opl_types::vm::{
+    Arch, CpuModel, DiskBus, Firmware, MAX_CDROMS, MachineType, NicModel, Q35_SATA_PORTS,
+};
 use thiserror::Error;
 
 use crate::host::{Accel, HostProfile};
 use crate::paths::RuntimePaths;
-
-/// q35의 내장 AHCI 컨트롤러 포트 수
-const Q35_SATA_PORTS: usize = 6;
 
 /// 핫플러그 루트 포트를 모아 두는 `pcie.0` 슬롯. 멀티펑션 8개(`0x1e.0`~`0x1e.7`)라 자동 주소를 밀지 않는다.
 pub const HOTPLUG_SLOT: u8 = 0x1e;
@@ -26,8 +25,12 @@ pub enum CmdlineError {
     BiosOnAarch64,
     #[error("SATA disks require the q35 machine type")]
     SataRequiresQ35,
-    #[error("at most {Q35_SATA_PORTS} SATA disks are supported")]
-    TooManySataDisks,
+    #[error(
+        "at most {Q35_SATA_PORTS} SATA devices (SATA disks, CD-ROM drives and the cloud-init drive) are supported"
+    )]
+    TooManySataDevices,
+    #[error("at most {MAX_CDROMS} CD-ROM drives are supported")]
+    TooManyCdroms,
     #[error("disk {0} is an rbd disk without an rbd image")]
     MissingRbdImage(usize),
     #[error("vCPU hotplug is not supported on aarch64")]
@@ -255,6 +258,53 @@ pub fn build_cmdline(
         );
     }
 
+    // CD-ROM 드라이브와 cloud-init 씨앗도 앞 장치들의 PCI 주소가 그대로이게 맨 뒤에 단다. q35는 내장 AHCI의 SATA
+    // 디스크 다음 포트, virt는 새 virtio-scsi 컨트롤러다. 매체는 늘 읽기 전용이고 씨앗은 부팅 장치가 아니다.
+    let seed = spec.cloud_init.as_ref().map(|_| paths.cidata.as_path());
+    if !spec.cdroms.is_empty() || seed.is_some() {
+        if spec.machine == MachineType::Virt {
+            a.opt("-device", "virtio-scsi-pci,id=scsi0".to_string());
+        }
+        let drives = spec
+            .cdroms
+            .iter()
+            .enumerate()
+            .map(|(i, cd)| {
+                let medium = cd.medium.as_ref().map(|m| m.path.as_path());
+                (format!("cd{i}"), medium, cd.boot_order)
+            })
+            .chain(seed.map(|p| ("cidata".to_string(), Some(p), None)));
+        for (name, medium, boot_order) in drives {
+            let mut dev = match spec.machine {
+                MachineType::Q35 => {
+                    let d = format!("ide-cd,bus=ide.{sata_port}");
+                    sata_port += 1;
+                    d
+                }
+                MachineType::Virt => "scsi-cd,bus=scsi0.0".to_string(),
+            };
+            if let Some(path) = medium {
+                a.opt(
+                    "-blockdev",
+                    format!(
+                        "driver=file,filename={},node-name={name}-file,read-only=on",
+                        esc_path(path)
+                    ),
+                );
+                a.opt(
+                    "-blockdev",
+                    format!("driver=raw,file={name}-file,node-name={name},read-only=on"),
+                );
+                dev.push_str(&format!(",drive={name}"));
+            }
+            dev.push_str(&format!(",id={name}-dev"));
+            if let Some(order) = boot_order {
+                dev.push_str(&format!(",bootindex={order}"));
+            }
+            a.opt("-device", dev);
+        }
+    }
+
     a.opt("-vnc", format!("unix:{}", esc_path(&paths.vnc_socket)));
     a.opt(
         "-qmp",
@@ -339,8 +389,17 @@ fn check_compat(spec: &VmRuntimeSpec, host: &HostProfile) -> Result<(), CmdlineE
     if sata > 0 && spec.machine != MachineType::Q35 {
         return Err(CmdlineError::SataRequiresQ35);
     }
-    if sata > Q35_SATA_PORTS {
-        return Err(CmdlineError::TooManySataDisks);
+    if spec.cdroms.len() > MAX_CDROMS {
+        return Err(CmdlineError::TooManyCdroms);
+    }
+    // q35는 SATA 디스크·CD-ROM·씨앗이 내장 AHCI 포트를 나눠 쓴다. virt의 CD는 virtio-scsi에 단다.
+    let drives = spec.cdroms.len() + usize::from(spec.cloud_init.is_some());
+    let sata_devices = match spec.machine {
+        MachineType::Q35 => sata + drives,
+        MachineType::Virt => sata,
+    };
+    if sata_devices > Q35_SATA_PORTS {
+        return Err(CmdlineError::TooManySataDevices);
     }
     if let Some(layout) = &spec.hotplug {
         check_layout(spec, host, layout)?;
@@ -406,7 +465,9 @@ fn esc_path(p: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use opl_types::runtime::{DiskKind, RbdTarget, RuntimeDisk, RuntimeNic};
+    use opl_types::runtime::{
+        DiskKind, RbdTarget, RuntimeCdrom, RuntimeDisk, RuntimeMedium, RuntimeNic,
+    };
     use opl_types::vm::CpuSpec;
     use uuid::Uuid;
 
@@ -911,6 +972,168 @@ mod tests {
                 boot_order: None,
             })
             .collect();
-        assert_eq!(err(&many, &x86_host()), CmdlineError::TooManySataDisks);
+        assert_eq!(err(&many, &x86_host()), CmdlineError::TooManySataDevices);
+    }
+
+    fn seed() -> opl_types::cloud_init::CloudInitSeed {
+        opl_types::cloud_init::CloudInitSeed {
+            instance_id: "iid-0123456789abcdef".into(),
+            meta_data: "{}".into(),
+            user_data: "#cloud-config\n{}".into(),
+            vendor_data: None,
+            network_config: None,
+        }
+    }
+
+    fn cdrom(path: Option<&str>, boot_order: Option<u8>) -> RuntimeCdrom {
+        RuntimeCdrom {
+            medium: path.map(|p| RuntimeMedium { path: p.into() }),
+            boot_order,
+        }
+    }
+
+    /// `without`에 없던 인자 `added`가 `-vnc` 바로 앞에 끼어들고 나머지는 그대로인지
+    fn assert_inserted_before_vnc(with: &[String], without: &[String], added: &[&str]) {
+        let at = without.iter().position(|a| a == "-vnc").unwrap();
+        assert_eq!(with[..at], without[..at]);
+        assert_eq!(with[at..at + added.len()], *added, "{with:#?}");
+        assert_eq!(with[at + added.len()..], without[at..]);
+    }
+
+    /// q35: SATA 디스크 하나(포트 0) 다음 AHCI 포트에 CD 둘(하나는 빈 드라이브)과 씨앗. bootindex는 기본 규칙
+    /// (디스크 1 다음 CD 2·3)이고 씨앗에는 없다. 앞 장치의 인자는 CD 없는 명령줄과 같다.
+    #[test]
+    fn q35_cdroms_and_seed_follow_the_sata_disks() {
+        let without = build_cmdline(&x86_spec(), &x86_host(), &paths()).unwrap();
+        let (disks, cds) = opl_types::vm::effective_boot(&[Some(1), None], &[None, None]);
+        assert_eq!(disks, [Some(1), None]);
+        let mut spec = x86_spec();
+        spec.cdroms = vec![
+            cdrom(Some("/pools/iso/ubuntu.raw"), cds[0]),
+            cdrom(None, cds[1]),
+        ];
+        spec.cloud_init = Some(seed());
+        let with = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        let dir = "/run/opl/vm/00000000-0000-0000-0000-000000000000";
+        assert_inserted_before_vnc(
+            &with,
+            &without,
+            &[
+                "-blockdev",
+                "driver=file,filename=/pools/iso/ubuntu.raw,node-name=cd0-file,read-only=on",
+                "-blockdev",
+                "driver=raw,file=cd0-file,node-name=cd0,read-only=on",
+                "-device",
+                "ide-cd,bus=ide.1,drive=cd0,id=cd0-dev,bootindex=2",
+                "-device",
+                "ide-cd,bus=ide.2,id=cd1-dev,bootindex=3",
+                "-blockdev",
+                &format!(
+                    "driver=file,filename={dir}/cidata.iso,node-name=cidata-file,read-only=on"
+                ),
+                "-blockdev",
+                "driver=raw,file=cidata-file,node-name=cidata,read-only=on",
+                "-device",
+                "ide-cd,bus=ide.3,drive=cidata,id=cidata-dev",
+            ],
+        );
+        // 받는 쪽도 같은 장치다.
+        let incoming = build_incoming_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert_eq!(incoming[..with.len()], with[..]);
+    }
+
+    /// virt: virtio-scsi 컨트롤러와 CD·씨앗을 게스트 에이전트·virtio-mem 뒤에 단다. NIC·디스크의 인자(PCI 주소)는 CD
+    /// 없는 명령줄과 같다.
+    #[test]
+    fn virt_cdroms_go_on_virtio_scsi_after_everything() {
+        let mut base = mac_spec();
+        base.guest_agent = true;
+        base.hotplug = Some(HotplugLayout {
+            vcpus: 4,
+            max_memory_mib: 16384,
+            plugged_mib: 0,
+            ports: HOTPLUG_PORTS,
+            boot_disks: 1,
+            boot_nics: 1,
+            disk_ports: vec![],
+            nic_ports: vec![],
+        });
+        let without = build_cmdline(&base, &mac_host(), &paths()).unwrap();
+        assert!(without.iter().any(|a| a.starts_with("virtio-mem-pci")));
+        let mut spec = base;
+        spec.cdroms = vec![cdrom(Some("/pools/iso/a,b.raw"), Some(2))];
+        spec.cloud_init = Some(seed());
+        let with = build_cmdline(&spec, &mac_host(), &paths()).unwrap();
+        let dir = "/run/opl/vm/00000000-0000-0000-0000-000000000000";
+        assert_inserted_before_vnc(
+            &with,
+            &without,
+            &[
+                "-device",
+                "virtio-scsi-pci,id=scsi0",
+                "-blockdev",
+                "driver=file,filename=/pools/iso/a,,b.raw,node-name=cd0-file,read-only=on",
+                "-blockdev",
+                "driver=raw,file=cd0-file,node-name=cd0,read-only=on",
+                "-device",
+                "scsi-cd,bus=scsi0.0,drive=cd0,id=cd0-dev,bootindex=2",
+                "-blockdev",
+                &format!(
+                    "driver=file,filename={dir}/cidata.iso,node-name=cidata-file,read-only=on"
+                ),
+                "-blockdev",
+                "driver=raw,file=cidata-file,node-name=cidata,read-only=on",
+                "-device",
+                "scsi-cd,bus=scsi0.0,drive=cidata,id=cidata-dev",
+            ],
+        );
+    }
+
+    /// 씨앗만 있어도 드라이브를 단다. 실행 디렉터리 경로의 쉼표도 이스케이프한다.
+    #[test]
+    fn a_seed_without_cdroms_gets_its_own_drive() {
+        let paths = RuntimePaths::new(Path::new("/run/a,b"), Uuid::nil()).unwrap();
+        let spec = VmRuntimeSpec {
+            cloud_init: Some(seed()),
+            ..mac_spec()
+        };
+        let args = build_cmdline(&spec, &mac_host(), &paths).unwrap();
+        assert!(args.contains(&"virtio-scsi-pci,id=scsi0".to_string()));
+        assert!(args.contains(
+            &"driver=file,filename=/run/a,,b/vm/00000000-0000-0000-0000-000000000000/cidata.iso,node-name=cidata-file,read-only=on"
+                .to_string()
+        ));
+        assert!(args.contains(&"scsi-cd,bus=scsi0.0,drive=cidata,id=cidata-dev".to_string()));
+        assert!(!args.iter().any(|a| a.contains("cd0")));
+    }
+
+    /// q35의 AHCI 포트 6개를 SATA 디스크·CD·씨앗이 나눠 쓴다. virt의 CD는 SATA 포트를 쓰지 않는다. CD는 4개까지.
+    #[test]
+    fn sata_ports_and_cdrom_limits() {
+        let err = |spec: &VmRuntimeSpec, host: &HostProfile| {
+            build_cmdline(spec, host, &paths()).unwrap_err()
+        };
+        let mut q35 = x86_spec();
+        q35.disks[0].bus = DiskBus::Sata;
+        q35.cdroms = vec![cdrom(None, None); 3];
+        q35.cloud_init = Some(seed());
+        // SATA 디스크 2 + CD 3 + 씨앗 1 = 6
+        let args = build_cmdline(&q35, &x86_host(), &paths()).unwrap();
+        assert!(args.contains(&"ide-cd,bus=ide.5,drive=cidata,id=cidata-dev".to_string()));
+        q35.cdroms.push(cdrom(None, None));
+        assert_eq!(err(&q35, &x86_host()), CmdlineError::TooManySataDevices);
+        // 씨앗을 빼거나 SATA 디스크를 virtio로 바꾸면 6이다.
+        q35.cloud_init = None;
+        build_cmdline(&q35, &x86_host(), &paths()).unwrap();
+        q35.cloud_init = Some(seed());
+        q35.disks[0].bus = DiskBus::VirtioBlk;
+        build_cmdline(&q35, &x86_host(), &paths()).unwrap();
+
+        let mut virt = mac_spec();
+        virt.cdroms = vec![cdrom(None, None); MAX_CDROMS];
+        virt.cloud_init = Some(seed());
+        build_cmdline(&virt, &mac_host(), &paths()).unwrap();
+        virt.cdroms.push(cdrom(None, None));
+        assert_eq!(err(&virt, &mac_host()), CmdlineError::TooManyCdroms);
     }
 }

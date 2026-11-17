@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -929,6 +929,72 @@ impl QmpClient {
         self.execute("blockdev-add", Some(args)).await.map(drop)
     }
 
+    /// 이동식 장치 `id`(qdev id, 예: `cd0-dev`)의 트레이를 연다. `force`면 게스트가 잠가 두었어도 연다.
+    pub async fn blockdev_open_tray(&self, id: &str, force: bool) -> Result<(), QmpError> {
+        let args = json!({ "id": id, "force": force });
+        self.execute("blockdev-open-tray", Some(args))
+            .await
+            .map(drop)
+    }
+
+    /// 이동식 장치 `id`의 트레이를 닫는다.
+    pub async fn blockdev_close_tray(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("blockdev-close-tray", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
+    /// 트레이를 연 장치 `id`에서 매체를 뺀다(블록 노드는 그대로 남는다). 빈 드라이브도 성공한다.
+    pub async fn blockdev_remove_medium(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("blockdev-remove-medium", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
+    /// 트레이를 연 빈 장치 `id`에 블록 노드 `node`를 매체로 넣는다.
+    pub async fn blockdev_insert_medium(&self, id: &str, node: &str) -> Result<(), QmpError> {
+        let args = json!({ "id": id, "node-name": node });
+        self.execute("blockdev-insert-medium", Some(args))
+            .await
+            .map(drop)
+    }
+
+    /// 블록 장치마다의 qdev id와 넣은 매체의 파일(`query-block`). 빈 드라이브는 None이다. qdev가 경로
+    /// (`/machine/peripheral/disk0-dev/virtio-backend`)로 오면 id(`disk0-dev`)만 남기고, 장치가 없는 백엔드는 뺀다.
+    pub async fn query_block_media(&self) -> Result<Vec<(String, Option<PathBuf>)>, QmpError> {
+        let ret = self.execute("query-block", None).await?;
+        let blocks = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-block: {ret}")))?;
+        Ok(blocks
+            .iter()
+            .filter_map(|b| {
+                let qdev = b["qdev"].as_str()?;
+                let id = match qdev.strip_prefix("/machine/peripheral/") {
+                    Some(rest) => rest.split('/').next().unwrap_or(rest),
+                    None => qdev,
+                };
+                let file = b["inserted"]["file"].as_str().map(PathBuf::from);
+                Some((id.to_string(), file))
+            })
+            .collect())
+    }
+
+    /// 이동식 장치 `id`(qdev id)의 트레이가 열려 있는지(`query-block`의 `tray_open`). 없는 장치는 false다.
+    pub async fn query_tray_open(&self, id: &str) -> Result<bool, QmpError> {
+        let ret = self.execute("query-block", None).await?;
+        let blocks = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-block: {ret}")))?;
+        Ok(blocks.iter().any(|b| {
+            let qdev = b["qdev"].as_str().unwrap_or_default();
+            let dev = qdev
+                .strip_prefix("/machine/peripheral/")
+                .map_or(qdev, |rest| rest.split('/').next().unwrap_or(rest));
+            dev == id && b["tray_open"].as_bool() == Some(true)
+        }))
+    }
+
     /// QOM 객체 `path`의 속성 `property`를 읽는다.
     pub async fn qom_get(&self, path: &str, property: &str) -> Result<Value, QmpError> {
         self.execute(
@@ -1181,6 +1247,86 @@ impl QmpClient {
             .cloned()
             .ok_or_else(|| QmpError::Protocol(format!("job {id} not in query-jobs: {jobs}")))
     }
+}
+
+/// CD-ROM 드라이브 `index`(장치 `cd{index}-dev`)의 매체를 `medium` 파일로 바꾸고, None이면 빼서 빈 드라이브로 둔다.
+/// 매체는 읽기 전용 블록 노드 `{node}-file`(file)·`{node}`(raw)로 연다. 노드 이름은 켤 때의 `cd{index}`이거나 바꿀
+/// 때마다 쓰지 않은 `cd{index}-{n}`이다. 새 매체의 노드를 **먼저** 열므로 파일을 열지 못하면 넣은 매체는 그대로다.
+/// 그 뒤 트레이를 강제로 열고 매체를 빼고 새 노드를 넣은 다음 옛 노드(넣었던 매체와 앞서 실패하고 남은 것)를 닫는다.
+/// 옛 노드를 닫지 못해도 트레이는 닫는다(남은 노드는 다음 바꾸기가 닫는다). 넣기가 실패하면 연 노드를 닫고 트레이를
+/// 닫은 뒤 처음 오류를 돌려준다. `force`로 열므로 게스트가 트레이를 잠가 두었어도 바뀐다(게스트는 매체 바뀜을 본다).
+pub async fn change_medium(
+    qmp: &QmpClient,
+    index: usize,
+    medium: Option<&Path>,
+) -> Result<(), QmpError> {
+    let dev = format!("cd{index}-dev");
+    let base = format!("cd{index}");
+    // 이 드라이브의 매체 노드(raw `cd{i}`·`cd{i}-{n}`과 그 `-file`)
+    let ours = |n: &str| {
+        let raw = n.strip_suffix("-file").unwrap_or(n);
+        raw == base
+            || raw
+                .strip_prefix(&base)
+                .and_then(|r| r.strip_prefix('-'))
+                .is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()))
+    };
+    let old: Vec<String> = qmp
+        .query_block_nodes()
+        .await?
+        .into_iter()
+        .map(|n| n.node_name)
+        .filter(|n| ours(n))
+        .collect();
+    let mut opened = None;
+    if let Some(path) = medium {
+        let node = std::iter::once(base.clone())
+            .chain((1..).map(|k| format!("{base}-{k}")))
+            .find(|n| !old.contains(n) && !old.contains(&format!("{n}-file")))
+            .expect("a free node name");
+        let file = format!("{node}-file");
+        let open = async {
+            qmp.blockdev_add(json!({
+                "driver": "file", "filename": path.display().to_string(),
+                "node-name": file, "read-only": true,
+            }))
+            .await?;
+            qmp.blockdev_add(json!({
+                "driver": "raw", "file": file, "node-name": node, "read-only": true,
+            }))
+            .await
+        };
+        if let Err(e) = open.await {
+            // 정리 실패는 처음 오류를 가리지 않는다(없는 노드를 닫는 오류 등). 넣은 매체는 그대로다.
+            let _ = qmp.blockdev_del(&node).await;
+            let _ = qmp.blockdev_del(&file).await;
+            return Err(e);
+        }
+        opened = Some((node, file));
+    }
+    let swap = async {
+        qmp.blockdev_open_tray(&dev, true).await?;
+        qmp.blockdev_remove_medium(&dev).await?;
+        if let Some((node, _)) = &opened {
+            qmp.blockdev_insert_medium(&dev, node).await?;
+        }
+        Ok(())
+    };
+    if let Err(e) = swap.await {
+        if let Some((node, file)) = &opened {
+            let _ = qmp.blockdev_del(node).await;
+            let _ = qmp.blockdev_del(file).await;
+        }
+        let _ = qmp.blockdev_close_tray(&dev).await;
+        return Err(e);
+    }
+    // raw 노드를 먼저 닫아야 그 아래 file 노드가 닫힌다.
+    let (raws, files): (Vec<&String>, Vec<&String>) =
+        old.iter().partition(|n| !n.ends_with("-file"));
+    for n in raws.into_iter().chain(files) {
+        let _ = qmp.blockdev_del(n).await;
+    }
+    qmp.blockdev_close_tray(&dev).await
 }
 
 impl Drop for QmpClient {
@@ -2665,5 +2811,281 @@ mod tests {
                 .await;
         });
         assert_eq!(r.unwrap(), ["disk0-dev", "nic0"]);
+    }
+
+    /// 가짜 QEMU가 명령을 차례로 받아 이름·인자를 확인하고 답한다. 답이 `error`면 QMP 오류로 돌려준다.
+    async fn expect_commands(fake: &mut FakeQemu, steps: Vec<(&str, Value, Value)>) {
+        for (name, args, ret) in steps {
+            let cmd = fake.recv().await;
+            assert_eq!(cmd["execute"], name, "{cmd}");
+            assert_eq!(cmd["arguments"], args, "{name}");
+            let mut reply = match ret.get("error") {
+                Some(_) => ret,
+                None => json!({ "return": ret }),
+            };
+            reply["id"] = cmd["id"].clone();
+            fake.send(reply).await;
+        }
+    }
+
+    fn nodes(names: &[&str]) -> Value {
+        names
+            .iter()
+            .map(|n| json!({ "node-name": n, "drv": "raw" }))
+            .collect()
+    }
+
+    fn open_file(path: &str, node: &str) -> (&'static str, Value, Value) {
+        (
+            "blockdev-add",
+            json!({ "driver": "file", "filename": path, "node-name": format!("{node}-file"), "read-only": true }),
+            json!({}),
+        )
+    }
+
+    fn open_raw(node: &str) -> (&'static str, Value, Value) {
+        (
+            "blockdev-add",
+            json!({ "driver": "raw", "file": format!("{node}-file"), "node-name": node, "read-only": true }),
+            json!({}),
+        )
+    }
+
+    fn tray(cmd: &'static str) -> (&'static str, Value, Value) {
+        let args = match cmd {
+            "blockdev-open-tray" => json!({ "id": "cd1-dev", "force": true }),
+            _ => json!({ "id": "cd1-dev" }),
+        };
+        (cmd, args, json!({}))
+    }
+
+    fn insert(node: &str) -> (&'static str, Value, Value) {
+        (
+            "blockdev-insert-medium",
+            json!({ "id": "cd1-dev", "node-name": node }),
+            json!({}),
+        )
+    }
+
+    fn del(node: &str) -> (&'static str, Value, Value) {
+        ("blockdev-del", json!({ "node-name": node }), json!({}))
+    }
+
+    /// 빈 드라이브에 넣기: 노드를 연 뒤 트레이를 강제로 열고, 빈 매체를 빼고, 넣고, 닫는다.
+    #[tokio::test]
+    async fn change_medium_inserts_into_an_empty_drive() {
+        let (client, mut fake, _dir) = setup().await;
+        let flat = json!({ "flat": true });
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, Some(Path::new("/pools/iso/a.raw"))),
+            expect_commands(
+                &mut fake,
+                vec![
+                    (
+                        "query-named-block-nodes",
+                        flat,
+                        nodes(&["disk0", "disk0-file", "cd10", "cd10-file"])
+                    ),
+                    open_file("/pools/iso/a.raw", "cd1"),
+                    open_raw("cd1"),
+                    tray("blockdev-open-tray"),
+                    tray("blockdev-remove-medium"),
+                    insert("cd1"),
+                    tray("blockdev-close-tray"),
+                ],
+            )
+        );
+        r.unwrap();
+    }
+
+    /// 매체 바꾸기: 새 매체를 쓰지 않은 이름(`cd1-1`, 그다음 `cd1`)의 노드로 먼저 열고, 트레이를 열어 바꿔 넣은 뒤
+    /// 옛 노드를 닫는다(트레이는 한 번만 연다).
+    #[tokio::test]
+    async fn change_medium_replaces_the_medium() {
+        let (client, mut fake, _dir) = setup().await;
+        let flat = json!({ "flat": true });
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, Some(Path::new("/pools/iso/b.raw"))),
+            expect_commands(
+                &mut fake,
+                vec![
+                    (
+                        "query-named-block-nodes",
+                        flat.clone(),
+                        nodes(&["disk0", "cd1", "cd1-file"])
+                    ),
+                    open_file("/pools/iso/b.raw", "cd1-1"),
+                    open_raw("cd1-1"),
+                    tray("blockdev-open-tray"),
+                    tray("blockdev-remove-medium"),
+                    insert("cd1-1"),
+                    del("cd1"),
+                    del("cd1-file"),
+                    tray("blockdev-close-tray"),
+                ],
+            )
+        );
+        r.unwrap();
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, Some(Path::new("/pools/iso/a.raw"))),
+            expect_commands(
+                &mut fake,
+                vec![
+                    (
+                        "query-named-block-nodes",
+                        flat,
+                        nodes(&["disk0", "cd1-1", "cd1-1-file"])
+                    ),
+                    open_file("/pools/iso/a.raw", "cd1"),
+                    open_raw("cd1"),
+                    tray("blockdev-open-tray"),
+                    tray("blockdev-remove-medium"),
+                    insert("cd1"),
+                    del("cd1-1"),
+                    del("cd1-1-file"),
+                    tray("blockdev-close-tray"),
+                ],
+            )
+        );
+        r.unwrap();
+    }
+
+    /// 빼기: 매체를 빼고 노드를 닫고 트레이를 닫아 빈 드라이브로 둔다. 앞서 실패하고 남은 file 노드만 있어도 닫고,
+    /// 노드를 닫지 못해도 트레이는 닫는다.
+    #[tokio::test]
+    async fn change_medium_ejects_and_closes_leftover_nodes() {
+        let (client, mut fake, _dir) = setup().await;
+        let flat = json!({ "flat": true });
+        let busy = json!({ "error": { "class": "GenericError", "desc": "Node cd1 is in use" } });
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, None),
+            expect_commands(
+                &mut fake,
+                vec![
+                    (
+                        "query-named-block-nodes",
+                        flat.clone(),
+                        nodes(&["cd1", "cd1-file"])
+                    ),
+                    tray("blockdev-open-tray"),
+                    tray("blockdev-remove-medium"),
+                    ("blockdev-del", json!({ "node-name": "cd1" }), busy),
+                    del("cd1-file"),
+                    tray("blockdev-close-tray"),
+                ],
+            )
+        );
+        r.unwrap();
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, None),
+            expect_commands(
+                &mut fake,
+                vec![
+                    ("query-named-block-nodes", flat, nodes(&["cd1-2-file"])),
+                    tray("blockdev-open-tray"),
+                    tray("blockdev-remove-medium"),
+                    del("cd1-2-file"),
+                    tray("blockdev-close-tray"),
+                ],
+            )
+        );
+        r.unwrap();
+    }
+
+    /// 새 매체를 열지 못하면 연 노드만 닫고 트레이는 건드리지 않는다(넣은 매체 그대로). 넣기가 실패하면 연 노드를
+    /// 닫고 트레이를 닫은 뒤 처음 오류를 돌려준다(정리 오류는 가리지 않는다).
+    #[tokio::test]
+    async fn change_medium_cleans_up_after_a_failure() {
+        let (client, mut fake, _dir) = setup().await;
+        let flat = json!({ "flat": true });
+        let failed = json!({ "error": { "class": "GenericError", "desc": "Could not open" } });
+        let gone = json!({ "error": { "class": "GenericError", "desc": "Failed to find node" } });
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, Some(Path::new("/pools/iso/a.raw"))),
+            expect_commands(
+                &mut fake,
+                vec![
+                    (
+                        "query-named-block-nodes",
+                        flat.clone(),
+                        nodes(&["cd1", "cd1-file"])
+                    ),
+                    open_file("/pools/iso/a.raw", "cd1-1"),
+                    ("blockdev-add", open_raw("cd1-1").1, failed.clone()),
+                    ("blockdev-del", json!({ "node-name": "cd1-1" }), gone),
+                    del("cd1-1-file"),
+                ],
+            )
+        );
+        match r.unwrap_err() {
+            QmpError::Command { desc, .. } => assert_eq!(desc, "Could not open"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+        let (r, ()) = tokio::join!(
+            change_medium(&client, 1, Some(Path::new("/pools/iso/a.raw"))),
+            expect_commands(
+                &mut fake,
+                vec![
+                    ("query-named-block-nodes", flat, nodes(&[])),
+                    open_file("/pools/iso/a.raw", "cd1"),
+                    open_raw("cd1"),
+                    tray("blockdev-open-tray"),
+                    tray("blockdev-remove-medium"),
+                    ("blockdev-insert-medium", insert("cd1").1, failed),
+                    del("cd1"),
+                    del("cd1-file"),
+                    tray("blockdev-close-tray"),
+                ],
+            )
+        );
+        match r.unwrap_err() {
+            QmpError::Command { desc, .. } => assert_eq!(desc, "Could not open"),
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// 트레이가 열린 장치인지(`query-block`의 `tray_open`)
+    #[tokio::test]
+    async fn query_tray_open_reads_the_device() {
+        let (client, mut fake, _dir) = setup().await;
+        let ret = json!([
+            { "device": "", "qdev": "/machine/peripheral/cd0-dev", "removable": true, "tray_open": true },
+            { "device": "", "qdev": "cd1-dev", "removable": true, "tray_open": false }
+        ]);
+        for (dev, want) in [("cd0-dev", true), ("cd1-dev", false), ("cd2-dev", false)] {
+            let (r, cmd) = tokio::join!(client.query_tray_open(dev), reply(&mut fake, ret.clone()));
+            assert_eq!(cmd["execute"], "query-block");
+            assert_eq!(r.unwrap(), want, "{dev}");
+        }
+    }
+
+    /// `query-block`: qdev id(경로면 장치 id만)와 매체 파일. 빈 드라이브는 None, 장치 없는 백엔드는 뺀다.
+    #[tokio::test]
+    async fn query_block_media_reads_devices_and_files() {
+        let (client, mut fake, _dir) = setup().await;
+        let ret = json!([
+            { "device": "", "qdev": "/machine/peripheral/disk0-dev/virtio-backend", "removable": false,
+              "inserted": { "file": "/pools/local/a.qcow2", "node-name": "disk0", "ro": false } },
+            { "device": "", "qdev": "cd0-dev", "removable": true, "tray_open": false,
+              "inserted": { "file": "/pools/iso/u.raw", "node-name": "cd0", "ro": true } },
+            { "device": "", "qdev": "/machine/peripheral/cd1-dev", "removable": true, "tray_open": false },
+            { "device": "", "removable": false }
+        ]);
+        let (r, cmd) = tokio::join!(client.query_block_media(), reply(&mut fake, ret));
+        assert_eq!(cmd["execute"], "query-block");
+        assert_eq!(
+            r.unwrap(),
+            [
+                (
+                    "disk0-dev".to_string(),
+                    Some(PathBuf::from("/pools/local/a.qcow2"))
+                ),
+                (
+                    "cd0-dev".to_string(),
+                    Some(PathBuf::from("/pools/iso/u.raw"))
+                ),
+                ("cd1-dev".to_string(), None),
+            ]
+        );
     }
 }

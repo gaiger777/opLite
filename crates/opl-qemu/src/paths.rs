@@ -16,6 +16,8 @@ pub struct RuntimePaths {
     pub qga_socket: PathBuf,
     pub pidfile: PathBuf,
     pub uefi_vars: PathBuf,
+    /// cloud-init NoCloud 씨앗 ISO(계획 57). `cloud_init`이 있는 VM만 드라이버가 쓴다.
+    pub cidata: PathBuf,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -34,6 +36,7 @@ impl RuntimePaths {
             qga_socket: dir.join("qga.sock"),
             pidfile: dir.join("qemu.pid"),
             uefi_vars: dir.join("uefi-vars.fd"),
+            cidata: dir.join("cidata.iso"),
             dir,
         };
         for sock in [&paths.qmp_socket, &paths.vnc_socket, &paths.qga_socket] {
@@ -64,6 +67,7 @@ mod tests {
         assert_eq!(p.qga_socket, Path::new(dir).join("qga.sock"));
         assert_eq!(p.pidfile, Path::new(dir).join("qemu.pid"));
         assert_eq!(p.uefi_vars, Path::new(dir).join("uefi-vars.fd"));
+        assert_eq!(p.cidata, Path::new(dir).join("cidata.iso"));
     }
 
     #[test]
