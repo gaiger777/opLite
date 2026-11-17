@@ -60,6 +60,34 @@ async fn starts_assigned_vm_and_records_status() {
     );
 }
 
+/// 템플릿(계획 58)은 켜라고 해도 켜지 않고 이유를 남긴다. 보통 VM으로 되돌리면 켠다.
+#[tokio::test]
+async fn never_starts_a_template() {
+    let env = Env::start().await;
+    let mut vm = vm("tmpl", env.node);
+    vm.spec.template = true;
+    env.create(&vm).await;
+
+    let got = env
+        .wait(vm.id, "refused", |v| v.status.last_error.is_some())
+        .await;
+    assert_eq!(got.status.phase, VmPhase::Stopped);
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some(opl_reconciler::TEMPLATE_NOT_STARTED)
+    );
+    assert_eq!(env.pid(vm.id).await, None);
+
+    let mut current = env.get(vm.id);
+    current.spec.template = false;
+    env.cluster
+        .update_spec(vm.id, None, current.labels.clone(), &current.spec)
+        .await
+        .unwrap();
+    env.wait(vm.id, "running", running).await;
+    assert!(env.pid(vm.id).await.is_some());
+}
+
 #[tokio::test]
 async fn ignores_vms_not_assigned_to_this_node() {
     let env = Env::start().await;

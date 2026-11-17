@@ -211,7 +211,7 @@ pub(super) async fn import(
         .map_err(|e| format!("invalid VM spec: {e}"))?;
     let mut new: Vm = Resource::new(run.name.as_str(), spec);
     new.id = task.spec.target;
-    create_vm(ctx, task, new).await?;
+    create_vm(ctx, task, new, None, false).await?;
 
     let vm = task.spec.target;
     update_import(ctx, id, |s| {

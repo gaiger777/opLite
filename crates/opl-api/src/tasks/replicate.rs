@@ -33,7 +33,7 @@ use uuid::Uuid;
 
 use super::Ctx;
 use super::backup::{VARS_FILE, backup_root, get_backup, read_manifest};
-use crate::backup_receive::drop_install_media;
+use crate::backup_receive::{drop_install_media, drop_templates};
 use crate::backups::now;
 use crate::remote_client::{RemoteClient, RemoteError};
 use crate::vms::{mask_data, mask_password};
@@ -574,7 +574,7 @@ fn copied_spec(got: &VmSpec) -> VmSpec {
 }
 
 /// 원본 VM 스펙 `local`을 원격이 받아 응답할 모양으로: 비밀을 가리고([`copied_spec`]), 받는 쪽이 늘 버리는 복제 대상을
-/// 버리고, 받는 쪽이 기능이 모자라 버린 필드(사본 `got`에 없는 핫플러그 상한, CD-ROM·cloud-init)는 받는 쪽과 같은
+/// 버리고, 받는 쪽이 기능이 모자라 버린 필드(사본 `got`에 없는 핫플러그 상한, CD-ROM·cloud-init, 템플릿 표시)는 받는 쪽과 같은
 /// 규칙으로 버린다.
 fn expected_spec(local: &VmSpec, got: &VmSpec) -> VmSpec {
     let mut spec = copied_spec(local);
@@ -588,6 +588,9 @@ fn expected_spec(local: &VmSpec, got: &VmSpec) -> VmSpec {
         && got.cloud_init.is_none()
     {
         drop_install_media(&mut spec);
+    }
+    if spec.template && !got.template {
+        drop_templates(&mut spec);
     }
     spec
 }
@@ -867,5 +870,12 @@ mod tests {
         let mut lost = same.clone();
         lost.cloud_init = None;
         assert_ne!(expected_spec(&local, &lost), copied_spec(&lost));
+        // 템플릿을 모르는 받는 쪽은 템플릿 표시를 버린다(계획 58).
+        let mut tmpl = local.clone();
+        tmpl.template = true;
+        assert_eq!(expected_spec(&tmpl, &same), copied_spec(&same));
+        let mut kept = same.clone();
+        kept.template = true;
+        assert_eq!(expected_spec(&tmpl, &kept), copied_spec(&kept));
     }
 }

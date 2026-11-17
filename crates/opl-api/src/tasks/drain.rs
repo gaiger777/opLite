@@ -58,9 +58,11 @@ pub(super) async fn drain(ctx: &Ctx, node: Uuid) -> Result<(), String> {
     loop {
         in_maintenance(ctx, node)?;
         let (_, mut vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+        // 템플릿(계획 58)은 켜지지 않으므로 옮길 것이 없다(방어로 뺀다).
         vms.retain(|v| {
             v.spec.node == Some(node)
                 && v.spec.power == PowerState::Running
+                && !v.spec.template
                 && !not_moved.contains_key(&v.id)
         });
         vms.sort_by(|a, b| a.name.cmp(&b.name));

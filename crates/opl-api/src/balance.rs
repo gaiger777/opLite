@@ -321,7 +321,7 @@ fn recent(at: u64, now: u64) -> bool {
 }
 
 /// 균형 조정기가 이 VM을 옮길 수 있는지. 아니면 그 이유다(시험·debug 로그).
-/// 자리 잡고 실행 중이고 마이그레이션 중이 아니며, 고정(`pinned`)이 아니고, 로컬 풀 디스크가 없거나 복제 대상이 있고(그
+/// 템플릿이 아니고(계획 58 — 켜지지 않는다), 자리 잡고 실행 중이고 마이그레이션 중이 아니며, 고정(`pinned`)이 아니고, 로컬 풀 디스크가 없거나 복제 대상이 있고(그
 /// 복제본 노드로만 옮긴다 — [`target_ok`]), 끝나지 않은
 /// 스냅샷·되돌리기·복제·백업·전원·마이그레이션·핫플러그·디스크 크기 늘리기 Task가 없고, 끝나지 않은 하드웨어 변경(스펙의
 /// 디스크·NIC가 도는 장치와 다름, 게스트가 아직 내려 주지 않은 장치)이 없고, HA 끄기 요청·옮겨 달라는 요청이 없고,
@@ -334,6 +334,9 @@ pub fn movable(
     moved: &BTreeMap<Uuid, u64>,
     now: u64,
 ) -> Result<(), &'static str> {
+    if vm.spec.template {
+        return Err("template");
+    }
     if vm.spec.power != PowerState::Running || vm.spec.node.is_none() {
         return Err("not placed");
     }
@@ -1356,6 +1359,9 @@ mod tests {
         let mut pinned = ok.clone();
         pinned.spec.placement = Some(VmPlacement { pinned: true });
         assert_eq!(check(&inv, &pinned, &[], &none), Err("pinned"));
+        let mut template = ok.clone();
+        template.spec.template = true;
+        assert_eq!(check(&inv, &template, &[], &none), Err("template"));
 
         let local = with_disk(vm("local", 1, 1024, &a), "d-local");
         assert_eq!(

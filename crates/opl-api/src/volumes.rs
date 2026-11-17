@@ -654,6 +654,34 @@ pub(crate) fn in_snapshot_message(volume: &str, snapshot: &str, vm: Uuid) -> Str
     format!("volume {volume:?} is used by snapshot {snapshot:?} of VM {vm}")
 }
 
+/// 이름 목록을 셋까지 적고 나머지는 `…`로 줄인다(연결 복제 문구).
+fn short_list(names: &[&str]) -> String {
+    let mut list = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > 3 {
+        list.push_str(", …");
+    }
+    list
+}
+
+/// 연결 복제(`clones`, 볼륨 이름)의 기반인 볼륨을 지울 수 없다는 문구(계획 58 `volume_has_clones`)
+pub(crate) fn has_clones_message(volume: &str, clones: &[&str]) -> String {
+    format!(
+        "volume {volume:?} is the base of {} linked clone(s) ({}); delete or flatten them first",
+        clones.len(),
+        short_list(clones)
+    )
+}
+
+/// 연결 복제(`clones`, 쓰는 VM 이름이나 붙지 않은 볼륨 이름)가 남은 템플릿을 VM으로 되돌릴 수 없다는 문구(계획 58
+/// `template_in_use`)
+pub(crate) fn template_in_use_message(template: &str, clones: &[&str]) -> String {
+    format!(
+        "template {template:?} has {} linked clone(s) ({}); delete or flatten them first",
+        clones.len(),
+        short_list(clones)
+    )
+}
+
 /// CD-ROM 드라이브에 꽂힌 ISO를 지울 수 없다는 문구. VM이 여럿이면 첫 VM과 나머지 수를 적는다.
 pub(crate) fn in_cdrom_message(volume: &str, users: &[&Vm]) -> String {
     let mut message = format!(
@@ -734,6 +762,18 @@ pub async fn resize_volume(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_clone_messages_list_three_names() {
+        assert_eq!(
+            has_clones_message("tmpl-disk0", &["web-1-disk0", "web-2-disk0"]),
+            "volume \"tmpl-disk0\" is the base of 2 linked clone(s) (web-1-disk0, web-2-disk0); delete or flatten them first"
+        );
+        assert_eq!(
+            template_in_use_message("tmpl", &["web-1", "web-2", "web-3", "web-4"]),
+            "template \"tmpl\" has 4 linked clone(s) (web-1, web-2, web-3, …); delete or flatten them first"
+        );
+    }
 
     #[test]
     fn redact_url_hides_user_info_only() {

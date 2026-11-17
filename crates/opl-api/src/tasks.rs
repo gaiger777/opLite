@@ -13,6 +13,7 @@ mod import;
 mod migrate;
 mod replicate;
 mod snapshot;
+mod template;
 mod vm_replicate;
 
 pub(crate) use clone::volume_name;
@@ -581,7 +582,9 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// 않는다. VM 가져오기와 가져오기 지우기도 그 가져오기의 줄에 선다(가져오기 Task의 대상은 새 VM이다).
 /// 노드 비우기는 그 노드의 줄에 서서 한 노드를 한 번에 하나만 비운다. 로컬 디스크 복제도 VM의 줄에 서서 백업·스냅샷·
 /// 핫플러그·마이그레이션과 차례로 돈다(디스크를 읽는 중에 장치가 바뀌거나 VM이 옮겨 가면 안 된다). Ceph Task는
-/// `Ceph` 리소스의 줄에 서서 한 노드 안에서 차례로 돈다(같은 노드의 apt·`/etc/ceph`를 함께 만지지 않게).
+/// `Ceph` 리소스의 줄에 서서 한 노드 안에서 차례로 돈다(같은 노드의 apt·`/etc/ceph`를 함께 만지지 않게). 평탄화(계획 58)는
+/// 크기 늘리기처럼 그 볼륨을 쓰는 VM의 줄에 서서 스냅샷·복제·백업과 섞이지 않는다. 템플릿 되돌리기는 템플릿 VM의 줄에
+/// 서서 앞서 받은 배포(복제) Task가 끝난 뒤 남은 연결 복제를 본다.
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     match task.spec.op {
@@ -589,7 +592,10 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
         TaskOp::VmImport { import, .. } => return Some(import),
         _ => {}
     }
-    if !matches!(task.spec.op, TaskOp::VolumeResize { .. }) {
+    if !matches!(
+        task.spec.op,
+        TaskOp::VolumeResize { .. } | TaskOp::VolumeFlatten
+    ) {
         let vm_queue = matches!(
             task.spec.op,
             TaskOp::VmClone { .. }
@@ -597,6 +603,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
                 | TaskOp::VmBackup { .. }
                 | TaskOp::VmHotplug
                 | TaskOp::VmReplicate { .. }
+                | TaskOp::VmUntemplate
         );
         let backup_queue = matches!(
             task.spec.op,
@@ -673,7 +680,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다. 노드 비우기는 마이그레이션을 여럿
     // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`). 로컬 디스크 복제는 전체 회차가 디스크 크기만큼
     // 걸리므로 보낸 양이 늘지 않는 시간만 본다(`replication_stall`). Ceph Task는 꾸러미 설치·디스크 지우기처럼
-    // 오래 걸리는 단계마다 한도가 따로 있다. URL 받기는 이미지 크기만큼 걸리므로 연결·읽기 쉼 한도만 둔다.
+    // 오래 걸리는 단계마다 한도가 따로 있다. URL 받기는 이미지 크기만큼 걸리므로 연결·읽기 쉼 한도만 둔다. 평탄화는
+    // 기반 데이터를 디스크 크기만큼 복사한다(`qemu-img rebase`, `zfs send`).
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
@@ -685,6 +693,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::NodeDrain
             | TaskOp::VmReplicate { .. }
             | TaskOp::VolumeDownload { .. }
+            | TaskOp::VolumeFlatten
     ) || task.spec.op.is_ceph();
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
@@ -858,16 +867,25 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
         TaskOp::SnapshotDelete { snapshot, .. } => snapshot::delete(ctx, id, *snapshot).await,
         TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
-        // 연결 복제·배포 덮어쓰기(계획 58)는 뒤 스테이지에서 실행한다.
-        op @ TaskOp::VmClone { .. } if op.needs_templates() => {
-            Err("this node cannot make linked clones or deploy templates yet".into())
-        }
+        // 연결하지 못해 전체 복사한 디스크, 고정 IP·호스트 이름, 켜지 못한 이유는 경고로 남긴다.
         TaskOp::VmClone {
             name,
             snapshot,
             pool,
-            ..
-        } => return clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
+            linked,
+            overrides,
+        } => {
+            return clone::clone(
+                ctx,
+                task,
+                name,
+                *snapshot,
+                pool.as_deref(),
+                *linked,
+                overrides.as_deref(),
+            )
+            .await;
+        }
         TaskOp::VmMigrate { node, pool } => {
             migrate::migrate(ctx, task, *node, pool.as_deref()).await
         }
@@ -922,8 +940,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             source_format,
             ..
         } => download::download(ctx, task, url, sha256.as_deref(), *source_format).await,
-        TaskOp::VolumeFlatten => Err("this node cannot flatten volumes yet".into()),
-        TaskOp::VmUntemplate => Err("this node cannot convert templates back to VMs yet".into()),
+        TaskOp::VolumeFlatten => template::flatten(ctx, id).await,
+        TaskOp::VmUntemplate => template::untemplate(ctx, task).await,
     };
     done.map(|()| None)
 }
@@ -1175,6 +1193,25 @@ async fn check_iso_source(source: &Path) -> Result<(), String> {
 }
 
 async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
+    // 연결 복제의 기반은 지우지 않는다(계획 58). API가 확인한 뒤 다른 노드의 복제 Task가 그새 기록을 만들었을 수 있다.
+    if let Some(volume) = ctx
+        .cluster
+        .get::<VolumeSpec>(id)
+        .map_err(|e| e.to_string())?
+    {
+        let (_, volumes) = ctx
+            .cluster
+            .list::<VolumeSpec>()
+            .map_err(|e| e.to_string())?;
+        let clones: Vec<&str> = volumes
+            .iter()
+            .filter(|v| v.spec.base == Some(id))
+            .map(|v| v.name.as_str())
+            .collect();
+        if !clones.is_empty() {
+            return Err(crate::volumes::has_clones_message(&volume.name, &clones));
+        }
+    }
     // ISO는 여러 VM이 함께 쓰므로 API가 확인한 뒤 다른 노드의 요청이 CD에 넣었거나 그 VM의 스냅샷을 찍었을 수 있다.
     // 지우기 전에 다시 본다.
     if let Some(volume) = ctx

@@ -1053,7 +1053,7 @@ pub(super) async fn restore(
     new.spec
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
-    create_vm(ctx, task, new).await?;
+    create_vm(ctx, task, new, None, false).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 

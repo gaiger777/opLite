@@ -33,6 +33,10 @@ use crate::resolve::{
 /// 크래시를 알리므로 그보다 길게 잡는다. 짧으면 느리게 끝난 크래시를 두 번 세게 된다.
 const EVENT_GRACE: Duration = Duration::from_secs(6);
 
+/// 켜라고 한 템플릿(계획 58)을 켜지 않았을 때의 status
+pub const TEMPLATE_NOT_STARTED: &str =
+    "the VM is a template and is never started; deploy a VM from it or convert it back";
+
 /// HA VM을 켜거나 이어서 실행하기 전에 리스를 기다리는 동안의 status
 const HA_WAITING: &str = "waiting for the cluster majority before starting an HA VM";
 /// 리스를 잃어 HA VM을 끈 뒤 리스를 기다리는 동안의 status
@@ -835,6 +839,16 @@ impl Worker {
                 self.awaiting_event = None;
                 self.force_requested = false;
                 self.deactivate_disks(vm).await;
+                // 템플릿(계획 58)은 스펙과 상관없이 켜지 않는다. API가 켜기를 막지만, 막기 전의 쓰기나 저장소를
+                // 직접 고친 경우를 막는다(켜면 연결 복제의 기반 디스크가 바뀐다).
+                if vm.spec.template {
+                    tracing::warn!(vm = %self.id, "not starting a template");
+                    self.backoff = None;
+                    status.phase = VmPhase::Stopped;
+                    status.pid = None;
+                    status.last_error = Some(TEMPLATE_NOT_STARTED.into());
+                    return Ok(status);
+                }
                 // 옮겨 달라고 했다. 리더가 옮기거나(spec의 노드), 포기하거나(power stopped), 사용자가 끌
                 // 때까지 켜지 않는다. 저장소에 요청이 있으면 리더가 쓴 status를 덮지 않는다.
                 let node = self.config.node;
@@ -1067,7 +1081,11 @@ impl Worker {
             Err(ResolveError::Cluster(e)) => return Err(e.into()),
             // 풀이 이 노드에서 아직 준비되지 않았거나(NFS 서버가 멈춤, 마운트 전 등) 디스크를 늘리는
             // 중이다. 끝나면 시작할 수 있으므로 실패로 세지 않고 잠시 뒤 다시 시도한다.
-            Err(e @ (ResolveError::PoolUnavailable(..) | ResolveError::VolumeResizing(_))) => {
+            Err(
+                e @ (ResolveError::PoolUnavailable(..)
+                | ResolveError::VolumeResizing(_)
+                | ResolveError::VolumeFlattening(_)),
+            ) => {
                 let delay = self.config.retry_interval;
                 self.backoff = Some((
                     Instant::now() + delay,

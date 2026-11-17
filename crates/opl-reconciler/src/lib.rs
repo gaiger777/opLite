@@ -18,3 +18,4 @@ pub use firewall::FirewallGate;
 pub use firmware::{FirmwareError, FirmwareFetcher};
 pub use ha::{HaConfig, HaGuard};
 pub use reconciler::{Reconciler, ReconcilerHandle};
+pub use worker::TEMPLATE_NOT_STARTED;

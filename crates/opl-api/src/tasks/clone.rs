@@ -7,15 +7,17 @@ use std::path::PathBuf;
 use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
 use opl_types::cloud_init::IpConfig;
-use opl_types::node::{NodeSpec, PLACEMENT};
+use opl_types::node::{NodeSpec, PLACEMENT, TEMPLATES};
 use opl_types::placement::HaGroupSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotPhase;
 use opl_types::storage::{
-    StoragePool, StoragePoolSpec, Volume, VolumeSpec, pool_error_on, pool_listed_on, pool_usable_on,
+    PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec, pool_error_on, pool_listed_on,
+    pool_supports_linked_clones, pool_usable_on,
 };
-use opl_types::task::Task;
+use opl_types::task::{Task, TaskOp, TaskSpec};
+use opl_types::template::{CloneOverrides, apply_overrides, grown_disks};
 use opl_types::vm::{MacAddr, PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
@@ -24,6 +26,7 @@ use super::snapshot::{
     vars_copy,
 };
 use super::{Ctx, mark_ready, remove_volume};
+use crate::scheduler::{Inventory, node_fits, schedule};
 use crate::volumes::block_pool_kind;
 
 /// 리소스 이름의 최대 길이
@@ -91,14 +94,26 @@ fn pool_by_name(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
 
 /// 원본(스냅샷이나 꺼진 VM의 지금 상태)의 디스크를 이 노드에서 새 볼륨으로 복사하고 UEFI 변수를
 /// 복사한 뒤 새 VM을 만든다. 새 VM은 꺼져 있고 노드·예약·스냅샷이 없으며 MAC은 새로 받는다.
+///
+/// 템플릿에서 배포하면(계획 58 §6) `linked`에 따라 디스크마다 연결 복제(기반을 함께 쓰는 볼륨, 기록에 `base`)나 전체
+/// 복사를 하고, `overrides`(vCPU·메모리·노드·NIC 네트워크·디스크 크기·cloud-init)를 적용하고, `start`면 놓을 노드를
+/// 골라 켠 채로 만든다. 연결하지 못해 전체 복사한 디스크, 켜지 못한 이유는 경고로 남긴다.
 pub(super) async fn clone(
     ctx: &Ctx,
     task: &Task,
     name: &str,
     snapshot: Option<Uuid>,
     pool: Option<&str>,
+    linked: Option<bool>,
+    overrides: Option<&CloneOverrides>,
 ) -> Result<Option<String>, String> {
     let vm = get_vm(ctx, task.spec.target)?;
+    // API가 확인했지만 줄에서 기다리는 사이 VM으로 되돌려졌을 수 있다.
+    if linked == Some(true) && (!vm.spec.template || snapshot.is_some()) {
+        return Err(LINKED_ONLY_FROM_TEMPLATES.into());
+    }
+    // 연결 복제를 해 볼지: 템플릿의 지금 상태에서, `linked`가 거짓이 아니면
+    let link = vm.spec.template && snapshot.is_none() && linked != Some(false);
     let stopped = vm.spec.power == PowerState::Stopped && is_down(&vm);
     let (spec, tag) = match snapshot {
         Some(id) => {
@@ -125,6 +140,14 @@ pub(super) async fn clone(
         return Err(format!("VM {name:?} already exists"));
     }
     let disks = ready_disks(ctx, &spec)?;
+    // 늘릴 디스크 크기(디스크 순번별). 원본 볼륨보다 작으면 거절한다.
+    let grown = match overrides {
+        Some(ov) => {
+            let sizes: Vec<u64> = disks.iter().map(|(v, _)| v.spec.size_bytes).collect();
+            grown_disks(ov, &sizes).map_err(|e| e.to_string())?
+        }
+        None => vec![None; disks.len()],
+    };
     let mut targets = Vec::with_capacity(disks.len());
     for (volume, source_pool) in &disks {
         check_local(ctx, volume, source_pool)?;
@@ -154,16 +177,47 @@ pub(super) async fn clone(
         targets.push(target);
     }
 
+    // 디스크마다 연결 복제로 만들지 정한다. `linked: true`면 하나라도 안 되면 실패, 없으면 전체 복사하고 경고를 남긴다.
+    let mut warnings = Vec::new();
+    let mut links = vec![false; disks.len()];
+    if link {
+        let (_, tasks) = ctx.cluster.list::<TaskSpec>().map_err(|e| e.to_string())?;
+        for (i, ((source, source_pool), target)) in disks.iter().zip(&targets).enumerate() {
+            match unlinkable(i, source, source_pool, target) {
+                None => {}
+                Some(reason) if linked == Some(true) => return Err(reason),
+                Some(reason) => {
+                    warnings.push(format!("{reason}; made a full copy"));
+                    continue;
+                }
+            }
+            // 다른 노드의 API가 기반을 지우기로 했으면 그 위에 복제를 만들지 않는다(지우기 Task도 다시 확인한다).
+            let deleting = tasks.iter().any(|t| {
+                t.spec.target == source.id
+                    && t.spec.op == TaskOp::VolumeDelete
+                    && !t.status.state.is_finished()
+            });
+            if deleting {
+                return Err(format!("volume {:?} is being deleted", source.name));
+            }
+            links[i] = true;
+        }
+    }
+
     let (_, volumes) = ctx
         .cluster
         .list::<VolumeSpec>()
         .map_err(|e| e.to_string())?;
     let mut taken: HashSet<String> = volumes.into_iter().map(|v| v.name).collect();
     let mut copies: Vec<(Volume, &StoragePool)> = Vec::with_capacity(disks.len());
-    for ((source, source_pool), target) in disks.iter().zip(&targets) {
+    for (i, ((source, source_pool), target)) in disks.iter().zip(&targets).enumerate() {
         let copy_name = volume_name(name, &source.name, |n| taken.contains(n));
         taken.insert(copy_name.clone());
-        let format = copy_format(source_pool, target, source.spec.format);
+        let format = if links[i] {
+            linked_format(target)
+        } else {
+            copy_format(source_pool, target, source.spec.format)
+        };
         let mut copy: Volume = Resource::new(
             copy_name,
             VolumeSpec {
@@ -171,7 +225,8 @@ pub(super) async fn clone(
                 size_bytes: source.spec.size_bytes,
                 format,
                 content: Default::default(),
-                base: None,
+                // 기반 기록이 먼저다: 저장소 작업 전에 남겨 끊겨도 기반을 지울 수 없다(설계 §4).
+                base: links[i].then_some(source.id),
             },
         );
         copy.status.node = Some(ctx.config.node);
@@ -181,22 +236,56 @@ pub(super) async fn clone(
             .create(&copy)
             .await
             .map_err(|e| format!("cannot create volume {:?}: {e}", copy.name))?;
-        ctx.storage
-            .copy_volume(
-                source_pool,
-                source.id,
-                source.spec.format,
-                tag.as_deref(),
-                force_share,
-                target,
-                copy.id,
-                format,
-            )
-            .await
-            .map_err(|e| format!("cannot copy volume {:?}: {e}", source.name))?;
+        if links[i] {
+            // 기록한 뒤 다시 본다: 다른 노드의 되돌리기 Task는 `template: false`를 쓴 뒤 연결 복제를 다시 보므로, 이 기록이
+            // 그 쓰기보다 앞서면 되돌리기가 이 기록을 보고 물러나고, 뒤면 여기서 `false`를 보고 물러난다(정리가 기록을 지운다).
+            if !get_vm(ctx, vm.id)?.spec.template {
+                return Err(format!("template {:?} was converted back to a VM", vm.name));
+            }
+            let (_, got) = ctx
+                .storage
+                .link_clone(source_pool, source.id, source.spec.format, copy.id)
+                .await
+                .map_err(|e| format!("cannot link volume {:?}: {e}", source.name))?;
+            // 백엔드가 고른 형식이 다르면 기록을 고친다(정리가 그 형식으로 지운다).
+            if got != copy.spec.format {
+                copy.spec.format = got;
+                ctx.cluster
+                    .update_spec(copy.id, None, copy.labels.clone(), &copy.spec)
+                    .await
+                    .map_err(|e| format!("cannot record volume {:?}: {e}", copy.name))?;
+            }
+        } else {
+            ctx.storage
+                .copy_volume(
+                    source_pool,
+                    source.id,
+                    source.spec.format,
+                    tag.as_deref(),
+                    force_share,
+                    target,
+                    copy.id,
+                    format,
+                )
+                .await
+                .map_err(|e| format!("cannot copy volume {:?}: {e}", source.name))?;
+        }
+        // 늘린 크기는 `mark_ready`가 실제 크기로 기록한다.
+        if let Some(size) = grown[i] {
+            ctx.storage
+                .resize_volume(target, copy.id, copy.spec.format, size)
+                .await
+                .map_err(|e| format!("cannot grow volume {:?}: {e}", copy.name))?;
+        }
         copies.push((copy, target));
     }
 
+    // 배포 때 바꾸는 값을 다시 적용한다(API가 같은 검사를 미리 했다). 새 VM은 템플릿이 아니다.
+    let mut spec = match overrides {
+        Some(ov) => apply_overrides(&spec, ov).map_err(|e| e.to_string())?,
+        None => spec,
+    };
+    spec.template = false;
     let mut new: Vm = Resource::new(name, spec);
     if let Some(dir) = &ctx.config.state_dir {
         let from = match snapshot {
@@ -228,9 +317,110 @@ pub(super) async fn clone(
     for nic in &mut new.spec.nics {
         nic.mac = None;
     }
-    let warning = identity_warning("the clone", &new.spec);
-    create_vm(ctx, task, new).await?;
-    Ok(warning)
+    warnings.extend(identity_warning(
+        "the clone",
+        &kept_identity(&new.spec, overrides),
+    ));
+    // 켜라고 했으면 놓을 노드를 고른다(주어진 노드는 그 노드가 켤 수 있는지 본다). 없으면 꺼진 채 만든다.
+    // 원본의 노드는 받지 않는다: 배포 때 준 노드만(`spec.node`, 켤 곳).
+    new.spec.node = overrides.and_then(|ov| ov.node);
+    let node = new.spec.node;
+    let start = match overrides.is_some_and(|ov| ov.start) {
+        false => None,
+        true => match start_node(ctx, &new) {
+            Ok(node) => Some(node),
+            Err(reason) => {
+                warnings.push(format!("{reason}; start {name:?} later"));
+                None
+            }
+        },
+    };
+    create_vm(ctx, task, new, start.or(node), start.is_some()).await?;
+    Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+}
+
+/// `linked: true`인데 원본이 템플릿이 아닐 때
+const LINKED_ONLY_FROM_TEMPLATES: &str = "linked clones can be made only from templates";
+
+/// 디스크 `disk`(원본 볼륨 `source`, 그 풀 `source_pool`)를 풀 `target`에 연결 복제로 만들 수 없는 이유. 되면 `None`이다.
+/// 연결 복제는 기반과 같은 풀에만, 그 백엔드가 지원할 때만, 기반이 독립 볼륨일 때만(사슬은 1단) 된다.
+fn unlinkable(
+    disk: usize,
+    source: &Volume,
+    source_pool: &StoragePool,
+    target: &StoragePool,
+) -> Option<String> {
+    if target.name != source_pool.name {
+        return Some(format!(
+            "disk{disk}: pool {:?} is not the pool {:?} of template disk {:?}",
+            target.name, source_pool.name, source.name
+        ));
+    }
+    if !pool_supports_linked_clones(&source_pool.spec.backend, source.spec.format) {
+        return Some(format!(
+            "disk{disk}: pool {:?} ({}) cannot hold linked clones",
+            source_pool.name,
+            backend_kind(&source_pool.spec.backend)
+        ));
+    }
+    if source.spec.base.is_some() {
+        return Some(format!(
+            "disk{disk}: volume {:?} is a linked clone itself",
+            source.name
+        ));
+    }
+    None
+}
+
+/// 풀 백엔드의 종류 이름(`dir`, `lvm-shared` …)
+fn backend_kind(backend: &PoolBackend) -> String {
+    serde_json::to_value(backend)
+        .ok()
+        .and_then(|v| v["kind"].as_str().map(str::to_string))
+        .unwrap_or_default()
+}
+
+/// 연결 복제 볼륨의 형식: 파일 풀(dir, NFS)은 qcow2 겹층, 블록 풀은 raw 네이티브 복제다.
+fn linked_format(pool: &StoragePool) -> ImageFormat {
+    match pool.spec.backend {
+        PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => ImageFormat::Qcow2,
+        _ => ImageFormat::Raw,
+    }
+}
+
+/// 경고([`identity_warning`])에서 볼 스펙: 배포 때 새로 준 호스트 이름·네트워크 설정은 원본의 것이 아니므로 뺀다.
+fn kept_identity(spec: &VmSpec, overrides: Option<&CloneOverrides>) -> VmSpec {
+    let mut spec = spec.clone();
+    if let (Some(ci), Some(given)) = (
+        spec.cloud_init.as_mut(),
+        overrides.and_then(|ov| ov.cloud_init.as_ref()),
+    ) {
+        if given.hostname.is_some() {
+            ci.hostname = None;
+        }
+        if !given.networks.is_empty() {
+            ci.networks.clear();
+        }
+    }
+    spec
+}
+
+/// 켜라고 한 새 VM을 놓을 노드: 스펙에 노드가 있으면(배포 때 준 노드) 그 노드가 켤 수 있어야 하고, 없으면 스케줄러가
+/// 고른다. 놓지 못하면 그 이유다.
+fn start_node(ctx: &Ctx, vm: &Vm) -> Result<Uuid, String> {
+    let inv = Inventory::load(&ctx.cluster).map_err(|e| e.to_string())?;
+    match vm.spec.node {
+        Some(id) => {
+            let node = inv
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .ok_or_else(|| format!("node {id} no longer exists"))?;
+            node_fits(&vm.spec, &inv, node)?;
+            Ok(id)
+        }
+        None => schedule(vm, &inv).map_err(|e| e.to_string()),
+    }
 }
 
 /// 새 VM(복제·복원)이 원본의 cloud-init 고정 IP 주소·호스트 이름을 그대로 가지면 Task가 남길 경고. 원본과 함께 켜면
@@ -261,9 +451,17 @@ pub(super) fn identity_warning(what: &str, spec: &VmSpec) -> Option<String> {
     })
 }
 
-/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, 노드·예약 없이 꺼진
-/// VM이다. `placement`를 모르는 노드가 있으면 VM 고정을 버린다. 성공하면 Task가 만든 것을 더는 정리하지 않는다.
-pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(), String> {
+/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, 예약 없는 VM이다. 노드는 `node`이고
+/// (복원·가져오기는 없음), `start`면 켠 채로(그 노드의 reconciler가 켠다), 아니면 꺼진 채로 만든다. `placement`를 모르는
+/// 노드가 있으면 VM 고정을, `templates`를 모르는 노드가 있으면 템플릿 표시(복원)를 버린다. 성공하면 Task가 만든 것을 더는
+/// 정리하지 않는다.
+pub(super) async fn create_vm(
+    ctx: &Ctx,
+    task: &Task,
+    mut new: Vm,
+    node: Option<Uuid>,
+    start: bool,
+) -> Result<(), String> {
     let name = new.name.clone();
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
     let mut used: BTreeSet<MacAddr> = vms
@@ -278,8 +476,12 @@ pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(),
         used.insert(mac);
         nic.mac = Some(mac);
     }
-    new.spec.node = None;
-    new.spec.power = PowerState::Stopped;
+    new.spec.node = node;
+    new.spec.power = if start {
+        PowerState::Running
+    } else {
+        PowerState::Stopped
+    };
     new.spec.snapshot_schedule = None;
     // 복제 대상과 그 복제본은 원본 VM의 것이다. 새 VM은 복제 없이 만든다.
     new.spec.replication.clear();
@@ -303,6 +505,14 @@ pub(super) async fn create_vm(ctx: &Ctx, task: &Task, mut new: Vm) -> Result<(),
             .is_empty()
     {
         new.spec.placement = None;
+    }
+    // 템플릿을 백업에서 복원하면 템플릿이다(계획 58). 옛 노드는 그 표시를 풀지 못하므로 그 노드가 있으면 버린다.
+    if new.spec.template
+        && !crate::cluster::missing_feature(&ctx.cluster, TEMPLATES)
+            .map_err(|e| e.to_string())?
+            .is_empty()
+    {
+        crate::backup_receive::drop_templates(&mut new.spec);
     }
     // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
     if let Err(e) = ctx.cluster.create(&new).await {
@@ -337,8 +547,6 @@ pub(super) async fn discard(ctx: &Ctx, task: Uuid) {
 
 #[cfg(test)]
 mod tests {
-    use opl_types::storage::PoolBackend;
-
     use super::*;
 
     fn pool(backend: PoolBackend) -> StoragePool {

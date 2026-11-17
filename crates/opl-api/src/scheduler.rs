@@ -278,6 +278,11 @@ pub fn node_fits_with(
     node: &Node,
     moves: &[DiskMove],
 ) -> Result<(), String> {
+    // 템플릿(계획 58)은 켜지 않는다: 어느 노드에도 놓지 않는다(스케줄러·HA·균형 조정기·마이그레이션 대상 모두).
+    // API가 켜기를 막지만 방어로.
+    if spec.template {
+        return Err("the VM is a template and is never started".into());
+    }
     let name = &node.name;
     // 위트니스는 투표만 하는 노드다. 다른 조건과 상관없이 VM을 돌리지 않는다.
     if node.spec.witness {
@@ -785,6 +790,23 @@ mod tests {
 
         let empty = Inventory::default();
         assert_eq!(sched(&me, &empty), Err(NoNode));
+    }
+
+    #[test]
+    fn never_places_a_template() {
+        let n = node(64000);
+        let inv = Inventory {
+            nodes: vec![n.clone()],
+            ..Default::default()
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        assert_eq!(sched(&me, &inv), Ok(n.id));
+        me.template = true;
+        assert_eq!(sched(&me, &inv), Err(NoNode));
+        assert_eq!(
+            node_fits(&me, &inv, &n),
+            Err("the VM is a template and is never started".into())
+        );
     }
 
     #[test]

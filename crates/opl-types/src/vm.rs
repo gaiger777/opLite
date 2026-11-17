@@ -411,11 +411,14 @@ impl VmSpec {
         self.cdroms.iter().map(|c| c.boot_order).collect()
     }
 
-    /// HA가 이 VM을 다루는지(정책이 있고 `ignored`가 아님). 펜싱·HA 가능 노드 조건·복구가 이것을 본다.
+    /// HA가 이 VM을 다루는지(정책이 있고 `ignored`가 아님). 펜싱·HA 가능 노드 조건·복구가 이것을 본다. 템플릿은
+    /// 켜지지 않으므로 HA가 다루지 않는다(계획 58, API가 HA를 막지만 방어로).
     pub fn ha_active(&self) -> bool {
-        self.ha
-            .as_ref()
-            .is_some_and(|ha| ha.state != HaState::Ignored)
+        !self.template
+            && self
+                .ha
+                .as_ref()
+                .is_some_and(|ha| ha.state != HaState::Ignored)
     }
 
     /// 균형 조정기가 옮기지 않는 VM인지
@@ -1847,6 +1850,11 @@ mod tests {
             });
             assert_eq!(s.ha_active(), active, "{state:?}");
         }
+        // 템플릿은 HA가 다루지 않는다.
+        s.ha = Some(VmHa::default());
+        assert!(s.ha_active());
+        s.template = true;
+        assert!(!s.ha_active());
     }
 
     #[test]

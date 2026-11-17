@@ -528,6 +528,36 @@ async fn apply_disk_moves_rewrites_the_volumes_once_committed() {
     assert_eq!(read(data.id).revision, d.revision);
 }
 
+/// 로컬 디스크 마이그레이션은 사슬 전체를 읽어 쓴 독립 볼륨을 만드므로 확정이 연결 복제 기록(`base`)을 지운다(계획 58).
+/// 같은 풀·형식이어도 그렇다.
+#[tokio::test]
+async fn apply_disk_moves_drops_the_base_of_a_linked_clone() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let (source, target) = (Uuid::now_v7(), Uuid::now_v7());
+    let mut root = volume("root", "local");
+    root.spec.base = Some(Uuid::now_v7());
+    root.status.node = Some(source);
+    cluster.create(&root).await.unwrap();
+    let mut vm = common::vm("web", target);
+    vm.spec.disks.push(disk("root"));
+    vm.status.migration = Some(MigrationStatus {
+        node: target,
+        task: Uuid::now_v7(),
+        disks: vec![DiskMove {
+            volume: root.id,
+            pool: "local".into(),
+            format: root.spec.format,
+            existing: false,
+        }],
+    });
+    apply_disk_moves(&cluster, &vm).await.unwrap();
+    let r = cluster.get::<VolumeSpec>(root.id).unwrap().unwrap();
+    assert_eq!(r.spec.base, None);
+    assert_eq!(r.spec.pool, "local");
+    assert_eq!(r.status.node, Some(target));
+}
+
 /// 디스크마다 공유·배타로 바꾼다. 처음 실패에서 멈추고, 저장소의 일시 오류는 `PoolUnavailable`,
 /// 없는 볼륨은 `VolumeNotFound`다.
 #[tokio::test]
@@ -660,6 +690,31 @@ async fn waits_for_resizes_of_its_disks() {
         .await
         .unwrap();
     resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+
+    // 연결 복제의 평탄화도 같다(계획 58): 실행 중이면 켜지 않는다.
+    let mut flatten: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeFlatten,
+            target: root.id,
+            node,
+        },
+    );
+    flatten.name = flatten.id.to_string();
+    flatten.status = TaskStatus {
+        state: TaskState::Running,
+        error: None,
+        progress: None,
+    };
+    cluster.create(&flatten).await.unwrap();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &Activations::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ResolveError::VolumeFlattening(ref v) if v == "root"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("being flattened"), "{err}");
 }
 
 /// 디스크로 쓰기 전에 저장소가 볼륨을 활성화한다. 활성화가 실패하면 다시 시도할 `PoolUnavailable`이고,

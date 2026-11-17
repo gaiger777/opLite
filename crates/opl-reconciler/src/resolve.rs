@@ -34,6 +34,9 @@ pub enum ResolveError {
     /// 볼륨의 크기 늘리기 Task가 실행 중이다. 끝나면 풀린다.
     #[error("volume {0:?} is being resized")]
     VolumeResizing(String),
+    /// 볼륨(연결 복제)의 평탄화 Task가 실행 중이다(계획 58). 끝나면 풀린다.
+    #[error("volume {0:?} is being flattened")]
+    VolumeFlattening(String),
     /// 이 노드의 OS(macOS)는 NFS 풀을 지원하지 않는다. 기다려도 풀리지 않는다.
     #[error("storage pool {0:?} is an nfs pool, which is not supported on this node's OS")]
     NfsUnsupported(String),
@@ -76,7 +79,7 @@ pub enum ResolveError {
 /// 활성화한 뒤 [`disk_location`]으로 위치를 정한다(RBD 풀은 경로 대신 `RuntimeDisk.rbd`의 이미지).
 /// 저장소의 일시 오류는 `PoolUnavailable`, 그 밖은 `VolumeUnusable`이다.
 /// (다시 해도 안 되는 것은 볼륨이 없거나 정의가 틀린 것뿐이고, 그 밖의 저장소 오류는 일시 오류로 본다.)
-/// 실행 중인 크기 늘리기 Task가 있는 볼륨은 켜지 않고 `VolumeResizing`이다(늘리는 중인 볼륨을 QEMU가
+/// 실행 중인 크기 늘리기 Task가 있는 볼륨은 켜지 않고 `VolumeResizing`이다(평탄화 Task면 `VolumeFlattening`)(늘리는 중인 볼륨을 QEMU가
 /// 열면 안 된다. 공유 LVM은 늘린 부분을 0으로 채우기 전이다). 기다리는(Pending) Task는 막지 않는다.
 /// 그 Task가 VM의 줄에서 되돌리기 뒤에 서 있으면 되돌리기가 다시 켜는 VM을 기다리게 되어 서로
 /// 기다린다. 실행기는 Task를 Running으로 기록(이 노드에 적용될 때까지 기다린다)한 뒤 VM 상태를 읽어
@@ -174,9 +177,10 @@ pub async fn apply_disk_moves(cluster: &Cluster, vm: &Vm) -> Result<(), ClusterE
     Ok(())
 }
 
-/// 볼륨 `id`의 기록을 노드 `node`의 풀 `pool`(형식 `format`)에 있는 것으로 고친다: 풀·형식이 다르면 spec을, 만든
-/// 노드(`status.node`)가 다르면 status를 쓴다(둘 다 revision 확인, 그 사이 바뀌었으면 다시 읽어). 이미 그렇거나 볼륨이
-/// 없으면 할 일이 없다(멱등). 마이그레이션 확정과 복제본 승격이 쓴다.
+/// 볼륨 `id`의 기록을 노드 `node`의 풀 `pool`(형식 `format`)에 있는 것으로 고친다: 풀·형식이 다르거나 연결 복제
+/// 기록(`base`)이 있으면 spec을, 만든 노드(`status.node`)가 다르면 status를 쓴다(둘 다 revision 확인, 그 사이 바뀌었으면
+/// 다시 읽어). 이미 그렇거나 볼륨이 없으면 할 일이 없다(멱등). 마이그레이션 확정과 복제본 승격이 쓴다. 옮긴 디스크는
+/// 사슬 전체를 읽어 쓴 독립 볼륨이므로 `base`를 지운다(계획 58 — 마이그레이션이 곧 평탄화다).
 pub async fn move_volume(
     cluster: &Cluster,
     id: Uuid,
@@ -188,10 +192,14 @@ pub async fn move_volume(
         let Some(volume) = cluster.get::<VolumeSpec>(id)? else {
             return Ok(());
         };
-        let written = if volume.spec.pool != pool || volume.spec.format != format {
+        let written = if volume.spec.pool != pool
+            || volume.spec.format != format
+            || volume.spec.base.is_some()
+        {
             let mut spec = volume.spec.clone();
             spec.pool = pool.to_string();
             spec.format = format;
+            spec.base = None;
             cluster
                 .update_spec(volume.id, Some(volume.revision), volume.labels, &spec)
                 .await
@@ -513,14 +521,21 @@ impl<'a> DiskLookup<'a> {
             .get_by_name::<VolumeSpec>(&disk.volume)?
             .ok_or_else(|| ResolveError::VolumeNotFound(disk.volume.clone()))?;
         let moved = moves.iter().find(|m| m.volume == volume.id);
-        if how != Activate::Running
-            && tasks.iter().any(|t| {
-                t.spec.target == volume.id
-                    && t.status.state == TaskState::Running
-                    && matches!(t.spec.op, TaskOp::VolumeResize { .. })
-            })
-        {
-            return Err(ResolveError::VolumeResizing(disk.volume.clone()));
+        if how != Activate::Running {
+            let running = |op: fn(&TaskOp) -> bool| {
+                tasks.iter().any(|t| {
+                    t.spec.target == volume.id
+                        && t.status.state == TaskState::Running
+                        && op(&t.spec.op)
+                })
+            };
+            if running(|op| matches!(op, TaskOp::VolumeResize { .. })) {
+                return Err(ResolveError::VolumeResizing(disk.volume.clone()));
+            }
+            // 평탄화하는 동안 QEMU가 열면 평탄화가 옮기는 데이터 뒤에 쓴 것을 잃는다(ZFS는 원본을 지운다).
+            if running(|op| *op == TaskOp::VolumeFlatten) {
+                return Err(ResolveError::VolumeFlattening(disk.volume.clone()));
+            }
         }
         let pool_name = moved.map_or(&volume.spec.pool, |m| &m.pool);
         let pool = self.usable_pool(pool_name)?;

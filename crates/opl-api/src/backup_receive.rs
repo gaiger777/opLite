@@ -18,7 +18,7 @@ use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupSpec, BackupStatus,
     MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, default_backup_name,
 };
-use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, PLACEMENT};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, PLACEMENT, TEMPLATES};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
 use opl_types::vm::{VmHa, VmSpec};
@@ -219,6 +219,12 @@ pub(crate) fn drop_install_media(spec: &mut VmSpec) {
     }
 }
 
+/// 받은 VM 스펙에서 템플릿 표시(계획 58)를 버린다(옛 노드가 풀지 못함). 복원하면 보통 VM이다. 보내는 쪽의 사본 확인도 같은
+/// 규칙으로 견준다.
+pub(crate) fn drop_templates(spec: &mut VmSpec) {
+    spec.template = false;
+}
+
 /// 다른 클러스터의 백업 사본을 받기 시작한다(201): 매니페스트의 VM·스펙·디스크로 `receiving` 백업을
 /// 만들고 백업 풀에 그 디렉터리를 만든다. 풀이 없거나 백업 풀이 아니거나 매니페스트가 올바르지 않으면
 /// 400, 풀을 이 노드에서 쓸 수 없으면 409 `pool_not_on_node`·`pool_unavailable`, 같은 원본(CA 지문과
@@ -296,6 +302,14 @@ pub async fn receive_backup(
             "a node does not know install media; dropping the CD-ROM drives and cloud-init of the received backup"
         );
         drop_install_media(&mut manifest.vm_spec);
+    }
+    // 옛 노드는 템플릿 표시가 든 VM 스펙을 풀지 못한다: 버린다(복원하면 보통 VM).
+    if manifest.vm_spec.template && !missing_feature(&state.cluster, TEMPLATES)?.is_empty() {
+        tracing::warn!(
+            backup = %manifest.backup,
+            "a node does not know templates; the received backup restores as a plain VM"
+        );
+        drop_templates(&mut manifest.vm_spec);
     }
     // 복제 대상은 원본 클러스터의 노드다: 늘 버린다.
     manifest.vm_spec.replication.clear();
