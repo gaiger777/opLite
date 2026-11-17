@@ -5,6 +5,7 @@ mod cli;
 mod client;
 mod config;
 mod console;
+mod media;
 mod output;
 
 pub use cli::run;

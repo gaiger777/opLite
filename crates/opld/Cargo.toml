@@ -49,6 +49,10 @@ web-it = ["qemu-it", "web-ui"]
 # qemu-it와 함께 켜고, Linux(Ubuntu 24.04)에서 root, apt가 닿는 네트워크와 qemu-block-extra가 필요하다. 호스트에
 # Ceph 꾸러미와 데몬을 남기므로 CI 러너에서만 돌린다.
 ceph-it = []
+# 실제 게스트로 설치 매체와 cloud-init을 보는 E2E(계획 57): 설치 ISO(`OPL_TEST_INSTALL_ISO`, Alpine virt)로 BIOS·UEFI VM이
+# CD에서 부팅하는지, 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04 qcow2)에 cloud-init이 적용되는지 본다.
+# qemu-it와 함께 켜고, KVM이 있는 x86_64 Linux와 ovmf, 인터넷에서 받아 둔 두 파일이 필요하다(CI `install-media` 작업).
+install-media-it = []
 # 한 호스트의 opld 둘로 실행 중인 VM을 공유 풀 위에서 옮기고 노드마다 다른 로컬 디렉터리 풀 사이로 디스크를
 # 복사하며 옮기는 라이브 마이그레이션 E2E. qemu-it의 준비물과 qemu-img, qemu-io가 필요하다. nfs-it·rbd-it·
 # lvm-shared-it와 함께 켜면 그 풀로도 옮기고, lvm-it·zfs-it와 함께 켜면 디렉터리 → 그 블록 풀 → 디렉터리로

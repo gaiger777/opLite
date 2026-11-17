@@ -46,6 +46,17 @@ pub fn task_header(headers: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 요청은 됐지만 알릴 것이 있을 때(cloud-init `user_data`가 만든 user-data를 덮음) 영어 문장 하나를 담는 응답 헤더
+pub const WARNING_HEADER: &str = "orbivisor-warning";
+
+/// 응답 헤더의 경고([`WARNING_HEADER`]). 없으면 None이다.
+pub fn warning_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(WARNING_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 /// 검증 없이 받는 CA 인증서 본문의 최대 크기
 const CA_MAX_BYTES: usize = 64 * 1024;
 
@@ -377,6 +388,15 @@ mod tests {
         assert_eq!(task_header(&headers), None);
         headers.insert("orbivisor-task", "t1".parse().unwrap());
         assert_eq!(task_header(&headers).as_deref(), Some("t1"));
+    }
+
+    /// 경고는 `orbivisor-warning` 헤더에서 읽는다.
+    #[test]
+    fn warning_header_reads_the_warning() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(warning_header(&headers), None);
+        headers.insert("orbivisor-warning", "user_data wins".parse().unwrap());
+        assert_eq!(warning_header(&headers).as_deref(), Some("user_data wins"));
     }
 
     fn cert_pem(name: &str) -> String {

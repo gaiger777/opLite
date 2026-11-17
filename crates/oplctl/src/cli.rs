@@ -13,9 +13,13 @@ use serde_json::{Value, json};
 use crate::ceph::{CephCmd, ceph, node_disks};
 use crate::client::{
     ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
-    UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header,
+    UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header, warning_header,
 };
 use crate::config::{CliConfig, default_path};
+use crate::media::{
+    CloudInitArgs, CloudInitClear, CloudInitInput, IsoCmd, VmCdromCmd, apply_boot, boot_line,
+    cdrom_lines, cdroms_value, cloud_init_lines, cloud_init_update, iso, parse_boot, vm_cdrom,
+};
 use crate::output::{bytes, cell, json as print_json, table};
 
 #[derive(Parser)]
@@ -83,6 +87,11 @@ enum Cmd {
     Volume {
         #[command(subcommand)]
         cmd: VolumeCmd,
+    },
+    /// 설치 매체(ISO 이미지): 올리기, URL에서 받기, 목록과 쓰는 VM, 지우기. VM에는 `vm cdrom`으로 넣는다.
+    Iso {
+        #[command(subcommand)]
+        cmd: IsoCmd,
     },
     Vm {
         #[command(subcommand)]
@@ -1310,6 +1319,27 @@ enum VolumeCmd {
         #[arg(long, value_enum)]
         format: Option<Format>,
     },
+    /// 노드가 http·https URL에서 이미지(클라우드 이미지 등)를 받아 새 볼륨으로 가져온다. 그 노드가 URL에 닿아야
+    /// 한다.
+    Download {
+        name: String,
+        #[arg(long)]
+        pool: String,
+        #[arg(long)]
+        url: String,
+        /// 받은 파일의 SHA-256(16진 64자). 다르면 실패하고 지운다.
+        #[arg(long, value_name = "HEX")]
+        sha256: Option<String>,
+        /// 받은 파일의 형식(기본 raw)
+        #[arg(long, value_enum)]
+        source_format: Option<SourceFormat>,
+        /// 생략하면 풀 종류로 정한다(LVM-thin, ZFS, RBD, 공유 LVM은 raw, 그 밖은 qcow2).
+        #[arg(long, value_enum)]
+        format: Option<Format>,
+        /// 받기 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// 볼륨 크기를 늘린다. 줄이지는 않는다.
     Resize {
         volume: String,
@@ -1448,6 +1478,11 @@ enum VmCmd {
         #[command(subcommand)]
         cmd: VmNicCmd,
     },
+    /// CD-ROM 드라이브: 매체 넣기·빼기(실행 중에도), 드라이브 더하기·빼기(꺼진 VM)
+    Cdrom {
+        #[command(subcommand)]
+        cmd: VmCdromCmd,
+    },
     /// 실행 중인 VM의 하드웨어를 지금 설정에 다시 맞춘다(실패한 핫플러그를 다시 해 본다. 예: 게스트가 드라이버를
     /// 올린 뒤).
     Hotplug {
@@ -1557,6 +1592,13 @@ struct VmCreate {
     /// 붙일 볼륨 이름. 여러 번 줄 수 있고 첫 디스크로 부팅한다.
     #[arg(long = "disk")]
     disks: Vec<String>,
+    /// CD-ROM 드라이브에 넣을 ISO(`none`은 빈 드라이브). 4번까지 줄 수 있다. 부팅 순서는 디스크 뒤다.
+    #[arg(long = "cdrom", value_name = "ISO|none")]
+    cdroms: Vec<String>,
+    /// 부팅 순서(예: `cdrom,disk` — `disk`는 `disk0`, `cdrom`은 `cdrom0`). 목록에 없는 디스크로는 부팅하지 않는다(디스크를
+    /// 하나도 적지 않으면 디스크는 목록 뒤에 차례로 온다).
+    #[arg(long, value_name = "DEVICE,...")]
+    boot: Option<String>,
     /// 연결할 네트워크 이름(`user`는 QEMU NAT). 여러 번 줄 수 있다. `,sg=A+B`를 붙이면 그 NIC에
     /// 보안 그룹을 건다(예: `lan,sg=web+db`).
     #[arg(long = "nic", value_name = "NETWORK[,sg=GROUP+...]", value_parser = parse_nic)]
@@ -1581,6 +1623,8 @@ struct VmCreate {
     /// 복제본을 둘 풀, 기본은 같은 이름). 세 번까지 줄 수 있다. HA는 복제본으로 다른 노드에서 다시 켠다.
     #[arg(long = "replicate", value_name = "NODE[,*/N][,pool=POOL]", value_parser = parse_replica_target)]
     replicate: Vec<ReplicateArg>,
+    #[command(flatten)]
+    cloud_init: CloudInitArgs,
 }
 
 /// `--nic`으로 받은 네트워크와 보안 그룹
@@ -1682,7 +1726,10 @@ fn nic_body(nic: &NicArg) -> Value {
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "ha", "no_ha", "ha_state", "ha_group", "max_restart", "max_relocate", "ha_priority",
     "guest_watch", "no_guest_watch", "pinned", "no_pinned", "sockets", "cores", "memory",
-    "max_vcpus", "no_max_vcpus", "max_memory", "no_max_memory", "replicate", "no_replicate"
+    "max_vcpus", "no_max_vcpus", "max_memory", "no_max_memory", "replicate", "no_replicate", "boot",
+    "cloud_init", "ci_hostname", "ci_user", "ci_password_file", "ci_password_prompt",
+    "ci_password_hash", "ci_ssh_keys", "ci_ip", "ci_ip6", "ci_dns", "ci_search", "ci_user_data",
+    "ci_vendor_data", "no_cloud_init", "ci_no_password", "ci_clear_ssh_keys"
 ])))]
 struct VmSet {
     vm: String,
@@ -1731,6 +1778,26 @@ struct VmSet {
     /// 복제를 끈다(복제본은 대상 노드가 지운다).
     #[arg(long, conflicts_with = "replicate")]
     no_replicate: bool,
+    /// 부팅 순서(예: `cdrom,disk`). 목록에 없는 장치는 순서를 뺀다. 실행 중이면 디스크 순서는 바꾸지 못하고 CD-ROM
+    /// 순서는 다음 재시작 때 적용한다.
+    #[arg(long, value_name = "DEVICE,...")]
+    boot: Option<String>,
+    /// cloud-init 값. 준 값만 바꾸고, 실행 중이면 다음 QEMU 시작(`vm reboot`) 때 적용한다.
+    #[command(flatten)]
+    cloud_init: Box<CloudInitArgs>,
+    /// cloud-init 씨앗 드라이브를 뗀다(설정을 지운다).
+    #[arg(long, conflicts_with_all = [
+        "cloud_init", "ci_hostname", "ci_user", "ci_password_file", "ci_password_prompt",
+        "ci_password_hash", "ci_ssh_keys", "ci_ip", "ci_ip6", "ci_dns", "ci_search", "ci_user_data",
+        "ci_vendor_data", "ci_no_password", "ci_clear_ssh_keys"
+    ])]
+    no_cloud_init: bool,
+    /// cloud-init 비밀번호를 지운다.
+    #[arg(long, conflicts_with_all = ["ci_password_file", "ci_password_prompt", "ci_password_hash"])]
+    ci_no_password: bool,
+    /// cloud-init SSH 키를 모두 지운다(`--ci-ssh-key`가 있으면 그 키만 남긴다).
+    #[arg(long)]
+    ci_clear_ssh_keys: bool,
     /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
     #[arg(long)]
     no_wait: bool,
@@ -1745,6 +1812,23 @@ impl VmSet {
     /// 복제 대상을 바꾸는지
     fn changes_replication(&self) -> bool {
         !self.replicate.is_empty() || self.no_replicate
+    }
+
+    /// cloud-init 설정을 바꾸는지
+    fn changes_cloud_init(&self) -> bool {
+        self.cloud_init.wanted()
+            || self.no_cloud_init
+            || self.ci_no_password
+            || self.ci_clear_ssh_keys
+    }
+
+    /// `vm set`만의 cloud-init 끄기·지우기
+    fn cloud_init_clear(&self) -> CloudInitClear {
+        CloudInitClear {
+            off: self.no_cloud_init,
+            password: self.ci_no_password,
+            ssh_keys: self.ci_clear_ssh_keys,
+        }
     }
 
     /// CPU·메모리를 바꾸는지
@@ -1813,6 +1897,34 @@ fn replication_set(body: &mut Value, replication: Option<&Value>, off: bool) {
     if off && let Some(spec) = body["spec"].as_object_mut() {
         spec.remove("replication");
     }
+}
+
+/// `vm set`의 수정 본문에 부팅 순서(`--boot`)와 cloud-init(`--ci-*`, 끄기·지우기)을 넣는다. `current`는 읽은 VM,
+/// `input`은 미리 읽은 비밀번호·키·파일이다.
+fn media_set(
+    body: &mut Value,
+    current: &Value,
+    args: &VmSet,
+    input: &CloudInitInput,
+) -> anyhow::Result<()> {
+    if let Some(list) = &args.boot {
+        apply_boot(&mut body["spec"], list)?;
+    }
+    if args.changes_cloud_init() {
+        let ci = cloud_init_update(
+            &current["spec"]["cloud_init"],
+            &args.cloud_init,
+            input,
+            args.cloud_init_clear(),
+        );
+        match (ci, body["spec"].as_object_mut()) {
+            (Value::Null, Some(spec)) => {
+                spec.remove("cloud_init");
+            }
+            (ci, _) => body["spec"]["cloud_init"] = ci,
+        }
+    }
+    Ok(())
 }
 
 #[derive(Subcommand)]
@@ -1974,7 +2086,7 @@ fn pending_lines(vm: &Value) -> Vec<String> {
 /// 하드웨어를 바꾼 뒤: PUT이 핫플러그 Task(`task`)를 만들었으면 기다려 바로 적용됐는지나 다음 재시작 때 적용할
 /// 것을 알린다. Task가 없으면(꺼진 VM, 하드웨어가 그대로) 기다리지 않고 `done`만 알린다. Task가 실패하면 그 이유로
 /// 실패한다.
-async fn hotplug_result(
+pub(crate) async fn hotplug_result(
     client: &Client,
     vm: &str,
     task: Option<String>,
@@ -5333,6 +5445,32 @@ fn pool_default_format(pool: &Value) -> Format {
     }
 }
 
+/// 이미지 파일을 `POST /volumes/import`(쿼리 `query`)로 올리고 가져오기 Task를 기다린다. 파일을 보내기 전에 서버가
+/// 받을 수 있는지(`/volumes/import/check`) 확인한다.
+pub(crate) async fn upload_volume(
+    client: &Client,
+    query: &[(&str, &str)],
+    file: &std::path::Path,
+) -> anyhow::Result<()> {
+    let size = tokio::fs::metadata(file)
+        .await
+        .with_context(|| format!("cannot read {}", file.display()))?
+        .len()
+        .to_string();
+    let mut check = query.to_vec();
+    check.push(("size", size.as_str()));
+    client
+        .send(
+            client
+                .request(Method::POST, "/volumes/import/check")
+                .query(&check),
+        )
+        .await?;
+    let task = client.upload("/volumes/import", query, file).await?;
+    client.wait_task(&task).await?;
+    Ok(())
+}
+
 /// 명령을 실행하고 결과를 `out`에 쓴다. 인자 오류는 `clap::Error`로 돌려준다.
 pub async fn run<I, T>(args: I, out: &mut (dyn Write + Send)) -> anyhow::Result<()>
 where
@@ -5583,24 +5721,30 @@ where
                     ("source_format", src.as_str()),
                     ("format", fmt.as_str()),
                 ];
-                // 파일을 보내기 전에 서버가 받을 수 있는지 확인한다.
-                let size = tokio::fs::metadata(&file)
-                    .await
-                    .with_context(|| format!("cannot read {}", file.display()))?
-                    .len()
-                    .to_string();
-                let mut check = query.to_vec();
-                check.push(("size", size.as_str()));
-                client
-                    .send(
-                        client
-                            .request(Method::POST, "/volumes/import/check")
-                            .query(&check),
-                    )
-                    .await?;
-                let task = client.upload("/volumes/import", &query, &file).await?;
-                client.wait_task(&task).await?;
+                upload_volume(&client, &query, &file).await?;
                 writeln!(out, "volume {name} imported")?;
+            }
+            VolumeCmd::Download {
+                name,
+                pool,
+                url,
+                sha256,
+                source_format,
+                format,
+                no_wait,
+            } => {
+                let mut body = json!({ "name": name, "pool": pool, "url": url });
+                if let Some(sum) = sha256 {
+                    body["sha256"] = json!(sum);
+                }
+                if let Some(f) = source_format {
+                    body["source_format"] = json!(value_name(f));
+                }
+                if let Some(f) = format {
+                    body["format"] = json!(value_name(f));
+                }
+                let err = &mut std::io::stderr();
+                crate::media::download(&client, &body, "volume", no_wait, out, err).await?;
             }
             VolumeCmd::Resize { volume, size } => {
                 let body = json!({ "size_bytes": size });
@@ -5616,6 +5760,7 @@ where
                 writeln!(out, "volume {volume} deleted")?;
             }
         },
+        Cmd::Iso { cmd } => iso(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
         Cmd::HaGroup { cmd } => ha_group(&client, cmd, json_out, out).await?,
         Cmd::HaCheck { cmd } => ha_check(&client, cmd, json_out, out).await?,
@@ -7208,7 +7353,7 @@ fn ha_without_replication(spec: &Value) -> bool {
 }
 
 /// 노드 로컬 풀인지(서버 `is_shared`의 반대): LVM-thin·ZFS 풀은 늘, 디렉터리 풀은 `shared`가 아니면 로컬이다.
-fn node_local(pool: &Value) -> bool {
+pub(crate) fn node_local(pool: &Value) -> bool {
     match pool["spec"]["backend"]["kind"].as_str() {
         Some("lvm-thin" | "zfs") => true,
         Some("dir") => pool["spec"]["shared"] != true,
@@ -7278,6 +7423,13 @@ async fn vm_get(
         if let Some(line) = hardware_line(&vm) {
             writeln!(err, "{line}")?;
         }
+        for line in cdrom_lines(&vm)
+            .into_iter()
+            .chain(boot_line(&vm))
+            .chain(cloud_init_lines(&vm))
+        {
+            writeln!(err, "{line}")?;
+        }
         if !replica_entries(&vm).is_empty() || vm["status"]["last_recovery"].is_object() {
             let items = |list: Value| list["items"].as_array().cloned().unwrap_or_default();
             let nodes = items(client.get("/nodes").await?);
@@ -7327,12 +7479,23 @@ async fn vm(
                 }
             };
             let node = node.map(|n| n["id"].clone());
+            let boot = match &args.boot {
+                Some(list) => Some(
+                    parse_boot(list, args.disks.len(), args.cdroms.len())
+                        .map_err(anyhow::Error::msg)?,
+                ),
+                None => None,
+            };
+            let ci_input = args.cloud_init.read()?;
             let disks: Vec<Value> = args
                 .disks
                 .iter()
                 .enumerate()
                 .map(|(i, volume)| {
-                    let boot = (i == 0).then_some(1);
+                    let boot = match &boot {
+                        Some((disks, _)) => disks[i],
+                        None => (i == 0).then_some(1),
+                    };
                     json!({ "volume": volume, "bus": "virtio-blk", "boot_order": boot })
                 })
                 .collect();
@@ -7369,8 +7532,31 @@ async fn vm(
                 let nodes = list["items"].as_array().cloned().unwrap_or_default();
                 body["spec"]["replication"] = replication_spec(&args.replicate, &nodes)?;
             }
-            client.post("/vms", &body).await?;
+            if !args.cdroms.is_empty() {
+                let mut cdroms = cdroms_value(&args.cdroms);
+                if let Some((_, orders)) = &boot {
+                    for (cdrom, order) in cdroms.iter_mut().zip(orders) {
+                        if let Some(n) = order {
+                            cdrom["boot_order"] = json!(n);
+                        }
+                    }
+                }
+                body["spec"]["cdroms"] = Value::Array(cdroms);
+            }
+            if args.cloud_init.wanted() {
+                body["spec"]["cloud_init"] = cloud_init_update(
+                    &Value::Null,
+                    &args.cloud_init,
+                    &ci_input,
+                    CloudInitClear::default(),
+                );
+            }
+            let r = client.request(Method::POST, "/vms").json(&body);
+            let (headers, _) = client.send_with_headers(r).await?;
             writeln!(out, "vm {} created", args.name)?;
+            if let Some(warning) = warning_header(&headers) {
+                eprintln!("warning: {warning}");
+            }
             warn_ha_without_replica(client, &args.name, &body["spec"], &mut std::io::stderr())
                 .await?;
             if args.start {
@@ -7385,9 +7571,11 @@ async fn vm(
                 let nodes = list["items"].as_array().cloned().unwrap_or_default();
                 Some(replication_spec(&args.replicate, &nodes)?)
             };
+            let ci_input = args.cloud_init.read()?;
             let task = put_spec(client, &args.vm, |current| {
                 let mut body = vm_set_spec(current, &args);
                 replication_set(&mut body, replication.as_ref(), args.no_replicate);
+                media_set(&mut body, current, &args, &ci_input)?;
                 Ok(body)
             })
             .await?;
@@ -7422,11 +7610,24 @@ async fn vm(
                 warn_ha_without_replica(client, &args.vm, &current["spec"], &mut std::io::stderr())
                     .await?;
             }
+            let mut done = Vec::new();
             if args.changes_hardware() {
-                let done = format!("vm {}: hardware updated", args.vm);
+                done.push(format!("vm {}: hardware updated", args.vm));
+            }
+            if let Some(list) = &args.boot {
+                done.push(format!("vm {}: boot order {list}", args.vm));
+            }
+            if args.no_cloud_init {
+                done.push(format!("vm {}: cloud-init off", args.vm));
+            } else if args.changes_cloud_init() {
+                done.push(format!("vm {}: cloud-init updated", args.vm));
+            }
+            if !done.is_empty() {
+                let done = done.join("\n");
                 hotplug_result(client, &args.vm, task, args.no_wait, &done, out).await?;
             }
         }
+        VmCmd::Cdrom { cmd } => vm_cdrom(client, cmd, out, &mut std::io::stderr()).await?,
         VmCmd::Disk { cmd } => match cmd {
             VmDiskCmd::Add {
                 vm,
@@ -7791,7 +7992,7 @@ async fn put_spec_field(
 
 /// VM `vm`을 읽어 `body`(읽은 VM → 수정 본문)로 만든 본문을 그 revision으로(`If-Match`) 다시 쓴다. 실행 중인
 /// VM의 하드웨어를 바꿔 서버가 핫플러그 Task를 만들었으면 그 id(`orbivisor-task` 헤더)를 돌려준다.
-async fn put_spec(
+pub(crate) async fn put_spec(
     client: &Client,
     vm: &str,
     body: impl Fn(&Value) -> anyhow::Result<Value>,
@@ -7809,7 +8010,12 @@ async fn put_spec(
                 Some(delay) => tokio::time::sleep(delay).await,
                 None => return Err(e),
             },
-            Ok((headers, _)) => return Ok(task_header(&headers)),
+            Ok((headers, _)) => {
+                if let Some(warning) = warning_header(&headers) {
+                    eprintln!("warning: {warning}");
+                }
+                return Ok(task_header(&headers));
+            }
         }
     }
 }
@@ -7843,7 +8049,7 @@ impl SpecRetries {
 }
 
 /// VM 수정 본문: 라벨과 spec은 그대로 두고 spec 필드 `field`만 `value`로 바꾼다.
-fn spec_update(vm: &Value, field: &str, value: Value) -> Value {
+pub(crate) fn spec_update(vm: &Value, field: &str, value: Value) -> Value {
     let mut spec = vm["spec"].clone();
     spec[field] = value;
     // 라벨이 없으면 응답에 `labels`가 없다.
@@ -9684,6 +9890,31 @@ mod tests {
             .await
             .unwrap();
         assert!(err.is_empty());
+    }
+
+    /// `vm get`은 CD-ROM 드라이브·실제 부팅 순서·cloud-init 요약도 stderr에 쓴다.
+    #[tokio::test]
+    async fn vm_get_shows_cdroms_boot_order_and_cloud_init() {
+        fn web(_: &str) -> Value {
+            json!({
+                "name": "web",
+                "spec": {
+                    "disks": [{ "volume": "root", "bus": "virtio-blk", "boot_order": 1 }],
+                    "cdroms": [{ "iso": "inst" }],
+                    "cloud_init": { "user": "orbi" },
+                },
+            })
+        }
+        let (base, _) = fake_api_bodies(web).await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut err = Vec::new();
+        vm_get(&client, "web", false, &mut Vec::new(), &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "cdroms:\n  cdrom0: inst (boot 2)\nboot: disk0, cdrom0\ncloud-init: user orbi\n"
+        );
     }
 
     /// 진행 줄을 쓰지 못해도(stderr가 닫힘) 마이그레이션이 끝나기를 기다린다.
@@ -13741,6 +13972,160 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             Cmd::Vm { cmd: VmCmd::Set(s) } => s,
             _ => panic!("not vm set"),
         }
+    }
+
+    /// 받은 VM을 고쳐 되보내는 `vm set --ci-hostname`은 가린 비밀번호(`********`)를 그대로 보낸다(서버가 저장된
+    /// 해시를 지킨다). `--boot`는 디스크·CD-ROM의 순서를 바꾸고 `--no-cloud-init`은 필드를 뺀다.
+    #[test]
+    fn vm_set_cloud_init_and_boot_order() {
+        let vm = json!({
+            "name": "web",
+            "spec": {
+                "disks": [{ "volume": "root", "bus": "virtio-blk", "boot_order": 1 }],
+                "cdroms": [{ "iso": "inst" }],
+                "cloud_init": { "user": "orbi", "password": "********" },
+            },
+        });
+        let body = |args: &[&str]| {
+            let set = vm_set(args);
+            let input = set.cloud_init.read().unwrap();
+            let mut body = vm_set_spec(&vm, &set);
+            media_set(&mut body, &vm, &set, &input).map(|()| body)
+        };
+        let b = body(&["--ci-hostname", "web2"]).unwrap();
+        assert_eq!(
+            b["spec"]["cloud_init"],
+            json!({ "user": "orbi", "password": "********", "hostname": "web2" })
+        );
+        assert_eq!(b["spec"]["cdroms"], vm["spec"]["cdroms"]);
+        let b = body(&["--boot", "cdrom,disk"]).unwrap();
+        assert_eq!(b["spec"]["disks"][0]["boot_order"], 2);
+        assert_eq!(b["spec"]["cdroms"][0]["boot_order"], 1);
+        assert_eq!(b["spec"]["cloud_init"], vm["spec"]["cloud_init"]);
+        let err = body(&["--boot", "disk1"]).unwrap_err();
+        assert_eq!(err.to_string(), "the VM has no disk1");
+        let b = body(&["--no-cloud-init"]).unwrap();
+        assert!(b["spec"].get("cloud_init").is_none(), "{b}");
+        let b = body(&["--ci-no-password", "--ci-ip", "nic0=10.0.0.5/24"]).unwrap();
+        assert_eq!(
+            b["spec"]["cloud_init"],
+            json!({ "user": "orbi", "networks": [{ "ipv4": { "mode": "static", "address": "10.0.0.5/24" } }] })
+        );
+        // cloud-init 값만 줘도 `vm set`이 된다. 끄기와 다른 값은 함께 주지 못한다.
+        assert!(vm_set(&["--cloud-init"]).changes_cloud_init());
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["oplctl", "vm", "set", "web"];
+            argv.extend(args);
+            Cli::try_parse_from(argv).map(|_| ())
+        };
+        assert!(parse(&["--no-cloud-init", "--ci-user", "x"]).is_err());
+        assert!(parse(&["--ci-password-hash", "$6$a$b", "--ci-no-password"]).is_err());
+        assert!(parse(&["--ci-ip", "nic0=bogus"]).is_err());
+    }
+
+    /// `vm create`의 `--cdrom`·`--boot`·`--ci-*`와 `iso`·`vm cdrom`·`volume download` 명령의 인자
+    #[test]
+    fn parses_install_media_commands() {
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "create",
+            "web",
+            "--disk",
+            "root",
+            "--cdrom",
+            "inst",
+            "--cdrom",
+            "none",
+            "--boot",
+            "cdrom,disk",
+            "--ci-user",
+            "orbi",
+            "--ci-ip6",
+            "nic0=slaac",
+            "--ci-dns",
+            "10.0.0.2",
+            "--ci-ssh-key",
+            "ssh-ed25519 AAAA",
+        ])
+        .unwrap();
+        let Cmd::Vm {
+            cmd: VmCmd::Create(args),
+        } = cli.cmd
+        else {
+            panic!("not vm create")
+        };
+        assert_eq!(args.cdroms, ["inst", "none"]);
+        assert_eq!(args.boot.as_deref(), Some("cdrom,disk"));
+        assert!(args.cloud_init.wanted());
+        assert_eq!(args.cloud_init.ci_ip6.len(), 1);
+        assert!(
+            Cli::try_parse_from([
+                "oplctl",
+                "vm",
+                "create",
+                "web",
+                "--ci-password-prompt",
+                "--ci-password-hash",
+                "$6$a$b"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "iso",
+            "download",
+            "alpine",
+            "--pool",
+            "isos",
+            "--url",
+            "https://example.com/a.iso",
+            "--sha256",
+            "ab",
+            "--no-wait",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Iso {
+                cmd: IsoCmd::Download { no_wait: true, .. }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "oplctl", "vm", "cdrom", "insert", "web", "alpine", "--drive", "1",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Cdrom {
+                    cmd: VmCdromCmd::Insert { drive: 1, .. }
+                }
+            }
+        ));
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "volume",
+            "download",
+            "noble",
+            "--pool",
+            "local",
+            "--url",
+            "https://example.com/noble.img",
+            "--source-format",
+            "qcow2",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Volume {
+                cmd: VolumeCmd::Download {
+                    source_format: Some(SourceFormat::Qcow2),
+                    format: None,
+                    ..
+                }
+            }
+        ));
     }
 
     /// `vm set`의 CPU·메모리 플래그는 준 값만 바꾸고, `--no-max-*`는 상한 필드를 뺀다.

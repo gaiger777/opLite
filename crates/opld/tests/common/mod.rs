@@ -25,13 +25,20 @@ pub struct Daemon {
     pub notify_socket: Option<PathBuf>,
 }
 
-/// 비어 있는 포트를 하나 고른다.
+/// 비어 있는 포트를 하나 고른다. 운영체제의 임시 포트 범위(Linux 32768~60999, macOS 49152~65535)
+/// 밖인 20000~31999에서 시험 프로세스마다 다른 구간을 차례로 나눠 준다 — 임시 포트로 받은 번호는
+/// 돌려준 뒤 다른 시험의 나가는 연결이 다시 가져갈 수 있어, opld가 그 포트를 열 때 가끔
+/// "Address already in use"가 났다.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    use std::sync::atomic::{AtomicU16, Ordering};
+    static NEXT: AtomicU16 = AtomicU16::new(0);
+    let base = 20000 + (std::process::id() % 24) as u16 * 500;
+    loop {
+        let port = base + NEXT.fetch_add(1, Ordering::Relaxed) % 500;
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 impl Daemon {

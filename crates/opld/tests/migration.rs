@@ -6,7 +6,8 @@
 //! 노드 로컬 디렉터리 풀(노드마다 다른 경로)의 디스크를 복사하며 옮기는지(`--pool`, 진행률, 실패 정리), 같은
 //! 이름의 로컬 풀이 같은 경로라 비우기가 그 VM을 남기는지도 본다. 균형 조정기가 hard 규칙을 어기는 VM을 추천·적용과
 //! `auto`로 옮기는지도 본다. 로컬 디스크를 다른 노드로 복제하고(전체 뒤 증분) 그 복제본이 있는 노드로 바뀐 것만 보내며
-//! 옮기는지도 본다.
+//! 옮기는지도 본다. 공유 풀 ISO를 CD-ROM에 넣고 cloud-init이 있는 VM이 옮겨지는지, 노드 로컬 풀 ISO면 거절하는지도
+//! 본다.
 //! `cargo test -p opld --features migration-it --test migration`
 //! QEMU(`qemu-it`와 같다), qemu-img, qemu-io가 필요하다. 이 Mac에서도 돈다(TCG).
 //!
@@ -658,6 +659,123 @@ async fn a_vm_with_a_disk_added_while_running_migrates() {
         d.ctl(&["volume", "delete", name]).await.unwrap();
     }
     d.ctl(&["pool", "delete", "shared"]).await.unwrap();
+}
+
+/// 공유 디렉터리 풀의 ISO를 CD-ROM에 넣고 cloud-init이 있는 VM을 옮기면 대상 QEMU가 같은 ISO를 읽기 전용으로 열고
+/// 대상 노드가 씨앗(`cidata.iso`)을 다시 만든다. 노드 로컬 풀의 ISO를 넣으면 옮기지 못한다(409 `cdrom_local`).
+#[tokio::test]
+async fn a_vm_with_a_cdrom_and_cloud_init_migrates() {
+    let p = Pair::new("mig-cdrom", ["60340-60349", "60350-60359"]).await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let node1 = p.node_id(0).await;
+    let dir = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .unwrap()
+    };
+    let (shared, local) = (dir("oplcdshared"), dir("oplcdlocal"));
+    d.ctl(&[
+        "pool",
+        "create",
+        "shared",
+        "--path",
+        shared.path().to_str().unwrap(),
+        "--shared",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&[
+        "pool",
+        "create",
+        "local",
+        "--path",
+        local.path().to_str().unwrap(),
+        "--node",
+        &node1,
+    ])
+    .await
+    .unwrap();
+    p.wait_pool_ready("shared").await;
+    p.d[0].wait_pool_ready("local").await;
+    let iso = opl_qemu::iso9660::build("INSTALL", &[("readme.txt", b"installer")]).unwrap();
+    let file = d.path("inst.iso");
+    std::fs::write(&file, iso).unwrap();
+    for (name, pool) in [("inst", "shared"), ("local-inst", "local")] {
+        d.ctl(&[
+            "iso",
+            "upload",
+            name,
+            "--pool",
+            pool,
+            "--file",
+            file.to_str().unwrap(),
+        ])
+        .await
+        .unwrap();
+    }
+    d.ctl(&[
+        "volume", "create", "root", "--pool", "shared", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&[
+        "vm",
+        "create",
+        "web",
+        "--memory",
+        "256",
+        "--disk",
+        "root",
+        "--cdrom",
+        "inst",
+        "--ci-user",
+        "orbi",
+        "--node",
+        "node1",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let vm = c.get("/vms/web").await.unwrap();
+    let id = vm["id"].as_str().unwrap().to_string();
+    let before = vm["status"]["hardware"].clone();
+    assert_eq!(before["cdroms"], json!([{ "iso": "inst" }]), "{vm}");
+
+    migrate(&p, 0, 1).await;
+    let vm = p.c[1].get("/vms/web").await.unwrap();
+    assert_eq!(vm["status"]["hardware"], before, "{vm}");
+    let seed = vm_run_dir(&p.d[1], &id).join("cidata.iso");
+    let text = String::from_utf8_lossy(&std::fs::read(&seed).unwrap()).into_owned();
+    assert!(text.contains("\"local-hostname\": \"web\""), "{text}");
+    assert!(text.contains(before["cloud_init"].as_str().unwrap()));
+    migrate(&p, 1, 0).await;
+
+    // 노드 로컬 풀의 ISO가 꽂혀 있으면 옮기지 못하고 VM은 그 노드에서 그대로 돈다.
+    let out = d
+        .ctl(&["vm", "cdrom", "insert", "web", "local-inst"])
+        .await
+        .unwrap();
+    assert!(out.ends_with("vm web: applied while running\n"), "{out}");
+    let pid = running_pid(c).await;
+    let err = d.ctl(&["vm", "migrate", "web", "node2"]).await.unwrap_err();
+    assert!(err.to_string().ends_with("(cdrom_local)"), "{err}");
+    assert!(
+        err.to_string().contains("from node-local pool \"local\""),
+        "{err}"
+    );
+    assert_vm_on(&p, &node1).await;
+    assert_eq!(running_pid(c).await, pid);
+
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    for iso in ["inst", "local-inst"] {
+        d.ctl(&["iso", "delete", iso]).await.unwrap();
+    }
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    for pool in ["shared", "local"] {
+        d.ctl(&["pool", "delete", pool]).await.unwrap();
+    }
 }
 
 /// `run`(마이그레이션을 기다리는 oplctl)이 끝날 때까지 VM `web`의 `vm-migrate` Task가 보인 진행률

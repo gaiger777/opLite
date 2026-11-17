@@ -380,6 +380,41 @@ jobs:
           sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features opld/ceph-it,opld/qemu-it -p opld --test ceph -- --nocapture
 
+  # 설치 매체와 cloud-init(계획 57)의 실제 게스트: 받아 둔 Alpine virt ISO로 BIOS·UEFI VM이 CD에서 부팅하는지, Ubuntu
+  # 24.04 클라우드 이미지에 cloud-init이 호스트 이름·사용자·비밀번호 해시·키·고정 IP를 적용하는지 본다. 게스트 OS가 있어야
+  # 보이는 것만 여기서 보고, 나머지 CD·씨앗 시험은 linux-kvm의 qemu-it·migration-it가 돌린다.
+  install-media:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: KVM, QEMU, UEFI firmware
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils
+          ls -l /dev/kvm
+      # 받기 실패는 시험 실패가 아니라 이 단계의 실패로 보인다.
+      - name: Cloud image and installer ISO
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl -fsSL --retry 3 -O https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+          curl -fsSL --retry 3 -O https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS
+          grep -E '[ *]ubuntu-24\.04-server-cloudimg-amd64\.img$' SHA256SUMS | sha256sum -c -
+          curl -fsSL --retry 3 -O https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso
+          curl -fsSL --retry 3 -O https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-virt-3.20.3-x86_64.iso.sha256
+          sha256sum -c alpine-virt-3.20.3-x86_64.iso.sha256
+      - name: Installer ISO boot and cloud-init in real guests
+        run: cargo test --features opld/install-media-it,opld/qemu-it -p opld --test install_media -- --nocapture
+        env:
+          OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
+          OPL_TEST_INSTALL_ISO: ${{ runner.temp }}/alpine-virt-3.20.3-x86_64.iso
+
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는
   # ldap-setup.sh가 아래 OPL_TEST_LDAP_* 값으로 만든다.
