@@ -65,6 +65,7 @@ async fn orphans_of_a_previous_opld_are_removed() {
                     pool: "local".into(),
                     size_bytes: 1,
                     format: ImageFormat::Raw,
+                    content: Default::default(),
                 },
             );
             cluster.create(&volume).await.unwrap();
@@ -105,6 +106,7 @@ async fn orphans_on_an_unmounted_pool_are_removed_later() {
             pool: "local".into(),
             size_bytes: 1,
             format: ImageFormat::Raw,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -157,6 +159,7 @@ async fn orphans_are_removed_only_by_the_node_that_made_them() {
                         pool: "local".into(),
                         size_bytes: 1,
                         format: ImageFormat::Raw,
+                        content: Default::default(),
                     },
                 );
                 volume.status.node = node;
@@ -203,6 +206,7 @@ async fn a_task_deleted_while_running_does_not_block_its_queue() {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -326,6 +330,7 @@ async fn volumes_left_active_are_deactivated() {
                 pool: pool.into(),
                 size_bytes: 1 << 20,
                 format: ImageFormat::Raw,
+                content: Default::default(),
             },
         );
         if ready {
@@ -451,6 +456,7 @@ async fn a_volume_taken_up_during_the_sweep_is_not_deactivated() {
                 pool: "san".into(),
                 size_bytes: 1 << 20,
                 format: ImageFormat::Raw,
+                content: Default::default(),
             },
         );
         volume.status.phase = VolumePhase::Ready;

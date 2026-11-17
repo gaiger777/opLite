@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::cloud_init::{CloudInit, CloudInitError};
 use crate::replication::{
     MAX_REPLICATION_TARGETS, ReplicaRecovery, ReplicaStatus, ReplicationTarget, parse_interval,
 };
@@ -69,6 +70,14 @@ pub struct VmSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub replication: Vec<ReplicationTarget>,
+    /// CD-ROM 드라이브(계획 57, 넷까지, 순번 = 드라이브 번호). 비면 쓰지 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cdroms: Vec<CdromSpec>,
+    /// cloud-init NoCloud 씨앗(계획 57). 없으면 쓰지 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cloud_init: Option<CloudInit>,
 }
 
 /// VM의 최적 배치 옵션
@@ -246,6 +255,12 @@ pub const MAX_NIC_SECURITY_GROUPS: usize = 8;
 /// 예약 스냅샷 보관 개수의 최댓값.
 pub const MAX_SCHEDULE_KEEP: u32 = 100;
 
+/// VM 하나의 최대 CD-ROM 드라이브 수
+pub const MAX_CDROMS: usize = 4;
+
+/// q35 내장 AHCI의 SATA 포트 수. SATA 디스크 → CD-ROM 드라이브 → cloud-init 드라이브 순으로 나눠 쓴다.
+pub const Q35_SATA_PORTS: usize = 6;
+
 impl VmSpec {
     pub fn validate(&self) -> Result<(), ValidationError> {
         if self.cpu.sockets == 0 {
@@ -282,11 +297,40 @@ impl VmSpec {
                 return Err(ValidationError::MemoryAlign);
             }
         }
+        if self.cdroms.len() > MAX_CDROMS {
+            return Err(ValidationError::TooManyCdroms);
+        }
+        // CD-ROM이나 cloud-init이 없는 VM은 지금처럼 명령줄 검사(`check_compat`)가 SATA 디스크 수를 본다.
+        let sata = self.disks.iter().filter(|d| d.bus == DiskBus::Sata).count();
+        let cloud_init = usize::from(self.cloud_init.is_some());
+        if self.machine == MachineType::Q35
+            && (!self.cdroms.is_empty() || cloud_init > 0)
+            && sata + self.cdroms.len() + cloud_init > Q35_SATA_PORTS
+        {
+            return Err(ValidationError::TooManySataDevices {
+                disks: sata,
+                cdroms: self.cdroms.len(),
+                cloud_init: cloud_init > 0,
+            });
+        }
         let mut seen = BTreeSet::new();
-        for order in self.disks.iter().filter_map(|d| d.boot_order) {
+        let orders = self.disks.iter().map(|d| d.boot_order);
+        for order in orders
+            .chain(self.cdroms.iter().map(|c| c.boot_order))
+            .flatten()
+        {
             if !seen.insert(order) {
                 return Err(ValidationError::DuplicateBootOrder(order));
             }
+        }
+        let (disks, cdroms) = boot_slots(&self.disk_boot_orders(), &self.cdrom_boot_orders());
+        if disks
+            .iter()
+            .chain(&cdroms)
+            .flatten()
+            .any(|&o| o > u16::from(u8::MAX))
+        {
+            return Err(ValidationError::BootOrderOverflow);
         }
         if self.nics.len() > MAX_NICS {
             return Err(ValidationError::TooManyNics);
@@ -346,7 +390,20 @@ impl VmSpec {
                 return Err(ValidationError::ReplicationOwnNode);
             }
         }
+        if let Some(ci) = &self.cloud_init {
+            ci.validate(self.nics.len())?;
+        }
         Ok(())
+    }
+
+    /// 디스크마다 스펙의 `boot_order`
+    pub fn disk_boot_orders(&self) -> Vec<Option<u8>> {
+        self.disks.iter().map(|d| d.boot_order).collect()
+    }
+
+    /// CD-ROM 드라이브마다 스펙의 `boot_order`
+    pub fn cdrom_boot_orders(&self) -> Vec<Option<u8>> {
+        self.cdroms.iter().map(|c| c.boot_order).collect()
     }
 
     /// HA가 이 VM을 다루는지(정책이 있고 `ignored`가 아님). 펜싱·HA 가능 노드 조건·복구가 이것을 본다.
@@ -389,8 +446,21 @@ pub enum ValidationError {
         "memory_mib and max_memory_mib must be multiples of {MEMORY_HOTPLUG_ALIGN_MIB} when max_memory_mib is set"
     )]
     MemoryAlign,
-    #[error("boot_order {0} is used by more than one disk")]
+    #[error("boot_order {0} is used by more than one disk or CD-ROM drive")]
     DuplicateBootOrder(u8),
+    #[error("a VM can have at most {MAX_CDROMS} CD-ROM drives")]
+    TooManyCdroms,
+    #[error(
+        "q35 has {Q35_SATA_PORTS} SATA ports: {disks} SATA disks, {cdroms} CD-ROM drives{} do not fit",
+        if *cloud_init { " and the cloud-init drive" } else { "" }
+    )]
+    TooManySataDevices {
+        disks: usize,
+        cdroms: usize,
+        cloud_init: bool,
+    },
+    #[error("boot_order leaves no room for the CD-ROM drives after it")]
+    BootOrderOverflow,
     #[error("MAC address {0} is a multicast address")]
     MulticastMac(MacAddr),
     #[error("MAC address {0} is used by more than one NIC")]
@@ -419,6 +489,63 @@ pub enum ValidationError {
     ReplicationSchedule,
     #[error("replication target cannot be the VM's own node")]
     ReplicationOwnNode,
+    #[error(transparent)]
+    CloudInit(#[from] CloudInitError),
+}
+
+/// 실제 부팅 순서(QEMU `bootindex`): 디스크와 CD-ROM 드라이브의 `boot_order`에서 정한다. CD-ROM이 없으면 그대로다
+/// (CD-ROM이 없는 VM의 명령줄은 바뀌지 않는다). 있으면 아무 장치에도 값이 없을 때 디스크를 순서대로 1, 2, …로 하고
+/// 그 뒤에 CD-ROM을, 하나라도 있으면 값 없는 디스크는 그대로 두고 값 없는 CD-ROM을 가장 큰 값 + 1부터 드라이브
+/// 순서로 둔다 — 기본은 디스크 → CD-ROM이다(빈 디스크는 펌웨어가 건너뛰어 설치 매체가 뜬다). 단 값이 CD-ROM에만
+/// 있으면 디스크를 가장 큰 값 뒤에 차례로 두고 값 없는 CD-ROM은 그 뒤다(CD로 설치하고 매체를 뺀 UEFI VM이 디스크로
+/// 켜지게). OVMF는 `bootindex`가 있는 장치만 부팅하므로 CD-ROM에는 늘 값을 준다. 255를 넘는 자리는 없음이다(검증이
+/// 먼저 거절한다).
+pub fn effective_boot(
+    disks: &[Option<u8>],
+    cdroms: &[Option<u8>],
+) -> (Vec<Option<u8>>, Vec<Option<u8>>) {
+    let (disks, cdroms) = boot_slots(disks, cdroms);
+    let narrow = |v: Vec<Option<u16>>| -> Vec<Option<u8>> {
+        v.into_iter()
+            .map(|o| o.and_then(|o| u8::try_from(o).ok()))
+            .collect()
+    };
+    (narrow(disks), narrow(cdroms))
+}
+
+/// [`effective_boot`]의 계산(넘침을 볼 수 있게 u16)
+fn boot_slots(disks: &[Option<u8>], cdroms: &[Option<u8>]) -> (Vec<Option<u16>>, Vec<Option<u16>>) {
+    let wide =
+        |v: &[Option<u8>]| -> Vec<Option<u16>> { v.iter().map(|o| o.map(u16::from)).collect() };
+    if cdroms.is_empty() {
+        return (wide(disks), Vec::new());
+    }
+    let (disks, first) = match disks.iter().chain(cdroms).flatten().max() {
+        None => (
+            (1..=disks.len() as u16).map(Some).collect(),
+            disks.len() as u16 + 1,
+        ),
+        // 값이 CD-ROM에만 있으면 디스크를 그 뒤에 차례로
+        Some(&max) if disks.iter().all(Option::is_none) => {
+            let start = u16::from(max) + 1;
+            (
+                (start..start + disks.len() as u16).map(Some).collect(),
+                start + disks.len() as u16,
+            )
+        }
+        Some(&max) => (wide(disks), u16::from(max) + 1),
+    };
+    let mut next = first;
+    let cdroms = cdroms
+        .iter()
+        .map(|o| {
+            Some(o.map(u16::from).unwrap_or_else(|| {
+                next += 1;
+                next - 1
+            }))
+        })
+        .collect();
+    (disks, cdroms)
 }
 
 /// 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다.
@@ -553,6 +680,21 @@ pub struct DiskSpec {
     pub boot_order: Option<u8>,
 }
 
+/// CD-ROM 드라이브. 매체는 늘 읽기 전용으로 열고, 여러 VM이 같은 ISO를 함께 넣을 수 있다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CdromSpec {
+    /// 넣은 ISO 볼륨(`content: iso`)의 이름. 없으면 빈 드라이브다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub iso: Option<String>,
+    /// 부팅 순서. 없으면 디스크 뒤에 둔다(`effective_boot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub boot_order: Option<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
@@ -673,6 +815,11 @@ pub struct RunningHardware {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub nics: Vec<NicSpec>,
+    /// 지금 QEMU의 CD-ROM 드라이브와 매체(계획 57, 순번 = QEMU의 `cd{i}-dev`). 켤 때 스펙 그대로이고 매체를 바꾸면
+    /// 핫플러그 Task가 고친다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cdroms: Vec<CdromSpec>,
     /// 떼기를 요청했으나 게스트가 아직 내려 주지 않은 장치의 QEMU id(`disk{i}-dev`, `nic{i}`, `cpu{i}`). 디스크·NIC는
     /// `disks`·`nics`에 남아 있고 vCPU는 `layout.vcpus`에 들어 있으며, 다음 핫플러그 Task가 떼기를 마저 한다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1844,5 +1991,232 @@ mod tests {
             assert!(bad.parse::<MacAddr>().is_err(), "{bad} should be rejected");
         }
         assert!(serde_json::from_value::<MacAddr>("nope".into()).is_err());
+    }
+
+    /// `cdroms`·`cloud_init`이 없으면 옛 VM 그대로 쓰고, 있으면 왕복한다. 모르는 키는 거절한다.
+    #[test]
+    fn cdroms_and_cloud_init_are_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert!(spec.cdroms.is_empty());
+        assert_eq!(spec.cloud_init, None);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+
+        let mut json = sample_json();
+        json["cdroms"] = serde_json::json!([{ "iso": "ubuntu-24-04", "boot_order": 2 }, {}]);
+        json["cloud_init"] =
+            serde_json::json!({ "user": "orbi", "ssh_keys": ["ssh-ed25519 AAAA"] });
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            spec.cdroms,
+            [
+                CdromSpec {
+                    iso: Some("ubuntu-24-04".into()),
+                    boot_order: Some(2),
+                },
+                CdromSpec::default(),
+            ]
+        );
+        assert_eq!(
+            spec.cloud_init.as_ref().unwrap().user.as_deref(),
+            Some("orbi")
+        );
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap()["cdroms"],
+            json["cdroms"]
+        );
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap()["cloud_init"],
+            json["cloud_init"]
+        );
+        let back: VmSpec = serde_json::from_value(serde_json::to_value(&spec).unwrap()).unwrap();
+        assert_eq!(back, spec);
+        assert_eq!(spec.validate(), Ok(()));
+
+        for (field, bad) in [
+            ("cdroms", serde_json::json!([{ "isoo": "a" }])),
+            ("cdroms", serde_json::json!([{ "iso": "a", "bus": "sata" }])),
+            ("cloud_init", serde_json::json!({ "username": "orbi" })),
+        ] {
+            let mut json = sample_json();
+            json[field] = bad.clone();
+            assert!(serde_json::from_value::<VmSpec>(json).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn status_hardware_writes_cdroms_only_when_present() {
+        let hw = RunningHardware::legacy(&sample());
+        assert!(hw.cdroms.is_empty());
+        let json = serde_json::to_value(&hw).unwrap();
+        assert!(json.get("cdroms").is_none(), "{json}");
+
+        let mut s = sample();
+        s.cdroms = vec![CdromSpec {
+            iso: Some("alpine".into()),
+            boot_order: None,
+        }];
+        let hw = RunningHardware::legacy(&s);
+        let json = serde_json::to_value(&hw).unwrap();
+        assert_eq!(json["cdroms"], serde_json::json!([{ "iso": "alpine" }]));
+        assert_eq!(serde_json::from_value::<RunningHardware>(json).unwrap(), hw);
+    }
+
+    fn cdrom(iso: &str, boot_order: Option<u8>) -> CdromSpec {
+        CdromSpec {
+            iso: Some(iso.into()),
+            boot_order,
+        }
+    }
+
+    #[test]
+    fn validate_checks_cdrom_count_and_sata_ports() {
+        let mut s = sample();
+        s.cdroms = vec![CdromSpec::default(); MAX_CDROMS];
+        assert_eq!(s.validate(), Ok(()));
+        s.cdroms.push(CdromSpec::default());
+        assert_eq!(s.validate(), Err(ValidationError::TooManyCdroms));
+        assert_eq!(
+            ValidationError::TooManyCdroms.to_string(),
+            "a VM can have at most 4 CD-ROM drives"
+        );
+
+        // q35: SATA 디스크 넷 + CD 둘 = 6은 되고, cloud-init 드라이브가 더해지면 넘는다.
+        let mut s = sample();
+        s.disks = (0..4)
+            .map(|i| DiskSpec {
+                volume: format!("d{i}"),
+                bus: DiskBus::Sata,
+                boot_order: None,
+            })
+            .collect();
+        s.cdroms = vec![CdromSpec::default(); 2];
+        assert_eq!(s.validate(), Ok(()));
+        s.cloud_init = Some(CloudInit::default());
+        let err = s.validate().unwrap_err();
+        assert_eq!(
+            err,
+            ValidationError::TooManySataDevices {
+                disks: 4,
+                cdroms: 2,
+                cloud_init: true,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "q35 has 6 SATA ports: 4 SATA disks, 2 CD-ROM drives and the cloud-init drive do not fit"
+        );
+        s.cloud_init = None;
+        s.cdroms.push(CdromSpec::default());
+        assert_eq!(
+            s.validate().unwrap_err().to_string(),
+            "q35 has 6 SATA ports: 4 SATA disks, 3 CD-ROM drives do not fit"
+        );
+        // virt는 CD-ROM을 virtio-scsi에 달아 SATA 규칙이 없다.
+        s.machine = MachineType::Virt;
+        s.cloud_init = Some(CloudInit::default());
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_checks_boot_order_across_disks_and_cdroms() {
+        let mut s = sample();
+        s.cdroms = vec![cdrom("a", Some(2)), cdrom("b", Some(1))];
+        assert_eq!(s.validate(), Err(ValidationError::DuplicateBootOrder(1)));
+        assert_eq!(
+            ValidationError::DuplicateBootOrder(1).to_string(),
+            "boot_order 1 is used by more than one disk or CD-ROM drive"
+        );
+        s.cdroms = vec![cdrom("a", Some(3)), cdrom("b", Some(3))];
+        assert_eq!(s.validate(), Err(ValidationError::DuplicateBootOrder(3)));
+
+        // 값 없는 CD-ROM이 가장 큰 값 뒤에 들어갈 자리가 없다.
+        s.cdroms = vec![cdrom("a", Some(255)), cdrom("b", None)];
+        assert_eq!(s.validate(), Err(ValidationError::BootOrderOverflow));
+        assert_eq!(
+            ValidationError::BootOrderOverflow.to_string(),
+            "boot_order leaves no room for the CD-ROM drives after it"
+        );
+        s.disks[0].boot_order = Some(254);
+        s.cdroms = vec![cdrom("a", None)];
+        assert_eq!(s.validate(), Ok(()));
+        s.cdroms.push(cdrom("b", None));
+        assert_eq!(s.validate(), Err(ValidationError::BootOrderOverflow));
+        // CD-ROM이 없으면 255도 그대로 된다.
+        s.disks[0].boot_order = Some(255);
+        s.cdroms.clear();
+        assert_eq!(s.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validate_delegates_cloud_init_checks() {
+        let mut s = sample();
+        s.cloud_init = Some(CloudInit {
+            user: Some("root".into()),
+            ..Default::default()
+        });
+        let err = s.validate().unwrap_err();
+        assert_eq!(err, ValidationError::CloudInit(CloudInitError::RootUser));
+        assert_eq!(
+            err.to_string(),
+            "cloud_init.user: use ssh_keys with the default user instead of root"
+        );
+        // networks는 VM의 NIC 수(1)까지
+        s.cloud_init = Some(CloudInit {
+            networks: vec![Default::default(); 2],
+            ..Default::default()
+        });
+        assert_eq!(
+            s.validate(),
+            Err(ValidationError::CloudInit(CloudInitError::TooManyNetworks(
+                2, 1
+            )))
+        );
+    }
+
+    #[test]
+    fn effective_boot_puts_cdroms_after_disks() {
+        // CD-ROM이 없으면 그대로(지금 명령줄)
+        assert_eq!(
+            effective_boot(&[Some(1), None], &[]),
+            (vec![Some(1), None], vec![])
+        );
+        assert_eq!(
+            effective_boot(&[None, None], &[]),
+            (vec![None, None], vec![])
+        );
+        // 아무 값도 없으면 디스크 1..n, 그 뒤 CD-ROM
+        assert_eq!(
+            effective_boot(&[None, None], &[None, None]),
+            (vec![Some(1), Some(2)], vec![Some(3), Some(4)])
+        );
+        assert_eq!(effective_boot(&[], &[None]), (vec![], vec![Some(1)]));
+        // 디스크 하나만 값이 있으면 값 없는 디스크는 그대로 없고 CD-ROM은 가장 큰 값 + 1부터
+        assert_eq!(
+            effective_boot(&[Some(1), None], &[None, None]),
+            (vec![Some(1), None], vec![Some(2), Some(3)])
+        );
+        // CD-ROM에 값이 있으면 그 값, 값 없는 CD-ROM은 가장 큰 값 뒤
+        assert_eq!(
+            effective_boot(&[Some(2), None], &[Some(1), None]),
+            (vec![Some(2), None], vec![Some(1), Some(3)])
+        );
+        // 값이 CD-ROM에만 있으면 디스크를 가장 큰 값 뒤에 차례로, 값 없는 CD-ROM은 그 뒤
+        assert_eq!(
+            effective_boot(&[None], &[Some(5), None]),
+            (vec![Some(6)], vec![Some(5), Some(7)])
+        );
+        assert_eq!(
+            effective_boot(&[None, None], &[Some(1)]),
+            (vec![Some(2), Some(3)], vec![Some(1)])
+        );
+        // 255를 넘는 자리는 없음
+        assert_eq!(
+            effective_boot(&[Some(255)], &[None]),
+            (vec![Some(255)], vec![None])
+        );
+        assert_eq!(
+            effective_boot(&[None], &[Some(255)]),
+            (vec![None], vec![Some(255)])
+        );
     }
 }

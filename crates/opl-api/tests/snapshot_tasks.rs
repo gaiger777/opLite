@@ -43,6 +43,7 @@ async fn pool_and_root(env: &Env) {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -479,6 +480,7 @@ async fn ready_volume(env: &Env, name: &str) -> Uuid {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -979,6 +981,7 @@ async fn block_volumes(
                     pool: (*pool).into(),
                     size_bytes: 1 << 20,
                     format: ImageFormat::Raw,
+                    content: Default::default(),
                 },
             );
             env.cluster.create(&volume).await.unwrap();
@@ -1026,6 +1029,7 @@ async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str])
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     };
     env.hv.start(&runtime, None).await.unwrap();
     let mut spec = current.spec.clone();

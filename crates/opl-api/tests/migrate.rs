@@ -95,6 +95,7 @@ async fn ready_volume(env: &Env, pool: &str, name: &str) {
             pool: pool.into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     volume.status.node = Some(env.node);

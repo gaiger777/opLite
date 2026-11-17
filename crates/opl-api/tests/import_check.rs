@@ -37,6 +37,7 @@ async fn volume(env: &Env, name: &str) -> Uuid {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();

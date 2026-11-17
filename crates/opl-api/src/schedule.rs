@@ -425,6 +425,8 @@ mod tests {
                 placement: None,
                 max_memory_mib: None,
                 replication: Vec::new(),
+                cdroms: vec![],
+                cloud_init: None,
             },
         );
         vm.status.phase = VmPhase::Running;

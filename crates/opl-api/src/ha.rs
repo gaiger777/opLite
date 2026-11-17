@@ -2279,6 +2279,8 @@ mod tests {
                 placement: None,
                 max_memory_mib: None,
                 replication: Vec::new(),
+                cdroms: vec![],
+                cloud_init: None,
             },
         )
     }
@@ -2514,6 +2516,7 @@ mod tests {
                 pool: "local".into(),
                 size_bytes: 1 << 30,
                 format: opl_types::runtime::ImageFormat::Qcow2,
+                content: Default::default(),
             },
         );
         root.status.node = Some(failed.id);

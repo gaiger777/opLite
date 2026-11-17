@@ -143,6 +143,7 @@ async fn received_vm_is_continued_after_the_commit() {
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
@@ -188,6 +189,7 @@ async fn taking_over_a_copied_disk_moves_the_volume_record_first() {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     volume.status.node = Some(source);

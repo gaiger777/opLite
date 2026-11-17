@@ -25,6 +25,24 @@ pub struct VmRuntimeSpec {
     /// 마이그레이션된다.
     #[serde(default)]
     pub hotplug: Option<HotplugLayout>,
+    /// CD-ROM 드라이브(계획 57, 순번 = QEMU의 `cd{i}-dev`). 없으면(옛 정의) 드라이브가 없다.
+    #[serde(default)]
+    pub cdroms: Vec<RuntimeCdrom>,
+}
+
+/// 이름이 풀린 CD-ROM 드라이브
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCdrom {
+    /// 넣은 매체. 없으면 빈 드라이브다.
+    pub medium: Option<RuntimeMedium>,
+    /// QEMU `bootindex`(실제 부팅 순서 `effective_boot`로 채운 값)
+    pub boot_order: Option<u8>,
+}
+
+/// CD-ROM 매체(ISO 볼륨). 파일 풀에만 있으므로 경로뿐이고 늘 읽기 전용으로 연다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeMedium {
+    pub path: PathBuf,
 }
 
 /// 핫플러그 배치가 켤 때 두는 빈 PCIe 루트 포트 수
@@ -187,6 +205,7 @@ mod tests {
         });
         let spec: VmRuntimeSpec = serde_json::from_value(old).unwrap();
         assert_eq!(spec.hotplug, None);
+        assert!(spec.cdroms.is_empty());
         let layout = HotplugLayout {
             vcpus: 2,
             max_memory_mib: 4096,
@@ -229,5 +248,33 @@ mod tests {
         let json = serde_json::to_value(&vxlan).unwrap();
         assert_eq!(json["mtu"], 1450);
         assert_eq!(serde_json::from_value::<NicBackend>(json).unwrap(), vxlan);
+    }
+
+    #[test]
+    fn cdroms_round_trip() {
+        let old = serde_json::json!({
+            "id": uuid::Uuid::nil(), "name": "a", "cpu": { "cores": 1 }, "memory_mib": 256,
+            "firmware": "uefi", "machine": "virt", "disks": [], "nics": []
+        });
+        let spec: VmRuntimeSpec = serde_json::from_value(old).unwrap();
+        let spec = VmRuntimeSpec {
+            cdroms: vec![
+                RuntimeCdrom {
+                    medium: Some(RuntimeMedium {
+                        path: "/pools/iso/a.raw".into(),
+                    }),
+                    boot_order: Some(2),
+                },
+                RuntimeCdrom {
+                    medium: None,
+                    boot_order: None,
+                },
+            ],
+            ..spec
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["cdroms"][0]["medium"]["path"], "/pools/iso/a.raw");
+        assert_eq!(json["cdroms"][1]["medium"], serde_json::Value::Null);
+        assert_eq!(serde_json::from_value::<VmRuntimeSpec>(json).unwrap(), spec);
     }
 }

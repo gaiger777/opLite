@@ -1292,6 +1292,8 @@ mod tests {
                 placement: None,
                 max_memory_mib: None,
                 replication: Vec::new(),
+                cdroms: vec![],
+                cloud_init: None,
             },
         )
     }
@@ -1319,6 +1321,7 @@ mod tests {
                 pool: pool.into(),
                 size_bytes: 1,
                 format: ImageFormat::Qcow2,
+                content: Default::default(),
             },
         )
     }

@@ -48,6 +48,7 @@ fn spec() -> VmRuntimeSpec {
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     }
 }
 

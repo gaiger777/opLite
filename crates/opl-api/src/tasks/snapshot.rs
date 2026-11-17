@@ -1011,6 +1011,7 @@ mod tests {
             nics: vec![],
             guest_agent: false,
             hotplug: None,
+            cdroms: vec![],
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

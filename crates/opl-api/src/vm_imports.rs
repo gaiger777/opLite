@@ -801,6 +801,8 @@ pub(crate) fn import_spec(
         placement: None,
         max_memory_mib: None,
         replication: Vec::new(),
+        cdroms: vec![],
+        cloud_init: None,
     })
 }
 

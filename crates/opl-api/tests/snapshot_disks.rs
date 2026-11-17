@@ -347,6 +347,7 @@ async fn unfinished_snapshot_tags_are_removed_at_startup() {
                     pool: "local".into(),
                     size_bytes: MIB,
                     format: ImageFormat::Qcow2,
+                    content: Default::default(),
                 },
             );
             volume.status.phase = VolumePhase::Ready;

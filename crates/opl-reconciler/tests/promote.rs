@@ -243,6 +243,7 @@ async fn setup(promote: bool) -> Setup {
             pool: "a".into(),
             size_bytes: SIZE,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     volume.status.node = Some(source);

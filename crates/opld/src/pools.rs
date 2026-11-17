@@ -2312,6 +2312,7 @@ mod tests {
                 pool: "nas".into(),
                 size_bytes: 1 << 20,
                 format: opl_types::runtime::ImageFormat::Qcow2,
+                content: Default::default(),
             },
         );
         s.cluster.create(&volume).await.unwrap();

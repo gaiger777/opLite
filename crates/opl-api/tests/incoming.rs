@@ -70,6 +70,7 @@ async fn setup() -> Setup {
             pool: "nas".into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     volume.status.node = Some(source.id);
@@ -445,6 +446,7 @@ async fn sweep_stops_a_source_qemu_committed_elsewhere() {
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(vm.id, &target, &opts).await.unwrap();
@@ -494,6 +496,7 @@ async fn sweep_stops_a_source_qemu_of_a_deleted_vm() {
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(spec.id, &target, &opts).await.unwrap();
@@ -649,6 +652,7 @@ impl Setup {
                 pool: "local".into(),
                 size_bytes: LOCAL_SIZE,
                 format: ImageFormat::Qcow2,
+                content: Default::default(),
             },
         );
         volume.status.node = Some(self.source);

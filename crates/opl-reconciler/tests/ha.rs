@@ -794,6 +794,7 @@ async fn ha_vm_reassigned_while_reattaching_is_not_started() {
             pool: "local".into(),
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -885,6 +886,7 @@ async fn received_ha_vm_is_continued_only_with_the_lease() {
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
@@ -1539,6 +1541,7 @@ async fn start_with_disk(storage: &Arc<GateStorage>) -> (Env, Ha, Vm) {
             pool: "shared".into(),
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();

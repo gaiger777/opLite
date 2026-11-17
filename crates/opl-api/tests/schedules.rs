@@ -76,6 +76,7 @@ async fn ready_volume(env: &Env, name: &str, format: ImageFormat) {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();

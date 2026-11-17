@@ -74,6 +74,7 @@ async fn setup() -> Setup {
             pool: "a".into(),
             size_bytes: SIZE,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -223,6 +224,7 @@ impl Setup {
                 pool: "a".into(),
                 size_bytes: SIZE,
                 format: ImageFormat::Qcow2,
+                content: Default::default(),
             },
         );
         self.env.cluster.create(&v).await.unwrap();
@@ -674,6 +676,7 @@ async fn sweep_deletes_replicas_no_longer_wanted() {
             pool: "a".into(),
             size_bytes: SIZE,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     other.status.node = Some(s.source);

@@ -12,8 +12,8 @@ use crate::vm::{
     CpuSpec, DiskBus, NicSpec, PendingChange, PendingReason, RunningHardware, Vm, VmSpec,
 };
 
-/// 핫플러그 Task가 차례로 하는 일. 순서는 떼기(NIC → 디스크, 큰 순번부터) → vCPU → 메모리 → 붙이기(디스크 →
-/// NIC, 작은 순번부터)라 떼어 빈 루트 포트를 붙이기가 다시 쓴다.
+/// 핫플러그 Task가 차례로 하는 일. 순서는 떼기(NIC → 디스크, 큰 순번부터) → vCPU → 메모리 → CD-ROM 매체 →
+/// 붙이기(디스크 → NIC, 작은 순번부터)라 떼어 빈 루트 포트를 붙이기가 다시 쓴다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     RemoveNic(usize),
@@ -22,6 +22,11 @@ pub enum Step {
     /// virtio-mem에 꽂을 크기(켤 때 메모리 위로 더한 것)
     SetMemory {
         plugged_mib: u32,
+    },
+    /// CD-ROM 드라이브 `index`의 매체를 스펙의 것으로 바꾼다(넣기·빼기). 루트 포트를 쓰지 않으므로 핫플러그 배치
+    /// 없이 켠 VM도 된다.
+    ChangeMedium {
+        index: usize,
     },
     AddDisk {
         index: usize,
@@ -76,6 +81,7 @@ impl RunningHardware {
             layout: None,
             disks: spec.disks.clone(),
             nics: spec.nics.clone(),
+            cdroms: spec.cdroms.clone(),
             unplugging: Vec::new(),
             pending: Vec::new(),
         }
@@ -185,11 +191,23 @@ pub fn plan(spec: &VmSpec, hw: &RunningHardware, caps: NodeHotplug) -> Result<Pl
     {
         return Err(DeviceError::SataDisk(sata.volume.clone()));
     }
+    // CD-ROM 드라이브(컨트롤러 포트)는 켤 때만 정해지고, 매체만 실행 중에 바꾼다.
+    if spec.cdroms.len() != hw.cdroms.len() {
+        return Err(DeviceError::Changed("add or remove CD-ROM drives".into()));
+    }
 
     let mut steps: Vec<Step> = nics.removed.iter().map(|&i| Step::RemoveNic(i)).collect();
     steps.extend(disks.removed.iter().map(|&i| Step::RemoveDisk(i)));
     let mut pending = Vec::new();
     changes(spec, hw, caps, &mut steps, &mut pending);
+    steps.extend(
+        spec.cdroms
+            .iter()
+            .zip(&hw.cdroms)
+            .enumerate()
+            .filter(|(_, (want, now))| want.iso != now.iso)
+            .map(|(index, _)| Step::ChangeMedium { index }),
+    );
 
     if disks.is_empty() && nics.is_empty() {
         return Ok(Plan { steps, pending });
@@ -320,19 +338,29 @@ pub fn allocated_memory_mib(vm: &Vm) -> u32 {
 /// 스펙의 디스크·NIC가 도는 QEMU의 장치(`hw`)와 같은지(NIC의 보안 그룹은 견주지 않는다). 다르면 핫플러그 Task가
 /// 끝나지 않았거나 실패해 게스트가 아직 내려 주지 않은 장치가 있다 — 마이그레이션 대상은 스펙의 장치로 켜므로
 /// 옮기면 안 된다.
+/// CD-ROM 드라이브는 수와 매체를 견준다(부팅 순서는 다음 재시작 때 적용할 보류일 뿐이고, 받는 쪽은 기록의 값으로
+/// 켠다).
 pub fn devices_match(spec: &VmSpec, hw: &RunningHardware) -> bool {
     spec.disks == hw.disks
         && spec.nics.len() == hw.nics.len()
         && spec.nics.iter().zip(&hw.nics).all(|(a, b)| same_nic(a, b))
+        && spec.cdroms.len() == hw.cdroms.len()
+        && spec
+            .cdroms
+            .iter()
+            .zip(&hw.cdroms)
+            .all(|(a, b)| a.iso == b.iso)
 }
 
-/// 마이그레이션 대상이 켤 QEMU의 핫플러그·디스크·NIC 장치 id(`/machine/peripheral`의 `disk{i}-dev`·`nic{i}`·
-/// `cpu{i}`·`vmem0-dev`, 이름순): 디스크·NIC는 스펙에서, 붙인 vCPU와 virtio-mem은 하드웨어 기록의 배치에서 나온다.
-/// 원본 드라이버가 도는 QEMU와 견준다.
+/// 마이그레이션 대상이 켤 QEMU의 핫플러그·디스크·NIC·CD-ROM 장치 id(`/machine/peripheral`의 `disk{i}-dev`·
+/// `nic{i}`·`cpu{i}`·`vmem0-dev`·`cd{i}-dev`, 이름순): 디스크·NIC는 스펙에서, 붙인 vCPU와 virtio-mem은 하드웨어
+/// 기록의 배치에서, CD-ROM 드라이브는 기록(없으면 스펙)에서 나온다. 원본 드라이버가 도는 QEMU와 견준다.
 pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> {
+    let cdroms = hw.map_or(spec.cdroms.len(), |hw| hw.cdroms.len());
     let mut ids: Vec<String> = (0..spec.disks.len())
         .map(|i| format!("disk{i}-dev"))
         .chain((0..spec.nics.len()).map(|i| format!("nic{i}")))
+        .chain((0..cdroms).map(|i| format!("cd{i}-dev")))
         .collect();
     if let Some(hw) = hw
         && let Some(layout) = &hw.layout
@@ -346,8 +374,8 @@ pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> 
     ids
 }
 
-/// 스펙의 하드웨어가 바뀌었는지(CPU·메모리·상한·펌웨어·머신·디스크·보안 그룹을 뺀 NIC). 실행 중이면 핫플러그
-/// Task를 만든다.
+/// 스펙의 하드웨어가 바뀌었는지(CPU·메모리·상한·펌웨어·머신·디스크·보안 그룹을 뺀 NIC·CD-ROM 드라이브와 매체·
+/// cloud-init). 실행 중이면 핫플러그 Task를 만든다.
 pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
     old.cpu != new.cpu
         || old.memory_mib != new.memory_mib
@@ -357,6 +385,8 @@ pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
         || old.disks != new.disks
         || old.nics.len() != new.nics.len()
         || old.nics.iter().zip(&new.nics).any(|(a, b)| !same_nic(a, b))
+        || old.cdroms != new.cdroms
+        || old.cloud_init != new.cloud_init
 }
 
 /// 같은 NIC 장치인지(보안 그룹은 방화벽 규칙이라 견주지 않는다)
@@ -428,7 +458,7 @@ fn device_changes<T>(
     })
 }
 
-/// vCPU·메모리·펌웨어·머신: 바로 할 단계는 `steps`에, 못 하는 것은 `pending`에 더한다.
+/// vCPU·메모리·펌웨어·머신·CD-ROM 부팅 순서: 바로 할 단계는 `steps`에, 못 하는 것은 `pending`에 더한다.
 fn changes(
     spec: &VmSpec,
     hw: &RunningHardware,
@@ -455,6 +485,19 @@ fn changes(
             PendingReason::Restart,
             None,
         ));
+    }
+    // CD-ROM 부팅 순서는 QEMU를 켤 때만 정해진다(`bootindex`).
+    let order = |o: Option<u8>| o.map_or("none".to_string(), |o| o.to_string());
+    for (i, (want, now)) in spec.cdroms.iter().zip(&hw.cdroms).enumerate() {
+        if want.boot_order != now.boot_order {
+            pending.push(change(
+                &format!("cdroms[{i}].boot_order"),
+                order(now.boot_order),
+                order(want.boot_order),
+                PendingReason::Restart,
+                None,
+            ));
+        }
     }
 }
 
@@ -625,9 +668,10 @@ fn kebab(v: impl Serialize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cloud_init::CloudInit;
     use crate::node::{NodeSpec, NodeStatus};
     use crate::resource::Resource;
-    use crate::vm::{CpuModel, DiskSpec, Firmware, MacAddr, MachineType, NicModel};
+    use crate::vm::{CdromSpec, CpuModel, DiskSpec, Firmware, MacAddr, MachineType, NicModel};
 
     const ALL: NodeHotplug = NodeHotplug {
         cpu: true,
@@ -1514,5 +1558,173 @@ mod tests {
             serde_json::to_value(PendingReason::Unsupported).unwrap(),
             "unsupported"
         );
+    }
+
+    fn cd(iso: Option<&str>, boot_order: Option<u8>) -> CdromSpec {
+        CdromSpec {
+            iso: iso.map(Into::into),
+            boot_order,
+        }
+    }
+
+    /// CD-ROM 드라이브 둘(하나는 빈 것)을 단 스펙
+    fn with_cdroms() -> VmSpec {
+        let mut s = spec();
+        s.cdroms = vec![cd(Some("ubuntu"), None), cd(None, None)];
+        s
+    }
+
+    #[test]
+    fn at_start_records_the_cdroms() {
+        let s = with_cdroms();
+        assert_eq!(started(&s, ALL).cdroms, s.cdroms);
+        assert_eq!(RunningHardware::legacy(&s).cdroms, s.cdroms);
+    }
+
+    #[test]
+    fn changing_media_is_one_step_per_drive_even_without_a_layout() {
+        let s = with_cdroms();
+        for hw in [started(&s, ALL), RunningHardware::legacy(&s)] {
+            let mut want = s.clone();
+            want.cdroms[0].iso = None;
+            want.cdroms[1].iso = Some("alpine".into());
+            let plan = plan(&want, &hw, ALL).unwrap();
+            assert_eq!(
+                plan.steps,
+                [
+                    Step::ChangeMedium { index: 0 },
+                    Step::ChangeMedium { index: 1 }
+                ]
+            );
+            // 배치 없이 켠 기록은 상한이 없어 상한 보류만 있다.
+            assert!(
+                plan.pending
+                    .iter()
+                    .all(|p| p.field.ends_with("max_vcpus") || p.field == "max_memory_mib"),
+                "{plan:?}"
+            );
+            // 같은 매체면 할 일이 없다.
+            assert!(plan_fn(&s, &hw).steps.is_empty());
+        }
+    }
+
+    fn plan_fn(spec: &VmSpec, hw: &RunningHardware) -> Plan {
+        plan(spec, hw, ALL).unwrap()
+    }
+
+    #[test]
+    fn media_changes_come_after_removals_and_resources_and_before_additions() {
+        let s = with_cdroms();
+        let hw = started(&s, ALL);
+        let mut want = s.clone();
+        want.cpu.cores = 4;
+        want.cdroms[0].iso = Some("alpine".into());
+        want.disks.push(DiskSpec {
+            volume: "data".into(),
+            bus: DiskBus::VirtioBlk,
+            boot_order: None,
+        });
+        let plan = plan_fn(&want, &hw);
+        assert_eq!(
+            plan.steps,
+            [
+                Step::SetVcpus(4),
+                Step::ChangeMedium { index: 0 },
+                Step::AddDisk { index: 1, port: 0 }
+            ]
+        );
+    }
+
+    #[test]
+    fn adding_or_removing_cdrom_drives_needs_a_restart() {
+        let s = with_cdroms();
+        let hw = started(&s, ALL);
+        let mut more = s.clone();
+        more.cdroms.push(cd(None, None));
+        let mut fewer = s.clone();
+        fewer.cdroms.pop();
+        for want in [more, fewer] {
+            let err = plan(&want, &hw, ALL).unwrap_err();
+            assert_eq!(
+                err,
+                DeviceError::Changed("add or remove CD-ROM drives".into())
+            );
+            assert_eq!(
+                err.to_string(),
+                "cannot add or remove CD-ROM drives while the VM is running"
+            );
+        }
+        // CD-ROM이 없던 VM에 드라이브를 더하는 것도 같다.
+        let hw = started(&spec(), ALL);
+        assert!(plan(&s, &hw, ALL).is_err());
+    }
+
+    #[test]
+    fn cdrom_boot_order_is_pending_until_restart() {
+        let s = with_cdroms();
+        let hw = started(&s, ALL);
+        let mut want = s.clone();
+        want.cdroms[1].boot_order = Some(5);
+        let pending = only_pending(plan_fn(&want, &hw));
+        assert_eq!(
+            pending,
+            [PendingChange {
+                field: "cdroms[1].boot_order".into(),
+                running: "none".into(),
+                wanted: "5".into(),
+                reason: PendingReason::Restart,
+                detail: None,
+            }]
+        );
+        // Task 끝의 보류에도 남는다.
+        assert_eq!(super::pending(&want, &hw, ALL, &[]), pending);
+        // 부팅 순서만 다르면 마이그레이션 대상이 기록의 값으로 켠다.
+        assert!(devices_match(&want, &hw));
+    }
+
+    #[test]
+    fn devices_match_compares_cdrom_media() {
+        let s = with_cdroms();
+        let hw = started(&s, ALL);
+        assert!(devices_match(&s, &hw));
+        let mut want = s.clone();
+        want.cdroms[1].iso = Some("alpine".into());
+        assert!(!devices_match(&want, &hw));
+        let mut want = s.clone();
+        want.cdroms.pop();
+        assert!(!devices_match(&want, &hw));
+    }
+
+    #[test]
+    fn qemu_devices_lists_the_cdrom_drives() {
+        let s = with_cdroms();
+        let ids = ["cd0-dev", "cd1-dev", "disk0-dev", "nic0"].map(String::from);
+        assert_eq!(qemu_devices(&s, None), ids);
+        assert_eq!(qemu_devices(&s, Some(&RunningHardware::legacy(&s))), ids);
+        // 기록이 있으면 기록의 드라이브 수다.
+        let mut hw = RunningHardware::legacy(&s);
+        hw.cdroms.pop();
+        assert_eq!(
+            qemu_devices(&s, Some(&hw)),
+            ["cd0-dev", "disk0-dev", "nic0"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn hardware_changed_sees_cdroms_and_cloud_init() {
+        let s = with_cdroms();
+        assert!(!hardware_changed(&s, &s.clone()));
+        let mut media = s.clone();
+        media.cdroms[0].iso = None;
+        assert!(hardware_changed(&s, &media));
+        let mut order = s.clone();
+        order.cdroms[0].boot_order = Some(1);
+        assert!(hardware_changed(&s, &order));
+        let mut ci = s.clone();
+        ci.cloud_init = Some(CloudInit::default());
+        assert!(hardware_changed(&s, &ci));
+        let mut host = ci.clone();
+        host.cloud_init.as_mut().unwrap().hostname = Some("web".into());
+        assert!(hardware_changed(&ci, &host));
     }
 }

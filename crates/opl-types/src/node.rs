@@ -341,6 +341,7 @@ pub const FEATURES: &[&str] = &[
     HOTPLUG,
     NODE_REPLICATION,
     CEPH_SETUP,
+    INSTALL_MEDIA,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -366,6 +367,10 @@ pub const NODE_REPLICATION: &str = "node-replication";
 
 /// Ceph 자동 구성(계획 56): `Ceph` 리소스, Task `ceph-*`, 디스크·Ceph 상태 peer RPC. 모든 노드가 알릴 때만 쓴다.
 pub const CEPH_SETUP: &str = "ceph-setup";
+
+/// 설치 매체와 cloud-init(계획 57): `content: iso` 볼륨, Task `volume-download`, VM `cdroms`·`cloud_init`, CD 매체
+/// 넣기·빼기. 모든 노드가 알릴 때만 쓴다.
+pub const INSTALL_MEDIA: &str = "install-media";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -839,7 +844,8 @@ mod tests {
                 "placement",
                 "hotplug",
                 "node-replication",
-                "ceph-setup"
+                "ceph-setup",
+                "install-media"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

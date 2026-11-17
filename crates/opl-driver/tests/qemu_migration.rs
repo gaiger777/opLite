@@ -138,6 +138,7 @@ fn spec(disk: PathBuf) -> VmRuntimeSpec {
         nics: vec![],
         guest_agent: false,
         hotplug: None,
+        cdroms: vec![],
     }
 }
 

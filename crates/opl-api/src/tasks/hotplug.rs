@@ -378,6 +378,9 @@ async fn apply(
             .await?;
             Ok(())
         }
+        Step::ChangeMedium { index } => Err(Stop::Failed(format!(
+            "CD-ROM drive {index}: this node cannot change CD-ROM media yet"
+        ))),
         Step::RemoveNic(index) => {
             let network = hw.nics[index].network.clone();
             let device = format!("nic{index}");

@@ -286,6 +286,7 @@ async fn resolve(
             .as_ref()
             .is_some_and(|ha| ha.guest_watch.is_some()),
         hotplug: None,
+        cdroms: vec![],
     };
     if how != Activate::Start
         && let Some(hw) = &vm.status.hardware

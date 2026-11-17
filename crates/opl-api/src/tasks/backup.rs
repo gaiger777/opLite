@@ -995,6 +995,7 @@ pub(super) async fn restore(
                 pool: target.name.clone(),
                 size_bytes: disk.virtual_bytes,
                 format,
+                content: Default::default(),
             },
         );
         copy.status.node = Some(ctx.config.node);

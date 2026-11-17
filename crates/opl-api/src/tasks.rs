@@ -894,6 +894,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
         | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
+        TaskOp::VolumeDownload { .. } => Err("this node cannot download volumes yet".into()),
     };
     done.map(|()| None)
 }

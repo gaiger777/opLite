@@ -47,6 +47,16 @@ pub enum TaskOp {
         source: PathBuf,
         source_format: SourceFormat,
     },
+    /// `url`에서 받아(`sha256`이 있으면 확인) 볼륨을 채운다(계획 57). 받은 파일은 작업 노드의 업로드 디렉터리에
+    /// 두었다가 가져오기처럼 변환하고 지운다.
+    VolumeDownload {
+        url: String,
+        /// 받은 파일의 SHA-256(소문자 16진 64자). 없으면 확인하지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        sha256: Option<String>,
+        source_format: SourceFormat,
+    },
     VolumeDelete,
     SnapshotCreate {
         snapshot: Uuid,
@@ -259,6 +269,35 @@ mod tests {
             serde_json::to_value(TaskOp::VmForceStop).unwrap(),
             serde_json::json!({ "kind": "vm-force-stop" })
         );
+    }
+
+    #[test]
+    fn volume_download_is_tagged_and_omits_a_missing_checksum() {
+        let json = serde_json::json!({
+            "kind": "volume-download",
+            "url": "https://x/a.iso",
+            "source_format": "raw"
+        });
+        let op: TaskOp = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            op,
+            TaskOp::VolumeDownload {
+                url: "https://x/a.iso".into(),
+                sha256: None,
+                source_format: SourceFormat::Raw,
+            }
+        );
+        assert_eq!(serde_json::to_value(&op).unwrap(), json);
+
+        let sum = "ab".repeat(32);
+        let op = TaskOp::VolumeDownload {
+            url: "https://x/a.qcow2".into(),
+            sha256: Some(sum.clone()),
+            source_format: SourceFormat::Qcow2,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(json["sha256"], sum);
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
     }
 
     #[test]

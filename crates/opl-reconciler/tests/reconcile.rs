@@ -653,6 +653,7 @@ async fn nfs_disk_on_a_node_without_nfs_powers_off() {
             pool: "nas".into(),
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -720,6 +721,7 @@ async fn unavailable_pool_is_retried_without_powering_off() {
             pool: "local".into(),
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();
@@ -1146,6 +1148,7 @@ async fn disk_vm_with(
             pool: "local".into(),
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&root).await.unwrap();

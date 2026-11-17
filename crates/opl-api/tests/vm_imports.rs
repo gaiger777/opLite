@@ -437,6 +437,7 @@ async fn run_checks_the_request() {
             pool: "local".into(),
             size_bytes: 1 << 20,
             format: opl_types::runtime::ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     env.cluster.create(&volume).await.unwrap();

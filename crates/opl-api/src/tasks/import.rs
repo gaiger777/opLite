@@ -182,6 +182,7 @@ pub(super) async fn import(
                 pool: pool.name.clone(),
                 size_bytes: disk.capacity_bytes,
                 format,
+                content: Default::default(),
             },
         );
         volume.status.node = Some(ctx.config.node);

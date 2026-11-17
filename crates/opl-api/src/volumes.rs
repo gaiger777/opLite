@@ -327,6 +327,7 @@ pub async fn import_volume(
             pool: pool.name.clone(),
             size_bytes: 0,
             format,
+            content: Default::default(),
         },
     );
     volume.status.node = Some(state.node);

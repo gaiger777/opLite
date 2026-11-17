@@ -539,6 +539,8 @@ mod tests {
                 placement: None,
                 max_memory_mib: None,
                 replication: Vec::new(),
+                cdroms: vec![],
+                cloud_init: None,
             },
         );
         f.cluster.create(&vm).await.unwrap();
@@ -564,6 +566,7 @@ mod tests {
                 nics: vec![],
                 guest_agent: false,
                 hotplug: None,
+                cdroms: vec![],
             },
             None,
         )

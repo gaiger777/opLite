@@ -2379,6 +2379,16 @@ export interface components {
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
         };
+        /** @description CD-ROM 드라이브. 매체는 늘 읽기 전용으로 열고, 여러 VM이 같은 ISO를 함께 넣을 수 있다. */
+        CdromSpec: {
+            /**
+             * Format: int32
+             * @description 부팅 순서. 없으면 디스크 뒤에 둔다(`effective_boot`).
+             */
+            boot_order?: number;
+            /** @description 넣은 ISO 볼륨(`content: iso`)의 이름. 없으면 빈 드라이브다. */
+            iso?: string;
+        };
         CephHealth: {
             /** @default [] */
             checks: components["schemas"]["CephHealthCheck"][];
@@ -2574,6 +2584,36 @@ export interface components {
             pool?: string | null;
             /** @description 복제할 스냅샷(이름이나 id). 없으면 꺼진 VM의 지금 상태에서 복제한다. */
             snapshot?: string | null;
+        };
+        /** @description VM의 cloud-init 설정. 비어 있는 칸은 cloud-init·배포판 기본을 따른다. */
+        CloudInit: {
+            dns?: components["schemas"]["CloudInitDns"];
+            /** @description 호스트 이름(FQDN도 됨). 없으면 VM 이름. */
+            hostname?: string;
+            /** @description NIC마다의 주소 설정(순번 = `nics` 순번). 비면 cloud-init 기본(첫 NIC DHCP). */
+            networks?: components["schemas"]["CloudInitNet"][];
+            /** @description 기본 사용자의 비밀번호. 저장되는 것은 crypt 해시이고 응답에서는 [`PASSWORD_MASK`]로 가린다. */
+            password?: string;
+            /** @description 기본 사용자의 SSH 공개 키(한 줄씩) */
+            ssh_keys?: string[];
+            /** @description 배포판 기본 사용자의 새 이름. 없으면 배포판 기본 이름. */
+            user?: string;
+            /** @description 사용자 user-data. 있으면 만든 user-data 대신 그대로 쓴다(`user`·`password`·`ssh_keys`는 쓰이지 않음). */
+            user_data?: string;
+            /** @description vendor-data 파일. 만든 user-data와 함께 돈다(패키지·runcmd). */
+            vendor_data?: string;
+        };
+        CloudInitDns: {
+            search?: string[];
+            servers?: string[];
+        };
+        /**
+         * @description NIC 하나의 주소 설정. 빈 항목(`{}`)은 IPv4 DHCP다. `ipv4` 없이 `ipv6`만 있으면 IPv4를 두지 않는다(IPv6 전용 —
+         *     DHCPv4도 쓰려면 `ipv4: {"mode": "dhcp"}`). `ipv6`이 없으면 IPv6 설정이 없다.
+         */
+        CloudInitNet: {
+            ipv4?: components["schemas"]["IpConfig"];
+            ipv6?: components["schemas"]["IpConfig"];
         };
         ClusterView: {
             /** @description 클러스터 CA 인증서의 지문. `orbivisorctl login --ca-fingerprint`에 쓴다. */
@@ -2796,6 +2836,10 @@ export interface components {
             name: string;
             /** @description VM의 원하는 상태. */
             spec: {
+                /** @description CD-ROM 드라이브(계획 57, 넷까지, 순번 = 드라이브 번호). 비면 쓰지 않아 옛 노드도 VM을 푼다. */
+                cdroms?: components["schemas"]["CdromSpec"][];
+                /** @description cloud-init NoCloud 씨앗(계획 57). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                cloud_init?: components["schemas"]["CloudInit"];
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
@@ -2837,6 +2881,8 @@ export interface components {
             };
             name: string;
             spec: {
+                /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
+                content?: components["schemas"]["VolumeContent"];
                 format: components["schemas"]["ImageFormat"];
                 /** @description StoragePool 리소스 이름 */
                 pool: string;
@@ -3337,6 +3383,20 @@ export interface components {
          * @enum {string}
          */
         InterfaceKind: "ethernet" | "bond" | "bridge" | "vlan" | "dummy" | "veth" | "other";
+        /** @description 주소를 얻는 방법 */
+        IpConfig: {
+            /** @enum {string} */
+            mode: "dhcp";
+        } | {
+            /** @enum {string} */
+            mode: "slaac";
+        } | {
+            /** @description `주소/접두 길이`(예: `10.0.0.5/24`) */
+            address: string;
+            gateway?: string;
+            /** @enum {string} */
+            mode: "static";
+        };
         /**
          * @description `ipmitool [-I lanplus] -H address -p port -U user -E chassis power off|status`. 비밀번호는 명령 인자가 아니라
          *     `IPMI_PASSWORD` 환경 변수로 넘긴다.
@@ -4215,6 +4275,10 @@ export interface components {
                 revision: number;
                 /** @description VM의 원하는 상태. */
                 spec: {
+                    /** @description CD-ROM 드라이브(계획 57, 넷까지, 순번 = 드라이브 번호). 비면 쓰지 않아 옛 노드도 VM을 푼다. */
+                    cdroms?: components["schemas"]["CdromSpec"][];
+                    /** @description cloud-init NoCloud 씨앗(계획 57). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                    cloud_init?: components["schemas"]["CloudInit"];
                     cpu: components["schemas"]["CpuSpec"];
                     disks?: components["schemas"]["DiskSpec"][];
                     firmware?: components["schemas"]["Firmware"];
@@ -4320,6 +4384,8 @@ export interface components {
                  */
                 revision: number;
                 spec: {
+                    /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
+                    content?: components["schemas"]["VolumeContent"];
                     format: components["schemas"]["ImageFormat"];
                     /** @description StoragePool 리소스 이름 */
                     pool: string;
@@ -6179,6 +6245,10 @@ export interface components {
             revision: number;
             /** @description VM의 원하는 상태. */
             spec: {
+                /** @description CD-ROM 드라이브(계획 57, 넷까지, 순번 = 드라이브 번호). 비면 쓰지 않아 옛 노드도 VM을 푼다. */
+                cdroms?: components["schemas"]["CdromSpec"][];
+                /** @description cloud-init NoCloud 씨앗(계획 57). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                cloud_init?: components["schemas"]["CloudInit"];
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
@@ -6280,6 +6350,8 @@ export interface components {
              */
             revision: number;
             spec: {
+                /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
+                content?: components["schemas"]["VolumeContent"];
                 format: components["schemas"]["ImageFormat"];
                 /** @description StoragePool 리소스 이름 */
                 pool: string;
@@ -6349,6 +6421,11 @@ export interface components {
         RuleKind: "affinity" | "anti-affinity" | "soft-affinity" | "soft-anti-affinity" | "node-affinity" | "node-anti-affinity" | "soft-node-affinity" | "soft-node-anti-affinity";
         /** @description 도는 QEMU의 하드웨어. CPU 토폴로지·메모리·펌웨어·머신은 켤 때 값이고, 핫플러그로 바뀐 것은 `layout`에 있다. */
         RunningHardware: {
+            /**
+             * @description 지금 QEMU의 CD-ROM 드라이브와 매체(계획 57, 순번 = QEMU의 `cd{i}-dev`). 켤 때 스펙 그대로이고 매체를 바꾸면
+             *     핫플러그 Task가 고친다. 옛 노드는 이 필드를 무시한다.
+             */
+            cdroms?: components["schemas"]["CdromSpec"][];
             /** @description 켤 때의 토폴로지·모델·상한. 노드가 CPU 핫플러그를 못 하거나 핫플러그 배치 없이 켰으면 `max_vcpus`가 없다. */
             cpu: components["schemas"]["CpuSpec"];
             /** @description 지금 QEMU에 붙은 디스크(순번 = QEMU의 `disk{i}`). 실행 중 붙이고 떼기를 스펙과 견준다. */
@@ -6656,6 +6733,13 @@ export interface components {
             kind: "volume-import";
             source: string;
             source_format: components["schemas"]["SourceFormat"];
+        } | {
+            /** @enum {string} */
+            kind: "volume-download";
+            /** @description 받은 파일의 SHA-256(소문자 16진 64자). 없으면 확인하지 않는다. */
+            sha256?: string;
+            source_format: components["schemas"]["SourceFormat"];
+            url: string;
         } | {
             /** @enum {string} */
             kind: "volume-delete";
@@ -7027,6 +7111,10 @@ export interface components {
             };
             /** @description VM의 원하는 상태. */
             spec: {
+                /** @description CD-ROM 드라이브(계획 57, 넷까지, 순번 = 드라이브 번호). 비면 쓰지 않아 옛 노드도 VM을 푼다. */
+                cdroms?: components["schemas"]["CdromSpec"][];
+                /** @description cloud-init NoCloud 씨앗(계획 57). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+                cloud_init?: components["schemas"]["CloudInit"];
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
@@ -7274,6 +7362,10 @@ export interface components {
         };
         /** @description VM의 원하는 상태. */
         VmSpec: {
+            /** @description CD-ROM 드라이브(계획 57, 넷까지, 순번 = 드라이브 번호). 비면 쓰지 않아 옛 노드도 VM을 푼다. */
+            cdroms?: components["schemas"]["CdromSpec"][];
+            /** @description cloud-init NoCloud 씨앗(계획 57). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
+            cloud_init?: components["schemas"]["CloudInit"];
             cpu: components["schemas"]["CpuSpec"];
             disks?: components["schemas"]["DiskSpec"][];
             firmware?: components["schemas"]["Firmware"];
@@ -7361,11 +7453,18 @@ export interface components {
             snapshot: string | null;
         };
         /**
+         * @description 볼륨의 내용 종류
+         * @enum {string}
+         */
+        VolumeContent: "disk" | "iso";
+        /**
          * @description 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.
          * @enum {string}
          */
         VolumePhase: "pending" | "ready";
         VolumeSpec: {
+            /** @description 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다. */
+            content?: components["schemas"]["VolumeContent"];
             format: components["schemas"]["ImageFormat"];
             /** @description StoragePool 리소스 이름 */
             pool: string;

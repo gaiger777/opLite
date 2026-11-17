@@ -436,6 +436,33 @@ pub struct VolumeSpec {
     pub pool: String,
     pub size_bytes: u64,
     pub format: ImageFormat,
+    /// 내용 종류(계획 57). 디스크(기본)면 쓰지 않아 옛 노드도 볼륨을 푼다.
+    #[serde(default, skip_serializing_if = "VolumeContent::is_disk")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub content: VolumeContent,
+}
+
+/// 볼륨의 내용 종류
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum VolumeContent {
+    /// VM 디스크
+    #[default]
+    Disk,
+    /// 설치 매체(ISO 9660·UDF 이미지, raw). dir·NFS 풀에만 두고 VM의 CD-ROM 드라이브에 읽기 전용으로 넣는다.
+    Iso,
+}
+
+impl VolumeContent {
+    pub fn is_disk(&self) -> bool {
+        *self == VolumeContent::Disk
+    }
+}
+
+/// 이 백엔드의 풀이 ISO 볼륨을 둘 수 있는지. 파일 풀(dir, nfs)만 된다.
+pub fn pool_holds_isos(backend: &PoolBackend) -> bool {
+    matches!(backend, PoolBackend::Dir { .. } | PoolBackend::Nfs { .. })
 }
 
 impl ResourceSpec for VolumeSpec {
@@ -1323,10 +1350,58 @@ mod tests {
             pool: "local".into(),
             size_bytes: 10 << 30,
             format: ImageFormat::Qcow2,
+            content: VolumeContent::Disk,
         };
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["format"], "qcow2");
         assert_eq!(serde_json::from_value::<VolumeSpec>(json).unwrap(), spec);
+    }
+
+    #[test]
+    fn volume_content_is_written_only_for_isos() {
+        // 옛 볼륨 JSON은 디스크로 읽고 그대로 쓴다.
+        let old = serde_json::json!({ "pool": "local", "size_bytes": 1024, "format": "raw" });
+        let disk: VolumeSpec = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(disk.content, VolumeContent::Disk);
+        assert!(disk.content.is_disk());
+        assert_eq!(serde_json::to_value(&disk).unwrap(), old);
+
+        let json = serde_json::json!({
+            "pool": "local", "size_bytes": 1024, "format": "raw", "content": "iso"
+        });
+        let iso: VolumeSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(iso.content, VolumeContent::Iso);
+        assert!(!iso.content.is_disk());
+        assert_eq!(serde_json::to_value(&iso).unwrap(), json);
+
+        let typo = serde_json::json!({
+            "pool": "local", "size_bytes": 1024, "format": "raw", "content": "cdrom"
+        });
+        assert!(serde_json::from_value::<VolumeSpec>(typo).is_err());
+        let typo = serde_json::json!({
+            "pool": "local", "size_bytes": 1024, "format": "raw", "contnet": "iso"
+        });
+        assert!(serde_json::from_value::<VolumeSpec>(typo).is_err());
+    }
+
+    #[test]
+    fn only_dir_and_nfs_pools_hold_isos() {
+        let backend =
+            |json: serde_json::Value| -> PoolBackend { serde_json::from_value(json).unwrap() };
+        assert!(pool_holds_isos(&backend(
+            serde_json::json!({ "kind": "dir", "path": "/p" })
+        )));
+        assert!(pool_holds_isos(&backend(
+            serde_json::json!({ "kind": "nfs", "server": "nas", "export": "/iso" })
+        )));
+        for block in [
+            serde_json::json!({ "kind": "lvm-thin", "vg": "vg0", "thinpool": "tp" }),
+            serde_json::json!({ "kind": "zfs", "dataset": "tank/opl" }),
+            serde_json::json!({ "kind": "rbd", "pool": "rbd" }),
+            serde_json::json!({ "kind": "lvm-shared", "vg": "vg0" }),
+        ] {
+            assert!(!pool_holds_isos(&backend(block.clone())), "{block}");
+        }
     }
 
     #[test]

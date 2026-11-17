@@ -106,6 +106,7 @@ async fn running_vm(env: &Env, admin: &Client, name: &str, pool: &str, shared: b
             pool: pool.into(),
             size_bytes: 1 << 20,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     );
     volume.status.node = Some(env.node);

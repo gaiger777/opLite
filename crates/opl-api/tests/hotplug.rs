@@ -70,6 +70,7 @@ async fn setup_with(
                 pool: "local".into(),
                 size_bytes: 1 << 20,
                 format: ImageFormat::Qcow2,
+                content: Default::default(),
             },
         );
         volume.status.phase = VolumePhase::Ready;

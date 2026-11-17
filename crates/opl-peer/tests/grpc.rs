@@ -58,6 +58,7 @@ fn volume(name: &str) -> Volume {
             pool: "local".into(),
             size_bytes: 1 << 30,
             format: ImageFormat::Qcow2,
+            content: Default::default(),
         },
     )
 }
