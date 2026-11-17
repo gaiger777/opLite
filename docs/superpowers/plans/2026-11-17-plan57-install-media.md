@@ -73,4 +73,5 @@ EOF
 - svc01에서 일반 시험(fmt·clippy·`cargo test --workspace`·starve·scale 100·storage-it)이 통과했다(시험 2897개).
 - GitHub 탐침(커밋 6737253)에서 install-media·linux-kvm·ceph·ldap·package·iso-e2e(bios·uefi) 작업이 모두 통과했다. install-media 작업은 Alpine ISO를 BIOS·UEFI에서 부팅하고, Ubuntu 24.04 클라우드 이미지에 cloud-init을 적용했다.
 - 마지막 탐침 뒤 Mac이 재시작되어 작업 폴더와 원래 생성한 계획 문서(Task별 전체 코드)를 잃었다. GitHub에 남은 탐침 커밋에서 단계 커밋 8개를 그대로 되살렸다(트리가 검증한 단계 커밋과 같다). 이 문서는 Task 목록과 결과만 적은 요약본이다.
-- 재시작 뒤 점프 호스트(192.168.0.103)에 닿지 않아 svc01·svc02 배포와 화면 확인은 미뤘다. 망이 돌아오면 배포한다.
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서로 바이너리만 바꿨다(유닛은 같아 그대로). 두 노드 모두 sha256이 빌드와 같고, 헬스 `ok`, 두 voter 모두 online, 기능에 `install-media`가 있다. `iso list`는 빈 목록, `/isos` 화면 경로는 새 웹 빌드(index-D4JY2sMM.js)를 돌려준다. svc02의 test-vm은 QEMU PID 916 그대로 실행 중이다. 저널에는 기존 경고(단일 클러스터 링크, KVM 없음)뿐이고 ERROR·panic은 없다.
+- Mac 재시작 뒤 Claude Code 프로세스가 LAN에 닿지 않아(Dripper.app 아래 실행), launchd로 띄운 SSH 터널로 svc01·svc02에 접속했다.
