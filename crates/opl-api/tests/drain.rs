@@ -10,6 +10,7 @@ use std::time::Duration;
 use common::{Client, Env, MOUNT_ROOT, set_pool_state, vm_request};
 use opl_cluster::types::{LeaderRequest, NodeId};
 use opl_driver::DirStorage;
+use opl_types::cloud_init::CloudInit;
 use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus, PoolState};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::replication::{ReplicaStatus, ReplicaVolume, ReplicationState, ReplicationTarget};
@@ -17,11 +18,11 @@ use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::storage::{
-    PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
+    PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeContent, VolumePhase, VolumeSpec,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::version::BUILD;
-use opl_types::vm::{Arch, PowerState, Vm, VmSpec};
+use opl_types::vm::{Arch, CdromSpec, PowerState, RunningHardware, Vm, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -543,6 +544,99 @@ async fn local_disk_vms_that_cannot_move_are_reported() {
     assert_eq!(
         error(admin.wait_task(&task).await),
         "1 VM(s) were not moved: db (disks on a local pool and snapshots)"
+    );
+}
+
+/// CD-ROM에 노드 로컬 풀의 ISO가 든 VM은 옮기지 않고 마이그레이션의 `cdrom_local`과 같은 문구로 알린다.
+#[tokio::test]
+async fn vms_with_a_local_iso_are_reported() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    add_node(&env, "node2", |_| {}).await;
+    let mut iso: Volume = Resource::new(
+        "installer",
+        VolumeSpec {
+            pool: "nas".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Raw,
+            content: VolumeContent::Iso,
+        },
+    );
+    iso.status.node = Some(env.node);
+    iso.status.phase = VolumePhase::Ready;
+    env.cluster.create(&iso).await.unwrap();
+    // 도는 VM의 스펙과 기록에 ISO를 직접 넣고(실행 중에는 드라이브를 더할 수 없다) 그 풀을 노드 로컬로 바꾼다.
+    let vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    let mut spec = vm.spec.clone();
+    spec.cdroms = vec![CdromSpec {
+        iso: Some("installer".into()),
+        boot_order: None,
+    }];
+    env.cluster
+        .update_spec(vm.id, None, vm.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let mut status = vm.status.clone();
+    if let Some(hw) = &mut status.hardware {
+        hw.cdroms = spec.cdroms.clone();
+    }
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    let mut pool = env
+        .cluster
+        .get_by_name::<StoragePoolSpec>("nas")
+        .unwrap()
+        .unwrap();
+    pool.spec.shared = false;
+    env.cluster
+        .update_spec(pool.id, None, pool.labels.clone(), &pool.spec)
+        .await
+        .unwrap();
+
+    let (_, task) = drain(&admin, "node1").await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(
+        task["status"]["error"],
+        "1 VM(s) were not moved: web (VM \"web\" has ISO \"installer\" from node-local pool \"nas\" in a CD-ROM drive; eject it or keep ISOs in a shared pool)"
+    );
+}
+
+/// 실행 중 cloud-init을 바꾼 VM은 옮기지 않고(다시 켜야 풀림) 마이그레이션의 `restart_required` 문구를 그대로 알린다.
+#[tokio::test]
+async fn vms_with_a_changed_cloud_init_are_reported() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    running_vm(&env, &admin, "web", "nas", true).await;
+    add_node(&env, "node2", |_| {}).await;
+    // 도는 QEMU는 다른 씨앗(기록의 instance-id)으로 켜졌다.
+    let vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
+    let mut spec = vm.spec.clone();
+    spec.cloud_init = Some(CloudInit {
+        hostname: Some("web2".into()),
+        ..CloudInit::default()
+    });
+    env.cluster
+        .update_spec(vm.id, None, vm.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let mut status = vm.status.clone();
+    status
+        .hardware
+        .get_or_insert_with(|| RunningHardware::legacy(&vm.spec))
+        .cloud_init = Some("iid-0000000000000000".into());
+    env.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+
+    let (_, task) = drain(&admin, "node1").await;
+    let task = admin.wait_task(&task).await;
+    assert_eq!(
+        task["status"]["error"],
+        "1 VM(s) were not moved: web (cannot migrate VM \"web\": cloud-init changed while running; restart the VM before migrating it)"
     );
 }
 

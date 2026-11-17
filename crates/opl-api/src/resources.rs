@@ -88,12 +88,17 @@ pub fn check_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
+/// 응답으로 내기 전에 리소스에서 가릴 것을 가린다(`public` — 묻는 주체에 따라 다를 수 있다).
 fn list<S: ResourceSpec>(
     state: &AppState,
     principal: &Principal,
+    public: fn(&AppState, &Principal, &mut Typed<S>),
 ) -> Result<Json<List<Typed<S>>>, ApiError> {
     state.authorize(principal, Action::Read, S::KIND)?;
-    let (revision, items) = state.cluster.list::<S>()?;
+    let (revision, mut items) = state.cluster.list::<S>()?;
+    items
+        .iter_mut()
+        .for_each(|item| public(state, principal, item));
     Ok(Json(List { revision, items }))
 }
 
@@ -101,14 +106,21 @@ fn get<S: ResourceSpec>(
     state: &AppState,
     principal: &Principal,
     key: &str,
+    public: fn(&AppState, &Principal, &mut Typed<S>),
 ) -> Result<Json<Typed<S>>, ApiError> {
     state.authorize(principal, Action::Read, S::KIND)?;
-    Ok(Json(lookup::<S>(&state.cluster, key)?))
+    let mut item = lookup::<S>(&state.cluster, key)?;
+    public(state, principal, &mut item);
+    Ok(Json(item))
 }
 
-/// 종류별 목록·조회 핸들러. OpenAPI 문서에 종류마다 경로가 따로 필요해 제네릭 핸들러 대신 쓴다.
+/// 종류별 목록·조회 핸들러. OpenAPI 문서에 종류마다 경로가 따로 필요해 제네릭 핸들러 대신 쓴다. 마지막 인자는 응답에서
+/// 가릴 것을 가리는 함수다(상태·묻는 주체·리소스, 없으면 그대로).
 macro_rules! list_and_get {
     ($list:ident, $get:ident, $spec:ident, $status:ident, $path:literal, $item_path:literal, $tag:literal) => {
+        list_and_get!($list, $get, $spec, $status, $path, $item_path, $tag, |_, _, _| {});
+    };
+    ($list:ident, $get:ident, $spec:ident, $status:ident, $path:literal, $item_path:literal, $tag:literal, $public:expr) => {
         #[utoipa::path(get, path = $path, tag = $tag, responses(
                                     (status = 200, body = List<Resource<$spec, $status>>),
                                     (status = "4XX", body = crate::error::ErrorBody),
@@ -117,7 +129,7 @@ macro_rules! list_and_get {
             State(state): State<Arc<AppState>>,
             principal: Principal,
         ) -> Result<Json<List<Resource<$spec, $status>>>, ApiError> {
-            list::<$spec>(&state, &principal)
+            list::<$spec>(&state, &principal, $public)
         }
 
         #[utoipa::path(get, path = $item_path, tag = $tag,
@@ -131,7 +143,7 @@ macro_rules! list_and_get {
             principal: Principal,
             Path(key): Path<String>,
         ) -> Result<Json<Resource<$spec, $status>>, ApiError> {
-            get::<$spec>(&state, &principal, &key)
+            get::<$spec>(&state, &principal, &key, $public)
         }
     };
 }
@@ -170,7 +182,8 @@ list_and_get!(
     VmStatus,
     "/vms",
     "/vms/{key}",
-    "vms"
+    "vms",
+    |state, principal, vm| crate::vms::mask_spec(state, principal, &mut vm.spec)
 );
 list_and_get!(
     list_networks,
@@ -242,7 +255,8 @@ list_and_get!(
     TaskStatus,
     "/tasks",
     "/tasks/{key}",
-    "tasks"
+    "tasks",
+    |_, _, task| crate::volumes::public_task(task)
 );
 
 #[utoipa::path(post, path = "/storage-pools", tag = "storage",

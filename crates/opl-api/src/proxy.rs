@@ -19,7 +19,7 @@ use opl_types::security_group::Cidr;
 
 use crate::auth::same_origin;
 use crate::limit::ClientIp;
-use crate::revision::{REVISION, TASK};
+use crate::revision::{REVISION, TASK, WARNING};
 use crate::state::AppState;
 
 const X_FORWARDED_FOR: &str = "x-forwarded-for";
@@ -241,9 +241,10 @@ pub(crate) async fn layer(
     response
 }
 
-/// 다른 출처에 노출하는 응답 헤더: `orbivisor-revision, orbivisor-task`
+/// 다른 출처에 노출하는 응답 헤더: `orbivisor-revision, orbivisor-task, orbivisor-warning`
 fn expose_headers() -> HeaderValue {
-    HeaderValue::try_from(format!("{REVISION}, {TASK}")).expect("header names are valid values")
+    HeaderValue::try_from(format!("{REVISION}, {TASK}, {WARNING}"))
+        .expect("header names are valid values")
 }
 
 #[cfg(test)]

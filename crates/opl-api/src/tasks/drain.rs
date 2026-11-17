@@ -21,7 +21,7 @@ use crate::scheduler::{Inventory, disk_moves, migration_moves, node_fits_with, r
 use crate::score::{self, Scorer};
 use crate::snapshots::count_snapshots;
 use crate::state::AppState;
-use crate::vms::{RuleCheck, start_migration};
+use crate::vms::{RuleCheck, local_cdrom, start_migration};
 
 /// VM 하나를 옮겨 본 결과
 enum Outcome {
@@ -222,6 +222,10 @@ async fn move_vm(
             "affinity partner {} could not move",
             partner.name
         )));
+    }
+    // 노드 로컬 풀의 ISO가 CD에 든 VM은 옮기지 않는다(마이그레이션의 409 `cdrom_local`과 같은 문구).
+    if let Some(reason) = bundle.iter().find_map(|v| local_cdrom(v, &inv)) {
+        return Ok(Outcome::NotMoved(reason));
     }
     let all_moves: Vec<Vec<DiskMove>> = bundle
         .iter()

@@ -21,7 +21,9 @@ use opl_types::backup::{
 use opl_types::replication::ReplicationTarget;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
+use opl_types::storage::{
+    PoolBackend, StoragePoolSpec, Volume, VolumeContent, VolumePhase, VolumeSpec,
+};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use reqwest::StatusCode;
@@ -577,6 +579,57 @@ async fn restore_makes_a_stopped_vm_from_the_backup() {
     // 백업은 그대로 남는다.
     assert_eq!(backup(&env, "b1").unwrap().status.phase, BackupPhase::Ready);
     assert!(backup_dir(&env, b.id).join(MANIFEST_FILE).exists());
+}
+
+/// 백업은 CD-ROM의 매체를 담지 않는다: 복원할 때 ISO가 없어졌으면 그 드라이브를 비우고(드라이브는 남김) Task 경고로
+/// 알린다. 남아 있는 ISO는 그대로 가리킨다.
+#[tokio::test]
+async fn restore_empties_cdrom_drives_whose_iso_is_gone() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (vm, _, _) = setup(&env, &admin).await;
+    let mut isos = Vec::new();
+    for name in ["gone", "kept"] {
+        let mut iso: Volume = Resource::new(
+            name,
+            VolumeSpec {
+                pool: "local".into(),
+                size_bytes: MIB,
+                format: ImageFormat::Raw,
+                content: VolumeContent::Iso,
+            },
+        );
+        iso.status.phase = VolumePhase::Ready;
+        iso.status.node = Some(env.node);
+        env.cluster.create(&iso).await.unwrap();
+        isos.push(iso.id);
+    }
+    let (_, current) = admin.get("/vms/web").await;
+    let mut spec = current["spec"].clone();
+    spec["cdroms"] = json!([{ "iso": "gone", "boot_order": 3 }, { "iso": "kept" }, {}]);
+    // 고정 IP는 복원한 VM에도 그대로라 경고가 붙는다.
+    spec["cloud_init"] =
+        json!({ "networks": [{ "ipv6": { "mode": "static", "address": "2001:db8::5/64" } }] });
+    let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let b = backed_up(&env, &admin).await;
+    assert_eq!(b.spec.vm_spec.cdroms.len(), 3);
+    env.cluster
+        .delete::<VolumeSpec>(isos[0], None)
+        .await
+        .unwrap();
+    assert!(get_vm(&env, "web").is_some_and(|v| v.id == vm));
+
+    let task = restore(&admin, "web-2", "local").await;
+    succeeded(&task);
+    assert_eq!(
+        task["status"]["error"],
+        "CD-ROM drive 0: ISO \"gone\" is not available; the drive is empty; the restored VM keeps the cloud-init static IP addresses 2001:db8::5/64; change them before starting it"
+    );
+    let new = get_vm(&env, "web-2").unwrap();
+    let media: Vec<Option<&str>> = new.spec.cdroms.iter().map(|c| c.iso.as_deref()).collect();
+    assert_eq!(media, [None, Some("kept"), None]);
+    assert_eq!(new.spec.cdroms[0].boot_order, Some(3));
 }
 
 /// 블록 풀(여기서는 LVM-thin)로 복원하면 볼륨은 raw다.

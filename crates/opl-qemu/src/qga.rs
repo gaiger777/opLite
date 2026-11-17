@@ -135,13 +135,27 @@ mod tests {
     }
 
     /// 채널이 없거나(파일 없음) 아무도 받지 않으면(연결 거부) 오류다.
+    ///
+    /// 듣는 소켓을 닫아도 같은 시험 프로세스의 다른 시험이 그 순간 자식 프로세스를 띄우면(fork) 자식이 exec할 때까지
+    /// 그 소켓을 들고 있어 연결이 잠깐 받아진다(병렬 시험에서 가끔 `Ok(false)`). 그래서 연결이 한 번 거부될 때까지
+    /// 기다린 뒤(그 뒤로는 소켓이 다시 살아나지 않는다) `ping`을 본다. 두 오류 모두 곧바로 나므로 시간 제한은 넉넉히 둔다.
     #[tokio::test]
     async fn a_missing_channel_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("qga.sock");
-        assert!(ping(&path, Duration::from_millis(200)).await.is_err());
-        drop(UnixListener::bind(&path).unwrap());
-        let err = ping(&path, Duration::from_millis(200)).await.unwrap_err();
+        let generous = Duration::from_secs(30);
+        let err = ping(&path, generous).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let deadline = std::time::Instant::now() + generous;
+        while std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the socket stayed open"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let err = ping(&path, generous).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::ConnectionRefused);
     }
 }

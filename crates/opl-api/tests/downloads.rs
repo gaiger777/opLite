@@ -215,6 +215,10 @@ async fn downloads_an_iso_and_checks_its_sha256() {
     let id: uuid::Uuid = task["id"].as_str().unwrap().parse().unwrap();
     let task = admin.wait_task(&task).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(task["spec"]["op"]["url"], shown);
+    let (_, tasks) = admin.get("/tasks").await;
+    let text = tasks.to_string();
+    assert!(!text.contains("secret") && !text.contains("t0k"), "{text}");
     let stored = env
         .cluster
         .get::<opl_types::task::TaskSpec>(id)

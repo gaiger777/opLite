@@ -482,6 +482,21 @@ impl Client {
         (status, task, body)
     }
 
+    /// `method` 요청을 보내고 응답 헤더(`orbivisor-task`·`orbivisor-warning` 등)도 돌려준다.
+    pub async fn send_headers(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Value,
+    ) -> (StatusCode, reqwest::header::HeaderMap, Value) {
+        let resp = self.req(method, path).json(&body).send().await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let text = resp.text().await.unwrap();
+        let body = serde_json::from_str(&text).unwrap_or(Value::String(text));
+        (status, headers, body)
+    }
+
     pub async fn patch(
         &self,
         path: &str,

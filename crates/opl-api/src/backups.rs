@@ -259,6 +259,9 @@ pub async fn list_backups(
         let by_name = Uuid::try_parse(&key).is_err();
         items.retain(|b| Some(b.spec.vm) == id || (by_name && b.spec.vm_name == key));
     }
+    items
+        .iter_mut()
+        .for_each(|b| mask_backup(&state, &principal, b));
     Ok(Json(List { revision, items }))
 }
 
@@ -274,7 +277,14 @@ pub async fn get_backup(
     Path(key): Path<String>,
 ) -> Result<Json<Backup>, ApiError> {
     state.authorize(&principal, Action::Read, BackupSpec::KIND)?;
-    Ok(Json(lookup::<BackupSpec>(&state.cluster, &key)?))
+    let mut backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    mask_backup(&state, &principal, &mut backup);
+    Ok(Json(backup))
+}
+
+/// 응답에서 백업이 담은 VM 스펙의 cloud-init 비밀번호(해시)를 가린다(VM 쓰기 권한이 없으면 user-data·vendor-data도).
+pub(crate) fn mask_backup(state: &AppState, principal: &Principal, backup: &mut Backup) {
+    crate::vms::mask_spec(state, principal, &mut backup.spec.vm_spec);
 }
 
 /// `pending` 백업을 만들고 그것을 채울 Task를 돌려준다(202). 풀은 백업 풀이어야 한다(400). 시작·정지

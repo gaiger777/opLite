@@ -1,4 +1,4 @@
-//! 핫플러그 Task(계획 54): 실행 중인 VM의 vCPU·메모리·디스크·NIC를 지금 스펙에 맞춘다. 스펙과 도는 하드웨어
+//! 핫플러그 Task(계획 54): 실행 중인 VM의 vCPU·메모리·디스크·NIC와 CD-ROM 매체(계획 57)를 지금 스펙에 맞춘다. 스펙과 도는 하드웨어
 //! (`status.hardware`)를 견준 계획([`hotplug::plan`])의 단계를 차례로 드라이버로 하고, 단계마다 곧바로 기록을
 //! 고친다. 첫 실패에서 멈추고, 스펙의 디스크·NIC 목록을 도는 장치에 맞게 되돌린다(스펙 순번 = QEMU 장치 순번).
 //! 게스트가 시간 안에 내려 주지 않은 떼기는 되돌리지 않고(사용자가 뗀 그대로) 기록의 `unplugging`에 두어 다음
@@ -10,12 +10,14 @@ use std::time::Duration;
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_driver::AddOutcome;
-use opl_reconciler::resolve::{runtime_disk, runtime_nic};
+use opl_reconciler::resolve::{runtime_disk, runtime_medium, runtime_nic};
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{NodeHotplug, NodeSpec};
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::task::Task;
-use opl_types::vm::{PendingChange, PendingReason, RunningHardware, Vm, VmPhase, VmSpec};
+use opl_types::vm::{
+    CdromSpec, PendingChange, PendingReason, RunningHardware, Vm, VmPhase, VmSpec,
+};
 use uuid::Uuid;
 
 use super::Ctx;
@@ -378,9 +380,51 @@ async fn apply(
             .await?;
             Ok(())
         }
-        Step::ChangeMedium { index } => Err(Stop::Failed(format!(
-            "CD-ROM drive {index}: this node cannot change CD-ROM media yet"
-        ))),
+        Step::ChangeMedium { index } => {
+            let cdrom = vm.spec.cdroms[index].clone();
+            let name = |c: &CdromSpec| c.iso.clone().unwrap_or_else(|| "empty".into());
+            // ISO는 여러 VM이 함께 넣으므로 뺀 매체의 볼륨은 끄지 않는다(파일 풀만이라 켜기도 마운트 확인뿐).
+            let changed = match runtime_medium(
+                &ctx.cluster,
+                vm,
+                index,
+                ctx.config.node,
+                &ctx.config.mount_root,
+                ctx.storage.as_ref(),
+            )
+            .await
+            {
+                Ok(medium) => {
+                    same_qemu(ctx, id, qemu)?;
+                    ctx.hv
+                        .change_medium(id, index, medium.as_ref())
+                        .await
+                        .map_err(|e| e.to_string())
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(detail) = changed {
+                // 기록은 그대로 두고(스펙은 사용자가 바꾼 그대로) 다시 해 보기(`vm hotplug`)를 기다린다.
+                failed.push(failure(
+                    &format!("cdroms[{index}]"),
+                    name(&hw.cdroms[index]),
+                    name(&cdrom),
+                    detail.clone(),
+                ));
+                return Err(Stop::Failed(format!(
+                    "CD-ROM drive {index} of VM {:?}: {detail}",
+                    vm.name
+                )));
+            }
+            // 부팅 순서는 QEMU를 켤 때만 바뀌므로(보류) 매체만 적는다.
+            *hw = update_hardware(ctx, id, qemu, |hw, _| {
+                if let Some(c) = hw.cdroms.get_mut(index) {
+                    c.iso = cdrom.iso.clone();
+                }
+            })
+            .await?;
+            Ok(())
+        }
         Step::RemoveNic(index) => {
             let network = hw.nics[index].network.clone();
             let device = format!("nic{index}");

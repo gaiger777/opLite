@@ -420,7 +420,10 @@ pub async fn list_snapshots(
     principal: Principal,
 ) -> Result<Json<List<Snapshot>>, ApiError> {
     state.authorize(&principal, Action::Read, VmSpec::KIND)?;
-    let (revision, items) = state.cluster.list::<SnapshotSpec>()?;
+    let (revision, mut items) = state.cluster.list::<SnapshotSpec>()?;
+    items
+        .iter_mut()
+        .for_each(|s| mask_snapshot(&state, &principal, s));
     Ok(Json(List { revision, items }))
 }
 
@@ -437,7 +440,10 @@ pub async fn list_vm_snapshots(
 ) -> Result<Json<List<Snapshot>>, ApiError> {
     state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    let (revision, items) = snapshots_of(&state, vm.id)?;
+    let (revision, mut items) = snapshots_of(&state, vm.id)?;
+    items
+        .iter_mut()
+        .for_each(|s| mask_snapshot(&state, &principal, s));
     Ok(Json(List { revision, items }))
 }
 
@@ -454,7 +460,14 @@ pub async fn get_snapshot(
 ) -> Result<Json<Snapshot>, ApiError> {
     state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    Ok(Json(find_snapshot(&state, &vm, &name)?))
+    let mut snapshot = find_snapshot(&state, &vm, &name)?;
+    mask_snapshot(&state, &principal, &mut snapshot);
+    Ok(Json(snapshot))
+}
+
+/// 응답에서 스냅샷이 담은 VM 스펙의 cloud-init 비밀번호(해시)를 가린다(VM 쓰기 권한이 없으면 user-data·vendor-data도).
+fn mask_snapshot(state: &AppState, principal: &Principal, snapshot: &mut Snapshot) {
+    crate::vms::mask_spec(state, principal, &mut snapshot.spec.vm_spec);
 }
 
 /// `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를

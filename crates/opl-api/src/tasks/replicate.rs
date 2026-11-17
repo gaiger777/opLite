@@ -25,6 +25,7 @@ use opl_types::backup::{
 use opl_types::backup_job::BackupJobSpec;
 use opl_types::cluster::ClusterSpec;
 use opl_types::remote::RemoteSpec;
+use opl_types::vm::VmSpec;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -32,8 +33,10 @@ use uuid::Uuid;
 
 use super::Ctx;
 use super::backup::{VARS_FILE, backup_root, get_backup, read_manifest};
+use crate::backup_receive::drop_install_media;
 use crate::backups::now;
 use crate::remote_client::{RemoteClient, RemoteError};
+use crate::vms::{mask_data, mask_password};
 
 /// 파일을 읽어 보내는 조각의 크기
 const CHUNK: usize = 256 << 10;
@@ -528,8 +531,8 @@ async fn get_copy(client: &RemoteClient, copy: Uuid) -> Result<Option<Backup>, R
 }
 
 /// 원격 백업 `got`이 이 백업(`manifest`)을 풀 `pool`에 받는 사본인지 본다: 출처의 원본 id, 풀, 부모
-/// 사본(`parent`, 전체 백업이면 없음), VM 스펙, 디스크 이름과 크기, UEFI 변수, 받는 중이거나 ready. 다르면
-/// 원격에서 지우라는 오류다.
+/// 사본(`parent`, 전체 백업이면 없음), VM 스펙(받는 쪽이 가리고 버리는 것을 같은 규칙으로 — [`expected_spec`]),
+/// 디스크 이름과 크기, UEFI 변수, 받는 중이거나 ready. 다르면 원격에서 지우라는 오류다.
 fn check_copy(
     got: &Backup,
     backup: &Backup,
@@ -544,7 +547,7 @@ fn check_copy(
     let same = got.spec.origin.as_ref().map(|o| o.backup) == Some(backup.id)
         && got.spec.pool == pool
         && got.status.parent == parent
-        && got.spec.vm_spec == backup.spec.vm_spec
+        && copied_spec(&got.spec.vm_spec) == expected_spec(&backup.spec.vm_spec, &got.spec.vm_spec)
         && disks(&got.status.disks) == disks(&manifest.disks)
         && got.status.uefi_vars == manifest.uefi_vars
         && matches!(
@@ -559,6 +562,34 @@ fn check_copy(
             backup.id
         ))
     }
+}
+
+/// 원격 사본의 VM 스펙을 견줄 모양으로: 원격 응답처럼 cloud-init 비밀(비밀번호, user-data·vendor-data)을 가린다
+/// (원격 토큰에 VM 쓰기 권한이 있으면 user-data는 가리지 않은 채 온다).
+fn copied_spec(got: &VmSpec) -> VmSpec {
+    let mut spec = got.clone();
+    mask_password(&mut spec);
+    mask_data(&mut spec);
+    spec
+}
+
+/// 원본 VM 스펙 `local`을 원격이 받아 응답할 모양으로: 비밀을 가리고([`copied_spec`]), 받는 쪽이 늘 버리는 복제 대상을
+/// 버리고, 받는 쪽이 기능이 모자라 버린 필드(사본 `got`에 없는 핫플러그 상한, CD-ROM·cloud-init)는 받는 쪽과 같은
+/// 규칙으로 버린다.
+fn expected_spec(local: &VmSpec, got: &VmSpec) -> VmSpec {
+    let mut spec = copied_spec(local);
+    spec.replication.clear();
+    if got.cpu.max_vcpus.is_none() && got.max_memory_mib.is_none() {
+        spec.cpu.max_vcpus = None;
+        spec.max_memory_mib = None;
+    }
+    if (!spec.cdroms.is_empty() || spec.cloud_init.is_some())
+        && got.cdroms.is_empty()
+        && got.cloud_init.is_none()
+    {
+        drop_install_media(&mut spec);
+    }
+    spec
 }
 
 /// ready 사본 `got`이 받은 디스크 파일의 해시가 원본 `backup`에 적힌 해시와 모두 같은지. 원본에 해시가
@@ -798,4 +829,43 @@ fn body_id(body: &Value, field: &str) -> Result<Uuid, RemoteError> {
         .as_str()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| RemoteError::Invalid(format!("the remote answered without {field}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 원본 스펙은 받는 쪽이 버린 것(복제 대상, 사본에 없는 핫플러그 상한·CD-ROM·cloud-init)을 같은 규칙으로 버리고
+    /// 비밀을 가린 뒤 견준다. 사본에 남아 있으면 버리지 않는다.
+    #[test]
+    fn the_expected_spec_follows_the_receiver() {
+        let local: VmSpec = serde_json::from_value(json!({
+            "cpu": { "cores": 2, "max_vcpus": 8 },
+            "memory_mib": 1024,
+            "max_memory_mib": 4096,
+            "machine": "q35",
+            "disks": [ { "volume": "root", "bus": "virtio-blk" } ],
+            "cdroms": [ { "iso": "alpine", "boot_order": 1 } ],
+            "cloud_init": { "password": "secret", "user_data": "#cloud-config\n" },
+            "replication": [ { "node": Uuid::nil() } ],
+        }))
+        .unwrap();
+        // 같은 기능의 받는 쪽: 복제 대상만 버리고 비밀을 가림
+        let mut same = local.clone();
+        same.replication.clear();
+        mask_password(&mut same);
+        assert_eq!(expected_spec(&local, &same), copied_spec(&same));
+        assert_ne!(expected_spec(&local, &same), copied_spec(&local));
+        // 기능이 모자라 버린 받는 쪽
+        let mut old = same.clone();
+        old.cpu.max_vcpus = None;
+        old.max_memory_mib = None;
+        drop_install_media(&mut old);
+        assert_eq!(old.disks[0].boot_order, Some(1));
+        assert_eq!(expected_spec(&local, &old), copied_spec(&old));
+        // 버리지 않은 것을 사본이 잃었으면 다르다.
+        let mut lost = same.clone();
+        lost.cloud_init = None;
+        assert_ne!(expected_spec(&local, &lost), copied_spec(&lost));
+    }
 }

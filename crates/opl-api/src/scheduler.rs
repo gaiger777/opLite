@@ -78,24 +78,30 @@ impl Inventory {
 
     /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지. 공유가 아닌 풀의 볼륨은 그 파일이 있는
     /// 노드(볼륨을 만든 노드)에서만 쓸 수 있다. 그 노드를 모르면 풀이 그 노드 하나에만 있을 때만 쓸 수 있다(파일이 어느
-    /// 노드에 있는지 모르는 볼륨을 다른 노드에서 켜지 않는다). `moves`의 볼륨(옮길 디스크)은 보지 않는다.
+    /// 노드에 있는지 모르는 볼륨을 다른 노드에서 켜지 않는다). `moves`의 볼륨(옮길 디스크)은 보지 않는다. CD-ROM에 넣은
+    /// ISO도 같다(노드 로컬 풀의 ISO는 그 노드에서만).
     fn reaches_disks(&self, spec: &VmSpec, node: &Node, moves: &[DiskMove]) -> bool {
-        spec.disks.iter().all(|disk| {
-            let Some(volume) = self.volumes.iter().find(|v| v.name == disk.volume) else {
-                return true;
-            };
-            if moves.iter().any(|m| m.volume == volume.id) {
-                return true;
-            }
-            let Some(pool) = self.pools.iter().find(|p| p.name == volume.spec.pool) else {
-                return true;
-            };
-            let here = match volume.status.node {
-                Some(n) => n == node.id,
-                None => pool.spec.nodes == [node.id],
-            };
-            pool_usable_on(pool, node) && (is_shared(pool) || here)
-        })
+        let media = spec.cdroms.iter().filter_map(|c| c.iso.as_ref());
+        spec.disks
+            .iter()
+            .map(|d| &d.volume)
+            .chain(media)
+            .all(|name| {
+                let Some(volume) = self.volumes.iter().find(|v| &v.name == name) else {
+                    return true;
+                };
+                if moves.iter().any(|m| m.volume == volume.id) {
+                    return true;
+                }
+                let Some(pool) = self.pools.iter().find(|p| p.name == volume.spec.pool) else {
+                    return true;
+                };
+                let here = match volume.status.node {
+                    Some(n) => n == node.id,
+                    None => pool.spec.nodes == [node.id],
+                };
+                pool_usable_on(pool, node) && (is_shared(pool) || here)
+            })
     }
 
     /// 실행하기로 된 다른 VM에 배정되지 않은 메모리
@@ -431,7 +437,8 @@ mod tests {
     use opl_types::settings::PlacementPolicy;
     use opl_types::storage::PoolBackend;
     use opl_types::vm::{
-        Arch, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec, RunningHardware, VmHa,
+        Arch, CdromSpec, CpuSpec, DiskBus, DiskSpec, MachineType, NicModel, NicSpec,
+        RunningHardware, VmHa,
     };
 
     use super::ScheduleError::NoNode;
@@ -1207,6 +1214,42 @@ mod tests {
         inv.pools[0].spec.nodes = vec![b.id];
         assert!(node_fits(&me, &inv, &a).is_err());
         assert_eq!(node_fits(&me, &inv, &b), Ok(()));
+    }
+
+    /// CD-ROM의 ISO도 디스크처럼 본다: 노드 로컬 풀의 ISO는 그 노드에서만, 공유 풀의 ISO는 어디서나. 빈 드라이브는
+    /// 노드를 묶지 않는다.
+    #[test]
+    fn local_isos_keep_the_vm_on_their_node() {
+        let (a, b) = (node(64000), node(1024));
+        let mut me = spec(512, None, PowerState::Running);
+        me.cdroms = vec![
+            CdromSpec {
+                iso: Some("installer".into()),
+                boot_order: None,
+            },
+            CdromSpec::default(),
+        ];
+        let local = pool("local", false);
+        let nas = pool("nas", true);
+        let mut inv = Inventory {
+            nodes: [&a, &b]
+                .into_iter()
+                .map(|n| with_pool(with_pool(n.clone(), &local, true), &nas, true))
+                .collect(),
+            volumes: vec![volume("installer", "local", Some(b.id))],
+            pools: vec![local, nas],
+            ..Default::default()
+        };
+        assert_eq!(sched(&me, &inv), Ok(b.id));
+        assert_eq!(
+            node_fits(&me, &inv, &inv.nodes[0]),
+            Err("node \"n\" cannot use the storage pools of the VM's disks".into())
+        );
+        inv.volumes[0].spec.pool = "nas".into();
+        assert_eq!(sched(&me, &inv), Ok(a.id));
+        me.cdroms[0].iso = None;
+        inv.volumes[0].spec.pool = "local".into();
+        assert_eq!(sched(&me, &inv), Ok(a.id));
     }
 
     #[test]

@@ -17,8 +17,8 @@ use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
-    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumeSpec, pool_error_on, pool_listed_on,
-    pool_usable_on,
+    SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumeContent, VolumePhase, VolumeSpec,
+    is_shared, pool_error_on, pool_listed_on, pool_usable_on,
 };
 use opl_types::task::Task;
 use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
@@ -919,7 +919,8 @@ async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
 /// `ready` 백업 `id`를 새 VM `name`(id는 Task의 대상)으로 되살린다(설계 §2.4): 매니페스트의 디스크마다
 /// 풀 `pool`에 새 볼륨 `{name}-disk{i}`를 만들어 백업 파일을 쓰고(블록 풀이면 raw, 아니면 qcow2),
 /// UEFI 변수를 복사한 뒤 백업 리소스에 적힌 VM 스펙으로 꺼진 VM을 만든다(새 MAC, 노드·예약·HA 없음).
-/// 매니페스트는 그 기록과 같아야 한다. 공유가 아닌 풀의 백업은 파일을 쓴 노드에서만 되살린다.
+/// 매니페스트는 그 기록과 같아야 한다. 공유가 아닌 풀의 백업은 파일을 쓴 노드에서만 되살린다. CD-ROM의 ISO가
+/// 이 클러스터에 없거나 이 노드에서 쓸 수 없으면 그 드라이브를 비우고 경고로 돌려준다([`available_media`]).
 /// 증분 백업은 부모를 거슬러 전체 백업까지의 체인([`read_chain`])을 디스크마다 한 이미지로 연다(증분
 /// 백업 설계 §3.6). 실패하면 실행기의 정리(복제와 같은 [`super::clone::discard`])가 만든 볼륨과 변수
 /// 사본을 지운다.
@@ -929,7 +930,7 @@ pub(super) async fn restore(
     id: Uuid,
     name: &str,
     pool: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
     if backup.status.phase != BackupPhase::Ready {
         return Err("backup is not ready".into());
@@ -1046,8 +1047,52 @@ pub(super) async fn restore(
     for nic in &mut new.spec.nics {
         nic.mac = None;
     }
+    let mut warnings = available_media(ctx, &mut new.spec)?;
+    warnings.extend(super::clone::identity_warning("the restored VM", &new.spec));
     new.spec
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
-    create_vm(ctx, task, new).await
+    create_vm(ctx, task, new).await?;
+    Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+}
+
+/// 백업은 CD-ROM의 매체(ISO)를 담지 않는다. 스펙의 ISO가 이 클러스터에 없거나, ISO가 아니거나, 준비되지 않았거나,
+/// 이 노드(복원한 디스크가 있는 노드)에서 쓸 수 없으면 그 드라이브를 비우고(드라이브는 남김) 드라이브마다 경고를
+/// 돌려준다.
+fn available_media(ctx: &Ctx, spec: &mut VmSpec) -> Result<Vec<String>, String> {
+    let me = ctx
+        .cluster
+        .get::<NodeSpec>(ctx.config.node)
+        .map_err(|e| e.to_string())?
+        .ok_or("this node is not registered")?;
+    let mut warnings = Vec::new();
+    for (i, cdrom) in spec.cdroms.iter_mut().enumerate() {
+        let Some(iso) = cdrom.iso.clone() else {
+            continue;
+        };
+        let volume = ctx
+            .cluster
+            .get_by_name::<VolumeSpec>(&iso)
+            .map_err(|e| e.to_string())?;
+        let pool = match &volume {
+            Some(v) => ctx
+                .cluster
+                .get_by_name::<StoragePoolSpec>(&v.spec.pool)
+                .map_err(|e| e.to_string())?,
+            None => None,
+        };
+        let usable = volume.zip(pool).is_some_and(|(v, pool)| {
+            v.spec.content == VolumeContent::Iso
+                && v.status.phase == VolumePhase::Ready
+                && pool_usable_on(&pool, &me)
+                && (is_shared(&pool) || v.status.node == Some(me.id))
+        });
+        if !usable {
+            cdrom.iso = None;
+            warnings.push(format!(
+                "CD-ROM drive {i}: ISO {iso:?} is not available; the drive is empty"
+            ));
+        }
+    }
+    Ok(warnings)
 }

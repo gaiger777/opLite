@@ -862,7 +862,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             name,
             snapshot,
             pool,
-        } => clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
+        } => return clone::clone(ctx, task, name, *snapshot, pool.as_deref()).await,
         TaskOp::VmMigrate { node, pool } => {
             migrate::migrate(ctx, task, *node, pool.as_deref()).await
         }
@@ -875,8 +875,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::BondDegraded { .. } => Err("a bond warning task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => return backup::delete(ctx, id).await,
+        // 비운 CD-ROM 드라이브는 경고로 남긴다.
         TaskOp::BackupRestore { backup, name, pool } => {
-            backup::restore(ctx, task, *backup, name, pool).await
+            return backup::restore(ctx, task, *backup, name, pool).await;
         }
         TaskOp::BackupReplicate { remote, pool } => {
             replicate::replicate(ctx, id, remote, pool).await

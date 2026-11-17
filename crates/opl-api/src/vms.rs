@@ -1,21 +1,24 @@
 //! VM 생성·수정·삭제와 동작(start, stop, reboot).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
+use opl_types::cloud_init::{PASSWORD_MASK, is_crypt_hash};
+use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    FAST_HA, HA_PLACEMENT, HOTPLUG, NODE_REPLICATION, Node, NodeSpec, PLACEMENT, ha_capable,
+    FAST_HA, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node, NodeSpec, PLACEMENT,
+    ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
-use opl_types::storage::{VolumePhase, is_shared, pool_usable_on};
+use opl_types::storage::{Volume, VolumeContent, VolumePhase, is_shared, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{
     CdromSpec, HaState, MacAddr, PowerState, RunningHardware, ValidationError, Vm, VmHa, VmPhase,
@@ -32,7 +35,7 @@ use crate::error::{ApiError, Json, Query};
 use crate::placement::{Assign, hard_violations};
 use crate::replication::start_replication;
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
-use crate::revision::TASK;
+use crate::revision::{TASK, WARNING};
 use crate::scheduler::{
     HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, migration_moves, node_fits_with,
     schedule_with,
@@ -159,6 +162,10 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         used.insert(mac);
         nic.mac = Some(mac);
     }
+    // CD-ROM 드라이브와 cloud-init은 옛 노드가 풀지 못한다.
+    if !spec.cdroms.is_empty() || spec.cloud_init.is_some() {
+        require_feature(&state.cluster, INSTALL_MEDIA)?;
+    }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate()
@@ -215,6 +222,12 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
                 disk.volume
             )));
         };
+        if volume.spec.content == VolumeContent::Iso {
+            return Err(ApiError::bad_request(format!(
+                "volume {:?} is an ISO image; attach it as a CD-ROM",
+                disk.volume
+            )));
+        }
         if volume.status.phase != VolumePhase::Ready {
             return Err(ApiError::conflict(
                 "volume_not_ready",
@@ -232,9 +245,29 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
             ));
         }
     }
+    // CD 매체는 읽기 전용이라 여러 VM이 같은 ISO를 함께 넣는다("볼륨은 VM 하나" 검사는 디스크만).
+    let deleting = deleting_isos(state, spec)?;
+    for iso in cdrom_isos(spec) {
+        let volume = cdrom_volume(&inv, iso)?;
+        if let Some(task) = deleting.get(&volume.id) {
+            return Err(ApiError::conflict(
+                "volume_in_use",
+                format!("ISO {iso:?} is being deleted (task {task})"),
+            ));
+        }
+        let pool = inv.pools.iter().find(|p| p.name == volume.spec.pool);
+        if (spec.ha_active() || !spec.replication.is_empty()) && !pool.is_some_and(is_shared) {
+            return Err(ApiError::bad_request(format!(
+                "HA and replicated VMs can use ISOs only from shared pools; ISO {iso:?} is in node-local pool {:?}",
+                volume.spec.pool
+            )));
+        }
+    }
+    let current = inv.vms.iter().find(|v| v.id == id);
+    hash_password(spec, current)?;
+    keep_masked_data(spec, current)?;
     check_replication(state, vm, &inv)?;
     // 이미 그 노드에 있는 VM(실행 중이거나 고정된 채 꺼진 VM)의 다른 고치기는 유지보수로 막지 않는다.
-    let current = inv.vms.iter().find(|v| v.id == id);
     if let Some(node_id) = vm.spec.node {
         let Some(node) = inv.nodes.iter().find(|n| n.id == node_id) else {
             return Err(ApiError::bad_request(format!("node {node_id} not found")));
@@ -246,6 +279,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         check_ha_capable(node, &vm.spec)?;
         check_node_arch(node, &vm.spec)?;
         check_firewall(node, &vm.spec)?;
+        check_cdrom_node(&inv, node, &vm.spec, current)?;
         // 켜진 채 노드를 준 요청은 hard 배치 규칙도 지켜야 한다. 이미 그 노드에 자리 잡은 VM(실행 중 고치기)은
         // 새 규칙을 어겨도 옮기거나 막지 않는다(위반으로 보인다).
         let placed = current
@@ -373,6 +407,214 @@ fn check_replication(state: &AppState, vm: &Vm, inv: &Inventory) -> Result<(), A
     Ok(())
 }
 
+/// 스펙의 CD-ROM 드라이브에 넣은 ISO 이름들(빈 드라이브는 빼고, 드라이브 순)
+fn cdrom_isos(spec: &VmSpec) -> impl Iterator<Item = &String> {
+    spec.cdroms.iter().filter_map(|c| c.iso.as_ref())
+}
+
+/// 끝나지 않은 볼륨 지우기 Task의 대상(볼륨 id → Task id). 스펙의 CD에 매체가 없으면 Task를 읽지 않는다. 지우기
+/// API의 확인 뒤 넣은 ISO를 지우기 Task가 지우지 않게 그런 ISO는 넣지 않는다(409 `volume_in_use`).
+fn deleting_isos(state: &AppState, spec: &VmSpec) -> Result<BTreeMap<Uuid, Uuid>, ApiError> {
+    if cdrom_isos(spec).next().is_none() {
+        return Ok(BTreeMap::new());
+    }
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    Ok(tasks
+        .iter()
+        .filter(|t| t.spec.op == TaskOp::VolumeDelete && !t.status.state.is_finished())
+        .map(|t| (t.spec.target, t.id))
+        .collect())
+}
+
+/// CD에 넣을 ISO 볼륨: 있고(400) 준비됐고(409 `volume_not_ready`) ISO여야(400) 한다.
+fn cdrom_volume<'a>(inv: &'a Inventory, iso: &str) -> Result<&'a Volume, ApiError> {
+    let Some(volume) = inv.volumes.iter().find(|v| v.name == iso) else {
+        return Err(ApiError::bad_request(format!("volume {iso:?} not found")));
+    };
+    if volume.status.phase != VolumePhase::Ready {
+        return Err(ApiError::conflict(
+            "volume_not_ready",
+            format!("volume {iso:?} is still being created"),
+        ));
+    }
+    if volume.spec.content != VolumeContent::Iso {
+        return Err(ApiError::bad_request(format!(
+            "volume {iso:?} is not an ISO image"
+        )));
+    }
+    Ok(volume)
+}
+
+/// 지정한 노드 `node`가 CD의 ISO를 모두 읽을 수 있는지: 풀을 쓸 수 있고, 노드 로컬 풀이면 그 파일이 이 노드에
+/// 있다(스케줄러의 디스크 규칙과 같음). 아니면 400. 같은 노드에서 이미 저장된 VM(`current`)이 넣은 ISO는 다시 보지
+/// 않는다 — 풀이 잠깐 준비되지 않아도 그 VM의 다른 고치기를 막지 않게.
+fn check_cdrom_node(
+    inv: &Inventory,
+    node: &Node,
+    spec: &VmSpec,
+    current: Option<&Vm>,
+) -> Result<(), ApiError> {
+    let stored = current
+        .filter(|v| v.spec.node == Some(node.id))
+        .map_or(&[][..], |v| &v.spec.cdroms[..]);
+    for iso in cdrom_isos(spec) {
+        if stored.iter().any(|c| c.iso.as_ref() == Some(iso)) {
+            continue;
+        }
+        let Some(volume) = inv.volumes.iter().find(|v| &v.name == iso) else {
+            continue;
+        };
+        let usable = inv
+            .pools
+            .iter()
+            .find(|p| p.name == volume.spec.pool)
+            .is_some_and(|pool| {
+                let here = match volume.status.node {
+                    Some(n) => n == node.id,
+                    None => pool.spec.nodes == [node.id],
+                };
+                pool_usable_on(pool, node) && (is_shared(pool) || here)
+            });
+        if !usable {
+            return Err(ApiError::bad_request(format!(
+                "node {:?} cannot use ISO {iso:?}",
+                node.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// cloud-init 비밀번호를 저장할 모양으로 바꾼다: crypt 해시는 그대로, 평문은 SHA-512 crypt(무작위 솔트 16자),
+/// [`PASSWORD_MASK`]는 저장된 VM(`current`)의 해시(없으면 400). 검증([`VmSpec::validate`]) 뒤에 부른다.
+fn hash_password(spec: &mut VmSpec, current: Option<&Vm>) -> Result<(), ApiError> {
+    let Some(password) = spec.cloud_init.as_mut().and_then(|c| c.password.as_mut()) else {
+        return Ok(());
+    };
+    if password == PASSWORD_MASK {
+        let stored = current
+            .and_then(|v| v.spec.cloud_init.as_ref())
+            .and_then(|c| c.password.as_ref())
+            .filter(|p| is_crypt_hash(p));
+        let Some(stored) = stored else {
+            return Err(ApiError::bad_request(
+                "cloud_init.password: give a new password",
+            ));
+        };
+        *password = stored.clone();
+    } else if !is_crypt_hash(password) {
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random).expect("system random source");
+        let salt: String = random
+            .iter()
+            .map(|b| char::from(CRYPT_SALT_CHARS[usize::from(*b) % CRYPT_SALT_CHARS.len()]))
+            .collect();
+        *password = sha512_crypt(password.as_bytes(), &salt);
+    }
+    Ok(())
+}
+
+/// 응답에서 cloud-init 비밀번호(해시)를 [`PASSWORD_MASK`]로 가린다(watch의 규칙 — 해시도 내보내지 않는다).
+pub(crate) fn mask_password(spec: &mut VmSpec) {
+    if let Some(password) = spec.cloud_init.as_mut().and_then(|c| c.password.as_mut()) {
+        *password = PASSWORD_MASK.into();
+    }
+}
+
+/// VM 쓰기 권한이 없는 주체에게 낼 응답에서 cloud-init `user_data`·`vendor_data`(비밀이 들 수 있다)를
+/// [`PASSWORD_MASK`]로 가린다. 쓰기 권한이 있으면 그대로다(고쳐 다시 보내야 한다).
+pub(crate) fn mask_data(spec: &mut VmSpec) {
+    if let Some(ci) = spec.cloud_init.as_mut() {
+        for data in [&mut ci.user_data, &mut ci.vendor_data]
+            .into_iter()
+            .flatten()
+        {
+            *data = PASSWORD_MASK.into();
+        }
+    }
+}
+
+/// VM 쓰기 권한이 있는 주체인지(cloud-init user-data·vendor-data를 그대로 본다)
+pub(crate) fn writes_vms(state: &AppState, principal: &Principal) -> bool {
+    state
+        .authorize(principal, Action::Write, VmSpec::KIND)
+        .is_ok()
+}
+
+/// 주체 `principal`에게 낼 VM 스펙: 비밀번호는 늘 가리고, VM 쓰기 권한이 없으면 user-data·vendor-data도 가린다.
+pub(crate) fn mask_spec(state: &AppState, principal: &Principal, spec: &mut VmSpec) {
+    mask_password(spec);
+    if !writes_vms(state, principal) {
+        mask_data(spec);
+    }
+}
+
+/// PUT 본문의 `user_data`·`vendor_data`가 [`PASSWORD_MASK`]면(가린 응답을 그대로 되보냄) 저장된 값을 둔다. 저장된 것이
+/// 없으면 400이다.
+fn keep_masked_data(spec: &mut VmSpec, current: Option<&Vm>) -> Result<(), ApiError> {
+    let Some(ci) = spec.cloud_init.as_mut() else {
+        return Ok(());
+    };
+    let stored = current.and_then(|v| v.spec.cloud_init.as_ref());
+    for (field, data, old) in [
+        (
+            "user_data",
+            &mut ci.user_data,
+            stored.and_then(|c| c.user_data.as_ref()),
+        ),
+        (
+            "vendor_data",
+            &mut ci.vendor_data,
+            stored.and_then(|c| c.vendor_data.as_ref()),
+        ),
+    ] {
+        if data.as_deref() == Some(PASSWORD_MASK) {
+            let Some(old) = old else {
+                return Err(ApiError::bad_request(format!(
+                    "cloud_init.{field}: give the {field} itself"
+                )));
+            };
+            *data = Some(old.clone());
+        }
+    }
+    Ok(())
+}
+
+/// 응답으로 낼 VM(비밀번호를 가림)
+pub(crate) fn public_vm(mut vm: Vm) -> Vm {
+    mask_password(&mut vm.spec);
+    vm
+}
+
+/// `user_data`가 만든 user-data를 대신해 쓰이지 않는 칸이 있으면 그 경고(응답 헤더 `orbivisor-warning`)
+pub(crate) fn user_data_warning(spec: &VmSpec) -> Option<&'static str> {
+    let ci = spec.cloud_init.as_ref()?;
+    let unused = ci.user.is_some() || ci.password.is_some() || !ci.ssh_keys.is_empty();
+    (ci.user_data.is_some() && unused).then_some(
+        "cloud_init.user_data replaces the generated user-data; user, password and ssh_keys are not used",
+    )
+}
+
+/// 노드 로컬 풀의 ISO가 CD에 들어 있으면 그 409 `cdrom_local` 문구. 도는 QEMU의 매체(기록, 없으면 스펙)를 본다.
+/// 마이그레이션·비우기는 매체를 옮겨 주지 않는다.
+pub(crate) fn local_cdrom(vm: &Vm, inv: &Inventory) -> Option<String> {
+    let cdroms = vm
+        .status
+        .hardware
+        .as_ref()
+        .map_or(&vm.spec.cdroms, |hw| &hw.cdroms);
+    cdroms.iter().filter_map(|c| c.iso.as_ref()).find_map(|iso| {
+        let volume = inv.volumes.iter().find(|v| &v.name == iso)?;
+        let pool = inv.pools.iter().find(|p| p.name == volume.spec.pool)?;
+        (!is_shared(pool)).then(|| {
+            format!(
+                "VM {:?} has ISO {iso:?} from node-local pool {:?} in a CD-ROM drive; eject it or keep ISOs in a shared pool",
+                vm.name, pool.name
+            )
+        })
+    })
+}
+
 /// NIC의 보안 그룹이 모두 있고, 그룹을 건 NIC가 `user` 네트워크가 아닌지. 아니면 400.
 pub(crate) fn check_security_groups(state: &AppState, spec: &VmSpec) -> Result<(), ApiError> {
     if spec.nics.iter().all(|n| n.security_groups.is_empty()) {
@@ -492,15 +734,22 @@ fn start_picks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
     Ok(!hard_violations(vm, &node, &inv, &Assign::default()).is_empty())
 }
 
-/// 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다.
+/// 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다. cloud-init 평문 비밀번호는 SHA-512 crypt로 바꿔 저장하고
+/// 응답에서는 `********`로 가린다. `cloud_init.user_data`가 만든 user-data의 칸(`user`·`password`·`ssh_keys`)을
+/// 쓰이지 않게 하면 응답 헤더 `orbivisor-warning`으로 알린다.
 #[utoipa::path(post, path = "/vms", tag = "vms",
     request_body = CreateRequest<VmSpec>,
-    responses((status = 201, body = Resource<VmSpec, VmStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses(
+        (status = 201, body = Resource<VmSpec, VmStatus>, headers(
+            ("orbivisor-warning" = String, description = "a warning about the stored spec (only when there is one)"),
+        )),
+        (status = "4XX", body = crate::error::ErrorBody),
+    ))]
 pub async fn create_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Json(req): Json<CreateRequest<VmSpec>>,
-) -> Result<(StatusCode, Json<Vm>), ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<Vm>), ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     check_name(&req.name)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
@@ -511,7 +760,17 @@ pub async fn create_vm(
     let _lock = state.vm_lock.lock().await;
     prepare(&state, &mut vm, &scoring.scorer())?;
     vm.revision = state.cluster.create(&vm).await?;
-    Ok((StatusCode::CREATED, Json(vm)))
+    let headers = warning_header(&vm.spec);
+    Ok((StatusCode::CREATED, headers, Json(public_vm(vm))))
+}
+
+/// [`user_data_warning`]이 있으면 그 응답 헤더
+fn warning_header(spec: &VmSpec) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(warning) = user_data_warning(spec) {
+        headers.insert(WARNING, HeaderValue::from_static(warning));
+    }
+    headers
 }
 
 /// spec 전체를 바꾼다. 실행 중인 VM의 `node`는 바꿀 수 없고 `ha`를 켜거나 `guest_watch`를 켜고 끌 수 없다(409
@@ -528,12 +787,17 @@ pub async fn create_vm(
 /// 기다림)은 실행 중에 디스크와 NIC 개수·순서·MAC을 바꿀 수 없고(보안 그룹을 건 NIC가 있으면 `security_groups`만)
 /// 다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그
 /// 사이 바뀌었으면 다시 읽어 검증한다.
+///
+/// CD-ROM 매체(`cdroms[i].iso`)는 실행 중에도 핫플러그 Task로 바꾼다(드라이브 더하기·빼기는 409 `vm_running`, CD
+/// 부팅 순서와 `cloud_init`은 다음 재시작 때 적용). `cloud_init.password`가 `********`이면 저장된 비밀번호를 그대로
+/// 둔다(받은 스펙을 고쳐 다시 보내는 길). 경고는 `POST /vms`처럼 `orbivisor-warning`이다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
     responses(
         (status = 200, body = Resource<VmSpec, VmStatus>, headers(
             ("orbivisor-task" = String, description = "id of the vm-hotplug task that applies a hardware change to the running VM (only when one was created)"),
+            ("orbivisor-warning" = String, description = "a warning about the stored spec (only when there is one)"),
         )),
         (status = "4XX", body = crate::error::ErrorBody),
     ))]
@@ -547,12 +811,29 @@ pub async fn update_vm(
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let expected = if_match(&headers)?;
     let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
-    let scoring = score::scorer(&state, picks).await;
+    let (headers, vm) = write_spec(&state, &key, expected, picks, |_| {
+        Ok((req.spec.clone(), req.labels.clone()))
+    })
+    .await?;
+    Ok((headers, Json(vm)))
+}
+
+/// VM `key`의 스펙과 레이블을 `edit`(지금 VM → 새 스펙·레이블)으로 바꿔 쓴다: [`update_vm`]의 검사와 실행 중
+/// 하드웨어 변경의 핫플러그 Task. 응답 헤더(`orbivisor-task`·`orbivisor-warning`)와 가린 VM을 돌려준다. `picks`면
+/// 노드를 고를 때 쓸 부하를 읽는다.
+async fn write_spec(
+    state: &AppState,
+    key: &str,
+    expected: Option<u64>,
+    picks: bool,
+    edit: impl Fn(&Vm) -> Result<(VmSpec, BTreeMap<String, String>), ApiError>,
+) -> Result<(HeaderMap, Vm), ApiError> {
+    let scoring = score::scorer(state, picks).await;
     for _ in 0..10 {
         let _lock = state.vm_lock.lock().await;
-        let current = lookup::<VmSpec>(&state.cluster, &key)?;
-        check_no_migration(&state, &current)?;
-        check_no_snapshot_task(&state, &current)?;
+        let current = lookup::<VmSpec>(&state.cluster, key)?;
+        check_no_migration(state, &current)?;
+        check_no_snapshot_task(state, &current)?;
         if let Some(expected) = expected
             && expected != current.revision
         {
@@ -562,11 +843,12 @@ pub async fn update_vm(
             })
             .into());
         }
+        let (spec, labels) = edit(&current)?;
         let mut next = current.clone();
-        next.spec = req.spec.clone();
-        next.labels = req.labels.clone();
-        prepare(&state, &mut next, &scoring.scorer())?;
-        let spec = next.spec;
+        next.spec = spec;
+        next.labels = labels;
+        prepare(state, &mut next, &scoring.scorer())?;
+        let (spec, labels) = (next.spec, next.labels);
         if spec.node != current.spec.node && !is_stopped(&current) {
             return Err(vm_running(&current, "move"));
         }
@@ -577,17 +859,17 @@ pub async fn update_vm(
         let stopping = spec.power == PowerState::Stopped;
         let idle = current.status.hardware.is_none()
             && matches!(current.status.phase, VmPhase::Stopped | VmPhase::Failed)
-            && !power_task_running(&state, &current)?;
+            && !power_task_running(state, &current)?;
         let changed = hotplug::hardware_changed(&current.spec, &spec);
         let hotplug = hot && !stopping && !idle && changed;
         if hotplug {
-            check_hot_change(&state, &current, &spec)?;
+            check_hot_change(state, &current, &spec)?;
         } else if !(is_stopped(&current) || hot && stopping) {
             check_running_devices(&current, &spec)?;
         }
         // 끄면서 바꾸는 하드웨어도 끝나지 않은 핫플러그 Task의 되돌리기가 지우지 않게 기다린다.
         if hot && stopping && changed {
-            check_no_hotplug_task(&state, &current)?;
+            check_no_hotplug_task(state, &current)?;
         }
         if spec.power == PowerState::Running && current.spec.power == PowerState::Stopped {
             check_stopping_devices(&current, &spec)?;
@@ -616,12 +898,7 @@ pub async fn update_vm(
         }
         match state
             .cluster
-            .update_spec(
-                current.id,
-                Some(current.revision),
-                req.labels.clone(),
-                &spec,
-            )
+            .update_spec(current.id, Some(current.revision), labels, &spec)
             .await
         {
             Ok(_) => {}
@@ -633,10 +910,10 @@ pub async fn update_vm(
             Err(e) => return Err(e.into()),
         }
         // 같은 잠금 안에서 Task를 만들어 그사이 마이그레이션이 시작하지 않게 한다.
-        let mut response = HeaderMap::new();
+        let mut response = warning_header(&spec);
         if hotplug {
             // 스펙은 이미 썼다. Task를 만들지 못하면 헤더 없이 200이고 변경은 `vm hotplug`로 다시 맞출 수 있다.
-            match start_hotplug(&state, &current).await {
+            match start_hotplug(state, &current).await {
                 Ok(task) => {
                     response.insert(
                         TASK,
@@ -649,12 +926,68 @@ pub async fn update_vm(
             }
         }
         let vm = lookup::<VmSpec>(&state.cluster, &current.id.to_string())?;
-        return Ok((response, Json(vm)));
+        return Ok((response, public_vm(vm)));
     }
     Err(ApiError::conflict(
         "busy",
         "the VM kept changing while being updated; try again",
     ))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdromMediaRequest {
+    /// CD-ROM 드라이브 번호(`cdroms`의 순번)
+    #[serde(default)]
+    pub drive: u8,
+    /// 넣을 ISO 볼륨 이름. 없으면 매체를 뺀다.
+    #[serde(default)]
+    pub iso: Option<String>,
+}
+
+/// CD-ROM 드라이브 하나의 매체를 넣거나 뺀다: 스펙의 `cdroms[drive].iso`만 바꿔 `PUT /vms/{key}`와 같은 길로 쓴다
+/// (같은 검사, 실행 중이면 `vm-hotplug` Task와 헤더 `orbivisor-task`). 드라이브가 없으면 400, 모든 노드가
+/// `install-media`를 알아야 한다(409 `cluster_upgrading`). 지우는 중인(끝나지 않은 지우기 Task가 있는) ISO는 409
+/// `volume_in_use`다. 드라이브 더하기·빼기는 `PUT`이다(꺼진 VM).
+#[utoipa::path(post, path = "/vms/{key}/cdrom", tag = "vms",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = CdromMediaRequest,
+    responses(
+        (status = 200, body = Resource<VmSpec, VmStatus>, headers(
+            ("orbivisor-task" = String, description = "id of the vm-hotplug task that changes the medium of the running VM (only when one was created)"),
+        )),
+        (status = "4XX", body = crate::error::ErrorBody),
+    ))]
+pub async fn cdrom_media(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+    Json(req): Json<CdromMediaRequest>,
+) -> Result<(HeaderMap, Json<Vm>), ApiError> {
+    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
+    require_feature(&state.cluster, INSTALL_MEDIA)?;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
+    let drive = usize::from(req.drive);
+    let (headers, vm) = write_spec(&state, &key, None, picks, |current| {
+        let mut spec = current.spec.clone();
+        let Some(cdrom) = spec.cdroms.get_mut(drive) else {
+            return Err(ApiError::bad_request(format!(
+                "VM {:?} has no CD-ROM drive {drive}",
+                current.name
+            )));
+        };
+        cdrom.iso = req.iso.clone();
+        Ok((spec, current.labels.clone()))
+    })
+    .await?;
+    let what = match &req.iso {
+        Some(iso) => format!("insert {iso}"),
+        None => "eject".into(),
+    };
+    audit.detail(format!("vm cdrom {} drive {drive}: {what}", vm.name));
+    Ok((headers, Json(vm)))
 }
 
 /// 이 VM의 전원 Task(시작·정지·강제 정지·재시작)가 끝나지 않았는지(켜는 중이라 곧 QEMU가 생긴다)
@@ -734,6 +1067,16 @@ fn check_hot_change(state: &AppState, vm: &Vm, spec: &VmSpec) -> Result<(), ApiE
     };
     check_not_busy(state, vm)?;
     check_no_hotplug_task(state, vm)?;
+    // CD-ROM 드라이브(컨트롤러 포트)는 켤 때만 정해진다.
+    if spec.cdroms.len() != hw.cdroms.len() {
+        return Err(ApiError::conflict(
+            "vm_running",
+            format!(
+                "cannot add or remove CD-ROM drives of VM {:?} while it is running; change the media instead or stop it first",
+                vm.name
+            ),
+        ));
+    }
     // 게스트가 아직 내려 주지 않은 디스크·NIC가 있으면 디스크·NIC 목록은 바꾸지 않는다(떼기를 먼저 마친다).
     let devices = |s: &VmSpec| {
         let mut nics = s.nics.clone();
@@ -767,7 +1110,57 @@ fn check_hot_change(state: &AppState, vm: &Vm, spec: &VmSpec) -> Result<(), ApiE
     let caps = node.and_then(|n| n.status.hotplug).unwrap_or_default();
     let plan =
         hotplug::plan(vm.id, &vm.name, spec, hw, caps).map_err(|e| device_error(vm, hw, e))?;
+    check_hot_boot_order(vm, spec, hw, &plan)?;
     check_hotplug_memory(&inv, vm, hw, node, &plan)
+}
+
+/// 실행 중 붙일 디스크의 `boot_order`가 도는 QEMU의 `bootindex`(켤 때 단 디스크·CD로 셈한 실제 순서 — CD에는 값을
+/// 주지 않아도 매겨진다)와 겹치면 409 `vm_running`: QEMU `device_add`가 겹치는 `bootindex`를 거절한다.
+fn check_hot_boot_order(
+    vm: &Vm,
+    spec: &VmSpec,
+    hw: &RunningHardware,
+    plan: &hotplug::Plan,
+) -> Result<(), ApiError> {
+    let boot = hw
+        .layout
+        .as_ref()
+        .map_or(hw.disks.len(), |l| usize::from(l.boot_disks))
+        .min(hw.disks.len());
+    let disks: Vec<_> = hw.disks[..boot].iter().map(|d| d.boot_order).collect();
+    let cdroms: Vec<_> = hw.cdroms.iter().map(|c| c.boot_order).collect();
+    let (disks, cdroms) = opl_types::vm::effective_boot(&disks, &cdroms);
+    let hot = hw.disks[boot..].iter().map(|d| d.boot_order);
+    let used: Vec<(u8, String)> = disks
+        .into_iter()
+        .chain(hot)
+        .enumerate()
+        .filter_map(|(i, o)| o.map(|o| (o, format!("disk{i}"))))
+        .chain(
+            cdroms
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, o)| o.map(|o| (o, format!("cdrom{i}")))),
+        )
+        .collect();
+    for step in &plan.steps {
+        let hotplug::Step::AddDisk { index, .. } = step else {
+            continue;
+        };
+        let Some(order) = spec.disks.get(*index).and_then(|d| d.boot_order) else {
+            continue;
+        };
+        if let Some((_, device)) = used.iter().find(|(o, _)| *o == order) {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "boot_order {order} is already used by {device} in the running VM {:?}; pick another or set it after a restart",
+                    vm.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 끄는 중인 VM(QEMU가 아직 돌아 기록이 있음)을 다시 켤 때 스펙 `spec`의 디스크·NIC가 도는 장치와 다르면 409
@@ -1135,7 +1528,9 @@ pub(crate) enum RuleCheck {
 /// 유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
 /// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
-/// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`).
+/// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
+/// ISO가 들어 있으면 409 `cdrom_local`이다(매체를 빼거나 공유 풀의 ISO를 쓴다). 실행 중 cloud-init을 바꿨으면(호스트
+/// 이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다.
 #[utoipa::path(post, path = "/vms/{key}/migrate", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     request_body = MigrateRequest,
@@ -1275,7 +1670,24 @@ pub(crate) async fn start_migration(
             ),
         ));
     }
+    // 대상은 cloud-init 씨앗을 지금 스펙으로 다시 만든다: 실행 중 바꾼 cloud-init(또는 호스트 이름 없는 VM의 새
+    // 이름)은 게스트가 다른 씨앗을 보게 한다. 기다려도 풀리지 않으므로 `vm_busy`가 아니다(비우기·HA가 그 문구를 보임).
+    if let Some(hw) = &vm.status.hardware
+        && !hotplug::seed_matches(vm.id, &vm.name, &vm.spec, hw)
+    {
+        return Err(ApiError::conflict(
+            "restart_required",
+            format!(
+                "cannot migrate VM {:?}: cloud-init changed while running; restart the VM before migrating it",
+                vm.name
+            ),
+        ));
+    }
     let inv = Inventory::load(&state.cluster)?;
+    // CD의 매체는 옮겨 주지 않는다: 노드 로컬 풀의 ISO는 대상 노드에 없다.
+    if let Some(message) = local_cdrom(&vm, &inv) {
+        return Err(ApiError::conflict("cdrom_local", message));
+    }
     check_no_resize_task(state, &inv, &vm)?;
     // 노드 로컬 풀의 디스크는 대상 노드에 복사한다(같은 이름의 풀 또는 `pool`). 대상이 복제 대상이면 그 복제본에 바뀐
     // 것만 보낸다(계획 55).

@@ -1664,7 +1664,11 @@ export interface paths {
         };
         get: operations["list_vms"];
         put?: never;
-        /** 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다. */
+        /**
+         * 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다. cloud-init 평문 비밀번호는 SHA-512 crypt로 바꿔 저장하고
+         *     응답에서는 `********`로 가린다. `cloud_init.user_data`가 만든 user-data의 칸(`user`·`password`·`ssh_keys`)을
+         *     쓰이지 않게 하면 응답 헤더 `orbivisor-warning`으로 알린다.
+         */
         post: operations["create_vm"];
         delete?: never;
         options?: never;
@@ -1694,6 +1698,10 @@ export interface paths {
          *     기다림)은 실행 중에 디스크와 NIC 개수·순서·MAC을 바꿀 수 없고(보안 그룹을 건 NIC가 있으면 `security_groups`만)
          *     다른 변경은 다음 시작부터 적용된다. `If-Match`가 없으면 검증한 revision에 쓰고, 그
          *     사이 바뀌었으면 다시 읽어 검증한다.
+         *
+         *     CD-ROM 매체(`cdroms[i].iso`)는 실행 중에도 핫플러그 Task로 바꾼다(드라이브 더하기·빼기는 409 `vm_running`, CD
+         *     부팅 순서와 `cloud_init`은 다음 재시작 때 적용). `cloud_init.password`가 `********`이면 저장된 비밀번호를 그대로
+         *     둔다(받은 스펙을 고쳐 다시 보내는 길). 경고는 `POST /vms`처럼 `orbivisor-warning`이다.
          */
         put: operations["update_vm"];
         post?: never;
@@ -1749,6 +1757,28 @@ export interface paths {
          *     `incremental`은 증분 백업을 모르는 노드가 있으면 409 `cluster_upgrading`.
          */
         post: operations["create_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/cdrom": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * CD-ROM 드라이브 하나의 매체를 넣거나 뺀다: 스펙의 `cdroms[drive].iso`만 바꿔 `PUT /vms/{key}`와 같은 길로 쓴다
+         *     (같은 검사, 실행 중이면 `vm-hotplug` Task와 헤더 `orbivisor-task`). 드라이브가 없으면 400, 모든 노드가
+         *     `install-media`를 알아야 한다(409 `cluster_upgrading`). 지우는 중인(끝나지 않은 지우기 Task가 있는) ISO는 409
+         *     `volume_in_use`다. 드라이브 더하기·빼기는 `PUT`이다(꺼진 VM).
+         */
+        post: operations["cdrom_media"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1832,7 +1862,9 @@ export interface paths {
          *     유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
          *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
          *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
-         *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`).
+         *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
+         *     ISO가 들어 있으면 409 `cdrom_local`이다(매체를 빼거나 공유 풀의 ISO를 쓴다). 실행 중 cloud-init을 바꿨으면(호스트
+         *     이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다.
          */
         post: operations["migrate_vm"];
         delete?: never;
@@ -2398,6 +2430,15 @@ export interface components {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
+        };
+        CdromMediaRequest: {
+            /**
+             * Format: int32
+             * @description CD-ROM 드라이브 번호(`cdroms`의 순번)
+             */
+            drive?: number;
+            /** @description 넣을 ISO 볼륨 이름. 없으면 매체를 뺀다. */
+            iso?: string | null;
         };
         /** @description CD-ROM 드라이브. 매체는 늘 읽기 전용으로 열고, 여러 VM이 같은 ISO를 함께 넣을 수 있다. */
         CdromSpec: {
@@ -11403,6 +11444,8 @@ export interface operations {
         responses: {
             201: {
                 headers: {
+                    /** @description a warning about the stored spec (only when there is one) */
+                    "orbivisor-warning"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -11471,6 +11514,8 @@ export interface operations {
                 headers: {
                     /** @description id of the vm-hotplug task that applies a hardware change to the running VM (only when one was created) */
                     "orbivisor-task"?: string;
+                    /** @description a warning about the stored spec (only when there is one) */
+                    "orbivisor-warning"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -11575,6 +11620,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cdrom_media: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CdromMediaRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    /** @description id of the vm-hotplug task that changes the medium of the running VM (only when one was created) */
+                    "orbivisor-task"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmSpec_VmStatus"];
                 };
             };
             "4XX": {

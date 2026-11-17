@@ -12,7 +12,9 @@ use common::{Client, Env, FakeStorage, WAIT, vm_request};
 use opl_types::node::{HOTPLUG, NodeHotplug, NodeSpec};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
+use opl_types::storage::{
+    PoolBackend, StoragePoolSpec, Volume, VolumeContent, VolumePhase, VolumeSpec,
+};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::vm::{
     DiskBus, DiskSpec, MacAddr, NicModel, NicSpec, PendingReason, PowerState, RunningHardware, Vm,
@@ -1381,4 +1383,226 @@ async fn a_vm_stopping_with_changed_devices_starts_after_it_stops() {
     }
     succeeded(&admin.act("web", "start").await);
     assert_eq!(hardware(&env, id).disks, [disk("boot"), disk("data")]);
+}
+
+/// 풀 `local`의 Ready ISO 볼륨(raw)을 만들고 id를 돌려준다.
+async fn iso(env: &Env, name: &str) -> Uuid {
+    let mut volume: Volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Raw,
+            content: VolumeContent::Iso,
+        },
+    );
+    volume.status.phase = VolumePhase::Ready;
+    volume.status.node = Some(env.node);
+    env.cluster.create(&volume).await.unwrap();
+    volume.id
+}
+
+/// 도는 QEMU의 CD 매체마다 그 파일 이름(빈 드라이브는 None)
+fn media(env: &Env, id: Uuid) -> Vec<Option<String>> {
+    env.hv
+        .media(id)
+        .into_iter()
+        .map(|m| m.map(|p| p.file_name().unwrap().to_string_lossy().into_owned()))
+        .collect()
+}
+
+/// `POST /vms/web/cdrom`과 응답 헤더 `orbivisor-task`
+async fn cdrom(admin: &Client, body: Value) -> (StatusCode, Option<String>, Value) {
+    let (status, headers, body) = admin
+        .send_headers(reqwest::Method::POST, "/vms/web/cdrom", body)
+        .await;
+    let task = headers
+        .get("orbivisor-task")
+        .map(|v| v.to_str().unwrap().to_string());
+    (status, task, body)
+}
+
+/// 켠 VM `web`: 디스크 `boot`, CD 드라이브 둘(`ubuntu`와 빈 드라이브)
+async fn running_with_cdroms(admin: &Client) -> Uuid {
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "boot", "bus": "virtio-blk" }]);
+    req["spec"]["cdroms"] = json!([{ "iso": "ubuntu" }, {}]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    succeeded(&admin.act("web", "start").await);
+    vm["id"].as_str().unwrap().parse().unwrap()
+}
+
+/// 실행 중에도 CD 매체를 넣고 뺀다(vCPU·메모리 핫플러그가 없는 노드에서도): `POST /vms/{key}/cdrom`이 스펙의 매체만 바꾸고 핫플러그
+/// Task를 만들며(헤더 `orbivisor-task`), Task가 QEMU의 매체와 기록을 바꾼다. 감사 설명은 `vm cdrom …`이다.
+#[tokio::test]
+async fn cdrom_media_change_while_running() {
+    let (env, _) = setup(NodeHotplug::default()).await;
+    let admin = env.admin().await;
+    let ubuntu = iso(&env, "ubuntu").await;
+    let alpine = iso(&env, "alpine").await;
+    let id = running_with_cdroms(&admin).await;
+    assert_eq!(media(&env, id), [Some(format!("{ubuntu}.raw")), None]);
+
+    let (status, task, vm) = cdrom(&admin, json!({ "drive": 1, "iso": "alpine" })).await;
+    assert_eq!(status, StatusCode::OK, "{vm}");
+    assert_eq!(
+        vm["spec"]["cdroms"],
+        json!([{ "iso": "ubuntu" }, { "iso": "alpine" }])
+    );
+    succeeded(&admin.wait_task(&json!({ "id": task.unwrap() })).await);
+    assert_eq!(
+        media(&env, id),
+        [Some(format!("{ubuntu}.raw")), Some(format!("{alpine}.raw"))]
+    );
+    let hw = hardware(&env, id);
+    assert_eq!(hw.cdroms[1].iso.as_deref(), Some("alpine"));
+    assert!(hw.pending.is_empty(), "{hw:?}");
+
+    // 빼기(드라이브 번호는 기본 0)
+    let (status, task, _) = cdrom(&admin, json!({ "iso": null })).await;
+    assert_eq!(status, StatusCode::OK);
+    succeeded(&admin.wait_task(&json!({ "id": task.unwrap() })).await);
+    assert_eq!(media(&env, id), [None, Some(format!("{alpine}.raw"))]);
+    assert_eq!(hardware(&env, id).cdroms[0].iso, None);
+    let (status, body) = admin.post("/vms/web/cdrom", json!({ "drive": 5 })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["message"], "VM \"web\" has no CD-ROM drive 5");
+
+    // 감사 기록은 쓰기 스레드가 곧 적는다(새것부터 읽힌다).
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let entries = env
+            .state
+            .audit
+            .read(opl_types::audit::AuditQuery {
+                since: 0,
+                until: u64::MAX,
+                user: None,
+                action: None,
+                limit: 1000,
+            })
+            .await
+            .unwrap();
+        let details: Vec<String> = entries
+            .iter()
+            .filter(|e| e.action == "POST /vms/{key}/cdrom" && e.status == 200)
+            .filter_map(|e| e.detail.clone())
+            .collect();
+        if details.len() == 2 || std::time::Instant::now() > deadline {
+            assert_eq!(
+                details,
+                [
+                    "vm cdrom web drive 0: eject",
+                    "vm cdrom web drive 1: insert alpine"
+                ]
+            );
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 실행 중에는 CD 드라이브를 더하거나 빼지 못하고(409 `vm_running`), CD 부팅 순서는 다음 재시작 때 적용된다. 매체를
+/// 넣지 못하면 Task가 실패하고 기록은 그대로이며 보류 `cdroms[i]`(failed)로 남아 다시 해 보기가 마저 넣는다.
+#[tokio::test]
+async fn cdrom_drives_and_boot_order_wait_for_a_restart() {
+    let (env, _) = setup(NodeHotplug::default()).await;
+    let admin = env.admin().await;
+    iso(&env, "ubuntu").await;
+    let alpine = iso(&env, "alpine").await;
+    let id = running_with_cdroms(&admin).await;
+    let (_, vm) = admin.get("/vms/web").await;
+
+    let mut spec = vm["spec"].clone();
+    spec["cdroms"] = json!([{ "iso": "ubuntu" }, {}, {}]);
+    let (status, _, body) = admin.put_task("/vms/web", json!({ "spec": spec })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_running");
+    assert_eq!(
+        body["message"],
+        "cannot add or remove CD-ROM drives of VM \"web\" while it is running; change the media instead or stop it first"
+    );
+
+    let mut spec = vm["spec"].clone();
+    spec["cdroms"][1]["boot_order"] = json!(5);
+    let (status, task, body) = admin.put_task("/vms/web", json!({ "spec": spec })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    succeeded(&admin.wait_task(&json!({ "id": task.unwrap() })).await);
+    let hw = hardware(&env, id);
+    assert_eq!(hw.pending.len(), 1, "{hw:?}");
+    assert_eq!(hw.pending[0].field, "cdroms[1].boot_order");
+    assert_eq!(hw.pending[0].reason, PendingReason::Restart);
+
+    env.hv.fail_next_hotplug("tray is stuck");
+    let (status, task, _) = cdrom(&admin, json!({ "drive": 1, "iso": "alpine" })).await;
+    assert_eq!(status, StatusCode::OK);
+    let error = failed(&admin.wait_task(&json!({ "id": task.unwrap() })).await);
+    assert!(error.contains("CD-ROM drive 1 of VM \"web\""), "{error}");
+    assert!(error.contains("tray is stuck"), "{error}");
+    assert_eq!(media(&env, id)[1], None);
+    let hw = hardware(&env, id);
+    assert_eq!(hw.cdroms[1].iso, None);
+    // 스펙은 바꾼 그대로고, 매체 바꾸기 중에는 옮기지 않는다(기록과 다름).
+    assert_eq!(vm_spec_iso(&env, id, 1).as_deref(), Some("alpine"));
+    let failed_change = hw
+        .pending
+        .iter()
+        .find(|p| p.field == "cdroms[1]")
+        .unwrap_or_else(|| panic!("{hw:?}"));
+    assert_eq!(
+        (
+            failed_change.running.as_str(),
+            failed_change.wanted.as_str()
+        ),
+        ("empty", "alpine")
+    );
+    assert_eq!(failed_change.reason, PendingReason::Failed);
+    // 부팅 순서 보류는 남는다(매체만 바꿨다).
+    assert!(hw.pending.iter().any(|p| p.field == "cdroms[1].boot_order"));
+
+    succeeded(&admin.act("web", "hotplug").await);
+    assert_eq!(media(&env, id)[1], Some(format!("{alpine}.raw")));
+    let hw = hardware(&env, id);
+    assert_eq!(hw.cdroms[1].iso.as_deref(), Some("alpine"));
+    assert_eq!(hw.cdroms[1].boot_order, None);
+    assert!(hw.pending.iter().all(|p| p.field != "cdroms[1]"), "{hw:?}");
+}
+
+fn vm_spec_iso(env: &Env, id: Uuid, drive: usize) -> Option<String> {
+    vm(env, id).spec.cdroms[drive].iso.clone()
+}
+
+/// 실행 중 붙이는 디스크의 `boot_order`가 도는 QEMU의 CD `bootindex`(값을 주지 않아 디스크 뒤에 매겨진 것)와 겹치면
+/// 409 `vm_running`이다(QEMU `device_add`가 겹치는 `bootindex`를 거절한다). 겹치지 않으면 붙는다.
+#[tokio::test]
+async fn a_hot_disk_boot_order_must_not_take_a_running_cdrom_bootindex() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    iso(&env, "ubuntu").await;
+    let id = running_with_cdroms(&admin).await;
+
+    // 켤 때 실제 순서: disk0 1, cdrom0 2, cdrom1 3
+    let (code, message) = put_conflict(&env, &admin, id, |s| {
+        s.disks.push(DiskSpec {
+            boot_order: Some(2),
+            ..disk("data")
+        })
+    })
+    .await;
+    assert_eq!(code, "vm_running");
+    assert_eq!(
+        message,
+        "boot_order 2 is already used by cdrom0 in the running VM \"web\"; pick another or set it after a restart"
+    );
+    succeeded(
+        &put_hot(&env, &admin, id, |s| {
+            s.disks.push(DiskSpec {
+                boot_order: Some(9),
+                ..disk("data")
+            })
+        })
+        .await,
+    );
+    assert!(env.hv.devices(id).contains(&"disk1-dev".to_string()));
 }

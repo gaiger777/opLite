@@ -21,7 +21,7 @@ use opl_types::replication::ReplicaStatus;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotSpec;
-use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumeContent, VolumePhase, VolumeSpec};
 use opl_types::vm::{Arch, PowerState, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -1909,4 +1909,199 @@ async fn replication_and_snapshots_exclude_each_other() {
         body["message"],
         "VM \"db\" is replicated to other nodes; replicas do not keep snapshots, remove the replication first"
     );
+}
+
+/// 풀 `pool`에 이 노드에 있는 ISO 볼륨 `name`(raw, 단계 `phase`)을 저장소에 만든다(파일 없음).
+async fn iso_in(env: &Env, name: &str, pool: &str, phase: VolumePhase) {
+    let mut volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: pool.into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Raw,
+            content: VolumeContent::Iso,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = phase;
+    volume.status.node = Some(env.node);
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+}
+
+/// CD-ROM 드라이브 `cdroms`를 둔 VM 요청
+fn cdrom_request(name: &str, cdroms: Value) -> Value {
+    let mut req = vm_request(name);
+    req["spec"]["cdroms"] = cdroms;
+    req
+}
+
+/// CD 매체는 준비된 ISO 볼륨이어야 하고, 읽기 전용이라 여러 VM이 같은 ISO를 넣는다. ISO는 디스크로 붙이지 못하고
+/// 디스크 볼륨은 CD에 넣지 못한다. HA·복제 VM은 공유 풀의 ISO만 쓰고, 지정한 노드는 그 ISO를 읽을 수 있어야 한다.
+#[tokio::test]
+async fn cdrom_media_must_be_ready_isos_shared_by_vms() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "local", false, vec![]).await;
+    dir_pool(&env, "nas", true, vec![]).await;
+    env.pool_ready("local").await;
+    env.pool_ready("nas").await;
+    iso_in(&env, "ubuntu", "local", VolumePhase::Ready).await;
+    iso_in(&env, "shared-iso", "nas", VolumePhase::Ready).await;
+    iso_in(&env, "uploading", "local", VolumePhase::Pending).await;
+    volume_in(&env, "root", "local").await;
+
+    let (status, a) = admin
+        .post("/vms", cdrom_request("a", json!([{ "iso": "ubuntu" }, {}])))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{a}");
+    assert_eq!(a["spec"]["cdroms"], json!([{ "iso": "ubuntu" }, {}]));
+    let (status, b) = admin
+        .post("/vms", cdrom_request("b", json!([{ "iso": "ubuntu" }])))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+
+    let mut req = vm_request("c");
+    req["spec"]["disks"] = json!([{ "volume": "ubuntu", "bus": "virtio-blk" }]);
+    assert_bad_request(
+        admin.post("/vms", req).await,
+        "volume \"ubuntu\" is an ISO image; attach it as a CD-ROM",
+    );
+    assert_bad_request(
+        admin
+            .post("/vms", cdrom_request("c", json!([{ "iso": "root" }])))
+            .await,
+        "volume \"root\" is not an ISO image",
+    );
+    assert_bad_request(
+        admin
+            .post("/vms", cdrom_request("c", json!([{ "iso": "nope" }])))
+            .await,
+        "volume \"nope\" not found",
+    );
+    let (status, body) = admin
+        .post("/vms", cdrom_request("c", json!([{ "iso": "uploading" }])))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "volume_not_ready");
+
+    // HA VM은 공유 풀의 ISO만(빈 드라이브는 된다).
+    let mut req = cdrom_request("c", json!([{ "iso": "ubuntu" }]));
+    req["spec"]["ha"] = json!(true);
+    let local_iso = "HA and replicated VMs can use ISOs only from shared pools; ISO \"ubuntu\" is in node-local pool \"local\"";
+    assert_bad_request(admin.post("/vms", req.clone()).await, local_iso);
+    req["spec"]["cdroms"] = json!([{ "iso": "shared-iso" }, {}]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 복제 VM도 같다(복제본은 다른 노드에서 켠다).
+    let mut req = replicated_request("d", "root", json!([{ "node": Uuid::now_v7() }]));
+    req["spec"]["cdroms"] = json!([{ "iso": "ubuntu" }]);
+    assert_bad_request(admin.post("/vms", req).await, local_iso);
+
+    // 지정한 노드는 노드 로컬 풀의 ISO를 그 파일이 있는 노드에서만 읽는다.
+    add_full_node(&env, "node2", false).await;
+    let mut req = cdrom_request("e", json!([{ "iso": "ubuntu" }]));
+    let node2 = env
+        .cluster
+        .get_by_name::<NodeSpec>("node2")
+        .unwrap()
+        .unwrap();
+    req["spec"]["node"] = json!(node2.id);
+    assert_bad_request(
+        admin.post("/vms", req.clone()).await,
+        "node \"node2\" cannot use ISO \"ubuntu\"",
+    );
+    req["spec"]["node"] = json!(env.node);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// 지우기 Task가 끝나지 않은 ISO는 CD에 넣지 못한다(409 `volume_in_use` — 지우기 API의 확인 뒤 넣으면 Task가 그 ISO를
+/// 지울 수 있다). Task가 끝나면 된다.
+#[tokio::test]
+async fn an_iso_being_deleted_cannot_be_inserted() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "nas", true, vec![]).await;
+    env.pool_ready("nas").await;
+    iso_in(&env, "ubuntu", "nas", VolumePhase::Ready).await;
+    let iso = env
+        .cluster
+        .get_by_name::<VolumeSpec>("ubuntu")
+        .unwrap()
+        .unwrap();
+    // 다른 노드의 Task라 이 실행기가 돌리지 않는다.
+    let mut task: opl_types::task::Task = Resource::new(
+        "",
+        opl_types::task::TaskSpec {
+            op: opl_types::task::TaskOp::VolumeDelete,
+            target: iso.id,
+            node: Uuid::now_v7(),
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+
+    let (status, body) = admin
+        .post("/vms", cdrom_request("a", json!([{ "iso": "ubuntu" }])))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "volume_in_use");
+    assert_eq!(
+        body["message"],
+        format!("ISO \"ubuntu\" is being deleted (task {})", task.id)
+    );
+    // 빈 드라이브는 된다.
+    let (status, body) = admin.post("/vms", cdrom_request("a", json!([{}]))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin
+        .post("/vms/a/cdrom", json!({ "drive": 0, "iso": "ubuntu" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "volume_in_use");
+
+    task.status.state = opl_types::task::TaskState::Failed;
+    env.cluster
+        .update_status::<opl_types::task::TaskSpec>(task.id, &task.status)
+        .await
+        .unwrap();
+    let (status, body) = admin
+        .post("/vms/a/cdrom", json!({ "drive": 0, "iso": "ubuntu" }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 스케줄러는 노드 로컬 풀의 ISO가 있는 노드를 고른다(메모리가 더 많은 노드가 있어도). 공유 풀의 ISO는 묶지 않는다.
+#[tokio::test]
+async fn the_scheduler_keeps_a_local_iso_on_its_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_full_node(&env, "node2", false).await;
+    let mut n = env.cluster.get::<NodeSpec>(node2).unwrap().unwrap();
+    n.status.memory_mib = 65536;
+    env.cluster
+        .update_status::<NodeSpec>(node2, &n.status)
+        .await
+        .unwrap();
+    dir_pool(&env, "local", false, vec![]).await;
+    dir_pool(&env, "nas", true, vec![]).await;
+    for pool in ["local", "nas"] {
+        env.pool_ready(pool).await;
+        common::mark_pool_ready(&env.cluster, node2, pool).await;
+    }
+    iso_in(&env, "ubuntu", "local", VolumePhase::Ready).await;
+    iso_in(&env, "shared-iso", "nas", VolumePhase::Ready).await;
+
+    let mut req = cdrom_request("a", json!([{ "iso": "ubuntu" }]));
+    req["spec"]["power"] = json!("running");
+    let (status, a) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{a}");
+    assert_eq!(a["spec"]["node"], env.node.to_string());
+    req["name"] = json!("b");
+    req["spec"]["cdroms"] = json!([{ "iso": "shared-iso" }]);
+    let (status, b) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    assert_eq!(b["spec"]["node"], node2.to_string());
 }

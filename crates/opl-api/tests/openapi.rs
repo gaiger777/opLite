@@ -58,6 +58,7 @@ async fn openapi_document_is_served_without_login() {
         "/vms/{key}/snapshots/{name}/revert",
         "/vms/{key}/clone",
         "/vms/{key}/migrate",
+        "/vms/{key}/cdrom",
         "/vms/{key}/backups",
         "/backups",
         "/backups/{key}",

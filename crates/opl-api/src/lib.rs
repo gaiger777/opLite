@@ -245,6 +245,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_vm, vms::update_vm, vms::delete_vm))
         .routes(routes!(vms::vm_action))
         .routes(routes!(vms::migrate_vm))
+        .routes(routes!(vms::cdrom_media))
         .routes(routes!(vms::replicate_vm))
         .routes(routes!(metrics::get_vm_metrics))
         .routes(routes!(snapshots::list_snapshots))

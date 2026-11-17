@@ -862,6 +862,41 @@ async fn hotplug_maximums_are_kept_only_when_every_node_knows_hotplug() {
     assert_eq!((spec.cpu.cores, spec.memory_mib), (1, 256));
 }
 
+/// CD-ROM 드라이브·cloud-init은 `install-media`를 모르는 노드가 있으면 버리고(옛 노드가 풀지 못함), 디스크에 부팅
+/// 순서가 없으면 첫 디스크를 부팅 장치로 둔다.
+#[tokio::test]
+async fn install_media_is_kept_only_when_every_node_knows_it() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let with_media = || {
+        let mut m = manifest();
+        m["vm_spec"]["cdroms"] = json!([{ "iso": "installer", "boot_order": 1 }]);
+        m["vm_spec"]["cloud_init"] = json!({ "user": "orbi" });
+        m
+    };
+    let id = receive_ok(&admin, receive_body(&with_media())).await;
+    let spec = get_backup(&env, id).unwrap().spec.vm_spec;
+    assert_eq!(spec.cdroms.len(), 1);
+    assert!(spec.cloud_init.is_some());
+    // 계획 56 노드: `install-media`를 모른다.
+    let old = current_node(&env, "plan56").await;
+    let mut node = env.cluster.get::<NodeSpec>(old).unwrap().unwrap();
+    node.status
+        .features
+        .retain(|f| f != opl_types::node::INSTALL_MEDIA);
+    env.cluster
+        .update_status::<NodeSpec>(old, &node.status)
+        .await
+        .unwrap();
+    let id = receive_ok(&admin, receive_body(&with_media())).await;
+    let spec = get_backup(&env, id).unwrap().spec.vm_spec;
+    assert!(spec.cdroms.is_empty());
+    assert_eq!(spec.cloud_init, None);
+    let orders: Vec<_> = spec.disks.iter().map(|d| d.boot_order).collect();
+    assert_eq!(orders, [Some(1), None]);
+}
+
 /// 복제 대상은 원본 클러스터의 노드다: 모든 노드가 `node-replication`을 알아도 늘 버린다.
 #[tokio::test]
 async fn received_copies_drop_the_replication_targets() {

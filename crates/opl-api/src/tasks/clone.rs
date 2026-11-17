@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
+use opl_types::cloud_init::IpConfig;
 use opl_types::node::{NodeSpec, PLACEMENT};
 use opl_types::placement::HaGroupSpec;
 use opl_types::resource::Resource;
@@ -96,7 +97,7 @@ pub(super) async fn clone(
     name: &str,
     snapshot: Option<Uuid>,
     pool: Option<&str>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let vm = get_vm(ctx, task.spec.target)?;
     let stopped = vm.spec.power == PowerState::Stopped && is_down(&vm);
     let (spec, tag) = match snapshot {
@@ -226,7 +227,37 @@ pub(super) async fn clone(
     for nic in &mut new.spec.nics {
         nic.mac = None;
     }
-    create_vm(ctx, task, new).await
+    let warning = identity_warning("the clone", &new.spec);
+    create_vm(ctx, task, new).await?;
+    Ok(warning)
+}
+
+/// 새 VM(복제·복원)이 원본의 cloud-init 고정 IP 주소·호스트 이름을 그대로 가지면 Task가 남길 경고. 원본과 함께 켜면
+/// 주소·이름이 겹친다. 호스트 이름이 없으면 새 VM 이름을 쓰므로 겹치지 않는다.
+pub(super) fn identity_warning(what: &str, spec: &VmSpec) -> Option<String> {
+    let ci = spec.cloud_init.as_ref()?;
+    let addresses: Vec<&str> = ci
+        .networks
+        .iter()
+        .flat_map(|n| [&n.ipv4, &n.ipv6])
+        .filter_map(|ip| match ip {
+            Some(IpConfig::Static { address, .. }) => Some(address.as_str()),
+            _ => None,
+        })
+        .collect();
+    let mut kept = Vec::new();
+    if !addresses.is_empty() {
+        kept.push(format!("static IP addresses {}", addresses.join(", ")));
+    }
+    if let Some(host) = &ci.hostname {
+        kept.push(format!("host name {host:?}"));
+    }
+    (!kept.is_empty()).then(|| {
+        format!(
+            "{what} keeps the cloud-init {}; change them before starting it",
+            kept.join(" and ")
+        )
+    })
 }
 
 /// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, 노드·예약 없이 꺼진

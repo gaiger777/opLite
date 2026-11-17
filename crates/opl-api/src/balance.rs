@@ -374,11 +374,11 @@ pub fn movable(
     if busy {
         return Err("busy with a task");
     }
-    let unsettled = vm
-        .status
-        .hardware
-        .as_ref()
-        .is_some_and(|hw| !hw.unplugging.is_empty() || !hotplug::devices_match(&vm.spec, hw));
+    let unsettled = vm.status.hardware.as_ref().is_some_and(|hw| {
+        !hw.unplugging.is_empty()
+            || !hotplug::devices_match(&vm.spec, hw)
+            || !hotplug::seed_matches(vm.id, &vm.name, &vm.spec, hw)
+    });
     if unsettled {
         return Err("hardware change not finished");
     }

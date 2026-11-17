@@ -30,6 +30,9 @@ pub const REVISION: HeaderName = HeaderName::from_static("orbivisor-revision");
 /// 응답 헤더: 요청이 만든 Task의 id(실행 중인 VM의 하드웨어를 바꾼 `PUT /vms/{key}`의 핫플러그 Task)
 pub const TASK: HeaderName = HeaderName::from_static("orbivisor-task");
 
+/// 응답 헤더: 요청은 받았지만 알릴 것(영어 문장 하나 — 예: `cloud_init.user_data`가 만든 칸을 덮음)
+pub const WARNING: HeaderName = HeaderName::from_static("orbivisor-warning");
+
 /// `Orbivisor-Min-Revision`을 기다리는 최대 시간
 pub const MIN_REVISION_WAIT: Duration = Duration::from_secs(5);
 

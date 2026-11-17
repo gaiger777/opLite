@@ -428,6 +428,53 @@ async fn replicating_again_continues_with_the_existing_copy() {
     assert_eq!(get_backup(&r.env, id).status.phase, BackupPhase::Ready);
 }
 
+/// cloud-init 비밀번호·user-data와 로컬 디스크 복제 대상이 있는 VM의 백업도 이미 있는 사본을 확인해 이어 간다: 원격은
+/// 비밀을 `********`로 가려 응답하고 복제 대상을 버리므로 같은 규칙으로 견준다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_a_vm_with_cloud_init_and_replication_is_checked() {
+    let r = remote().await;
+    let (local, admin) = local_with_remote(&r, "operator").await;
+    let mut spec = vm_request("web")["spec"].clone();
+    spec["disks"] = json!([
+        { "volume": "web-root", "bus": "virtio-blk" },
+        { "volume": "web-data", "bus": "virtio-blk" }
+    ]);
+    spec["cloud_init"] = json!({
+        "user": "orbi",
+        "password": format!("$6$saltsalt${}", "a".repeat(86)),
+        "user_data": "#cloud-config\nruncmd: [true]\n",
+        "vendor_data": "#cloud-config\npackages: [curl]\n",
+    });
+    spec["replication"] = json!([{ "node": Uuid::now_v7() }]);
+    let spec = BackupSpec {
+        vm: Uuid::now_v7(),
+        vm_name: "web".into(),
+        pool: "backups".into(),
+        vm_spec: serde_json::from_value(spec).unwrap(),
+        job: None,
+        origin: None,
+        incremental: false,
+        max_chain: None,
+    };
+    let source = make_backup(&local, "web-1", spec, None).await;
+
+    let task = replicate_done(&admin, "web-1").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let copy = only_replica(&local, source.id).backup.unwrap();
+    let got = get_backup(&r.env, copy);
+    assert!(got.spec.vm_spec.replication.is_empty());
+    assert!(got.spec.vm_spec.cloud_init.is_some());
+
+    // 한 번 더: ready 사본을 확인한다(원격 응답은 비밀번호를 가린다).
+    let task = replicate_done(&admin, "web-1").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let replica = only_replica(&local, source.id);
+    assert_eq!(
+        (replica.state, replica.backup),
+        (ReplicaState::Ready, Some(copy))
+    );
+}
+
 /// 같은 원본의 사본이라고 하지만 풀·VM 스펙·디스크가 다른 원격 백업에는 붙지 않는다.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_different_backup_claiming_the_origin_fails_the_copy() {

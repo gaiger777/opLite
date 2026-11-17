@@ -14,7 +14,7 @@ use opl_types::replication::ReplicationTarget;
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{SnapshotPhase, SnapshotSpec, SnapshotStatus};
-use opl_types::storage::{StoragePoolSpec, VolumePhase, VolumeSpec};
+use opl_types::storage::{StoragePoolSpec, VolumeContent, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{PowerState, Vm, VmHa, VmPhase, VmSpec, VmStatus};
 use reqwest::StatusCode;
@@ -674,6 +674,75 @@ async fn a_clone_keeps_the_pinning_only_when_every_node_knows_placement() {
 }
 
 /// 복제 대상과 그 복제본은 원본 VM의 것이다: 복제한 VM은 복제 없이 만든다.
+/// 복제본은 원본의 CD-ROM 드라이브와 그 ISO(읽기 전용이라 함께 씀), cloud-init 설정(비밀번호 해시 포함)을 그대로
+/// 받는다. 새 VM id라 씨앗의 instance-id가 다르다.
+#[tokio::test]
+async fn a_clone_keeps_the_cdroms_and_cloud_init() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    let root = volume(&env, "root").await;
+    let iso = volume(&env, "installer").await;
+    let mut installer = env.cluster.get::<VolumeSpec>(iso).unwrap().unwrap();
+    installer.spec.content = VolumeContent::Iso;
+    installer.spec.format = ImageFormat::Raw;
+    env.cluster
+        .update_spec(iso, None, installer.labels.clone(), &installer.spec)
+        .await
+        .unwrap();
+    fake_storage(&mut env, &[root]).await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    req["spec"]["cdroms"] = json!([{ "iso": "installer", "boot_order": 1 }, {}]);
+    req["spec"]["cloud_init"] = json!({ "user": "orbi", "password": "pw" });
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let task = clone_and_wait(&admin, "web", json!({ "name": "web-2" })).await;
+    succeeded(&task);
+    // 고정 IP·호스트 이름이 없으면 경고도 없다.
+    assert!(task["status"]["error"].is_null(), "{task}");
+    let (source, copy) = (get_vm(&env, "web").unwrap(), get_vm(&env, "web-2").unwrap());
+    assert_eq!(copy.spec.cdroms, source.spec.cdroms);
+    assert_eq!(copy.spec.cloud_init, source.spec.cloud_init);
+    let seed = |vm: &Vm| {
+        opl_types::cloud_init::render(
+            vm.id,
+            &vm.name,
+            vm.spec.cloud_init.as_ref().unwrap(),
+            &vm.spec.nics,
+        )
+        .instance_id
+    };
+    assert_ne!(seed(&copy), seed(&source));
+
+    // 고정 IP·호스트 이름은 그대로 옮기고, 원본과 겹치지 않게 바꾸라고 Task 경고로 알린다.
+    let mut spec = source.spec.clone();
+    let ci = spec.cloud_init.as_mut().unwrap();
+    ci.hostname = Some("web-01".into());
+    ci.networks = vec![opl_types::cloud_init::CloudInitNet {
+        ipv4: Some(opl_types::cloud_init::IpConfig::Static {
+            address: "10.0.0.5/24".into(),
+            gateway: None,
+        }),
+        ipv6: None,
+    }];
+    env.cluster
+        .update_spec(source.id, None, source.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let task = clone_and_wait(&admin, "web", json!({ "name": "web-3" })).await;
+    succeeded(&task);
+    assert_eq!(
+        task["status"]["error"],
+        "the clone keeps the cloud-init static IP addresses 10.0.0.5/24 and host name \"web-01\"; change them before starting it"
+    );
+    assert_eq!(
+        get_vm(&env, "web-3").unwrap().spec.cloud_init,
+        spec.cloud_init
+    );
+}
+
 #[tokio::test]
 async fn a_clone_does_not_take_the_replication_targets() {
     let mut env = Env::start().await;

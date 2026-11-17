@@ -12,7 +12,7 @@ use opl_types::placement::{PlacementRule, PlacementRuleSpec, RuleKind};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
-use opl_types::storage::{StoragePoolSpec, Volume, VolumePhase, VolumeSpec};
+use opl_types::storage::{StoragePoolSpec, Volume, VolumeContent, VolumePhase, VolumeSpec};
 use opl_types::task::{TaskSpec, TaskState};
 use opl_types::vm::{Arch, HaEvict, MigrationStatus, VmHa, VmHaStatus, VmPhase, VmSpec};
 use reqwest::StatusCode;
@@ -761,4 +761,83 @@ async fn a_vm_with_a_running_affinity_partner_does_not_move_alone() {
     let (status, task) = migrate(&admin, "web", "node2").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
     admin.wait_task(&task).await;
+}
+
+/// 풀 `pool`에 이 노드에 있는 Ready ISO 볼륨을 저장소에 직접 만든다(파일 없음).
+async fn ready_iso(env: &Env, pool: &str, name: &str) {
+    let mut volume: Volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: pool.into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Raw,
+            content: VolumeContent::Iso,
+        },
+    );
+    volume.status.node = Some(env.node);
+    volume.status.phase = VolumePhase::Ready;
+    env.cluster.create(&volume).await.unwrap();
+}
+
+/// CD-ROM의 매체는 옮겨 주지 않는다: 노드 로컬 풀의 ISO가 들어 있으면 409 `cdrom_local`이고 빼면 옮긴다. 공유 풀의
+/// ISO는 양쪽이 함께 읽으므로 그대로 옮긴다. 매체를 바꾸는 중(스펙과 도는 장치가 다름)이면 409 `vm_busy`다.
+#[tokio::test]
+async fn cdroms_with_local_isos_do_not_migrate() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let node2 = add_node(&env, "node2").await;
+    upgrade(&env, node2).await;
+    create_pool(&env, &admin, "nas", true).await;
+    mark_pool_ready(&env.cluster, node2, "nas").await;
+    create_pool(&env, &admin, "local", false).await;
+    ready_iso(&env, "local", "installer").await;
+    ready_iso(&env, "nas", "shared-iso").await;
+    for (vm, disk, iso) in [("web", "root", "installer"), ("db", "data", "shared-iso")] {
+        ready_volume(&env, "nas", disk).await;
+        let mut req = vm_request(vm);
+        req["spec"]["disks"] = json!([{ "volume": disk, "bus": "virtio-blk" }]);
+        req["spec"]["cdroms"] = json!([{ "iso": iso }]);
+        req["spec"]["node"] = json!(env.node);
+        let (status, body) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let task = admin.act(vm, "start").await;
+        assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    }
+
+    let (status, body) = migrate(&admin, "web", "node2").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cdrom_local");
+    assert_eq!(
+        body["message"],
+        "VM \"web\" has ISO \"installer\" from node-local pool \"local\" in a CD-ROM drive; eject it or keep ISOs in a shared pool"
+    );
+    let (status, headers, body) = admin
+        .send_headers(
+            reqwest::Method::POST,
+            "/vms/web/cdrom",
+            json!({ "drive": 0, "iso": null }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let task = headers["orbivisor-task"].to_str().unwrap();
+    let task = admin.wait_task(&json!({ "id": task })).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (status, task) = migrate(&admin, "web", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+
+    // 스펙만 바뀐 매체(기록과 다름)는 받는 쪽이 같은 장치로 켤 수 없다.
+    let db = env.cluster.get_by_name::<VmSpec>("db").unwrap().unwrap();
+    let mut spec = db.spec.clone();
+    spec.cdroms[0].iso = None;
+    env.cluster
+        .update_spec(db.id, None, db.labels.clone(), &spec)
+        .await
+        .unwrap();
+    assert_conflict(migrate(&admin, "db", "node2").await, "vm_busy");
+    env.cluster
+        .update_spec(db.id, None, db.labels.clone(), &db.spec)
+        .await
+        .unwrap();
+    let (status, task) = migrate(&admin, "db", "node2").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
 }
