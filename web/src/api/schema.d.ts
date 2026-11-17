@@ -703,6 +703,71 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/image-catalog": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 이미지 카탈로그: 내장 항목과 관리자 항목. `arch`를 주면 그 아키텍처만. 항목마다 그 URL에서 이미 받아 준비된 볼륨을
+         *     `volumes`로 함께 준다. 관리자(설정 쓰기 권한)가 아니면 URL의 쿼리 문자열과 사용자 정보를 가린다.
+         */
+        get: operations["list_catalog"];
+        put?: never;
+        /**
+         * 관리자 카탈로그 항목을 더한다(201). 같은 `(id, arch)`가 있으면 409 `already_exists`, 내장 항목의 id(아키텍처와
+         *     상관없이)·잘못된 id·URL·해시 길이·200개 넘음은 400이다. 고정 해시는 소문자로 저장한다. 모든 노드가 `templates`를
+         *     알아야 한다(409 `cluster_upgrading`).
+         */
+        post: operations["add_catalog_image"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/image-catalog/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** 관리자 카탈로그 항목을 지운다(204). 이미 받은 볼륨과 템플릿은 그대로다. 내장 항목은 지울 수 없고(400), 없으면 404다. */
+        delete: operations["remove_catalog_image"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/image-catalog/{id}/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 카탈로그 이미지를 풀에 받는 Task(`volume-download`)를 돌려준다(202). 항목의 체크섬(고정 해시나 체크섬 파일)으로
+         *     확인하고, `template`이 있으면 가져온 뒤 디스크를 늘리고 꺼진 템플릿 VM을 만든다(그 단계가 실패해도 받은 볼륨은
+         *     남는다). 항목이 없으면 404, 볼륨이나 VM 이름이 쓰였으면 409 `name_taken`, 템플릿의 네트워크가 없거나 크기가
+         *     이미지보다 작으면 400, 풀을 쓸 수 있는 노드 가운데 항목의 아키텍처인 노드가 없으면 400 `machine_arch_mismatch`다.
+         *     볼륨 쓰기 권한(템플릿이면 VM 쓰기도)이 있어야 하고, 모든 노드가 `templates`를 알아야 한다(409 `cluster_upgrading`).
+         */
+        post: operations["download_catalog_image"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/metrics/nodes": {
         parameters: {
             query?: never;
@@ -1259,7 +1324,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 클러스터 설정. 로그인한 누구나 읽는다. */
+        /** 클러스터 설정. 로그인한 누구나 읽는다. 관리자(설정 쓰기 권한)가 아니면 이미지 카탈로그의 URL을 가린다. */
         get: operations["get_settings"];
         put?: never;
         post?: never;
@@ -1702,12 +1767,17 @@ export interface paths {
          *     CD-ROM 매체(`cdroms[i].iso`)는 실행 중에도 핫플러그 Task로 바꾼다(드라이브 더하기·빼기는 409 `vm_running`, CD
          *     부팅 순서와 `cloud_init`은 다음 재시작 때 적용). `cloud_init.password`가 `********`이면 저장된 비밀번호를 그대로
          *     둔다(받은 스펙을 고쳐 다시 보내는 길). 경고는 `POST /vms`처럼 `orbivisor-warning`이다.
+         *
+         *     `template`은 바꾸지 않는다(`POST`·`DELETE /vms/{key}/template`). 템플릿은 켤 수 없고(`power: running`은 409
+         *     `vm_is_template`) 디스크 목록(볼륨·버스·개수)을 바꿀 수 없으며(409 `vm_is_template`) `ha`·`replication`·
+         *     `snapshot_schedule`을 가질 수 없다(400). 연결 복제 디스크가 있는 VM의 복제 대상(`replication`)은 400이다.
          */
         put: operations["update_vm"];
         post?: never;
         /**
          * 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`, 끝나지 않은 스냅샷·복제
-         *     Task가 있으면 409 `vm_busy`(복제는 원본 VM과 그 스냅샷을 읽는다).
+         *     Task가 있으면 409 `vm_busy`(복제는 원본 VM과 그 스냅샷을 읽는다). 템플릿은 먼저 VM으로 되돌린다(409
+         *     `vm_is_template`).
          */
         delete: operations["delete_vm"];
         options?: never;
@@ -1730,7 +1800,8 @@ export interface paths {
          *     지금 스펙에 맞추는 Task(`vm-hotplug`, 실패한 변경 다시 해 보기)다: 모든 노드가 `hotplug`를 알아야 하고(409
          *     `cluster_upgrading`) 핫플러그 기록이 있는 실행 중 VM이어야 한다(409 `vm_not_running`). 끝나지 않은 스냅샷·되돌리기·
          *     복제·백업 Task가 있으면 409 `vm_busy`이고, 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다
-         *     (409 `no_capacity`).
+         *     (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
+         *     `start`·`reboot`은 409 `vm_busy`다.
          */
         post: operations["vm_action"];
         delete?: never;
@@ -1776,7 +1847,7 @@ export interface paths {
          * CD-ROM 드라이브 하나의 매체를 넣거나 뺀다: 스펙의 `cdroms[drive].iso`만 바꿔 `PUT /vms/{key}`와 같은 길로 쓴다
          *     (같은 검사, 실행 중이면 `vm-hotplug` Task와 헤더 `orbivisor-task`). 드라이브가 없으면 400, 모든 노드가
          *     `install-media`를 알아야 한다(409 `cluster_upgrading`). 지우는 중인(끝나지 않은 지우기 Task가 있는) ISO는 409
-         *     `volume_in_use`다. 드라이브 더하기·빼기는 `PUT`이다(꺼진 VM).
+         *     `volume_in_use`다. 드라이브 더하기·빼기는 `PUT`이다(꺼진 VM). 템플릿에 매체를 넣으면 409 `vm_is_template`이다.
          */
         post: operations["cdrom_media"];
         delete?: never;
@@ -1798,6 +1869,11 @@ export interface paths {
          * VM을 `name`으로 복제할 Task를 돌려준다(202). 원본은 `ready` 스냅샷이나 꺼진 VM의 지금 상태다
          *     (실행 중인데 스냅샷이 없으면 409 `vm_running`). 원본 스펙의 볼륨이 모두 있어야 하고, `pool`은 Task
          *     노드에서 쓸 수 있어야 한다. Task는 원본 VM을 대상으로 그 VM의 디스크 노드에서 돈다.
+         * @description 템플릿에서 배포(계획 58 §6): 템플릿이면 디스크를 기반과 같은 풀에 연결 복제로 만든다(`linked`). `linked: true`는
+         *     템플릿의 지금 상태에서만이고(400) 디스크마다 연결할 수 있어야 한다(400 `disk0: …` — 다른 풀, 연결 복제를 못 하는
+         *     백엔드). `node`·`vcpus`·`memory_mib`·`nics`·`disks`·`cloud_init`·`start`는 원본 스펙을 바꿔 VM 만들기와 같은 검사를
+         *     한다(400 — 디스크 줄이기, 없는 네트워크, 디스크가 닿지 않는 노드, 맞지 않는 아키텍처). 새 칸은 모든 노드가
+         *     `templates`를 알아야 한다(409 `cluster_upgrading`). 응답 Task의 cloud-init 비밀번호는 가린다.
          */
         post: operations["clone_vm"];
         delete?: never;
@@ -1864,7 +1940,7 @@ export interface paths {
          *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
          *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
          *     ISO가 들어 있으면 409 `cdrom_local`이다(매체를 빼거나 공유 풀의 ISO를 쓴다). 실행 중 cloud-init을 바꿨으면(호스트
-         *     이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다.
+         *     이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다. 템플릿은 409 `vm_is_template`이다.
          */
         post: operations["migrate_vm"];
         delete?: never;
@@ -1887,6 +1963,7 @@ export interface paths {
          *     만든다(202). 결과는 `GET /vms/{key}`의 `status.replication`에 남는다. 대상이 둘 이상이면 `node`가 있어야 하고(400),
          *     `node`가 VM의 복제 대상이 아니면 400, 모든 노드가 복제를 알아야 하고(409 `cluster_upgrading`), VM이 실행 중이어야
          *     하며(409 `vm_not_running`, 옮기는 중이면 409 `vm_busy`), 같은 대상의 복제 Task가 끝나지 않았으면 409 `vm_busy`다.
+         *     템플릿은 409 `vm_is_template`이다.
          */
         post: operations["replicate_vm"];
         delete?: never;
@@ -1958,6 +2035,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/{key}/template": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * VM을 템플릿으로 바꾼다(계획 58 §3, Raft 쓰기 하나). 꺼져 있어야 하고(409 `vm_running`), 마이그레이션·스냅샷·
+         *     복제·백업 Task가 없어야 하며(409 `vm_busy`), 스냅샷이 없어야 한다(409 `vm_has_snapshots` — 템플릿의 되돌리기가
+         *     연결 복제의 기반을 바꾸면 안 된다). `ha`·`replication`·`snapshot_schedule`이 있거나 디스크가 연결 복제면 400이다.
+         *     모든 노드가 `templates`를 알아야 한다(409 `cluster_upgrading`). 이미 템플릿이면 그대로 200이다. 저장소에는
+         *     아무것도 하지 않는다(기반 스냅샷은 첫 연결 복제가 만든다).
+         */
+        post: operations["convert_template"];
+        /**
+         * 템플릿을 보통 VM으로 되돌릴 Task(`vm-untemplate`)를 VM의 노드에 만든다(202, 계획 58 §3). 템플릿이 아니면 400,
+         *     연결 복제가 남았으면 409 `template_in_use`(쓰는 VM이나 붙지 않은 복제 볼륨의 이름), 앞 되돌리기 Task가 끝나지 않았으면
+         *     409 `vm_busy`, 모든 노드가 `templates`를 알아야 한다(409 `cluster_upgrading`). 되돌리기 Task가 끝날 때까지 켜기·고치기·
+         *     지우기도 409 `vm_busy`다. Task는 줄에서 기다린 뒤 다시 확인하고 디스크마다 기반 스냅샷을 푼 다음
+         *     `template: false`를 쓴다.
+         */
+        delete: operations["untemplate_vm"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/volumes": {
         parameters: {
             query?: never;
@@ -1987,6 +2094,8 @@ export interface paths {
         /**
          * URL에서 이미지를 받아 볼륨을 채울 Task를 돌려준다(202). 풀을 쓸 수 있는 노드(`pool_node`)가 받는다.
          *     크기는 받아 가져온 뒤 실제 이미지 크기가 된다. 모든 노드가 `install-media`를 알아야 한다(새 Task).
+         *     확인은 `sha256`·`sha512`·`checksum_url` 가운데 하나이고(둘 이상이면 400), `sha512`·`checksum_url`은 모든 노드가
+         *     `templates`를 알아야 한다(409 `cluster_upgrading`).
          */
         post: operations["download_volume"];
         delete?: never;
@@ -2044,9 +2153,34 @@ export interface paths {
         post?: never;
         /**
          * VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202). 아직 만들고 있는 볼륨은 지울 수 없다.
-         *     스냅샷의 VM 스펙이 가리키면 409 `volume_in_snapshot`.
+         *     스냅샷의 VM 스펙이 가리키면 409 `volume_in_snapshot`, 템플릿의 디스크면 409 `volume_is_template`, 연결 복제의
+         *     기반이면 409 `volume_has_clones`(복제를 먼저 지우거나 평탄화한다).
          */
         delete: operations["delete_volume"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/volumes/{key}/flatten": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 연결 복제 볼륨을 기반과 떼어 독립 볼륨으로 만들 Task(`volume-flatten`)를 돌려준다(202, 계획 58 §7). 볼륨을
+         *     쓸 수 있는 노드에서 돈다(쓰는 VM이 있으면 그 VM의 디스크 노드). 모든 노드가 `templates`를 알아야 하고(409
+         *     `cluster_upgrading`), 연결 복제가 아니면 400, 아직 만드는 중이면 409 `volume_not_ready`, 쓰는 VM이 꺼져 있지 않으면
+         *     409 `vm_running`(실행 중 평탄화는 없다), 그 VM의 스냅샷·복제·백업·마이그레이션 Task가 끝나지 않았으면 409
+         *     `vm_busy`다. 파일 풀(dir·NFS)의 디스크는 VM에 스냅샷이 있으면 409 `vm_has_snapshots`(qcow2 내부 스냅샷이 기반을
+         *     잃는다). 기반이 쓰는 공간을 노드가 알린 풀 여유가 담지 못하면 409 `no_capacity`다.
+         */
+        post: operations["flatten_volume"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2066,7 +2200,8 @@ export interface paths {
          *     Task와 같은 노드(실행 중이면 그 VM의 노드, 꺼졌으면 다음에 돌 노드)의 실행기에서 차례로 돌도록
          *     거기서 한다. 쓰는 VM이 없거나 정할 노드가 없으면 볼륨의 노드에서 한다. 쓰는 VM이 켜지거나 꺼지는
          *     중이면(원하는 상태와 실제 상태가 다르다) 409 `vm_busy`다. 꺼진 VM으로 보고 저장소로 늘리는 동안
-         *     시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
+         *     시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다. 템플릿의 디스크는 409 `volume_is_template`이다(배포 때 디스크 크기를
+         *     준다).
          */
         post: operations["resize_volume"];
         delete?: never;
@@ -2431,6 +2566,23 @@ export interface components {
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
         };
+        /** @description `POST /image-catalog/{id}/download` */
+        CatalogDownloadRequest: {
+            /** @description 받을 항목의 아키텍처. 없으면 풀에서 받는 노드의 아키텍처다. */
+            arch?: components["schemas"]["Arch"];
+            /** @description 볼륨 이름. 없으면 id의 `.`을 `-`로 바꾸고 aarch64면 `-arm64`를 붙인다(`ubuntu-24-04`). */
+            name?: string;
+            /** @description 받은 디스크를 둘 풀 */
+            pool: string;
+            /** @description 받은 뒤 만들 템플릿 VM. 없으면 볼륨만 받는다. */
+            template?: components["schemas"]["CatalogTemplate"];
+        };
+        /** @description 목록의 카탈로그 항목: 이미지와 출처, 이미 받은 볼륨 */
+        CatalogEntry: components["schemas"]["CatalogImage"] & {
+            source: components["schemas"]["CatalogSource"];
+            /** @description 이 이미지 URL에서 받아 준비된 볼륨 이름(끝난 `volume-download` Task의 결과, 이름 순) */
+            volumes: string[];
+        };
         /** @description 카탈로그 이미지 하나 */
         CatalogImage: {
             arch: components["schemas"]["Arch"];
@@ -2438,7 +2590,7 @@ export interface components {
             /** @description cloud-init 기본 사용자 이름(예: `ubuntu`) */
             default_user?: string;
             firmware: components["schemas"]["Firmware"];
-            /** @description 항목 id(소문자·숫자·`.`·`_`·`-`, 63자까지). 아키텍처마다 같은 id를 쓴다. */
+            /** @description 항목 id(소문자·숫자·`.`·`-`, 57자까지, 소문자·숫자로 시작하고 끝남). 아키텍처마다 같은 id를 쓴다. */
             id: string;
             /**
              * Format: int64
@@ -2450,9 +2602,41 @@ export interface components {
             /** @description `qcow2` 또는 `raw` */
             source_format: components["schemas"]["SourceFormat"];
             title: string;
-            /** @description 이미지 URL(`http`·`https`) */
+            /** @description 이미지 URL(`http`·`https`, 사용자 정보 없음) */
             url: string;
             version: string;
+        };
+        /**
+         * @description 카탈로그 항목의 출처
+         * @enum {string}
+         */
+        CatalogSource: "builtin" | "custom";
+        /**
+         * @description 카탈로그 이미지를 받은 뒤 만들 템플릿 VM. 머신 타입은 항목의 아키텍처(`q35`·`virt`), 펌웨어는 항목의 것이고, 디스크는
+         *     `virtio-blk` 첫 부팅 디스크, NIC 하나, cloud-init(호스트 이름·정적 IP 없음)이다.
+         */
+        CatalogTemplate: {
+            /** @description cloud-init 기본 설정(사용자·비밀번호·SSH 키 등). 평문 비밀번호는 SHA-512 crypt로 바꿔 Task에 담는다. */
+            cloud_init?: components["schemas"]["CloudInit"];
+            /**
+             * Format: int32
+             * @default 2048
+             */
+            memory_mib: number;
+            /** @description 템플릿 VM 이름 */
+            name: string;
+            /** @description NIC 하나의 네트워크 이름 */
+            network: string;
+            /**
+             * Format: int64
+             * @description 받은 디스크를 이 크기로 늘린다(바이트, 512의 배수, 이미지 크기 이상). 없으면 이미지 크기 그대로다.
+             */
+            size_bytes?: number;
+            /**
+             * Format: int32
+             * @default 2
+             */
+            vcpus: number;
         };
         CdromMediaRequest: {
             /**
@@ -2699,12 +2883,37 @@ export interface components {
             vcpus?: number;
         };
         CloneRequest: {
+            /**
+             * @description 주어진·비지 않은 칸만 원본의 cloud-init 설정을 바꾼다. 평문 비밀번호는 SHA-512 crypt로 바꿔 Task에 담고,
+             *     `********`는 원본의 비밀번호를 그대로 둔다.
+             */
+            cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 디스크 순번별 새 크기(바이트, 늘리기만, 512의 배수). null은 그대로다. */
+            disks?: (number | null)[];
+            /**
+             * @description 연결 복제(계획 58, 템플릿에서만). 없으면 템플릿의 디스크 가운데 되는 것은 연결하고 안 되는 것은 전체 복사한다
+             *     (Task 경고). `true`면 모두 연결하고(안 되면 400), `false`면 전체 복사다.
+             */
+            linked?: boolean;
+            /** Format: int32 */
+            memory_mib?: number;
             /** @description 새 VM의 이름 */
             name: string;
+            /** @description NIC 순번별 새 네트워크 이름. null은 그대로다. */
+            nics?: (string | null)[];
+            /** @description 새 VM을 켤 노드(이름이나 id, `spec.node`). 디스크가 닿아야 한다(공유 풀이거나 그 노드의 로컬 풀). */
+            node?: string;
             /** @description 새 디스크를 둘 풀. 없으면 원본 볼륨마다 그 볼륨의 풀이다. */
             pool?: string | null;
             /** @description 복제할 스냅샷(이름이나 id). 없으면 꺼진 VM의 지금 상태에서 복제한다. */
             snapshot?: string | null;
+            /** @description 만든 뒤 켠다. 놓을 노드가 없으면 꺼진 채 만들고 Task 경고를 남긴다. */
+            start?: boolean;
+            /**
+             * Format: int32
+             * @description vCPU 수(소켓 하나에 코어로 둔다)
+             */
+            vcpus?: number;
         };
         /** @description VM의 cloud-init 설정. 비어 있는 칸은 cloud-init·배포판 기본을 따른다. */
         CloudInit: {
@@ -3722,6 +3931,16 @@ export interface components {
          * @enum {string}
          */
         Level: "standard" | "premium";
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_CatalogEntry: {
+            items: (components["schemas"]["CatalogImage"] & {
+                source: components["schemas"]["CatalogSource"];
+                /** @description 이 이미지 URL에서 받아 준비된 볼륨 이름(끝난 `volume-download` Task의 결과, 이름 순) */
+                volumes: string[];
+            })[];
+            /** Format: int64 */
+            revision: number;
+        };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_RealmView: {
             items: {
@@ -7682,6 +7901,11 @@ export interface components {
         VolumeContent: "disk" | "iso";
         /** @description `POST /volumes/download`: URL에서 이미지를 받아 볼륨을 만든다(계획 57). */
         VolumeDownloadRequest: {
+            /**
+             * @description 체크섬 파일(`SHA256SUMS`·`SHA512SUMS`·BSD `CHECKSUM` 모양)의 http·https URL(계획 58). 받기 전에 이 파일에서
+             *     이미지 URL의 파일 이름 줄을 찾아 그 해시로 확인한다. `sha256`·`sha512`와 함께 쓰지 않는다.
+             */
+            checksum_url?: string;
             /** @description 내용 종류(기본 disk). iso는 dir·nfs 풀에 raw로 둔다. */
             content?: components["schemas"]["VolumeContent"];
             /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: 블록 풀은 raw, 그 밖은 qcow2. ISO는 늘 raw) */
@@ -7690,6 +7914,8 @@ export interface components {
             pool: string;
             /** @description 받은 파일의 SHA-256(16진 64자). 있으면 다르면 실패한다. */
             sha256?: string;
+            /** @description 받은 파일의 SHA-512(16진 128자, 계획 58). `sha256`·`checksum_url`과 함께 쓰지 않는다. */
+            sha512?: string;
             /** @description 받은 파일의 형식(디스크만, 기본 raw) */
             source_format?: components["schemas"]["SourceFormat"];
             /** @description 받을 http·https URL. 작업 노드가 닿을 수 있어야 한다. */
@@ -9169,6 +9395,133 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Health"];
+                };
+            };
+        };
+    };
+    list_catalog: {
+        parameters: {
+            query?: {
+                /** @description 이 아키텍처의 항목만 */
+                arch?: "x86_64" | "aarch64";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_CatalogEntry"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_catalog_image: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogImage"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CatalogImage"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_catalog_image: {
+        parameters: {
+            query?: {
+                /** @description 이 아키텍처의 항목만 지운다. 없으면 그 id의 모든 항목이다. */
+                arch?: "x86_64" | "aarch64";
+            };
+            header?: never;
+            path: {
+                /** @description catalog image id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    download_catalog_image: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description catalog image id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogDownloadRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
         };
@@ -12158,6 +12511,68 @@ export interface operations {
             };
         };
     };
+    convert_template: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmSpec_VmStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    untemplate_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_volumes: {
         parameters: {
             query?: never;
@@ -12352,6 +12767,36 @@ export interface operations {
         };
     };
     delete_volume: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    flatten_volume: {
         parameters: {
             query?: never;
             header?: never;

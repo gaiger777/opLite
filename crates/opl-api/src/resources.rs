@@ -256,7 +256,10 @@ list_and_get!(
     "/tasks",
     "/tasks/{key}",
     "tasks",
-    |_, _, task| crate::volumes::public_task(task)
+    |state, principal, task| crate::volumes::public_task(
+        task,
+        crate::vms::writes_vms(state, principal)
+    )
 );
 
 #[utoipa::path(post, path = "/storage-pools", tag = "storage",

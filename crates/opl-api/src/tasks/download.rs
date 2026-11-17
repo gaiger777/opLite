@@ -177,17 +177,19 @@ pub(super) async fn download(
     }
 }
 
+/// 받은 볼륨을 남긴 실패의 오류: 그 볼륨으로 손수 템플릿을 만드는 길을 붙인다.
+pub(super) fn keep_hint(e: String, volume: &str) -> String {
+    format!(
+        "{e}; volume {volume:?} is ready; create the template from it with vm create and template convert"
+    )
+}
+
 /// 가져온 볼륨(Task 대상)을 초안 크기로 늘리고(더 클 때만) 그 볼륨을 디스크로 쓰는 템플릿 VM을 만든다. 실패해도 볼륨은
 /// 남기고(Task 정리가 준비된 볼륨을 지우지 않는다) 그것으로 손수 만드는 길을 알린다. 앞 시도가 이미 만든 템플릿이
 /// 있으면 할 일이 없다.
 async fn make_template(ctx: &Ctx, task: &Task, draft: &TemplateDraft) -> Result<(), String> {
     let (volume, _) = volume_and_pool(ctx, task.spec.target)?;
-    let keep = |e: String| {
-        format!(
-            "{e}; volume {:?} is ready; create the template from it with vm create and template convert",
-            volume.name
-        )
-    };
+    let keep = |e: String| keep_hint(e, &volume.name);
     if let Some(size) = draft.size_bytes.filter(|s| *s > volume.spec.size_bytes) {
         resize_volume(ctx, volume.id, size)
             .await

@@ -13,7 +13,7 @@ use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
     FAST_HA, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node, NodeSpec, PLACEMENT,
-    ha_capable,
+    TEMPLATES, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
@@ -43,10 +43,11 @@ use crate::scheduler::{
 use crate::score::{self, Scorer};
 use crate::snapshots::{
     check_no_hotplug_task, check_no_migration, check_no_revert_task, check_no_snapshot_task,
-    check_not_busy, check_not_migrating, count_snapshots,
+    check_no_untemplate_task, check_not_busy, check_not_migrating, count_snapshots,
 };
 use crate::state::AppState;
 use crate::tasks::create_task;
+use crate::volumes::{clone_names, linked_clones, template_in_use_message};
 
 /// 원하는 상태도 실제 상태도 꺼져 있다. 삭제와 노드·디스크 변경은 이때만 할 수 있다.
 pub(crate) fn is_stopped(vm: &Vm) -> bool {
@@ -89,6 +90,62 @@ fn vm_running(vm: &Vm, what: &str) -> ApiError {
             vm.name
         ),
     )
+}
+
+/// 템플릿에 할 수 없는 동작의 409 `vm_is_template`(계획 58 §3)
+pub(crate) fn vm_is_template(name: &str) -> ApiError {
+    ApiError::conflict(
+        "vm_is_template",
+        format!("VM {name:?} is a template; deploy a VM from it or convert it back"),
+    )
+}
+
+/// 템플릿이면 409 `vm_is_template`: 켜기·재시작·마이그레이션·복제(계획 55)·스냅샷 만들기·CD 넣기를 막는다.
+pub(crate) fn check_not_template(vm: &Vm) -> Result<(), ApiError> {
+    if vm.spec.template {
+        return Err(vm_is_template(&vm.name));
+    }
+    Ok(())
+}
+
+/// 템플릿 스펙의 규칙(계획 58 §3): 켤 수 없고(409 `vm_is_template`), HA·복제 대상·스냅샷 예약을 가질 수 없으며(400),
+/// 디스크가 연결 복제가 아니다(400 — 사슬은 1단). 볼륨이 있는지·준비됐는지는 [`prepare`]가 본다.
+fn check_template_spec(name: &str, spec: &VmSpec, inv: &Inventory) -> Result<(), ApiError> {
+    if spec.power == PowerState::Running {
+        return Err(vm_is_template(name));
+    }
+    for (field, set) in [
+        ("ha", spec.ha.is_some()),
+        ("replication", !spec.replication.is_empty()),
+        ("snapshot_schedule", spec.snapshot_schedule.is_some()),
+    ] {
+        if set {
+            return Err(ApiError::bad_request(format!(
+                "a template cannot have {field}; remove it first"
+            )));
+        }
+    }
+    for disk in &spec.disks {
+        if inv
+            .volumes
+            .iter()
+            .any(|v| v.name == disk.volume && v.spec.base.is_some())
+        {
+            return Err(ApiError::bad_request(format!(
+                "volume {:?} is a linked clone; flatten it before making a template",
+                disk.volume
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 템플릿 디스크의 모양(볼륨·버스·개수). 템플릿인 동안 바꿀 수 없다(형식은 볼륨에 있다).
+fn disk_layout(spec: &VmSpec) -> Vec<(&str, opl_types::vm::DiskBus)> {
+    spec.disks
+        .iter()
+        .map(|d| (d.volume.as_str(), d.bus))
+        .collect()
 }
 
 /// hard 배치 규칙 때문에 놓을 노드가 없으면 409 `placement_rule`(`details.rules`에 어긴 규칙 이름)
@@ -166,6 +223,10 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     if !spec.cdroms.is_empty() || spec.cloud_init.is_some() {
         require_feature(&state.cluster, INSTALL_MEDIA)?;
     }
+    // 템플릿 표시는 옛 노드가 풀지 못한다(계획 58).
+    if spec.template {
+        require_feature(&state.cluster, TEMPLATES)?;
+    }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate()
@@ -208,6 +269,9 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         }
     }
     check_security_groups(state, spec)?;
+    if spec.template {
+        check_template_spec(&vm.name, spec, &inv)?;
+    }
     let mut disks = BTreeSet::new();
     for disk in &spec.disks {
         if !disks.insert(&disk.volume) {
@@ -372,6 +436,23 @@ fn check_replication(state: &AppState, vm: &Vm, inv: &Inventory) -> Result<(), A
             vm.name
         )));
     }
+    // 연결 복제 디스크는 복제하지 않는다(계획 58 §9): 복제 마이그레이션 뒤 옛 원본이 기반을 계속 가리킨다.
+    for disk in &local {
+        let Some(volume) = inv.volumes.iter().find(|v| v.id == disk.volume) else {
+            continue;
+        };
+        if let Some(base) = volume.spec.base {
+            let base = inv
+                .volumes
+                .iter()
+                .find(|v| v.id == base)
+                .map_or_else(|| base.to_string(), |v| v.name.clone());
+            return Err(ApiError::bad_request(format!(
+                "volume {:?} is a linked clone of {base:?}; flatten it before enabling replication",
+                volume.name
+            )));
+        }
+    }
     for (target, node) in targets {
         for disk in &local {
             let pool = target.pool.as_ref().unwrap_or(&disk.pool);
@@ -503,15 +584,20 @@ fn hash_password(spec: &mut VmSpec, current: Option<&Vm>) -> Result<(), ApiError
         };
         *password = stored.clone();
     } else if !is_crypt_hash(password) {
-        let mut random = [0u8; 16];
-        getrandom::fill(&mut random).expect("system random source");
-        let salt: String = random
-            .iter()
-            .map(|b| char::from(CRYPT_SALT_CHARS[usize::from(*b) % CRYPT_SALT_CHARS.len()]))
-            .collect();
-        *password = sha512_crypt(password.as_bytes(), &salt);
+        *password = crypt_password(password);
     }
     Ok(())
+}
+
+/// 평문 비밀번호의 SHA-512 crypt(무작위 솔트 16자)
+pub(crate) fn crypt_password(password: &str) -> String {
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).expect("system random source");
+    let salt: String = random
+        .iter()
+        .map(|b| char::from(CRYPT_SALT_CHARS[usize::from(*b) % CRYPT_SALT_CHARS.len()]))
+        .collect();
+    sha512_crypt(password.as_bytes(), &salt)
 }
 
 /// 응답에서 cloud-init 비밀번호(해시)를 [`PASSWORD_MASK`]로 가린다(watch의 규칙 — 해시도 내보내지 않는다).
@@ -643,7 +729,7 @@ pub(crate) fn check_security_groups(state: &AppState, spec: &VmSpec) -> Result<(
 }
 
 /// 위트니스 노드면 409 `node_unavailable`. 위트니스는 VM을 돌리지 않는다.
-fn check_not_witness(node: &Node) -> Result<(), ApiError> {
+pub(crate) fn check_not_witness(node: &Node) -> Result<(), ApiError> {
     if node.spec.witness {
         return Err(ApiError::conflict(
             "node_unavailable",
@@ -791,6 +877,10 @@ fn warning_header(spec: &VmSpec) -> HeaderMap {
 /// CD-ROM 매체(`cdroms[i].iso`)는 실행 중에도 핫플러그 Task로 바꾼다(드라이브 더하기·빼기는 409 `vm_running`, CD
 /// 부팅 순서와 `cloud_init`은 다음 재시작 때 적용). `cloud_init.password`가 `********`이면 저장된 비밀번호를 그대로
 /// 둔다(받은 스펙을 고쳐 다시 보내는 길). 경고는 `POST /vms`처럼 `orbivisor-warning`이다.
+///
+/// `template`은 바꾸지 않는다(`POST`·`DELETE /vms/{key}/template`). 템플릿은 켤 수 없고(`power: running`은 409
+/// `vm_is_template`) 디스크 목록(볼륨·버스·개수)을 바꿀 수 없으며(409 `vm_is_template`) `ha`·`replication`·
+/// `snapshot_schedule`을 가질 수 없다(400). 연결 복제 디스크가 있는 VM의 복제 대상(`replication`)은 400이다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
@@ -811,8 +901,12 @@ pub async fn update_vm(
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let expected = if_match(&headers)?;
     let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
-    let (headers, vm) = write_spec(&state, &key, expected, picks, |_| {
-        Ok((req.spec.clone(), req.labels.clone()))
+    let (headers, vm) = write_spec(&state, &key, expected, picks, |current| {
+        // 템플릿 표시는 바꾸기·되돌리기 경로(`/vms/{key}/template`)로만 바꾼다. 이 필드를 모르는 옛 클라이언트의
+        // PUT이 템플릿을 보통 VM으로 만들지 않게 저장된 값을 둔다.
+        let mut spec = req.spec.clone();
+        spec.template = current.spec.template;
+        Ok((spec, req.labels.clone()))
     })
     .await?;
     Ok((headers, Json(vm)))
@@ -834,6 +928,7 @@ async fn write_spec(
         let current = lookup::<VmSpec>(&state.cluster, key)?;
         check_no_migration(state, &current)?;
         check_no_snapshot_task(state, &current)?;
+        check_no_untemplate_task(state, &current)?;
         if let Some(expected) = expected
             && expected != current.revision
         {
@@ -844,6 +939,19 @@ async fn write_spec(
             .into());
         }
         let (spec, labels) = edit(&current)?;
+        // 템플릿의 디스크 목록(볼륨·버스·개수)은 배포한 연결 복제의 기반이라 바꿀 수 없다(계획 58 §3).
+        if current.spec.template
+            && spec.template
+            && disk_layout(&spec) != disk_layout(&current.spec)
+        {
+            return Err(ApiError::conflict(
+                "vm_is_template",
+                format!(
+                    "the disks of template {:?} cannot change; convert it back to a VM first",
+                    current.name
+                ),
+            ));
+        }
         let mut next = current.clone();
         next.spec = spec;
         next.labels = labels;
@@ -948,7 +1056,7 @@ pub struct CdromMediaRequest {
 /// CD-ROM 드라이브 하나의 매체를 넣거나 뺀다: 스펙의 `cdroms[drive].iso`만 바꿔 `PUT /vms/{key}`와 같은 길로 쓴다
 /// (같은 검사, 실행 중이면 `vm-hotplug` Task와 헤더 `orbivisor-task`). 드라이브가 없으면 400, 모든 노드가
 /// `install-media`를 알아야 한다(409 `cluster_upgrading`). 지우는 중인(끝나지 않은 지우기 Task가 있는) ISO는 409
-/// `volume_in_use`다. 드라이브 더하기·빼기는 `PUT`이다(꺼진 VM).
+/// `volume_in_use`다. 드라이브 더하기·빼기는 `PUT`이다(꺼진 VM). 템플릿에 매체를 넣으면 409 `vm_is_template`이다.
 #[utoipa::path(post, path = "/vms/{key}/cdrom", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     request_body = CdromMediaRequest,
@@ -968,6 +1076,9 @@ pub async fn cdrom_media(
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     require_feature(&state.cluster, INSTALL_MEDIA)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    if req.iso.is_some() {
+        check_not_template(&vm)?;
+    }
     let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
     let drive = usize::from(req.drive);
     let (headers, vm) = write_spec(&state, &key, None, picks, |current| {
@@ -988,6 +1099,108 @@ pub async fn cdrom_media(
     };
     audit.detail(format!("vm cdrom {} drive {drive}: {what}", vm.name));
     Ok((headers, Json(vm)))
+}
+
+/// VM을 템플릿으로 바꾼다(계획 58 §3, Raft 쓰기 하나). 꺼져 있어야 하고(409 `vm_running`), 마이그레이션·스냅샷·
+/// 복제·백업 Task가 없어야 하며(409 `vm_busy`), 스냅샷이 없어야 한다(409 `vm_has_snapshots` — 템플릿의 되돌리기가
+/// 연결 복제의 기반을 바꾸면 안 된다). `ha`·`replication`·`snapshot_schedule`이 있거나 디스크가 연결 복제면 400이다.
+/// 모든 노드가 `templates`를 알아야 한다(409 `cluster_upgrading`). 이미 템플릿이면 그대로 200이다. 저장소에는
+/// 아무것도 하지 않는다(기반 스냅샷은 첫 연결 복제가 만든다).
+#[utoipa::path(post, path = "/vms/{key}/template", tag = "vms",
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
+    responses(
+        (status = 200, body = Resource<VmSpec, VmStatus>),
+        (status = "4XX", body = crate::error::ErrorBody),
+    ))]
+pub async fn convert_template(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<Vm>, ApiError> {
+    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
+    require_feature(&state.cluster, TEMPLATES)?;
+    let expected = if_match(&headers)?;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    if vm.spec.template {
+        return Ok(Json(public_vm(vm)));
+    }
+    // 마이그레이션·전원·스냅샷·복제·백업 Task가 도는 VM은 바꾸지 않는다(설계 §3).
+    check_not_busy(&state, &vm)?;
+    check_no_snapshot_task(&state, &vm)?;
+    let (_, vm) = write_spec(&state, &key, expected, false, |current| {
+        if !is_stopped(current) {
+            return Err(vm_running(current, "make a template of"));
+        }
+        let snapshots = count_snapshots(&state, current.id)?;
+        if snapshots > 0 {
+            return Err(ApiError::conflict(
+                "vm_has_snapshots",
+                format!(
+                    "VM {:?} has {snapshots} snapshot(s); delete them before making a template",
+                    current.name
+                ),
+            ));
+        }
+        let mut spec = current.spec.clone();
+        spec.template = true;
+        Ok((spec, current.labels.clone()))
+    })
+    .await?;
+    audit.detail(format!("vm template {}", vm.name));
+    Ok(Json(vm))
+}
+
+/// 템플릿을 보통 VM으로 되돌릴 Task(`vm-untemplate`)를 VM의 노드에 만든다(202, 계획 58 §3). 템플릿이 아니면 400,
+/// 연결 복제가 남았으면 409 `template_in_use`(쓰는 VM이나 붙지 않은 복제 볼륨의 이름), 앞 되돌리기 Task가 끝나지 않았으면
+/// 409 `vm_busy`, 모든 노드가 `templates`를 알아야 한다(409 `cluster_upgrading`). 되돌리기 Task가 끝날 때까지 켜기·고치기·
+/// 지우기도 409 `vm_busy`다. Task는 줄에서 기다린 뒤 다시 확인하고 디스크마다 기반 스냅샷을 푼 다음
+/// `template: false`를 쓴다.
+#[utoipa::path(delete, path = "/vms/{key}/template", tag = "vms",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn untemplate_vm(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
+    require_feature(&state.cluster, TEMPLATES)?;
+    // 그새 시작한 배포와의 엇갈림은 Task가 본다(`template: false`를 쓴 뒤 연결 복제를 다시 본다).
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    if !vm.spec.template {
+        return Err(ApiError::bad_request(format!(
+            "VM {:?} is not a template",
+            vm.name
+        )));
+    }
+    let inv = Inventory::load(&state.cluster)?;
+    let bases: Vec<Uuid> = inv
+        .volumes
+        .iter()
+        .filter(|v| vm.spec.disks.iter().any(|d| d.volume == v.name))
+        .map(|v| v.id)
+        .collect();
+    // 끝나지 않은 되돌리기가 있으면 둘째는 받지 않는다.
+    check_no_untemplate_task(&state, &vm)?;
+    let clones = linked_clones(&inv.volumes, &bases);
+    if !clones.is_empty() {
+        return Err(ApiError::conflict(
+            "template_in_use",
+            template_in_use_message(&vm.name, &clone_names(&clones, &inv.vms)),
+        ));
+    }
+    let task = create_task(
+        &state.cluster,
+        TaskOp::VmUntemplate,
+        vm.id,
+        crate::snapshots::template_node(&state, &vm),
+    )
+    .await?;
+    audit.detail(format!("vm untemplate {}", vm.name));
+    Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
 /// 이 VM의 전원 Task(시작·정지·강제 정지·재시작)가 끝나지 않았는지(켜는 중이라 곧 QEMU가 생긴다)
@@ -1215,7 +1428,8 @@ fn device_error(vm: &Vm, hw: &RunningHardware, e: hotplug::DeviceError) -> ApiEr
 }
 
 /// 꺼진 VM만 지울 수 있다. 스냅샷이 남아 있으면 409 `vm_has_snapshots`, 끝나지 않은 스냅샷·복제
-/// Task가 있으면 409 `vm_busy`(복제는 원본 VM과 그 스냅샷을 읽는다).
+/// Task가 있으면 409 `vm_busy`(복제는 원본 VM과 그 스냅샷을 읽는다). 템플릿은 먼저 VM으로 되돌린다(409
+/// `vm_is_template`).
 #[utoipa::path(delete, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1227,7 +1441,18 @@ pub async fn delete_vm(
 ) -> Result<StatusCode, ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    // 되돌리기 Task가 블록 백엔드의 기반 스냅샷을 풀어야 낡은 `opl-base`가 남지 않는다(계획 58 §3).
+    if vm.spec.template {
+        return Err(ApiError::conflict(
+            "vm_is_template",
+            format!(
+                "convert template {:?} back to a VM before deleting it",
+                vm.name
+            ),
+        ));
+    }
     check_no_migration(&state, &vm)?;
+    check_no_untemplate_task(&state, &vm)?;
     if !is_stopped(&vm) {
         return Err(vm_running(&vm, "delete"));
     }
@@ -1272,7 +1497,8 @@ pub enum StopMode {
 /// 지금 스펙에 맞추는 Task(`vm-hotplug`, 실패한 변경 다시 해 보기)다: 모든 노드가 `hotplug`를 알아야 하고(409
 /// `cluster_upgrading`) 핫플러그 기록이 있는 실행 중 VM이어야 한다(409 `vm_not_running`). 끝나지 않은 스냅샷·되돌리기·
 /// 복제·백업 Task가 있으면 409 `vm_busy`이고, 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다
-/// (409 `no_capacity`).
+/// (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
+/// `start`·`reboot`은 409 `vm_busy`다.
 #[utoipa::path(post, path = "/vms/{key}/actions/{action}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("action" = String, Path, description = "start, stop, reboot or hotplug"), ActionQuery),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1287,6 +1513,10 @@ pub async fn vm_action(
         return Err(ApiError::bad_request("mode=force applies only to stop"));
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    if matches!(action.as_str(), "start" | "reboot") {
+        check_not_template(&vm)?;
+        check_no_untemplate_task(&state, &vm)?;
+    }
     // 스냅샷 Task가 끝나지 않았으면 막는다. 시작한 스냅샷 Task는 실행기의 시간 제한으로 끝난다.
     // 강제 정지는 되돌리기만 막는다. 저장이 멈춘 만들기 중에도 VM을 끌 수 있어야 한다.
     // 마이그레이션 중에는 모두 막는다. 실패하면 원본이 계속 돌고, 시간 제한으로 끝난다.
@@ -1313,6 +1543,10 @@ pub async fn vm_action(
             let scorer = scoring.scorer();
             let _lock = state.vm_lock.lock().await;
             let vm = modify_spec(&state, id, |spec| {
+                // 검사 뒤 템플릿으로 바뀌었을 수 있다(바꾸기와 엇갈림). 쓰기 직전의 스펙으로 다시 본다.
+                if spec.template {
+                    return Err(vm_is_template(&vm.name));
+                }
                 // 배치 규칙은 VM의 이름·레이블로 고른다.
                 let mut me = vm.clone();
                 me.spec = spec.clone();
@@ -1530,7 +1764,7 @@ pub(crate) enum RuleCheck {
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
 /// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
 /// ISO가 들어 있으면 409 `cdrom_local`이다(매체를 빼거나 공유 풀의 ISO를 쓴다). 실행 중 cloud-init을 바꿨으면(호스트
-/// 이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다.
+/// 이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다. 템플릿은 409 `vm_is_template`이다.
 #[utoipa::path(post, path = "/vms/{key}/migrate", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     request_body = MigrateRequest,
@@ -1571,6 +1805,7 @@ pub struct VmReplicateRequest {
 /// 만든다(202). 결과는 `GET /vms/{key}`의 `status.replication`에 남는다. 대상이 둘 이상이면 `node`가 있어야 하고(400),
 /// `node`가 VM의 복제 대상이 아니면 400, 모든 노드가 복제를 알아야 하고(409 `cluster_upgrading`), VM이 실행 중이어야
 /// 하며(409 `vm_not_running`, 옮기는 중이면 409 `vm_busy`), 같은 대상의 복제 Task가 끝나지 않았으면 409 `vm_busy`다.
+/// 템플릿은 409 `vm_is_template`이다.
 #[utoipa::path(post, path = "/vms/{key}/replicate", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     request_body = VmReplicateRequest,
@@ -1583,6 +1818,7 @@ pub async fn replicate_vm(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    check_not_template(&vm)?;
     let node = match &req.node {
         Some(node) => lookup::<NodeSpec>(&state.cluster, node)?.id,
         None => match vm.spec.replication.as_slice() {
@@ -1620,6 +1856,7 @@ pub(crate) async fn start_migration(
     // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
     let _lock = state.vm_lock.lock().await;
     let vm = lookup::<VmSpec>(&state.cluster, &vm.to_string())?;
+    check_not_template(&vm)?;
     let target = lookup::<NodeSpec>(&state.cluster, &target.to_string())?;
     if let Some(source) = source
         && vm.spec.node != Some(source)
@@ -1805,8 +2042,8 @@ pub(crate) async fn start_migration(
     Ok((task, broken))
 }
 
-/// VM 디스크의 크기 늘리기 Task가 끝나지 않았으면 409 `vm_busy`. 실행 중인 VM의 디스크는 QMP로
-/// 늘리므로 원본 QEMU가 사라지면 안 된다.
+/// VM 디스크의 크기 늘리기·평탄화 Task가 끝나지 않았으면 409 `vm_busy`. 실행 중인 VM의 디스크는 QMP로
+/// 늘리므로 원본 QEMU가 사라지면 안 되고, 평탄화하는 디스크는 그동안 쓰이면 안 된다(계획 58).
 fn check_no_resize_task(state: &AppState, inv: &Inventory, vm: &Vm) -> Result<(), ApiError> {
     let disks: BTreeSet<Uuid> = inv
         .volumes
@@ -1815,16 +2052,19 @@ fn check_no_resize_task(state: &AppState, inv: &Inventory, vm: &Vm) -> Result<()
         .map(|v| v.id)
         .collect();
     let (_, tasks) = state.cluster.list::<TaskSpec>()?;
-    let busy = tasks.iter().any(|t| {
-        disks.contains(&t.spec.target)
-            && !t.status.state.is_finished()
-            && matches!(t.spec.op, TaskOp::VolumeResize { .. })
-    });
-    if busy {
+    let doing = tasks
+        .iter()
+        .filter(|t| disks.contains(&t.spec.target) && !t.status.state.is_finished())
+        .find_map(|t| match t.spec.op {
+            TaskOp::VolumeResize { .. } => Some("resized"),
+            TaskOp::VolumeFlatten => Some("flattened"),
+            _ => None,
+        });
+    if let Some(doing) = doing {
         return Err(ApiError::conflict(
             "vm_busy",
             format!(
-                "a disk of VM {:?} is being resized; try again when the task has finished",
+                "a disk of VM {:?} is being {doing}; try again when the task has finished",
                 vm.name
             ),
         ));

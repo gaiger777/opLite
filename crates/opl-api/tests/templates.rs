@@ -428,6 +428,162 @@ async fn deleting_a_base_fails_while_linked_clones_exist() {
     assert!(storage.deleted().is_empty());
 
     succeeded(&run(&env, &admin, TaskOp::VolumeDelete, clone).await);
+    // 그새 템플릿이 된 VM의 디스크도 지우지 않는다.
+    let tmpl = vm_with_disks(&admin, "tmpl", &["base"]).await;
+    make_template(&env, tmpl, true).await;
+    let task = run(&env, &admin, TaskOp::VolumeDelete, base).await;
+    failed_with(&task, "volume \"base\" is a disk of template \"tmpl\"");
+    assert!(storage.deleted().iter().all(|v| *v != base));
+    make_template(&env, tmpl, false).await;
+    let (status, _) = admin.delete("/vms/tmpl").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     succeeded(&run(&env, &admin, TaskOp::VolumeDelete, base).await);
     assert!(get_volume(&env, "base").is_none());
+}
+
+/// Task를 저장소에 바로 만든다(기다리지 않는다).
+async fn start(env: &Env, op: TaskOp, target: Uuid) -> Value {
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op,
+            target,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+    json!({ "id": task.id })
+}
+
+/// 되돌리기와 다른 노드의 배포가 엇갈림: 되돌리기가 연결 복제를 확인한 뒤(기반을 푸는 동안) 배포가 복제 볼륨을 기록하면,
+/// 되돌리기는 `template: false`를 쓴 뒤 다시 보고 그 복제를 찾아 템플릿 표시를 되돌리고 실패한다.
+#[tokio::test]
+async fn untemplate_backs_off_when_a_deploy_records_a_clone_meanwhile() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "local").await;
+    let root = volume(&env, "root", "local", ImageFormat::Raw, None).await;
+    let storage = fake_storage(&mut env, &[root]).await;
+    let tmpl = vm_with_disks(&admin, "tmpl", &["root"]).await;
+    make_template(&env, tmpl, true).await;
+
+    storage.pause();
+    let task = start(&env, TaskOp::VmUntemplate, tmpl).await;
+    storage.reached().await;
+    assert_eq!(storage.calls(), [("release_base", root)]);
+    // 다른 노드의 배포 Task가 지금 기록한 복제 볼륨
+    volume(&env, "web-1-root", "local", ImageFormat::Qcow2, Some(root)).await;
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    failed_with(
+        &task,
+        "template \"tmpl\" has 1 linked clone(s) (web-1-root); delete or flatten them first",
+    );
+    assert!(get_vm(&env, "tmpl").unwrap().spec.template);
+}
+
+/// 배포와 다른 노드의 되돌리기가 엇갈림: 배포가 템플릿을 확인한 뒤 되돌리기가 `template: false`를 쓰면, 배포는 복제 볼륨을
+/// 기록한 뒤 다시 보고 실패하며 만든 볼륨을 지운다(VM은 만들지 않는다).
+#[tokio::test]
+async fn a_deploy_backs_off_when_the_template_is_converted_back_meanwhile() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "local").await;
+    let root = volume(&env, "root", "local", ImageFormat::Raw, None).await;
+    let data = volume(&env, "data", "local", ImageFormat::Raw, None).await;
+    let storage = fake_storage(&mut env, &[root, data]).await;
+    let tmpl = vm_with_disks(&admin, "tmpl", &["root", "data"]).await;
+    make_template(&env, tmpl, true).await;
+
+    storage.pause();
+    let task = start(&env, deploy("web-1", None, None), tmpl).await;
+    // 첫 디스크를 연결하는 동안 다른 노드의 되돌리기가 표시를 지웠다.
+    storage.reached().await;
+    make_template(&env, tmpl, false).await;
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    failed_with(&task, "template \"tmpl\" was converted back to a VM");
+    assert!(get_vm(&env, "web-1").is_none());
+    for name in ["web-1-root", "web-1-data"] {
+        assert!(get_volume(&env, name).is_none(), "{name} was left behind");
+    }
+}
+
+/// 이미 템플릿 표시가 지워진 VM의 되돌리기(같은 VM의 다른 되돌리기가 먼저 마쳤거나 다시 하는 Task)도 연결 복제를 다시
+/// 본다. 남았으면 실패하지만 이 Task가 쓴 스펙을 모르므로 표시를 되돌리지 않는다(다른 쓰기를 덮지 않는다).
+#[tokio::test]
+async fn untemplate_of_a_converted_vm_still_checks_the_clones() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "local").await;
+    let root = volume(&env, "root", "local", ImageFormat::Raw, None).await;
+    let clone = volume(&env, "web-1-root", "local", ImageFormat::Qcow2, Some(root)).await;
+    let storage = fake_storage(&mut env, &[root, clone]).await;
+    let tmpl = vm_with_disks(&admin, "tmpl", &["root"]).await;
+
+    let task = run(&env, &admin, TaskOp::VmUntemplate, tmpl).await;
+    failed_with(
+        &task,
+        "template \"tmpl\" has 1 linked clone(s) (web-1-root); delete or flatten them first; \
+         VM \"tmpl\" was left as a regular VM because it may have changed meanwhile — make it a template again",
+    );
+    assert!(!get_vm(&env, "tmpl").unwrap().spec.template);
+    assert!(storage.calls().is_empty());
+}
+
+/// 재시작으로 끊긴 되돌리기: 표시를 지운 뒤 끊겼으면 정리가 연결 복제를 다시 보고 오류에 남긴다.
+#[tokio::test]
+async fn an_interrupted_untemplate_reports_remaining_clones() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "local").await;
+    let root = volume(&env, "root", "local", ImageFormat::Raw, None).await;
+    let clone = volume(&env, "web-1-root", "local", ImageFormat::Qcow2, Some(root)).await;
+    fake_storage(&mut env, &[root, clone]).await;
+    let tmpl = vm_with_disks(&admin, "tmpl", &["root"]).await;
+
+    env.stop_runner().await;
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VmUntemplate,
+            target: tmpl,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    task.status.state = opl_types::task::TaskState::Running;
+    env.cluster.create(&task).await.unwrap();
+    env.start_runner().await;
+    let task = admin.wait_task(&json!({ "id": task.id })).await;
+    failed_with(
+        &task,
+        "interrupted: orbivisord restarted while the task was running; \
+         template \"tmpl\" has 1 linked clone(s) (web-1-root)",
+    );
+    assert!(!get_vm(&env, "tmpl").unwrap().spec.template);
+}
+
+/// 로컬 풀 볼륨이 있던 노드가 클러스터에서 빠졌거나 풀이 없어진 템플릿 디스크는 기반을 풀지 않고 되돌린다(풀 것이 없다).
+#[tokio::test]
+async fn untemplate_skips_disks_whose_node_or_pool_is_gone() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    dir_pool(&env, "local").await;
+    let root = volume(&env, "root", "local", ImageFormat::Raw, None).await;
+    let data = volume(&env, "data", "local", ImageFormat::Raw, None).await;
+    let storage = fake_storage(&mut env, &[root, data]).await;
+    let tmpl = vm_with_disks(&admin, "tmpl", &["root", "data"]).await;
+    make_template(&env, tmpl, true).await;
+    let mut gone = env.cluster.get::<VolumeSpec>(root).unwrap().unwrap();
+    gone.status.node = Some(Uuid::now_v7());
+    env.cluster
+        .update_status::<VolumeSpec>(root, &gone.status)
+        .await
+        .unwrap();
+
+    succeeded(&run(&env, &admin, TaskOp::VmUntemplate, tmpl).await);
+    assert!(!get_vm(&env, "tmpl").unwrap().spec.template);
+    assert_eq!(storage.calls(), [("release_base", data)]);
 }

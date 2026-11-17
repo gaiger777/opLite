@@ -793,3 +793,57 @@ async fn a_failed_template_keeps_the_downloaded_volume() {
     assert_eq!(admin.get("/volumes/dropped").await.0, StatusCode::NOT_FOUND);
     assert_eq!(admin.get("/vms/other").await.0, StatusCode::NOT_FOUND);
 }
+
+/// 가져오기를 마친 뒤(볼륨 Ready) 재시작으로 끊긴 받기 → 템플릿은 볼륨을 남기고, 오류에 손수 템플릿을 만드는 길을 붙인다.
+#[tokio::test]
+async fn an_interrupted_download_to_a_template_tells_how_to_finish() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, base) = setup(&env, &admin).await;
+    let mut volume = Resource::new(
+        "kept",
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 1 << 20,
+            format: ImageFormat::Qcow2,
+            content: Default::default(),
+            base: None,
+        },
+    );
+    env.cluster.create(&volume).await.unwrap();
+    volume.status.phase = opl_types::storage::VolumePhase::Ready;
+    volume.status.node = Some(env.node);
+    env.cluster
+        .update_status::<VolumeSpec>(volume.id, &volume.status)
+        .await
+        .unwrap();
+
+    env.stop_runner().await;
+    let op = disk_download(
+        format!("{base}/disk.qcow2"),
+        None,
+        None,
+        Some(draft("tmpl", None)),
+    );
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op,
+            target: volume.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    task.status.state = opl_types::task::TaskState::Running;
+    env.cluster.create(&task).await.unwrap();
+    env.start_runner().await;
+    let task = admin.wait_task(&json!({ "id": task.id })).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(
+        task["status"]["error"],
+        "interrupted: orbivisord restarted while the task was running; volume \"kept\" is ready; \
+         create the template from it with vm create and template convert"
+    );
+    let (_, volume) = admin.get("/volumes/kept").await;
+    assert_eq!(volume["status"]["phase"], "ready", "{volume}");
+}

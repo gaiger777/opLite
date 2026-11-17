@@ -24,6 +24,7 @@ mod ha_checks;
 mod ha_groups;
 mod ha_health;
 pub mod health;
+mod images;
 mod incoming;
 mod janitor;
 pub mod ldap;
@@ -247,6 +248,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vms::migrate_vm))
         .routes(routes!(vms::cdrom_media))
         .routes(routes!(vms::replicate_vm))
+        .routes(routes!(vms::convert_template, vms::untemplate_vm))
         .routes(routes!(metrics::get_vm_metrics))
         .routes(routes!(snapshots::list_snapshots))
         .routes(routes!(
@@ -284,6 +286,10 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(volumes::download_volume))
         .routes(routes!(r::get_volume, volumes::delete_volume))
         .routes(routes!(volumes::resize_volume))
+        .routes(routes!(volumes::flatten_volume))
+        .routes(routes!(images::list_catalog, images::add_catalog_image))
+        .routes(routes!(images::remove_catalog_image))
+        .routes(routes!(images::download_catalog_image))
         .routes(routes!(console::console))
         .routes(routes!(watch::watch))
         .routes(routes!(audit::list_audit))

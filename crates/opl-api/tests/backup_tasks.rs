@@ -1269,6 +1269,31 @@ async fn stopped_vm_backups_are_full_and_leave_their_bitmap_on_qcow2_disks() {
     assert!(env.hv.incremental_backups().is_empty());
 }
 
+/// 템플릿(계획 58)의 백업은 디스크에 비트맵을 두지 않는다: 템플릿 디스크는 연결 복제의 backing 파일이라 바뀌면 안 된다.
+#[tokio::test]
+async fn template_backups_leave_no_bitmap_on_the_base() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, root, _) = setup(&env, &admin).await;
+    let (status, body) = admin.post("/vms/web/template", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let before = std::fs::read(&root).unwrap();
+    let task = wait(
+        &admin,
+        admin
+            .post("/vms/web/backups", json!({ "pool": "bk", "name": "t1" }))
+            .await,
+    )
+    .await;
+    succeeded(&task);
+    let bitmaps = &info(&root)["format-specific"]["data"]["bitmaps"];
+    assert!(bitmaps.as_array().is_none_or(|b| b.is_empty()), "{bitmaps}");
+    assert!(
+        std::fs::read(&root).unwrap() == before,
+        "the base qcow2 changed"
+    );
+}
+
 /// 증분 백업을 아는 온라인인 다른 노드(실행기 없음)
 async fn current_node(env: &Env, name: &str) -> Uuid {
     let id = other_node(env, name).await;

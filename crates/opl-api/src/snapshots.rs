@@ -7,28 +7,34 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::cloud_init::{CloudInit, PASSWORD_MASK, is_crypt_hash};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
-use opl_types::node::HOTPLUG;
+use opl_types::node::{HOTPLUG, NodeSpec, TEMPLATES};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{
-    PoolBackend, StoragePool, StoragePoolSpec, VolumePhase, VolumeSpec, is_shared,
-    pool_kind_supports_snapshots,
+    PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
+    pool_kind_supports_snapshots, pool_usable_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
+use opl_types::template::{CloneOverrides, apply_overrides, grown_disks};
 use opl_types::vm::{PowerState, RunningHardware, Vm, VmPhase, VmSpec};
 use serde::Deserialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::audit::AuditNote;
 use crate::auth::{Action, Principal};
-use crate::cluster::missing_feature;
+use crate::cluster::{missing_feature, require_feature};
 use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, lookup};
 use crate::score::Scorer;
 use crate::state::AppState;
-use crate::tasks::create_task;
-use crate::vms::{check_security_groups, is_stopped, prepare};
+use crate::tasks::{LINKED_ONLY_FROM_TEMPLATES, create_task, unlinkable};
+use crate::vms::{
+    check_node_arch, check_not_template, check_not_witness, check_security_groups, crypt_password,
+    is_stopped, prepare,
+};
 use crate::volumes::{check_pool_on, usable_node};
 
 /// 설명의 최대 글자 수
@@ -55,6 +61,50 @@ pub struct CloneRequest {
     pub snapshot: Option<String>,
     /// 새 디스크를 둘 풀. 없으면 원본 볼륨마다 그 볼륨의 풀이다.
     pub pool: Option<String>,
+    /// 연결 복제(계획 58, 템플릿에서만). 없으면 템플릿의 디스크 가운데 되는 것은 연결하고 안 되는 것은 전체 복사한다
+    /// (Task 경고). `true`면 모두 연결하고(안 되면 400), `false`면 전체 복사다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub linked: Option<bool>,
+    /// 새 VM을 켤 노드(이름이나 id, `spec.node`). 디스크가 닿아야 한다(공유 풀이거나 그 노드의 로컬 풀).
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub node: Option<String>,
+    /// vCPU 수(소켓 하나에 코어로 둔다)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub vcpus: Option<u16>,
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub memory_mib: Option<u32>,
+    /// NIC 순번별 새 네트워크 이름. null은 그대로다.
+    #[serde(default)]
+    pub nics: Vec<Option<String>>,
+    /// 디스크 순번별 새 크기(바이트, 늘리기만, 512의 배수). null은 그대로다.
+    #[serde(default)]
+    pub disks: Vec<Option<u64>>,
+    /// 주어진·비지 않은 칸만 원본의 cloud-init 설정을 바꾼다. 평문 비밀번호는 SHA-512 crypt로 바꿔 Task에 담고,
+    /// `********`는 원본의 비밀번호를 그대로 둔다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cloud_init: Option<CloudInit>,
+    /// 만든 뒤 켠다. 놓을 노드가 없으면 꺼진 채 만들고 Task 경고를 남긴다.
+    #[serde(default)]
+    pub start: bool,
+}
+
+impl CloneRequest {
+    /// 계획 58의 새 칸(연결·덮어쓰기)을 쓰는지
+    fn deploys(&self) -> bool {
+        self.linked.is_some()
+            || self.node.is_some()
+            || self.vcpus.is_some()
+            || self.memory_mib.is_some()
+            || !self.nics.is_empty()
+            || !self.disks.is_empty()
+            || self.cloud_init.is_some()
+            || self.start
+    }
 }
 
 /// VM의 디스크 작업을 할 노드: 다음에 돌 노드(`spec.node`), 지금(또는 마지막으로) 돈 노드
@@ -78,6 +128,30 @@ pub(crate) fn vm_placement(cluster: &Cluster, prefer: Option<Uuid>, vm: &Vm) -> 
 /// 스냅샷 Task를 실행할 노드: [`vm_placement`], 없으면 요청을 받은 이 노드(설계 §3).
 pub(crate) fn vm_node(state: &AppState, vm: &Vm) -> Uuid {
     vm_placement(&state.cluster, Some(state.node), vm).unwrap_or(state.node)
+}
+
+/// 템플릿의 배포·되돌리기 Task를 실행할 노드: 요청을 받은 노드와 상관없이 [`vm_placement`](공유 풀이면 풀을 쓸 수
+/// 있는 온라인 노드 가운데 id가 가장 작은 노드)다. 두 Task가 보통 같은 노드의 같은 줄에 서게 한다(엇갈림은 Task가 쓰고
+/// 다시 보아 막는다). 템플릿은 켜지 않으므로 `spec.node`·`status.node`는 지난 기록일 뿐이다: 그 노드가 클러스터에서
+/// 빠졌거나 오프라인이면 건너뛰고 디스크로 정한다(공유 풀은 쓸 수 있는 노드, 로컬 풀은 볼륨이 있는 노드). 볼륨이 있던
+/// 노드도 빠졌으면 요청을 받은 이 노드다. 템플릿이 아니면 [`vm_node`]다.
+pub(crate) fn template_node(state: &AppState, vm: &Vm) -> Uuid {
+    if !vm.spec.template {
+        return vm_node(state, vm);
+    }
+    let node = |id: &Uuid| state.cluster.get::<NodeSpec>(*id).ok().flatten();
+    let mut placed = vm.clone();
+    placed.spec.node = vm
+        .spec
+        .node
+        .filter(|n| node(n).is_some_and(|n| n.status.online));
+    placed.status.node = vm
+        .status
+        .node
+        .filter(|n| node(n).is_some_and(|n| n.status.online));
+    vm_placement(&state.cluster, None, &placed)
+        .filter(|n| node(n).is_some())
+        .unwrap_or(state.node)
 }
 
 /// 시작·정지 중인 VM은 스냅샷 작업을 받지 않는다: phase가 Starting·Stopping이거나, 원하는 전원
@@ -146,6 +220,14 @@ pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), Ap
             )
         },
     )
+}
+
+/// 이 VM의 템플릿 되돌리기 Task(`vm-untemplate`)가 끝나지 않았으면 409 `vm_busy`. 되돌리기는 표시를 지운 뒤 연결 복제가
+/// 그새 생겼으면 표시를 되돌리므로, 그사이 켜거나 디스크를 바꾸거나 지우면 템플릿이 아닌 기반을 쓰는 연결 복제가 남는다.
+pub(crate) fn check_no_untemplate_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_no_task(state, vm, "being converted back to a VM", |op| {
+        *op == TaskOp::VmUntemplate
+    })
 }
 
 /// 실행 중인 VM의 메모리를 켤 때 모양 그대로 담을 수 있는지: 실행 중에 바꾼 하드웨어·보류가 없고
@@ -509,6 +591,8 @@ pub(crate) async fn start_create(
     memory: Option<bool>,
     scheduled: bool,
 ) -> Result<Task, ApiError> {
+    // 템플릿은 스냅샷이 없다(되돌리기가 연결 복제의 기반을 바꾼다).
+    check_not_template(vm)?;
     // 복제본은 활성 층만 담아 승격·마이그레이션 뒤 스냅샷 기록이 매달린다.
     if !vm.spec.replication.is_empty() {
         return Err(ApiError::conflict(
@@ -637,6 +721,8 @@ pub async fn revert_snapshot(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    // 템플릿에는 스냅샷이 없지만(바꾸기가 막음) 되돌리기가 연결 복제의 기반을 바꾸지 않게 한 번 더 막는다.
+    check_not_template(&vm)?;
     check_not_busy(&state, &vm)?;
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
@@ -716,6 +802,12 @@ pub(crate) async fn start_delete(
 /// VM을 `name`으로 복제할 Task를 돌려준다(202). 원본은 `ready` 스냅샷이나 꺼진 VM의 지금 상태다
 /// (실행 중인데 스냅샷이 없으면 409 `vm_running`). 원본 스펙의 볼륨이 모두 있어야 하고, `pool`은 Task
 /// 노드에서 쓸 수 있어야 한다. Task는 원본 VM을 대상으로 그 VM의 디스크 노드에서 돈다.
+///
+/// 템플릿에서 배포(계획 58 §6): 템플릿이면 디스크를 기반과 같은 풀에 연결 복제로 만든다(`linked`). `linked: true`는
+/// 템플릿의 지금 상태에서만이고(400) 디스크마다 연결할 수 있어야 한다(400 `disk0: …` — 다른 풀, 연결 복제를 못 하는
+/// 백엔드). `node`·`vcpus`·`memory_mib`·`nics`·`disks`·`cloud_init`·`start`는 원본 스펙을 바꿔 VM 만들기와 같은 검사를
+/// 한다(400 — 디스크 줄이기, 없는 네트워크, 디스크가 닿지 않는 노드, 맞지 않는 아키텍처). 새 칸은 모든 노드가
+/// `templates`를 알아야 한다(409 `cluster_upgrading`). 응답 Task의 cloud-init 비밀번호는 가린다.
 #[utoipa::path(post, path = "/vms/{key}/clone", tag = "vms",
     params(("key" = String, Path, description = "VM id or name")),
     request_body = CloneRequest,
@@ -723,11 +815,16 @@ pub(crate) async fn start_delete(
 pub async fn clone_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: AuditNote,
     Path(key): Path<String>,
     Json(req): Json<CloneRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    // 새 칸은 옛 노드가 풀지 못한다(계획 58). 기능 검사는 검증보다 먼저다.
+    if req.deploys() {
+        require_feature(&state.cluster, TEMPLATES)?;
+    }
     check_name(&req.name)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     // 이름이 그새 쓰이면 Task가 VM을 만들 때 실패한다.
@@ -755,31 +852,55 @@ pub async fn clone_vm(
         }
         None => (None, vm.spec.clone()),
     };
-    let node = vm_node(&state, &vm);
-    if let Some(name) = &req.pool {
-        let pool = state
-            .cluster
-            .get_by_name::<StoragePoolSpec>(name)?
-            .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))?;
-        check_pool_on(&state, &pool, node, || {
-            format!(
-                "storage pool {name:?} is not available on the node holding VM {:?}",
-                vm.name
-            )
-        })?;
+    if req.linked == Some(true) && (!vm.spec.template || snapshot.is_some()) {
+        return Err(ApiError::bad_request(LINKED_ONLY_FROM_TEMPLATES));
     }
+    let node = template_node(&state, &vm);
+    let target = match &req.pool {
+        Some(name) => {
+            let pool = state
+                .cluster
+                .get_by_name::<StoragePoolSpec>(name)?
+                .ok_or_else(|| ApiError::bad_request(format!("storage pool {name:?} not found")))?;
+            check_pool_on(&state, &pool, node, || {
+                format!(
+                    "storage pool {name:?} is not available on the node holding VM {:?}",
+                    vm.name
+                )
+            })?;
+            Some(pool)
+        }
+        None => None,
+    };
+    let mut disks = Vec::with_capacity(spec.disks.len());
     for disk in &spec.disks {
-        if state
-            .cluster
-            .get_by_name::<VolumeSpec>(&disk.volume)?
-            .is_none()
-        {
+        let Some(volume) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? else {
             return Err(ApiError::bad_request(format!(
                 "volume {:?} not found",
                 disk.volume
             )));
+        };
+        let pool = state
+            .cluster
+            .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("storage pool {:?} not found", volume.spec.pool))
+            })?;
+        disks.push((volume, pool));
+    }
+    // 모두 연결하라고 했으면 디스크마다 될 수 있어야 한다(Task가 줄에서 기다린 뒤 다시 본다).
+    if req.linked == Some(true) {
+        for (i, (volume, pool)) in disks.iter().enumerate() {
+            if let Some(reason) = unlinkable(i, volume, pool, target.as_ref().unwrap_or(pool)) {
+                return Err(ApiError::bad_request(reason));
+            }
         }
     }
+    let overrides = overrides(&state, &vm, &spec, &req, &disks, target.as_ref(), node)?;
+    let spec = match &overrides {
+        Some(ov) => apply_overrides(&spec, ov).map_err(|e| ApiError::bad_request(e.to_string()))?,
+        None => spec,
+    };
     // 새 VM은 원본 스펙의 NIC를 그대로 가진다(VM 만들기와 같은 검사).
     for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {
         if state
@@ -794,15 +915,108 @@ pub async fn clone_vm(
         }
     }
     check_security_groups(&state, &spec)?;
+    let how = match (vm.spec.template && snapshot.is_none(), req.linked) {
+        (true, Some(false)) => " (full)",
+        (true, _) => " (linked)",
+        (false, _) => "",
+    };
+    let detail = format!("vm clone {} -> {}{how}", vm.name, req.name);
     let op = TaskOp::VmClone {
         name: req.name,
         snapshot,
         pool: req.pool,
-        linked: None,
-        overrides: None,
+        linked: req.linked,
+        overrides: overrides.map(Box::new),
     };
-    let task = create_task(&state.cluster, op, vm.id, node).await?;
+    let mut task = create_task(&state.cluster, op, vm.id, node).await?;
+    // 요청한 주체(VM 쓰기 권한)가 준 값이다.
+    crate::volumes::public_task(&mut task, true);
+    audit.detail(detail);
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 원본 스펙 `spec`에 적용할 배포 요청의 덮어쓰기(계획 58 §6). 바꾸는 것이 없으면 `None`(계획 57과 같은 Task). `node`는 있어야 하고(400) 위트니스가
+/// 아니며(409 `node_unavailable`) 새 디스크가 닿아야 한다: 공유 풀이면 그 노드에서 쓸 수 있고, 로컬 풀이면 Task
+/// 노드(`task_node`, 복제 볼륨을 만드는 노드)여야 한다(400). 디스크 크기는 원본보다 작으면(400) 안 되고 512의
+/// 배수다. cloud-init 평문 비밀번호는 SHA-512 crypt로 바꾸고 `********`는 원본 것을 그대로 둔다(칸을 뺀다).
+fn overrides(
+    state: &AppState,
+    vm: &Vm,
+    spec: &VmSpec,
+    req: &CloneRequest,
+    disks: &[(Volume, StoragePool)],
+    target: Option<&StoragePool>,
+    task_node: Uuid,
+) -> Result<Option<CloneOverrides>, ApiError> {
+    let node = match &req.node {
+        Some(key) => {
+            let found = match Uuid::try_parse(key) {
+                Ok(id) => state.cluster.get::<NodeSpec>(id)?,
+                Err(_) => state.cluster.get_by_name::<NodeSpec>(key)?,
+            };
+            Some(found.ok_or_else(|| ApiError::bad_request(format!("node {key:?} not found")))?)
+        }
+        None => None,
+    };
+    let mut cloud_init = req.cloud_init.clone();
+    if let Some(ci) = cloud_init.as_mut() {
+        match ci.password.as_deref() {
+            Some(PASSWORD_MASK) => ci.password = None,
+            Some(p) if !is_crypt_hash(p) => ci.password = Some(crypt_password(p)),
+            _ => {}
+        }
+    }
+    let ov = CloneOverrides {
+        node: node.as_ref().map(|n| n.id),
+        vcpus: req.vcpus,
+        memory_mib: req.memory_mib,
+        nics: req.nics.clone(),
+        disks: req.disks.clone(),
+        cloud_init,
+        start: req.start,
+    };
+    if ov.is_empty() {
+        return Ok(None);
+    }
+    if let Some(size) = ov.disks.iter().flatten().find(|s| *s % 512 != 0) {
+        return Err(ApiError::bad_request(format!(
+            "disks: {size} bytes is not a multiple of 512"
+        )));
+    }
+    let sizes: Vec<u64> = disks.iter().map(|(v, _)| v.spec.size_bytes).collect();
+    grown_disks(&ov, &sizes).map_err(|e| ApiError::bad_request(e.to_string()))?;
+    if let Some(node) = &node {
+        check_not_witness(node)?;
+        let what = if vm.spec.template { "template" } else { "VM" };
+        for (_, source) in disks {
+            let pool = target.unwrap_or(source);
+            let reaches = if is_shared(pool) {
+                pool_usable_on(pool, node)
+            } else {
+                node.id == task_node
+            };
+            if reaches {
+                continue;
+            }
+            let mut message = format!(
+                "node {:?} cannot reach pool {:?} of {what} {:?}",
+                node.name, pool.name, vm.name
+            );
+            if !is_shared(pool)
+                && let Some(here) = state.cluster.get::<NodeSpec>(task_node)?
+            {
+                message.push_str(&format!(
+                    "; deploy on node {:?} and migrate the VM",
+                    here.name
+                ));
+            }
+            return Err(ApiError::bad_request(message));
+        }
+        let applied =
+            apply_overrides(spec, &ov).map_err(|e| ApiError::bad_request(e.to_string()))?;
+        check_node_arch(node, &applied)?;
+    }
+    Ok(Some(ov))
 }
 
 /// VM의 스냅샷 수. VM 삭제를 막는 데 쓴다.

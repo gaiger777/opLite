@@ -9,7 +9,8 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{INSTALL_MEDIA, NodeSpec};
+use opl_types::cloud_init::PASSWORD_MASK;
+use opl_types::node::{INSTALL_MEDIA, NodeSpec, TEMPLATES};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotSpec;
@@ -29,12 +30,12 @@ use crate::auth::{Action, Principal};
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, check_name, lookup};
-use crate::vms::{vm_uses_volume, volume_in_use};
+use crate::vms::{is_stopped, vm_uses_volume, volume_in_use};
 
 /// `/volumes/import`·`/volumes/download` 경로와 겹치므로 볼륨 이름으로 쓸 수 없다.
 const RESERVED_NAMES: [&str; 2] = ["import", "download"];
 
-fn check_volume_name(name: &str) -> Result<(), ApiError> {
+pub(crate) fn check_volume_name(name: &str) -> Result<(), ApiError> {
     check_name(name)?;
     if RESERVED_NAMES.contains(&name) {
         return Err(ApiError::bad_request(format!(
@@ -43,7 +44,7 @@ fn check_volume_name(name: &str) -> Result<(), ApiError> {
     }
     Ok(())
 }
-use crate::snapshots::{check_not_busy, vm_placement};
+use crate::snapshots::{check_no_snapshot_task, check_not_busy, count_snapshots, vm_placement};
 use crate::state::AppState;
 use crate::tasks::create_task;
 
@@ -86,7 +87,7 @@ pub(crate) fn usable_node(
 /// 볼륨 파일 작업을 실행할 노드. 공유가 아닌 풀은 파일이 있는 노드(볼륨을 만든 노드)이고, 공유
 /// 풀은 [`pool_node`]의 규칙이다. 풀이 없어졌거나 파일이 있던 노드가 클러스터에서 빠졌으면 이
 /// 노드다(파일이 없으니 리소스만 지운다).
-fn volume_node(state: &AppState, volume: &Volume) -> Result<Uuid, ApiError> {
+pub(crate) fn volume_node(state: &AppState, volume: &Volume) -> Result<Uuid, ApiError> {
     match state
         .cluster
         .get_by_name::<StoragePoolSpec>(&volume.spec.pool)?
@@ -139,7 +140,7 @@ pub(crate) fn check_pool_on(
     Ok(())
 }
 
-fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
+pub(crate) fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
     state
         .cluster
         .get_by_name::<StoragePoolSpec>(name)?
@@ -159,7 +160,7 @@ pub(crate) fn block_pool_kind(pool: &StoragePool) -> Option<&'static str> {
 }
 
 /// 풀이 `format` 볼륨을 담을 수 있는지. 블록 풀(LVM-thin, ZFS, RBD, 공유 LVM)은 raw만 담는다.
-fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiError> {
+pub(crate) fn check_pool_format(pool: &StoragePool, format: ImageFormat) -> Result<(), ApiError> {
     let Some(kind) = block_pool_kind(pool) else {
         return Ok(());
     };
@@ -221,6 +222,13 @@ pub async fn create_volume(
     }
     if req.spec.size_bytes == 0 {
         return Err(ApiError::bad_request("size_bytes must be greater than 0"));
+    }
+    // 연결 복제(계획 58)는 배포 Task만 만든다: 빈 볼륨의 `base`는 거짓 기록이고(기반 지우기·되돌리기를 막는다) 옛 노드는
+    // 이 칸을 풀지 못한다.
+    if req.spec.base.is_some() {
+        return Err(ApiError::bad_request(
+            "base is set only by deploying from a template",
+        ));
     }
     let pool = find_pool(&state, &req.spec.pool)?;
     check_pool_format(&pool, req.spec.format)?;
@@ -420,6 +428,15 @@ pub struct VolumeDownloadRequest {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub format: Option<ImageFormat>,
+    /// 받은 파일의 SHA-512(16진 128자, 계획 58). `sha256`·`checksum_url`과 함께 쓰지 않는다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub sha512: Option<String>,
+    /// 체크섬 파일(`SHA256SUMS`·`SHA512SUMS`·BSD `CHECKSUM` 모양)의 http·https URL(계획 58). 받기 전에 이 파일에서
+    /// 이미지 URL의 파일 이름 줄을 찾아 그 해시로 확인한다. `sha256`·`sha512`와 함께 쓰지 않는다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub checksum_url: Option<String>,
 }
 
 /// URL의 사용자 정보(`user:password@`)를 `***@`로, 쿼리 문자열(서명·토큰이 흔히 든다)을 `?***`로 가린다. 감사
@@ -441,23 +458,141 @@ pub(crate) fn redact_url(url: &str) -> String {
     }
 }
 
-/// 응답으로 낼 Task: 받기 Task의 URL을 가린다([`redact_url`]). 저장은 그대로다(Task 실행은 원래 URL을 쓴다).
-pub(crate) fn public_task(task: &mut Task) {
-    if let TaskOp::VolumeDownload { url, .. } = &mut task.spec.op {
-        *url = redact_url(url);
+/// 응답으로 낼 Task: 받기 Task의 URL·체크섬 파일 URL을 가리고([`redact_url`]), 템플릿 초안(받기)과 배포 덮어쓰기
+/// (복제)의 cloud-init 비밀번호(해시)를 [`PASSWORD_MASK`]로 가린다(계획 58). 저장은 그대로다(Task 실행은 원래 값을
+/// 쓴다).
+pub(crate) fn public_task(task: &mut Task, writer: bool) {
+    let ci = match &mut task.spec.op {
+        TaskOp::VolumeDownload {
+            url,
+            checksum_url,
+            template,
+            ..
+        } => {
+            *url = redact_url(url);
+            if let Some(sums) = checksum_url {
+                *sums = redact_url(sums);
+            }
+            template.as_mut().and_then(|t| t.cloud_init.as_mut())
+        }
+        TaskOp::VmClone { overrides, .. } => overrides.as_mut().and_then(|o| o.cloud_init.as_mut()),
+        _ => None,
+    };
+    let Some(ci) = ci else { return };
+    if let Some(password) = ci.password.as_mut() {
+        *password = PASSWORD_MASK.into();
+    }
+    // VM 쓰기 권한이 없으면 user-data·vendor-data도 가린다(VM 스펙과 같음).
+    if !writer {
+        for data in [&mut ci.user_data, &mut ci.vendor_data]
+            .into_iter()
+            .flatten()
+        {
+            *data = PASSWORD_MASK.into();
+        }
     }
 }
 
-/// 소문자 16진 64자로 바꾼 SHA-256. 아니면 400.
-fn parse_sha256(sum: &str) -> Result<String, ApiError> {
-    if sum.len() != 64 || !sum.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err(ApiError::bad_request("sha256 must be 64 hex digits"));
+/// 소문자 16진 `len`자로 바꾼 해시(`field`는 오류 문구의 이름). 아니면 400.
+fn parse_hex(field: &str, sum: &str, len: usize) -> Result<String, ApiError> {
+    if sum.len() != len || !sum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(format!(
+            "{field} must be {len} hex digits"
+        )));
     }
     Ok(sum.to_ascii_lowercase())
 }
 
+/// http·https URL인지. 아니면 400(`field must be an http or https URL`).
+pub(crate) fn check_http_url(field: &str, url: &str) -> Result<(), ApiError> {
+    match reqwest::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https") => Ok(()),
+        _ => Err(ApiError::bad_request(format!(
+            "{field} must be an http or https URL"
+        ))),
+    }
+}
+
+/// 받은 파일을 확인할 방법: 고정 SHA-256·SHA-512(소문자로)나 체크섬 파일 URL 가운데 하나(둘 이상이면 400).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DownloadCheck {
+    pub sha256: Option<String>,
+    pub sha512: Option<String>,
+    pub checksum_url: Option<String>,
+}
+
+impl DownloadCheck {
+    pub(crate) fn parse(
+        sha256: Option<&str>,
+        sha512: Option<&str>,
+        checksum_url: Option<&str>,
+    ) -> Result<Self, ApiError> {
+        let given = [sha256.is_some(), sha512.is_some(), checksum_url.is_some()];
+        if given.into_iter().filter(|g| *g).count() > 1 {
+            return Err(ApiError::bad_request(
+                "give only one of sha256, sha512 and checksum_url",
+            ));
+        }
+        if let Some(url) = checksum_url {
+            check_http_url("checksum_url", url)?;
+        }
+        Ok(Self {
+            sha256: sha256.map(|s| parse_hex("sha256", s, 64)).transpose()?,
+            sha512: sha512.map(|s| parse_hex("sha512", s, 128)).transpose()?,
+            checksum_url: checksum_url.map(str::to_string),
+        })
+    }
+
+    /// 감사 설명에 덧붙일 말(해시는 앞 4자만, URL은 가림)
+    pub(crate) fn describe(&self) -> String {
+        match (&self.sha256, &self.sha512, &self.checksum_url) {
+            (Some(sum), _, _) => format!(" (sha256 {}…)", &sum[..4]),
+            (_, Some(sum), _) => format!(" (sha512 {}…)", &sum[..4]),
+            (_, _, Some(url)) => format!(" (checksum file {})", redact_url(url)),
+            _ => String::new(),
+        }
+    }
+}
+
+/// 받기 Task가 채울 볼륨 리소스(`pending`, 크기 0 — 가져온 뒤 실제 이미지 크기가 된다)를 풀을 쓸 수 있는 노드
+/// ([`pool_node`])에 만들고 `op`(받기)로 Task를 만든다. 이름이 쓰였으면 409 `name_taken`. 응답용으로 가린 Task다.
+pub(crate) async fn start_download(
+    state: &AppState,
+    name: String,
+    pool: &StoragePool,
+    format: ImageFormat,
+    content: VolumeContent,
+    op: TaskOp,
+) -> Result<Task, ApiError> {
+    if state.cluster.get_by_name::<VolumeSpec>(&name)?.is_some() {
+        return Err(ApiError::conflict(
+            "name_taken",
+            format!("volume {name:?} already exists"),
+        ));
+    }
+    let node = pool_node(state, pool)?;
+    let mut volume: Volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: pool.name.clone(),
+            size_bytes: 0,
+            format,
+            content,
+            base: None,
+        },
+    );
+    volume.status.node = Some(node);
+    state.cluster.create(&volume).await?;
+    let mut task = create_task(&state.cluster, op, volume.id, node).await?;
+    // 요청한 주체가 준 값이다.
+    public_task(&mut task, true);
+    Ok(task)
+}
+
 /// URL에서 이미지를 받아 볼륨을 채울 Task를 돌려준다(202). 풀을 쓸 수 있는 노드(`pool_node`)가 받는다.
 /// 크기는 받아 가져온 뒤 실제 이미지 크기가 된다. 모든 노드가 `install-media`를 알아야 한다(새 Task).
+/// 확인은 `sha256`·`sha512`·`checksum_url` 가운데 하나이고(둘 이상이면 400), `sha512`·`checksum_url`은 모든 노드가
+/// `templates`를 알아야 한다(409 `cluster_upgrading`).
 #[utoipa::path(post, path = "/volumes/download", tag = "storage",
     request_body = VolumeDownloadRequest,
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -469,12 +604,17 @@ pub async fn download_volume(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     require_feature(&state.cluster, INSTALL_MEDIA)?;
-    check_volume_name(&req.name)?;
-    match reqwest::Url::parse(&req.url) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => {}
-        _ => return Err(ApiError::bad_request("url must be an http or https URL")),
+    // 새 확인 칸은 옛 노드가 풀지 못한다(계획 58). 기능 검사는 검증보다 먼저다.
+    if req.sha512.is_some() || req.checksum_url.is_some() {
+        require_feature(&state.cluster, TEMPLATES)?;
     }
-    let sha256 = req.sha256.as_deref().map(parse_sha256).transpose()?;
+    check_volume_name(&req.name)?;
+    check_http_url("url", &req.url)?;
+    let check = DownloadCheck::parse(
+        req.sha256.as_deref(),
+        req.sha512.as_deref(),
+        req.checksum_url.as_deref(),
+    )?;
     let pool = find_pool(&state, &req.pool)?;
     let format = if req.content.is_disk() {
         let format = req.format.unwrap_or_else(|| default_format(&pool));
@@ -483,45 +623,22 @@ pub async fn download_volume(
     } else {
         check_iso(&pool, req.format, req.source_format, "download")?
     };
-    if state
-        .cluster
-        .get_by_name::<VolumeSpec>(&req.name)?
-        .is_some()
-    {
-        return Err(ApiError::conflict(
-            "name_taken",
-            format!("volume {:?} already exists", req.name),
-        ));
-    }
-    let node = pool_node(&state, &pool)?;
-    // 크기는 가져온 뒤 실제 이미지 크기로 바뀐다(업로드와 같다).
-    let mut volume: Volume = Resource::new(
-        req.name.clone(),
-        VolumeSpec {
-            pool: pool.name.clone(),
-            size_bytes: 0,
-            format,
-            content: req.content,
-            base: None,
-        },
+    let detail = format!(
+        "volume download {} from {}{}",
+        req.name,
+        redact_url(&req.url),
+        check.describe()
     );
-    volume.status.node = Some(node);
-    state.cluster.create(&volume).await?;
-    let mut detail = format!("volume download {} from {}", req.name, redact_url(&req.url));
-    if let Some(sum) = &sha256 {
-        detail.push_str(&format!(" (sha256 {}…)", &sum[..4]));
-    }
-    audit.detail(detail);
     let op = TaskOp::VolumeDownload {
         url: req.url,
-        sha256,
+        sha256: check.sha256,
         source_format: req.source_format.unwrap_or(SourceFormat::Raw),
-        sha512: None,
-        checksum_url: None,
+        sha512: check.sha512,
+        checksum_url: check.checksum_url,
         template: None,
     };
-    let mut task = create_task(&state.cluster, op, volume.id, node).await?;
-    public_task(&mut task);
+    let task = start_download(&state, req.name, &pool, format, req.content, op).await?;
+    audit.detail(detail);
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -590,7 +707,8 @@ pub(crate) async fn receive(path: &FsPath, body: Body, length: u64) -> Result<()
 }
 
 /// VM이 쓰지 않는 볼륨을 지울 Task를 돌려준다(202). 아직 만들고 있는 볼륨은 지울 수 없다.
-/// 스냅샷의 VM 스펙이 가리키면 409 `volume_in_snapshot`.
+/// 스냅샷의 VM 스펙이 가리키면 409 `volume_in_snapshot`, 템플릿의 디스크면 409 `volume_is_template`, 연결 복제의
+/// 기반이면 409 `volume_has_clones`(복제를 먼저 지우거나 평탄화한다).
 #[utoipa::path(delete, path = "/volumes/{key}", tag = "storage",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -611,6 +729,9 @@ pub async fn delete_volume(
     // 엇갈림은 지우기 Task가 다시 본다).
     let _lock = state.vm_lock.lock().await;
     let (_, vms) = state.cluster.list::<VmSpec>()?;
+    if let Some(template) = template_of(&vms, &volume.name) {
+        return Err(volume_is_template(&volume.name, &template.name));
+    }
     let users: Vec<&Vm> = vms
         .iter()
         .filter(|vm| vm_uses_volume(vm, &volume.name))
@@ -636,6 +757,17 @@ pub async fn delete_volume(
         return Err(ApiError::conflict(
             "volume_in_snapshot",
             in_snapshot_message(&volume.name, &s.spec.name, s.spec.vm),
+        ));
+    }
+    // 연결 복제의 기반은 지우지 않는다(계획 58 §4). 다른 노드의 복제 Task와의 엇갈림은 지우기 Task가 다시 본다.
+    let (_, volumes) = state.cluster.list::<VolumeSpec>()?;
+    let clones = linked_clones(&volumes, &[volume.id]);
+    if !clones.is_empty() {
+        let mut names: Vec<&str> = clones.iter().map(|c| c.name.as_str()).collect();
+        names.sort_unstable();
+        return Err(ApiError::conflict(
+            "volume_has_clones",
+            has_clones_message(&volume.name, &names),
         ));
     }
     let node = volume_node(&state, &volume)?;
@@ -682,6 +814,43 @@ pub(crate) fn template_in_use_message(template: &str, clones: &[&str]) -> String
     )
 }
 
+/// 기반 볼륨 `bases`(id)의 연결 복제(`base`가 그 id인 볼륨)
+pub(crate) fn linked_clones<'a>(volumes: &'a [Volume], bases: &[Uuid]) -> Vec<&'a Volume> {
+    volumes
+        .iter()
+        .filter(|v| v.spec.base.is_some_and(|b| bases.contains(&b)))
+        .collect()
+}
+
+/// 연결 복제 `clones`를 사람에게 보일 이름: 쓰는 VM의 이름, 붙지 않은 복제는 볼륨 이름(이름 순, 겹침 없음)
+pub(crate) fn clone_names<'a>(clones: &[&'a Volume], vms: &'a [Vm]) -> Vec<&'a str> {
+    let mut names: Vec<&str> = clones
+        .iter()
+        .map(|c| {
+            vms.iter()
+                .find(|vm| vm.spec.disks.iter().any(|d| d.volume == c.name))
+                .map_or(c.name.as_str(), |vm| vm.name.as_str())
+        })
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
+/// 볼륨 `volume`(이름)을 디스크로 가진 템플릿 VM
+pub(crate) fn template_of<'a>(vms: &'a [Vm], volume: &str) -> Option<&'a Vm> {
+    vms.iter()
+        .find(|vm| vm.spec.template && vm.spec.disks.iter().any(|d| d.volume == volume))
+}
+
+/// 템플릿 디스크라 크기를 바꾸거나 지울 수 없다(409 `volume_is_template`, 계획 58 §3)
+fn volume_is_template(volume: &str, template: &str) -> ApiError {
+    ApiError::conflict(
+        "volume_is_template",
+        format!("volume {volume:?} is a disk of template {template:?}"),
+    )
+}
+
 /// CD-ROM 드라이브에 꽂힌 ISO를 지울 수 없다는 문구. VM이 여럿이면 첫 VM과 나머지 수를 적는다.
 pub(crate) fn in_cdrom_message(volume: &str, users: &[&Vm]) -> String {
     let mut message = format!(
@@ -705,7 +874,8 @@ pub struct ResizeRequest {
 /// Task와 같은 노드(실행 중이면 그 VM의 노드, 꺼졌으면 다음에 돌 노드)의 실행기에서 차례로 돌도록
 /// 거기서 한다. 쓰는 VM이 없거나 정할 노드가 없으면 볼륨의 노드에서 한다. 쓰는 VM이 켜지거나 꺼지는
 /// 중이면(원하는 상태와 실제 상태가 다르다) 409 `vm_busy`다. 꺼진 VM으로 보고 저장소로 늘리는 동안
-/// 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
+/// 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다. 템플릿의 디스크는 409 `volume_is_template`이다(배포 때 디스크 크기를
+/// 준다).
 #[utoipa::path(post, path = "/volumes/{key}/resize", tag = "storage",
     params(("key" = String, Path, description = "id or name")),
     request_body = ResizeRequest,
@@ -740,6 +910,9 @@ pub async fn resize_volume(
         ));
     }
     let (_, vms) = state.cluster.list::<VmSpec>()?;
+    if let Some(template) = template_of(&vms, &volume.name) {
+        return Err(volume_is_template(&volume.name, &template.name));
+    }
     let user = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name));
     if let Some(vm) = user {
         // 떼는 중인 디스크는 스펙 순번이 없어 늘릴 수 없다.
@@ -757,6 +930,105 @@ pub async fn resize_volume(
     };
     let task = create_task(&state.cluster, op, volume.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 연결 복제 볼륨을 기반과 떼어 독립 볼륨으로 만들 Task(`volume-flatten`)를 돌려준다(202, 계획 58 §7). 볼륨을
+/// 쓸 수 있는 노드에서 돈다(쓰는 VM이 있으면 그 VM의 디스크 노드). 모든 노드가 `templates`를 알아야 하고(409
+/// `cluster_upgrading`), 연결 복제가 아니면 400, 아직 만드는 중이면 409 `volume_not_ready`, 쓰는 VM이 꺼져 있지 않으면
+/// 409 `vm_running`(실행 중 평탄화는 없다), 그 VM의 스냅샷·복제·백업·마이그레이션 Task가 끝나지 않았으면 409
+/// `vm_busy`다. 파일 풀(dir·NFS)의 디스크는 VM에 스냅샷이 있으면 409 `vm_has_snapshots`(qcow2 내부 스냅샷이 기반을
+/// 잃는다). 기반이 쓰는 공간을 노드가 알린 풀 여유가 담지 못하면 409 `no_capacity`다.
+#[utoipa::path(post, path = "/volumes/{key}/flatten", tag = "storage",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn flatten_volume(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    require_feature(&state.cluster, TEMPLATES)?;
+    // 같은 VM을 켜는 요청과 엇갈리지 않게 확인과 Task 만들기를 VM 쓰기와 함께 잠근다.
+    let _lock = state.vm_lock.lock().await;
+    let volume = lookup::<VolumeSpec>(&state.cluster, &key)?;
+    let Some(base) = volume.spec.base else {
+        return Err(ApiError::bad_request(format!(
+            "volume {:?} is not a linked clone",
+            volume.name
+        )));
+    };
+    if volume.status.phase != VolumePhase::Ready {
+        return Err(ApiError::conflict(
+            "volume_not_ready",
+            format!("volume {:?} is still being created", volume.name),
+        ));
+    }
+    let pool = find_pool(&state, &volume.spec.pool)?;
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    let user = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name));
+    if let Some(vm) = user {
+        if !is_stopped(vm) {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "cannot flatten disk {:?} of VM {:?} while it is running; stop it first",
+                    volume.name, vm.name
+                ),
+            ));
+        }
+        check_not_busy(&state, vm)?;
+        check_no_snapshot_task(&state, vm)?;
+        let snapshots = count_snapshots(&state, vm.id)?;
+        if block_pool_kind(&pool).is_none() && snapshots > 0 {
+            return Err(ApiError::conflict(
+                "vm_has_snapshots",
+                format!(
+                    "VM {:?} has {snapshots} snapshot(s); delete them before flattening disk {:?}",
+                    vm.name, volume.name
+                ),
+            ));
+        }
+    }
+    let node = match user.and_then(|vm| vm_placement(&state.cluster, Some(state.node), vm)) {
+        Some(node) => node,
+        None => volume_node(&state, &volume)?,
+    };
+    let base = state.cluster.get::<VolumeSpec>(base)?;
+    check_flatten_space(&state, &pool, node, base.as_ref())?;
+    let task = create_task(&state.cluster, TaskOp::VolumeFlatten, volume.id, node).await?;
+    let base = base.map_or_else(|| "?".to_string(), |b| b.name);
+    audit.detail(format!("volume flatten {} (base {base})", volume.name));
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 평탄화가 기반의 데이터(할당량, 모르면 보지 않는다)를 복제로 가져올 자리가 Task 노드가 알린 풀 여유(모르면 보지
+/// 않는다)에 있는지. 아니면 409 `no_capacity`.
+fn check_flatten_space(
+    state: &AppState,
+    pool: &StoragePool,
+    node: Uuid,
+    base: Option<&Volume>,
+) -> Result<(), ApiError> {
+    let Some(need) = base.and_then(|b| b.status.allocated_bytes) else {
+        return Ok(());
+    };
+    let available = state
+        .cluster
+        .get::<NodeSpec>(node)?
+        .and_then(|n| n.status.pools.get(&pool.name).cloned())
+        .filter(|p| p.pool_id == pool.id && p.total_bytes > 0)
+        .map(|p| p.available_bytes);
+    match available {
+        Some(available) if available < need => Err(ApiError::conflict(
+            "no_capacity",
+            format!(
+                "storage pool {:?} has {available} bytes free, but flattening needs about {need} bytes",
+                pool.name
+            ),
+        )),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -804,8 +1076,32 @@ mod tests {
     #[test]
     fn sha256_is_64_hex_digits_stored_lowercase() {
         let sum = "AB".repeat(32);
-        assert_eq!(parse_sha256(&sum).unwrap(), "ab".repeat(32));
-        assert!(parse_sha256(&"ab".repeat(31)).is_err());
-        assert!(parse_sha256(&"zz".repeat(32)).is_err());
+        assert_eq!(parse_hex("sha256", &sum, 64).unwrap(), "ab".repeat(32));
+        assert!(parse_hex("sha256", &"ab".repeat(31), 64).is_err());
+        assert!(parse_hex("sha256", &"zz".repeat(32), 64).is_err());
+    }
+
+    #[test]
+    fn a_download_is_checked_one_way_at_most() {
+        let sha512 = "CD".repeat(64);
+        let check = DownloadCheck::parse(None, Some(&sha512), None).unwrap();
+        assert_eq!(check.sha512, Some("cd".repeat(64)));
+        assert_eq!(check.describe(), " (sha512 cdcd…)");
+        let e = DownloadCheck::parse(Some(&"ab".repeat(32)), Some(&sha512), None).unwrap_err();
+        assert!(e.message.contains("only one"), "{}", e.message);
+        let e = DownloadCheck::parse(None, Some(&"ab".repeat(32)), None).unwrap_err();
+        assert_eq!(e.message, "sha512 must be 128 hex digits");
+        let e = DownloadCheck::parse(None, None, Some("ftp://a.example/SUMS")).unwrap_err();
+        assert_eq!(e.message, "checksum_url must be an http or https URL");
+        let check =
+            DownloadCheck::parse(None, None, Some("https://u:p@a.example/SHA256SUMS")).unwrap();
+        assert_eq!(
+            check.describe(),
+            " (checksum file https://***@a.example/SHA256SUMS)"
+        );
+        assert_eq!(
+            DownloadCheck::parse(None, None, None).unwrap(),
+            DownloadCheck::default()
+        );
     }
 }

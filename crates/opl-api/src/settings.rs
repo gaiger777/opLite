@@ -311,7 +311,7 @@ fn apply_telemetry(
     Ok(())
 }
 
-/// 클러스터 설정. 로그인한 누구나 읽는다.
+/// 클러스터 설정. 로그인한 누구나 읽는다. 관리자(설정 쓰기 권한)가 아니면 이미지 카탈로그의 URL을 가린다.
 #[utoipa::path(get, path = "/settings", tag = "settings",
     responses((status = 200, body = Resource<SettingsSpec, SettingsStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_settings(
@@ -319,7 +319,15 @@ pub async fn get_settings(
     principal: Principal,
 ) -> Result<Json<Settings>, ApiError> {
     state.authorize(&principal, Action::Read, SettingsSpec::KIND)?;
-    Ok(Json(public(current(&state.cluster)?)))
+    let mut settings = public(current(&state.cluster)?);
+    if !crate::images::writes_settings(&state, &principal) {
+        settings
+            .spec
+            .image_catalog
+            .iter_mut()
+            .for_each(crate::images::redact_image);
+    }
+    Ok(Json(settings))
 }
 
 /// 설정의 주어진 값을 바꾼다. 아무것도 없으면 400. 설정이 아직 없으면 만든다(`If-Match`는 0).

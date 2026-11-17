@@ -340,11 +340,11 @@ pub(super) async fn clone(
 }
 
 /// `linked: true`인데 원본이 템플릿이 아닐 때
-const LINKED_ONLY_FROM_TEMPLATES: &str = "linked clones can be made only from templates";
+pub(crate) const LINKED_ONLY_FROM_TEMPLATES: &str = "linked clones can be made only from templates";
 
 /// 디스크 `disk`(원본 볼륨 `source`, 그 풀 `source_pool`)를 풀 `target`에 연결 복제로 만들 수 없는 이유. 되면 `None`이다.
 /// 연결 복제는 기반과 같은 풀에만, 그 백엔드가 지원할 때만, 기반이 독립 볼륨일 때만(사슬은 1단) 된다.
-fn unlinkable(
+pub(crate) fn unlinkable(
     disk: usize,
     source: &Volume,
     source_pool: &StoragePool,

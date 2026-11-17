@@ -13,7 +13,7 @@ use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::{Snapshot, SnapshotSpec};
 use opl_types::storage::{StoragePoolSpec, Volume, VolumeContent, VolumePhase, VolumeSpec};
-use opl_types::task::{TaskSpec, TaskState};
+use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
 use opl_types::vm::{Arch, HaEvict, MigrationStatus, VmHa, VmHaStatus, VmPhase, VmSpec};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -842,4 +842,39 @@ async fn cdroms_with_local_isos_do_not_migrate() {
         .unwrap();
     let (status, task) = migrate(&admin, "db", "node2").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+}
+
+/// 디스크의 평탄화 Task(계획 58)가 끝나지 않았으면 옮길 수 없다: 409 `vm_busy`. 평탄화하는 동안 디스크가 쓰이면 안 된다.
+#[tokio::test]
+async fn a_disk_being_flattened_makes_the_vm_busy() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env, &admin).await;
+    let root = env
+        .cluster
+        .get_by_name::<VolumeSpec>("root")
+        .unwrap()
+        .unwrap();
+    // 실행기가 없는 노드의 Task라 끝나지 않는다.
+    let node2 = env
+        .cluster
+        .get_by_name::<NodeSpec>("node2")
+        .unwrap()
+        .unwrap();
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::VolumeFlatten,
+            target: root.id,
+            node: node2.id,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+    let (status, body) = migrate(&admin, "web", "node2").await;
+    assert_conflict((status, body.clone()), "vm_busy");
+    assert_eq!(
+        body["message"],
+        "a disk of VM \"web\" is being flattened; try again when the task has finished"
+    );
 }

@@ -16,7 +16,7 @@ mod snapshot;
 mod template;
 mod vm_replicate;
 
-pub(crate) use clone::volume_name;
+pub(crate) use clone::{LINKED_ONLY_FROM_TEMPLATES, unlinkable, volume_name};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -60,6 +60,10 @@ pub(crate) async fn create_task(
     target: Uuid,
     node: Uuid,
 ) -> Result<Task, ApiError> {
+    // 템플릿 Task와 새 칸은 옛 노드가 풀지 못한다(계획 58). 경로마다 검증 전에 보지만, 빠뜨린 길이 없게 여기서도 본다.
+    if op.needs_templates() {
+        crate::cluster::require_feature(cluster, opl_types::node::TEMPLATES)?;
+    }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
     task.revision = cluster.create(&task).await?;
@@ -725,6 +729,11 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
 /// 실패로 기록한다. 만들다 만 볼륨·스냅샷은 지운다. 예약 스냅샷의 만들기나 예약 정리의 삭제였으면
 /// VM에 이유를 남긴다. `unfinished`면 작업이 끝나지 않았다(시간 초과, 재시작으로 중단).
 async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
+    let error = if unfinished {
+        unfinished_error(ctx, task, error).await
+    } else {
+        error
+    };
     tracing::warn!(task = %task.id, error = %error, "task failed");
     // 정리가 스냅샷 리소스를 지우므로 먼저 본다.
     let scheduled = snapshot::scheduled_vm(ctx, task);
@@ -733,6 +742,31 @@ async fn fail(ctx: &Ctx, task: &Task, error: String, unfinished: bool) {
         snapshot::record_schedule(ctx, vm, Some(task_failed(error.clone()))).await;
     }
     set_status(ctx, task.id, TaskState::Failed, Some(error)).await;
+}
+
+/// 끝나지 않은(시간 초과, 재시작으로 중단) Task의 오류에 남은 일을 붙인다. 템플릿 표시를 지운 뒤 끊긴 되돌리기는 다시 보기를
+/// 하지 못했으므로 여기서 연결 복제를 다시 본다(남았으면 그 이름, 표시는 되돌리지 않는다). 가져오기를 마친 받기 → 템플릿은
+/// 받은 볼륨을 남기므로([`keeps_downloaded`]) 그것으로 손수 만드는 길을 알린다(템플릿을 이미 만들었으면 알리지 않는다).
+async fn unfinished_error(ctx: &Ctx, task: &Task, error: String) -> String {
+    if task.spec.op == TaskOp::VmUntemplate
+        && let Err(e) = template::recheck_unfinished(ctx, task.spec.target).await
+    {
+        return format!("{error}; {e}");
+    }
+    if let TaskOp::VolumeDownload {
+        template: Some(draft),
+        ..
+    } = &task.spec.op
+        && keeps_downloaded(ctx, task)
+        && let Ok(Some(volume)) = ctx.cluster.get::<VolumeSpec>(task.spec.target)
+        && !matches!(
+            ctx.cluster.get_by_name::<VmSpec>(&draft.name),
+            Ok(Some(vm)) if vm.spec.template
+        )
+    {
+        return download::keep_hint(error, &volume.name);
+    }
+    error
 }
 
 /// 실패한 볼륨 생성·가져오기, 스냅샷 만들기, 복제·복원·VM 가져오기의 흔적을 지워 이름을 다시 쓸 수 있게
@@ -1222,7 +1256,8 @@ async fn check_iso_source(source: &Path) -> Result<(), String> {
 }
 
 async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
-    // 연결 복제의 기반은 지우지 않는다(계획 58). API가 확인한 뒤 다른 노드의 복제 Task가 그새 기록을 만들었을 수 있다.
+    // 연결 복제의 기반과 템플릿 디스크는 지우지 않는다(계획 58). API가 확인한 뒤 다른 노드의 복제 Task가 그새 기록을
+    // 만들었거나 다른 노드의 요청이 템플릿으로 바꿨을 수 있다.
     if let Some(volume) = ctx
         .cluster
         .get::<VolumeSpec>(id)
@@ -1239,6 +1274,14 @@ async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
             .collect();
         if !clones.is_empty() {
             return Err(crate::volumes::has_clones_message(&volume.name, &clones));
+        }
+        // 그새 템플릿이 된 VM의 디스크도 지우지 않는다(다음 배포의 기반이다).
+        let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+        if let Some(template) = crate::volumes::template_of(&vms, &volume.name) {
+            return Err(format!(
+                "volume {:?} is a disk of template {:?}",
+                volume.name, template.name
+            ));
         }
     }
     // ISO는 여러 VM이 함께 쓰므로 API가 확인한 뒤 다른 노드의 요청이 CD에 넣었거나 그 VM의 스냅샷을 찍었을 수 있다.

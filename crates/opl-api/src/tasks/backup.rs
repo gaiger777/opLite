@@ -361,6 +361,19 @@ async fn drop_new_bitmap(ctx: &Ctx, vm: Uuid, new: &str) {
     }
 }
 
+/// VM이 템플릿이거나 디스크 가운데 연결 복제의 기반이 있는지
+fn is_base(ctx: &Ctx, vm: &Vm, disks: &[(Volume, StoragePool)]) -> Result<bool, String> {
+    if vm.spec.template {
+        return Ok(true);
+    }
+    let (_, volumes) = ctx
+        .cluster
+        .list::<VolumeSpec>()
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<Uuid> = disks.iter().map(|(v, _)| v.id).collect();
+    Ok(!crate::volumes::linked_clones(&volumes, &ids).is_empty())
+}
+
 /// 전체 백업: 디스크마다 지금(실행 중이면 임시 스냅샷) 내용을 `{dir}/disk{i}.qcow2`로 내보내고 UEFI
 /// 변수를 `vars`로 복사한다. `bitmap`을 주면 실행 중일 때 임시 스냅샷과 같은 시점에 그 비트맵을 만들고,
 /// 꺼진 VM은 내보낸 뒤 qcow2 디스크에 비트맵을 둔다(설계 §3.1). 담은 디스크와 그 시각을 돌려준다.
@@ -603,6 +616,9 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         None => plan,
     };
     let bitmap = bitmap_name(id);
+    // 템플릿 디스크(연결 복제의 기반)에는 비트맵을 두지 않는다(계획 58): 그 qcow2는 연결 복제의 backing 파일이라 바뀌면
+    // 안 되고, 템플릿은 켜지지 않아 증분 백업이 쓸 일도 없다.
+    let bitmaps = bitmaps && !is_base(ctx, &vm, &disks)?;
     // 실행 중인 VM의 전체 백업은 임시 스냅샷과 함께 새 비트맵을 만든다. 끝나면 다른 비트맵을 지우고,
     // 실패하면 새 비트맵만 지운다.
     let live_bitmap = bitmaps && running && !disks.is_empty() && matches!(plan, Plan::Full(_));
