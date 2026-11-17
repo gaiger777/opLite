@@ -51,6 +51,7 @@ fn config(root: &Path) -> QemuConfig {
         // systemd 스코프 이름은 VM id로 정해져(`opl-vm-{id}.scope`) 한 호스트의 두 QEMU가 겹친다.
         // 받는 쪽을 띄울 때 남은 스코프로 보고 원본 스코프를 멈추므로 쓰지 않는다.
         systemd_scope: false,
+        swtpm: Default::default(),
     }
 }
 
@@ -284,6 +285,68 @@ async fn migrates_a_running_vm_over_tls() {
     assert_eq!(
         info["format-specific"]["data"]["bitmaps"][0]["name"], "opl-a",
         "{info}"
+    );
+}
+
+/// 실제 swtpm(`vtpm-it`): TPM VM을 옮기면 QEMU가 swtpm 상태를 마이그레이션 스트림으로 옮겨 대상 노드의 TPM 상태
+/// 파일이 원본과 같아진다. 대상 swtpm은 빈 디렉터리로 띄우고(받는 쪽은 만들지 않는다), 원본 swtpm은 원본 QEMU와 함께
+/// 끝난다.
+#[cfg(feature = "vtpm-it")]
+#[tokio::test]
+async fn a_tpm_vm_migrates_with_its_state() {
+    use opl_types::runtime::RuntimeTpm;
+
+    let n = nodes().await;
+    let disk = create_disk(n.tmp.path());
+    let mut vm = spec(disk);
+    vm.tpm = Some(RuntimeTpm {
+        fresh: true,
+        epoch: 0,
+    });
+    n.src.start(&vm, None).await.unwrap();
+    let src_run = n.tmp.path().join("a/run/vm").join(vm.id.to_string());
+    let src_swtpm: u32 = std::fs::read_to_string(src_run.join("swtpm.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let incoming = VmRuntimeSpec {
+        tpm: Some(RuntimeTpm {
+            fresh: false,
+            epoch: 0,
+        }),
+        ..vm.clone()
+    };
+    let port = n
+        .dst
+        .start_incoming(&incoming, Uuid::now_v7(), HOST, 61040..=61059, &[])
+        .await
+        .unwrap()
+        .migration;
+    let dst_permall = opl_driver::tpm_state_path(&n.tmp.path().join("b/state"), vm.id);
+    assert!(!dst_permall.exists());
+    let target = MigrateTarget {
+        host: HOST.into(),
+        port,
+        tls_hostname: HOST.into(),
+    };
+    n.src.migrate(vm.id, &target, &opts()).await.unwrap();
+    n.dst.incoming_wait(vm.id).await.unwrap();
+    n.dst.finish_incoming(vm.id, None).await.unwrap();
+    assert!(n.src.stop_migrated(vm.id).await.unwrap());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process_exists(src_swtpm) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the source swtpm outlived its QEMU"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    n.dst.stop(vm.id, StopMode::Force).await.unwrap();
+    let src_permall = opl_driver::tpm_state_path(&n.tmp.path().join("a/state"), vm.id);
+    assert_eq!(
+        std::fs::read(&dst_permall).unwrap(),
+        std::fs::read(&src_permall).unwrap()
     );
 }
 
@@ -864,7 +927,10 @@ async fn failed_disk_copy_keeps_the_source_running() {
     }
     assert_eq!(status(&n.src, id).await, Some(RuntimeStatus::Running));
     // 미러가 남지 않아 스냅샷이 된다.
-    n.src.snapshot_save(id, "after", false).await.unwrap();
+    n.src
+        .snapshot_save(id, "after", false, false)
+        .await
+        .unwrap();
     n.src.stop(id, StopMode::Force).await.unwrap();
 }
 

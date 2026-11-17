@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""가짜 swtpm(계획 59 시험용). 실제 swtpm의 `socket` 모드 인자를 읽고 흉내 낸다.
+
+- `socket --print-capabilities`: TPM 2.0 능력 JSON을 찍는다.
+- `socket ... --daemon`: 떼어 낸 자식이 TPM 디렉터리의 `.lock`을 fcntl로 잠그고, 제어 소켓을 열고, pid 파일을
+  쓴 뒤 부모가 끝난다(표준 입출력은 /dev/null). `--terminate`면 첫 연결(QEMU)이 끊길 때 끝난다.
+"""
+import fcntl
+import json
+import os
+import socket
+import sys
+
+
+def opts(value):
+    """`k=v,k=v`(쉼표 두 개는 값 안의 쉼표)"""
+    out = {}
+    for part in value.replace(",,", "\0").split(","):
+        k, _, v = part.partition("=")
+        out[k] = v.replace("\0", ",")
+    return out
+
+
+def main(argv):
+    if argv[:1] != ["socket"]:
+        print("fake swtpm: only the socket interface", file=sys.stderr)
+        return 1
+    if "--print-capabilities" in argv:
+        print(json.dumps({"type": "swtpm", "features": ["tpm-1.2", "tpm-2.0"], "version": "0.0.0-fake"}))
+        return 0
+    args = {}
+    flags = set()
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--tpmstate", "--ctrl", "--pid", "--log"):
+            args[a] = opts(argv[i + 1])
+            i += 2
+        else:
+            flags.add(a)
+            i += 1
+    state = args["--tpmstate"]["dir"]
+    ctrl = args["--ctrl"]["path"]
+    pidfile = args["--pid"]["file"]
+    log = args.get("--log", {}).get("file")
+    if not os.path.isdir(state):
+        print(f"swtpm: Could not open TPM state directory {state}", file=sys.stderr)
+        return 1
+    lock = os.open(os.path.join(state, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"swtpm: Could not lock access to lockfile {state}/.lock", file=sys.stderr)
+        return 1
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(ctrl)
+    srv.listen(1)
+    if "--daemon" in flags:
+        # fcntl 잠금은 fork한 자식에 넘어가지 않으므로 놓고 자식이 다시 잠근다.
+        os.close(lock)
+        r, w = os.pipe()
+        if os.fork() > 0:
+            os.close(w)
+            os.read(r, 1)
+            return 0
+        os.close(r)
+        os.setsid()
+        null = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(null, fd)
+        lock = os.open(os.path.join(state, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    else:
+        w = None
+    with open(pidfile, "w") as f:
+        f.write(f"{os.getpid()}\n")
+    if log:
+        with open(log, "a") as f:
+            f.write("fake swtpm started\n")
+    if w is not None:
+        os.write(w, b"x")
+        os.close(w)
+    conn, _ = srv.accept()
+    while conn.recv(4096):
+        pass
+    if "--terminate" in flags:
+        return 0
+    # --terminate가 없으면 계속 산다(시험은 쓰지 않는다).
+    while True:
+        conn, _ = srv.accept()
+        while conn.recv(4096):
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

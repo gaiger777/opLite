@@ -8,7 +8,8 @@ use async_trait::async_trait;
 use opl_qemu::QmpError;
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::cloud_init::CloudInitSeed;
-use opl_types::node::NodeHotplug;
+use opl_types::guest::GuestInfo;
+use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, DiskBus, RunningHardware};
@@ -18,7 +19,7 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
+    Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
@@ -300,6 +301,20 @@ struct MockState {
     catch_up_passes: Option<u8>,
     /// 따라잡기를 마치고 스위치오버를 기다리는 VM
     catching_up: HashMap<Uuid, CatchUpState>,
+    /// `set_guest_info`로 정한 VM별 게스트 정보. 다시 켜도 남는다.
+    guest_infos: HashMap<Uuid, GuestInfo>,
+    /// `guest_info` 호출(실패 포함)
+    guest_info_calls: Vec<Uuid>,
+    /// `set_user_password` 호출의 (VM, 사용자). 비밀번호는 남기지 않는다.
+    password_sets: Vec<(Uuid, String)>,
+    /// `stop(Acpi|Agent)`가 실제로 보낸 종료 요청(에이전트가 답하지 않으면 `Acpi`)
+    stop_requests: Vec<(Uuid, StopMode)>,
+    /// 얼리기가 이 이유로 실패하는 VM(`fail_freeze`)
+    freeze_failures: HashMap<Uuid, String>,
+    /// 시점을 찍는 호출의 (VM, `quiesce`)(실패 포함)
+    quiesce_calls: Vec<(Uuid, bool)>,
+    /// `set_firmware_caps`로 정한 능력(없으면 TPM·Secure Boot 모두)
+    firmware_caps: Option<FirmwareCaps>,
 }
 
 impl Default for MockHypervisor {
@@ -473,6 +488,102 @@ impl MockHypervisor {
     pub fn guest_pings(&self, id: Uuid) -> usize {
         let st = self.state.lock().unwrap();
         st.guest_pings.iter().filter(|vm| **vm == id).count()
+    }
+
+    /// 이후 이 VM의 `guest_info`가 이 정보를 돌려준다(에이전트가 `Ok`로 답할 때, 다시 켜도 그대로).
+    pub fn set_guest_info(&self, id: Uuid, info: GuestInfo) {
+        self.state.lock().unwrap().guest_infos.insert(id, info);
+    }
+
+    /// 이 VM에 부른 `guest_info` 수(실패 포함)
+    pub fn guest_info_calls(&self, id: Uuid) -> usize {
+        let st = self.state.lock().unwrap();
+        st.guest_info_calls.iter().filter(|vm| **vm == id).count()
+    }
+
+    /// 이 VM에 성공한 `set_user_password`의 사용자들(비밀번호는 남기지 않는다)
+    pub fn password_sets(&self, id: Uuid) -> Vec<String> {
+        let st = self.state.lock().unwrap();
+        st.password_sets
+            .iter()
+            .filter(|(vm, _)| *vm == id)
+            .map(|(_, user)| user.clone())
+            .collect()
+    }
+
+    /// 이 VM에 실제로 보낸 종료 요청(`Acpi`·`Agent`, 에이전트가 답하지 않아 ACPI로 넘어간 것은 `Acpi`)
+    pub fn stop_requests(&self, id: Uuid) -> Vec<StopMode> {
+        let st = self.state.lock().unwrap();
+        st.stop_requests
+            .iter()
+            .filter(|(vm, _)| *vm == id)
+            .map(|(_, mode)| *mode)
+            .collect()
+    }
+
+    /// 이후 이 VM의 파일 시스템 얼리기가 이 이유로 실패한다(None이면 되돌린다).
+    pub fn fail_freeze(&self, id: Uuid, reason: Option<&str>) {
+        let mut st = self.state.lock().unwrap();
+        match reason {
+            Some(r) => st.freeze_failures.insert(id, r.to_string()),
+            None => st.freeze_failures.remove(&id),
+        };
+    }
+
+    /// 이 VM에 시점을 찍는 호출(스냅샷·증분 백업·복제 회차)이 넘긴 `quiesce`들(실패 포함)
+    pub fn quiesce_calls(&self, id: Uuid) -> Vec<bool> {
+        let st = self.state.lock().unwrap();
+        st.quiesce_calls
+            .iter()
+            .filter(|(vm, _)| *vm == id)
+            .map(|(_, q)| *q)
+            .collect()
+    }
+
+    /// 이후 `firmware_caps`가 이 능력을 돌려준다.
+    pub fn set_firmware_caps(&self, caps: FirmwareCaps) {
+        self.state.lock().unwrap().firmware_caps = Some(caps);
+    }
+
+    /// 에이전트가 답하는지: 정한 답, 없으면 채널을 달고 띄운 VM은 `Hang`, 아니면 `None`
+    fn agent_answer(st: &MockState, id: Uuid) -> GuestAnswer {
+        let channel = st.guest_channels.contains(&id);
+        st.guest_answers.get(&id).copied().unwrap_or(if channel {
+            GuestAnswer::Hang
+        } else {
+            GuestAnswer::None
+        })
+    }
+
+    /// 에이전트 세션을 열 수 있는지(실제 드라이버의 채널 확인과 동기화)
+    fn agent_session(st: &MockState, id: Uuid) -> Result<(), DriverError> {
+        match Self::agent_answer(st, id) {
+            GuestAnswer::None => Err(DriverError::InvalidSpec(format!(
+                "VM {id} has no guest agent channel"
+            ))),
+            GuestAnswer::Hang => Err(DriverError::GuestAgent(
+                "the guest agent did not answer guest-sync-delimited in time".into(),
+            )),
+            GuestAnswer::Ok => Ok(()),
+        }
+    }
+
+    /// 시점을 찍는 호출의 얼림 결과: 에이전트가 답하고 주입한 실패가 없으면 `Yes`다.
+    fn quiesce(st: &mut MockState, id: Uuid, quiesce: bool) -> Quiesced {
+        st.quiesce_calls.push((id, quiesce));
+        if !quiesce {
+            return Quiesced::No;
+        }
+        if let Some(why) = st.freeze_failures.get(&id) {
+            return Quiesced::Skipped(why.clone());
+        }
+        match Self::agent_session(st, id) {
+            Ok(()) => Quiesced::Yes,
+            Err(DriverError::InvalidSpec(_)) => {
+                Quiesced::Skipped("the VM has no guest agent channel".into())
+            }
+            Err(e) => Quiesced::Skipped(e.to_string()),
+        }
     }
 
     /// `block_resize`로 마지막에 바꾼 크기
@@ -1123,7 +1234,9 @@ impl Hypervisor for MockHypervisor {
                 // 실제 드라이버는 다시 붙지 못한 VM에 ACPI 요청을 보낼 수 없고, 강제 종료는
                 // 프로세스를 죽이므로 종료 이벤트가 없다.
                 return match mode {
-                    StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
+                    StopMode::Acpi | StopMode::Agent => {
+                        Err(DriverError::Timeout("reattach to running QEMU"))
+                    }
                     StopMode::Force | StopMode::Kill => {
                         Self::forget_volatile_bitmaps(&mut st, id);
                         st.unresponsive.remove(&id);
@@ -1141,8 +1254,17 @@ impl Hypervisor for MockHypervisor {
         }
         match mode {
             // 실제 QEMU처럼 요청만 보낸다. 게스트는 무시할 수 있으므로 실제 종료는
-            // 테스트가 `guest_shutdown`으로 일으킨다.
-            StopMode::Acpi => {}
+            // 테스트가 `guest_shutdown`으로 일으킨다. 에이전트가 답하지 않으면 ACPI로 넘어간다.
+            StopMode::Acpi | StopMode::Agent => {
+                let mut st = self.state.lock().unwrap();
+                if st.vms.contains_key(&id) {
+                    let sent = match mode {
+                        StopMode::Agent if Self::agent_session(&st, id).is_ok() => StopMode::Agent,
+                        _ => StopMode::Acpi,
+                    };
+                    st.stop_requests.push((id, sent));
+                }
+            }
             StopMode::Force => self.remove(
                 id,
                 EventKind::Stopped {
@@ -1185,7 +1307,13 @@ impl Hypervisor for MockHypervisor {
         }
     }
 
-    async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError> {
+    async fn snapshot_save(
+        &self,
+        id: Uuid,
+        tag: &str,
+        memory: bool,
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError> {
         let hang = {
             let mut st = self.state.lock().unwrap();
             Self::controllable(&st, id)?;
@@ -1203,9 +1331,10 @@ impl Hypervisor for MockHypervisor {
             .entry(id)
             .or_default()
             .push((tag.to_string(), memory));
+        let quiesced = Self::quiesce(&mut st, id, quiesce && !memory);
         match st.fail_next_snapshot.take() {
             Some(err) => Err(err),
-            None => Ok(()),
+            None => Ok(quiesced),
         }
     }
 
@@ -1215,17 +1344,19 @@ impl Hypervisor for MockHypervisor {
         id: Uuid,
         tag: &str,
         bitmap: &str,
-    ) -> Result<(), DriverError> {
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError> {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
         st.snapshots
             .entry(id)
             .or_default()
             .push((tag.to_string(), false));
+        let quiesced = Self::quiesce(&mut st, id, quiesce);
         if let Some(err) = st.fail_next_snapshot.take() {
             return Err(err);
         }
-        Self::add_bitmaps_to(&mut st, id, bitmap)
+        Self::add_bitmaps_to(&mut st, id, bitmap).map(|()| quiesced)
     }
 
     async fn backup_bitmaps(&self, id: Uuid) -> Result<Vec<DiskBitmaps>, DriverError> {
@@ -1273,11 +1404,13 @@ impl Hypervisor for MockHypervisor {
         parent: &str,
         new: &str,
         targets: &[BackupTarget],
-    ) -> Result<(), DriverError> {
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError> {
         let mut st = self.state.lock().unwrap();
         st.incrementals
             .push((id, parent.to_string(), new.to_string(), targets.to_vec()));
         Self::controllable(&st, id)?;
+        let quiesced = Self::quiesce(&mut st, id, quiesce);
         let disks = st.disk_formats.get(&id).map_or(0, Vec::len);
         let wanted: Vec<String> = (0..disks).map(|i| format!("disk{i}")).collect();
         let nodes: Vec<String> = targets.iter().map(|t| t.node.clone()).collect();
@@ -1315,7 +1448,7 @@ impl Hypervisor for MockHypervisor {
         for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
             disk.retain(|b| b.name != parent);
         }
-        Ok(())
+        Ok(quiesced)
     }
 
     /// 남은 증분 백업 작업은 없다. 호출을 기록하고 남은 미러와 따라잡기 비트맵(`opl-mig-*`)을 치운다.
@@ -1333,7 +1466,11 @@ impl Hypervisor for MockHypervisor {
 
     /// 실제 QEMU처럼 증분 디스크에는 기준 비트맵이 있고 inconsistent가 아니어야 한다. 성공하면 대상 디스크마다 새
     /// 비트맵을 만들고(기준 비트맵은 그대로) 가짜 바이트를 알린다. 받는 쪽에는 쓰지 않는다.
-    async fn replicate_disks(&self, id: Uuid, req: &ReplicateRequest) -> Result<u64, DriverError> {
+    async fn replicate_disks(
+        &self,
+        id: Uuid,
+        req: &ReplicateRequest,
+    ) -> Result<(u64, Quiesced), DriverError> {
         let record = |st: &mut MockState, bytes| {
             st.replications.push(ReplicationCall {
                 vm: id,
@@ -1421,7 +1558,8 @@ impl Hypervisor for MockHypervisor {
             });
         }
         record(&mut st, Some(bytes));
-        Ok(bytes)
+        let quiesced = Self::quiesce(&mut st, id, req.quiesce);
+        Ok((bytes, quiesced))
     }
 
     async fn start_replica_receiver(
@@ -1559,19 +1697,37 @@ impl Hypervisor for MockHypervisor {
         let mut st = self.state.lock().unwrap();
         st.guest_pings.push(id);
         Self::controllable(&st, id)?;
-        let channel = st.guest_channels.contains(&id);
-        let answer = st.guest_answers.get(&id).copied();
-        match answer.unwrap_or(if channel {
-            GuestAnswer::Hang
-        } else {
-            GuestAnswer::None
-        }) {
+        match Self::agent_answer(&st, id) {
             GuestAnswer::None => Err(DriverError::InvalidSpec(format!(
                 "VM {id} has no guest agent channel"
             ))),
             GuestAnswer::Ok => Ok(true),
             GuestAnswer::Hang => Ok(false),
         }
+    }
+
+    /// 에이전트가 `Ok`로 답하면 `set_guest_info`로 정한 정보(없으면 빈 정보)다.
+    async fn guest_info(&self, id: Uuid) -> Result<GuestInfo, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.guest_info_calls.push(id);
+        Self::controllable(&st, id)?;
+        Self::agent_session(&st, id)?;
+        let mut info = st.guest_infos.get(&id).cloned().unwrap_or_default();
+        info.truncate();
+        Ok(info)
+    }
+
+    async fn set_user_password(
+        &self,
+        id: Uuid,
+        user: &str,
+        _password: &str,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        Self::agent_session(&st, id)?;
+        st.password_sets.push((id, user.to_string()));
+        Ok(())
     }
 
     async fn start_incoming(
@@ -1938,6 +2094,14 @@ impl Hypervisor for MockHypervisor {
         })
     }
 
+    async fn firmware_caps(&self) -> FirmwareCaps {
+        let caps = self.state.lock().unwrap().firmware_caps;
+        caps.unwrap_or(FirmwareCaps {
+            tpm: true,
+            secure_boot: true,
+        })
+    }
+
     /// 실제 드라이버처럼 켤 때 수 아래·상한 위는 `InvalidSpec`이다. 지금 수에서 `to`로 바꾼다(`from`은 기록만).
     async fn set_vcpus(
         &self,
@@ -2208,6 +2372,69 @@ mod tests {
         assert_eq!(hv.guest_pings(plain.id), 1);
     }
 
+    /// 게스트 정보·비밀번호·에이전트 종료·얼리기는 `guest_ping`과 같은 답(채널, `set_guest_agent`)을 따른다.
+    #[tokio::test]
+    async fn agent_calls_follow_the_set_answer() {
+        let hv = MockHypervisor::default();
+        let watched = VmRuntimeSpec {
+            guest_agent: true,
+            ..spec()
+        };
+        hv.start(&watched, None).await.unwrap();
+        let id = watched.id;
+        assert!(matches!(
+            hv.guest_info(id).await,
+            Err(DriverError::GuestAgent(_))
+        ));
+        hv.stop(id, StopMode::Agent).await.unwrap();
+        assert_eq!(
+            hv.snapshot_save(id, "a", false, true).await.unwrap(),
+            Quiesced::Skipped(
+                "guest agent unavailable: the guest agent did not answer guest-sync-delimited in time"
+                    .into()
+            )
+        );
+        hv.set_guest_agent(id, GuestAnswer::Ok);
+        let info = GuestInfo {
+            hostname: Some("web-1".into()),
+            ..GuestInfo::default()
+        };
+        hv.set_guest_info(id, info.clone());
+        assert_eq!(hv.guest_info(id).await.unwrap(), info);
+        assert_eq!(hv.guest_info_calls(id), 2);
+        hv.set_user_password(id, "root", "secret").await.unwrap();
+        assert_eq!(hv.password_sets(id), ["root"]);
+        hv.stop(id, StopMode::Agent).await.unwrap();
+        hv.stop(id, StopMode::Acpi).await.unwrap();
+        assert_eq!(
+            hv.stop_requests(id),
+            [StopMode::Acpi, StopMode::Agent, StopMode::Acpi]
+        );
+        assert_eq!(
+            hv.snapshot_save(id, "b", false, true).await.unwrap(),
+            Quiesced::Yes
+        );
+        // 메모리 스냅샷은 얼리지 않는다.
+        assert_eq!(
+            hv.snapshot_save(id, "c", true, true).await.unwrap(),
+            Quiesced::No
+        );
+        hv.fail_freeze(id, Some("frozen already"));
+        let q = hv.snapshot_save(id, "d", false, true).await.unwrap();
+        assert_eq!(q, Quiesced::Skipped("frozen already".into()));
+        assert!(q.warning().unwrap().contains("crash-consistent"));
+        assert_eq!(hv.quiesce_calls(id), [true, true, false, true]);
+        assert_eq!(
+            hv.firmware_caps().await,
+            FirmwareCaps {
+                tpm: true,
+                secure_boot: true
+            }
+        );
+        hv.set_firmware_caps(FirmwareCaps::default());
+        assert_eq!(hv.firmware_caps().await, FirmwareCaps::default());
+    }
+
     #[tokio::test]
     async fn start_is_idempotent_and_emits_one_event() {
         let hv = MockHypervisor::default();
@@ -2438,7 +2665,7 @@ mod tests {
         let hv = MockHypervisor::default();
         let vm = spec();
         for res in [
-            hv.snapshot_save(vm.id, "s", true).await,
+            hv.snapshot_save(vm.id, "s", true, false).await.map(drop),
             hv.snapshot_delete(vm.id, "s").await,
             hv.block_resize(vm.id, 0, 1 << 30).await,
             hv.pause(vm.id).await,
@@ -2448,8 +2675,8 @@ mod tests {
         }
 
         hv.start(&vm, None).await.unwrap();
-        hv.snapshot_save(vm.id, "mem", true).await.unwrap();
-        hv.snapshot_save(vm.id, "disk", false).await.unwrap();
+        hv.snapshot_save(vm.id, "mem", true, false).await.unwrap();
+        hv.snapshot_save(vm.id, "disk", false, false).await.unwrap();
         hv.snapshot_delete(vm.id, "mem").await.unwrap();
         // 없는 태그를 지워도 성공한다.
         hv.snapshot_delete(vm.id, "mem").await.unwrap();
@@ -2468,7 +2695,10 @@ mod tests {
 
         // QMP로 다룰 수 없는 VM은 다시 시도할 수 있는 오류로 끝난다.
         hv.set_unresponsive(vm.id, true);
-        let err = hv.snapshot_save(vm.id, "x", false).await.unwrap_err();
+        let err = hv
+            .snapshot_save(vm.id, "x", false, false)
+            .await
+            .unwrap_err();
         assert!(err.is_transient(), "{err:?}");
     }
 
@@ -2479,7 +2709,7 @@ mod tests {
         hv.start(&vm, None).await.unwrap();
         // 저장은 태그를 남긴 채 실패한다.
         hv.fail_next_snapshot(DriverError::StartFailed("boom".into()));
-        assert!(hv.snapshot_save(vm.id, "s", true).await.is_err());
+        assert!(hv.snapshot_save(vm.id, "s", true, false).await.is_err());
         assert_eq!(hv.snapshots(vm.id), vec![("s".to_string(), true)]);
         hv.fail_next_snapshot(DriverError::StartFailed("boom".into()));
         assert!(hv.snapshot_delete(vm.id, "s").await.is_err());
@@ -2530,9 +2760,12 @@ mod tests {
         for res in [
             hv.add_bitmaps(vm.id, "opl-a").await,
             hv.remove_bitmaps(vm.id, None).await,
-            hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a").await,
-            hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets())
-                .await,
+            hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a", false)
+                .await
+                .map(drop),
+            hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets(), false)
+                .await
+                .map(drop),
             hv.clear_backup_leftovers(vm.id).await,
         ] {
             assert!(matches!(res, Err(DriverError::NotRunning(_))), "{res:?}");
@@ -2542,7 +2775,7 @@ mod tests {
 
         hv.start(&vm, None).await.unwrap();
         // 전체 백업: 스냅샷과 비트맵을 한 시점에. qcow2 디스크의 비트맵만 persistent다.
-        hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a")
+        hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a", false)
             .await
             .unwrap();
         assert_eq!(hv.snapshots(vm.id), [("t".to_string(), false)]);
@@ -2559,7 +2792,7 @@ mod tests {
         assert!(hv.add_bitmaps(vm.id, "opl-a").await.is_err());
 
         // 증분: 성공하면 새 비트맵만 남는다.
-        hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets())
+        hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets(), false)
             .await
             .unwrap();
         assert_eq!(names(&hv, vm.id), [["opl-b"], ["opl-b"]]);
@@ -2569,26 +2802,26 @@ mod tests {
             error: "No space left on device".into(),
         }));
         assert!(
-            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets())
+            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets(), false)
                 .await
                 .is_err()
         );
         assert_eq!(names(&hv, vm.id), [["opl-b"], ["opl-b"]]);
         // 없는 비트맵, 디스크와 맞지 않는 대상, inconsistent 비트맵은 실패한다.
         assert!(
-            hv.incremental_backup(vm.id, "opl-x", "opl-c", &targets())
+            hv.incremental_backup(vm.id, "opl-x", "opl-c", &targets(), false)
                 .await
                 .is_err()
         );
         assert!(
-            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets()[..1])
+            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets()[..1], false)
                 .await
                 .is_err()
         );
         hv.set_bitmap_inconsistent(vm.id, 1, "opl-b");
         assert!(hv.backup_bitmaps(vm.id).await.unwrap()[1].bitmaps[0].inconsistent);
         assert!(
-            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets())
+            hv.incremental_backup(vm.id, "opl-b", "opl-c", &targets(), false)
                 .await
                 .is_err()
         );
@@ -2657,6 +2890,7 @@ mod tests {
             speed: None,
             stall: Duration::from_secs(600),
             progress: None,
+            quiesce: false,
         }
     }
 
@@ -2681,7 +2915,7 @@ mod tests {
         req.progress = Some(tx);
         assert_eq!(
             hv.replicate_disks(vm.id, &req).await.unwrap(),
-            MOCK_MIRROR_BYTES
+            (MOCK_MIRROR_BYTES, Quiesced::No)
         );
         assert_eq!(rx.borrow().done_bytes, MOCK_MIRROR_BYTES);
         assert_eq!(names(&hv, vm.id), [vec!["opl-repl-1"], vec![]]);
@@ -2695,7 +2929,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            hv.replicate_disks(vm.id, &req).await.unwrap(),
+            hv.replicate_disks(vm.id, &req).await.unwrap().0,
             MOCK_INCREMENT_BYTES + MOCK_MIRROR_BYTES
         );
         assert_eq!(
@@ -2741,7 +2975,7 @@ mod tests {
             assert_eq!(hv.replications().len(), 6);
             hv.release_replicate();
         });
-        assert_eq!(held.unwrap(), MOCK_MIRROR_BYTES);
+        assert_eq!(held.unwrap().0, MOCK_MIRROR_BYTES);
     }
 
     /// 받는 QEMU: 회차마다 하나, 끝내기 실패는 받는 QEMU를 남기고, 끄기는 없어도 성공한다.
@@ -2799,7 +3033,7 @@ mod tests {
         hv.start(&vm, None).await.unwrap();
         hv.fail_next_snapshot(DriverError::Timeout("QMP transaction"));
         assert!(
-            hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a")
+            hv.snapshot_save_with_bitmap(vm.id, "t", "opl-a", false)
                 .await
                 .is_err()
         );

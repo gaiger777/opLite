@@ -71,6 +71,7 @@ fn config(root: &Path) -> QemuConfig {
         state_dir: root.join("state"),
         net: Some(Arc::new(IpRoute::default())),
         systemd_scope: std::env::var_os("OPL_TEST_SYSTEMD").is_some(),
+        swtpm: Default::default(),
     }
 }
 

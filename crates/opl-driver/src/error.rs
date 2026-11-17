@@ -54,6 +54,9 @@ pub enum DriverError {
     /// VXLAN 네트워크 몇 개를 맞추지 못했다. 내용은 네트워크(VNI)마다의 오류다. 나머지는 맞췄다.
     #[error("VXLAN overlay sync failed: {0}")]
     Overlay(String),
+    /// 게스트 에이전트가 답하지 않았거나 오류로 답했다(계획 59). API는 409 `guest_agent_unavailable`로 알린다.
+    #[error("guest agent unavailable: {0}")]
+    GuestAgent(String),
     #[error(transparent)]
     Qmp(#[from] QmpError),
     #[error("i/o error: {0}")]
@@ -95,6 +98,7 @@ impl DriverError {
             | DriverError::Rbd(_)
             | DriverError::Migration(_)
             | DriverError::Replication(_)
+            | DriverError::GuestAgent(_)
             | DriverError::Overlay(_) => false,
         }
     }
@@ -161,6 +165,7 @@ mod tests {
         assert!(!DriverError::Lvm("Volume group \"vg0\" not found".into()).is_transient());
         assert!(!DriverError::Zfs("dataset does not exist".into()).is_transient());
         assert!(!DriverError::Rbd("rbd: error opening pool 'x'".into()).is_transient());
+        assert!(!DriverError::GuestAgent("no answer".into()).is_transient());
         // 마이그레이션 실패는 Task가 되돌린다. 같은 QEMU로 다시 받을 수 없다.
         assert!(!DriverError::Migration("TLS handshake failed".into()).is_transient());
     }

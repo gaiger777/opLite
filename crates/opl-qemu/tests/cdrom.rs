@@ -48,6 +48,7 @@ fn machines() -> Vec<(&'static str, HostProfile, Firmware)> {
             qemu_binary: PathBuf::from("qemu-system-x86_64"),
             uefi_code: share.join("edk2-x86_64-code.fd"),
             uefi_vars_template: share.join("edk2-i386-vars.fd"),
+            secure_boot: None,
         };
         out.push(("q35-tcg-bios", q35.clone(), Firmware::Bios));
         if q35.uefi_code.exists() && q35.uefi_vars_template.exists() {

@@ -240,3 +240,102 @@ async fn blockstats_count_writes_to_the_disk() {
         .unwrap();
     assert!(exit.success(), "qemu exited with {exit}");
 }
+
+/// x86_64 TCG에서 Secure Boot 펌웨어를 고를 수 있으면 그 쌍. Linux는 descriptor로 찾고(`ovmf`의 MS 키 등록 펌웨어),
+/// macOS는 Homebrew의 `edk2-x86_64-secure-code.fd`(descriptor에 `enrolled-keys`가 없어 discover는 고르지 않는다)를
+/// 쓴다. `qemu-system-x86_64`나 펌웨어가 없으면 None이다.
+fn secure_boot_x86_host() -> Option<HostProfile> {
+    let found = std::process::Command::new("qemu-system-x86_64")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !found {
+        return None;
+    }
+    let pair = if cfg!(target_os = "macos") {
+        let share = PathBuf::from(
+            std::env::var("OPL_QEMU_SHARE").unwrap_or_else(|_| "/opt/homebrew/share/qemu".into()),
+        );
+        opl_qemu::FirmwarePair {
+            code: share.join("edk2-x86_64-secure-code.fd"),
+            vars_template: share.join("edk2-i386-vars.fd"),
+        }
+    } else {
+        let dirs = opl_qemu::firmware::SYSTEM_DIRS.map(PathBuf::from);
+        opl_qemu::firmware::discover(&dirs, Arch::X86_64)?
+    };
+    if !pair.code.exists() || !pair.vars_template.exists() {
+        return None;
+    }
+    Some(HostProfile {
+        arch: Arch::X86_64,
+        accel: opl_qemu::Accel::Tcg,
+        qemu_binary: PathBuf::from("qemu-system-x86_64"),
+        uefi_code: PathBuf::new(),
+        uefi_vars_template: pair.vars_template.clone(),
+        secure_boot: Some(pair),
+    })
+}
+
+/// Secure Boot q35: `smm=on`과 secure pflash로 Secure Boot 펌웨어가 켜져 돈다(SMM이 없으면 펌웨어가 멈춘다).
+#[tokio::test]
+async fn secure_boot_firmware_runs_with_smm_and_secure_flash() {
+    let Some(host) = secure_boot_x86_host() else {
+        eprintln!("no x86_64 QEMU or Secure Boot firmware; skipping");
+        return;
+    };
+    let tmp = tempfile::Builder::new()
+        .prefix("opl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let id = Uuid::now_v7();
+    let paths = RuntimePaths::new(tmp.path(), id).unwrap();
+    std::fs::create_dir_all(&paths.dir).unwrap();
+    let pair = host.secure_boot.clone().unwrap();
+    std::fs::copy(&pair.vars_template, &paths.uefi_vars).unwrap();
+    let disk = tmp.path().join("root.qcow2");
+    let status = std::process::Command::new("qemu-img")
+        .args(["create", "-q", "-f", "qcow2"])
+        .arg(&disk)
+        .arg("1G")
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let spec = VmRuntimeSpec {
+        machine: opl_types::vm::MachineType::Q35,
+        cpu: CpuSpec {
+            model: CpuModel::Max,
+            ..spec(id, disk.clone()).cpu
+        },
+        secure_boot: true,
+        ..spec(id, disk)
+    };
+    let args = build_cmdline(&spec, &host, &paths).unwrap();
+    assert!(
+        args.contains(&"q35,smm=on,accel=tcg".to_string()),
+        "{args:?}"
+    );
+    let mut child = tokio::process::Command::new(&host.qemu_binary)
+        .args(&args)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    wait_for(&paths.qmp_socket).await;
+    let qmp = QmpClient::connect(&paths.qmp_socket).await.unwrap();
+    assert_eq!(qmp.qom_get("/machine", "smm").await.unwrap(), "on");
+    assert_eq!(
+        qmp.qom_get("/machine/system.flash0", "secure")
+            .await
+            .unwrap(),
+        true
+    );
+    qmp.cont().await.unwrap();
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(qmp.query_status().await.unwrap(), RunState::Running);
+    qmp.quit().await.unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .expect("qemu did not exit within 10s")
+        .unwrap();
+    assert!(exit.success(), "qemu exited with {exit}");
+}

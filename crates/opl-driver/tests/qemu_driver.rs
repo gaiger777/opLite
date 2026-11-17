@@ -29,6 +29,7 @@ fn config(root: &Path) -> QemuConfig {
         net: None,
         // systemd가 있는 Linux(CI)에서 `OPL_TEST_SYSTEMD=1`로 스코프 실행까지 확인한다.
         systemd_scope: std::env::var_os("OPL_TEST_SYSTEMD").is_some(),
+        swtpm: Default::default(),
     }
 }
 
@@ -140,6 +141,98 @@ async fn guest_agent_channel_without_a_guest_does_not_answer() {
     hv.stop(plain.id, StopMode::Force).await.unwrap();
     hv.stop(watched.id, StopMode::Force).await.unwrap();
     assert_eq!(hv.guest_ping(watched.id).await.ok(), None);
+}
+
+/// 게스트 OS가 없으면(채널은 있음) 에이전트 호출이 모두 물러선다: 정보는 `GuestAgent` 오류, 에이전트 종료는 ACPI로
+/// 넘어가고, 얼려 찍는 스냅샷은 얼리지 못한 이유와 함께 찍힌다.
+#[tokio::test]
+async fn agent_calls_without_a_guest_fall_back() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let disk = tmp.path().join("disk0.qcow2");
+    let vm = with_qcow2_disk(
+        VmRuntimeSpec {
+            guest_agent: true,
+            ..spec()
+        },
+        &disk,
+    );
+    hv.start(&vm, None).await.unwrap();
+    let err = hv.guest_info(vm.id).await.unwrap_err();
+    assert!(
+        matches!(err, opl_driver::DriverError::GuestAgent(_)),
+        "{err}"
+    );
+    let err = hv.set_user_password(vm.id, "root", "pw").await.unwrap_err();
+    assert!(!err.to_string().contains("pw"), "{err}");
+    let q = hv.snapshot_save(vm.id, "q", false, true).await.unwrap();
+    assert!(q.warning().is_some(), "{q:?}");
+    assert_eq!(image_info(&disk).0, ["q"]);
+    assert!(
+        !tmp.path()
+            .join("run/vm")
+            .join(vm.id.to_string())
+            .join("fsfrozen")
+            .exists()
+    );
+    // ACPI로 넘어가 요청만 보낸다(펌웨어만 도는 VM은 꺼지지 않을 수 있다).
+    hv.stop(vm.id, StopMode::Agent).await.unwrap();
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// 실제 swtpm(`vtpm-it`, Linux CI의 swtpm·swtpm-tools): TPM VM을 켜면 `swtpm_setup`이 상태를 만들고 QEMU에 emulator
+/// TPM이 붙는다. 끄면 swtpm도 끝나고, 다시 켜면 같은 상태 파일을 쓴다.
+#[cfg(feature = "vtpm-it")]
+#[tokio::test]
+async fn a_tpm_vm_runs_with_its_own_swtpm() {
+    use opl_types::runtime::RuntimeTpm;
+
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let mut vm = VmRuntimeSpec {
+        tpm: Some(RuntimeTpm {
+            fresh: true,
+            epoch: 0,
+        }),
+        ..spec()
+    };
+    hv.start(&vm, None).await.unwrap();
+    let state = tmp.path().join("state");
+    let permall = opl_driver::tpm_state_path(&state, vm.id);
+    let first = std::fs::read(&permall).unwrap();
+    assert!(!first.is_empty());
+    let info = hv.human_monitor_command(vm.id, "info tpm").await.unwrap();
+    assert!(info.contains("emulator"), "{info}");
+    let run = tmp.path().join("run/vm").join(vm.id.to_string());
+    let pid: u32 = std::fs::read_to_string(run.join("swtpm.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(process_exists(pid));
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while process_exists(pid) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "swtpm {pid} outlived its QEMU"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // 다시 켜면(이번에는 fresh가 아님) 같은 TPM이다.
+    vm.tpm = Some(RuntimeTpm {
+        fresh: false,
+        epoch: 0,
+    });
+    hv.start(&vm, None).await.unwrap();
+    let info = hv.human_monitor_command(vm.id, "info tpm").await.unwrap();
+    assert!(info.contains("emulator"), "{info}");
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    assert!(!std::fs::read(&permall).unwrap().is_empty());
+    assert!(
+        hv.firmware_caps().await.tpm,
+        "swtpm and the emulator backend are installed"
+    );
 }
 
 #[tokio::test]
@@ -389,11 +482,11 @@ async fn snapshots_of_running_vm_and_start_restoring_memory() {
     assert_eq!(image_info(&disk).1, 2 << 30);
 
     // 메모리 스냅샷: 저장하는 동안 멈췄다가 다시 실행된다.
-    hv.snapshot_save(vm.id, "mem", true).await.unwrap();
+    hv.snapshot_save(vm.id, "mem", true, false).await.unwrap();
     let st = hv.inspect(vm.id).await.unwrap().unwrap();
     assert_eq!(st.status, RuntimeStatus::Running);
     // 디스크만 스냅샷
-    hv.snapshot_save(vm.id, "disk", false).await.unwrap();
+    hv.snapshot_save(vm.id, "disk", false, false).await.unwrap();
     assert_eq!(image_info(&disk).0, ["mem", "disk"]);
     hv.snapshot_delete(vm.id, "disk").await.unwrap();
     // 없는 태그를 지워도 성공한다.
@@ -434,7 +527,10 @@ async fn memory_snapshot_needs_a_disk() {
     let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
     let vm = spec();
     hv.start(&vm, None).await.unwrap();
-    let err = hv.snapshot_save(vm.id, "mem", true).await.unwrap_err();
+    let err = hv
+        .snapshot_save(vm.id, "mem", true, false)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, opl_driver::DriverError::InvalidSpec(_)),
         "{err:?}"
@@ -544,7 +640,7 @@ async fn incremental_backup_holds_only_changed_blocks() {
     hv.start(&vm, None).await.unwrap();
 
     // 전체 백업: 스냅샷과 비트맵을 한 시점에 만들고 스냅샷을 내보낸다.
-    hv.snapshot_save_with_bitmap(vm.id, "full", "opl-a")
+    hv.snapshot_save_with_bitmap(vm.id, "full", "opl-a", false)
         .await
         .unwrap();
     let disks = hv.backup_bitmaps(vm.id).await.unwrap();
@@ -586,13 +682,13 @@ async fn incremental_backup_holds_only_changed_blocks() {
         size: 1 << 30,
     }];
     let err = hv
-        .incremental_backup(vm.id, "opl-x", "opl-b", &targets)
+        .incremental_backup(vm.id, "opl-x", "opl-b", &targets, false)
         .await
         .unwrap_err();
     assert!(err.to_string().contains("opl-x"), "{err}");
     assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-a"]]);
 
-    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets)
+    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets, false)
         .await
         .unwrap();
     assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-b"]]);
@@ -681,7 +777,7 @@ async fn raw_disk_bitmaps_do_not_survive_a_restart() {
         path: incr.clone(),
         size: 64 << 20,
     }];
-    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets)
+    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets, false)
         .await
         .unwrap();
     assert_eq!(bitmap_names(&hv, vm.id).await, [["opl-b"]]);
@@ -735,7 +831,7 @@ async fn incremental_backup_holds_zeroed_and_discarded_blocks() {
     let vm = with_qcow2_disk(spec(), &disk);
     assert!(qemu_io(&disk, "write -P 0xab 0 4M"));
     hv.start(&vm, None).await.unwrap();
-    hv.snapshot_save_with_bitmap(vm.id, "full", "opl-a")
+    hv.snapshot_save_with_bitmap(vm.id, "full", "opl-a", false)
         .await
         .unwrap();
     let full = tmp.path().join("full.qcow2");
@@ -772,7 +868,7 @@ async fn incremental_backup_holds_zeroed_and_discarded_blocks() {
         path: incr.clone(),
         size: 1 << 30,
     }];
-    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets)
+    hv.incremental_backup(vm.id, "opl-a", "opl-b", &targets, false)
         .await
         .unwrap();
     hv.stop(vm.id, StopMode::Force).await.unwrap();
@@ -981,6 +1077,7 @@ fn q35_tcg(root: &Path) -> Option<QemuConfig> {
             qemu_binary: "qemu-system-x86_64".into(),
             uefi_code: Default::default(),
             uefi_vars_template: Default::default(),
+            secure_boot: None,
         },
         ..config(root)
     })

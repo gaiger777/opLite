@@ -12,6 +12,7 @@ pub mod net;
 pub mod qemu;
 pub mod replication;
 pub mod storage;
+pub mod tpm;
 pub mod vip;
 
 pub use error::DriverError;
@@ -24,7 +25,7 @@ pub use hostcheck::{
 };
 pub use hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
+    Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 pub use migration::{
     CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
@@ -46,4 +47,5 @@ pub use storage::{
     ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root, disk_location, is_iso_image,
     parse_ceph_df, parse_lvs, parse_vgs, parse_zfs_dataset, pool_root,
 };
+pub use tpm::{SwtpmConfig, read_firmware_epoch, tpm_state_path, vm_tpm_dir, write_firmware_epoch};
 pub use vip::{IpVip, VipAddress, VipNet, VipRecord, release_recorded};

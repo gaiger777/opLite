@@ -39,6 +39,12 @@ pub enum CmdlineError {
     TooManyPorts,
     #[error("{0} {1} was added while running but has no hotplug port")]
     MissingPort(&'static str, usize),
+    #[error("Secure Boot needs UEFI firmware")]
+    SecureBootNeedsUefi,
+    #[error(
+        "this node has no Secure Boot firmware (a QEMU firmware descriptor with secure-boot and enrolled-keys)"
+    )]
+    NoSecureBootFirmware,
 }
 
 /// QEMU 인자 목록(바이너리 제외)을 만든다. 부수 효과가 없는 순수 함수다.
@@ -64,9 +70,12 @@ pub fn build_cmdline(
         MachineType::Q35 => "q35",
         MachineType::Virt => "virt",
     };
+    // Secure Boot는 q35에서 SMM이 있어야 펌웨어의 변수 저장소를 게스트 OS가 바꾸지 못한다.
+    let smm = spec.secure_boot && spec.machine == MachineType::Q35;
+    let smm_opt = if smm { ",smm=on" } else { "" };
     a.opt(
         "-machine",
-        format!("{machine},accel={}", host.accel.as_str()),
+        format!("{machine}{smm_opt},accel={}", host.accel.as_str()),
     );
     let cpu = match (spec.cpu.model, host.accel) {
         (CpuModel::Host, Accel::Tcg) | (CpuModel::Max, _) => "max",
@@ -122,11 +131,22 @@ pub fn build_cmdline(
     }
 
     if spec.firmware == Firmware::Uefi {
+        // Secure Boot면 MS 키를 등록한 펌웨어의 코드다([`check_compat`]이 있는지 먼저 본다).
+        let code = match &host.secure_boot {
+            Some(pair) if spec.secure_boot => &pair.code,
+            _ => &host.uefi_code,
+        };
+        if smm {
+            a.opt(
+                "-global",
+                "driver=cfi.pflash01,property=secure,value=on".to_string(),
+            );
+        }
         a.opt(
             "-drive",
             format!(
                 "if=pflash,unit=0,format=raw,readonly=on,file={}",
-                esc_path(&host.uefi_code)
+                esc_path(code)
             ),
         );
         a.opt(
@@ -305,6 +325,20 @@ pub fn build_cmdline(
         }
     }
 
+    // TPM도 앞 장치들의 PCI 주소가 그대로이게 맨 뒤에 단다. swtpm은 드라이버가 먼저 띄워 둔다.
+    if spec.tpm.is_some() {
+        a.opt(
+            "-chardev",
+            format!("socket,id=chrtpm,path={}", esc_path(&paths.tpm_socket)),
+        );
+        a.opt("-tpmdev", "emulator,id=tpm0,chardev=chrtpm".to_string());
+        let dev = match spec.machine {
+            MachineType::Q35 => "tpm-crb,tpmdev=tpm0",
+            MachineType::Virt => "tpm-tis-device,tpmdev=tpm0",
+        };
+        a.opt("-device", dev.to_string());
+    }
+
     a.opt("-vnc", format!("unix:{}", esc_path(&paths.vnc_socket)));
     a.opt(
         "-qmp",
@@ -384,6 +418,14 @@ fn check_compat(spec: &VmRuntimeSpec, host: &HostProfile) -> Result<(), CmdlineE
     }
     if host.arch == Arch::Aarch64 && spec.firmware == Firmware::Bios {
         return Err(CmdlineError::BiosOnAarch64);
+    }
+    if spec.secure_boot {
+        if spec.firmware != Firmware::Uefi {
+            return Err(CmdlineError::SecureBootNeedsUefi);
+        }
+        if host.secure_boot.is_none() {
+            return Err(CmdlineError::NoSecureBootFirmware);
+        }
     }
     let sata = spec.disks.iter().filter(|d| d.bus == DiskBus::Sata).count();
     if sata > 0 && spec.machine != MachineType::Q35 {
@@ -503,6 +545,7 @@ mod tests {
             qemu_binary: PathBuf::from("/usr/bin/qemu-system-x86_64"),
             uefi_code: PathBuf::from("/usr/share/OVMF/OVMF_CODE.fd"),
             uefi_vars_template: PathBuf::from("/usr/share/OVMF/OVMF_VARS.fd"),
+            secure_boot: None,
         }
     }
 
@@ -1138,5 +1181,113 @@ mod tests {
         build_cmdline(&virt, &mac_host(), &paths()).unwrap();
         virt.cdroms.push(cdrom(None, None));
         assert_eq!(err(&virt, &mac_host()), CmdlineError::TooManyCdroms);
+    }
+
+    fn sb_host(mut host: HostProfile, code: &str, vars: &str) -> HostProfile {
+        host.secure_boot = Some(crate::firmware::FirmwarePair {
+            code: code.into(),
+            vars_template: vars.into(),
+        });
+        host
+    }
+
+    /// TPM은 CD·씨앗 뒤, `-vnc` 바로 앞에 붙고 앞 장치의 인자는 그대로다. q35는 `tpm-crb`, virt는 `tpm-tis-device`다.
+    /// 받는 쪽도 같다.
+    #[test]
+    fn tpm_goes_after_everything_else() {
+        let tpm = Some(opl_types::runtime::RuntimeTpm {
+            fresh: false,
+            epoch: 0,
+        });
+        let sock =
+            "socket,id=chrtpm,path=/run/opl/vm/00000000-0000-0000-0000-000000000000/tpm.sock";
+        for (spec, host, dev) in [
+            (x86_spec(), x86_host(), "tpm-crb,tpmdev=tpm0"),
+            (mac_spec(), mac_host(), "tpm-tis-device,tpmdev=tpm0"),
+        ] {
+            let mut spec = spec;
+            spec.cdroms = vec![cdrom(Some("/pools/iso/x.raw"), None)];
+            let without = build_cmdline(&spec, &host, &paths()).unwrap();
+            let with_tpm = VmRuntimeSpec { tpm, ..spec };
+            let with = build_cmdline(&with_tpm, &host, &paths()).unwrap();
+            assert_inserted_before_vnc(
+                &with,
+                &without,
+                &[
+                    "-chardev",
+                    sock,
+                    "-tpmdev",
+                    "emulator,id=tpm0,chardev=chrtpm",
+                    "-device",
+                    dev,
+                ],
+            );
+            let incoming = build_incoming_cmdline(&with_tpm, &host, &paths()).unwrap();
+            assert_eq!(incoming[..with.len()], with[..]);
+        }
+    }
+
+    /// Secure Boot(q35): SMM, secure pflash, MS 키 펌웨어의 코드. 변수 파일 경로는 그대로다. virt는 코드만 바뀐다.
+    #[test]
+    fn secure_boot_uses_smm_and_the_enrolled_firmware() {
+        let host = sb_host(x86_host(), "/usr/share/OVMF/OVMF_CODE_4M.secboot.fd", "/v");
+        let plain = build_cmdline(&x86_spec(), &host, &paths()).unwrap();
+        let spec = VmRuntimeSpec {
+            secure_boot: true,
+            ..x86_spec()
+        };
+        let args = build_cmdline(&spec, &host, &paths()).unwrap();
+        assert!(args.contains(&"q35,smm=on,accel=kvm".to_string()));
+        let g = args.iter().position(|a| a == "-global").unwrap();
+        assert_eq!(args[g + 1], "driver=cfi.pflash01,property=secure,value=on");
+        assert_eq!(args[g + 2], "-drive");
+        assert_eq!(
+            args[g + 3],
+            "if=pflash,unit=0,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+        );
+        assert!(args.contains(
+            &"if=pflash,unit=1,format=raw,file=/run/opl/vm/00000000-0000-0000-0000-000000000000/uefi-vars.fd"
+                .to_string()
+        ));
+        // 끄면 Secure Boot 펌웨어가 있어도 계획 58과 같다.
+        assert!(plain.contains(&"q35,accel=kvm".to_string()));
+        assert!(
+            !plain
+                .iter()
+                .any(|a| a.contains("secboot") || a == "-global")
+        );
+
+        let host = sb_host(mac_host(), "/sb/code.fd", "/sb/vars.fd");
+        let spec = VmRuntimeSpec {
+            secure_boot: true,
+            ..mac_spec()
+        };
+        let args = build_cmdline(&spec, &host, &paths()).unwrap();
+        assert!(args.contains(&"virt,accel=hvf".to_string()));
+        assert!(!args.contains(&"-global".to_string()));
+        assert!(
+            args.contains(&"if=pflash,unit=0,format=raw,readonly=on,file=/sb/code.fd".to_string())
+        );
+    }
+
+    #[test]
+    fn secure_boot_needs_uefi_and_the_firmware() {
+        let spec = VmRuntimeSpec {
+            secure_boot: true,
+            ..x86_spec()
+        };
+        assert_eq!(
+            build_cmdline(&spec, &x86_host(), &paths()).unwrap_err(),
+            CmdlineError::NoSecureBootFirmware
+        );
+        let bios = VmRuntimeSpec {
+            firmware: Firmware::Bios,
+            ..spec
+        };
+        let host = sb_host(x86_host(), "/c", "/v");
+        assert_eq!(
+            build_cmdline(&bios, &host, &paths()).unwrap_err(),
+            CmdlineError::SecureBootNeedsUefi
+        );
     }
 }

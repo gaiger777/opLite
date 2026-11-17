@@ -595,15 +595,20 @@ where
     } else if let Some(bitmap) = bitmap {
         // 비트맵 때문에 백업이 실패하지 않게 비트맵 없이 한 번 더 찍는다(transaction이라 아무것도 만들지
         // 않았다). 그 백업은 비트맵을 남기지 않아 다음은 전체다.
-        match ctx.hv.snapshot_save_with_bitmap(vm_id, tag, bitmap).await {
+        match ctx.hv.snapshot_save_with_bitmap(vm_id, tag, bitmap, false).await {
             Err(e) if !e.may_be_in_progress() => {
                 tracing::warn!(vm = %vm_id, snapshot = %id, error = %e, "cannot add dirty bitmap; snapshotting without it");
-                ctx.hv.snapshot_save(vm_id, tag, false).await
+                ctx.hv.snapshot_save(vm_id, tag, false, false).await
             }
             r => r,
         }
+        .map(drop)
     } else {
-        ctx.hv.snapshot_save(vm_id, tag, memory).await
+        // 얼리기(quiesce)는 스테이지 4가 VM의 `guest_agent.freeze_fs`로 정한다.
+        ctx.hv
+            .snapshot_save(vm_id, tag, memory, false)
+            .await
+            .map(drop)
     };
     let resumed = match &mut paused {
         Some(guard) => {

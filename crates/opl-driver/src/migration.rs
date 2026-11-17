@@ -281,6 +281,16 @@ mod tests {
         let port = busy.local_addr().unwrap().port();
         assert_eq!(pick_port("127.0.0.1", port..=port, &[]), None);
         drop(busy);
+        // 같은 시험 프로세스의 다른 시험이 그 순간 자식 프로세스를 띄우면(fork) 자식이 exec할 때까지 닫은 소켓을
+        // 들고 있어 포트가 잠깐 쓰이는 것으로 보인다(swtpm 시험의 `ps` 등). 잠시 다시 본다.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while pick_port("127.0.0.1", port..=port, &[]).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "port {port} stayed busy"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(pick_port("127.0.0.1", port..=port, &[]), Some(port));
         // 이미 고른 포트(아직 열지 않음)는 건너뛴다.
         assert_eq!(pick_port("127.0.0.1", port..=port, &[port]), None);

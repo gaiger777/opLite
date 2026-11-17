@@ -163,6 +163,7 @@ fn q35_tcg() -> Option<HostProfile> {
         qemu_binary: PathBuf::from("qemu-system-x86_64"),
         uefi_code: PathBuf::new(),
         uefi_vars_template: PathBuf::new(),
+        secure_boot: None,
     })
 }
 

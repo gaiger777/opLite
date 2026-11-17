@@ -474,7 +474,13 @@ async fn incremental_disks(
     }
     let created_at = now_secs();
     ctx.hv
-        .incremental_backup(vm.id, &bitmap_name(parent.backup.id), bitmap, &targets)
+        .incremental_backup(
+            vm.id,
+            &bitmap_name(parent.backup.id),
+            bitmap,
+            &targets,
+            false,
+        )
         .await
         .map_err(|e| format!("incremental backup failed: {e}"))?;
     let mut out = Vec::with_capacity(targets.len());

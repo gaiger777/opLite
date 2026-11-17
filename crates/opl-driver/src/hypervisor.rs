@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 pub use opl_qemu::BitmapInfo;
-use opl_types::node::NodeHotplug;
+use opl_types::guest::GuestInfo;
+use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::runtime::{RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, RunningHardware};
 use tokio::sync::broadcast;
@@ -21,6 +22,10 @@ use crate::replication::{ReceiverExport, ReplicateRequest};
 pub enum StopMode {
     /// 게스트에 ACPI 전원 버튼을 보낸다. 게스트가 무시할 수 있다.
     Acpi,
+    /// 게스트 에이전트에 `guest-shutdown`(powerdown)을 보낸다(계획 59). 성공하면 에이전트가 답하지 않으므로 시간
+    /// 초과는 보낸 것으로 본다. 채널이 없거나, 연결하지 못하거나, 동기화되지 않거나, 오류로 답하면 곧바로 `Acpi`로
+    /// 넘어간다. `Acpi`처럼 요청만 보내고 돌아온다.
+    Agent,
     /// 프로세스를 즉시 끝낸다.
     Force,
     /// QMP 없이 곧바로 SIGKILL한다. I/O에 묶여 QMP에 답하지 못하는 QEMU에 쓴다(HA 검사의 다른 노드에서 다시 켜기).
@@ -113,6 +118,30 @@ pub struct VcpuChange {
     pub refused: bool,
 }
 
+/// 시점을 찍는 동작(`quiesce` 인자)에서 게스트 파일 시스템을 얼린 결과(계획 59)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Quiesced {
+    /// 얼리지 않았다(요청하지 않음, 메모리 스냅샷).
+    #[default]
+    No,
+    /// 시점을 고정하는 QMP 직전에 얼리고 직후에 녹였다.
+    Yes,
+    /// 얼리려 했지만 못 했다(이유). 시점은 crash-consistent다.
+    Skipped(String),
+}
+
+impl Quiesced {
+    /// 얼리지 못했을 때 Task에 남길 경고
+    pub fn warning(&self) -> Option<String> {
+        match self {
+            Quiesced::Skipped(why) => Some(format!(
+                "guest agent did not freeze file systems ({why}); the snapshot is crash-consistent"
+            )),
+            Quiesced::No | Quiesced::Yes => None,
+        }
+    }
+}
+
 /// 실행 중 붙이기([`Hypervisor::add_disk`]·[`Hypervisor::add_nic`])의 결과
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddOutcome {
@@ -149,16 +178,26 @@ pub trait Hypervisor: Send + Sync {
 
     /// 실행 중인 VM의 모든 디스크에 내부 스냅샷 `tag`를 만든다. `memory`면 메모리 상태도
     /// 첫 디스크에 담는다(저장하는 동안 VM이 멈춘다). 아니면 VM을 멈추지 않고 디스크만 찍는다.
-    async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError>;
+    /// `quiesce`면(메모리 없을 때만) 찍기 직전에 게스트 에이전트로 파일 시스템을 얼리고 직후에 녹인다. 얼리지
+    /// 못해도 찍고 `Skipped`를 돌려준다.
+    async fn snapshot_save(
+        &self,
+        id: Uuid,
+        tag: &str,
+        memory: bool,
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError>;
 
     /// 메모리 없이 실행 중인 VM의 모든 디스크에 내부 스냅샷 `tag`와 dirty bitmap `bitmap`을 한 시점에
-    /// 만든다(transaction 하나). 비트맵은 qcow2 디스크면 이미지에 저장된다(persistent).
+    /// 만든다(transaction 하나). 비트맵은 qcow2 디스크면 이미지에 저장된다(persistent). `quiesce`는
+    /// [`snapshot_save`](Self::snapshot_save)와 같다.
     async fn snapshot_save_with_bitmap(
         &self,
         id: Uuid,
         tag: &str,
         bitmap: &str,
-    ) -> Result<(), DriverError>;
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError>;
 
     /// 실행 중인 VM의 디스크 노드(`disk{i}`)마다 dirty bitmap들을 디스크 순서로 읽는다.
     async fn backup_bitmaps(&self, id: Uuid) -> Result<Vec<DiskBitmaps>, DriverError>;
@@ -178,14 +217,15 @@ pub trait Hypervisor: Send + Sync {
     /// 쓴다. 쓰기 시작하는 시점에 모든 디스크에 새 비트맵 `new`를 만든다(transaction 하나). 작업이
     /// 하나라도 실패하면 나머지를 취소한다. 대상 노드는 끝나면 닫는다(닫지 못하면 대상 파일이 온전하지
     /// 않으므로 실패). 성공하면 `parent`를 지우고, 실패하면 `new`를 지워 `parent`만 남긴다(대상 파일은
-    /// 호출자가 지운다).
+    /// 호출자가 지운다). `quiesce`면 작업을 시작하는 transaction 앞뒤로 게스트 파일 시스템을 얼리고 녹인다.
     async fn incremental_backup(
         &self,
         id: Uuid,
         parent: &str,
         new: &str,
         targets: &[BackupTarget],
-    ) -> Result<(), DriverError>;
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError>;
 
     /// 실행 중인 VM에 앞선 증분 백업이 남긴 작업과 대상 노드(`opl-backup-*`, opld가 기다리다 죽었다)와
     /// 남은 디스크 미러(`opl-mirror-*`), 복제 회차의 작업과 NBD 노드(`opl-repl-*`)를 치우고, 남은 마이그레이션
@@ -204,8 +244,13 @@ pub trait Hypervisor: Send + Sync {
     /// 실패한다. 모두 끝나면 작업을 지우고 플리싱을 떼고(이미지 지움) NBD 노드를 닫는다(닫을 때 받는 쪽에 쓴 것을
     /// 내보내므로, 닫지 못하면 실패). 작업이 실패하거나 `req.stall` 동안 보낸 양이 늘지 않으면 나머지를 취소하고,
     /// 플리싱을 떼고, 노드를 닫고, 새 비트맵을 지워 실패한다. 기준 비트맵은 성공해도 실패해도 지우지 않는다(호출자가
-    /// 고른다).
-    async fn replicate_disks(&self, id: Uuid, req: &ReplicateRequest) -> Result<u64, DriverError>;
+    /// 고른다). `req.quiesce`면 게스트를 멈추기 직전에 파일 시스템을 얼리고 이어서 실행한 직후에 녹인다(전송 내내
+    /// 얼리지 않는다). 보낸 바이트와 얼림 결과를 돌려준다.
+    async fn replicate_disks(
+        &self,
+        id: Uuid,
+        req: &ReplicateRequest,
+    ) -> Result<(u64, Quiesced), DriverError>;
 
     /// 복제 회차 `run`을 받을 QEMU를 게스트 장치 없이(`-machine none`, opld의 자식, 실행 디렉터리
     /// `{run_dir}/replica-{run}`의 pid 파일) 띄우고, `exports`마다 블록 노드(겹층이 있으면 복제본을 backing으로 둔
@@ -267,6 +312,20 @@ pub trait Hypervisor: Send + Sync {
     /// 실행 중인 VM의 게스트 에이전트에 `guest-ping`을 보낸다(QGA 채널, 3초). 답하면 true, 답이 없으면
     /// false(게스트 에이전트가 없거나 멈춤). 채널 없이 띄운 VM(`guest_agent`가 아님)이면 오류다.
     async fn guest_ping(&self, id: Uuid) -> Result<bool, DriverError>;
+
+    /// 실행 중인 VM의 게스트 에이전트에서 게스트 정보(에이전트 버전, OS, 호스트 이름, NIC/IP, 파일 시스템)를 모은다
+    /// (계획 59). 오류로 답한 명령의 칸은 비운다. 결과는 상한으로 자른다. 채널이 없으면 `InvalidSpec`, 에이전트가
+    /// 동기화에 답하지 않으면 `GuestAgent`다.
+    async fn guest_info(&self, id: Uuid) -> Result<GuestInfo, DriverError>;
+
+    /// 게스트 사용자 `user`의 비밀번호를 바꾼다(`guest-set-user-password`). 비밀번호는 기록하지 않고 오류에도 넣지
+    /// 않는다. 에이전트가 답하지 않거나 오류로 답하면 `GuestAgent`다.
+    async fn set_user_password(
+        &self,
+        id: Uuid,
+        user: &str,
+        password: &str,
+    ) -> Result<(), DriverError>;
 
     /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시(마이그레이션 Task
     /// `task`)를 남기고, TLS
@@ -359,6 +418,10 @@ pub trait Hypervisor: Send + Sync {
     /// 이 노드의 핫플러그 능력(계획 54). vCPU는 x86_64만, 메모리는 QEMU에 `virtio-mem-pci`가 있을 때다
     /// (`-device help`, 5초). 장치 목록을 읽지 못하면 메모리는 못 하는 것으로 하고 경고만 남긴다.
     async fn hotplug_caps(&self) -> NodeHotplug;
+
+    /// 이 노드의 펌웨어 능력(계획 59). TPM은 `swtpm`·`swtpm_setup`이 있고 swtpm이 TPM 2.0을 하며 QEMU에
+    /// `emulator` TPM 백엔드가 있을 때, Secure Boot는 MS 키를 등록한 펌웨어(firmware descriptor·설정)가 있을 때다.
+    async fn firmware_caps(&self) -> FirmwareCaps;
 
     /// 핫플러그 배치로 켠 VM의 켜진 vCPU 수를 `from`에서 `to`로 바꾸고 닿은 수를 돌려준다. `cpu`는 켤 때의 CPU
     /// 모양(소켓·상한으로 vCPU `i`의 자리를 정한다)이다. 늘리기(같은 수 포함)는 켤 때 수부터 `to` 아래의 빈 자리에

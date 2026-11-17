@@ -65,6 +65,7 @@ impl Host {
             state_dir: config.data_dir.clone(),
             net: self.net.clone(),
             systemd_scope: self.systemd_scope,
+            swtpm: Default::default(),
         }
     }
 

@@ -53,6 +53,7 @@ fn config(root: &Path) -> QemuConfig {
         state_dir: root.join("state"),
         net: None,
         systemd_scope: false,
+        swtpm: Default::default(),
     }
 }
 
@@ -274,8 +275,9 @@ async fn round(
         speed: None,
         stall: STALL,
         progress: None,
+        quiesce: false,
     };
-    let sent = n.src.replicate_disks(vm.id, &req).await;
+    let sent = n.src.replicate_disks(vm.id, &req).await.map(|(b, _)| b);
     if sent.is_ok() {
         n.dst.finish_replica_receiver(run).await.unwrap();
         assert!(n.dst.replica_receivers().await.unwrap().is_empty());
@@ -436,6 +438,7 @@ async fn a_failed_increment_leaves_the_replica_as_it_was() {
         speed: None,
         stall: STALL,
         progress: None,
+        quiesce: false,
     };
     assert!(n.src.replicate_disks(vm.id, &req).await.is_err());
     let bitmaps = n.src.backup_bitmaps(vm.id).await.unwrap();
@@ -523,6 +526,7 @@ async fn a_receiver_killed_mid_run_does_not_fail_guest_writes() {
         speed: Some(MIB),
         stall: STALL,
         progress: None,
+        quiesce: false,
     };
     let killing = async {
         tokio::time::sleep(Duration::from_secs(2)).await;

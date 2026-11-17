@@ -1596,6 +1596,7 @@ dependencies = [
 name = "opl-qemu"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "insta",
  "opl-types",
  "serde_json",

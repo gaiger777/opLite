@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use opl_types::node::NodeHotplug;
 use opl_types::vm::Arch;
 
+use crate::firmware::{self, FirmwarePair};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Accel {
     Kvm,
@@ -29,6 +31,8 @@ pub struct HostProfile {
     pub uefi_code: PathBuf,
     /// VM마다 복사해서 쓰는 UEFI 변수 저장소 원본
     pub uefi_vars_template: PathBuf,
+    /// Secure Boot 펌웨어(MS 키 등록, 계획 59). firmware descriptor로 찾고 없으면 None이다. 일반 UEFI VM은 쓰지 않는다.
+    pub secure_boot: Option<FirmwarePair>,
 }
 
 impl HostProfile {
@@ -40,6 +44,7 @@ impl HostProfile {
             qemu_binary: PathBuf::from("qemu-system-aarch64"),
             uefi_code: share_dir.join("edk2-aarch64-code.fd"),
             uefi_vars_template: share_dir.join("edk2-arm-vars.fd"),
+            secure_boot: None,
         }
     }
 
@@ -52,6 +57,7 @@ impl HostProfile {
                 qemu_binary: PathBuf::from("/usr/bin/qemu-system-x86_64"),
                 uefi_code: PathBuf::from("/usr/share/OVMF/OVMF_CODE_4M.fd"),
                 uefi_vars_template: PathBuf::from("/usr/share/OVMF/OVMF_VARS_4M.fd"),
+                secure_boot: None,
             },
             Arch::Aarch64 => Self {
                 arch,
@@ -59,23 +65,31 @@ impl HostProfile {
                 qemu_binary: PathBuf::from("/usr/bin/qemu-system-aarch64"),
                 uefi_code: PathBuf::from("/usr/share/AAVMF/AAVMF_CODE.fd"),
                 uefi_vars_template: PathBuf::from("/usr/share/AAVMF/AAVMF_VARS.fd"),
+                secure_boot: None,
             },
         }
     }
 
     /// 이 호스트의 기본 프로필. macOS는 Homebrew QEMU와 hvf, Linux는 Debian 경로와
-    /// KVM(`/dev/kvm`을 열 수 없으면 TCG)이다.
+    /// KVM(`/dev/kvm`을 열 수 없으면 TCG)이다. Secure Boot 펌웨어는 firmware descriptor로 찾는다(macOS는
+    /// `{share_dir}/firmware`, Linux는 [`firmware::SYSTEM_DIRS`]).
     pub fn native(share_dir: &Path) -> Self {
-        if cfg!(target_os = "macos") {
-            Self::homebrew_hvf(share_dir)
+        let (mut profile, dirs) = if cfg!(target_os = "macos") {
+            (
+                Self::homebrew_hvf(share_dir),
+                firmware::homebrew_dirs(share_dir),
+            )
         } else {
             let accel = if kvm_available() {
                 Accel::Kvm
             } else {
                 Accel::Tcg
             };
-            Self::debian(Arch::native(), accel)
-        }
+            let dirs = firmware::SYSTEM_DIRS.map(PathBuf::from).to_vec();
+            (Self::debian(Arch::native(), accel), dirs)
+        };
+        profile.secure_boot = firmware::discover(&dirs, profile.arch);
+        profile
     }
 }
 

@@ -14,6 +14,10 @@ pub struct RuntimePaths {
     pub vnc_socket: PathBuf,
     /// 게스트 에이전트(QGA) 채널. `guest_agent`인 VM만 QEMU가 만든다.
     pub qga_socket: PathBuf,
+    /// swtpm 제어 채널(계획 59). `tpm`인 VM만 swtpm이 만든다.
+    pub tpm_socket: PathBuf,
+    /// swtpm의 pid 파일
+    pub tpm_pidfile: PathBuf,
     pub pidfile: PathBuf,
     pub uefi_vars: PathBuf,
     /// cloud-init NoCloud 씨앗 ISO(계획 57). `cloud_init`이 있는 VM만 드라이버가 쓴다.
@@ -34,12 +38,19 @@ impl RuntimePaths {
             qmp_socket: dir.join("qmp.sock"),
             vnc_socket: dir.join("vnc.sock"),
             qga_socket: dir.join("qga.sock"),
+            tpm_socket: dir.join("tpm.sock"),
+            tpm_pidfile: dir.join("swtpm.pid"),
             pidfile: dir.join("qemu.pid"),
             uefi_vars: dir.join("uefi-vars.fd"),
             cidata: dir.join("cidata.iso"),
             dir,
         };
-        for sock in [&paths.qmp_socket, &paths.vnc_socket, &paths.qga_socket] {
+        for sock in [
+            &paths.qmp_socket,
+            &paths.vnc_socket,
+            &paths.qga_socket,
+            &paths.tpm_socket,
+        ] {
             let len = sock.as_os_str().len();
             if len > MAX_SOCKET_PATH {
                 return Err(PathError {
@@ -65,6 +76,8 @@ mod tests {
         assert_eq!(p.qmp_socket, Path::new(dir).join("qmp.sock"));
         assert_eq!(p.vnc_socket, Path::new(dir).join("vnc.sock"));
         assert_eq!(p.qga_socket, Path::new(dir).join("qga.sock"));
+        assert_eq!(p.tpm_socket, Path::new(dir).join("tpm.sock"));
+        assert_eq!(p.tpm_pidfile, Path::new(dir).join("swtpm.pid"));
         assert_eq!(p.pidfile, Path::new(dir).join("qemu.pid"));
         assert_eq!(p.uefi_vars, Path::new(dir).join("uefi-vars.fd"));
         assert_eq!(p.cidata, Path::new(dir).join("cidata.iso"));
@@ -85,6 +98,7 @@ mod tests {
         let fits = Path::new("/").join("x".repeat(MAX_SOCKET_PATH - fixed - 1));
         let p = RuntimePaths::new(&fits, Uuid::nil()).unwrap();
         assert_eq!(p.qga_socket.as_os_str().len(), MAX_SOCKET_PATH);
+        assert_eq!(p.tpm_socket.as_os_str().len(), MAX_SOCKET_PATH);
         let over = Path::new("/").join("x".repeat(MAX_SOCKET_PATH - fixed));
         let err = RuntimePaths::new(&over, Uuid::nil()).unwrap_err();
         assert_eq!(err.len, MAX_SOCKET_PATH + 1);

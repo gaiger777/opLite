@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_qemu::paths::MAX_SOCKET_PATH;
+use opl_qemu::qga::{self, Session};
 use opl_qemu::{
     BackupSync, BlockNode, HostProfile, JobInfo, MigrationInfo, MigrationParameters,
     MigrationState, NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths,
@@ -14,8 +15,9 @@ use opl_qemu::{
     build_replica_receiver_cmdline,
 };
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
+use opl_types::guest::GuestInfo;
 use opl_types::network::{tap_name, tap_prefix};
-use opl_types::node::NodeHotplug;
+use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{
     DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec,
@@ -31,7 +33,7 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
-    HypervisorEvent, RuntimeStatus, StopMode, VcpuChange,
+    HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
@@ -41,6 +43,11 @@ use crate::migration::{
 use crate::net::{HostNet, Tap};
 use crate::replication::{REPLICA_TLS_ID, ReceiverExport, ReplicateRequest};
 use crate::storage::{DiskLocation, fmt_name};
+use crate::tpm::{self, SwtpmConfig, vm_tpm_dir};
+
+mod agent;
+
+use agent::Freezer;
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -150,8 +157,10 @@ pub struct QemuConfig {
     /// 브리지 NIC의 tap을 만들고 지운다. 없으면(macOS) 브리지 NIC를 가진 VM은 시작하지 않는다.
     pub net: Option<Arc<dyn HostNet>>,
     /// QEMU를 `systemd-run --scope`로 감싸 VM마다 cgroup(`opl-vm-<id>.scope`)으로 분리한다.
-    /// systemd가 있는 Linux에서만 켠다.
+    /// systemd가 있는 Linux에서만 켠다. swtpm도 `opl-tpm-<id>.scope`로 감싼다.
     pub systemd_scope: bool,
+    /// TPM VM의 swtpm·swtpm_setup(계획 59)
+    pub swtpm: SwtpmConfig,
 }
 
 /// QEMU 프로세스를 `-daemonize`로 띄워 opld와 분리한다. opld가 재시작해도 VM은 계속 돈다.
@@ -202,6 +211,8 @@ struct VmHandle {
     pid: u32,
     paths: RuntimePaths,
     monitor: JoinHandle<()>,
+    /// 게스트 에이전트 채널은 한 번에 한 연결뿐이라 ping·정보·종료·얼리기·비밀번호가 모두 이것을 거친다(계획 59).
+    agent: tokio::sync::Mutex<()>,
 }
 
 impl Drop for VmHandle {
@@ -240,9 +251,10 @@ impl QemuHypervisor {
                 Liveness::Alive(_) => {}
                 Liveness::Dead => {
                     tracing::warn!(%id, "cleaning up stale runtime dir");
-                    // 런타임 디렉터리가 정리할 것이 남았다는 유일한 기록이므로 tap부터 지운다.
-                    // 지우지 못하면 디렉터리를 남겨 다음 new()가 다시 시도한다.
-                    if delete_taps(hv.config.net.as_deref(), id).await
+                    // 런타임 디렉터리가 정리할 것이 남았다는 유일한 기록이므로 tap과 QEMU 없이 남은 swtpm부터
+                    // 지운다. 지우지 못하면 디렉터리를 남겨 다음 new()가 다시 시도한다.
+                    if tpm::terminate(&paths).await
+                        && delete_taps(hv.config.net.as_deref(), id).await
                         && let Err(e) = std::fs::remove_dir_all(&paths.dir)
                     {
                         tracing::error!(%id, error = %e, "failed to remove stale runtime dir");
@@ -258,6 +270,8 @@ impl QemuHypervisor {
             match tokio::time::timeout(ATTACH_TIMEOUT, hv.attach(id, paths, false)).await {
                 Ok(Ok(())) => {
                     tracing::info!(%id, "reattached to running VM");
+                    // 앞선 opld가 얼린 채 죽었으면 게스트 파일 시스템을 녹인다.
+                    agent::thaw_left(id, &hv.paths(id)?).await;
                     // 앞선 opld가 복제 회차 도중에 죽었으면 플리싱이 남아 디스크 장치를 쥐고 있다.
                     if let Err(e) = hv.clear_left_fleecing(id).await {
                         tracing::warn!(%id, error = %e, "cannot remove the fleecing left by an earlier run");
@@ -331,6 +345,7 @@ impl QemuHypervisor {
                 pid,
                 paths,
                 monitor,
+                agent: tokio::sync::Mutex::new(()),
             }),
         );
         if launched {
@@ -352,8 +367,32 @@ impl QemuHypervisor {
         std::fs::create_dir_all(self.state_dir(vm.id))?;
         // 앞선 QEMU의 복제 회차가 남긴 플리싱 이미지(그 QEMU와 함께 쓸모가 없어졌다)
         remove_fleece_files(&self.state_dir(vm.id))?;
+        let incoming = matches!(how, Launch::Incoming { .. });
+        if let Some(t) = vm.tpm {
+            // 펌웨어 초기화 회차가 다르면 UEFI 변수도 지우므로 변수를 복사하기 전에 맞춘다.
+            let state = &self.config.state_dir;
+            tpm::prepare_state(
+                &self.config.swtpm,
+                state,
+                vm.id,
+                t,
+                incoming,
+                &paths.uefi_vars,
+            )
+            .await?;
+        }
         if vm.firmware == Firmware::Uefi && !paths.uefi_vars.exists() {
-            std::fs::copy(&self.config.host.uefi_vars_template, &paths.uefi_vars)?;
+            // Secure Boot VM은 MS 키를 등록한 변수 원본에서 만든다.
+            let template = match (&self.config.host.secure_boot, vm.secure_boot) {
+                (Some(pair), true) => &pair.vars_template,
+                (None, true) => {
+                    return Err(DriverError::InvalidSpec(
+                        opl_qemu::CmdlineError::NoSecureBootFirmware.to_string(),
+                    ));
+                }
+                (_, false) => &self.config.host.uefi_vars_template,
+            };
+            std::fs::copy(template, &paths.uefi_vars)?;
         }
         // cloud-init 씨앗은 켤 때마다 이 노드에서 런타임 정의로 다시 만든다(어느 노드에서 켜든 같은 바이트).
         write_seed(vm, &paths.cidata)?;
@@ -362,6 +401,7 @@ impl QemuHypervisor {
         for sock in [&paths.qmp_socket, &paths.vnc_socket, &paths.qga_socket] {
             remove_if_exists(sock)?;
         }
+        remove_if_exists(&paths.dir.join(agent::FSFROZEN_MARK))?;
 
         let args = match how {
             Launch::Start { .. } => build_cmdline(vm, &self.config.host, paths),
@@ -374,8 +414,20 @@ impl QemuHypervisor {
             std::fs::write(paths.dir.join(INCOMING_MARK), task.to_string())?;
         }
         self.create_taps(vm).await?;
+        if vm.tpm.is_some() {
+            // QEMU가 띄울 때 제어 채널에 연결하므로 먼저 띄운다. QEMU를 띄우지 못하면 kill_and_cleanup이 끝낸다.
+            let dir = vm_tpm_dir(&self.config.state_dir, vm.id);
+            tpm::start(
+                &self.config.swtpm,
+                self.config.systemd_scope,
+                vm.id,
+                paths,
+                &dir,
+            )
+            .await?;
+        }
         let mut cmd = if self.config.systemd_scope {
-            clear_stale_scope(vm.id).await;
+            clear_stale_scope(&format!("opl-vm-{}.scope", vm.id)).await;
             let mut cmd = tokio::process::Command::new("systemd-run");
             cmd.args(scope_args(vm.id))
                 .arg("--")
@@ -507,6 +559,10 @@ impl QemuHypervisor {
                 tracing::error!(%id, pid, "QEMU did not exit; keeping runtime dir");
                 return false;
             }
+        }
+        // QEMU 없이 남은 swtpm(QEMU를 띄우지 못함)을 끝낸다. 끝내지 못하면 그 pid 파일을 지우지 않는다.
+        if !tpm::terminate(paths).await {
+            return false;
         }
         // tap부터 지운다. 지우지 못하면 런타임 디렉터리를 남겨 다음 new()가 다시 시도한다.
         if delete_taps(self.config.net.as_deref(), id).await
@@ -845,7 +901,9 @@ impl Hypervisor for QemuHypervisor {
             match tokio::time::timeout(ATTACH_TIMEOUT, self.attach(vm.id, paths, false)).await {
                 Ok(Ok(())) => {
                     tracing::info!(id = %vm.id, "reattached to running VM");
-                    return self.continue_if_left_stopped(vm.id).await;
+                    self.continue_if_left_stopped(vm.id).await?;
+                    agent::thaw_left(vm.id, &self.paths(vm.id)?).await;
+                    return Ok(());
                 }
                 Ok(Err(e)) => {
                     tracing::error!(id = %vm.id, error = %e, "could not reattach to running VM")
@@ -876,7 +934,9 @@ impl Hypervisor for QemuHypervisor {
             }
             // 살아 있지만 QMP로 다룰 수 없는 VM
             return match mode {
-                StopMode::Acpi => Err(DriverError::Timeout("reattach to running QEMU")),
+                StopMode::Acpi | StopMode::Agent => {
+                    Err(DriverError::Timeout("reattach to running QEMU"))
+                }
                 StopMode::Force | StopMode::Kill if self.kill_and_cleanup(id, &paths).await => {
                     Ok(())
                 }
@@ -887,6 +947,13 @@ impl Hypervisor for QemuHypervisor {
             StopMode::Acpi => {
                 let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.system_powerdown()).await;
                 flatten(r, "QMP system_powerdown")?;
+            }
+            StopMode::Agent => {
+                if let Err(e) = agent_shutdown(&handle, id).await {
+                    tracing::info!(%id, error = %e, "guest agent shutdown failed; sending ACPI power button");
+                    let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.system_powerdown()).await;
+                    flatten(r, "QMP system_powerdown")?;
+                }
             }
             StopMode::Force => {
                 let pid = handle.pid;
@@ -980,22 +1047,39 @@ impl Hypervisor for QemuHypervisor {
             .ok_or(DriverError::NotRunning(id))
     }
 
-    async fn snapshot_save(&self, id: Uuid, tag: &str, memory: bool) -> Result<(), DriverError> {
+    async fn snapshot_save(
+        &self,
+        id: Uuid,
+        tag: &str,
+        memory: bool,
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError> {
         let handle = self.running_handle(id)?;
         let devices = query_disk_nodes(&handle.qmp).await?;
         let Some(vmstate) = devices.first() else {
             return Err(DriverError::InvalidSpec(format!("VM {id} has no disks")));
         };
         if memory {
+            // 메모리 스냅샷은 그 자체로 게스트의 한 시점이라 얼리지 않는다.
             let save = handle
                 .qmp
                 .snapshot_save(tag, vmstate, &devices, SNAPSHOT_TIMEOUT);
-            job(save, "QMP snapshot-save").await
+            job(save, "QMP snapshot-save").await?;
+            Ok(Quiesced::No)
         } else {
+            let _agent = if quiesce {
+                Some(handle.agent.lock().await)
+            } else {
+                None
+            };
+            let mut freezer = Freezer::new(quiesce, &handle.paths);
+            freezer.freeze(id).await;
             let r =
                 tokio::time::timeout(SNAPSHOT_TIMEOUT, handle.qmp.snapshot_disks(tag, &devices))
                     .await;
-            flatten(r, "QMP transaction")
+            freezer.thaw(id).await;
+            flatten(r, "QMP transaction")?;
+            Ok(freezer.outcome())
         }
     }
 
@@ -1004,7 +1088,8 @@ impl Hypervisor for QemuHypervisor {
         id: Uuid,
         tag: &str,
         bitmap: &str,
-    ) -> Result<(), DriverError> {
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError> {
         let handle = self.running_handle(id)?;
         let disks = query_disks(&handle.qmp).await?;
         let actions: Vec<TransactionAction> = disks
@@ -1019,8 +1104,17 @@ impl Hypervisor for QemuHypervisor {
                 ]
             })
             .collect();
+        let _agent = if quiesce {
+            Some(handle.agent.lock().await)
+        } else {
+            None
+        };
+        let mut freezer = Freezer::new(quiesce, &handle.paths);
+        freezer.freeze(id).await;
         let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, handle.qmp.transaction(&actions)).await;
-        flatten(r, "QMP transaction")
+        freezer.thaw(id).await;
+        flatten(r, "QMP transaction")?;
+        Ok(freezer.outcome())
     }
 
     async fn backup_bitmaps(&self, id: Uuid) -> Result<Vec<DiskBitmaps>, DriverError> {
@@ -1069,7 +1163,8 @@ impl Hypervisor for QemuHypervisor {
         parent: &str,
         new: &str,
         targets: &[BackupTarget],
-    ) -> Result<(), DriverError> {
+        quiesce: bool,
+    ) -> Result<Quiesced, DriverError> {
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
         clear_backup_leftovers(qmp).await?;
@@ -1082,7 +1177,21 @@ impl Hypervisor for QemuHypervisor {
             )));
         }
         let mut opened = Vec::new();
-        let mut result = backup_into(qmp, &disks, parent, new, targets, &mut opened).await;
+        let _agent = if quiesce {
+            Some(handle.agent.lock().await)
+        } else {
+            None
+        };
+        let mut freezer = Freezer::new(quiesce, &handle.paths);
+        let mut result = backup_into(
+            qmp,
+            &disks,
+            (parent, new),
+            targets,
+            &mut opened,
+            (id, &mut freezer),
+        )
+        .await;
         // 대상 노드를 닫는다. 닫을 때 QEMU가 이미지 메타데이터(L2)를 쓰고 플러시하므로, 닫지 못하면
         // 대상 파일이 온전하지 않아 백업 실패다(앞 비트맵을 남겨 다음도 같은 부모에서 증분). 남은 노드는
         // 다음 증분 백업이 앞서 남은 것으로 치운다.
@@ -1106,7 +1215,7 @@ impl Hypervisor for QemuHypervisor {
                     "cannot remove dirty bitmap");
             }
         }
-        result
+        result.map(|()| freezer.outcome())
     }
 
     async fn remove_named_bitmaps(&self, id: Uuid, names: &[String]) -> Result<(), DriverError> {
@@ -1120,7 +1229,11 @@ impl Hypervisor for QemuHypervisor {
         clear_fleecing(&handle.qmp, &self.state_dir(id)).await
     }
 
-    async fn replicate_disks(&self, id: Uuid, req: &ReplicateRequest) -> Result<u64, DriverError> {
+    async fn replicate_disks(
+        &self,
+        id: Uuid,
+        req: &ReplicateRequest,
+    ) -> Result<(u64, Quiesced), DriverError> {
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
         if req.targets.is_empty() {
@@ -1149,11 +1262,17 @@ impl Hypervisor for QemuHypervisor {
         let mut opened = Vec::new();
         let mut fleeces = Vec::new();
         let halt = self.fleece_halt(id, &handle);
+        let _agent = if req.quiesce {
+            Some(handle.agent.lock().await)
+        } else {
+            None
+        };
+        let mut freezer = Freezer::new(req.quiesce, &handle.paths);
         let mut result = send_replicas(
             qmp,
             &disks,
             req,
-            (&fleece_dir, &halt),
+            (&fleece_dir, &halt, &mut freezer),
             &mut opened,
             &mut fleeces,
         )
@@ -1180,7 +1299,7 @@ impl Hypervisor for QemuHypervisor {
                 }
             }
         }
-        result
+        result.map(|sent| (sent, freezer.outcome()))
     }
 
     async fn start_replica_receiver(
@@ -1368,14 +1487,39 @@ impl Hypervisor for QemuHypervisor {
 
     async fn guest_ping(&self, id: Uuid) -> Result<bool, DriverError> {
         let handle = self.running_handle(id)?;
-        let sock = handle.paths.qga_socket.clone();
-        drop(handle);
-        if !sock.exists() {
-            return Err(DriverError::InvalidSpec(format!(
-                "VM {id} has no guest agent channel"
-            )));
-        }
+        let sock = agent_socket(&handle, id)?;
+        let _agent = handle.agent.lock().await;
         Ok(opl_qemu::qga::ping(&sock, GUEST_PING_TIMEOUT).await?)
+    }
+
+    async fn guest_info(&self, id: Uuid) -> Result<GuestInfo, DriverError> {
+        let handle = self.running_handle(id)?;
+        let sock = agent_socket(&handle, id)?;
+        let _agent = handle.agent.lock().await;
+        let mut session = Session::connect(&sock, qga::SYNC_TIMEOUT)
+            .await
+            .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Ok(qga::guest_info(&mut session, now).await)
+    }
+
+    async fn set_user_password(
+        &self,
+        id: Uuid,
+        user: &str,
+        password: &str,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let sock = agent_socket(&handle, id)?;
+        let _agent = handle.agent.lock().await;
+        let mut session = Session::connect(&sock, qga::SYNC_TIMEOUT)
+            .await
+            .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
+        qga::set_user_password(&mut session, user, password)
+            .await
+            .map_err(|e| DriverError::GuestAgent(e.to_string()))
     }
 
     async fn start_incoming(
@@ -1782,6 +1926,17 @@ impl Hypervisor for QemuHypervisor {
                     "cannot list QEMU devices; memory hotplug is off on this node");
                 opl_qemu::hotplug_caps(host.arch, LINUX, "")
             }
+        }
+    }
+
+    async fn firmware_caps(&self) -> FirmwareCaps {
+        let host = &self.config.host;
+        FirmwareCaps {
+            tpm: tpm::tpm_capable(&self.config.swtpm, &host.qemu_binary).await,
+            secure_boot: host
+                .secure_boot
+                .as_ref()
+                .is_some_and(|p| p.code.is_file() && p.vars_template.is_file()),
         }
     }
 
@@ -2216,6 +2371,29 @@ impl Hypervisor for QemuHypervisor {
 /// QEMU 시작 stderr가 다른 프로세스가 쥔 이미지 잠금 때문인지. QEMU(file-posix, 8.2와 11 같음)는
 /// `Failed to get "write" lock`이나 `Failed to get shared "write" lock` 뒤에
 /// `Is another process using the image [경로]?`를 붙인다.
+/// VM의 게스트 에이전트 채널 소켓. 채널 없이 띄운 VM이면 `InvalidSpec`이다.
+fn agent_socket(handle: &VmHandle, id: Uuid) -> Result<PathBuf, DriverError> {
+    let sock = handle.paths.qga_socket.clone();
+    if !sock.exists() {
+        return Err(DriverError::InvalidSpec(format!(
+            "VM {id} has no guest agent channel"
+        )));
+    }
+    Ok(sock)
+}
+
+/// 게스트 에이전트로 끈다(`guest-shutdown`). 채널이 없거나, 동기화되지 않거나, 오류로 답하면 오류다.
+async fn agent_shutdown(handle: &VmHandle, id: Uuid) -> Result<(), DriverError> {
+    let sock = agent_socket(handle, id)?;
+    let _agent = handle.agent.lock().await;
+    let mut session = Session::connect(&sock, qga::SYNC_TIMEOUT)
+        .await
+        .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
+    qga::shutdown(&mut session, qga::AGENT_TIMEOUT)
+        .await
+        .map_err(|e| DriverError::GuestAgent(e.to_string()))
+}
+
 fn image_locked(stderr: &str) -> bool {
     stderr.contains("\"write\" lock") || stderr.contains("Is another process using the image")
 }
@@ -2562,10 +2740,10 @@ fn bitmap_add(disk: &BlockNode, name: &str) -> TransactionAction {
 async fn backup_into(
     qmp: &QmpClient,
     disks: &[BlockNode],
-    parent: &str,
-    new: &str,
+    (parent, new): (&str, &str),
     targets: &[BackupTarget],
     opened: &mut Vec<String>,
+    (id, freezer): (Uuid, &mut Freezer),
 ) -> Result<(), DriverError> {
     let mut actions = Vec::new();
     for ((i, target), disk) in targets.iter().enumerate().zip(disks) {
@@ -2590,8 +2768,10 @@ async fn backup_into(
             bitmap: parent.to_string(),
         });
     }
-    // blockdev-backup transaction은 게스트의 진행 중인 I/O가 끝나기를 기다린다.
+    // blockdev-backup transaction은 게스트의 진행 중인 I/O가 끝나기를 기다린다. 얼리기는 그 앞뒤로만 한다.
+    freezer.freeze(id).await;
     let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, qmp.transaction(&actions)).await;
+    freezer.thaw(id).await;
     flatten(r, "QMP transaction")?;
     let failed = wait_jobs(qmp, opened).await?;
     // 작업을 모두 지운다. 작업이 실패했으면 지우기 오류보다 그 오류다.
@@ -2765,8 +2945,7 @@ async fn start_fleecing(
     disks: &[BlockNode],
     indexes: &[usize],
     new: &[TransactionAction],
-    dir: &Path,
-    halt: &FleeceHalt<'_>,
+    (dir, halt, freezer): (&Path, &FleeceHalt<'_>, &mut Freezer),
     error: fn(String) -> DriverError,
     fleeces: &mut Vec<Fleece>,
 ) -> Result<(), DriverError> {
@@ -2805,6 +2984,32 @@ async fn start_fleecing(
         }
     }
     let running = qmp_call(qmp.query_status(), "QMP query-status").await? == RunState::Running;
+    // 게스트를 멈추기 전에 얼린다(멈춘 게스트의 에이전트는 답하지 않는다). 이어서 실행한 뒤에 녹인다.
+    if running {
+        freezer.freeze(halt.id).await;
+    }
+    let inserted = halt_and_insert(qmp, new, halt, running, fleeces).await;
+    freezer.thaw(halt.id).await;
+    inserted?;
+    for f in fleeces.iter_mut() {
+        let (_, cbw, access) = fleece_nodes(f.disk);
+        let add = qmp.blockdev_add(json!({
+            "driver": "snapshot-access", "node-name": access, "file": cbw,
+        }));
+        qmp_call(add, "QMP blockdev-add").await?;
+        f.access = true;
+    }
+    Ok(())
+}
+
+/// 실행 중이면(`running`) 게스트를 멈추고 필터를 끼운 뒤 이어서 실행한다([`start_fleecing`]).
+async fn halt_and_insert(
+    qmp: &QmpClient,
+    new: &[TransactionAction],
+    halt: &FleeceHalt<'_>,
+    running: bool,
+    fleeces: &mut [Fleece],
+) -> Result<(), DriverError> {
     if running {
         halt.pausing.lock().unwrap().insert(halt.id);
         let stopped = match std::fs::write(&halt.mark, b"") {
@@ -2831,16 +3036,7 @@ async fn start_fleecing(
             }
         }
     }
-    inserted?;
-    for f in fleeces.iter_mut() {
-        let (_, cbw, access) = fleece_nodes(f.disk);
-        let add = qmp.blockdev_add(json!({
-            "driver": "snapshot-access", "node-name": access, "file": cbw,
-        }));
-        qmp_call(add, "QMP blockdev-add").await?;
-        f.access = true;
-    }
-    Ok(())
+    inserted
 }
 
 /// 디스크 크기 합이 `bytes`인 플리싱 이미지를 둘 `dir`의 남은 공간이 그 [`FLEECE_SPACE_PERCENT`]% 이상인지 본다.
@@ -2991,7 +3187,7 @@ async fn send_replicas(
     qmp: &QmpClient,
     disks: &[BlockNode],
     req: &ReplicateRequest,
-    fleece: (&Path, &FleeceHalt<'_>),
+    fleece: (&Path, &FleeceHalt<'_>, &mut Freezer),
     opened: &mut Vec<String>,
     fleeces: &mut Vec<Fleece>,
 ) -> Result<u64, DriverError> {
@@ -3016,9 +3212,18 @@ async fn send_replicas(
         .map(|t| bitmap_add(&disks[t.disk], &req.bitmap))
         .collect();
     let indexes: Vec<usize> = req.targets.iter().map(|t| t.disk).collect();
-    let (dir, halt) = fleece;
+    let (dir, halt, freezer) = fleece;
     let error = DriverError::Replication;
-    start_fleecing(qmp, disks, &indexes, &new, dir, halt, error, fleeces).await?;
+    start_fleecing(
+        qmp,
+        disks,
+        &indexes,
+        &new,
+        (dir, halt, freezer),
+        error,
+        fleeces,
+    )
+    .await?;
     for t in &req.targets {
         let (_, _, access) = fleece_nodes(t.disk);
         let sync = match &t.base {
@@ -3262,7 +3467,8 @@ async fn start_catch_up_pass(
         Some((dir, halt, fleeces)) => {
             let indexes: Vec<usize> = passes.iter().map(|(i, _)| *i).collect();
             let error = DriverError::Migration;
-            start_fleecing(qmp, disks, &indexes, &new, dir, halt, error, fleeces).await?;
+            let fleece = (dir, halt, &mut Freezer::off());
+            start_fleecing(qmp, disks, &indexes, &new, fleece, error, fleeces).await?;
             for (i, base) in passes {
                 let (_, _, access) = fleece_nodes(*i);
                 let sync = match base {
@@ -3679,8 +3885,10 @@ async fn monitor(
     // 오류를 받는다). 게스트는 이미 꺼졌으므로 괜찮다. 런타임 디렉터리는 정리할 것이 남았다는
     // 유일한 기록이므로 tap을 지운 뒤에 지운다. 그 전에 끊기거나(드라이버가 내려가 이 태스크가
     // abort됨) tap을 지우지 못하면 디렉터리가 남아 다음 launch/new()가 다시 정리한다.
+    // swtpm은 `--terminate`로 QEMU와 함께 끝나지만, 남았으면(주인 확인) 끝낸다.
     if delete_taps(net.as_deref(), id).await
         && exited
+        && tpm::terminate(&paths).await
         && let Err(e) = std::fs::remove_dir_all(&paths.dir)
     {
         tracing::warn!(%id, error = %e, "failed to remove runtime dir");
@@ -3721,11 +3929,10 @@ fn scope_args(id: Uuid) -> Vec<String> {
 /// 끝난 QEMU의 `--collect` 스코프는 systemd가 비동기로 회수하므로, 곧바로 다시 띄우면
 /// systemd-run이 "Unit ... already exists"로 실패한다. 호출자가 이전 QEMU가 없음을 확인했으므로
 /// 남은 스코프를 멈추고 실패 기록을 지운다. 오류와 출력은 무시한다.
-async fn clear_stale_scope(id: Uuid) {
-    let unit = format!("opl-vm-{id}.scope");
+pub(crate) async fn clear_stale_scope(unit: &str) {
     for verb in ["stop", "reset-failed"] {
         let status = tokio::process::Command::new("systemctl")
-            .args([verb, "--quiet", &unit])
+            .args([verb, "--quiet", unit])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -3807,7 +4014,7 @@ fn kill_if_owner(pidfile: &Path, pid: u32) {
 }
 
 /// `cond`가 참이 될 때까지 짧게 쉬며 확인한다. 한도 안에 참이 되면 true.
-async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
+pub(crate) async fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     tokio::time::timeout(limit, async {
         while !cond() {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3975,11 +4182,13 @@ mod tests {
                 qemu_binary,
                 uefi_code: root.join("code.fd"),
                 uefi_vars_template: template,
+                secure_boot: None,
             },
             run_dir: root.join("run"),
             state_dir: root.join("state"),
             net: None,
             systemd_scope: false,
+            swtpm: Default::default(),
         }
     }
 
@@ -6206,7 +6415,7 @@ time.sleep(60)
         let hv = QemuHypervisor::new(cfg).await.unwrap();
 
         // 디스크만 스냅샷은 모든 디스크를 transaction 하나로 찍는다.
-        hv.snapshot_save(vm.id, "s1", false).await.unwrap();
+        hv.snapshot_save(vm.id, "s1", false, false).await.unwrap();
         hv.block_resize(vm.id, 1, 2 << 30).await.unwrap();
         let commands = fake.commands.lock().unwrap().clone();
         let arguments = fake.arguments.lock().unwrap().clone();
@@ -6387,7 +6596,7 @@ time.sleep(60)
         assert!(!disks[1].bitmaps[0].persistent);
 
         // qcow2 디스크의 비트맵만 persistent다. 스냅샷과 비트맵은 transaction 하나다.
-        hv.snapshot_save_with_bitmap(id, "t", "opl-n")
+        hv.snapshot_save_with_bitmap(id, "t", "opl-n", false)
             .await
             .unwrap();
         hv.add_bitmaps(id, "opl-m").await.unwrap();
@@ -6480,7 +6689,7 @@ time.sleep(60)
                 job("opl-backup-1", "concluded", None)
             ]),
         ]);
-        hv.incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+        hv.incremental_backup(id, "opl-a", "opl-n", &backup_targets(), false)
             .await
             .unwrap();
 
@@ -6560,7 +6769,7 @@ time.sleep(60)
             ]),
         ]);
         let err = hv
-            .incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets(), false)
             .await
             .unwrap_err();
         match err {
@@ -6613,7 +6822,7 @@ time.sleep(60)
             serde_json::json!([job("opl-backup-0", "concluded", Some("Operation canceled"))]),
         ]);
         let err = hv
-            .incremental_backup(id, "opl-a", "opl-n", &backup_targets()[..1])
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets()[..1], false)
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
@@ -6651,7 +6860,7 @@ time.sleep(60)
         ]);
         fake.failing.lock().unwrap().push("blockdev-del");
         let err = hv
-            .incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets(), false)
             .await
             .unwrap_err();
         assert!(
@@ -6694,7 +6903,7 @@ time.sleep(60)
         ]);
         fake.failing.lock().unwrap().push("job-dismiss");
         let err = hv
-            .incremental_backup(id, "opl-a", "opl-n", &backup_targets())
+            .incremental_backup(id, "opl-a", "opl-n", &backup_targets(), false)
             .await
             .unwrap_err();
         assert!(
@@ -6747,6 +6956,7 @@ time.sleep(60)
             speed: Some(1 << 20),
             stall,
             progress: None,
+            quiesce: false,
         }
     }
 
@@ -6795,8 +7005,9 @@ time.sleep(60)
         let (tx, rx) = tokio::sync::watch::channel(MirrorProgress::default());
         let mut req = replicate_request(Duration::from_secs(600));
         req.progress = Some(tx);
-        let bytes = hv.replicate_disks(id, &req).await.unwrap();
+        let (bytes, quiesced) = hv.replicate_disks(id, &req).await.unwrap();
         assert_eq!(bytes, (1 << 26) + 65536);
+        assert_eq!(quiesced, Quiesced::No);
         assert_eq!(rx.borrow().done_bytes, bytes);
 
         let sent = sent(&fake, &REPLICATION_COMMANDS);
@@ -7096,7 +7307,8 @@ time.sleep(60)
         assert_eq!(
             hv.replicate_disks(id, &replicate_request(Duration::from_secs(600)))
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
             14
         );
         let sent_now = sent(
@@ -7486,7 +7698,7 @@ time.sleep(60)
         let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
         let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
         let err = hv
-            .snapshot_save(Uuid::now_v7(), "s", true)
+            .snapshot_save(Uuid::now_v7(), "s", true, false)
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::NotRunning(_)), "{err:?}");
@@ -7497,7 +7709,7 @@ time.sleep(60)
         let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
         let _qemu = unresponsive_vm(&dir).await;
         for err in [
-            hv.snapshot_save(vm.id, "s", true).await.unwrap_err(),
+            hv.snapshot_save(vm.id, "s", true, false).await.unwrap_err(),
             hv.snapshot_delete(vm.id, "s").await.unwrap_err(),
             hv.block_resize(vm.id, 0, 1 << 30).await.unwrap_err(),
             hv.pause(vm.id).await.unwrap_err(),
@@ -8771,5 +8983,348 @@ time.sleep(60)
         std::fs::write(dir.join("cidata.iso"), b"stale").unwrap();
         assert!(hv.start(&plain, None).await.is_err());
         assert!(!seen.exists());
+    }
+
+    /// 가짜 swtpm·swtpm_setup(`tests/fixtures`, python3)
+    fn fake_swtpm() -> SwtpmConfig {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        SwtpmConfig {
+            swtpm: dir.join("fake-swtpm"),
+            swtpm_setup: dir.join("fake-swtpm-setup"),
+        }
+    }
+
+    fn failing_qemu(dir: &Path) -> PathBuf {
+        let fake = dir.join("fake-qemu");
+        std::fs::write(&fake, "#!/bin/sh\necho 'qemu: no' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fake
+    }
+
+    /// TPM VM: 새 상태를 만들고 swtpm을 먼저 띄운다. QEMU를 띄우지 못하면 swtpm을 끝내고 실행 디렉터리를 지운다.
+    /// 상태 파일은 남는다(같은 TPM으로 다시 켠다).
+    #[tokio::test]
+    async fn a_failed_qemu_takes_its_swtpm_down() {
+        let tmp = short_tempdir();
+        let mut cfg = config(tmp.path(), failing_qemu(tmp.path()));
+        cfg.swtpm = fake_swtpm();
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let vm = VmRuntimeSpec {
+            tpm: Some(opl_types::runtime::RuntimeTpm {
+                fresh: true,
+                epoch: 0,
+            }),
+            ..spec()
+        };
+        let err = hv.start(&vm, None).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::StartFailed(m) if m == "qemu: no"),
+            "{err}"
+        );
+        let state = tmp.path().join("state");
+        assert!(crate::tpm::tpm_state_path(&state, vm.id).exists());
+        let run = tmp.path().join("run/vm").join(vm.id.to_string());
+        assert!(!run.exists());
+        // 남은 swtpm이 있으면 상태 디렉터리 잠금이 남는다: 가짜 swtpm은 잠금을 다시 잡을 수 있어야 뜬다.
+        let paths = hv.paths(vm.id).unwrap();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        crate::tpm::start(
+            &fake_swtpm(),
+            false,
+            vm.id,
+            &paths,
+            &vm_tpm_dir(&state, vm.id),
+        )
+        .await
+        .unwrap();
+        assert!(crate::tpm::terminate(&paths).await);
+
+        // fresh가 아닌데 상태가 없으면 띄우지 않는다.
+        let other = VmRuntimeSpec {
+            tpm: Some(opl_types::runtime::RuntimeTpm {
+                fresh: false,
+                epoch: 0,
+            }),
+            ..spec()
+        };
+        let err = hv.start(&other, None).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::InvalidSpec(m) if m.contains("is missing on this node")),
+            "{err}"
+        );
+    }
+
+    /// QEMU 없이 swtpm만 남은 실행 디렉터리(띄우는 도중 opld가 죽음)는 다시 켤 때 swtpm을 끝내고 지운다.
+    #[tokio::test]
+    async fn restart_stops_a_swtpm_left_without_its_qemu() {
+        let tmp = short_tempdir();
+        let mut cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        cfg.swtpm = fake_swtpm();
+        let id = Uuid::now_v7();
+        let paths = RuntimePaths::new(&cfg.run_dir, id).unwrap();
+        std::fs::create_dir_all(&paths.dir).unwrap();
+        let dir = vm_tpm_dir(&cfg.state_dir, id);
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::tpm::start(&cfg.swtpm, false, id, &paths, &dir)
+            .await
+            .unwrap();
+        assert!(crate::tpm::alive(&paths).is_some());
+        let _hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert!(!paths.dir.exists());
+        assert!(crate::tpm::alive(&paths).is_none());
+    }
+
+    /// Secure Boot VM은 MS 키 변수 원본에서 변수를 만든다. 이 노드에 Secure Boot 펌웨어가 없으면 띄우지 않는다.
+    #[tokio::test]
+    async fn secure_boot_vars_come_from_the_enrolled_template() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), failing_qemu(tmp.path()));
+        let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
+        let vm = VmRuntimeSpec {
+            secure_boot: true,
+            ..spec()
+        };
+        let err = hv.start(&vm, None).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::InvalidSpec(m) if m.contains("no Secure Boot firmware")),
+            "{err}"
+        );
+
+        let mut cfg = cfg;
+        let ms = tmp.path().join("ms-vars.fd");
+        std::fs::write(&ms, b"ms keys").unwrap();
+        cfg.host.secure_boot = Some(opl_qemu::FirmwarePair {
+            code: tmp.path().join("sb-code.fd"),
+            vars_template: ms,
+        });
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert!(hv.start(&vm, None).await.is_err());
+        let vars = uefi_vars_path(&tmp.path().join("state"), vm.id);
+        assert_eq!(std::fs::read(vars).unwrap(), b"ms keys");
+    }
+
+    #[tokio::test]
+    async fn firmware_caps_read_swtpm_and_the_secure_boot_files() {
+        let tmp = short_tempdir();
+        let qemu = tmp.path().join("fake-qemu");
+        std::fs::write(
+            &qemu,
+            "#!/bin/sh\necho 'Supported TPM types (choose only one):'\necho '    emulator   TPM emulator backend driver'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cfg = config(tmp.path(), qemu);
+        cfg.swtpm = fake_swtpm();
+        let code = tmp.path().join("sb-code.fd");
+        cfg.host.secure_boot = Some(opl_qemu::FirmwarePair {
+            code: code.clone(),
+            vars_template: tmp.path().join("vars-template.fd"),
+        });
+        let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
+        // 코드 파일이 없으면 Secure Boot는 못 한다.
+        assert_eq!(
+            hv.firmware_caps().await,
+            FirmwareCaps {
+                tpm: true,
+                secure_boot: false
+            }
+        );
+        std::fs::write(&code, b"code").unwrap();
+        assert!(hv.firmware_caps().await.secure_boot);
+        cfg.swtpm.swtpm = "/nonexistent/swtpm".into();
+        cfg.host.secure_boot = None;
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert_eq!(hv.firmware_caps().await, FirmwareCaps::default());
+    }
+
+    /// 가짜 게스트 에이전트: sync에 답하고, 다른 명령은 `reply`가 정한다(None이면 연결을 끊는다). 받은 명령을 남긴다.
+    fn fake_agent(
+        path: &Path,
+        reply: impl Fn(&str) -> Option<serde_json::Value> + Send + Sync + 'static,
+    ) -> Arc<Mutex<Vec<String>>> {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let _ = std::fs::remove_file(path);
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let reply = Arc::new(reply);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (log, reply) = (log.clone(), reply.clone());
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut read = BufReader::new(read);
+                    let mut buf = Vec::new();
+                    loop {
+                        buf.clear();
+                        if read.read_until(b'\n', &mut buf).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                        let Some(at) = buf.iter().position(|b| *b == b'{') else {
+                            continue;
+                        };
+                        let cmd: serde_json::Value = serde_json::from_slice(&buf[at..]).unwrap();
+                        let name = cmd["execute"].as_str().unwrap().to_string();
+                        let out = if name == "guest-sync-delimited" {
+                            let mut out = vec![0xFF];
+                            out.extend_from_slice(
+                                format!("{}\n", json!({ "return": cmd["arguments"]["id"] }))
+                                    .as_bytes(),
+                            );
+                            out
+                        } else {
+                            log.lock().unwrap().push(name.clone());
+                            match reply(&name) {
+                                Some(v) => format!("{v}\n").into_bytes(),
+                                None => return,
+                            }
+                        };
+                        if write.write_all(&out).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        seen
+    }
+
+    /// 에이전트 종료: 에이전트가 받으면(답 없이 끊음) ACPI를 보내지 않는다. 오류로 답하거나 채널이 없으면 ACPI다.
+    #[tokio::test]
+    async fn agent_stop_falls_back_to_acpi() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let sock = hv.paths(id).unwrap().qga_socket;
+        // 채널 없음
+        hv.stop(id, StopMode::Agent).await.unwrap();
+        assert_eq!(sent(&fake, &["system_powerdown"]).len(), 1);
+        let seen = fake_agent(&sock, |_| None);
+        hv.stop(id, StopMode::Agent).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["guest-shutdown"]);
+        assert_eq!(sent(&fake, &["system_powerdown"]).len(), 1);
+        let _seen = fake_agent(&sock, |_| {
+            Some(json!({ "error": { "class": "GenericError", "desc": "denied" } }))
+        });
+        hv.stop(id, StopMode::Agent).await.unwrap();
+        assert_eq!(sent(&fake, &["system_powerdown"]).len(), 2);
+    }
+
+    /// 얼리기: 시점을 찍는 transaction 직전에 얼리고 직후에 녹인다. 얼리지 못해도 찍고 이유를 돌려준다. 묻지 않으면
+    /// 에이전트에 연결하지 않는다.
+    #[tokio::test]
+    async fn quiesced_snapshots_freeze_around_the_transaction() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let paths = hv.paths(id).unwrap();
+        let commands = fake.commands.clone();
+        let mark = paths.dir.join(agent::FSFROZEN_MARK);
+        let frozen_mark = mark.clone();
+        let seen = fake_agent(&paths.qga_socket, move |cmd| {
+            let snapshots = commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|c| *c == "transaction")
+                .count();
+            match cmd {
+                // 얼릴 때는 아직 찍지 않았고 표시가 있다.
+                "guest-fsfreeze-freeze" => {
+                    assert_eq!(snapshots, 0);
+                    assert!(frozen_mark.exists());
+                    Some(json!({ "return": 2 }))
+                }
+                "guest-fsfreeze-thaw" => {
+                    assert_eq!(snapshots, 1);
+                    Some(json!({ "return": 2 }))
+                }
+                other => panic!("unexpected {other}"),
+            }
+        });
+        assert_eq!(
+            hv.snapshot_save(id, "s1", false, true).await.unwrap(),
+            Quiesced::Yes
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["guest-fsfreeze-freeze", "guest-fsfreeze-thaw"]
+        );
+        assert!(!mark.exists());
+
+        // 묻지 않으면 연결하지 않는다. 메모리 스냅샷도 얼리지 않는다.
+        seen.lock().unwrap().clear();
+        assert_eq!(
+            hv.snapshot_save(id, "s2", false, false).await.unwrap(),
+            Quiesced::No
+        );
+        assert!(seen.lock().unwrap().is_empty());
+
+        let seen = fake_agent(&paths.qga_socket, |cmd| match cmd {
+            "guest-fsfreeze-freeze" => Some(
+                json!({ "error": { "class": "GenericError", "desc": "fsfreeze is not supported" } }),
+            ),
+            _ => Some(json!({ "return": 0 })),
+        });
+        let q = hv
+            .snapshot_save_with_bitmap(id, "s3", "opl-x", true)
+            .await
+            .unwrap();
+        assert_eq!(
+            q.warning().unwrap(),
+            "guest agent did not freeze file systems (guest agent error (GenericError): fsfreeze is not supported); the snapshot is crash-consistent"
+        );
+        // 실패한 freeze 뒤에도 녹여 둔다.
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["guest-fsfreeze-freeze", "guest-fsfreeze-thaw"]
+        );
+        assert!(!mark.exists());
+        assert_eq!(sent(&fake, &["transaction"]).len(), 3);
+    }
+
+    /// 얼린 채 opld가 죽었으면(표시가 남음) 다시 붙을 때 녹인다.
+    #[tokio::test]
+    async fn reattaching_thaws_file_systems_left_frozen() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let _qemu = hold_pidfile(&dir).await;
+        let _fake = fake_qmp(&dir, "running").await;
+        std::fs::write(dir.join(agent::FSFROZEN_MARK), b"").unwrap();
+        let seen = fake_agent(&dir.join("qga.sock"), |_| Some(json!({ "return": 1 })));
+        let _hv = QemuHypervisor::new(cfg).await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["guest-fsfreeze-thaw"]);
+        assert!(!dir.join(agent::FSFROZEN_MARK).exists());
+    }
+
+    #[tokio::test]
+    async fn guest_info_and_password_go_through_the_agent() {
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        let err = hv.guest_info(id).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::InvalidSpec(m) if m.contains("no guest agent channel")),
+            "{err}"
+        );
+        let sock = hv.paths(id).unwrap().qga_socket;
+        let seen = fake_agent(&sock, |cmd| match cmd {
+            "guest-get-host-name" => Some(json!({ "return": { "host-name": "web-1" } })),
+            "guest-set-user-password" => Some(json!({ "return": {} })),
+            _ => Some(json!({ "error": { "class": "CommandNotFound", "desc": "no" } })),
+        });
+        let info = hv.guest_info(id).await.unwrap();
+        assert_eq!(info.hostname.as_deref(), Some("web-1"));
+        assert!(info.os.is_none());
+        assert!(info.collected_at > 0);
+        hv.set_user_password(id, "root", "pw").await.unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 6);
+
+        // 동기화에 답하지 않는 채널(에이전트 없음)
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = hv.guest_info(id).await.unwrap_err();
+        assert!(matches!(err, DriverError::GuestAgent(_)), "{err}");
+        drop(listener);
     }
 }

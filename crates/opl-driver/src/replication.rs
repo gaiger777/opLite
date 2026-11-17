@@ -41,6 +41,8 @@ pub struct ReplicateRequest {
     pub stall: Duration,
     /// 있으면 진행이 바뀔 때마다 보낸다.
     pub progress: Option<watch::Sender<MirrorProgress>>,
+    /// 회차의 시점에 게스트 파일 시스템을 얼린다(계획 59, `guest_agent.freeze_fs`).
+    pub quiesce: bool,
 }
 
 /// 받는 QEMU가 내보낼 복제본 하나([`Hypervisor::start_replica_receiver`](crate::Hypervisor::start_replica_receiver))

@@ -462,11 +462,12 @@ async fn send(
         bitmap: bitmap.to_string(),
         stall: ctx.config.replication_stall,
         progress: Some(tx),
+        quiesce: false,
     };
     // 복제가 끝나면 req(보내는 쪽)가 버려져 진행률 쓰기도 끝난다.
     let replicate = async move { ctx.hv.replicate_disks(vm, &req).await };
     let (sent, _) = tokio::join!(replicate, report_copy(ctx, task, "replicating", rx));
-    sent.map_err(|e| e.to_string())
+    sent.map(|(bytes, _)| bytes).map_err(|e| e.to_string())
 }
 
 /// 도는 VM에서 비트맵들을 지운다. 실패는 경고만 남긴다(다음 성공한 회차가 다시 지운다).
