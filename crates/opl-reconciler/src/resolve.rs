@@ -5,18 +5,20 @@ use std::path::{Path, PathBuf};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{DiskLocation, DriverError, Storage, disk_location};
+use opl_types::cloud_init;
 use opl_types::hotplug;
 use opl_types::network::{NetworkSpec, USER_NETWORK, tap_name};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::runtime::{
-    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
+    DiskKind, ImageFormat, NicBackend, RuntimeCdrom, RuntimeDisk, RuntimeMedium, RuntimeNic,
+    VmRuntimeSpec,
 };
 use opl_types::storage::{
-    PoolBackend, StoragePool, StoragePoolSpec, VolumeSpec, pool_error_on, pool_listed_on,
-    pool_state_on,
+    PoolBackend, StoragePool, StoragePoolSpec, VolumeContent, VolumeSpec, pool_error_on,
+    pool_holds_isos, pool_listed_on, pool_state_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{DiskMove, DiskSpec, RunningHardware, Vm};
+use opl_types::vm::{DiskMove, DiskSpec, RunningHardware, Vm, effective_boot};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,10 +53,17 @@ pub enum ResolveError {
     /// 스펙에 그 순번의 NIC가 없다([`runtime_nic`]).
     #[error("nic {0} is not in the VM spec")]
     NoNic(usize),
+    /// 스펙에 그 순번의 CD-ROM 드라이브가 없다([`runtime_medium`]).
+    #[error("CD-ROM drive {0} is not in the VM spec")]
+    NoCdrom(usize),
     /// 마이그레이션으로 받을 VM의 스펙 디스크·NIC가 원본 QEMU의 장치 기록(`status.hardware`)과 다르다(핫플러그가
     /// 끝나지 않았거나 게스트가 아직 내려 주지 않은 장치). 같은 장치로 켤 수 없어 받지 않는다.
     #[error("the VM's devices do not match its running hardware")]
     DevicesChanged,
+    /// 마이그레이션으로 받을 VM의 cloud-init 씨앗(지금 스펙으로 만든 것)이 원본 QEMU의 씨앗(기록의 instance-id)과
+    /// 다르다(실행 중 cloud-init을 바꿨거나 호스트 이름 없는 VM의 이름을 바꿈). 게스트가 다른 씨앗을 보게 되어 받지 않는다.
+    #[error("cloud-init changed while running; restart the VM before migrating it")]
+    CloudInitChanged,
     #[error(transparent)]
     Cluster(#[from] ClusterError),
 }
@@ -261,10 +270,34 @@ async fn resolve(
     {
         return Err(ResolveError::DevicesChanged);
     }
+    if how == Activate::Incoming
+        && let Some(hw) = &vm.status.hardware
+        && !hotplug::seed_matches(vm.id, &vm.name, &vm.spec, hw)
+    {
+        return Err(ResolveError::CloudInitChanged);
+    }
+    // 다시 붙거나 받을 때는 도는 QEMU의 CD-ROM 드라이브(매체를 바꾸는 중이면 기록의 매체)로 푼다.
+    let hardware = vm
+        .status
+        .hardware
+        .as_ref()
+        .filter(|_| how != Activate::Start);
+    let cdrom_specs = hardware.map_or(&vm.spec.cdroms, |hw| &hw.cdroms);
     let lookup = DiskLookup::new(cluster, vm, node, mount_root, storage, how)?;
     let mut disks = Vec::with_capacity(vm.spec.disks.len());
     for disk in &vm.spec.disks {
         disks.push(lookup.disk(disk, activated).await?);
+    }
+    let mut cdroms = Vec::with_capacity(cdrom_specs.len());
+    for cdrom in cdrom_specs {
+        let medium = match &cdrom.iso {
+            Some(iso) => Some(lookup.medium(iso, activated).await?),
+            None => None,
+        };
+        cdroms.push(RuntimeCdrom {
+            medium,
+            boot_order: cdrom.boot_order,
+        });
     }
     let mut nics = Vec::with_capacity(vm.spec.nics.len());
     for i in 0..vm.spec.nics.len() {
@@ -286,25 +319,69 @@ async fn resolve(
             .as_ref()
             .is_some_and(|ha| ha.guest_watch.is_some()),
         hotplug: None,
-        cdroms: vec![],
-        cloud_init: None,
+        cdroms,
+        // 씨앗은 지금 스펙의 cloud-init으로 만든다. NIC 입력(MAC)은 새로 켜면 스펙의 NIC, 다시 붙거나 받을 때는 기록의
+        // 켤 때 단 NIC다(실행 중 붙인 NIC는 원본 QEMU의 씨앗에 없다) — 받는 쪽이 원본과 같은 바이트를 만든다.
+        cloud_init: vm.spec.cloud_init.as_ref().map(|ci| {
+            let nics = hardware.map_or(&vm.spec.nics[..], |hw| hw.boot_nics());
+            cloud_init::render(vm.id, &vm.name, ci, nics)
+        }),
     };
-    if how != Activate::Start
-        && let Some(hw) = &vm.status.hardware
-    {
+    set_boot_order(&mut spec);
+    if let Some(hw) = hardware {
         apply_hardware(&mut spec, hw);
     }
     Ok(spec)
 }
 
-/// 런타임 정의를 실행 중 하드웨어 기록의 모양(켤 때의 cpu·메모리·펌웨어·머신과 핫플러그 배치)으로 덮는다. 스펙은
-/// 실행 중에 바뀌어도(다음 재시작 때 적용) 마이그레이션 대상은 원본 QEMU와 같은 장치로 켜야 한다.
+/// 런타임 정의의 디스크·CD-ROM `boot_order`(스펙 값)를 실제 부팅 순서([`effective_boot`])로 바꾼다. CD가 없으면
+/// 그대로다.
+fn set_boot_order(spec: &mut VmRuntimeSpec) {
+    let disks: Vec<_> = spec.disks.iter().map(|d| d.boot_order).collect();
+    let cdroms: Vec<_> = spec.cdroms.iter().map(|c| c.boot_order).collect();
+    let (disks, cdroms) = effective_boot(&disks, &cdroms);
+    for (disk, order) in spec.disks.iter_mut().zip(disks) {
+        disk.boot_order = order;
+    }
+    for (cdrom, order) in spec.cdroms.iter_mut().zip(cdroms) {
+        cdrom.boot_order = order;
+    }
+}
+
+/// 런타임 정의를 실행 중 하드웨어 기록의 모양(켤 때의 cpu·메모리·펌웨어·머신과 핫플러그 배치, CD-ROM 부팅 순서,
+/// cloud-init 씨앗 드라이브 유무)으로 덮는다. 스펙은 실행 중에 바뀌어도(다음 재시작 때 적용) 마이그레이션 대상은 원본
+/// QEMU와 같은 장치로 켜야 한다. CD 매체는 [`runtime_spec`]이 기록의 것으로 이미 풀었다(드라이브 수가 다르면 부팅
+/// 순서는 덮지 않는다).
 pub fn apply_hardware(spec: &mut VmRuntimeSpec, hw: &RunningHardware) {
     spec.cpu = hw.cpu.clone();
     spec.memory_mib = hw.memory_mib;
     spec.firmware = hw.firmware;
     spec.machine = hw.machine;
     spec.hotplug = hw.layout.clone();
+    if !hw.cdroms.is_empty()
+        && hw.cdroms.len() == spec.cdroms.len()
+        && hw.disks.len() == spec.disks.len()
+    {
+        // 원본 QEMU의 `bootindex`: 켤 때 단 디스크와 CD로 셈한 순서이고, 실행 중 붙인 디스크는 스펙 값 그대로다.
+        let boot = hw
+            .layout
+            .as_ref()
+            .map_or(hw.disks.len(), |l| usize::from(l.boot_disks))
+            .min(hw.disks.len());
+        let disks: Vec<_> = hw.disks[..boot].iter().map(|d| d.boot_order).collect();
+        let cdroms: Vec<_> = hw.cdroms.iter().map(|c| c.boot_order).collect();
+        let (disks, cdroms) = effective_boot(&disks, &cdroms);
+        let hot = hw.disks[boot..].iter().map(|d| d.boot_order);
+        for (disk, order) in spec.disks.iter_mut().zip(disks.into_iter().chain(hot)) {
+            disk.boot_order = order;
+        }
+        for (cdrom, order) in spec.cdroms.iter_mut().zip(cdroms) {
+            cdrom.boot_order = order;
+        }
+    }
+    if hw.cloud_init.is_none() {
+        spec.cloud_init = None;
+    }
 }
 
 /// 실행 중 VM에 붙일 디스크 하나(`vm.spec.disks[index]`)를 VM을 켤 때처럼 푼다: 크기 늘리기 Task를 기다리고
@@ -329,6 +406,34 @@ pub async fn runtime_disk(
         deactivate(vm, storage, activated).await;
     }
     result
+}
+
+/// 실행 중 VM의 CD-ROM 드라이브 하나(`vm.spec.cdroms[index]`)에 넣을 매체를 VM을 켤 때처럼 푼다(풀 검사·볼륨
+/// 켜기·위치). 빈 드라이브면 None이다. ISO는 늘리지 않으므로 크기 늘리기 Task를 기다리지 않는다. 오류는
+/// [`runtime_spec`]과 같고, 실패하면 켠 볼륨을 끈다.
+pub async fn runtime_medium(
+    cluster: &Cluster,
+    vm: &Vm,
+    index: usize,
+    node: Uuid,
+    mount_root: &Path,
+    storage: &dyn Storage,
+) -> Result<Option<RuntimeMedium>, ResolveError> {
+    let cdrom = vm
+        .spec
+        .cdroms
+        .get(index)
+        .ok_or(ResolveError::NoCdrom(index))?;
+    let Some(iso) = &cdrom.iso else {
+        return Ok(None);
+    };
+    let lookup = DiskLookup::new(cluster, vm, node, mount_root, storage, Activate::Running)?;
+    let mut activated = Vec::new();
+    let result = lookup.medium(iso, &mut activated).await;
+    if result.is_err() {
+        deactivate(vm, storage, activated).await;
+    }
+    result.map(Some)
 }
 
 /// NIC 하나(`vm.spec.nics[index]`)의 런타임 정의. tap 이름은 순번으로 정한다([`tap_name`]).
@@ -401,14 +506,9 @@ impl<'a> DiskLookup<'a> {
         disk: &DiskSpec,
         activated: &mut Vec<(StoragePool, Uuid, ImageFormat)>,
     ) -> Result<RuntimeDisk, ResolveError> {
-        let (cluster, node, mount_root, storage, how) = (
-            self.cluster,
-            self.node,
-            self.mount_root,
-            self.storage,
-            self.how,
-        );
-        let (me, tasks, moves) = (&self.me, &self.tasks, self.moves);
+        let (cluster, mount_root, storage, how) =
+            (self.cluster, self.mount_root, self.storage, self.how);
+        let (tasks, moves) = (&self.tasks, self.moves);
         let volume = cluster
             .get_by_name::<VolumeSpec>(&disk.volume)?
             .ok_or_else(|| ResolveError::VolumeNotFound(disk.volume.clone()))?;
@@ -423,52 +523,7 @@ impl<'a> DiskLookup<'a> {
             return Err(ResolveError::VolumeResizing(disk.volume.clone()));
         }
         let pool_name = moved.map_or(&volume.spec.pool, |m| &m.pool);
-        let pool = cluster
-            .get_by_name::<StoragePoolSpec>(pool_name)?
-            .ok_or_else(|| ResolveError::PoolNotFound(pool_name.clone()))?;
-        if !pool_listed_on(&pool, node) {
-            return Err(ResolveError::PoolNotOnNode(pool_name.clone()));
-        }
-        // opld는 Linux에서만 NFS 풀을 마운트하고 LVM(공유 LVM 포함)·ZFS·RBD를 쓴다(Homebrew QEMU에는
-        // rbd가 없다).
-        if !cfg!(target_os = "linux") {
-            match pool.spec.backend {
-                PoolBackend::Nfs { .. } => {
-                    return Err(ResolveError::NfsUnsupported(pool_name.clone()));
-                }
-                PoolBackend::LvmThin { .. } => {
-                    return Err(ResolveError::PoolUnsupported(
-                        pool_name.clone(),
-                        "lvm-thin pools are not supported on macOS",
-                    ));
-                }
-                PoolBackend::Zfs { .. } => {
-                    return Err(ResolveError::PoolUnsupported(
-                        pool_name.clone(),
-                        "zfs pools are not supported on macOS",
-                    ));
-                }
-                PoolBackend::Rbd { .. } => {
-                    return Err(ResolveError::PoolUnsupported(
-                        pool_name.clone(),
-                        "rbd pools are not supported on macOS",
-                    ));
-                }
-                PoolBackend::LvmShared { .. } => {
-                    return Err(ResolveError::PoolUnsupported(
-                        pool_name.clone(),
-                        "lvm-shared pools are not supported on macOS",
-                    ));
-                }
-                PoolBackend::Dir { .. } => {}
-            }
-        }
-        if let Some(me) = &me
-            && pool_state_on(&pool, me).is_some_and(|s| !s.ready)
-        {
-            let error = pool_error_on(&pool, me);
-            return Err(ResolveError::PoolUnavailable(pool_name.clone(), error));
-        }
+        let pool = self.usable_pool(pool_name)?;
         let format = moved.map_or(volume.spec.format, |m| m.format);
         let activation = match how {
             Activate::Incoming if moved.is_none() => {
@@ -509,5 +564,103 @@ impl<'a> DiskLookup<'a> {
             bus: disk.bus,
             boot_order: disk.boot_order,
         })
+    }
+
+    /// 볼륨이 든 풀 `pool_name`을 이 노드에서 쓸 수 있는지 본다: 풀이 있고 이 노드에 나열되고, 이 OS가 그 백엔드를
+    /// 쓰고(macOS는 dir만), 이 노드가 준비되지 않았다고 알리지 않았다.
+    fn usable_pool(&self, pool_name: &str) -> Result<StoragePool, ResolveError> {
+        let (cluster, node, me) = (self.cluster, self.node, &self.me);
+        let pool = cluster
+            .get_by_name::<StoragePoolSpec>(pool_name)?
+            .ok_or_else(|| ResolveError::PoolNotFound(pool_name.to_string()))?;
+        if !pool_listed_on(&pool, node) {
+            return Err(ResolveError::PoolNotOnNode(pool_name.to_string()));
+        }
+        // opld는 Linux에서만 NFS 풀을 마운트하고 LVM(공유 LVM 포함)·ZFS·RBD를 쓴다(Homebrew QEMU에는
+        // rbd가 없다).
+        if !cfg!(target_os = "linux") {
+            match pool.spec.backend {
+                PoolBackend::Nfs { .. } => {
+                    return Err(ResolveError::NfsUnsupported(pool_name.to_string()));
+                }
+                PoolBackend::LvmThin { .. } => {
+                    return Err(ResolveError::PoolUnsupported(
+                        pool_name.to_string(),
+                        "lvm-thin pools are not supported on macOS",
+                    ));
+                }
+                PoolBackend::Zfs { .. } => {
+                    return Err(ResolveError::PoolUnsupported(
+                        pool_name.to_string(),
+                        "zfs pools are not supported on macOS",
+                    ));
+                }
+                PoolBackend::Rbd { .. } => {
+                    return Err(ResolveError::PoolUnsupported(
+                        pool_name.to_string(),
+                        "rbd pools are not supported on macOS",
+                    ));
+                }
+                PoolBackend::LvmShared { .. } => {
+                    return Err(ResolveError::PoolUnsupported(
+                        pool_name.to_string(),
+                        "lvm-shared pools are not supported on macOS",
+                    ));
+                }
+                PoolBackend::Dir { .. } => {}
+            }
+        }
+        if let Some(me) = &me
+            && pool_state_on(&pool, me).is_some_and(|s| !s.ready)
+        {
+            let error = pool_error_on(&pool, me);
+            return Err(ResolveError::PoolUnavailable(pool_name.to_string(), error));
+        }
+        Ok(pool)
+    }
+
+    /// CD-ROM 매체(ISO 볼륨 `iso`)를 켜고 위치를 정한다. 켠 볼륨을 `activated`에 적는다. ISO가 아니거나 파일 풀(dir·
+    /// NFS)이 아닌 풀의 볼륨이면 `VolumeUnusable`이다. 매체는 읽기 전용이라 여러 VM이 함께 쓰고, 받는 마이그레이션도
+    /// 그대로 켠다(원본과 같은 파일을 함께 연다).
+    async fn medium(
+        &self,
+        iso: &str,
+        activated: &mut Vec<(StoragePool, Uuid, ImageFormat)>,
+    ) -> Result<RuntimeMedium, ResolveError> {
+        let volume = self
+            .cluster
+            .get_by_name::<VolumeSpec>(iso)?
+            .ok_or_else(|| ResolveError::VolumeNotFound(iso.to_string()))?;
+        let unusable = |why: String| {
+            ResolveError::VolumeUnusable(iso.to_string(), DriverError::InvalidSpec(why))
+        };
+        if volume.spec.content != VolumeContent::Iso {
+            return Err(unusable(format!("volume {iso:?} is not an ISO image")));
+        }
+        let pool = self.usable_pool(&volume.spec.pool)?;
+        if !pool_holds_isos(&pool.spec.backend) {
+            return Err(unusable(
+                "ISO images can be kept only in dir or nfs pools".into(),
+            ));
+        }
+        let format = volume.spec.format;
+        let located = match self.storage.activate_volume(&pool, volume.id, format).await {
+            Ok(()) => {
+                activated.push((pool.clone(), volume.id, format));
+                disk_location(&pool, self.mount_root, volume.id, format)
+            }
+            Err(e) => Err(e),
+        };
+        match located {
+            Ok(DiskLocation::Path(path, DiskKind::File)) => Ok(RuntimeMedium { path }),
+            Ok(_) => Err(unusable("ISO images must be files".into())),
+            Err(e @ (DriverError::VolumeNotFound(_) | DriverError::InvalidSpec(_))) => {
+                Err(ResolveError::VolumeUnusable(iso.to_string(), e))
+            }
+            Err(e) => Err(ResolveError::PoolUnavailable(
+                volume.spec.pool.clone(),
+                e.to_string(),
+            )),
+        }
     }
 }

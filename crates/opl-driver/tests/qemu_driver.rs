@@ -10,9 +10,10 @@ use opl_driver::{
     QemuHypervisor, RuntimeStatus, StopMode, Storage, VolumeSource,
 };
 use opl_qemu::{Accel, HostProfile};
+use opl_types::cloud_init::CloudInitSeed;
 use opl_types::runtime::{
-    DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic,
-    VmRuntimeSpec,
+    DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RuntimeCdrom, RuntimeDisk,
+    RuntimeMedium, RuntimeNic, VmRuntimeSpec,
 };
 use opl_types::vm::{Arch, CpuModel, CpuSpec, DiskBus, Firmware, MachineType, NicModel};
 use tokio::sync::broadcast;
@@ -1034,4 +1035,77 @@ async fn a_vcpu_is_hotplugged_on_q35() {
     assert!(!hv.remove_disk(vm.id, 0, t).await.unwrap());
     assert!(has_device(&hv, vm.id, "disk0-dev").await);
     hv.stop(vm.id, StopMode::Force).await.unwrap();
+}
+
+/// CD-ROM 드라이브 둘(하나는 빈)과 cloud-init 씨앗을 단 VM(이 노드의 아키텍처, OS 없음): 켤 때 실행 디렉터리에 씨앗
+/// ISO를 쓰고, 실행 중에 매체를 넣고·바꾸고·뺀다(같은 매체는 할 일이 없다). 매체는 HMP `info block`으로 본다.
+#[tokio::test]
+async fn cdrom_media_change_and_the_cloud_init_seed() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let image = |name: &str| {
+        let path = tmp.path().join(format!("{name}.iso"));
+        let bytes = opl_qemu::iso9660::build(name, &[("readme.txt", name.as_bytes())]).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    };
+    let (a, b) = (image("alpha"), image("bravo"));
+    let seed = CloudInitSeed {
+        instance_id: "iid-0123456789abcdef".into(),
+        meta_data: "{\"instance-id\": \"iid-0123456789abcdef\", \"local-hostname\": \"it-vm\"}"
+            .into(),
+        user_data: "#cloud-config\n{}".into(),
+        vendor_data: None,
+        network_config: None,
+    };
+    let mut vm = spec();
+    vm.cdroms = vec![
+        RuntimeCdrom {
+            medium: Some(RuntimeMedium { path: a.clone() }),
+            boot_order: Some(1),
+        },
+        RuntimeCdrom {
+            medium: None,
+            boot_order: Some(2),
+        },
+    ];
+    vm.cloud_init = Some(seed.clone());
+    hv.start(&vm, None).await.unwrap();
+
+    let file = tmp
+        .path()
+        .join("run/vm")
+        .join(vm.id.to_string())
+        .join("cidata.iso");
+    let want = opl_qemu::iso9660::build("cidata", &opl_qemu::iso9660::cidata_files(&seed)).unwrap();
+    assert_eq!(std::fs::read(&file).unwrap(), want);
+    for dev in ["cd0-dev", "cd1-dev", "cidata-dev"] {
+        assert!(has_device(&hv, vm.id, dev).await, "{dev}");
+    }
+    let block = || hv.human_monitor_command(vm.id, "info block");
+    let info = block().await.unwrap();
+    assert!(info.contains(&a.display().to_string()), "{info}");
+    assert!(info.contains(&file.display().to_string()), "{info}");
+    assert!(!info.contains(&b.display().to_string()), "{info}");
+
+    let bravo = RuntimeMedium { path: b.clone() };
+    hv.change_medium(vm.id, 1, Some(&bravo)).await.unwrap();
+    hv.change_medium(vm.id, 1, Some(&bravo)).await.unwrap();
+    hv.change_medium(vm.id, 0, None).await.unwrap();
+    let info = block().await.unwrap();
+    assert!(!info.contains(&a.display().to_string()), "{info}");
+    assert!(info.contains(&b.display().to_string()), "{info}");
+    // 뺀 드라이브에 다시 넣는다(닫은 노드 이름으로 다시 연다).
+    let alpha = RuntimeMedium { path: a.clone() };
+    hv.change_medium(vm.id, 0, Some(&alpha)).await.unwrap();
+    assert!(block().await.unwrap().contains(&a.display().to_string()));
+    assert!(hv.change_medium(vm.id, 2, None).await.is_err());
+
+    let mut rx = hv.subscribe();
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    assert!(matches!(
+        next_event_for(&mut rx, vm.id).await,
+        EventKind::Stopped { .. }
+    ));
+    assert!(!file.exists());
 }

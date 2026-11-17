@@ -1164,8 +1164,9 @@ impl Worker {
     }
 
     /// 켜는 동안 바뀐 스펙을 켠 하드웨어 `hw`의 보류로 남긴다. 그동안 API는 QEMU가 없는 VM으로 보고 핫플러그 Task 없이
-    /// 받았으므로, 켤 때 쓴 스펙(`vm`)과 지금 저장된 스펙의 vCPU·메모리·펌웨어·머신이 다르면 다음 재시작(`restart`) 때
-    /// 적용할 것으로 적는다(실행 중에 할 수 있는 것은 `vm hotplug`로도 된다).
+    /// 받았으므로, 켤 때 쓴 스펙(`vm`)과 지금 저장된 스펙의 vCPU·메모리·펌웨어·머신·CD-ROM(드라이브 수·매체·부팅
+    /// 순서)·cloud-init이 다르면 다음 재시작(`restart`) 때 적용할 것으로 적는다(실행 중에 할 수 있는 것 — vCPU·메모리·CD
+    /// 매체 — 은 `vm hotplug`로도 된다).
     fn changed_while_starting(&self, vm: &Vm, mut hw: RunningHardware) -> RunningHardware {
         let Ok(Some(now)) = self.cluster.get::<VmSpec>(self.id) else {
             return hw;
@@ -1198,6 +1199,29 @@ impl Worker {
                     pending.push(late("memory_mib", hw.memory_now(), now.spec.memory_mib))
                 }
                 _ => {}
+            }
+        }
+        // CD-ROM 매체는 실행 중에 바꿀 수 있고, 드라이브 수는 다시 켜야 바뀐다.
+        let medium = |iso: &Option<String>| iso.clone().unwrap_or_else(|| "empty".into());
+        if now.spec.cdroms.len() != hw.cdroms.len() {
+            pending.push(PendingChange {
+                field: "cdroms".into(),
+                running: hw.cdroms.len().to_string(),
+                wanted: now.spec.cdroms.len().to_string(),
+                reason: PendingReason::Restart,
+                detail: Some("changed while the VM was starting; restart it".into()),
+            });
+        } else {
+            for (i, (want, run)) in now.spec.cdroms.iter().zip(&hw.cdroms).enumerate() {
+                if want.iso != run.iso {
+                    pending.push(PendingChange {
+                        field: format!("cdroms[{i}]"),
+                        running: medium(&run.iso),
+                        wanted: medium(&want.iso),
+                        reason: PendingReason::Restart,
+                        detail: Some("changed while the VM was starting; run `vm hotplug`".into()),
+                    });
+                }
             }
         }
         hw.pending = pending;

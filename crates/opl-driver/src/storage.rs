@@ -1039,6 +1039,16 @@ fn src_fmt_name(format: SourceFormat) -> &'static str {
     }
 }
 
+/// [`is_iso_image`]가 보는 원본 앞부분의 길이: 시스템 영역 16섹터(32 KiB) 뒤 첫 볼륨 기술자의 형식 바이트와 식별자 5바이트
+pub const ISO_HEADER_LEN: usize = 16 * 2048 + 6;
+
+/// 원본 이미지의 앞부분(`header`, [`ISO_HEADER_LEN`]바이트 이상)이 설치 매체인지: 섹터 16의 볼륨 기술자 식별자가
+/// `CD001`(ISO 9660)이나 `BEA01`(UDF 볼륨 인식 순서 — Windows 설치 매체)이다. 짧으면 아니다.
+pub fn is_iso_image(header: &[u8]) -> bool {
+    let at = 16 * 2048 + 1;
+    matches!(header.get(at..at + 5), Some(b"CD001" | b"BEA01"))
+}
+
 /// `qemu-img info`가 다른 파일이나 연결을 열기 전에 헤더만 보고 거부한다.
 /// info는 보고하려고 VMDK extent와 qcow2 외부 데이터 파일을 실제로 연다.
 async fn check_source_header(src: &Path, src_format: SourceFormat) -> Result<(), DriverError> {
@@ -1488,6 +1498,24 @@ pub(crate) mod tests {
 
     /// `dir` 풀만 쓰는 테스트의 마운트 루트. 쓰이지 않는다.
     const MNT: &str = "/nonexistent/opl-pools";
+
+    /// ISO 9660·UDF 이미지는 섹터 16의 식별자로 알아본다. 다른 식별자·빈 이미지·짧은 파일은 아니다.
+    #[test]
+    fn iso_images_are_recognized_by_the_sector_16_descriptor() {
+        let image = |id: &[u8]| {
+            let mut v = vec![0u8; ISO_HEADER_LEN];
+            v[16 * 2048] = 1;
+            v[16 * 2048 + 1..16 * 2048 + 6].copy_from_slice(id);
+            v
+        };
+        assert!(is_iso_image(&image(b"CD001")));
+        assert!(is_iso_image(&image(b"BEA01")));
+        assert!(!is_iso_image(&image(b"CD002")));
+        assert!(!is_iso_image(&vec![0u8; ISO_HEADER_LEN]));
+        assert!(!is_iso_image(&image(b"CD001")[..ISO_HEADER_LEN - 1]));
+        let built = opl_qemu::iso9660::build("cidata", &[("meta-data", b"{}")]).unwrap();
+        assert!(is_iso_image(&built));
+    }
 
     fn pool(path: &str) -> StoragePool {
         Resource::new(

@@ -10,19 +10,23 @@ use opl_cluster::memnet::MemRouter;
 use opl_driver::{Capacity, DriverError, SourceFormat, Storage, VolumeInfo, VolumeSource};
 use opl_reconciler::resolve::{
     ResolveError, apply_disk_moves, apply_hardware, incoming_spec, running_spec, runtime_disk,
-    runtime_nic, runtime_spec, set_disks_shared,
+    runtime_medium, runtime_nic, runtime_spec, set_disks_shared,
 };
+use opl_types::cloud_init::{CloudInit, CloudInitNet, IpConfig, render};
 use opl_types::network::{Network, NetworkSpec, Vxlan, tap_name};
 use opl_types::node::{Node, NodeSpec, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::{
-    DiskKind, HotplugLayout, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic,
+    DiskKind, HotplugLayout, ImageFormat, NicBackend, RuntimeCdrom, RuntimeDisk, RuntimeMedium,
+    RuntimeNic,
 };
-use opl_types::storage::{PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeSpec};
+use opl_types::storage::{
+    PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumeContent, VolumeSpec,
+};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
 use opl_types::vm::{
-    CpuSpec, DiskBus, DiskMove, DiskSpec, Firmware, GuestWatch, MacAddr, MigrationStatus, NicModel,
-    NicSpec, RunningHardware, Vm, VmHa,
+    CdromSpec, CpuSpec, DiskBus, DiskMove, DiskSpec, Firmware, GuestWatch, MacAddr,
+    MigrationStatus, NicModel, NicSpec, RunningHardware, Vm, VmHa,
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -1422,4 +1426,347 @@ async fn resolves_one_disk_and_one_nic() {
         runtime_nic(&cluster, &vm, 2),
         Err(ResolveError::NoNic(2))
     ));
+}
+
+/// ISO 볼륨(raw, `content: iso`)
+fn iso(name: &str, pool: &str) -> Volume {
+    let mut v = volume(name, pool);
+    v.spec.format = ImageFormat::Raw;
+    v.spec.content = VolumeContent::Iso;
+    v
+}
+
+fn cd(iso: Option<&str>, boot_order: Option<u8>) -> CdromSpec {
+    CdromSpec {
+        iso: iso.map(String::from),
+        boot_order,
+    }
+}
+
+/// CD-ROM 드라이브는 ISO 파일(읽기 전용 매체)로 풀고 빈 드라이브는 매체가 없다. 부팅 순서는 실제 순서
+/// (`effective_boot`)다: 아무 값이 없으면 디스크 뒤에 CD를 차례로 둔다. cloud-init이 있으면 지금 스펙으로 씨앗을 만든다.
+#[tokio::test]
+async fn resolves_cdrom_media_the_boot_order_and_the_seed() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    cluster.create(&pool("isos", vec![node])).await.unwrap();
+    cluster.create(&volume("root", "local")).await.unwrap();
+    let ubuntu = iso("ubuntu", "isos");
+    cluster.create(&ubuntu).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks = vec![DiskSpec {
+        boot_order: None,
+        ..disk("root")
+    }];
+    vm.spec.cdroms = vec![cd(Some("ubuntu"), None), cd(None, None)];
+    vm.spec.nics = vec![nic("user", Some("52:54:00:00:00:01".parse().unwrap()))];
+    let ci = CloudInit {
+        user: Some("orbi".into()),
+        ..Default::default()
+    };
+    vm.spec.cloud_init = Some(ci.clone());
+
+    let storage = Activations::default();
+    let spec = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(spec.disks[0].boot_order, Some(1));
+    assert_eq!(
+        spec.cdroms,
+        [
+            RuntimeCdrom {
+                medium: Some(RuntimeMedium {
+                    path: format!("/pools/isos/{}.raw", ubuntu.id).into()
+                }),
+                boot_order: Some(2),
+            },
+            RuntimeCdrom {
+                medium: None,
+                boot_order: Some(3),
+            },
+        ]
+    );
+    assert_eq!(
+        storage.calls.lock().unwrap()[1],
+        ("isos".to_string(), ubuntu.id, ImageFormat::Raw)
+    );
+    let seed = spec.cloud_init.expect("no seed");
+    assert_eq!(seed, render(vm.id, "web", &ci, &vm.spec.nics));
+    let meta: serde_json::Value = serde_json::from_str(&seed.meta_data).unwrap();
+    assert_eq!(meta["local-hostname"], "web");
+
+    // 순서가 CD에만 있으면 디스크가 그 뒤(매체를 뺀 뒤 디스크로 켜짐), 순서 없는 CD는 그다음이다.
+    vm.spec.cdroms[1].boot_order = Some(1);
+    vm.spec.cloud_init = None;
+    let spec = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    assert_eq!(spec.disks[0].boot_order, Some(2));
+    let order: Vec<_> = spec.cdroms.iter().map(|c| c.boot_order).collect();
+    assert_eq!(order, [Some(3), Some(1)]);
+    assert_eq!(spec.cloud_init, None);
+
+    // 실행 중 넣을 매체 하나
+    let storage = Activations::default();
+    let medium = runtime_medium(&cluster, &vm, 0, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(
+        medium.unwrap().path,
+        PathBuf::from(format!("/pools/isos/{}.raw", ubuntu.id))
+    );
+    assert_eq!(storage.calls.lock().unwrap().len(), 1);
+    let empty = runtime_medium(&cluster, &vm, 1, node, Path::new(MNT), &storage).await;
+    assert_eq!(empty.unwrap(), None);
+    assert!(matches!(
+        runtime_medium(&cluster, &vm, 2, node, Path::new(MNT), &storage).await,
+        Err(ResolveError::NoCdrom(2))
+    ));
+}
+
+/// CD 매체는 파일 풀의 ISO 볼륨이어야 한다: 없는 볼륨, 디스크 볼륨, 블록 풀(LVM-thin)의 볼륨은 켜지 않는다(실패하면
+/// 켠 디스크를 끈다).
+#[tokio::test]
+async fn cdrom_media_must_be_isos_in_file_pools() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    let root = volume("root", "local");
+    cluster.create(&root).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks = vec![disk("root")];
+    vm.spec.cdroms = vec![cd(Some("ubuntu"), None)];
+
+    let storage = Activations::default();
+    let err = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::VolumeNotFound(v) if v == "ubuntu"),
+        "{err:?}"
+    );
+    assert_eq!(*storage.deactivated.lock().unwrap(), [root.id]);
+
+    cluster.create(&volume("ubuntu", "local")).await.unwrap();
+    let err = resolve(&cluster, &vm, node, Path::new(MNT))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ResolveError::VolumeUnusable(v, _) if v == "ubuntu"),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("not an ISO image"), "{err}");
+
+    let vg: StoragePool = Resource::new(
+        "vg",
+        StoragePoolSpec {
+            backend: PoolBackend::LvmThin {
+                vg: "vg0".into(),
+                thinpool: "tp".into(),
+            },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+        },
+    );
+    cluster.create(&vg).await.unwrap();
+    cluster.create(&iso("alpine", "vg")).await.unwrap();
+    vm.spec.cdroms = vec![cd(Some("alpine"), None)];
+    let err = resolve(&cluster, &vm, node, Path::new(MNT))
+        .await
+        .unwrap_err();
+    if cfg!(target_os = "linux") {
+        assert!(
+            err.to_string().contains("only in dir or nfs pools"),
+            "{err:?}"
+        );
+    } else {
+        assert!(
+            matches!(&err, ResolveError::PoolUnsupported(p, _) if p == "vg"),
+            "{err:?}"
+        );
+    }
+}
+
+/// NFS 풀의 ISO는 NFS 디스크와 같다: NFS를 못 쓰는 노드(macOS)에서는 참조 오류, Linux에서는 마운트될 때까지 기다린다.
+#[tokio::test]
+async fn nfs_isos_follow_the_nfs_rules() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let nas: StoragePool = Resource::new(
+        "nas",
+        StoragePoolSpec {
+            backend: PoolBackend::Nfs {
+                server: "nas".into(),
+                export: "/srv/iso".into(),
+                options: None,
+            },
+            nodes: vec![],
+            shared: true,
+            backups: false,
+        },
+    );
+    cluster.create(&nas).await.unwrap();
+    cluster.create(&iso("ubuntu", "nas")).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.cdroms = vec![cd(Some("ubuntu"), None)];
+    let mnt = TempDir::new().unwrap();
+    std::fs::create_dir(mnt.path().join(nas.id.to_string())).unwrap();
+    let err = resolve(&cluster, &vm, node, mnt.path()).await.unwrap_err();
+    if cfg!(target_os = "linux") {
+        assert!(
+            matches!(&err, ResolveError::PoolUnavailable(n, e) if n == "nas" && e.contains("not mounted")),
+            "{err:?}"
+        );
+    } else {
+        assert!(
+            matches!(&err, ResolveError::NfsUnsupported(n) if n == "nas"),
+            "{err:?}"
+        );
+    }
+}
+
+/// 마이그레이션 대상은 원본 QEMU의 CD-ROM 드라이브(기록의 매체·부팅 순서)로 켠다: 실행 중 바꾼 CD `boot_order`(보류)는
+/// 따르지 않는다. 매체를 바꾸는 중이면(스펙 ≠ 기록) 받지 않고, 다시 붙을 때는 기록의 매체다. 씨앗 드라이브 유무도
+/// 기록대로다.
+#[tokio::test]
+async fn incoming_spec_starts_the_running_cdroms() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    cluster.create(&volume("root", "local")).await.unwrap();
+    let ubuntu = iso("ubuntu", "local");
+    cluster.create(&ubuntu).await.unwrap();
+    cluster.create(&iso("alpine", "local")).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks = vec![DiskSpec {
+        boot_order: None,
+        ..disk("root")
+    }];
+    vm.spec.cdroms = vec![cd(Some("ubuntu"), None), cd(None, None)];
+    let hw = RunningHardware::legacy(&vm.spec);
+    vm.status.hardware = Some(hw.clone());
+    // 실행 중에 둘째 CD를 첫 부팅 장치로 바꿨다(다음 재시작 때 적용).
+    vm.spec.cdroms[1].boot_order = Some(1);
+
+    let storage = Activations::default();
+    let incoming = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    let order = |s: &opl_types::runtime::VmRuntimeSpec| {
+        let disks: Vec<_> = s.disks.iter().map(|d| d.boot_order).collect();
+        let cds: Vec<_> = s.cdroms.iter().map(|c| c.boot_order).collect();
+        (disks, cds)
+    };
+    assert_eq!(order(&incoming), (vec![Some(1)], vec![Some(2), Some(3)]));
+    assert_eq!(
+        incoming.cdroms[0].medium.as_ref().unwrap().path,
+        PathBuf::from(format!("/pools/local/{}.raw", ubuntu.id))
+    );
+    let start = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(order(&start), (vec![Some(2)], vec![Some(3), Some(1)]));
+    let mut applied = start.clone();
+    apply_hardware(&mut applied, &hw);
+    assert_eq!(applied, incoming);
+
+    // 매체를 바꾸는 중: 받지 않는다. 다시 붙을 때는 도는 QEMU의 매체다.
+    vm.spec.cdroms[0].iso = Some("alpine".into());
+    let err = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::DevicesChanged), "{err:?}");
+    let running = running_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(running.cdroms, incoming.cdroms);
+
+    // 씨앗 없이 켠 QEMU에 다시 붙으면 씨앗 드라이브가 없다(실행 중 켠 cloud-init은 다음 재시작 때).
+    vm.spec.cdroms[0].iso = Some("ubuntu".into());
+    vm.spec.cloud_init = Some(CloudInit::default());
+    let running = running_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(running.cloud_init, None);
+    let start = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert!(start.cloud_init.is_some());
+
+    // 씨앗을 넣고 켠 QEMU: 실행 중 cloud-init을 바꿨으면(또는 호스트 이름 없는 VM의 이름을 바꿈) 받는 쪽이 다른 씨앗을
+    // 만들게 되므로 받지 않는다.
+    vm.status.hardware =
+        Some(RunningHardware::at_start(vm.id, &vm.name, &vm.spec, Default::default(), false).0);
+    incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    vm.spec.cloud_init = Some(CloudInit {
+        hostname: Some("web2".into()),
+        ..CloudInit::default()
+    });
+    let err = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::CloudInitChanged), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "cloud-init changed while running; restart the VM before migrating it"
+    );
+    vm.spec.cloud_init = Some(CloudInit::default());
+    vm.name = "web-new".into();
+    let err = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ResolveError::CloudInitChanged), "{err:?}");
+}
+
+/// 주소 설정이 있는 cloud-init VM에 실행 중 NIC를 붙인 뒤에도 받는 쪽은 원본 QEMU와 같은 씨앗(켤 때 단 NIC로 만든
+/// 것, 같은 instance-id)을 만든다. 새로 켜면 붙인 NIC까지 든 씨앗이다.
+#[tokio::test]
+async fn incoming_spec_keeps_the_seed_after_a_nic_hotplug() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    cluster.create(&pool("local", vec![node])).await.unwrap();
+    cluster.create(&volume("root", "local")).await.unwrap();
+    let mut vm = common::vm("web", node);
+    vm.spec.disks = vec![disk("root")];
+    vm.spec.nics = vec![nic("user", Some("52:54:00:00:00:01".parse().unwrap()))];
+    vm.spec.cloud_init = Some(CloudInit {
+        networks: vec![CloudInitNet {
+            ipv4: Some(IpConfig::Static {
+                address: "10.0.0.5/24".into(),
+                gateway: None,
+            }),
+            ipv6: None,
+        }],
+        ..CloudInit::default()
+    });
+    let (mut hw, _) =
+        RunningHardware::at_start(vm.id, &vm.name, &vm.spec, Default::default(), true);
+    // 핫플러그 Task가 둘째 NIC를 붙였다.
+    let added = nic("user", Some("52:54:00:00:00:02".parse().unwrap()));
+    vm.spec.nics.push(added.clone());
+    hw.nics.push(added);
+    hw.layout.as_mut().unwrap().nic_ports.push(0);
+    vm.status.hardware = Some(hw.clone());
+
+    let storage = Activations::default();
+    let incoming = incoming_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    assert_eq!(incoming.nics.len(), 2);
+    let seed = incoming.cloud_init.expect("no seed");
+    assert_eq!(Some(&seed.instance_id), hw.cloud_init.as_ref());
+    assert!(!seed.network_config.as_deref().unwrap().contains("eth1"));
+    let start = runtime_spec(&cluster, &vm, node, Path::new(MNT), &storage)
+        .await
+        .unwrap();
+    let fresh = start.cloud_init.expect("no seed");
+    assert_ne!(Some(&fresh.instance_id), hw.cloud_init.as_ref());
+    assert!(fresh.network_config.as_deref().unwrap().contains("eth1"));
 }

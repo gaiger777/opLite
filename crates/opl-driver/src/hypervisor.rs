@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 pub use opl_qemu::BitmapInfo;
 use opl_types::node::NodeHotplug;
-use opl_types::runtime::{RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, RunningHardware};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -425,6 +425,17 @@ pub trait Hypervisor: Send + Sync {
         index: usize,
         timeout: Duration,
     ) -> Result<bool, DriverError>;
+
+    /// 실행 중인 VM의 CD-ROM 드라이브 `index`(`cd{index}-dev`)에 매체 `medium`을 넣고, None이면 빼서 빈 드라이브로 둔다.
+    /// 매체는 읽기 전용으로 열고 트레이는 강제로 연다(게스트가 잠가 두어도 바뀐다). 그 드라이브에 이미 같은 파일이
+    /// 있으면(빼기는 이미 비었으면) 아무것도 하지 않는다. 앞서 실패하고 남은 블록 노드는 먼저 닫고, 중간에 실패하면 연
+    /// 노드를 닫고 오류다. 드라이브가 없으면 `InvalidSpec`이다.
+    async fn change_medium(
+        &self,
+        id: Uuid,
+        index: usize,
+        medium: Option<&RuntimeMedium>,
+    ) -> Result<(), DriverError>;
 
     /// 이 노드가 켠 VM의 하드웨어 기록(`status.hardware`, 핫플러그 배치 포함)을 VM 실행 디렉터리에 남긴다(QMP
     /// 소켓 옆 `hardware.json`). QEMU가 끝나면 실행 디렉터리와 함께 지워진다. VM이 없으면 `NotRunning`.

@@ -7,9 +7,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opl_qemu::QmpError;
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
+use opl_types::cloud_init::CloudInitSeed;
 use opl_types::node::NodeHotplug;
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
-use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, DiskBus, RunningHardware};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
@@ -66,12 +67,39 @@ pub struct CatchUpCall {
 /// 핫플러그 호출 하나([`MockHypervisor::hotplug_calls`]). 실패한 호출 포함
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HotplugCall {
-    SetVcpus { id: Uuid, from: u16, to: u16 },
-    SetMemory { id: Uuid, plugged_mib: u32 },
-    AddDisk { id: Uuid, index: usize, port: u8 },
-    RemoveDisk { id: Uuid, index: usize },
-    AddNic { id: Uuid, index: usize, port: u8 },
-    RemoveNic { id: Uuid, index: usize },
+    SetVcpus {
+        id: Uuid,
+        from: u16,
+        to: u16,
+    },
+    SetMemory {
+        id: Uuid,
+        plugged_mib: u32,
+    },
+    AddDisk {
+        id: Uuid,
+        index: usize,
+        port: u8,
+    },
+    RemoveDisk {
+        id: Uuid,
+        index: usize,
+    },
+    AddNic {
+        id: Uuid,
+        index: usize,
+        port: u8,
+    },
+    RemoveNic {
+        id: Uuid,
+        index: usize,
+    },
+    /// CD-ROM 드라이브 `index`의 매체 바꾸기(None = 빼기)
+    ChangeMedium {
+        id: Uuid,
+        index: usize,
+        medium: Option<PathBuf>,
+    },
 }
 
 /// 실행 중인 VM의 핫플러그 상태(켤 때 런타임 스펙에서 정하고 핫플러그 호출이 바꾼다)
@@ -83,8 +111,13 @@ struct HotState {
     vmem_mib: u32,
     /// 빈 루트 포트 수
     ports: u8,
-    /// 장치 id(`disk{i}-dev`·`nic{i}`)와 그 루트 포트(켤 때 단 장치는 None — `pcie.0`이라 뗄 수 없다)
+    /// 장치 id(`disk{i}-dev`·`nic{i}`·`cd{i}-dev`·`cidata-dev`)와 그 루트 포트(켤 때 단 장치는 None — `pcie.0`이라 뗄 수
+    /// 없다)
     devices: BTreeMap<String, Option<u8>>,
+    /// CD-ROM 드라이브마다 넣은 매체 파일(빈 드라이브는 None)
+    media: Vec<Option<PathBuf>>,
+    /// 켤 때 넣은 cloud-init 씨앗
+    seed: Option<CloudInitSeed>,
 }
 
 /// 게스트 에이전트가 `guest_ping`에 어떻게 답하는지([`MockHypervisor::set_guest_agent`])
@@ -800,7 +833,19 @@ impl MockHypervisor {
             .map(|h| h.plugged_mib)
     }
 
-    /// 실행 중인 VM의 디스크·NIC 장치 id(`disk{i}-dev`·`nic{i}`, 이름 순). 꺼져 있으면 비어 있다.
+    /// 실행 중인 VM의 CD-ROM 드라이브마다 넣은 매체 파일(빈 드라이브는 None). 꺼져 있으면 비어 있다.
+    pub fn media(&self, id: Uuid) -> Vec<Option<PathBuf>> {
+        let st = self.state.lock().unwrap();
+        st.hot.get(&id).map(|h| h.media.clone()).unwrap_or_default()
+    }
+
+    /// 실행 중인 VM에 켤 때 넣은 cloud-init 씨앗(없거나 꺼져 있으면 None)
+    pub fn seed(&self, id: Uuid) -> Option<CloudInitSeed> {
+        let st = self.state.lock().unwrap();
+        st.hot.get(&id).and_then(|h| h.seed.clone())
+    }
+
+    /// 실행 중인 VM의 장치 id(`disk{i}-dev`·`nic{i}`·`cd{i}-dev`·`cidata-dev`, 이름 순). 꺼져 있으면 비어 있다.
     pub fn devices(&self, id: Uuid) -> Vec<String> {
         let st = self.state.lock().unwrap();
         st.hot
@@ -817,7 +862,8 @@ impl MockHypervisor {
             | HotplugCall::AddDisk { id, .. }
             | HotplugCall::RemoveDisk { id, .. }
             | HotplugCall::AddNic { id, .. }
-            | HotplugCall::RemoveNic { id, .. } => id,
+            | HotplugCall::RemoveNic { id, .. }
+            | HotplugCall::ChangeMedium { id, .. } => id,
         };
         st.hotplug_calls.push(call);
         Self::controllable(st, id)?;
@@ -897,6 +943,13 @@ impl MockHypervisor {
             let p = port(layout.map(|l| l.boot_nics), layout.map(|l| &l.nic_ports), i);
             devices.insert(format!("nic{i}"), p);
         }
+        // CD-ROM·씨앗 드라이브는 컨트롤러 포트에 있어 뗄 수 없다.
+        for i in 0..vm.cdroms.len() {
+            devices.insert(format!("cd{i}-dev"), None);
+        }
+        if vm.cloud_init.is_some() {
+            devices.insert("cidata-dev".into(), None);
+        }
         let boot_vcpus = u16::try_from(vm.cpu.vcpus()).unwrap_or(u16::MAX);
         st.hot.insert(
             vm.id,
@@ -906,6 +959,12 @@ impl MockHypervisor {
                 vmem_mib: layout.map_or(0, |l| l.max_memory_mib.saturating_sub(vm.memory_mib)),
                 ports: layout.map_or(0, |l| l.ports),
                 devices,
+                media: vm
+                    .cdroms
+                    .iter()
+                    .map(|c| c.medium.as_ref().map(|m| m.path.clone()))
+                    .collect(),
+                seed: vm.cloud_init.clone(),
             },
         );
         let formats: Vec<ImageFormat> = vm.disks.iter().map(|d| d.format).collect();
@@ -1847,13 +1906,16 @@ impl Hypervisor for MockHypervisor {
         Ok(migrated)
     }
 
-    /// 실제 드라이버처럼 도는 VM의 장치와 `expected`를 견준다. Mock은 디스크·NIC 장치(`disk{i}-dev`·`nic{i}`)만
-    /// 따라가므로 그것만 견준다.
+    /// 실제 드라이버처럼 도는 VM의 장치와 `expected`를 견준다. Mock은 디스크·NIC·CD-ROM·씨앗 장치(`disk{i}-dev`·
+    /// `nic{i}`·`cd{i}-dev`·`cidata-dev`)만 따라가므로 그것만 견준다.
     async fn check_devices(&self, id: Uuid, expected: &[String]) -> Result<(), DriverError> {
         let st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
-        let tracked =
-            |d: &&String| d.starts_with("nic") || d.ends_with("-dev") && d.starts_with("disk");
+        let tracked = |d: &&String| {
+            d.starts_with("nic")
+                || *d == "cidata-dev"
+                || d.ends_with("-dev") && (d.starts_with("disk") || d.starts_with("cd"))
+        };
         let want: BTreeSet<&String> = expected.iter().filter(tracked).collect();
         let running: BTreeSet<&String> = st
             .hot
@@ -2028,6 +2090,32 @@ impl Hypervisor for MockHypervisor {
         for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
             disk.retain(|b| !b.name.starts_with(MIGRATION_BITMAP_PREFIX));
         }
+        Ok(())
+    }
+
+    /// 실제 드라이버처럼 없는 드라이브는 `InvalidSpec`, 같은 매체는 할 일이 없다.
+    async fn change_medium(
+        &self,
+        id: Uuid,
+        index: usize,
+        medium: Option<&RuntimeMedium>,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        let path = medium.map(|m| m.path.clone());
+        let call = HotplugCall::ChangeMedium {
+            id,
+            index,
+            medium: path.clone(),
+        };
+        Self::hotplug_call(&mut st, call)?;
+        let drive = st
+            .hot
+            .get_mut(&id)
+            .and_then(|h| h.media.get_mut(index))
+            .ok_or_else(|| {
+                DriverError::InvalidSpec(format!("the VM has no CD-ROM drive {index}"))
+            })?;
+        *drive = path;
         Ok(())
     }
 
@@ -3347,5 +3435,76 @@ mod tests {
             .unwrap();
         assert_eq!(hv.incoming_specs(), std::slice::from_ref(&incoming));
         assert_eq!(hv.vcpus(incoming.id), Some(3));
+    }
+
+    /// CD-ROM 드라이브 둘(하나는 빈)과 씨앗을 단 VM: 매체·씨앗을 기록하고 장치 목록·장치 확인에 드러낸다. 매체를
+    /// 바꾸고 빼면 기록이 바뀌고, 없는 드라이브는 오류다. 꺼지면 사라진다.
+    #[tokio::test]
+    async fn cdrom_media_and_the_seed_are_recorded() {
+        use opl_types::runtime::RuntimeCdrom;
+
+        let hv = MockHypervisor::default();
+        let seed = CloudInitSeed {
+            instance_id: "iid-1".into(),
+            meta_data: "m".into(),
+            user_data: "u".into(),
+            vendor_data: None,
+            network_config: None,
+        };
+        let medium = |p: &str| RuntimeMedium { path: p.into() };
+        let vm = VmRuntimeSpec {
+            cdroms: vec![
+                RuntimeCdrom {
+                    medium: Some(medium("/pools/iso/a.raw")),
+                    boot_order: Some(2),
+                },
+                RuntimeCdrom {
+                    medium: None,
+                    boot_order: None,
+                },
+            ],
+            cloud_init: Some(seed.clone()),
+            ..spec()
+        };
+        hv.start(&vm, None).await.unwrap();
+        assert_eq!(
+            hv.media(vm.id),
+            [Some(PathBuf::from("/pools/iso/a.raw")), None]
+        );
+        assert_eq!(hv.seed(vm.id), Some(seed));
+        assert_eq!(hv.devices(vm.id), ["cd0-dev", "cd1-dev", "cidata-dev"]);
+        let ids = |l: &[&str]| l.iter().map(|d| d.to_string()).collect::<Vec<_>>();
+        hv.check_devices(vm.id, &ids(&["cd0-dev", "cd1-dev", "cidata-dev"]))
+            .await
+            .unwrap();
+        assert!(
+            hv.check_devices(vm.id, &ids(&["cd0-dev", "cd1-dev"]))
+                .await
+                .is_err()
+        );
+
+        hv.change_medium(vm.id, 1, Some(&medium("/pools/iso/b.raw")))
+            .await
+            .unwrap();
+        hv.change_medium(vm.id, 0, None).await.unwrap();
+        assert_eq!(
+            hv.media(vm.id),
+            [None, Some(PathBuf::from("/pools/iso/b.raw"))]
+        );
+        let err = hv.change_medium(vm.id, 2, None).await.unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        assert_eq!(
+            hv.hotplug_calls()[1],
+            HotplugCall::ChangeMedium {
+                id: vm.id,
+                index: 0,
+                medium: None
+            }
+        );
+
+        hv.stop(vm.id, StopMode::Force).await.unwrap();
+        assert!(hv.media(vm.id).is_empty());
+        assert_eq!(hv.seed(vm.id), None);
+        assert!(hv.change_medium(vm.id, 0, None).await.is_err());
     }
 }

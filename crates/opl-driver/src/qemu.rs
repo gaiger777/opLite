@@ -18,7 +18,7 @@ use opl_types::network::{tap_name, tap_prefix};
 use opl_types::node::NodeHotplug;
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{
-    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeNic, VmRuntimeSpec,
+    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec,
 };
 use opl_types::vm::{CpuSpec, DiskBus, Firmware, NicModel, RunningHardware};
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
@@ -46,6 +46,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(30);
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 /// QMP 명령 하나의 응답을 기다리는 한도. 멈춘(SIGSTOP 등) QEMU에서 호출자가 묶이지 않게 한다.
 const QMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// CD-ROM 매체 바꾸기(QMP 명령 여럿 — 남은 노드 닫기, 노드 열기, 트레이 열기·빼기·넣기·닫기) 전체의 한도. 넘기면
+/// 노드가 남을 수 있고 다음 바꾸기가 먼저 닫는다.
+const MEDIUM_TIMEOUT: Duration = Duration::from_secs(30);
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// SIGKILL을 보낸 뒤 프로세스가 사라지기를 기다리는 한도. 큰 VM은 메모리를 푸는 데 몇 초가 걸린다. HA 검사의
 /// 끄기 요청 시간(opl-api `EVICT_TIMEOUT` 20초)보다 짧아야 한다.
@@ -352,6 +355,8 @@ impl QemuHypervisor {
         if vm.firmware == Firmware::Uefi && !paths.uefi_vars.exists() {
             std::fs::copy(&self.config.host.uefi_vars_template, &paths.uefi_vars)?;
         }
+        // cloud-init 씨앗은 켤 때마다 이 노드에서 런타임 정의로 다시 만든다(어느 노드에서 켜든 같은 바이트).
+        write_seed(vm, &paths.cidata)?;
         // 호출자가 pidfile 잠금이 풀린 것(= QEMU 없음)을 확인했으므로 남은 소켓은 지워도 된다.
         // 이전 인스턴스가 남긴 pidfile은 새 QEMU가 잠그고 다시 쓴다.
         for sock in [&paths.qmp_socket, &paths.vnc_socket, &paths.qga_socket] {
@@ -2151,6 +2156,36 @@ impl Hypervisor for QemuHypervisor {
         Ok(true)
     }
 
+    async fn change_medium(
+        &self,
+        id: Uuid,
+        index: usize,
+        medium: Option<&RuntimeMedium>,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let qmp = &handle.qmp;
+        let dev = format!("cd{index}-dev");
+        let media = qmp_call(qmp.query_block_media(), "QMP query-block").await?;
+        let Some((_, now)) = media.iter().find(|(d, _)| *d == dev) else {
+            return Err(DriverError::InvalidSpec(format!(
+                "the VM has no CD-ROM drive {index}"
+            )));
+        };
+        let wanted = medium.map(|m| m.path.as_path());
+        if now.as_deref() == wanted {
+            // 같은 매체(빈 드라이브)지만 트레이가 열려 있으면(게스트가 열었거나 앞서 실패) 닫아 둔다.
+            if qmp_call(qmp.query_tray_open(&dev), "QMP query-block").await? {
+                qmp_call(qmp.blockdev_close_tray(&dev), "QMP blockdev-close-tray").await?;
+            }
+            return Ok(());
+        }
+        let change = opl_qemu::change_medium(qmp, index, wanted);
+        flatten(
+            tokio::time::timeout(MEDIUM_TIMEOUT, change).await,
+            "QMP CD-ROM medium change",
+        )
+    }
+
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {
         let dir = self.paths(id)?.dir;
         if !dir.is_dir() {
@@ -3817,14 +3852,17 @@ async fn check_devices(qmp: &QmpClient, expected: &[String]) -> Result<(), Drive
     )))
 }
 
-/// 마이그레이션 전에 견주는 장치 id인지: `disk{i}-dev`, `nic{i}`, `cpu{i}`, `vmem0-dev`
+/// 마이그레이션 전에 견주는 장치 id인지: `disk{i}-dev`, `nic{i}`, `cpu{i}`, `vmem0-dev`, CD-ROM `cd{i}-dev`, cloud-init
+/// 씨앗 `cidata-dev`(CD 컨트롤러 `scsi0`는 견주지 않는다)
 fn tracked_device(id: &str) -> bool {
     let number = |rest: &str| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
     id == "vmem0-dev"
-        || id
-            .strip_prefix("disk")
-            .and_then(|r| r.strip_suffix("-dev"))
-            .is_some_and(number)
+        || id == "cidata-dev"
+        || ["disk", "cd"].iter().any(|p| {
+            id.strip_prefix(p)
+                .and_then(|r| r.strip_suffix("-dev"))
+                .is_some_and(number)
+        })
         || id.strip_prefix("nic").is_some_and(number)
         || id.strip_prefix("cpu").is_some_and(number)
 }
@@ -3883,6 +3921,32 @@ fn read_pid(pidfile: &Path) -> Result<u32, DriverError> {
     })
 }
 
+/// 런타임 정의의 cloud-init 씨앗을 NoCloud ISO(볼륨 id `cidata`)로 `path`에 쓴다: 임시 파일(0600)에 쓰고 디스크에
+/// 내린 뒤 이름을 바꾼다. 씨앗이 없으면 앞선 QEMU가 남긴 파일을 지운다.
+fn write_seed(vm: &VmRuntimeSpec, path: &Path) -> Result<(), DriverError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Some(seed) = &vm.cloud_init else {
+        return Ok(remove_if_exists(path)?);
+    };
+    let files = opl_qemu::iso9660::cidata_files(seed);
+    let iso = opl_qemu::iso9660::build("cidata", &files)
+        .map_err(|e| DriverError::InvalidSpec(format!("cloud-init seed: {e}")))?;
+    let tmp = path.with_extension("iso.tmp");
+    remove_if_exists(&tmp)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(&iso)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn remove_if_exists(path: &Path) -> std::io::Result<()> {
     match std::fs::remove_file(path) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -3895,6 +3959,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use opl_qemu::{Accel, BitmapInfo};
+    use opl_types::cloud_init::CloudInitSeed;
     use opl_types::runtime::RuntimeNic;
     use opl_types::vm::{Arch, CpuModel, CpuSpec, MachineType, NicModel};
 
@@ -4128,6 +4193,10 @@ time.sleep(60)
         roots: Arc<Mutex<[String; 2]>>,
         /// 이 이름의 명령에는 이만큼 기다린 뒤 답한다.
         delay: Arc<Mutex<Option<(&'static str, Duration)>>>,
+        /// CD-ROM 드라이브(`cd0-dev`)에 넣은 매체 파일(`blockdev-insert-medium`이 넣고 `blockdev-remove-medium`이 뺀다)
+        cd_medium: Arc<Mutex<Option<String>>>,
+        /// `cd0-dev`의 트레이가 열려 있는지(`blockdev-open-tray`가 열고 `blockdev-close-tray`가 닫는다)
+        cd_tray: Arc<Mutex<bool>>,
     }
 
     /// QEMU 대신 QMP 소켓을 여는 가짜 서버. greeting과 capabilities 협상까지 처리하고,
@@ -4173,6 +4242,12 @@ time.sleep(60)
         let drives = roots.clone();
         let delay = Arc::new(Mutex::new(None::<(&'static str, Duration)>));
         let slow = delay.clone();
+        let cd_medium = Arc::new(Mutex::new(None::<String>));
+        let medium = cd_medium.clone();
+        let cd_tray = Arc::new(Mutex::new(false));
+        let tray = cd_tray.clone();
+        // `blockdev-add`로 연 CD 노드마다 그 파일(raw 노드는 아래 file 노드의 파일)
+        let mut cd_files: HashMap<String, String> = HashMap::new();
         // id 있는 장치: 디스크 두 개와 NIC 하나를 가진 VM. `device_add`가 더하고 `device_del`(내려 줌)이 뺀다.
         let mut devices: Vec<String> = ["disk0-dev", "disk1-dev", "nic0"]
             .map(String::from)
@@ -4239,12 +4314,36 @@ time.sleep(60)
                     "blockdev-add"
                         if cmd["arguments"]["node-name"].as_str().is_some_and(|n| {
                             n.starts_with("disk")
+                                || n.starts_with("cd")
                                 || n.starts_with("opl-repl-")
                                 || n.starts_with("opl-fl-")
                         }) =>
                     {
-                        let node = cmd["arguments"]["node-name"].as_str().unwrap();
+                        let args = &cmd["arguments"];
+                        let node = args["node-name"].as_str().unwrap();
+                        let file = match args["file"].as_str() {
+                            Some(below) => cd_files.get(below).cloned(),
+                            None => args["filename"].as_str().map(String::from),
+                        };
+                        if let Some(file) = file.filter(|_| node.starts_with("cd")) {
+                            cd_files.insert(node.to_string(), file);
+                        }
                         hot.lock().unwrap().push(node.to_string());
+                        serde_json::json!({})
+                    }
+                    "blockdev-insert-medium" if !fail.lock().unwrap().contains(&name.as_str()) => {
+                        let node = cmd["arguments"]["node-name"].as_str().unwrap();
+                        *medium.lock().unwrap() = cd_files.get(node).cloned();
+                        serde_json::json!({})
+                    }
+                    "blockdev-remove-medium" => {
+                        *medium.lock().unwrap() = None;
+                        serde_json::json!({})
+                    }
+                    "blockdev-open-tray" | "blockdev-close-tray"
+                        if !fail.lock().unwrap().contains(&name.as_str()) =>
+                    {
+                        *tray.lock().unwrap() = name == "blockdev-open-tray";
                         serde_json::json!({})
                     }
                     "blockdev-del" => {
@@ -4287,15 +4386,23 @@ time.sleep(60)
                         mem.lock().unwrap().0 = cmd["arguments"]["value"].as_u64().unwrap();
                         serde_json::json!({})
                     }
-                    // 디스크 장치 둘(64 MiB, 1 GiB)과 매체 없는 CD-ROM
+                    // 디스크 장치 둘(64 MiB, 1 GiB)과 CD-ROM(처음에는 매체 없음)
                     "query-block" => {
                         let root = drives.lock().unwrap().clone();
+                        let mut cd = serde_json::json!({
+                            "device": "", "qdev": "/machine/peripheral/cd0-dev",
+                            "tray_open": *tray.lock().unwrap(),
+                        });
+                        if let Some(file) = medium.lock().unwrap().clone() {
+                            cd["inserted"] =
+                                serde_json::json!({ "node-name": "cd0", "file": file, "ro": true });
+                        }
                         serde_json::json!([
                             { "device": "", "qdev": "/machine/peripheral/disk0-dev/virtio-backend",
                               "inserted": { "node-name": root[0], "image": { "virtual-size": 64u64 << 20 } } },
                             { "device": "", "qdev": "/machine/peripheral/disk1-dev",
                               "inserted": { "node-name": root[1], "image": { "virtual-size": 1u64 << 30 } } },
-                            { "device": "", "qdev": "/machine/peripheral/cd0-dev" },
+                            cd,
                         ])
                     }
                     "qom-get" => {
@@ -4475,6 +4582,8 @@ time.sleep(60)
             extra_bitmaps,
             roots,
             delay,
+            cd_medium,
+            cd_tray,
         }
     }
 
@@ -8442,5 +8551,222 @@ time.sleep(60)
                 memory: false
             }
         );
+    }
+
+    /// 견주는 장치에 CD-ROM 드라이브와 씨앗 드라이브가 든다(컨트롤러 `scsi0`·비디오는 아니다).
+    #[test]
+    fn tracked_devices_include_cdroms_and_the_seed() {
+        for id in [
+            "disk0-dev",
+            "nic1",
+            "cpu2",
+            "vmem0-dev",
+            "cd0-dev",
+            "cd3-dev",
+            "cidata-dev",
+        ] {
+            assert!(tracked_device(id), "{id}");
+        }
+        for id in ["scsi0", "cd-dev", "cdx-dev", "cd0", "video0", "cidata"] {
+            assert!(!tracked_device(id), "{id}");
+        }
+    }
+
+    fn iso(path: &str) -> RuntimeMedium {
+        RuntimeMedium { path: path.into() }
+    }
+
+    const MEDIUM_COMMANDS: &[&str] = &[
+        "blockdev-add",
+        "blockdev-del",
+        "blockdev-open-tray",
+        "blockdev-close-tray",
+        "blockdev-remove-medium",
+        "blockdev-insert-medium",
+    ];
+
+    /// 보낸 매체 명령 이름(`blockdev-del`은 노드 이름을 붙임)을 차례로 꺼내고 기록을 비운다.
+    fn take_medium_commands(fake: &FakeQmp) -> Vec<String> {
+        let names = sent(fake, MEDIUM_COMMANDS)
+            .into_iter()
+            .map(|(name, args)| match name.as_str() {
+                "blockdev-del" => format!("del {}", args["node-name"].as_str().unwrap()),
+                "blockdev-add" => format!("add {}", args["node-name"].as_str().unwrap()),
+                _ => name,
+            })
+            .collect();
+        fake.commands.lock().unwrap().clear();
+        fake.arguments.lock().unwrap().clear();
+        names
+    }
+
+    /// 매체 넣기·바꾸기·빼기: 빈 드라이브에는 노드를 연 뒤 트레이를 열어 넣고, 바꾸기는 새 매체의 노드(쓰지 않은
+    /// 이름)를 먼저 연 뒤 바꿔 넣고 옛 노드를 닫는다. 빼기는 노드를 닫고 빈 드라이브로 둔다. 같은 매체를 다시 넣거나
+    /// 빈 드라이브를 빼면 아무것도 보내지 않고, 그때 트레이가 열려 있으면 닫기만 한다.
+    #[tokio::test]
+    async fn change_medium_inserts_replaces_and_ejects() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        hv.change_medium(id, 0, Some(&iso("/pools/iso/a.raw")))
+            .await
+            .unwrap();
+        assert_eq!(
+            take_medium_commands(&fake),
+            [
+                "add cd0-file",
+                "add cd0",
+                "blockdev-open-tray",
+                "blockdev-remove-medium",
+                "blockdev-insert-medium",
+                "blockdev-close-tray",
+            ]
+        );
+        assert_eq!(
+            fake.cd_medium.lock().unwrap().as_deref(),
+            Some("/pools/iso/a.raw")
+        );
+        // 같은 매체
+        hv.change_medium(id, 0, Some(&iso("/pools/iso/a.raw")))
+            .await
+            .unwrap();
+        assert!(take_medium_commands(&fake).is_empty());
+        // 같은 매체인데 트레이가 열려 있으면 닫는다.
+        *fake.cd_tray.lock().unwrap() = true;
+        hv.change_medium(id, 0, Some(&iso("/pools/iso/a.raw")))
+            .await
+            .unwrap();
+        assert_eq!(take_medium_commands(&fake), ["blockdev-close-tray"]);
+        assert!(!*fake.cd_tray.lock().unwrap());
+
+        hv.change_medium(id, 0, Some(&iso("/pools/iso/b.raw")))
+            .await
+            .unwrap();
+        assert_eq!(
+            take_medium_commands(&fake),
+            [
+                "add cd0-1-file",
+                "add cd0-1",
+                "blockdev-open-tray",
+                "blockdev-remove-medium",
+                "blockdev-insert-medium",
+                "del cd0",
+                "del cd0-file",
+                "blockdev-close-tray",
+            ]
+        );
+        assert_eq!(
+            fake.cd_medium.lock().unwrap().as_deref(),
+            Some("/pools/iso/b.raw")
+        );
+
+        hv.change_medium(id, 0, None).await.unwrap();
+        assert_eq!(
+            take_medium_commands(&fake),
+            [
+                "blockdev-open-tray",
+                "blockdev-remove-medium",
+                "del cd0-1",
+                "del cd0-1-file",
+                "blockdev-close-tray",
+            ]
+        );
+        assert_eq!(*fake.cd_medium.lock().unwrap(), None);
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        hv.change_medium(id, 0, None).await.unwrap();
+        assert!(take_medium_commands(&fake).is_empty());
+    }
+
+    /// 넣다가 실패하면 연 노드를 닫고 트레이를 닫은 뒤 오류다(드라이브는 빈 채). 다시 넣으면 된다. 없는 드라이브는
+    /// 명령 없이 `InvalidSpec`이다.
+    #[tokio::test]
+    async fn a_failed_medium_change_closes_what_it_opened() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        fake.failing.lock().unwrap().push("blockdev-insert-medium");
+        let err = hv
+            .change_medium(id, 0, Some(&iso("/pools/iso/a.raw")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::Qmp(_)), "{err:?}");
+        let sent = take_medium_commands(&fake);
+        assert_eq!(
+            sent[sent.len() - 3..],
+            ["del cd0", "del cd0-file", "blockdev-close-tray"]
+        );
+        assert!(fake.hot_nodes.lock().unwrap().is_empty());
+        assert_eq!(*fake.cd_medium.lock().unwrap(), None);
+
+        fake.failing.lock().unwrap().clear();
+        hv.change_medium(id, 0, Some(&iso("/pools/iso/a.raw")))
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.cd_medium.lock().unwrap().as_deref(),
+            Some("/pools/iso/a.raw")
+        );
+        take_medium_commands(&fake);
+
+        let err = hv
+            .change_medium(id, 1, Some(&iso("/pools/iso/a.raw")))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+        assert!(take_medium_commands(&fake).is_empty());
+    }
+
+    fn seed() -> CloudInitSeed {
+        CloudInitSeed {
+            instance_id: "iid-0123456789abcdef".into(),
+            meta_data: "{\"instance-id\": \"iid-0123456789abcdef\"}".into(),
+            user_data: "#cloud-config\n{}".into(),
+            vendor_data: None,
+            network_config: Some("{\"version\": 1}".into()),
+        }
+    }
+
+    /// 켤 때 cloud-init 씨앗을 실행 디렉터리의 `cidata.iso`(0600, 같은 씨앗이면 같은 바이트)로 써 두고 QEMU를 띄운다.
+    /// 씨앗이 없으면 앞서 남은 파일을 지운다. 가짜 QEMU가 띄워질 때의 파일을 복사해 두고 실패로 끝난다.
+    #[tokio::test]
+    async fn launch_writes_the_cloud_init_seed() {
+        let tmp = short_tempdir();
+        let vm = VmRuntimeSpec {
+            cloud_init: Some(seed()),
+            ..spec()
+        };
+        let dir = tmp.path().join("run/vm").join(vm.id.to_string());
+        let seen = tmp.path().join("seen.iso");
+        let fake = tmp.path().join("fake-qemu");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/sh\nif [ -e '{0}/cidata.iso' ]; then cp -p '{0}/cidata.iso' '{1}'; fi\nexit 1\n",
+                dir.display(),
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hv = QemuHypervisor::new(config(tmp.path(), fake)).await.unwrap();
+
+        assert!(matches!(
+            hv.start(&vm, None).await,
+            Err(DriverError::StartFailed(_))
+        ));
+        let want =
+            opl_qemu::iso9660::build("cidata", &opl_qemu::iso9660::cidata_files(&seed())).unwrap();
+        assert_eq!(std::fs::read(&seen).unwrap(), want);
+        let mode = std::fs::metadata(&seen).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // 씨앗이 없는 VM: 남은 파일(앞선 QEMU의 것)을 지우고 띄운다.
+        std::fs::remove_file(&seen).unwrap();
+        let plain = VmRuntimeSpec {
+            id: vm.id,
+            ..spec()
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cidata.iso"), b"stale").unwrap();
+        assert!(hv.start(&plain, None).await.is_err());
+        assert!(!seen.exists());
     }
 }
