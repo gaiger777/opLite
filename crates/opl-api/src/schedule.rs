@@ -688,7 +688,8 @@ mod tests {
     #[test]
     fn memory_only_with_the_hardware_as_booted() {
         let mut v = vm(ScheduleEvery::Hourly, 3, true);
-        let (mut hw, _) = RunningHardware::at_start(&v.spec, Default::default(), true);
+        let (mut hw, _) =
+            RunningHardware::at_start(v.id, &v.name, &v.spec, Default::default(), true);
         v.status.hardware = Some(hw.clone());
         let memory = create("auto-20261027-0507", true);
         let disks = create("auto-20261027-0507", false);

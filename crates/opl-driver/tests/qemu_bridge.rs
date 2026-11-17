@@ -102,6 +102,7 @@ fn spec(bridge: &str) -> VmRuntimeSpec {
         guest_agent: false,
         hotplug: None,
         cdroms: vec![],
+        cloud_init: None,
     }
 }
 

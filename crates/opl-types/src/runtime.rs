@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cloud_init::CloudInitSeed;
 use crate::vm::{CpuSpec, DiskBus, Firmware, MacAddr, MachineType, NicModel};
 
 /// 하이퍼바이저 드라이버가 받는, 이름 참조가 모두 풀린 VM 정의.
@@ -28,6 +29,10 @@ pub struct VmRuntimeSpec {
     /// CD-ROM 드라이브(계획 57, 순번 = QEMU의 `cd{i}-dev`). 없으면(옛 정의) 드라이브가 없다.
     #[serde(default)]
     pub cdroms: Vec<RuntimeCdrom>,
+    /// cloud-init NoCloud 씨앗(계획 57). 있으면 드라이버가 실행 디렉터리에 `cidata.iso`로 써서 읽기 전용 드라이브로
+    /// 넣는다. 없으면(옛 정의) 씨앗 드라이브가 없다.
+    #[serde(default)]
+    pub cloud_init: Option<CloudInitSeed>,
 }
 
 /// 이름이 풀린 CD-ROM 드라이브
@@ -251,13 +256,21 @@ mod tests {
     }
 
     #[test]
-    fn cdroms_round_trip() {
+    fn cdroms_and_seed_round_trip() {
         let old = serde_json::json!({
             "id": uuid::Uuid::nil(), "name": "a", "cpu": { "cores": 1 }, "memory_mib": 256,
             "firmware": "uefi", "machine": "virt", "disks": [], "nics": []
         });
         let spec: VmRuntimeSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(spec.cloud_init, None);
         let spec = VmRuntimeSpec {
+            cloud_init: Some(CloudInitSeed {
+                instance_id: "iid-1".into(),
+                meta_data: "{}".into(),
+                user_data: "#cloud-config\n{}".into(),
+                vendor_data: None,
+                network_config: Some("{}".into()),
+            }),
             cdroms: vec![
                 RuntimeCdrom {
                     medium: Some(RuntimeMedium {
@@ -275,6 +288,7 @@ mod tests {
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["cdroms"][0]["medium"]["path"], "/pools/iso/a.raw");
         assert_eq!(json["cdroms"][1]["medium"], serde_json::Value::Null);
+        assert_eq!(json["cloud_init"]["instance_id"], "iid-1");
         assert_eq!(serde_json::from_value::<VmRuntimeSpec>(json).unwrap(), spec);
     }
 }

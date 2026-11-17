@@ -820,6 +820,10 @@ pub struct RunningHardware {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub cdroms: Vec<CdromSpec>,
+    /// 켤 때 넣은 cloud-init 씨앗의 instance-id(계획 57). 없으면 씨앗 드라이브가 없다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cloud_init: Option<String>,
     /// 떼기를 요청했으나 게스트가 아직 내려 주지 않은 장치의 QEMU id(`disk{i}-dev`, `nic{i}`, `cpu{i}`). 디스크·NIC는
     /// `disks`·`nics`에 남아 있고 vCPU는 `layout.vcpus`에 들어 있으며, 다음 핫플러그 Task가 떼기를 마저 한다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2044,20 +2048,23 @@ mod tests {
     }
 
     #[test]
-    fn status_hardware_writes_cdroms_only_when_present() {
+    fn status_hardware_writes_cdroms_and_seed_only_when_present() {
         let hw = RunningHardware::legacy(&sample());
         assert!(hw.cdroms.is_empty());
         let json = serde_json::to_value(&hw).unwrap();
         assert!(json.get("cdroms").is_none(), "{json}");
+        assert!(json.get("cloud_init").is_none(), "{json}");
 
         let mut s = sample();
         s.cdroms = vec![CdromSpec {
             iso: Some("alpine".into()),
             boot_order: None,
         }];
-        let hw = RunningHardware::legacy(&s);
+        let mut hw = RunningHardware::legacy(&s);
+        hw.cloud_init = Some("iid-0123456789abcdef".into());
         let json = serde_json::to_value(&hw).unwrap();
         assert_eq!(json["cdroms"], serde_json::json!([{ "iso": "alpine" }]));
+        assert_eq!(json["cloud_init"], "iid-0123456789abcdef");
         assert_eq!(serde_json::from_value::<RunningHardware>(json).unwrap(), hw);
     }
 

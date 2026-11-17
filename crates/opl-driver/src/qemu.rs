@@ -3936,6 +3936,7 @@ mod tests {
             guest_agent: false,
             hotplug: None,
             cdroms: vec![],
+            cloud_init: None,
         }
     }
 
@@ -8012,7 +8013,7 @@ time.sleep(60)
             serde_json::json!({ "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt" }),
         )
         .unwrap();
-        let (hw, _) = RunningHardware::at_start(&spec, NodeHotplug::default(), true);
+        let (hw, _) = RunningHardware::at_start(id, "a", &spec, NodeHotplug::default(), true);
         hv.save_hardware(id, &hw).unwrap();
         assert!(hv.paths(id).unwrap().dir.join(HARDWARE_FILE).is_file());
         assert_eq!(hv.saved_hardware(id), Some(hw.clone()));

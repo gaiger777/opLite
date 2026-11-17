@@ -1030,6 +1030,7 @@ async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str])
         guest_agent: false,
         hotplug: None,
         cdroms: vec![],
+        cloud_init: None,
     };
     env.hv.start(&runtime, None).await.unwrap();
     let mut spec = current.spec.clone();

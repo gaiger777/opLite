@@ -85,7 +85,7 @@ async fn run(
     caps: NodeHotplug,
 ) -> Result<Option<String>, Stop> {
     let id = vm.id;
-    let plan = match hotplug::plan(&vm.spec, &hw, caps) {
+    let plan = match hotplug::plan(vm.id, &vm.name, &vm.spec, &hw, caps) {
         Ok(plan) => plan,
         Err(e) => {
             // 스펙이 도는 장치와 실행 중에 맞출 수 없게 어긋났다. 장치 목록을 되돌리고 보류를 다시 셈한다. 함께 바뀐
@@ -94,7 +94,7 @@ async fn run(
             if undo_devices(ctx, id, qemu, &hw).await? {
                 e.push_str(UNDONE);
             }
-            let rest = hotplug::plan_resources(&vm.spec, &hw, caps).steps;
+            let rest = hotplug::plan_resources(vm.id, &vm.name, &vm.spec, &hw, caps).steps;
             write_pending(ctx, id, qemu, caps, &skipped(rest, &hw, &vm.spec)).await?;
             return Err(Stop::Failed(e));
         }
@@ -161,10 +161,10 @@ async fn write_pending(
     caps: NodeHotplug,
     failed: &[PendingChange],
 ) -> Result<RunningHardware, Stop> {
-    update_hardware(ctx, id, qemu, |hw, spec| {
+    update_hardware(ctx, id, qemu, |hw, vm| {
         let mut failed = failed.to_vec();
         failed.extend(still_unplugging(hw));
-        hw.pending = hotplug::pending(spec, hw, caps, &failed);
+        hw.pending = hotplug::pending(vm.id, &vm.name, &vm.spec, hw, caps, &failed);
     })
     .await
 }
@@ -519,14 +519,14 @@ async fn update_hardware(
     ctx: &Ctx,
     id: Uuid,
     qemu: Qemu,
-    f: impl Fn(&mut RunningHardware, &VmSpec),
+    f: impl Fn(&mut RunningHardware, &Vm),
 ) -> Result<RunningHardware, Stop> {
     loop {
         let vm = same_qemu(ctx, id, qemu)?;
         let Some(mut hw) = vm.status.hardware.clone() else {
             return Err(Stop::Moved);
         };
-        f(&mut hw, &vm.spec);
+        f(&mut hw, &vm);
         if vm.status.hardware.as_ref() == Some(&hw) {
             return Ok(hw);
         }

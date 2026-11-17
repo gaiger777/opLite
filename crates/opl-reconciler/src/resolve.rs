@@ -287,6 +287,7 @@ async fn resolve(
             .is_some_and(|ha| ha.guest_watch.is_some()),
         hotplug: None,
         cdroms: vec![],
+        cloud_init: None,
     };
     if how != Activate::Start
         && let Some(hw) = &vm.status.hardware

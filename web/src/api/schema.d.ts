@@ -6426,6 +6426,8 @@ export interface components {
              *     핫플러그 Task가 고친다. 옛 노드는 이 필드를 무시한다.
              */
             cdroms?: components["schemas"]["CdromSpec"][];
+            /** @description 켤 때 넣은 cloud-init 씨앗의 instance-id(계획 57). 없으면 씨앗 드라이브가 없다. 옛 노드는 이 필드를 무시한다. */
+            cloud_init?: string;
             /** @description 켤 때의 토폴로지·모델·상한. 노드가 CPU 핫플러그를 못 하거나 핫플러그 배치 없이 켰으면 `max_vcpus`가 없다. */
             cpu: components["schemas"]["CpuSpec"];
             /** @description 지금 QEMU에 붙은 디스크(순번 = QEMU의 `disk{i}`). 실행 중 붙이고 떼기를 스펙과 견준다. */

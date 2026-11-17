@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 
 use serde::Serialize;
 use thiserror::Error;
+use uuid::Uuid;
 
+use crate::cloud_init;
 use crate::node::{HOTPLUG, Node, NodeHotplug};
 use crate::runtime::{HOTPLUG_PORTS, HotplugLayout};
 use crate::vm::{
@@ -82,19 +84,24 @@ impl RunningHardware {
             disks: spec.disks.clone(),
             nics: spec.nics.clone(),
             cdroms: spec.cdroms.clone(),
+            cloud_init: None,
             unplugging: Vec::new(),
             pending: Vec::new(),
         }
     }
 
-    /// 켤 때의 기록과 QEMU에 줄 배치. `enabled`(모든 노드가 `hotplug`)가 아니면 배치가 없다. 노드가 CPU 핫플러그를
-    /// 못 하면 `max_vcpus`를, virtio-mem이 없으면 메모리 상한을 두지 않는다.
+    /// VM `id`(이름 `name`)를 켤 때의 기록과 QEMU에 줄 배치. `enabled`(모든 노드가 `hotplug`)가 아니면 배치가 없다.
+    /// 노드가 CPU 핫플러그를 못 하면 `max_vcpus`를, virtio-mem이 없으면 메모리 상한을 두지 않는다. cloud-init이
+    /// 있으면 넣을 씨앗의 instance-id를 적는다.
     pub fn at_start(
+        id: Uuid,
+        name: &str,
         spec: &VmSpec,
         caps: NodeHotplug,
         enabled: bool,
     ) -> (Self, Option<HotplugLayout>) {
         let mut hw = Self::legacy(spec);
+        hw.cloud_init = seed_id(id, name, spec);
         if !enabled {
             return (hw, None);
         }
@@ -116,6 +123,16 @@ impl RunningHardware {
         };
         hw.layout = Some(layout.clone());
         (hw, Some(layout))
+    }
+
+    /// 켤 때 단 NIC(기록의 앞 `boot_nics`개, 배치가 없으면 모두). 켤 때 단 NIC는 실행 중에 떼거나 바꾸지 못하므로
+    /// cloud-init 씨앗을 만들 때 쓴 NIC 입력(MAC)이다.
+    pub fn boot_nics(&self) -> &[NicSpec] {
+        let boot = self
+            .layout
+            .as_ref()
+            .map_or(self.nics.len(), |l| usize::from(l.boot_nics));
+        &self.nics[..boot.min(self.nics.len())]
     }
 
     /// 켤 때의 vCPU 수
@@ -155,8 +172,15 @@ impl RunningHardware {
     }
 }
 
-/// 스펙 `spec`에 맞추는 계획. 이 노드의 능력은 `caps`다. 디스크·NIC를 실행 중에 바꿀 수 없으면 오류다.
-pub fn plan(spec: &VmSpec, hw: &RunningHardware, caps: NodeHotplug) -> Result<Plan, DeviceError> {
+/// VM `id`(이름 `name`)를 스펙 `spec`에 맞추는 계획. 이 노드의 능력은 `caps`다. 디스크·NIC를 실행 중에 바꿀 수
+/// 없으면 오류다.
+pub fn plan(
+    id: Uuid,
+    name: &str,
+    spec: &VmSpec,
+    hw: &RunningHardware,
+    caps: NodeHotplug,
+) -> Result<Plan, DeviceError> {
     let layout = hw.layout.as_ref();
     let disk_boot = layout.map_or(hw.disks.len(), |l| usize::from(l.boot_disks));
     let nic_boot = layout.map_or(hw.nics.len(), |l| usize::from(l.boot_nics));
@@ -199,7 +223,7 @@ pub fn plan(spec: &VmSpec, hw: &RunningHardware, caps: NodeHotplug) -> Result<Pl
     let mut steps: Vec<Step> = nics.removed.iter().map(|&i| Step::RemoveNic(i)).collect();
     steps.extend(disks.removed.iter().map(|&i| Step::RemoveDisk(i)));
     let mut pending = Vec::new();
-    changes(spec, hw, caps, &mut steps, &mut pending);
+    changes(id, name, spec, hw, caps, &mut steps, &mut pending);
     steps.extend(
         spec.cdroms
             .iter()
@@ -247,9 +271,15 @@ pub fn plan(spec: &VmSpec, hw: &RunningHardware, caps: NodeHotplug) -> Result<Pl
 
 /// 디스크·NIC는 견주지 않고 vCPU·메모리·펌웨어·머신만 맞추는 계획(바로 할 단계와 보류). 디스크·NIC를 맞출 수 없을
 /// 때도 남은 변경을 셀 수 있다.
-pub fn plan_resources(spec: &VmSpec, hw: &RunningHardware, caps: NodeHotplug) -> Plan {
+pub fn plan_resources(
+    id: Uuid,
+    name: &str,
+    spec: &VmSpec,
+    hw: &RunningHardware,
+    caps: NodeHotplug,
+) -> Plan {
     let mut plan = Plan::default();
-    changes(spec, hw, caps, &mut plan.steps, &mut plan.pending);
+    changes(id, name, spec, hw, caps, &mut plan.steps, &mut plan.pending);
     plan
 }
 
@@ -274,6 +304,8 @@ pub fn device_name(hw: &RunningHardware, device: &str) -> String {
 
 /// 핫플러그 Task 끝에 쓸 보류 목록: 지금 셈한 보류에 실패한 항목(`failed`)을 같은 `field` 자리에 덮어 더한다.
 pub fn pending(
+    id: Uuid,
+    name: &str,
     spec: &VmSpec,
     hw: &RunningHardware,
     caps: NodeHotplug,
@@ -281,7 +313,7 @@ pub fn pending(
 ) -> Vec<PendingChange> {
     let mut steps = Vec::new();
     let mut out = Vec::new();
-    changes(spec, hw, caps, &mut steps, &mut out);
+    changes(id, name, spec, hw, caps, &mut steps, &mut out);
     for f in failed {
         match out.iter_mut().find(|p| p.field == f.field) {
             Some(p) => *p = f.clone(),
@@ -339,7 +371,7 @@ pub fn allocated_memory_mib(vm: &Vm) -> u32 {
 /// 끝나지 않았거나 실패해 게스트가 아직 내려 주지 않은 장치가 있다 — 마이그레이션 대상은 스펙의 장치로 켜므로
 /// 옮기면 안 된다.
 /// CD-ROM 드라이브는 수와 매체를 견준다(부팅 순서는 다음 재시작 때 적용할 보류일 뿐이고, 받는 쪽은 기록의 값으로
-/// 켠다).
+/// 켠다). cloud-init 씨앗은 드라이브가 있는지만 견준다(내용은 받는 쪽이 스펙으로 다시 만든다).
 pub fn devices_match(spec: &VmSpec, hw: &RunningHardware) -> bool {
     spec.disks == hw.disks
         && spec.nics.len() == hw.nics.len()
@@ -350,17 +382,21 @@ pub fn devices_match(spec: &VmSpec, hw: &RunningHardware) -> bool {
             .iter()
             .zip(&hw.cdroms)
             .all(|(a, b)| a.iso == b.iso)
+        && spec.cloud_init.is_some() == hw.cloud_init.is_some()
 }
 
 /// 마이그레이션 대상이 켤 QEMU의 핫플러그·디스크·NIC·CD-ROM 장치 id(`/machine/peripheral`의 `disk{i}-dev`·
-/// `nic{i}`·`cpu{i}`·`vmem0-dev`·`cd{i}-dev`, 이름순): 디스크·NIC는 스펙에서, 붙인 vCPU와 virtio-mem은 하드웨어
-/// 기록의 배치에서, CD-ROM 드라이브는 기록(없으면 스펙)에서 나온다. 원본 드라이버가 도는 QEMU와 견준다.
+/// `nic{i}`·`cpu{i}`·`vmem0-dev`·`cd{i}-dev`·`cidata-dev`, 이름순): 디스크·NIC는 스펙에서, 붙인 vCPU와 virtio-mem은
+/// 하드웨어 기록의 배치에서, CD-ROM 드라이브와 cloud-init 씨앗 드라이브는 기록(없으면 스펙)에서 나온다. 원본
+/// 드라이버가 도는 QEMU와 견준다.
 pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> {
     let cdroms = hw.map_or(spec.cdroms.len(), |hw| hw.cdroms.len());
+    let seed = hw.map_or(spec.cloud_init.is_some(), |hw| hw.cloud_init.is_some());
     let mut ids: Vec<String> = (0..spec.disks.len())
         .map(|i| format!("disk{i}-dev"))
         .chain((0..spec.nics.len()).map(|i| format!("nic{i}")))
         .chain((0..cdroms).map(|i| format!("cd{i}-dev")))
+        .chain(seed.then(|| "cidata-dev".to_string()))
         .collect();
     if let Some(hw) = hw
         && let Some(layout) = &hw.layout
@@ -458,8 +494,10 @@ fn device_changes<T>(
     })
 }
 
-/// vCPU·메모리·펌웨어·머신·CD-ROM 부팅 순서: 바로 할 단계는 `steps`에, 못 하는 것은 `pending`에 더한다.
+/// vCPU·메모리·펌웨어·머신·CD-ROM 부팅 순서·cloud-init: 바로 할 단계는 `steps`에, 못 하는 것은 `pending`에 더한다.
 fn changes(
+    id: Uuid,
+    name: &str,
     spec: &VmSpec,
     hw: &RunningHardware,
     caps: NodeHotplug,
@@ -499,6 +537,36 @@ fn changes(
             ));
         }
     }
+    // cloud-init 씨앗은 QEMU를 켤 때 스펙으로 만든다(instance-id = 내용 해시).
+    let seed = seed_id(id, name, spec);
+    if seed != hw.cloud_init {
+        let id = |s: Option<String>| s.unwrap_or_else(|| "none".into());
+        pending.push(change(
+            "cloud_init",
+            id(hw.cloud_init.clone()),
+            id(seed),
+            PendingReason::Restart,
+            None,
+        ));
+    }
+}
+
+/// 스펙 `spec`의 cloud-init으로 만들 씨앗이 도는 QEMU의 씨앗(기록의 instance-id)과 같은지. 마이그레이션 대상은
+/// 씨앗을 스펙의 cloud-init과 켤 때 단 NIC([`RunningHardware::boot_nics`])로 다시 만들므로, 실행 중 cloud-init을
+/// 바꿨거나 호스트 이름 없는 VM의 이름을 바꿨으면 게스트가 다른 씨앗을 보게 된다. 실행 중 붙인 NIC는 씨앗을 바꾸지
+/// 않는다(다음 재시작 때 들어감).
+pub fn seed_matches(id: Uuid, name: &str, spec: &VmSpec, hw: &RunningHardware) -> bool {
+    spec.cloud_init
+        .as_ref()
+        .map(|ci| cloud_init::render(id, name, ci, hw.boot_nics()).instance_id)
+        == hw.cloud_init
+}
+
+/// VM `id`(이름 `name`)를 스펙 `spec`으로 켜면 넣을 cloud-init 씨앗의 instance-id. cloud-init이 없으면 없다.
+fn seed_id(id: Uuid, name: &str, spec: &VmSpec) -> Option<String> {
+    spec.cloud_init
+        .as_ref()
+        .map(|ci| cloud_init::render(id, name, ci, &spec.nics).instance_id)
 }
 
 /// vCPU: 바로 = 배치 있음·노드가 CPU 핫플러그를 함·토폴로지·모델·상한이 켤 때와 같음·켤 때 수 ≤ 새 수 ≤ 상한.
@@ -673,6 +741,9 @@ mod tests {
     use crate::resource::Resource;
     use crate::vm::{CdromSpec, CpuModel, DiskSpec, Firmware, MacAddr, MachineType, NicModel};
 
+    /// 시험 VM의 id·이름("web")
+    const VM: Uuid = Uuid::nil();
+
     const ALL: NodeHotplug = NodeHotplug {
         cpu: true,
         memory: true,
@@ -709,7 +780,7 @@ mod tests {
     }
 
     fn started(spec: &VmSpec, caps: NodeHotplug) -> RunningHardware {
-        RunningHardware::at_start(spec, caps, true).0
+        RunningHardware::at_start(VM, "web", spec, caps, true).0
     }
 
     fn layout(hw: &mut RunningHardware) -> &mut HotplugLayout {
@@ -731,7 +802,7 @@ mod tests {
     #[test]
     fn at_start_records_the_layout_and_respects_node_caps() {
         let s = spec();
-        let (hw, layout) = RunningHardware::at_start(&s, ALL, true);
+        let (hw, layout) = RunningHardware::at_start(VM, "web", &s, ALL, true);
         let layout = layout.unwrap();
         assert_eq!(hw.layout.as_ref(), Some(&layout));
         assert_eq!(layout.vcpus, 2);
@@ -751,12 +822,12 @@ mod tests {
         assert!(hw.matches_boot());
 
         // CPU 핫플러그·virtio-mem이 없는 노드는 상한을 두지 않는다.
-        let (hw, layout) = RunningHardware::at_start(&s, NodeHotplug::default(), true);
+        let (hw, layout) = RunningHardware::at_start(VM, "web", &s, NodeHotplug::default(), true);
         assert_eq!(hw.cpu.max_vcpus, None);
         assert_eq!(layout.unwrap().max_memory_mib, 4096);
 
         // 클러스터가 업그레이드 중이면 배치가 없다.
-        let (hw, layout) = RunningHardware::at_start(&s, ALL, false);
+        let (hw, layout) = RunningHardware::at_start(VM, "web", &s, ALL, false);
         assert_eq!(layout, None);
         assert_eq!(hw, RunningHardware::legacy(&s));
         assert_eq!(hw.cpu.max_vcpus, None);
@@ -771,7 +842,7 @@ mod tests {
         let hw = started(&spec(), ALL);
         let mut s = spec();
         s.cpu.cores = 4;
-        let first = plan(&s, &hw, ALL).unwrap();
+        let first = plan(VM, "web", &s, &hw, ALL).unwrap();
         assert_eq!(first.steps, [Step::SetVcpus(4)]);
         assert!(first.pending.is_empty());
 
@@ -780,7 +851,10 @@ mod tests {
         layout(&mut hw).vcpus = 6;
         assert_eq!(hw.vcpus(), 6);
         s.cpu.cores = 2;
-        assert_eq!(plan(&s, &hw, ALL).unwrap().steps, [Step::SetVcpus(2)]);
+        assert_eq!(
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
+            [Step::SetVcpus(2)]
+        );
     }
 
     #[test]
@@ -790,7 +864,7 @@ mod tests {
         // 상한도 함께 올렸다: 상한은 재시작, vCPU는 지금 상한 밖이다.
         s.cpu.cores = 9;
         s.cpu.max_vcpus = Some(16);
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(
             reasons(&pending),
             [
@@ -816,10 +890,10 @@ mod tests {
         s.cpu.cores = 4;
         let hw = started(&s, ALL);
         s.cpu.cores = 3;
-        assert_eq!(plan(&s, &hw, ALL).unwrap().steps, []);
+        assert_eq!(plan(VM, "web", &s, &hw, ALL).unwrap().steps, []);
         s.cpu.cores = 2;
         assert_eq!(
-            reasons(&only_pending(plan(&s, &hw, ALL).unwrap())),
+            reasons(&only_pending(plan(VM, "web", &s, &hw, ALL).unwrap())),
             [("vcpus", PendingReason::Limit)]
         );
     }
@@ -831,7 +905,7 @@ mod tests {
         s.cpu.cores = 4;
         s.cpu.max_vcpus = Some(12);
         assert_eq!(
-            reasons(&only_pending(plan(&s, &hw, ALL).unwrap())),
+            reasons(&only_pending(plan(VM, "web", &s, &hw, ALL).unwrap())),
             [
                 ("cpu.max_vcpus", PendingReason::Restart),
                 ("vcpus", PendingReason::Restart)
@@ -841,7 +915,10 @@ mod tests {
         let mut s = spec();
         s.cpu.cores = 8;
         s.cpu.max_vcpus = None;
-        assert_eq!(plan(&s, &hw, ALL).unwrap().steps, [Step::SetVcpus(8)]);
+        assert_eq!(
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
+            [Step::SetVcpus(8)]
+        );
     }
 
     #[test]
@@ -850,7 +927,7 @@ mod tests {
         let mut s = spec();
         s.cpu.sockets = 2;
         s.cpu.cores = 4;
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(reasons(&pending), [("cpu", PendingReason::Restart)]);
         assert_eq!(
             (pending[0].running.as_str(), pending[0].wanted.as_str()),
@@ -859,7 +936,7 @@ mod tests {
 
         let mut s = spec();
         s.cpu.model = CpuModel::Max;
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(reasons(&pending), [("cpu", PendingReason::Restart)]);
         assert_eq!(pending[0].wanted, "1x2 max");
     }
@@ -873,13 +950,13 @@ mod tests {
         let mut s = spec();
         let hw = started(&s, no_cpu);
         s.cpu.cores = 4;
-        let pending = only_pending(plan(&s, &hw, no_cpu).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, no_cpu).unwrap());
         // 상한은 이 노드에서 켜도 없으므로 보류가 아니다.
         assert_eq!(reasons(&pending), [("vcpus", PendingReason::Unsupported)]);
         assert_eq!(pending[0].detail.as_deref(), Some(NO_CPU_HOTPLUG));
 
         let hw = RunningHardware::legacy(&spec());
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         // 옛 배치: 상한(켤 때 없음)은 재시작, vCPU는 못 함
         assert_eq!(
             reasons(&pending),
@@ -897,7 +974,7 @@ mod tests {
         let hw = started(&spec(), ALL);
         let mut s = spec();
         s.memory_mib = 8192;
-        let plan1 = plan(&s, &hw, ALL).unwrap();
+        let plan1 = plan(VM, "web", &s, &hw, ALL).unwrap();
         assert_eq!(plan1.steps, [Step::SetMemory { plugged_mib: 4096 }]);
         assert!(plan1.pending.is_empty());
 
@@ -906,17 +983,17 @@ mod tests {
         assert_eq!(hw.memory_now(), 8192);
         s.memory_mib = 6144;
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [Step::SetMemory { plugged_mib: 2048 }]
         );
         s.memory_mib = 4096;
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [Step::SetMemory { plugged_mib: 0 }]
         );
         // 켤 때 아래
         s.memory_mib = 2048;
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(reasons(&pending), [("memory_mib", PendingReason::Limit)]);
         assert_eq!(
             (pending[0].running.as_str(), pending[0].wanted.as_str()),
@@ -937,7 +1014,7 @@ mod tests {
         let mut s = spec();
         let hw = started(&s, no_mem);
         s.memory_mib = 8192;
-        let pending = only_pending(plan(&s, &hw, no_mem).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, no_mem).unwrap());
         assert_eq!(
             reasons(&pending),
             [("memory_mib", PendingReason::Unsupported)]
@@ -950,7 +1027,7 @@ mod tests {
         let hw = started(&s, ALL);
         s.memory_mib = 8192;
         assert_eq!(
-            reasons(&only_pending(plan(&s, &hw, ALL).unwrap())),
+            reasons(&only_pending(plan(VM, "web", &s, &hw, ALL).unwrap())),
             [("memory_mib", PendingReason::Limit)]
         );
 
@@ -958,7 +1035,7 @@ mod tests {
         let hw = started(&spec(), ALL);
         let mut s = spec();
         s.max_memory_mib = Some(32768);
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(
             reasons(&pending),
             [("max_memory_mib", PendingReason::Restart)]
@@ -969,7 +1046,7 @@ mod tests {
         );
         s.memory_mib = 8192;
         assert_eq!(
-            reasons(&only_pending(plan(&s, &hw, ALL).unwrap())),
+            reasons(&only_pending(plan(VM, "web", &s, &hw, ALL).unwrap())),
             [
                 ("max_memory_mib", PendingReason::Restart),
                 ("memory_mib", PendingReason::Restart)
@@ -980,7 +1057,7 @@ mod tests {
         s.memory_mib = 16384;
         s.max_memory_mib = None;
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [Step::SetMemory { plugged_mib: 12288 }]
         );
     }
@@ -991,7 +1068,7 @@ mod tests {
         let mut s = spec();
         s.firmware = Firmware::Bios;
         s.machine = MachineType::Virt;
-        let pending = only_pending(plan(&s, &hw, ALL).unwrap());
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(
             reasons(&pending),
             [
@@ -1015,14 +1092,14 @@ mod tests {
         let mut s = spec();
         s.disks.push(disk("data"));
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [Step::AddDisk { index: 1, port: 0 }]
         );
         // 부팅 순서는 받는다(다음 부팅부터).
         s.disks[1].boot_order = Some(2);
         s.disks.push(disk("logs"));
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [
                 Step::AddDisk { index: 1, port: 0 },
                 Step::AddDisk { index: 2, port: 1 }
@@ -1042,24 +1119,27 @@ mod tests {
 
         let mut less = s.clone();
         less.disks.pop();
-        assert_eq!(plan(&less, &hw, ALL).unwrap().steps, [Step::RemoveDisk(2)]);
+        assert_eq!(
+            plan(VM, "web", &less, &hw, ALL).unwrap().steps,
+            [Step::RemoveDisk(2)]
+        );
         less.disks.pop();
         assert_eq!(
-            plan(&less, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &less, &hw, ALL).unwrap().steps,
             [Step::RemoveDisk(2), Step::RemoveDisk(1)]
         );
         // 떼고 붙이기: 떼기 먼저, 빈 포트(작은 것부터) 다시 씀
         let mut swap = s.clone();
         swap.disks[2] = disk("other");
         assert_eq!(
-            plan(&swap, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &swap, &hw, ALL).unwrap().steps,
             [Step::RemoveDisk(2), Step::AddDisk { index: 2, port: 0 }]
         );
         layout(&mut hw).nic_ports = vec![0];
         hw.nics.push(nic(2));
         swap.nics.push(nic(2));
         assert_eq!(
-            plan(&swap, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &swap, &hw, ALL).unwrap().steps,
             [Step::RemoveDisk(2), Step::AddDisk { index: 2, port: 1 }]
         );
     }
@@ -1076,7 +1156,7 @@ mod tests {
         let changed = |f: &dyn Fn(&mut VmSpec)| {
             let mut next = s.clone();
             f(&mut next);
-            plan(&next, &hw, ALL).unwrap_err()
+            plan(VM, "web", &next, &hw, ALL).unwrap_err()
         };
         // 부팅 디스크 떼기
         assert_eq!(
@@ -1127,12 +1207,12 @@ mod tests {
         let mut s = spec();
         let hw = RunningHardware::legacy(&s);
         s.disks.push(disk("data"));
-        assert_eq!(plan(&s, &hw, ALL), Err(DeviceError::NoLayout));
+        assert_eq!(plan(VM, "web", &s, &hw, ALL), Err(DeviceError::NoLayout));
         // 장치가 그대로면 배치 없이도 vCPU·메모리 보류를 셈한다.
         let mut s = spec();
         s.memory_mib = 8192;
         assert_eq!(
-            reasons(&only_pending(plan(&s, &hw, ALL).unwrap())),
+            reasons(&only_pending(plan(VM, "web", &s, &hw, ALL).unwrap())),
             [
                 ("cpu.max_vcpus", PendingReason::Restart),
                 ("max_memory_mib", PendingReason::Restart),
@@ -1153,15 +1233,21 @@ mod tests {
         layout(&mut hw).nic_ports = vec![1, 3, 5, 7];
         let mut more = s.clone();
         more.disks.push(disk("d9"));
-        assert_eq!(plan(&more, &hw, ALL), Err(DeviceError::NoFreePort));
+        assert_eq!(
+            plan(VM, "web", &more, &hw, ALL),
+            Err(DeviceError::NoFreePort)
+        );
         let mut more = s.clone();
         more.nics.push(nic(30));
-        assert_eq!(plan(&more, &hw, ALL), Err(DeviceError::NoFreePort));
+        assert_eq!(
+            plan(VM, "web", &more, &hw, ALL),
+            Err(DeviceError::NoFreePort)
+        );
         // 하나 떼면 그 포트를 다시 쓴다.
         let mut swap = s.clone();
         swap.nics[4] = nic(30);
         assert_eq!(
-            plan(&swap, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &swap, &hw, ALL).unwrap().steps,
             [Step::RemoveNic(4), Step::AddNic { index: 4, port: 7 }]
         );
     }
@@ -1172,23 +1258,26 @@ mod tests {
         let mut hw = started(&s, ALL);
         // 보안 그룹만 바꾸기는 단계가 없다.
         s.nics[0].security_groups = vec!["web".into()];
-        assert_eq!(plan(&s, &hw, ALL).unwrap(), Plan::default());
+        assert_eq!(plan(VM, "web", &s, &hw, ALL).unwrap(), Plan::default());
         // 끝에 붙이기와 실행 중 붙인 것 떼기
         s.nics.push(nic(2));
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [Step::AddNic { index: 1, port: 0 }]
         );
         hw.nics = s.nics.clone();
         layout(&mut hw).nic_ports = vec![0];
         let mut less = s.clone();
         less.nics.pop();
-        assert_eq!(plan(&less, &hw, ALL).unwrap().steps, [Step::RemoveNic(1)]);
+        assert_eq!(
+            plan(VM, "web", &less, &hw, ALL).unwrap().steps,
+            [Step::RemoveNic(1)]
+        );
         // MAC·네트워크·모델 바꾸기와 부팅 NIC 떼기
         let refused = |f: &dyn Fn(&mut NicSpec)| {
             let mut next = s.clone();
             f(&mut next.nics[0]);
-            plan(&next, &hw, ALL).unwrap_err()
+            plan(VM, "web", &next, &hw, ALL).unwrap_err()
         };
         assert_eq!(
             refused(&|n| n.mac = Some(MacAddr([0x52, 0x54, 0, 0, 0, 9]))),
@@ -1205,13 +1294,13 @@ mod tests {
         let mut none = s.clone();
         none.nics.clear();
         assert_eq!(
-            plan(&none, &hw, ALL).unwrap_err(),
+            plan(VM, "web", &none, &hw, ALL).unwrap_err(),
             DeviceError::Changed("remove NIC 0".into())
         );
         let mut swapped = s.clone();
         swapped.nics.swap(0, 1);
         assert_eq!(
-            plan(&swapped, &hw, ALL).unwrap_err(),
+            plan(VM, "web", &swapped, &hw, ALL).unwrap_err(),
             DeviceError::Changed("reorder the NICs".into())
         );
     }
@@ -1232,7 +1321,7 @@ mod tests {
         s.cpu.cores = 4;
         s.memory_mib = 8192;
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [
                 Step::RemoveNic(1),
                 Step::RemoveDisk(1),
@@ -1259,13 +1348,13 @@ mod tests {
             reason: PendingReason::Failed,
             detail: Some("the guest did not release vCPU 3 within 60s".into()),
         };
-        let out = pending(&s, &hw, ALL, std::slice::from_ref(&failed));
+        let out = pending(VM, "web", &s, &hw, ALL, std::slice::from_ref(&failed));
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].field, "firmware");
         assert_eq!(out[1], failed);
         // 셈한 항목과 같은 field면 그 자리를 덮는다.
         s.cpu.cores = 12;
-        let out = pending(&s, &hw, ALL, std::slice::from_ref(&failed));
+        let out = pending(VM, "web", &s, &hw, ALL, std::slice::from_ref(&failed));
         assert_eq!(
             reasons(&out),
             [
@@ -1273,7 +1362,7 @@ mod tests {
                 ("firmware", PendingReason::Restart)
             ]
         );
-        assert!(pending(&spec(), &started(&spec(), ALL), ALL, &[]).is_empty());
+        assert!(pending(VM, "web", &spec(), &started(&spec(), ALL), ALL, &[]).is_empty());
     }
 
     /// 게스트가 아직 내려 주지 않은 장치는 스펙의 같은 장치와 같지 않은 것으로 본다: 떼기를 먼저 마저 하고 스펙에
@@ -1290,14 +1379,17 @@ mod tests {
         layout(&mut hw).nic_ports = vec![1];
         hw.unplugging = vec!["disk1-dev".into()];
         assert_eq!(
-            plan(&s, &hw, ALL).unwrap().steps,
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
             [Step::RemoveDisk(1), Step::AddDisk { index: 1, port: 0 }]
         );
         // 스펙에서도 뺐으면 떼기만 한다.
         hw.unplugging = vec!["nic1".into()];
         let mut less = s.clone();
         less.nics.pop();
-        assert_eq!(plan(&less, &hw, ALL).unwrap().steps, [Step::RemoveNic(1)]);
+        assert_eq!(
+            plan(VM, "web", &less, &hw, ALL).unwrap().steps,
+            [Step::RemoveNic(1)]
+        );
         assert_eq!(device_name(&hw, "nic1"), "NIC 1 on network \"lan\"");
         assert_eq!(device_name(&hw, "disk1-dev"), "disk \"data\"");
         assert_eq!(device_name(&hw, "cpu3"), "cpu3");
@@ -1310,9 +1402,12 @@ mod tests {
         layout(&mut hw).vcpus = 4;
         let mut s = spec();
         s.cpu.cores = 4;
-        assert!(plan(&s, &hw, ALL).unwrap().steps.is_empty());
+        assert!(plan(VM, "web", &s, &hw, ALL).unwrap().steps.is_empty());
         hw.unplugging = vec!["cpu2".into(), "cpu3".into()];
-        assert_eq!(plan(&s, &hw, ALL).unwrap().steps, [Step::SetVcpus(4)]);
+        assert_eq!(
+            plan(VM, "web", &s, &hw, ALL).unwrap().steps,
+            [Step::SetVcpus(4)]
+        );
     }
 
     /// 디스크·NIC를 실행 중에 맞출 수 없어도 vCPU·메모리 단계와 보류는 센다.
@@ -1323,8 +1418,8 @@ mod tests {
         s.disks.clear();
         s.cpu.cores = 4;
         s.firmware = Firmware::Bios;
-        assert!(plan(&s, &hw, ALL).is_err());
-        let p = plan_resources(&s, &hw, ALL);
+        assert!(plan(VM, "web", &s, &hw, ALL).is_err());
+        let p = plan_resources(VM, "web", &s, &hw, ALL);
         assert_eq!(p.steps, [Step::SetVcpus(4)]);
         assert_eq!(reasons(&p.pending), [("firmware", PendingReason::Restart)]);
     }
@@ -1488,6 +1583,8 @@ mod tests {
         assert!(!hw.matches_boot());
         let mut hw = RunningHardware::legacy(&spec());
         hw.pending = pending(
+            VM,
+            "web",
             &VmSpec {
                 firmware: Firmware::Bios,
                 ..spec()
@@ -1588,7 +1685,7 @@ mod tests {
             let mut want = s.clone();
             want.cdroms[0].iso = None;
             want.cdroms[1].iso = Some("alpine".into());
-            let plan = plan(&want, &hw, ALL).unwrap();
+            let plan = plan(VM, "web", &want, &hw, ALL).unwrap();
             assert_eq!(
                 plan.steps,
                 [
@@ -1609,7 +1706,7 @@ mod tests {
     }
 
     fn plan_fn(spec: &VmSpec, hw: &RunningHardware) -> Plan {
-        plan(spec, hw, ALL).unwrap()
+        plan(VM, "web", spec, hw, ALL).unwrap()
     }
 
     #[test]
@@ -1644,7 +1741,7 @@ mod tests {
         let mut fewer = s.clone();
         fewer.cdroms.pop();
         for want in [more, fewer] {
-            let err = plan(&want, &hw, ALL).unwrap_err();
+            let err = plan(VM, "web", &want, &hw, ALL).unwrap_err();
             assert_eq!(
                 err,
                 DeviceError::Changed("add or remove CD-ROM drives".into())
@@ -1656,7 +1753,7 @@ mod tests {
         }
         // CD-ROM이 없던 VM에 드라이브를 더하는 것도 같다.
         let hw = started(&spec(), ALL);
-        assert!(plan(&s, &hw, ALL).is_err());
+        assert!(plan(VM, "web", &s, &hw, ALL).is_err());
     }
 
     #[test]
@@ -1677,7 +1774,7 @@ mod tests {
             }]
         );
         // Task 끝의 보류에도 남는다.
-        assert_eq!(super::pending(&want, &hw, ALL, &[]), pending);
+        assert_eq!(super::pending(VM, "web", &want, &hw, ALL, &[]), pending);
         // 부팅 순서만 다르면 마이그레이션 대상이 기록의 값으로 켠다.
         assert!(devices_match(&want, &hw));
     }
@@ -1726,5 +1823,159 @@ mod tests {
         let mut host = ci.clone();
         host.cloud_init.as_mut().unwrap().hostname = Some("web".into());
         assert!(hardware_changed(&ci, &host));
+    }
+
+    /// cloud-init(호스트 이름 `host`)이 있는 스펙
+    fn with_cloud_init(host: &str) -> VmSpec {
+        let mut s = spec();
+        s.cloud_init = Some(CloudInit {
+            hostname: Some(host.into()),
+            ..CloudInit::default()
+        });
+        s
+    }
+
+    #[test]
+    fn at_start_records_the_seed_instance_id() {
+        let s = with_cloud_init("web");
+        let want = crate::cloud_init::render(VM, "web", s.cloud_init.as_ref().unwrap(), &s.nics)
+            .instance_id;
+        for enabled in [true, false] {
+            let (hw, _) = RunningHardware::at_start(VM, "web", &s, ALL, enabled);
+            assert_eq!(hw.cloud_init.as_deref(), Some(want.as_str()));
+        }
+        assert_eq!(started(&spec(), ALL).cloud_init, None);
+        // 옛 노드가 켠 기록(씨앗 없음)
+        assert_eq!(RunningHardware::legacy(&s).cloud_init, None);
+    }
+
+    #[test]
+    fn seed_matches_compares_the_instance_id() {
+        let s = with_cloud_init("web");
+        let hw = started(&s, ALL);
+        assert!(seed_matches(VM, "web", &s, &hw));
+        // 실행 중 cloud-init을 바꿈·이름 바꿈(호스트 이름 없는 VM)은 다른 씨앗이다.
+        assert!(!seed_matches(VM, "web", &with_cloud_init("web2"), &hw));
+        let no_host = VmSpec {
+            cloud_init: Some(CloudInit::default()),
+            ..spec()
+        };
+        let hw = started(&no_host, ALL);
+        assert!(seed_matches(VM, "web", &no_host, &hw));
+        assert!(!seed_matches(VM, "web-new", &no_host, &hw));
+        // cloud-init 없는 VM
+        assert!(seed_matches(VM, "web", &spec(), &started(&spec(), ALL)));
+    }
+
+    /// 주소 설정이 있는 cloud-init VM에 실행 중 NIC를 붙여도 씨앗은 켤 때 단 NIC로 셈해 같다(받는 쪽도 그 NIC로 다시
+    /// 만든다). 새 NIC는 다음 재시작 때 들어가므로 보류로 남는다.
+    #[test]
+    fn a_hot_plugged_nic_keeps_the_seed() {
+        let mut s = spec();
+        s.cloud_init = Some(CloudInit {
+            networks: vec![crate::cloud_init::CloudInitNet {
+                ipv4: Some(crate::cloud_init::IpConfig::Static {
+                    address: "10.0.0.5/24".into(),
+                    gateway: None,
+                }),
+                ipv6: None,
+            }],
+            ..CloudInit::default()
+        });
+        let mut hw = started(&s, ALL);
+        let mut want = s.clone();
+        want.nics.push(nic(2));
+        // 핫플러그 Task가 붙인 뒤의 기록
+        hw.nics.push(nic(2));
+        layout(&mut hw).nic_ports.push(0);
+        assert_eq!(hw.boot_nics(), &s.nics[..]);
+        assert!(devices_match(&want, &hw));
+        assert!(seed_matches(VM, "web", &want, &hw));
+        assert_eq!(
+            reasons(&plan_fn(&want, &hw).pending),
+            [("cloud_init", PendingReason::Restart)]
+        );
+        // 배치 없이 켠 기록은 모든 NIC가 켤 때 단 것이다.
+        let legacy = RunningHardware::legacy(&want);
+        assert_eq!(legacy.boot_nics(), &want.nics[..]);
+    }
+
+    #[test]
+    fn cloud_init_changes_are_pending_until_restart() {
+        let s = with_cloud_init("web");
+        let hw = started(&s, ALL);
+        // 같은 내용이면 보류가 없다.
+        assert_eq!(plan_fn(&s, &hw), Plan::default());
+        let iid = hw.cloud_init.clone().unwrap();
+
+        // 바꿈
+        let changed = with_cloud_init("web2");
+        let new_iid = started(&changed, ALL).cloud_init.unwrap();
+        let want = [PendingChange {
+            field: "cloud_init".into(),
+            running: iid.clone(),
+            wanted: new_iid.clone(),
+            reason: PendingReason::Restart,
+            detail: None,
+        }];
+        assert_eq!(only_pending(plan_fn(&changed, &hw)), want);
+        assert_eq!(super::pending(VM, "web", &changed, &hw, ALL, &[]), want);
+        assert_eq!(plan_resources(VM, "web", &changed, &hw, ALL).pending, want);
+
+        // 켬·끔
+        let plain = started(&spec(), ALL);
+        let on = only_pending(plan_fn(&s, &plain));
+        assert_eq!(reasons(&on), [("cloud_init", PendingReason::Restart)]);
+        assert_eq!(
+            (on[0].running.as_str(), on[0].wanted.as_str()),
+            ("none", iid.as_str())
+        );
+        let off = only_pending(plan_fn(&spec(), &hw));
+        assert_eq!(
+            (off[0].running.as_str(), off[0].wanted.as_str()),
+            (iid.as_str(), "none")
+        );
+
+        // VM 이름이 호스트 이름이면 이름도 내용이다.
+        let bare = {
+            let mut s = spec();
+            s.cloud_init = Some(CloudInit::default());
+            s
+        };
+        let hw = started(&bare, ALL);
+        assert!(plan(VM, "web", &bare, &hw, ALL).unwrap().pending.is_empty());
+        assert_eq!(plan(VM, "db", &bare, &hw, ALL).unwrap().pending.len(), 1);
+    }
+
+    #[test]
+    fn devices_match_compares_whether_there_is_a_seed() {
+        let s = with_cloud_init("web");
+        let hw = started(&s, ALL);
+        assert!(devices_match(&s, &hw));
+        // 내용만 다르면 받는 쪽이 스펙으로 다시 만든다.
+        assert!(devices_match(&with_cloud_init("web2"), &hw));
+        assert!(!devices_match(&spec(), &hw));
+        assert!(!devices_match(&s, &started(&spec(), ALL)));
+    }
+
+    #[test]
+    fn qemu_devices_lists_the_seed_drive() {
+        let s = with_cloud_init("web");
+        let ids = ["cidata-dev", "disk0-dev", "nic0"].map(String::from);
+        assert_eq!(qemu_devices(&s, None), ids);
+        let hw = started(&s, NodeHotplug::default());
+        assert_eq!(qemu_devices(&s, Some(&hw)), ids);
+        // 기록에 씨앗이 없으면(켤 때 없었음) 드라이브도 없다.
+        assert_eq!(
+            qemu_devices(&s, Some(&RunningHardware::legacy(&s))),
+            ["disk0-dev", "nic0"].map(String::from)
+        );
+        // CD-ROM과 함께면 이름순이다.
+        let mut both = with_cdroms();
+        both.cloud_init = s.cloud_init.clone();
+        assert_eq!(
+            qemu_devices(&both, None),
+            ["cd0-dev", "cd1-dev", "cidata-dev", "disk0-dev", "nic0"].map(String::from)
+        );
     }
 }

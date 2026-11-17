@@ -568,7 +568,8 @@ mod tests {
     fn running_memory_above_the_spec_counts_as_allocated() {
         let a = node(8192);
         let mut big: Vm = Resource::new("big", spec(2048, Some(a.id), PowerState::Running));
-        let (mut hw, _) = RunningHardware::at_start(&big.spec, Default::default(), true);
+        let (mut hw, _) =
+            RunningHardware::at_start(big.id, &big.name, &big.spec, Default::default(), true);
         hw.memory_mib = 1024;
         hw.layout.as_mut().unwrap().plugged_mib = 3072;
         big.status.hardware = Some(hw);

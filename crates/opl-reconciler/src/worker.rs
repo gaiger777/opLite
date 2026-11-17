@@ -1180,7 +1180,7 @@ impl Worker {
             .flatten()
             .and_then(|n| n.status.hotplug)
             .unwrap_or_default();
-        let plan = hotplug::plan_resources(&now.spec, &hw, caps);
+        let plan = hotplug::plan_resources(now.id, &now.name, &now.spec, &hw, caps);
         let late = |field: &str, running: u32, wanted: u32| PendingChange {
             field: field.into(),
             running: running.to_string(),
@@ -1217,7 +1217,7 @@ impl Worker {
             .find(|n| n.id == self.config.node)
             .and_then(|n| n.status.hotplug)
             .unwrap_or_default();
-        RunningHardware::at_start(&vm.spec, caps, all_have(&nodes, HOTPLUG)).0
+        RunningHardware::at_start(vm.id, &vm.name, &vm.spec, caps, all_have(&nodes, HOTPLUG)).0
     }
 
     /// 메모리 스냅샷 `tag`(스냅샷 id)를 불러오며 켤 하드웨어: 메모리를 담을 때 도는 QEMU와 같은 장치여야 하므로

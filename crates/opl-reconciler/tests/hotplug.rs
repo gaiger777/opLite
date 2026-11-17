@@ -391,7 +391,8 @@ async fn a_memory_snapshot_restores_with_the_hardware_it_was_taken_with() {
     env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
         .await;
     // 능력이 없는 노드에서 찍은 메모리: vCPU 상한·virtio-mem 없이 켠다(이 노드는 둘 다 있다).
-    let (taken, _) = RunningHardware::at_start(&vm.spec, NodeHotplug::default(), true);
+    let (taken, _) =
+        RunningHardware::at_start(vm.id, &vm.name, &vm.spec, NodeHotplug::default(), true);
     let recorded = memory_snapshot(&env, &vm, "recorded", Some(taken.clone())).await;
     env.restore_on_start(vm.id, &recorded.to_string());
     env.set_power(vm.id, PowerState::Running).await;

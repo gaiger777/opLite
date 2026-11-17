@@ -65,6 +65,7 @@ fn spec(host: &HostProfile, id: Uuid, disk: PathBuf, layout: HotplugLayout) -> V
         guest_agent: false,
         hotplug: Some(layout),
         cdroms: vec![],
+        cloud_init: None,
     }
 }
 

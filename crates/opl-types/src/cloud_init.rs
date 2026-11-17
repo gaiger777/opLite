@@ -5,9 +5,11 @@ use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::host::valid_host;
 use crate::resource::Kind;
+use crate::vm::NicSpec;
 
 /// 응답에서 비밀번호(해시) 대신 보이는 값. PUT 본문의 이 값은 "저장된 해시를 그대로 둠"이다.
 pub const PASSWORD_MASK: &str = "********";
@@ -350,6 +352,226 @@ pub fn redact_vm_json(kind: Kind, value: &mut serde_json::Value) {
     {
         *password = PASSWORD_MASK.into();
     }
+}
+
+/// Orbivisor가 만든 NoCloud 씨앗(파일 내용). 드라이버가 ISO 9660(라벨 `cidata`)으로 써서 VM에 넣는다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudInitSeed {
+    /// meta-data의 `instance-id`(`iid-` + 내용 해시 16자). 내용이 바뀌면 바뀌어 cloud-init이 다시 적용한다.
+    pub instance_id: String,
+    pub meta_data: String,
+    pub user_data: String,
+    pub vendor_data: Option<String>,
+    pub network_config: Option<String>,
+}
+
+/// meta-data 파일
+#[derive(Serialize)]
+struct MetaData<'a> {
+    #[serde(rename = "instance-id")]
+    instance_id: &'a str,
+    #[serde(rename = "local-hostname")]
+    local_hostname: &'a str,
+}
+
+/// 만든 user-data(`#cloud-config`)
+#[derive(Serialize)]
+struct UserData<'a> {
+    hostname: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fqdn: Option<&'a str>,
+    manage_etc_hosts: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chpasswd: Option<Chpasswd>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_pwauth: Option<bool>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    ssh_authorized_keys: &'a [String],
+}
+
+#[derive(Serialize)]
+struct Chpasswd {
+    expire: bool,
+}
+
+/// network-config 버전 1
+#[derive(Serialize)]
+struct NetworkConfig<'a> {
+    version: u8,
+    config: Vec<NetEntry<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum NetEntry<'a> {
+    Physical {
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mac_address: Option<String>,
+        subnets: Vec<Subnet<'a>>,
+    },
+    Nameserver {
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        address: Vec<String>,
+        #[serde(skip_serializing_if = "<[String]>::is_empty")]
+        search: &'a [String],
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Subnet<'a> {
+    Dhcp,
+    Dhcp6,
+    #[serde(rename = "ipv6_slaac")]
+    Ipv6Slaac,
+    Static {
+        address: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gateway: Option<&'a str>,
+    },
+    Static6 {
+        address: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        gateway: Option<&'a str>,
+    },
+}
+
+/// VM `vm_id`(이름 `vm_name`, NIC `nics`)의 cloud-init 설정 `ci`로 NoCloud 씨앗을 만든다. 같은 입력이면 같은
+/// 바이트다. YAML 파일은 JSON으로 쓴다(JSON은 YAML이고 cloud-init이 그대로 읽는다).
+pub fn render(vm_id: Uuid, vm_name: &str, ci: &CloudInit, nics: &[NicSpec]) -> CloudInitSeed {
+    let host = ci.hostname.as_deref().unwrap_or(vm_name);
+    let label = host.split('.').next().unwrap_or(host);
+    let user_data = match &ci.user_data {
+        Some(custom) => custom.clone(),
+        None => {
+            let password = ci.password.as_deref();
+            let data = UserData {
+                hostname: label,
+                fqdn: host.contains('.').then_some(host),
+                manage_etc_hosts: true,
+                user: ci.user.as_deref(),
+                password,
+                chpasswd: password.map(|_| Chpasswd { expire: false }),
+                ssh_pwauth: password.map(|_| true),
+                ssh_authorized_keys: &ci.ssh_keys,
+            };
+            format!("#cloud-config\n{}\n", pretty(&data))
+        }
+    };
+    let network_config = network_config(ci, nics);
+    let instance_id = instance_id(
+        vm_id,
+        label,
+        &user_data,
+        ci.vendor_data.as_deref(),
+        network_config.as_deref(),
+    );
+    let meta_data = pretty(&MetaData {
+        instance_id: &instance_id,
+        local_hostname: label,
+    }) + "\n";
+    CloudInitSeed {
+        instance_id,
+        meta_data,
+        user_data,
+        vendor_data: ci.vendor_data.clone(),
+        network_config,
+    }
+}
+
+/// 씨앗의 instance-id: VM id와 파일 내용(호스트 이름·user-data·vendor-data·network-config)의 SHA-256 앞 16자.
+/// 내용이 같으면 같아 다시 켜도 cloud-init이 인스턴스마다 하는 일을 다시 하지 않는다.
+pub fn instance_id(
+    vm_id: Uuid,
+    local_hostname: &str,
+    user_data: &str,
+    vendor_data: Option<&str>,
+    network_config: Option<&str>,
+) -> String {
+    let mut c = ring::digest::Context::new(&ring::digest::SHA256);
+    c.update(vm_id.as_bytes());
+    // 칸마다 있음 표시와 길이를 앞에 둬 경계가 겹치지 않게 한다.
+    for part in [
+        Some(local_hostname),
+        Some(user_data),
+        vendor_data,
+        network_config,
+    ] {
+        match part {
+            Some(p) => {
+                c.update(&[1]);
+                c.update(&(p.len() as u64).to_be_bytes());
+                c.update(p.as_bytes());
+            }
+            None => c.update(&[0]),
+        }
+    }
+    let hex: String = c.finish().as_ref()[..8]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("iid-{hex}")
+}
+
+/// network-config. 주소 설정도 DNS도 없으면 파일을 두지 않는다(cloud-init 기본 — 첫 NIC DHCP). 있으면 모든 NIC를
+/// 적고, 설정이 없는(항목이 없거나 빈) NIC는 IPv4 DHCP다. IPv6만 설정한 NIC에는 IPv4를 두지 않는다(IPv6 전용 망에
+/// DHCPv4를 기다리지 않게).
+fn network_config(ci: &CloudInit, nics: &[NicSpec]) -> Option<String> {
+    let dns = ci
+        .dns
+        .as_ref()
+        .filter(|d| !d.servers.is_empty() || !d.search.is_empty());
+    if ci.networks.is_empty() && dns.is_none() {
+        return None;
+    }
+    let mut config: Vec<NetEntry> = nics
+        .iter()
+        .enumerate()
+        .map(|(i, nic)| {
+            let net = ci.networks.get(i);
+            let ipv6_only = net.is_some_and(|n| n.ipv4.is_none() && n.ipv6.is_some());
+            let mut subnets = Vec::new();
+            if !ipv6_only {
+                subnets.push(match net.and_then(|n| n.ipv4.as_ref()) {
+                    None | Some(IpConfig::Dhcp) | Some(IpConfig::Slaac) => Subnet::Dhcp,
+                    Some(IpConfig::Static { address, gateway }) => Subnet::Static {
+                        address,
+                        gateway: gateway.as_deref(),
+                    },
+                });
+            }
+            match net.and_then(|n| n.ipv6.as_ref()) {
+                None => {}
+                Some(IpConfig::Dhcp) => subnets.push(Subnet::Dhcp6),
+                Some(IpConfig::Slaac) => subnets.push(Subnet::Ipv6Slaac),
+                Some(IpConfig::Static { address, gateway }) => subnets.push(Subnet::Static6 {
+                    address,
+                    gateway: gateway.as_deref(),
+                }),
+            }
+            NetEntry::Physical {
+                name: format!("eth{i}"),
+                mac_address: nic.mac.map(|m| m.to_string()),
+                subnets,
+            }
+        })
+        .collect();
+    if let Some(dns) = dns {
+        config.push(NetEntry::Nameserver {
+            address: dns.servers.iter().map(ToString::to_string).collect(),
+            search: &dns.search,
+        });
+    }
+    Some(pretty(&NetworkConfig { version: 1, config }) + "\n")
+}
+
+fn pretty(v: &impl Serialize) -> String {
+    serde_json::to_string_pretty(v).expect("cloud-init files serialize")
 }
 
 #[cfg(test)]
@@ -740,5 +962,261 @@ mod tests {
             redact_vm_json(kind, &mut v);
             assert_eq!(v, json);
         }
+    }
+
+    /// 두 NIC VM(MAC 고정)
+    fn nics() -> Vec<NicSpec> {
+        serde_json::from_value(serde_json::json!([
+            { "network": "lan", "model": "virtio", "mac": "52:54:00:12:34:56" },
+            { "network": "dmz", "model": "virtio", "mac": "52:54:00:12:34:57" }
+        ]))
+        .unwrap()
+    }
+
+    const HASH: &str = "$6$saltstring$svn8UoSVapNtMuq1ukKS4tPQd8iKwSMHWjl/O817G3uBnIFNjnQJuesI68u4OTLiBFdcbYEdFCoEOfaS35inz1";
+
+    fn hashed() -> CloudInit {
+        CloudInit {
+            password: Some(HASH.into()),
+            ..ci()
+        }
+    }
+
+    #[test]
+    fn renders_the_four_nocloud_files() {
+        let seed = render(Uuid::nil(), "web", &hashed(), &nics());
+        assert_eq!(seed.instance_id, "iid-0cd5141d80a257cf");
+        assert_eq!(
+            seed.meta_data,
+            "{\n  \"instance-id\": \"iid-0cd5141d80a257cf\",\n  \"local-hostname\": \"web-01\"\n}\n"
+        );
+        let want_user = format!(
+            r#"#cloud-config
+{{
+  "hostname": "web-01",
+  "fqdn": "web-01.example.com",
+  "manage_etc_hosts": true,
+  "user": "orbi",
+  "password": "{HASH}",
+  "chpasswd": {{
+    "expire": false
+  }},
+  "ssh_pwauth": true,
+  "ssh_authorized_keys": [
+    "ssh-ed25519 AAAAC3Nza orbi@laptop"
+  ]
+}}
+"#
+        );
+        assert_eq!(seed.user_data, want_user);
+        assert_eq!(
+            seed.vendor_data.as_deref(),
+            Some("#cloud-config\nruncmd: [true]\n")
+        );
+        let want_net = r#"{
+  "version": 1,
+  "config": [
+    {
+      "type": "physical",
+      "name": "eth0",
+      "mac_address": "52:54:00:12:34:56",
+      "subnets": [
+        {
+          "type": "static",
+          "address": "10.0.0.5/24",
+          "gateway": "10.0.0.1"
+        },
+        {
+          "type": "ipv6_slaac"
+        }
+      ]
+    },
+    {
+      "type": "physical",
+      "name": "eth1",
+      "mac_address": "52:54:00:12:34:57",
+      "subnets": [
+        {
+          "type": "dhcp"
+        }
+      ]
+    },
+    {
+      "type": "nameserver",
+      "address": [
+        "10.0.0.2"
+      ],
+      "search": [
+        "example.com"
+      ]
+    }
+  ]
+}
+"#;
+        assert_eq!(seed.network_config.as_deref(), Some(want_net));
+        // user-data는 첫 줄 `#cloud-config` 뒤가 JSON(= YAML)이다.
+        let (head, body) = seed.user_data.split_once('\n').unwrap();
+        assert_eq!(head, "#cloud-config");
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["password"], HASH);
+        let net: serde_json::Value =
+            serde_json::from_str(seed.network_config.as_deref().unwrap()).unwrap();
+        assert_eq!(net["config"][0]["subnets"][0]["address"], "10.0.0.5/24");
+    }
+
+    #[test]
+    fn minimal_settings_use_the_vm_name_and_distribution_defaults() {
+        let seed = render(Uuid::nil(), "web", &CloudInit::default(), &nics());
+        assert_eq!(
+            seed.user_data,
+            "#cloud-config\n{\n  \"hostname\": \"web\",\n  \"manage_etc_hosts\": true\n}\n"
+        );
+        assert!(seed.meta_data.contains("\"local-hostname\": \"web\""));
+        // 비밀번호가 없으면 ssh_pwauth를 적지 않는다. 주소 설정·DNS가 없으면 network-config도 없다.
+        assert!(!seed.user_data.contains("ssh_pwauth"));
+        assert_eq!(seed.network_config, None);
+        assert_eq!(seed.vendor_data, None);
+        let no_password = CloudInit {
+            password: None,
+            ..ci()
+        };
+        let seed = render(Uuid::nil(), "web", &no_password, &nics());
+        assert!(!seed.user_data.contains("ssh_pwauth"));
+        assert!(!seed.user_data.contains("chpasswd"));
+    }
+
+    #[test]
+    fn custom_user_data_replaces_the_generated_one() {
+        let custom = "#cloud-config\npackages: [nginx]\n";
+        let c = CloudInit {
+            user_data: Some(custom.into()),
+            ..hashed()
+        };
+        let seed = render(Uuid::nil(), "web", &c, &nics());
+        assert_eq!(seed.user_data, custom);
+        // 호스트 이름은 meta-data에 남는다.
+        assert!(seed.meta_data.contains("\"local-hostname\": \"web-01\""));
+    }
+
+    #[test]
+    fn every_nic_is_written_once_any_address_is_set() {
+        // 둘째 NIC만 정적 IPv6(IPv4 없음 — DHCPv4를 넣지 않음), 첫 NIC는 항목이 비어 DHCP
+        let c = CloudInit {
+            networks: vec![
+                CloudInitNet::default(),
+                CloudInitNet {
+                    ipv4: None,
+                    ipv6: Some(IpConfig::Static {
+                        address: "2001:db8::5/64".into(),
+                        gateway: None,
+                    }),
+                },
+            ],
+            dns: None,
+            ..CloudInit::default()
+        };
+        let seed = render(Uuid::nil(), "web", &c, &nics());
+        let net: serde_json::Value =
+            serde_json::from_str(seed.network_config.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            net["config"],
+            serde_json::json!([
+                { "type": "physical", "name": "eth0", "mac_address": "52:54:00:12:34:56",
+                  "subnets": [{ "type": "dhcp" }] },
+                { "type": "physical", "name": "eth1", "mac_address": "52:54:00:12:34:57",
+                  "subnets": [{ "type": "static6", "address": "2001:db8::5/64" }] }
+            ])
+        );
+        // DHCPv4와 DHCPv6, 그리고 DNS만 있어도 파일을 쓴다(모든 NIC IPv4 DHCP).
+        let c = CloudInit {
+            networks: vec![CloudInitNet {
+                ipv4: Some(IpConfig::Dhcp),
+                ipv6: Some(IpConfig::Dhcp),
+            }],
+            ..CloudInit::default()
+        };
+        let net: serde_json::Value = serde_json::from_str(
+            &render(Uuid::nil(), "web", &c, &nics())
+                .network_config
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            net["config"][0]["subnets"],
+            serde_json::json!([{ "type": "dhcp" }, { "type": "dhcp6" }])
+        );
+        let c = CloudInit {
+            dns: Some(CloudInitDns {
+                servers: vec!["2001:db8::53".parse().unwrap()],
+                search: vec![],
+            }),
+            ..CloudInit::default()
+        };
+        let net: serde_json::Value = serde_json::from_str(
+            &render(Uuid::nil(), "web", &c, &nics())
+                .network_config
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(net["config"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            net["config"][2],
+            serde_json::json!({ "type": "nameserver", "address": ["2001:db8::53"] })
+        );
+    }
+
+    #[test]
+    fn a_plain_hostname_has_no_fqdn() {
+        let c = CloudInit {
+            hostname: Some("db".into()),
+            ..CloudInit::default()
+        };
+        let seed = render(Uuid::nil(), "web", &c, &[]);
+        assert!(seed.user_data.contains("\"hostname\": \"db\""));
+        assert!(!seed.user_data.contains("fqdn"));
+    }
+
+    #[test]
+    fn instance_id_follows_the_content() {
+        let id = |vm: Uuid, name: &str, c: &CloudInit| render(vm, name, c, &nics()).instance_id;
+        let a = id(Uuid::nil(), "web", &hashed());
+        assert_eq!(a.len(), "iid-".len() + 16);
+        assert!(a.starts_with("iid-"));
+        // 같은 입력이면 같다.
+        assert_eq!(a, id(Uuid::nil(), "web", &hashed()));
+        // 호스트 이름, VM id, vendor-data, 주소가 바뀌면 바뀐다.
+        let host = CloudInit {
+            hostname: Some("web-02".into()),
+            ..hashed()
+        };
+        assert_ne!(a, id(Uuid::nil(), "web", &host));
+        assert_ne!(a, id(Uuid::from_u128(1), "web", &hashed()));
+        let vendor = CloudInit {
+            vendor_data: None,
+            ..hashed()
+        };
+        assert_ne!(a, id(Uuid::nil(), "web", &vendor));
+        // 호스트 이름이 없으면 VM 이름이 내용이다.
+        let bare = CloudInit::default();
+        assert_ne!(id(Uuid::nil(), "web", &bare), id(Uuid::nil(), "db", &bare));
+        // 사용자 user-data만 쓸 때도 호스트 이름이 바뀌면 바뀐다(meta-data에만 있음).
+        let custom = |h: &str| CloudInit {
+            hostname: Some(h.into()),
+            user_data: Some("#cloud-config\n".into()),
+            ..CloudInit::default()
+        };
+        assert_ne!(
+            id(Uuid::nil(), "web", &custom("a")),
+            id(Uuid::nil(), "web", &custom("b"))
+        );
+        // 칸 경계가 섞이지 않는다.
+        assert_ne!(
+            instance_id(Uuid::nil(), "a", "b", None, None),
+            instance_id(Uuid::nil(), "ab", "", None, None)
+        );
+        assert_ne!(
+            instance_id(Uuid::nil(), "a", "b", Some(""), None),
+            instance_id(Uuid::nil(), "a", "b", None, Some(""))
+        );
     }
 }

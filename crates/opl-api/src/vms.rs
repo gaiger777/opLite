@@ -763,7 +763,8 @@ fn check_hot_change(state: &AppState, vm: &Vm, spec: &VmSpec) -> Result<(), ApiE
         .node
         .and_then(|id| inv.nodes.iter().find(|n| n.id == id));
     let caps = node.and_then(|n| n.status.hotplug).unwrap_or_default();
-    let plan = hotplug::plan(spec, hw, caps).map_err(|e| device_error(vm, hw, e))?;
+    let plan =
+        hotplug::plan(vm.id, &vm.name, spec, hw, caps).map_err(|e| device_error(vm, hw, e))?;
     check_hotplug_memory(&inv, vm, hw, node, &plan)
 }
 
@@ -1047,7 +1048,7 @@ fn check_hotplug_room(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
         .node
         .and_then(|id| inv.nodes.iter().find(|n| n.id == id));
     let caps = node.and_then(|n| n.status.hotplug).unwrap_or_default();
-    match hotplug::plan(&vm.spec, hw, caps) {
+    match hotplug::plan(vm.id, &vm.name, &vm.spec, hw, caps) {
         Ok(plan) => check_hotplug_memory(&inv, vm, hw, node, &plan),
         Err(_) => Ok(()),
     }

@@ -1504,7 +1504,7 @@ mod tests {
             cpu: true,
             memory: true,
         };
-        let mut hw = RunningHardware::at_start(&v.spec, all, true).0;
+        let mut hw = RunningHardware::at_start(v.id, &v.name, &v.spec, all, true).0;
         let inv = |v: &Vm| Inventory {
             nodes: vec![a.clone(), b.clone()],
             vms: vec![v.clone()],
@@ -1560,7 +1560,7 @@ mod tests {
             cpu: true,
             memory: true,
         };
-        v.status.hardware = Some(RunningHardware::at_start(&v.spec, all, true).0);
+        v.status.hardware = Some(RunningHardware::at_start(v.id, &v.name, &v.spec, all, true).0);
         let inv = Inventory {
             nodes: vec![a.clone(), b.clone()],
             vms: vec![v.clone()],

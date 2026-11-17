@@ -1012,6 +1012,7 @@ mod tests {
             guest_agent: false,
             hotplug: None,
             cdroms: vec![],
+            cloud_init: None,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

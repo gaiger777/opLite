@@ -7,6 +7,7 @@ pub mod backup_job;
 pub mod ceph;
 pub mod cloud_init;
 pub mod cluster;
+pub mod crypt;
 pub mod fence;
 pub mod ha_check;
 pub mod host;

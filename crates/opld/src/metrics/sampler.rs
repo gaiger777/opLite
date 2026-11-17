@@ -567,6 +567,7 @@ mod tests {
                 guest_agent: false,
                 hotplug: None,
                 cdroms: vec![],
+                cloud_init: None,
             },
             None,
         )

@@ -47,6 +47,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
         guest_agent: false,
         hotplug: None,
         cdroms: vec![],
+        cloud_init: None,
     }
 }
 

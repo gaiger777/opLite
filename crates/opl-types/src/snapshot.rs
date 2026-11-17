@@ -114,7 +114,13 @@ mod tests {
                 .is_none()
         );
 
-        let (hw, _) = RunningHardware::at_start(&spec.vm_spec, Default::default(), true);
+        let (hw, _) = RunningHardware::at_start(
+            uuid::Uuid::nil(),
+            "web",
+            &spec.vm_spec,
+            Default::default(),
+            true,
+        );
         spec.hardware = Some(hw);
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(json["hardware"]["layout"]["ports"], 8);

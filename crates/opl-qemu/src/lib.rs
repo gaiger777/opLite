@@ -2,6 +2,7 @@
 
 pub mod cmdline;
 pub mod host;
+pub mod iso9660;
 pub mod paths;
 pub mod qga;
 pub mod qmp;
