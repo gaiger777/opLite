@@ -1,5 +1,6 @@
 //! URL에서 이미지를 받아 볼륨을 만든다(`POST /volumes/download`, 계획 57). 127.0.0.1의 시험 HTTP 서버에서 받고
-//! qemu-img로 가져온다. `cargo test -p opl-api --features storage-it --test downloads`
+//! qemu-img로 가져온다. 계획 58: 체크섬 파일(`checksum` 단계)·SHA-512, 받은 볼륨으로 템플릿 VM 만들기.
+//! `cargo test -p opl-api --features storage-it --test downloads`
 #![cfg(feature = "storage-it")]
 
 mod common;
@@ -18,9 +19,13 @@ use common::{Client, Env, WAIT};
 use opl_types::audit::AuditQuery;
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::resource::Resource;
+use opl_types::runtime::ImageFormat;
+use opl_types::storage::{SourceFormat, VolumeSpec};
+use opl_types::task::{Task, TaskOp, TaskSpec};
+use opl_types::template::TemplateDraft;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 use tokio::sync::{Notify, mpsc};
 
 const CHUNK: usize = 64 * 1024;
@@ -41,6 +46,10 @@ fn iso_image() -> Vec<u8> {
 
 fn sha256(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
+}
+
+fn sha512(data: &[u8]) -> String {
+    hex::encode(Sha512::digest(data))
 }
 
 /// 본문을 `chunks` 채널에서 받는 스트림 응답
@@ -101,6 +110,35 @@ async fn serve(files: Arc<Files>) -> String {
             get(|State(f): State<Arc<Files>>| async move { f.qcow2.clone() }),
         )
         .route("/chunked.iso", get(chunked_iso))
+        // 체크섬 파일(계획 58): GNU SHA-256, BSD SHA-512, 틀린 해시, disk.qcow2 줄이 없는 것, 1 MiB 넘는 것
+        .route(
+            "/SHA256SUMS",
+            get(|State(f): State<Arc<Files>>| async move {
+                format!(
+                    "{}  a.iso\n{} *disk.qcow2\n",
+                    sha256(&f.iso),
+                    sha256(&f.qcow2)
+                )
+            }),
+        )
+        .route(
+            "/SHA512SUMS",
+            get(|State(f): State<Arc<Files>>| async move {
+                format!(
+                    "# Fedora-like\nSHA512 (disk.qcow2) = {}\n",
+                    sha512(&f.qcow2)
+                )
+            }),
+        )
+        .route(
+            "/BADSUMS",
+            get(|| async { format!("{}  disk.qcow2\n", "0".repeat(64)) }),
+        )
+        .route(
+            "/OTHERSUMS",
+            get(|| async { format!("{}  other.qcow2\n", "0".repeat(64)) }),
+        )
+        .route("/HUGESUMS", get(|| async { vec![b'#'; 2 << 20] }))
         .route("/slow.iso", get(slow_iso))
         .with_state(files);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -534,4 +572,224 @@ async fn private_addresses_are_refused_unless_allowed() {
         "{error}"
     );
     assert_cleaned(&env, &admin, "named").await;
+}
+
+/// 저장소에 받기 볼륨(풀 `local`, qcow2 디스크)과 새 칸을 쓴 받기 Task를 바로 만들고 끝나기를 기다린다(이 칸을 받는 API는
+/// 계획 58 S5가 연다).
+async fn run_download(env: &Env, admin: &Client, name: &str, op: TaskOp) -> Value {
+    let mut volume: opl_types::storage::Volume = Resource::new(
+        name,
+        VolumeSpec {
+            pool: "local".into(),
+            size_bytes: 0,
+            format: ImageFormat::Qcow2,
+            content: Default::default(),
+            base: None,
+        },
+    );
+    volume.status.node = Some(env.node);
+    env.cluster.create(&volume).await.unwrap();
+    let mut task: Task = Resource::new(
+        "",
+        TaskSpec {
+            op,
+            target: volume.id,
+            node: env.node,
+        },
+    );
+    task.name = task.id.to_string();
+    env.cluster.create(&task).await.unwrap();
+    admin.wait_task(&json!({ "id": task.id })).await
+}
+
+fn disk_download(
+    url: String,
+    sha512: Option<String>,
+    checksum_url: Option<String>,
+    template: Option<TemplateDraft>,
+) -> TaskOp {
+    TaskOp::VolumeDownload {
+        url,
+        sha256: None,
+        source_format: SourceFormat::Qcow2,
+        sha512,
+        checksum_url,
+        template: template.map(Box::new),
+    }
+}
+
+/// 체크섬 파일에서 이미지 파일 이름의 줄을 찾아 그 알고리즘(SHA-256·SHA-512)으로 확인한다. 고정 SHA-512도 받는다.
+#[tokio::test]
+async fn checksum_files_and_sha512_check_downloads() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (files, base) = setup(&env, &admin).await;
+    let url = format!("{base}/disk.qcow2");
+    for (name, sha, sums) in [
+        ("gnu", None, Some(format!("{base}/SHA256SUMS"))),
+        ("bsd", None, Some(format!("{base}/SHA512SUMS"))),
+        ("fixed", Some(sha512(&files.qcow2).to_uppercase()), None),
+    ] {
+        let task = run_download(
+            &env,
+            &admin,
+            name,
+            disk_download(url.clone(), sha, sums, None),
+        )
+        .await;
+        assert_eq!(task["status"]["state"], "succeeded", "{name}: {task}");
+        let (_, volume) = admin.get(&format!("/volumes/{name}")).await;
+        assert_eq!(volume["status"]["phase"], "ready", "{volume}");
+        assert_eq!(volume["spec"]["size_bytes"], 2u64 << 20);
+    }
+}
+
+/// 체크섬 파일에 줄이 없거나 해시가 틀리거나 파일이 너무 크면 실패하고 아무것도 남기지 않는다.
+#[tokio::test]
+async fn bad_checksum_files_fail_downloads() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (files, base) = setup(&env, &admin).await;
+    let url = format!("{base}/disk.qcow2");
+    let zeros = "0".repeat(64);
+    let got = sha256(&files.qcow2);
+    for (name, sha, sums, error) in [
+        (
+            "noentry",
+            None,
+            Some(format!("{base}/OTHERSUMS")),
+            format!("checksum file {base}/OTHERSUMS has no entry for disk.qcow2"),
+        ),
+        (
+            "wrong",
+            None,
+            Some(format!("{base}/BADSUMS")),
+            format!("checksum mismatch: expected {zeros} (from {base}/BADSUMS), got {got}"),
+        ),
+        (
+            "huge",
+            None,
+            Some(format!("{base}/HUGESUMS")),
+            format!("checksum file {base}/HUGESUMS is larger than 1024 KiB"),
+        ),
+        (
+            "nosums",
+            None,
+            Some(format!("{base}/MISSINGSUMS")),
+            format!("GET {base}/MISSINGSUMS: HTTP 404 Not Found"),
+        ),
+        (
+            "wrong512",
+            Some("0".repeat(128)),
+            None,
+            format!(
+                "checksum mismatch: expected {}, got {}",
+                "0".repeat(128),
+                sha512(&files.qcow2)
+            ),
+        ),
+    ] {
+        let task = run_download(
+            &env,
+            &admin,
+            name,
+            disk_download(url.clone(), sha, sums, None),
+        )
+        .await;
+        assert_eq!(task["status"]["state"], "failed", "{name}: {task}");
+        assert_eq!(task["status"]["error"], error, "{name}");
+        assert_cleaned(&env, &admin, name).await;
+    }
+}
+
+fn draft(name: &str, size_bytes: Option<u64>) -> TemplateDraft {
+    serde_json::from_value(json!({
+        "name": name,
+        "network": "user",
+        "size_bytes": size_bytes,
+        "cloud_init": { "user": "orbi" },
+    }))
+    .unwrap()
+}
+
+/// 템플릿 초안이 있으면 받은 볼륨을 늘리고 그것을 첫 부팅 디스크로 쓰는 꺼진 템플릿 VM을 만든다.
+#[tokio::test]
+async fn a_download_with_a_draft_makes_a_template() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, base) = setup(&env, &admin).await;
+    let op = disk_download(
+        format!("{base}/disk.qcow2"),
+        None,
+        Some(format!("{base}/SHA256SUMS")),
+        Some(draft("ubuntu-tmpl", Some(8 << 20))),
+    );
+    let task = run_download(&env, &admin, "ubuntu-24-04", op).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, volume) = admin.get("/volumes/ubuntu-24-04").await;
+    assert_eq!(volume["status"]["phase"], "ready", "{volume}");
+    assert_eq!(volume["spec"]["size_bytes"], 8u64 << 20);
+    let (status, vm) = admin.get("/vms/ubuntu-tmpl").await;
+    assert_eq!(status, StatusCode::OK, "{vm}");
+    let spec = &vm["spec"];
+    assert_eq!(spec["template"], true, "{vm}");
+    assert_eq!(spec["power"], "stopped");
+    assert_eq!(spec["cpu"]["cores"], 2);
+    assert_eq!(spec["memory_mib"], 2048);
+    assert_eq!(spec["disks"][0]["volume"], "ubuntu-24-04");
+    assert_eq!(spec["disks"][0]["bus"], "virtio-blk");
+    assert_eq!(spec["disks"][0]["boot_order"], 1);
+    assert_eq!(spec["nics"][0]["network"], "user");
+    assert!(spec["nics"][0]["mac"].is_string(), "{vm}");
+    assert_eq!(spec["cloud_init"]["user"], "orbi");
+}
+
+/// 템플릿을 만들지 못하면(이름이 그새 쓰임) Task는 실패하지만 받은 볼륨은 남기고 손수 만드는 길을 알린다.
+#[tokio::test]
+async fn a_failed_template_keeps_the_downloaded_volume() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (_, base) = setup(&env, &admin).await;
+    let (status, body) = admin.post("/vms", common::vm_request("taken")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let op = disk_download(
+        format!("{base}/disk.qcow2"),
+        None,
+        None,
+        Some(draft("taken", None)),
+    );
+    let task = run_download(&env, &admin, "kept", op).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.starts_with("cannot create VM \"taken\""), "{error}");
+    assert!(
+        error.ends_with(
+            "; volume \"kept\" is ready; create the template from it with vm create and template convert"
+        ),
+        "{error}"
+    );
+    let (_, volume) = admin.get("/volumes/kept").await;
+    assert_eq!(volume["status"]["phase"], "ready", "{volume}");
+    let file = env
+        .dir
+        .path()
+        .join("pool")
+        .join(format!("{}.qcow2", volume["id"].as_str().unwrap()));
+    assert!(file.exists());
+    let uploads = std::fs::read_dir(env.dir.path().join("uploads")).unwrap();
+    assert_eq!(uploads.count(), 0);
+    let (_, vm) = admin.get("/vms/taken").await;
+    assert_ne!(vm["spec"]["template"], true, "{vm}");
+
+    // 체크섬이 틀려 가져오기 전에 실패하면 초안이 있어도 볼륨을 지운다.
+    let op = disk_download(
+        format!("{base}/disk.qcow2"),
+        None,
+        Some(format!("{base}/BADSUMS")),
+        Some(draft("other", None)),
+    );
+    let task = run_download(&env, &admin, "dropped", op).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    assert_eq!(admin.get("/volumes/dropped").await.0, StatusCode::NOT_FOUND);
+    assert_eq!(admin.get("/vms/other").await.0, StatusCode::NOT_FOUND);
 }

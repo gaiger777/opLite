@@ -780,10 +780,26 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if matches!(
         task.spec.op,
         TaskOp::VolumeCreate | TaskOp::VolumeImport { .. } | TaskOp::VolumeDownload { .. }
-    ) && let Err(e) = remove_volume(ctx, task.spec.target).await
+    ) && !keeps_downloaded(ctx, task)
+        && let Err(e) = remove_volume(ctx, task.spec.target).await
     {
         tracing::warn!(volume = %task.spec.target, error = %e, "cannot clean up failed volume");
     }
+}
+
+/// 템플릿 초안이 있는 받기가 가져오기를 마친 뒤(볼륨 Ready) 실패했으면 받은 볼륨을 남긴다 — 템플릿 만들기만 실패했다
+/// (계획 58 §8). 그 볼륨으로 손수 템플릿을 만들 수 있다.
+fn keeps_downloaded(ctx: &Ctx, task: &Task) -> bool {
+    matches!(
+        &task.spec.op,
+        TaskOp::VolumeDownload {
+            template: Some(_),
+            ..
+        }
+    ) && matches!(
+        ctx.cluster.get::<VolumeSpec>(task.spec.target),
+        Ok(Some(v)) if v.status.phase == VolumePhase::Ready
+    )
 }
 
 /// `pending`을 `running`으로 읽은 revision에서만 바꾼다. 그사이 다른 쪽(리더의 정리 작업)이
@@ -930,16 +946,29 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
         | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
-        op @ TaskOp::VolumeDownload { .. } if op.needs_templates() => Err(
-            "this node cannot check SHA-512 or checksum files or make templates from downloads yet"
-                .into(),
-        ),
         TaskOp::VolumeDownload {
             url,
             sha256,
             source_format,
-            ..
-        } => download::download(ctx, task, url, sha256.as_deref(), *source_format).await,
+            sha512,
+            checksum_url,
+            template,
+        } => {
+            let expected = download::Expected {
+                sha256: sha256.as_deref(),
+                sha512: sha512.as_deref(),
+                checksum_url: checksum_url.as_deref(),
+            };
+            download::download(
+                ctx,
+                task,
+                url,
+                expected,
+                *source_format,
+                template.as_deref(),
+            )
+            .await
+        }
         TaskOp::VolumeFlatten => template::flatten(ctx, id).await,
         TaskOp::VmUntemplate => template::untemplate(ctx, task).await,
     };
