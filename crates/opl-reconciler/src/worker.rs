@@ -1649,9 +1649,13 @@ impl Worker {
         }
     }
 
-    /// UEFI VM이 이 노드의 변수 파일로 돈다: 이 노드를 `firmware_node`로 남긴다. BIOS VM은 그대로 둔다.
+    /// UEFI VM이 이 노드의 변수 파일로 돈다: 이 노드를 `firmware_node`로 남긴다. BIOS VM은 그대로 둔다. 다른 노드에서
+    /// 넘어왔으면(마이그레이션을 확정보다 먼저 넘겨받음) 펌웨어 사본은 비운다(계획 59 §10, 해시 기록 뒤 다시 밀어 둔다).
     fn own_firmware(&self, vm: &Vm, status: &mut VmStatus) {
         if vm.spec.firmware == Firmware::Uefi {
+            if status.firmware_node != Some(self.config.node) {
+                status.firmware_copies.clear();
+            }
             status.firmware_node = Some(self.config.node);
         }
     }

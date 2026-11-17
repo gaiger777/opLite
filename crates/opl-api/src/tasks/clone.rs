@@ -21,6 +21,7 @@ use opl_types::template::{CloneOverrides, apply_overrides, grown_disks};
 use opl_types::vm::{MacAddr, PowerState, Vm, VmSpec};
 use uuid::Uuid;
 
+use super::firmware::new_tpm_warning;
 use super::snapshot::{
     check_local, check_settled, copy_file, fetch_vars, get_snapshot, get_vm, is_down, ready_disks,
     vars_copy,
@@ -40,6 +41,8 @@ const MAX_NAME: usize = 63;
 pub(super) struct Made {
     pub(super) volumes: Vec<Uuid>,
     pub(super) vars: Option<PathBuf>,
+    /// 새 VM의 TPM 상태 디렉터리(복원, 계획 59)
+    pub(super) tpm: Option<PathBuf>,
 }
 
 pub(super) fn made(ctx: &Ctx, task: Uuid, f: impl FnOnce(&mut Made)) {
@@ -93,7 +96,8 @@ fn pool_by_name(ctx: &Ctx, name: &str) -> Result<StoragePool, String> {
 }
 
 /// 원본(스냅샷이나 꺼진 VM의 지금 상태)의 디스크를 이 노드에서 새 볼륨으로 복사하고 UEFI 변수를
-/// 복사한 뒤 새 VM을 만든다. 새 VM은 꺼져 있고 노드·예약·스냅샷이 없으며 MAC은 새로 받는다.
+/// 복사한 뒤 새 VM을 만든다. 새 VM은 꺼져 있고 노드·예약·스냅샷이 없으며 MAC은 새로 받는다. TPM 상태는 복사하지
+/// 않는다: 새 VM은 처음 켤 때 새 TPM을 받고, 원본에 TPM 상태가 있었으면 그 경고를 남긴다(계획 59 §10).
 ///
 /// 템플릿에서 배포하면(계획 58 §6) `linked`에 따라 디스크마다 연결 복제(기반을 함께 쓰는 볼륨, 기록에 `base`)나 전체
 /// 복사를 하고, `overrides`(vCPU·메모리·노드·NIC 네트워크·디스크 크기·cloud-init)를 적용하고, `start`면 놓을 노드를
@@ -115,7 +119,8 @@ pub(super) async fn clone(
     // 연결 복제를 해 볼지: 템플릿의 지금 상태에서, `linked`가 거짓이 아니면
     let link = vm.spec.template && snapshot.is_none() && linked != Some(false);
     let stopped = vm.spec.power == PowerState::Stopped && is_down(&vm);
-    let (spec, tag) = match snapshot {
+    // 원본에 TPM 상태가 있었는지(새 VM은 늘 새 TPM이다, 계획 59 §10)
+    let (spec, tag, had_tpm) = match snapshot {
         Some(id) => {
             let snapshot = get_snapshot(ctx, id)?
                 .filter(|s| s.spec.vm == vm.id)
@@ -124,10 +129,11 @@ pub(super) async fn clone(
                 return Err("snapshot is not ready".into());
             }
             check_settled(&vm)?;
-            (snapshot.spec.vm_spec, Some(id.to_string()))
+            let had_tpm = snapshot.status.tpm_node.is_some();
+            (snapshot.spec.vm_spec, Some(id.to_string()), had_tpm)
         }
         None if !stopped => return Err("VM is running; stop it or clone from a snapshot".into()),
-        None => (vm.spec.clone(), None),
+        None => (vm.spec.clone(), None, vm.status.tpm_sha256.is_some()),
     };
     // 실행 중인 VM의 디스크는 QEMU가 쥐고 있다. 스냅샷 데이터는 바뀌지 않으므로 잠금을 무시하고 읽는다.
     let force_share = tag.is_some() && !stopped;
@@ -321,6 +327,10 @@ pub(super) async fn clone(
         "the clone",
         &kept_identity(&new.spec, overrides),
     ));
+    // 새 VM의 TPM은 켤 때 새로 만든다(`tpm_sha256` 없음). UEFI 변수(Secure Boot 키 포함)는 위에서 복사했다.
+    if new.spec.tpm && had_tpm {
+        warnings.push(new_tpm_warning(name, &vm.name));
+    }
     // 켜라고 했으면 놓을 노드를 고른다(주어진 노드는 그 노드가 켤 수 있는지 본다). 없으면 꺼진 채 만든다.
     // 원본의 노드는 받지 않는다: 배포 때 준 노드만(`spec.node`, 켤 곳).
     new.spec.node = overrides.and_then(|ov| ov.node);
@@ -526,7 +536,7 @@ pub(super) async fn create_vm(
     Ok(())
 }
 
-/// 실패한 복제(와 복원)가 만든 볼륨(파일과 리소스)과 UEFI 변수 사본을 지운다.
+/// 실패한 복제(와 복원)가 만든 볼륨(파일과 리소스)과 UEFI 변수 사본, TPM 상태를 지운다.
 pub(super) async fn discard(ctx: &Ctx, task: Uuid) {
     let Some(made) = ctx.cloned.lock().unwrap().remove(&task) else {
         return;
@@ -536,12 +546,16 @@ pub(super) async fn discard(ctx: &Ctx, task: Uuid) {
             tracing::warn!(volume = %id, error = %e, "cannot clean up volume of failed clone");
         }
     }
-    if let Some(vars) = made.vars {
-        let _ = tokio::fs::remove_file(&vars).await;
-        // 새 VM의 상태 디렉터리. 비어 있을 때만 지워진다.
-        if let Some(dir) = vars.parent() {
-            let _ = tokio::fs::remove_dir(dir).await;
-        }
+    if let Some(tpm) = &made.tpm {
+        let _ = tokio::fs::remove_dir_all(tpm).await;
+    }
+    if let Some(vars) = &made.vars {
+        let _ = tokio::fs::remove_file(vars).await;
+    }
+    // 새 VM의 상태 디렉터리. 비어 있을 때만 지워진다.
+    let file = made.vars.as_deref().or(made.tpm.as_deref());
+    if let Some(dir) = file.and_then(std::path::Path::parent) {
+        let _ = tokio::fs::remove_dir(dir).await;
     }
 }
 

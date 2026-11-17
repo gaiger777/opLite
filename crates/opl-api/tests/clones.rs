@@ -141,6 +141,7 @@ async fn ready_snapshot(env: &Env, admin: &Client, vm: &str, name: &str) -> Uuid
         phase: SnapshotPhase::Ready,
         created_at: Some(1),
         vmstate_bytes: None,
+        tpm_node: None,
     };
     env.cluster
         .update_status::<SnapshotSpec>(id, &status)

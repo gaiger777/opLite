@@ -995,8 +995,12 @@ async fn finish(
             status.node = Some(migration.node);
             status.pid = None;
         }
-        // QEMU가 UEFI 변수(pflash)를 대상 노드의 변수 파일로 옮겼다(설계 §5).
+        // QEMU가 UEFI 변수(pflash)를 대상 노드의 변수 파일로 옮겼다(설계 §5). TPM 상태도 swtpm이 대상 노드에 썼다
+        // (계획 59 §10): 사본은 비우고 대상의 작업자가 곧 해시를 다시 적고 밀어 둔다.
         if vm.spec.firmware == Firmware::Uefi {
+            if status.firmware_node != Some(migration.node) {
+                status.firmware_copies.clear();
+            }
             status.firmware_node = Some(migration.node);
         }
         match ctx

@@ -459,6 +459,7 @@ mod tests {
             },
             created_at,
             vmstate_bytes: None,
+            tpm_node: None,
         };
         s
     }

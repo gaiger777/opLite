@@ -8,10 +8,11 @@ use std::path::{Path, PathBuf};
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_driver::{BackupTarget, check_pool_root, uefi_vars_path};
+use opl_driver::{BackupTarget, Quiesced, check_pool_root, tpm_state_path, uefi_vars_path};
 use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupPhase, BackupSpec, BackupStatus, MANIFEST_FILE,
-    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, bitmap_name, is_backup_bitmap,
+    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, TPM_STATE_FILE, backup_dir, bitmap_name,
+    is_backup_bitmap,
 };
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
@@ -25,6 +26,7 @@ use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 use super::clone::{copy_format, create_vm, made, volume_name};
+use super::firmware::{current_tpm, place_private};
 use super::snapshot::{
     check_local, check_settled, copy_file, fetch_vars, get_vm, is_down, now_secs, ready_disks,
     remove_tags, take_tags,
@@ -80,18 +82,31 @@ pub(super) fn backup_root(ctx: &Ctx, name: &str) -> Result<(StoragePool, PathBuf
     Ok((pool, root))
 }
 
-/// VM의 UEFI 변수 파일(있으면)을 `to`로 복사한다. 변수 파일이 다른 노드에 있으면 받아 온다.
-/// BIOS VM이거나 한 번도 켠 적 없는 UEFI VM이면 복사할 것이 없다.
-async fn copy_vars(ctx: &Ctx, vm: &Vm, to: &Path) -> std::io::Result<()> {
-    let Some(dir) = &ctx.config.state_dir else {
+/// VM의 UEFI 변수 파일(있으면)을 백업 디렉터리 `dir`의 [`VARS_FILE`]로, TPM 상태(있으면, 계획 59)를
+/// [`TPM_STATE_FILE`](0600)로 복사한다. 파일이 다른 노드에 있으면 받아 온다. BIOS VM이거나 한 번도 켠 적 없는 UEFI
+/// VM이면 복사할 변수가 없다. TPM 상태를 얻지 못하면(기록된 상태를 가진 노드가 모두 오프라인) 실패한다 — TPM 없이
+/// 담은 백업을 복원하면 BitLocker 같은 게스트가 복구 키를 묻는다.
+async fn copy_firmware(ctx: &Ctx, vm: &Vm, dir: &Path) -> Result<(), String> {
+    let Some(state) = &ctx.config.state_dir else {
         return Ok(());
     };
     fetch_vars(ctx, vm).await;
-    let from = uefi_vars_path(dir, vm.id);
-    if !tokio::fs::try_exists(&from).await? {
-        return Ok(());
+    let from = uefi_vars_path(state, vm.id);
+    let copied = async {
+        if tokio::fs::try_exists(&from).await? {
+            copy_file(&from, &dir.join(VARS_FILE)).await?;
+        }
+        Ok::<_, std::io::Error>(())
+    };
+    copied
+        .await
+        .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
+    if let Some(tpm) = current_tpm(ctx, vm).await? {
+        place_private(&tpm, &dir.join(TPM_STATE_FILE))
+            .await
+            .map_err(|e| format!("cannot copy the TPM state: {e}"))?;
     }
-    copy_file(&from, to).await
+    Ok(())
 }
 
 /// 디스크마다 `tag`(없으면 지금) 때의 내용을 `{dir}/disk{i}.qcow2`로 내보낸다. `force_share`는 실행
@@ -375,8 +390,9 @@ fn is_base(ctx: &Ctx, vm: &Vm, disks: &[(Volume, StoragePool)]) -> Result<bool, 
 }
 
 /// 전체 백업: 디스크마다 지금(실행 중이면 임시 스냅샷) 내용을 `{dir}/disk{i}.qcow2`로 내보내고 UEFI
-/// 변수를 `vars`로 복사한다. `bitmap`을 주면 실행 중일 때 임시 스냅샷과 같은 시점에 그 비트맵을 만들고,
-/// 꺼진 VM은 내보낸 뒤 qcow2 디스크에 비트맵을 둔다(설계 §3.1). 담은 디스크와 그 시각을 돌려준다.
+/// 변수·TPM 상태를 `dir`에 복사한다([`copy_firmware`]). `bitmap`을 주면 실행 중일 때 임시 스냅샷과 같은 시점에 그
+/// 비트맵을 만들고, 꺼진 VM은 내보낸 뒤 qcow2 디스크에 비트맵을 둔다(설계 §3.1). 담은 디스크와 그 시각, 임시
+/// 스냅샷의 얼리기 결과를 돌려준다.
 async fn full_disks(
     ctx: &Ctx,
     vm: &Vm,
@@ -384,23 +400,20 @@ async fn full_disks(
     id: Uuid,
     bitmap: Option<&str>,
     dir: &Path,
-    vars: &Path,
-) -> Result<(Vec<BackupDisk>, u64), String> {
+) -> Result<(Vec<BackupDisk>, u64, Quiesced), String> {
     use super::snapshot::resume_vm;
     let running = vm.status.phase == VmPhase::Running;
     let tag = temp_tag(id);
     // 실행 중이면 디스크를 임시 스냅샷으로 얼리고 그때의 UEFI 변수를 복사한다.
     let tagged = running && !disks.is_empty();
-    let resumed = if tagged {
+    let (resumed, quiesced) = if tagged {
         take_tags(ctx, vm, disks, id, &tag, false, bitmap, || {
-            copy_vars(ctx, vm, vars)
+            copy_firmware(ctx, vm, dir)
         })
         .await?
     } else {
-        copy_vars(ctx, vm, vars)
-            .await
-            .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
-        Ok(())
+        copy_firmware(ctx, vm, dir).await?;
+        (Ok(()), Quiesced::No)
     };
     // 블록 스냅샷을 위해 멈춘 VM을 이어서 실행하지 못했으면 한 번 더 해 본다. 그래도 멈춰 있으면 디스크를
     // 읽지 않고 실패한다(임시 스냅샷은 아래에서 지운다). 오래 걸리는 내보내기 동안 VM을 멈춰 두지 않는다.
@@ -441,24 +454,21 @@ async fn full_disks(
             }
         }
     }
-    Ok((exported, created_at))
+    Ok((exported, created_at, quiesced))
 }
 
 /// 증분 백업(설계 §3.5): 디스크마다 backing 없는 빈 qcow2를 만들고 하이퍼바이저가 부모 비트맵 뒤에
 /// 바뀐 블록만 쓰게 한 뒤 `{dir}/disk{i}.qcow2`로 이름을 바꾼다. 쓰기 시작하는 시점에 새 비트맵
-/// `bitmap`이 생기고, 성공하면 부모 비트맵은 지워진다(실패하면 새 비트맵이 지워진다). 담은 디스크와
-/// 그 시각을 돌려준다.
+/// `bitmap`이 생기고, 성공하면 부모 비트맵은 지워진다(실패하면 새 비트맵이 지워진다). UEFI 변수와 TPM 상태는
+/// 작으므로 증분에도 늘 통째로 담는다(계획 59 §10). 담은 디스크와 그 시각, 얼리기 결과를 돌려준다.
 async fn incremental_disks(
     ctx: &Ctx,
     vm: &Vm,
     parent: &Parent,
     bitmap: &str,
     dir: &Path,
-    vars: &Path,
-) -> Result<(Vec<BackupDisk>, u64), String> {
-    copy_vars(ctx, vm, vars)
-        .await
-        .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
+) -> Result<(Vec<BackupDisk>, u64, Quiesced), String> {
+    copy_firmware(ctx, vm, dir).await?;
     let mut targets = Vec::with_capacity(parent.sizes.len());
     for (i, size) in parent.sizes.iter().enumerate() {
         let path = dir.join(format!("disk{i}.qcow2.part"));
@@ -473,13 +483,15 @@ async fn incremental_disks(
         });
     }
     let created_at = now_secs();
-    ctx.hv
+    let quiesce = vm.spec.guest_agent.as_ref().is_some_and(|g| g.freeze_fs);
+    let quiesced = ctx
+        .hv
         .incremental_backup(
             vm.id,
             &bitmap_name(parent.backup.id),
             bitmap,
             &targets,
-            false,
+            quiesce,
         )
         .await
         .map_err(|e| format!("incremental backup failed: {e}"))?;
@@ -510,16 +522,17 @@ async fn incremental_disks(
     sync_path(dir)
         .await
         .map_err(|e| format!("cannot write backup directory: {e}"))?;
-    Ok((out, created_at))
+    Ok((out, created_at, quiesced))
 }
 
 /// `pending` 백업 `id`를 채운다(설계 §2.3): 백업 풀의 `{루트}/backups/{id}/`에 디스크마다 압축 qcow2,
 /// UEFI 변수, 매니페스트를 쓰고 `ready`로 바꾼다. 실행 중인 VM은 디스크에 메모리 없는 임시 스냅샷을
 /// 찍어 그것을 읽고 끝나면 지운다(스냅샷 리소스는 만들지 않는다). 꺼진 VM은 지금 디스크를 읽는다.
 /// `incremental`을 요청했고 부모를 고를 수 있으면 바뀐 블록만 담는다(증분 백업 설계 §3.3·§3.5). 성공하면
-/// 디스크의 비트맵은 이 백업의 것(`opl-{id}`) 하나만 남는다(§3.1).
+/// 디스크의 비트맵은 이 백업의 것(`opl-{id}`) 하나만 남는다(§3.1). TPM VM은 TPM 상태도 담는다(계획 59, `tpm_state`).
+/// 게스트 에이전트가 파일 시스템을 얼리지 못했으면 그 경고를 돌려준다.
 /// 실패하면 실행기의 정리([`discard`])가 디렉터리를 지우고 `failed`로 남긴다.
-pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), String> {
+pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<Option<String>, String> {
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
     if backup.status.phase != BackupPhase::Pending {
         return Err("backup is not pending".into());
@@ -640,11 +653,11 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
                 .map_err(|e| format!("cannot create backup directory: {e}"))?;
         }
         let vars = dir.join(VARS_FILE);
-        let (disks, created_at) = match &plan {
-            Plan::Incremental(p) => incremental_disks(ctx, &vm, p, &bitmap, &dir, &vars).await?,
+        let (disks, created_at, quiesced) = match &plan {
+            Plan::Incremental(p) => incremental_disks(ctx, &vm, p, &bitmap, &dir).await?,
             Plan::Full(_) => {
                 let bitmap = bitmaps.then_some(bitmap.as_str());
-                full_disks(ctx, &vm, &disks, id, bitmap, &dir, &vars).await?
+                full_disks(ctx, &vm, &disks, id, bitmap, &dir).await?
             }
         };
         let uefi_vars = tokio::fs::try_exists(&vars).await.unwrap_or(false);
@@ -653,6 +666,9 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
                 .await
                 .map_err(|e| format!("cannot write UEFI variables: {e}"))?;
         }
+        let tpm_state = tokio::fs::try_exists(dir.join(TPM_STATE_FILE))
+            .await
+            .unwrap_or(false);
         let manifest = BackupManifest {
             // 전체 백업은 옛 노드도 읽게 버전 1 그대로다.
             version: if parent.is_some() {
@@ -668,7 +684,7 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             disks: disks.clone(),
             uefi_vars,
             created_at,
-            tpm_state: false,
+            tpm_state,
         };
         write_manifest(&dir, &manifest)
             .await
@@ -697,7 +713,7 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             received_at: None,
             parent,
             full_reason,
-            tpm_state: false,
+            tpm_state,
         };
         // 다 만든 백업이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
         loop {
@@ -710,12 +726,12 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
                 }
             }
         }
-        Ok(())
+        Ok(quiesced.warning())
     }
     .await;
     if live_bitmap && matches!(ctx.hv.inspect(vm.id).await, Ok(Some(_))) {
         match &made {
-            Ok(()) => {
+            Ok(_) => {
                 // 남은 앞 비트맵은 다음 증분을 막을 뿐이다(그 백업은 전체로 하고 다시 지운다).
                 if let Err(e) = ctx.hv.remove_bitmaps(vm.id, Some(&bitmap)).await {
                     tracing::warn!(backup = %id, error = %e, "cannot remove older dirty bitmaps");
@@ -942,7 +958,9 @@ async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
 
 /// `ready` 백업 `id`를 새 VM `name`(id는 Task의 대상)으로 되살린다(설계 §2.4): 매니페스트의 디스크마다
 /// 풀 `pool`에 새 볼륨 `{name}-disk{i}`를 만들어 백업 파일을 쓰고(블록 풀이면 raw, 아니면 qcow2),
-/// UEFI 변수를 복사한 뒤 백업 리소스에 적힌 VM 스펙으로 꺼진 VM을 만든다(새 MAC, 노드·예약·HA 없음).
+/// UEFI 변수·TPM 상태(계획 59, 해시와 `firmware_node`를 함께 적는다)를 복사한 뒤 백업 리소스에 적힌 VM 스펙으로
+/// 꺼진 VM을 만든다(새 MAC, 노드·예약·HA 없음). TPM 상태·Secure Boot가 든 백업은 vTPM을 모르는 노드가 있으면 되살리지
+/// 않는다.
 /// 매니페스트는 그 기록과 같아야 한다. 공유가 아닌 풀의 백업은 파일을 쓴 노드에서만 되살린다. CD-ROM의 ISO가
 /// 이 클러스터에 없거나 이 노드에서 쓸 수 없으면 그 드라이브를 비우고 경고로 돌려준다([`available_media`]).
 /// 증분 백업은 부모를 거슬러 전체 백업까지의 체인([`read_chain`])을 디스크마다 한 이미지로 연다(증분
@@ -981,6 +999,18 @@ pub(super) async fn restore(
         || manifest.disks.len() != spec.disks.len()
     {
         return Err("backup manifest does not match the backup record".into());
+    }
+    // TPM 상태나 Secure Boot가 든 VM은 모든 노드가 vTPM을 알아야 되살린다(계획 59 §10). 옛 노드는 그 VM 스펙을
+    // 풀지 못하고, TPM 상태를 버리는 것은 데이터를 버리는 일이라 빼고 되살리지 않는다.
+    if manifest.tpm_state || spec.tpm || spec.secure_boot {
+        let old = crate::cluster::missing_feature(&ctx.cluster, opl_types::node::VTPM)
+            .map_err(|e| e.to_string())?;
+        if !old.is_empty() {
+            return Err(format!(
+                "some nodes do not support vtpm yet ({}); upgrade them first",
+                old.join(", ")
+            ));
+        }
     }
     // 증분 백업의 조상 디렉터리(부모부터)
     let ancestors = read_chain(ctx, &backup, &root, &manifest).await?;
@@ -1059,6 +1089,22 @@ pub(super) async fn restore(
             .await
             .map_err(|e| format!("cannot copy UEFI variables: {e}"))?;
         // 새 VM의 변수는 이 노드에 있다. 다른 노드에서 켜면 여기서 받아 간다.
+        new.status.firmware_node = Some(ctx.config.node);
+    }
+    // TPM 상태(계획 59)는 새 VM의 TPM 디렉터리에 0600으로 두고 그 해시를 적는다. 이 노드가 그 상태를 가진 노드다.
+    if manifest.tpm_state {
+        let state = ctx
+            .config
+            .state_dir
+            .as_ref()
+            .ok_or("this node cannot keep the TPM state of the backup")?;
+        let tpm = regular_file(&dir, TPM_STATE_FILE).await?;
+        let to = tpm_state_path(state, new.id);
+        made(ctx, task.id, |m| m.tpm = to.parent().map(Path::to_path_buf));
+        let sha256 = place_private(&tpm, &to)
+            .await
+            .map_err(|e| format!("cannot restore the TPM state: {e}"))?;
+        new.status.tpm_sha256 = Some(sha256);
         new.status.firmware_node = Some(ctx.config.node);
     }
     for copy in &copies {

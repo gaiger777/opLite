@@ -12,7 +12,7 @@ use std::path::Path;
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::NodeId;
-use opl_driver::{MirrorProgress, ReplicaDiskTarget, ReplicateRequest};
+use opl_driver::{MirrorProgress, Quiesced, ReplicaDiskTarget, ReplicateRequest};
 use opl_peer::{
     PrepareMode, PrepareVolume, ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest,
     ReplicaPrepareRequest, ReplicaPrepareResponse,
@@ -59,7 +59,8 @@ struct Disk {
     base: Option<(String, u64)>,
 }
 
-/// VM을 Task의 대상 노드로 복제한다(회차 id = Task id). 회차를 건너뛰었으면 그 경고다.
+/// VM을 Task의 대상 노드로 복제한다(회차 id = Task id). 회차를 건너뛰었거나 게스트 에이전트가 파일 시스템을 얼리지
+/// 못했으면 그 경고다. 회차가 끝나면 대상 노드에 펌웨어 사본(UEFI 변수·TPM 상태)이 없을 때 밀어 둔다(계획 59 §10).
 pub(super) async fn replicate(ctx: &Ctx, task: &Task) -> Result<Option<String>, String> {
     let TaskOp::VmReplicate { node: target } = task.spec.op else {
         return Err("not a replication task".into());
@@ -148,7 +149,8 @@ pub(super) async fn replicate(ctx: &Ctx, task: &Task) -> Result<Option<String>, 
     let bitmap = replica_bitmap(target, task.id);
     let started = Instant::now();
     let at = now();
-    let sent = send(ctx, id, task.id, &disks, &reply, host, &bitmap).await;
+    let quiesce = vm.spec.guest_agent.as_ref().is_some_and(|g| g.freeze_fs);
+    let sent = send(ctx, id, task.id, &disks, &reply, host, &bitmap, quiesce).await;
     let finish = |ok| ReplicaFinishRequest {
         vm: id,
         task: task.id,
@@ -157,8 +159,8 @@ pub(super) async fn replicate(ctx: &Ctx, task: &Task) -> Result<Option<String>, 
         synced_at: at,
         volumes: disks.iter().map(|d| d.volume.id).collect(),
     };
-    let bytes = match sent {
-        Ok(bytes) => bytes,
+    let (bytes, quiesced) = match sent {
+        Ok(sent) => sent,
         Err(e) => {
             // 드라이버가 새 비트맵을 지웠다. 받는 쪽에 회차를 버리게 한다(못 하면 정리·청소가 한다).
             if let Err(w) = peers.replica_finish(&addr, finish(false)).await {
@@ -227,7 +229,8 @@ pub(super) async fn replicate(ctx: &Ctx, task: &Task) -> Result<Option<String>, 
             tracing::warn!(vm = %vm.name, error = %e, "cannot read the dirty bitmaps to remove old ones")
         }
     }
-    Ok(None)
+    super::firmware::push_replica_copy(ctx, id, target).await;
+    Ok(quiesced.warning())
 }
 
 /// VM이 이 노드에서 실행 중이고(옮기는 중이 아님) 대상이 아직 복제 대상이며 온라인인지 본다. VM, 그 대상의 설정,
@@ -430,7 +433,9 @@ async fn prepare(
 }
 
 /// 디스크마다 받는 QEMU의 내보내기로 보내고 그동안 진행률을 Task에 쓴다. 대역폭 상한은 디스크 수로 나눈다. 보낸
-/// 바이트를 돌려준다. 실패하면 드라이버가 작업을 치우고 새 비트맵을 지운다.
+/// 바이트와 얼리기 결과를 돌려준다(`quiesce`면 회차 시점 앞뒤로 게스트 파일 시스템을 얼린다). 실패하면 드라이버가
+/// 작업을 치우고 새 비트맵을 지운다.
+#[allow(clippy::too_many_arguments)]
 async fn send(
     ctx: &Ctx,
     vm: Uuid,
@@ -439,7 +444,8 @@ async fn send(
     reply: &ReplicaPrepareResponse,
     host: &str,
     bitmap: &str,
-) -> Result<u64, String> {
+    quiesce: bool,
+) -> Result<(u64, Quiesced), String> {
     let targets = disks
         .iter()
         .zip(&reply.exports)
@@ -462,12 +468,12 @@ async fn send(
         bitmap: bitmap.to_string(),
         stall: ctx.config.replication_stall,
         progress: Some(tx),
-        quiesce: false,
+        quiesce,
     };
     // 복제가 끝나면 req(보내는 쪽)가 버려져 진행률 쓰기도 끝난다.
     let replicate = async move { ctx.hv.replicate_disks(vm, &req).await };
     let (sent, _) = tokio::join!(replicate, report_copy(ctx, task, "replicating", rx));
-    sent.map(|(bytes, _)| bytes).map_err(|e| e.to_string())
+    sent.map_err(|e| e.to_string())
 }
 
 /// 도는 VM에서 비트맵들을 지운다. 실패는 경고만 남긴다(다음 성공한 회차가 다시 지운다).

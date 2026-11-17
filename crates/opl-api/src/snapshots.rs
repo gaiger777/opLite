@@ -727,7 +727,7 @@ pub async fn revert_snapshot(
     let snapshot = find_snapshot(&state, &vm, &name)?;
     check_ready(&snapshot)?;
     check_zfs_latest(&state, &vm, &snapshot)?;
-    check_guest_watch(&vm, &snapshot)?;
+    check_memory_devices(&vm, &snapshot)?;
     // 되돌린 스펙을 VM 수정처럼 검증한다. 노드는 지금 것을 유지하고, 시작은 Task가 한다. HA와 고정은 Task가
     // 지금 것을 지키므로(스냅샷의 것은 쓰지 않는다) 지금 것으로 검증한다.
     let mut reverted = vm.clone();
@@ -745,23 +745,50 @@ pub async fn revert_snapshot(
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
-/// 메모리 스냅샷은 찍을 때의 장치로만 이어 켤 수 있다. 되돌리기는 지금 HA 정책을 지키므로 게스트 감시
-/// (`ha.guest_watch`, QGA 채널 장치)의 있음/없음이 스냅샷 때와 다르면 `snapshot-load`가 실패한다(409
+/// 메모리 스냅샷은 찍을 때의 장치로만 이어 켤 수 있다(`snapshot-load`가 vmstate의 장치를 찾는다, 409
 /// `snapshot_mismatch`).
-fn check_guest_watch(vm: &Vm, snapshot: &Snapshot) -> Result<(), ApiError> {
-    let watched = |s: &VmSpec| s.ha.as_ref().is_some_and(|ha| ha.guest_watch.is_some());
-    let then = watched(&snapshot.spec.vm_spec);
-    if !snapshot.spec.memory || then == watched(&vm.spec) {
+/// - QGA 채널: 되돌리기는 지금 HA 정책을 지키므로 게스트 감시(`ha.guest_watch`)가 정하는 채널(`agent_channel`, 계획 59)이
+///   스냅샷 때와 다를 수 있다. 스냅샷에 `guest_agent`가 있으면 채널은 늘 있다.
+/// - TPM·Secure Boot(계획 59 §7): 되돌린 스펙은 스냅샷의 것이지만, 스냅샷이 기록한 하드웨어(`hardware`)와 다르면 그
+///   장치로 켤 수 없다.
+fn check_memory_devices(vm: &Vm, snapshot: &Snapshot) -> Result<(), ApiError> {
+    if !snapshot.spec.memory {
+        return Ok(());
+    }
+    let then = &snapshot.spec.vm_spec;
+    let mut reverted = then.clone();
+    reverted.ha = vm.spec.ha.clone();
+    if then.agent_channel() != reverted.agent_channel() {
+        let watched = |s: &VmSpec| s.ha.as_ref().is_some_and(|ha| ha.guest_watch.is_some());
+        let then = if watched(then) { "on" } else { "off" };
+        return Err(ApiError::conflict(
+            "snapshot_mismatch",
+            format!(
+                "snapshot {:?} of VM {:?} holds the memory state with guest_watch {then}; set guest_watch to match the snapshot ({then}) before reverting",
+                snapshot.spec.name, vm.name,
+            ),
+        ));
+    }
+    let Some(hw) = &snapshot.spec.hardware else {
+        return Ok(());
+    };
+    let mut differ = Vec::new();
+    if hw.tpm != reverted.tpm {
+        differ.push("tpm");
+    }
+    if hw.secure_boot != reverted.secure_boot {
+        differ.push("secure_boot");
+    }
+    if differ.is_empty() {
         return Ok(());
     }
     Err(ApiError::conflict(
         "snapshot_mismatch",
         format!(
-            "snapshot {:?} of VM {:?} holds the memory state with guest_watch {}; set guest_watch to match the snapshot ({}) before reverting",
+            "snapshot {:?} of VM {:?} holds the memory state of a VM whose {} differs from the snapshot's VM spec; it cannot be reverted",
             snapshot.spec.name,
             vm.name,
-            if then { "on" } else { "off" },
-            if then { "on" } else { "off" },
+            differ.join(" and "),
         ),
     ))
 }

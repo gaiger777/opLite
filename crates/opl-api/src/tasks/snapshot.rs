@@ -7,7 +7,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_driver::{DriverError, Hypervisor, RuntimeStatus, uefi_vars_path, vm_state_dir};
+use opl_driver::{
+    DriverError, Hypervisor, Quiesced, RuntimeStatus, tpm_state_path, uefi_vars_path, vm_state_dir,
+    write_firmware_epoch,
+};
 use opl_types::node::NodeSpec;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{
@@ -21,6 +24,7 @@ use crate::schedule::{recorded_vm, set_schedule_error};
 use crate::snapshots::{block_snapshot_kind, uses_block_snapshots};
 use crate::vms::check_node_arch;
 
+use super::firmware::{current_tpm, place_private, tpm_copy, update_vm_status};
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
 /// 실행 중인 VM을 블록 스냅샷을 위해 멈춰 두는 한도. Task 한도(600초)보다 충분히 짧다.
@@ -249,28 +253,59 @@ pub(super) async fn fetch_vars(ctx: &Ctx, vm: &Vm) {
     }
 }
 
-/// UEFI 변수 파일을 이 노드에 썼다: 이 노드를 `firmware_node`로 삼는다. reconciler도 status를
-/// 쓰므로 revision을 확인하며 쓰고, 그 사이 누가 썼으면 다시 읽어 쓴다.
-async fn set_firmware_node(ctx: &Ctx, vm: Uuid) -> Result<(), String> {
-    loop {
-        let current = get_vm(ctx, vm)?;
-        if current.status.firmware_node == Some(ctx.config.node) {
-            return Ok(());
-        }
-        let status = VmStatus {
-            firmware_node: Some(ctx.config.node),
-            ..current.status.clone()
-        };
-        match ctx
-            .cluster
-            .update_status_checked::<VmSpec>(vm, current.revision, &status)
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
-            Err(e) => return Err(e.to_string()),
-        }
+/// 되돌린 펌웨어 파일(UEFI 변수, TPM 상태면 그 해시 `tpm`)을 이 노드에 썼다: 이 노드의 회차 파일을 VM의 회차로 적어
+/// 켤 때 지워지지 않게 하고, 이 노드를 `firmware_node`로 삼는다. TPM 상태를 되돌렸으면 `tpm_sha256`을 그 해시로 쓰고
+/// 사본(이제 다른 상태)을 비운다.
+async fn set_firmware_node(ctx: &Ctx, vm: Uuid, tpm: Option<String>) -> Result<(), String> {
+    if let Some(dir) = &ctx.config.state_dir {
+        let epoch = get_vm(ctx, vm)?.status.firmware_epoch;
+        write_firmware_epoch(dir, vm, epoch)
+            .map_err(|e| format!("cannot record the firmware epoch: {e}"))?;
     }
+    let me = ctx.config.node;
+    update_vm_status(ctx, vm, |status| {
+        let mut changed = status.firmware_node != Some(me);
+        status.firmware_node = Some(me);
+        if let Some(hash) = &tpm
+            && (status.tpm_sha256.as_ref() != Some(hash) || !status.firmware_copies.is_empty())
+        {
+            status.tpm_sha256 = Some(hash.clone());
+            status.firmware_copies.clear();
+            changed = true;
+        }
+        changed
+    })
+    .await
+}
+
+/// 스냅샷의 TPM 상태 사본이 이 노드에 있는지 본다(설계 §10). 다른 노드에서 찍었으면 그 노드 이름과 함께 오류다
+/// (지금 TPM 상태를 그대로 두고 되돌리면 디스크와 TPM이 어긋난다). 사본이 있으면 그 파일이다. 찍을 때 TPM 상태가
+/// 없었으면 None이다.
+async fn snapshot_tpm(ctx: &Ctx, snapshot: &Snapshot) -> Result<Option<PathBuf>, String> {
+    let Some(node) = snapshot.status.tpm_node else {
+        return Ok(None);
+    };
+    if node != ctx.config.node {
+        let name = ctx
+            .cluster
+            .get::<NodeSpec>(node)
+            .ok()
+            .flatten()
+            .map_or_else(|| node.to_string(), |n| n.name);
+        return Err(format!(
+            "the TPM copy of snapshot {:?} is on node {name:?}; revert it while the VM is on that node",
+            snapshot.spec.name
+        ));
+    }
+    let copy =
+        tpm_copy(ctx, snapshot.spec.vm, snapshot.id).ok_or("this node keeps no TPM state")?;
+    if !tokio::fs::try_exists(&copy).await.unwrap_or(false) {
+        return Err(format!(
+            "the TPM copy of snapshot {:?} is missing on this node",
+            snapshot.spec.name
+        ));
+    }
+    Ok(Some(copy))
 }
 
 /// 이 노드에서 파일이 보이는 볼륨인지. 다른 노드에 만든 볼륨은 풀이 공유되지 않으면 오류다.
@@ -425,9 +460,10 @@ pub(super) fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// `pending` 스냅샷을 채운다: 디스크에 태그를 찍고 UEFI 변수를 복사한 뒤([`take_tags`]) `ready`로
-/// 바꾸고 VM의 현재 위치로 삼는다. 실패하면 리소스는 실행기의 정리가 지운다.
-pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), String> {
+/// `pending` 스냅샷을 채운다: 디스크에 태그를 찍고 UEFI 변수와 TPM 상태(계획 59, `{스냅샷}.tpm`)를 복사한 뒤
+/// ([`take_tags`]) `ready`로 바꾸고 VM의 현재 위치로 삼는다. TPM 상태를 복사했으면 이 노드를 `tpm_node`로 적는다.
+/// 게스트 에이전트가 파일 시스템을 얼리지 못했으면 그 경고를 돌려준다. 실패하면 리소스는 실행기의 정리가 지운다.
+pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<Option<String>, String> {
     let snapshot = get_snapshot(ctx, id)?.ok_or("snapshot was deleted")?;
     let vm = get_vm(ctx, vm_id)?;
     check_settled(&vm)?;
@@ -467,7 +503,8 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     }
 
     let tag = id.to_string();
-    let copy_vars = || async {
+    let tpm_copied = std::sync::atomic::AtomicBool::new(false);
+    let copy_firmware = || async {
         let Some(dir) = ctx.config.state_dir.as_ref() else {
             return Ok(());
         };
@@ -475,25 +512,36 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
         let vars = uefi_vars_path(dir, vm_id);
         match tokio::fs::try_exists(&vars).await {
             // BIOS VM이거나 한 번도 켠 적 없는 UEFI VM
-            Ok(false) => Ok(()),
-            Ok(true) => copy_file(&vars, &vars_copy(ctx, vm_id, id).unwrap()).await,
-            Err(e) => Err(e),
+            Ok(false) => {}
+            Ok(true) => copy_file(&vars, &vars_copy(ctx, vm_id, id).unwrap())
+                .await
+                .map_err(|e| format!("cannot copy UEFI variables: {e}"))?,
+            Err(e) => return Err(format!("cannot copy UEFI variables: {e}")),
         }
+        if let Some(state) = current_tpm(ctx, &vm).await? {
+            place_private(&state, &tpm_copy(ctx, vm_id, id).unwrap())
+                .await
+                .map_err(|e| format!("cannot copy the TPM state: {e}"))?;
+            tpm_copied.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     };
-    let resumed = match take_tags(ctx, &vm, &disks, id, &tag, spec.memory, None, copy_vars).await {
-        Ok(resumed) => resumed,
-        Err(e) => {
-            if let Some(copy) = vars_copy(ctx, vm_id, id) {
-                let _ = tokio::fs::remove_file(copy).await;
+    let (resumed, quiesced) =
+        match take_tags(ctx, &vm, &disks, id, &tag, spec.memory, None, copy_firmware).await {
+            Ok(taken) => taken,
+            Err(e) => {
+                remove_firmware_copies(ctx, vm_id, id).await;
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
 
     let status = SnapshotStatus {
         phase: SnapshotPhase::Ready,
         created_at: Some(now_secs()),
         vmstate_bytes: None,
+        tpm_node: tpm_copied
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then_some(ctx.config.node),
     };
     // 다 만든 스냅샷이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
     loop {
@@ -508,13 +556,24 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
     }
     set_position(ctx, vm_id, |_| Some(id)).await?;
     // 스냅샷은 다 만들었으므로 그대로 두고 Task만 실패로 끝낸다. VM은 다시 붙을 때 이어서 실행한다.
-    resumed.map_err(|e| format!("snapshot taken; resuming the VM failed: {e}"))
+    resumed.map_err(|e| format!("snapshot taken; resuming the VM failed: {e}"))?;
+    Ok(quiesced.warning())
+}
+
+/// 스냅샷 `snapshot`의 UEFI 변수·TPM 상태 사본을 지운다. 없으면 넘어간다.
+async fn remove_firmware_copies(ctx: &Ctx, vm: Uuid, snapshot: Uuid) {
+    for copy in [vars_copy(ctx, vm, snapshot), tpm_copy(ctx, vm, snapshot)]
+        .into_iter()
+        .flatten()
+    {
+        let _ = tokio::fs::remove_file(copy).await;
+    }
 }
 
 /// VM `vm`의 디스크 `disks`에 스냅샷 태그 `tag`를 찍는다(스냅샷 만들기, 백업의 임시 스냅샷). 실행
 /// 중이면 하이퍼바이저로(`memory`면 메모리 포함, 아니면 디스크만), 정지했으면 디스크마다 스토리지로
 /// 찍는다(블록 스냅샷은 실행 중이면 VM을 잠시 멈추고 스토리지로). 스토리지로는 같은 풀의 디스크를 한
-/// 번에 찍는다(ZFS는 원자적). 찍은 뒤 `copy_vars`로 UEFI 변수를 복사한다. 실패를 확인했으면 만든 태그를
+/// 번에 찍는다(ZFS는 원자적). 찍은 뒤 `copy_vars`로 펌웨어 파일(UEFI 변수·TPM 상태)을 복사한다. 실패를 확인했으면 만든 태그를
 /// 지운다. 응답을 기다리다 시간이 다 됐으면 작업이 아직 돌 수 있으므로 태그를 두고 실패한다(블록
 /// 스냅샷의 태그는 뒤에서 다시 지운다, [`remove_left_tags`]; `id`는 스냅샷이나 백업의 id). 찍었으면
 /// 블록 스냅샷을 위해 멈춘 VM을 이어서 실행한 결과를 돌려준다. `bitmap`을 주면 실행 중인 VM의 모든
@@ -522,6 +581,10 @@ pub(super) async fn create(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
 /// transaction으로, 블록 스냅샷은 VM을 멈춘 동안 — 이것은 만들지 못해도 찍기는 성공이다; qcow2에서
 /// 실패하면 비트맵 없이 한 번 더 찍는다). 실행 중인 VM은 먼저 남은 증분 백업 작업을 치운다(남으면
 /// 내부 스냅샷이 실패한다).
+///
+/// 실행 중이고 VM의 `guest_agent.freeze_fs`가 켜져 있으면 하이퍼바이저로 찍는 시점 앞뒤에 게스트 에이전트로 파일 시스템을
+/// 얼리고 녹인다(계획 59 §9). 그 결과([`Quiesced`])도 돌려준다. 메모리 스냅샷은 얼리지 않는다. 블록 스냅샷은 VM을 멈추고
+/// 저장소로 찍으므로 얼리지 않고 그 이유를 결과로 남긴다.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn take_tags<F, Fut>(
     ctx: &Ctx,
@@ -532,14 +595,19 @@ pub(super) async fn take_tags<F, Fut>(
     memory: bool,
     bitmap: Option<&str>,
     copy_vars: F,
-) -> Result<Result<(), DriverError>, String>
+) -> Result<(Result<(), DriverError>, Quiesced), String>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = std::io::Result<()>>,
+    Fut: Future<Output = Result<(), String>>,
 {
     let vm_id = vm.id;
     let running = vm.status.phase == VmPhase::Running;
     let block = block_snapshots(disks)?;
+    let quiesce = running
+        && !memory
+        && !disks.is_empty()
+        && vm.spec.guest_agent.as_ref().is_some_and(|g| g.freeze_fs);
+    let mut quiesced = Quiesced::No;
     if running
         && !disks.is_empty()
         && let Err(e) = ctx.hv.clear_backup_leftovers(vm_id).await
@@ -575,6 +643,12 @@ where
                     .await?;
                 taken.extend(group.into_iter().map(|(v, p)| (v, p)));
             }
+            if quiesce {
+                quiesced = Quiesced::Skipped(format!(
+                    "{} disks are snapshotted with the VM paused",
+                    block.unwrap_or("block")
+                ));
+            }
             // 비트맵을 만들지 못해도 스냅샷은 쓸 수 있다. 다음 백업이 전체가 될 뿐이다.
             if let Some(bitmap) = bitmap.filter(|_| running)
                 && let Err(e) = ctx.hv.add_bitmaps(vm_id, bitmap).await
@@ -595,20 +669,23 @@ where
     } else if let Some(bitmap) = bitmap {
         // 비트맵 때문에 백업이 실패하지 않게 비트맵 없이 한 번 더 찍는다(transaction이라 아무것도 만들지
         // 않았다). 그 백업은 비트맵을 남기지 않아 다음은 전체다.
-        match ctx.hv.snapshot_save_with_bitmap(vm_id, tag, bitmap, false).await {
+        match ctx
+            .hv
+            .snapshot_save_with_bitmap(vm_id, tag, bitmap, quiesce)
+            .await
+        {
             Err(e) if !e.may_be_in_progress() => {
                 tracing::warn!(vm = %vm_id, snapshot = %id, error = %e, "cannot add dirty bitmap; snapshotting without it");
-                ctx.hv.snapshot_save(vm_id, tag, false, false).await
+                ctx.hv.snapshot_save(vm_id, tag, false, quiesce).await
             }
             r => r,
         }
-        .map(drop)
+        .map(|q| quiesced = q)
     } else {
-        // 얼리기(quiesce)는 스테이지 4가 VM의 `guest_agent.freeze_fs`로 정한다.
         ctx.hv
-            .snapshot_save(vm_id, tag, memory, false)
+            .snapshot_save(vm_id, tag, memory, quiesce)
             .await
-            .map(drop)
+            .map(|q| quiesced = q)
     };
     let resumed = match &mut paused {
         Some(guard) => {
@@ -663,7 +740,7 @@ where
             ));
         }
         (Err(e), _) => Some(e.to_string()),
-        (Ok(()), Err(e)) => Some(format!("cannot copy UEFI variables: {e}")),
+        (Ok(()), Err(e)) => Some(e),
         (Ok(()), Ok(())) => None,
     };
     if let Some(error) = failure {
@@ -679,7 +756,7 @@ where
             Ok(()) => error,
         });
     }
-    Ok(resumed)
+    Ok((resumed, quiesced))
 }
 
 /// 예약 스냅샷의 만들기나 예약 정리의 삭제 Task면 그 VM([`recorded_vm`])
@@ -723,14 +800,13 @@ pub(super) async fn discard(ctx: &Ctx, snapshot: &Snapshot) -> Result<(), String
     if let Err(e) = remove_tags(ctx, vm, running, &snapshot.spec.vm_spec, &tag).await {
         tracing::warn!(snapshot = %snapshot.id, error = %e, "cannot remove tags of unfinished snapshot");
     }
-    if let Some(copy) = vars_copy(ctx, vm, snapshot.id) {
-        let _ = tokio::fs::remove_file(copy).await;
-    }
+    remove_firmware_copies(ctx, vm, snapshot.id).await;
     delete_resource(ctx, snapshot).await
 }
 
 /// VM을 스냅샷 때로 되돌린다(설계 §5): 강제로 끄고, 스펙을 스냅샷의 것으로(노드는 그대로) 바꾸고,
-/// 디스크와 UEFI 변수를 되돌리고, 볼륨의 실제 크기를 다시 읽는다. 현재 위치를 이 스냅샷으로
+/// 디스크와 UEFI 변수·TPM 상태(계획 59)를 되돌리고, 볼륨의 실제 크기를 다시 읽는다. TPM 상태 사본이 다른 노드에
+/// 있으면 끄기 전에 실패한다. 현재 위치를 이 스냅샷으로
 /// 바꾼 뒤, 메모리 스냅샷이면 그 메모리를 불러오며 시작한다.
 pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), String> {
     let vm_id = task.spec.target;
@@ -764,6 +840,8 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             check_latest_tag(ctx, volume, pool, &tag, &snapshot.spec.name).await?;
         }
     }
+    // TPM 상태 사본이 다른 노드에 있으면 끄기 전에 그만둔다.
+    let tpm = snapshot_tpm(ctx, &snapshot).await?;
 
     let vm = get_vm(ctx, vm_id)?;
     if vm.spec.power != PowerState::Stopped || !is_down(&vm) {
@@ -772,6 +850,12 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         wait_vm(ctx, vm_id, stopped).await?;
     }
     write_reverted_spec(ctx, vm_id, &snapshot).await?;
+    let vars = vars_copy(ctx, vm_id, id).filter(|copy| std::fs::exists(copy).unwrap_or(false));
+    // 변수 사본을 되돌리면 이 노드가 `firmware_node`가 된다. 스냅샷에 TPM 상태가 없는 TPM VM은 지금 TPM 상태를 그대로
+    // 쓰므로 디스크를 건드리기 전에 이 노드로 가져온다(못 가져오면 되돌리지 않는다).
+    if tpm.is_none() && vars.is_some() {
+        current_tpm(ctx, &get_vm(ctx, vm_id)?).await?;
+    }
 
     // 여기서 멈추면 VM은 꺼진 채 남는다. 같은 되돌리기를 다시 하면 처음부터 한다(설계 §6).
     for (volume, pool) in &disks {
@@ -796,17 +880,31 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             .await
             .map_err(|e| format!("cannot revert volume {:?}: {e}", volume.name))?;
     }
-    if let (Some(copy), Some(dir)) = (vars_copy(ctx, vm_id, id), &ctx.config.state_dir) {
-        if tokio::fs::try_exists(&copy).await.unwrap_or(false) {
-            copy_file(&copy, &uefi_vars_path(dir, vm_id))
+    if let Some(dir) = &ctx.config.state_dir {
+        if vars.is_none() && tpm.is_some() {
+            // TPM 상태가 이 노드로 오므로 지금 변수도 이 노드에 둔다(다른 노드에 있으면 받아 온다).
+            fetch_vars(ctx, &get_vm(ctx, vm_id)?).await;
+        }
+        if let Some(copy) = &vars {
+            copy_file(copy, &uefi_vars_path(dir, vm_id))
                 .await
                 .map_err(|e| format!("cannot restore UEFI variables: {e}"))?;
-            // 되돌린 변수는 이 노드에 있다. 다음 시작이 다른 노드에서 받아 덮지 않게 한다.
-            set_firmware_node(ctx, vm_id).await?;
         } else if get_vm(ctx, vm_id)?.spec.firmware == Firmware::Uefi {
             // 스냅샷을 다른 노드에서 찍었거나 한 번도 켜지 않은 VM이다. 변수 복사본은 노드 사이에
             // 받아 오지 않으므로 지금 변수를 그대로 둔다.
             tracing::warn!(vm = %vm_id, snapshot = %id, "this node has no UEFI variables copy of the snapshot; keeping the current variables");
+        }
+        let hash = match &tpm {
+            Some(copy) => Some(
+                place_private(copy, &tpm_state_path(dir, vm_id))
+                    .await
+                    .map_err(|e| format!("cannot restore the TPM state: {e}"))?,
+            ),
+            None => None,
+        };
+        // 되돌린 파일은 이 노드에 있다. 다음 시작이 다른 노드에서 받아 덮지 않게 한다.
+        if vars.is_some() || hash.is_some() {
+            set_firmware_node(ctx, vm_id, hash).await?;
         }
     }
     // 스냅샷 뒤에 늘린 크기는 되돌아간다.
@@ -934,7 +1032,7 @@ async fn record_size(ctx: &Ctx, volume: &Volume, pool: &StoragePool) {
 }
 
 /// 스냅샷을 지운다: 디스크의 태그(실행 중이면 하이퍼바이저로, 그 뒤 떼어 낸 디스크는 스토리지로),
-/// UEFI 변수 사본, 리소스. 자식은 지운 스냅샷의 부모로 옮겨 붙고, 현재 위치였으면 부모로 옮긴다.
+/// UEFI 변수·TPM 상태 사본, 리소스. 자식은 지운 스냅샷의 부모로 옮겨 붙고, 현재 위치였으면 부모로 옮긴다.
 /// 태그가 이미 없으면 성공으로 보므로 중간에 멈춰도 다시 하면 된다.
 pub(super) async fn delete(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), String> {
     let Some(snapshot) = get_snapshot(ctx, id)? else {
@@ -958,11 +1056,17 @@ pub(super) async fn delete(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             .retain(|d| !vm.spec.disks.iter().any(|a| a.volume == d.volume));
     }
     remove_tags(ctx, vm_id, false, &detached, &tag).await?;
-    if let Some(copy) = vars_copy(ctx, vm_id, id) {
+    for (copy, what) in [
+        (vars_copy(ctx, vm_id, id), "UEFI variables"),
+        (tpm_copy(ctx, vm_id, id), "TPM state"),
+    ] {
+        let Some(copy) = copy else {
+            continue;
+        };
         match tokio::fs::remove_file(copy).await {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("cannot remove UEFI variables copy: {e}")),
+            Err(e) => return Err(format!("cannot remove {what} copy: {e}")),
         }
     }
 

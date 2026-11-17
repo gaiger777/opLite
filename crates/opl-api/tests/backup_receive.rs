@@ -1239,3 +1239,71 @@ async fn completing_an_incremental_copy_checks_its_parent_copy_again() {
         BackupPhase::Receiving
     );
 }
+
+/// TPM 상태가 든 백업(계획 59)은 모든 노드가 vTPM을 알 때만 받는다(409 `cluster_upgrading`). TPM 상태를 버리고 받지
+/// 않는다. 받으면 `tpm2-00.permall`도 받을 파일이고(4 MiB까지) 끝낸 매니페스트에 `tpm_state`가 남는다.
+#[tokio::test]
+async fn tpm_backups_wait_for_vtpm_and_keep_the_tpm_state() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let mut m = manifest();
+    m["vm_spec"]["firmware"] = json!("uefi");
+    m["vm_spec"]["tpm"] = json!(true);
+    m["tpm_state"] = json!(true);
+    // vTPM을 모르는 노드
+    let old = other_node(&env, "node2").await;
+    let got = admin.post("/backups/receive", receive_body(&m)).await;
+    assert_error(&got, StatusCode::CONFLICT, "cluster_upgrading");
+    assert!(
+        got.1["message"].as_str().unwrap().contains("vtpm"),
+        "{}",
+        got.1
+    );
+    assert!(
+        env.cluster.list::<BackupSpec>().unwrap().1.is_empty(),
+        "nothing was received"
+    );
+
+    let mut node = env.cluster.get::<NodeSpec>(old).unwrap().unwrap();
+    node.status.features = opl_types::node::FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    env.cluster
+        .update_status::<NodeSpec>(old, &node.status)
+        .await
+        .unwrap();
+    let id = receive_ok(&admin, receive_body(&m)).await;
+    let got = get_backup(&env, id).unwrap();
+    assert!(got.status.tpm_state);
+    assert!(got.spec.vm_spec.tpm);
+    let too_big = vec![0u8; (4 << 20) + 1];
+    let (status, _) = put_file(&admin, id, "tpm2-00.permall", &too_big).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for (file, data) in [
+        ("disk0.qcow2", &b"abc"[..]),
+        ("disk1.qcow2", b"abcde"),
+        ("vars.fd", b"uefi"),
+    ] {
+        assert_eq!(put_file(&admin, id, file, data).await.0, StatusCode::OK);
+    }
+    // TPM 상태가 빠졌으면 끝내지 않는다.
+    let (status, body) = complete(&admin, id).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["details"]["files"], json!(["tpm2-00.permall"]));
+    assert_eq!(
+        put_file(&admin, id, "tpm2-00.permall", b"tpm").await.0,
+        StatusCode::OK
+    );
+    let (status, body) = complete(&admin, id).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let written: BackupManifest =
+        serde_json::from_slice(&std::fs::read(dir_of(&env, id).join("manifest.json")).unwrap())
+            .unwrap();
+    assert!(written.tpm_state);
+    assert_eq!(
+        std::fs::read(dir_of(&env, id).join("tpm2-00.permall")).unwrap(),
+        b"tpm"
+    );
+}

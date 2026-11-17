@@ -20,7 +20,7 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupReplica, BackupSpec,
-    ReplicaState, backup_dir,
+    ReplicaState, TPM_STATE_FILE, backup_dir,
 };
 use opl_types::backup_job::BackupJobSpec;
 use opl_types::cluster::ClusterSpec;
@@ -495,6 +495,9 @@ async fn send(
     if manifest.uefi_vars {
         files.push(VARS_FILE);
     }
+    if manifest.tpm_state {
+        files.push(TPM_STATE_FILE);
+    }
     for file in files {
         let sha256 = send_file(&client, remote, copy, &dir.join(file), file).await?;
         record_hash(ctx, id, file, &sha256).await;
@@ -550,6 +553,7 @@ fn check_copy(
         && copied_spec(&got.spec.vm_spec) == expected_spec(&backup.spec.vm_spec, &got.spec.vm_spec)
         && disks(&got.status.disks) == disks(&manifest.disks)
         && got.status.uefi_vars == manifest.uefi_vars
+        && got.status.tpm_state == manifest.tpm_state
         && matches!(
             got.status.phase,
             BackupPhase::Receiving | BackupPhase::Ready

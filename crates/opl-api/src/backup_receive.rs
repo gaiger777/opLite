@@ -16,9 +16,12 @@ use opl_cluster::types::Rejection;
 use opl_driver::check_pool_root;
 use opl_types::backup::{
     Backup, BackupDisk, BackupManifest, BackupOrigin, BackupPhase, BackupSpec, BackupStatus,
-    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, backup_dir, default_backup_name,
+    MANIFEST_VERSION, MANIFEST_VERSION_INCREMENTAL, TPM_STATE_FILE, backup_dir,
+    default_backup_name,
 };
-use opl_types::node::{FAST_HA, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, PLACEMENT, TEMPLATES};
+use opl_types::node::{
+    FAST_HA, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, PLACEMENT, TEMPLATES, VTPM,
+};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
 use opl_types::vm::{VmHa, VmSpec};
@@ -41,6 +44,8 @@ use crate::volumes::{check_pool_on, content_length};
 const SYNC_EVERY: u64 = 128 << 20;
 /// `vars.fd`의 최대 크기. 디스크 파일과 달리 매니페스트에 크기가 없다.
 const MAX_VARS_BYTES: u64 = 64 << 20;
+/// TPM 상태 파일(`tpm2-00.permall`, 계획 59)의 최대 크기. 노드 사이 RPC의 상한과 같다.
+const MAX_TPM_BYTES: u64 = opl_peer::firmware::MAX_TPM_BYTES;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -311,6 +316,14 @@ pub async fn receive_backup(
         );
         drop_templates(&mut manifest.vm_spec);
     }
+    // TPM 상태·Secure Boot·게스트 에이전트(계획 59)는 버리지 않는다: TPM 상태를 버리면 봉인한 비밀을 잃는다. 옛 노드는
+    // 그 VM 스펙을 풀지 못하므로 모든 노드가 그 기능을 알 때만 받는다(409 `cluster_upgrading`).
+    if manifest.tpm_state || manifest.vm_spec.tpm || manifest.vm_spec.secure_boot {
+        require_feature(&state.cluster, VTPM)?;
+    }
+    if manifest.vm_spec.guest_agent.is_some() {
+        require_feature(&state.cluster, GUEST_AGENT)?;
+    }
     // 복제 대상은 원본 클러스터의 노드다: 늘 버린다.
     manifest.vm_spec.replication.clear();
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
@@ -378,7 +391,7 @@ pub async fn receive_backup(
         received_at: None,
         parent: req.parent,
         full_reason: None,
-        tpm_state: false,
+        tpm_state: manifest.tpm_state,
     };
     // 그사이 같은 이름이 생겼으면 저장소가 거부한다(409 name_taken).
     state.cluster.create(&backup).await?;
@@ -432,7 +445,7 @@ fn receiving_dir(state: &AppState, backup: &Backup) -> Result<PathBuf, ApiError>
     Ok(backup_dir(&pool_root(state, &pool)?, backup.id))
 }
 
-/// 백업이 받는 파일 이름과 크기(UEFI 변수는 크기를 모른다)
+/// 백업이 받는 파일 이름과 크기(UEFI 변수·TPM 상태는 크기를 모른다)
 fn expected_files(backup: &Backup) -> Vec<(&str, Option<u64>)> {
     let mut files: Vec<(&str, Option<u64>)> = backup
         .status
@@ -442,6 +455,9 @@ fn expected_files(backup: &Backup) -> Vec<(&str, Option<u64>)> {
         .collect();
     if backup.status.uefi_vars {
         files.push((VARS_FILE, None));
+    }
+    if backup.status.tpm_state {
+        files.push((TPM_STATE_FILE, None));
     }
     files
 }
@@ -502,14 +518,14 @@ pub struct BackupFile(#[allow(dead_code)] Vec<u8>);
 /// 받는 중인 백업의 파일 하나를 받는다(200): `{file}.part`에 쓰고 디스크에 내려 쓴 뒤 이름을 바꾸고,
 /// 받은 내용의 SHA-256과 크기를 돌려주며, 디스크 파일의 해시와 받은 시각(`received_at`)을 백업 상태에
 /// 적는다. 같은 파일을 다시 보내면 덮는다. `file`은 매니페스트의 디스크 파일이나(UEFI 변수가 있으면)
-/// `vars.fd`여야 하고, `Content-Length`는 디스크 파일이면 매니페스트의 크기, `vars.fd`면 64 MiB까지다
-/// (400). 본문 조각이 60초 넘게 오지 않으면 받은 것을 버리고 400(멈춘 업로드). `Content-Length`가 없으면
+/// `vars.fd`, (TPM 상태가 있으면) `tpm2-00.permall`이어야 하고, `Content-Length`는 디스크 파일이면 매니페스트의
+/// 크기, `vars.fd`면 64 MiB, `tpm2-00.permall`이면 4 MiB까지다(400). 본문 조각이 60초 넘게 오지 않으면 받은 것을 버리고 400(멈춘 업로드). `Content-Length`가 없으면
 /// 411, 받는 중이 아니면 409 `backup_not_receiving`, 파일이 다른 노드에 있으면 409 `backup_on_other_node`,
 /// 같은 파일을 받고 있으면 409 `backup_busy`.
 #[utoipa::path(put, path = "/backups/{key}/files/{file}", tag = "backups",
     params(
         ("key" = String, Path, description = "id or name"),
-        ("file" = String, Path, description = "disk file of the manifest or vars.fd"),
+        ("file" = String, Path, description = "disk file of the manifest, vars.fd or tpm2-00.permall"),
     ),
     request_body(content = BackupFile, content_type = "application/octet-stream"),
     responses((status = 200, body = ReceivedFile), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -539,6 +555,11 @@ pub async fn put_backup_file(
             return Err(ApiError::bad_request(format!(
                 "{file} of backup {:?} is {size} bytes, not {length}",
                 backup.name
+            )));
+        }
+        None if file == TPM_STATE_FILE && length > MAX_TPM_BYTES => {
+            return Err(ApiError::bad_request(format!(
+                "{file} must not be larger than {MAX_TPM_BYTES} bytes"
             )));
         }
         None if length > MAX_VARS_BYTES => {

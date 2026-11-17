@@ -51,6 +51,11 @@ pub struct SnapshotStatus {
     pub created_at: Option<u64>,
     /// 메모리 상태 크기. 메모리 스냅샷만 있다.
     pub vmstate_bytes: Option<u64>,
+    /// TPM 상태 사본(`{스냅샷 id}.tpm`)을 둔 노드(계획 59). 되돌리기는 이 노드에서만 TPM 상태를 돌려놓는다. 찍을 때
+    /// TPM 상태가 없었으면(TPM이 없거나 한 번도 켜지 않은 VM) 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub tpm_node: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -149,6 +154,7 @@ mod tests {
             phase: SnapshotPhase::Ready,
             created_at: Some(1_790_000_000),
             vmstate_bytes: Some(1 << 20),
+            tpm_node: None,
         };
         assert_eq!(
             serde_json::to_value(&ready).unwrap(),
@@ -157,6 +163,18 @@ mod tests {
                 "created_at": 1_790_000_000u64,
                 "vmstate_bytes": 1u64 << 20
             })
+        );
+        // TPM 사본 노드는 있을 때만 쓴다(계획 59 전 JSON과 같다).
+        let node = Uuid::now_v7();
+        let with = SnapshotStatus {
+            tpm_node: Some(node),
+            ..ready
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["tpm_node"], node.to_string());
+        assert_eq!(
+            serde_json::from_value::<SnapshotStatus>(json).unwrap(),
+            with
         );
     }
 }

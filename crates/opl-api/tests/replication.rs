@@ -29,7 +29,7 @@ use opl_peer::{
 };
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::replicas::{self, ReplicaState, Role};
-use opl_reconciler::{HaConfig, HaGuard, Reconciler};
+use opl_reconciler::{FirmwareCopy, FirmwareError, FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role as UserRole, UserSpec};
 use opl_types::backup::bitmap_name;
 use opl_types::node::{
@@ -93,6 +93,22 @@ impl ReplicaReceiver for LossyReceiver {
 }
 
 /// 리스 갱신이 늘 성공하는 HA guard 갱신기(리더의 리스 표는 시험이 따로 갱신한다)
+/// 펌웨어 사본 밀어 두기를 기록하기만 하는 가짜(계획 59)
+#[derive(Default)]
+struct RecordedPushes(std::sync::Mutex<Vec<FirmwareCopy>>);
+
+#[async_trait]
+impl FirmwareFetcher for RecordedPushes {
+    async fn fetch(&self, _vm: Uuid, _node: Uuid) -> Result<(), FirmwareError> {
+        Ok(())
+    }
+
+    async fn push(&self, copy: &FirmwareCopy) -> Result<(), FirmwareError> {
+        self.0.lock().unwrap().push(copy.clone());
+        Ok(())
+    }
+}
+
 struct AlwaysRenewed;
 
 #[async_trait]
@@ -121,6 +137,8 @@ struct Node {
     state: Option<Arc<AppState>>,
     reconciler: Option<Reconciler>,
     runner: Option<TaskRunner>,
+    /// Task 실행기가 밀어 둔 펌웨어 사본
+    pushes: Arc<RecordedPushes>,
 }
 
 impl Node {
@@ -166,6 +184,7 @@ impl Node {
             state: None,
             reconciler: None,
             runner: None,
+            pushes: Arc::default(),
         }
     }
 
@@ -233,6 +252,7 @@ impl Node {
         config.peers = Some(self.peers.clone());
         config.api = Some(state.clone());
         config.replica_dir = Some(self.replica_dir.clone());
+        config.firmware = Some(self.pushes.clone());
         self.runner = Some(
             TaskRunner::spawn(
                 self.cluster.clone(),
@@ -326,6 +346,10 @@ async fn setup_full(schedule: &str, a_hotplug: bool, ha: bool) -> Setup {
         r.status.hypervisor = "mock".into();
         r.status.arch = Some(Arch::Aarch64);
         r.status.features = FEATURES.iter().map(|f| f.to_string()).collect();
+        r.status.firmware_caps = Some(opl_types::node::FirmwareCaps {
+            tpm: true,
+            secure_boot: true,
+        });
         if ha {
             r.status.ha = Some(NodeHa {
                 fencing: Fencing::Process,
@@ -1510,4 +1534,43 @@ async fn a_replica_that_cannot_take_the_changes_is_caught_up_in_full() {
     assert_eq!(catch_ups[0].base, [None]);
     s.wait_running_on(&s.b).await;
     assert_eq!(s.vm().status.replication[0].node, s.a.id);
+}
+
+/// TPM VM의 회차가 끝나면 복제 대상(펌웨어 사본의 첫 대상)에 사본이 없을 때 밀어 두고 `firmware_copies`에 더한다(계획 59
+/// §10). 이미 사본이 있으면 다시 보내지 않는다. 게스트 에이전트가 없는 VM의 회차는 얼리지 않는다.
+#[tokio::test]
+async fn a_run_pushes_the_firmware_copy_to_its_target_once() {
+    let s = setup().await;
+    let mut vm = s.vm();
+    vm.spec.firmware = opl_types::vm::Firmware::Uefi;
+    vm.spec.tpm = true;
+    s.a.cluster
+        .update_spec(s.vm, None, vm.labels.clone(), &vm.spec)
+        .await
+        .unwrap();
+    let hash = "ab".repeat(32);
+    let mut status = s.vm().status;
+    status.firmware_node = Some(s.a.id);
+    status.tpm_sha256 = Some(hash.clone());
+    status.firmware_epoch = 2;
+    s.a.cluster
+        .update_status::<VmSpec>(s.vm, &status)
+        .await
+        .unwrap();
+
+    succeeded(&s.replicate().await);
+    assert_eq!(
+        *s.a.pushes.0.lock().unwrap(),
+        [FirmwareCopy {
+            vm: s.vm,
+            to: s.b.id,
+            sha256: hash.clone(),
+            epoch: 2,
+            secure_boot: false,
+        }]
+    );
+    assert_eq!(s.vm().status.firmware_copies, [s.b.id]);
+    succeeded(&s.replicate().await);
+    assert_eq!(s.a.pushes.0.lock().unwrap().len(), 1);
+    assert_eq!(s.a.hv.quiesce_calls(s.vm), [false, false]);
 }

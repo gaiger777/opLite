@@ -370,7 +370,11 @@ async fn two_nodes_with(
             interfaces: vec![],
             checks: vec![],
             hotplug: None,
-            firmware_caps: None,
+            // Mock 하이퍼바이저의 기본 능력(swtpm·Secure Boot 펌웨어 있음)
+            firmware_caps: Some(opl_types::node::FirmwareCaps {
+                tpm: true,
+                secure_boot: true,
+            }),
         };
         // 리더가 뽑힐 때까지 쓰기가 기다린다.
         a.cluster.create(&r).await.unwrap();
@@ -609,6 +613,69 @@ async fn variables_follow_a_stopped_vm_to_another_node() {
     assert_eq!(read_vars(&root, &b, vm.id), b"vars 1");
 }
 
+/// 멈춘 TPM VM을 다른 노드로 옮기면 그 노드의 스냅샷이 TPM 상태를 가진 노드(`firmware_node`)에서 받아(해시 확인) 담는다.
+/// 그 노드가 오프라인이고 사본이 없으면 TPM 없이 담지 않고 실패한다(계획 59 §5).
+#[tokio::test]
+async fn tpm_state_follows_a_stopped_vm_into_snapshots() {
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let mut req = vm_request("win");
+    req["spec"]["firmware"] = serde_json::json!("uefi");
+    req["spec"]["tpm"] = serde_json::json!(true);
+    req["spec"]["node"] = serde_json::json!(b.id);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let vm = a.cluster.get_by_name::<VmSpec>("win").unwrap().unwrap();
+    // A가 TPM 상태를 가진 노드다(A에서 돌다가 멈췄다).
+    write_vars(&root, &a, vm.id, b"vars 1");
+    let tpm = opl_driver::tpm_state_path(&state_dir(&root, &a), vm.id);
+    std::fs::create_dir_all(tpm.parent().unwrap()).unwrap();
+    std::fs::write(&tpm, b"tpm on a").unwrap();
+    let mut status = vm.status.clone();
+    status.firmware_node = Some(a.id);
+    status.tpm_sha256 = Some(opl_peer::sha256_hex(b"tpm on a"));
+    a.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+
+    let (status, task) = admin
+        .post("/vms/win/snapshots", serde_json::json!({ "name": "s1" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(task["spec"]["node"], b.id.to_string());
+    let s1 = b
+        .cluster
+        .list::<opl_types::snapshot::SnapshotSpec>()
+        .unwrap()
+        .1
+        .into_iter()
+        .find(|s| s.spec.vm == vm.id)
+        .unwrap();
+    assert_eq!(s1.status.tpm_node, Some(b.id));
+    let copy = state_dir(&root, &b).join(format!("vm/{}/snapshots/{}.tpm", vm.id, s1.id));
+    assert_eq!(std::fs::read(copy).unwrap(), b"tpm on a");
+
+    // A가 오프라인이면 받을 곳이 없다.
+    let mut node = a.cluster.get::<NodeSpec>(a.id).unwrap().unwrap();
+    node.status.online = false;
+    a.cluster
+        .update_status::<NodeSpec>(a.id, &node.status)
+        .await
+        .unwrap();
+    std::fs::remove_file(opl_driver::tpm_state_path(&state_dir(&root, &b), vm.id)).unwrap();
+    let (status, task) = admin
+        .post("/vms/win/snapshots", serde_json::json!({ "name": "s2" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "failed", "{task}");
+    let error = task["status"]["error"].as_str().unwrap();
+    assert!(error.contains("is on node \"node1\" (offline)"), "{error}");
+}
+
 /// A에서 도는 VM `web`(디스크 없음)을 만든다.
 async fn running_vm(a: &Node, admin: &common::Client) -> opl_types::vm::Vm {
     let mut req = vm_request("web");
@@ -669,6 +736,13 @@ async fn running_vm_migrates_to_the_other_node() {
     // B의 reconciler가 넘겨받으며 `firmware_node`를 쓰기 전에, 확정 뒤 기록이 B를 쓰는지 본다.
     let b_reconciler = b.reconciler.as_ref().unwrap().handle();
     b_reconciler.begin_migration(vm.id).await;
+    // 펌웨어 사본 기록(계획 59)은 확정이 비운다. 대상의 작업자가 해시를 다시 적고 밀어 둔다.
+    let mut current = a.cluster.get::<VmSpec>(vm.id).unwrap().unwrap();
+    current.status.firmware_copies = vec![Uuid::now_v7()];
+    a.cluster
+        .update_status::<VmSpec>(vm.id, &current.status)
+        .await
+        .unwrap();
 
     // B의 API로 요청해도 Task는 원본 노드 A에서 돈다.
     let admin_b = login_at(&b.base, "admin", ADMIN_PASSWORD).await;
@@ -694,6 +768,7 @@ async fn running_vm_migrates_to_the_other_node() {
     assert_eq!(vm_now.status.migration, None);
     // QEMU가 변수를 B로 옮겼다.
     assert_eq!(vm_now.status.firmware_node, Some(b.id));
+    assert!(vm_now.status.firmware_copies.is_empty());
     assert_eq!(runtime_status(&a, vm.id).await, None);
     b_reconciler.end_migration(vm.id);
     // B의 reconciler가 받은 QEMU를 넘겨받아 이어서 실행한다(새로 띄우지 않는다).

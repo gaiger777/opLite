@@ -8,6 +8,7 @@ mod ceph;
 mod clone;
 mod download;
 mod drain;
+mod firmware;
 mod hotplug;
 mod import;
 mod migrate;
@@ -132,6 +133,9 @@ pub struct TaskRunnerConfig {
     /// URL에서 받기(`volume-download`)가 루프백·링크 로컬·사설망 주소에서도 받는지(opld `[download] allow_private`,
     /// 기본 false — 노드 안쪽이나 클라우드 메타데이터에 닿지 않게)
     pub download_allow_private: bool,
+    /// 지운 VM의 상태 디렉터리(`{state_dir}/vm/{id}`)는 마지막으로 바뀐 지 이만큼 지나야 지운다(계획 59 §10, 기본
+    /// 1시간). 정리는 `tag_sweep`마다 돈다.
+    pub state_dir_min_age: Duration,
 }
 
 impl TaskRunnerConfig {
@@ -161,6 +165,7 @@ impl TaskRunnerConfig {
             replica_dir: None,
             ceph: None,
             download_allow_private: false,
+            state_dir_min_age: firmware::STATE_DIR_MIN_AGE,
         }
     }
 }
@@ -232,6 +237,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     let tags = tokio::spawn(sweep_block_tags_every(ctx.clone()));
     let idle = tokio::spawn(deactivate_idle_volumes_every(ctx.clone()));
     let migrations = tokio::spawn(migrate::sweep_every(ctx.clone()));
+    let state_dirs = tokio::spawn(firmware::sweep_state_dirs_every(ctx.clone()));
     // 실행을 시작한 Task. 목록을 다시 읽을 때 같은 Task를 두 번 시작하지 않게 한다.
     let mut started: HashSet<Uuid> = HashSet::new();
     // 실행 중인 Task. 실행기가 멈출 때 함께 멈춘다.
@@ -311,6 +317,7 @@ async fn run(ctx: Arc<Ctx>, mut shutdown: oneshot::Receiver<()>, unmounted: Vec<
     tags.abort();
     idle.abort();
     migrations.abort();
+    state_dirs.abort();
     ctx.stopped.send_replace(true);
 }
 
@@ -588,7 +595,8 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// 핫플러그·마이그레이션과 차례로 돈다(디스크를 읽는 중에 장치가 바뀌거나 VM이 옮겨 가면 안 된다). Ceph Task는
 /// `Ceph` 리소스의 줄에 서서 한 노드 안에서 차례로 돈다(같은 노드의 apt·`/etc/ceph`를 함께 만지지 않게). 평탄화(계획 58)는
 /// 크기 늘리기처럼 그 볼륨을 쓰는 VM의 줄에 서서 스냅샷·복제·백업과 섞이지 않는다. 템플릿 되돌리기는 템플릿 VM의 줄에
-/// 서서 앞서 받은 배포(복제) Task가 끝난 뒤 남은 연결 복제를 본다.
+/// 서서 앞서 받은 배포(복제) Task가 끝난 뒤 남은 연결 복제를 본다. 펌웨어 초기화(계획 59)도 VM의 줄에 서서 스냅샷·백업·복제가
+/// 펌웨어 파일을 담는 중에 지우지 않는다.
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
     match task.spec.op {
@@ -608,6 +616,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
                 | TaskOp::VmHotplug
                 | TaskOp::VmReplicate { .. }
                 | TaskOp::VmUntemplate
+                | TaskOp::VmFirmwareReset { .. }
         );
         let backup_queue = matches!(
             task.spec.op,
@@ -896,7 +905,7 @@ async fn set_status(ctx: &Ctx, id: Uuid, state: TaskState, error: Option<String>
     }
 }
 
-/// 성공한 Task가 남길 경고(`error`)가 있으면 `Ok(Some)`이다(지우지 못한 원격 사본).
+/// 성공한 Task가 남길 경고(`error`)가 있으면 `Ok(Some)`이다(지우지 못한 원격 사본, 얼리지 못한 파일 시스템).
 async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>, String> {
     let id = task.spec.target;
     let done = match &task.spec.op {
@@ -913,7 +922,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             source_format,
         } => import_volume(ctx, id, source, *source_format).await,
         TaskOp::VolumeDelete => delete_volume(ctx, id).await,
-        TaskOp::SnapshotCreate { snapshot } => snapshot::create(ctx, id, *snapshot).await,
+        // 게스트 에이전트가 파일 시스템을 얼리지 못했으면 경고로 남긴다(계획 59 §9).
+        TaskOp::SnapshotCreate { snapshot } => return snapshot::create(ctx, id, *snapshot).await,
         TaskOp::SnapshotRevert { snapshot } => snapshot::revert(ctx, task, *snapshot).await,
         TaskOp::SnapshotDelete { snapshot, .. } => snapshot::delete(ctx, id, *snapshot).await,
         TaskOp::VolumeResize { size_bytes } => resize_volume(ctx, id, *size_bytes).await,
@@ -946,7 +956,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         TaskOp::HaCheck { .. } => Err("an HA check task is a record and is not run".into()),
         TaskOp::BondDegraded { .. } => Err("a bond warning task is a record and is not run".into()),
-        TaskOp::VmBackup { backup } => backup::backup(ctx, task, *backup).await,
+        TaskOp::VmBackup { backup } => return backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => return backup::delete(ctx, id).await,
         // 비운 CD-ROM 드라이브는 경고로 남긴다.
         TaskOp::BackupRestore { backup, name, pool } => {
@@ -1005,9 +1015,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         TaskOp::VolumeFlatten => template::flatten(ctx, id).await,
         TaskOp::VmUntemplate => template::untemplate(ctx, task).await,
-        // 펌웨어 초기화(계획 59)는 뒤 스테이지에서 실행한다.
-        TaskOp::VmFirmwareReset { .. } => {
-            Err("this node cannot reset UEFI variables or the TPM yet".into())
+        TaskOp::VmFirmwareReset { uefi_vars, tpm } => {
+            firmware::reset(ctx, task, *uefi_vars, *tpm).await
         }
     };
     done.map(|()| None)

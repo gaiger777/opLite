@@ -329,8 +329,8 @@ export interface paths {
          * 받는 중인 백업의 파일 하나를 받는다(200): `{file}.part`에 쓰고 디스크에 내려 쓴 뒤 이름을 바꾸고,
          *     받은 내용의 SHA-256과 크기를 돌려주며, 디스크 파일의 해시와 받은 시각(`received_at`)을 백업 상태에
          *     적는다. 같은 파일을 다시 보내면 덮는다. `file`은 매니페스트의 디스크 파일이나(UEFI 변수가 있으면)
-         *     `vars.fd`여야 하고, `Content-Length`는 디스크 파일이면 매니페스트의 크기, `vars.fd`면 64 MiB까지다
-         *     (400). 본문 조각이 60초 넘게 오지 않으면 받은 것을 버리고 400(멈춘 업로드). `Content-Length`가 없으면
+         *     `vars.fd`, (TPM 상태가 있으면) `tpm2-00.permall`이어야 하고, `Content-Length`는 디스크 파일이면 매니페스트의
+         *     크기, `vars.fd`면 64 MiB, `tpm2-00.permall`이면 4 MiB까지다(400). 본문 조각이 60초 넘게 오지 않으면 받은 것을 버리고 400(멈춘 업로드). `Content-Length`가 없으면
          *     411, 받는 중이 아니면 409 `backup_not_receiving`, 파일이 다른 노드에 있으면 409 `backup_on_other_node`,
          *     같은 파일을 받고 있으면 409 `backup_busy`.
          */
@@ -4526,6 +4526,12 @@ export interface components {
                     /** @default pending */
                     phase: components["schemas"]["SnapshotPhase"];
                     /**
+                     * Format: uuid
+                     * @description TPM 상태 사본(`{스냅샷 id}.tpm`)을 둔 노드(계획 59). 되돌리기는 이 노드에서만 TPM 상태를 돌려놓는다. 찍을 때
+                     *     TPM 상태가 없었으면(TPM이 없거나 한 번도 켜지 않은 VM) 없다.
+                     */
+                    tpm_node?: string;
+                    /**
                      * Format: int64
                      * @description 메모리 상태 크기. 메모리 스냅샷만 있다.
                      * @default null
@@ -6574,6 +6580,12 @@ export interface components {
                 /** @default pending */
                 phase: components["schemas"]["SnapshotPhase"];
                 /**
+                 * Format: uuid
+                 * @description TPM 상태 사본(`{스냅샷 id}.tpm`)을 둔 노드(계획 59). 되돌리기는 이 노드에서만 TPM 상태를 돌려놓는다. 찍을 때
+                 *     TPM 상태가 없었으면(TPM이 없거나 한 번도 켜지 않은 VM) 없다.
+                 */
+                tpm_node?: string;
+                /**
                  * Format: int64
                  * @description 메모리 상태 크기. 메모리 스냅샷만 있다.
                  * @default null
@@ -7135,6 +7147,12 @@ export interface components {
             created_at: number | null;
             /** @default pending */
             phase: components["schemas"]["SnapshotPhase"];
+            /**
+             * Format: uuid
+             * @description TPM 상태 사본(`{스냅샷 id}.tpm`)을 둔 노드(계획 59). 되돌리기는 이 노드에서만 TPM 상태를 돌려놓는다. 찍을 때
+             *     TPM 상태가 없었으면(TPM이 없거나 한 번도 켜지 않은 VM) 없다.
+             */
+            tpm_node?: string;
             /**
              * Format: int64
              * @description 메모리 상태 크기. 메모리 스냅샷만 있다.
@@ -8771,7 +8789,7 @@ export interface operations {
             path: {
                 /** @description id or name */
                 key: string;
-                /** @description disk file of the manifest or vars.fd */
+                /** @description disk file of the manifest, vars.fd or tpm2-00.permall */
                 file: string;
             };
             cookie?: never;

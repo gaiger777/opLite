@@ -141,6 +141,7 @@ async fn mark_ready_at(env: &Env, id: Uuid, created_at: u64) {
         phase: SnapshotPhase::Ready,
         created_at: Some(created_at),
         vmstate_bytes: None,
+        tpm_node: None,
     };
     env.cluster
         .update_status::<SnapshotSpec>(id, &status)

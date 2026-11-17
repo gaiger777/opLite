@@ -174,7 +174,11 @@ impl Env {
             interfaces: vec![],
             checks: vec![],
             hotplug: None,
-            firmware_caps: None,
+            // Mock 하이퍼바이저의 기본 능력(swtpm·Secure Boot 펌웨어 있음)
+            firmware_caps: Some(opl_types::node::FirmwareCaps {
+                tpm: true,
+                secure_boot: true,
+            }),
         };
         // 이 노드는 지금 빌드를 돌린다.
         me.status.version = Some(BUILD.into());
