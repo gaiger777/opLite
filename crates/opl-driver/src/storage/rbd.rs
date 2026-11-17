@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use opl_types::runtime::{ImageFormat, RbdTarget};
-use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
+use opl_types::storage::{BASE_TAG, PoolBackend, SourceFormat, StoragePool};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -41,6 +41,8 @@ pub struct RbdSnapshot {
     pub size_bytes: u64,
     /// 만든 시각. 알 수 없으면 `None`.
     pub created: Option<SystemTime>,
+    /// 보호돼 있는지(`rbd snap protect`, clone의 원본)
+    pub protected: bool,
 }
 
 /// Ceph 풀의 `ceph df`: 남은 공간(`max_avail`)과 담긴 데이터(`stored`)
@@ -81,6 +83,21 @@ pub trait RbdOps: Send + Sync {
     fn changing(&self, image: &RbdTarget) -> bool;
     /// 이미지를 연 클라이언트(watcher) 수(`rbd status`)
     async fn watchers(&self, image: &RbdTarget) -> Result<usize, DriverError>;
+    /// 스냅샷을 보호한다(`rbd snap protect`). clone의 원본은 보호돼 있어야 한다(clone v1).
+    async fn protect(&self, image: &RbdTarget, tag: &str) -> Result<(), DriverError>;
+    /// 스냅샷의 보호를 푼다(`rbd snap unprotect`). 그 스냅샷의 clone이 있으면 실패한다.
+    async fn unprotect(&self, image: &RbdTarget, tag: &str) -> Result<(), DriverError>;
+    /// `parent`의 스냅샷 `tag`의 clone 이미지 `child`를 만든다(`rbd clone`).
+    async fn clone_image(
+        &self,
+        parent: &RbdTarget,
+        tag: &str,
+        child: &RbdTarget,
+    ) -> Result<(), DriverError>;
+    /// clone 이미지에 부모의 데이터를 모두 가져와 부모와 끊는다(`rbd flatten`). 크기에 비례해 걸린다.
+    async fn flatten(&self, image: &RbdTarget) -> Result<(), DriverError>;
+    /// clone이면 부모(`{pool}[/{namespace}]/{image}@{snapshot}`, `rbd info`), 아니면 `None`.
+    async fn parent(&self, image: &RbdTarget) -> Result<Option<String>, DriverError>;
 }
 
 /// 실제 RBD 명령(`rbd`, `ceph`). 노드에 ceph.conf와 키링이 있어야 한다.
@@ -244,18 +261,49 @@ fn parse_snapshots(out: &[u8]) -> Result<Vec<RbdSnapshot>, DriverError> {
                 .get("timestamp")
                 .and_then(Value::as_str)
                 .and_then(parse_timestamp);
+            // `"true"`/`"false"` 문자열이다(판에 따라 불리언).
+            let protected = match s.get("protected") {
+                Some(Value::String(v)) => v == "true",
+                Some(Value::Bool(v)) => *v,
+                _ => false,
+            };
             Ok((
                 id,
                 RbdSnapshot {
                     tag: tag.to_string(),
                     size_bytes: size,
                     created,
+                    protected,
                 },
             ))
         })
         .collect::<Result<Vec<_>, DriverError>>()?;
     snapshots.sort_by_key(|(id, _)| *id);
     Ok(snapshots.into_iter().map(|(_, s)| s).collect())
+}
+
+/// `rbd info --format json`의 `parent`(clone이면 `{pool}[/{namespace}]/{image}@{snapshot}`). 휴지통에 든 부모도
+/// 부모다.
+fn parse_parent(out: &[u8]) -> Result<Option<String>, DriverError> {
+    let v = json(out)?;
+    let Some(parent) = v.get("parent").filter(|p| !p.is_null()) else {
+        return Ok(None);
+    };
+    let field = |k: &str| {
+        parent
+            .get(k)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+    };
+    let (Some(pool), Some(image), Some(snapshot)) =
+        (field("pool"), field("image"), field("snapshot"))
+    else {
+        return Err(bad_output(format!("parent {parent}")));
+    };
+    Ok(Some(match field("pool_namespace") {
+        Some(ns) => format!("{pool}/{ns}/{image}@{snapshot}"),
+        None => format!("{pool}/{image}@{snapshot}"),
+    }))
 }
 
 /// `ceph df detail --format json`에서 풀 `pool`의 `max_avail`·`stored`(없는 값은 0). 풀이 없으면 오류.
@@ -395,6 +443,41 @@ impl RbdOps for SystemRbd {
         let spec = image_spec(image);
         let args = rbd_args(image, &["status", "--format", "json", &spec]);
         parse_status(&RBD.run_read("rbd", &args, RBD_TIMEOUT).await?)
+    }
+
+    async fn protect(&self, image: &RbdTarget, tag: &str) -> Result<(), DriverError> {
+        let name = format!("{}@{tag}", image_spec(image));
+        self.change(image, &["snap", "protect", &name], RBD_TIMEOUT)
+            .await
+    }
+
+    async fn unprotect(&self, image: &RbdTarget, tag: &str) -> Result<(), DriverError> {
+        let name = format!("{}@{tag}", image_spec(image));
+        self.change(image, &["snap", "unprotect", &name], RBD_TIMEOUT)
+            .await
+    }
+
+    /// 바꾸는 대상은 새 이미지다.
+    async fn clone_image(
+        &self,
+        parent: &RbdTarget,
+        tag: &str,
+        child: &RbdTarget,
+    ) -> Result<(), DriverError> {
+        let (from, to) = (format!("{}@{tag}", image_spec(parent)), image_spec(child));
+        self.change(child, &["clone", &from, &to], RBD_TIMEOUT)
+            .await
+    }
+
+    async fn flatten(&self, image: &RbdTarget) -> Result<(), DriverError> {
+        let spec = image_spec(image);
+        self.change(image, &["flatten", &spec], Duration::MAX).await
+    }
+
+    async fn parent(&self, image: &RbdTarget) -> Result<Option<String>, DriverError> {
+        let spec = image_spec(image);
+        let args = rbd_args(image, &["info", "--format", "json", &spec]);
+        parse_parent(&RBD.run_read("rbd", &args, RBD_TIMEOUT).await?)
     }
 }
 
@@ -572,6 +655,29 @@ impl RbdStorage {
         Ok(())
     }
 
+    /// 이미지의 기반 스냅샷이 보호돼 있으면 푼다. 기반 스냅샷이 남았는지 돌려준다.
+    async fn unprotect_base(&self, image: &RbdTarget) -> Result<bool, DriverError> {
+        let snapshots = self.ops.snapshots(image).await?;
+        let Some(base) = snapshots.iter().find(|s| s.tag == BASE_TAG) else {
+            return Ok(false);
+        };
+        if base.protected {
+            self.ops
+                .unprotect(image, BASE_TAG)
+                .await
+                .map_err(|e| match e {
+                    // 자식이 있다: 연결 복제, 또는 평탄화한 연결 복제의 평탄화 전 스냅샷(그 스냅샷은 부모를 계속 가리킨다)
+                    DriverError::Rbd(m) if m.contains("(16)") || m.contains("busy") => {
+                        DriverError::Rbd(format!(
+                            "{m}; the base snapshot is still used by a linked clone or by a snapshot that a flattened linked clone took before flattening; delete those first"
+                        ))
+                    }
+                    e => e,
+                })?;
+        }
+        Ok(true)
+    }
+
     /// 새 볼륨 이미지를 만든다. 크기는 1 MiB 배수로 올린다.
     async fn create_image(
         &self,
@@ -677,6 +783,9 @@ impl Storage for RbdStorage {
             return Err(DriverError::VolumeNotFound(id));
         }
         self.unwatched(&image).await?;
+        // 보호된 스냅샷이 있으면 `snap purge`가 실패한다. 기반 스냅샷의 보호를 푼다(clone이 남아 있으면 실패하고
+        // 이미지는 그대로다).
+        self.unprotect_base(&image).await?;
         self.ops.remove(&image).await
     }
 
@@ -909,6 +1018,78 @@ impl Storage for RbdStorage {
         let from = convert_from(&source, force_share, None)?;
         self.fill(&image, dst_id, &from).await
     }
+
+    /// 기반 이미지에 기반 스냅샷 `@opl-base`가 없으면 찍고, 보호돼 있지 않으면 보호한 뒤(clone v1·v2 모두 된다) 그
+    /// clone `opl-{clone}`을 만든다. 기반의 보호는 clone이 있는 동안 풀 수 없으므로 기반 이미지를 지울 수 없다.
+    async fn link_clone(
+        &self,
+        pool: &StoragePool,
+        base_id: Uuid,
+        base_format: ImageFormat,
+        clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        let base = Self::target(pool, base_id, base_format)?;
+        let clone = Self::target(pool, clone_id, ImageFormat::Raw)?;
+        self.existing(&base, base_id).await?;
+        if self.ops.info(&clone).await?.is_some() {
+            return Err(DriverError::VolumeExists(clone_id));
+        }
+        let snapshots = self.ops.snapshots(&base).await?;
+        let protected = match snapshots.iter().find(|s| s.tag == BASE_TAG) {
+            Some(s) => s.protected,
+            None => {
+                self.ops.snapshot(&base, BASE_TAG).await?;
+                false
+            }
+        };
+        if !protected {
+            self.ops.protect(&base, BASE_TAG).await?;
+        }
+        self.ops.clone_image(&base, BASE_TAG, &clone).await?;
+        Ok((PathBuf::new(), ImageFormat::Raw))
+    }
+
+    /// 기반 스냅샷 `@opl-base`의 보호를 풀고 지운다. clone이 남아 있으면 보호를 풀지 못해 실패한다. 이미지나 스냅샷이
+    /// 없으면 지운 것으로 본다. 다만 그 이미지를 바꾸는 명령이 아직 돌고 있으면 일시 오류다.
+    async fn release_base(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let image = Self::target(pool, id, format)?;
+        if self.ops.changing(&image) {
+            return Err(DriverError::Timeout(RBD_BUSY));
+        }
+        if self.ops.info(&image).await?.is_none() {
+            return Ok(());
+        }
+        if self.unprotect_base(&image).await? {
+            self.ops.remove_snapshot(&image, BASE_TAG).await?;
+        }
+        Ok(())
+    }
+
+    /// `rbd flatten`으로 부모의 데이터를 가져와 끊는다. clone이 아니면 할 일이 없다. 이미지를 연 클라이언트가 없어야
+    /// 한다(있으면 일시 오류). clone의 스냅샷은 flatten 뒤에도 부모를 가리키므로 그 스냅샷이 남은 동안 기반 스냅샷의
+    /// 보호를 풀 수 없다.
+    async fn flatten_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let image = Self::target(pool, id, format)?;
+        if self.ops.changing(&image) {
+            return Err(DriverError::Timeout(RBD_BUSY));
+        }
+        self.existing(&image, id).await?;
+        if self.ops.parent(&image).await?.is_none() {
+            return Ok(());
+        }
+        self.unwatched(&image).await?;
+        self.ops.flatten(&image).await
+    }
 }
 
 #[cfg(test)]
@@ -926,6 +1107,10 @@ mod tests {
         size: u64,
         /// 만든 순서의 스냅샷(태그, 크기, 만든 시각)
         snapshots: Vec<(String, u64, Option<SystemTime>)>,
+        /// 보호된 스냅샷 태그
+        protected: Vec<String>,
+        /// clone이면 부모 스냅샷(`{사양}@{tag}`)
+        parent: Option<String>,
     }
 
     /// Ceph 풀 `rbd`, `other`를 메모리에 두는 RBD. 이미지는 사양(`{pool}[/{ns}]/{image}`)으로
@@ -1036,6 +1221,8 @@ mod tests {
             let i = FakeImage {
                 size: size_bytes,
                 snapshots: vec![],
+                protected: vec![],
+                parent: None,
             };
             images.insert(spec, i);
             Ok(())
@@ -1044,6 +1231,11 @@ mod tests {
         async fn remove(&self, image: &RbdTarget) -> Result<(), DriverError> {
             let spec = image_spec(image);
             self.call(format!("remove {spec}"))?;
+            if self.image(&spec).is_some_and(|i| !i.protected.is_empty()) {
+                return Err(DriverError::Rbd(
+                    "rbd: snapshot 'opl-base' is protected from removal".into(),
+                ));
+            }
             let removed = self.images.lock().unwrap().remove(&spec);
             removed.map(drop).ok_or_else(|| Self::missing(&spec))
         }
@@ -1057,6 +1249,7 @@ mod tests {
                     tag: tag.clone(),
                     size_bytes: *size,
                     created: *created,
+                    protected: i.protected.contains(tag),
                 })
                 .collect())
         }
@@ -1091,6 +1284,9 @@ mod tests {
             self.call(format!("snap rm {spec}@{tag}"))?;
             let mut images = self.images.lock().unwrap();
             let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
+            if i.protected.iter().any(|t| t == tag) {
+                return Err(DriverError::Rbd("rbd: snapshot is protected".into()));
+            }
             i.snapshots.retain(|(t, _, _)| t != tag);
             Ok(())
         }
@@ -1117,6 +1313,100 @@ mod tests {
             self.image(&spec).ok_or_else(|| Self::missing(&spec))?;
             let watched = self.watched.lock().unwrap();
             Ok(watched.iter().filter(|s| **s == spec).count())
+        }
+
+        async fn protect(&self, image: &RbdTarget, tag: &str) -> Result<(), DriverError> {
+            let spec = image_spec(image);
+            self.call(format!("snap protect {spec}@{tag}"))?;
+            let mut images = self.images.lock().unwrap();
+            let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
+            if !i.snapshots.iter().any(|(t, _, _)| t == tag) {
+                return Err(Self::missing(&format!("{spec}@{tag}")));
+            }
+            if i.protected.iter().any(|t| t == tag) {
+                return Err(DriverError::Rbd("rbd: snap is already protected".into()));
+            }
+            i.protected.push(tag.into());
+            Ok(())
+        }
+
+        async fn unprotect(&self, image: &RbdTarget, tag: &str) -> Result<(), DriverError> {
+            let spec = image_spec(image);
+            self.call(format!("snap unprotect {spec}@{tag}"))?;
+            let snapshot = format!("{spec}@{tag}");
+            let mut images = self.images.lock().unwrap();
+            let children = images
+                .values()
+                .filter(|i| i.parent.as_ref() == Some(&snapshot))
+                .count();
+            if children > 0 {
+                return Err(DriverError::Rbd(format!(
+                    "rbd: unprotecting snap failed: (16) Device or resource busy ({children} child(ren))"
+                )));
+            }
+            let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
+            if !i.protected.iter().any(|t| t == tag) {
+                return Err(DriverError::Rbd("rbd: snap is already unprotected".into()));
+            }
+            i.protected.retain(|t| t != tag);
+            Ok(())
+        }
+
+        async fn clone_image(
+            &self,
+            parent: &RbdTarget,
+            tag: &str,
+            child: &RbdTarget,
+        ) -> Result<(), DriverError> {
+            let (from, to) = (format!("{}@{tag}", image_spec(parent)), image_spec(child));
+            self.call(format!("clone {from} {to}"))?;
+            let mut images = self.images.lock().unwrap();
+            let p = images
+                .get(&image_spec(parent))
+                .ok_or_else(|| Self::missing(&from))?;
+            let (_, size, _) = p
+                .snapshots
+                .iter()
+                .find(|(t, _, _)| t == tag)
+                .cloned()
+                .ok_or_else(|| Self::missing(&from))?;
+            if !p.protected.iter().any(|t| t == tag) {
+                return Err(DriverError::Rbd(
+                    "rbd: parent snapshot must be protected".into(),
+                ));
+            }
+            if images.contains_key(&to) {
+                return Err(DriverError::Rbd(
+                    "rbd: clone error: (17) File exists".into(),
+                ));
+            }
+            let i = FakeImage {
+                size,
+                snapshots: vec![],
+                protected: vec![],
+                parent: Some(from),
+            };
+            images.insert(to, i);
+            Ok(())
+        }
+
+        async fn flatten(&self, image: &RbdTarget) -> Result<(), DriverError> {
+            let spec = image_spec(image);
+            self.call(format!("flatten {spec}"))?;
+            let mut images = self.images.lock().unwrap();
+            let i = images.get_mut(&spec).ok_or_else(|| Self::missing(&spec))?;
+            if i.parent.take().is_none() {
+                return Err(DriverError::Rbd("rbd: image has no parent".into()));
+            }
+            Ok(())
+        }
+
+        async fn parent(&self, image: &RbdTarget) -> Result<Option<String>, DriverError> {
+            let spec = image_spec(image);
+            Ok(self
+                .image(&spec)
+                .ok_or_else(|| Self::missing(&spec))?
+                .parent)
         }
     }
 
@@ -1302,6 +1592,141 @@ mod tests {
         assert!(matches!(err, DriverError::Timeout(RBD_BUSY)), "{err:?}");
         assert!(err.is_transient());
         assert!(rbd.taken().is_empty());
+    }
+
+    /// 연결 복제는 보호한 기반 스냅샷 `@opl-base`(없을 때만 찍고 보호한다)의 clone이다. clone이 있는 동안 기반
+    /// 이미지도 기반 스냅샷도 지울 수 없다(보호를 풀지 못한다). clone이 없으면 지우기가 보호를 풀고 지운다.
+    #[tokio::test]
+    async fn linked_clones_are_clones_of_the_protected_base_snapshot() {
+        let (rbd, storage) = setup("/nonexistent/qemu-img");
+        let p = pool();
+        let (base, a, b) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        rbd.taken();
+
+        let (path, format) = storage.link_clone(&p, base, RAW, a).await.unwrap();
+        assert_eq!((path, format), (PathBuf::new(), RAW));
+        let snapshot = format!("{}@opl-base", spec(base));
+        assert_eq!(
+            rbd.taken(),
+            [
+                format!("snap create {snapshot}"),
+                format!("snap protect {snapshot}"),
+                format!("clone {snapshot} {}", spec(a)),
+            ]
+        );
+        storage.link_clone(&p, base, RAW, b).await.unwrap();
+        assert_eq!(rbd.taken(), [format!("clone {snapshot} {}", spec(b))]);
+        assert_eq!(rbd.image(&spec(b)).unwrap().parent, Some(snapshot.clone()));
+        // 기반 스냅샷이 남았지만 보호가 풀렸으면(끊긴 되돌리기) 다시 보호한다.
+        rbd.images
+            .lock()
+            .unwrap()
+            .get_mut(&spec(base))
+            .unwrap()
+            .protected
+            .clear();
+        let c = Uuid::now_v7();
+        storage.link_clone(&p, base, RAW, c).await.unwrap();
+        assert_eq!(
+            rbd.taken(),
+            [
+                format!("snap protect {snapshot}"),
+                format!("clone {snapshot} {}", spec(c)),
+            ]
+        );
+
+        let err = storage.link_clone(&p, base, RAW, a).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeExists(v) if v == a),
+            "{err:?}"
+        );
+        let missing = Uuid::now_v7();
+        not_found(
+            storage
+                .link_clone(&p, missing, RAW, Uuid::now_v7())
+                .await
+                .unwrap_err(),
+            missing,
+        );
+        invalid(
+            storage
+                .link_clone(&p, base, ImageFormat::Qcow2, Uuid::now_v7())
+                .await
+                .unwrap_err(),
+            "raw volumes",
+        );
+        rbd.taken();
+
+        // 백엔드 막이: clone이 있으면 보호를 풀지 못해 기반 이미지도 기반 스냅샷도 남는다.
+        let err = storage.delete_volume(&p, base, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Rbd(ref m) if m.contains("busy")),
+            "{err:?}"
+        );
+        let err = storage.release_base(&p, base, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Rbd(ref m) if m.contains("busy")),
+            "{err:?}"
+        );
+        // 평탄화한 복제의 스냅샷 때문일 수도 있으므로 무엇을 지워야 하는지 말한다.
+        assert!(
+            err.to_string()
+                .contains("by a snapshot that a flattened linked clone took before flattening"),
+            "{err}"
+        );
+        assert!(rbd.image(&spec(base)).is_some());
+        assert_eq!(
+            rbd.taken(),
+            [
+                format!("snap unprotect {snapshot}"),
+                format!("snap unprotect {snapshot}")
+            ]
+        );
+
+        // 평탄화는 `rbd flatten`이고 다시 하면 할 일이 없다.
+        for clone in [a, b, c] {
+            storage.flatten_volume(&p, clone, RAW).await.unwrap();
+            storage.flatten_volume(&p, clone, RAW).await.unwrap();
+            assert_eq!(rbd.taken(), [format!("flatten {}", spec(clone))]);
+        }
+        storage.release_base(&p, base, RAW).await.unwrap();
+        assert_eq!(
+            rbd.taken(),
+            [
+                format!("snap unprotect {snapshot}"),
+                format!("snap rm {snapshot}")
+            ]
+        );
+        storage.release_base(&p, base, RAW).await.unwrap();
+        storage.release_base(&p, missing, RAW).await.unwrap();
+        assert!(rbd.taken().is_empty());
+
+        // 평탄화를 안 했어도 clone이 지워졌으면 기반 이미지의 지우기는 보호를 풀고 지운다.
+        let d = Uuid::now_v7();
+        storage.link_clone(&p, base, RAW, d).await.unwrap();
+        storage.delete_volume(&p, d, RAW).await.unwrap();
+        rbd.taken();
+        storage.delete_volume(&p, base, RAW).await.unwrap();
+        assert_eq!(
+            rbd.taken(),
+            [
+                format!("snap unprotect {snapshot}"),
+                format!("remove {}", spec(base))
+            ]
+        );
+
+        // 쓰는 클라이언트가 있으면 평탄화하지 않는다(일시 오류).
+        let (base, e) = (Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        storage.link_clone(&p, base, RAW, e).await.unwrap();
+        rbd.watched.lock().unwrap().push(spec(e));
+        let err = storage.flatten_volume(&p, e, RAW).await.unwrap_err();
+        assert!(matches!(err, DriverError::Timeout(RBD_WATCHED)), "{err:?}");
+        not_found(
+            storage.flatten_volume(&p, missing, RAW).await.unwrap_err(),
+            missing,
+        );
     }
 
     /// 이미지를 연 클라이언트(watcher, 다른 노드의 QEMU 등)가 있으면 스냅샷도 지우지 않고 일시
@@ -1834,7 +2259,7 @@ mod tests {
 
         // 스냅샷 id 순. 시각은 읽을 수 있을 때만 담는다.
         let snaps = br#"[
-            {"id":9,"name":"b","size":2048,"protected":"false","timestamp":"x"},
+            {"id":9,"name":"b","size":2048,"protected":"true","timestamp":"x"},
             {"id":4,"name":"a","size":1024,"protected":"false","timestamp":"Thu Oct  1 09:00:05 2026"},
             {"id":5,"name":"c","size":1024,"protected":"false"}
         ]"#;
@@ -1845,21 +2270,40 @@ mod tests {
                     tag: "a".into(),
                     size_bytes: 1024,
                     created: Some(UNIX_EPOCH + Duration::from_secs(1_790_845_205)),
+                    protected: false,
                 },
                 RbdSnapshot {
                     tag: "c".into(),
                     size_bytes: 1024,
                     created: None,
+                    protected: false,
                 },
                 RbdSnapshot {
                     tag: "b".into(),
                     size_bytes: 2048,
                     created: None,
+                    protected: true,
                 },
             ]
         );
         assert_eq!(parse_snapshots(b"[]").unwrap(), []);
         assert!(parse_snapshots(br#"[{"id":1}]"#).is_err());
+
+        // clone이면 부모(네임스페이스가 있으면 함께)
+        assert_eq!(parse_parent(br#"{"name":"opl-a","size":1}"#).unwrap(), None);
+        let clone = br#"{"name":"opl-b","size":1,"parent":{"pool":"rbd","pool_namespace":"",
+            "image":"opl-a","id":"1","snapshot":"opl-base","trash":false,"overlap":1}}"#;
+        assert_eq!(
+            parse_parent(clone).unwrap(),
+            Some("rbd/opl-a@opl-base".into())
+        );
+        let clone = br#"{"parent":{"pool":"rbd","pool_namespace":"opl","image":"opl-a",
+            "snapshot":"opl-base"}}"#;
+        assert_eq!(
+            parse_parent(clone).unwrap(),
+            Some("rbd/opl/opl-a@opl-base".into())
+        );
+        assert!(parse_parent(br#"{"parent":{"pool":"rbd"}}"#).is_err());
 
         let df = br#"{"stats":{},"pools":[
             {"name":"other","id":1,"stats":{"stored":1,"max_avail":2}},

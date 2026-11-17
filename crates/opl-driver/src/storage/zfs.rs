@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{PoolBackend, SourceFormat, StoragePool};
+use opl_types::storage::{BASE_TAG, PoolBackend, SourceFormat, StoragePool};
 use uuid::Uuid;
 
 use super::blockcmd::BlockTool;
@@ -37,6 +37,12 @@ const BUSY_WAIT: Duration = Duration::from_secs(1);
 
 /// zvol 크기는 이 배수로 올린다(volblocksize의 배수여야 한다).
 const ZVOL_ALIGN: u64 = 1 << 20;
+
+/// 평탄화가 보낼 때 찍는 복제 zvol의 스냅샷. 받은 쪽에서는 끝에 지운다.
+const FLATTEN_TAG: &str = "opl-flatten";
+
+/// 평탄화가 받는 새 zvol 이름의 꼬리(`{dataset}/opl-{id}-flat`). 원본을 지운 뒤 원본 이름으로 바꾼다.
+const FLAT_SUFFIX: &str = "-flat";
 
 /// `zfs list`가 알려 준 zvol 하나
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +104,24 @@ pub trait ZfsOps: Send + Sync {
     /// udev가 이벤트(장치 노드 만들기·다시 다루기)를 다 다루기를 기다린다(`udevadm settle`).
     /// udev가 없으면 `false`, 시간을 넘기면 오류다.
     async fn settle(&self) -> Result<bool, DriverError>;
+    /// zvol이 clone이면 그 원본 스냅샷(`{zvol}@{tag}`, `zfs get origin`), 아니면 `None`.
+    async fn origin(&self, zvol: &str) -> Result<Option<String>, DriverError>;
+    /// 스냅샷 `{zvol}@{tag}` 뒤에 zvol에 쓴 바이트(`zfs get written@{tag}`)
+    async fn written(&self, zvol: &str, tag: &str) -> Result<u64, DriverError>;
+    /// 스냅샷 `snapshot`(`{zvol}@{tag}`)의 clone zvol `zvol`을 만든다(`zfs clone`, 새 zvol과 같은 속성).
+    async fn clone_snapshot(&self, snapshot: &str, zvol: &str) -> Result<(), DriverError>;
+    /// zvol의 이름을 바꾼다(`zfs rename`).
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DriverError>;
+    /// zvol `zvol`의 스냅샷 `tag`를 `target`으로 보낸다(`zfs send | zfs recv`). `from`이 없으면 전체 스트림으로 새
+    /// zvol `target`을 만들고(새 zvol과 같은 속성), 있으면 `from` 다음부터 `tag`까지의 스냅샷을 모두(`-I`) 이미
+    /// 받은 `target`에 더한다. 크기에 비례해 걸리므로 시간 제한이 없다.
+    async fn send(
+        &self,
+        zvol: &str,
+        from: Option<&str>,
+        tag: &str,
+        target: &str,
+    ) -> Result<(), DriverError>;
 }
 
 /// 실제 ZFS 명령. root여야 한다.
@@ -287,6 +311,97 @@ impl ZfsOps for SystemZfs {
             Err(DriverError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    async fn origin(&self, zvol: &str) -> Result<Option<String>, DriverError> {
+        let args = ["get", "-Hp", "-o", "value", "origin", zvol];
+        parse_origin(&ZFS.run_read("zfs", &args, ZFS_TIMEOUT).await?)
+    }
+
+    async fn written(&self, zvol: &str, tag: &str) -> Result<u64, DriverError> {
+        let property = format!("written@{tag}");
+        let args = ["get", "-Hp", "-o", "value", &property, zvol];
+        parse_written(&ZFS.run_read("zfs", &args, ZFS_TIMEOUT).await?)
+    }
+
+    async fn clone_snapshot(&self, snapshot: &str, zvol: &str) -> Result<(), DriverError> {
+        let mut args = vec!["clone"];
+        args.extend_from_slice(&ZVOL_PROPS);
+        args.extend([snapshot, zvol]);
+        ZFS.run_change("zfs", &args, &[zvol], ZFS_TIMEOUT).await
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), DriverError> {
+        ZFS.run_change("zfs", &["rename", from, to], &[from, to], ZFS_TIMEOUT)
+            .await
+    }
+
+    async fn send(
+        &self,
+        zvol: &str,
+        from: Option<&str>,
+        tag: &str,
+        target: &str,
+    ) -> Result<(), DriverError> {
+        let (snapshot, from) = (format!("{zvol}@{tag}"), from.map(|f| format!("@{f}")));
+        let (send, recv) = send_recv_args(&snapshot, from.as_deref(), target);
+        ZFS.run_pipe_change(
+            ("zfs", &send),
+            ("zfs", &recv),
+            &[zvol, target],
+            Duration::MAX,
+        )
+        .await
+    }
+}
+
+/// 새 zvol의 속성(`-o` 인자): 장치로만 보이고(`volmode=dev`) 스냅샷 장치도 보인다(`snapdev=visible`). 이 속성을 따르는
+/// 자동 스냅샷 도구(zfs-auto-snapshot 등)가 찍지 않게 `com.sun:auto-snapshot=false`를 둔다: 더 최근 스냅샷이 생기면
+/// 되돌리기가 막힌다.
+const ZVOL_PROPS: [&str; 6] = [
+    "-o",
+    "volmode=dev",
+    "-o",
+    "snapdev=visible",
+    "-o",
+    "com.sun:auto-snapshot=false",
+];
+
+/// `zfs send [-I @from] {snapshot}`과 `zfs recv`의 인자. 전체 스트림은 새 zvol의 속성으로 받는다.
+fn send_recv_args<'a>(
+    snapshot: &'a str,
+    from: Option<&'a str>,
+    target: &'a str,
+) -> (Vec<&'a str>, Vec<&'a str>) {
+    let mut send = vec!["send"];
+    let mut recv = vec!["recv"];
+    match from {
+        Some(from) => send.extend(["-I", from]),
+        None => recv.extend_from_slice(&ZVOL_PROPS),
+    }
+    send.push(snapshot);
+    recv.push(target);
+    (send, recv)
+}
+
+/// `zfs get -Hp -o value origin`의 출력. clone이 아니면 `-`다.
+fn parse_origin(out: &[u8]) -> Result<Option<String>, DriverError> {
+    let values: Vec<Vec<&str>> = rows(out).collect();
+    match values.as_slice() {
+        [value] if value.len() == 1 => {
+            let origin = value[0].trim();
+            Ok((origin != "-" && !origin.is_empty()).then(|| origin.to_string()))
+        }
+        _ => Err(bad_output(format!("origin {values:?}"))),
+    }
+}
+
+/// `zfs get -Hp -o value written@{tag}`의 출력
+fn parse_written(out: &[u8]) -> Result<u64, DriverError> {
+    let values: Vec<Vec<&str>> = rows(out).collect();
+    match values.as_slice() {
+        [value] if value.len() == 1 => number(value[0].trim()),
+        _ => Err(bad_output(format!("written {values:?}"))),
     }
 }
 
@@ -631,7 +746,8 @@ impl Storage for ZfsStorage {
 
     /// zvol을 스냅샷과 함께 지운다. 먼저 udev를 기다린다(방금 생긴 스냅샷 장치를 열고 있을 수
     /// 있다). zvol이 없어도 그 zvol을 바꾸는 명령이 아직 돌고 있으면(시간을 넘긴 만들기) zvol이 곧
-    /// 생길 수 있으므로 `VolumeNotFound`가 아니라 일시 오류다.
+    /// 생길 수 있으므로 `VolumeNotFound`가 아니라 일시 오류다. 끊긴 평탄화가 남긴 `{zvol}-flat`도 지운다(원본을
+    /// 지운 뒤 이름을 바꾸기 전에 끊겼으면 볼륨의 데이터는 그것뿐이다).
     async fn delete_volume(
         &self,
         pool: &StoragePool,
@@ -640,14 +756,24 @@ impl Storage for ZfsStorage {
     ) -> Result<(), DriverError> {
         let dataset = Self::dataset(pool, format)?;
         let zvol = volume_zvol(dataset, id);
+        let flat = format!("{zvol}{FLAT_SUFFIX}");
+        let has_flat = self.find(dataset, &flat).await?.is_some();
         if self.find(dataset, &zvol).await?.is_none() {
-            if self.ops.changing(&zvol) {
+            if self.ops.changing(&zvol) || self.ops.changing(&flat) {
                 return Err(DriverError::Timeout(ZFS_BUSY));
             }
-            return Err(DriverError::VolumeNotFound(id));
+            if !has_flat {
+                return Err(DriverError::VolumeNotFound(id));
+            }
+        } else {
+            self.settle().await;
+            self.destroy(&zvol).await?;
         }
-        self.settle().await;
-        self.destroy(&zvol).await
+        if has_flat {
+            self.settle().await;
+            self.destroy(&flat).await?;
+        }
+        Ok(())
     }
 
     /// zvol은 늘 활성이다. 볼륨이 있고 장치 노드가 있는지만 본다.
@@ -887,6 +1013,158 @@ impl Storage for ZfsStorage {
         let from = convert_from(&source, force_share, Some(dst_format))?;
         self.fill(dataset, dst_id, &dst, &from).await
     }
+
+    /// 기반 zvol에 기반 스냅샷 `@opl-base`가 없으면 찍고 그 스냅샷의 clone `{dataset}/opl-{clone}`을 만든다. 장치
+    /// 노드가 생기지 않으면 만든 clone을 지운다. 기반 zvol은 clone이 있는 동안 지울 수 없다(`zfs destroy`가 거절).
+    async fn link_clone(
+        &self,
+        pool: &StoragePool,
+        base_id: Uuid,
+        base_format: ImageFormat,
+        clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        let dataset = Self::dataset(pool, base_format)?;
+        let base = self.existing(dataset, base_id).await?.name;
+        let clone = volume_zvol(dataset, clone_id);
+        if self.find(dataset, &clone).await?.is_some() {
+            return Err(DriverError::VolumeExists(clone_id));
+        }
+        if !self
+            .ops
+            .snapshots(&base)
+            .await?
+            .iter()
+            .any(|s| s.tag == BASE_TAG)
+        {
+            self.ops.snapshot(&[&base], BASE_TAG).await?;
+        }
+        self.ops
+            .clone_snapshot(&format!("{base}@{BASE_TAG}"), &clone)
+            .await?;
+        match self.wait_node(device_path(&self.dev, &clone, None)).await {
+            Ok(path) => Ok((path, ImageFormat::Raw)),
+            Err(e) => {
+                if let Err(del) = self.destroy(&clone).await {
+                    tracing::warn!(volume = %clone_id, error = %del, "cannot remove clone without device");
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 기반 스냅샷 `@opl-base`를 지운다. clone이 남아 있으면 `zfs destroy`가 거절한다. 볼륨이나 스냅샷이 없으면
+    /// 지운 것으로 본다. 다만 그 zvol을 바꾸는 명령이 아직 돌고 있으면 일시 오류다.
+    async fn release_base(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.snapshot_delete(pool, id, format, BASE_TAG).await
+    }
+
+    /// clone zvol을 기반과 독립인 zvol로 바꾼다(`zfs promote`는 의존 방향을 뒤집으므로 쓰지 않는다). clone의 스냅샷
+    /// `@opl-flatten`을 찍어 그때까지의 스냅샷과 함께 `{zvol}-flat`으로 보내고(`zfs send | zfs recv`, 첫 스냅샷은 전체
+    /// 스트림), 원본 clone을 지운 뒤 `-flat`을 원본 이름으로 바꾸고 `@opl-flatten`을 지운다. 다시 할 때: 원본과
+    /// `-flat`이 함께 있으면 `-flat`을 지우고 처음부터, 원본 없이 `-flat`만 있으면 이름만 바꾼다. 이미 clone이 아니면
+    /// 남은 `@opl-flatten`만 지운다.
+    async fn flatten_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let dataset = Self::dataset(pool, format)?;
+        let zvol = volume_zvol(dataset, id);
+        let flat = format!("{zvol}{FLAT_SUFFIX}");
+        if self.ops.changing(&zvol) || self.ops.changing(&flat) {
+            return Err(DriverError::Timeout(ZFS_BUSY));
+        }
+        let volumes = self.ops.volumes(dataset).await?;
+        let has = |name: &str| volumes.iter().any(|v| v.name == name);
+        match (has(&zvol), has(&flat)) {
+            (false, false) => return Err(DriverError::VolumeNotFound(id)),
+            (false, true) => return self.finish_flatten(&flat, &zvol).await,
+            (true, true) => {
+                tracing::warn!(volume = %id, "removing a flattened copy left by an earlier attempt");
+                self.settle().await;
+                self.destroy(&flat).await?;
+            }
+            (true, false) => {}
+        }
+        let snapshots = self.ops.snapshots(&zvol).await?;
+        if self.ops.origin(&zvol).await?.is_none() {
+            if snapshots.iter().any(|s| s.tag == FLATTEN_TAG) {
+                self.settle().await;
+                self.destroy_snapshot(&zvol, FLATTEN_TAG).await?;
+            }
+            return Ok(());
+        }
+        // 앞선 시도가 남긴 스냅샷은 그 뒤의 쓰기를 담지 않는다.
+        if snapshots.iter().any(|s| s.tag == FLATTEN_TAG) {
+            self.settle().await;
+            self.destroy_snapshot(&zvol, FLATTEN_TAG).await?;
+        }
+        self.ops.snapshot(&[&zvol], FLATTEN_TAG).await?;
+        let first = snapshots
+            .iter()
+            .map(|s| s.tag.as_str())
+            .find(|t| *t != FLATTEN_TAG)
+            .unwrap_or(FLATTEN_TAG);
+        let sent = async {
+            self.ops.send(&zvol, None, first, &flat).await?;
+            if first != FLATTEN_TAG {
+                self.ops
+                    .send(&zvol, Some(first), FLATTEN_TAG, &flat)
+                    .await?;
+            }
+            Ok::<_, DriverError>(())
+        };
+        if let Err(e) = sent.await {
+            // 원본은 그대로다. 받다 만 것은 다시 할 때도 지운다.
+            self.settle().await;
+            if self.find(dataset, &flat).await.is_ok_and(|f| f.is_some())
+                && let Err(del) = self.destroy(&flat).await
+            {
+                tracing::warn!(volume = %id, error = %del, "cannot remove partial flattened copy");
+            }
+            return Err(e);
+        }
+        // 보낸 시점 뒤에 쓰였으면(그사이 VM이 켜졌다) 받은 것은 그 쓰기를 담지 않으므로 원본을 지우지 않는다.
+        let written = self.ops.written(&zvol, FLATTEN_TAG).await?;
+        if written > 0 {
+            self.settle().await;
+            if let Err(del) = self.destroy(&flat).await {
+                tracing::warn!(volume = %id, error = %del, "cannot remove stale flattened copy");
+            }
+            return Err(DriverError::Zfs(format!(
+                "{zvol} was written while it was being flattened; stop what uses it and flatten it again"
+            )));
+        }
+        self.settle().await;
+        self.destroy(&zvol).await?;
+        self.finish_flatten(&flat, &zvol).await
+    }
+}
+
+impl ZfsStorage {
+    /// 평탄화의 끝: 받은 `flat`을 원본 이름 `zvol`로 바꾸고 보낼 때 찍은 스냅샷을 지운 뒤 장치 노드를 기다린다.
+    async fn finish_flatten(&self, flat: &str, zvol: &str) -> Result<(), DriverError> {
+        self.ops.rename(flat, zvol).await?;
+        self.settle().await;
+        if self
+            .ops
+            .snapshots(zvol)
+            .await?
+            .iter()
+            .any(|s| s.tag == FLATTEN_TAG)
+        {
+            self.destroy_snapshot(zvol, FLATTEN_TAG).await?;
+        }
+        self.wait_node(device_path(&self.dev, zvol, None))
+            .await
+            .map(drop)
+    }
 }
 
 #[cfg(test)]
@@ -904,6 +1182,8 @@ mod tests {
         size: u64,
         /// 만든 순서의 스냅샷(태그, 크기)
         snapshots: Vec<(String, u64)>,
+        /// clone이면 원본 스냅샷(`{zvol}@{tag}`)
+        origin: Option<String>,
     }
 
     /// 데이터셋 `tank/opl`, `tank/other`를 메모리에 두는 ZFS. 바꾸는 호출을 적고, `fail`에 적은 호출은
@@ -917,6 +1197,8 @@ mod tests {
         /// 바꾸는 명령이 아직 돌고 있다고 알리는 zvol
         changing: Mutex<Vec<String>>,
         no_udev: Mutex<bool>,
+        /// `written`이 알릴 바이트(zvol마다, 없으면 0)
+        written: Mutex<BTreeMap<String, u64>>,
         dev: tempfile::TempDir,
     }
 
@@ -929,6 +1211,7 @@ mod tests {
                 busy: Mutex::default(),
                 changing: Mutex::default(),
                 no_udev: Mutex::default(),
+                written: Mutex::default(),
                 dev: tempfile::tempdir().unwrap(),
             }
         }
@@ -1002,6 +1285,27 @@ mod tests {
             DriverError::Zfs(format!("cannot open '{name}': dataset does not exist"))
         }
 
+        /// `snapshot`(`{zvol}@{tag}`, `tag`가 없으면 그 zvol의 모든 스냅샷)을 원본으로 둔 clone이 있으면 거절
+        fn check_dependents(
+            zvols: &BTreeMap<String, FakeZvol>,
+            zvol: &str,
+            tag: Option<&str>,
+        ) -> Result<(), DriverError> {
+            let origin_of = |o: &str| match tag {
+                Some(tag) => o == format!("{zvol}@{tag}"),
+                None => o.starts_with(&format!("{zvol}@")),
+            };
+            if zvols
+                .values()
+                .any(|z| z.origin.as_deref().is_some_and(origin_of))
+            {
+                return Err(DriverError::Zfs(format!(
+                    "cannot destroy '{zvol}': filesystem has dependent clones"
+                )));
+            }
+            Ok(())
+        }
+
         /// 데이터셋 `dataset` 바로 아래의 이름인지
         fn in_dataset(dataset: &str, name: &str) -> bool {
             name.strip_prefix(dataset)
@@ -1061,6 +1365,7 @@ mod tests {
             let z = FakeZvol {
                 size: size_bytes,
                 snapshots: vec![],
+                origin: None,
             };
             zvols.insert(zvol.into(), z);
             self.sync_nodes(&zvols);
@@ -1070,6 +1375,7 @@ mod tests {
         async fn destroy(&self, zvol: &str) -> Result<(), DriverError> {
             self.call(format!("destroy -r {zvol}"))?;
             let mut zvols = self.zvols.lock().unwrap();
+            Self::check_dependents(&zvols, zvol, None)?;
             let removed = zvols.remove(zvol);
             self.sync_nodes(&zvols);
             removed.map(drop).ok_or_else(|| Self::missing(zvol))
@@ -1107,6 +1413,7 @@ mod tests {
         async fn destroy_snapshot(&self, zvol: &str, tag: &str) -> Result<(), DriverError> {
             self.call(format!("destroy {zvol}@{tag}"))?;
             let mut zvols = self.zvols.lock().unwrap();
+            Self::check_dependents(&zvols, zvol, Some(tag))?;
             let z = zvols.get_mut(zvol).ok_or_else(|| Self::missing(zvol))?;
             let before = z.snapshots.len();
             z.snapshots.retain(|(t, _)| t != tag);
@@ -1139,6 +1446,107 @@ mod tests {
         async fn settle(&self) -> Result<bool, DriverError> {
             self.call("settle".into())?;
             Ok(!*self.no_udev.lock().unwrap())
+        }
+
+        async fn origin(&self, zvol: &str) -> Result<Option<String>, DriverError> {
+            let zvols = self.zvols.lock().unwrap();
+            Ok(zvols
+                .get(zvol)
+                .ok_or_else(|| Self::missing(zvol))?
+                .origin
+                .clone())
+        }
+
+        async fn written(&self, zvol: &str, _: &str) -> Result<u64, DriverError> {
+            Ok(self.written.lock().unwrap().get(zvol).copied().unwrap_or(0))
+        }
+
+        async fn clone_snapshot(&self, snapshot: &str, zvol: &str) -> Result<(), DriverError> {
+            self.call(format!("clone {snapshot} {zvol}"))?;
+            let mut zvols = self.zvols.lock().unwrap();
+            let (origin, tag) = snapshot.split_once('@').unwrap();
+            let size = zvols
+                .get(origin)
+                .and_then(|z| z.snapshots.iter().find(|(t, _)| t == tag))
+                .map(|(_, size)| *size)
+                .ok_or_else(|| Self::missing(snapshot))?;
+            if zvols.contains_key(zvol) {
+                return Err(DriverError::Zfs(format!("cannot create '{zvol}': exists")));
+            }
+            let z = FakeZvol {
+                size,
+                snapshots: vec![],
+                origin: Some(snapshot.into()),
+            };
+            zvols.insert(zvol.into(), z);
+            self.sync_nodes(&zvols);
+            Ok(())
+        }
+
+        async fn rename(&self, from: &str, to: &str) -> Result<(), DriverError> {
+            self.call(format!("rename {from} {to}"))?;
+            let mut zvols = self.zvols.lock().unwrap();
+            if zvols.contains_key(to) {
+                return Err(DriverError::Zfs(format!("cannot rename to '{to}': exists")));
+            }
+            let z = zvols.remove(from).ok_or_else(|| Self::missing(from))?;
+            zvols.insert(to.into(), z);
+            self.sync_nodes(&zvols);
+            Ok(())
+        }
+
+        /// 받은 zvol은 clone이 아니다. 전체 스트림은 `tag` 하나를, `-I`는 `from` 뒤 `tag`까지의 스냅샷을 더한다.
+        async fn send(
+            &self,
+            zvol: &str,
+            from: Option<&str>,
+            tag: &str,
+            target: &str,
+        ) -> Result<(), DriverError> {
+            let call = match from {
+                Some(from) => format!("send -I @{from} {zvol}@{tag} | recv {target}"),
+                None => format!("send {zvol}@{tag} | recv {target}"),
+            };
+            self.call(call)?;
+            let mut zvols = self.zvols.lock().unwrap();
+            let source = zvols.get(zvol).ok_or_else(|| Self::missing(zvol))?.clone();
+            let end = source
+                .snapshots
+                .iter()
+                .position(|(t, _)| t == tag)
+                .ok_or_else(|| Self::missing(&format!("{zvol}@{tag}")))?;
+            match from {
+                None => {
+                    if zvols.contains_key(target) {
+                        return Err(DriverError::Zfs(format!("'{target}' exists")));
+                    }
+                    let snapshot = source.snapshots[end].clone();
+                    let z = FakeZvol {
+                        size: snapshot.1,
+                        snapshots: vec![snapshot],
+                        origin: None,
+                    };
+                    zvols.insert(target.into(), z);
+                }
+                Some(from) => {
+                    let start = source
+                        .snapshots
+                        .iter()
+                        .position(|(t, _)| t == from)
+                        .ok_or_else(|| Self::missing(&format!("{zvol}@{from}")))?;
+                    let t = zvols.get_mut(target).ok_or_else(|| Self::missing(target))?;
+                    if t.snapshots.last().map(|(t, _)| t.as_str()) != Some(from) {
+                        return Err(DriverError::Zfs(
+                            "most recent snapshot does not match".into(),
+                        ));
+                    }
+                    t.snapshots
+                        .extend_from_slice(&source.snapshots[start + 1..=end]);
+                    t.size = source.snapshots[end].1;
+                }
+            }
+            self.sync_nodes(&zvols);
+            Ok(())
         }
     }
 
@@ -1360,6 +1768,270 @@ mod tests {
     }
 
     /// 지우기는 zvol을 스냅샷과 함께 지운다. 없으면 `VolumeNotFound`다.
+    /// 연결 복제는 기반 스냅샷 `@opl-base`(없을 때만 찍는다)의 clone이다. clone이 있는 동안 기반 zvol도 기반
+    /// 스냅샷도 지울 수 없다. 기반 스냅샷 풀기는 다시 해도 된다.
+    #[tokio::test]
+    async fn linked_clones_are_clones_of_the_base_snapshot() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let p = pool();
+        let (base, a, b) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        zfs.taken();
+
+        let (path, format) = storage.link_clone(&p, base, RAW, a).await.unwrap();
+        assert_eq!((path, format), (zfs.node(&zvol(a), None), RAW));
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("snapshot {} @opl-base", zvol(base)),
+                format!("clone {}@opl-base {}", zvol(base), zvol(a)),
+            ]
+        );
+        storage.link_clone(&p, base, RAW, b).await.unwrap();
+        assert_eq!(
+            zfs.taken(),
+            [format!("clone {}@opl-base {}", zvol(base), zvol(b))]
+        );
+        assert_eq!(
+            zfs.zvol(&zvol(b)).unwrap().origin,
+            Some(format!("{}@opl-base", zvol(base)))
+        );
+
+        let err = storage.link_clone(&p, base, RAW, a).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeExists(v) if v == a),
+            "{err:?}"
+        );
+        let missing = Uuid::now_v7();
+        not_found(
+            storage
+                .link_clone(&p, missing, RAW, Uuid::now_v7())
+                .await
+                .unwrap_err(),
+            missing,
+        );
+        invalid(
+            storage
+                .link_clone(&p, base, ImageFormat::Qcow2, Uuid::now_v7())
+                .await
+                .unwrap_err(),
+            "raw volumes",
+        );
+        zfs.taken();
+
+        // 백엔드 막이: clone이 있으면 기반 zvol도 기반 스냅샷도 지워지지 않는다.
+        let err = storage.delete_volume(&p, base, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Zfs(ref m) if m.contains("dependent clones")),
+            "{err:?}"
+        );
+        let err = storage.release_base(&p, base, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Zfs(ref m) if m.contains("dependent clones")),
+            "{err:?}"
+        );
+        assert!(zfs.names().contains(&zvol(base)));
+
+        for clone in [a, b] {
+            storage.delete_volume(&p, clone, RAW).await.unwrap();
+        }
+        zfs.taken();
+        storage.release_base(&p, base, RAW).await.unwrap();
+        assert_eq!(zfs.taken(), [format!("destroy {}@opl-base", zvol(base))]);
+        assert!(zfs.zvol(&zvol(base)).unwrap().snapshots.is_empty());
+        storage.release_base(&p, base, RAW).await.unwrap();
+        storage.release_base(&p, missing, RAW).await.unwrap();
+        assert!(zfs.taken().is_empty());
+    }
+
+    /// 평탄화는 clone의 스냅샷들을 `@opl-flatten`과 함께 `-flat`으로 보내고(첫 스냅샷은 전체, 나머지는 `-I`) 원본을
+    /// 지운 뒤 이름을 바꾼다. 평탄화한 볼륨은 clone이 아니고 스냅샷이 남는다. 다시 하면 할 일이 없다.
+    #[tokio::test]
+    async fn flatten_sends_the_clone_into_an_independent_zvol() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let p = pool();
+        let (base, id) = (Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        storage.link_clone(&p, base, RAW, id).await.unwrap();
+        storage.snapshot_create(&p, id, RAW, "s1").await.unwrap();
+        storage.snapshot_create(&p, id, RAW, "s2").await.unwrap();
+        zfs.taken();
+
+        storage.flatten_volume(&p, id, RAW).await.unwrap();
+        let (z, flat) = (zvol(id), format!("{}-flat", zvol(id)));
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("snapshot {z} @opl-flatten"),
+                format!("send {z}@s1 | recv {flat}"),
+                format!("send -I @s1 {z}@opl-flatten | recv {flat}"),
+                format!("destroy -r {z}"),
+                format!("rename {flat} {z}"),
+                format!("destroy {z}@opl-flatten"),
+            ]
+        );
+        let flattened = zfs.zvol(&z).unwrap();
+        assert_eq!(flattened.origin, None);
+        let tags: Vec<&str> = flattened
+            .snapshots
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(tags, ["s1", "s2"]);
+        assert!(zfs.node(&z, None).exists());
+        // 이제 기반 스냅샷을 풀 수 있다.
+        storage.release_base(&p, base, RAW).await.unwrap();
+        zfs.taken();
+
+        storage.flatten_volume(&p, id, RAW).await.unwrap();
+        assert!(zfs.taken().is_empty());
+        let missing = Uuid::now_v7();
+        not_found(
+            storage.flatten_volume(&p, missing, RAW).await.unwrap_err(),
+            missing,
+        );
+    }
+
+    /// 스냅샷 없는 clone은 `@opl-flatten` 하나를 전체 스트림으로 보낸다. 보내다 실패하면 받다 만 것을 지우고 원본은
+    /// 그대로다. 다시 할 때 원본과 `-flat`이 함께 있으면 `-flat`을 지우고 처음부터, `-flat`만 있으면 이름만 바꾼다.
+    #[tokio::test]
+    async fn flatten_resumes_after_interruptions() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let p = pool();
+        let (base, id) = (Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        storage.link_clone(&p, base, RAW, id).await.unwrap();
+        let (z, flat) = (zvol(id), format!("{}-flat", zvol(id)));
+        let base_snapshot = format!("{}@opl-base", zvol(base));
+
+        // 받다 실패: 원본은 clone 그대로다(남은 `@opl-flatten`은 다음에 새로 찍는다).
+        zfs.fail_on(format!("send {z}@opl-flatten | recv {flat}"));
+        zfs.taken();
+        storage.flatten_volume(&p, id, RAW).await.unwrap_err();
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("snapshot {z} @opl-flatten"),
+                format!("send {z}@opl-flatten | recv {flat}"),
+            ]
+        );
+        assert_eq!(
+            zfs.zvol(&z).unwrap().origin.as_deref(),
+            Some(base_snapshot.as_str())
+        );
+        zfs.fail.lock().unwrap().clear();
+
+        // 원본을 지우다 실패(쓰는 중): `-flat`이 남는다. 다시 하면 지우고 처음부터 한다.
+        zfs.fail_on(format!("destroy -r {z}"));
+        storage.flatten_volume(&p, id, RAW).await.unwrap_err();
+        assert!(zfs.names().contains(&flat));
+        zfs.fail.lock().unwrap().clear();
+        zfs.taken();
+        storage.flatten_volume(&p, id, RAW).await.unwrap();
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("destroy -r {flat}"),
+                format!("destroy {z}@opl-flatten"),
+                format!("snapshot {z} @opl-flatten"),
+                format!("send {z}@opl-flatten | recv {flat}"),
+                format!("destroy -r {z}"),
+                format!("rename {flat} {z}"),
+                format!("destroy {z}@opl-flatten"),
+            ]
+        );
+        assert_eq!(zfs.zvol(&z).unwrap().origin, None);
+
+        // 원본을 지운 뒤 이름을 바꾸기 전에 끊겼으면 이름만 바꾼다.
+        let other = Uuid::now_v7();
+        let (oz, oflat) = (zvol(other), format!("{}-flat", zvol(other)));
+        storage.link_clone(&p, base, RAW, other).await.unwrap();
+        zfs.fail_on(format!("rename {oflat} {oz}"));
+        storage.flatten_volume(&p, other, RAW).await.unwrap_err();
+        assert_eq!(zfs.names().iter().filter(|n| **n == oz).count(), 0);
+        zfs.fail.lock().unwrap().clear();
+        zfs.taken();
+        storage.flatten_volume(&p, other, RAW).await.unwrap();
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("rename {oflat} {oz}"),
+                format!("destroy {oz}@opl-flatten")
+            ]
+        );
+        assert!(zfs.zvol(&oz).unwrap().snapshots.is_empty());
+    }
+
+    /// 보낸 시점 뒤에 clone이 쓰였으면(그사이 VM이 켜졌다) 원본을 지우지 않고 받은 것을 지운 뒤 실패한다.
+    #[tokio::test]
+    async fn flatten_keeps_a_clone_written_while_sending() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let p = pool();
+        let (base, id) = (Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        storage.link_clone(&p, base, RAW, id).await.unwrap();
+        let (z, flat) = (zvol(id), format!("{}-flat", zvol(id)));
+        zfs.written.lock().unwrap().insert(z.clone(), 4096);
+        zfs.taken();
+        let err = storage.flatten_volume(&p, id, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::Zfs(ref m) if m.contains("was written while it was being flattened")),
+            "{err:?}"
+        );
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("snapshot {z} @opl-flatten"),
+                format!("send {z}@opl-flatten | recv {flat}"),
+                format!("destroy -r {flat}"),
+            ]
+        );
+        assert!(zfs.zvol(&z).unwrap().origin.is_some());
+        assert!(!zfs.names().contains(&flat));
+    }
+
+    /// 지우기는 끊긴 평탄화가 남긴 `-flat`도 지운다: 원본과 함께 있어도, 원본을 지운 뒤 끊겨 `-flat`만 있어도.
+    #[tokio::test]
+    async fn delete_removes_a_flattened_copy_left_behind() {
+        let (zfs, storage) = setup("/nonexistent/qemu-img");
+        let p = pool();
+        let (base, a, b) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, MIB, RAW).await.unwrap();
+        storage.link_clone(&p, base, RAW, a).await.unwrap();
+        storage.link_clone(&p, base, RAW, b).await.unwrap();
+        // a: 원본을 지우다 실패해 둘 다 남음
+        let (az, aflat) = (zvol(a), format!("{}-flat", zvol(a)));
+        zfs.fail_on(format!("destroy -r {az}"));
+        storage.flatten_volume(&p, a, RAW).await.unwrap_err();
+        zfs.fail.lock().unwrap().clear();
+        // b: 원본을 지운 뒤 이름을 바꾸다 실패해 `-flat`만 남음
+        let (bz, bflat) = (zvol(b), format!("{}-flat", zvol(b)));
+        zfs.fail_on(format!("rename {bflat} {bz}"));
+        storage.flatten_volume(&p, b, RAW).await.unwrap_err();
+        zfs.fail.lock().unwrap().clear();
+        assert!(zfs.names().contains(&aflat) && zfs.names().contains(&bflat));
+        zfs.taken();
+
+        storage.delete_volume(&p, a, RAW).await.unwrap();
+        storage.delete_volume(&p, b, RAW).await.unwrap();
+        assert_eq!(
+            zfs.taken(),
+            [
+                format!("destroy -r {az}"),
+                format!("destroy -r {aflat}"),
+                format!("destroy -r {bflat}"),
+            ]
+        );
+        let names = zfs.names();
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.starts_with(&az) || n.starts_with(&bz)),
+            "{names:?}"
+        );
+        not_found(storage.delete_volume(&p, b, RAW).await.unwrap_err(), b);
+    }
+
     #[tokio::test]
     async fn delete_destroys_zvol_with_its_snapshots() {
         let (zfs, storage) = setup("/nonexistent/qemu-img");
@@ -1903,6 +2575,37 @@ mod tests {
             matches!(err, DriverError::Zfs(ref m) if m == "/bin/sh: cannot open 'x': dataset does not exist"),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn parses_origin_and_builds_send_recv_args() {
+        assert_eq!(parse_origin(b"-\n").unwrap(), None);
+        assert_eq!(
+            parse_origin(b"tank/opl/opl-a@opl-base\n").unwrap(),
+            Some("tank/opl/opl-a@opl-base".into())
+        );
+        parse_origin(b"").unwrap_err();
+        assert_eq!(parse_written(b"0\n").unwrap(), 0);
+        assert_eq!(parse_written(b"65536\n").unwrap(), 65536);
+        parse_written(b"").unwrap_err();
+        let (send, recv) = send_recv_args("t/o-a@s1", None, "t/o-a-flat");
+        assert_eq!(send, ["send", "t/o-a@s1"]);
+        assert_eq!(
+            recv,
+            [
+                "recv",
+                "-o",
+                "volmode=dev",
+                "-o",
+                "snapdev=visible",
+                "-o",
+                "com.sun:auto-snapshot=false",
+                "t/o-a-flat"
+            ]
+        );
+        let (send, recv) = send_recv_args("t/o-a@opl-flatten", Some("@s1"), "t/o-a-flat");
+        assert_eq!(send, ["send", "-I", "@s1", "t/o-a@opl-flatten"]);
+        assert_eq!(recv, ["recv", "t/o-a-flat"]);
     }
 
     #[test]

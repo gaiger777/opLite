@@ -34,7 +34,7 @@ use opl_types::node::{FEATURES, NodeSpec, NodeStatus, PoolState};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::storage::{
-    SourceFormat, StoragePool, StoragePoolSpec, pool_kind_supports_snapshots,
+    PoolBackend, SourceFormat, StoragePool, StoragePoolSpec, pool_kind_supports_snapshots,
 };
 use opl_types::version::BUILD;
 use opl_types::vm::Arch;
@@ -1181,6 +1181,47 @@ impl Storage for FakeStorage {
         self.copy_formats.lock().unwrap().push((dst_id, dst_format));
         let size = self.sizes.lock().unwrap().get(&src_id).copied();
         self.set_size(dst_id, size.ok_or(DriverError::VolumeNotFound(src_id))?);
+        Ok(())
+    }
+    /// 호출을 `link`(복제 볼륨)로 적고 기반의 크기로 복제 파일을 둔다. 형식은 파일 풀이면 qcow2, 아니면 raw다.
+    async fn link_clone(
+        &self,
+        pool: &StoragePool,
+        base_id: Uuid,
+        _: ImageFormat,
+        clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        self.record("link", clone_id).await;
+        let size = self.sizes.lock().unwrap().get(&base_id).copied();
+        let size = size.ok_or(DriverError::VolumeNotFound(base_id))?;
+        if !self.files.lock().unwrap().insert(clone_id) {
+            return Err(DriverError::VolumeExists(clone_id));
+        }
+        self.set_size(clone_id, size);
+        let format = match pool.spec.backend {
+            PoolBackend::Dir { .. } | PoolBackend::Nfs { .. } => ImageFormat::Qcow2,
+            _ => ImageFormat::Raw,
+        };
+        Ok((PathBuf::new(), format))
+    }
+    /// 호출을 `release_base`로 적는다.
+    async fn release_base(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.record("release_base", id).await;
+        Ok(())
+    }
+    /// 호출을 `flatten`으로 적는다.
+    async fn flatten_volume(
+        &self,
+        _: &StoragePool,
+        id: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.record("flatten", id).await;
         Ok(())
     }
 }

@@ -404,6 +404,47 @@ pub trait Storage: Send + Sync {
             "this storage cannot keep replica overlays".into(),
         ))
     }
+
+    /// 꺼진 기반 볼륨 `base_id`(템플릿 디스크, 형식 `base_format`)와 데이터를 함께 쓰는 연결 복제 `clone_id`를
+    /// 같은 풀에 만들고 그 위치와 형식을 돌려준다. 기반 스냅샷([`BASE_TAG`](opl_types::storage::BASE_TAG))이 필요한
+    /// 백엔드는 없을 때만 만든다(다시 해도 된다). 기반이 없으면 `VolumeNotFound`, 대상이 이미 있으면 `VolumeExists`.
+    /// 실패하면 만들다 만 복제를 남기지 않는다. 기본은 지원하지 않는다.
+    async fn link_clone(
+        &self,
+        _pool: &StoragePool,
+        _base_id: Uuid,
+        _base_format: ImageFormat,
+        _clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot make linked clones".into(),
+        ))
+    }
+
+    /// [`link_clone`](Self::link_clone)이 기반 볼륨에 만든 기반 스냅샷을 풀고 지운다(템플릿을 VM으로 되돌릴 때).
+    /// 연결 복제가 남아 있으면 실패하고, 기반 스냅샷이나 볼륨이 없으면 성공이다(다시 해도 된다). 기본은 할 일이
+    /// 없다(연결 복제를 만들지 못하는 저장소에는 기반 스냅샷도 없다).
+    async fn release_base(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    /// 연결 복제 볼륨의 기반과의 연결을 끊어 독립 볼륨으로 만든다(기반의 데이터를 복제 안으로 가져온다). 이미
+    /// 독립이면 성공이다(다시 해도 된다). 볼륨을 쓰는 QEMU가 없어야 한다. 기본은 지원하지 않는다.
+    async fn flatten_volume(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot flatten linked clones".into(),
+        ))
+    }
 }
 
 /// 풀의 볼륨 파일이 놓이는 디렉터리. `dir` 풀은 그 경로, `nfs` 풀은 이 노드의 마운트 지점
@@ -1476,6 +1517,81 @@ impl Storage for DirStorage {
         let path = self.existing_path(pool, id, format).await?;
         self.remove_backup_bitmaps(&path, format).await
     }
+
+    /// 기반 파일을 backing으로 둔 qcow2 겹층 `{clone_id}.qcow2`를 만든다. backing은 **상대 경로**(`{base_id}.{형식}`,
+    /// 겹층과 같은 디렉터리)로 적는다: NFS 풀의 마운트 지점이 노드마다 달라도, dir 풀의 경로를 옮겨도 열린다. 기반
+    /// 스냅샷은 필요 없다(템플릿은 켜지지 않으므로 기반 파일이 바뀌지 않는다).
+    async fn link_clone(
+        &self,
+        pool: &StoragePool,
+        base_id: Uuid,
+        base_format: ImageFormat,
+        clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        let base = self.existing_path(pool, base_id, base_format).await?;
+        let path = self.file_path(pool, clone_id, ImageFormat::Qcow2)?;
+        if self.exists(pool, &path).await? {
+            return Err(DriverError::VolumeExists(clone_id));
+        }
+        let backing = base
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| DriverError::InvalidSpec(format!("bad volume path {base:?}")))?;
+        let before = [
+            "create",
+            "-q",
+            "-f",
+            "qcow2",
+            "-b",
+            backing,
+            "-F",
+            fmt_name(base_format),
+        ];
+        self.write_new(pool, clone_id, &path, &before, &[]).await?;
+        Ok((path, ImageFormat::Qcow2))
+    }
+
+    /// 파일 풀에는 기반 스냅샷이 없다.
+    async fn release_base(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    /// `qemu-img rebase -b ""`(안전 모드): 기반에서 읽히는 클러스터를 겹층에 모두 쓴 뒤 마지막에 헤더의 backing을
+    /// 지운다. 중간에 끊겨도 옛 사슬이 그대로이므로 다시 하면 된다. raw 볼륨이거나 backing이 없으면 할 일이 없다.
+    /// 내부 스냅샷이 있으면 거절한다: `rebase`는 지금 내용만 채우므로 스냅샷의 비어 있는 클러스터가 기반 대신 0으로
+    /// 읽히게 된다.
+    async fn flatten_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let path = self.existing_path(pool, id, format).await?;
+        if format == ImageFormat::Raw {
+            return Ok(());
+        }
+        let info = self.info_json(&path, format).await?;
+        if info.get("backing-filename").is_none() {
+            return Ok(());
+        }
+        if info
+            .get("snapshots")
+            .and_then(Value::as_array)
+            .is_some_and(|s| !s.is_empty())
+        {
+            return Err(DriverError::InvalidSpec(format!(
+                "volume {id} has snapshots; delete them before flattening it"
+            )));
+        }
+        self.qemu_img(&["rebase", "-q", "-f", "qcow2", "-b", "", path_str(&path)?])
+            .await?;
+        Ok(())
+    }
 }
 
 /// [`Storage::create_backup_target`]: `qemu-img create -f qcow2`. 파일시스템 호출은 하지 않는다.
@@ -2095,6 +2211,65 @@ pub(crate) mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    /// 연결 복제는 기반 파일 이름(상대 경로)을 backing으로 둔 qcow2 겹층이다. 기반이 없으면 `VolumeNotFound`,
+    /// 복제가 이미 있으면 `VolumeExists`이고 아무것도 쓰지 않는다.
+    #[tokio::test]
+    async fn linked_clones_name_the_base_file_relatively() {
+        let tools = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path().to_str().unwrap());
+        let (base, clone) = (Uuid::now_v7(), Uuid::now_v7());
+        let args = tools.path().join("args");
+        let body = format!("printf '%s\\n' \"$@\" > {args:?}; echo clone > \"$last\"");
+        let storage = dir_storage(fake_tool(tools.path(), &body));
+
+        let err = storage
+            .link_clone(&p, base, ImageFormat::Raw, clone)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeNotFound(v) if v == base),
+            "{err:?}"
+        );
+        std::fs::write(volume_path(&p, base, ImageFormat::Raw), b"base").unwrap();
+
+        let (path, format) = storage
+            .link_clone(&p, base, ImageFormat::Raw, clone)
+            .await
+            .unwrap();
+        assert_eq!(path, volume_path(&p, clone, ImageFormat::Qcow2));
+        assert_eq!(format, ImageFormat::Qcow2);
+        assert_eq!(std::fs::read(&path).unwrap(), b"clone\n");
+        let args = std::fs::read_to_string(&args).unwrap();
+        let args: Vec<&str> = args.lines().collect();
+        let backing = format!("{base}.raw");
+        assert_eq!(
+            args[..8],
+            ["create", "-q", "-f", "qcow2", "-b", &backing, "-F", "raw"]
+        );
+        // 임시 파일에 만든 뒤 하드 링크한다.
+        assert!(args[8].ends_with(".part"), "{args:?}");
+
+        let err = storage
+            .link_clone(&p, base, ImageFormat::Raw, clone)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeExists(v) if v == clone),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"clone\n");
+        // 파일 풀에는 기반 스냅샷이 없다. raw 볼륨은 평탄화할 것이 없다.
+        storage
+            .release_base(&p, base, ImageFormat::Raw)
+            .await
+            .unwrap();
+        storage
+            .flatten_volume(&p, base, ImageFormat::Raw)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

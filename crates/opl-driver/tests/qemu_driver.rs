@@ -1109,3 +1109,80 @@ async fn cdrom_media_change_and_the_cloud_init_seed() {
     ));
     assert!(!file.exists());
 }
+
+/// 연결 복제 디스크(기반 raw를 상대 경로 backing으로 둔 qcow2 겹층)로 켠다: QEMU가 헤더의 backing을 열고(HMP `info
+/// block`의 `Backing file`, 기반 파일에 쓰기 잠금을 못 잡음) 펌웨어가 디스크를 읽는다(`rd_bytes > 0`). 끈 뒤 기반
+/// 파일은 바이트까지 그대로다.
+#[tokio::test]
+async fn a_linked_clone_disk_opens_its_backing_file() {
+    let tmp = short_tempdir();
+    let hv = QemuHypervisor::new(config(tmp.path())).await.unwrap();
+    let pools = tmp.path().join("pool");
+    std::fs::create_dir(&pools).unwrap();
+    let pool = opl_types::resource::Resource::new(
+        "local",
+        opl_types::storage::StoragePoolSpec {
+            backend: opl_types::storage::PoolBackend::Dir { path: pools },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+        },
+    );
+    let storage = DirStorage::new("qemu-img", tmp.path().join("mnt"));
+    let (base, clone) = (Uuid::now_v7(), Uuid::now_v7());
+    let base_path = storage
+        .create_volume(&pool, base, 64 << 20, ImageFormat::Raw)
+        .await
+        .unwrap();
+    let write = std::process::Command::new("qemu-io")
+        .args(["-f", "raw", "-c", "write -P 0x5a 0 1M"])
+        .arg(&base_path)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(write.success());
+    let base_bytes = std::fs::read(&base_path).unwrap();
+    let (path, format) = storage
+        .link_clone(&pool, base, ImageFormat::Raw, clone)
+        .await
+        .unwrap();
+
+    let mut vm = spec();
+    vm.disks.push(RuntimeDisk {
+        path,
+        kind: DiskKind::File,
+        rbd: None,
+        format,
+        bus: DiskBus::VirtioBlk,
+        boot_order: Some(1),
+    });
+    hv.start(&vm, None).await.unwrap();
+    let block = hv.human_monitor_command(vm.id, "info block").await.unwrap();
+    assert!(
+        block.contains("Backing file") && block.contains(&format!("{base}.raw")),
+        "{block}"
+    );
+    // QEMU가 기반을 읽기 전용으로 열어 쥐고 있으므로 다른 프로그램이 쓸 수 없다.
+    let locked = std::process::Command::new("qemu-io")
+        .args(["-f", "raw", "-c", "write -P 0 0 512"])
+        .arg(&base_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!locked.success(), "the base is not locked by QEMU");
+    let read = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let stats = hv.disk_stats(vm.id).await.unwrap();
+            if stats.rd_bytes > 0 {
+                return stats.rd_bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("the firmware did not read the disk within 60s");
+    assert!(read > 0);
+    hv.stop(vm.id, StopMode::Force).await.unwrap();
+    assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+}

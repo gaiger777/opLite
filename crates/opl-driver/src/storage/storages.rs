@@ -552,6 +552,37 @@ impl Storage for Storages {
         }
         committed
     }
+
+    /// 기반과 복제는 늘 같은 풀이므로 그 풀의 저장소가 만든다.
+    async fn link_clone(
+        &self,
+        pool: &StoragePool,
+        base_id: Uuid,
+        base_format: ImageFormat,
+        clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        self.backend(pool)?
+            .link_clone(pool, base_id, base_format, clone_id)
+            .await
+    }
+
+    async fn release_base(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?.release_base(pool, id, format).await
+    }
+
+    async fn flatten_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        self.backend(pool)?.flatten_volume(pool, id, format).await
+    }
 }
 
 impl Storages {
@@ -927,6 +958,32 @@ mod tests {
         ) -> Result<(), DriverError> {
             self.call("copy_volume")
         }
+        async fn link_clone(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+            clone_id: Uuid,
+        ) -> Result<(PathBuf, ImageFormat), DriverError> {
+            self.call("link_clone")?;
+            Ok((self.dir.join(clone_id.to_string()), ImageFormat::Raw))
+        }
+        async fn release_base(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+        ) -> Result<(), DriverError> {
+            self.call("release_base")
+        }
+        async fn flatten_volume(
+            &self,
+            _: &StoragePool,
+            _: Uuid,
+            _: ImageFormat,
+        ) -> Result<(), DriverError> {
+            self.call("flatten_volume")
+        }
     }
 
     fn pool(backend: PoolBackend) -> StoragePool {
@@ -1063,6 +1120,12 @@ mod tests {
                 .copy_volume(&p, id, f, None, false, &p, Uuid::now_v7(), f)
                 .await
                 .unwrap();
+            storages
+                .link_clone(&p, id, f, Uuid::now_v7())
+                .await
+                .unwrap();
+            storages.release_base(&p, id, f).await.unwrap();
+            storages.flatten_volume(&p, id, f).await.unwrap();
             let methods = [
                 "create_volume",
                 "import_volume",
@@ -1088,6 +1151,9 @@ mod tests {
                 "volume_source",
                 "release_source",
                 "copy_volume",
+                "link_clone",
+                "release_base",
+                "flatten_volume",
             ];
             let want: Vec<String> = methods.iter().map(|m| format!("{name}.{m}")).collect();
             assert_eq!(taken(&log), want);

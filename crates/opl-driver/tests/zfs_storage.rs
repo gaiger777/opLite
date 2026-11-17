@@ -451,3 +451,90 @@ async fn copies_snapshots_within_and_across_backends() {
     }
     storages.delete_volume(&local, out, qcow2).await.unwrap();
 }
+
+/// 연결 복제: 기반 스냅샷 `@opl-base`의 clone이다. 복제는 기반의 내용을 읽고, 복제에 써도 기반은 그대로다. clone이
+/// 있는 동안 기반 zvol도 기반 스냅샷도 지워지지 않는다. 평탄화(send/recv)한 복제는 clone이 아니고 내용과 스냅샷이
+/// 그대로이며 남은 것(`-flat`, `@opl-flatten`)이 없다. 그 뒤 기반 스냅샷을 풀고 기반을 지울 수 있다.
+#[tokio::test]
+async fn linked_clones_are_clones_of_the_base_snapshot() {
+    let pool = zfs_pool();
+    let storage = storage();
+    let (base, a, b) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let base_path = storage
+        .create_volume(&pool, base, 64 * MIB, RAW)
+        .await
+        .unwrap();
+    assert!(qemu_io(&base_path, RAW, "write -P 0x5a 0 1M"));
+
+    for clone in [a, b] {
+        let (path, format) = storage.link_clone(&pool, base, RAW, clone).await.unwrap();
+        assert_eq!((path.clone(), format), (volume_device(clone), RAW));
+        assert!(path.exists(), "{}", path.display());
+    }
+    assert_eq!(
+        zfs_names(&format!("opl-{base}")),
+        vec![format!("opl-{base}"), format!("opl-{base}@opl-base")]
+    );
+    let path = volume_device(a);
+    assert!(qemu_io(&path, RAW, "read -P 0x5a 0 1M"));
+    assert!(qemu_io(&path, RAW, "write -P 0x77 1M 1M"));
+    assert!(qemu_io(&base_path, RAW, "read -P 0 1M 1M"));
+    assert!(qemu_io(&volume_device(b), RAW, "read -P 0x5a 0 1M"));
+    let err = storage.link_clone(&pool, base, RAW, a).await.unwrap_err();
+    assert!(
+        matches!(err, DriverError::VolumeExists(v) if v == a),
+        "{err:?}"
+    );
+
+    // 백엔드 막이
+    let err = storage.delete_volume(&pool, base, RAW).await.unwrap_err();
+    assert!(matches!(err, DriverError::Zfs(_)), "{err:?}");
+    let err = storage.release_base(&pool, base, RAW).await.unwrap_err();
+    assert!(matches!(err, DriverError::Zfs(_)), "{err:?}");
+    assert!(base_path.exists());
+
+    // 복제의 스냅샷은 평탄화 뒤에도 남는다.
+    storage.snapshot_create(&pool, a, RAW, "s1").await.unwrap();
+    assert!(qemu_io(&path, RAW, "write -P 0x99 2M 1M"));
+    storage.flatten_volume(&pool, a, RAW).await.unwrap();
+    assert_eq!(
+        zfs_names(&format!("opl-{a}")),
+        vec![format!("opl-{a}"), format!("opl-{a}@s1")]
+    );
+    let origin = Command::new("zfs")
+        .args(["get", "-H", "-o", "value", "origin"])
+        .arg(format!("{}/opl-{a}", dataset()))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&origin.stdout).trim(), "-");
+    assert!(path.exists(), "{}", path.display());
+    for (cmd, ok) in [
+        ("read -P 0x5a 0 1M", true),
+        ("read -P 0x77 1M 1M", true),
+        ("read -P 0x99 2M 1M", true),
+    ] {
+        assert_eq!(qemu_io(&path, RAW, cmd), ok, "{cmd}");
+    }
+    assert_eq!(
+        storage
+            .volume_info(&pool, a, RAW)
+            .await
+            .unwrap()
+            .virtual_bytes,
+        64 * MIB
+    );
+    storage.flatten_volume(&pool, a, RAW).await.unwrap();
+
+    storage.delete_volume(&pool, b, RAW).await.unwrap();
+    storage.release_base(&pool, base, RAW).await.unwrap();
+    storage.release_base(&pool, base, RAW).await.unwrap();
+    storage.delete_volume(&pool, base, RAW).await.unwrap();
+    assert!(zfs_names(&format!("opl-{base}")).is_empty());
+    // 평탄화한 복제는 기반 없이 읽히고 스냅샷으로 되돌릴 수 있다.
+    storage.snapshot_revert(&pool, a, RAW, "s1").await.unwrap();
+    assert!(qemu_io(&path, RAW, "read -P 0x5a 0 1M"));
+    assert!(qemu_io(&path, RAW, "read -P 0x77 1M 1M"));
+    assert!(qemu_io(&path, RAW, "read -P 0 2M 1M"));
+    storage.delete_volume(&pool, a, RAW).await.unwrap();
+    assert!(zfs_names(&format!("opl-{a}")).is_empty());
+}

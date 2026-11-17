@@ -135,6 +135,71 @@ impl BlockTool {
         Err(self.failure(program, status, &text))
     }
 
+    /// 대상 `targets`를 바꾸는 파이프라인 `first | second`(예: `zfs send … | zfs recv …`)를 돌린다. 시간·취소·
+    /// 출력은 [`run_change`](Self::run_change)와 같다. 둘 중 하나라도 실패하면 오류다: 앞 명령이 스스로 실패했으면
+    /// 그 오류, 아니면(뒤 명령이 먼저 끝나 앞 명령이 SIGPIPE로 죽었을 수 있다) 뒤 명령의 오류다.
+    pub(super) async fn run_pipe_change(
+        &'static self,
+        first: (&str, &[&str]),
+        second: (&str, &[&str]),
+        targets: &[&str],
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        let changing = Changing::begin(self, targets)?;
+        let (mut first_err, mut second_err) = (stderr_file()?, stderr_file()?);
+        let mut head = self
+            .command(first.0, first.1)
+            .stdout(Stdio::piped())
+            .stderr(first_err.try_clone()?)
+            .kill_on_drop(false)
+            .spawn()?;
+        let pipe: Stdio = head
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout pipe"))?
+            .try_into()?;
+        let mut tail = match self
+            .command(second.0, second.1)
+            .stdin(pipe)
+            .stdout(Stdio::null())
+            .stderr(second_err.try_clone()?)
+            .kill_on_drop(false)
+            .spawn()
+        {
+            Ok(tail) => tail,
+            Err(e) => {
+                // 앞 명령은 읽는 쪽이 없으므로 곧 SIGPIPE로 끝난다. 거두기만 한다.
+                tokio::spawn(async move { head.wait().await });
+                return Err(e.into());
+            }
+        };
+        let waited = tokio::spawn(async move {
+            let statuses = (head.wait().await, tail.wait().await);
+            drop(changing);
+            statuses
+        });
+        let (head, tail) = tokio::time::timeout(timeout, waited)
+            .await
+            .map_err(|_| DriverError::Timeout(self.timeout))?
+            .map_err(|e| DriverError::Io(std::io::Error::other(e)))?;
+        let (head, tail) = (head?, tail?);
+        let read = |file: &mut std::fs::File| -> std::io::Result<Vec<u8>> {
+            let mut text = Vec::new();
+            file.seek(SeekFrom::Start(0))?;
+            file.read_to_end(&mut text)?;
+            Ok(text)
+        };
+        // SIGPIPE로 끝나면 종료 코드가 없다. 셸을 거치면 셸이 128+13=141로 바꿔 알린다(Linux dash).
+        let head_piped = matches!(head.code(), None | Some(141));
+        if !head.success() && (!head_piped || tail.success()) {
+            return Err(self.failure(first.0, head, &read(&mut first_err)?));
+        }
+        if !tail.success() {
+            return Err(self.failure(second.0, tail, &read(&mut second_err)?));
+        }
+        Ok(())
+    }
+
     /// 대상 `target`을 바꾸는 명령이 아직 돌고 있는지(시간을 넘겨 뒤에서 도는 중)
     pub(super) fn changing(&self, target: &str) -> bool {
         self.changing.lock().unwrap().contains(target)
@@ -342,5 +407,75 @@ mod tests {
             .await
             .unwrap();
         assert!(second.exists());
+    }
+
+    /// 파이프라인은 앞 명령의 출력을 뒤 명령에 넘긴다. 앞 명령이 스스로 실패하면 그 오류, 뒤 명령이 실패하면
+    /// (앞 명령이 SIGPIPE로 죽어도) 뒤 명령의 오류다. 도는 동안 대상은 바뀌는 중이다.
+    #[tokio::test]
+    async fn pipelines_pass_output_and_report_the_failing_side() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let long = Duration::from_secs(10);
+        let sink = format!("cat > {}", out.display());
+        let target = format!("tank/{}", Uuid::now_v7());
+        TOOL.run_pipe_change(
+            ("/bin/sh", &["-c", "echo $OPL_BLOCKCMD_TEST; echo data"]),
+            ("/bin/sh", &["-c", &sink]),
+            &[&target],
+            long,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "set\ndata\n");
+        assert!(!TOOL.changing(&target));
+
+        let err = TOOL
+            .run_pipe_change(
+                ("/bin/sh", &["-c", "echo 'no snapshot' >&2; exit 1"]),
+                (
+                    "/bin/sh",
+                    &["-c", "cat >/dev/null; echo 'short stream' >&2; exit 1"],
+                ),
+                &[&target],
+                long,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m == "/bin/sh: no snapshot"),
+            "{err:?}"
+        );
+        // 뒤 명령이 읽지 않고 끝나면 앞 명령은 SIGPIPE로 죽는다.
+        let err = TOOL
+            .run_pipe_change(
+                ("/bin/sh", &["-c", "yes"]),
+                ("/bin/sh", &["-c", "echo 'no space' >&2; exit 1"]),
+                &[&target],
+                long,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::Lvm(ref m) if m == "/bin/sh: no space"),
+            "{err:?}"
+        );
+
+        // 시간을 넘기면 일시 오류이고 둘 다 뒤에서 끝난다. 그동안 대상은 바뀌는 중이다.
+        let done = tmp.path().join("done");
+        let slow = format!("cat >/dev/null; sleep 0.3; touch {}", done.display());
+        let err = TOOL
+            .run_pipe_change(
+                ("/bin/sh", &["-c", "echo x"]),
+                ("/bin/sh", &["-c", &slow]),
+                &[&target],
+                Duration::from_millis(50),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::Timeout(_)), "{err:?}");
+        assert!(TOOL.changing(&target));
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(done.exists());
+        assert!(!TOOL.changing(&target));
     }
 }

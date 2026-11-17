@@ -1041,6 +1041,75 @@ impl Storage for LvmThinStorage {
         guard.release().await;
         copied
     }
+
+    /// 기반 볼륨 LV의 thin 스냅샷을 복제 볼륨 LV `opl-{clone}`로 만들어(`lvcreate -s`) 활성화하고 활성화 건너뛰기
+    /// 표시를 지운다(되돌리기와 같다). thin 스냅샷은 원본과 블록을 함께 쓰지만 원본과 독립이므로 기반 스냅샷이
+    /// 필요 없다. 활성화하지 못하면 만든 LV를 지운다. 단계가 시간을 넘겼으면 다시 보고 끝났으면 이어서 한다.
+    async fn link_clone(
+        &self,
+        pool: &StoragePool,
+        base_id: Uuid,
+        base_format: ImageFormat,
+        clone_id: Uuid,
+    ) -> Result<(PathBuf, ImageFormat), DriverError> {
+        let (vg, _) = Self::target(pool, base_format)?;
+        let lvs = self.volume_lvs(vg, base_id).await?;
+        if !lvs.iter().any(|lv| lv.name == volume_lv(base_id)) {
+            return Err(DriverError::VolumeNotFound(base_id));
+        }
+        let clone = volume_lv(clone_id);
+        if lvs.iter().any(|lv| lv.name == clone) {
+            return Err(DriverError::VolumeExists(clone_id));
+        }
+        if let Err(e) = self.ops.snapshot(vg, &volume_lv(base_id), &clone).await
+            && !self.done_after(&e, vg, &clone, false).await
+        {
+            return Err(e);
+        }
+        let ready = async {
+            if let Err(e) = self.ops.set_active(vg, &clone, true).await
+                && !self.done_after(&e, vg, &clone, true).await
+            {
+                return Err(e);
+            }
+            device_node(&self.dev, vg, &clone)
+        };
+        let path = match ready.await {
+            Ok(path) => path,
+            Err(e) => {
+                if let Err(del) = self.ops.remove(vg, &clone).await {
+                    tracing::warn!(volume = %clone_id, error = %del, "cannot remove partial linked clone");
+                }
+                return Err(e);
+            }
+        };
+        // 지우지 못해도 VM을 시작할 때 표시와 상관없이 활성화한다(`-K`).
+        if let Err(e) = self.ops.clear_skip(vg, &clone).await {
+            tracing::warn!(volume = %clone_id, error = %e, "cannot clear activation skip of linked clone");
+        }
+        Ok((path, ImageFormat::Raw))
+    }
+
+    /// thin 스냅샷에는 기반 스냅샷이 없다.
+    async fn release_base(
+        &self,
+        _: &StoragePool,
+        _: Uuid,
+        _: ImageFormat,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    /// thin 스냅샷은 원본과 독립이므로 할 일이 없다. 볼륨이 있는지만 본다.
+    async fn flatten_volume(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        format: ImageFormat,
+    ) -> Result<(), DriverError> {
+        let (vg, _) = Self::target(pool, format)?;
+        self.existing(vg, id).await.map(drop)
+    }
 }
 
 /// 공유 LVM 풀은 raw 볼륨만 담는다.
@@ -2085,6 +2154,119 @@ mod tests {
                 .unwrap_err(),
             "raw volumes",
         );
+        assert_eq!(lvm.taken(), Vec::<String>::new());
+    }
+
+    /// 연결 복제는 기반 LV의 thin 스냅샷을 볼륨 LV로 만들어 켜고 활성화 건너뛰기 표시를 지운다. 기반 스냅샷도
+    /// 평탄화도 할 일이 없다.
+    #[tokio::test]
+    async fn linked_clones_are_activated_thin_snapshots() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let (p, base, clone) = (lvm_pool(), Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, 1 << 20, RAW).await.unwrap();
+        lvm.taken();
+
+        let (path, format) = storage.link_clone(&p, base, RAW, clone).await.unwrap();
+        assert_eq!((path, format), (lvm.node(&format!("opl-{clone}")), RAW));
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("snapshot vg0/opl-{base} opl-{clone}"),
+                format!("activate vg0/opl-{clone}"),
+                format!("unskip vg0/opl-{clone}"),
+            ]
+        );
+        let lv = lvm.lv(&format!("opl-{clone}")).unwrap();
+        assert!(lv.active && !lv.skip, "{lv:?}");
+
+        // 다시 만들면 VolumeExists, 기반이 없으면 VolumeNotFound, raw가 아니면 InvalidSpec.
+        let err = storage.link_clone(&p, base, RAW, clone).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeExists(v) if v == clone),
+            "{err:?}"
+        );
+        let missing = Uuid::now_v7();
+        let err = storage
+            .link_clone(&p, missing, RAW, Uuid::now_v7())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeNotFound(v) if v == missing),
+            "{err:?}"
+        );
+        invalid(
+            storage
+                .link_clone(&p, base, ImageFormat::Qcow2, Uuid::now_v7())
+                .await
+                .unwrap_err(),
+            "raw volumes",
+        );
+        assert_eq!(lvm.taken(), Vec::<String>::new());
+
+        storage.release_base(&p, base, RAW).await.unwrap();
+        storage.flatten_volume(&p, clone, RAW).await.unwrap();
+        assert_eq!(lvm.taken(), Vec::<String>::new());
+        let err = storage.flatten_volume(&p, missing, RAW).await.unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeNotFound(v) if v == missing),
+            "{err:?}"
+        );
+
+        // 기반을 지워도 복제는 남는다(thin 스냅샷은 독립이다).
+        storage.delete_volume(&p, base, RAW).await.unwrap();
+        assert!(lvm.lv(&format!("opl-{clone}")).is_some());
+    }
+
+    /// 켜지 못한 복제 LV는 지운다.
+    #[tokio::test]
+    async fn linked_clone_that_cannot_be_activated_is_removed() {
+        let (lvm, storage) = setup("/nonexistent/qemu-img");
+        let (p, base, clone) = (lvm_pool(), Uuid::now_v7(), Uuid::now_v7());
+        storage.create_volume(&p, base, 1 << 20, RAW).await.unwrap();
+        lvm.fail_on(format!("activate vg0/opl-{clone}"));
+        lvm.taken();
+        storage.link_clone(&p, base, RAW, clone).await.unwrap_err();
+        assert_eq!(
+            lvm.taken(),
+            [
+                format!("snapshot vg0/opl-{base} opl-{clone}"),
+                format!("activate vg0/opl-{clone}"),
+                format!("remove vg0/opl-{clone}"),
+            ]
+        );
+        assert_eq!(lvm.names(), [format!("opl-{base}")]);
+    }
+
+    /// 공유 LVM 풀은 두꺼운 LV라 연결 복제를 만들지 못한다. 기반 스냅샷도 없다.
+    #[tokio::test]
+    async fn shared_lvm_pools_make_no_linked_clones() {
+        let lvm = Arc::new(FakeLvm::default());
+        let storage = LvmSharedStorage::new("/nonexistent/qemu-img", lvm.clone());
+        let p = Resource::new(
+            "san",
+            StoragePoolSpec {
+                backend: PoolBackend::LvmShared {
+                    vg: "vg0".into(),
+                    iscsi: None,
+                },
+                nodes: vec![],
+                shared: true,
+                backups: false,
+            },
+        );
+        let id = Uuid::now_v7();
+        invalid(
+            storage
+                .link_clone(&p, id, RAW, Uuid::now_v7())
+                .await
+                .unwrap_err(),
+            "cannot make linked clones",
+        );
+        invalid(
+            storage.flatten_volume(&p, id, RAW).await.unwrap_err(),
+            "cannot flatten",
+        );
+        storage.release_base(&p, id, RAW).await.unwrap();
         assert_eq!(lvm.taken(), Vec::<String>::new());
     }
 

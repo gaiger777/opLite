@@ -544,3 +544,66 @@ async fn restricted_user_in_a_namespace_with_its_conf() {
         );
     }
 }
+
+/// 연결 복제: 보호한 기반 스냅샷 `@opl-base`의 clone이다. 복제는 기반의 내용을 읽고, 복제에 써도 기반은 그대로다.
+/// clone이 있는 동안 기반 이미지도 기반 스냅샷도 지워지지 않는다(보호를 풀지 못한다). 평탄화(`rbd flatten`)하거나
+/// clone을 지우면 기반 스냅샷을 풀고 기반을 지울 수 있고, 평탄화한 복제는 그대로 읽힌다.
+#[tokio::test]
+async fn linked_clones_are_clones_of_the_protected_base_snapshot() {
+    let pool = rbd_pool();
+    let storage = storage();
+    let (base, a, b) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    storage
+        .create_volume(&pool, base, 64 * MIB, RAW)
+        .await
+        .unwrap();
+    assert!(qemu_io_rbd(base, None, "write -P 0x5a 0 1M"));
+
+    for clone in [a, b] {
+        let (path, format) = storage.link_clone(&pool, base, RAW, clone).await.unwrap();
+        assert_eq!((path.as_path(), format), (Path::new(""), RAW));
+    }
+    assert_eq!(
+        rbd_names(&image(base)),
+        vec![image(base), format!("{}@opl-base", image(base))]
+    );
+    assert!(qemu_io_rbd(a, None, "read -P 0x5a 0 1M"));
+    assert!(qemu_io_rbd(a, None, "write -P 0x77 0 1M"));
+    assert!(qemu_io_rbd(base, None, "read -P 0x5a 0 1M"));
+    assert!(qemu_io_rbd(b, None, "read -P 0x5a 0 1M"));
+    let err = storage.link_clone(&pool, base, RAW, a).await.unwrap_err();
+    assert!(
+        matches!(err, DriverError::VolumeExists(v) if v == a),
+        "{err:?}"
+    );
+
+    // 백엔드 막이
+    let err = storage.delete_volume(&pool, base, RAW).await.unwrap_err();
+    assert!(matches!(err, DriverError::Rbd(_)), "{err:?}");
+    let err = storage.release_base(&pool, base, RAW).await.unwrap_err();
+    assert!(matches!(err, DriverError::Rbd(_)), "{err:?}");
+    assert!(rbd_names(&image(base)).contains(&image(base)));
+
+    storage.flatten_volume(&pool, a, RAW).await.unwrap();
+    storage.flatten_volume(&pool, a, RAW).await.unwrap();
+    storage.delete_volume(&pool, b, RAW).await.unwrap();
+    storage.release_base(&pool, base, RAW).await.unwrap();
+    storage.release_base(&pool, base, RAW).await.unwrap();
+    assert_eq!(rbd_names(&image(base)), vec![image(base)]);
+    storage.delete_volume(&pool, base, RAW).await.unwrap();
+    assert!(qemu_io_rbd(a, None, "read -P 0x77 0 1M"));
+    assert!(qemu_io_rbd(a, None, "read -P 0 1M 1M"));
+    storage.delete_volume(&pool, a, RAW).await.unwrap();
+    assert!(rbd_names(&image(a)).is_empty());
+
+    // clone이 없으면 기반 이미지의 지우기가 기반 스냅샷의 보호를 풀고 지운다.
+    let (base, c) = (Uuid::now_v7(), Uuid::now_v7());
+    storage
+        .create_volume(&pool, base, 16 * MIB, RAW)
+        .await
+        .unwrap();
+    storage.link_clone(&pool, base, RAW, c).await.unwrap();
+    storage.delete_volume(&pool, c, RAW).await.unwrap();
+    storage.delete_volume(&pool, base, RAW).await.unwrap();
+    assert!(rbd_names(&image(base)).is_empty());
+}

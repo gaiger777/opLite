@@ -567,3 +567,30 @@ async fn copies_within_and_across_backends() {
     }
     storages.delete_volume(&local, out, qcow2).await.unwrap();
 }
+
+/// 두꺼운 LV는 데이터를 함께 쓸 수 없으므로 연결 복제를 만들지 못하고(아무것도 만들지 않는다) 평탄화할 것도 없다.
+/// 기반 스냅샷도 없으므로 풀기는 할 일이 없다.
+#[tokio::test]
+async fn shared_lvm_pools_make_no_linked_clones() {
+    let pool = shared_pool();
+    let storage = storage();
+    let (base, clone) = (Uuid::now_v7(), Uuid::now_v7());
+    storage
+        .create_volume(&pool, base, 16 * MIB, RAW)
+        .await
+        .unwrap();
+    let err = storage
+        .link_clone(&pool, base, RAW, clone)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DriverError::InvalidSpec(ref m) if m.contains("cannot make linked clones")),
+        "{err:?}"
+    );
+    assert!(lvs(&lv(clone)).is_empty(), "{}", state());
+    let err = storage.flatten_volume(&pool, base, RAW).await.unwrap_err();
+    assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+    storage.release_base(&pool, base, RAW).await.unwrap();
+    storage.delete_volume(&pool, base, RAW).await.unwrap();
+    assert!(lvs(&lv(base)).is_empty(), "{}", state());
+}

@@ -397,3 +397,50 @@ async fn copies_snapshots_within_and_across_backends() {
     }
     storages.delete_volume(&local, out, qcow2).await.unwrap();
 }
+
+/// 연결 복제: 기반 LV의 thin 스냅샷을 켠 볼륨 LV다. 복제는 기반의 내용을 읽고, 복제에 써도 기반은 그대로다. thin
+/// 스냅샷은 원본과 독립이므로 기반 스냅샷 풀기와 평탄화는 할 일이 없고, 기반을 지워도 복제는 남는다.
+#[tokio::test]
+async fn linked_clones_are_thin_snapshots_of_the_base() {
+    let pool = lvm_pool();
+    let storage = storage();
+    let (base, clone) = (Uuid::now_v7(), Uuid::now_v7());
+    let base_path = storage
+        .create_volume(&pool, base, 64 * MIB, RAW)
+        .await
+        .unwrap();
+    assert!(qemu_io(&base_path, RAW, "write -P 0x5a 0 1M"));
+
+    let (path, format) = storage.link_clone(&pool, base, RAW, clone).await.unwrap();
+    assert_eq!((path.clone(), format), (volume_device(clone), RAW));
+    assert!(path.exists(), "{}", path.display());
+    assert_eq!(
+        storage
+            .volume_info(&pool, clone, RAW)
+            .await
+            .unwrap()
+            .virtual_bytes,
+        64 * MIB
+    );
+    assert!(qemu_io(&path, RAW, "read -P 0x5a 0 1M"));
+    assert!(qemu_io(&path, RAW, "write -P 0x77 0 1M"));
+    assert!(qemu_io(&base_path, RAW, "read -P 0x5a 0 1M"));
+    let err = storage
+        .link_clone(&pool, base, RAW, clone)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DriverError::VolumeExists(v) if v == clone),
+        "{err:?}"
+    );
+
+    storage.release_base(&pool, base, RAW).await.unwrap();
+    storage.flatten_volume(&pool, clone, RAW).await.unwrap();
+    storage.delete_volume(&pool, base, RAW).await.unwrap();
+    assert!(lvs(&format!("opl-{base}")).is_empty());
+    // 복제를 다시 켜도(노드를 다시 켠 것처럼) 그대로 읽힌다.
+    storage.activate_volume(&pool, clone, RAW).await.unwrap();
+    assert!(qemu_io(&path, RAW, "read -P 0x77 0 1M"));
+    storage.delete_volume(&pool, clone, RAW).await.unwrap();
+    assert!(lvs(&format!("opl-{clone}")).is_empty());
+}

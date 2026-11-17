@@ -1050,3 +1050,195 @@ async fn replica_overlays_commit_into_the_volume() {
         assert!(qemu_io_fmt(&path, format, "read -P 0x11 0 64k"));
     }
 }
+
+/// 연결 복제(파일 풀): 기반(raw·qcow2)을 상대 경로 backing으로 둔 qcow2 겹층이다. 복제는 기반의 내용을 읽고, 복제에
+/// 써도 기반 파일은 바이트까지 그대로다. 풀 디렉터리를 다른 이름으로 옮겨도(노드마다 다른 NFS 마운트 지점) 열린다.
+/// 전체 복사·내보내기는 backing 없는 전체 데이터다. 평탄화(`rebase`) 뒤에는 기반을 지워도 내용이 같고, 다시 해도
+/// 된다. 내부 스냅샷이 있는 복제는 평탄화하지 않는다.
+#[tokio::test]
+async fn linked_clones_share_the_base_through_a_relative_backing_path() {
+    for base_format in [ImageFormat::Raw, ImageFormat::Qcow2] {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("a");
+        std::fs::create_dir(&first).unwrap();
+        let pool_a = pool(&first);
+        let storage = DirStorage::new("qemu-img", MNT);
+        let (base, clone) = (Uuid::now_v7(), Uuid::now_v7());
+        let base_path = storage
+            .create_volume(&pool_a, base, 16 * MIB, base_format)
+            .await
+            .unwrap();
+        assert!(qemu_io_fmt(&base_path, base_format, "write -P 0x5a 0 1M"));
+        let base_bytes = std::fs::read(&base_path).unwrap();
+
+        let (path, format) = storage
+            .link_clone(&pool_a, base, base_format, clone)
+            .await
+            .unwrap();
+        assert_eq!(path, volume_path(&pool_a, clone, ImageFormat::Qcow2));
+        assert_eq!(format, ImageFormat::Qcow2);
+        let info = image_info(&path);
+        let backing = format!(
+            "{base}.{}",
+            if base_format == ImageFormat::Raw {
+                "raw"
+            } else {
+                "qcow2"
+            }
+        );
+        assert_eq!(info["backing-filename"], backing.as_str(), "{info}");
+        assert_eq!(info["virtual-size"], 16 * MIB, "{info}");
+        // 만드는 동안의 임시 파일은 남지 않는다.
+        let mut names: Vec<String> = std::fs::read_dir(&first)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        let mut want = vec![backing.clone(), format!("{clone}.qcow2")];
+        want.sort();
+        assert_eq!(names, want);
+        let err = storage
+            .link_clone(&pool_a, base, base_format, clone)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeExists(v) if v == clone),
+            "{err:?}"
+        );
+
+        assert!(qemu_io(&path, "read -P 0x5a 0 1M"));
+        assert!(qemu_io(&path, "write -P 0x77 1M 1M"));
+        assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
+
+        // 풀 디렉터리를 옮겨도 상대 backing으로 열린다.
+        let second = tmp.path().join("b");
+        std::fs::rename(&first, &second).unwrap();
+        let pool_b = pool(&second);
+        let path = volume_path(&pool_b, clone, ImageFormat::Qcow2);
+        assert!(qemu_io(&path, "read -P 0x5a 0 1M"));
+        assert!(qemu_io(&path, "read -P 0x77 1M 1M"));
+        let info = storage
+            .volume_info(&pool_b, clone, ImageFormat::Qcow2)
+            .await
+            .unwrap();
+        assert_eq!(info.virtual_bytes, 16 * MIB);
+
+        // 전체 복사와 내보내기는 기반 없이 같은 내용이다.
+        let copy = Uuid::now_v7();
+        storage
+            .copy_volume(
+                &pool_b,
+                clone,
+                ImageFormat::Qcow2,
+                None,
+                false,
+                &pool_b,
+                copy,
+                ImageFormat::Qcow2,
+            )
+            .await
+            .unwrap();
+        let copy_path = volume_path(&pool_b, copy, ImageFormat::Qcow2);
+        assert!(image_info(&copy_path).get("backing-filename").is_none());
+        assert!(same_contents(&copy_path, &path));
+        let src = storage
+            .volume_source(&pool_b, clone, ImageFormat::Qcow2, None)
+            .await
+            .unwrap();
+        let exported = tmp.path().join("export.qcow2");
+        storage.export_volume(&src, false, &exported).await.unwrap();
+        assert!(image_info(&exported).get("backing-filename").is_none());
+        assert!(same_contents(&exported, &path));
+
+        // 내부 스냅샷이 있으면 평탄화하지 않는다(스냅샷이 기반을 잃는다).
+        storage
+            .snapshot_create(&pool_b, clone, ImageFormat::Qcow2, "s1")
+            .await
+            .unwrap();
+        let err = storage
+            .flatten_volume(&pool_b, clone, ImageFormat::Qcow2)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::InvalidSpec(ref m) if m.contains("snapshots")),
+            "{err:?}"
+        );
+        storage
+            .snapshot_delete(&pool_b, clone, ImageFormat::Qcow2, "s1")
+            .await
+            .unwrap();
+
+        storage
+            .flatten_volume(&pool_b, clone, ImageFormat::Qcow2)
+            .await
+            .unwrap();
+        assert!(image_info(&path).get("backing-filename").is_none());
+        storage
+            .delete_volume(&pool_b, base, base_format)
+            .await
+            .unwrap();
+        assert!(qemu_io(&path, "read -P 0x5a 0 1M"));
+        assert!(qemu_io(&path, "read -P 0x77 1M 1M"));
+        storage
+            .flatten_volume(&pool_b, clone, ImageFormat::Qcow2)
+            .await
+            .unwrap();
+        // 기반이 없으면 복제를 만들지 못한다.
+        let err = storage
+            .link_clone(&pool_b, base, base_format, Uuid::now_v7())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DriverError::VolumeNotFound(v) if v == base),
+            "{err:?}"
+        );
+    }
+}
+
+/// 평탄화가 끊겨도(qemu-img를 죽임) 옛 사슬이 그대로이므로 다시 하면 된다.
+#[tokio::test]
+async fn interrupted_flatten_can_be_redone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pool = pool(tmp.path());
+    let storage = DirStorage::new("qemu-img", MNT);
+    let (base, clone) = (Uuid::now_v7(), Uuid::now_v7());
+    let base_path = storage
+        .create_volume(&pool, base, 256 * MIB, ImageFormat::Raw)
+        .await
+        .unwrap();
+    assert!(qemu_io_fmt(
+        &base_path,
+        ImageFormat::Raw,
+        "write -P 0x42 0 192M"
+    ));
+    let (path, _) = storage
+        .link_clone(&pool, base, ImageFormat::Raw, clone)
+        .await
+        .unwrap();
+    assert!(qemu_io(&path, "write -P 0x24 200M 1M"));
+
+    // 곧 끊는다(취소하면 qemu-img를 죽인다). 그사이 끝났을 수도 있다.
+    let flatten = storage.flatten_volume(&pool, clone, ImageFormat::Qcow2);
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(30), flatten).await;
+    // 취소는 qemu-img에 SIGKILL을 보내고 거두기는 tokio가 뒤에서 한다. 죽은 프로세스가 이미지 잠금을 놓을 때까지 기다린다
+    // (잠금이 남아 있으면 qemu-io가 열지 못한다).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !qemu_io(&path, "read -P 0x42 0 192M") {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the interrupted flatten changed the data"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(qemu_io(&path, "read -P 0x24 200M 1M"));
+
+    storage
+        .flatten_volume(&pool, clone, ImageFormat::Qcow2)
+        .await
+        .unwrap();
+    assert!(image_info(&path).get("backing-filename").is_none());
+    std::fs::remove_file(&base_path).unwrap();
+    assert!(qemu_io(&path, "read -P 0x42 0 192M"));
+    assert!(qemu_io(&path, "read -P 0x24 200M 1M"));
+    assert!(qemu_io(&path, "read -P 0 192M 8M"));
+}
