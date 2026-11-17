@@ -170,6 +170,7 @@ impl Env {
             interfaces: vec![],
             checks: vec![],
             hotplug: None,
+            firmware_caps: None,
         };
         // 이 노드는 지금 빌드를 돌린다.
         me.status.version = Some(BUILD.into());

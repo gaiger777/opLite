@@ -133,6 +133,9 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
             cdroms: vec![],
             cloud_init: None,
             template: false,
+            tpm: false,
+            secure_boot: false,
+            guest_agent: None,
         },
     )
 }

@@ -1005,6 +1005,10 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         TaskOp::VolumeFlatten => template::flatten(ctx, id).await,
         TaskOp::VmUntemplate => template::untemplate(ctx, task).await,
+        // 펌웨어 초기화(계획 59)는 뒤 스테이지에서 실행한다.
+        TaskOp::VmFirmwareReset { .. } => {
+            Err("this node cannot reset UEFI variables or the TPM yet".into())
+        }
     };
     done.map(|()| None)
 }

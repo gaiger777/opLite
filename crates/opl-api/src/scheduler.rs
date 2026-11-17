@@ -484,6 +484,7 @@ mod tests {
             interfaces: vec![],
             checks: vec![],
             hotplug: None,
+            firmware_caps: None,
         };
         n
     }
@@ -552,6 +553,9 @@ mod tests {
             cdroms: vec![],
             cloud_init: None,
             template: false,
+            tpm: false,
+            secure_boot: false,
+            guest_agent: None,
         }
     }
 

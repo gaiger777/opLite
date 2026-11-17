@@ -117,6 +117,9 @@ fn spec(
             },
         ],
         cloud_init: Some(seed()),
+        tpm: None,
+        secure_boot: false,
+        freeze_fs: false,
     }
 }
 

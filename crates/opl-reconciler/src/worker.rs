@@ -1624,6 +1624,9 @@ impl Worker {
             hardware: None,
             replication: vm.status.replication.clone(),
             last_recovery: vm.status.last_recovery,
+            tpm_sha256: vm.status.tpm_sha256.clone(),
+            firmware_copies: vm.status.firmware_copies.clone(),
+            firmware_epoch: vm.status.firmware_epoch,
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

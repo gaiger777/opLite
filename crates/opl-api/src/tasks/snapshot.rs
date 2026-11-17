@@ -1013,6 +1013,9 @@ mod tests {
             hotplug: None,
             cdroms: vec![],
             cloud_init: None,
+            tpm: None,
+            secure_boot: false,
+            freeze_fs: false,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

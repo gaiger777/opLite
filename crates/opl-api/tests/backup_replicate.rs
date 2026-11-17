@@ -115,6 +115,7 @@ async fn make_backup(env: &Env, name: &str, spec: BackupSpec, parent: Option<Uui
         received_at: None,
         parent,
         full_reason: None,
+        tpm_state: false,
     };
     let dir = source_dir(env, backup.id);
     std::fs::create_dir_all(&dir).unwrap();

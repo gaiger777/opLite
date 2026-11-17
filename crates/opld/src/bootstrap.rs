@@ -241,6 +241,8 @@ async fn record_node(
             interfaces: std::mem::take(&mut status.interfaces),
             checks: std::mem::take(&mut status.checks),
             hotplug: Some(host.hotplug),
+            // 펌웨어 능력(계획 59)은 아직 살피지 않는다(뒤 스테이지에서 채운다).
+            firmware_caps: None,
         };
         true
     })
@@ -786,7 +788,9 @@ pub(crate) mod tests {
                 "node-replication",
                 "ceph-setup",
                 "install-media",
-                "templates"
+                "templates",
+                "vtpm",
+                "guest-agent"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -821,7 +825,9 @@ pub(crate) mod tests {
                 "node-replication",
                 "ceph-setup",
                 "install-media",
-                "templates"
+                "templates",
+                "vtpm",
+                "guest-agent"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -875,7 +881,9 @@ pub(crate) mod tests {
                 "node-replication",
                 "ceph-setup",
                 "install-media",
-                "templates"
+                "templates",
+                "vtpm",
+                "guest-agent"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1104,6 +1112,8 @@ pub(crate) mod tests {
                     "ceph-setup".into(),
                     "install-media".into(),
                     "templates".into(),
+                    "vtpm".into(),
+                    "guest-agent".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

@@ -136,6 +136,23 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub hotplug: Option<NodeHotplug>,
+    /// 이 노드가 켤 수 있는 펌웨어 장치(계획 59: swtpm·Secure Boot 펌웨어). 노드가 시작할 때와 노드 검사가 쓴다.
+    /// 없으면(옛 노드·위트니스) 모두 못 한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub firmware_caps: Option<FirmwareCaps>,
+}
+
+/// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FirmwareCaps {
+    /// TPM 2.0: `swtpm`·`swtpm_setup`이 있고 swtpm이 TPM 2.0을 하며 QEMU에 `emulator` TPM 백엔드가 있다.
+    #[serde(default)]
+    pub tpm: bool,
+    /// Secure Boot: `secure-boot`·`enrolled-keys` 펌웨어를 찾았다(firmware descriptor나 설정).
+    #[serde(default)]
+    pub secure_boot: bool,
 }
 
 /// 노드의 핫플러그 능력. 디스크·NIC(루트 포트)는 `hotplug` 기능이 있는 모든 노드가 하므로 적지 않는다.
@@ -343,6 +360,8 @@ pub const FEATURES: &[&str] = &[
     CEPH_SETUP,
     INSTALL_MEDIA,
     TEMPLATES,
+    VTPM,
+    GUEST_AGENT,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -377,6 +396,13 @@ pub const INSTALL_MEDIA: &str = "install-media";
 /// `volume-download`의 `sha512`·`checksum_url`·`template`, Task `volume-flatten`·`vm-untemplate`, 설정
 /// `image_catalog`. 모든 노드가 알릴 때만 쓴다.
 pub const TEMPLATES: &str = "templates";
+
+/// vTPM·Secure Boot(계획 59): VM `tpm`·`secure_boot`, Task `vm-firmware-reset`, peer RPC `TpmState`·`PushFirmware`,
+/// 백업의 TPM 상태. 모든 노드가 알릴 때만 쓴다.
+pub const VTPM: &str = "vtpm";
+
+/// 게스트 에이전트(계획 59): VM `guest_agent`, peer RPC `GuestAgent`. 모든 노드가 알릴 때만 쓴다.
+pub const GUEST_AGENT: &str = "guest-agent";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -852,7 +878,9 @@ mod tests {
                 "node-replication",
                 "ceph-setup",
                 "install-media",
-                "templates"
+                "templates",
+                "vtpm",
+                "guest-agent"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1018,5 +1046,35 @@ mod tests {
         let old: PoolState = serde_json::from_value(serde_json::json!({ "ready": true })).unwrap();
         assert_eq!(old.pool_id, Uuid::nil());
         assert!(old.ready);
+    }
+
+    /// 펌웨어 능력(계획 59)이 없으면(옛 노드) 쓰지 않고, 있으면 그대로 오간다. 빠진 칸은 못 함이다.
+    #[test]
+    fn status_firmware_caps_round_trip_and_are_omitted_when_unknown() {
+        let none = serde_json::to_value(NodeStatus::default()).unwrap();
+        assert!(none.get("firmware_caps").is_none(), "{none}");
+        let status = NodeStatus {
+            firmware_caps: Some(FirmwareCaps {
+                tpm: true,
+                secure_boot: false,
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["firmware_caps"],
+            serde_json::json!({ "tpm": true, "secure_boot": false })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        let partial: NodeStatus =
+            serde_json::from_value(serde_json::json!({ "firmware_caps": { "secure_boot": true } }))
+                .unwrap();
+        assert_eq!(
+            partial.firmware_caps,
+            Some(FirmwareCaps {
+                tpm: false,
+                secure_boot: true
+            })
+        );
     }
 }

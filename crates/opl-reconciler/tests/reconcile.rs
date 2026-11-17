@@ -56,6 +56,9 @@ async fn starts_assigned_vm_and_records_status() {
             hardware: Some(RunningHardware::legacy(&vm.spec)),
             replication: Vec::new(),
             last_recovery: None,
+            tpm_sha256: None,
+            firmware_copies: Vec::new(),
+            firmware_epoch: 0,
         }
     );
 }

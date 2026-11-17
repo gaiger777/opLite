@@ -130,6 +130,10 @@ pub struct BackupStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub full_reason: Option<String>,
+    /// TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다.
+    #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub tpm_state: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -214,7 +218,15 @@ pub struct BackupManifest {
     pub uefi_vars: bool,
     /// 만든 시각(유닉스 초)
     pub created_at: u64,
+    /// TPM 상태 파일(`tpm2-00.permall`, 0600)을 담았는지(계획 59). 거짓이면 빼고 써서 형식 버전은 그대로다. 옛 노드는
+    /// 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub tpm_state: bool,
 }
+
+/// 백업 디렉터리 안 TPM 상태 파일의 이름(swtpm의 TPM 2.0 영구 상태와 같은 이름)
+pub const TPM_STATE_FILE: &str = "tpm2-00.permall";
 
 /// 기본 백업 이름 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC). 리소스 이름 길이(63자)를 넘지 않게 VM 이름을
 /// 47자까지 줄인다(끝의 `-`는 뺀다).
@@ -316,6 +328,7 @@ mod tests {
             received_at: None,
             parent: None,
             full_reason: None,
+            tpm_state: false,
         };
         assert_eq!(
             serde_json::to_value(&ready).unwrap(),
@@ -508,6 +521,7 @@ mod tests {
             }],
             uefi_vars: false,
             created_at: 1_790_000_000,
+            tpm_state: false,
         };
         let json = serde_json::to_value(&manifest).unwrap();
         assert_eq!(json["version"], 1);
@@ -609,6 +623,7 @@ mod tests {
             disks: vec![],
             uefi_vars: false,
             created_at: 1_790_000_000,
+            tpm_state: false,
         };
         let json = serde_json::to_value(&full).unwrap();
         assert!(json.get("parent").is_none(), "{json}");
@@ -694,5 +709,59 @@ mod tests {
             backup_dir(Path::new("/srv/backups"), id),
             PathBuf::from(format!("/srv/backups/backups/{id}"))
         );
+    }
+
+    /// TPM 상태(계획 59)는 담았을 때만 쓴다. 옛 매니페스트·상태도 그대로 읽고, 형식 버전은 바뀌지 않는다.
+    #[test]
+    fn tpm_state_is_written_only_when_backed_up() {
+        let manifest = BackupManifest {
+            version: MANIFEST_VERSION,
+            backup: Uuid::now_v7(),
+            parent: None,
+            vm: Uuid::now_v7(),
+            vm_name: "win".into(),
+            vm_spec: vm_spec(),
+            disks: vec![],
+            uefi_vars: true,
+            created_at: 1_790_000_000,
+            tpm_state: false,
+        };
+        let json = serde_json::to_value(&manifest).unwrap();
+        assert!(json.get("tpm_state").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<BackupManifest>(json).unwrap(),
+            manifest
+        );
+
+        let with_tpm = BackupManifest {
+            tpm_state: true,
+            ..manifest
+        };
+        let json = serde_json::to_value(&with_tpm).unwrap();
+        assert_eq!(json["tpm_state"], true);
+        assert_eq!(json["version"], MANIFEST_VERSION);
+        assert_eq!(
+            serde_json::from_value::<BackupManifest>(json).unwrap(),
+            with_tpm
+        );
+
+        let status = BackupStatus::default();
+        assert!(
+            serde_json::to_value(&status)
+                .unwrap()
+                .get("tpm_state")
+                .is_none()
+        );
+        let status = BackupStatus {
+            tpm_state: true,
+            ..status
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["tpm_state"], true);
+        assert_eq!(
+            serde_json::from_value::<BackupStatus>(json).unwrap(),
+            status
+        );
+        assert_eq!(TPM_STATE_FILE, "tpm2-00.permall");
     }
 }

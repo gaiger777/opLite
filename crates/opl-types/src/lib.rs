@@ -9,6 +9,8 @@ pub mod cloud_init;
 pub mod cluster;
 pub mod crypt;
 pub mod fence;
+pub mod firmware;
+pub mod guest;
 pub mod ha_check;
 pub mod host;
 pub mod hotplug;

@@ -138,6 +138,7 @@ async fn node_with(
         interfaces: vec![],
         checks: vec![],
         hotplug: None,
+        firmware_caps: None,
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();

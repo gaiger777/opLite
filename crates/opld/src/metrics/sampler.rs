@@ -542,6 +542,9 @@ mod tests {
                 cdroms: vec![],
                 cloud_init: None,
                 template: false,
+                tpm: false,
+                secure_boot: false,
+                guest_agent: None,
             },
         );
         f.cluster.create(&vm).await.unwrap();
@@ -569,6 +572,9 @@ mod tests {
                 hotplug: None,
                 cdroms: vec![],
                 cloud_init: None,
+                tpm: None,
+                secure_boot: false,
+                freeze_fs: false,
             },
             None,
         )

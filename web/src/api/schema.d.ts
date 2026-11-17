@@ -2237,6 +2237,11 @@ export interface components {
     schemas: {
         /** @enum {string} */
         Action: "accept" | "drop";
+        /**
+         * @description 게스트 에이전트가 있는 VM을 끄는 방법
+         * @enum {string}
+         */
+        AgentShutdown: "agent" | "acpi";
         /** @description 앞단(로드 밸런서)이 부를 API 노드 하나 */
         ApiEndpoint: {
             /** @description API 주소(`host:port`) */
@@ -2417,6 +2422,11 @@ export interface components {
              *     전체 백업이면 뺀다.
              */
             parent?: string;
+            /**
+             * @description TPM 상태 파일(`tpm2-00.permall`, 0600)을 담았는지(계획 59). 거짓이면 빼고 써서 형식 버전은 그대로다. 옛 노드는
+             *     이 필드를 무시한다.
+             */
+            tpm_state?: boolean;
             uefi_vars: boolean;
             /**
              * Format: int32
@@ -2531,6 +2541,8 @@ export interface components {
             received_at?: number;
             /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
             replicas?: components["schemas"]["BackupReplica"][];
+            /** @description TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다. */
+            tpm_state?: boolean;
             /**
              * @description UEFI 변수 파일(`vars.fd`)을 담았는지
              * @default false
@@ -3174,6 +3186,11 @@ export interface components {
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
                 /**
+                 * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
+                 *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
+                 */
+                guest_agent?: components["schemas"]["GuestAgentSpec"];
+                /**
                  * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
                  *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                  */
@@ -3202,12 +3219,22 @@ export interface components {
                  */
                 replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
+                /**
+                 * @description Secure Boot(계획 59): Microsoft 키를 등록한 UEFI 변수로 켜는 secure-boot 펌웨어(x86_64는 SMM). UEFI VM만 쓸 수
+                 *     있다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                 */
+                secure_boot?: boolean;
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
                 /**
                  * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
                  *     않아 옛 노드도 VM을 푼다.
                  */
                 template?: boolean;
+                /**
+                 * @description TPM 2.0(계획 59): VM마다 swtpm 하나를 띄워 단다(q35 `tpm-crb`, virt `tpm-tis-device`). UEFI VM만 쓸 수 있다.
+                 *     상태는 노드 로컬 파일이고 `firmware_node`를 따라다닌다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                 */
+                tpm?: boolean;
             };
         };
         CreateRequest_VolumeSpec: {
@@ -3436,10 +3463,27 @@ export interface components {
         Fencing: "watchdog" | "process";
         /** @enum {string} */
         Firmware: "bios" | "uefi";
+        /** @description 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다. */
+        FirmwareCaps: {
+            /** @description Secure Boot: `secure-boot`·`enrolled-keys` 펌웨어를 찾았다(firmware descriptor나 설정). */
+            secure_boot?: boolean;
+            /** @description TPM 2.0: `swtpm`·`swtpm_setup`이 있고 swtpm이 TPM 2.0을 하며 QEMU에 `emulator` TPM 백엔드가 있다. */
+            tpm?: boolean;
+        };
         /** @description 이 그룹(보통 DN)에 든 사용자는 이 역할 */
         GroupRole: {
             group: string;
             role: components["schemas"]["Role"];
+        };
+        /** @description VM의 게스트 에이전트 설정(계획 59). JSON `{}`은 기본값 그대로 켠다는 뜻이고, 기본값인 칸은 쓰지 않는다. */
+        GuestAgentSpec: {
+            /**
+             * @description 디스크 스냅샷·백업·복제 회차의 시점을 찍을 때 게스트 파일 시스템을 얼린다(`guest-fsfreeze-freeze`).
+             * @default true
+             */
+            freeze_fs: boolean;
+            /** @description VM을 끌 때 쓰는 방법 */
+            shutdown?: components["schemas"]["AgentShutdown"];
         };
         /** @description 게스트 에이전트(QGA) 감시: 한 번 답한 에이전트가 `timeout_secs` 동안 답하지 않으면 VM을 강제로 다시 켠다. */
         GuestWatch: {
@@ -4114,6 +4158,8 @@ export interface components {
                     received_at?: number;
                     /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
                     replicas?: components["schemas"]["BackupReplica"][];
+                    /** @description TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다. */
+                    tpm_state?: boolean;
                     /**
                      * @description UEFI 변수 파일(`vars.fd`)을 담았는지
                      * @default false
@@ -4297,6 +4343,11 @@ export interface components {
                      *     (위트니스는 늘 false).
                      */
                     firewall?: boolean;
+                    /**
+                     * @description 이 노드가 켤 수 있는 펌웨어 장치(계획 59: swtpm·Secure Boot 펌웨어). 노드가 시작할 때와 노드 검사가 쓴다.
+                     *     없으면(옛 노드·위트니스) 모두 못 한다.
+                     */
+                    firmware_caps?: components["schemas"]["FirmwareCaps"];
                     /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
                     ha?: components["schemas"]["NodeHa"];
                     /** @description 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다. */
@@ -4634,6 +4685,11 @@ export interface components {
                     disks?: components["schemas"]["DiskSpec"][];
                     firmware?: components["schemas"]["Firmware"];
                     /**
+                     * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
+                     *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
+                     */
+                    guest_agent?: components["schemas"]["GuestAgentSpec"];
+                    /**
                      * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
                      *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                      */
@@ -4662,15 +4718,36 @@ export interface components {
                      */
                     replication?: components["schemas"]["ReplicationTarget"][];
                     restart?: components["schemas"]["RestartPolicy"];
+                    /**
+                     * @description Secure Boot(계획 59): Microsoft 키를 등록한 UEFI 변수로 켜는 secure-boot 펌웨어(x86_64는 SMM). UEFI VM만 쓸 수
+                     *     있다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                     */
+                    secure_boot?: boolean;
                     snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
                     /**
                      * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
                      *     않아 옛 노드도 VM을 푼다.
                      */
                     template?: boolean;
+                    /**
+                     * @description TPM 2.0(계획 59): VM마다 swtpm 하나를 띄워 단다(q35 `tpm-crb`, virt `tpm-tis-device`). UEFI VM만 쓸 수 있다.
+                     *     상태는 노드 로컬 파일이고 `firmware_node`를 따라다닌다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                     */
+                    tpm?: boolean;
                 };
                 /** @description VM의 실제 상태. reconciler만 기록한다. */
                 status: {
+                    /**
+                     * @description `tpm_sha256`과 같은 펌웨어 사본(UEFI 변수 + TPM)을 가진 다른 노드(계획 59). 해시가 바뀌면 비운다. 비면 쓰지
+                     *     않는다.
+                     */
+                    firmware_copies?: string[];
+                    /**
+                     * Format: int32
+                     * @description 펌웨어 초기화 회차(계획 59). `vm-firmware-reset`이 1씩 올린다. 노드의 파일이 다른 회차의 것이면 낡은 것이다.
+                     *     0이면 쓰지 않는다.
+                     */
+                    firmware_epoch?: number;
                     /**
                      * Format: uuid
                      * @description 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
@@ -4720,6 +4797,11 @@ export interface components {
                      * @default null
                      */
                     snapshot: string | null;
+                    /**
+                     * @description 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
+                     *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
+                     */
+                    tpm_sha256?: string;
                 };
             }[];
             /** Format: int64 */
@@ -5157,6 +5239,11 @@ export interface components {
              *     (위트니스는 늘 false).
              */
             firewall?: boolean;
+            /**
+             * @description 이 노드가 켤 수 있는 펌웨어 장치(계획 59: swtpm·Secure Boot 펌웨어). 노드가 시작할 때와 노드 검사가 쓴다.
+             *     없으면(옛 노드·위트니스) 모두 못 한다.
+             */
+            firmware_caps?: components["schemas"]["FirmwareCaps"];
             /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
             ha?: components["schemas"]["NodeHa"];
             /** @description 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다. */
@@ -5309,7 +5396,10 @@ export interface components {
         PendingChange: {
             /** @description 이유의 자세한 설명(예: 실패한 까닭) */
             detail?: string;
-            /** @description `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine` */
+            /**
+             * @description `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine`, `tpm`,
+             *     `secure_boot`, `guest_agent`
+             */
             field: string;
             reason: components["schemas"]["PendingReason"];
             /** @description 도는 값 */
@@ -6083,6 +6173,8 @@ export interface components {
                 received_at?: number;
                 /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
                 replicas?: components["schemas"]["BackupReplica"][];
+                /** @description TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다. */
+                tpm_state?: boolean;
                 /**
                  * @description UEFI 변수 파일(`vars.fd`)을 담았는지
                  * @default false
@@ -6250,6 +6342,11 @@ export interface components {
                  *     (위트니스는 늘 false).
                  */
                 firewall?: boolean;
+                /**
+                 * @description 이 노드가 켤 수 있는 펌웨어 장치(계획 59: swtpm·Secure Boot 펌웨어). 노드가 시작할 때와 노드 검사가 쓴다.
+                 *     없으면(옛 노드·위트니스) 모두 못 한다.
+                 */
+                firmware_caps?: components["schemas"]["FirmwareCaps"];
                 /** @description 이 노드의 HA 펜싱. None이면 펜싱이 꺼져 HA VM을 돌리지 않는다(위트니스는 늘 None). */
                 ha?: components["schemas"]["NodeHa"];
                 /** @description 이 노드의 QEMU가 할 수 있는 핫플러그(계획 54). 노드가 시작할 때 쓴다. 없으면(옛 노드·위트니스) 모두 못 한다. */
@@ -6620,6 +6717,11 @@ export interface components {
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
                 /**
+                 * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
+                 *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
+                 */
+                guest_agent?: components["schemas"]["GuestAgentSpec"];
+                /**
                  * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
                  *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                  */
@@ -6648,15 +6750,36 @@ export interface components {
                  */
                 replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
+                /**
+                 * @description Secure Boot(계획 59): Microsoft 키를 등록한 UEFI 변수로 켜는 secure-boot 펌웨어(x86_64는 SMM). UEFI VM만 쓸 수
+                 *     있다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                 */
+                secure_boot?: boolean;
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
                 /**
                  * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
                  *     않아 옛 노드도 VM을 푼다.
                  */
                 template?: boolean;
+                /**
+                 * @description TPM 2.0(계획 59): VM마다 swtpm 하나를 띄워 단다(q35 `tpm-crb`, virt `tpm-tis-device`). UEFI VM만 쓸 수 있다.
+                 *     상태는 노드 로컬 파일이고 `firmware_node`를 따라다닌다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                 */
+                tpm?: boolean;
             };
             /** @description VM의 실제 상태. reconciler만 기록한다. */
             status: {
+                /**
+                 * @description `tpm_sha256`과 같은 펌웨어 사본(UEFI 변수 + TPM)을 가진 다른 노드(계획 59). 해시가 바뀌면 비운다. 비면 쓰지
+                 *     않는다.
+                 */
+                firmware_copies?: string[];
+                /**
+                 * Format: int32
+                 * @description 펌웨어 초기화 회차(계획 59). `vm-firmware-reset`이 1씩 올린다. 노드의 파일이 다른 회차의 것이면 낡은 것이다.
+                 *     0이면 쓰지 않는다.
+                 */
+                firmware_epoch?: number;
                 /**
                  * Format: uuid
                  * @description 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
@@ -6706,6 +6829,11 @@ export interface components {
                  * @default null
                  */
                 snapshot: string | null;
+                /**
+                 * @description 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
+                 *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
+                 */
+                tpm_sha256?: string;
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -6811,6 +6939,11 @@ export interface components {
             /** @description 지금 QEMU에 붙은 디스크(순번 = QEMU의 `disk{i}`). 실행 중 붙이고 떼기를 스펙과 견준다. */
             disks?: components["schemas"]["DiskSpec"][];
             firmware: components["schemas"]["Firmware"];
+            /**
+             * @description 켤 때 게스트 에이전트 채널을 달았다(계획 59). 거짓이면 쓰지 않는다. 계획 59 전 노드의 기록에는 없으므로
+             *     `ha.guest_watch`만 있는 VM은 거짓이어도 채널이 있을 수 있다.
+             */
+            guest_agent?: boolean;
             /** @description 핫플러그 배치. 없으면 핫플러그 없이 켠 VM이다(계획 54 전이나 업그레이드 중에 켬). */
             layout?: components["schemas"]["HotplugLayout"];
             machine: components["schemas"]["MachineType"];
@@ -6823,6 +6956,10 @@ export interface components {
             nics?: components["schemas"]["NicSpec"][];
             /** @description 다음 재시작 때 적용할 변경. 핫플러그 Task가 쓴다. */
             pending?: components["schemas"]["PendingChange"][];
+            /** @description 켤 때 Secure Boot 펌웨어로 켰다(계획 59). 거짓이면 쓰지 않는다. */
+            secure_boot?: boolean;
+            /** @description 켤 때 TPM을 달았다(계획 59). 거짓이면 쓰지 않아 옛 노드의 기록 그대로다. */
+            tpm?: boolean;
             /**
              * @description 떼기를 요청했으나 게스트가 아직 내려 주지 않은 장치의 QEMU id(`disk{i}-dev`, `nic{i}`, `cpu{i}`). 디스크·NIC는
              *     `disks`·`nics`에 남아 있고 vCPU는 `layout.vcpus`에 들어 있으며, 다음 핫플러그 Task가 떼기를 마저 한다.
@@ -7278,6 +7415,11 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "vm-untemplate";
+        } | {
+            /** @enum {string} */
+            kind: "vm-firmware-reset";
+            tpm?: boolean;
+            uefi_vars?: boolean;
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -7551,6 +7693,11 @@ export interface components {
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
                 /**
+                 * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
+                 *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
+                 */
+                guest_agent?: components["schemas"]["GuestAgentSpec"];
+                /**
                  * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
                  *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                  */
@@ -7579,12 +7726,22 @@ export interface components {
                  */
                 replication?: components["schemas"]["ReplicationTarget"][];
                 restart?: components["schemas"]["RestartPolicy"];
+                /**
+                 * @description Secure Boot(계획 59): Microsoft 키를 등록한 UEFI 변수로 켜는 secure-boot 펌웨어(x86_64는 SMM). UEFI VM만 쓸 수
+                 *     있다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                 */
+                secure_boot?: boolean;
                 snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
                 /**
                  * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
                  *     않아 옛 노드도 VM을 푼다.
                  */
                 template?: boolean;
+                /**
+                 * @description TPM 2.0(계획 59): VM마다 swtpm 하나를 띄워 단다(q35 `tpm-crb`, virt `tpm-tis-device`). UEFI VM만 쓸 수 있다.
+                 *     상태는 노드 로컬 파일이고 `firmware_node`를 따라다닌다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+                 */
+                tpm?: boolean;
             };
         };
         /** @description 노드 업데이트 설정 */
@@ -7807,6 +7964,11 @@ export interface components {
             disks?: components["schemas"]["DiskSpec"][];
             firmware?: components["schemas"]["Firmware"];
             /**
+             * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
+             *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
+             */
+            guest_agent?: components["schemas"]["GuestAgentSpec"];
+            /**
              * @description HA VM: 노드가 펜싱되면 다른 노드에서 켠다. HA 가능 노드(펜싱이 켜진 노드)에서만 돈다.
              *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
              */
@@ -7835,15 +7997,36 @@ export interface components {
              */
             replication?: components["schemas"]["ReplicationTarget"][];
             restart?: components["schemas"]["RestartPolicy"];
+            /**
+             * @description Secure Boot(계획 59): Microsoft 키를 등록한 UEFI 변수로 켜는 secure-boot 펌웨어(x86_64는 SMM). UEFI VM만 쓸 수
+             *     있다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+             */
+            secure_boot?: boolean;
             snapshot_schedule?: components["schemas"]["SnapshotSchedule"] | null;
             /**
              * @description 템플릿(계획 58): 켤 수 없고 디스크를 바꿀 수 없는 원본. 배포(복제)와 연결 복제의 기반이 된다. 거짓이면 쓰지
              *     않아 옛 노드도 VM을 푼다.
              */
             template?: boolean;
+            /**
+             * @description TPM 2.0(계획 59): VM마다 swtpm 하나를 띄워 단다(q35 `tpm-crb`, virt `tpm-tis-device`). UEFI VM만 쓸 수 있다.
+             *     상태는 노드 로컬 파일이고 `firmware_node`를 따라다닌다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+             */
+            tpm?: boolean;
         };
         /** @description VM의 실제 상태. reconciler만 기록한다. */
         VmStatus: {
+            /**
+             * @description `tpm_sha256`과 같은 펌웨어 사본(UEFI 변수 + TPM)을 가진 다른 노드(계획 59). 해시가 바뀌면 비운다. 비면 쓰지
+             *     않는다.
+             */
+            firmware_copies?: string[];
+            /**
+             * Format: int32
+             * @description 펌웨어 초기화 회차(계획 59). `vm-firmware-reset`이 1씩 올린다. 노드의 파일이 다른 회차의 것이면 낡은 것이다.
+             *     0이면 쓰지 않는다.
+             */
+            firmware_epoch?: number;
             /**
              * Format: uuid
              * @description 지금 UEFI 변수 파일을 가진 노드. UEFI VM을 켠 노드나 마이그레이션의 대상 노드가 쓴다.
@@ -7893,6 +8076,11 @@ export interface components {
              * @default null
              */
             snapshot: string | null;
+            /**
+             * @description 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
+             *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
+             */
+            tpm_sha256?: string;
         };
         /**
          * @description 볼륨의 내용 종류

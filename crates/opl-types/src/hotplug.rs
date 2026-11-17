@@ -87,6 +87,9 @@ impl RunningHardware {
             cloud_init: None,
             unplugging: Vec::new(),
             pending: Vec::new(),
+            tpm: spec.tpm,
+            secure_boot: spec.secure_boot,
+            guest_agent: spec.agent_channel(),
         }
     }
 
@@ -371,7 +374,8 @@ pub fn allocated_memory_mib(vm: &Vm) -> u32 {
 /// 끝나지 않았거나 실패해 게스트가 아직 내려 주지 않은 장치가 있다 — 마이그레이션 대상은 스펙의 장치로 켜므로
 /// 옮기면 안 된다.
 /// CD-ROM 드라이브는 수와 매체를 견준다(부팅 순서는 다음 재시작 때 적용할 보류일 뿐이고, 받는 쪽은 기록의 값으로
-/// 켠다). cloud-init 씨앗은 드라이브가 있는지만 견준다(내용은 받는 쪽이 스펙으로 다시 만든다).
+/// 켠다). cloud-init 씨앗은 드라이브가 있는지만 견준다(내용은 받는 쪽이 스펙으로 다시 만든다). TPM·Secure Boot·
+/// 게스트 에이전트 채널(계획 59)은 있는지를 견준다.
 pub fn devices_match(spec: &VmSpec, hw: &RunningHardware) -> bool {
     spec.disks == hw.disks
         && spec.nics.len() == hw.nics.len()
@@ -383,6 +387,15 @@ pub fn devices_match(spec: &VmSpec, hw: &RunningHardware) -> bool {
             .zip(&hw.cdroms)
             .all(|(a, b)| a.iso == b.iso)
         && spec.cloud_init.is_some() == hw.cloud_init.is_some()
+        && spec.tpm == hw.tpm
+        && spec.secure_boot == hw.secure_boot
+        && !agent_channel_differs(spec, hw)
+}
+
+/// 스펙의 게스트 에이전트 채널이 도는 QEMU와 다른지. 계획 59 전 노드의 기록에는 `guest_agent`가 없으므로, 스펙에
+/// `guest_agent`가 없고 기록도 거짓이면 `ha.guest_watch`(실행 중에 바꿀 수 없다)가 정한 채널 그대로라 같다고 본다.
+fn agent_channel_differs(spec: &VmSpec, hw: &RunningHardware) -> bool {
+    spec.agent_channel() != hw.guest_agent && (spec.guest_agent.is_some() || hw.guest_agent)
 }
 
 /// 마이그레이션 대상이 켤 QEMU의 핫플러그·디스크·NIC·CD-ROM 장치 id(`/machine/peripheral`의 `disk{i}-dev`·
@@ -411,7 +424,8 @@ pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> 
 }
 
 /// 스펙의 하드웨어가 바뀌었는지(CPU·메모리·상한·펌웨어·머신·디스크·보안 그룹을 뺀 NIC·CD-ROM 드라이브와 매체·
-/// cloud-init). 실행 중이면 핫플러그 Task를 만든다.
+/// cloud-init·TPM·Secure Boot·게스트 에이전트 채널). 실행 중이면 핫플러그 Task를 만든다. 에이전트의 `freeze_fs`·
+/// `shutdown`은 장치가 아니라서 견주지 않는다.
 pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
     old.cpu != new.cpu
         || old.memory_mib != new.memory_mib
@@ -423,6 +437,9 @@ pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
         || old.nics.iter().zip(&new.nics).any(|(a, b)| !same_nic(a, b))
         || old.cdroms != new.cdroms
         || old.cloud_init != new.cloud_init
+        || old.tpm != new.tpm
+        || old.secure_boot != new.secure_boot
+        || old.agent_channel() != new.agent_channel()
 }
 
 /// 같은 NIC 장치인지(보안 그룹은 방화벽 규칙이라 견주지 않는다)
@@ -545,6 +562,35 @@ fn changes(
             "cloud_init",
             id(hw.cloud_init.clone()),
             id(seed),
+            PendingReason::Restart,
+            None,
+        ));
+    }
+    // TPM·Secure Boot·게스트 에이전트 채널(계획 59)은 QEMU를 켤 때만 단다.
+    let on = |b: bool| if b { "on" } else { "off" }.to_string();
+    if spec.tpm != hw.tpm {
+        pending.push(change(
+            "tpm",
+            on(hw.tpm),
+            on(spec.tpm),
+            PendingReason::Restart,
+            None,
+        ));
+    }
+    if spec.secure_boot != hw.secure_boot {
+        pending.push(change(
+            "secure_boot",
+            on(hw.secure_boot),
+            on(spec.secure_boot),
+            PendingReason::Restart,
+            None,
+        ));
+    }
+    if agent_channel_differs(spec, hw) {
+        pending.push(change(
+            "guest_agent",
+            on(hw.guest_agent),
+            on(spec.agent_channel()),
             PendingReason::Restart,
             None,
         ));
@@ -1977,5 +2023,73 @@ mod tests {
             qemu_devices(&both, None),
             ["cd0-dev", "cd1-dev", "cidata-dev", "disk0-dev", "nic0"].map(String::from)
         );
+    }
+
+    fn uefi() -> VmSpec {
+        let mut s = spec();
+        s.firmware = crate::vm::Firmware::Uefi;
+        s
+    }
+
+    #[test]
+    fn records_and_compares_tpm_secure_boot_and_agent_channel() {
+        let mut s = uefi();
+        s.tpm = true;
+        s.secure_boot = true;
+        s.guest_agent = Some(Default::default());
+        let hw = started(&s, ALL);
+        assert!(hw.tpm && hw.secure_boot && hw.guest_agent);
+        assert!(devices_match(&s, &hw));
+        assert!(plan(VM, "web", &s, &hw, ALL).unwrap().pending.is_empty());
+
+        // 실행 중 더하거나 빼면 다음 재시작 때 적용한다.
+        let plain = uefi();
+        assert!(hardware_changed(&s, &plain));
+        assert!(!devices_match(&plain, &hw));
+        let pending = only_pending(plan(VM, "web", &plain, &hw, ALL).unwrap());
+        assert_eq!(
+            pending
+                .iter()
+                .map(|p| (p.field.as_str(), p.running.as_str(), p.wanted.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("tpm", "on", "off"),
+                ("secure_boot", "on", "off"),
+                ("guest_agent", "on", "off")
+            ]
+        );
+        assert!(pending.iter().all(|p| p.reason == PendingReason::Restart));
+
+        // 에이전트의 freeze_fs·shutdown은 장치가 아니다.
+        let mut acpi = s.clone();
+        acpi.guest_agent = Some(crate::vm::GuestAgentSpec {
+            freeze_fs: false,
+            shutdown: crate::vm::AgentShutdown::Acpi,
+        });
+        assert!(!hardware_changed(&s, &acpi));
+        assert!(devices_match(&acpi, &hw));
+    }
+
+    /// 계획 59 전 노드가 켠 게스트 감시 VM의 기록에는 `guest_agent`가 없다: 채널이 바뀐 것으로 보지 않는다.
+    #[test]
+    fn old_records_of_guest_watch_vms_still_match() {
+        let mut s = spec();
+        s.ha = Some(crate::vm::VmHa {
+            guest_watch: Some(Default::default()),
+            ..Default::default()
+        });
+        let mut hw = started(&s, ALL);
+        assert!(hw.guest_agent);
+        assert!(devices_match(&s, &hw));
+        hw.guest_agent = false;
+        assert!(devices_match(&s, &hw));
+        assert!(plan(VM, "web", &s, &hw, ALL).unwrap().pending.is_empty());
+        // 스펙에 guest_agent를 더하면 기록이 없는 채널도 다시 켜야 하는 것으로 본다.
+        s.guest_agent = Some(Default::default());
+        assert!(!devices_match(&s, &hw));
+        // 게스트 감시도 에이전트도 없는데 채널이 있으면 다르다.
+        let bare = spec();
+        hw.guest_agent = true;
+        assert!(!devices_match(&bare, &hw));
     }
 }

@@ -378,6 +378,7 @@ pub async fn receive_backup(
         received_at: None,
         parent: req.parent,
         full_reason: None,
+        tpm_state: false,
     };
     // 그사이 같은 이름이 생겼으면 저장소가 거부한다(409 name_taken).
     state.cluster.create(&backup).await?;
@@ -711,6 +712,7 @@ pub async fn complete_backup(
             disks: current.status.disks.clone(),
             uefi_vars: current.status.uefi_vars,
             created_at: current.status.created_at.unwrap_or_default(),
+            tpm_state: current.status.tpm_state,
         };
         write_manifest(&dir, &manifest)
             .await

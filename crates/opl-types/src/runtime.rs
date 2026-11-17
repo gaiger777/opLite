@@ -18,8 +18,10 @@ pub struct VmRuntimeSpec {
     pub machine: MachineType,
     pub disks: Vec<RuntimeDisk>,
     pub nics: Vec<RuntimeNic>,
-    /// 게스트 에이전트(QGA) 채널을 단다(`ha.guest_watch`가 있는 VM만). 장치가 바뀌므로 받는 쪽도 같은 값이어야
-    /// 마이그레이션된다.
+    /// 게스트 에이전트(QGA) 채널을 단다(`guest_agent`나 `ha.guest_watch`가 있는 VM, [`VmSpec::agent_channel`]).
+    /// 장치가 바뀌므로 받는 쪽도 같은 값이어야 마이그레이션된다.
+    ///
+    /// [`VmSpec::agent_channel`]: crate::vm::VmSpec::agent_channel
     #[serde(default)]
     pub guest_agent: bool,
     /// 핫플러그 배치(계획 54). 없으면 옛 명령줄 그대로(vCPU 자리·virtio-mem·루트 포트 없음). 받는 쪽도 같은 값이어야
@@ -33,6 +35,27 @@ pub struct VmRuntimeSpec {
     /// 넣는다. 없으면(옛 정의) 씨앗 드라이브가 없다.
     #[serde(default)]
     pub cloud_init: Option<CloudInitSeed>,
+    /// TPM 2.0(계획 59): 드라이버가 swtpm을 먼저 띄우고 명령줄 끝에 TPM 장치를 단다. 없으면(옛 정의) TPM이 없고
+    /// 명령줄은 계획 58과 같다.
+    #[serde(default)]
+    pub tpm: Option<RuntimeTpm>,
+    /// Secure Boot 펌웨어(계획 59, UEFI만): secure-boot 펌웨어와 MS 키 vars 템플릿, x86_64는 SMM과 secure pflash.
+    #[serde(default)]
+    pub secure_boot: bool,
+    /// 시점을 찍는 동작(디스크 스냅샷·백업·복제 회차)에서 게스트 파일 시스템을 얼린다(계획 59, `guest_agent.freeze_fs`).
+    #[serde(default)]
+    pub freeze_fs: bool,
+}
+
+/// 켤 때의 TPM 상태 규칙(계획 59)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeTpm {
+    /// 이 노드에 TPM 상태 파일이 없으면 새로 만든다(`swtpm_setup`, EK와 인증서). 거짓인데 파일이 없으면 몰래 새로
+    /// 만들지 않고 실패한다. 있는 파일은 늘 그대로 쓴다.
+    pub fresh: bool,
+    /// VM의 펌웨어 초기화 회차(`VmStatus.firmware_epoch`). 노드의 `firmware.epoch`(없으면 0)와 다르면 그 노드의
+    /// UEFI 변수·TPM은 초기화 전의 것이라 지우고 새로 만든다.
+    pub epoch: u32,
 }
 
 /// 이름이 풀린 CD-ROM 드라이브

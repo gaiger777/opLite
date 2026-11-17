@@ -83,6 +83,71 @@ pub struct VmSpec {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub template: bool,
+    /// TPM 2.0(계획 59): VM마다 swtpm 하나를 띄워 단다(q35 `tpm-crb`, virt `tpm-tis-device`). UEFI VM만 쓸 수 있다.
+    /// 상태는 노드 로컬 파일이고 `firmware_node`를 따라다닌다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub tpm: bool,
+    /// Secure Boot(계획 59): Microsoft 키를 등록한 UEFI 변수로 켜는 secure-boot 펌웨어(x86_64는 SMM). UEFI VM만 쓸 수
+    /// 있다. 거짓이면 쓰지 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub secure_boot: bool,
+    /// 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
+    /// VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub guest_agent: Option<GuestAgentSpec>,
+}
+
+/// VM의 게스트 에이전트 설정(계획 59). JSON `{}`은 기본값 그대로 켠다는 뜻이고, 기본값인 칸은 쓰지 않는다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields, default)]
+pub struct GuestAgentSpec {
+    /// 디스크 스냅샷·백업·복제 회차의 시점을 찍을 때 게스트 파일 시스템을 얼린다(`guest-fsfreeze-freeze`).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    #[cfg_attr(feature = "openapi", schema(default = true))]
+    pub freeze_fs: bool,
+    /// VM을 끌 때 쓰는 방법
+    #[serde(skip_serializing_if = "AgentShutdown::is_agent")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub shutdown: AgentShutdown,
+}
+
+impl Default for GuestAgentSpec {
+    fn default() -> Self {
+        GuestAgentSpec {
+            freeze_fs: true,
+            shutdown: AgentShutdown::Agent,
+        }
+    }
+}
+
+/// 게스트 에이전트가 있는 VM을 끄는 방법
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentShutdown {
+    /// 에이전트 `guest-shutdown`을 먼저 보내고, 에이전트가 답하지 않으면 ACPI로 끈다.
+    #[default]
+    Agent,
+    /// 지금처럼 ACPI(`system_powerdown`)로만 끈다.
+    Acpi,
+}
+
+impl AgentShutdown {
+    fn is_agent(&self) -> bool {
+        *self == AgentShutdown::Agent
+    }
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// VM의 최적 배치 옵션
@@ -398,7 +463,18 @@ impl VmSpec {
         if let Some(ci) = &self.cloud_init {
             ci.validate(self.nics.len())?;
         }
+        if self.tpm && self.firmware != Firmware::Uefi {
+            return Err(ValidationError::TpmNeedsUefi);
+        }
+        if self.secure_boot && self.firmware != Firmware::Uefi {
+            return Err(ValidationError::SecureBootNeedsUefi);
+        }
         Ok(())
+    }
+
+    /// 게스트 에이전트 채널을 다는지(계획 59): `guest_agent`가 있거나 HA 게스트 감시(`ha.guest_watch`)가 있다.
+    pub fn agent_channel(&self) -> bool {
+        self.guest_agent.is_some() || self.ha.as_ref().is_some_and(|ha| ha.guest_watch.is_some())
     }
 
     /// 디스크마다 스펙의 `boot_order`
@@ -499,6 +575,10 @@ pub enum ValidationError {
     ReplicationOwnNode,
     #[error(transparent)]
     CloudInit(#[from] CloudInitError),
+    #[error("tpm needs UEFI firmware")]
+    TpmNeedsUefi,
+    #[error("secure_boot needs UEFI firmware")]
+    SecureBootNeedsUefi,
 }
 
 /// 실제 부팅 순서(QEMU `bootindex`): 디스크와 CD-ROM 드라이브의 `boot_order`에서 정한다. CD-ROM이 없으면 그대로다
@@ -799,6 +879,25 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub last_recovery: Option<ReplicaRecovery>,
+    /// 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
+    /// 멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub tpm_sha256: Option<String>,
+    /// `tpm_sha256`과 같은 펌웨어 사본(UEFI 변수 + TPM)을 가진 다른 노드(계획 59). 해시가 바뀌면 비운다. 비면 쓰지
+    /// 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub firmware_copies: Vec<Uuid>,
+    /// 펌웨어 초기화 회차(계획 59). `vm-firmware-reset`이 1씩 올린다. 노드의 파일이 다른 회차의 것이면 낡은 것이다.
+    /// 0이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub firmware_epoch: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// 도는 QEMU의 하드웨어. CPU 토폴로지·메모리·펌웨어·머신은 켤 때 값이고, 핫플러그로 바뀐 것은 `layout`에 있다.
@@ -841,13 +940,27 @@ pub struct RunningHardware {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub pending: Vec<PendingChange>,
+    /// 켤 때 TPM을 달았다(계획 59). 거짓이면 쓰지 않아 옛 노드의 기록 그대로다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub tpm: bool,
+    /// 켤 때 Secure Boot 펌웨어로 켰다(계획 59). 거짓이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub secure_boot: bool,
+    /// 켤 때 게스트 에이전트 채널을 달았다(계획 59). 거짓이면 쓰지 않는다. 계획 59 전 노드의 기록에는 없으므로
+    /// `ha.guest_watch`만 있는 VM은 거짓이어도 채널이 있을 수 있다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub guest_agent: bool,
 }
 
 /// 실행 중에 적용하지 못해 다음 재시작 때 적용할 변경 하나
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PendingChange {
-    /// `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine`
+    /// `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine`, `tpm`,
+    /// `secure_boot`, `guest_agent`
     pub field: String,
     /// 도는 값
     pub running: String,
@@ -2258,5 +2371,134 @@ mod tests {
 
         json["template"] = "yes".into();
         assert!(serde_json::from_value::<VmSpec>(json).is_err());
+    }
+
+    /// 계획 59 필드가 없으면 옛 VM 그대로 쓰고, 있으면 왕복한다. 게스트 에이전트 `{}`은 기본값으로 켠다.
+    #[test]
+    fn firmware_and_guest_agent_fields_are_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert!(!spec.tpm && !spec.secure_boot && spec.guest_agent.is_none());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+
+        let mut json = sample_json();
+        json["firmware"] = "uefi".into();
+        json["tpm"] = true.into();
+        json["secure_boot"] = true.into();
+        json["guest_agent"] = serde_json::json!({});
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert!(spec.tpm && spec.secure_boot);
+        assert_eq!(spec.guest_agent, Some(GuestAgentSpec::default()));
+        assert_eq!(
+            spec.guest_agent,
+            Some(GuestAgentSpec {
+                freeze_fs: true,
+                shutdown: AgentShutdown::Agent
+            })
+        );
+        let out = serde_json::to_value(&spec).unwrap();
+        assert_eq!(out["tpm"], true);
+        assert_eq!(out["secure_boot"], true);
+        assert_eq!(out["guest_agent"], serde_json::json!({}));
+        assert_eq!(serde_json::from_value::<VmSpec>(out).unwrap(), spec);
+        assert!(spec.validate().is_ok());
+        assert!(spec.agent_channel());
+
+        json["guest_agent"] = serde_json::json!({ "freeze_fs": false, "shutdown": "acpi" });
+        let spec: VmSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            spec.guest_agent,
+            Some(GuestAgentSpec {
+                freeze_fs: false,
+                shutdown: AgentShutdown::Acpi
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap()["guest_agent"],
+            serde_json::json!({ "freeze_fs": false, "shutdown": "acpi" })
+        );
+        json["guest_agent"] = serde_json::json!({ "exec": true });
+        assert!(serde_json::from_value::<VmSpec>(json).is_err());
+    }
+
+    #[test]
+    fn tpm_and_secure_boot_need_uefi() {
+        let mut spec = sample();
+        spec.firmware = Firmware::Bios;
+        spec.tpm = true;
+        assert_eq!(spec.validate(), Err(ValidationError::TpmNeedsUefi));
+        assert_eq!(
+            ValidationError::TpmNeedsUefi.to_string(),
+            "tpm needs UEFI firmware"
+        );
+        spec.tpm = false;
+        spec.secure_boot = true;
+        assert_eq!(spec.validate(), Err(ValidationError::SecureBootNeedsUefi));
+        assert_eq!(
+            ValidationError::SecureBootNeedsUefi.to_string(),
+            "secure_boot needs UEFI firmware"
+        );
+        spec.firmware = Firmware::Uefi;
+        spec.tpm = true;
+        assert_eq!(spec.validate(), Ok(()));
+        // 템플릿도 TPM을 가질 수 있다(배포한 VM이 새 TPM을 받는다).
+        spec.power = PowerState::Stopped;
+        spec.template = true;
+        assert_eq!(spec.validate(), Ok(()));
+    }
+
+    #[test]
+    fn agent_channel_comes_from_guest_agent_or_guest_watch() {
+        let mut spec = sample();
+        assert!(!spec.agent_channel());
+        spec.ha = Some(VmHa {
+            guest_watch: Some(GuestWatch::default()),
+            ..VmHa::default()
+        });
+        assert!(spec.agent_channel());
+        spec.ha = Some(VmHa::default());
+        assert!(!spec.agent_channel());
+        spec.guest_agent = Some(GuestAgentSpec::default());
+        assert!(spec.agent_channel());
+    }
+
+    /// TPM 해시·사본·회차(계획 59)는 없으면 쓰지 않고 있으면 왕복한다. 하드웨어 기록의 세 칸도 같다.
+    #[test]
+    fn status_firmware_fields_and_hardware_flags_are_written_only_when_set() {
+        let json = serde_json::to_value(VmStatus::default()).unwrap();
+        for key in ["tpm_sha256", "firmware_copies", "firmware_epoch"] {
+            assert!(json.get(key).is_none(), "{json}");
+        }
+        let copy = Uuid::now_v7();
+        let st = VmStatus {
+            tpm_sha256: Some("ab".repeat(32)),
+            firmware_copies: vec![copy],
+            firmware_epoch: 2,
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["firmware_copies"], serde_json::json!([copy]));
+        assert_eq!(json["firmware_epoch"], 2);
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
+
+        // 계획 58 노드가 쓴 하드웨어 기록을 그대로 읽고 쓴다.
+        let old = serde_json::json!({
+            "cpu": { "sockets": 1, "cores": 2, "model": "host" },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35"
+        });
+        let hw: RunningHardware = serde_json::from_value(old.clone()).unwrap();
+        assert!(!hw.tpm && !hw.secure_boot && !hw.guest_agent);
+        assert_eq!(serde_json::to_value(&hw).unwrap(), old);
+        let hw = RunningHardware {
+            tpm: true,
+            guest_agent: true,
+            ..hw
+        };
+        let json = serde_json::to_value(&hw).unwrap();
+        assert_eq!(json["tpm"], true);
+        assert_eq!(json["guest_agent"], true);
+        assert!(json.get("secure_boot").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<RunningHardware>(json).unwrap(), hw);
     }
 }

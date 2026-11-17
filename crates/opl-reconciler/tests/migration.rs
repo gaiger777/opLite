@@ -145,6 +145,9 @@ async fn received_vm_is_continued_after_the_commit() {
         hotplug: None,
         cdroms: vec![],
         cloud_init: None,
+        tpm: None,
+        secure_boot: false,
+        freeze_fs: false,
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])

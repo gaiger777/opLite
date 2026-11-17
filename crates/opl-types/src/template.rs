@@ -251,6 +251,9 @@ impl TemplateDraft {
             cdroms: Vec::new(),
             cloud_init: Some(self.cloud_init.clone().unwrap_or_default()),
             template: true,
+            tpm: false,
+            secure_boot: false,
+            guest_agent: None,
         };
         spec.validate()?;
         Ok(spec)

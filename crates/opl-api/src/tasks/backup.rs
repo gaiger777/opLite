@@ -662,6 +662,7 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             disks: disks.clone(),
             uefi_vars,
             created_at,
+            tpm_state: false,
         };
         write_manifest(&dir, &manifest)
             .await
@@ -690,6 +691,7 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
             received_at: None,
             parent,
             full_reason,
+            tpm_state: false,
         };
         // 다 만든 백업이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
         loop {

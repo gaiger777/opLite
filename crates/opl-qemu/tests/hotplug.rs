@@ -66,6 +66,9 @@ fn spec(host: &HostProfile, id: Uuid, disk: PathBuf, layout: HotplugLayout) -> V
         hotplug: Some(layout),
         cdroms: vec![],
         cloud_init: None,
+        tpm: None,
+        secure_boot: false,
+        freeze_fs: false,
     }
 }
 

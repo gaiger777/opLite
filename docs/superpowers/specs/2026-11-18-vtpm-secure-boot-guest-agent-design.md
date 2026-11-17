@@ -275,3 +275,12 @@ TPM 1.2, swtpm 상태 암호화(`--key`, 키 관리)와 백업 암호화, 사용
    - CI: `ci.yml`의 `linux-kvm`·`install-media` 단계와 apt, 패키지 `Recommends`.
 7. **feat(web): 보안·게스트 에이전트 카드, 게스트 탭, 초기화·비밀번호 창, Windows 11 미리 채우기, 노드 능력(web)**.
 8. **docs: README "vTPM과 Secure Boot"·"게스트 에이전트", 마이그레이션·HA·백업 절의 TPM, 설계 문서 스테이지 보고, 계획 59 실행 기록**.
+
+## 16. 스테이지 보고 (설계와 다른 것·결정)
+
+- **S1 켜기 규칙 4**: `tpm_sha256`이 없으면 `firmware_node`와 상관없이 `TpmSource::Fresh`다(설계는 둘 다 없을 때만). UEFI 변수만 있던 VM(`firmware_node` 있음)에 TPM을 더하면 어느 노드에도 TPM 상태가 없는데, 설계대로면 `firmware_node`에서 받으려다 실패해 켜지 못한다. `RuntimeTpm.fresh`는 파일이 없을 때만 만들고 있으면 그대로 쓰므로(`--not-overwrite`) `firmware_node`에서 켜면 있던 TPM을 지킨다. 대가: 첫 해시 기록(멈출 때·60초) 전에 노드가 죽으면 다른 노드는 새 TPM으로 켠다.
+- **S1 vars만 초기화**: TPM VM에서 `uefi_vars`만 초기화할 때 `firmware_node = None`으로 쓰면 TPM 상태의 위치를 잃는다(규칙 2가 볼 노드가 없음). S4 실행기는 TPM VM이면 vars 파일만 지우고 `firmware_node`를 남겨야 한다(vars가 없는 노드는 지금처럼 템플릿에서 새로 만든다).
+- **S1 `devices_match`·보류의 에이전트 채널**: 계획 59 전 노드가 쓴 `RunningHardware`에는 `guest_agent`가 없다. 스펙에 `guest_agent`가 없고 기록이 거짓이면 `ha.guest_watch`(실행 중 바꿀 수 없음)가 정한 채널 그대로라 같다고 본다(`agent_channel_differs`). 그러지 않으면 게스트 감시 VM이 업그레이드 뒤 옮겨지지 않는다.
+- **S1 보류**: `tpm`·`guest_agent`뿐 아니라 `secure_boot`도 보류(`Restart`)를 만든다. API는 실행 중 `secure_boot` 변경을 409로 막지만, `devices_match`가 다르다고 보는데 보류가 없으면 이유 없이 옮기지 못하는 VM이 되므로 방어로 둔다.
+- **S1 `firmware_copy_nodes`**: 복제 대상과 HA 노드 모두 온라인·유지 보수 아님·위트니스 아님·`firmware_caps.tpm`인 노드만 고른다(능력 없는 노드의 사본은 HA 복구에 쓸 수 없다). HA 그룹이 있으면 우선순위 큰 그룹 노드 → (`restricted`가 아니면) 그룹 밖 노드, 같으면 이름순이다.
+- **S1 더한 것**: `opl_types::guest`에 `GuestInfoState`·`GuestInfoResponse`(§11)와 비밀번호 검사 `validate_guest_password`(§9의 길이·제어 문자 규칙)를, `opl_types::backup::TPM_STATE_FILE`을 미리 둔다. `resolve.rs`는 채널을 `VmSpec::agent_channel()`로 넓히고 `secure_boot`·`freeze_fs`를 스펙에서 채운다. `tpm`은 S3의 `prepare_firmware`가 채울 때까지 늘 None이다. `bootstrap.rs`의 `firmware_caps`는 S3까지 None이다.

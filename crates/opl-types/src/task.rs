@@ -213,6 +213,16 @@ pub enum TaskOp {
     /// 템플릿(대상 VM)을 보통 VM으로 되돌린다(계획 58): 디스크마다 기반 스냅샷을 풀고 마지막에 `template: false`를
     /// 쓴다. VM의 노드에서 돈다.
     VmUntemplate,
+    /// 꺼진 대상 VM의 펌웨어 상태를 초기화한다(계획 59): `uefi_vars`면 UEFI 변수, `tpm`이면 TPM 상태를 지우고
+    /// `firmware_epoch`를 올린다. VM의 `firmware_node`(없거나 오프라인이면 요청 노드)에서 돈다.
+    VmFirmwareReset {
+        #[serde(default)]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        uefi_vars: bool,
+        #[serde(default)]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        tpm: bool,
+    },
 }
 
 impl TaskOp {
@@ -245,6 +255,11 @@ impl TaskOp {
             } => sha512.is_some() || checksum_url.is_some() || template.is_some(),
             _ => false,
         }
+    }
+
+    /// vTPM 기능(계획 59, `node::VTPM`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_vtpm(&self) -> bool {
+        matches!(self, TaskOp::VmFirmwareReset { .. })
     }
 }
 
@@ -753,6 +768,34 @@ mod tests {
         assert_eq!(TaskStatus::default().state, TaskState::Pending);
         assert!(!TaskState::Running.is_finished());
         assert!(TaskState::Failed.is_finished());
+    }
+
+    #[test]
+    fn firmware_reset_round_trips_and_needs_vtpm() {
+        let op = TaskOp::VmFirmwareReset {
+            uefi_vars: true,
+            tpm: false,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "vm-firmware-reset", "uefi_vars": true, "tpm": false })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        let tpm_only: TaskOp =
+            serde_json::from_value(serde_json::json!({ "kind": "vm-firmware-reset", "tpm": true }))
+                .unwrap();
+        assert_eq!(
+            tpm_only,
+            TaskOp::VmFirmwareReset {
+                uefi_vars: false,
+                tpm: true
+            }
+        );
+        assert!(op.needs_vtpm());
+        assert!(!op.needs_templates());
+        assert!(!TaskOp::VmUntemplate.needs_vtpm());
+        assert!(!TaskOp::VolumeDelete.needs_vtpm());
     }
 
     #[test]

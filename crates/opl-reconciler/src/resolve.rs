@@ -320,12 +320,8 @@ async fn resolve(
         machine: vm.spec.machine,
         disks,
         nics,
-        // `ha.guest_watch`가 있는 VM만 게스트 에이전트 채널을 단다(API는 멈춘 VM에서만 켜고 끈다).
-        guest_agent: vm
-            .spec
-            .ha
-            .as_ref()
-            .is_some_and(|ha| ha.guest_watch.is_some()),
+        // `guest_agent`나 `ha.guest_watch`가 있는 VM만 게스트 에이전트 채널을 단다.
+        guest_agent: vm.spec.agent_channel(),
         hotplug: None,
         cdroms,
         // 씨앗은 지금 스펙의 cloud-init으로 만든다. NIC 입력(MAC)은 새로 켜면 스펙의 NIC, 다시 붙거나 받을 때는 기록의
@@ -334,6 +330,10 @@ async fn resolve(
             let nics = hardware.map_or(&vm.spec.nics[..], |hw| hw.boot_nics());
             cloud_init::render(vm.id, &vm.name, ci, nics)
         }),
+        // TPM 상태를 얻는 곳(계획 59 `firmware::tpm_source`)은 뒤 스테이지에서 정한다.
+        tpm: None,
+        secure_boot: vm.spec.secure_boot,
+        freeze_fs: vm.spec.guest_agent.is_some_and(|g| g.freeze_fs),
     };
     set_boot_order(&mut spec);
     if let Some(hw) = hardware {
