@@ -280,6 +280,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(volumes::check_import_volume))
+        .routes(routes!(volumes::download_volume))
         .routes(routes!(r::get_volume, volumes::delete_volume))
         .routes(routes!(volumes::resize_volume))
         .routes(routes!(console::console))

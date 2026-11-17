@@ -50,6 +50,7 @@ async fn openapi_document_is_served_without_login() {
         "/vms/{key}/console",
         "/volumes/import",
         "/volumes/import/check",
+        "/volumes/download",
         "/volumes/{key}/resize",
         "/snapshots",
         "/vms/{key}/snapshots",

@@ -95,6 +95,8 @@ pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
     config.migration_disks = Some(dir.join("migration-disks"));
     // 핫플러그 떼기·줄이기의 시간 제한 길을 짧게 본다.
     config.hotplug_timeout = Duration::from_millis(200);
+    // 받기 시험은 127.0.0.1의 시험 서버에서 받는다.
+    config.download_allow_private = true;
     config
 }
 

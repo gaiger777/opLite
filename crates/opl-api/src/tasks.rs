@@ -6,6 +6,7 @@
 pub(crate) mod backup;
 mod ceph;
 mod clone;
+mod download;
 mod drain;
 mod hotplug;
 mod import;
@@ -25,7 +26,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::ceph::CephHost;
-use opl_driver::{DriverError, Hypervisor, Storage};
+use opl_driver::{DriverError, Hypervisor, ISO_HEADER_LEN, Storage, is_iso_image};
 use opl_peer::Peers;
 use opl_reconciler::{FirewallGate, FirmwareFetcher, ReconcilerHandle};
 use opl_types::backup::{BackupPhase, BackupSpec};
@@ -123,6 +124,9 @@ pub struct TaskRunnerConfig {
     pub replica_dir: Option<PathBuf>,
     /// 이 노드에서 Ceph를 세우는 단계들(opld `[ceph]`). 없으면 Ceph Task는 실패한다.
     pub ceph: Option<Arc<CephHost>>,
+    /// URL에서 받기(`volume-download`)가 루프백·링크 로컬·사설망 주소에서도 받는지(opld `[download] allow_private`,
+    /// 기본 false — 노드 안쪽이나 클라우드 메타데이터에 닿지 않게)
+    pub download_allow_private: bool,
 }
 
 impl TaskRunnerConfig {
@@ -151,6 +155,7 @@ impl TaskRunnerConfig {
             replication_stall: migrate::DISK_STALL,
             replica_dir: None,
             ceph: None,
+            download_allow_private: false,
         }
     }
 }
@@ -547,7 +552,10 @@ async fn retry_orphans(ctx: Arc<Ctx>, mut volumes: Vec<Uuid>) {
 fn is_volume_op(op: &TaskOp) -> bool {
     matches!(
         op,
-        TaskOp::VolumeCreate | TaskOp::VolumeImport { .. } | TaskOp::VolumeDelete
+        TaskOp::VolumeCreate
+            | TaskOp::VolumeImport { .. }
+            | TaskOp::VolumeDownload { .. }
+            | TaskOp::VolumeDelete
     )
 }
 
@@ -665,7 +673,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다. 노드 비우기는 마이그레이션을 여럿
     // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`). 로컬 디스크 복제는 전체 회차가 디스크 크기만큼
     // 걸리므로 보낸 양이 늘지 않는 시간만 본다(`replication_stall`). Ceph Task는 꾸러미 설치·디스크 지우기처럼
-    // 오래 걸리는 단계마다 한도가 따로 있다.
+    // 오래 걸리는 단계마다 한도가 따로 있다. URL 받기는 이미지 크기만큼 걸리므로 연결·읽기 쉼 한도만 둔다.
     let unlimited = matches!(
         task.spec.op,
         TaskOp::VmMigrate { .. }
@@ -676,6 +684,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::NodeUpgrade
             | TaskOp::NodeDrain
             | TaskOp::VmReplicate { .. }
+            | TaskOp::VolumeDownload { .. }
     ) || task.spec.op.is_ceph();
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
@@ -738,6 +747,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if let TaskOp::VolumeImport { source, .. } = &task.spec.op {
         let _ = tokio::fs::remove_file(source).await;
     }
+    if let (TaskOp::VolumeDownload { .. }, Some(dir)) = (&task.spec.op, &ctx.config.upload_dir) {
+        let _ = tokio::fs::remove_file(download::path(dir, task.spec.target)).await;
+    }
     if let TaskOp::VmClone { .. } | TaskOp::BackupRestore { .. } = task.spec.op {
         clone::discard(ctx, task.id).await;
     }
@@ -758,7 +770,7 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if matches!(
         task.spec.op,
-        TaskOp::VolumeCreate | TaskOp::VolumeImport { .. }
+        TaskOp::VolumeCreate | TaskOp::VolumeImport { .. } | TaskOp::VolumeDownload { .. }
     ) && let Err(e) = remove_volume(ctx, task.spec.target).await
     {
         tracing::warn!(volume = %task.spec.target, error = %e, "cannot clean up failed volume");
@@ -894,7 +906,11 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
         | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
-        TaskOp::VolumeDownload { .. } => Err("this node cannot download volumes yet".into()),
+        TaskOp::VolumeDownload {
+            url,
+            sha256,
+            source_format,
+        } => download::download(ctx, task, url, sha256.as_deref(), *source_format).await,
     };
     done.map(|()| None)
 }
@@ -1111,6 +1127,9 @@ async fn import_volume(
     source_format: SourceFormat,
 ) -> Result<(), String> {
     let (volume, pool) = volume_and_pool(ctx, id)?;
+    if !volume.spec.content.is_disk() {
+        check_iso_source(source).await?;
+    }
     ctx.storage
         .check_import_source(source, source_format)
         .await
@@ -1124,7 +1143,56 @@ async fn import_volume(
     Ok(())
 }
 
+/// ISO 볼륨의 원본이 설치 매체(ISO 9660·UDF)인지 앞부분으로 본다.
+async fn check_iso_source(source: &Path) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = Vec::with_capacity(ISO_HEADER_LEN);
+    tokio::fs::File::open(source)
+        .await
+        .map_err(|e| e.to_string())?
+        .take(ISO_HEADER_LEN as u64)
+        .read_to_end(&mut header)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !is_iso_image(&header) {
+        return Err("not an ISO 9660 or UDF image".into());
+    }
+    Ok(())
+}
+
 async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
+    // ISO는 여러 VM이 함께 쓰므로 API가 확인한 뒤 다른 노드의 요청이 CD에 넣었거나 그 VM의 스냅샷을 찍었을 수 있다.
+    // 지우기 전에 다시 본다.
+    if let Some(volume) = ctx
+        .cluster
+        .get::<VolumeSpec>(id)
+        .map_err(|e| e.to_string())?
+        .filter(|v| !v.spec.content.is_disk())
+    {
+        let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+        let users: Vec<&Vm> = vms
+            .iter()
+            .filter(|vm| vm_uses_volume(vm, &volume.name))
+            .collect();
+        if !users.is_empty() {
+            return Err(crate::volumes::in_cdrom_message(&volume.name, &users));
+        }
+        let (_, snapshots) = ctx
+            .cluster
+            .list::<SnapshotSpec>()
+            .map_err(|e| e.to_string())?;
+        if let Some(s) = snapshots
+            .iter()
+            .find(|s| crate::volumes::spec_refers_to(&s.spec.vm_spec, &volume.name))
+        {
+            return Err(crate::volumes::in_snapshot_message(
+                &volume.name,
+                &s.spec.name,
+                s.spec.vm,
+            ));
+        }
+    }
     remove_volume(ctx, id).await.map_err(|e| e.to_string())
 }
 
@@ -1340,9 +1408,11 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
-        let wanted = unfinished
-            .iter()
-            .any(|t| matches!(&t.spec.op, TaskOp::VolumeImport { source, .. } if *source == path));
+        let wanted = unfinished.iter().any(|t| match &t.spec.op {
+            TaskOp::VolumeImport { source, .. } => *source == path,
+            TaskOp::VolumeDownload { .. } => download::path(dir, t.spec.target) == path,
+            _ => false,
+        });
         if !wanted {
             tracing::warn!(path = %path.display(), "removing an upload without a task");
             let _ = std::fs::remove_file(&path);

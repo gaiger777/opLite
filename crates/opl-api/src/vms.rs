@@ -18,8 +18,8 @@ use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::{VolumePhase, is_shared, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{
-    HaState, MacAddr, PowerState, RunningHardware, ValidationError, Vm, VmHa, VmPhase, VmSpec,
-    VmStatus,
+    CdromSpec, HaState, MacAddr, PowerState, RunningHardware, ValidationError, Vm, VmHa, VmPhase,
+    VmSpec, VmStatus,
 };
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
@@ -51,15 +51,17 @@ pub(crate) fn is_stopped(vm: &Vm) -> bool {
         && matches!(vm.status.phase, VmPhase::Stopped | VmPhase::Failed)
 }
 
-/// VM `vm`이 볼륨 `volume`(이름)을 쓰는지: 스펙의 디스크이거나, 도는 QEMU에 아직 붙은 디스크(`status.hardware` —
-/// 스펙에서 뺐지만 게스트가 아직 내려 주지 않은 것)다.
+/// VM `vm`이 볼륨 `volume`(이름)을 쓰는지: 스펙의 디스크·CD-ROM 매체이거나, 도는 QEMU에 아직 붙은 디스크·매체
+/// (`status.hardware` — 스펙에서 뺐지만 게스트가 아직 내려 주지 않은 디스크, 아직 빼지 못한 매체)다.
 pub(crate) fn vm_uses_volume(vm: &Vm, volume: &str) -> bool {
+    let in_cdrom = |cdroms: &[CdromSpec]| cdroms.iter().any(|c| c.iso.as_deref() == Some(volume));
     vm.spec.disks.iter().any(|d| d.volume == volume)
+        || in_cdrom(&vm.spec.cdroms)
         || vm
             .status
             .hardware
             .as_ref()
-            .is_some_and(|hw| hw.disks.iter().any(|d| d.volume == volume))
+            .is_some_and(|hw| hw.disks.iter().any(|d| d.volume == volume) || in_cdrom(&hw.cdroms))
 }
 
 /// 볼륨 `volume`을 VM `vm`이 써서 다룰 수 없다(409 `volume_in_use`). 스펙의 디스크면 `attached` 문구, 떼는 중인

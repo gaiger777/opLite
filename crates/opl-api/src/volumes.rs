@@ -9,34 +9,36 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::NodeSpec;
+use opl_types::node::{INSTALL_MEDIA, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{
-    PoolBackend, SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec,
-    is_shared, pool_error_on, pool_listed_on, pool_usable_on,
+    PoolBackend, SourceFormat, StoragePool, StoragePoolSpec, Volume, VolumeContent, VolumePhase,
+    VolumeSpec, is_shared, pool_error_on, pool_holds_isos, pool_listed_on, pool_usable_on,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
-use opl_types::vm::VmSpec;
+use opl_types::vm::{Vm, VmSpec};
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+use crate::audit::AuditNote;
 use crate::auth::{Action, Principal};
+use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, check_name, lookup};
 use crate::vms::{vm_uses_volume, volume_in_use};
 
-/// `/volumes/import` 경로와 겹치므로 볼륨 이름으로 쓸 수 없다.
-const RESERVED_NAME: &str = "import";
+/// `/volumes/import`·`/volumes/download` 경로와 겹치므로 볼륨 이름으로 쓸 수 없다.
+const RESERVED_NAMES: [&str; 2] = ["import", "download"];
 
 fn check_volume_name(name: &str) -> Result<(), ApiError> {
     check_name(name)?;
-    if name == RESERVED_NAME {
+    if RESERVED_NAMES.contains(&name) {
         return Err(ApiError::bad_request(format!(
-            "the name {RESERVED_NAME} is reserved"
+            "the name {name} is reserved"
         )));
     }
     Ok(())
@@ -179,6 +181,28 @@ pub(crate) fn default_format(pool: &StoragePool) -> ImageFormat {
     }
 }
 
+/// ISO 볼륨의 규칙(계획 57): dir·NFS 풀에만 두고 형식과 원본 형식은 raw다. `how`는 원본 형식 문구의 동사
+/// (`upload`·`download`). 만들 형식(raw)을 돌려준다.
+fn check_iso(
+    pool: &StoragePool,
+    format: Option<ImageFormat>,
+    source_format: Option<SourceFormat>,
+    how: &str,
+) -> Result<ImageFormat, ApiError> {
+    if !pool_holds_isos(&pool.spec.backend) {
+        return Err(ApiError::bad_request(
+            "ISO images can be kept only in dir or nfs pools",
+        ));
+    }
+    if format.is_some_and(|f| f != ImageFormat::Raw) {
+        return Err(ApiError::bad_request("ISO volumes are raw"));
+    }
+    if source_format.is_some_and(|f| f != SourceFormat::Raw) {
+        return Err(ApiError::bad_request(format!("{how} ISO images as raw")));
+    }
+    Ok(ImageFormat::Raw)
+}
+
 /// 볼륨 리소스를 만들고, 파일을 만들 Task를 돌려준다(202). Task가 실패하면 리소스도 지운다.
 #[utoipa::path(post, path = "/volumes", tag = "storage",
     request_body = CreateRequest<VolumeSpec>,
@@ -190,6 +214,11 @@ pub async fn create_volume(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     check_volume_name(&req.name)?;
+    if !req.spec.content.is_disk() {
+        return Err(ApiError::bad_request(
+            "create ISO volumes by uploading or downloading an image",
+        ));
+    }
     if req.spec.size_bytes == 0 {
         return Err(ApiError::bad_request("size_bytes must be greater than 0"));
     }
@@ -216,6 +245,10 @@ pub struct ImportQuery {
     pub format: Option<ImageFormat>,
     #[param(inline)]
     pub source_format: SourceFormat,
+    /// 내용 종류(기본 disk). iso는 dir·nfs 풀에 raw로 둔다.
+    #[serde(default)]
+    #[param(inline)]
+    pub content: VolumeContent,
 }
 
 /// 업로드 사전 확인의 매개변수. 업로드의 것에 올릴 파일 크기(바이트)를 더한다.
@@ -231,6 +264,10 @@ pub struct ImportCheckQuery {
     pub format: Option<ImageFormat>,
     #[param(inline)]
     pub source_format: SourceFormat,
+    /// 내용 종류(기본 disk)
+    #[serde(default)]
+    #[param(inline)]
+    pub content: VolumeContent,
     /// 올릴 파일 크기(바이트)
     pub size: u64,
 }
@@ -244,10 +281,19 @@ pub async fn check_import(
     size: u64,
 ) -> Result<(StoragePool, ImageFormat), ApiError> {
     state.authorize(principal, Action::Write, VolumeSpec::KIND)?;
+    let iso = !q.content.is_disk();
+    if iso {
+        require_feature(&state.cluster, INSTALL_MEDIA)?;
+    }
     check_volume_name(&q.name)?;
     let pool = find_pool(state, &q.pool)?;
-    let format = q.format.unwrap_or_else(|| default_format(&pool));
-    check_pool_format(&pool, format)?;
+    let format = if iso {
+        check_iso(&pool, q.format, Some(q.source_format), "upload")?
+    } else {
+        let format = q.format.unwrap_or_else(|| default_format(&pool));
+        check_pool_format(&pool, format)?;
+        format
+    };
     check_pool_on(state, &pool, state.node, || {
         format!(
             "storage pool {:?} is not available on this node; upload to one of its nodes",
@@ -295,6 +341,7 @@ pub async fn check_import_volume(
         pool: q.pool,
         format: q.format,
         source_format: q.source_format,
+        content: q.content,
     };
     check_import(&state, &principal, &q, size).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -327,7 +374,7 @@ pub async fn import_volume(
             pool: pool.name.clone(),
             size_bytes: 0,
             format,
-            content: Default::default(),
+            content: q.content,
         },
     );
     volume.status.node = Some(state.node);
@@ -346,6 +393,130 @@ pub async fn import_volume(
     };
     let task = create_task(&state.cluster, op, volume.id, state.node).await?;
     guard.armed = false;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// `POST /volumes/download`: URL에서 이미지를 받아 볼륨을 만든다(계획 57).
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VolumeDownloadRequest {
+    pub name: String,
+    pub pool: String,
+    /// 받을 http·https URL. 작업 노드가 닿을 수 있어야 한다.
+    pub url: String,
+    /// 내용 종류(기본 disk). iso는 dir·nfs 풀에 raw로 둔다.
+    #[serde(default)]
+    pub content: VolumeContent,
+    /// 받은 파일의 SHA-256(16진 64자). 있으면 다르면 실패한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub sha256: Option<String>,
+    /// 받은 파일의 형식(디스크만, 기본 raw)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub source_format: Option<SourceFormat>,
+    /// 만들 볼륨의 형식 (생략하면 풀 종류로: 블록 풀은 raw, 그 밖은 qcow2. ISO는 늘 raw)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub format: Option<ImageFormat>,
+}
+
+/// URL의 사용자 정보(`user:password@`)를 `***@`로, 쿼리 문자열(서명·토큰이 흔히 든다)을 `?***`로 가린다. 감사
+/// 설명, Task 오류 문구, 응답·watch로 내보내는 받기 Task에 쓴다.
+pub(crate) fn redact_url(url: &str) -> String {
+    let (url, tail) = match url.find('?') {
+        Some(q) => (&url[..q], "?***"),
+        None => (url, ""),
+    };
+    let Some(start) = url.find("://").map(|i| i + 3) else {
+        return format!("{url}{tail}");
+    };
+    let end = url[start..]
+        .find(['/', '#'])
+        .map_or(url.len(), |i| start + i);
+    match url[start..end].rfind('@') {
+        Some(at) => format!("{}***{}{tail}", &url[..start], &url[start + at..]),
+        None => format!("{url}{tail}"),
+    }
+}
+
+/// 응답으로 낼 Task: 받기 Task의 URL을 가린다([`redact_url`]). 저장은 그대로다(Task 실행은 원래 URL을 쓴다).
+pub(crate) fn public_task(task: &mut Task) {
+    if let TaskOp::VolumeDownload { url, .. } = &mut task.spec.op {
+        *url = redact_url(url);
+    }
+}
+
+/// 소문자 16진 64자로 바꾼 SHA-256. 아니면 400.
+fn parse_sha256(sum: &str) -> Result<String, ApiError> {
+    if sum.len() != 64 || !sum.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request("sha256 must be 64 hex digits"));
+    }
+    Ok(sum.to_ascii_lowercase())
+}
+
+/// URL에서 이미지를 받아 볼륨을 채울 Task를 돌려준다(202). 풀을 쓸 수 있는 노드(`pool_node`)가 받는다.
+/// 크기는 받아 가져온 뒤 실제 이미지 크기가 된다. 모든 노드가 `install-media`를 알아야 한다(새 Task).
+#[utoipa::path(post, path = "/volumes/download", tag = "storage",
+    request_body = VolumeDownloadRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn download_volume(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Json(req): Json<VolumeDownloadRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    require_feature(&state.cluster, INSTALL_MEDIA)?;
+    check_volume_name(&req.name)?;
+    match reqwest::Url::parse(&req.url) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => {}
+        _ => return Err(ApiError::bad_request("url must be an http or https URL")),
+    }
+    let sha256 = req.sha256.as_deref().map(parse_sha256).transpose()?;
+    let pool = find_pool(&state, &req.pool)?;
+    let format = if req.content.is_disk() {
+        let format = req.format.unwrap_or_else(|| default_format(&pool));
+        check_pool_format(&pool, format)?;
+        format
+    } else {
+        check_iso(&pool, req.format, req.source_format, "download")?
+    };
+    if state
+        .cluster
+        .get_by_name::<VolumeSpec>(&req.name)?
+        .is_some()
+    {
+        return Err(ApiError::conflict(
+            "name_taken",
+            format!("volume {:?} already exists", req.name),
+        ));
+    }
+    let node = pool_node(&state, &pool)?;
+    // 크기는 가져온 뒤 실제 이미지 크기로 바뀐다(업로드와 같다).
+    let mut volume: Volume = Resource::new(
+        req.name.clone(),
+        VolumeSpec {
+            pool: pool.name.clone(),
+            size_bytes: 0,
+            format,
+            content: req.content,
+        },
+    );
+    volume.status.node = Some(node);
+    state.cluster.create(&volume).await?;
+    let mut detail = format!("volume download {} from {}", req.name, redact_url(&req.url));
+    if let Some(sum) = &sha256 {
+        detail.push_str(&format!(" (sha256 {}…)", &sum[..4]));
+    }
+    audit.detail(detail);
+    let op = TaskOp::VolumeDownload {
+        url: req.url,
+        sha256,
+        source_format: req.source_format.unwrap_or(SourceFormat::Raw),
+    };
+    let mut task = create_task(&state.cluster, op, volume.id, node).await?;
+    public_task(&mut task);
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
@@ -431,8 +602,21 @@ pub async fn delete_volume(
             format!("volume {:?} is still being created", volume.name),
         ));
     }
+    // 이 노드에서 같은 ISO를 CD에 넣는 요청과 엇갈리지 않게 확인과 Task 만들기를 VM 쓰기와 함께 잠근다(다른 노드와의
+    // 엇갈림은 지우기 Task가 다시 본다).
+    let _lock = state.vm_lock.lock().await;
     let (_, vms) = state.cluster.list::<VmSpec>()?;
-    if let Some(vm) = vms.iter().find(|vm| vm_uses_volume(vm, &volume.name)) {
+    let users: Vec<&Vm> = vms
+        .iter()
+        .filter(|vm| vm_uses_volume(vm, &volume.name))
+        .collect();
+    if let Some(vm) = users.first() {
+        if !volume.spec.content.is_disk() {
+            return Err(ApiError::conflict(
+                "volume_in_use",
+                in_cdrom_message(&volume.name, &users),
+            ));
+        }
         return Err(volume_in_use(
             vm,
             &volume.name,
@@ -442,19 +626,39 @@ pub async fn delete_volume(
     let (_, snapshots) = state.cluster.list::<SnapshotSpec>()?;
     if let Some(s) = snapshots
         .iter()
-        .find(|s| s.spec.vm_spec.disks.iter().any(|d| d.volume == volume.name))
+        .find(|s| spec_refers_to(&s.spec.vm_spec, &volume.name))
     {
         return Err(ApiError::conflict(
             "volume_in_snapshot",
-            format!(
-                "volume {:?} is used by snapshot {:?} of VM {}",
-                volume.name, s.spec.name, s.spec.vm
-            ),
+            in_snapshot_message(&volume.name, &s.spec.name, s.spec.vm),
         ));
     }
     let node = volume_node(&state, &volume)?;
     let task = create_task(&state.cluster, TaskOp::VolumeDelete, volume.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 스펙이 볼륨을 디스크나 CD-ROM 매체로 가리키는지(스냅샷 되돌리기가 그것으로 켠다)
+pub(crate) fn spec_refers_to(spec: &VmSpec, volume: &str) -> bool {
+    spec.disks.iter().any(|d| d.volume == volume)
+        || spec.cdroms.iter().any(|c| c.iso.as_deref() == Some(volume))
+}
+
+/// VM `vm`의 스냅샷 `snapshot`이 가리키는 볼륨을 지울 수 없다는 문구
+pub(crate) fn in_snapshot_message(volume: &str, snapshot: &str, vm: Uuid) -> String {
+    format!("volume {volume:?} is used by snapshot {snapshot:?} of VM {vm}")
+}
+
+/// CD-ROM 드라이브에 꽂힌 ISO를 지울 수 없다는 문구. VM이 여럿이면 첫 VM과 나머지 수를 적는다.
+pub(crate) fn in_cdrom_message(volume: &str, users: &[&Vm]) -> String {
+    let mut message = format!(
+        "volume {volume:?} is in the CD-ROM drive of VM {:?}",
+        users[0].name
+    );
+    if users.len() > 1 {
+        message.push_str(&format!(" and {} more", users.len() - 1));
+    }
+    message
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -481,6 +685,9 @@ pub async fn resize_volume(
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     let volume = lookup::<VolumeSpec>(&state.cluster, &key)?;
+    if !volume.spec.content.is_disk() {
+        return Err(ApiError::bad_request("ISO volumes cannot be resized"));
+    }
     if volume.status.phase != VolumePhase::Ready {
         return Err(ApiError::conflict(
             "volume_not_ready",
@@ -517,4 +724,43 @@ pub async fn resize_volume(
     };
     let task = create_task(&state.cluster, op, volume.id, node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_hides_user_info_only() {
+        for (url, shown) in [
+            ("https://a.example/x.iso", "https://a.example/x.iso"),
+            (
+                "https://user:pw@a.example/x.iso",
+                "https://***@a.example/x.iso",
+            ),
+            ("http://user@a.example:8080", "http://***@a.example:8080"),
+            // 경로의 `@`는 사용자 정보가 아니다. 쿼리 문자열은 통째로 가린다(서명·토큰).
+            (
+                "https://a.example/x@y.iso?u=a@b",
+                "https://a.example/x@y.iso?***",
+            ),
+            (
+                "https://u:p@a.example/x.iso?X-Amz-Signature=abc&token=t#f",
+                "https://***@a.example/x.iso?***",
+            ),
+            ("https://a.example?sig=1", "https://a.example?***"),
+            ("https://u:p@ss@a.example/", "https://***@a.example/"),
+            ("not a url", "not a url"),
+        ] {
+            assert_eq!(redact_url(url), shown, "{url}");
+        }
+    }
+
+    #[test]
+    fn sha256_is_64_hex_digits_stored_lowercase() {
+        let sum = "AB".repeat(32);
+        assert_eq!(parse_sha256(&sum).unwrap(), "ab".repeat(32));
+        assert!(parse_sha256(&"ab".repeat(31)).is_err());
+        assert!(parse_sha256(&"zz".repeat(32)).is_err());
+    }
 }

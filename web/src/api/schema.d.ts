@@ -1943,6 +1943,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/volumes/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * URL에서 이미지를 받아 볼륨을 채울 Task를 돌려준다(202). 풀을 쓸 수 있는 노드(`pool_node`)가 받는다.
+         *     크기는 받아 가져온 뒤 실제 이미지 크기가 된다. 모든 노드가 `install-media`를 알아야 한다(새 Task).
+         */
+        post: operations["download_volume"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/volumes/import": {
         parameters: {
             query?: never;
@@ -7459,6 +7479,21 @@ export interface components {
          * @enum {string}
          */
         VolumeContent: "disk" | "iso";
+        /** @description `POST /volumes/download`: URL에서 이미지를 받아 볼륨을 만든다(계획 57). */
+        VolumeDownloadRequest: {
+            /** @description 내용 종류(기본 disk). iso는 dir·nfs 풀에 raw로 둔다. */
+            content?: components["schemas"]["VolumeContent"];
+            /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: 블록 풀은 raw, 그 밖은 qcow2. ISO는 늘 raw) */
+            format?: components["schemas"]["ImageFormat"];
+            name: string;
+            pool: string;
+            /** @description 받은 파일의 SHA-256(16진 64자). 있으면 다르면 실패한다. */
+            sha256?: string;
+            /** @description 받은 파일의 형식(디스크만, 기본 raw) */
+            source_format?: components["schemas"]["SourceFormat"];
+            /** @description 받을 http·https URL. 작업 노드가 닿을 수 있어야 한다. */
+            url: string;
+        };
         /**
          * @description 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.
          * @enum {string}
@@ -11934,6 +11969,37 @@ export interface operations {
             };
         };
     };
+    download_volume: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VolumeDownloadRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     import_volume: {
         parameters: {
             query: {
@@ -11942,6 +12008,8 @@ export interface operations {
                 /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2) */
                 format?: "qcow2" | "raw";
                 source_format: "vmdk" | "qcow2" | "raw";
+                /** @description 내용 종류(기본 disk). iso는 dir·nfs 풀에 raw로 둔다. */
+                content?: "disk" | "iso";
             };
             header?: never;
             path?: never;
@@ -11979,6 +12047,8 @@ export interface operations {
                 /** @description 만들 볼륨의 형식 (생략하면 풀 종류로: lvm-thin·zfs는 raw, 그 밖은 qcow2) */
                 format?: "qcow2" | "raw";
                 source_format: "vmdk" | "qcow2" | "raw";
+                /** @description 내용 종류(기본 disk) */
+                content?: "disk" | "iso";
                 /** @description 올릴 파일 크기(바이트) */
                 size: number;
             };

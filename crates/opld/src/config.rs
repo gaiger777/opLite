@@ -98,6 +98,8 @@ pub struct Config {
     pub node: NodeSection,
     #[serde(default)]
     pub ceph: CephSection,
+    #[serde(default)]
+    pub download: DownloadSection,
     /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
     #[cfg(any(
         feature = "starve-it",
@@ -856,6 +858,16 @@ impl Default for WebSection {
 
 fn default_web_enabled() -> bool {
     true
+}
+
+/// URL에서 받기(`volume download`·`iso download`, 계획 57)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DownloadSection {
+    /// 루프백·링크 로컬(클라우드 메타데이터 169.254.169.254 포함)·사설망 주소에서도 받는다. 기본은 받지 않는다(볼륨
+    /// 쓰기 권한으로 노드 안쪽 서비스에 닿지 않게). 리디렉션의 각 단계에도 같다. 사내 미러가 사설 주소면 켠다.
+    #[serde(default)]
+    pub allow_private: bool,
 }
 
 /// 이 노드에 대한 것
@@ -2171,6 +2183,21 @@ mod tests {
         std::fs::write(&path, "data_dir = 5").unwrap();
         assert!(Config::data_dir_of(&path).is_err());
         assert!(Config::data_dir_of(&dir.path().join("none")).is_err());
+    }
+
+    #[test]
+    fn download_section() {
+        assert!(
+            !parse("name = \"n\"\naddress = \"h\"")
+                .download
+                .allow_private
+        );
+        let c = parse("name = \"n\"\naddress = \"h\"\n[download]\nallow_private = true");
+        assert!(c.download.allow_private);
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[download]\nprivate = true")
+                .is_err()
+        );
     }
 
     #[test]

@@ -727,6 +727,7 @@ impl Member {
         // 복제 Task: 받는 쪽(ReplicaConfig)·reconciler와 같은 기록 디렉터리
         runner_config.replica_dir = Some(config.data_dir.join(REPLICAS_DIR));
         runner_config.replication_bandwidth = config.replication.bandwidth();
+        runner_config.download_allow_private = config.download.allow_private;
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         runner_config.ceph = Some(ceph.clone());
