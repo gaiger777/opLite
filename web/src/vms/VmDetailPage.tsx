@@ -32,6 +32,7 @@ import { choosableIsos } from "@/isos/isos";
 import { formatBytes, formatMib, formatTime, uuidTime } from "@/lib/format";
 import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
+import { diskVolumes, isTemplate, linkedClones } from "@/templates/templates";
 import {
   ACTIONS,
   availability,
@@ -62,7 +63,7 @@ import {
   unusableDisk,
   type ReplicaRow,
 } from "@/vms/replication";
-import { VmConfirm, type VmDialog } from "@/vms/VmMenu";
+import { useTemplateReasons, VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
 
@@ -168,6 +169,8 @@ function VmHeader({ vm }: { vm: Vm }) {
   const hint = useId();
   const { run, remove } = useVmActions();
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
+  const template = isTemplate(vm);
+  const { convert, revert } = useTemplateReasons(vm);
   const migration = vm.status.migration;
   // 옮기는 중이면 QEMU가 도는 원본(확정하며 spec.node가 먼저 대상이 될 수 있다). 아니면 고정한 노드가
   // 있으면 그 노드, 없으면 스케줄러가 놓은 노드
@@ -193,6 +196,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   const reasons = [
     ...(operate ? [...ACTIONS.map(reasonOf), consoleReason, reasonOf("migrate")] : []),
     write ? reasonOf("delete") : null,
+    write ? (template ? revert : convert) : null,
   ];
   const button = (action: VmAction) => (
     <ReasonButton
@@ -212,6 +216,7 @@ function VmHeader({ vm }: { vm: Vm }) {
         <h1 className="text-2xl font-semibold">{vm.name}</h1>
         <VmPhaseBadge vm={vm} />
         {haEnabled(vm.spec) && <Badge variant="outline">{t("vms.ha")}</Badge>}
+        {template && <Badge variant="secondary">{t("vms.template")}</Badge>}
         {/* 실행 중에 적용하지 못한 하드웨어 변경이 있다. */}
         {needsRestart(vm) && <Badge variant="secondary">{t("vms.restartNeeded")}</Badge>}
         {node && (
@@ -248,9 +253,24 @@ function VmHeader({ vm }: { vm: Vm }) {
           </Button>
         )}
         {write && can(me.role, "write", "volume") && (
-          <Button variant="outline" size="sm" onClick={() => setConfirm("clone")}>
-            {t("vms.action.clone")}
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setConfirm(template ? "deploy" : "clone")}
+          >
+            {template ? t("templates.deploy") : t("vms.action.clone")}
           </Button>
+        )}
+        {write && (
+          <ReasonButton
+            variant="outline"
+            size="sm"
+            reason={template ? revert : convert}
+            reasons={hint}
+            onClick={() => setConfirm(template ? "untemplate" : "template")}
+          >
+            {template ? t("templates.revert") : t("templates.convert")}
+          </ReasonButton>
         )}
         {write && (
           <ReasonButton
@@ -329,6 +349,43 @@ function CloudInitLine({ vm }: { vm: Vm }) {
   );
 }
 
+/**
+ * 템플릿이면 연결 복제 수, 연결 복제 디스크가 있으면 디스크마다 기반 볼륨(`disk0: tmpl-root의 연결 복제`). 둘 다 아니면
+ * 그리지 않는다.
+ */
+function TemplateField({ vm }: { vm: Vm }) {
+  const { t } = useTranslation();
+  const volumes = useList("volume").data ?? [];
+  const disks = diskVolumes(vm, volumes);
+  const linked = disks.flatMap((v, i) => {
+    const base = v?.spec.base;
+    if (base == null) {
+      return [];
+    }
+    const name = volumes.find((b) => b.id === base)?.name ?? base;
+    return [t("vms.linkedDisk", { n: i, base: name })];
+  });
+  if (isTemplate(vm)) {
+    return (
+      <Field label={t("vms.template")}>
+        {t("vms.templateClones", { count: linkedClones(disks, volumes).length })}
+      </Field>
+    );
+  }
+  if (linked.length === 0) {
+    return null;
+  }
+  return (
+    <Field label={t("vms.linkedClone")}>
+      {linked.map((line) => (
+        <span key={line} className="block">
+          {line}
+        </span>
+      ))}
+    </Field>
+  );
+}
+
 function Summary({ vm }: { vm: Vm }) {
   const { t, i18n } = useTranslation();
   const { cpu } = vm.spec;
@@ -368,6 +425,7 @@ function Summary({ vm }: { vm: Vm }) {
       <Field label={t("vms.cloudInit")}>
         <CloudInitLine vm={vm} />
       </Field>
+      <TemplateField vm={vm} />
       <Field label={t("vms.firmware")}>{(vm.spec.firmware ?? "uefi").toUpperCase()}</Field>
       <Field label={t("vms.machine")}>{vm.spec.machine}</Field>
       <Field label={t("vms.restart")}>{t(`vms.restartPolicy.${vm.spec.restart ?? "never"}`)}</Field>

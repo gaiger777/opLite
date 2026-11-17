@@ -24,6 +24,7 @@ export function FormDialog({
   destructive = false,
   submitDisabled = false,
   returnFocus,
+  className,
   onClose,
   onSubmit,
   children,
@@ -36,6 +37,8 @@ export function FormDialog({
   submitDisabled?: boolean;
   /** 닫으면 포커스를 돌려줄 곳. 메뉴에서 열면 메뉴 항목이 사라지므로 메뉴 버튼을 준다. */
   returnFocus?: RefObject<HTMLElement | null>;
+  /** 대화상자 상자의 클래스(입력이 많은 창의 너비) */
+  className?: string;
   onClose(): void;
   /** 보낸다. 입력 오류로 보내지 않았으면 false를 돌려준다(열어 둔다). 실패하면 던진다. */
   onSubmit(): Promise<boolean | void>;
@@ -70,6 +73,7 @@ export function FormDialog({
   return (
     <Dialog open onOpenChange={(open) => !open && !busy && onClose()}>
       <DialogContent
+        className={className}
         {...(description ? {} : { "aria-describedby": undefined })}
         onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
       >

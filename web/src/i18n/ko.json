@@ -92,7 +92,11 @@
     "disk_in_use": "이 디스크에는 OSD를 만들 수 없습니다: {{message}}",
     "disk_not_empty": "디스크가 비어 있지 않습니다. 지우기를 고르세요: {{message}}",
     "cdrom_local": "노드 로컬 풀의 ISO가 CD-ROM 드라이브에 있습니다: {{message}}",
-    "restart_required": "먼저 VM을 다시 시작해야 합니다: {{message}}"
+    "restart_required": "먼저 VM을 다시 시작해야 합니다: {{message}}",
+    "vm_is_template": "템플릿에서는 할 수 없습니다. 템플릿에서 VM을 배포하거나 먼저 VM으로 되돌리세요: {{message}}",
+    "volume_is_template": "템플릿의 디스크는 바꾸거나 지울 수 없습니다: {{message}}",
+    "template_in_use": "연결 복제가 남은 템플릿입니다. 복제를 먼저 지우거나 평탄화하세요: {{message}}",
+    "volume_has_clones": "연결 복제의 기반 볼륨입니다. 복제를 먼저 지우거나 평탄화하세요: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -118,7 +122,9 @@
     "placementRules": "배치 규칙",
     "placement": "최적 배치",
     "ceph": "Ceph",
-    "isos": "ISO 이미지"
+    "isos": "ISO 이미지",
+    "templates": "템플릿",
+    "images": "이미지 라이브러리"
   },
   "header": {
     "language": "언어",
@@ -209,7 +215,9 @@
       "ceph-osd-add": "{{node}} {{device}}에 Ceph OSD 추가",
       "ceph-pool-create": "Ceph 풀 {{pool}}을(를) 스토리지 풀 {{name}}(으)로 만들기(size {{size}})",
       "ceph-client-install": "{{node}}에 Ceph 클라이언트 패키지 설치",
-      "volume-download": "볼륨 {{target}} 받기"
+      "volume-download": "볼륨 {{target}} 받기",
+      "vm-untemplate": "{{target}}을(를) VM으로 되돌리기",
+      "volume-flatten": "볼륨 {{target}} 평탄화"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -218,7 +226,9 @@
       "downloading": "받는 중 {{percent}}% ({{done}}/{{total}} GiB)",
       "downloadingUnknown": "받는 중 ({{done}} GiB)",
       "verifying": "체크섬 확인 중",
-      "importing": "볼륨으로 가져오는 중"
+      "importing": "볼륨으로 가져오는 중",
+      "checksum": "체크섬 파일 받는 중",
+      "template": "템플릿 VM 만드는 중"
     },
     "detail": {
       "vms": "VM: {{vms}}."
@@ -281,7 +291,8 @@
       "failed": "VM이 실패 상태입니다.",
       "busy": "VM이 시작하거나 정지하는 중입니다.",
       "migrating": "VM을 마이그레이션하는 중에는 할 수 없습니다.",
-      "snapshotPending": "스냅샷이나 복제 작업 중에는 할 수 없습니다."
+      "snapshotPending": "스냅샷이나 복제 작업 중에는 할 수 없습니다.",
+      "template": "템플릿은 켜거나 옮기거나 지울 수 없습니다."
     },
     "deleteTitle": "{{name}}을(를) 삭제할까요?",
     "deleteDescription": "VM을 삭제합니다. 볼륨은 남습니다.",
@@ -443,7 +454,13 @@
       "ejectNamed": "드라이브 {{drive}} 빼기",
       "insertLabel": "{{name}} 드라이브 {{drive}}에 {{iso}} 넣기",
       "ejectLabel": "{{name}} 드라이브 {{drive}} 빼기"
-    }
+    },
+    "template": "템플릿",
+    "templatesOnly": "템플릿만 보기",
+    "templateClones_one": "연결 복제 {{count}}개",
+    "templateClones_other": "연결 복제 {{count}}개",
+    "linkedClone": "연결 복제",
+    "linkedDisk": "disk{{n}}: {{base}}의 연결 복제"
   },
   "snapshots": {
     "created": "만든 시각",
@@ -838,9 +855,17 @@
       "inUse": "먼저 VM에서 빼세요.",
       "notReady": "준비되면 쓸 수 있습니다.",
       "vmsUnknown": "어느 VM이 쓰는지 알 수 없습니다.",
-      "iso": "ISO 이미지는 크기를 바꿀 수 없습니다."
+      "iso": "ISO 이미지는 크기를 바꿀 수 없습니다.",
+      "template": "템플릿의 디스크입니다.",
+      "hasClones": "연결 복제의 기반입니다. 복제를 먼저 지우거나 평탄화하세요.",
+      "vmRunning": "쓰는 VM을 먼저 정지하세요."
     },
-    "showIsos": "ISO 이미지도 보기"
+    "showIsos": "ISO 이미지도 보기",
+    "base": "기반",
+    "flatten": "평탄화",
+    "flattenNamed": "{{name}} 평탄화",
+    "flattenTitle": "볼륨 {{name}}을(를) 평탄화할까요?",
+    "flattenDescription": "기반(템플릿 디스크)의 데이터를 복사해 독립 볼륨으로 만듭니다. 쓰는 VM은 꺼져 있어야 하고, 기반만큼 풀 공간을 더 씁니다."
   },
   "uploads": {
     "open": "이미지 올리기",
@@ -2280,5 +2305,129 @@
     },
     "deleteTitle": "ISO {{name}}을(를) 삭제할까요?",
     "deleteDescription": "이미지 파일을 지웁니다. 이 ISO를 넣은 VM의 스냅샷이 있으면 지울 수 없습니다."
+  },
+  "templates": {
+    "note": "템플릿은 켤 수 없는 VM 원본입니다. 배포하면 디스크를 같은 풀에 연결 복제(기반을 함께 쓰는 얇은 복사)로 만들고, 연결 복제를 못 하는 풀은 전체 복사합니다.",
+    "empty": "템플릿이 없습니다. 꺼진 VM의 메뉴에서 \"템플릿으로 바꾸기\"를 고르거나 이미지 라이브러리에서 받으세요.",
+    "disks": "디스크",
+    "clones": "연결 복제",
+    "deploy": "배포",
+    "deployNamed": "{{name}}에서 배포",
+    "revert": "VM으로 되돌리기",
+    "revertNamed": "{{name}}을(를) VM으로 되돌리기",
+    "revertTitle": "{{name}}을(를) VM으로 되돌릴까요?",
+    "revertDescription": "기반 스냅샷을 풀고 보통 VM으로 되돌립니다. 연결 복제가 남아 있으면 되돌릴 수 없습니다.",
+    "deleteTitle": "템플릿 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "VM으로 되돌린 뒤 지웁니다. 디스크 볼륨은 남습니다.",
+    "convert": "템플릿으로 바꾸기",
+    "convertTitle": "{{name}}을(를) 템플릿으로 바꿀까요?",
+    "convertDescription": "템플릿은 켤 수 없고 디스크를 바꿀 수 없습니다. 템플릿에서 VM을 배포하고, 연결 복제가 없을 때 VM으로 되돌릴 수 있습니다.",
+    "converted": "{{name}}을(를) 템플릿으로 바꿨습니다.",
+    "deployTitle": "{{name}}에서 배포",
+    "deployDescription": "비운 칸은 템플릿 값 그대로입니다. 배포 Task는 템플릿이 있는 노드에서 돕니다.",
+    "deployOp": "{{template}}에서 {{name}} 배포",
+    "deployStopped": "{{name}}을(를) 배포하지 못해 멈췄습니다(나머지 {{rest}}개 배포 안 함): {{error}}",
+    "name": "새 VM 이름",
+    "nameHint": "여러 개면 {n}이 번호로 바뀝니다(예: web-{n}).",
+    "preview": "만들 VM: {{names}}",
+    "count": "개수",
+    "first": "첫 번호",
+    "mode": "디스크 복제 방식",
+    "modes": {
+      "auto": "되는 디스크는 연결 복제",
+      "linked": "모두 연결 복제",
+      "full": "전체 복사"
+    },
+    "modeHint": {
+      "auto": "연결 복제를 못 하는 디스크는 전체 복사하고 경고를 남깁니다.",
+      "linked": "하나라도 연결 복제를 못 하면 배포하지 않습니다.",
+      "full": "기반과 상관없는 독립 디스크를 만듭니다(오래 걸립니다)."
+    },
+    "node": "켤 노드",
+    "nodeHint": "디스크가 닿는 노드여야 합니다(공유 풀이거나 그 노드의 로컬 풀).",
+    "anyNode": "정하지 않음(스케줄러)",
+    "memoryMib": "메모리(MiB)",
+    "diskLine": "disk{{n}}: {{volume}} ({{size}})",
+    "diskLinked": "연결 복제",
+    "diskFull": "전체 복사",
+    "diskNotLinkable": "연결 복제 안 됨 — 전체 복사(다른 풀이거나 연결 복제를 못 하는 풀)",
+    "diskSize": "disk{{n}} 새 크기(GiB, 늘리기만)",
+    "nics": "NIC 네트워크",
+    "nicNetwork": "nic{{n}} 네트워크",
+    "keepNetwork": "그대로({{network}})",
+    "ciNote": "cloud-init을 켜면 넣은 칸만 템플릿의 설정을 바꿉니다. 여러 개를 배포하면 호스트 이름은 비우세요(VM 이름이 호스트 이름).",
+    "start": "배포 뒤 켜기",
+    "reason": {
+      "notStopped": "꺼진 VM만 템플릿으로 바꿀 수 있습니다.",
+      "snapshots": "스냅샷을 먼저 지우세요.",
+      "ha": "HA를 먼저 끄세요.",
+      "replication": "복제 대상을 먼저 지우세요.",
+      "schedule": "예약 스냅샷을 먼저 끄세요.",
+      "linkedDisk": "연결 복제 디스크를 먼저 평탄화하세요.",
+      "clonesUnknown": "연결 복제가 있는지 알 수 없습니다.",
+      "inUse": "연결 복제가 남았습니다. 복제를 먼저 지우거나 평탄화하세요."
+    },
+    "errors": {
+      "count": "1에서 100 사이의 수를 넣으세요.",
+      "first": "0 이상의 정수를 넣으세요.",
+      "pattern": "여러 개를 배포하려면 이름에 {n}을 넣으세요.",
+      "notLinkable": "연결 복제를 못 하는 디스크가 있습니다.",
+      "vcpus": "1에서 256 사이의 수를 넣으세요.",
+      "memory": "64 MiB 이상의 정수를 넣으세요.",
+      "hostname": "여러 VM에 같은 호스트 이름을 줄 수 없습니다. 비우면 VM 이름을 씁니다.",
+      "staticIp": "여러 VM에 같은 정적 주소를 줄 수 없습니다."
+    }
+  },
+  "images": {
+    "note": "잘 알려진 클라우드 이미지 목록입니다. 받는 노드가 배포처의 체크섬 파일로 이미지를 확인하고, 원하면 받은 디스크로 템플릿을 바로 만듭니다.",
+    "add": "항목 더하기",
+    "arch": "아키텍처",
+    "allArches": "모두",
+    "image": "이미지",
+    "checksum": "체크섬",
+    "checksums": {
+      "sha256": "SHA-256",
+      "sha512": "SHA-512",
+      "sums": "체크섬 파일"
+    },
+    "source": "출처",
+    "sources": {
+      "builtin": "내장",
+      "custom": "관리자"
+    },
+    "volumes": "받은 볼륨",
+    "empty": "카탈로그 항목이 없습니다.",
+    "queued": "받기 대기 중",
+    "downloadNamed": "{{name}} 받기",
+    "removeTitle": "카탈로그 항목 {{name}}({{arch}})을(를) 지울까요?",
+    "removeDescription": "목록에서만 지웁니다. 이미 받은 볼륨과 템플릿은 남습니다.",
+    "downloadTitle": "{{name}} 받기",
+    "downloadDescription": "풀을 쓸 수 있는 노드가 이미지와 체크섬 파일을 받으므로 그 노드가 배포처에 닿아야 합니다.",
+    "downloadTemplateOp": "볼륨 {{name}} 받기와 템플릿 {{template}} 만들기",
+    "imageSize": "이미지 디스크 크기: {{size}}",
+    "volumeName": "볼륨 이름",
+    "makeTemplate": "받은 뒤 템플릿 만들기",
+    "templateName": "템플릿 이름",
+    "diskSize": "디스크 크기(GiB)",
+    "addTitle": "카탈로그 항목 더하기",
+    "addDescription": "이 클러스터만의 이미지 항목입니다. 아키텍처마다 같은 id를 쓰고, 내장 항목의 id는 쓸 수 없습니다.",
+    "id": "id",
+    "idHint": "소문자·숫자·.·_·-, 63자까지(예: myos-1.0).",
+    "title": "제목",
+    "os": "배포판",
+    "version": "판",
+    "sumsUrl": "체크섬 파일 URL",
+    "digest": "해시(16진)",
+    "defaultUser": "기본 사용자(선택)",
+    "minSize": "디스크 크기(GiB, 선택)",
+    "errors": {
+      "network": "네트워크를 고르세요.",
+      "size": "이미지 디스크 크기보다 작습니다.",
+      "id": "소문자·숫자로 시작하고 소문자·숫자·.·_·-만 쓰세요(63자까지).",
+      "required": "값을 넣으세요.",
+      "sha256": "16진 64자를 넣으세요.",
+      "sha512": "16진 128자를 넣으세요.",
+      "aarch64Bios": "aarch64 이미지는 UEFI만 됩니다."
+    }
   }
 }

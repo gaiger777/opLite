@@ -144,7 +144,7 @@ function gib(bytes: number): string {
 
 /**
  * 실행 중인 Task의 진행률 문구(로컬 디스크를 복사하는 마이그레이션과 복제): "디스크 복사 37% (14.8/40.0 GiB)",
- * "메모리 옮기는 중", "복제 12% (0.1/1.0 GiB)", 받기("받는 중 40% (0.4/1.0 GiB)", 확인, 가져오기), Ceph Task의 단계("패키지 설치 중", 모르는 단계는 그 이름). 진행률이
+ * "메모리 옮기는 중", "복제 12% (0.1/1.0 GiB)", 받기(체크섬 파일, "받는 중 40% (0.4/1.0 GiB)", 확인, 가져오기, 템플릿 만들기), Ceph Task의 단계("패키지 설치 중", 모르는 단계는 그 이름). 진행률이
  * 없거나 모르는 단계면 null이다.
  */
 export function describeProgress(task: Task, t: TFunction): string | null {
@@ -170,7 +170,13 @@ export function describeProgress(task: Task, t: TFunction): string | null {
         })
       : t("tasks.progress.downloadingUnknown", { done: gib(done) });
   }
-  if (progress?.stage === "verifying" || progress?.stage === "importing") {
+  // 체크섬 파일 받기(받기 전), 확인·가져오기, 받은 디스크로 템플릿 만들기(계획 58)
+  if (
+    progress?.stage === "checksum" ||
+    progress?.stage === "verifying" ||
+    progress?.stage === "importing" ||
+    progress?.stage === "template"
+  ) {
     return t(`tasks.progress.${progress.stage}`);
   }
   if (progress?.stage === "migrating-memory") {

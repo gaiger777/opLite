@@ -87,6 +87,14 @@ it("translates API error codes and falls back to the server message", async () =
   ).toBe(
     'The VM must be restarted first: cannot migrate VM "web": cloud-init changed while running',
   );
+  expect(
+    errorMessage(
+      t,
+      new ApiError(409, "template_in_use", 'template "tmpl" has 1 linked clone(s) (web-1)'),
+    ),
+  ).toBe(
+    'The template still has linked clones. Delete or flatten them first: template "tmpl" has 1 linked clone(s) (web-1)',
+  );
   // HA 용량 예약은 서버의 셈으로 남은 자리를 알린다(details가 없으면 앞 문장만).
   const capacity = { capacity_mib: 16384, reserve_mib: 8192, used_mib: 7168, need_mib: 2048 };
   expect(errorMessage(t, new ApiError(409, "ha_capacity", "x", capacity))).toBe(

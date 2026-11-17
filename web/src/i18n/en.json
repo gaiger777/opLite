@@ -92,7 +92,11 @@
     "disk_in_use": "The disk cannot hold an OSD: {{message}}",
     "disk_not_empty": "The disk is not empty. Choose to erase it first: {{message}}",
     "cdrom_local": "An ISO from a node-local pool is in a CD-ROM drive: {{message}}",
-    "restart_required": "The VM must be restarted first: {{message}}"
+    "restart_required": "The VM must be restarted first: {{message}}",
+    "vm_is_template": "Not possible on a template. Deploy a VM from it or convert it back first: {{message}}",
+    "volume_is_template": "A template's disk cannot be changed or deleted: {{message}}",
+    "template_in_use": "The template still has linked clones. Delete or flatten them first: {{message}}",
+    "volume_has_clones": "The volume is the base of linked clones. Delete or flatten them first: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -118,7 +122,9 @@
     "placementRules": "Placement rules",
     "placement": "Optimal placement",
     "ceph": "Ceph",
-    "isos": "ISO images"
+    "isos": "ISO images",
+    "templates": "Templates",
+    "images": "Image library"
   },
   "header": {
     "language": "Language",
@@ -209,7 +215,9 @@
       "ceph-osd-add": "Add a Ceph OSD on {{node}} {{device}}",
       "ceph-pool-create": "Create Ceph pool {{pool}} as storage pool {{name}} (size {{size}})",
       "ceph-client-install": "Install Ceph client packages on {{node}}",
-      "volume-download": "Download volume {{target}}"
+      "volume-download": "Download volume {{target}}",
+      "vm-untemplate": "Convert {{target}} back to a VM",
+      "volume-flatten": "Flatten volume {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -218,7 +226,9 @@
       "downloading": "Downloading {{percent}}% ({{done}}/{{total}} GiB)",
       "downloadingUnknown": "Downloading ({{done}} GiB)",
       "verifying": "Checking the checksum",
-      "importing": "Importing into the volume"
+      "importing": "Importing into the volume",
+      "checksum": "Fetching the checksum file",
+      "template": "Creating the template VM"
     },
     "detail": {
       "vms": "VMs: {{vms}}."
@@ -281,7 +291,8 @@
       "failed": "The VM has failed.",
       "busy": "The VM is starting or stopping.",
       "migrating": "Not available while the VM is being migrated.",
-      "snapshotPending": "Not available while a snapshot or clone task is in progress."
+      "snapshotPending": "Not available while a snapshot or clone task is in progress.",
+      "template": "A template cannot be started, migrated or deleted."
     },
     "deleteTitle": "Delete {{name}}?",
     "deleteDescription": "The VM is deleted. Its volumes are kept.",
@@ -443,7 +454,13 @@
       "ejectNamed": "Eject drive {{drive}}",
       "insertLabel": "Insert {{iso}} into drive {{drive}} of {{name}}",
       "ejectLabel": "Eject drive {{drive}} of {{name}}"
-    }
+    },
+    "template": "Template",
+    "templatesOnly": "Templates only",
+    "templateClones_one": "{{count}} linked clone",
+    "templateClones_other": "{{count}} linked clones",
+    "linkedClone": "Linked clone",
+    "linkedDisk": "disk{{n}}: linked clone of {{base}}"
   },
   "snapshots": {
     "created": "Created",
@@ -838,9 +855,17 @@
       "inUse": "Remove it from the VM first.",
       "notReady": "Available once ready.",
       "vmsUnknown": "Cannot tell which VMs use it.",
-      "iso": "ISO images cannot be resized."
+      "iso": "ISO images cannot be resized.",
+      "template": "It is a disk of a template.",
+      "hasClones": "It is the base of linked clones. Delete or flatten them first.",
+      "vmRunning": "Stop the VM using it first."
     },
-    "showIsos": "Show ISO images"
+    "showIsos": "Show ISO images",
+    "base": "Base",
+    "flatten": "Flatten",
+    "flattenNamed": "Flatten {{name}}",
+    "flattenTitle": "Flatten volume {{name}}?",
+    "flattenDescription": "Copies the data of the base (template disk) to make an independent volume. The VM using it must be stopped, and it uses as much more pool space as the base."
   },
   "uploads": {
     "open": "Upload image",
@@ -2280,5 +2305,129 @@
     },
     "deleteTitle": "Delete ISO {{name}}?",
     "deleteDescription": "The image file is deleted. Snapshots whose VM had it in a drive keep it from being deleted."
+  },
+  "templates": {
+    "note": "A template is a VM that cannot be started. Deploying makes its disks linked clones (thin copies sharing the base) in the same pool, or full copies where the pool cannot hold linked clones.",
+    "empty": "No templates. Choose \"Convert to template\" in a stopped VM's menu or download one from the image library.",
+    "disks": "Disks",
+    "clones": "Linked clones",
+    "deploy": "Deploy",
+    "deployNamed": "Deploy from {{name}}",
+    "revert": "Convert to VM",
+    "revertNamed": "Convert {{name}} to a VM",
+    "revertTitle": "Convert {{name}} back to a VM?",
+    "revertDescription": "Releases the base snapshots and makes it an ordinary VM. Not possible while linked clones remain.",
+    "deleteTitle": "Delete template {{name}}?",
+    "deleteDescription": "Converts it back to a VM and deletes it. The disk volumes are kept.",
+    "convert": "Convert to template",
+    "convertTitle": "Convert {{name}} to a template?",
+    "convertDescription": "A template cannot be started and its disks cannot be changed. Deploy VMs from it; convert it back while it has no linked clones.",
+    "converted": "Converted {{name}} to a template.",
+    "deployTitle": "Deploy from {{name}}",
+    "deployDescription": "Empty fields keep the template's values. The deploy task runs on the template's node.",
+    "deployOp": "Deploy {{name}} from {{template}}",
+    "deployStopped": "Stopped: could not deploy {{name}} ({{rest}} more not deployed): {{error}}",
+    "name": "New VM name",
+    "nameHint": "For several VMs {n} becomes a number (e.g. web-{n}).",
+    "preview": "VMs: {{names}}",
+    "count": "Count",
+    "first": "First number",
+    "mode": "Disk copies",
+    "modes": {
+      "auto": "Linked where possible",
+      "linked": "All linked",
+      "full": "Full copies"
+    },
+    "modeHint": {
+      "auto": "Disks that cannot be linked are copied in full, with a warning.",
+      "linked": "Refused if any disk cannot be a linked clone.",
+      "full": "Makes disks independent of the base (takes longer)."
+    },
+    "node": "Node to run on",
+    "nodeHint": "The node must reach the disks (a shared pool or its own local pool).",
+    "anyNode": "Not set (scheduler)",
+    "memoryMib": "Memory (MiB)",
+    "diskLine": "disk{{n}}: {{volume}} ({{size}})",
+    "diskLinked": "Linked clone",
+    "diskFull": "Full copy",
+    "diskNotLinkable": "Cannot be linked — full copy (other pool, or the pool cannot hold linked clones)",
+    "diskSize": "disk{{n}} new size (GiB, grow only)",
+    "nics": "NIC networks",
+    "nicNetwork": "nic{{n}} network",
+    "keepNetwork": "Keep ({{network}})",
+    "ciNote": "With cloud-init on, only the fields you fill change the template's settings. For several VMs leave the host name empty (the VM name is used).",
+    "start": "Start after deploying",
+    "reason": {
+      "notStopped": "Only a stopped VM can become a template.",
+      "snapshots": "Delete its snapshots first.",
+      "ha": "Turn off HA first.",
+      "replication": "Remove its replication targets first.",
+      "schedule": "Turn off scheduled snapshots first.",
+      "linkedDisk": "Flatten its linked-clone disks first.",
+      "clonesUnknown": "Cannot tell whether linked clones exist.",
+      "inUse": "Linked clones remain. Delete or flatten them first."
+    },
+    "errors": {
+      "count": "Enter a number from 1 to 100.",
+      "first": "Enter a whole number of 0 or more.",
+      "pattern": "Put {n} in the name to deploy several VMs.",
+      "notLinkable": "Some disks cannot be linked clones.",
+      "vcpus": "Enter a number from 1 to 256.",
+      "memory": "Enter a whole number of at least 64 MiB.",
+      "hostname": "Several VMs cannot share one host name. Leave it empty to use the VM names.",
+      "staticIp": "Several VMs cannot share one static address."
+    }
+  },
+  "images": {
+    "note": "Well-known cloud images. The downloading node checks each image against the publisher's checksum file and can make a template from the disk right away.",
+    "add": "Add entry",
+    "arch": "Architecture",
+    "allArches": "All",
+    "image": "Image",
+    "checksum": "Checksum",
+    "checksums": {
+      "sha256": "SHA-256",
+      "sha512": "SHA-512",
+      "sums": "Checksum file"
+    },
+    "source": "Source",
+    "sources": {
+      "builtin": "Built-in",
+      "custom": "Custom"
+    },
+    "volumes": "Downloaded volumes",
+    "empty": "No catalog entries.",
+    "queued": "Waiting to download",
+    "downloadNamed": "Download {{name}}",
+    "removeTitle": "Remove catalog entry {{name}} ({{arch}})?",
+    "removeDescription": "Removes it from the list only. Downloaded volumes and templates are kept.",
+    "downloadTitle": "Download {{name}}",
+    "downloadDescription": "A node that can use the pool downloads the image and its checksum file, so it must reach the publisher.",
+    "downloadTemplateOp": "Download volume {{name}} and create template {{template}}",
+    "imageSize": "Image disk size: {{size}}",
+    "volumeName": "Volume name",
+    "makeTemplate": "Create a template after downloading",
+    "templateName": "Template name",
+    "diskSize": "Disk size (GiB)",
+    "addTitle": "Add a catalog entry",
+    "addDescription": "An image entry for this cluster only. Use the same id for each architecture; built-in ids cannot be used.",
+    "id": "id",
+    "idHint": "Lowercase letters, digits, ., _ and -, up to 63 (e.g. myos-1.0).",
+    "title": "Title",
+    "os": "Distribution",
+    "version": "Version",
+    "sumsUrl": "Checksum file URL",
+    "digest": "Hash (hex)",
+    "defaultUser": "Default user (optional)",
+    "minSize": "Disk size (GiB, optional)",
+    "errors": {
+      "network": "Choose a network.",
+      "size": "Smaller than the image's disk size.",
+      "id": "Start with a lowercase letter or digit and use only lowercase letters, digits, ., _ and - (up to 63).",
+      "required": "Enter a value.",
+      "sha256": "Use 64 hex digits.",
+      "sha512": "Use 128 hex digits.",
+      "aarch64Bios": "aarch64 images need UEFI."
+    }
   }
 }

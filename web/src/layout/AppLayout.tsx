@@ -16,6 +16,8 @@ import {
   Languages,
   Layers,
   LayoutDashboard,
+  LayoutTemplate,
+  Library,
   ListChecks,
   Lock,
   LogOut,
@@ -67,6 +69,8 @@ const NAV: {
 }[] = [
   { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
   { to: "/vms", key: "nav.vms", icon: Server, end: false },
+  { to: "/templates", key: "nav.templates", icon: LayoutTemplate, end: false },
+  { to: "/images", key: "nav.images", icon: Library, end: false },
   { to: "/imports", key: "nav.imports", icon: Import, end: false },
   { to: "/volumes", key: "nav.volumes", icon: HardDrive, end: false },
   { to: "/isos", key: "nav.isos", icon: Disc, end: false },

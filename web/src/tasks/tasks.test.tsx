@@ -128,6 +128,20 @@ it("describes unknown operations by their kind", () => {
   expect(describeTask(clone as unknown as Task, i18n.t, "web")).toBe("Clone web");
   const migrate = { ...task("4", "pending"), spec: { op: { kind: "vm-migrate" }, target: "x" } };
   expect(describeTask(migrate as unknown as Task, i18n.t, "web")).toBe("Migrate web");
+  const untemplate = {
+    ...task("4", "pending"),
+    spec: { op: { kind: "vm-untemplate" }, target: "x" },
+  };
+  expect(describeTask(untemplate as unknown as Task, i18n.t, "tmpl")).toBe(
+    "Convert tmpl back to a VM",
+  );
+  const flatten = {
+    ...task("4", "pending"),
+    spec: { op: { kind: "volume-flatten" }, target: "x" },
+  };
+  expect(describeTask(flatten as unknown as Task, i18n.t, "web-1-disk0")).toBe(
+    "Flatten volume web-1-disk0",
+  );
 });
 
 it("names the failed node of an HA recovery", () => {
@@ -245,4 +259,7 @@ it("describes the progress of downloads", () => {
   expect(describeProgress(at("verifying", 1, 1), t)).toBe("Checking the checksum");
   expect(describeProgress(at("importing", 1, 1), t)).toBe("Importing into the volume");
   expect(describeTask(at("importing", 1, 1), t, "alpine")).toBe("Download volume alpine");
+  // 계획 58: 체크섬 파일 단계와 받은 디스크로 템플릿 만들기
+  expect(describeProgress(at("checksum", 0, 0), t)).toBe("Fetching the checksum file");
+  expect(describeProgress(at("template", 1, 1), t)).toBe("Creating the template VM");
 });

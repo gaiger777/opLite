@@ -1,4 +1,4 @@
-import { Download, Maximize2, Plus, Trash2, Upload } from "lucide-react";
+import { Download, Maximize2, Plus, SquareStack, Trash2, Upload } from "lucide-react";
 import { type RefObject, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -34,6 +34,8 @@ import { poolFormats, poolUsableSomewhere } from "@/storage/pools";
 import { UploadDialog } from "@/storage/UploadDialog";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
+import { isTemplate } from "@/templates/templates";
+import { isStopped } from "@/vms/actions";
 import { gibToBytes } from "@/vms/form";
 
 const MIB = 1024 ** 2;
@@ -50,6 +52,7 @@ export function VolumesPage() {
   // ISO 이미지는 ISO 화면에서 다룬다. 거르기 칩으로 함께 볼 수 있다.
   const [showIsos, setShowIsos] = useState(false);
   const [deleting, setDeleting] = useState<Volume | null>(null);
+  const [flattening, setFlattening] = useState<Volume | null>(null);
   // 볼륨 id. 대화상자는 살아 있는 목록에서 찾아 지금 크기를 최신으로 보인다.
   const [resizing, setResizing] = useState<string | null>(null);
   const resizingVolume = volumes.data?.find((v) => v.id === resizing);
@@ -74,6 +77,12 @@ export function VolumesPage() {
     return users;
   }, [vms.data]);
   const shown = (volumes.data ?? []).filter((v) => showIsos || !isIso(v));
+  const nameById = useMemo(() => new Map(volumes.data?.map((v) => [v.id, v.name])), [volumes.data]);
+  // 연결 복제의 기반인 볼륨(id). 복제를 지우거나 평탄화하기 전에는 지울 수 없다.
+  const bases = useMemo(
+    () => new Set(volumes.data?.flatMap((v) => (v.spec.base != null ? [v.spec.base] : []))),
+    [volumes.data],
+  );
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
   const reasonBase = useId();
 
@@ -118,6 +127,7 @@ export function VolumesPage() {
             <TableHead>{t("volumes.size")}</TableHead>
             <TableHead>{t("volumes.allocated")}</TableHead>
             <TableHead>{t("volumes.format")}</TableHead>
+            <TableHead>{t("volumes.base")}</TableHead>
             <TableHead>{t("common.state")}</TableHead>
             <TableHead>{t("common.node")}</TableHead>
             <TableHead>{t("volumes.vm")}</TableHead>
@@ -130,26 +140,41 @@ export function VolumesPage() {
         </TableHeader>
         <TableBody>
           {shown.length === 0 && (
-            <TableMessage colSpan={write ? 9 : 8} query={volumes} empty={t("volumes.empty")} />
+            <TableMessage colSpan={write ? 10 : 9} query={volumes} empty={t("volumes.empty")} />
           )}
           {shown.map((volume) => {
             const vm = userByVolume.get(volume.name);
             const ready = volume.status.phase === "ready";
             const node = volume.status.node ? nodeById.get(volume.status.node) : undefined;
             // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
+            // 템플릿의 디스크는 크기를 바꾸거나 지울 수 없다(배포 때 크기를 준다).
+            const ofTemplate = vm !== undefined && isTemplate(vm);
             const resizeReason = !ready
               ? "volumes.reason.notReady"
               : isIso(volume)
                 ? "volumes.reason.iso"
-                : null;
+                : ofTemplate
+                  ? "volumes.reason.template"
+                  : null;
             // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
             const deleteReason = !ready
               ? "volumes.reason.notReady"
               : !vms.isSuccess
                 ? "volumes.reason.vmsUnknown"
-                : vm
-                  ? "volumes.reason.inUse"
-                  : null;
+                : ofTemplate
+                  ? "volumes.reason.template"
+                  : vm
+                    ? "volumes.reason.inUse"
+                    : bases.has(volume.id)
+                      ? "volumes.reason.hasClones"
+                      : null;
+            const base = volume.spec.base;
+            // 평탄화는 꺼진 VM의 디스크만(실행 중 평탄화는 없다).
+            const flattenReason = !ready
+              ? "volumes.reason.notReady"
+              : vm && !isStopped(vm)
+                ? "volumes.reason.vmRunning"
+                : null;
             const reasons = `${reasonBase}-${volume.id}`;
             return (
               <TableRow key={volume.id}>
@@ -172,6 +197,7 @@ export function VolumesPage() {
                     : "—"}
                 </TableCell>
                 <TableCell>{volume.spec.format}</TableCell>
+                <TableCell>{base != null ? (nameById.get(base) ?? base.slice(-8)) : "—"}</TableCell>
                 <TableCell>
                   <Badge variant={ready ? "default" : "secondary"}>
                     {t(`volumes.phase.${volume.status.phase}`)}
@@ -191,7 +217,19 @@ export function VolumesPage() {
                   )}
                 </TableCell>
                 {write && (
-                  <TableCell className="text-right">
+                  <TableCell className="text-right whitespace-nowrap">
+                    {base != null && (
+                      <ReasonButton
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("volumes.flattenNamed", { name: volume.name })}
+                        reason={flattenReason}
+                        reasons={reasons}
+                        onClick={() => setFlattening(volume)}
+                      >
+                        <SquareStack />
+                      </ReasonButton>
+                    )}
                     <ReasonButton
                       variant="ghost"
                       size="icon-sm"
@@ -215,7 +253,10 @@ export function VolumesPage() {
                     >
                       <Trash2 />
                     </ReasonButton>
-                    <ReasonList base={reasons} reasons={[resizeReason, deleteReason]} />
+                    <ReasonList
+                      base={reasons}
+                      reasons={[base != null ? flattenReason : null, resizeReason, deleteReason]}
+                    />
                   </TableCell>
                 )}
               </TableRow>
@@ -233,6 +274,20 @@ export function VolumesPage() {
           onClose={() => setResizing(null)}
         />
       )}
+      <ConfirmDialog
+        open={flattening !== null}
+        onOpenChange={(open) => !open && setFlattening(null)}
+        title={t("volumes.flattenTitle", { name: flattening?.name })}
+        description={t("volumes.flattenDescription")}
+        confirmLabel={t("volumes.flatten")}
+        onConfirm={async () => {
+          const volume = flattening!;
+          const task = await call(
+            api.POST("/volumes/{key}/flatten", { params: { path: { key: volume.id } } }),
+          );
+          trackTask(task, t("tasks.op.volume-flatten", { target: volume.name }));
+        }}
+      />
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}

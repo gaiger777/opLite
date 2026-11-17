@@ -17,6 +17,7 @@ import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
 import { HaChecksPage } from "@/ha-checks/HaChecksPage";
 import { HaGroupsPage } from "@/ha-groups/HaGroupsPage";
+import { ImagesPage } from "@/images/ImagesPage";
 import { ImportPage } from "@/imports/ImportPage";
 import { ImportsPage } from "@/imports/ImportsPage";
 import { IsosPage } from "@/isos/IsosPage";
@@ -38,6 +39,7 @@ import { SettingsPage } from "@/settings/SettingsPage";
 import { PoolsPage } from "@/storage/PoolsPage";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { TasksPage } from "@/tasks/TasksPage";
+import { TemplatesPage } from "@/templates/TemplatesPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
 import { ConsolePage } from "@/vms/ConsolePage";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -67,6 +69,8 @@ function routes() {
             { path: "vms/:name", element: <VmDetailPage /> },
             { path: "vms/:name/edit", element: <VmEditPage /> },
             { path: "vms/:name/console", element: <ConsolePage /> },
+            { path: "templates", element: <TemplatesPage /> },
+            { path: "images", element: <ImagesPage /> },
             { path: "imports", element: <ImportsPage /> },
             { path: "imports/:name", element: <ImportPage /> },
             { path: "volumes", element: <VolumesPage /> },

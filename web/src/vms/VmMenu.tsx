@@ -2,12 +2,18 @@ import { MoreHorizontal } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
+import { toast } from "sonner";
 
+import { api, call } from "@/api/client";
+import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { trackTask } from "@/tasks/tasks";
+import { DeployDialog } from "@/templates/DeployDialog";
+import { convertReason, isTemplate, revertReason } from "@/templates/templates";
 import { ReasonMenuItem } from "@/components/Reason";
 import { Button } from "@/components/ui/button";
 import {
@@ -37,6 +43,8 @@ export function VmMenu({ vm }: { vm: Vm }) {
   const [confirm, setConfirm] = useState<VmDialog | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
+  const { convert, revert } = useTemplateReasons(vm);
+  const template = isTemplate(vm);
   // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
   const reasonOf = (action: VmOperation) => {
     const able = availability(vm, action, vmTasks);
@@ -85,9 +93,17 @@ export function VmMenu({ vm }: { vm: Vm }) {
             </ReasonMenuItem>
           )}
           {clone && (
-            <DropdownMenuItem onSelect={() => setConfirm("clone")}>
-              {t("vms.action.clone")}
+            <DropdownMenuItem onSelect={() => setConfirm(template ? "deploy" : "clone")}>
+              {template ? t("templates.deploy") : t("vms.action.clone")}
             </DropdownMenuItem>
+          )}
+          {write && (
+            <ReasonMenuItem
+              reason={template ? revert : convert}
+              onSelect={() => setConfirm(template ? "untemplate" : "template")}
+            >
+              {template ? t("templates.revert") : t("templates.convert")}
+            </ReasonMenuItem>
           )}
           {write && (
             <>
@@ -115,8 +131,22 @@ export function VmMenu({ vm }: { vm: Vm }) {
   );
 }
 
+/**
+ * 템플릿으로 바꿀 수 없는 이유와 VM으로 되돌릴 수 없는 이유(번역 키). 스냅샷·볼륨 목록을 모르면 그것으로는 막지 않는다
+ * (되돌리기는 연결 복제를 모르면 막는다).
+ */
+export function useTemplateReasons(vm: Vm): { convert: string | null; revert: string | null } {
+  const snapshots = useList("snapshot");
+  const volumes = useList("volume");
+  return {
+    convert: convertReason(vm, snapshots.data, volumes.data),
+    revert: revertReason(vm, volumes.data),
+  };
+}
+
 /** 메뉴·상세 버튼이 여는 대화상자 */
-export type VmDialog = "force-stop" | "delete" | "clone" | "migrate";
+export type VmDialog =
+  "force-stop" | "delete" | "clone" | "migrate" | "deploy" | "template" | "untemplate";
 
 /** 강제 정지·삭제의 확인과 복제·마이그레이션 대화상자 */
 export function VmConfirm({
@@ -161,6 +191,35 @@ export function VmConfirm({
       {which === "migrate" && (
         <VmMigrateDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />
       )}
+      {which === "deploy" && (
+        <DeployDialog template={vm} onClose={onClose} returnFocus={returnFocus} />
+      )}
+      <ConfirmDialog
+        open={which === "template"}
+        onOpenChange={(open) => !open && onClose()}
+        title={t("templates.convertTitle", { name: vm.name })}
+        description={t("templates.convertDescription")}
+        confirmLabel={t("templates.convert")}
+        returnFocus={returnFocus}
+        onConfirm={async () => {
+          await call(api.POST("/vms/{key}/template", { params: { path: { key: vm.id } } }));
+          toast.success(t("templates.converted", { name: vm.name }));
+        }}
+      />
+      <ConfirmDialog
+        open={which === "untemplate"}
+        onOpenChange={(open) => !open && onClose()}
+        title={t("templates.revertTitle", { name: vm.name })}
+        description={t("templates.revertDescription")}
+        confirmLabel={t("templates.revert")}
+        returnFocus={returnFocus}
+        onConfirm={async () => {
+          const task = await call(
+            api.DELETE("/vms/{key}/template", { params: { path: { key: vm.id } } }),
+          );
+          trackTask(task, t("tasks.op.vm-untemplate", { target: vm.name }));
+        }}
+      />
     </>
   );
 }

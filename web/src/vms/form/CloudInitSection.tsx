@@ -30,9 +30,10 @@ export function CloudInitSection({
   onChange,
   running,
 }: {
-  values: VmFormValues;
+  /** VM 폼의 값. 배포 창은 이름(패턴)·NIC·cloud-init만 준다. */
+  values: Pick<VmFormValues, "name" | "nics" | "cloudInit">;
   errors: Record<string, string>;
-  onChange: (patch: Partial<VmFormValues>) => void;
+  onChange: (patch: Pick<VmFormValues, "cloudInit">) => void;
   /** 실행 중인 VM이다(바꾸면 다시 시작할 때 적용) */
   running: boolean;
 }) {

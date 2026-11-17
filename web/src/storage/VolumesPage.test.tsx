@@ -355,3 +355,58 @@ it("downloads a disk image from a URL", async () => {
     format: "raw",
   });
 });
+
+it("shows linked clones' bases and flattens a stopped VM's disk", async () => {
+  const base = volume("tmpl-root", "local");
+  const linked = (name: string) => {
+    const v = volume(name, "local");
+    return { ...v, spec: { ...v.spec, base: base.id } };
+  };
+  const withDisk = (v: ReturnType<typeof vm>, disk: string, template = false) => ({
+    ...v,
+    spec: { ...v.spec, template, disks: [{ volume: disk, bus: "virtio-blk" as const }] },
+  });
+  mockLists({
+    volume: [base, linked("web-1-root"), linked("web-2-root")],
+    vm: [
+      withDisk(vm("tmpl", "stopped"), "tmpl-root", true),
+      withDisk(vm("web-1", "stopped"), "web-1-root"),
+      withDisk(vm("web-2", "running"), "web-2-root"),
+    ],
+    node: [NODE],
+  });
+  let flattened = false;
+  server.use(
+    http.post(apiUrl(`/volumes/${linked("web-1-root").id}/flatten`), () => {
+      flattened = true;
+      return HttpResponse.json(task("t-f", "volume-flatten", "x"), { status: 202 });
+    }),
+  );
+  renderPage(<VolumesPage />);
+  const table = await screen.findByRole("table", { name: "Volumes" });
+  const baseColumn = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Base");
+  const tmplRow = (await within(table).findByRole("button", { name: "Resize tmpl-root" })).closest(
+    "tr",
+  )!;
+  // 템플릿의 디스크는 크기를 바꾸거나 지울 수 없고, 평탄화할 것도 없다.
+  expect(
+    within(tmplRow).getByRole("button", { name: "Resize tmpl-root" }),
+  ).toHaveAccessibleDescription("It is a disk of a template.");
+  expect(
+    within(tmplRow).queryByRole("button", { name: "Flatten tmpl-root" }),
+  ).not.toBeInTheDocument();
+  const web2 = within(table).getByText("web-2-root").closest("tr")!;
+  expect(within(web2).getAllByRole("cell")[baseColumn]).toHaveTextContent("tmpl-root");
+  expect(
+    within(web2).getByRole("button", { name: "Flatten web-2-root" }),
+  ).toHaveAccessibleDescription("Stop the VM using it first.");
+  const web1 = within(table).getByText("web-1-root").closest("tr")!;
+  const user = userEvent.setup();
+  await user.click(within(web1).getByRole("button", { name: "Flatten web-1-root" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Flatten volume web-1-root?" });
+  await user.click(within(dialog).getByRole("button", { name: "Flatten" }));
+  await waitFor(() => expect(flattened).toBe(true));
+  expect(await screen.findByText("Flatten volume web-1-root")).toBeInTheDocument();
+});

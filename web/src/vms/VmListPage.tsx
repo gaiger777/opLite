@@ -34,6 +34,7 @@ import {
 import { formatMib } from "@/lib/format";
 import { readPref, writePref } from "@/lib/prefs";
 import { useVmActions } from "@/vms/actions";
+import { isTemplate } from "@/templates/templates";
 import { haEnabled } from "@/vms/ha";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -75,6 +76,12 @@ export function VmListPage() {
   const { runMany } = useVmActions();
   const taskIndex = useTaskIndex();
   const [filter, setFilter] = useState("");
+  // 템플릿만 보기(거름 칩)
+  const [templatesOnly, setTemplatesOnly] = useState(false);
+  const shown = useMemo(
+    () => (templatesOnly ? (vms.data ?? []).filter(isTemplate) : (vms.data ?? [])),
+    [vms.data, templatesOnly],
+  );
   const [sorting, setSorting] = useState<SortingState>(savedSorting);
   const [selection, setSelection] = useState<RowSelectionState>({});
 
@@ -124,6 +131,11 @@ export function VmListPage() {
                 {t("vms.ha")}
               </Badge>
             )}
+            {isTemplate(row.original) && (
+              <Badge variant="secondary" className="ml-2">
+                {t("vms.template")}
+              </Badge>
+            )}
           </>
         ),
       },
@@ -156,7 +168,7 @@ export function VmListPage() {
   );
 
   const table = useReactTable({
-    data: vms.data ?? [],
+    data: shown,
     columns,
     state: { sorting, rowSelection: selection, globalFilter: filter },
     getRowId: (vm) => vm.id,
@@ -197,6 +209,16 @@ export function VmListPage() {
             </Button>
           )}
         </div>
+      </div>
+      <div>
+        <Button
+          variant={templatesOnly ? "secondary" : "outline"}
+          size="sm"
+          aria-pressed={templatesOnly}
+          onClick={() => setTemplatesOnly((v) => !v)}
+        >
+          {t("vms.templatesOnly")}
+        </Button>
       </div>
       {selected.length > 0 && can(me.role, "operate", "vm") && (
         <div className="flex items-center gap-2 text-sm">

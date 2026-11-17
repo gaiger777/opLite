@@ -226,7 +226,7 @@ function poolStateOn(pool: StoragePool, node: Node): PoolState | undefined {
  * 이 노드에서 풀을 쓸 수 있는지. 서버의 `pool_usable_on`(위트니스가 아니고 노드 목록이 허용하고
  * 준비됐다고 알림 — 디렉터리 풀은 알리지 않았어도 됨)에 노드가 온라인일 것을 더한다.
  */
-function usableOn(pool: StoragePool, node: Node): boolean {
+export function usableOn(pool: StoragePool, node: Node): boolean {
   const listed = pool.spec.nodes ?? [];
   if (
     node.spec.witness ||
