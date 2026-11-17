@@ -81,9 +81,9 @@
   - **리뷰 1:** 노드 사이 되돌리기와 배포의 엇갈림(둘 다 Raft에 쓰고 다시 보아 뒤에 쓴 쪽이 물러남, 배포·되돌리기 Task 노드를 `template_node`로 통일), 평탄화 중 켜기·핫플러그·마이그레이션 막기(`VolumeFlattening`, 409 `vm_busy`)와 ZFS 평탄화의 `written@opl-flatten` 확인, `POST /volumes`의 `base` 거절, 템플릿·연결 복제 VM 백업의 비트맵 만들지 않기, 카탈로그 템플릿 초안의 호스트 이름·정적 IP 거절, RBD 기반 풀기 실패 안내 문구, 바꾸기 API의 바쁨 검사·스냅샷 되돌리기의 템플릿 검사·권한 없는 사용자에게 덮어쓰기의 `user_data`·`vendor_data` 가림·ZFS `-flat` 정리·지우기 Task의 템플릿 디스크 재확인.
   - **리뷰 2:** 지난 노드가 빠졌거나 꺼진 템플릿의 Task 노드 고르기와 되돌리기의 `release_base` 건너뛰기(웹 배포 창도 같은 규칙), 되돌리기의 표시 되돌리기를 스펙이 같을 때만 하기(바뀌었으면 보통 VM으로 두고 안내), 끊긴·이미 보통 VM인 되돌리기 Task의 남은 복제 보고, 끝나지 않은 `vm-untemplate` 동안 켜기·PUT·CD·바꾸기·지우기 409 `vm_busy`, `vm start`의 템플릿 재확인, 카탈로그 URL의 사용자 정보 거절·비관리자 가림·`url` 크레이트 해석·id·칸 길이 상한.
 - 이 Mac에서 `cargo test --workspace` 2912개, 웹 시험 781개가 통과했다.
-- svc01에서 일반 시험 묶음이 통과했다(시험 2988개). Linux에서만 나는 시험 하나가 한 번 흔들려 뒤에 고쳤다.
-- GitHub 탐침에서 linux-kvm(LVM-thin·ZFS·RBD·공유 LVM·NFS의 연결 복제 흐름과 마이그레이션), install-media(실제 Ubuntu 24.04 게스트: 템플릿 → 연결 복제 2대 → 부팅·보고 → 평탄화), ceph·ldap·package·catalog-links가 통과했다. iso-e2e uefi는 한 번 Debian netinst 설치 중 시간 초과가 났다 — 이 계획과 상관없다.
-- 배포: (배포 후 채움)
+- svc01에서 일반 시험 묶음이 통과했다(최종 시험 2997개, 실패 0). Linux에서만 나는 시험 하나가 한 번 흔들려 뒤에 고쳤다.
+- GitHub 탐침에서 linux-kvm(LVM-thin·ZFS·RBD·공유 LVM·NFS의 연결 복제 흐름과 마이그레이션), install-media(실제 Ubuntu 24.04 게스트: 템플릿 → 연결 복제 2대 → 부팅·보고 → 평탄화), ceph·ldap·package·catalog-links·iso-e2e(bios·uefi)가 통과했다. 앞선 탐침에서 iso-e2e uefi가 한 번 Debian netinst 설치 중 시간 초과가 났다 — 이 계획과 상관없다. 최종 탐침의 linux-kvm에서 ZFS 연결 복제 시험이 zvol을 만든 직후 장치 노드를 못 찾아 한 번 실패했고(udev 타이밍, 계획 58 이전 코드), 같은 작업을 다시 돌려 통과했다.
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서로 바이너리만 바꿨다(유닛은 같아 그대로). 두 노드 모두 sha256이 빌드와 같고, 헬스 `ok`, 두 voter 모두 online, 기능에 `templates`가 있다. `template list`는 빈 목록, `image list`는 내장 14개 항목, `/templates`·`/images` 화면 경로는 새 웹 빌드(index-CcNpxwnD.js)를 돌려준다. svc02의 test-vm은 QEMU PID 916 그대로 실행 중이다. 저널에 ERROR·panic은 없다.
 
 ## 다음 계획으로 넘길 사항
 
