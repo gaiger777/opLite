@@ -249,6 +249,8 @@ async fn rbd_pool_runs_snapshots_reverts_and_clones_a_vm() {
     assert_eq!(rbd_names(&pool, &image), vec![image.clone()]);
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     assert!(rbd_names(&pool, &image).is_empty());
+    // 템플릿 → 배포 → 켜기 → 기반 지우기 거절 → 평탄화 → 지우기(계획 58, RBD: 보호한 opl-base에 clone)
+    common::linked_clone_flow(&d, "ceph", true).await;
     d.ctl(&["pool", "delete", "local"]).await.unwrap();
     d.ctl(&["pool", "delete", "ceph"]).await.unwrap();
     d.stop();

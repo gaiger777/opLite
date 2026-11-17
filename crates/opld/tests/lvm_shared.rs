@@ -349,6 +349,8 @@ async fn lvm_shared_pool_runs_and_clones_a_vm_and_deactivates_its_disk() {
     for name in [&lv, &twin, &idle] {
         assert!(lvs(name).is_empty(), "{}", diagnostics(&d));
     }
+    // 템플릿 → 배포 → 켜기 → 기반 지우기 거절 → 평탄화 → 지우기(계획 58, 공유 LVM: 연결 복제가 없어 전체 복사 + 경고)
+    common::linked_clone_flow(&d, "san", false).await;
     d.ctl(&["pool", "delete", "local"]).await.unwrap();
     d.ctl(&["pool", "delete", "san"]).await.unwrap();
     d.stop();

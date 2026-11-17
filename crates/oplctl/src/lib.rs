@@ -7,6 +7,7 @@ mod config;
 mod console;
 mod media;
 mod output;
+mod template;
 
 pub use cli::run;
 pub use client::Client;

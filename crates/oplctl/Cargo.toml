@@ -13,6 +13,10 @@ autobins = false
 name = "orbivisorctl"
 path = "src/main.rs"
 
+[features]
+# 내장 이미지 카탈로그의 URL과 체크섬 파일을 실제 서버에 확인하는 시험(계획 58, CI `catalog.yml`). 인터넷이 필요하다.
+catalog-it = []
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

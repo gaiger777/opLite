@@ -1,0 +1,28 @@
+name: Catalog
+
+# 내장 이미지 카탈로그(계획 58)의 링크 확인: 항목마다 이미지 URL이 답하고 체크섬 파일에 그 이미지의 줄이 있는지 본다
+# (이미지는 받지 않는다). 바깥 서버 사정으로 푸시 CI를 깨지 않게 따로 주 1회 돌린다. 실패하면 `BUILTIN`을 고친다.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 1"
+  push:
+    branches: ["ci-probe/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  catalog-links:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL headers (native-tls)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config
+      - name: Built-in catalog URLs and checksum files
+        run: cargo test -p oplctl --features catalog-it --test catalog -- --nocapture

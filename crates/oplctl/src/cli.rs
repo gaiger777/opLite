@@ -21,6 +21,10 @@ use crate::media::{
     cdrom_lines, cdroms_value, cloud_init_lines, cloud_init_update, iso, parse_boot, vm_cdrom,
 };
 use crate::output::{bytes, cell, json as print_json, table};
+use crate::template::{
+    ImageCmd, TemplateCmd, VOLUME_HEADERS, image, linked_value, template, template_lines,
+    volume_flatten, volume_row,
+};
 
 #[derive(Parser)]
 #[command(
@@ -96,6 +100,16 @@ enum Cmd {
     Vm {
         #[command(subcommand)]
         cmd: VmCmd,
+    },
+    /// 템플릿(켤 수 없는 원본 VM): 바꾸기·되돌리기, 목록, 배포(연결 복제·여러 VM)
+    Template {
+        #[command(subcommand)]
+        cmd: TemplateCmd,
+    },
+    /// 이미지 라이브러리: 잘 알려진 클라우드 이미지 카탈로그, 받기(→ 템플릿), 관리자 항목
+    Image {
+        #[command(subcommand)]
+        cmd: ImageCmd,
     },
     /// HA 그룹: HA VM을 놓고 복구할 노드와 우선순위
     HaGroup {
@@ -1328,8 +1342,15 @@ enum VolumeCmd {
         #[arg(long)]
         url: String,
         /// 받은 파일의 SHA-256(16진 64자). 다르면 실패하고 지운다.
-        #[arg(long, value_name = "HEX")]
+        #[arg(long, value_name = "HEX", conflicts_with_all = ["sha512", "checksum_url"])]
         sha256: Option<String>,
+        /// 받은 파일의 SHA-512(16진 128자). 다르면 실패하고 지운다.
+        #[arg(long, value_name = "HEX", conflicts_with = "checksum_url")]
+        sha512: Option<String>,
+        /// 이미지와 같은 곳의 체크섬 파일(`SHA256SUMS`·`SHA512SUMS`·`CHECKSUM` 등). 받기 전에 이미지 파일 이름의 줄을
+        /// 찾아 그 해시로 확인한다.
+        #[arg(long, value_name = "URL")]
+        checksum_url: Option<String>,
         /// 받은 파일의 형식(기본 raw)
         #[arg(long, value_enum)]
         source_format: Option<SourceFormat>,
@@ -1349,6 +1370,13 @@ enum VolumeCmd {
     },
     Delete {
         volume: String,
+    },
+    /// 연결 복제 볼륨을 기반과 떼어 독립 볼륨으로 만든다. 쓰는 VM은 꺼져 있어야 한다.
+    Flatten {
+        volume: String,
+        /// 평탄화 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
     },
 }
 
@@ -1536,7 +1564,8 @@ enum VmCmd {
         #[arg(long)]
         with_snapshots: bool,
     },
-    /// VM을 복제해 새 VM(꺼짐)을 만든다. 디스크는 새 볼륨에 복사하고 NIC는 새 MAC을 받는다.
+    /// VM을 복제해 새 VM(꺼짐)을 만든다. 디스크는 새 볼륨에 복사하고 NIC는 새 MAC을 받는다. 템플릿이면 되는
+    /// 디스크는 연결 복제다(바꾸는 배포는 `template deploy`).
     Clone {
         vm: String,
         /// 새 VM 이름
@@ -1547,6 +1576,12 @@ enum VmCmd {
         /// 새 디스크를 둘 풀. 생략하면 원본 볼륨과 같은 풀이다.
         #[arg(long)]
         pool: Option<String>,
+        /// 모든 디스크를 연결 복제로(템플릿만, 안 되면 실패)
+        #[arg(long, conflicts_with = "full")]
+        linked: bool,
+        /// 모든 디스크를 전체 복사로
+        #[arg(long)]
+        full: bool,
     },
     /// VM 스냅샷(디스크, 실행 중이면 메모리, VM 설정)
     Snapshot {
@@ -5377,7 +5412,7 @@ async fn realm(
 }
 
 /// `1024`, `512M`, `10G`처럼 쓴다.
-fn parse_size(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
     let (num, shift) = match s.chars().last() {
         Some('K' | 'k') => (&s[..s.len() - 1], 10),
@@ -5671,21 +5706,10 @@ where
         Cmd::Volume { cmd } => match cmd {
             VolumeCmd::List => {
                 let list = client.get("/volumes").await?;
-                print_list(
-                    out,
-                    json_out,
-                    &list,
-                    &["NAME", "POOL", "SIZE", "FORMAT", "ALLOCATED"],
-                    |v| {
-                        vec![
-                            cell(&v["name"]),
-                            cell(&v["spec"]["pool"]),
-                            bytes(&v["spec"]["size_bytes"]),
-                            cell(&v["spec"]["format"]),
-                            bytes(&v["status"]["allocated_bytes"]),
-                        ]
-                    },
-                )?;
+                let volumes = items(&list);
+                print_list(out, json_out, &list, VOLUME_HEADERS, |v| {
+                    volume_row(v, &volumes)
+                })?;
             }
             VolumeCmd::Get { volume } => print_json(
                 out,
@@ -5729,6 +5753,8 @@ where
                 pool,
                 url,
                 sha256,
+                sha512,
+                checksum_url,
                 source_format,
                 format,
                 no_wait,
@@ -5736,6 +5762,12 @@ where
                 let mut body = json!({ "name": name, "pool": pool, "url": url });
                 if let Some(sum) = sha256 {
                     body["sha256"] = json!(sum);
+                }
+                if let Some(sum) = sha512 {
+                    body["sha512"] = json!(sum);
+                }
+                if let Some(url) = checksum_url {
+                    body["checksum_url"] = json!(url);
                 }
                 if let Some(f) = source_format {
                     body["source_format"] = json!(value_name(f));
@@ -5759,9 +5791,16 @@ where
                 client.wait_task(&task).await?;
                 writeln!(out, "volume {volume} deleted")?;
             }
+            VolumeCmd::Flatten { volume, no_wait } => {
+                volume_flatten(&client, &volume, no_wait, out).await?
+            }
         },
         Cmd::Iso { cmd } => iso(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
+        Cmd::Template { cmd } => {
+            template(&client, cmd, json_out, out, &mut std::io::stderr()).await?
+        }
+        Cmd::Image { cmd } => image(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::HaGroup { cmd } => ha_group(&client, cmd, json_out, out).await?,
         Cmd::HaCheck { cmd } => ha_check(&client, cmd, json_out, out).await?,
         Cmd::PlacementRule { cmd } => placement_rule(&client, cmd, json_out, out).await?,
@@ -7430,6 +7469,14 @@ async fn vm_get(
         {
             writeln!(err, "{line}")?;
         }
+        // 볼륨을 읽을 권한이 없으면 템플릿 줄만 보인다.
+        let volumes = match client.get("/volumes").await {
+            Ok(list) => items(&list),
+            Err(_) => Vec::new(),
+        };
+        for line in template_lines(&vm, &volumes) {
+            writeln!(err, "{line}")?;
+        }
         if !replica_entries(&vm).is_empty() || vm["status"]["last_recovery"].is_object() {
             let items = |list: Value| list["items"].as_array().cloned().unwrap_or_default();
             let nodes = items(client.get("/nodes").await?);
@@ -7751,13 +7798,21 @@ async fn vm(
             name,
             snapshot,
             pool,
+            linked,
+            full,
         } => {
-            let body = json!({ "name": name, "snapshot": snapshot, "pool": pool });
+            let mut body = json!({ "name": name, "snapshot": snapshot, "pool": pool });
+            if let Some(linked) = linked_value(linked, full) {
+                body["linked"] = json!(linked);
+            }
             let task = client
                 .post(&format!("/vms/{}/clone", seg(&vm)), &body)
                 .await?;
-            client.wait_task(&task).await?;
+            let done = client.wait_task_for(&task, IMPORT_WAIT).await?;
             writeln!(out, "vm {name} cloned from {vm}")?;
+            if let Some(warning) = done["status"]["error"].as_str() {
+                eprintln!("warning: {warning}");
+            }
         }
         VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
         VmCmd::Stats { vm, stats } => {
@@ -7811,17 +7866,23 @@ fn task_row(t: &Value) -> Vec<String> {
 /// `vm list`의 열
 const VM_HEADERS: &[&str] = &["NAME", "POWER", "PHASE", "NODE", "HA", "PID", "ERROR"];
 
-/// `vm list`의 한 행. 마이그레이션 중이면 NODE에 대상 노드를 붙인다(`A -> B`).
+/// `vm list`의 한 행. 마이그레이션 중이면 NODE에 대상 노드를 붙인다(`A -> B`). 템플릿이면 PHASE가 `template`이다.
 fn vm_row(v: &Value) -> Vec<String> {
     let mut node = cell(&v["status"]["node"]);
     let target = &v["status"]["migration"]["node"];
     if !target.is_null() {
         node = format!("{node} -> {}", cell(target));
     }
+    // 템플릿은 켜지지 않으므로 PHASE 자리에 템플릿임을 보인다.
+    let phase = if v["spec"]["template"] == true {
+        "template".to_string()
+    } else {
+        cell(&v["status"]["phase"])
+    };
     vec![
         cell(&v["name"]),
         cell(&v["spec"]["power"]),
-        cell(&v["status"]["phase"]),
+        phase,
         node,
         ha_cell(&v["spec"]["ha"]),
         cell(&v["status"]["pid"]),
@@ -8930,8 +8991,59 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Vm { cmd: VmCmd::Clone { vm, name, snapshot: Some(s), pool: Some(p) } }
+            Cmd::Vm { cmd: VmCmd::Clone { vm, name, snapshot: Some(s), pool: Some(p), linked: false, full: false } }
                 if vm == "web" && name == "copy" && s == "base" && p == "fast"
+        ));
+        let cli =
+            Cli::try_parse_from(["oplctl", "vm", "clone", "tmpl", "web-1", "--linked"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Clone {
+                    linked: true,
+                    full: false,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "clone", "t", "w", "--linked", "--full"]).is_err()
+        );
+        // 체크섬 방법은 하나만
+        assert!(
+            Cli::try_parse_from([
+                "oplctl",
+                "volume",
+                "download",
+                "v",
+                "--pool",
+                "p",
+                "--url",
+                "http://h/x",
+                "--sha256",
+                "a",
+                "--checksum-url",
+                "http://h/SUMS",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "volume",
+            "download",
+            "v",
+            "--pool",
+            "p",
+            "--url",
+            "http://h/x",
+            "--checksum-url",
+            "http://h/SUMS",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Volume { cmd: VolumeCmd::Download { checksum_url: Some(u), sha256: None, sha512: None, .. } }
+                if u == "http://h/SUMS"
         ));
         let schedule = |args: &[&str]| {
             let mut argv = vec!["oplctl", "vm", "snapshot", "schedule", "web"];
@@ -9993,6 +10105,9 @@ mod tests {
         assert_eq!(vm_row(&vm)[4], "ignored");
         vm["spec"]["ha"] = json!({ "group": "rack-a" });
         assert_eq!(vm_row(&vm)[4], "started");
+        // 템플릿(계획 58)
+        vm["spec"]["template"] = json!(true);
+        assert_eq!(vm_row(&vm)[2], "template");
     }
 
     #[test]

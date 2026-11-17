@@ -209,6 +209,8 @@ async fn lvm_pool_runs_snapshots_reverts_and_clones_a_vm() {
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     assert!(lvs(vg, &lv).is_empty());
     assert!(!dev.exists());
+    // 템플릿 → 배포 → 켜기 → 기반 지우기 거절 → 평탄화 → 지우기(계획 58, LVM-thin: thin 스냅샷)
+    common::linked_clone_flow(&d, "lvm", true).await;
     d.ctl(&["pool", "delete", "local"]).await.unwrap();
     d.ctl(&["pool", "delete", "lvm"]).await.unwrap();
     d.stop();

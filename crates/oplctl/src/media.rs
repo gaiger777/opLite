@@ -181,28 +181,42 @@ pub(crate) async fn download(
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let name = cell(&body["name"]);
+    let label = format!("{what} {}", cell(&body["name"]));
     let task = client.post("/volumes/download", body).await?;
+    if watch_download(client, &task, &label, no_wait, out, err)
+        .await?
+        .is_some()
+    {
+        writeln!(out, "{label} downloaded")?;
+    }
+    Ok(())
+}
+
+/// 받기 Task `task`를 끝날 때까지 기다리며 진행 줄(`{label}: downloading …`)을 `err`에 쓰고 끝난 Task를 돌려준다.
+/// `no_wait`이면 Task id만 알리고 None이다.
+pub(crate) async fn watch_download(
+    client: &Client,
+    task: &Value,
+    label: &str,
+    no_wait: bool,
+    out: &mut (dyn Write + Send),
+    err: &mut (dyn Write + Send),
+) -> anyhow::Result<Option<Value>> {
     if no_wait {
-        writeln!(
-            out,
-            "{what} {name}: download task {} started",
-            cell(&task["id"])
-        )?;
-        return Ok(());
+        writeln!(out, "{label}: download task {} started", cell(&task["id"]))?;
+        return Ok(None);
     }
     let mut shown = None;
-    client
-        .wait_task_watch(&task, IMPORT_WAIT, |t| {
+    let done = client
+        .wait_task_watch(task, IMPORT_WAIT, |t| {
             if let Some(line) = download_progress(&t["status"]["progress"], &mut shown) {
                 // 진행 줄을 쓰지 못해도(stderr가 닫힘) 받기는 계속 기다린다.
-                let _ = writeln!(err, "{what} {name}: {line}");
+                let _ = writeln!(err, "{label}: {line}");
             }
             Ok(())
         })
         .await?;
-    writeln!(out, "{what} {name} downloaded")?;
-    Ok(())
+    Ok(Some(done))
 }
 
 /// 마지막으로 알린 받기 진행: (단계, 받은 바이트)

@@ -352,3 +352,98 @@ where
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+/// 템플릿과 연결 복제의 한 흐름(계획 58, 풀마다 같은 단계): 풀 `pool`에 디스크 하나인 VM을 만들어 템플릿으로 바꾸고,
+/// 켜기가 거절되는지 본 뒤, 디스크를 늘려 배포하고 켠다. `linked`(풀이 연결 복제를 만듦)면 새 디스크의 `base`가
+/// 템플릿 디스크이고, 템플릿 디스크 지우기·되돌리기·실행 중 평탄화가 거절되며, 끈 뒤 평탄화하면 `base`가 없어진다.
+/// 아니면(공유 LVM) 전체 복사이고 평탄화는 400이다. 평탄화한 디스크로 다시 켠 뒤 모두 지운다(템플릿 디스크 볼륨까지).
+/// 볼륨·VM 이름은 `pool`로 시작한다.
+pub async fn linked_clone_flow(d: &Daemon, pool: &str, linked: bool) {
+    let (base, tmpl, web) = (
+        format!("{pool}-tmpl-root"),
+        format!("{pool}-tmpl"),
+        format!("{pool}-web"),
+    );
+    d.ctl(&["volume", "create", &base, "--pool", pool, "--size", "64M"])
+        .await
+        .unwrap();
+    d.ctl(&["vm", "create", &tmpl, "--memory", "256", "--disk", &base])
+        .await
+        .unwrap();
+    let out = d.ctl(&["template", "convert", &tmpl]).await.unwrap();
+    assert_eq!(out, format!("vm {tmpl} is now a template\n"));
+    let err = d.ctl(&["vm", "start", &tmpl]).await.unwrap_err();
+    assert!(err.to_string().ends_with("(vm_is_template)"), "{err}");
+
+    let out = d
+        .ctl(&[
+            "template",
+            "deploy",
+            &tmpl,
+            "--name",
+            &web,
+            "--disk-size",
+            "disk0=128M",
+            "--start",
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "vm {web} deployed from {tmpl}\nvm {web}: running on {}\n",
+            d.name
+        )
+    );
+    let vm = d.ctl_json(&["vm", "get", &web]).await;
+    assert_eq!(vm["spec"]["template"], serde_json::Value::Null, "{vm}");
+    assert_eq!(vm["status"]["phase"], "running", "{vm}");
+    let disk = vm["spec"]["disks"][0]["volume"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let volume = d.ctl_json(&["volume", "get", &disk]).await;
+    let base_volume = d.ctl_json(&["volume", "get", &base]).await;
+    assert_eq!(volume["spec"]["pool"], pool, "{volume}");
+    assert_eq!(volume["spec"]["size_bytes"], 128 << 20, "{volume}");
+    if linked {
+        assert_eq!(volume["spec"]["base"], base_volume["id"], "{volume}");
+        let table = d.ctl(&["template", "list"]).await.unwrap();
+        assert!(
+            table
+                .lines()
+                .any(|l| l.split_whitespace().eq([tmpl.as_str(), &base, pool, "1"])),
+            "{table}"
+        );
+        let err = d.ctl(&["volume", "delete", &base]).await.unwrap_err();
+        assert!(err.to_string().ends_with("(volume_is_template)"), "{err}");
+        let err = d.ctl(&["template", "unconvert", &tmpl]).await.unwrap_err();
+        assert!(err.to_string().ends_with("(template_in_use)"), "{err}");
+        let err = d.ctl(&["volume", "flatten", &disk]).await.unwrap_err();
+        assert!(err.to_string().ends_with("(vm_running)"), "{err}");
+    } else {
+        assert_eq!(volume["spec"]["base"], serde_json::Value::Null, "{volume}");
+    }
+
+    d.ctl(&["vm", "stop", &web, "--force"]).await.unwrap();
+    if linked {
+        let out = d.ctl(&["volume", "flatten", &disk]).await.unwrap();
+        assert_eq!(out, format!("volume {disk} flattened\n"));
+        let volume = d.ctl_json(&["volume", "get", &disk]).await;
+        assert_eq!(volume["spec"]["base"], serde_json::Value::Null, "{volume}");
+    } else {
+        let err = d.ctl(&["volume", "flatten", &disk]).await.unwrap_err();
+        assert!(err.to_string().contains("is not a linked clone"), "{err}");
+    }
+    let out = d.ctl(&["vm", "start", &web]).await.unwrap();
+    assert!(out.contains(&format!("vm {web}: start done")), "{out}");
+    d.ctl(&["vm", "stop", &web, "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", &web]).await.unwrap();
+    d.ctl(&["volume", "delete", &disk]).await.unwrap();
+    let out = d.ctl(&["template", "delete", &tmpl]).await.unwrap();
+    assert_eq!(
+        out,
+        format!("template {tmpl} deleted (its disk volumes are kept)\n")
+    );
+    d.ctl(&["volume", "delete", &base]).await.unwrap();
+}

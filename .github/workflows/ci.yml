@@ -383,9 +383,11 @@ jobs:
   # 설치 매체와 cloud-init(계획 57)의 실제 게스트: 받아 둔 Alpine virt ISO로 BIOS·UEFI VM이 CD에서 부팅하는지, Ubuntu
   # 24.04 클라우드 이미지에 cloud-init이 호스트 이름·사용자·비밀번호 해시·키·고정 IP를 적용하는지 본다. 게스트 OS가 있어야
   # 보이는 것만 여기서 보고, 나머지 CD·씨앗 시험은 linux-kvm의 qemu-it·migration-it가 돌린다.
+  # 템플릿·연결 복제(계획 58): 같은 클라우드 이미지와 SHA256SUMS를 관리자 카탈로그 항목으로 받아 템플릿을 만들고, 디스크를
+  # 늘린 연결 복제 둘이 cloud-init으로 켜져 보고하는지, 기반 파일이 그대로인지, 평탄화한 VM이 다시 켜지는지 본다.
   install-media:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -414,6 +416,11 @@ jobs:
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
           OPL_TEST_INSTALL_ISO: ${{ runner.temp }}/alpine-virt-3.20.3-x86_64.iso
+      - name: Templates and linked clones in real guests
+        run: cargo test --features opld/templates-it,opld/qemu-it -p opld --test templates -- --nocapture
+        env:
+          OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
+          OPL_TEST_CLOUD_SUMS: ${{ runner.temp }}/SHA256SUMS
 
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는

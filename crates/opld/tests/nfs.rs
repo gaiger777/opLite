@@ -169,6 +169,9 @@ async fn nfs_pool_mounts_holds_volumes_and_unmounts() {
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     assert!(!file.exists(), "{}", file.display());
 
+    // 템플릿 → 배포 → 켜기 → 기반 지우기 거절 → 평탄화 → 지우기(계획 58, NFS 위 qcow2 상대 backing)
+    common::linked_clone_flow(&d, "nas", true).await;
+
     // 풀을 지우면 언마운트하고 마운트 지점도 지운다.
     d.ctl(&["pool", "delete", "nas"]).await.unwrap();
     eventually("nfs pool unmounted", || async {

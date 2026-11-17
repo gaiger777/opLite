@@ -53,6 +53,10 @@ ceph-it = []
 # CD에서 부팅하는지, 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04 qcow2)에 cloud-init이 적용되는지 본다.
 # qemu-it와 함께 켜고, KVM이 있는 x86_64 Linux와 ovmf, 인터넷에서 받아 둔 두 파일이 필요하다(CI `install-media` 작업).
 install-media-it = []
+# 실제 게스트로 템플릿·연결 복제를 보는 E2E(계획 58): 받아 둔 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04 qcow2)를
+# 관리자 카탈로그 항목으로 받아 템플릿을 만들고, 연결 복제 둘이 cloud-init으로 켜져 보고하는지, 평탄화한 VM이 다시 켜지는지
+# 본다. qemu-it와 함께 켜고, KVM이 있는 x86_64 Linux와 ovmf가 필요하다(CI `install-media` 작업).
+templates-it = []
 # 한 호스트의 opld 둘로 실행 중인 VM을 공유 풀 위에서 옮기고 노드마다 다른 로컬 디렉터리 풀 사이로 디스크를
 # 복사하며 옮기는 라이브 마이그레이션 E2E. qemu-it의 준비물과 qemu-img, qemu-io가 필요하다. nfs-it·rbd-it·
 # lvm-shared-it와 함께 켜면 그 풀로도 옮기고, lvm-it·zfs-it와 함께 켜면 디렉터리 → 그 블록 풀 → 디렉터리로

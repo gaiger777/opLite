@@ -1646,3 +1646,160 @@ async fn migrates_local_disks_through_a_zfs_pool() {
     )
     .await;
 }
+
+/// `qemu-img info`의 backing 파일 이름(없으면 Null). 실행 중인 QEMU가 연 파일도 읽는다(`-U`).
+fn backing_of(path: &Path) -> Value {
+    let out = Command::new("qemu-img")
+        .args(["info", "--output=json", "-U"])
+        .arg(path)
+        .output()
+        .expect("run qemu-img");
+    assert!(out.status.success(), "{out:?}");
+    let info: Value = serde_json::from_slice(&out.stdout).unwrap();
+    info["backing-filename"].clone()
+}
+
+/// 노드 1의 로컬 디렉터리 풀 `a`에 둔 템플릿에서 연결 배포한 VM(qcow2 겹층)을 노드 2의 로컬 풀 `b`로 옮긴다(계획 58
+/// §9): 디스크 복사(`sync: full`)가 사슬 전체를 읽어 대상은 backing이 없는 독립 볼륨이고, 확정이 볼륨 기록의 `base`를
+/// 지운다. 원본 겹층은 지워지고 기반 파일은 그대로이며, 남은 연결 복제가 없으므로 템플릿을 되돌릴 수 있다.
+#[tokio::test]
+async fn a_linked_clone_migrates_to_a_local_pool_of_another_node() {
+    let p = Pair::new("mig-linked", ["60360-60369", "60370-60379"]).await;
+    let (c, d) = (&p.c[0], &p.d[0]);
+    let (node1, node2) = (p.node_id(0).await, p.node_id(1).await);
+    let dir = |prefix: &str| {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .unwrap()
+    };
+    let (a, b) = (dir("oplpoola"), dir("oplpoolb"));
+    for (name, path, node) in [("a", &a, &node1), ("b", &b, &node2)] {
+        d.ctl(&[
+            "pool",
+            "create",
+            name,
+            "--path",
+            path.path().to_str().unwrap(),
+            "--node",
+            node,
+        ])
+        .await
+        .unwrap();
+    }
+    p.d[0].wait_pool_ready("a").await;
+    p.d[1].wait_pool_ready("b").await;
+    d.ctl(&["volume", "create", "base", "--pool", "a", "--size", "64M"])
+        .await
+        .unwrap();
+    let base = c.get("/volumes/base").await.unwrap();
+    let base_file = a
+        .path()
+        .join(format!("{}.qcow2", base["id"].as_str().unwrap()));
+    assert!(qemu_io(&base_file, "qcow2", "write -P 0x5a 0 1M"));
+    d.ctl(&[
+        "vm", "create", "tmpl", "--memory", "256", "--disk", "base", "--node", "node1",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&["template", "convert", "tmpl"]).await.unwrap();
+    let base_bytes = std::fs::read(&base_file).unwrap();
+
+    let out = d
+        .ctl(&[
+            "template", "deploy", "tmpl", "--name", "web", "--linked", "--node", "node1", "--start",
+        ])
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        "vm web deployed from tmpl (linked)\nvm web: running on node1\n"
+    );
+    let vm = c.get("/vms/web").await.unwrap();
+    let disk = vm["spec"]["disks"][0]["volume"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let volume = c.get(&format!("/volumes/{disk}")).await.unwrap();
+    assert_eq!(volume["spec"]["base"], base["id"], "{volume}");
+    let file = format!("{}.qcow2", volume["id"].as_str().unwrap());
+    let (src, dst) = (a.path().join(&file), b.path().join(&file));
+    assert_eq!(
+        backing_of(&src),
+        base_file.file_name().unwrap().to_str().unwrap()
+    );
+
+    let out = d
+        .ctl(&["vm", "migrate", "web", "node2", "--pool", "b"])
+        .await
+        .unwrap();
+    assert_eq!(out, "vm web: migrated to node2\n");
+    assert_vm_on(&p, &node2).await;
+    for c in &p.c {
+        let volume = c.get(&format!("/volumes/{disk}")).await.unwrap();
+        assert_eq!(volume["spec"]["pool"], "b", "{volume}");
+        assert_eq!(volume["spec"]["base"], Value::Null, "{volume}");
+    }
+    assert_eq!(backing_of(&dst), Value::Null);
+    eventually("source overlay deleted", || async { !src.exists() }).await;
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    assert!(qemu_io(&dst, "qcow2", "read -P 0x5a 0 1M"));
+    assert_eq!(std::fs::read(&base_file).unwrap(), base_bytes);
+
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", &disk]).await.unwrap();
+    let out = d.ctl(&["template", "unconvert", "tmpl"]).await.unwrap();
+    assert_eq!(out, "template tmpl converted back to a VM\n");
+    d.ctl(&["vm", "delete", "tmpl"]).await.unwrap();
+    d.ctl(&["volume", "delete", "base"]).await.unwrap();
+    d.ctl(&["pool", "delete", "a"]).await.unwrap();
+    d.ctl(&["pool", "delete", "b"]).await.unwrap();
+}
+
+/// NFS 공유 풀의 연결 복제는 디스크를 복사하지 않고 옮기므로 사슬(상대 backing)과 `base`가 그대로다(계획 58 §9).
+#[cfg(all(feature = "nfs-it", target_os = "linux"))]
+#[tokio::test]
+async fn a_linked_clone_on_an_nfs_pool_migrates_with_its_chain() {
+    let export = std::env::var("OPL_TEST_NFS_EXPORT")
+        .expect("OPL_TEST_NFS_EXPORT must name a directory exported to 127.0.0.1");
+    let p = Pair::new("mig-nfs-linked", ["60380-60389", "60390-60399"]).await;
+    let d = &p.d[0];
+    let source = format!("127.0.0.1:{export}");
+    d.ctl(&["pool", "create", "nas", "--nfs", &source])
+        .await
+        .unwrap();
+    p.wait_pool_ready("nas").await;
+    d.ctl(&[
+        "volume", "create", "mig-base", "--pool", "nas", "--size", "64M",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&[
+        "vm", "create", "mig-tmpl", "--memory", "256", "--disk", "mig-base",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&["template", "convert", "mig-tmpl"]).await.unwrap();
+    d.ctl(&[
+        "template", "deploy", "mig-tmpl", "--name", "web", "--linked", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+    migrate(&p, 0, 1).await;
+    migrate(&p, 1, 0).await;
+    let c = &p.c[0];
+    let base = c.get("/volumes/mig-base").await.unwrap();
+    let vm = c.get("/vms/web").await.unwrap();
+    let disk = vm["spec"]["disks"][0]["volume"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let volume = c.get(&format!("/volumes/{disk}")).await.unwrap();
+    assert_eq!(volume["spec"]["base"], base["id"], "{volume}");
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", &disk]).await.unwrap();
+    d.ctl(&["template", "delete", "mig-tmpl"]).await.unwrap();
+    d.ctl(&["volume", "delete", "mig-base"]).await.unwrap();
+    d.ctl(&["pool", "delete", "nas"]).await.unwrap();
+}

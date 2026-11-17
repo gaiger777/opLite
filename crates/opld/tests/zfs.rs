@@ -238,6 +238,8 @@ async fn zfs_pool_runs_snapshots_reverts_and_clones_a_vm() {
     assert_eq!(zfs_names(&dataset, &zvol), vec![zvol.clone()]);
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     assert!(zfs_names(&dataset, &zvol).is_empty());
+    // 템플릿 → 배포 → 켜기 → 기반 지우기 거절 → 평탄화 → 지우기(계획 58, ZFS: @opl-base clone)
+    common::linked_clone_flow(&d, "zfs", true).await;
     d.ctl(&["pool", "delete", "local"]).await.unwrap();
     d.ctl(&["pool", "delete", "zfs"]).await.unwrap();
     d.stop();
