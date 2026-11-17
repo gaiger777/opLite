@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료, 설치 매체와 cloud-init(계획 57) 완료
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료, 설치 매체와 cloud-init(계획 57) 완료, 템플릿·링크드 클론·이미지 라이브러리(계획 58) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -2175,6 +2175,222 @@ ConfigDrive2, 패키지 설치 필드(`vendor_data`로 한다), 클라우드 이
 strict=on`은 모든 VM 명령줄을 바꾸므로 쓰지 않음). 받기 Task의 원래 URL(`user:password@`·쿼리)은 응답에서는 가리지만
 클러스터 저장소에는 남으므로 오래 쓰는 비밀이 든 URL은 피한다.
 
+## 템플릿과 링크드 클론
+
+VM을 **템플릿**(켤 수 없는 원본)으로 바꾸고, 템플릿에서 디스크를 통째로 복사하지 않고 기반 디스크를 함께 쓰는
+**링크드 클론**(연결 복제)으로 VM을 찍어 낸다(Proxmox VE의 "Convert to template"·linked clone, vSphere의 템플릿·
+linked clone과 같은 자리). 모든 노드가 이 버전이어야 한다(노드가 알리는 기능 `templates` — 아니면 `template: true`인 VM
+스펙, `base`가 든 볼륨, 연결·덮어쓰기를 쓴 배포, 체크섬 파일·SHA-512·템플릿 초안을 쓴 받기, `volume-flatten`·
+`vm-untemplate` Task, 관리자 카탈로그 항목은 **409** `cluster_upgrading`). 템플릿도 연결 복제도 없는 VM·볼륨·Task의
+JSON은 그대로이고, 새 옵션 없는 `vm clone`은 이전과 같은 Task를 만든다. 설계는
+[템플릿·연결 복제·이미지 라이브러리 설계](docs/superpowers/specs/2026-11-17-templates-linked-clones-design.md).
+
+**템플릿으로 바꾸기·되돌리기.** 템플릿은 새 리소스가 아니라 `spec.template: true`인 VM이다 — VM 목록·watch·권한·감사·
+백업이 그대로 다룬다.
+
+```bash
+orbivisorctl template convert ubuntu-base        # 꺼진 VM → 템플릿(POST /vms/{key}/template, 200)
+orbivisorctl template list                       # NAME DISKS POOL CLONES
+orbivisorctl template unconvert ubuntu-base      # 템플릿 → 보통 VM(DELETE /vms/{key}/template, 202 Task vm-untemplate)
+orbivisorctl template delete ubuntu-base         # 되돌리기 Task를 기다린 뒤 VM을 지운다(디스크 볼륨은 남는다)
+```
+
+- **바꾸기 조건**: 꺼져 있고(**409** `vm_running`), 마이그레이션·스냅샷·복제·백업·평탄화 Task가 없고(**409** `vm_busy`),
+  스냅샷이 없고(**409** `vm_has_snapshots` — 되돌리기가 기반을 바꾸면 안 됨), `ha`·`replication`·`snapshot_schedule`이
+  없고(**400**, 지우고 다시), 디스크가 모두 준비된 디스크 볼륨이며 연결 복제가 아니어야 한다(**400** `volume … is a linked
+  clone; flatten it before making a template` — 사슬은 1단). 저장소에는 아무것도 하지 않는다(기반 스냅샷은 첫 연결 복제가
+  만든다). `POST /vms`에 `template: true`를 주어 처음부터 템플릿으로 만들 수도 있다(같은 규칙).
+- **불변 규칙**(템플릿인 동안): 켜기·재시작·마이그레이션·복제(`replicate`)·스냅샷 만들기·스냅샷 되돌리기·CD 넣기는
+  **409** `vm_is_template`(`VM "tmpl" is a template; deploy a VM from it or convert it back`). `PUT`이 디스크 목록(볼륨·
+  버스·개수)을 바꾸면 **409** `vm_is_template`, `ha`·`replication`·`snapshot_schedule`은 **400**이다. CPU·메모리·NIC·
+  cloud-init·CD·부팅 순서는 바꿀 수 있다(배포가 그때의 스펙을 복사할 뿐 기반 데이터와 무관). 템플릿 디스크 볼륨의 크기
+  바꾸기·지우기는 **409** `volume_is_template`(`volume … is a disk of template "tmpl"`). 템플릿 표시는 이 두 경로로만
+  바뀐다 — `PUT /vms/{key}`는 저장된 `template`을 그대로 두므로 이 칸을 모르는 옛 클라이언트가 템플릿을 풀지 않는다.
+  템플릿을 바로 지우면(`DELETE /vms/{key}`) **409** `vm_is_template`이다 — 되돌리기 Task가 블록 백엔드의 기반 스냅샷
+  (`opl-base`)을 정리하게 한다(`template delete`·웹 "삭제"가 이렇게 한다).
+- **되돌리기**: 연결 복제가 남아 있으면 **409** `template_in_use`(`template "tmpl" has 3 linked clone(s) (web-1, web-2,
+  …); delete or flatten them first`). Task는 디스크마다 기반 스냅샷을 풀고(RBD `opl-base` 보호 풀기·지우기, ZFS
+  `@opl-base` 지우기, 파일·LVM-thin은 할 일 없음) 마지막에 `template: false`를 쓴다. 중간에 끊기면 다시 하면 된다. 다른
+  노드에서 동시에 배포가 시작됐으면 Raft 순서에서 뒤에 쓴 쪽이 물러난다(배포는 `template "tmpl" was converted back to a
+  VM`로 실패, 되돌리기는 표시를 되돌리고 `template_in_use` 문구로 실패 — 그새 스펙이 바뀌었으면 덮지 않고 `VM "x" was left
+  as a regular VM …; make it a template again`). 끝나지 않은 되돌리기 Task가 있으면 켜기·PUT·CD·둘째 되돌리기는 **409**
+  `vm_busy`다. 빠진 노드의 로컬 풀에 묶인 템플릿도 되돌려 지울 수 있다(그 디스크의 기반 풀기를 건너뜀).
+- reconciler는 템플릿을 켜지 않는다(`power: running`이어도 `phase: stopped`와 오류 `TEMPLATE_NOT_STARTED`). 스케줄러·
+  균형 조정기·HA·노드 비우기는 템플릿을 후보에서 뺀다.
+
+**배포.** `template deploy`(`POST /vms/{key}/clone`을 넓힌 것 — 새 경로는 없다)가 새 VM을 만든다.
+
+```bash
+orbivisorctl template deploy ubuntu-base --name web-1 --start
+orbivisorctl template deploy ubuntu-base --name 'web-{n}' --count 5 --first 10 --linked \
+  --node node-b --cpus 4 --memory 8192 --network nic0=prod --disk-size disk0=40G \
+  --ci-user orbi --ci-ssh-key @~/.ssh/id_ed25519.pub --start
+orbivisorctl template deploy ubuntu-base --name db-1 --full --pool fast   # 다른 풀에 전체 복사
+orbivisorctl vm clone ubuntu-base web-9 --linked                        # vm clone도 --linked|--full
+```
+
+- **덮어쓰기**: 이름·노드(`--node`, 새 VM을 켤 곳 — 디스크가 닿아야 한다: 공유 풀이거나 그 로컬 풀의 노드, 아니면 **400**
+  `node "b" cannot reach pool "local" of template "tmpl"; deploy on node "a" and migrate the VM`)·풀(전체 복사만)·vCPU
+  (소켓 하나)·메모리·NIC별 네트워크(`--network [nicN=]NET`, NIC 수는 템플릿과 같다)·디스크 크기(`--disk-size [diskN=]SIZE`,
+  늘리기만 — 줄이면 400, 512의 배수)·cloud-init(`--ci-*`는 [설치 매체와 cloud-init](#설치-매체와-cloud-init)과 같은 이름,
+  준 칸만 바꾼다; 평문 비밀번호는 API가 SHA-512 crypt로 바꾸고 Task 응답·watch에서 가린다)·`--start`. API 본문은
+  `linked`·`node`·`vcpus`·`memory_mib`·`nics`(순번별, null은 그대로)·`disks`(순번별 바이트)·`cloud_init`·`start`다.
+  템플릿이 아닌 VM의 복제에도 덮어쓰기는 쓸 수 있다.
+- **연결/전체**: 기본(`linked` 생략)은 템플릿이면 **되는 디스크는 연결 복제, 안 되는 디스크는 전체 복사**하고 디스크마다
+  Task 경고를 남긴다(`disk1: pool "san" (lvm-shared) cannot hold linked clones; made a full copy`). `--linked`(`true`)는
+  하나라도 안 되면 **400**(다른 풀, 미지원 백엔드), `--full`(`false`)은 전체 복사다. `linked: true`는 템플릿에서만 된다
+  (`linked clones can be made only from templates`). 연결 복제는 **템플릿 디스크와 같은 풀**에만 만든다.
+
+  | 백엔드 | 연결 복제 | 평탄화 |
+  |---|---|---|
+  | 디렉터리·NFS | qcow2 겹층, **상대 경로** backing(`qemu-img create -b {기반}.{fmt}` — 노드마다 NFS 마운트 지점이 달라도 열림) | `qemu-img rebase -b ""`(안전 모드 — 끊겨도 옛 사슬 그대로). 복제 VM에 스냅샷이 있으면 409 `vm_has_snapshots` |
+  | LVM-thin | thin 스냅샷(`lvcreate -s`), raw | 할 일 없음(thin 스냅샷은 원본과 독립 — 기록만 지움) |
+  | ZFS | `@opl-base` 스냅샷의 `zfs clone`, raw | `zfs send` → `zfs recv`로 새 zvol(복제의 스냅샷도 함께) → 원본 지우기 → 이름 바꾸기 |
+  | Ceph RBD | 보호한 `opl-base` 스냅샷의 `rbd clone`, raw | `rbd flatten` |
+  | 공유 LVM(iSCSI·FC) | 지원 안 함 → 전체 복사 + 경고(`--linked`면 400) | — |
+
+  QEMU 쪽은 바뀌지 않는다 — 겹층 qcow2는 헤더의 backing을 QEMU가 읽기 전용으로 열고, RBD clone·ZFS clone·thin 스냅샷은
+  보통 볼륨처럼 열린다.
+- **켜기**: `--start`면 Task가 스케줄러로 놓을 노드를 골라(`--node`면 그 노드) 켠 채 만든다. 놓지 못하면 꺼진 채 만들고
+  경고(`node "a" is in maintenance; start "web-1" later` 등)를 남긴다. CLI는 VM이 `running`이 될 때까지(5분) 기다려
+  `vm web-1: running on NODE`를 쓰고, 경고는 stderr의 `warning: vm web-1: …`다. 기본으로 Task를 기다리며 `--no-wait`가
+  있다. 템플릿에 고정 IP·호스트 이름 cloud-init이 있으면 계획 57처럼 겹친다는 경고를 남긴다(배포 때 새로 준 값은 보지 않음).
+- **여러 대 배포**(`--count 1~100`, 웹 배포 창의 "개수")는 클라이언트가 단건 API를 차례로 불러 Task들을 함께 기다린다.
+  이름에 `{n}`이 있어야 하고(`--first`부터, 기본 1), cloud-init 호스트 이름을 비우면 VM 이름이 호스트 이름이다. 2대 이상에
+  `--ci-hostname`·정적 `--ci-ip`/`--ci-ip6`은 거절한다(같은 값이 겹침). 하나가 API에서 거절되면 더 만들지 않고 이미 만든
+  Task를 마저 기다린 뒤 실패한다. 서버 쪽 일괄 Task·IP 풀은 없다.
+- 표시: `vm list`는 템플릿의 PHASE 칸에 `template`을, `vm get`은 stderr에 `template: 2 linked clone(s)`·
+  `disk0: linked clone of tmpl-root`를, `volume list`는 `BASE` 열(기반 볼륨 이름)을 보인다. `volume get`의 `spec.base`는
+  기반 볼륨 id다(같은 이름으로 다시 만든 볼륨을 기반으로 오인하지 않음).
+
+**기반 지우기 거절.** 연결 복제가 남은 볼륨을 지우면 **409** `volume_has_clones`(`volume "tmpl-disk0" is the base of 2
+linked clone(s) (web-1-disk0, …); delete or flatten them first`) — 템플릿 디스크라면 그보다 먼저 `volume_is_template`이다.
+배포 Task는 복제 볼륨 기록(`base`)을 저장소 작업 **전에** 쓰고, 지우기 Task는 지우기 직전에 다시 보므로 다른 노드의
+배포와 엇갈려도 기반을 지우지 않는다. 백엔드도 막는다(ZFS `destroy`·RBD `snap unprotect`가 자식이 있으면 실패). `base`는
+배포 Task만 쓴다(`POST /volumes`의 `base`는 400 `base is set only by deploying from a template`).
+
+**평탄화.** 연결 복제를 기반에서 떼어 독립 볼륨으로 만든다.
+
+```bash
+orbivisorctl vm stop web-1
+orbivisorctl volume flatten web-1-disk0          # POST /volumes/{key}/flatten → 202 Task volume-flatten
+```
+
+- 쓰는 VM이 꺼져 있어야 한다(**409** `vm_running` — 실행 중 평탄화는 아직 없다). 그 VM에 스냅샷·백업·마이그레이션 Task가
+  있으면 **409** `vm_busy`, 연결 복제가 아니면 **400** `volume … is not a linked clone`, 풀 여유가 기반 할당량보다 작으면
+  **409** `no_capacity`(둘 중 하나라도 모르면 보지 않음). 평탄화 중에는 그 VM을 켜지 않고 기다리며(`VolumeFlattening`),
+  핫플러그·마이그레이션은 **409** `vm_busy`(`a disk of VM … is being flattened`)다. Task 시간 제한은 없고 진행률은
+  단계만 보인다.
+- 저장소 작업이 끝났는데 기록 전에 끊겨도 다시 하면 할 일 없이 성공하고 기록만 고친다.
+
+**다른 기능과.**
+
+- **라이브 마이그레이션**: 공유 풀(NFS·공유 디렉터리·RBD)의 연결 복제는 디스크를 복사하지 않고 양쪽 QEMU가 같은 기반을
+  읽는다(사슬 그대로). **로컬 디스크 마이그레이션**은 대상 노드의 새 볼륨으로 사슬 전체를 미러하므로 옮긴 디스크는 독립
+  볼륨이다(`base` 지워짐 — 마이그레이션이 곧 평탄화). 템플릿은 옮기지 못한다(노드·풀 옮기기는 나중).
+- **로컬 디스크 복제(계획 55)**: 연결 복제 디스크가 있는 VM에 `replication`을 켜면 **400** `volume … is a linked clone of
+  …; flatten it before enabling replication` — 먼저 평탄화한다. 템플릿은 복제 대상이 될 수 없다.
+- **백업·복원**: 백업은 사슬 전체를 읽으므로 늘 전체 데이터이고, 복원(원격·DR 포함)은 독립 볼륨을 만든다. 템플릿의 백업은
+  `template: true`를 그대로 담아 복원하면 템플릿이다(받는 쪽에 `templates`를 모르는 노드가 있으면 표시를 버림). 템플릿과
+  연결 복제 디스크가 있는 VM의 백업은 증분 비트맵을 만들지 않는다(꺼진 VM의 비트맵이 기반 qcow2를 바꾸지 않게).
+- **HA**: 템플릿은 HA를 가질 수 없다. 공유 풀 연결 복제는 기반도 같은 공유 풀이므로 다른 노드에서 그대로 복구된다. 로컬
+  풀 연결 복제의 HA는 복제(계획 55)가 필요하므로 평탄화 뒤에만 된다.
+- **스냅샷**: 연결 복제 VM의 스냅샷·되돌리기는 백엔드마다 그대로 되고 복제 볼륨만 바꾼다. 스냅샷에서 복제(`--snapshot`)는
+  전체 복사다. 템플릿은 스냅샷이 없다.
+- **노드 비우기**: 실행 중 VM만 옮기므로 템플릿은 남는다. 로컬 풀 템플릿의 배포는 그 노드에서 도는 Task라 노드가 꺼져
+  있으면 배포하지 못한다.
+- **cloud-init·ISO(계획 57)**: 템플릿의 CD는 그대로 복사되고(같은 ISO), 템플릿은 켜지지 않으므로 씨앗을 만들지 않는다.
+  배포한 VM은 새 id라 instance-id가 달라 cloud-init이 처음부터 돈다.
+
+**오류 코드.**
+
+| 코드 | 때 |
+|---|---|
+| 409 `vm_is_template` | 템플릿 켜기·재시작·마이그레이션·복제·스냅샷·CD 넣기·디스크 목록 바꾸기·바로 지우기 |
+| 409 `volume_is_template` | 템플릿 디스크 볼륨의 크기 바꾸기·지우기 |
+| 409 `template_in_use` | 연결 복제가 남은 템플릿 되돌리기 |
+| 409 `volume_has_clones` | 연결 복제의 기반 볼륨 지우기 |
+| 409 `cluster_upgrading` | `templates` 기능이 없는 노드가 있을 때 새 칸·새 Task |
+
+웹: 메뉴 "템플릿"(이름·디스크·풀·연결 복제 수, "배포"·"VM으로 되돌리기"·"삭제"), 배포 창(개수와 `{n}` 미리 보기, 디스크
+복제 방식 — 되는 디스크만 연결·모두 연결·전체 복사 — 와 디스크별 가능 여부, 노드·풀, vCPU·메모리, NIC별 네트워크, 디스크
+크기, cloud-init, "배포 뒤 켜기"; VM마다 Task 알림), VM 목록·상세의 "템플릿으로 바꾸기"(안 되면 이유)와 "템플릿만 보기"
+칩, 볼륨 화면의 "기반" 열과 "평탄화".
+
+**넣지 않은 것(나중).** 실행 중 평탄화(`block-stream`), 노드마다 기반 사본을 두는 "기반 캐시"(로컬 풀의 다른 노드 연결
+배포), 템플릿 옮기기(노드·풀), 연결 복제의 연결 복제(사슬 2단 이상), 연결 복제 VM의 로컬 디스크 복제, 서버 쪽 대량
+배포와 IP 풀, 배포 때 NIC 더하기·빼기, OVF 템플릿 내보내기, Windows sysprep.
+
+**한계.** RBD는 평탄화한 복제가 평탄화 전에 찍은 스냅샷이 여전히 부모를 가리키므로, 그 스냅샷이 남은 동안 템플릿
+되돌리기가 기반 보호를 풀지 못해 실패한다(오류 문구가 안내 — 데이터는 안전, Raft에 없는 관계라 API가 미리 막지 못함).
+ZFS 평탄화는 복제 크기만큼 공간이 더 들고, LVM-thin 연결 복제는 thin pool 과할당을 늘린다.
+
+## 이미지 라이브러리
+
+잘 알려진 클라우드 이미지의 목록(카탈로그)에서 고르면 풀에 받아 체크섬을 확인하고, 원하면 **받기 → 템플릿을 한 번에**
+만든다(vSphere 콘텐츠 라이브러리와 비슷한 자리, 구독은 없음). 받기는 [설치 매체와 cloud-init](#설치-매체와-cloud-init)의
+`volume-download` Task이므로 같은 규칙(받는 노드가 URL에 닿아야 함, 사설 주소 거절, 프록시, URL 가림)을 따르고,
+`install-media`와 `templates` 기능이 모두 있어야 한다.
+
+```bash
+orbivisorctl image list --arch x86_64      # ID ARCH OS VERSION FIRMWARE SOURCE VOLUMES
+orbivisorctl image get ubuntu-24.04 --pool nas                     # 받기만(볼륨 ubuntu-24-04)
+orbivisorctl image get debian-12 --pool nas --template debian-tmpl --network lan \
+  --cpus 2 --memory 2048 --size 20G --ci-user orbi --ci-ssh-key @~/.ssh/id_ed25519.pub
+orbivisorctl template deploy debian-tmpl --name 'app-{n}' --count 3 --start
+```
+
+- **내장 항목**(Orbivisor 판마다 갱신, 각각 x86_64·aarch64): `ubuntu-24.04`, `ubuntu-22.04`, `debian-12`(genericcloud),
+  `rocky-9`, `alma-9`(GenericCloud), `fedora-45`(Cloud Base Generic), `alpine-3.20`(nocloud cloudinit). "release·latest"
+  경로와 **같은 디렉터리의 체크섬 파일**(`SHA256SUMS`·`SHA512SUMS`·`CHECKSUM`·`.sha512`)을 써서 고정 해시가 낡지
+  않는다. 펌웨어는 Alpine x86_64(BIOS)만 BIOS, 나머지는 UEFI다. 항목은 `(id, 아키텍처)`로 구분한다.
+- **관리자 항목**(설정 쓰기 권한, admin): 클러스터 설정(`image_catalog`)에 200개까지 둔다(Raft·백업 그대로).
+
+  ```bash
+  orbivisorctl image catalog add corp-ubuntu --os ubuntu --version 24.04 --arch x86_64 \
+    --url https://mirror.corp/ubuntu/noble-server-cloudimg-amd64.img \
+    --checksum-url https://mirror.corp/ubuntu/SHA256SUMS --default-user ubuntu --min-size 3584M
+  orbivisorctl image catalog remove corp-ubuntu --arch x86_64     # --arch 없으면 그 id의 모든 아키텍처
+  ```
+
+  체크섬은 `--sha256`·`--sha512`·`--checksum-url` 가운데 꼭 하나다. 내장 id는 쓸 수 없고(400), 같은 `(id, arch)`는
+  **409** `already_exists`, URL은 `http`·`https`만이고 사용자 정보(`user:password@`)는 400이다. id는 `.`을 `-`로 바꾸면
+  리소스 이름이 되는 57자까지다. 관리자가 아닌 사용자에게는 `GET /image-catalog`·`GET /settings`가 URL의 쿼리 문자열을
+  가린다. 항목을 지워도 받은 볼륨과 템플릿은 그대로다.
+- **받기**: 볼륨 이름은 기본으로 id의 `.`을 `-`로(aarch64면 `-arm64`를 붙임, 예 `ubuntu-24-04`), 아키텍처는 기본으로
+  풀에서 받는 노드의 것이다. 진행률 단계는 `checksum` → `downloading` → `verifying` → `importing`(→ `template`)이다.
+  `image list`의 VOLUMES는 같은 URL에서 이미 받은 준비된 볼륨이다.
+- **받기 → 템플릿**: `--template NAME --network NET`(+ `--cpus` 기본 2, `--memory` 기본 2048, `--size`는 이미지보다 클
+  때만 늘림, `--ci-user`·`--ci-ssh-key`·`--ci-password-*`)이면 가져오기가 끝난 뒤 템플릿 VM을 만든다: 아키텍처로
+  `q35`/`virt`, 항목의 펌웨어, `virtio-blk` 디스크 하나(부팅 1), NIC 하나, cloud-init. 호스트 이름·정적 IP는 400이다
+  (배포 때 준다). API가 VM 만들기와 같은 검사를 미리 한다(이름 **409** `name_taken`, 아키텍처가 맞는 노드가 없으면 **400**
+  `machine_arch_mismatch`). 템플릿 단계가 실패하면(그새 이름이 쓰였거나 opld가 재시작) **받은 볼륨은 지우지 않고**
+  `…; volume "ubuntu-24-04" is ready; create the template from it with vm create and template convert`로 알린다.
+  가져오기 전 실패(체크섬 등)는 볼륨을 지운다. 웹은 메뉴 "이미지 라이브러리"(아키텍처 거름, 항목별 "받기"·"받은 뒤 템플릿
+  만들기", 진행률, 관리자 항목 더하기·지우기).
+
+**체크섬 확인.** `volume download`·`iso download`(`POST /volumes/download`)에도 `--sha512 HEX`와
+`--checksum-url URL`이 생겼다(`--sha256`과 셋 중 하나, 없으면 확인하지 않음).
+
+```bash
+orbivisorctl volume download noble --pool nas --source-format qcow2 \
+  --url https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img \
+  --checksum-url https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS
+```
+
+- `checksum_url`이면 Task가 먼저 그 파일을 이미지와 같은 클라이언트·SSRF 규칙으로 1 MiB까지 받아 이미지 URL의 마지막
+  경로 조각(파일 이름)의 줄을 찾는다: GNU `해시  이름`·`해시 *이름`, BSD `SHA256 (이름) = 해시`, Fedora·Rocky의
+  clearsign 머리·꼬리, Alpine의 해시 하나뿐인 파일. 64자는 SHA-256, 128자는 SHA-512다. 줄이 없으면 `checksum file … has
+  no entry for …`, 다르면 `checksum mismatch: expected … (from …), got …`로 실패하고 볼륨을 지운다.
+- 보증 범위: 손상·잘린 받기·미러 오류는 잡지만 배포처 자체의 변조는 못 잡는다(GPG 서명 확인은 나중). 배포처가 이미지와
+  SUMS를 바꾸는 사이에 받으면 불일치로 실패한다 — 다시 받으면 된다.
+
+**링크 확인.** `.github/workflows/catalog.yml`이 주 1회(와 수동) 내장 항목마다 이미지 URL이 답하는지와 체크섬 파일에 그
+이미지의 줄이 있는지 본다(받지는 않음, `cargo test -p oplctl --features catalog-it --test catalog`). 바깥 서버 사정으로
+푸시 CI를 깨지 않게 따로 돈다. 실패하면 `BUILTIN`을 고친다.
+
+**넣지 않은 것(나중).** 카탈로그 원격 피드·구독, 원격 클러스터 사이 템플릿 동기화, 체크섬 파일의 GPG 서명 확인.
+
 ## VM 무중단 유형 변경
 
 실행 중인 VM의 vCPU·메모리를 늘리거나 줄이고 디스크·NIC를 붙이거나 뗀다(Proxmox VE의 hotplug, VMware의 CPU·메모리
@@ -4321,6 +4537,11 @@ cargo test -p opld --features qemu-it --test backup                 # E2E: 실�
 cargo test -p opld --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
 cargo test -p opld --test cluster                                   # E2E: orbivisord 프로세스 3개로 클러스터 구성
 cargo test -p opld --features starve-it --test starve              # E2E: 리더의 API 실행기를 막아도 리스·Raft 리더 그대로
+cargo test -p opld --features qemu-it --test templates              # E2E: 템플릿 → 연결 배포(qcow2 겹층) → 평탄화, 카탈로그 받기 → 템플릿(qemu-img·qemu-io 필요)
+# x86_64 Linux, KVM: 실제 게스트 — Ubuntu 24.04 클라우드 이미지 템플릿 → 연결 복제 2대 켜기·보고 → 평탄화(CI install-media 작업)
+OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img OPL_TEST_CLOUD_SUMS=/tmp/SHA256SUMS \
+  cargo test -p opld --features templates-it,qemu-it --test templates -- --nocapture
+cargo test -p oplctl --features catalog-it --test catalog -- --nocapture  # 내장 이미지 카탈로그 링크·체크섬 파일 확인(인터넷 필요)
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -4500,6 +4721,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [실시간 지표와 쉬운 화면 설계 (하위 프로젝트 14: 계획 44~47)](docs/superpowers/specs/2026-11-11-monitoring-ui-design.md)
 - [제어부 가용성과 대규모 클러스터 설계 (하위 프로젝트 15: 계획 45~56)](docs/superpowers/specs/2026-11-11-availability-scale-design.md)
 - [설치 매체와 cloud-init 설계 (계획 57)](docs/superpowers/specs/2026-11-17-install-media-cloud-init-design.md)
+- [템플릿·연결 복제·이미지 라이브러리 설계 (계획 58)](docs/superpowers/specs/2026-11-17-templates-linked-clones-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
@@ -4557,3 +4779,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 55: 로컬 디스크 HA](docs/superpowers/plans/2026-11-16-plan55-local-disk-ha.md)
 - [계획 56: Ceph 자동 구성](docs/superpowers/plans/2026-11-16-plan56-ceph-setup.md)
 - [계획 57: 설치 매체와 cloud-init](docs/superpowers/plans/2026-11-17-plan57-install-media.md)
+- [계획 58: 템플릿·링크드 클론·이미지 라이브러리](docs/superpowers/plans/2026-11-18-plan58-templates.md)
