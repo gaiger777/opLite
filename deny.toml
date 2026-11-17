@@ -20,3 +20,10 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[advisories]
+ignore = [
+    # chrono는 openraft 0.9를 거쳐서만 들어온다(직접 쓰지 않는다). 유지보수 중단 권고일 뿐 알려진 취약점은 없고,
+    # openraft가 chrono를 떼거나 openraft를 올릴 때 함께 빠진다.
+    { id = "RUSTSEC-2026-0543", reason = "openraft 0.9를 거친 간접 의존성, 알려진 취약점 없음" },
+]
