@@ -19,6 +19,7 @@ import { HaChecksPage } from "@/ha-checks/HaChecksPage";
 import { HaGroupsPage } from "@/ha-groups/HaGroupsPage";
 import { ImportPage } from "@/imports/ImportPage";
 import { ImportsPage } from "@/imports/ImportsPage";
+import { IsosPage } from "@/isos/IsosPage";
 import { AppLayout } from "@/layout/AppLayout";
 import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
@@ -69,6 +70,7 @@ function routes() {
             { path: "imports", element: <ImportsPage /> },
             { path: "imports/:name", element: <ImportPage /> },
             { path: "volumes", element: <VolumesPage /> },
+            { path: "isos", element: <IsosPage /> },
             { path: "storage-pools", element: <PoolsPage /> },
             { path: "ceph", element: <CephPage /> },
             { path: "backups", element: <BackupsPage /> },

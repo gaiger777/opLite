@@ -25,8 +25,10 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
+import { choosableIsos } from "@/isos/isos";
 import { formatBytes, formatMib, formatTime, uuidTime } from "@/lib/format";
 import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
@@ -37,12 +39,16 @@ import {
   type VmAction,
   type VmOperation,
 } from "@/vms/actions";
+import { bootList, deviceName } from "@/vms/boot";
+import { cloudInitSummary } from "@/vms/cloudInit";
+import { changeCdrom, trackHotplug } from "@/vms/form/submit";
 import { haEnabled, haPolicy } from "@/vms/ha";
 import {
   failedChanges,
   hotplugPorts,
   isHotAdded,
   needsRestart,
+  pendingFieldLabel,
   pendingReasonKey,
   runningMemory,
   runningVcpus,
@@ -280,6 +286,49 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+/** 실제 부팅 순서(`disk0, cdrom0`). 켜진 VM이면 도는 QEMU의 CD-ROM 목록 대신 스펙으로 셈한다(순서는 재시작 때 적용). */
+function bootLine(vm: Vm): string {
+  const order = (o: number | null | undefined) => o ?? null;
+  const { booting } = bootList(
+    (vm.spec.disks ?? []).map((d) => order(d.boot_order)),
+    (vm.spec.cdroms ?? []).map((c) => order(c.boot_order)),
+  );
+  return booting.map(deviceName).join(", ");
+}
+
+/** cloud-init 요약: 사용자·키 수·비밀번호·정적 주소와 켤 때 넣은 instance-id. 바뀐 설정은 다음 재시작 때 적용된다. */
+function CloudInitLine({ vm }: { vm: Vm }) {
+  const { t } = useTranslation();
+  const ci = vm.spec.cloud_init;
+  const hw = vm.status.hardware;
+  if (!ci) {
+    return <>{t("vms.haOff")}</>;
+  }
+  const sum = cloudInitSummary(ci);
+  const parts = [
+    sum.user ? t("vms.ciUser", { user: sum.user }) : t("vms.ciDefaultUser"),
+    t("vms.ciKeys", { count: sum.keys }),
+    sum.password ? t("vms.ciPassword") : t("vms.ciNoPassword"),
+    ...sum.addresses,
+  ];
+  const pending = (hw?.pending ?? []).some((c) => c.field === "cloud_init");
+  return (
+    <>
+      {parts.join(", ")}
+      {hw?.cloud_init && (
+        <span className="block font-mono text-xs text-muted-foreground">
+          {t("vms.ciInstance", { id: hw.cloud_init })}
+        </span>
+      )}
+      {pending && (
+        <span className="block text-xs text-amber-700 dark:text-amber-400">
+          {t("vms.ciPending")}
+        </span>
+      )}
+    </>
+  );
+}
+
 function Summary({ vm }: { vm: Vm }) {
   const { t, i18n } = useTranslation();
   const { cpu } = vm.spec;
@@ -315,6 +364,10 @@ function Summary({ vm }: { vm: Vm }) {
           {ports ? t("vms.hotplugPorts", ports) : t("vms.hotplugOff")}
         </Field>
       )}
+      <Field label={t("vms.bootOrder")}>{bootLine(vm) || t("vms.bootNone")}</Field>
+      <Field label={t("vms.cloudInit")}>
+        <CloudInitLine vm={vm} />
+      </Field>
       <Field label={t("vms.firmware")}>{(vm.spec.firmware ?? "uefi").toUpperCase()}</Field>
       <Field label={t("vms.machine")}>{vm.spec.machine}</Field>
       <Field label={t("vms.restart")}>{t(`vms.restartPolicy.${vm.spec.restart ?? "never"}`)}</Field>
@@ -570,6 +623,7 @@ function Hardware({ vm }: { vm: Vm }) {
           </TableBody>
         </Table>
       </section>
+      <Cdroms vm={vm} />
       <section className="flex flex-col gap-2">
         <h2 id="vm-nics" className="font-medium">
           {t("vms.nics")}
@@ -608,6 +662,148 @@ function Hardware({ vm }: { vm: Vm }) {
         </Table>
       </section>
     </div>
+  );
+}
+
+/** 매체 바꾸기(`POST /vms/{key}/cdrom`) 거절 가운데 서버의 설명을 보이는 code */
+const CDROM_ERROR_CODES = [...HOTPLUG_ERROR_CODES, "volume_not_ready"];
+
+/**
+ * CD/DVD 드라이브: 드라이브마다 매체·부팅 순서와 넣기(ISO 고르기)·빼기. 실행 중에도 되고(서버의 핫플러그 Task), 도는
+ * QEMU의 매체가 스펙과 다르면(바꾸는 중이거나 실패) 그것을 보인다. 드라이브 더하기·빼기는 고치기 화면에서(멈춘 VM).
+ */
+function Cdroms({ vm }: { vm: Vm }) {
+  const { t } = useTranslation();
+  const me = usePrincipal();
+  const volumes = useList("volume");
+  const pools = useList("storage-pool");
+  const [chosen, setChosen] = useState<Record<number, string>>({});
+  const [busy, setBusy] = useState<number | null>(null);
+  const cdroms = vm.spec.cdroms ?? [];
+  if (cdroms.length === 0) {
+    return null;
+  }
+  const write = can(me.role, "write", "vm");
+  const running = vm.status.hardware?.cdroms;
+  const isos = choosableIsos(
+    volumes.data ?? [],
+    pools.data,
+    haEnabled(vm.spec) || (vm.spec.replication ?? []).length > 0,
+  );
+  const { booting } = bootList(
+    (vm.spec.disks ?? []).map((d) => d.boot_order ?? null),
+    cdroms.map((c) => c.boot_order ?? null),
+  );
+  const position = (i: number) => {
+    const at = booting.findIndex((d) => d.kind === "cdrom" && d.index === i);
+    return at === -1 ? "—" : String(at + 1);
+  };
+
+  async function change(drive: number, iso: string | null) {
+    setBusy(drive);
+    const target = iso
+      ? t("vms.cdrom.insertLabel", { name: vm.name, drive, iso })
+      : t("vms.cdrom.ejectLabel", { name: vm.name, drive });
+    try {
+      const task = await changeCdrom(vm, drive, iso);
+      if (task) {
+        void trackHotplug(task, target);
+      } else {
+        toast.success(t("tasks.done", { label: target }));
+      }
+    } catch (err) {
+      toast.error(
+        t("vms.actionFailed", {
+          name: vm.name,
+          error: serverErrorMessage(t, err, CDROM_ERROR_CODES),
+        }),
+      );
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <section className="flex flex-col gap-2">
+      <h2 id="vm-cdroms" className="font-medium">
+        {t("vms.cdroms")}
+      </h2>
+      <Table aria-labelledby="vm-cdroms">
+        <TableHeader>
+          <TableRow>
+            <TableHead>{t("vms.cdrom.drive")}</TableHead>
+            <TableHead>{t("vms.cdrom.media")}</TableHead>
+            <TableHead>{t("vms.bootOrder")}</TableHead>
+            {write && (
+              <TableHead>
+                <span className="sr-only">{t("vms.actions")}</span>
+              </TableHead>
+            )}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {cdroms.map((cdrom, i) => {
+            const was = running?.[i];
+            const changing = running !== undefined && (was?.iso ?? null) !== (cdrom.iso ?? null);
+            const pick = chosen[i] ?? "";
+            return (
+              <TableRow key={i}>
+                <TableCell>{`cdrom${i}`}</TableCell>
+                <TableCell>
+                  {cdrom.iso ?? (
+                    <span className="text-muted-foreground">{t("vmForm.cdromEmpty")}</span>
+                  )}
+                  {changing && (
+                    <Badge variant="secondary" className="ml-2">
+                      {t("vms.cdrom.changing", { from: was?.iso ?? t("vmForm.cdromEmpty") })}
+                    </Badge>
+                  )}
+                </TableCell>
+                <TableCell>{position(i)}</TableCell>
+                {write && (
+                  <TableCell>
+                    <div className="flex flex-wrap items-center justify-end gap-2">
+                      <NativeSelect
+                        aria-label={t("vms.cdrom.choose", { drive: i })}
+                        value={pick}
+                        disabled={busy !== null}
+                        onChange={(e) => setChosen((c) => ({ ...c, [i]: e.target.value }))}
+                      >
+                        <NativeSelectOption value="">—</NativeSelectOption>
+                        {isos
+                          .filter((v) => v.name !== cdrom.iso)
+                          .map((v) => (
+                            <NativeSelectOption key={v.id} value={v.name}>
+                              {v.name}
+                            </NativeSelectOption>
+                          ))}
+                      </NativeSelect>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy !== null || pick === ""}
+                        onClick={() => void change(i, pick)}
+                      >
+                        {t("vms.cdrom.insert")}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        aria-label={t("vms.cdrom.ejectNamed", { drive: i })}
+                        disabled={busy !== null || cdrom.iso === undefined}
+                        onClick={() => void change(i, null)}
+                      >
+                        {t("vms.cdrom.eject")}
+                      </Button>
+                    </div>
+                  </TableCell>
+                )}
+              </TableRow>
+            );
+          })}
+        </TableBody>
+      </Table>
+    </section>
   );
 }
 
@@ -665,12 +861,7 @@ function PendingChanges({ vm }: { vm: Vm }) {
       <ul aria-labelledby="vm-pending" className="flex flex-col gap-1 text-sm">
         {pending.map((change) => (
           <li key={change.field}>
-            <span className="font-medium">
-              {/* 번역 키에는 `.`을 쓸 수 없다(`cpu.max_vcpus` → `cpu_max_vcpus`). */}
-              {t(`vms.pendingField.${change.field.replaceAll(".", "_")}`, {
-                defaultValue: change.field,
-              })}
-            </span>
+            <span className="font-medium">{pendingFieldLabel(change.field, t)}</span>
             {": "}
             {t("vms.pendingValue", { running: change.running, wanted: change.wanted })}
             {" — "}

@@ -1175,6 +1175,7 @@ VM 노드를 대상으로 바꾸는 순간 확정된다. 그 뒤에만 대상에
 디스크는 두 노드가 함께 열고, 노드 로컬 풀(공유가 아닌 디렉터리 풀, LVM-thin, ZFS)의 디스크는 대상 노드에 새로 만든
 볼륨으로 복사한다(`qm migrate --online --with-local-disks`·Storage vMotion — 아래 "로컬 디스크 복사").
 대상 노드에 VM의 복제본이 있으면 마지막 복제 뒤 바뀐 것만 보낸다(아래 "로컬 디스크 복제와 HA").
+CD-ROM에 노드 로컬 풀의 ISO가 있으면 옮기지 않는다(409 `cdrom_local` — "설치 매체와 cloud-init").
 
 ```bash
 orbivisorctl vm migrate web node2        # 끝날 때까지 기다린다: "vm web: migrated to node2"
@@ -2033,13 +2034,154 @@ API 노드는 노드를 고를 수 있을 때만(노드 없이 켠 채 만들기
 노드는 리더의 상태를 읽지 못한다(부하 없이 놓고 `GET /placement`는 503). 문턱·효과 상수는 실제 다중 노드 부하로 다시 볼
 것이다.
 
+## 설치 매체와 cloud-init
+
+OS를 설치하는 두 가지 길을 준다: **설치 ISO**를 VM의 CD/DVD 드라이브에 넣어 부팅하거나, **클라우드 이미지**를 디스크로
+받고 **cloud-init**(NoCloud 씨앗)으로 사용자·SSH 키·주소를 넣는다(Proxmox VE의 ISO 저장소·CD/DVD 드라이브·cloud-init
+드라이브, vSphere의 데이터스토어 ISO·게스트 사용자 지정과 같은 자리). 모든 노드가 이 버전이어야 한다(노드가 알리는 기능
+`install-media` — 아니면 ISO 볼륨·받기 Task·CD-ROM·cloud-init이 든 VM 스펙·`POST /vms/{key}/cdrom`은 **409**
+`cluster_upgrading`). CD-ROM도 cloud-init도 없는 VM의 스펙과 QEMU 명령줄은 그대로다. 설계는
+[설치 매체와 cloud-init 설계](docs/superpowers/specs/2026-11-17-install-media-cloud-init-design.md).
+
+**ISO 이미지.** 내용 종류가 `iso`인 raw 볼륨이다. **디렉터리·NFS 풀에만** 둔다(블록 풀은 400). 만드는 길은 둘이다.
+
+```bash
+orbivisorctl iso upload alpine --pool nas --file alpine-virt-3.20.3-x86_64.iso   # 접속한 노드로 올린다
+orbivisorctl iso download ubuntu-24-04 --pool nas \
+  --url https://releases.ubuntu.com/24.04/ubuntu-24.04.1-live-server-amd64.iso --sha256 <HEX>
+orbivisorctl iso list                      # NAME POOL SIZE NODE USED-BY
+orbivisorctl iso delete alpine
+```
+
+- 내용을 확인한다: 32 KiB 뒤에 `CD001`(ISO 9660)이나 `BEA01`(UDF — Windows 설치 매체)이 없으면 Task가
+  `not an ISO 9660 or UDF image`로 실패하고 볼륨을 지운다. 크기 상한은 따로 없다(업로드 디렉터리의 여유 공간과 풀 용량).
+- **URL에서 받기**(`iso download`, 디스크 이미지는 `volume download`, 웹 "URL에서 받기", `POST /volumes/download` → Task
+  `volume-download`)는 풀을 쓸 수 있는 노드가 받는다 — **그 노드가 URL에 닿아야 한다**. `http`·`https`만, 리디렉션 10번,
+  연결 30초·읽기 쉼 120초, 진행률은 Task에(`downloading 1.2 GiB / 2.5 GiB`). `--sha256`을 주면 받은 파일이 같아야 한다
+  (다르면 실패하고 지운다). 프록시는 노드의 `HTTPS_PROXY`·`HTTP_PROXY`·`NO_PROXY` 환경 변수다(systemd 유닛에
+  `Environment=`로). **볼륨 쓰기 권한(operator 이상)을 가진 사용자만** 받기를 쓸 수 있고, 노드는 기본으로 루프백·링크 로컬
+  (클라우드 메타데이터 169.254.169.254 포함)·사설망·공유(100.64/10)·`0.0.0.0/8`·시험망(198.18/15)·예약(240/4)·멀티캐스트
+  주소에서는 받지 않는다(이름이 그런 주소로 풀려도, 리디렉션의 어느 단계여도, IPv4를 담은 IPv6 — `::ffff:a.b.c.d`·`::a.b.c.d`·
+  NAT64 `64:ff9b::/96`·6to4 `2002::/16` — 여도 — `address 10.0.0.9 is loopback, link-local or private`). 사내 미러가 사설 주소면 opld 설정 `[download]`의
+  `allow_private = true`로 켠다. 프록시를 쓰면 대상 주소는 프록시가 푼다.
+  URL의 `user:password@`는 `***@`로, 쿼리 문자열(서명·토큰)은 `?***`로 감사 기록·오류 문구·Task 응답(`GET /tasks`, watch)에서
+  가린다(저장소의 Task에는 원래 URL이 남는다 — 아래 한계).
+- **여러 VM이 함께 쓴다**: CD 매체는 늘 읽기 전용으로 열므로 한 ISO를 여러 VM에 넣을 수 있다. 디스크로는 붙이지 못한다
+  (400 `attach it as a CD-ROM`). 크기를 바꾸지 못한다.
+- **지우기**: VM의 CD-ROM 드라이브에 있으면(스펙, 또는 실행 중 빼기를 아직 마치지 못한 매체) **409** `volume_in_use`
+  (`volume "alpine" is in the CD-ROM drive of VM "web"`), 스냅샷의 VM 스펙이 가리키면 **409** `volume_in_snapshot`
+  (되돌리기가 그 매체로 켠다). 백업은 막지 않는다(복원이 드라이브를 비운다). 확인한 뒤 다른 노드에서 그 ISO를 넣었거나 그
+  매체가 든 스냅샷을 찍었으면 지우기 Task가 다시 보고 같은 문구로 실패한다. 지우기 Task가 끝나지 않은 ISO는 CD에 넣지 못한다
+  (**409** `volume_in_use` `ISO "alpine" is being deleted (task …)`).
+- 웹: 메뉴 "ISO 이미지"(풀별 표, 올리기·URL에서 받기·지우기, 넣은 VM). 볼륨 화면은 ISO를 빼고 보이며 "ISO 이미지도 보기"로
+  함께 본다.
+
+**CD/DVD 드라이브.** VM마다 4개까지(`spec.cdroms`, 드라이브 번호 = 순번 `cdrom0`…). 빈 드라이브도 된다.
+
+```bash
+orbivisorctl vm create web --disk web-root --cdrom alpine --cdrom none
+orbivisorctl vm cdrom insert web ubuntu-24-04 --drive 1     # 실행 중에도
+orbivisorctl vm cdrom eject web                             # 드라이브 0을 비운다
+orbivisorctl vm cdrom add web --boot-order 1                # 꺼진 VM만: 빈 드라이브를 끝에
+orbivisorctl vm cdrom remove web --drive 1                  # 꺼진 VM만
+```
+
+- q35는 내장 AHCI의 `ide-cd`(Windows 설치 프로그램이 드라이버 없이 읽음)이고 SATA 포트 6개를 SATA 디스크 → CD-ROM →
+  cloud-init 드라이브가 나눠 쓴다(넘치면 400). virt(aarch64)는 `virtio-scsi-pci` + `scsi-cd`다. 컨트롤러와 드라이브는
+  명령줄 끝에 두어 CD를 더해도 디스크·NIC의 PCI 주소가 바뀌지 않는다.
+- **실행 중 넣기·빼기**: `vm cdrom insert|eject`, 웹 VM 상세 "하드웨어" 탭의 CD/DVD 표, 또는 스펙의 매체만 바꾼 PUT이
+  핫플러그 Task(`vm-hotplug`)로 도는 QEMU의 매체를 바꾼다. 트레이를 **강제로** 열므로 게스트가 잠가도 바뀐다(게스트에 매체
+  바뀜이 알려진다). 핫플러그 배치 없이 켠 VM도 된다. 실행 중에 드라이브를 더하거나 빼면 **409** `vm_running`이다.
+  매체를 바꾸는 중(스펙 ≠ 도는 QEMU)이면 `vm get`과 웹에 `<- changing from …`/"바꾸는 중"으로 보이고 마이그레이션은 먼저
+  `vm hotplug`를 하라며 막힌다.
+
+**부팅 순서.** 장치마다 `boot_order`(디스크와 CD-ROM에서 겹치지 않게). 기본은 **디스크 다음 CD-ROM**이다: 아무 장치에도
+값이 없으면 디스크를 순서대로 1, 2, …, 그 뒤 CD-ROM; 값이 CD-ROM에만 있으면 디스크를 그 뒤에 차례로 두고(CD로 설치하고
+매체를 뺀 UEFI VM이 디스크로 켜진다) 값 없는 CD-ROM은 그다음; 디스크에 값이 있으면 값 없는 디스크는 부팅하지 않고 값 없는
+CD-ROM은 가장 큰 값 뒤에 선다. 빈 디스크는 펌웨어가 건너뛰므로 처음에는 CD의 설치 프로그램이, 설치 뒤에는 디스크의 시스템이 켜진다
+— "한 번만 CD로 부팅" 없이 설치 흐름이 된다(설치 뒤 매체를 빼 두면 된다). `--boot cdrom,disk`(목록 순서대로 1, 2, …,
+목록에 없는 디스크는 부팅하지 않음 — 디스크를 하나도 적지 않으면 디스크는 목록 뒤)와 웹 VM 편집의 "부팅 순서" 카드(위·아래, "부팅 안 함")로 바꾼다. OVMF·aarch64 EDK2는
+순서에 든 장치만 부팅하므로 CD-ROM에는 늘 순서를 준다. 실행 중 바꾼 CD-ROM 순서는 보류(`cdroms[0].boot_order`)로 남아
+다음 재시작에 적용되고, 디스크 순서는 지금처럼 409다. 실행 중 붙이는 디스크의 `boot_order`가 도는 VM의 CD-ROM이 받은
+순서와 겹치면 409 `vm_running`(`boot_order 2 is already used by cdrom0 in the running VM …`)이다. `-boot once=d`는
+SeaBIOS만 따르므로 쓰지 않는다.
+
+**노드 로컬 풀의 ISO는 VM을 그 노드에 묶는다.** 스케줄러·균형 조정기·비우기는 그 노드에만 둔다. 실행 중 마이그레이션은
+**409** `cdrom_local`(`… eject it or keep ISOs in a shared pool`)이고, 노드 비우기는 그 VM에서 같은 이유로 실패한다 — 매체를
+몰래 빼지 않는다. HA VM과 복제(계획 55) VM에는 처음부터 공유 풀 ISO만 넣는다(400, 다른 노드에서 켜지 못하는 일을 막음).
+공유 풀(NFS, `shared` 디렉터리 풀) ISO는 어디서나 쓰고 마이그레이션 양쪽 QEMU가 같은 파일을 함께 읽는다.
+
+**cloud-init.** `spec.cloud_init`이 있으면 Orbivisor가 NoCloud 씨앗(ISO 9660 + Joliet, 볼륨 라벨 `cidata`, 파일
+`meta-data`·`user-data`·`network-config`·`vendor-data`)을 VM 실행 디렉터리의 `cidata.iso`로 만들어 읽기 전용 CD로 단다(부팅
+장치가 아니다). 볼륨이 아니므로 노드·풀에 남는 것이 없고, 어느 노드에서 켜든(새로 켜기·마이그레이션 받기·HA 복구·스냅샷
+되돌리기) 그 자리에서 다시 만든다.
+
+```bash
+orbivisorctl volume download noble --pool local --source-format qcow2 \
+  --url https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img --sha256 <HEX>
+orbivisorctl volume resize noble --size 20G
+orbivisorctl vm create web --disk noble --nic lan --cloud-init --ci-user orbi \
+  --ci-ssh-key @~/.ssh/id_ed25519.pub --ci-ip 10.0.0.5/24,gw=10.0.0.1 --ci-dns 10.0.0.2 --ci-search lab
+orbivisorctl vm set web --ci-hostname web.lab && orbivisorctl vm reboot web
+```
+
+- 필드: `hostname`(없으면 VM 이름, FQDN이면 `fqdn`도), `user`(배포판 기본 사용자의 새 이름, `root`는 안 됨), `password`,
+  `ssh_keys`(32개까지), `networks`(NIC 순번마다 IPv4 `dhcp`|`static`, IPv6 `dhcp`|`slaac`|`static`), `dns`(서버 3개·검색 6개),
+  `user_data`·`vendor_data`(각 64 KiB). CLI는 `--ci-hostname`·`--ci-user`·`--ci-password-file|--ci-password-prompt|--ci-password-hash`·
+  `--ci-ssh-key KEY|@FILE`·`--ci-ip [nicN=]…`·`--ci-ip6`·`--ci-dns`·`--ci-search`·`--ci-user-data`·`--ci-vendor-data`, `vm set`은
+  준 값만 바꾸고 `--no-cloud-init`·`--ci-no-password`·`--ci-clear-ssh-keys`로 끄거나 지운다. 웹은 VM 편집의 "cloud-init" 카드.
+- 네트워크는 **network-config v1**(cloud-init의 모든 렌더러·옛 판·cloudbase-init이 읽음)이고 MAC으로 맞춰 `eth{i}`로
+  이름을 바꾼다. 주소도 DNS도 주지 않으면 파일을 넣지 않는다(cloud-init 기본 — 첫 NIC DHCP). 하나라도 주면 모든 NIC를 적는다
+  (주지 않은 NIC는 IPv4 DHCP). IPv6만 준 NIC(`--ci-ip6`만, 웹 IPv4 "없음(IPv6만)")에는 IPv4를 두지 않는다 — DHCPv4도 쓰려면
+  `--ci-ip nicN=dhcp`.
+- `user_data`를 주면 **만든 user-data 대신** 그대로 쓴다(Proxmox `cicustom`) — 이때 `user`·`password`·`ssh_keys`는 쓰이지
+  않고 API가 `orbivisor-warning` 헤더로, CLI는 stderr로, 웹은 폼에서 알린다. `vendor_data`는 만든 user-data와 함께 돈다
+  (패키지·`runcmd`는 여기에). **`user_data`·`vendor_data`는 그대로 저장되고 VM 쓰기 권한자에게는 보인다**(고쳐 보내야
+  하므로). 읽기만 하는 사용자(viewer)에게는 VM·스냅샷·백업 응답과 watch에서 `********`로 가리며, PUT에 `********`를 되보내면
+  저장된 값을 둔다. watch 스트림은 연결할 때의 권한으로 가리므로 사용자의 역할이 바뀌면 다시 연결해야 가림이 바뀐다. 그래도
+  비밀은 user-data에 넣지 말고 SSH 키·해시를 쓴다.
+- **instance-id는 내용의 해시다**(`iid-` + 16자): 설정을 바꾸면 instance-id가 바뀌어 cloud-init이 인스턴스마다 하는 일을 다시
+  한다(사용자·키·호스트 이름·네트워크, **SSH 호스트 키도 다시 만든다** — 클라이언트의 known_hosts 경고). 같으면 다시 켜도
+  다시 하지 않는다. 바꾼 설정은 **다음 QEMU 시작**(`vm reboot`·끄고 켜기·마이그레이션 받는 쪽)에 적용되고, 그동안 보류
+  `cloud_init`으로 보인다. 게스트 안의 재부팅(같은 QEMU)은 옛 씨앗을 본다. 실행 중 cloud-init을 바꾸거나 켜고 끄면(호스트
+  이름 없는 VM의 이름 바꾸기도) 재시작할 때까지 마이그레이션이 막힌다(**409** `restart_required`
+  `cloud-init changed while running; restart the VM before migrating it` — 받는 쪽은 씨앗을 지금 스펙으로 다시 만든다). 노드
+  비우기의 결과와 HA 로그도 이 문구를 그대로 보인다. 실행 중 붙인 NIC는 다음 재시작 때 씨앗에 들어가며(보류 `cloud_init`)
+  마이그레이션을 막지 않는다(받는 쪽은 켤 때 단 NIC로 같은 씨앗을 만든다).
+- Windows: cloudbase-init은 NoCloud를 읽으므로 같은 씨앗을 쓸 수 있다(사용자 이름·비밀번호·키·호스트 이름). sysprep 응답
+  파일은 만들지 않는다.
+
+**비밀번호.** 평문은 API가 **SHA-512 crypt**(`$6$`, 무작위 솔트, 5000회)로 바꿔 해시만 저장한다. cloud-init이 해시로 보는
+모양(`$6$`·`$5$`·`$1$`·`$2a$`·`$2y$`, 예: `mkpasswd -m sha-512`)이면 그대로 둔다. yescrypt(`$y$` — 요즘 배포판 `mkpasswd`의
+기본)와 bcrypt `$2b$`는 cloud-init이 평문으로 설정해 버리므로 **400**이다(`--ci-password-hash`도 받지 않음 — 같은 까닭으로
+평문 비밀번호도 `$y$`·`$2b$`로 시작하면 400 `plain passwords may not start with $y$ or $2b$`). 모양이 어긋난
+값(솔트·해시 길이)은 평문으로 보아 해시한다. 응답(VM·스냅샷·백업, watch)에는 해시도 내보내지 않고 `********`로 가린다 — PUT에 `********`를 되보내면
+저장된 해시를 그대로 둔다(웹·CLI가 이렇게 한다). 해시는 Raft·스냅샷·백업 매니페스트에 남으므로 **SSH 키를 권한다**.
+
+**다른 기능과.** 스냅샷·백업·복제(계획 55)·디스크 미러는 디스크(`disk{i}`)만 다루고 CD·씨앗은 담지 않는다. 스냅샷 되돌리기는
+기록된 매체·설정으로 켠다. 백업 복원은 그 클러스터에 없거나 쓸 수 없는 ISO의 드라이브를 비우고 Task 경고(`CD-ROM drive 0:
+ISO "alpine" is not available; the drive is empty`)를 남긴다. cloud-init은 그대로 옮기며 새 VM id라 instance-id가 바뀌어
+다시 적용된다. VM 복제(clone)는 같은 ISO를 가리키고, `hostname`이 없으면 새 이름이 호스트 이름이다. **복제·복원한 VM은
+cloud-init의 고정 IP와 호스트 이름을 그대로 가진다** — 원본과 겹치므로 Task가 경고(`the clone keeps the cloud-init static IP
+addresses 10.0.0.5/24 and host name "web-01"; change them before starting it`)를 남기고, 켜기 전에 `vm set --ci-ip …
+--ci-hostname …`으로 바꾼다. 원격 클러스터에 백업을 복제할 때 받는 쪽이 같은 버전이지만 기능(`install-media`)이 모자란 노드가
+있으면(방어용 — 받기는 옛 버전 노드가 있으면 409 `cluster_upgrading`) CD-ROM 드라이브와 cloud-init을 버린다. 이미 있는
+사본을 확인할 때는 원격 응답이 가린 비밀(`********`)과 받는 쪽이 버린 필드(복제 대상 등)를 같은 규칙으로 견준다. VMware·OVA 가져오기는 CD 장치를 가져오지 않는다.
+
+**넣지 않은 것(나중).** 블록 풀(LVM-thin·ZFS·RBD·공유 LVM)의 ISO, 이어 받기 업로드, 한 번만 CD로 부팅, NIC(PXE) 부팅 순서,
+ConfigDrive2, 패키지 설치 필드(`vendor_data`로 한다), 클라우드 이미지 템플릿·연결 복제, Windows 응답 파일(autounattend).
+
+**한계.** SeaBIOS(q35 BIOS)는 부팅 순서에 없는 씨앗 드라이브의 첫 4096바이트도 읽어 본다(부팅하지는 않음; `-boot
+strict=on`은 모든 VM 명령줄을 바꾸므로 쓰지 않음). 받기 Task의 원래 URL(`user:password@`·쿼리)은 응답에서는 가리지만
+클러스터 저장소에는 남으므로 오래 쓰는 비밀이 든 URL은 피한다.
+
 ## VM 무중단 유형 변경
 
 실행 중인 VM의 vCPU·메모리를 늘리거나 줄이고 디스크·NIC를 붙이거나 뗀다(Proxmox VE의 hotplug, VMware의 CPU·메모리
 hot-add와 같은 자리). 따로 명령이 있는 것이 아니라 실행 중인 VM의 스펙을 바꾸면(`orbivisorctl vm set`, 웹 VM 편집,
 `PUT /api/v1/vms/{key}`) 그 VM의 노드가 **핫플러그 Task**(`vm-hotplug`)로 도는 QEMU를 스펙에 맞춘다. 실행 중에 할 수 없는
 것은 스펙에만 저장하고 **다음 재시작 때 적용할 것**(보류)으로 VM에 남는다. 모든 노드가 이 버전이어야 한다(노드가 알리는
-기능 `hotplug`, 아래 "업그레이드").
+기능 `hotplug`, 아래 "업그레이드"). CD-ROM 매체 넣기·빼기도 같은 Task로 실행 중에 된다("설치 매체와 cloud-init").
 
 | 바꾸는 것 | 실행 중에 바로 | 다음 재시작 때 |
 |---|---|---|
@@ -2954,6 +3096,7 @@ orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Line
 백업은 VM 전체(디스크, UEFI 변수, VM 스펙)를 다른 저장소에 떠 둔 것이다. 스냅샷과 달리 VM 디스크의 저장소를
 잃거나 VM을 지워도 남고, 언제든 **새 VM**으로 되살린다. 백업은 `backups`를 켠 **디렉터리·NFS 풀**(백업 풀)에 둔다.
 노드 사이 로컬 디스크 복제(위 "로컬 디스크 복제와 HA")와 함께 쓸 수 있다 — 복제 비트맵과 증분 백업 비트맵은 따로다.
+CD-ROM 매체와 cloud-init 씨앗은 담지 않는다 — 복원은 없는 ISO의 드라이브를 비우고 경고한다("설치 매체와 cloud-init").
 
 ```bash
 orbivisorctl pool create bk --nfs nas.lan:/srv/backup --backups  # 백업 풀(디렉터리 풀이면 --path /srv/backup)
@@ -4152,6 +4295,7 @@ orbivisorctl backup list
 - **처리 대기.** 웹에서 파일을 다 보낸 뒤 서버가 2분 동안 응답하지 않으면 "처리 중" 알림이 "<이름>: 서버
   응답이 없습니다. 볼륨 목록에서 결과를 확인하세요."로 바뀌고 닫을 수 있다. 업로드는 끊지 않고 서버에서 계속된다.
   나중에 응답이 오면 평소처럼 결과를 알린다.
+- **ISO 이미지·URL에서 받기.** ISO 올리기(`content=iso`)와 URL에서 이미지 받기는 "설치 매체와 cloud-init"에 있다.
 - **머신 기본값.** 노드는 시작할 때 자기 아키텍처(x86_64·aarch64)를 등록한다(노드 목록의 "아키텍처" 열).
   머신 종류를 정하지 않으면 웹과 `orbivisorctl vm create`는 지정한 노드의 아키텍처를, 노드를 정하지 않았으면 클러스터
   노드가 모두 같은 아키텍처일 때 그것을 쓴다(x86_64 → `q35`, aarch64 → `virt`). 아키텍처가 섞인 클러스터에서
@@ -4355,6 +4499,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [제품 이름 Orbivisor로 바꾸기 설계 (계획 43)](docs/superpowers/specs/2026-11-10-rename-orbivisor-design.md)
 - [실시간 지표와 쉬운 화면 설계 (하위 프로젝트 14: 계획 44~47)](docs/superpowers/specs/2026-11-11-monitoring-ui-design.md)
 - [제어부 가용성과 대규모 클러스터 설계 (하위 프로젝트 15: 계획 45~56)](docs/superpowers/specs/2026-11-11-availability-scale-design.md)
+- [설치 매체와 cloud-init 설계 (계획 57)](docs/superpowers/specs/2026-11-17-install-media-cloud-init-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)

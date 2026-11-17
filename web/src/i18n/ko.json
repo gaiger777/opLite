@@ -90,7 +90,9 @@
     "ceph_limit": "{{message}}",
     "ceph_unreachable": "Ceph 상태를 읽지 못했습니다: {{message}}",
     "disk_in_use": "이 디스크에는 OSD를 만들 수 없습니다: {{message}}",
-    "disk_not_empty": "디스크가 비어 있지 않습니다. 지우기를 고르세요: {{message}}"
+    "disk_not_empty": "디스크가 비어 있지 않습니다. 지우기를 고르세요: {{message}}",
+    "cdrom_local": "노드 로컬 풀의 ISO가 CD-ROM 드라이브에 있습니다: {{message}}",
+    "restart_required": "먼저 VM을 다시 시작해야 합니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -115,7 +117,8 @@
     "haChecks": "HA 검사",
     "placementRules": "배치 규칙",
     "placement": "최적 배치",
-    "ceph": "Ceph"
+    "ceph": "Ceph",
+    "isos": "ISO 이미지"
   },
   "header": {
     "language": "언어",
@@ -205,12 +208,17 @@
       "ceph-mgr-add": "{{node}}에 Ceph 매니저 추가",
       "ceph-osd-add": "{{node}} {{device}}에 Ceph OSD 추가",
       "ceph-pool-create": "Ceph 풀 {{pool}}을(를) 스토리지 풀 {{name}}(으)로 만들기(size {{size}})",
-      "ceph-client-install": "{{node}}에 Ceph 클라이언트 패키지 설치"
+      "ceph-client-install": "{{node}}에 Ceph 클라이언트 패키지 설치",
+      "volume-download": "볼륨 {{target}} 받기"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
       "migratingMemory": "메모리 옮기는 중",
-      "replicating": "복제 {{percent}}% ({{done}}/{{total}} GiB)"
+      "replicating": "복제 {{percent}}% ({{done}}/{{total}} GiB)",
+      "downloading": "받는 중 {{percent}}% ({{done}}/{{total}} GiB)",
+      "downloadingUnknown": "받는 중 ({{done}} GiB)",
+      "verifying": "체크섬 확인 중",
+      "importing": "볼륨으로 가져오는 중"
     },
     "detail": {
       "vms": "VM: {{vms}}."
@@ -383,7 +391,11 @@
       "memory_mib": "메모리 (MiB)",
       "max_memory_mib": "최대 메모리 (MiB)",
       "firmware": "펌웨어",
-      "machine": "머신 타입"
+      "machine": "머신 타입",
+      "cdrom": "CD-ROM 드라이브 {{n}}",
+      "cdromBoot": "CD-ROM 드라이브 {{n}}의 부팅 순서",
+      "cdroms": "CD-ROM 드라이브",
+      "cloud_init": "cloud-init"
     },
     "applyAgain": "다시 적용",
     "replication": {
@@ -409,6 +421,28 @@
       "error": "마지막 회차 실패: {{error}}",
       "unusable": "HA가 이 복제본을 쓸 수 없습니다: 마지막 회차 뒤 디스크 {{volume}}이(가) 바뀌었습니다(다음 회차가 끝나면 씁니다).",
       "lastRecovery": "마지막 복구 {{time}}: {{from}}이(가) 죽어 {{node}}에서 {{synced}} 시점의 복제본으로 켰습니다(그 뒤의 쓰기는 잃었습니다)."
+    },
+    "cdroms": "CD/DVD",
+    "cloudInit": "cloud-init",
+    "bootNone": "부팅 장치 없음",
+    "ciUser": "사용자 {{user}}",
+    "ciDefaultUser": "기본 사용자",
+    "ciKeys_one": "SSH 키 {{count}}개",
+    "ciKeys_other": "SSH 키 {{count}}개",
+    "ciPassword": "비밀번호 있음",
+    "ciNoPassword": "비밀번호 없음",
+    "ciInstance": "instance {{id}}",
+    "ciPending": "바꾼 설정은 다음 재시작 때 적용됩니다.",
+    "cdrom": {
+      "drive": "드라이브",
+      "media": "매체",
+      "changing": "{{from}}에서 바꾸는 중",
+      "choose": "드라이브 {{drive}}에 넣을 ISO",
+      "insert": "넣기",
+      "eject": "빼기",
+      "ejectNamed": "드라이브 {{drive}} 빼기",
+      "insertLabel": "{{name}} 드라이브 {{drive}}에 {{iso}} 넣기",
+      "ejectLabel": "{{name}} 드라이브 {{drive}} 빼기"
     }
   },
   "snapshots": {
@@ -796,15 +830,17 @@
     "currentSize": "지금 크기: {{size}}",
     "newSize": "새 크기(GiB)",
     "errors": {
-      "reserved": "import는 예약된 이름입니다.",
+      "reserved": "import와 download는 예약된 이름입니다.",
       "exists": "같은 이름의 볼륨이 이미 있습니다.",
       "grow": "지금 크기보다 큰 값을 넣으세요."
     },
     "reason": {
       "inUse": "먼저 VM에서 빼세요.",
       "notReady": "준비되면 쓸 수 있습니다.",
-      "vmsUnknown": "어느 VM이 쓰는지 알 수 없습니다."
-    }
+      "vmsUnknown": "어느 VM이 쓰는지 알 수 없습니다.",
+      "iso": "ISO 이미지는 크기를 바꿀 수 없습니다."
+    },
+    "showIsos": "ISO 이미지도 보기"
   },
   "uploads": {
     "open": "이미지 올리기",
@@ -823,7 +859,10 @@
     "noNode": "접속한 노드를 알 수 없습니다. {{error}}",
     "errors": {
       "file": "파일을 고르세요."
-    }
+    },
+    "isoTitle": "ISO 이미지 올리기",
+    "isoDescription": "파일은 접속한 노드({{node}})로 가므로 그 노드의 디렉터리·NFS 풀만 고를 수 있습니다. 이미지는 그대로(raw) 둡니다.",
+    "noIsoPool": "쓸 수 있는 디렉터리·NFS 풀이 없습니다. ISO 이미지는 디렉터리·NFS 풀에만 둘 수 있습니다."
   },
   "pools": {
     "path": "디렉터리",
@@ -1532,7 +1571,24 @@
       "replicationNode": "노드를 고르세요.",
       "replicationDuplicate": "이미 대상인 노드입니다.",
       "replicationOwnNode": "VM 자신의 노드에는 복제본을 둘 수 없습니다.",
-      "replicationMinutes": "1~1440 사이의 분을 정수로 쓰세요."
+      "replicationMinutes": "1~1440 사이의 분을 정수로 쓰세요.",
+      "cdromCount": "CD-ROM 드라이브는 4개까지입니다.",
+      "sataPorts": "q35의 SATA 포트 6개를 SATA 디스크·CD-ROM·cloud-init 드라이브가 함께 씁니다.",
+      "bootOverflow": "부팅 순서 뒤에 CD-ROM 드라이브를 둘 자리가 없습니다.",
+      "ciHostname": "호스트 이름이나 FQDN을 쓰세요: 63자까지의 라벨에 영문자·숫자·-.",
+      "ciRoot": "root 대신 기본 사용자에 SSH 키를 쓰세요.",
+      "ciUser": "영소문자·_로 시작하는 1–32자의 영소문자·숫자·_·-를 쓰세요.",
+      "ciPassword": "256바이트까지입니다.",
+      "ciIpv4None": "IPv6가 없으면 IPv4가 있어야 합니다.",
+      "ciPasswordHash": "cloud-init은 yescrypt($y$)·bcrypt-2b($2b$) 해시를 쓰지 못합니다. SHA-512 crypt 해시($6$, 예: mkpasswd -m sha-512)나 평문 비밀번호를 쓰세요.",
+      "ciKeyCount": "SSH 키는 {{max}}개까지입니다.",
+      "ciKey": "{{n}}번째 줄은 SSH 공개 키가 아닙니다.",
+      "ciKeysSize": "SSH 키를 합해 16 KiB를 넘습니다.",
+      "ciAddress": "10.0.0.5/24처럼 접두 길이가 있는 주소를 쓰세요.",
+      "ciGateway": "같은 계열의 주소를 쓰세요.",
+      "ciDns": "IP 주소 3개까지입니다.",
+      "ciSearch": "도메인 이름 6개까지입니다.",
+      "ciData": "64 KiB까지입니다."
     },
     "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
@@ -1587,7 +1643,61 @@
     "replicationPool": "대상 풀",
     "removeReplication": "복제 대상 {{n}} 빼기",
     "addReplication": "복제 대상 더하기",
-    "haNoReplica": "이 VM은 다른 노드에서 다시 켤 수 없습니다 — 디스크 {{volume}}이(가) 노드 로컬 풀 {{pool}}에 있고 복제본이 없습니다. 복제를 더하세요."
+    "haNoReplica": "이 VM은 다른 노드에서 다시 켤 수 없습니다 — 디스크 {{volume}}이(가) 노드 로컬 풀 {{pool}}에 있고 복제본이 없습니다. 복제를 더하세요.",
+    "cdroms": "CD/DVD 드라이브",
+    "cdromsLive": "실행 중에는 매체만 바꿀 수 있습니다(트레이를 강제로 엽니다). 드라이브를 더하거나 빼려면 VM을 멈추세요.",
+    "noCdroms": "CD/DVD 드라이브가 없습니다.",
+    "cdromN": "CD-ROM 드라이브 {{n}}",
+    "cdromMedia": "cdrom{{n}} 매체",
+    "cdromEmpty": "비어 있음",
+    "removeCdrom": "CD-ROM 드라이브 {{n}} 빼기",
+    "addCdrom": "CD/DVD 드라이브 더하기",
+    "bootOrder": "부팅 순서",
+    "bootOrderNote": "펌웨어는 위에서부터 장치를 시도합니다. 기본은 디스크 다음 CD-ROM이라 빈 디스크면 설치 프로그램이, 설치 뒤에는 설치한 시스템이 켜집니다.",
+    "bootOrderRunning": "부팅 순서를 바꾸려면 VM을 멈추세요.",
+    "bootNone": "부팅하는 장치가 없습니다.",
+    "bootDisk": "{{name}} — {{volume}}",
+    "bootCdrom": "{{name}} — {{iso}}",
+    "bootUp": "{{name}} 위로",
+    "bootDown": "{{name}} 아래로",
+    "bootOff": "부팅 안 함",
+    "bootOffNamed": "{{name}}에서 부팅 안 함",
+    "bootOffList": "부팅하지 않는 장치",
+    "bootOn": "부팅",
+    "bootOnNamed": "{{name}}에서 부팅",
+    "cloudInit": "cloud-init",
+    "ciEnabled": "cloud-init으로 게스트 설정",
+    "ciNote": "Orbivisor가 NoCloud 씨앗 드라이브(라벨 cidata)를 붙입니다. 클라우드 이미지와 cloudbase-init이 첫 부팅 때 읽습니다.",
+    "ciRunning": "바꾼 설정은 VM을 다시 시작할 때 적용됩니다. 게스트 안의 재부팅은 옛 설정을 봅니다.",
+    "ciHostname": "호스트 이름",
+    "ciHostnameHint": "비우면 VM 이름({{name}})입니다. FQDN이면 도메인도 정합니다.",
+    "ciUser": "사용자",
+    "ciUserHint": "배포판 기본 사용자의 이름을 바꿉니다. 비우면 그대로입니다.",
+    "ciPasswordSet": "비밀번호가 설정돼 있습니다.",
+    "ciPasswordChange": "바꾸기·지우기",
+    "ciPassword": "비밀번호",
+    "ciPasswordHint": "SHA-512 crypt 해시로만 저장합니다. crypt 해시($6$…)는 그대로 둡니다. 비우면 비밀번호가 없습니다 — SSH 키가 더 안전합니다.",
+    "ciKeys": "SSH 공개 키",
+    "ciKeysHint": "한 줄에 키 하나(ssh-ed25519, ssh-rsa, ecdsa-sha2-…).",
+    "ciNic": "NIC {{n}} 주소",
+    "ciIpv4": "nic{{n}} IPv4",
+    "ciIpv6": "nic{{n}} IPv6",
+    "ciStatic": "정적",
+    "ciAddress": "주소/접두 길이",
+    "ciGateway": "게이트웨이",
+    "ciIpv6None": "없음",
+    "ciIpv4None": "없음(IPv6만)",
+    "ciAddress6": "IPv6 주소/접두 길이",
+    "ciGateway6": "IPv6 게이트웨이",
+    "ciDns": "DNS 서버",
+    "ciSearch": "검색 도메인",
+    "ciListHint": "쉼표나 공백으로 나눕니다.",
+    "ciAdvanced": "고급: user-data와 vendor-data",
+    "ciUserData": "user-data",
+    "ciUserDataHint": "만든 user-data 대신 그대로 씁니다(#cloud-config로 시작).",
+    "ciVendorData": "vendor-data",
+    "ciVendorDataHint": "만든 user-data와 함께 돕니다. 패키지·runcmd는 여기에.",
+    "ciUserDataWarning": "user-data가 만든 user-data를 대신하므로 사용자·비밀번호·SSH 키는 쓰이지 않습니다."
   },
   "console": {
     "connecting": "연결 중…",
@@ -2144,5 +2254,31 @@
       "poolHint": "Ceph 풀을 만들어 스토리지 풀로 등록하세요. 먼저 OSD를 더하세요.",
       "clientsHint": "Ceph 데몬이 없는 노드의 VM도 풀을 쓰도록 클라이언트 패키지를 설치할 수 있습니다(선택)."
     }
+  },
+  "downloads": {
+    "open": "URL에서 받기",
+    "title": "디스크 이미지 받기",
+    "isoTitle": "ISO 이미지 받기",
+    "description": "풀을 쓸 수 있는 노드가 파일을 받으므로 그 노드가 URL에 닿아야 합니다(프록시는 노드의 HTTPS_PROXY). 파일을 확인하려면 SHA-256 체크섬을 넣으세요.",
+    "submit": "받기",
+    "url": "URL",
+    "sha256": "SHA-256 (선택)",
+    "sha256Hint": "배포처 체크섬 파일의 16진 64자입니다.",
+    "errors": {
+      "url": "http나 https URL을 넣으세요.",
+      "sha256": "16진 64자를 넣으세요."
+    }
+  },
+  "isos": {
+    "upload": "ISO 올리기",
+    "note": "ISO 이미지는 디렉터리·NFS 풀에 두고 여러 VM의 CD-ROM 드라이브에 함께 넣을 수 있습니다. 노드 로컬 풀의 ISO를 넣은 VM은 그 노드에만 있습니다.",
+    "usedBy": "넣은 VM",
+    "empty": "ISO 이미지가 없습니다.",
+    "progressFor": "{{name}} 받기",
+    "reason": {
+      "inUse": "먼저 VM에서 빼세요."
+    },
+    "deleteTitle": "ISO {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "이미지 파일을 지웁니다. 이 ISO를 넣은 VM의 스냅샷이 있으면 지울 수 없습니다."
   }
 }

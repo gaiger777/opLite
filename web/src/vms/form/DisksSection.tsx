@@ -170,26 +170,8 @@ export function DisksSection({
                   </NativeSelectOption>
                 </NativeSelect>
               </Field>
+              {/* 부팅 순서는 부팅 순서 카드에서 디스크·CD-ROM을 함께 정한다. */}
               <div className="flex items-end gap-2">
-                <Field
-                  id={`disk-${i}-boot`}
-                  label={t("vms.bootOrder")}
-                  error={errors[`disks.${i}.bootOrder`]}
-                >
-                  {(a11y) => (
-                    <Input
-                      id={`disk-${i}-boot`}
-                      {...a11y}
-                      type="number"
-                      min={1}
-                      max={255}
-                      className="w-20"
-                      disabled={fixed}
-                      value={disk.bootOrder}
-                      onChange={(e) => setDisk(i, { bootOrder: e.target.value })}
-                    />
-                  )}
-                </Field>
                 <Button
                   type="button"
                   variant="ghost"

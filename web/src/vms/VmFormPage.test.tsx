@@ -7,6 +7,8 @@ import type { Task } from "@/api/types";
 import {
   hardware,
   haGroup,
+  installVm,
+  isoVolume,
   NODE,
   pool,
   poolState,
@@ -1165,5 +1167,158 @@ describe("replication", () => {
     await user.click(screen.getByRole("button", { name: "Save" }));
     await waitFor(() => expect(body).toBeDefined());
     expect(body!.spec).not.toHaveProperty("replication");
+  });
+});
+
+describe("install media", () => {
+  const nas = pool("nas", { backend: { kind: "nfs", server: "nas.lan", export: "/srv/iso" } });
+  const media = [
+    volume("web-root", "local"),
+    isoVolume("alpine", "local"),
+    isoVolume("ubuntu", "nas"),
+  ];
+
+  it("creates a VM with a CD-ROM, a boot order and cloud-init", async () => {
+    mockLists({ node: [NODE], "storage-pool": [pool("local"), nas], volume: media });
+    let body: { spec: Record<string, unknown> } | undefined;
+    server.use(
+      http.post(apiUrl("/vms"), async ({ request }) => {
+        body = (await request.json()) as typeof body;
+        return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+      }),
+    );
+    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    await user.click(screen.getByRole("button", { name: "Attach a volume" }));
+    const disk = screen.getByRole("group", { name: "Disk 1" });
+    // ISO는 디스크로 붙이지 않는다.
+    expect(within(disk).queryByRole("option", { name: "alpine" })).not.toBeInTheDocument();
+    await user.selectOptions(within(disk).getByLabelText("Volume"), "web-root");
+    await user.click(screen.getByRole("button", { name: "Add a CD/DVD drive" }));
+    const cd = screen.getByRole("group", { name: "CD-ROM drive 0" });
+    await user.selectOptions(within(cd).getByLabelText("Media of cdrom0"), "alpine");
+
+    // 기본은 디스크 다음 CD-ROM이다. CD-ROM을 위로 올리면 목록 순서대로 적는다.
+    const boot = screen.getByRole("list", { name: "Boot order" });
+    expect(
+      within(boot)
+        .getAllByRole("listitem")
+        .map((li) => li.textContent),
+    ).toEqual([
+      expect.stringContaining("disk0 — web-root"),
+      expect.stringContaining("cdrom0 — alpine"),
+    ]);
+    await user.click(within(boot).getByRole("button", { name: "Move cdrom0 up" }));
+    expect(within(boot).getAllByRole("listitem")[0]).toHaveTextContent("cdrom0 — alpine");
+
+    await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
+    await user.type(screen.getByLabelText("User"), "orbi");
+    await user.type(screen.getByLabelText("Password"), "secret");
+    await user.type(screen.getByLabelText("SSH public keys"), "ssh-ed25519 AAAA me@laptop");
+    await user.selectOptions(screen.getByLabelText("nic0 IPv4"), "static");
+    await user.type(screen.getByLabelText("Address/prefix"), "10.0.0.5/24");
+    await user.type(screen.getByLabelText("Gateway"), "10.0.0.1");
+    await user.type(screen.getByLabelText("DNS servers"), "10.0.0.2");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    await waitFor(() => expect(body).toBeDefined());
+    expect(body!.spec).toMatchObject({
+      disks: [{ volume: "web-root", bus: "virtio-blk", boot_order: 2 }],
+      cdroms: [{ iso: "alpine", boot_order: 1 }],
+      cloud_init: {
+        user: "orbi",
+        password: "secret",
+        ssh_keys: ["ssh-ed25519 AAAA me@laptop"],
+        networks: [{ ipv4: { mode: "static", address: "10.0.0.5/24", gateway: "10.0.0.1" } }],
+        dns: { servers: ["10.0.0.2"] },
+      },
+    });
+    expect(body!.spec.cloud_init).not.toHaveProperty("hostname");
+  });
+
+  it("checks cloud-init input and warns when user-data replaces the user", async () => {
+    mockLists({ node: [NODE], "storage-pool": [pool("local")], volume: media });
+    renderPage(<VmCreatePage />, { path: "/vms/-new" });
+    const user = userEvent.setup();
+    await user.type(await screen.findByLabelText("Name"), "web");
+    await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
+    await user.type(screen.getByLabelText("User"), "root");
+    await user.type(screen.getByLabelText("SSH public keys"), "not a key");
+    await user.click(screen.getByRole("button", { name: "Create" }));
+    expect(screen.getByText("Use SSH keys with the default user instead of root.")).toBeVisible();
+    expect(screen.getByText("Line 1 is not an SSH public key.")).toBeVisible();
+    expect(screen.queryByText(/replaces the generated user-data/)).not.toBeInTheDocument();
+    await user.click(screen.getByText("Advanced: user-data and vendor-data"));
+    await user.type(screen.getByLabelText("user-data"), "#cloud-config");
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "The user-data replaces the generated user-data; user, password and SSH keys are not used.",
+    );
+  });
+
+  it("keeps the stored password when other cloud-init fields change", async () => {
+    const web = installVm("web", "stopped");
+    mockLists({ vm: [web], node: [NODE], "storage-pool": [pool("local")], volume: media });
+    let body: { spec: Record<string, unknown> } | undefined;
+    server.use(
+      http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+        body = (await request.json()) as typeof body;
+        return HttpResponse.json(web);
+      }),
+    );
+    renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+    const user = userEvent.setup();
+    expect(await screen.findByText("A password is set.")).toBeVisible();
+    expect(screen.queryByLabelText("Password")).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText("Host name"), "web.lab");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(body).toBeDefined());
+    expect(body!.spec.cloud_init).toEqual({ ...web.spec.cloud_init, hostname: "web.lab" });
+    expect(body!.spec.cdroms).toEqual([{ iso: "alpine" }, {}]);
+  });
+
+  it("changes the media of a running VM but not its drives or boot order", async () => {
+    const web = installVm("web", "running", {
+      status: {
+        ...vm("web", "running").status,
+        hardware: hardware({ cdroms: [{ iso: "alpine" }, {}] }),
+      },
+    });
+    mockLists({ vm: [web], node: [NODE], "storage-pool": [pool("local"), nas], volume: media });
+    let body: { spec: { cdroms: unknown } } | undefined;
+    server.use(
+      http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+        body = (await request.json()) as typeof body;
+        return HttpResponse.json(web, { headers: { "orbivisor-task": "t-hot" } });
+      }),
+      http.get(apiUrl("/tasks/t-hot"), () =>
+        HttpResponse.json(task("t-hot", "vm-hotplug", web.id)),
+      ),
+    );
+    renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+    const user = userEvent.setup();
+    const cd = await screen.findByRole("group", { name: "CD-ROM drive 1" });
+    expect(screen.queryByRole("button", { name: "Add a CD/DVD drive" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Remove CD-ROM drive 0" })).toBeDisabled();
+    expect(screen.getByText("Stop the VM to change the boot order.")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Move cdrom1 up" })).toBeDisabled();
+    expect(screen.getByText(/apply at the next start/)).toBeVisible();
+    // 볼륨 목록을 읽으면 ISO를 고를 수 있다.
+    await within(cd).findByRole("option", { name: "ubuntu" });
+    await user.selectOptions(within(cd).getByLabelText("Media of cdrom1"), "ubuntu");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findByText("Change hardware of web")).toBeInTheDocument();
+    expect(body!.spec.cdroms).toEqual([{ iso: "alpine" }, { iso: "ubuntu" }]);
+  });
+
+  it("offers only ISOs from shared pools to HA VMs", async () => {
+    const web = installVm("web", "stopped", {
+      spec: { ...installVm("web", "stopped").spec, ha: true },
+    });
+    mockLists({ vm: [web], node: [NODE], "storage-pool": [pool("local"), nas], volume: media });
+    renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+    const cd = await screen.findByRole("group", { name: "CD-ROM drive 1" });
+    await within(cd).findByRole("option", { name: "ubuntu" });
+    const options = within(within(cd).getByLabelText("Media of cdrom1")).getAllByRole("option");
+    expect(options.map((o) => o.textContent)).toEqual(["Empty", "ubuntu"]);
   });
 });

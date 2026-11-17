@@ -7,7 +7,7 @@ import type { Volume } from "@/api/types";
 import { volumeNameError } from "@/storage/volumes";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { resetTasks } from "@/tasks/tasks";
-import { NODE, pool, poolState, task, vm, volume } from "@/test/fixtures";
+import { installVm, isoVolume, NODE, pool, poolState, task, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -17,6 +17,7 @@ it("checks new volume names like the server", () => {
   expect(volumeNameError("data", [])).toBeUndefined();
   expect(volumeNameError("Data", [])).toBe("forms.name");
   expect(volumeNameError("import", [])).toBe("volumes.errors.reserved");
+  expect(volumeNameError("download", [])).toBe("volumes.errors.reserved");
   expect(volumeNameError("data", ["data"])).toBe("volumes.errors.exists");
 });
 
@@ -296,4 +297,61 @@ it("keeps the resize dialog open when the server refuses", async () => {
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
     "You do not have permission to do this.",
   );
+});
+
+it("leaves ISO images out unless asked", async () => {
+  mockLists({
+    volume: [volume("root", "local"), isoVolume("alpine", "local")],
+    vm: [installVm("web", "stopped")],
+    node: [NODE],
+  });
+  renderPage(<VolumesPage />);
+  const table = await screen.findByRole("table", { name: "Volumes" });
+  await within(table).findByText("root");
+  expect(within(table).queryByText("alpine")).not.toBeInTheDocument();
+  const user = userEvent.setup();
+  const chip = screen.getByRole("button", { name: "Show ISO images" });
+  expect(chip).toHaveAttribute("aria-pressed", "false");
+  await user.click(chip);
+  expect(chip).toHaveAttribute("aria-pressed", "true");
+  const alpine = within(table).getByText("alpine").closest("tr")!;
+  expect(alpine).toHaveTextContent("ISO");
+  // CD-ROM에 넣은 VM이 쓰는 VM이다. ISO는 크기를 바꾸지 않는다.
+  expect(within(alpine).getByRole("link", { name: "web" })).toBeInTheDocument();
+  expect(within(alpine).getByRole("button", { name: "Resize alpine" })).toHaveAccessibleDescription(
+    "ISO images cannot be resized.",
+  );
+});
+
+it("downloads a disk image from a URL", async () => {
+  mockLists({ "storage-pool": [pool("local")], volume: [], node: [NODE] });
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/volumes/download"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(task("t1", "volume-download", "v9"), { status: 202 });
+    }),
+  );
+  renderPage(<VolumesPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Download from URL" }));
+  const dialog = await screen.findByRole("dialog", { name: "Download a disk image" });
+  await user.type(
+    within(dialog).getByLabelText("URL"),
+    "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img",
+  );
+  await user.clear(within(dialog).getByLabelText("Name"));
+  await user.type(within(dialog).getByLabelText("Name"), "noble");
+  await user.selectOptions(within(dialog).getByLabelText("Storage pool"), "local");
+  expect(within(dialog).getByLabelText("File format")).toHaveValue("qcow2");
+  await user.selectOptions(within(dialog).getByLabelText("Format"), "raw");
+  await user.click(within(dialog).getByRole("button", { name: "Download" }));
+  expect(await screen.findByText("Download volume noble")).toBeInTheDocument();
+  expect(body).toEqual({
+    name: "noble",
+    pool: "local",
+    url: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img",
+    source_format: "qcow2",
+    format: "raw",
+  });
 });

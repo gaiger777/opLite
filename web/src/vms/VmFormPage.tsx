@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { errorMessage, HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
+import { choosableIsos } from "@/isos/isos";
 import { poolFormats } from "@/storage/pools";
 import { isStopped } from "@/vms/actions";
 import {
@@ -17,9 +18,13 @@ import {
   emptyForm,
   fromVm,
   haActive,
+  type NicRow,
   validate,
   type VmFormValues,
 } from "@/vms/form";
+import { BootOrderSection } from "@/vms/form/BootOrderSection";
+import { CdromsSection } from "@/vms/form/CdromsSection";
+import { CloudInitSection } from "@/vms/form/CloudInitSection";
 import { DisksSection } from "@/vms/form/DisksSection";
 import { GeneralSection } from "@/vms/form/GeneralSection";
 import { haEnabled } from "@/vms/ha";
@@ -86,15 +91,36 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   // 행을 넣거나 빼면 행 번호로 단 오류가 다른 행을 가리키므로 지운다.
   const changeRows = (
     patch:
-      Pick<VmFormValues, "disks"> | Pick<VmFormValues, "nics"> | Pick<VmFormValues, "replication">,
+      | Pick<VmFormValues, "disks">
+      | Pick<VmFormValues, "cdroms">
+      | Pick<VmFormValues, "nics" | "cloudInit">
+      | Pick<VmFormValues, "replication">,
   ) => {
     change(patch);
     setErrors({});
   };
+  // NIC를 빼면 cloud-init의 그 NIC 주소도 뺀다(주소는 NIC 순번을 따른다).
+  const changeNics = (nics: NicRow[]) => {
+    const removed = values.nics.findIndex((n, i) => nics[i] !== n);
+    const networks =
+      nics.length < values.nics.length && removed !== -1
+        ? values.cloudInit.networks.filter((_, i) => i !== removed)
+        : values.cloudInit.networks;
+    changeRows({ nics, cloudInit: { ...values.cloudInit, networks } });
+  };
 
-  // 이 VM에 붙어 있거나 아무 데도 붙지 않은 준비된 볼륨
+  // 이 VM에 붙어 있거나 아무 데도 붙지 않은 준비된 디스크 볼륨(ISO는 CD-ROM에만 넣는다)
   const freeVolumes = (volumes.data ?? []).filter(
-    (v) => v.status.phase === "ready" && (!v.status.attached_to || v.status.attached_to === vm?.id),
+    (v) =>
+      v.spec.content !== "iso" &&
+      v.status.phase === "ready" &&
+      (!v.status.attached_to || v.status.attached_to === vm?.id),
+  );
+  // CD-ROM에 넣을 ISO. HA·복제 VM은 공유 풀의 ISO만(서버의 400)
+  const isos = choosableIsos(
+    volumes.data ?? [],
+    pools.data,
+    haActive(values) || values.replication.length > 0,
   );
 
   // 디스크의 스냅샷 가능 여부(예약 스냅샷). 볼륨·풀 목록을 다 읽어야 안다.
@@ -252,12 +278,32 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           values={values}
           errors={errors}
           onChange={change}
-          onRowsChange={(nics) => changeRows({ nics })}
+          onRowsChange={changeNics}
           networks={networks.data}
           securityGroups={securityGroups.data}
           mode={mode}
           saved={vm?.spec.nics ?? []}
           boot={layout?.boot_nics ?? 0}
+        />
+        <CdromsSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          onRowsChange={(cdroms) => changeRows({ cdroms })}
+          isos={isos}
+          mode={mode}
+        />
+        <BootOrderSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          locked={mode !== "free"}
+        />
+        <CloudInitSection
+          values={values}
+          errors={errors}
+          onChange={change}
+          running={mode !== "free"}
         />
         <ScheduleSection values={values} errors={errors} onChange={change} support={support} />
         <ReplicationSection

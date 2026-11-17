@@ -1,4 +1,4 @@
-import { Maximize2, Plus, Trash2, Upload } from "lucide-react";
+import { Download, Maximize2, Plus, Trash2, Upload } from "lucide-react";
 import { type RefObject, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -27,6 +27,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { DownloadDialog } from "@/isos/DownloadDialog";
+import { isIso } from "@/isos/isos";
 import { formatBytes } from "@/lib/format";
 import { poolFormats, poolUsableSomewhere } from "@/storage/pools";
 import { UploadDialog } from "@/storage/UploadDialog";
@@ -44,6 +46,9 @@ export function VolumesPage() {
   const nodes = useList("node");
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+  // ISO 이미지는 ISO 화면에서 다룬다. 거르기 칩으로 함께 볼 수 있다.
+  const [showIsos, setShowIsos] = useState(false);
   const [deleting, setDeleting] = useState<Volume | null>(null);
   // 볼륨 id. 대화상자는 살아 있는 목록에서 찾아 지금 크기를 최신으로 보인다.
   const [resizing, setResizing] = useState<string | null>(null);
@@ -51,19 +56,24 @@ export function VolumesPage() {
   // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
   const opener = useRef<HTMLElement | null>(null);
   const write = can(me.role, "write", "volume");
-  // 서버는 VM spec의 디스크로 사용 중인지 판단한다(`attached_to`는 마지막으로 실행한 VM이다).
+  // 서버는 VM spec의 디스크와 CD-ROM 매체로 사용 중인지 판단한다(`attached_to`는 마지막으로 실행한 VM이다).
   const userByVolume = useMemo(() => {
     const users = new Map<string, Vm>();
     for (const vm of vms.data ?? []) {
-      for (const disk of vm.spec.disks ?? []) {
+      const media = [...(vm.spec.cdroms ?? []), ...(vm.status.hardware?.cdroms ?? [])];
+      for (const name of [
+        ...(vm.spec.disks ?? []).map((d) => d.volume),
+        ...media.flatMap((c) => (c.iso ? [c.iso] : [])),
+      ]) {
         // 목록에서 먼저 나온 VM을 보인다.
-        if (!users.has(disk.volume)) {
-          users.set(disk.volume, vm);
+        if (!users.has(name)) {
+          users.set(name, vm);
         }
       }
     }
     return users;
   }, [vms.data]);
+  const shown = (volumes.data ?? []).filter((v) => showIsos || !isIso(v));
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
   const reasonBase = useId();
 
@@ -75,6 +85,10 @@ export function VolumesPage() {
         </h1>
         {write && (
           <div className="flex gap-2">
+            <Button variant="outline" onClick={() => setDownloading(true)}>
+              <Download />
+              {t("downloads.open")}
+            </Button>
             <Button variant="outline" onClick={() => setUploading(true)}>
               <Upload />
               {t("uploads.open")}
@@ -85,6 +99,16 @@ export function VolumesPage() {
             </Button>
           </div>
         )}
+      </div>
+      <div>
+        <Button
+          variant={showIsos ? "secondary" : "outline"}
+          size="sm"
+          aria-pressed={showIsos}
+          onClick={() => setShowIsos((v) => !v)}
+        >
+          {t("volumes.showIsos")}
+        </Button>
       </div>
       <Table aria-labelledby="volumes-title">
         <TableHeader>
@@ -105,15 +129,19 @@ export function VolumesPage() {
           </TableRow>
         </TableHeader>
         <TableBody>
-          {(volumes.data ?? []).length === 0 && (
+          {shown.length === 0 && (
             <TableMessage colSpan={write ? 9 : 8} query={volumes} empty={t("volumes.empty")} />
           )}
-          {(volumes.data ?? []).map((volume) => {
+          {shown.map((volume) => {
             const vm = userByVolume.get(volume.name);
             const ready = volume.status.phase === "ready";
             const node = volume.status.node ? nodeById.get(volume.status.node) : undefined;
             // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
-            const resizeReason = ready ? null : "volumes.reason.notReady";
+            const resizeReason = !ready
+              ? "volumes.reason.notReady"
+              : isIso(volume)
+                ? "volumes.reason.iso"
+                : null;
             // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
             const deleteReason = !ready
               ? "volumes.reason.notReady"
@@ -125,7 +153,14 @@ export function VolumesPage() {
             const reasons = `${reasonBase}-${volume.id}`;
             return (
               <TableRow key={volume.id}>
-                <TableCell className="font-medium">{volume.name}</TableCell>
+                <TableCell className="font-medium">
+                  {volume.name}
+                  {isIso(volume) && (
+                    <Badge variant="outline" className="ml-2">
+                      ISO
+                    </Badge>
+                  )}
+                </TableCell>
                 <TableCell>{volume.spec.pool}</TableCell>
                 {/* 가져오는 볼륨은 끝나기 전까지 크기를 모른다. */}
                 <TableCell>
@@ -190,6 +225,7 @@ export function VolumesPage() {
       </Table>
       {creating && <CreateVolumeDialog onClose={() => setCreating(false)} />}
       {uploading && <UploadDialog onClose={() => setUploading(false)} />}
+      {downloading && <DownloadDialog content="disk" onClose={() => setDownloading(false)} />}
       {resizingVolume && (
         <ResizeVolumeDialog
           volume={resizingVolume}

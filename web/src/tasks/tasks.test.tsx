@@ -9,6 +9,7 @@ import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
 import {
   describeDetail,
+  describeProgress,
   describeTask,
   onTrack,
   resetTasks,
@@ -222,4 +223,26 @@ it("stops waiting when aborted or after the timeout", async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+it("describes the progress of downloads", () => {
+  const t = i18n.t;
+  const at = (stage: string, done: number, total: number) =>
+    ({
+      id: "t1",
+      spec: { op: { kind: "volume-download", url: "https://x/a.iso", source_format: "raw" } },
+      status: {
+        state: "running",
+        error: null,
+        progress: { stage, done_bytes: done, total_bytes: total },
+      },
+    }) as Task;
+  expect(describeProgress(at("downloading", 1024 ** 3, 4 * 1024 ** 3), t)).toBe(
+    "Downloading 25% (1.0/4.0 GiB)",
+  );
+  // 전체 길이를 모르면(Content-Length 없음) 받은 양만
+  expect(describeProgress(at("downloading", 2 * 1024 ** 3, 0), t)).toBe("Downloading (2.0 GiB)");
+  expect(describeProgress(at("verifying", 1, 1), t)).toBe("Checking the checksum");
+  expect(describeProgress(at("importing", 1, 1), t)).toBe("Importing into the volume");
+  expect(describeTask(at("importing", 1, 1), t, "alpine")).toBe("Download volume alpine");
 });

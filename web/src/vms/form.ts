@@ -1,6 +1,14 @@
 import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
+import { effectiveBoot, MAX_BOOT_ORDER } from "@/vms/boot";
+import {
+  cloudInitErrors,
+  cloudInitFrom,
+  type CloudInitValues,
+  emptyCloudInit,
+  toCloudInit,
+} from "@/vms/cloudInit";
 import {
   DEFAULT_GUEST_WATCH_SECS,
   DEFAULT_HA,
@@ -25,17 +33,20 @@ export const MAX_VCPUS = 256;
 export const MAX_HOTPLUG_MEMORY_MIB = 512 * 1024;
 /** 서버의 `MEMORY_HOTPLUG_ALIGN_MIB`: 메모리 상한이 있으면 메모리와 상한이 이 배수여야 한다. */
 export const MEMORY_HOTPLUG_ALIGN_MIB = 128;
-/** 서버의 `cores`(u16)와 `boot_order`(u8)의 최댓값 */
+/** 서버의 `MAX_CDROMS` */
+export const MAX_CDROMS = 4;
+/** 서버의 `Q35_SATA_PORTS`: q35 내장 AHCI 포트를 SATA 디스크·CD-ROM·cloud-init 드라이브가 나눠 쓴다. */
+export const Q35_SATA_PORTS = 6;
+/** 서버의 `cores`(u16)의 최댓값 */
 const MAX_CORES = 65535;
-const MAX_BOOT_ORDER = 255;
 /** 서버의 `MAX_SCHEDULE_KEEP` */
 const MAX_SCHEDULE_KEEP = 100;
 /** 서버의 리소스 이름 규칙: 소문자·숫자·`-`, 63자까지, `-`로 시작하거나 끝나지 않는다. */
 const NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const MAC = /^[0-9a-f]{2}(:[0-9a-f]{2}){5}$/i;
-/** `/volumes/import` 경로와 겹쳐 서버가 볼륨 이름으로 받지 않는다. */
-export const RESERVED_VOLUME = "import";
+/** `/volumes/import`·`/volumes/download` 경로와 겹쳐 서버가 볼륨 이름으로 받지 않는다. */
+export const RESERVED_VOLUMES: readonly string[] = ["import", "download"];
 const GIB = 1024 ** 3;
 
 export interface DiskRow {
@@ -45,6 +56,14 @@ export interface DiskRow {
   pool: string;
   sizeGib: string;
   bus: Schemas["DiskBus"];
+  bootOrder: string;
+}
+
+/** CD-ROM 드라이브 하나(`spec.cdroms`). */
+export interface CdromRow {
+  /** 넣은 ISO 볼륨 이름. 비면 빈 드라이브 */
+  iso: string;
+  /** 비면 디스크 뒤(`effectiveBoot`) */
   bootOrder: string;
 }
 
@@ -85,7 +104,9 @@ export interface VmFormValues {
   firmware: Schemas["Firmware"];
   machine: Schemas["MachineType"];
   disks: DiskRow[];
+  cdroms: CdromRow[];
   nics: NicRow[];
+  cloudInit: CloudInitValues;
   /** 빈 문자열이면 스케줄러가 고른다. */
   node: string;
   restart: Schemas["RestartPolicy"];
@@ -154,7 +175,9 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     firmware: "uefi",
     machine,
     disks: [],
+    cdroms: [],
     nics: [{ network: "user", model: "virtio", mac: "", securityGroups: [] }],
+    cloudInit: emptyCloudInit(),
     node: "",
     restart: "never",
     snapshotSchedule: { every: "off", keep: "7", memory: false },
@@ -185,12 +208,17 @@ export function fromVm(vm: Vm): VmFormValues {
       bus: d.bus,
       bootOrder: d.boot_order == null ? "" : String(d.boot_order),
     })),
+    cdroms: (s.cdroms ?? []).map((c) => ({
+      iso: c.iso ?? "",
+      bootOrder: c.boot_order == null ? "" : String(c.boot_order),
+    })),
     nics: (s.nics ?? []).map((n) => ({
       network: n.network,
       model: n.model,
       mac: n.mac ?? "",
       securityGroups: n.security_groups ?? [],
     })),
+    cloudInit: cloudInitFrom(s.cloud_init),
     node: s.node ?? "",
     restart: s.restart ?? "never",
     snapshotSchedule: s.snapshot_schedule
@@ -293,7 +321,7 @@ export function validate(
       errors[`disks.${i}.volume`] = "vmForm.errors.volume";
     } else if (names.has(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volumeDuplicate";
-    } else if (d.kind === "new" && d.volume === RESERVED_VOLUME) {
+    } else if (d.kind === "new" && RESERVED_VOLUMES.includes(d.volume)) {
       errors[`disks.${i}.volume`] = "volumes.errors.reserved";
     } else if (d.kind === "new" && volumes.includes(d.volume)) {
       errors[`disks.${i}.volume`] = "vmForm.errors.volumeExists";
@@ -314,6 +342,16 @@ export function validate(
       boots.add(order);
     }
   });
+  v.cdroms.forEach((c, i) => {
+    if (c.bootOrder !== "") {
+      const order = Number(c.bootOrder);
+      if (!intIn(c.bootOrder, 1, MAX_BOOT_ORDER) || boots.has(order)) {
+        errors[`cdroms.${i}.bootOrder`] = "vmForm.errors.bootOrder";
+      }
+      boots.add(order);
+    }
+  });
+  Object.assign(errors, cdromErrors(v));
   const macs = new Set<string>();
   v.nics.forEach((n, i) => {
     if (n.securityGroups.length > MAX_NIC_SECURITY_GROUPS) {
@@ -338,6 +376,7 @@ export function validate(
     errors["schedule.keep"] = "vmForm.errors.keep";
   }
   Object.assign(errors, replicationErrors(v));
+  Object.assign(errors, cloudInitErrors(v.cloudInit, v.nics.length));
   if (v.ha) {
     for (const [field, value] of [
       ["maxRestart", v.maxRestart],
@@ -357,6 +396,54 @@ export function validate(
     ) {
       errors.guestWatchSecs = "vmForm.errors.guestWatch";
     }
+  }
+  return errors;
+}
+
+/** 폼의 부팅 순서 값(빈 칸은 null) */
+export function bootOrders(v: Pick<VmFormValues, "disks" | "cdroms">): {
+  disks: (number | null)[];
+  cdroms: (number | null)[];
+} {
+  const order = (text: string) => (text === "" ? null : Number(text));
+  return {
+    disks: v.disks.map((d) => order(d.bootOrder)),
+    cdroms: v.cdroms.map((c) => order(c.bootOrder)),
+  };
+}
+
+/**
+ * CD-ROM 드라이브의 오류(서버의 `VmSpec::validate`): 드라이브 수, q35 SATA 포트 나눠 쓰기(CD-ROM이나 cloud-init이 있을
+ * 때만), 디스크 뒤에 둘 부팅 순서 자리.
+ */
+function cdromErrors(v: VmFormValues): Record<string, string> {
+  const errors: Record<string, string> = {};
+  if (v.cdroms.length > MAX_CDROMS) {
+    errors.cdroms = "vmForm.errors.cdromCount";
+    return errors;
+  }
+  const seed = v.cloudInit.enabled ? 1 : 0;
+  const sata = v.disks.filter((d) => d.bus === "sata").length;
+  if (
+    v.machine === "q35" &&
+    (v.cdroms.length > 0 || seed > 0) &&
+    sata + v.cdroms.length + seed > Q35_SATA_PORTS
+  ) {
+    errors.cdroms = "vmForm.errors.sataPorts";
+    return errors;
+  }
+  const orders = bootOrders(v);
+  // 틀린 값은 그 행의 오류가 알린다.
+  const valid = [...orders.disks, ...orders.cdroms].every(
+    (o) => o === null || intIn(String(o), 1, MAX_BOOT_ORDER),
+  );
+  const boot = effectiveBoot(orders.disks, orders.cdroms);
+  // 값 없는 CD-ROM과 (값이 CD-ROM에만 있을 때) 차례로 매긴 디스크가 255를 넘으면 서버가 거절한다.
+  const overflow =
+    boot.cdroms.includes(null) ||
+    (v.cdroms.length > 0 && orders.disks.every((o) => o === null) && boot.disks.includes(null));
+  if (valid && overflow) {
+    errors.cdroms = "vmForm.errors.bootOverflow";
   }
   return errors;
 }
@@ -439,12 +526,20 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
       bus: d.bus,
       boot_order: d.bootOrder === "" ? null : Number(d.bootOrder),
     })),
+    // CD-ROM과 cloud-init이 없으면 보내지 않는다(옛 클러스터는 이 필드를 모른다).
+    ...(v.cdroms.length > 0 && {
+      cdroms: v.cdroms.map((c) => ({
+        ...(c.iso !== "" && { iso: c.iso }),
+        ...(c.bootOrder !== "" && { boot_order: Number(c.bootOrder) }),
+      })),
+    }),
     nics: v.nics.map((n) => ({
       network: n.network,
       model: n.model,
       mac: n.mac === "" ? null : n.mac.toLowerCase(),
       ...(n.securityGroups.length > 0 && { security_groups: n.securityGroups }),
     })),
+    ...(v.cloudInit.enabled && { cloud_init: toCloudInit(v.cloudInit, v.nics.length) }),
     node: v.node === "" ? null : v.node,
     power,
     restart: v.restart,

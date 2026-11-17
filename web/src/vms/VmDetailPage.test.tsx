@@ -4,6 +4,8 @@ import { http, HttpResponse } from "msw";
 
 import {
   hardware,
+  installVm,
+  isoVolume,
   NODE,
   pool,
   replica,
@@ -685,5 +687,91 @@ describe("replication card", () => {
     renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
     expect(await screen.findByRole("heading", { name: "web" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "Replication" })).not.toBeInTheDocument();
+  });
+});
+
+describe("install media", () => {
+  const nas = pool("nas", { backend: { kind: "nfs", server: "nas.lan", export: "/srv/iso" } });
+  const running = installVm("web", "running", {
+    status: {
+      ...vm("web", "running").status,
+      hardware: hardware({
+        cdroms: [{ iso: "alpine" }, {}],
+        cloud_init: "iid-0123456789abcdef",
+        pending: [
+          {
+            field: "cloud_init",
+            running: "iid-0123456789abcdef",
+            wanted: "iid-fedcba9876543210",
+            reason: "restart",
+          },
+          { field: "cdroms[1].boot_order", running: "4", wanted: "1", reason: "restart" },
+        ],
+      }),
+    },
+  });
+
+  it("summarizes the boot order and cloud-init", async () => {
+    mockLists({ vm: [running], node: [NODE] });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+    expect(await screen.findByText("disk0, cdrom0, cdrom1")).toBeInTheDocument();
+    expect(
+      screen.getByText("user orbi, 1 SSH key, password set, nic0 10.0.0.5/24 gw 10.0.0.1"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("instance iid-0123456789abcdef")).toBeInTheDocument();
+    expect(screen.getByText("Changed settings apply at the next restart.")).toBeInTheDocument();
+    // 보류 목록은 CD-ROM 드라이브 번호를 넣어 보인다.
+    const pending = screen.getByRole("list", { name: "Applies at the next restart" });
+    expect(pending).toHaveTextContent("Boot order of CD-ROM drive 1");
+    expect(pending).toHaveTextContent("cloud-init");
+  });
+
+  it("inserts and ejects media while the VM runs and tracks the task", async () => {
+    mockLists({
+      vm: [running],
+      node: [NODE],
+      volume: [isoVolume("alpine", "local"), isoVolume("ubuntu", "nas")],
+      "storage-pool": [pool("local"), nas],
+    });
+    const bodies: unknown[] = [];
+    server.use(
+      http.post(apiUrl(`/vms/${running.id}/cdrom`), async ({ request }) => {
+        bodies.push(await request.json());
+        return HttpResponse.json(running, { headers: { "orbivisor-task": "t-hot" } });
+      }),
+      http.get(apiUrl("/tasks/t-hot"), () =>
+        HttpResponse.json(task("t-hot", "vm-hotplug", running.id)),
+      ),
+    );
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web?tab=hardware" });
+    const user = userEvent.setup();
+    const table = await screen.findByRole("table", { name: "CD/DVD" });
+    const rows = within(table).getAllByRole("row");
+    expect(rows[1]).toHaveTextContent("cdrom0");
+    expect(rows[1]).toHaveTextContent("alpine");
+    expect(rows[2]).toHaveTextContent("Empty");
+    expect(within(rows[2]!).getByRole("button", { name: "Eject drive 1" })).toBeDisabled();
+    const choose = within(rows[2]!).getByLabelText("ISO for drive 1");
+    await within(choose).findByRole("option", { name: "ubuntu" });
+    await user.selectOptions(choose, "ubuntu");
+    await user.click(within(rows[2]!).getByRole("button", { name: "Insert" }));
+    expect(await screen.findByText("Insert ubuntu into drive 1 of web")).toBeInTheDocument();
+    await user.click(within(rows[1]!).getByRole("button", { name: "Eject drive 0" }));
+    await waitFor(() => expect(bodies).toHaveLength(2));
+    expect(bodies).toEqual([
+      { drive: 1, iso: "ubuntu" },
+      { drive: 0, iso: null },
+    ]);
+  });
+
+  it("shows media that is still being changed", async () => {
+    const changing = {
+      ...running,
+      spec: { ...running.spec, cdroms: [{}, {}] },
+    };
+    mockLists({ vm: [changing], node: [NODE] });
+    renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web?tab=hardware" });
+    const table = await screen.findByRole("table", { name: "CD/DVD" });
+    expect(within(table).getAllByRole("row")[1]).toHaveTextContent("changing from alpine");
   });
 });

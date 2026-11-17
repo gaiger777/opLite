@@ -1,9 +1,10 @@
-import { NODE, replicatedVm, vm } from "@/test/fixtures";
+import { installVm, NODE, replicatedVm, vm } from "@/test/fixtures";
 import {
   defaultMachine,
   emptyDisk,
   emptyForm,
   fromVm,
+  type CdromRow,
   gibToBytes,
   haUnavailable,
   toSpec,
@@ -325,4 +326,68 @@ it("checks replication targets like the server", () => {
   ).toEqual({ replication: "vmForm.errors.replicationSnapshots" });
   // 노드를 스케줄러에 맡긴 VM은 어느 대상이든 받는다(서버가 고른 노드와 겹치면 400).
   expect(validate({ ...base, node: "", replication: [row("n1")] }, true)).toEqual({});
+});
+
+it("round-trips CD-ROM drives and cloud-init", () => {
+  const web = installVm("web", "stopped");
+  const values = fromVm(web);
+  expect(values.cdroms).toEqual([
+    { iso: "alpine", bootOrder: "" },
+    { iso: "", bootOrder: "" },
+  ]);
+  expect(values.cloudInit).toMatchObject({ enabled: true, user: "orbi", passwordSet: true });
+  // 저장된 비밀번호는 가림 값으로 되보낸다.
+  expect(toSpec(values, "stopped")).toEqual({ ...web.spec, snapshot_schedule: null });
+  // 없으면 보내지 않는다(옛 클러스터).
+  const plain = toSpec(fromVm(vm("db", "stopped")), "stopped");
+  expect(plain).not.toHaveProperty("cdroms");
+  expect(plain).not.toHaveProperty("cloud_init");
+  expect(
+    toSpec({ ...values, cloudInit: { ...values.cloudInit, enabled: false } }, "stopped"),
+  ).not.toHaveProperty("cloud_init");
+});
+
+it("checks CD-ROM drives and boot orders like the server", () => {
+  const cd = (bootOrder = ""): CdromRow => ({ iso: "", bootOrder });
+  const base = { ...emptyForm("q35"), name: "web" };
+  expect(validate({ ...base, cdroms: [cd(), cd(), cd(), cd(), cd()] }, true)).toEqual({
+    cdroms: "vmForm.errors.cdromCount",
+  });
+  // q35의 SATA 포트 6개: SATA 디스크 넷 + CD 둘 + cloud-init 드라이브는 넘친다.
+  const sata = Array.from({ length: 4 }, (_, i) => ({
+    ...emptyDisk("web", i),
+    pool: "local",
+    bus: "sata" as const,
+    bootOrder: "",
+  }));
+  const crowded = { ...base, disks: sata, cdroms: [cd(), cd()] };
+  expect(validate(crowded, true)).toEqual({});
+  expect(
+    validate({ ...crowded, cloudInit: { ...crowded.cloudInit, enabled: true } }, true),
+  ).toEqual({ cdroms: "vmForm.errors.sataPorts" });
+  // virt에는 SATA 규칙이 없다.
+  expect(
+    validate(
+      { ...crowded, machine: "virt", cloudInit: { ...crowded.cloudInit, enabled: true } },
+      true,
+    ),
+  ).toEqual({});
+  // 디스크와 CD-ROM 사이에서도 겹치면 안 된다.
+  const disk = { ...emptyDisk("web", 0), pool: "local", bootOrder: "1" };
+  expect(validate({ ...base, disks: [disk], cdroms: [cd("1")] }, true)).toEqual({
+    "cdroms.0.bootOrder": "vmForm.errors.bootOrder",
+  });
+  // 255 뒤에는 CD-ROM을 둘 자리가 없다.
+  expect(
+    validate({ ...base, disks: [{ ...disk, bootOrder: "255" }], cdroms: [cd()] }, true),
+  ).toEqual({ cdroms: "vmForm.errors.bootOverflow" });
+});
+
+it("rejects the reserved volume names", () => {
+  const v = {
+    ...emptyForm("q35"),
+    name: "web",
+    disks: [{ ...emptyDisk("web", 0), pool: "local", volume: "download" }],
+  };
+  expect(validate(v, true)).toEqual({ "disks.0.volume": "volumes.errors.reserved" });
 });

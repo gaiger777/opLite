@@ -145,6 +145,40 @@ export function volume(name: string, pool: string, extra: Partial<Volume["status
   };
 }
 
+/** 테스트용 ISO 이미지 볼륨(`content: iso`, raw, 600 MiB) */
+export function isoVolume(
+  name: string,
+  pool: string,
+  extra: Partial<Volume["status"]> = {},
+): Volume {
+  const v = volume(name, pool, { allocated_bytes: 600 * 1024 ** 2, ...extra });
+  return { ...v, spec: { pool, size_bytes: 600 * 1024 ** 2, format: "raw", content: "iso" } };
+}
+
+/**
+ * 테스트용 설치 VM: 디스크 하나, ISO `alpine`을 넣은 CD-ROM 하나와 빈 드라이브 하나, cloud-init(사용자 `orbi`, 가려진
+ * 비밀번호, 키 하나, NIC 0 정적 주소).
+ */
+export function installVm(name: string, phase: Vm["status"]["phase"], extra: Partial<Vm> = {}): Vm {
+  const v = vm(name, phase, extra);
+  return {
+    ...v,
+    spec: {
+      ...v.spec,
+      disks: [{ volume: `${name}-root`, bus: "virtio-blk", boot_order: null }],
+      cdroms: [{ iso: "alpine" }, {}],
+      nics: [{ network: "user", model: "virtio", mac: "52:54:00:00:00:01" }],
+      cloud_init: {
+        user: "orbi",
+        password: "********",
+        ssh_keys: ["ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK0 me@laptop"],
+        networks: [{ ipv4: { mode: "static", address: "10.0.0.5/24", gateway: "10.0.0.1" } }],
+      },
+      ...extra.spec,
+    },
+  };
+}
+
 /** 대상 노드 `node`의 복제 상태. 기본은 볼륨 `web-root`(`volume("web-root", …)`)를 담은 준비된 증분 복제본이다. */
 export function replica(node: string, extra: Partial<ReplicaStatus> = {}): ReplicaStatus {
   return {

@@ -1,3 +1,4 @@
+import i18n from "@/i18n";
 import { hardware, vm } from "@/test/fixtures";
 import {
   deviceMode,
@@ -7,6 +8,7 @@ import {
   liveRemovable,
   memoryMatchesBoot,
   needsRestart,
+  pendingFieldLabel,
   pendingReasonKey,
   runningMemory,
   runningVcpus,
@@ -131,4 +133,13 @@ it("tells whether a memory snapshot can be taken like the server", () => {
       }),
     ),
   ).toBe(false);
+});
+
+it("names the pending changes of CD-ROM drives and cloud-init", () => {
+  const t = i18n.t;
+  expect(pendingFieldLabel("cdroms[1].boot_order", t)).toBe("Boot order of CD-ROM drive 1");
+  expect(pendingFieldLabel("cdroms[0]", t)).toBe("CD-ROM drive 0");
+  expect(pendingFieldLabel("cloud_init", t)).toBe("cloud-init");
+  expect(pendingFieldLabel("cpu.max_vcpus", t)).toBe("Maximum vCPUs");
+  expect(pendingFieldLabel("something.new", t)).toBe("something.new");
 });

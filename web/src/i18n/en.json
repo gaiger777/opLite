@@ -90,7 +90,9 @@
     "ceph_limit": "{{message}}",
     "ceph_unreachable": "Could not read the Ceph status: {{message}}",
     "disk_in_use": "The disk cannot hold an OSD: {{message}}",
-    "disk_not_empty": "The disk is not empty. Choose to erase it first: {{message}}"
+    "disk_not_empty": "The disk is not empty. Choose to erase it first: {{message}}",
+    "cdrom_local": "An ISO from a node-local pool is in a CD-ROM drive: {{message}}",
+    "restart_required": "The VM must be restarted first: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -115,7 +117,8 @@
     "haChecks": "HA checks",
     "placementRules": "Placement rules",
     "placement": "Optimal placement",
-    "ceph": "Ceph"
+    "ceph": "Ceph",
+    "isos": "ISO images"
   },
   "header": {
     "language": "Language",
@@ -205,12 +208,17 @@
       "ceph-mgr-add": "Add a Ceph manager on {{node}}",
       "ceph-osd-add": "Add a Ceph OSD on {{node}} {{device}}",
       "ceph-pool-create": "Create Ceph pool {{pool}} as storage pool {{name}} (size {{size}})",
-      "ceph-client-install": "Install Ceph client packages on {{node}}"
+      "ceph-client-install": "Install Ceph client packages on {{node}}",
+      "volume-download": "Download volume {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
       "migratingMemory": "Migrating memory",
-      "replicating": "Replicating {{percent}}% ({{done}}/{{total}} GiB)"
+      "replicating": "Replicating {{percent}}% ({{done}}/{{total}} GiB)",
+      "downloading": "Downloading {{percent}}% ({{done}}/{{total}} GiB)",
+      "downloadingUnknown": "Downloading ({{done}} GiB)",
+      "verifying": "Checking the checksum",
+      "importing": "Importing into the volume"
     },
     "detail": {
       "vms": "VMs: {{vms}}."
@@ -383,7 +391,11 @@
       "memory_mib": "Memory (MiB)",
       "max_memory_mib": "Maximum memory (MiB)",
       "firmware": "Firmware",
-      "machine": "Machine type"
+      "machine": "Machine type",
+      "cdrom": "CD-ROM drive {{n}}",
+      "cdromBoot": "Boot order of CD-ROM drive {{n}}",
+      "cdroms": "CD-ROM drives",
+      "cloud_init": "cloud-init"
     },
     "applyAgain": "Apply again",
     "replication": {
@@ -409,6 +421,28 @@
       "error": "Last run failed: {{error}}",
       "unusable": "HA cannot use this replica: disk {{volume}} changed after the last run (it can after the next run).",
       "lastRecovery": "Last recovery at {{time}}: {{from}} failed; restarted on {{node}} from the replica taken at {{synced}} (writes after that were lost)."
+    },
+    "cdroms": "CD/DVD",
+    "cloudInit": "cloud-init",
+    "bootNone": "No boot device",
+    "ciUser": "user {{user}}",
+    "ciDefaultUser": "default user",
+    "ciKeys_one": "{{count}} SSH key",
+    "ciKeys_other": "{{count}} SSH keys",
+    "ciPassword": "password set",
+    "ciNoPassword": "no password",
+    "ciInstance": "instance {{id}}",
+    "ciPending": "Changed settings apply at the next restart.",
+    "cdrom": {
+      "drive": "Drive",
+      "media": "Media",
+      "changing": "changing from {{from}}",
+      "choose": "ISO for drive {{drive}}",
+      "insert": "Insert",
+      "eject": "Eject",
+      "ejectNamed": "Eject drive {{drive}}",
+      "insertLabel": "Insert {{iso}} into drive {{drive}} of {{name}}",
+      "ejectLabel": "Eject drive {{drive}} of {{name}}"
     }
   },
   "snapshots": {
@@ -796,15 +830,17 @@
     "currentSize": "Current size: {{size}}",
     "newSize": "New size (GiB)",
     "errors": {
-      "reserved": "The name import is reserved.",
+      "reserved": "The names import and download are reserved.",
       "exists": "A volume with this name already exists.",
       "grow": "Enter a size larger than the current size."
     },
     "reason": {
       "inUse": "Remove it from the VM first.",
       "notReady": "Available once ready.",
-      "vmsUnknown": "Cannot tell which VMs use it."
-    }
+      "vmsUnknown": "Cannot tell which VMs use it.",
+      "iso": "ISO images cannot be resized."
+    },
+    "showIsos": "Show ISO images"
   },
   "uploads": {
     "open": "Upload image",
@@ -823,7 +859,10 @@
     "noNode": "Cannot tell which node you are connected to. {{error}}",
     "errors": {
       "file": "Choose a file."
-    }
+    },
+    "isoTitle": "Upload an ISO image",
+    "isoDescription": "The file goes to the node you are connected to ({{node}}), so only directory and NFS pools on that node can be chosen. The image is kept as it is (raw).",
+    "noIsoPool": "No directory or NFS pool is available. ISO images can be kept only in directory and NFS pools."
   },
   "pools": {
     "path": "Directory",
@@ -1532,7 +1571,24 @@
       "replicationNode": "Choose a node.",
       "replicationDuplicate": "This node is already a target.",
       "replicationOwnNode": "The VM's own node cannot hold its replica.",
-      "replicationMinutes": "Enter whole minutes from 1 to 1440."
+      "replicationMinutes": "Enter whole minutes from 1 to 1440.",
+      "cdromCount": "Up to 4 CD-ROM drives.",
+      "sataPorts": "q35 has 6 SATA ports for SATA disks, CD-ROM drives and the cloud-init drive together.",
+      "bootOverflow": "The boot order leaves no room for the CD-ROM drives after it.",
+      "ciHostname": "Use a host name or FQDN: letters, digits and - in labels of up to 63 characters.",
+      "ciRoot": "Use SSH keys with the default user instead of root.",
+      "ciUser": "Use 1–32 lowercase letters, digits, _ and -, starting with a letter or _.",
+      "ciPassword": "At most 256 bytes.",
+      "ciIpv4None": "Without IPv6 the NIC needs IPv4.",
+      "ciPasswordHash": "cloud-init cannot use yescrypt ($y$) or bcrypt-2b ($2b$) hashes. Use a SHA-512 crypt hash ($6$, e.g. mkpasswd -m sha-512) or a plain password.",
+      "ciKeyCount": "Up to {{max}} SSH keys.",
+      "ciKey": "Line {{n}} is not an SSH public key.",
+      "ciKeysSize": "The SSH keys are longer than 16 KiB together.",
+      "ciAddress": "Use an address with a prefix length, such as 10.0.0.5/24.",
+      "ciGateway": "Use an address of the same family.",
+      "ciDns": "Up to 3 IP addresses.",
+      "ciSearch": "Up to 6 domain names.",
+      "ciData": "At most 64 KiB."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
@@ -1587,7 +1643,61 @@
     "replicationPool": "Target pool",
     "removeReplication": "Remove replication target {{n}}",
     "addReplication": "Add replication target",
-    "haNoReplica": "This VM cannot be restarted on another node: disk {{volume}} is on node-local pool {{pool}} and has no replica. Add replication."
+    "haNoReplica": "This VM cannot be restarted on another node: disk {{volume}} is on node-local pool {{pool}} and has no replica. Add replication.",
+    "cdroms": "CD/DVD drives",
+    "cdromsLive": "While the VM runs, only the media can be changed (the drive tray is opened by force). Stop the VM to add or remove drives.",
+    "noCdroms": "No CD/DVD drive.",
+    "cdromN": "CD-ROM drive {{n}}",
+    "cdromMedia": "Media of cdrom{{n}}",
+    "cdromEmpty": "Empty",
+    "removeCdrom": "Remove CD-ROM drive {{n}}",
+    "addCdrom": "Add a CD/DVD drive",
+    "bootOrder": "Boot order",
+    "bootOrderNote": "The firmware tries the devices from the top. By default the disks come first and then the CD-ROM drives, so an empty disk boots the installer and the installed system boots afterwards.",
+    "bootOrderRunning": "Stop the VM to change the boot order.",
+    "bootNone": "No device boots.",
+    "bootDisk": "{{name}} — {{volume}}",
+    "bootCdrom": "{{name}} — {{iso}}",
+    "bootUp": "Move {{name}} up",
+    "bootDown": "Move {{name}} down",
+    "bootOff": "Do not boot",
+    "bootOffNamed": "Do not boot from {{name}}",
+    "bootOffList": "Not booted",
+    "bootOn": "Boot",
+    "bootOnNamed": "Boot from {{name}}",
+    "cloudInit": "cloud-init",
+    "ciEnabled": "Configure the guest with cloud-init",
+    "ciNote": "Orbivisor attaches a NoCloud seed drive (label cidata). Cloud images and cloudbase-init read it at first boot.",
+    "ciRunning": "Changes apply at the next start of the VM (restart). A reboot inside the guest still sees the old settings.",
+    "ciHostname": "Host name",
+    "ciHostnameHint": "Empty uses the VM name ({{name}}). A FQDN also sets the domain.",
+    "ciUser": "User",
+    "ciUserHint": "Renames the distribution's default user. Empty keeps its name.",
+    "ciPasswordSet": "A password is set.",
+    "ciPasswordChange": "Change or remove",
+    "ciPassword": "Password",
+    "ciPasswordHint": "Stored only as a SHA-512 crypt hash. A crypt hash ($6$…) is kept as it is. Empty means no password; SSH keys are safer.",
+    "ciKeys": "SSH public keys",
+    "ciKeysHint": "One key per line (ssh-ed25519, ssh-rsa, ecdsa-sha2-…).",
+    "ciNic": "Addresses of NIC {{n}}",
+    "ciIpv4": "nic{{n}} IPv4",
+    "ciIpv6": "nic{{n}} IPv6",
+    "ciStatic": "Static",
+    "ciAddress": "Address/prefix",
+    "ciGateway": "Gateway",
+    "ciIpv6None": "None",
+    "ciIpv4None": "None (IPv6 only)",
+    "ciAddress6": "IPv6 address/prefix",
+    "ciGateway6": "IPv6 gateway",
+    "ciDns": "DNS servers",
+    "ciSearch": "Search domains",
+    "ciListHint": "Separate with commas or spaces.",
+    "ciAdvanced": "Advanced: user-data and vendor-data",
+    "ciUserData": "user-data",
+    "ciUserDataHint": "Used as it is instead of the generated user-data (start with #cloud-config).",
+    "ciVendorData": "vendor-data",
+    "ciVendorDataHint": "Runs together with the generated user-data, for packages and runcmd.",
+    "ciUserDataWarning": "The user-data replaces the generated user-data; user, password and SSH keys are not used."
   },
   "console": {
     "connecting": "Connecting…",
@@ -2144,5 +2254,31 @@
       "poolHint": "Create a Ceph pool and register it as a storage pool. Add OSDs first.",
       "clientsHint": "Optionally install the Ceph client packages on nodes without Ceph daemons so that their VMs can use the pools."
     }
+  },
+  "downloads": {
+    "open": "Download from URL",
+    "title": "Download a disk image",
+    "isoTitle": "Download an ISO image",
+    "description": "A node that can use the pool downloads the file, so it must reach the URL (set HTTPS_PROXY on the nodes for a proxy). Give the SHA-256 checksum to check the file.",
+    "submit": "Download",
+    "url": "URL",
+    "sha256": "SHA-256 (optional)",
+    "sha256Hint": "64 hex digits from the publisher's checksum file.",
+    "errors": {
+      "url": "Enter an http or https URL.",
+      "sha256": "Use 64 hex digits."
+    }
+  },
+  "isos": {
+    "upload": "Upload ISO",
+    "note": "ISO images are kept in directory and NFS pools and can be in the CD-ROM drives of many VMs at once. An ISO in a node-local pool keeps its VMs on that node.",
+    "usedBy": "Used by",
+    "empty": "No ISO images.",
+    "progressFor": "Download of {{name}}",
+    "reason": {
+      "inUse": "Eject it from the VMs first."
+    },
+    "deleteTitle": "Delete ISO {{name}}?",
+    "deleteDescription": "The image file is deleted. Snapshots whose VM had it in a drive keep it from being deleted."
   }
 }

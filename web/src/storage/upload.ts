@@ -22,6 +22,8 @@ export interface UploadParams {
   pool: string;
   format: Schemas["ImageFormat"];
   sourceFormat: Schemas["SourceFormat"];
+  /** 내용 종류. `iso`면 ISO 이미지(raw)다. 디스크면 보내지 않는다(서버 기본). */
+  content?: Schemas["VolumeContent"];
 }
 
 /** 파일 이름으로 볼륨 이름을 제안한다: `Ubuntu 24.04.vmdk` → `ubuntu-24-04` */
@@ -58,6 +60,7 @@ export async function checkUpload(size: number, params: UploadParams, signal?: A
           format: params.format,
           source_format: params.sourceFormat,
           size,
+          ...(params.content === "iso" && { content: "iso" as const }),
         },
       },
       signal,
@@ -83,6 +86,9 @@ export function uploadImage(file: Blob, params: UploadParams, options: SendOptio
     format: params.format,
     source_format: params.sourceFormat,
   });
+  if (params.content === "iso") {
+    query.set("content", "iso");
+  }
   // Task가 아닌 본문(프록시 따위)은 실패로 본다.
   return sendFile("/volumes/import", query, file, 202, isTask, options);
 }

@@ -16,6 +16,7 @@ beforeEach(() =>
 it("shows account pages only to admins", async () => {
   renderPage(<AppLayout />);
   expect(await screen.findByRole("link", { name: "Volumes" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "ISO images" })).toHaveAttribute("href", "/isos");
   expect(screen.getByRole("link", { name: "Users" })).toHaveAttribute("href", "/users");
   expect(screen.getByRole("link", { name: "Audit log" })).toHaveAttribute("href", "/audit");
   expect(screen.getByRole("link", { name: "Realms" })).toHaveAttribute("href", "/realms");

@@ -72,6 +72,30 @@ export async function updateVm(
   return response?.headers.get(TASK_HEADER) ?? null;
 }
 
+/**
+ * CD-ROM 드라이브 `drive`의 매체만 바꾼다(`POST /vms/{key}/cdrom`, `iso`가 null이면 뺀다). 실행 중이면 서버가 매체를 바꾸는
+ * 핫플러그 Task를 만들어 그 id를, 아니면 null을 돌려준다.
+ */
+export async function changeCdrom(
+  vm: Vm,
+  drive: number,
+  iso: string | null,
+): Promise<string | null> {
+  let response: Response | undefined;
+  await call(
+    api
+      .POST("/vms/{key}/cdrom", {
+        params: { path: { key: vm.id } },
+        body: { drive, iso },
+      })
+      .then((result) => {
+        response = result.response;
+        return result;
+      }),
+  );
+  return response?.headers.get(TASK_HEADER) ?? null;
+}
+
 /** 핫플러그 Task를 읽어 알림으로 지켜본다. 읽지 못하면(이미 지워짐 등) 알리지 않는다. */
 export async function trackHotplug(id: string, label: string): Promise<void> {
   try {

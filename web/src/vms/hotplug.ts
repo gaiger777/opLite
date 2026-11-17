@@ -1,3 +1,5 @@
+import type { TFunction } from "i18next";
+
 import type { PendingChange, PendingReason, RunningHardware, Vm } from "@/api/types";
 import { isStopped } from "@/vms/actions";
 
@@ -118,4 +120,16 @@ export function failedChanges(vm: Vm): PendingChange[] {
 /** 보류 이유의 번역 키 */
 export function pendingReasonKey(reason: PendingReason): string {
   return `vms.pendingReason.${reason}`;
+}
+
+/**
+ * 보류 필드의 이름: `vms.pendingField.<필드>`(번역 키에는 `.`을 쓸 수 없어 `_`로 — `cpu.max_vcpus` → `cpu_max_vcpus`).
+ * CD-ROM 드라이브의 것(`cdroms[i]`, `cdroms[i].boot_order`)은 드라이브 번호를 넣어 번역한다. 모르는 필드는 그대로.
+ */
+export function pendingFieldLabel(field: string, t: TFunction): string {
+  const cdrom = /^cdroms\[(\d+)\](\.boot_order)?$/.exec(field);
+  if (cdrom) {
+    return t(cdrom[2] ? "vms.pendingField.cdromBoot" : "vms.pendingField.cdrom", { n: cdrom[1] });
+  }
+  return t(`vms.pendingField.${field.replaceAll(".", "_")}`, { defaultValue: field });
 }
