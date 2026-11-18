@@ -20,6 +20,8 @@ async-trait.workspace = true
 axum.workspace = true
 # OIDC: JWT·JWKS의 base64url
 base64.workspace = true
+# WebAuthn(패스키) CBOR(계획 62)
+ciborium.workspace = true
 clap.workspace = true
 fs4.workspace = true
 futures-util.workspace = true

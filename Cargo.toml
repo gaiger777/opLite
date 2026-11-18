@@ -70,6 +70,8 @@ ring = "0.17.14"
 base64 = "0.22.1"
 # TOTP 비밀의 base32(계획 62). 이미 트리에 있다.
 data-encoding = "2.11.1"
+# WebAuthn(패스키) attestationObject·COSE 키의 CBOR(계획 62). Apache-2.0, 버전을 못 박는다(직접 짠 최소 검증기가 기대는 모양).
+ciborium = { version = "=0.2.2", default-features = false, features = ["std"] }
 rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder-path"] }
 libc = "0.2.191"
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }

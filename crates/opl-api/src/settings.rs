@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{FAST_HA, HA_PLACEMENT, METRICS_HISTORY, PLACEMENT};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, METRICS_HISTORY, PLACEMENT, TWO_FACTOR};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
     Channel, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT,
@@ -89,6 +89,12 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub prometheus: Option<PrometheusPatch>,
+    /// 2단계 인증 정책(계획 62) 전체: 전역 역할(`roles`)·영역(`realms`, 로컬 사용자는 `local`)에 요구하고, 패스키의
+    /// RP ID(`rp_id`)를 정한다. `{}`는 정책을 지운다. OIDC 영역은 400(IdP가 MFA를 맡는다). 모든 노드가
+    /// `two-factor`를 알아야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub two_factor: Option<opl_types::two_factor::TwoFactorPolicy>,
 }
 
 /// Prometheus 끝점에서 바꿀 값
@@ -373,10 +379,16 @@ pub async fn patch_settings(
         && req.ha_start_concurrency.is_none()
         && req.placement.is_none()
         && req.prometheus.is_none()
+        && req.two_factor.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement or prometheus",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus or two_factor",
         ));
+    }
+    // 옛 노드는 2단계 인증 정책을 풀지 못하고 대기 세션을 모른다.
+    if let Some(policy) = &req.two_factor {
+        crate::cluster::require_feature(&state.cluster, TWO_FACTOR)?;
+        crate::two_factor::check_policy(&state.cluster, policy)?;
     }
     // 옛 노드는 Prometheus 필드를 풀지 못한다(계획 58·59처럼 검증보다 먼저 본다).
     if req.prometheus.is_some() {
@@ -494,6 +506,10 @@ pub async fn patch_settings(
         if let Some(enabled) = req.prometheus.and_then(|p| p.enabled) {
             spec.prometheus = enabled.then_some(PrometheusSettings { enabled });
         }
+        // 빈 정책은 쓰지 않는다.
+        if let Some(policy) = &req.two_factor {
+            spec.two_factor = (*policy != Default::default()).then(|| policy.clone());
+        }
         Ok(())
     })
     .await?;
@@ -501,6 +517,14 @@ pub async fn patch_settings(
         audit.detail(format!(
             "settings prometheus {}",
             if enabled { "on" } else { "off" }
+        ));
+    }
+    if let Some(policy) = &req.two_factor {
+        let roles: Vec<&str> = policy.roles.iter().map(|r| r.as_str()).collect();
+        audit.detail(format!(
+            "settings two-factor roles=[{}] realms=[{}]",
+            roles.join(","),
+            policy.realms.join(",")
         ));
     }
     let has_id = written

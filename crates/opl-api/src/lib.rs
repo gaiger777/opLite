@@ -67,6 +67,7 @@ mod state;
 mod subscription;
 mod tasks;
 mod telemetry;
+pub mod two_factor;
 mod updates;
 pub mod users;
 pub mod vip;
@@ -75,6 +76,7 @@ pub mod vm_imports;
 mod vms;
 mod volumes;
 mod watch;
+pub mod webauthn;
 
 use std::sync::Arc;
 
@@ -150,6 +152,15 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(users::login))
         .routes(routes!(users::logout))
         .routes(routes!(users::whoami))
+        .routes(routes!(two_factor::second_factor))
+        .routes(routes!(two_factor::get_two_factor))
+        .routes(routes!(two_factor::enroll_totp, two_factor::disable_totp))
+        .routes(routes!(two_factor::confirm_totp))
+        .routes(routes!(two_factor::regenerate_recovery))
+        .routes(routes!(two_factor::start_passkey))
+        .routes(routes!(two_factor::finish_passkey))
+        .routes(routes!(two_factor::delete_passkey))
+        .routes(routes!(two_factor::reset_two_factor))
         .routes(routes!(realms::list_login_realms))
         .routes(routes!(oidc_login::oidc_start))
         .routes(routes!(oidc_login::oidc_callback))

@@ -137,6 +137,144 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/auth/2fa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 자기 2단계 인증 상태. 강제 등록 중인 대기 세션도 읽는다. */
+        get: operations["get_two_factor"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/2fa/recovery": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 복구 코드 10개를 새로 만든다(남은 옛 코드는 모두 못 쓴다). 요소가 있어야 하고 본인 확인이 필요하다. */
+        post: operations["regenerate_recovery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/2fa/totp": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * TOTP 등록을 시작한다: 새 비밀과 `otpauth://` URI(QR)를 한 번 준다. 첫 코드로 확인(`/auth/2fa/totp/confirm`)해야
+         *     쓰인다. 확인 전에 다시 부르면 새 비밀로 바뀐다. 이미 켜져 있으면 409 `totp_enabled`(먼저 끈다).
+         */
+        post: operations["enroll_totp"];
+        /**
+         * TOTP를 끈다(등록 중인 것도 지운다). 본인 확인(`code` 또는 `password`)이 필요하다. 남은 요소가 없으면 복구 코드도
+         *     지우고, 정책이 요구하는 사용자의 마지막 요소면 409 `two_factor_required`.
+         */
+        delete: operations["disable_totp"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/2fa/totp/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 등록 중인 TOTP를 첫 코드로 확인해 켠다. 첫 요소면 복구 코드 10개를 만들어 한 번 준다. 강제 등록 중인 대기 세션은
+         *     이것으로 로그인이 끝난다. 틀리면 403 `invalid_second_factor`(시도 제한).
+         */
+        post: operations["confirm_totp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/2fa/webauthn/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 패스키 등록을 시작한다: `navigator.credentials.create({publicKey: options})`에 넘길 옵션과 끝낼 때 돌려보낼 토큰.
+         *     RP ID는 정책의 `rp_id` 또는 요청 호스트이고, IP 주소로 접속했으면 400 `webauthn_unavailable`(브라우저가 막는다).
+         */
+        post: operations["start_passkey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/2fa/webauthn/register/finish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 패스키 등록을 끝낸다(201). 첫 요소면 복구 코드 10개를 만들어 한 번 준다. 강제 등록 중인 대기 세션은 이것으로
+         *     로그인이 끝난다. 토큰이 틀렸거나 지났거나 응답이 맞지 않으면 400 `invalid_passkey`.
+         */
+        post: operations["finish_passkey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/2fa/webauthn/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 패스키를 지운다. 본인 확인(`code` 또는 `password`)이 필요하고, 정책이 요구하는 사용자의 마지막 요소면 409
+         *     `two_factor_required`.
+         */
+        delete: operations["delete_passkey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/auth/login": {
         parameters: {
             query?: never;
@@ -152,8 +290,32 @@ export interface paths {
          *     LDAP 영역 로그인은 디렉터리로 확인하고 외부 사용자 `<이름>@<영역>`을 만들거나 역할을 고친다.
          *     모르는 영역과 OIDC 영역(IdP에서 로그인한다)은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에
          *     닿지 못하면 503 `realm_unavailable`.
+         *     사용자에게 2단계 인증 요소가 있거나 정책이 요구하면(계획 62) 쿠키는 5분짜리 대기 세션이고 본문의
+         *     `second_factor`가 남은 단계를 알린다. 대기 세션으로는 둘째 단계·등록 경로만 쓴다(다른 경로는 401
+         *     `second_factor_required`).
          */
         post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/auth/login/second-factor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 비밀번호 로그인의 둘째 단계. `totp`·`recovery`·`webauthn` 가운데 하나를 낸다. 맞으면 같은 세션 쿠키가 정식 세션이
+         *     된다(200 사용자). 틀리면 401 `invalid_second_factor`이고 로그인과 같은 시도 제한을 받는다(429). 강제 등록 중인
+         *     세션은 403 `enrollment_required`(등록 경로를 쓴다).
+         */
+        post: operations["second_factor"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2038,6 +2200,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/users/{key}/two-factor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 관리자 초기화: 사용자의 2단계 인증 요소를 모두 지우고 세션을 끊는다(API 토큰은 남는다). 자기 자신은 409
+         *     `cannot_reset_self`(자기 요소는 `/auth/2fa`에서 뺀다).
+         */
+        delete: operations["reset_two_factor"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/version": {
         parameters: {
             query?: never;
@@ -3029,6 +3211,22 @@ export interface components {
          * @enum {string}
          */
         Arch: "x86_64" | "aarch64";
+        AssertionCredential: {
+            /** @description 자격 증명 id(base64url) */
+            id: string;
+            response: components["schemas"]["AssertionResponse"];
+        };
+        /** @description `AuthenticatorAssertionResponse`(base64url) */
+        AssertionResponse: {
+            authenticatorData: string;
+            clientDataJSON: string;
+            signature: string;
+        };
+        /** @description `AuthenticatorAttestationResponse`(base64url). 브라우저 `toJSON()`의 다른 칸은 무시한다. */
+        AttestationResponse: {
+            attestationObject: string;
+            clientDataJSON: string;
+        };
         /**
          * @description 요청을 인증한 방식
          * @enum {string}
@@ -3089,6 +3287,10 @@ export interface components {
             key: string;
             /** @description 예: `vms` */
             kind: string;
+        };
+        AuthenticatorSelection: {
+            residentKey: string;
+            userVerification: string;
         };
         /** @description 백업에 담은 디스크 하나. VM 스펙의 디스크 순서를 따른다. */
         BackupDisk: {
@@ -3836,6 +4038,9 @@ export interface components {
              */
             node: string;
         };
+        CodeRequest: {
+            code: string;
+        };
         /**
          * @description 리더 노드에서 `/bin/sh -c`로 돌리는 명령. 환경 변수 `ORBIVISOR_NODE_NAME`·`ORBIVISOR_NODE_ID`·
          *     `ORBIVISOR_NODE_ADDRESS`(노드 API 주소의 호스트)가 끌 노드를 알린다.
@@ -4255,6 +4460,32 @@ export interface components {
             secret: string;
             token: components["schemas"]["TokenView"];
         };
+        /** @description `PublicKeyCredentialCreationOptions`(이진 값은 base64url) */
+        CreationOptions: {
+            attestation: string;
+            authenticatorSelection: components["schemas"]["AuthenticatorSelection"];
+            challenge: string;
+            excludeCredentials: components["schemas"]["CredentialDescriptor"][];
+            pubKeyCredParams: components["schemas"]["CredentialParameter"][];
+            rp: components["schemas"]["RelyingParty"];
+            /** Format: int64 */
+            timeout: number;
+            user: components["schemas"]["WebauthnUser"];
+        };
+        /** @description 패스키 자격 증명 설명자 */
+        CredentialDescriptor: {
+            /** @description 자격 증명 id(base64url) */
+            id: string;
+            type: string;
+        };
+        CredentialParameter: {
+            /**
+             * Format: int64
+             * @description COSE 알고리즘(-7 ES256, -8 EdDSA, -257 RS256)
+             */
+            alg: number;
+            type: string;
+        };
         /** @enum {string} */
         Direction: "in" | "out";
         /** @enum {string} */
@@ -4445,6 +4676,13 @@ export interface components {
          * @enum {string}
          */
         Fencing: "watchdog" | "process";
+        FinishRegistrationRequest: {
+            credential: components["schemas"]["RegistrationCredential"];
+            /** @description 패스키 이름(1~64자) */
+            name: string;
+            /** @description 등록 시작이 준 토큰 */
+            token: string;
+        };
         /** @enum {string} */
         Firmware: "bios" | "uefi";
         /** @description 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다. */
@@ -6328,6 +6566,8 @@ export interface components {
                 /** Format: int64 */
                 revision: number;
                 role: components["schemas"]["Role"];
+                /** @description 2단계 인증 요소(확인된 TOTP 또는 패스키)가 있다(계획 62) */
+                two_factor?: boolean;
             }[];
             /** Format: int64 */
             revision: number;
@@ -6338,6 +6578,11 @@ export interface components {
             realm?: string;
             /** @description 영역 로그인이면 영역 안의 이름이다(`alice`로 로그인하면 사용자 `alice@<영역>`). */
             username: string;
+        };
+        /** @description 로그인 응답: 사용자와, 둘째 단계가 남았으면 그 안내(쿠키는 대기 세션이다) */
+        LoginResponse: components["schemas"]["UserView"] & {
+            /** @description 둘째 단계가 남았다(`POST /auth/login/second-factor`, 강제 등록이면 `/auth/2fa/…`). 없으면 로그인이 끝났다. */
+            second_factor?: components["schemas"]["SecondFactorPrompt"];
         };
         /** @description `52:54:00:12:34:56` 형식의 MAC 주소. */
         MacAddr: string;
@@ -6963,6 +7208,18 @@ export interface components {
             current?: string | null;
             name: string;
         };
+        PasskeyAdded: {
+            passkey: components["schemas"]["PasskeyView"];
+            /** @description 첫 요소라 새로 만든 복구 코드(한 번만 보인다). 아니면 비어 있다. */
+            recovery_codes: string[];
+        };
+        PasskeyView: {
+            /** Format: int64 */
+            created_at: number;
+            id: string;
+            name: string;
+            rp_id: string;
+        };
         /** @description 백분위(최근순위) */
         Pct: {
             /** @description 5초 원본이 아니라 층의 AVG 값으로 셈한 근사(짧은 봉우리를 낮게 본다) */
@@ -7296,6 +7553,11 @@ export interface components {
             /** @description 끄면 끝점이 404다. */
             enabled?: boolean;
         };
+        /** @description 요소를 빼거나 복구 코드를 다시 만들 때의 본인 확인: TOTP 코드나 복구 코드(`code`), 또는 로컬 사용자의 비밀번호 */
+        ProofRequest: {
+            code?: string;
+            password?: string;
+        };
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         /** @description 할당량 있는 폴더 하나의 상한과 하위 트리 사용량 */
@@ -7414,6 +7676,10 @@ export interface components {
             id: string;
             name: string;
         };
+        /** @description 새 복구 코드(한 번만 보인다). 이미 남은 코드가 있어 새로 만들지 않았으면 비어 있다. */
+        RecoveryCodes: {
+            codes: string[];
+        };
         /** @description Redfish BMC. Basic 인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`로 확인한다. */
         RedfishFence: {
             /** @description BMC 인증서를 확인할 CA(PEM). 없으면 시스템 루트 */
@@ -7437,6 +7703,20 @@ export interface components {
             system_id?: string;
             url: string;
             user: string;
+        };
+        RegistrationCredential: {
+            /** @description 자격 증명 id(base64url) */
+            id: string;
+            response: components["schemas"]["AttestationResponse"];
+        };
+        /** @description 패스키 등록 시작: 브라우저에 넘길 옵션과, 끝낼 때 돌려보낼 서명한 토큰(5분) */
+        RegistrationStart: {
+            options: components["schemas"]["CreationOptions"];
+            token: string;
+        };
+        RelyingParty: {
+            id: string;
+            name: string;
         };
         RemoteNodeCounts: {
             /** Format: int64 */
@@ -7643,6 +7923,15 @@ export interface components {
              * @default *\/15
              */
             schedule: string;
+        };
+        /** @description `PublicKeyCredentialRequestOptions`(이진 값은 base64url) */
+        RequestOptions: {
+            allowCredentials: components["schemas"]["CredentialDescriptor"][];
+            challenge: string;
+            rpId: string;
+            /** Format: int64 */
+            timeout: number;
+            userVerification: string;
         };
         ResizeRequest: {
             /**
@@ -8800,6 +9089,34 @@ export interface components {
         };
         /** @enum {string} */
         ScheduleEvery: "hourly" | "daily" | "weekly";
+        /**
+         * @description 둘째 단계 방법
+         * @enum {string}
+         */
+        SecondFactorMethod: "totp" | "recovery" | "webauthn";
+        /** @description 로그인 응답의 둘째 단계 안내. 쿠키는 대기 세션이고 [`PENDING_LOGIN_SECS`] 안에 끝내야 한다. */
+        SecondFactorPrompt: {
+            /** @description 정책이 요구하는데 요소가 없다: `/auth/2fa/totp`·`/auth/2fa/webauthn/register`로 등록하면 로그인이 끝난다. */
+            enroll: boolean;
+            /**
+             * Format: int64
+             * @description 대기 세션이 끝나는 시각(유닉스 초)
+             */
+            expires_at: number;
+            /** @description 쓸 수 있는 방법. `enroll`이면 비어 있다. */
+            methods: components["schemas"]["SecondFactorMethod"][];
+            /** @description 패스키 로그인 옵션(`navigator.credentials.get({publicKey})`). 패스키가 없거나 이 접속(IP 주소)에서 쓸 수 없으면 없다. */
+            webauthn?: components["schemas"]["RequestOptions"];
+        };
+        /** @description 둘째 단계: 셋 가운데 하나만 */
+        SecondFactorRequest: {
+            /** @description 복구 코드(`xxxx-xxxx-xxxx-xxxx`). 한 번 쓰면 없어진다. */
+            recovery?: string;
+            /** @description 인증 앱의 6자리 코드 */
+            totp?: string;
+            /** @description 패스키 응답(`navigator.credentials.get`) */
+            webauthn?: components["schemas"]["AssertionCredential"];
+        };
         /** @description 보안 그룹에서 바꿀 값. 주어진 필드만 바꾼다. */
         SecurityGroupPatch: {
             /** @description 빈 글이면 설명을 지운다. */
@@ -8838,6 +9155,12 @@ export interface components {
              */
             shutdown_policy?: components["schemas"]["ShutdownPolicy"];
             telemetry?: components["schemas"]["TelemetryPatch"];
+            /**
+             * @description 2단계 인증 정책(계획 62) 전체: 전역 역할(`roles`)·영역(`realms`, 로컬 사용자는 `local`)에 요구하고, 패스키의
+             *     RP ID(`rp_id`)를 정한다. `{}`는 정책을 지운다. OIDC 영역은 400(IdP가 MFA를 맡는다). 모든 노드가
+             *     `two-factor`를 알아야 한다.
+             */
+            two_factor?: components["schemas"]["TwoFactorPolicy"];
             updates?: components["schemas"]["UpdateSettingsPatch"];
             /**
              * Format: int32
@@ -9526,6 +9849,11 @@ export interface components {
             /** Format: uuid */
             vm: string;
         };
+        /** @description TOTP 등록: 인증 앱에 넣을 비밀과 `otpauth://` URI(QR). 다시 볼 수 없다. */
+        TotpEnrollment: {
+            secret: string;
+            uri: string;
+        };
         /** @description 2단계 인증 정책(`SettingsSpec.two_factor`) */
         TwoFactorPolicy: {
             /** @description 이 영역의 사용자에게 요구한다. 로컬 사용자는 `local`이다. OIDC 영역은 받지 않는다(IdP가 MFA를 맡는다). */
@@ -9534,6 +9862,24 @@ export interface components {
             roles?: components["schemas"]["Role"][];
             /** @description 패스키의 RP ID(도메인). 없으면 요청 호스트다. */
             rp_id?: string;
+        };
+        /** @description 자기 2단계 인증 상태(비밀은 없다) */
+        TwoFactorView: {
+            /** @description 모든 노드가 2단계 인증을 안다(아니면 등록을 받지 않는다) */
+            available: boolean;
+            /** @description 이 세션은 강제 등록 중이다(등록을 마치면 로그인이 끝난다) */
+            enrolling: boolean;
+            passkeys: components["schemas"]["PasskeyView"][];
+            /** @description 남은 복구 코드 수 */
+            recovery_codes: number;
+            /** @description 정책이 이 사용자에게 2단계 인증을 요구한다 */
+            required: boolean;
+            /** @description 이 접속에서 패스키에 쓸 RP ID. 없으면(IP 주소로 접속) 브라우저가 패스키를 막는다. */
+            rp_id?: string;
+            /** @description 확인된 TOTP가 있다 */
+            totp: boolean;
+            /** @description 확인을 기다리는 TOTP가 있다 */
+            totp_pending: boolean;
         };
         UpdateAccessRoleRequest: {
             description?: string;
@@ -9803,6 +10149,8 @@ export interface components {
             /** Format: int64 */
             revision: number;
             role: components["schemas"]["Role"];
+            /** @description 2단계 인증 요소(확인된 TOTP 또는 패스키)가 있다(계획 62) */
+            two_factor?: boolean;
         };
         VersionInfo: {
             /** @description 이 노드의 orbivisord 빌드 버전 */
@@ -10193,6 +10541,12 @@ export interface components {
              * @description VXLAN 네트워크 식별자(1~16777215). 클러스터 안에서 겹치지 않는다.
              */
             vni: number;
+        };
+        WebauthnUser: {
+            displayName: string;
+            /** @description 사용자 id 바이트(base64url) */
+            id: string;
+            name: string;
         };
         /**
          * @description webhook 본문 형식
@@ -10653,6 +11007,243 @@ export interface operations {
             };
         };
     };
+    get_two_factor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TwoFactorView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    regenerate_recovery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProofRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCodes"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    enroll_totp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TotpEnrollment"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    disable_totp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProofRequest"];
+            };
+        };
+        responses: {
+            /** @description Disabled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    confirm_totp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CodeRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryCodes"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    start_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegistrationStart"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    finish_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FinishRegistrationRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PasskeyAdded"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description passkey credential id (base64url) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProofRequest"];
+            };
+        };
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     login: {
         parameters: {
             query?: never;
@@ -10663,6 +11254,37 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["LoginRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    second_factor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SecondFactorRequest"];
             };
         };
         responses: {
@@ -15173,6 +15795,35 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reset_two_factor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Reset */
             204: {
                 headers: {
                     [name: string]: unknown;

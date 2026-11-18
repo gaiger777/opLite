@@ -2819,6 +2819,99 @@ async fn a_session_made_on_one_node_works_on_the_other() {
     }
 }
 
+/// 로그인해 (상태, 본문, 쿠키)
+async fn login_cookie(base: &str) -> (serde_json::Value, String) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&serde_json::json!({ "username": "admin", "password": ADMIN_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let cookie = resp.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    (resp.json().await.unwrap(), cookie)
+}
+
+/// `base`에 쿠키 `cookie`로 JSON을 POST한 (상태, 본문)
+async fn post_cookie(
+    base: &str,
+    cookie: &str,
+    path: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/api/v1{path}"))
+        .header("cookie", cookie)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, resp.json().await.unwrap_or_default())
+}
+
+/// 계획 62: 두 노드에 같은 TOTP 코드를 동시에 내도 하나만 통과한다(`last_totp_step`의 revision CAS).
+#[tokio::test]
+async fn the_same_totp_code_on_two_nodes_passes_once() {
+    use opl_types::two_factor::{decode_secret, totp, totp_step};
+    let (_root, a, b) = two_nodes().await;
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let (_, cookie) = login_cookie(&a.base).await;
+    let (status, enrol) =
+        post_cookie(&a.base, &cookie, "/auth/2fa/totp", serde_json::json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{enrol}");
+    let secret = decode_secret(enrol["secret"].as_str().unwrap()).unwrap();
+    let code = |offset: u64| format!("{:06}", totp(&secret, totp_step(now()) + offset, 6));
+    let (status, body) = post_cookie(
+        &a.base,
+        &cookie,
+        "/auth/2fa/totp/confirm",
+        serde_json::json!({ "code": code(0) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // B에도 적용되면 B의 로그인도 둘째 단계를 묻는다.
+    let deadline = Instant::now() + WAIT;
+    let cookie_b = loop {
+        let (body, cookie) = login_cookie(&b.base).await;
+        if body.get("second_factor").is_some() {
+            break cookie;
+        }
+        assert!(Instant::now() < deadline, "two-factor not applied on B");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let (body, cookie_a) = login_cookie(&a.base).await;
+    assert!(body.get("second_factor").is_some(), "{body}");
+    let same = serde_json::json!({ "totp": code(1) });
+    let (on_a, on_b) = tokio::join!(
+        post_cookie(
+            &a.base,
+            &cookie_a,
+            "/auth/login/second-factor",
+            same.clone()
+        ),
+        post_cookie(&b.base, &cookie_b, "/auth/login/second-factor", same),
+    );
+    let mut statuses = [on_a.0, on_b.0];
+    statuses.sort();
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::UNAUTHORIZED],
+        "{on_a:?} {on_b:?}"
+    );
+}
+
 /// 정족수가 없으면 로그인 세션을 그 노드 메모리에 둔다. 장애 때도 관리자가 들어와 상태를 읽는다.
 #[tokio::test]
 async fn login_works_without_quorum_on_the_node_left() {

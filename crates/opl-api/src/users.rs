@@ -15,6 +15,7 @@ use opl_types::authz::TokenScope;
 use opl_types::node::FOLDERS;
 use opl_types::realm::{LOCAL_REALM, RealmBackend, RealmSpec};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
+use opl_types::two_factor::TwoFactorSpec;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -43,6 +44,14 @@ pub struct UserView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, default)]
     pub realm: Option<String>,
+    /// 2단계 인증 요소(확인된 TOTP 또는 패스키)가 있다(계획 62)
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[schema(default)]
+    pub two_factor: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl From<User> for UserView {
@@ -53,8 +62,31 @@ impl From<User> for UserView {
             revision: u.revision,
             role: u.spec.role,
             realm: u.spec.realm,
+            two_factor: false,
         }
     }
+}
+
+/// 사용자 보기(2단계 인증 여부를 채운다)
+pub(crate) fn view(cluster: &opl_cluster::Cluster, user: User) -> Result<UserView, ApiError> {
+    let on = cluster
+        .get_by_name::<TwoFactorSpec>(&user.id.to_string())?
+        .is_some_and(|t| t.spec.has_factor());
+    Ok(UserView {
+        two_factor: on,
+        ..user.into()
+    })
+}
+
+/// 로그인 응답: 사용자와, 둘째 단계가 남았으면 그 안내(쿠키는 대기 세션이다)
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LoginResponse {
+    #[serde(flatten)]
+    pub user: UserView,
+    /// 둘째 단계가 남았다(`POST /auth/login/second-factor`, 강제 등록이면 `/auth/2fa/…`). 없으면 로그인이 끝났다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub second_factor: Option<crate::two_factor::SecondFactorPrompt>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -107,13 +139,17 @@ pub struct LoginRequest {
 /// LDAP 영역 로그인은 디렉터리로 확인하고 외부 사용자 `<이름>@<영역>`을 만들거나 역할을 고친다.
 /// 모르는 영역과 OIDC 영역(IdP에서 로그인한다)은 400, 맞는 역할이 없으면 403 `no_role`, 디렉터리에
 /// 닿지 못하면 503 `realm_unavailable`.
+/// 사용자에게 2단계 인증 요소가 있거나 정책이 요구하면(계획 62) 쿠키는 5분짜리 대기 세션이고 본문의
+/// `second_factor`가 남은 단계를 알린다. 대기 세션으로는 둘째 단계·등록 경로만 쓴다(다른 경로는 401
+/// `second_factor_required`).
 #[utoipa::path(post, path = "/auth/login", tag = "auth", security(()),
     request_body = LoginRequest,
-    responses((status = 200, body = UserView), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 200, body = LoginResponse), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn login(
     State(state): State<Arc<AppState>>,
     ClientIp(ip): ClientIp,
     FromWebOrigin(web_origin): FromWebOrigin,
+    host: crate::two_factor::RequestHost,
     audit: AuditNote,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
@@ -130,8 +166,18 @@ pub async fn login(
         },
         AuditAuth::Session,
     );
-    let cookie = new_session(&state, &user, web_origin).await?;
-    let mut response = Json(UserView::from(user)).into_response();
+    let prompt = crate::two_factor::login_prompt(&state, &user, &host)?;
+    let (pending, second_factor) = match prompt {
+        Some((pending, prompt)) => (Some(pending), Some(prompt)),
+        None => (None, None),
+    };
+    let session = state.create_session(&user, pending).await?;
+    let cookie = session_set_cookie(&state, &session, SESSION_TTL.as_secs(), web_origin)?;
+    let mut response = Json(LoginResponse {
+        user: view(&state.cluster, user)?,
+        second_factor,
+    })
+    .into_response();
     response.headers_mut().insert(SET_COOKIE, cookie);
     Ok(response)
 }
@@ -143,7 +189,7 @@ pub(crate) async fn new_session(
     user: &User,
     web_origin: bool,
 ) -> Result<HeaderValue, ApiError> {
-    let session = state.create_session(user).await?;
+    let session = state.create_session(user, None).await?;
     session_set_cookie(state, &session, SESSION_TTL.as_secs(), web_origin)
 }
 
@@ -426,9 +472,16 @@ pub async fn list_users(
 ) -> Result<Json<List<UserView>>, ApiError> {
     state.authorize(&principal, Action::Read, UserSpec::KIND)?;
     let (revision, users) = state.cluster.list::<UserSpec>()?;
+    let two_factor = crate::two_factor::enabled_users(&state.cluster)?;
     Ok(Json(List {
         revision,
-        items: users.into_iter().map(UserView::from).collect(),
+        items: users
+            .into_iter()
+            .map(|u| UserView {
+                two_factor: two_factor.contains(&u.id),
+                ..u.into()
+            })
+            .collect(),
     }))
 }
 
@@ -560,9 +613,10 @@ pub async fn update_user(
     if password_changed && let Err(e) = state.end_user_sessions(user.id).await {
         tracing::warn!(user = %user.name, error = %e.message, "old sessions not deleted");
     }
-    Ok(Json(
-        lookup::<UserSpec>(&state.cluster, &user.id.to_string())?.into(),
-    ))
+    Ok(Json(view(
+        &state.cluster,
+        lookup::<UserSpec>(&state.cluster, &user.id.to_string())?,
+    )?))
 }
 
 /// 사용자와 그 사용자의 토큰을 지운다. 자기 자신은 지울 수 없다(마지막 관리자를 잃지 않게).
@@ -587,6 +641,16 @@ pub async fn delete_user(
     let (_, tokens) = state.cluster.list::<ApiTokenSpec>()?;
     for token in tokens.into_iter().filter(|t| t.spec.user == user.id) {
         state.cluster.delete::<ApiTokenSpec>(token.id, None).await?;
+    }
+    // 2단계 인증 요소(계획 62). 같은 이름으로 다시 만든 사용자는 id가 달라 이어받지 않는다.
+    if let Some(tf) = state
+        .cluster
+        .get_by_name::<TwoFactorSpec>(&user.id.to_string())?
+    {
+        match state.cluster.delete::<TwoFactorSpec>(tf.id, None).await {
+            Ok(_) | Err(ClusterError::Rejected(Rejection::NotFound { .. })) => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     // 세션도 주인을 다시 읽으므로 이미 쓸 수 없다. 지우지 못한 것은 리더의 정리 작업이 지운다.
     if let Err(e) = state.end_user_sessions(user.id).await {

@@ -72,6 +72,19 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/auth/oidc/{realm}/start", Public),
     ("GET", "/auth/realms", Public),
     ("GET", "/auth/whoami", Handler),
+    // 2단계 인증(계획 62). 대기 세션이 쓰는 경로는 미들웨어가 인증하지 않고(`Public`) 핸들러의 추출기가 본다:
+    // 둘째 단계는 대기 세션만(`PendingPrincipal`), 상태·등록은 정식 세션·토큰 또는 강제 등록 중인 대기 세션(`Enroller`).
+    ("POST", "/auth/login/second-factor", Public),
+    ("GET", "/auth/2fa", Public),
+    ("POST", "/auth/2fa/totp", Public),
+    ("POST", "/auth/2fa/totp/confirm", Public),
+    ("POST", "/auth/2fa/webauthn/register", Public),
+    ("POST", "/auth/2fa/webauthn/register/finish", Public),
+    // 요소 빼기·복구 코드 다시 만들기는 정식 세션·토큰과 본인 확인(핸들러)
+    ("DELETE", "/auth/2fa/totp", Handler),
+    ("POST", "/auth/2fa/recovery", Handler),
+    ("DELETE", "/auth/2fa/webauthn/{id}", Handler),
+    ("DELETE", "/users/{key}/two-factor", Root(ClusterAdmin)),
     ("GET", "/users", Root(ClusterAdmin)),
     ("POST", "/users", Root(ClusterAdmin)),
     // 자기 비밀번호는 누구나 바꾼다(핸들러가 본다).

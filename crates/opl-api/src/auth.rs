@@ -17,6 +17,7 @@ use opl_cluster::types::Rejection;
 use opl_types::auth::{ApiTokenSpec, Role, Session, SessionSpec, SessionStatus, User, UserSpec};
 use opl_types::realm::RealmSpec;
 use opl_types::resource::Kind;
+use opl_types::two_factor::{PENDING_LOGIN_SECS, PendingLogin};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -179,27 +180,82 @@ pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
 /// 만들 때 사용자의 세션 세대를 함께 둔다(다른 노드에서 비밀번호가 바뀌면 끊으려고).
 #[derive(Default)]
 pub struct Sessions {
-    inner: Mutex<HashMap<String, (Uuid, u64, Instant)>>,
+    inner: Mutex<HashMap<String, MemorySession>>,
     /// 이 노드가 마지막 사용 시각을 적으러 보낸 Raft 세션과 보낸 때
     touched: Mutex<HashMap<Uuid, Instant>>,
 }
 
+struct MemorySession {
+    user: Uuid,
+    epoch: u64,
+    expires: Instant,
+    /// 둘째 단계를 기다리는 로그인(계획 62)
+    pending: Option<PendingLogin>,
+}
+
 impl Sessions {
     pub fn create(&self, user: Uuid, epoch: u64) -> String {
+        self.insert(user, epoch, SESSION_TTL, None)
+    }
+
+    /// 둘째 단계를 기다리는 세션. [`PENDING_LOGIN_SECS`] 뒤에 끝난다.
+    pub fn create_pending(&self, user: Uuid, epoch: u64, pending: PendingLogin) -> String {
+        self.insert(
+            user,
+            epoch,
+            Duration::from_secs(PENDING_LOGIN_SECS),
+            Some(pending),
+        )
+    }
+
+    fn insert(
+        &self,
+        user: Uuid,
+        epoch: u64,
+        ttl: Duration,
+        pending: Option<PendingLogin>,
+    ) -> String {
         let id = random_hex(32);
         let now = Instant::now();
         let mut map = self.inner.lock().unwrap();
-        map.retain(|_, (_, _, expires)| *expires > now);
-        map.insert(id.clone(), (user, epoch, now + SESSION_TTL));
+        map.retain(|_, s| s.expires > now);
+        map.insert(
+            id.clone(),
+            MemorySession {
+                user,
+                epoch,
+                expires: now + ttl,
+                pending,
+            },
+        );
         id
     }
 
     /// (사용자, 만들 때의 세션 세대)
     pub fn get(&self, id: &str) -> Option<(Uuid, u64)> {
+        self.find(id).map(|(user, epoch, _)| (user, epoch))
+    }
+
+    fn find(&self, id: &str) -> Option<(Uuid, u64, Option<PendingLogin>)> {
         let map = self.inner.lock().unwrap();
         map.get(id)
-            .filter(|(_, _, expires)| *expires > Instant::now())
-            .map(|(user, epoch, _)| (*user, *epoch))
+            .filter(|s| s.expires > Instant::now())
+            .map(|s| (s.user, s.epoch, s.pending.clone()))
+    }
+
+    /// 대기 세션의 둘째 단계가 끝났다: 정식 세션이 되고 수명이 처음부터 다시 [`SESSION_TTL`]이다.
+    /// 그사이 끝났으면 거짓이다.
+    pub fn complete(&self, id: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(id).filter(|s| s.expires > now) {
+            Some(s) => {
+                s.pending = None;
+                s.expires = now + SESSION_TTL;
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn remove(&self, id: &str) {
@@ -208,7 +264,7 @@ impl Sessions {
 
     /// 사용자의 세션을 모두 끝낸다(비밀번호를 바꿨을 때).
     pub fn remove_user(&self, user: Uuid) {
-        self.inner.lock().unwrap().retain(|_, (u, _, _)| *u != user);
+        self.inner.lock().unwrap().retain(|_, s| s.user != user);
     }
 
     /// Raft 세션 `id`의 마지막 사용 시각을 지금 적을 차례면 참이고 보낸 것으로 적는다. 이 노드에서
@@ -231,6 +287,17 @@ struct FoundSession {
     epoch: u64,
     /// Raft 세션이면 그 리소스(메모리 세션은 None)
     shared: Option<Session>,
+    /// 둘째 단계를 기다리는 로그인이면 그 내용(계획 62)
+    pending: Option<PendingLogin>,
+}
+
+/// 401 `second_factor_required`: 비밀번호는 맞았고 둘째 단계(`POST /auth/login/second-factor`)가 남았다.
+pub(crate) fn second_factor_required() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::UNAUTHORIZED,
+        "second_factor_required",
+        "finish signing in with the second factor",
+    )
 }
 
 pub(crate) fn unix_now() -> u64 {
@@ -289,13 +356,24 @@ impl AppState {
     /// 사용자의 세션을 만들고 쿠키 값을 돌려준다. 모든 노드가 [`SHARED_SESSIONS`]를 알면 Raft에 두고
     /// (쿠키 값은 해시만), 아니면 이 노드 메모리에 둔다.
     /// 정족수가 없거나 쓰기가 리더에 닿지 못하면 이 노드 메모리에 둔다(장애 때도 관리자가 들어와 상태를 본다).
-    pub(crate) async fn create_session(&self, user: &User) -> Result<String, ApiError> {
+    /// `pending`이 있으면 둘째 단계를 기다리는 세션이다(그 수명까지만 살고 `Principal`로는 쓰지 못한다).
+    pub(crate) async fn create_session(
+        &self,
+        user: &User,
+        pending: Option<PendingLogin>,
+    ) -> Result<String, ApiError> {
+        let memory = || match &pending {
+            Some(p) => self
+                .sessions
+                .create_pending(user.id, user.spec.session_epoch, p.clone()),
+            None => self.sessions.create(user.id, user.spec.session_epoch),
+        };
         if !crate::cluster::missing_feature(&self.cluster, SHARED_SESSIONS)?.is_empty() {
-            return Ok(self.sessions.create(user.id, user.spec.session_epoch));
+            return Ok(memory());
         }
         if !self.cluster.health().quorum {
             tracing::warn!(user = %user.name, "the cluster has no quorum; the session works only on this node");
-            return Ok(self.sessions.create(user.id, user.spec.session_epoch));
+            return Ok(memory());
         }
         let cookie = random_hex(32);
         let now = unix_now();
@@ -305,8 +383,11 @@ impl AppState {
             SessionSpec {
                 user: user.id,
                 epoch: user.spec.session_epoch,
-                expires_at: now + SESSION_TTL.as_secs(),
-                pending: None,
+                // 대기 세션은 둘째 단계를 마치면 늘린다. 버려진 것은 정리 작업이 곧 지운다.
+                expires_at: pending
+                    .as_ref()
+                    .map_or(now + SESSION_TTL.as_secs(), |p| p.expires_at),
+                pending: pending.clone(),
             },
         );
         session.status.last_used = now;
@@ -320,7 +401,7 @@ impl AppState {
             ) => {
                 // 쓰기가 나중에 커밋돼도 그 세션의 쿠키는 아무도 모르고, 정리 작업이 만료 뒤 지운다.
                 tracing::warn!(user = %user.name, error = %e, "cannot write the session to the cluster; it works only on this node");
-                Ok(self.sessions.create(user.id, user.spec.session_epoch))
+                Ok(memory())
             }
             Err(e) => Err(e.into()),
         }
@@ -329,7 +410,7 @@ impl AppState {
     /// 쿠키의 세션. 메모리에 없으면 Raft에서 찾는다. 끝난 세션은 없는 것과 같다. 메모리 세션도 같은
     /// 이름의 끝난 Raft 세션(다른 노드의 로그아웃 표시)이 있으면 끝난 것이다.
     fn find_session(&self, cookie: &str) -> Result<Option<FoundSession>, ApiError> {
-        if let Some((user, epoch)) = self.sessions.get(cookie) {
+        if let Some((user, epoch, pending)) = self.sessions.find(cookie) {
             if self
                 .cluster
                 .get_by_name::<SessionSpec>(&sha256_hex(cookie))?
@@ -342,15 +423,19 @@ impl AppState {
                 user,
                 epoch,
                 shared: None,
+                pending,
             }));
         }
+        let now = unix_now();
         Ok(self
             .cluster
             .get_by_name::<SessionSpec>(&sha256_hex(cookie))?
-            .filter(|s| s.spec.expires_at > unix_now())
+            .filter(|s| s.spec.expires_at > now)
+            .filter(|s| s.spec.pending.as_ref().is_none_or(|p| p.expires_at > now))
             .map(|s| FoundSession {
                 user: s.spec.user,
                 epoch: s.spec.epoch,
+                pending: s.spec.pending.clone(),
                 shared: Some(s),
             }))
     }
@@ -516,6 +601,19 @@ impl AppState {
             principal.token = Some(stored.id);
             return Ok(principal);
         }
+        let (user, found) = self.session_login(parts)?;
+        // 둘째 단계가 남은 세션은 그 경로(`PendingPrincipal`)에서만 쓴다.
+        if found.pending.is_some() {
+            return Err(second_factor_required());
+        }
+        if let Some(shared) = &found.shared {
+            self.touch_session(shared);
+        }
+        Ok(principal_of(user))
+    }
+
+    /// 쿠키 세션과 그 사용자. 대기 세션도 돌려준다(부르는 쪽이 `pending`을 본다).
+    fn session_login(&self, parts: &Parts) -> Result<(User, FoundSession), ApiError> {
         let session = session_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         let found = self
             .find_session(session)?
@@ -534,10 +632,44 @@ impl AppState {
         if !self.realm_exists(&user)? {
             return Err(ApiError::unauthorized());
         }
-        if let Some(shared) = &found.shared {
-            self.touch_session(shared);
+        Ok((user, found))
+    }
+
+    /// 대기 세션의 둘째 단계가 끝났다: `pending`을 지우고 수명을 [`SESSION_TTL`]로 늘린다(Raft 세션은 revision
+    /// CAS). 그사이 다른 요청이 먼저 끝냈으면 그대로 성공이고, 세션이 없어졌으면 401이다.
+    pub(crate) async fn complete_login(&self, login: &PendingPrincipal) -> Result<(), ApiError> {
+        let Some(shared) = &login.shared else {
+            return if self.sessions.complete(&login.cookie) {
+                Ok(())
+            } else {
+                Err(ApiError::unauthorized())
+            };
+        };
+        let mut spec = shared.spec.clone();
+        spec.pending = None;
+        spec.expires_at = unix_now() + SESSION_TTL.as_secs();
+        match self
+            .cluster
+            .update_spec(
+                shared.id,
+                Some(shared.revision),
+                shared.labels.clone(),
+                &spec,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {
+                match self.cluster.get::<SessionSpec>(shared.id)? {
+                    Some(s) if s.spec.pending.is_none() && s.spec.expires_at > unix_now() => Ok(()),
+                    _ => Err(ApiError::unauthorized()),
+                }
+            }
+            Err(ClusterError::Rejected(Rejection::NotFound { .. })) => {
+                Err(ApiError::unauthorized())
+            }
+            Err(e) => Err(e.into()),
         }
-        Ok(principal_of(user))
     }
 
     /// 쿠키는 브라우저가 알아서 붙이므로, 다른 출처의 페이지가 보낸 쿠키 요청(WebSocket 포함)은 받지 않는다
@@ -640,6 +772,53 @@ impl FromRequestParts<Arc<AppState>> for Principal {
         crate::revision::authenticated(parts);
         waited?;
         Ok(principal)
+    }
+}
+
+/// 둘째 단계를 기다리는 세션(계획 62 설계 §10.2). 쿠키 세션만이고(토큰은 2FA를 거치지 않는다) 대기 중이어야 한다.
+/// 둘째 단계·강제 등록 경로만 받는다.
+pub struct PendingPrincipal {
+    pub user: User,
+    /// 쿠키 값(메모리 세션을 찾는다). 로그에 쓰지 않는다.
+    cookie: String,
+    /// Raft 세션이면 그 리소스
+    shared: Option<Session>,
+    pub pending: PendingLogin,
+}
+
+impl PendingPrincipal {
+    pub fn principal(&self) -> Principal {
+        principal_of(self.user.clone())
+    }
+}
+
+impl FromRequestParts<Arc<AppState>> for PendingPrincipal {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        if parts.headers.contains_key(AUTHORIZATION) {
+            return Err(ApiError::unauthorized());
+        }
+        let (user, found) = state.session_login(parts)?;
+        let Some(pending) = found.pending else {
+            return Err(ApiError::conflict(
+                "already_signed_in",
+                "this session has already finished signing in",
+            ));
+        };
+        let cookie = session_cookie(&parts.headers)
+            .unwrap_or_default()
+            .to_string();
+        crate::audit::note_auth(parts, Some(&principal_of(user.clone())));
+        Ok(Self {
+            user,
+            cookie,
+            shared: found.shared,
+            pending,
+        })
     }
 }
 
@@ -780,6 +959,23 @@ mod tests {
         s.remove_user(user);
         assert_eq!((s.get(&a), s.get(&b)), (None, None));
         assert!(s.get(&other).is_some());
+    }
+
+    #[test]
+    fn pending_memory_sessions_complete_once() {
+        let s = Sessions::default();
+        let user = Uuid::now_v7();
+        let pending = PendingLogin {
+            expires_at: 1,
+            enroll: false,
+            challenge: None,
+        };
+        let id = s.create_pending(user, 3, pending.clone());
+        assert_eq!(s.find(&id), Some((user, 3, Some(pending))));
+        assert!(s.complete(&id));
+        assert_eq!(s.find(&id), Some((user, 3, None)));
+        s.remove(&id);
+        assert!(!s.complete(&id));
     }
 
     #[test]
