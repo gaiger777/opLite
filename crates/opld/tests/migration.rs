@@ -1803,3 +1803,94 @@ async fn a_linked_clone_on_an_nfs_pool_migrates_with_its_chain() {
     d.ctl(&["volume", "delete", "mig-base"]).await.unwrap();
     d.ctl(&["pool", "delete", "nas"]).await.unwrap();
 }
+
+/// 노드 `d`의 VM `id` TPM 상태 파일(`{data_dir}/vm/{id}/tpm/tpm2-00.permall`)
+#[cfg(feature = "vtpm-it")]
+fn tpm_state(d: &Daemon, id: &str) -> PathBuf {
+    opl_driver::tpm_state_path(&d.data_dir(), id.parse().unwrap())
+}
+
+#[cfg(feature = "vtpm-it")]
+fn sha256_file(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
+}
+
+/// VM `web`의 `firmware_node`가 노드 `i`이고 `tpm_sha256`이 그 노드의 상태 파일 해시와 같아질 때까지 기다려 해시를
+/// 돌려준다(작업자가 `[test] firmware_sync_secs`마다 다시 센다).
+#[cfg(feature = "vtpm-it")]
+async fn tpm_recorded_on(p: &Pair, i: usize, id: &str) -> String {
+    let node = p.node_id(i).await;
+    let file = tpm_state(&p.d[i], id);
+    let deadline = std::time::Instant::now() + common::WAIT;
+    loop {
+        let vm = p.c[0].get("/vms/web").await.unwrap();
+        if vm["status"]["firmware_node"] == node.as_str()
+            && let Some(hash) = vm["status"]["tpm_sha256"].as_str()
+            && file.exists()
+            && sha256_file(&file) == hash
+        {
+            return hash.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the TPM state of vm web is not recorded on {}: {vm}",
+            p.d[i].name
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// 실제 swtpm(`vtpm-it`): TPM VM을 실행 중에 옮기면 QEMU가 swtpm 상태를 마이그레이션 스트림으로 옮기고(받는 쪽은 상태를
+/// 만들지 않는다) 대상 노드가 `firmware_node`가 되며 원본 swtpm은 끝난다. 끈 VM을 다른 노드에서 켜면 그 노드가
+/// `firmware_node`에서 TPM 상태를 받아 온다.
+#[cfg(feature = "vtpm-it")]
+#[tokio::test]
+async fn a_tpm_vm_migrates_with_its_state() {
+    let p = Pair::with_migration(
+        "mig-tpm",
+        ["60400-60409", "60410-60419"],
+        "[test]\nfirmware_sync_secs = 2\n",
+    )
+    .await;
+    let d = &p.d[0];
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--tpm", "on", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+    let vm = p.c[0].get("/vms/web").await.unwrap();
+    let id = vm["id"].as_str().unwrap().to_string();
+    tpm_recorded_on(&p, 0, &id).await;
+    let src_ctrl = vm_run_dir(&p.d[0], &id).join("tpm.sock");
+    assert!(process_with(&src_ctrl), "no swtpm on node1");
+    assert!(!tpm_state(&p.d[1], &id).exists());
+
+    migrate(&p, 0, 1).await;
+    eventually("the source swtpm ends", || async {
+        !process_with(&src_ctrl)
+    })
+    .await;
+    assert!(process_with(&vm_run_dir(&p.d[1], &id).join("tpm.sock")));
+    tpm_recorded_on(&p, 1, &id).await;
+    let vm = p.c[0].get("/vms/web").await.unwrap();
+    assert_eq!(vm["status"]["firmware_copies"], Value::Null, "{vm}");
+
+    // 끈 뒤 노드 1에서 켜면 노드 2의 상태를 받아 온다.
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    let moved = tpm_recorded_on(&p, 1, &id).await;
+    let mut spec = p.c[0].get("/vms/web").await.unwrap()["spec"].clone();
+    spec["node"] = json!(p.node_id(0).await);
+    p.c[0]
+        .put("/vms/web", &json!({ "spec": spec }))
+        .await
+        .unwrap();
+    let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
+    assert!(out.contains("vm web: start done"), "{out}");
+    let log = p.d[0].log();
+    assert!(log.contains("fetched the TPM state"), "{log}");
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    let back = tpm_recorded_on(&p, 0, &id).await;
+    eprintln!("tpm state on node2 {moved}, back on node1 {back}");
+    d.ctl(&["vm", "delete", "web"]).await.unwrap();
+}

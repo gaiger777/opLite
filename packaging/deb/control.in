@@ -4,7 +4,7 @@ Architecture: amd64
 Maintainer: Orbivisor developers <gaiger777@gmail.com>
 Installed-Size: @INSTALLED_SIZE@
 Depends: libc6 (>= 2.39), libssl3t64, qemu-system-x86, qemu-utils, ovmf, iproute2, iputils-ping, nftables, systemd
-Recommends: nfs-common, lvm2, thin-provisioning-tools, open-iscsi, lvm2-lockd, sanlock, ceph-common, qemu-block-extra, iputils-arping
+Recommends: nfs-common, lvm2, thin-provisioning-tools, open-iscsi, lvm2-lockd, sanlock, ceph-common, qemu-block-extra, iputils-arping, swtpm, swtpm-tools
 Breaks: oplite (<< @VERSION@)
 Replaces: oplite (<< @VERSION@)
 Section: admin

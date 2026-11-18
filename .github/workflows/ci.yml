@@ -150,24 +150,28 @@ jobs:
   # QEMU는 systemd 스코프로 감싼다(OPL_TEST_SYSTEMD). 웹 UI E2E는 브라우저로 같은 opld를 다룬다.
   # 라이브 마이그레이션 E2E는 한 호스트의 opld 둘로 공유 디렉터리·NFS·RBD·공유 LVM 풀 위의 VM을 옮긴다
   # (두 노드의 스코프 이름이 겹치므로 그 시험만 스코프를 끈다).
+  # vTPM(계획 59, vtpm-it): 실제 swtpm으로 TPM VM의 상태 만들기·해시·초기화, 두 노드 사이 옮기기·받아 오기, 사본 노드로의
+  # HA 복구를 본다. 시험 디렉터리는 /tmp 아래라 Ubuntu swtpm AppArmor 프로필(`/tmp/** rwk`)이 막지 않는다.
   linux-kvm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 65
     # root로 도는 테스트도 runner가 설치한 브라우저를 쓴다.
     env:
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: KVM, QEMU, UEFI firmware, iproute2, nftables
+      - name: KVM, QEMU, UEFI firmware, swtpm, iproute2, nftables
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils iproute2 nftables
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils iproute2 nftables swtpm swtpm-tools
           ls -l /dev/kvm
+          swtpm --version
+          ls /usr/share/qemu/firmware
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: web/package.json
@@ -344,7 +348,7 @@ jobs:
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl
@@ -385,9 +389,12 @@ jobs:
   # 보이는 것만 여기서 보고, 나머지 CD·씨앗 시험은 linux-kvm의 qemu-it·migration-it가 돌린다.
   # 템플릿·연결 복제(계획 58): 같은 클라우드 이미지와 SHA256SUMS를 관리자 카탈로그 항목으로 받아 템플릿을 만들고, 디스크를
   # 늘린 연결 복제 둘이 cloud-init으로 켜져 보고하는지, 기반 파일이 그대로인지, 평탄화한 VM이 다시 켜지는지 본다.
+  # vTPM·Secure Boot·게스트 에이전트(계획 59): 같은 클라우드 이미지를 q35·Secure Boot(ovmf의 MS 키 변수)·TPM·게스트
+  # 에이전트로 켜 게스트가 /dev/tpm0·Secure Boot·EK를 보고하는지, `vm guest`가 OS·IP를 보이는지, 다시 켜도 EK가 같고
+  # 복제는 다른지 본다(게스트 안 apt가 1~2분 걸린다).
   install-media:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -399,8 +406,11 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils swtpm swtpm-tools
           ls -l /dev/kvm
+          ls /usr/share/qemu/firmware
+          # root가 아닌 사용자의 swtpm_setup은 /var/lib/swtpm-localca(tss 소유) 대신 ~/.config의 설정과 CA를 쓴다.
+          swtpm_setup --create-config-files skip-if-exist
       # 받기 실패는 시험 실패가 아니라 이 단계의 실패로 보인다.
       - name: Cloud image and installer ISO
         working-directory: ${{ runner.temp }}
@@ -421,6 +431,10 @@ jobs:
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
           OPL_TEST_CLOUD_SUMS: ${{ runner.temp }}/SHA256SUMS
+      - name: vTPM, Secure Boot and the guest agent in a real guest
+        run: cargo test --features opld/vtpm-it,opld/install-media-it,opld/qemu-it -p opld --test vtpm -- --nocapture
+        env:
+          OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
 
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는

@@ -1427,3 +1427,75 @@ async fn an_ha_vm_with_local_disks_restarts_from_its_replica() {
     b.ctl(&["pool", "delete", "a"]).await.unwrap();
     b.ctl(&["pool", "delete", "b"]).await.unwrap();
 }
+
+/// 실제 swtpm(`vtpm-it`): A에서 도는 HA TPM VM의 상태 사본을 B에 밀어 두고(`firmware_copies`), A가 죽으면 리더가 사본이
+/// 있는 B에서 그 사본으로 켠다. B가 `firmware_node`가 된다.
+#[cfg(feature = "vtpm-it")]
+#[tokio::test]
+async fn an_ha_tpm_vm_recovers_on_the_node_with_its_copy() {
+    use sha2::{Digest, Sha256};
+
+    let config = format!("{CONFIG}[test]\nfirmware_sync_secs = 2\n");
+    let (mut a, b, _w) = ha_cluster_with("ha-tpm", &config, "").await;
+    b.login_with(
+        a.admin_password.as_deref().unwrap(),
+        a.ca_fingerprint.as_deref().unwrap(),
+    )
+    .await;
+    let (ca, cb) = (client(&a), client(&b));
+    let (id_a, id_b) = (node_id(&ca, "node-a").await, node_id(&ca, "node-b").await);
+    a.ctl(&[
+        "vm",
+        "create",
+        "tpm",
+        "--memory",
+        "256",
+        "--tpm",
+        "on",
+        "--node",
+        "node-a",
+        "--ha",
+        "--restart",
+        "on-failure",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = running_pid(&ca, "tpm", &id_a).await;
+    let vm = ca.get("/vms/tpm").await.unwrap();
+    let id: uuid::Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let copy = opl_driver::tpm_state_path(&b.data_dir(), id);
+    // 사본은 지금 해시와 같아야 쓸 수 있다. 펌웨어가 상태를 고치는 동안은 사본이 다시 밀린다.
+    eventually_within("a current TPM copy on node B", RECOVER_WAIT, || async {
+        let vm = ca.get("/vms/tpm").await.unwrap();
+        let status = &vm["status"];
+        status["firmware_node"] == id_a.as_str()
+            && status["firmware_copies"]
+                .as_array()
+                .is_some_and(|c| c.iter().any(|n| n == id_b.as_str()))
+            && copy.exists()
+            && status["tpm_sha256"].as_str()
+                == Some(hex::encode(Sha256::digest(std::fs::read(&copy).unwrap())).as_str())
+    })
+    .await;
+
+    a.kill();
+    kill_qemu(pid).await;
+    eventually_within("HA TPM VM running on node B", RECOVER_WAIT, || async {
+        let Ok(vm) = cb.get("/vms/tpm").await else {
+            return false;
+        };
+        vm["status"]["phase"] == "running" && vm["status"]["node"] == id_b.as_str()
+    })
+    .await;
+    eventually_within("node B holds the TPM state", RECOVER_WAIT, || async {
+        let vm = cb.get("/vms/tpm").await.unwrap();
+        vm["status"]["firmware_node"] == id_b.as_str()
+    })
+    .await;
+    let log = b.log();
+    assert!(!log.contains("fetched the TPM state"), "{log}");
+
+    b.ctl(&["vm", "stop", "tpm", "--force"]).await.unwrap();
+    b.ctl(&["vm", "delete", "tpm"]).await.unwrap();
+}

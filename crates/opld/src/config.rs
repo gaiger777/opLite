@@ -556,6 +556,15 @@ impl Config {
         Duration::from_secs(HOTPLUG_TIMEOUT_SECS)
     }
 
+    /// TPM 상태 해시·사본 주기(60초). 시험 빌드(`qemu-it`)는 `[test] firmware_sync_secs`로 바꾼다.
+    pub fn firmware_sync_interval(&self) -> Duration {
+        #[cfg(feature = "qemu-it")]
+        if let Some(secs) = self.test.firmware_sync_secs {
+            return Duration::from_secs(secs);
+        }
+        opl_reconciler::FIRMWARE_SYNC_INTERVAL
+    }
+
     /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
     pub fn checker_net(&self) -> NetFs {
         #[cfg(feature = "ha-it")]
@@ -1029,6 +1038,10 @@ pub struct TestSection {
     #[cfg(feature = "qemu-it")]
     #[serde(default)]
     pub hotplug_timeout_secs: Option<u64>,
+    /// TPM 상태 해시를 다시 보고 사본을 밀어 두는 간격(초, 기본 60, 계획 59). HA·마이그레이션 시험이 사본을 빨리 본다.
+    #[cfg(feature = "qemu-it")]
+    #[serde(default)]
+    pub firmware_sync_secs: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -2349,6 +2362,24 @@ mod tests {
         let parsed = toml::from_str::<Config>(&format!("{text}[test]\nhotplug_timeout_secs = 5"));
         #[cfg(feature = "qemu-it")]
         assert_eq!(parsed.unwrap().hotplug_timeout(), Duration::from_secs(5));
+        #[cfg(not(feature = "qemu-it"))]
+        assert!(parsed.is_err());
+    }
+
+    /// `[test] firmware_sync_secs`는 `qemu-it` 빌드에만 있고 TPM 상태 해시·사본 주기를 바꾼다.
+    #[test]
+    fn the_test_section_changes_the_firmware_sync_only_in_qemu_builds() {
+        let text = "name = \"n\"\naddress = \"h\"\n";
+        assert_eq!(
+            parse(text).firmware_sync_interval(),
+            Duration::from_secs(60)
+        );
+        let parsed = toml::from_str::<Config>(&format!("{text}[test]\nfirmware_sync_secs = 2"));
+        #[cfg(feature = "qemu-it")]
+        assert_eq!(
+            parsed.unwrap().firmware_sync_interval(),
+            Duration::from_secs(2)
+        );
         #[cfg(not(feature = "qemu-it"))]
         assert!(parsed.is_err());
     }

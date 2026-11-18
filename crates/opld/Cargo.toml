@@ -57,6 +57,12 @@ install-media-it = []
 # 관리자 카탈로그 항목으로 받아 템플릿을 만들고, 연결 복제 둘이 cloud-init으로 켜져 보고하는지, 평탄화한 VM이 다시 켜지는지
 # 본다. qemu-it와 함께 켜고, KVM이 있는 x86_64 Linux와 ovmf가 필요하다(CI `install-media` 작업).
 templates-it = []
+# 실제 swtpm으로 vTPM을 보는 E2E(계획 59): TPM VM의 상태 만들기·해시 기록·초기화(`vtpm.rs`), migration-it와 함께
+# 켜면 두 노드 사이 TPM 상태 옮기기·받아 오기(`migration.rs`), ha-it와 함께 켜면 사본 노드로의 HA 복구(`ha.rs`).
+# qemu-it의 준비물에 더해 swtpm·swtpm-tools(Linux CI `linux-kvm`)가 필요하다. install-media-it와 함께 켜면 받아 둔
+# Ubuntu 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`)를 TPM·Secure Boot·게스트 에이전트로 켜는 실제 게스트 시험도 돈다
+# (KVM이 있는 x86_64 Linux와 Secure Boot 키를 넣은 ovmf, CI `install-media` 작업).
+vtpm-it = ["qemu-it"]
 # 한 호스트의 opld 둘로 실행 중인 VM을 공유 풀 위에서 옮기고 노드마다 다른 로컬 디렉터리 풀 사이로 디스크를
 # 복사하며 옮기는 라이브 마이그레이션 E2E. qemu-it의 준비물과 qemu-img, qemu-io가 필요하다. nfs-it·rbd-it·
 # lvm-shared-it와 함께 켜면 그 풀로도 옮기고, lvm-it·zfs-it와 함께 켜면 디렉터리 → 그 블록 풀 → 디렉터리로

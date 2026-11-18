@@ -651,6 +651,7 @@ impl Member {
         // 받는 쪽(ReplicaConfig)과 같은 디렉터리다.
         reconciler_config.replica_dir = config.data_dir.join(REPLICAS_DIR);
         reconciler_config.acpi_timeout = config.reconciler.acpi_timeout();
+        reconciler_config.firmware_sync_interval = config.firmware_sync_interval();
         // 다른 노드에 있는 UEFI 변수 파일을 노드 사이 RPC로 받아 온다(시작, 스냅샷, 복제).
         let firmware: Arc<dyn FirmwareFetcher> = Arc::new(
             UefiVarsFetcher::new(

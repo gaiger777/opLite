@@ -136,8 +136,9 @@ if grep -qx 'Package: orbivisor' "$T/DEBIAN/control" && grep -qx 'Version: 0.1.0
 	grep -qx 'Replaces: oplite (<< 0.1.0~ci7)' "$T/DEBIAN/control" &&
 	! grep -q '^Provides:' "$T/DEBIAN/control" &&
 	grep -q '^Depends: .*iputils-ping' "$T/DEBIAN/control" &&
+	grep -q '^Recommends: .*swtpm, swtpm-tools' "$T/DEBIAN/control" &&
 	[ -x "$T/DEBIAN/postinst" ] && [ -x "$T/DEBIAN/prerm" ] && [ -x "$T/DEBIAN/postrm" ]; then
-	ok "orbivisor control(Breaks·Replaces oplite)과 유지 스크립트, HA 검사의 ping(Depends)"
+	ok "orbivisor control(Breaks·Replaces oplite)과 유지 스크립트, HA 검사의 ping(Depends), vTPM의 swtpm(Recommends)"
 else
 	fail "orbivisor control: $(cat "$T/DEBIAN/control")"
 fi

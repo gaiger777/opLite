@@ -16,6 +16,11 @@ use crate::client::{
     UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header, warning_header,
 };
 use crate::config::{CliConfig, default_path};
+use crate::firmware::{
+    FirmwareArgs, FirmwareCmd, GuestArgs, Preset, WINDOWS11_CORES, WINDOWS11_MEMORY,
+    WINDOWS11_NOTE, apply_preset, caps_cell, check_preset, firmware, firmware_done,
+    firmware_update, guest, node_firmware_line, reset_with_secure_boot, write_firmware_lines,
+};
 use crate::media::{
     CloudInitArgs, CloudInitClear, CloudInitInput, IsoCmd, VmCdromCmd, apply_boot, boot_line,
     cdrom_lines, cdroms_value, cloud_init_lines, cloud_init_update, iso, parse_boot, vm_cdrom,
@@ -615,7 +620,7 @@ struct StatsArgs {
 
 /// `node maintenance`의 켜기·끄기
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Switch {
+pub(crate) enum Switch {
     On,
     Off,
 }
@@ -1594,6 +1599,14 @@ enum VmCmd {
         #[command(flatten)]
         stats: StatsArgs,
     },
+    /// UEFI 변수·TPM 상태 초기화
+    Firmware {
+        #[command(subcommand)]
+        cmd: FirmwareCmd,
+    },
+    /// 게스트 에이전트가 알린 정보(OS·호스트 이름·NIC 주소·파일 시스템). `vm guest password VM --user U`는 게스트
+    /// 사용자의 비밀번호를 바꾼다.
+    Guest(GuestArgs),
     /// 로컬 포트에서 VNC 연결을 받아 VM 콘솔로 잇는다. Ctrl-C로 끝낸다.
     Console {
         vm: String,
@@ -1606,13 +1619,15 @@ enum VmCmd {
 #[derive(Args)]
 struct VmCreate {
     name: String,
-    #[arg(long, default_value_t = 1)]
-    sockets: u16,
-    #[arg(long, default_value_t = 1)]
-    cores: u16,
-    /// 메모리(MiB)
-    #[arg(long, default_value_t = 1024)]
-    memory: u32,
+    /// 소켓 수(기본 1)
+    #[arg(long)]
+    sockets: Option<u16>,
+    /// 소켓당 코어 수(기본 1, `--preset windows11`은 2)
+    #[arg(long)]
+    cores: Option<u16>,
+    /// 메모리(MiB, 기본 1024, `--preset windows11`은 4096)
+    #[arg(long)]
+    memory: Option<u32>,
     /// 실행 중 늘릴 수 있는 vCPU 상한(`--sockets`의 배수, 256 이하). 실행 중에는 `--cores`를 이 안에서 바꾼다.
     #[arg(long)]
     max_vcpus: Option<u16>,
@@ -1622,8 +1637,15 @@ struct VmCreate {
     /// 기본값은 노드 아키텍처에 맞춘다(aarch64: virt, x86_64: q35).
     #[arg(long, value_enum)]
     machine: Option<Machine>,
-    #[arg(long, value_enum, default_value = "uefi")]
-    firmware: Firmware,
+    /// 펌웨어(기본 uefi)
+    #[arg(long, value_enum)]
+    firmware: Option<Firmware>,
+    /// 미리 채우기. `windows11`은 q35·UEFI·Secure Boot·TPM 2.0·게스트 에이전트, vCPU 2, 4096 MiB, SATA 디스크,
+    /// e1000e NIC다(드라이버 없이 설치). 따로 준 값이 이긴다.
+    #[arg(long, value_enum)]
+    preset: Option<Preset>,
+    #[command(flatten)]
+    fw: FirmwareArgs,
     /// 붙일 볼륨 이름. 여러 번 줄 수 있고 첫 디스크로 부팅한다.
     #[arg(long = "disk")]
     disks: Vec<String>,
@@ -1764,7 +1786,8 @@ fn nic_body(nic: &NicArg) -> Value {
     "max_vcpus", "no_max_vcpus", "max_memory", "no_max_memory", "replicate", "no_replicate", "boot",
     "cloud_init", "ci_hostname", "ci_user", "ci_password_file", "ci_password_prompt",
     "ci_password_hash", "ci_ssh_keys", "ci_ip", "ci_ip6", "ci_dns", "ci_search", "ci_user_data",
-    "ci_vendor_data", "no_cloud_init", "ci_no_password", "ci_clear_ssh_keys"
+    "ci_vendor_data", "no_cloud_init", "ci_no_password", "ci_clear_ssh_keys", "tpm", "secure_boot",
+    "guest_agent", "agent_freeze", "agent_shutdown"
 ])))]
 struct VmSet {
     vm: String,
@@ -1833,6 +1856,12 @@ struct VmSet {
     /// cloud-init SSH 키를 모두 지운다(`--ci-ssh-key`가 있으면 그 키만 남긴다).
     #[arg(long)]
     ci_clear_ssh_keys: bool,
+    #[command(flatten)]
+    fw: FirmwareArgs,
+    /// `--secure-boot`을 UEFI 변수 초기화와 함께 바꾼다(UEFI 변수가 이미 있는 VM에 필요하다). 부팅 항목을 잃는다.
+    /// VM이 꺼져 있어야 한다.
+    #[arg(long, requires = "secure_boot")]
+    reset_uefi_vars: bool,
     /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
     #[arg(long)]
     no_wait: bool,
@@ -1864,6 +1893,19 @@ impl VmSet {
             password: self.ci_no_password,
             ssh_keys: self.ci_clear_ssh_keys,
         }
+    }
+
+    /// `--reset-uefi-vars`의 초기화 요청 말고 VM 수정(PUT)이 필요한지
+    fn changes_spec(&self) -> bool {
+        self.changes_ha()
+            || self.pinned
+            || self.no_pinned
+            || self.changes_replication()
+            || self.changes_hardware()
+            || self.boot.is_some()
+            || self.changes_cloud_init()
+            || self.fw.changes_other()
+            || (self.fw.secure_boot.is_some() && !self.reset_uefi_vars)
     }
 
     /// CPU·메모리를 바꾸는지
@@ -1945,6 +1987,7 @@ fn media_set(
     if let Some(list) = &args.boot {
         apply_boot(&mut body["spec"], list)?;
     }
+    firmware_update(&mut body["spec"], &args.fw, args.reset_uefi_vars)?;
     if args.changes_cloud_init() {
         let ci = cloud_init_update(
             &current["spec"]["cloud_init"],
@@ -5598,7 +5641,11 @@ where
         Cmd::Node { cmd } => match cmd {
             NodeCmd::List => node_list(&client, json_out, out).await?,
             NodeCmd::Get { node } => {
-                print_json(out, &client.get(&format!("/nodes/{}", seg(&node))).await?)?
+                let node = client.get(&format!("/nodes/{}", seg(&node))).await?;
+                print_json(out, &node)?;
+                if !json_out && let Some(line) = node_firmware_line(&node) {
+                    eprintln!("{line}");
+                }
             }
             NodeCmd::Updates { node, refresh } => {
                 node_updates(&client, &node, refresh, json_out, out).await?
@@ -7138,7 +7185,7 @@ fn mib(bytes: u64) -> String {
 }
 
 /// 지금 시각(유닉스 초)
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
@@ -7155,7 +7202,7 @@ fn age(secs: u64) -> String {
 }
 
 /// 지난 시간을 가장 큰 단위 하나로(`45s`, `4m`, `3h`, `2d`)
-fn ago(secs: u64) -> String {
+pub(crate) fn ago(secs: u64) -> String {
     match secs {
         0..60 => format!("{secs}s"),
         60..3600 => format!("{}m", secs / 60),
@@ -7462,6 +7509,7 @@ async fn vm_get(
         if let Some(line) = hardware_line(&vm) {
             writeln!(err, "{line}")?;
         }
+        write_firmware_lines(client, &vm, err).await?;
         for line in cdrom_lines(&vm)
             .into_iter()
             .chain(boot_line(&vm))
@@ -7517,8 +7565,17 @@ async fn vm(
                 Some(key) => Some(client.get(&format!("/nodes/{}", seg(key))).await?),
                 None => None,
             };
+            if let Some(preset) = args.preset {
+                check_preset(
+                    preset,
+                    args.machine.map(|m| m == Machine::Q35),
+                    args.firmware.map(|f| matches!(f, Firmware::Uefi)),
+                )?;
+            }
+            let windows = args.preset == Some(Preset::Windows11);
             let machine = match args.machine {
                 Some(m) => m,
+                None if windows => Machine::Q35,
                 None => {
                     let list = client.get("/nodes").await?;
                     let nodes = list["items"].as_array().cloned().unwrap_or_default();
@@ -7550,10 +7607,13 @@ async fn vm(
             let mut body = json!({
                 "name": args.name,
                 "spec": {
-                    "cpu": { "sockets": args.sockets, "cores": args.cores },
-                    "memory_mib": args.memory,
+                    "cpu": {
+                        "sockets": args.sockets.unwrap_or(1),
+                        "cores": args.cores.unwrap_or(if windows { WINDOWS11_CORES } else { 1 }),
+                    },
+                    "memory_mib": args.memory.unwrap_or(if windows { WINDOWS11_MEMORY } else { 1024 }),
                     "machine": value_name(machine),
-                    "firmware": value_name(args.firmware),
+                    "firmware": value_name(args.firmware.unwrap_or(Firmware::Uefi)),
                     "disks": disks,
                     "nics": nics,
                     "restart": value_name(args.restart),
@@ -7598,11 +7658,18 @@ async fn vm(
                     CloudInitClear::default(),
                 );
             }
+            if let Some(preset) = args.preset {
+                apply_preset(&mut body["spec"], preset);
+            }
+            firmware_update(&mut body["spec"], &args.fw, false)?;
             let r = client.request(Method::POST, "/vms").json(&body);
             let (headers, _) = client.send_with_headers(r).await?;
             writeln!(out, "vm {} created", args.name)?;
             if let Some(warning) = warning_header(&headers) {
                 eprintln!("warning: {warning}");
+            }
+            if windows {
+                eprintln!("{WINDOWS11_NOTE}");
             }
             warn_ha_without_replica(client, &args.name, &body["spec"], &mut std::io::stderr())
                 .await?;
@@ -7619,13 +7686,23 @@ async fn vm(
                 Some(replication_spec(&args.replicate, &nodes)?)
             };
             let ci_input = args.cloud_init.read()?;
-            let task = put_spec(client, &args.vm, |current| {
-                let mut body = vm_set_spec(current, &args);
-                replication_set(&mut body, replication.as_ref(), args.no_replicate);
-                media_set(&mut body, current, &args, &ci_input)?;
-                Ok(body)
-            })
-            .await?;
+            // Secure Boot는 UEFI 변수 초기화 Task와 한 요청으로 바꾼다(VM이 꺼져 있지 않으면 아무것도 바꾸기 전에 실패).
+            if args.reset_uefi_vars
+                && let Some(on) = args.fw.secure_boot
+            {
+                reset_with_secure_boot(client, &args.vm, on == Switch::On, out).await?;
+            }
+            let task = if args.changes_spec() {
+                put_spec(client, &args.vm, |current| {
+                    let mut body = vm_set_spec(current, &args);
+                    replication_set(&mut body, replication.as_ref(), args.no_replicate);
+                    media_set(&mut body, current, &args, &ci_input)?;
+                    Ok(body)
+                })
+                .await?
+            } else {
+                None
+            };
             if args.changes_ha() {
                 let state = match args.policy.ha_state {
                     _ if args.no_ha => "off".to_string(),
@@ -7668,6 +7745,9 @@ async fn vm(
                 done.push(format!("vm {}: cloud-init off", args.vm));
             } else if args.changes_cloud_init() {
                 done.push(format!("vm {}: cloud-init updated", args.vm));
+            }
+            if let Some(line) = firmware_done(&args.fw, args.reset_uefi_vars) {
+                done.push(format!("vm {}: {line}", args.vm));
             }
             if !done.is_empty() {
                 let done = done.join("\n");
@@ -7815,6 +7895,8 @@ async fn vm(
             }
         }
         VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
+        VmCmd::Firmware { cmd } => firmware(client, cmd, out, &mut std::io::stderr()).await?,
+        VmCmd::Guest(args) => guest(client, args, json_out, out).await?,
         VmCmd::Stats { vm, stats } => {
             vm_stats(
                 client,
@@ -8212,7 +8294,7 @@ fn snapshot_subtree(
 }
 
 /// 유닉스 초를 `2026-10-26 09:30 UTC`처럼
-fn unix_time(secs: i64) -> String {
+pub(crate) fn unix_time(secs: i64) -> String {
     match time::OffsetDateTime::from_unix_timestamp(secs) {
         Ok(t) => format!("{} {:02}:{:02} UTC", t.date(), t.hour(), t.minute()),
         Err(_) => secs.to_string(),
@@ -8274,6 +8356,8 @@ const NODE_HEADERS: &[&str] = &[
     "FENCE",
     "SHUTDOWN",
     "CHECKS",
+    "TPM",
+    "SB",
 ];
 
 /// `node list`. 투표 멤버인지는 클러스터 멤버십(`GET /cluster`)에 있다. 그것을 읽지 못해도(과반 없음 등) 목록은
@@ -8321,6 +8405,9 @@ fn node_row(n: &Value, cluster: &Value) -> Vec<String> {
         node_fence_cell(&n["status"]),
         node_shutdown_cell(&n["status"]),
         node_checks_cell(&n["status"]),
+        // 계획 59 전 노드와 위트니스는 펌웨어 능력을 알리지 않는다.
+        caps_cell(n, "tpm"),
+        caps_cell(n, "secure_boot"),
     ]
 }
 
@@ -10002,6 +10089,247 @@ mod tests {
             .await
             .unwrap();
         assert!(err.is_empty());
+    }
+
+    /// 계획 59 명령의 인자: 미리 채우기, `--reset-uefi-vars`는 `--secure-boot`과 함께, `vm guest`의 VM과 하위 명령,
+    /// `vm firmware reset`은 무엇을 지울지 적어야 한다.
+    #[test]
+    fn firmware_and_guest_arguments_parse() {
+        let parse = |args: &[&str]| {
+            let mut argv = vec!["oplctl"];
+            argv.extend_from_slice(args);
+            Cli::try_parse_from(argv)
+        };
+        let Cmd::Vm {
+            cmd: VmCmd::Create(c),
+        } = parse(&[
+            "vm",
+            "create",
+            "win",
+            "--preset",
+            "windows11",
+            "--tpm",
+            "off",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("not vm create");
+        };
+        assert_eq!(c.preset, Some(Preset::Windows11));
+        assert_eq!(c.fw.tpm, Some(Switch::Off));
+        assert_eq!((c.sockets, c.cores, c.memory), (None, None, None));
+
+        let Cmd::Vm { cmd: VmCmd::Set(s) } = parse(&[
+            "vm",
+            "set",
+            "win",
+            "--secure-boot",
+            "on",
+            "--reset-uefi-vars",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("not vm set");
+        };
+        assert!(s.reset_uefi_vars && !s.changes_spec());
+        assert!(parse(&["vm", "set", "win", "--reset-uefi-vars"]).is_err());
+        let Cmd::Vm { cmd: VmCmd::Set(s) } = parse(&[
+            "vm",
+            "set",
+            "win",
+            "--guest-agent",
+            "on",
+            "--agent-shutdown",
+            "acpi",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            panic!("not vm set");
+        };
+        assert!(s.changes_spec());
+        // Secure Boot만 바꾸는 PUT(초기화 없이)도 VM 수정이다.
+        let Cmd::Vm { cmd: VmCmd::Set(s) } = parse(&["vm", "set", "win", "--secure-boot", "off"])
+            .unwrap()
+            .cmd
+        else {
+            panic!("not vm set");
+        };
+        assert!(s.changes_spec());
+
+        let Cmd::Vm {
+            cmd: VmCmd::Guest(g),
+        } = parse(&["vm", "guest", "web", "--refresh"]).unwrap().cmd
+        else {
+            panic!("not vm guest");
+        };
+        assert_eq!(g.vm.as_deref(), Some("web"));
+        assert!(g.refresh && g.cmd.is_none());
+        let Cmd::Vm {
+            cmd: VmCmd::Guest(g),
+        } = parse(&["vm", "guest", "password", "web", "--user", "Administrator"])
+            .unwrap()
+            .cmd
+        else {
+            panic!("not vm guest");
+        };
+        assert!(matches!(
+            g.cmd,
+            Some(crate::firmware::GuestCmd::Password { vm, user }) if vm == "web" && user == "Administrator"
+        ));
+        assert!(parse(&["vm", "guest"]).is_err());
+        // 비밀번호는 인자로 받지 않는다.
+        assert!(
+            parse(&[
+                "vm",
+                "guest",
+                "password",
+                "web",
+                "--user",
+                "a",
+                "--password",
+                "x"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["vm", "firmware", "reset", "win"]).is_err());
+        assert!(parse(&["vm", "firmware", "reset", "win", "--tpm", "--yes"]).is_ok());
+    }
+
+    /// `vm set --secure-boot on --reset-uefi-vars`는 초기화 요청 하나(`secure_boot` 포함)를 보내고 Task를 기다린다.
+    /// 바꿀 것이 더 없으면 PUT하지 않는다.
+    #[tokio::test]
+    async fn vm_set_secure_boot_with_a_reset_sends_one_request() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/tasks/t1" => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+            _ => json!({ "id": "t1", "status": { "state": "pending" } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "set",
+            "win",
+            "--secure-boot",
+            "on",
+            "--reset-uefi-vars",
+        ])
+        .unwrap();
+        let Cmd::Vm { cmd } = cli.cmd else {
+            panic!("not vm");
+        };
+        let mut out = Vec::new();
+        vm(&client, cmd, false, &mut out).await.unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "vm win: UEFI variables reset, Secure Boot on\n"
+        );
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /api/v1/vms/win/firmware/reset HTTP/1.1",
+                "GET /api/v1/tasks/t1 HTTP/1.1"
+            ]
+        );
+        assert_eq!(
+            seen[0].body,
+            json!({ "uefi_vars": true, "secure_boot": true })
+        );
+    }
+
+    /// `vm firmware reset --uefi-vars`는 두 값을 보내고 Task를 기다린다. `vm guest`는 `refresh`를 쿼리로 보내고
+    /// 답하지 않은 상태를 알린다. `vm guest password`의 출력에는 비밀번호가 없다.
+    #[tokio::test]
+    async fn firmware_reset_and_guest_requests() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/tasks/t1" => json!({ "id": "t1", "status": { "state": "succeeded" } }),
+            "/api/v1/vms/web/guest?refresh=true" => json!({ "state": "no_agent" }),
+            "/api/v1/vms/web/guest/password" => json!({ "user": "orbi" }),
+            _ => json!({ "id": "t1", "status": { "state": "pending" } }),
+        })
+        .await;
+        let client = Client::new(&base, None, None).unwrap();
+        let run = |args: &[&str]| {
+            let mut argv = vec!["oplctl"];
+            argv.extend_from_slice(args);
+            let Cmd::Vm { cmd } = Cli::try_parse_from(argv).unwrap().cmd else {
+                panic!("not vm");
+            };
+            cmd
+        };
+        let mut out = Vec::new();
+        vm(
+            &client,
+            run(&["vm", "firmware", "reset", "web", "--uefi-vars"]),
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        vm(
+            &client,
+            run(&["vm", "guest", "web", "--refresh"]),
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        crate::firmware::guest_password(&client, "web", "orbi", "s3cret".into(), &mut out)
+            .await
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(
+            out,
+            "vm web: firmware reset (uefi vars)\n\
+             vm web: the guest agent has not answered (turn on --guest-agent and install qemu-guest-agent in the guest)\n\
+             vm web: password of guest user orbi set\n"
+        );
+        assert!(!out.contains("s3cret"));
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].line, "POST /api/v1/vms/web/firmware/reset HTTP/1.1");
+        assert_eq!(seen[0].body, json!({ "uefi_vars": true, "tpm": false }));
+        assert_eq!(
+            seen[2].line,
+            "GET /api/v1/vms/web/guest?refresh=true HTTP/1.1"
+        );
+        assert_eq!(seen[3].line, "POST /api/v1/vms/web/guest/password HTTP/1.1");
+        assert_eq!(
+            seen[3].body,
+            json!({ "user": "orbi", "password": "s3cret" })
+        );
+    }
+
+    /// `vm get`은 TPM(상태가 있는 노드와 사본)·Secure Boot·게스트 에이전트 줄을 stderr에 쓴다. 노드 이름은 TPM 상태가
+    /// 있을 때만 읽는다.
+    #[tokio::test]
+    async fn vm_get_shows_tpm_secure_boot_and_the_guest_agent() {
+        fn reply(path: &str) -> Value {
+            match path {
+                "/api/v1/nodes" => json!({ "items": [
+                    { "id": "id-a", "name": "a" }, { "id": "id-b", "name": "b" },
+                ] }),
+                _ => json!({
+                    "name": "win",
+                    "spec": { "tpm": true, "secure_boot": true, "guest_agent": {} },
+                    "status": { "tpm_sha256": "ab", "firmware_node": "id-a", "firmware_copies": ["id-b"] },
+                }),
+            }
+        }
+        let (base, _) = fake_api_bodies(reply).await;
+        let client = Client::new(&base, None, None).unwrap();
+        let mut err = Vec::new();
+        vm_get(&client, "win", false, &mut Vec::new(), &mut err)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "tpm: on (state on node a, copies: b)\nsecure boot: on\nguest agent: on (freeze fs, shutdown agent)\n"
+        );
     }
 
     /// `vm get`은 CD-ROM 드라이브·실제 부팅 순서·cloud-init 요약도 stderr에 쓴다.
@@ -11943,6 +12271,7 @@ mod tests {
         a["status"]["underlay"] = json!("10.0.0.1");
         a["status"]["version"] = json!("0.2.0");
         a["status"]["fence_check"] = json!({ "at": 1, "by": "old" });
+        a["status"]["firmware_caps"] = json!({ "tpm": true, "secure_boot": false });
         a["status"]["checks"] = json!([
             { "name": "cluster-link-1", "state": "ok" },
             { "name": "stor", "state": "failing", "error": "eth1 is down" },
@@ -11966,14 +12295,14 @@ mod tests {
         table(&mut out, NODE_HEADERS, &rows).unwrap();
         // 옛 서버는 witness를 보내지 않는다 — 일반 노드다. 펜싱이 꺼진 노드는 `ha`가 없다.
         // underlay가 없는 노드(위트니스, 옛 서버)는 `-`다. 역할이 없으면 기본 역할(위트니스는 없음)이다.
-        // HA 검사 보고가 없으면 CHECKS는 `-`다.
+        // HA 검사 보고가 없으면 CHECKS는 `-`다. 펌웨어 능력을 알리지 않은 노드(옛 노드, 위트니스)의 TPM·SB는 `-`다.
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   FENCE        SHUTDOWN  CHECKS\n\
-             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  ok           -         failing:stor,vmnet\n\
-             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -            -         -\n\
-             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -            -         -\n\
-             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         unreachable  -         degraded\n"
+            "NAME  ID       ADDRESS        VERSION  UNDERLAY  ONLINE  CPUS  MEMORY  MAINTENANCE  WITNESS  VOTER  ROLES  FENCING   FENCE        SHUTDOWN  CHECKS              TPM   SB\n\
+             a     id-a     10.0.0.1:8006  0.2.0    10.0.0.1  true    4     1.0GiB  false        false    true   api    watchdog  ok           -         failing:stor,vmnet  true  false\n\
+             w     id-w     10.0.0.1:8006  -        -         true    4     1.0GiB  false        true     true   -      -         -            -         -                   -     -\n\
+             old   id-old   10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    false  api    -         -            -         -                   -     -\n\
+             none  id-none  10.0.0.1:8006  -        -         true    4     1.0GiB  false        false    -      -      -         unreachable  -         degraded            -     -\n"
         );
     }
 

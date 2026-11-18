@@ -5,6 +5,7 @@ mod cli;
 mod client;
 mod config;
 mod console;
+mod firmware;
 mod media;
 mod output;
 mod template;
