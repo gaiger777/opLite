@@ -129,6 +129,13 @@ impl MetricsStore {
         Pending { node, vms }
     }
 
+    /// VM에 `marks` 뒤에 들어온(아직 기록 파일에 가져가지 않은) 점이 있는지
+    pub fn vm_pending(&self, vm: Uuid, marks: &Marks) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.vms.get(&vm).is_some_and(|s| !s.is_empty())
+            && inner.vm_pushed.get(&vm) != marks.vms.get(&vm)
+    }
+
     /// VM 시리즈의 마지막 점 시각(이 노드에서 잰 적이 없거나 지워졌으면 `None`)
     pub fn last_vm_t(&self, vm: Uuid) -> Option<i64> {
         let inner = self.inner.lock().unwrap();
@@ -496,11 +503,13 @@ mod tests {
         assert_eq!(times(&p.node, |s| s.t), [1_000]);
         assert_eq!(p.vms.len(), 1);
         assert_eq!(p.vms[0].0, a);
+        assert!(!store.vm_pending(a, &marks));
         // 아무것도 넣지 않으면 비었다.
         assert_eq!(store.take_pending(&mut marks), Pending::default());
         // 시계가 뒤로 간 점도 새 점이다.
         store.push_node(node(500));
         store.push_vm(b, vm(2_000));
+        assert!(store.vm_pending(b, &marks) && !store.vm_pending(a, &marks));
         store.push_vm(b, vm(3_000));
         let p = store.take_pending(&mut marks);
         assert_eq!(times(&p.node, |s| s.t), [500]);

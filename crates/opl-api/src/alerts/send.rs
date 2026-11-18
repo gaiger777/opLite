@@ -2,8 +2,10 @@
 //! 경보 엔진은 [`Sender`]의 대기열(노드마다 1000개)에 넣기만 하고 기다리지 않는다. 보내기는 동시에 4개까지(한 대상은
 //! 1개까지), 한 번에 10초까지이고, 실패하면 30초·2분·10분 뒤 다시 한다. 대기열에서는 보낼 허가가 남았을 때만 꺼내므로
 //! 보내기가 밀리면 대기열이 차고 넘친 것은 버린다. 바쁜 대상의 일은 대상마다 줄을 서고, 줄 전체가 대기열 크기를 넘으면
-//! 가장 긴 줄의 가장 오래된 것을 버린다(응답 없는 대상 하나가 다른 대상의 알림을 늦추지 않게). 대상마다 분당 20개를 넘는 알림은 보내지 않고 모았다가 다음 분에
-//! "N건 더" 알림 하나로 알린다. 결과는 경보 장부의 보낸 기록에 남긴다. 오류 문구에는 비밀(비밀번호·토큰·헤더 값·URL의
+//! 가장 긴 줄의 가장 오래된 것을 버린다(응답 없는 대상 하나가 다른 대상의 알림을 늦추지 않게). 줄은 돌아가며 꺼낸다.
+//! 대상마다 분당 20개를 넘는 알림은 보내지 않고 모았다가 다음 분에 "N건 더" 알림 하나로 알린다. 한 대상의 줄도 20개까지이고
+//! 넘친 것은 "N건 더"에 넣는다. 처음 넣은 뒤 15분 안에 보내지 못한 알림과, 같은 경보의 `RESOLVED`를 받은 뒤의 `FIRING`
+//! 다시 하기는 버린다(`dropped`). 결과는 경보 장부의 보낸 기록에 남긴다. 오류 문구에는 비밀(비밀번호·토큰·헤더 값·URL의
 //! 경로와 질의)을 넣지 않는다.
 
 use std::collections::{HashMap, VecDeque};
@@ -392,6 +394,9 @@ pub struct SenderConfig {
     pub queue: usize,
     /// 한 대상에 동시에 보내는 수(응답 없는 대상이 허가를 다 쓰지 못하게)
     pub per_target: usize,
+    /// 처음 넣은 뒤 이만큼 지나도록 보내지 못한 일은 버리고 `dropped`로 기록한다(살아난 대상에 묵은 알림을 몰아
+    /// 보내지 않게).
+    pub max_age: Duration,
 }
 
 impl Default for SenderConfig {
@@ -408,6 +413,7 @@ impl Default for SenderConfig {
             window: Duration::from_secs(60),
             queue: 1000,
             per_target: 1,
+            max_age: Duration::from_secs(15 * 60),
         }
     }
 }
@@ -422,7 +428,37 @@ struct Job {
     attempt: usize,
     /// "N건 더" 알림(분당 상한을 세지 않는다)
     summary: bool,
+    /// 처음 대기열에 넣은 때
+    born: Instant,
 }
+
+impl Job {
+    fn new(target: String, n: Arc<Notification>, summary: bool) -> Self {
+        Self {
+            target,
+            n,
+            attempt: 0,
+            summary,
+            born: Instant::now(),
+        }
+    }
+
+    /// 같은 경보의 같은 대상 알림을 가리는 열쇠: (대상, 규칙, 경보 대상 id). 규칙 경보가 아니면 None이다.
+    fn alert(&self) -> Option<AlertKey> {
+        let (rule, subject) = (self.n.rule.as_ref()?, self.n.subject.as_ref()?);
+        Some((self.target.clone(), rule.clone(), subject.id))
+    }
+
+    /// 다시 하기를 기다리는 `FIRING`인데 그 뒤에 같은 경보의 `RESOLVED`를 받았다(리뷰 2 #5).
+    fn superseded(&self, resolved: &HashMap<AlertKey, Instant>) -> bool {
+        self.attempt > 0
+            && self.n.state == NotificationState::Firing
+            && (self.alert()).is_some_and(|k| resolved.get(&k).is_some_and(|at| *at >= self.born))
+    }
+}
+
+/// (대상, 규칙 이름, 경보 대상 id)
+type AlertKey = (String, String, uuid::Uuid);
 
 /// 대상 하나의 분당 창
 struct Window {
@@ -470,17 +506,12 @@ impl Sender {
 
     /// 대기열에 넣는다(기다리지 않음). 가득 찼으면 버리고 기록에 `dropped`로 남긴다.
     pub fn enqueue(&self, target: &str, n: Arc<Notification>) {
-        let job = Job {
-            target: target.into(),
-            n,
-            attempt: 0,
-            summary: false,
-        };
+        let job = Job::new(target.into(), n, false);
         if let Err(e) = self.tx.try_send(job) {
             let job = match e {
                 mpsc::error::TrySendError::Full(j) | mpsc::error::TrySendError::Closed(j) => j,
             };
-            dropped(&self.book, self.clock.as_ref(), &job);
+            dropped(&self.book, self.clock.as_ref(), &job, DropReason::Full);
         }
     }
 
@@ -498,15 +529,34 @@ struct Ctx {
     config: SenderConfig,
 }
 
-/// 대기열이 넘쳐 버린 알림을 경고하고 기록에 `dropped`로 남긴다.
-fn dropped(book: &AlertBook, clock: &dyn Clock, job: &Job) {
-    tracing::warn!(target = %job.target, "the notification queue is full; dropping a notification");
-    let rec = record_of(
-        &job.n,
-        &job.target,
-        clock.now_ms(),
-        Err("dropped: the send queue is full".into()),
-    );
+/// 알림을 버린 까닭
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// 대기열이나 줄이 넘쳤다.
+    Full,
+    /// `max_age` 안에 보내지 못했다.
+    Stale,
+    /// 다시 하기를 기다리는 `FIRING`인데 같은 경보의 `RESOLVED`가 왔다.
+    Resolved,
+}
+
+/// 버린 알림을 경고하고 기록에 `dropped: …`로 남긴다.
+fn dropped(book: &AlertBook, clock: &dyn Clock, job: &Job, why: DropReason) {
+    let error = match why {
+        DropReason::Full => {
+            tracing::warn!(target = %job.target, "the notification queue is full; dropping a notification");
+            "dropped: the send queue is full"
+        }
+        DropReason::Stale => {
+            tracing::warn!(target = %job.target, "a notification waited too long to be sent; dropping it");
+            "dropped: not sent in time"
+        }
+        DropReason::Resolved => {
+            tracing::info!(target = %job.target, "the alert was resolved before a retry; dropping the FIRING notification");
+            "dropped: the alert was resolved before the retry"
+        }
+    };
+    let rec = record_of(&job.n, &job.target, clock.now_ms(), Err(error.into()));
     let book = book.clone();
     tokio::task::spawn_blocking(move || book.record(rec));
 }
@@ -520,49 +570,107 @@ enum Next {
     Again(Job),
 }
 
-/// 보낼 차례를 기다리는 일들: 대상마다 줄과 그 대상의 동시 보내기 몫
+/// 보낼 차례를 기다리는 일들: 대상마다 줄과 그 대상의 동시 보내기 몫. 줄은 돌아가며 꺼낸다.
 #[derive(Default)]
 struct Lanes {
-    lanes: HashMap<String, Lane>,
+    lanes: Vec<Lane>,
+    /// 다음에 먼저 볼 줄(리뷰 2 #4: 앞 줄이 늘 이기지 않게)
+    turn: usize,
     /// 모든 줄의 일 수
     waiting: usize,
 }
 
 struct Lane {
+    target: String,
     jobs: VecDeque<Job>,
     /// 한 대상의 동시 보내기 몫(`per_target`개). 보내는 작업이 끝나면 돌려준다.
     slots: Arc<Semaphore>,
 }
 
+/// 줄에 세우다 넘친 일
+#[derive(Debug)]
+enum Overflow {
+    /// 그 대상의 줄이 `per_lane`을 넘어 가장 오래된 일을 "N건 더"로 접는다.
+    Fold(Job),
+    /// 줄 전체가 `cap`을 넘어 가장 긴 줄의 가장 오래된 일을 버린다.
+    Shed(Job),
+}
+
 impl Lanes {
-    /// 일을 대상의 줄 끝에 세운다. 줄 전체가 `cap`을 넘으면 가장 긴 줄의 가장 오래된 일을 버려 돌려준다.
-    fn push(&mut self, job: Job, per_target: usize, cap: usize) -> Option<Job> {
-        let lane = self
-            .lanes
-            .entry(job.target.clone())
-            .or_insert_with(|| Lane {
-                jobs: VecDeque::new(),
-                slots: Arc::new(Semaphore::new(per_target.max(1))),
-            });
+    /// 일을 대상의 줄 끝에 세운다. 그 대상의 줄("N건 더"는 빼고 셈)이 `per_lane`을 넘으면 가장 오래된 일을 접어
+    /// 돌려주고, 줄 전체가 `cap`을 넘으면 가장 긴 줄의 가장 오래된 일을 버려 돌려준다.
+    fn push(
+        &mut self,
+        job: Job,
+        per_target: usize,
+        per_lane: usize,
+        cap: usize,
+    ) -> Option<Overflow> {
+        let i = match self.lanes.iter().position(|l| l.target == job.target) {
+            Some(i) => i,
+            None => {
+                self.lanes.push(Lane {
+                    target: job.target.clone(),
+                    jobs: VecDeque::new(),
+                    slots: Arc::new(Semaphore::new(per_target.max(1))),
+                });
+                self.lanes.len() - 1
+            }
+        };
+        let lane = &mut self.lanes[i];
         lane.jobs.push_back(job);
+        if lane.jobs.iter().filter(|j| !j.summary).count() > per_lane.max(1)
+            && let Some(k) = lane.jobs.iter().position(|j| !j.summary)
+        {
+            return lane.jobs.remove(k).map(Overflow::Fold);
+        }
         self.waiting += 1;
         if self.waiting <= cap.max(1) {
             return None;
         }
-        let longest = self.lanes.values_mut().max_by_key(|l| l.jobs.len())?;
+        let longest = self.lanes.iter_mut().max_by_key(|l| l.jobs.len())?;
         self.waiting -= 1;
-        longest.jobs.pop_front()
+        longest.jobs.pop_front().map(Overflow::Shed)
     }
 
-    /// 대상 몫과 보낼 허가가 둘 다 있는 일 하나. 허가가 없으면 `None`이다. 빈 줄은 정리한다.
+    /// 처음 넣은 뒤 `max_age`가 지난 일과 `RESOLVED`에 가려진 다시 하기를 줄에서 빼 돌려준다.
+    fn expire(
+        &mut self,
+        now: Instant,
+        max_age: Duration,
+        resolved: &HashMap<AlertKey, Instant>,
+    ) -> Vec<(Job, DropReason)> {
+        let mut out = Vec::new();
+        for lane in &mut self.lanes {
+            let mut keep = VecDeque::with_capacity(lane.jobs.len());
+            for job in lane.jobs.drain(..) {
+                if now.duration_since(job.born) >= max_age {
+                    out.push((job, DropReason::Stale));
+                } else if job.superseded(resolved) {
+                    out.push((job, DropReason::Resolved));
+                } else {
+                    keep.push_back(job);
+                }
+            }
+            lane.jobs = keep;
+        }
+        self.waiting -= out.len();
+        out
+    }
+
+    /// 대상 몫과 보낼 허가가 둘 다 있는 일 하나. 허가가 없으면 `None`이다. 지난번에 꺼낸 줄 다음 줄부터 보고, 빈 줄은
+    /// 정리한다.
     fn next(
         &mut self,
         permits: &Arc<Semaphore>,
     ) -> Option<(Job, OwnedSemaphorePermit, OwnedSemaphorePermit)> {
         // 기다리는 일도 보내는 중인 일(몫을 쥔 작업)도 없는 줄
         self.lanes
-            .retain(|_, l| !l.jobs.is_empty() || Arc::strong_count(&l.slots) > 1);
-        for lane in self.lanes.values_mut() {
+            .retain(|l| !l.jobs.is_empty() || Arc::strong_count(&l.slots) > 1);
+        let n = self.lanes.len();
+        for k in 0..n {
+            let i = (self.turn + k) % n;
+            let lane = &mut self.lanes[i];
             if lane.jobs.is_empty() {
                 continue;
             }
@@ -572,6 +680,7 @@ impl Lanes {
             let permit = permits.clone().try_acquire_owned().ok()?;
             let job = lane.jobs.pop_front()?;
             self.waiting -= 1;
+            self.turn = i + 1;
             return Some((job, permit, slot));
         }
         None
@@ -583,9 +692,17 @@ async fn run(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Job>, mut stop: oneshot::Rece
     let mut windows: HashMap<String, Window> = HashMap::new();
     let mut lanes = Lanes::default();
     let mut work: JoinSet<Next> = JoinSet::new();
+    // 받은 `RESOLVED`(경보마다 마지막으로 받은 때): 그 전에 넣은 `FIRING`의 다시 하기는 버린다.
+    let mut resolved: HashMap<AlertKey, Instant> = HashMap::new();
     let mut flush = tokio::time::interval(Duration::from_secs(1).min(ctx.config.window));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let (per_target, cap) = (ctx.config.per_target, ctx.config.queue);
+    let config = &ctx.config;
+    let (per_target, per_lane, cap) = (
+        config.per_target,
+        usize::try_from(config.per_window).unwrap_or(usize::MAX),
+        config.queue,
+    );
+    let drop_job = |job: &Job, why: DropReason| dropped(&ctx.book, ctx.clock.as_ref(), job, why);
     loop {
         // 대상 몫과 허가가 있는 만큼 보낸다.
         while let Some((job, permit, slot)) = lanes.next(&permits) {
@@ -595,37 +712,80 @@ async fn run(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Job>, mut stop: oneshot::Rece
             _ = &mut stop => break,
             // 허가가 남았을 때만 대기열에서 꺼낸다(보내기가 밀리면 대기열이 차서 넘친 것을 버린다).
             job = rx.recv(), if permits.available_permits() > 0 => match job {
-                Some(job) if job.attempt == 0 && !job.summary && !admit(&mut windows, &job, &ctx.config) => continue,
-                Some(job) => job,
+                Some(job) => {
+                    if job.n.state == NotificationState::Resolved
+                        && let Some(key) = job.alert()
+                    {
+                        resolved.insert(key, job.born);
+                        for (old, why) in lanes.expire(Instant::now(), config.max_age, &resolved) {
+                            drop_job(&old, why);
+                        }
+                    }
+                    if !job.summary && !admit(&mut windows, &job, config) {
+                        continue;
+                    }
+                    job
+                }
                 None => break,
             },
             Some(done) = work.join_next(), if !work.is_empty() => match done {
                 Ok(Next::Done) | Err(_) => continue,
+                Ok(Next::Retry(job)) if job.superseded(&resolved) => {
+                    drop_job(&job, DropReason::Resolved);
+                    continue;
+                }
                 Ok(Next::Retry(job)) => {
-                    let wait = ctx.config.retries[job.attempt - 1];
+                    let wait = config.retries[job.attempt - 1];
                     work.spawn(async move {
                         tokio::time::sleep(wait).await;
                         Next::Again(job)
                     });
                     continue;
                 }
+                Ok(Next::Again(job)) if job.superseded(&resolved) => {
+                    drop_job(&job, DropReason::Resolved);
+                    continue;
+                }
                 Ok(Next::Again(job)) => job,
             },
             _ = flush.tick() => {
-                for (target, n) in held_over(&mut windows, ctx.config.window, ctx.clock.now_ms()) {
-                    let job = Job { target, n: Arc::new(n), attempt: 0, summary: true };
-                    if let Some(old) = lanes.push(job, per_target, cap) {
-                        dropped(&ctx.book, ctx.clock.as_ref(), &old);
-                    }
+                let now = Instant::now();
+                for (old, why) in lanes.expire(now, config.max_age, &resolved) {
+                    drop_job(&old, why);
+                }
+                // 이보다 오래된 `FIRING`은 줄에서 이미 버린다.
+                resolved.retain(|_, at| now.duration_since(*at) < config.max_age);
+                for (target, n) in held_over(&mut windows, config.window, ctx.clock.now_ms()) {
+                    let job = Job::new(target, Arc::new(n), true);
+                    queue(&mut lanes, &mut windows, job, (per_target, per_lane, cap), &drop_job);
                 }
                 continue;
             }
         };
-        if let Some(old) = lanes.push(job, per_target, cap) {
-            dropped(&ctx.book, ctx.clock.as_ref(), &old);
-        }
+        queue(
+            &mut lanes,
+            &mut windows,
+            job,
+            (per_target, per_lane, cap),
+            &drop_job,
+        );
     }
     // 남은 보내기·기다림은 `work`를 버리며 끊는다.
+}
+
+/// 일을 줄에 세운다. 대상 줄이 넘쳐 접은 일은 "N건 더"로 세고, 줄 전체가 넘쳐 버린 일은 `dropped`로 기록한다.
+fn queue(
+    lanes: &mut Lanes,
+    windows: &mut HashMap<String, Window>,
+    job: Job,
+    (per_target, per_lane, cap): (usize, usize, usize),
+    drop_job: &impl Fn(&Job, DropReason),
+) {
+    match lanes.push(job, per_target, per_lane, cap) {
+        None => {}
+        Some(Overflow::Fold(old)) => hold(windows, &old),
+        Some(Overflow::Shed(old)) => drop_job(&old, DropReason::Full),
+    }
 }
 
 /// 대상의 분당 창에 넣을 수 있으면 센다. 넘으면 모아 둔다.
@@ -650,6 +810,20 @@ fn admit(windows: &mut HashMap<String, Window>, job: &Job, config: &SenderConfig
     w.held += 1;
     w.worst = w.worst.max(job.n.severity);
     false
+}
+
+/// 보내지 않고 모아 둔 것으로 센다(다음 "N건 더" 알림에 들어간다).
+fn hold(windows: &mut HashMap<String, Window>, job: &Job) {
+    let w = windows.entry(job.target.clone()).or_insert_with(|| Window {
+        start: Instant::now(),
+        sent: 0,
+        held: 0,
+        worst: Severity::Info,
+        cluster: String::new(),
+    });
+    w.cluster = job.n.cluster.clone();
+    w.held += 1;
+    w.worst = w.worst.max(job.n.severity);
 }
 
 /// 창이 끝난 대상 가운데 모아 둔 것이 있는 대상의 "N건 더" 알림. 그 창은 새로 시작한다.
@@ -960,12 +1134,7 @@ mod tests {
             ..SenderConfig::default()
         };
         let mut windows = HashMap::new();
-        let job = Job {
-            target: "ops".into(),
-            n: Arc::new(firing()),
-            attempt: 0,
-            summary: false,
-        };
+        let job = Job::new("ops".into(), Arc::new(firing()), false);
         assert!(admit(&mut windows, &job, &config));
         assert!(admit(&mut windows, &job, &config));
         assert!(!admit(&mut windows, &job, &config));
@@ -1135,21 +1304,29 @@ mod tests {
         cluster.shutdown().await.unwrap();
     }
 
+    fn job(target: &str, attempt: usize) -> Job {
+        Job {
+            attempt,
+            ..Job::new(target.into(), Arc::new(firing()), false)
+        }
+    }
+
+    fn shed(o: Option<Overflow>) -> Job {
+        match o {
+            Some(Overflow::Shed(j)) => j,
+            o => panic!("not shed: {o:?}"),
+        }
+    }
+
     /// 줄 전체가 상한을 넘으면 가장 긴 줄의 가장 오래된 일을 버린다.
     #[test]
     fn full_lanes_shed_the_oldest_job_of_the_longest_lane() {
-        let job = |target: &str, attempt: usize| Job {
-            target: target.into(),
-            n: Arc::new(firing()),
-            attempt,
-            summary: false,
-        };
         let mut lanes = Lanes::default();
         for k in 1..=3 {
-            assert!(lanes.push(job("slow", k), 1, 4).is_none());
+            assert!(lanes.push(job("slow", k), 1, 20, 4).is_none());
         }
-        assert!(lanes.push(job("mail", 1), 1, 4).is_none());
-        let shed = lanes.push(job("mail", 2), 1, 4).unwrap();
+        assert!(lanes.push(job("mail", 1), 1, 20, 4).is_none());
+        let shed = shed(lanes.push(job("mail", 2), 1, 20, 4));
         assert_eq!((shed.target.as_str(), shed.attempt), ("slow", 1));
         assert_eq!(lanes.waiting, 4);
         // 대상마다 하나씩만 꺼낸다.
@@ -1160,5 +1337,106 @@ mod tests {
         assert!(lanes.next(&permits).is_none());
         drop(a);
         assert!(lanes.next(&permits).is_some());
+    }
+
+    /// 한 대상의 줄은 분당 상한까지이고 넘친 것은 "N건 더"로 접는다. 처음 넣은 뒤 `max_age`가 지난 일은 줄에서
+    /// 버린다(리뷰 2 #2).
+    #[tokio::test(start_paused = true)]
+    async fn a_lane_holds_at_most_a_window_and_drops_stale_jobs() {
+        let mut lanes = Lanes::default();
+        for k in 0..3 {
+            assert!(lanes.push(job("slack", k), 1, 3, 1000).is_none());
+        }
+        // 요약은 세지 않는다.
+        let summary = Job::new("slack".into(), Arc::new(firing()), true);
+        assert!(lanes.push(summary, 1, 3, 1000).is_none());
+        match lanes.push(job("slack", 3), 1, 3, 1000) {
+            Some(Overflow::Fold(j)) => assert_eq!(j.attempt, 0),
+            o => panic!("not folded: {o:?}"),
+        }
+        assert_eq!(lanes.waiting, 4);
+        let mut windows = HashMap::new();
+        queue(
+            &mut lanes,
+            &mut windows,
+            job("slack", 4),
+            (1, 3, 1000),
+            &|_: &Job, _| panic!("dropped"),
+        );
+        assert_eq!(windows["slack"].held, 1);
+        let out = held_over(&mut windows, Duration::ZERO, 5);
+        assert!(
+            out[0].1.title().contains("1 more notifications"),
+            "{}",
+            out[0].1.title()
+        );
+
+        let max_age = Duration::from_secs(900);
+        tokio::time::advance(Duration::from_secs(600)).await;
+        assert!(lanes.push(job("mail", 0), 1, 3, 1000).is_none());
+        tokio::time::advance(Duration::from_secs(301)).await;
+        let old = lanes.expire(Instant::now(), max_age, &HashMap::new());
+        assert_eq!(old.len(), 4);
+        assert!(
+            old.iter()
+                .all(|(j, why)| j.target == "slack" && *why == DropReason::Stale)
+        );
+        assert_eq!(lanes.waiting, 1);
+        let permits = Arc::new(Semaphore::new(4));
+        assert_eq!(lanes.next(&permits).unwrap().0.target, "mail");
+    }
+
+    /// 몫이 빈 대상 둘이 번갈아 있어도 뒤쪽 줄이 차례를 얻는다(리뷰 2 #4).
+    #[test]
+    fn lanes_take_turns() {
+        let mut lanes = Lanes::default();
+        for t in ["a", "b", "c"] {
+            for k in 0..3 {
+                assert!(lanes.push(job(t, k), 1, 20, 100).is_none());
+            }
+        }
+        // 허가가 하나뿐이라 한 번에 하나씩 보낸다.
+        let permits = Arc::new(Semaphore::new(1));
+        let mut order = Vec::new();
+        for _ in 0..6 {
+            let (j, permit, slot) = lanes.next(&permits).unwrap();
+            order.push(j.target);
+            drop((permit, slot));
+        }
+        assert_eq!(order, ["a", "b", "c", "a", "b", "c"]);
+    }
+
+    /// 다시 하기를 기다리는 `FIRING`은 그 뒤에 받은 같은 경보·같은 대상의 `RESOLVED`가 있으면 버린다. 다른 대상,
+    /// 처음 보내는 것, `RESOLVED` 뒤에 다시 넣은 `FIRING`은 둔다(리뷰 2 #5).
+    #[tokio::test(start_paused = true)]
+    async fn a_resolved_alert_supersedes_pending_firing_retries() {
+        let retry = job("ops", 1);
+        let first = job("ops", 0);
+        let other = job("mail", 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let resolved_job = Job::new(
+            "ops".into(),
+            Arc::new(Notification {
+                state: NotificationState::Resolved,
+                ..firing()
+            }),
+            false,
+        );
+        let resolved = HashMap::from([(resolved_job.alert().unwrap(), resolved_job.born)]);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let later = job("ops", 1);
+        assert!(retry.superseded(&resolved));
+        assert!(!first.superseded(&resolved));
+        assert!(!other.superseded(&resolved));
+        assert!(!later.superseded(&resolved));
+        assert!(!resolved_job.superseded(&resolved));
+        let mut lanes = Lanes::default();
+        for j in [retry, first, other, later] {
+            assert!(lanes.push(j, 1, 20, 100).is_none());
+        }
+        let out = lanes.expire(Instant::now(), Duration::from_secs(900), &resolved);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, DropReason::Resolved);
+        assert_eq!(lanes.waiting, 3);
     }
 }

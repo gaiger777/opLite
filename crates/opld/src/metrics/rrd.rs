@@ -378,8 +378,10 @@ fn read_cells(
         let mut buf = vec![0u8; n * cell];
         src.read_at_exact(&mut buf, hdr.offsets[i] + slot(b, rows) * cell as u64)?;
         let at = (b - first) as usize * per;
-        for (k, chunk) in buf.chunks_exact(4).enumerate() {
-            out[at + k] = f32::from_le_bytes(chunk.try_into().unwrap());
+        // `chunks_exact(4)`는 새 clippy가 `as_chunks`를 권하고 옛 툴체인에는 `as_chunks`가 없어 인덱스로 돈다.
+        for k in 0..buf.len() / 4 {
+            let b: [u8; 4] = buf[k * 4..k * 4 + 4].try_into().unwrap();
+            out[at + k] = f32::from_le_bytes(b);
         }
     }
     Ok(out)

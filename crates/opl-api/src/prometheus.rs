@@ -34,9 +34,38 @@ pub(crate) const CONTENT_TYPE_TEXT: &str = "text/plain; version=0.0.4; charset=u
 const FRESH_MS: i64 = 15_000;
 const MIB: f64 = 1_048_576.0;
 
-/// 마지막으로 만든 답과 그 때
+/// 지금 캐시 칸과 그 칸을 연 때. 칸(`OnceCell`)은 TTL마다 새로 열고, 같은 칸을 기다리는 긁기는 한 번 만든 답을 함께
+/// 쓴다(리뷰 2 #10: 만료 뒤 몰린 긁기가 저마다 Raft 목록을 읽지 않게). 만들다 실패하거나 끊기면 다음 요청이 채운다.
 #[derive(Default)]
-pub(crate) struct PrometheusCache(std::sync::Mutex<Option<(Instant, Arc<str>)>>);
+pub(crate) struct PrometheusCache(std::sync::Mutex<Option<(Instant, PrometheusSlot)>>);
+
+type PrometheusSlot = Arc<tokio::sync::OnceCell<Arc<str>>>;
+
+impl PrometheusCache {
+    /// TTL 안의 답이나 `render`로 만든 답. 바깥 잠금은 칸을 찾을 때만 잡는다.
+    pub(crate) async fn get_or_render<F, Fut, E>(
+        &self,
+        now: Instant,
+        render: F,
+    ) -> Result<Arc<str>, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Arc<str>, E>>,
+    {
+        let slot = {
+            let mut cache = self.0.lock().unwrap();
+            match cache.as_ref() {
+                Some((at, slot)) if now.duration_since(*at) < PROMETHEUS_CACHE_TTL => slot.clone(),
+                _ => {
+                    let slot = PrometheusSlot::default();
+                    *cache = Some((now, slot.clone()));
+                    slot
+                }
+            }
+        };
+        slot.get_or_try_init(render).await.cloned()
+    }
+}
 
 /// 이 노드의 Prometheus 지표(텍스트 형식 0.0.4, gauge). 이 노드와 이 노드에서 잰 VM의 마지막 5초 점, 이 노드에서
 /// 준비된 풀, 클러스터 값(노드 수·VM 수·리더)이다. 노드마다 따로 긁는다. Node와 Vm 읽기 권한이 필요하고(viewer 토큰이면
@@ -59,23 +88,12 @@ pub async fn get_prometheus(
             "the Prometheus endpoint is turned off; turn it on in the settings (prometheus.enabled)",
         ));
     }
-    let now = Instant::now();
-    let cached = state
+    let text = state
         .prometheus_cache
-        .0
-        .lock()
-        .unwrap()
-        .as_ref()
-        .filter(|(at, _)| now.duration_since(*at) < PROMETHEUS_CACHE_TTL)
-        .map(|(_, text)| text.clone());
-    let text = match cached {
-        Some(text) => text,
-        None => {
-            let text: Arc<str> = render(&snapshot(&state)?).into();
-            *state.prometheus_cache.0.lock().unwrap() = Some((now, text.clone()));
-            text
-        }
-    };
+        .get_or_render(Instant::now(), || async {
+            Ok::<_, ApiError>(render(&snapshot(&state)?).into())
+        })
+        .await?;
     Ok(([(CONTENT_TYPE, CONTENT_TYPE_TEXT)], text.to_string()).into_response())
 }
 
@@ -591,5 +609,39 @@ orbivisor_vm_network_transmit_bytes_per_second{vm_id="00000000-0000-0000-0000-00
         // 경보 장부가 없는 노드(위트니스)는 경보 수를 내지 않는다.
         assert!(!text.contains("orbivisor_alerts_firing"));
         assert!(!text.contains("orbivisor_pool_"));
+    }
+
+    /// 만료 뒤 동시에 온 긁기는 한 번만 만들고 그 답을 함께 쓴다. TTL이 지나면 다시 만든다. 실패는 캐시하지 않는다
+    /// (리뷰 2 #10).
+    #[tokio::test]
+    async fn concurrent_scrapes_render_once_per_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = PrometheusCache::default();
+        let renders = AtomicUsize::new(0);
+        let render = || async {
+            renders.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok::<Arc<str>, ()>("text".into())
+        };
+        let now = Instant::now();
+        let (a, b, c) = tokio::join!(
+            cache.get_or_render(now, render),
+            cache.get_or_render(now, render),
+            cache.get_or_render(now + Duration::from_secs(1), render),
+        );
+        assert_eq!(
+            (&*a.unwrap(), &*b.unwrap(), &*c.unwrap()),
+            ("text", "text", "text")
+        );
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+        let later = now + PROMETHEUS_CACHE_TTL;
+        assert!(
+            cache
+                .get_or_render(later, || async { Err::<Arc<str>, _>(()) })
+                .await
+                .is_err()
+        );
+        cache.get_or_render(later, render).await.unwrap();
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
     }
 }

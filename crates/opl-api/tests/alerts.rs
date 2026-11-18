@@ -56,6 +56,18 @@ struct Hook {
     fail: Arc<AtomicUsize>,
 }
 
+/// 0보다 크면 하나 줄이고 true다(`fetch_update`는 새 툴체인에서 deprecated이고 `try_update`는 옛 툴체인에 없다).
+fn take_one(n: &AtomicUsize) -> bool {
+    let mut cur = n.load(Ordering::SeqCst);
+    while cur > 0 {
+        match n.compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
 impl Hook {
     async fn start() -> Self {
         let hits: Arc<Mutex<Vec<Hit>>> = Arc::default();
@@ -64,9 +76,7 @@ impl Hook {
         let app = axum::Router::new().fallback(move |uri: Uri, headers: HeaderMap, body: Bytes| {
             let (h, f) = (h.clone(), f.clone());
             async move {
-                if f.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-                    .is_ok()
-                {
+                if take_one(&f) {
                     return AxumStatus::INTERNAL_SERVER_ERROR;
                 }
                 h.lock().unwrap().push(Hit {

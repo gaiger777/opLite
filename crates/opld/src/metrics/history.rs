@@ -5,7 +5,7 @@
 //! 파일은 `{data_dir}/metrics`(`node.rrd`, `vm/{id}.rrd`, `pool/{id}.rrd`)에 있고 핸들은 연 채 둔다. 파일 IO는 막히는
 //! 호출이므로 비동기 쪽([`HistoryWriter`], 노드 간 서버)은 `spawn_blocking`에서 부른다.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -61,8 +61,9 @@ const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PUSH_DEADLINE: Duration = Duration::from_secs(120);
 /// 동시에 밀어 넘기는 수
 const PUSH_CONCURRENCY: usize = 8;
-/// 받는 쪽이 `Invalid`로 거절한 VM 기록을 다시 보내기까지 처음 기다리는 시간. 거절할 때마다 두 배로 늘려 하루까지
-/// 기다린다(옛 RRD 형식의 노드처럼 받을 수 없는 쪽에 376 KiB를 10분마다 보내지 않게).
+/// 받는 쪽이 `Invalid`(받을 수 없는 파일)나 `Disabled`(기록을 끔)로 거절한 VM 기록을 다시 보내기까지 처음 기다리는
+/// 시간. 거절할 때마다 두 배로 늘려 하루까지 기다린다(옛 RRD 형식의 노드나 기록을 끈 노드에 336 KiB를 10분마다 보내지
+/// 않게). 기록을 끈 노드가 나중에 켜면 늦어도 하루 안에 넘어간다.
 const REFUSED_BACKOFF: Duration = SCAN_INTERVAL;
 const MAX_REFUSED_BACKOFF: Duration = Duration::from_secs(86_400);
 /// 옆으로 옮긴 파일(`.corrupt`·`.vN`)과 남은 임시 파일(`.tmp`)을 지우는 나이
@@ -71,6 +72,9 @@ pub const ASIDE_KEEP: Duration = Duration::from_secs(30 * 86_400);
 const SWEEP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// 기록은 주기 경계보다 이만큼 뒤에 한다(경계 바로 앞에 잰 점이 저장소에 들어오게).
 const FLUSH_DELAY_MS: i64 = 1_000;
+/// 같은 종류의 파일 오류(열기·쓰기·닫기·sync·commit)를 다시 경고하기까지(그 사이는 debug, 디스크가 차면 VM 파일마다
+/// 분마다 경고해 같은 디스크의 로그를 채우지 않게)
+const FAILURE_WARN_EVERY_MS: i64 = 600_000;
 
 /// 기록 시리즈 하나
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +131,24 @@ impl PoolLevels {
     }
 }
 
+/// 한 번 기록하는 동안의 파일 오류: 종류마다 (수, 첫 오류)
+#[derive(Debug, Default)]
+struct Failures(BTreeMap<&'static str, (usize, String)>);
+
+impl Failures {
+    fn note(&mut self, what: &'static str, key: Key, e: &dyn std::fmt::Display) {
+        let entry = self
+            .0
+            .entry(what)
+            .or_insert_with(|| (0, format!("{key:?}: {e}")));
+        entry.0 += 1;
+    }
+
+    fn count(&self) -> usize {
+        self.0.values().map(|(n, _)| n).sum()
+    }
+}
+
 /// 이 노드의 기록 파일들. 기록을 끄면(`dir`이 없음) 파일 없이 메모리 저장소의 1시간만으로 조회에 답한다.
 pub struct History {
     dir: Option<PathBuf>,
@@ -135,6 +157,9 @@ pub struct History {
     /// `Digest`의 상위 VM에서 주인이 이 노드인 VM만 두려고 본다(없으면 거르지 않음).
     owner: Option<(Uuid, Arc<Cluster>)>,
     open: Mutex<Open>,
+    /// 파일 열기(만들기)를 한 번에 하나만 한다. `open`은 그동안 잡지 않는다(만들기가 느려도 열린 파일 읽기를 막지
+    /// 않게).
+    opening: Mutex<()>,
     max_open: usize,
     /// 기록 쓰기가 저장소에서 마지막으로 가져간 자리
     marks: Mutex<Marks>,
@@ -142,6 +167,8 @@ pub struct History {
     last_flush: Mutex<Option<i64>>,
     /// 시계가 조금 뒤로 가 쓰지 못한다고 경고한 시리즈(한 번만 경고한다)
     behind: Mutex<HashSet<Key>>,
+    /// 파일 오류 종류마다 마지막으로 경고한 때
+    warned: Mutex<HashMap<&'static str, i64>>,
 }
 
 /// 기록 파일의 `Raw5s` 칸을 점으로: (칸 시작 시각, 칸 값들). 모든 칸을 모르는 칸은 뺀다.
@@ -253,10 +280,12 @@ impl History {
             clock,
             owner: None,
             open: Mutex::default(),
+            opening: Mutex::default(),
             max_open: MAX_OPEN,
             marks: Mutex::default(),
             last_flush: Mutex::default(),
             behind: Mutex::default(),
+            warned: Mutex::default(),
         };
         history.restore();
         history
@@ -314,17 +343,29 @@ impl History {
         }
     }
 
-    /// 열린 핸들을 주거나 파일을 연다. `create`가 아니면 없는 파일은 `None`이다.
+    /// 열린 핸들(쓴 차례를 새로 함)
+    fn opened(&self, key: Key) -> Option<Handle> {
+        let mut open = self.open.lock().unwrap();
+        open.tick += 1;
+        let tick = open.tick;
+        let entry = open.files.get_mut(&key)?;
+        entry.used = tick;
+        Some(entry.rrd.clone())
+    }
+
+    /// 열린 핸들을 주거나 파일을 연다. `create`가 아니면 없는 파일은 `None`이다. 파일을 여는(만드는) 동안은 열린
+    /// 목록을 잡지 않는다(리뷰 2 #6).
     fn handle(&self, key: Key, create: bool) -> io::Result<Option<Handle>> {
         let Some(dir) = &self.dir else {
             return Ok(None);
         };
-        let mut open = self.open.lock().unwrap();
-        open.tick += 1;
-        let tick = open.tick;
-        if let Some(entry) = open.files.get_mut(&key) {
-            entry.used = tick;
-            return Ok(Some(entry.rrd.clone()));
+        if let Some(h) = self.opened(key) {
+            return Ok(Some(h));
+        }
+        let _opening = self.opening.lock().unwrap();
+        // 기다리는 사이 다른 쪽이 열었을 수 있다.
+        if let Some(h) = self.opened(key) {
+            return Ok(Some(h));
         }
         let path = key.path(dir);
         if !create && !path.exists() {
@@ -346,6 +387,9 @@ impl History {
                 tracing::warn!(file = %path.display(), version, moved_to = %moved_to.display(), "a metrics history file is from a newer version; starting it over");
             }
         }
+        let mut open = self.open.lock().unwrap();
+        open.tick += 1;
+        let tick = open.tick;
         if open.files.len() >= self.max_open
             && let Some(oldest) = (open.files.iter())
                 .filter(|(k, _)| **k != Key::Node)
@@ -392,20 +436,22 @@ impl History {
 
     /// 한 번 기록한다: 저장소에서 앞서 가져간 뒤의 점을 노드·VM 파일에, `pools`(풀 id → 전체·남은 바이트)를 지난 기록
     /// 뒤 5초 칸마다 풀 파일에 쓰고, 끝난 거친 층 칸을 닫은 뒤 모든 파일을 `fdatasync` → 머리 commit 한다(설계 §5
-    /// 순서). 파일 하나가 실패해도 나머지는 쓴다. 막히는 호출이다.
-    pub fn flush(&self, pools: &HashMap<Uuid, (u64, u64)>) {
+    /// 순서). 파일 하나가 실패해도 나머지는 쓴다. 파일 오류는 종류마다 한 줄로 모아 10분에 한 번까지 경고하고, 그
+    /// 수를 돌려준다. 막히는 호출이다.
+    pub fn flush(&self, pools: &HashMap<Uuid, (u64, u64)>) -> usize {
         if self.dir.is_none() {
-            return;
+            return 0;
         }
+        let mut failures = Failures::default();
         let now = self.clock.now_ms();
         let pending = self.store.take_pending(&mut self.marks.lock().unwrap());
         let node: Vec<_> = (pending.node.iter())
             .map(|s| (s.t, s.values().to_vec()))
             .collect();
-        self.append(Key::Node, &node);
+        self.append(Key::Node, &node, &mut failures);
         for (id, samples) in &pending.vms {
             let points: Vec<_> = samples.iter().map(|s| (s.t, s.values().to_vec())).collect();
-            self.append(Key::Vm(*id), &points);
+            self.append(Key::Vm(*id), &points, &mut failures);
         }
         // 풀은 5초마다 재지 않으므로 지난 기록 뒤의 칸마다 지금 값을 쓴다(처음은 지금 칸 하나).
         let step = Tier::Raw5s.step_ms();
@@ -427,7 +473,7 @@ impl History {
             let points: Vec<_> = (from_b..=now_b)
                 .map(|b| (b * step, values.clone()))
                 .collect();
-            self.append(Key::Pool(*id), &points);
+            self.append(Key::Pool(*id), &points, &mut failures);
         }
         let handles: Vec<(Key, Handle)> = {
             let open = self.open.lock().unwrap();
@@ -441,7 +487,7 @@ impl History {
             if let Some(until) = close_until(&rrd, now)
                 && let Err(e) = rrd.close(until)
             {
-                tracing::warn!(series = ?key, error = %e, "cannot close metrics history buckets");
+                failures.note("close", key, &e);
             }
             if rrd.is_dirty() {
                 drop(rrd);
@@ -453,30 +499,70 @@ impl History {
             let r = handle.lock().unwrap().sync_data();
             match r {
                 Ok(()) => synced.push((key, handle)),
-                Err(e) => tracing::warn!(series = ?key, error = %e, "cannot sync metrics history"),
+                Err(e) => failures.note("sync", key, &e),
             }
         }
         for (key, handle) in synced {
             if let Err(e) = handle.lock().unwrap().commit() {
-                tracing::warn!(series = ?key, error = %e, "cannot commit metrics history");
+                failures.note("commit", key, &e);
             }
         }
+        self.report(&failures, now);
+        failures.count()
     }
 
-    /// 점들을 시각 순으로 그 시리즈 파일에 쓴다(데이터만). 시계가 조금 뒤로 가 쓰지 못하면 한 번만 경고한다.
-    fn append(&self, key: Key, points: &[(i64, Vec<Option<f32>>)]) {
+    /// 파일 오류를 종류마다 한 줄로 경고한다. 같은 종류는 [`FAILURE_WARN_EVERY_MS`]에 한 번까지이고 그 사이는 debug다.
+    /// 경고한 종류 수를 돌려준다.
+    fn report(&self, failures: &Failures, now: i64) -> usize {
+        let mut warned = self.warned.lock().unwrap();
+        let mut n = 0;
+        for (what, (count, first)) in &failures.0 {
+            let due = warned
+                .get(what)
+                .is_none_or(|at| now - at >= FAILURE_WARN_EVERY_MS || now < *at);
+            if due {
+                warned.insert(what, now);
+                n += 1;
+                tracing::warn!(op = what, files = count, first = %first, "metrics history file operations failed (repeats are logged at debug for 10 minutes)");
+            } else {
+                tracing::debug!(op = what, files = count, first = %first, "metrics history file operations failed");
+            }
+        }
+        n
+    }
+
+    /// 점들을 시각 순으로 그 시리즈 파일에 쓴다(데이터만). 시계가 조금 뒤로 가 쓰지 못하면 한 번만 경고한다. 밀어
+    /// 넘긴 뒤 지운 핸들을 잡았으면 새 파일에 쓴다(지운 파일에 쓰면 잃는다).
+    fn append(&self, key: Key, points: &[(i64, Vec<Option<f32>>)], failures: &mut Failures) {
         if points.is_empty() {
             return;
         }
-        let handle = match self.handle(key, true) {
-            Ok(Some(h)) => h,
-            Ok(None) => return,
-            Err(e) => {
-                tracing::warn!(series = ?key, error = %e, "cannot open metrics history");
-                return;
+        for _ in 0..2 {
+            let handle = match self.handle(key, true) {
+                Ok(Some(h)) => h,
+                Ok(None) => return,
+                Err(e) => {
+                    failures.note("open", key, &e);
+                    return;
+                }
+            };
+            let mut rrd = handle.lock().unwrap();
+            if rrd.is_removed() {
+                continue;
             }
-        };
-        let mut rrd = handle.lock().unwrap();
+            self.write_points(key, &mut rrd, points, failures);
+            return;
+        }
+        failures.note("open", key, &"the file was removed while writing");
+    }
+
+    fn write_points(
+        &self,
+        key: Key,
+        rrd: &mut Rrd,
+        points: &[(i64, Vec<Option<f32>>)],
+        failures: &mut Failures,
+    ) {
         for (t, values) in points {
             match rrd.append(*t, values) {
                 Ok(Append::Written) => {
@@ -492,7 +578,7 @@ impl History {
                     tracing::warn!(file = %rrd.path().display(), t, "the clock went back more than an hour; dropped later metrics history");
                 }
                 Err(e) => {
-                    tracing::warn!(file = %rrd.path().display(), error = %e, "cannot write metrics history");
+                    failures.note("write", key, &e);
                     return;
                 }
             }
@@ -663,6 +749,11 @@ impl History {
         Ok(Some((rrd.to_bytes()?, rrd.seq())))
     }
 
+    /// VM에 아직 기록 파일에 쓰지 않은 저장소 점이 있는지(있으면 밀어 넘겨도 다음 기록이 파일을 다시 만든다)
+    fn vm_pending(&self, vm: Uuid) -> bool {
+        self.store.vm_pending(vm, &self.marks.lock().unwrap())
+    }
+
     /// 밀어 넘긴 VM 파일을 읽은 뒤 바뀌지 않았으면(쓰지 않은 것이 없고 머리 차례 `seq`가 같으면) 닫고 지운다.
     /// 그사이 다른 노드가 합쳐 넣었거나 새 점을 썼으면 두고 false다. 막히는 호출이다.
     fn remove_pushed(&self, vm: Uuid, seq: u64) -> io::Result<bool> {
@@ -747,6 +838,8 @@ impl History {
         let Some(dir) = &self.dir else {
             return Ok(());
         };
+        // 지우는 동안 다른 쪽이 같은 파일을 열어 지운 파일의 핸들을 목록에 두지 않게 한다.
+        let _opening = self.opening.lock().unwrap();
         self.open.lock().unwrap().files.remove(&key);
         match std::fs::remove_file(key.path(dir)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -946,6 +1039,28 @@ async fn vm_changed(watch: &mut Option<Watch>, history: &History) -> bool {
     }
 }
 
+/// 밀어 넘길 (주인 노드, VM)을 주인마다 돌아가며 늘어놓는다(리뷰 2 #8: 답하지 않는 노드의 VM이 앞에 몰려 한 차례
+/// 기한을 다 쓰고 다른 노드의 VM이 늘 남지 않게). 주인 순서는 처음 나온 순서, 한 주인 안은 받은 순서다.
+fn by_owner(pushes: Vec<(Uuid, Uuid)>) -> Vec<(Uuid, Uuid)> {
+    let mut owners: Vec<(Uuid, std::collections::VecDeque<Uuid>)> = Vec::new();
+    for (owner, vm) in pushes {
+        match owners.iter_mut().find(|(o, _)| *o == owner) {
+            Some((_, vms)) => vms.push_back(vm),
+            None => owners.push((owner, [vm].into())),
+        }
+    }
+    let mut out = Vec::new();
+    while !owners.is_empty() {
+        owners.retain_mut(|(owner, vms)| {
+            if let Some(vm) = vms.pop_front() {
+                out.push((*owner, vm));
+            }
+            !vms.is_empty()
+        });
+    }
+    out
+}
+
 /// 앞 정리 차례에 지울 후보였던 파일(두 차례 연속 후보여야 지운다)
 #[derive(Debug, Default)]
 struct Seen {
@@ -958,7 +1073,7 @@ struct Scanner {
     cluster: Arc<Cluster>,
     pusher: Arc<dyn HistoryPusher>,
     seen: Seen,
-    /// 받는 쪽이 `Invalid`로 거절한 VM: (연속 거절 수, 다시 보낼 수 있는 때)
+    /// 받는 쪽이 `Invalid`나 `Disabled`로 거절한 VM: (연속 거절 수, 다시 보낼 수 있는 때)
     refused: Mutex<HashMap<Uuid, (u32, tokio::time::Instant)>>,
     /// 한 차례의 밀어 넘기기를 모두 기다리는 시간
     push_deadline: Duration,
@@ -1024,7 +1139,12 @@ impl Scanner {
         let mut pushes = Vec::new();
         let clock = tokio::time::Instant::now();
         for id in vm_files {
-            if busy(id) || (self.history.store.last_vm_t(id)).is_some_and(|t| now - t < BUSY_MS) {
+            // 아직 재는 중이거나 기록하지 않은 점이 있으면 다음 차례에 본다(리뷰 2 #3: 밀어 넘긴 뒤 다음 기록이 파일을
+            // 다시 만들지 않게).
+            if busy(id)
+                || (self.history.store.last_vm_t(id)).is_some_and(|t| now - t < BUSY_MS)
+                || self.history.vm_pending(id)
+            {
                 continue;
             }
             let Some(vm) = vms.iter().find(|vm| vm.id == id) else {
@@ -1064,7 +1184,7 @@ impl Scanner {
             .unwrap()
             .retain(|id, _| vms.iter().any(|vm| vm.id == *id));
         let this = &*self;
-        let all = futures_util::stream::iter(pushes)
+        let all = futures_util::stream::iter(by_owner(pushes))
             .for_each_concurrent(PUSH_CONCURRENCY, |(owner, id)| this.push(owner, id));
         if tokio::time::timeout(self.push_deadline, all).await.is_err() {
             tracing::info!(
@@ -1085,7 +1205,10 @@ impl Scanner {
             }
         };
         let result = self.pusher.push(owner, vm, bytes).await;
-        if !matches!(result, Err(HistoryError::Invalid(_))) {
+        if !matches!(
+            result,
+            Err(HistoryError::Invalid(_) | HistoryError::Disabled)
+        ) {
             self.refused.lock().unwrap().remove(&vm);
         }
         match result {
@@ -1105,19 +1228,24 @@ impl Scanner {
                     Err(_) => {}
                 }
             }
-            // 옛 노드이거나 기록을 끈 노드: 파일을 두고 다음 차례에 다시 본다.
-            Err(e @ (HistoryError::Unsupported | HistoryError::Disabled)) => {
+            // 옛 노드: 파일을 두고 다음 차례에 다시 본다(기록을 알리는 노드에만 보내므로 드물다).
+            Err(e @ HistoryError::Unsupported) => {
                 tracing::debug!(vm = %vm, node = %owner, error = %e, "the VM's node does not take metrics history; keeping it");
             }
-            // 받는 쪽이 이 파일을 받을 수 없다(옛 형식 등): 거절할 때마다 두 배로 늦춰 다시 본다.
-            Err(e @ HistoryError::Invalid(_)) => {
+            // 받는 쪽이 이 파일을 받을 수 없거나(옛 형식 등) 기록을 껐다: 파일은 두고(나중에 켜면 넘어가게) 거절할
+            // 때마다 두 배로 늦춰 다시 본다(리뷰 2 #1).
+            Err(e @ (HistoryError::Invalid(_) | HistoryError::Disabled)) => {
                 let mut refused = self.refused.lock().unwrap();
                 let n = refused.get(&vm).map_or(0, |(n, _)| *n).saturating_add(1);
                 let wait = REFUSED_BACKOFF
                     .saturating_mul(1 << (n - 1).min(16))
                     .min(MAX_REFUSED_BACKOFF);
                 refused.insert(vm, (n, tokio::time::Instant::now() + wait));
-                tracing::warn!(vm = %vm, node = %owner, error = %e, retry_in_secs = wait.as_secs(), "the VM's node refused its metrics history; keeping it");
+                if e == HistoryError::Disabled {
+                    tracing::info!(vm = %vm, node = %owner, retry_in_secs = wait.as_secs(), "the VM's node has metrics history turned off; keeping it");
+                } else {
+                    tracing::warn!(vm = %vm, node = %owner, error = %e, retry_in_secs = wait.as_secs(), "the VM's node refused its metrics history; keeping it");
+                }
             }
             Err(e) => {
                 tracing::warn!(vm = %vm, node = %owner, error = %e, "cannot push metrics history; will retry");
@@ -1579,6 +1707,8 @@ mod tests {
         invalid: Option<Uuid>,
         /// 이 노드는 답하지 않는다.
         hung: Option<Uuid>,
+        /// 이 노드는 기록을 꺼 `Disabled`로 거절한다.
+        disabled: Option<Uuid>,
     }
 
     #[async_trait]
@@ -1594,6 +1724,9 @@ mod tests {
             }
             if self.hung == Some(node) {
                 return std::future::pending().await;
+            }
+            if self.disabled == Some(node) {
+                return Err(HistoryError::Disabled);
             }
             self.pushed.lock().unwrap().push((node, vm));
             Ok(())
@@ -1941,5 +2074,128 @@ mod tests {
         assert_eq!(f.history.sweep_aside(ASIDE_KEEP), gone.len());
         assert!(gone.iter().all(|p| !p.exists()));
         assert!(kept.iter().all(|p| p.exists()));
+    }
+
+    /// 기록을 끈 노드로 옮긴 VM은 거절(`Disabled`)될 때마다 늦춰 다시 보내고 파일은 둔다(리뷰 2 #1).
+    #[tokio::test]
+    async fn a_node_with_history_off_backs_off_and_keeps_the_file() {
+        let f = Fx::new();
+        let (cluster, _) = single_node(&f.dir.path().join("cluster")).await;
+        let cluster = Arc::new(cluster);
+        let sd = add_node(&cluster, "sd", &[METRICS_HISTORY]).await;
+        let vm = add_vm(&cluster, "web", Some(sd)).await;
+        f.history.handle(Key::Vm(vm), true).unwrap().unwrap();
+        let pusher = Arc::new(FakePusher {
+            disabled: Some(sd),
+            ..Default::default()
+        });
+        let history = Arc::new(f.history);
+        let mut scanner = Scanner::new(history.clone(), cluster.clone(), pusher.clone());
+        scanner.scan().await;
+        scanner.scan().await;
+        assert_eq!(
+            pusher.tried.lock().unwrap().len(),
+            1,
+            "pushed again at once"
+        );
+        assert!(rrd::vm_path(&history.dir.clone().unwrap(), vm).exists());
+        let (n, at) = scanner.refused.lock().unwrap()[&vm];
+        assert_eq!(n, 1);
+        assert!(at > tokio::time::Instant::now() + REFUSED_BACKOFF - Duration::from_secs(5));
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 기록하지 않은 점이 남은 VM은 밀어 넘기지 않고, 기록한 뒤에 밀어 넘긴다(리뷰 2 #3).
+    #[tokio::test]
+    async fn vms_with_unflushed_points_are_pushed_after_the_flush() {
+        let f = Fx::new();
+        let (cluster, _) = single_node(&f.dir.path().join("cluster")).await;
+        let cluster = Arc::new(cluster);
+        let new = add_node(&cluster, "new", &[METRICS_HISTORY]).await;
+        let vm = add_vm(&cluster, "web", Some(new)).await;
+        f.store.push_vm(vm, vm_at(T0, 1.0));
+        f.history.flush(&HashMap::new());
+        // 떠나기 바로 전의 점(BUSY_MS보다 오래됐지만 아직 파일에 쓰지 않음)
+        f.store.push_vm(vm, vm_at(T0 + 5_000, 2.0));
+        f.clock.set(T0 + 5_000 + BUSY_MS + 1);
+        let pusher = Arc::new(FakePusher::default());
+        let history = Arc::new(f.history);
+        let mut scanner = Scanner::new(history.clone(), cluster.clone(), pusher.clone());
+        scanner.scan().await;
+        assert!(pusher.tried.lock().unwrap().is_empty());
+        history.flush(&HashMap::new());
+        scanner.scan().await;
+        assert_eq!(*pusher.pushed.lock().unwrap(), [(new, vm)]);
+        assert!(!rrd::vm_path(&history.dir.clone().unwrap(), vm).exists());
+        // 그 뒤의 기록은 파일을 다시 만들지 않는다.
+        history.flush(&HashMap::new());
+        assert!(!rrd::vm_path(&history.dir.clone().unwrap(), vm).exists());
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 파일을 여는(만드는) 동안에도 열린 파일은 바로 준다(리뷰 2 #6).
+    #[test]
+    fn open_files_are_served_while_another_file_is_being_created() {
+        let f = Fx::new();
+        f.push(1, None);
+        f.history.flush(&HashMap::new());
+        let history = Arc::new(f.history);
+        let creating = history.opening.lock().unwrap();
+        let h = history.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(h.handle(Key::Node, false).unwrap().is_some()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)), Ok(true));
+        drop(creating);
+    }
+
+    /// 파일 오류는 종류마다 모아 10분에 한 번까지만 경고한다(리뷰 2 #7).
+    #[test]
+    fn file_failures_are_summarized_and_rate_limited() {
+        let f = Fx::new();
+        // `vm`이 파일이라 VM 파일을 만들 수 없다(디스크가 찬 것처럼 모든 VM 파일이 실패).
+        std::fs::write(f.metrics_dir().join("vm"), b"").unwrap();
+        let vms: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        for vm in &vms {
+            f.store.push_vm(*vm, vm_at(T0, 1.0));
+        }
+        assert_eq!(f.history.flush(&HashMap::new()), 3);
+        assert!(f.history.warned.lock().unwrap().contains_key("open"));
+        let mut failures = Failures::default();
+        failures.note("open", Key::Vm(vms[0]), &"no space left on device");
+        failures.note("sync", Key::Node, &"no space left on device");
+        // "open"은 방금 경고했으므로 "sync"만
+        assert_eq!(f.history.report(&failures, T0 + 60_000), 1);
+        assert_eq!(f.history.report(&failures, T0 + 120_000), 0);
+        assert_eq!(
+            f.history
+                .report(&failures, T0 + 60_000 + FAILURE_WARN_EVERY_MS),
+            2
+        );
+    }
+
+    /// 밀어 넘기기는 주인 노드마다 돌아가며 한다(리뷰 2 #8).
+    #[test]
+    fn pushes_are_interleaved_by_owner() {
+        let (a, b, c) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let vm = Uuid::from_u128;
+        let pushes = vec![
+            (a, vm(10)),
+            (a, vm(11)),
+            (a, vm(12)),
+            (b, vm(20)),
+            (c, vm(30)),
+            (b, vm(21)),
+        ];
+        assert_eq!(
+            by_owner(pushes),
+            [
+                (a, vm(10)),
+                (b, vm(20)),
+                (c, vm(30)),
+                (a, vm(11)),
+                (b, vm(21)),
+                (a, vm(12)),
+            ]
+        );
     }
 }

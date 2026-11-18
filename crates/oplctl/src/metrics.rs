@@ -36,17 +36,35 @@ impl RangeArgs {
         self.range.is_some() || self.from.is_some() || self.points.is_some()
     }
 
-    /// API 질의(`range`·`from`·`until`·`points`). 시각은 유닉스 밀리초로 바꿔 보낸다.
+    /// API 질의(`range`·`from`·`until`·`points`). 시각은 유닉스 밀리초로 바꿔 보낸다. `--until` 없는 `--from`이
+    /// 기간이면 서버 시계로 세도록 같은 길이의 `range`(`1h`·`1d`·`7d`·`30d`·`365d`)로 보내고, 그 밖의 기간이면 `until`도
+    /// 이 시계로 보내 범위 길이가 두 시계의 차이로 바뀌지 않게 한다.
     pub fn query(&self, now_ms: i64) -> anyhow::Result<Vec<(&'static str, String)>> {
         let mut q = Vec::new();
-        if let Some(range) = self.range {
-            q.push(("range", HistoryRange::from(range).as_str().to_string()));
-        }
-        if let Some(from) = &self.from {
-            q.push(("from", time_ms(from, now_ms)?.to_string()));
-        }
-        if let Some(until) = &self.until {
-            q.push(("until", time_ms(until, now_ms)?.to_string()));
+        let relative = (self.from.as_deref())
+            .filter(|_| self.until.is_none())
+            .and_then(duration_ms);
+        let range = self.range.map(HistoryRange::from).or_else(|| {
+            let ranges = [
+                HistoryRange::Hour,
+                HistoryRange::Day,
+                HistoryRange::Week,
+                HistoryRange::Month,
+                HistoryRange::Year,
+            ];
+            ranges.into_iter().find(|r| Some(r.ms()) == relative)
+        });
+        if let Some(range) = range {
+            q.push(("range", range.as_str().to_string()));
+        } else {
+            if let Some(from) = &self.from {
+                q.push(("from", time_ms(from, now_ms)?.to_string()));
+            }
+            match &self.until {
+                Some(until) => q.push(("until", time_ms(until, now_ms)?.to_string())),
+                None if relative.is_some() => q.push(("until", now_ms.to_string())),
+                None => {}
+            }
         }
         if let Some(points) = self.points {
             q.push(("points", points.to_string()));
@@ -85,7 +103,7 @@ pub(crate) fn now_ms() -> i64 {
         .map_or(0, |d| d.as_millis() as i64)
 }
 
-/// `30s`·`5m`·`2h`·`7d` 같은 기간의 밀리초. 단위가 없으면 None
+/// `30s`·`5m`·`2h`·`7d` 같은 기간의 밀리초. 단위가 없거나 수가 숫자만이 아니면(`-2h`·`+2h`) None
 pub(crate) fn duration_ms(s: &str) -> Option<i64> {
     let unit = match s.chars().last()? {
         's' => 1_000,
@@ -94,8 +112,11 @@ pub(crate) fn duration_ms(s: &str) -> Option<i64> {
         'd' => 86_400_000,
         _ => return None,
     };
-    let n = s[..s.len() - 1].parse::<i64>().ok()?;
-    n.checked_mul(unit)
+    let digits = &s[..s.len() - 1];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<i64>().ok()?.checked_mul(unit)
 }
 
 /// 시각 인자: 기간(지금에서 뺌), 유닉스 밀리초, RFC 3339
@@ -529,6 +550,11 @@ mod tests {
         assert!(time_ms("yesterday", now).is_err());
         assert_eq!(duration_ms("5m"), Some(300_000));
         assert_eq!(duration_ms("5"), None);
+        // 앞의 부호는 기간이 아니다(`-2h`가 지금 + 2시간이 되지 않게, 리뷰 2 #9).
+        assert_eq!(duration_ms("-2h"), None);
+        assert_eq!(duration_ms("+2h"), None);
+        assert_eq!(duration_ms("h"), None);
+        assert!(time_ms("-2h", now).is_err());
     }
 
     /// 범위 인자는 API 질의가 된다.
@@ -557,6 +583,24 @@ mod tests {
             ]
         );
         assert!(!RangeArgs::default().given());
+        // `--until` 없는 기간은 같은 길이의 `range`로(서버 시계), 아니면 `until`도 이 시계로 보낸다(리뷰 2 #9).
+        let from = |f: &str| RangeArgs {
+            from: Some(f.into()),
+            ..Default::default()
+        };
+        assert_eq!(from("24h").query(now).unwrap(), [("range", "day".into())]);
+        assert_eq!(from("7d").query(now).unwrap(), [("range", "week".into())]);
+        assert_eq!(
+            from("2h").query(now).unwrap(),
+            [
+                ("from", (now - 7_200_000).to_string()),
+                ("until", now.to_string())
+            ]
+        );
+        assert_eq!(
+            from("1700000000000").query(now).unwrap(),
+            [("from", "1700000000000".to_string())]
+        );
     }
 
     /// 기록 요약은 경로에 범위 질의를 붙여 부르고, `-o json`은 응답 그대로다.

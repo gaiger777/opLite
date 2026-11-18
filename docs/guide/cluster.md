@@ -728,6 +728,8 @@ flush_secs = 60   # 파일에 옮기는 주기(60~600초). 전원이 나가면 �
   1.7 GB, 해마다 약 0.6 TB로 보통 SSD(수백 TBW)에는 작고, 파일 크기가 바뀌지 않아 파일 시스템 저널 쓰기는 거의 없다.
   **SD 카드·USB 메모리로 부팅한 노드**는 `flush_secs = 600`(쓰기 약 1/8, 대가로 전원이 나가면 10분을 잃음)이나
   `history = false`를 쓴다. `data_dir`을 SSD에 두면 걱정할 일이 없다.
+- **기록을 끈 노드로 옮긴 VM.** 옮기기 전 노드는 그 VM 파일을 지우지 않고 두며, 받는 쪽이 거절할 때마다 10분부터 하루까지
+  두 배로 늦춰 다시 보낸다. 나중에 그 노드에서 기록을 켜면 늦어도 하루 안에 넘어간다.
 
 ### 기록 조회
 
@@ -740,13 +742,14 @@ orbivisorctl node stats node1 --range day     # 노드 하나의 하루 요약(-
 # ...
 orbivisorctl vm stats web --range week        # VM(주인 노드에 묻는다)
 orbivisorctl pool stats nas --range month     # 풀(그 풀이 준비된 노드 하나에 묻는다)
-orbivisorctl vm stats web --from 2h           # 지금부터 2시간 전까지. --from·--until은 2h·7d, 유닉스 ms, RFC 3339
+orbivisorctl vm stats web --from 2h           # 2시간 전부터 지금까지. --from·--until은 2h·7d, 유닉스 ms, RFC 3339
 orbivisorctl vm stats web --from 2026-11-18T01:00:00Z --until 2026-11-18T03:00:00Z --points 120
 orbivisorctl -o json node stats node1 --range year   # 응답 그대로(열 배열)
 ```
 
 - **범위.** `--range hour|day|week|month|year`(1개월은 30일, 1년은 365일, 지금에서 끝남)이거나 `--from`(+`--until`, 없으면
-  지금)이다. 범위는 366일까지, `--points`는 1~1000(기본 300)이다. 범위를 주지 않은 `vm stats`·`node stats`(노드 없이)는
+  지금)이다. `--until` 없는 `--from 1h|24h|1d|7d|30d|365d`는 같은 길이의 `--range`로 보내 서버 시계로 세고, 그 밖의 기간은
+  `--until`도 CLI 시계의 지금으로 보낸다(두 시계가 달라도 범위 길이는 그대로). `-2h`처럼 부호가 붙은 기간은 받지 않는다. 범위는 366일까지, `--points`는 1~1000(기본 300)이다. 범위를 주지 않은 `vm stats`·`node stats`(노드 없이)는
   지금처럼 마지막 점이고, `--watch`는 범위와 함께 쓰지 않는다.
 - **층 고르기.** 범위가 그 층의 기간 안에 드는 가장 고운 층을 고른다(1시간 → `raw5s`, 1일 → `min1`, 1주 → `min30`, 그 밖 →
   `hour6`, 시작이 층에 남은 기간보다 이르면 한 층 거칠게). 그 뒤 칸을 `points` 안으로 묶는다(평균은 아는 칸의 평균, 최대의
@@ -942,7 +945,10 @@ orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보�
   10분 뒤 세 번 다시 한다. 대상마다 노드마다 **분당 20개**까지이고, 넘는 것은 그 분이 끝난 뒤 "N more notifications were held
   back by the rate limit of {대상}" 알림 하나로 묶는다. 보낼 대기열은 1000개까지이고 넘으면 버린다(기록에 `dropped: the send
   queue is full`). 바쁜 대상의 차례를 기다리는 알림도 모두 합쳐 1000개까지이고, 넘으면 가장 많이 밀린 대상의 가장 오래된
-  것을 버린다 — 답하지 않는 대상 하나가 다른 대상의 알림을 늦추지 않는다. 꺼진 대상(`--disable`)은 조용히 건너뛴다.
+  것을 버린다 — 답하지 않는 대상 하나가 다른 대상의 알림을 늦추지 않는다. 대상의 차례는 돌아가며 오고, 한 대상의 차례를
+  기다리는 알림은 20개까지(넘는 것은 "N more" 알림에 센다)다. 처음 넣은 뒤 15분 안에 보내지 못한 알림은 버린다(`dropped: not
+  sent in time` — 살아난 대상에 묵은 알림을 몰아 보내지 않게). 같은 경보의 RESOLVED를 받으면 다시 하기를 기다리는 그 대상의
+  FIRING은 버린다(`dropped: the alert was resolved before the retry`). 꺼진 대상(`--disable`)은 조용히 건너뛴다.
 - **보낸 기록.** 보낸 노드의 `{data_dir}/alerts/history.log`(JSON Lines, 4 MiB에서 `history.log.1`로 한 번 돌림)에 마지막 결과만
   남는다(성공, 또는 다시 하기를 다 쓴 실패 — `(after N attempts)`).
 
