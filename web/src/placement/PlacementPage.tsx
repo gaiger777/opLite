@@ -10,6 +10,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -86,10 +87,7 @@ export function PlacementPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex flex-col gap-2">
-        <h1 className="text-xl font-semibold">{t("nav.placement")}</h1>
-        <p className="text-sm text-muted-foreground">{t("placement.pageHint")}</p>
-      </div>
+      <PageHeader title={t("nav.placement")} description={t("placement.pageHint")} />
       {!s ? (
         // 리더에 묻지 못하면(503 `placement_unavailable`) 그 문구를 보인다.
         <ListPending error={status.error} />

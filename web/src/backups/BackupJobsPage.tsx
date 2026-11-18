@@ -26,6 +26,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -70,27 +71,28 @@ export function BackupJobsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="backup-jobs-title" className="text-xl font-semibold">
-          {t("nav.backupJobs")}
-        </h1>
-        {write && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            {/* 풀 목록을 읽어야 백업 풀을 고른다. */}
-            {!pools.isSuccess && <ListPending error={pools.error} />}
-            <Button
-              disabled={!pools.isSuccess || !jobs.isSuccess}
-              onClick={(e) => {
-                opener.current = e.currentTarget;
-                setEditing(null);
-              }}
-            >
-              <Plus />
-              {t("common.create")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="backup-jobs-title"
+        title={t("nav.backupJobs")}
+        actions={
+          write && (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {/* 풀 목록을 읽어야 백업 풀을 고른다. */}
+              {!pools.isSuccess && <ListPending error={pools.error} />}
+              <Button
+                disabled={!pools.isSuccess || !jobs.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("common.create")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("backupJobs.pageHint")}</p>
       <Table aria-labelledby="backup-jobs-title">
         <TableHeader>

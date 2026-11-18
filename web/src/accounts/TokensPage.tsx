@@ -14,6 +14,7 @@ import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import {
@@ -67,15 +68,16 @@ export function TokensPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="tokens-title" className="text-xl font-semibold">
-          {t("nav.tokens")}
-        </h1>
-        <Button ref={opener} onClick={() => setCreating(true)}>
-          <Plus />
-          {t("common.create")}
-        </Button>
-      </div>
+      <PageHeader
+        id="tokens-title"
+        title={t("nav.tokens")}
+        actions={
+          <Button ref={opener} onClick={() => setCreating(true)}>
+            <Plus />
+            {t("common.create")}
+          </Button>
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("tokens.note")}</p>
       <Table aria-labelledby="tokens-title">
         <TableHeader>

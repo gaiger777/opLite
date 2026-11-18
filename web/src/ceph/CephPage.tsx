@@ -7,6 +7,7 @@ import { useCeph } from "@/ceph/ceph";
 import { CephStatusView } from "@/ceph/CephStatusView";
 import { CephWizard } from "@/ceph/CephWizard";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 
 /**
  * Orbivisor가 관리하는 Ceph. 없으면 admin에게 만들기 마법사를, 있으면 상태를 보인다. 마법사로 만들기 시작하면 끝내기
@@ -21,10 +22,7 @@ export function CephPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex flex-col gap-2">
-        <h1 className="text-xl font-semibold">{t("nav.ceph")}</h1>
-        <p className="text-sm text-muted-foreground">{t("ceph.pageHint")}</p>
-      </div>
+      <PageHeader title={t("nav.ceph")} description={t("ceph.pageHint")} />
       {ceph.data === undefined ? (
         <ListPending error={ceph.error} />
       ) : ceph.data === null || inWizard ? (

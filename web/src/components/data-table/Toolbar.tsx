@@ -8,6 +8,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+import { undoToast } from "@/lib/undo";
 
 /** 저장 보기: 코드에 둔 기본 보기, 저장한 보기, 지금 쿼리를 이름 붙여 저장하기 */
 export function ViewMenu({
@@ -60,7 +61,16 @@ export function ViewMenu({
                 variant="ghost"
                 size="icon-sm"
                 aria-label={t("table.deleteView", { name: view.name })}
-                onClick={() => store(saved.filter((v) => v.name !== view.name))}
+                onClick={() => {
+                  store(saved.filter((v) => v.name !== view.name));
+                  // 10초 동안 되돌린다(그 사이 같은 이름으로 저장했으면 그것을 둔다).
+                  undoToast(t, t("table.viewDeleted", { name: view.name }), () => {
+                    const now = readViews(table);
+                    if (!now.some((v) => v.name === view.name)) {
+                      store([...now, view]);
+                    }
+                  });
+                }}
               >
                 <X />
               </Button>

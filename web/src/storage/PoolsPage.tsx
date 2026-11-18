@@ -12,6 +12,7 @@ import { isManagedPool, useCeph } from "@/ceph/ceph";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { ListPending } from "@/components/ListPending";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
@@ -255,17 +256,18 @@ export function PoolsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="pools-title" className="text-xl font-semibold">
-          {t("nav.pools")}
-        </h1>
-        {write && (
-          <Button onClick={() => setCreating(true)}>
-            <Plus />
-            {t("common.create")}
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        id="pools-title"
+        title={t("nav.pools")}
+        actions={
+          write && (
+            <Button onClick={() => setCreating(true)}>
+              <Plus />
+              {t("common.create")}
+            </Button>
+          )
+        }
+      />
       <DataTable
         id="pools"
         rows={pools.data ?? []}
@@ -316,6 +318,14 @@ export function PoolsPage() {
         title={t("pools.deleteTitle", { name: deleting?.name })}
         description={t("pools.deleteDescription")}
         confirmLabel={t("common.delete")}
+        impact={
+          deleting
+            ? [
+                [volumeCount(deleting), "impact.volumes"] as const,
+                [backupCount(deleting), "impact.backups"] as const,
+              ].flatMap(([count, key]) => (count === undefined ? [] : [t(key, { count })]))
+            : undefined
+        }
         onConfirm={async () => {
           const pool = deleting!;
           await call(api.DELETE("/storage-pools/{key}", { params: { path: { key: pool.id } } }));

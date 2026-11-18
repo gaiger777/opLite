@@ -8,6 +8,7 @@ import type { AuditEntry } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { focusBack } from "@/components/focusBack";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -62,7 +63,7 @@ export function AuditPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <h1 className="text-xl font-semibold">{t("nav.audit")}</h1>
+        <PageHeader title={t("nav.audit")} />
         <p className="text-sm text-muted-foreground">{t("audit.adminOnly")}</p>
       </div>
     );
@@ -136,15 +137,20 @@ export function AuditPage() {
   const disabled = audit.data?.disabled ?? [];
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="audit-title" className="text-xl font-semibold">
-          {t("nav.audit")}
-        </h1>
-        <Button variant="outline" disabled={audit.isFetching} onClick={() => void audit.refetch()}>
-          <RefreshCw />
-          {t("audit.refresh")}
-        </Button>
-      </div>
+      <PageHeader
+        id="audit-title"
+        title={t("nav.audit")}
+        actions={
+          <Button
+            variant="outline"
+            disabled={audit.isFetching}
+            onClick={() => void audit.refetch()}
+          >
+            <RefreshCw />
+            {t("audit.refresh")}
+          </Button>
+        }
+      />
       <div className="flex flex-wrap items-end gap-4">
         <div className="flex flex-col gap-2">
           <Label htmlFor="audit-range">{t("audit.range")}</Label>

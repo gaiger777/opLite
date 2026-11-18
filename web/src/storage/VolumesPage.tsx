@@ -13,6 +13,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
@@ -266,27 +267,28 @@ export function VolumesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="volumes-title" className="text-xl font-semibold">
-          {t("nav.volumes")}
-        </h1>
-        {write && (
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => setDownloading(true)}>
-              <Download />
-              {t("downloads.open")}
-            </Button>
-            <Button variant="outline" onClick={() => setUploading(true)}>
-              <Upload />
-              {t("uploads.open")}
-            </Button>
-            <Button onClick={() => setCreating(true)}>
-              <Plus />
-              {t("common.create")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="volumes-title"
+        title={t("nav.volumes")}
+        actions={
+          write && (
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setDownloading(true)}>
+                <Download />
+                {t("downloads.open")}
+              </Button>
+              <Button variant="outline" onClick={() => setUploading(true)}>
+                <Upload />
+                {t("uploads.open")}
+              </Button>
+              <Button onClick={() => setCreating(true)}>
+                <Plus />
+                {t("common.create")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <DataTable
         id="volumes"
         rows={shown}

@@ -7,6 +7,7 @@ import { Link } from "react-router";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Node, Vm } from "@/api/types";
+import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -97,7 +98,7 @@ export function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <h1 className="text-xl font-semibold">{t("nav.area.home")}</h1>
+      <PageHeader title={t("nav.area.home")} />
       <SubscriptionBanner />
       {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
       {versions.length > 1 && (

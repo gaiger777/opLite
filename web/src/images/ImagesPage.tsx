@@ -8,6 +8,7 @@ import { useList } from "@/api/live";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -58,17 +59,18 @@ export function ImagesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="images-title" className="text-xl font-semibold">
-          {t("nav.images")}
-        </h1>
-        {admin && (
-          <Button variant="outline" onClick={() => setAdding(true)}>
-            <Plus />
-            {t("images.add")}
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        id="images-title"
+        title={t("nav.images")}
+        actions={
+          admin && (
+            <Button variant="outline" onClick={() => setAdding(true)}>
+              <Plus />
+              {t("images.add")}
+            </Button>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("images.note")}</p>
       <div role="group" aria-label={t("images.arch")} className="flex flex-wrap gap-2">
         {[null, ...ARCHES].map((a) => (

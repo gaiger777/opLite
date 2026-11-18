@@ -32,6 +32,7 @@ export function VmDeleteDialog({
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const snapshots = useList("snapshot");
+  const backups = useList("backup");
   const [withSnapshots, setWithSnapshots] = useState(false);
   // 확인을 누를 때의 스냅샷. 지우는 동안 목록에서 빠져도 이것으로 그린다.
   const [deleting, setDeleting] = useState<Snapshot[] | null>(null);
@@ -81,6 +82,17 @@ export function VmDeleteDialog({
       description={t("vms.deleteDescription")}
       confirmLabel={t("vms.action.delete")}
       typeToConfirm={vm.name}
+      impact={[
+        t("impact.disksKept", { count: (vm.spec.disks ?? []).length }),
+        ...(snapshots.isSuccess ? [t("impact.snapshots", { count: mine.length })] : []),
+        ...(backups.isSuccess
+          ? [
+              t("impact.backupsKept", {
+                count: backups.data.filter((b) => b.spec.vm === vm.id).length,
+              }),
+            ]
+          : []),
+      ]}
       returnFocus={returnFocus}
       // 스냅샷 목록을 다 읽어야 스냅샷이 있는지 안다.
       confirmDisabled={!snapshots.isSuccess || pending || (mine.length > 0 && !withSnapshots)}

@@ -8,6 +8,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Task, Vm } from "@/api/types";
+import { TypeToConfirm } from "@/components/ConfirmDialog";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,7 +19,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import {
@@ -257,16 +257,7 @@ export function VmBulkDialog({
           </p>
         )}
         {TYPED.includes(action) && !started && (
-          <div className="flex flex-col gap-2">
-            <Label htmlFor={typeId}>{t("vms.bulk.typeCount", { count: vms.length })}</Label>
-            <Input
-              id={typeId}
-              autoComplete="off"
-              inputMode="numeric"
-              value={typed}
-              onChange={(e) => setTyped(e.target.value)}
-            />
-          </div>
+          <TypeToConfirm id={typeId} expected={vms.length} value={typed} onChange={setTyped} />
         )}
         <DialogFooter>
           {started ? (

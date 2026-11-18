@@ -1,4 +1,4 @@
-import { Lock, Menu, Monitor, Moon, Sun, User } from "lucide-react";
+import { Lock, Menu, Monitor, Moon, Sun, User, WifiOff } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Outlet, useLocation, useNavigate } from "react-router";
@@ -129,6 +129,7 @@ export function AppLayout() {
           tabIndex={-1}
           className="flex min-w-0 flex-1 flex-col gap-(--gap) p-4 outline-none md:p-6"
         >
+          <OfflineBanner />
           {!full && <AreaTabs />}
           {!full && <ViewSwitch />}
           <div className="min-w-0">
@@ -166,6 +167,26 @@ function MobileNav() {
         <AreaLinks onNavigate={() => setOpen(false)} />
       </SheetContent>
     </Sheet>
+  );
+}
+
+/**
+ * 실시간 연결이 끊긴 동안 본문 위의 띠(설계 §5.5). 화면 읽기 프로그램에는 머리줄 `LiveBadge`(role=status)가
+ * 이미 알리므로 여기는 역할을 두지 않는다.
+ */
+function OfflineBanner() {
+  const { t } = useTranslation();
+  if (useLiveStatus() !== "offline") {
+    return null;
+  }
+  return (
+    <div
+      data-offline-banner
+      className="flex items-center gap-2 rounded-md bg-warning-soft px-3 py-2 text-sm text-warning-fg"
+    >
+      <WifiOff aria-hidden className="size-4 shrink-0" />
+      {t("live.banner")}
+    </div>
   );
 }
 

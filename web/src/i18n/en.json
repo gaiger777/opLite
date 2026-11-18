@@ -193,7 +193,8 @@
   "live": {
     "live": "Live",
     "connecting": "Connecting…",
-    "offline": "Disconnected · reconnecting"
+    "offline": "Disconnected · reconnecting",
+    "banner": "The live connection was lost – reconnecting. What you see may be out of date."
   },
   "tasks": {
     "time": "Time",
@@ -297,10 +298,14 @@
     "done": "Done",
     "name": "Name",
     "state": "State",
-    "node": "Node"
+    "node": "Node",
+    "undo": "Undo",
+    "undone": "Undone."
   },
   "confirm": {
-    "typeName": "Type {{name}} to confirm"
+    "typeName": "Type {{name}} to confirm",
+    "typeCount": "Type {{count}} to confirm",
+    "impact": "What this affects"
   },
   "vms": {
     "vcpus": "vCPUs",
@@ -594,7 +599,6 @@
       "done": "Succeeded",
       "failed": "Failed: {{error}}",
       "skippedReason": "Skipped",
-      "typeCount": "Type {{count}} to confirm",
       "snapshotName": "Snapshot name: {{name}} (disks only)",
       "running_one": "{{action}}: {{count}} VM…",
       "running_other": "{{action}}: {{count}} VMs…",
@@ -1685,7 +1689,6 @@
     "refreshFailed": "Could not refresh {{name}}: {{error}}",
     "deleteTitle": "Delete remote cluster {{name}}?",
     "deleteDescription": "This cluster stops showing it. Nothing changes on the remote cluster, and its API token stays there until you delete it.",
-    "backToList": "Back to remote clusters",
     "vmsTitle": "Virtual machines on {{name}}",
     "actionRequested": "{{action}} requested for {{name}} on {{remote}}.",
     "errors": {
@@ -2903,7 +2906,8 @@
     "docs": "Read the guide"
   },
   "favorites": {
-    "toggle": "Favorite {{name}}"
+    "toggle": "Favorite {{name}}",
+    "removed": "{{name}} removed from favorites."
   },
   "create": {
     "menu": "Create new",
@@ -3005,6 +3009,16 @@
     "deleteView": "Delete view {{name}}",
     "columns": "Columns",
     "open": "Open",
-    "addresses": "Addresses"
+    "addresses": "Addresses",
+    "viewDeleted": "View {{name}} deleted."
+  },
+  "impact": {
+    "vmsAssigned": "VMs assigned to it: {{count}}",
+    "disksKept": "Disk volumes (kept): {{count}}",
+    "snapshots": "Snapshots: {{count}}",
+    "backupsKept": "Backups (kept): {{count}}",
+    "vmsUsing": "VMs using it: {{count}}",
+    "volumes": "Volumes in it: {{count}}",
+    "backups": "Backups in it: {{count}}"
   }
 }

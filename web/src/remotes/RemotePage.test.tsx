@@ -40,10 +40,7 @@ it("lists the VMs of the remote through the proxy", async () => {
   expect(row).toHaveTextContent("2");
   expect(row).toHaveTextContent("2 GiB");
   expect(screen.getByText("dr · https://dr.example:8006")).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Back to remote clusters" })).toHaveAttribute(
-    "href",
-    "/remotes",
-  );
+  expect(screen.getByRole("heading", { level: 1, name: "dr" })).toBeInTheDocument();
 });
 
 it("starts, shuts down and force stops remote VMs", async () => {

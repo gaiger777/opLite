@@ -1,91 +1,92 @@
-import { MoreHorizontal } from "lucide-react";
-import { useRef, useState } from "react";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
+import { useNavigate } from "react-router";
 
 import type { Node } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
-import { PinButton, useVisit } from "@/components/PinButton";
-import { Badge } from "@/components/ui/badge";
+import { useVisit } from "@/components/PinButton";
+import { ReasonButton, ReasonList } from "@/components/Reason";
+import { ResourceHeader } from "@/components/ResourceHeader";
+import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
-import { NodeDisksDialog } from "@/nodes/NodeDisksDialog";
-import { NodeFenceDialog } from "@/nodes/NodeFenceDialog";
-import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
-import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
-
-type Dialog = "updates" | "interfaces" | "disks" | "fence";
+import { formatCapacity } from "@/lib/format";
+import { isFrozen, useNodeActions } from "@/nodes/NodeActions";
 
 /**
- * 노드 상세의 머리: 이름·상태와 동작 메뉴. 동작은 노드 목록의 대화상자를 그대로 쓴다(유지보수·비우기·지우기는
- * 노드 목록에 남는다 — 계획 61이 머리를 `ResourceHeader`로 바꾸며 모은다).
+ * 노드 상세의 머리(`ResourceHeader`): 이름·상태·★, 주 동작(유지보수·비우기), 케밥(업데이트·인터페이스·디스크·
+ * 레이블·펜스·얼림 풀기·지우기), 요약 카드(주소·CPU·메모리·VM). 동작은 노드 목록과 같은 `useNodeActions`다.
  */
-export function NodeHeader({ node }: { node: Node }) {
+export function NodeHeader({ node, vms }: { node: Node; vms?: number }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
-  const write = can(me.role, "write", "node");
-  const [open, setOpen] = useState<Dialog | null>(null);
-  const trigger = useRef<HTMLButtonElement>(null);
-  const close = () => setOpen(null);
+  const navigate = useNavigate();
+  const hint = useId();
+  const actions = useNodeActions({ onRemoved: () => void navigate("/nodes") });
   useVisit({ kind: "node", id: node.id, name: node.name });
-  const items: { id: Dialog; label: string }[] = [
-    ...(node.status.updates ? [{ id: "updates" as const, label: t("nodes.updates.menu") }] : []),
-    ...(!node.spec.witness
-      ? [{ id: "interfaces" as const, label: t("nodes.interfaces.menu") }]
-      : []),
-    ...(write && !node.spec.witness
-      ? [
-          { id: "disks" as const, label: t("nodes.disks.menu") },
-          { id: "fence" as const, label: t("nodes.fence.menu") },
-        ]
-      : []),
-  ];
+  const witness = node.spec.witness;
+  const drain = actions.write && !witness ? actions.drainReason(node) : null;
+  const menu = actions.write || node.status.updates || !witness;
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-xl font-semibold">{node.name}</h1>
-        <PinButton resource={{ kind: "node", id: node.id, name: node.name }} />
-        <Badge variant={node.status.online ? "default" : "destructive"}>
-          {t(node.status.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
-        </Badge>
-        {node.spec.maintenance && <Badge variant="outline">{t("dashboard.maintenance")}</Badge>}
-        {node.spec.witness && <Badge variant="outline">{t("dashboard.witness")}</Badge>}
-        <span className="font-mono text-xs text-muted-foreground">{node.spec.address}</span>
-      </div>
-      {items.length > 0 && (
-        <DropdownMenu modal={false}>
-          <DropdownMenuTrigger asChild>
-            <Button
-              ref={trigger}
-              variant="outline"
-              size="sm"
-              aria-label={t("vms.actionsFor", { name: node.name })}
-            >
-              <MoreHorizontal />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end">
-            {items.map((item) => (
-              <DropdownMenuItem key={item.id} onSelect={() => setOpen(item.id)}>
-                {item.label}
-              </DropdownMenuItem>
-            ))}
-          </DropdownMenuContent>
-        </DropdownMenu>
-      )}
-      {open === "updates" && (
-        <NodeUpdatesDialog node={node} returnFocus={trigger} onClose={close} />
-      )}
-      {open === "interfaces" && (
-        <NodeInterfacesDialog node={node} returnFocus={trigger} onClose={close} />
-      )}
-      {open === "disks" && <NodeDisksDialog node={node} returnFocus={trigger} onClose={close} />}
-      {open === "fence" && <NodeFenceDialog node={node} returnFocus={trigger} onClose={close} />}
-    </div>
+    <>
+      <ResourceHeader
+        name={node.name}
+        pin={{ kind: "node", id: node.id, name: node.name }}
+        status={
+          <>
+            <StatusChip tone={node.status.online ? "success" : "danger"}>
+              {t(node.status.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
+            </StatusChip>
+            {node.spec.maintenance && (
+              <StatusChip tone="warning">{t("dashboard.maintenance")}</StatusChip>
+            )}
+            {witness && <StatusChip tone="neutral">{t("dashboard.witness")}</StatusChip>}
+            {isFrozen(node) && <StatusChip tone="info">{t("nodes.frozen")}</StatusChip>}
+          </>
+        }
+        actions={
+          actions.write && (
+            <>
+              <Button
+                variant="outline"
+                size="sm"
+                onPointerDown={actions.rememberTrigger}
+                onKeyDown={actions.rememberTrigger}
+                onClick={() => actions.toggleMaintenance(node)}
+              >
+                {t(node.spec.maintenance ? "nodes.endMaintenance" : "nodes.startMaintenance")}
+              </Button>
+              {!witness && (
+                <ReasonButton
+                  variant="outline"
+                  size="sm"
+                  reason={drain}
+                  reasons={hint}
+                  onPointerDown={actions.rememberTrigger}
+                  onKeyDown={actions.rememberTrigger}
+                  onClick={() => actions.show("drain", node)}
+                >
+                  {t("nodes.drain.menu")}
+                </ReasonButton>
+              )}
+            </>
+          )
+        }
+        menu={menu ? actions.items(node, { primary: false }) : undefined}
+        menuTrigger={{
+          onPointerDown: actions.rememberTrigger,
+          onKeyDown: actions.rememberTrigger,
+        }}
+        summary={[
+          {
+            label: t("nodes.address"),
+            value: <span className="font-mono text-sm">{node.spec.address}</span>,
+          },
+          { label: t("nodes.cpus"), value: node.status.cpus },
+          { label: t("nodes.memory"), value: formatCapacity(node.status.memory_mib) },
+          { label: t("nodes.vms"), value: vms ?? "—" },
+        ]}
+      >
+        <ReasonList base={hint} reasons={[drain]} className="basis-full" />
+      </ResourceHeader>
+      {actions.dialogs}
+    </>
   );
 }

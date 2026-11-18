@@ -10,6 +10,7 @@ import type { Volume } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
@@ -61,23 +62,24 @@ export function IsosPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="isos-title" className="text-xl font-semibold">
-          {t("nav.isos")}
-        </h1>
-        {write && (
-          <div className="flex gap-2">
-            <Button variant="outline" onClick={() => setDownloading(true)}>
-              <Download />
-              {t("downloads.open")}
-            </Button>
-            <Button onClick={() => setUploading(true)}>
-              <Upload />
-              {t("isos.upload")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="isos-title"
+        title={t("nav.isos")}
+        actions={
+          write && (
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => setDownloading(true)}>
+                <Download />
+                {t("downloads.open")}
+              </Button>
+              <Button onClick={() => setUploading(true)}>
+                <Upload />
+                {t("isos.upload")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("isos.note")}</p>
       <Table aria-labelledby="isos-title">
         <TableHeader>

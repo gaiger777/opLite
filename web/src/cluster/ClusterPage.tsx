@@ -12,6 +12,7 @@ import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -65,15 +66,17 @@ export function ClusterPage() {
   const { name, ca_fingerprint: fingerprint, leader, node: here, members } = cluster.data;
   return (
     <div className="flex flex-col gap-6">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-xl font-semibold">{t("cluster.title", { name })}</h1>
-        {can(me.role, "write", "join-token") && (
-          <Button ref={opener} onClick={() => setIssuing(true)}>
-            <Plus />
-            {t("cluster.issue")}
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        title={t("cluster.title", { name })}
+        actions={
+          can(me.role, "write", "join-token") && (
+            <Button ref={opener} onClick={() => setIssuing(true)}>
+              <Plus />
+              {t("cluster.issue")}
+            </Button>
+          )
+        }
+      />
       {/* 다시 읽지 못하면 마지막으로 읽은 내용을 그대로 보이고 오류를 알린다. */}
       {cluster.isError && (
         <p role="alert" className="text-sm text-destructive">

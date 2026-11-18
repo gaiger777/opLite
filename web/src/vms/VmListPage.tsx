@@ -11,6 +11,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { type Column, DataTable, type Filter } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
+import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { formatMib } from "@/lib/format";
@@ -158,19 +159,20 @@ export function VmListPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="vms-title" className="text-xl font-semibold">
-          {t("nav.vms")}
-        </h1>
-        {write && (
-          <Button asChild>
-            <Link to="/vms/-new">
-              <Plus />
-              {t("common.create")}
-            </Link>
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        id="vms-title"
+        title={t("nav.vms")}
+        actions={
+          write && (
+            <Button asChild>
+              <Link to="/vms/-new">
+                <Plus />
+                {t("common.create")}
+              </Link>
+            </Button>
+          )
+        }
+      />
       <DataTable
         id="vms"
         rows={vms.data ?? []}

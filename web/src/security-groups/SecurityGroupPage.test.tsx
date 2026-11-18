@@ -1,6 +1,7 @@
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
+import { toast } from "sonner";
 
 import { SecurityGroupPage } from "@/security-groups/SecurityGroupPage";
 import { securityGroup } from "@/test/fixtures";
@@ -15,6 +16,9 @@ const ssh = securityGroup(
   ],
   "SSH",
 );
+
+// 되돌리기 알림은 10초 남으므로 앞 시험의 알림이 다음 시험에 보이지 않게 닫는다.
+afterEach(() => toast.dismiss());
 
 function open(as = ADMIN) {
   return renderPage(<SecurityGroupPage />, {
@@ -157,4 +161,38 @@ it("says when the group does not exist", async () => {
     await screen.findByRole("heading", { name: "Security group ssh not found" }),
   ).toBeInTheDocument();
   expect(within(document.body).queryByRole("table")).not.toBeInTheDocument();
+});
+
+it("undoes a save by writing the previous description and rules back", async () => {
+  mockLists({ "security-group": [ssh] });
+  const sent: { ifMatch: string | null; body: unknown }[] = [];
+  server.use(
+    http.patch(apiUrl(`/security-groups/${ssh.id}`), async ({ request }) => {
+      sent.push({ ifMatch: request.headers.get("if-match"), body: await request.json() });
+      return HttpResponse.json({ ...ssh, revision: 1 + sent.length });
+    }),
+  );
+  open();
+  const user = userEvent.setup();
+  await user.clear(await screen.findByLabelText("Description"));
+  await user.type(screen.getByLabelText("Description"), "Shell");
+  await user.click(screen.getByRole("button", { name: "Remove rule 2" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Saved security group ssh.")).toBeInTheDocument();
+  // sonner 단추는 pointer capture를 쓰므로(jsdom에 없음) 클릭만 보낸다.
+  fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+  expect(await screen.findByText("Undone.")).toBeInTheDocument();
+  expect(sent[1]).toEqual({
+    ifMatch: "2",
+    body: { description: "SSH", rules: ssh.spec.rules },
+  });
+  expect(screen.getByLabelText("Description")).toHaveValue("SSH");
+  expect(screen.getByLabelText("Direction of rule 2")).toHaveValue("out");
+});
+
+it("shows the rule and VM counts under the header", async () => {
+  mockLists({ "security-group": [ssh] });
+  open();
+  const rules = await screen.findByText("Rules", { selector: "dt" });
+  expect(rules.nextSibling).toHaveTextContent("2");
 });

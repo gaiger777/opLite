@@ -13,6 +13,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -77,28 +78,29 @@ export function HaChecksPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="ha-checks-title" className="text-xl font-semibold">
-          {t("nav.haChecks")}
-        </h1>
-        {write && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            {/* 노드·풀 목록을 읽어야 대상을 고른다. */}
-            {!nodes.isSuccess && <ListPending error={nodes.error} />}
-            {nodes.isSuccess && !pools.isSuccess && <ListPending error={pools.error} />}
-            <Button
-              disabled={!nodes.isSuccess || !pools.isSuccess || !checks.isSuccess}
-              onClick={(e) => {
-                opener.current = e.currentTarget;
-                setEditing(null);
-              }}
-            >
-              <Plus />
-              {t("common.create")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="ha-checks-title"
+        title={t("nav.haChecks")}
+        actions={
+          write && (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {/* 노드·풀 목록을 읽어야 대상을 고른다. */}
+              {!nodes.isSuccess && <ListPending error={nodes.error} />}
+              {nodes.isSuccess && !pools.isSuccess && <ListPending error={pools.error} />}
+              <Button
+                disabled={!nodes.isSuccess || !pools.isSuccess || !checks.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("common.create")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("haChecks.pageHint")}</p>
       <Table aria-labelledby="ha-checks-title">
         <TableHeader>

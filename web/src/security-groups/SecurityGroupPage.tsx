@@ -1,7 +1,7 @@
 import { ArrowDown, ArrowUp, Plus, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, useParams } from "react-router";
+import { useParams } from "react-router";
 import { toast } from "sonner";
 
 import { ApiError, api, call } from "@/api/client";
@@ -11,6 +11,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
+import { ResourceHeader } from "@/components/ResourceHeader";
 import { useVisit } from "@/components/PinButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -24,6 +25,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
+import { undoToast } from "@/lib/undo";
 import {
   emptyRule,
   fromRule,
@@ -35,6 +37,7 @@ import {
   toRule,
   validateRules,
 } from "@/security-groups/rules";
+import { groupUsers } from "@/security-groups/SecurityGroupsPage";
 
 /** 보안 그룹 하나: 설명과 규칙 표. 쓰기 권한이 없으면 읽기만 한다. */
 export function SecurityGroupPage() {
@@ -55,6 +58,7 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
   const { t } = useTranslation();
   const me = usePrincipal();
   const write = can(me.role, "write", "security-group");
+  const vms = useList("vm");
   useVisit({ kind: "security-group", id: group.id, name: group.name });
   const [description, setDescription] = useState(group.spec.description ?? "");
   const [rows, setRows] = useState(() => (group.spec.rules ?? []).map(fromRule));
@@ -101,7 +105,29 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
         }),
       );
       setRevision(saved.revision);
-      toast.success(t("securityGroups.saved", { name: group.name }));
+      // 10초 동안 저장 전 설명·규칙으로 되돌린다(`If-Match`, 그 사이 바뀌었으면 실패를 알린다).
+      const before = {
+        description: group.spec.description ?? "",
+        rules: group.spec.rules ?? [],
+        revision: saved.revision,
+      };
+      undoToast(t, t("securityGroups.saved", { name: group.name }), async () => {
+        try {
+          const back = await call(
+            api.PATCH("/security-groups/{key}", {
+              params: { path: { key: group.id }, header: { "If-Match": before.revision } },
+              body: { description: before.description, rules: before.rules },
+            }),
+          );
+          setDescription(before.description);
+          setRows(before.rules.map(fromRule));
+          setRevision(back.revision);
+          setErrors({});
+          toast.success(t("common.undone"));
+        } catch (err) {
+          toast.error(errorMessage(t, err));
+        }
+      });
     } catch (err) {
       setFailure({
         message: errorMessage(t, err),
@@ -115,15 +141,13 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
   const n = (i: number) => ({ n: i + 1 });
   return (
     <form onSubmit={(e) => void submit(e)} className="flex flex-col gap-4" noValidate>
-      <div className="flex flex-col gap-1">
-        <Link
-          to="/security-groups"
-          className="text-sm text-muted-foreground underline-offset-4 hover:underline"
-        >
-          {t("nav.securityGroups")}
-        </Link>
-        <h1 className="text-xl font-semibold">{group.name}</h1>
-      </div>
+      <ResourceHeader
+        name={group.name}
+        summary={[
+          { label: t("securityGroups.rules"), value: (group.spec.rules ?? []).length },
+          { label: t("securityGroups.vms"), value: vms.data ? groupUsers(group, vms.data) : "—" },
+        ]}
+      />
       <p className="text-sm text-muted-foreground">{t("securityGroups.order")}</p>
       <p className="text-sm text-muted-foreground">{t("securityGroups.always")}</p>
       {/* 보내는 동안이나 읽기 권한뿐이면 고치지 못하게 한다. */}

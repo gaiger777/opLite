@@ -193,7 +193,8 @@
   "live": {
     "live": "실시간",
     "connecting": "연결 중…",
-    "offline": "실시간 연결 끊김 · 재연결 중"
+    "offline": "실시간 연결 끊김 · 재연결 중",
+    "banner": "실시간 연결이 끊겼습니다 – 다시 연결하는 중입니다. 보이는 내용이 오래됐을 수 있습니다."
   },
   "tasks": {
     "time": "시각",
@@ -297,10 +298,14 @@
     "done": "완료",
     "name": "이름",
     "state": "상태",
-    "node": "노드"
+    "node": "노드",
+    "undo": "되돌리기",
+    "undone": "되돌렸습니다."
   },
   "confirm": {
-    "typeName": "확인하려면 {{name}}을(를) 입력하세요"
+    "typeName": "확인하려면 {{name}}을(를) 입력하세요",
+    "typeCount": "확인하려면 {{count}}을(를) 입력하세요",
+    "impact": "영향"
   },
   "vms": {
     "vcpus": "vCPU",
@@ -594,7 +599,6 @@
       "done": "성공",
       "failed": "실패: {{error}}",
       "skippedReason": "건너뜀",
-      "typeCount": "확인하려면 {{count}}을(를) 입력하세요",
       "snapshotName": "스냅샷 이름: {{name}}(디스크만)",
       "running_one": "{{action}}: VM {{count}}개…",
       "running_other": "{{action}}: VM {{count}}개…",
@@ -1685,7 +1689,6 @@
     "refreshFailed": "{{name}}을(를) 새로 읽지 못했습니다: {{error}}",
     "deleteTitle": "원격 클러스터 {{name}}을(를) 삭제할까요?",
     "deleteDescription": "이 클러스터에서 보이지 않게 됩니다. 원격 클러스터는 바뀌지 않고, 그곳의 API 토큰도 지우기 전까지 남습니다.",
-    "backToList": "원격 클러스터 목록으로",
     "vmsTitle": "{{name}}의 가상 머신",
     "actionRequested": "{{remote}}의 {{name}}에 {{action}} 요청을 보냈습니다.",
     "errors": {
@@ -2903,7 +2906,8 @@
     "docs": "안내서 읽기"
   },
   "favorites": {
-    "toggle": "{{name}} 즐겨찾기"
+    "toggle": "{{name}} 즐겨찾기",
+    "removed": "즐겨찾기에서 {{name}}을(를) 뺐습니다."
   },
   "create": {
     "menu": "새로 만들기",
@@ -3005,6 +3009,16 @@
     "deleteView": "{{name}} 보기 지우기",
     "columns": "열",
     "open": "열기",
-    "addresses": "주소"
+    "addresses": "주소",
+    "viewDeleted": "보기 {{name}}을(를) 지웠습니다."
+  },
+  "impact": {
+    "vmsAssigned": "배정된 VM: {{count}}개",
+    "disksKept": "디스크 볼륨(남음): {{count}}개",
+    "snapshots": "스냅샷: {{count}}개",
+    "backupsKept": "백업(남음): {{count}}개",
+    "vmsUsing": "쓰는 VM: {{count}}개",
+    "volumes": "안의 볼륨: {{count}}개",
+    "backups": "안의 백업: {{count}}개"
   }
 }

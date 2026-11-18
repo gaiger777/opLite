@@ -22,6 +22,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -58,7 +59,7 @@ export function NotificationTargetsPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <h1 className="text-xl font-semibold">{t("nav.notificationTargets")}</h1>
+        <PageHeader title={t("nav.notificationTargets")} />
         <p className="text-sm text-muted-foreground">{t("alerts.targets.adminOnly")}</p>
       </div>
     );
@@ -89,21 +90,22 @@ export function NotificationTargetsPage() {
   const list = targets.data ?? [];
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="targets-title" className="text-xl font-semibold">
-          {t("nav.notificationTargets")}
-        </h1>
-        <Button
-          disabled={!targets.isSuccess}
-          onClick={(e) => {
-            opener.current = e.currentTarget;
-            setDialog({ target: null });
-          }}
-        >
-          <Plus />
-          {t("common.create")}
-        </Button>
-      </div>
+      <PageHeader
+        id="targets-title"
+        title={t("nav.notificationTargets")}
+        actions={
+          <Button
+            disabled={!targets.isSuccess}
+            onClick={(e) => {
+              opener.current = e.currentTarget;
+              setDialog({ target: null });
+            }}
+          >
+            <Plus />
+            {t("common.create")}
+          </Button>
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("alerts.targets.pageHint")}</p>
       <Table aria-labelledby="targets-title">
         <TableHeader>

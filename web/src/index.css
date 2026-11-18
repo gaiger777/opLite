@@ -197,6 +197,19 @@ html[data-density="compact"] {
   --gap: 12px;
 }
 
+/* watch로 바뀐 상태 칩을 잠깐 강조한다(설계 §5.5, `StatusChip`의 `data-changed`). */
+@keyframes changed-flash {
+  from {
+    box-shadow: 0 0 0 2px var(--brand);
+  }
+  to {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+[data-changed] {
+  animation: changed-flash 600ms var(--ease-out);
+}
+
 /* 움직임 줄이기: 미끄러짐·흐려짐·깜박이는 강조·스켈레톤 맥박을 끈다(설계 §6). */
 @media (prefers-reduced-motion: reduce) {
   :root {

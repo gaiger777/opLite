@@ -12,6 +12,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -54,27 +55,28 @@ export function HaGroupsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="ha-groups-title" className="text-xl font-semibold">
-          {t("nav.haGroups")}
-        </h1>
-        {write && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            {/* 노드 목록을 읽어야 그룹 노드를 고른다. */}
-            {!nodes.isSuccess && <ListPending error={nodes.error} />}
-            <Button
-              disabled={!nodes.isSuccess || !groups.isSuccess}
-              onClick={(e) => {
-                opener.current = e.currentTarget;
-                setEditing(null);
-              }}
-            >
-              <Plus />
-              {t("common.create")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="ha-groups-title"
+        title={t("nav.haGroups")}
+        actions={
+          write && (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {/* 노드 목록을 읽어야 그룹 노드를 고른다. */}
+              {!nodes.isSuccess && <ListPending error={nodes.error} />}
+              <Button
+                disabled={!nodes.isSuccess || !groups.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("common.create")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("haGroups.pageHint")}</p>
       <Table aria-labelledby="ha-groups-title">
         <TableHeader>

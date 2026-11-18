@@ -6,6 +6,7 @@ import { AlertList } from "@/alerts/AlertList";
 import { AlertRulesTab } from "@/alerts/AlertRulesTab";
 import { HISTORY_PERIODS, useAlertHistory, useAlerts, type HistoryPeriod } from "@/alerts/alerts";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -29,7 +30,7 @@ export function AlertsPage() {
   const tab = TABS.find((id) => id === params.get("tab")) ?? "active";
   return (
     <div className="flex flex-col gap-4">
-      <h1 className="text-xl font-semibold">{t("nav.alerts")}</h1>
+      <PageHeader title={t("nav.alerts")} />
       <Tabs
         value={tab}
         onValueChange={(value) =>

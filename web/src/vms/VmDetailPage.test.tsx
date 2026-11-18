@@ -178,6 +178,10 @@ it("stops deleting snapshots when the page goes away", async () => {
   });
   await userEvent.click(await screen.findByRole("button", { name: "Delete" }));
   const dialog = await screen.findByRole("alertdialog");
+  // 영향 목록: 이미 받은 목록에서 센다.
+  expect(within(dialog).getByRole("list", { name: "What this affects" })).toHaveTextContent(
+    /Disk volumes \(kept\): \d+Snapshots: 2Backups \(kept\): 0/,
+  );
   await userEvent.type(within(dialog).getByLabelText("Type db to confirm"), "db");
   await userEvent.click(
     within(dialog).getByRole("checkbox", { name: "Also delete all 2 of its snapshots" }),
@@ -774,4 +778,14 @@ describe("install media", () => {
     const table = await screen.findByRole("table", { name: "CD/DVD" });
     expect(within(table).getAllByRole("row")[1]).toHaveTextContent("changing from alpine");
   });
+});
+
+it("shows summary cards under the VM header", async () => {
+  mockLists({ vm: [vm("web", "running")], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  const heading = await screen.findByRole("heading", { level: 1, name: "web" });
+  const cards = heading.closest("div")!.parentElement!.parentElement!.querySelector("dl")!;
+  expect(within(cards).getByText("Node").nextSibling).toHaveTextContent("node-a");
+  expect(within(cards).getByText("vCPUs")).toBeInTheDocument();
+  expect(within(cards).getByText("Memory")).toBeInTheDocument();
 });

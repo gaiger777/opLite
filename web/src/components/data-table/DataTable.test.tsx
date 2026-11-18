@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { type Column, DataTable } from "@/components/data-table/DataTable";
@@ -183,6 +183,13 @@ it("saves, applies and deletes views", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Delete view Mine" }));
   expect(screen.queryByRole("button", { name: "Mine" })).not.toBeInTheDocument();
   expect(JSON.parse(window.localStorage.getItem("opl.views.demo")!)).toEqual([]);
+  // 10초 동안 되돌린다.
+  expect(await screen.findByText("View Mine deleted.")).toBeInTheDocument();
+  // sonner 단추는 pointer capture를 쓰므로(jsdom에 없음) 클릭만 보낸다.
+  fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+  expect(JSON.parse(window.localStorage.getItem("opl.views.demo")!)).toEqual([
+    { name: "Mine", query: "q=al" },
+  ]);
 });
 
 it("hides chosen columns and narrow-screen columns by priority", async () => {

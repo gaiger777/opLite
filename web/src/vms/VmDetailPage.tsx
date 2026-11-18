@@ -12,9 +12,10 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { VmBackups } from "@/backups/VmBackups";
 import { ListPending } from "@/components/ListPending";
-import { PinButton, useVisit } from "@/components/PinButton";
+import { useVisit } from "@/components/PinButton";
 import { Pager, usePage } from "@/components/Pager";
 import { ReasonButton, ReasonList } from "@/components/Reason";
+import { ResourceHeader } from "@/components/ResourceHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -238,83 +239,104 @@ function VmHeader({ vm }: { vm: Vm }) {
       {t(`vms.action.${action}`)}
     </ReasonButton>
   );
+  const ips = (vm.spec.cloud_init?.networks ?? []).flatMap((net) =>
+    [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
+  );
   return (
-    <div className="flex flex-wrap items-center justify-between gap-2">
-      <div className="flex items-center gap-3">
-        <h1 className="text-xl font-semibold">{vm.name}</h1>
-        <PinButton resource={{ kind: "vm", id: vm.id, name: vm.name }} />
-        <VmPhaseBadge vm={vm} />
-        {haEnabled(vm.spec) && <Badge variant="outline">{t("vms.ha")}</Badge>}
-        {template && <Badge variant="secondary">{t("vms.template")}</Badge>}
-        {/* 실행 중에 적용하지 못한 하드웨어 변경이 있다. */}
-        {needsRestart(vm) && <Badge variant="secondary">{t("vms.restartNeeded")}</Badge>}
-        {node && (
-          <span className="text-sm text-muted-foreground">
-            {target ? t("vms.migratingTo", { from: node.name, to: target.name }) : node.name}
-          </span>
-        )}
-        {progress && <span className="text-sm text-muted-foreground">{progress}</span>}
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {operate && ACTIONS.map(button)}
-        {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
-        {operate && (
-          <ReasonButton variant="outline" size="sm" reason={consoleReason} reasons={hint} asChild>
-            <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
-              {t("vms.openConsole")}
-            </Link>
-          </ReasonButton>
-        )}
-        {operate && (
-          <ReasonButton
-            variant="outline"
-            size="sm"
-            reason={reasonOf("migrate")}
-            reasons={hint}
-            onClick={() => setConfirm("migrate")}
-          >
-            {t("vms.action.migrate")}
-          </ReasonButton>
-        )}
-        {write && (
-          <Button variant="outline" size="sm" asChild>
-            <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>
-          </Button>
-        )}
-        {write && can(me.role, "write", "volume") && (
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setConfirm(template ? "deploy" : "clone")}
-          >
-            {template ? t("templates.deploy") : t("vms.action.clone")}
-          </Button>
-        )}
-        {write && (
-          <ReasonButton
-            variant="outline"
-            size="sm"
-            reason={template ? revert : convert}
-            reasons={hint}
-            onClick={() => setConfirm(template ? "untemplate" : "template")}
-          >
-            {template ? t("templates.revert") : t("templates.convert")}
-          </ReasonButton>
-        )}
-        {write && (
-          <ReasonButton
-            variant="destructive"
-            size="sm"
-            reason={reasonOf("delete")}
-            reasons={hint}
-            onClick={() => setConfirm("delete")}
-          >
-            {t("vms.action.delete")}
-          </ReasonButton>
-        )}
-      </div>
+    <ResourceHeader
+      name={vm.name}
+      pin={{ kind: "vm", id: vm.id, name: vm.name }}
+      status={
+        <>
+          <VmPhaseBadge vm={vm} />
+          {haEnabled(vm.spec) && <Badge variant="outline">{t("vms.ha")}</Badge>}
+          {template && <Badge variant="secondary">{t("vms.template")}</Badge>}
+          {/* 실행 중에 적용하지 못한 하드웨어 변경이 있다. */}
+          {needsRestart(vm) && <Badge variant="secondary">{t("vms.restartNeeded")}</Badge>}
+        </>
+      }
+      meta={
+        (target || progress) && (
+          <>
+            {target && node && (
+              <span>{t("vms.migratingTo", { from: node.name, to: target.name })}</span>
+            )}
+            {progress && <span className="ml-2">{progress}</span>}
+          </>
+        )
+      }
+      summary={[
+        { label: t("common.node"), value: node?.name ?? "—" },
+        { label: t("vms.vcpus"), value: (vm.spec.cpu.sockets ?? 1) * vm.spec.cpu.cores },
+        { label: t("vms.memory"), value: formatMib(vm.spec.memory_mib) },
+        {
+          label: t("table.addresses"),
+          value: <span className="font-mono text-sm">{ips.join(", ") || "—"}</span>,
+        },
+      ]}
+      actions={
+        <>
+          {operate && ACTIONS.map(button)}
+          {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
+          {operate && (
+            <ReasonButton variant="outline" size="sm" reason={consoleReason} reasons={hint} asChild>
+              <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
+                {t("vms.openConsole")}
+              </Link>
+            </ReasonButton>
+          )}
+          {operate && (
+            <ReasonButton
+              variant="outline"
+              size="sm"
+              reason={reasonOf("migrate")}
+              reasons={hint}
+              onClick={() => setConfirm("migrate")}
+            >
+              {t("vms.action.migrate")}
+            </ReasonButton>
+          )}
+          {write && (
+            <Button variant="outline" size="sm" asChild>
+              <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>
+            </Button>
+          )}
+          {write && can(me.role, "write", "volume") && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setConfirm(template ? "deploy" : "clone")}
+            >
+              {template ? t("templates.deploy") : t("vms.action.clone")}
+            </Button>
+          )}
+          {write && (
+            <ReasonButton
+              variant="outline"
+              size="sm"
+              reason={template ? revert : convert}
+              reasons={hint}
+              onClick={() => setConfirm(template ? "untemplate" : "template")}
+            >
+              {template ? t("templates.revert") : t("templates.convert")}
+            </ReasonButton>
+          )}
+          {write && (
+            <ReasonButton
+              variant="destructive"
+              size="sm"
+              reason={reasonOf("delete")}
+              reasons={hint}
+              onClick={() => setConfirm("delete")}
+            >
+              {t("vms.action.delete")}
+            </ReasonButton>
+          )}
+        </>
+      }
+    >
       <ReasonList base={hint} reasons={reasons} className="basis-full" />
-    </div>
+    </ResourceHeader>
   );
 }
 

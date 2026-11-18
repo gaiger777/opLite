@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { NODE, pool, vm } from "@/test/fixtures";
@@ -30,6 +30,14 @@ it("pins a VM from its header and remembers the visit", async () => {
   await user.click(star);
   expect(star).toHaveAttribute("aria-pressed", "false");
   expect(localStorage.getItem(`opl.${ADMIN.user}.pins`)).toBe("[]");
+  // 빼면 되돌리기 알림이 뜬다.
+  expect(await screen.findByText("web removed from favorites.")).toBeInTheDocument();
+  // sonner 단추는 pointer capture를 쓰므로(jsdom에 없음) 클릭만 보낸다.
+  fireEvent.click(screen.getByRole("button", { name: "Undo" }));
+  expect(star).toHaveAttribute("aria-pressed", "true");
+  expect(JSON.parse(localStorage.getItem(`opl.${ADMIN.user}.pins`) ?? "[]")).toEqual([
+    { kind: "vm", id: web.id, name: "web" },
+  ]);
 });
 
 it("pins a node from its header", async () => {

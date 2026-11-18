@@ -5,6 +5,7 @@ import { Link } from "react-router";
 import { useList } from "@/api/live";
 import type { Task } from "@/api/types";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Pager, usePage } from "@/components/Pager";
@@ -188,22 +189,23 @@ export function TasksPage() {
   const pager = usePage(shown, TASK_PAGE_SIZE);
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex items-center justify-between gap-4">
-        <h1 id="tasks-title" className="text-xl font-semibold">
-          {t("nav.tasks")}
-        </h1>
-        <div className="flex items-center gap-2">
-          <Checkbox
-            id="failed-only"
-            checked={failedOnly}
-            onCheckedChange={(v) => {
-              setFailedOnly(v === true);
-              pager.setPage(0);
-            }}
-          />
-          <Label htmlFor="failed-only">{t("tasks.failedOnly")}</Label>
-        </div>
-      </div>
+      <PageHeader
+        id="tasks-title"
+        title={t("nav.tasks")}
+        actions={
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="failed-only"
+              checked={failedOnly}
+              onCheckedChange={(v) => {
+                setFailedOnly(v === true);
+                pager.setPage(0);
+              }}
+            />
+            <Label htmlFor="failed-only">{t("tasks.failedOnly")}</Label>
+          </div>
+        }
+      />
       <TaskTable
         tasks={pager.pageItems}
         labelledBy="tasks-title"

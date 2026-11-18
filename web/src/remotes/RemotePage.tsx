@@ -1,8 +1,8 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, MoreHorizontal } from "lucide-react";
+import { MoreHorizontal } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, useParams } from "react-router";
+import { useParams } from "react-router";
 import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
@@ -12,6 +12,8 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { ReasonMenuItem } from "@/components/Reason";
+import { ResourceHeader } from "@/components/ResourceHeader";
+import { StatusChip } from "@/components/StatusChip";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import {
@@ -77,37 +79,38 @@ export function RemotePage() {
     }
   }
 
-  const back = (
-    <Link
-      to="/remotes"
-      className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:underline"
-    >
-      <ArrowLeft className="size-4" />
-      {t("remotes.backToList")}
-    </Link>
-  );
   if (!remote.data) {
-    return (
-      <div className="flex flex-col gap-4">
-        {back}
-        <ListPending error={remote.error} />
-      </div>
-    );
+    return <ListPending error={remote.error} />;
   }
   const { status } = remote.data;
   const list = vms.data ?? [];
   return (
     <div className="flex flex-col gap-4">
-      {back}
-      <div className="flex flex-col gap-1">
-        <h1 id="remote-vms-title" className="text-xl font-semibold">
-          {t("remotes.vmsTitle", { name })}
-        </h1>
-        <p className="font-mono text-xs text-muted-foreground">
-          {status.cluster_name ? `${status.cluster_name} · ` : ""}
-          {remote.data.url}
-        </p>
-      </div>
+      <ResourceHeader
+        name={name}
+        status={
+          <StatusChip tone={status.reachable ? "success" : "danger"}>
+            {t(status.reachable ? "remotes.reachable" : "remotes.unreachable")}
+          </StatusChip>
+        }
+        meta={
+          <span className="font-mono text-xs">
+            {status.cluster_name ? `${status.cluster_name} · ` : ""}
+            {remote.data.url}
+          </span>
+        }
+        summary={[
+          { label: t("remotes.version"), value: status.version ?? "—" },
+          {
+            label: t("remotes.nodes"),
+            value: status.nodes ? t("remotes.nodesValue", status.nodes) : "—",
+          },
+          { label: t("remotes.vms"), value: status.vms ? t("remotes.vmsValue", status.vms) : "—" },
+        ]}
+      />
+      <h2 id="remote-vms-title" className="font-medium">
+        {t("remotes.vmsTitle", { name })}
+      </h2>
       {/* 다시 읽지 못하면 마지막으로 읽은 목록을 그대로 보이고 이유를 알린다. */}
       {vms.isError && vms.data && (
         <p role="alert" className="text-sm text-destructive">

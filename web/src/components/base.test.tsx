@@ -1,11 +1,11 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Inbox, TriangleAlert } from "lucide-react";
 
 import type { Vm } from "@/api/types";
 import { EmptyState } from "@/components/EmptyState";
 import { ACTION_ICONS, AREA_ICONS } from "@/components/icons";
-import { StatusChip } from "@/components/StatusChip";
+import { CHANGED_MS, StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { Kbd } from "@/components/ui/kbd";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -24,6 +24,23 @@ import { expectNoAxeViolations } from "@/test/axe";
 import { PHASE_TONE, VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
 describe("StatusChip", () => {
+  it("flashes data-changed for a moment when its state changes, not when first drawn", () => {
+    vi.useFakeTimers();
+    try {
+      const { rerender } = render(<StatusChip tone="neutral">Stopped</StatusChip>);
+      expect(screen.getByText("Stopped")).not.toHaveAttribute("data-changed");
+      rerender(<StatusChip tone="success">Running</StatusChip>);
+      expect(screen.getByText("Running")).toHaveAttribute("data-changed");
+      act(() => vi.advanceTimersByTime(CHANGED_MS));
+      expect(screen.getByText("Running")).not.toHaveAttribute("data-changed");
+      // 같은 상태로 다시 그려도 강조하지 않는다.
+      rerender(<StatusChip tone="success">Running</StatusChip>);
+      expect(screen.getByText("Running")).not.toHaveAttribute("data-changed");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows the text with a tone and a hidden dot", async () => {
     const { container } = render(<StatusChip tone="success">Running</StatusChip>);
     const chip = screen.getByText("Running");

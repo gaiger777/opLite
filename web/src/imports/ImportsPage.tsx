@@ -12,6 +12,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -95,26 +96,25 @@ export function ImportsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-col gap-1">
-          <h1 id="imports-title" className="text-xl font-semibold">
-            {t("nav.imports")}
-          </h1>
-          <p className="text-sm text-muted-foreground">{t("imports.pageHint")}</p>
-        </div>
-        {write && (
-          <div className="flex flex-wrap gap-2">
-            <Button variant="outline" onClick={() => setEsxi(true)}>
-              <Server />
-              {t("imports.esxi")}
-            </Button>
-            <Button onClick={() => setUploading(true)}>
-              <Upload />
-              {t("imports.upload")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="imports-title"
+        title={t("nav.imports")}
+        description={t("imports.pageHint")}
+        actions={
+          write && (
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => setEsxi(true)}>
+                <Server />
+                {t("imports.esxi")}
+              </Button>
+              <Button onClick={() => setUploading(true)}>
+                <Upload />
+                {t("imports.upload")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <Table aria-labelledby="imports-title">
         <TableHeader>
           <TableRow>

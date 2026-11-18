@@ -27,6 +27,7 @@ export function NodeDetailPage() {
   const { t } = useTranslation();
   const { name = "" } = useParams();
   const nodes = useList("node");
+  const vms = useList("vm");
   if (!nodes.data) {
     return <ListPending error={nodes.error} />;
   }
@@ -43,7 +44,7 @@ export function NodeDetailPage() {
   }
   return (
     <div className="flex flex-col gap-6">
-      <NodeHeader node={node} />
+      <NodeHeader node={node} vms={vms.data ? vmsOn(node, vms.data).length : undefined} />
       <NodeMetrics node={node} />
       <NodeVms node={node} />
     </div>

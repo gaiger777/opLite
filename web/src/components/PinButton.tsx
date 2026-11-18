@@ -6,6 +6,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { pushRecent, type ResourceRef, useRefs } from "@/lib/recent";
+import { undoToast } from "@/lib/undo";
 
 /**
  * 상세 머리의 즐겨찾기 ★(설계 §5.7). `f` 단축키가 `data-pin-toggle`인 단추를 누른다. 브라우저에만 둔다. 목록 행·미리
@@ -20,7 +21,7 @@ export function PinButton({
 }) {
   const { t } = useTranslation();
   const me = usePrincipal();
-  const { pins, toggle } = useRefs(me.user);
+  const { pins, toggle, set } = useRefs(me.user);
   const pinned = pins.some((p) => p.kind === resource.kind && p.id === resource.id);
   const Icon = ACTION_ICONS.favorite;
   return (
@@ -30,7 +31,13 @@ export function PinButton({
       data-pin-toggle={shortcut ? "" : undefined}
       aria-pressed={pinned}
       aria-label={t("favorites.toggle", { name: resource.name })}
-      onClick={() => toggle({ kind: resource.kind, id: resource.id, name: resource.name })}
+      onClick={() => {
+        const ref = { kind: resource.kind, id: resource.id, name: resource.name };
+        // 빼면 10초 동안 되돌릴 수 있다(설계 §5.8).
+        if (!toggle(ref)) {
+          undoToast(t, t("favorites.removed", { name: ref.name }), () => set(ref, true));
+        }
+      }}
     >
       <Icon className={cn(pinned && "fill-current text-warning")} />
     </Button>

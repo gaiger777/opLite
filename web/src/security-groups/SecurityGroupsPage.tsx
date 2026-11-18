@@ -12,6 +12,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -43,17 +44,18 @@ export function SecurityGroupsPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="security-groups-title" className="text-xl font-semibold">
-          {t("nav.securityGroups")}
-        </h1>
-        {write && (
-          <Button onClick={() => setCreating(true)}>
-            <Plus />
-            {t("common.create")}
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        id="security-groups-title"
+        title={t("nav.securityGroups")}
+        actions={
+          write && (
+            <Button onClick={() => setCreating(true)}>
+              <Plus />
+              {t("common.create")}
+            </Button>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("securityGroups.note")}</p>
       <Table aria-labelledby="security-groups-title">
         <TableHeader>

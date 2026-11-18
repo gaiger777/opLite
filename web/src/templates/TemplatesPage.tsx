@@ -11,6 +11,7 @@ import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import {
@@ -51,9 +52,7 @@ export function TemplatesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <h1 id="templates-title" className="text-xl font-semibold">
-        {t("nav.templates")}
-      </h1>
+      <PageHeader id="templates-title" title={t("nav.templates")} />
       <p className="text-sm text-muted-foreground">{t("templates.note")}</p>
       <Table aria-labelledby="templates-title">
         <TableHeader>

@@ -13,6 +13,7 @@ import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -77,7 +78,7 @@ export function RealmsPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <h1 className="text-xl font-semibold">{t("nav.realms")}</h1>
+        <PageHeader title={t("nav.realms")} />
         <p className="text-sm text-muted-foreground">{t("realms.adminOnly")}</p>
       </div>
     );
@@ -86,21 +87,22 @@ export function RealmsPage() {
   const list = realms.data ?? [];
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="realms-title" className="text-xl font-semibold">
-          {t("nav.realms")}
-        </h1>
-        <Button
-          disabled={!realms.isSuccess}
-          onClick={(e) => {
-            opener.current = e.currentTarget;
-            setDialog({ kind: "create" });
-          }}
-        >
-          <Plus />
-          {t("common.create")}
-        </Button>
-      </div>
+      <PageHeader
+        id="realms-title"
+        title={t("nav.realms")}
+        actions={
+          <Button
+            disabled={!realms.isSuccess}
+            onClick={(e) => {
+              opener.current = e.currentTarget;
+              setDialog({ kind: "create" });
+            }}
+          >
+            <Plus />
+            {t("common.create")}
+          </Button>
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("realms.pageHint")}</p>
       <Table aria-labelledby="realms-title">
         <TableHeader>

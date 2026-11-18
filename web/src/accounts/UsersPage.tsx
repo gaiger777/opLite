@@ -13,6 +13,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field, type FieldA11y } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { PageHeader } from "@/components/PageHeader";
 import { ReasonMenuItem } from "@/components/Reason";
 import { TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
@@ -73,7 +74,7 @@ export function UsersPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <h1 className="text-xl font-semibold">{t("nav.users")}</h1>
+        <PageHeader title={t("nav.users")} />
         <p className="text-sm text-muted-foreground">{t("users.adminOnly")}</p>
       </div>
     );
@@ -81,15 +82,16 @@ export function UsersPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="users-title" className="text-xl font-semibold">
-          {t("nav.users")}
-        </h1>
-        <Button onClick={() => setDialog({ kind: "create" })}>
-          <Plus />
-          {t("common.create")}
-        </Button>
-      </div>
+      <PageHeader
+        id="users-title"
+        title={t("nav.users")}
+        actions={
+          <Button onClick={() => setDialog({ kind: "create" })}>
+            <Plus />
+            {t("common.create")}
+          </Button>
+        }
+      />
       <Table aria-labelledby="users-title">
         <TableHeader>
           <TableRow>

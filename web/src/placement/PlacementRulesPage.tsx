@@ -12,6 +12,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -56,27 +57,28 @@ export function PlacementRulesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="placement-rules-title" className="text-xl font-semibold">
-          {t("nav.placementRules")}
-        </h1>
-        {write && (
-          <div className="flex flex-wrap items-center gap-2 text-sm">
-            {/* 노드 목록을 읽어야 규칙의 노드를 고른다. */}
-            {!nodes.isSuccess && <ListPending error={nodes.error} />}
-            <Button
-              disabled={!nodes.isSuccess || !rules.isSuccess}
-              onClick={(e) => {
-                opener.current = e.currentTarget;
-                setEditing(null);
-              }}
-            >
-              <Plus />
-              {t("common.create")}
-            </Button>
-          </div>
-        )}
-      </div>
+      <PageHeader
+        id="placement-rules-title"
+        title={t("nav.placementRules")}
+        actions={
+          write && (
+            <div className="flex flex-wrap items-center gap-2 text-sm">
+              {/* 노드 목록을 읽어야 규칙의 노드를 고른다. */}
+              {!nodes.isSuccess && <ListPending error={nodes.error} />}
+              <Button
+                disabled={!nodes.isSuccess || !rules.isSuccess}
+                onClick={(e) => {
+                  opener.current = e.currentTarget;
+                  setEditing(null);
+                }}
+              >
+                <Plus />
+                {t("common.create")}
+              </Button>
+            </div>
+          )
+        }
+      />
       <p className="text-sm text-muted-foreground">{t("placementRules.pageHint")}</p>
       <Table aria-labelledby="placement-rules-title">
         <TableHeader>

@@ -1,7 +1,7 @@
 import type { TFunction } from "i18next";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, useNavigate, useParams } from "react-router";
+import { useNavigate, useParams } from "react-router";
 
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
@@ -11,6 +11,7 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
+import { ResourceHeader } from "@/components/ResourceHeader";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -84,42 +85,52 @@ function ImportView({ imp }: { imp: VmImport }) {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-end justify-between gap-2">
-        <div className="flex flex-col gap-1">
-          <Link
-            to="/imports"
-            className="text-sm text-muted-foreground underline-offset-4 hover:underline"
-          >
-            {t("nav.imports")}
-          </Link>
-          <h1 className="text-xl font-semibold">{imp.name}</h1>
-        </div>
-        {write && (
-          // 가져오는 중인지는 서버가 정한다(실행 Task가 끝나지 않았으면 import_busy). 실행을 보내는 동안만 막는다.
-          <Button
-            variant="outline"
-            aria-label={t("imports.deleteNamed", { name: imp.name })}
-            disabled={busy}
-            onClick={(e) => {
-              opener.current = e.currentTarget;
-              setDeleteOpen(true);
-            }}
-          >
-            {t("common.delete")}
-          </Button>
-        )}
-      </div>
-      <div className="flex flex-wrap items-center gap-2 text-sm">
-        <ImportPhaseBadge phase={phase} />
-        {phase === "importing" && (
-          <span className="text-muted-foreground">{t("imports.importing")}</span>
-        )}
-        {phase === "done" && (
-          <span>
-            {t("imports.imported")} <ImportedVm imp={imp} />
-          </span>
-        )}
-      </div>
+      <ResourceHeader
+        name={imp.name}
+        status={
+          <>
+            <ImportPhaseBadge phase={phase} />
+            {phase === "importing" && (
+              <span className="text-sm text-muted-foreground">{t("imports.importing")}</span>
+            )}
+            {phase === "done" && (
+              <span className="text-sm">
+                {t("imports.imported")} <ImportedVm imp={imp} />
+              </span>
+            )}
+          </>
+        }
+        actions={
+          write && (
+            // 가져오는 중인지는 서버가 정한다(실행 Task가 끝나지 않았으면 import_busy). 실행을 보내는 동안만 막는다.
+            <Button
+              variant="outline"
+              size="sm"
+              aria-label={t("imports.deleteNamed", { name: imp.name })}
+              disabled={busy}
+              onClick={(e) => {
+                opener.current = e.currentTarget;
+                setDeleteOpen(true);
+              }}
+            >
+              {t("common.delete")}
+            </Button>
+          )
+        }
+        summary={[
+          { label: t("common.node"), value: node },
+          ...(src
+            ? [
+                { label: t("imports.sourceVm"), value: src.name },
+                {
+                  label: t("vms.cpu"),
+                  value: t("imports.cpuValue", { vcpus: src.vcpus, cores: src.cores_per_socket }),
+                },
+                { label: t("vms.memory"), value: formatMib(src.memory_mib) },
+              ]
+            : []),
+        ]}
+      />
       {error && (
         <p role="status" className="text-sm text-destructive">
           {t(phase === "failed" ? "imports.failedError" : "imports.lastError", { error })}
@@ -140,14 +151,9 @@ function ImportView({ imp }: { imp: VmImport }) {
             </dd>
             {src && (
               <>
-                <dt className="text-muted-foreground">{t("imports.sourceVm")}</dt>
-                <dd>{src.name}</dd>
+                {/* 원본 VM 이름·CPU·메모리는 머리의 요약 카드에 있다. */}
                 <dt className="text-muted-foreground">{t("imports.guestOs")}</dt>
                 <dd>{src.guest_os}</dd>
-                <dt className="text-muted-foreground">{t("vms.cpu")}</dt>
-                <dd>{t("imports.cpuValue", { vcpus: src.vcpus, cores: src.cores_per_socket })}</dd>
-                <dt className="text-muted-foreground">{t("vms.memory")}</dt>
-                <dd>{formatMib(src.memory_mib)}</dd>
                 <dt className="text-muted-foreground">{t("vms.firmware")}</dt>
                 <dd>{src.firmware}</dd>
               </>

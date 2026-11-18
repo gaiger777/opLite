@@ -69,11 +69,18 @@ export function readPins(user: string): ResourceRef[] {
   return read(pinsKey(user));
 }
 
+/** 즐겨찾기에 넣거나 뺀다(이미 그렇면 그대로 둔다). */
+export function setPin(user: string, ref: ResourceRef, on: boolean) {
+  const pins = readPins(user);
+  if (pins.some((p) => same(p, ref)) !== on) {
+    write(pinsKey(user), on ? [...pins, ref] : pins.filter((p) => !same(p, ref)));
+  }
+}
+
 /** 즐겨찾기에 넣거나 뺀다. 넣었으면 참이다. */
 export function togglePin(user: string, ref: ResourceRef): boolean {
-  const pins = readPins(user);
-  const pinned = pins.some((p) => same(p, ref));
-  write(pinsKey(user), pinned ? pins.filter((p) => !same(p, ref)) : [...pins, ref]);
+  const pinned = readPins(user).some((p) => same(p, ref));
+  setPin(user, ref, !pinned);
   return !pinned;
 }
 
@@ -108,5 +115,6 @@ export function useRefs(user: string) {
     };
   }, [user]);
   const toggle = useCallback((ref: ResourceRef) => togglePin(user, ref), [user]);
-  return { ...state, toggle };
+  const set = useCallback((ref: ResourceRef, on: boolean) => setPin(user, ref, on), [user]);
+  return { ...state, toggle, set };
 }
