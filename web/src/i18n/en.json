@@ -104,7 +104,6 @@
     "in_use": "It is still in use: {{message}}"
   },
   "nav": {
-    "dashboard": "Dashboard",
     "vms": "Virtual machines",
     "imports": "Imports",
     "volumes": "Volumes",
@@ -131,7 +130,30 @@
     "templates": "Templates",
     "images": "Image library",
     "alerts": "Alerts",
-    "notificationTargets": "Notification targets"
+    "notificationTargets": "Notification targets",
+    "area": {
+      "home": "Home",
+      "vms": "Virtual machines",
+      "infra": "Infrastructure",
+      "protect": "Protection",
+      "activity": "Activity",
+      "settings": "Settings"
+    },
+    "vmList": "VMs",
+    "imagesIsos": "Images & ISOs",
+    "replication": "Remote replication",
+    "placementTab": "Placement",
+    "general": "General",
+    "subscription": "Subscription",
+    "new": "New",
+    "main": "Main",
+    "areaMenu": "{{area}} menu",
+    "viewMenu": "{{tab}} views",
+    "breadcrumb": "Breadcrumb",
+    "skipToContent": "Skip to content",
+    "openMenu": "Open menu",
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar"
   },
   "header": {
     "language": "Language",
@@ -1629,7 +1651,13 @@
       "confirm": "Check the fingerprint against the remote cluster and confirm it.",
       "token": "Enter an API token of the remote cluster.",
       "tokenAgain": "Enter the API token again: the URL or CA changed."
-    }
+    },
+    "manage": "Manage remote clusters",
+    "manageHint": "Add, change or remove the remote clusters this cluster can see. Their status and VMs are under Protection › Remote replication.",
+    "replicatingJobs": "Backup jobs that copy to remote clusters",
+    "noReplicatingJobs": "No backup job copies to a remote cluster.",
+    "job": "Backup job",
+    "target": "Remote / pool"
   },
   "vmForm": {
     "createTitle": "Create a virtual machine",
@@ -2002,9 +2030,7 @@
       "disable": "Turn off Prometheus endpoint",
       "enabled": "The Prometheus endpoint is on.",
       "disabled": "The Prometheus endpoint is off."
-    },
-    "notificationsIntro": "Where alert rules send notifications: mail servers and webhooks (Slack, Teams, ntfy, Gotify).",
-    "manageNotifications": "Manage notification targets"
+    }
   },
   "audit": {
     "adminOnly": "Only administrators can read the audit log.",

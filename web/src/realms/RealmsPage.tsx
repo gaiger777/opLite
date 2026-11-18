@@ -77,7 +77,7 @@ export function RealmsPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <h1 className="text-2xl font-semibold">{t("nav.realms")}</h1>
+        <h1 className="text-xl font-semibold">{t("nav.realms")}</h1>
         <p className="text-sm text-muted-foreground">{t("realms.adminOnly")}</p>
       </div>
     );
@@ -87,7 +87,7 @@ export function RealmsPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="realms-title" className="text-2xl font-semibold">
+        <h1 id="realms-title" className="text-xl font-semibold">
           {t("nav.realms")}
         </h1>
         <Button

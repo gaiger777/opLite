@@ -74,7 +74,7 @@ it("says when old nodes do not know the Prometheus setting", async () => {
   );
 });
 
-it("shows Prometheus read-only and hides notification targets from non-admins", async () => {
+it("shows Prometheus read-only to non-admins", async () => {
   server.use(http.get(apiUrl("/settings"), () => HttpResponse.json(SETTINGS)));
   renderPage(<SettingsPage />, {
     path: "/settings",
@@ -84,16 +84,4 @@ it("shows Prometheus read-only and hides notification targets from non-admins", 
   expect(
     within(section).queryByRole("button", { name: /Prometheus endpoint/ }),
   ).not.toBeInTheDocument();
-  expect(
-    screen.queryByRole("link", { name: "Manage notification targets" }),
-  ).not.toBeInTheDocument();
-});
-
-it("links admins to the notification targets", async () => {
-  server.use(http.get(apiUrl("/settings"), () => HttpResponse.json(SETTINGS)));
-  renderPage(<SettingsPage />, { path: "/settings" });
-  expect(await screen.findByRole("link", { name: "Manage notification targets" })).toHaveAttribute(
-    "href",
-    "/settings/notifications",
-  );
 });

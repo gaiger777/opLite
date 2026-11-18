@@ -1,49 +1,14 @@
 import { useQuery } from "@tanstack/react-query";
-import {
-  Archive,
-  Boxes,
-  CalendarClock,
-  Cpu,
-  Database,
-  DatabaseZap,
-  Disc,
-  Globe,
-  HeartPulse,
-  HardDrive,
-  IdCard,
-  Import,
-  KeyRound,
-  Languages,
-  Layers,
-  LayoutDashboard,
-  LayoutTemplate,
-  Library,
-  ListChecks,
-  Lock,
-  LogOut,
-  Monitor,
-  Moon,
-  Network,
-  Scale,
-  ScrollText,
-  Server,
-  Settings,
-  Shield,
-  Sun,
-  User,
-  Users,
-  Waypoints,
-  type LucideIcon,
-} from "lucide-react";
-import { useRef, useState } from "react";
+import { Lock, Menu, Monitor, Moon, Sun, User } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { NavLink, Outlet } from "react-router";
+import { Outlet, useLocation } from "react-router";
 
 import { ChangePasswordDialog } from "@/accounts/ChangePasswordDialog";
 import { api, call } from "@/api/client";
 import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
-import { can, type Kind } from "@/auth/permissions";
+import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -53,97 +18,118 @@ import {
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
   DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
 import { type Language, setLanguage } from "@/i18n";
+import { AreaTabs, ViewSwitch } from "@/layout/AreaTabs";
+import { Breadcrumbs } from "@/layout/Breadcrumbs";
+import { crumbsOf, isFullWidth, rememberTab } from "@/layout/nav";
+import { AreaLinks, Sidebar } from "@/layout/Sidebar";
 import { type Density, useDensity } from "@/lib/density";
 import { type Theme, useTheme } from "@/lib/theme";
 
-/** 왼쪽 메뉴. `kind`가 있으면 그 종류를 읽을 수 있는 역할에만, `admin`이면 admin에게만 보인다. */
-const NAV: {
-  to: string;
-  key: string;
-  icon: LucideIcon;
-  end: boolean;
-  kind?: Kind;
-  admin?: boolean;
-}[] = [
-  { to: "/", key: "nav.dashboard", icon: LayoutDashboard, end: true },
-  { to: "/vms", key: "nav.vms", icon: Server, end: false },
-  { to: "/templates", key: "nav.templates", icon: LayoutTemplate, end: false },
-  { to: "/images", key: "nav.images", icon: Library, end: false },
-  { to: "/imports", key: "nav.imports", icon: Import, end: false },
-  { to: "/volumes", key: "nav.volumes", icon: HardDrive, end: false },
-  { to: "/isos", key: "nav.isos", icon: Disc, end: false },
-  { to: "/storage-pools", key: "nav.pools", icon: Database, end: false },
-  { to: "/ceph", key: "nav.ceph", icon: DatabaseZap, end: false },
-  { to: "/backups", key: "nav.backups", icon: Archive, end: false },
-  { to: "/backup-jobs", key: "nav.backupJobs", icon: CalendarClock, end: false },
-  { to: "/networks", key: "nav.networks", icon: Network, end: false },
-  { to: "/security-groups", key: "nav.securityGroups", icon: Shield, end: false },
-  { to: "/nodes", key: "nav.nodes", icon: Cpu, end: false },
-  { to: "/ha-groups", key: "nav.haGroups", icon: Layers, end: false },
-  { to: "/ha-checks", key: "nav.haChecks", icon: HeartPulse, end: false },
-  { to: "/placement-rules", key: "nav.placementRules", icon: Waypoints, end: false },
-  { to: "/placement", key: "nav.placement", icon: Scale, end: false },
-  { to: "/tasks", key: "nav.tasks", icon: ListChecks, end: false },
-  { to: "/audit", key: "nav.audit", icon: ScrollText, end: false, admin: true },
-  { to: "/users", key: "nav.users", icon: Users, end: false, kind: "user" },
-  { to: "/realms", key: "nav.realms", icon: IdCard, end: false, kind: "realm" },
-  { to: "/tokens", key: "nav.tokens", icon: KeyRound, end: false },
-  { to: "/cluster", key: "nav.cluster", icon: Boxes, end: false },
-  { to: "/remotes", key: "nav.remotes", icon: Globe, end: false, kind: "remote" },
-  { to: "/settings", key: "nav.settings", icon: Settings, end: false },
-];
-
+/**
+ * 앱의 틀: 왼쪽 영역 사이드바(설계 §4), 머리줄(☰·이동 경로·클러스터·실시간·사용자 메뉴), 본문 위 영역 탭과
+ * 보기 전환. 경로가 바뀌면 그 영역의 마지막 탭을 기억하고 본문 제목으로 포커스를 옮긴다.
+ */
 export function AppLayout() {
   const { t } = useTranslation();
   const me = usePrincipal();
+  const { pathname, search } = useLocation();
   const cluster = useQuery({
     queryKey: ["cluster"],
     queryFn: () => call(api.GET("/cluster")),
   });
-  const nav = NAV.filter(
-    (item) =>
-      (!item.kind || can(me.role, "read", item.kind)) && (!item.admin || me.role === "admin"),
-  );
+  const main = useRef<HTMLElement>(null);
+  const [announce, setAnnounce] = useState("");
+  const full = isFullWidth(pathname);
+
+  useEffect(() => rememberTab(pathname, search), [pathname, search]);
+
+  // 첫 화면은 그대로 두고, 화면이 바뀔 때만 본문 제목(없으면 본문)으로 포커스를 옮기고 화면 이름을 읽어 준다.
+  const shown = useRef(pathname);
+  useEffect(() => {
+    if (shown.current === pathname) {
+      return;
+    }
+    shown.current = pathname;
+    const target = main.current?.querySelector("h1") ?? main.current;
+    if (target) {
+      target.setAttribute("tabindex", "-1");
+      target.focus({ preventScroll: true });
+    }
+    setAnnounce(
+      crumbsOf(pathname, me.role, t)
+        .map((crumb) => crumb.label)
+        .join(" › "),
+    );
+    // 화면 이름은 경로가 바뀔 때만 읽는다(언어를 바꿨다고 다시 읽지 않는다).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pathname]);
+
   return (
-    <div className="flex min-h-svh flex-col md:flex-row">
-      <aside className="border-b bg-sidebar text-sidebar-foreground md:w-56 md:border-r md:border-b-0">
-        <div className="px-4 py-3 text-lg font-semibold">Orbivisor</div>
-        <nav className="flex gap-1 overflow-x-auto px-2 pb-2 md:flex-col">
-          {nav.map(({ to, key, icon: Icon, end }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={end}
-              className={({ isActive }) =>
-                `flex items-center gap-2 rounded-md px-3 py-2 text-sm whitespace-nowrap hover:bg-sidebar-accent ${
-                  isActive ? "bg-sidebar-accent font-medium" : ""
-                }`
-              }
-            >
-              <Icon className="size-4" />
-              {t(key)}
-            </NavLink>
-          ))}
-        </nav>
-      </aside>
+    <div className="flex min-h-svh">
+      <a
+        href="#main"
+        className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:ring-2 focus:ring-ring"
+      >
+        {t("nav.skipToContent")}
+      </a>
+      <Sidebar />
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 items-center justify-between gap-2 border-b px-4">
-          <span className="truncate text-sm text-muted-foreground">{cluster.data?.name}</span>
-          <div className="flex items-center gap-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <MobileNav />
+            <Breadcrumbs />
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <span className="hidden truncate text-sm text-muted-foreground lg:inline">
+              {cluster.data?.name}
+            </span>
             <LiveBadge />
-            <LanguageMenu />
-            <ThemeMenu />
             <UserMenu />
           </div>
         </header>
-        <main className="min-w-0 flex-1 p-4 md:p-6">
-          <Outlet />
+        <main
+          id="main"
+          ref={main}
+          tabIndex={-1}
+          className="flex min-w-0 flex-1 flex-col gap-(--gap) p-4 outline-none md:p-6"
+        >
+          {!full && <AreaTabs />}
+          {!full && <ViewSwitch />}
+          <div className="min-w-0">
+            <Outlet />
+          </div>
         </main>
+        <div aria-live="polite" className="sr-only">
+          {announce}
+        </div>
       </div>
     </div>
+  );
+}
+
+/** 768px 아래: 사이드바 대신 머리줄의 ☰가 영역 링크 서랍을 연다. */
+function MobileNav() {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  return (
+    <Sheet open={open} onOpenChange={setOpen}>
+      <SheetTrigger asChild>
+        <Button variant="ghost" size="icon" className="md:hidden" aria-label={t("nav.openMenu")}>
+          <Menu />
+        </Button>
+      </SheetTrigger>
+      <SheetContent side="left" className="w-64 gap-0 p-0" aria-describedby={undefined}>
+        <SheetTitle className="flex h-14 items-center px-4 text-lg">Orbivisor</SheetTitle>
+        <AreaLinks onNavigate={() => setOpen(false)} />
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -160,54 +146,6 @@ function LiveBadge() {
         {t(`live.${status}`)}
       </span>
     </span>
-  );
-}
-
-function LanguageMenu() {
-  const { t, i18n } = useTranslation();
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" aria-label={t("header.language")}>
-          <Languages />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuRadioGroup
-          value={i18n.language}
-          onValueChange={(v) => setLanguage(v as Language)}
-        >
-          <DropdownMenuRadioItem value="ko" lang="ko">
-            한국어
-          </DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="en" lang="en">
-            English
-          </DropdownMenuRadioItem>
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
-function ThemeMenu() {
-  const { t } = useTranslation();
-  const { theme, setTheme } = useTheme();
-  const Icon = theme === "dark" ? Moon : theme === "light" ? Sun : Monitor;
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" aria-label={t("header.theme")}>
-          <Icon />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuRadioGroup value={theme} onValueChange={(v) => setTheme(v as Theme)}>
-          <DropdownMenuRadioItem value="system">{t("header.themeSystem")}</DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="light">{t("header.themeLight")}</DropdownMenuRadioItem>
-          <DropdownMenuRadioItem value="dark">{t("header.themeDark")}</DropdownMenuRadioItem>
-        </DropdownMenuRadioGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
   );
 }
 
@@ -248,6 +186,8 @@ function UserMenu() {
               {t("header.densityCompact")}
             </DropdownMenuRadioItem>
           </DropdownMenuRadioGroup>
+          <LanguageItems />
+          <ThemeItems />
           <DropdownMenuSeparator />
           {/* 외부 사용자(이름에 `@<영역>`)의 비밀번호는 영역의 디렉터리가 맡는다. */}
           {!me.name.includes("@") && (
@@ -257,7 +197,7 @@ function UserMenu() {
             </DropdownMenuItem>
           )}
           <DropdownMenuItem onSelect={() => void logout()}>
-            <LogOut />
+            <ACTION_ICONS.logout />
             {t("header.logout")}
           </DropdownMenuItem>
         </DropdownMenuContent>
@@ -266,5 +206,58 @@ function UserMenu() {
         <ChangePasswordDialog returnFocus={trigger} onClose={() => setChanging(false)} />
       )}
     </>
+  );
+}
+
+/** 사용자 메뉴의 언어 고르기 */
+function LanguageItems() {
+  const { t, i18n } = useTranslation();
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <ACTION_ICONS.language />
+        {t("header.language")}
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        <DropdownMenuRadioGroup
+          aria-label={t("header.language")}
+          value={i18n.language}
+          onValueChange={(v) => setLanguage(v as Language)}
+        >
+          <DropdownMenuRadioItem value="ko" lang="ko">
+            한국어
+          </DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="en" lang="en">
+            English
+          </DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
+  );
+}
+
+/** 사용자 메뉴의 테마 고르기 */
+function ThemeItems() {
+  const { t } = useTranslation();
+  const { theme, setTheme } = useTheme();
+  const Icon = theme === "dark" ? Moon : theme === "light" ? Sun : Monitor;
+  return (
+    <DropdownMenuSub>
+      <DropdownMenuSubTrigger>
+        <Icon />
+        {t("header.theme")}
+      </DropdownMenuSubTrigger>
+      <DropdownMenuSubContent>
+        <DropdownMenuRadioGroup
+          aria-label={t("header.theme")}
+          value={theme}
+          onValueChange={(v) => setTheme(v as Theme)}
+        >
+          <DropdownMenuRadioItem value="system">{t("header.themeSystem")}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="light">{t("header.themeLight")}</DropdownMenuRadioItem>
+          <DropdownMenuRadioItem value="dark">{t("header.themeDark")}</DropdownMenuRadioItem>
+        </DropdownMenuRadioGroup>
+      </DropdownMenuSubContent>
+    </DropdownMenuSub>
   );
 }

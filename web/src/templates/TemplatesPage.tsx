@@ -51,7 +51,7 @@ export function TemplatesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <h1 id="templates-title" className="text-2xl font-semibold">
+      <h1 id="templates-title" className="text-xl font-semibold">
         {t("nav.templates")}
       </h1>
       <p className="text-sm text-muted-foreground">{t("templates.note")}</p>

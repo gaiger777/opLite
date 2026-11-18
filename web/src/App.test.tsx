@@ -274,7 +274,7 @@ it("reads the session cookie with whoami when single sign-on lands on /", async 
   );
   window.history.pushState({}, "", "/");
   render(<App />);
-  expect(await screen.findByRole("heading", { level: 1, name: "Dashboard" })).toBeInTheDocument();
+  expect(await screen.findByRole("heading", { level: 1, name: "Home" })).toBeInTheDocument();
   expect(window.location.pathname).toBe("/");
   expect(whoami.length).toBeGreaterThan(0);
   for (const request of whoami) {

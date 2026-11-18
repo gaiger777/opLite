@@ -29,7 +29,7 @@ export function AlertsPage() {
   const tab = TABS.find((id) => id === params.get("tab")) ?? "active";
   return (
     <div className="flex flex-col gap-4">
-      <h1 className="text-2xl font-semibold">{t("nav.alerts")}</h1>
+      <h1 className="text-xl font-semibold">{t("nav.alerts")}</h1>
       <Tabs
         value={tab}
         onValueChange={(value) =>

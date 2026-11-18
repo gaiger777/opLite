@@ -97,7 +97,7 @@ export function DashboardPage() {
 
   return (
     <div className="flex flex-col gap-6">
-      <h1 className="text-2xl font-semibold">{t("nav.dashboard")}</h1>
+      <h1 className="text-xl font-semibold">{t("nav.area.home")}</h1>
       <SubscriptionBanner />
       {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
       {versions.length > 1 && (

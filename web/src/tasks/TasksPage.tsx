@@ -178,14 +178,10 @@ export function TasksPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between gap-4">
-        <h1 id="tasks-title" className="text-2xl font-semibold">
+        <h1 id="tasks-title" className="text-xl font-semibold">
           {t("nav.tasks")}
         </h1>
         <div className="flex items-center gap-2">
-          {/* 경보 화면은 사이드바에 없다(계획 61이 활동 영역 탭으로 넣는다). */}
-          <Link to="/alerts" className="mr-4 text-sm underline-offset-4 hover:underline">
-            {t("nav.alerts")}
-          </Link>
           <Checkbox
             id="failed-only"
             checked={failedOnly}

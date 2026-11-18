@@ -87,7 +87,7 @@ export function PlacementPage() {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-semibold">{t("nav.placement")}</h1>
+        <h1 className="text-xl font-semibold">{t("nav.placement")}</h1>
         <p className="text-sm text-muted-foreground">{t("placement.pageHint")}</p>
       </div>
       {!s ? (

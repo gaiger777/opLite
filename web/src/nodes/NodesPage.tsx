@@ -227,7 +227,7 @@ export function NodesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <h1 id="nodes-title" className="text-2xl font-semibold">
+      <h1 id="nodes-title" className="text-xl font-semibold">
         {t("nav.nodes")}
       </h1>
       <p className="text-sm text-muted-foreground">{t("nodes.joinNote")}</p>

@@ -1,8 +1,30 @@
-import { currentAuthEpoch, NetworkError, reportUnauthorized, toApiError } from "@/api/client";
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  api,
+  call,
+  currentAuthEpoch,
+  NetworkError,
+  reportUnauthorized,
+  toApiError,
+} from "@/api/client";
 import type { components } from "@/api/schema";
 import type { StoragePool, Task, Vm } from "@/api/types";
 
 export type RemoteView = components["schemas"]["RemoteView"];
+
+/** 목록을 다시 읽는 간격. 원격은 watch로 받지 않는다(토큰을 담고 있다). */
+const REFRESH_MS = 10_000;
+
+/** 원격 목록(이름 순). 보기 화면과 관리 화면이 같은 쿼리 키를 쓴다. */
+export function useRemotes() {
+  return useQuery({
+    queryKey: ["remotes"],
+    queryFn: () => call(api.GET("/remotes")),
+    select: (list) => [...list.items].sort((a, b) => a.name.localeCompare(b.name)),
+    refetchInterval: REFRESH_MS,
+  });
+}
 
 /** 원격 클러스터 화면에서 하는 VM 동작. `stop`은 ACPI 종료, `force-stop`은 곧바로 끄기다. */
 export type RemoteVmAction = "start" | "stop" | "force-stop";

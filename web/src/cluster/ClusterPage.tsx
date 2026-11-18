@@ -66,7 +66,7 @@ export function ClusterPage() {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-2xl font-semibold">{t("cluster.title", { name })}</h1>
+        <h1 className="text-xl font-semibold">{t("cluster.title", { name })}</h1>
         {can(me.role, "write", "join-token") && (
           <Button ref={opener} onClick={() => setIssuing(true)}>
             <Plus />

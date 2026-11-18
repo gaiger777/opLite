@@ -104,7 +104,6 @@
     "in_use": "아직 쓰는 곳이 있습니다: {{message}}"
   },
   "nav": {
-    "dashboard": "대시보드",
     "vms": "가상 머신",
     "imports": "가져오기",
     "volumes": "볼륨",
@@ -131,7 +130,30 @@
     "templates": "템플릿",
     "images": "이미지 라이브러리",
     "alerts": "경보",
-    "notificationTargets": "알림 대상"
+    "notificationTargets": "알림 대상",
+    "area": {
+      "home": "홈",
+      "vms": "가상 머신",
+      "infra": "인프라",
+      "protect": "보호",
+      "activity": "활동",
+      "settings": "설정"
+    },
+    "vmList": "VM",
+    "imagesIsos": "이미지·ISO",
+    "replication": "원격 복제",
+    "placementTab": "배치",
+    "general": "일반",
+    "subscription": "구독",
+    "new": "새로 만들기",
+    "main": "주 메뉴",
+    "areaMenu": "{{area}} 메뉴",
+    "viewMenu": "{{tab}} 보기",
+    "breadcrumb": "이동 경로",
+    "skipToContent": "본문으로 건너뛰기",
+    "openMenu": "메뉴 열기",
+    "collapse": "사이드바 접기",
+    "expand": "사이드바 펴기"
   },
   "header": {
     "language": "언어",
@@ -1629,7 +1651,13 @@
       "confirm": "지문을 원격 클러스터에서 확인하고 체크하세요.",
       "token": "원격 클러스터의 API 토큰을 넣으세요.",
       "tokenAgain": "URL이나 CA가 바뀌었으니 API 토큰을 다시 넣으세요."
-    }
+    },
+    "manage": "원격 클러스터 관리",
+    "manageHint": "이 클러스터가 보는 원격 클러스터를 더하고 고치고 지웁니다. 상태와 VM은 보호 › 원격 복제에 있습니다.",
+    "replicatingJobs": "원격 클러스터로 사본을 보내는 백업 작업",
+    "noReplicatingJobs": "원격 클러스터로 사본을 보내는 백업 작업이 없습니다.",
+    "job": "백업 작업",
+    "target": "원격 / 풀"
   },
   "vmForm": {
     "createTitle": "가상 머신 만들기",
@@ -2002,9 +2030,7 @@
       "disable": "Prometheus 끝점 끄기",
       "enabled": "Prometheus 끝점을 켰습니다.",
       "disabled": "Prometheus 끝점을 껐습니다."
-    },
-    "notificationsIntro": "경보 규칙이 알림을 보낼 곳: 메일 서버와 webhook(Slack·Teams·ntfy·Gotify).",
-    "manageNotifications": "알림 대상 관리"
+    }
   },
   "audit": {
     "adminOnly": "관리자만 감사 로그를 읽을 수 있습니다.",

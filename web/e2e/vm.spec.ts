@@ -15,7 +15,22 @@ async function signIn(page: Page) {
   await page.getByLabel("Username").fill(user);
   await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: "Sign in" }).click();
-  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Home" })).toBeVisible();
+}
+
+/**
+ * 왼쪽 사이드바의 영역을 누른 뒤 본문 위 영역 탭을 누른다. 사이드바에는 영역만 있고 하위 화면은 영역 탭이다
+ * (설계 §4). 이동 경로에도 같은 이름의 링크가 있으므로 내비게이션 안에서 찾는다.
+ */
+async function openTab(page: Page, area: string, tab: string) {
+  await page
+    .getByRole("navigation", { name: "Main" })
+    .getByRole("link", { name: area, exact: true })
+    .click();
+  await page
+    .getByRole("navigation", { name: `${area} menu` })
+    .getByRole("link", { name: tab, exact: true })
+    .click();
 }
 
 /**
@@ -59,7 +74,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByRole("status").filter({ hasText: "Live" })).toBeVisible();
 
   // 풀을 만들고 이미지를 올린다. 볼륨은 가져오기 Task가 끝나면 준비된다(watch).
-  await page.getByRole("link", { name: "Storage pools" }).click();
+  await openTab(page, "Infrastructure", "Storage pools");
   await page.getByRole("button", { name: "Create" }).click();
   let dialog = page.getByRole("dialog", { name: "Create a storage pool" });
   await dialog.getByLabel("Name").fill("local");
@@ -68,7 +83,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(dialog).toBeHidden();
   await expect(page.getByRole("cell", { name: "local", exact: true })).toBeVisible();
 
-  await page.getByRole("link", { name: "Volumes" }).click();
+  await openTab(page, "Infrastructure", "Volumes");
   await page.getByRole("button", { name: "Upload image" }).click();
   dialog = page.getByRole("dialog", { name: "Upload a disk image" });
   await dialog.getByLabel("Image file").setInputFiles(image);
@@ -84,7 +99,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   // raw 파일을 기본 형식 qcow2로 바꿔 가져왔다.
   await expect(root.getByRole("cell", { name: "qcow2", exact: true })).toBeVisible();
 
-  await page.getByRole("link", { name: "Virtual machines" }).click();
+  await openTab(page, "Virtual machines", "VMs");
   await page.getByRole("link", { name: "Create" }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   await page.getByLabel("Name", { exact: true }).fill("web");
@@ -134,7 +149,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("Clone web to copy: done")).toBeVisible({ timeout: 60_000 });
 
   // 복제한 VM은 꺼진 채로 생기고, 새 볼륨으로 시작한다.
-  await page.getByRole("link", { name: "Virtual machines" }).click();
+  await openTab(page, "Virtual machines", "VMs");
   await page.getByRole("link", { name: "copy", exact: true }).click();
   await expect(page.getByRole("heading", { name: "copy" })).toBeVisible();
   await expect(page.getByTestId("vm-phase")).toHaveText("Stopped");
@@ -161,7 +176,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("No snapshots.")).toBeVisible({ timeout: 60_000 });
 
   // 실행 중인 VM의 볼륨을 1 GiB로 늘린다.
-  await page.getByRole("link", { name: "Volumes" }).click();
+  await openTab(page, "Infrastructure", "Volumes");
   await page.getByRole("button", { name: "Resize root" }).click();
   dialog = page.getByRole("dialog", { name: "Resize volume root" });
   await expect(dialog.getByText("Current size: 16 MiB")).toBeVisible();
@@ -172,7 +187,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
     timeout: 60_000,
   });
 
-  await page.getByRole("link", { name: "Virtual machines" }).click();
+  await openTab(page, "Virtual machines", "VMs");
   await page.getByRole("link", { name: "web", exact: true }).click();
   await expect(page.getByTestId("vm-phase")).toHaveText("Running");
 
@@ -262,7 +277,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   });
 
   // 볼륨과 풀을 지운다. 볼륨은 삭제 Task가 끝나야 목록에서 사라진다.
-  await page.getByRole("link", { name: "Volumes" }).click();
+  await openTab(page, "Infrastructure", "Volumes");
   await page.getByRole("button", { name: "Delete root" }).click();
   confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type root to confirm").fill("root");
@@ -278,7 +293,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
     timeout: 60_000,
   });
 
-  await page.getByRole("link", { name: "Storage pools" }).click();
+  await openTab(page, "Infrastructure", "Storage pools");
   await page.getByRole("button", { name: "Delete local" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
   await expect(page.getByText("No storage pools.")).toBeVisible();

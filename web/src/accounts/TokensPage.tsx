@@ -68,7 +68,7 @@ export function TokensPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="tokens-title" className="text-2xl font-semibold">
+        <h1 id="tokens-title" className="text-xl font-semibold">
           {t("nav.tokens")}
         </h1>
         <Button ref={opener} onClick={() => setCreating(true)}>

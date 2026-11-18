@@ -58,7 +58,7 @@ export function NotificationTargetsPage() {
   if (!admin) {
     return (
       <div className="flex flex-col gap-4">
-        <h1 className="text-2xl font-semibold">{t("nav.notificationTargets")}</h1>
+        <h1 className="text-xl font-semibold">{t("nav.notificationTargets")}</h1>
         <p className="text-sm text-muted-foreground">{t("alerts.targets.adminOnly")}</p>
       </div>
     );
@@ -90,7 +90,7 @@ export function NotificationTargetsPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="targets-title" className="text-2xl font-semibold">
+        <h1 id="targets-title" className="text-xl font-semibold">
           {t("nav.notificationTargets")}
         </h1>
         <Button

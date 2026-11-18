@@ -100,7 +100,7 @@ export function RemotePage() {
     <div className="flex flex-col gap-4">
       {back}
       <div className="flex flex-col gap-1">
-        <h1 id="remote-vms-title" className="text-2xl font-semibold">
+        <h1 id="remote-vms-title" className="text-xl font-semibold">
           {t("remotes.vmsTitle", { name })}
         </h1>
         <p className="font-mono text-xs text-muted-foreground">

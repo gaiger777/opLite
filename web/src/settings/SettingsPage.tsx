@@ -1,7 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { useSettings, useSubscription } from "@/api/live";
@@ -10,18 +9,18 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { HaSection } from "@/settings/HaSection";
 import { PrometheusSection } from "@/settings/PrometheusSection";
 import { patchSettings, settingsError } from "@/settings/save";
 import { ShutdownSection } from "@/settings/ShutdownSection";
-import { SubscriptionSection } from "@/settings/SubscriptionSection";
 import { TelemetrySection } from "@/settings/TelemetrySection";
 
 const CHANNELS: Channel[] = ["stable", "testing", "enterprise"];
 
-/** 클러스터 설정. 누구나 읽고 admin만 바꾼다. */
+/** 설정 › 일반: 업데이트·종료·HA·텔레메트리·Prometheus. 누구나 읽고 admin만 바꾼다. 구독은 따로 탭이다. */
 export function SettingsPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
@@ -60,8 +59,7 @@ export function SettingsPage() {
 
   return (
     <div className="flex max-w-xl flex-col gap-6">
-      <h1 className="text-2xl font-semibold">{t("nav.settings")}</h1>
-      <SubscriptionSection write={write} />
+      <PageHeader title={t("nav.settings")} />
       <form noValidate onSubmit={(e) => void save(e)} className="flex flex-col gap-4">
         <h2 className="font-medium">{t("settings.updates")}</h2>
         {error && (
@@ -108,18 +106,6 @@ export function SettingsPage() {
       <HaSection write={write} />
       <TelemetrySection write={write} />
       <PrometheusSection write={write} />
-      {/* 알림 대상은 비밀이 있어 admin만 본다(계획 61이 설정 영역 탭으로 옮긴다). */}
-      {can(me.role, "read", "notification-target") && (
-        <section aria-labelledby="settings-notifications" className="flex flex-col gap-2">
-          <h2 id="settings-notifications" className="font-medium">
-            {t("nav.notificationTargets")}
-          </h2>
-          <p className="text-sm text-muted-foreground">{t("settings.notificationsIntro")}</p>
-          <Link to="/settings/notifications" className="text-sm underline underline-offset-4">
-            {t("settings.manageNotifications")}
-          </Link>
-        </section>
-      )}
     </div>
   );
 }

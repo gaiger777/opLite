@@ -11,7 +11,7 @@ export function BackupsPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col gap-1">
-        <h1 id="backups-title" className="text-2xl font-semibold">
+        <h1 id="backups-title" className="text-xl font-semibold">
           {t("nav.backups")}
         </h1>
         <p className="text-sm text-muted-foreground">{t("backups.pageHint")}</p>

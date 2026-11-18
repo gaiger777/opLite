@@ -34,7 +34,7 @@ export function NodeDetailPage() {
   if (!node) {
     return (
       <div className="flex flex-col items-start gap-2">
-        <h1 className="text-2xl font-semibold">{t("nodes.notFound", { name })}</h1>
+        <h1 className="text-xl font-semibold">{t("nodes.notFound", { name })}</h1>
         <Link to="/nodes" className="text-sm underline">
           {t("nodes.backToList")}
         </Link>

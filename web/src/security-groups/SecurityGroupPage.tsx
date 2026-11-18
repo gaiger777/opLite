@@ -45,7 +45,7 @@ export function SecurityGroupPage() {
   }
   const group = groups.data.find((g) => g.name === name);
   if (!group) {
-    return <h1 className="text-2xl font-semibold">{t("securityGroups.notFound", { name })}</h1>;
+    return <h1 className="text-xl font-semibold">{t("securityGroups.notFound", { name })}</h1>;
   }
   return <RulesEditor key={group.id} group={group} />;
 }
@@ -120,7 +120,7 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
         >
           {t("nav.securityGroups")}
         </Link>
-        <h1 className="text-2xl font-semibold">{group.name}</h1>
+        <h1 className="text-xl font-semibold">{group.name}</h1>
       </div>
       <p className="text-sm text-muted-foreground">{t("securityGroups.order")}</p>
       <p className="text-sm text-muted-foreground">{t("securityGroups.always")}</p>

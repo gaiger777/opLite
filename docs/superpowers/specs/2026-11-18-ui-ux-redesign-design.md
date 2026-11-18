@@ -372,3 +372,11 @@
 - **S1 글자**: 본문 기본을 14px(`body` `text-sm`)로 했다. 페이지 제목 20px는 S2의 `PageHeader`가 맡는다(지금 화면마다 `h1` 클래스가 있어 S1에서 고치면 S2에서 다시 고친다).
 - **S1 색 이름 정리**: `amber-*`·`emerald-*` 직접 색(경고 글·띠, `LiveBadge` 점)을 `warning`·`success`·`danger` 토큰으로 바꿨다(§8.2 4 "색은 CSS 변수로만").
 - **S1 움직임 줄이기**: `--duration-fast/normal`을 0ms로 하고, 모든 요소의 `animation-duration`·`transition-duration`을 0.01ms·한 번으로 줄인다(Sheet 미끄러짐, 스켈레톤 맥박, `StatusChip`의 `busy` 점, 이후 `data-changed` 강조까지 한 곳에서 끔).
+- **S2 탭 이름**: 영역 이름과 탭 이름이 겹치지 않게 새 키를 두었다. VM 탭 `nav.vmList`("VM"/"VMs"), 이미지·ISO 탭 `nav.imagesIsos`(보기는 이미지 라이브러리·ISO 이미지), 배치 탭 `nav.placementTab`(보기는 배치 규칙·최적 배치), 원격 복제 탭 `nav.replication`, 설정 일반 `nav.general`, 구독 `nav.subscription`. 영역 이름은 `nav.area.*`이다. 홈 제목은 "홈"("Home")이고 쓰지 않게 된 `nav.dashboard`를 지웠다.
+- **S2 본문 위 영역 이름**: §4.4 그림의 탭 위 "인프라" 글은 두지 않았다. 이동 경로 첫 칸이 영역이고, 제목(h1)이 둘로 보이지 않게 했다. 보이는 탭이 하나뿐인 영역(홈)은 탭 줄을 그리지 않는다. 보기 전환은 목록 화면에서만 보이고 상세(`/nodes/:name`)에서는 숨긴다.
+- **S2 머리줄**: 언어·테마는 사용자 메뉴의 하위 메뉴(라디오)로 옮겼고 밀도는 S1처럼 메뉴 안 라디오 묶음이다. 클러스터 이름은 S3의 클러스터 전환이 들어올 때까지 머리줄 오른쪽(1024px 이상)에 둔다. 레일 접기 단추는 사이드바 아래에 있고, `[` 단축키는 S3의 `lib/shortcuts.ts`가 단다. 레일은 `prefs` `nav.rail`("1"/"0")을 기억하고, 고른 적이 없으면 1280px 이상에서 펼친다.
+- **S2 PageHeader**: `components/PageHeader.tsx`(h1 20px·동작·설명)는 새로 만들거나 고친 화면(설정 일반·구독, 원격 복제, 원격 클러스터 관리)에 썼다. 나머지 화면은 `h1`의 글 크기만 `text-xl`로 바꿨고, S4·S5가 목록·상세를 고칠 때 `PageHeader`로 옮긴다.
+- **S2 원격 나누기**: 보호 › 원격 복제(`RemotesPage`)는 상태 카드(이름은 원격 VM 보기 링크), admin의 새로고침(상태를 다시 모으는 동작이라 보기 쪽에 남김), "원격 클러스터 관리" 링크, 원격 대상이 있는 백업 작업 표(이름은 `/backup-jobs` 링크)다. 설정 › 원격 클러스터(`RemotesManagePage`, admin 탭)는 표와 추가·고치기·지우기 대화상자다. 목록 쿼리는 `remotes.ts`의 `useRemotes()`로 함께 쓴다.
+- **S2 계획 60 자리**: 설정 일반의 "알림 대상 관리" 칸(`settings.notificationsIntro`·`manageNotifications` 키)과 작업 화면 위 "경보" 링크는 탭이 생겨 지웠다. 경보 규칙 탭의 알림 대상 링크와 홈 경보 위젯의 "모든 경보 보기"는 맥락 링크라 남겼다. `/alerts?tab=targets`는 계획 60이 만들지 않았으므로 넘기기를 두지 않았다. 구독 배너 링크는 `/settings/subscription`으로 바꿨다.
+- **S2 넘기기**: `Redirect`는 `<Navigate to={{pathname, search, hash}} replace>`로 쿼리·해시를 지킨다(글로 준 `to`만 쿼리를 버린다). `/infra`·`/protect`·`/activity`는 `AreaRedirect`가 기억한 탭(권한 밖·다른 영역·상세 경로면 보이는 첫 탭)으로 간다. 경로 표는 `App.tsx`의 `appRoutes`다.
+- **S2 포커스**: 경로(pathname)가 바뀔 때만 본문 `h1`(없으면 `<main>`)로 포커스를 옮기고 `aria-live` 영역에 이동 경로를 읽어 준다. VM 상세 `?tab=`처럼 쿼리만 바뀌면 옮기지 않는다.

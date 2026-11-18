@@ -22,7 +22,7 @@ export function CephPage() {
   return (
     <div className="flex flex-col gap-6">
       <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-semibold">{t("nav.ceph")}</h1>
+        <h1 className="text-xl font-semibold">{t("nav.ceph")}</h1>
         <p className="text-sm text-muted-foreground">{t("ceph.pageHint")}</p>
       </div>
       {ceph.data === undefined ? (

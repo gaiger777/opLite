@@ -56,7 +56,7 @@ export function VmEditPage() {
     return <ListPending error={vms.error} />;
   }
   if (vm === null) {
-    return <h1 className="text-2xl font-semibold">{t("vms.notFound", { name })}</h1>;
+    return <h1 className="text-xl font-semibold">{t("vms.notFound", { name })}</h1>;
   }
   return <VmForm key={vm.id} vm={vm} initial={fromVm(vm)} />;
 }
@@ -243,7 +243,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
 
   return (
     <form onSubmit={submit} className="flex max-w-3xl flex-col gap-4" noValidate>
-      <h1 className="text-2xl font-semibold">
+      <h1 className="text-xl font-semibold">
         {creating ? t("vmForm.createTitle") : t("vmForm.editTitle", { name: vm.name })}
       </h1>
       {mode === "locked" && (

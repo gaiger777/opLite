@@ -71,7 +71,7 @@ export function SubscriptionBanner() {
           used: info.used_nodes,
           limit: info.nodes,
         })}{" "}
-        <Link to="/settings" className="underline underline-offset-4">
+        <Link to="/settings/subscription" className="underline underline-offset-4">
           {t("dashboard.subscription.manage")}
         </Link>
       </p>

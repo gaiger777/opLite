@@ -59,7 +59,7 @@ export function ImportPage() {
   }
   const imp = imports.data.find((i) => i.name === name);
   if (!imp) {
-    return <h1 className="text-2xl font-semibold">{t("imports.notFound", { name })}</h1>;
+    return <h1 className="text-xl font-semibold">{t("imports.notFound", { name })}</h1>;
   }
   return <ImportView key={imp.id} imp={imp} />;
 }
@@ -92,7 +92,7 @@ function ImportView({ imp }: { imp: VmImport }) {
           >
             {t("nav.imports")}
           </Link>
-          <h1 className="text-2xl font-semibold">{imp.name}</h1>
+          <h1 className="text-xl font-semibold">{imp.name}</h1>
         </div>
         {write && (
           // 가져오는 중인지는 서버가 정한다(실행 Task가 끝나지 않았으면 import_busy). 실행을 보내는 동안만 막는다.

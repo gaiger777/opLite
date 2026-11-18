@@ -44,7 +44,7 @@ export function SecurityGroupsPage() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 id="security-groups-title" className="text-2xl font-semibold">
+        <h1 id="security-groups-title" className="text-xl font-semibold">
           {t("nav.securityGroups")}
         </h1>
         {write && (

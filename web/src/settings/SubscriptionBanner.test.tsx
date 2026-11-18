@@ -67,7 +67,7 @@ it.each([
   expect(banner).toHaveTextContent(text);
   expect(screen.getByRole("link", { name: "Subscription settings" })).toHaveAttribute(
     "href",
-    "/settings",
+    "/settings/subscription",
   );
 });
 

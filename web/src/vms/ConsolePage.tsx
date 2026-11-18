@@ -36,7 +36,7 @@ export function ConsolePage() {
     );
   }
   if (vm === null) {
-    return <h1 className="text-2xl font-semibold">{t("vms.notFound", { name })}</h1>;
+    return <h1 className="text-xl font-semibold">{t("vms.notFound", { name })}</h1>;
   }
   return (
     <div className="flex flex-col gap-3">

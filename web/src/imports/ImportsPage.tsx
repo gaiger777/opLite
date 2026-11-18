@@ -95,7 +95,7 @@ export function ImportsPage() {
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-col gap-1">
-          <h1 id="imports-title" className="text-2xl font-semibold">
+          <h1 id="imports-title" className="text-xl font-semibold">
             {t("nav.imports")}
           </h1>
           <p className="text-sm text-muted-foreground">{t("imports.pageHint")}</p>

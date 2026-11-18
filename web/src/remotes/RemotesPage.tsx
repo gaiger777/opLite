@@ -1,49 +1,42 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
-import { useId, useRef, useState, type RefObject } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { RefreshCw } from "lucide-react";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
+import { useList } from "@/api/live";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
-import { ConfirmDialog } from "@/components/ConfirmDialog";
-import { Field } from "@/components/Field";
-import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { PageHeader } from "@/components/PageHeader";
+import { TableMessage } from "@/components/TableMessage";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
-import type { RemoteView } from "@/remotes/remotes";
-import { validName } from "@/vms/form";
-
-/** 목록을 다시 읽는 간격. 원격은 watch로 받지 않는다(토큰을 담고 있다). */
-const REFRESH_MS = 10_000;
+import { type RemoteView, useRemotes } from "@/remotes/remotes";
 
 /**
- * 원격 클러스터: 카드 목록과 admin의 추가·고치기·지우기·새로고침. 카드를 누르면 그 클러스터의 VM 목록으로
- * 간다. 상태는 리더가 모은 것을 10초마다 다시 읽는다.
+ * 보호 › 원격 복제: 원격 클러스터의 상태 카드, 원격으로 사본을 보내는 백업 작업, 원격 VM 보기(카드의 이름)다.
+ * 상태는 리더가 모은 것을 10초마다 다시 읽는다. 추가·고치기·지우기는 설정 › 원격 클러스터(`RemotesManagePage`)에
+ * 있다.
  */
 export function RemotesPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
   const admin = can(me.role, "write", "remote");
   const queryClient = useQueryClient();
-  const remotes = useQuery({
-    queryKey: ["remotes"],
-    queryFn: () => call(api.GET("/remotes")),
-    select: (list) => [...list.items].sort((a, b) => a.name.localeCompare(b.name)),
-    refetchInterval: REFRESH_MS,
-  });
-  const [dialog, setDialog] = useState<{ remote: RemoteView | null } | null>(null);
-  const [deleting, setDeleting] = useState<RemoteView | null>(null);
-  const [deleteOpen, setDeleteOpen] = useState(false);
-  const opener = useRef<HTMLElement | null>(null);
+  const remotes = useRemotes();
   const changed = () => queryClient.invalidateQueries({ queryKey: ["remotes"] });
 
   async function refresh(remote: RemoteView) {
@@ -59,21 +52,17 @@ export function RemotesPage() {
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-2xl font-semibold">{t("nav.remotes")}</h1>
-        {admin && (
-          <Button
-            onClick={(e) => {
-              opener.current = e.currentTarget;
-              setDialog({ remote: null });
-            }}
-          >
-            <Plus />
-            {t("remotes.add")}
-          </Button>
-        )}
-      </div>
-      <p className="text-sm text-muted-foreground">{t("remotes.pageHint")}</p>
+      <PageHeader
+        title={t("nav.replication")}
+        description={t("remotes.pageHint")}
+        actions={
+          admin && (
+            <Link to="/settings/remotes" className="text-sm underline-offset-4 hover:underline">
+              {t("remotes.manage")}
+            </Link>
+          )
+        }
+      />
       {!remotes.data ? (
         <ListPending error={remotes.error} />
       ) : remotes.data.length === 0 ? (
@@ -86,42 +75,53 @@ export function RemotesPage() {
               remote={remote}
               admin={admin}
               onRefresh={() => void refresh(remote)}
-              onEdit={(target) => {
-                opener.current = target;
-                setDialog({ remote });
-              }}
-              onDelete={(target) => {
-                opener.current = target;
-                setDeleting(remote);
-                setDeleteOpen(true);
-              }}
             />
           ))}
         </div>
       )}
-      {dialog && (
-        <RemoteDialog
-          remote={dialog.remote}
-          returnFocus={opener}
-          onClose={() => setDialog(null)}
-          onDone={changed}
-        />
-      )}
-      <ConfirmDialog
-        open={deleteOpen}
-        onOpenChange={setDeleteOpen}
-        returnFocus={opener}
-        title={t("remotes.deleteTitle", { name: deleting?.name })}
-        description={t("remotes.deleteDescription")}
-        confirmLabel={t("common.delete")}
-        onConfirm={async () => {
-          const remote = deleting!;
-          await call(api.DELETE("/remotes/{key}", { params: { path: { key: remote.name } } }));
-          toast.success(t("remotes.deleted", { name: remote.name }));
-          await changed();
-        }}
-      />
+      <ReplicatingJobs />
     </div>
+  );
+}
+
+/** 원격 대상(`replicate`)이 있는 백업 작업. 고치기는 백업 작업 화면에서 한다. */
+function ReplicatingJobs() {
+  const { t } = useTranslation();
+  const jobs = useList("backup-job");
+  const list = (jobs.data ?? [])
+    .filter((job) => job.spec.replicate)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  return (
+    <section aria-labelledby="replicating-jobs" className="flex flex-col gap-2">
+      <h2 id="replicating-jobs" className="font-medium">
+        {t("remotes.replicatingJobs")}
+      </h2>
+      <Table aria-labelledby="replicating-jobs">
+        <TableHeader>
+          <TableRow>
+            <TableHead>{t("remotes.job")}</TableHead>
+            <TableHead>{t("remotes.target")}</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {list.length === 0 && (
+            <TableMessage colSpan={2} query={jobs} empty={t("remotes.noReplicatingJobs")} />
+          )}
+          {list.map((job) => (
+            <TableRow key={job.id}>
+              <TableCell className="font-medium">
+                <Link to="/backup-jobs" className="underline-offset-4 hover:underline">
+                  {job.name}
+                </Link>
+              </TableCell>
+              <TableCell>
+                {job.spec.replicate!.remote} / {job.spec.replicate!.pool}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
+    </section>
   );
 }
 
@@ -130,14 +130,10 @@ function RemoteCard({
   remote,
   admin,
   onRefresh,
-  onEdit,
-  onDelete,
 }: {
   remote: RemoteView;
   admin: boolean;
   onRefresh(): void;
-  onEdit(target: HTMLElement): void;
-  onDelete(target: HTMLElement): void;
 }) {
   const { t } = useTranslation();
   const id = useId();
@@ -193,224 +189,9 @@ function RemoteCard({
             >
               <RefreshCw />
             </Button>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={t("remotes.editNamed", { name: remote.name })}
-              onClick={(e) => onEdit(e.currentTarget)}
-            >
-              <Pencil />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label={t("common.deleteNamed", { name: remote.name })}
-              onClick={(e) => onDelete(e.currentTarget)}
-            >
-              <Trash2 />
-            </Button>
           </div>
         )}
       </CardContent>
     </Card>
-  );
-}
-
-/** 서버가 CA를 받아 돌려준 정규화한 URL과 지문 */
-interface Probe {
-  url: string;
-  ca_fingerprint: string;
-}
-
-/**
- * 원격 추가(`remote`가 null)와 고치기. 브라우저는 다른 출처의 CA를 읽지 못하므로 서버(`/remotes/probe`)가
- * 받아 온 지문을 보이고 사람이 원격 클러스터에서 확인하게 한다. 고칠 때는 저장된 URL·지문으로 시작하고,
- * URL이 바뀌면 CA를 다시 받는다. 토큰은 비우면 저장된 것을 두되, URL이나 지문이 바뀌면 다시 받는다(서버 규칙).
- */
-function RemoteDialog({
-  remote,
-  returnFocus,
-  onClose,
-  onDone,
-}: {
-  remote: RemoteView | null;
-  returnFocus: RefObject<HTMLElement | null>;
-  onClose(): void;
-  onDone(): Promise<void>;
-}) {
-  const { t } = useTranslation();
-  const [name, setName] = useState("");
-  const [url, setUrl] = useState(remote?.url ?? "");
-  const [probe, setProbe] = useState<Probe | null>(
-    remote && { url: remote.url, ca_fingerprint: remote.ca_fingerprint },
-  );
-  const [probing, setProbing] = useState(false);
-  const [confirmed, setConfirmed] = useState(false);
-  const [token, setToken] = useState("");
-  const [errors, setErrors] = useState<Record<string, string>>({});
-  const [probeError, setProbeError] = useState<string | null>(null);
-  // 저장된 URL·지문 그대로면 이미 확인한 것이다.
-  const same =
-    remote !== null &&
-    probe !== null &&
-    probe.url === remote.url &&
-    probe.ca_fingerprint === remote.ca_fingerprint;
-
-  async function getCa() {
-    setProbing(true);
-    setProbeError(null);
-    setErrors((e) => ({ ...e, url: "" }));
-    try {
-      const found = await call(api.POST("/remotes/probe", { body: { url } }));
-      setProbe(found);
-      setUrl(found.url);
-      setConfirmed(false);
-    } catch (err) {
-      setProbeError(errorMessage(t, err));
-    } finally {
-      setProbing(false);
-    }
-  }
-
-  async function submit() {
-    const found: Record<string, string> = {};
-    if (!remote && !validName(name)) {
-      found.name = "forms.name";
-    }
-    if (!probe) {
-      found.url = "remotes.errors.probeFirst";
-    } else if (!same && !confirmed) {
-      found.confirm = "remotes.errors.confirm";
-    }
-    if (token.trim() === "" && !same) {
-      found.token = remote ? "remotes.errors.tokenAgain" : "remotes.errors.token";
-    }
-    setErrors(found);
-    if (Object.keys(found).length > 0 || !probe) {
-      return false;
-    }
-    const body = {
-      url: probe.url,
-      ca_fingerprint: probe.ca_fingerprint,
-      ...(token.trim() !== "" && { token: token.trim() }),
-    };
-    // 상태를 모을 때마다 revision이 바뀌므로 If-Match 없이 보낸다(서버가 지금 것에 쓴다).
-    if (remote) {
-      await call(api.PUT("/remotes/{key}", { params: { path: { key: remote.name } }, body }));
-      toast.success(t("remotes.saved", { name: remote.name }));
-    } else {
-      await call(api.POST("/remotes", { body: { name, ...body } }));
-      toast.success(t("remotes.created", { name }));
-    }
-    await onDone();
-  }
-
-  return (
-    <FormDialog
-      title={remote ? t("remotes.editTitle", { name: remote.name }) : t("remotes.addTitle")}
-      description={t("remotes.addDescription")}
-      submitLabel={remote ? t("common.save") : t("remotes.add")}
-      returnFocus={returnFocus}
-      onClose={onClose}
-      onSubmit={submit}
-    >
-      {!remote && (
-        <Field id="remote-name" label={t("common.name")} error={errors.name}>
-          {(a11y) => (
-            <Input
-              id="remote-name"
-              autoComplete="off"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              {...a11y}
-            />
-          )}
-        </Field>
-      )}
-      <Field
-        id="remote-url"
-        label={t("remotes.url")}
-        error={probeError ? "remotes.errors.probe" : errors.url}
-        errorValues={probeError ? { error: probeError } : undefined}
-        hint={t("remotes.urlHint")}
-      >
-        {(a11y) => (
-          <div className="flex gap-2">
-            <Input
-              id="remote-url"
-              autoComplete="off"
-              spellCheck={false}
-              placeholder="https://"
-              value={url}
-              onChange={(e) => {
-                setUrl(e.target.value);
-                // 받은 지문은 그 URL의 것이다.
-                setProbe(null);
-                setConfirmed(false);
-                setProbeError(null);
-              }}
-              {...a11y}
-            />
-            <Button
-              type="button"
-              variant="outline"
-              disabled={probing || url.trim() === ""}
-              onClick={() => void getCa()}
-            >
-              {t("remotes.getCa")}
-            </Button>
-          </div>
-        )}
-      </Field>
-      {probe && (
-        <div className="flex flex-col gap-2">
-          <dl className="flex flex-col gap-2">
-            <dt className="text-sm leading-none font-medium">{t("remotes.fingerprint")}</dt>
-            <dd>
-              <code className="block rounded-md bg-muted px-2 py-1 text-xs break-all">
-                {probe.ca_fingerprint}
-              </code>
-            </dd>
-          </dl>
-          {!same && (
-            <div className="flex items-start gap-2">
-              <Checkbox
-                id="remote-confirm"
-                checked={confirmed}
-                aria-invalid={errors.confirm ? true : undefined}
-                aria-describedby={errors.confirm ? "remote-confirm-error" : undefined}
-                onCheckedChange={(on) => setConfirmed(on === true)}
-              />
-              <Label htmlFor="remote-confirm" className="leading-snug font-normal">
-                {t("remotes.confirmFingerprint")}
-              </Label>
-            </div>
-          )}
-          {errors.confirm && (
-            <p id="remote-confirm-error" className="text-xs text-destructive">
-              {t(errors.confirm)}
-            </p>
-          )}
-        </div>
-      )}
-      <Field
-        id="remote-token"
-        label={t("remotes.token")}
-        error={errors.token}
-        hint={t(remote ? "remotes.tokenSaved" : "remotes.tokenHint")}
-      >
-        {(a11y) => (
-          <Input
-            id="remote-token"
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            value={token}
-            onChange={(e) => setToken(e.target.value)}
-            {...a11y}
-          />
-        )}
-      </Field>
-    </FormDialog>
   );
 }

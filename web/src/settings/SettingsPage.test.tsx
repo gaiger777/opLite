@@ -3,9 +3,10 @@ import userEvent from "@testing-library/user-event";
 import type { QueryClient } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 
-import { SETTINGS_KEY } from "@/api/live";
+import { SETTINGS_KEY, SUBSCRIPTION_KEY } from "@/api/live";
 
 import { SettingsPage } from "@/settings/SettingsPage";
+import { SubscriptionPage } from "@/settings/SubscriptionPage";
 import { ADMIN, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -119,7 +120,7 @@ it.each([
     http.get(apiUrl("/settings"), () => HttpResponse.json(DEFAULT)),
     http.get(apiUrl("/subscription"), () => HttpResponse.json(info)),
   );
-  renderPage(<SettingsPage />);
+  renderPage(<SubscriptionPage />);
   const section = await screen.findByRole("region", { name: "Subscription" });
   for (const text of texts) {
     expect(await within(section).findByText(text)).toBeInTheDocument();
@@ -147,7 +148,7 @@ it("applies and removes a subscription key", async () => {
       return HttpResponse.json({ state: "none", used_nodes: 3 });
     }),
   );
-  renderPage(<SettingsPage />);
+  renderPage(<SubscriptionPage />);
   const section = await screen.findByRole("region", { name: "Subscription" });
   expect(await within(section).findByText("No subscription")).toBeInTheDocument();
   // 지울 키가 없다.
@@ -188,7 +189,7 @@ it("says why a subscription key was rejected", async () => {
       ),
     ),
   );
-  renderPage(<SettingsPage />);
+  renderPage(<SubscriptionPage />);
   const section = await screen.findByRole("region", { name: "Subscription" });
   await userEvent.type(within(section).getByLabelText("Subscription key"), "opl1.x.y");
   await userEvent.click(within(section).getByRole("button", { name: "Apply key" }));
@@ -208,8 +209,9 @@ it("lets admins pick enterprise only with an active subscription", async () => {
       return HttpResponse.json({ ...DEFAULT, revision: 2, spec: { updates: body.updates } });
     }),
   );
-  const { unmount } = renderPage(<SettingsPage />);
-  await screen.findByText("Expired");
+  const { unmount, queryClient } = renderPage(<SettingsPage />);
+  await screen.findByLabelText("Update channel");
+  await vi.waitFor(() => expect(queryClient.getQueryData(SUBSCRIPTION_KEY)).toBeDefined());
   expect(screen.getByRole("option", { name: "Enterprise" })).toBeDisabled();
   expect(screen.getByLabelText("Update channel")).toHaveAccessibleDescription(
     /Enterprise needs an active subscription\./,
@@ -218,8 +220,8 @@ it("lets admins pick enterprise only with an active subscription", async () => {
 
   server.use(http.get(apiUrl("/subscription"), () => HttpResponse.json(ACTIVE)));
   renderPage(<SettingsPage />);
-  await screen.findByText("Active");
-  expect(screen.getByRole("option", { name: "Enterprise" })).toBeEnabled();
+  // 구독을 읽으면 enterprise를 고를 수 있다.
+  await vi.waitFor(() => expect(screen.getByRole("option", { name: "Enterprise" })).toBeEnabled());
   expect(screen.getByLabelText("Update channel")).not.toHaveAccessibleDescription(
     /Enterprise needs/,
   );
@@ -239,7 +241,7 @@ it("explains when the enterprise channel needs a subscription", async () => {
     ),
   );
   renderPage(<SettingsPage />);
-  await screen.findByText("Active");
+  await vi.waitFor(() => expect(screen.getByRole("option", { name: "Enterprise" })).toBeEnabled());
   await userEvent.selectOptions(screen.getByLabelText("Update channel"), "enterprise");
   await userEvent.click(screen.getByRole("button", { name: "Save" }));
   expect(await screen.findByRole("alert")).toHaveTextContent(
@@ -421,12 +423,16 @@ it("shows subscription and telemetry read-only to everyone but admins", async ()
       }),
     ),
   );
-  renderPage(<SettingsPage />, { as: { ...ADMIN, role: "operator" } });
+  const operator = { ...ADMIN, role: "operator" } as const;
+  const { unmount } = renderPage(<SubscriptionPage />, { as: operator });
   const subscription = await screen.findByRole("region", { name: "Subscription" });
   expect(await within(subscription).findByText("Active")).toBeInTheDocument();
   expect(within(subscription).queryByLabelText("Subscription key")).not.toBeInTheDocument();
   expect(within(subscription).queryByRole("button")).not.toBeInTheDocument();
-  const telemetry = screen.getByRole("region", { name: "Telemetry" });
+  unmount();
+
+  renderPage(<SettingsPage />, { as: operator });
+  const telemetry = await screen.findByRole("region", { name: "Telemetry" });
   expect(within(telemetry).getByText("On")).toBeInTheDocument();
   expect(within(telemetry).queryByLabelText("Endpoint")).not.toBeInTheDocument();
   expect(within(telemetry).queryByRole("button")).not.toBeInTheDocument();
@@ -459,29 +465,28 @@ it("sends the endpoint typed but not saved when turning telemetry on", async () 
   expect(await within(section).findByText("https://t.example/r")).toBeInTheDocument();
 });
 
-it("reads the settings again after the subscription key changes", async () => {
-  let reads = 0;
+it("marks the settings stale after the subscription key changes", async () => {
+  // 업데이트 채널(enterprise)이 구독을 따르므로 설정 화면이 다시 읽게 한다.
   server.use(
-    http.get(apiUrl("/settings"), () => {
-      reads += 1;
-      return HttpResponse.json(DEFAULT);
-    }),
     http.get(apiUrl("/subscription"), () => HttpResponse.json({ state: "none", used_nodes: 1 })),
     http.put(apiUrl("/subscription"), () => HttpResponse.json(ACTIVE)),
     http.delete(apiUrl("/subscription"), () => HttpResponse.json({ state: "none", used_nodes: 1 })),
   );
-  renderPage(<SettingsPage />);
+  const { queryClient } = renderPage(<SubscriptionPage />);
+  queryClient.setQueryData(SETTINGS_KEY, DEFAULT);
+  const stale = () => queryClient.getQueryState(SETTINGS_KEY)?.isInvalidated;
   const section = await screen.findByRole("region", { name: "Subscription" });
   await within(section).findByText("No subscription");
-  expect(reads).toBe(1);
+  expect(stale()).toBe(false);
   await userEvent.type(within(section).getByLabelText("Subscription key"), "opl1.a.b");
   await userEvent.click(within(section).getByRole("button", { name: "Apply key" }));
-  await vi.waitFor(() => expect(reads).toBe(2));
+  await vi.waitFor(() => expect(stale()).toBe(true));
 
+  queryClient.setQueryData(SETTINGS_KEY, DEFAULT);
   await userEvent.click(within(section).getByRole("button", { name: "Remove key" }));
   const dialog = await screen.findByRole("alertdialog");
   await userEvent.click(within(dialog).getByRole("button", { name: "Remove key" }));
-  await vi.waitFor(() => expect(reads).toBe(3));
+  await vi.waitFor(() => expect(stale()).toBe(true));
 });
 
 it("says when another settings change is in progress", async () => {
@@ -516,7 +521,7 @@ it("shows why the subscription key could not be removed", async () => {
       ),
     ),
   );
-  renderPage(<SettingsPage />);
+  renderPage(<SubscriptionPage />);
   const section = await screen.findByRole("region", { name: "Subscription" });
   await userEvent.click(await within(section).findByRole("button", { name: "Remove key" }));
   const dialog = await screen.findByRole("alertdialog");

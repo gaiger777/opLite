@@ -46,7 +46,7 @@ export function NodeHeader({ node }: { node: Node }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-2">
       <div className="flex flex-wrap items-center gap-3">
-        <h1 className="text-2xl font-semibold">{node.name}</h1>
+        <h1 className="text-xl font-semibold">{node.name}</h1>
         <Badge variant={node.status.online ? "default" : "destructive"}>
           {t(node.status.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
         </Badge>

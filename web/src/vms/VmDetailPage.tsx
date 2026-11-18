@@ -108,7 +108,7 @@ export function VmDetailPage() {
   if (vm === null) {
     return (
       <div className="flex flex-col items-start gap-2">
-        <h1 className="text-2xl font-semibold">{t("vms.notFound", { name })}</h1>
+        <h1 className="text-xl font-semibold">{t("vms.notFound", { name })}</h1>
         <Link to="/vms" className="text-sm underline">
           {t("vms.backToList")}
         </Link>
@@ -236,7 +236,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   return (
     <div className="flex flex-wrap items-center justify-between gap-2">
       <div className="flex items-center gap-3">
-        <h1 className="text-2xl font-semibold">{vm.name}</h1>
+        <h1 className="text-xl font-semibold">{vm.name}</h1>
         <VmPhaseBadge vm={vm} />
         {haEnabled(vm.spec) && <Badge variant="outline">{t("vms.ha")}</Badge>}
         {template && <Badge variant="secondary">{t("vms.template")}</Badge>}
