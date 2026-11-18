@@ -493,10 +493,11 @@ pub(crate) fn firmware_lines(vm: &Value, nodes: &[Value]) -> Vec<String> {
     if tpm || state {
         let mut line = format!("tpm: {}", if tpm { "on" } else { "off" });
         if state {
-            let holder = if status["firmware_node"].is_null() {
+            // TPM 상태를 가진 노드는 `tpm_node`다(UEFI 변수의 `firmware_node`와 다를 수 있다).
+            let holder = if status["tpm_node"].is_null() {
                 "-".to_string()
             } else {
-                name_of(nodes, &status["firmware_node"])
+                name_of(nodes, &status["tpm_node"])
             };
             let copies: Vec<String> = items_of(&status["firmware_copies"])
                 .iter()
@@ -726,7 +727,7 @@ mod tests {
         ];
         let vm = json!({
             "spec": { "tpm": true, "secure_boot": true, "guest_agent": {} },
-            "status": { "tpm_sha256": "ab", "firmware_node": "id-a", "firmware_copies": ["id-b"] },
+            "status": { "tpm_sha256": "ab", "tpm_node": "id-a", "firmware_node": "id-b", "firmware_copies": ["id-b"] },
         });
         assert!(needs_nodes(&vm));
         assert_eq!(
@@ -750,7 +751,7 @@ mod tests {
             ]
         );
         // TPM을 뺐어도 상태는 남는다.
-        let vm = json!({ "spec": {}, "status": { "tpm_sha256": "ab", "firmware_node": "id-a" } });
+        let vm = json!({ "spec": {}, "status": { "tpm_sha256": "ab", "tpm_node": "id-a", "firmware_node": "id-b" } });
         assert_eq!(
             firmware_lines(&vm, &nodes),
             ["tpm: off (state kept on node a)"]

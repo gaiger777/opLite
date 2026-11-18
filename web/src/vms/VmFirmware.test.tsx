@@ -17,6 +17,7 @@ function win(phase: "running" | "stopped" = "stopped", extra: Record<string, unk
     status: {
       ...base.status,
       firmware_node: "n1",
+      tpm_node: "n1",
       tpm_sha256: "ab".repeat(32),
       firmware_copies: ["n2", "n3"],
       ...extra,
@@ -44,7 +45,12 @@ it("says a TPM VM has no state until it starts and that turned-off TPM state is 
     spec: { ...vm("fresh", "stopped").spec, tpm: true },
   });
   const off = vm("off", "stopped", {
-    status: { ...vm("off", "stopped").status, firmware_node: "n1", tpm_sha256: "cd".repeat(32) },
+    status: {
+      ...vm("off", "stopped").status,
+      firmware_node: "n1",
+      tpm_node: "n1",
+      tpm_sha256: "cd".repeat(32),
+    },
   });
   mockLists({ vm: [fresh, off], node: NODES });
   const { router } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/fresh" });

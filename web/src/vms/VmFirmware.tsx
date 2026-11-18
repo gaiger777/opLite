@@ -70,21 +70,23 @@ export function VmSecurity({ vm }: { vm: Vm }) {
   const hasTpmState = status.tpm_sha256 != null;
   const copies = (status.firmware_copies ?? []).map(nodeName);
   const firmwareNode = status.firmware_node ? nodeName(status.firmware_node) : null;
+  // TPM 상태를 가진 노드(UEFI 변수의 firmware_node와 다를 수 있다)
+  const tpmNode = status.tpm_node ? nodeName(status.tpm_node) : null;
   const write = can(me.role, "write", "vm");
   // 지울 것이 있는 VM만: UEFI 변수나 TPM 상태
   const resettable = uefi || tpm || hasTpmState;
   const reason = resetReason(vm);
 
   let tpmDetail: string | null = null;
-  if (tpm && hasTpmState && firmwareNode) {
+  if (tpm && hasTpmState && tpmNode) {
     tpmDetail =
       copies.length > 0
-        ? t("vms.security.tpmStateCopies", { node: firmwareNode, copies: copies.join(", ") })
-        : t("vms.security.tpmState", { node: firmwareNode });
+        ? t("vms.security.tpmStateCopies", { node: tpmNode, copies: copies.join(", ") })
+        : t("vms.security.tpmState", { node: tpmNode });
   } else if (tpm) {
     tpmDetail = t("vms.security.tpmNoState");
-  } else if (hasTpmState && firmwareNode) {
-    tpmDetail = t("vms.security.tpmKept", { node: firmwareNode });
+  } else if (hasTpmState && tpmNode) {
+    tpmDetail = t("vms.security.tpmKept", { node: tpmNode });
   }
 
   return (
