@@ -90,12 +90,13 @@
 - 8개 스테이지를 단계 커밋으로 구현했다(`782dcec` 타입 … `06a432b` 웹, 이 문서 커밋). 설계와 다른 것·결정은 설계 문서 §17에 스테이지마다 남겼다.
   - 스테이지 5의 `sends_are_retried_and_rate_limited` 시험이 작업공간 전체 부하에서 가끔 실패해 스테이지 6에서 창을 500ms → 5초로 늘렸다(시험만).
   - 스테이지 6 E2E는 `[test]` 고리 때문에 설계의 "기능 없이" 대신 `metrics-it`(QEMU 없음)·`qemu-it` 빌드에서 돈다.
-- 이 Mac에서 `cargo test --workspace` 3169개 넘게 통과, 웹 시험 856개 통과.
+- 이 Mac에서 `cargo test --workspace` 3204개 통과(리뷰 2 수정 뒤), `metrics-it` 실제 시험(기록 되살리기·Prometheus·경보 웹훅) 통과, 웹 시험 856개 통과.
 - `cargo deny` 통과: `lettre`의 `builder`가 끌어오는 `quoted_printable`(0BSD)만 `deny.toml`에 예외로 더했다. `uplot`은 MIT.
 - 이 Mac에서 `metrics-it`·`qemu-it` E2E와 `migration-it,qemu-it`의 라이브 마이그레이션 기록 시험(TCG), Homebrew promtool 2.53.3의 `check metrics`(VM 줄 포함)가 통과했다.
-- 리뷰: (채움)
-- svc01 일반 시험: (채움)
-- GitHub 탐침: (채움)
+- 리뷰 1(중대 0·중요 4·경미 9, 모두 고침): 보내기 큐가 허가를 잡은 뒤에만 받고 대상마다 한 건씩, 대시보드 모으기를 키별로 공유하고 잠금 밖에서 묻기, 기록 훑기·밀기를 쓰기와 떼기, SMTP TLS·웹훅 URL이 바뀌면 비밀 다시 묻기, 비관리자 이력에서 대상·오류 가림, 경보 500개 상한, 목록을 못 읽으면 경보 지키기, `Invalid` 밀기 물러서기와 옆 파일 30일 정리, 경보 상태 파일을 못 열어도 시작, 꺼 둔 규칙의 백업 실패 다시 보내지 않기.
+- 리뷰 2(중대 0·중요 2·경미 8, 모두 고침, 리뷰 1 수정은 옳다고 확인): 기록 끈 노드로 밀기 물러서기(파일은 지킴), 15분 넘은 알림 버리기와 대상별 20건 상한, 대상 돌아가며 보내기, 풀린 경보의 발생 재시도 버리기, 열기 잠금 밖에서 파일 만들기, 디스크 오류 경고 묶기, 밀기 순서를 주인 노드별로 섞기, CLI의 부호 붙은 기간 거절, Prometheus 캐시 몰림 막기.
+- svc01 일반 시험: 첫 회는 시험 3280개 통과였으나 clippy가 svc01의 Rust 1.99에서만 나는 두 경고(`fetch_update` 사용 중단, `chunks_exact_to_as_chunks`)에 걸렸다. 옛·새 툴체인 모두에서 깨끗한 꼴로 고친 뒤 둘째 회에서 fmt·clippy·시험 3289개·starve·규모 100·저장소 시험 모두 통과.
+- GitHub 탐침: 세 번 모두 linux-kvm(KVM 마이그레이션의 기록 따라가기, promtool 2.45 검사 포함), install-media, ceph, ldap, package, iso-e2e(bios·uefi), catalog-links 통과.
 - 배포: (배포 후 채움)
 
 ## 다음 계획으로 넘길 사항
