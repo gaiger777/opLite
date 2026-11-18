@@ -512,25 +512,8 @@ impl Member {
             None => Arc::new(AuditLog::disabled()),
         };
         // 경보 장부(계획 60): 경보 엔진이 적고, API와 다른 노드(노드 간 서버)가 읽는다.
-        let alert_book = {
-            let dir = config.data_dir.join(ALERTS_DIR);
-            let name = config.name.clone();
-            let opened = tokio::task::spawn_blocking(move || AlertBook::open(dir, name)).await;
-            match opened {
-                Ok(Ok(book)) => book,
-                Ok(Err(e)) => {
-                    let _ = cluster.shutdown().await;
-                    return Err(anyhow::Error::new(e).context(format!(
-                        "cannot open the alert state in {}",
-                        config.data_dir.join(ALERTS_DIR).display()
-                    )));
-                }
-                Err(e) => {
-                    let _ = cluster.shutdown().await;
-                    return Err(anyhow::anyhow!("opening the alert state failed: {e}"));
-                }
-            }
-        };
+        let alert_book =
+            open_alert_book(config.data_dir.join(ALERTS_DIR), config.name.clone()).await;
         // 측정기가 적고, API와 다른 노드(노드 간 서버)가 읽는다. 기록 파일(계획 60)의 지난 1시간을 측정기를 띄우기 전에
         // 저장소에 되살린다. 기록을 끄면 파일 없이 메모리 1시간만으로 기록 조회에 답한다.
         let metrics_store = Arc::new(MetricsStore::default());
@@ -1262,6 +1245,19 @@ pub const SHUTDOWN_MIGRATE_LIMIT: Duration = Duration::from_secs(600);
 const SHUTDOWN_MIGRATE_POLL: Duration = Duration::from_secs(1);
 
 /// 지금 시각(유닉스 초)
+/// 경보 장부를 연다. 열지 못하면(권한, 이름 바꾸기 실패 …) 경고하고 메모리 장부로 시작한다: 경보는 돌지만 다시
+/// 시작하면 상태와 보낸 기록을 잊는다(기록 파일을 열지 못하면 기록만 끄는 것처럼 opld 시작을 막지 않는다).
+async fn open_alert_book(dir: PathBuf, name: String) -> AlertBook {
+    let (d, n) = (dir.clone(), name.clone());
+    let error = match tokio::task::spawn_blocking(move || AlertBook::open(d, n)).await {
+        Ok(Ok(book)) => return book,
+        Ok(Err(e)) => e.to_string(),
+        Err(e) => e.to_string(),
+    };
+    tracing::warn!(dir = %dir.display(), error = %error, "cannot open the alert state; keeping alerts in memory only");
+    AlertBook::memory(name)
+}
+
 fn unix_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1921,5 +1917,18 @@ mod tests {
         check_leave(id(&w), &voters(&[&a, &w]), &nodes).unwrap();
         // Node 리소스가 없는 투표 멤버는 일반 노드로 본다(get_cluster처럼).
         check_leave(id(&a), &voters(&[&a, &b, &w]), &[a.clone(), w.clone()]).unwrap();
+    }
+
+    /// 경보 장부를 열지 못해도 opld는 메모리 장부로 시작한다(리뷰 1 #12).
+    #[tokio::test]
+    async fn an_unusable_alert_dir_falls_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        // 디렉터리 자리에 파일이 있어 만들지 못한다.
+        let blocked = dir.path().join("alerts");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let book = open_alert_book(blocked.clone(), "n1".into()).await;
+        assert_eq!(book.node(), "n1");
+        assert!(book.active().is_empty());
+        assert!(blocked.is_file());
     }
 }

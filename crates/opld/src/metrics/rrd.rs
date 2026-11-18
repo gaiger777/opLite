@@ -6,7 +6,9 @@
 //!   쓴 칸)가 있고, 칸 `b`는 `last − rows < b ≤ last`일 때만 읽는다. 가리키지 않은 자리의 쓰레기는 다음 쓰기가 덮는다.
 //! - 쓰기: 데이터를 제자리에 쓰고([`Rrd::append`]·[`Rrd::close`]) → [`Rrd::sync_data`] → [`Rrd::commit`](머리를
 //!   번갈아 쓰고 다시 sync). 머리는 데이터가 디스크에 닿은 뒤에만 그 칸을 가리키므로 끊겨도 잃는 것은 마지막 기록
-//!   주기(1분)다.
+//!   주기(1분)다. 다만 데이터는 제자리에 쓰므로 새 칸이 옛 머리가 아직 가장 오래된 칸으로 보는 자리를 덮는다. 그 사이에
+//!   끊기면 다시 연 뒤 그 자리(층의 가장 오래된 끝, `Raw5s`면 약 1시간 전, `Hour6`이면 약 1년 전)에 새 값이 보이다가
+//!   다음 쓰기가 NaN으로 덮는다. 보이는 기간을 줄여 막는 것보다 싸서 그대로 둔다(리뷰 1 #10, 겉모습만의 문제).
 //! - 합치기: `Min1`은 그 분의 `Raw5s` 12칸, `Min30`·`Hour6`은 `Min1` 칸을 칸이 닫힐 때 다시 읽어 만든다. 따로
 //!   누산기가 없어 다시 열어도 닫히지 않은 칸을 이어서 만든다.
 //! - 시각 `t`는 인자로 받는다(시험은 벽시계를 쓰지 않는다).
@@ -438,6 +440,8 @@ pub struct Rrd {
     /// 쓰는 중인 머리(마지막 [`Rrd::commit`] 뒤 바뀌었으면 `dirty`)
     hdr: Header,
     dirty: bool,
+    /// [`Rrd::unlink`]로 지웠다(더 쓰면 사라지는 파일에 쓰는 것이다).
+    removed: bool,
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -465,6 +469,27 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(suffix);
     PathBuf::from(s)
+}
+
+/// `name`이 이 형식의 파일(`{stem}.rrd`, `stem_ok(stem)`) 옆으로 옮긴 파일이나 남은 임시 파일인지: `.rrd` 뒤에
+/// `.tmp`, `.corrupt`, `.corrupt.N`, `.vN`, `.vN.M`이 붙은 이름이다.
+pub fn is_aside(name: &str, stem_ok: impl Fn(&str) -> bool) -> bool {
+    let Some((stem, rest)) = name.split_once(&format!(".{EXT}.")) else {
+        return false;
+    };
+    if !stem_ok(stem) {
+        return false;
+    }
+    let num = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    if rest == "tmp" {
+        return true;
+    }
+    let (head, tail) = match rest.split_once('.') {
+        Some((h, t)) => (h, Some(t)),
+        None => (rest, None),
+    };
+    let head_ok = head == "corrupt" || head.strip_prefix('v').is_some_and(num);
+    head_ok && tail.is_none_or(num)
 }
 
 /// 지우지 않고 옆으로 옮긴다. 같은 이름이 있으면 `.1`, `.2`…를 붙인다.
@@ -567,6 +592,7 @@ impl Rrd {
                 file,
                 hdr,
                 dirty: false,
+                removed: false,
             };
             return Ok((rrd, Opened::Existing));
         }
@@ -583,6 +609,7 @@ impl Rrd {
             file,
             hdr,
             dirty: false,
+            removed: false,
         })
     }
 
@@ -619,6 +646,7 @@ impl Rrd {
             file,
             hdr,
             dirty: false,
+            removed: false,
         })
     }
 
@@ -637,6 +665,26 @@ impl Rrd {
     /// 층의 마지막으로 쓴 칸(쓴 적이 없으면 `None`)
     pub fn last(&self, tier: Tier) -> Option<i64> {
         self.hdr.last[tier_index(tier)]
+    }
+
+    /// 마지막으로 commit 한 머리의 차례(commit 할 때마다 1씩 는다)
+    pub fn seq(&self) -> u64 {
+        self.hdr.seq
+    }
+
+    /// 파일을 지운다(없으면 그만). 그 뒤 이 핸들은 [`Rrd::is_removed`]다.
+    pub fn unlink(&mut self) -> io::Result<()> {
+        match std::fs::remove_file(&self.path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => {
+                self.removed = true;
+                Ok(())
+            }
+        }
+    }
+
+    pub fn is_removed(&self) -> bool {
+        self.removed
     }
 
     /// 마지막 [`Rrd::commit`] 뒤 바뀐 것이 있는지
@@ -1331,6 +1379,8 @@ mod tests {
         rrd.sync_data().unwrap();
     }
 
+    /// 머리를 쓰기 전에 끊기면 마지막 기록 주기를 잃는다. 덮인 가장 오래된 자리의 새 값이 잠깐 옛 시각으로 보이는
+    /// 것은 모듈 문서대로 그대로 둔다(리뷰 1 #10).
     #[test]
     fn interrupted_before_header_loses_last_minute() {
         let dir = tempfile::tempdir().unwrap();
@@ -1604,5 +1654,32 @@ mod tests {
         assert!(rrd.read(Tier::Raw5s, T0, T0 + 24 * 60 * MIN).is_err());
         // 366일 범위의 Hour6은 된다
         assert!(rrd.read(Tier::Hour6, T0, T0 + 366 * 24 * 60 * MIN).is_ok());
+    }
+
+    #[test]
+    fn aside_names_are_only_our_moved_and_temporary_files() {
+        let uuid = |s: &str| s.parse::<uuid::Uuid>().is_ok();
+        let id = "0192f0c2-0000-7000-8000-000000000001";
+        for name in [
+            format!("{id}.rrd.corrupt"),
+            format!("{id}.rrd.corrupt.2"),
+            format!("{id}.rrd.v2"),
+            format!("{id}.rrd.v3.1"),
+            format!("{id}.rrd.tmp"),
+        ] {
+            assert!(is_aside(&name, uuid), "{name}");
+        }
+        for name in [
+            format!("{id}.rrd"),
+            format!("{id}.rrd.bak"),
+            format!("{id}.rrd.v"),
+            format!("{id}.rrd.corrupt.x"),
+            format!("{id}.rrd.tmp.1"),
+            "notes.rrd.corrupt".to_string(),
+            "x.txt".to_string(),
+        ] {
+            assert!(!is_aside(&name, uuid), "{name}");
+        }
+        assert!(is_aside("node.rrd.corrupt", |s| s == "node"));
     }
 }

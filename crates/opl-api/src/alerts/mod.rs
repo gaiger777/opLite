@@ -24,6 +24,7 @@ use opl_types::alert::{
     NotificationTargetView, NotificationTestResult, Severity, SmtpTarget, TargetConfig,
     WebhookTarget, redact_url,
 };
+use opl_types::auth::Role;
 use opl_types::clock::{Clock, SystemClock};
 use opl_types::node::{NOTIFICATIONS, Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
@@ -166,13 +167,6 @@ fn yes() -> bool {
     true
 }
 
-/// URL의 출처(`scheme://host[:port]`)
-fn origin(url: &str) -> Option<String> {
-    reqwest::Url::parse(url.trim())
-        .ok()
-        .map(|u| u.origin().ascii_serialization())
-}
-
 /// CRLF를 LF로 바꾸고 앞뒤 공백을 뗀다.
 fn trim_pem(pem: Option<String>) -> Option<String> {
     pem.map(|p| p.replace("\r\n", "\n").trim().to_string())
@@ -216,10 +210,14 @@ fn smtp_of(mut s: SmtpTarget, old: Option<&SmtpTarget>) -> Result<SmtpTarget, Ap
         Some(p) => Some(p),
         None => match old {
             Some(old) if old.password.is_some() => {
-                // 저장된 비밀번호를 다른 서버·계정으로 보내지 않는다.
-                if old.host != s.host || old.port != s.port || old.user != s.user {
+                // 저장된 비밀번호를 다른 서버·계정으로, 다른 TLS 방식(평문으로 낮추기 포함)으로 보내지 않는다.
+                if old.host != s.host
+                    || old.port != s.port
+                    || old.user != s.user
+                    || old.tls != s.tls
+                {
                     return Err(ApiError::bad_request(
-                        "password must be given again when host, port or user changes",
+                        "password must be given again when host, port, user or tls changes",
                     ));
                 }
                 old.password.clone()
@@ -241,13 +239,12 @@ fn webhook_of(
     {
         w.url = old.url.clone();
     }
-    // 저장된 비밀(토큰·헤더 값)은 같은 출처·같은 CA로만 다시 보낸다.
-    let same = old.filter(|old| {
-        origin(&old.url).is_some() && origin(&old.url) == origin(&w.url) && old.ca_pem == w.ca_pem
-    });
+    // 저장된 비밀(토큰·헤더 값)은 같은 URL(줄인 URL을 그대로 보냈거나 저장된 URL 전체)·같은 CA로만 다시 보낸다.
+    // 경로만 바꿔도 다시 묻는다(같은 호스트의 다른 경로가 받은 요청을 보여 주는 곳일 수 있다).
+    let same = old.filter(|old| old.url == w.url && old.ca_pem == w.ca_pem);
     let again = |what: &str| {
         ApiError::bad_request(format!(
-            "{what} must be given again when the url host or ca_pem changes"
+            "{what} must be given again when the url or ca_pem changes"
         ))
     };
     w.token = match w.token.take() {
@@ -652,6 +649,8 @@ pub async fn list_alert_history(
     Query(params): Query<AlertHistoryParams>,
 ) -> Result<Json<NotificationHistoryResponse>, ApiError> {
     state.authorize(&principal, Action::Read, AlertRuleSpec::KIND)?;
+    // 알림 대상은 admin만 읽으므로 다른 사용자에게는 대상 이름과 오류 문구(서버·주소가 담김)를 보이지 않는다.
+    let admin = principal.role == Role::Admin;
     let ms = |field: &str, v: &str| {
         crate::audit::parse_time(field, v).map(|t| i64::try_from(t).unwrap_or(i64::MAX))
     };
@@ -692,6 +691,12 @@ pub async fn list_alert_history(
     records.sort_by(|a, b| b.at.cmp(&a.at).then(a.node.cmp(&b.node)));
     let truncated = records.len() > limit as usize;
     records.truncate(limit as usize);
+    if !admin {
+        for r in &mut records {
+            r.target.clear();
+            r.error = None;
+        }
+    }
     Ok(Json(NotificationHistoryResponse {
         records,
         unreachable,

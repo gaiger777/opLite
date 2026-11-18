@@ -488,10 +488,11 @@ const HISTORY_HEADERS: &[&str] = &[
 ];
 
 fn history_row(r: &Value) -> Vec<String> {
-    let result = if r["ok"] == true {
-        "ok".to_string()
-    } else {
-        format!("failed: {}", r["error"].as_str().unwrap_or("unknown error"))
+    // admin이 아니면 서버가 대상 이름과 오류 문구를 빼고 보낸다.
+    let result = match (r["ok"] == true, r["error"].as_str()) {
+        (true, _) => "ok".to_string(),
+        (false, Some(e)) => format!("failed: {e}"),
+        (false, None) => "failed".to_string(),
     };
     vec![
         ms_time(&r["at"]),

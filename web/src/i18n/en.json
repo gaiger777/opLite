@@ -2817,7 +2817,7 @@
         "from": "Enter the sender address.",
         "to": "Enter 1 to 20 recipient addresses.",
         "passwordWithoutUser": "A password needs a user.",
-        "passwordAgain": "The server, port or user changed. Enter the password again or remove it.",
+        "passwordAgain": "The server, port, user or TLS changed. Enter the password again or remove it.",
         "url": "Enter an http:// or https:// URL.",
         "tokenUnused": "Only ntfy and Gotify use a token.",
         "tokenAgain": "The URL or CA changed. Enter the token again or remove it.",

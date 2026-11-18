@@ -687,20 +687,36 @@ async fn targets_are_admin_only_and_never_show_secrets() {
         hit.headers["title"].starts_with("[Orbivisor test] TEST:"),
         "{hit:?}"
     );
-    // 다른 호스트로 바꾸면 비밀을 다시 줘야 한다.
-    let got = admin
-        .put(
-            "/notification-targets/ntfy",
-            json!({"target": {"kind": "webhook", "url": "http://localhost:9/x", "format": "ntfy"}}),
-            None,
-        )
-        .await;
-    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
-    assert!(
-        got.1["message"].as_str().unwrap().contains("token"),
-        "{:?}",
-        got.1
-    );
+    // 보낸 기록: admin이 아닌 사용자에게는 대상 이름과 오류 문구를 보이지 않는다(리뷰 1 #9).
+    let (_, history) = admin.get("/alerts/history?since=0").await;
+    assert_eq!(history["records"][0]["target"], "ntfy", "{history}");
+    let viewer = rig.env.user("u-history", "viewer").await;
+    let (status, history) = viewer.get("/alerts/history?since=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let records = history["records"].as_array().unwrap();
+    assert!(!records.is_empty(), "{history}");
+    for r in records {
+        assert!(r.get("target").is_none() && r.get("error").is_none(), "{r}");
+    }
+    // 다른 호스트나 같은 호스트의 다른 경로로 바꾸면 비밀을 다시 줘야 한다(리뷰 1 #8).
+    for url in [
+        "http://localhost:9/x".to_string(),
+        format!("http://127.0.0.1:{port}/hook/OTHERPATH"),
+    ] {
+        let got = admin
+            .put(
+                "/notification-targets/ntfy",
+                json!({"target": {"kind": "webhook", "url": url, "format": "ntfy"}}),
+                None,
+            )
+            .await;
+        assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+        assert!(
+            got.1["message"].as_str().unwrap().contains("token"),
+            "{:?}",
+            got.1
+        );
+    }
     let got = admin
         .put(
             "/notification-targets/mail",
@@ -710,6 +726,21 @@ async fn targets_are_admin_only_and_never_show_secrets() {
         )
         .await;
     assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    // TLS 방식만 바꿔도 비밀번호를 다시 줘야 한다(리뷰 1 #4).
+    let got = admin
+        .put(
+            "/notification-targets/mail",
+            json!({"target": {"kind": "smtp", "host": "127.0.0.1", "port": 2525, "tls": "starttls",
+                              "user": "ops", "from": "o@example.com", "to": ["a@example.com"]}}),
+            None,
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
+    assert!(
+        got.1["message"].as_str().unwrap().contains("tls"),
+        "{:?}",
+        got.1
+    );
     // 이름은 바꾸지 못한다.
     let got = admin
         .put(

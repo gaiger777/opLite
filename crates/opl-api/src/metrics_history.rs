@@ -6,8 +6,8 @@
 //! 노드가 셈한다(지난 1시간은 5초 원본으로 정확히, 그 밖은 층의 AVG로 근사하고 `approx`).
 //!
 //! 클러스터 모으기(`GET /metrics/cluster`)는 위트니스를 뺀 노드에 `Digest`를 [`crate::fan_out::gather`]로 묻고(동시에
-//! 32개까지), 같은 층·칸으로 답한 노드의 열을 합친다(`cluster_sum`). 같은 조건은 이 API 노드에서 10초 캐시하고, 캐시를
-//! 채우는 동안 같은 노드의 다른 모으기는 기다린다(모으기가 겹쳐 노드에 묻는 수가 늘지 않게).
+//! 32개까지), 같은 층·칸으로 답한 노드의 열을 합친다(`cluster_sum`). 같은 조건은 이 API 노드에서 10초 캐시하고, 같은
+//! 조건을 채우는 동안 온 요청은 그것을 기다린다(모으기가 겹쳐 노드에 묻는 수가 늘지 않게). 다른 조건은 따로 돈다.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -303,34 +303,58 @@ pub async fn get_pool_history(
 /// 클러스터 모으기 캐시의 열쇠: (`range`, `from`, `until`, `points`)
 type DigestKey = (Option<&'static str>, Option<i64>, Option<i64>, u16);
 
-/// 클러스터 모으기의 캐시(이 API 노드 메모리)
+/// 조건 하나의 캐시 칸: 비었으면 누군가 채우는 중이고, 채워졌으면 (채운 때, 답)이다.
+type DigestSlot = Arc<tokio::sync::OnceCell<(Instant, Arc<ClusterHistoryResponse>)>>;
+
+/// 클러스터 모으기의 캐시(이 API 노드 메모리). 바깥 잠금은 칸을 찾을 때만 잡고, 모으기는 칸마다 한 번만 돈다.
 #[derive(Default)]
 pub(crate) struct DigestCache {
-    entries: HashMap<DigestKey, (Instant, Arc<ClusterHistoryResponse>)>,
+    entries: HashMap<DigestKey, DigestSlot>,
 }
 
 impl DigestCache {
-    fn get(&self, key: &DigestKey, now: Instant) -> Option<Arc<ClusterHistoryResponse>> {
-        self.entries
-            .get(key)
-            .filter(|(at, _)| now.duration_since(*at) < DIGEST_CACHE_TTL)
-            .map(|(_, r)| r.clone())
-    }
-
-    fn put(&mut self, key: DigestKey, response: Arc<ClusterHistoryResponse>, now: Instant) {
-        self.entries
-            .retain(|_, (at, _)| now.duration_since(*at) < DIGEST_CACHE_TTL);
+    /// 조건의 칸: 채우는 중이거나 아직 새것이면 그 칸, 아니면 새 빈 칸(오래된 칸은 정리하고, 많으면 가장 오래 채운
+    /// 칸을 뺀다).
+    fn slot(&mut self, key: DigestKey, now: Instant) -> DigestSlot {
+        let fresh = |s: &DigestSlot| {
+            s.get()
+                .is_none_or(|(at, _)| now.duration_since(*at) < DIGEST_CACHE_TTL)
+        };
+        if let Some(s) = self.entries.get(&key)
+            && fresh(s)
+        {
+            return s.clone();
+        }
+        self.entries.retain(|_, s| fresh(s));
         if self.entries.len() >= DIGEST_CACHE_MAX
-            && let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
+            && let Some(oldest) = (self.entries.iter())
+                .min_by_key(|(_, s)| s.get().map_or(now, |(at, _)| *at))
                 .map(|(k, _)| *k)
         {
             self.entries.remove(&oldest);
         }
-        self.entries.insert(key, (now, response));
+        let s = DigestSlot::default();
+        self.entries.insert(key, s.clone());
+        s
     }
+}
+
+/// 조건 `key`의 답을 캐시에서 주거나 `fill`로 채운다. 같은 조건을 채우는 중이면 그것을 기다리고(채우던 요청이
+/// 끊기거나 실패하면 기다리던 요청 하나가 이어 채운다), 다른 조건은 기다리지 않는다.
+pub(crate) async fn cached_digest<F, Fut>(
+    cache: &std::sync::Mutex<DigestCache>,
+    key: DigestKey,
+    fill: F,
+) -> Result<Arc<ClusterHistoryResponse>, ApiError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<ClusterHistoryResponse, ApiError>>,
+{
+    let slot = cache.lock().unwrap().slot(key, Instant::now());
+    let (_, response) = slot
+        .get_or_try_init(|| async { Ok::<_, ApiError>((Instant::now(), Arc::new(fill().await?))) })
+        .await?;
+    Ok(response.clone())
 }
 
 /// 클러스터 전체의 기록 요약: 노드 열을 합친 클러스터 열(CPU %는 코어 수로 가중, 나머지는 합, AVG만), 노드 줄(20개
@@ -349,13 +373,7 @@ pub async fn get_cluster_history(
     let now = now_ms();
     let query = params.query(HistoryScope::Digest { top: DIGEST_TOP }, now, DIGEST_POINTS)?;
     let key = params.cache_key(query.points);
-    // 캐시를 채우는 동안 같은 노드의 다른 모으기는 기다렸다가 캐시를 읽는다.
-    let mut cache = state.digest_cache.lock().await;
-    if let Some(hit) = cache.get(&key, Instant::now()) {
-        return Ok(Json(hit.as_ref().clone()));
-    }
-    let response = Arc::new(digest(&state, &query, now).await?);
-    cache.put(key, response.clone(), Instant::now());
+    let response = cached_digest(&state.digest_cache, key, || digest(&state, &query, now)).await?;
     Ok(Json(response.as_ref().clone()))
 }
 
@@ -1000,14 +1018,64 @@ mod tests {
         let mut cache = DigestCache::default();
         let t0 = Instant::now();
         let key = (Some("hour"), None, None, 120);
-        cache.put(key, response.clone(), t0);
-        assert!(cache.get(&key, t0 + Duration::from_secs(9)).is_some());
-        assert!(cache.get(&key, t0 + DIGEST_CACHE_TTL).is_none());
-        assert!(cache.get(&(Some("day"), None, None, 120), t0).is_none());
+        let fill = |cache: &mut DigestCache, key, at| {
+            cache.slot(key, at).set((at, response.clone())).unwrap();
+        };
+        fill(&mut cache, key, t0);
+        let same = |a: &DigestSlot, b: &DigestSlot| Arc::ptr_eq(a, b);
+        let first = cache.slot(key, t0);
+        assert!(same(&first, &cache.slot(key, t0 + Duration::from_secs(9))));
+        let renewed = cache.slot(key, t0 + DIGEST_CACHE_TTL);
+        assert!(!same(&first, &renewed) && renewed.get().is_none());
+        // 채우는 중인 칸은 오래되어도 그대로 준다.
+        assert!(same(&renewed, &cache.slot(key, t0 + DIGEST_CACHE_TTL * 5)));
+        assert!(
+            cache
+                .slot((Some("day"), None, None, 120), t0)
+                .get()
+                .is_none()
+        );
         for i in 0..(DIGEST_CACHE_MAX as i64 * 2) {
-            cache.put((None, Some(i), None, 120), response.clone(), t0);
+            fill(&mut cache, (None, Some(i), None, 120), t0);
         }
         assert_eq!(cache.entries.len(), DIGEST_CACHE_MAX);
+    }
+
+    fn empty_digest() -> ClusterHistoryResponse {
+        merge_digest(Uuid::nil(), &digest_query(), NOW, vec![], &[], &[], &[])
+    }
+
+    /// 응답 없는 노드 때문에 한 조건의 모으기가 오래 걸려도 다른 조건의 요청은 기다리지 않고, 같은 조건의 요청은
+    /// 모으기를 한 번만 한다(리뷰 1 #2).
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_digest_does_not_block_other_keys_and_is_shared() {
+        let cache = Arc::new(std::sync::Mutex::new(DigestCache::default()));
+        let fills = Arc::new(AtomicUsize::new(0));
+        let hung = (Some("hour"), None, None, 120);
+        let spawn_hung = || {
+            let (cache, fills) = (cache.clone(), fills.clone());
+            tokio::spawn(async move {
+                cached_digest(&cache, hung, || async move {
+                    fills.fetch_add(1, Ordering::SeqCst);
+                    // 노드 하나가 답하지 않아 기록 읽기 제한 시간까지 기다린다.
+                    tokio::time::sleep(HISTORY_READ_TIMEOUT).await;
+                    Ok(empty_digest())
+                })
+                .await
+            })
+        };
+        let (a, b) = (spawn_hung(), spawn_hung());
+        tokio::task::yield_now().await;
+        let other = tokio::time::timeout(
+            Duration::from_millis(10),
+            cached_digest(&cache, (Some("day"), None, None, 120), || async {
+                Ok(empty_digest())
+            }),
+        )
+        .await;
+        assert!(other.is_ok(), "a request for another key waited");
+        assert!(a.await.unwrap().is_ok() && b.await.unwrap().is_ok());
+        assert_eq!(fills.load(Ordering::SeqCst), 1);
     }
 
     /// 노드 300대: 한꺼번에 묻는 수는 `FAN_OUT`개까지이고, 답의 크기는 노드 수와 함께 늘지 않는다(줄 20개).

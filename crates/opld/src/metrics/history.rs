@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use opl_cluster::Cluster;
 use opl_cluster::types::NodeId;
 use opl_cluster::watch::{Watch, WatchEvent};
@@ -56,6 +57,16 @@ pub const MAX_OPEN: usize = 4096;
 pub const BUSY_MS: i64 = 30_000;
 /// 밀어 넘기기 한 번을 기다리는 시간
 const PUSH_TIMEOUT: Duration = Duration::from_secs(30);
+/// 정리 한 차례의 밀어 넘기기를 모두 기다리는 시간(넘으면 남은 것은 다음 차례에 한다)
+pub const PUSH_DEADLINE: Duration = Duration::from_secs(120);
+/// 동시에 밀어 넘기는 수
+const PUSH_CONCURRENCY: usize = 8;
+/// 받는 쪽이 `Invalid`로 거절한 VM 기록을 다시 보내기까지 처음 기다리는 시간. 거절할 때마다 두 배로 늘려 하루까지
+/// 기다린다(옛 RRD 형식의 노드처럼 받을 수 없는 쪽에 376 KiB를 10분마다 보내지 않게).
+const REFUSED_BACKOFF: Duration = SCAN_INTERVAL;
+const MAX_REFUSED_BACKOFF: Duration = Duration::from_secs(86_400);
+/// 옆으로 옮긴 파일(`.corrupt`·`.vN`)과 남은 임시 파일(`.tmp`)을 지우는 나이
+pub const ASIDE_KEEP: Duration = Duration::from_secs(30 * 86_400);
 /// 정리의 리더 확인 읽기를 기다리는 시간
 const SWEEP_READ_TIMEOUT: Duration = Duration::from_secs(10);
 /// 기록은 주기 경계보다 이만큼 뒤에 한다(경계 바로 앞에 잰 점이 저장소에 들어오게).
@@ -622,23 +633,113 @@ impl History {
                 "a metrics history file is at most {MAX_HISTORY_BYTES} bytes"
             )));
         }
-        let handle = self
-            .handle(Key::Vm(vm), true)
-            .map_err(io_error)?
-            .ok_or(HistoryError::Disabled)?;
-        handle.lock().unwrap().merge(bytes).map_err(io_error)?;
-        tracing::info!(vm = %vm, "merged metrics history pushed by another node");
-        Ok(())
+        // 밀어 넘긴 뒤 지운 핸들을 잡았으면 새 파일로 한 번 더 한다(지운 파일에 합치면 잃는다).
+        for _ in 0..2 {
+            let handle = self
+                .handle(Key::Vm(vm), true)
+                .map_err(io_error)?
+                .ok_or(HistoryError::Disabled)?;
+            let mut rrd = handle.lock().unwrap();
+            if rrd.is_removed() {
+                continue;
+            }
+            rrd.merge(bytes).map_err(io_error)?;
+            tracing::info!(vm = %vm, "merged metrics history pushed by another node");
+            return Ok(());
+        }
+        Err(HistoryError::Io(
+            "the metrics history file was removed while merging".into(),
+        ))
     }
 
-    /// VM 파일을 디스크에 닿게 한 뒤 통째로 읽는다(밀어 넘기기). 파일이 없으면 `None`이다. 막히는 호출이다.
-    fn file_bytes(&self, vm: Uuid) -> io::Result<Option<Vec<u8>>> {
+    /// VM 파일을 디스크에 닿게 한 뒤 통째로 읽는다(밀어 넘기기): (바이트, 머리 차례). 파일이 없으면 `None`이다.
+    /// 막히는 호출이다.
+    fn file_bytes(&self, vm: Uuid) -> io::Result<Option<(Vec<u8>, u64)>> {
         let Some(handle) = self.handle(Key::Vm(vm), false)? else {
             return Ok(None);
         };
         let mut rrd = handle.lock().unwrap();
         rrd.flush()?;
-        rrd.to_bytes().map(Some)
+        Ok(Some((rrd.to_bytes()?, rrd.seq())))
+    }
+
+    /// 밀어 넘긴 VM 파일을 읽은 뒤 바뀌지 않았으면(쓰지 않은 것이 없고 머리 차례 `seq`가 같으면) 닫고 지운다.
+    /// 그사이 다른 노드가 합쳐 넣었거나 새 점을 썼으면 두고 false다. 막히는 호출이다.
+    fn remove_pushed(&self, vm: Uuid, seq: u64) -> io::Result<bool> {
+        let key = Key::Vm(vm);
+        let Some(handle) = self.handle(key, false)? else {
+            return Ok(true);
+        };
+        // 핸들을 잡은 채 지워 그사이 합치기가 끼어들지 못하게 한다(잠금 순서: 핸들 → 열린 목록).
+        let mut rrd = handle.lock().unwrap();
+        if rrd.is_dirty() || rrd.seq() != seq {
+            return Ok(false);
+        }
+        {
+            let mut open = self.open.lock().unwrap();
+            if open
+                .files
+                .get(&key)
+                .is_some_and(|e| Arc::ptr_eq(&e.rrd, &handle))
+            {
+                open.files.remove(&key);
+            }
+        }
+        rrd.unlink()?;
+        Ok(true)
+    }
+
+    /// 기록 디렉터리에서 `keep`보다 오래된, 옆으로 옮긴 파일과 남은 임시 파일을 지운다([`rrd::is_aside`]: 이 형식의
+    /// 파일 이름 옆의 것만). 지운 수를 돌려준다. 막히는 호출이다.
+    fn sweep_aside(&self, keep: Duration) -> usize {
+        let Some(dir) = &self.dir else {
+            return 0;
+        };
+        // (디렉터리, 노드 파일 자리인지): 노드 자리는 `node.rrd`, 나머지는 `{uuid}.rrd` 옆의 것만 본다.
+        let places = [
+            (dir.clone(), true),
+            (dir.join("vm"), false),
+            (dir.join("pool"), false),
+        ];
+        let now = std::time::SystemTime::now();
+        let mut removed = 0;
+        for (place, node) in places {
+            let stem_ok = |s: &str| {
+                if node {
+                    s == "node"
+                } else {
+                    s.parse::<Uuid>().is_ok()
+                }
+            };
+            let Ok(entries) = std::fs::read_dir(&place) else {
+                continue;
+            };
+            for e in entries.filter_map(Result::ok) {
+                let Some(name) = e.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let old = e
+                    .metadata()
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| now.duration_since(t).ok())
+                    .is_some_and(|age| age > keep);
+                if !old || !rrd::is_aside(&name, stem_ok) {
+                    continue;
+                }
+                match std::fs::remove_file(e.path()) {
+                    Ok(()) => {
+                        removed += 1;
+                        tracing::info!(file = %e.path().display(), "removed an old set-aside metrics history file");
+                    }
+                    Err(err) => {
+                        tracing::warn!(file = %e.path().display(), error = %err, "cannot remove an old set-aside metrics history file")
+                    }
+                }
+            }
+        }
+        removed
     }
 
     /// 시리즈 파일을 닫고 지운다. 막히는 호출이다.
@@ -720,12 +821,7 @@ impl HistoryWriter {
         pusher: Arc<dyn HistoryPusher>,
         config: WriterConfig,
     ) -> Self {
-        let scanner = Scanner {
-            history: history.clone(),
-            cluster,
-            pusher,
-            seen: Seen::default(),
-        };
+        let scanner = Scanner::new(history.clone(), cluster, pusher);
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
@@ -756,40 +852,61 @@ async fn flush(history: &Arc<History>, pools: &PoolLevels) {
 
 async fn run_writer(
     history: Arc<History>,
-    mut scanner: Scanner,
+    scanner: Scanner,
     pools: Arc<PoolLevels>,
     config: WriterConfig,
     mut shutdown: oneshot::Receiver<()>,
 ) {
+    let (cluster, pusher) = (scanner.cluster.clone(), scanner.pusher.clone());
     let mut next_scan = tokio::time::Instant::now() + config.first_scan;
     let mut watch: Option<Watch> = None;
+    // 정리는 따로 돈다(밀어 넘기기가 늦어도 기록 주기를 놓치지 않게). 도는 동안 정리기는 작업이 가진다.
+    let mut idle = Some(scanner);
+    let mut scanning: Option<JoinHandle<Scanner>> = None;
+    // 정리가 도는 동안 VM이 바뀌어 앞당길 다음 정리
+    let mut soon: Option<tokio::time::Instant> = None;
     loop {
         let wait = until_next_flush(history.clock.now_ms(), config.flush);
         if watch.is_none() {
-            watch = scanner
-                .cluster
+            watch = cluster
                 .list::<VmSpec>()
                 .ok()
-                .and_then(|(revision, _)| scanner.cluster.watch(revision).ok());
+                .and_then(|(revision, _)| cluster.watch(revision).ok());
         }
         tokio::select! {
             _ = &mut shutdown => {
+                if let Some(task) = scanning.take() {
+                    task.abort();
+                }
                 flush(&history, &pools).await;
                 return;
             }
             () = tokio::time::sleep(wait) => flush(&history, &pools).await,
-            () = tokio::time::sleep_until(next_scan) => {
-                tokio::select! {
-                    _ = &mut shutdown => {
-                        flush(&history, &pools).await;
-                        return;
+            () = tokio::time::sleep_until(next_scan), if idle.is_some() => {
+                let mut scanner = idle.take().unwrap();
+                scanning = Some(tokio::spawn(async move {
+                    scanner.scan().await;
+                    scanner
+                }));
+            }
+            done = async { scanning.as_mut().unwrap().await }, if scanning.is_some() => {
+                scanning = None;
+                idle = Some(match done {
+                    Ok(scanner) => scanner,
+                    Err(e) => {
+                        tracing::error!(error = %e, "the metrics history scan panicked");
+                        Scanner::new(history.clone(), cluster.clone(), pusher.clone())
                     }
-                    () = scanner.scan() => {}
-                }
-                next_scan = tokio::time::Instant::now() + config.scan;
+                });
+                let regular = tokio::time::Instant::now() + config.scan;
+                next_scan = soon.take().map_or(regular, |t| t.min(regular));
             }
             changed = vm_changed(&mut watch, &history) => if changed {
-                next_scan = next_scan.min(tokio::time::Instant::now() + config.after_change);
+                let at = tokio::time::Instant::now() + config.after_change;
+                next_scan = next_scan.min(at);
+                if scanning.is_some() {
+                    soon = Some(soon.map_or(at, |t| t.min(at)));
+                }
             },
         }
     }
@@ -841,16 +958,33 @@ struct Scanner {
     cluster: Arc<Cluster>,
     pusher: Arc<dyn HistoryPusher>,
     seen: Seen,
+    /// 받는 쪽이 `Invalid`로 거절한 VM: (연속 거절 수, 다시 보낼 수 있는 때)
+    refused: Mutex<HashMap<Uuid, (u32, tokio::time::Instant)>>,
+    /// 한 차례의 밀어 넘기기를 모두 기다리는 시간
+    push_deadline: Duration,
 }
 
 impl Scanner {
+    fn new(history: Arc<History>, cluster: Arc<Cluster>, pusher: Arc<dyn HistoryPusher>) -> Self {
+        Self {
+            history,
+            cluster,
+            pusher,
+            seen: Seen::default(),
+            refused: Mutex::default(),
+            push_deadline: PUSH_DEADLINE,
+        }
+    }
+
     /// VM 파일을 훑어 주인이 다른 노드인 VM의 기록을 밀어 넘기고(받은 쪽이 합치면 지움), Raft에 없는 VM·풀의 파일을
     /// 계획 59 상태 디렉터리 정리와 같은 규칙으로 지운다: 두 차례 연속 후보, 리더 확인 읽기(`read_index`) 성공, 그
     /// id를 대상으로 하는 끝나지 않은 Task 없음, 지우기 바로 전에 다시 읽어도 없음. 이 노드에서 아직 재는 VM은 두지
-    /// 않는다. 목록을 읽지 못하면 아무것도 하지 않는다.
+    /// 않는다. 목록을 읽지 못하면 아무것도 하지 않는다. 밀어 넘기기는 동시에 여럿을 하고 모두 합쳐
+    /// `push_deadline`까지만 기다린다(남은 것은 다음 차례). 30일 넘은 옆으로 옮긴 파일·임시 파일도 지운다.
     async fn scan(&mut self) {
         let history = self.history.clone();
         let files = tokio::task::spawn_blocking(move || {
+            history.sweep_aside(ASIDE_KEEP);
             (
                 history.files(SeriesKind::Vm),
                 history.files(SeriesKind::Pool),
@@ -887,6 +1021,8 @@ impl Scanner {
                 .any(|t| t.spec.target == id && !t.status.state.is_finished())
         };
         let mut seen = Seen::default();
+        let mut pushes = Vec::new();
+        let clock = tokio::time::Instant::now();
         for id in vm_files {
             if busy(id) || (self.history.store.last_vm_t(id)).is_some_and(|t| now - t < BUSY_MS) {
                 continue;
@@ -907,8 +1043,10 @@ impl Scanner {
                     && n.status.online
                     && n.status.features.iter().any(|f| f == METRICS_HISTORY)
             });
-            if ready {
-                self.push(owner, id).await;
+            let refused =
+                (self.refused.lock().unwrap().get(&id)).is_some_and(|(_, at)| *at > clock);
+            if ready && !refused {
+                pushes.push((owner, id));
             }
         }
         for id in pool_files {
@@ -921,25 +1059,45 @@ impl Scanner {
             }
         }
         self.seen = seen;
+        self.refused
+            .lock()
+            .unwrap()
+            .retain(|id, _| vms.iter().any(|vm| vm.id == *id));
+        let this = &*self;
+        let all = futures_util::stream::iter(pushes)
+            .for_each_concurrent(PUSH_CONCURRENCY, |(owner, id)| this.push(owner, id));
+        if tokio::time::timeout(self.push_deadline, all).await.is_err() {
+            tracing::info!(
+                "pushing metrics history took too long; the rest waits for the next scan"
+            );
+        }
     }
 
     /// VM 기록을 주인 노드 `owner`에 밀어 넘기고, 받은 쪽이 합쳤으면 이 노드의 파일을 지운다.
     async fn push(&self, owner: Uuid, vm: Uuid) {
         let history = self.history.clone();
-        let bytes = match tokio::task::spawn_blocking(move || history.file_bytes(vm)).await {
-            Ok(Ok(Some(bytes))) => bytes,
+        let (bytes, seq) = match tokio::task::spawn_blocking(move || history.file_bytes(vm)).await {
+            Ok(Ok(Some(read))) => read,
             Ok(Ok(None)) | Err(_) => return,
             Ok(Err(e)) => {
                 tracing::warn!(vm = %vm, error = %e, "cannot read metrics history to push");
                 return;
             }
         };
-        match self.pusher.push(owner, vm, bytes).await {
+        let result = self.pusher.push(owner, vm, bytes).await;
+        if !matches!(result, Err(HistoryError::Invalid(_))) {
+            self.refused.lock().unwrap().remove(&vm);
+        }
+        match result {
             Ok(()) => {
                 let history = self.history.clone();
-                match tokio::task::spawn_blocking(move || history.remove(Key::Vm(vm))).await {
-                    Ok(Ok(())) => {
+                match tokio::task::spawn_blocking(move || history.remove_pushed(vm, seq)).await {
+                    Ok(Ok(true)) => {
                         tracing::info!(vm = %vm, node = %owner, "pushed metrics history to the VM's node")
+                    }
+                    // 읽은 뒤 바뀌었다(합쳐 넣었거나 새 점): 두고 다음 차례에 다시 보낸다.
+                    Ok(Ok(false)) => {
+                        tracing::info!(vm = %vm, node = %owner, "metrics history changed while pushing; keeping it for the next scan")
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(vm = %vm, error = %e, "cannot remove pushed metrics history")
@@ -950,6 +1108,16 @@ impl Scanner {
             // 옛 노드이거나 기록을 끈 노드: 파일을 두고 다음 차례에 다시 본다.
             Err(e @ (HistoryError::Unsupported | HistoryError::Disabled)) => {
                 tracing::debug!(vm = %vm, node = %owner, error = %e, "the VM's node does not take metrics history; keeping it");
+            }
+            // 받는 쪽이 이 파일을 받을 수 없다(옛 형식 등): 거절할 때마다 두 배로 늦춰 다시 본다.
+            Err(e @ HistoryError::Invalid(_)) => {
+                let mut refused = self.refused.lock().unwrap();
+                let n = refused.get(&vm).map_or(0, |(n, _)| *n).saturating_add(1);
+                let wait = REFUSED_BACKOFF
+                    .saturating_mul(1 << (n - 1).min(16))
+                    .min(MAX_REFUSED_BACKOFF);
+                refused.insert(vm, (n, tokio::time::Instant::now() + wait));
+                tracing::warn!(vm = %vm, node = %owner, error = %e, retry_in_secs = wait.as_secs(), "the VM's node refused its metrics history; keeping it");
             }
             Err(e) => {
                 tracing::warn!(vm = %vm, node = %owner, error = %e, "cannot push metrics history; will retry");
@@ -1289,7 +1457,7 @@ mod tests {
         a.push(24, Some((vm, 30.0)));
         a.clock.set(T0 + 121_000);
         a.history.flush(&HashMap::new());
-        let bytes = a.history.file_bytes(vm).unwrap().unwrap();
+        let (bytes, _) = a.history.file_bytes(vm).unwrap().unwrap();
         assert!(bytes.len() < MAX_HISTORY_BYTES);
         assert_eq!(a.history.file_bytes(Uuid::nil()).unwrap(), None);
 
@@ -1403,16 +1571,29 @@ mod tests {
     #[derive(Default)]
     struct FakePusher {
         pushed: Mutex<Vec<(Uuid, Uuid)>>,
+        /// 해 본 밀어 넘기기(거절·멈춤 포함)
+        tried: Mutex<Vec<(Uuid, Uuid)>>,
         /// 이 노드는 옛 노드처럼 거절한다.
         old: Option<Uuid>,
+        /// 이 노드는 받을 수 없는 파일이라 `Invalid`로 거절한다.
+        invalid: Option<Uuid>,
+        /// 이 노드는 답하지 않는다.
+        hung: Option<Uuid>,
     }
 
     #[async_trait]
     impl HistoryPusher for FakePusher {
         async fn push(&self, node: Uuid, vm: Uuid, bytes: Vec<u8>) -> Result<(), HistoryError> {
             assert!(!bytes.is_empty());
+            self.tried.lock().unwrap().push((node, vm));
             if self.old == Some(node) {
                 return Err(HistoryError::Unsupported);
+            }
+            if self.invalid == Some(node) {
+                return Err(HistoryError::Invalid("unknown field id".into()));
+            }
+            if self.hung == Some(node) {
+                return std::future::pending().await;
             }
             self.pushed.lock().unwrap().push((node, vm));
             Ok(())
@@ -1509,12 +1690,7 @@ mod tests {
             ..Default::default()
         });
         let history = Arc::new(f.history);
-        let mut scanner = Scanner {
-            history: history.clone(),
-            cluster: cluster.clone(),
-            pusher: pusher.clone(),
-            seen: Seen::default(),
-        };
+        let mut scanner = Scanner::new(history.clone(), cluster.clone(), pusher.clone());
         let vms = |h: &History| h.files(SeriesKind::Vm).into_iter().collect::<HashSet<_>>();
 
         scanner.scan().await;
@@ -1616,5 +1792,154 @@ mod tests {
             [Some(1.0), Some(2.0)]
         );
         cluster.shutdown().await.unwrap();
+    }
+
+    /// 답하지 않는 노드로 밀어 넘기는 동안에도 기록 주기는 돌고, 멈출 때는 정리를 끊고 마지막으로 기록한다
+    /// (리뷰 1 #3).
+    #[tokio::test]
+    async fn flushes_continue_while_a_scan_is_stuck() {
+        let Fx {
+            dir,
+            store,
+            clock,
+            history,
+        } = Fx::new();
+        let (cluster, _) = single_node(&dir.path().join("cluster")).await;
+        let cluster = Arc::new(cluster);
+        let hung = add_node(&cluster, "hung", &[METRICS_HISTORY]).await;
+        let vm = add_vm(&cluster, "web", Some(hung)).await;
+        let history = Arc::new(history);
+        history.handle(Key::Vm(vm), true).unwrap().unwrap();
+        clock.set(T0 + 59_500);
+        store.push_node(node_at(T0, 1.0));
+        let pusher = Arc::new(FakePusher {
+            hung: Some(hung),
+            ..Default::default()
+        });
+        let hour = Duration::from_secs(3600);
+        let writer = HistoryWriter::spawn(
+            history.clone(),
+            cluster.clone(),
+            Arc::new(PoolLevels::default()),
+            pusher.clone(),
+            WriterConfig {
+                flush: Duration::from_secs(60),
+                scan: hour,
+                first_scan: Duration::from_millis(10),
+                after_change: hour,
+            },
+        );
+        wait_until("the scan never pushed", || {
+            !pusher.tried.lock().unwrap().is_empty()
+        })
+        .await;
+        let node_file = rrd::node_path(&dir.path().join(DIR));
+        wait_until("no flush while the scan was stuck", || node_file.exists()).await;
+        store.push_node(node_at(T0 + 5_000, 2.0));
+        tokio::time::timeout(Duration::from_secs(5), writer.shutdown())
+            .await
+            .expect("shutting down waited for the stuck scan");
+        assert_eq!(
+            raw(&history, Key::Node, T0, T0 + 5_000),
+            [Some(1.0), Some(2.0)]
+        );
+        assert!(rrd::vm_path(&dir.path().join(DIR), vm).exists());
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 밀어 넘기기는 동시에 하고 한 차례 기한이 있어 답하지 않는 노드가 다른 VM의 밀어 넘기기를 막지 않는다. `Invalid`로
+    /// 거절된 VM은 바로 다시 보내지 않는다(리뷰 1 #3·#11).
+    #[tokio::test]
+    async fn pushes_run_together_under_a_deadline_and_refusals_back_off() {
+        let f = Fx::new();
+        let (cluster, _) = single_node(&f.dir.path().join("cluster")).await;
+        let cluster = Arc::new(cluster);
+        let hung = add_node(&cluster, "hung", &[METRICS_HISTORY]).await;
+        let new = add_node(&cluster, "new", &[METRICS_HISTORY]).await;
+        let picky = add_node(&cluster, "picky", &[METRICS_HISTORY]).await;
+        let stuck = add_vm(&cluster, "stuck", Some(hung)).await;
+        let moved = add_vm(&cluster, "moved", Some(new)).await;
+        let refused = add_vm(&cluster, "refused", Some(picky)).await;
+        for vm in [stuck, moved, refused] {
+            f.history.handle(Key::Vm(vm), true).unwrap().unwrap();
+        }
+        let pusher = Arc::new(FakePusher {
+            hung: Some(hung),
+            invalid: Some(picky),
+            ..Default::default()
+        });
+        let history = Arc::new(f.history);
+        let mut scanner = Scanner::new(history.clone(), cluster.clone(), pusher.clone());
+        scanner.push_deadline = Duration::from_millis(500);
+        let vms = |h: &History| h.files(SeriesKind::Vm).into_iter().collect::<HashSet<_>>();
+        tokio::time::timeout(Duration::from_secs(5), scanner.scan())
+            .await
+            .expect("the scan did not stop at its deadline");
+        assert_eq!(*pusher.pushed.lock().unwrap(), [(new, moved)]);
+        assert_eq!(vms(&history), HashSet::from([stuck, refused]));
+        let tried = |vm| {
+            (pusher.tried.lock().unwrap().iter())
+                .filter(|(_, v)| *v == vm)
+                .count()
+        };
+        assert_eq!(tried(refused), 1);
+        scanner.scan().await;
+        assert_eq!(tried(refused), 1, "a refused push was retried at once");
+        assert_eq!(tried(stuck), 2);
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 밀어 넘긴 뒤 그사이 합쳐 넣거나 새로 쓴 파일은 지우지 않는다(리뷰 1 #5).
+    #[test]
+    fn a_pushed_file_that_changed_meanwhile_is_kept() {
+        let f = Fx::new();
+        let vm = Uuid::now_v7();
+        f.push(12, Some((vm, 5.0)));
+        f.history.flush(&HashMap::new());
+        let (bytes, seq) = f.history.file_bytes(vm).unwrap().unwrap();
+        // 그사이 다른 노드가 같은 VM 기록을 합쳐 넣었다.
+        f.history.receive(vm, &bytes).unwrap();
+        assert!(!f.history.remove_pushed(vm, seq).unwrap());
+        assert!(rrd::vm_path(&f.metrics_dir(), vm).exists());
+        let (_, seq) = f.history.file_bytes(vm).unwrap().unwrap();
+        assert!(f.history.remove_pushed(vm, seq).unwrap());
+        assert!(!rrd::vm_path(&f.metrics_dir(), vm).exists());
+        // 지운 뒤 받은 것은 새 파일에 합친다.
+        f.history.receive(vm, &bytes).unwrap();
+        assert!(rrd::vm_path(&f.metrics_dir(), vm).exists());
+    }
+
+    /// 30일 넘은, 이 형식 파일 옆의 `.corrupt*`·`.v*`·`.tmp`만 지운다(리뷰 1 #11).
+    #[test]
+    fn old_set_aside_files_are_removed() {
+        let f = Fx::new();
+        let dir = f.metrics_dir();
+        let id = Uuid::now_v7();
+        std::fs::create_dir_all(dir.join("vm")).unwrap();
+        std::fs::create_dir_all(dir.join("pool")).unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(31 * 86_400);
+        let make = |path: PathBuf, modified: std::time::SystemTime| {
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_modified(modified).unwrap();
+            path
+        };
+        let gone = [
+            make(dir.join("node.rrd.corrupt"), old),
+            make(dir.join("vm").join(format!("{id}.rrd.v2")), old),
+            make(dir.join("pool").join(format!("{id}.rrd.tmp")), old),
+            make(dir.join("vm").join(format!("{id}.rrd.corrupt.1")), old),
+        ];
+        let kept = [
+            make(dir.join("vm").join(format!("{id}.rrd")), old),
+            make(
+                dir.join("vm").join(format!("{id}.rrd.corrupt.2")),
+                std::time::SystemTime::now(),
+            ),
+            make(dir.join("vm").join("notes.rrd.corrupt"), old),
+            make(dir.join("vm").join(format!("{id}.rrd.bak")), old),
+        ];
+        assert_eq!(f.history.sweep_aside(ASIDE_KEEP), gone.len());
+        assert!(gone.iter().all(|p| !p.exists()));
+        assert!(kept.iter().all(|p| p.exists()));
     }
 }

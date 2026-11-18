@@ -75,6 +75,10 @@ it("asks for the SMTP password again when the server or user changes", () => {
   });
   expect(checkTargetForm({ ...form, password: "x" }, SMTP, [])).toEqual({});
   expect(checkTargetForm({ ...form, clearPassword: true }, SMTP, [])).toEqual({});
+  // TLS 방식만 바꿔도(평문으로 낮추기) 다시 묻는다.
+  expect(checkTargetForm({ ...targetFormOf(SMTP), tls: "none" }, SMTP, [])).toEqual({
+    password: "alerts.targets.errors.passwordAgain",
+  });
 });
 
 it("keeps the webhook URL, token and header values unless changed", () => {
@@ -105,14 +109,17 @@ it("keeps the webhook URL, token and header values unless changed", () => {
   expect(targetRequestOf({ ...form, format: "json" }, HOOK).target).toMatchObject({ token: "" });
 });
 
-it("asks for webhook secrets again when the URL origin or CA changes", () => {
+it("asks for webhook secrets again when the URL or CA changes", () => {
   const form = { ...targetFormOf(HOOK), url: "https://other.example.com/topic" };
   expect(checkTargetForm(form, HOOK, [])).toEqual({
     token: "alerts.targets.errors.tokenAgain",
     headers: "alerts.targets.errors.headersAgain",
   });
-  // 같은 출처의 다른 경로는 비밀을 지킨다.
-  expect(checkTargetForm({ ...form, url: "https://ntfy.example.com/new" }, HOOK, [])).toEqual({});
+  // 같은 출처의 다른 경로도 비밀을 다시 묻는다(그 경로가 받은 요청을 보여 주는 곳일 수 있다).
+  expect(checkTargetForm({ ...form, url: "https://ntfy.example.com/new" }, HOOK, [])).toEqual({
+    token: "alerts.targets.errors.tokenAgain",
+    headers: "alerts.targets.errors.headersAgain",
+  });
   expect(
     checkTargetForm(
       { ...form, token: "t", headers: [{ name: "X-Priority", value: "1", saved: true }] },

@@ -1,10 +1,12 @@
 //! 알림 보내기(설계 §9): SMTP(`lettre`)와 webhook 다섯 형식(일반 JSON·Slack·Teams·ntfy·Gotify, `reqwest`).
-//! 경보 엔진은 [`Sender`]의 대기열(노드마다 1000개)에 넣기만 하고 기다리지 않는다. 보내기는 동시에 4개까지, 한 번에
-//! 10초까지이고, 실패하면 30초·2분·10분 뒤 다시 한다. 대상마다 분당 20개를 넘는 알림은 보내지 않고 모았다가 다음 분에
+//! 경보 엔진은 [`Sender`]의 대기열(노드마다 1000개)에 넣기만 하고 기다리지 않는다. 보내기는 동시에 4개까지(한 대상은
+//! 1개까지), 한 번에 10초까지이고, 실패하면 30초·2분·10분 뒤 다시 한다. 대기열에서는 보낼 허가가 남았을 때만 꺼내므로
+//! 보내기가 밀리면 대기열이 차고 넘친 것은 버린다. 바쁜 대상의 일은 대상마다 줄을 서고, 줄 전체가 대기열 크기를 넘으면
+//! 가장 긴 줄의 가장 오래된 것을 버린다(응답 없는 대상 하나가 다른 대상의 알림을 늦추지 않게). 대상마다 분당 20개를 넘는 알림은 보내지 않고 모았다가 다음 분에
 //! "N건 더" 알림 하나로 알린다. 결과는 경보 장부의 보낸 기록에 남긴다. 오류 문구에는 비밀(비밀번호·토큰·헤더 값·URL의
 //! 경로와 질의)을 넣지 않는다.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,7 +19,7 @@ use opl_types::clock::Clock;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
@@ -386,8 +388,10 @@ pub struct SenderConfig {
     /// 대상마다 `window`에 보내는 최대 수
     pub per_window: u32,
     pub window: Duration,
-    /// 대기열 크기. 넘치면 버리고 기록에 남긴다.
+    /// 대기열 크기. 넘치면 버리고 기록에 남긴다. 바쁜 대상의 줄(다시 하기를 기다린 것 포함)도 모두 합쳐 이만큼이다.
     pub queue: usize,
+    /// 한 대상에 동시에 보내는 수(응답 없는 대상이 허가를 다 쓰지 못하게)
+    pub per_target: usize,
 }
 
 impl Default for SenderConfig {
@@ -403,6 +407,7 @@ impl Default for SenderConfig {
             per_window: 20,
             window: Duration::from_secs(60),
             queue: 1000,
+            per_target: 1,
         }
     }
 }
@@ -475,15 +480,7 @@ impl Sender {
             let job = match e {
                 mpsc::error::TrySendError::Full(j) | mpsc::error::TrySendError::Closed(j) => j,
             };
-            tracing::warn!(target = %job.target, "the notification queue is full; dropping a notification");
-            let rec = record_of(
-                &job.n,
-                &job.target,
-                self.clock.now_ms(),
-                Err("dropped: the send queue is full".into()),
-            );
-            let book = self.book.clone();
-            tokio::task::spawn_blocking(move || book.record(rec));
+            dropped(&self.book, self.clock.as_ref(), &job);
         }
     }
 
@@ -501,6 +498,19 @@ struct Ctx {
     config: SenderConfig,
 }
 
+/// 대기열이 넘쳐 버린 알림을 경고하고 기록에 `dropped`로 남긴다.
+fn dropped(book: &AlertBook, clock: &dyn Clock, job: &Job) {
+    tracing::warn!(target = %job.target, "the notification queue is full; dropping a notification");
+    let rec = record_of(
+        &job.n,
+        &job.target,
+        clock.now_ms(),
+        Err("dropped: the send queue is full".into()),
+    );
+    let book = book.clone();
+    tokio::task::spawn_blocking(move || book.record(rec));
+}
+
 /// 보내기 작업이 끝난 뒤 할 일
 enum Next {
     Done,
@@ -510,16 +520,82 @@ enum Next {
     Again(Job),
 }
 
+/// 보낼 차례를 기다리는 일들: 대상마다 줄과 그 대상의 동시 보내기 몫
+#[derive(Default)]
+struct Lanes {
+    lanes: HashMap<String, Lane>,
+    /// 모든 줄의 일 수
+    waiting: usize,
+}
+
+struct Lane {
+    jobs: VecDeque<Job>,
+    /// 한 대상의 동시 보내기 몫(`per_target`개). 보내는 작업이 끝나면 돌려준다.
+    slots: Arc<Semaphore>,
+}
+
+impl Lanes {
+    /// 일을 대상의 줄 끝에 세운다. 줄 전체가 `cap`을 넘으면 가장 긴 줄의 가장 오래된 일을 버려 돌려준다.
+    fn push(&mut self, job: Job, per_target: usize, cap: usize) -> Option<Job> {
+        let lane = self
+            .lanes
+            .entry(job.target.clone())
+            .or_insert_with(|| Lane {
+                jobs: VecDeque::new(),
+                slots: Arc::new(Semaphore::new(per_target.max(1))),
+            });
+        lane.jobs.push_back(job);
+        self.waiting += 1;
+        if self.waiting <= cap.max(1) {
+            return None;
+        }
+        let longest = self.lanes.values_mut().max_by_key(|l| l.jobs.len())?;
+        self.waiting -= 1;
+        longest.jobs.pop_front()
+    }
+
+    /// 대상 몫과 보낼 허가가 둘 다 있는 일 하나. 허가가 없으면 `None`이다. 빈 줄은 정리한다.
+    fn next(
+        &mut self,
+        permits: &Arc<Semaphore>,
+    ) -> Option<(Job, OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        // 기다리는 일도 보내는 중인 일(몫을 쥔 작업)도 없는 줄
+        self.lanes
+            .retain(|_, l| !l.jobs.is_empty() || Arc::strong_count(&l.slots) > 1);
+        for lane in self.lanes.values_mut() {
+            if lane.jobs.is_empty() {
+                continue;
+            }
+            let Ok(slot) = lane.slots.clone().try_acquire_owned() else {
+                continue;
+            };
+            let permit = permits.clone().try_acquire_owned().ok()?;
+            let job = lane.jobs.pop_front()?;
+            self.waiting -= 1;
+            return Some((job, permit, slot));
+        }
+        None
+    }
+}
+
 async fn run(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Job>, mut stop: oneshot::Receiver<()>) {
     let permits = Arc::new(Semaphore::new(ctx.config.concurrency.max(1)));
     let mut windows: HashMap<String, Window> = HashMap::new();
+    let mut lanes = Lanes::default();
     let mut work: JoinSet<Next> = JoinSet::new();
     let mut flush = tokio::time::interval(Duration::from_secs(1).min(ctx.config.window));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let (per_target, cap) = (ctx.config.per_target, ctx.config.queue);
     loop {
+        // 대상 몫과 허가가 있는 만큼 보낸다.
+        while let Some((job, permit, slot)) = lanes.next(&permits) {
+            work.spawn(attempt(ctx.clone(), job, permit, slot));
+        }
         let job = tokio::select! {
             _ = &mut stop => break,
-            job = rx.recv() => match job {
+            // 허가가 남았을 때만 대기열에서 꺼낸다(보내기가 밀리면 대기열이 차서 넘친 것을 버린다).
+            job = rx.recv(), if permits.available_permits() > 0 => match job {
+                Some(job) if job.attempt == 0 && !job.summary && !admit(&mut windows, &job, &ctx.config) => continue,
                 Some(job) => job,
                 None => break,
             },
@@ -538,15 +614,16 @@ async fn run(ctx: Arc<Ctx>, mut rx: mpsc::Receiver<Job>, mut stop: oneshot::Rece
             _ = flush.tick() => {
                 for (target, n) in held_over(&mut windows, ctx.config.window, ctx.clock.now_ms()) {
                     let job = Job { target, n: Arc::new(n), attempt: 0, summary: true };
-                    work.spawn(attempt(ctx.clone(), permits.clone(), job));
+                    if let Some(old) = lanes.push(job, per_target, cap) {
+                        dropped(&ctx.book, ctx.clock.as_ref(), &old);
+                    }
                 }
                 continue;
             }
         };
-        if job.attempt == 0 && !job.summary && !admit(&mut windows, &job, &ctx.config) {
-            continue;
+        if let Some(old) = lanes.push(job, per_target, cap) {
+            dropped(&ctx.book, ctx.clock.as_ref(), &old);
         }
-        work.spawn(attempt(ctx.clone(), permits.clone(), job));
     }
     // 남은 보내기·기다림은 `work`를 버리며 끊는다.
 }
@@ -614,12 +691,14 @@ fn held_over(
     out
 }
 
-/// 한 번 보낸다. 대상을 Raft에서 읽고(없으면 기록하고 끝, 꺼졌으면 조용히 끝), 실패하면 남은 다시 하기가 있으면
-/// [`Next::Retry`], 없으면 실패를 기록한다.
-async fn attempt(ctx: Arc<Ctx>, permits: Arc<Semaphore>, job: Job) -> Next {
-    let Ok(_permit) = permits.acquire_owned().await else {
-        return Next::Done;
-    };
+/// 한 번 보낸다(보낼 허가와 대상 몫을 쥐고, 끝나면 돌려준다). 대상을 Raft에서 읽고(없으면 기록하고 끝, 꺼졌으면
+/// 조용히 끝), 실패하면 남은 다시 하기가 있으면 [`Next::Retry`], 없으면 실패를 기록한다.
+async fn attempt(
+    ctx: Arc<Ctx>,
+    job: Job,
+    _permit: OwnedSemaphorePermit,
+    _slot: OwnedSemaphorePermit,
+) -> Next {
     let result = match ctx
         .cluster
         .get_by_name::<NotificationTargetSpec>(&job.target)
@@ -901,5 +980,185 @@ mod tests {
         assert_eq!(n.cluster, "lab");
         assert!(n.title().contains("2 more notifications"), "{}", n.title());
         assert!(windows.is_empty());
+    }
+
+    /// 노드 하나짜리 클러스터
+    async fn one_node_cluster(dir: &std::path::Path) -> Arc<Cluster> {
+        use opl_cluster::ClusterConfig;
+        use opl_cluster::memnet::MemRouter;
+        use opl_cluster::types::{NodeId, OrbNode};
+
+        let router = MemRouter::default();
+        let id = NodeId(Uuid::now_v7());
+        let cluster = Cluster::open(ClusterConfig::new(id, dir), router.network(id))
+            .await
+            .unwrap();
+        router.register(id, &cluster);
+        cluster
+            .initialize(BTreeMap::from([(id, OrbNode::single(id.to_string()))]))
+            .await
+            .unwrap();
+        cluster
+            .raft()
+            .unwrap()
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.state == openraft::ServerState::Leader, "leader")
+            .await
+            .unwrap();
+        Arc::new(cluster)
+    }
+
+    async fn add_target(cluster: &Cluster, name: &str, url: String) {
+        let target: opl_types::alert::NotificationTarget = opl_types::resource::Resource::new(
+            name,
+            NotificationTargetSpec {
+                target: TargetConfig::Webhook(WebhookTarget {
+                    url,
+                    format: WebhookFormat::Json,
+                    headers: BTreeMap::new(),
+                    token: None,
+                    ca_pem: None,
+                }),
+                enabled: true,
+            },
+        );
+        cluster.create(&target).await.unwrap();
+    }
+
+    /// 받으면 200으로 답하고 받은 경로를 알리는 webhook 수신기
+    async fn hook() -> (String, mpsc::UnboundedReceiver<String>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let app = axum::Router::new().fallback(move |uri: axum::http::Uri| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(uri.path().to_string());
+                axum::http::StatusCode::OK
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, rx)
+    }
+
+    /// 연결은 받지만 답하지 않는 곳(응답 없는 호스트)
+    fn black_hole() -> (std::net::TcpListener, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/hook", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    /// 응답 없는 대상에 알림이 몰려도 그 대상은 허가 하나만 쓰므로 다른 대상의 알림은 바로 간다(리뷰 1 #1).
+    #[tokio::test]
+    async fn a_black_holed_target_does_not_delay_other_targets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = one_node_cluster(dir.path()).await;
+        let (_hole, slow_url) = black_hole();
+        let (base, mut hits) = hook().await;
+        add_target(&cluster, "slow", slow_url).await;
+        add_target(&cluster, "fast", format!("{base}/fast")).await;
+        let book = AlertBook::memory("node1");
+        let clock: Arc<dyn Clock> = Arc::new(opl_types::clock::SystemClock);
+        let sender = Sender::spawn(
+            cluster.clone(),
+            book,
+            clock,
+            SenderConfig {
+                timeout: Duration::from_secs(5),
+                retries: vec![],
+                per_window: 100,
+                ..SenderConfig::default()
+            },
+        );
+        for _ in 0..8 {
+            sender.enqueue("slow", Arc::new(firing()));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        sender.enqueue("fast", Arc::new(firing()));
+        let got = tokio::time::timeout(Duration::from_secs(2), hits.recv())
+            .await
+            .expect("the fast target waited behind the black-holed one");
+        assert_eq!(got.as_deref(), Some("/fast"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        sender.shutdown().await;
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 허가가 없으면 대기열에서 꺼내지 않으므로 대기열 크기가 상한이다. 넘친 알림은 `dropped`로 기록한다(리뷰 1 #1).
+    #[tokio::test]
+    async fn the_queue_bound_holds_while_sends_are_stuck() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = one_node_cluster(dir.path()).await;
+        let (_hole, slow_url) = black_hole();
+        add_target(&cluster, "slow", slow_url).await;
+        let book = AlertBook::memory("node1");
+        let clock: Arc<dyn Clock> = Arc::new(opl_types::clock::SystemClock);
+        let sender = Sender::spawn(
+            cluster.clone(),
+            book.clone(),
+            clock,
+            SenderConfig {
+                concurrency: 1,
+                timeout: Duration::from_secs(30),
+                retries: vec![],
+                per_window: 100,
+                queue: 2,
+                ..SenderConfig::default()
+            },
+        );
+        // 처음 것은 꺼내 보내는 중이고(허가 0), 다음 둘은 대기열을 채우고, 넷째부터 버린다.
+        sender.enqueue("slow", Arc::new(firing()));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for _ in 0..4 {
+            sender.enqueue("slow", Arc::new(firing()));
+        }
+        let window = opl_types::alert::HistoryWindow {
+            since: 0,
+            until: i64::MAX,
+            limit: 100,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let dropped = loop {
+            let recs = book.read_history(window).unwrap();
+            let dropped = recs
+                .iter()
+                .filter(|r| r.error.as_deref().is_some_and(|e| e.starts_with("dropped")))
+                .count();
+            if dropped >= 2 || Instant::now() > deadline {
+                break dropped;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(dropped, 2);
+        sender.shutdown().await;
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 줄 전체가 상한을 넘으면 가장 긴 줄의 가장 오래된 일을 버린다.
+    #[test]
+    fn full_lanes_shed_the_oldest_job_of_the_longest_lane() {
+        let job = |target: &str, attempt: usize| Job {
+            target: target.into(),
+            n: Arc::new(firing()),
+            attempt,
+            summary: false,
+        };
+        let mut lanes = Lanes::default();
+        for k in 1..=3 {
+            assert!(lanes.push(job("slow", k), 1, 4).is_none());
+        }
+        assert!(lanes.push(job("mail", 1), 1, 4).is_none());
+        let shed = lanes.push(job("mail", 2), 1, 4).unwrap();
+        assert_eq!((shed.target.as_str(), shed.attempt), ("slow", 1));
+        assert_eq!(lanes.waiting, 4);
+        // 대상마다 하나씩만 꺼낸다.
+        let permits = Arc::new(Semaphore::new(4));
+        let a = lanes.next(&permits).unwrap();
+        let b = lanes.next(&permits).unwrap();
+        assert_ne!(a.0.target, b.0.target);
+        assert!(lanes.next(&permits).is_none());
+        drop(a);
+        assert!(lanes.next(&permits).is_some());
     }
 }

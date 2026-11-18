@@ -1046,10 +1046,13 @@ pub struct NotificationRecord {
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub subject: Option<String>,
     pub state: NotificationState,
-    /// 알림 대상 이름
+    /// 알림 대상 이름. admin이 아닌 사용자에게는 보이지 않는다(빈 이름이면 빼고 보낸다).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub target: String,
     pub ok: bool,
-    /// 실패 이유. 보낸 쪽이 비밀을 지운 문구다(대기열이 넘쳐 버렸으면 `dropped`로 시작).
+    /// 실패 이유. 보낸 쪽이 비밀을 지운 문구다(대기열이 넘쳐 버렸으면 `dropped`로 시작). admin이 아닌 사용자에게는
+    /// 보이지 않는다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub error: Option<String>,

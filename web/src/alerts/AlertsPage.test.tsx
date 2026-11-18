@@ -210,6 +210,8 @@ it("lists sent notifications for the chosen period", async () => {
             ok: false,
             error: "connection refused",
           },
+          // admin이 아니면 대상 이름과 오류 문구가 없다.
+          { at: 1_799_998_000_000, node: "node-b", state: "event", ok: false },
         ],
         unreachable: [],
         unsupported: [],
@@ -224,6 +226,7 @@ it("lists sent notifications for the chosen period", async () => {
   const rows = within(table).getAllByRole("row");
   expect(rows[1]).toHaveTextContent("Firingcpu-hotnode-aops-mailnode-aSent");
   expect(rows[2]).toHaveTextContent("Test——phonenode-aFailedconnection refused");
+  expect(rows[3]).toHaveTextContent("Event———node-bFailed");
   expect(screen.getByText("Only the newest notifications are shown.")).toBeInTheDocument();
   await user.selectOptions(screen.getByLabelText("Period"), "week");
   await vi.waitFor(() => expect(since).toHaveLength(2));

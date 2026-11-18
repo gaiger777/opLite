@@ -137,7 +137,7 @@ it("asks for the password again when the mail server changes", async () => {
   await user.click(within(dialog).getByRole("button", { name: "Save" }));
   expect(
     within(dialog).getByText(
-      "The server, port or user changed. Enter the password again or remove it.",
+      "The server, port, user or TLS changed. Enter the password again or remove it.",
     ),
   ).toBeInTheDocument();
   expect(sent).toEqual([]);

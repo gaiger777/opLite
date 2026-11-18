@@ -21,7 +21,7 @@ use opl_types::alert::{
     ActiveAlert, AlertCondition, AlertRule, AlertRuleSpec, AlertState, AlertSubject, Evaluator,
     Notice, NotificationState, Observation, RESOLVE_AFTER_MS, SubjectKind, advance,
 };
-use opl_types::backup_job::BackupJobSpec;
+use opl_types::backup_job::{BackupJob, BackupJobSpec};
 use opl_types::clock::{Clock, SystemClock};
 use opl_types::cluster::ClusterSpec;
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, VmSample};
@@ -207,14 +207,10 @@ impl Engine {
         }
     }
 
-    fn rules(&self) -> Vec<AlertRule> {
-        self.cluster()
-            .list::<AlertRuleSpec>()
-            .map(|(_, rules)| rules)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.spec.enabled)
-            .collect()
+    /// 켠 규칙. 읽지 못하면 `None`이다(빈 목록으로 보면 활성 경보를 모두 알림 없이 뺀다).
+    fn rules(&self) -> Option<Vec<AlertRule>> {
+        let rules = self.cluster().list::<AlertRuleSpec>().ok()?.1;
+        Some(rules.into_iter().filter(|r| r.spec.enabled).collect())
     }
 
     fn me(&self) -> Option<Node> {
@@ -232,6 +228,7 @@ impl Engine {
         }
         let rules: Vec<AlertRule> = self
             .rules()
+            .unwrap_or_default()
             .into_iter()
             .filter(|r| {
                 matches!(
@@ -314,13 +311,13 @@ impl Engine {
     }
 
     async fn tick(&mut self) {
-        let rules = self.rules();
         let now = self.clock.now_ms();
-        let nodes = self
-            .cluster()
-            .list::<NodeSpec>()
-            .map(|(_, n)| n)
-            .unwrap_or_default();
+        // 규칙·노드를 읽지 못하면 이번 tick은 건너뛴다(활성 경보를 알림 없이 빼지 않게).
+        let (Some(rules), Ok((_, nodes))) = (self.rules(), self.cluster().list::<NodeSpec>())
+        else {
+            tracing::debug!("cannot read alert rules or nodes; skipping this alert tick");
+            return;
+        };
         self.node_rules(now, &rules, &nodes).await;
         self.leader_rules(now, &nodes).await;
     }
@@ -329,53 +326,18 @@ impl Engine {
     async fn node_rules(&mut self, now: i64, rules: &[AlertRule], nodes: &[Node]) {
         let old = self.book.snapshot();
         let mut observed: Vec<(&AlertRule, AlertSubject, Option<Observation>)> = Vec::new();
+        let mut partial = false;
         if let Some(me) = nodes
             .iter()
             .find(|n| n.id == self.state.node && !n.spec.witness)
         {
-            self.observe(rules, me, nodes, &mut observed);
+            partial = !self.observe(rules, me, nodes, &mut observed);
         }
-        let mut current: HashMap<String, ActiveAlert> =
-            old.active.iter().map(|a| (a.key(), a.clone())).collect();
-        let mut active = Vec::new();
-        let mut out = Vec::new();
-        let mut overflow = false;
-        for (rule, subject, seen) in observed {
-            let before = current.remove(&subject.key(rule.id));
-            if before.is_none()
-                && active.len() >= MAX_ACTIVE
-                && seen.is_some_and(|s: Observation| s.holds)
-            {
-                overflow = true;
-                continue;
-            }
-            let (after, notice) = advance(
-                rule.id,
-                &rule.spec,
-                &subject,
-                before.clone(),
-                seen,
-                now,
-                self.resolve_after_ms,
-            );
-            if let Some(mut a) = after.clone() {
-                // 이름이 바뀌었으면 새 이름으로 알린다.
-                a.subject = subject.clone();
-                active.push(a);
-            }
-            if let Some(notice) = notice
-                && let Some(alert) = after.or(before)
-            {
-                out.push(Pending {
-                    rule: rule.clone(),
-                    alert,
-                    state: notice_state(notice),
-                    detail: None,
-                });
-            }
-        }
-        // 남은 것(대상이 사라짐, 규칙을 끄거나 지움, 유지 보수)은 알림 없이 뺀다.
-        active.sort_by_key(|a| a.key());
+        let Stepped {
+            active,
+            out,
+            overflow,
+        } = step_node_alerts(observed, &old.active, partial, now, self.resolve_after_ms);
         let mut events = old.events.clone();
         events.retain(|_, at| now - *at < EVENT_KEEP_MS);
         let new = NodeAlertState {
@@ -397,14 +359,17 @@ impl Engine {
         self.send(out, now);
     }
 
-    /// 이 노드가 평가하는 상태 규칙의 (규칙, 대상, 본 것)
+    /// 이 노드가 평가하는 상태 규칙의 (규칙, 대상, 본 것). 목록(VM·풀)을 읽지 못해 다 보지 못했으면 false다.
+    /// 잠깐 볼 수 없는 대상(준비되지 않은 로컬 풀, 마이그레이션 중인 VM의 지표)은 값을 모름(`None`)으로 넣어 단계를
+    /// 그대로 둔다(빠졌다가 다시 보이면 해제 없이 다시 알리지 않게).
     fn observe<'r>(
         &mut self,
         rules: &'r [AlertRule],
         me: &Node,
         nodes: &[Node],
         out: &mut Vec<(&'r AlertRule, AlertSubject, Option<Observation>)>,
-    ) {
+    ) -> bool {
+        let mut complete = true;
         let here = |r: &AlertRule| {
             r.spec.condition.evaluator() == Evaluator::Node
                 && !r.spec.condition.is_event()
@@ -412,7 +377,7 @@ impl Engine {
         };
         let rules: Vec<&AlertRule> = rules.iter().filter(|r| here(r)).collect();
         if rules.is_empty() {
-            return;
+            return true;
         }
         let kinds = |f: fn(&AlertCondition) -> bool| rules.iter().any(|r| f(&r.spec.condition));
         // 노드 지표(유지 보수 중에는 보지 않고, 활성 경보는 알림 없이 뺀다)
@@ -445,10 +410,9 @@ impl Engine {
             })
             .collect();
         if !vm_rules.is_empty() {
-            let vms: Vec<Vm> = self
-                .cluster()
-                .list::<VmSpec>()
-                .map(|(_, v)| v)
+            let all = self.cluster().list::<VmSpec>().map(|(_, v)| v);
+            complete &= all.is_ok();
+            let vms: Vec<Vm> = all
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|v| v.status.node.or(v.spec.node) == Some(me.id))
@@ -474,6 +438,12 @@ impl Engine {
                             let seen = sample.as_ref().and_then(|s| r.spec.condition.observe_vm(s));
                             out.push((r, subject.clone(), seen));
                         }
+                        // 마이그레이션 중에는 값을 모른다(끝나 다른 노드로 가면 그때 뺀다).
+                        AlertCondition::VmMetric { .. }
+                            if vm.status.phase == VmPhase::Migrating =>
+                        {
+                            out.push((r, subject.clone(), None));
+                        }
                         AlertCondition::VmFailed => {
                             let failed = vm.status.phase == VmPhase::Failed;
                             out.push((r, subject.clone(), Some(Observation::new(failed, None))));
@@ -483,8 +453,10 @@ impl Engine {
                 }
             }
             // 이 노드를 떠난 VM의 시리즈는 잊는다.
-            self.last_t
-                .retain(|id, _| *id == me.id || vms.iter().any(|v| v.id == *id));
+            if complete {
+                self.last_t
+                    .retain(|id, _| *id == me.id || vms.iter().any(|v| v.id == *id));
+            }
         }
         // 풀 사용률: 로컬 풀은 이 노드, 공유 풀은 준비된 온라인 노드 가운데 id가 가장 작은 노드
         let pool_rules: Vec<&&AlertRule> = rules
@@ -492,17 +464,27 @@ impl Engine {
             .filter(|r| matches!(r.spec.condition, AlertCondition::PoolUsage { .. }))
             .collect();
         if !pool_rules.is_empty() {
-            let pools = self
-                .cluster()
-                .list::<StoragePoolSpec>()
-                .map(|(_, p)| p)
-                .unwrap_or_default();
+            let pools = self.cluster().list::<StoragePoolSpec>().map(|(_, p)| p);
+            complete &= pools.is_ok();
+            let pools = pools.unwrap_or_default();
             for (name, ps) in &me.status.pools {
                 let Some(pool) = pools.iter().find(|p| p.name == *name && p.id == ps.pool_id)
                 else {
                     continue;
                 };
+                let subject = AlertSubject {
+                    kind: SubjectKind::Pool,
+                    id: pool.id,
+                    name: pool.name.clone(),
+                    node: Some(me.name.clone()),
+                };
+                // 잠깐 준비되지 않은 로컬 풀은 값을 모른다. 공유 풀은 준비된 다른 노드가 이어 본다.
                 if !ps.ready {
+                    if !is_shared(pool) {
+                        for r in &pool_rules {
+                            out.push((r, subject.clone(), None));
+                        }
+                    }
                     continue;
                 }
                 if is_shared(pool) {
@@ -521,12 +503,6 @@ impl Engine {
                         continue;
                     }
                 }
-                let subject = AlertSubject {
-                    kind: SubjectKind::Pool,
-                    id: pool.id,
-                    name: pool.name.clone(),
-                    node: Some(me.name.clone()),
-                };
                 for r in &pool_rules {
                     let seen = r
                         .spec
@@ -536,6 +512,7 @@ impl Engine {
                 }
             }
         }
+        complete
     }
 
     /// 이 노드의 지난 tick 뒤 새 점 가운데 마지막 것
@@ -685,36 +662,22 @@ impl Engine {
         now: i64,
         rule: &AlertRule,
     ) -> (opl_types::alert::AlertRuleStatus, Vec<Pending>) {
+        let mut out = Vec::new();
+        // 읽지 못하면 그대로 둔다(빈 목록으로 보면 알린 기록을 잊어 다시 알린다).
+        let Ok((_, jobs)) = self.cluster().list::<BackupJobSpec>() else {
+            return (rule.status.clone(), out);
+        };
         let mut status = rule.status.clone();
         status.active.clear();
-        let mut out = Vec::new();
-        let jobs = self
-            .cluster()
-            .list::<BackupJobSpec>()
-            .map(|(_, j)| j)
-            .unwrap_or_default();
-        status
-            .notified
-            .retain(|id, _| jobs.iter().any(|j| j.id == *id));
+        // 끈 동안에도 알린 것으로 적어 둔다(다시 켰을 때 끈 동안의 실패를 보내지 않게).
+        let failed = new_failures(&mut status.notified, &jobs, created_ms(rule.id));
         if !rule.spec.enabled {
             return (status, out);
         }
-        // 규칙을 만들기 전에 끝난 실행은 알리지 않는다.
-        let created = created_ms(rule.id);
-        for job in &jobs {
+        for job in failed {
             let Some(run) = &job.status.last_run else {
                 continue;
             };
-            let at = i64::try_from(run.finished_at)
-                .unwrap_or(i64::MAX / 1000)
-                .saturating_mul(1000);
-            if run.failed == 0
-                || at < created
-                || status.notified.get(&job.id).is_some_and(|t| *t >= at)
-            {
-                continue;
-            }
-            status.notified.insert(job.id, at);
             let mut detail = format!(
                 "Backup job {} finished with {} of {} backups failed",
                 job.name,
@@ -814,6 +777,98 @@ fn op_name(op: &TaskOp) -> String {
 }
 
 /// UUIDv7 id의 만든 시각(ms). 시각이 없는 id는 0이다.
+/// 노드 경보 한 걸음의 결과
+struct Stepped {
+    active: Vec<ActiveAlert>,
+    out: Vec<Pending>,
+    overflow: bool,
+}
+
+/// 본 것(`observed`)으로 노드 경보(`old_active`)를 한 걸음 진행한다. 새 경보는 활성 경보가 아직 보지 않은 지금 경보까지
+/// 합쳐 [`MAX_ACTIVE`]개 미만일 때만 받는다(넘으면 `overflow`). 보지 못한 지금 경보는 `partial`(목록을 읽지 못해 다
+/// 보지 못함)이면 그대로 두고, 아니면(대상이 사라짐, 규칙을 끄거나 지움, 유지 보수) 알림 없이 뺀다.
+fn step_node_alerts(
+    observed: Vec<(&AlertRule, AlertSubject, Option<Observation>)>,
+    old_active: &[ActiveAlert],
+    partial: bool,
+    now: i64,
+    resolve_after_ms: i64,
+) -> Stepped {
+    let mut current: HashMap<String, ActiveAlert> =
+        old_active.iter().map(|a| (a.key(), a.clone())).collect();
+    let mut active = Vec::new();
+    let mut out = Vec::new();
+    let mut overflow = false;
+    for (rule, subject, seen) in observed {
+        let before = current.remove(&subject.key(rule.id));
+        if before.is_none()
+            && active.len() + current.len() >= MAX_ACTIVE
+            && seen.is_some_and(|s: Observation| s.holds)
+        {
+            overflow = true;
+            continue;
+        }
+        let (after, notice) = advance(
+            rule.id,
+            &rule.spec,
+            &subject,
+            before.clone(),
+            seen,
+            now,
+            resolve_after_ms,
+        );
+        if let Some(mut a) = after.clone() {
+            // 이름이 바뀌었으면 새 이름으로 알린다.
+            a.subject = subject.clone();
+            active.push(a);
+        }
+        if let Some(notice) = notice
+            && let Some(alert) = after.or(before)
+        {
+            out.push(Pending {
+                rule: rule.clone(),
+                alert,
+                state: notice_state(notice),
+                detail: None,
+            });
+        }
+    }
+    if partial {
+        active.extend(current.into_values());
+    }
+    active.sort_by_key(|a| a.key());
+    Stepped {
+        active,
+        out,
+        overflow,
+    }
+}
+
+/// 백업 작업의 아직 알리지 않은 실패한 마지막 실행(규칙을 만든 뒤 끝난 것)을 `notified`에 적고 그 작업들을 돌려준다.
+/// 지운 작업은 잊는다.
+fn new_failures<'j>(
+    notified: &mut BTreeMap<Uuid, i64>,
+    jobs: &'j [BackupJob],
+    created: i64,
+) -> Vec<&'j BackupJob> {
+    notified.retain(|id, _| jobs.iter().any(|j| j.id == *id));
+    let mut out = Vec::new();
+    for job in jobs {
+        let Some(run) = &job.status.last_run else {
+            continue;
+        };
+        let at = i64::try_from(run.finished_at)
+            .unwrap_or(i64::MAX / 1000)
+            .saturating_mul(1000);
+        if run.failed == 0 || at < created || notified.get(&job.id).is_some_and(|t| *t >= at) {
+            continue;
+        }
+        notified.insert(job.id, at);
+        out.push(job);
+    }
+    out
+}
+
 fn created_ms(id: Uuid) -> i64 {
     id.get_timestamp().map_or(0, |ts| {
         let (secs, nanos) = ts.to_unix();
@@ -857,4 +912,111 @@ pub(crate) fn firing_counts(state: &AppState) -> Option<[u64; 3]> {
         }
     }
     Some(counts)
+}
+
+#[cfg(test)]
+mod tests {
+    use opl_types::resource::Resource;
+    use serde_json::json;
+
+    use super::*;
+
+    const NOW: i64 = 1_700_000_000_000;
+
+    fn rule() -> AlertRule {
+        let spec: AlertRuleSpec = serde_json::from_value(json!({
+            "condition": {"kind": "vm_failed"}, "severity": "warning", "targets": ["ops"]
+        }))
+        .unwrap();
+        Resource::new("vm-failed", spec)
+    }
+
+    fn vm(n: u128) -> AlertSubject {
+        AlertSubject {
+            kind: SubjectKind::Vm,
+            id: Uuid::from_u128(n),
+            name: format!("vm{n}"),
+            node: Some("node1".into()),
+        }
+    }
+
+    fn firing(rule: &AlertRule, n: u128) -> ActiveAlert {
+        ActiveAlert {
+            rule: rule.id,
+            subject: vm(n),
+            state: AlertState::Firing,
+            since: NOW - 60_000,
+            value: None,
+            last_sent: Some(NOW - 60_000),
+            clear_since: None,
+        }
+    }
+
+    /// 아직 보지 않은 지금 경보까지 세어 새 경보를 받으므로 활성 경보는 상한을 넘지 않는다(리뷰 1 #6).
+    #[test]
+    fn the_active_alert_cap_counts_alerts_not_yet_seen() {
+        let r = rule();
+        let old: Vec<ActiveAlert> = (0..MAX_ACTIVE as u128).map(|n| firing(&r, n)).collect();
+        let holds = Some(Observation::new(true, None));
+        // 새 대상이 앞에, 지금 경보가 모두 뒤에 온다.
+        let observed = std::iter::once((&r, vm(10_000), holds))
+            .chain((0..MAX_ACTIVE as u128).map(|n| (&r, vm(n), holds)))
+            .collect();
+        let s = step_node_alerts(observed, &old, false, NOW, RESOLVE_AFTER_MS);
+        assert!(s.overflow);
+        assert_eq!(s.active.len(), MAX_ACTIVE);
+        assert!(s.out.is_empty());
+    }
+
+    /// 목록을 읽지 못해 보지 못한 경보는 알림 없이 빼지 않고 그대로 둔다. 다 보았는데 없으면 뺀다(리뷰 1 #7).
+    #[test]
+    fn unseen_alerts_stay_when_the_lists_could_not_be_read() {
+        let r = rule();
+        let old = vec![firing(&r, 1), firing(&r, 2)];
+        let observed = vec![(&r, vm(1), Some(Observation::new(true, None)))];
+        let kept = step_node_alerts(observed.clone(), &old, true, NOW, RESOLVE_AFTER_MS);
+        assert_eq!(kept.active, old);
+        assert!(kept.out.is_empty());
+        let dropped = step_node_alerts(observed, &old, false, NOW, RESOLVE_AFTER_MS);
+        assert_eq!(dropped.active, [firing(&r, 1)]);
+        // 값을 모르면(`None`) 단계를 그대로 둔다.
+        let unknown = vec![(&r, vm(1), None), (&r, vm(2), None)];
+        let s = step_node_alerts(unknown, &old, false, NOW, RESOLVE_AFTER_MS);
+        assert_eq!(s.active, old);
+    }
+
+    fn job(n: u128, finished_at: u64, failed: u32) -> BackupJob {
+        let spec = serde_json::from_value(json!({
+            "vms": {"labels": {"tier": "prod"}}, "pool": "backups", "schedule": {"at": "03:00"},
+        }))
+        .unwrap();
+        let mut job: BackupJob = Resource::new(format!("job{n}"), spec);
+        job.id = Uuid::from_u128(n);
+        job.status.last_run = Some(opl_types::backup_job::JobRunResult {
+            started_at: finished_at - 10,
+            finished_at,
+            ok: 1,
+            failed,
+        });
+        job
+    }
+
+    /// 규칙을 끈 동안의 실패도 알린 것으로 적어 두므로 다시 켰을 때 보내지 않는다. 새 실패만 보낸다(리뷰 1 #13).
+    #[test]
+    fn failures_while_a_rule_was_off_are_not_sent_later() {
+        let created = 1_000_000;
+        let mut notified = BTreeMap::new();
+        // 규칙이 꺼진 동안 실패했다(꺼진 동안에도 부른다).
+        let jobs = vec![job(1, 2_000, 1), job(2, 2_000, 0)];
+        let failed = new_failures(&mut notified, &jobs, created);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(notified, BTreeMap::from([(Uuid::from_u128(1), 2_000_000)]));
+        // 다시 켰다: 같은 실행은 알리지 않고 새 실패만 알린다.
+        assert!(new_failures(&mut notified, &jobs, created).is_empty());
+        let jobs = vec![job(1, 3_000, 2)];
+        assert_eq!(new_failures(&mut notified, &jobs, created).len(), 1);
+        // 규칙을 만들기 전에 끝난 실행과 지운 작업은 보지 않는다.
+        assert!(new_failures(&mut notified, &[job(3, 500, 1)], created).is_empty());
+        assert!(!notified.contains_key(&Uuid::from_u128(1)));
+    }
 }

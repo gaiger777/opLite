@@ -106,18 +106,9 @@ function split(text: string): string[] {
     .filter((s) => s !== "");
 }
 
-/** URL의 출처(scheme·host·port). 읽지 못하면 글 그대로 */
-function origin(url: string): string {
-  try {
-    return new URL(url.trim()).origin;
-  } catch {
-    return url.trim();
-  }
-}
-
 /**
- * 서버가 지킬 수 없는 비밀이 있는가. SMTP는 호스트·포트·사용자가, webhook은 URL 출처나 CA가 바뀌면 저장된 비밀을
- * 다시 넣어야 한다(바뀐 곳으로 옛 비밀을 보내지 않게 서버가 400으로 막는다).
+ * 서버가 지킬 수 없는 비밀이 있는가. SMTP는 호스트·포트·사용자·TLS 방식이, webhook은 URL(줄인 URL에서 조금이라도
+ * 바꾸면)이나 CA가 바뀌면 저장된 비밀을 다시 넣어야 한다(바뀐 곳으로 옛 비밀을 보내지 않게 서버가 400으로 막는다).
  */
 function secretsMoved(form: TargetForm, view: NotificationTargetView): boolean {
   const t = view.target;
@@ -125,10 +116,11 @@ function secretsMoved(form: TargetForm, view: NotificationTargetView): boolean {
     return (
       form.host.trim() !== t.host ||
       form.port.trim() !== String(t.port) ||
-      form.user.trim() !== (t.user ?? "")
+      form.user.trim() !== (t.user ?? "") ||
+      form.tls !== t.tls
     );
   }
-  return origin(form.url) !== origin(t.url) || form.caPem.trim() !== (t.ca_pem ?? "");
+  return form.url.trim() !== t.url || form.caPem.trim() !== (t.ca_pem ?? "");
 }
 
 /** 폼의 오류(칸 → 번역 키). `view`는 고치는 대상(만들 때 null), `taken`은 만들 때 있는 이름 */

@@ -6156,7 +6156,10 @@ export interface components {
              * @description 보낸(또는 마지막으로 해 본) 때
              */
             at: number;
-            /** @description 실패 이유. 보낸 쪽이 비밀을 지운 문구다(대기열이 넘쳐 버렸으면 `dropped`로 시작). */
+            /**
+             * @description 실패 이유. 보낸 쪽이 비밀을 지운 문구다(대기열이 넘쳐 버렸으면 `dropped`로 시작). admin이 아닌 사용자에게는
+             *     보이지 않는다.
+             */
             error?: string;
             /** @description 보낸 노드 이름 */
             node: string;
@@ -6166,8 +6169,8 @@ export interface components {
             state: components["schemas"]["NotificationState"];
             /** @description 대상 이름(예: VM 이름, 시험 보내기는 없음) */
             subject?: string;
-            /** @description 알림 대상 이름 */
-            target: string;
+            /** @description 알림 대상 이름. admin이 아닌 사용자에게는 보이지 않는다(빈 이름이면 빼고 보낸다). */
+            target?: string;
         };
         /**
          * @description 알림의 종류

@@ -2817,7 +2817,7 @@
         "from": "보내는 주소를 넣으세요.",
         "to": "받는 주소를 1~20개 넣으세요.",
         "passwordWithoutUser": "비밀번호에는 사용자가 필요합니다.",
-        "passwordAgain": "서버·포트·사용자가 바뀌었습니다. 비밀번호를 다시 넣거나 지우세요.",
+        "passwordAgain": "서버·포트·사용자·TLS가 바뀌었습니다. 비밀번호를 다시 넣거나 지우세요.",
         "url": "http:// 또는 https:// URL을 넣으세요.",
         "tokenUnused": "토큰은 ntfy와 Gotify만 씁니다.",
         "tokenAgain": "URL이나 CA가 바뀌었습니다. 토큰을 다시 넣거나 지우세요.",

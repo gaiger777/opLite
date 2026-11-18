@@ -145,7 +145,7 @@ function NotificationHistory() {
               <TableCell>{t(`alerts.history.states.${r.state}`)}</TableCell>
               <TableCell>{r.rule ?? "—"}</TableCell>
               <TableCell className="font-mono text-xs">{r.subject ?? "—"}</TableCell>
-              <TableCell>{r.target}</TableCell>
+              <TableCell>{r.target ?? "—"}</TableCell>
               <TableCell>{r.node}</TableCell>
               <TableCell>
                 {r.ok ? (
