@@ -33,6 +33,13 @@ it("mirrors the server roles", () => {
   expect(can("viewer", "read", "placement-rule")).toBe(true);
   expect(can("operator", "write", "placement-rule")).toBe(false);
   expect(can("admin", "write", "placement-rule")).toBe(true);
+  // 경보 규칙은 누구나 읽고 admin만 바꾼다. 알림 대상은 비밀이 있어 admin만 읽는다.
+  expect(can("viewer", "read", "alert-rule")).toBe(true);
+  expect(can("operator", "write", "alert-rule")).toBe(false);
+  expect(can("admin", "write", "alert-rule")).toBe(true);
+  expect(can("operator", "read", "notification-target")).toBe(false);
+  expect(can("viewer", "read", "notification-target")).toBe(false);
+  expect(can("admin", "write", "notification-target")).toBe(true);
   // 클러스터 설정은 누구나 읽고 admin만 바꾼다.
   expect(can("viewer", "read", "settings")).toBe(true);
   expect(can("operator", "write", "settings")).toBe(false);

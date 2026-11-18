@@ -6,6 +6,12 @@ import i18n from "@/i18n";
 import { FakeXhr } from "@/test/fakeXhr";
 import { server } from "@/test/server";
 
+// uPlot은 캔버스를 쓰므로 jsdom에서 그리지 않는다. 차트는 받은 선 이름만 보이는 가짜다(설계 §13).
+vi.mock("@/charts/TimeChart", () => ({
+  default: ({ lines }: { lines: { label: string }[] }) =>
+    lines.map((line) => line.label).join(", "),
+}));
+
 // jsdom에는 matchMedia가 없다(테마가 시스템 설정을 읽는다).
 window.matchMedia ??= (query: string) =>
   ({

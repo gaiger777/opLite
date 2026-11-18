@@ -715,3 +715,28 @@ export const DISKS: NodeDisk[] = [
     reasons: ["gpt partition table", "ext4 filesystem"],
   },
 ];
+
+/** 테스트용 지표 기록 응답: 칸마다 같은 세 점(AVG·MAX·MIN)과 요약. `approx`면 근사 백분위다. */
+export function history(fields: string[], { approx = false } = {}) {
+  const column = { avg: [10, null, 30], max: [15, null, 40], min: [5, null, 20] };
+  return {
+    tier: approx ? "min1" : "raw5s",
+    step_ms: 5_000,
+    start: 1_800_000_000_000,
+    columns: Object.fromEntries(fields.map((f) => [f, column])),
+    stats: Object.fromEntries(fields.map((f) => [f, { avg: 20, max: 40, min: 5 }])),
+    pct: Object.fromEntries(fields.map((f) => [f, { p50: 20, p95: 38, approx }])),
+  };
+}
+
+export const NODE_FIELDS = [
+  "cpu",
+  "mem_used",
+  "mem_total",
+  "disk_read",
+  "disk_write",
+  "net_rx",
+  "net_tx",
+  "fs_used",
+  "fs_total",
+];

@@ -100,7 +100,8 @@
     "firmware_reset_required": "The VM has UEFI variables made for the other Secure Boot setting. Change Secure Boot with \"Reset firmware\" on the VM page, which resets the UEFI variables too (boot entries are lost).",
     "tpm_state_unavailable": "The VM cannot start because its TPM state is not available: {{message}}",
     "guest_agent_unavailable": "The guest agent cannot be used: {{message}}",
-    "node_unreachable": "Cannot reach the node: {{message}}"
+    "node_unreachable": "Cannot reach the node: {{message}}",
+    "in_use": "It is still in use: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -128,7 +129,9 @@
     "ceph": "Ceph",
     "isos": "ISO images",
     "templates": "Templates",
-    "images": "Image library"
+    "images": "Image library",
+    "alerts": "Alerts",
+    "notificationTargets": "Notification targets"
   },
   "header": {
     "language": "Language",
@@ -336,7 +339,8 @@
       "backups": "Backups",
       "tasks": "Tasks",
       "json": "JSON",
-      "guest": "Guest"
+      "guest": "Guest",
+      "metrics": "Metrics"
     },
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}} cores ({{model}})",
@@ -1386,7 +1390,10 @@
     },
     "firmware": "Firmware",
     "firmwareCaps": "TPM {{tpm}}, Secure Boot {{secureBoot}}",
-    "firmwareUnknown": "unknown"
+    "firmwareUnknown": "unknown",
+    "notFound": "Node {{name}} not found",
+    "backToList": "Back to nodes",
+    "noVms": "No VMs on this node."
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -1977,7 +1984,24 @@
         "percent": "From 1 to 90.",
         "concurrency": "From 1 to 32."
       }
-    }
+    },
+    "prometheus": {
+      "title": "Prometheus",
+      "intro": "Each node can serve its metrics in the Prometheus text format. Scrape every node: each one exports only its own node, VMs and pools, plus the cluster values.",
+      "on": "On",
+      "off": "Off",
+      "url": "Scrape URL (this node)",
+      "copyUrl": "Copy scrape URL",
+      "auth": "Prometheus signs in with an API token of a viewer or higher. Trust the cluster CA for HTTPS.",
+      "example": "Example scrape configuration",
+      "copyExample": "Copy example scrape configuration",
+      "enable": "Turn on Prometheus endpoint",
+      "disable": "Turn off Prometheus endpoint",
+      "enabled": "The Prometheus endpoint is on.",
+      "disabled": "The Prometheus endpoint is off."
+    },
+    "notificationsIntro": "Where alert rules send notifications: mail servers and webhooks (Slack, Teams, ntfy, Gotify).",
+    "manageNotifications": "Manage notification targets"
   },
   "audit": {
     "adminOnly": "Only administrators can read the audit log.",
@@ -2535,6 +2559,272 @@
       "sha256": "Use 64 hex digits.",
       "sha512": "Use 128 hex digits.",
       "aarch64Bios": "aarch64 images need UEFI."
+    }
+  },
+  "metrics": {
+    "title": "Metrics",
+    "range": "Time range",
+    "ranges": {
+      "hour": "1 hour",
+      "day": "1 day",
+      "week": "1 week",
+      "month": "1 month",
+      "year": "1 year"
+    },
+    "chart": {
+      "cpu": "CPU",
+      "memory": "Memory",
+      "disk": "Disk",
+      "network": "Network"
+    },
+    "field": {
+      "cpu": "CPU",
+      "mem_used": "Used",
+      "mem_total": "Total",
+      "mem_rss": "Memory (RSS)",
+      "disk_read": "Read",
+      "disk_write": "Write",
+      "net_rx": "Received",
+      "net_tx": "Sent"
+    },
+    "series": "Series",
+    "avg": "AVG",
+    "max": "MAX",
+    "min": "MIN",
+    "p50": "p50",
+    "p95": "p95",
+    "approxNote": "≈ Percentiles over this range are computed from averages and underestimate short peaks.",
+    "coveredFrom": "No history before {{time}}.",
+    "showTable": "Show as table",
+    "hideTable": "Hide table",
+    "tableOf": "{{title}} values",
+    "legendOf": "{{title}} summary",
+    "time": "Time",
+    "summary": "{{title}}, last {{range}}: {{values}}",
+    "summaryField": "{{field}} average {{avg}}, max {{max}}, min {{min}}",
+    "witness": "Witness nodes keep no metrics history.",
+    "clusterLoad": "Cluster load",
+    "nodeUnreachable": "{{node}} (did not answer)",
+    "nodeUnsupported": "{{node}} (older version)",
+    "nodeSkewed": "{{node}} (clock is off)",
+    "leftOut": "Not included: {{nodes}}.",
+    "nodeLoad": "Node load",
+    "noNodeHistory": "No node has metrics history yet.",
+    "cores_one": "{{count}} core",
+    "cores_other": "{{count}} cores",
+    "topNodes": "Showing the {{shown}} busiest of {{total}} nodes.",
+    "topVms": "Top VMs by CPU",
+    "noVms": "No VM history in this range.",
+    "poolUsage": "Storage pool usage",
+    "noPools": "No storage pools.",
+    "poolWarn": "{{percent}} %, nearly full"
+  },
+  "alerts": {
+    "active": "Active alerts",
+    "viewAll": "View all alerts",
+    "more_one": "{{count}} more alert",
+    "more_other": "{{count}} more alerts",
+    "none": "No active alerts.",
+    "phase": {
+      "firing": "Firing",
+      "pending": "Pending",
+      "clearing": "Clearing"
+    },
+    "severity": {
+      "critical": "Critical",
+      "warning": "Warning",
+      "info": "Info"
+    },
+    "valueThreshold": "value {{value}} · threshold {{threshold}}",
+    "value": "value {{value}}",
+    "since": "since {{time}}",
+    "tab": {
+      "active": "Active",
+      "rules": "Rules",
+      "history": "Sent notifications"
+    },
+    "unreachable": "These nodes did not answer, so their alerts are missing: {{nodes}}.",
+    "unsupported": "These nodes run an older version without alerts: {{nodes}}.",
+    "history": {
+      "period": "Period",
+      "periods": {
+        "day": "Last 24 hours",
+        "week": "Last 7 days"
+      },
+      "at": "Time",
+      "state": "Kind",
+      "rule": "Rule",
+      "subject": "Subject",
+      "target": "Target",
+      "result": "Result",
+      "states": {
+        "firing": "Firing",
+        "resolved": "Resolved",
+        "event": "Event",
+        "test": "Test"
+      },
+      "sent": "Sent",
+      "failed": "Failed",
+      "empty": "No notifications were sent in this period.",
+      "truncated": "Only the newest notifications are shown."
+    },
+    "condition": {
+      "node_metric": "Node {{metric}} {{op}} {{value}}",
+      "vm_metric": "VM {{metric}} {{op}} {{value}}",
+      "pool_usage": "Pool usage > {{percent}} %",
+      "node_offline": "Node offline",
+      "vm_failed": "VM failed",
+      "task_failed": "Task failed",
+      "task_failed_ops": "Task failed ({{ops}})",
+      "ha_recovery": "HA recovery",
+      "backup_job_failed": "Backup job failed"
+    },
+    "metric": {
+      "cpu": "CPU %",
+      "mem_percent": "memory %",
+      "fs_percent": "file system %",
+      "disk_read": "disk read B/s",
+      "disk_write": "disk write B/s",
+      "net_rx": "network received B/s",
+      "net_tx": "network sent B/s",
+      "mem_rss": "memory RSS MiB",
+      "disk_read_iops": "disk read IOPS",
+      "disk_write_iops": "disk write IOPS"
+    },
+    "kind": {
+      "node_metric": "Node metric",
+      "vm_metric": "VM metric",
+      "pool_usage": "Storage pool usage",
+      "node_offline": "Node offline",
+      "vm_failed": "VM failed",
+      "task_failed": "Task failed",
+      "ha_recovery": "HA recovery",
+      "backup_job_failed": "Backup job failed"
+    },
+    "rules": {
+      "create": "Create rule",
+      "condition": "Condition",
+      "severity": "Severity",
+      "targets": "Notify",
+      "empty": "No alert rules.",
+      "forText": "for {{secs}} s",
+      "on": "On",
+      "off": "Off",
+      "editNamed": "Edit {{name}}",
+      "deleteTitle": "Delete alert rule {{name}}?",
+      "deleteDescription": "Its active alerts disappear without a notification.",
+      "deleted": "Alert rule {{name}} deleted.",
+      "saved": "Alert rule {{name}} saved.",
+      "created": "Alert rule {{name}} created.",
+      "editTitle": "Edit alert rule {{name}}",
+      "createTitle": "Create alert rule",
+      "metric": "Metric",
+      "op": "Comparison",
+      "gt": "above",
+      "lt": "below",
+      "value": "Threshold",
+      "unitHint": "Units: CPU and other % values in percent, memory in MiB, disk and network in bytes per second.",
+      "percent": "Used above (%)",
+      "ops": "Task kinds",
+      "opsHint": "For example vm-start, vm-migrate. Leave empty for every task.",
+      "forSecs": "For (seconds)",
+      "forSecsHint": "The condition must hold this long before it notifies (0 to 86400).",
+      "noTargets": "There are no notification targets. Create one first.",
+      "repeatSecs": "Repeat every (seconds)",
+      "repeatSecsHint": "Notify again while the alert lasts. 0 sends once; otherwise 60 to 604800.",
+      "sendResolved": "Notify when resolved",
+      "nodes": "Only nodes",
+      "vms": "Only VMs",
+      "namesHint": "Names separated by commas. Leave empty for all.",
+      "enabled": "Rule is on",
+      "errors": {
+        "name": "Use 1-63 lowercase letters, digits and '-', not starting or ending with '-'.",
+        "taken": "That name is already in use.",
+        "value": "Enter a number.",
+        "percent": "Enter a percentage from 0 to 100.",
+        "forSecs": "Enter whole seconds from 0 to 86400.",
+        "repeatSecs": "Enter 0, or whole seconds from 60 to 604800.",
+        "targets": "Choose 1 to 16 notification targets."
+      }
+    },
+    "targets": {
+      "adminOnly": "Only administrators can manage notification targets.",
+      "pageHint": "Alert rules send to these targets by name. Passwords, tokens, header values and webhook URL paths are never shown again.",
+      "testSent": "Test notification sent to {{name}}.",
+      "testFailed": "Test notification to {{name}} failed: {{error}}",
+      "kind": "Kind",
+      "destination": "Destination",
+      "kinds": {
+        "smtp": "Email (SMTP)",
+        "webhook": "Webhook"
+      },
+      "formats": {
+        "json": "Webhook (JSON)",
+        "slack": "Slack",
+        "teams": "Microsoft Teams",
+        "ntfy": "ntfy",
+        "gotify": "Gotify"
+      },
+      "on": "On",
+      "off": "Off",
+      "testNamed": "Send a test notification to {{name}}",
+      "test": "Test",
+      "editNamed": "Edit {{name}}",
+      "deleteTitle": "Delete notification target {{name}}?",
+      "deleteDescription": "Rules that still use it must be changed first.",
+      "deleted": "Notification target {{name}} deleted.",
+      "saved": "Notification target {{name}} saved.",
+      "created": "Notification target {{name}} created.",
+      "editTitle": "Edit notification target {{name}}",
+      "createTitle": "Create notification target",
+      "formDescription": "Secrets you leave empty keep their saved values.",
+      "host": "SMTP server",
+      "port": "Port",
+      "tls": "Security",
+      "tlsModes": {
+        "starttls": "STARTTLS",
+        "tls": "TLS",
+        "none": "None"
+      },
+      "user": "User",
+      "userHint": "Leave empty to send without signing in.",
+      "password": "Password",
+      "secretSaved": "A value is saved. Leave empty to keep it.",
+      "clearPassword": "Remove the saved password",
+      "from": "From",
+      "to": "To",
+      "toHint": "Up to 20 addresses separated by commas.",
+      "url": "URL",
+      "urlSaved": "The path and query are hidden. Leave the URL as it is to keep it.",
+      "urlHint": "http:// or https:// address that receives a POST.",
+      "format": "Format",
+      "token": "Token",
+      "clearToken": "Remove the saved token",
+      "headers": "Extra headers",
+      "headerName": "Header {{n}} name",
+      "headerValue": "Header {{n}} value",
+      "headerKept": "saved value kept",
+      "removeHeader": "Remove header {{n}}",
+      "addHeader": "Add header",
+      "caPem": "CA certificate (PEM)",
+      "caPemHint": "Only trust this CA. Leave empty to use the system CAs.",
+      "enabled": "Send notifications",
+      "errors": {
+        "name": "Use 1-63 lowercase letters, digits and '-', not starting or ending with '-'.",
+        "taken": "That name is already in use.",
+        "host": "Enter the SMTP server.",
+        "port": "Enter a port from 1 to 65535.",
+        "from": "Enter the sender address.",
+        "to": "Enter 1 to 20 recipient addresses.",
+        "passwordWithoutUser": "A password needs a user.",
+        "passwordAgain": "The server, port or user changed. Enter the password again or remove it.",
+        "url": "Enter an http:// or https:// URL.",
+        "tokenUnused": "Only ntfy and Gotify use a token.",
+        "tokenAgain": "The URL or CA changed. Enter the token again or remove it.",
+        "header": "Enter a name and value for each new header.",
+        "headersAgain": "The URL or CA changed. Enter the header values again or remove them."
+      },
+      "empty": "No notification targets."
     }
   }
 }

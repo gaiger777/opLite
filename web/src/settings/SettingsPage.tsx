@@ -1,6 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { useSettings, useSubscription } from "@/api/live";
@@ -12,6 +13,7 @@ import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { HaSection } from "@/settings/HaSection";
+import { PrometheusSection } from "@/settings/PrometheusSection";
 import { patchSettings, settingsError } from "@/settings/save";
 import { ShutdownSection } from "@/settings/ShutdownSection";
 import { SubscriptionSection } from "@/settings/SubscriptionSection";
@@ -105,6 +107,19 @@ export function SettingsPage() {
       <ShutdownSection write={write} />
       <HaSection write={write} />
       <TelemetrySection write={write} />
+      <PrometheusSection write={write} />
+      {/* 알림 대상은 비밀이 있어 admin만 본다(계획 61이 설정 영역 탭으로 옮긴다). */}
+      {can(me.role, "read", "notification-target") && (
+        <section aria-labelledby="settings-notifications" className="flex flex-col gap-2">
+          <h2 id="settings-notifications" className="font-medium">
+            {t("nav.notificationTargets")}
+          </h2>
+          <p className="text-sm text-muted-foreground">{t("settings.notificationsIntro")}</p>
+          <Link to="/settings/notifications" className="text-sm underline underline-offset-4">
+            {t("settings.manageNotifications")}
+          </Link>
+        </section>
+      )}
     </div>
   );
 }

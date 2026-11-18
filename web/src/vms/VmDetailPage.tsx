@@ -58,6 +58,7 @@ import {
 import { VmConsole } from "@/vms/lazyConsole";
 import { VmSecurity } from "@/vms/VmFirmware";
 import { VmGuestCard, VmGuestTab } from "@/vms/VmGuest";
+import { VmMetrics } from "@/vms/VmMetrics";
 import {
   formatAge,
   replicaRows,
@@ -71,6 +72,7 @@ import { VmSnapshots } from "@/vms/VmSnapshots";
 
 const TABS = [
   "summary",
+  "metrics",
   "hardware",
   "guest",
   "console",
@@ -142,6 +144,10 @@ export function VmDetailPage() {
           <VmSecurity vm={vm} />
           <VmGuestCard vm={vm} />
           <PendingChanges vm={vm} />
+        </TabsContent>
+        <TabsContent value="metrics">
+          {/* 탭을 열 때만 읽는다. */}
+          {tab === "metrics" && <VmMetrics vm={vm} />}
         </TabsContent>
         <TabsContent value="hardware">
           <Hardware vm={vm} />

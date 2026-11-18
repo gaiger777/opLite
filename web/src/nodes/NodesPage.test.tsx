@@ -56,6 +56,8 @@ it("lists nodes with their state, capacity and VMs", async () => {
   expect(a).toHaveTextContent("Online");
   expect(a).toHaveTextContent("16 GiB");
   expect(await within(a).findByText("(this node)")).toBeInTheDocument();
+  // 이름은 노드 상세로 간다.
+  expect(within(a).getByRole("link", { name: "node-a" })).toHaveAttribute("href", "/nodes/node-a");
   // 두 VM 모두 node-a에 고정돼 있다.
   const vmsColumn = within(table)
     .getAllByRole("columnheader")

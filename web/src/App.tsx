@@ -4,6 +4,8 @@ import { createBrowserRouter, RouterProvider } from "react-router";
 
 import { TokensPage } from "@/accounts/TokensPage";
 import { UsersPage } from "@/accounts/UsersPage";
+import { AlertsPage } from "@/alerts/AlertsPage";
+import { NotificationTargetsPage } from "@/alerts/NotificationTargetsPage";
 import { AuditPage } from "@/audit/AuditPage";
 import { LiveProvider } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
@@ -26,6 +28,7 @@ import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
 import { NetworksPage } from "@/networks/NetworksPage";
+import { NodeDetailPage } from "@/nodes/NodeDetailPage";
 import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
 import { PlacementPage } from "@/placement/PlacementPage";
@@ -83,11 +86,13 @@ function routes() {
             { path: "security-groups", element: <SecurityGroupsPage /> },
             { path: "security-groups/:name", element: <SecurityGroupPage /> },
             { path: "nodes", element: <NodesPage /> },
+            { path: "nodes/:name", element: <NodeDetailPage /> },
             { path: "ha-groups", element: <HaGroupsPage /> },
             { path: "ha-checks", element: <HaChecksPage /> },
             { path: "placement-rules", element: <PlacementRulesPage /> },
             { path: "placement", element: <PlacementPage /> },
             { path: "tasks", element: <TasksPage /> },
+            { path: "alerts", element: <AlertsPage /> },
             { path: "audit", element: <AuditPage /> },
             { path: "users", element: <UsersPage /> },
             { path: "realms", element: <RealmsPage /> },
@@ -96,6 +101,7 @@ function routes() {
             { path: "remotes", element: <RemotesPage /> },
             { path: "remotes/:name", element: <RemotePage /> },
             { path: "settings", element: <SettingsPage /> },
+            { path: "settings/notifications", element: <NotificationTargetsPage /> },
             { path: "*", element: <NotFoundPage /> },
           ],
         },

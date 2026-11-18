@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreHorizontal } from "lucide-react";
 import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { ApiError, api, call } from "@/api/client";
@@ -266,7 +267,12 @@ export function NodesPage() {
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
               <TableCell className="font-medium">
-                {node.name}
+                <Link
+                  to={`/nodes/${encodeURIComponent(node.name)}`}
+                  className="underline-offset-4 hover:underline"
+                >
+                  {node.name}
+                </Link>
                 {node.id === cluster.data?.node && (
                   <span className="ml-2 text-xs text-muted-foreground">{t("nodes.thisNode")}</span>
                 )}

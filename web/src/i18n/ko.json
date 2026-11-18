@@ -100,7 +100,8 @@
     "firmware_reset_required": "VM의 UEFI 변수가 지금과 다른 Secure Boot 설정으로 만들어졌습니다. VM 화면의 \"펌웨어 초기화\"에서 UEFI 변수와 함께 Secure Boot를 바꾸세요(부팅 항목이 지워집니다).",
     "tpm_state_unavailable": "TPM 상태를 가져올 수 없어 VM을 켤 수 없습니다: {{message}}",
     "guest_agent_unavailable": "게스트 에이전트를 쓸 수 없습니다: {{message}}",
-    "node_unreachable": "노드에 닿지 못했습니다: {{message}}"
+    "node_unreachable": "노드에 닿지 못했습니다: {{message}}",
+    "in_use": "아직 쓰는 곳이 있습니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -128,7 +129,9 @@
     "ceph": "Ceph",
     "isos": "ISO 이미지",
     "templates": "템플릿",
-    "images": "이미지 라이브러리"
+    "images": "이미지 라이브러리",
+    "alerts": "경보",
+    "notificationTargets": "알림 대상"
   },
   "header": {
     "language": "언어",
@@ -336,7 +339,8 @@
       "backups": "백업",
       "tasks": "작업",
       "json": "JSON",
-      "guest": "게스트"
+      "guest": "게스트",
+      "metrics": "지표"
     },
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}}코어 ({{model}})",
@@ -1386,7 +1390,10 @@
     },
     "firmware": "펌웨어",
     "firmwareCaps": "TPM {{tpm}}, Secure Boot {{secureBoot}}",
-    "firmwareUnknown": "모름"
+    "firmwareUnknown": "모름",
+    "notFound": "노드 {{name}}을(를) 찾을 수 없습니다",
+    "backToList": "노드 목록으로",
+    "noVms": "이 노드에 VM이 없습니다."
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -1977,7 +1984,24 @@
         "percent": "1~90.",
         "concurrency": "1~32."
       }
-    }
+    },
+    "prometheus": {
+      "title": "Prometheus",
+      "intro": "노드마다 지표를 Prometheus 텍스트 형식으로 내보낼 수 있습니다. 모든 노드를 긁으세요. 각 노드는 자기 노드·VM·풀과 클러스터 값만 내보냅니다.",
+      "on": "켜짐",
+      "off": "꺼짐",
+      "url": "스크레이프 주소(이 노드)",
+      "copyUrl": "스크레이프 주소 복사",
+      "auth": "Prometheus는 viewer 이상의 API 토큰으로 로그인합니다. HTTPS에는 클러스터 CA를 믿게 하세요.",
+      "example": "스크레이프 설정 예",
+      "copyExample": "스크레이프 설정 예 복사",
+      "enable": "Prometheus 끝점 켜기",
+      "disable": "Prometheus 끝점 끄기",
+      "enabled": "Prometheus 끝점을 켰습니다.",
+      "disabled": "Prometheus 끝점을 껐습니다."
+    },
+    "notificationsIntro": "경보 규칙이 알림을 보낼 곳: 메일 서버와 webhook(Slack·Teams·ntfy·Gotify).",
+    "manageNotifications": "알림 대상 관리"
   },
   "audit": {
     "adminOnly": "관리자만 감사 로그를 읽을 수 있습니다.",
@@ -2535,6 +2559,272 @@
       "sha256": "16진 64자를 넣으세요.",
       "sha512": "16진 128자를 넣으세요.",
       "aarch64Bios": "aarch64 이미지는 UEFI만 됩니다."
+    }
+  },
+  "metrics": {
+    "title": "지표",
+    "range": "범위",
+    "ranges": {
+      "hour": "1시간",
+      "day": "1일",
+      "week": "1주",
+      "month": "1개월",
+      "year": "1년"
+    },
+    "chart": {
+      "cpu": "CPU",
+      "memory": "메모리",
+      "disk": "디스크",
+      "network": "네트워크"
+    },
+    "field": {
+      "cpu": "CPU",
+      "mem_used": "사용",
+      "mem_total": "전체",
+      "mem_rss": "메모리(RSS)",
+      "disk_read": "읽기",
+      "disk_write": "쓰기",
+      "net_rx": "받기",
+      "net_tx": "보내기"
+    },
+    "series": "항목",
+    "avg": "평균",
+    "max": "최대",
+    "min": "최소",
+    "p50": "p50",
+    "p95": "p95",
+    "approxNote": "≈ 이 범위의 백분위는 평균값으로 셈해 짧은 봉우리를 낮게 봅니다.",
+    "coveredFrom": "{{time}} 전의 기록은 없습니다.",
+    "showTable": "표로 보기",
+    "hideTable": "표 닫기",
+    "tableOf": "{{title}} 값",
+    "legendOf": "{{title}} 요약",
+    "time": "시각",
+    "summary": "{{title}}, 지난 {{range}}: {{values}}",
+    "summaryField": "{{field}} 평균 {{avg}}, 최대 {{max}}, 최소 {{min}}",
+    "witness": "위트니스 노드는 지표를 기록하지 않습니다.",
+    "clusterLoad": "클러스터 부하",
+    "nodeUnreachable": "{{node}}(답하지 않음)",
+    "nodeUnsupported": "{{node}}(옛 버전)",
+    "nodeSkewed": "{{node}}(시계가 어긋남)",
+    "leftOut": "넣지 못한 노드: {{nodes}}.",
+    "nodeLoad": "노드 부하",
+    "noNodeHistory": "아직 지표 기록이 있는 노드가 없습니다.",
+    "cores_one": "{{count}}코어",
+    "cores_other": "{{count}}코어",
+    "topNodes": "노드 {{total}}개 중 가장 바쁜 {{shown}}개를 보입니다.",
+    "topVms": "CPU 상위 VM",
+    "noVms": "이 범위의 VM 기록이 없습니다.",
+    "poolUsage": "스토리지 풀 사용률",
+    "noPools": "스토리지 풀이 없습니다.",
+    "poolWarn": "{{percent}} %, 거의 참"
+  },
+  "alerts": {
+    "active": "활성 경보",
+    "viewAll": "경보 모두 보기",
+    "more_one": "경보 {{count}}개 더",
+    "more_other": "경보 {{count}}개 더",
+    "none": "활성 경보가 없습니다.",
+    "phase": {
+      "firing": "울림",
+      "pending": "대기",
+      "clearing": "해제 중"
+    },
+    "severity": {
+      "critical": "심각",
+      "warning": "경고",
+      "info": "정보"
+    },
+    "valueThreshold": "값 {{value}} · 문턱 {{threshold}}",
+    "value": "값 {{value}}",
+    "since": "{{time}}부터",
+    "tab": {
+      "active": "활성",
+      "rules": "규칙",
+      "history": "보낸 알림"
+    },
+    "unreachable": "이 노드가 답하지 않아 그 경보가 빠졌습니다: {{nodes}}.",
+    "unsupported": "이 노드는 경보가 없는 옛 버전입니다: {{nodes}}.",
+    "history": {
+      "period": "기간",
+      "periods": {
+        "day": "지난 24시간",
+        "week": "지난 7일"
+      },
+      "at": "시각",
+      "state": "종류",
+      "rule": "규칙",
+      "subject": "대상",
+      "target": "알림 대상",
+      "result": "결과",
+      "states": {
+        "firing": "울림",
+        "resolved": "해제",
+        "event": "이벤트",
+        "test": "시험"
+      },
+      "sent": "보냄",
+      "failed": "실패",
+      "empty": "이 기간에 보낸 알림이 없습니다.",
+      "truncated": "가장 새 알림만 보입니다."
+    },
+    "condition": {
+      "node_metric": "노드 {{metric}} {{op}} {{value}}",
+      "vm_metric": "VM {{metric}} {{op}} {{value}}",
+      "pool_usage": "풀 사용률 > {{percent}} %",
+      "node_offline": "노드 오프라인",
+      "vm_failed": "VM 실패",
+      "task_failed": "작업 실패",
+      "task_failed_ops": "작업 실패({{ops}})",
+      "ha_recovery": "HA 복구",
+      "backup_job_failed": "백업 작업 실패"
+    },
+    "metric": {
+      "cpu": "CPU %",
+      "mem_percent": "메모리 %",
+      "fs_percent": "파일 시스템 %",
+      "disk_read": "디스크 읽기 B/s",
+      "disk_write": "디스크 쓰기 B/s",
+      "net_rx": "네트워크 받기 B/s",
+      "net_tx": "네트워크 보내기 B/s",
+      "mem_rss": "메모리 RSS MiB",
+      "disk_read_iops": "디스크 읽기 IOPS",
+      "disk_write_iops": "디스크 쓰기 IOPS"
+    },
+    "kind": {
+      "node_metric": "노드 지표",
+      "vm_metric": "VM 지표",
+      "pool_usage": "스토리지 풀 사용률",
+      "node_offline": "노드 오프라인",
+      "vm_failed": "VM 실패",
+      "task_failed": "작업 실패",
+      "ha_recovery": "HA 복구",
+      "backup_job_failed": "백업 작업 실패"
+    },
+    "rules": {
+      "create": "규칙 만들기",
+      "condition": "조건",
+      "severity": "심각도",
+      "targets": "알릴 곳",
+      "empty": "경보 규칙이 없습니다.",
+      "forText": "{{secs}}초 동안",
+      "on": "켜짐",
+      "off": "꺼짐",
+      "editNamed": "{{name}} 고치기",
+      "deleteTitle": "경보 규칙 {{name}}을(를) 지울까요?",
+      "deleteDescription": "그 규칙의 활성 경보는 알림 없이 사라집니다.",
+      "deleted": "경보 규칙 {{name}}을(를) 지웠습니다.",
+      "saved": "경보 규칙 {{name}}을(를) 저장했습니다.",
+      "created": "경보 규칙 {{name}}을(를) 만들었습니다.",
+      "editTitle": "경보 규칙 {{name}} 고치기",
+      "createTitle": "경보 규칙 만들기",
+      "metric": "지표",
+      "op": "비교",
+      "gt": "보다 큼",
+      "lt": "보다 작음",
+      "value": "문턱",
+      "unitHint": "단위: CPU와 % 값은 퍼센트, 메모리는 MiB, 디스크·네트워크는 초당 바이트입니다.",
+      "percent": "사용률이 넘으면(%)",
+      "ops": "작업 종류",
+      "opsHint": "예: vm-start, vm-migrate. 비우면 모든 작업입니다.",
+      "forSecs": "지속 시간(초)",
+      "forSecsHint": "조건이 이만큼 이어져야 알립니다(0~86400).",
+      "noTargets": "알림 대상이 없습니다. 먼저 만드세요.",
+      "repeatSecs": "다시 알리기(초)",
+      "repeatSecsHint": "경보가 이어지는 동안 다시 알립니다. 0이면 한 번만, 아니면 60~604800입니다.",
+      "sendResolved": "해제도 알리기",
+      "nodes": "이 노드만",
+      "vms": "이 VM만",
+      "namesHint": "쉼표로 나눈 이름. 비우면 모두입니다.",
+      "enabled": "규칙 켜기",
+      "errors": {
+        "name": "소문자·숫자·'-'로 1~63자이고, '-'로 시작하거나 끝나지 않아야 합니다.",
+        "taken": "이미 쓰는 이름입니다.",
+        "value": "숫자를 넣으세요.",
+        "percent": "0~100 사이의 퍼센트를 넣으세요.",
+        "forSecs": "0~86400 사이의 초를 정수로 넣으세요.",
+        "repeatSecs": "0이나 60~604800 사이의 초를 정수로 넣으세요.",
+        "targets": "알림 대상을 1~16개 고르세요."
+      }
+    },
+    "targets": {
+      "adminOnly": "알림 대상은 관리자만 다룹니다.",
+      "pageHint": "경보 규칙은 이 대상에 이름으로 보냅니다. 비밀번호·토큰·헤더 값·webhook URL의 경로는 다시 보이지 않습니다.",
+      "testSent": "{{name}}에 시험 알림을 보냈습니다.",
+      "testFailed": "{{name}}에 시험 알림을 보내지 못했습니다: {{error}}",
+      "kind": "종류",
+      "destination": "보낼 곳",
+      "kinds": {
+        "smtp": "메일(SMTP)",
+        "webhook": "Webhook"
+      },
+      "formats": {
+        "json": "Webhook(JSON)",
+        "slack": "Slack",
+        "teams": "Microsoft Teams",
+        "ntfy": "ntfy",
+        "gotify": "Gotify"
+      },
+      "on": "켜짐",
+      "off": "꺼짐",
+      "testNamed": "{{name}}에 시험 알림 보내기",
+      "test": "시험",
+      "editNamed": "{{name}} 고치기",
+      "deleteTitle": "알림 대상 {{name}}을(를) 지울까요?",
+      "deleteDescription": "이 대상을 쓰는 규칙을 먼저 고쳐야 합니다.",
+      "deleted": "알림 대상 {{name}}을(를) 지웠습니다.",
+      "saved": "알림 대상 {{name}}을(를) 저장했습니다.",
+      "created": "알림 대상 {{name}}을(를) 만들었습니다.",
+      "editTitle": "알림 대상 {{name}} 고치기",
+      "createTitle": "알림 대상 만들기",
+      "formDescription": "비워 둔 비밀은 저장된 값을 그대로 씁니다.",
+      "host": "SMTP 서버",
+      "port": "포트",
+      "tls": "보안",
+      "tlsModes": {
+        "starttls": "STARTTLS",
+        "tls": "TLS",
+        "none": "없음"
+      },
+      "user": "사용자",
+      "userHint": "비우면 로그인하지 않고 보냅니다.",
+      "password": "비밀번호",
+      "secretSaved": "저장된 값이 있습니다. 비우면 그대로 둡니다.",
+      "clearPassword": "저장된 비밀번호 지우기",
+      "from": "보내는 주소",
+      "to": "받는 주소",
+      "toHint": "쉼표로 나눈 주소 20개까지.",
+      "url": "URL",
+      "urlSaved": "경로와 질의는 가렸습니다. 그대로 두면 저장된 URL을 씁니다.",
+      "urlHint": "POST를 받을 http:// 또는 https:// 주소.",
+      "format": "형식",
+      "token": "토큰",
+      "clearToken": "저장된 토큰 지우기",
+      "headers": "더 붙일 헤더",
+      "headerName": "헤더 {{n}} 이름",
+      "headerValue": "헤더 {{n}} 값",
+      "headerKept": "저장된 값 유지",
+      "removeHeader": "헤더 {{n}} 빼기",
+      "addHeader": "헤더 더하기",
+      "caPem": "CA 인증서(PEM)",
+      "caPemHint": "이 CA만 믿습니다. 비우면 시스템 CA를 씁니다.",
+      "enabled": "알림 보내기",
+      "errors": {
+        "name": "소문자·숫자·'-'로 1~63자이고, '-'로 시작하거나 끝나지 않아야 합니다.",
+        "taken": "이미 쓰는 이름입니다.",
+        "host": "SMTP 서버를 넣으세요.",
+        "port": "1~65535 사이의 포트를 넣으세요.",
+        "from": "보내는 주소를 넣으세요.",
+        "to": "받는 주소를 1~20개 넣으세요.",
+        "passwordWithoutUser": "비밀번호에는 사용자가 필요합니다.",
+        "passwordAgain": "서버·포트·사용자가 바뀌었습니다. 비밀번호를 다시 넣거나 지우세요.",
+        "url": "http:// 또는 https:// URL을 넣으세요.",
+        "tokenUnused": "토큰은 ntfy와 Gotify만 씁니다.",
+        "tokenAgain": "URL이나 CA가 바뀌었습니다. 토큰을 다시 넣거나 지우세요.",
+        "header": "새 헤더마다 이름과 값을 넣으세요.",
+        "headersAgain": "URL이나 CA가 바뀌었습니다. 헤더 값을 다시 넣거나 빼세요."
+      },
+      "empty": "알림 대상이 없습니다."
     }
   }
 }

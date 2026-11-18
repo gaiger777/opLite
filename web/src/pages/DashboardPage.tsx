@@ -17,6 +17,11 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ActiveAlertsWidget } from "@/dashboard/ActiveAlertsWidget";
+import { ClusterChartsWidget } from "@/dashboard/ClusterChartsWidget";
+import { NodeStripWidget } from "@/dashboard/NodeStripWidget";
+import { PoolUsageWidget } from "@/dashboard/PoolUsageWidget";
+import { TopVmsWidget } from "@/dashboard/TopVmsWidget";
 import { errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
 import { compareVersions } from "@/lib/version";
@@ -127,6 +132,17 @@ export function DashboardPage() {
           }
         />
         <Stat title={t("dashboard.leader")} value={leader} detail={cluster.data?.name} />
+      </div>
+
+      {/* 계획 60 위젯. 위젯은 카드 하나만 그리고 배치는 여기서 한다. */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <ActiveAlertsWidget />
+        <PoolUsageWidget />
+      </div>
+      <ClusterChartsWidget />
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <NodeStripWidget />
+        <TopVmsWidget />
       </div>
 
       <section className="flex flex-col gap-2">
