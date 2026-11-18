@@ -31,8 +31,8 @@ orbivisorctl settings set updates.channel=enterprise  # admin. 구독이 active�
   not match this build`, `the subscription key expired on 2026-01-01`). 키 문자열은 클러스터 설정
   (`Settings.spec.subscription`)에 저장하지만 API(`GET`·`PATCH /api/v1/settings`, watch)로는 내보내지 않는다. 감사
   로그(`detail` `id=<키 id>`, "감사 로그")와 orbivisord 로그에는 키 id만 남는다.
-- **웹.** "설정" 화면의 구독 카드가 상태·고객·수준·노드(사용/한도)·만료일을 보이고, admin은 키를 붙여 넣거나 지운다.
-  상태가 `active`가 아니거나 만료 30일 전부터 대시보드 제목 아래에 안내가 보인다(`expired`·`over_limit`는 경고 색,
+- **웹.** 설정 › 구독 탭이 상태·고객·수준·노드(사용/한도)·만료일을 보이고, admin은 키를 붙여 넣거나 지운다.
+  상태가 `active`가 아니거나 만료 30일 전부터 홈 제목 아래에 안내가 보인다(`expired`·`over_limit`는 경고 색,
   그 밖은 정보 색). "7일 동안 숨기기"를 누르면 그 브라우저에서 그 안내만 7일 동안 숨긴다(예: "구독 없음"을 닫은 뒤
   구독이 만료되면 만료 안내는 보인다). 웹은 설정이 바뀌거나, 노드가 합류하거나 떠나거나, 다시 연결할 때와 한
   시간마다 상태를 다시 읽는다. 만료일은 UTC 날짜다.
@@ -102,7 +102,7 @@ orbivisorctl telemetry reset-id                    # 보고 id를 새로 만든�
   아니면 **400** `invalid_request`). `""`를 보내면 지워 빌드 값
   `OPL_TELEMETRY_URL`을 쓴다. 켰는데 끝점도 빌드 값도 없으면 **400** `telemetry_endpoint_required`. 처음 켤 때 무작위
   UUID v4 보고 id를 만든다(클러스터 이름·CA와 관계없다). 꺼도 id는 남고, `POST /api/v1/telemetry/reset-id`(admin)가
-  새로 만든다. 웹 "설정" 화면은 "켜기…"를 누르면 보낼 JSON(`GET /api/v1/telemetry/preview`, admin)을 대화상자로
+  새로 만든다. 웹 설정 › 일반의 텔레메트리 칸은 "켜기…"를 누르면 보낼 JSON(`GET /api/v1/telemetry/preview`, admin)을 대화상자로
   보이고 확인해야 켠다(끝점 입력란에 저장하지 않은 값이 있으면 함께 보낸다).
 - **보내기.** 리더가 `[telemetry] tick`마다 확인해, 켜져 있고 마지막 전송(`status.telemetry.last_sent_at`)에서
   `interval`이 지났으면 끝점에 JSON을 `POST`한다(시간 제한 30초, https만, 리다이렉트는 따르지 않는다). 2xx면

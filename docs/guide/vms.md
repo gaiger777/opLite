@@ -50,7 +50,7 @@ orbivisorctl iso delete alpine
   (되돌리기가 그 매체로 켠다). 백업은 막지 않는다(복원이 드라이브를 비운다). 확인한 뒤 다른 노드에서 그 ISO를 넣었거나 그
   매체가 든 스냅샷을 찍었으면 지우기 Task가 다시 보고 같은 문구로 실패한다. 지우기 Task가 끝나지 않은 ISO는 CD에 넣지 못한다
   (**409** `volume_in_use` `ISO "alpine" is being deleted (task …)`).
-- 웹: 메뉴 "ISO 이미지"(풀별 표, 올리기·URL에서 받기·지우기, 넣은 VM). 볼륨 화면은 ISO를 빼고 보이며 "ISO 이미지도 보기"로
+- 웹: 가상 머신 › 이미지·ISO › ISO 이미지 보기(풀별 표, 올리기·URL에서 받기·지우기, 넣은 VM). 볼륨 화면은 ISO를 빼고 보이며 "ISO 이미지도 보기"로
   함께 본다.
 
 **CD/DVD 드라이브.** VM마다 4개까지(`spec.cdroms`, 드라이브 번호 = 순번 `cdrom0`…). 빈 드라이브도 된다.
@@ -289,9 +289,9 @@ orbivisorctl volume flatten web-1-disk0          # POST /volumes/{key}/flatten �
 | 409 `volume_has_clones` | 연결 복제의 기반 볼륨 지우기 |
 | 409 `cluster_upgrading` | `templates` 기능이 없는 노드가 있을 때 새 칸·새 Task |
 
-웹: 메뉴 "템플릿"(이름·디스크·풀·연결 복제 수, "배포"·"VM으로 되돌리기"·"삭제"), 배포 창(개수와 `{n}` 미리 보기, 디스크
+웹: 가상 머신 › 템플릿 탭(이름·디스크·풀·연결 복제 수, "배포"·"VM으로 되돌리기"·"삭제"), 배포 창(개수와 `{n}` 미리 보기, 디스크
 복제 방식 — 되는 디스크만 연결·모두 연결·전체 복사 — 와 디스크별 가능 여부, 노드·풀, vCPU·메모리, NIC별 네트워크, 디스크
-크기, cloud-init, "배포 뒤 켜기"; VM마다 Task 알림), VM 목록·상세의 "템플릿으로 바꾸기"(안 되면 이유)와 "템플릿만 보기"
+크기, cloud-init, "배포 뒤 켜기"; VM마다 Task 알림), VM 목록 행 메뉴와 VM 상세 동작 메뉴(⋯)의 "템플릿으로 바꾸기"(안 되면 이유)와 "템플릿만 보기"
 칩, 볼륨 화면의 "기반" 열과 "평탄화".
 
 **넣지 않은 것(나중).** 실행 중 평탄화(`block-stream`), 노드마다 기반 사본을 두는 "기반 캐시"(로컬 풀의 다른 노드 연결
@@ -343,7 +343,7 @@ orbivisorctl template deploy debian-tmpl --name 'app-{n}' --count 3 --start
   (배포 때 준다). API가 VM 만들기와 같은 검사를 미리 한다(이름 **409** `name_taken`, 아키텍처가 맞는 노드가 없으면 **400**
   `machine_arch_mismatch`). 템플릿 단계가 실패하면(그새 이름이 쓰였거나 opld가 재시작) **받은 볼륨은 지우지 않고**
   `…; volume "ubuntu-24-04" is ready; create the template from it with vm create and template convert`로 알린다.
-  가져오기 전 실패(체크섬 등)는 볼륨을 지운다. 웹은 메뉴 "이미지 라이브러리"(아키텍처 거름, 항목별 "받기"·"받은 뒤 템플릿
+  가져오기 전 실패(체크섬 등)는 볼륨을 지운다. 웹은 가상 머신 › 이미지·ISO › 이미지 라이브러리 보기(아키텍처 거름, 항목별 "받기"·"받은 뒤 템플릿
   만들기", 진행률, 관리자 항목 더하기·지우기).
 
 **체크섬 확인.** `volume download`·`iso download`(`POST /volumes/download`)에도 `--sha512 HEX`와
@@ -462,7 +462,7 @@ orbivisorctl vm create win11 --preset windows11 --disk win11-disk0 --cdrom win11
 q35·UEFI(다른 `--machine`·`--firmware`는 거절), `tpm`·`secure_boot`·`guest_agent: {}`, 소켓 1 × 코어 2, 4096 MiB(따로
 주지 않았을 때), 디스크 버스 SATA, NIC e1000e다 — 드라이버 없이 설치되게 한 것이고, VirtIO 드라이버를 넣은 뒤 VirtIO로
 바꾸라고 알린다. 따로 준 값(`--cores`, `--tpm off` 등)이 이긴다. CLI는 볼륨을 만들지 않으므로 `--disk`로 준 볼륨의 버스만
-바꾼다. 웹 새 VM 폼의 "Windows 11" 단추는 64 GiB 디스크까지 채운다.
+바꾼다. 웹 새 VM 폼의 "Windows 11" 프리셋은 64 GiB 디스크까지 채운다.
 
 **초기화와 Secure Boot 바꾸기.** 꺼진 VM의 UEFI 변수(부팅 항목)나 TPM 상태를 지운다. 다음 켜기에서 새로 만든다.
 

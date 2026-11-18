@@ -91,7 +91,7 @@ orbivisorctl vm nic-sg web1 0                                # 0번 NIC의 그�
 orbivisorctl security-group delete web                       # 그룹을 쓰는 NIC가 없어야 한다
 ```
 
-웹은 "보안 그룹" 메뉴에서 그룹을 만들고 지우며, 그룹 화면의 규칙 표에서 방향·동작·프로토콜·포트·원격 CIDR을
+웹은 인프라 › 보안 그룹 탭에서 그룹을 만들고 지우며, 그룹 화면의 규칙 표에서 방향·동작·프로토콜·포트·원격 CIDR을
 고치고 순서를 바꿔 저장한다. VM 편집의 NIC마다 그룹을 고른다. API는 `/api/v1/security-groups`(목록·만들기·읽기·
 지우기)와 `PATCH /api/v1/security-groups/{name}`(`{"description": …, "rules": […]}` 중 보낸 것만, `If-Match`로
 revision), VM NIC의 `security_groups: ["web"]`, Node `status.firewall`이다.

@@ -208,7 +208,7 @@ orbivisorctl cluster status                      # 버전이 섞여 있으면 �
 
 - **채널.** 설정은 클러스터에 하나뿐인 `Settings` 리소스(이름 `cluster`)다. `GET /api/v1/settings`는 로그인한 누구나,
   `PATCH /api/v1/settings`(`{"updates":{"channel":"testing"}}`, 다른 패치 API처럼 `If-Match`를 받는다)는 admin만
-  한다. 한 번도 바꾸지 않았으면 기본값(`stable`)이다. 웹은 "설정" 화면(admin만 저장, 그 밖은 읽기만).
+  한다. 한 번도 바꾸지 않았으면 기본값(`stable`)이다. 웹은 설정 › 일반 탭(admin만 저장, 그 밖은 읽기만).
 - **소스 파일.** 저장소 주소는 orbivisord 설정 `[updates] apt_url`이고, 비면 빌드할 때 넣은 `OPL_APT_URL`이다. 둘 다 비면
   orbivisord는 소스 파일을 쓰지 않는다(관리자가 apt 소스를 직접 둔다). 주소가 있으면 orbivisord가 시작할 때와 채널이 바뀔 때
   `/etc/apt/sources.list.d/oplite.sources`를 쓴다:
@@ -271,7 +271,7 @@ orbivisorctl cluster status                      # 버전이 섞여 있으면 �
    끈다(`orbivisorctl node maintenance <노드> off`).
 4. `orbivisorctl node list`에서 그 노드의 VERSION과 ONLINE을 확인하고 다음 노드로 간다.
 
-모든 노드가 같은 버전이 될 때까지 `cluster status`와 웹 대시보드에 "nodes run different Orbivisor versions (…); finish
+모든 노드가 같은 버전이 될 때까지 `cluster status`와 웹 홈에 "nodes run different Orbivisor versions (…); finish
 the upgrade on every node" 경고가 보인다. 웹은 노드 표의 업데이트 배지(올릴 패키지 수, 확인 실패면 경고)를 누르면
 같은 정보와 "다시 확인"·"업그레이드" 버튼(admin)이 있는 대화상자를 연다. 로그인 화면 아래에 서버 버전
 (`GET /api/v1/version`, 인증 없음)이 보인다.

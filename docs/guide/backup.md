@@ -30,7 +30,7 @@ orbivisorctl backup restore before-upgrade --name web2 --pool local  # 새 VM we
 orbivisorctl backup delete before-upgrade                    # 파일과 리소스를 지운다(실패한 백업도)
 ```
 
-웹은 사이드바의 "백업" 화면(모든 백업, VM이 지워진 백업 포함)과 VM 상세의 "백업" 탭(지금 백업, 복원)에서 하고,
+웹은 보호 › 백업 탭(모든 백업, VM이 지워진 백업 포함)과 VM 상세의 "백업" 탭(지금 백업, 복원)에서 하고,
 스토리지 풀 화면의 "백업 저장" 스위치로 백업 풀을 정한다. API는 `POST /api/v1/vms/{name}/backups`
 (`{"pool": …, "name": …, "incremental": …}` — `incremental`은 기본 false), `GET /api/v1/backups[?vm=]`,
 `GET`·`DELETE /api/v1/backups/{name}`, `POST /api/v1/backups/{name}/restore`(`{"name": …, "pool": …, "node": …}`)이고
@@ -208,7 +208,7 @@ orbivisorctl backup-job delete nightly         # 작업만 지운다. 만든 백
   `cluster_upgrading`), `--replicate`와 함께 두면 증분 백업도 체인 순서로 원격에 보낸다(아래 "원격 복제(DR)").
   `backup-job list`의 `SCHEDULE` 칸에는 `, full every N`, 웹 작업 표의 일정 칸에는 "증분, 증분 n개마다 전체"가 보인다.
 - **작업을 지워도 백업은 남는다.** 그 백업은 더는 보존 규칙으로 지워지지 않으니 `orbivisorctl backup delete`로 지운다.
-- 웹은 사이드바 "백업" 아래 "백업 작업" 화면(만들기·편집·지우기·지금 실행, 다음·마지막 실행 시각은 UTC로 표시)에서
+- 웹은 보호 › 백업 작업 탭(만들기·편집·지우기·지금 실행, 다음·마지막 실행 시각은 UTC로 표시)에서
   한다. API는 `GET`·`POST /api/v1/backup-jobs`, `GET`·`PATCH`·`DELETE /api/v1/backup-jobs/{name}`,
   `POST /api/v1/backup-jobs/{name}/run`이고, 읽기는 모든 사용자, 쓰기는 operator 이상이다. 스케줄러의 확인 간격은
   `[backup] tick_secs`(기본 60초)다.
@@ -706,7 +706,7 @@ orbivisorctl import run web01 --name web --pool local --net lan  # 디스크를 
   실행하거나 지울 수 있다(노드가 없으면 `--force`). 웹의 지우기 단추는 `importing`에서도 누를 수 있고, 아직 실행 중이면
   서버가 `import_busy`로 거절한다.
 - **아키텍처.** 가져온 VM은 x86 `q35`다. aarch64(macOS) 노드에도 가져올 수는 있지만 켜려면 x86_64 노드가 필요하다.
-- 웹은 사이드바 "가져오기" 화면에서 한다(목록, "OVA 올리기" — 진행률, 이름은 파일 이름에서; "ESXi에서 가져오기" —
+- 웹은 가상 머신 › 가져오기 탭에서 한다(목록, "OVA 올리기" — 진행률, 이름은 파일 이름에서; "ESXi에서 가져오기" —
   호스트·포트·사용자·비밀번호·데이터센터로 연결 → 처음 보는 인증서면 지문을 보이고 "이 지문을 믿고 계속" → VM 고르기
   (잠금 경고, 읽지 못한 VM은 고를 수 없음) → 가져오기 이름 → 만들기, 비밀번호는 브라우저에 저장하지 않는다; 항목 화면 —
   원본 요약·경고, 이름·풀·CPU·메모리·펌웨어·디스크 버스·NIC 모델·네트워크 매핑·MAC 유지, 실행과 진행, 만든 VM 링크,
