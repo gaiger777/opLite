@@ -1,5 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams } from "react-router";
 
@@ -68,6 +69,19 @@ export function VmEditPage() {
   return <VmForm key={vm.id} vm={vm} initial={fromVm(vm)} />;
 }
 
+/**
+ * 섹션 안의 첫 틀린 입력. `aria-invalid`를 단 입력이 먼저이고, 없으면 `Field`의 오류 문장(`{id}-error`)이
+ * 가리키는 입력이다.
+ */
+function firstInvalid(section: HTMLElement): HTMLElement | null {
+  const invalid = section.querySelector<HTMLElement>("[aria-invalid=true]");
+  if (invalid) {
+    return invalid;
+  }
+  const error = section.querySelector<HTMLElement>("[id$='-error']");
+  return error ? document.getElementById(error.id.slice(0, -"-error".length)) : null;
+}
+
 /** VM 만들기(`vm` 없음)와 고치기 */
 function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const { t } = useTranslation();
@@ -88,6 +102,8 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const [machineChosen, setMachineChosen] = useState(false);
   // 고른 프리셋(만들 때만). "Windows 11"이면 그 뒤에 더하는 디스크는 SATA, NIC는 e1000e로 시작한다.
   const [preset, setPreset] = useState<Preset>("blank");
+  // 폼 값에 마지막으로 얹은 프리셋(템플릿은 값을 바꾸지 않으므로 빠진다). Windows에서 떠날 때 장치를 돌린다.
+  const [applied, setApplied] = useState<Preset>("blank");
   const windows = preset === "windows";
   // 화면을 떠나면 기다리던 볼륨 Task를 그만 기다리고 VM을 만들지 않는다.
   const abort = useRef<AbortController | null>(null);
@@ -178,11 +194,16 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       creating,
       (volumes.data ?? []).map((v) => v.name),
     );
-    setErrors(found);
+    // 오류를 바로 그려야 그 입력에 포커스를 줄 수 있다.
+    flushSync(() => setErrors(found));
     if (Object.keys(found).length > 0) {
-      // 오류가 있는 첫 단계로 옮긴다(긴 폼의 아래쪽 오류를 놓치지 않게).
+      // 오류가 있는 첫 단계로 옮기고 그 안의 첫 틀린 입력에 포커스를 준다(긴 폼·좁은 화면·화면 읽기 프로그램).
       const first = FORM_STEPS.find((step) => errorCounts(found)[step]);
-      document.getElementById(stepId(first ?? "general"))?.scrollIntoView?.({ block: "start" });
+      const section = document.getElementById(stepId(first ?? "general"));
+      section?.scrollIntoView?.({ block: "start" });
+      if (section) {
+        firstInvalid(section)?.focus({ preventScroll: true });
+      }
       return;
     }
     setBusy(true);
@@ -290,11 +311,15 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
               disabled={busy}
               onChange={(next) => {
                 setPreset(next);
-                if (next !== "template") {
-                  setValues((v) => applyPreset(next, v, initial));
+                // 템플릿은 폼 값을 바꾸지 않는다(돌아와도 입력이 남는다).
+                if (next !== "template" && next !== applied) {
+                  setValues((v) => applyPreset(next, applied, v));
+                  setApplied(next);
                   setErrors({});
                   // 프리셋이 머신을 정했으면 노드를 바꿔도 다시 고르지 않는다.
-                  setMachineChosen(next === "windows");
+                  if (next === "windows") {
+                    setMachineChosen(true);
+                  }
                 }
               }}
             />

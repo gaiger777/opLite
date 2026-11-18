@@ -86,13 +86,14 @@ export function VmMigrateDialog({
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const targets = migrationTargets(vm, nodes.data ?? []);
   const [chosen, setChosen] = useState<string | null>(initialNode ?? null);
-  // 고르지 않았거나 고른 노드가 후보에서 빠졌으면 첫 후보
-  const target = targets.find((n) => n.id === chosen) ?? targets[0];
-  // 팔레트가 고른 노드가 그 사이 후보에서 빠졌으면 말없이 바꾸지 않고 알린다.
+  // 팔레트가 고른 노드가 그 사이 후보에서 빠졌으면 다른 노드로 바꾸지 않고, 사용자가 다시 고를 때까지 보내지 않는다.
   const dropped =
-    target && chosen !== null && chosen !== target.id
-      ? nodes.data?.find((n) => n.id === chosen)?.name
+    chosen !== null && nodes.data !== undefined && !targets.some((n) => n.id === chosen)
+      ? (nodes.data.find((n) => n.id === chosen)?.name ?? chosen)
       : undefined;
+  // 고르지 않았으면 첫 후보
+  const target =
+    dropped !== undefined ? undefined : (targets.find((n) => n.id === chosen) ?? targets[0]);
   // 대화상자를 연 사이 VM이 멈추거나 옮기기 시작했을 수 있다.
   const able = availability(vm, "migrate", vmTasks);
   // 복사할 디스크와 스냅샷을 알 때까지 보내지 않는다.
@@ -154,9 +155,7 @@ export function VmMigrateDialog({
         )
       )}
       {dropped && (
-        <p className="text-sm text-warning-fg">
-          {t("migrate.nodeDropped", { node: dropped, target: target!.name })}
-        </p>
+        <p className="text-sm text-warning-fg">{t("migrate.nodeDropped", { node: dropped })}</p>
       )}
       <Field id="migrate-node" label={t("migrate.node")}>
         {(a11y) => (
@@ -167,6 +166,11 @@ export function VmMigrateDialog({
             onChange={(e) => setChosen(e.target.value)}
             {...a11y}
           >
+            {dropped !== undefined && (
+              <NativeSelectOption value="" disabled>
+                {t("migrate.chooseNode")}
+              </NativeSelectOption>
+            )}
             {targets.map((n) => (
               <NativeSelectOption key={n.id} value={n.id}>
                 {n.name}

@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
+import type { List } from "@/api/live";
 import type { Node, Principal, Vm } from "@/api/types";
 import { AppLayout } from "@/layout/AppLayout";
 import { resetTasks } from "@/tasks/tasks";
@@ -190,10 +191,30 @@ it("asks before starting a VM whose name only starts with the typed text", async
   await waitFor(() => expect(actions).toEqual([`start:${app.id}`]));
 });
 
+it("blocks the stop confirm when the VM stops while the dialog is open", async () => {
+  const { queryClient } = shell();
+  const { user } = await search("web 정지", "Stop web…");
+  await user.keyboard("{Enter}");
+  const confirm = await screen.findByRole("alertdialog", { name: "Stop web?" });
+  expect(within(confirm).getByRole("button", { name: "Stop" })).toBeEnabled();
+  // 그 사이 다른 사람이 VM을 껐다.
+  queryClient.setQueryData<List<Vm>>(["list", "vm"], {
+    revision: 99,
+    items: [vm("web", "stopped"), webDb, app],
+  });
+  await waitFor(() => expect(within(confirm).getByRole("button", { name: "Stop" })).toBeDisabled());
+  expect(confirm).toHaveTextContent("The VM is stopped.");
+  expect(actions).toEqual([]);
+});
+
 it("ignores the Enter that finishes Korean input", async () => {
   shell();
   const { box } = await search("start app", "Start app");
   fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+  expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
+  expect(actions).toEqual([]);
+  // Safari: 조합을 끝낸 Enter는 isComposing이 false이고 keyCode가 229다.
+  fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
   expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
   expect(actions).toEqual([]);
   fireEvent.keyDown(box, { key: "Enter" });

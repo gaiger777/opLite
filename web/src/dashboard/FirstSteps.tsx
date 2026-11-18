@@ -41,6 +41,9 @@ export function FirstSteps() {
   ];
   // 지금 할 단계: 끝나지 않은 첫 단계
   const current = steps.findIndex((s) => !s.done);
+  // 지금 단계를 할 수 없는 역할(operator의 풀 만들기)은 관리자에게 부탁하라고 하고, 그 단계에 기대는 뒤 단계의 버튼은
+  // 숨긴다(풀 없이 ISO 올리기를 열지 않게).
+  const blocked = current !== -1 && !steps[current]!.allowed;
   return (
     <section
       aria-labelledby={id}
@@ -75,7 +78,10 @@ export function FirstSteps() {
               {step.done && <span className="sr-only">{t("firstSteps.done")}</span>}
             </div>
             <p className="text-xs text-muted-foreground">{t(`firstSteps.${step.id}.hint`)}</p>
-            {!step.done && step.allowed && (
+            {blocked && i === current && (
+              <p className="mt-auto text-xs font-medium">{t(`firstSteps.${step.id}.askAdmin`)}</p>
+            )}
+            {!step.done && step.allowed && !(blocked && i > current) && (
               <div className="mt-auto flex flex-wrap items-center gap-2">
                 <Button size="sm" variant={i === current ? "default" : "outline"} asChild>
                   <Link to={step.to}>{t(`firstSteps.${step.id}.action`)}</Link>

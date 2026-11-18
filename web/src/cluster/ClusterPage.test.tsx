@@ -139,7 +139,10 @@ it("issues a join token and shows the command once", async () => {
       items: [NODE, { ...NODE, id: "n9", name: "node-new" }],
     }),
   );
-  expect(await within(dialog).findByText("node-new joined the cluster.")).toBeInTheDocument();
+  // 어느 토큰으로 들어왔는지는 모르므로 이 토큰의 노드라고 하지 않고 새 노드를 알린다.
+  expect(
+    await within(dialog).findByText("A node joined the cluster: node-new."),
+  ).toBeInTheDocument();
   expect(within(steps(dialog)).queryByText(/./, { selector: "[aria-current]" })).toBeNull();
   // 명령을 놓치지 않게 Esc나 바깥 클릭으로는 닫히지 않는다.
   expect(within(dialog).queryByRole("button", { name: "Close" })).not.toBeInTheDocument();

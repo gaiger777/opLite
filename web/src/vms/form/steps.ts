@@ -61,21 +61,23 @@ export const PRESETS = ["blank", "linux", "windows", "template"] as const;
 export type Preset = (typeof PRESETS)[number];
 
 /**
- * 프리셋을 폼 값에 채운다. 이름과 이미 고른 디스크·NIC·CD-ROM은 남기고 나머지는 `blank`(처음 값)에서 시작한다.
+ * 프리셋을 폼 값에 얹는다. 프리셋이 정하는 값만 바꾸고 나머지 입력은 그대로 둔다.
  * Windows 11은 계획 59의 미리 채우기(`windows11`)이고, Linux 서버는 게스트 에이전트와 cloud-init을 켠다.
+ * 빈 VM과 템플릿은 값을 바꾸지 않는다. `applied`(앞서 얹은 프리셋)가 Windows였으면
+ * 그 프리셋이 바꾼 디스크 버스(SATA)와 NIC 모델(e1000e)을 처음 값으로 돌린다.
  */
-export function applyPreset(
-  preset: Preset,
-  current: VmFormValues,
-  blank: VmFormValues,
-): VmFormValues {
-  const base: VmFormValues = {
-    ...blank,
-    name: current.name,
-    disks: current.disks,
-    cdroms: current.cdroms,
-    nics: current.nics,
-  };
+export function applyPreset(preset: Preset, applied: Preset, current: VmFormValues): VmFormValues {
+  if (preset === "template" || preset === applied) {
+    return current;
+  }
+  const base: VmFormValues =
+    applied === "windows"
+      ? {
+          ...current,
+          disks: current.disks.map((d) => (d.bus === "sata" ? { ...d, bus: "virtio-blk" } : d)),
+          nics: current.nics.map((n) => (n.model === "e1000e" ? { ...n, model: "virtio" } : n)),
+        }
+      : current;
   switch (preset) {
     case "windows":
       return windows11(base);

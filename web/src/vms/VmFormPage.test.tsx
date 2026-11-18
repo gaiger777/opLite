@@ -1528,3 +1528,36 @@ it("fills in a Linux server and deploys from a template instead of the form", as
   await user.click(within(list).getByRole("button", { name: "Deploy tmpl…" }));
   expect(await screen.findByRole("dialog", { name: "Deploy from tmpl" })).toBeInTheDocument();
 });
+
+it("keeps what was entered when the preset changes, also with arrow keys", async () => {
+  mockLists({ node: [NODE], vm: [] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("radio", { name: "Linux server" }));
+  await user.selectOptions(screen.getByLabelText("CPU model"), "max");
+  // 템플릿을 거쳐(화살표로) 다시 Linux: 입력이 남는다.
+  await user.click(screen.getByRole("radio", { name: "Linux server" }));
+  await user.keyboard("{ArrowRight}{ArrowRight}");
+  expect(screen.getByRole("radio", { name: "From a template" })).toBeChecked();
+  await user.keyboard("{ArrowLeft}{ArrowLeft}");
+  expect(screen.getByRole("radio", { name: "Linux server" })).toBeChecked();
+  expect(screen.getByLabelText("Name")).toHaveValue("web");
+  expect(screen.getByLabelText("CPU model")).toHaveValue("max");
+  // Windows를 지나쳐 오면 Windows 장치는 돌아간다.
+  const nic = screen.getByRole("group", { name: "Network interface 1" });
+  expect(within(nic).getByLabelText("Model")).toHaveValue("virtio");
+});
+
+it("moves focus to the first wrong input of the first step with errors", async () => {
+  mockLists({ node: [NODE], vm: [] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  const nic = screen.getByRole("group", { name: "Network interface 1" });
+  const mac = within(nic).getByLabelText("MAC address");
+  await user.type(mac, "zz");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  expect(mac).toHaveFocus();
+  expect(mac).toHaveAccessibleDescription("Use the form 52:54:00:12:34:56.");
+});

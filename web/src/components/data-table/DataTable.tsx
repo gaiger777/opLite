@@ -16,7 +16,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { ColumnMenu, ViewMenu } from "@/components/data-table/Toolbar";
 import { readCols, type TableState, type View, writeCols } from "@/components/data-table/state";
 import { ACTION_ICONS } from "@/components/icons";
-import { TableMessage } from "@/components/TableMessage";
+import { tableMessage, TableMessage } from "@/components/TableMessage";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -59,6 +59,8 @@ export interface Filter<T> {
 
 const PRIORITY_CLASS = { 1: "", 2: "max-lg:hidden", 3: "max-xl:hidden" } as const;
 const PHONE = "(max-width: 767px)";
+/** 목록 쿼리를 주지 않은 표 */
+const NO_QUERY = { isPending: false, isError: false, error: null };
 /** 한 글자 키가 이 안에서 눌렸으면 그 요소의 기본 동작에 맡긴다. */
 const INTERACTIVE = "a, button, select, [role=checkbox], [role=switch], [role=menuitem]";
 
@@ -408,7 +410,7 @@ export function DataTable<T>(props: Props<T>) {
         <ul aria-labelledby={props.labelledBy} className="flex flex-col gap-2">
           {(loading || rows.length === 0) && (
             <li className="text-center text-sm text-muted-foreground">
-              {loading ? t("common.loading") : props.empty}
+              {tableMessage(t, props.query ?? NO_QUERY, props.empty)}
             </li>
           )}
           {rows.map((row, index) => {
@@ -507,7 +509,7 @@ export function DataTable<T>(props: Props<T>) {
               rows.length === 0 && (
                 <TableMessage
                   colSpan={colSpan}
-                  query={props.query ?? { isPending: false, isError: false, error: null }}
+                  query={props.query ?? NO_QUERY}
                   empty={props.empty}
                 />
               )

@@ -176,6 +176,7 @@ export function VmConfirm({
   returnFocus?: RefObject<HTMLElement | null>;
 }) {
   const { t } = useTranslation();
+  const vmTasks = useTaskIndex().get(vm.id) ?? [];
   return (
     <>
       <ConfirmDialog
@@ -187,18 +188,25 @@ export function VmConfirm({
         returnFocus={returnFocus}
         onConfirm={() => onRun(vm, "force-stop")}
       />
-      {(["start", "stop", "reboot"] as const).map((action) => (
-        <ConfirmDialog
-          key={action}
-          open={which === action}
-          onOpenChange={(open) => !open && onClose()}
-          title={t(`vms.${action}Title`, { name: vm.name })}
-          description={t(`vms.${action}Description`)}
-          confirmLabel={t(`vms.action.${action}`)}
-          returnFocus={returnFocus}
-          onConfirm={() => onRun(vm, action)}
-        />
-      ))}
+      {(["start", "stop", "reboot"] as const).map((action) => {
+        // 확인 창을 연 사이 다른 사람이 VM을 켜거나 껐을 수 있다(`vm`은 watch로 늘 최신이다).
+        const able = availability(vm, action, vmTasks);
+        return (
+          <ConfirmDialog
+            key={action}
+            open={which === action}
+            onOpenChange={(open) => !open && onClose()}
+            title={t(`vms.${action}Title`, { name: vm.name })}
+            description={t(`vms.${action}Description`)}
+            confirmLabel={t(`vms.action.${action}`)}
+            confirmDisabled={!able.ok}
+            returnFocus={returnFocus}
+            onConfirm={() => onRun(vm, action)}
+          >
+            {!able.ok && <p className="text-sm text-muted-foreground">{t(able.reason)}</p>}
+          </ConfirmDialog>
+        );
+      })}
       {which === "snapshot" && (
         <VmSnapshotDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />
       )}

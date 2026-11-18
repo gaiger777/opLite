@@ -27,7 +27,15 @@ const COLUMNS: Column<Row>[] = [
   { id: "kind", header: "Kind", cell: (r) => r.kind, priority: 3 },
 ];
 
-function Harness({ rows = ROWS, pending = false }: { rows?: Row[]; pending?: boolean }) {
+function Harness({
+  rows = ROWS,
+  pending = false,
+  error,
+}: {
+  rows?: Row[];
+  pending?: boolean;
+  error?: Error;
+}) {
   const state = useTableState("demo", ["kind"]);
   return (
     <>
@@ -38,7 +46,7 @@ function Harness({ rows = ROWS, pending = false }: { rows?: Row[]; pending?: boo
         columns={COLUMNS}
         rowId={(r) => r.id}
         rowName={(r) => r.name}
-        query={{ isPending: pending, isError: false, error: null }}
+        query={{ isPending: pending, isError: error !== undefined, error }}
         empty="Nothing."
         labelledBy="demo-title"
         state={state}
@@ -262,6 +270,22 @@ it("draws cards on a phone", async () => {
     expect(cards[0]).not.toHaveTextContent("3 GiB");
     expect(within(cards[0]!).getByRole("button", { name: "Preview alpha" })).toBeInTheDocument();
     await expectNoAxeViolations(container, { disable: ["region"] });
+  } finally {
+    window.matchMedia = original;
+  }
+});
+
+it("says why the list failed on a phone, like the table does", async () => {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    ...original(query),
+    matches: query === "(max-width: 767px)",
+  })) as typeof window.matchMedia;
+  try {
+    renderPage(<Harness rows={[]} error={new Error("watch failed")} />);
+    const list = await screen.findByRole("list", { name: "Demo" });
+    expect(list).toHaveTextContent("watch failed");
+    expect(list).not.toHaveTextContent("Nothing.");
   } finally {
     window.matchMedia = original;
   }

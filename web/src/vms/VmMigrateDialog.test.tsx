@@ -76,12 +76,17 @@ it("says so when the node chosen in the palette is no longer a target", async ()
   renderPage(<VmMigrateDialog vm={web} initialNode="n3" onClose={() => {}} />, { as: OPERATOR });
   const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
   expect(
-    await within(dialog).findByText("node-c cannot take this VM now, so node-b is chosen instead."),
+    await within(dialog).findByText("node-c cannot take this VM now. Choose another node."),
   ).toBeInTheDocument();
-  expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2");
-  // 직접 고르면 알림이 없어진다.
-  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n7");
+  // 다른 노드를 대신 고르지 않고, 다시 고를 때까지 옮기지 않는다.
+  expect(within(dialog).getByLabelText("Target node")).toHaveValue("");
+  expect(within(dialog).getByRole("button", { name: "Migrate" })).toBeDisabled();
+  // 직접 고르면(첫 후보라도) 알림이 없어지고 옮길 수 있다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n2");
   expect(within(dialog).queryByText(/cannot take this VM now/)).not.toBeInTheDocument();
+  await waitFor(() =>
+    expect(within(dialog).getByRole("button", { name: "Migrate" })).toBeEnabled(),
+  );
 });
 
 it("migrates a running VM to the chosen node", async () => {

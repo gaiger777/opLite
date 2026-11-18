@@ -11,6 +11,7 @@ import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
 const VIEWER = { ...ADMIN, role: "viewer" as const };
+const OPERATOR = { ...ADMIN, role: "operator" as const };
 
 beforeEach(() => localStorage.clear());
 
@@ -357,6 +358,18 @@ it("walks a new cluster through its first steps", async () => {
   renderPage(<DashboardPage />, { as: VIEWER });
   await screen.findByText("1 / 1");
   expect(screen.queryByRole("region", { name: "First steps" })).not.toBeInTheDocument();
+});
+
+it("tells an operator to ask an admin for the pool instead of leaving them stuck", async () => {
+  mockLists({ node: [NODE] });
+  server.use(cluster("n1"));
+  renderPage(<DashboardPage />, { as: OPERATOR });
+  const steps = await screen.findByRole("region", { name: "First steps" });
+  const items = within(steps).getAllByRole("listitem");
+  expect(items[0]).toHaveAttribute("aria-current", "step");
+  expect(items[0]).toHaveTextContent("Ask an admin to create a storage pool.");
+  // 풀이 없으면 뒤 단계(ISO 올리기·VM 만들기)의 버튼도 없다.
+  expect(within(steps).queryByRole("link")).not.toBeInTheDocument();
 });
 
 it("puts alerts, the health strip and favorites first on a phone", async () => {

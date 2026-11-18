@@ -991,7 +991,8 @@
     "force": "Ignore placement rules",
     "forceHint": "Moves the VM even if it breaks hard placement rules or a restricted HA group. Node checks and memory still apply. The audit log records the broken rules.",
     "replicaNote": "This node holds a replica, so only what changed since the last replication is copied.",
-    "nodeDropped": "{{node}} cannot take this VM now, so {{target}} is chosen instead."
+    "nodeDropped": "{{node}} cannot take this VM now. Choose another node.",
+    "chooseNode": "Choose a node"
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
@@ -1680,7 +1681,8 @@
         "run": "Run the command on the new node",
         "wait": "Wait for the node"
       },
-      "joined": "{{name}} joined the cluster.",
+      "joined_one": "A node joined the cluster: {{names}}.",
+      "joined_other": "Nodes joined the cluster: {{names}}.",
       "waiting": "Waiting for the new node to join…"
     }
   },
@@ -3128,7 +3130,8 @@
     "pool": {
       "title": "Create a storage pool",
       "hint": "Disks, ISOs and backups live in storage pools.",
-      "action": "Create a pool"
+      "action": "Create a pool",
+      "askAdmin": "Ask an admin to create a storage pool."
     },
     "media": {
       "title": "Upload an ISO or get an image",

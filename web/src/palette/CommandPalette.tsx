@@ -180,7 +180,8 @@ function PaletteBody({
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
     // 한글 입력의 마지막 글자를 끝내는 Enter는 항목을 실행하지 않는다.
-    if (items.length === 0 || e.nativeEvent.isComposing) {
+    // Safari는 compositionend를 keydown보다 먼저 보내 그 Enter의 isComposing이 false이고 keyCode만 229다.
+    if (items.length === 0 || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
       return;
     }
     switch (e.key) {

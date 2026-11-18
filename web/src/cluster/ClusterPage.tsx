@@ -238,7 +238,7 @@ function JoinSteps({ current }: { current: JoinStep }) {
 
 /**
  * 발급한 조인 URL과 합류 기다리기. 서버는 URL을 다시 보여 주지 않으므로 "완료"로만 닫는다. 열 때의 노드 목록에 없던
- * 노드가 watch로 나타나면 합류했다고 알린다.
+ * 노드가 watch로 나타나면 클러스터에 노드가 들어왔다고 알린다(어느 토큰인지는 모른다).
  */
 function JoinTokenDialog({
   token,
@@ -258,8 +258,10 @@ function JoinTokenDialog({
   if (known === null && nodes.data) {
     setKnown(new Set(nodes.data.map((n) => n.id)));
   }
-  const joined = known && nodes.data?.find((n) => !known.has(n.id));
-  const step: JoinStep = joined ? "done" : copied ? "wait" : "run";
+  // 서버는 노드가 어느 토큰으로 합류했는지 알려 주지 않는다. 다른 토큰으로 들어온 노드일 수 있으므로 새로 나타난
+  // 노드를 모두 이름으로 알리고 이 토큰의 노드라고 하지 않는다.
+  const joined = known ? (nodes.data ?? []).filter((n) => !known.has(n.id)) : [];
+  const step: JoinStep = joined.length > 0 ? "done" : copied ? "wait" : "run";
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent
@@ -290,10 +292,13 @@ function JoinTokenDialog({
         <p className="text-xs text-muted-foreground">{t("cluster.commandNote")}</p>
         {/* 합류를 화면 읽기 프로그램에 알린다(머리줄 LiveBadge의 status와 겹치지 않게 role 없이). */}
         <p aria-live="polite" className="text-sm">
-          {joined ? (
+          {joined.length > 0 ? (
             <span className="flex items-center gap-1 font-medium text-success-fg">
               <Check aria-hidden className="size-4" />
-              {t("cluster.join.joined", { name: joined.name })}
+              {t("cluster.join.joined", {
+                names: joined.map((n) => n.name).join(", "),
+                count: joined.length,
+              })}
             </span>
           ) : (
             <span className="text-muted-foreground">{t("cluster.join.waiting")}</span>
