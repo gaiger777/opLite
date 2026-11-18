@@ -355,3 +355,8 @@ Prometheus 누적 카운터·OpenMetrics, Graphite·InfluxDB 밀어 보내기, �
 - **권한(웹)**: `permissions.ts`에 `alert-rule`(누구나 읽고 admin만 씀)과 `notification-target`(계정 종류처럼 admin만)을 더했다.
 - **시험**: 시험 설정(`test/setup.ts`)이 `@/charts/TimeChart`를 선 이름만 보이는 가짜로 바꾼다. 기본 MSW 처리기에 빈 `/metrics/cluster`·`/alerts`를 더해 지금 대시보드 시험이 그대로 돈다. 새 시험은 역할·이름으로 찾는다(`radiogroup "Time range"`, `img` 요약, `region` 위젯, `meter` 풀). 실제 uPlot은 vite preview와 Chromium(가짜 API)으로 밝음·어두움 두 테마에서 그려지는 것을 눈으로 확인했다.
 - **번들**: 처음 내려받는 JS는 1,315.8 kB → 1,384.8 kB(gzip 381.3 → 398.3 kB, +17.0 kB — 새 화면과 en·ko 글), CSS 63.4 → 66.1 kB. uPlot은 따로 `TimeChart` 조각(53.2 kB, gzip 23.3 kB, CSS 1.6 kB)으로 차트를 그릴 때만 내려받는다. 단위 표시(`charts/format.ts`)를 조회 훅에서 떼어 차트 조각이 react-query를 끌고 오지 않게 했다.
+
+### 스테이지 8 (문서)
+
+- **자리**: 설계 §16의 "README"는 지금 README가 짧은 첫 장이라 기능 표와 상태 줄만 고치고, 내용은 가이드 `docs/guide/cluster.md`의 "지표"(넓힘)와 새 절 "알림"·"Prometheus"에 두었다. 디스크 닳음·SD 카드 안내(§11)와 기록을 잃는 경우(§5 내려 깔기, §11 HA)도 README가 아니라 가이드의 "기록 파일"·"한계"에 있다.
+- **Prometheus 예**: `scrape_configs`는 웹 설정 칸(`settings/PrometheusSection.tsx`)의 예와 같은 꼴에 노드마다 대상을 둔 것이고, Grafana 예 쿼리는 `orbivisor_vm_info` 이어 붙이기, 클러스터 값의 `max without(instance)`, 공유 풀의 `max by(pool)`를 보인다.

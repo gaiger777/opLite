@@ -1,6 +1,6 @@
 # 클러스터 운영
 
-제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 지표. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [제어부 가용성](#제어부-가용성)
 - [앞단 프록시와 VIP (API 가용성)](#앞단-프록시와-vip-api-가용성)
@@ -8,6 +8,8 @@
 - [클러스터 통신 다중 링크](#클러스터-통신-다중-링크)
 - [노드 유지보수와 비우기](#노드-유지보수와-비우기)
 - [지표](#지표)
+- [알림](#알림)
+- [Prometheus](#prometheus)
 
 ## 제어부 가용성
 
@@ -614,9 +616,15 @@ orbivisorctl node maintenance node1 on   # VM은 옮기지 않고 배치만 막�
 
 ## 지표
 
-노드마다 5초마다 그 노드와 그 노드에서 도는 VM의 사용량을 재고 메모리에 1시간(시리즈마다 720점) 둔다. Raft에 쓰지
-않고 디스크에도 쓰지 않는다. 다른 노드의 지표는 읽을 때 노드 사이 RPC로 모은다(감사 로그와 같은 방식). 측정기는 이 값으로
-부하 요약(1분·5분 CPU, 메모리, VM마다 CPU·RSS)도 만들어 리스 갱신으로 리더에 보낸다(위 "최적 배치").
+노드마다 5초마다 그 노드와 그 노드에서 도는 VM의 사용량을 재어 메모리에 1시간(시리즈마다 720점) 두고, 분마다
+`{data_dir}/metrics`의 **기록 파일**(노드 로컬, 크기가 정해진 RRD)에 옮겨 1년까지 남긴다(Proxmox VE의 RRD 그래프,
+vSphere의 성능 차트와 같은 자리). Raft에는 쓰지 않는다. 다른 노드의 지표는 읽을 때 노드 사이 RPC로 묻는다(감사 로그와
+같은 방식). 측정기는 이 값으로 부하 요약(1분·5분 CPU, 메모리, VM마다 CPU·RSS)도 만들어 리스 갱신으로 리더에 보낸다(위
+"최적 배치"). 기록 조회·클러스터 요약·Prometheus 설정은 모든 노드가 이 버전이어야 한다(노드가 알리는 기능
+`metrics-history` — 옛 노드의 기록 조회와 `prometheus` 설정 바꾸기는 **409** `cluster_upgrading`, 클러스터 요약에서는
+`unsupported`). 설계는 [지표 기록·대시보드·알림·Prometheus 설계](../superpowers/specs/2026-11-18-dashboard-metrics-notifications-design.md).
+
+### 측정
 
 ```bash
 orbivisorctl node stats            # 노드마다 마지막 점
@@ -626,7 +634,7 @@ orbivisorctl vm stats web          # VM의 마지막 점(마이그레이션 앞�
 # TIME                  CPU    MEMORY  DISK READ  DISK WRITE  READ IOPS  WRITE IOPS  NET RX    NET TX
 # 2026-11-11T06:30:05Z  48.7%  1.1GiB  0B/s       512.0KiB/s  0.0        12.4        2.0KiB/s  1.1KiB/s
 orbivisorctl node stats --watch    # 5초마다 새 점만 다시 읽어 새 표를 이어 찍는다(Ctrl-C로 끝냄, vm stats도)
-orbivisorctl -o json vm stats web  # 응답 그대로(남은 모든 점)
+orbivisorctl -o json vm stats web  # 응답 그대로(메모리에 남은 모든 점)
 orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Lines)
 ```
 
@@ -640,11 +648,13 @@ orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Line
   `query-blockstats`의 모든 VM 디스크 합(바이트/초와 IOPS), 네트워크는 tap NIC 카운터의 합을 게스트 기준으로 바꾼
   것이다(받기 = tap의 보내기). 사용자 모드 NIC(`user`)는 tap이 없어 세지 않고, tap NIC가 없으면(macOS) 네트워크는
   없다. `Running`·`Paused` VM만 잰다.
+- **풀 값.** 그 노드에서 준비된(`ready`) 풀의 쓴 양·전체를 분마다 기록한다(풀 마운터가 마지막으로 잰 값). 공유 풀은
+  여러 노드가 같은 값을 따로 기록한다.
 - **비율과 빈 값.** 비율은 직전 측정과의 차이를 걸린 시간(단조 시계)으로 나눈다. 첫 측정(orbivisord 시작, VM 시작·붙기,
   QEMU pid 바뀜, 카운터가 줄어듦)은 기준만 잡으므로 VM의 첫 점은 켠 뒤 5~10초에 생긴다. 읽지 못한 값은 `null`(표는
   `-`)이다. `query-blockstats`가 1초 안에 답하지 않으면 그 VM의 디스크 값만 `null`이고, 실패 경고는 VM마다 10분에 한 번
   남는다.
-- **API.** `GET /api/v1/metrics/nodes?since=`(모든 노드, `{"nodes":[{"node","samples"}],"unreachable","unsupported"}`,
+- **마지막 점 API.** `GET /api/v1/metrics/nodes?since=`(모든 노드, `{"nodes":[{"node","samples"}],"unreachable","unsupported"}`,
   노드 이름 순), `GET /api/v1/nodes/{key}/metrics?since=`(노드 하나, `{"node","samples"}`), `GET /api/v1/vms/{key}/metrics?since=`
   (`{"vm","samples","unreachable","unsupported"}` — 위트니스를 뺀 모든 노드에 물어 시각 순으로 합친다). 노드 읽기는 노드
   읽기 권한, VM 읽기는 VM 읽기 권한(viewer도 된다)이다. `since`는 그 노드 시계의 유닉스 밀리초 `t`이고 그보다 뒤의
@@ -654,7 +664,406 @@ orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Line
   `warning: no metrics from: …`, `note: these nodes do not report metrics yet: …`를 쓴다). 노드 하나 읽기는 그 노드가
   꺼졌거나(`node "…" is offline`) 닿지 않으면 **503** `node_unreachable`, 옛 노드면 **409** `cluster_upgrading`,
   위트니스면 **409** `node_unavailable`이다. 노드 기능 목록(`status.features`)에 `metrics`가 있다.
-- **한계.** orbivisord를 다시 시작하면 그 노드의 기록이 비고, 꺼진 노드의 기록은 읽을 수 없다. 측정 간격(5초)과
-  보관 시간(1시간)은 바꿀 수 없다. Prometheus 내보내기, 경보, 게스트 안의 지표, 디스크·NIC마다 나눈 값은 없다. 웹 차트는
-  다음 계획이다. vCPU 수와 NIC 목록은 지금 VM 스펙에서 읽으므로, 다시 시작해야 적용되는 변경(코어 수, NIC 더하기) 뒤
-  VM을 다시 시작하기 전까지는 CPU %가 새 vCPU 수로 나뉘고 네트워크가 `null`일 수 있다.
+
+### 기록 파일
+
+분마다(`[metrics] flush_secs`) 메모리의 지난 점을 시리즈마다 파일 하나에 옮긴다. 위트니스는 기록하지 않는다.
+
+| 파일 | 내용 | 크기 |
+|---|---|---|
+| `{data_dir}/metrics/node.rrd` | 이 노드(9칸) | 376 KiB |
+| `{data_dir}/metrics/vm/{VM id}.rrd` | 이 노드가 주인인 VM(8칸) | 336 KiB |
+| `{data_dir}/metrics/pool/{풀 id}.rrd` | 이 노드에서 준비된 풀(2칸, 풀 id라서 이름을 바꿔도 이어진다) | 92 KiB |
+
+| 층 | 간격 × 칸 | 기간 | 칸마다 |
+|---|---|---|---|
+| `raw5s` | 5초 × 720 | 1시간 | 값 하나 |
+| `min1` | 1분 × 1440 | 1일 | 평균·최대·최소 |
+| `min30` | 30분 × 336 | 1주 | 평균·최대·최소 |
+| `hour6` | 6시간 × 1460 | 1년 | 평균·최대·최소 |
+
+- **크기가 늘지 않는다.** 파일은 만들 때 전체 크기로 만들고(모르는 값 NaN으로 채움) 그 뒤로는 제자리에서 덮어 쓴다. 칸
+  자리는 시각으로 정하므로(칸 번호 = 유닉스 시각 ÷ 간격, 자리 = 번호 mod 칸 수) 모든 노드의 칸 경계가 같다. VM이 100개인
+  노드는 약 34 MB다. 디렉터리는 0700, 파일은 0600이다.
+- **합치기.** `min1` 칸은 그 분의 5초 점 12개로 만들고, 아는 값이 절반 미만이면 그 칸은 모름이다. `min30`·`hour6` 칸은 닫힐
+  때 `min1` 층에서 다시 읽어 만든다(따로 누산기가 없어 재시작 중간에 잃는 것이 없다). 평균은 아는 칸 수로 가중하고, 최대는
+  최대의 최대, 최소는 최소의 최소다.
+- **빈 칸.** 노드가 꺼졌거나 orbivisord가 멈췄던 구간, 읽지 못한 값은 모름(NaN)으로 남고 API·CLI는 `null`, 차트는 끊어
+  그린다. 0과 다르다.
+- **전원이 나가도.** 쓰기 순서는 (1) 모든 파일에 새 칸 → (2) 모두 `fdatasync` → (3) 머리(512 B 사본 둘, 번갈아 쓰고 순번과
+  SHA-256 검사합을 담음) → 다시 `fdatasync`다. 머리는 데이터가 디스크에 닿은 뒤에만 그 칸을 가리키므로 잃는 것은 마지막
+  쓰기 주기(기본 1분)뿐이다. 머리 사본이 둘 다 깨졌으면 `{name}.rrd.corrupt`로 옮기고 새로 만든다(경고, 지우지 않음).
+- **다시 시작.** orbivisord가 뜨면 파일의 `raw5s` 층(지난 1시간)을 메모리로 되돌려 넣는다. 그래서 1시간 차트와 정확한
+  p50·p95가 재시작 뒤에도 이어지고, 멈췄던 동안은 `null`이다. 그동안 닫혔어야 할 `min1`·`min30`·`hour6` 칸은 남은 고운
+  층에서 메운다. 멈출 때(`systemctl stop`)는 마지막으로 한 번 더 쓴다.
+- **시계가 뛰면.** 점의 시각은 노드 벽시계다. 앞으로 뛰면 공백과 같다. 1시간 미만 뒤로 가면 이미 쓴 칸 앞의 점은 파일에
+  쓰지 않고(경고 한 번, 메모리 1시간 기록에는 보임) 시계가 따라잡으면 이어 쓴다. 1시간 넘게 뒤로 가면(RTC가 틀렸던
+  부팅으로 미래 시각에 쓴 칸) 그 미래 칸을 층마다 지우고 지금부터 다시 쓴다(경고). NTP를 쓰기를 권한다.
+- **VM을 따라간다.** VM 기록의 주인은 VM이 도는 노드(`status.node`, 없으면 `spec.node`)다. 각 노드는 10분마다, 그리고 VM이
+  이 노드를 떠난 것을 보면 30초 뒤에 자기 `vm/*.rrd`를 훑어, 주인이 다른 노드인 VM의 파일을 그 노드로 보낸다(파일 하나,
+  노드 사이 RPC). 받은 노드는 칸 단위로 합치고(자기 칸이 모름일 때만 받은 값을 씀 — 마이그레이션 중 두 노드가 함께 잰
+  몇 초를 두 번 세지 않는다) 디스크에 쓴 뒤에 답하고, 그 뒤에만 보낸 노드가 지운다. 받는 노드가 꺼졌거나 옛 버전이거나
+  기록을 껐으면 파일을 두고 다음 차례에 다시 한다. 아직 이 노드에서 재는(마지막 점이 30초 안인) VM은 보내지 않는다.
+  라이브·꺼진 마이그레이션, 비우기, HA 복구 뒤 옛 노드가 돌아온 경우, 정해진 노드 바꾸기가 모두 같은 길이다.
+- **지우기.** Raft에 없는 VM·풀의 파일은 계획 59의 상태 디렉터리 정리와 같은 규칙으로 지운다: 두 차례 연속 후보이고,
+  리더 확인(`read_index`)이 성공하고, 그 id를 대상으로 하는 끝나지 않은 Task가 없을 때다. `node.rrd`와 옆으로 옮긴 파일
+  (`.corrupt`·`.v{n}`)은 지우지 않는다.
+- **형식 버전.** 머리에 형식 버전과 칸 목록이 있어, 다음 버전이 칸을 더하면 열 때 새 배치로 옮긴다(같은 칸은 그대로).
+  더 새 형식의 파일(orbivisord를 내려 깐 경우)은 `{name}.rrd.v{n}`으로 옮기고 새로 시작한다 — 내려 깔면 기록을 잃는다.
+
+**설정.** `/etc/opl/opld.toml`(노드마다):
+
+```toml
+[metrics]
+history = true    # false면 파일을 쓰지 않고 메모리 1시간만(조회는 1시간까지만 값이 있다)
+flush_secs = 60   # 파일에 옮기는 주기(60~600초). 전원이 나가면 이만큼 잃는다
+```
+
+- **디스크 닳음.** VM 파일 하나는 쓰기 주기마다 약 3 × 4 KiB 페이지와 `fdatasync` 둘을 쓴다. VM 100개인 노드는 하루 약
+  1.7 GB, 해마다 약 0.6 TB로 보통 SSD(수백 TBW)에는 작고, 파일 크기가 바뀌지 않아 파일 시스템 저널 쓰기는 거의 없다.
+  **SD 카드·USB 메모리로 부팅한 노드**는 `flush_secs = 600`(쓰기 약 1/8, 대가로 전원이 나가면 10분을 잃음)이나
+  `history = false`를 쓴다. `data_dir`을 SSD에 두면 걱정할 일이 없다.
+
+### 기록 조회
+
+```bash
+orbivisorctl node stats node1 --range day     # 노드 하나의 하루 요약(--range 없으면 지난 1시간)
+# 2026-11-17T09:00:00Z .. 2026-11-18T09:00:00Z (tier min1, step 5m, 288 points)
+# FIELD       AVG        MAX        MIN       P50~       P95~
+# cpu         12.4%      88.0%      1.2%      9.8%       31.5%
+# mem_used    6.1GiB     7.9GiB     5.8GiB    6.0GiB     7.2GiB
+# ...
+orbivisorctl vm stats web --range week        # VM(주인 노드에 묻는다)
+orbivisorctl pool stats nas --range month     # 풀(그 풀이 준비된 노드 하나에 묻는다)
+orbivisorctl vm stats web --from 2h           # 지금부터 2시간 전까지. --from·--until은 2h·7d, 유닉스 ms, RFC 3339
+orbivisorctl vm stats web --from 2026-11-18T01:00:00Z --until 2026-11-18T03:00:00Z --points 120
+orbivisorctl -o json node stats node1 --range year   # 응답 그대로(열 배열)
+```
+
+- **범위.** `--range hour|day|week|month|year`(1개월은 30일, 1년은 365일, 지금에서 끝남)이거나 `--from`(+`--until`, 없으면
+  지금)이다. 범위는 366일까지, `--points`는 1~1000(기본 300)이다. 범위를 주지 않은 `vm stats`·`node stats`(노드 없이)는
+  지금처럼 마지막 점이고, `--watch`는 범위와 함께 쓰지 않는다.
+- **층 고르기.** 범위가 그 층의 기간 안에 드는 가장 고운 층을 고른다(1시간 → `raw5s`, 1일 → `min1`, 1주 → `min30`, 그 밖 →
+  `hour6`, 시작이 층에 남은 기간보다 이르면 한 층 거칠게). 그 뒤 칸을 `points` 안으로 묶는다(평균은 아는 칸의 평균, 최대의
+  최대, 최소의 최소). 표의 첫 줄이 고른 층과 한 점의 간격이다.
+- **요약 값.** 칸마다 범위 전체의 평균·최대·최소(점 수와 상관없이 고른 층 전체로 셈)와 p50·p95다.
+  - **지난 1시간 안의 범위**는 5초 원본으로 셈한 **정확한** 백분위다(`approx: false`, 표 머리 `P50`·`P95`).
+  - **더 긴 범위**는 고른 층의 칸 평균으로 셈한 **근사**다(`approx: true`, 표 머리 `P50~`·`P95~`, 웹 `p95 ≈`). 평균으로 셈하므로
+    1분보다 짧은 봉우리를 낮게 본다 — 짧은 봉우리는 MAX를 본다.
+  - 재시작·마이그레이션 직후처럼 앞쪽 기록이 없으면 `covered_from`이 아는 첫 칸이다(표 끝 `note: no history before …`).
+- **API.** `GET /api/v1/nodes/{key}/metrics/history`, `/vms/{key}/metrics/history`, `/storage-pools/{key}/metrics/history`
+  (`range=` 또는 `from=`·`until=` 유닉스 ms, `points=`, 둘 다 없으면 지난 1시간 — 그 종류의 읽기 권한). 응답은
+  `{"tier","step_ms","start","columns":{"cpu":{"avg":[…],"max":[…],"min":[…]},…},"stats":{…},"pct":{"cpu":{"p50","p95","approx"}},"covered_from"?}`
+  이고 점 `i`의 시각은 `start + i × step_ms`, 모름은 `null`이다. 단위는 CPU %, 메모리·파일 시스템·RSS·풀 MiB, 디스크·
+  네트워크 바이트/초, IOPS /초다. 노드 기록은 그 노드에, VM 기록은 VM의 주인 노드 **하나에만**, 풀 기록은 그 풀이 준비된
+  노드(이 노드 먼저, 그다음 이름 순) 하나에 5초까지 묻는다.
+- **오류.** **400** `invalid_request`(`range`와 `from`을 함께, `until`만, 순서가 틀림, 366일 넘음, `points` 범위 밖, 모르는
+  매개변수), **404** `not_found`, **409** `cluster_upgrading`(그 노드가 옛 버전 — `node "x" does not keep metrics history yet;
+  upgrade it first`), **409** `node_unavailable`(위트니스의 노드 기록), **409** `pool_unavailable`(풀이 준비된 노드가 없음),
+  **503** `node_unreachable`(꺼졌거나 5초 안에 답하지 않음 — `node "x" did not answer: …`).
+
+### 클러스터 요약
+
+```bash
+orbivisorctl node stats --range day           # 노드 이름 없이 범위를 주면 클러스터 요약
+# cluster (3 nodes): 2026-11-17T09:00:00Z .. 2026-11-18T09:00:00Z (tier min1, step 12m, 120 points)
+# FIELD       AVG      PEAK
+# cpu         18.2%    61.0%
+# ...
+# NODE    CPUS  CPU    MEMORY           DISK READ  DISK WRITE  NET RX    NET TX
+# node1   16    22.1%  24.0GiB/62.0GiB  1.2MiB/s   3.4MiB/s    2.1MiB/s  1.8MiB/s
+# ...
+# TOP VM  NODE    CPU    MEMORY
+# db      node2   71.3%  15.8GiB
+# ...
+# POOL    KIND    USED     TOTAL    USE
+# nas     shared  1.2TiB   4.0TiB   30.0%
+```
+
+- `GET /api/v1/metrics/cluster?range=&points=`(기본 120점, 노드 읽기 권한)은 요청을 받은 노드가 위트니스를 뺀 온라인 노드에
+  32개씩 함께 묻는다(노드마다 자기 노드 열의 평균과 범위 평균 CPU 상위 VM 10개, 약 5 KB). 리더를 거치지 않는다.
+- **클러스터 열**은 노드 열을 칸끼리 더한 것이다: CPU는 코어 수로 가중한 %, 나머지(메모리·디스크·네트워크·파일 시스템)는
+  합이다. 최대·최소 열은 없으므로 CLI의 `PEAK`와 웹 범례의 최대·최소는 그 평균 열의 최대·최소다.
+- **노드 줄**은 노드마다 범위 평균이고, 20개가 넘으면 범위 평균 CPU 상위 20개다(`node_count`는 더한 노드 수). **상위 VM**은
+  모든 노드의 후보를 합친 10개(지운 VM은 뺌), **풀**은 Raft의 지금 값이다(공유 풀은 한 노드의 값, 노드 로컬 풀은 준비된
+  노드의 합).
+- 같은 조건의 요약은 그 API 노드에서 10초 동안 다시 쓰고, 한 API 노드의 요약은 한 번에 하나만 모은다(대시보드를 연
+  사람이 많아도 노드에 묻는 수가 늘지 않는다).
+- 답하지 않은 노드는 `unreachable`, 옛 노드는 `unsupported`, 시계가 크게 어긋나 다른 칸 경계로 답한 노드는 `skewed`에 이름이
+  들어가고 열·줄에서 빠진다(CLI는 stderr `warning: no metrics history from: …`, `note: these nodes do not keep metrics
+  history yet: …`, `warning: left out because their clock is far off: …`). 요약 자체는 노드 문제로 실패하지 않는다.
+
+### 웹 화면
+
+- **대시보드.** 지금 카드(노드·VM 수, 자원 합) 아래에 활성 경보 위젯(심각도 순, 30초마다, "경보 모두 보기")과 풀 사용률
+  막대(85 %를 넘으면 경고색), **클러스터 부하** 차트 넷(CPU·메모리·디스크·네트워크, 범위 고르기 1시간·1일·1주·1개월·1년),
+  **노드 부하**(범위 평균, 20개 넘으면 가장 바쁜 20개)와 **상위 VM** 10개가 있다. 범위를 바꾸면 노드 부하·상위 VM도 그
+  범위가 된다. 넣지 못한 노드는 차트 아래 한 줄로 알린다(답하지 않음·옛 버전·시계가 어긋남).
+- **노드 상세**(`/nodes/{이름}`, 노드 목록·노드 부하 위젯의 이름을 누름). 머리(상태·업데이트·인터페이스·디스크·펜싱 동작),
+  차트 넷(범위 고르기), 그 노드의 VM 표다. 위트니스는 기록이 없다고 안내한다.
+- **VM "지표" 탭**(`/vms/{이름}?tab=metrics`, 상위 VM 위젯의 이름을 누름). CPU·메모리(RSS)·디스크(읽기·쓰기)·네트워크 차트
+  넷이다. IOPS는 차트에 없고 CLI·API와 경보 규칙에서 쓴다.
+- **차트.** 평균 선과 최대~최소 사이의 옅은 띠를 그리고, 모르는 칸은 끊어 그린다. 범례 표에 칸마다 평균·최대·최소와
+  (있으면) p50·p95를 둔다 — 근사면 `p50 ≈`·`p95 ≈`와 "평균값으로 셈해 짧은 봉우리를 낮게 봅니다"를 적고, 앞쪽 기록이 없으면
+  "… 전의 기록은 없습니다"를 적는다. 1시간 범위는 5초마다, 그 밖은 60초마다 다시 읽는다. 차트마다 요약을 담은 접근성
+  이름과 "표로 보기"(같은 값의 표)가 있고, 밝음·어두움 테마를 따른다. 범위는 주소의 `?range=`에 남는다.
+
+### 한계
+
+- 측정 간격(5초)과 층(5초·1분·30분·6시간)은 바꿀 수 없다. 디스크·NIC마다 나눈 값, 게스트 안의 지표(파일 시스템 사용량
+  등), 기록 내보내기(CSV), 지표 밀어 보내기(Graphite·InfluxDB), 사용자 정의 대시보드는 없다.
+- 1시간보다 긴 범위의 p50·p95는 평균으로 셈한 근사다(분 단위보다 짧은 봉우리를 낮게 봄).
+- 마이그레이션 직후 기록이 새 주인 노드로 넘어가기 전(최대 약 10분)에는 기록 조회의 앞쪽이 비어 보인다(`covered_from`).
+  그동안 지난 1시간은 마지막 점 API(`vm stats`, 모든 노드에 묻는다)로 이어 보인다.
+- 꺼진 노드에 있는 기록은 읽을 수 없다. 죽은 노드에서 HA로 복구한 VM의 옛 기록은 그 노드가 돌아와야 새 주인에게 넘어가고,
+  돌아오지 않으면 잃는다. 지운 노드의 노드 기록은 함께 사라진다.
+- orbivisord를 내려 깔면(더 옛 형식) 기록 파일을 옆으로 옮기고 새로 시작한다.
+- 공유 풀은 그 풀을 쓰는 노드마다 같은 기록을 따로 둔다(파일 92 KiB). 노드 로컬 풀의 기록 조회는 노드 하나의 것이다(노드를
+  고르는 매개변수가 없다).
+- vCPU 수와 NIC 목록은 지금 VM 스펙에서 읽으므로, 다시 시작해야 적용되는 변경(코어 수, NIC 더하기) 뒤 VM을 다시 시작하기
+  전까지는 CPU %가 새 vCPU 수로 나뉘고 네트워크가 `null`일 수 있다.
+
+## 알림
+
+**경보 규칙**(무엇을 언제)과 **알림 대상**(어디로)을 따로 만든다. 규칙이 참인 채 정한 시간이 지나면 그 규칙의 대상들로
+알림을 보내고, 풀리면 해제 알림을 보낸다(Proxmox VE의 알림 대상·매처, vSphere의 알람·동작과 같은 자리). 모든 노드가 이
+버전이어야 한다(노드가 알리는 기능 `notifications` — 아니면 규칙·대상 만들기·바꾸기·지우기는 **409** `cluster_upgrading`,
+목록에 노드 이름). 옛 노드가 섞인 동안 그 노드의 노드 경보는 비어 보인다.
+
+### 알림 대상
+
+```bash
+# 메일(SMTP). 비밀번호는 묻는다(터미널이 아니면 표준 입력에서 한 줄)
+orbivisorctl notify target create ops-mail smtp --host smtp.example.com --port 587 --tls starttls \
+  --user alerts@example.com --password --from alerts@example.com --to ops@example.com --to oncall@example.com
+# Slack(들어오는 webhook URL 자체가 비밀이므로 --url -로 묻는다)
+orbivisorctl notify target create ops-slack webhook --format slack --url -
+# ntfy·Gotify(토큰을 묻는다), 일반 JSON(헤더 값을 묻는다), 사설 CA
+orbivisorctl notify target create phone webhook --format ntfy --url https://ntfy.example.com/orbivisor --token
+orbivisorctl notify target create hook webhook --url https://hooks.example.com/orbivisor --header X-Api-Key --ca-file corp-ca.pem
+orbivisorctl notify target test ops-mail      # 시험 알림을 한 번(꺼진 대상도) — 실패하면 오류로 끝난다
+orbivisorctl notify target list               # NAME KIND ENABLED DESTINATION
+orbivisorctl notify target get ops-slack      # 비밀은 있는지만(has_password·has_token·헤더 이름), URL은 줄여서
+orbivisorctl notify target set ops-mail --to ops@example.com --disable
+orbivisorctl notify target delete ops-mail    # 쓰는 규칙이 있으면 409 in_use(규칙 이름)
+```
+
+- **SMTP.** `--tls starttls`(기본, `--port` 기본 587)·`tls`(보통 `--port 465`)·`none`(127.0.0.1의 로컬 중계용 평문)이다. 서버 인증서는 OS 신뢰 저장소로
+  확인한다. `--user`가 없으면 인증하지 않는다. 받는 주소는 20개까지, 본문은 일반 텍스트, 제목은
+  `[Orbivisor {클러스터}] FIRING critical: {규칙} on {대상}`(해제는 `RESOLVED`, 이벤트는 `EVENT`, 시험은 `TEST`)이다.
+- **webhook.** HTTPS(또는 HTTP) POST다. `--ca-file`이 있으면 그 CA만 믿고, 없으면 OS 신뢰 저장소다. 사설 주소도 된다(사내
+  대상). 헤더는 16개까지(`Host`·`Content-Length`·`Transfer-Encoding`·`Connection`은 안 됨). 형식(`--format`):
+
+| 형식 | 본문 | 비고 |
+|---|---|---|
+| `json`(기본) | `{"version":1,"cluster","state":"firing\|resolved\|event\|test","severity","rule","subject":{"kind","id","name","node"},"value","threshold","since","at","title","detail"}` | 시각은 유닉스 ms, 없는 칸은 `null` |
+| `slack` | `{"text":"*제목*\n본문"}` | Slack 들어오는 webhook, Mattermost·Rocket.Chat도 |
+| `teams` | `{"type":"message","attachments":[Adaptive Card]}` | Teams Workflows(Power Automate) webhook |
+| `ntfy` | 텍스트 본문 + `Title`·`Priority`(critical 5·warning 4·그 밖 3)·`Tags` 헤더 | `--token`이면 `Authorization: Bearer` |
+| `gotify` | `{"title","message","priority"}`(8·5·2) | `--token`은 `X-Gotify-Key` |
+
+- **비밀.** SMTP 비밀번호, webhook 토큰·헤더 값, URL의 경로·질의(Slack·Teams URL은 경로가 비밀이다)는 API 응답에 나오지
+  않는다: `has_password`·`has_token`·`header_names`만 보이고 URL은 `https://hooks.slack.com/…`처럼 줄인다. 오류 문구·로그·
+  보낸 기록에도 줄인 URL만 쓴다. CLI는 비밀을 명령 인자로 받지 않는다(셸 기록·`ps`에 남지 않게) — 값 없는 `--password`·
+  `--token`·`--header NAME`·`--url -`가 묻는다.
+- **바꿀 때 비밀 지키기.** `notify target set`(그리고 웹)은 주지 않은 비밀을 보내지 않고 서버가 저장된 값을 지킨다. 다만
+  저장된 비밀이 다른 곳으로 가지 않도록 SMTP 서버·포트·사용자를 바꾸면 비밀번호를, webhook URL의 출처(scheme·호스트·포트)나
+  CA를 바꾸면 토큰과 헤더 값을 다시 줘야 한다(아니면 **400** `invalid_request` "… must be given again …"). `--no-password`·
+  `--no-user`·`--no-token`·`--no-ca`·`--rm-header NAME`이 지운다. 대상 이름은 바꾸지 못한다.
+- **시험 보내기.** `POST /notification-targets/{key}/test`는 요청을 받은 노드에서 곧바로 한 번 보내고(10초, 다시 하지 않음)
+  `{"ok":true}`나 `{"ok":false,"error":"…"}`를 돌려준다. 보낸 기록에 `test`로 남고 감사된다. **보내는 노드가 대상에 닿아야
+  한다** — 경보 알림은 경보를 가진 노드가 보내므로(아래), 모든 노드가 메일 서버·webhook에 닿게 한다.
+
+### 경보 규칙
+
+```bash
+orbivisorctl alert rule create cpu-hot --node-metric cpu --gt 90 --for 5m --severity critical --target ops-mail
+orbivisorctl alert rule create fs-full --node-metric fs-percent --gt 85 --for 10m --target ops-mail --target ops-slack
+orbivisorctl alert rule create web-rss --vm-metric mem-rss --gt 7000 --for 15m --vm web --vm api --target ops-slack
+orbivisorctl alert rule create pool-full --pool-usage 90 --target ops-mail
+orbivisorctl alert rule create node-down --node-offline --severity critical --target ops-mail --target phone
+orbivisorctl alert rule create vm-failed --vm-failed --target ops-slack
+orbivisorctl alert rule create start-failed --task-failed --op vm-start --op vm-migrate --target ops-slack
+orbivisorctl alert rule create ha --ha-recovery --severity critical --target phone
+orbivisorctl alert rule create backup --backup-job-failed --target ops-mail
+orbivisorctl alert rule list                     # NAME ENABLED SEVERITY CONDITION FOR TARGETS
+orbivisorctl alert rule set cpu-hot --gt 95      # 준 것만 바꾼다(--gt·--lt만 주면 문턱만)
+orbivisorctl alert rule set cpu-hot --disable    # --enable, --all-nodes, --all-vms
+orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보는 알림 없이 사라진다
+```
+
+| 조건 | 무엇 | 누가 평가 | 대상 |
+|---|---|---|---|
+| `--node-metric M --gt\|--lt V` | 노드 지표: `cpu`(%), `mem-percent`, `fs-percent`(%), `disk-read`·`disk-write`·`net-rx`·`net-tx`(바이트/초) | 그 노드 | 노드 |
+| `--vm-metric M --gt\|--lt V` | VM 지표: `cpu`(%), `mem-rss`(MiB), 디스크·네트워크(바이트/초), `disk-read-iops`·`disk-write-iops` | VM이 도는 노드 | 실행 중 VM |
+| `--pool-usage P` | 풀 사용률이 P %보다 큼 | 노드 로컬 풀은 그 노드, 공유 풀은 그 풀이 준비된 온라인 노드 가운데 id가 가장 작은 노드 | 풀 |
+| `--vm-failed` | VM 단계 `failed` | VM의 주인 노드 | VM |
+| `--node-offline` | 노드가 오프라인(리스) | **리더** | 노드 |
+| `--task-failed [--op OP]…` | Task 실패(이벤트, `--op` 없으면 모든 종류) | Task를 돈 노드 | Task |
+| `--ha-recovery` | `vm-ha-recover` Task가 끝남(이벤트, 결과는 본문에) | Task를 돈 노드 | Task |
+| `--backup-job-failed` | 백업 작업 실행이 실패(이벤트) | **리더** | 백업 작업 |
+
+- **칸.** `--for`(조건이 이만큼 이어지면 알림, `0`~`24h`, 기본 0), `--severity info|warning|critical`(기본 warning), `--target`
+  (알림 대상 이름 1~16개, 있어야 함), `--repeat`(계속 firing이면 이 간격으로 다시, 기본 `4h`, `0`이면 다시 보내지 않음,
+  `1m`~`7d`), `--send-resolved true|false`(기본 true), `--node`·`--vm`(이 노드·VM만, 이름 256개까지, 비면 모두), `--disabled`.
+  `--vm`은 VM 조건(`vm-metric`·`vm-failed`·`ha-recovery`)에만, `--node`는 `backup-job-failed`에 쓰지 못한다. 이벤트 조건은
+  `--for 0`만 받고 해제 알림이 없다. API 본문은 `POST /alert-rules {"name","spec":{"condition":{"kind":"node_metric","metric":"cpu","op":"gt","value":90},"for_secs":300,"severity":"critical","targets":["ops-mail"]}}`다.
+- **유지보수.** 유지보수 노드(`node maintenance NODE on`·`node drain`)의 노드 지표 규칙과 `node-offline`은 평가하지 않고, 들어갈 때 그 노드의
+  활성 노드 경보는 알림 없이 풀린다. 그 노드에서 도는 VM의 규칙은 그대로 본다. 기록은 유지보수 중에도 계속한다.
+
+### 평가와 상태
+
+- **노드 경보.** 지표·`vm-failed`·`task-failed`·`ha-recovery`·`pool-usage` 규칙은 그 일이 일어난 노드가 자기 메모리 지표와
+  자기 VM·Task로 5초마다 평가하고, 그 노드가 보낸다. 일이 노드마다 나뉘므로 노드가 늘어도 한 노드의 일이 늘지 않고,
+  Raft에 쓰지 않는다. 상태는 `{data_dir}/alerts/state.json`(0600, 바뀔 때만 임시 파일 → fsync → rename)에 두어 orbivisord를
+  다시 시작해도 같은 경보를 다시 보내지 않고, 멈췄던 동안의 Task 이벤트는 처리한 watch 리비전부터 이어 본다(Task id로
+  7일 동안 두 번 보내지 않음). 깨진 파일은 `state.json.corrupt`로 옮기고 빈 상태로 시작한다.
+- **리더 경보.** `node-offline`·`backup-job-failed`는 그 판단이 이미 리더의 것이므로 리더가 평가하고 리더가 보낸다. 상태는
+  규칙의 `status.active`(Raft)에 두고, **상태를 쓴 뒤에만 보내므로** 리더가 바뀌어도 새 리더가 이어받아 다시 보내지 않는다.
+  규칙을 만들기 전에 끝난 백업 실행은 알리지 않는다. 지운 노드의 `node-offline` 경보는 해제로 알린다.
+- **상태 기계.** 지표·상태 조건은 `pending`(조건이 참) → `firing`(참인 채 `--for`가 지남, 알림) → `--repeat`마다 다시 알림 →
+  `resolved`(거짓인 채 **60초**가 지남 — 깜박임 막기, `--send-resolved`면 알림)다. `pending` 중에 거짓이 되면 알림 없이 끝난다.
+  값을 읽지 못한 점(`null`)은 상태를 바꾸지 않는다. 대상이 사라지면(VM 지움·멈춤, 노드를 지움) 알림 없이 끝난다. 이벤트
+  조건은 일마다 한 번 보내고 끝이다.
+- **상한.** 노드마다 활성 경보는 500개까지다. 넘으면 새 경보를 따라가지 않고 `GET /alerts`의 `overflowing`에 그 노드 이름이
+  보인다(경고 로그 한 번).
+
+### 보내기와 보낸 기록
+
+- 경보를 가진 노드가 Raft의 대상 설정으로 보낸다: 노드마다 동시에 4개, 하나에 10초까지. 실패하면 30초·2분·10분 뒤 세 번
+  다시 한다. 대상마다 노드마다 **분당 20개**까지이고, 넘는 것은 그 분이 끝난 뒤 "N more notifications were held back by the
+  rate limit of {대상}" 알림 하나로 묶는다. 보낼 대기열은 1000개까지이고 넘으면 버린다(기록에 `dropped: the send queue is
+  full`). 꺼진 대상(`--disable`)은 조용히 건너뛴다.
+- **보낸 기록.** 보낸 노드의 `{data_dir}/alerts/history.log`(JSON Lines, 4 MiB에서 `history.log.1`로 한 번 돌림)에 마지막 결과만
+  남는다(성공, 또는 다시 하기를 다 쓴 실패 — `(after N attempts)`).
+
+```bash
+orbivisorctl alert list                 # 활성 경보(firing 먼저, 심각도 높은 것 먼저)
+# STATE     SEVERITY  RULE     SUBJECT       VALUE  THRESHOLD  SINCE
+# firing    critical  cpu-hot  node/node1    97.26  90         2026-11-18T06:00:00Z
+# clearing  warning   web-rss  vm/web@node2  -      -          2026-11-18T05:40:00Z
+orbivisorctl alert history --since 1h   # 보낸 알림(새 것부터, 기본 지난 24시간, --until, --limit 1~5000 기본 200)
+# TIME                  NODE   STATE     RULE     SUBJECT  TARGET    RESULT
+# 2026-11-18T06:00:05Z  node1  firing    cpu-hot  node1    ops-mail  ok
+```
+
+- `STATE`의 `clearing`은 조건이 풀려 60초 해제 대기 중인 것이다. 노드 대상은 노드 이름, 그 밖은 `종류/이름@노드`로 보인다.
+- **API.** `GET /api/v1/alerts`는 Raft의 리더 경보와, 모든 노드에 노드 사이 RPC로 물은 노드 경보(32개씩, 5초)를 합친다
+  (`{"alerts":[…],"unreachable","unsupported","overflowing"?}`). 답하지 않는 노드의 노드 경보는 보이지 않지만 그 노드의
+  `node-offline` 경보가 대신 보인다. `GET /api/v1/alerts/history?since=&until=&limit=`(유닉스 ms나 RFC 3339)은 노드마다의
+  기록을 시각 순으로 합친다(`truncated`면 CLI가 `note: more records match …`). 둘 다 노드 문제로 실패하지 않는다.
+  `/watch?kinds=alert-rule`로 규칙(리더 경보 포함) 변경을 받는다. 알림 대상은 watch할 수 없다.
+
+### 웹
+
+- **경보**(`/alerts`, 대시보드 경보 위젯의 "경보 모두 보기"나 작업 화면 머리의 "경보" 링크): **활성** 탭(심각도·대상·단계
+  울림/대기/해제 중·값과 문턱·시작 시각, 답하지 않은·옛 노드 안내), **규칙** 탭(누구나 읽음, admin만 만들기·고치기·지우기 —
+  조건 종류에 따라 칸이 바뀌는 폼), **보낸 알림** 탭(지난 24시간·7일, 500개까지). 경보는 화면 알림으로 띄우지 않는다.
+- **알림 대상**(`/settings/notifications`, admin — 설정의 "알림 대상 관리"나 규칙 탭의 링크): SMTP·webhook 폼, 시험 보내기.
+  저장된 비밀은 비워 두면 지키고 "지우기"로 지운다. 서버·포트·사용자나 URL 출처·CA를 바꾸면서 비밀을 다시 넣지 않으면
+  폼이 먼저 막는다.
+
+### 권한·감사·오류
+
+- **권한.** 규칙과 활성 경보·보낸 기록은 누구나(viewer 포함) 읽고 admin만 쓴다. 알림 대상은 읽기·쓰기·시험 보내기 모두
+  admin만이다(사용자·인증 영역과 같은 계정 종류 — viewer·operator는 `/notification-targets*`에 **403**).
+- **감사.** `alert-rule create|update|delete NAME`, `notification-target create|update|delete|test NAME`.
+- **오류.** **400** `invalid_request`(규칙·대상 검증, 없는 대상을 쓰는 규칙, 비밀을 다시 줘야 함, 이름 바꾸기, 모르는 칸,
+  잘못된 `since`·`until`·`limit`), **403** `forbidden`, **404** `not_found`, **409** `cluster_upgrading`(`notifications`를
+  모르는 노드), **409** `in_use`(규칙이 쓰는 대상 지우기 — 규칙 이름), **409** `busy`(대상이 계속 바뀜), **412**
+  `revision_mismatch`(`If-Match`가 낡음 — CLI `rule set`은 세 번까지 다시 읽어 한다).
+
+### 한계
+
+- 경보 묶기·억제(노드 경보가 그 노드 VM의 경보를 가림), 근무 일정, 개별 경보 확인(ack)·잠시 끄기(silence)는 없다. 잠시
+  끄려면 규칙을 `--disable`하거나 노드를 유지보수로 둔다.
+- SNMP 트랩, SMS, 스크립트 실행 대상은 없다. 메일 본문은 일반 텍스트다.
+- 노드 경보 상태는 쓰기 직후·보내기 전에 orbivisord가 죽으면 그 알림 하나를 보내지 못할 수 있다(다시 보내지 않는 쪽을
+  골랐다). 꺼진 노드의 노드 경보는 그 노드가 돌아와야 해제되고, 그동안은 `node-offline` 경보로만 보인다.
+- 업그레이드 중 옛 노드의 지표 경보는 없다(그 노드는 평가하지 않는다).
+
+## Prometheus
+
+노드마다 `GET /api/v1/metrics`가 Prometheus 텍스트 형식(0.0.4)으로 **그 노드의** 지표를 내보낸다. 클러스터 값은 모든
+노드가 같은 것을 낸다. Prometheus는 **모든 노드를 따로** 긁는다. 설정 `prometheus.enabled`가 꺼져 있으면(기본) **404**
+`not_found`다. 켜고 끄기는 모든 노드가 기능 `metrics-history`를 알려야 한다(아니면 **409** `cluster_upgrading`).
+
+```bash
+orbivisorctl prometheus enable      # PATCH /settings {"prometheus":{"enabled":true}} — 감사 settings prometheus on
+# prometheus: enabled
+# scrape: https://10.0.0.11:8006/api/v1/metrics (bearer token of a viewer or higher)
+orbivisorctl prometheus show        # 켜졌는지(on·off는 enable·disable의 별칭)
+orbivisorctl prometheus disable
+```
+
+- **인증.** API 토큰(`Authorization: Bearer opl_…`)이나 세션이다. 노드 읽기와 VM 읽기 권한이 있어야 하므로 **viewer 역할의
+  토큰**이면 된다(따로 읽기 전용 토큰 종류는 없다 — 폐기·감사도 보통 토큰과 같다). 순서는 401(인증 없음) → 403(권한) →
+  404(꺼짐)이다. 응답은 노드마다 5초 동안 다시 쓴다.
+- **값.** 모두 gauge이고 노드 메모리의 마지막 5초 점(15초보다 오래되면 그 줄을 뺌)이다. 누적 카운터가 아니라 비율이므로
+  `rate()`를 씌우지 않는다. 읽지 못한 값의 줄은 빼고, 줄이 하나도 없는 이름은 HELP·TYPE도 쓰지 않는다.
+
+| 이름 | 레이블 | 값 |
+|---|---|---|
+| `orbivisor_node_cpu_usage_ratio` | `node` | 0~1(모든 코어 합) |
+| `orbivisor_node_memory_used_bytes`, `_memory_total_bytes` | `node` | 바이트 |
+| `orbivisor_node_disk_read_bytes_per_second`, `_disk_write_bytes_per_second` | `node` | 바이트/초 |
+| `orbivisor_node_network_receive_bytes_per_second`, `_network_transmit_bytes_per_second` | `node` | 바이트/초 |
+| `orbivisor_node_fs_used_bytes`, `_fs_total_bytes` | `node` | `data_dir`의 파일 시스템 |
+| `orbivisor_vm_info` | `vm_id`, `vm`(이름), `node` | 1(이 노드에서 도는 VM마다) |
+| `orbivisor_vm_cpu_usage_ratio` | `vm_id` | 1 = 모든 vCPU가 바쁨(조금 넘을 수 있다) |
+| `orbivisor_vm_memory_rss_bytes` | `vm_id` | QEMU RSS |
+| `orbivisor_vm_disk_read_bytes_per_second`, `_disk_write_bytes_per_second`, `_disk_read_ops_per_second`, `_disk_write_ops_per_second` | `vm_id` | |
+| `orbivisor_vm_network_receive_bytes_per_second`, `_network_transmit_bytes_per_second` | `vm_id` | 게스트 기준 |
+| `orbivisor_pool_used_bytes`, `orbivisor_pool_total_bytes` | `pool`(이름) | 이 노드에서 준비된 풀(Raft 값, 1 GiB 단위로 갱신) |
+| `orbivisor_cluster_nodes` | `state` = `online`·`offline`·`maintenance` | 노드 수(유지보수가 먼저, 서로 겹치지 않음) |
+| `orbivisor_cluster_vms` | `phase` = `stopped`·`starting`·`running`·`stopping`·`failed`·`migrating` | VM 수(0도 냄) |
+| `orbivisor_cluster_leader_present` | | 1이면 정족수가 있음 |
+| `orbivisor_node_is_raft_leader` | `node` | 1이면 이 노드가 리더 |
+| `orbivisor_alerts_firing` | `severity` = `info`·`warning`·`critical` | 이 노드의 firing 노드 경보 + (리더면) 리더 경보 |
+
+- **카디널리티.** 레이블은 `node`·`vm_id`·`pool`·`state`·`phase`·`severity`뿐이다. VM 이름은 `orbivisor_vm_info`에만 있어 이름을
+  바꿔도 시리즈가 끊기지 않는다. Task id·사용자·디스크 장치는 레이블로 쓰지 않는다. 위트니스는 클러스터 값과
+  `orbivisor_node_is_raft_leader`만 내보낸다.
+
+**Prometheus 설정 예.** viewer 사용자의 토큰과 클러스터 CA를 Prometheus 서버에 둔다(웹 설정의 "Prometheus" 칸에도 이 노드의
+주소로 채운 예와 복사 단추가 있다):
+
+```bash
+orbivisorctl user create prometheus --role viewer
+# 그 사용자로 로그인해 토큰을 만든다(웹: 그 사용자로 API 토큰 화면). 토큰은 다시 볼 수 없다.
+orbivisorctl token create prometheus > /etc/prometheus/orbivisor.token
+curl -k https://10.0.0.11:8006/api/v1/cluster/ca -o /etc/prometheus/orbivisor-ca.pem   # 지문을 cluster status와 비교한다
+```
+
+```yaml
+scrape_configs:
+  - job_name: orbivisor
+    scheme: https
+    metrics_path: /api/v1/metrics
+    authorization:
+      credentials_file: /etc/prometheus/orbivisor.token
+    tls_config:
+      ca_file: /etc/prometheus/orbivisor-ca.pem
+    static_configs:
+      - targets: ["10.0.0.11:8006", "10.0.0.12:8006", "10.0.0.13:8006"]   # 모든 노드(VIP 하나가 아님)
+```
+
+VIP나 프록시 하나만 긁으면 그 순간 그 주소가 가리키는 노드의 값만 모인다.
+
+**Grafana 쿼리 예.**
+
+```promql
+100 * orbivisor_node_cpu_usage_ratio                                          # 노드 CPU %
+orbivisor_node_memory_used_bytes / orbivisor_node_memory_total_bytes          # 노드 메모리 사용률
+100 * orbivisor_vm_cpu_usage_ratio * on(vm_id) group_left(vm, node) orbivisor_vm_info   # VM CPU %, VM 이름·노드를 붙여
+topk(10, orbivisor_vm_memory_rss_bytes * on(vm_id) group_left(vm) orbivisor_vm_info)
+max without(instance) (orbivisor_cluster_nodes)                               # 클러스터 값은 노드마다 같으므로 하나로
+max by(pool) (orbivisor_pool_used_bytes) / max by(pool) (orbivisor_pool_total_bytes)   # 공유 풀(노드마다 같은 값)
+sum by(severity) (orbivisor_alerts_firing)                                    # 클러스터의 firing 경보
+```
+
+- Prometheus 쪽에서 오래 둘 지표와 자기 경보(Alertmanager)를 쓰려면 이 끝점을, 클러스터 안에서 바로 보려면 위 기록·알림을
+  쓴다. 둘은 같은 측정 값이다.
+- **한계.** 누적 카운터·OpenMetrics·원격 쓰기는 없다(값은 마지막 5초 비율). 지표를 밀어 보내기(Graphite·InfluxDB)와 내장
+  Grafana는 없다. 노드마다 따로 긁어야 하고(서비스 찾기 없음 — 노드를 더하면 `targets`에 더한다), 클러스터 값은 노드 수만큼
+  중복이다.

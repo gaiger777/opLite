@@ -19,6 +19,12 @@ cargo test -p opld --features qemu-it --test backup                 # E2E: 실�
 cargo test -p opld --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
 cargo test -p opld --test cluster                                   # E2E: orbivisord 프로세스 3개로 클러스터 구성
 cargo test -p opld --features starve-it --test starve              # E2E: 리더의 API 실행기를 막아도 리스·Raft 리더 그대로
+# 지표 기록·경보(QEMU 없음, [test] 고리가 있는 metrics-it 빌드): SIGKILL 뒤 기록, Prometheus 긁기(엄격한 텍스트 형식 파서),
+# 127.0.0.1 webhook으로 시험 보내기·경보 발생·해제·보낸 기록
+cargo test -p opld --features metrics-it --test metrics_history --test alerts
+OPL_TEST_PROMTOOL=promtool cargo test -p opld --features metrics-it --test metrics_history   # promtool check metrics로도 본다(CI linux-kvm)
+cargo test -p opld --features qemu-it --test metrics_history --test alerts   # 위에 더해 VM 줄과 멈춘 채 옮긴 VM의 기록(QEMU 필요)
+cargo test -p opld --features migration-it,qemu-it --test migration metrics_history_follows_a_live_migration  # 라이브 마이그레이션 뒤 VM 기록
 cargo test -p opld --features qemu-it --test templates              # E2E: 템플릿 → 연결 배포(qcow2 겹층) → 평탄화, 카탈로그 받기 → 템플릿(qemu-img·qemu-io 필요)
 # x86_64 Linux, KVM: 실제 게스트 — Ubuntu 24.04 클라우드 이미지 템플릿 → 연결 복제 2대 켜기·보고 → 평탄화(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img OPL_TEST_CLOUD_SUMS=/tmp/SHA256SUMS \
