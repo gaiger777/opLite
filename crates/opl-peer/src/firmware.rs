@@ -290,8 +290,9 @@ pub(crate) fn purge(state_dir: &Path, req: &PurgeFirmwareRequest) -> std::io::Re
             ))?;
         }
     }
+    // 회차 파일을 읽지 못하면 모르는 것이라 지우지 않는다(리뷰 2 #5).
     if let Some(epoch) = req.epoch
-        && opl_driver::read_firmware_epoch(state_dir, req.vm).ok() != Some(epoch)
+        && opl_driver::firmware_epoch_differs(state_dir, req.vm, epoch)
     {
         if req.uefi_vars {
             gone(std::fs::remove_file(opl_driver::uefi_vars_path(

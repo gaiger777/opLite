@@ -555,6 +555,11 @@ async fn fetching_vars_of_a_newer_epoch_drops_a_stale_tpm_state() {
         state_dir(&root, &a),
         template(&root, &a),
     );
+    // B의 변수도 초기화 전(회차 0)의 것이면 B가 주지 않는다(리뷰 2 #3). A의 파일은 그대로다.
+    let err = fetcher.fetch(vm.id, b.id).await.unwrap_err();
+    assert!(err.0.contains("from before a firmware reset"), "{err}");
+    assert!(permall.exists());
+    opl_driver::write_firmware_epoch(&state_dir(&root, &b), vm.id, 1).unwrap();
     fetcher.fetch(vm.id, b.id).await.unwrap();
     assert!(!permall.exists());
     let dir = state_dir(&root, &a);
@@ -565,10 +570,13 @@ async fn fetching_vars_of_a_newer_epoch_drops_a_stale_tpm_state() {
     std::fs::write(&permall, b"current tpm").unwrap();
     status.firmware_epoch = 2;
     status.tpm_sha256 = Some(opl_peer::sha256_hex(b"current tpm"));
+    opl_driver::write_firmware_epoch(&state_dir(&root, &b), vm.id, 2).unwrap();
     a.cluster
         .update_status::<VmSpec>(vm.id, &status)
         .await
         .unwrap();
+    // B는 자기 클러스터 상태의 회차와 견준다.
+    wait_vm(&b, vm.id, "epoch 2 on B", |v| v.status.firmware_epoch == 2).await;
     fetcher.fetch(vm.id, b.id).await.unwrap();
     assert!(permall.exists());
     assert_eq!(opl_driver::read_firmware_epoch(&dir, vm.id).unwrap(), 2);
@@ -699,7 +707,7 @@ async fn variables_follow_a_stopped_vm_to_another_node() {
     assert_eq!(read_vars(&root, &b, vm.id), b"vars 1");
 }
 
-/// 멈춘 TPM VM을 다른 노드로 옮기면 그 노드의 스냅샷이 TPM 상태를 가진 노드(`firmware_node`)에서 받아(해시 확인) 담는다.
+/// 멈춘 TPM VM을 다른 노드로 옮기면 그 노드의 스냅샷이 TPM 상태를 가진 노드(`tpm_node`)에서 받아(해시 확인) 담는다.
 /// 그 노드가 오프라인이고 사본이 없으면 TPM 없이 담지 않고 실패한다(계획 59 §5).
 #[tokio::test]
 async fn tpm_state_follows_a_stopped_vm_into_snapshots() {
@@ -719,6 +727,7 @@ async fn tpm_state_follows_a_stopped_vm_into_snapshots() {
     std::fs::write(&tpm, b"tpm on a").unwrap();
     let mut status = vm.status.clone();
     status.firmware_node = Some(a.id);
+    status.tpm_node = Some(a.id);
     status.tpm_sha256 = Some(opl_peer::sha256_hex(b"tpm on a"));
     a.cluster
         .update_status::<VmSpec>(vm.id, &status)

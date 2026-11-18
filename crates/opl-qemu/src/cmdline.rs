@@ -613,6 +613,7 @@ mod tests {
             secure_boot: false,
             freeze_fs: false,
             firmware_epoch: 0,
+            keep_tpm: false,
         }
     }
 

@@ -1647,13 +1647,13 @@ fn recovery_pick(
     }
 }
 
-/// TPM VM의 지금 TPM 상태를 가진 노드(`firmware_node`)가 죽은 노드 `failed`이거나 오프라인이면 그 노드의 이름과 사본을
+/// TPM VM의 지금 TPM 상태를 가진 노드(`tpm_node`)가 죽은 노드 `failed`이거나 오프라인이면 그 노드의 이름과 사본을
 /// 가진 노드(`firmware_copies`)다. 기록된 TPM 상태가 없거나(어디서든 새로 만든다) 그 노드가 살아 있으면(받아 온다) None이다.
 fn tpm_copies(vm: &Vm, inv: &Inventory, failed: &Node) -> Option<(String, Vec<Uuid>)> {
     if !vm.spec.tpm || vm.status.tpm_sha256.is_none() {
         return None;
     }
-    let holder = vm.status.firmware_node?;
+    let holder = vm.status.tpm_node?;
     let node = inv.nodes.iter().find(|n| n.id == holder);
     if holder != failed.id && node.is_some_and(|n| n.status.online) {
         return None;
@@ -2608,6 +2608,7 @@ mod tests {
         web.spec.firmware = opl_types::vm::Firmware::Uefi;
         web.spec.tpm = true;
         web.status.firmware_node = Some(failed.id);
+        web.status.tpm_node = Some(failed.id);
         web.status.tpm_sha256 = Some("ab".repeat(32));
         web.status.firmware_copies = vec![b.id];
         let inv = Inventory {

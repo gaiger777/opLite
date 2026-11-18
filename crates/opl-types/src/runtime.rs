@@ -49,6 +49,11 @@ pub struct VmRuntimeSpec {
     /// 다르면 그 노드의 UEFI 변수를 지우고 템플릿에서 새로 만든다. TPM VM은 `RuntimeTpm.epoch`와 같다.
     #[serde(default)]
     pub firmware_epoch: u32,
+    /// 이 노드의 회차가 `firmware_epoch`와 달라 펌웨어 파일을 지울 때 TPM 상태는 남긴다(리뷰 2): 이 노드가 `tpm_node`이거나
+    /// 이 노드의 파일 해시가 VM의 `tpm_sha256`과 같다(지금 것이다). TPM이 없는 UEFI VM도 같다(TPM을 끈 동안 유일한
+    /// 지금 상태일 수 있다).
+    #[serde(default)]
+    pub keep_tpm: bool,
 }
 
 /// 켤 때의 TPM 상태 규칙(계획 59)

@@ -4970,6 +4970,13 @@ export interface components {
                      */
                     snapshot: string | null;
                     /**
+                     * Format: uuid
+                     * @description 지금 TPM 상태를 가진 노드(리뷰 2). TPM VM을 켠 노드·마이그레이션 대상·TPM을 되돌리거나 복원한 노드가 쓰고, TPM을
+                     *     초기화하면 지운다. UEFI 변수를 가진 노드(`firmware_node`)와 다를 수 있다(TPM을 끈 채 다른 노드에서 켬). 이 노드의
+                     *     파일만 기록된 해시(`tpm_sha256`) 뒤에 바뀌었을 수 있어 해시가 달라도 지금 것으로 본다. 없으면 쓰지 않는다.
+                     */
+                    tpm_node?: string;
+                    /**
                      * @description 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
                      *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
                      */
@@ -7008,6 +7015,13 @@ export interface components {
                  */
                 snapshot: string | null;
                 /**
+                 * Format: uuid
+                 * @description 지금 TPM 상태를 가진 노드(리뷰 2). TPM VM을 켠 노드·마이그레이션 대상·TPM을 되돌리거나 복원한 노드가 쓰고, TPM을
+                 *     초기화하면 지운다. UEFI 변수를 가진 노드(`firmware_node`)와 다를 수 있다(TPM을 끈 채 다른 노드에서 켬). 이 노드의
+                 *     파일만 기록된 해시(`tpm_sha256`) 뒤에 바뀌었을 수 있어 해시가 달라도 지금 것으로 본다. 없으면 쓰지 않는다.
+                 */
+                tpm_node?: string;
+                /**
                  * @description 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
                  *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
                  */
@@ -8265,6 +8279,13 @@ export interface components {
              * @default null
              */
             snapshot: string | null;
+            /**
+             * Format: uuid
+             * @description 지금 TPM 상태를 가진 노드(리뷰 2). TPM VM을 켠 노드·마이그레이션 대상·TPM을 되돌리거나 복원한 노드가 쓰고, TPM을
+             *     초기화하면 지운다. UEFI 변수를 가진 노드(`firmware_node`)와 다를 수 있다(TPM을 끈 채 다른 노드에서 켬). 이 노드의
+             *     파일만 기록된 해시(`tpm_sha256`) 뒤에 바뀌었을 수 있어 해시가 달라도 지금 것으로 본다. 없으면 쓰지 않는다.
+             */
+            tpm_node?: string;
             /**
              * @description 지금 TPM 영구 상태(`tpm2-00.permall`)의 SHA-256(16진 소문자, 계획 59). 비밀이 아니다. VM을 돌리는 노드가
              *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.

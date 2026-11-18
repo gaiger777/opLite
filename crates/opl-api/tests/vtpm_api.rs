@@ -233,7 +233,8 @@ async fn firmware_reset_makes_a_task_for_a_stopped_vm() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
-/// TPM 상태가 있는 VM의 변수만 초기화는 그 상태를 가진 노드가 오프라인이면 409이고, TPM까지 초기화하면 이 노드에서 돈다.
+/// TPM 상태가 있는 VM의 변수만 초기화나 TPM만 초기화는 변수를 가진 노드가 오프라인이면 409이고, 둘 다 초기화하면 이
+/// 노드에서 돈다.
 #[tokio::test]
 async fn a_vars_only_reset_of_a_tpm_vm_needs_its_node() {
     let env = Env::start().await;
@@ -252,6 +253,19 @@ async fn a_vars_only_reset_of_a_tpm_vm_needs_its_node() {
     assert_eq!(body["code"], "node_unavailable");
     assert!(
         body["message"].as_str().unwrap().contains("\"node2\""),
+        "{body}"
+    );
+    // TPM만 초기화해도 그 노드의 변수(부팅 항목)를 잃으므로 409다(리뷰 2 #10).
+    let (status, body) = admin
+        .post("/vms/win/firmware/reset", json!({ "tpm": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "node_unavailable");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("reset the UEFI variables as well"),
         "{body}"
     );
     let (status, task) = admin
@@ -277,6 +291,7 @@ async fn start_refuses_a_tpm_vm_whose_state_no_node_can_give() {
     let node2 = offline_node(&env).await;
     set_status(&env, id, |s| {
         s.firmware_node = Some(node2);
+        s.tpm_node = Some(node2);
         s.tpm_sha256 = Some("ab".repeat(32));
     })
     .await;
@@ -305,7 +320,11 @@ async fn secure_boot_changes_with_a_reset_of_the_uefi_variables() {
     let mut env = Env::start().await;
     let admin = env.admin().await;
     let id = uefi_vm(&admin, "win", |s| s["tpm"] = json!(true)).await;
-    set_status(&env, id, |s| s.firmware_node = Some(env.node)).await;
+    set_status(&env, id, |s| {
+        s.firmware_node = Some(env.node);
+        s.tpm_node = Some(env.node);
+    })
+    .await;
     let (status, body) = put_spec(&admin, "win", |s| s["secure_boot"] = json!(true)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "firmware_reset_required");
@@ -337,8 +356,9 @@ async fn secure_boot_changes_with_a_reset_of_the_uefi_variables() {
     env.start_runner().await;
     succeeded(&admin.wait_task(&task).await);
     assert!(get_vm(&env, id).spec.secure_boot);
-    // TPM VM의 변수만 초기화는 TPM 상태의 자리를 지킨다.
-    assert_eq!(get_vm(&env, id).status.firmware_node, Some(env.node));
+    // 변수만 초기화하면 변수의 자리는 지우고 TPM 상태의 자리(`tpm_node`)는 지킨다(리뷰 2).
+    assert_eq!(get_vm(&env, id).status.firmware_node, None);
+    assert_eq!(get_vm(&env, id).status.tpm_node, Some(env.node));
     let entries = audit_entries(&env, |es| {
         es.iter()
             .any(|e| e.action == "POST /vms/{key}/firmware/reset" && e.status == 202)

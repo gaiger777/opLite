@@ -59,6 +59,7 @@ async fn starts_assigned_vm_and_records_status() {
             tpm_sha256: None,
             firmware_copies: Vec::new(),
             firmware_epoch: 0,
+            tpm_node: None,
         }
     );
 }

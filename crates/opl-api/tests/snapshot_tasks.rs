@@ -1038,6 +1038,7 @@ async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str])
         secure_boot: false,
         freeze_fs: false,
         firmware_epoch: 0,
+        keep_tpm: false,
     };
     env.hv.start(&runtime, None).await.unwrap();
     let mut spec = current.spec.clone();

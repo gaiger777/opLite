@@ -894,6 +894,12 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub firmware_epoch: u32,
+    /// 지금 TPM 상태를 가진 노드(리뷰 2). TPM VM을 켠 노드·마이그레이션 대상·TPM을 되돌리거나 복원한 노드가 쓰고, TPM을
+    /// 초기화하면 지운다. UEFI 변수를 가진 노드(`firmware_node`)와 다를 수 있다(TPM을 끈 채 다른 노드에서 켬). 이 노드의
+    /// 파일만 기록된 해시(`tpm_sha256`) 뒤에 바뀌었을 수 있어 해시가 달라도 지금 것으로 본다. 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub tpm_node: Option<Uuid>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -2465,7 +2471,12 @@ mod tests {
     #[test]
     fn status_firmware_fields_and_hardware_flags_are_written_only_when_set() {
         let json = serde_json::to_value(VmStatus::default()).unwrap();
-        for key in ["tpm_sha256", "firmware_copies", "firmware_epoch"] {
+        for key in [
+            "tpm_sha256",
+            "firmware_copies",
+            "firmware_epoch",
+            "tpm_node",
+        ] {
             assert!(json.get(key).is_none(), "{json}");
         }
         let copy = Uuid::now_v7();
@@ -2473,10 +2484,12 @@ mod tests {
             tpm_sha256: Some("ab".repeat(32)),
             firmware_copies: vec![copy],
             firmware_epoch: 2,
+            tpm_node: Some(copy),
             ..Default::default()
         };
         let json = serde_json::to_value(&st).unwrap();
         assert_eq!(json["firmware_copies"], serde_json::json!([copy]));
+        assert_eq!(json["tpm_node"], serde_json::json!(copy));
         assert_eq!(json["firmware_epoch"], 2);
         assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
 

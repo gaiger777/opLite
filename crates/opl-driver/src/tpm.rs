@@ -71,69 +71,96 @@ pub fn read_firmware_epoch(state_dir: &Path, id: Uuid) -> std::io::Result<u32> {
     }
 }
 
-/// 이 노드의 VM 펌웨어 파일 회차를 적는다(임시 파일에 쓰고 rename). 다른 노드에서 받아 온 UEFI 변수·TPM 파일을 둔
-/// 뒤에도 VM의 `firmware_epoch`로 적어야 켤 때 지워지지 않는다.
+/// 이 노드의 VM 펌웨어 파일 회차를 적는다(임시 파일에 쓰고 fsync한 뒤 rename, 디렉터리도 fsync — 리뷰 2 #5: 전원이
+/// 나가도 빈 파일이 남지 않게). 다른 노드에서 받아 온 UEFI 변수·TPM 파일을 둔 뒤에도 VM의 `firmware_epoch`로 적어야
+/// 켤 때 지워지지 않는다.
 pub fn write_firmware_epoch(state_dir: &Path, id: Uuid, epoch: u32) -> std::io::Result<()> {
+    use std::io::Write;
     let dir = vm_state_dir(state_dir, id);
     std::fs::create_dir_all(&dir)?;
     let tmp = dir.join(format!("{EPOCH_FILE}.tmp"));
-    std::fs::write(&tmp, epoch.to_string())?;
-    std::fs::rename(&tmp, dir.join(EPOCH_FILE))
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(epoch.to_string().as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, dir.join(EPOCH_FILE))?;
+    std::fs::File::open(&dir)?.sync_all()
+}
+
+/// 이 노드의 회차가 `epoch`와 다른지(이 노드의 펌웨어 파일이 초기화 전의 것인지). 회차 파일을 읽지 못하면(깨짐, 입출력
+/// 오류) 모르는 것이라 다르지 않다고 본다(리뷰 2 #5): 경고만 남기고 아무것도 지우지 않는다 — 지금 파일일 수 있다.
+pub fn firmware_epoch_differs(state_dir: &Path, id: Uuid, epoch: u32) -> bool {
+    match read_firmware_epoch(state_dir, id) {
+        Ok(on_node) => on_node != epoch,
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "cannot read the firmware epoch on this node; keeping its firmware files");
+            false
+        }
+    }
 }
 
 /// [`adopt_firmware_epoch`]가 남길 이 노드의 펌웨어 파일
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeepFirmware {
-    /// UEFI 변수(막 받았다)
+    /// UEFI 변수(막 받았거나 되돌렸다)
     pub vars: bool,
-    /// TPM 상태(막 받았거나 해시가 VM의 지금 `tpm_sha256`과 같다)
+    /// TPM 상태(막 받았거나 되돌렸거나, 지금 것이다 — 이 노드가 `tpm_node`이거나 해시가 VM의 `tpm_sha256`과 같다)
     pub tpm: bool,
 }
 
-/// 다른 노드에서 펌웨어 파일을 받은 뒤 이 노드의 회차를 VM의 `epoch`로 옮긴다(리뷰 1 C2). 이 노드의 회차가 다르면
-/// 이 노드의 파일은 초기화 전의 것이므로, `keep`에 없는 파일(받지 않은 변수, 지금 것이 아닌 TPM 상태)을 지운 뒤
-/// 회차를 적는다. 회차만 적으면 받지 않은 낡은 파일이 지금 것으로 보여 켤 때 지워지지 않는다(초기화가 되살아난다).
+/// 이 노드의 펌웨어 회차를 VM의 `epoch`로 옮기는 단 하나의 규칙(리뷰 1 C2, 리뷰 2 #1): 이 노드의 회차가 다르면 이
+/// 노드의 파일은 초기화 전의 것이므로 `keep`에 없는 파일(받거나 되돌리지 않은 변수, 지금 것이 아닌 TPM 상태)을 지운
+/// 뒤 회차를 적는다. 회차만 적으면 낡은 파일이 지금 것으로 보여 켤 때 지워지지 않는다(초기화가 되살아난다). 회차 파일을
+/// 읽지 못하면 아무것도 지우지 않고 회차만 적는다([`firmware_epoch_differs`]). 받기·사본 받기·초기화·되돌리기·켜기가 모두
+/// 이것을 부른다.
 pub fn adopt_firmware_epoch(
     state_dir: &Path,
     id: Uuid,
     epoch: u32,
     keep: KeepFirmware,
 ) -> std::io::Result<()> {
-    if read_firmware_epoch(state_dir, id).ok() != Some(epoch) {
-        if !keep.vars {
-            remove_file(&crate::qemu::uefi_vars_path(state_dir, id))?;
-        }
-        if !keep.tpm {
-            match std::fs::remove_dir_all(vm_tpm_dir(state_dir, id)) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-                _ => {}
+    match read_firmware_epoch(state_dir, id) {
+        Ok(on_node) if on_node == epoch => return Ok(()),
+        Ok(_) => {
+            if !keep.vars {
+                remove_file(&crate::qemu::uefi_vars_path(state_dir, id))?;
             }
+            if !keep.tpm {
+                match std::fs::remove_dir_all(vm_tpm_dir(state_dir, id)) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(%id, error = %e, "cannot read the firmware epoch on this node; keeping its firmware files");
         }
     }
     write_firmware_epoch(state_dir, id, epoch)
 }
 
 /// TPM이 없는 UEFI VM을 켜기 전에(리뷰 1 I1): 이 노드의 회차가 VM의 `epoch`와 다르면 이 노드의 UEFI 변수는 초기화
-/// 전의 것이므로 지우고 회차를 적는다. 회차 파일이 없고 VM의 회차가 0이면(초기화한 적 없음) 아무것도 쓰지 않는다.
+/// 전의 것이므로 지우고, TPM 상태도 지금 것이 아니면(`keep_tpm` 거짓) 지운 뒤 회차를 적는다(리뷰 2 #1b — 남기면 TPM을
+/// 다시 켤 때 낡은 TPM이 새 회차의 것으로 보인다). 회차 파일이 없고 VM의 회차가 0이면(초기화한 적 없음) 아무것도 쓰지
+/// 않는다.
 pub(crate) fn prepare_vars(
     state_dir: &Path,
     id: Uuid,
     epoch: u32,
-    uefi_vars: &Path,
+    keep_tpm: bool,
 ) -> Result<(), DriverError> {
-    if read_firmware_epoch(state_dir, id).ok() != Some(epoch) {
-        tracing::info!(%id, epoch, "UEFI variables on this node are from before a reset; removing them");
-        remove_file(uefi_vars)?;
-        write_firmware_epoch(state_dir, id, epoch)?;
-    }
-    Ok(())
+    let keep = KeepFirmware {
+        vars: false,
+        tpm: keep_tpm,
+    };
+    adopt_firmware_epoch(state_dir, id, epoch, keep).map_err(Into::into)
 }
 
 /// 켜기 전에 TPM 상태를 맞춘다.
 ///
-/// 1. `tpm.epoch`가 이 노드의 회차와 다르면 이 노드의 파일은 초기화 전의 것이다. UEFI 변수(`uefi_vars`)를 지우고,
-///    `tpm.fresh`면 TPM 상태도 지운 뒤 회차를 적는다. `fresh`가 아니면 TPM 파일은 해시가 맞는 지금 것이거나 막 받아
-///    온 것이라 그대로 둔다.
+/// 1. `tpm.epoch`가 이 노드의 회차와 다르면 이 노드의 파일은 초기화 전의 것이다. UEFI 변수를 지우고, TPM 상태는 지금
+///    것이 아니면(`keep_tpm` 거짓) 지운 뒤 회차를 적는다([`adopt_firmware_epoch`]). 막 받아 온 TPM은 받을 때 회차를
+///    이미 옮겼다.
 /// 2. TPM 디렉터리를 0700으로 만든다.
 /// 3. 마이그레이션을 받는 쪽(`incoming`)이 아니고 상태 파일이 없으면, `fresh`면 `swtpm_setup`으로 새로 만들고(EK와
 ///    인증서, 있는 파일은 덮어쓰지 않음) 아니면 몰래 새로 만들지 않고 실패한다.
@@ -142,24 +169,17 @@ pub(crate) async fn prepare_state(
     state_dir: &Path,
     id: Uuid,
     tpm: RuntimeTpm,
+    keep_tpm: bool,
     incoming: bool,
-    uefi_vars: &Path,
 ) -> Result<(), DriverError> {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = vm_tpm_dir(state_dir, id);
-    if read_firmware_epoch(state_dir, id)? != tpm.epoch {
-        tracing::info!(%id, epoch = tpm.epoch, fresh = tpm.fresh,
-            "firmware files on this node are from before a reset; removing them");
-        remove_file(uefi_vars)?;
-        if tpm.fresh {
-            match std::fs::remove_dir_all(&dir) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
-        }
-        write_firmware_epoch(state_dir, id, tpm.epoch)?;
-    }
+    let keep = KeepFirmware {
+        vars: false,
+        tpm: keep_tpm,
+    };
+    adopt_firmware_epoch(state_dir, id, tpm.epoch, keep)?;
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
     if incoming || dir.join(TPM_STATE_FILE).exists() {
@@ -422,17 +442,18 @@ async fn run_swtpm(cfg: &SwtpmConfig, tpm_dir: &Path, paths: &RuntimePaths) -> R
     std::fs::create_dir_all(&paths.dir)
         .map_err(|e| format!("cannot create {}: {e}", paths.dir.display()))?;
     let mut args = swtpm_args(paths, tpm_dir);
-    // 떼어 내지 않고(`--daemon`·`--terminate` 빼기) 자식으로 두어 확인한 뒤 끝낸다.
-    args.retain(|a| a != "--daemon" && a != "--terminate");
+    // 떼어 내지 않고(`--daemon` 빼기) 자식으로 두어 확인한 뒤 제어 소켓에 붙었다 끊어 끝낸다(`--terminate`). opld가 그
+    // 사이 죽어도(감시견 SIGKILL) 남지 않게 Linux에서는 부모가 죽으면 SIGKILL을 받는다(리뷰 2 #9).
+    args.retain(|a| a != "--daemon");
     args.extend(["--flags".into(), "not-need-init,startup-clear".into()]);
-    let mut child = tokio::process::Command::new(&cfg.swtpm)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(&cfg.swtpm);
+    cmd.args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("swtpm: {e}"))?;
+        .kill_on_drop(true);
+    die_with_parent(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("swtpm: {e}"))?;
     let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
     let outcome = loop {
         if paths.tpm_socket.exists() && paths.tpm_pidfile.exists() {
@@ -454,10 +475,35 @@ async fn run_swtpm(cfg: &SwtpmConfig, tpm_dir: &Path, paths: &RuntimePaths) -> R
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
+    if outcome.is_ok() {
+        // QEMU처럼 붙었다 끊는다: `--terminate`로 스스로 끝난다.
+        drop(tokio::net::UnixStream::connect(&paths.tpm_socket).await);
+        if tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .is_err()
+        {
+            tracing::debug!("the probe swtpm did not end on disconnect; killing it");
+        }
+    }
     let _ = child.start_kill();
     let _ = tokio::time::timeout(KILL_TIMEOUT, child.wait()).await;
     outcome
 }
+
+/// 띄운 프로세스가 부모(opld)가 죽으면 SIGKILL을 받게 한다(Linux `PR_SET_PDEATHSIG`). 다른 곳에서는 아무것도 하지 않는다.
+#[cfg(target_os = "linux")]
+fn die_with_parent(cmd: &mut tokio::process::Command) {
+    // SAFETY: fork 뒤 exec 전에 비동기 신호 안전한 prctl 하나만 부른다.
+    unsafe {
+        cmd.pre_exec(|| {
+            rustix::process::set_parent_process_death_signal(Some(Signal::KILL))
+                .map_err(std::io::Error::from)
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn die_with_parent(_cmd: &mut tokio::process::Command) {}
 
 /// `--print-capabilities`(JSON의 `features`)와 `-tpmdev help` 출력으로 본 TPM 2.0 능력
 pub(crate) fn tpm_caps(swtpm_caps: &str, tpmdev_help: &str) -> bool {
@@ -623,22 +669,78 @@ mod tests {
         assert!(permall.exists());
     }
 
-    /// TPM이 없는 UEFI VM도 회차가 다르면 변수를 지운다(리뷰 1 I1).
+    /// TPM이 없는 UEFI VM도 회차가 다르면 변수를 지운다(리뷰 1 I1). TPM 상태도 지금 것이 아니면 지운다(리뷰 2 #1b).
     #[test]
     fn vars_of_an_older_epoch_are_removed() {
         let tmp = tempfile::tempdir().unwrap();
         let id = Uuid::now_v7();
         let vars = crate::qemu::uefi_vars_path(tmp.path(), id);
-        std::fs::create_dir_all(vars.parent().unwrap()).unwrap();
+        let permall = tpm_state_path(tmp.path(), id);
+        std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
         std::fs::write(&vars, b"vars").unwrap();
-        prepare_vars(tmp.path(), id, 0, &vars).unwrap();
-        assert!(vars.exists());
-        prepare_vars(tmp.path(), id, 1, &vars).unwrap();
+        std::fs::write(&permall, b"tpm").unwrap();
+        prepare_vars(tmp.path(), id, 0, false).unwrap();
+        assert!(vars.exists() && permall.exists());
+        // 회차 파일이 없고 VM의 회차가 0이면(업그레이드 뒤 첫 켜기) 아무것도 쓰지 않는다.
+        assert!(!vm_state_dir(tmp.path(), id).join(EPOCH_FILE).exists());
+        // 지금 것인 TPM(tpm_node, 해시 같음)은 남긴다.
+        prepare_vars(tmp.path(), id, 1, true).unwrap();
         assert!(!vars.exists());
+        assert!(permall.exists());
         assert_eq!(read_firmware_epoch(tmp.path(), id).unwrap(), 1);
         std::fs::write(&vars, b"vars").unwrap();
-        prepare_vars(tmp.path(), id, 1, &vars).unwrap();
-        assert!(vars.exists());
+        prepare_vars(tmp.path(), id, 1, false).unwrap();
+        assert!(vars.exists() && permall.exists());
+        // 초기화 전의 TPM(지금 것이 아님)은 지운다: 다시 TPM을 켜면 새 회차의 것으로 보이지 않게.
+        prepare_vars(tmp.path(), id, 2, false).unwrap();
+        assert!(!vars.exists());
+        assert!(!permall.exists());
+    }
+
+    /// 업그레이드: 계획 59 전 UEFI VM(회차 파일 없음, VM 회차 0)은 첫 켜기에 변수를 지키고 회차 파일을 쓰지 않는다.
+    #[test]
+    fn upgraded_uefi_vms_keep_their_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::now_v7();
+        let vars = crate::qemu::uefi_vars_path(tmp.path(), id);
+        std::fs::create_dir_all(vars.parent().unwrap()).unwrap();
+        std::fs::write(&vars, b"boot entries").unwrap();
+        prepare_vars(tmp.path(), id, 0, false).unwrap();
+        assert_eq!(std::fs::read(&vars).unwrap(), b"boot entries");
+        let keep = KeepFirmware {
+            vars: true,
+            tpm: false,
+        };
+        adopt_firmware_epoch(tmp.path(), id, 0, keep).unwrap();
+        prepare_vars(tmp.path(), id, 0, false).unwrap();
+        assert_eq!(std::fs::read(&vars).unwrap(), b"boot entries");
+    }
+
+    /// 회차 파일이 깨졌으면(리뷰 2 #5) 모르는 것이라 아무것도 지우지 않고 회차를 다시 적는다.
+    #[test]
+    fn an_unreadable_epoch_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::now_v7();
+        let vars = crate::qemu::uefi_vars_path(tmp.path(), id);
+        let permall = tpm_state_path(tmp.path(), id);
+        std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+        std::fs::write(&vars, b"vars").unwrap();
+        std::fs::write(&permall, b"tpm").unwrap();
+        let epoch = vm_state_dir(tmp.path(), id).join(EPOCH_FILE);
+        std::fs::write(&epoch, b"").unwrap();
+        assert!(!firmware_epoch_differs(tmp.path(), id, 3));
+        prepare_vars(tmp.path(), id, 3, false).unwrap();
+        assert!(vars.exists() && permall.exists());
+        assert_eq!(read_firmware_epoch(tmp.path(), id).unwrap(), 3);
+        std::fs::write(&epoch, b"garbage").unwrap();
+        let none = KeepFirmware {
+            vars: false,
+            tpm: false,
+        };
+        adopt_firmware_epoch(tmp.path(), id, 4, none).unwrap();
+        assert!(vars.exists() && permall.exists());
+        assert_eq!(read_firmware_epoch(tmp.path(), id).unwrap(), 4);
+        assert!(firmware_epoch_differs(tmp.path(), id, 5));
     }
 
     /// 가짜 swtpm·swtpm_setup(`tests/fixtures`, python3)
@@ -677,15 +779,14 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let (state, cfg, id) = (tmp.path(), fake_swtpm(), Uuid::now_v7());
-        let vars = tmp.path().join("vars.fd");
-        let err = prepare_state(&cfg, state, id, kept(0), false, &vars)
+        let err = prepare_state(&cfg, state, id, kept(0), false, false)
             .await
             .unwrap_err();
         assert!(
             matches!(&err, DriverError::InvalidSpec(m) if m == &format!("the TPM state of VM {id} is missing on this node")),
             "{err}"
         );
-        prepare_state(&cfg, state, id, fresh(0), false, &vars)
+        prepare_state(&cfg, state, id, fresh(0), false, false)
             .await
             .unwrap();
         let file = tpm_state_path(state, id);
@@ -697,16 +798,16 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o700);
         // 다시 켜도 같은 TPM이다(fresh여도 덮어쓰지 않는다).
-        prepare_state(&cfg, state, id, fresh(0), false, &vars)
+        prepare_state(&cfg, state, id, fresh(0), false, false)
             .await
             .unwrap();
-        prepare_state(&cfg, state, id, kept(0), false, &vars)
+        prepare_state(&cfg, state, id, kept(0), false, false)
             .await
             .unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), first);
         // 마이그레이션을 받는 쪽은 빈 디렉터리로 띄운다.
         let other = Uuid::now_v7();
-        prepare_state(&cfg, state, other, kept(0), true, &vars)
+        prepare_state(&cfg, state, other, kept(0), false, true)
             .await
             .unwrap();
         assert!(vm_tpm_dir(state, other).is_dir());
@@ -718,15 +819,15 @@ mod tests {
     async fn a_new_epoch_drops_stale_firmware_files() {
         let tmp = tempfile::tempdir().unwrap();
         let (state, cfg, id) = (tmp.path(), fake_swtpm(), Uuid::now_v7());
-        let vars = tmp.path().join("vars.fd");
-        prepare_state(&cfg, state, id, fresh(0), false, &vars)
+        let vars = crate::qemu::uefi_vars_path(state, id);
+        prepare_state(&cfg, state, id, fresh(0), false, false)
             .await
             .unwrap();
         let file = tpm_state_path(state, id);
         let first = std::fs::read(&file).unwrap();
 
         std::fs::write(&vars, b"old vars").unwrap();
-        prepare_state(&cfg, state, id, kept(1), false, &vars)
+        prepare_state(&cfg, state, id, kept(1), true, false)
             .await
             .unwrap();
         assert!(!vars.exists());
@@ -734,7 +835,7 @@ mod tests {
         assert_eq!(read_firmware_epoch(state, id).unwrap(), 1);
 
         std::fs::write(&vars, b"old vars").unwrap();
-        prepare_state(&cfg, state, id, fresh(2), false, &vars)
+        prepare_state(&cfg, state, id, fresh(2), false, false)
             .await
             .unwrap();
         assert!(!vars.exists());
@@ -748,7 +849,7 @@ mod tests {
         let (state, cfg, id) = (tmp.path(), fake_swtpm(), Uuid::now_v7());
         std::fs::create_dir_all(vm_tpm_dir(state, id)).unwrap();
         std::fs::write(vm_tpm_dir(state, id).join("fail-setup"), b"").unwrap();
-        let err = prepare_state(&cfg, state, id, fresh(0), false, Path::new("/nonexistent"))
+        let err = prepare_state(&cfg, state, id, fresh(0), false, false)
             .await
             .unwrap_err();
         assert!(
@@ -760,7 +861,7 @@ mod tests {
             ..fake_swtpm()
         };
         std::fs::remove_file(vm_tpm_dir(state, id).join("fail-setup")).unwrap();
-        let err = prepare_state(&missing, state, id, fresh(0), false, Path::new("/x"))
+        let err = prepare_state(&missing, state, id, fresh(0), false, false)
             .await
             .unwrap_err();
         assert!(

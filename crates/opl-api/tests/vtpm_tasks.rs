@@ -378,8 +378,8 @@ async fn clones_get_a_new_tpm_with_a_warning() {
     assert!(!tpm_state_path(&state(&env), copy.id).exists());
 }
 
-/// 초기화 Task: 변수만이면 TPM 상태와 그 자리를 지키고, TPM만이면 이 노드의 변수를 지키며, 둘 다면 자리도 지운다. 매번
-/// 회차를 올리고 사본을 비우며 이 노드의 회차 파일을 적는다. 켜진 VM은 초기화하지 않는다.
+/// 초기화 Task: 변수만이면 TPM 상태와 그 자리·사본을 지키고, TPM만이면 이 노드의 변수를 지키며, 둘 다면 자리도 지운다.
+/// 매번 회차를 올리고 이 노드의 회차 파일을 적는다. 켜진 VM은 초기화하지 않는다.
 #[tokio::test]
 async fn firmware_reset_bumps_the_epoch_and_removes_this_nodes_files() {
     let env = Env::start().await;
@@ -407,9 +407,10 @@ async fn firmware_reset_bumps_the_epoch_and_removes_this_nodes_files() {
     assert!(!vars.exists());
     assert!(tpm.exists());
     assert_eq!(after.status.firmware_epoch, 2);
-    assert_eq!(after.status.firmware_node, Some(env.node));
+    // 변수는 어디에도 지금 것이 없고, TPM 상태와 사본은 그대로다(리뷰 2 #3).
+    assert_eq!(after.status.firmware_node, None);
     assert_eq!(after.status.tpm_sha256, Some(sha256_hex(b"tpm")));
-    assert!(after.status.firmware_copies.is_empty());
+    assert_eq!(after.status.firmware_copies, [copy]);
     assert_eq!(
         opl_driver::read_firmware_epoch(&state(&env), vm).unwrap(),
         2
@@ -421,8 +422,9 @@ async fn firmware_reset_bumps_the_epoch_and_removes_this_nodes_files() {
     assert!(vars.exists());
     assert!(!tpm.parent().unwrap().exists());
     assert_eq!(after.status.firmware_epoch, 3);
-    assert_eq!(after.status.firmware_node, Some(env.node));
+    assert_eq!(after.status.firmware_node, None);
     assert_eq!(after.status.tpm_sha256, None);
+    assert!(after.status.firmware_copies.is_empty());
     assert_eq!(
         opl_driver::read_firmware_epoch(&state(&env), vm).unwrap(),
         3
@@ -547,4 +549,127 @@ async fn memory_snapshots_need_the_devices_they_were_taken_with() {
             .contains("whose tpm differs"),
         "{body}"
     );
+}
+
+/// 리뷰 2 #1a: 이 노드의 회차가 초기화 전 VM의 회차와도 달랐으면(앞 초기화 때 오프라인) 초기화하지 않는 변수도 낡은
+/// 것이라 TPM만 초기화해도 지운다. 회차가 같았으면 변수를 지킨다(위 시험).
+#[tokio::test]
+async fn a_reset_also_drops_files_left_from_an_older_reset() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = tpm_vm(&admin, "win", &[], |_| {}).await;
+    write_firmware(&env, vm, b"vars from epoch 0", b"tpm");
+    set_status(&env, vm, |s| {
+        s.firmware_node = Some(env.node);
+        s.firmware_epoch = 1;
+    })
+    .await;
+    let reset = TaskOp::VmFirmwareReset {
+        uefi_vars: false,
+        tpm: true,
+        secure_boot: None,
+    };
+    succeeded(&run_task(&env, &admin, reset, vm).await);
+    assert!(!uefi_vars_path(&state(&env), vm).exists());
+    assert!(!tpm_state_path(&state(&env), vm).exists());
+    assert_eq!(
+        opl_driver::read_firmware_epoch(&state(&env), vm).unwrap(),
+        2
+    );
+}
+
+/// 리뷰 2 #1c: TPM 사본이 없는 스냅샷을 되돌리면 이 노드의 회차가 달랐을 때 남은 낡은 TPM 상태를 지운다(회차만 적으면
+/// 새 회차의 것으로 보인다). 되돌린 변수는 남는다.
+#[tokio::test]
+async fn reverting_a_snapshot_without_a_tpm_drops_a_stale_tpm() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = tpm_vm(&admin, "web", &[], |spec| spec["tpm"] = json!(false)).await;
+    succeeded(&admin.act("web", "start").await);
+    let vars = uefi_vars_path(&state(&env), vm);
+    std::fs::create_dir_all(vars.parent().unwrap()).unwrap();
+    std::fs::write(&vars, b"vars-a").unwrap();
+    succeeded(&snapshot(&admin, "web", json!({ "name": "a" })).await);
+    assert_eq!(snapshot_of(&env, vm, "a").status.tpm_node, None);
+
+    // 초기화 전(회차 0)의 TPM 상태가 남았고 VM은 그 뒤 초기화됐다.
+    let tpm = tpm_state_path(&state(&env), vm);
+    std::fs::create_dir_all(tpm.parent().unwrap()).unwrap();
+    std::fs::write(&tpm, b"old tpm").unwrap();
+    std::fs::write(&vars, b"vars-b").unwrap();
+    set_status(&env, vm, |s| s.firmware_epoch = 1).await;
+
+    let (status, task) = admin.post("/vms/web/snapshots/a/revert", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    assert_eq!(std::fs::read(&vars).unwrap(), b"vars-a");
+    assert!(!tpm.exists());
+    assert_eq!(
+        opl_driver::read_firmware_epoch(&state(&env), vm).unwrap(),
+        1
+    );
+}
+
+/// 리뷰 2 #8: 기록된 TPM 상태가 없을 때(TPM 초기화 뒤) 이 노드의 회차가 다르면 남은 파일은 초기화 전의 것이라 스냅샷에
+/// 담지 않는다.
+#[tokio::test]
+async fn snapshots_do_not_capture_a_tpm_from_before_a_reset() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = tpm_vm(&admin, "win", &[], |_| {}).await;
+    write_firmware(&env, vm, b"vars", b"old tpm");
+    set_status(&env, vm, |s| s.firmware_epoch = 1).await;
+    succeeded(&snapshot(&admin, "win", json!({ "name": "a" })).await);
+    assert_eq!(snapshot_of(&env, vm, "a").status.tpm_node, None);
+
+    // 회차가 같으면(이 노드에서 새로 만든 상태) 담는다.
+    opl_driver::write_firmware_epoch(&state(&env), vm, 1).unwrap();
+    succeeded(&snapshot(&admin, "win", json!({ "name": "b" })).await);
+    assert_eq!(snapshot_of(&env, vm, "b").status.tpm_node, Some(env.node));
+}
+
+/// 리뷰 2 #7: 정리는 회차가 달라 남은 지금 것이 아닌 TPM 상태(오프라인 동안 초기화됨)를 두 차례 본 뒤 지운다. 이 노드가
+/// `tpm_node`이거나 해시가 같은 TPM, 회차가 같은 TPM은 둔다.
+#[tokio::test]
+async fn the_sweep_removes_tpm_states_from_before_a_reset() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let stale = tpm_vm(&admin, "stale", &[], |_| {}).await;
+    let holder = tpm_vm(&admin, "holder", &[], |_| {}).await;
+    let copy = tpm_vm(&admin, "copy", &[], |_| {}).await;
+    for id in [stale, holder, copy] {
+        write_firmware(&env, id, b"vars", b"tpm");
+    }
+    set_status(&env, stale, |s| {
+        s.firmware_epoch = 1;
+        s.tpm_sha256 = Some(sha256_hex(b"newer"));
+    })
+    .await;
+    set_status(&env, holder, |s| {
+        s.firmware_epoch = 1;
+        s.tpm_node = Some(env.node);
+        s.tpm_sha256 = Some(sha256_hex(b"newer"));
+    })
+    .await;
+    set_status(&env, copy, |s| {
+        s.firmware_epoch = 1;
+        s.tpm_sha256 = Some(sha256_hex(b"tpm"));
+    })
+    .await;
+    env.stop_runner().await;
+    env.start_runner_config(Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)), |c| {
+        c.tag_sweep = Duration::from_millis(50);
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + common::WAIT;
+    while tpm_state_path(&state(&env), stale).exists() {
+        assert!(tokio::time::Instant::now() < deadline, "not removed");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 변수는 켤 때 지운다(정리는 비밀인 TPM 상태만 지운다).
+    assert!(uefi_vars_path(&state(&env), stale).exists());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for id in [holder, copy] {
+        assert!(tpm_state_path(&state(&env), id).exists(), "{id}");
+    }
 }

@@ -8,9 +8,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_driver::{
-    DriverError, Hypervisor, Quiesced, RuntimeStatus, tpm_state_path, uefi_vars_path, vm_state_dir,
-    write_firmware_epoch,
+    DriverError, Hypervisor, KeepFirmware, Quiesced, RuntimeStatus, adopt_firmware_epoch,
+    tpm_state_path, uefi_vars_path, vm_state_dir,
 };
+use opl_types::firmware::tpm_is_current;
 use opl_types::node::NodeSpec;
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{
@@ -24,7 +25,7 @@ use crate::schedule::{recorded_vm, set_schedule_error};
 use crate::snapshots::{block_snapshot_kind, uses_block_snapshots};
 use crate::vms::check_node_arch;
 
-use super::firmware::{current_tpm, place_private, tpm_copy, update_vm_status};
+use super::firmware::{current_tpm, file_hash, place_private, tpm_copy, update_vm_status};
 use super::{Ctx, set_power, set_volume_size, started, stopped, superseded, wait_vm};
 
 /// 실행 중인 VM을 블록 스냅샷을 위해 멈춰 두는 한도. Task 한도(600초)보다 충분히 짧다.
@@ -253,23 +254,37 @@ pub(super) async fn fetch_vars(ctx: &Ctx, vm: &Vm) {
     }
 }
 
-/// 되돌린 펌웨어 파일(UEFI 변수, TPM 상태면 그 해시 `tpm`)을 이 노드에 썼다: 이 노드의 회차 파일을 VM의 회차로 적어
-/// 켤 때 지워지지 않게 하고, 이 노드를 `firmware_node`로 삼는다. TPM 상태를 되돌렸으면 `tpm_sha256`을 그 해시로 쓰고
-/// 사본(이제 다른 상태)을 비운다.
-async fn set_firmware_node(ctx: &Ctx, vm: Uuid, tpm: Option<String>) -> Result<(), String> {
+/// 되돌린 펌웨어 파일(UEFI 변수면 `vars`, TPM 상태면 그 해시 `tpm`)을 이 노드에 썼다: 이 노드의 회차를 VM의 회차로
+/// 옮기고([`adopt_firmware_epoch`] — 되돌리지 않은 파일은 회차가 달랐으면 낡은 것이라 지운다. TPM 상태는 지금 것이면
+/// 남긴다, 리뷰 2 #1c) 이 노드를 `firmware_node`로 삼는다. TPM 상태를 되돌렸으면 이 노드를 `tpm_node`로 삼고
+/// `tpm_sha256`을 그 해시로 쓰고 사본(이제 다른 상태)을 비운다.
+async fn set_firmware_node(
+    ctx: &Ctx,
+    vm: Uuid,
+    vars: bool,
+    tpm: Option<String>,
+) -> Result<(), String> {
+    let me = ctx.config.node;
     if let Some(dir) = &ctx.config.state_dir {
-        let epoch = get_vm(ctx, vm)?.status.firmware_epoch;
-        write_firmware_epoch(dir, vm, epoch)
+        let current = get_vm(ctx, vm)?;
+        let local = file_hash(&tpm_state_path(dir, vm)).await.ok().flatten();
+        let keep = KeepFirmware {
+            vars,
+            tpm: tpm.is_some() || tpm_is_current(&current.status, me, local.as_deref()),
+        };
+        adopt_firmware_epoch(dir, vm, current.status.firmware_epoch, keep)
             .map_err(|e| format!("cannot record the firmware epoch: {e}"))?;
     }
-    let me = ctx.config.node;
     update_vm_status(ctx, vm, |status| {
         let mut changed = status.firmware_node != Some(me);
         status.firmware_node = Some(me);
         if let Some(hash) = &tpm
-            && (status.tpm_sha256.as_ref() != Some(hash) || !status.firmware_copies.is_empty())
+            && (status.tpm_sha256.as_ref() != Some(hash)
+                || status.tpm_node != Some(me)
+                || !status.firmware_copies.is_empty())
         {
             status.tpm_sha256 = Some(hash.clone());
+            status.tpm_node = Some(me);
             status.firmware_copies.clear();
             changed = true;
         }
@@ -904,7 +919,7 @@ pub(super) async fn revert(ctx: &Ctx, task: &Task, id: Uuid) -> Result<(), Strin
         };
         // 되돌린 파일은 이 노드에 있다. 다음 시작이 다른 노드에서 받아 덮지 않게 한다.
         if vars.is_some() || hash.is_some() {
-            set_firmware_node(ctx, vm_id, hash).await?;
+            set_firmware_node(ctx, vm_id, vars.is_some(), hash).await?;
         }
     }
     // 스냅샷 뒤에 늘린 크기는 되돌아간다.
@@ -1129,6 +1144,7 @@ mod tests {
             secure_boot: false,
             freeze_fs: false,
             firmware_epoch: 0,
+            keep_tpm: false,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

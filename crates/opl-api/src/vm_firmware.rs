@@ -76,16 +76,17 @@ pub(crate) fn check_secure_boot_change(vm: &Vm, on: bool) -> Result<(), ApiError
 }
 
 /// 꺼진 TPM VM `vm`(스펙은 켤 모양, status는 지금 것)을 노드 `node`에서 켤 때 TPM 상태를 얻을 수 있는지 미리 본다(설계
-/// §5 켜기 규칙). 얻을 곳이 없으면 409 `tpm_state_unavailable`(작업자가 남길 문구와 같다). `node`가 `firmware_node`나
+/// §5 켜기 규칙). 얻을 곳이 없으면 409 `tpm_state_unavailable`(작업자가 남길 문구와 같다). `node`가 `tpm_node`나
 /// 사본 노드면 그 노드의 파일이 지금 해시와 같다고 본다(API는 파일을 볼 수 없다 — 없으면 작업자가 사본에서 받는다).
 pub(crate) fn check_tpm_state(state: &AppState, vm: &Vm, node: Uuid) -> Result<(), ApiError> {
     if !vm.spec.tpm {
         return Ok(());
     }
     let nodes = state.cluster.list::<NodeSpec>()?.1;
-    let local = vm.status.tpm_sha256.as_deref().filter(|_| {
-        vm.status.firmware_node == Some(node) || vm.status.firmware_copies.contains(&node)
-    });
+    let local =
+        vm.status.tpm_sha256.as_deref().filter(|_| {
+            vm.status.tpm_node == Some(node) || vm.status.firmware_copies.contains(&node)
+        });
     match tpm_source(vm, node, local, &nodes) {
         TpmSource::Unavailable(message) => {
             Err(ApiError::conflict("tpm_state_unavailable", message))
@@ -96,7 +97,8 @@ pub(crate) fn check_tpm_state(state: &AppState, vm: &Vm, node: Uuid) -> Result<(
 
 /// 초기화 Task를 돌릴 노드: 온라인인 `firmware_node`(그 노드의 파일을 지운다), 없거나 오프라인이면 VM의 디스크로 정한
 /// 노드다. TPM 상태가 있는 VM의 변수만 초기화는 `firmware_node`가 오프라인이면 409 `node_unavailable`이다(다른
-/// 노드에서 지우면 나중에 그 노드의 TPM 상태와 함께 낡은 변수가 돌아온다 — 설계 §16 S4).
+/// 노드에서 지우면 나중에 그 노드의 TPM 상태와 함께 낡은 변수가 돌아온다 — 설계 §16 S4). TPM만 초기화도
+/// `firmware_node`가 오프라인이면 409다(리뷰 2 #10): 회차가 올라 그 노드의 변수와 부팅 항목도 함께 잃는다.
 fn reset_node(state: &AppState, vm: &Vm, uefi_vars: bool, tpm: bool) -> Result<Uuid, ApiError> {
     let Some(holder) = vm.status.firmware_node else {
         return Ok(vm_node(state, vm));
@@ -109,6 +111,17 @@ fn reset_node(state: &AppState, vm: &Vm, uefi_vars: bool, tpm: bool) -> Result<U
         return Ok(holder);
     }
     let tpm_vm = vm.spec.tpm || vm.status.tpm_sha256.is_some();
+    if tpm && !uefi_vars {
+        let name = node.map_or_else(|| holder.to_string(), |n| n.name);
+        return Err(ApiError::conflict(
+            "node_unavailable",
+            format!(
+                "the UEFI variables of VM {:?} are on node {name:?} (offline); reset the TPM when {name:?} is back, \
+                 or reset the UEFI variables as well (boot entries are lost)",
+                vm.name
+            ),
+        ));
+    }
     if uefi_vars && !tpm && tpm_vm {
         let name = node.map_or_else(|| holder.to_string(), |n| n.name);
         return Err(ApiError::conflict(

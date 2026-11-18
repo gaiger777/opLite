@@ -504,3 +504,35 @@ async fn a_learner_listed_as_an_observer_while_catching_up_is_not_promoted() {
     );
     assert!(!c.members().voters.contains_key(&n4));
 }
+
+/// 리더가 확인한 읽기(계획 59 리뷰 2): 팔로워도 리더의 확인을 받아 그때까지 커밋된 것을 본다. 리더에 닿지 못하면
+/// 확인하지 못한다(정리 같은 지우기는 하지 않는다).
+#[tokio::test]
+async fn read_index_confirms_with_the_leader() {
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let follower = *tc.nodes.keys().find(|id| **id != leader).unwrap();
+    let rev = tc.get(leader).create(&volume("seen")).await.unwrap();
+    let index = tc
+        .get(follower)
+        .read_index(Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(index >= rev, "{index} < {rev}");
+    assert!(tc.get(follower).revision() >= rev);
+    assert!(
+        tc.get(leader)
+            .read_index(Duration::from_secs(5))
+            .await
+            .unwrap()
+            >= rev
+    );
+
+    tc.router.isolate(follower);
+    assert!(
+        tc.get(follower)
+            .read_index(Duration::from_secs(1))
+            .await
+            .is_err()
+    );
+}

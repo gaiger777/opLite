@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openraft::error::{ChangeMembershipError, ClientWriteError, RaftError};
+use openraft::error::{ChangeMembershipError, CheckIsLeaderError, ClientWriteError, RaftError};
 use openraft::raft::ClientWriteResponse;
 use openraft::{ChangeMembers, Raft, RaftMetrics};
 use opl_types::cluster::ClusterStatus;
@@ -121,6 +121,21 @@ pub(crate) async fn execute(
             ctx.vips
                 .renew(raft, &ctx.confirm, node, vips, timeout)
                 .await
+        }
+        LeaderRequest::ReadIndex => {
+            let read = tokio::time::timeout(timeout, raft.ensure_linearizable())
+                .await
+                .map_err(|_| ClusterError::Timeout)?;
+            match read {
+                Ok(log) => Ok(log.map_or(0, |l| l.index)),
+                Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(f))) => {
+                    Err(ClusterError::NotLeader {
+                        leader_id: f.leader_id,
+                        leader_addr: f.leader_node.map(|n| n.addr().to_string()),
+                    })
+                }
+                Err(e) => Err(ClusterError::Raft(e.to_string())),
+            }
         }
         LeaderRequest::Write { command } => {
             let resp = tokio::time::timeout(timeout, raft.client_write(command))

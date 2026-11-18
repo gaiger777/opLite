@@ -214,7 +214,7 @@ struct VmHandle {
     paths: RuntimePaths,
     monitor: JoinHandle<()>,
     /// 게스트 에이전트 채널은 한 번에 한 연결뿐이라 ping·정보·종료·얼리기·비밀번호가 모두 이것을 거친다(계획 59).
-    agent: tokio::sync::Mutex<()>,
+    agent: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Drop for VmHandle {
@@ -347,7 +347,7 @@ impl QemuHypervisor {
                 pid,
                 paths,
                 monitor,
-                agent: tokio::sync::Mutex::new(()),
+                agent: Arc::new(tokio::sync::Mutex::new(())),
             }),
         );
         if launched {
@@ -373,21 +373,13 @@ impl QemuHypervisor {
         if let Some(t) = vm.tpm {
             // 펌웨어 초기화 회차가 다르면 UEFI 변수도 지우므로 변수를 복사하기 전에 맞춘다.
             let state = &self.config.state_dir;
-            tpm::prepare_state(
-                &self.config.swtpm,
-                state,
-                vm.id,
-                t,
-                incoming,
-                &paths.uefi_vars,
-            )
-            .await?;
+            tpm::prepare_state(&self.config.swtpm, state, vm.id, t, vm.keep_tpm, incoming).await?;
         } else if vm.firmware == Firmware::Uefi {
             tpm::prepare_vars(
                 &self.config.state_dir,
                 vm.id,
                 vm.firmware_epoch,
-                &paths.uefi_vars,
+                vm.keep_tpm,
             )?;
         }
         if vm.firmware == Firmware::Uefi && !paths.uefi_vars.exists() {
@@ -2755,7 +2747,7 @@ async fn backup_into(
     (parent, new): (&str, &str),
     targets: &[BackupTarget],
     opened: &mut Vec<String>,
-    (id, freezer): (Uuid, &mut Freezer<'_>),
+    (id, freezer): (Uuid, &mut Freezer),
 ) -> Result<(), DriverError> {
     let mut actions = Vec::new();
     for ((i, target), disk) in targets.iter().enumerate().zip(disks) {
@@ -2957,7 +2949,7 @@ async fn start_fleecing(
     disks: &[BlockNode],
     indexes: &[usize],
     new: &[TransactionAction],
-    (dir, halt, freezer): (&Path, &FleeceHalt<'_>, &mut Freezer<'_>),
+    (dir, halt, freezer): (&Path, &FleeceHalt<'_>, &mut Freezer),
     error: fn(String) -> DriverError,
     fleeces: &mut Vec<Fleece>,
 ) -> Result<(), DriverError> {
@@ -3199,7 +3191,7 @@ async fn send_replicas(
     qmp: &QmpClient,
     disks: &[BlockNode],
     req: &ReplicateRequest,
-    fleece: (&Path, &FleeceHalt<'_>, &mut Freezer<'_>),
+    fleece: (&Path, &FleeceHalt<'_>, &mut Freezer),
     opened: &mut Vec<String>,
     fleeces: &mut Vec<Fleece>,
 ) -> Result<u64, DriverError> {
@@ -4227,6 +4219,7 @@ mod tests {
             secure_boot: false,
             freeze_fs: false,
             firmware_epoch: 0,
+            keep_tpm: false,
         }
     }
 
@@ -9369,6 +9362,42 @@ time.sleep(60)
             *seen.lock().unwrap(),
             ["guest-fsfreeze-freeze", "guest-fsfreeze-thaw"]
         );
+    }
+
+    /// 버려진 얼리기의 녹이기는 끝날 때까지 에이전트 잠금을 쥔다(리뷰 2 #4): 다음 회차가 그사이 얼리지 못한다.
+    #[tokio::test]
+    async fn an_abandoned_freeze_keeps_the_agent_lock_until_thawed() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        let paths = hv.paths(id).unwrap();
+        let thaws = Arc::new(AtomicU32::new(0));
+        let count = thaws.clone();
+        let _seen = fake_agent(&paths.qga_socket, move |cmd| {
+            if cmd == "guest-fsfreeze-thaw" && count.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Some(json!({ "error": { "class": "GenericError", "desc": "busy" } }));
+            }
+            Some(json!({ "return": 0 }))
+        });
+        let handle = hv.handle(id).unwrap();
+        let mut freezer = Freezer::new(true, &handle.paths, &handle.agent);
+        freezer.freeze(id).await;
+        drop(freezer);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            handle.agent.try_lock().is_err(),
+            "the background thaw does not hold the agent lock"
+        );
+        let mark = paths.dir.join(agent::FSFROZEN_MARK);
+        for _ in 0..200 {
+            if handle.agent.try_lock().is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(handle.agent.try_lock().is_ok());
+        assert!(!mark.exists());
+        assert_eq!(thaws.load(Ordering::SeqCst), 3);
     }
 
     #[tokio::test]

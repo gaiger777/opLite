@@ -1199,6 +1199,21 @@ impl Cluster {
         }
     }
 
+    /// 리더가 확인한 읽기(계획 59 리뷰 2): 리더에게 과반수의 리더인지 확인받은 인덱스(`ReadIndex`)까지 이 노드에도
+    /// 적용되기를 기다린다. 성공하면 그 뒤 이 노드에서 읽은 목록에는 확인한 때까지 커밋된 것이 모두 있다. 리더가 없거나
+    /// 닿지 않거나 `timeout` 안에 적용하지 못하면 오류다. 팔로워·관찰 노드에서도 쓸 수 있다.
+    pub async fn read_index(&self, timeout: Duration) -> Result<u64, ClusterError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let index = self
+            .request_within(LeaderRequest::ReadIndex, timeout)
+            .await?;
+        self.wait_revision(
+            index,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await
+    }
+
     /// `since` 이후에 커밋된 변경을 구독한다.
     pub fn watch(&self, since: u64) -> Result<Watch, WatchError> {
         self.store.watch_hub().subscribe(since)

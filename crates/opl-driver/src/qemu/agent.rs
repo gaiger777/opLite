@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use opl_qemu::RuntimePaths;
 use opl_qemu::qga::{self, FREEZE_TIMEOUT, SYNC_TIMEOUT, Session};
-use tokio::sync::{Mutex, MutexGuard};
+use std::sync::Arc;
+
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use uuid::Uuid;
 
 use crate::hypervisor::Quiesced;
@@ -21,20 +23,20 @@ const THAW_WINDOW: Duration = FREEZE_TIMEOUT.saturating_add(Duration::from_secs(
 /// 실패한 녹이기 사이의 쉼
 const THAW_PAUSE: Duration = Duration::from_millis(500);
 
-pub(super) struct Freezer<'a> {
+pub(super) struct Freezer {
     want: bool,
     sock: PathBuf,
     mark: PathBuf,
-    lock: Option<&'a Mutex<()>>,
-    /// 얼리기부터 녹이기까지 쥐는 에이전트 잠금
-    guard: Option<MutexGuard<'a, ()>>,
+    lock: Option<Arc<Mutex<()>>>,
+    /// 얼리기부터 녹이기까지 쥐는 에이전트 잠금. 버려진 뒤 띄운 녹이기도 끝날 때까지 쥔다(리뷰 2 #4).
+    guard: Option<OwnedMutexGuard<()>>,
     session: Option<Session>,
     outcome: Quiesced,
     /// 얼렸고 아직 녹이지 않았다(떨어뜨리면 녹이기를 띄운다).
     frozen: bool,
 }
 
-impl Freezer<'static> {
+impl Freezer {
     /// 얼리지 않는다.
     pub(super) fn off() -> Self {
         Self {
@@ -50,14 +52,14 @@ impl Freezer<'static> {
     }
 }
 
-impl<'a> Freezer<'a> {
+impl Freezer {
     /// `want`면 이 VM의 게스트 에이전트 채널로 얼린다. `lock`은 VM의 에이전트 잠금이다.
-    pub(super) fn new(want: bool, paths: &RuntimePaths, lock: &'a Mutex<()>) -> Self {
+    pub(super) fn new(want: bool, paths: &RuntimePaths, lock: &Arc<Mutex<()>>) -> Self {
         Self {
             want,
             sock: paths.qga_socket.clone(),
             mark: paths.dir.join(FSFROZEN_MARK),
-            lock: Some(lock),
+            lock: Some(lock.clone()),
             guard: None,
             session: None,
             outcome: Quiesced::No,
@@ -75,8 +77,8 @@ impl<'a> Freezer<'a> {
             self.outcome = Quiesced::Skipped("the VM has no guest agent channel".into());
             return;
         }
-        if let Some(lock) = self.lock {
-            self.guard = Some(lock.lock().await);
+        if let Some(lock) = &self.lock {
+            self.guard = Some(lock.clone().lock_owned().await);
         }
         if let Err(e) = std::fs::write(&self.mark, b"") {
             self.outcome = Quiesced::Skipped(format!("cannot write the freeze mark: {e}"));
@@ -135,14 +137,16 @@ impl<'a> Freezer<'a> {
     }
 }
 
-impl Drop for Freezer<'_> {
-    /// 얼린 뒤 녹이기 전에 버려졌으면(호출한 future가 취소됨) 녹이기를 띄운다. 띄울 런타임이 없으면 표시가 남아
-    /// 다음 ping·정보 수집이 녹인다.
+impl Drop for Freezer {
+    /// 얼린 뒤 녹이기 전에 버려졌으면(호출한 future가 취소됨) 녹이기를 띄운다. 띄운 녹이기가 에이전트 잠금을 넘겨받아
+    /// 끝날 때까지 쥔다(리뷰 2 #4): 그사이 다음 회차가 얼린 것을 이 녹이기가 녹이거나 그 표시를 지우지 않게. 띄울
+    /// 런타임이 없으면 표시가 남아 다음 ping·정보 수집이 녹인다.
     fn drop(&mut self) {
         if !self.frozen {
             return;
         }
         let (sock, mark, session) = (self.sock.clone(), self.mark.clone(), self.session.take());
+        let guard = self.guard.take();
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             tracing::warn!(
                 ?sock,
@@ -152,6 +156,7 @@ impl Drop for Freezer<'_> {
                 if thaw_tries(&sock, session).await {
                     remove_mark(&mark);
                 }
+                drop(guard);
             });
         }
     }

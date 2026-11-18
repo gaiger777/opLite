@@ -132,7 +132,8 @@ fn last_tpm(env: &Env) -> Option<RuntimeTpm> {
     env.hv.launch_specs().last().unwrap().tpm
 }
 
-/// 지금 TPM 상태를 가진 노드가 받기에 실패하면 사본 노드에서 받고, 변수도 그 노드에서 받는다. 이 노드의 상태로 켠다.
+/// 지금 TPM 상태를 가진 노드(`tpm_node`)가 받기에 실패하면 사본 노드에서 받는다. 변수는 온라인인 `firmware_node`에서
+/// 받는다(리뷰 2 #3). 이 노드의 상태로 켠다.
 #[tokio::test]
 async fn the_tpm_state_is_fetched_from_the_holder_then_a_copy() {
     let fetcher = Arc::new(Fetcher::default());
@@ -145,6 +146,7 @@ async fn the_tpm_state_is_fetched_from_the_holder_then_a_copy() {
     fetcher.fail_tpm.lock().unwrap().push(a);
     let mut v = tpm_vm(&env);
     v.status.firmware_node = Some(a);
+    v.status.tpm_node = Some(a);
     v.status.tpm_sha256 = Some("ab".repeat(32));
     v.status.firmware_copies = vec![b];
     v.status.firmware_epoch = 2;
@@ -155,7 +157,7 @@ async fn the_tpm_state_is_fetched_from_the_holder_then_a_copy() {
         *fetcher.tpm.lock().unwrap(),
         [(a, "ab".repeat(32), 2), (b, "ab".repeat(32), 2)]
     );
-    assert_eq!(*fetcher.vars.lock().unwrap(), [b]);
+    assert_eq!(*fetcher.vars.lock().unwrap(), [a]);
     assert_eq!(
         last_tpm(&env),
         Some(RuntimeTpm {
@@ -177,6 +179,7 @@ async fn a_vm_whose_tpm_state_is_unreachable_waits() {
     let a = add_node(&env, "a", false).await;
     let mut v = tpm_vm(&env);
     v.status.firmware_node = Some(a);
+    v.status.tpm_node = Some(a);
     v.status.tpm_sha256 = Some("ab".repeat(32));
     env.create(&v).await;
     let want = tpm_unavailable("web", Some("a"));
@@ -217,10 +220,11 @@ async fn a_new_tpm_is_created_only_without_a_recorded_state() {
         })
     );
 
-    // firmware_node가 이 노드이고 파일이 있으면(해시는 기록 뒤 바뀌었을 수 있다) 이 노드의 상태로 켠다.
+    // tpm_node가 이 노드이고 파일이 있으면(해시는 기록 뒤 바뀌었을 수 있다) 이 노드의 상태로 켠다.
     let mut mine = vm("mine", env.node);
     mine.spec.tpm = true;
     mine.status.firmware_node = Some(env.node);
+    mine.status.tpm_node = Some(env.node);
     mine.status.tpm_sha256 = Some("cd".repeat(32));
     let permall = opl_driver::tpm_state_path(state.path(), mine.id);
     std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
@@ -235,6 +239,35 @@ async fn a_new_tpm_is_created_only_without_a_recorded_state() {
         })
     );
     assert!(fetcher.tpm.lock().unwrap().is_empty());
+}
+
+/// 리뷰 2 #2: TPM을 끈 채 이 노드에서 돌아 이 노드가 변수의 노드(`firmware_node`)가 됐어도, 이 노드의 해시가 다른 TPM
+/// 파일(오프라인 동안 남은 낡은 사본)로 켜지 않고 `tpm_node`에서 받는다. 변수는 이 노드의 것이다.
+#[tokio::test]
+async fn a_stale_tpm_on_the_vars_node_is_replaced_from_the_tpm_node() {
+    let state = tempfile::tempdir().unwrap();
+    let fetcher = Arc::new(Fetcher::default());
+    let f: Arc<dyn FirmwareFetcher> = fetcher.clone();
+    let dir = state.path().to_path_buf();
+    let env = Env::start_with(|c| {
+        c.firmware = Some(f);
+        c.state_dir = Some(dir);
+    })
+    .await;
+    let a = add_node(&env, "a", true).await;
+    let mut v = tpm_vm(&env);
+    v.status.firmware_node = Some(env.node);
+    v.status.tpm_node = Some(a);
+    v.status.tpm_sha256 = Some("ab".repeat(32));
+    let permall = opl_driver::tpm_state_path(state.path(), v.id);
+    std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+    std::fs::write(&permall, b"old copy").unwrap();
+    env.create(&v).await;
+    let got = env.wait(v.id, "running", running).await;
+    assert_eq!(*fetcher.tpm.lock().unwrap(), [(a, "ab".repeat(32), 0)]);
+    assert!(fetcher.vars.lock().unwrap().is_empty());
+    assert_eq!(got.status.tpm_node, Some(env.node));
+    assert_eq!(got.status.firmware_node, Some(env.node));
 }
 
 /// TPM 상태를 가진 노드의 작업자는 상태 파일의 해시를 기록하고, 사본 대상(복제 대상)에 밀어 둔다. 파일이 바뀌면 해시를

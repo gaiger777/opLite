@@ -9,10 +9,15 @@ use std::time::{Duration, SystemTime};
 
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
-use opl_driver::{tpm_state_path, uefi_vars_path, vm_state_dir, vm_tpm_dir, write_firmware_epoch};
+use opl_driver::{
+    KeepFirmware, adopt_firmware_epoch, read_firmware_epoch, tpm_state_path, uefi_vars_path,
+    vm_state_dir, vm_tpm_dir,
+};
 use opl_peer::sha256_hex;
 use opl_reconciler::{FirmwareCopy, FirmwarePurge};
-use opl_types::firmware::{TpmSource, firmware_copy_nodes, tpm_source, tpm_unavailable};
+use opl_types::firmware::{
+    TpmSource, firmware_copy_nodes, tpm_is_current, tpm_source, tpm_unavailable, vars_source,
+};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::placement::HaGroupSpec;
 use opl_types::task::{Task, TaskSpec};
@@ -88,10 +93,11 @@ fn node_name(nodes: &[Node], id: Uuid) -> String {
 ///
 /// - TPM이 없는 VM이거나 `state_dir`가 없으면 None이다.
 /// - 이 노드에서 QEMU가 돌면 swtpm이 이 노드의 파일을 쓴다: 그 파일이다.
-/// - 이 노드가 `firmware_node`이거나 파일 해시가 기록과 같으면 이 노드의 파일이다. 기록된 상태가 있는데 파일이 없으면
+/// - 이 노드가 `tpm_node`이거나 파일 해시가 기록과 같으면 이 노드의 파일이다. 기록된 상태가 있는데 파일이 없으면
 ///   오류다(상태를 잃었다 — 몰래 TPM 없이 담지 않는다).
-/// - 기록된 해시가 없으면(한 번도 켜지 않음) 이 노드에 파일이 있을 때만 그것이다.
-/// - 아니면 `firmware_node`, 그다음 온라인 사본 노드에서 받아 온다(해시 확인). 받은 노드에서 UEFI 변수도 받는다.
+/// - 기록된 해시가 없으면(한 번도 켜지 않음, TPM 초기화 뒤) 이 노드에 파일이 있고 이 노드의 회차가 VM의 회차와 같을
+///   때만 그것이다(리뷰 2 #8: 회차가 다르면 초기화 전의 TPM이다).
+/// - 아니면 `tpm_node`, 그다음 온라인 사본 노드에서 받아 온다(해시 확인). UEFI 변수도 받는다([`vars_source`]).
 ///   모두 실패하면 [`tpm_unavailable`] 문구로 실패한다.
 pub(super) async fn current_tpm(ctx: &Ctx, vm: &Vm) -> Result<Option<PathBuf>, String> {
     let Some(dir) = &ctx.config.state_dir else {
@@ -115,7 +121,12 @@ pub(super) async fn current_tpm(ctx: &Ctx, vm: &Vm) -> Result<Option<PathBuf>, S
                 vm.name
             ));
         }
-        TpmSource::Local | TpmSource::Fresh => return Ok(local.map(|_| path)),
+        TpmSource::Local => return Ok(local.map(|_| path)),
+        TpmSource::Fresh => {
+            let current =
+                matches!(read_firmware_epoch(dir, vm.id), Ok(e) if e == vm.status.firmware_epoch);
+            return Ok(local.filter(|_| current).map(|_| path));
+        }
         TpmSource::Unavailable(reason) => return Err(reason),
         TpmSource::Fetch(from) => from,
     };
@@ -131,9 +142,10 @@ pub(super) async fn current_tpm(ctx: &Ctx, vm: &Vm) -> Result<Option<PathBuf>, S
             .await
         {
             Ok(()) => {
-                // 사본은 변수와 TPM 상태를 함께 둔다. 변수도 그 노드의 것을 쓴다.
-                if let Err(e) = fetcher.fetch(vm.id, node).await {
-                    tracing::warn!(vm = %vm.id, from = %node, error = %e, "cannot fetch UEFI variables with the TPM state");
+                if let Some(vars) = vars_source(vm, ctx.config.node, node, &nodes)
+                    && let Err(e) = fetcher.fetch(vm.id, vars).await
+                {
+                    tracing::warn!(vm = %vm.id, from = %vars, error = %e, "cannot fetch UEFI variables with the TPM state");
                 }
                 return Ok(Some(path));
             }
@@ -142,7 +154,7 @@ pub(super) async fn current_tpm(ctx: &Ctx, vm: &Vm) -> Result<Option<PathBuf>, S
             }
         }
     }
-    let holder = vm.status.firmware_node.map(|id| node_name(&nodes, id));
+    let holder = vm.status.tpm_node.map(|id| node_name(&nodes, id));
     Err(tpm_unavailable(&vm.name, holder.as_deref()))
 }
 
@@ -176,32 +188,24 @@ pub(super) async fn update_vm_status(
     }
 }
 
-/// 초기화가 VM status에 쓸 것(설계 §5): 회차를 올리고 사본(이제 낡음)을 비운다. TPM을 초기화하면 해시를 지운다.
-/// `firmware_node`(`me`는 Task가 도는 노드)는 남는 파일의 자리일 때만 지킨다.
+/// 초기화가 VM status에 쓸 것(설계 §5): 회차를 올린다. `me`는 Task가 도는 노드다.
 ///
-/// - 둘 다: 남는 것이 없다 — 지운다.
-/// - 변수만: TPM VM이면 TPM 상태의 자리이므로 지킨다(지우면 켜기 규칙이 상태를 찾지 못한다). 아니면 지운다.
+/// - 변수: 어느 노드의 변수도 지금 것이 아니다 — `firmware_node`를 지운다(켤 때 템플릿에서 새로 만든다).
+/// - TPM: 해시·`tpm_node`·사본을 지운다(켤 때 새로 만든다).
+/// - 변수만: TPM 상태는 그대로라 `tpm_node`와 사본을 지킨다(리뷰 2 #3 — 지우면 TPM을 가진 노드를 잃는다). 사본 노드의
+///   변수는 회차가 달라 그 노드가 주지 않는다.
 /// - TPM만: 이 노드가 `firmware_node`면 이 노드의 변수가 새 회차로 남으므로 지킨다. 아니면(그 노드가 오프라인이라
-///   여기서 돈다) 그 노드의 변수는 회차가 달라 켤 때 지워지므로 지운다.
-pub(super) fn reset_status(
-    status: &mut VmStatus,
-    tpm_vm: bool,
-    me: Uuid,
-    uefi_vars: bool,
-    tpm: bool,
-) {
+///   여기서 돈다 — API가 409로 막는다, 리뷰 2 #10) 그 노드의 변수는 회차가 달라 켤 때 지워지므로 지운다. 사본은
+///   낡은 TPM이라 비운다.
+pub(super) fn reset_status(status: &mut VmStatus, me: Uuid, uefi_vars: bool, tpm: bool) {
     status.firmware_epoch = status.firmware_epoch.wrapping_add(1);
-    status.firmware_copies.clear();
-    let keep = match (uefi_vars, tpm) {
-        (true, false) => tpm_vm || status.tpm_sha256.is_some(),
-        (false, true) => status.firmware_node == Some(me),
-        _ => false,
-    };
+    if uefi_vars || status.firmware_node != Some(me) {
+        status.firmware_node = None;
+    }
     if tpm {
         status.tpm_sha256 = None;
-    }
-    if !keep {
-        status.firmware_node = None;
+        status.tpm_node = None;
+        status.firmware_copies.clear();
     }
 }
 
@@ -232,6 +236,22 @@ pub(super) async fn reset(
     if let Some(on) = secure_boot {
         set_secure_boot(ctx, id, on).await?;
     }
+    // 이 노드의 파일이 초기화 전 회차의 지금 것인지는 status를 바꾸기 전에 본다.
+    let keep = match &ctx.config.state_dir {
+        Some(dir) => {
+            let local = file_hash(&tpm_state_path(dir, id)).await.ok().flatten();
+            let me = ctx.config.node;
+            KeepFirmware {
+                vars: !uefi_vars
+                    && matches!(read_firmware_epoch(dir, id), Ok(e) if e == vm.status.firmware_epoch),
+                tpm: !tpm && tpm_is_current(&vm.status, me, local.as_deref()),
+            }
+        }
+        None => KeepFirmware {
+            vars: false,
+            tpm: false,
+        },
+    };
     let epoch = write_reset(ctx, &vm, uefi_vars, tpm).await?;
     let Some(dir) = &ctx.config.state_dir else {
         return Ok(());
@@ -248,7 +268,9 @@ pub(super) async fn reset(
         gone(tokio::fs::remove_dir_all(vm_tpm_dir(dir, id)).await)
             .map_err(|e| format!("cannot remove the TPM state: {e}"))?;
     }
-    write_firmware_epoch(dir, id, epoch)
+    // 초기화하지 않은 파일도 이 노드의 회차가 초기화 전 VM의 회차와 달랐으면 더 낡은 것이다. 같은 규칙으로 지운 뒤 새
+    // 회차를 적는다(리뷰 2 #1a — 회차만 적으면 낡은 파일이 새 회차의 것으로 보인다).
+    adopt_firmware_epoch(dir, id, epoch, keep)
         .map_err(|e| format!("cannot record the firmware epoch: {e}"))?;
     tracing::info!(vm = %id, uefi_vars, tpm, epoch, "reset VM firmware");
     let purge = FirmwarePurge {
@@ -313,7 +335,7 @@ async fn write_reset(ctx: &Ctx, vm: &Vm, uefi_vars: bool, tpm: bool) -> Result<u
     let mut current = vm.clone();
     loop {
         let mut status = current.status.clone();
-        reset_status(&mut status, current.spec.tpm, me, uefi_vars, tpm);
+        reset_status(&mut status, me, uefi_vars, tpm);
         let epoch = status.firmware_epoch;
         match ctx
             .cluster
@@ -432,24 +454,42 @@ pub(super) async fn push_replica_copy(ctx: &Ctx, vm: Uuid, to: Uuid) {
     }
 }
 
-/// 지운 VM의 상태 디렉터리를 `tag_sweep`마다 지운다([`sweep_state_dirs`]). 시작할 때는 후보만 모으고, 다음 차례에도
-/// 후보이면 지운다(리뷰 1 I3): 다시 합류한 노드의 로컬 클러스터 상태가 아직 따라잡지 못해 VM 목록이 모자라도 그 사이에
-/// 따라잡으므로, 살아 있는 VM의 TPM 상태·UEFI 변수를 지우지 않는다. 실행기가 멈추면 함께 멈춘다.
+/// 정리의 리더 확인 읽기를 기다리는 시간
+const SWEEP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 앞 정리 차례에 본 후보([`sweep_state_dirs`])
+#[derive(Debug, Default)]
+pub(super) struct SweepSeen {
+    /// Raft에 VM이 없는 상태 디렉터리
+    gone: HashSet<Uuid>,
+    /// 이 노드의 회차가 VM의 회차(값)와 다르고 지금 것이 아닌 TPM 상태가 남은 VM(리뷰 2 #7)
+    stale_tpm: HashSet<(Uuid, u32)>,
+}
+
+/// 지운 VM의 상태 디렉터리와 초기화 전 TPM 상태를 `tag_sweep`마다 지운다([`sweep_state_dirs`]). 시작할 때는 후보만 모으고,
+/// 다음 차례에도 후보이면 지운다(리뷰 1 I3): 다시 합류한 노드의 로컬 클러스터 상태가 아직 따라잡지 못해 VM 목록이 모자라도
+/// 그 사이에 따라잡으므로, 살아 있는 VM의 TPM 상태·UEFI 변수를 지우지 않는다. 실행기가 멈추면 함께 멈춘다.
 pub(super) async fn sweep_state_dirs_every(ctx: Arc<Ctx>) {
-    let mut candidates = HashSet::new();
+    let mut seen = SweepSeen::default();
     loop {
-        candidates = sweep_state_dirs(&ctx, &candidates).await;
+        seen = sweep_state_dirs(&ctx, &seen).await;
         tokio::time::sleep(ctx.config.tag_sweep).await;
     }
 }
 
-/// 이 노드의 `{state_dir}/vm/{id}` 가운데 Raft에 VM이 없는 것(후보)을 돌려주고, 그 가운데 앞 차례에도 후보였던
-/// (`before`) 것을 지운다(설계 §10): 디렉터리가 마지막으로 바뀐 지 `state_dir_min_age`(1시간)가 지났고 그 id를 대상으로
-/// 하는 끝나지 않은 Task가 없어야 한다(복원·복제는 VM을 만들기 전에 파일을 쓴다). 사용자가 VM을 지운 뜻대로 거쳐 간
-/// 노드의 UEFI 변수·TPM 상태(비밀)를 남기지 않는다. 다른 노드가 맡은 VM을 포함해 VM이 있는 디렉터리는 건드리지 않는다.
-/// 목록을 읽지 못하거나 이 노드가 받은 클러스터 기록을 아직 다 적용하지 않았으면 아무것도 지우지 않는다.
-pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &HashSet<Uuid>) -> HashSet<Uuid> {
-    let mut found = HashSet::new();
+/// 이 노드의 `{state_dir}/vm/{id}`를 정리한다. 앞 차례(`before`)에도 같은 후보였던 것만 지우고 이번 후보를 돌려준다.
+///
+/// - Raft에 VM이 없는 디렉터리(설계 §10): 마지막으로 바뀐 지 `state_dir_min_age`(1시간)가 지났고 그 id를 대상으로 하는
+///   끝나지 않은 Task가 없으면 지운다(복원·복제는 VM을 만들기 전에 파일을 쓴다). 사용자가 VM을 지운 뜻대로 거쳐 간 노드의
+///   UEFI 변수·TPM 상태(비밀)를 남기지 않는다.
+/// - VM이 있으면 디렉터리는 두되, 이 노드의 회차가 VM의 회차와 달라(오프라인 동안 초기화됨) 남은 TPM 상태가 지금 것이
+///   아니면([`tpm_is_current`]) 그 TPM 상태만 지운다(리뷰 2 #7 — 그 VM이 이 노드에서 켜지기 전까지 비밀이 남지 않게).
+///   VM이 이 노드에서 돌거나 끝나지 않은 Task의 대상이면 두고, 회차 파일을 읽지 못하면 모르는 것이라 둔다.
+///
+/// 목록을 읽기 전에 리더가 확인한 읽기([`opl_cluster::Cluster::read_index`])로 따라잡았는지 본다(리뷰 2 #6). 리더에 닿지
+/// 못하거나 목록을 읽지 못하면 후보만 모으고 아무것도 지우지 않는다.
+pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &SweepSeen) -> SweepSeen {
+    let mut found = SweepSeen::default();
     let Some(state) = &ctx.config.state_dir else {
         return found;
     };
@@ -462,7 +502,13 @@ pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &HashSet<Uuid>) -> HashS
             return found;
         }
     };
-    let caught_up = ctx.cluster.revision() >= ctx.cluster.known_revision();
+    let caught_up = match ctx.cluster.read_index(SWEEP_READ_TIMEOUT).await {
+        Ok(_) => true,
+        Err(e) => {
+            tracing::info!(error = %e, "cannot confirm the cluster state with the leader; not removing VM state");
+            false
+        }
+    };
     let (Ok((_, vms)), Ok((_, tasks))) =
         (ctx.cluster.list::<VmSpec>(), ctx.cluster.list::<TaskSpec>())
     else {
@@ -484,11 +530,19 @@ pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &HashSet<Uuid>) -> HashS
         else {
             continue;
         };
-        if vms.iter().any(|vm| vm.id == id)
-            || tasks
-                .iter()
-                .any(|t| t.spec.target == id && !t.status.state.is_finished())
+        if tasks
+            .iter()
+            .any(|t| t.spec.target == id && !t.status.state.is_finished())
         {
+            continue;
+        }
+        if let Some(vm) = vms.iter().find(|vm| vm.id == id) {
+            if let Some(key) = stale_tpm(ctx, state, vm).await {
+                found.stale_tpm.insert(key);
+                if caught_up && before.stale_tpm.contains(&key) {
+                    wipe_stale_tpm(ctx, state, id, key.1).await;
+                }
+            }
             continue;
         }
         let Ok(meta) = tokio::fs::symlink_metadata(entry.path()).await else {
@@ -501,8 +555,8 @@ pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &HashSet<Uuid>) -> HashS
         if !meta.is_dir() || age.is_none_or(|a| a < ctx.config.state_dir_min_age) {
             continue;
         }
-        found.insert(id);
-        if !caught_up || !before.contains(&id) {
+        found.gone.insert(id);
+        if !caught_up || !before.gone.contains(&id) {
             continue;
         }
         // 목록을 읽은 뒤 만든 VM일 수 있다. 지우기 바로 전에 다시 본다.
@@ -511,12 +565,49 @@ pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &HashSet<Uuid>) -> HashS
         }
         match tokio::fs::remove_dir_all(entry.path()).await {
             Ok(()) => {
-                found.remove(&id);
+                found.gone.remove(&id);
                 tracing::info!(vm = %id, "removed the state directory of a deleted VM");
             }
             Err(e) => {
                 tracing::warn!(vm = %id, error = %e, "cannot remove the state directory of a deleted VM");
             }
+        }
+    }
+}
+
+/// 이 노드에 VM `vm`의 초기화 전 TPM 상태가 남았으면 (VM id, VM의 회차): TPM 디렉터리가 있고, 이 노드의 회차를 읽었고
+/// VM의 회차와 다르며, 이 노드의 파일이 지금 것이 아니고([`tpm_is_current`]), 이 노드에서 VM이 돌지 않는다.
+async fn stale_tpm(ctx: &Ctx, state: &Path, vm: &Vm) -> Option<(Uuid, u32)> {
+    let epoch = vm.status.firmware_epoch;
+    if !tokio::fs::try_exists(vm_tpm_dir(state, vm.id))
+        .await
+        .unwrap_or(false)
+        || !matches!(read_firmware_epoch(state, vm.id), Ok(e) if e != epoch)
+    {
+        return None;
+    }
+    let local = file_hash(&tpm_state_path(state, vm.id)).await.ok()?;
+    if tpm_is_current(&vm.status, ctx.config.node, local.as_deref())
+        || !matches!(ctx.hv.inspect(vm.id).await, Ok(None))
+    {
+        return None;
+    }
+    Some((vm.id, epoch))
+}
+
+/// 지우기 바로 전에 VM을 다시 읽어 아직 같은 회차의 낡은 TPM 상태이면 지운다.
+async fn wipe_stale_tpm(ctx: &Ctx, state: &Path, id: Uuid, epoch: u32) {
+    let Ok(Some(vm)) = ctx.cluster.get::<VmSpec>(id) else {
+        return;
+    };
+    if vm.status.firmware_epoch != epoch || stale_tpm(ctx, state, &vm).await.is_none() {
+        return;
+    }
+    match tokio::fs::remove_dir_all(vm_tpm_dir(state, id)).await {
+        Ok(()) => tracing::info!(vm = %id, "removed a TPM state from before a firmware reset"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(vm = %id, error = %e, "cannot remove a TPM state from before a firmware reset");
         }
     }
 }
@@ -528,6 +619,7 @@ mod tests {
     fn status(node: Uuid) -> VmStatus {
         VmStatus {
             firmware_node: Some(node),
+            tpm_node: Some(node),
             tpm_sha256: Some("ab".repeat(32)),
             firmware_copies: vec![Uuid::now_v7()],
             firmware_epoch: 2,
@@ -540,31 +632,33 @@ mod tests {
     fn reset_of_both_forgets_everything() {
         let me = Uuid::now_v7();
         let mut s = status(me);
-        reset_status(&mut s, true, me, true, true);
+        reset_status(&mut s, me, true, true);
         assert_eq!(s.firmware_epoch, 3);
         assert_eq!(s.tpm_sha256, None);
         assert_eq!(s.firmware_node, None);
+        assert_eq!(s.tpm_node, None);
         assert!(s.firmware_copies.is_empty());
     }
 
-    /// 변수만 초기화하면 TPM VM은 상태의 자리(`firmware_node`)와 해시를 지키고, TPM 없는 VM은 자리를 지운다.
+    /// 변수만 초기화하면 TPM 상태의 노드(`tpm_node`)·해시·사본을 지킨다(리뷰 2 #3). 변수의 노드는 지운다.
     #[test]
-    fn reset_of_the_vars_keeps_the_tpm_location() {
-        let (me, other) = (Uuid::now_v7(), Uuid::now_v7());
-        let mut s = status(other);
-        reset_status(&mut s, true, me, true, false);
-        assert_eq!(s.firmware_node, Some(other));
-        assert_eq!(s.tpm_sha256, Some("ab".repeat(32)));
-        assert!(s.firmware_copies.is_empty());
-        assert_eq!(s.firmware_epoch, 3);
-
-        let mut plain = VmStatus {
+    fn reset_of_the_vars_keeps_the_tpm_holder_and_copies() {
+        let (me, a) = (Uuid::now_v7(), Uuid::now_v7());
+        // TPM을 끈 채 me에서 돌았다: 변수는 me, TPM 상태는 a.
+        let mut s = VmStatus {
             firmware_node: Some(me),
+            tpm_node: Some(a),
+            tpm_sha256: Some("ab".repeat(32)),
+            firmware_copies: vec![a],
+            firmware_epoch: 2,
             ..Default::default()
         };
-        reset_status(&mut plain, false, me, true, false);
-        assert_eq!(plain.firmware_node, None);
-        assert_eq!(plain.firmware_epoch, 1);
+        reset_status(&mut s, me, true, false);
+        assert_eq!(s.firmware_node, None);
+        assert_eq!(s.tpm_node, Some(a));
+        assert_eq!(s.tpm_sha256, Some("ab".repeat(32)));
+        assert_eq!(s.firmware_copies, [a]);
+        assert_eq!(s.firmware_epoch, 3);
     }
 
     /// TPM만 초기화하면 이 노드가 변수를 가진 노드일 때만 그 자리를 지킨다.
@@ -572,12 +666,14 @@ mod tests {
     fn reset_of_the_tpm_keeps_the_vars_of_this_node() {
         let (me, other) = (Uuid::now_v7(), Uuid::now_v7());
         let mut here = status(me);
-        reset_status(&mut here, true, me, false, true);
+        reset_status(&mut here, me, false, true);
         assert_eq!(here.firmware_node, Some(me));
         assert_eq!(here.tpm_sha256, None);
+        assert_eq!(here.tpm_node, None);
+        assert!(here.firmware_copies.is_empty());
 
         let mut elsewhere = status(other);
-        reset_status(&mut elsewhere, true, me, false, true);
+        reset_status(&mut elsewhere, me, false, true);
         assert_eq!(elsewhere.firmware_node, None);
     }
 

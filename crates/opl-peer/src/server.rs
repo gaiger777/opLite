@@ -472,6 +472,20 @@ impl Peer for PeerService {
             .clone()
             .ok_or_else(|| Status::unimplemented("this node does not serve UEFI variables"))?;
         let vm = req.into_inner().vm;
+        // 이 노드의 회차가 VM의 회차와 다르면 이 노드의 변수는 초기화 전의 것이다(오프라인 동안 초기화된 사본 노드 등):
+        // 주지 않는다(리뷰 2 #3). 회차 파일을 읽지 못하면 모르는 것이라 준다.
+        let epoch = self
+            .cluster
+            .get::<VmSpec>(vm)
+            .map_err(|e| Status::unavailable(e.to_string()))?
+            .map(|v| v.status.firmware_epoch);
+        if let Some(epoch) = epoch
+            && opl_driver::firmware_epoch_differs(&dir, vm, epoch)
+        {
+            return Err(Status::failed_precondition(format!(
+                "the UEFI variables of VM {vm} on this node are from before a firmware reset"
+            )));
+        }
         let stream = self
             .offload(async move {
                 let file = match tokio::fs::File::open(uefi_vars_path(&dir, vm)).await {
@@ -543,14 +557,14 @@ impl Peer for PeerService {
         };
         let req = req.into_inner();
         let vm = req.vm;
-        // 이 노드가 지금 것을 가졌으면(VM이 여기서 돌거나 `firmware_node`) 낡을 수 있는 사본으로 덮지 않는다.
+        // 이 노드가 지금 것을 가졌으면(VM이 여기서 돌거나 `firmware_node`·`tpm_node`) 낡을 수 있는 사본으로 덮지 않는다.
         let me = self.cluster.id().0;
-        let holder = self
+        let holds = self
             .cluster
             .get::<VmSpec>(vm)
             .map_err(|e| Status::unavailable(e.to_string()))?
-            .and_then(|v| v.status.firmware_node);
-        if holder == Some(me) {
+            .is_some_and(|v| v.status.firmware_node == Some(me) || v.status.tpm_node == Some(me));
+        if holds {
             return Err(Status::failed_precondition(format!(
                 "this node holds the current firmware files of VM {vm}"
             )));

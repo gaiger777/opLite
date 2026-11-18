@@ -11,6 +11,7 @@ use opl_cluster::types::NodeId;
 use opl_driver::{KeepFirmware, adopt_firmware_epoch, tpm_state_path, uefi_vars_path};
 use opl_peer::{Peers, PurgeFirmwareRequest, PushFirmwareRequest, read_chunks, sha256_hex};
 use opl_reconciler::{FirmwareCopy, FirmwareError, FirmwareFetcher, FirmwarePurge};
+use opl_types::firmware::tpm_is_current;
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
 use uuid::Uuid;
@@ -71,15 +72,14 @@ impl UefiVarsFetcher {
             .map_err(|e| FirmwareError(format!("cannot record the firmware epoch: {e}")))
     }
 
-    /// 이 노드의 TPM 상태가 VM의 지금 해시(`tpm_sha256`)와 같은지. 해시가 없으면(초기화 뒤 새로 만들 차례) 아니다.
-    async fn tpm_current(&self, vm: Uuid, sha256: Option<&str>) -> bool {
-        let Some(want) = sha256 else {
-            return false;
+    /// 이 노드의 TPM 상태가 지금 것인지([`tpm_is_current`]: 이 노드가 `tpm_node`이거나 해시가 VM의 `tpm_sha256`과
+    /// 같다). 회차를 옮길 때 지금 것인 TPM 상태는 지우지 않는다(리뷰 2).
+    async fn tpm_current(&self, vm: &opl_types::vm::Vm) -> bool {
+        let local = match tokio::fs::read(tpm_state_path(&self.state_dir, vm.id)).await {
+            Ok(data) => Some(sha256_hex(&data)),
+            Err(_) => None,
         };
-        match tokio::fs::read(tpm_state_path(&self.state_dir, vm)).await {
-            Ok(data) => sha256_hex(&data) == want,
-            Err(_) => false,
-        }
+        tpm_is_current(&vm.status, self.cluster.id().0, local.as_deref())
     }
 }
 
@@ -122,7 +122,7 @@ impl FirmwareFetcher for UefiVarsFetcher {
             .map_err(|e| FirmwareError(e.to_string()))?;
         match current {
             Some(v) => {
-                let tpm = self.tpm_current(vm, v.status.tpm_sha256.as_deref()).await;
+                let tpm = self.tpm_current(&v).await;
                 let keep = KeepFirmware { vars: true, tpm };
                 self.record_epoch(vm, v.status.firmware_epoch, keep)
             }

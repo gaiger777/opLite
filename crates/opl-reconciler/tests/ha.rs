@@ -893,6 +893,7 @@ async fn received_ha_vm_is_continued_only_with_the_lease() {
         secure_boot: false,
         freeze_fs: false,
         firmware_epoch: 0,
+        keep_tpm: false,
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])

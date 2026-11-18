@@ -48,7 +48,7 @@ pub use storage::{
     parse_ceph_df, parse_lvs, parse_vgs, parse_zfs_dataset, pool_root,
 };
 pub use tpm::{
-    KeepFirmware, SwtpmConfig, adopt_firmware_epoch, read_firmware_epoch, tpm_state_path,
-    vm_tpm_dir, write_firmware_epoch,
+    KeepFirmware, SwtpmConfig, adopt_firmware_epoch, firmware_epoch_differs, read_firmware_epoch,
+    tpm_state_path, vm_tpm_dir, write_firmware_epoch,
 };
 pub use vip::{IpVip, VipAddress, VipNet, VipRecord, release_recorded};

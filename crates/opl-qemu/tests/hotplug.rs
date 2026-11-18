@@ -70,6 +70,7 @@ fn spec(host: &HostProfile, id: Uuid, disk: PathBuf, layout: HotplugLayout) -> V
         secure_boot: false,
         freeze_fs: false,
         firmware_epoch: 0,
+        keep_tpm: false,
     }
 }
 

@@ -5,7 +5,8 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
 use opl_types::firmware::{
-    TpmSource, firmware_copy_nodes, move_firmware_node, tpm_source, tpm_unavailable,
+    TpmSource, firmware_copy_nodes, move_firmware_node, tpm_is_current, tpm_source,
+    tpm_unavailable, vars_source,
 };
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
@@ -1176,8 +1177,8 @@ impl Worker {
         // 방금 이 노드에서 켰다(배타).
         self.disks_shared = false;
         // TPM 상태를 얻지 못하면(지금 것을 가진 노드가 모두 오프라인) 실패로 세지 않고 켜지 않은 채 다시 본다.
-        let tpm = match self.prepare_firmware(vm).await {
-            Ok(tpm) => tpm,
+        let (tpm, keep_tpm) = match self.prepare_firmware(vm).await {
+            Ok(prepared) => prepared,
             Err(reason) => {
                 tracing::warn!(vm = %self.id, error = %reason, "TPM state unavailable; not starting");
                 self.deactivate_disks(vm).await;
@@ -1229,6 +1230,7 @@ impl Worker {
                 epoch: vm.status.firmware_epoch,
             }));
         }
+        spec.keep_tpm = keep_tpm;
         let started = self.hv.start(&spec, restore.as_deref()).await;
         if started.is_err() {
             self.deactivate_disks(vm).await;
@@ -1420,14 +1422,28 @@ impl Worker {
     /// 멈춘 VM을 새로 켜기 전에 펌웨어 파일을 맞춘다(계획 59 §5의 켜기 규칙). TPM이 없는 VM은 UEFI 변수만 받아 온다
     /// ([`Self::fetch_firmware`], 받지 못해도 켠다). TPM VM은 [`tpm_source`]를 따른다.
     ///
-    /// - 이 노드의 상태가 지금 것이면(`firmware_node`이거나 해시가 같음) 그것으로 켜고, 변수는 지금처럼 받아 온다.
-    /// - 아니면 `firmware_node`, 그다음 온라인 사본 노드에서 TPM 상태(해시 확인)와 그 노드의 변수를 받는다.
+    /// - 이 노드의 상태가 지금 것이면(`tpm_node`이거나 해시가 같음) 그것으로 켜고, 변수는 지금처럼 받아 온다.
+    /// - 아니면 `tpm_node`, 그다음 온라인 사본 노드에서 TPM 상태(해시 확인)를 받는다. 변수는 `firmware_node`가 온라인이면
+    ///   거기서, 아니면 TPM 상태를 준 노드에서 받는다(그 노드는 회차가 다른 변수를 주지 않는다).
     /// - 기록된 TPM 상태가 없으면 새로 만든다(`fresh`, 이 노드에 파일이 있으면 그대로 쓴다).
     /// - 그 밖이면 켜지 않는다: 남길 문구를 돌려준다(몰래 새 TPM으로 켜지 않는다).
-    async fn prepare_firmware(&mut self, vm: &Vm) -> Result<Option<RuntimeTpm>, String> {
+    ///
+    /// 둘째 값은 드라이버가 회차가 바뀐 이 노드의 파일을 지울 때 TPM 상태를 남길지다([`tpm_is_current`], 리뷰 2).
+    async fn prepare_firmware(&mut self, vm: &Vm) -> Result<(Option<RuntimeTpm>, bool), String> {
+        let me = self.config.node;
+        let local = match self.config.state_dir.clone() {
+            Some(dir) if vm.spec.firmware == Firmware::Uefi => {
+                self.tpm_hash(&dir).await.unwrap_or_else(|e| {
+                    tracing::warn!(vm = %self.id, error = %e, "cannot read the TPM state on this node");
+                    None
+                })
+            }
+            _ => None,
+        };
+        let keep = tpm_is_current(&vm.status, me, local.as_deref());
         if !vm.spec.tpm {
             self.fetch_firmware(vm).await;
-            return Ok(None);
+            return Ok((None, keep));
         }
         let epoch = vm.status.firmware_epoch;
         let nodes = self
@@ -1435,24 +1451,20 @@ impl Worker {
             .list::<NodeSpec>()
             .map(|(_, nodes)| nodes)
             .unwrap_or_default();
-        let local = match self.config.state_dir.clone() {
-            Some(dir) => self.tpm_hash(&dir).await.unwrap_or_else(|e| {
-                tracing::warn!(vm = %self.id, error = %e, "cannot read the TPM state on this node");
-                None
-            }),
-            None => None,
-        };
-        let from = match tpm_source(vm, self.config.node, local.as_deref(), &nodes) {
+        let from = match tpm_source(vm, me, local.as_deref(), &nodes) {
             TpmSource::Local => {
                 self.fetch_firmware(vm).await;
-                return Ok(Some(RuntimeTpm {
-                    fresh: false,
-                    epoch,
-                }));
+                return Ok((
+                    Some(RuntimeTpm {
+                        fresh: false,
+                        epoch,
+                    }),
+                    keep,
+                ));
             }
             TpmSource::Fresh => {
                 self.fetch_firmware(vm).await;
-                return Ok(Some(RuntimeTpm { fresh: true, epoch }));
+                return Ok((Some(RuntimeTpm { fresh: true, epoch }), keep));
             }
             TpmSource::Unavailable(reason) => return Err(reason),
             TpmSource::Fetch(from) => from,
@@ -1463,18 +1475,19 @@ impl Worker {
                 match fetcher.fetch_tpm(self.id, node, &hash, epoch).await {
                     Ok(()) => {
                         tracing::info!(vm = %self.id, from = %node, "fetched the TPM state");
-                        // 변수도 TPM 상태를 준 노드에서 받는다(사본은 둘을 함께 둔다). 이 노드가 `firmware_node`면(TPM을
-                        // 끈 동안 옮겨 옴) 이 노드의 변수가 지금 것이다.
                         if vm.spec.firmware == Firmware::Uefi
-                            && vm.status.firmware_node != Some(self.config.node)
-                            && let Err(e) = fetcher.fetch(self.id, node).await
+                            && let Some(vars) = vars_source(vm, me, node, &nodes)
+                            && let Err(e) = fetcher.fetch(self.id, vars).await
                         {
-                            tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
+                            tracing::warn!(vm = %self.id, from = %vars, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
                         }
-                        return Ok(Some(RuntimeTpm {
-                            fresh: false,
-                            epoch,
-                        }));
+                        return Ok((
+                            Some(RuntimeTpm {
+                                fresh: false,
+                                epoch,
+                            }),
+                            true,
+                        ));
                     }
                     Err(e) => {
                         tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch the TPM state");
@@ -1482,8 +1495,7 @@ impl Worker {
                 }
             }
         }
-        let me = self.config.node;
-        let holder = vm.status.firmware_node.filter(|id| *id != me).map(|id| {
+        let holder = vm.status.tpm_node.filter(|id| *id != me).map(|id| {
             nodes
                 .iter()
                 .find(|n| n.id == id)
@@ -1526,7 +1538,7 @@ impl Worker {
     async fn sync_firmware(&mut self, vm: &Vm, status: &mut VmStatus) {
         let node = self.config.node;
         let tpm = vm.spec.tpm || status.hardware.as_ref().is_some_and(|hw| hw.tpm);
-        if !tpm || vm.spec.node != Some(node) || status.firmware_node != Some(node) {
+        if !tpm || vm.spec.node != Some(node) || status.tpm_node != Some(node) {
             return;
         }
         let Some(dir) = self.config.state_dir.clone() else {
@@ -1562,6 +1574,10 @@ impl Worker {
         let (Some(fetcher), Some(hash)) = (&self.config.firmware, status.tpm_sha256.clone()) else {
             return true;
         };
+        // 사본은 변수와 TPM 상태를 함께 둔다. 이 노드의 변수가 지금 것일 때만 민다.
+        if status.firmware_node != Some(self.config.node) {
+            return true;
+        }
         let Ok((_, nodes)) = self.cluster.list::<NodeSpec>() else {
             return false;
         };
@@ -1676,8 +1692,8 @@ impl Worker {
     }
 
     /// UEFI VM이 이 노드의 변수 파일로 돈다: 이 노드를 `firmware_node`로 남긴다. BIOS VM은 그대로 둔다. 다른 노드에서
-    /// 넘어왔으면(마이그레이션을 확정보다 먼저 넘겨받음) 펌웨어 사본은 비운다(계획 59 §10, 해시 기록 뒤 다시 밀어 둔다).
-    /// TPM을 끈 채 넘어왔으면 TPM 상태를 가진 앞 노드를 사본으로 남긴다([`move_firmware_node`]).
+    /// TPM VM이면 이 노드가 `tpm_node`이고, 다른 노드에서 넘어왔으면 펌웨어 사본은 비운다(계획 59 §10, 해시 기록 뒤 다시
+    /// 밀어 둔다). TPM을 끈 채 돌면 `tpm_node`와 사본은 그대로다([`move_firmware_node`]).
     fn own_firmware(&self, vm: &Vm, status: &mut VmStatus) {
         if vm.spec.firmware == Firmware::Uefi {
             let tpm = vm.spec.tpm || status.hardware.as_ref().is_some_and(|hw| hw.tpm);
@@ -1901,6 +1917,7 @@ impl Worker {
     /// 리더가 쓴다). 복제본으로 한 HA 복구 기록(`last_recovery`)은 리더만 쓰므로 늘 저장소의 것이다.
     async fn write_status(&self, mut status: VmStatus, mut vm: Vm) -> Result<(), StepError> {
         let keep_firmware = status.firmware_node == vm.status.firmware_node;
+        let keep_tpm_node = status.tpm_node == vm.status.tpm_node;
         // TPM 해시와 사본은 이 작업자가 바꾸지 않았으면 저장소의 것을 지킨다(사본 밀어 두기·마이그레이션 확정·초기화가
         // 쓴다). 그 사이 초기화됐으면(회차가 바뀜) 이 작업자가 바꿨어도 저장소의 것이다. 회차는 늘 저장소의 것이다.
         let keep_tpm = status.tpm_sha256 == vm.status.tpm_sha256
@@ -1919,6 +1936,9 @@ impl Worker {
             if keep_tpm || vm.status.firmware_epoch != read_epoch {
                 status.tpm_sha256 = vm.status.tpm_sha256.clone();
                 status.firmware_copies = vm.status.firmware_copies.clone();
+            }
+            if keep_tpm_node || vm.status.firmware_epoch != read_epoch {
+                status.tpm_node = vm.status.tpm_node;
             }
             status.firmware_epoch = vm.status.firmware_epoch;
             if keep_hardware {
@@ -1985,6 +2005,7 @@ impl Worker {
             tpm_sha256: vm.status.tpm_sha256.clone(),
             firmware_copies: vm.status.firmware_copies.clone(),
             firmware_epoch: vm.status.firmware_epoch,
+            tpm_node: vm.status.tpm_node,
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

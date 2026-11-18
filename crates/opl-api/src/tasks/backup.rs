@@ -1106,6 +1106,7 @@ pub(super) async fn restore(
             .map_err(|e| format!("cannot restore the TPM state: {e}"))?;
         new.status.tpm_sha256 = Some(sha256);
         new.status.firmware_node = Some(ctx.config.node);
+        new.status.tpm_node = Some(ctx.config.node);
     }
     for copy in &copies {
         mark_ready(ctx, copy, &target).await;
