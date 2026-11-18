@@ -10,6 +10,7 @@ use opl_types::replication::{DEFAULT_INTERVAL, parse_interval};
 use reqwest::Method;
 use serde_json::{Value, json};
 
+use crate::alerts::{AlertCmd, NotifyCmd, alert, notify};
 use crate::ceph::{CephCmd, ceph, node_disks};
 use crate::client::{
     ApiError, BACKUP_WAIT, Client, DRAIN_WAIT, IMPORT_WAIT, MIGRATE_WAIT, NotLoggedIn,
@@ -25,6 +26,7 @@ use crate::media::{
     CloudInitArgs, CloudInitClear, CloudInitInput, IsoCmd, VmCdromCmd, apply_boot, boot_line,
     cdrom_lines, cdroms_value, cloud_init_lines, cloud_init_update, iso, parse_boot, vm_cdrom,
 };
+use crate::metrics::{PrometheusCmd, RangeArgs, cluster_history, history, prometheus};
 use crate::output::{bytes, cell, json as print_json, table};
 use crate::template::{
     ImageCmd, TemplateCmd, VOLUME_HEADERS, image, linked_value, template, template_lines,
@@ -185,6 +187,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TelemetryCmd,
     },
+    /// 경보: 규칙(지표 임계값·지속 시간, 상태, 이벤트), 활성 경보, 보낸 알림 기록
+    Alert {
+        #[command(subcommand)]
+        cmd: AlertCmd,
+    },
+    /// 알림 대상(SMTP, webhook·Slack·Teams·ntfy·Gotify)과 시험 보내기(admin만)
+    Notify {
+        #[command(subcommand)]
+        cmd: NotifyCmd,
+    },
+    /// Prometheus 끌어가기 끝점 `GET /api/v1/metrics`(기본 꺼짐)
+    Prometheus {
+        #[command(subcommand)]
+        cmd: PrometheusCmd,
+    },
     /// 감사 로그(admin만): 모든 노드의 바꾸는 요청·로그인·콘솔 열기를 새 것부터
     Audit(AuditArgs),
     /// 원격 클러스터: 다른 Orbivisor 클러스터를 등록해 상태를 모아 보고, 그 클러스터의 API를 이 클러스터를
@@ -322,8 +339,13 @@ enum NodeCmd {
         wait: bool,
     },
     /// 노드마다 마지막 사용량 점(CPU, 메모리, 디스크, 네트워크, 데이터 파일 시스템). `-o json`은 남은 모든
-    /// 점(1시간)이다.
-    Stats(StatsArgs),
+    /// 점(1시간)이다. `--range`·`--from`이면 NODE의 기록 요약이고, NODE가 없으면 클러스터 요약(클러스터 열, 노드 줄,
+    /// 상위 VM, 풀)이다. NODE만 주면 지난 1시간의 기록 요약이다.
+    Stats {
+        node: Option<String>,
+        #[command(flatten)]
+        stats: StatsArgs,
+    },
     /// 얼린 노드(호스트 종료 정책 `freeze`로 HA VM을 끄고 꺼진 노드)의 표시를 지워 리더가 그 HA VM을 다른 노드로
     /// 옮기게 한다. 돌아오지 않는 노드에 쓴다(오프라인일 때만).
     Unfreeze {
@@ -614,8 +636,11 @@ async fn node_fence_test(
 #[derive(Args)]
 struct StatsArgs {
     /// 5초마다 다시 읽어 새 표를 이어 찍는다(Ctrl-C로 끝낸다).
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["range", "from", "points"])]
     watch: bool,
+    /// 기록 요약(`--range`·`--from`·`--until`·`--points`): 칸마다 범위의 AVG·MAX·MIN·p50·p95. 근사면 `P95~`이다.
+    #[command(flatten)]
+    range: RangeArgs,
 }
 
 /// `node maintenance`의 켜기·끄기
@@ -867,6 +892,12 @@ enum PoolCmd {
     Set(PoolSet),
     Delete {
         pool: String,
+    },
+    /// 풀 사용량 기록 요약(`pool_used`·`pool_total`, 기본 지난 1시간). `-o json`은 응답 그대로다.
+    Stats {
+        pool: String,
+        #[command(flatten)]
+        range: RangeArgs,
     },
 }
 
@@ -1594,6 +1625,7 @@ enum VmCmd {
         cmd: SnapshotCmd,
     },
     /// VM의 마지막 사용량 점(QEMU 프로세스의 CPU·RSS, 디스크, 네트워크). `-o json`은 남은 모든 점(1시간)이다.
+    /// `--range`·`--from`이면 VM이 도는 노드의 기록 요약이다(마이그레이션 뒤에도 기록이 따라간다).
     Stats {
         vm: String,
         #[command(flatten)]
@@ -5671,7 +5703,21 @@ where
                 writeln!(out, "node {node}: labels updated")?;
             }
             NodeCmd::Drain { node, wait } => node_drain(&client, &node, wait, out).await?,
-            NodeCmd::Stats(stats) => {
+            NodeCmd::Stats {
+                node: Some(node),
+                stats,
+            } => {
+                if stats.watch {
+                    bail!("--watch shows every node; leave out NODE");
+                }
+                let path = format!("/nodes/{}/metrics/history", seg(&node));
+                history(&client, &path, &stats.range, json_out, out).await?
+            }
+            NodeCmd::Stats { node: None, stats } if stats.range.given() => {
+                cluster_history(&client, &stats.range, json_out, out, &mut std::io::stderr())
+                    .await?
+            }
+            NodeCmd::Stats { node: None, stats } => {
                 node_stats(&client, stats.watch, json_out, out, &mut std::io::stderr()).await?
             }
             NodeCmd::Unfreeze { node } => node_unfreeze(&client, &node, out).await?,
@@ -5726,6 +5772,10 @@ where
                     .delete(&format!("/storage-pools/{}", seg(&pool)))
                     .await?;
                 writeln!(out, "storage pool {pool} deleted")?;
+            }
+            PoolCmd::Stats { pool, range } => {
+                let path = format!("/storage-pools/{}/metrics/history", seg(&pool));
+                history(&client, &path, &range, json_out, out).await?
             }
         },
         Cmd::Ceph { cmd } => ceph(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
@@ -5931,6 +5981,9 @@ where
         Cmd::Placement { cmd } => placement(&client, cmd, json_out, out).await?,
         Cmd::Subscription { cmd } => subscription(&client, cmd, json_out, out).await?,
         Cmd::Telemetry { cmd } => telemetry(&client, cmd, json_out, out).await?,
+        Cmd::Alert { cmd } => alert(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
+        Cmd::Notify { cmd } => notify(&client, cmd, json_out, out).await?,
+        Cmd::Prometheus { cmd } => prometheus(&client, cmd, json_out, out).await?,
         Cmd::Audit(args) => audit(&client, args, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Remote { cmd } => remote(&client, cmd, json_out, out).await?,
     }
@@ -7897,6 +7950,10 @@ async fn vm(
         VmCmd::Snapshot { cmd } => snapshot(client, cmd, json_out, out).await?,
         VmCmd::Firmware { cmd } => firmware(client, cmd, out, &mut std::io::stderr()).await?,
         VmCmd::Guest(args) => guest(client, args, json_out, out).await?,
+        VmCmd::Stats { vm, stats } if stats.range.given() => {
+            let path = format!("/vms/{}/metrics/history", seg(&vm));
+            history(client, &path, &stats.range, json_out, out).await?
+        }
         VmCmd::Stats { vm, stats } => {
             vm_stats(
                 client,
@@ -15697,21 +15754,124 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         }
     }
 
-    /// `node stats`·`vm stats`는 `--watch`를 받는다.
+    /// `node stats`·`vm stats`는 `--watch`를 받고, 기록 범위(`--range`·`--from`·`--until`·`--points`)는 `--watch`와
+    /// 함께 쓰지 않는다. `--until`은 `--from`과 함께만, `--range`는 `--from`과 함께 쓰지 않는다.
     #[test]
     fn parses_stats_commands() {
         let cli = Cli::try_parse_from(["oplctl", "node", "stats", "--watch"]).unwrap();
         assert!(matches!(
             cli.cmd,
             Cmd::Node {
-                cmd: NodeCmd::Stats(StatsArgs { watch: true })
+                cmd: NodeCmd::Stats {
+                    node: None,
+                    stats: StatsArgs { watch: true, .. }
+                }
             }
         ));
         let cli = Cli::try_parse_from(["oplctl", "vm", "stats", "web"]).unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Vm { cmd: VmCmd::Stats { vm, stats: StatsArgs { watch: false } } } if vm == "web"
+            Cmd::Vm { cmd: VmCmd::Stats { vm, stats: StatsArgs { watch: false, ref range } } }
+                if vm == "web" && !range.given()
         ));
+        let cli =
+            Cli::try_parse_from(["oplctl", "node", "stats", "n1", "--range", "week"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Node { cmd: NodeCmd::Stats { node: Some(n), stats } } if n == "n1" && stats.range.given()
+        ));
+        let cli = Cli::try_parse_from([
+            "oplctl", "pool", "stats", "local", "--from", "2d", "--until", "1d", "--points", "10",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Pool { cmd: PoolCmd::Stats { pool, range } } if pool == "local" && range.points == Some(10)
+        ));
+        for bad in [
+            &["oplctl", "node", "stats", "--watch", "--range", "day"][..],
+            &["oplctl", "vm", "stats", "web", "--until", "1h"][..],
+            &[
+                "oplctl", "vm", "stats", "web", "--range", "day", "--from", "2h",
+            ][..],
+            &["oplctl", "pool", "stats", "local", "--points", "0"][..],
+            &["oplctl", "node", "stats", "--range", "decade"][..],
+        ] {
+            assert!(Cli::try_parse_from(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    /// `node stats NODE`·`node stats --range`(NODE 없음, 클러스터 요약)·`vm stats --from`·`pool stats`가 부르는 기록 경로
+    #[tokio::test]
+    async fn stats_with_a_range_call_the_history_routes() {
+        let (client, seen) = fake_api(|path| {
+            if path.starts_with("/api/v1/metrics/cluster") {
+                json!({ "tier": "min30", "step_ms": 1_800_000, "start": 0, "columns": {}, "nodes": [],
+                        "node_count": 0, "top": [], "pools": [], "unreachable": [], "unsupported": [] })
+            } else {
+                json!({ "tier": "raw5s", "step_ms": 5000, "start": 0, "columns": {} })
+            }
+        })
+        .await;
+        let mut out = Vec::new();
+        for args in [
+            &["oplctl", "node", "stats", "n1"][..],
+            &["oplctl", "node", "stats", "--range", "month"][..],
+            &[
+                "oplctl",
+                "vm",
+                "stats",
+                "web",
+                "--from",
+                "1700000000000",
+                "--points",
+                "5",
+            ][..],
+            &["oplctl", "pool", "stats", "local", "--range", "year"][..],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            match cli.cmd {
+                Cmd::Node {
+                    cmd:
+                        NodeCmd::Stats {
+                            node: Some(node),
+                            stats,
+                        },
+                } => {
+                    let path = format!("/nodes/{}/metrics/history", seg(&node));
+                    history(&client, &path, &stats.range, true, &mut out)
+                        .await
+                        .unwrap()
+                }
+                Cmd::Node {
+                    cmd: NodeCmd::Stats { node: None, stats },
+                } => {
+                    assert!(stats.range.given());
+                    cluster_history(&client, &stats.range, true, &mut out, &mut Vec::new())
+                        .await
+                        .unwrap()
+                }
+                Cmd::Vm { cmd } => vm(&client, cmd, true, &mut out).await.unwrap(),
+                Cmd::Pool {
+                    cmd: PoolCmd::Stats { pool, range },
+                } => {
+                    let path = format!("/storage-pools/{}/metrics/history", seg(&pool));
+                    history(&client, &path, &range, true, &mut out)
+                        .await
+                        .unwrap()
+                }
+                _ => unreachable!(),
+            }
+        }
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                "GET /api/v1/nodes/n1/metrics/history HTTP/1.1",
+                "GET /api/v1/metrics/cluster?range=month HTTP/1.1",
+                "GET /api/v1/vms/web/metrics/history?from=1700000000000&points=5 HTTP/1.1",
+                "GET /api/v1/storage-pools/local/metrics/history?range=year HTTP/1.1",
+            ]
+        );
     }
 
     /// `--since`의 기간(`30m`·`1h`·`7d`)은 지금에서 뺀 유닉스 밀리초로, 나머지는 그대로 보낸다.

@@ -1901,3 +1901,78 @@ async fn a_tpm_vm_migrates_with_its_state() {
     eprintln!("tpm state on node2 {moved}, back on node1 {back}");
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
 }
+
+/// 계획 60: VM 지표 기록이 라이브 마이그레이션을 따라간다. 디스크 없는 VM을 노드 1에서 켜 5초 점이 쌓이면 노드 2로
+/// 옮기고, 짧게 둔 `[test] metrics_push_secs` 뒤 노드 2의 `vm/{id}.rrd`에 노드 1 시절 점이 있고 노드 1의 파일은 없어진다.
+/// 기록 조회(`vm stats --range hour`)는 VM의 노드에 묻고 옮기기 전과 뒤의 점을 함께 보인다. `[test]` 고리는 `qemu-it`
+/// 빌드에 있다.
+#[cfg(feature = "qemu-it")]
+#[tokio::test]
+async fn metrics_history_follows_a_live_migration() {
+    let p = Pair::with_migration(
+        "mig-hist",
+        ["60420-60429", "60430-60439"],
+        "[test]\nmetrics_flush_secs = 1\nmetrics_push_secs = 1\n",
+    )
+    .await;
+    let d = &p.d[0];
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--node", "node1", "--start",
+    ])
+    .await
+    .unwrap();
+    let id = p.c[0].get("/vms/web").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // VM 기록 칸 cpu의 아는 점들(시각, 값)
+    let cpu = |reply: &Value| -> Vec<(i64, f64)> {
+        let start = reply["start"].as_i64().unwrap();
+        let step = reply["step_ms"].as_i64().unwrap();
+        reply["columns"]["cpu"]["avg"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+            .filter_map(|(i, v)| v.as_f64().map(|v| (start + i as i64 * step, v)))
+            .collect()
+    };
+    let history = || d.ctl_json(&["vm", "stats", "web", "--range", "hour", "--points", "1000"]);
+    eventually("two VM samples on node1", || async {
+        cpu(&history().await).len() >= 2
+    })
+    .await;
+    // 파일에 쓰인(1초마다) 점만 견준다.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let before = cpu(&history().await);
+    let file = |i: usize| {
+        p.d[i]
+            .data_dir()
+            .join("metrics")
+            .join("vm")
+            .join(format!("{id}.rrd"))
+    };
+    assert!(file(0).exists());
+
+    migrate(&p, 0, 1).await;
+    eventually("the history file moved to node2", || async {
+        file(1).exists() && !file(0).exists()
+    })
+    .await;
+    let last_before = before.last().unwrap().0;
+    eventually("a sample on node2", || async {
+        cpu(&history().await).iter().any(|(t, _)| *t > last_before)
+    })
+    .await;
+    let reply = history().await;
+    let after = cpu(&reply);
+    for (t, v) in &before {
+        assert!(
+            after
+                .iter()
+                .any(|(t2, v2)| t2 == t && (v2 - v).abs() < 1e-3),
+            "point {t} = {v} did not follow the VM: {reply}"
+        );
+    }
+    p.d[1].ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+}

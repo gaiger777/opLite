@@ -547,7 +547,8 @@ async fn sends_are_retried_and_rate_limited() {
     .await;
     let sender = SenderConfig {
         per_window: 2,
-        window: Duration::from_millis(500),
+        // 바쁜 기계에서도 뒤의 넷이 처음 것과 같은 창에 들게 넉넉히 둔다(500ms면 가끔 새 창이 열렸다).
+        window: Duration::from_secs(5),
         ..fast_sender()
     };
     let engine = rig.engine_with(rig.book.clone(), sender);
@@ -563,7 +564,7 @@ async fn sends_are_retried_and_rate_limited() {
     for _ in 0..4 {
         failed_task(&rig.env, TaskOp::VmStart).await;
     }
-    // 창(500ms)에 둘까지: 처음 것과 하나 더, 그다음 창에 "N건 더"
+    // 창(5초)에 둘까지: 처음 것과 하나 더, 그다음 창에 "N건 더"
     let hits = rig.hook.wait(3).await;
     let last = hits.last().unwrap().json();
     assert_eq!(last["state"], "firing");

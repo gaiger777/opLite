@@ -326,3 +326,15 @@ Prometheus 누적 카운터·OpenMetrics, Graphite·InfluxDB 밀어 보내기, �
 - **API 더함**: 규칙이 쓰는 대상 지우기는 409 `in_use`, 없는 대상을 쓰는 규칙은 400. 대상 이름은 바꾸지 못한다(400). 시험 보내기는 `Operate`(대상은 `account` 종류라 admin만)이고 꺼진 대상에도 보낸다. `/watch`에 `alert-rule`을 더했다(대상은 넣지 않음). `GET /alerts/history`는 `since`·`until`(유닉스 ms나 RFC 3339, 기본 24시간)·`limit`(1~5000, 기본 200)을 받는다.
 - **시험 고리**: `[test] alert_tick_ms`(`metrics-it`·`qemu-it`)는 평가 간격을 바꾸고 해제 대기도 같은 비율(12 tick)로 줄인다.
 - **Prometheus**: `orbivisor_alerts_firing{severity}`는 이 노드의 `firing` 노드 경보와, 리더면 리더 경보를 센다. 세 심각도를 모두(0 포함) 내고, 장부가 없는 노드(위트니스)는 내지 않는다.
+
+### 스테이지 6 (CLI·opld E2E·CI)
+
+- **CLI 모듈**: 18,000줄인 `cli.rs`에 더하지 않고 `oplctl/src/metrics.rs`(기록 요약·클러스터 요약·`prometheus`)와 `alerts.rs`(`alert`·`notify`)로 나눴다. 두 모듈의 시험은 새 `#[cfg(test)] fake_api.rs`(메서드·경로마다 상태와 JSON, 요청 줄·`If-Match`·본문을 남김)를 쓴다. `time`에 `parsing` 기능을 켰다(`--from`·`--until`의 RFC 3339).
+- **stats**: `node stats NODE`(범위 없으면 지난 1시간), `node stats --range …`(NODE 없음)는 설계에 CLI가 없던 클러스터 모으기 요약(클러스터 열의 평균·봉우리, 노드 줄, 상위 VM, 풀)이다. `NODE` 없이 범위도 없으면 지금처럼 마지막 점이다. `--from`·`--until`은 기간(`2h`, 지금에서 뺌)·유닉스 ms·RFC 3339를 받아 ms로 보낸다. `--points`만 줘도 기록 요약이다. `--watch`는 범위와 함께 쓰지 않는다. 표의 근사 표시는 머리 `P50~`·`P95~`다.
+- **prometheus**: `enable|disable` 외에 `show`와 별칭 `on|off`를 두었다. 켜면 긁을 URL을 보인다.
+- **비밀 입력**: `--password`·`--token`(값 없는 깃발), 값 없는 `--header NAME`, `--url -`(Slack·Teams처럼 URL이 비밀일 때)는 터미널이면 보이지 않게 묻고 아니면 표준 입력에서 한 줄씩 읽는다. `notify target set`은 읽은 보기에서 본문을 만들어 비밀을 보내지 않는다(SMTP `password` 뺌, webhook URL은 줄인 URL 그대로, 헤더는 빈 값). `--no-password`·`--no-token`·`--no-user`·`--no-ca`·`--rm-header`로 지운다.
+- **alert rule set**: 읽은 spec에 준 것만 바꾸고, `--gt`·`--lt`만 주면 지금 지표 조건의 문턱만 바꾼다. 리더 규칙은 status가 자주 바뀌므로 `revision_mismatch`면 세 번까지 다시 읽어 쓴다. 노드 대상 경보는 `node/NAME`, 그 밖은 `kind/NAME@NODE`로 보인다.
+- **E2E**: `tests/metrics_history.rs`(재시작 뒤 기록, Prometheus 긁기, `qemu-it`면 멈춘 채 옮긴 VM의 기록)와 `tests/alerts.rs`(webhook으로 시험·발생·해제·기록)는 `metrics-it` 또는 `qemu-it` 빌드에서 돈다(설계는 "기능 없이"였지만 `[test]` 고리가 시험 빌드에만 있다). 라이브 마이그레이션 확인은 `migration.rs`의 `metrics_history_follows_a_live_migration`이고 `[test]` 고리 때문에 `qemu-it`도 켜야 한다(GitHub `linux-kvm`은 둘 다 켠다). 이 Mac에서 모두 통과한다(TCG).
+- **리더 경보 E2E는 뺐다**: 노드 셋으로는 노드 하나를 끈 채(`node_offline` 발생) 리더를 바꾸면 정족수가 없다. 다섯 노드 시험은 비싸서 opl-api `a_leader_change_does_not_resend_leader_alerts`에 맡긴다.
+- **CI**: `check`에 `cargo test -p opld --features metrics-it --test metrics_history --test alerts`(Linux·macOS)를 더했다. `linux-kvm`은 apt `prometheus`(promtool)를 깔고 서비스를 멈춘 뒤 E2E 단계에 `OPL_TEST_PROMTOOL=promtool`을 주어 긁기 시험이 `promtool check metrics`(린트 포함)도 돌린다. 이 Mac에서 promtool 2.53.3으로 VM 줄까지 통과를 확인했다.
+- **스테이지 5 시험 고침**: opl-api `sends_are_retried_and_rate_limited`는 창이 500ms라 작업공간 전체 시험의 부하에서 뒤의 Task들이 새 창에 들어 가끔 실패했다. 창을 5초로 늘렸다(시험만, 동작은 그대로).

@@ -31,6 +31,9 @@ jobs:
       - run: cargo test --workspace
       # 시험 빌드에만 있는 고리로 리더의 api 실행기를 막는 굶김 시험(QEMU 없음)
       - run: cargo test -p opld --features starve-it --test starve
+      # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
+      # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
+      - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)
@@ -172,6 +175,13 @@ jobs:
           ls -l /dev/kvm
           swtpm --version
           ls /usr/share/qemu/firmware
+      # 계획 60 Prometheus 긁기 시험이 받은 본문을 `promtool check metrics`로도 본다(OPL_TEST_PROMTOOL). 꾸러미가 띄우는
+      # prometheus 서비스는 쓰지 않으므로 멈춘다.
+      - name: promtool
+        run: |
+          sudo apt-get install -y --no-install-recommends prometheus
+          sudo systemctl stop prometheus || echo "prometheus service was not running"
+          promtool --version
       # TPM 능력 확인이 보는 것(GitHub 탐침 2): 거짓 음성이면 시험의 opld 로그 줄과 견준다.
       - name: TPM capability diagnostics
         run: |
@@ -365,6 +375,7 @@ jobs:
           OPL_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
           OPL_TEST_LVM_SHARED: oplshared
           OPL_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
+          OPL_TEST_PROMTOOL: promtool
 
   # Ceph 자동 구성(계획 56): Ceph가 없는 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 mon·mgr, 루프 장치
   # 위 OSD(ceph-volume LVM), RBD 풀을 세워 그 풀의 볼륨으로 VM을 켠다. linux-kvm은 손으로 띄운 Ceph(바깥 Ceph를
