@@ -173,7 +173,10 @@ if [ "$(grep -cxF "$INCLUDE" "$LOCAL")" = 1 ]; then echo "ok   local 파일에 i
 	FAILED=1
 fi
 printf '#include <tunables/global>\n' >"$AA/usr.bin.swtpm"
+# 가짜 명령의 본문이라 $는 가짜 명령이 돌 때 풀린다(작은따옴표 그대로).
+# shellcheck disable=SC2016
 printf '#!/bin/sh\n[ "${OPL_FAKE_AA:-yes}" = yes ]\n' >"$WORK/bin/aa-enabled"
+# shellcheck disable=SC2016
 printf '#!/bin/sh\necho "apparmor_parser $*" >>"$OPL_FAKE_LOG"\n' >"$WORK/bin/apparmor_parser"
 chmod 0755 "$WORK/bin/aa-enabled" "$WORK/bin/apparmor_parser"
 check "AppArmor 켜짐: 프로필을 다시 읽힘" no "apparmor_parser -r -T -W $AA/usr.bin.swtpm" postinst configure 0.1.0
