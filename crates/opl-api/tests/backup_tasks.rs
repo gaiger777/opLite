@@ -368,6 +368,7 @@ async fn delete_waits_for_restores_of_the_backup() {
         backup: b.id,
         name: "web-2".into(),
         pool: "local".into(),
+        folder: None,
     };
     put_task(&env, restore, Uuid::now_v7(), n2, TaskState::Running).await;
 
@@ -889,6 +890,7 @@ async fn restore_runs_only_on_the_node_holding_the_backup() {
         backup: b.id,
         name: "web-2".into(),
         pool: "other".into(),
+        folder: None,
     };
     let task = put_task(&env, op, Uuid::now_v7(), env.node, TaskState::Pending).await;
     let task = admin.wait_task(&task).await;

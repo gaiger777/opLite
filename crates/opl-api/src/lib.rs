@@ -8,6 +8,7 @@ mod api_cert;
 pub mod audit;
 pub mod auth;
 pub mod authz;
+mod authz_routes;
 mod backup_jobs;
 mod backup_receive;
 mod backups;
@@ -21,6 +22,7 @@ mod drain;
 pub mod error;
 mod fan_out;
 mod firmware;
+mod folders;
 mod guest;
 mod ha;
 mod ha_checks;
@@ -38,6 +40,7 @@ mod migration_disks;
 mod node_fence;
 pub mod oidc;
 mod oidc_login;
+mod permissions;
 pub mod placement;
 mod placement_api;
 pub mod placement_board;
@@ -326,6 +329,33 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(console::console))
         .routes(routes!(watch::watch))
         .routes(routes!(audit::list_audit))
+        .routes(routes!(folders::list_folders, folders::create_folder))
+        .routes(routes!(
+            folders::get_folder,
+            folders::patch_folder,
+            folders::delete_folder
+        ))
+        .routes(routes!(folders::move_members))
+        .routes(routes!(
+            permissions::list_access_roles,
+            permissions::create_access_role
+        ))
+        .routes(routes!(
+            permissions::get_access_role,
+            permissions::update_access_role,
+            permissions::delete_access_role
+        ))
+        .routes(routes!(permissions::list_groups, permissions::create_group))
+        .routes(routes!(
+            permissions::get_group,
+            permissions::update_group,
+            permissions::delete_group
+        ))
+        .routes(routes!(permissions::list_grants, permissions::create_grant))
+        .routes(routes!(permissions::get_grant, permissions::delete_grant))
+        .routes(routes!(permissions::my_permissions))
+        .routes(routes!(permissions::effective_permissions))
+        .routes(routes!(permissions::who_permissions))
 }
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.
@@ -337,8 +367,13 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 pub fn router(state: Arc<AppState>) -> Router {
     let (api, doc) = api().split_for_parts();
     let doc = Arc::new(doc);
-    // 라우트가 맞은 요청만 감사 로그에 적는다(라우트 템플릿이 동작 이름이다).
+    // 라우트가 맞은 요청만 경로표대로 권한을 보고(계획 62), 감사 로그에 적는다(라우트 템플릿이 동작 이름이다).
+    // 감사가 바깥이라 권한 거절(403·404)도 적는다.
     let api = api
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authz_routes::layer,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             audit::layer,

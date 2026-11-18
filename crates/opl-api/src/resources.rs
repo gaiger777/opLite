@@ -27,10 +27,13 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
+use crate::authz::{AuthzObject, Owned, Owners};
 use crate::backups::check_no_backups;
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
 use crate::state::AppState;
+use opl_types::authz::Privilege;
+use opl_types::node::FOLDERS;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -89,37 +92,157 @@ pub fn check_name(name: &str) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// 응답으로 내기 전에 리소스에서 가릴 것을 가린다(`public` — 묻는 주체에 따라 다를 수 있다).
-fn list<S: ResourceSpec>(
+/// 응답으로 내기 전에 리소스에서 가릴 것을 가린다(`public` — 묻는 주체와 그 리소스의 주인에 따라 다를 수 있다).
+type Public<S> = fn(&AppState, &Principal, &Owned, &mut Typed<S>);
+
+/// 목록과 조회가 권한을 보는 법(계획 62)
+pub(crate) trait Visible: ResourceSpec {
+    /// 폴더를 따르는 종류면 참: 목록은 항목마다 거르고, 조회는 경로표가 객체를 본다. 거짓이면 루트 종류다(종류 단위
+    /// 루트 확인).
+    const SCOPED: bool;
+    /// 주인 표(`Owners`)가 있어야 주인을 안다(볼륨·백업·Task).
+    const NEEDS_OWNERS: bool = false;
+
+    /// 항목의 주인. 루트 종류는 쓰지 않는다.
+    fn owned(_owners: &Owners, _item: &Typed<Self>) -> Owned {
+        Owned::cluster()
+    }
+
+    /// 항목 하나의 주인(조회). 주인 표를 다 뜨지 않아도 되면 바꾼다.
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Self::owned(&owners_for::<Self>(state)?, item))
+    }
+}
+
+macro_rules! root_kinds {
+    ($($spec:ty),*) => {$(
+        impl Visible for $spec {
+            const SCOPED: bool = false;
+        }
+    )*};
+}
+
+root_kinds!(
+    NodeSpec,
+    SecurityGroupSpec,
+    BackupJobSpec,
+    HaGroupSpec,
+    HaCheckSpec,
+    AlertRuleSpec,
+    PlacementRuleSpec
+);
+
+macro_rules! in_folder {
+    ($($spec:ty),*) => {$(
+        impl Visible for $spec {
+            const SCOPED: bool = true;
+
+            fn owned(_owners: &Owners, item: &Typed<Self>) -> Owned {
+                Owned::object(AuthzObject::authz_target(item))
+            }
+        }
+    )*};
+}
+
+in_folder!(VmSpec, NetworkSpec, StoragePoolSpec);
+
+impl Visible for VolumeSpec {
+    const SCOPED: bool = true;
+    const NEEDS_OWNERS: bool = true;
+
+    fn owned(owners: &Owners, item: &Typed<Self>) -> Owned {
+        Owned::object(owners.volume(&item.name, &item.spec.pool))
+    }
+
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Owned::object(Owners::around_volume(
+            &state.cluster,
+            &item.name,
+            &item.spec.pool,
+        )?))
+    }
+}
+
+impl Visible for VmImportSpec {
+    const SCOPED: bool = true;
+
+    fn owned(_owners: &Owners, item: &Typed<Self>) -> Owned {
+        Owned::object(Owners::import(item.id))
+    }
+}
+
+impl Visible for TaskSpec {
+    const SCOPED: bool = true;
+    const NEEDS_OWNERS: bool = true;
+
+    fn owned(owners: &Owners, item: &Typed<Self>) -> Owned {
+        owners.task(&item.spec)
+    }
+
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Owners::around_task(&state.cluster, &item.spec)?.task(&item.spec))
+    }
+}
+
+/// 주인 표(필요한 종류만 뜬다)
+fn owners_for<S: Visible>(state: &AppState) -> Result<Owners, ApiError> {
+    if S::NEEDS_OWNERS {
+        Owners::load(&state.cluster)
+    } else {
+        Ok(Owners::default())
+    }
+}
+
+fn list<S: Visible>(
     state: &AppState,
     principal: &Principal,
-    public: fn(&AppState, &Principal, &mut Typed<S>),
+    public: Public<S>,
 ) -> Result<Json<List<Typed<S>>>, ApiError> {
-    state.authorize(principal, Action::Read, S::KIND)?;
-    let (revision, mut items) = state.cluster.list::<S>()?;
-    items
-        .iter_mut()
-        .for_each(|item| public(state, principal, item));
+    if !S::SCOPED {
+        state.authorize(principal, Action::Read, S::KIND)?;
+    }
+    let (revision, items) = state.cluster.list::<S>()?;
+    let owners = owners_for::<S>(state)?;
+    let mut items: Vec<(Owned, Typed<S>)> = items
+        .into_iter()
+        .map(|i| (S::owned(&owners, &i), i))
+        .collect();
+    if S::SCOPED {
+        items = state
+            .authz
+            .filter_by(principal, items, |(owned, _)| *owned)?;
+    }
+    let items = items
+        .into_iter()
+        .map(|(owned, mut item)| {
+            public(state, principal, &owned, &mut item);
+            item
+        })
+        .collect();
     Ok(Json(List { revision, items }))
 }
 
-fn get<S: ResourceSpec>(
+fn get<S: Visible>(
     state: &AppState,
     principal: &Principal,
     key: &str,
-    public: fn(&AppState, &Principal, &mut Typed<S>),
+    public: Public<S>,
 ) -> Result<Json<Typed<S>>, ApiError> {
-    state.authorize(principal, Action::Read, S::KIND)?;
+    if !S::SCOPED {
+        state.authorize(principal, Action::Read, S::KIND)?;
+    }
+    // 폴더를 따르는 종류는 경로표가 이 객체를 볼 수 있는지 봤다.
     let mut item = lookup::<S>(&state.cluster, key)?;
-    public(state, principal, &mut item);
+    let owned = S::owned_one(state, &item)?;
+    public(state, principal, &owned, &mut item);
     Ok(Json(item))
 }
 
 /// 종류별 목록·조회 핸들러. OpenAPI 문서에 종류마다 경로가 따로 필요해 제네릭 핸들러 대신 쓴다. 마지막 인자는 응답에서
-/// 가릴 것을 가리는 함수다(상태·묻는 주체·리소스, 없으면 그대로).
+/// 가릴 것을 가리는 함수다(상태·묻는 주체·주인·리소스, 없으면 그대로).
 macro_rules! list_and_get {
     ($list:ident, $get:ident, $spec:ident, $status:ident, $path:literal, $item_path:literal, $tag:literal) => {
-        list_and_get!($list, $get, $spec, $status, $path, $item_path, $tag, |_, _, _| {});
+        list_and_get!($list, $get, $spec, $status, $path, $item_path, $tag, |_, _, _, _| {});
     };
     ($list:ident, $get:ident, $spec:ident, $status:ident, $path:literal, $item_path:literal, $tag:literal, $public:expr) => {
         #[utoipa::path(get, path = $path, tag = $tag, responses(
@@ -184,7 +307,12 @@ list_and_get!(
     "/vms",
     "/vms/{key}",
     "vms",
-    |state, principal, vm| crate::vms::mask_spec(state, principal, &mut vm.spec)
+    |state, principal, owned, vm| crate::vms::mask_spec(
+        state,
+        principal,
+        owned.target,
+        &mut vm.spec
+    )
 );
 list_and_get!(
     list_networks,
@@ -266,9 +394,9 @@ list_and_get!(
     "/tasks",
     "/tasks/{key}",
     "tasks",
-    |state, principal, task| crate::volumes::public_task(
+    |state, principal, owned, task| crate::volumes::public_task(
         task,
-        crate::vms::writes_vms(state, principal)
+        crate::vms::writes_vm(state, principal, owned.target)
     )
 );
 
@@ -280,12 +408,21 @@ pub async fn create_pool(
     principal: Principal,
     Json(req): Json<CreateRequest<serde_json::Value>>,
 ) -> Result<(StatusCode, Json<StoragePool>), ApiError> {
-    state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
     check_name(&req.name)?;
     // `shared`를 적었는지 알아야 하므로 spec은 JSON 값으로 받아 읽는다.
     let shared_given = req.spec.get("shared").is_some();
     let mut spec: StoragePoolSpec = serde_json::from_value(req.spec)
         .map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
+    // 폴더는 모든 노드가 알아야 쓴다(기능 검사가 권한 검사보다 먼저다).
+    if spec.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
+    state.authz.require_new(
+        &principal,
+        Privilege::StorageConfig,
+        StoragePoolSpec::KIND,
+        spec.folder,
+    )?;
     check_pool_spec(&state.cluster, &mut spec, shared_given)?;
     let mut pool = Resource::new(req.name, spec);
     pool.labels = req.labels;
@@ -342,11 +479,10 @@ pub(crate) fn check_pool_spec(
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_pool(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
     let pool = lookup::<StoragePoolSpec>(&state.cluster, &key)?;
     let (_, volumes) = state.cluster.list::<VolumeSpec>()?;
     if let Some(v) = volumes.iter().find(|v| v.spec.pool == pool.name) {
@@ -386,12 +522,11 @@ pub struct PoolPatch {
     responses((status = 200, body = Resource<StoragePoolSpec, StoragePoolStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn patch_pool(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(req): Json<PoolPatch>,
 ) -> Result<Json<StoragePool>, ApiError> {
-    state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
     if req.shared.is_none() && req.backups.is_none() {
         return Err(ApiError::bad_request("give shared or backups"));
     }
@@ -535,8 +670,16 @@ pub async fn create_network(
     principal: Principal,
     Json(req): Json<CreateRequest<NetworkSpec>>,
 ) -> Result<(StatusCode, Json<Network>), ApiError> {
-    state.authorize(&principal, Action::Write, NetworkSpec::KIND)?;
     check_name(&req.name)?;
+    if req.spec.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
+    state.authz.require_new(
+        &principal,
+        Privilege::NetworkConfig,
+        NetworkSpec::KIND,
+        req.spec.folder,
+    )?;
     if req.name == USER_NETWORK {
         return Err(ApiError::bad_request(format!(
             "network name {USER_NETWORK:?} is reserved for user-mode NAT"
@@ -566,11 +709,10 @@ pub async fn create_network(
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_network(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    state.authorize(&principal, Action::Write, NetworkSpec::KIND)?;
     let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
     let (_, vms) = state.cluster.list::<VmSpec>()?;
     if let Some(vm) = vms

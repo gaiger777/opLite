@@ -265,7 +265,8 @@ async fn bad_requests_and_missing_resources_are_rejected() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let denied = serve(&env, |s| s.authorizer = Arc::new(DenyAll)).await;
     let admin = login_at(&denied, "admin", ADMIN_PASSWORD).await;
-    for path in ["/metrics/nodes", "/nodes/node1/metrics", "/vms/web/metrics"] {
+    // 플러그인은 루트 확인만 정한다(VM 지표는 폴더·grant 색인을 따른다, 계획 62).
+    for path in ["/metrics/nodes", "/nodes/node1/metrics"] {
         let (status, body) = admin.get(path).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
     }

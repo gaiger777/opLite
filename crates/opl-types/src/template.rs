@@ -49,6 +49,10 @@ pub struct CloneOverrides {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub start: bool,
+    /// 새 VM을 둘 폴더(계획 62). 없으면 원본의 폴더다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub folder: Option<Uuid>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -99,6 +103,9 @@ pub fn apply_overrides(spec: &VmSpec, ov: &CloneOverrides) -> Result<VmSpec, Tem
     let mut new = spec.clone();
     if let Some(node) = ov.node {
         new.node = Some(node);
+    }
+    if let Some(folder) = ov.folder {
+        new.folder = Some(folder);
     }
     if let Some(vcpus) = ov.vcpus {
         new.cpu.sockets = 1;
@@ -308,6 +315,7 @@ mod tests {
                 ..CloudInit::default()
             }),
             start: true,
+            folder: None,
         };
         assert!(!ov.is_empty());
         let json = serde_json::to_value(&ov).unwrap();

@@ -963,8 +963,13 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::VmBackup { backup } => return backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => return backup::delete(ctx, id).await,
         // 비운 CD-ROM 드라이브는 경고로 남긴다.
-        TaskOp::BackupRestore { backup, name, pool } => {
-            return backup::restore(ctx, task, *backup, name, pool).await;
+        TaskOp::BackupRestore {
+            backup,
+            name,
+            pool,
+            folder,
+        } => {
+            return backup::restore(ctx, task, *backup, name, pool, *folder).await;
         }
         TaskOp::BackupReplicate { remote, pool } => {
             replicate::replicate(ctx, id, remote, pool).await

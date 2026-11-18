@@ -7,10 +7,11 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::authz::Privilege;
 use opl_types::cloud_init::{CloudInit, PASSWORD_MASK, is_crypt_hash};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
-use opl_types::node::{HOTPLUG, NodeSpec, TEMPLATES};
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::node::{FOLDERS, HOTPLUG, NodeSpec, TEMPLATES};
+use opl_types::resource::{Kind, Resource};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec, SnapshotStatus};
 use opl_types::storage::{
     PoolBackend, StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
@@ -24,7 +25,8 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::audit::AuditNote;
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
+use crate::authz::{Owned, Owners};
 use crate::cluster::{missing_feature, require_feature};
 use crate::error::{ApiError, Json};
 use crate::resources::{List, check_name, lookup};
@@ -91,6 +93,10 @@ pub struct CloneRequest {
     /// 만든 뒤 켠다. 놓을 노드가 없으면 꺼진 채 만들고 Task 경고를 남긴다.
     #[serde(default)]
     pub start: bool,
+    /// 새 VM을 둘 폴더 id(계획 62). 없으면 원본의 폴더다. 대상 폴더의 `vm.create`가 있어야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub folder: Option<Uuid>,
 }
 
 impl CloneRequest {
@@ -104,6 +110,7 @@ impl CloneRequest {
             || !self.disks.is_empty()
             || self.cloud_init.is_some()
             || self.start
+            || self.folder.is_some()
     }
 }
 
@@ -501,8 +508,12 @@ pub async fn list_snapshots(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Json<List<Snapshot>>, ApiError> {
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
-    let (revision, mut items) = state.cluster.list::<SnapshotSpec>()?;
+    let (revision, items) = state.cluster.list::<SnapshotSpec>()?;
+    // 스냅샷은 VM을 따른다.
+    let owners = Owners::load(&state.cluster)?;
+    let mut items = state
+        .authz
+        .filter_by(&principal, items, |s| Owned::object(owners.vm(s.spec.vm)))?;
     items
         .iter_mut()
         .for_each(|s| mask_snapshot(&state, &principal, s));
@@ -520,7 +531,6 @@ pub async fn list_vm_snapshots(
     principal: Principal,
     Path(key): Path<String>,
 ) -> Result<Json<List<Snapshot>>, ApiError> {
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let (revision, mut items) = snapshots_of(&state, vm.id)?;
     items
@@ -540,7 +550,6 @@ pub async fn get_snapshot(
     principal: Principal,
     Path((key, name)): Path<(String, String)>,
 ) -> Result<Json<Snapshot>, ApiError> {
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let mut snapshot = find_snapshot(&state, &vm, &name)?;
     mask_snapshot(&state, &principal, &mut snapshot);
@@ -549,7 +558,19 @@ pub async fn get_snapshot(
 
 /// 응답에서 스냅샷이 담은 VM 스펙의 cloud-init 비밀번호(해시)를 가린다(VM 쓰기 권한이 없으면 user-data·vendor-data도).
 fn mask_snapshot(state: &AppState, principal: &Principal, snapshot: &mut Snapshot) {
-    crate::vms::mask_spec(state, principal, &mut snapshot.spec.vm_spec);
+    // 스냅샷의 주인은 지금 VM이다(지웠으면 루트).
+    let folder = state
+        .cluster
+        .get::<VmSpec>(snapshot.spec.vm)
+        .ok()
+        .flatten()
+        .and_then(|vm| vm.spec.folder);
+    let target = opl_types::authz_eval::AuthzTarget::Object {
+        kind: Kind::Vm,
+        id: snapshot.spec.vm,
+        folder,
+    };
+    crate::vms::mask_spec(state, principal, target, &mut snapshot.spec.vm_spec);
 }
 
 /// `pending` 스냅샷을 만들고(부모는 VM의 현재 위치, `vm_spec`은 지금 스펙) 그것을 채울 Task를
@@ -565,11 +586,10 @@ fn mask_snapshot(state: &AppState, principal: &Principal, snapshot: &mut Snapsho
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn create_snapshot(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Json(req): Json<CreateSnapshotRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     check_name(&req.name)?;
     if req.description.chars().count() > MAX_DESCRIPTION_CHARS {
         return Err(ApiError::bad_request(format!(
@@ -716,10 +736,9 @@ pub(crate) async fn start_create(
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn revert_snapshot(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path((key, name)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     // 템플릿에는 스냅샷이 없지만(바꾸기가 막음) 되돌리기가 연결 복제의 기반을 바꾸지 않게 한 번 더 막는다.
     check_not_template(&vm)?;
@@ -799,10 +818,9 @@ fn check_memory_devices(vm: &Vm, snapshot: &Snapshot) -> Result<(), ApiError> {
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_snapshot(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path((key, name)): Path<(String, String)>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let task = start_delete(&state, &vm, &name, false).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
@@ -846,11 +864,13 @@ pub async fn clone_vm(
     Path(key): Path<String>,
     Json(req): Json<CloneRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    // 원본의 `vm.clone`은 경로표가 봤다. 새 VM의 폴더·풀·네트워크는 아래에서 본다.
     // 새 칸은 옛 노드가 풀지 못한다(계획 58). 기능 검사는 검증보다 먼저다.
     if req.deploys() {
         require_feature(&state.cluster, TEMPLATES)?;
+    }
+    if req.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
     }
     check_name(&req.name)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
@@ -942,6 +962,20 @@ pub async fn clone_vm(
         }
     }
     check_security_groups(&state, &spec)?;
+    state
+        .authz
+        .require_new(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
+    state
+        .authz
+        .require_networks(&principal, spec.nics.iter().map(|n| n.network.as_str()))?;
+    match &target {
+        Some(pool) => state.authz.require_pool(&principal, &pool.name)?,
+        None => {
+            for (_, pool) in &disks {
+                state.authz.require_pool(&principal, &pool.name)?;
+            }
+        }
+    }
     let how = match (vm.spec.template && snapshot.is_none(), req.linked) {
         (true, Some(false)) => " (full)",
         (true, _) => " (linked)",
@@ -1001,6 +1035,7 @@ fn overrides(
         disks: req.disks.clone(),
         cloud_init,
         start: req.start,
+        folder: req.folder,
     };
     if ov.is_empty() {
         return Ok(None);

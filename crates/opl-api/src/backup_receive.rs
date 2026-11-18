@@ -22,7 +22,7 @@ use opl_types::backup::{
 use opl_types::node::{
     FAST_HA, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, PLACEMENT, TEMPLATES, VTPM,
 };
-use opl_types::resource::{Resource, ResourceSpec, validate_name};
+use opl_types::resource::{Resource, validate_name};
 use opl_types::storage::{StoragePool, is_shared};
 use opl_types::vm::{VmHa, VmSpec};
 use serde::{Deserialize, Serialize};
@@ -31,7 +31,7 @@ use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
 use crate::backups::{backup_tasks, check_not_deleting, find_pool, node_name, now};
 use crate::cluster::{missing_feature, require_current, require_feature};
 use crate::error::{ApiError, Json};
@@ -246,7 +246,10 @@ pub async fn receive_backup(
     principal: Principal,
     Json(req): Json<ReceiveRequest>,
 ) -> Result<(StatusCode, Json<ReceivingBackup>), ApiError> {
-    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
+    // 다른 클러스터의 사본은 루트에 둔다(폴더 id는 이 클러스터의 것이 아니다).
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
     if let Some(name) = &req.name {
         check_name(name)?;
     }
@@ -536,7 +539,10 @@ pub async fn put_backup_file(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<ReceivedFile>, ApiError> {
-    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
+    // 다른 클러스터의 사본은 루트에 둔다(폴더 id는 이 클러스터의 것이 아니다).
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
     let length = content_length(&headers)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     let dir = receiving_dir(&state, &backup)?;
@@ -678,7 +684,10 @@ pub async fn complete_backup(
     principal: Principal,
     Path(key): Path<String>,
 ) -> Result<Json<Backup>, ApiError> {
-    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
+    // 다른 클러스터의 사본은 루트에 둔다(폴더 id는 이 클러스터의 것이 아니다).
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     let dir = receiving_dir(&state, &backup)?;
     check_not_deleting(&state, &backup)?;

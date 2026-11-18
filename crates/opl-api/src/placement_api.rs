@@ -71,7 +71,10 @@ pub async fn apply_recommendation(
     audit: AuditNote,
     Path(id): Path<String>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
+    // 추천의 VM에서 `vm.migrate`가 있어야 한다(아래). 어디에도 없으면 먼저 403이다.
+    state
+        .authz
+        .require_anywhere(&principal, opl_types::authz::Privilege::VmMigrate)?;
     let cluster = &state.cluster;
     let leader = cluster.members().leader;
     if leader != Some(cluster.id()) {
@@ -104,6 +107,9 @@ pub async fn apply_recommendation(
         ));
     };
     let vm = lookup::<VmSpec>(&state.cluster, &m.vm.to_string())?;
+    state
+        .authz
+        .require(&principal, opl_types::authz::Privilege::VmMigrate, &vm)?;
     if vm.spec.pinned() {
         return Err(ApiError::conflict(
             "vm_pinned",

@@ -79,7 +79,6 @@ pub async fn get_prometheus(
     principal: Principal,
 ) -> Result<Response, ApiError> {
     state.authorize(&principal, Action::Read, NodeSpec::KIND)?;
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     if !crate::settings::current(&state.cluster)?
         .spec
         .prometheus_enabled()

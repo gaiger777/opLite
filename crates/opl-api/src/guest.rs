@@ -12,13 +12,12 @@ use opl_cluster::types::NodeId;
 use opl_peer::{GuestAgentError, GuestAgentOp, GuestAgentRequest};
 use opl_types::guest::{GuestInfoResponse, GuestInfoState, validate_guest_password};
 use opl_types::node::{GUEST_AGENT, NodeSpec};
-use opl_types::resource::ResourceSpec;
 use opl_types::vm::{Vm, VmPhase, VmSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::audit::AuditNote;
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::lookup;
@@ -157,11 +156,10 @@ fn info_state(e: &GuestAgentError) -> GuestInfoState {
     responses((status = 200, body = GuestInfoResponse), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_guest(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Query(params): Query<GuestParams>,
 ) -> Result<Json<GuestInfoResponse>, ApiError> {
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let only = |state| GuestInfoResponse { state, info: None };
     let Some(node) = running_node(&vm) else {
@@ -240,12 +238,11 @@ fn no_channel(vm: &Vm) -> ApiError {
         (status = 503, body = crate::error::ErrorBody)))]
 pub async fn set_guest_password(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
     Json(req): Json<GuestPasswordRequest>,
 ) -> Result<Json<GuestPasswordResponse>, ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     require_feature(&state.cluster, GUEST_AGENT)?;
     let GuestPasswordRequest { user, password } = req;
     validate_guest_password(&user, &password).map_err(|e| ApiError::bad_request(e.to_string()))?;

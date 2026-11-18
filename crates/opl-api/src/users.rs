@@ -11,6 +11,8 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::audit::AuditAuth;
 use opl_types::auth::{ApiToken, ApiTokenSpec, Role, User, UserSpec, external_name};
+use opl_types::authz::TokenScope;
+use opl_types::node::FOLDERS;
 use opl_types::realm::{LOCAL_REALM, RealmBackend, RealmSpec};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,7 @@ use crate::auth::{
     Action, Principal, SESSION_COOKIE, SESSION_TTL, dummy_hash, hash_password, new_token,
     session_cookie, verify_password,
 };
+use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
 use crate::limit::ClientIp;
 use crate::proxy::FromWebOrigin;
@@ -60,6 +63,10 @@ pub struct TokenView {
     pub name: String,
     pub revision: u64,
     pub user: Uuid,
+    /// 권한 범위(계획 62). 없으면 주인 권한 그대로다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub scope: Option<TokenScope>,
 }
 
 impl From<ApiToken> for TokenView {
@@ -69,6 +76,7 @@ impl From<ApiToken> for TokenView {
             name: t.name,
             revision: t.revision,
             user: t.spec.user,
+            scope: t.spec.scope,
         }
     }
 }
@@ -118,6 +126,7 @@ pub async fn login(
             user: user.id,
             name: user.name.clone(),
             role: user.spec.role,
+            token: None,
         },
         AuditAuth::Session,
     );
@@ -258,7 +267,7 @@ async fn login_realm(
     })?;
     // 외부 사용자는 옛 노드가 모르는 필드(`realm`)를 쓴다.
     crate::cluster::require_current(&state.cluster)?;
-    let user = upsert_external(state, &name, realm, role, None).await?;
+    let user = upsert_external(state, &name, realm, role, None, &found.groups).await?;
     state.attempts.success(&name, ip, attempt);
     Ok(user)
 }
@@ -273,7 +282,21 @@ pub(crate) async fn upsert_external(
     realm: &str,
     role: Role,
     subject: Option<&str>,
+    groups: &[String],
 ) -> Result<User, ApiError> {
+    // 로그인 때 본 디렉터리 그룹(계획 62): 로컬 그룹의 외부 그룹 연결이 본다. 옛 노드는 이 칸을 모르므로 모든 노드가
+    // `folders`를 알 때만 적는다(아니면 적지 않고 로그인은 그대로 된다).
+    let groups: Vec<String> = if crate::cluster::missing_feature(&state.cluster, FOLDERS)
+        .is_ok_and(|missing| missing.is_empty())
+    {
+        let mut g: Vec<String> = groups.iter().map(|g| g.trim().to_string()).collect();
+        g.retain(|g| !g.is_empty());
+        g.sort();
+        g.dedup();
+        g
+    } else {
+        Vec::new()
+    };
     let mut retried = false;
     loop {
         let written = match state.cluster.get_by_name::<UserSpec>(name)? {
@@ -290,6 +313,7 @@ pub(crate) async fn upsert_external(
             }
             Some(user)
                 if user.spec.role == role
+                    && user.spec.external_groups == groups
                     && (subject.is_none() || user.spec.subject.as_deref() == subject) =>
             {
                 return Ok(user);
@@ -299,6 +323,8 @@ pub(crate) async fn upsert_external(
                     user.spec.role = role;
                     user.spec.session_epoch += 1;
                 }
+                // 그룹이 바뀌어도 세션은 끊지 않는다(요청마다 색인을 본다).
+                user.spec.external_groups = groups.clone();
                 if let Some(subject) = subject {
                     user.spec.subject = Some(subject.into());
                 }
@@ -322,7 +348,7 @@ pub(crate) async fn upsert_external(
                         session_epoch: 0,
                         realm: Some(realm.into()),
                         subject: subject.map(str::to_string),
-                        external_groups: vec![],
+                        external_groups: groups.clone(),
                     },
                 );
                 state
@@ -423,6 +449,10 @@ pub async fn create_user(
     Json(req): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserView>), ApiError> {
     state.authorize(&principal, Action::Write, UserSpec::KIND)?;
+    // 전역 역할 없음(`none`)은 옛 노드가 풀지 못한다.
+    if req.role == Role::None {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
     check_name(&req.name)?;
     check_password(&req.password)?;
     let mut user: User = Resource::new(
@@ -469,8 +499,8 @@ pub async fn update_user(
 ) -> Result<Json<UserView>, ApiError> {
     // 관리 권한이 없으면 다른 사용자가 있는지조차 알려 주지 않는다.
     let may_write = state
-        .authorizer
-        .check(&principal, Action::Write, UserSpec::KIND);
+        .authorize(&principal, Action::Write, UserSpec::KIND)
+        .is_ok();
     if !may_write && key != principal.name && key != principal.user.to_string() {
         return Err(ApiError::forbidden());
     }
@@ -507,6 +537,9 @@ pub async fn update_user(
         spec.session_epoch += 1;
     }
     if let Some(role) = req.role {
+        if role == Role::None {
+            require_feature(&state.cluster, FOLDERS)?;
+        }
         if user.spec.role == Role::Admin && role != Role::Admin {
             let (_, users) = state.cluster.list::<UserSpec>()?;
             let admins = users.iter().filter(|u| u.spec.role == Role::Admin).count();
@@ -566,6 +599,11 @@ pub async fn delete_user(
 #[serde(deny_unknown_fields)]
 pub struct CreateTokenRequest {
     pub name: String,
+    /// 권한 범위(계획 62): 토큰의 권한은 주인 권한과 이 범위(`targets`마다 `privileges`를 건 propagate grant)의
+    /// 교집합이다. 없으면 주인과 같다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub scope: Option<TokenScope>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -578,8 +616,8 @@ pub struct CreatedToken {
 fn may_manage(state: &AppState, principal: &Principal, token: &ApiToken) -> bool {
     token.spec.user == principal.user
         || state
-            .authorizer
-            .check(principal, Action::Write, ApiTokenSpec::KIND)
+            .authorize(principal, Action::Write, ApiTokenSpec::KIND)
+            .is_ok()
 }
 
 /// 요청한 사용자의 토큰을 만든다. 토큰의 권한은 주인의 역할을 따른다.
@@ -592,12 +630,32 @@ pub async fn create_token(
     Json(req): Json<CreateTokenRequest>,
 ) -> Result<(StatusCode, Json<CreatedToken>), ApiError> {
     check_name(&req.name)?;
+    if let Some(scope) = &req.scope {
+        // 옛 노드는 범위를 모르고 주인 권한 전부를 준다.
+        require_feature(&state.cluster, FOLDERS)?;
+        scope
+            .validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    }
+    // 범위 있는 토큰이 범위 없는(더 넓은) 토큰을 만들지 못하게 범위 토큰으로는 토큰을 만들지 않는다.
+    if let Some(id) = principal.token
+        && state
+            .cluster
+            .get::<ApiTokenSpec>(id)?
+            .is_some_and(|t| t.spec.scope.is_some())
+    {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "a scoped token cannot create tokens",
+        ));
+    }
     let mut token: ApiToken = Resource::new(
         req.name,
         ApiTokenSpec {
             user: principal.user,
             secret_hash: String::new(),
-            scope: None,
+            scope: req.scope,
         },
     );
     let (hash, secret) = new_token(token.id);

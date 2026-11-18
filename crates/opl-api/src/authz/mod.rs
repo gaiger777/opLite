@@ -5,9 +5,11 @@
 //!   VM 이동은 세대를 올리지 않는다(객체의 폴더는 확인할 때 읽는다).
 //! - **색인**: 세대마다 한 번 상태를 떠([`AuthzSnapshot`]) 주체별 [`EffectiveIndex`]를 처음 요청에서 만든다. 주체 1024개
 //!   LRU이고, 만들기는 잠금 밖에서 한다.
-//! - 이 스테이지에서는 아직 경로가 부르지 않는다. 핸들러는 루트 확인(`AppState::authorize`)을 그대로 쓴다.
+//! - **시행**: 경로표(`crate::authz_routes`)의 미들웨어가 경로의 객체를 찾아 [`Authz::require`]를 부르고, 목록·watch·
+//!   지표·경보·Task는 [`Authz::filter`]·[`Owners`]로 거른다. 루트 종류는 `AppState::authorize`(루트 확인)다.
 
 mod index;
+mod owners;
 #[cfg(test)]
 mod tests;
 
@@ -28,8 +30,9 @@ use opl_types::storage::StoragePool;
 use opl_types::vm::Vm;
 use uuid::Uuid;
 
-pub use index::EffectiveIndex;
 use index::Lru;
+pub use index::{EffectiveIndex, Layers};
+pub use owners::{Owned, Owners, network_target, pool_target};
 
 use crate::auth::Principal;
 use crate::error::ApiError;
@@ -45,11 +48,11 @@ pub struct Subject {
 }
 
 impl From<&Principal> for Subject {
-    /// 스테이지 3이 `Principal`에 토큰을 더하기 전까지는 사용자 권한 그대로다.
+    /// 토큰 요청이면 토큰의 범위까지 본다.
     fn from(p: &Principal) -> Self {
         Subject {
             user: p.user,
-            token: None,
+            token: p.token,
         }
     }
 }
@@ -61,6 +64,41 @@ pub trait AuthzObject {
     /// 읽을 수 없을 때의 404. 없는 객체와 같은 답이어야 존재를 드러내지 않는다.
     fn not_found(&self) -> ApiError {
         ApiError::not_found("not found")
+    }
+
+    /// "볼 수 있다"의 권한. 객체는 `system.read`, 객체가 없는 Task 같은 클러스터 것은 `cluster.read`다.
+    fn read_privilege(&self) -> Privilege {
+        Privilege::SystemRead
+    }
+}
+
+impl AuthzObject for Owned {
+    fn authz_target(&self) -> AuthzTarget {
+        self.target
+    }
+
+    fn read_privilege(&self) -> Privilege {
+        self.read
+    }
+}
+
+/// 찾은 객체와 그 404 문구(경로표 미들웨어가 쓴다)
+pub struct Found {
+    pub owned: Owned,
+    pub missing: String,
+}
+
+impl AuthzObject for Found {
+    fn authz_target(&self) -> AuthzTarget {
+        self.owned.target
+    }
+
+    fn not_found(&self) -> ApiError {
+        ApiError::not_found(self.missing.clone())
+    }
+
+    fn read_privilege(&self) -> Privilege {
+        self.owned.read
     }
 }
 
@@ -77,6 +115,10 @@ impl<T: AuthzObject + ?Sized> AuthzObject for &T {
 
     fn not_found(&self) -> ApiError {
         (**self).not_found()
+    }
+
+    fn read_privilege(&self) -> Privilege {
+        (**self).read_privilege()
     }
 }
 
@@ -254,6 +296,12 @@ impl Authz {
         })
     }
 
+    /// 지금 세대의 평가 스냅샷(폴더 트리·사용자·그룹·역할·grant). 유효 권한의 근거를 찾을 때 쓴다.
+    pub fn with_snapshot<R>(&self, f: impl FnOnce(&AuthzSnapshot) -> R) -> Result<R, ApiError> {
+        let shared = self.shared(self.generation())?;
+        Ok(f(&shared.snap))
+    }
+
     /// 주체의 색인. 세대가 같으면 캐시에서 꺼낸다.
     pub fn index(&self, subject: Subject) -> Result<Arc<EffectiveIndex>, ApiError> {
         let generation = self.generation();
@@ -262,7 +310,22 @@ impl Authz {
         {
             return Ok(hit);
         }
-        let shared = self.shared(generation)?;
+        let mut shared = self.shared(generation)?;
+        // 이 노드에 막 적용된 사용자·토큰을 구독이 아직 알리지 않았을 수 있다(인증은 저장소를 바로 읽는다). 스냅샷에
+        // 없는데 저장소에 있으면 세대를 올려 다시 뜬다.
+        let stale = !shared.snap.users.contains_key(&subject.user)
+            && self.cluster.get::<UserSpec>(subject.user)?.is_some()
+            || subject.token.is_some_and(|t| {
+                !shared.tokens.contains_key(&t)
+                    && self
+                        .cluster
+                        .get::<ApiTokenSpec>(t)
+                        .is_ok_and(|found| found.is_some())
+            });
+        if stale {
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            shared = self.shared(generation)?;
+        }
         let built = Arc::new(match subject.token {
             None => EffectiveIndex::build(&shared.snap, subject.user, None, shared.generation),
             // 지워졌거나 남의 토큰이면 아무 권한도 없다.
@@ -301,7 +364,7 @@ impl Authz {
         let set = self.effective(principal, object)?;
         if set.contains(privilege) {
             Ok(())
-        } else if set.contains(Privilege::SystemRead) {
+        } else if set.contains(object.read_privilege()) {
             Err(ApiError::forbidden())
         } else {
             Err(object.not_found())
@@ -324,16 +387,176 @@ impl Authz {
         }
     }
 
+    /// 어디에서도 `privilege`가 없으면 403(객체를 찾기 전에 막는다)
+    pub fn require_anywhere(
+        &self,
+        principal: &Principal,
+        privilege: Privilege,
+    ) -> Result<(), ApiError> {
+        if self.index(Subject::from(principal))?.anywhere(privilege) {
+            Ok(())
+        } else {
+            Err(ApiError::forbidden())
+        }
+    }
+
     /// 읽을 수 있는(`system.read`) 것만 남긴다. 순서는 그대로다.
     pub fn filter<T: AuthzObject>(
         &self,
         principal: &Principal,
         items: impl IntoIterator<Item = T>,
     ) -> Result<Vec<T>, ApiError> {
+        self.filter_by(principal, items, |o| Owned {
+            target: o.authz_target(),
+            read: o.read_privilege(),
+        })
+    }
+
+    /// `owner`가 정한 대상에서 볼 수 있는 것만 남긴다(볼륨·백업·Task처럼 주인을 따르는 것). 순서는 그대로다.
+    pub fn filter_by<T>(
+        &self,
+        principal: &Principal,
+        items: impl IntoIterator<Item = T>,
+        owner: impl Fn(&T) -> Owned,
+    ) -> Result<Vec<T>, ApiError> {
         let index = self.index(Subject::from(principal))?;
+        if index.is_all() {
+            return Ok(items.into_iter().collect());
+        }
         Ok(items
             .into_iter()
-            .filter(|o| index.get(&o.authz_target()).contains(Privilege::SystemRead))
+            .filter(|o| {
+                let owned = owner(o);
+                index.get(&owned.target).contains(owned.read)
+            })
             .collect())
+    }
+
+    /// 대상에서 `privilege`가 있는지(오류 없이). 응답에서 가릴 것을 정할 때 쓴다.
+    pub fn allows(&self, principal: &Principal, privilege: Privilege, target: AuthzTarget) -> bool {
+        self.effective(principal, &target)
+            .is_ok_and(|set| set.contains(privilege))
+    }
+
+    /// NIC를 붙일 네트워크마다 `network.assign`. 사용자 모드 NAT(`user`)와 없는 네트워크는 보지 않는다(검증이 400을 낸다).
+    pub fn require_networks<'a>(
+        &self,
+        principal: &Principal,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ApiError> {
+        let mut seen = std::collections::BTreeSet::new();
+        for name in names {
+            if name == opl_types::network::USER_NETWORK || !seen.insert(name) {
+                continue;
+            }
+            let target = network_target(&self.cluster, name)?;
+            if target != AuthzTarget::Root {
+                self.require(
+                    principal,
+                    Privilege::NetworkAssign,
+                    &Found {
+                        owned: Owned::object(target),
+                        missing: format!("network {name:?} not found"),
+                    },
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 볼륨을 만들 풀의 `storage.allocate`. 없는 풀은 보지 않는다(검증이 400을 낸다).
+    pub fn require_pool(&self, principal: &Principal, name: &str) -> Result<(), ApiError> {
+        let target = pool_target(&self.cluster, name)?;
+        if target == AuthzTarget::Root {
+            return Ok(());
+        }
+        self.require(
+            principal,
+            Privilege::StorageAllocate,
+            &Found {
+                owned: Owned::object(target),
+                missing: format!("storage pool {name:?} not found"),
+            },
+        )
+    }
+
+    /// VM 디스크로 붙일 볼륨마다 `storage.allocate`(볼륨의 주인 — 붙은 VM 또는 풀). 없는 볼륨은 보지 않는다.
+    pub fn require_volumes<'a>(
+        &self,
+        principal: &Principal,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ApiError> {
+        for name in names.into_iter().collect::<std::collections::BTreeSet<_>>() {
+            let Some(v) = self
+                .cluster
+                .get_by_name::<opl_types::storage::VolumeSpec>(name)?
+            else {
+                continue;
+            };
+            let target = Owners::around_volume(&self.cluster, &v.name, &v.spec.pool)?;
+            self.require(
+                principal,
+                Privilege::StorageAllocate,
+                &Found {
+                    owned: Owned::object(target),
+                    missing: format!("volume {name:?} not found"),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 새 객체(VM·네트워크·풀)를 `folder`에 만들 권한. 폴더를 주지 않았는데 루트에는 권한이 없고 다른 어딘가(폴더)에는
+    /// 있으면 400 `folder_required`다(설계 §5).
+    pub fn require_new(
+        &self,
+        principal: &Principal,
+        privilege: Privilege,
+        kind: Kind,
+        folder: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        if folder.is_none() {
+            let index = self.index(Subject::from(principal))?;
+            if !index.get(&AuthzTarget::Root).contains(privilege) && index.anywhere(privilege) {
+                return Err(ApiError::bad_request(format!(
+                    "give a folder: you may not create a {} at the root",
+                    kind.as_str()
+                ))
+                .with_code("folder_required"));
+            }
+        }
+        self.require_in_folder(principal, privilege, kind, folder)
+    }
+
+    /// 폴더 `folder`(없으면 그 트리의 루트)에 새 객체를 둘 권한. 루트면 루트 대상에서, 폴더면 그 폴더 안의 객체가
+    /// 받는 권한(propagate)으로 본다. 폴더를 읽을 수도 없으면 그 폴더가 없는 것과 같은 404다.
+    pub fn require_in_folder(
+        &self,
+        principal: &Principal,
+        privilege: Privilege,
+        kind: Kind,
+        folder: Option<Uuid>,
+    ) -> Result<(), ApiError> {
+        let Some(folder) = folder else {
+            return self.require_root(principal, privilege);
+        };
+        // 폴더 안에 새로 둘 객체(id 없음)가 받는 권한
+        let inside = AuthzTarget::Object {
+            kind,
+            id: Uuid::nil(),
+            folder: Some(folder),
+        };
+        let set = self.effective(principal, &inside)?;
+        if set.contains(privilege) {
+            Ok(())
+        } else if set.contains(Privilege::SystemRead)
+            || self
+                .effective(principal, &AuthzTarget::Folder(folder))?
+                .contains(Privilege::SystemRead)
+        {
+            Err(ApiError::forbidden())
+        } else {
+            Err(ApiError::not_found(format!("folder {folder} not found")))
+        }
     }
 }

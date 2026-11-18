@@ -9,9 +9,10 @@ use axum::http::header::CONTENT_LENGTH;
 use axum::http::{HeaderMap, StatusCode};
 use futures_util::StreamExt;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::authz::Privilege;
 use opl_types::cloud_init::PASSWORD_MASK;
 use opl_types::node::{INSTALL_MEDIA, NodeSpec, TEMPLATES};
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
 use opl_types::snapshot::SnapshotSpec;
 use opl_types::storage::{
@@ -26,7 +27,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::audit::AuditNote;
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, check_name, lookup};
@@ -213,7 +214,6 @@ pub async fn create_volume(
     principal: Principal,
     Json(req): Json<CreateRequest<VolumeSpec>>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     check_volume_name(&req.name)?;
     if !req.spec.content.is_disk() {
         return Err(ApiError::bad_request(
@@ -231,6 +231,9 @@ pub async fn create_volume(
         ));
     }
     let pool = find_pool(&state, &req.spec.pool)?;
+    state
+        .authz
+        .require(&principal, Privilege::StorageAllocate, &pool)?;
     check_pool_format(&pool, req.spec.format)?;
     let node = pool_node(&state, &pool)?;
     let mut volume: Volume = Resource::new(req.name, req.spec);
@@ -288,13 +291,15 @@ pub async fn check_import(
     q: &ImportQuery,
     size: u64,
 ) -> Result<(StoragePool, ImageFormat), ApiError> {
-    state.authorize(principal, Action::Write, VolumeSpec::KIND)?;
     let iso = !q.content.is_disk();
     if iso {
         require_feature(&state.cluster, INSTALL_MEDIA)?;
     }
     check_volume_name(&q.name)?;
     let pool = find_pool(state, &q.pool)?;
+    state
+        .authz
+        .require(principal, Privilege::StorageAllocate, &pool)?;
     let format = if iso {
         check_iso(&pool, q.format, Some(q.source_format), "upload")?
     } else {
@@ -602,7 +607,6 @@ pub async fn download_volume(
     audit: AuditNote,
     Json(req): Json<VolumeDownloadRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     require_feature(&state.cluster, INSTALL_MEDIA)?;
     // 새 확인 칸은 옛 노드가 풀지 못한다(계획 58). 기능 검사는 검증보다 먼저다.
     if req.sha512.is_some() || req.checksum_url.is_some() {
@@ -616,6 +620,9 @@ pub async fn download_volume(
         req.checksum_url.as_deref(),
     )?;
     let pool = find_pool(&state, &req.pool)?;
+    state
+        .authz
+        .require(&principal, Privilege::StorageAllocate, &pool)?;
     let format = if req.content.is_disk() {
         let format = req.format.unwrap_or_else(|| default_format(&pool));
         check_pool_format(&pool, format)?;
@@ -714,10 +721,9 @@ pub(crate) async fn receive(path: &FsPath, body: Body, length: u64) -> Result<()
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_volume(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     let volume = lookup::<VolumeSpec>(&state.cluster, &key)?;
     if volume.status.phase != VolumePhase::Ready {
         return Err(ApiError::conflict(
@@ -886,11 +892,16 @@ pub async fn resize_volume(
     Path(key): Path<String>,
     Json(req): Json<ResizeRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     let volume = lookup::<VolumeSpec>(&state.cluster, &key)?;
     if !volume.spec.content.is_disk() {
         return Err(ApiError::bad_request("ISO volumes cannot be resized"));
     }
+    // 볼륨(붙은 VM 또는 풀)의 권한은 경로표가 봤다. 늘리는 것은 풀의 몫도 쓴다.
+    state.authz.require(
+        &principal,
+        Privilege::StorageAllocate,
+        &crate::authz::pool_target(&state.cluster, &volume.spec.pool)?,
+    )?;
     if volume.status.phase != VolumePhase::Ready {
         return Err(ApiError::conflict(
             "volume_not_ready",
@@ -943,11 +954,10 @@ pub async fn resize_volume(
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn flatten_volume(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
     require_feature(&state.cluster, TEMPLATES)?;
     // 같은 VM을 켜는 요청과 엇갈리지 않게 확인과 Task 만들기를 VM 쓰기와 함께 잠근다.
     let _lock = state.vm_lock.lock().await;

@@ -1,6 +1,42 @@
 // 생성된 파일이다. 고치지 말고 `pnpm gen:api`로 다시 만든다.
 
 export interface paths {
+    "/access-roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 내장 역할 셋과 사용자 정의 역할. 로그인한 누구나 본다(grant를 주는 위임자가 고른다). */
+        get: operations["list_access_roles"];
+        put?: never;
+        /** 사용자 정의 역할을 만든다(`cluster.admin`). 이름 `admin`·`operator`·`viewer`·`none`은 400, 모르는 권한 이름은 400. */
+        post: operations["create_access_role"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/access-roles/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_access_role"];
+        /** 권한 목록을 바꾼다(`cluster.admin`). 이 역할을 건 모든 grant가 바로 바뀐다. 내장 역할은 400. */
+        put: operations["update_access_role"];
+        post?: never;
+        /** 사용자 정의 역할을 지운다(`cluster.admin`). 이 역할을 건 grant가 있으면 409 `role_in_use`, 내장 역할은 400. */
+        delete: operations["delete_access_role"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/alert-rules": {
         parameters: {
             query?: never;
@@ -688,6 +724,151 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/folders": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 볼 수 있는 폴더의 평면 목록(부모 id로 트리를 이룬다). 부모를 볼 수 없는 폴더는 보는 사람에게 맨 위 폴더다. */
+        get: operations["list_folders"];
+        put?: never;
+        /**
+         * 폴더를 만든다. 부모(없으면 루트)의 `inventory.folder`가 있어야 한다. 부모가 없거나 다른 트리면 404, 깊이 16을 넘으면
+         *     409 `folder_too_deep`, 형제 이름이 겹치면 409 `name_taken`.
+         */
+        post: operations["create_folder"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/folders/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_folder"];
+        put?: never;
+        post?: never;
+        /** 빈 폴더를 지운다(그 폴더의 `inventory.folder`). 자식 폴더나 리소스가 있으면 409 `folder_not_empty`. */
+        delete: operations["delete_folder"];
+        options?: never;
+        head?: never;
+        /**
+         * 폴더의 이름·부모·할당량을 바꾼다. 이름은 그 폴더의 `inventory.folder`, 부모는 그 폴더와 새 부모(없으면 루트)의
+         *     `inventory.move`, 할당량은 부모(없으면 루트)의 `inventory.quota`(팀 관리자가 자기 상한을 올리지 못하게)가 있어야
+         *     한다. 순환은 409 `folder_cycle`, 깊이 16을 넘으면 409 `folder_too_deep`, 형제 이름이 겹치면 409 `name_taken`.
+         */
+        patch: operations["patch_folder"];
+        trace?: never;
+    };
+    "/folders/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 리소스를 이 폴더로 옮긴다(일괄, 항목마다 결과). 대상 폴더의 `inventory.move`와 항목마다 그 리소스(원본 쪽)의
+         *     `inventory.move`가 있어야 한다. 폴더 id 대신 `root`면 그 트리의 루트로 옮긴다(루트의 `inventory.move`). 항목의
+         *     실패(볼 수 없으면 404, 권한 403, 다른 트리 400)는 그 항목의 `error`에 담고 응답은 200이다.
+         */
+        post: operations["move_members"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 볼 수 있는 grant(`cluster.admin`은 전부, 그 밖에는 자기·자기 그룹의 것과 `permission.modify`가 있는 대상의 것).
+         *     `target`·`principal`로 좁힌다.
+         */
+        get: operations["list_grants"];
+        put?: never;
+        /**
+         * grant를 준다. 루트 grant는 `cluster.admin`, 폴더·객체 grant는 대상의 `permission.modify`가 있어야 하고 역할의 권한이
+         *     그 대상에서 자기 유효 권한 안이어야 한다(403). 주체·역할이 없으면 400, 대상이 없거나 볼 수 없으면 404.
+         */
+        post: operations["create_grant"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/grants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_grant"];
+        put?: never;
+        post?: never;
+        /**
+         * grant를 뺀다. 루트 grant는 `cluster.admin`, 그 밖에는 대상의 `permission.modify`(없는 대상에 남은 grant는 루트
+         *     관리자만). 볼 수 없으면 404.
+         */
+        delete: operations["delete_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_groups"];
+        put?: never;
+        /**
+         * 로컬 그룹을 만든다(`cluster.admin`). `members`는 사용자 id, `external`은 영역의 디렉터리 그룹이다(그 영역 사용자가
+         *     로그인 때 그 그룹에 있었으면 든다).
+         */
+        post: operations["create_group"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/groups/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_group"];
+        put: operations["update_group"];
+        post?: never;
+        /** 그룹을 지운다(`cluster.admin`). 이 그룹에 건 grant가 있으면 409 `group_in_use`. */
+        delete: operations["delete_group"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/ha-checks": {
         parameters: {
             query?: never;
@@ -1237,6 +1418,60 @@ export interface paths {
          *     보낸 기록에 `test`로 남는다.
          */
         post: operations["test_notification_target"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permissions/effective": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 사용자의 대상 유효 권한과 근거 grant. 다른 사용자는 그 대상의 `permission.modify`가 있어야 한다(아니면 403). 대상을
+         *     볼 수 없으면 404.
+         */
+        get: operations["effective_permissions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permissions/mine": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 요청한 주체(토큰이면 범위까지)의 권한. 웹이 메뉴·단추를 숨길 때 쓴다. */
+        get: operations["my_permissions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permissions/who": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 대상에 권한이 닿는 grant와 전역 역할 사용자. 대상의 `permission.modify`가 있어야 한다(403, 볼 수 없으면 404). */
+        get: operations["who_permissions"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -2545,6 +2780,11 @@ export interface paths {
          * 이벤트는 `opl_cluster::watch::WatchEvent`의 JSON이다. 이어 받을 수 없게 되면
          *     `{"type":"error","code":"expired"|"lagged"|"closed"}`를 보내고 닫는다. 클라이언트는 목록을
          *     다시 읽고 새로 구독한다.
+         * @description 계획 62: 폴더를 따르는 종류(VM·볼륨·풀·네트워크·스냅샷·백업·가져오기·Task·폴더)와 grant는 이벤트마다 볼 수 있는
+         *     것만 보낸다. 보이던 객체가 옮겨져 안 보이게 되면 그 객체의 `deleted` 이벤트(이름과 id만)를 보낸다. 구독자의 권한이
+         *     바뀌거나(grant·역할·그룹·폴더 트리·사용자·토큰), 파생 종류(볼륨·스냅샷·백업·Task)를 구독하는데 VM·풀이 옮겨져
+         *     보임이 바뀌면 `{"type":"error","code":"permissions"}`를 보내고 닫는다(목록을 다시 읽는다). 그 밖의 종류는 구독할 때
+         *     루트에서 읽기 권한을 본다(403).
          */
         get: operations["watch"];
         put?: never;
@@ -2559,6 +2799,25 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description 역할(내장 또는 사용자 정의) */
+        AccessRoleView: {
+            /** @description 내장 역할(`admin`·`operator`·`viewer`)이면 참이고 바꿀 수 없다. */
+            builtin: boolean;
+            description: string;
+            /**
+             * Format: uuid
+             * @description 사용자 정의 역할의 id. 내장 역할은 없다.
+             */
+            id?: string;
+            name: string;
+            /** @description 권한 이름 목록(`vm.power` 등) */
+            privileges: string[];
+            /**
+             * Format: int64
+             * @description 사용자 정의 역할의 revision(내장 역할은 0)
+             */
+            revision: number;
+        };
         /** @enum {string} */
         Action: "accept" | "drop";
         /** @description 활성 경보 하나 */
@@ -3376,6 +3635,11 @@ export interface components {
             cloud_init?: components["schemas"]["CloudInit"];
             /** @description 디스크 순번별 새 크기(바이트, 늘리기만). null은 그대로다. */
             disks?: (number | null)[];
+            /**
+             * Format: uuid
+             * @description 새 VM을 둘 폴더(계획 62). 없으면 원본의 폴더다.
+             */
+            folder?: string;
             /** Format: int32 */
             memory_mib?: number;
             /** @description NIC 순번별 새 네트워크 이름. null은 그대로다. */
@@ -3401,6 +3665,11 @@ export interface components {
             cloud_init?: components["schemas"]["CloudInit"];
             /** @description 디스크 순번별 새 크기(바이트, 늘리기만, 512의 배수). null은 그대로다. */
             disks?: (number | null)[];
+            /**
+             * Format: uuid
+             * @description 새 VM을 둘 폴더 id(계획 62). 없으면 원본의 폴더다. 대상 폴더의 `vm.create`가 있어야 한다.
+             */
+            folder?: string;
             /**
              * @description 연결 복제(계획 58, 템플릿에서만). 없으면 템플릿의 디스크 가운데 되는 것은 연결하고 안 되는 것은 전체 복사한다
              *     (Task 경고). `true`면 모두 연결하고(안 되면 400), `false`면 전체 복사다.
@@ -3572,6 +3841,11 @@ export interface components {
             /** Format: int32 */
             sockets?: number;
         };
+        CreateAccessRoleRequest: {
+            description?: string;
+            name: string;
+            privileges: string[];
+        };
         CreateBackupRequest: {
             /**
              * @description 할 수 있으면 증분으로(같은 풀의 바로 앞 백업을 부모로 바뀐 블록만) 백업한다. 할 수 없으면
@@ -3582,6 +3856,28 @@ export interface components {
             name?: string | null;
             /** @description 백업 풀(`backups`를 켠 풀) */
             pool: string;
+        };
+        CreateFolderRequest: {
+            kind: components["schemas"]["FolderKind"];
+            /** @description 화면 이름(1~64자, `/` 없음). 형제 사이에서 대소문자 무시로 겹치면 409 `name_taken` */
+            name: string;
+            /**
+             * Format: uuid
+             * @description 부모 폴더 id. 없으면 그 트리의 루트 바로 아래다.
+             */
+            parent?: string;
+            /** @description 하위 트리 할당량(VM 폴더만). 부모(없으면 루트)의 `inventory.quota`가 있어야 한다. */
+            quota?: components["schemas"]["FolderQuota"];
+        };
+        CreateGrantRequest: {
+            principal: components["schemas"]["PrincipalRef"];
+            /**
+             * @description 하위 폴더와 그 안의 객체로 내려가는지(기본 참)
+             * @default true
+             */
+            propagate: boolean;
+            role: components["schemas"]["RoleRef"];
+            target: components["schemas"]["GrantTarget"];
         };
         CreateRequest_AlertRuleSpec: {
             labels?: {
@@ -3648,6 +3944,20 @@ export interface components {
                 schedule: components["schemas"]["JobSchedule"];
                 /** @description 백업할 VM */
                 vms: components["schemas"]["VmSelector"];
+            };
+        };
+        CreateRequest_GroupSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description 로컬 그룹(`Kind::Group`). 외부 사용자는 그 영역의 `external_groups`에 `external`의 그룹이 있으면 든다. */
+            spec: {
+                description?: string;
+                /** @description 연결한 디렉터리 그룹 */
+                external?: components["schemas"]["ExternalGroup"][];
+                /** @description 멤버 사용자 id(로컬·외부) */
+                members?: string[];
             };
         };
         CreateRequest_HaCheckSpec: {
@@ -3900,6 +4210,11 @@ export interface components {
         };
         CreateTokenRequest: {
             name: string;
+            /**
+             * @description 권한 범위(계획 62): 토큰의 권한은 주인 권한과 이 범위(`targets`마다 `privileges`를 건 propagate grant)의
+             *     교집합이다. 없으면 주인과 같다.
+             */
+            scope?: components["schemas"]["TokenScope"];
         };
         CreateUserRequest: {
             name: string;
@@ -3958,6 +4273,18 @@ export interface components {
             reason: string;
             /** @enum {string} */
             state: "in-use";
+        };
+        /** @description 유효 권한과 그 근거 */
+        EffectivePermissions: {
+            /** @description 이 대상에 닿는 그 사용자(와 그 그룹)의 grant */
+            grants: components["schemas"]["Resource"][];
+            name: string;
+            object: string;
+            privileges: string[];
+            /** @description 전역 역할(루트에 건 암묵 grant) */
+            role: components["schemas"]["Role"];
+            /** Format: uuid */
+            user: string;
         };
         /** @description 오류 응답 본문 */
         ErrorBody: {
@@ -4034,6 +4361,11 @@ export interface components {
             vcpus: number;
             /** @description 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`) */
             vmx: string;
+        };
+        /** @description 영역의 디렉터리 그룹(LDAP 그룹 DN 또는 OIDC `groups` 클레임 값) */
+        ExternalGroup: {
+            group: string;
+            realm: string;
         };
         /** @description 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`). */
         FenceCheck: {
@@ -4114,11 +4446,95 @@ export interface components {
             /** @description UEFI 변수(부팅 항목, Secure Boot 키)를 펌웨어 원본으로 되돌린다. */
             uefi_vars?: boolean;
         };
+        /**
+         * @description 폴더 트리의 종류
+         * @enum {string}
+         */
+        FolderKind: "vm" | "network" | "storage";
+        FolderPatch: {
+            /** @description 새 이름(그 폴더의 `inventory.folder`) */
+            name?: string;
+            /**
+             * Format: uuid
+             * @description 새 부모 폴더 id, `null`은 트리의 루트(그 폴더와 새 부모 쪽의 `inventory.move`)
+             */
+            parent?: string | null;
+            quota?: components["schemas"]["FolderQuota"] | null;
+        };
+        /** @description 폴더 할당량. 하위 트리 전체의 합에 건다. 칸마다 없으면 그 차원은 상한이 없다. */
+        FolderQuota: {
+            /**
+             * Format: int64
+             * @description 붙은 볼륨의 가상 크기 합(바이트)
+             */
+            disk_bytes?: number;
+            /** Format: int64 */
+            memory_mib?: number;
+            /** Format: int64 */
+            vcpus?: number;
+            /**
+             * Format: int64
+             * @description 템플릿 아닌 VM 수
+             */
+            vms?: number;
+        };
+        FolderSpec: {
+            /** @description 이 폴더가 속한 트리 */
+            kind: components["schemas"]["FolderKind"];
+            /** @description 화면 이름. 형제 사이에서 대소문자 무시로 겹치지 않는다(상태 머신이 막는다). */
+            name: string;
+            /**
+             * Format: uuid
+             * @description 부모 폴더. 없으면 그 종류의 루트 바로 아래다. 부모는 같은 종류여야 한다.
+             */
+            parent?: string;
+            /** @description 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다. */
+            quota?: components["schemas"]["FolderQuota"];
+        };
+        FolderStatus: Record<string, never>;
+        /** @description 권한 하나(`Kind::Grant`): 주체에게 대상에서 역할을 준다. */
+        GrantSpec: {
+            principal: components["schemas"]["PrincipalRef"];
+            /**
+             * @description 하위 폴더와 그 안의 객체로 내려가는지. 거짓이면 대상 자체(폴더 이름 바꾸기·지우기·그 폴더의 권한 보기)에만
+             *     닿는다. 기본은 참이고 참이면 쓰지 않는다.
+             * @default true
+             */
+            propagate: boolean;
+            role: components["schemas"]["RoleRef"];
+            target: components["schemas"]["GrantTarget"];
+        };
+        GrantStatus: Record<string, never>;
+        /** @description grant를 건 곳 */
+        GrantTarget: {
+            /** @enum {string} */
+            type: "root";
+        } | {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            type: "folder";
+        } | {
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["Kind"];
+            /** @enum {string} */
+            type: "object";
+        };
         /** @description 이 그룹(보통 DN)에 든 사용자는 이 역할 */
         GroupRole: {
             group: string;
             role: components["schemas"]["Role"];
         };
+        /** @description 로컬 그룹(`Kind::Group`). 외부 사용자는 그 영역의 `external_groups`에 `external`의 그룹이 있으면 든다. */
+        GroupSpec: {
+            description?: string;
+            /** @description 연결한 디렉터리 그룹 */
+            external?: components["schemas"]["ExternalGroup"][];
+            /** @description 멤버 사용자 id(로컬·외부) */
+            members?: string[];
+        };
+        GroupStatus: Record<string, never>;
         /** @description NIC의 IP 주소 하나 */
         GuestAddr: {
             /** Format: ip */
@@ -4488,6 +4904,11 @@ export interface components {
             disk_bus?: components["schemas"]["DiskBus"] | null;
             firmware?: components["schemas"]["Firmware"] | null;
             /**
+             * Format: uuid
+             * @description 만든 VM을 둘 폴더(계획 62). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 푼다.
+             */
+            folder?: string;
+            /**
              * @description 원본 MAC 주소를 그대로 쓴다. 끄면 새 MAC을 받는다.
              * @default true
              */
@@ -4681,6 +5102,11 @@ export interface components {
              */
             weekly: number;
         };
+        /**
+         * @description 클러스터 저장소가 구분하는 리소스 종류.
+         * @enum {string}
+         */
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor";
         /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
         LdapRealm: {
             /** @description 사용자를 찾을 기준 DN(subtree) */
@@ -4726,6 +5152,29 @@ export interface components {
          * @enum {string}
          */
         Level: "standard" | "premium";
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_AccessRoleView: {
+            items: {
+                /** @description 내장 역할(`admin`·`operator`·`viewer`)이면 참이고 바꿀 수 없다. */
+                builtin: boolean;
+                description: string;
+                /**
+                 * Format: uuid
+                 * @description 사용자 정의 역할의 id. 내장 역할은 없다.
+                 */
+                id?: string;
+                name: string;
+                /** @description 권한 이름 목록(`vm.power` 등) */
+                privileges: string[];
+                /**
+                 * Format: int64
+                 * @description 사용자 정의 역할의 revision(내장 역할은 0)
+                 */
+                revision: number;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_CatalogEntry: {
             items: (components["schemas"]["CatalogImage"] & {
@@ -4993,6 +5442,96 @@ export interface components {
                      */
                     uefi_vars: boolean;
                 };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_FolderSpec_FolderStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /** @description 이 폴더가 속한 트리 */
+                    kind: components["schemas"]["FolderKind"];
+                    /** @description 화면 이름. 형제 사이에서 대소문자 무시로 겹치지 않는다(상태 머신이 막는다). */
+                    name: string;
+                    /**
+                     * Format: uuid
+                     * @description 부모 폴더. 없으면 그 종류의 루트 바로 아래다. 부모는 같은 종류여야 한다.
+                     */
+                    parent?: string;
+                    /** @description 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다. */
+                    quota?: components["schemas"]["FolderQuota"];
+                };
+                status: Record<string, never>;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_GrantSpec_GrantStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 권한 하나(`Kind::Grant`): 주체에게 대상에서 역할을 준다. */
+                spec: {
+                    principal: components["schemas"]["PrincipalRef"];
+                    /**
+                     * @description 하위 폴더와 그 안의 객체로 내려가는지. 거짓이면 대상 자체(폴더 이름 바꾸기·지우기·그 폴더의 권한 보기)에만
+                     *     닿는다. 기본은 참이고 참이면 쓰지 않는다.
+                     * @default true
+                     */
+                    propagate: boolean;
+                    role: components["schemas"]["RoleRef"];
+                    target: components["schemas"]["GrantTarget"];
+                };
+                status: Record<string, never>;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_GroupSpec_GroupStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 로컬 그룹(`Kind::Group`). 외부 사용자는 그 영역의 `external_groups`에 `external`의 그룹이 있으면 든다. */
+                spec: {
+                    description?: string;
+                    /** @description 연결한 디렉터리 그룹 */
+                    external?: components["schemas"]["ExternalGroup"][];
+                    /** @description 멤버 사용자 id(로컬·외부) */
+                    members?: string[];
+                };
+                status: Record<string, never>;
             }[];
             /** Format: int64 */
             revision: number;
@@ -5725,6 +6264,8 @@ export interface components {
                 name: string;
                 /** Format: int64 */
                 revision: number;
+                /** @description 권한 범위(계획 62). 없으면 주인 권한 그대로다. */
+                scope?: components["schemas"]["TokenScope"];
                 /** Format: uuid */
                 user: string;
             }[];
@@ -5757,6 +6298,13 @@ export interface components {
         MacAddr: string;
         /** @enum {string} */
         MachineType: "q35" | "virt";
+        /** @description 옮길 리소스 하나 */
+        MemberRef: {
+            /** @description 이름이나 id */
+            key: string;
+            /** @description `vm`(템플릿 포함), `network`, `storage-pool` */
+            kind: string;
+        };
         /**
          * @description 노드가 클러스터에 무엇으로 참여하는지
          * @enum {string}
@@ -5825,11 +6373,45 @@ export interface components {
             /** @default  */
             name: string;
         };
+        MoveMembersRequest: {
+            items: components["schemas"]["MemberRef"][];
+        };
+        MoveMembersResponse: {
+            items: components["schemas"]["MoveResult"][];
+        };
         /**
          * @description 옮기는 이유
          * @enum {string}
          */
         MoveReason: "balance" | "rule";
+        /** @description 항목 하나의 결과 */
+        MoveResult: {
+            /** @description 실패한 이유(`code`·`message`) */
+            error?: components["schemas"]["ErrorBody"];
+            key: string;
+            kind: string;
+            /** @description 옮겼거나 이미 그 폴더에 있었다. */
+            ok: boolean;
+        };
+        /** @description 내 권한(색인 그대로). 객체의 유효 권한 = 그 객체 폴더의 `contents`(없으면 `root_contents`) ∪ `objects`의 그 객체 */
+        MyPermissions: {
+            /** @description 루트에 모든 권한(전역 admin): 아래 표 없이 전부 참 */
+            all: boolean;
+            /** @description 폴더 안 객체의 권한(하위 폴더 포함) */
+            contents: {
+                [key: string]: string[];
+            };
+            /** @description 폴더 자체의 권한(이름 바꾸기·지우기·그 폴더의 grant) */
+            folders: {
+                [key: string]: string[];
+            };
+            /** @description 객체에 직접 건 grant로 더해지는 권한 */
+            objects: components["schemas"]["ObjectPermissions"][];
+            /** @description 루트(클러스터 객체)의 권한 */
+            root: string[];
+            /** @description 루트에 있는 객체(폴더 없음)의 권한 */
+            root_contents: string[];
+        };
         /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
@@ -6248,6 +6830,13 @@ export interface components {
             error?: string;
             ok: boolean;
         };
+        /** @description 객체 하나의 권한 */
+        ObjectPermissions: {
+            /** Format: uuid */
+            id: string;
+            kind: string;
+            privileges: string[];
+        };
         /** @description OpenID Connect 제공자(IdP). 브라우저가 IdP에서 로그인하고(인증 코드 흐름과 PKCE) 돌아온다. */
         OidcRealm: {
             /** @description IdP 인증서를 확인할 CA(PEM). 없으면 시스템 루트 */
@@ -6640,6 +7229,18 @@ export interface components {
             /** Format: uuid */
             user: string;
         };
+        /** @description grant를 받는 주체 */
+        PrincipalRef: {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            type: "user";
+        } | {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            type: "group";
+        };
         /** @description Prometheus 끝점에서 바꿀 값 */
         PrometheusPatch: {
             /** @description 켜면 각 노드가 `GET /api/v1/metrics`로 지표를 내보낸다(Node·Vm 읽기 권한 토큰). 끄면 404다. */
@@ -6997,6 +7598,22 @@ export interface components {
             size_bytes: number;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: components["schemas"]["GrantSpec"];
+            status: components["schemas"]["GrantStatus"];
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_AlertRuleSpec_AlertRuleStatus: {
             /** Format: uuid */
             id: string;
@@ -7195,6 +7812,84 @@ export interface components {
                  */
                 uefi_vars: boolean;
             };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_FolderSpec_FolderStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description 이 폴더가 속한 트리 */
+                kind: components["schemas"]["FolderKind"];
+                /** @description 화면 이름. 형제 사이에서 대소문자 무시로 겹치지 않는다(상태 머신이 막는다). */
+                name: string;
+                /**
+                 * Format: uuid
+                 * @description 부모 폴더. 없으면 그 종류의 루트 바로 아래다. 부모는 같은 종류여야 한다.
+                 */
+                parent?: string;
+                /** @description 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다. */
+                quota?: components["schemas"]["FolderQuota"];
+            };
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_GrantSpec_GrantStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 권한 하나(`Kind::Grant`): 주체에게 대상에서 역할을 준다. */
+            spec: {
+                principal: components["schemas"]["PrincipalRef"];
+                /**
+                 * @description 하위 폴더와 그 안의 객체로 내려가는지. 거짓이면 대상 자체(폴더 이름 바꾸기·지우기·그 폴더의 권한 보기)에만
+                 *     닿는다. 기본은 참이고 참이면 쓰지 않는다.
+                 * @default true
+                 */
+                propagate: boolean;
+                role: components["schemas"]["RoleRef"];
+                target: components["schemas"]["GrantTarget"];
+            };
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_GroupSpec_GroupStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 로컬 그룹(`Kind::Group`). 외부 사용자는 그 영역의 `external_groups`에 `external`의 그룹이 있으면 든다. */
+            spec: {
+                description?: string;
+                /** @description 연결한 디렉터리 그룹 */
+                external?: components["schemas"]["ExternalGroup"][];
+                /** @description 멤버 사용자 id(로컬·외부) */
+                members?: string[];
+            };
+            status: Record<string, never>;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_HaCheckSpec_HaCheckStatus: {
@@ -7936,6 +8631,11 @@ export interface components {
         /** @enum {string} */
         RestartPolicy: "never" | "on-failure";
         RestoreRequest: {
+            /**
+             * Format: uuid
+             * @description 새 VM을 둘 폴더 id(계획 62). 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트다.
+             */
+            folder?: string | null;
             /** @description 새 VM의 이름 */
             name: string;
             /** @description 복원을 실행할 노드(이름이나 id). 없으면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다. */
@@ -7945,11 +8645,29 @@ export interface components {
         };
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer" | "none";
+        /** @description 전역 역할이 있는 사용자 */
+        RoleHolder: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            role: components["schemas"]["Role"];
+        };
         /** @description 그룹에서 역할 정하기 */
         RoleMapping: {
             /** @description 맞는 그룹이 없을 때의 역할. 없으면 로그인을 거절한다. */
             default?: components["schemas"]["Role"];
             groups?: components["schemas"]["GroupRole"][];
+        };
+        /** @description grant가 주는 역할 */
+        RoleRef: {
+            role: components["schemas"]["Role"];
+            /** @enum {string} */
+            type: "builtin";
+        } | {
+            /** Format: uuid */
+            id: string;
+            /** @enum {string} */
+            type: "custom";
         };
         Rule: {
             action: components["schemas"]["Action"];
@@ -8474,6 +9192,12 @@ export interface components {
         } | {
             /** Format: uuid */
             backup: string;
+            /**
+             * Format: uuid
+             * @description 새 VM의 폴더(계획 62). API가 정한다: 요청의 폴더, 없으면 백업한 VM의 폴더(아직 있으면). 없으면 루트이고
+             *     쓰지 않아 옛 노드도 푼다.
+             */
+            folder?: string;
             /** @enum {string} */
             kind: "backup-restore";
             name: string;
@@ -8716,12 +9440,20 @@ export interface components {
          * @enum {string}
          */
         Tier: "raw5s" | "min1" | "min30" | "hour6";
+        /** @description API 토큰의 권한 범위(설계 §6.6). `targets`마다 `privileges`를 건 propagate grant로 읽은 천장이다. */
+        TokenScope: {
+            /** @description 권한 이름 목록. 모르는 이름은 읽을 때 버린다. */
+            privileges: string[];
+            targets: components["schemas"]["GrantTarget"][];
+        };
         TokenView: {
             /** Format: uuid */
             id: string;
             name: string;
             /** Format: int64 */
             revision: number;
+            /** @description 권한 범위(계획 62). 없으면 주인 권한 그대로다. */
+            scope?: components["schemas"]["TokenScope"];
             /** Format: uuid */
             user: string;
         };
@@ -8748,6 +9480,10 @@ export interface components {
             roles?: components["schemas"]["Role"][];
             /** @description 패스키의 RP ID(도메인). 없으면 요청 호스트다. */
             rp_id?: string;
+        };
+        UpdateAccessRoleRequest: {
+            description?: string;
+            privileges: string[];
         };
         UpdateRequest_AlertRuleSpec: {
             labels?: {
@@ -8785,6 +9521,19 @@ export interface components {
                 targets: string[];
                 /** @description 이 VM(이름)들만(VM 조건만). 비면 모든 VM */
                 vms?: string[];
+            };
+        };
+        UpdateRequest_GroupSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            /** @description 로컬 그룹(`Kind::Group`). 외부 사용자는 그 영역의 `external_groups`에 `external`의 그룹이 있으면 든다. */
+            spec: {
+                description?: string;
+                /** @description 연결한 디렉터리 그룹 */
+                external?: components["schemas"]["ExternalGroup"][];
+                /** @description 멤버 사용자 id(로컬·외부) */
+                members?: string[];
             };
         };
         UpdateRequest_HaCheckSpec: {
@@ -9422,6 +10171,14 @@ export interface components {
         };
         /** @enum {string} */
         Weekday: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+        /** @description 대상에 권한이 닿는 것: grant와 전역 역할 사용자 */
+        WhoPermissions: {
+            /** @description 이 대상에 직접 건 것과 조상에 propagate로 건 것 */
+            grants: components["schemas"]["Resource"][];
+            object: string;
+            /** @description 전역 역할(`none`이 아닌)이 있는 사용자 — 루트에 건 암묵 grant다. */
+            users: components["schemas"]["RoleHolder"][];
+        };
     };
     responses: never;
     parameters: never;
@@ -9431,6 +10188,161 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_access_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_AccessRoleView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_access_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAccessRoleRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRoleView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_access_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name (admin, operator and viewer are the built-in roles) */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRoleView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_access_role: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateAccessRoleRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessRoleView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_access_role: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_alert_rules: {
         parameters: {
             query?: never;
@@ -10713,6 +11625,475 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["CreatedJoinToken"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_folders: {
+        parameters: {
+            query?: {
+                /** @description 이 트리의 폴더만(`vm`, `network`, `storage`) */
+                kind?: "vm" | "network" | "storage";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_FolderSpec_FolderStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFolderRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_FolderSpec_FolderStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_folder: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description folder id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_FolderSpec_FolderStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_folder: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description folder id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_folder: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description folder id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FolderPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_FolderSpec_FolderStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    move_members: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description folder id, or root */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MoveMembersRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MoveMembersResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_grants: {
+        parameters: {
+            query?: {
+                /** @description 대상: `root`, `folder/<id>`, `vm/<id>`, `network/<id>`, `storage-pool/<id>` */
+                target?: string;
+                /** @description 주체: `user/<id>`, `group/<id>` */
+                principal?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_GrantSpec_GrantStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateGrantRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_GrantSpec_GrantStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description grant id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_GrantSpec_GrantStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description grant id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_groups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_GroupSpec_GroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_GroupSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_GroupSpec_GroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_GroupSpec_GroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_group: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRequest_GroupSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_GroupSpec_GroupStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_group: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -12083,6 +13464,95 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NotificationTestResult"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    effective_permissions: {
+        parameters: {
+            query: {
+                /** @description 사용자(이름이나 id). 없으면 요청한 주체다. */
+                user?: string;
+                /** @description 대상: `root`, `folder/<id>`, `vm/<key>`, `network/<key>`, `storage-pool/<key>`(key는 이름이나 id) */
+                object: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EffectivePermissions"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    my_permissions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MyPermissions"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    who_permissions: {
+        parameters: {
+            query: {
+                /** @description 대상: `root`, `folder/<id>`, `vm/<key>`, `network/<key>`, `storage-pool/<key>` */
+                object: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhoPermissions"];
                 };
             };
             "4XX": {

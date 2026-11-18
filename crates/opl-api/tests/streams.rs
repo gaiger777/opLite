@@ -48,7 +48,7 @@ async fn watch_streams_changes_after_revision() {
 
     admin.post("/vms", vm_request("web")).await;
     let ev = next_json(&mut ws).await;
-    assert_eq!(ev["type"], "put");
+    assert_eq!(ev["type"], "put", "{ev}");
     assert_eq!(ev["kind"], "vm");
     assert_eq!(ev["resource"]["name"], "web");
 

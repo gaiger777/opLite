@@ -13,12 +13,11 @@ use futures_util::{SinkExt, StreamExt};
 use opl_cluster::types::NodeId;
 use opl_driver::DriverError;
 use opl_peer::{ConsoleError, ConsoleStream};
-use opl_types::resource::ResourceSpec;
 use opl_types::vm::VmSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
 use crate::error::ApiError;
 use crate::resources::lookup;
 use crate::state::AppState;
@@ -32,11 +31,10 @@ const CONSOLE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
     responses((status = 101, description = "WebSocket carrying the VNC (RFB) stream"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn console(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let not_running = || {
         ApiError::conflict(

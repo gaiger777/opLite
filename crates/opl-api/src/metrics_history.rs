@@ -212,11 +212,10 @@ pub async fn get_node_history(
         (status = 503, body = crate::error::ErrorBody)))]
 pub async fn get_vm_history(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HistoryReply>, ApiError> {
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let query = params.query(
         HistoryScope::Vm { id: vm.id },
@@ -267,11 +266,10 @@ fn ready_nodes<'a>(pool: &StoragePool, nodes: &'a [Node], me: Uuid) -> Vec<&'a N
         (status = 503, body = crate::error::ErrorBody)))]
 pub async fn get_pool_history(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Query(params): Query<HistoryParams>,
 ) -> Result<Json<HistoryReply>, ApiError> {
-    state.authorize(&principal, Action::Read, StoragePoolSpec::KIND)?;
     let pool = lookup::<StoragePoolSpec>(&state.cluster, &key)?;
     let query = params.query(
         HistoryScope::Pool { id: pool.id },
@@ -374,7 +372,24 @@ pub async fn get_cluster_history(
     let query = params.query(HistoryScope::Digest { top: DIGEST_TOP }, now, DIGEST_POINTS)?;
     let key = params.cache_key(query.points);
     let response = cached_digest(&state.digest_cache, key, || digest(&state, &query, now)).await?;
-    Ok(Json(response.as_ref().clone()))
+    let mut response = response.as_ref().clone();
+    // 상위 VM과 풀은 볼 수 있는 것만 낸다(캐시는 모든 주체가 함께 쓴다, 계획 62).
+    let owners = crate::authz::Owners::load(&state.cluster)?;
+    response.top = state.authz.filter_by(&principal, response.top, |t| {
+        crate::authz::Owned::object(owners.vm(t.vm))
+    })?;
+    let pools = state.cluster.list::<StoragePoolSpec>()?.1;
+    response.pools = state.authz.filter_by(&principal, response.pools, |p| {
+        crate::authz::Owned::object(opl_types::authz_eval::AuthzTarget::Object {
+            kind: opl_types::resource::Kind::StoragePool,
+            id: p.pool,
+            folder: pools
+                .iter()
+                .find(|x| x.id == p.pool)
+                .and_then(|x| x.spec.folder),
+        })
+    })?;
+    Ok(Json(response))
 }
 
 /// 노드 하나의 `Digest` 답

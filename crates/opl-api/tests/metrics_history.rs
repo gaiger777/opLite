@@ -364,12 +364,8 @@ async fn history_needs_read_permission() {
     })
     .await;
     let admin = env.admin().await;
-    for path in [
-        "/nodes/node1/metrics/history",
-        "/vms/web/metrics/history",
-        "/storage-pools/local/metrics/history",
-        "/metrics/cluster",
-    ] {
+    // 플러그인은 루트 확인만 정한다(VM·풀 기록은 폴더·grant 색인을 따른다, 계획 62).
+    for path in ["/nodes/node1/metrics/history", "/metrics/cluster"] {
         let (status, body) = admin.get(path).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
     }

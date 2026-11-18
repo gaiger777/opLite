@@ -992,8 +992,8 @@ pub async fn create_ceph_pool(
     audit: AuditNote,
     Json(req): Json<CephPoolRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    // Ceph 쓰기(`cluster.admin`)는 루트의 풀 설정(`storage.config`)을 품는다. 풀은 루트에 만든다.
     state.authorize(&principal, Action::Write, Kind::Ceph)?;
-    state.authorize(&principal, Action::Write, StoragePoolSpec::KIND)?;
     let ceph = require_ceph(&state.cluster)?;
     require_feature(&state.cluster, CEPH_SETUP)?;
     require_ready(&ceph)?;

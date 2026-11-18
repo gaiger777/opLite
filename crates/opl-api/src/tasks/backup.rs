@@ -972,6 +972,7 @@ pub(super) async fn restore(
     id: Uuid,
     name: &str,
     pool: &str,
+    folder: Option<Uuid>,
 ) -> Result<Option<String>, String> {
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
     if backup.status.phase != BackupPhase::Ready {
@@ -1079,6 +1080,8 @@ pub(super) async fn restore(
 
     let mut new: Vm = Resource::new(name, backup.spec.vm_spec.clone());
     new.id = task.spec.target;
+    // 폴더는 API가 정했다(백업한 VM의 폴더가 지워졌으면 루트).
+    new.spec.folder = folder;
     if manifest.uefi_vars
         && let Some(state) = &ctx.config.state_dir
     {

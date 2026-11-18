@@ -14,11 +14,14 @@ use serde::Deserialize;
 use utoipa::IntoParams;
 
 use crate::auth::{Action, Principal};
+use crate::authz::{EffectiveIndex, Owned, Owners, Subject};
 use crate::error::{ApiError, Query};
 use crate::state::AppState;
+use opl_cluster::types::RawResource;
+use opl_types::authz::Privilege;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 15] = [
+const WATCHABLE: [Kind; 19] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
@@ -35,7 +38,25 @@ const WATCHABLE: [Kind; 15] = [
     Kind::PlacementRule,
     // 경보 규칙(리더 경보 포함, 비밀 없음). 알림 대상은 비밀을 담아 넣지 않는다.
     Kind::AlertRule,
+    // 계획 62: 폴더(볼 수 있는 것만), 역할(누구나), grant(목록과 같은 것만), 그룹(cluster.admin)
+    Kind::Folder,
+    Kind::AccessRole,
+    Kind::Grant,
+    Kind::Group,
 ];
+
+/// 이벤트마다 거르는 종류(폴더를 따르는 것과 grant). 나머지는 구독할 때 종류 단위로 루트에서 본다.
+fn per_event(kind: Kind) -> bool {
+    crate::auth::folder_kind(kind) || matches!(kind, Kind::Grant | Kind::AccessRole)
+}
+
+/// 주인이 바뀌면(VM·풀의 이동) 보임이 함께 바뀌는 파생 종류
+fn derived(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Volume | Kind::Snapshot | Kind::Backup | Kind::Task
+    )
+}
 
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -61,6 +82,12 @@ fn parse_kinds(s: &str) -> Result<BTreeSet<Kind>, ApiError> {
 /// 이벤트는 `opl_cluster::watch::WatchEvent`의 JSON이다. 이어 받을 수 없게 되면
 /// `{"type":"error","code":"expired"|"lagged"|"closed"}`를 보내고 닫는다. 클라이언트는 목록을
 /// 다시 읽고 새로 구독한다.
+///
+/// 계획 62: 폴더를 따르는 종류(VM·볼륨·풀·네트워크·스냅샷·백업·가져오기·Task·폴더)와 grant는 이벤트마다 볼 수 있는
+/// 것만 보낸다. 보이던 객체가 옮겨져 안 보이게 되면 그 객체의 `deleted` 이벤트(이름과 id만)를 보낸다. 구독자의 권한이
+/// 바뀌거나(grant·역할·그룹·폴더 트리·사용자·토큰), 파생 종류(볼륨·스냅샷·백업·Task)를 구독하는데 VM·풀이 옮겨져
+/// 보임이 바뀌면 `{"type":"error","code":"permissions"}`를 보내고 닫는다(목록을 다시 읽는다). 그 밖의 종류는 구독할 때
+/// 루트에서 읽기 권한을 본다(403).
 #[utoipa::path(get, path = "/watch", tag = "watch",
     params(WatchQuery),
     responses((status = 101, description = "WebSocket stream of change events"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -71,21 +98,161 @@ pub async fn watch(
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
     let kinds = parse_kinds(&q.kinds)?;
-    for kind in &kinds {
+    for kind in kinds.iter().filter(|k| !per_event(**k)) {
         state.authorize(&principal, Action::Read, *kind)?;
     }
+    // 권한의 세대와 주인 표는 구독 전에 뜬다(이벤트를 놓치지 않게 구독보다 먼저).
+    let generation = state.authz.generation();
+    let index = state.authz.index(Subject::from(&principal))?;
+    let owners = Owners::load(&state.cluster)?;
     let watch = state.cluster.watch(q.since).map_err(|e| match e {
         WatchError::Expired { .. } => ApiError::conflict("expired", e.to_string()),
         other => ApiError::internal(other),
     })?;
-    let writer = crate::vms::writes_vms(&state, &principal);
-    Ok(ws?.on_upgrade(move |socket| stream(socket, watch, kinds, writer)))
+    let filter = Filter {
+        state: state.clone(),
+        subject: Subject::from(&principal),
+        principal,
+        generation,
+        index,
+        owners,
+        derived: kinds.iter().any(|k| derived(*k)),
+    };
+    Ok(ws?.on_upgrade(move |socket| stream(socket, watch, kinds, filter)))
 }
 
-fn wanted(event: &WatchEvent, kinds: &BTreeSet<Kind>) -> bool {
-    match event {
-        WatchEvent::Put { kind, .. } | WatchEvent::Deleted { kind, .. } => kinds.contains(kind),
-        WatchEvent::Reset { .. } => true,
+/// 연결 하나의 거르기 상태
+struct Filter {
+    state: Arc<AppState>,
+    principal: Principal,
+    subject: Subject,
+    generation: u64,
+    index: Arc<EffectiveIndex>,
+    /// 이벤트 순서대로 고친 주인 표
+    owners: Owners,
+    /// 파생 종류를 구독한다
+    derived: bool,
+}
+
+/// 이벤트 하나를 거른 결과
+enum Verdict {
+    Send(WatchEvent, bool),
+    Skip,
+    /// 목록을 다시 읽어야 한다(`permissions`).
+    Close,
+}
+
+impl Filter {
+    fn visible(&self, owned: Option<Owned>) -> bool {
+        owned.is_some_and(|o| self.index.get(&o.target).contains(o.read))
+    }
+
+    /// 이벤트의 리소스를 VM 설정 권한으로 볼 수 있는지(cloud-init user-data를 그대로 낸다)
+    fn writer(&self, owned: Option<Owned>) -> bool {
+        owned.is_some_and(|o| self.index.get(&o.target).contains(Privilege::VmConfig))
+    }
+
+    /// 구독자의 권한이 바뀌었으면 거짓. 세대만 바뀌었으면(남의 grant·토큰 등) 새 색인으로 계속한다.
+    fn still_valid(&mut self) -> bool {
+        let generation = self.state.authz.generation();
+        if generation == self.generation {
+            return true;
+        }
+        match self.state.authz.index(self.subject) {
+            Ok(index) if index.same_rights(&self.index) => {
+                self.index = index;
+                self.generation = generation;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn judge(&mut self, event: WatchEvent, kinds: &BTreeSet<Kind>) -> Verdict {
+        if !self.still_valid() {
+            return Verdict::Close;
+        }
+        let (kind, resource) = match &event {
+            WatchEvent::Reset { .. } => {
+                // 스냅샷 설치: 클라이언트가 목록을 다시 읽는다. 주인 표도 새로 뜬다.
+                if let Ok(owners) = Owners::load(&self.state.cluster) {
+                    self.owners = owners;
+                }
+                return Verdict::Send(event, false);
+            }
+            WatchEvent::Put { kind, resource } | WatchEvent::Deleted { kind, resource, .. } => {
+                (*kind, resource)
+            }
+        };
+        let scoped = per_event(kind);
+        // 이벤트 앞의 보임: VM·네트워크·풀은 표가 아는 폴더, 나머지는 이벤트의 주인
+        let owned_before = if scoped && kind != Kind::Grant && kind != Kind::AccessRole {
+            match self.owners.stored(kind, resource.id) {
+                Some(target) => Some(Owned::object(target)),
+                None if matches!(kind, Kind::Vm | Kind::Network | Kind::StoragePool) => None,
+                None => self.owners.of_event(kind, resource),
+            }
+        } else {
+            None
+        };
+        let before = self.visible(owned_before);
+        let moved_owner = self.owners.apply(&event);
+        let deleted = matches!(event, WatchEvent::Deleted { .. });
+        let owned_after = if deleted {
+            owned_before
+        } else {
+            self.owners.of_event(kind, resource)
+        };
+        let after = match kind {
+            Kind::Grant => crate::permissions::grant_visible_raw(
+                &self.state,
+                &self.principal,
+                &self.index,
+                resource,
+            ),
+            Kind::AccessRole => true,
+            _ => self.visible(owned_after),
+        };
+        // VM·풀이 옮겨져 보임이 바뀌었으면 그 볼륨·스냅샷·백업·Task의 보임도 바뀐다.
+        // 지우기는 파생 객체가 자기 이벤트로 지워지므로 닫지 않는다. 새로 생긴 VM·풀(앞의 주인이 없음)에는 아직 파생
+        // 객체가 없다.
+        if moved_owner
+            && self.derived
+            && !deleted
+            && owned_before.is_some()
+            && matches!(kind, Kind::Vm | Kind::StoragePool)
+            && before != after
+        {
+            return Verdict::Close;
+        }
+        if !kinds.contains(&kind) {
+            return Verdict::Skip;
+        }
+        if !scoped {
+            let writer = self.writer(self.owners.of_event(kind, resource));
+            return Verdict::Send(event, writer);
+        }
+        let writer = self.writer(owned_after);
+        match event {
+            WatchEvent::Put { .. } if after => Verdict::Send(event, writer),
+            // 옮겨져 안 보이게 됐다: 이름과 id만 담은 지우기
+            WatchEvent::Put { kind, resource } if before => {
+                let mut gone = RawResource::new(resource.name.clone(), serde_json::Value::Null);
+                gone.id = resource.id;
+                gone.revision = resource.revision;
+                gone.status = serde_json::Value::Null;
+                Verdict::Send(
+                    WatchEvent::Deleted {
+                        revision: resource.revision,
+                        kind,
+                        resource: gone,
+                    },
+                    false,
+                )
+            }
+            WatchEvent::Deleted { .. } if before || after => Verdict::Send(event, writer),
+            _ => Verdict::Skip,
+        }
     }
 }
 
@@ -168,13 +335,30 @@ fn redact_task_json(spec: &mut serde_json::Value, writer: bool) {
     }
 }
 
-async fn stream(mut socket: WebSocket, mut watch: Watch, kinds: BTreeSet<Kind>, writer: bool) {
+async fn stream(
+    mut socket: WebSocket,
+    mut watch: Watch,
+    kinds: BTreeSet<Kind>,
+    mut filter: Filter,
+) {
     loop {
         tokio::select! {
             ev = watch.next() => {
                 let text = match ev {
-                    Ok(ev) if wanted(&ev, &kinds) => serde_json::to_string(&public(ev, writer)),
-                    Ok(_) => continue,
+                    Ok(ev) => match filter.judge(ev, &kinds) {
+                        Verdict::Send(ev, writer) => serde_json::to_string(&public(ev, writer)),
+                        Verdict::Skip => continue,
+                        Verdict::Close => {
+                            let msg = serde_json::json!({
+                                "type": "error",
+                                "code": "permissions",
+                                "message": "your permissions or the objects you can see changed; list again",
+                            });
+                            let _ = socket.send(Message::text(msg.to_string())).await;
+                            let _ = socket.send(Message::Close(None)).await;
+                            return;
+                        }
+                    },
                     Err(e) => {
                         let code = match e {
                             WatchError::Expired { .. } => "expired",

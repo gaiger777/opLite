@@ -7,16 +7,18 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
+use opl_types::authz::Privilege;
+use opl_types::authz_eval::AuthzTarget;
 use opl_types::cloud_init::{PASSWORD_MASK, is_crypt_hash};
 use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    FAST_HA, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node, NodeSpec,
-    PLACEMENT, TEMPLATES, VTPM, ha_capable,
+    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node,
+    NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::{Kind, Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::{Volume, VolumeContent, VolumePhase, is_shared, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
@@ -628,19 +630,50 @@ pub(crate) fn mask_data(spec: &mut VmSpec) {
     }
 }
 
-/// VM 쓰기 권한이 있는 주체인지(cloud-init user-data·vendor-data를 그대로 본다)
-pub(crate) fn writes_vms(state: &AppState, principal: &Principal) -> bool {
-    state
-        .authorize(principal, Action::Write, VmSpec::KIND)
-        .is_ok()
+/// 대상(VM 또는 그 VM을 따르는 것)에서 VM 설정 권한(`vm.config`)이 있는 주체인지(cloud-init user-data·vendor-data를
+/// 그대로 본다)
+pub(crate) fn writes_vm(state: &AppState, principal: &Principal, target: AuthzTarget) -> bool {
+    state.authz.allows(principal, Privilege::VmConfig, target)
 }
 
-/// 주체 `principal`에게 낼 VM 스펙: 비밀번호는 늘 가리고, VM 쓰기 권한이 없으면 user-data·vendor-data도 가린다.
-pub(crate) fn mask_spec(state: &AppState, principal: &Principal, spec: &mut VmSpec) {
+/// 주체 `principal`에게 낼 VM 스펙(그 VM은 `target`): 비밀번호는 늘 가리고, 그 VM의 설정 권한이 없으면
+/// user-data·vendor-data도 가린다.
+pub(crate) fn mask_spec(
+    state: &AppState,
+    principal: &Principal,
+    target: AuthzTarget,
+    spec: &mut VmSpec,
+) {
     mask_password(spec);
-    if !writes_vms(state, principal) {
+    if !writes_vm(state, principal, target) {
         mask_data(spec);
     }
+}
+
+/// 새로 붙이는 네트워크(NIC마다 `network.assign`)와 볼륨(디스크마다 볼륨 주인의 `storage.allocate`). `current`가 있으면
+/// 이미 붙은 것은 다시 보지 않는다.
+pub(crate) fn check_attachments(
+    state: &AppState,
+    principal: &Principal,
+    spec: &VmSpec,
+    current: Option<&VmSpec>,
+) -> Result<(), ApiError> {
+    let had = |name: &str| current.is_some_and(|c| c.nics.iter().any(|n| n.network == name));
+    state.authz.require_networks(
+        principal,
+        spec.nics
+            .iter()
+            .map(|n| n.network.as_str())
+            .filter(|n| !had(n)),
+    )?;
+    let had_disk = |name: &str| current.is_some_and(|c| c.disks.iter().any(|d| d.volume == name));
+    state.authz.require_volumes(
+        principal,
+        spec.disks
+            .iter()
+            .map(|d| d.volume.as_str())
+            .filter(|v| !had_disk(v)),
+    )
 }
 
 /// PUT 본문의 `user_data`·`vendor_data`가 [`PASSWORD_MASK`]면(가린 응답을 그대로 되보냄) 저장된 값을 둔다. 저장된 것이
@@ -844,8 +877,15 @@ pub async fn create_vm(
     principal: Principal,
     Json(req): Json<CreateRequest<VmSpec>>,
 ) -> Result<(StatusCode, HeaderMap, Json<Vm>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     check_name(&req.name)?;
+    // 폴더는 모든 노드가 알아야 쓴다(옛 노드는 폴더 권한을 모른다).
+    if req.spec.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
+    state
+        .authz
+        .require_new(&principal, Privilege::VmCreate, Kind::Vm, req.spec.folder)?;
+    check_attachments(&state, &principal, &req.spec, None)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
     // 부하는 잠그기 전에 읽는다(리더가 아니면 리더에 물을 수 있다). 켜진 채 노드 없이 만들 때만 노드를 고른다.
@@ -913,10 +953,16 @@ pub async fn update_vm(
     headers: HeaderMap,
     Json(req): Json<UpdateRequest<VmSpec>>,
 ) -> Result<(HeaderMap, Json<Vm>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let expected = if_match(&headers)?;
     let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
     let (headers, vm) = write_spec(&state, &key, expected, picks, |current| {
+        // 옮기기는 원본·대상 폴더의 `inventory.move`를 따로 보는 `POST /folders/{id}/members`로만 한다.
+        if req.spec.folder != current.spec.folder {
+            return Err(ApiError::bad_request(
+                "use POST /folders/{id}/members to move a VM to another folder",
+            ));
+        }
+        check_attachments(&state, &principal, &req.spec, Some(&current.spec))?;
         // 템플릿 표시는 바꾸기·되돌리기 경로(`/vms/{key}/template`)로만 바꾼다. 이 필드를 모르는 옛 클라이언트의
         // PUT이 템플릿을 보통 VM으로 만들지 않게 저장된 값을 둔다.
         let mut spec = req.spec.clone();
@@ -1089,12 +1135,11 @@ pub struct CdromMediaRequest {
     ))]
 pub async fn cdrom_media(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
     Json(req): Json<CdromMediaRequest>,
 ) -> Result<(HeaderMap, Json<Vm>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     require_feature(&state.cluster, INSTALL_MEDIA)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     if req.iso.is_some() {
@@ -1135,12 +1180,11 @@ pub async fn cdrom_media(
     ))]
 pub async fn convert_template(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<Vm>, ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     require_feature(&state.cluster, TEMPLATES)?;
     let expected = if_match(&headers)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
@@ -1183,11 +1227,10 @@ pub async fn convert_template(
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn untemplate_vm(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     require_feature(&state.cluster, TEMPLATES)?;
     // 그새 시작한 배포와의 엇갈림은 Task가 본다(`template: false`를 쓴 뒤 연결 복제를 다시 본다).
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
@@ -1456,11 +1499,10 @@ fn device_error(vm: &Vm, hw: &RunningHardware, e: hotplug::DeviceError) -> ApiEr
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_vm(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     // 되돌리기 Task가 블록 백엔드의 기반 스냅샷을 풀어야 낡은 `opl-base`가 남지 않는다(계획 58 §3).
     if vm.spec.template {
@@ -1527,11 +1569,10 @@ pub enum StopMode {
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn vm_action(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path((key, action)): Path<(String, String)>,
     Query(query): Query<ActionQuery>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     if query.mode == StopMode::Force && action != "stop" {
         return Err(ApiError::bad_request("mode=force applies only to stop"));
     }
@@ -1806,7 +1847,6 @@ pub async fn migrate_vm(
     Path(key): Path<String>,
     Json(req): Json<MigrateRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     // 규칙을 넘는 것은 규칙을 쓸 수 있는 사용자만이다.
     let rules = if req.force {
         state.authorize(&principal, Action::Write, PlacementRuleSpec::KIND)?;
@@ -1842,11 +1882,10 @@ pub struct VmReplicateRequest {
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn replicate_vm(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Json(req): Json<VmReplicateRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Operate, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     check_not_template(&vm)?;
     let node = match &req.node {

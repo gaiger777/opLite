@@ -25,7 +25,6 @@ use axum::response::Response;
 use opl_cluster::types::NodeId;
 use opl_peer::AuditSource;
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery, AuditResponse, AuditTarget};
-use opl_types::auth::Role;
 use opl_types::node::NodeSpec;
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -253,9 +252,10 @@ pub async fn list_audit(
     principal: Principal,
     Query(params): Query<AuditParams>,
 ) -> Result<Json<AuditResponse>, ApiError> {
-    if principal.role != Role::Admin {
-        return Err(ApiError::forbidden());
-    }
+    // 감사 로그는 루트의 `cluster.admin`(폴더별 읽기는 없다, 계획 62 §16)
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::ClusterAdmin)?;
     let until = match &params.until {
         Some(s) => parse_time("until", s)?,
         None => now_ms(),
@@ -487,7 +487,7 @@ pub(crate) async fn layer(
 }
 
 /// `/api/v1` 아래의 경로
-fn api_path(path: &str) -> &str {
+pub(crate) fn api_path(path: &str) -> &str {
     path.strip_prefix("/api/v1").unwrap_or(path)
 }
 

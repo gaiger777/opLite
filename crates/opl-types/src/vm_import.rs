@@ -247,6 +247,10 @@ pub struct ImportRun {
     #[serde(default = "yes")]
     #[cfg_attr(feature = "openapi", schema(default = true))]
     pub keep_macs: bool,
+    /// 만든 VM을 둘 폴더(계획 62). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub folder: Option<uuid::Uuid>,
 }
 
 fn yes() -> bool {

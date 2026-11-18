@@ -253,6 +253,7 @@ pub async fn oidc_callback(
                     user: user.id,
                     name: user.name.clone(),
                     role: user.spec.role,
+                    token: None,
                 },
                 AuditAuth::Session,
             );
@@ -425,7 +426,8 @@ async fn complete(
     let subject = format!("{} {sub}", oidc.issuer);
     // 외부 사용자는 옛 노드가 모르는 필드(`realm`·`subject`)를 쓴다.
     crate::cluster::require_current(&state.cluster)?;
-    let user = crate::users::upsert_external(state, &name, realm, role, Some(&subject)).await?;
+    let user =
+        crate::users::upsert_external(state, &name, realm, role, Some(&subject), &groups).await?;
     let username = name[..name.len() - realm.len() - 1].to_string();
     Ok((user, username))
 }

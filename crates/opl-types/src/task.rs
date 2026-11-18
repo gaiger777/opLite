@@ -132,6 +132,11 @@ pub enum TaskOp {
         backup: Uuid,
         name: String,
         pool: String,
+        /// 새 VM의 폴더(계획 62). API가 정한다: 요청의 폴더, 없으면 백업한 VM의 폴더(아직 있으면). 없으면 루트이고
+        /// 쓰지 않아 옛 노드도 푼다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        folder: Option<Uuid>,
     },
     /// 대상 백업(`ready`)을 원격 `remote`의 백업 풀 `pool`에 사본으로 보낸다. 백업 풀을 읽을 수 있는
     /// 노드에서 돈다.
@@ -598,6 +603,7 @@ mod tests {
                     backup,
                     name: "web-2".into(),
                     pool: "local".into(),
+                    folder: None,
                 },
                 serde_json::json!({
                     "kind": "backup-restore",

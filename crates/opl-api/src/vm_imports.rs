@@ -19,9 +19,12 @@ use axum::response::{IntoResponse, Response};
 use futures_util::{StreamExt, TryStreamExt};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::authz::Privilege;
 use opl_types::network::{NetworkSpec, USER_NETWORK};
+use opl_types::node::FOLDERS;
 use opl_types::node::NodeSpec;
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::Kind;
+use opl_types::resource::Resource;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{
@@ -37,8 +40,9 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
 use crate::backups::{check_online, node_name};
+use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{check_name, lookup};
 use crate::state::AppState;
@@ -102,7 +106,7 @@ pub struct OvaCheckQuery {
 /// 이 노드에 새 가져오기를 만들 수 있는지 본다(권한, 이름, 위트니스 노드). OVA 올리기와 ESXi 가져오기가
 /// 함께 쓴다. 확인 뒤에 다른 요청이 이름을 가져가면 저장소에 만들 때 `name_taken`이 난다.
 fn check_new(state: &AppState, principal: &Principal, name: &str) -> Result<(), ApiError> {
-    state.authorize(principal, Action::Write, VmImportSpec::KIND)?;
+    state.authz.require_root(principal, Privilege::VmCreate)?;
     check_name(name)?;
     if RESERVED_NAMES.contains(&name) {
         return Err(ApiError::bad_request(format!(
@@ -390,7 +394,7 @@ pub async fn browse_esxi(
     principal: Principal,
     Json(mut conn): Json<EsxiConnection>,
 ) -> Result<Json<EsxiBrowse>, ApiError> {
-    state.authorize(&principal, Action::Write, VmImportSpec::KIND)?;
+    state.authz.require_root(&principal, Privilege::VmCreate)?;
     check_fingerprint(&mut conn)?;
     let datastores = esxi::list(&conn, None, "").await.map_err(esxi_error)?;
     let mut dirs = Vec::new();
@@ -807,7 +811,7 @@ pub(crate) fn import_spec(
         tpm: false,
         secure_boot: false,
         guest_agent: None,
-        folder: None,
+        folder: run.folder,
     })
 }
 
@@ -972,9 +976,10 @@ pub async fn run_import(
     Path(key): Path<String>,
     Json(run): Json<ImportRun>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VmImportSpec::KIND)?;
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    // 가져오기의 `vm.create`는 경로표가 봤다. 만들 VM의 폴더·풀·네트워크는 아래에서 본다.
+    if run.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
     let import = lookup::<VmImportSpec>(&state.cluster, &key)?;
     match import.status.phase {
         ImportPhase::Ready | ImportPhase::Importing => {
@@ -1030,6 +1035,13 @@ pub async fn run_import(
     let spec = import_spec(src, proposal, &run, &volumes).map_err(ApiError::bad_request)?;
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    state
+        .authz
+        .require_in_folder(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
+    state
+        .authz
+        .require_networks(&principal, spec.nics.iter().map(|n| n.network.as_str()))?;
+    state.authz.require_pool(&principal, &run.pool)?;
     for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {
         if state
             .cluster
@@ -1144,11 +1156,10 @@ pub struct VmImportForgotten {
     ))]
 pub async fn delete_import(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Query(q): Query<DeleteImportQuery>,
 ) -> Result<Response, ApiError> {
-    state.authorize(&principal, Action::Write, VmImportSpec::KIND)?;
     let import = lookup::<VmImportSpec>(&state.cluster, &key)?;
     check_idle(&state, &import)?;
     if let Err(e) = check_online(&state, import.spec.node) {
@@ -1227,6 +1238,7 @@ mod tests {
             cores: None,
             memory_mib: None,
             keep_macs: true,
+            folder: None,
         }
     }
 

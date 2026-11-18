@@ -12,7 +12,7 @@ use opl_types::backup::{Backup, BackupPhase, BackupSpec, BackupStatus, default_b
 use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::node::{GUEST_AGENT, Node, NodeSpec, VTPM};
 use opl_types::remote::RemoteSpec;
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::Resource;
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumePhase, VolumeSpec, is_shared,
     pool_kind_supports_snapshots, pool_usable_on,
@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
+use crate::authz::{Owned, Owners};
 use crate::cluster::{require_current, require_feature};
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{List, check_name, lookup};
@@ -32,6 +33,9 @@ use crate::state::AppState;
 use crate::tasks::create_task;
 use crate::vms::{check_security_groups, is_stopped};
 use crate::volumes::{check_pool_on, pool_node};
+use opl_types::authz::Privilege;
+use opl_types::node::FOLDERS;
+use opl_types::resource::Kind;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +59,9 @@ pub struct RestoreRequest {
     pub pool: String,
     /// 복원을 실행할 노드(이름이나 id). 없으면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다.
     pub node: Option<String>,
+    /// 새 VM을 둘 폴더 id(계획 62). 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트다.
+    #[serde(default)]
+    pub folder: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -248,8 +255,12 @@ pub async fn list_backups(
     principal: Principal,
     Query(q): Query<BackupQuery>,
 ) -> Result<Json<List<Backup>>, ApiError> {
-    state.authorize(&principal, Action::Read, BackupSpec::KIND)?;
-    let (revision, mut items) = state.cluster.list::<BackupSpec>()?;
+    let (revision, items) = state.cluster.list::<BackupSpec>()?;
+    // 백업은 VM을 따른다(지운 VM이면 만든 때의 폴더).
+    let owners = Owners::load(&state.cluster)?;
+    let mut items = state.authz.filter_by(&principal, items, |b| {
+        Owned::object(owners.backup(b.spec.vm, b.spec.vm_spec.folder))
+    })?;
     if let Some(key) = q.vm {
         let id = match Uuid::try_parse(&key) {
             Ok(id) => Some(id),
@@ -276,15 +287,24 @@ pub async fn get_backup(
     principal: Principal,
     Path(key): Path<String>,
 ) -> Result<Json<Backup>, ApiError> {
-    state.authorize(&principal, Action::Read, BackupSpec::KIND)?;
     let mut backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     mask_backup(&state, &principal, &mut backup);
     Ok(Json(backup))
 }
 
-/// 응답에서 백업이 담은 VM 스펙의 cloud-init 비밀번호(해시)를 가린다(VM 쓰기 권한이 없으면 user-data·vendor-data도).
+/// 응답에서 백업이 담은 VM 스펙의 cloud-init 비밀번호(해시)를 가린다(그 VM의 설정 권한이 없으면 user-data·vendor-data도).
 pub(crate) fn mask_backup(state: &AppState, principal: &Principal, backup: &mut Backup) {
-    crate::vms::mask_spec(state, principal, &mut backup.spec.vm_spec);
+    // 백업의 주인: VM이 있으면 지금 VM, 지워졌으면 만든 때의 폴더
+    let folder = match state.cluster.get::<VmSpec>(backup.spec.vm) {
+        Ok(Some(vm)) => vm.spec.folder,
+        _ => backup.spec.vm_spec.folder,
+    };
+    let target = opl_types::authz_eval::AuthzTarget::Object {
+        kind: Kind::Vm,
+        id: backup.spec.vm,
+        folder,
+    };
+    crate::vms::mask_spec(state, principal, target, &mut backup.spec.vm_spec);
 }
 
 /// `pending` 백업을 만들고 그것을 채울 Task를 돌려준다(202). 풀은 백업 풀이어야 한다(400). 시작·정지
@@ -299,11 +319,10 @@ pub(crate) fn mask_backup(state: &AppState, principal: &Principal, backup: &mut 
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn create_backup(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Json(req): Json<CreateBackupRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     if let Some(name) = &req.name {
         check_name(name)?;
     }
@@ -456,11 +475,10 @@ pub(crate) fn files_node(
     ))]
 pub async fn delete_backup(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Query(q): Query<DeleteBackupQuery>,
 ) -> Result<Response, ApiError> {
-    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     if q.force {
         check_backup_idle(&state, &backup)?;
@@ -554,11 +572,30 @@ pub async fn restore_backup(
     Path(key): Path<String>,
     Json(req): Json<RestoreRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
+    // 백업의 `backup.restore`는 경로표가 봤다. 새 VM의 폴더·풀·네트워크는 아래에서 본다.
+    if req.folder.is_some() {
+        require_feature(&state.cluster, FOLDERS)?;
+    }
     check_name(&req.name)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    // 새 VM의 폴더: 요청의 폴더, 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트(설계 §12)
+    let folder = match req.folder {
+        Some(folder) => Some(folder),
+        None => backup.spec.vm_spec.folder.filter(|f| {
+            state
+                .cluster
+                .get::<opl_types::folder::FolderSpec>(*f)
+                .is_ok_and(|found| found.is_some())
+        }),
+    };
+    state
+        .authz
+        .require_new(&principal, Privilege::VmCreate, Kind::Vm, folder)?;
+    state.authz.require_pool(&principal, &req.pool)?;
+    state.authz.require_networks(
+        &principal,
+        backup.spec.vm_spec.nics.iter().map(|n| n.network.as_str()),
+    )?;
     // 이름이 그새 쓰이면 Task가 VM을 만들 때 실패한다.
     if state.cluster.get_by_name::<VmSpec>(&req.name)?.is_some() {
         return Err(ApiError::conflict(
@@ -669,6 +706,7 @@ pub async fn restore_backup(
         backup: backup.id,
         name: req.name,
         pool: target.name,
+        folder,
     };
     let task = create_task(&state.cluster, op, Uuid::now_v7(), node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
@@ -688,11 +726,10 @@ pub async fn restore_backup(
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn replicate_backup(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Json(req): Json<ReplicateRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, BackupSpec::KIND)?;
     check_name(&req.pool)?;
     // 옛 노드는 복제 Task와 사본 기록을 모른다.
     require_current(&state.cluster)?;

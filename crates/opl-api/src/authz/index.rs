@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use opl_types::authz::{
-    GrantSpec, GrantTarget, PrincipalRef, PrivSet, RoleRef, TokenScope, builtin_privileges,
+    GrantSpec, GrantTarget, PrincipalRef, PrivSet, Privilege, RoleRef, TokenScope,
+    builtin_privileges,
 };
 use opl_types::authz_eval::{AuthzSnapshot, AuthzTarget, ancestors, groups_of};
 use opl_types::resource::Kind;
@@ -87,7 +88,7 @@ impl Grants {
 }
 
 /// 대상별로 합친 권한(`system.read` 품기 전)
-#[derive(Debug, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 struct Layer {
     /// 루트 대상
     root: PrivSet,
@@ -101,6 +102,15 @@ struct Layer {
 }
 
 impl Layer {
+    /// 어느 대상에서든 `privilege`가 있다(루트·폴더·폴더 안·객체).
+    fn anywhere(&self, privilege: Privilege) -> bool {
+        self.root.contains(privilege)
+            || self.down_root.contains(privilege)
+            || self.contents.values().any(|s| s.contains(privilege))
+            || self.folders.values().any(|s| s.contains(privilege))
+            || self.objects.values().any(|s| s.contains(privilege))
+    }
+
     fn get(&self, target: &AuthzTarget) -> PrivSet {
         match *target {
             AuthzTarget::Root => self.root,
@@ -208,6 +218,68 @@ impl EffectiveIndex {
     pub fn is_all(&self) -> bool {
         self.all
     }
+
+    /// 세대만 다르고 권한은 같다(`/watch`가 세대가 바뀌어도 닫지 않아도 되는지 본다).
+    pub fn same_rights(&self, other: &EffectiveIndex) -> bool {
+        self.all == other.all && self.owner == other.owner && self.ceiling == other.ceiling
+    }
+
+    /// 어딘가에서 `privilege`가 있다(범위 토큰이면 범위도). 만들기 요청에 폴더가 빠졌을 때 400 `folder_required`와
+    /// 403을 가른다.
+    pub fn anywhere(&self, privilege: Privilege) -> bool {
+        self.all
+            || (self.owner.anywhere(privilege)
+                && self.ceiling.as_ref().is_none_or(|c| c.anywhere(privilege)))
+    }
+
+    /// 대상별 권한 그대로(`/permissions/mine`): (루트, 폴더 자체, 폴더 안의 객체, 객체). 전부 `system.read`를 품는다.
+    pub fn layers(&self, folders: &[Uuid]) -> Layers {
+        let root = self.get(&AuthzTarget::Root);
+        let mut out = Layers {
+            all: self.all,
+            root,
+            folders: Default::default(),
+            contents: Default::default(),
+            objects: Default::default(),
+        };
+        if self.all {
+            return out;
+        }
+        for f in folders {
+            let here = self.get(&AuthzTarget::Folder(*f));
+            if !here.is_empty() {
+                out.folders.insert(*f, here);
+            }
+            let inside = self.get(&AuthzTarget::Object {
+                kind: Kind::Vm,
+                id: Uuid::nil(),
+                folder: Some(*f),
+            });
+            if !inside.is_empty() {
+                out.contents.insert(*f, inside);
+            }
+        }
+        for (kind, id) in self.owner.objects.keys() {
+            // 객체 grant는 그 객체가 어느 폴더에 있든 더해지므로 루트에 있는 것으로 셈한 값을 준다(폴더 권한과 합쳐 본다).
+            let set = self.get(&AuthzTarget::Object {
+                kind: *kind,
+                id: *id,
+                folder: None,
+            });
+            out.objects.insert((*kind, *id), set);
+        }
+        out
+    }
+}
+
+/// 주체 색인을 대상별로 펼친 것(`GET /permissions/mine`)
+#[derive(Debug, Default)]
+pub struct Layers {
+    pub all: bool,
+    pub root: PrivSet,
+    pub folders: HashMap<Uuid, PrivSet>,
+    pub contents: HashMap<Uuid, PrivSet>,
+    pub objects: HashMap<(Kind, Uuid), PrivSet>,
 }
 
 fn role_privileges(snap: &AuthzSnapshot, g: &GrantSpec) -> PrivSet {

@@ -7,7 +7,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_types::firmware::{TpmSource, tpm_source};
 use opl_types::node::{NodeSpec, VTPM};
-use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::resource::Resource;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{Vm, VmSpec};
 use serde::Deserialize;
@@ -15,7 +15,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::audit::AuditNote;
-use crate::auth::{Action, Principal};
+use crate::auth::Principal;
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
 use crate::resources::lookup;
@@ -148,12 +148,11 @@ fn reset_node(state: &AppState, vm: &Vm, uefi_vars: bool, tpm: bool) -> Result<U
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn reset_firmware(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
     Json(req): Json<FirmwareResetRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VmSpec::KIND)?;
     require_feature(&state.cluster, VTPM)?;
     let FirmwareResetRequest {
         uefi_vars,

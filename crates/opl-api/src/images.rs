@@ -98,7 +98,9 @@ pub async fn list_catalog(
     principal: Principal,
     Query(q): Query<CatalogQuery>,
 ) -> Result<Json<List<CatalogEntry>>, ApiError> {
-    state.authorize(&principal, Action::Read, VolumeSpec::KIND)?;
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::SystemRead)?;
     let images = catalog(&state)?;
     let admin = writes_settings(&state, &principal);
     let (revision, tasks) = state.cluster.list::<TaskSpec>()?;
@@ -287,13 +289,20 @@ pub async fn download_catalog_image(
     Path(id): Path<String>,
     Json(req): Json<CatalogDownloadRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
-    state.authorize(&principal, Action::Write, VolumeSpec::KIND)?;
-    if req.template.is_some() {
-        state.authorize(&principal, Action::Write, VmSpec::KIND)?;
-    }
     require_feature(&state.cluster, INSTALL_MEDIA)?;
     require_feature(&state.cluster, TEMPLATES)?;
     let pool = find_pool(&state, &req.pool)?;
+    // 받을 풀의 `storage.allocate`, 템플릿을 만들면 루트(VM 트리의 루트에 만든다)의 `vm.create`
+    state.authz.require(
+        &principal,
+        opl_types::authz::Privilege::StorageAllocate,
+        &pool,
+    )?;
+    if req.template.is_some() {
+        state
+            .authz
+            .require_root(&principal, opl_types::authz::Privilege::VmCreate)?;
+    }
     let format = default_format(&pool);
     check_pool_format(&pool, format)?;
     let arch = match req.arch {

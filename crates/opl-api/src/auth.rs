@@ -43,20 +43,33 @@ pub struct Principal {
     pub user: Uuid,
     pub name: String,
     pub role: Role,
+    /// API 토큰으로 온 요청이면 그 토큰(계획 62: 토큰 범위를 찾는다). 응답에는 내지 않는다.
+    #[serde(skip)]
+    pub token: Option<Uuid>,
 }
 
 /// 종류 단위 확인의 동작. 권한 목록(계획 62)과 견주려고 opl-types에 둔다.
 pub use opl_types::authz::Action;
 
-/// 모든 핸들러가 거치는 권한 확인 훅(설계 4절). 엔터프라이즈 플러그인이 세분화된 RBAC로 바꾼다.
+/// 루트(클러스터 객체)의 종류 단위 권한 확인 훅(설계 4절). 엔터프라이즈 플러그인이 바꾼다. 계획 62부터 폴더를 따르는
+/// 객체(VM·볼륨·백업·네트워크·풀 등)는 폴더·grant 색인(`AppState::authz`)이 정하고 이 훅은 루트 확인에만 쓴다.
 pub trait Authorizer: Send + Sync {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool;
+
+    /// 내장 역할 규칙([`RoleAuthorizer`])이면 참: 루트 확인을 색인(전역 역할 + 루트 grant + 토큰 범위)이 대신한다.
+    fn builtin(&self) -> bool {
+        false
+    }
 }
 
 /// 고정 역할 3개. 자기 API 토큰은 역할과 관계없이 누구나 다룬다(토큰 핸들러가 따로 확인한다).
 pub struct RoleAuthorizer;
 
 impl Authorizer for RoleAuthorizer {
+    fn builtin(&self) -> bool {
+        true
+    }
+
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
         // 계정과 비밀을 담은 종류(전원 끄기 펜싱의 BMC 비밀번호, 알림 대상의 SMTP 비밀번호·webhook 토큰, 2FA 비밀,
         // 누가 무엇을 받았는지 담은 grant·그룹)는 admin만 읽는다.
@@ -268,6 +281,7 @@ fn principal_of(u: User) -> Principal {
         user: u.id,
         name: u.name,
         role: u.spec.role,
+        token: None,
     }
 }
 
@@ -496,9 +510,11 @@ impl AppState {
             if !constant_time_eq(&sha256_hex(secret), &stored.spec.secret_hash) {
                 return Err(ApiError::unauthorized());
             }
-            return self
+            let mut principal = self
                 .principal_for(stored.spec.user)?
-                .ok_or_else(ApiError::unauthorized);
+                .ok_or_else(ApiError::unauthorized)?;
+            principal.token = Some(stored.id);
+            return Ok(principal);
         }
         let session = session_cookie(&parts.headers).ok_or_else(ApiError::unauthorized)?;
         let found = self
@@ -552,19 +568,53 @@ impl AppState {
         Ok(())
     }
 
-    /// 권한이 없으면 403
+    /// 루트(클러스터 객체)의 종류 단위 확인. 권한이 없으면 403. 내장 규칙이면 루트의 유효 권한(전역 역할과 루트 grant,
+    /// 토큰 범위)에 `kind_privilege(action, kind)`가 있어야 하고, 플러그인(`authorizer`)이면 플러그인이 정한다(토큰
+    /// 요청은 색인의 범위도 지킨다). 폴더를 따르는 종류(VM·볼륨·백업·가져오기·네트워크·풀)는 객체 확인(`state.authz`,
+    /// 경로표 `authz_routes`)을 써야 하므로 디버그 빌드에서 막는다.
     pub fn authorize(
         &self,
         principal: &Principal,
         action: Action,
         kind: Kind,
     ) -> Result<(), ApiError> {
-        if self.authorizer.check(principal, action, kind) {
+        debug_assert!(
+            !folder_kind(kind),
+            "{kind:?} follows folders; check the object with state.authz"
+        );
+        let privilege = opl_types::authz::kind_privilege(action, kind);
+        let by_index = self
+            .authz
+            .effective(principal, &opl_types::authz_eval::AuthzTarget::Root)?
+            .contains(privilege);
+        let ok = if self.authorizer.builtin() {
+            by_index
+        } else {
+            self.authorizer.check(principal, action, kind)
+                && (principal.token.is_none() || by_index)
+        };
+        if ok {
             Ok(())
         } else {
             Err(ApiError::forbidden())
         }
     }
+}
+
+/// 객체 권한(폴더·객체 grant)을 따르는 종류. 루트 확인(`AppState::authorize`)에 쓰지 않는다.
+pub(crate) fn folder_kind(kind: Kind) -> bool {
+    matches!(
+        kind,
+        Kind::Vm
+            | Kind::Volume
+            | Kind::Snapshot
+            | Kind::Backup
+            | Kind::VmImport
+            | Kind::Network
+            | Kind::StoragePool
+            | Kind::Task
+            | Kind::Folder
+    )
 }
 
 impl FromRequestParts<Arc<AppState>> for Principal {
@@ -574,6 +624,10 @@ impl FromRequestParts<Arc<AppState>> for Principal {
         parts: &mut Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
+        // 경로표 미들웨어(`authz_routes::layer`)가 이미 인증했으면 그 주체다.
+        if let Some(principal) = parts.extensions.get::<Principal>() {
+            return Ok(principal.clone());
+        }
         let mut principal = state.authenticate(parts).await;
         // `Orbivisor-Min-Revision`의 리비전까지 기다렸으면 다시 인증한다(다른 노드에서 막 만든 자격 증명은 받고,
         // 기다리는 사이 폐기된 것은 받지 않는다).
@@ -598,6 +652,7 @@ mod tests {
             user: Uuid::nil(),
             name: "u".into(),
             role,
+            token: None,
         }
     }
 

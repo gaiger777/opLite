@@ -17,6 +17,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::{NodeId, Rejection};
+use opl_types::alert::SubjectKind;
 use opl_types::alert::{
     AlertRule, AlertRuleSpec, AlertRuleStatus, AlertState, AlertView, AlertsQuery, AlertsReply,
     AlertsResponse, DEFAULT_HISTORY_LIMIT, HistoryWindow, MAX_HISTORY_LIMIT,
@@ -24,7 +25,6 @@ use opl_types::alert::{
     NotificationTargetView, NotificationTestResult, Severity, SmtpTarget, TargetConfig,
     WebhookTarget, redact_url,
 };
-use opl_types::auth::Role;
 use opl_types::clock::{Clock, SystemClock};
 use opl_types::node::{NOTIFICATIONS, Node, NodeSpec};
 use opl_types::resource::{Resource, ResourceSpec};
@@ -42,6 +42,8 @@ use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
 use crate::resources::{CreateRequest, List, UpdateRequest, check_name, if_match, lookup};
 use crate::state::AppState;
+use opl_types::authz::Privilege;
+use opl_types::authz_eval::AuthzTarget;
 
 /// 다른 노드의 경보를 읽는 데 기다리는 최대 시간
 const PEER_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -575,7 +577,6 @@ pub async fn list_alerts(
     State(state): State<Arc<AppState>>,
     principal: Principal,
 ) -> Result<Json<AlertsResponse>, ApiError> {
-    state.authorize(&principal, Action::Read, AlertRuleSpec::KIND)?;
     let rules: std::collections::BTreeMap<uuid::Uuid, AlertRule> = state
         .cluster
         .list::<AlertRuleSpec>()?
@@ -610,6 +611,11 @@ pub async fn list_alerts(
             }
         }
     }
+    // 경보는 대상을 볼 수 있는 것만(대상의 `alert.read`, 노드·백업 작업은 루트, 계획 62)
+    let owners = crate::authz::Owners::load(&state.cluster)?;
+    let mut alerts = state.authz.filter_by(&principal, alerts, |a| {
+        subject_owner(&state, &owners, a.subject.kind, Some(a.subject.id), None)
+    })?;
     alerts.sort_by(|a, b| {
         (b.state == AlertState::Firing)
             .cmp(&(a.state == AlertState::Firing))
@@ -624,6 +630,52 @@ pub async fn list_alerts(
         unsupported,
         overflowing,
     }))
+}
+
+/// 경보 대상(종류와 id 또는 이름)의 주인. 볼 권한은 그 대상의 `alert.read`다. 노드·백업 작업·모르는 대상은 루트다.
+fn subject_owner(
+    state: &AppState,
+    owners: &crate::authz::Owners,
+    kind: SubjectKind,
+    id: Option<uuid::Uuid>,
+    name: Option<&str>,
+) -> crate::authz::Owned {
+    use opl_types::storage::StoragePoolSpec;
+    use opl_types::task::TaskSpec;
+    use opl_types::vm::VmSpec;
+    let target = match kind {
+        SubjectKind::Vm => {
+            let id = id.or_else(|| {
+                name.and_then(|n| state.cluster.get_by_name::<VmSpec>(n).ok().flatten())
+                    .map(|v| v.id)
+            });
+            id.map(|id| owners.vm(id))
+        }
+        SubjectKind::Pool => {
+            let pool = match (id, name) {
+                (Some(id), _) => state.cluster.get::<StoragePoolSpec>(id).ok().flatten(),
+                (None, Some(n)) => state
+                    .cluster
+                    .get_by_name::<StoragePoolSpec>(n)
+                    .ok()
+                    .flatten(),
+                _ => None,
+            };
+            pool.map(|p| AuthzTarget::Object {
+                kind: opl_types::resource::Kind::StoragePool,
+                id: p.id,
+                folder: p.spec.folder,
+            })
+        }
+        SubjectKind::Task => id
+            .and_then(|id| state.cluster.get::<TaskSpec>(id).ok().flatten())
+            .map(|t| owners.task(&t.spec).target),
+        SubjectKind::Node | SubjectKind::BackupJob => None,
+    };
+    crate::authz::Owned {
+        target: target.unwrap_or(AuthzTarget::Root),
+        read: Privilege::AlertRead,
+    }
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -648,9 +700,10 @@ pub async fn list_alert_history(
     principal: Principal,
     Query(params): Query<AlertHistoryParams>,
 ) -> Result<Json<NotificationHistoryResponse>, ApiError> {
-    state.authorize(&principal, Action::Read, AlertRuleSpec::KIND)?;
     // 알림 대상은 admin만 읽으므로 다른 사용자에게는 대상 이름과 오류 문구(서버·주소가 담김)를 보이지 않는다.
-    let admin = principal.role == Role::Admin;
+    let admin = state
+        .authz
+        .allows(&principal, Privilege::ClusterAdmin, AuthzTarget::Root);
     let ms = |field: &str, v: &str| {
         crate::audit::parse_time(field, v).map(|t| i64::try_from(t).unwrap_or(i64::MAX))
     };
@@ -688,6 +741,24 @@ pub async fn list_alert_history(
             }
         }
     }
+    // 규칙의 대상 종류와 대상 이름으로 볼 수 있는 기록만 남긴다(시험 보내기는 루트, 계획 62).
+    let kinds: std::collections::HashMap<String, SubjectKind> = state
+        .cluster
+        .list::<AlertRuleSpec>()?
+        .1
+        .into_iter()
+        .map(|r| (r.name, r.spec.condition.subject_kind()))
+        .collect();
+    let owners = crate::authz::Owners::load(&state.cluster)?;
+    let mut records = state.authz.filter_by(&principal, records, |r| {
+        match (r.rule.as_ref().and_then(|n| kinds.get(n)), &r.subject) {
+            (Some(kind), Some(name)) => subject_owner(&state, &owners, *kind, None, Some(name)),
+            _ => crate::authz::Owned {
+                target: AuthzTarget::Root,
+                read: Privilege::AlertRead,
+            },
+        }
+    })?;
     records.sort_by(|a, b| b.at.cmp(&a.at).then(a.node.cmp(&b.node)));
     let truncated = records.len() > limit as usize;
     records.truncate(limit as usize);

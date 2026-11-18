@@ -102,7 +102,7 @@ fn role_privileges(snap: &AuthzSnapshot, role: &RoleRef) -> PrivSet {
 }
 
 /// grant 대상 `on`(propagate `propagate`)이 `target`에 닿는가. `chain`은 대상 쪽 조상 폴더(자기 폴더 포함)다.
-fn reaches(on: &GrantTarget, propagate: bool, target: &AuthzTarget, chain: &[Uuid]) -> bool {
+pub fn reaches(on: &GrantTarget, propagate: bool, target: &AuthzTarget, chain: &[Uuid]) -> bool {
     match (on, target) {
         (GrantTarget::Root, AuthzTarget::Root) => true,
         (GrantTarget::Root, _) => propagate,
@@ -118,7 +118,7 @@ fn reaches(on: &GrantTarget, propagate: bool, target: &AuthzTarget, chain: &[Uui
     }
 }
 
-fn chain_of(snap: &AuthzSnapshot, target: &AuthzTarget) -> Vec<Uuid> {
+pub fn chain_of(snap: &AuthzSnapshot, target: &AuthzTarget) -> Vec<Uuid> {
     match target {
         AuthzTarget::Root => Vec::new(),
         AuthzTarget::Folder(f) => ancestors(snap, Some(*f)),

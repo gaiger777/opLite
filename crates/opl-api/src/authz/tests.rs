@@ -38,6 +38,7 @@ fn principal(user: Uuid, role: Role) -> Principal {
         user,
         name: "u".into(),
         role,
+        token: None,
     }
 }
 

@@ -235,11 +235,10 @@ pub async fn get_node_metrics(
     responses((status = 200, body = VmMetricsResponse), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_vm_metrics(
     State(state): State<Arc<AppState>>,
-    principal: Principal,
+    _principal: Principal,
     Path(key): Path<String>,
     Query(params): Query<MetricsParams>,
 ) -> Result<Json<VmMetricsResponse>, ApiError> {
-    state.authorize(&principal, Action::Read, VmSpec::KIND)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let query = MetricsQuery {
         scope: MetricsScope::Vm { id: vm.id },
