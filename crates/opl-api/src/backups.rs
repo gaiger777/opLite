@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use opl_types::backup::{Backup, BackupPhase, BackupSpec, BackupStatus, default_backup_name};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
-use opl_types::node::{Node, NodeSpec};
+use opl_types::node::{GUEST_AGENT, Node, NodeSpec, VTPM};
 use opl_types::remote::RemoteSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::{
@@ -542,7 +542,8 @@ pub(crate) async fn start_backup_delete(
 /// 백업 풀과 대상 풀을 함께 쓸 수 있는 온라인 노드 가운데 이름이 가장 앞선 노드다(없으면 409 `no_node`).
 /// 공유가 아닌 풀의 백업은 파일을 쓴 노드(`status.node`)에서만 되살린다: `node`가 다르면 409
 /// `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`. 증분 백업은 고른 노드가 증분 백업을
-/// 알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`).
+/// 알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`). TPM 상태가 있거나 VM 스펙에 `tpm`·`secure_boot`가 있는
+/// 백업은 모든 노드가 `vtpm`을, `guest_agent`가 있는 백업은 `guest-agent`를 알아야 한다(409 `cluster_upgrading`).
 #[utoipa::path(post, path = "/backups/{key}/restore", tag = "backups",
     params(("key" = String, Path, description = "id or name")),
     request_body = RestoreRequest,
@@ -575,6 +576,13 @@ pub async fn restore_backup(
         return Err(backup_busy(&backup, "being deleted"));
     }
     let spec = &backup.spec.vm_spec;
+    // TPM 상태·TPM·Secure Boot·게스트 에이전트가 든 VM은 옛 노드가 풀지 못한다. 버리지 않고 거절한다(계획 59 §10).
+    if backup.status.tpm_state || spec.tpm || spec.secure_boot {
+        require_feature(&state.cluster, VTPM)?;
+    }
+    if spec.guest_agent.is_some() {
+        require_feature(&state.cluster, GUEST_AGENT)?;
+    }
     for nic in spec.nics.iter().filter(|n| n.network != USER_NETWORK) {
         if state
             .cluster

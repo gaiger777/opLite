@@ -118,6 +118,23 @@ impl Env {
         F: FnOnce(Arc<Cluster>) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
+        Self::start_full(tweak, before_runner, |_| {}).await
+    }
+
+    /// `tweak_state`로 API 상태를 바꾼다(예: 게스트 에이전트 소스).
+    pub async fn start_with_state(tweak_state: impl FnOnce(&mut AppState)) -> Self {
+        Self::start_full(|_| {}, |_| async {}, tweak_state).await
+    }
+
+    async fn start_full<F, Fut>(
+        tweak: impl FnOnce(&mut ReconcilerConfig),
+        before_runner: F,
+        tweak_state: impl FnOnce(&mut AppState),
+    ) -> Self
+    where
+        F: FnOnce(Arc<Cluster>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let dir = TempDir::new().unwrap();
         let router = MemRouter::default();
         let id = NodeId(Uuid::now_v7());
@@ -223,6 +240,7 @@ impl Env {
             })
             .unwrap(),
         );
+        tweak_state(&mut state);
         let state = Arc::new(state);
         let mut config = runner_config(node, dir.path());
         config.import_credentials = state.import_credentials.clone();

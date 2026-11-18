@@ -298,7 +298,7 @@ pub(crate) fn check_no_revert_task(state: &AppState, vm: &Vm) -> Result<(), ApiE
     })
 }
 
-fn check_no_task(
+pub(crate) fn check_no_task(
     state: &AppState,
     vm: &Vm,
     doing: &str,

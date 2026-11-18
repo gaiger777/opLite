@@ -583,6 +583,7 @@ impl Member {
             state.trusted_proxies = config.api.trusted_proxies.clone();
             state.audit = audit;
             state.metrics = Some(metrics_source);
+            state.guest = Some(guest.clone());
             state.fence = fence;
             state.placement = placement;
             // 헬스 체크가 실행기 확인과 HA 리스(아래에서 띄운 뒤)를 본다.

@@ -65,6 +65,10 @@ pub(crate) async fn create_task(
     if op.needs_templates() {
         crate::cluster::require_feature(cluster, opl_types::node::TEMPLATES)?;
     }
+    // 펌웨어 초기화 Task는 옛 노드가 풀지 못한다(계획 59).
+    if op.needs_vtpm() {
+        crate::cluster::require_feature(cluster, opl_types::node::VTPM)?;
+    }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
     task.revision = cluster.create(&task).await?;

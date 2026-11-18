@@ -19,6 +19,7 @@ mod drain;
 pub mod error;
 mod fan_out;
 mod firmware;
+mod guest;
 mod ha;
 mod ha_checks;
 mod ha_groups;
@@ -61,6 +62,7 @@ mod telemetry;
 mod updates;
 pub mod users;
 pub mod vip;
+mod vm_firmware;
 pub mod vm_imports;
 mod vms;
 mod volumes;
@@ -249,6 +251,9 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vms::cdrom_media))
         .routes(routes!(vms::replicate_vm))
         .routes(routes!(vms::convert_template, vms::untemplate_vm))
+        .routes(routes!(vm_firmware::reset_firmware))
+        .routes(routes!(guest::get_guest))
+        .routes(routes!(guest::set_guest_password))
         .routes(routes!(metrics::get_vm_metrics))
         .routes(routes!(snapshots::list_snapshots))
         .routes(routes!(

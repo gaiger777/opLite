@@ -358,7 +358,8 @@ export interface paths {
          *     백업 풀과 대상 풀을 함께 쓸 수 있는 온라인 노드 가운데 이름이 가장 앞선 노드다(없으면 409 `no_node`).
          *     공유가 아닌 풀의 백업은 파일을 쓴 노드(`status.node`)에서만 되살린다: `node`가 다르면 409
          *     `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`. 증분 백업은 고른 노드가 증분 백업을
-         *     알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`).
+         *     알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`). TPM 상태가 있거나 VM 스펙에 `tpm`·`secure_boot`가 있는
+         *     백업은 모든 노드가 `vtpm`을, `guest_agent`가 있는 백업은 `guest-agent`를 알아야 한다(409 `cluster_upgrading`).
          */
         post: operations["restore_backup"];
         delete?: never;
@@ -1771,6 +1772,13 @@ export interface paths {
          *     `template`은 바꾸지 않는다(`POST`·`DELETE /vms/{key}/template`). 템플릿은 켤 수 없고(`power: running`은 409
          *     `vm_is_template`) 디스크 목록(볼륨·버스·개수)을 바꿀 수 없으며(409 `vm_is_template`) `ha`·`replication`·
          *     `snapshot_schedule`을 가질 수 없다(400). 연결 복제 디스크가 있는 VM의 복제 대상(`replication`)은 400이다.
+         *
+         *     `tpm`·`secure_boot`가 켜진 스펙은 모든 노드가 `vtpm`을, `guest_agent`가 있는 스펙은 `guest-agent`를 알아야 한다(409
+         *     `cluster_upgrading`). 실행 중에 `tpm`이나 게스트 에이전트 채널(`guest_agent`)을 켜고 끄면 다음 재시작 때 적용하는
+         *     보류(`status.hardware.pending`)가 되고, `guest_agent`의 `freeze_fs`·`shutdown`은 바로 적용된다. `secure_boot`는
+         *     실행 중이면 409 `vm_running`, UEFI 변수가 있으면(`status.firmware_node`) 409 `firmware_reset_required`다(변수 초기화와
+         *     함께 `POST /vms/{key}/firmware/reset`의 `secure_boot`로 바꾼다). 끝나지 않은 펌웨어 초기화 Task가 있으면 켜기는 409
+         *     `vm_busy`다.
          */
         put: operations["update_vm"];
         post?: never;
@@ -1801,7 +1809,9 @@ export interface paths {
          *     `cluster_upgrading`) 핫플러그 기록이 있는 실행 중 VM이어야 한다(409 `vm_not_running`). 끝나지 않은 스냅샷·되돌리기·
          *     복제·백업 Task가 있으면 409 `vm_busy`이고, 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다
          *     (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
-         *     `start`·`reboot`은 409 `vm_busy`다.
+         *     `start`·`reboot`은 409 `vm_busy`다. 끝나지 않은 펌웨어 초기화 Task(`vm-firmware-reset`)가 있어도 `start`·`reboot`은 409
+         *     `vm_busy`이고, 꺼진 TPM VM을 켤 노드가 지금 TPM 상태를 얻을 수 없으면(`firmware_node`가 오프라인이고 온라인 사본이
+         *     없음) `start`는 409 `tpm_state_unavailable`이다.
          */
         post: operations["vm_action"];
         delete?: never;
@@ -1892,6 +1902,76 @@ export interface paths {
         get: operations["console"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/firmware/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 꺼진 VM의 UEFI 변수·TPM 상태를 초기화할 Task(`vm-firmware-reset`)를 만든다(202, 설계 §5). Task는 온라인인
+         *     `firmware_node`에서 돌고(없거나 오프라인이면 VM의 디스크가 있는 노드), 그 노드의 파일을 지우고 `firmware_epoch`를
+         *     올린다(다른 노드의 사본은 회차가 달라 켤 때 지워진다). `uefi_vars`·`tpm`이 모두 거짓이면 400, VM이 꺼져 있지 않으면
+         *     409 `vm_running`, 켜거나 끄는 중이거나 마이그레이션·스냅샷·복제·백업 Task가 끝나지 않았으면 409 `vm_busy`, 모든
+         *     노드가 `vtpm`을 알아야 한다(409 `cluster_upgrading`). TPM 상태가 있는 VM의 변수만 초기화는 `firmware_node`가
+         *     오프라인이면 409 `node_unavailable`이다. `secure_boot`를 주면 Task를 만든 뒤 스펙의 `secure_boot`도 바꾼다(UEFI
+         *     펌웨어가 아니면 400). Task가 끝날 때까지 켜기는 409 `vm_busy`다.
+         */
+        post: operations["reset_firmware"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/guest": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * VM의 게스트 정보(OS·호스트 이름·NIC와 IP·파일 시스템). VM이 도는 노드의 메모리 캐시(60초마다 모음)를 읽고,
+         *     `refresh`면 에이전트에 지금 묻는다(VM마다 5초에 한 번). `state`는 `answered`(정보가 있음), `no_agent`(채널이 없거나
+         *     에이전트가 아직 답하지 않음), `not_running`, `unreachable`(VM이 도는 노드가 답하지 않음), `unsupported`(그 노드가
+         *     게스트 에이전트를 모르는 옛 노드)다. 정보는 `answered`일 때만 있다.
+         */
+        get: operations["get_guest"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/guest/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 게스트 사용자 `user`의 비밀번호를 바꾼다(`guest-set-user-password`, 설계 §9). 게스트 안 관리자 권한과 같은 무게라
+         *     VM 쓰기 권한이 필요하다. 비밀번호는 저장하지 않고 로그·감사(`vm guest password win user X`)·오류에 넣지 않는다.
+         *     사용자 이름(1~64바이트, 제어 문자 없음)·비밀번호(1~256바이트)가 맞지 않으면 400, 모든 노드가 `guest-agent`를 알아야
+         *     하고(409 `cluster_upgrading`), VM이 돌지 않으면 409 `vm_not_running`, 채널이 없거나 에이전트가 답하지 않으면 409
+         *     `guest_agent_unavailable`, VM이 도는 노드가 답하지 않으면 503 `node_unreachable`이다.
+         */
+        post: operations["set_guest_password"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3470,10 +3550,29 @@ export interface components {
             /** @description TPM 2.0: `swtpm`·`swtpm_setup`이 있고 swtpm이 TPM 2.0을 하며 QEMU에 `emulator` TPM 백엔드가 있다. */
             tpm?: boolean;
         };
+        /** @description 초기화할 것. 적어도 하나는 참이어야 한다. */
+        FirmwareResetRequest: {
+            /**
+             * @description UEFI 변수 초기화와 함께 VM 스펙의 `secure_boot`를 이 값으로 바꾼다(`uefi_vars`가 있어야 한다). 변수가 있는
+             *     VM의 Secure Boot는 이 길로만 바꾼다(`PUT`은 409 `firmware_reset_required`).
+             */
+            secure_boot?: boolean;
+            /** @description TPM 상태를 버린다(다음 켜기가 새 TPM을 만든다). TPM에 봉인한 비밀(BitLocker·LUKS 키)을 잃는다. */
+            tpm?: boolean;
+            /** @description UEFI 변수(부팅 항목, Secure Boot 키)를 펌웨어 원본으로 되돌린다. */
+            uefi_vars?: boolean;
+        };
         /** @description 이 그룹(보통 DN)에 든 사용자는 이 역할 */
         GroupRole: {
             group: string;
             role: components["schemas"]["Role"];
+        };
+        /** @description NIC의 IP 주소 하나 */
+        GuestAddr: {
+            /** Format: ip */
+            ip: string;
+            /** Format: int32 */
+            prefix: number;
         };
         /** @description VM의 게스트 에이전트 설정(계획 59). JSON `{}`은 기본값 그대로 켠다는 뜻이고, 기본값인 칸은 쓰지 않는다. */
         GuestAgentSpec: {
@@ -3484,6 +3583,73 @@ export interface components {
             freeze_fs: boolean;
             /** @description VM을 끌 때 쓰는 방법 */
             shutdown?: components["schemas"]["AgentShutdown"];
+        };
+        /** @description 게스트의 파일 시스템 하나. 크기는 에이전트가 알려 줄 때만 있다. */
+        GuestFs: {
+            fstype: string;
+            mountpoint: string;
+            /** Format: int64 */
+            total_bytes?: number;
+            /** Format: int64 */
+            used_bytes?: number;
+        };
+        /** @description 게스트 에이전트에서 모은 게스트 정보. 실패한 명령(옛 에이전트, freeze 중)의 칸은 비어 있다. */
+        GuestInfo: {
+            /** @description 에이전트 버전(`guest-info`) */
+            agent_version?: string;
+            /**
+             * Format: int64
+             * @description 모은 시각(유닉스 초)
+             */
+            collected_at: number;
+            /** @description 파일 시스템(`guest-get-fsinfo`) */
+            filesystems?: components["schemas"]["GuestFs"][];
+            /** @description 호스트 이름(`guest-get-host-name`) */
+            hostname?: string;
+            /** @description NIC와 주소(`guest-network-get-interfaces`) */
+            interfaces?: components["schemas"]["GuestNic"][];
+            /** @description 게스트 OS(`guest-get-osinfo`) */
+            os?: components["schemas"]["GuestOs"];
+        };
+        /** @description 게스트 정보 읽기의 응답 */
+        GuestInfoResponse: {
+            info?: components["schemas"]["GuestInfo"];
+            state: components["schemas"]["GuestInfoState"];
+        };
+        /**
+         * @description 게스트 정보 읽기의 결과(`GET /vms/{key}/guest`)
+         * @enum {string}
+         */
+        GuestInfoState: "answered" | "no_agent" | "not_running" | "unreachable" | "unsupported";
+        /** @description 게스트의 NIC 하나 */
+        GuestNic: {
+            addresses?: components["schemas"]["GuestAddr"][];
+            /** @description 하드웨어 주소(게스트가 보낸 문자열 그대로) */
+            mac?: string;
+            name: string;
+        };
+        /** @description 게스트 OS(`guest-get-osinfo`의 `id`·`pretty-name`·`version`·`kernel-release`) */
+        GuestOs: {
+            /** @description 예: `ubuntu`, `mswindows` */
+            id?: string;
+            kernel?: string;
+            /** @description 예: `Ubuntu 24.04.1 LTS` */
+            name?: string;
+            version?: string;
+        };
+        /** @description 게스트 사용자 비밀번호 설정 */
+        GuestPasswordRequest: {
+            /**
+             * Format: password
+             * @description 새 비밀번호(평문, 1~256바이트). 저장하지 않는다.
+             */
+            password: string;
+            /** @description 게스트 사용자 이름(1~64바이트, 제어 문자 없음) */
+            user: string;
+        };
+        /** @description 비밀번호를 설정한 사용자 */
+        GuestPasswordResponse: {
+            user: string;
         };
         /** @description 게스트 에이전트(QGA) 감시: 한 번 답한 에이전트가 `timeout_secs` 동안 답하지 않으면 VM을 강제로 다시 켠다. */
         GuestWatch: {
@@ -12445,6 +12611,115 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    reset_firmware: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FirmwareResetRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_guest: {
+        parameters: {
+            query?: {
+                /** @description 캐시(60초마다 모음) 대신 에이전트에 지금 묻는다. VM마다 5초에 한 번이고 그 사이에는 캐시를 돌려준다. */
+                refresh?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestInfoResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_guest_password: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GuestPasswordRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestPasswordResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
             };
             "4XX": {
                 headers: {

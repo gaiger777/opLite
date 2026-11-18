@@ -12,8 +12,8 @@ use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    FAST_HA, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node, NodeSpec, PLACEMENT,
-    TEMPLATES, ha_capable,
+    FAST_HA, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node, NodeSpec,
+    PLACEMENT, TEMPLATES, VTPM, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Resource, ResourceSpec};
@@ -47,6 +47,7 @@ use crate::snapshots::{
 };
 use crate::state::AppState;
 use crate::tasks::create_task;
+use crate::vm_firmware::{check_no_firmware_reset_task, check_secure_boot_change, check_tpm_state};
 use crate::volumes::{clone_names, linked_clones, template_in_use_message};
 
 /// 원하는 상태도 실제 상태도 꺼져 있다. 삭제와 노드·디스크 변경은 이때만 할 수 있다.
@@ -226,6 +227,13 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     // 템플릿 표시는 옛 노드가 풀지 못한다(계획 58).
     if spec.template {
         require_feature(&state.cluster, TEMPLATES)?;
+    }
+    // TPM·Secure Boot와 게스트 에이전트는 옛 노드가 풀지 못한다(계획 59).
+    if spec.tpm || spec.secure_boot {
+        require_feature(&state.cluster, VTPM)?;
+    }
+    if spec.guest_agent.is_some() {
+        require_feature(&state.cluster, GUEST_AGENT)?;
     }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
@@ -881,6 +889,13 @@ fn warning_header(spec: &VmSpec) -> HeaderMap {
 /// `template`은 바꾸지 않는다(`POST`·`DELETE /vms/{key}/template`). 템플릿은 켤 수 없고(`power: running`은 409
 /// `vm_is_template`) 디스크 목록(볼륨·버스·개수)을 바꿀 수 없으며(409 `vm_is_template`) `ha`·`replication`·
 /// `snapshot_schedule`을 가질 수 없다(400). 연결 복제 디스크가 있는 VM의 복제 대상(`replication`)은 400이다.
+///
+/// `tpm`·`secure_boot`가 켜진 스펙은 모든 노드가 `vtpm`을, `guest_agent`가 있는 스펙은 `guest-agent`를 알아야 한다(409
+/// `cluster_upgrading`). 실행 중에 `tpm`이나 게스트 에이전트 채널(`guest_agent`)을 켜고 끄면 다음 재시작 때 적용하는
+/// 보류(`status.hardware.pending`)가 되고, `guest_agent`의 `freeze_fs`·`shutdown`은 바로 적용된다. `secure_boot`는
+/// 실행 중이면 409 `vm_running`, UEFI 변수가 있으면(`status.firmware_node`) 409 `firmware_reset_required`다(변수 초기화와
+/// 함께 `POST /vms/{key}/firmware/reset`의 `secure_boot`로 바꾼다). 끝나지 않은 펌웨어 초기화 Task가 있으면 켜기는 409
+/// `vm_busy`다.
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
@@ -960,6 +975,11 @@ async fn write_spec(
         if spec.node != current.spec.node && !is_stopped(&current) {
             return Err(vm_running(&current, "move"));
         }
+        // Secure Boot는 꺼진 VM에서, UEFI 변수가 없을 때만 바꾼다(변수 초기화와 함께 바꾸기는
+        // `POST /vms/{key}/firmware/reset`).
+        if spec.secure_boot != current.spec.secure_boot {
+            check_secure_boot_change(&current, spec.secure_boot)?;
+        }
         // 모든 노드가 `hotplug`를 알면 실행 중인 VM의 하드웨어 변경을 핫플러그 Task로 맞춘다. 같은 PUT으로 끄면
         // 다음 시작부터 적용하는 변경이다. 켜져 있어야 하지만 QEMU가 없고 전원 Task도 없는 VM(실패, 다시 켜기를
         // 기다림)은 지금 규칙대로 받는다(CPU·메모리는 다음 시작부터, 디스크·NIC 순서는 그대로).
@@ -981,6 +1001,7 @@ async fn write_spec(
         }
         if spec.power == PowerState::Running && current.spec.power == PowerState::Stopped {
             check_stopping_devices(&current, &spec)?;
+            check_no_firmware_reset_task(state, &current)?;
         }
         // 노드가 과반수와 끊긴 동안 켜면 그 노드는 HA인 줄 모르고 펜싱하지 않는다. 끄기는 언제든.
         if spec.ha_active() && !current.spec.ha_active() && !is_stopped(&current) {
@@ -1498,7 +1519,9 @@ pub enum StopMode {
 /// `cluster_upgrading`) 핫플러그 기록이 있는 실행 중 VM이어야 한다(409 `vm_not_running`). 끝나지 않은 스냅샷·되돌리기·
 /// 복제·백업 Task가 있으면 409 `vm_busy`이고, 메모리를 바로 늘리면 VM이 도는 노드에 그만큼 미할당 메모리가 있어야 한다
 /// (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
-/// `start`·`reboot`은 409 `vm_busy`다.
+/// `start`·`reboot`은 409 `vm_busy`다. 끝나지 않은 펌웨어 초기화 Task(`vm-firmware-reset`)가 있어도 `start`·`reboot`은 409
+/// `vm_busy`이고, 꺼진 TPM VM을 켤 노드가 지금 TPM 상태를 얻을 수 없으면(`firmware_node`가 오프라인이고 온라인 사본이
+/// 없음) `start`는 409 `tpm_state_unavailable`이다.
 #[utoipa::path(post, path = "/vms/{key}/actions/{action}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("action" = String, Path, description = "start, stop, reboot or hotplug"), ActionQuery),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1516,6 +1539,7 @@ pub async fn vm_action(
     if matches!(action.as_str(), "start" | "reboot") {
         check_not_template(&vm)?;
         check_no_untemplate_task(&state, &vm)?;
+        check_no_firmware_reset_task(&state, &vm)?;
     }
     // 스냅샷 Task가 끝나지 않았으면 막는다. 시작한 스냅샷 Task는 실행기의 시간 제한으로 끝난다.
     // 강제 정지는 되돌리기만 막는다. 저장이 멈춘 만들기 중에도 VM을 끌 수 있어야 한다.
@@ -1607,6 +1631,12 @@ pub async fn vm_action(
                 if spec.power != PowerState::Running {
                     me.spec = spec.clone();
                     check_ha_capacity(&state, &Inventory::load(&state.cluster)?, &me)?;
+                    // 꺼진 TPM VM을 켤 노드가 지금 TPM 상태를 얻을 수 없으면 켜지 않는다(409
+                    // `tpm_state_unavailable`, 작업자도 켜지 않고 기다린다).
+                    if let Some(now) = state.cluster.get::<VmSpec>(id)?.filter(is_stopped) {
+                        me.status = now.status;
+                        check_tpm_state(&state, &me, spec.node.expect("node picked above"))?;
+                    }
                 }
                 spec.power = PowerState::Running;
                 Ok(())

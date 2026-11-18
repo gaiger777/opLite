@@ -7,6 +7,7 @@
 //! 지표: 한 노드의 지표 API가 다른 노드의 지표를 읽고, 지표를 모르는 노드와 닿지 않는 노드를 알린다.
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
 //! 최적 배치: 리더가 아닌 노드의 API가 리더의 노드 부하를 노드 사이 RPC로 읽어 보이고 VM을 놓는다.
+//! 게스트 에이전트: 한 노드의 API가 다른 노드에서 도는 VM의 게스트 정보를 읽고 비밀번호를 설정한다.
 //! 세션: 한 노드에서 만든 로그인 세션을 다른 노드가 받고, 로그아웃이 두 노드에 반영된다. 정족수가 없으면
 //! 로그인 세션을 그 노드 메모리에 둔다.
 
@@ -97,6 +98,8 @@ struct Node {
     state: Option<Arc<AppState>>,
     /// 이 노드의 Ceph 단계가 부르는 명령을 받는 가짜 실행기(API와 노드 간 서버가 같은 단계를 쓴다)
     ceph: Arc<FakeRunner>,
+    /// 이 노드의 게스트 에이전트 소스(API와 노드 간 서버가 같은 것을 쓴다)
+    guest: Arc<NodeGuest>,
 }
 
 impl Node {
@@ -150,6 +153,10 @@ impl Node {
             runner_config: None,
             state: None,
             ceph: Arc::new(FakeRunner::new()),
+            guest: Arc::new(NodeGuest {
+                hostname: format!("{name}-guest"),
+                passwords: Default::default(),
+            }),
         }
     }
 
@@ -211,6 +218,7 @@ impl Node {
             .with_migrations(Arc::new(incoming))
             .with_uefi_vars(work.join("state"))
             .with_audit(audit.clone())
+            .with_guest_agent(self.guest.clone())
             .with_ceph(Arc::new(CephPeerSource::new(
                 self.cluster.clone(),
                 self.id,
@@ -263,6 +271,7 @@ impl Node {
         state.peers = Some(self.peers.clone());
         state.audit = audit;
         state.metrics = metrics;
+        state.guest = Some(self.guest.clone());
         state.placement = board;
         state.ceph = Some(ceph);
         let state = Arc::new(state);
@@ -674,6 +683,56 @@ async fn tpm_state_follows_a_stopped_vm_into_snapshots() {
     assert_eq!(task["status"]["state"], "failed", "{task}");
     let error = task["status"]["error"].as_str().unwrap();
     assert!(error.contains("is on node \"node1\" (offline)"), "{error}");
+}
+
+/// A의 API가 B에서 도는 VM의 게스트 정보를 노드 사이 RPC로 읽고 비밀번호를 설정한다. 꺼진 노드의 VM은 `unreachable`이다.
+#[tokio::test]
+async fn the_guest_agent_of_a_vm_on_another_node_is_reached() {
+    let (_root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let mut req = vm_request("web");
+    req["spec"]["node"] = serde_json::json!(b.id);
+    req["spec"]["guest_agent"] = serde_json::json!({});
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let (status, body) = admin.get("/vms/web/guest?refresh=true").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["state"], "answered", "{body}");
+    assert_eq!(body["info"]["hostname"], "node2-guest");
+    let (status, body) = admin
+        .post(
+            "/vms/web/guest/password",
+            serde_json::json!({ "user": "root", "password": "pw-on-b" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        *b.guest.passwords.lock().unwrap(),
+        [("root".to_string(), "pw-on-b".to_string())]
+    );
+    assert!(a.guest.passwords.lock().unwrap().is_empty());
+
+    // B를 꺼진 것으로 적으면 묻지 않는다.
+    let mut node = a.cluster.get::<NodeSpec>(b.id).unwrap().unwrap();
+    node.status.online = false;
+    a.cluster
+        .update_status::<NodeSpec>(b.id, &node.status)
+        .await
+        .unwrap();
+    let (status, body) = admin.get("/vms/web/guest").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body, serde_json::json!({ "state": "unreachable" }));
+    let (status, body) = admin
+        .post(
+            "/vms/web/guest/password",
+            serde_json::json!({ "user": "root", "password": "pw-on-b" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "node_unreachable");
 }
 
 /// A에서 도는 VM `web`(디스크 없음)을 만든다.
@@ -2146,6 +2205,38 @@ async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
 }
 
 /// 노드 점은 `t` 1000·2000(CPU는 노드 id의 첫 바이트), VM 점은 어떤 VM이든 `vm_times`.
+/// 시험용 게스트 에이전트 소스: 정보의 호스트 이름은 `{노드 이름}-guest`이고, 비밀번호 설정을 (사용자, 비밀번호)로 적는다.
+struct NodeGuest {
+    hostname: String,
+    passwords: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl opl_peer::GuestAgentSource for NodeGuest {
+    async fn info(&self, _vm: Uuid, _refresh: bool) -> opl_types::guest::GuestInfoResponse {
+        opl_types::guest::GuestInfoResponse {
+            state: opl_types::guest::GuestInfoState::Answered,
+            info: Some(opl_types::guest::GuestInfo {
+                hostname: Some(self.hostname.clone()),
+                ..Default::default()
+            }),
+        }
+    }
+
+    async fn set_password(
+        &self,
+        _vm: Uuid,
+        user: &str,
+        password: &str,
+    ) -> Result<(), opl_peer::GuestAgentError> {
+        self.passwords
+            .lock()
+            .unwrap()
+            .push((user.into(), password.into()));
+        Ok(())
+    }
+}
+
 struct FakeMetrics {
     node: Uuid,
     vm_times: Vec<i64>,

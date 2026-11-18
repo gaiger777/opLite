@@ -5,7 +5,7 @@ use std::time::Duration;
 use opl_cluster::Cluster;
 use opl_driver::Hypervisor;
 use opl_driver::ceph::CephHost;
-use opl_peer::{MetricsSource, Peers};
+use opl_peer::{GuestAgentSource, MetricsSource, Peers};
 use opl_reconciler::HaGuard;
 use opl_types::security_group::Cidr;
 use uuid::Uuid;
@@ -50,6 +50,9 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     /// 이 노드의 지표(opld의 측정기 저장소). 없으면 지표 API가 이 노드를 `unsupported`로 보인다.
     pub metrics: Option<Arc<dyn MetricsSource>>,
+    /// 이 노드에서 도는 VM의 게스트 에이전트(opld의 게스트 정보 캐시, 계획 59). 없으면 게스트 정보 API가 이 노드의 VM을
+    /// `unsupported`로 보인다.
+    pub guest: Option<Arc<dyn GuestAgentSource>>,
     /// OIDC 영역의 discovery·JWKS(노드 메모리)
     pub(crate) oidc: OidcCache,
     /// 이 노드가 지금 받고 있는 백업 사본 파일(백업 id, 파일 이름). 같은 파일을 두 요청이 함께 쓰지 않게 한다.
@@ -100,6 +103,7 @@ impl AppState {
             import_credentials: Arc::default(),
             audit: Arc::new(AuditLog::disabled()),
             metrics: None,
+            guest: None,
             oidc: OidcCache::default(),
             receiving_files: Default::default(),
             receive_idle_timeout: Duration::from_secs(60),
