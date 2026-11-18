@@ -340,3 +340,8 @@ TPM 1.2, swtpm 상태 암호화(`--key`, 키 관리)와 백업 암호화, 사용
 - **M2 TPM 해시 캐시**: 열쇠에 inode와 ctime(나노초)을 더했다.
 - **M3 HA와 낡은 사본(문서만)**: 사본은 마지막 밀어 두기(`firmware_sync_interval`, 60초) 시점이라, 그 사이 TPM에 쓴 것(NV 카운터, 새로 만든 키)은 다른 노드로 복구하면 없어진다. 복제 회차의 디스크와 TPM 시점이 다를 수 있는 것과 같은 설계 결과로 받아들이고 README 한계에 적는다(S8).
 - **M4 실제 게스트 시험**: 보고 스크립트는 파이썬 표준 라이브러리만 쓴다 — TPM은 sysfs(`/sys/class/tpm/tpm0`, `tpm_version_major`), EK는 `/dev/tpmrm0`에 보낸 `TPM2_ReadPublic`(swtpm_setup이 EK를 0x81010001 등에 영구로 둔다)의 답 해시. `qemu-guest-agent`만 cloud-init `packages`로 넣고, 설치되지 않으면 게스트 정보·얼린 스냅샷의 경고 없음·에이전트 종료 검사를 건너뛴다고 알린다. CI 시간: `linux-kvm` 65 → 80분, `install-media` 55 → 60분.
+
+### GitHub 탐침에서 고친 것
+
+- **TPM 능력 거짓 음성**: QEMU는 `-tpmdev help`를 표준 오류로 찍는다(`error_printf`, 8.2와 11.1 같음). 능력 확인이 표준 출력만 읽어 swtpm이 있는 Ubuntu 노드도 `firmware_caps.tpm = false`였다(S2 확인 (b)는 터미널에서 둘을 함께 봤다). 이제 둘 다 읽고, 실패 이유를 경고로 남긴다. CLI 시험은 노드가 알린 능력대로 TPM VM이 켜지는지(능력 있음) 또는 이유를 남기고 켜지지 않는지(없음) 본다.
+- **Linux에서만 컴파일하는 시험**: `opl-driver/tests/qemu_bridge.rs`의 `VmRuntimeSpec`에 계획 59 칸을 더했다. 이 Mac에서 `target_os` 조건을 바꾼 사본으로 모든 기능을 검사해 다른 곳은 없음을 확인했다.

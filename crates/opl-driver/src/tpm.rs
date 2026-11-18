@@ -372,10 +372,14 @@ pub(crate) async fn tpm_capable(
     let caps = probe(&cfg.swtpm, &["socket", "--print-capabilities"]).await;
     let help = probe(qemu_binary, &["-tpmdev", "help"]).await;
     let listed = match (caps, help) {
-        (Some(caps), Some(help)) => tpm_caps(&caps, &help),
+        // QEMU는 `-tpmdev help`를 표준 오류로 찍는다(`error_printf`, 8.2와 11.1 같음).
+        (Some((caps, _)), Some((out, err))) => tpm_caps(&caps, &format!("{out}{err}")),
         _ => false,
     };
     if !listed {
+        tracing::warn!(
+            "swtpm does not list TPM 2.0 or QEMU has no TPM emulator backend; TPM is off on this node"
+        );
         return false;
     }
     match try_swtpm(cfg, state_dir, run_dir).await {
@@ -477,23 +481,25 @@ fn installed(binary: &Path) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(binary).is_file()))
 }
 
-async fn probe(binary: &Path, args: &[&str]) -> Option<String> {
+/// 명령을 돌려 (표준 출력, 표준 오류)를 돌려준다. 실패하면 None이다.
+async fn probe(binary: &Path, args: &[&str]) -> Option<(String, String)> {
     let output = tokio::process::Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();
     match tokio::time::timeout(PROBE_TIMEOUT, output).await {
-        Ok(Ok(out)) if out.status.success() => {
-            Some(String::from_utf8_lossy(&out.stdout).into_owned())
-        }
+        Ok(Ok(out)) if out.status.success() => Some((
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )),
         other => {
             let error = match other {
                 Ok(Ok(out)) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => "timed out".into(),
             };
-            tracing::info!(?binary, ?args, %error, "TPM probe failed; TPM is off on this node");
+            tracing::warn!(?binary, ?args, %error, "TPM probe failed; TPM is off on this node");
             None
         }
     }
@@ -851,7 +857,7 @@ mod tests {
         let qemu = tmp.path().join("fake-qemu");
         std::fs::write(
             &qemu,
-            "#!/bin/sh\necho 'Supported TPM types (choose only one):'\necho '    emulator   TPM emulator backend driver'\n",
+            "#!/bin/sh\necho 'Supported TPM types (choose only one):' >&2\necho '    emulator   TPM emulator backend driver' >&2\n",
         )
         .unwrap();
         std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -878,6 +884,11 @@ mod tests {
         // 기본 설정은 PATH의 swtpm을 찾는다(이 Mac에는 없다).
         if !installed(Path::new("swtpm")) {
             assert!(!capable(SwtpmConfig::default(), qemu).await);
+        }
+        // 실제 QEMU(있으면)의 `-tpmdev help`(표준 오류)에서도 emulator를 찾는다.
+        if installed(Path::new("qemu-system-x86_64")) {
+            std::fs::remove_file(state.join("fail-swtpm")).unwrap();
+            assert!(capable(fake_swtpm(), "qemu-system-x86_64".into()).await);
         }
     }
 

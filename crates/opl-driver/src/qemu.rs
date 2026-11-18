@@ -9122,7 +9122,7 @@ time.sleep(60)
         let qemu = tmp.path().join("fake-qemu");
         std::fs::write(
             &qemu,
-            "#!/bin/sh\necho 'Supported TPM types (choose only one):'\necho '    emulator   TPM emulator backend driver'\n",
+            "#!/bin/sh\necho 'Supported TPM types (choose only one):' >&2\necho '    emulator   TPM emulator backend driver' >&2\n",
         )
         .unwrap();
         std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();

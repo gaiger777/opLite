@@ -167,7 +167,7 @@ async fn firmware_and_guest_agent_through_the_cli() {
         .unwrap();
     assert_eq!(out, "vm fw: UEFI variables reset, Secure Boot off\n");
 
-    // swtpm이 없는 노드는 TPM VM을 켜지 않는다.
+    // TPM을 켠다.
     let out = d
         .ctl(&["vm", "set", "fw", "--tpm", "on", "--guest-agent", "off"])
         .await
@@ -176,11 +176,19 @@ async fn firmware_and_guest_agent_through_the_cli() {
     let vm = d.ctl_json(&["vm", "get", "fw"]).await;
     assert_eq!(vm["spec"]["tpm"], true, "{vm}");
     assert_eq!(vm["spec"]["guest_agent"], Value::Null, "{vm}");
-    if caps["tpm"] != true {
-        let why = refused(&d, d.ctl(&["vm", "start", "fw"]).await).await;
+    // 노드가 알린 능력대로다: swtpm을 쓸 수 있으면 켜지고, 아니면 이유를 남기고 켜지지 않는다.
+    let started = d.ctl(&["vm", "start", "fw"]).await;
+    if caps["tpm"] == true {
+        assert!(started.is_ok(), "{started:?}");
+    } else {
+        assert!(
+            started.is_err(),
+            "the node reports no TPM capability ({caps}) but the TPM VM started: the capability probe is wrong"
+        );
+        let why = refused(&d, started).await;
         assert!(why.contains("swtpm"), "{why}");
-        d.ctl(&["vm", "stop", "fw", "--force"]).await.unwrap();
     }
+    d.ctl(&["vm", "stop", "fw", "--force"]).await.unwrap();
     d.ctl(&["vm", "delete", "fw"]).await.unwrap();
     d.stop();
 }
