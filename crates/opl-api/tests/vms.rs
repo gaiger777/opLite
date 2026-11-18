@@ -502,6 +502,71 @@ async fn a_witness_cannot_hold_vms() {
     assert_eq!(vm["spec"]["node"], env.node.to_string());
 }
 
+/// `machine`을 빼면 클러스터 아키텍처의 기본값이다(노드 목록을 못 읽는 폴더 사용자의 웹). 위트니스는 세지 않고,
+/// 지정 노드가 있으면 그 노드, 아키텍처가 섞였으면 400이다. 적은 `machine`은 그대로다(하위 호환).
+#[tokio::test]
+async fn create_without_machine_uses_the_cluster_architecture() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let without = |name: &str| {
+        let mut req = vm_request(name);
+        req["spec"].as_object_mut().unwrap().remove("machine");
+        req
+    };
+    // 이 노드는 aarch64다(시험 하네스).
+    let (status, vm) = admin.post("/vms", without("a")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["machine"], "virt");
+
+    // x86_64 위트니스는 세지 않는다.
+    let mut witness: Node = Resource::new(
+        "w",
+        NodeSpec {
+            address: "127.0.0.2:0".into(),
+            maintenance: false,
+            witness: true,
+            roles: None,
+        },
+    );
+    witness.status.arch = Some(Arch::X86_64);
+    env.cluster.create(&witness).await.unwrap();
+    let (status, vm) = admin.post("/vms", without("b")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["machine"], "virt");
+
+    // x86_64 노드가 들어오면 섞였으므로 고를 수 없다. 노드를 정하면 그 노드의 아키텍처다.
+    let mut x86: Node = Resource::new(
+        "x86",
+        NodeSpec {
+            address: "127.0.0.3:0".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    x86.status.online = true;
+    x86.status.arch = Some(Arch::X86_64);
+    env.cluster.create(&x86).await.unwrap();
+    let (status, body) = admin.post("/vms", without("c")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_request");
+    let mut pinned = without("c");
+    pinned["spec"]["node"] = json!(env.node);
+    let (status, vm) = admin.post("/vms", pinned).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["machine"], "virt");
+
+    // 적은 머신은 그대로다.
+    let (status, vm) = admin.post("/vms", vm_request("d")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["machine"], "virt");
+    // 틀린 칸은 전처럼 400이다.
+    let mut typo = without("e");
+    typo["spec"]["memroy_mib"] = json!(512);
+    let (status, body) = admin.post("/vms", typo).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// 실행기도 reconciler도 없는 노드를 저장소에만 만든다(온라인, aarch64).
 async fn add_node(env: &Env, name: &str) -> Uuid {
     let mut node: Node = Resource::new(

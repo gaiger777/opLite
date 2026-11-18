@@ -23,8 +23,8 @@ use opl_types::security_group::SecurityGroupSpec;
 use opl_types::storage::{Volume, VolumeContent, VolumePhase, is_shared, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{
-    CdromSpec, HaState, MacAddr, PowerState, RunningHardware, ValidationError, Vm, VmHa, VmPhase,
-    VmSpec, VmStatus,
+    Arch, CdromSpec, HaState, MacAddr, MachineType, PowerState, RunningHardware, ValidationError,
+    Vm, VmHa, VmPhase, VmSpec, VmStatus,
 };
 use serde::Deserialize;
 use utoipa::{IntoParams, ToSchema};
@@ -863,7 +863,8 @@ fn start_picks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
 
 /// 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다. cloud-init 평문 비밀번호는 SHA-512 crypt로 바꿔 저장하고
 /// 응답에서는 `********`로 가린다. `cloud_init.user_data`가 만든 user-data의 칸(`user`·`password`·`ssh_keys`)을
-/// 쓰이지 않게 하면 응답 헤더 `orbivisor-warning`으로 알린다.
+/// 쓰이지 않게 하면 응답 헤더 `orbivisor-warning`으로 알린다. `machine`을 빼면 클러스터 아키텍처의 기본값이다
+/// ([`default_machine`], 노드 목록을 읽지 못하는 폴더 사용자의 웹 만들기 화면이 쓴다).
 #[utoipa::path(post, path = "/vms", tag = "vms",
     request_body = CreateRequest<VmSpec>,
     responses(
@@ -875,9 +876,10 @@ fn start_picks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
 pub async fn create_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
-    Json(req): Json<CreateRequest<VmSpec>>,
+    Json(req): Json<CreateRequest<serde_json::Value>>,
 ) -> Result<(StatusCode, HeaderMap, Json<Vm>), ApiError> {
     check_name(&req.name)?;
+    let req = with_machine(&state, req)?;
     // 폴더는 모든 노드가 알아야 쓴다(옛 노드는 폴더 권한을 모른다).
     if req.spec.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
@@ -897,6 +899,64 @@ pub async fn create_vm(
     vm.revision = state.cluster.create(&vm).await?;
     let headers = warning_header(&vm.spec);
     Ok((StatusCode::CREATED, headers, Json(public_vm(vm))))
+}
+
+/// 만들기 요청의 spec을 푼다. `machine`이 없으면 [`default_machine`]으로 채운다.
+fn with_machine(
+    state: &AppState,
+    req: CreateRequest<serde_json::Value>,
+) -> Result<CreateRequest<VmSpec>, ApiError> {
+    let CreateRequest {
+        name,
+        labels,
+        mut spec,
+    } = req;
+    if let Some(obj) = spec.as_object_mut()
+        && !obj.contains_key("machine")
+    {
+        let node = obj
+            .get("node")
+            .and_then(|n| n.as_str())
+            .and_then(|n| n.parse::<Uuid>().ok());
+        let (_, nodes) = state.cluster.list::<NodeSpec>()?;
+        let machine = default_machine(&nodes, node)?;
+        obj.insert(
+            "machine".into(),
+            serde_json::to_value(machine).expect("machine"),
+        );
+    }
+    let spec: VmSpec =
+        serde_json::from_value(spec).map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
+    Ok(CreateRequest { name, labels, spec })
+}
+
+/// `machine`을 뺀 만들기의 머신: 지정 노드(`node`)의 아키텍처, 아니면 아키텍처를 아는 노드(위트니스 제외)가 모두
+/// 같을 때 그 아키텍처의 머신이다(웹 `defaultMachine`과 같다). 아는 노드가 없으면 이 노드의 아키텍처이고,
+/// 아키텍처가 섞였으면 400이다(고를 수 없다).
+pub(crate) fn default_machine(nodes: &[Node], node: Option<Uuid>) -> Result<MachineType, ApiError> {
+    if let Some(arch) = node
+        .and_then(|id| nodes.iter().find(|n| n.id == id))
+        .and_then(|n| n.status.arch)
+    {
+        return Ok(arch.machine());
+    }
+    let mut archs: Vec<Arch> = Vec::new();
+    for arch in nodes
+        .iter()
+        .filter(|n| !n.spec.witness)
+        .filter_map(|n| n.status.arch)
+    {
+        if !archs.contains(&arch) {
+            archs.push(arch);
+        }
+    }
+    match archs.as_slice() {
+        [] => Ok(Arch::native().machine()),
+        [arch] => Ok(arch.machine()),
+        _ => Err(ApiError::bad_request(
+            "give spec.machine: the cluster has nodes of more than one architecture",
+        )),
+    }
 }
 
 /// [`user_data_warning`]이 있으면 그 응답 헤더
