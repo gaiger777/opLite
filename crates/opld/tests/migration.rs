@@ -1885,10 +1885,17 @@ async fn a_tpm_vm_migrates_with_its_state() {
         .put("/vms/web", &json!({ "spec": spec }))
         .await
         .unwrap();
+    // 노드 1에 남은 옛 파일이 지금 상태와 같으면(마이그레이션 뒤 TPM이 바뀌지 않음) 받지 않고 그것으로 켠다.
+    // 다르면 노드 2에서 받아 온다(켜면 펌웨어가 TPM에 쓰므로 켠 뒤 파일은 견주지 않는다).
+    let stale = tpm_state(&p.d[0], &id);
+    let current_here = stale.exists() && sha256_file(&stale) == moved;
     let out = d.ctl(&["vm", "start", "web"]).await.unwrap();
     assert!(out.contains("vm web: start done"), "{out}");
     let log = p.d[0].log();
-    assert!(log.contains("fetched the TPM state"), "{log}");
+    assert!(
+        current_here || log.contains("fetched the TPM state"),
+        "node1 had a stale TPM file but did not fetch the current one: {log}"
+    );
     d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
     let back = tpm_recorded_on(&p, 0, &id).await;
     eprintln!("tpm state on node2 {moved}, back on node1 {back}");

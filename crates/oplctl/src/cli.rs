@@ -10316,7 +10316,7 @@ mod tests {
                 _ => json!({
                     "name": "win",
                     "spec": { "tpm": true, "secure_boot": true, "guest_agent": {} },
-                    "status": { "tpm_sha256": "ab", "firmware_node": "id-a", "firmware_copies": ["id-b"] },
+                    "status": { "tpm_sha256": "ab", "tpm_node": "id-a", "firmware_node": "id-a", "firmware_copies": ["id-b"] },
                 }),
             }
         }
