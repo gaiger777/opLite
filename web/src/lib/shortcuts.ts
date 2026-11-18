@@ -15,13 +15,18 @@ export type ShortcutId =
   | "go.infra"
   | "go.protect"
   | "go.activity"
-  | "go.settings";
+  | "go.settings"
+  | "list.next"
+  | "list.prev"
+  | "list.select"
+  | "list.peek"
+  | "list.open";
 
 export interface Shortcut {
   id: ShortcutId;
   /** 차례로 누를 키(`["g", "v"]`). `mod+k`는 ⌘K(맥)·Ctrl+K다. */
   keys: string[];
-  group: "general" | "navigation";
+  group: "general" | "navigation" | "list";
 }
 
 /** 도움말 표의 순서이기도 하다. */
@@ -38,7 +43,16 @@ export const SHORTCUTS: readonly Shortcut[] = [
   { id: "go.protect", keys: ["g", "p"], group: "navigation" },
   { id: "go.activity", keys: ["g", "a"], group: "navigation" },
   { id: "go.settings", keys: ["g", "s"], group: "navigation" },
+  // 목록 키는 공통 표(`DataTable`)가 받는다. 여기서는 도움말에만 보인다.
+  { id: "list.next", keys: ["j"], group: "list" },
+  { id: "list.prev", keys: ["k"], group: "list" },
+  { id: "list.select", keys: ["x"], group: "list" },
+  { id: "list.peek", keys: ["Space"], group: "list" },
+  { id: "list.open", keys: ["Enter"], group: "list" },
 ];
+
+/** 머리줄이 받는 단축키(목록 키는 표가 받는다) */
+const GLOBAL = SHORTCUTS.filter((s) => s.group !== "list");
 
 /** 순서 키의 둘째 키를 기다리는 시간 */
 export const SEQUENCE_MS = 1000;
@@ -47,7 +61,7 @@ export const SEQUENCE_MS = 1000;
  * 순서 키 해석기. `feed`에 키와 시각을 넣으면 끝난 단축키 id를, 아직 아니면 null을 준다. 앞 키 뒤 `timeout`이
  * 지나면 앞 키를 잊는다. 맞지 않는 키는 그 키로 새로 시작한다(`g x g v`의 끝은 `g v`).
  */
-export function createSequence(shortcuts: readonly Shortcut[] = SHORTCUTS, timeout = SEQUENCE_MS) {
+export function createSequence(shortcuts: readonly Shortcut[] = GLOBAL, timeout = SEQUENCE_MS) {
   let pending: string[] = [];
   let last = 0;
   const startsWith = (seq: string[]) =>

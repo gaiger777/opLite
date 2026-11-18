@@ -309,10 +309,6 @@
     "actionsFor": "Actions for {{name}}",
     "search": "Search by name",
     "empty": "No virtual machines.",
-    "selectAll": "Select all",
-    "select": "Select {{name}}",
-    "selected_one": "{{count}} selected",
-    "selected_other": "{{count}} selected",
     "deleted": "Deleted {{name}}.",
     "forceStopTitle": "Force stop {{name}}?",
     "forceStopDescription": "The VM is turned off without shutting down its OS. Unsaved data in the guest is lost.",
@@ -394,7 +390,6 @@
     "mac": "MAC address",
     "openConsole": "Open console",
     "actionFailed": "{{name}}: {{error}}",
-    "bulkSummary": "{{action}}: {{done}} requested, {{failed}} failed, {{skipped}} skipped.",
     "noDisks": "No disks.",
     "noNics": "No network interfaces.",
     "ha": "HA",
@@ -572,7 +567,48 @@
     "stopTitle": "Stop {{name}}?",
     "stopDescription": "The guest OS is asked to shut down.",
     "rebootTitle": "Reboot {{name}}?",
-    "rebootDescription": "The guest OS is asked to restart."
+    "rebootDescription": "The guest OS is asked to restart.",
+    "view": {
+      "running": "Running",
+      "failed": "Failed",
+      "thisNode": "On this node"
+    },
+    "bulk": {
+      "action": {
+        "start": "Start",
+        "stop": "Stop",
+        "force-stop": "Force stop",
+        "reboot": "Reboot",
+        "snapshot": "Snapshot",
+        "migrate": "Migrate",
+        "delete": "Delete"
+      },
+      "button": "{{action}} ({{able}} possible, {{blocked}} not possible)",
+      "title_one": "{{action}} {{count}} VM",
+      "title_other": "{{action}} {{count}} VMs",
+      "counts": "Possible: {{able}} · Not possible: {{blocked}}",
+      "impact": "Affected VMs",
+      "result": "Result",
+      "ready": "Will run",
+      "requested": "Requested…",
+      "done": "Succeeded",
+      "failed": "Failed: {{error}}",
+      "skippedReason": "Skipped",
+      "typeCount": "Type {{count}} to confirm",
+      "snapshotName": "Snapshot name: {{name}} (disks only)",
+      "running_one": "{{action}}: {{count}} VM…",
+      "running_other": "{{action}}: {{count}} VMs…",
+      "summary": "{{action}}: {{ok}} of {{total}} succeeded, {{failed}} failed.",
+      "skipped_one": "{{count}} VM skipped.",
+      "skipped_other": "{{count}} VMs skipped.",
+      "view": "View tasks",
+      "reason": {
+        "snapshots": "The VM has snapshots. Delete it from its own page.",
+        "noTarget": "Choose a node.",
+        "sameNode": "Already on this node.",
+        "target": "Cannot run on this node (offline, in maintenance or another architecture)."
+      }
+    }
   },
   "snapshots": {
     "created": "Created",
@@ -2928,7 +2964,8 @@
     "then": "then",
     "group": {
       "general": "General",
-      "navigation": "Go to"
+      "navigation": "Go to",
+      "list": "Lists"
     },
     "palette": "Command palette",
     "help": "Show this help",
@@ -2943,6 +2980,31 @@
       "protect": "Protection",
       "activity": "Activity",
       "settings": "Settings"
+    },
+    "list": {
+      "next": "Next row",
+      "prev": "Previous row",
+      "select": "Select the row",
+      "peek": "Preview the row",
+      "open": "Open the row"
     }
+  },
+  "table": {
+    "search": "Search",
+    "select": "Select {{name}}",
+    "selectAll": "Select all",
+    "selected_one": "{{count}} selected",
+    "selected_other": "{{count}} selected",
+    "bulk": "Bulk actions",
+    "peek": "Preview",
+    "peekNamed": "Preview {{name}}",
+    "views": "Views",
+    "allRows": "All",
+    "viewName": "View name",
+    "saveView": "Save view",
+    "deleteView": "Delete view {{name}}",
+    "columns": "Columns",
+    "open": "Open",
+    "addresses": "Addresses"
   }
 }

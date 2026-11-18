@@ -14,19 +14,12 @@ import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { ReasonButton, ReasonList } from "@/components/Reason";
-import { TableMessage } from "@/components/TableMessage";
+import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { useTableState } from "@/components/data-table/state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { DownloadDialog } from "@/isos/DownloadDialog";
 import { isIso } from "@/isos/isos";
 import { formatBytes } from "@/lib/format";
@@ -40,6 +33,9 @@ import { gibToBytes } from "@/vms/form";
 
 const MIB = 1024 ** 2;
 
+/** 주소 쿼리의 거름 키 */
+const ISO_KEY = ["iso"];
+
 export function VolumesPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
@@ -49,8 +45,9 @@ export function VolumesPage() {
   const [creating, setCreating] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  // ISO 이미지는 ISO 화면에서 다룬다. 거르기 칩으로 함께 볼 수 있다.
-  const [showIsos, setShowIsos] = useState(false);
+  const state = useTableState("volumes", ISO_KEY);
+  // ISO 이미지는 ISO 화면에서 다룬다. 거르기 칩(`?iso=1`)으로 함께 볼 수 있다.
+  const showIsos = state.get("iso") === "1";
   const [deleting, setDeleting] = useState<Volume | null>(null);
   const [flattening, setFlattening] = useState<Volume | null>(null);
   // 볼륨 id. 대화상자는 살아 있는 목록에서 찾아 지금 크기를 최신으로 보인다.
@@ -86,6 +83,187 @@ export function VolumesPage() {
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
   const reasonBase = useId();
 
+  /** 행 동작을 막는 까닭 */
+  const info = (volume: Volume) => {
+    const vm = userByVolume.get(volume.name);
+    const ready = volume.status.phase === "ready";
+    // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
+    // 템플릿의 디스크는 크기를 바꾸거나 지울 수 없다(배포 때 크기를 준다).
+    const ofTemplate = vm !== undefined && isTemplate(vm);
+    const resizeReason = !ready
+      ? "volumes.reason.notReady"
+      : isIso(volume)
+        ? "volumes.reason.iso"
+        : ofTemplate
+          ? "volumes.reason.template"
+          : null;
+    // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
+    const deleteReason = !ready
+      ? "volumes.reason.notReady"
+      : !vms.isSuccess
+        ? "volumes.reason.vmsUnknown"
+        : ofTemplate
+          ? "volumes.reason.template"
+          : vm
+            ? "volumes.reason.inUse"
+            : bases.has(volume.id)
+              ? "volumes.reason.hasClones"
+              : null;
+    // 평탄화는 꺼진 VM의 디스크만(실행 중 평탄화는 없다).
+    const flattenReason = !ready
+      ? "volumes.reason.notReady"
+      : vm && !isStopped(vm)
+        ? "volumes.reason.vmRunning"
+        : null;
+    return { resizeReason, deleteReason, flattenReason };
+  };
+  const columns: Column<Volume>[] = [
+    {
+      id: "name",
+      header: t("common.name"),
+      value: (volume) => volume.name,
+      className: "font-medium",
+      cell: (volume) => (
+        <>
+          {volume.name}
+          {isIso(volume) && (
+            <Badge variant="outline" className="ml-2">
+              ISO
+            </Badge>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "pool",
+      header: t("volumes.pool"),
+      value: (volume) => volume.spec.pool,
+      cell: (volume) => volume.spec.pool,
+    },
+    {
+      id: "size",
+      header: t("volumes.size"),
+      value: (volume) => volume.spec.size_bytes,
+      // 가져오는 볼륨은 끝나기 전까지 크기를 모른다.
+      cell: (volume) => (volume.spec.size_bytes > 0 ? formatBytes(volume.spec.size_bytes) : "—"),
+    },
+    {
+      id: "allocated",
+      header: t("volumes.allocated"),
+      value: (volume) => volume.status.allocated_bytes ?? -1,
+      priority: 2,
+      cell: (volume) =>
+        volume.status.allocated_bytes !== null ? formatBytes(volume.status.allocated_bytes) : "—",
+    },
+    {
+      id: "format",
+      header: t("volumes.format"),
+      priority: 2,
+      cell: (volume) => volume.spec.format,
+    },
+    {
+      id: "base",
+      header: t("volumes.base"),
+      priority: 3,
+      cell: (volume) =>
+        volume.spec.base != null
+          ? (nameById.get(volume.spec.base) ?? volume.spec.base.slice(-8))
+          : "—",
+    },
+    {
+      id: "state",
+      header: t("common.state"),
+      value: (volume) => volume.status.phase,
+      cell: (volume) => (
+        <Badge variant={volume.status.phase === "ready" ? "default" : "secondary"}>
+          {t(`volumes.phase.${volume.status.phase}`)}
+        </Badge>
+      ),
+    },
+    {
+      id: "node",
+      header: t("common.node"),
+      priority: 3,
+      cell: (volume) =>
+        (volume.status.node ? nodeById.get(volume.status.node)?.name : undefined) ??
+        volume.status.node?.slice(-8) ??
+        "—",
+    },
+    {
+      id: "vm",
+      header: t("volumes.vm"),
+      priority: 2,
+      cell: (volume) => {
+        const vm = userByVolume.get(volume.name);
+        return vm ? (
+          <Link
+            to={`/vms/${encodeURIComponent(vm.name)}`}
+            className="underline-offset-4 hover:underline"
+          >
+            {vm.name}
+          </Link>
+        ) : (
+          "—"
+        );
+      },
+    },
+  ];
+  if (write) {
+    columns.push({
+      id: "menu",
+      header: t("vms.actions"),
+      actions: true,
+      cell: (volume) => {
+        const { resizeReason, deleteReason, flattenReason } = info(volume);
+        const base = volume.spec.base;
+        const reasons = `${reasonBase}-${volume.id}`;
+        return (
+          <>
+            {base != null && (
+              <ReasonButton
+                variant="ghost"
+                size="icon-sm"
+                aria-label={t("volumes.flattenNamed", { name: volume.name })}
+                reason={flattenReason}
+                reasons={reasons}
+                onClick={() => setFlattening(volume)}
+              >
+                <SquareStack />
+              </ReasonButton>
+            )}
+            <ReasonButton
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t("volumes.resizeNamed", { name: volume.name })}
+              reason={resizeReason}
+              reasons={reasons}
+              onClick={(e) => {
+                opener.current = e.currentTarget;
+                setResizing(volume.id);
+              }}
+            >
+              <Maximize2 />
+            </ReasonButton>
+            <ReasonButton
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t("common.deleteNamed", { name: volume.name })}
+              reason={deleteReason}
+              reasons={reasons}
+              onClick={() => setDeleting(volume)}
+            >
+              <Trash2 />
+            </ReasonButton>
+            <ReasonList
+              base={reasons}
+              reasons={[base != null ? flattenReason : null, resizeReason, deleteReason]}
+            />
+          </>
+        );
+      },
+    });
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -109,161 +287,29 @@ export function VolumesPage() {
           </div>
         )}
       </div>
-      <div>
-        <Button
-          variant={showIsos ? "secondary" : "outline"}
-          size="sm"
-          aria-pressed={showIsos}
-          onClick={() => setShowIsos((v) => !v)}
-        >
-          {t("volumes.showIsos")}
-        </Button>
-      </div>
-      <Table aria-labelledby="volumes-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("volumes.pool")}</TableHead>
-            <TableHead>{t("volumes.size")}</TableHead>
-            <TableHead>{t("volumes.allocated")}</TableHead>
-            <TableHead>{t("volumes.format")}</TableHead>
-            <TableHead>{t("volumes.base")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>{t("common.node")}</TableHead>
-            <TableHead>{t("volumes.vm")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {shown.length === 0 && (
-            <TableMessage colSpan={write ? 10 : 9} query={volumes} empty={t("volumes.empty")} />
-          )}
-          {shown.map((volume) => {
-            const vm = userByVolume.get(volume.name);
-            const ready = volume.status.phase === "ready";
-            const node = volume.status.node ? nodeById.get(volume.status.node) : undefined;
-            // 만드는 중인 볼륨은 서버가 크기를 바꾸지 않는다(volume_not_ready).
-            // 템플릿의 디스크는 크기를 바꾸거나 지울 수 없다(배포 때 크기를 준다).
-            const ofTemplate = vm !== undefined && isTemplate(vm);
-            const resizeReason = !ready
-              ? "volumes.reason.notReady"
-              : isIso(volume)
-                ? "volumes.reason.iso"
-                : ofTemplate
-                  ? "volumes.reason.template"
-                  : null;
-            // 서버는 VM이 쓰거나 아직 만드는 볼륨을 지우지 않는다. VM 목록을 다 읽어야 안다.
-            const deleteReason = !ready
-              ? "volumes.reason.notReady"
-              : !vms.isSuccess
-                ? "volumes.reason.vmsUnknown"
-                : ofTemplate
-                  ? "volumes.reason.template"
-                  : vm
-                    ? "volumes.reason.inUse"
-                    : bases.has(volume.id)
-                      ? "volumes.reason.hasClones"
-                      : null;
-            const base = volume.spec.base;
-            // 평탄화는 꺼진 VM의 디스크만(실행 중 평탄화는 없다).
-            const flattenReason = !ready
-              ? "volumes.reason.notReady"
-              : vm && !isStopped(vm)
-                ? "volumes.reason.vmRunning"
-                : null;
-            const reasons = `${reasonBase}-${volume.id}`;
-            return (
-              <TableRow key={volume.id}>
-                <TableCell className="font-medium">
-                  {volume.name}
-                  {isIso(volume) && (
-                    <Badge variant="outline" className="ml-2">
-                      ISO
-                    </Badge>
-                  )}
-                </TableCell>
-                <TableCell>{volume.spec.pool}</TableCell>
-                {/* 가져오는 볼륨은 끝나기 전까지 크기를 모른다. */}
-                <TableCell>
-                  {volume.spec.size_bytes > 0 ? formatBytes(volume.spec.size_bytes) : "—"}
-                </TableCell>
-                <TableCell>
-                  {volume.status.allocated_bytes !== null
-                    ? formatBytes(volume.status.allocated_bytes)
-                    : "—"}
-                </TableCell>
-                <TableCell>{volume.spec.format}</TableCell>
-                <TableCell>{base != null ? (nameById.get(base) ?? base.slice(-8)) : "—"}</TableCell>
-                <TableCell>
-                  <Badge variant={ready ? "default" : "secondary"}>
-                    {t(`volumes.phase.${volume.status.phase}`)}
-                  </Badge>
-                </TableCell>
-                <TableCell>{node?.name ?? volume.status.node?.slice(-8) ?? "—"}</TableCell>
-                <TableCell>
-                  {vm ? (
-                    <Link
-                      to={`/vms/${encodeURIComponent(vm.name)}`}
-                      className="underline-offset-4 hover:underline"
-                    >
-                      {vm.name}
-                    </Link>
-                  ) : (
-                    "—"
-                  )}
-                </TableCell>
-                {write && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    {base != null && (
-                      <ReasonButton
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("volumes.flattenNamed", { name: volume.name })}
-                        reason={flattenReason}
-                        reasons={reasons}
-                        onClick={() => setFlattening(volume)}
-                      >
-                        <SquareStack />
-                      </ReasonButton>
-                    )}
-                    <ReasonButton
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("volumes.resizeNamed", { name: volume.name })}
-                      reason={resizeReason}
-                      reasons={reasons}
-                      onClick={(e) => {
-                        opener.current = e.currentTarget;
-                        setResizing(volume.id);
-                      }}
-                    >
-                      <Maximize2 />
-                    </ReasonButton>
-                    <ReasonButton
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("common.deleteNamed", { name: volume.name })}
-                      reason={deleteReason}
-                      reasons={reasons}
-                      onClick={() => setDeleting(volume)}
-                    >
-                      <Trash2 />
-                    </ReasonButton>
-                    <ReasonList
-                      base={reasons}
-                      reasons={[base != null ? flattenReason : null, resizeReason, deleteReason]}
-                    />
-                  </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+      <DataTable
+        id="volumes"
+        rows={shown}
+        columns={columns}
+        rowId={(volume) => volume.id}
+        rowName={(volume) => volume.name}
+        query={volumes}
+        empty={t("volumes.empty")}
+        labelledBy="volumes-title"
+        state={state}
+        search={(volume) => `${volume.name} ${volume.spec.pool}`}
+        keys
+        toolbar={
+          <Button
+            variant={showIsos ? "secondary" : "outline"}
+            size="sm"
+            aria-pressed={showIsos}
+            onClick={() => state.set("iso", showIsos ? "" : "1")}
+          >
+            {t("volumes.showIsos")}
+          </Button>
+        }
+      />
       {creating && <CreateVolumeDialog onClose={() => setCreating(false)} />}
       {uploading && <UploadDialog onClose={() => setUploading(false)} />}
       {downloading && <DownloadDialog content="disk" onClose={() => setDownloading(false)} />}

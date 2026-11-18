@@ -8,9 +8,16 @@ import { Button } from "@/components/ui/button";
 import { pushRecent, type ResourceRef, useRefs } from "@/lib/recent";
 
 /**
- * 상세 머리의 즐겨찾기 ★(설계 §5.7). `f` 단축키가 `data-pin-toggle`인 단추를 누른다. 브라우저에만 둔다.
+ * 상세 머리의 즐겨찾기 ★(설계 §5.7). `f` 단축키가 `data-pin-toggle`인 단추를 누른다. 브라우저에만 둔다. 목록 행·미리
+ * 보기의 ★는 `shortcut={false}`다(`f`가 첫 행을 누르지 않게).
  */
-export function PinButton({ resource }: { resource: ResourceRef }) {
+export function PinButton({
+  resource,
+  shortcut = true,
+}: {
+  resource: ResourceRef;
+  shortcut?: boolean;
+}) {
   const { t } = useTranslation();
   const me = usePrincipal();
   const { pins, toggle } = useRefs(me.user);
@@ -20,7 +27,7 @@ export function PinButton({ resource }: { resource: ResourceRef }) {
     <Button
       variant="ghost"
       size="icon-sm"
-      data-pin-toggle=""
+      data-pin-toggle={shortcut ? "" : undefined}
       aria-pressed={pinned}
       aria-label={t("favorites.toggle", { name: resource.name })}
       onClick={() => toggle({ kind: resource.kind, id: resource.id, name: resource.name })}

@@ -34,7 +34,19 @@ it("runs single keys right away", () => {
 
 it("has a single-key shortcut for no power or delete action", () => {
   const single = SHORTCUTS.filter((s) => s.keys.length === 1).map((s) => s.id);
-  expect(single).toEqual(["palette", "help", "search", "create", "rail", "favorite"]);
+  expect(single).toEqual([
+    "palette",
+    "help",
+    "search",
+    "create",
+    "rail",
+    "favorite",
+    "list.next",
+    "list.prev",
+    "list.select",
+    "list.peek",
+    "list.open",
+  ]);
 });
 
 it("ignores typing targets", () => {

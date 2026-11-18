@@ -82,7 +82,8 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await dialog.getByLabel("Directory").fill(poolPath);
   await dialog.getByRole("button", { name: "Create" }).click();
   await expect(dialog).toBeHidden();
-  await expect(page.getByRole("cell", { name: "local", exact: true })).toBeVisible();
+  // 풀 이름 칸에는 즐겨찾기 ★도 있다.
+  await expect(page.getByRole("button", { name: "Favorite local", exact: true })).toBeVisible();
 
   await openTab(page, "Infrastructure", "Volumes");
   await page.getByRole("button", { name: "Upload image" }).click();
@@ -158,9 +159,25 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByRole("cell", { name: "copy-root", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Start", exact: true }).click();
   await expect(page.getByTestId("vm-phase")).toHaveText("Running", { timeout: 60_000 });
-  await page.getByRole("button", { name: "Force stop" }).click();
-  await page.getByRole("alertdialog").getByRole("button", { name: "Force stop" }).click();
-  await expect(page.getByTestId("vm-phase")).toHaveText("Stopped", { timeout: 60_000 });
+
+  // 목록에서 골라 일괄로 끈다(설계 §5.3). 강제 정지는 고른 수를 입력해야 하고, VM마다 Task 결과를 보인다.
+  await openTab(page, "Virtual machines", "VMs");
+  await page.getByRole("checkbox", { name: "Select copy", exact: true }).check();
+  await page
+    .getByRole("region", { name: "Bulk actions" })
+    .getByRole("button", { name: /^Force stop \(/ })
+    .click();
+  const bulk = page.getByRole("dialog", { name: "Force stop 1 VM" });
+  await bulk.getByLabel("Type 1 to confirm").fill("1");
+  await bulk.getByRole("button", { name: "Force stop", exact: true }).click();
+  await expect(bulk.getByText("Succeeded", { exact: true })).toBeVisible({ timeout: 60_000 });
+  await bulk.getByRole("button", { name: "Done", exact: true }).click();
+  const copyRow = page
+    .getByRole("row")
+    .filter({ has: page.getByRole("link", { name: "copy", exact: true }) });
+  await expect(copyRow.getByTestId("vm-phase")).toHaveText("Stopped", { timeout: 60_000 });
+  await page.getByRole("link", { name: "copy", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "copy" })).toBeVisible();
   await page.getByRole("button", { name: "Delete", exact: true }).click();
   let confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type copy to confirm").fill("copy");

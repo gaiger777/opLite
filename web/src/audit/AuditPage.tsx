@@ -7,7 +7,7 @@ import { api, call } from "@/api/client";
 import type { AuditEntry } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { focusBack } from "@/components/focusBack";
-import { TableMessage } from "@/components/TableMessage";
+import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -19,14 +19,6 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { formatTime } from "@/lib/format";
 
@@ -75,6 +67,69 @@ export function AuditPage() {
       </div>
     );
   }
+
+  const columns: Column<AuditEntry>[] = [
+    {
+      id: "time",
+      header: t("audit.time"),
+      className: "whitespace-nowrap",
+      cell: (entry) => {
+        const time = new Date(entry.time);
+        return <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>;
+      },
+    },
+    { id: "node", header: t("common.node"), priority: 2, cell: (entry) => entry.node },
+    { id: "user", header: t("audit.user"), cell: (entry) => entry.user ?? "—" },
+    {
+      id: "ip",
+      header: t("audit.ip"),
+      className: "font-mono text-xs",
+      priority: 3,
+      cell: (entry) => entry.ip,
+    },
+    {
+      id: "action",
+      header: t("audit.action"),
+      cell: (entry) => {
+        // 노드가 스스로 남긴 항목(예: 균형 조정기의 `placement.move`)은 번역한 이름과 detail을 함께 보인다.
+        const named = `audit.actions.${entry.action}`;
+        return (
+          <>
+            {/* 키보드로도 열 수 있게 단추로 둔다. 누르면 행의 onClick이 연다. */}
+            <button
+              type="button"
+              className="text-left font-mono text-xs underline-offset-4 hover:underline"
+            >
+              {entry.action}
+            </button>
+            {i18n.exists(named) && (
+              <span className="block text-xs text-muted-foreground">{t(named)}</span>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      id: "target",
+      header: t("audit.target"),
+      priority: 2,
+      cell: (entry) => (
+        <>
+          {/* 대상이 없으면 detail(예: audit.dropped의 수, 로그인의 username=…) */}
+          {entry.target ? `${entry.target.kind}/${entry.target.key}` : (entry.detail ?? "—")}
+          {i18n.exists(`audit.actions.${entry.action}`) && entry.target && entry.detail && (
+            <span className="block text-xs text-muted-foreground">{entry.detail}</span>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "status",
+      header: t("audit.status"),
+      className: (entry) => (entry.status >= 400 ? "font-medium text-destructive" : undefined),
+      cell: (entry) => entry.status,
+    },
+  ];
 
   const entries = audit.data?.entries ?? [];
   const unreachable = audit.data?.unreachable ?? [];
@@ -155,71 +210,23 @@ export function AuditPage() {
           {t("audit.truncated", { count: entries.length })}
         </p>
       )}
-      <Table aria-labelledby="audit-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("audit.time")}</TableHead>
-            <TableHead>{t("common.node")}</TableHead>
-            <TableHead>{t("audit.user")}</TableHead>
-            <TableHead>{t("audit.ip")}</TableHead>
-            <TableHead>{t("audit.action")}</TableHead>
-            <TableHead>{t("audit.target")}</TableHead>
-            <TableHead>{t("audit.status")}</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {entries.length === 0 && (
-            <TableMessage colSpan={7} query={audit} empty={t("audit.empty")} />
-          )}
-          {entries.map((entry) => {
-            const time = new Date(entry.time);
-            // 노드가 스스로 남긴 항목(예: 균형 조정기의 `placement.move`)은 번역한 이름과 detail을 함께 보인다.
-            const named = `audit.actions.${entry.action}`;
-            const known = i18n.exists(named);
-            return (
-              <TableRow
-                key={entry.id}
-                className="cursor-pointer"
-                onClick={(e) => {
-                  returnFocus.current = e.currentTarget.querySelector("button");
-                  setOpened(entry);
-                }}
-              >
-                <TableCell className="whitespace-nowrap">
-                  <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>
-                </TableCell>
-                <TableCell>{entry.node}</TableCell>
-                <TableCell>{entry.user ?? "—"}</TableCell>
-                <TableCell className="font-mono text-xs">{entry.ip}</TableCell>
-                <TableCell>
-                  {/* 키보드로도 열 수 있게 단추로 둔다. 누르면 행의 onClick이 연다. */}
-                  <button
-                    type="button"
-                    className="text-left font-mono text-xs underline-offset-4 hover:underline"
-                  >
-                    {entry.action}
-                  </button>
-                  {known && <span className="block text-xs text-muted-foreground">{t(named)}</span>}
-                </TableCell>
-                <TableCell>
-                  {/* 대상이 없으면 detail(예: audit.dropped의 수, 로그인의 username=…) */}
-                  {entry.target
-                    ? `${entry.target.kind}/${entry.target.key}`
-                    : (entry.detail ?? "—")}
-                  {known && entry.target && entry.detail && (
-                    <span className="block text-xs text-muted-foreground">{entry.detail}</span>
-                  )}
-                </TableCell>
-                <TableCell
-                  className={entry.status >= 400 ? "font-medium text-destructive" : undefined}
-                >
-                  {entry.status}
-                </TableCell>
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+      <DataTable
+        id="audit"
+        rows={entries}
+        columns={columns}
+        rowId={(entry) => entry.id}
+        query={audit}
+        empty={t("audit.empty")}
+        labelledBy="audit-title"
+        keys
+        rowProps={(entry) => ({
+          className: "cursor-pointer",
+          onClick: (e) => {
+            returnFocus.current = e.currentTarget.querySelector("button");
+            setOpened(entry);
+          },
+        })}
+      />
       {opened && (
         <Dialog open onOpenChange={(open) => !open && setOpened(null)}>
           <DialogContent

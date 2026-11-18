@@ -19,7 +19,20 @@ const db = vm("db", "stopped", { spec: { ...vm("db", "stopped").spec, memory_mib
 afterEach(() => {
   toast.dismiss();
   resetTasks();
+  window.localStorage.clear();
 });
+
+/** 일괄 막대의 동작을 눌러 확인 대화상자를 연다. */
+async function openBulk(action: string) {
+  const bar = screen.getByRole("region", { name: "Bulk actions" });
+  await userEvent.click(within(bar).getByRole("button", { name: new RegExp(`^${action} \\(`) }));
+  return screen.findByRole("dialog", { name: new RegExp(`^${action} \\d+ VMs?$`) });
+}
+
+/** 확인 대화상자에서 동작을 누른다. */
+async function confirmBulk(dialog: HTMLElement, action: string) {
+  await userEvent.click(within(dialog).getByRole("button", { name: action }));
+}
 
 function rowOf(name: string) {
   return screen.getByRole("link", { name }).closest("tr")!;
@@ -61,8 +74,12 @@ it("starts a VM from its menu and selected VMs together", async () => {
   expect(started).toEqual([`start:${db.id}`]);
 
   await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
-  await userEvent.click(within(screen.getByText("3 selected").parentElement!).getByText("Start"));
-  // 실행 중인 web은 건너뛴다.
+  const dialog = await openBulk("Start");
+  // 실행 중인 web은 까닭과 함께 보이고 건너뛴다.
+  expect(within(dialog).getByText("Possible: 2 · Not possible: 1")).toBeInTheDocument();
+  expect(within(dialog).getByText("The VM is running.")).toBeInTheDocument();
+  await confirmBulk(dialog, "Start");
+  await waitFor(() => expect(started).toHaveLength(3));
   expect(started.slice(1).sort()).toEqual(
     [`start:${db.id}`, `start:${vm("app", "stopped").id}`].sort(),
   );
@@ -132,9 +149,10 @@ it("blocks starting a VM whose start is still pending, alone or with others", as
 
   // 여럿을 시작할 때도 db는 건너뛴다.
   await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
-  await userEvent.click(within(screen.getByText("3 selected").parentElement!).getByText("Start"));
-  expect(await screen.findByText("Start: 1 requested, 0 failed, 2 skipped.")).toBeInTheDocument();
-  expect(started).toEqual([app.id]);
+  const dialog = await openBulk("Start");
+  expect(within(dialog).getByText("A power action is still in progress.")).toBeInTheDocument();
+  await confirmBulk(dialog, "Start");
+  await waitFor(() => expect(started).toEqual([app.id]));
 });
 
 it("deletes only after the name is typed", async () => {
@@ -325,6 +343,7 @@ it("hides changes from viewers", async () => {
   await screen.findByRole("link", { name: "web" });
   expect(screen.queryByRole("link", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Actions for web" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("checkbox", { name: "Select web" })).not.toBeInTheDocument();
 });
 
 it("says why the list could not be read", async () => {
@@ -349,11 +368,22 @@ it("marks the sort order on header cells and ignores a bad saved sort", async ()
   expect(header).toHaveAttribute("aria-sort", "ascending");
   await userEvent.click(within(header).getByRole("button"));
   expect(header).toHaveAttribute("aria-sort", "descending");
-  expect(JSON.parse(window.localStorage.getItem("opl.vms.sort")!)).toEqual([
-    { id: "name", desc: true },
-  ]);
+  expect(JSON.parse(window.localStorage.getItem("opl.cols.vms")!)).toEqual({
+    hidden: [],
+    sort: "-name",
+  });
   expect(screen.getByRole("columnheader", { name: "Actions" })).not.toHaveAttribute("aria-sort");
-  window.localStorage.removeItem("opl.vms.sort");
+});
+
+it("moves the old saved sort over", async () => {
+  window.localStorage.setItem("opl.vms.sort", JSON.stringify([{ id: "memory", desc: true }]));
+  mockLists({ vm: [web, db], node: [NODE] });
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "web" });
+  expect(screen.getByRole("columnheader", { name: /Memory/ })).toHaveAttribute(
+    "aria-sort",
+    "descending",
+  );
 });
 
 it("shows a dash for a VM without a node", async () => {
@@ -380,14 +410,24 @@ it("acts only on selected VMs that the search still shows", async () => {
   await screen.findByRole("link", { name: "db" });
   await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
   await userEvent.type(screen.getByLabelText("Search by name"), "d");
-  await userEvent.click(within(screen.getByText("1 selected").parentElement!).getByText("Start"));
-  expect(await screen.findByText("Start db")).toBeInTheDocument();
-  expect(started).toEqual([db.id]);
+  // 가려진 행은 고르기에서 빠진다.
+  expect(screen.getByText("1 selected")).toBeInTheDocument();
+  const dialog = await openBulk("Start");
+  await confirmBulk(dialog, "Start");
+  await waitFor(() => expect(started).toEqual([db.id]));
+  await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+  await userEvent.clear(screen.getByLabelText("Search by name"));
+  expect(screen.getByRole("checkbox", { name: "Select app" })).not.toBeChecked();
 });
 
 it("names the VM that failed and sums up a bulk action", async () => {
   const app = vm("app", "stopped");
-  mockLists({ vm: [web, db, app], node: [NODE] });
+  // db의 Task는 이미 끝났다(목록에 있으면 기다림이 곧 끝난다).
+  const done = {
+    ...task("t-bulk", "vm-start", db.id),
+    status: { state: "succeeded", error: null },
+  };
+  mockLists({ vm: [web, db, app], node: [NODE], task: [done as Task] });
   const started: string[] = [];
   server.use(
     http.post(apiUrl("/vms/:key/actions/:action"), ({ params }) => {
@@ -401,10 +441,15 @@ it("names the VM that failed and sums up a bulk action", async () => {
   renderPage(<VmListPage />);
   await screen.findByRole("link", { name: "db" });
   await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
-  await userEvent.click(within(screen.getByText("3 selected").parentElement!).getByText("Start"));
-  expect(await screen.findByText(/^app: /)).toBeInTheDocument();
-  // 실행 중인 web은 건너뛴다.
-  expect(await screen.findByText("Start: 1 requested, 1 failed, 1 skipped.")).toBeInTheDocument();
+  const dialog = await openBulk("Start");
+  await confirmBulk(dialog, "Start");
+  // VM마다 결과를 보이고, 알림 하나로 묶는다. 실행 중인 web은 건너뛴다.
+  expect(await within(dialog).findByText("Failed: busy")).toBeInTheDocument();
+  expect(await within(dialog).findByText("Succeeded")).toBeInTheDocument();
+  expect(
+    await screen.findByText("Start: 1 of 2 succeeded, 1 failed. 1 VM skipped."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "View tasks" })).toBeInTheDocument();
   expect(started).toEqual([db.id]);
 });
 
@@ -421,8 +466,11 @@ it("shows why a VM pinned to a node in maintenance did not start", async () => {
   await screen.findByRole("link", { name: "db" });
   await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
   await userEvent.type(screen.getByLabelText("Search by name"), "d");
-  await userEvent.click(within(screen.getByText("1 selected").parentElement!).getByText("Start"));
-  expect(await screen.findByText(`db: The node is unavailable: ${message}`)).toBeInTheDocument();
+  const dialog = await openBulk("Start");
+  await confirmBulk(dialog, "Start");
+  expect(
+    await within(dialog).findByText(`Failed: The node is unavailable: ${message}`),
+  ).toBeInTheDocument();
 });
 
 it("marks HA VMs", async () => {
@@ -440,4 +488,123 @@ it("has no accessibility violations", async () => {
   await screen.findByRole("link", { name: "web" });
   // 화면 하나만 그리므로 랜드마크(사이드바·main)는 셸 시험이 본다.
   await expectNoAxeViolations(container, { disable: ["region"] });
+});
+
+it("deletes several VMs only after their count is typed", async () => {
+  const app = vm("app", "stopped");
+  mockLists({ vm: [web, db, app], node: [NODE] });
+  const deleted: string[] = [];
+  server.use(
+    http.delete(apiUrl("/vms/:key"), ({ params }) => {
+      deleted.push(String(params.key));
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "db" });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  const dialog = await openBulk("Delete");
+  // 실행 중인 web은 영향 목록에 까닭과 함께 있고 지우지 않는다.
+  expect(within(dialog).getByRole("table", { name: "Affected VMs" })).toHaveTextContent("web");
+  const confirm = within(dialog).getByRole("button", { name: "Delete" });
+  expect(confirm).toBeDisabled();
+  await userEvent.type(within(dialog).getByLabelText("Type 3 to confirm"), "2");
+  expect(confirm).toBeDisabled();
+  await userEvent.clear(within(dialog).getByLabelText("Type 3 to confirm"));
+  await userEvent.type(within(dialog).getByLabelText("Type 3 to confirm"), "3");
+  await userEvent.click(confirm);
+  await waitFor(() => expect(deleted.sort()).toEqual([db.id, app.id].sort()));
+  expect(
+    await screen.findByText("Delete: 2 of 2 succeeded, 0 failed. 1 VM skipped."),
+  ).toBeVisible();
+  // 고르기를 풀었다.
+  await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+  expect(screen.getByRole("checkbox", { name: "Select web" })).not.toBeChecked();
+});
+
+it("sends at most four requests at once", async () => {
+  const many = ["a1", "a2", "a3", "a4", "a5", "a6"].map((n) => vm(n, "stopped"));
+  mockLists({ vm: many, node: [NODE] });
+  let running = 0;
+  let most = 0;
+  let count = 0;
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), async ({ params }) => {
+      running += 1;
+      most = Math.max(most, running);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      running -= 1;
+      count += 1;
+      return HttpResponse.json(task(`t-c${count}`, "vm-start", String(params.key)), {
+        status: 202,
+      });
+    }),
+  );
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "a1" });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  const dialog = await openBulk("Start");
+  await confirmBulk(dialog, "Start");
+  await waitFor(() => expect(count).toBe(6));
+  expect(most).toBe(4);
+  expect(within(dialog).getAllByText("Requested…")).toHaveLength(6);
+});
+
+it("migrates to the chosen node and snapshots with a bulk name", async () => {
+  const other = { ...NODE, id: "n2", name: "node-b" };
+  const app = vm("app", "running");
+  mockLists({ vm: [web, app], node: [NODE, other] });
+  const migrated: unknown[] = [];
+  const snapped: { name: string; memory: boolean }[] = [];
+  server.use(
+    http.post(apiUrl("/vms/:key/migrate"), async ({ request, params }) => {
+      migrated.push({ key: params.key, ...((await request.json()) as object) });
+      return HttpResponse.json(task(`t-m${migrated.length}`, "vm-migrate", String(params.key)), {
+        status: 202,
+      });
+    }),
+    http.post(apiUrl("/vms/:key/snapshots"), async ({ request, params }) => {
+      snapped.push((await request.json()) as { name: string; memory: boolean });
+      return HttpResponse.json(
+        task(`t-s${snapped.length}`, "snapshot-create", String(params.key)),
+        {
+          status: 202,
+        },
+      );
+    }),
+  );
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "app" });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  let dialog = await openBulk("Migrate");
+  // 처음 고른 node-a에는 이미 있다.
+  expect(within(dialog).getAllByText("Already on this node.")).toHaveLength(2);
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n2");
+  // 픽스처 노드는 아키텍처를 모르므로 virt VM의 대상이 아니다.
+  expect(within(dialog).getAllByText(/Cannot run on this node/)).toHaveLength(2);
+  // 취소하면 고른 채로 남는다.
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  dialog = await openBulk("Snapshot");
+  expect(
+    within(dialog).getByText(/^Snapshot name: bulk-\d{8}-\d{4} \(disks only\)$/),
+  ).toBeVisible();
+  await confirmBulk(dialog, "Snapshot");
+  await waitFor(() => expect(snapped).toHaveLength(2));
+  expect(snapped[0]!.name).toMatch(/^bulk-\d{8}-\d{4}$/);
+  expect(snapped[0]!.memory).toBe(false);
+  expect(migrated).toEqual([]);
+});
+
+it("previews a VM in a drawer", async () => {
+  mockLists({ vm: [web, db], node: [NODE] });
+  renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "web" });
+  await userEvent.click(screen.getByRole("button", { name: "Preview web" }));
+  const peek = await screen.findByRole("dialog", { name: "web" });
+  expect(peek).toHaveTextContent("node-a");
+  expect(within(peek).getByRole("link", { name: "Open" })).toHaveAttribute("href", "/vms/web");
+  expect(within(peek).getByRole("link", { name: "Console" })).toBeInTheDocument();
+  // 정지는 확인을 받는다.
+  await userEvent.click(within(peek).getByRole("button", { name: "Stop" }));
+  expect(await screen.findByRole("alertdialog", { name: "Stop web?" })).toBeInTheDocument();
 });

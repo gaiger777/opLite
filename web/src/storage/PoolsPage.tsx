@@ -13,7 +13,9 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
-import { TableMessage } from "@/components/TableMessage";
+import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { useTableState } from "@/components/data-table/state";
+import { PinButton } from "@/components/PinButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -21,14 +23,6 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Switch } from "@/components/ui/switch";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { useCreateParam } from "@/lib/createParam";
 import { formatBytes } from "@/lib/format";
@@ -66,6 +60,7 @@ export function PoolsPage() {
   const [sharingOpen, setSharingOpen] = useState(false);
   const write = can(me.role, "write", "storage-pool");
   useCreateParam(() => setCreating(true), write);
+  const state = useTableState("pools");
 
   const nodeList = useMemo(() => nodes.data ?? [], [nodes.data]);
   // 볼륨 목록을 다 읽기 전에는 모른다(undefined).
@@ -94,6 +89,170 @@ export function PoolsPage() {
     }
   }
 
+  const columns: Column<StoragePool>[] = [
+    {
+      id: "name",
+      header: t("common.name"),
+      value: (pool) => pool.name,
+      className: "font-medium",
+      cell: (pool) => (
+        <span className="inline-flex items-center gap-1">
+          {pool.name}
+          {/* 즐겨찾기(설계 §5.7). 풀은 상세 화면이 없어 행에 둔다. */}
+          <PinButton
+            resource={{ kind: "storage-pool", id: pool.id, name: pool.name }}
+            shortcut={false}
+          />
+        </span>
+      ),
+    },
+    {
+      id: "kind",
+      header: t("pools.kind"),
+      value: (pool) => pool.spec.backend.kind,
+      cell: (pool) => t(`pools.kinds.${pool.spec.backend.kind}`),
+    },
+    {
+      id: "location",
+      header: t("pools.location"),
+      className: "font-mono text-xs",
+      priority: 2,
+      cell: (pool) => (
+        <>
+          {poolLocation(pool)}
+          {/* Orbivisor가 세운 Ceph의 풀(Ceph 화면에서 만듦) */}
+          {isManagedPool(pool, ceph.data) && (
+            <Badge variant="outline" className="ml-2 font-sans">
+              {t("pools.managedCeph")}
+            </Badge>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "sharing",
+      header: t("pools.sharing"),
+      priority: 3,
+      // 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유).
+      cell: (pool) =>
+        write && pool.spec.backend.kind === "dir" ? (
+          <Switch
+            aria-label={t("pools.sharedNamed", { name: pool.name })}
+            checked={isShared(pool)}
+            onCheckedChange={(shared) => {
+              setSharing({ pool, shared });
+              setSharingOpen(true);
+            }}
+          />
+        ) : isShared(pool) ? (
+          t("pools.sharedState")
+        ) : (
+          t("pools.localState")
+        ),
+    },
+    {
+      id: "backups",
+      header: t("pools.backups"),
+      priority: 3,
+      cell: (pool) => {
+        const held = backupCount(pool);
+        // 디렉터리·NFS 풀만 백업을 담는다.
+        const backupKind = pool.spec.backend.kind === "dir" || pool.spec.backend.kind === "nfs";
+        return (
+          <>
+            {write && backupKind ? (
+              <Switch
+                aria-label={t("pools.backupsNamed", { name: pool.name })}
+                checked={pool.spec.backups === true}
+                onCheckedChange={(on) => void setBackups(pool, on)}
+              />
+            ) : pool.spec.backups ? (
+              t("pools.backupsState")
+            ) : (
+              "—"
+            )}
+            {write && held !== undefined && held > 0 && (
+              <div className="text-xs text-muted-foreground">
+                {t("pools.holdsBackups", { count: held })}
+              </div>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      id: "nodes",
+      header: t("pools.nodes"),
+      cell: (pool) => (
+        <>
+          {/* 노드를 정하지 않은 풀은 모든 노드에서 쓴다. */}
+          {(pool.spec.nodes ?? []).length === 0 && (
+            <div className="text-xs text-muted-foreground">{t("pools.allNodes")}</div>
+          )}
+          {poolNodes(pool, nodeList).map((n) => (
+            <PoolStatus key={n.id} name={n.name} state={n.state} offline={n.offline} />
+          ))}
+        </>
+      ),
+    },
+    {
+      id: "free",
+      header: t("pools.free"),
+      cell: (pool) => {
+        const capacity = poolCapacity(pool, nodeList);
+        // 공유 풀은 값 하나, 로컬 풀은 준비된 노드마다(노드가 둘 이상이면 이름을 붙인다).
+        return capacity.length === 0
+          ? "—"
+          : capacity.map((c) => (
+              <div key={c.node ?? ""}>
+                {capacity.length > 1 && `${c.node}: `}
+                {`${formatBytes(c.free)} / ${formatBytes(c.total)}`}
+              </div>
+            ));
+      },
+    },
+    {
+      id: "volumes",
+      header: t("pools.volumes"),
+      value: (pool) => volumeCount(pool) ?? -1,
+      priority: 2,
+      cell: (pool) => {
+        const used = volumeCount(pool);
+        return (
+          <>
+            {used ?? "—"}
+            {write && used !== undefined && used > 0 && (
+              <div className="text-xs text-muted-foreground">{t("pools.inUse")}</div>
+            )}
+          </>
+        );
+      },
+    },
+  ];
+  if (write) {
+    columns.push({
+      id: "menu",
+      header: t("vms.actions"),
+      actions: true,
+      cell: (pool) => {
+        const used = volumeCount(pool);
+        const held = backupCount(pool);
+        return (
+          <Button
+            variant="ghost"
+            size="icon-sm"
+            aria-label={t("common.deleteNamed", { name: pool.name })}
+            // 볼륨이나 백업이 남은 풀은 서버가 지우지 않는다.
+            disabled={used !== 0 || held !== 0}
+            onClick={() => setDeleting(pool)}
+          >
+            <Trash2 />
+          </Button>
+        );
+      },
+    });
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -107,127 +266,19 @@ export function PoolsPage() {
           </Button>
         )}
       </div>
-      <Table aria-labelledby="pools-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("pools.kind")}</TableHead>
-            <TableHead>{t("pools.location")}</TableHead>
-            <TableHead>{t("pools.sharing")}</TableHead>
-            <TableHead>{t("pools.backups")}</TableHead>
-            <TableHead>{t("pools.nodes")}</TableHead>
-            <TableHead>{t("pools.free")}</TableHead>
-            <TableHead>{t("pools.volumes")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(pools.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 9 : 8} query={pools} empty={t("pools.empty")} />
-          )}
-          {(pools.data ?? []).map((pool) => {
-            const capacity = poolCapacity(pool, nodeList);
-            const used = volumeCount(pool);
-            const held = backupCount(pool);
-            const backupKind = pool.spec.backend.kind === "dir" || pool.spec.backend.kind === "nfs";
-            return (
-              <TableRow key={pool.id}>
-                <TableCell className="font-medium">{pool.name}</TableCell>
-                <TableCell>{t(`pools.kinds.${pool.spec.backend.kind}`)}</TableCell>
-                <TableCell className="font-mono text-xs">
-                  {poolLocation(pool)}
-                  {/* Orbivisor가 세운 Ceph의 풀(Ceph 화면에서 만듦) */}
-                  {isManagedPool(pool, ceph.data) && (
-                    <Badge variant="outline" className="ml-2 font-sans">
-                      {t("pools.managedCeph")}
-                    </Badge>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {/* 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유). */}
-                  {write && pool.spec.backend.kind === "dir" ? (
-                    <Switch
-                      aria-label={t("pools.sharedNamed", { name: pool.name })}
-                      checked={isShared(pool)}
-                      onCheckedChange={(shared) => {
-                        setSharing({ pool, shared });
-                        setSharingOpen(true);
-                      }}
-                    />
-                  ) : isShared(pool) ? (
-                    t("pools.sharedState")
-                  ) : (
-                    t("pools.localState")
-                  )}
-                </TableCell>
-                <TableCell>
-                  {/* 디렉터리·NFS 풀만 백업을 담는다. */}
-                  {write && backupKind ? (
-                    <Switch
-                      aria-label={t("pools.backupsNamed", { name: pool.name })}
-                      checked={pool.spec.backups === true}
-                      onCheckedChange={(on) => void setBackups(pool, on)}
-                    />
-                  ) : pool.spec.backups ? (
-                    t("pools.backupsState")
-                  ) : (
-                    "—"
-                  )}
-                  {write && held !== undefined && held > 0 && (
-                    <div className="text-xs text-muted-foreground">
-                      {t("pools.holdsBackups", { count: held })}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {/* 노드를 정하지 않은 풀은 모든 노드에서 쓴다. */}
-                  {(pool.spec.nodes ?? []).length === 0 && (
-                    <div className="text-xs text-muted-foreground">{t("pools.allNodes")}</div>
-                  )}
-                  {poolNodes(pool, nodeList).map((n) => (
-                    <PoolStatus key={n.id} name={n.name} state={n.state} offline={n.offline} />
-                  ))}
-                </TableCell>
-                <TableCell>
-                  {/* 공유 풀은 값 하나, 로컬 풀은 준비된 노드마다(노드가 둘 이상이면 이름을 붙인다). */}
-                  {capacity.length === 0
-                    ? "—"
-                    : capacity.map((c) => (
-                        <div key={c.node ?? ""}>
-                          {capacity.length > 1 && `${c.node}: `}
-                          {`${formatBytes(c.free)} / ${formatBytes(c.total)}`}
-                        </div>
-                      ))}
-                </TableCell>
-                <TableCell>
-                  {used ?? "—"}
-                  {write && used !== undefined && used > 0 && (
-                    <div className="text-xs text-muted-foreground">{t("pools.inUse")}</div>
-                  )}
-                </TableCell>
-                {write && (
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("common.deleteNamed", { name: pool.name })}
-                      // 볼륨이나 백업이 남은 풀은 서버가 지우지 않는다.
-                      disabled={used !== 0 || held !== 0}
-                      onClick={() => setDeleting(pool)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+      <DataTable
+        id="pools"
+        rows={pools.data ?? []}
+        columns={columns}
+        rowId={(pool) => pool.id}
+        rowName={(pool) => pool.name}
+        query={pools}
+        empty={t("pools.empty")}
+        labelledBy="pools-title"
+        state={state}
+        search={(pool) => `${pool.name} ${poolLocation(pool)}`}
+        keys
+      />
       {creating && <CreatePoolDialog onClose={() => setCreating(false)} />}
       <ConfirmDialog
         open={sharingOpen}

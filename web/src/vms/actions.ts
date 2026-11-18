@@ -165,13 +165,6 @@ export function availability(vm: Vm, action: VmOperation, vmTasks: readonly Task
   return { ok: true };
 }
 
-/** 여럿에 한 동작의 결과: 요청이 받아들여진 수, 실패한 수, 할 수 없어 건너뛴 수 */
-interface BulkResult {
-  done: number;
-  failed: number;
-  skipped: number;
-}
-
 export function useVmActions() {
   const { t } = useTranslation();
 
@@ -196,45 +189,11 @@ export function useVmActions() {
     }
   }
 
-  /**
-   * 여러 VM에 같은 동작을 한다. 할 수 없는 VM은 건너뛴다(`taskIndex`는 `useTaskIndex`). 건너뛰거나 실패한
-   * 것이 있으면 요약 알림을 하나 더 띄운다.
-   */
-  async function runMany(
-    vms: Vm[],
-    action: VmAction,
-    taskIndex: Map<string, Task[]>,
-  ): Promise<BulkResult> {
-    const able = vms.filter((vm) => availability(vm, action, taskIndex.get(vm.id) ?? []).ok);
-    const results = await Promise.allSettled(
-      able.map((vm) =>
-        request(vm, action).catch((err: unknown) => {
-          toast.error(t("vms.actionFailed", { name: vm.name, error: errorMessage(t, err) }));
-          throw err;
-        }),
-      ),
-    );
-    const failed = results.filter((r) => r.status === "rejected").length;
-    const result = { done: able.length - failed, failed, skipped: vms.length - able.length };
-    if (result.failed > 0 || result.skipped > 0) {
-      const summary = t("vms.bulkSummary", {
-        action: t(`vms.action.${action}`),
-        ...result,
-      });
-      if (result.failed > 0) {
-        toast.error(summary);
-      } else {
-        toast.info(summary);
-      }
-    }
-    return result;
-  }
-
   /** VM을 지운다. 실패하면 던진다(확인 대화상자가 보여 준다). 볼륨은 남는다. */
   async function remove(vm: Vm) {
     await call(api.DELETE("/vms/{key}", { params: { path: { key: vm.id } } }));
     toast.success(t("vms.deleted", { name: vm.name }));
   }
 
-  return { run, runMany, remove };
+  return { run, remove };
 }

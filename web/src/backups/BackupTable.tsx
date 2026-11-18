@@ -14,19 +14,12 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
-import { TableMessage } from "@/components/TableMessage";
+import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { useTableState } from "@/components/data-table/state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { codeMessage } from "@/i18n/errors";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
@@ -81,11 +74,14 @@ export function BackupTable({
   query,
   labelledBy,
   showVm = false,
+  url = false,
 }: {
   backups: Backup[];
   query: { isPending: boolean; isError: boolean; error: unknown };
   labelledBy: string;
   showVm?: boolean;
+  /** 화면의 주 목록이면 검색·정렬을 주소에 두고 목록 단축키를 받는다. */
+  url?: boolean;
 }) {
   const { t, i18n } = useTranslation();
   const me = usePrincipal();
@@ -105,7 +101,7 @@ export function BackupTable({
     can(me.role, "write", "volume");
   const remove = can(me.role, "write", "backup");
   const actions = restore || remove;
-  const columns = 8 + (showVm ? 1 : 0) + (actions ? 1 : 0);
+  const state = useTableState("backups", [], url);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));
   const originHint = (origin: NonNullable<Backup["spec"]["origin"]>) =>
     t(origin.job ? "backups.originJobHint" : "backups.originHint", {
@@ -122,211 +118,298 @@ export function BackupTable({
     return job ? job.name : jobs.isSuccess ? t("backups.jobDeleted") : "—";
   };
 
+  /** 행 하나를 그릴 값 */
+  const rowInfo = (backup: Backup) => {
+    const { phase, created_at: created, error, replicas = [] } = backup.status;
+    const { parent: parentId, full_reason: fullReason } = backup.status;
+    return {
+      vm: vmById.get(backup.spec.vm),
+      size: storedBytes(backup),
+      phase,
+      created,
+      error,
+      replicas,
+      origin: backup.spec.origin,
+      parentId,
+      fullReason,
+      parent: parentId ? backups.find((b) => b.id === parentId) : undefined,
+      chain: parentId ? chainBytes(backup, backups) : undefined,
+      // 체인이 다 원격에 있으면 진행 줄을 뺀다.
+      chainCopies: chainReplicas(backup, backups).filter((c) => c.sent < c.total),
+    };
+  };
+  const columns: Column<Backup>[] = [
+    {
+      id: "name",
+      header: t("common.name"),
+      value: (backup) => backup.name,
+      className: "font-medium",
+      cell: (backup) => {
+        const { origin } = rowInfo(backup);
+        return (
+          <>
+            {backup.name}
+            {/* 다른 클러스터에서 받은 사본 */}
+            {origin && (
+              <Badge variant="outline" className="ml-2" title={originHint(origin)}>
+                {t("backups.origin", { cluster: origin.cluster })}
+                <span className="sr-only">{originHint(origin)}</span>
+              </Badge>
+            )}
+          </>
+        );
+      },
+    },
+    ...(showVm
+      ? ([
+          {
+            id: "vm",
+            header: t("backups.vm"),
+            priority: 2,
+            cell: (backup) => {
+              const { vm } = rowInfo(backup);
+              return (
+                <>
+                  {vm ? (
+                    <Link
+                      to={`/vms/${encodeURIComponent(vm.name)}`}
+                      className="underline-offset-4 hover:underline"
+                    >
+                      {vm.name}
+                    </Link>
+                  ) : (
+                    backup.spec.vm_name
+                  )}
+                </>
+              );
+            },
+          },
+        ] satisfies Column<Backup>[])
+      : []),
+    {
+      id: "pool",
+      header: t("backups.pool"),
+      value: (backup) => backup.spec.pool,
+      priority: 2,
+      cell: (backup) => backup.spec.pool,
+    },
+    {
+      id: "job",
+      header: t("backups.job"),
+      priority: 3,
+      cell: (backup) => jobName(backup.spec.job),
+    },
+    {
+      id: "state",
+      header: t("common.state"),
+      value: (backup) => backup.status.phase,
+      cell: (backup) => {
+        const { phase, error } = rowInfo(backup);
+        return (
+          <>
+            <Badge variant={PHASE_VARIANT[phase]}>{t(`backups.phase.${phase}`)}</Badge>
+            {error && (
+              <div className="max-w-xs text-xs whitespace-normal break-words text-destructive">
+                {error}
+              </div>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      id: "created",
+      header: t("backups.created"),
+      value: (backup) => backup.status.created_at ?? 0,
+      cell: (backup) => {
+        const { created } = rowInfo(backup);
+        return <>{created !== null ? formatTime(new Date(created * 1000), i18n.language) : "—"}</>;
+      },
+    },
+    {
+      id: "size",
+      header: t("backups.size"),
+      value: (backup) => storedBytes(backup) ?? -1,
+      priority: 2,
+      cell: (backup) => {
+        const { size, chain } = rowInfo(backup);
+        return (
+          <>
+            {size !== undefined ? formatBytes(size) : "—"}
+            {chain !== undefined && (
+              <div className="text-xs text-muted-foreground">
+                {t("backups.chainSize", { size: formatBytes(chain) })}
+              </div>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      id: "type",
+      header: t("backups.type"),
+      priority: 3,
+      cell: (backup) => {
+        const { parentId, fullReason, parent } = rowInfo(backup);
+        return (
+          <>
+            <Badge variant="outline">
+              {t(parentId ? "backups.kind.incremental" : "backups.kind.full")}
+            </Badge>
+            {parentId && (
+              <div className="text-xs text-muted-foreground">
+                {t("backups.parent")}{" "}
+                {parent ? (
+                  <a href={`#backup-${parent.id}`} className="underline-offset-4 hover:underline">
+                    {parent.name}
+                  </a>
+                ) : (
+                  parentId
+                )}
+              </div>
+            )}
+            {fullReason && (
+              <div className="max-w-xs text-xs whitespace-normal break-words text-muted-foreground">
+                {t("backups.fullReason", { reason: fullReason })}
+              </div>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      id: "replicas",
+      header: t("backups.replicas"),
+      priority: 3,
+      cell: (backup) => {
+        const { replicas, chainCopies } = rowInfo(backup);
+        return (
+          <>
+            {replicas.length === 0 && chainCopies.length === 0 ? (
+              "—"
+            ) : (
+              <>
+                {replicas.length > 0 && (
+                  <div className="flex flex-wrap gap-2">
+                    {replicas.map((r) => (
+                      <ReplicaBadge key={`${r.remote}/${r.pool}`} replica={r} />
+                    ))}
+                  </div>
+                )}
+                {replicas
+                  .filter((r) => r.state === "failed" && r.error)
+                  .map((r) => (
+                    <div
+                      key={`${r.remote}/${r.pool}`}
+                      className="max-w-xs text-xs whitespace-normal break-words text-destructive"
+                    >
+                      {t("backups.replicaError", {
+                        remote: r.remote,
+                        pool: r.pool,
+                        error: r.error,
+                      })}
+                    </div>
+                  ))}
+                {/* 증분은 복제가 체인을 전체 백업부터 차례로 보낸다. */}
+                {chainCopies.map((c) => (
+                  <div
+                    key={`chain-${c.remote}/${c.pool}`}
+                    className="text-xs text-muted-foreground"
+                  >
+                    {t("backups.chainSent", {
+                      remote: c.remote,
+                      pool: c.pool,
+                      sent: c.sent,
+                      total: c.total,
+                    })}
+                  </div>
+                ))}
+              </>
+            )}
+          </>
+        );
+      },
+    },
+    ...(actions
+      ? ([
+          {
+            id: "menu",
+            header: t("vms.actions"),
+            actions: true,
+            cell: (backup) => {
+              const { phase } = rowInfo(backup);
+              return (
+                <>
+                  {restore && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-label={t("backups.restoreNamed", { name: backup.name })}
+                      disabled={phase !== "ready"}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setRestoring(backup);
+                      }}
+                    >
+                      {t("backups.restore")}
+                    </Button>
+                  )}
+                  {/* 복제 API는 백업 쓰기 권한이다(지우기와 같다). 원격 쪽 권한은 원격 토큰의 역할이다. */}
+                  {remove && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="ml-2"
+                      aria-label={t("backups.replicateNamed", { name: backup.name })}
+                      disabled={phase !== "ready"}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setReplicating(backup);
+                      }}
+                    >
+                      {t("backups.replicate")}
+                    </Button>
+                  )}
+                  {/* 실패했거나 Task 없이 남은 백업도 지운다. 진행 중인 Task가 있으면 서버가 거절한다. */}
+                  {remove && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="ml-2"
+                      aria-label={t("backups.deleteNamed", { name: backup.name })}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setDeleting(backup);
+                        setDeleteOpen(true);
+                      }}
+                    >
+                      {t("common.delete")}
+                    </Button>
+                  )}
+                </>
+              );
+            },
+          },
+        ] satisfies Column<Backup>[])
+      : []),
+  ];
+
   return (
     <>
-      <Table aria-labelledby={labelledBy}>
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            {showVm && <TableHead>{t("backups.vm")}</TableHead>}
-            <TableHead>{t("backups.pool")}</TableHead>
-            <TableHead>{t("backups.job")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>{t("backups.created")}</TableHead>
-            <TableHead>{t("backups.size")}</TableHead>
-            <TableHead>{t("backups.type")}</TableHead>
-            <TableHead>{t("backups.replicas")}</TableHead>
-            {actions && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {backups.length === 0 && (
-            <TableMessage colSpan={columns} query={query} empty={t("backups.empty")} />
-          )}
-          {backups.map((backup) => {
-            const vm = vmById.get(backup.spec.vm);
-            const size = storedBytes(backup);
-            const { phase, created_at: created, error, replicas = [] } = backup.status;
-            const origin = backup.spec.origin;
-            const { parent: parentId, full_reason: fullReason } = backup.status;
-            const parent = parentId ? backups.find((b) => b.id === parentId) : undefined;
-            const chain = parentId ? chainBytes(backup, backups) : undefined;
-            // 체인이 다 원격에 있으면 진행 줄을 뺀다.
-            const chainCopies = chainReplicas(backup, backups).filter((c) => c.sent < c.total);
-            return (
-              <TableRow key={backup.id} id={`backup-${backup.id}`}>
-                <TableCell className="font-medium">
-                  {backup.name}
-                  {/* 다른 클러스터에서 받은 사본 */}
-                  {origin && (
-                    <Badge variant="outline" className="ml-2" title={originHint(origin)}>
-                      {t("backups.origin", { cluster: origin.cluster })}
-                      <span className="sr-only">{originHint(origin)}</span>
-                    </Badge>
-                  )}
-                </TableCell>
-                {showVm && (
-                  <TableCell>
-                    {vm ? (
-                      <Link
-                        to={`/vms/${encodeURIComponent(vm.name)}`}
-                        className="underline-offset-4 hover:underline"
-                      >
-                        {vm.name}
-                      </Link>
-                    ) : (
-                      backup.spec.vm_name
-                    )}
-                  </TableCell>
-                )}
-                <TableCell>{backup.spec.pool}</TableCell>
-                <TableCell>{jobName(backup.spec.job)}</TableCell>
-                <TableCell>
-                  <Badge variant={PHASE_VARIANT[phase]}>{t(`backups.phase.${phase}`)}</Badge>
-                  {error && (
-                    <div className="max-w-xs text-xs whitespace-normal break-words text-destructive">
-                      {error}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {created !== null ? formatTime(new Date(created * 1000), i18n.language) : "—"}
-                </TableCell>
-                <TableCell>
-                  {size !== undefined ? formatBytes(size) : "—"}
-                  {chain !== undefined && (
-                    <div className="text-xs text-muted-foreground">
-                      {t("backups.chainSize", { size: formatBytes(chain) })}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell>
-                  <Badge variant="outline">
-                    {t(parentId ? "backups.kind.incremental" : "backups.kind.full")}
-                  </Badge>
-                  {parentId && (
-                    <div className="text-xs text-muted-foreground">
-                      {t("backups.parent")}{" "}
-                      {parent ? (
-                        <a
-                          href={`#backup-${parent.id}`}
-                          className="underline-offset-4 hover:underline"
-                        >
-                          {parent.name}
-                        </a>
-                      ) : (
-                        parentId
-                      )}
-                    </div>
-                  )}
-                  {fullReason && (
-                    <div className="max-w-xs text-xs whitespace-normal break-words text-muted-foreground">
-                      {t("backups.fullReason", { reason: fullReason })}
-                    </div>
-                  )}
-                </TableCell>
-                <TableCell>
-                  {replicas.length === 0 && chainCopies.length === 0 ? (
-                    "—"
-                  ) : (
-                    <>
-                      {replicas.length > 0 && (
-                        <div className="flex flex-wrap gap-2">
-                          {replicas.map((r) => (
-                            <ReplicaBadge key={`${r.remote}/${r.pool}`} replica={r} />
-                          ))}
-                        </div>
-                      )}
-                      {replicas
-                        .filter((r) => r.state === "failed" && r.error)
-                        .map((r) => (
-                          <div
-                            key={`${r.remote}/${r.pool}`}
-                            className="max-w-xs text-xs whitespace-normal break-words text-destructive"
-                          >
-                            {t("backups.replicaError", {
-                              remote: r.remote,
-                              pool: r.pool,
-                              error: r.error,
-                            })}
-                          </div>
-                        ))}
-                      {/* 증분은 복제가 체인을 전체 백업부터 차례로 보낸다. */}
-                      {chainCopies.map((c) => (
-                        <div
-                          key={`chain-${c.remote}/${c.pool}`}
-                          className="text-xs text-muted-foreground"
-                        >
-                          {t("backups.chainSent", {
-                            remote: c.remote,
-                            pool: c.pool,
-                            sent: c.sent,
-                            total: c.total,
-                          })}
-                        </div>
-                      ))}
-                    </>
-                  )}
-                </TableCell>
-                {actions && (
-                  <TableCell className="text-right whitespace-nowrap">
-                    {restore && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        aria-label={t("backups.restoreNamed", { name: backup.name })}
-                        disabled={phase !== "ready"}
-                        onClick={(e) => {
-                          opener.current = e.currentTarget;
-                          setRestoring(backup);
-                        }}
-                      >
-                        {t("backups.restore")}
-                      </Button>
-                    )}
-                    {/* 복제 API는 백업 쓰기 권한이다(지우기와 같다). 원격 쪽 권한은 원격 토큰의 역할이다. */}
-                    {remove && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="ml-2"
-                        aria-label={t("backups.replicateNamed", { name: backup.name })}
-                        disabled={phase !== "ready"}
-                        onClick={(e) => {
-                          opener.current = e.currentTarget;
-                          setReplicating(backup);
-                        }}
-                      >
-                        {t("backups.replicate")}
-                      </Button>
-                    )}
-                    {/* 실패했거나 Task 없이 남은 백업도 지운다. 진행 중인 Task가 있으면 서버가 거절한다. */}
-                    {remove && (
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="ml-2"
-                        aria-label={t("backups.deleteNamed", { name: backup.name })}
-                        onClick={(e) => {
-                          opener.current = e.currentTarget;
-                          setDeleting(backup);
-                          setDeleteOpen(true);
-                        }}
-                      >
-                        {t("common.delete")}
-                      </Button>
-                    )}
-                  </TableCell>
-                )}
-              </TableRow>
-            );
-          })}
-        </TableBody>
-      </Table>
+      <DataTable
+        id="backups"
+        rows={backups}
+        columns={columns}
+        rowId={(backup) => backup.id}
+        rowName={(backup) => backup.name}
+        query={query}
+        empty={t("backups.empty")}
+        labelledBy={labelledBy}
+        state={url ? state : undefined}
+        search={url ? (backup) => `${backup.name} ${backup.spec.vm_name}` : undefined}
+        keys={url}
+        rowProps={(backup) => ({ id: `backup-${backup.id}` })}
+      />
       {restoring && (
         <RestoreDialog backup={restoring} returnFocus={opener} onClose={() => setRestoring(null)} />
       )}

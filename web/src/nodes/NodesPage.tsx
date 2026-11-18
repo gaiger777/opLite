@@ -17,7 +17,8 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ReasonMenuItem } from "@/components/Reason";
-import { TableMessage } from "@/components/TableMessage";
+import { type Column, DataTable } from "@/components/data-table/DataTable";
+import { useTableState } from "@/components/data-table/state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -28,20 +29,13 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatCapacity } from "@/lib/format";
 import { failingChecks } from "@/ha-checks/checks";
 import { NodeDisksDialog } from "@/nodes/NodeDisksDialog";
 import { NodeFenceDialog } from "@/nodes/NodeFenceDialog";
 import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
+import { NodePeek } from "@/nodes/NodePeek";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { trackTask } from "@/tasks/tasks";
@@ -203,6 +197,7 @@ export function NodesPage() {
     trigger.current = e.currentTarget;
   };
   const write = can(me.role, "write", "node");
+  const state = useTableState("nodes");
 
   async function setMaintenance(node: Node, maintenance: boolean) {
     try {
@@ -225,291 +220,368 @@ export function NodesPage() {
     }
   }
 
+  const columns: Column<Node>[] = [
+    {
+      id: "name",
+      header: t("common.name"),
+      value: (node) => node.name,
+      className: "font-medium",
+      cell: (node) => (
+        <>
+          <Link
+            to={`/nodes/${encodeURIComponent(node.name)}`}
+            className="underline-offset-4 hover:underline"
+          >
+            {node.name}
+          </Link>
+          {node.id === cluster.data?.node && (
+            <span className="ml-2 text-xs text-muted-foreground">{t("nodes.thisNode")}</span>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "state",
+      header: t("common.state"),
+      value: (node) => (node.status.online ? 1 : 0),
+      cell: (node) => (
+        <div className="flex flex-wrap gap-1">
+          <Badge variant={node.status.online ? "default" : "destructive"}>
+            {t(node.status.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
+          </Badge>
+          {node.spec.maintenance && <Badge variant="outline">{t("dashboard.maintenance")}</Badge>}
+          {node.spec.witness && <Badge variant="outline">{t("dashboard.witness")}</Badge>}
+          {/* 리더는 얼린 노드의 HA VM을 옮기지 않는다(돌아오면 그 노드에서 켠다). */}
+          {isFrozen(node) && <Badge variant="secondary">{t("nodes.frozen")}</Badge>}
+        </div>
+      ),
+    },
+    {
+      id: "address",
+      header: t("nodes.address"),
+      value: (node) => node.spec.address,
+      className: "font-mono text-xs",
+      priority: 2,
+      cell: (node) => node.spec.address,
+    },
+    {
+      id: "version",
+      header: t("nodes.version"),
+      className: "font-mono text-xs",
+      priority: 3,
+      // 옛 버전으로 등록한 노드는 모른다.
+      cell: (node) => node.status.version ?? "—",
+    },
+    {
+      id: "updates",
+      header: t("nodes.updates.column"),
+      priority: 3,
+      // 업데이트를 확인하지 않는 노드(위트니스, 꺼 둔 노드)는 `updates`가 없다.
+      cell: (node) =>
+        node.status.updates ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={t("nodes.updates.open", {
+              name: node.name,
+              state: updatesState(t, node.status.updates),
+            })}
+            onPointerDown={rememberTrigger}
+            onKeyDown={rememberTrigger}
+            onClick={() => setShowingUpdates(node)}
+          >
+            <UpdatesBadge updates={node.status.updates} />
+          </Button>
+        ) : (
+          "—"
+        ),
+    },
+    {
+      id: "underlay",
+      header: t("nodes.underlay"),
+      className: "font-mono text-xs",
+      priority: 3,
+      // VXLAN 패킷을 주고받는 주소. 위트니스와 정하지 못한 노드는 없다.
+      cell: (node) => node.status.underlay ?? "—",
+    },
+    {
+      id: "hypervisor",
+      header: t("nodes.hypervisor"),
+      priority: 3,
+      cell: (node) => (
+        <>
+          {node.status.hypervisor}
+          {/* 실행 중 vCPU·메모리 핫플러그. 디스크·NIC는 이 기록이 있는 모든 노드가 한다. 옛 노드·위트니스는 없다. */}
+          {node.status.hotplug && (
+            <span className="block text-xs text-muted-foreground">
+              {t("nodes.hotplug", {
+                cpu: t(node.status.hotplug.cpu ? "nodes.yes" : "nodes.no"),
+                memory: t(node.status.hotplug.memory ? "nodes.yes" : "nodes.no"),
+              })}
+            </span>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "arch",
+      header: t("nodes.arch"),
+      priority: 3,
+      // 옛 버전으로 등록한 노드는 모른다.
+      cell: (node) => node.status.arch ?? "—",
+    },
+    {
+      id: "firmware",
+      header: t("nodes.firmware"),
+      priority: 3,
+      // TPM·Secure Boot 능력. 옛 노드는 알리지 않고(모름), 위트니스는 VM을 돌리지 않는다.
+      cell: (node) =>
+        node.spec.witness ? (
+          "—"
+        ) : node.status.firmware_caps ? (
+          t("nodes.firmwareCaps", {
+            tpm: t(node.status.firmware_caps.tpm ? "nodes.yes" : "nodes.no"),
+            secureBoot: t(node.status.firmware_caps.secure_boot ? "nodes.yes" : "nodes.no"),
+          })
+        ) : (
+          <span className="text-muted-foreground">{t("nodes.firmwareUnknown")}</span>
+        ),
+    },
+    {
+      id: "fencing",
+      header: t("nodes.fencing"),
+      priority: 3,
+      // 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다.
+      cell: (node) => (
+        <>
+          {node.status.ha ? (
+            <>
+              {t(`nodes.fencingMode.${node.status.ha.fencing}`)}
+              {/* `[ha] profile`이 정한, 리더가 이 노드의 HA VM을 옮기기까지의 시간 */}
+              <span className="block text-xs text-muted-foreground">
+                {t("nodes.recoverAfter", { secs: node.status.ha.recover_after_secs })}
+              </span>
+            </>
+          ) : (
+            "—"
+          )}
+          {/* 이웃 노드가 이 노드의 BMC·명령으로 전원을 읽지 못했다. */}
+          {node.status.fence_check?.error && (
+            <Badge variant="destructive" title={node.status.fence_check.error}>
+              {t("nodes.fenceUnreachable")}
+            </Badge>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "checks",
+      header: t("nodes.checks"),
+      priority: 2,
+      // HA 검사를 하지 않는 노드(위트니스, 옛 버전)는 결과도 인터페이스도 없다.
+      cell: (node) =>
+        (node.status.checks ?? []).length > 0 || (node.status.interfaces ?? []).length > 0 ? (
+          <Button
+            variant="ghost"
+            size="sm"
+            aria-label={t("nodes.interfaces.open", {
+              name: node.name,
+              state: checksState(t, node),
+            })}
+            onPointerDown={rememberTrigger}
+            onKeyDown={rememberTrigger}
+            onClick={() => setShowingInterfaces(node)}
+          >
+            {(node.status.checks ?? []).length > 0 ? <ChecksBadge node={node} /> : "—"}
+          </Button>
+        ) : (
+          "—"
+        ),
+    },
+    {
+      id: "cpus",
+      header: t("nodes.cpus"),
+      value: (node) => node.status.cpus,
+      priority: 2,
+      cell: (node) => node.status.cpus,
+    },
+    {
+      id: "memory",
+      header: t("nodes.memory"),
+      value: (node) => node.status.memory_mib,
+      priority: 2,
+      cell: (node) => formatCapacity(node.status.memory_mib),
+    },
+    {
+      id: "bridges",
+      header: t("nodes.bridges"),
+      className: "font-mono text-xs",
+      priority: 3,
+      cell: (node) => node.status.bridges.map((b) => b.name).join(", ") || "—",
+    },
+    {
+      id: "pools",
+      header: t("nodes.pools"),
+      priority: 3,
+      cell: (node) =>
+        Object.keys(node.status.pools).length === 0
+          ? "—"
+          : Object.entries(node.status.pools)
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([name, state]) => (
+                <PoolStatus key={name} name={name} state={state} offline={!node.status.online} />
+              )),
+    },
+    {
+      id: "labels",
+      header: t("nodes.labels"),
+      className: "font-mono text-xs",
+      priority: 3,
+      // 배치 규칙의 노드 태그(`zone=rack-a`)가 보는 레이블
+      cell: (node) => labelText(node.labels) || "—",
+    },
+    {
+      id: "vms",
+      header: t("nodes.vms"),
+      value: (node) => (vms.isSuccess ? vmCount(node, vms.data) : -1),
+      // VM 목록을 다 읽기 전에는 모른다.
+      cell: (node) => (vms.isSuccess ? vmCount(node, vms.data) : "—"),
+    },
+    {
+      id: "replicas",
+      header: t("nodes.replicas"),
+      priority: 3,
+      // 그 노드가 대상인 복제(VM 목록으로 센다)
+      cell: (node) => (vms.isSuccess ? <ReplicasCell node={node} vms={vms.data} /> : "—"),
+    },
+    {
+      id: "ceph",
+      header: t("nodes.ceph"),
+      className: "font-mono text-xs",
+      priority: 3,
+      // 관리 Ceph에서 이 노드가 맡은 데몬(mon·mgr·osd)
+      cell: (node) => cephRoles(ceph.data, node.id).join(", ") || "—",
+    },
+  ];
+  if (write) {
+    columns.push({
+      id: "menu",
+      header: t("vms.actions"),
+      actions: true,
+      cell: (node) => (
+        <DropdownMenu modal={false}>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              aria-label={t("vms.actionsFor", { name: node.name })}
+              onPointerDown={rememberTrigger}
+              onKeyDown={rememberTrigger}
+            >
+              <MoreHorizontal />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem
+              onSelect={() =>
+                // 유지보수를 끝내면 진행 중인 비우기가 멈추므로 먼저 묻는다.
+                node.spec.maintenance && isDraining(node)
+                  ? setEnding(node)
+                  : void setMaintenance(node, !node.spec.maintenance)
+              }
+            >
+              {t(node.spec.maintenance ? "nodes.endMaintenance" : "nodes.startMaintenance")}
+            </DropdownMenuItem>
+            {/* 위트니스는 VM을 돌리지 않는다. */}
+            {!node.spec.witness && (
+              <ReasonMenuItem
+                reason={
+                  !node.status.online
+                    ? "nodes.drain.reason.offline"
+                    : node.status.hypervisor === "qemu-hvf"
+                      ? "nodes.drain.reason.hvf"
+                      : isDraining(node)
+                        ? "nodes.drain.reason.draining"
+                        : null
+                }
+                onSelect={() => setDraining(node)}
+              >
+                {t("nodes.drain.menu")}
+              </ReasonMenuItem>
+            )}
+            {node.status.updates && (
+              <DropdownMenuItem onSelect={() => setShowingUpdates(node)}>
+                {t("nodes.updates.menu")}
+              </DropdownMenuItem>
+            )}
+            {!node.spec.witness && (
+              <DropdownMenuItem onSelect={() => setShowingInterfaces(node)}>
+                {t("nodes.interfaces.menu")}
+              </DropdownMenuItem>
+            )}
+            {!node.spec.witness && (
+              <DropdownMenuItem onSelect={() => setShowingDisks(node)}>
+                {t("nodes.disks.menu")}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuItem onSelect={() => setLabeling(node)}>
+              {t("nodes.labelsMenu")}
+            </DropdownMenuItem>
+            {/* 위트니스는 HA VM을 돌리지 않아 끌 일이 없다. */}
+            {!node.spec.witness && (
+              <DropdownMenuItem onSelect={() => setFencing(node)}>
+                {t("nodes.fence.menu")}
+              </DropdownMenuItem>
+            )}
+            {isFrozen(node) && (
+              <DropdownMenuItem onSelect={() => setUnfreezing(node)}>
+                {t("nodes.unfreeze.menu")}
+              </DropdownMenuItem>
+            )}
+            <DropdownMenuSeparator />
+            <ReasonMenuItem
+              variant="destructive"
+              // 살아 있는 노드는 그 노드에서 `oplctl cluster leave`로 뺀다(서버도 막는다).
+              reason={
+                node.id === cluster.data?.node
+                  ? "nodes.reason.thisNode"
+                  : node.status.online
+                    ? "nodes.reason.online"
+                    : null
+              }
+              onSelect={() => setRemoving(node)}
+            >
+              {t("nodes.remove")}
+            </ReasonMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      ),
+    });
+  }
+
   return (
     <div className="flex flex-col gap-4">
       <h1 id="nodes-title" className="text-xl font-semibold">
         {t("nav.nodes")}
       </h1>
       <p className="text-sm text-muted-foreground">{t("nodes.joinNote")}</p>
-      <Table aria-labelledby="nodes-title">
-        <TableHeader>
-          <TableRow>
-            <TableHead>{t("common.name")}</TableHead>
-            <TableHead>{t("common.state")}</TableHead>
-            <TableHead>{t("nodes.address")}</TableHead>
-            <TableHead>{t("nodes.version")}</TableHead>
-            <TableHead>{t("nodes.updates.column")}</TableHead>
-            <TableHead>{t("nodes.underlay")}</TableHead>
-            <TableHead>{t("nodes.hypervisor")}</TableHead>
-            <TableHead>{t("nodes.arch")}</TableHead>
-            <TableHead>{t("nodes.firmware")}</TableHead>
-            <TableHead>{t("nodes.fencing")}</TableHead>
-            <TableHead>{t("nodes.checks")}</TableHead>
-            <TableHead>{t("nodes.cpus")}</TableHead>
-            <TableHead>{t("nodes.memory")}</TableHead>
-            <TableHead>{t("nodes.bridges")}</TableHead>
-            <TableHead>{t("nodes.pools")}</TableHead>
-            <TableHead>{t("nodes.labels")}</TableHead>
-            <TableHead>{t("nodes.vms")}</TableHead>
-            <TableHead>{t("nodes.replicas")}</TableHead>
-            <TableHead>{t("nodes.ceph")}</TableHead>
-            {write && (
-              <TableHead>
-                <span className="sr-only">{t("vms.actions")}</span>
-              </TableHead>
-            )}
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 20 : 19} query={nodes} empty={t("dashboard.noNodes")} />
-          )}
-          {(nodes.data ?? []).map((node) => (
-            <TableRow key={node.id}>
-              <TableCell className="font-medium">
-                <Link
-                  to={`/nodes/${encodeURIComponent(node.name)}`}
-                  className="underline-offset-4 hover:underline"
-                >
-                  {node.name}
-                </Link>
-                {node.id === cluster.data?.node && (
-                  <span className="ml-2 text-xs text-muted-foreground">{t("nodes.thisNode")}</span>
-                )}
-              </TableCell>
-              <TableCell>
-                <div className="flex flex-wrap gap-1">
-                  <Badge variant={node.status.online ? "default" : "destructive"}>
-                    {t(node.status.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
-                  </Badge>
-                  {node.spec.maintenance && (
-                    <Badge variant="outline">{t("dashboard.maintenance")}</Badge>
-                  )}
-                  {node.spec.witness && <Badge variant="outline">{t("dashboard.witness")}</Badge>}
-                  {/* 리더는 얼린 노드의 HA VM을 옮기지 않는다(돌아오면 그 노드에서 켠다). */}
-                  {isFrozen(node) && <Badge variant="secondary">{t("nodes.frozen")}</Badge>}
-                </div>
-              </TableCell>
-              <TableCell className="font-mono text-xs">{node.spec.address}</TableCell>
-              {/* 옛 버전으로 등록한 노드는 모른다. */}
-              <TableCell className="font-mono text-xs">{node.status.version ?? "—"}</TableCell>
-              {/* 업데이트를 확인하지 않는 노드(위트니스, 꺼 둔 노드)는 `updates`가 없다. */}
-              <TableCell>
-                {node.status.updates ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    aria-label={t("nodes.updates.open", {
-                      name: node.name,
-                      state: updatesState(t, node.status.updates),
-                    })}
-                    onPointerDown={rememberTrigger}
-                    onKeyDown={rememberTrigger}
-                    onClick={() => setShowingUpdates(node)}
-                  >
-                    <UpdatesBadge updates={node.status.updates} />
-                  </Button>
-                ) : (
-                  "—"
-                )}
-              </TableCell>
-              {/* VXLAN 패킷을 주고받는 주소. 위트니스와 정하지 못한 노드는 없다. */}
-              <TableCell className="font-mono text-xs">{node.status.underlay ?? "—"}</TableCell>
-              <TableCell>
-                {node.status.hypervisor}
-                {/* 실행 중 vCPU·메모리 핫플러그. 디스크·NIC는 이 기록이 있는 모든 노드가 한다. 옛 노드·위트니스는 없다. */}
-                {node.status.hotplug && (
-                  <span className="block text-xs text-muted-foreground">
-                    {t("nodes.hotplug", {
-                      cpu: t(node.status.hotplug.cpu ? "nodes.yes" : "nodes.no"),
-                      memory: t(node.status.hotplug.memory ? "nodes.yes" : "nodes.no"),
-                    })}
-                  </span>
-                )}
-              </TableCell>
-              {/* 옛 버전으로 등록한 노드는 모른다. */}
-              <TableCell>{node.status.arch ?? "—"}</TableCell>
-              {/* TPM·Secure Boot 능력. 옛 노드는 알리지 않고(모름), 위트니스는 VM을 돌리지 않는다. */}
-              <TableCell>
-                {node.spec.witness ? (
-                  "—"
-                ) : node.status.firmware_caps ? (
-                  t("nodes.firmwareCaps", {
-                    tpm: t(node.status.firmware_caps.tpm ? "nodes.yes" : "nodes.no"),
-                    secureBoot: t(node.status.firmware_caps.secure_boot ? "nodes.yes" : "nodes.no"),
-                  })
-                ) : (
-                  <span className="text-muted-foreground">{t("nodes.firmwareUnknown")}</span>
-                )}
-              </TableCell>
-              {/* 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다. */}
-              <TableCell>
-                {node.status.ha ? (
-                  <>
-                    {t(`nodes.fencingMode.${node.status.ha.fencing}`)}
-                    {/* `[ha] profile`이 정한, 리더가 이 노드의 HA VM을 옮기기까지의 시간 */}
-                    <span className="block text-xs text-muted-foreground">
-                      {t("nodes.recoverAfter", { secs: node.status.ha.recover_after_secs })}
-                    </span>
-                  </>
-                ) : (
-                  "—"
-                )}
-                {/* 이웃 노드가 이 노드의 BMC·명령으로 전원을 읽지 못했다. */}
-                {node.status.fence_check?.error && (
-                  <Badge variant="destructive" title={node.status.fence_check.error}>
-                    {t("nodes.fenceUnreachable")}
-                  </Badge>
-                )}
-              </TableCell>
-              {/* HA 검사를 하지 않는 노드(위트니스, 옛 버전)는 결과도 인터페이스도 없다. */}
-              <TableCell>
-                {(node.status.checks ?? []).length > 0 ||
-                (node.status.interfaces ?? []).length > 0 ? (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    aria-label={t("nodes.interfaces.open", {
-                      name: node.name,
-                      state: checksState(t, node),
-                    })}
-                    onPointerDown={rememberTrigger}
-                    onKeyDown={rememberTrigger}
-                    onClick={() => setShowingInterfaces(node)}
-                  >
-                    {(node.status.checks ?? []).length > 0 ? <ChecksBadge node={node} /> : "—"}
-                  </Button>
-                ) : (
-                  "—"
-                )}
-              </TableCell>
-              <TableCell>{node.status.cpus}</TableCell>
-              <TableCell>{formatCapacity(node.status.memory_mib)}</TableCell>
-              <TableCell className="font-mono text-xs">
-                {node.status.bridges.map((b) => b.name).join(", ") || "—"}
-              </TableCell>
-              <TableCell>
-                {Object.keys(node.status.pools).length === 0
-                  ? "—"
-                  : Object.entries(node.status.pools)
-                      .sort(([a], [b]) => a.localeCompare(b))
-                      .map(([name, state]) => (
-                        <PoolStatus
-                          key={name}
-                          name={name}
-                          state={state}
-                          offline={!node.status.online}
-                        />
-                      ))}
-              </TableCell>
-              {/* 배치 규칙의 노드 태그(`zone=rack-a`)가 보는 레이블 */}
-              <TableCell className="font-mono text-xs">{labelText(node.labels) || "—"}</TableCell>
-              {/* VM 목록을 다 읽기 전에는 모른다. */}
-              <TableCell>{vms.isSuccess ? vmCount(node, vms.data) : "—"}</TableCell>
-              {/* 그 노드가 대상인 복제(VM 목록으로 센다) */}
-              <TableCell>
-                {vms.isSuccess ? <ReplicasCell node={node} vms={vms.data} /> : "—"}
-              </TableCell>
-              {/* 관리 Ceph에서 이 노드가 맡은 데몬(mon·mgr·osd) */}
-              <TableCell className="font-mono text-xs">
-                {cephRoles(ceph.data, node.id).join(", ") || "—"}
-              </TableCell>
-              {write && (
-                <TableCell className="text-right">
-                  <DropdownMenu modal={false}>
-                    <DropdownMenuTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon-sm"
-                        aria-label={t("vms.actionsFor", { name: node.name })}
-                        onPointerDown={rememberTrigger}
-                        onKeyDown={rememberTrigger}
-                      >
-                        <MoreHorizontal />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem
-                        onSelect={() =>
-                          // 유지보수를 끝내면 진행 중인 비우기가 멈추므로 먼저 묻는다.
-                          node.spec.maintenance && isDraining(node)
-                            ? setEnding(node)
-                            : void setMaintenance(node, !node.spec.maintenance)
-                        }
-                      >
-                        {t(
-                          node.spec.maintenance ? "nodes.endMaintenance" : "nodes.startMaintenance",
-                        )}
-                      </DropdownMenuItem>
-                      {/* 위트니스는 VM을 돌리지 않는다. */}
-                      {!node.spec.witness && (
-                        <ReasonMenuItem
-                          reason={
-                            !node.status.online
-                              ? "nodes.drain.reason.offline"
-                              : node.status.hypervisor === "qemu-hvf"
-                                ? "nodes.drain.reason.hvf"
-                                : isDraining(node)
-                                  ? "nodes.drain.reason.draining"
-                                  : null
-                          }
-                          onSelect={() => setDraining(node)}
-                        >
-                          {t("nodes.drain.menu")}
-                        </ReasonMenuItem>
-                      )}
-                      {node.status.updates && (
-                        <DropdownMenuItem onSelect={() => setShowingUpdates(node)}>
-                          {t("nodes.updates.menu")}
-                        </DropdownMenuItem>
-                      )}
-                      {!node.spec.witness && (
-                        <DropdownMenuItem onSelect={() => setShowingInterfaces(node)}>
-                          {t("nodes.interfaces.menu")}
-                        </DropdownMenuItem>
-                      )}
-                      {!node.spec.witness && (
-                        <DropdownMenuItem onSelect={() => setShowingDisks(node)}>
-                          {t("nodes.disks.menu")}
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuItem onSelect={() => setLabeling(node)}>
-                        {t("nodes.labelsMenu")}
-                      </DropdownMenuItem>
-                      {/* 위트니스는 HA VM을 돌리지 않아 끌 일이 없다. */}
-                      {!node.spec.witness && (
-                        <DropdownMenuItem onSelect={() => setFencing(node)}>
-                          {t("nodes.fence.menu")}
-                        </DropdownMenuItem>
-                      )}
-                      {isFrozen(node) && (
-                        <DropdownMenuItem onSelect={() => setUnfreezing(node)}>
-                          {t("nodes.unfreeze.menu")}
-                        </DropdownMenuItem>
-                      )}
-                      <DropdownMenuSeparator />
-                      <ReasonMenuItem
-                        variant="destructive"
-                        // 살아 있는 노드는 그 노드에서 `oplctl cluster leave`로 뺀다(서버도 막는다).
-                        reason={
-                          node.id === cluster.data?.node
-                            ? "nodes.reason.thisNode"
-                            : node.status.online
-                              ? "nodes.reason.online"
-                              : null
-                        }
-                        onSelect={() => setRemoving(node)}
-                      >
-                        {t("nodes.remove")}
-                      </ReasonMenuItem>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </TableCell>
-              )}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
+      <DataTable
+        id="nodes"
+        rows={nodes.data ?? []}
+        columns={columns}
+        rowId={(node) => node.id}
+        rowName={(node) => node.name}
+        query={nodes}
+        empty={t("dashboard.noNodes")}
+        labelledBy="nodes-title"
+        state={state}
+        search={(node) => `${node.name} ${node.spec.address}`}
+        rowHref={(node) => `/nodes/${encodeURIComponent(node.name)}`}
+        peek={(node) => (
+          <NodePeek node={node} vms={vms.isSuccess ? vmCount(node, vms.data) : undefined} />
+        )}
+        keys
+      />
       {write && (
         <>
           <p className="text-sm text-muted-foreground">{t("nodes.maintenanceNote")}</p>

@@ -4,18 +4,11 @@ import { Link } from "react-router";
 
 import { useList } from "@/api/live";
 import type { Task } from "@/api/types";
+import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { Badge } from "@/components/ui/badge";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Pager, usePage } from "@/components/Pager";
 import { Label } from "@/components/ui/label";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { formatTime, uuidTime } from "@/lib/format";
 import { describeDetail, describeProgress, describeTask } from "@/tasks/tasks";
 
@@ -88,75 +81,93 @@ export function TaskTable({
   tasks,
   labelledBy,
   empty,
+  keys = false,
 }: {
   tasks: Task[];
   labelledBy?: string;
   empty?: string;
+  /** 화면의 주 목록이면 목록 단축키를 받는다. */
+  keys?: boolean;
 }) {
   const { t, i18n } = useTranslation();
   const target = useTaskTarget();
   const nodes = useList("node");
   const nodeById = useMemo(() => new Map(nodes.data?.map((n) => [n.id, n])), [nodes.data]);
+  const columns: Column<Task>[] = [
+    {
+      id: "time",
+      header: t("tasks.time"),
+      className: "whitespace-nowrap",
+      cell: (task) => {
+        const time = uuidTime(task.id);
+        return <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>;
+      },
+    },
+    {
+      id: "operation",
+      header: t("tasks.operation"),
+      cell: (task) => {
+        const { name, href } = target(task);
+        const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
+        const detail = describeDetail(task, t);
+        return (
+          <>
+            {href ? (
+              <Link to={href} className="underline-offset-4 hover:underline">
+                {label}
+              </Link>
+            ) : (
+              label
+            )}
+            {detail && <span className="block text-xs text-muted-foreground">{detail}</span>}
+          </>
+        );
+      },
+    },
+    {
+      id: "node",
+      header: t("common.node"),
+      priority: 2,
+      cell: (task) => nodeById.get(task.spec.node)?.name ?? "—",
+    },
+    {
+      id: "state",
+      header: t("common.state"),
+      cell: (task) => {
+        const progress = describeProgress(task, t);
+        return (
+          <>
+            <TaskStateBadge task={task} />
+            {progress && (
+              <span className="ml-2 text-xs whitespace-nowrap text-muted-foreground">
+                {progress}
+              </span>
+            )}
+          </>
+        );
+      },
+    },
+    {
+      id: "error",
+      header: t("tasks.error"),
+      priority: 2,
+      cell: (task) => (
+        <div className="max-w-md truncate" title={task.status.error ?? undefined}>
+          {task.status.error ?? ""}
+        </div>
+      ),
+    },
+  ];
   return (
-    <Table aria-labelledby={labelledBy}>
-      <TableHeader>
-        <TableRow>
-          <TableHead>{t("tasks.time")}</TableHead>
-          <TableHead>{t("tasks.operation")}</TableHead>
-          <TableHead>{t("common.node")}</TableHead>
-          <TableHead>{t("common.state")}</TableHead>
-          <TableHead>{t("tasks.error")}</TableHead>
-        </TableRow>
-      </TableHeader>
-      <TableBody>
-        {tasks.length === 0 && (
-          <TableRow>
-            <TableCell colSpan={5} className="text-center text-muted-foreground">
-              {empty ?? t("tasks.empty")}
-            </TableCell>
-          </TableRow>
-        )}
-        {tasks.map((task) => {
-          const { name, href } = target(task);
-          const node = nodeById.get(task.spec.node);
-          const time = uuidTime(task.id);
-          const label = describeTask(task, t, name, (id) => nodeById.get(id)?.name);
-          const progress = describeProgress(task, t);
-          const detail = describeDetail(task, t);
-          return (
-            <TableRow key={task.id}>
-              <TableCell className="whitespace-nowrap">
-                <time dateTime={time.toISOString()}>{formatTime(time, i18n.language)}</time>
-              </TableCell>
-              <TableCell>
-                {href ? (
-                  <Link to={href} className="underline-offset-4 hover:underline">
-                    {label}
-                  </Link>
-                ) : (
-                  label
-                )}
-                {detail && <span className="block text-xs text-muted-foreground">{detail}</span>}
-              </TableCell>
-              <TableCell>{node?.name ?? "—"}</TableCell>
-              <TableCell>
-                <TaskStateBadge task={task} />
-                {progress && (
-                  <span className="ml-2 text-xs whitespace-nowrap text-muted-foreground">
-                    {progress}
-                  </span>
-                )}
-              </TableCell>
-              <TableCell>
-                <div className="max-w-md truncate" title={task.status.error ?? undefined}>
-                  {task.status.error ?? ""}
-                </div>
-              </TableCell>
-            </TableRow>
-          );
-        })}
-      </TableBody>
-    </Table>
+    <DataTable
+      id="tasks"
+      rows={tasks}
+      columns={columns}
+      rowId={(task) => task.id}
+      empty={empty ?? t("tasks.empty")}
+      labelledBy={labelledBy}
+      keys={keys}
+    />
   );
 }
 
@@ -196,6 +207,7 @@ export function TasksPage() {
       <TaskTable
         tasks={pager.pageItems}
         labelledBy="tasks-title"
+        keys
         empty={failedOnly ? t("tasks.emptyFailed") : undefined}
       />
       <Pager {...pager} pageSize={TASK_PAGE_SIZE} total={shown.length} />

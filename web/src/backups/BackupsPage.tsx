@@ -21,6 +21,7 @@ export function BackupsPage() {
         query={backups}
         labelledBy="backups-title"
         showVm
+        url
       />
     </div>
   );

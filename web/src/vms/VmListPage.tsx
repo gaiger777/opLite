@@ -1,15 +1,6 @@
-import {
-  type ColumnDef,
-  flexRender,
-  getCoreRowModel,
-  getFilteredRowModel,
-  getSortedRowModel,
-  type RowSelectionState,
-  type SortingState,
-  useReactTable,
-} from "@tanstack/react-table";
-import { ArrowDown, ArrowUp, ArrowUpDown, Plus } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { Plus } from "lucide-react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
@@ -18,274 +9,205 @@ import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
-import { TableMessage } from "@/components/TableMessage";
+import { type Column, DataTable, type Filter } from "@/components/data-table/DataTable";
+import { useTableState } from "@/components/data-table/state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Checkbox } from "@/components/ui/checkbox";
-import { Input } from "@/components/ui/input";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { formatMib } from "@/lib/format";
-import { readPref, writePref } from "@/lib/prefs";
-import { useVmActions } from "@/vms/actions";
 import { isTemplate } from "@/templates/templates";
+import { type BulkAction, BULK_ACTIONS, bulkReason } from "@/vms/bulk";
 import { haEnabled } from "@/vms/ha";
+import { VmBulkDialog } from "@/vms/VmBulkDialog";
 import { VmMenu } from "@/vms/VmMenu";
+import { VmPeek } from "@/vms/VmPeek";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
-
-/** 정렬할 수 있는 열 */
-const SORTABLE = new Set(["name", "phase", "node", "cpu", "memory"]);
-
-/** 저장해 둔 정렬. 모양이 다르면(손으로 고쳤거나 열이 바뀌었으면) 버린다. */
-function savedSorting(): SortingState {
-  try {
-    const value: unknown = JSON.parse(readPref("vms.sort") ?? "[]");
-    const valid =
-      Array.isArray(value) &&
-      value.every(
-        (s: unknown) =>
-          typeof s === "object" &&
-          s !== null &&
-          "id" in s &&
-          typeof s.id === "string" &&
-          SORTABLE.has(s.id) &&
-          "desc" in s &&
-          typeof s.desc === "boolean",
-      );
-    return valid ? (value as SortingState) : [];
-  } catch {
-    return [];
-  }
-}
 
 export function vcpus(vm: Vm): number {
   return (vm.spec.cpu.sockets ?? 1) * vm.spec.cpu.cores;
 }
+
+const PHASES = ["running", "stopped", "failed", "starting", "stopping", "migrating"] as const;
+/** 주소 쿼리의 거름 키 */
+const KEYS = ["phase", "node", "template"];
 
 export function VmListPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
   const vms = useList("vm");
   const nodes = useList("node");
-  const { runMany } = useVmActions();
+  const snapshots = useList("snapshot");
   const taskIndex = useTaskIndex();
-  const [filter, setFilter] = useState("");
-  // 템플릿만 보기(거름 칩)
-  const [templatesOnly, setTemplatesOnly] = useState(false);
-  const shown = useMemo(
-    () => (templatesOnly ? (vms.data ?? []).filter(isTemplate) : (vms.data ?? [])),
-    [vms.data, templatesOnly],
-  );
-  const [sorting, setSorting] = useState<SortingState>(savedSorting);
-  const [selection, setSelection] = useState<RowSelectionState>({});
-
-  useEffect(() => writePref("vms.sort", JSON.stringify(sorting)), [sorting]);
+  // 머리줄의 클러스터 전환이 읽은 값만 본다("이 노드" 보기). 따로 묻지 않는다.
+  const cluster = useQuery<{ node?: string }>({ queryKey: ["cluster"], enabled: false });
+  const state = useTableState("vms", KEYS);
+  const [bulk, setBulk] = useState<{ action: BulkAction; vms: Vm[]; clear(): void } | null>(null);
+  const operate = can(me.role, "operate", "vm");
+  const write = can(me.role, "write", "vm");
+  const templatesOnly = state.get("template") === "1";
 
   const nodeName = useMemo(() => {
     const names = new Map(nodes.data?.map((n) => [n.id, n.name]));
     return (id: string | null | undefined) => (id ? (names.get(id) ?? id.slice(-8)) : "—");
   }, [nodes.data]);
 
-  const columns = useMemo<ColumnDef<Vm>[]>(
-    () => [
-      {
-        id: "select",
-        enableSorting: false,
-        header: ({ table }) => (
-          <Checkbox
-            aria-label={t("vms.selectAll")}
-            checked={
-              table.getIsAllRowsSelected() || (table.getIsSomeRowsSelected() && "indeterminate")
-            }
-            onCheckedChange={(v) => table.toggleAllRowsSelected(v === true)}
-          />
-        ),
-        cell: ({ row }) => (
-          <Checkbox
-            aria-label={t("vms.select", { name: row.original.name })}
-            checked={row.getIsSelected()}
-            onCheckedChange={(v) => row.toggleSelected(v === true)}
-          />
-        ),
-      },
-      {
-        id: "name",
-        accessorKey: "name",
-        header: t("common.name"),
-        cell: ({ row }) => (
-          <>
-            <Link
-              to={`/vms/${encodeURIComponent(row.original.name)}`}
-              className="font-medium underline-offset-4 hover:underline"
-            >
-              {row.original.name}
-            </Link>
-            {haEnabled(row.original.spec) && (
-              <Badge variant="outline" className="ml-2">
-                {t("vms.ha")}
-              </Badge>
-            )}
-            {isTemplate(row.original) && (
-              <Badge variant="secondary" className="ml-2">
-                {t("vms.template")}
-              </Badge>
-            )}
-          </>
-        ),
-      },
-      {
-        id: "phase",
-        accessorFn: (vm) => vm.status.phase,
-        header: t("common.state"),
-        cell: ({ row }) => <VmPhaseBadge vm={row.original} />,
-      },
-      {
-        id: "node",
-        accessorFn: (vm) => nodeName(vm.spec.node ?? vm.status.node),
-        header: t("common.node"),
-      },
-      { id: "cpu", accessorFn: vcpus, header: t("vms.vcpus") },
-      {
-        id: "memory",
-        accessorFn: (vm) => vm.spec.memory_mib,
-        header: t("vms.memory"),
-        cell: ({ row }) => formatMib(row.original.spec.memory_mib),
-      },
-      {
-        id: "menu",
-        enableSorting: false,
-        header: () => <span className="sr-only">{t("vms.actions")}</span>,
-        cell: ({ row }) => <VmMenu vm={row.original} />,
-      },
-    ],
-    [t, nodeName],
-  );
+  const columns: Column<Vm>[] = [
+    {
+      id: "name",
+      header: t("common.name"),
+      value: (vm) => vm.name,
+      cell: (vm) => (
+        <>
+          <Link
+            to={`/vms/${encodeURIComponent(vm.name)}`}
+            className="font-medium underline-offset-4 hover:underline"
+          >
+            {vm.name}
+          </Link>
+          {haEnabled(vm.spec) && (
+            <Badge variant="outline" className="ml-2">
+              {t("vms.ha")}
+            </Badge>
+          )}
+          {isTemplate(vm) && (
+            <Badge variant="secondary" className="ml-2">
+              {t("vms.template")}
+            </Badge>
+          )}
+        </>
+      ),
+    },
+    {
+      id: "phase",
+      header: t("common.state"),
+      value: (vm) => vm.status.phase,
+      cell: (vm) => <VmPhaseBadge vm={vm} />,
+    },
+    {
+      id: "node",
+      header: t("common.node"),
+      value: (vm) => nodeName(vm.spec.node ?? vm.status.node),
+      cell: (vm) => nodeName(vm.spec.node ?? vm.status.node),
+    },
+    { id: "cpu", header: t("vms.vcpus"), value: vcpus, cell: vcpus, priority: 2 },
+    {
+      id: "memory",
+      header: t("vms.memory"),
+      value: (vm) => vm.spec.memory_mib,
+      cell: (vm) => formatMib(vm.spec.memory_mib),
+      priority: 2,
+    },
+    { id: "menu", header: t("vms.actions"), actions: true, cell: (vm) => <VmMenu vm={vm} /> },
+  ];
 
-  const table = useReactTable({
-    data: shown,
-    columns,
-    state: { sorting, rowSelection: selection, globalFilter: filter },
-    getRowId: (vm) => vm.id,
-    onSortingChange: setSorting,
-    onRowSelectionChange: setSelection,
-    globalFilterFn: (row, _column, value: string) =>
-      row.original.name.toLowerCase().includes(value.toLowerCase()),
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-    getFilteredRowModel: getFilteredRowModel(),
-  });
+  const filters: Filter<Vm>[] = [
+    {
+      id: "phase",
+      label: t("common.state"),
+      options: PHASES.map((p) => ({ value: p, label: t(`vms.phase.${p}`) })),
+      test: (vm, value) => vm.status.phase === value,
+    },
+    {
+      id: "node",
+      label: t("common.node"),
+      options: (nodes.data ?? []).map((n) => ({ value: n.id, label: n.name })),
+      test: (vm, value) => (vm.spec.node ?? vm.status.node) === value,
+    },
+    {
+      id: "template",
+      label: t("vms.templatesOnly"),
+      options: [],
+      test: (vm, value) => value !== "1" || isTemplate(vm),
+    },
+  ];
+  const here = cluster.data?.node;
+  const views = [
+    { name: t("vms.view.running"), query: "phase=running" },
+    { name: t("vms.view.failed"), query: "phase=failed" },
+    ...(here ? [{ name: t("vms.view.thisNode"), query: `node=${encodeURIComponent(here)}` }] : []),
+  ];
 
-  // 검색으로 가려진 행은 선택돼 있어도 일괄 동작에 넣지 않는다.
-  const selected = table.getFilteredSelectedRowModel().rows.map((r) => r.original);
-  const bulk = (action: "start" | "stop") => {
-    void runMany(selected, action, taskIndex);
-    setSelection({});
-  };
+  const ctx = { tasks: taskIndex, nodes: nodes.data ?? [], snapshots: snapshots.data ?? [] };
+  const bulkBar = (chosen: Vm[], clear: () => void) =>
+    BULK_ACTIONS.filter((a) => (a === "delete" ? write : operate)).map((action) => {
+      // 옮기기는 대상 노드를 대화상자에서 고르므로 노드와 상관없는 까닭만 센다.
+      const able = chosen.filter((vm) => {
+        const reason = bulkReason(vm, action, ctx);
+        return reason === null || reason === "vms.bulk.reason.noTarget";
+      }).length;
+      const label = t(`vms.bulk.action.${action}`);
+      return (
+        <Button
+          key={action}
+          size="sm"
+          variant={action === "delete" ? "destructive" : "outline"}
+          disabled={able === 0}
+          aria-label={t("vms.bulk.button", {
+            action: label,
+            able,
+            blocked: chosen.length - able,
+          })}
+          onClick={() => setBulk({ action, vms: chosen, clear })}
+        >
+          {label}
+          <span aria-hidden className="text-xs tabular-nums opacity-70">
+            {able}/{chosen.length}
+          </span>
+        </Button>
+      );
+    });
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h1 className="text-xl font-semibold">{t("nav.vms")}</h1>
-        <div className="flex items-center gap-2">
-          <Input
-            data-list-search=""
-            className="w-48"
-            placeholder={t("vms.search")}
-            aria-label={t("vms.search")}
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-          />
-          {can(me.role, "write", "vm") && (
-            <Button asChild>
-              <Link to="/vms/-new">
-                <Plus />
-                {t("common.create")}
-              </Link>
-            </Button>
-          )}
-        </div>
-      </div>
-      <div>
-        <Button
-          variant={templatesOnly ? "secondary" : "outline"}
-          size="sm"
-          aria-pressed={templatesOnly}
-          onClick={() => setTemplatesOnly((v) => !v)}
-        >
-          {t("vms.templatesOnly")}
-        </Button>
-      </div>
-      {selected.length > 0 && can(me.role, "operate", "vm") && (
-        <div className="flex items-center gap-2 text-sm">
-          <span>{t("vms.selected", { count: selected.length })}</span>
-          <Button size="sm" variant="outline" onClick={() => bulk("start")}>
-            {t("vms.action.start")}
+        <h1 id="vms-title" className="text-xl font-semibold">
+          {t("nav.vms")}
+        </h1>
+        {write && (
+          <Button asChild>
+            <Link to="/vms/-new">
+              <Plus />
+              {t("common.create")}
+            </Link>
           </Button>
-          <Button size="sm" variant="outline" onClick={() => bulk("stop")}>
-            {t("vms.action.stop")}
+        )}
+      </div>
+      <DataTable
+        id="vms"
+        rows={vms.data ?? []}
+        columns={columns}
+        rowId={(vm) => vm.id}
+        rowName={(vm) => vm.name}
+        query={vms}
+        empty={t("vms.empty")}
+        labelledBy="vms-title"
+        state={state}
+        search={(vm) => vm.name}
+        searchLabel={t("vms.search")}
+        filters={filters}
+        views={views}
+        bulk={operate || write ? bulkBar : undefined}
+        rowHref={(vm) => `/vms/${encodeURIComponent(vm.name)}`}
+        peek={(vm) => <VmPeek vm={vm} nodeName={nodeName} />}
+        keys
+        toolbar={
+          <Button
+            variant={templatesOnly ? "secondary" : "outline"}
+            size="sm"
+            aria-pressed={templatesOnly}
+            onClick={() => state.set("template", templatesOnly ? "" : "1")}
+          >
+            {t("vms.templatesOnly")}
           </Button>
-        </div>
+        }
+      />
+      {bulk && (
+        <VmBulkDialog
+          action={bulk.action}
+          vms={bulk.vms}
+          onClose={() => setBulk(null)}
+          onStarted={bulk.clear}
+        />
       )}
-      <Table>
-        <TableHeader>
-          {table.getHeaderGroups().map((group) => (
-            <TableRow key={group.id}>
-              {group.headers.map((header) => {
-                const sorted = header.column.getIsSorted();
-                const SortIcon =
-                  sorted === "asc" ? ArrowUp : sorted === "desc" ? ArrowDown : ArrowUpDown;
-                return (
-                  <TableHead
-                    key={header.id}
-                    aria-sort={
-                      !header.column.getCanSort()
-                        ? undefined
-                        : sorted === "asc"
-                          ? "ascending"
-                          : sorted === "desc"
-                            ? "descending"
-                            : "none"
-                    }
-                  >
-                    {header.column.getCanSort() ? (
-                      <button
-                        type="button"
-                        className="inline-flex items-center gap-1"
-                        onClick={header.column.getToggleSortingHandler()}
-                      >
-                        {flexRender(header.column.columnDef.header, header.getContext())}
-                        <SortIcon aria-hidden className={sorted ? "size-3" : "size-3 opacity-50"} />
-                      </button>
-                    ) : (
-                      flexRender(header.column.columnDef.header, header.getContext())
-                    )}
-                  </TableHead>
-                );
-              })}
-            </TableRow>
-          ))}
-        </TableHeader>
-        <TableBody>
-          {table.getRowModel().rows.length === 0 && (
-            <TableMessage colSpan={columns.length} query={vms} empty={t("vms.empty")} />
-          )}
-          {table.getRowModel().rows.map((row) => (
-            <TableRow key={row.id} data-state={row.getIsSelected() ? "selected" : undefined}>
-              {row.getVisibleCells().map((cell) => (
-                <TableCell key={cell.id}>
-                  {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                </TableCell>
-              ))}
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
     </div>
   );
 }
