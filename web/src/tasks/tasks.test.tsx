@@ -1,5 +1,6 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import { createQueryClient } from "@/api/queryClient";
@@ -7,6 +8,7 @@ import type { Task } from "@/api/types";
 import { Toaster } from "@/components/ui/sonner";
 import i18n from "@/i18n";
 import { ThemeProvider } from "@/lib/theme";
+import { isCenterOpen, setCenterOpen } from "@/tasks/center";
 import {
   describeDetail,
   describeProgress,
@@ -19,6 +21,8 @@ import {
   waitForTask,
 } from "@/tasks/tasks";
 import { TaskToasts } from "@/tasks/TaskToasts";
+import { vm } from "@/test/fixtures";
+import { apiUrl, server } from "@/test/server";
 
 // 알림과 지켜보는 Task는 모듈 전역이므로 테스트마다 비우고, Task id도 테스트마다 다르게 쓴다.
 afterEach(() => {
@@ -75,6 +79,66 @@ it("warns when a task succeeded with a warning", async () => {
     ),
   ).toBeInTheDocument();
   expect(warning).toHaveBeenCalledOnce();
+});
+
+it("leaves running and success toasts to the open center and offers View on failures", async () => {
+  render(
+    <ThemeProvider>
+      <Toaster />
+    </ThemeProvider>,
+  );
+  const loading = vi.spyOn(toast, "loading");
+  const success = vi.spyOn(toast, "success");
+  setCenterOpen(true);
+  trackTask(task("20", "pending"), "Start web");
+  trackTask(task("21", "pending"), "Start db");
+  expect(loading).not.toHaveBeenCalled();
+  settleTasks(
+    { revision: 2, items: [task("20", "succeeded"), task("21", "failed", "no firmware")] },
+    i18n.t,
+  );
+  expect(success).not.toHaveBeenCalled();
+  // 실패는 센터가 열려 있어도 알리고, "보기"가 센터를 연다.
+  expect(await screen.findByText("Start db: failed. no firmware")).toBeInTheDocument();
+  setCenterOpen(false);
+  fireEvent.click(screen.getByRole("button", { name: "View" }));
+  expect(isCenterOpen()).toBe(true);
+});
+
+it("offers to turn a stopped VM on again", async () => {
+  const web = vm("web", "stopped");
+  const start = vi.fn();
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), ({ params }) => {
+      start(params.key, params.action);
+      return HttpResponse.json(
+        { ...task("31", "pending"), spec: { op: { kind: "vm-start" }, target: web.id, node: "n" } },
+        { status: 202 },
+      );
+    }),
+  );
+  const queryClient = createQueryClient();
+  queryClient.setQueryData(["list", "vm"], { revision: 1, items: [web] });
+  const stop = {
+    ...task("30", "pending"),
+    spec: { op: { kind: "vm-stop" }, target: web.id, node: "n" },
+  } as Task;
+  queryClient.setQueryData(["list", "task"], {
+    revision: 2,
+    items: [{ ...stop, status: { state: "succeeded", error: null } }],
+  });
+  render(
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <TaskToasts />
+        <Toaster />
+      </QueryClientProvider>
+    </ThemeProvider>,
+  );
+  trackTask(stop, "Stop web");
+  expect(await screen.findByText("Stop web: done")).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Turn on again" }));
+  await waitFor(() => expect(start).toHaveBeenCalledWith(web.id, "start"));
 });
 
 it("settles a task that finished before it was tracked", async () => {

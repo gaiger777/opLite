@@ -10,6 +10,7 @@ export type ShortcutId =
   | "rail"
   | "create"
   | "favorite"
+  | "center"
   | "go.home"
   | "go.vms"
   | "go.infra"
@@ -37,6 +38,8 @@ export const SHORTCUTS: readonly Shortcut[] = [
   { id: "create", keys: ["c"], group: "general" },
   { id: "rail", keys: ["["], group: "general" },
   { id: "favorite", keys: ["f"], group: "general" },
+  // Shift+N(키 이름은 대문자 N)
+  { id: "center", keys: ["N"], group: "general" },
   { id: "go.home", keys: ["g", "h"], group: "navigation" },
   { id: "go.vms", keys: ["g", "v"], group: "navigation" },
   { id: "go.infra", keys: ["g", "i"], group: "navigation" },
@@ -180,5 +183,12 @@ export function isMac(): boolean {
 
 /** 도움말·머리줄에 보이는 키 글 */
 export function keyLabel(key: string): string {
-  return key === "mod+k" ? (isMac() ? "⌘K" : "Ctrl K") : key;
+  if (key === "mod+k") {
+    return isMac() ? "⌘K" : "Ctrl K";
+  }
+  // 대문자는 Shift와 함께 누른다.
+  if (/^[A-Z]$/.test(key)) {
+    return isMac() ? `⇧${key}` : `Shift ${key}`;
+  }
+  return key;
 }

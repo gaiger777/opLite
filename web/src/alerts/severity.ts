@@ -18,10 +18,3 @@ export function severityTone(severity: Severity): Tone {
       return "info";
   }
 }
-
-/** 칩(배경·글자)의 클래스. 색은 토큰으로만 쓴다. */
-export const TONE_CHIP: Record<Tone, string> = {
-  danger: "bg-danger-soft text-danger-fg",
-  warning: "bg-warning-soft text-warning-fg",
-  info: "bg-info-soft text-info-fg",
-};

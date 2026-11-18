@@ -612,7 +612,8 @@
         "sameNode": "Already on this node.",
         "target": "Cannot run on this node (offline, in maintenance or another architecture)."
       }
-    }
+    },
+    "startAgain": "Turn on again"
   },
   "snapshots": {
     "created": "Created",
@@ -2977,6 +2978,7 @@
     "create": "Create menu",
     "rail": "Collapse or expand the sidebar",
     "favorite": "Favorite this resource",
+    "center": "Tasks and alerts",
     "go": {
       "home": "Home",
       "vms": "Virtual machines",
@@ -3020,5 +3022,22 @@
     "vmsUsing": "VMs using it: {{count}}",
     "volumes": "Volumes in it: {{count}}",
     "backups": "Backups in it: {{count}}"
+  },
+  "center": {
+    "title": "Tasks and alerts",
+    "description": "Running and recent tasks, and active alerts.",
+    "openCount": "Tasks and alerts ({{n}} active)",
+    "running": "Running ({{n}})",
+    "recent": "Recent",
+    "alerts": "Alerts ({{n}} firing)",
+    "noRunning": "Nothing is running.",
+    "noRecent": "No finished tasks yet.",
+    "allTasks": "View all tasks",
+    "retry": "Retry",
+    "runJobAgain": "Run job again",
+    "retryNamed": "Retry: {{label}}",
+    "jobRunning": "The backup job is running.",
+    "jobDisabled": "The backup job is turned off.",
+    "view": "View"
   }
 }

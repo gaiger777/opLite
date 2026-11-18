@@ -4,6 +4,8 @@ import { toast } from "sonner";
 
 import { type List, listKey } from "@/api/live";
 import type { Task } from "@/api/types";
+import { UNDO_MS } from "@/lib/undo";
+import { isCenterOpen, setCenterOpen } from "@/tasks/center";
 
 /** 결과를 기다리는 Task: id → 알림에 쓸 설명과 만든 revision */
 const pending = new Map<string, { label: string; revision: number }>();
@@ -27,6 +29,7 @@ export function resetTasks() {
     toast.dismiss(id);
   }
   pending.clear();
+  setCenterOpen(false);
 }
 
 /**
@@ -35,15 +38,30 @@ export function resetTasks() {
  */
 export function trackTask(task: Task, label: string) {
   pending.set(task.id, { label, revision: task.revision });
-  toast.loading(label, { id: task.id });
+  // 열린 작업·알림 센터가 진행을 보여 주므로 도는 알림은 띄우지 않는다.
+  if (!isCenterOpen()) {
+    toast.loading(label, { id: task.id });
+  }
   tracked();
+}
+
+/** 결과 알림에 달 단추(정지 뒤 "다시 켜기") */
+export interface TaskToastAction {
+  label: string;
+  onClick(): void;
 }
 
 /**
  * 끝난 Task의 알림을 결과로 바꾼다. Task 목록이 바뀔 때마다 부른다. 만든 뒤에 읽은 목록에 없는 Task는
- * watch가 끊긴 사이 정리 작업이 지운 것이므로 결과를 알 수 없다고 알린다.
+ * watch가 끊긴 사이 정리 작업이 지운 것이므로 결과를 알 수 없다고 알린다. 작업·알림 센터가 열려 있으면 단추 없는
+ * 성공 알림은 띄우지 않는다(센터에 보인다, 설계 §5.4). 실패 알림에는 센터를 여는 "보기"를 단다. `actionFor`는
+ * 성공 알림에 달 단추를 정한다(정지 뒤 "다시 켜기", §5.8).
  */
-export function settleTasks(list: List<Task>, t: TFunction) {
+export function settleTasks(
+  list: List<Task>,
+  t: TFunction,
+  actionFor: (task: Task) => TaskToastAction | undefined = () => undefined,
+) {
   const byId = new Map(list.items.map((task) => [task.id, task]));
   for (const [id, { label, revision }] of pending) {
     const task = byId.get(id);
@@ -63,13 +81,21 @@ export function settleTasks(list: List<Task>, t: TFunction) {
       });
     } else if (task.status.state === "succeeded") {
       pending.delete(id);
-      toast.success(t("tasks.done", { label }), { id });
+      const action = actionFor(task);
+      if (action) {
+        toast.success(t("tasks.done", { label }), { id, duration: UNDO_MS, action });
+      } else if (isCenterOpen()) {
+        toast.dismiss(id);
+      } else {
+        toast.success(t("tasks.done", { label }), { id });
+      }
     } else if (task.status.state === "failed") {
       pending.delete(id);
       toast.error(t("tasks.failed", { label, error: task.status.error ?? "" }), {
         id,
         duration: Infinity,
         closeButton: true,
+        action: { label: t("center.view"), onClick: () => setCenterOpen(true) },
       });
     }
   }

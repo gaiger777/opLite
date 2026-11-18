@@ -6,33 +6,36 @@ import { useList } from "@/api/live";
 import type { Task } from "@/api/types";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { PageHeader } from "@/components/PageHeader";
-import { Badge } from "@/components/ui/badge";
+import { StatusChip, type StatusTone } from "@/components/StatusChip";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Pager, usePage } from "@/components/Pager";
 import { Label } from "@/components/ui/label";
 import { formatTime, uuidTime } from "@/lib/format";
+import { type TargetLookup, taskTarget } from "@/tasks/target";
 import { describeDetail, describeProgress, describeTask } from "@/tasks/tasks";
 
 /** 한 페이지에 보일 Task 수. API에 페이지 나누기가 없어 모두 받아 화면에서 나눈다. */
 export const TASK_PAGE_SIZE = 50;
 
-const STATE_VARIANT = {
-  pending: "outline",
-  running: "secondary",
-  succeeded: "default",
-  failed: "destructive",
-} as const;
+/** Task 상태의 색. 도는 Task는 점이 깜박인다. */
+export const TASK_TONE: Record<Task["status"]["state"], StatusTone> = {
+  pending: "neutral",
+  running: "info",
+  succeeded: "success",
+  failed: "danger",
+};
 
 export function TaskStateBadge({ task }: { task: Task }) {
   const { t } = useTranslation();
+  const state = task.status.state;
   return (
-    <Badge variant={STATE_VARIANT[task.status.state]}>
-      {t(`tasks.state.${task.status.state}`)}
-    </Badge>
+    <StatusChip tone={TASK_TONE[state]} busy={state === "running"}>
+      {t(`tasks.state.${state}`)}
+    </StatusChip>
   );
 }
 
-/** Task 대상의 이름. VM이면 VM 화면으로, 가져오기면 가져오기 화면으로 이어진다. */
+/** Task 대상의 이름과 화면(`taskTarget`). 이미 받은 목록으로 찾는다. */
 export function useTaskTarget() {
   const vms = useList("vm");
   const nodes = useList("node");
@@ -40,37 +43,14 @@ export function useTaskTarget() {
   const backups = useList("backup");
   const imports = useList("vm-import");
   return useMemo(() => {
-    const vmById = new Map(vms.data?.map((v) => [v.id, v]));
-    const volumeById = new Map(volumes.data?.map((v) => [v.id, v]));
-    const backupById = new Map(backups.data?.map((b) => [b.id, b]));
-    const importById = new Map(imports.data?.map((i) => [i.id, i]));
-    const nodeById = new Map(nodes.data?.map((n) => [n.id, n]));
-    return (task: Task) => {
-      const vm = vmById.get(task.spec.target);
-      if (vm) {
-        return { name: vm.name, href: `/vms/${encodeURIComponent(vm.name)}` };
-      }
-      const op = task.spec.op;
-      // 복원의 대상은 Task가 끝날 때 만들어지는 새 VM이다. 그 전에는 요청한 이름을 보인다.
-      if (op.kind === "backup-restore") {
-        return { name: op.name, href: undefined };
-      }
-      // 가져오기도 같다.
-      if (op.kind === "vm-import") {
-        return { name: op.run.name, href: undefined };
-      }
-      const imp = importById.get(task.spec.target);
-      if (imp) {
-        return { name: imp.name, href: `/imports/${encodeURIComponent(imp.name)}` };
-      }
-      // 노드 업데이트 확인·업그레이드의 대상은 노드다.
-      const name =
-        volumeById.get(task.spec.target)?.name ??
-        backupById.get(task.spec.target)?.name ??
-        nodeById.get(task.spec.target)?.name;
-      // 지워진 대상은 id의 끝(UUIDv7의 무작위 부분)으로 구분한다. 앞부분은 시각이라 서로 비슷하다.
-      return { name: name ?? task.spec.target.slice(-8), href: undefined };
+    const lookup: TargetLookup = {
+      vm: new Map(vms.data?.map((v) => [v.id, v])),
+      volume: new Map(volumes.data?.map((v) => [v.id, v])),
+      backup: new Map(backups.data?.map((b) => [b.id, b])),
+      import: new Map(imports.data?.map((i) => [i.id, i])),
+      node: new Map(nodes.data?.map((n) => [n.id, n])),
     };
+    return (task: Task) => taskTarget(task, lookup);
   }, [vms.data, volumes.data, backups.data, imports.data, nodes.data]);
 }
 

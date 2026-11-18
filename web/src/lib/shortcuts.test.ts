@@ -1,4 +1,4 @@
-import { createSequence, isTyping, keyName, SHORTCUTS } from "@/lib/shortcuts";
+import { createSequence, isTyping, keyLabel, keyName, SHORTCUTS } from "@/lib/shortcuts";
 
 it("finishes a g sequence within a second", () => {
   const seq = createSequence();
@@ -30,6 +30,14 @@ it("runs single keys right away", () => {
   expect(seq.feed("[", 0)).toBe("rail");
   expect(seq.feed("c", 0)).toBe("create");
   expect(seq.feed("v", 0)).toBeNull();
+  // Shift+N(대문자)만 센터를 연다.
+  expect(seq.feed("N", 0)).toBe("center");
+  expect(seq.feed("n", 0)).toBeNull();
+});
+
+it("labels Shift keys", () => {
+  expect(keyLabel("N")).toMatch(/^(⇧N|Shift N)$/);
+  expect(keyLabel("n")).toBe("n");
 });
 
 it("has a single-key shortcut for no power or delete action", () => {
@@ -41,6 +49,7 @@ it("has a single-key shortcut for no power or delete action", () => {
     "create",
     "rail",
     "favorite",
+    "center",
     "list.next",
     "list.prev",
     "list.select",

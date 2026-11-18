@@ -98,9 +98,10 @@ it("names backup tasks by the backup and the VM being restored", async () => {
     ],
   });
   renderPage(<TasksPage />);
+  // 백업 Task는 VM의 백업 탭으로 이어진다.
   expect(await screen.findByRole("link", { name: "Back up web" })).toHaveAttribute(
     "href",
-    "/vms/web",
+    "/vms/web?tab=backups",
   );
   expect(await screen.findByText("Delete backup web-1")).toBeInTheDocument();
   expect(screen.getByText("Restore a backup as web2")).toBeInTheDocument();

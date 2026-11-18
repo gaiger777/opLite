@@ -7,8 +7,8 @@ import { AlertRulesTab } from "@/alerts/AlertRulesTab";
 import { HISTORY_PERIODS, useAlertHistory, useAlerts, type HistoryPeriod } from "@/alerts/alerts";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
+import { StatusChip } from "@/components/StatusChip";
 import { TableMessage } from "@/components/TableMessage";
-import { Badge } from "@/components/ui/badge";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import {
   Table,
@@ -20,6 +20,7 @@ import {
 } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatTime } from "@/lib/format";
+import { alertHref } from "@/tasks/target";
 
 const TABS = ["active", "rules", "history"] as const;
 
@@ -93,7 +94,11 @@ function ActiveAlerts() {
   }
   return (
     <div className="flex flex-col gap-2">
-      <AlertList alerts={alerts.data.alerts} label={t("alerts.tab.active")} />
+      <AlertList
+        alerts={alerts.data.alerts}
+        label={t("alerts.tab.active")}
+        subjectHref={alertHref}
+      />
       <MissingNodes unreachable={alerts.data.unreachable} unsupported={alerts.data.unsupported} />
     </div>
   );
@@ -150,10 +155,10 @@ function NotificationHistory() {
               <TableCell>{r.node}</TableCell>
               <TableCell>
                 {r.ok ? (
-                  <Badge variant="outline">{t("alerts.history.sent")}</Badge>
+                  <StatusChip tone="success">{t("alerts.history.sent")}</StatusChip>
                 ) : (
                   <>
-                    <Badge variant="destructive">{t("alerts.history.failed")}</Badge>
+                    <StatusChip tone="danger">{t("alerts.history.failed")}</StatusChip>
                     {r.error && (
                       <span className="block text-xs text-muted-foreground">{r.error}</span>
                     )}

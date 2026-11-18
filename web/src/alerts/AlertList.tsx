@@ -1,19 +1,15 @@
 import { useTranslation } from "react-i18next";
+import { Link } from "react-router";
 
 import { alertPhase, subjectText, type AlertView } from "@/alerts/alerts";
-import { severityTone, TONE_CHIP, type Severity } from "@/alerts/severity";
+import { severityTone, type Severity } from "@/alerts/severity";
+import { StatusChip } from "@/components/StatusChip";
 import { formatTime } from "@/lib/format";
 
 /** 심각도 칩 */
 export function SeverityBadge({ severity }: { severity: Severity }) {
   const { t } = useTranslation();
-  return (
-    <span
-      className={`inline-flex h-5 w-fit shrink-0 items-center rounded-4xl px-2 text-xs font-medium ${TONE_CHIP[severityTone(severity)]}`}
-    >
-      {t(`alerts.severity.${severity}`)}
-    </span>
-  );
+  return <StatusChip tone={severityTone(severity)}>{t(`alerts.severity.${severity}`)}</StatusChip>;
 }
 
 /** 값 숫자(단위는 규칙에 따라 다르므로 숫자만) */
@@ -29,11 +25,14 @@ export function AlertList({
   alerts,
   compact = false,
   label,
+  subjectHref,
 }: {
   alerts: AlertView[];
   compact?: boolean;
   /** 목록의 접근 이름 */
   label: string;
+  /** 대상의 화면(주면 대상이 링크다) */
+  subjectHref?: (subject: AlertView["subject"]) => string;
 }) {
   const { t, i18n } = useTranslation();
   if (alerts.length === 0) {
@@ -50,7 +49,16 @@ export function AlertList({
           >
             <SeverityBadge severity={alert.severity} />
             <span className="font-medium">{alert.rule_name}</span>
-            <span className="font-mono text-xs">{subjectText(alert.subject)}</span>
+            {subjectHref ? (
+              <Link
+                to={subjectHref(alert.subject)}
+                className="font-mono text-xs underline-offset-4 hover:underline"
+              >
+                {subjectText(alert.subject)}
+              </Link>
+            ) : (
+              <span className="font-mono text-xs">{subjectText(alert.subject)}</span>
+            )}
             <span className="text-xs text-muted-foreground">{t(`alerts.phase.${phase}`)}</span>
             {!compact && alert.value !== undefined && (
               <span className="text-xs tabular-nums">

@@ -5,6 +5,7 @@ import { AlertList } from "@/alerts/AlertList";
 import { useAlerts } from "@/alerts/alerts";
 import { WidgetCard } from "@/dashboard/WidgetCard";
 import { errorMessage } from "@/i18n/errors";
+import { alertHref } from "@/tasks/target";
 
 /** 홈에 보이는 활성 경보 수 */
 const SHOWN = 5;
@@ -24,7 +25,12 @@ export function ActiveAlertsWidget() {
       }
     >
       {alerts.data ? (
-        <AlertList alerts={list.slice(0, SHOWN)} compact label={t("alerts.active")} />
+        <AlertList
+          alerts={list.slice(0, SHOWN)}
+          compact
+          label={t("alerts.active")}
+          subjectHref={alertHref}
+        />
       ) : (
         <p className="text-sm text-muted-foreground">
           {alerts.isError ? errorMessage(t, alerts.error) : t("common.loading")}

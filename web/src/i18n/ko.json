@@ -612,7 +612,8 @@
         "sameNode": "이미 이 노드에 있습니다.",
         "target": "이 노드에서 돌 수 없습니다(꺼짐, 유지보수 또는 다른 아키텍처)."
       }
-    }
+    },
+    "startAgain": "다시 켜기"
   },
   "snapshots": {
     "created": "만든 시각",
@@ -2977,6 +2978,7 @@
     "create": "만들기 메뉴",
     "rail": "사이드바 접기·펴기",
     "favorite": "이 리소스 즐겨찾기",
+    "center": "작업·알림 센터",
     "go": {
       "home": "홈",
       "vms": "가상 머신",
@@ -3020,5 +3022,22 @@
     "vmsUsing": "쓰는 VM: {{count}}개",
     "volumes": "안의 볼륨: {{count}}개",
     "backups": "안의 백업: {{count}}개"
+  },
+  "center": {
+    "title": "작업·알림",
+    "description": "도는 작업과 최근 작업, 활성 경보입니다.",
+    "openCount": "작업·알림 ({{n}}개 진행·경보)",
+    "running": "진행 중 ({{n}})",
+    "recent": "최근",
+    "alerts": "경보 ({{n}}개 울림)",
+    "noRunning": "도는 작업이 없습니다.",
+    "noRecent": "끝난 작업이 아직 없습니다.",
+    "allTasks": "모든 작업 보기",
+    "retry": "다시 하기",
+    "runJobAgain": "작업 다시 실행",
+    "retryNamed": "다시 하기: {{label}}",
+    "jobRunning": "백업 작업이 도는 중입니다.",
+    "jobDisabled": "백업 작업이 꺼져 있습니다.",
+    "view": "보기"
   }
 }

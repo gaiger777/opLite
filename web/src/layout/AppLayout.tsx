@@ -27,15 +27,17 @@ import { AreaTabs, ViewSwitch } from "@/layout/AreaTabs";
 import { Breadcrumbs } from "@/layout/Breadcrumbs";
 import { ClusterSwitch, CreateMenu, SearchButton } from "@/layout/HeaderTools";
 import { AREAS, crumbsOf, isFullWidth, lastTab, rememberTab } from "@/layout/nav";
+import { NotificationBell } from "@/layout/NotificationBell";
 import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
 import { AreaLinks, Sidebar, useRail } from "@/layout/Sidebar";
 import { type Density, useDensity } from "@/lib/density";
 import { type ShortcutId, useShortcuts } from "@/lib/shortcuts";
 import { type Theme, useTheme } from "@/lib/theme";
 import { CommandPalette } from "@/palette/CommandPalette";
+import { setCenterOpen } from "@/tasks/center";
 
 /**
- * 앱의 틀: 왼쪽 영역 사이드바(설계 §4), 머리줄(☰·이동 경로·검색·+ 만들기·클러스터 전환·실시간·사용자 메뉴), 본문 위
+ * 앱의 틀: 왼쪽 영역 사이드바(설계 §4), 머리줄(☰·이동 경로·검색·+ 만들기·클러스터 전환·종·실시간·사용자 메뉴), 본문 위
  * 영역 탭과 보기 전환, ⌘K 팔레트와 단축키(§5.2·§5.7). 경로가 바뀌면 그 영역의 마지막 탭을 기억하고 본문 제목으로
  * 포커스를 옮긴다.
  */
@@ -73,6 +75,7 @@ export function AppLayout() {
       create: () => setCreating(true),
       search: () => main.current?.querySelector<HTMLElement>("[data-list-search]")?.focus(),
       favorite: () => main.current?.querySelector<HTMLElement>("[data-pin-toggle]")?.click(),
+      center: () => setCenterOpen(true),
     },
     !full,
   );
@@ -119,6 +122,7 @@ export function AppLayout() {
             <SearchButton onOpen={openPalette} />
             <CreateMenu open={creating} onOpenChange={setCreating} />
             <ClusterSwitch />
+            <NotificationBell />
             <LiveBadge />
             <UserMenu onHelp={() => setHelp(true)} />
           </div>

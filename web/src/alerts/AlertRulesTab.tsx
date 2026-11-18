@@ -32,8 +32,8 @@ import { can } from "@/auth/permissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
+import { StatusChip } from "@/components/StatusChip";
 import { TableMessage } from "@/components/TableMessage";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
@@ -138,9 +138,9 @@ export function AlertRulesTab() {
               </TableCell>
               <TableCell>{rule.spec.targets.join(", ")}</TableCell>
               <TableCell>
-                <Badge variant={rule.spec.enabled ? "default" : "outline"}>
+                <StatusChip tone={rule.spec.enabled ? "success" : "neutral"}>
                   {t(rule.spec.enabled ? "alerts.rules.on" : "alerts.rules.off")}
-                </Badge>
+                </StatusChip>
               </TableCell>
               {admin && (
                 <TableCell className="text-right whitespace-nowrap">
