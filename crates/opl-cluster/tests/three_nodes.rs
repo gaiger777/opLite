@@ -2,7 +2,7 @@
 
 mod common;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -535,4 +535,101 @@ async fn read_index_confirms_with_the_leader() {
             .await
             .is_err()
     );
+}
+
+/// 폴더 할당량은 Raft 안에서 확인한다(계획 62 설계 §9·§14): 두 팔로워(다른 API 노드)가 같은 폴더에 동시에 VM을
+/// 만들어도 합이 상한을 넘지 않고, 진 쪽은 `QuotaExceeded`다. 넘은 폴더에서도 노드·전원 바꾸기는 막히지 않는다.
+#[tokio::test]
+async fn concurrent_creates_on_two_nodes_keep_the_folder_quota() {
+    use opl_types::folder::{Folder, FolderKind, FolderQuota, FolderSpec};
+    use opl_types::quota::QuotaDimension;
+    use opl_types::resource::Resource;
+    use opl_types::vm::{Vm, VmSpec};
+
+    const LIMIT: u64 = 20;
+    const TRIES: usize = 50;
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let followers: Vec<NodeId> = tc
+        .nodes
+        .keys()
+        .copied()
+        .filter(|id| *id != leader)
+        .collect();
+    let mut team: Folder = Resource::new(
+        "",
+        FolderSpec {
+            name: "team".into(),
+            kind: FolderKind::Vm,
+            parent: None,
+            quota: Some(FolderQuota {
+                vms: Some(LIMIT),
+                ..FolderQuota::default()
+            }),
+        },
+    );
+    team.name = team.id.to_string();
+    tc.get(leader).create(&team).await.unwrap();
+    let vm = |name: String| -> Vm {
+        let spec = serde_json::json!({
+            "cpu": {"sockets": 1, "cores": 1}, "memory_mib": 256, "machine": "virt",
+            "folder": team.id,
+        });
+        Resource::new(name, serde_json::from_value(spec).unwrap())
+    };
+    let tries = followers
+        .iter()
+        .flat_map(|f| (0..TRIES).map(move |i| (*f, format!("vm-{f}-{i}"))));
+    let results = futures_util::future::join_all(tries.map(|(f, name)| {
+        let c = tc.get(f);
+        let vm = vm(name);
+        async move { c.create(&vm).await }
+    }))
+    .await;
+    let ok = results.iter().filter(|r| r.is_ok()).count() as u64;
+    let refused = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Err(ClusterError::Rejected(Rejection::QuotaExceeded {
+                    dimension: QuotaDimension::Vms,
+                    limit: LIMIT,
+                    ..
+                }))
+            )
+        })
+        .count();
+    assert_eq!(ok, LIMIT, "{results:?}");
+    assert_eq!(refused, 2 * TRIES - LIMIT as usize);
+    let last = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .max()
+        .copied();
+    for id in tc.nodes.keys().copied().collect::<Vec<_>>() {
+        tc.wait_applied(id, last.unwrap()).await;
+        let (_, vms) = tc.get(id).list::<VmSpec>().unwrap();
+        assert_eq!(vms.len() as u64, LIMIT, "node {id}");
+    }
+    // 상한을 줄여 넘은 폴더에서도 노드 바꾸기·끄기(HA·마이그레이션)는 받는다.
+    let lower = FolderSpec {
+        quota: Some(FolderQuota {
+            vms: Some(1),
+            ..FolderQuota::default()
+        }),
+        ..team.spec.clone()
+    };
+    tc.get(followers[0])
+        .update_spec(team.id, None, BTreeMap::new(), &lower)
+        .await
+        .unwrap();
+    let (_, vms) = tc.get(followers[1]).list::<VmSpec>().unwrap();
+    let mut spec = vms[0].spec.clone();
+    spec.node = Some(uuid::Uuid::from_u128(5));
+    spec.power = opl_types::vm::PowerState::Stopped;
+    tc.get(followers[1])
+        .update_spec(vms[0].id, None, BTreeMap::new(), &spec)
+        .await
+        .unwrap();
 }

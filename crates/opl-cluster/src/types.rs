@@ -4,6 +4,7 @@ use std::io::Cursor;
 
 use opl_types::ha_check::CheckReport;
 use opl_types::placement::LoadSummary;
+use opl_types::quota::QuotaDimension;
 use opl_types::resource::{Kind, Resource};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -98,6 +99,15 @@ pub enum Rejection {
     /// 자식 폴더나 그 폴더에 든 리소스가 있는 폴더는 지우거나 종류를 바꿀 수 없다.
     #[error("folder {id} is not empty")]
     FolderNotEmpty { id: Uuid },
+    /// 폴더 할당량을 넘는다(계획 62 설계 §9): 쓰기 뒤 하위 트리 사용량 `used`가 상한 `limit`을 넘고 쓰기 전보다
+    /// 늘었다. 할당량이 걸린 폴더가 있을 때만 나온다.
+    #[error("folder {folder} would use {used} of {limit} {}", dimension.unit())]
+    QuotaExceeded {
+        folder: Uuid,
+        dimension: QuotaDimension,
+        limit: u64,
+        used: u64,
+    },
 }
 
 /// 리더가 처리하는 요청. 팔로워는 받은 쓰기와 멤버십 변경을 이것으로 리더에 전달한다.
@@ -471,6 +481,16 @@ mod tests {
             (
                 Rejection::FolderNotEmpty { id },
                 json!({"reason": "folder-not-empty", "id": id}),
+            ),
+            (
+                Rejection::QuotaExceeded {
+                    folder: id,
+                    dimension: QuotaDimension::MemoryMib,
+                    limit: 1024,
+                    used: 2048,
+                },
+                json!({"reason": "quota-exceeded", "folder": id, "dimension": "memory_mib",
+                       "limit": 1024, "used": 2048}),
             ),
         ] {
             let value = serde_json::to_value(&r).unwrap();

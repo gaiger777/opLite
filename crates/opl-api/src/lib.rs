@@ -48,6 +48,7 @@ mod placement_rules;
 pub mod power_fence;
 mod prometheus;
 pub mod proxy;
+mod quota;
 pub mod realms;
 pub mod remote_client;
 mod remote_proxy;
@@ -336,6 +337,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             folders::delete_folder
         ))
         .routes(routes!(folders::move_members))
+        .routes(routes!(quota::folder_usage))
         .routes(routes!(
             permissions::list_access_roles,
             permissions::create_access_role

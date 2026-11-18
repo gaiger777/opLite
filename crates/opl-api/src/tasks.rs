@@ -1366,6 +1366,16 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
             volume.name, vm.name
         ));
     }
+    // 저장소를 늘리기 전에 폴더 할당량을 다시 본다(요청 뒤 다른 노드가 몫을 썼을 수 있다). 늘린 뒤 크기 기록이
+    // 할당량에 막히면 디스크만 커진 채로 남는다.
+    crate::quota::precheck(
+        &ctx.cluster,
+        crate::quota::Change::Volume {
+            name: &volume.name,
+            size: size_bytes,
+        },
+    )
+    .map_err(|e| e.message)?;
     let user = vms.iter().find_map(|vm| {
         let disk = vm.spec.disks.iter().position(|d| d.volume == volume.name)?;
         Some((vm, disk))

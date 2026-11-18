@@ -788,6 +788,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/folders/{id}/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 폴더의 하위 트리 사용량(vCPU·메모리·붙은 디스크·VM 수)과 그 폴더·조상의 할당량, 차원마다 묶는 폴더. 볼 수 없는
+         *     조상의 할당량도 보인다(그 상한이 이 폴더의 쓰기를 막으므로).
+         */
+        get: operations["folder_usage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/grants": {
         parameters: {
             query?: never;
@@ -4492,6 +4512,31 @@ export interface components {
             quota?: components["schemas"]["FolderQuota"];
         };
         FolderStatus: Record<string, never>;
+        /** @description 폴더 하위 트리의 사용량(할당 기준, 전원과 무관). 할당량과 같은 네 칸이다. */
+        FolderUsage: {
+            /** Format: int64 */
+            disk_bytes: number;
+            /** Format: int64 */
+            memory_mib: number;
+            /** Format: int64 */
+            vcpus: number;
+            /** Format: int64 */
+            vms: number;
+        };
+        /** @description 폴더의 사용량과 그 폴더를 묶는 할당량 */
+        FolderUsageView: {
+            /** @description 차원마다 남은 몫이 가장 적은(묶는) 폴더. 상한이 없는 차원은 없다. */
+            binding: {
+                [key: string]: string;
+            };
+            /** Format: uuid */
+            folder: string;
+            /** @description 이 폴더와 조상 가운데 할당량이 있는 폴더(가까운 것부터). 쓰기는 이 모두를 지켜야 한다. */
+            limits: components["schemas"]["QuotaLimit"][];
+            path: string;
+            /** @description 하위 트리 사용량(할당 기준, 전원과 무관). 템플릿은 디스크만 센다. */
+            usage: components["schemas"]["FolderUsage"];
+        };
         /** @description 권한 하나(`Kind::Grant`): 주체에게 대상에서 역할을 준다. */
         GrantSpec: {
             principal: components["schemas"]["PrincipalRef"];
@@ -7253,6 +7298,15 @@ export interface components {
         };
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
+        /** @description 할당량 있는 폴더 하나의 상한과 하위 트리 사용량 */
+        QuotaLimit: {
+            /** Format: uuid */
+            folder: string;
+            /** @description `/teamA/prod` */
+            path: string;
+            quota: components["schemas"]["FolderQuota"];
+            usage: components["schemas"]["FolderUsage"];
+        };
         /** @description 영역이 사용자를 확인하는 방법 */
         RealmBackend: (components["schemas"]["LdapRealm"] & {
             /** @enum {string} */
@@ -11816,6 +11870,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MoveMembersResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    folder_usage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description folder id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FolderUsageView"];
                 };
             };
             "4XX": {

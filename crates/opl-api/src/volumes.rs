@@ -932,6 +932,14 @@ pub async fn resize_volume(
         }
         check_not_busy(&state, vm)?;
     }
+    // 붙은 VM의 폴더 할당량(디스크)
+    crate::quota::precheck(
+        &state.cluster,
+        crate::quota::Change::Volume {
+            name: &volume.name,
+            size: req.size_bytes,
+        },
+    )?;
     let node = match user.and_then(|vm| vm_placement(&state.cluster, Some(state.node), vm)) {
         Some(node) => node,
         None => volume_node(&state, &volume)?,

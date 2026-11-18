@@ -265,6 +265,16 @@ pub async fn patch_folder(
     if spec == folder.spec {
         return Ok(Json(folder));
     }
+    // 하위 트리를 할당량 있는 폴더 아래로 옮기면 그 사용량이 더해진다.
+    if spec.parent != folder.spec.parent {
+        crate::quota::precheck(
+            &state.cluster,
+            crate::quota::Change::Folder {
+                id: folder.id,
+                parent: spec.parent,
+            },
+        )?;
+    }
     spec.validate(folder.id)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     state
@@ -361,7 +371,7 @@ async fn move_one(
     }
     let to = dest.map(|f| f.id);
     macro_rules! move_resource {
-        ($spec:ty) => {{
+        ($spec:ty, $check:expr) => {{
             for _ in 0..10 {
                 let r = lookup::<$spec>(&state.cluster, &item.key)?;
                 state
@@ -372,6 +382,7 @@ async fn move_one(
                 }
                 let mut spec = r.spec.clone();
                 spec.folder = to;
+                $check(&r, &spec)?;
                 match state
                     .cluster
                     .update_spec(r.id, Some(r.revision), r.labels.clone(), &spec)
@@ -396,10 +407,22 @@ async fn move_one(
         Kind::Vm => {
             // VM 스펙 쓰기와 엇갈리지 않게 한다(이 노드의 검사·쓰기 잠금).
             let _lock = state.vm_lock.lock().await;
-            move_resource!(VmSpec)
+            // 할당량 있는 폴더로 옮기면 그 VM의 몫이 더해진다.
+            move_resource!(VmSpec, |r: &opl_types::vm::Vm, spec: &VmSpec| {
+                crate::quota::precheck_vm(&state.cluster, Some((r.id, &r.spec)), spec)
+            })
         }
-        Kind::Network => move_resource!(NetworkSpec),
-        Kind::StoragePool => move_resource!(StoragePoolSpec),
+        Kind::Network => {
+            move_resource!(NetworkSpec, |_: &_, _: &NetworkSpec| Ok::<_, ApiError>(()))
+        }
+        Kind::StoragePool => {
+            move_resource!(StoragePoolSpec, |_: &_, _: &StoragePoolSpec| Ok::<
+                _,
+                ApiError,
+            >(
+                ()
+            ))
+        }
         _ => unreachable!("FolderKind::of"),
     }
 }

@@ -134,6 +134,12 @@ impl From<ClusterError> for ApiError {
                     Rejection::FolderNotEmpty { .. } => {
                         ApiError::conflict("folder_not_empty", message)
                     }
+                    Rejection::QuotaExceeded {
+                        folder,
+                        dimension,
+                        limit,
+                        used,
+                    } => crate::quota::exceeded(folder, dimension, limit, used, message),
                 }
             }
             ClusterError::Timeout | ClusterError::Unreachable(_) => ApiError::new(
@@ -246,6 +252,20 @@ mod tests {
             assert_eq!(e.status, StatusCode::CONFLICT);
             assert_eq!(e.code, code);
         }
+        // 할당량은 409 `quota_exceeded`이고 `details`에 폴더·차원·상한·사용량을 싣는다.
+        let e = ApiError::from(ClusterError::Rejected(Rejection::QuotaExceeded {
+            folder: id,
+            dimension: opl_types::quota::QuotaDimension::Vcpus,
+            limit: 32,
+            used: 34,
+        }));
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.code, "quota_exceeded");
+        assert_eq!(e.message, format!("folder {id} would use 34 of 32 vCPUs"));
+        assert_eq!(
+            e.details,
+            Some(serde_json::json!({"folder": id, "dimension": "vcpus", "limit": 32, "used": 34}))
+        );
         // 형제 이름 겹침은 이름 겹침과 같다.
         let e = ApiError::from(ClusterError::Rejected(Rejection::InUse {
             kind: opl_types::resource::Kind::Folder,

@@ -1038,6 +1038,20 @@ pub async fn run_import(
     state
         .authz
         .require_in_folder(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
+    // 폴더 할당량: 만들 VM과 원본 디스크 크기
+    let bytes = src
+        .disks
+        .iter()
+        .fold(0u64, |sum, d| sum.saturating_add(d.capacity_bytes));
+    crate::quota::precheck(
+        &state.cluster,
+        crate::quota::Change::Vm {
+            replaces: None,
+            folder: spec.folder,
+            usage: opl_types::folder::FolderUsage::of_vm(&spec, bytes),
+            count: 1,
+        },
+    )?;
     state
         .authz
         .require_networks(&principal, spec.nics.iter().map(|n| n.network.as_str()))?;

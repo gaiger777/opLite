@@ -976,6 +976,28 @@ pub async fn clone_vm(
             }
         }
     }
+    // 폴더 할당량: 새 VM은 템플릿이 아니고 디스크는 원본 크기(배포가 늘리면 그 크기, 연결 복제도 가상 크기)다.
+    let grown = overrides
+        .as_ref()
+        .map(|o| o.disks.clone())
+        .unwrap_or_default();
+    let bytes = disks.iter().enumerate().fold(0u64, |sum, (i, (v, _))| {
+        let size = grown.get(i).copied().flatten().unwrap_or(0);
+        sum.saturating_add(size.max(v.spec.size_bytes))
+    });
+    let new_vm = VmSpec {
+        template: false,
+        ..spec.clone()
+    };
+    crate::quota::precheck(
+        &state.cluster,
+        crate::quota::Change::Vm {
+            replaces: None,
+            folder: spec.folder,
+            usage: opl_types::folder::FolderUsage::of_vm(&new_vm, bytes),
+            count: 1,
+        },
+    )?;
     let how = match (vm.spec.template && snapshot.is_none(), req.linked) {
         (true, Some(false)) => " (full)",
         (true, _) => " (linked)",

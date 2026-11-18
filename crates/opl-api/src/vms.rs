@@ -886,6 +886,7 @@ pub async fn create_vm(
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, req.spec.folder)?;
     check_attachments(&state, &principal, &req.spec, None)?;
+    crate::quota::precheck_vm(&state.cluster, None, &req.spec)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
     // 부하는 잠그기 전에 읽는다(리더가 아니면 리더에 물을 수 있다). 켜진 채 노드 없이 만들 때만 노드를 고른다.
@@ -1071,6 +1072,8 @@ async fn write_spec(
                 ),
             ));
         }
+        // 폴더 할당량(핫플러그·CPU·메모리·디스크 붙이기, 템플릿 되돌리기)
+        crate::quota::precheck_vm(&state.cluster, Some((current.id, &current.spec)), &spec)?;
         match state
             .cluster
             .update_spec(current.id, Some(current.revision), labels, &spec)

@@ -596,6 +596,21 @@ pub async fn restore_backup(
         &principal,
         backup.spec.vm_spec.nics.iter().map(|n| n.network.as_str()),
     )?;
+    // 폴더 할당량: 되살릴 VM과 디스크(백업한 가상 크기)
+    let bytes = backup
+        .status
+        .disks
+        .iter()
+        .fold(0u64, |sum, d| sum.saturating_add(d.virtual_bytes));
+    crate::quota::precheck(
+        &state.cluster,
+        crate::quota::Change::Vm {
+            replaces: None,
+            folder,
+            usage: opl_types::folder::FolderUsage::of_vm(&backup.spec.vm_spec, bytes),
+            count: 1,
+        },
+    )?;
     // 이름이 그새 쓰이면 Task가 VM을 만들 때 실패한다.
     if state.cluster.get_by_name::<VmSpec>(&req.name)?.is_some() {
         return Err(ApiError::conflict(

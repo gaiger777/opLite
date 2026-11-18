@@ -346,10 +346,31 @@ pub(crate) fn apply_command(
                     name: resource.name,
                 }));
             }
-            if let Err(r) = check_exclusive(objects, kind, resource.id, &resource.spec)? {
+            let mut quota = folders::quota_check(
+                objects,
+                names,
+                kind,
+                resource.id,
+                &resource.name,
+                &resource.spec,
+                None,
+            )?;
+            if let Err(r) = check_exclusive(
+                objects,
+                names,
+                kind,
+                resource.id,
+                &resource.spec,
+                quota.as_mut(),
+            )? {
                 return Ok(Err(r));
             }
             if let Err(r) = folders::check_write(objects, kind, resource.id, &resource.spec, None)?
+            {
+                return Ok(Err(r));
+            }
+            if let Some(quota) = quota
+                && let Err(r) = quota.finish(objects, names)?
             {
                 return Ok(Err(r));
             }
@@ -373,10 +394,24 @@ pub(crate) fn apply_command(
             if let Err(r) = check(expected_revision, resource.revision) {
                 return Ok(Err(r));
             }
-            if let Err(r) = check_exclusive(objects, kind, id, &spec)? {
+            let mut quota = folders::quota_check(
+                objects,
+                names,
+                kind,
+                id,
+                &resource.name,
+                &spec,
+                Some(&resource.spec),
+            )?;
+            if let Err(r) = check_exclusive(objects, names, kind, id, &spec, quota.as_mut())? {
                 return Ok(Err(r));
             }
             if let Err(r) = folders::check_write(objects, kind, id, &spec, Some(&resource.spec))? {
+                return Ok(Err(r));
+            }
+            if let Some(quota) = quota
+                && let Err(r) = quota.finish(objects, names)?
+            {
                 return Ok(Err(r));
             }
             resource.labels = labels;
@@ -438,15 +473,21 @@ pub(crate) fn apply_command(
     Ok(Ok(WatchEvent::Put { kind, resource }))
 }
 
-/// `spec`의 독점 값이 같은 종류의 다른 리소스나 같은 spec 안에서 겹치면 거부한다.
+/// `spec`의 독점 값이 같은 종류의 다른 리소스나 같은 spec 안에서 겹치면 거부한다. VM 쓰기의 할당량 검사(`quota`)가
+/// 있으면 같은 VM 훑기에서 사용량도 센다(설계 §9: VM을 한 번만 푼다).
 fn check_exclusive(
     objects: &Table<(&'static str, u128), &'static [u8]>,
+    names: &Table<(&'static str, &'static str), u128>,
     kind: Kind,
     id: Uuid,
     spec: &serde_json::Value,
+    mut quota: Option<&mut folders::QuotaCheck>,
 ) -> Result<Result<(), Rejection>, StoreError> {
     let wanted = exclusive_values(kind, spec);
-    if wanted.is_empty() {
+    if kind != Kind::Vm {
+        quota = None;
+    }
+    if wanted.is_empty() && quota.is_none() {
         return Ok(Ok(()));
     }
     let in_use = |field: &str, value: &str, holder: Uuid| Rejection::InUse {
@@ -467,11 +508,17 @@ fn check_exclusive(
             continue;
         }
         let other_spec: RawResource = serde_json::from_slice(v.value())?;
+        if let Some(q) = quota.as_deref_mut() {
+            q.add(objects, names, other, &other_spec.spec)?;
+        }
         for (field, value) in exclusive_values(kind, &other_spec.spec) {
             if wanted.iter().any(|(f, v)| *f == field && *v == value) {
                 return Ok(Err(in_use(field, &value, other)));
             }
         }
+    }
+    if let Some(q) = quota {
+        q.scanned = true;
     }
     Ok(Ok(()))
 }

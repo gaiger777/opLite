@@ -326,6 +326,7 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
         "/folders/{id}/members",
         Object(Folder, InventoryMove),
     ),
+    ("GET", "/folders/{id}/usage", Read(Folder)),
     // 역할·그룹·grant·유효 권한(계획 62)
     ("GET", "/access-roles", Handler),
     ("POST", "/access-roles", Root(ClusterAdmin)),
