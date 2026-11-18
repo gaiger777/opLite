@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/table";
 import { DownloadDialog } from "@/isos/DownloadDialog";
 import { isoVolumes, usedBy } from "@/isos/isos";
+import { useCreateParam } from "@/lib/createParam";
 import { formatBytes } from "@/lib/format";
 import { isShared } from "@/storage/pools";
 import { UploadDialog } from "@/storage/UploadDialog";
@@ -45,6 +46,7 @@ export function IsosPage() {
   const [downloading, setDownloading] = useState(false);
   const [deleting, setDeleting] = useState<Volume | null>(null);
   const write = can(me.role, "write", "volume");
+  useCreateParam(() => setUploading(true), write);
   const reasonBase = useId();
   // 풀 이름, 이름 순
   const isos = useMemo(

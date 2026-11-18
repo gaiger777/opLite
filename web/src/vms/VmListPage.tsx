@@ -194,6 +194,7 @@ export function VmListPage() {
         <h1 className="text-xl font-semibold">{t("nav.vms")}</h1>
         <div className="flex items-center gap-2">
           <Input
+            data-list-search=""
             className="w-48"
             placeholder={t("vms.search")}
             aria-label={t("vms.search")}

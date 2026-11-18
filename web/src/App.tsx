@@ -52,6 +52,7 @@ import { TemplatesPage } from "@/templates/TemplatesPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
 import { ConsolePage } from "@/vms/ConsolePage";
 import { VmDetailPage } from "@/vms/VmDetailPage";
+import { VmActionHost } from "@/vms/VmActionHost";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
 import { VmListPage } from "@/vms/VmListPage";
 
@@ -66,7 +67,9 @@ export const appRoutes: RouteObject[] = [
           <LiveProvider>
             <TaskIndexProvider>
               <TaskToasts />
-              <AppLayout />
+              <VmActionHost>
+                <AppLayout />
+              </VmActionHost>
             </TaskIndexProvider>
           </LiveProvider>
         ),

@@ -23,6 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { useCreateParam } from "@/lib/createParam";
 import { validName } from "@/vms/form";
 
 /** QEMU user 모드 NAT. 서버가 이 이름을 예약해 둔다. */
@@ -72,6 +73,7 @@ export function NetworksPage() {
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<Network | null>(null);
   const write = can(me.role, "write", "network");
+  useCreateParam(() => setCreating(true), write);
   // VM 목록을 다 읽기 전에는 모른다(undefined).
   const users = (network: Network) =>
     vms.isSuccess

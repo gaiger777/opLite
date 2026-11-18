@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import type { Node } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
+import { PinButton, useVisit } from "@/components/PinButton";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -31,6 +32,7 @@ export function NodeHeader({ node }: { node: Node }) {
   const [open, setOpen] = useState<Dialog | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const close = () => setOpen(null);
+  useVisit({ kind: "node", id: node.id, name: node.name });
   const items: { id: Dialog; label: string }[] = [
     ...(node.status.updates ? [{ id: "updates" as const, label: t("nodes.updates.menu") }] : []),
     ...(!node.spec.witness
@@ -47,6 +49,7 @@ export function NodeHeader({ node }: { node: Node }) {
     <div className="flex flex-wrap items-center justify-between gap-2">
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-xl font-semibold">{node.name}</h1>
+        <PinButton resource={{ kind: "node", id: node.id, name: node.name }} />
         <Badge variant={node.status.online ? "default" : "destructive"}>
           {t(node.status.online ? "dashboard.nodeOnline" : "dashboard.nodeOffline")}
         </Badge>

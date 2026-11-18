@@ -74,14 +74,19 @@ export function AreaLinks({ rail = false, onNavigate }: { rail?: boolean; onNavi
   );
 }
 
-/** 768px 이상에서 보이는 왼쪽 사이드바. 펼치면 224px, 접으면 56px 아이콘 레일이다. */
-export function Sidebar() {
-  const { t } = useTranslation();
+/** 레일 접기 상태. 머리줄 단축키 `[`와 사이드바 단추가 함께 쓴다. */
+export function useRail() {
   const [rail, setRail] = useState(readRail);
   const toggle = () => {
     writePref(RAIL_PREF, rail ? "0" : "1");
     setRail(!rail);
   };
+  return { rail, toggle };
+}
+
+/** 768px 이상에서 보이는 왼쪽 사이드바. 펼치면 224px, 접으면 56px 아이콘 레일이다. */
+export function Sidebar({ rail, onToggle: toggle }: { rail: boolean; onToggle(): void }) {
+  const { t } = useTranslation();
   const Chevron = rail ? ChevronsRight : ChevronsLeft;
   return (
     <aside
@@ -112,6 +117,7 @@ export function Sidebar() {
           variant="ghost"
           size="icon-sm"
           aria-label={rail ? t("nav.expand") : t("nav.collapse")}
+          aria-keyshortcuts="["
           onClick={toggle}
         >
           <Chevron />

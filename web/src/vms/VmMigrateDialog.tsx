@@ -64,10 +64,13 @@ export function localDisks(
 /** 실행 중인 VM의 라이브 마이그레이션 대화상자. 열 때만 그린다. */
 export function VmMigrateDialog({
   vm,
+  initialNode,
   onClose,
   returnFocus,
 }: {
   vm: Vm;
+  /** 미리 고를 노드 id(팔레트의 `migrate web to node2`). 후보가 아니면 첫 후보다. */
+  initialNode?: string;
   onClose(): void;
   returnFocus?: RefObject<HTMLElement | null>;
 }) {
@@ -82,7 +85,7 @@ export function VmMigrateDialog({
   const snapshots = useList("snapshot");
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const targets = migrationTargets(vm, nodes.data ?? []);
-  const [chosen, setChosen] = useState<string | null>(null);
+  const [chosen, setChosen] = useState<string | null>(initialNode ?? null);
   // 고르지 않았거나 고른 노드가 후보에서 빠졌으면 첫 후보
   const target = targets.find((n) => n.id === chosen) ?? targets[0];
   // 대화상자를 연 사이 VM이 멈추거나 옮기기 시작했을 수 있다.

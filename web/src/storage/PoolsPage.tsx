@@ -30,6 +30,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { codeMessage, errorMessage } from "@/i18n/errors";
+import { useCreateParam } from "@/lib/createParam";
 import { formatBytes } from "@/lib/format";
 import {
   cephNameError,
@@ -64,6 +65,7 @@ export function PoolsPage() {
   const [sharing, setSharing] = useState<{ pool: StoragePool; shared: boolean } | null>(null);
   const [sharingOpen, setSharingOpen] = useState(false);
   const write = can(me.role, "write", "storage-pool");
+  useCreateParam(() => setCreating(true), write);
 
   const nodeList = useMemo(() => nodes.data ?? [], [nodes.data]);
   // 볼륨 목록을 다 읽기 전에는 모른다(undefined).

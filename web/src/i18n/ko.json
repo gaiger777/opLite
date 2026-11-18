@@ -568,7 +568,11 @@
         "password": "1~256바이트로 쓰세요.",
         "again": "두 비밀번호가 다릅니다."
       }
-    }
+    },
+    "stopTitle": "{{name}}을(를) 정지할까요?",
+    "stopDescription": "게스트 OS에 종료를 요청합니다.",
+    "rebootTitle": "{{name}}을(를) 재시작할까요?",
+    "rebootDescription": "게스트 OS에 재시작을 요청합니다."
   },
   "snapshots": {
     "created": "만든 시각",
@@ -1606,7 +1610,10 @@
     "issuedDescription": "{{time}} 전에 새 노드에서 실행하세요. 다시 볼 수 없습니다.",
     "command": "명령",
     "copyCommand": "명령 복사",
-    "commandNote": "새 노드의 orbivisord가 /run/opl/opld.sock을 쓰지 않으면 --socket을 붙이세요."
+    "commandNote": "새 노드의 orbivisord가 /run/opl/opld.sock을 쓰지 않으면 --socket을 붙이세요.",
+    "switch": "클러스터 전환(지금 {{name}})",
+    "thisCluster": "이 클러스터",
+    "noRemotes": "원격 클러스터가 없습니다."
   },
   "remotes": {
     "pageHint": "이 클러스터가 보는 다른 Orbivisor 클러스터입니다. 상태는 30초마다 모읍니다. 원격 클러스터에서 할 수 있는 일은 그곳 API 토큰 주인의 역할로도 정해집니다.",
@@ -2858,5 +2865,84 @@
   },
   "empty": {
     "docs": "안내서 읽기"
+  },
+  "favorites": {
+    "toggle": "{{name}} 즐겨찾기"
+  },
+  "create": {
+    "menu": "새로 만들기",
+    "vm": "가상 머신",
+    "import": "VM 가져오기",
+    "pool": "스토리지 풀",
+    "network": "네트워크",
+    "backup-job": "백업 작업",
+    "iso": "ISO 올리기"
+  },
+  "palette": {
+    "open": "검색 또는 명령",
+    "title": "명령 팔레트",
+    "placeholder": "검색 또는 명령…",
+    "results": "결과",
+    "empty": "맞는 것이 없습니다.",
+    "group": {
+      "favorites": "즐겨찾기",
+      "recent": "최근",
+      "actions": "동작",
+      "vms": "가상 머신",
+      "nodes": "노드",
+      "pools": "스토리지 풀",
+      "volumes": "볼륨",
+      "networks": "네트워크",
+      "securityGroups": "보안 그룹",
+      "backupJobs": "백업 작업",
+      "haGroups": "HA 그룹",
+      "navigation": "이동",
+      "commands": "명령"
+    },
+    "hint": {
+      "select": "고르기",
+      "run": "실행",
+      "newTab": "새 탭",
+      "actions": "동작 보기"
+    },
+    "verb": {
+      "start": "{{name}} 시작",
+      "stop": "{{name}} 정지",
+      "reboot": "{{name}} 재시작",
+      "force-stop": "{{name}} 강제 정지",
+      "migrate": "{{name}} 옮기기",
+      "migrateTo": "{{name}}을(를) {{node}}(으)로 옮기기",
+      "snapshot": "{{name}} 스냅샷 만들기",
+      "console": "{{name}} 콘솔 열기",
+      "open": "{{name}} 열기"
+    },
+    "noNode": "{{node}} 노드가 없습니다",
+    "notTarget": "{{node}}(으)로 옮길 수 없습니다",
+    "create": "만들기: {{what}}",
+    "theme": "테마: {{theme}}",
+    "density": "밀도: {{density}}"
+  },
+  "shortcuts": {
+    "title": "단축키",
+    "description": "한 글자 키는 입력 칸과 대화상자 밖에서만 받습니다. 콘솔은 모든 키를 게스트에 보냅니다.",
+    "then": "다음",
+    "group": {
+      "general": "일반",
+      "navigation": "이동"
+    },
+    "palette": "명령 팔레트",
+    "help": "이 도움말",
+    "search": "목록 검색",
+    "create": "만들기 메뉴",
+    "rail": "사이드바 접기·펴기",
+    "favorite": "이 리소스 즐겨찾기",
+    "go": {
+      "home": "홈",
+      "vms": "가상 머신",
+      "infra": "인프라",
+      "protect": "보호",
+      "activity": "활동",
+      "settings": "설정"
+    }
   }
 }

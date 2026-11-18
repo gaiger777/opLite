@@ -359,6 +359,42 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   );
 }
 
+/**
+ * 스냅샷 탭 밖(팔레트)에서 여는 스냅샷 만들기. 이미 쓴 이름과 디스크의 스냅샷 방식은 목록에서 셈한다. 만들 수 없는
+ * 디스크·복제 VM이면 서버가 거절하고 대화상자가 그 까닭을 보인다.
+ */
+export function VmSnapshotDialog({
+  vm,
+  returnFocus,
+  onClose,
+}: {
+  vm: Vm;
+  returnFocus?: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
+  const snapshots = useList("snapshot");
+  const volumes = useList("volume");
+  const pools = useList("storage-pool");
+  const support =
+    volumes.data && pools.data
+      ? snapshotSupport(
+          (vm.spec.disks ?? []).flatMap((d) => {
+            const volume = volumes.data.find((v) => v.name === d.volume);
+            return volume ? [volumeDisk(volume, pools.data)] : [];
+          }),
+        )
+      : undefined;
+  return (
+    <CreateSnapshotDialog
+      vm={vm}
+      taken={(snapshots.data ?? []).filter((s) => s.spec.vm === vm.id).map((s) => s.spec.name)}
+      block={support?.kind === "ok" && support.block}
+      returnFocus={returnFocus}
+      onClose={onClose}
+    />
+  );
+}
+
 /** 스냅샷 만들기의 거절 가운데 번역 대신 서버의 설명을 보이는 code */
 const SERVER_REASONS = ["snapshot_unsupported", "vm_busy"];
 
@@ -373,7 +409,7 @@ function CreateSnapshotDialog({
   taken: string[];
   /** 디스크가 블록 스냅샷(LVM-thin, ZFS, RBD)을 쓴다(메모리를 담지 못한다). */
   block: boolean;
-  returnFocus: RefObject<HTMLElement | null>;
+  returnFocus?: RefObject<HTMLElement | null>;
   onClose(): void;
 }) {
   const { t } = useTranslation();

@@ -1,11 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
 import { Lock, Menu, Monitor, Moon, Sun, User } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Outlet, useLocation } from "react-router";
+import { Outlet, useLocation, useNavigate } from "react-router";
 
 import { ChangePasswordDialog } from "@/accounts/ChangePasswordDialog";
-import { api, call } from "@/api/client";
 import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
 import { ACTION_ICONS } from "@/components/icons";
@@ -27,26 +25,57 @@ import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/s
 import { type Language, setLanguage } from "@/i18n";
 import { AreaTabs, ViewSwitch } from "@/layout/AreaTabs";
 import { Breadcrumbs } from "@/layout/Breadcrumbs";
-import { crumbsOf, isFullWidth, rememberTab } from "@/layout/nav";
-import { AreaLinks, Sidebar } from "@/layout/Sidebar";
+import { ClusterSwitch, CreateMenu, SearchButton } from "@/layout/HeaderTools";
+import { AREAS, crumbsOf, isFullWidth, lastTab, rememberTab } from "@/layout/nav";
+import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
+import { AreaLinks, Sidebar, useRail } from "@/layout/Sidebar";
 import { type Density, useDensity } from "@/lib/density";
+import { type ShortcutId, useShortcuts } from "@/lib/shortcuts";
 import { type Theme, useTheme } from "@/lib/theme";
+import { CommandPalette } from "@/palette/CommandPalette";
 
 /**
- * 앱의 틀: 왼쪽 영역 사이드바(설계 §4), 머리줄(☰·이동 경로·클러스터·실시간·사용자 메뉴), 본문 위 영역 탭과
- * 보기 전환. 경로가 바뀌면 그 영역의 마지막 탭을 기억하고 본문 제목으로 포커스를 옮긴다.
+ * 앱의 틀: 왼쪽 영역 사이드바(설계 §4), 머리줄(☰·이동 경로·검색·+ 만들기·클러스터 전환·실시간·사용자 메뉴), 본문 위
+ * 영역 탭과 보기 전환, ⌘K 팔레트와 단축키(§5.2·§5.7). 경로가 바뀌면 그 영역의 마지막 탭을 기억하고 본문 제목으로
+ * 포커스를 옮긴다.
  */
 export function AppLayout() {
   const { t } = useTranslation();
   const me = usePrincipal();
+  const navigate = useNavigate();
   const { pathname, search } = useLocation();
-  const cluster = useQuery({
-    queryKey: ["cluster"],
-    queryFn: () => call(api.GET("/cluster")),
-  });
   const main = useRef<HTMLElement>(null);
   const [announce, setAnnounce] = useState("");
   const full = isFullWidth(pathname);
+  const { rail, toggle: toggleRail } = useRail();
+  const [palette, setPalette] = useState(false);
+  const [help, setHelp] = useState(false);
+  const [creating, setCreating] = useState(false);
+  // 팔레트를 연 곳(닫으면 돌아간다)
+  const opener = useRef<HTMLElement | null>(null);
+  const openPalette = () => {
+    if (!palette) {
+      opener.current =
+        document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
+    setPalette(!palette);
+  };
+  const goTo = Object.fromEntries(
+    AREAS.map((area) => [`go.${area.id}`, () => void navigate(lastTab(area, me.role))]),
+  ) as Partial<Record<ShortcutId, () => void>>;
+  // 콘솔 화면에서는 키를 모두 게스트에 넘긴다.
+  useShortcuts(
+    {
+      ...goTo,
+      palette: openPalette,
+      help: () => setHelp(true),
+      rail: toggleRail,
+      create: () => setCreating(true),
+      search: () => main.current?.querySelector<HTMLElement>("[data-list-search]")?.focus(),
+      favorite: () => main.current?.querySelector<HTMLElement>("[data-pin-toggle]")?.click(),
+    },
+    !full,
+  );
 
   useEffect(() => rememberTab(pathname, search), [pathname, search]);
 
@@ -79,7 +108,7 @@ export function AppLayout() {
       >
         {t("nav.skipToContent")}
       </a>
-      <Sidebar />
+      <Sidebar rail={rail} onToggle={toggleRail} />
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 items-center justify-between gap-2 border-b px-4">
           <div className="flex min-w-0 items-center gap-2">
@@ -87,11 +116,11 @@ export function AppLayout() {
             <Breadcrumbs />
           </div>
           <div className="flex shrink-0 items-center gap-1">
-            <span className="hidden truncate text-sm text-muted-foreground lg:inline">
-              {cluster.data?.name}
-            </span>
+            <SearchButton onOpen={openPalette} />
+            <CreateMenu open={creating} onOpenChange={setCreating} />
+            <ClusterSwitch />
             <LiveBadge />
-            <UserMenu />
+            <UserMenu onHelp={() => setHelp(true)} />
           </div>
         </header>
         <main
@@ -109,6 +138,13 @@ export function AppLayout() {
         <div aria-live="polite" className="sr-only">
           {announce}
         </div>
+        <CommandPalette
+          open={palette}
+          onOpenChange={setPalette}
+          returnFocus={opener}
+          onHelp={() => setHelp(true)}
+        />
+        <ShortcutsHelp open={help} onOpenChange={setHelp} />
       </div>
     </div>
   );
@@ -149,7 +185,7 @@ function LiveBadge() {
   );
 }
 
-function UserMenu() {
+function UserMenu({ onHelp }: { onHelp(): void }) {
   const { t } = useTranslation();
   const { logout } = useAuth();
   const me = usePrincipal();
@@ -188,6 +224,10 @@ function UserMenu() {
           </DropdownMenuRadioGroup>
           <LanguageItems />
           <ThemeItems />
+          <DropdownMenuItem onSelect={onHelp}>
+            <ACTION_ICONS.shortcuts />
+            {t("shortcuts.title")}
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           {/* 외부 사용자(이름에 `@<영역>`)의 비밀번호는 영역의 디렉터리가 맡는다. */}
           {!me.name.includes("@") && (

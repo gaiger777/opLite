@@ -13,6 +13,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
 import { apiUrl, server } from "@/test/server";
+import { VmActionHost } from "@/vms/VmActionHost";
 
 const PATHS: Record<WatchKind, string> = {
   vm: "/vms",
@@ -57,8 +58,17 @@ export function renderPage(
     [
       {
         element: <RequireAuth />,
-        // 앱처럼 화면들 바깥에 Task 색인을 둔다.
-        children: [{ path, element: <TaskIndexProvider>{element}</TaskIndexProvider> }],
+        // 앱처럼 화면들 바깥에 Task 색인과 VM 대화상자 자리를 둔다.
+        children: [
+          {
+            path,
+            element: (
+              <TaskIndexProvider>
+                <VmActionHost>{element}</VmActionHost>
+              </TaskIndexProvider>
+            ),
+          },
+        ],
       },
       { path: "*", element: <p>moved</p> },
     ],

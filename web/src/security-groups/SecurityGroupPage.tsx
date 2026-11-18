@@ -11,6 +11,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
+import { useVisit } from "@/components/PinButton";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
@@ -54,6 +55,7 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
   const { t } = useTranslation();
   const me = usePrincipal();
   const write = can(me.role, "write", "security-group");
+  useVisit({ kind: "security-group", id: group.id, name: group.name });
   const [description, setDescription] = useState(group.spec.description ?? "");
   const [rows, setRows] = useState(() => (group.spec.rules ?? []).map(fromRule));
   // 읽은 revision. 그 사이 다른 사람이 바꿨으면 저장이 실패한다(If-Match).

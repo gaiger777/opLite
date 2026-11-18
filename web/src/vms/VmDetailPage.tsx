@@ -12,6 +12,7 @@ import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
 import { VmBackups } from "@/backups/VmBackups";
 import { ListPending } from "@/components/ListPending";
+import { PinButton, useVisit } from "@/components/PinButton";
 import { Pager, usePage } from "@/components/Pager";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Badge } from "@/components/ui/badge";
@@ -66,7 +67,8 @@ import {
   unusableDisk,
   type ReplicaRow,
 } from "@/vms/replication";
-import { useTemplateReasons, VmConfirm, type VmDialog } from "@/vms/VmMenu";
+import { useVmActionHost } from "@/vms/actionHost";
+import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
 
@@ -190,9 +192,12 @@ function VmHeader({ vm }: { vm: Vm }) {
   const nodes = useList("node");
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const hint = useId();
-  const { run, remove } = useVmActions();
-  const [confirm, setConfirm] = useState<VmDialog | null>(null);
+  const { run } = useVmActions();
+  const host = useVmActionHost();
+  const setConfirm = (which: VmDialog) =>
+    host.open({ vm, which, afterRemove: () => void navigate("/vms") });
   const template = isTemplate(vm);
+  useVisit({ kind: "vm", id: vm.id, name: vm.name });
   const { convert, revert } = useTemplateReasons(vm);
   const migration = vm.status.migration;
   // 옮기는 중이면 QEMU가 도는 원본(확정하며 spec.node가 먼저 대상이 될 수 있다). 아니면 고정한 노드가
@@ -237,6 +242,7 @@ function VmHeader({ vm }: { vm: Vm }) {
     <div className="flex flex-wrap items-center justify-between gap-2">
       <div className="flex items-center gap-3">
         <h1 className="text-xl font-semibold">{vm.name}</h1>
+        <PinButton resource={{ kind: "vm", id: vm.id, name: vm.name }} />
         <VmPhaseBadge vm={vm} />
         {haEnabled(vm.spec) && <Badge variant="outline">{t("vms.ha")}</Badge>}
         {template && <Badge variant="secondary">{t("vms.template")}</Badge>}
@@ -308,14 +314,6 @@ function VmHeader({ vm }: { vm: Vm }) {
         )}
       </div>
       <ReasonList base={hint} reasons={reasons} className="basis-full" />
-      <VmConfirm
-        vm={vm}
-        which={confirm}
-        onClose={() => setConfirm(null)}
-        onRun={run}
-        onRemove={remove}
-        afterRemove={() => void navigate("/vms")}
-      />
     </div>
   );
 }

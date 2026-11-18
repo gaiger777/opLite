@@ -42,6 +42,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
+import { useCreateParam } from "@/lib/createParam";
 
 /** 백업 작업: 목록과 만들기·바꾸기·지우기·지금 실행. 시각은 모두 UTC다(작업 일정이 UTC다). */
 export function BackupJobsPage() {
@@ -55,6 +56,7 @@ export function BackupJobsPage() {
   const [deleteOpen, setDeleteOpen] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
   const write = can(me.role, "write", "backup-job");
+  useCreateParam(() => setEditing(null), write, pools.isSuccess && jobs.isSuccess);
   const list = [...(jobs.data ?? [])].sort((a, b) => a.name.localeCompare(b.name));
 
   async function run(job: BackupJob) {

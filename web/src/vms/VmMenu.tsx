@@ -1,5 +1,5 @@
 import { MoreHorizontal } from "lucide-react";
-import { useRef, useState, type RefObject } from "react";
+import { useRef, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
@@ -32,16 +32,19 @@ import {
 } from "@/vms/actions";
 import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDeleteDialog } from "@/vms/VmDeleteDialog";
+import { useVmActionHost } from "@/vms/actionHost";
 import { VmMigrateDialog } from "@/vms/VmMigrateDialog";
+import { VmSnapshotDialog } from "@/vms/VmSnapshots";
 
 /** 목록 행의 동작 메뉴 */
 export function VmMenu({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
   const me = usePrincipal();
   const navigate = useNavigate();
-  const { run, remove } = useVmActions();
-  const [confirm, setConfirm] = useState<VmDialog | null>(null);
+  const { run } = useVmActions();
+  const host = useVmActionHost();
   const trigger = useRef<HTMLButtonElement>(null);
+  const setConfirm = (which: VmDialog) => host.open({ vm, which, returnFocus: trigger });
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const { convert, revert } = useTemplateReasons(vm);
   const template = isTemplate(vm);
@@ -119,14 +122,6 @@ export function VmMenu({ vm }: { vm: Vm }) {
           )}
         </DropdownMenuContent>
       </DropdownMenu>
-      <VmConfirm
-        vm={vm}
-        which={confirm}
-        onClose={() => setConfirm(null)}
-        onRun={run}
-        onRemove={remove}
-        returnFocus={trigger}
-      />
     </>
   );
 }
@@ -146,12 +141,23 @@ export function useTemplateReasons(vm: Vm): { convert: string | null; revert: st
 
 /** 메뉴·상세 버튼이 여는 대화상자 */
 export type VmDialog =
-  "force-stop" | "delete" | "clone" | "migrate" | "deploy" | "template" | "untemplate";
+  | "force-stop"
+  | "delete"
+  | "clone"
+  | "migrate"
+  | "deploy"
+  | "template"
+  | "untemplate"
+  // 팔레트가 바로 하지 않고 확인을 받는 전원 동작과 스냅샷(설계 §5.2)
+  | "stop"
+  | "reboot"
+  | "snapshot";
 
 /** 강제 정지·삭제의 확인과 복제·마이그레이션 대화상자 */
 export function VmConfirm({
   vm,
   which,
+  node,
   onClose,
   onRun,
   onRemove,
@@ -160,6 +166,8 @@ export function VmConfirm({
 }: {
   vm: Vm;
   which: VmDialog | null;
+  /** 옮기기 대화상자에 미리 고를 노드 id */
+  node?: string;
   onClose(): void;
   onRun(vm: Vm, action: VmAction): Promise<void>;
   onRemove(vm: Vm): Promise<void>;
@@ -178,6 +186,21 @@ export function VmConfirm({
         returnFocus={returnFocus}
         onConfirm={() => onRun(vm, "force-stop")}
       />
+      {(["stop", "reboot"] as const).map((action) => (
+        <ConfirmDialog
+          key={action}
+          open={which === action}
+          onOpenChange={(open) => !open && onClose()}
+          title={t(`vms.${action}Title`, { name: vm.name })}
+          description={t(`vms.${action}Description`)}
+          confirmLabel={t(`vms.action.${action}`)}
+          returnFocus={returnFocus}
+          onConfirm={() => onRun(vm, action)}
+        />
+      ))}
+      {which === "snapshot" && (
+        <VmSnapshotDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />
+      )}
       {which === "delete" && (
         <VmDeleteDialog
           vm={vm}
@@ -189,7 +212,7 @@ export function VmConfirm({
       )}
       {which === "clone" && <VmCloneDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />}
       {which === "migrate" && (
-        <VmMigrateDialog vm={vm} onClose={onClose} returnFocus={returnFocus} />
+        <VmMigrateDialog vm={vm} initialNode={node} onClose={onClose} returnFocus={returnFocus} />
       )}
       {which === "deploy" && (
         <DeployDialog template={vm} onClose={onClose} returnFocus={returnFocus} />

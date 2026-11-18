@@ -568,7 +568,11 @@
         "password": "Use 1–256 bytes.",
         "again": "The passwords do not match."
       }
-    }
+    },
+    "stopTitle": "Stop {{name}}?",
+    "stopDescription": "The guest OS is asked to shut down.",
+    "rebootTitle": "Reboot {{name}}?",
+    "rebootDescription": "The guest OS is asked to restart."
   },
   "snapshots": {
     "created": "Created",
@@ -1606,7 +1610,10 @@
     "issuedDescription": "Run this on the new node before {{time}}. It cannot be shown again.",
     "command": "Command",
     "copyCommand": "Copy the command",
-    "commandNote": "Add --socket if orbivisord on the new node does not use /run/opl/opld.sock."
+    "commandNote": "Add --socket if orbivisord on the new node does not use /run/opl/opld.sock.",
+    "switch": "Switch cluster (now {{name}})",
+    "thisCluster": "This cluster",
+    "noRemotes": "No remote clusters."
   },
   "remotes": {
     "pageHint": "Other Orbivisor clusters this cluster can see. The status is collected every 30 seconds. What you can do on a remote cluster also depends on the role of the user who owns its API token there.",
@@ -2858,5 +2865,84 @@
   },
   "empty": {
     "docs": "Read the guide"
+  },
+  "favorites": {
+    "toggle": "Favorite {{name}}"
+  },
+  "create": {
+    "menu": "Create new",
+    "vm": "Virtual machine",
+    "import": "VM import",
+    "pool": "Storage pool",
+    "network": "Network",
+    "backup-job": "Backup job",
+    "iso": "ISO upload"
+  },
+  "palette": {
+    "open": "Search or run a command",
+    "title": "Command palette",
+    "placeholder": "Search or run a command…",
+    "results": "Results",
+    "empty": "No matches.",
+    "group": {
+      "favorites": "Favorites",
+      "recent": "Recent",
+      "actions": "Actions",
+      "vms": "Virtual machines",
+      "nodes": "Nodes",
+      "pools": "Storage pools",
+      "volumes": "Volumes",
+      "networks": "Networks",
+      "securityGroups": "Security groups",
+      "backupJobs": "Backup jobs",
+      "haGroups": "HA groups",
+      "navigation": "Go to",
+      "commands": "Commands"
+    },
+    "hint": {
+      "select": "select",
+      "run": "run",
+      "newTab": "new tab",
+      "actions": "actions"
+    },
+    "verb": {
+      "start": "Start {{name}}",
+      "stop": "Stop {{name}}",
+      "reboot": "Reboot {{name}}",
+      "force-stop": "Force stop {{name}}",
+      "migrate": "Migrate {{name}}",
+      "migrateTo": "Migrate {{name}} to {{node}}",
+      "snapshot": "Take a snapshot of {{name}}",
+      "console": "Open the console of {{name}}",
+      "open": "Open {{name}}"
+    },
+    "noNode": "No node {{node}}",
+    "notTarget": "Cannot move to {{node}}",
+    "create": "Create: {{what}}",
+    "theme": "Theme: {{theme}}",
+    "density": "Density: {{density}}"
+  },
+  "shortcuts": {
+    "title": "Keyboard shortcuts",
+    "description": "Single keys work outside text fields and dialogs. The console gets every key.",
+    "then": "then",
+    "group": {
+      "general": "General",
+      "navigation": "Go to"
+    },
+    "palette": "Command palette",
+    "help": "Show this help",
+    "search": "Search the list",
+    "create": "Create menu",
+    "rail": "Collapse or expand the sidebar",
+    "favorite": "Favorite this resource",
+    "go": {
+      "home": "Home",
+      "vms": "Virtual machines",
+      "infra": "Infrastructure",
+      "protect": "Protection",
+      "activity": "Activity",
+      "settings": "Settings"
+    }
   }
 }

@@ -28,6 +28,7 @@ import { errorMessage } from "@/i18n/errors";
 import { EsxiImportDialog } from "@/imports/EsxiImportDialog";
 import { CREDENTIALS_LOST, importNameError, sourceText } from "@/imports/imports";
 import { startOvaUpload } from "@/imports/ova";
+import { useCreateParam } from "@/lib/createParam";
 import { formatBytes } from "@/lib/format";
 import { nameFromFile } from "@/storage/upload";
 
@@ -89,6 +90,7 @@ export function ImportsPage() {
   const [uploading, setUploading] = useState(false);
   const [esxi, setEsxi] = useState(false);
   const write = can(me.role, "write", "vm-import");
+  useCreateParam(() => setUploading(true), write);
   const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? "—";
 
   return (

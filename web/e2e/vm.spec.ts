@@ -75,7 +75,8 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
 
   // 풀을 만들고 이미지를 올린다. 볼륨은 가져오기 Task가 끝나면 준비된다(watch).
   await openTab(page, "Infrastructure", "Storage pools");
-  await page.getByRole("button", { name: "Create" }).click();
+  // 머리줄의 "+ 만들기"(Create new)와 겹치지 않게 정확히 찾는다.
+  await page.getByRole("button", { name: "Create", exact: true }).click();
   let dialog = page.getByRole("dialog", { name: "Create a storage pool" });
   await dialog.getByLabel("Name").fill("local");
   await dialog.getByLabel("Directory").fill(poolPath);
@@ -100,7 +101,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(root.getByRole("cell", { name: "qcow2", exact: true })).toBeVisible();
 
   await openTab(page, "Virtual machines", "VMs");
-  await page.getByRole("link", { name: "Create" }).click();
+  await page.getByRole("link", { name: "Create", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Create a virtual machine" })).toBeVisible();
   await page.getByLabel("Name", { exact: true }).fill("web");
   await page.getByLabel("Memory (MiB)", { exact: true }).fill("256");
@@ -187,8 +188,18 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
     timeout: 60_000,
   });
 
-  await openTab(page, "Virtual machines", "VMs");
-  await page.getByRole("link", { name: "web", exact: true }).click();
+  // ⌘K 팔레트로 VM을 연다(설계 §5.2). CI는 Linux라 Ctrl+K다(ControlOrMeta가 둘 다 맞춘다).
+  // VM 이름 그대로 치면 그 VM의 동작들이 앞에 오므로 "가상 머신" 묶음의 항목을 누른다.
+  await page.keyboard.press("ControlOrMeta+k");
+  const palette = page.getByRole("dialog", { name: "Command palette" });
+  await palette.getByRole("combobox", { name: "Command palette" }).fill("web");
+  await palette
+    .getByRole("group", { name: "Virtual machines" })
+    .getByRole("option", { name: /^web/ })
+    .click();
+  await expect(palette).toBeHidden();
+  await expect(page).toHaveURL(/\/vms\/web$/);
+  await expect(page.getByRole("heading", { name: "web" })).toBeVisible();
   await expect(page.getByTestId("vm-phase")).toHaveText("Running");
 
   // OS가 없는 게스트는 ACPI 종료에 응하지 않으므로 강제로 끈다.

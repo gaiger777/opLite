@@ -16,13 +16,14 @@ export type RemoteView = components["schemas"]["RemoteView"];
 /** 목록을 다시 읽는 간격. 원격은 watch로 받지 않는다(토큰을 담고 있다). */
 const REFRESH_MS = 10_000;
 
-/** 원격 목록(이름 순). 보기 화면과 관리 화면이 같은 쿼리 키를 쓴다. */
-export function useRemotes() {
+/** 원격 목록(이름 순). 보기 화면과 관리 화면이 같은 쿼리 키를 쓴다. 머리줄 클러스터 전환은 메뉴를 열 때만 읽는다. */
+export function useRemotes(enabled = true) {
   return useQuery({
     queryKey: ["remotes"],
     queryFn: () => call(api.GET("/remotes")),
     select: (list) => [...list.items].sort((a, b) => a.name.localeCompare(b.name)),
     refetchInterval: REFRESH_MS,
+    enabled,
   });
 }
 
