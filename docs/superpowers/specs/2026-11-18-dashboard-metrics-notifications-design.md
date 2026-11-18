@@ -270,3 +270,16 @@ Prometheus 누적 카운터·OpenMetrics, Graphite·InfluxDB 밀어 보내기, �
 - **`NotificationRecord`**: 여러 노드의 기록을 합치므로 보낸 노드 `node`를 더했다. 대기열이 넘쳐 버린 것은 `ok: false`, `error: "dropped…"`로 남긴다(따로 상태를 두지 않음). 반복은 `firing`이다.
 - **serde 한계**: `AlertCondition`의 칸 없는 변형(`node_offline` 등)은 serde가 남는 칸을 막지 못한다. 칸이 있는 변형과 규칙·대상 struct는 `deny_unknown_fields`로 막는다.
 - **뒤 스테이지로**: `auth.rs`의 `account` 목록에 `NotificationTarget` 넣기(스테이지 5, 지금은 끝점이 없고 `/watch`는 명시 목록이라 새지 않음), `AlertsQuery`·`AlertsReply`·`HistoryWindow`(스테이지 5), 대상 응답의 비밀 뺀 모양(스테이지 5, `realms.rs`처럼 opl-api).
+
+### 스테이지 2 (opld `metrics/rrd.rs`)
+
+- **API 모양**: 한 파일이 `Rrd`다. `append(t, values)`는 5초 점 하나를 쓰고(데이터만), `close(now)`는 `now`까지 끝난 거친 층 칸을 닫고, `sync_data()` → `commit()`이 §5 쓰기 순서다(파일 하나면 `flush()`). 여러 파일은 쓰는 쪽(스테이지 3)이 모두 `sync_data` 한 뒤 모두 `commit` 한다. `fdatasync`는 rustix 대신 `File::sync_data`(Linux는 `fdatasync`, macOS는 `F_FULLFSYNC`)를 쓴다 — rustix의 `fdatasync`는 macOS에 없다.
+- **만들기**: `fallocate` 대신 NaN으로 채운 전체 내용을 `{name}.tmp`에 쓰고 fsync → rename → 디렉터리 fsync 한다(크기 336 KiB라 비용이 작고 macOS에서도 같은 길). 두 머리 사본(seq 0·1)을 같게 쓴다. 사본 자리는 `seq mod 2`라서 다음 commit은 늘 옛 사본을 덮는다.
+- **크기**: VM 336 KiB(설계대로), 노드 376 KiB, 풀 92 KiB.
+- **머리 배치(512 B)**: magic 8, version u16, 종류 u8(node 1·vm 2·pool 3), 칸 수 u8, seq u64(16), 칸 id 64바이트(24, 한 번 정한 번호는 바꾸지 않음: cpu 1 … pool_total 14), 층 표 4 × 32바이트(88: 층 id·rows·step_ms·offset·last, 칸 없음 `i64::MIN`), 504..512에 SHA-256 앞 8바이트. 층 표는 열 때 이 빌드의 배치와 맞는지 본다.
+- **닫기 순서**: 큰 공백을 건너뛸 때 `Min1`이 먼저 밀려 나가면 닫히지 않은 30분·6시간 칸의 재료를 잃으므로, 점을 쓰기 전에 닫고 원본 끝을 6시간 경계로 올린 시각까지 먼저 닫는다. 처음 쓰는 파일은 거친 층의 `last`를 지금 칸 앞으로 둔다(앞 칸을 셈하지 않음).
+- **시계 뒤로**: `last` 칸 시작 − `t` ≥ 1시간(`REWIND_MS`)이면 되돌린다. 층마다 `t`가 든 칸부터 `last`까지 지우고 `last`를 그 앞 칸으로 둔다(설계의 `(새 칸, last]`보다 한 칸 더 — 열린 칸은 닫힐 때 다시 만든다). 같은 칸·1시간 미만이면 `Append::Behind`이고, 경고 한 번은 쓰는 쪽이 남긴다.
+- **버전 옮기기**: 칸 목록이 이 빌드와 다르면(버전이 같아도) 옮긴다. 다른 종류이거나 파일이 짧으면 깨진 것으로 보고 옆으로 옮긴다. 사본 하나라도 더 새 버전이면 새 형식으로 본다(내려 깐 빌드가 새 파일을 덮지 않게). 옆으로 옮길 이름이 이미 있으면 `.1`, `.2`…를 붙여 지우지 않는다.
+- **조회**: `read(tier, from, until)`은 `bucket_window` 칸을 칸(필드)마다 `Agg`로 돌려준다(`Raw5s`는 AVG=MAX=MIN, 모르면 NaN). 칸이 층 칸 수의 두 배보다 많으면 거절한다(366일 `Hour6`은 됨).
+- **합치기**: `merge(bytes)`는 받은 파일 바이트(머리 포함)와 층마다 새 `last`의 창 전체를 칸 단위로 합쳐 쓰고 commit 한다. 칸 목록이 다르면 같은 칸 id만 합친다. 종류가 다르거나 머리가 깨졌거나 짧으면 거절한다.
+- **로그**: 이 모듈은 로그를 남기지 않는다. `Opened`(Existing·Created·Migrated·Corrupt·Newer)와 `Append`(Written·Behind·Rewound)를 돌려주고 쓰는 쪽이 남긴다. opld가 바이너리 크레이트라 스테이지 3이 쓰기 전까지 `metrics.rs`에 `#[allow(dead_code)]`를 두었다.
