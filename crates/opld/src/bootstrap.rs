@@ -808,7 +808,9 @@ pub(crate) mod tests {
                 "install-media",
                 "templates",
                 "vtpm",
-                "guest-agent"
+                "guest-agent",
+                "metrics-history",
+                "notifications"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -845,7 +847,9 @@ pub(crate) mod tests {
                 "install-media",
                 "templates",
                 "vtpm",
-                "guest-agent"
+                "guest-agent",
+                "metrics-history",
+                "notifications"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -901,7 +905,9 @@ pub(crate) mod tests {
                 "install-media",
                 "templates",
                 "vtpm",
-                "guest-agent"
+                "guest-agent",
+                "metrics-history",
+                "notifications"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1132,6 +1138,8 @@ pub(crate) mod tests {
                     "templates".into(),
                     "vtpm".into(),
                     "guest-agent".into(),
+                    "metrics-history".into(),
+                    "notifications".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

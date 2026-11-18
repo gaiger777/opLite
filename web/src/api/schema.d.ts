@@ -5873,6 +5873,11 @@ export interface components {
             /** Format: uuid */
             user: string;
         };
+        /** @description Prometheus 끝점 설정 */
+        PrometheusSettings: {
+            /** @description 끄면 끝점이 404다. */
+            enabled?: boolean;
+        };
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
         /** @description 영역이 사용자를 확인하는 방법 */
@@ -6679,6 +6684,8 @@ export interface components {
                  *     노드도 설정을 계속 푼다.
                  */
                 placement?: components["schemas"]["PlacementSettings"];
+                /** @description Prometheus 끝점 `GET /api/v1/metrics`(계획 60). 없으면 꺼짐이고 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+                prometheus?: components["schemas"]["PrometheusSettings"];
                 /**
                  * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
                  *     옛 노드도 설정을 계속 푼다.
@@ -7245,6 +7252,8 @@ export interface components {
              *     노드도 설정을 계속 푼다.
              */
             placement?: components["schemas"]["PlacementSettings"];
+            /** @description Prometheus 끝점 `GET /api/v1/metrics`(계획 60). 없으면 꺼짐이고 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+            prometheus?: components["schemas"]["PrometheusSettings"];
             /**
              * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. 없으면 `conditional`이고, 쓰지 않아
              *     옛 노드도 설정을 계속 푼다.

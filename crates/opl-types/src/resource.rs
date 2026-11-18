@@ -61,6 +61,8 @@ pub enum Kind {
     NodeFence,
     HaCheck,
     Ceph,
+    AlertRule,
+    NotificationTarget,
 }
 
 impl Kind {
@@ -91,6 +93,8 @@ impl Kind {
             Kind::NodeFence => "node-fence",
             Kind::HaCheck => "ha-check",
             Kind::Ceph => "ceph",
+            Kind::AlertRule => "alert-rule",
+            Kind::NotificationTarget => "notification-target",
         }
     }
 }
@@ -177,6 +181,8 @@ mod tests {
             Kind::NodeFence,
             Kind::HaCheck,
             Kind::Ceph,
+            Kind::AlertRule,
+            Kind::NotificationTarget,
         ] {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }

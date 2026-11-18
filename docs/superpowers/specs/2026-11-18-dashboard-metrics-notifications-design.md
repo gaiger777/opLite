@@ -252,3 +252,21 @@ Prometheus 누적 카운터·OpenMetrics, Graphite·InfluxDB 밀어 보내기, �
    - CLI 명령과 표시, `tests/metrics_history.rs`·`tests/alerts.rs`·`promtext`, `migration-it` 라이브 확인, `linux-kvm`의 `promtool` 단계.
 7. **feat(web): uPlot 차트, 대시보드, 노드 상세, VM 지표 탭, 경보 화면, Prometheus 설정(web)**.
 8. **docs: README·가이드 "지표"(기록·경보·알림·Prometheus·Grafana 예·디스크 닳음·한계), 설계 문서 스테이지 보고, 계획 60 실행 기록**.
+
+## 17. 스테이지 보고 (설계와 다른 것·결정)
+
+### 스테이지 1 (opl-types)
+
+- **시각 단위**: 경보·알림의 시각(`since`·`last_sent`·`at` 등)은 지표 점처럼 유닉스 ms(`i64`)다.
+- **풀 칸 단위**: `pool_used`·`pool_total`은 MiB다(`fs_*`와 같고 f32 칸에 맞음). `metrics::pool_values(total, available)`가 바꾼다. Prometheus가 바이트로 되돌린다.
+- **`HistoryReply.top`**: `Digest`의 상위 VM(`TopVm { vm, cpu, mem_rss }`, 범위 평균)을 담을 칸이 설계에 없어 더했다(비면 쓰지 않음). `Digest`의 열은 AVG만이라 `Cf.max`·`min`은 비면 쓰지 않는다.
+- **층 고르기 여유**: API 노드가 셈한 `from`이 기록 노드에 닿을 때 시계 차이·지연으로 층의 남은 기간보다 조금 이를 수 있어, `choose_tier`는 60초(`TIER_SLACK_MS`) 여유를 둔다. 앞 몇 칸이 `null`이 되고 `covered_from`이 알린다.
+- **조회 검증**: `HistoryQuery::validate`는 `from < until`, 범위 366일 이하(`MAX_HISTORY_RANGE_MS`), `points` 1~1000, `Digest.top` 1~50을 본다.
+- **순수 함수 더함**: 설계의 다섯 함수 말고 `bucket_window`(범위가 걸치는 칸), `group_size`, `consolidate`(5초 → 1분, xff 0.5)·`consolidate_aggs`(1분 → 30분·6시간), `to_cf`, `percentiles`, `merge_top`(노드마다의 상위 VM 합치기)을 `metrics_math`에 두었다. 경보 상태 기계도 순수 함수 `alert::advance`로 두어 표 시험을 했다.
+- **`ActiveAlert`**: `key`는 칸이 아니라 메서드(`{rule}/{kind}/{id}`)다. 대상은 `AlertSubject { kind, id, name, node }`(webhook `json`의 `subject`와 같음)이고, 단계 `state: pending|firing`과 해제 대기 시작 `clear_since`를 더했다(깜박임 막기 60초를 재시작·리더 바뀜 뒤에도 잇기 위함).
+- **`NotificationTargetSpec`**: 칸 이름이 `kind`면 JSON이 `{"kind":{"kind":"smtp"}}`가 되어 `target: TargetConfig`(`kind` 태그, `RealmSpec.backend`와 같은 꼴)로 했다: `{"target":{"kind":"smtp",…},"enabled":false}`.
+- **규칙 검증 더함**: `vms`는 VM 조건(`vm_metric`·`vm_failed`·`ha_recovery`)에만, `nodes`는 `backup_job_failed`에 받지 않는다. `nodes`·`vms`는 256개까지, `TaskFailed.ops`는 64개까지 이름 형식이다. `repeat_secs`는 0이나 60~7일이다. 이벤트 조건은 `for_secs = 0`만 받고, `repeat_secs`·`send_resolved`는 받되 쓰지 않는다.
+- **대상 검증 더함**: webhook `token`은 `ntfy`·`gotify`에만(다른 형식은 `headers`에), 헤더는 16개까지이고 `Host`·`Content-Length`·`Transfer-Encoding`·`Connection`은 받지 않는다. 메일 주소는 `local@domain` 모양만 보고 CR/LF를 막는다. 오류 문구의 URL은 `redact_url`로 줄인다.
+- **`NotificationRecord`**: 여러 노드의 기록을 합치므로 보낸 노드 `node`를 더했다. 대기열이 넘쳐 버린 것은 `ok: false`, `error: "dropped…"`로 남긴다(따로 상태를 두지 않음). 반복은 `firing`이다.
+- **serde 한계**: `AlertCondition`의 칸 없는 변형(`node_offline` 등)은 serde가 남는 칸을 막지 못한다. 칸이 있는 변형과 규칙·대상 struct는 `deny_unknown_fields`로 막는다.
+- **뒤 스테이지로**: `auth.rs`의 `account` 목록에 `NotificationTarget` 넣기(스테이지 5, 지금은 끝점이 없고 `/watch`는 명시 목록이라 새지 않음), `AlertsQuery`·`AlertsReply`·`HistoryWindow`(스테이지 5), 대상 응답의 비밀 뺀 모양(스테이지 5, `realms.rs`처럼 opl-api).

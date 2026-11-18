@@ -362,6 +362,8 @@ pub const FEATURES: &[&str] = &[
     TEMPLATES,
     VTPM,
     GUEST_AGENT,
+    METRICS_HISTORY,
+    NOTIFICATIONS,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -403,6 +405,13 @@ pub const VTPM: &str = "vtpm";
 
 /// 게스트 에이전트(계획 59): VM `guest_agent`, peer RPC `GuestAgent`. 모든 노드가 알릴 때만 쓴다.
 pub const GUEST_AGENT: &str = "guest-agent";
+
+/// 지표 기록(계획 60): 노드 로컬 RRD 기록, peer RPC `ReadMetricsHistory`·`PushMetricsHistory`, 기록 조회 API, 설정
+/// `prometheus`. 설정 쓰기는 모든 노드가 알릴 때만 받는다(옛 노드는 기록 조회에서 `unsupported`).
+pub const METRICS_HISTORY: &str = "metrics-history";
+
+/// 경보·알림(계획 60): 종류 `AlertRule`·`NotificationTarget`, peer RPC `ReadAlerts`. 모든 노드가 알릴 때만 쓴다.
+pub const NOTIFICATIONS: &str = "notifications";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -880,7 +889,9 @@ mod tests {
                 "install-media",
                 "templates",
                 "vtpm",
-                "guest-agent"
+                "guest-agent",
+                "metrics-history",
+                "notifications"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

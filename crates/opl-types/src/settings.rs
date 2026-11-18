@@ -73,6 +73,21 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub image_catalog: Vec<CatalogImage>,
+    /// Prometheus 끝점 `GET /api/v1/metrics`(계획 60). 없으면 꺼짐이고 쓰지 않아 옛 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub prometheus: Option<PrometheusSettings>,
+}
+
+/// Prometheus 끝점 설정
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct PrometheusSettings {
+    /// 끄면 끝점이 404다.
+    #[serde(default)]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub enabled: bool,
 }
 
 /// 최적 배치 설정. 모든 값이 기본이면 [`SettingsSpec::placement`]를 쓰지 않는다.
@@ -256,6 +271,11 @@ impl SettingsSpec {
         usize::from(n.unwrap_or(DEFAULT_HA_START_CONCURRENCY))
     }
 
+    /// Prometheus 끝점이 켜져 있는지(없으면 꺼짐)
+    pub fn prometheus_enabled(&self) -> bool {
+        self.prometheus.is_some_and(|p| p.enabled)
+    }
+
     /// 최적 배치 설정. 없거나 범위 밖이면 기본값이다.
     pub fn placement(&self) -> PlacementSettings {
         self.placement.filter(|p| p.valid()).unwrap_or_default()
@@ -401,6 +421,7 @@ mod tests {
             ha_start_concurrency: None,
             placement: None,
             image_catalog: vec![],
+            prometheus: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -723,5 +744,29 @@ mod tests {
         assert_eq!(json["image_catalog"][0]["id"], "corp-ubuntu");
         assert_eq!(json["image_catalog"][0]["checksum"]["kind"], "sums");
         assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+    }
+
+    /// Prometheus 설정이 없으면 옛 모양 그대로 쓰고, 있으면 함께 쓰고 푼다(옛 노드는 풀지 못하므로 API가 기능
+    /// `metrics-history`로 막는다).
+    #[test]
+    fn prometheus_is_written_only_when_set() {
+        let old = r#"{"updates":{"channel":"stable"}}"#;
+        let spec: SettingsSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(spec.prometheus, None);
+        assert!(!spec.prometheus_enabled());
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+
+        let spec = SettingsSpec {
+            prometheus: Some(PrometheusSettings { enabled: true }),
+            ..SettingsSpec::default()
+        };
+        assert!(spec.prometheus_enabled());
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["prometheus"], serde_json::json!({ "enabled": true }));
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+        let off: SettingsSpec = serde_json::from_str(r#"{"prometheus":{}}"#).unwrap();
+        assert_eq!(off.prometheus, Some(PrometheusSettings { enabled: false }));
+        assert!(!off.prometheus_enabled());
+        assert!(serde_json::from_str::<SettingsSpec>(r#"{"prometheus":{"port":9100}}"#).is_err());
     }
 }
