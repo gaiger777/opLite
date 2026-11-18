@@ -50,18 +50,18 @@ RULES=(
 	'packaging/tests/maint-test.sh|OPL_FAKE_OPLITE_CONFIG|mirror\.lan/oplite|-f \$\{Config-Version\} oplite'
 	'.github/workflows/ci.yml|\(oplite\)'
 	'.github/actions/build-deb/action.yml|transitional oplite package'
-	# README의 "이름 바꾸기" 절이 보이는 옛 이름과 그대로 둔 저장소 주소 예
-	'README.md|opLite → Orbivisor'
-	'README.md|\| `oplite` \||새 판의 `oplite`는|`oplite` 두 줄'
-	'README.md|`oplite\.iso`, "Install opLite"'
-	'README.md|`/usr/share/oplite/opld\.toml\.example`'
-	'README.md|/etc/issue\.d/oplite\.issue'
-	'README.md|s/opLite/'
-	'README.md|`apt-get remove oplite`'
-	'README.md|`dpkg -l oplite`'
-	'README.md|sudo apt install \./orbivisor_0\.1\.0_amd64\.deb \./oplite_0\.1\.0_amd64\.deb'
-	'README.md|"opLite cluster X CA"'
-	'README.md|apt\.example\.com/oplite'
+	# docs/guide/getting-started.md의 "이름 바꾸기" 절이 보이는 옛 이름과 그대로 둔 저장소 주소 예
+	'docs/guide/getting-started.md|opLite → Orbivisor'
+	'docs/guide/getting-started.md|\| `oplite` \||새 판의 `oplite`는|`oplite` 두 줄'
+	'docs/guide/getting-started.md|`oplite\.iso`, "Install opLite"'
+	'docs/guide/getting-started.md|`/usr/share/oplite/opld\.toml\.example`'
+	'docs/guide/getting-started.md|/etc/issue\.d/oplite\.issue'
+	'docs/guide/getting-started.md|s/opLite/'
+	'docs/guide/getting-started.md|`apt-get remove oplite`'
+	'docs/guide/getting-started.md|`dpkg -l oplite`'
+	'docs/guide/getting-started.md|sudo apt install \./orbivisor_0\.1\.0_amd64\.deb \./oplite_0\.1\.0_amd64\.deb'
+	'docs/guide/getting-started.md|"opLite cluster X CA"'
+	'docs/guide/getting-started.md|apt\.example\.com/oplite'
 )
 
 # 전환 패키지 oplite(소문자 패키지 이름)를 만들고 넘기고 시험하는 파일에서 패키지 이름으로 쓰는 모양
@@ -172,15 +172,15 @@ expect_name left packaging/iso/oplite.cfg
 expect_name left packaging/tests/fixtures/oplite.issue
 expect_name left web/src/OpLiteLogo.tsx
 expect left packaging/iso/build-iso.sh 'cp "$DEB" "$tree/oplite/"'
-expect clean README.md '| 설치 ISO | `oplite.iso`, "Install opLite" | `orbivisor.iso`, "Install Orbivisor" |'
-expect left README.md 'packaging/iso/build-iso.sh --deb dist/oplite_0.1.0_amd64.deb --out oplite.iso'
-expect left README.md '패키지 `oplite_0.1.0_amd64.deb`와 opLite 저장소'
-expect clean README.md '  `sudo apt install ./orbivisor_0.1.0_amd64.deb ./oplite_0.1.0_amd64.deb`. 새 deb 하나만 설치하면'
-expect clean README.md '| Debian 패키지 | `oplite` | `orbivisor`(옛 이름은 빈 전환 패키지) |'
-expect left README.md 'sudo dpkg -i ./oplite_0.1.0_amd64.deb'
-expect left README.md 'sudo cp /usr/share/oplite/opld.toml.example /etc/opl/opld.toml'
-expect left README.md '패키지 `oplite`를 설치한다'
-expect left README.md 'packaging/iso/build-iso.sh --deb dist/orbivisor_0.1.0_amd64.deb --out `oplite.iso`'
+expect clean docs/guide/getting-started.md '| 설치 ISO | `oplite.iso`, "Install opLite" | `orbivisor.iso`, "Install Orbivisor" |'
+expect left docs/guide/getting-started.md 'packaging/iso/build-iso.sh --deb dist/oplite_0.1.0_amd64.deb --out oplite.iso'
+expect left docs/guide/getting-started.md '패키지 `oplite_0.1.0_amd64.deb`와 opLite 저장소'
+expect clean docs/guide/getting-started.md '  `sudo apt install ./orbivisor_0.1.0_amd64.deb ./oplite_0.1.0_amd64.deb`. 새 deb 하나만 설치하면'
+expect clean docs/guide/getting-started.md '| Debian 패키지 | `oplite` | `orbivisor`(옛 이름은 빈 전환 패키지) |'
+expect left docs/guide/getting-started.md 'sudo dpkg -i ./oplite_0.1.0_amd64.deb'
+expect left docs/guide/getting-started.md 'sudo cp /usr/share/oplite/opld.toml.example /etc/opl/opld.toml'
+expect left docs/guide/getting-started.md '패키지 `oplite`를 설치한다'
+expect left docs/guide/getting-started.md 'packaging/iso/build-iso.sh --deb dist/orbivisor_0.1.0_amd64.deb --out `oplite.iso`'
 
 cd "$ROOT"
 code=0

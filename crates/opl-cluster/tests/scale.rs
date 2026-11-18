@@ -72,7 +72,7 @@ const REATTACH_MAX: Duration = Duration::from_secs(5);
 const FAILOVER_MAX_MS: u64 = 5000;
 /// 리더 장애 뒤 새 리더를 기다리는 한도. 넘으면 기준과 관계없이 그 자리에서 실패한다.
 const FAILOVER_GIVE_UP: Duration = Duration::from_secs(10);
-/// 쓰기 지연 p99 기준(ms). 코어가 적은 CI 러너는 `OPL_SCALE_P99_MS`로 바꾼다(설계 §14, README).
+/// 쓰기 지연 p99 기준(ms). 코어가 적은 CI 러너는 `OPL_SCALE_P99_MS`로 바꾼다(설계 §14, docs/guide/cluster.md).
 const WRITE_P99_MAX_MS: u64 = 50;
 const ADD_NODE_MAX: Duration = Duration::from_secs(2);
 /// 리더가 비투표 구성원(대기 learner 둘)에게 보내는 초당 Raft RPC 상한: 하트비트 5(200 ms) × 둘 = 10에 쓰기
