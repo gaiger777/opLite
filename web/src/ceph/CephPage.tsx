@@ -1,3 +1,4 @@
+import { Database } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
@@ -6,8 +7,10 @@ import { can } from "@/auth/permissions";
 import { useCeph } from "@/ceph/ceph";
 import { CephStatusView } from "@/ceph/CephStatusView";
 import { CephWizard } from "@/ceph/CephWizard";
+import { EmptyState } from "@/components/EmptyState";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
+import { Button } from "@/components/ui/button";
 
 /**
  * Orbivisor가 관리하는 Ceph. 없으면 admin에게 만들기 마법사를, 있으면 상태를 보인다. 마법사로 만들기 시작하면 끝내기
@@ -18,6 +21,8 @@ export function CephPage() {
   const me = usePrincipal();
   const ceph = useCeph(true);
   const [inWizard, setInWizard] = useState(false);
+  // 빈 상태의 주 단추를 눌러 마법사를 열었다.
+  const [opened, setOpened] = useState(false);
   const admin = can(me.role, "write", "ceph");
 
   return (
@@ -25,16 +30,19 @@ export function CephPage() {
       <PageHeader title={t("nav.ceph")} description={t("ceph.pageHint")} />
       {ceph.data === undefined ? (
         <ListPending error={ceph.error} />
-      ) : ceph.data === null || inWizard ? (
-        admin ? (
-          <CephWizard
-            ceph={ceph.data}
-            onStarted={() => setInWizard(true)}
-            onDone={() => setInWizard(false)}
-          />
-        ) : (
-          <p className="text-sm text-muted-foreground">{t("ceph.none")}</p>
-        )
+      ) : inWizard || (ceph.data === null && opened && admin) ? (
+        <CephWizard
+          ceph={ceph.data}
+          onStarted={() => setInWizard(true)}
+          onDone={() => setInWizard(false)}
+        />
+      ) : ceph.data === null ? (
+        <EmptyState
+          icon={Database}
+          title={t("ceph.empty.title")}
+          description={t(admin ? "ceph.empty.admin" : "ceph.none")}
+          action={admin && <Button onClick={() => setOpened(true)}>{t("ceph.empty.start")}</Button>}
+        />
       ) : (
         <CephStatusView ceph={ceph.data} />
       )}

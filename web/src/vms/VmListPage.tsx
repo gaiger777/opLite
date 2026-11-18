@@ -9,11 +9,12 @@ import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
-import { type Column, DataTable, type Filter } from "@/components/data-table/DataTable";
+import { type Column, DataTable, type Filter, useIsPhone } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { FirstSteps } from "@/dashboard/FirstSteps";
 import { formatMib } from "@/lib/format";
 import { isTemplate } from "@/templates/templates";
 import { type BulkAction, BULK_ACTIONS, bulkReason } from "@/vms/bulk";
@@ -22,6 +23,7 @@ import { VmBulkDialog } from "@/vms/VmBulkDialog";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPeek } from "@/vms/VmPeek";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
+import { VmPowerButton } from "@/vms/VmPowerButton";
 
 export function vcpus(vm: Vm): number {
   return (vm.spec.cpu.sockets ?? 1) * vm.spec.cpu.cores;
@@ -45,6 +47,7 @@ export function VmListPage() {
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   const templatesOnly = state.get("template") === "1";
+  const phone = useIsPhone();
 
   const nodeName = useMemo(() => {
     const names = new Map(nodes.data?.map((n) => [n.id, n.name]));
@@ -97,7 +100,21 @@ export function VmListPage() {
       cell: (vm) => formatMib(vm.spec.memory_mib),
       priority: 2,
     },
-    { id: "menu", header: t("vms.actions"), actions: true, cell: (vm) => <VmMenu vm={vm} /> },
+    {
+      id: "menu",
+      header: t("vms.actions"),
+      actions: true,
+      // 휴대폰 카드(당직 보기)에는 전원 단추 하나를 앞에 둔다(설계 §5.9).
+      cell: (vm) =>
+        phone ? (
+          <div className="flex items-center gap-1">
+            <VmPowerButton vm={vm} />
+            <VmMenu vm={vm} />
+          </div>
+        ) : (
+          <VmMenu vm={vm} />
+        ),
+    },
   ];
 
   const filters: Filter<Vm>[] = [
@@ -173,6 +190,7 @@ export function VmListPage() {
           )
         }
       />
+      <FirstSteps />
       <DataTable
         id="vms"
         rows={vms.data ?? []}

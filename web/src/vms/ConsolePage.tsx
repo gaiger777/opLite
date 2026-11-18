@@ -48,6 +48,8 @@ export function ConsolePage() {
           · {t("vms.action.console")}
         </h1>
       </div>
+      {/* 콘솔은 넓은 화면·키보드가 있어야 쓰기 좋다(설계 §5.9). */}
+      <p className="text-sm text-muted-foreground md:hidden">{t("common.desktopOnly")}</p>
       <Suspense
         fallback={
           <p role="status" className="text-muted-foreground">

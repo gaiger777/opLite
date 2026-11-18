@@ -252,7 +252,8 @@ it("converts a stopped VM to a template from its page", async () => {
   );
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
   const user = userEvent.setup();
-  await user.click(await screen.findByRole("button", { name: "Convert to template" }));
+  await user.click(await screen.findByRole("button", { name: "Actions for db" }));
+  await user.click(screen.getByRole("menuitem", { name: "Convert to template" }));
   const dialog = await screen.findByRole("alertdialog", { name: "Convert db to a template?" });
   await user.click(within(dialog).getByRole("button", { name: "Convert to template" }));
   await waitFor(() => expect(converted).toBe(true));
@@ -262,9 +263,10 @@ it("converts a stopped VM to a template from its page", async () => {
 it("explains why a running VM cannot become a template", async () => {
   mockLists({ vm: [web1], volume: [cloneOf("web-1-root", root), root], node: [NODE] });
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web-1" });
-  expect(
-    await screen.findByRole("button", { name: "Convert to template" }),
-  ).toHaveAccessibleDescription("Only a stopped VM can become a template.");
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for web-1" }));
+  expect(screen.getByRole("menuitem", { name: "Convert to template" })).toHaveAccessibleDescription(
+    "Only a stopped VM can become a template.",
+  );
   // 연결 복제 디스크의 기반
   expect(await screen.findByText("disk0: linked clone of tmpl-root")).toBeInTheDocument();
 });

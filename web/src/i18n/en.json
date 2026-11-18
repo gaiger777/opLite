@@ -300,7 +300,8 @@
     "state": "State",
     "node": "Node",
     "undo": "Undo",
-    "undone": "Undone."
+    "undone": "Undone.",
+    "desktopOnly": "This screen is easier to use on a larger screen."
   },
   "confirm": {
     "typeName": "Type {{name}} to confirm",
@@ -613,7 +614,11 @@
         "target": "Cannot run on this node (offline, in maintenance or another architecture)."
       }
     },
-    "startAgain": "Turn on again"
+    "startAgain": "Turn on again",
+    "powerButton": {
+      "start": "Start {{name}}",
+      "stop": "Stop {{name}}"
+    }
   },
   "snapshots": {
     "created": "Created",
@@ -1654,7 +1659,17 @@
     "commandNote": "Add --socket if orbivisord on the new node does not use /run/opl/opld.sock.",
     "switch": "Switch cluster (now {{name}})",
     "thisCluster": "This cluster",
-    "noRemotes": "No remote clusters."
+    "noRemotes": "No remote clusters.",
+    "join": {
+      "steps": "Join steps",
+      "step": {
+        "issue": "Issue a token",
+        "run": "Run the command on the new node",
+        "wait": "Wait for the node"
+      },
+      "joined": "{{name}} joined the cluster.",
+      "waiting": "Waiting for the new node to join…"
+    }
   },
   "remotes": {
     "pageHint": "Other Orbivisor clusters this cluster can see. The status is collected every 30 seconds. What you can do on a remote cluster also depends on the role of the user who owns its API token there.",
@@ -1891,7 +1906,6 @@
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "Runs together with the generated user-data, for packages and runcmd.",
     "ciUserDataWarning": "The user-data replaces the generated user-data; user, password and SSH keys are not used.",
-    "windows11": "Fill in for Windows 11",
     "windows11Hint": "Filled in for Windows 11: q35, UEFI with Secure Boot, TPM 2.0, guest agent, 2 cores, 4096 MiB, SATA disks and e1000e interfaces, because the Windows installer has no VirtIO drivers. After installing the VirtIO drivers in Windows, switch the disks to virtio-blk and the interfaces to virtio for better speed.",
     "security": "Security",
     "securityLive": "TPM changes apply at the next restart. Secure Boot can only change while the VM is stopped.",
@@ -1914,7 +1928,42 @@
     "agentFreezeHint": "Asks the guest to flush and freeze its file systems so disk snapshots, backups and replicas are consistent.",
     "agentShutdown": "Shutdown",
     "agentShutdownAgent": "Through the guest agent, then ACPI",
-    "agentShutdownAcpi": "ACPI only"
+    "agentShutdownAcpi": "ACPI only",
+    "steps": "Form steps",
+    "stepErrors": "({{count}} errors)",
+    "step": {
+      "general": "General",
+      "disks": "Disks",
+      "nics": "Network",
+      "cdroms": "CD/DVD",
+      "boot": "Boot order",
+      "security": "Security",
+      "agent": "Guest agent",
+      "cloudInit": "cloud-init",
+      "schedule": "Snapshots",
+      "replication": "Replication",
+      "review": "Review"
+    },
+    "review": {
+      "on": "On",
+      "off": "Off",
+      "cpu": "CPU",
+      "cpuValue": "{{sockets}} × {{cores}} cores",
+      "firmware": "Firmware"
+    },
+    "preset": {
+      "title": "Start from a preset",
+      "blank": "Blank VM",
+      "blankHint": "Default values; set everything yourself.",
+      "linux": "Linux server",
+      "linuxHint": "2 cores, 2048 MiB, guest agent and cloud-init on.",
+      "windows": "Windows 11",
+      "windowsHint": "UEFI with Secure Boot, TPM 2.0, SATA disks and e1000e interfaces.",
+      "template": "From a template",
+      "templateHint": "Deploy a copy of a template.",
+      "noTemplates": "There are no templates yet. Convert a VM on the Templates page.",
+      "deploy": "Deploy {{name}}…"
+    }
   },
   "console": {
     "connecting": "Connecting…",
@@ -1933,16 +1982,12 @@
     "nodes": "Nodes",
     "online": "online",
     "vms": "Virtual machines",
-    "vmCounts": "{{running}} running · {{stopped}} stopped · {{failed}} failed",
+    "vmCounts": "{{running}} running · {{stopped}} stopped",
     "leader": "Leader",
-    "perNode": "Nodes",
-    "hypervisor": "Hypervisor",
-    "activeVms": "Active VMs",
     "nodeOnline": "Online",
     "nodeOffline": "Offline",
     "maintenance": "Maintenance",
     "witness": "Witness",
-    "failedVms": "Failed virtual machines",
     "recentTasks": "Recent tasks",
     "allTasks": "All tasks",
     "noLeader": "No leader",
@@ -1956,7 +2001,11 @@
       "expiring": "The subscription expires on {{date}}.",
       "manage": "Subscription settings",
       "dismiss": "Hide for 7 days"
-    }
+    },
+    "health": "Cluster health",
+    "alerts": "Alerts firing",
+    "ringing": "View alerts",
+    "failedCount": "{{count}} failed"
   },
   "settings": {
     "updates": "Updates",
@@ -2485,6 +2534,11 @@
       "osdsHint": "Add OSDs on whole disks of the nodes. Disks that are not empty must be erased; disks in use cannot be chosen.",
       "poolHint": "Create a Ceph pool and register it as a storage pool. Add OSDs first.",
       "clientsHint": "Optionally install the Ceph client packages on nodes without Ceph daemons so that their VMs can use the pools."
+    },
+    "empty": {
+      "title": "No Ceph cluster",
+      "admin": "Set up a Ceph cluster that Orbivisor installs and runs on the cluster nodes, step by step.",
+      "start": "Start the Ceph setup"
     }
   },
   "downloads": {
@@ -2908,7 +2962,14 @@
   },
   "favorites": {
     "toggle": "Favorite {{name}}",
-    "removed": "{{name}} removed from favorites."
+    "removed": "{{name}} removed from favorites.",
+    "title": "Favorites",
+    "empty": "No favorites yet. Mark VMs, nodes and storage pools with ★ to keep them here.",
+    "kind": {
+      "vm": "VM",
+      "node": "Node",
+      "storage-pool": "Storage pool"
+    }
   },
   "create": {
     "menu": "Create new",
@@ -3039,5 +3100,33 @@
     "jobRunning": "The backup job is running.",
     "jobDisabled": "The backup job is turned off.",
     "view": "View"
+  },
+  "capacity": {
+    "title": "Capacity",
+    "vcpus": "vCPUs given to running VMs",
+    "memory": "Memory given to running VMs",
+    "vcpusOf": "{{used}} of {{total}} cores",
+    "high": "{{text}}, {{percent}} %, high"
+  },
+  "firstSteps": {
+    "title": "First steps",
+    "description": "Three steps to your first virtual machine.",
+    "done": "(done)",
+    "pool": {
+      "title": "Create a storage pool",
+      "hint": "Disks, ISOs and backups live in storage pools.",
+      "action": "Create a pool"
+    },
+    "media": {
+      "title": "Upload an ISO or get an image",
+      "hint": "Install from an ISO, or start from a ready cloud image.",
+      "action": "Upload an ISO",
+      "images": "or download an image"
+    },
+    "vm": {
+      "title": "Create a VM",
+      "hint": "Pick a preset and attach the ISO or image.",
+      "action": "Create a VM"
+    }
   }
 }

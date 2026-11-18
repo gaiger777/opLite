@@ -4,44 +4,26 @@ import { useId } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
+import { useAlerts } from "@/alerts/alerts";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Node, Vm } from "@/api/types";
+import { useIsPhone } from "@/components/data-table/DataTable";
 import { PageHeader } from "@/components/PageHeader";
-import { Badge } from "@/components/ui/badge";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
 import { ActiveAlertsWidget } from "@/dashboard/ActiveAlertsWidget";
+import { CapacityWidget } from "@/dashboard/CapacityWidget";
 import { ClusterChartsWidget } from "@/dashboard/ClusterChartsWidget";
+import { FavoritesWidget } from "@/dashboard/FavoritesWidget";
+import { FirstSteps } from "@/dashboard/FirstSteps";
 import { NodeStripWidget } from "@/dashboard/NodeStripWidget";
 import { PoolUsageWidget } from "@/dashboard/PoolUsageWidget";
 import { TopVmsWidget } from "@/dashboard/TopVmsWidget";
+import { WidgetCard } from "@/dashboard/WidgetCard";
 import { errorMessage } from "@/i18n/errors";
-import { formatCapacity } from "@/lib/format";
 import { compareVersions } from "@/lib/version";
 import { SubscriptionBanner } from "@/settings/SubscriptionBanner";
+import { isRinging } from "@/tasks/center";
 import { newestFirst, TaskTable } from "@/tasks/TasksPage";
-import { vcpus } from "@/vms/VmListPage";
-
-/** QEMU가 떠 있는 단계. 실패한 VM도 `status.node`가 남으므로 단계로 거른다. */
-const ACTIVE: Vm["status"]["phase"][] = ["starting", "running", "stopping", "migrating"];
-
-/** 노드에서 시작 중·실행 중·정지 중·옮기는 중(원본 노드)인 VM이 쓰는 vCPU와 메모리 */
-export function usage(node: Node, vms: Vm[]) {
-  const here = vms.filter((vm) => vm.status.node === node.id && ACTIVE.includes(vm.status.phase));
-  return {
-    vms: here.length,
-    vcpus: here.reduce((sum, vm) => sum + vcpus(vm), 0),
-    memoryMib: here.reduce((sum, vm) => sum + vm.spec.memory_mib, 0),
-  };
-}
 
 /** 노드들이 돌리는 서로 다른 버전(낮은 것부터). 버전을 모르는 노드(옛 노드)는 뺀다. */
 function nodeVersions(nodes: Node[]): string[] {
@@ -55,36 +37,46 @@ function waiting(t: TFunction, ...queries: { isError: boolean; error: unknown }[
   return failed ? errorMessage(t, failed.error) : t("common.loading");
 }
 
-function Stat({ title, value, detail }: { title: string; value: string; detail?: string }) {
+/** 건강 띠의 칸 하나: 작은 이름, 큰 값, 작은 설명 */
+function Stat({
+  title,
+  value,
+  detail,
+}: {
+  title: string;
+  value: React.ReactNode;
+  detail?: React.ReactNode;
+}) {
   const id = useId();
   return (
-    <Card role="group" aria-labelledby={id}>
-      <CardHeader>
-        <CardTitle id={id} className="text-sm font-normal text-muted-foreground">
-          {title}
-        </CardTitle>
-      </CardHeader>
-      <CardContent>
-        <div className="text-2xl font-semibold">{value}</div>
-        {detail && <div className="text-xs text-muted-foreground">{detail}</div>}
-      </CardContent>
-    </Card>
+    <div
+      role="group"
+      aria-labelledby={id}
+      className="flex min-w-0 flex-col gap-1 rounded-lg border bg-surface-2 px-4 py-3"
+    >
+      <span id={id} className="text-xs text-muted-foreground">
+        {title}
+      </span>
+      <div className="truncate text-xl font-semibold tabular-nums">{value}</div>
+      {detail && <div className="text-xs text-muted-foreground">{detail}</div>}
+    </div>
   );
 }
 
-export function DashboardPage() {
+/** 건강 띠(설계 §8.1): 노드 온라인, VM(실패), 울리는 경보, 리더. 혼합 버전 경고는 그 아래 줄이다. */
+function HealthStrip() {
   const { t } = useTranslation();
   const nodes = useList("node");
   const vms = useList("vm");
-  const tasks = useList("task");
+  const alerts = useAlerts();
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const allNodes = nodes.data ?? [];
   const allVms = vms.data ?? [];
   const count = (phase: Vm["status"]["phase"]) =>
     allVms.filter((vm) => vm.status.phase === phase).length;
-  const failed = allVms.filter((vm) => vm.status.phase === "failed");
+  const failed = count("failed");
   const versions = nodeVersions(allNodes);
-
+  const ringing = alerts.data?.alerts.filter(isRinging).length;
   // 리더 이름: Node 리소스, 클러스터 멤버, 그래도 없으면(합류 중) id 끝 8자
   let leader = waiting(t, cluster);
   if (cluster.data) {
@@ -95,21 +87,9 @@ export function DashboardPage() {
         id.slice(-8))
       : t("dashboard.noLeader");
   }
-
   return (
-    <div className="flex flex-col gap-6">
-      <PageHeader title={t("nav.area.home")} />
-      <SubscriptionBanner />
-      {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
-      {versions.length > 1 && (
-        <p
-          role="alert"
-          className="rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
-        >
-          {t("dashboard.mixedVersions", { versions: versions.join(", ") })}
-        </p>
-      )}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+    <section aria-label={t("dashboard.health")} className="flex flex-col gap-(--gap)">
+      <div className="grid grid-cols-2 gap-(--gap) lg:grid-cols-4">
         <Stat
           title={t("dashboard.nodes")}
           value={
@@ -123,120 +103,114 @@ export function DashboardPage() {
           title={t("dashboard.vms")}
           value={vms.data ? String(allVms.length) : waiting(t, vms)}
           detail={
-            vms.data &&
-            t("dashboard.vmCounts", {
-              // 옮기는 중인 VM은 원본에서 계속 돈다.
-              running: count("running") + count("migrating"),
-              stopped: count("stopped"),
-              failed: count("failed"),
-            })
+            vms.data && (
+              <>
+                {t("dashboard.vmCounts", {
+                  // 옮기는 중인 VM은 원본에서 계속 돈다.
+                  running: count("running") + count("migrating"),
+                  stopped: count("stopped"),
+                })}
+                {" · "}
+                {failed > 0 ? (
+                  <Link
+                    to="/vms?phase=failed"
+                    className="font-medium text-danger-fg underline underline-offset-4"
+                  >
+                    {t("dashboard.failedCount", { count: failed })}
+                  </Link>
+                ) : (
+                  t("dashboard.failedCount", { count: 0 })
+                )}
+              </>
+            )
+          }
+        />
+        <Stat
+          title={t("dashboard.alerts")}
+          value={ringing ?? (alerts.isError ? "—" : t("common.loading"))}
+          detail={
+            <Link to="/alerts" className="underline-offset-4 hover:underline">
+              {t("dashboard.ringing")}
+            </Link>
           }
         />
         <Stat title={t("dashboard.leader")} value={leader} detail={cluster.data?.name} />
       </div>
-
-      {/* 계획 60 위젯. 위젯은 카드 하나만 그리고 배치는 여기서 한다. */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <ActiveAlertsWidget />
-        <PoolUsageWidget />
-      </div>
-      <ClusterChartsWidget />
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        <NodeStripWidget />
-        <TopVmsWidget />
-      </div>
-
-      <section className="flex flex-col gap-2">
-        <h2 id="dashboard-nodes" className="font-medium">
-          {t("dashboard.perNode")}
-        </h2>
-        <Table aria-labelledby="dashboard-nodes">
-          <TableHeader>
-            <TableRow>
-              <TableHead>{t("common.node")}</TableHead>
-              <TableHead>{t("common.state")}</TableHead>
-              <TableHead>{t("dashboard.hypervisor")}</TableHead>
-              <TableHead>{t("nodes.fencing")}</TableHead>
-              <TableHead>{t("dashboard.activeVms")}</TableHead>
-              <TableHead>{t("vms.vcpus")}</TableHead>
-              <TableHead>{t("vms.memory")}</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {(!nodes.data || !vms.data || allNodes.length === 0) && (
-              <TableRow>
-                <TableCell colSpan={7} className="text-center text-muted-foreground">
-                  {nodes.data && vms.data ? t("dashboard.noNodes") : waiting(t, nodes, vms)}
-                </TableCell>
-              </TableRow>
-            )}
-            {(vms.data ? allNodes : []).map((node) => {
-              const used = usage(node, allVms);
-              return (
-                <TableRow key={node.id}>
-                  <TableCell className="font-medium">{node.name}</TableCell>
-                  <TableCell>
-                    {node.status.online ? (
-                      <Badge>{t("dashboard.nodeOnline")}</Badge>
-                    ) : (
-                      <Badge variant="destructive">{t("dashboard.nodeOffline")}</Badge>
-                    )}
-                    {node.spec.maintenance && (
-                      <Badge variant="outline" className="ml-1">
-                        {t("dashboard.maintenance")}
-                      </Badge>
-                    )}
-                    {node.spec.witness && (
-                      <Badge variant="outline" className="ml-1">
-                        {t("dashboard.witness")}
-                      </Badge>
-                    )}
-                  </TableCell>
-                  <TableCell>{node.status.hypervisor}</TableCell>
-                  <TableCell>
-                    {node.status.ha ? t(`nodes.fencingMode.${node.status.ha.fencing}`) : "—"}
-                  </TableCell>
-                  <TableCell>{used.vms}</TableCell>
-                  <TableCell>
-                    {used.vcpus} / {node.status.cpus}
-                  </TableCell>
-                  <TableCell>
-                    {formatCapacity(used.memoryMib)} / {formatCapacity(node.status.memory_mib)}
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </TableBody>
-        </Table>
-      </section>
-
-      {failed.length > 0 && (
-        <section className="flex flex-col gap-2">
-          <h2 className="font-medium">{t("dashboard.failedVms")}</h2>
-          <ul className="flex flex-col gap-1 text-sm">
-            {failed.map((vm) => (
-              <li key={vm.id}>
-                <Link to={`/vms/${encodeURIComponent(vm.name)}`} className="font-medium underline">
-                  {vm.name}
-                </Link>
-                <span className="ml-2 text-muted-foreground">{vm.status.last_error}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
+      {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
+      {versions.length > 1 && (
+        <p
+          role="alert"
+          className="rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
+        >
+          {t("dashboard.mixedVersions", { versions: versions.join(", ") })}
+        </p>
       )}
+    </section>
+  );
+}
 
-      <section className="flex flex-col gap-2">
-        <div className="flex items-center justify-between">
-          <h2 id="dashboard-tasks" className="font-medium">
-            {t("dashboard.recentTasks")}
-          </h2>
-          <Link to="/tasks" className="text-sm underline-offset-4 hover:underline">
-            {t("dashboard.allTasks")}
-          </Link>
-        </div>
-        <TaskTable tasks={newestFirst(tasks.data ?? []).slice(0, 5)} labelledBy="dashboard-tasks" />
-      </section>
+/** 최근 Task 5개(작업 표와 같은 칩·깊은 링크) */
+function RecentTasksWidget() {
+  const { t } = useTranslation();
+  const tasks = useList("task");
+  const id = useId();
+  return (
+    <WidgetCard
+      title={t("dashboard.recentTasks")}
+      titleId={id}
+      action={
+        <Link to="/tasks" className="text-sm underline-offset-4 hover:underline">
+          {t("dashboard.allTasks")}
+        </Link>
+      }
+    >
+      <TaskTable tasks={newestFirst(tasks.data ?? []).slice(0, 5)} labelledBy={id} />
+    </WidgetCard>
+  );
+}
+
+/**
+ * 홈(설계 §8.1): 첫 걸음, 건강 띠, 경보, 용량(클러스터·풀), 차트, 노드 부하·상위 VM, 최근 작업, 즐겨찾기.
+ * 위젯은 카드 하나씩만 그리고 배치는 여기서 한다. 휴대폰(당직 보기, §5.9)은 경보 → 상태 요약 → 즐겨찾기를
+ * 먼저 쌓는다(화면 읽기 순서도 같게 DOM 순서를 바꾼다).
+ */
+export function DashboardPage() {
+  const { t } = useTranslation();
+  const phone = useIsPhone();
+  const grid2 = "grid grid-cols-1 gap-(--gap) lg:grid-cols-2";
+  return (
+    <div className="flex flex-col gap-(--gap)">
+      <PageHeader title={t("nav.area.home")} />
+      <SubscriptionBanner />
+      <FirstSteps />
+      {phone ? (
+        <>
+          <ActiveAlertsWidget />
+          <HealthStrip />
+          <FavoritesWidget />
+          <CapacityWidget />
+          <PoolUsageWidget />
+          <RecentTasksWidget />
+        </>
+      ) : (
+        <>
+          <HealthStrip />
+          <div className="grid grid-cols-1 gap-(--gap) lg:grid-cols-3">
+            <ActiveAlertsWidget />
+            <CapacityWidget />
+            <PoolUsageWidget />
+          </div>
+          <ClusterChartsWidget />
+          <div className={grid2}>
+            <NodeStripWidget />
+            <TopVmsWidget />
+          </div>
+          <div className={grid2}>
+            <RecentTasksWidget />
+            <FavoritesWidget />
+          </div>
+        </>
+      )}
     </div>
   );
 }

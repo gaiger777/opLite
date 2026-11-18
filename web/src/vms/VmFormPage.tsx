@@ -21,7 +21,6 @@ import {
   type NicRow,
   validate,
   type VmFormValues,
-  windows11,
 } from "@/vms/form";
 import { BootOrderSection } from "@/vms/form/BootOrderSection";
 import { CdromsSection } from "@/vms/form/CdromsSection";
@@ -34,6 +33,14 @@ import { deviceMode } from "@/vms/hotplug";
 import { NicsSection } from "@/vms/form/NicsSection";
 import { ReplicationSection } from "@/vms/form/ReplicationSection";
 import { ScheduleSection } from "@/vms/form/ScheduleSection";
+import {
+  FormSteps,
+  PresetPicker,
+  ReviewSection,
+  StepSection,
+  TemplatePicker,
+} from "@/vms/form/FormSteps";
+import { applyPreset, errorCounts, FORM_STEPS, type Preset, stepId } from "@/vms/form/steps";
 import { createVm, createVolume, isConflict, trackHotplug, updateVm } from "@/vms/form/submit";
 import { firstLocalDisk } from "@/vms/replication";
 import { formSnapshotSupport } from "@/vms/snapshots";
@@ -79,8 +86,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const [busy, setBusy] = useState(false);
   // 사용자가 머신을 직접 고르기 전에는 노드를 바꾸면 그 노드에 맞게 기본값을 다시 정한다(만들 때만).
   const [machineChosen, setMachineChosen] = useState(false);
-  // "Windows 11" 미리 채우기를 썼다. 그 뒤에 더하는 디스크는 SATA, NIC는 e1000e로 시작한다.
-  const [windows, setWindows] = useState(false);
+  // 고른 프리셋(만들 때만). "Windows 11"이면 그 뒤에 더하는 디스크는 SATA, NIC는 e1000e로 시작한다.
+  const [preset, setPreset] = useState<Preset>("blank");
+  const windows = preset === "windows";
   // 화면을 떠나면 기다리던 볼륨 Task를 그만 기다리고 VM을 만들지 않는다.
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
@@ -172,6 +180,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
     );
     setErrors(found);
     if (Object.keys(found).length > 0) {
+      // 오류가 있는 첫 단계로 옮긴다(긴 폼의 아래쪽 오류를 놓치지 않게).
+      const first = FORM_STEPS.find((step) => errorCounts(found)[step]);
+      document.getElementById(stepId(first ?? "general"))?.scrollIntoView?.({ block: "start" });
       return;
     }
     setBusy(true);
@@ -241,159 +252,209 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
     }
   }
 
+  const counts = errorCounts(errors);
+  const fromTemplate = creating && preset === "template";
   return (
-    <form onSubmit={submit} className="flex max-w-3xl flex-col gap-4" noValidate>
-      <h1 className="text-xl font-semibold">
+    <form
+      onSubmit={submit}
+      className="grid max-w-5xl grid-cols-1 gap-x-8 gap-y-4 lg:grid-cols-[12rem_minmax(0,1fr)]"
+      noValidate
+    >
+      <h1 className="text-xl font-semibold lg:col-span-2">
         {creating ? t("vmForm.createTitle") : t("vmForm.editTitle", { name: vm.name })}
       </h1>
-      {mode === "locked" && (
-        <p className="text-sm text-muted-foreground">{t("vmForm.runningNote")}</p>
+      {/* 긴 폼은 넓은 화면에서 쓰기 좋다(설계 §5.9 당직 보기). */}
+      <p className="text-sm text-muted-foreground md:hidden lg:col-span-2">
+        {t("common.desktopOnly")}
+      </p>
+      {!fromTemplate ? (
+        <FormSteps steps={FORM_STEPS} errors={counts} />
+      ) : (
+        <div aria-hidden className="hidden lg:block" />
       )}
-      {(mode === "live" || mode === "restart") && (
-        <p className="text-sm text-muted-foreground">{t("vmForm.runningNoteLive")}</p>
-      )}
-      {mode === "restart" && (
-        <p className="text-sm text-muted-foreground">{t("vmForm.restartForHotplug")}</p>
-      )}
-
-      {creating && (
-        <div className="flex flex-col gap-1.5">
-          <div>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              disabled={busy}
-              onClick={() => {
-                setValues(windows11);
-                setErrors({});
-                setMachineChosen(true);
-                setWindows(true);
-              }}
-            >
-              {t("vmForm.windows11")}
-            </Button>
-          </div>
-          {windows && (
-            <p role="status" className="text-sm text-muted-foreground">
-              {t("vmForm.windows11Hint")}
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* 보내는 동안에는 고치지 못하게 한다. */}
-      <fieldset disabled={busy} className="flex min-w-0 flex-col gap-4">
-        <GeneralSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          nodes={nodes.data}
-          groups={groups.data?.map((g) => g.name).sort()}
-          creating={creating}
-          locked={locked}
-          haLocked={locked && !(vm && haEnabled(vm.spec))}
-          live={mode === "live" || mode === "restart"}
-          autoMachine={creating && !machineChosen}
-          onMachineChosen={() => setMachineChosen(true)}
-          noReplica={noReplica}
-        />
-        <DisksSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          onRowsChange={(disks) =>
-            changeRows({ disks: presetRows(disks, values.disks, { bus: "sata" }) })
-          }
-          volumes={freeVolumes}
-          pools={pools.data}
-          creating={creating}
-          mode={mode}
-          saved={(vm?.spec.disks ?? []).map((d) => d.volume)}
-          boot={layout?.boot_disks ?? 0}
-        />
-        <NicsSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          onRowsChange={changeNics}
-          networks={networks.data}
-          securityGroups={securityGroups.data}
-          mode={mode}
-          saved={vm?.spec.nics ?? []}
-          boot={layout?.boot_nics ?? 0}
-        />
-        <CdromsSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          onRowsChange={(cdroms) => changeRows({ cdroms })}
-          isos={isos}
-          mode={mode}
-        />
-        <BootOrderSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          locked={mode !== "free"}
-        />
-        <SecuritySection
-          values={values}
-          errors={errors}
-          onChange={change}
-          nodes={nodes.data}
-          stopped={creating || isStopped(vm)}
-          firmwareNode={vm?.status.firmware_node ?? null}
-          live={mode !== "free"}
-        />
-        <GuestAgentSection values={values} onChange={change} live={mode !== "free"} />
-        <CloudInitSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          running={mode !== "free"}
-        />
-        <ScheduleSection values={values} errors={errors} onChange={change} support={support} />
-        <ReplicationSection
-          values={values}
-          errors={errors}
-          onChange={change}
-          onRowsChange={(replication) => changeRows({ replication })}
-          nodes={nodes.data}
-          pools={pools.data}
-          ownNode={values.node || (vm?.status.node ?? "")}
-        />
+      <div className="flex min-w-0 flex-col gap-4">
+        {mode === "locked" && (
+          <p className="text-sm text-muted-foreground">{t("vmForm.runningNote")}</p>
+        )}
+        {(mode === "live" || mode === "restart") && (
+          <p className="text-sm text-muted-foreground">{t("vmForm.runningNoteLive")}</p>
+        )}
+        {mode === "restart" && (
+          <p className="text-sm text-muted-foreground">{t("vmForm.restartForHotplug")}</p>
+        )}
 
         {creating && (
-          <div className="flex items-center gap-2">
-            <Checkbox
-              id="vm-start"
-              checked={values.start}
-              onCheckedChange={(v) => change({ start: v === true })}
+          <div className="flex flex-col gap-1.5">
+            <PresetPicker
+              value={preset}
+              disabled={busy}
+              onChange={(next) => {
+                setPreset(next);
+                if (next !== "template") {
+                  setValues((v) => applyPreset(next, v, initial));
+                  setErrors({});
+                  // 프리셋이 머신을 정했으면 노드를 바꿔도 다시 고르지 않는다.
+                  setMachineChosen(next === "windows");
+                }
+              }}
             />
-            <Label htmlFor="vm-start">{t("vmForm.startAfter")}</Label>
+            {windows && (
+              <p role="status" className="text-sm text-muted-foreground">
+                {t("vmForm.windows11Hint")}
+              </p>
+            )}
           </div>
         )}
-      </fieldset>
-      {failure && (
-        <div role="alert" className="flex items-center gap-3 text-sm text-destructive">
-          <span>{failure.message}</span>
-          {failure.conflict && (
-            <Button type="button" variant="outline" size="sm" onClick={reload}>
-              {t("vmForm.reload")}
+
+        {fromTemplate ? (
+          <TemplatePicker />
+        ) : (
+          <>
+            {/* 보내는 동안에는 고치지 못하게 한다. */}
+            <fieldset disabled={busy} className="flex min-w-0 flex-col gap-4">
+              <StepSection step="general">
+                <GeneralSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  nodes={nodes.data}
+                  groups={groups.data?.map((g) => g.name).sort()}
+                  creating={creating}
+                  locked={locked}
+                  haLocked={locked && !(vm && haEnabled(vm.spec))}
+                  live={mode === "live" || mode === "restart"}
+                  autoMachine={creating && !machineChosen}
+                  onMachineChosen={() => setMachineChosen(true)}
+                  noReplica={noReplica}
+                />
+              </StepSection>
+              <StepSection step="disks">
+                <DisksSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  onRowsChange={(disks) =>
+                    changeRows({ disks: presetRows(disks, values.disks, { bus: "sata" }) })
+                  }
+                  volumes={freeVolumes}
+                  pools={pools.data}
+                  creating={creating}
+                  mode={mode}
+                  saved={(vm?.spec.disks ?? []).map((d) => d.volume)}
+                  boot={layout?.boot_disks ?? 0}
+                />
+              </StepSection>
+              <StepSection step="nics">
+                <NicsSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  onRowsChange={changeNics}
+                  networks={networks.data}
+                  securityGroups={securityGroups.data}
+                  mode={mode}
+                  saved={vm?.spec.nics ?? []}
+                  boot={layout?.boot_nics ?? 0}
+                />
+              </StepSection>
+              <StepSection step="cdroms">
+                <CdromsSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  onRowsChange={(cdroms) => changeRows({ cdroms })}
+                  isos={isos}
+                  mode={mode}
+                />
+              </StepSection>
+              <StepSection step="boot">
+                <BootOrderSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  locked={mode !== "free"}
+                />
+              </StepSection>
+              <StepSection step="security">
+                <SecuritySection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  nodes={nodes.data}
+                  stopped={creating || isStopped(vm)}
+                  firmwareNode={vm?.status.firmware_node ?? null}
+                  live={mode !== "free"}
+                />
+              </StepSection>
+              <StepSection step="agent">
+                <GuestAgentSection values={values} onChange={change} live={mode !== "free"} />
+              </StepSection>
+              <StepSection step="cloudInit">
+                <CloudInitSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  running={mode !== "free"}
+                />
+              </StepSection>
+              <StepSection step="schedule">
+                <ScheduleSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  support={support}
+                />
+              </StepSection>
+              <StepSection step="replication">
+                <ReplicationSection
+                  values={values}
+                  errors={errors}
+                  onChange={change}
+                  onRowsChange={(replication) => changeRows({ replication })}
+                  nodes={nodes.data}
+                  pools={pools.data}
+                  ownNode={values.node || (vm?.status.node ?? "")}
+                />
+              </StepSection>
+
+              {creating && (
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="vm-start"
+                    checked={values.start}
+                    onCheckedChange={(v) => change({ start: v === true })}
+                  />
+                  <Label htmlFor="vm-start">{t("vmForm.startAfter")}</Label>
+                </div>
+              )}
+              <StepSection step="review">
+                <ReviewSection values={values} nodes={nodes.data} creating={creating} />
+              </StepSection>
+            </fieldset>
+            {failure && (
+              <div role="alert" className="flex items-center gap-3 text-sm text-destructive">
+                <span>{failure.message}</span>
+                {failure.conflict && (
+                  <Button type="button" variant="outline" size="sm" onClick={reload}>
+                    {t("vmForm.reload")}
+                  </Button>
+                )}
+              </div>
+            )}
+          </>
+        )}
+        <div className="flex gap-2">
+          {!fromTemplate && (
+            <Button type="submit" disabled={busy}>
+              {creating ? t("common.create") : t("common.save")}
             </Button>
           )}
+          <Button variant="ghost" asChild>
+            <Link to={creating ? "/vms" : `/vms/${encodeURIComponent(vm.name)}`}>
+              {t("common.cancel")}
+            </Link>
+          </Button>
         </div>
-      )}
-      <div className="flex gap-2">
-        <Button type="submit" disabled={busy}>
-          {creating ? t("common.create") : t("common.save")}
-        </Button>
-        <Button variant="ghost" asChild>
-          <Link to={creating ? "/vms" : `/vms/${encodeURIComponent(vm.name)}`}>
-            {t("common.cancel")}
-          </Link>
-        </Button>
       </div>
     </form>
   );

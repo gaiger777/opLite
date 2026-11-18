@@ -300,7 +300,8 @@
     "state": "상태",
     "node": "노드",
     "undo": "되돌리기",
-    "undone": "되돌렸습니다."
+    "undone": "되돌렸습니다.",
+    "desktopOnly": "이 화면은 넓은 화면에서 쓰기 좋습니다."
   },
   "confirm": {
     "typeName": "확인하려면 {{name}}을(를) 입력하세요",
@@ -613,7 +614,11 @@
         "target": "이 노드에서 돌 수 없습니다(꺼짐, 유지보수 또는 다른 아키텍처)."
       }
     },
-    "startAgain": "다시 켜기"
+    "startAgain": "다시 켜기",
+    "powerButton": {
+      "start": "{{name}} 시작",
+      "stop": "{{name}} 정지"
+    }
   },
   "snapshots": {
     "created": "만든 시각",
@@ -1654,7 +1659,17 @@
     "commandNote": "새 노드의 orbivisord가 /run/opl/opld.sock을 쓰지 않으면 --socket을 붙이세요.",
     "switch": "클러스터 전환(지금 {{name}})",
     "thisCluster": "이 클러스터",
-    "noRemotes": "원격 클러스터가 없습니다."
+    "noRemotes": "원격 클러스터가 없습니다.",
+    "join": {
+      "steps": "합류 단계",
+      "step": {
+        "issue": "토큰 만들기",
+        "run": "새 노드에서 명령 실행",
+        "wait": "노드 기다리기"
+      },
+      "joined": "{{name}}이(가) 클러스터에 합류했습니다.",
+      "waiting": "새 노드가 합류하기를 기다리는 중…"
+    }
   },
   "remotes": {
     "pageHint": "이 클러스터가 보는 다른 Orbivisor 클러스터입니다. 상태는 30초마다 모읍니다. 원격 클러스터에서 할 수 있는 일은 그곳 API 토큰 주인의 역할로도 정해집니다.",
@@ -1891,7 +1906,6 @@
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "만든 user-data와 함께 돕니다. 패키지·runcmd는 여기에.",
     "ciUserDataWarning": "user-data가 만든 user-data를 대신하므로 사용자·비밀번호·SSH 키는 쓰이지 않습니다.",
-    "windows11": "Windows 11로 미리 채우기",
     "windows11Hint": "Windows 11에 맞게 채웠습니다: q35, Secure Boot를 켠 UEFI, TPM 2.0, 게스트 에이전트, 2코어, 4096 MiB, SATA 디스크와 e1000e 인터페이스(Windows 설치 프로그램에 VirtIO 드라이버가 없음). Windows에 VirtIO 드라이버를 설치한 뒤 디스크는 virtio-blk, 인터페이스는 virtio로 바꾸면 더 빠릅니다.",
     "security": "보안",
     "securityLive": "TPM 변경은 다음 재시작 때 적용됩니다. Secure Boot는 VM이 정지돼 있을 때만 바꿀 수 있습니다.",
@@ -1914,7 +1928,42 @@
     "agentFreezeHint": "게스트가 파일 시스템을 비우고 얼리게 해 디스크 스냅샷·백업·복제본이 일관되게 합니다.",
     "agentShutdown": "끄는 방법",
     "agentShutdownAgent": "게스트 에이전트로, 안 되면 ACPI",
-    "agentShutdownAcpi": "ACPI만"
+    "agentShutdownAcpi": "ACPI만",
+    "steps": "폼 단계",
+    "stepErrors": "(오류 {{count}}개)",
+    "step": {
+      "general": "일반",
+      "disks": "디스크",
+      "nics": "네트워크",
+      "cdroms": "CD/DVD",
+      "boot": "부팅 순서",
+      "security": "보안",
+      "agent": "게스트 에이전트",
+      "cloudInit": "cloud-init",
+      "schedule": "스냅샷",
+      "replication": "복제",
+      "review": "검토"
+    },
+    "review": {
+      "on": "켬",
+      "off": "끔",
+      "cpu": "CPU",
+      "cpuValue": "{{sockets}} × 코어 {{cores}}",
+      "firmware": "펌웨어"
+    },
+    "preset": {
+      "title": "프리셋에서 시작",
+      "blank": "빈 VM",
+      "blankHint": "기본값에서 직접 정합니다.",
+      "linux": "Linux 서버",
+      "linuxHint": "코어 2개, 2048 MiB, 게스트 에이전트와 cloud-init 켬.",
+      "windows": "Windows 11",
+      "windowsHint": "Secure Boot UEFI, TPM 2.0, SATA 디스크, e1000e 인터페이스.",
+      "template": "템플릿에서",
+      "templateHint": "템플릿의 복사본을 배포합니다.",
+      "noTemplates": "아직 템플릿이 없습니다. 템플릿 화면에서 VM을 바꾸세요.",
+      "deploy": "{{name}} 배포…"
+    }
   },
   "console": {
     "connecting": "연결 중…",
@@ -1933,16 +1982,12 @@
     "nodes": "노드",
     "online": "온라인",
     "vms": "가상 머신",
-    "vmCounts": "실행 {{running}} · 정지 {{stopped}} · 실패 {{failed}}",
+    "vmCounts": "실행 {{running}} · 정지 {{stopped}}",
     "leader": "리더",
-    "perNode": "노드",
-    "hypervisor": "하이퍼바이저",
-    "activeVms": "활성 VM",
     "nodeOnline": "온라인",
     "nodeOffline": "오프라인",
     "maintenance": "유지보수",
     "witness": "위트니스",
-    "failedVms": "실패한 가상 머신",
     "recentTasks": "최근 작업",
     "allTasks": "모든 작업",
     "noLeader": "리더 없음",
@@ -1956,7 +2001,11 @@
       "expiring": "구독이 {{date}}에 만료됩니다.",
       "manage": "구독 설정",
       "dismiss": "7일 동안 숨기기"
-    }
+    },
+    "health": "클러스터 상태",
+    "alerts": "울리는 경보",
+    "ringing": "경보 보기",
+    "failedCount": "실패 {{count}}"
   },
   "settings": {
     "updates": "업데이트",
@@ -2485,6 +2534,11 @@
       "osdsHint": "노드의 디스크 통째에 OSD를 더하세요. 비어 있지 않은 디스크는 지워야 하고, 쓰는 중인 디스크는 고를 수 없습니다.",
       "poolHint": "Ceph 풀을 만들어 스토리지 풀로 등록하세요. 먼저 OSD를 더하세요.",
       "clientsHint": "Ceph 데몬이 없는 노드의 VM도 풀을 쓰도록 클라이언트 패키지를 설치할 수 있습니다(선택)."
+    },
+    "empty": {
+      "title": "Ceph 클러스터 없음",
+      "admin": "Orbivisor가 클러스터 노드에 설치하고 돌리는 Ceph 클러스터를 단계별로 만듭니다.",
+      "start": "Ceph 설정 시작"
     }
   },
   "downloads": {
@@ -2908,7 +2962,14 @@
   },
   "favorites": {
     "toggle": "{{name}} 즐겨찾기",
-    "removed": "즐겨찾기에서 {{name}}을(를) 뺐습니다."
+    "removed": "즐겨찾기에서 {{name}}을(를) 뺐습니다.",
+    "title": "즐겨찾기",
+    "empty": "아직 즐겨찾기가 없습니다. VM·노드·스토리지 풀에 ★를 누르면 여기에 모입니다.",
+    "kind": {
+      "vm": "VM",
+      "node": "노드",
+      "storage-pool": "스토리지 풀"
+    }
   },
   "create": {
     "menu": "새로 만들기",
@@ -3039,5 +3100,33 @@
     "jobRunning": "백업 작업이 도는 중입니다.",
     "jobDisabled": "백업 작업이 꺼져 있습니다.",
     "view": "보기"
+  },
+  "capacity": {
+    "title": "용량",
+    "vcpus": "도는 VM에 나눠 준 vCPU",
+    "memory": "도는 VM에 나눠 준 메모리",
+    "vcpusOf": "코어 {{total}}개 중 {{used}}",
+    "high": "{{text}}, {{percent}} %, 높음"
+  },
+  "firstSteps": {
+    "title": "첫 걸음",
+    "description": "첫 가상 머신까지 세 단계입니다.",
+    "done": "(완료)",
+    "pool": {
+      "title": "스토리지 풀 만들기",
+      "hint": "디스크·ISO·백업은 스토리지 풀에 둡니다.",
+      "action": "풀 만들기"
+    },
+    "media": {
+      "title": "ISO 올리기·이미지 받기",
+      "hint": "ISO로 설치하거나 준비된 클라우드 이미지로 시작합니다.",
+      "action": "ISO 올리기",
+      "images": "또는 이미지 받기"
+    },
+    "vm": {
+      "title": "VM 만들기",
+      "hint": "프리셋을 고르고 ISO나 이미지를 붙입니다.",
+      "action": "VM 만들기"
+    }
   }
 }

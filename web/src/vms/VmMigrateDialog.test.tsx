@@ -145,11 +145,19 @@ it("blocks other actions and shows the target while migrating", async () => {
   openDetail();
   expect(await screen.findByText("Migrating")).toBeInTheDocument();
   expect(await screen.findByText("node-a → node-b")).toBeInTheDocument();
-  for (const name of ["Migrate", "Stop", "Force stop", "Reboot"]) {
+  for (const name of ["Migrate", "Stop"]) {
     const button = screen.getByRole("button", { name });
     expect(button).toHaveAttribute("aria-disabled", "true");
     expect(button).toHaveAccessibleDescription("Not available while the VM is being migrated.");
   }
+  // 강제 정지·재시작은 케밥 메뉴에 있다.
+  await userEvent.click(screen.getByRole("button", { name: "Actions for web" }));
+  for (const name of ["Force stop", "Reboot"]) {
+    const item = screen.getByRole("menuitem", { name });
+    expect(item).toHaveAttribute("aria-disabled", "true");
+    expect(item).toHaveAccessibleDescription("Not available while the VM is being migrated.");
+  }
+  await userEvent.keyboard("{Escape}");
   // 콘솔은 열 수 있다(원본 QEMU가 계속 돈다).
   expect(screen.getByRole("link", { name: "Open console" })).not.toHaveAttribute("aria-disabled");
 });

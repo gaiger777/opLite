@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { Download, Plus } from "lucide-react";
+import { Check } from "lucide-react";
 import { useRef, useState, type RefObject } from "react";
 import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
+import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
 import { can } from "@/auth/permissions";
@@ -192,6 +194,7 @@ function IssueDialog({
       onClose={onClose}
       onSubmit={submit}
     >
+      <JoinSteps current="issue" />
       <Field id="join-ttl" label={t("cluster.ttl")}>
         <NativeSelect
           id="join-ttl"
@@ -210,7 +213,33 @@ function IssueDialog({
   );
 }
 
-/** 발급한 조인 URL. 서버는 다시 보여 주지 않으므로 "완료"로만 닫는다. */
+/** 합류 마법사의 단계(설계 §5.6): 토큰 만들기 → 새 노드에서 명령 실행 → 노드가 나타나기 기다리기 */
+const JOIN_STEPS = ["issue", "run", "wait"] as const;
+type JoinStep = (typeof JOIN_STEPS)[number] | "done";
+
+function JoinSteps({ current }: { current: JoinStep }) {
+  const { t } = useTranslation();
+  const at = current === "done" ? JOIN_STEPS.length : JOIN_STEPS.indexOf(current);
+  return (
+    <ol aria-label={t("cluster.join.steps")} className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+      {JOIN_STEPS.map((step, i) => (
+        <li
+          key={step}
+          aria-current={i === at ? "step" : undefined}
+          className={i === at ? "font-medium" : "flex items-center gap-1 text-muted-foreground"}
+        >
+          {i < at && <Check aria-hidden className="size-3.5 text-success" />}
+          {`${i + 1}. ${t(`cluster.join.step.${step}`)}`}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
+ * 발급한 조인 URL과 합류 기다리기. 서버는 URL을 다시 보여 주지 않으므로 "완료"로만 닫는다. 열 때의 노드 목록에 없던
+ * 노드가 watch로 나타나면 합류했다고 알린다.
+ */
 function JoinTokenDialog({
   token,
   returnFocus,
@@ -222,6 +251,15 @@ function JoinTokenDialog({
 }) {
   const { t, i18n } = useTranslation();
   const command = joinCommand(token.url);
+  const nodes = useList("node");
+  // 열 때 이미 있던 노드. 목록을 아직 읽지 못했으면 읽은 때의 목록이다.
+  const [known, setKnown] = useState<Set<string> | null>(null);
+  const [copied, setCopied] = useState(false);
+  if (known === null && nodes.data) {
+    setKnown(new Set(nodes.data.map((n) => n.id)));
+  }
+  const joined = known && nodes.data?.find((n) => !known.has(n.id));
+  const step: JoinStep = joined ? "done" : copied ? "wait" : "run";
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
       <DialogContent
@@ -238,7 +276,8 @@ function JoinTokenDialog({
             })}
           </DialogDescription>
         </DialogHeader>
-        <div className="flex items-center gap-2">
+        <JoinSteps current={step} />
+        <div className="flex items-center gap-2" onClickCapture={() => setCopied(true)}>
           <Input
             readOnly
             aria-label={t("cluster.command")}
@@ -249,6 +288,17 @@ function JoinTokenDialog({
           <CopyButton text={command} label={t("cluster.copyCommand")} />
         </div>
         <p className="text-xs text-muted-foreground">{t("cluster.commandNote")}</p>
+        {/* 합류를 화면 읽기 프로그램에 알린다(머리줄 LiveBadge의 status와 겹치지 않게 role 없이). */}
+        <p aria-live="polite" className="text-sm">
+          {joined ? (
+            <span className="flex items-center gap-1 font-medium text-success-fg">
+              <Check aria-hidden className="size-4" />
+              {t("cluster.join.joined", { name: joined.name })}
+            </span>
+          ) : (
+            <span className="text-muted-foreground">{t("cluster.join.waiting")}</span>
+          )}
+        </p>
         <DialogFooter>
           <Button onClick={onClose}>{t("common.done")}</Button>
         </DialogFooter>

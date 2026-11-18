@@ -608,3 +608,34 @@ it("previews a VM in a drawer", async () => {
   await userEvent.click(within(peek).getByRole("button", { name: "Stop" }));
   expect(await screen.findByRole("alertdialog", { name: "Stop web?" })).toBeInTheDocument();
 });
+
+it("shows the first steps while there are no VMs", async () => {
+  mockLists({ node: [NODE] });
+  renderPage(<VmListPage />);
+  const steps = await screen.findByRole("region", { name: "First steps" });
+  expect(within(steps).getByRole("link", { name: "Create a pool" })).toHaveAttribute(
+    "href",
+    "/storage-pools?create=1",
+  );
+});
+
+it("puts a power button on each phone card", async () => {
+  const original = window.matchMedia;
+  window.matchMedia = ((query: string) => ({
+    ...original(query),
+    matches: query === "(max-width: 767px)",
+  })) as typeof window.matchMedia;
+  try {
+    mockLists({ vm: [web, db], node: [NODE] });
+    renderPage(<VmListPage />);
+    const list = await screen.findByRole("list", { name: "Virtual machines" });
+    await within(list).findByRole("link", { name: "db" });
+    const cards = within(list).getAllByRole("listitem");
+    const card = (name: string) => cards.find((c) => within(c).queryByRole("link", { name }))!;
+    expect(within(card("web")).getByRole("button", { name: "Stop web" })).toBeInTheDocument();
+    expect(within(card("db")).getByRole("button", { name: "Start db" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "First steps" })).not.toBeInTheDocument();
+  } finally {
+    window.matchMedia = original;
+  }
+});

@@ -42,6 +42,13 @@ function initTask(state: Task["status"]["state"], extra: Partial<Task["status"]>
   return { ...t, status: { ...t.status, state, ...extra } };
 }
 
+/** 빈 상태의 주 단추로 마법사를 연다. */
+async function startSetup(user: ReturnType<typeof userEvent.setup>) {
+  const start = await screen.findByRole("button", { name: "Start the Ceph setup" });
+  expect(screen.getByText("No Ceph cluster")).toBeInTheDocument();
+  await user.click(start);
+}
+
 /** `POST /ceph`에 보낸 본문을 모은다. */
 function acceptInit() {
   const sent: unknown[] = [];
@@ -66,6 +73,7 @@ it("sets up Ceph from the wizard and follows the bootstrap task", async () => {
   const sent = acceptInit();
   renderPage(<CephPage />);
   const user = userEvent.setup();
+  await startSetup(user);
   await screen.findByRole("option", { name: "node-a" });
   const select = screen.getByLabelText("First node");
   // 위트니스는 빼고, 오프라인 노드는 막는다.
@@ -89,6 +97,7 @@ it("sends the networks the admin typed", async () => {
   const sent = acceptInit();
   renderPage(<CephPage />);
   const user = userEvent.setup();
+  await startSetup(user);
   // 인터페이스를 모르는 노드는 채우지 않는다(비우면 서버가 정한다).
   const pub = await screen.findByLabelText("Public network");
   expect(pub).toHaveValue("");
@@ -107,6 +116,7 @@ it("shows why setting up failed and retries on the same node", async () => {
   const sent = acceptInit();
   renderPage(<CephPage />);
   const user = userEvent.setup();
+  await startSetup(user);
   await user.click(await screen.findByRole("button", { name: "Set up Ceph" }));
   expect(
     await screen.findByText("Setting up Ceph failed: apt-get install failed"),
@@ -135,6 +145,7 @@ it("goes through the monitor, OSD, pool and client steps", async () => {
   );
   renderPage(<CephPage />);
   const user = userEvent.setup();
+  await startSetup(user);
   await user.click(await screen.findByRole("button", { name: "Set up Ceph" }));
   await user.click(await screen.findByRole("button", { name: "Next" }));
   expect(await screen.findByText("Monitors now: 1 (node-a)")).toBeInTheDocument();
@@ -154,6 +165,7 @@ it("tells other roles that no Ceph is set up", async () => {
   mockLists({ node: [NODE] });
   renderPage(<CephPage />, { as: VIEWER });
   expect(await screen.findByText(/No Ceph cluster is set up/)).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Start the Ceph setup" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Set up Ceph" })).not.toBeInTheDocument();
 });
 

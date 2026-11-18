@@ -53,7 +53,15 @@ it("shows a VM, its hardware and its tasks", async () => {
   expect(screen.getByRole("button", { name: "Start" })).toHaveAccessibleDescription(
     "The VM is running.",
   );
-  expect(screen.getByRole("button", { name: "Delete" })).toHaveAttribute("aria-disabled", "true");
+  // 나머지 동작은 케밥 메뉴에 있다.
+  await userEvent.click(screen.getByRole("button", { name: "Actions for web" }));
+  expect(screen.getByRole("menuitem", { name: "Delete" })).toHaveAttribute("aria-disabled", "true");
+  expect(screen.getByRole("menuitem", { name: "Delete" })).toHaveAccessibleDescription(
+    "The VM is running.",
+  );
+  expect(screen.getByRole("menuitem", { name: "Edit" })).toBeInTheDocument();
+  expect(screen.getByRole("menuitem", { name: "Clone" })).toBeInTheDocument();
+  await userEvent.keyboard("{Escape}");
 
   await userEvent.click(screen.getByRole("tab", { name: "Hardware" }));
   expect(screen.getByText("web-root")).toBeInTheDocument();
@@ -74,7 +82,8 @@ it("force stops after confirming", async () => {
     }),
   );
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
-  await userEvent.click(await screen.findByRole("button", { name: "Force stop" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for web" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Force stop" }));
   const dialog = await screen.findByRole("alertdialog");
   await userEvent.click(within(dialog).getByRole("button", { name: "Force stop" }));
   expect(await screen.findByText("Force stop web")).toBeInTheDocument();
@@ -144,7 +153,8 @@ it("keeps the delete dialog open while the request runs", async () => {
     ),
   );
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
-  await userEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for db" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
   const dialog = await screen.findByRole("alertdialog");
   await userEvent.type(within(dialog).getByLabelText("Type db to confirm"), "db");
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
@@ -176,7 +186,8 @@ it("stops deleting snapshots when the page goes away", async () => {
     path: "/vms/:name",
     url: "/vms/db",
   });
-  await userEvent.click(await screen.findByRole("button", { name: "Delete" }));
+  await userEvent.click(await screen.findByRole("button", { name: "Actions for db" }));
+  await userEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
   const dialog = await screen.findByRole("alertdialog");
   // 영향 목록: 이미 받은 목록에서 센다.
   expect(within(dialog).getByRole("list", { name: "What this affects" })).toHaveTextContent(
@@ -219,7 +230,8 @@ it("blocks force stop while a snapshot is being reverted and says why", async ()
   };
   mockLists({ vm: [web], node: [NODE], task: [revert] });
   const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
-  const button = await screen.findByRole("button", { name: "Force stop" });
+  await userEvent.click(await screen.findByRole("button", { name: /^Actions for / }));
+  const button = screen.getByRole("menuitem", { name: "Force stop" });
   await waitFor(() => expect(button).toHaveAttribute("aria-disabled", "true"));
   expect(button).toHaveAccessibleDescription("Not available while a snapshot is being reverted.");
   // 되돌리기가 끝나면 다시 켠다.
@@ -242,7 +254,8 @@ it("does not blame a revert for a VM that is already off", async () => {
   };
   mockLists({ vm: [db], node: [NODE], task: [revert] });
   const { queryClient } = renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
-  const button = await screen.findByRole("button", { name: "Force stop" });
+  await userEvent.click(await screen.findByRole("button", { name: /^Actions for / }));
+  const button = screen.getByRole("menuitem", { name: "Force stop" });
   await waitFor(() => expect(queryClient.getQueryData(["list", "task"])).toBeDefined());
   expect(button).toHaveAttribute("aria-disabled", "true");
   expect(button).toHaveAccessibleDescription("The VM is stopped.");

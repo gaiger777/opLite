@@ -1,52 +1,18 @@
 import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
-import { DashboardPage, usage } from "@/pages/DashboardPage";
-import { NODE, vm } from "@/test/fixtures";
-import { mockLists, renderPage } from "@/test/render";
+import { clusterCapacity, usage } from "@/dashboard/CapacityWidget";
+import { setPin } from "@/lib/recent";
+import { DashboardPage } from "@/pages/DashboardPage";
+import { expectNoAxeViolations } from "@/test/axe";
+import { NODE, pool, task, vm, volume } from "@/test/fixtures";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
-it("summarizes nodes, VMs and failures", async () => {
-  const down = { ...NODE, id: "n2", name: "node-b", status: { ...NODE.status, online: false } };
-  const broken = vm("db", "failed", {
-    status: {
-      phase: "failed",
-      node: null,
-      pid: null,
-      last_error: "no firmware",
-      snapshot: null,
-      schedule_error: null,
-    },
-  });
-  // 옮기는 중인 VM도 실행 중으로 센다.
-  const app = vm("app", "running");
-  const migrating = { ...app, status: { ...app.status, phase: "migrating" as const } };
-  mockLists({ node: [NODE, down], vm: [vm("web", "running"), migrating, broken] });
-  server.use(
-    http.get(apiUrl("/cluster"), () =>
-      HttpResponse.json({
-        name: "lab",
-        ca_fingerprint: "x",
-        leader: "n1",
-        node: "n1",
-        members: [],
-      }),
-    ),
-  );
-  renderPage(<DashboardPage />);
-  expect(await screen.findByText("1 / 2")).toBeInTheDocument();
-  expect(screen.getByText("2 running · 0 stopped · 1 failed")).toBeInTheDocument();
-  expect(await screen.findByText("node-a", { selector: "div" })).toBeInTheDocument();
-  expect(screen.getByRole("group", { name: "Leader" })).toHaveTextContent("node-a");
-  const table = screen.getByRole("table", { name: "Nodes" });
-  expect(within(table).getByRole("columnheader", { name: "Active VMs" })).toBeInTheDocument();
-  const row = within(table).getByText("node-a", { selector: "td" }).closest("tr")!;
-  expect(row).toHaveTextContent("4 / 8");
-  expect(row).toHaveTextContent("4 GiB / 16 GiB");
-  expect(screen.getByText("Offline")).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "db" })).toBeInTheDocument();
-  expect(screen.getByText("no firmware")).toBeInTheDocument();
-});
+const VIEWER = { ...ADMIN, role: "viewer" as const };
+
+beforeEach(() => localStorage.clear());
 
 const cluster = (leader: string | null, members: { id: string; name?: string | null }[] = []) =>
   http.get(apiUrl("/cluster"), () =>
@@ -65,97 +31,112 @@ const cluster = (leader: string | null, members: { id: string; name?: string | n
     }),
   );
 
+it("summarizes nodes, VMs, failures, alerts and the leader in the health strip", async () => {
+  const down = { ...NODE, id: "n2", name: "node-b", status: { ...NODE.status, online: false } };
+  const broken = vm("db", "failed");
+  // 옮기는 중인 VM도 실행 중으로 센다.
+  const app = vm("app", "running");
+  const migrating = { ...app, status: { ...app.status, phase: "migrating" as const } };
+  mockLists({ node: [NODE, down], vm: [vm("web", "running"), migrating, broken] });
+  server.use(
+    cluster("n1"),
+    http.get(apiUrl("/alerts"), () =>
+      HttpResponse.json({
+        alerts: [
+          {
+            rule: "r1",
+            rule_name: "hot",
+            severity: "critical",
+            state: "firing",
+            since: 1,
+            condition: "node_metric",
+            subject: { kind: "node", id: "n1", name: "node-a" },
+          },
+          {
+            rule: "r2",
+            rule_name: "fyi",
+            severity: "info",
+            state: "firing",
+            since: 1,
+            condition: "node_metric",
+            subject: { kind: "node", id: "n1", name: "node-a" },
+          },
+        ],
+        unreachable: [],
+        unsupported: [],
+      }),
+    ),
+  );
+  const { container } = renderPage(<DashboardPage />);
+  const health = await screen.findByRole("region", { name: "Cluster health" });
+  expect(await within(health).findByText("1 / 2")).toBeInTheDocument();
+  const vms = within(health).getByRole("group", { name: "Virtual machines" });
+  expect(vms).toHaveTextContent("2 running · 0 stopped · 1 failed");
+  expect(within(vms).getByRole("link", { name: "1 failed" })).toHaveAttribute(
+    "href",
+    "/vms?phase=failed",
+  );
+  expect(await within(health).findByRole("group", { name: "Leader" })).toHaveTextContent("node-a");
+  // info 경보는 울리는 수에 넣지 않는다.
+  const alerts = within(health).getByRole("group", { name: "Alerts firing" });
+  await vi.waitFor(() => expect(alerts).toHaveTextContent(/^Alerts firing1/));
+  expect(within(alerts).getByRole("link", { name: "View alerts" })).toHaveAttribute(
+    "href",
+    "/alerts",
+  );
+  // 지난 홈의 노드별 표와 실패 목록은 없다(노드 부하·작업 위젯이 맡는다).
+  expect(screen.queryByRole("table", { name: "Nodes" })).not.toBeInTheDocument();
+  await expectNoAxeViolations(container);
+});
+
 it("counts only VMs whose QEMU runs on the node", () => {
-  // 실패한 VM도 status.node가 남는다.
-  const failed = vm("db", "failed", {
-    status: {
-      phase: "failed",
-      node: "n1",
-      pid: null,
-      last_error: "boom",
-      snapshot: null,
-      schedule_error: null,
-    },
-  });
-  const stopping = vm("app", "stopping", {
-    status: {
-      phase: "stopping",
-      node: "n1",
-      pid: 7,
-      last_error: null,
-      snapshot: null,
-      schedule_error: null,
-    },
-  });
-  const elsewhere = vm("far", "running", {
-    status: {
-      phase: "running",
-      node: "n2",
-      pid: 8,
-      last_error: null,
-      snapshot: null,
-      schedule_error: null,
-    },
-  });
-  // 옮기는 중인 VM은 확정할 때까지 원본 노드(status.node)에서 돈다.
-  const migrating = vm("mig", "migrating", {
-    status: {
-      phase: "migrating",
-      node: "n1",
-      pid: 9,
-      last_error: null,
-      snapshot: null,
-      schedule_error: null,
-      migration: { node: "n2", task: "t1" },
-    },
-  });
-  expect(usage(NODE, [vm("web", "running"), failed, stopping, elsewhere, migrating])).toEqual({
-    vms: 3,
+  const at = (name: string, phase: "failed" | "stopping" | "running" | "migrating", node: string) =>
+    vm(name, phase, {
+      status: {
+        phase,
+        node,
+        pid: null,
+        last_error: null,
+        snapshot: null,
+        schedule_error: null,
+      },
+    });
+  // 실패한 VM도 status.node가 남는다. 옮기는 중인 VM은 확정할 때까지 원본 노드에서 돈다.
+  const list = [
+    vm("web", "running"),
+    at("db", "failed", "n1"),
+    at("app", "stopping", "n1"),
+    at("far", "running", "n2"),
+    at("mig", "migrating", "n1"),
+  ];
+  expect(usage(NODE, list)).toEqual({ vms: 3, vcpus: 6, memoryMib: 6144 });
+  // 오프라인 노드와 위트니스는 용량에 넣지 않는다.
+  const off = { ...NODE, id: "n2", status: { ...NODE.status, online: false } };
+  const witness = { ...NODE, id: "n3", spec: { ...NODE.spec, witness: true } };
+  expect(clusterCapacity([NODE, off, witness], list)).toEqual({
+    cpus: 8,
     vcpus: 6,
-    memoryMib: 6144,
+    memoryMib: 16384,
+    usedMib: 6144,
   });
 });
 
-it("shows node capacity in GiB with one decimal", async () => {
-  mockLists({ node: [{ ...NODE, status: { ...NODE.status, memory_mib: 15890 } }], vm: [] });
+it("shows how much CPU and memory running VMs take", async () => {
+  mockLists({ node: [NODE], vm: [vm("web", "running"), vm("off", "stopped")] });
   server.use(cluster("n1"));
   renderPage(<DashboardPage />);
-  const table = await screen.findByRole("table", { name: "Nodes" });
-  expect(await within(table).findByText("0 MiB / 15.5 GiB")).toBeInTheDocument();
-});
-
-it("marks witness nodes", async () => {
-  const witness = { ...NODE, id: "n3", name: "node-w", spec: { ...NODE.spec, witness: true } };
-  mockLists({ node: [NODE, witness], vm: [] });
-  server.use(cluster("n1"));
-  renderPage(<DashboardPage />);
-  const table = await screen.findByRole("table", { name: "Nodes" });
-  const w = (await within(table).findByText("node-w")).closest("tr")!;
-  expect(within(w).getByText("Witness")).toBeInTheDocument();
-  expect(within(table).getAllByText("Witness")).toHaveLength(1);
-});
-
-it("shows how each node fences", async () => {
-  const fenced = {
-    ...NODE,
-    status: { ...NODE.status, ha: { fencing: "process" as const, recover_after_secs: 35 } },
-  };
-  const off = { ...NODE, id: "n2", name: "node-b" };
-  mockLists({ node: [fenced, off], vm: [] });
-  server.use(cluster("n1"));
-  renderPage(<DashboardPage />);
-  const table = await screen.findByRole("table", { name: "Nodes" });
-  const column = within(table)
-    .getAllByRole("columnheader")
-    .findIndex((h) => h.textContent === "Fencing");
-  const a = (await within(table).findByText("node-a")).closest("tr")!;
-  expect(within(a).getAllByRole("cell")[column]).toHaveTextContent("Process");
-  const b = within(table).getByText("node-b").closest("tr")!;
-  expect(within(b).getAllByRole("cell")[column]).toHaveTextContent("—");
+  const capacity = await screen.findByRole("region", { name: "Capacity" });
+  const cpu = await within(capacity).findByRole("meter", { name: "vCPUs given to running VMs" });
+  expect(cpu).toHaveAttribute("aria-valuenow", "25");
+  expect(cpu).toHaveAttribute("aria-valuetext", "2 of 8 cores, 25 %");
+  expect(
+    within(capacity).getByRole("meter", { name: "Memory given to running VMs" }),
+  ).toHaveAttribute("aria-valuetext", "2 GiB / 16 GiB, 13 %");
 });
 
 it("shows loading instead of zeros, then errors", async () => {
   let fail: (() => void) | undefined;
+  mockLists({});
   server.use(
     http.get(
       apiUrl("/nodes"),
@@ -166,7 +147,6 @@ it("shows loading instead of zeros, then errors", async () => {
         }),
     ),
     http.get(apiUrl("/vms"), () => new Promise<never>(() => {})),
-    http.get(apiUrl("/tasks"), () => HttpResponse.json({ revision: 1, items: [] })),
     http.get(apiUrl("/cluster"), () => new Promise<never>(() => {})),
   );
   renderPage(<DashboardPage />);
@@ -175,23 +155,19 @@ it("shows loading instead of zeros, then errors", async () => {
   expect(nodes).not.toHaveTextContent("0 / 0");
   expect(screen.getByRole("group", { name: "Virtual machines" })).toHaveTextContent("Loading…");
   expect(screen.getByRole("group", { name: "Leader" })).toHaveTextContent("Loading…");
-  const table = screen.getByRole("table", { name: "Nodes" });
-  expect(table).toHaveTextContent("Loading…");
 
   // 요청이 핸들러에 닿은 뒤에 실패시킨다(부하가 크면 화면이 먼저 그려진다).
   await vi.waitFor(() => expect(fail).toBeDefined());
   fail!();
   expect(await within(nodes).findByText("You do not have permission to do this.")).toBeVisible();
-  expect(within(table).getByText("You do not have permission to do this.")).toBeVisible();
 });
 
-it("says when there are no nodes", async () => {
+it("says when there is no leader", async () => {
   mockLists({});
   server.use(cluster(null));
   renderPage(<DashboardPage />);
-  const table = await screen.findByRole("table", { name: "Nodes" });
-  expect(await within(table).findByText("No nodes.")).toBeInTheDocument();
-  expect(await screen.findByRole("group", { name: "Leader" })).toHaveTextContent("No leader");
+  const leader = await screen.findByRole("group", { name: "Leader" });
+  expect(await within(leader).findByText("No leader")).toBeInTheDocument();
 });
 
 it("names the leader from cluster members, then from its id", async () => {
@@ -210,11 +186,24 @@ it("names the leader from cluster members, then from its id", async () => {
   ).toBeInTheDocument();
 });
 
-it("names the recent tasks table", async () => {
-  mockLists({ node: [NODE] });
+it("shows the recent tasks in their own card", async () => {
+  const web = vm("web", "running");
+  mockLists({
+    node: [NODE],
+    vm: [web],
+    task: [
+      {
+        ...task("019a0f3c-8a10-7000-8000-000000000009", "vm-start", web.id),
+        status: { state: "succeeded", error: null },
+      },
+    ],
+  });
   server.use(cluster("n1"));
   renderPage(<DashboardPage />);
-  expect(await screen.findByRole("table", { name: "Recent tasks" })).toBeInTheDocument();
+  const card = await screen.findByRole("region", { name: "Recent tasks" });
+  const table = within(card).getByRole("table", { name: "Recent tasks" });
+  expect(await within(table).findByText("Start web")).toBeInTheDocument();
+  expect(within(card).getByRole("link", { name: "All tasks" })).toHaveAttribute("href", "/tasks");
 });
 
 it("warns while nodes run different versions", async () => {
@@ -239,7 +228,7 @@ it("warns while nodes run different versions", async () => {
 
   mockLists({ node: [at("a", "0.10.0"), at("b", "0.10.0"), at("d")], vm: [] });
   renderPage(<DashboardPage />);
-  expect(await screen.findByText("a", { selector: "td" })).toBeInTheDocument();
+  expect(await screen.findByText("3 / 3")).toBeInTheDocument();
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 });
 
@@ -251,4 +240,148 @@ it("shows the subscription notice above the dashboard", async () => {
   );
   renderPage(<DashboardPage />);
   expect(await screen.findByRole("status")).toHaveTextContent("This cluster has no subscription.");
+});
+
+it("lists favorites with their state and a power button", async () => {
+  const web = vm("web", "running");
+  const db = vm("db", "stopped");
+  const gone = vm("gone", "stopped");
+  for (const ref of [web, db, gone]) {
+    setPin(ADMIN.user, { kind: "vm", id: ref.id, name: ref.name }, true);
+  }
+  setPin(ADMIN.user, { kind: "node", id: NODE.id, name: NODE.name }, true);
+  const local = pool("local");
+  setPin(ADMIN.user, { kind: "storage-pool", id: local.id, name: "local" }, true);
+  mockLists({ node: [NODE], vm: [web, db], "storage-pool": [local] });
+  let started = false;
+  server.use(
+    cluster("n1"),
+    http.post(apiUrl(`/vms/${db.id}/actions/start`), () => {
+      started = true;
+      return HttpResponse.json(task("t1", "vm-start", db.id), { status: 202 });
+    }),
+  );
+  renderPage(<DashboardPage />);
+  const card = await screen.findByRole("region", { name: "Favorites" });
+  const list = await within(card).findByRole("list", { name: "Favorites" });
+  // 지운 VM은 빠진다.
+  await vi.waitFor(() => expect(within(list).getAllByRole("listitem")).toHaveLength(4));
+  expect(within(list).getByRole("link", { name: "node-a" })).toHaveAttribute(
+    "href",
+    "/nodes/node-a",
+  );
+  expect(within(list).getByRole("link", { name: "local" })).toHaveAttribute(
+    "href",
+    "/storage-pools?q=local",
+  );
+  const webItem = within(list).getByRole("link", { name: "web" }).closest("li")!;
+  expect(webItem).toHaveTextContent("Running");
+  // 실행 중이면 정지(확인), 꺼져 있으면 시작(바로)
+  await userEvent.click(within(webItem).getByRole("button", { name: "Stop web" }));
+  expect(await screen.findByRole("alertdialog", { name: "Stop web?" })).toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  await userEvent.click(within(list).getByRole("button", { name: "Start db" }));
+  await vi.waitFor(() => expect(started).toBe(true));
+});
+
+it("says when there are no favorites and hides power buttons from viewers", async () => {
+  const web = vm("web", "running");
+  setPin(ADMIN.user, { kind: "vm", id: web.id, name: "web" }, true);
+  mockLists({ node: [NODE], vm: [web] });
+  server.use(cluster("n1"));
+  const { unmount } = renderPage(<DashboardPage />, { as: VIEWER });
+  const card = await screen.findByRole("region", { name: "Favorites" });
+  expect(await within(card).findByRole("link", { name: "web" })).toBeInTheDocument();
+  expect(within(card).queryByRole("button")).not.toBeInTheDocument();
+  unmount();
+
+  localStorage.clear();
+  renderPage(<DashboardPage />);
+  expect(
+    await screen.findByText(/^No favorites yet\. Mark VMs, nodes and storage pools/),
+  ).toBeInTheDocument();
+});
+
+it("walks a new cluster through its first steps", async () => {
+  mockLists({ node: [NODE] });
+  server.use(cluster("n1"));
+  const { unmount } = renderPage(<DashboardPage />);
+  let steps = await screen.findByRole("region", { name: "First steps" });
+  const items = () => within(steps).getAllByRole("listitem");
+  expect(items()[0]).toHaveAttribute("aria-current", "step");
+  expect(within(items()[0]!).getByRole("link", { name: "Create a pool" })).toHaveAttribute(
+    "href",
+    "/storage-pools?create=1",
+  );
+  unmount();
+
+  // 풀이 있으면 첫 단계는 끝났고 ISO·이미지 단계가 지금 단계다.
+  mockLists({ node: [NODE], "storage-pool": [pool("local")] });
+  const second = renderPage(<DashboardPage />);
+  steps = await screen.findByRole("region", { name: "First steps" });
+  await vi.waitFor(() => expect(items()[1]).toHaveAttribute("aria-current", "step"));
+  expect(items()[0]).toHaveTextContent("(done)");
+  expect(within(items()[0]!).queryByRole("link")).not.toBeInTheDocument();
+  expect(within(items()[1]!).getByRole("link", { name: "Upload an ISO" })).toHaveAttribute(
+    "href",
+    "/isos?create=1",
+  );
+  expect(within(items()[1]!).getByRole("link", { name: "or download an image" })).toHaveAttribute(
+    "href",
+    "/images",
+  );
+  second.unmount();
+
+  mockLists({
+    node: [NODE],
+    "storage-pool": [pool("local")],
+    volume: [volume("root", "local")],
+  });
+  const third = renderPage(<DashboardPage />);
+  steps = await screen.findByRole("region", { name: "First steps" });
+  await vi.waitFor(() => expect(items()[2]).toHaveAttribute("aria-current", "step"));
+  expect(within(items()[2]!).getByRole("link", { name: "Create a VM" })).toHaveAttribute(
+    "href",
+    "/vms/-new",
+  );
+  third.unmount();
+
+  // VM이 생기면 사라진다. viewer에게는 보이지 않는다.
+  mockLists({ node: [NODE], "storage-pool": [pool("local")], vm: [vm("web", "stopped")] });
+  const fourth = renderPage(<DashboardPage />);
+  expect(await screen.findByRole("region", { name: "Favorites" })).toBeInTheDocument();
+  await screen.findByText("1 / 1");
+  expect(screen.queryByRole("region", { name: "First steps" })).not.toBeInTheDocument();
+  fourth.unmount();
+  mockLists({ node: [NODE] });
+  renderPage(<DashboardPage />, { as: VIEWER });
+  await screen.findByText("1 / 1");
+  expect(screen.queryByRole("region", { name: "First steps" })).not.toBeInTheDocument();
+});
+
+it("puts alerts, the health strip and favorites first on a phone", async () => {
+  const media = vi.spyOn(window, "matchMedia").mockImplementation(
+    (query: string) =>
+      ({
+        matches: query === "(max-width: 767px)",
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }) as unknown as MediaQueryList,
+  );
+  try {
+    mockLists({ node: [NODE], vm: [vm("web", "running")] });
+    server.use(cluster("n1"));
+    renderPage(<DashboardPage />);
+    await screen.findByText("1 / 1");
+    const names = screen.getAllByRole("region").map((r) => {
+      const id = r.getAttribute("aria-labelledby");
+      return r.getAttribute("aria-label") ?? (id ? document.getElementById(id)?.textContent : "");
+    });
+    expect(names.slice(0, 3)).toEqual(["Active alerts", "Cluster health", "Favorites"]);
+    // 휴대폰에서는 차트를 그리지 않는다.
+    expect(screen.queryByRole("region", { name: "Cluster load" })).not.toBeInTheDocument();
+  } finally {
+    media.mockRestore();
+  }
 });

@@ -1,4 +1,4 @@
-import { Suspense, useEffect, useId, useMemo, useState } from "react";
+import { Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -14,11 +14,12 @@ import { VmBackups } from "@/backups/VmBackups";
 import { ListPending } from "@/components/ListPending";
 import { useVisit } from "@/components/PinButton";
 import { Pager, usePage } from "@/components/Pager";
-import { ReasonButton, ReasonList } from "@/components/Reason";
+import { ReasonButton, ReasonList, ReasonMenuItem } from "@/components/Reason";
 import { ResourceHeader } from "@/components/ResourceHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import {
   Table,
   TableBody,
@@ -35,13 +36,7 @@ import { formatBytes, formatMib, formatTime, uuidTime } from "@/lib/format";
 import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import { diskVolumes, isTemplate, linkedClones } from "@/templates/templates";
-import {
-  ACTIONS,
-  availability,
-  useVmActions,
-  type VmAction,
-  type VmOperation,
-} from "@/vms/actions";
+import { availability, useVmActions, type VmAction, type VmOperation } from "@/vms/actions";
 import { bootList, deviceName } from "@/vms/boot";
 import { cloudInitSummary } from "@/vms/cloudInit";
 import { changeCdrom, trackHotplug } from "@/vms/form/submit";
@@ -72,6 +67,10 @@ import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
+
+/** 머리의 단추로 두는 전원 동작. 나머지 전원 동작은 케밥에 있다. */
+const PRIMARY: readonly VmAction[] = ["start", "stop"];
+const SECONDARY: readonly VmAction[] = ["reboot", "force-stop"];
 
 const TABS = [
   "summary",
@@ -195,8 +194,10 @@ function VmHeader({ vm }: { vm: Vm }) {
   const hint = useId();
   const { run } = useVmActions();
   const host = useVmActionHost();
+  // 케밥에서 연 대화상자가 닫히면 케밥 단추로 포커스를 돌린다.
+  const kebab = useRef<HTMLButtonElement>(null);
   const setConfirm = (which: VmDialog) =>
-    host.open({ vm, which, afterRemove: () => void navigate("/vms") });
+    host.open({ vm, which, returnFocus: kebab, afterRemove: () => void navigate("/vms") });
   const template = isTemplate(vm);
   useVisit({ kind: "vm", id: vm.id, name: vm.name });
   const { convert, revert } = useTemplateReasons(vm);
@@ -221,12 +222,8 @@ function VmHeader({ vm }: { vm: Vm }) {
     return able.ok ? null : able.reason;
   };
   const consoleReason = reasonOf("console");
-  // 보이는 버튼의 막힌 이유만 모은다.
-  const reasons = [
-    ...(operate ? [...ACTIONS.map(reasonOf), consoleReason, reasonOf("migrate")] : []),
-    write ? reasonOf("delete") : null,
-    write ? (template ? revert : convert) : null,
-  ];
+  // 보이는 버튼의 막힌 이유만 모은다(케밥 항목은 항목 옆에 이유를 보인다).
+  const reasons = operate ? [...PRIMARY.map(reasonOf), consoleReason, reasonOf("migrate")] : [];
   const button = (action: VmAction) => (
     <ReasonButton
       key={action}
@@ -234,13 +231,62 @@ function VmHeader({ vm }: { vm: Vm }) {
       size="sm"
       reason={reasonOf(action)}
       reasons={hint}
-      onClick={() => (action === "force-stop" ? setConfirm("force-stop") : void run(vm, action))}
+      onClick={() => void run(vm, action)}
     >
       {t(`vms.action.${action}`)}
     </ReasonButton>
   );
   const ips = (vm.spec.cloud_init?.networks ?? []).flatMap((net) =>
     [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
+  );
+  // 주 동작(시작·정지·콘솔·옮기기)은 단추, 나머지는 케밥이다(설계 §5.3).
+  const menu = (operate || write) && (
+    <>
+      {operate &&
+        SECONDARY.map((action) => (
+          <ReasonMenuItem
+            key={action}
+            reason={reasonOf(action)}
+            onSelect={() =>
+              action === "force-stop" ? setConfirm("force-stop") : void run(vm, action)
+            }
+          >
+            {t(`vms.action.${action}`)}
+          </ReasonMenuItem>
+        ))}
+      {write && (
+        <DropdownMenuItem
+          onSelect={() => void navigate(`/vms/${encodeURIComponent(vm.name)}/edit`)}
+        >
+          {t("vms.action.edit")}
+        </DropdownMenuItem>
+      )}
+      {write && can(me.role, "write", "volume") && (
+        <DropdownMenuItem onSelect={() => setConfirm(template ? "deploy" : "clone")}>
+          {template ? t("templates.deploy") : t("vms.action.clone")}
+        </DropdownMenuItem>
+      )}
+      {write && (
+        <ReasonMenuItem
+          reason={template ? revert : convert}
+          onSelect={() => setConfirm(template ? "untemplate" : "template")}
+        >
+          {template ? t("templates.revert") : t("templates.convert")}
+        </ReasonMenuItem>
+      )}
+      {write && (
+        <>
+          <DropdownMenuSeparator />
+          <ReasonMenuItem
+            variant="destructive"
+            reason={reasonOf("delete")}
+            onSelect={() => setConfirm("delete")}
+          >
+            {t("vms.action.delete")}
+          </ReasonMenuItem>
+        </>
+      )}
+    </>
   );
   return (
     <ResourceHeader
@@ -275,17 +321,15 @@ function VmHeader({ vm }: { vm: Vm }) {
         },
       ]}
       actions={
-        <>
-          {operate && ACTIONS.map(button)}
-          {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
-          {operate && (
+        operate && (
+          <>
+            {PRIMARY.map(button)}
+            {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
             <ReasonButton variant="outline" size="sm" reason={consoleReason} reasons={hint} asChild>
               <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
                 {t("vms.openConsole")}
               </Link>
             </ReasonButton>
-          )}
-          {operate && (
             <ReasonButton
               variant="outline"
               size="sm"
@@ -295,45 +339,11 @@ function VmHeader({ vm }: { vm: Vm }) {
             >
               {t("vms.action.migrate")}
             </ReasonButton>
-          )}
-          {write && (
-            <Button variant="outline" size="sm" asChild>
-              <Link to={`/vms/${encodeURIComponent(vm.name)}/edit`}>{t("vms.action.edit")}</Link>
-            </Button>
-          )}
-          {write && can(me.role, "write", "volume") && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirm(template ? "deploy" : "clone")}
-            >
-              {template ? t("templates.deploy") : t("vms.action.clone")}
-            </Button>
-          )}
-          {write && (
-            <ReasonButton
-              variant="outline"
-              size="sm"
-              reason={template ? revert : convert}
-              reasons={hint}
-              onClick={() => setConfirm(template ? "untemplate" : "template")}
-            >
-              {template ? t("templates.revert") : t("templates.convert")}
-            </ReasonButton>
-          )}
-          {write && (
-            <ReasonButton
-              variant="destructive"
-              size="sm"
-              reason={reasonOf("delete")}
-              reasons={hint}
-              onClick={() => setConfirm("delete")}
-            >
-              {t("vms.action.delete")}
-            </ReasonButton>
-          )}
-        </>
+          </>
+        )
       }
+      menu={menu}
+      menuRef={kebab}
     >
       <ReasonList base={hint} reasons={reasons} className="basis-full" />
     </ResourceHeader>

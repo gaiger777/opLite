@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { ClusterPage, joinCommand } from "@/cluster/ClusterPage";
-import { ADMIN, renderPage } from "@/test/render";
+import { NODE } from "@/test/fixtures";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
 const member = (id: string, name: string | null, extra = {}) => ({
@@ -105,9 +106,13 @@ it("issues a join token and shows the command once", async () => {
       );
     }),
   );
-  renderPage(<ClusterPage />);
+  mockLists({ node: [NODE] });
+  const { queryClient } = renderPage(<ClusterPage />);
   await user.click(await screen.findByRole("button", { name: "Issue a join token" }));
   const form = await screen.findByRole("dialog", { name: "Issue a join token" });
+  // 합류 마법사: 토큰 → 명령 → 기다리기
+  const steps = (el: HTMLElement) => within(el).getByRole("list", { name: "Join steps" });
+  expect(within(steps(form)).getByText("1. Issue a token")).toHaveAttribute("aria-current", "step");
   await user.selectOptions(within(form).getByLabelText("Valid for"), "1 day");
   await user.click(within(form).getByRole("button", { name: "Issue a join token" }));
 
@@ -116,8 +121,26 @@ it("issues a join token and shows the command once", async () => {
   const command = "orbivisorctl cluster join 'opl-join://node-b:8006?token=oplj_x&ca=sha256:00ff'";
   expect(within(dialog).getByLabelText("Command")).toHaveValue(command);
   expect(within(dialog).getByText(/2030/)).toBeInTheDocument();
+  expect(within(steps(dialog)).getByText("2. Run the command on the new node")).toHaveAttribute(
+    "aria-current",
+    "step",
+  );
   await user.click(within(dialog).getByRole("button", { name: "Copy the command" }));
   expect(await navigator.clipboard.readText()).toBe(command);
+  expect(within(steps(dialog)).getByText("3. Wait for the node")).toHaveAttribute(
+    "aria-current",
+    "step",
+  );
+  expect(within(dialog).getByText("Waiting for the new node to join…")).toBeInTheDocument();
+  // watch로 새 노드가 나타나면 합류했다고 알린다.
+  act(() =>
+    queryClient.setQueryData(["list", "node"], {
+      revision: 2,
+      items: [NODE, { ...NODE, id: "n9", name: "node-new" }],
+    }),
+  );
+  expect(await within(dialog).findByText("node-new joined the cluster.")).toBeInTheDocument();
+  expect(within(steps(dialog)).queryByText(/./, { selector: "[aria-current]" })).toBeNull();
   // 명령을 놓치지 않게 Esc나 바깥 클릭으로는 닫히지 않는다.
   expect(within(dialog).queryByRole("button", { name: "Close" })).not.toBeInTheDocument();
   await user.keyboard("{Escape}");

@@ -62,7 +62,7 @@ const PHONE = "(max-width: 767px)";
 const INTERACTIVE = "a, button, select, [role=checkbox], [role=switch], [role=menuitem]";
 
 /** 휴대폰 폭이면 카드 목록으로 그린다(설계 §5.9). */
-function useIsPhone(): boolean {
+export function useIsPhone(): boolean {
   const [phone, setPhone] = useState(() => window.matchMedia(PHONE).matches);
   useEffect(() => {
     const media = window.matchMedia(PHONE);

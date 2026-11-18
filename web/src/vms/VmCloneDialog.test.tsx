@@ -34,6 +34,12 @@ function withDisk(v: Vm): Vm {
 const db = withDisk(vm("db", "stopped"));
 const web = withDisk(vm("web", "running"));
 
+/** VM 상세 머리의 케밥 메뉴에서 항목을 고른다. */
+async function openMenu(name: string) {
+  await userEvent.click(await screen.findByRole("button", { name: /^Actions for / }));
+  await userEvent.click(screen.getByRole("menuitem", { name }));
+}
+
 function openDetail(v: Vm, as = OPERATOR) {
   return renderPage(<VmDetailPage />, { path: "/vms/:name", url: `/vms/${v.name}`, as });
 }
@@ -107,7 +113,7 @@ it("clones a running VM from its newest ready snapshot", async () => {
   });
   const bodies = captureClone(web);
   openDetail(web);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   const source = within(dialog).getByLabelText("Source");
   // 만드는 중이거나 다른 VM의 스냅샷은 고를 수 없다.
@@ -147,7 +153,7 @@ it("keeps a chosen snapshot that goes away and blocks cloning", async () => {
   });
   const bodies = captureClone(web);
   const { queryClient } = openDetail(web);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   const source = within(dialog).getByLabelText("Source");
   await waitFor(() => expect(source).toHaveValue(upgraded.id));
@@ -181,7 +187,7 @@ it("keeps a chosen snapshot that goes away and blocks cloning", async () => {
 it("explains why a running VM without snapshots cannot be cloned", async () => {
   mockLists({ vm: [web], node: [NODE], volume: [volume("web-root", "local")] });
   openDetail(web);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   expect(within(dialog).getByLabelText("Source")).toHaveAccessibleDescription(
     "The VM is not stopped. Stop it first or choose a snapshot.",
@@ -198,7 +204,7 @@ it("blocks cloning while the VM is starting", async () => {
     snapshot: [snapshot("base", starting, 1)],
   });
   openDetail(starting);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   expect(
     within(dialog).getByText(
@@ -219,7 +225,7 @@ it("blocks cloning while a stop has yet to finish", async () => {
     snapshot: [snapshot("base", halting, 1)],
   });
   openDetail(halting);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone web" });
   expect(
     within(dialog).getByText(
@@ -237,7 +243,7 @@ it("shows the server's refusal in the dialog", async () => {
     ),
   );
   openDetail(db);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone db" });
   await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-copy");
   await userEvent.click(within(dialog).getByRole("button", { name: "Clone" }));
@@ -259,7 +265,7 @@ it("points at the pool when the VM's node cannot use it", async () => {
     ),
   );
   openDetail(db);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone db" });
   await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-copy");
   const pools = within(dialog).getByLabelText("Storage pool for the disks");
@@ -299,7 +305,7 @@ it("offers only pools ready on the VM's node and points at one that is not", asy
     ),
   );
   openDetail(db);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone db" });
   await userEvent.type(within(dialog).getByLabelText("New VM name"), "db-copy");
   const pools = within(dialog).getByLabelText("Storage pool for the disks");
@@ -357,7 +363,7 @@ it("offers the pools of the connected node when the VM has no node", async () =>
     ),
   );
   openDetail(free);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone db" });
   const pools = within(dialog).getByLabelText("Storage pool for the disks");
   await waitFor(() =>
@@ -375,7 +381,7 @@ it("offers no pools until it knows the node", async () => {
   // 볼륨 목록이 오지 않는다.
   server.use(http.get(apiUrl("/volumes"), () => new Promise<never>(() => {})));
   openDetail(free);
-  await userEvent.click(await screen.findByRole("button", { name: "Clone" }));
+  await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone db" });
   await new Promise((r) => setTimeout(r, 50));
   expect(within(dialog).getByRole("status")).toHaveTextContent("Loading");
@@ -390,5 +396,7 @@ it("hides cloning from viewers", async () => {
   mockLists({ vm: [db], node: [NODE] });
   openDetail(db, VIEWER);
   await screen.findByRole("heading", { name: "db" });
-  expect(screen.queryByRole("button", { name: "Clone" })).not.toBeInTheDocument();
+  // viewer에게는 케밥 메뉴가 없다.
+  expect(screen.queryByRole("button", { name: "Actions for db" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("menuitem", { name: "Clone" })).not.toBeInTheDocument();
 });

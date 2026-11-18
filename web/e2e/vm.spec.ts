@@ -33,6 +33,12 @@ async function openTab(page: Page, area: string, tab: string) {
     .click();
 }
 
+/** VM 상세 머리의 케밥 메뉴("Actions for {vm}")에서 항목을 고른다. 주 동작(시작·정지·콘솔·옮기기) 밖은 메뉴에 있다. */
+async function vmMenu(page: Page, vm: string, item: string) {
+  await page.getByRole("button", { name: `Actions for ${vm}`, exact: true }).click();
+  await page.getByRole("menuitem", { name: item, exact: true }).click();
+}
+
 /**
  * noVNC 캔버스에 검은색이 아닌 화소가 있다(콘솔이 화면을 받아 그린다). aarch64에서는 게스트가 화면을
  * 준비하기 전에 QEMU가 직접 글자를 그리므로 펌웨어 화면이라고까지는 보지 않는다.
@@ -142,7 +148,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
 
   // 실행 중인 VM은 지금 상태를 복사하지 않으므로 복제 대화상자는 최근 스냅샷을 원본으로 고른다.
   // 디스크를 QEMU가 쥐고 있어도 스냅샷에서는 복사할 수 있다.
-  await page.getByRole("button", { name: "Clone", exact: true }).click();
+  await vmMenu(page, "web", "Clone");
   dialog = page.getByRole("dialog", { name: "Clone web" });
   await expect(dialog.getByLabel("Source").locator("option:checked")).toHaveText("Snapshot before");
   await dialog.getByLabel("New VM name").fill("copy");
@@ -178,7 +184,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(copyRow.getByTestId("vm-phase")).toHaveText("Stopped", { timeout: 60_000 });
   await page.getByRole("link", { name: "copy", exact: true }).click();
   await expect(page.getByRole("heading", { name: "copy" })).toBeVisible();
-  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await vmMenu(page, "copy", "Delete");
   let confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type copy to confirm").fill("copy");
   await confirm.getByRole("button", { name: "Delete" }).click();
@@ -220,7 +226,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByTestId("vm-phase")).toHaveText("Running");
 
   // OS가 없는 게스트는 ACPI 종료에 응하지 않으므로 강제로 끈다.
-  await page.getByRole("button", { name: "Force stop" }).click();
+  await vmMenu(page, "web", "Force stop");
   await page.getByRole("alertdialog").getByRole("button", { name: "Force stop" }).click();
   await expect(page.getByTestId("vm-phase")).toHaveText("Stopped", { timeout: 60_000 });
 
@@ -273,7 +279,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
     if (await page.getByRole("heading", { name: "Edit web" }).isVisible()) {
       await page.getByRole("link", { name: "Cancel" }).click();
     }
-    await page.getByRole("link", { name: "Edit", exact: true }).click();
+    await vmMenu(page, "web", "Edit");
     await page.getByLabel("Take snapshots").selectOption("off");
     await page.getByRole("button", { name: "Save" }).click();
     await expect(page.getByRole("heading", { name: "Edit web" })).toHaveCount(0, {
@@ -293,7 +299,7 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(page.getByText("Last scheduled snapshot failed:")).toHaveCount(0);
 
   // 스냅샷이 있는 VM은 스냅샷도 지우겠다고 골라야 지울 수 있다.
-  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await vmMenu(page, "web", "Delete");
   confirm = page.getByRole("alertdialog");
   await confirm.getByLabel("Type web to confirm").fill("web");
   await expect(confirm.getByRole("button", { name: "Delete" })).toBeDisabled();

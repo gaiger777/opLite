@@ -18,6 +18,7 @@ import {
   vm,
   volume,
 } from "@/test/fixtures";
+import { expectNoAxeViolations } from "@/test/axe";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
@@ -1346,7 +1347,7 @@ it("fills in Windows 11 and creates the VM with TPM, Secure Boot and the guest a
   const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
   const user = userEvent.setup();
   await user.type(await screen.findByLabelText("Name"), "win");
-  await user.click(screen.getByRole("button", { name: "Fill in for Windows 11" }));
+  await user.click(screen.getByRole("radio", { name: "Windows 11" }));
   expect(screen.getByRole("status")).toHaveTextContent(/switch the disks to virtio-blk/);
   expect(screen.getByRole("switch", { name: "TPM 2.0" })).toBeChecked();
   expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeChecked();
@@ -1390,7 +1391,7 @@ it("says why TPM and Secure Boot cannot be turned on and needs UEFI", async () =
   ).toBeInTheDocument();
   expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeDisabled();
   // 미리 채우기는 켜 두고 쓸 수 없다고 알린다(끌 수는 있다).
-  await user.click(screen.getByRole("button", { name: "Fill in for Windows 11" }));
+  await user.click(screen.getByRole("radio", { name: "Windows 11" }));
   expect(tpm).toBeChecked();
   expect(tpm).toBeEnabled();
   await user.click(tpm);
@@ -1469,4 +1470,61 @@ it("shows the server's message when Secure Boot needs a firmware reset", async (
   expect(await screen.findByRole("alert")).toHaveTextContent(
     'Change Secure Boot with "Reset firmware" on the VM page',
   );
+});
+
+it("marks the steps with input errors and sums up the VM to review", async () => {
+  mockLists({ node: [NODE] });
+  const { container } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const steps = await screen.findByRole("navigation", { name: "Form steps" });
+  expect(
+    within(steps)
+      .getAllByRole("link")
+      .map((l) => l.textContent),
+  ).toEqual([
+    "1General",
+    "2Disks",
+    "3Network",
+    "4CD/DVD",
+    "5Boot order",
+    "6Security",
+    "7Guest agent",
+    "8cloud-init",
+    "9Snapshots",
+    "10Replication",
+    "11Review",
+  ]);
+  await user.type(screen.getByLabelText("Name"), "Bad Name");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  expect(within(steps).getByRole("link", { name: "General (1 errors)" })).toBeInTheDocument();
+  // 요약 검토
+  await user.clear(screen.getByLabelText("Name"));
+  await user.type(screen.getByLabelText("Name"), "web");
+  const review = screen.getByRole("region", { name: "Review" });
+  expect(within(review).getByText("Name").nextSibling).toHaveTextContent("web");
+  expect(within(review).getByText("Node").nextSibling).toHaveTextContent("Automatic");
+  expect(within(review).getByText("Memory (MiB)").nextSibling).toHaveTextContent("2 GiB");
+  expect(within(review).getByText("Start after creating").nextSibling).toHaveTextContent("On");
+  await expectNoAxeViolations(container, { disable: ["region"] });
+});
+
+it("fills in a Linux server and deploys from a template instead of the form", async () => {
+  const tmpl = {
+    ...vm("tmpl", "stopped"),
+    spec: { ...vm("tmpl", "stopped").spec, template: true },
+  };
+  mockLists({ node: [NODE], vm: [tmpl] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  expect(await screen.findByRole("radio", { name: "Blank VM" })).toBeChecked();
+  await user.click(screen.getByRole("radio", { name: "Linux server" }));
+  expect(screen.getByRole("switch", { name: "QEMU guest agent" })).toBeChecked();
+  const review = screen.getByRole("region", { name: "Review" });
+  expect(within(review).getByText("cloud-init").nextSibling).toHaveTextContent("On");
+  // 템플릿에서: 폼 대신 템플릿 목록, 배포 대화상자
+  await user.click(screen.getByRole("radio", { name: "From a template" }));
+  expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
+  const list = await screen.findByRole("list", { name: "Templates" });
+  await user.click(within(list).getByRole("button", { name: "Deploy tmpl…" }));
+  expect(await screen.findByRole("dialog", { name: "Deploy from tmpl" })).toBeInTheDocument();
 });

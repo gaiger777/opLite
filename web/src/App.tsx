@@ -7,11 +7,8 @@ import { createQueryClient } from "@/api/queryClient";
 import { TaskIndexProvider } from "@/api/taskIndex";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
-import { BackupJobsPage } from "@/backups/BackupJobsPage";
-import { BackupsPage } from "@/backups/BackupsPage";
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { IsosPage } from "@/isos/IsosPage";
 import { AppLayout } from "@/layout/AppLayout";
 import { AREAS, LEGACY_REDIRECTS } from "@/layout/nav";
 import { AreaRedirect, Redirect } from "@/layout/Redirect";
@@ -19,21 +16,10 @@ import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
-import { NetworksPage } from "@/networks/NetworksPage";
-import { NodeDetailPage } from "@/nodes/NodeDetailPage";
-import { NodesPage } from "@/nodes/NodesPage";
 import { NotFoundPage } from "@/pages/NotFoundPage";
-import { SecurityGroupPage } from "@/security-groups/SecurityGroupPage";
-import { SecurityGroupsPage } from "@/security-groups/SecurityGroupsPage";
-import { PoolsPage } from "@/storage/PoolsPage";
-import { VolumesPage } from "@/storage/VolumesPage";
 import { TasksPage } from "@/tasks/TasksPage";
-import { TemplatesPage } from "@/templates/TemplatesPage";
 import { TaskToasts } from "@/tasks/TaskToasts";
-import { ConsolePage } from "@/vms/ConsolePage";
-import { VmDetailPage } from "@/vms/VmDetailPage";
 import { VmActionHost } from "@/vms/VmActionHost";
-import { VmCreatePage, VmEditPage } from "@/vms/VmFormPage";
 import { VmListPage } from "@/vms/VmListPage";
 
 /**
@@ -66,25 +52,43 @@ export const appRoutes: RouteObject[] = [
           { index: true, element: <DashboardPage /> },
           { path: "vms", element: <VmListPage /> },
           // VM 이름은 `-`로 시작할 수 없으므로 "new"라는 VM과 겹치지 않는다.
-          { path: "vms/-new", element: <VmCreatePage /> },
-          { path: "vms/:name", element: <VmDetailPage /> },
-          { path: "vms/:name/edit", element: <VmEditPage /> },
-          { path: "vms/:name/console", element: <ConsolePage /> },
-          { path: "templates", element: <TemplatesPage /> },
+          { path: "vms/-new", lazy: page(() => import("@/vms/VmFormPage"), "VmCreatePage") },
+          { path: "vms/:name", lazy: page(() => import("@/vms/VmDetailPage"), "VmDetailPage") },
+          { path: "vms/:name/edit", lazy: page(() => import("@/vms/VmFormPage"), "VmEditPage") },
+          {
+            path: "vms/:name/console",
+            lazy: page(() => import("@/vms/ConsolePage"), "ConsolePage"),
+          },
+          {
+            path: "templates",
+            lazy: page(() => import("@/templates/TemplatesPage"), "TemplatesPage"),
+          },
           { path: "images", lazy: page(() => import("@/images/ImagesPage"), "ImagesPage") },
           { path: "imports", lazy: page(() => import("@/imports/ImportsPage"), "ImportsPage") },
           { path: "imports/:name", lazy: page(() => import("@/imports/ImportPage"), "ImportPage") },
-          { path: "volumes", element: <VolumesPage /> },
-          { path: "isos", element: <IsosPage /> },
-          { path: "storage-pools", element: <PoolsPage /> },
+          { path: "volumes", lazy: page(() => import("@/storage/VolumesPage"), "VolumesPage") },
+          { path: "isos", lazy: page(() => import("@/isos/IsosPage"), "IsosPage") },
+          { path: "storage-pools", lazy: page(() => import("@/storage/PoolsPage"), "PoolsPage") },
           { path: "ceph", lazy: page(() => import("@/ceph/CephPage"), "CephPage") },
-          { path: "backups", element: <BackupsPage /> },
-          { path: "backup-jobs", element: <BackupJobsPage /> },
-          { path: "networks", element: <NetworksPage /> },
-          { path: "security-groups", element: <SecurityGroupsPage /> },
-          { path: "security-groups/:name", element: <SecurityGroupPage /> },
-          { path: "nodes", element: <NodesPage /> },
-          { path: "nodes/:name", element: <NodeDetailPage /> },
+          { path: "backups", lazy: page(() => import("@/backups/BackupsPage"), "BackupsPage") },
+          {
+            path: "backup-jobs",
+            lazy: page(() => import("@/backups/BackupJobsPage"), "BackupJobsPage"),
+          },
+          { path: "networks", lazy: page(() => import("@/networks/NetworksPage"), "NetworksPage") },
+          {
+            path: "security-groups",
+            lazy: page(() => import("@/security-groups/SecurityGroupsPage"), "SecurityGroupsPage"),
+          },
+          {
+            path: "security-groups/:name",
+            lazy: page(() => import("@/security-groups/SecurityGroupPage"), "SecurityGroupPage"),
+          },
+          { path: "nodes", lazy: page(() => import("@/nodes/NodesPage"), "NodesPage") },
+          {
+            path: "nodes/:name",
+            lazy: page(() => import("@/nodes/NodeDetailPage"), "NodeDetailPage"),
+          },
           {
             path: "ha-groups",
             lazy: page(() => import("@/ha-groups/HaGroupsPage"), "HaGroupsPage"),
