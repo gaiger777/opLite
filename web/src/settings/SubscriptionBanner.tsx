@@ -61,7 +61,7 @@ export function SubscriptionBanner() {
       role={warning ? "alert" : "status"}
       className={
         warning
-          ? "flex items-center gap-3 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+          ? "flex items-center gap-3 rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
           : "flex items-center gap-3 rounded-md border border-border bg-muted/50 px-3 py-2 text-sm"
       }
     >

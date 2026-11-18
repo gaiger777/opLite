@@ -113,7 +113,7 @@ export function CreateCephPoolDialog({
           </NativeSelect>
         )}
       </Field>
-      {warning && <p className="text-sm text-amber-700 dark:text-amber-400">{t(warning)}</p>}
+      {warning && <p className="text-sm text-warning-fg">{t(warning)}</p>}
       {size === 1 && (
         <div className="flex items-center gap-2">
           <Checkbox

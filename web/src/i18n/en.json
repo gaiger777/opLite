@@ -140,7 +140,10 @@
     "themeLight": "Light",
     "themeDark": "Dark",
     "account": "Account",
-    "logout": "Sign out"
+    "logout": "Sign out",
+    "density": "Density",
+    "densityComfortable": "Comfortable",
+    "densityCompact": "Compact"
   },
   "roles": {
     "admin": "Administrator",
@@ -2826,5 +2829,8 @@
       },
       "empty": "No notification targets."
     }
+  },
+  "empty": {
+    "docs": "Read the guide"
   }
 }

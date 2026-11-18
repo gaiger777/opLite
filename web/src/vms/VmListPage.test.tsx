@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import type { List } from "@/api/live";
 import type { Task } from "@/api/types";
 import { snapshot, task, NODE, vm } from "@/test/fixtures";
+import { expectNoAxeViolations } from "@/test/axe";
 import { mockLists, renderPage } from "@/test/render";
 import { resetTasks } from "@/tasks/tasks";
 import { apiUrl, server } from "@/test/server";
@@ -431,4 +432,12 @@ it("marks HA VMs", async () => {
   await screen.findByRole("link", { name: "app" });
   expect(within(rowOf("app")).getByText("HA")).toBeInTheDocument();
   expect(within(rowOf("web")).queryByText("HA")).not.toBeInTheDocument();
+});
+
+it("has no accessibility violations", async () => {
+  mockLists({ vm: [web, db], node: [NODE] });
+  const { container } = renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "web" });
+  // 화면 하나만 그리므로 랜드마크(사이드바·main)는 셸 시험이 본다.
+  await expectNoAxeViolations(container, { disable: ["region"] });
 });

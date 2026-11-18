@@ -112,9 +112,7 @@ export function PlacementPage() {
             <Item label={t("placement.nextRun")}>{time(s.next_run)}</Item>
             {s.paused && (
               <Item label={t("placement.paused")}>
-                <span className="text-amber-700 dark:text-amber-400">
-                  {pausedText(t, s.paused)}
-                </span>
+                <span className="text-warning-fg">{pausedText(t, s.paused)}</span>
               </Item>
             )}
           </dl>

@@ -78,9 +78,7 @@ export function AddMonDialog({
           </NativeSelect>
         </Field>
       )}
-      {!full && warning && (
-        <p className="text-sm text-amber-700 dark:text-amber-400">{t(warning)}</p>
-      )}
+      {!full && warning && <p className="text-sm text-warning-fg">{t(warning)}</p>}
     </FormDialog>
   );
 }

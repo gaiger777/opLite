@@ -334,7 +334,7 @@ export function EsxiImportDialog({ onClose }: { onClose(): void }) {
                             <TriangleAlert
                               role="img"
                               aria-label={t("imports.locked")}
-                              className="size-4 text-amber-600"
+                              className="size-4 text-warning"
                             />
                           )}
                         </span>

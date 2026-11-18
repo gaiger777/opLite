@@ -23,7 +23,7 @@ export function PendingNote({ vm, fields }: { vm: Vm; fields: readonly string[] 
     return null;
   }
   return (
-    <ul className="flex flex-col gap-0.5 text-xs text-amber-700 dark:text-amber-400">
+    <ul className="flex flex-col gap-0.5 text-xs text-warning-fg">
       {pending.map((c) => (
         <li key={c.field}>
           {t("vms.security.pending", {

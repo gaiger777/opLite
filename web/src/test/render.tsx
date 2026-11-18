@@ -9,6 +9,8 @@ import type { Principal, Resources, WatchKind } from "@/api/types";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { RequireAuth } from "@/auth/RequireAuth";
 import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
 import { apiUrl, server } from "@/test/server";
 
@@ -65,12 +67,16 @@ export function renderPage(
   const queryClient = createQueryClient();
   const result = render(
     <ThemeProvider>
-      <QueryClientProvider client={queryClient}>
-        <AuthProvider>
-          <RouterProvider router={router} />
-        </AuthProvider>
-        <Toaster />
-      </QueryClientProvider>
+      <DensityProvider>
+        <TooltipProvider>
+          <QueryClientProvider client={queryClient}>
+            <AuthProvider>
+              <RouterProvider router={router} />
+            </AuthProvider>
+            <Toaster />
+          </QueryClientProvider>
+        </TooltipProvider>
+      </DensityProvider>
     </ThemeProvider>,
   );
   return { ...result, router, queryClient };

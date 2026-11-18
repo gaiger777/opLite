@@ -56,6 +56,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { type Language, setLanguage } from "@/i18n";
+import { type Density, useDensity } from "@/lib/density";
 import { type Theme, useTheme } from "@/lib/theme";
 
 /** 왼쪽 메뉴. `kind`가 있으면 그 종류를 읽을 수 있는 역할에만, `admin`이면 admin에게만 보인다. */
@@ -151,7 +152,7 @@ function LiveBadge() {
   const { t } = useTranslation();
   const status = useLiveStatus();
   const color =
-    status === "live" ? "bg-emerald-500" : status === "offline" ? "bg-destructive" : "bg-amber-500";
+    status === "live" ? "bg-success" : status === "offline" ? "bg-danger" : "bg-warning";
   return (
     <span role="status" className="flex items-center gap-2 px-2 text-xs text-muted-foreground">
       <span className={`size-2 rounded-full ${color}`} />
@@ -214,6 +215,7 @@ function UserMenu() {
   const { t } = useTranslation();
   const { logout } = useAuth();
   const me = usePrincipal();
+  const { density, setDensity } = useDensity();
   const [changing, setChanging] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
   return (
@@ -230,6 +232,22 @@ function UserMenu() {
           <DropdownMenuLabel>
             {me.name} · {t(`roles.${me.role}`)}
           </DropdownMenuLabel>
+          <DropdownMenuSeparator />
+          <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+            {t("header.density")}
+          </DropdownMenuLabel>
+          <DropdownMenuRadioGroup
+            aria-label={t("header.density")}
+            value={density}
+            onValueChange={(v) => setDensity(v as Density)}
+          >
+            <DropdownMenuRadioItem value="comfortable">
+              {t("header.densityComfortable")}
+            </DropdownMenuRadioItem>
+            <DropdownMenuRadioItem value="compact">
+              {t("header.densityCompact")}
+            </DropdownMenuRadioItem>
+          </DropdownMenuRadioGroup>
           <DropdownMenuSeparator />
           {/* 외부 사용자(이름에 `@<영역>`)의 비밀번호는 영역의 디렉터리가 맡는다. */}
           {!me.name.includes("@") && (

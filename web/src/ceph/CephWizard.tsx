@@ -305,7 +305,7 @@ function ActionStep({
       <p className="text-sm text-muted-foreground">{t(`ceph.wizard.${step}Hint`)}</p>
       {current && <p className="text-sm">{current}</p>}
       {busy && <p className="text-sm text-muted-foreground">{t("ceph.wizard.busy")}</p>}
-      {warning && <p className="text-sm text-amber-700 dark:text-amber-400">{t(warning)}</p>}
+      {warning && <p className="text-sm text-warning-fg">{t(warning)}</p>}
       <div className="flex gap-2">
         <Button
           variant="outline"

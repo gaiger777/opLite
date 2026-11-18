@@ -201,7 +201,7 @@ export function VmMigrateDialog({
           {missingPool !== undefined && target && (
             <p
               role="alert"
-              className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+              className="rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
             >
               {t("migrate.noSamePool", { node: target.name, pool: missingPool })}
             </p>

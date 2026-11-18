@@ -164,7 +164,7 @@ export function CephStatusView({ ceph }: { ceph: CephView }) {
         </div>
       )}
       {report?.stale && (
-        <p role="alert" className="rounded-md border border-amber-500 p-3 text-sm">
+        <p role="alert" className="rounded-md border border-warning p-3 text-sm">
           {t("ceph.stale", {
             time: formatTime(new Date(report.read_at * 1000), i18n.language),
             error: report.error ?? "",
@@ -307,7 +307,7 @@ function Report({ report }: { report: Status }) {
               {pgs.map((p) => (
                 <li key={p.state} className="flex items-center gap-2">
                   <Meter label={p.state} percent={Math.round(p.percent * 10) / 10} />
-                  <span className={p.clean ? undefined : "text-amber-700 dark:text-amber-400"}>
+                  <span className={p.clean ? undefined : "text-warning-fg"}>
                     {`${p.count} ${p.state}`}
                   </span>
                 </li>

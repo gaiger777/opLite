@@ -264,9 +264,7 @@ export function GeneralSection({
             </p>
           )}
           {noReplica && (
-            <p className="text-sm text-amber-700 dark:text-amber-400">
-              {t("vmForm.haNoReplica", noReplica)}
-            </p>
+            <p className="text-sm text-warning-fg">{t("vmForm.haNoReplica", noReplica)}</p>
           )}
         </div>
         {values.ha && (

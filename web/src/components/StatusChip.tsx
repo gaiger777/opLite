@@ -1,0 +1,62 @@
+import { cn } from "cn";
+import type { LucideIcon } from "lucide-react";
+
+/** 상태의 뜻. 색은 `index.css`의 상태 토큰(`--{tone}`·`-soft`·`-fg`)으로만 쓴다. */
+export type StatusTone = "success" | "warning" | "danger" | "info" | "neutral";
+
+const CHIP: Record<StatusTone, string> = {
+  success: "bg-success-soft text-success-fg",
+  warning: "bg-warning-soft text-warning-fg",
+  danger: "bg-danger-soft text-danger-fg",
+  info: "bg-info-soft text-info-fg",
+  neutral: "bg-muted text-muted-foreground",
+};
+
+const DOT: Record<StatusTone, string> = {
+  success: "bg-success",
+  warning: "bg-warning",
+  danger: "bg-danger",
+  info: "bg-info",
+  neutral: "bg-muted-foreground",
+};
+
+/**
+ * 상태 칩: 색 + 점(또는 아이콘) + 글. 색만으로 뜻을 전하지 않도록 글은 늘 있다(설계 §5.3).
+ * `busy`는 바뀌는 중(시작·옮기기 …)인 상태이고 점이 깜박인다(움직임 줄이기면 멈춤).
+ */
+export function StatusChip({
+  tone,
+  icon: Icon,
+  busy = false,
+  className,
+  children,
+  ...props
+}: React.ComponentProps<"span"> & {
+  tone: StatusTone;
+  /** 점 대신 보일 아이콘 */
+  icon?: LucideIcon;
+  busy?: boolean;
+}) {
+  return (
+    <span
+      data-slot="status-chip"
+      data-tone={tone}
+      className={cn(
+        "inline-flex h-5 w-fit shrink-0 items-center gap-1.5 rounded-md px-2 text-xs font-medium whitespace-nowrap",
+        CHIP[tone],
+        className,
+      )}
+      {...props}
+    >
+      {Icon ? (
+        <Icon aria-hidden className="size-3" />
+      ) : (
+        <span
+          aria-hidden
+          className={cn("size-1.5 shrink-0 rounded-full", DOT[tone], busy && "animate-pulse")}
+        />
+      )}
+      {children}
+    </span>
+  );
+}

@@ -1,9 +1,13 @@
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { AppLayout } from "@/layout/AppLayout";
+import { expectNoAxeViolations } from "@/test/axe";
 import { ADMIN, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
+
+const original = window.matchMedia;
 
 beforeEach(() =>
   server.use(
@@ -59,4 +63,26 @@ it("hides account pages from other roles", async () => {
   expect(screen.getByRole("link", { name: "Ceph" })).toHaveAttribute("href", "/ceph");
   // 원격 클러스터도 누구나 읽는다.
   expect(screen.getByRole("link", { name: "Remote clusters" })).toHaveAttribute("href", "/remotes");
+});
+
+it("switches density from the account menu", async () => {
+  const user = userEvent.setup();
+  const wide = vi
+    .spyOn(window, "matchMedia")
+    .mockImplementation((query) => ({ ...original(query), matches: query.includes("min-width") }));
+  renderPage(<AppLayout />);
+  await user.click(await screen.findByRole("button", { name: "Account (admin)" }));
+  const group = screen.getByRole("group", { name: "Density" });
+  expect(within(group).getByRole("menuitemradio", { name: "Comfortable" })).toBeChecked();
+  await user.click(within(group).getByRole("menuitemradio", { name: "Compact" }));
+  expect(document.documentElement.dataset.density).toBe("compact");
+  expect(localStorage.getItem("opl.density")).toBe("compact");
+  wide.mockRestore();
+  localStorage.removeItem("opl.density");
+});
+
+it("has no accessibility violations in the shell", async () => {
+  const { container } = renderPage(<AppLayout />);
+  await screen.findByRole("link", { name: "Volumes" });
+  await expectNoAxeViolations(container);
 });

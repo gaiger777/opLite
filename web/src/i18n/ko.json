@@ -140,7 +140,10 @@
     "themeLight": "밝게",
     "themeDark": "어둡게",
     "account": "계정",
-    "logout": "로그아웃"
+    "logout": "로그아웃",
+    "density": "밀도",
+    "densityComfortable": "편안하게",
+    "densityCompact": "촘촘하게"
   },
   "roles": {
     "admin": "관리자",
@@ -2826,5 +2829,8 @@
       },
       "empty": "알림 대상이 없습니다."
     }
+  },
+  "empty": {
+    "docs": "안내서 읽기"
   }
 }

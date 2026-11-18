@@ -363,11 +363,7 @@ function CloudInitLine({ vm }: { vm: Vm }) {
           {t("vms.ciInstance", { id: hw.cloud_init })}
         </span>
       )}
-      {pending && (
-        <span className="block text-xs text-amber-700 dark:text-amber-400">
-          {t("vms.ciPending")}
-        </span>
-      )}
+      {pending && <span className="block text-xs text-warning-fg">{t("vms.ciPending")}</span>}
     </>
   );
 }
@@ -477,7 +473,7 @@ function Summary({ vm }: { vm: Vm }) {
       {/* 리더가 계산한 배치 규칙 위반(켜진 VM만) */}
       <Field label={t("vms.ruleViolations")}>
         {violations.length > 0 ? (
-          <span className="text-amber-700 dark:text-amber-400">{violations.join(", ")}</span>
+          <span className="text-warning-fg">{violations.join(", ")}</span>
         ) : (
           "—"
         )}
@@ -572,9 +568,7 @@ function Replication({ vm }: { vm: Vm }) {
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         {warning && (
-          <p className="text-sm text-amber-700 dark:text-amber-400">
-            {t("vms.replication.noReplica", warning)}
-          </p>
+          <p className="text-sm text-warning-fg">{t("vms.replication.noReplica", warning)}</p>
         )}
         {recovery && (
           <p className="text-sm text-muted-foreground">
@@ -648,7 +642,7 @@ function Replication({ vm }: { vm: Vm }) {
                   </span>
                 )}
                 {unusable(row) && (
-                  <span className="text-amber-700 dark:text-amber-400">
+                  <span className="text-warning-fg">
                     {t("vms.replication.unusable", { volume: unusable(row) })}
                   </span>
                 )}

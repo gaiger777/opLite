@@ -361,3 +361,14 @@
    - 홈 격자(건강 띠·경보·용량·차트 자리·상위 VM·최근 작업·즐겨찾기)에 계획 60 위젯을 끼운다. 계획 60 전이면 지금 카드만 둔다.
    - 첫 걸음 카드, VM 만들기 프리셋·단계 폼, 클러스터 합류 마법사, Ceph 빈 상태. 휴대폰 홈 순서, `lazy` 경로, 묶음 크기 기록.
 8. **docs: 가이드 "웹 화면 둘러보기·단축키"와 메뉴 이름 고치기, README 한계(팔레트 IP 검색), 설계 문서 스테이지 보고, 계획 61 실행 기록**.
+
+## 14. 스테이지 보고 (설계와 다른 것·결정)
+
+- **S1 토큰 값**: §6 값 그대로 두면 대비 시험에 걸리는 것 둘을 고쳤다. 밝음 `--warning`을 `oklch(0.7 0.16 70)`에서 `oklch(0.63 0.15 70)`으로(흰 바탕·`--warning-soft` 위 3:1), 밝음 `--muted-foreground`를 0.556에서 0.54로(`--muted` 위 4.5:1) 낮췄다.
+- **S1 그림자 이름**: Tailwind의 `--shadow-*` 테마 이름과 겹치지 않게 값은 `--elevation-sm/md/lg`(`:root`·`.dark`)에 두고 `@theme inline`의 `--shadow-sm/md/lg`가 그것을 가리킨다. 그래서 `shadow-sm` 같은 유틸리티가 테마를 따른다. 어두움은 sm·md 그림자가 없고 lg만 짙게 남는다.
+- **S1 표면**: `--surface-1`(바탕 위 판)·`--surface-2`(카드)·`--surface-3`(떠 있는 층)을 더했다. 지금 `--card`·`--popover`는 그대로 두고 S2부터 새 화면이 표면 토큰을 쓴다.
+- **S1 대비 시험 범위**: §10의 "테두리 3:1"은 포커스 링(`--ring` = `--brand`)과 강조색에만 둔다. 장식 테두리 `--border`·`--input`(shadcn 0.922)은 3:1로 올리면 화면이 무거워지므로 빼고, 입력 칸은 레이블과 포커스 링으로 알아본다.
+- **S1 밀도 적용**: `--control-h`는 `Button` 기본·아이콘 크기, `Input`, `NativeSelect` 높이에, `--row-h`는 `TableRow`·`TableHead` 높이에 걸었다(셀 위아래 여백은 `p-2` → `px-2 py-1`). `--gap`은 정의만 하고 S2의 페이지 틀이 쓴다. 기본 단추 높이가 32px에서 36px(편안함)이 된다.
+- **S1 글자**: 본문 기본을 14px(`body` `text-sm`)로 했다. 페이지 제목 20px는 S2의 `PageHeader`가 맡는다(지금 화면마다 `h1` 클래스가 있어 S1에서 고치면 S2에서 다시 고친다).
+- **S1 색 이름 정리**: `amber-*`·`emerald-*` 직접 색(경고 글·띠, `LiveBadge` 점)을 `warning`·`success`·`danger` 토큰으로 바꿨다(§8.2 4 "색은 CSS 변수로만").
+- **S1 움직임 줄이기**: `--duration-fast/normal`을 0ms로 하고, 모든 요소의 `animation-duration`·`transition-duration`을 0.01ms·한 번으로 줄인다(Sheet 미끄러짐, 스켈레톤 맥박, `StatusChip`의 `busy` 점, 이후 `data-changed` 강조까지 한 곳에서 끔).

@@ -103,7 +103,7 @@ export function DashboardPage() {
       {versions.length > 1 && (
         <p
           role="alert"
-          className="rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+          className="rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
         >
           {t("dashboard.mixedVersions", { versions: versions.join(", ") })}
         </p>

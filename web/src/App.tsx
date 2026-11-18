@@ -17,6 +17,7 @@ import { BackupsPage } from "@/backups/BackupsPage";
 import { CephPage } from "@/ceph/CephPage";
 import { ClusterPage } from "@/cluster/ClusterPage";
 import { Toaster } from "@/components/ui/sonner";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import { HaChecksPage } from "@/ha-checks/HaChecksPage";
 import { HaGroupsPage } from "@/ha-groups/HaGroupsPage";
 import { ImagesPage } from "@/images/ImagesPage";
@@ -24,6 +25,7 @@ import { ImportPage } from "@/imports/ImportPage";
 import { ImportsPage } from "@/imports/ImportsPage";
 import { IsosPage } from "@/isos/IsosPage";
 import { AppLayout } from "@/layout/AppLayout";
+import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { LoginPage } from "@/pages/LoginPage";
@@ -115,12 +117,16 @@ export function App() {
   const [router] = useState(routes);
   return (
     <ThemeProvider>
-      <QueryClientProvider client={queryClient}>
-        <AuthProvider>
-          <RouterProvider router={router} />
-        </AuthProvider>
-        <Toaster position="bottom-right" />
-      </QueryClientProvider>
+      <DensityProvider>
+        <TooltipProvider delayDuration={300}>
+          <QueryClientProvider client={queryClient}>
+            <AuthProvider>
+              <RouterProvider router={router} />
+            </AuthProvider>
+            <Toaster position="bottom-right" />
+          </QueryClientProvider>
+        </TooltipProvider>
+      </DensityProvider>
     </ThemeProvider>
   );
 }
