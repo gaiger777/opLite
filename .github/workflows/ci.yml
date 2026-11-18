@@ -177,7 +177,7 @@ jobs:
         run: |
           swtpm --version
           swtpm socket --print-capabilities
-          qemu-system-x86_64 -tpmdev help 2>&1; echo "exit status $?"
+          qemu-system-x86_64 -tpmdev help 2>&1 && rc=0 || rc=$?; echo "exit status $rc"
           sudo aa-status 2>/dev/null | grep -i swtpm || echo "no swtpm AppArmor profile loaded"
       - uses: pnpm/action-setup@v4
         with:
@@ -424,7 +424,7 @@ jobs:
         run: |
           swtpm --version
           swtpm socket --print-capabilities
-          qemu-system-x86_64 -tpmdev help 2>&1; echo "exit status $?"
+          qemu-system-x86_64 -tpmdev help 2>&1 && rc=0 || rc=$?; echo "exit status $rc"
           sudo aa-status 2>/dev/null | grep -i swtpm || echo "no swtpm AppArmor profile loaded"
       # 받기 실패는 시험 실패가 아니라 이 단계의 실패로 보인다.
       - name: Cloud image and installer ISO
