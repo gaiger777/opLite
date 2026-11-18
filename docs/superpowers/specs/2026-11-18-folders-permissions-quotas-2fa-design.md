@@ -1,0 +1,249 @@
+# 폴더·객체 권한·폴더 할당량·2단계 인증 설계 (계획 62)
+
+작성일: 2026-11-18
+상위 문서: `2026-11-06-enterprise-design.md`(설계 4절 `Authorizer` 훅, 감사 로그), 계획 34~38 인증 영역(`realm.rs`·`ldap.rs`·`oidc_login.rs`), 계획 46 공유 세션(`SHARED_SESSIONS`), `2026-11-17-templates-linked-clones-design.md`(계획 58 "Raft에 쓰고 다시 보기"), `2026-11-18-dashboard-metrics-notifications-design.md`(계획 60), `2026-11-18-ui-ux-redesign-design.md`(계획 61, 다른 가지에서 구현 중)
+기준 트리: 계획 60 끝(`26ae1b4`). 이 문서는 구현 전 설계다. 스테이지 보고는 구현하면서 덧붙인다.
+
+## 1. 목적
+
+지금 권한은 사용자마다 전역 역할 하나다(`opl_types::auth::Role` = `Admin|Operator|Viewer`, `UserSpec.role`). 확인은 `RoleAuthorizer::check(principal, Action, Kind)`(`opl-api/src/auth.rs`) 하나이고, 핸들러 148곳이 `state.authorize(&principal, Action::…, XSpec::KIND)`를 부른다. 웹은 같은 규칙을 `web/src/auth/permissions.ts`의 `can(role, action, kind)`로 흉내 낸다. 그래서 "A팀은 A팀 VM만 다룬다"를 할 수 없고, VM이 수천 개면 목록을 나눌 길도 없다. 팀별 자원 상한과 2단계 인증도 없다. 이 계획은 vSphere식 **인벤토리 폴더 + 객체 권한(아래로 전파)**, 폴더 **할당량**, **TOTP·패스키 2단계 인증**을 넣는다.
+
+| | Proxmox VE 8 | vSphere 8 | Orbivisor 계획 62 |
+|---|---|---|---|
+| 묶음 | 리소스 풀(8.x부터 중첩), 경로 ACL `/vms/100`·`/pool/x` | VM·호스트·데이터스토어·네트워크 폴더 | 종류별 폴더 트리 셋(VM·네트워크·스토리지), 중첩(§5) |
+| 권한 | (사용자·그룹·토큰, 역할, 경로, propagate), 더 구체적인 경로가 이김, `NoAccess` | (주체, 역할, 객체, propagate), 객체 쪽이 이김, "No Access" | (주체, 역할, 대상, propagate)의 **합집합**, 거부 없음(§6) |
+| 역할 | 내장 + 사용자 정의(권한 목록) | 내장 + 사용자 정의(권한 목록) | 내장 셋(지금 역할 그대로) + 사용자 정의(§6.2) |
+| 할당량 | 없음 | Cloud Director에서만 | 폴더마다 vCPU·메모리·디스크·VM 수, 하위 트리 합, Raft에서 확인(§9) |
+| 2FA | TOTP·WebAuthn·Yubico·복구 코드, 영역마다 강제 | vCenter SSO: RSA SecurID·스마트카드·IdP | TOTP·복구 코드·WebAuthn, 역할·영역마다 강제(§10) |
+
+## 2. 범위
+
+| 넣는 것 | 넣지 않는 것(§16) |
+|---|---|
+| 종류별 중첩 폴더(VM·템플릿 / 네트워크 / 스토리지 풀), 옮기기·이름 바꾸기·빈 폴더 지우기 | 볼륨·백업·노드 폴더, 태그 기반 권한 |
+| 권한(사용자·그룹 → 역할 → 루트·폴더·객체, propagate), 사용자 정의 역할, 로컬 그룹과 외부 그룹 연결 | 거부 규칙·"No Access" 역할, 시간 제한 권한 |
+| 모든 API 경로·목록·`/watch`·지표·경보·Task·콘솔·백업 복원의 확인, 유효 권한 조회 | 폴더 단위 감사 로그 읽기, 폴더별 Prometheus |
+| 폴더 할당량(vCPU·메모리·디스크 바이트·VM 수), 사용량 보기, 노드 사이 경쟁에도 지킴 | 실행 중만 세는 할당량, CPU·IO 속도 제한, 풀별 디스크 할당량 |
+| TOTP(RFC 6238)·복구 코드·WebAuthn(패스키), 정책(역할·영역), 관리자 초기화, 토큰 범위 | SMS·이메일 코드, Yubico OTP, CLI 패스키, OIDC `amr` 강제 |
+| 웹: VM·인프라 영역의 폴더 보기, 끌어 놓기·일괄 옮기기, 설정의 권한·역할·그룹·보안, "권한" 탭 | 폴더별 대시보드 |
+
+**기능 둘**(`opl_types::node`, `FEATURES` 끝). **`folders`**(`FOLDERS`)는 새 종류 `Folder`·`Grant`·`AccessRole`·`Group`, 스펙의 `folder` 칸, `Role::None`, `UserSpec.external_groups`, `ApiTokenSpec.scope`, 할당량을 가린다. **`two-factor`**(`TWO_FACTOR`)는 새 종류 `TwoFactor`, `SessionSpec.pending`, `SettingsSpec.two_factor`를 가린다. 그 쓰기는 모든 노드가 기능을 알릴 때만 받고, 아니면 409 `cluster_upgrading`이다(`require_feature`). 계획 58~60처럼 기능 검사는 검증보다 먼저 한다(§11).
+
+## 3. 지금 있는 것 (계획 60 끝)
+
+- **인증**: `AppState::authenticate`가 `Authorization: Bearer opl_…`(토큰 → `ApiTokenSpec.user`)나 세션 쿠키(`find_session` → 메모리 `Sessions` 또는 Raft `Session`, `session_epoch` 비교, `realm_exists`)로 `Principal { user, name, role }`을 만든다. 요청마다 `UserSpec`을 다시 읽으므로 역할 변경이 곧바로 반영된다. `FromRequestParts for Principal`이 모든 핸들러의 입구다.
+- **로그인**: `users::login` → `login_local`(argon2, `attempts` 제한) 또는 `login_realm`(LDAP 바인드 → `RoleMapping::role_for(groups)` → `upsert_external`). OIDC는 `oidc_login.rs` 콜백이 같은 `role_for`·`upsert_external`·`new_session`을 쓴다. 외부 그룹은 로그인 때 역할을 고르는 데만 쓰고 저장하지 않는다.
+- **권한**: `Authorizer` 트레이트(“엔터프라이즈 플러그인이 세분화된 RBAC로 바꾼다”)와 `RoleAuthorizer`. `account` 종류(`User`·`ApiToken`·`JoinToken`·`Realm`·`Session`·`NodeFence`·`NotificationTarget`)는 admin만 읽는다. Operator는 `Vm`·`Volume`·`Backup`·`BackupJob`·`VmImport`만 쓴다. 감사 로그(`audit.rs`, `ReadAudit`)는 admin만 읽는다.
+- **목록·watch**: `resources.rs`의 `list<S>`/`get<S>` 매크로가 종류 단위로 `Read`를 본 뒤 전부 돌려준다. `/watch`(`watch.rs`)는 `WATCHABLE` 15종을 종류 단위로 확인한 뒤 모든 이벤트를 보낸다.
+- **상태 머신**: `apply_command`(`opl-cluster/src/state_machine.rs`)는 JSON 스펙을 보고 결정적으로 거부한다. `check_exclusive`(`exclusive.rs`)가 VM 쓰기마다 모든 VM을 훑어 볼륨·MAC 중복을 막는다(`Rejection::InUse`). 이것이 할당량·폴더 검사의 본이다.
+- **비밀 저장의 본**: 비밀번호는 argon2 PHC, 토큰·세션은 SHA-256, LDAP bind 비밀번호·CA 키(`ClusterSpec.ca_key_pem`)는 평문으로 Raft에 두고 API·`Debug`에서 가린다. 저장 시 암호화는 어디에도 없다.
+
+## 4. 타입 (opl-types)
+
+- **`folder.rs`**(새): `FolderSpec { name: String, kind: FolderKind (Vm|Network|Storage), parent: Option<Uuid>, quota: Option<FolderQuota> }`, `deny_unknown_fields`. 리소스 이름은 폴더 id 문자열로 둔다(이름 표는 종류 전체에서 하나라서 형제마다 같은 이름 `prod`를 쓰려면 화면 이름을 스펙에 둔다). `FolderQuota { vcpus, memory_mib, disk_bytes, vms: Option<u64> }`. `FolderUsage`도 같은 네 칸이다.
+- **스펙의 `folder` 칸**: `VmSpec`·`NetworkSpec`·`StoragePoolSpec`에 `#[serde(default, skip_serializing_if = "Option::is_none")] folder: Option<Uuid>`. 없으면 그 종류의 루트이므로 옮기기 작업이 없고, 루트에 둔 리소스는 바이트까지 지금과 같다. 템플릿은 `VmSpec`이라 VM 트리에 산다.
+- **`authz.rs`**(새):
+  - `Privilege`(표 §6.2, kebab 문자열 `"vm.power"`)와 `PrivSet(u64)` 비트 집합. 저장은 문자열 목록이고 모르는 이름은 읽을 때 버린다(경고). 새 권한을 더해도 앞 버전이 역할을 푼다. 쓰기 검증은 모르는 이름을 400으로 막는다.
+  - `builtin_privileges(Role) -> PrivSet`: 지금 역할의 뜻 그대로(§6.3).
+  - `AccessRoleSpec { privileges: Vec<String>, description }`(`Kind::AccessRole`, "access-role"). 내장 역할 `admin`·`operator`·`viewer`는 저장하지 않고 이름을 예약한다.
+  - `GrantSpec { principal: PrincipalRef (User{id}|Group{id}), role: RoleRef (Builtin(Role)|Custom(Uuid)), target: GrantTarget (Root|Folder{id}|Object{kind,id}), propagate: bool = true }`(`Kind::Grant`).
+  - `GroupSpec { members: Vec<Uuid>, external: Vec<ExternalGroup { realm, group }> }`(`Kind::Group`).
+- **`auth.rs`**: `Role::None`("none", 전역 역할 없음 — 권한은 grant로만), `UserSpec.external_groups: Vec<String>`(로그인 때 본 외부 그룹, 비면 쓰지 않음), `ApiTokenSpec.scope: Option<TokenScope { privileges: Vec<String>, targets: Vec<GrantTarget> }>`. `RoleMapping`은 그대로이고 `default: none`을 받는다.
+- **`two_factor.rs`**(새): `TwoFactorSpec { user: Uuid, totp: Option<Totp { secret: String /*base32*/, confirmed: bool, created_at }>, recovery: Vec<String /*SHA-256*/>, webauthn: Vec<Passkey { id, name, rp_id, cose_key: Vec<u8>, sign_count: u32, created_at }> }`, 상태 `{ last_totp_step: u64, last_used: u64 }`(`Kind::TwoFactor`, `account` 목록, watch 불가). `Debug`는 `secret`을 가린다. `SessionSpec.pending: Option<PendingLogin { expires_at, enroll: bool, challenge: Option<String> }>`, `SettingsSpec.two_factor: Option<TwoFactorPolicy { roles: Vec<Role>, realms: Vec<String>, rp_id: Option<String> }>`.
+- **순수 함수**(`authz_eval.rs`, IO 없음): `effective(&Snapshot, principal, object) -> PrivSet`의 참조 구현(조상을 걸어 올라가며 합집합). §7 색인의 시험 기준이다. `totp(secret, step, digits) -> u32`(ring `HMAC_SHA1_FOR_LEGACY_USE_ONLY`, base32는 이미 트리에 있는 `data-encoding`).
+
+## 5. 폴더 트리 (opl-cluster 상태 머신·opl-api)
+
+- **종류별 트리 셋**(vSphere의 VM/Network/Datastore 폴더). 한 트리로 모든 종류를 섞지 않는 이유: 계획 61에서 VM은 "가상 머신" 영역, 네트워크·풀은 "인프라" 영역에 산다. 할당량은 VM 트리에만 뜻이 있다. 종류가 다른 것을 같은 폴더에 두면 옮기기·할당량·화면 규칙마다 갈래가 생긴다. 대가로 "A팀 VM + A팀 네트워크"는 grant 둘이다(그룹 하나에 두 줄, §6.4).
+- **루트**: 종류마다 있는 보이지 않는 루트(`parent: None`). 루트는 리소스가 아니다. 루트 권한은 `GrantTarget::Root` 하나이고 세 트리와 클러스터 객체 모두의 조상이다.
+- **상태 머신 검사**(새 `opl-cluster/src/folders.rs`, `apply_command`에서 `check_exclusive` 옆): 모두 결정적이고 `Folder` 리소스가 없으면 아무 일도 하지 않는다(옛 노드와 결과가 같다, §11).
+  - `Folder` Create/UpdateSpec: `parent`가 있고 종류가 같다, 걸어 올라가 자기를 만나지 않는다(`Rejection::FolderCycle`), 깊이 ≤ 16.
+  - 형제 이름 중복: `exclusive_values`에 `Folder → ("name", "{parent}/{소문자 name}")`를 더해 `InUse`로 막는다(노드 둘이 같은 이름을 동시에 만들어도 하나만).
+  - `Folder` Delete: 자식 폴더나 그 폴더를 가리키는 VM·네트워크·풀이 있으면 `Rejection::FolderNotEmpty`.
+  - VM·네트워크·풀 Create/UpdateSpec: `folder`가 있으면 그 폴더가 있고 종류가 맞아야 한다(`NotFound`). 지우기와 넣기가 엇갈려도 Raft 순서로 하나만 이긴다.
+- **API**: 폴더 PATCH(이름·`parent`·할당량), 리소스 옮기기는 `POST /folders/{id}/members`(§13)로만 한다. `PUT /vms/{key}`가 `folder`를 바꾸면 400 `"use POST /folders/{id}/members to move"`(옮기기 권한을 따로 보기 위해). 리소스 만들기 요청은 `folder`(id 또는 경로 `/teamA/prod`)를 받는다. 없으면 루트이지만, 루트에 `vm.create`가 없는 사용자는 400 `folder_required`.
+
+## 6. 권한 모델
+
+### 6.1 grant와 평가
+
+- grant = (주체: 사용자 또는 그룹, 역할, 대상: 루트·폴더·단일 객체, propagate). 유효 권한(사용자 U, 객체 O) = `builtin(U.role)`(루트 암묵 grant) ∪ U와 U가 든 그룹의 grant 가운데 (O에 직접 건 것) ∪ (O의 조상 폴더·루트에 `propagate`로 건 것). propagate가 거짓인 폴더 grant는 그 폴더 객체 자체(이름 바꾸기·지우기·그 폴더의 권한 보기)에만 닿는다(vSphere와 같다).
+- **거부 규칙은 두지 않는다.** vSphere·Proxmox는 "더 구체적인 쪽이 이김"과 No Access로 가린다. 그러면 평가가 순서에 따라 달라지고(사용자 grant가 그룹 grant를 덮는가, 자식 grant가 부모를 덮는가), "왜 못 하나"를 설명하기 어렵고, 비트 OR 한 번으로 캐시할 수 없다. 합집합은 단조라서 grant를 더하면 권한이 늘기만 하고, 색인이 단순하고, 성질 시험(§14)이 쉽다. 대가: "prod 전체에서 payroll VM만 빼기"는 payroll을 형제 폴더로 옮겨 푼다(가이드에 적는다).
+- 모든 권한은 그 객체의 `system.read`를 품는다(풀에 `storage.allocate`만 받아도 풀이 보인다).
+- **읽을 수 없는 객체는 404**, 읽을 수 있으나 권한이 없으면 403 `forbidden`. 이름·id로 남의 객체 존재를 알 수 없게 한다. 다만 이름이 종류 전체에서 하나라서 만들기의 409 `name_taken`은 남는다(§12 한계).
+
+### 6.2 권한 목록
+
+| 권한 | 대상 | 지금 확인(Action, Kind) |
+|---|---|---|
+| `system.read` | 보기: 목록·상세·watch·지표·Task·경보 | Read 그 종류 |
+| `vm.create` · `vm.delete` | 폴더에 만들기(새로·가져오기·복원·배포 받기) · 지우기 | Write Vm·VmImport |
+| `vm.config` | `PUT` 스펙, CD, cloud-init, 펌웨어 재설정, 핫플러그, 템플릿 바꾸기·되돌리기 | Write Vm |
+| `vm.power` · `vm.console` | 켜기·끄기·재시작·에이전트 종료 · 콘솔 | Operate Vm |
+| `vm.snapshot` · `vm.migrate` · `vm.clone` | 스냅샷 · 라이브·저장소 옮기기 · 원본(템플릿) 쪽 복제·배포 | Write Vm |
+| `backup.create` · `backup.restore` · `backup.delete` · `backup.job` | 지금 백업 · 복원 · 지우기 · 백업 작업(루트) | Write Backup·BackupJob |
+| `storage.allocate` · `storage.config` | 풀에 볼륨 만들기·늘리기·지우기 · 풀 만들기·바꾸기 | Write Volume · Write StoragePool |
+| `network.assign` · `network.config` | NIC를 그 네트워크에 붙이기 · 네트워크·보안 그룹 쓰기 | (Write Vm) · Write Network·SecurityGroup |
+| `inventory.folder` · `inventory.move` · `inventory.quota` | 하위 폴더 만들기·이름·지우기 · 옮기기(원본·대상 둘 다) · 자식 폴더 할당량 | 새 것 |
+| `permission.modify` | 이 대상 아래 grant 주기·빼기(자기 권한 안에서) | 새 것 |
+| `alert.read` · `alert.manage` | 경보 보기 · 규칙 쓰기(루트) | Read · Write AlertRule |
+| `cluster.read` | 노드·클러스터·설정·HA·배치·Ceph·원격 읽기, 노드·클러스터 지표, Prometheus | Read 그 밖(계정 아님) |
+| `cluster.admin` | 계정·영역·남의 토큰·알림 대상·감사 로그·설정·노드·HA·배치·Ceph·원격 쓰기, 역할·그룹·루트 grant | 그 밖 전부 |
+
+### 6.3 내장 역할 = 지금 역할
+
+`admin` = 전부. `operator` = `system.read`·`cluster.read`·`alert.read`·`vm.*`·`backup.*`·`storage.allocate`·`network.assign`. `viewer` = `system.read`·`cluster.read`·`alert.read`. `UserSpec.role`은 그대로 남고 "루트에 그 내장 역할 grant"로 읽는다. 그래서 grant가 하나도 없는 클러스터에서는 모든 (Role, Action, Kind)가 지금 `RoleAuthorizer::check`와 같은 답을 낸다(§14 동치 시험, 옛 구현을 시험 안 참조로 남긴다). 새 권한(`inventory.*`·`permission.modify`·`network.config`·`storage.config`)은 operator에 넣지 않는다.
+
+### 6.4 그룹과 외부 그룹
+
+- 로컬 그룹 `Group`: `members`(로컬·외부 사용자 id)와 `external`(`{realm, group}` — LDAP 그룹 DN 또는 OIDC `groups` 클레임 값). 외부 사용자는 그 영역의 `external_groups`에 같은 값(앞뒤 공백 떼고 ASCII 대소문자 무시, `role_for`와 같은 비교)이 있으면 그룹에 든다.
+- **grant는 외부 그룹 이름을 바로 가리키지 않는다.** DN 문자열이 grant마다 흩어지면 오타를 잡을 곳이 없고, 디렉터리 그룹 이름이 바뀌면 grant를 다 고쳐야 한다. 연결은 `Group` 한 곳에서 하고, 화면은 "이 그룹에 든 외부 그룹"을 보인다.
+- `login_realm`·OIDC 콜백이 `upsert_external`에 그룹 목록을 넘긴다. 바뀌었을 때만 `external_groups`를 쓴다(세션은 끊지 않는다 — 요청마다 색인을 보므로 곧바로 반영). 토큰만 쓰는 외부 사용자는 마지막 로그인의 그룹을 쓴다(README 한계).
+- `RoleMapping`(그룹 → 전역 역할)은 그대로 둔다. 폴더 grant만 받을 외부 사용자는 매핑 `default: none`으로 로그인시킨다. 둘 다 없으면 지금처럼 403 `no_role`.
+
+### 6.5 위임과 상승 막기
+
+grant를 만들려면 대상에 `permission.modify`가 있어야 하고, 역할의 권한이 그 대상에서 자기 유효 권한의 부분집합이어야 한다(아니면 403 `"cannot grant privileges you do not hold: vm.delete"`). 루트 grant, 사용자 정의 역할·그룹 쓰기는 `cluster.admin`이다(역할 하나를 고치면 모든 grant가 바뀐다). 할당량은 그 폴더의 **부모**에서 `inventory.quota`를 요구한다(팀 관리자가 자기 상한을 올리지 못하게).
+
+### 6.6 API 토큰의 범위
+
+토큰 유효 권한 = 주인 유효 권한 ∩ `scope`(있으면 `targets`에 `privileges`를 건 propagate grant로 읽은 천장). 범위 없는 토큰은 지금처럼 주인과 같다. 토큰은 2FA를 거치지 않으므로 자동화에는 범위 토큰을 권한다(§10.4).
+
+## 7. 평가 색인 (opl-api `authz/`)
+
+- **노드마다, 리더 없이.** 모든 API 노드는 Raft 상태를 로컬에 가진다. 색인은 그 노드의 저장소에서 만들고 리더에 아무것도 묻지 않는다. 수백 노드에서 리더 짐이 늘지 않는다.
+- **세대**: `AuthzIndex`가 `cluster.follow`로 커밋 흐름을 받아 `Folder`·`Grant`·`AccessRole`·`Group`·`User`·`ApiToken` 이벤트에 `generation: AtomicU64`를 올린다. VM 이동은 세대를 올리지 않는다(객체의 폴더는 확인할 때 읽는다).
+- **주체별 색인** `EffectiveIndex { generation, root: PrivSet, folders: HashMap<Uuid, PrivSet>, objects: HashMap<(Kind, Uuid), PrivSet> }`: 처음 요청에서 만들고 세대가 바뀌면 다시 만든다. 그 주체의 grant를 대상별로 모은 뒤 폴더 트리를 위에서 아래로 한 번 훑어 propagate를 내린다(O(폴더 + grant)). 확인은 `folders[obj.folder] | objects[obj]` 두 번 찾기다. 캐시는 주체 1024개 LRU(`HashMap` + 시계 바늘, `Mutex` 하나, 만들기는 잠금 밖).
+- **빠른 길**: 루트에 `admin`(전역 역할 포함)이면 색인 없이 전부 참. 목록 거르기는 VM 1만 개 × 확인 2회라 1 ms 안이다(§14 벤치 기준값).
+- **API**: `Authz::require(principal, Privilege, &impl AuthzObject) -> Result<(), ApiError>`(못 읽으면 404, 읽으면 403), `Authz::filter(principal, iter)`, `Authz::require_root(principal, Privilege)`. `AuthzObject`는 `Vm`·`Network`·`StoragePool`·`Folder`에 구현하고, 파생 객체는 주인을 따른다: `Volume`(붙은 VM 또는 풀), `Snapshot`(VM), `Backup`(VM, 지워졌으면 `vm_spec.folder`), `Task`(`TaskOp` 대상 종류 + `target`, 대상이 없으면 루트), `VmImport`(대상 폴더). `Principal`은 그대로 두고 색인이 `user`로 그룹·토큰 범위를 찾는다(토큰 요청은 `Principal.token: Option<Uuid>`를 더한다).
+- `Authorizer` 트레이트와 `state.authorize(action, kind)`는 **루트 확인 전용**으로 남긴다(Node·Settings·Ceph·HA·배치·원격·영역·사용자 등 루트 종류의 호출은 바뀌지 않는다). 폴더를 따르는 종류(Vm·Volume·Snapshot·Backup·VmImport·Network·StoragePool)에 `authorize`를 부르면 디버그 빌드의 `debug_assert!`와 경로 시험(§14)이 막는다. 보안 그룹·백업 작업은 루트 종류다.
+
+## 8. 시행 범위
+
+| 면 | 규칙 |
+|---|---|
+| 모든 경로 | 위 표의 권한. 경로표 `authz_routes.rs`가 (메서드, 경로) → 권한·대상 해석을 적고, OpenAPI 경로가 표에 없으면 시험이 실패한다 |
+| 목록 | `list<S>` 매크로와 손으로 짠 목록(`vms`·`volumes`·`backups`·`snapshots`·`tasks`·`vm_imports`)이 `Authz::filter`를 거친다. 볼 수 없는 것은 빠지고 `revision`은 그대로다 |
+| `/watch` | 종류 확인 대신 이벤트마다 거른다. 연결마다 보낸 id 집합을 두고, 보이던 객체가 안 보이게 되면(폴더 이동) 가짜 `Deleted`를 보낸다. 세대가 바뀌면 `{"type":"error","code":"permissions"}`로 닫아 목록을 다시 읽게 한다(웹은 `expired`와 같이 다룬다) |
+| 검색·⌘K | 팔레트는 `useList` 캐시만 쓴다(계획 61 §5.2). 목록 거르기로 충분하고 새 API가 없다 |
+| 지표 | `/vms/{key}/metrics[/history]`는 VM `system.read`, 풀 기록은 풀 `system.read`. 노드 지표·`/metrics/cluster`·Prometheus `/metrics`는 루트 `cluster.read`(노드 합계가 다른 팀의 부하를 드러내므로 VM별 거르기 대신 클러스터 읽기를 요구한다). `Digest`의 상위 VM 목록은 거른다 |
+| 경보 | 규칙 쓰기는 루트 `alert.manage`. `/alerts`·`/alerts/history`는 subject로 거른다(VM → VM `system.read`, 노드·풀 → `cluster.read`·풀 읽기). 알림 대상은 `cluster.admin` |
+| Task | 목록·상세는 대상 읽기로 거르고, 취소는 그 op의 권한이다. 대상 없는 Task(노드 비우기 등)는 `cluster.read` |
+| 감사 로그 | 루트 `cluster.admin`(지금 admin과 같다). 폴더별 읽기는 §16 |
+| 콘솔 | `vm.console`(WebSocket 업그레이드 전에) |
+| 백업·복원 | 지금 백업 `backup.create`(VM), 복원 `backup.restore`(백업) + 대상 폴더 `vm.create` + 풀 `storage.allocate` + 네트워크 `network.assign` + 할당량. 원격 대상은 `cluster.admin` |
+| 만들기·배포 | 대상 폴더 `vm.create`, 템플릿 `vm.clone`, 풀 `storage.allocate`, NIC마다 `network.assign`, 보안 그룹은 읽기 |
+
+## 9. 폴더 할당량
+
+- **세는 것(할당 기준, 전원과 무관)**: 하위 트리의 VM에 대해 `vcpus = CpuSpec::vcpus()`, `memory_mib`, `disk_bytes` = `disks[].volume`이 가리키는 볼륨의 `size_bytes` 합(연결 복제도 가상 크기), `vms` = 템플릿 아닌 VM 수. 템플릿은 디스크만 센다. 붙지 않은 볼륨은 세지 않는다(볼륨에는 폴더가 없다, §16).
+- **중첩**: 사용량은 하위 트리 합이고, 쓰기는 경로 위의 **할당량 있는 모든 조상**을 지켜야 한다(가장 빡빡한 것이 묶는다). 자식 상한을 부모에서 미리 떼어 두지 않는다 — 자식 상한 합이 부모를 넘어도 된다(과약정). 미리 떼면 쓰지 않는 몫이 묶이고, 부모 상한을 줄일 때 자식을 먼저 줄여야 하는 순서 문제가 생긴다. 자식 상한이 부모보다 크면 화면이 "부모가 묶음"을 보인다.
+- **줄이기**: 사용량보다 낮게 둘 수 있다. 그때는 "초과"로 보이고 늘리는 쓰기만 막는다.
+- **경쟁 안전 = Raft 안 확인.** `folders.rs`의 `check_quota`가 `apply_command`에서 VM Create/UpdateSpec, 볼륨 UpdateSpec(크기가 늘 때, 붙은 VM을 찾아), 폴더 UpdateSpec(`parent`가 바뀔 때)마다 돈다. 경로에 할당량 있는 조상이 없으면 바로 끝난다. 있으면 VM을 한 번 훑어(`check_exclusive`와 같은 훑기에 붙인다) 그 조상들의 사용량 전·후를 셈하고, **어느 차원이든 후 > 상한이고 후 > 전**이면 `Rejection::QuotaExceeded { folder, dimension, limit, used }`. "늘릴 때만"이라서 HA 복구·마이그레이션·비우기·균형 조정(노드만 바꿈), 이름 바꾸기, 초과 폴더의 끄기는 막히지 않는다. 커밋 순서로 결정되므로 노드 둘이 동시에 만들어도 뒤에 커밋된 쪽만 거절된다. 예약·CAS 재시도·리더 단일 지점이 없다.
+- **API 사전 확인**: 만들기·복제·템플릿 배포(개수 n이면 n배)·크기 바꾸기·핫플러그·복원·가져오기는 요청 때 같은 계산(`quota::precheck`, 로컬 상태)으로 409 `quota_exceeded` `"folder /teamA would use 34 of 32 vCPUs"`를 먼저 낸다. 복제·복원·가져오기 Task는 디스크를 만든 뒤 VM을 쓰므로, 경쟁에서 진 Task는 마지막 쓰기에서 `QuotaExceeded`로 실패하고 지금 실패 정리가 볼륨을 지운다.
+- **사용량 보기**: `GET /folders/{id}/usage`는 하위 트리 사용량·상한·묶는 조상을 로컬 상태로 셈한다(10초 캐시).
+- **비용**: 할당량이 걸린 VM 쓰기의 apply가 VM 수만큼 JSON을 푼다. 이미 `check_exclusive`가 같은 훑기를 하므로 한 번에 합친다. `scale.rs`에 VM 1만 개 apply 시간 기준을 더하고, 넘으면 파생 표(`folder_usage`, 스냅샷 설치 때 다시 셈)로 바꾼다(§16).
+
+## 10. 2단계 인증
+
+### 10.1 요소
+
+- **TOTP**: SHA-1, 6자리, 30초, ±1 칸 허용(RFC 6238 권장, 앱 호환). 재사용 막기: 받은 칸이 `last_totp_step` 이하이면 거절하고, 성공하면 `UpdateStatusIf`(revision CAS)로 올린다. 노드 둘에 같은 코드를 동시에 내도 하나만 통과한다.
+- **복구 코드**: 10개, 80비트 무작위(`xxxx-xxxx-xxxx-xxxx`), SHA-256만 저장(엔트로피가 커서 argon2가 필요 없다, 토큰과 같다). 쓰면 `update_spec(expected_revision)`으로 지운다.
+- **WebAuthn(패스키)**: 직접 짠 최소 검증기 `opl-api/src/webauthn.rs`. `webauthn-rs`는 MPL-2.0(`deny.toml` 허용 목록 밖)이고 openssl을 끌어와 aarch64 정적 빌드를 흔든다. 범위를 좁혀 짠다: 등록은 `attestation: "none"`(증명문은 보지 않음), 알고리즘은 ES256(ring `ECDSA_P256_SHA256_ASN1`)·EdDSA(ring `ED25519`)·RS256(ring `RsaPublicKeyComponents`), CBOR는 `ciborium`(Apache-2.0). 확인: `clientDataJSON`의 `type`·`challenge`·`origin`(요청 호스트 또는 `web_origins`), `rpIdHash`, UP 플래그, `signCount`(0이 아니고 줄면 거절·경고). RP ID는 `two_factor.rp_id` 또는 요청 호스트이며, **IP 주소 접속에서는 브라우저가 WebAuthn을 막는다**. 화면은 그때 패스키를 숨기고 이유를 보인다.
+
+### 10.2 로그인 흐름
+
+`/auth/login`이 비밀번호(또는 LDAP)를 통과하고 그 사용자에게 요소가 있거나 정책이 요구하면, 쿠키는 **대기 세션**(`SessionSpec.pending`, 5분)이고 본문은 `{ "second_factor": { "methods": ["totp","recovery","webauthn"], "webauthn": {요청 옵션}, "enroll": false } }`다. `POST /auth/login/second-factor {totp|recovery|webauthn}`이 맞으면 같은 세션의 `pending`을 지운다(`update_spec` CAS). `find_session`이 `pending`을 돌려주고, `Principal` 추출기는 대기 세션을 401 `second_factor_required`로 막는다. 새 추출기 `PendingPrincipal`만 받으며, 받는 곳은 second-factor·등록 경로뿐이다. 실패는 `attempts`(사용자·IP)로 센다. 정책이 요구하는데 요소가 없으면 `enroll: true` 대기 세션이 등록 경로만 쓴다.
+
+### 10.3 정책·초기화·저장
+
+- 정책 `SettingsSpec.two_factor { roles, realms }`: 전역 역할이 `roles`에 있거나 영역(`local` 포함)이 `realms`에 있으면 요구한다. OIDC 영역 이름은 400(IdP가 MFA를 맡는다). 사용자 정의 역할 grant로는 정하지 않는다(로그인 때 grant 전체를 볼 이유가 없고, 폴더 위임자가 남의 2FA 요구를 바꾸게 된다).
+- 관리자 초기화 `DELETE /users/{key}/two-factor`(`cluster.admin`, 자기 자신은 안 됨): `TwoFactor`를 지우고 `session_epoch`을 올려 세션을 끊는다. 감사 `user 2fa-reset alice`.
+- **비밀 저장**: TOTP 비밀은 해시할 수 없다(서버가 HMAC을 다시 셈). 암호화도 하지 않는다. 쓸 수 있는 키가 같은 Raft DB 안(CA 키)에 있으니 겉치레다. LDAP bind 비밀번호·CA 키와 같이 `account` 종류에 두고 API 응답·watch·`Debug`·감사에서 빼며, 실제 보호는 0700 데이터 디렉터리다. 복구 코드는 해시, 패스키는 공개 키만 둔다.
+
+### 10.4 다른 인증과
+
+- **API 토큰**: 2FA를 거치지 않는다(자동화). 토큰 만들기는 2FA를 거친 세션이나 다른 토큰으로만 할 수 있으므로 비밀번호만 훔쳐서는 토큰을 만들 수 없다. 정책이 켜질 때 남은 토큰은 그대로이고, 화면이 "2FA 이전 토큰 n개"를 보인다. 범위(§6.6)를 권한다.
+- **OIDC**: 로컬 2FA를 묻지 않는다. **LDAP**: 디렉터리 바인드 뒤 로컬 요소를 묻는다(요소는 외부 사용자 `alice@corp`에 붙는다).
+- **CLI**: `oplctl login`이 `second_factor`를 받으면 TOTP·복구 코드를 묻는다. 패스키는 웹 전용이다.
+
+## 11. 버전이 섞인 클러스터
+
+- 옛 노드는 grant를 모르고 전역 역할만 본다. 그래서 grant·폴더 지정·`Role::None`이 **하나라도 있으면** 옛 노드가 더 주거나(폴더로 좁힌 operator가 전부 봄) 덜 준다(`none` 사용자를 못 풂). 그래서 §2의 쓰기는 모두 `require_feature(FOLDERS)` 뒤에만 받는다. 새 종류·새 칸이 없는 동안 새 노드의 판단은 옛 노드와 같다(§6.3 동치).
+- 상태 머신의 새 검사(§5·§9)는 `Folder`가 없으면 아무 일도 하지 않으므로, 업그레이드 중 같은 로그를 적용한 옛·새 노드의 결과가 같다. `Rejection`의 새 변형은 모든 노드가 새 버전인 뒤에만 나온다.
+- 뒤에 옛 노드가 합류하는 것은 지금 합류 검사(`version_too_old`)가 막는다. 2FA도 같다. `two-factor` 전에는 대기 세션을 만들지 않으므로 옛 노드가 대기 세션을 정식 세션으로 받는 일이 없다.
+
+## 12. 다른 기능과의 관계
+
+- **HA·마이그레이션·비우기·균형 조정**: 시스템 쓰기라 주체가 없고, 노드만 바꾸므로 할당량에 걸리지 않는다(§9).
+- **템플릿(계획 58)**: 템플릿은 VM 트리의 폴더에 산다. 배포는 원본 `vm.clone`, 대상 폴더 `vm.create`와 할당량이다.
+- **백업·복원**: `BackupSpec.vm_spec.folder`가 지운 VM 백업의 주인이다. 복원은 원래 폴더가 있으면 그곳, 없으면 루트이고 `--folder`로 바꾼다.
+- **원격 복제·가져오기**: 받는 클러스터에 없는 폴더 id는 버리고(루트) 받는 쪽 요청의 `folder`를 쓴다.
+- **보안 그룹**: 루트 객체(`network.config`)로 둔다. 폴더에 넣는 것은 §16.
+- **노드 목록**: 루트 `cluster.read`가 없는 폴더 사용자는 노드 목록을 못 본다. VM 만들기는 자동 배치이고 화면은 노드 칸을 숨긴다.
+- **이름 존재 노출**: 이름이 종류 전체에서 하나라서 만들기의 `name_taken`이 안 보이는 객체 이름을 드러낸다(README 한계, 이름 앞에 팀 접두사를 권함).
+- **규모(수백 노드)**: 리더 일은 늘지 않는다. 색인·거르기·사전 확인은 요청 받은 API 노드에서, 상태 머신 검사는 모든 노드의 apply에서 돈다.
+
+## 13. API·CLI·웹
+
+- **API**(태그 `folders`·`permissions`·`auth`):
+  - 폴더 `GET|POST /folders`(`?kind=vm`, 트리 평면 목록), `GET|PATCH|DELETE /folders/{id}`, `POST /folders/{id}/members {items: [{kind, key}]}`(일괄, 항목마다 결과), `GET /folders/{id}/usage`.
+  - 역할 `/access-roles[/{key}]`(내장은 읽기만), 그룹 `/groups[/{key}]`, grant `/grants[/{id}]`(`?target=folder/ID&principal=group/ID`).
+  - 유효 권한: `GET /permissions/mine`(색인 그대로 `{root, folders, objects}` — 웹이 쓴다), `GET /permissions/effective?user=alice&object=vm/web`(권한과 근거 grant), `GET /permissions/who?object=vm/web`(대상 `permission.modify` 필요).
+  - 2FA: `GET /auth/2fa`, `POST /auth/2fa/totp`(비밀·`otpauth://` URI) → `POST /auth/2fa/totp/confirm {code}`(복구 코드 10개, 한 번만), `DELETE /auth/2fa/totp {code|password}`, `POST /auth/2fa/recovery`, `POST /auth/2fa/webauthn/register` → `/finish`, `DELETE /auth/2fa/webauthn/{id}`, `POST /auth/login/second-factor`, `DELETE /users/{key}/two-factor`, `PATCH /settings {two_factor}`.
+  - 오류 404·403 `forbidden`, 409 `quota_exceeded`·`folder_not_empty`·`folder_cycle`·`name_taken`·`cluster_upgrading`, 400 `folder_required`, 401 `second_factor_required`·`invalid_second_factor`. 감사 설명 `folder create /teamA/prod`, `folder move vm web -> /teamA`, `grant add group:team-a operator on /teamA`, `user 2fa-reset alice`.
+- **CLI**: `folder tree|list|create|rename|move|delete [--kind vm|network|storage]`, `folder quota set /teamA --vcpus 32 --memory 128G --disk 2T --vms 20`, `folder usage /teamA`, `vm|network|pool move NAME… --folder /teamA`, `--folder` on `vm create|clone|import`·`backup restore`, `role list|get|create|set|delete`, `group …`, `grant list|add|remove`, `perm check --user alice vm/web`, `perm who vm/web`, `2fa status|totp enable|totp disable|recovery regen`, `user 2fa-reset NAME`, `token create --scope vm.power,vm.console@/teamA`.
+- **웹**(계획 61을 따른다, 사이드바는 그대로 최상위 영역만):
+  - **가상 머신 > VM** 탭에 보기 전환 `목록 | 폴더`(`/vms` | `/vm-folders`). 폴더 보기는 왼쪽 트리(가상화된 `role="tree"`, 화살표 키) + 오른쪽 계획 61 `DataTable`(그 폴더, "하위 포함" 칩)이다. 목록 보기에 폴더 열과 거름 칩. 템플릿 탭도 같은 트리를 쓴다.
+  - **인프라 > 네트워크·스토리지 풀** 탭에 같은 보기 전환(`/network-folders`·`/storage-folders`).
+  - 폴더 상세 `/vm-folders/:id`: `ResourceHeader`, 요약 카드(VM 수·사용량/상한 막대 넷), 탭 `내용 | 할당량 | 권한`. VM·네트워크·풀 상세에 **"권한" 탭**(유효 권한·근거·이 객체 grant, `permission.modify`면 더하기).
+  - 옮기기: 행(여러 개 고르면 묶음)을 트리 노드로 끌어 놓기(HTML5 DnD, 새 의존성 없음, 놓기 전 대상 폴더 강조와 불가 이유). 키보드·휴대폰 대안은 `BulkBar`의 "폴더로 옮기기…" 대화상자. 결과는 계획 61 묶음 알림.
+  - **설정**에 탭 `권한`(`/settings/permissions`, 모든 grant 표)·`역할`(`/settings/roles`, 권한 체크 표)·`그룹`(`/settings/groups`)·`보안`(`/settings/security`, 2FA 정책). 사용자 메뉴의 "2단계 인증"은 `/settings/account`(모두에게 보임, 토큰 탭처럼). 사용자 표에 2FA 열과 "초기화".
+  - 로그인 화면에 둘째 단계(코드 칸·"패스키 사용"·"복구 코드"), 강제 등록 화면(QR: npm `qrcode-generator` MIT, 의존성 없음).
+  - **숨기기**: `can(role, action, kind)`를 `usePermissions()`(`/permissions/mine`, `useQuery`, `folder`·`grant`·`access-role`·`group` watch에 무효화)의 `can(privilege, object?)`로 바꾼다. 43곳은 루트 확인 shim으로 먼저 옮긴 뒤 객체가 있는 곳을 객체 확인으로 바꾼다. 팔레트 동작·`BulkBar` "가능 n / 불가 m"·+ 만들기 메뉴도 같은 함수를 쓴다. i18n en·ko(`folders.*`, `permissions.*`, `twoFactor.*`).
+
+## 14. 시험과 CI
+
+- **순수(opl-types)**: serde 하위 호환(옛 `VmSpec`·`UserSpec`·`ApiTokenSpec`·`SessionSpec`·`SettingsSpec` JSON이 바이트 그대로, `folder` 없음 = 루트), 모르는 권한 이름 버리기, TOTP RFC 6238 부록 B의 SHA-1 벡터(59·1111111109·1111111111·1234567890·2000000000·20000000000, 8자리) + 6자리 자르기, base32 왕복.
+- **동치**: grant 없는 색인 × 모든 (`Role`, `Action`, `Kind`)가 시험 안에 남긴 옛 `RoleAuthorizer::check`와 같다.
+- **권한 행렬**(`insta`): 주체(루트 admin·operator·viewer, `none` + 그룹 grant(LDAP 외부 그룹), 폴더 A operator, 객체 하나 grant, propagate 거짓, 범위 토큰) × 객체(A의 VM, A/B의 VM, C의 VM, 루트 VM, 풀, 네트워크, 템플릿, 백업, Task) × 권한.
+- **성질 시험**(`proptest`, 새 dev 의존성 MIT/Apache): 무작위 트리(폴더 ≤ 40)·grant·객체에서 색인 = 참조 `effective`, 단조(grant 더하기는 권한을 줄이지 않음), propagate 거짓은 자손에 닿지 않음, 객체 이동 뒤 = 새 조상 기준, 세대 무효화 뒤 = 처음부터 만든 색인.
+- **상태 머신**(opl-cluster): 순환(A→B, B→A 동시)·빈 폴더 지우기와 넣기의 엇갈림·형제 이름 중복이 커밋 순서로 하나만 이김, `Folder` 없는 로그가 옛 구현과 같은 결과.
+- **경로 시험**(opl-api, `MockHypervisor`): `authz_routes.rs`가 OpenAPI 모든 경로를 덮는지, 폴더 A 사용자로 **모든 목록 경로**가 A만 돌려주는지, B 객체 경로는 404·A의 권한 밖 동작은 403인지, 대기 세션 쿠키로 모든 경로가 401인지 본다. `/watch`는 거르기·이동 뒤 가짜 `Deleted`·세대 바뀜 닫기를, 지표·경보·Task·감사는 거르기와 루트 요구를 본다. 위임 상승 막기, 할당량 부모 권한도 본다.
+- **할당량 경쟁**: opl-cluster `memnet` 노드 셋에서 두 팔로워가 같은 폴더에 동시에 만들기 100회 → 합이 상한을 넘지 않고 진 쪽이 `QuotaExceeded`. 늘리기만 막기(초과 폴더에서 노드 바꾸기·끄기는 통과), 볼륨 늘리기, 폴더 이동. opld E2E로 한 번 더(아래).
+- **2FA**: 재사용 거절과 두 노드 동시 같은 코드(CAS), 복구 코드 한 번만, 정책 강제 등록, 관리자 초기화가 세션을 끊음. WebAuthn은 시험 안 **소프트웨어 인증기**(ring 키로 `attestationObject`·`authenticatorData`·서명을 만듦)로 ES256·EdDSA·RS256 등록·로그인, 틀린 origin·challenge·rpId·signCount 되감기 거절을 본다.
+- **opld E2E**(새 `tests/permissions.rs`, QEMU 없음, 이 Mac·svc01): 노드 하나 — admin이 `/teamA`·`/teamB`와 꺼진 VM(디스크 없음)을 만들고, 그룹 `team-a`(LDAP 없이 로컬 멤버)에 `/teamA` operator를 준다. alice 토큰의 `vm list`·`watch`·`task list`에 teamA만 있고 teamB VM은 404. 할당량 `--vms 2`에서 셋째 409. alice가 TOTP를 켜고(시험이 코드 계산) 로그인에 둘째 단계가 필요하다. 노드 둘 — 두 노드 API로 동시에 만들기 → 상한을 지킴(`cluster.rs` 본).
+- **웹**: vitest(`usePermissions`·트리 키보드·끌어 놓기·숨기기, msw), Playwright `web/e2e/permissions.spec.ts`: **admin이 아닌 사용자로 로그인하면 VM 목록·폴더 트리·팔레트에 자기 폴더만 보이고 + 만들기가 그 폴더로 채워진다**. 2FA 로그인 단계 하나.
+- **svc01(aarch64)**: 일반 묶음 전체와 위 E2E, `scale.rs` VM 1만 개 + 할당량 apply 시간 기록. **GitHub**: 새 작업 없음. `deny`가 `ciborium`·`proptest`·`qrcode-generator` 라이선스를 본다(셋 다 허용 목록 안).
+
+## 15. 견준 길
+
+- **Proxmox 풀 + 경로 ACL vs vSphere 폴더 + 객체 권한(채택, 사용자 결정).** 리소스가 폴더 하나에만 속해 "어디에 있나"가 하나이고 할당량을 그 트리에 걸 수 있다.
+- **한 트리 vs 종류별 트리(채택).** 영역 나눔(계획 61)·할당량과 맞는다. 대가는 팀마다 grant 둘.
+- **더 구체적인 쪽이 이김 + 거부 vs 합집합(채택).** §6.1.
+- **grant에 외부 그룹 이름 vs `Group` 연결(채택).** §6.4.
+- **할당량: API 확인 / 예약 객체 CAS / Raft 안 확인(채택).** API만 확인하면 두 노드가 함께 넘는다. 예약은 실패 때 되돌리기와 표류 정리가 필요하고 폴더 객체 하나에 쓰기가 몰린다. 상태 머신 확인은 이미 있는 `check_exclusive` 틀이고 커밋 순서가 답을 정한다. 계획 58의 "쓰고 다시 보기"는 늘리기가 여럿(크기·핫플러그·이동)이라 물러설 쪽을 고르는 규칙이 복잡해서 쓰지 않는다.
+- **할당량 중첩: 부모에서 떼기 vs 조상마다 하위 트리 합(채택).** §9.
+- **TOTP 비밀: 암호화 vs Raft 평문 + API에서 가림(채택).** §10.3.
+- **WebAuthn: `webauthn-rs` vs 최소 직접 구현(채택).** 라이선스·openssl. 대가는 증명(attestation) 검증·MDS가 없다(§16).
+- **목록 거르기: SQL식 질의 vs 메모리 비트 집합(채택).** 상태가 이미 메모리에 가깝고 확인이 두 번 찾기다.
+
+## 16. 나중 할 일
+
+볼륨·백업·보안 그룹·노드 폴더, 태그(라벨) 기반 grant, 폴더별 감사 로그 읽기와 Prometheus, 실행 중만 세는 할당량·풀별 디스크 할당량·붙지 않은 볼륨 세기, `folder_usage` 파생 표, WebAuthn 증명·MDS·CLI 패스키, OIDC `amr`/`acr` 요구, 시간 제한 grant, 외부 그룹 주기적 다시 읽기(LDAP 동기화), 이름을 폴더 범위로 만들기.
+
+## 17. 스테이지 나누기
+
+각 스테이지는 커밋 하나이고, 혼자 컴파일되고 시험된다. 새 API는 그 스테이지에서 연다.
+
+1. **feat(types): 폴더·grant·역할·그룹·2FA 타입, 권한 목록과 내장 역할, 기능 `folders`·`two-factor`(opl-types)** — `folder.rs`·`authz.rs`·`two_factor.rs`, 스펙의 `folder`·`Role::None`·`external_groups`·`scope`·`pending`·`two_factor`, `Kind` 다섯, 참조 `effective`, `totp`(RFC 벡터), serde 하위 호환.
+2. **feat(cluster,api): 폴더 상태 머신 검사와 권한 색인(opl-cluster·opl-api `authz/`)** — `folders.rs`(부모·순환·빈 폴더·형제 이름), `Rejection` 변형, `AuthzIndex`·세대·LRU, `Authz::require|filter`, `RoleAuthorizer` 동치·행렬·`proptest`. 핸들러는 아직 루트 shim이라 동작이 같다.
+3. **feat(api): 모든 경로·목록·watch·지표·경보·Task 시행, 폴더·역할·그룹·grant·유효 권한 API(opl-api)** — `authz_routes.rs`와 덮기 시험, 404/403, 위임, 외부 그룹 저장, 토큰 범위, OpenAPI·`schema.d.ts`.
+4. **feat(cluster,api): 폴더 할당량** — `check_quota`, `QuotaExceeded` → 409, 일곱 경로 사전 확인, 사용량 API, memnet 경쟁 시험, `scale.rs` 기준.
+5. **feat(api): 2단계 인증 — TOTP·복구 코드·대기 세션·정책·초기화, WebAuthn 최소 검증기** — `PendingPrincipal`, CAS 재사용 막기, `webauthn.rs`(`ciborium`)와 소프트웨어 인증기 시험, `deny.toml` 확인.
+6. **feat(cli): folder·role·group·grant·perm·2fa 명령, `--folder`, 로그인 둘째 단계, opld E2E와 CI(oplctl·opld)** — `tests/permissions.rs`(한 노드·두 노드).
+7. **feat(web): 폴더 보기·끌어 놓기·일괄 옮기기, 권한 탭, 설정의 권한·역할·그룹·보안, 2FA 등록·로그인, `usePermissions` 숨기기(web)** — 계획 61 `AREAS`·`ViewSwitch`·`DataTable`·`BulkBar` 위에, Playwright `permissions.spec.ts`.
+8. **docs: README·가이드 "폴더와 권한"(위임 예, 거부 없는 설계로 빼기, 할당량, 2FA·패스키·IP 접속 한계, 이름 노출), 설계 문서 스테이지 보고, 계획 62 실행 기록**.
+
+## 18. 스테이지 보고 (설계와 다른 것·결정)
