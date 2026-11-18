@@ -10,13 +10,14 @@ export function apiUrl(path: string) {
  * 테스트마다 `server.use(...)`로 API 응답을 정한다. 정하지 않은 요청은 실패한다. 다만 Task 목록은
  * 모든 화면 바깥의 Task 색인(`renderPage`)이 읽으므로 기본으로 빈 목록이다(`server.use`가 앞선다).
  * 구독 상태도 대시보드 배너가 읽으므로 기본으로 배너가 없는 상태(오래 남은 active)다. 관리 Ceph도 노드·풀
- * 화면이 읽으므로 기본으로 없다.
+ * 화면이 읽으므로 기본으로 없다. 게스트 정보도 VM 요약이 읽으므로 기본으로 에이전트가 없다.
  */
 export const server = setupServer(
   http.get(apiUrl("/tasks"), () => HttpResponse.json({ revision: 1, items: [] })),
   http.get(apiUrl("/ceph"), () =>
     HttpResponse.json({ code: "not_found", message: "no Ceph cluster is set up" }, { status: 404 }),
   ),
+  http.get(apiUrl("/vms/:key/guest"), () => HttpResponse.json({ state: "no_agent" })),
   http.get(apiUrl("/subscription"), () =>
     HttpResponse.json({
       state: "active",

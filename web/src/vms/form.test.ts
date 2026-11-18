@@ -3,12 +3,14 @@ import {
   defaultMachine,
   emptyDisk,
   emptyForm,
+  firmwareUnavailable,
   fromVm,
   type CdromRow,
   gibToBytes,
   haUnavailable,
   toSpec,
   validate,
+  windows11,
 } from "@/vms/form";
 
 it("checks values the server would reject", () => {
@@ -390,4 +392,100 @@ it("rejects the reserved volume names", () => {
     disks: [{ ...emptyDisk("web", 0), pool: "local", volume: "download" }],
   };
   expect(validate(v, true)).toEqual({ "disks.0.volume": "volumes.errors.reserved" });
+});
+
+it("round-trips TPM, Secure Boot and the guest agent and leaves them out when off", () => {
+  const plain = toSpec({ ...emptyForm("q35"), name: "web" }, "stopped");
+  expect(plain).not.toHaveProperty("tpm");
+  expect(plain).not.toHaveProperty("secure_boot");
+  expect(plain).not.toHaveProperty("guest_agent");
+  const win = vm("win", "stopped", {
+    spec: {
+      ...vm("win", "stopped").spec,
+      tpm: true,
+      secure_boot: true,
+      guest_agent: { freeze_fs: false, shutdown: "acpi" },
+    },
+  });
+  const form = fromVm(win);
+  expect(form).toMatchObject({
+    tpm: true,
+    secureBoot: true,
+    guestAgent: true,
+    agentFreeze: false,
+    agentShutdown: "acpi",
+  });
+  expect(toSpec(form, "stopped")).toMatchObject({
+    tpm: true,
+    secure_boot: true,
+    guest_agent: { freeze_fs: false, shutdown: "acpi" },
+  });
+  // 기본 에이전트 설정은 끄는 방법을 보내지 않는다.
+  const agent = toSpec({ ...emptyForm("q35"), guestAgent: true }, "stopped");
+  expect(agent.guest_agent).toEqual({ freeze_fs: true });
+  // 에이전트를 꺼도 설정은 남겨 두되 보내지 않는다.
+  expect(toSpec({ ...form, guestAgent: false }, "stopped")).not.toHaveProperty("guest_agent");
+});
+
+it("needs UEFI for TPM and Secure Boot", () => {
+  const v = { ...emptyForm("q35"), name: "web", firmware: "bios" as const };
+  expect(validate({ ...v, tpm: true, secureBoot: true }, true)).toEqual({
+    tpm: "vmForm.errors.needsUefi",
+    secureBoot: "vmForm.errors.needsUefi",
+  });
+  expect(validate({ ...v, firmware: "uefi", tpm: true, secureBoot: true }, true)).toEqual({});
+});
+
+it("fills in Windows 11 like the CLI preset", () => {
+  const v = {
+    ...emptyForm("virt"),
+    name: "win",
+    firmware: "bios" as const,
+    sockets: 2,
+    disks: [emptyDisk("win", 0)],
+    nics: [{ network: "lan", model: "virtio" as const, mac: "", securityGroups: [] }],
+  };
+  const w = windows11(v);
+  expect(w).toMatchObject({
+    name: "win",
+    machine: "q35",
+    firmware: "uefi",
+    secureBoot: true,
+    tpm: true,
+    guestAgent: true,
+    agentFreeze: true,
+    agentShutdown: "agent",
+    sockets: 1,
+    cores: "2",
+    memory: "4096",
+  });
+  expect(w.disks.map((d) => d.bus)).toEqual(["sata"]);
+  expect(w.nics.map((n) => [n.network, n.model])).toEqual([["lan", "e1000e"]]);
+  expect(toSpec(w, "stopped")).toMatchObject({ guest_agent: { freeze_fs: true } });
+});
+
+it("says why TPM or Secure Boot cannot be turned on for the chosen node", () => {
+  const tpmOnly = {
+    ...NODE,
+    status: { ...NODE.status, firmware_caps: { tpm: true, secure_boot: false } },
+  };
+  // 옛 노드는 능력을 알리지 않는다(없는 것으로 본다).
+  const old = { ...NODE, id: "n2", name: "node-b" };
+  const witness = {
+    ...NODE,
+    id: "n3",
+    name: "w",
+    spec: { ...NODE.spec, witness: true },
+    status: { ...NODE.status, firmware_caps: { tpm: true, secure_boot: true } },
+  };
+  expect(firmwareUnavailable(undefined, "", "tpm")).toBeNull();
+  expect(firmwareUnavailable([tpmOnly, old], "", "tpm")).toBeNull();
+  expect(firmwareUnavailable([tpmOnly, old, witness], "", "secure_boot")).toEqual({
+    key: "vmForm.secureBootNoNode",
+  });
+  expect(firmwareUnavailable([tpmOnly, old], "n2", "tpm")).toEqual({
+    key: "vmForm.tpmNodeOff",
+    values: { node: "node-b" },
+  });
+  expect(firmwareUnavailable([tpmOnly, old], "n1", "tpm")).toBeNull();
 });

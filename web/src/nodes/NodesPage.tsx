@@ -241,6 +241,7 @@ export function NodesPage() {
             <TableHead>{t("nodes.underlay")}</TableHead>
             <TableHead>{t("nodes.hypervisor")}</TableHead>
             <TableHead>{t("nodes.arch")}</TableHead>
+            <TableHead>{t("nodes.firmware")}</TableHead>
             <TableHead>{t("nodes.fencing")}</TableHead>
             <TableHead>{t("nodes.checks")}</TableHead>
             <TableHead>{t("nodes.cpus")}</TableHead>
@@ -260,7 +261,7 @@ export function NodesPage() {
         </TableHeader>
         <TableBody>
           {(nodes.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 19 : 18} query={nodes} empty={t("dashboard.noNodes")} />
+            <TableMessage colSpan={write ? 20 : 19} query={nodes} empty={t("dashboard.noNodes")} />
           )}
           {(nodes.data ?? []).map((node) => (
             <TableRow key={node.id}>
@@ -322,6 +323,19 @@ export function NodesPage() {
               </TableCell>
               {/* 옛 버전으로 등록한 노드는 모른다. */}
               <TableCell>{node.status.arch ?? "—"}</TableCell>
+              {/* TPM·Secure Boot 능력. 옛 노드는 알리지 않고(모름), 위트니스는 VM을 돌리지 않는다. */}
+              <TableCell>
+                {node.spec.witness ? (
+                  "—"
+                ) : node.status.firmware_caps ? (
+                  t("nodes.firmwareCaps", {
+                    tpm: t(node.status.firmware_caps.tpm ? "nodes.yes" : "nodes.no"),
+                    secureBoot: t(node.status.firmware_caps.secure_boot ? "nodes.yes" : "nodes.no"),
+                  })
+                ) : (
+                  <span className="text-muted-foreground">{t("nodes.firmwareUnknown")}</span>
+                )}
+              </TableCell>
               {/* 펜싱이 꺼진 노드(위트니스 포함)는 HA VM을 돌리지 않는다. */}
               <TableCell>
                 {node.status.ha ? (

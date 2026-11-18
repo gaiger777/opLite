@@ -96,7 +96,11 @@
     "vm_is_template": "Not possible on a template. Deploy a VM from it or convert it back first: {{message}}",
     "volume_is_template": "A template's disk cannot be changed or deleted: {{message}}",
     "template_in_use": "The template still has linked clones. Delete or flatten them first: {{message}}",
-    "volume_has_clones": "The volume is the base of linked clones. Delete or flatten them first: {{message}}"
+    "volume_has_clones": "The volume is the base of linked clones. Delete or flatten them first: {{message}}",
+    "firmware_reset_required": "The VM has UEFI variables made for the other Secure Boot setting. Change Secure Boot with \"Reset firmware\" on the VM page, which resets the UEFI variables too (boot entries are lost).",
+    "tpm_state_unavailable": "The VM cannot start because its TPM state is not available: {{message}}",
+    "guest_agent_unavailable": "The guest agent cannot be used: {{message}}",
+    "node_unreachable": "Cannot reach the node: {{message}}"
   },
   "nav": {
     "dashboard": "Dashboard",
@@ -217,7 +221,8 @@
       "ceph-client-install": "Install Ceph client packages on {{node}}",
       "volume-download": "Download volume {{target}}",
       "vm-untemplate": "Convert {{target}} back to a VM",
-      "volume-flatten": "Flatten volume {{target}}"
+      "volume-flatten": "Flatten volume {{target}}",
+      "vm-firmware-reset": "Reset the firmware of {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -330,7 +335,8 @@
       "snapshots": "Snapshots",
       "backups": "Backups",
       "tasks": "Tasks",
-      "json": "JSON"
+      "json": "JSON",
+      "guest": "Guest"
     },
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}} cores ({{model}})",
@@ -406,7 +412,10 @@
       "cdrom": "CD-ROM drive {{n}}",
       "cdromBoot": "Boot order of CD-ROM drive {{n}}",
       "cdroms": "CD-ROM drives",
-      "cloud_init": "cloud-init"
+      "cloud_init": "cloud-init",
+      "tpm": "TPM 2.0",
+      "secure_boot": "Secure Boot",
+      "guest_agent": "Guest agent"
     },
     "applyAgain": "Apply again",
     "replication": {
@@ -460,7 +469,77 @@
     "templateClones_one": "{{count}} linked clone",
     "templateClones_other": "{{count}} linked clones",
     "linkedClone": "Linked clone",
-    "linkedDisk": "disk{{n}}: linked clone of {{base}}"
+    "linkedDisk": "disk{{n}}: linked clone of {{base}}",
+    "on": "On",
+    "security": {
+      "title": "Security",
+      "tpm": "TPM 2.0",
+      "secureBoot": "Secure Boot",
+      "uefiVars": "UEFI variables",
+      "varsOn": "On node {{node}}",
+      "noVars": "None yet (made on first start)",
+      "tpmState": "State on node {{node}}",
+      "tpmStateCopies": "State on node {{node}}, copies on {{copies}}",
+      "tpmNoState": "No state yet (made on first start)",
+      "tpmKept": "State kept on node {{node}}",
+      "pending": "{{field}}: {{running}} → {{wanted}} at the next restart",
+      "reset": "Reset firmware",
+      "secureBootOn": "Turn Secure Boot on",
+      "secureBootOff": "Turn Secure Boot off",
+      "notStopped": "Stop the VM to reset its firmware or change Secure Boot.",
+      "resetTitle": "Reset the firmware of {{name}}?",
+      "resetDescription": "Choose what to reset. This cannot be undone. The VM must be stopped.",
+      "resetVars": "UEFI variables",
+      "resetVarsHint": "Boot entries and UEFI settings are lost. The VM starts with fresh variables.",
+      "resetTpm": "TPM state",
+      "resetTpmWarning": "Keys in the TPM are lost. Disk encryption such as BitLocker will ask for its recovery key. Have it ready.",
+      "resetSecureBootOn": "Turn Secure Boot on (resets the UEFI variables)",
+      "resetSecureBootOff": "Turn Secure Boot off (resets the UEFI variables)"
+    },
+    "guest": {
+      "agent": "Guest agent",
+      "settings": "Settings",
+      "setting": "On ({{freeze}}, {{shutdown}})",
+      "freezeOn": "freezes file systems",
+      "freezeOff": "no file system freeze",
+      "shutdown": {
+        "agent": "shuts down through the agent",
+        "acpi": "shuts down with ACPI"
+      },
+      "os": "Operating system",
+      "kernel": "Kernel",
+      "hostname": "Host name",
+      "agentVersion": "Agent version",
+      "addresses": "IP addresses",
+      "filesystems": "File systems",
+      "mountpoint": "Mount point",
+      "fstype": "Type",
+      "usage": "Used",
+      "used": "{{used}} of {{total}} ({{percent}}%)",
+      "noFilesystems": "No file systems.",
+      "refresh": "Refresh",
+      "collected": "Collected {{time}}",
+      "password": "Set guest password",
+      "passwordTitle": "Set a guest password on {{name}}",
+      "passwordDescription": "The guest agent sets the password of a user account inside the guest. The password is not stored.",
+      "user": "User",
+      "newPassword": "New password",
+      "passwordAgain": "New password again",
+      "passwordSet": "Set the password of {{user}} on {{name}}",
+      "notRunning": "The VM must be running to set a guest password.",
+      "state": {
+        "answered": "The guest agent answered.",
+        "no_agent": "No guest agent answers. Turn on the guest agent in the VM settings, install qemu-guest-agent in the guest, and restart the VM.",
+        "not_running": "The VM is not running.",
+        "unreachable": "Cannot reach the node the VM runs on. Try again shortly.",
+        "unsupported": "The node the VM runs on runs an older Orbivisor that cannot read guest information. Upgrade it."
+      },
+      "errors": {
+        "user": "Use 1–64 bytes without control characters.",
+        "password": "Use 1–256 bytes.",
+        "again": "The passwords do not match."
+      }
+    }
   },
   "snapshots": {
     "created": "Created",
@@ -1304,7 +1383,10 @@
       "menu": "Disks…",
       "title": "Disks of {{name}}",
       "description": "Whole disks on the node and whether a Ceph OSD can use them. Disks in use (system, mounted, swap, ZFS, RAID, storage pool volume groups) are never erased."
-    }
+    },
+    "firmware": "Firmware",
+    "firmwareCaps": "TPM {{tpm}}, Secure Boot {{secureBoot}}",
+    "firmwareUnknown": "unknown"
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -1613,7 +1695,8 @@
       "ciGateway": "Use an address of the same family.",
       "ciDns": "Up to 3 IP addresses.",
       "ciSearch": "Up to 6 domain names.",
-      "ciData": "At most 64 KiB."
+      "ciData": "At most 64 KiB.",
+      "needsUefi": "Needs UEFI firmware."
     },
     "volumesCreated": "Volumes {{names}} were created; {{error}}",
     "schedule": "Scheduled snapshots",
@@ -1722,7 +1805,31 @@
     "ciUserDataHint": "Used as it is instead of the generated user-data (start with #cloud-config).",
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "Runs together with the generated user-data, for packages and runcmd.",
-    "ciUserDataWarning": "The user-data replaces the generated user-data; user, password and SSH keys are not used."
+    "ciUserDataWarning": "The user-data replaces the generated user-data; user, password and SSH keys are not used.",
+    "windows11": "Fill in for Windows 11",
+    "windows11Hint": "Filled in for Windows 11: q35, UEFI with Secure Boot, TPM 2.0, guest agent, 2 cores, 4096 MiB, SATA disks and e1000e interfaces, because the Windows installer has no VirtIO drivers. After installing the VirtIO drivers in Windows, switch the disks to virtio-blk and the interfaces to virtio for better speed.",
+    "security": "Security",
+    "securityLive": "TPM changes apply at the next restart. Secure Boot can only change while the VM is stopped.",
+    "tpm": "TPM 2.0",
+    "tpmHint": "A virtual TPM (swtpm). Its state stays on the node the VM runs on and follows the VM. Windows 11 needs it.",
+    "secureBoot": "Secure Boot",
+    "secureBootHint": "UEFI firmware with Microsoft's keys enrolled. Only signed boot loaders start.",
+    "needsUefi": "Needs UEFI firmware.",
+    "tpmNodeOff": "Node {{node}} cannot run a TPM (swtpm is missing or the node is too old).",
+    "tpmNoNode": "No node can run a TPM. Install swtpm on the nodes and restart orbivisor.",
+    "secureBootNodeOff": "Node {{node}} has no Secure Boot firmware (or is too old).",
+    "secureBootNoNode": "No node has Secure Boot firmware. Install the OVMF Secure Boot firmware on the nodes and restart orbivisor.",
+    "secureBootRunning": "Stop the VM to change Secure Boot.",
+    "secureBootReset": "The VM already has UEFI variables. Change Secure Boot with \"Reset firmware\" on the VM page.",
+    "guestAgent": "Guest agent",
+    "guestAgentOn": "QEMU guest agent",
+    "guestAgentHint": "Shows the guest's addresses and OS, shuts down cleanly and freezes file systems for snapshots. Install qemu-guest-agent in the guest.",
+    "guestAgentLive": "Adding or removing the agent channel applies at the next restart. The other settings apply right away.",
+    "agentFreeze": "Freeze file systems for snapshots and backups",
+    "agentFreezeHint": "Asks the guest to flush and freeze its file systems so disk snapshots, backups and replicas are consistent.",
+    "agentShutdown": "Shutdown",
+    "agentShutdownAgent": "Through the guest agent, then ACPI",
+    "agentShutdownAcpi": "ACPI only"
   },
   "console": {
     "connecting": "Connecting…",

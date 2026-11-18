@@ -126,6 +126,16 @@ export interface VmFormValues {
   /** 게스트 에이전트 감시를 켠다. 끄더라도 초는 남겨 다시 켤 때 쓴다. */
   guestWatch: boolean;
   guestWatchSecs: string;
+  /** TPM 2.0(swtpm). UEFI가 있어야 한다. */
+  tpm: boolean;
+  /** Secure Boot 펌웨어. UEFI가 있어야 한다. */
+  secureBoot: boolean;
+  /** QEMU 게스트 에이전트 채널(`guest_agent`). 끄더라도 아래 두 값은 남겨 다시 켤 때 쓴다. */
+  guestAgent: boolean;
+  /** 스냅샷·백업·복제 때 게스트의 파일 시스템을 얼린다(`freeze_fs`). */
+  agentFreeze: boolean;
+  /** 끌 때 에이전트(`guest-shutdown`)를 먼저 쓰거나 ACPI만 쓴다. */
+  agentShutdown: Schemas["AgentShutdown"];
   /** 균형 조정기가 옮기지 않는다(`placement.pinned`). 끄면 `placement`를 보내지 않는다. */
   pinned: boolean;
   /** 만든 뒤 곧바로 시작한다(만들 때만). */
@@ -183,6 +193,9 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     snapshotSchedule: { every: "off", keep: "7", memory: false },
     replication: [],
     ...haFields(null),
+    ...agentFields(undefined),
+    tpm: false,
+    secureBoot: false,
     pinned: false,
     start: true,
   };
@@ -235,8 +248,44 @@ export function fromVm(vm: Vm): VmFormValues {
       pool: r.pool ?? "",
     })),
     ...haFields(haPolicy(s)),
+    tpm: s.tpm ?? false,
+    secureBoot: s.secure_boot ?? false,
+    ...agentFields(s.guest_agent),
     pinned: s.placement?.pinned ?? false,
     start: false,
+  };
+}
+
+/** 게스트 에이전트 설정(없으면 undefined)의 폼 값. 없으면 서버의 기본값(얼리기, 에이전트로 끄기)을 채워 둔다. */
+function agentFields(
+  agent: Schemas["GuestAgentSpec"] | undefined,
+): Pick<VmFormValues, "guestAgent" | "agentFreeze" | "agentShutdown"> {
+  return {
+    guestAgent: agent != null,
+    agentFreeze: agent?.freeze_fs ?? true,
+    agentShutdown: agent?.shutdown ?? "agent",
+  };
+}
+
+/**
+ * "Windows 11" 미리 채우기(CLI의 `vm create --preset windows11`과 같은 값): q35·UEFI·Secure Boot·TPM·게스트 에이전트,
+ * 2코어·4096 MiB, 디스크는 SATA, NIC는 e1000e(Windows 설치 프로그램에 VirtIO 드라이버가 없다). 이름·노드 등 다른 값은 둔다.
+ */
+export function windows11(v: VmFormValues): VmFormValues {
+  return {
+    ...v,
+    machine: "q35",
+    firmware: "uefi",
+    secureBoot: true,
+    tpm: true,
+    guestAgent: true,
+    agentFreeze: true,
+    agentShutdown: "agent",
+    sockets: 1,
+    cores: "2",
+    memory: "4096",
+    disks: v.disks.map((d) => ({ ...d, bus: "sata" })),
+    nics: v.nics.map((n) => ({ ...n, model: "e1000e" })),
   };
 }
 
@@ -312,6 +361,13 @@ export function validate(
     errors.memory = "vmForm.errors.memory";
   }
   Object.assign(errors, maxErrors(v));
+  // 서버의 `TpmNeedsUefi`·`SecureBootNeedsUefi`
+  if (v.firmware !== "uefi" && v.tpm) {
+    errors.tpm = "vmForm.errors.needsUefi";
+  }
+  if (v.firmware !== "uefi" && v.secureBoot) {
+    errors.secureBoot = "vmForm.errors.needsUefi";
+  }
   const boots = new Set<number>();
   const names = new Set<string>();
   v.disks.forEach((d, i) => {
@@ -571,6 +627,15 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
           }
         : null,
     ),
+    // 끈 TPM·Secure Boot와 없는 에이전트는 보내지 않는다(옛 클러스터는 이 필드를 모른다).
+    ...(v.tpm && { tpm: true }),
+    ...(v.secureBoot && { secure_boot: true }),
+    ...(v.guestAgent && {
+      guest_agent: {
+        freeze_fs: v.agentFreeze,
+        ...(v.agentShutdown !== "agent" && { shutdown: v.agentShutdown }),
+      },
+    }),
     // 고정하지 않으면 보내지 않는다(서버도 `pinned: false`를 저장하지 않고, 옛 클러스터는 이 필드를 모른다).
     ...(v.pinned && { placement: { pinned: true } }),
   };
@@ -599,4 +664,31 @@ export function haUnavailable(
       : null;
   }
   return nodes.some(haCapable) ? null : { key: "vmForm.haNoNode" };
+}
+
+/** 노드의 펌웨어 능력. 옛 노드·위트니스는 `firmware_caps`가 없다(모름). */
+export type FirmwareCap = "tpm" | "secure_boot";
+
+/**
+ * TPM·Secure Boot를 켤 수 없는 이유(번역 키와 값). {@link haUnavailable}처럼 지정 노드(`node`, 빈 문자열이면 자동)만
+ * 보고, 자동이면 그 능력을 알린 노드(위트니스 제외)가 하나도 없을 때다. 능력을 모르는 노드는 없는 것으로 본다(서버의
+ * 스케줄러). 노드 목록을 아직 모르면 막지 않는다.
+ */
+export function firmwareUnavailable(
+  nodes: Node[] | undefined,
+  node: string,
+  cap: FirmwareCap,
+): { key: string; values?: Record<string, string> } | null {
+  if (!nodes) {
+    return null;
+  }
+  const has = (n: Node) => n.status.firmware_caps?.[cap] === true;
+  const what = cap === "tpm" ? "tpm" : "secureBoot";
+  if (node !== "") {
+    const chosen = nodes.find((n) => n.id === node);
+    return chosen && !has(chosen)
+      ? { key: `vmForm.${what}NodeOff`, values: { node: chosen.name } }
+      : null;
+  }
+  return nodes.some((n) => !n.spec.witness && has(n)) ? null : { key: `vmForm.${what}NoNode` };
 }

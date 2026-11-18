@@ -145,6 +145,31 @@ it("shows what each node can hotplug", async () => {
   expect(cell("node-c")).toHaveTextContent(/^qemu-kvm$/);
 });
 
+it("shows which nodes can run a TPM and Secure Boot", async () => {
+  cluster();
+  const full = {
+    ...NODE,
+    status: { ...NODE.status, firmware_caps: { tpm: true, secure_boot: true } },
+  };
+  const tpmOnly = { ...DOWN, status: { ...DOWN.status, firmware_caps: { tpm: true } } };
+  // 옛 노드는 알리지 않는다(모름). 위트니스는 VM을 돌리지 않는다.
+  const old = { ...NODE, id: "n3", name: "node-c" };
+  const witness = { ...NODE, id: "n4", name: "node-w", spec: { ...NODE.spec, witness: true } };
+  mockLists({ node: [full, tpmOnly, old, witness] });
+  renderPage(<NodesPage />);
+  const table = await screen.findByRole("table", { name: "Nodes" });
+  const column = within(table)
+    .getAllByRole("columnheader")
+    .findIndex((h) => h.textContent === "Firmware");
+  const cell = (name: string) =>
+    within(within(table).getByText(name).closest("tr")!).getAllByRole("cell")[column];
+  expect(await within(table).findByText("node-a")).toBeInTheDocument();
+  expect(cell("node-a")).toHaveTextContent("TPM yes, Secure Boot yes");
+  expect(cell("node-b")).toHaveTextContent("TPM yes, Secure Boot no");
+  expect(cell("node-c")).toHaveTextContent("unknown");
+  expect(cell("node-w")).toHaveTextContent("—");
+});
+
 it("counts the replicas each node holds and lists them", async () => {
   cluster();
   const web = replicatedVm("running");

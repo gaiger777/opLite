@@ -95,6 +95,28 @@ it("translates API error codes and falls back to the server message", async () =
   ).toBe(
     'The template still has linked clones. Delete or flatten them first: template "tmpl" has 1 linked clone(s) (web-1)',
   );
+  expect(
+    errorMessage(
+      t,
+      new ApiError(
+        409,
+        "tpm_state_unavailable",
+        'the TPM state of VM "win" is on node "a" (offline)',
+      ),
+    ),
+  ).toBe(
+    'The VM cannot start because its TPM state is not available: the TPM state of VM "win" is on node "a" (offline)',
+  );
+  expect(
+    errorMessage(t, new ApiError(409, "guest_agent_unavailable", 'VM "win" has no guest agent')),
+  ).toBe('The guest agent cannot be used: VM "win" has no guest agent');
+  // 서버의 설명은 CLI 명령을 말하므로 웹의 길을 알린다.
+  expect(
+    errorMessage(t, new ApiError(409, "firmware_reset_required", "vm set win --reset-uefi-vars")),
+  ).toMatch(/^The VM has UEFI variables .* "Reset firmware" on the VM page/);
+  expect(errorMessage(t, new ApiError(409, "cluster_upgrading", 'node "b" lacks vtpm'))).toBe(
+    'The cluster is being upgraded: node "b" lacks vtpm',
+  );
   // HA 용량 예약은 서버의 셈으로 남은 자리를 알린다(details가 없으면 앞 문장만).
   const capacity = { capacity_mib: 16384, reserve_mib: 8192, used_mib: 7168, need_mib: 2048 };
   expect(errorMessage(t, new ApiError(409, "ha_capacity", "x", capacity))).toBe(

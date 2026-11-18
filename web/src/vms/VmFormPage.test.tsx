@@ -1322,3 +1322,151 @@ describe("install media", () => {
     expect(options.map((o) => o.textContent)).toEqual(["Empty", "ubuntu"]);
   });
 });
+
+/** TPM·Secure Boot를 돌릴 수 있는 노드 */
+const CAPABLE = {
+  ...NODE,
+  status: { ...NODE.status, firmware_caps: { tpm: true, secure_boot: true } },
+};
+
+it("fills in Windows 11 and creates the VM with TPM, Secure Boot and the guest agent", async () => {
+  mockLists({ node: [CAPABLE], "storage-pool": [pool("local")] });
+  let body: { spec: Record<string, unknown> } | undefined;
+  let volumeBody: unknown;
+  server.use(
+    http.post(apiUrl("/volumes"), async ({ request }) => {
+      volumeBody = await request.json();
+      return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
+    }),
+    http.post(apiUrl("/vms"), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(vm("win", "stopped"), { status: 201 });
+    }),
+  );
+  const { queryClient } = renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "win");
+  await user.click(screen.getByRole("button", { name: "Fill in for Windows 11" }));
+  expect(screen.getByRole("status")).toHaveTextContent(/switch the disks to virtio-blk/);
+  expect(screen.getByRole("switch", { name: "TPM 2.0" })).toBeChecked();
+  expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeChecked();
+  expect(screen.getByRole("switch", { name: "QEMU guest agent" })).toBeChecked();
+  expect(screen.getByLabelText("Memory (MiB)")).toHaveValue(4096);
+  // 미리 채운 뒤 더한 디스크·NIC도 Windows 장치로 시작한다.
+  await user.click(screen.getByRole("button", { name: "New empty volume" }));
+  const disk = screen.getByRole("group", { name: "Disk 1" });
+  await user.selectOptions(within(disk).getByLabelText("Storage pool"), "local");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  const done = {
+    ...task("t-vol", "volume-create", "v1"),
+    status: { state: "succeeded", error: null },
+  };
+  // 볼륨 Task가 끝나야 VM을 만든다.
+  await waitFor(() => expect(volumeBody).toBeDefined());
+  queryClient.setQueryData<List<Task>>(["list", "task"], { revision: 2, items: [done as Task] });
+  await waitFor(() => expect(body).toBeDefined());
+  expect(body!.spec).toMatchObject({
+    machine: "q35",
+    firmware: "uefi",
+    cpu: { sockets: 1, cores: 2 },
+    memory_mib: 4096,
+    tpm: true,
+    secure_boot: true,
+    guest_agent: { freeze_fs: true },
+    disks: [{ volume: "win-disk0", bus: "sata" }],
+    nics: [{ network: "user", model: "e1000e" }],
+  });
+});
+
+it("says why TPM and Secure Boot cannot be turned on and needs UEFI", async () => {
+  // 옛 노드는 능력을 알리지 않는다.
+  mockLists({ node: [NODE] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const tpm = await screen.findByRole("switch", { name: "TPM 2.0" });
+  expect(tpm).toBeDisabled();
+  expect(
+    screen.getByText("No node can run a TPM. Install swtpm on the nodes and restart orbivisor."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeDisabled();
+  // 미리 채우기는 켜 두고 쓸 수 없다고 알린다(끌 수는 있다).
+  await user.click(screen.getByRole("button", { name: "Fill in for Windows 11" }));
+  expect(tpm).toBeChecked();
+  expect(tpm).toBeEnabled();
+  await user.click(tpm);
+  expect(tpm).not.toBeChecked();
+  expect(tpm).toBeDisabled();
+});
+
+it("asks for UEFI before sending TPM", async () => {
+  mockLists({ node: [CAPABLE] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("switch", { name: "TPM 2.0" }));
+  await user.selectOptions(screen.getByLabelText("Firmware"), "bios");
+  await user.click(screen.getByRole("button", { name: "Create" }));
+  // 이유와 입력 오류
+  expect(screen.getAllByText("Needs UEFI firmware.").length).toBeGreaterThan(0);
+  expect(screen.getByRole("switch", { name: "Secure Boot" })).toBeDisabled();
+});
+
+it("changes Secure Boot only through the firmware reset once the VM has UEFI variables", async () => {
+  const win = vm("win", "stopped", {
+    status: { ...vm("win", "stopped").status, firmware_node: "n1" },
+  });
+  mockLists({ vm: [win], node: [CAPABLE] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/win/edit" });
+  const sb = await screen.findByRole("switch", { name: "Secure Boot" });
+  expect(sb).toBeDisabled();
+  expect(screen.getByText(/Change Secure Boot with "Reset firmware" on the VM page/)).toBeVisible();
+  // TPM은 바꿀 수 있다.
+  expect(screen.getByRole("switch", { name: "TPM 2.0" })).toBeEnabled();
+});
+
+it("changes the guest agent of a running VM and keeps Secure Boot locked", async () => {
+  const app = vm("app", "running", {
+    status: { ...vm("app", "running").status, hardware: hardware() },
+  });
+  mockLists({ vm: [app], node: [CAPABLE] });
+  let body: { spec: Record<string, unknown> } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${app.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(app);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/app/edit" });
+  const user = userEvent.setup();
+  expect(await screen.findByRole("switch", { name: "Secure Boot" })).toBeDisabled();
+  expect(screen.getByText("Stop the VM to change Secure Boot.")).toBeInTheDocument();
+  await user.click(screen.getByRole("switch", { name: "QEMU guest agent" }));
+  await user.click(
+    screen.getByRole("switch", { name: "Freeze file systems for snapshots and backups" }),
+  );
+  await user.selectOptions(screen.getByLabelText("Shutdown"), "acpi");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(body).toBeDefined());
+  expect(body!.spec.guest_agent).toEqual({ freeze_fs: false, shutdown: "acpi" });
+  expect(body!.spec).not.toHaveProperty("secure_boot");
+});
+
+it("shows the server's message when Secure Boot needs a firmware reset", async () => {
+  const win = vm("win", "stopped");
+  mockLists({ vm: [win], node: [CAPABLE] });
+  server.use(
+    http.put(apiUrl(`/vms/${win.id}`), () =>
+      HttpResponse.json(
+        { code: "firmware_reset_required", message: 'VM "win" has UEFI variables …' },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/win/edit" });
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("switch", { name: "Secure Boot" }));
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    'Change Secure Boot with "Reset firmware" on the VM page',
+  );
+});

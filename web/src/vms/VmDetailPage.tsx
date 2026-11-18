@@ -56,6 +56,8 @@ import {
   type WithMax,
 } from "@/vms/hotplug";
 import { VmConsole } from "@/vms/lazyConsole";
+import { VmSecurity } from "@/vms/VmFirmware";
+import { VmGuestCard, VmGuestTab } from "@/vms/VmGuest";
 import {
   formatAge,
   replicaRows,
@@ -67,7 +69,16 @@ import { useTemplateReasons, VmConfirm, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
 
-const TABS = ["summary", "hardware", "console", "snapshots", "backups", "tasks", "json"] as const;
+const TABS = [
+  "summary",
+  "hardware",
+  "guest",
+  "console",
+  "snapshots",
+  "backups",
+  "tasks",
+  "json",
+] as const;
 
 /** 이름으로 VM을 찾는다. 목록이 아직 없으면 undefined, 없는 VM이면 null */
 export function useVmByName(name: string): Vm | null | undefined {
@@ -128,10 +139,16 @@ export function VmDetailPage() {
         <TabsContent value="summary">
           <Summary vm={vm} />
           <Replication vm={vm} />
+          <VmSecurity vm={vm} />
+          <VmGuestCard vm={vm} />
           <PendingChanges vm={vm} />
         </TabsContent>
         <TabsContent value="hardware">
           <Hardware vm={vm} />
+        </TabsContent>
+        <TabsContent value="guest">
+          {/* 탭을 열 때만 묻는다. */}
+          {tab === "guest" && <VmGuestTab vm={vm} />}
         </TabsContent>
         <TabsContent value="console">
           {/* 탭을 열 때만 연결한다. */}

@@ -142,6 +142,11 @@ it("describes unknown operations by their kind", () => {
   expect(describeTask(flatten as unknown as Task, i18n.t, "web-1-disk0")).toBe(
     "Flatten volume web-1-disk0",
   );
+  const reset = {
+    ...task("4", "pending"),
+    spec: { op: { kind: "vm-firmware-reset", uefi_vars: true }, target: "x" },
+  };
+  expect(describeTask(reset as unknown as Task, i18n.t, "win")).toBe("Reset the firmware of win");
 });
 
 it("names the failed node of an HA recovery", () => {

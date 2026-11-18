@@ -21,11 +21,13 @@ import {
   type NicRow,
   validate,
   type VmFormValues,
+  windows11,
 } from "@/vms/form";
 import { BootOrderSection } from "@/vms/form/BootOrderSection";
 import { CdromsSection } from "@/vms/form/CdromsSection";
 import { CloudInitSection } from "@/vms/form/CloudInitSection";
 import { DisksSection } from "@/vms/form/DisksSection";
+import { GuestAgentSection, SecuritySection } from "@/vms/form/FirmwareSection";
 import { GeneralSection } from "@/vms/form/GeneralSection";
 import { haEnabled } from "@/vms/ha";
 import { deviceMode } from "@/vms/hotplug";
@@ -77,6 +79,8 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const [busy, setBusy] = useState(false);
   // 사용자가 머신을 직접 고르기 전에는 노드를 바꾸면 그 노드에 맞게 기본값을 다시 정한다(만들 때만).
   const [machineChosen, setMachineChosen] = useState(false);
+  // "Windows 11" 미리 채우기를 썼다. 그 뒤에 더하는 디스크는 SATA, NIC는 e1000e로 시작한다.
+  const [windows, setWindows] = useState(false);
   // 화면을 떠나면 기다리던 볼륨 Task를 그만 기다리고 VM을 만들지 않는다.
   const abort = useRef<AbortController | null>(null);
   useEffect(() => () => abort.current?.abort(), []);
@@ -88,6 +92,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const layout = vm?.status.hardware?.layout;
 
   const change = (patch: Partial<VmFormValues>) => setValues((v) => ({ ...v, ...patch }));
+  /** 미리 채우기를 썼으면 새로 더한 행(뒤에 붙은 행)을 Windows 장치로 바꾼다. */
+  const presetRows = <T,>(rows: T[], old: T[], patch: Partial<T>) =>
+    windows ? rows.map((r, i) => (i >= old.length ? { ...r, ...patch } : r)) : rows;
   // 행을 넣거나 빼면 행 번호로 단 오류가 다른 행을 가리키므로 지운다.
   const changeRows = (
     patch:
@@ -106,7 +113,10 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       nics.length < values.nics.length && removed !== -1
         ? values.cloudInit.networks.filter((_, i) => i !== removed)
         : values.cloudInit.networks;
-    changeRows({ nics, cloudInit: { ...values.cloudInit, networks } });
+    changeRows({
+      nics: presetRows(nics, values.nics, { model: "e1000e" }),
+      cloudInit: { ...values.cloudInit, networks },
+    });
   };
 
   // 이 VM에 붙어 있거나 아무 데도 붙지 않은 준비된 디스크 볼륨(ISO는 CD-ROM에만 넣는다)
@@ -246,6 +256,32 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
         <p className="text-sm text-muted-foreground">{t("vmForm.restartForHotplug")}</p>
       )}
 
+      {creating && (
+        <div className="flex flex-col gap-1.5">
+          <div>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              disabled={busy}
+              onClick={() => {
+                setValues(windows11);
+                setErrors({});
+                setMachineChosen(true);
+                setWindows(true);
+              }}
+            >
+              {t("vmForm.windows11")}
+            </Button>
+          </div>
+          {windows && (
+            <p role="status" className="text-sm text-muted-foreground">
+              {t("vmForm.windows11Hint")}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* 보내는 동안에는 고치지 못하게 한다. */}
       <fieldset disabled={busy} className="flex min-w-0 flex-col gap-4">
         <GeneralSection
@@ -266,7 +302,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           values={values}
           errors={errors}
           onChange={change}
-          onRowsChange={(disks) => changeRows({ disks })}
+          onRowsChange={(disks) =>
+            changeRows({ disks: presetRows(disks, values.disks, { bus: "sata" }) })
+          }
           volumes={freeVolumes}
           pools={pools.data}
           creating={creating}
@@ -299,6 +337,16 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
           onChange={change}
           locked={mode !== "free"}
         />
+        <SecuritySection
+          values={values}
+          errors={errors}
+          onChange={change}
+          nodes={nodes.data}
+          stopped={creating || isStopped(vm)}
+          firmwareNode={vm?.status.firmware_node ?? null}
+          live={mode !== "free"}
+        />
+        <GuestAgentSection values={values} onChange={change} live={mode !== "free"} />
         <CloudInitSection
           values={values}
           errors={errors}

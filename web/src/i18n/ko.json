@@ -96,7 +96,11 @@
     "vm_is_template": "템플릿에서는 할 수 없습니다. 템플릿에서 VM을 배포하거나 먼저 VM으로 되돌리세요: {{message}}",
     "volume_is_template": "템플릿의 디스크는 바꾸거나 지울 수 없습니다: {{message}}",
     "template_in_use": "연결 복제가 남은 템플릿입니다. 복제를 먼저 지우거나 평탄화하세요: {{message}}",
-    "volume_has_clones": "연결 복제의 기반 볼륨입니다. 복제를 먼저 지우거나 평탄화하세요: {{message}}"
+    "volume_has_clones": "연결 복제의 기반 볼륨입니다. 복제를 먼저 지우거나 평탄화하세요: {{message}}",
+    "firmware_reset_required": "VM의 UEFI 변수가 지금과 다른 Secure Boot 설정으로 만들어졌습니다. VM 화면의 \"펌웨어 초기화\"에서 UEFI 변수와 함께 Secure Boot를 바꾸세요(부팅 항목이 지워집니다).",
+    "tpm_state_unavailable": "TPM 상태를 가져올 수 없어 VM을 켤 수 없습니다: {{message}}",
+    "guest_agent_unavailable": "게스트 에이전트를 쓸 수 없습니다: {{message}}",
+    "node_unreachable": "노드에 닿지 못했습니다: {{message}}"
   },
   "nav": {
     "dashboard": "대시보드",
@@ -217,7 +221,8 @@
       "ceph-client-install": "{{node}}에 Ceph 클라이언트 패키지 설치",
       "volume-download": "볼륨 {{target}} 받기",
       "vm-untemplate": "{{target}}을(를) VM으로 되돌리기",
-      "volume-flatten": "볼륨 {{target}} 평탄화"
+      "volume-flatten": "볼륨 {{target}} 평탄화",
+      "vm-firmware-reset": "{{target}} 펌웨어 초기화"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -330,7 +335,8 @@
       "snapshots": "스냅샷",
       "backups": "백업",
       "tasks": "작업",
-      "json": "JSON"
+      "json": "JSON",
+      "guest": "게스트"
     },
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}}코어 ({{model}})",
@@ -406,7 +412,10 @@
       "cdrom": "CD-ROM 드라이브 {{n}}",
       "cdromBoot": "CD-ROM 드라이브 {{n}}의 부팅 순서",
       "cdroms": "CD-ROM 드라이브",
-      "cloud_init": "cloud-init"
+      "cloud_init": "cloud-init",
+      "tpm": "TPM 2.0",
+      "secure_boot": "Secure Boot",
+      "guest_agent": "게스트 에이전트"
     },
     "applyAgain": "다시 적용",
     "replication": {
@@ -460,7 +469,77 @@
     "templateClones_one": "연결 복제 {{count}}개",
     "templateClones_other": "연결 복제 {{count}}개",
     "linkedClone": "연결 복제",
-    "linkedDisk": "disk{{n}}: {{base}}의 연결 복제"
+    "linkedDisk": "disk{{n}}: {{base}}의 연결 복제",
+    "on": "켜짐",
+    "security": {
+      "title": "보안",
+      "tpm": "TPM 2.0",
+      "secureBoot": "Secure Boot",
+      "uefiVars": "UEFI 변수",
+      "varsOn": "노드 {{node}}에 있음",
+      "noVars": "아직 없음(처음 켤 때 만듦)",
+      "tpmState": "상태는 노드 {{node}}에 있음",
+      "tpmStateCopies": "상태는 노드 {{node}}에 있음, 사본: {{copies}}",
+      "tpmNoState": "아직 상태 없음(처음 켤 때 만듦)",
+      "tpmKept": "상태가 노드 {{node}}에 남아 있음",
+      "pending": "{{field}}: 다음 재시작 때 {{running}} → {{wanted}}",
+      "reset": "펌웨어 초기화",
+      "secureBootOn": "Secure Boot 켜기",
+      "secureBootOff": "Secure Boot 끄기",
+      "notStopped": "펌웨어를 초기화하거나 Secure Boot를 바꾸려면 VM을 정지하세요.",
+      "resetTitle": "{{name}}의 펌웨어를 초기화할까요?",
+      "resetDescription": "초기화할 것을 고르세요. 되돌릴 수 없습니다. VM이 정지돼 있어야 합니다.",
+      "resetVars": "UEFI 변수",
+      "resetVarsHint": "부팅 항목과 UEFI 설정이 지워집니다. VM은 새 변수로 켜집니다.",
+      "resetTpm": "TPM 상태",
+      "resetTpmWarning": "TPM의 키가 지워집니다. BitLocker 같은 디스크 암호화는 복구 키를 물으니 미리 준비하세요.",
+      "resetSecureBootOn": "Secure Boot 켜기(UEFI 변수를 초기화함)",
+      "resetSecureBootOff": "Secure Boot 끄기(UEFI 변수를 초기화함)"
+    },
+    "guest": {
+      "agent": "게스트 에이전트",
+      "settings": "설정",
+      "setting": "켜짐({{freeze}}, {{shutdown}})",
+      "freezeOn": "파일 시스템 얼리기",
+      "freezeOff": "파일 시스템 얼리지 않음",
+      "shutdown": {
+        "agent": "에이전트로 끄기",
+        "acpi": "ACPI로 끄기"
+      },
+      "os": "운영 체제",
+      "kernel": "커널",
+      "hostname": "호스트 이름",
+      "agentVersion": "에이전트 버전",
+      "addresses": "IP 주소",
+      "filesystems": "파일 시스템",
+      "mountpoint": "마운트 지점",
+      "fstype": "종류",
+      "usage": "사용량",
+      "used": "{{total}} 중 {{used}} ({{percent}}%)",
+      "noFilesystems": "파일 시스템이 없습니다.",
+      "refresh": "새로 고치기",
+      "collected": "{{time}}에 수집",
+      "password": "게스트 비밀번호 설정",
+      "passwordTitle": "{{name}}의 게스트 비밀번호 설정",
+      "passwordDescription": "게스트 에이전트가 게스트 안 사용자 계정의 비밀번호를 바꿉니다. 비밀번호는 저장하지 않습니다.",
+      "user": "사용자",
+      "newPassword": "새 비밀번호",
+      "passwordAgain": "새 비밀번호 확인",
+      "passwordSet": "{{name}}의 {{user}} 비밀번호를 바꿨습니다",
+      "notRunning": "게스트 비밀번호를 바꾸려면 VM이 실행 중이어야 합니다.",
+      "state": {
+        "answered": "게스트 에이전트가 답했습니다.",
+        "no_agent": "답하는 게스트 에이전트가 없습니다. VM 설정에서 게스트 에이전트를 켜고, 게스트에 qemu-guest-agent를 설치한 뒤 VM을 다시 시작하세요.",
+        "not_running": "VM이 실행 중이 아닙니다.",
+        "unreachable": "VM이 도는 노드에 닿지 못했습니다. 잠시 뒤 다시 시도하세요.",
+        "unsupported": "VM이 도는 노드의 Orbivisor가 오래되어 게스트 정보를 읽지 못합니다. 노드를 업그레이드하세요."
+      },
+      "errors": {
+        "user": "제어 문자 없이 1~64바이트로 쓰세요.",
+        "password": "1~256바이트로 쓰세요.",
+        "again": "두 비밀번호가 다릅니다."
+      }
+    }
   },
   "snapshots": {
     "created": "만든 시각",
@@ -1304,7 +1383,10 @@
       "menu": "디스크…",
       "title": "{{name}}의 디스크",
       "description": "노드의 디스크(통째)와 Ceph OSD로 쓸 수 있는지입니다. 쓰는 중인 디스크(시스템, 마운트, 스왑, ZFS, RAID, 스토리지 풀의 볼륨 그룹)는 절대 지우지 않습니다."
-    }
+    },
+    "firmware": "펌웨어",
+    "firmwareCaps": "TPM {{tpm}}, Secure Boot {{secureBoot}}",
+    "firmwareUnknown": "모름"
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -1613,7 +1695,8 @@
       "ciGateway": "같은 계열의 주소를 쓰세요.",
       "ciDns": "IP 주소 3개까지입니다.",
       "ciSearch": "도메인 이름 6개까지입니다.",
-      "ciData": "64 KiB까지입니다."
+      "ciData": "64 KiB까지입니다.",
+      "needsUefi": "UEFI 펌웨어가 필요합니다."
     },
     "volumesCreated": "볼륨 {{names}}은(는) 만들어졌습니다. {{error}}",
     "schedule": "예약 스냅샷",
@@ -1722,7 +1805,31 @@
     "ciUserDataHint": "만든 user-data 대신 그대로 씁니다(#cloud-config로 시작).",
     "ciVendorData": "vendor-data",
     "ciVendorDataHint": "만든 user-data와 함께 돕니다. 패키지·runcmd는 여기에.",
-    "ciUserDataWarning": "user-data가 만든 user-data를 대신하므로 사용자·비밀번호·SSH 키는 쓰이지 않습니다."
+    "ciUserDataWarning": "user-data가 만든 user-data를 대신하므로 사용자·비밀번호·SSH 키는 쓰이지 않습니다.",
+    "windows11": "Windows 11로 미리 채우기",
+    "windows11Hint": "Windows 11에 맞게 채웠습니다: q35, Secure Boot를 켠 UEFI, TPM 2.0, 게스트 에이전트, 2코어, 4096 MiB, SATA 디스크와 e1000e 인터페이스(Windows 설치 프로그램에 VirtIO 드라이버가 없음). Windows에 VirtIO 드라이버를 설치한 뒤 디스크는 virtio-blk, 인터페이스는 virtio로 바꾸면 더 빠릅니다.",
+    "security": "보안",
+    "securityLive": "TPM 변경은 다음 재시작 때 적용됩니다. Secure Boot는 VM이 정지돼 있을 때만 바꿀 수 있습니다.",
+    "tpm": "TPM 2.0",
+    "tpmHint": "가상 TPM(swtpm). 상태는 VM이 도는 노드에 남고 VM을 따라다닙니다. Windows 11에 필요합니다.",
+    "secureBoot": "Secure Boot",
+    "secureBootHint": "Microsoft 키를 넣은 UEFI 펌웨어. 서명된 부트 로더만 켜집니다.",
+    "needsUefi": "UEFI 펌웨어가 필요합니다.",
+    "tpmNodeOff": "노드 {{node}}는 TPM을 돌릴 수 없습니다(swtpm이 없거나 오래된 노드).",
+    "tpmNoNode": "TPM을 돌릴 수 있는 노드가 없습니다. 노드에 swtpm을 설치하고 orbivisor를 다시 시작하세요.",
+    "secureBootNodeOff": "노드 {{node}}에 Secure Boot 펌웨어가 없습니다(또는 오래된 노드).",
+    "secureBootNoNode": "Secure Boot 펌웨어가 있는 노드가 없습니다. 노드에 OVMF Secure Boot 펌웨어를 설치하고 orbivisor를 다시 시작하세요.",
+    "secureBootRunning": "Secure Boot를 바꾸려면 VM을 정지하세요.",
+    "secureBootReset": "VM에 이미 UEFI 변수가 있습니다. VM 화면의 \"펌웨어 초기화\"에서 Secure Boot를 바꾸세요.",
+    "guestAgent": "게스트 에이전트",
+    "guestAgentOn": "QEMU 게스트 에이전트",
+    "guestAgentHint": "게스트의 주소·OS를 보이고, 깔끔하게 끄고, 스냅샷 때 파일 시스템을 얼립니다. 게스트에 qemu-guest-agent를 설치하세요.",
+    "guestAgentLive": "에이전트 채널을 붙이거나 떼는 것은 다음 재시작 때 적용됩니다. 다른 설정은 곧바로 적용됩니다.",
+    "agentFreeze": "스냅샷·백업 때 파일 시스템 얼리기",
+    "agentFreezeHint": "게스트가 파일 시스템을 비우고 얼리게 해 디스크 스냅샷·백업·복제본이 일관되게 합니다.",
+    "agentShutdown": "끄는 방법",
+    "agentShutdownAgent": "게스트 에이전트로, 안 되면 ACPI",
+    "agentShutdownAcpi": "ACPI만"
   },
   "console": {
     "connecting": "연결 중…",
