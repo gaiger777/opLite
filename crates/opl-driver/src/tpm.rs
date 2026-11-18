@@ -376,40 +376,63 @@ pub(crate) async fn terminate(paths: &RuntimePaths) -> bool {
     ok
 }
 
-/// 이 노드가 TPM 2.0 VM을 켤 수 있는지: `swtpm`·`swtpm_setup`이 있고, `swtpm socket --print-capabilities`에
-/// `tpm-2.0`이 있고, `qemu -tpmdev help`에 `emulator`가 있고, 실제 상태·실행 디렉터리(`state_dir`·`run_dir`의
-/// `vm/{id}`)에서 swtpm을 한 번 띄워 볼 수 있다([`try_swtpm`]). 마지막 것은 AppArmor(Ubuntu의 swtpm 프로필) 같은 막힘을
-/// VM 켜기 실패가 아니라 능력 없음으로 알리려는 것이다(리뷰 1 I6). 읽지 못하면 못 하는 것이다.
+/// 이 노드가 TPM 2.0 VM을 켤 수 있는지([`tpm_check`]). 아니면 그 이유를 경고로 남긴다(opld 로그에서 볼 수 있게).
 pub(crate) async fn tpm_capable(
     cfg: &SwtpmConfig,
     qemu_binary: &Path,
     state_dir: &Path,
     run_dir: &Path,
 ) -> bool {
-    if !installed(&cfg.swtpm) || !installed(&cfg.swtpm_setup) {
-        return false;
-    }
-    let caps = probe(&cfg.swtpm, &["socket", "--print-capabilities"]).await;
-    let help = probe(qemu_binary, &["-tpmdev", "help"]).await;
-    let listed = match (caps, help) {
-        // QEMU는 `-tpmdev help`를 표준 오류로 찍는다(`error_printf`, 8.2와 11.1 같음).
-        (Some((caps, _)), Some((out, err))) => tpm_caps(&caps, &format!("{out}{err}")),
-        _ => false,
-    };
-    if !listed {
-        tracing::warn!(
-            "swtpm does not list TPM 2.0 or QEMU has no TPM emulator backend; TPM is off on this node"
-        );
-        return false;
-    }
-    match try_swtpm(cfg, state_dir, run_dir).await {
+    match tpm_check(cfg, qemu_binary, state_dir, run_dir).await {
         Ok(()) => true,
-        Err(e) => {
-            tracing::warn!(error = %e, "swtpm cannot run with this node's state and run directories \
-                (on Ubuntu/Debian check the AppArmor include /etc/apparmor.d/abstractions/orbivisor-swtpm); TPM is off on this node");
+        Err(why) => {
+            tracing::warn!(reason = %why, "TPM is off on this node: {why}");
             false
         }
     }
+}
+
+/// 이 노드가 TPM 2.0 VM을 켤 수 있는지: `swtpm`·`swtpm_setup`이 있고, `swtpm socket --print-capabilities`에
+/// `tpm-2.0`이 있고, `qemu -tpmdev help`에 `emulator`가 있고, 실제 상태·실행 디렉터리(`state_dir`·`run_dir`의
+/// `vm/{id}`)에서 swtpm을 한 번 띄워 볼 수 있다([`try_swtpm`]). 마지막 것은 AppArmor(Ubuntu의 swtpm 프로필) 같은 막힘을
+/// VM 켜기 실패가 아니라 능력 없음으로 알리려는 것이다(리뷰 1 I6). 못 하면 그 이유다.
+///
+/// `-tpmdev help`는 끝난 상태를 보지 않는다: QEMU 8.2(Ubuntu 24.04)는 목록을 찍은 뒤 1로 끝나고(`tpm_config_parse`가
+/// -1을 돌려 `exit(1)`) 11.1은 0으로 끝난다. 출력은 표준 오류다(GitHub 탐침 2).
+pub(crate) async fn tpm_check(
+    cfg: &SwtpmConfig,
+    qemu_binary: &Path,
+    state_dir: &Path,
+    run_dir: &Path,
+) -> Result<(), String> {
+    for binary in [&cfg.swtpm, &cfg.swtpm_setup] {
+        if !installed(binary) {
+            return Err(format!("{} is not installed", binary.display()));
+        }
+    }
+    let (caps, _) = probe(&cfg.swtpm, &["socket", "--print-capabilities"], false).await?;
+    if !tpm2_listed(&caps) {
+        return Err(format!(
+            "`{} socket --print-capabilities` does not list tpm-2.0: {}",
+            cfg.swtpm.display(),
+            caps.trim()
+        ));
+    }
+    let (out, err) = probe(qemu_binary, &["-tpmdev", "help"], true).await?;
+    let help = format!("{out}{err}");
+    if !emulator_listed(&help) {
+        return Err(format!(
+            "`{} -tpmdev help` does not list the emulator backend: {}",
+            qemu_binary.display(),
+            help.trim()
+        ));
+    }
+    try_swtpm(cfg, state_dir, run_dir).await.map_err(|e| {
+        format!(
+            "swtpm cannot run with this node's state and run directories ({e}); on Ubuntu/Debian check the \
+             AppArmor include /etc/apparmor.d/abstractions/orbivisor-swtpm"
+        )
+    })
 }
 
 /// 버릴 VM id의 상태·실행 디렉터리(`{state}/vm/{id}/tpm`, `{run}/vm/{id}`)에서 VM과 같은 인자로 swtpm을 띄워 제어
@@ -506,16 +529,25 @@ fn die_with_parent(cmd: &mut tokio::process::Command) {
 fn die_with_parent(_cmd: &mut tokio::process::Command) {}
 
 /// `--print-capabilities`(JSON의 `features`)와 `-tpmdev help` 출력으로 본 TPM 2.0 능력
+#[cfg(test)]
 pub(crate) fn tpm_caps(swtpm_caps: &str, tpmdev_help: &str) -> bool {
-    let tpm2 = serde_json::from_str::<serde_json::Value>(swtpm_caps).is_ok_and(|v| {
+    tpm2_listed(swtpm_caps) && emulator_listed(tpmdev_help)
+}
+
+/// `--print-capabilities`의 JSON `features`에 `tpm-2.0`이 있는지
+fn tpm2_listed(swtpm_caps: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(swtpm_caps).is_ok_and(|v| {
         v["features"]
             .as_array()
             .is_some_and(|f| f.iter().any(|x| x == "tpm-2.0"))
-    });
-    let emulator = tpmdev_help
+    })
+}
+
+/// `-tpmdev help` 출력에 `emulator` 줄이 있는지(앞의 공백은 버전마다 다르다)
+fn emulator_listed(tpmdev_help: &str) -> bool {
+    tpmdev_help
         .lines()
-        .any(|l| l.split_whitespace().next() == Some("emulator"));
-    tpm2 && emulator
+        .any(|l| l.split_whitespace().next() == Some("emulator"))
 }
 
 /// 실행 파일이 있는지. 이름만 있으면 `PATH`에서 찾는다.
@@ -527,28 +559,31 @@ fn installed(binary: &Path) -> bool {
         .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(binary).is_file()))
 }
 
-/// 명령을 돌려 (표준 출력, 표준 오류)를 돌려준다. 실패하면 None이다.
-async fn probe(binary: &Path, args: &[&str]) -> Option<(String, String)> {
+/// 명령을 돌려 (표준 출력, 표준 오류)를 돌려준다. `any_status`가 아니면 0이 아닌 끝난 상태도 실패다. 띄우지 못했거나
+/// 시간이 넘었으면 그 이유다.
+async fn probe(binary: &Path, args: &[&str], any_status: bool) -> Result<(String, String), String> {
     let output = tokio::process::Command::new(binary)
         .args(args)
         .stdin(Stdio::null())
         .kill_on_drop(true)
         .output();
-    match tokio::time::timeout(PROBE_TIMEOUT, output).await {
-        Ok(Ok(out)) if out.status.success() => Some((
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )),
-        other => {
-            let error = match other {
-                Ok(Ok(out)) => String::from_utf8_lossy(&out.stderr).trim().to_string(),
-                Ok(Err(e)) => e.to_string(),
-                Err(_) => "timed out".into(),
-            };
-            tracing::warn!(?binary, ?args, %error, "TPM probe failed; TPM is off on this node");
-            None
-        }
+    let shown = || format!("`{} {}`", binary.display(), args.join(" "));
+    let out = match tokio::time::timeout(PROBE_TIMEOUT, output).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("{}: {e}", shown())),
+        Err(_) => return Err(format!("{} timed out", shown())),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if !any_status && !out.status.success() {
+        return Err(format!(
+            "{} failed ({}): {}",
+            shown(),
+            out.status,
+            stderr.trim()
+        ));
     }
+    Ok((stdout, stderr))
 }
 
 fn remove_file(path: &Path) -> std::io::Result<()> {
@@ -991,6 +1026,69 @@ mod tests {
             std::fs::remove_file(state.join("fail-swtpm")).unwrap();
             assert!(capable(fake_swtpm(), "qemu-system-x86_64".into()).await);
         }
+    }
+
+    /// GitHub 탐침 2: Ubuntu 24.04의 QEMU 8.2는 `-tpmdev help`를 표준 오류로 찍고 1로 끝난다(11.1은 0). 끝난 상태와
+    /// 상관없이 출력을 읽는다. 능력이 없으면 이유를 돌려준다.
+    #[tokio::test]
+    async fn tpm_check_reads_the_ubuntu_qemu_help_and_explains_failures() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = tmp.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let ubuntu = script(
+            "qemu-8.2",
+            "printf 'Supported TPM types (choose only one):\\n passthrough   Passthrough TPM backend driver\\n    emulator   Emulator TPM backend driver\\n' >&2\nexit 1\n",
+        );
+        let stdout_zero = script(
+            "qemu-stdout",
+            "printf 'Supported TPM types (choose only one):\\n    emulator   TPM emulator backend driver\\n'\n",
+        );
+        let none = script(
+            "qemu-none",
+            "printf 'Supported TPM types (choose only one):\\n passthrough   Passthrough TPM backend driver\\n' >&2\nexit 1\n",
+        );
+        let dirs = short_tempdir();
+        let (state, run) = (dirs.path().join("state"), dirs.path().join("run"));
+        let check = |cfg: SwtpmConfig, qemu: PathBuf| {
+            let (state, run) = (state.clone(), run.clone());
+            async move { tpm_check(&cfg, &qemu, &state, &run).await }
+        };
+        check(fake_swtpm(), ubuntu).await.unwrap();
+        check(fake_swtpm(), stdout_zero).await.unwrap();
+        let why = check(fake_swtpm(), none).await.unwrap_err();
+        assert!(
+            why.contains("-tpmdev help` does not list the emulator backend")
+                && why.contains("passthrough"),
+            "{why}"
+        );
+        let missing = SwtpmConfig {
+            swtpm: "/nonexistent/swtpm".into(),
+            ..fake_swtpm()
+        };
+        let why = check(missing, "qemu".into()).await.unwrap_err();
+        assert_eq!(why, "/nonexistent/swtpm is not installed");
+        let why = check(fake_swtpm(), tmp.path().join("no-qemu"))
+            .await
+            .unwrap_err();
+        assert!(
+            why.contains("is not installed") || why.contains("-tpmdev help"),
+            "{why}"
+        );
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("fail-swtpm"), b"").unwrap();
+        let why = check(fake_swtpm(), tmp.path().join("qemu-8.2"))
+            .await
+            .unwrap_err();
+        assert!(
+            why.starts_with("swtpm cannot run with this node's state"),
+            "{why}"
+        );
     }
 
     #[test]

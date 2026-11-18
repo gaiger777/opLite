@@ -52,7 +52,25 @@ async fn caps(d: &Daemon) -> Value {
         caps.is_object(),
         "the node did not report firmware caps: {node}"
     );
+    if caps["tpm"] != true {
+        eprintln!("the node reports no TPM capability: {}", tpm_log(d));
+    }
     caps
+}
+
+/// opld 로그에서 TPM 능력 확인의 이유(경고 "TPM is off on this node: …"와 swtpm 줄)
+fn tpm_log(d: &Daemon) -> String {
+    let lines: Vec<_> = d
+        .log()
+        .lines()
+        .filter(|l| l.contains("TPM") || l.contains("swtpm"))
+        .map(str::to_string)
+        .collect();
+    if lines.is_empty() {
+        "no TPM lines in the opld log".into()
+    } else {
+        lines.join("\n")
+    }
 }
 
 /// 켜기가 실패했는지 보고 그 이유(명령 오류와 VM의 `last_error`)를 돌려준다.
@@ -183,7 +201,8 @@ async fn firmware_and_guest_agent_through_the_cli() {
     } else {
         assert!(
             started.is_err(),
-            "the node reports no TPM capability ({caps}) but the TPM VM started: the capability probe is wrong"
+            "the node reports no TPM capability ({caps}) but the TPM VM started: the capability probe is wrong\n{}",
+            tpm_log(&d)
         );
         let why = refused(&d, started).await;
         assert!(why.contains("swtpm"), "{why}");
@@ -533,7 +552,8 @@ urllib.request.urlopen(request, timeout=30)
         assert_eq!(
             caps,
             json!({ "tpm": true, "secure_boot": true }),
-            "this node needs swtpm and ovmf with enrolled Secure Boot keys"
+            "this node needs swtpm and ovmf with enrolled Secure Boot keys\n{}",
+            tpm_log(&d)
         );
         let pool = d.path("pool");
         std::fs::create_dir(&pool).unwrap();

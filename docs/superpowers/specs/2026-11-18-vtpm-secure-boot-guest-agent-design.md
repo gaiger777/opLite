@@ -358,3 +358,8 @@ TPM 1.2, swtpm 상태 암호화(`--key`, 키 관리)와 백업 암호화, 사용
 - **TPM 담기(#8)**: 스냅샷·백업의 `current_tpm`은 기록된 TPM 상태가 없을 때(`Fresh`) 이 노드의 회차가 VM의 회차와 같아야 이 노드의 파일을 담는다.
 - **탐침 swtpm(#9)**: 능력 확인의 swtpm은 `--terminate`를 단다. 확인한 뒤 제어 소켓에 붙었다 끊어 스스로 끝나게 하고, 남으면 죽인다. Linux에서는 `PR_SET_PDEATHSIG`(SIGKILL)로 opld가 그 사이 죽어도 남지 않는다. 능력은 여전히 opld가 시작할 때만 본다. swtpm을 나중에 설치하면 opld를 다시 시작해야 한다(S8 README 한계에 적는다).
 - **TPM만 초기화(#10)**: `firmware_node`가 오프라인이면 TPM만 초기화도 409 `node_unavailable`이다. 회차가 오르면 그 노드의 변수와 부팅 항목도 함께 잃기 때문이다. 둘 다 초기화하거나 그 노드가 돌아온 뒤 한다.
+
+### GitHub 탐침 2에서 고친 것
+
+- **TPM 능력 거짓 음성(끝난 상태)**: Ubuntu 24.04의 QEMU 8.2는 `-tpmdev help`의 목록을 찍은 뒤 1로 끝난다(`tpm_config_parse`가 -1을 돌려 `exit(1)`). 이 Mac의 11.1은 0으로 끝난다. 능력 확인은 끝난 상태가 0이 아니면 출력을 버렸으므로 가짜 swtpm으로도 Linux에서 늘 `tpm = false`였다. 이제 `-tpmdev help`는 끝난 상태와 상관없이 표준 출력과 표준 오류를 읽는다(`--print-capabilities`는 여전히 성공해야 한다). 8.2와 같은 가짜 QEMU(표준 오류, 끝난 상태 1, `passthrough`·`emulator` 줄)로 이 Mac에서 시험한다.
+- **이유가 보이게**: `tpm::tpm_check`가 능력이 없는 이유를 돌려주고, opld는 그것을 경고 `TPM is off on this node: …`로 남긴다. opld 시험(`vtpm.rs`)은 능력이 없거나 알린 능력과 결과가 다르면 opld 로그의 TPM·swtpm 줄을 함께 찍는다. CI의 두 작업은 시험 전에 `swtpm --version`, `swtpm socket --print-capabilities`, `qemu-system-x86_64 -tpmdev help 2>&1`(끝난 상태 포함), `aa-status | grep swtpm`을 찍는다.

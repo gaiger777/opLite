@@ -172,6 +172,13 @@ jobs:
           ls -l /dev/kvm
           swtpm --version
           ls /usr/share/qemu/firmware
+      # TPM 능력 확인이 보는 것(GitHub 탐침 2): 거짓 음성이면 시험의 opld 로그 줄과 견준다.
+      - name: TPM capability diagnostics
+        run: |
+          swtpm --version
+          swtpm socket --print-capabilities
+          qemu-system-x86_64 -tpmdev help 2>&1; echo "exit status $?"
+          sudo aa-status 2>/dev/null | grep -i swtpm || echo "no swtpm AppArmor profile loaded"
       - uses: pnpm/action-setup@v4
         with:
           package_json_file: web/package.json
@@ -412,6 +419,13 @@ jobs:
           ls /usr/share/qemu/firmware
           # root가 아닌 사용자의 swtpm_setup은 /var/lib/swtpm-localca(tss 소유) 대신 ~/.config의 설정과 CA를 쓴다.
           swtpm_setup --create-config-files skip-if-exist
+      # TPM 능력 확인이 보는 것(GitHub 탐침 2): 거짓 음성이면 시험의 opld 로그 줄과 견준다.
+      - name: TPM capability diagnostics
+        run: |
+          swtpm --version
+          swtpm socket --print-capabilities
+          qemu-system-x86_64 -tpmdev help 2>&1; echo "exit status $?"
+          sudo aa-status 2>/dev/null | grep -i swtpm || echo "no swtpm AppArmor profile loaded"
       # 받기 실패는 시험 실패가 아니라 이 단계의 실패로 보인다.
       - name: Cloud image and installer ISO
         working-directory: ${{ runner.temp }}
