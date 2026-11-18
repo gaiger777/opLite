@@ -11,9 +11,14 @@ export function apiUrl(path: string) {
  * 모든 화면 바깥의 Task 색인(`renderPage`)이 읽으므로 기본으로 빈 목록이다(`server.use`가 앞선다).
  * 구독 상태도 대시보드 배너가 읽으므로 기본으로 배너가 없는 상태(오래 남은 active)다. 관리 Ceph도 노드·풀
  * 화면이 읽으므로 기본으로 없다. 게스트 정보도 VM 요약이 읽으므로 기본으로 에이전트가 없다. 대시보드 위젯이 읽는
- * 클러스터 지표 모으기와 활성 경보도 기본으로 비어 있다.
+ * 클러스터 지표 모으기와 활성 경보도 기본으로 비어 있다. 내 권한(`/permissions/mine`)은 기본으로 없어(404)
+ * 화면이 전역 역할로 본다. 폴더 목록도 기본으로 비어 있다.
  */
 export const server = setupServer(
+  http.get(apiUrl("/permissions/mine"), () =>
+    HttpResponse.json({ code: "not_found", message: "not found" }, { status: 404 }),
+  ),
+  http.get(apiUrl("/folders"), () => HttpResponse.json({ revision: 1, items: [] })),
   http.get(apiUrl("/tasks"), () => HttpResponse.json({ revision: 1, items: [] })),
   http.get(apiUrl("/ceph"), () =>
     HttpResponse.json({ code: "not_found", message: "no Ceph cluster is set up" }, { status: 404 }),

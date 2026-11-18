@@ -10,7 +10,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Task } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
+import { usePermissions } from "@/auth/usePermissions";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { errorMessage } from "@/i18n/errors";
@@ -127,7 +127,7 @@ function Empty({ children }: { children: React.ReactNode }) {
 /** Task 목록: 상태 칩, 대상 화면으로 가는 설명, 진행률, 시각과 오류, 실패한 전원·백업 작업의 다시 하기 */
 function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const target = useTaskTarget();
   const nodes = useList("node");
   const vms = useList("vm");
@@ -143,14 +143,14 @@ function TaskItems({ tasks, labelledBy }: { tasks: Task[]; labelledBy: string })
   const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name;
   const ctx = useMemo(
     () => ({
-      role: me.role,
+      perms,
       vm: new Map(vms.data?.map((v) => [v.id, v])),
       backup: new Map(backups.data?.map((b) => [b.id, b])),
       job: new Map(jobs.data?.map((j) => [j.id, j])),
       tasks: index,
       latest: latestTasks(all.data ?? []),
     }),
-    [me.role, vms.data, backups.data, jobs.data, index, all.data],
+    [perms, vms.data, backups.data, jobs.data, index, all.data],
   );
 
   /** 시작만 바로 보낸다. 정지·다시 시작·강제 정지는 다른 곳처럼 확인 대화상자를 거친다. */

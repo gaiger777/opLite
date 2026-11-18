@@ -5,8 +5,7 @@ import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Node } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { focusBack } from "@/components/focusBack";
 import { Button } from "@/components/ui/button";
@@ -50,14 +49,14 @@ export function NodeUpdatesDialog({
   returnFocus?: RefObject<HTMLElement | null>;
 }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const nodes = useList("node");
   const node = nodes.data?.find((n) => n.id === opened.id) ?? opened;
   const tasks = useTaskIndex().get(node.id) ?? [];
   const checking = tasks.some((task) => task.spec.op.kind === "node-update-check");
   // 업그레이드가 apt를 쓰는 동안은 다시 확인도 새 업그레이드도 하지 않는다(서버도 409).
   const upgradeRunning = tasks.some((task) => task.spec.op.kind === "node-upgrade");
-  const write = can(me.role, "write", "node");
+  const write = perms.can("write", "node");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [upgrading, setUpgrading] = useState(false);

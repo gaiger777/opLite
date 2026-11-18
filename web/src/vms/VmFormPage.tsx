@@ -2,14 +2,17 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { Link, useNavigate, useParams } from "react-router";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
+import type { Permissions } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
+import { folderPath, folderTree, type FolderTree } from "@/folders/folders";
 import { errorMessage, HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
 import { choosableIsos } from "@/isos/isos";
 import { poolFormats } from "@/storage/pools";
@@ -48,11 +51,38 @@ import { formSnapshotSupport } from "@/vms/snapshots";
 import { useVmByName } from "@/vms/VmDetailPage";
 
 export function VmCreatePage() {
+  const perms = usePermissions();
   const nodes = useList("node");
-  if (!nodes.data) {
-    return <ListPending error={nodes.error} />;
+  const folders = useList("folder");
+  const [params] = useSearchParams();
+  // 노드 목록을 읽을 수 없는 폴더 사용자는 머신을 서버에 맡긴다(계획 62).
+  const readsNodes = perms.reads("node");
+  if ((readsNodes && !nodes.data) || !folders.data) {
+    return <ListPending error={nodes.error ?? folders.error} />;
   }
-  return <VmForm initial={emptyForm(defaultMachine(nodes.data))} />;
+  const folder = defaultFolder(perms, folderTree(folders.data, "vm"), params.get("folder"));
+  return <VmForm initial={emptyForm(readsNodes ? defaultMachine(nodes.data ?? []) : "", folder)} />;
+}
+
+/**
+ * 새 VM의 폴더: 주소의 `?folder=`(폴더 보기의 "여기에 만들기"), 아니면 루트에 만들 수 있으면 루트, 아니면
+ * `vm.create`가 있는 첫 폴더(경로순)다.
+ */
+export function defaultFolder(
+  perms: Pick<Permissions, "has">,
+  tree: FolderTree,
+  asked: string | null,
+): string {
+  if (asked && tree.byId.has(asked)) {
+    return asked;
+  }
+  if (perms.has("vm.create")) {
+    return "";
+  }
+  const allowed = tree.folders
+    .filter((f) => perms.has("vm.create", { type: "object", kind: "vm", folder: f.id }))
+    .sort((a, b) => folderPath(tree, a.id).localeCompare(folderPath(tree, b.id)));
+  return allowed[0]?.id ?? "";
 }
 
 export function VmEditPage() {

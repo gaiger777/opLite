@@ -5,8 +5,7 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { Field as FormField } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ReasonButton, ReasonList } from "@/components/Reason";
@@ -118,7 +117,7 @@ export function VmGuestCard({ vm }: { vm: Vm }) {
  */
 export function VmGuestTab({ vm }: { vm: Vm }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const hint = useId();
   const queryClient = useQueryClient();
   const guest = useGuest(vm);
@@ -134,7 +133,7 @@ export function VmGuestTab({ vm }: { vm: Vm }) {
     const timer = setTimeout(() => setCooling(false), GUEST_REFRESH_MS);
     return () => clearTimeout(timer);
   }, [cooling]);
-  const write = can(me.role, "write", "vm");
+  const write = can("vm.config");
   const reason = passwordReason(vm);
 
   async function refresh() {

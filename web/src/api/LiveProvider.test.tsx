@@ -42,6 +42,7 @@ function lists(vms: unknown[], revision: number) {
     http.get(apiUrl("/vm-imports"), empty),
     http.get(apiUrl("/ha-groups"), empty),
     http.get(apiUrl("/placement-rules"), empty),
+    http.get(apiUrl("/folders"), empty),
   ];
 }
 
@@ -63,7 +64,7 @@ it("watches from the oldest list revision and applies changes", async () => {
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,settings&since=7",
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,settings&since=7",
   );
 });
 
@@ -291,4 +292,42 @@ it("keeps lists cached when no screen shows them", async () => {
   // 목록은 watch가 계속 바꾸므로 남고, 다른 조회는 지워진다.
   expect(queryClient.getQueryData(listKey("vm"))).toBeDefined();
   expect(queryClient.getQueryData(["cluster"])).toBeUndefined();
+});
+
+it("reads and watches only what a folder user can read at the root", async () => {
+  const urls: string[] = [];
+  const read: string[] = [];
+  server.use(
+    ...lists([vm("web", 3, "stopped")], 7),
+    // 루트 권한이 없는 폴더 사용자(계획 62): 노드·설정 등은 읽지 않는다(403이 연결을 막지 않게).
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/nodes"), () => {
+      read.push("nodes");
+      return HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 });
+    }),
+    watch.addEventListener("connection", ({ client }) => {
+      urls.push(client.url.toString());
+    }),
+  );
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <LiveProvider>
+        <Probe />
+      </LiveProvider>
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText("live: web=stopped")).toBeInTheDocument();
+  expect(urls[0]).toContain(
+    "kinds=vm,volume,storage-pool,task,network,snapshot,backup,vm-import,folder&since=7",
+  );
+  expect(read).toEqual([]);
 });

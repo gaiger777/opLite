@@ -23,14 +23,18 @@ export class NetworkError extends Error {
   }
 }
 
-let onUnauthorized: (sentAt: number) => void = () => {};
+let onUnauthorized: (sentAt: number, code?: string) => void = () => {};
 let authEpoch = () => 0;
 
 /**
  * 로그인 밖의 요청이 401을 받으면(세션 만료, opld 재시작, 비밀번호 변경) 부른다. 요청을 보낼 때의
- * 인증 세대(`epoch`)를 넘기므로, 그 뒤에 다시 로그인했으면 오래된 요청의 401을 무시할 수 있다.
+ * 인증 세대(`epoch`)를 넘기므로, 그 뒤에 다시 로그인했으면 오래된 요청의 401을 무시할 수 있다. `code`는 오류
+ * 본문의 코드다(`second_factor_required`면 로그인 둘째 단계로 돌아간다, 계획 62).
  */
-export function setUnauthorizedHandler(handler: (sentAt: number) => void, epoch: () => number) {
+export function setUnauthorizedHandler(
+  handler: (sentAt: number, code?: string) => void,
+  epoch: () => number,
+) {
   onUnauthorized = handler;
   authEpoch = epoch;
 }
@@ -47,13 +51,22 @@ export function reportUnauthorized(sentAt: number) {
 
 const sentAt = new WeakMap<Request, number>();
 
+/** 401이 세션 끝이 아닌 경로: 로그인과 그 둘째 단계(틀린 비밀번호·코드) */
+const LOGIN_PATHS = ["/auth/login", "/auth/login/second-factor"];
+
 const unauthorized: Middleware = {
   onRequest({ request }) {
     sentAt.set(request, authEpoch());
   },
-  onResponse({ request, response }) {
-    if (response.status === 401 && !new URL(request.url).pathname.endsWith("/auth/login")) {
-      onUnauthorized(sentAt.get(request) ?? authEpoch());
+  async onResponse({ request, response }) {
+    const path = new URL(request.url).pathname;
+    if (response.status === 401 && !LOGIN_PATHS.some((p) => path.endsWith(p))) {
+      const body: unknown = await response
+        .clone()
+        .json()
+        .catch(() => null);
+      const code = isErrorBody(body) ? body.code : undefined;
+      onUnauthorized(sentAt.get(request) ?? authEpoch(), code);
     }
   },
 };

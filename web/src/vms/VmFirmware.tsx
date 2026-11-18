@@ -4,8 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ReasonButton, ReasonList } from "@/components/Reason";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -57,7 +56,7 @@ function resetReason(vm: Vm): string | null {
  */
 export function VmSecurity({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const hint = useId();
   const nodes = useList("node");
   // 열린 초기화 창. `secureBoot`가 있으면 Secure Boot를 그 값으로 바꾸며 연다.
@@ -72,7 +71,7 @@ export function VmSecurity({ vm }: { vm: Vm }) {
   const firmwareNode = status.firmware_node ? nodeName(status.firmware_node) : null;
   // TPM 상태를 가진 노드(UEFI 변수의 firmware_node와 다를 수 있다)
   const tpmNode = status.tpm_node ? nodeName(status.tpm_node) : null;
-  const write = can(me.role, "write", "vm");
+  const write = can("vm.config");
   // 지울 것이 있는 VM만: UEFI 변수나 TPM 상태
   const resettable = uefi || tpm || hasTpmState;
   const reason = resetReason(vm);

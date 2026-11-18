@@ -1,7 +1,7 @@
 // 실패한 Task의 "다시 하기"(설계 §5.4). Task에는 동작 파라미터가 없으므로 파라미터가 필요 없는 전원 동작과
 // "백업 작업 지금 실행"만 같은 API로 다시 보낸다.
-import type { Backup, BackupJob, Role, Task, Vm } from "@/api/types";
-import { can } from "@/auth/permissions";
+import type { Backup, BackupJob, Task, Vm } from "@/api/types";
+import { objectTarget, type Permissions } from "@/auth/permissions";
 import { availability, type VmAction } from "@/vms/actions";
 
 /** 다시 보낼 요청. `reason`이 있으면 지금은 할 수 없다(번역 키). */
@@ -17,7 +17,8 @@ const POWER: Partial<Record<Task["spec"]["op"]["kind"], VmAction>> = {
 };
 
 export interface RetryContext {
-  role: Role;
+  /** 내 권한. VM마다(폴더·객체 grant) 따로 본다. */
+  perms: Pick<Permissions, "has">;
   vm: Map<string, Vm>;
   backup: Map<string, Backup>;
   job: Map<string, BackupJob>;
@@ -66,7 +67,7 @@ export function retryOf(task: Task, ctx: RetryContext): Retry | null {
   const action = POWER[op.kind];
   if (action) {
     const vm = ctx.vm.get(task.spec.target);
-    if (!vm || !can(ctx.role, "operate", "vm")) {
+    if (!vm || !ctx.perms.has("vm.power", objectTarget("vm", vm))) {
       return null;
     }
     const ok = availability(vm, action, ctx.tasks.get(vm.id) ?? []);
@@ -75,7 +76,7 @@ export function retryOf(task: Task, ctx: RetryContext): Retry | null {
   if (op.kind === "vm-backup") {
     const jobId = ctx.backup.get(op.backup)?.spec.job;
     const job = jobId ? ctx.job.get(jobId) : undefined;
-    if (!job || !can(ctx.role, "write", "backup-job")) {
+    if (!job || !ctx.perms.has("backup.job")) {
       return null;
     }
     // 서버는 도는 중이거나 꺼 둔 작업을 거절한다(백업 작업 화면의 "지금 실행"과 같음).

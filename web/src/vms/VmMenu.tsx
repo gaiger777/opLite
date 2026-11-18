@@ -8,8 +8,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions, useVmCan } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { trackTask } from "@/tasks/tasks";
 import { DeployDialog } from "@/templates/DeployDialog";
@@ -39,7 +38,8 @@ import { VmSnapshotDialog } from "@/vms/VmSnapshots";
 /** 목록 행의 동작 메뉴 */
 export function VmMenu({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
+  const can = useVmCan(vm);
   const navigate = useNavigate();
   const { run } = useVmActions();
   const host = useVmActionHost();
@@ -53,11 +53,13 @@ export function VmMenu({ vm }: { vm: Vm }) {
     const able = availability(vm, action, vmTasks);
     return able.ok ? null : able.reason;
   };
-  const operate = can(me.role, "operate", "vm");
-  const write = can(me.role, "write", "vm");
-  // 복제는 새 VM과 새 볼륨을 만든다.
-  const clone = write && can(me.role, "write", "volume");
-  if (!operate && !write) {
+  // 이 VM의 권한(폴더·객체 grant). 없는 동작은 보이지 않는다.
+  const operate = can("vm.power");
+  const write = can("vm.config");
+  const remove = can("vm.delete");
+  // 복제는 원본의 vm.clone과 새 VM을 둘 곳의 vm.create다.
+  const clone = can("vm.clone") && perms.anywhere("vm.create");
+  if (!operate && !write && !remove && !clone && !can("vm.console")) {
     return null;
   }
   return (
@@ -87,7 +89,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
                 {t(`vms.action.${action}`)}
               </ReasonMenuItem>
             ))}
-          {operate && (
+          {can("vm.console") && (
             <ReasonMenuItem
               reason={reasonOf("console")}
               onSelect={() => void navigate(`/vms/${encodeURIComponent(vm.name)}/console`)}
@@ -108,7 +110,7 @@ export function VmMenu({ vm }: { vm: Vm }) {
               {template ? t("templates.revert") : t("templates.convert")}
             </ReasonMenuItem>
           )}
-          {write && (
+          {remove && (
             <>
               <DropdownMenuSeparator />
               <ReasonMenuItem

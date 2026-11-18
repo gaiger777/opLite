@@ -7,8 +7,7 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
@@ -33,8 +32,8 @@ import { type RemoteView, useRemotes } from "@/remotes/remotes";
  */
 export function RemotesPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
-  const admin = can(me.role, "write", "remote");
+  const perms = usePermissions();
+  const admin = perms.can("write", "remote");
   const queryClient = useQueryClient();
   const remotes = useRemotes();
   const changed = () => queryClient.invalidateQueries({ queryKey: ["remotes"] });

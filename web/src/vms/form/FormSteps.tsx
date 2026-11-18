@@ -114,7 +114,7 @@ export function ReviewSection({
         .join(", ") || "—",
     ],
     [t("vmForm.cdroms"), String(values.cdroms.length)],
-    [t("vmForm.review.firmware"), `${firmware} · ${values.machine}`],
+    [t("vmForm.review.firmware"), `${firmware} · ${values.machine || t("vmForm.machineAuto")}`],
     [t("vmForm.guestAgent"), on(values.guestAgent)],
     [t("vmForm.cloudInit"), on(values.cloudInit.enabled)],
     ...(creating ? [[t("vmForm.startAfter"), on(values.start)] as [string, string]] : []),

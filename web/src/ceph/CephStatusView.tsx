@@ -7,8 +7,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { CephStatusView as Status, CephView } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { AddMonDialog } from "@/ceph/AddMonDialog";
 import { AddOsdDialog } from "@/ceph/AddOsdDialog";
 import {
@@ -50,13 +49,13 @@ type Dialog = "mon" | "mgr" | "osd" | "pool" | "clients";
 /** 관리 Ceph의 상태: 설정, health, mon·mgr, 호스트별 OSD, PG, 사용량, 풀, admin 동작 */
 export function CephStatusView({ ceph }: { ceph: CephView }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const nodes = useList("node");
   const status = useCephStatus(ceph.mons.length > 0);
   const [open, setOpen] = useState<Dialog | null>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
-  const admin = can(me.role, "write", "ceph");
+  const admin = perms.can("write", "ceph");
   const ready = ceph.phase === "ready";
   const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? id;
   const report = status.data;

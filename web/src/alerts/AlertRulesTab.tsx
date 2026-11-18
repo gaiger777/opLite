@@ -27,8 +27,7 @@ import {
 } from "@/alerts/rules";
 import { SEVERITIES } from "@/alerts/severity";
 import { api, call } from "@/api/client";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -72,8 +71,8 @@ export function conditionText(t: TFunction, c: AlertCondition): string {
 /** 경보 규칙 표. 누구나 읽고 admin만 바꾼다. 규칙은 watch로 받지 않으므로 바꾼 뒤 다시 읽는다. */
 export function AlertRulesTab() {
   const { t } = useTranslation();
-  const me = usePrincipal();
-  const admin = can(me.role, "write", "alert-rule");
+  const perms = usePermissions();
+  const admin = perms.can("write", "alert-rule");
   const queryClient = useQueryClient();
   const rules = useAlertRules();
   const [dialog, setDialog] = useState<{ rule: AlertRule | null } | null>(null);

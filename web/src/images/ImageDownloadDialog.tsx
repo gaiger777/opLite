@@ -4,8 +4,7 @@ import { useTranslation } from "react-i18next";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
@@ -39,7 +38,7 @@ function intIn(value: string, min: number, max: number): boolean {
  */
 export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; onClose(): void }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const pools = useList("storage-pool");
   const nodes = useList("node");
   const volumes = useList("volume");
@@ -47,7 +46,7 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
   const networks = useList("network");
   const usable = (pools.data ?? []).filter((p) => poolUsableSomewhere(p, nodes.data ?? []));
   // 템플릿 VM을 만들려면 VM 쓰기 권한도 있어야 한다.
-  const canTemplate = can(me.role, "write", "vm");
+  const canTemplate = perms.anywhere("vm.create");
   const suggested = defaultVolumeName(entry);
   const [pool, setPool] = useState("");
   const [name, setName] = useState("");

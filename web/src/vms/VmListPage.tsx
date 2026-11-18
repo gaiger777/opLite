@@ -7,17 +7,19 @@ import { Link } from "react-router";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { objectTarget, type Privilege } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { type Column, DataTable, type Filter, useIsPhone } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { FirstSteps } from "@/dashboard/FirstSteps";
+import { folderPath, folderTree, membersOf } from "@/folders/folders";
+import { MoveButton, MoveDialog } from "@/folders/MoveDialog";
 import { formatMib } from "@/lib/format";
 import { isTemplate } from "@/templates/templates";
-import { type BulkAction, BULK_ACTIONS, bulkReason, snapshotVms } from "@/vms/bulk";
+import { type BulkAction, BULK_ACTIONS, BULK_PRIVILEGE, bulkReason, snapshotVms } from "@/vms/bulk";
 import { haEnabled } from "@/vms/ha";
 import { VmBulkDialog } from "@/vms/VmBulkDialog";
 import { VmMenu } from "@/vms/VmMenu";
@@ -31,14 +33,16 @@ export function vcpus(vm: Vm): number {
 
 const PHASES = ["running", "stopped", "failed", "starting", "stopping", "migrating"] as const;
 /** 주소 쿼리의 거름 키 */
-const KEYS = ["phase", "node", "template"];
+const KEYS = ["phase", "node", "template", "folder"];
 
 export function VmListPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const vms = useList("vm");
   const nodes = useList("node");
   const snapshots = useList("snapshot");
+  const folders = useList("folder");
+  const tree = useMemo(() => folderTree(folders.data, "vm"), [folders.data]);
   const taskIndex = useTaskIndex();
   // 머리줄의 클러스터 전환이 읽은 값만 본다("이 노드" 보기). 따로 묻지 않는다.
   const cluster = useQuery<{ node?: string }>({ queryKey: ["cluster"], enabled: false });
@@ -47,8 +51,10 @@ export function VmListPage() {
   const [bulk, setBulk] = useState<{ action: BulkAction; ids: string[]; clear(): void } | null>(
     null,
   );
-  const operate = can(me.role, "operate", "vm");
-  const write = can(me.role, "write", "vm");
+  const [moving, setMoving] = useState<{ vms: Vm[]; clear(): void } | null>(null);
+  // VM마다 권한이 다르다(계획 62 폴더·객체 grant). 어딘가에 그 권한이 있으면 단추를 두고 VM마다 센다.
+  const allowed = (vm: Vm, privilege: Privilege) => perms.has(privilege, objectTarget("vm", vm));
+  const create = perms.anywhere("vm.create");
   const templatesOnly = state.get("template") === "1";
   const phone = useIsPhone();
 
@@ -58,6 +64,18 @@ export function VmListPage() {
   }, [nodes.data]);
 
   const columns: Column<Vm>[] = [
+    // 계획 62: 폴더가 하나라도 보이면 폴더 열을 둔다.
+    ...(tree.folders.length > 0
+      ? [
+          {
+            id: "folder",
+            header: t("folders.folder"),
+            value: (vm: Vm) => folderPath(tree, vm.spec.folder),
+            cell: (vm: Vm) => folderPath(tree, vm.spec.folder),
+            priority: 2 as const,
+          },
+        ]
+      : []),
     {
       id: "name",
       header: t("common.name"),
@@ -134,6 +152,13 @@ export function VmListPage() {
       test: (vm, value) => (vm.spec.node ?? vm.status.node) === value,
     },
     {
+      id: "folder",
+      label: t("folders.folder"),
+      options: tree.folders.map((f) => ({ value: f.id, label: folderPath(tree, f.id) })),
+      // 하위 폴더의 VM도 보인다.
+      test: (vm, value) => membersOf(tree, [vm], value, true).length > 0,
+    },
+    {
       id: "template",
       label: t("vms.templatesOnly"),
       options: [],
@@ -148,9 +173,14 @@ export function VmListPage() {
   ];
 
   const withSnapshots = useMemo(() => snapshotVms(snapshots.data), [snapshots.data]);
-  const ctx = { tasks: taskIndex, nodes: nodes.data ?? [], snapshotVms: withSnapshots };
-  const bulkBar = (chosen: Vm[], clear: () => void) =>
-    BULK_ACTIONS.filter((a) => (a === "delete" ? write : operate)).map((action) => {
+  const ctx = { tasks: taskIndex, nodes: nodes.data ?? [], snapshotVms: withSnapshots, allowed };
+  // 노드를 읽을 수 없으면(폴더 사용자) 옮길 노드를 고를 수 없다.
+  const actions = BULK_ACTIONS.filter(
+    (a) => perms.anywhere(BULK_PRIVILEGE[a]) && (a !== "migrate" || perms.reads("node")),
+  );
+  const mover = perms.anywhere("inventory.move") && tree.folders.length > 0;
+  const bulkBar = (chosen: Vm[], clear: () => void) => [
+    ...actions.map((action) => {
       // 옮기기는 대상 노드를 대화상자에서 고르므로 노드와 상관없는 까닭만 센다.
       const able = chosen.filter((vm) => {
         const reason = bulkReason(vm, action, ctx);
@@ -176,7 +206,18 @@ export function VmListPage() {
           </span>
         </Button>
       );
-    });
+    }),
+    ...(mover
+      ? [
+          <MoveButton
+            key="move"
+            items={chosen}
+            allowed={(vm) => allowed(vm, "inventory.move")}
+            onClick={() => setMoving({ vms: chosen, clear })}
+          />,
+        ]
+      : []),
+  ];
 
   return (
     <div className="flex flex-col gap-4">
@@ -184,7 +225,7 @@ export function VmListPage() {
         id="vms-title"
         title={t("nav.vms")}
         actions={
-          write && (
+          create && (
             <Button asChild>
               <Link to="/vms/-new">
                 <Plus />
@@ -209,7 +250,7 @@ export function VmListPage() {
         searchLabel={t("vms.search")}
         filters={filters}
         views={views}
-        bulk={operate || write ? bulkBar : undefined}
+        bulk={actions.length > 0 || mover ? bulkBar : undefined}
         rowHref={(vm) => `/vms/${encodeURIComponent(vm.name)}`}
         peek={(vm) => <VmPeek vm={vm} nodeName={nodeName} />}
         keys
@@ -224,6 +265,14 @@ export function VmListPage() {
           </Button>
         }
       />
+      {moving && (
+        <MoveDialog
+          kind="vm"
+          items={moving.vms}
+          onClose={() => setMoving(null)}
+          onDone={moving.clear}
+        />
+      )}
       {bulk && (
         <VmBulkDialog
           action={bulk.action}

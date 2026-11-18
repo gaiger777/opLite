@@ -6,6 +6,7 @@ import { Outlet, useLocation, useNavigate } from "react-router";
 import { ChangePasswordDialog } from "@/accounts/ChangePasswordDialog";
 import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
+import { useNavUser } from "@/auth/usePermissions";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import {
@@ -44,7 +45,7 @@ import { setCenterOpen } from "@/tasks/center";
  */
 export function AppLayout() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const me = useNavUser();
   const navigate = useNavigate();
   const { pathname, search } = useLocation();
   const main = useRef<HTMLElement>(null);

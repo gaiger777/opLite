@@ -8,6 +8,8 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Task, Vm } from "@/api/types";
+import { objectTarget, type Privilege } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { TypeToConfirm } from "@/components/ConfirmDialog";
 import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
@@ -67,6 +69,7 @@ export function VmBulkDialog({
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const tasks = useTaskIndex();
+  const perms = usePermissions();
   const nodes = useList("node");
   const snapshots = useList("snapshot");
   const live = useList("vm");
@@ -92,6 +95,7 @@ export function VmBulkDialog({
     nodes: nodes.data ?? [],
     snapshotVms: withSnapshots,
     target: target || candidates[0]?.id,
+    allowed: (vm: Vm, privilege: Privilege) => perms.has(privilege, objectTarget("vm", vm)),
   };
   // 시작한 뒤에는 그때 고른 VM을 그대로 보인다(상태가 바뀌어도 까닭이 다시 붙지 않게).
   const [frozen, setFrozen] = useState<Set<string> | null>(null);
@@ -104,7 +108,9 @@ export function VmBulkDialog({
         ? bulkReason(vm, action, ctx)
         : "vms.bulk.reason.gone";
   const able = vms.filter((vm) => reasonOf(vm) === null);
-  const loaded = nodes.isSuccess && (action !== "delete" || snapshots.isSuccess);
+  // 노드를 읽을 수 없는 폴더 사용자는 노드 목록 없이 한다(옮기기 말고는 노드가 필요 없다).
+  const loaded =
+    (nodes.isSuccess || !perms.reads("node")) && (action !== "delete" || snapshots.isSuccess);
   const label = t(`vms.bulk.action.${action}`);
   // 입력할 수는 실제로 할 VM 수다. 그 수가 바뀌면(누가 VM을 켰다 등) 다시 입력해야 한다.
   const typedOk = !TYPED.includes(action) || typed.trim() === String(able.length);

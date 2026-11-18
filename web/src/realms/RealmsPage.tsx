@@ -6,8 +6,7 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import type { Role } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
@@ -58,8 +57,8 @@ type Dialogs = { kind: "create" } | { kind: "edit" | "test"; realm: RealmView };
  */
 export function RealmsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
-  const admin = can(me.role, "read", "realm");
+  const perms = usePermissions();
+  const admin = perms.can("read", "realm");
   const queryClient = useQueryClient();
   const realms = useQuery({
     queryKey: ["realms"],

@@ -9,7 +9,7 @@ import { PasswordFields } from "@/accounts/PasswordFields";
 import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field, type FieldA11y } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -38,7 +38,8 @@ import { validName } from "@/vms/form";
 type User = components["schemas"]["UserView"];
 type Role = components["schemas"]["Role"];
 
-const ROLES: readonly Role[] = ["admin", "operator", "viewer"];
+// `none`(계획 62): 전역 역할 없이 폴더·객체 grant로만 권한을 받는다.
+const ROLES: readonly Role[] = ["admin", "operator", "viewer", "none"];
 
 /**
  * 사용자 목록. 감시할 수 없으므로 화면을 열 때와 바꾼 뒤에 다시 읽는다. 관리자가 아니면 읽을 수 없으므로
@@ -53,12 +54,14 @@ export function useUsers(enabled = true) {
   });
 }
 
-type Dialog = { kind: "create" } | { kind: "role" | "password" | "delete"; user: User };
+type Dialog =
+  { kind: "create" } | { kind: "role" | "password" | "delete" | "reset2fa"; user: User };
 
 export function UsersPage() {
   const { t } = useTranslation();
   const me = usePrincipal();
-  const admin = can(me.role, "write", "user");
+  const perms = usePermissions();
+  const admin = perms.can("write", "user");
   const users = useUsers(admin);
   const queryClient = useQueryClient();
   const [dialog, setDialog] = useState<Dialog | null>(null);
@@ -98,6 +101,7 @@ export function UsersPage() {
             <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("users.role")}</TableHead>
             <TableHead>{t("users.realm")}</TableHead>
+            <TableHead>{t("users.twoFactor")}</TableHead>
             <TableHead>
               <span className="sr-only">{t("vms.actions")}</span>
             </TableHead>
@@ -105,7 +109,7 @@ export function UsersPage() {
         </TableHeader>
         <TableBody>
           {(users.data ?? []).length === 0 && (
-            <TableMessage colSpan={4} query={users} empty={t("users.empty")} />
+            <TableMessage colSpan={5} query={users} empty={t("users.empty")} />
           )}
           {(users.data ?? []).map((user) => {
             // 자기 비밀번호는 현재 비밀번호가 필요하므로 계정 메뉴에서 바꾼다. 자기 자신은 지울 수 없다.
@@ -121,6 +125,7 @@ export function UsersPage() {
                 </TableCell>
                 <TableCell>{t(`roles.${user.role}`)}</TableCell>
                 <TableCell>{user.realm ?? "local"}</TableCell>
+                <TableCell>{user.two_factor ? t("users.twoFactorOn") : "—"}</TableCell>
                 <TableCell className="text-right">
                   <DropdownMenu modal={false}>
                     <DropdownMenuTrigger asChild>
@@ -150,6 +155,15 @@ export function UsersPage() {
                           {t("users.resetPassword")}
                         </ReasonMenuItem>
                       )}
+                      {/* 자기 2FA는 설정 › 2단계 인증에서 바꾼다(서버도 409 cannot_reset_self). */}
+                      {user.two_factor && !self && (
+                        <ReasonMenuItem
+                          reason={null}
+                          onSelect={() => setDialog({ kind: "reset2fa", user })}
+                        >
+                          {t("users.reset2fa")}
+                        </ReasonMenuItem>
+                      )}
                       <DropdownMenuSeparator />
                       <ReasonMenuItem
                         variant="destructive"
@@ -174,6 +188,25 @@ export function UsersPage() {
       {dialog?.kind === "password" && (
         <ResetPasswordDialog user={dialog.user} returnFocus={trigger} onClose={close} />
       )}
+      <ConfirmDialog
+        open={dialog?.kind === "reset2fa"}
+        onOpenChange={(open) => !open && close()}
+        title={t("users.reset2faTitle", {
+          name: dialog?.kind === "reset2fa" ? dialog.user.name : "",
+        })}
+        description={t("users.reset2faDescription")}
+        confirmLabel={t("users.reset2fa")}
+        returnFocus={trigger}
+        onConfirm={async () => {
+          if (dialog?.kind !== "reset2fa") {
+            return;
+          }
+          const { user } = dialog;
+          await call(api.DELETE("/users/{key}/two-factor", { params: { path: { key: user.id } } }));
+          toast.success(t("users.reset2faDone", { name: user.name }));
+          await changed();
+        }}
+      />
       <ConfirmDialog
         open={dialog?.kind === "delete"}
         onOpenChange={(open) => !open && close()}

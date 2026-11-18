@@ -5,8 +5,7 @@ import { useTranslation } from "react-i18next";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { backupPools, newestFirst } from "@/backups/backups";
 import { BackupTable } from "@/backups/BackupTable";
 import { Field } from "@/components/Field";
@@ -24,7 +23,7 @@ import { validName } from "@/vms/form";
 /** VM 상세의 백업 탭: 이 VM의 백업 목록과 지금 백업하기 */
 export function VmBackups({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const backups = useList("backup");
   const pools = useList("storage-pool");
   const [creating, setCreating] = useState(false);
@@ -39,7 +38,7 @@ export function VmBackups({ vm }: { vm: Vm }) {
         <h2 id="vm-backups" className="font-medium">
           {t("vms.tab.backups")}
         </h2>
-        {can(me.role, "write", "vm") && (
+        {can("backup.create") && (
           <div className="flex flex-wrap items-center gap-2 text-sm">
             {/* 풀 목록을 읽어야 백업 풀을 고른다. */}
             {!pools.isSuccess && <ListPending error={pools.error} />}
@@ -57,7 +56,7 @@ export function VmBackups({ vm }: { vm: Vm }) {
           </div>
         )}
       </div>
-      {can(me.role, "write", "vm") && busy && (
+      {can("backup.create") && busy && (
         <p className="text-sm text-muted-foreground">{t("backups.busy")}</p>
       )}
       <BackupTable backups={mine} query={backups} labelledBy="vm-backups" />

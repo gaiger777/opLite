@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Navigate, useSearchParams } from "react-router";
 
-import { api, call } from "@/api/client";
+import { getAssertion } from "@/accounts/webauthn";
+import { api, ApiError, call } from "@/api/client";
+import type { SecondFactorPrompt } from "@/api/types";
 import { useAuth } from "@/auth/AuthProvider";
 import { safeNext } from "@/auth/RequireAuth";
 import { Button } from "@/components/ui/button";
@@ -13,12 +15,17 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 
+// 강제 등록 화면(QR 포함)은 그때만 내려받는다.
+const EnrollStep = lazy(async () => ({
+  default: (await import("@/accounts/TwoFactorSetup")).EnrollStep,
+}));
+
 /** SSO 콜백이 `/login?error=<code>`로 돌려보내는 코드(`oidc_login`). 모르는 코드는 `sso_failed`로 보인다. */
 const SSO_ERRORS = ["sso_failed", "no_role", "realm_unavailable", "too_many_attempts"];
 
 export function LoginPage() {
   const { t } = useTranslation();
-  const { principal, login } = useAuth();
+  const { principal, login, pending, finishEnrollment, logout } = useAuth();
   const [params, setParams] = useSearchParams();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -70,6 +77,20 @@ export function LoginPage() {
   }
   if (principal) {
     return <Navigate to={safeNext(params.get("next"))} replace />;
+  }
+  // 비밀번호는 맞았고 둘째 단계(또는 강제 등록)가 남았다.
+  if (pending) {
+    return (
+      <LoginCard>
+        {pending.enroll ? (
+          <Suspense fallback={null}>
+            <EnrollStep onDone={() => void finishEnrollment()} onCancel={() => void logout()} />
+          </Suspense>
+        ) : (
+          <SecondFactorStep prompt={pending} />
+        )}
+      </LoginCard>
+    );
   }
 
   async function submit(e: React.FormEvent) {
@@ -175,6 +196,136 @@ export function LoginPage() {
           {t("login.version", { version: version.data.version })}
         </p>
       )}
+    </div>
+  );
+}
+
+function LoginCard({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="flex min-h-svh flex-col items-center justify-center gap-4 p-4">
+      <Card className="w-full max-w-sm">
+        <CardHeader>
+          <CardTitle className="text-xl">
+            <h1>Orbivisor</h1>
+          </CardTitle>
+        </CardHeader>
+        <CardContent>{children}</CardContent>
+      </Card>
+    </div>
+  );
+}
+
+/**
+ * 로그인 둘째 단계(계획 62 설계 §10.2): 인증 앱 코드, "복구 코드 쓰기", 패스키가 있으면 "패스키 사용". 강제 등록
+ * 세션이면(403 `enrollment_required`) 등록 화면으로 바꾸고, 대기 세션이 끝났으면(401) 처음으로 돌아간다.
+ */
+function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
+  const { t } = useTranslation();
+  const { secondFactor, needEnrollment, logout } = useAuth();
+  const [recovery, setRecovery] = useState(!prompt.methods.includes("totp"));
+  const [code, setCode] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const passkey = prompt.methods.includes("webauthn") && prompt.webauthn;
+
+  async function send(body: Parameters<typeof secondFactor>[0]) {
+    setBusy(true);
+    setError(null);
+    try {
+      await secondFactor(body);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "enrollment_required") {
+        needEnrollment();
+      } else if (
+        err instanceof ApiError &&
+        err.status === 401 &&
+        err.code !== "invalid_second_factor"
+      ) {
+        // 대기 세션이 끝났다(5분). 비밀번호부터 다시 한다.
+        await logout();
+      } else {
+        setError(errorMessage(t, err));
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function signInWithPasskey() {
+    if (!prompt.webauthn) {
+      return;
+    }
+    try {
+      const credential = await getAssertion(prompt.webauthn);
+      if (credential) {
+        await send({ webauthn: credential });
+      }
+    } catch (err) {
+      setError(errorMessage(t, err));
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-4">
+      <p className="text-sm text-muted-foreground">
+        {t(recovery ? "login.secondFactor.recoveryHint" : "login.secondFactor.hint")}
+      </p>
+      <form
+        onSubmit={(e) => {
+          e.preventDefault();
+          const value = code.trim();
+          void send(recovery ? { recovery: value } : { totp: value.replace(/\s/g, "") });
+        }}
+        className="flex flex-col gap-4"
+      >
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="second-factor">
+            {t(recovery ? "login.secondFactor.recovery" : "login.secondFactor.code")}
+          </Label>
+          <Input
+            id="second-factor"
+            autoComplete="one-time-code"
+            inputMode={recovery ? "text" : "numeric"}
+            autoFocus
+            required
+            aria-invalid={error ? true : undefined}
+            aria-describedby={error ? "second-factor-error" : undefined}
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+          />
+        </div>
+        {error && (
+          <p id="second-factor-error" role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        )}
+        <Button type="submit" disabled={busy}>
+          {t("login.secondFactor.verify")}
+        </Button>
+      </form>
+      {passkey && (
+        <Button variant="outline" disabled={busy} onClick={() => void signInWithPasskey()}>
+          {t("login.secondFactor.passkey")}
+        </Button>
+      )}
+      <div className="flex flex-wrap justify-between gap-2">
+        {prompt.methods.includes("recovery") && prompt.methods.includes("totp") && (
+          <Button
+            variant="link"
+            className="px-0"
+            onClick={() => {
+              setRecovery(!recovery);
+              setCode("");
+              setError(null);
+            }}
+          >
+            {t(recovery ? "login.secondFactor.useCode" : "login.secondFactor.useRecovery")}
+          </Button>
+        )}
+        <Button variant="link" className="px-0" onClick={() => void logout()}>
+          {t("twoFactor.backToLogin")}
+        </Button>
+      </div>
     </div>
   );
 }

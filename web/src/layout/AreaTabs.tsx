@@ -2,7 +2,7 @@ import { cn } from "cn";
 import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
-import { usePrincipal } from "@/auth/AuthProvider";
+import { usePermissions } from "@/auth/usePermissions";
 import { areaOf, visibleTabs } from "@/layout/nav";
 
 /**
@@ -11,13 +11,13 @@ import { areaOf, visibleTabs } from "@/layout/nav";
  */
 export function AreaTabs() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const gate = usePermissions();
   const { pathname } = useLocation();
   const hit = areaOf(pathname);
   if (!hit) {
     return null;
   }
-  const tabs = visibleTabs(hit.area, me.role);
+  const tabs = visibleTabs(hit.area, gate);
   if (tabs.length <= 1) {
     return null;
   }

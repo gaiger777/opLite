@@ -60,6 +60,20 @@ export type CephStatusView = Schemas["CephStatusView"];
 export type OsdReport = Schemas["OsdReport"];
 export type PgReport = Schemas["PgReport"];
 export type NodeDisk = Schemas["NodeDisk"];
+export type Folder = Schemas["Resource_FolderSpec_FolderStatus"];
+export type FolderKind = Schemas["FolderKind"];
+export type FolderQuota = Schemas["FolderQuota"];
+export type FolderUsageView = Schemas["FolderUsageView"];
+export type Grant = Schemas["Resource_GrantSpec_GrantStatus"];
+export type GrantTarget = Schemas["GrantTarget"];
+export type PrincipalRef = Schemas["PrincipalRef"];
+export type RoleRef = Schemas["RoleRef"];
+export type AccessRole = Schemas["AccessRoleView"];
+export type Group = Schemas["Resource_GroupSpec_GroupStatus"];
+export type TwoFactorView = Schemas["TwoFactorView"];
+export type SecondFactorPrompt = Schemas["SecondFactorPrompt"];
+export type TwoFactorPolicy = Schemas["TwoFactorPolicy"];
+export type ExternalGroupRef = Schemas["ExternalGroup"];
 
 /** watch로 받는 리소스 종류. 이름은 API의 `kinds`와 같다. */
 export type WatchKind =
@@ -75,7 +89,8 @@ export type WatchKind =
   | "backup-job"
   | "vm-import"
   | "ha-group"
-  | "placement-rule";
+  | "placement-rule"
+  | "folder";
 
 /** 종류별 리소스 */
 export interface Resources {
@@ -92,4 +107,5 @@ export interface Resources {
   "vm-import": VmImport;
   "ha-group": HaGroup;
   "placement-rule": PlacementRule;
+  folder: Folder;
 }

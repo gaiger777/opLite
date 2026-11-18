@@ -104,7 +104,8 @@ interface Props<T> {
   peek?(row: T): ReactNode;
   /** `j`/`k`/`x`/`Space`/`Enter`를 받는다(화면의 주 목록 하나에만). */
   keys?: boolean;
-  rowProps?(row: T): HTMLAttributes<HTMLTableRowElement> & { id?: string };
+  /** 행의 속성. `selected`는 지금 고른 행이다(고른 행을 함께 끌기). */
+  rowProps?(row: T, selected: readonly T[]): HTMLAttributes<HTMLTableRowElement> & { id?: string };
   /** 도구 줄 끝에 더할 것 */
   toolbar?: ReactNode;
 }
@@ -515,7 +516,7 @@ export function DataTable<T>(props: Props<T>) {
               )
             )}
             {rows.map((row, index) => {
-              const extra = props.rowProps?.(row);
+              const extra = props.rowProps?.(row, chosen);
               return (
                 <TableRow
                   key={rowId(row)}

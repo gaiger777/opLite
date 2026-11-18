@@ -6,8 +6,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { HaGroup } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -41,7 +40,7 @@ import {
 /** HA 그룹: 목록과 만들기·바꾸기·지우기. 누구나 읽고 admin만 바꾼다. */
 export function HaGroupsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const groups = useList("ha-group");
   const nodes = useList("node");
   const vms = useList("vm");
@@ -50,7 +49,7 @@ export function HaGroupsPage() {
   const [deleting, setDeleting] = useState<HaGroup | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
-  const write = can(me.role, "write", "ha-group");
+  const write = perms.can("write", "ha-group");
   const list = [...(groups.data ?? [])].sort((a, b) => a.name.localeCompare(b.name));
 
   return (

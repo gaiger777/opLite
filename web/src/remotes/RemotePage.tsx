@@ -7,8 +7,7 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { ReasonMenuItem } from "@/components/Reason";
@@ -46,8 +45,8 @@ const REFRESH_MS = 10_000;
 export function RemotePage() {
   const { t } = useTranslation();
   const { name = "" } = useParams();
-  const me = usePrincipal();
-  const admin = can(me.role, "write", "remote");
+  const perms = usePermissions();
+  const admin = perms.can("write", "remote");
   const queryClient = useQueryClient();
   const remote = useQuery({
     queryKey: ["remotes", name],

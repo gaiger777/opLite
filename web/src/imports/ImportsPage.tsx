@@ -8,8 +8,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import type { VmImport } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { PageHeader } from "@/components/PageHeader";
@@ -85,12 +84,13 @@ export function ImportedVm({ imp }: { imp: VmImport }) {
 /** VM 가져오기 목록과 OVA 올리기. 항목을 열면 원본을 보고 가져오기를 실행한다. */
 export function ImportsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const imports = useList("vm-import");
   const nodes = useList("node");
   const [uploading, setUploading] = useState(false);
   const [esxi, setEsxi] = useState(false);
-  const write = can(me.role, "write", "vm-import");
+  // 가져오기는 대상 폴더의 vm.create다(계획 62).
+  const write = perms.anywhere("vm.create");
   useCreateParam(() => setUploading(true), write);
   const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? "—";
 

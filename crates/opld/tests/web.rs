@@ -1,14 +1,16 @@
 //! 웹 UI E2E: 실제 opld(QEMU)에 브라우저(Playwright)로 로그인해 풀을 만들고 이미지를 올린 뒤, 그 볼륨으로
 //! VM을 만들어 콘솔을 보고, 스냅샷을 만들고 되돌리고, 그 스냅샷에서 복제한 VM을 시작했다가 지우고, 스냅샷을
 //! 지우고, 볼륨을 늘리고, 예약 스냅샷이 생기고 보관 개수대로 지워지는지 본 뒤, VM(스냅샷과 함께)·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
+//! 계획 62: 전역 역할이 없는 폴더 사용자로 로그인하면 자기 폴더만 보이고 2단계 인증으로 다시 로그인한다
+//! (`permissions.spec.ts`, QEMU 없음).
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
 
 mod common;
 
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 use std::time::Duration;
 
 use common::Daemon;
@@ -30,13 +32,38 @@ fn client(d: &Daemon) -> Client {
     .unwrap()
 }
 
-#[tokio::test]
-async fn browser_uploads_image_runs_vm_and_cleans_up() {
+/// 브라우저 시험은 하나씩 돈다(Playwright의 결과 디렉터리와 브라우저·QEMU 부하를 나누지 않게).
+static BROWSER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn web_dir() -> PathBuf {
     let web = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web");
     assert!(
         web.join("dist/index.html").exists(),
         "build the web UI first: pnpm -C web build"
     );
+    web
+}
+
+/// `spec` 하나만 Playwright로 돌린다(다른 spec은 다른 준비가 필요하다).
+async fn playwright(spec: &str, env: Vec<(&'static str, String)>) -> Output {
+    let web = web_dir();
+    let spec = spec.to_string();
+    tokio::task::spawn_blocking(move || {
+        Command::new("pnpm")
+            .args(["exec", "playwright", "test", &spec])
+            .current_dir(&web)
+            .envs(env)
+            .output()
+            .expect("run pnpm (is it installed?)")
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn browser_uploads_image_runs_vm_and_cleans_up() {
+    let _one = BROWSER.lock().await;
+    web_dir();
     // 디스크에 OS가 없는 UEFI 게스트는 ACPI 종료에 응하지 않을 수 있다. 예약 스냅샷은 한 시간을 2초로.
     let mut d = Daemon::new(
         "node1",
@@ -53,24 +80,17 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         .set_len(IMAGE_BYTES)
         .unwrap();
 
-    let out = tokio::task::spawn_blocking({
-        let (url, password) = (d.server(), d.admin_password.clone().unwrap());
-        let (pool, image) = (pool.clone(), image.clone());
-        move || {
-            Command::new("pnpm")
-                .args(["exec", "playwright", "test"])
-                .current_dir(&web)
-                .env("OPL_URL", url)
-                .env("OPL_USER", "admin")
-                .env("OPL_PASSWORD", password)
-                .env("OPL_POOL_PATH", pool)
-                .env("OPL_IMAGE", image)
-                .output()
-                .expect("run pnpm (is it installed?)")
-        }
-    })
-    .await
-    .unwrap();
+    let out = playwright(
+        "e2e/vm.spec.ts",
+        vec![
+            ("OPL_URL", d.server()),
+            ("OPL_USER", "admin".into()),
+            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
+            ("OPL_POOL_PATH", pool.to_str().unwrap().into()),
+            ("OPL_IMAGE", image.to_str().unwrap().into()),
+        ],
+    )
+    .await;
     if !out.status.success() {
         // 브라우저가 지우지 못한 VM을 끄고 지운다(QEMU가 남지 않게). 볼륨 삭제는 Task를 오래 기다릴 수
         // 있어 잠깐만 기다리고, 풀과 남은 파일은 데몬의 임시 디렉터리와 함께 사라진다. 실패는 무시한다.
@@ -132,5 +152,94 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         "pool directory {}: {left:?}",
         pool.display()
     );
+    d.stop();
+}
+
+/// 계획 62: admin이 `/teamA`·`/teamB`와 꺼진 VM(디스크 없음)을 만들고, 그룹 `team-a`(멤버 alice, 전역 역할 `none`)에
+/// `/teamA` operator를 준다. 브라우저로 alice가 로그인하면 VM 목록·폴더 트리·팔레트에 teamA만 있고, + 만들기가
+/// `/teamA`를 골라 둔 채 VM을 만들며(노드 목록 없이), 인증 앱을 켠 뒤에는 둘째 단계로 로그인한다.
+#[tokio::test]
+async fn browser_shows_a_folder_user_only_their_folder() {
+    let _one = BROWSER.lock().await;
+    web_dir();
+    let mut d = Daemon::new("node1", "");
+    d.start().await;
+    d.init("web-perm").await;
+    d.login().await;
+    for f in ["/teamA", "/teamB"] {
+        d.ctl(&["folder", "create", f]).await.unwrap();
+    }
+    for (vm, folder) in [("a1", Some("/teamA")), ("b1", Some("/teamB")), ("r1", None)] {
+        let mut args = vec!["vm", "create", vm, "--memory", "256"];
+        if let Some(f) = folder {
+            args.extend(["--folder", f]);
+        }
+        d.ctl(&args).await.unwrap();
+    }
+    let password = "alice-password-1";
+    let file = d.path("alice-password");
+    std::fs::write(&file, password).unwrap();
+    d.ctl(&[
+        "user",
+        "create",
+        "alice",
+        "--role",
+        "none",
+        "--password-file",
+        file.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    d.ctl(&["group", "create", "team-a", "--member", "alice"])
+        .await
+        .unwrap();
+    d.ctl(&[
+        "grant", "add", "--group", "team-a", "--role", "operator", "--on", "/teamA",
+    ])
+    .await
+    .unwrap();
+
+    let out = playwright(
+        "e2e/permissions.spec.ts",
+        vec![
+            ("OPL_URL", d.server()),
+            ("OPL_USER", "alice".into()),
+            ("OPL_PASSWORD", password.into()),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "playwright failed:\n{}\n{}\nopld log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        d.log()
+    );
+    // 브라우저가 만든 VM은 /teamA에 있고(머신은 서버가 골랐다), alice에게 2단계 인증이 켜졌다.
+    let mut names: Vec<String> = d
+        .ctl_json(&["vm", "list", "--folder", "/teamA"])
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].as_str().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a1", "a2"]);
+    let a2 = d.ctl_json(&["vm", "get", "a2"]).await;
+    let machine = if std::env::consts::ARCH == "aarch64" {
+        "virt"
+    } else {
+        "q35"
+    };
+    assert_eq!(a2["spec"]["machine"], machine, "{a2}");
+    let users: Value = client(&d).get("/users").await.unwrap();
+    let alice = users["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == "alice")
+        .unwrap();
+    assert_eq!(alice["two_factor"], true, "{alice}");
     d.stop();
 }

@@ -7,8 +7,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { SecurityGroup, Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -35,12 +34,12 @@ export function groupUsers(group: SecurityGroup, vms: Vm[]): number {
 
 export function SecurityGroupsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const groups = useList("security-group");
   const vms = useList("vm");
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<SecurityGroup | null>(null);
-  const write = can(me.role, "write", "security-group");
+  const write = perms.can("write", "security-group");
 
   return (
     <div className="flex flex-col gap-4">

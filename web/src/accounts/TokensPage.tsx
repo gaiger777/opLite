@@ -8,7 +8,7 @@ import { useUsers } from "@/accounts/UsersPage";
 import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
@@ -47,6 +47,7 @@ type CreatedToken = components["schemas"]["CreatedToken"];
 export function TokensPage() {
   const { t, i18n } = useTranslation();
   const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const tokens = useQuery({
     queryKey: ["tokens"],
@@ -54,7 +55,7 @@ export function TokensPage() {
     select: (list) => list.items,
   });
   // 남의 토큰을 다루는 것은 관리자뿐이다(서버의 may_manage와 같은 규칙).
-  const admin = can(me.role, "write", "api-token");
+  const admin = perms.can("write", "api-token");
   const users = useUsers(admin);
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<CreatedToken | null>(null);

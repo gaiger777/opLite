@@ -7,8 +7,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import type { Vm, Volume } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -39,7 +38,7 @@ const ISO_KEY = ["iso"];
 
 export function VolumesPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const volumes = useList("volume");
   const vms = useList("vm");
   const nodes = useList("node");
@@ -56,7 +55,8 @@ export function VolumesPage() {
   const resizingVolume = volumes.data?.find((v) => v.id === resizing);
   // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
   const opener = useRef<HTMLElement | null>(null);
-  const write = can(me.role, "write", "volume");
+  // 볼륨 권한은 그 VM·풀을 따른다(계획 62). 어딘가에 권한이 있으면 단추를 두고 서버가 막는다.
+  const write = perms.anywhere("storage.allocate");
   // 서버는 VM spec의 디스크와 CD-ROM 매체로 사용 중인지 판단한다(`attached_to`는 마지막으로 실행한 VM이다).
   const userByVolume = useMemo(() => {
     const users = new Map<string, Vm>();

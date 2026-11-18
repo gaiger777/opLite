@@ -4,7 +4,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
-import { usePrincipal } from "@/auth/AuthProvider";
+import { useNavUser } from "@/auth/usePermissions";
 import { AREA_ICONS, RAIL_ICON_SIZE } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -27,10 +27,10 @@ export function readRail(): boolean {
 /** 영역 링크들. 데스크톱 사이드바와 휴대폰 ☰ 서랍이 함께 쓴다. 설정은 맨 아래에 고정한다. */
 export function AreaLinks({ rail = false, onNavigate }: { rail?: boolean; onNavigate?(): void }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const me = useNavUser();
   const { pathname } = useLocation();
   const current = areaOf(pathname)?.area.id;
-  const areas = visibleAreas(me.role);
+  const areas = visibleAreas(me.gate);
   const item = (area: NavArea) => {
     const Icon = AREA_ICONS[area.id];
     const label = t(area.key);

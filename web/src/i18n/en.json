@@ -101,7 +101,24 @@
     "tpm_state_unavailable": "The VM cannot start because its TPM state is not available: {{message}}",
     "guest_agent_unavailable": "The guest agent cannot be used: {{message}}",
     "node_unreachable": "Cannot reach the node: {{message}}",
-    "in_use": "It is still in use: {{message}}"
+    "in_use": "It is still in use: {{message}}",
+    "folder_not_empty": "The folder is not empty. Move or delete what is in it first.",
+    "folder_cycle": "A folder cannot move into its own subfolder.",
+    "folder_too_deep": "Folders can be nested at most 16 deep.",
+    "folder_required": "Choose a folder: you cannot create this at the top level.",
+    "quota_exceeded": "The folder quota does not allow this: {{message}}",
+    "invalid_second_factor": "That code is not valid.",
+    "second_factor_required": "Finish signing in with your second factor.",
+    "enrollment_required": "Set up two-step verification to finish signing in.",
+    "two_factor_required": "Two-step verification is required for you. Keep at least one method.",
+    "totp_enabled": "An authenticator app is already set up.",
+    "cannot_reset_self": "You cannot reset your own two-step verification here.",
+    "webauthn_unavailable": "Passkeys need a domain name. Open the web UI by its host name, not an IP address.",
+    "invalid_passkey": "The passkey could not be verified. Try again.",
+    "passkey_exists": "This passkey is already registered.",
+    "too_many_passkeys": "You have the most passkeys allowed (16). Remove one first.",
+    "role_in_use": "Permissions use this role. Remove them first: {{message}}",
+    "no_second_factor": "Set up an authenticator app or a passkey first."
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -154,7 +171,15 @@
     "skipToContent": "Skip to content",
     "openMenu": "Open menu",
     "collapse": "Collapse sidebar",
-    "expand": "Expand sidebar"
+    "expand": "Expand sidebar",
+    "vmFolders": "VM folders",
+    "networkFolders": "Network folders",
+    "storageFolders": "Storage folders",
+    "permissions": "Permissions",
+    "roles": "Roles",
+    "groups": "Groups",
+    "security": "Security",
+    "account": "Two-step verification"
   },
   "header": {
     "language": "Language",
@@ -171,7 +196,8 @@
   "roles": {
     "admin": "Administrator",
     "operator": "Operator",
-    "viewer": "Viewer"
+    "viewer": "Viewer",
+    "none": "No global role"
   },
   "login": {
     "username": "Username",
@@ -185,6 +211,16 @@
       "signIn": "Sign in with {{name}}",
       "no_role": "Your account at the identity provider has no role in Orbivisor. Ask an administrator to map one of your groups.",
       "realm_unavailable": "Cannot reach the identity provider of this realm. Try again later or ask an administrator."
+    },
+    "secondFactor": {
+      "hint": "Enter the 6-digit code from your authenticator app.",
+      "recoveryHint": "Enter one of your recovery codes. Each code works once.",
+      "code": "Authentication code",
+      "recovery": "Recovery code",
+      "verify": "Verify",
+      "passkey": "Use a passkey",
+      "useRecovery": "Use a recovery code",
+      "useCode": "Use the authenticator app"
     }
   },
   "routeError": {
@@ -309,7 +345,9 @@
     "node": "Node",
     "undo": "Undo",
     "undone": "Undone.",
-    "desktopOnly": "This screen is easier to use on a larger screen."
+    "desktopOnly": "This screen is easier to use on a larger screen.",
+    "yes": "Yes",
+    "no": "No"
   },
   "confirm": {
     "typeName": "Type {{name}} to confirm",
@@ -375,7 +413,8 @@
       "tasks": "Tasks",
       "json": "JSON",
       "guest": "Guest",
-      "metrics": "Metrics"
+      "metrics": "Metrics",
+      "permissions": "Permissions"
     },
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}} cores ({{model}})",
@@ -623,7 +662,8 @@
         "noTarget": "Choose a node.",
         "sameNode": "Already on this node.",
         "target": "Cannot run on this node (offline, in maintenance or another architecture).",
-        "gone": "Deleted"
+        "gone": "Deleted",
+        "denied": "You do not have permission for this VM."
       }
     },
     "startAgain": "Turn on again",
@@ -1523,7 +1563,13 @@
       "selfRole": "Only another administrator can change your role.",
       "selfPassword": "Change your own password from the account menu.",
       "selfDelete": "Only another administrator can delete your account."
-    }
+    },
+    "twoFactor": "2FA",
+    "twoFactorOn": "On",
+    "reset2fa": "Reset two-step verification",
+    "reset2faTitle": "Reset two-step verification of {{name}}?",
+    "reset2faDescription": "Their authenticator app, passkeys and recovery codes are removed and their sessions end. API tokens stay. If a policy requires two-step verification, they set it up again at the next sign-in.",
+    "reset2faDone": "Two-step verification of {{name}} was reset."
   },
   "realms": {
     "pageHint": "Users of a realm sign in with their directory (LDAP) or identity provider (OIDC) account as <name>@<realm>. Their role comes from their groups at each sign-in.",
@@ -1978,7 +2024,8 @@
       "templateHint": "Deploy a copy of a template.",
       "noTemplates": "There are no templates yet. Convert a VM on the Templates page.",
       "deploy": "Deploy {{name}}…"
-    }
+    },
+    "machineAuto": "Automatic (cluster default)"
   },
   "console": {
     "connecting": "Connecting…",
@@ -3144,5 +3191,195 @@
       "hint": "Pick a preset and attach the ISO or image.",
       "action": "Create a VM"
     }
+  },
+  "folders": {
+    "folder": "Folder",
+    "root": "Top level",
+    "rootOf": {
+      "vm": "All VMs",
+      "network": "All networks",
+      "storage": "All storage pools"
+    },
+    "new": "New folder",
+    "createTitle": "Create a folder",
+    "createIn": "In {{path}}",
+    "created": "Created folder {{path}}.",
+    "badName": "Use 1–64 characters without “/” and without spaces at the ends.",
+    "rename": "Rename",
+    "renameTitle": "Rename {{name}}",
+    "renamed": "Renamed the folder to {{name}}.",
+    "deleteTitle": "Delete folder {{path}}?",
+    "deleteDescription": "Only an empty folder can be deleted.",
+    "deleted": "Deleted folder {{path}}.",
+    "details": "Folder details",
+    "notFound": "Folder not found",
+    "backToTree": "Back to folders",
+    "includeSubfolders": "Include subfolders",
+    "emptyFolder": "Nothing in this folder.",
+    "createVmHere": "Create a VM here",
+    "subfolders": "Subfolders",
+    "count": {
+      "vm": "VMs",
+      "network": "Networks",
+      "storage": "Storage pools"
+    },
+    "tab": {
+      "contents": "Contents",
+      "quota": "Quota",
+      "permissions": "Permissions"
+    },
+    "moveTo": "Move to folder…",
+    "move": "Move",
+    "destination": "Destination folder",
+    "moveButton": "Move to folder ({{able}} possible, {{blocked}} not possible)",
+    "moveTitle_one": "Move {{count}} item to a folder",
+    "moveTitle_other": "Move {{count}} items to a folder",
+    "moveCounts": "Possible: {{able}} · Not possible: {{blocked}}",
+    "willMove": "Will move",
+    "moved": "Move to {{path}}: {{ok}} of {{total}} succeeded, {{failed}} failed.",
+    "draggable": "draggable",
+    "reason": {
+      "already": "Already in this folder",
+      "denied": "No permission to move here",
+      "kind": "Another kind of folder"
+    },
+    "setQuota": "Set quota",
+    "quotaTitle": "Quota of {{name}}",
+    "quotaDescription": "Limits for this folder and everything under it. Leave a field empty for no limit. A parent folder's quota still applies.",
+    "quotaHint": "Usage counts allocated resources whether the VMs run or not. Templates count only their disks. A write that would go over a limit here or in a parent folder is refused; lowering a limit below usage only blocks growth.",
+    "noQuota": "This folder has no quota of its own.",
+    "quotaSaved": "Saved the quota of {{name}}.",
+    "badLimit": "Enter a number of 0 or more.",
+    "noLimitHint": "Empty: no limit",
+    "memoryGib": "Memory (GiB)",
+    "diskGib": "Disk (GiB)",
+    "dim": {
+      "vcpus": "vCPUs",
+      "memory_mib": "Memory",
+      "disk_bytes": "Disk",
+      "vms": "VMs"
+    },
+    "usedOf": "{{used}} of {{limit}}",
+    "noLimit": "No limit",
+    "over": "Over the limit",
+    "boundBy": "Limited by {{path}}"
+  },
+  "permissions": {
+    "title": "Permissions of {{name}}",
+    "mine": "Your permissions here",
+    "none": "None",
+    "loadFailed": "Could not read the permissions.",
+    "who": "Who has access",
+    "principal": "User or group",
+    "role": "Role",
+    "from": "Granted on",
+    "target": "Target",
+    "globalRole": "Global role",
+    "group": "Group",
+    "user": "User",
+    "noPropagate": "(this folder only)",
+    "empty": "No one has access through a permission here.",
+    "emptyAll": "No permissions yet.",
+    "add": "Add permission",
+    "addTitle": "Add a permission on {{name}}",
+    "addDescription": "You can only give privileges you hold here yourself.",
+    "added": "Added a permission on {{name}}.",
+    "principalKind": "Give to",
+    "choose": "Choose…",
+    "typedHint": "Paste the user or group id (from the people who already have access, or from an administrator).",
+    "badPrincipal": "Enter a user or group id.",
+    "propagate": "Also apply to subfolders and what they contain",
+    "propagateShort": "Subfolders",
+    "remove": "Remove",
+    "removeNamed": "Remove the permission of {{name}}",
+    "removeTitle": "Remove the permission of {{name}}?",
+    "removeDescription": "They keep any access they have through other permissions.",
+    "removed": "Removed the permission.",
+    "rootTarget": "Whole cluster",
+    "openNamed": "Permissions of {{name}}",
+    "pageHint": "Every permission in the cluster. A permission gives a user or group a role on the whole cluster, a folder (and what is under it) or one object. Permissions add up; there is no deny."
+  },
+  "roleEditor": {
+    "pageHint": "Built-in roles match the global roles. Custom roles are lists of privileges to use in permissions.",
+    "privileges": "Privileges",
+    "description": "Description",
+    "builtin": "built-in",
+    "empty": "No roles.",
+    "createTitle": "Create a role",
+    "editTitle": "Edit role {{name}}",
+    "editNamed": "Edit {{name}}",
+    "badName": "Use a resource name that is not admin, operator, viewer or none.",
+    "noPrivileges": "Choose at least one privilege.",
+    "saved": "Saved role {{name}}.",
+    "deleteTitle": "Delete role {{name}}?",
+    "deleteDescription": "A role that permissions use cannot be deleted.",
+    "deleted": "Deleted role {{name}}."
+  },
+  "groupEditor": {
+    "pageHint": "Groups collect users for permissions. Members are local or directory users; a linked directory group adds its members when they sign in.",
+    "members": "Members",
+    "external": "Directory groups",
+    "externalHint": "Users of that realm who belong to the directory group (LDAP DN or OIDC group value) are members.",
+    "realm": "Realm",
+    "groupName": "Directory group",
+    "addExternal": "Link a directory group",
+    "removeExternal": "Remove the directory group",
+    "badExternal": "Choose a realm and enter a group name.",
+    "empty": "No groups.",
+    "createTitle": "Create a group",
+    "editTitle": "Edit group {{name}}",
+    "editNamed": "Edit {{name}}",
+    "saved": "Saved group {{name}}.",
+    "deleteTitle": "Delete group {{name}}?",
+    "deleteDescription": "A group that permissions use cannot be deleted.",
+    "deleted": "Deleted group {{name}}.",
+    "inUse": "Permissions use this group. Remove them first: {{message}}"
+  },
+  "twoFactor": {
+    "pageHint": "A second step after your password: an authenticator app code, a passkey or a recovery code.",
+    "required": "Required for you",
+    "unavailable": "Two-step verification is not available until every node is upgraded.",
+    "app": "Authenticator app",
+    "appOn": "An authenticator app is set up.",
+    "appOff": "No authenticator app is set up.",
+    "setUpApp": "Set up an authenticator app",
+    "scan": "Scan the QR code with your authenticator app, or enter the key by hand, then type the code it shows.",
+    "qrLabel": "QR code for the authenticator app",
+    "secret": "Key",
+    "copySecret": "Copy the key",
+    "code": "Code from the app",
+    "confirm": "Confirm",
+    "disableApp": "Turn off the authenticator app",
+    "disable": "Turn off",
+    "appDisabled": "The authenticator app was turned off.",
+    "recoveryTitle": "Recovery codes",
+    "recoveryOnce": "Save these codes somewhere safe. They are shown only now. Each code signs you in once if you lose your app or passkey.",
+    "recoveryLeft_one": "{{count}} recovery code left.",
+    "recoveryLeft_other": "{{count}} recovery codes left.",
+    "copyCodes": "Copy the recovery codes",
+    "savedCodes": "I saved them",
+    "regenerate": "Make new recovery codes",
+    "passkeys": "Passkeys",
+    "passkeyName": "Passkey name",
+    "addPasskey": "Add a passkey",
+    "passkeyIp": "Passkeys are not available because you opened the web UI by IP address. Browsers allow passkeys only on a domain name.",
+    "passkeyBrowser": "This browser cannot use passkeys.",
+    "passkeyCancelled": "The passkey was not created.",
+    "removePasskey": "Remove passkey {{name}}",
+    "passkeyRemoved": "Removed passkey {{name}}.",
+    "proofHint": "Confirm it is you: enter a code from your app, a recovery code, or your password.",
+    "proofHintCode": "Confirm it is you: enter a code from your app or a recovery code.",
+    "codeOrRecovery": "Code or recovery code",
+    "orPassword": "Or your password",
+    "saved": "Saved.",
+    "enrollTitle": "Set up two-step verification",
+    "enrollRequired": "Your administrator requires two-step verification. Set it up to finish signing in.",
+    "orPasskey": "Or use a passkey:",
+    "backToLogin": "Back to sign-in",
+    "policyHint": "Require two-step verification for users with these global roles or from these realms. OIDC realms are not listed: the identity provider handles it.",
+    "policyRoles": "Global roles",
+    "policyRealms": "Realms",
+    "rpId": "Passkey domain (RP ID)",
+    "rpIdHint": "Optional. Empty: the host name the browser uses."
   }
 }

@@ -4,8 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import { useVmActionHost } from "@/vms/actionHost";
@@ -17,12 +16,12 @@ import { availability, isStopped, useVmActions } from "@/vms/actions";
  */
 export function VmPowerButton({ vm, className }: { vm: Vm; className?: string }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const { run } = useVmActions();
   const host = useVmActionHost();
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
   const reasonId = useId();
-  if (!can(me.role, "operate", "vm")) {
+  if (!can("vm.power")) {
     return null;
   }
   const action = isStopped(vm) ? "start" : "stop";

@@ -1,7 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { Navigate, useLocation } from "react-router";
 
-import { usePrincipal } from "@/auth/AuthProvider";
+import { useNavUser } from "@/auth/usePermissions";
 import { EmptyState } from "@/components/EmptyState";
 import { AREA_ICONS, type AreaId } from "@/components/icons";
 import { PageHeader } from "@/components/PageHeader";
@@ -23,9 +23,9 @@ export function Redirect({ to }: { to: string }) {
  */
 export function AreaRedirect({ area }: { area: AreaId }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const me = useNavUser();
   const found = AREAS.find((a) => a.id === area)!;
-  if (visibleTabs(found, me.role).length === 0) {
+  if (visibleTabs(found, me.gate).length === 0) {
     return (
       <div className="flex flex-col gap-4">
         <PageHeader title={t(found.key)} />

@@ -6,8 +6,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { PlacementRule, RuleKind } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -44,7 +43,7 @@ import {
 /** 배치 규칙: 목록과 만들기·바꾸기·지우기. 누구나 읽고 admin만 바꾼다. */
 export function PlacementRulesPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const rules = useList("placement-rule");
   const nodes = useList("node");
   // 만들기는 `null`, 바꾸기는 그 규칙
@@ -52,7 +51,7 @@ export function PlacementRulesPage() {
   const [deleting, setDeleting] = useState<PlacementRule | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
-  const write = can(me.role, "write", "placement-rule");
+  const write = perms.can("write", "placement-rule");
   const list = [...(rules.data ?? [])].sort((a, b) => a.name.localeCompare(b.name));
 
   return (

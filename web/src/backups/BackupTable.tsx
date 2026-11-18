@@ -6,8 +6,7 @@ import { Link } from "react-router";
 import { api, ApiError, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Backup, Task } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { chainBytes, chainReplicas, storedBytes } from "@/backups/backups";
 import { type RemoteTarget, RemoteTargetFields } from "@/backups/RemoteTargetFields";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
@@ -84,7 +83,7 @@ export function BackupTable({
   url?: boolean;
 }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const vms = useList("vm");
   const jobs = useList("backup-job");
   const [restoring, setRestoring] = useState<Backup | null>(null);
@@ -94,12 +93,9 @@ export function BackupTable({
   const [deleteOpen, setDeleteOpen] = useState(false);
   // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
   const opener = useRef<HTMLElement | null>(null);
-  // 복원은 새 VM과 볼륨을 만든다(서버는 백업·VM·볼륨 쓰기를 모두 본다).
-  const restore =
-    can(me.role, "write", "backup") &&
-    can(me.role, "write", "vm") &&
-    can(me.role, "write", "volume");
-  const remove = can(me.role, "write", "backup");
+  // 복원은 원래 VM의 backup.restore와 새 VM을 둘 곳의 vm.create다(계획 62, 폴더마다 다르므로 서버가 막는다).
+  const restore = perms.anywhere("backup.restore") && perms.anywhere("vm.create");
+  const remove = perms.anywhere("backup.delete");
   const actions = restore || remove;
   const state = useTableState("backups", [], url);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));

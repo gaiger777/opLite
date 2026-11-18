@@ -863,8 +863,8 @@ fn start_picks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
 
 /// 빠진 MAC을 채우고, 켜진 채로 만들면 노드를 고른다. cloud-init 평문 비밀번호는 SHA-512 crypt로 바꿔 저장하고
 /// 응답에서는 `********`로 가린다. `cloud_init.user_data`가 만든 user-data의 칸(`user`·`password`·`ssh_keys`)을
-/// 쓰이지 않게 하면 응답 헤더 `orbivisor-warning`으로 알린다. `machine`을 빼면 클러스터 아키텍처의 기본값이다
-/// ([`default_machine`], 노드 목록을 읽지 못하는 폴더 사용자의 웹 만들기 화면이 쓴다).
+/// 쓰이지 않게 하면 응답 헤더 `orbivisor-warning`으로 알린다. `machine`을 빼면 지정 노드나 클러스터 아키텍처의
+/// 기본값이다(노드 목록을 읽지 못하는 폴더 사용자의 웹 만들기 화면이 쓴다, 아키텍처가 섞였으면 400).
 #[utoipa::path(post, path = "/vms", tag = "vms",
     request_body = CreateRequest<VmSpec>,
     responses(

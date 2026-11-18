@@ -58,6 +58,17 @@ export const appRoutes: RouteObject[] = [
             children: [
               { index: true, element: <DashboardPage /> },
               { path: "vms", element: <VmListPage /> },
+              // 계획 62: 목록 | 폴더 보기 전환의 폴더 쪽과 폴더 상세
+              ...(
+                [
+                  ["vm-folders", "VmFoldersPage", "VmFolderDetailPage"],
+                  ["network-folders", "NetworkFoldersPage", "NetworkFolderDetailPage"],
+                  ["storage-folders", "StorageFoldersPage", "StorageFolderDetailPage"],
+                ] as const
+              ).flatMap(([path, list, detail]) => [
+                { path, lazy: page(() => import("@/folders/FolderPages"), list) },
+                { path: `${path}/:id`, lazy: page(() => import("@/folders/FolderPages"), detail) },
+              ]),
               // VM 이름은 `-`로 시작할 수 없으므로 "new"라는 VM과 겹치지 않는다.
               { path: "vms/-new", lazy: page(() => import("@/vms/VmFormPage"), "VmCreatePage") },
               { path: "vms/:name", lazy: page(() => import("@/vms/VmDetailPage"), "VmDetailPage") },
@@ -150,6 +161,26 @@ export const appRoutes: RouteObject[] = [
               {
                 path: "settings/realms",
                 lazy: page(() => import("@/realms/RealmsPage"), "RealmsPage"),
+              },
+              {
+                path: "settings/permissions",
+                lazy: page(() => import("@/permissions/SettingsPermissionsPage"), "GrantsPage"),
+              },
+              {
+                path: "settings/roles",
+                lazy: page(() => import("@/permissions/SettingsPermissionsPage"), "RolesPage"),
+              },
+              {
+                path: "settings/groups",
+                lazy: page(() => import("@/permissions/SettingsPermissionsPage"), "GroupsPage"),
+              },
+              {
+                path: "settings/security",
+                lazy: page(() => import("@/accounts/TwoFactorPages"), "SecurityPage"),
+              },
+              {
+                path: "settings/account",
+                lazy: page(() => import("@/accounts/TwoFactorPages"), "AccountPage"),
               },
               {
                 path: "settings/tokens",

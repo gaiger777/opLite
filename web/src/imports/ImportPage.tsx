@@ -6,8 +6,7 @@ import { useNavigate, useParams } from "react-router";
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Task, VmImport } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
@@ -67,10 +66,10 @@ export function ImportPage() {
 
 function ImportView({ imp }: { imp: VmImport }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const navigate = useNavigate();
   const nodes = useList("node");
-  const write = can(me.role, "write", "vm-import");
+  const write = perms.anywhere("vm.create");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
   // 폼은 가져오기마다 하나다. 실행이 실패해 `ready`로 돌아와도 고친 값이 남는다.

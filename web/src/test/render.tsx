@@ -29,6 +29,7 @@ const PATHS: Record<WatchKind, string> = {
   "vm-import": "/vm-imports",
   "ha-group": "/ha-groups",
   "placement-rule": "/placement-rules",
+  folder: "/folders",
 };
 
 /** 목록 API의 응답을 정한다. 주지 않은 종류는 빈 목록이다. */

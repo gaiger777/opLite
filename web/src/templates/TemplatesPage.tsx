@@ -8,8 +8,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PageHeader } from "@/components/PageHeader";
 import { ReasonButton, ReasonList } from "@/components/Reason";
@@ -33,7 +32,7 @@ import { cloneOwners, revertReason, templateRows } from "@/templates/templates";
  */
 export function TemplatesPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const vms = useList("vm");
   const volumes = useList("volume");
@@ -41,9 +40,10 @@ export function TemplatesPage() {
   const [reverting, setReverting] = useState<Vm | null>(null);
   const [deleting, setDeleting] = useState<Vm | null>(null);
   const reasonBase = useId();
-  const write = can(me.role, "write", "vm");
-  // 배포는 새 VM과 새 볼륨을 만든다.
-  const deploy = write && can(me.role, "write", "volume");
+  // 템플릿마다 폴더가 다르다(계획 62). 어딘가에 권한이 있으면 열을 두고 행마다 서버가 막는다.
+  const write = perms.anywhere("vm.config");
+  // 배포는 원본의 vm.clone과 새 VM을 둘 곳의 vm.create다.
+  const deploy = perms.anywhere("vm.clone") && perms.anywhere("vm.create");
   const rows = useMemo(
     () => templateRows(vms.data ?? [], volumes.data ?? []),
     [vms.data, volumes.data],

@@ -2,8 +2,7 @@ import { Database } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { useCeph } from "@/ceph/ceph";
 import { CephStatusView } from "@/ceph/CephStatusView";
 import { CephWizard } from "@/ceph/CephWizard";
@@ -18,12 +17,12 @@ import { Button } from "@/components/ui/button";
  */
 export function CephPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const ceph = useCeph(true);
   const [inWizard, setInWizard] = useState(false);
   // 빈 상태의 주 단추를 눌러 마법사를 열었다.
   const [opened, setOpened] = useState(false);
-  const admin = can(me.role, "write", "ceph");
+  const admin = perms.can("write", "ceph");
 
   return (
     <div className="flex flex-col gap-6">

@@ -5,8 +5,7 @@ import { toast } from "sonner";
 
 import { useSettings, useSubscription } from "@/api/live";
 import type { Channel } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
@@ -23,11 +22,11 @@ const CHANNELS: Channel[] = ["stable", "testing", "enterprise"];
 /** 설정 › 일반: 업데이트·종료·HA·텔레메트리·Prometheus. 누구나 읽고 admin만 바꾼다. 구독은 따로 탭이다. */
 export function SettingsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const settings = useSettings();
   const subscription = useSubscription();
-  const write = can(me.role, "write", "settings");
+  const write = perms.can("write", "settings");
   // 고르기 전에는 서버의 값을 보인다(watch로 바뀌어도 따라간다).
   const [chosen, setChosen] = useState<Channel | null>(null);
   const [busy, setBusy] = useState(false);

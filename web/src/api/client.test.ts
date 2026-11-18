@@ -35,7 +35,7 @@ it("reports 401 except for the login request itself", async () => {
   expect(handler).not.toHaveBeenCalled();
   await call(api.GET("/vms")).catch(() => {});
   // 요청을 보낼 때의 인증 세대를 넘긴다.
-  expect(handler).toHaveBeenCalledExactlyOnceWith(3);
+  expect(handler).toHaveBeenCalledExactlyOnceWith(3, "unauthorized");
 });
 
 it("treats proxy error pages as network errors", async () => {

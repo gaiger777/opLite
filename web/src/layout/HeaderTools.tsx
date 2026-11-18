@@ -5,8 +5,7 @@ import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
 import { api, call } from "@/api/client";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import {
@@ -52,9 +51,9 @@ export function CreateMenu({
   onOpenChange(v: boolean): void;
 }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const navigate = useNavigate();
-  const items = createItems(me.role);
+  const items = createItems(perms);
   if (items.length === 0) {
     return null;
   }
@@ -84,14 +83,14 @@ export function CreateMenu({
  */
 export function ClusterSwitch() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
   const cluster = useQuery({
     queryKey: ["cluster"],
     queryFn: () => call(api.GET("/cluster")),
   });
-  const readRemotes = can(me.role, "read", "remote");
+  const readRemotes = perms.can("read", "remote");
   const remotes = useRemotes(open && readRemotes);
   const name = cluster.data?.name ?? "";
   return (

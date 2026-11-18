@@ -101,7 +101,24 @@
     "tpm_state_unavailable": "TPM 상태를 가져올 수 없어 VM을 켤 수 없습니다: {{message}}",
     "guest_agent_unavailable": "게스트 에이전트를 쓸 수 없습니다: {{message}}",
     "node_unreachable": "노드에 닿지 못했습니다: {{message}}",
-    "in_use": "아직 쓰는 곳이 있습니다: {{message}}"
+    "in_use": "아직 쓰는 곳이 있습니다: {{message}}",
+    "folder_not_empty": "폴더가 비어 있지 않습니다. 안의 것을 먼저 옮기거나 지우세요.",
+    "folder_cycle": "폴더를 자기 하위 폴더로 옮길 수 없습니다.",
+    "folder_too_deep": "폴더는 16단계까지만 겹칠 수 있습니다.",
+    "folder_required": "폴더를 고르세요. 맨 위에는 만들 수 없습니다.",
+    "quota_exceeded": "폴더 할당량을 넘습니다: {{message}}",
+    "invalid_second_factor": "코드가 맞지 않습니다.",
+    "second_factor_required": "둘째 단계를 마쳐 로그인하세요.",
+    "enrollment_required": "로그인을 마치려면 2단계 인증을 설정하세요.",
+    "two_factor_required": "2단계 인증이 필요한 사용자입니다. 방법을 하나 이상 남기세요.",
+    "totp_enabled": "인증 앱이 이미 설정돼 있습니다.",
+    "cannot_reset_self": "자기 2단계 인증은 여기서 초기화할 수 없습니다.",
+    "webauthn_unavailable": "패스키는 도메인 이름이 있어야 합니다. IP 주소가 아니라 호스트 이름으로 웹 화면을 여세요.",
+    "invalid_passkey": "패스키를 확인하지 못했습니다. 다시 하세요.",
+    "passkey_exists": "이미 등록한 패스키입니다.",
+    "too_many_passkeys": "패스키는 16개까지입니다. 먼저 하나를 빼세요.",
+    "role_in_use": "권한이 쓰는 역할입니다. 먼저 그 권한을 빼세요: {{message}}",
+    "no_second_factor": "먼저 인증 앱이나 패스키를 설정하세요."
   },
   "nav": {
     "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",
@@ -154,7 +171,15 @@
     "skipToContent": "본문으로 건너뛰기",
     "openMenu": "메뉴 열기",
     "collapse": "사이드바 접기",
-    "expand": "사이드바 펴기"
+    "expand": "사이드바 펴기",
+    "vmFolders": "VM 폴더",
+    "networkFolders": "네트워크 폴더",
+    "storageFolders": "스토리지 폴더",
+    "permissions": "권한",
+    "roles": "역할",
+    "groups": "그룹",
+    "security": "보안",
+    "account": "2단계 인증"
   },
   "header": {
     "language": "언어",
@@ -171,7 +196,8 @@
   "roles": {
     "admin": "관리자",
     "operator": "운영자",
-    "viewer": "조회자"
+    "viewer": "조회자",
+    "none": "전역 역할 없음"
   },
   "login": {
     "username": "사용자 이름",
@@ -185,6 +211,16 @@
       "signIn": "{{name}}(으)로 로그인",
       "no_role": "IdP 계정에 Orbivisor 역할이 없습니다. 관리자에게 그룹의 역할 매핑을 요청하세요.",
       "realm_unavailable": "이 영역의 IdP에 연결할 수 없습니다. 잠시 뒤 다시 시도하거나 관리자에게 문의하세요."
+    },
+    "secondFactor": {
+      "hint": "인증 앱의 6자리 코드를 넣으세요.",
+      "recoveryHint": "복구 코드 하나를 넣으세요. 코드마다 한 번만 쓸 수 있습니다.",
+      "code": "인증 코드",
+      "recovery": "복구 코드",
+      "verify": "확인",
+      "passkey": "패스키 사용",
+      "useRecovery": "복구 코드 쓰기",
+      "useCode": "인증 앱 쓰기"
     }
   },
   "routeError": {
@@ -309,7 +345,9 @@
     "node": "노드",
     "undo": "되돌리기",
     "undone": "되돌렸습니다.",
-    "desktopOnly": "이 화면은 넓은 화면에서 쓰기 좋습니다."
+    "desktopOnly": "이 화면은 넓은 화면에서 쓰기 좋습니다.",
+    "yes": "예",
+    "no": "아니요"
   },
   "confirm": {
     "typeName": "확인하려면 {{name}}을(를) 입력하세요",
@@ -375,7 +413,8 @@
       "tasks": "작업",
       "json": "JSON",
       "guest": "게스트",
-      "metrics": "지표"
+      "metrics": "지표",
+      "permissions": "권한"
     },
     "cpu": "CPU",
     "cpuValue": "{{sockets}} × {{cores}}코어 ({{model}})",
@@ -623,7 +662,8 @@
         "noTarget": "노드를 고르세요.",
         "sameNode": "이미 이 노드에 있습니다.",
         "target": "이 노드에서 돌 수 없습니다(꺼짐, 유지보수 또는 다른 아키텍처).",
-        "gone": "지워짐"
+        "gone": "지워짐",
+        "denied": "이 VM에 대한 권한이 없습니다."
       }
     },
     "startAgain": "다시 켜기",
@@ -1523,7 +1563,13 @@
       "selfRole": "내 역할은 다른 관리자가 바꿉니다.",
       "selfPassword": "내 비밀번호는 계정 메뉴에서 바꿉니다.",
       "selfDelete": "내 계정은 다른 관리자가 삭제합니다."
-    }
+    },
+    "twoFactor": "2FA",
+    "twoFactorOn": "켜짐",
+    "reset2fa": "2단계 인증 초기화",
+    "reset2faTitle": "{{name}}의 2단계 인증을 초기화할까요?",
+    "reset2faDescription": "인증 앱·패스키·복구 코드를 지우고 세션을 끝냅니다. API 토큰은 남습니다. 정책이 2단계 인증을 요구하면 다음 로그인 때 다시 설정합니다.",
+    "reset2faDone": "{{name}}의 2단계 인증을 초기화했습니다."
   },
   "realms": {
     "pageHint": "영역의 사용자는 디렉터리(LDAP)나 IdP(OIDC) 계정으로 로그인하고 <이름>@<영역>이 됩니다. 역할은 로그인할 때마다 그룹으로 정해집니다.",
@@ -1978,7 +2024,8 @@
       "templateHint": "템플릿의 복사본을 배포합니다.",
       "noTemplates": "아직 템플릿이 없습니다. 템플릿 화면에서 VM을 바꾸세요.",
       "deploy": "{{name}} 배포…"
-    }
+    },
+    "machineAuto": "자동(클러스터 기본값)"
   },
   "console": {
     "connecting": "연결 중…",
@@ -3144,5 +3191,195 @@
       "hint": "프리셋을 고르고 ISO나 이미지를 붙입니다.",
       "action": "VM 만들기"
     }
+  },
+  "folders": {
+    "folder": "폴더",
+    "root": "맨 위",
+    "rootOf": {
+      "vm": "모든 VM",
+      "network": "모든 네트워크",
+      "storage": "모든 스토리지 풀"
+    },
+    "new": "새 폴더",
+    "createTitle": "폴더 만들기",
+    "createIn": "{{path}} 안에",
+    "created": "폴더 {{path}}을(를) 만들었습니다.",
+    "badName": "“/” 없이, 앞뒤 공백 없이 1~64자로 쓰세요.",
+    "rename": "이름 바꾸기",
+    "renameTitle": "{{name}} 이름 바꾸기",
+    "renamed": "폴더 이름을 {{name}}(으)로 바꿨습니다.",
+    "deleteTitle": "폴더 {{path}}을(를) 지울까요?",
+    "deleteDescription": "빈 폴더만 지울 수 있습니다.",
+    "deleted": "폴더 {{path}}을(를) 지웠습니다.",
+    "details": "폴더 상세",
+    "notFound": "폴더가 없습니다",
+    "backToTree": "폴더로 돌아가기",
+    "includeSubfolders": "하위 포함",
+    "emptyFolder": "이 폴더에 든 것이 없습니다.",
+    "createVmHere": "여기에 VM 만들기",
+    "subfolders": "하위 폴더",
+    "count": {
+      "vm": "VM",
+      "network": "네트워크",
+      "storage": "스토리지 풀"
+    },
+    "tab": {
+      "contents": "내용",
+      "quota": "할당량",
+      "permissions": "권한"
+    },
+    "moveTo": "폴더로 옮기기…",
+    "move": "옮기기",
+    "destination": "대상 폴더",
+    "moveButton": "폴더로 옮기기 (가능 {{able}}, 불가 {{blocked}})",
+    "moveTitle_one": "{{count}}개를 폴더로 옮기기",
+    "moveTitle_other": "{{count}}개를 폴더로 옮기기",
+    "moveCounts": "가능: {{able}} · 불가: {{blocked}}",
+    "willMove": "옮김",
+    "moved": "{{path}}(으)로 옮기기: {{total}}개 중 {{ok}}개 성공, {{failed}}개 실패.",
+    "draggable": "끌 수 있음",
+    "reason": {
+      "already": "이미 이 폴더에 있음",
+      "denied": "여기로 옮길 권한 없음",
+      "kind": "다른 종류의 폴더"
+    },
+    "setQuota": "할당량 정하기",
+    "quotaTitle": "{{name}}의 할당량",
+    "quotaDescription": "이 폴더와 그 아래 전부의 상한입니다. 비우면 상한이 없습니다. 부모 폴더의 할당량도 그대로 적용됩니다.",
+    "quotaHint": "사용량은 VM이 켜졌든 꺼졌든 할당한 자원입니다. 템플릿은 디스크만 셉니다. 여기나 부모 폴더의 상한을 넘는 쓰기는 거절하고, 사용량보다 낮춘 상한은 늘리는 쓰기만 막습니다.",
+    "noQuota": "이 폴더에는 자기 할당량이 없습니다.",
+    "quotaSaved": "{{name}}의 할당량을 저장했습니다.",
+    "badLimit": "0 이상의 수를 넣으세요.",
+    "noLimitHint": "비우면 상한 없음",
+    "memoryGib": "메모리(GiB)",
+    "diskGib": "디스크(GiB)",
+    "dim": {
+      "vcpus": "vCPU",
+      "memory_mib": "메모리",
+      "disk_bytes": "디스크",
+      "vms": "VM 수"
+    },
+    "usedOf": "{{limit}} 중 {{used}}",
+    "noLimit": "상한 없음",
+    "over": "상한 넘음",
+    "boundBy": "{{path}}이(가) 묶음"
+  },
+  "permissions": {
+    "title": "{{name}}의 권한",
+    "mine": "여기서 내 권한",
+    "none": "없음",
+    "loadFailed": "권한을 읽지 못했습니다.",
+    "who": "접근할 수 있는 사람",
+    "principal": "사용자·그룹",
+    "role": "역할",
+    "from": "건 곳",
+    "target": "대상",
+    "globalRole": "전역 역할",
+    "group": "그룹",
+    "user": "사용자",
+    "noPropagate": "(이 폴더만)",
+    "empty": "여기에 권한으로 접근하는 사람이 없습니다.",
+    "emptyAll": "권한이 아직 없습니다.",
+    "add": "권한 더하기",
+    "addTitle": "{{name}}에 권한 더하기",
+    "addDescription": "여기서 내가 가진 권한만 줄 수 있습니다.",
+    "added": "{{name}}에 권한을 더했습니다.",
+    "principalKind": "받는 쪽",
+    "choose": "고르세요…",
+    "typedHint": "사용자나 그룹 id를 넣으세요(이미 접근하는 사람에서 고르거나 관리자에게 받으세요).",
+    "badPrincipal": "사용자나 그룹 id를 넣으세요.",
+    "propagate": "하위 폴더와 그 안의 것에도 적용",
+    "propagateShort": "하위로",
+    "remove": "빼기",
+    "removeNamed": "{{name}}의 권한 빼기",
+    "removeTitle": "{{name}}의 권한을 뺄까요?",
+    "removeDescription": "다른 권한으로 받은 접근은 그대로입니다.",
+    "removed": "권한을 뺐습니다.",
+    "rootTarget": "클러스터 전체",
+    "openNamed": "{{name}}의 권한",
+    "pageHint": "클러스터의 모든 권한입니다. 권한은 사용자나 그룹에게 클러스터 전체, 폴더(와 그 아래), 객체 하나에서 역할을 줍니다. 권한은 더해지기만 하고 거부는 없습니다."
+  },
+  "roleEditor": {
+    "pageHint": "내장 역할은 전역 역할과 같습니다. 사용자 정의 역할은 권한에 쓸 권한 목록입니다.",
+    "privileges": "권한 목록",
+    "description": "설명",
+    "builtin": "내장",
+    "empty": "역할이 없습니다.",
+    "createTitle": "역할 만들기",
+    "editTitle": "역할 {{name}} 고치기",
+    "editNamed": "{{name}} 고치기",
+    "badName": "admin·operator·viewer·none이 아닌 리소스 이름을 쓰세요.",
+    "noPrivileges": "권한을 하나 이상 고르세요.",
+    "saved": "역할 {{name}}을(를) 저장했습니다.",
+    "deleteTitle": "역할 {{name}}을(를) 지울까요?",
+    "deleteDescription": "권한이 쓰는 역할은 지울 수 없습니다.",
+    "deleted": "역할 {{name}}을(를) 지웠습니다."
+  },
+  "groupEditor": {
+    "pageHint": "그룹은 권한을 줄 사용자의 묶음입니다. 멤버는 로컬·디렉터리 사용자이고, 연결한 디렉터리 그룹의 멤버는 로그인할 때 들어옵니다.",
+    "members": "멤버",
+    "external": "디렉터리 그룹",
+    "externalHint": "그 영역의 사용자 가운데 디렉터리 그룹(LDAP DN·OIDC 그룹 값)에 속한 사람이 멤버입니다.",
+    "realm": "영역",
+    "groupName": "디렉터리 그룹",
+    "addExternal": "디렉터리 그룹 연결",
+    "removeExternal": "디렉터리 그룹 빼기",
+    "badExternal": "영역을 고르고 그룹 이름을 넣으세요.",
+    "empty": "그룹이 없습니다.",
+    "createTitle": "그룹 만들기",
+    "editTitle": "그룹 {{name}} 고치기",
+    "editNamed": "{{name}} 고치기",
+    "saved": "그룹 {{name}}을(를) 저장했습니다.",
+    "deleteTitle": "그룹 {{name}}을(를) 지울까요?",
+    "deleteDescription": "권한이 쓰는 그룹은 지울 수 없습니다.",
+    "deleted": "그룹 {{name}}을(를) 지웠습니다.",
+    "inUse": "권한이 쓰는 그룹입니다. 먼저 그 권한을 빼세요: {{message}}"
+  },
+  "twoFactor": {
+    "pageHint": "비밀번호 다음의 둘째 단계입니다: 인증 앱 코드, 패스키, 복구 코드.",
+    "required": "필수",
+    "unavailable": "모든 노드를 올리기 전에는 2단계 인증을 쓸 수 없습니다.",
+    "app": "인증 앱",
+    "appOn": "인증 앱이 설정돼 있습니다.",
+    "appOff": "인증 앱이 없습니다.",
+    "setUpApp": "인증 앱 설정",
+    "scan": "인증 앱으로 QR 코드를 찍거나 키를 직접 넣은 뒤 앱이 보이는 코드를 넣으세요.",
+    "qrLabel": "인증 앱용 QR 코드",
+    "secret": "키",
+    "copySecret": "키 복사",
+    "code": "앱의 코드",
+    "confirm": "확인",
+    "disableApp": "인증 앱 끄기",
+    "disable": "끄기",
+    "appDisabled": "인증 앱을 껐습니다.",
+    "recoveryTitle": "복구 코드",
+    "recoveryOnce": "이 코드를 안전한 곳에 저장하세요. 지금만 보입니다. 앱이나 패스키를 잃으면 코드 하나로 한 번 로그인합니다.",
+    "recoveryLeft_one": "복구 코드 {{count}}개 남음.",
+    "recoveryLeft_other": "복구 코드 {{count}}개 남음.",
+    "copyCodes": "복구 코드 복사",
+    "savedCodes": "저장했습니다",
+    "regenerate": "새 복구 코드 만들기",
+    "passkeys": "패스키",
+    "passkeyName": "패스키 이름",
+    "addPasskey": "패스키 더하기",
+    "passkeyIp": "IP 주소로 웹 화면을 열어 패스키를 쓸 수 없습니다. 브라우저는 도메인 이름에서만 패스키를 허락합니다.",
+    "passkeyBrowser": "이 브라우저는 패스키를 쓸 수 없습니다.",
+    "passkeyCancelled": "패스키를 만들지 않았습니다.",
+    "removePasskey": "패스키 {{name}} 빼기",
+    "passkeyRemoved": "패스키 {{name}}을(를) 뺐습니다.",
+    "proofHint": "본인 확인: 앱의 코드, 복구 코드, 또는 비밀번호를 넣으세요.",
+    "proofHintCode": "본인 확인: 앱의 코드나 복구 코드를 넣으세요.",
+    "codeOrRecovery": "코드나 복구 코드",
+    "orPassword": "또는 비밀번호",
+    "saved": "저장했습니다.",
+    "enrollTitle": "2단계 인증 설정",
+    "enrollRequired": "관리자가 2단계 인증을 요구합니다. 설정하면 로그인이 끝납니다.",
+    "orPasskey": "또는 패스키:",
+    "backToLogin": "로그인으로 돌아가기",
+    "policyHint": "이 전역 역할이거나 이 영역의 사용자에게 2단계 인증을 요구합니다. OIDC 영역은 IdP가 맡으므로 없습니다.",
+    "policyRoles": "전역 역할",
+    "policyRealms": "영역",
+    "rpId": "패스키 도메인(RP ID)",
+    "rpIdHint": "선택. 비우면 브라우저가 쓰는 호스트 이름입니다."
   }
 }

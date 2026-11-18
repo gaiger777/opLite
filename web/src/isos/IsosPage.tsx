@@ -7,8 +7,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Volume } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PageHeader } from "@/components/PageHeader";
 import { ReasonButton, ReasonList } from "@/components/Reason";
@@ -37,7 +36,7 @@ import { describeProgress, trackTask } from "@/tasks/tasks";
  */
 export function IsosPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const volumes = useList("volume");
   const vms = useList("vm");
   const nodes = useList("node");
@@ -46,7 +45,7 @@ export function IsosPage() {
   const [uploading, setUploading] = useState(false);
   const [downloading, setDownloading] = useState(false);
   const [deleting, setDeleting] = useState<Volume | null>(null);
-  const write = can(me.role, "write", "volume");
+  const write = perms.anywhere("storage.allocate");
   useCreateParam(() => setUploading(true), write);
   const reasonBase = useId();
   // 풀 이름, 이름 순

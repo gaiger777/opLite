@@ -12,7 +12,10 @@ import {
   SUBSCRIPTION_KEY,
   type WatchEvent,
 } from "@/api/live";
-import type { Settings } from "@/api/types";
+import type { Settings, WatchKind } from "@/api/types";
+import { useOptionalPrincipal } from "@/auth/AuthProvider";
+import { Permissions } from "@/auth/permissions";
+import { fetchPermissions, PERMISSIONS_KEY } from "@/auth/usePermissions";
 
 export type LiveStatus = "connecting" | "live" | "offline";
 
@@ -23,18 +26,21 @@ const MAX_RETRY_MS = 30_000;
 /** 이만큼 이어져 있다 끊기면 다시 1초부터 기다린다. 곧바로 끊기면(lagged 등) 계속 늘린다. */
 const STABLE_MS = 30_000;
 
-function watchUrl(since: number) {
+function watchUrl(kinds: readonly string[], since: number) {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
-  return `${scheme}://${window.location.host}/api/v1/watch?kinds=${[...KINDS, SETTINGS_KIND].join(",")}&since=${since}`;
+  return `${scheme}://${window.location.host}/api/v1/watch?kinds=${kinds.join(",")}&since=${since}`;
 }
 
 /**
  * 로그인한 동안 목록을 모두 읽고, 그중 가장 작은 revision부터 watch를 하나 열어 변경을 캐시에 반영한다.
- * 이어 받을 수 없으면(오류, reset, 연결 끊김) 목록을 다시 읽고 새로 연다.
+ * 이어 받을 수 없으면(오류, reset, 연결 끊김, 권한 바뀜 `permissions`) 목록을 다시 읽고 새로 연다. 연결마다 내
+ * 권한(`/permissions/mine`)을 먼저 다시 읽고, 루트에서 읽어야 하는 종류(노드·설정 등)는 읽을 수 있을 때만
+ * 받는다(폴더 사용자는 403을 받는다).
  */
 export function LiveProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
   const [status, setStatus] = useState<LiveStatus>("connecting");
+  const role = useOptionalPrincipal()?.role ?? "admin";
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -53,9 +59,20 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
 
     async function connect() {
       let since: number;
+      let kinds: WatchKind[];
+      let settings: boolean;
       try {
+        const perms = await queryClient
+          .fetchQuery({ queryKey: PERMISSIONS_KEY, queryFn: fetchPermissions, retry: false })
+          .then(
+            (mine) => new Permissions(mine),
+            // 받지 못하면 전역 역할로 본다(서버가 막는 것은 그대로다).
+            () => Permissions.fromRole(role),
+          );
+        kinds = KINDS.filter((kind) => perms.reads(kind));
+        settings = perms.reads("settings");
         const lists = await Promise.all(
-          KINDS.map((kind) =>
+          kinds.map((kind) =>
             // 다시 시도는 여기의 backoff만 한다.
             queryClient.fetchQuery({
               queryKey: listKey(kind),
@@ -75,7 +92,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       if (stopped) {
         return;
       }
-      const ws = new WebSocket(watchUrl(since));
+      const ws = new WebSocket(watchUrl(settings ? [...kinds, SETTINGS_KIND] : kinds, since));
       socket = ws;
       let openedAt: number | undefined;
       ws.onopen = () => {
@@ -120,6 +137,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               listKey(event.kind),
               (list) => list && applyEvent(list, event),
             );
+            // 폴더가 생기거나 옮겨지면 폴더별 권한 표가 바뀐다(계획 62). 내 권한이 바뀌면 서버가 연결을
+            // `permissions`로 닫지만, 새 폴더의 칸은 여기서 다시 읽는다.
+            if (event.kind === "folder") {
+              void queryClient.invalidateQueries({ queryKey: PERMISSIONS_KEY });
+            }
             break;
           case "reset":
           case "error":
@@ -149,7 +171,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       socket?.close();
       socket = null;
     };
-  }, [queryClient]);
+  }, [queryClient, role]);
 
   return <LiveContext value={status}>{children}</LiveContext>;
 }

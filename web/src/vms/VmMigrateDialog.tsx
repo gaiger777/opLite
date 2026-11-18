@@ -6,8 +6,7 @@ import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, StoragePool, Vm, Volume } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
@@ -75,9 +74,9 @@ export function VmMigrateDialog({
   returnFocus?: RefObject<HTMLElement | null>;
 }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   // 배치 규칙을 넘는 것은 규칙을 쓸 수 있는 사용자(admin)만이다(서버도 403으로 막는다).
-  const mayForce = can(me.role, "write", "placement-rule");
+  const mayForce = perms.can("write", "placement-rule");
   const [force, setForce] = useState(false);
   const nodes = useList("node");
   const volumes = useList("volume");

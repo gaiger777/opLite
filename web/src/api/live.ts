@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 
 import { api, call } from "@/api/client";
 import type { Resources, WatchKind } from "@/api/types";
+import { usePermissions } from "@/auth/usePermissions";
 
 /** 화면이 실시간으로 보는 리소스 종류. 사용자와 토큰은 감시할 수 없다. */
 export const KINDS: WatchKind[] = [
@@ -18,6 +19,7 @@ export const KINDS: WatchKind[] = [
   "vm-import",
   "ha-group",
   "placement-rule",
+  "folder",
 ];
 
 /**
@@ -86,6 +88,8 @@ export async function fetchList<K extends WatchKind>(kind: K): Promise<List<Reso
         return call(api.GET("/ha-groups"));
       case "placement-rule":
         return call(api.GET("/placement-rules"));
+      case "folder":
+        return call(api.GET("/folders"));
     }
   })();
   return list as List<Resources[K]>;
@@ -119,13 +123,18 @@ export function applyEvent<T extends Versioned>(list: List<T>, event: WatchEvent
   return { ...list, items: list.items.filter((item) => item.id !== event.resource.id) };
 }
 
-/** 리소스 목록. 처음에는 직접 읽고, 그 뒤로는 watch가 바꾼다(`LiveProvider`). */
+/**
+ * 리소스 목록. 처음에는 직접 읽고, 그 뒤로는 watch가 바꾼다(`LiveProvider`). 루트에서 읽어야 하는 종류(노드 등)를
+ * 읽을 수 없으면(폴더 사용자) 묻지 않는다(`data`가 없다).
+ */
 export function useList<K extends WatchKind>(kind: K) {
+  const readable = usePermissions().reads(kind);
   return useQuery({
     queryKey: listKey(kind),
     queryFn: () => fetchList(kind),
     staleTime: Infinity,
     select: (list) => list.items,
+    enabled: readable,
   });
 }
 

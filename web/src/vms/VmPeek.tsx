@@ -4,8 +4,7 @@ import { Link } from "react-router";
 
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { PeekFacts } from "@/components/data-table/PeekFacts";
 import { ACTION_ICONS } from "@/components/icons";
 import { PinButton } from "@/components/PinButton";
@@ -19,11 +18,11 @@ import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 /** VM 미리 보기(설계 §5.3): 요약, 주 동작(시작·정지·콘솔), 열기 */
 export function VmPeek({ vm, nodeName }: { vm: Vm; nodeName(id?: string | null): string }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const host = useVmActionHost();
   const { run } = useVmActions();
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
-  const operate = can(me.role, "operate", "vm");
+  const operate = can("vm.power");
   const href = `/vms/${encodeURIComponent(vm.name)}`;
   const ips = (vm.spec.cloud_init?.networks ?? []).flatMap((net) =>
     [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
@@ -68,7 +67,7 @@ export function VmPeek({ vm, nodeName }: { vm: Vm; nodeName(id?: string | null):
             {t("vms.action.stop")}
           </Button>
         )}
-        {operate && ok("console") && (
+        {can("vm.console") && ok("console") && (
           <Button variant="outline" size="sm" asChild>
             <Link to={`${href}/console`}>
               <Console />

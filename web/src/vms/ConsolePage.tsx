@@ -3,8 +3,8 @@ import { useTranslation } from "react-i18next";
 import { Link, useParams } from "react-router";
 
 import { useList } from "@/api/live";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { objectTarget } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { errorMessage } from "@/i18n/errors";
 import { VmConsole } from "@/vms/lazyConsole";
 import { useVmByName } from "@/vms/VmDetailPage";
@@ -13,11 +13,11 @@ import { useVmByName } from "@/vms/VmDetailPage";
 export function ConsolePage() {
   const { t } = useTranslation();
   const { name = "" } = useParams();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const vms = useList("vm");
   const vm = useVmByName(name);
-  // 콘솔은 VM 동작 권한이 있어야 연다(서버도 막는다).
-  if (!can(me.role, "operate", "vm")) {
+  // 콘솔은 그 VM의 콘솔 권한이 있어야 연다(서버도 막는다).
+  if (vm ? !perms.has("vm.console", objectTarget("vm", vm)) : !perms.anywhere("vm.console")) {
     return (
       <p role="alert" className="text-destructive">
         {t("console.forbidden")}

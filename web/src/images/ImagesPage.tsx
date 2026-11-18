@@ -5,8 +5,7 @@ import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PageHeader } from "@/components/PageHeader";
 import { TableMessage } from "@/components/TableMessage";
@@ -34,7 +33,7 @@ export const CATALOG_KEY = ["image-catalog"] as const;
  */
 export function ImagesPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const [arch, setArch] = useState<Arch | null>(null);
   const catalog = useQuery({
@@ -45,8 +44,8 @@ export function ImagesPage() {
   const [downloading, setDownloading] = useState<CatalogEntry | null>(null);
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<CatalogEntry | null>(null);
-  const write = can(me.role, "write", "volume");
-  const admin = can(me.role, "write", "settings");
+  const write = perms.anywhere("storage.allocate");
+  const admin = perms.can("write", "settings");
   const items = catalog.data?.items ?? [];
   // 받기가 끝나면 받은 볼륨(`volumes`)을 다시 읽는다.
   const finished = (tasks.data ?? []).filter(

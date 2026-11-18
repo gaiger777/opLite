@@ -1,12 +1,15 @@
 import { useTranslation } from "react-i18next";
 
+import { useList } from "@/api/live";
 import type { Node } from "@/api/types";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Switch } from "@/components/ui/switch";
+import { folderPath, folderTree } from "@/folders/folders";
 import {
   defaultMachine,
   haActive,
@@ -183,34 +186,44 @@ export function GeneralSection({
               onChange({ machine: e.target.value as VmFormValues["machine"] });
             }}
           >
+            {/* 노드를 모르면(폴더 사용자) 서버가 클러스터 아키텍처로 고른다. */}
+            {(nodes === undefined || values.machine === "") && (
+              <NativeSelectOption value="">{t("vmForm.machineAuto")}</NativeSelectOption>
+            )}
             <NativeSelectOption value="q35">q35 (x86_64)</NativeSelectOption>
             <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
           </NativeSelect>
         </Field>
-        <Field id="vm-node" label={t("common.node")}>
-          <NativeSelect
-            id="vm-node"
-            className="w-full"
-            disabled={locked}
-            value={values.node}
-            onChange={(e) => {
-              const node = e.target.value;
-              onChange(
-                autoMachine ? { node, machine: defaultMachine(nodes ?? [], node) } : { node },
-              );
-            }}
-          >
-            <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
-            {/* 위트니스는 VM을 돌리지 않는다. */}
-            {nodes
-              ?.filter((n) => !n.spec.witness)
-              .map((n) => (
-                <NativeSelectOption key={n.id} value={n.id}>
-                  {n.name}
-                </NativeSelectOption>
-              ))}
-          </NativeSelect>
-        </Field>
+        {creating && (
+          <FolderField value={values.folder} onChange={(folder) => onChange({ folder })} />
+        )}
+        {/* 노드 목록을 읽을 수 없으면(폴더 사용자) 자동 배치다. */}
+        {nodes !== undefined && (
+          <Field id="vm-node" label={t("common.node")}>
+            <NativeSelect
+              id="vm-node"
+              className="w-full"
+              disabled={locked}
+              value={values.node}
+              onChange={(e) => {
+                const node = e.target.value;
+                onChange(
+                  autoMachine ? { node, machine: defaultMachine(nodes ?? [], node) } : { node },
+                );
+              }}
+            >
+              <NativeSelectOption value="">{t("vmForm.nodeAuto")}</NativeSelectOption>
+              {/* 위트니스는 VM을 돌리지 않는다. */}
+              {nodes
+                ?.filter((n) => !n.spec.witness)
+                .map((n) => (
+                  <NativeSelectOption key={n.id} value={n.id}>
+                    {n.name}
+                  </NativeSelectOption>
+                ))}
+            </NativeSelect>
+          </Field>
+        )}
         <Field id="vm-restart" label={t("vms.restart")}>
           <NativeSelect
             id="vm-restart"
@@ -405,5 +418,44 @@ export function GeneralSection({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * 새 VM의 폴더(계획 62): 루트(루트에 `vm.create`가 있을 때)와 `vm.create`가 있는 VM 폴더. 폴더가 없으면 보이지
+ * 않는다.
+ */
+function FolderField({ value, onChange }: { value: string; onChange(folder: string): void }) {
+  const { t } = useTranslation();
+  const perms = usePermissions();
+  const folders = useList("folder");
+  const tree = folderTree(folders.data, "vm");
+  if (tree.folders.length === 0) {
+    return null;
+  }
+  const allowed = tree.folders
+    .filter(
+      (f) => f.id === value || perms.has("vm.create", { type: "object", kind: "vm", folder: f.id }),
+    )
+    .map((f) => ({ id: f.id, path: folderPath(tree, f.id) }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  return (
+    <Field id="vm-folder" label={t("folders.folder")}>
+      <NativeSelect
+        id="vm-folder"
+        className="w-full"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {(perms.has("vm.create") || value === "") && (
+          <NativeSelectOption value="">{t("folders.root")}</NativeSelectOption>
+        )}
+        {allowed.map((f) => (
+          <NativeSelectOption key={f.id} value={f.id}>
+            {f.path}
+          </NativeSelectOption>
+        ))}
+      </NativeSelect>
+    </Field>
   );
 }

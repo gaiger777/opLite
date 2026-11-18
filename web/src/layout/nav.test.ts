@@ -2,6 +2,7 @@ import { matchRoutes } from "react-router";
 
 import { appRoutes } from "@/App";
 import type { Role } from "@/api/types";
+import { Permissions } from "@/auth/permissions";
 import en from "@/i18n/en.json";
 import {
   AREAS,
@@ -18,7 +19,7 @@ import {
 const area = (id: string) => AREAS.find((a) => a.id === id)!;
 const U1 = "00000000-0000-0000-0000-0000000000a1";
 const U2 = "00000000-0000-0000-0000-0000000000a2";
-const as = (role: Role, user = U1) => ({ user, role });
+const as = (role: Role, user = U1) => ({ user, gate: Permissions.fromRole(role) });
 
 /** `nav.area.home` 같은 키를 영어 글로 바꾼다(i18n을 띄우지 않는 순수 시험). */
 function t(key: string): string {
@@ -102,7 +103,10 @@ it("shows the console full width", () => {
 
 const visible = (role: Role) =>
   Object.fromEntries(
-    visibleAreas(role).map((a) => [a.id, visibleTabs(a, role).map((tab) => tab.to)]),
+    visibleAreas(Permissions.fromRole(role)).map((a) => [
+      a.id,
+      visibleTabs(a, Permissions.fromRole(role)).map((tab) => tab.to),
+    ]),
   );
 
 it("shows every area and tab to admins", () => {
@@ -115,7 +119,12 @@ it.each(["operator", "viewer"] as const)("hides account and admin tabs from %s",
   const tabs = visible(role);
   expect(Object.keys(tabs)).toEqual(["home", "vms", "infra", "protect", "activity", "settings"]);
   expect(tabs.activity).toEqual(["/tasks", "/alerts"]);
-  expect(tabs.settings).toEqual(["/settings", "/settings/tokens", "/settings/subscription"]);
+  expect(tabs.settings).toEqual([
+    "/settings",
+    "/settings/tokens",
+    "/settings/account",
+    "/settings/subscription",
+  ]);
   // 원격 클러스터 상태는 누구나 읽는다.
   expect(tabs.protect).toContain("/remotes");
 });

@@ -6,8 +6,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useSettings } from "@/api/live";
 import type { NodeLoadView, PlacementMode, PlacementMove, PlacementPolicy } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
@@ -50,7 +49,7 @@ const REFRESH_MS = 15_000;
 /** 최적 배치: 균형 조정기의 상태, 노드 부하, 추천과 적용, admin의 설정 */
 export function PlacementPage() {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const status = useQuery({
     queryKey: PLACEMENT_KEY,
@@ -60,7 +59,7 @@ export function PlacementPage() {
     retry: false,
   });
   const [applying, setApplying] = useState<string | null>(null);
-  const operate = can(me.role, "operate", "vm");
+  const operate = perms.anywhere("vm.migrate");
   const reload = () => queryClient.invalidateQueries({ queryKey: PLACEMENT_KEY });
   const s = status.data;
   const time = (secs: number | undefined) =>
@@ -205,7 +204,7 @@ export function PlacementPage() {
           </section>
         </>
       )}
-      {can(me.role, "write", "settings") && <SettingsCard onSaved={reload} />}
+      {perms.can("write", "settings") && <SettingsCard onSaved={reload} />}
     </div>
   );
 }

@@ -8,8 +8,8 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { ReplicationState, Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { objectTarget } from "@/auth/permissions";
+import { usePermissions, useVmCan } from "@/auth/usePermissions";
 import { VmBackups } from "@/backups/VmBackups";
 import { ListPending } from "@/components/ListPending";
 import { useVisit } from "@/components/PinButton";
@@ -63,6 +63,7 @@ import {
   unusableDisk,
   type ReplicaRow,
 } from "@/vms/replication";
+import { PermissionsPanel } from "@/permissions/lazyPanel";
 import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -81,6 +82,7 @@ const TABS = [
   "snapshots",
   "backups",
   "tasks",
+  "permissions",
   "json",
 ] as const;
 
@@ -98,10 +100,11 @@ export function VmDetailPage() {
   const { name = "" } = useParams();
   const vms = useList("vm");
   const vm = useVmByName(name);
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const [params, setParams] = useSearchParams();
-  // 콘솔 탭은 VM 동작 권한이 있을 때만 보인다.
-  const tabs = TABS.filter((id) => id !== "console" || can(me.role, "operate", "vm"));
+  // 콘솔 탭은 그 VM의 콘솔 권한이 있을 때만 보인다. 권한 탭은 누구나 자기 권한을 보고, grant는 다룰 권한이
+  // 있을 때만 보인다(탭 안에서).
+  const tabs = TABS.filter((id) => id !== "console" || can("vm.console"));
   const tab = tabs.find((id) => id === params.get("tab")) ?? "summary";
 
   if (vm === undefined) {
@@ -175,6 +178,13 @@ export function VmDetailPage() {
         <TabsContent value="tasks">
           <VmTasks key={vm.id} vm={vm} />
         </TabsContent>
+        <TabsContent value="permissions">
+          {tab === "permissions" && (
+            <Suspense fallback={null}>
+              <PermissionsPanel target={objectTarget("vm", vm)} label={vm.name} />
+            </Suspense>
+          )}
+        </TabsContent>
         <TabsContent value="json">
           <pre className="overflow-x-auto rounded-md bg-muted p-4 text-xs">
             {JSON.stringify(vm, null, 2)}
@@ -187,7 +197,7 @@ export function VmDetailPage() {
 
 function VmHeader({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const navigate = useNavigate();
   const nodes = useList("node");
   const vmTasks = useTaskIndex().get(vm.id) ?? [];
@@ -214,8 +224,10 @@ function VmHeader({ vm }: { vm: Vm }) {
   // 옮기는 중이면 그 마이그레이션 Task의 진행률(디스크 복사, 메모리)
   const migrationTask = migration && vmTasks.find((task) => task.id === migration.task);
   const progress = migrationTask ? describeProgress(migrationTask, t) : null;
-  const operate = can(me.role, "operate", "vm");
-  const write = can(me.role, "write", "vm");
+  // 이 VM의 권한(폴더·객체 grant). 없는 동작은 숨긴다.
+  const can = useVmCan(vm);
+  const operate = can("vm.power");
+  const write = can("vm.config");
   // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
   const reasonOf = (action: VmOperation) => {
     const able = availability(vm, action, vmTasks);
@@ -223,7 +235,11 @@ function VmHeader({ vm }: { vm: Vm }) {
   };
   const consoleReason = reasonOf("console");
   // 보이는 버튼의 막힌 이유만 모은다(케밥 항목은 항목 옆에 이유를 보인다).
-  const reasons = operate ? [...PRIMARY.map(reasonOf), consoleReason, reasonOf("migrate")] : [];
+  const reasons = [
+    ...(operate ? PRIMARY.map(reasonOf) : []),
+    ...(can("vm.console") ? [consoleReason] : []),
+    ...(can("vm.migrate") ? [reasonOf("migrate")] : []),
+  ];
   const button = (action: VmAction) => (
     <ReasonButton
       key={action}
@@ -240,7 +256,7 @@ function VmHeader({ vm }: { vm: Vm }) {
     [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
   );
   // 주 동작(시작·정지·콘솔·옮기기)은 단추, 나머지는 케밥이다(설계 §5.3).
-  const menu = (operate || write) && (
+  const menu = (operate || write || can("vm.clone") || can("vm.delete")) && (
     <>
       {operate &&
         SECONDARY.map((action) => (
@@ -261,7 +277,7 @@ function VmHeader({ vm }: { vm: Vm }) {
           {t("vms.action.edit")}
         </DropdownMenuItem>
       )}
-      {write && can(me.role, "write", "volume") && (
+      {can("vm.clone") && perms.anywhere("vm.create") && (
         <DropdownMenuItem onSelect={() => setConfirm(template ? "deploy" : "clone")}>
           {template ? t("templates.deploy") : t("vms.action.clone")}
         </DropdownMenuItem>
@@ -274,7 +290,7 @@ function VmHeader({ vm }: { vm: Vm }) {
           {template ? t("templates.revert") : t("templates.convert")}
         </ReasonMenuItem>
       )}
-      {write && (
+      {can("vm.delete") && (
         <>
           <DropdownMenuSeparator />
           <ReasonMenuItem
@@ -321,24 +337,34 @@ function VmHeader({ vm }: { vm: Vm }) {
         },
       ]}
       actions={
-        operate && (
+        (operate || can("vm.console") || can("vm.migrate")) && (
           <>
-            {PRIMARY.map(button)}
+            {operate && PRIMARY.map(button)}
             {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
-            <ReasonButton variant="outline" size="sm" reason={consoleReason} reasons={hint} asChild>
-              <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
-                {t("vms.openConsole")}
-              </Link>
-            </ReasonButton>
-            <ReasonButton
-              variant="outline"
-              size="sm"
-              reason={reasonOf("migrate")}
-              reasons={hint}
-              onClick={() => setConfirm("migrate")}
-            >
-              {t("vms.action.migrate")}
-            </ReasonButton>
+            {can("vm.console") && (
+              <ReasonButton
+                variant="outline"
+                size="sm"
+                reason={consoleReason}
+                reasons={hint}
+                asChild
+              >
+                <Link to={`/vms/${encodeURIComponent(vm.name)}/console`} target="_blank">
+                  {t("vms.openConsole")}
+                </Link>
+              </ReasonButton>
+            )}
+            {can("vm.migrate") && (
+              <ReasonButton
+                variant="outline"
+                size="sm"
+                reason={reasonOf("migrate")}
+                reasons={hint}
+                onClick={() => setConfirm("migrate")}
+              >
+                {t("vms.action.migrate")}
+              </ReasonButton>
+            )}
           </>
         )
       }
@@ -546,7 +572,7 @@ const REPLICATE_ERROR_CODES = ["vm_busy"];
  */
 function Replication({ vm }: { vm: Vm }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const hint = useId();
   const nodes = useList("node");
   const volumes = useList("volume");
@@ -558,7 +584,7 @@ function Replication({ vm }: { vm: Vm }) {
   if (rows.length === 0 && !warning) {
     return null;
   }
-  const operate = can(me.role, "operate", "vm");
+  const operate = can("vm.power");
   // 꺼진 VM은 복제하지 않는다(서버의 409 `vm_not_running`).
   const reason = vm.status.phase === "running" ? null : "vms.replication.notRunning";
   const recovery = vm.status.last_recovery;
@@ -779,7 +805,7 @@ const CDROM_ERROR_CODES = [...HOTPLUG_ERROR_CODES, "volume_not_ready"];
  */
 function Cdroms({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const volumes = useList("volume");
   const pools = useList("storage-pool");
   const [chosen, setChosen] = useState<Record<number, string>>({});
@@ -788,7 +814,7 @@ function Cdroms({ vm }: { vm: Vm }) {
   if (cdroms.length === 0) {
     return null;
   }
-  const write = can(me.role, "write", "vm");
+  const write = can("vm.config");
   const running = vm.status.hardware?.cdroms;
   const isos = choosableIsos(
     volumes.data ?? [],
@@ -931,13 +957,12 @@ function HotAdded({ vm, kind, index }: { vm: Vm; kind: "disk" | "nic"; index: nu
  */
 function PendingChanges({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const pending = vm.status.hardware?.pending ?? [];
   if (pending.length === 0) {
     return null;
   }
-  const retry =
-    failedChanges(vm).length > 0 && can(me.role, "operate", "vm") && vm.status.phase === "running";
+  const retry = failedChanges(vm).length > 0 && can("vm.config") && vm.status.phase === "running";
 
   async function applyAgain() {
     try {

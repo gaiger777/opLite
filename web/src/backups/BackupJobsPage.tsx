@@ -6,8 +6,7 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { BackupJob } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { backupPools } from "@/backups/backups";
 import {
   checkForm,
@@ -48,7 +47,7 @@ import { useCreateParam } from "@/lib/createParam";
 /** 백업 작업: 목록과 만들기·바꾸기·지우기·지금 실행. 시각은 모두 UTC다(작업 일정이 UTC다). */
 export function BackupJobsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const jobs = useList("backup-job");
   const pools = useList("storage-pool");
   // 만들기는 `null`, 바꾸기는 그 작업
@@ -56,7 +55,7 @@ export function BackupJobsPage() {
   const [deleting, setDeleting] = useState<BackupJob | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
-  const write = can(me.role, "write", "backup-job");
+  const write = perms.can("write", "backup-job");
   useCreateParam(() => setEditing(null), write, pools.isSuccess && jobs.isSuccess);
   const list = [...(jobs.data ?? [])].sort((a, b) => a.name.localeCompare(b.name));
 

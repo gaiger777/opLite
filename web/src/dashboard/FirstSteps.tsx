@@ -4,8 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 
 import { useList } from "@/api/live";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Button } from "@/components/ui/button";
 
 /**
@@ -14,12 +13,12 @@ import { Button } from "@/components/ui/button";
  */
 export function FirstSteps() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
   const vms = useList("vm");
   const id = useId();
-  const write = can(me.role, "write", "vm");
+  const write = perms.can("write", "vm");
   // 목록을 다 읽기 전에는 보이지 않는다(있는 클러스터에서 깜박이지 않게).
   if (!write || !pools.data || !volumes.data || !vms.data || vms.data.length > 0) {
     return null;
@@ -29,13 +28,13 @@ export function FirstSteps() {
       id: "pool",
       done: pools.data.length > 0,
       to: "/storage-pools?create=1",
-      allowed: can(me.role, "write", "storage-pool"),
+      allowed: perms.can("write", "storage-pool"),
     },
     {
       id: "media",
       done: volumes.data.length > 0,
       to: "/isos?create=1",
-      allowed: can(me.role, "write", "volume"),
+      allowed: perms.can("write", "volume"),
     },
     { id: "vm", done: false, to: "/vms/-new", allowed: true },
   ];

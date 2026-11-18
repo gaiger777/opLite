@@ -6,8 +6,10 @@ import { toast } from "sonner";
 import { api, ApiError, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { StoragePool } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { objectTarget } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
+import { FolderSelect, useNewFolder } from "@/folders/FolderSelect";
+import { PermissionsButton, PermissionsSheet } from "@/permissions/PermissionsSheet";
 import { isManagedPool, useCeph } from "@/ceph/ceph";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
@@ -48,7 +50,7 @@ import { validName } from "@/vms/form";
 
 export function PoolsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
   const backups = useList("backup");
@@ -59,7 +61,13 @@ export function PoolsPage() {
   // 공유 여부를 바꿀 디렉터리 풀과 바꿀 값. 닫히는 동안에도 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
   const [sharing, setSharing] = useState<{ pool: StoragePool; shared: boolean } | null>(null);
   const [sharingOpen, setSharingOpen] = useState(false);
-  const write = can(me.role, "write", "storage-pool");
+  // 계획 62: 풀마다 폴더가 다르다. 어딘가에 만들 수 있으면 만들기를, 행마다 그 풀의 권한으로 단추를 보인다.
+  const write = perms.anywhere("storage.config");
+  const writes = (pool: StoragePool) =>
+    perms.has("storage.config", objectTarget("storage-pool", pool));
+  const delegates = (pool: StoragePool) =>
+    perms.has("permission.modify", objectTarget("storage-pool", pool));
+  const [sharingPerms, setSharingPerms] = useState<StoragePool | null>(null);
   useCreateParam(() => setCreating(true), write);
   const state = useTableState("pools");
 
@@ -136,7 +144,7 @@ export function PoolsPage() {
       priority: 3,
       // 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유).
       cell: (pool) =>
-        write && pool.spec.backend.kind === "dir" ? (
+        writes(pool) && pool.spec.backend.kind === "dir" ? (
           <Switch
             aria-label={t("pools.sharedNamed", { name: pool.name })}
             checked={isShared(pool)}
@@ -161,7 +169,7 @@ export function PoolsPage() {
         const backupKind = pool.spec.backend.kind === "dir" || pool.spec.backend.kind === "nfs";
         return (
           <>
-            {write && backupKind ? (
+            {writes(pool) && backupKind ? (
               <Switch
                 aria-label={t("pools.backupsNamed", { name: pool.name })}
                 checked={pool.spec.backups === true}
@@ -172,7 +180,7 @@ export function PoolsPage() {
             ) : (
               "—"
             )}
-            {write && held !== undefined && held > 0 && (
+            {writes(pool) && held !== undefined && held > 0 && (
               <div className="text-xs text-muted-foreground">
                 {t("pools.holdsBackups", { count: held })}
               </div>
@@ -222,7 +230,7 @@ export function PoolsPage() {
         return (
           <>
             {used ?? "—"}
-            {write && used !== undefined && used > 0 && (
+            {writes(pool) && used !== undefined && used > 0 && (
               <div className="text-xs text-muted-foreground">{t("pools.inUse")}</div>
             )}
           </>
@@ -230,7 +238,7 @@ export function PoolsPage() {
       },
     },
   ];
-  if (write) {
+  if (write || perms.anywhere("permission.modify")) {
     columns.push({
       id: "menu",
       header: t("vms.actions"),
@@ -239,16 +247,23 @@ export function PoolsPage() {
         const used = volumeCount(pool);
         const held = backupCount(pool);
         return (
-          <Button
-            variant="ghost"
-            size="icon-sm"
-            aria-label={t("common.deleteNamed", { name: pool.name })}
-            // 볼륨이나 백업이 남은 풀은 서버가 지우지 않는다.
-            disabled={used !== 0 || held !== 0}
-            onClick={() => setDeleting(pool)}
-          >
-            <Trash2 />
-          </Button>
+          <>
+            {delegates(pool) && (
+              <PermissionsButton name={pool.name} onClick={() => setSharingPerms(pool)} />
+            )}
+            {writes(pool) && (
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={t("common.deleteNamed", { name: pool.name })}
+                // 볼륨이나 백업이 남은 풀은 서버가 지우지 않는다.
+                disabled={used !== 0 || held !== 0}
+                onClick={() => setDeleting(pool)}
+              >
+                <Trash2 />
+              </Button>
+            )}
+          </>
         );
       },
     });
@@ -282,6 +297,13 @@ export function PoolsPage() {
         keys
       />
       {creating && <CreatePoolDialog onClose={() => setCreating(false)} />}
+      {sharingPerms && (
+        <PermissionsSheet
+          target={objectTarget("storage-pool", sharingPerms)}
+          label={sharingPerms.name}
+          onClose={() => setSharingPerms(null)}
+        />
+      )}
       <ConfirmDialog
         open={sharingOpen}
         onOpenChange={setSharingOpen}
@@ -340,6 +362,7 @@ type Kind = StoragePool["spec"]["backend"]["kind"];
 
 function CreatePoolDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
+  const folder = useNewFolder("storage", "storage.config");
   const nodes = useList("node");
   const [name, setName] = useState("");
   const [kind, setKind] = useState<Kind>("dir");
@@ -480,7 +503,11 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       ...(sharedDir && { shared: true }),
       ...(backupPool && { backups: true }),
     };
-    await call(api.POST("/storage-pools", { body: { name, spec } }));
+    await call(
+      api.POST("/storage-pools", {
+        body: { name, spec: { ...spec, ...(folder.value && { folder: folder.value }) } },
+      }),
+    );
     toast.success(t("pools.created", { name }));
   }
 
@@ -492,6 +519,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
       onClose={onClose}
       onSubmit={submit}
     >
+      <FolderSelect id="pool-folder" state={folder} />
       <Field id="pool-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input id="pool-name" value={name} onChange={(e) => setName(e.target.value)} {...a11y} />

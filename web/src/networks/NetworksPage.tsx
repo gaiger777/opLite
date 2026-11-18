@@ -6,8 +6,10 @@ import { toast } from "sonner";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Network, Node } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { objectTarget } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
+import { FolderSelect, useNewFolder } from "@/folders/FolderSelect";
+import { PermissionsButton, PermissionsSheet } from "@/permissions/PermissionsSheet";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -67,13 +69,21 @@ export function bridgeNodes(network: Network, nodes: Node[]) {
 
 export function NetworksPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const networks = useList("network");
   const nodes = useList("node");
   const vms = useList("vm");
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<Network | null>(null);
-  const write = can(me.role, "write", "network");
+  // 계획 62: 네트워크마다 폴더가 다르다. 어딘가에 만들 수 있으면 만들기를, 행마다 그 네트워크의 권한으로 단추를
+  // 보인다.
+  const write = perms.anywhere("network.config");
+  const writes = (network: Network) =>
+    perms.has("network.config", objectTarget("network", network));
+  const delegates = (network: Network) =>
+    perms.has("permission.modify", objectTarget("network", network));
+  const actions = write || perms.anywhere("permission.modify");
+  const [sharingPerms, setSharingPerms] = useState<Network | null>(null);
   useCreateParam(() => setCreating(true), write);
   // VM 목록을 다 읽기 전에는 모른다(undefined).
   const users = (network: Network) =>
@@ -106,7 +116,7 @@ export function NetworksPage() {
             <TableHead>{t("networks.mtu")}</TableHead>
             <TableHead>{t("networks.nodes")}</TableHead>
             <TableHead>{t("networks.vms")}</TableHead>
-            {write && (
+            {actions && (
               <TableHead>
                 <span className="sr-only">{t("vms.actions")}</span>
               </TableHead>
@@ -115,7 +125,7 @@ export function NetworksPage() {
         </TableHeader>
         <TableBody>
           {(networks.data ?? []).length === 0 && (
-            <TableMessage colSpan={write ? 8 : 7} query={networks} empty={t("networks.empty")} />
+            <TableMessage colSpan={actions ? 8 : 7} query={networks} empty={t("networks.empty")} />
           )}
           {(networks.data ?? []).map((network) => {
             const { having, noVlan } = bridgeNodes(network, nodes.data ?? []);
@@ -149,22 +159,30 @@ export function NetworksPage() {
                 </TableCell>
                 <TableCell>
                   {used ?? "—"}
-                  {write && used !== undefined && used > 0 && (
+                  {writes(network) && used !== undefined && used > 0 && (
                     <div className="text-xs text-muted-foreground">{t("networks.inUse")}</div>
                   )}
                 </TableCell>
-                {write && (
-                  <TableCell className="text-right">
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("common.deleteNamed", { name: network.name })}
-                      // VM이 쓰는 네트워크는 서버가 지우지 않는다.
-                      disabled={used !== 0}
-                      onClick={() => setDeleting(network)}
-                    >
-                      <Trash2 />
-                    </Button>
+                {actions && (
+                  <TableCell className="text-right whitespace-nowrap">
+                    {delegates(network) && (
+                      <PermissionsButton
+                        name={network.name}
+                        onClick={() => setSharingPerms(network)}
+                      />
+                    )}
+                    {writes(network) && (
+                      <Button
+                        variant="ghost"
+                        size="icon-sm"
+                        aria-label={t("common.deleteNamed", { name: network.name })}
+                        // VM이 쓰는 네트워크는 서버가 지우지 않는다.
+                        disabled={used !== 0}
+                        onClick={() => setDeleting(network)}
+                      >
+                        <Trash2 />
+                      </Button>
+                    )}
                   </TableCell>
                 )}
               </TableRow>
@@ -173,6 +191,13 @@ export function NetworksPage() {
         </TableBody>
       </Table>
       {creating && <CreateNetworkDialog onClose={() => setCreating(false)} />}
+      {sharingPerms && (
+        <PermissionsSheet
+          target={objectTarget("network", sharingPerms)}
+          label={sharingPerms.name}
+          onClose={() => setSharingPerms(null)}
+        />
+      )}
       <ConfirmDialog
         open={deleting !== null}
         onOpenChange={(open) => !open && setDeleting(null)}
@@ -196,6 +221,7 @@ export function NetworksPage() {
 
 function CreateNetworkDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
+  const folder = useNewFolder("network", "network.config");
   const nodes = useList("node");
   const bridgesId = useId();
   const [name, setName] = useState("");
@@ -246,7 +272,11 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
       kind === "bridge"
         ? { bridge, vlan: vlan === "" ? null : Number(vlan) }
         : { vxlan: { vni: Number(vni) }, ...(mtu !== "" && { mtu: Number(mtu) }) };
-    await call(api.POST("/networks", { body: { name, spec } }));
+    await call(
+      api.POST("/networks", {
+        body: { name, spec: { ...spec, ...(folder.value && { folder: folder.value }) } },
+      }),
+    );
     toast.success(t("networks.created", { name }));
   }
 
@@ -258,6 +288,7 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
       onClose={onClose}
       onSubmit={submit}
     >
+      <FolderSelect id="network-folder" state={folder} />
       <Field id="network-name" label={t("common.name")} error={errors.name}>
         {(a11y) => (
           <Input

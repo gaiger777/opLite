@@ -17,8 +17,7 @@ import {
   type TargetForm,
 } from "@/alerts/targets";
 import { api, call } from "@/api/client";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -45,8 +44,8 @@ import { errorMessage } from "@/i18n/errors";
  */
 export function NotificationTargetsPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
-  const admin = can(me.role, "read", "notification-target");
+  const perms = usePermissions();
+  const admin = perms.can("read", "notification-target");
   const queryClient = useQueryClient();
   const targets = useNotificationTargets(admin);
   const [dialog, setDialog] = useState<{ target: NotificationTargetView | null } | null>(null);

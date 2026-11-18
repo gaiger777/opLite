@@ -3,6 +3,7 @@ import type {
   BackupJob,
   CephStatusView,
   CephView,
+  Folder,
   HaCheck,
   HaGroup,
   HotplugLayout,
@@ -740,3 +741,24 @@ export const NODE_FIELDS = [
   "fs_used",
   "fs_total",
 ];
+
+/** 테스트용 폴더(계획 62). id는 이름에서 만든다. */
+export function folder(
+  name: string,
+  kind: Folder["spec"]["kind"] = "vm",
+  parent?: string,
+  extra: Partial<Folder["spec"]> = {},
+): Folder {
+  return {
+    id: folderId(name),
+    name: folderId(name),
+    revision: 1,
+    labels: {},
+    spec: { name, kind, ...(parent && { parent: folderId(parent) }), ...extra },
+    status: {},
+  };
+}
+
+export function folderId(name: string): string {
+  return `019a0f3c-0000-7000-8009-${name.padStart(12, "0").slice(-12)}`;
+}

@@ -1,5 +1,6 @@
 // VM 일괄 동작(설계 §5.3): VM마다 할 수 있는지와 그 이유, 스냅샷 이름, 동시 요청 상한.
 import type { Node, Snapshot, Task, Vm } from "@/api/types";
+import type { Privilege } from "@/auth/permissions";
 import { availability, isBusy, isMigrating } from "@/vms/actions";
 import { migrationTargets } from "@/vms/VmMigrateDialog";
 
@@ -17,6 +18,17 @@ export const BULK_ACTIONS: readonly BulkAction[] = [
   "delete",
 ];
 
+/** 동작마다 VM에 있어야 하는 권한(계획 62 경로표) */
+export const BULK_PRIVILEGE: Record<BulkAction, Privilege> = {
+  start: "vm.power",
+  stop: "vm.power",
+  "force-stop": "vm.power",
+  reboot: "vm.power",
+  snapshot: "vm.snapshot",
+  migrate: "vm.migrate",
+  delete: "vm.delete",
+};
+
 /** 되돌릴 수 없어 고른 수를 입력해야 하는 동작(설계 §5.8) */
 export const TYPED: readonly BulkAction[] = ["delete", "force-stop"];
 
@@ -31,10 +43,15 @@ export interface BulkContext {
   snapshotVms: ReadonlySet<string>;
   /** 옮길 노드 id */
   target?: string;
+  /** 이 VM에 이 권한이 있는지(폴더·객체 grant). 없으면 모두 있는 것으로 본다. */
+  allowed?(vm: Vm, privilege: Privilege): boolean;
 }
 
 /** 이 VM에 이 동작을 할 수 없는 이유(번역 키), 할 수 있으면 null */
 export function bulkReason(vm: Vm, action: BulkAction, ctx: BulkContext): string | null {
+  if (ctx.allowed && !ctx.allowed(vm, BULK_PRIVILEGE[action])) {
+    return "vms.bulk.reason.denied";
+  }
   const vmTasks = ctx.tasks.get(vm.id) ?? [];
   if (action === "snapshot") {
     if (isMigrating(vm, vmTasks)) {

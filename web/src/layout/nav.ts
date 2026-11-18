@@ -1,7 +1,6 @@
 // 화면 구성의 한 곳(설계 §4). 사이드바·영역 탭·보기 전환·이동 경로·팔레트 이동 항목·넘기기 시험이 모두
 // 이 표를 읽는다. 사이드바에는 영역만 두고(둘째 단계 없음) 하위 화면은 영역 안 탭과 보기 전환으로 고른다.
-import type { Principal, Role } from "@/api/types";
-import { can, type Kind } from "@/auth/permissions";
+import type { Kind, Permissions } from "@/auth/permissions";
 import type { AreaId } from "@/components/icons";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 
@@ -11,8 +10,12 @@ export interface NavView {
   key: string;
 }
 
+/** 탭을 보일지 정하는 권한(`usePermissions()`) */
+export type Gate = Pick<Permissions, "has" | "reads">;
+
 /**
- * 영역 탭. `kind`가 있으면 그 종류를 읽을 수 있는 역할에만, `admin`이면 admin에게만 보인다. `match`는 이 탭에
+ * 영역 탭. `kind`가 있으면 그 종류를 읽을 수 있는 사용자에게만, `admin`이면 루트 `cluster.admin`이 있는 사용자에게만
+ * 보인다. `match`는 이 탭에
  * 속하는 경로 접두사이고 주지 않으면 `to`와 보기들의 `to`다(상세 경로 `/vms/web`은 `/vms`에 속한다).
  */
 export interface NavTab {
@@ -39,7 +42,14 @@ export const AREAS: NavArea[] = [
     key: "nav.area.vms",
     to: "/vms",
     tabs: [
-      { to: "/vms", key: "nav.vmList" },
+      {
+        to: "/vms",
+        key: "nav.vmList",
+        views: [
+          { to: "/vms", key: "nav.vmList" },
+          { to: "/vm-folders", key: "nav.vmFolders" },
+        ],
+      },
       { to: "/templates", key: "nav.templates" },
       {
         to: "/images",
@@ -60,16 +70,31 @@ export const AREAS: NavArea[] = [
       {
         to: "/nodes",
         key: "nav.nodes",
+        kind: "node",
         views: [
           { to: "/nodes", key: "nav.nodes" },
           { to: "/cluster", key: "nav.cluster" },
         ],
       },
-      { to: "/storage-pools", key: "nav.pools" },
+      {
+        to: "/storage-pools",
+        key: "nav.pools",
+        views: [
+          { to: "/storage-pools", key: "nav.pools" },
+          { to: "/storage-folders", key: "nav.storageFolders" },
+        ],
+      },
       { to: "/volumes", key: "nav.volumes" },
-      { to: "/ceph", key: "nav.ceph" },
-      { to: "/networks", key: "nav.networks" },
-      { to: "/security-groups", key: "nav.securityGroups" },
+      { to: "/ceph", key: "nav.ceph", kind: "ceph" },
+      {
+        to: "/networks",
+        key: "nav.networks",
+        views: [
+          { to: "/networks", key: "nav.networks" },
+          { to: "/network-folders", key: "nav.networkFolders" },
+        ],
+      },
+      { to: "/security-groups", key: "nav.securityGroups", kind: "security-group" },
     ],
   },
   {
@@ -78,13 +103,14 @@ export const AREAS: NavArea[] = [
     to: "/protect",
     tabs: [
       { to: "/backups", key: "nav.backups" },
-      { to: "/backup-jobs", key: "nav.backupJobs" },
+      { to: "/backup-jobs", key: "nav.backupJobs", kind: "backup-job" },
       { to: "/remotes", key: "nav.replication", kind: "remote" },
-      { to: "/ha-groups", key: "nav.haGroups" },
-      { to: "/ha-checks", key: "nav.haChecks" },
+      { to: "/ha-groups", key: "nav.haGroups", kind: "ha-group" },
+      { to: "/ha-checks", key: "nav.haChecks", kind: "ha-check" },
       {
         to: "/placement-rules",
         key: "nav.placementTab",
+        kind: "placement-rule",
         views: [
           { to: "/placement-rules", key: "nav.placementRules" },
           { to: "/placement", key: "nav.placement" },
@@ -107,14 +133,20 @@ export const AREAS: NavArea[] = [
     key: "nav.area.settings",
     to: "/settings",
     tabs: [
-      { to: "/settings", key: "nav.general" },
+      { to: "/settings", key: "nav.general", kind: "settings" },
       { to: "/settings/users", key: "nav.users", kind: "user" },
       { to: "/settings/realms", key: "nav.realms", kind: "realm" },
-      // 토큰은 누구나 자기 것을 다룬다.
+      // 계획 62: 모든 grant 표·사용자 정의 역할·그룹·2FA 정책(admin)
+      { to: "/settings/permissions", key: "nav.permissions", admin: true },
+      { to: "/settings/roles", key: "nav.roles", admin: true },
+      { to: "/settings/groups", key: "nav.groups", kind: "group" },
+      { to: "/settings/security", key: "nav.security", admin: true },
+      // 토큰과 2단계 인증은 누구나 자기 것을 다룬다.
       { to: "/settings/tokens", key: "nav.tokens" },
+      { to: "/settings/account", key: "nav.account" },
       { to: "/settings/remotes", key: "nav.remotes", admin: true },
       { to: "/settings/notifications", key: "nav.notificationTargets", admin: true },
-      { to: "/settings/subscription", key: "nav.subscription" },
+      { to: "/settings/subscription", key: "nav.subscription", kind: "settings" },
     ],
   },
 ];
@@ -131,17 +163,17 @@ export function isFullWidth(pathname: string) {
   return /^\/vms\/[^/]+\/console\/?$/.test(pathname);
 }
 
-export function tabVisible(tab: NavTab, role: Role) {
-  return (!tab.kind || can(role, "read", tab.kind)) && (!tab.admin || role === "admin");
+export function tabVisible(tab: NavTab, gate: Gate) {
+  return (!tab.kind || gate.reads(tab.kind)) && (!tab.admin || gate.has("cluster.admin"));
 }
 
-export function visibleTabs(area: NavArea, role: Role) {
-  return area.tabs.filter((tab) => tabVisible(tab, role));
+export function visibleTabs(area: NavArea, gate: Gate) {
+  return area.tabs.filter((tab) => tabVisible(tab, gate));
 }
 
 /** 보이는 탭이 하나라도 있는 영역 */
-export function visibleAreas(role: Role) {
-  return AREAS.filter((area) => visibleTabs(area, role).length > 0);
+export function visibleAreas(gate: Gate) {
+  return AREAS.filter((area) => visibleTabs(area, gate).length > 0);
 }
 
 function prefixes(tab: NavTab) {
@@ -183,22 +215,25 @@ export function areaOf(pathname: string): NavHit | null {
 const lastKey = (area: AreaId) => `nav.last.${area}`;
 
 /** 마지막 탭을 사용자별로 읽고 쓰는 데 필요한 것 */
-export type NavUser = Pick<Principal, "user" | "role">;
+export interface NavUser {
+  user: string;
+  gate: Gate;
+}
 
 /**
  * 영역에서 마지막으로 본 탭(경로와 쿼리, 사용자별 `{user}.nav.last.{area}`). 기억이 없거나, 그 영역의 탭이
  * 아니거나, 지금 권한으로 보이지 않으면 보이는 첫 탭이다. 보이는 탭이 없으면 영역 주소다.
  */
-export function lastTab(area: NavArea, { user, role }: NavUser): string {
+export function lastTab(area: NavArea, { user, gate }: NavUser): string {
   const saved = readUserPref(user, lastKey(area.id));
   if (saved) {
     const pathname = saved.split(/[?#]/)[0] ?? "";
     const hit = areaOf(pathname);
-    if (hit && hit.area.id === area.id && hit.prefix === pathname && tabVisible(hit.tab, role)) {
+    if (hit && hit.area.id === area.id && hit.prefix === pathname && tabVisible(hit.tab, gate)) {
       return saved;
     }
   }
-  return visibleTabs(area, role)[0]?.to ?? area.to;
+  return visibleTabs(area, gate)[0]?.to ?? area.to;
 }
 
 /** 지금 화면을 그 영역의 마지막 탭으로 기억한다. 상세 경로는 그 탭의 목록을 기억한다. */
@@ -218,9 +253,15 @@ export interface Crumb {
 }
 
 /**
- * 이동 경로 `영역 › 탭(보기) › 리소스`. 리소스 이름은 탭 목록 주소 뒤 첫 경로 조각이다. `t`는 i18n 함수다.
+ * 이동 경로 `영역 › 탭(보기) › 리소스`. 리소스 이름은 탭 목록 주소 뒤 첫 경로 조각이다(`label`이 주면 그것으로
+ * 바꾼다: 폴더 id → 폴더 이름). `t`는 i18n 함수다.
  */
-export function crumbsOf(pathname: string, me: NavUser, t: (key: string) => string): Crumb[] {
+export function crumbsOf(
+  pathname: string,
+  me: NavUser,
+  t: (key: string) => string,
+  label?: (prefix: string, segment: string) => string | undefined,
+): Crumb[] {
   const hit = areaOf(pathname);
   if (!hit) {
     return [];
@@ -241,5 +282,9 @@ export function crumbsOf(pathname: string, me: NavUser, t: (key: string) => stri
   } catch {
     resource = rest;
   }
-  return [area, { label: tabLabel, to: hit.prefix }, { label: resource }];
+  return [
+    area,
+    { label: tabLabel, to: hit.prefix },
+    { label: label?.(hit.prefix, resource) ?? resource },
+  ];
 }

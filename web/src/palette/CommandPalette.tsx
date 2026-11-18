@@ -8,7 +8,8 @@ import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, Vm } from "@/api/types";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { objectTarget, type Privilege } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { ACTION_ICONS } from "@/components/icons";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Kbd } from "@/components/ui/kbd";
@@ -68,6 +69,17 @@ const VM_VERBS: readonly Verb[] = [
   "snapshot",
   "console",
 ];
+
+/** 동작마다 VM에 있어야 하는 권한(서버 경로표와 같다). 열기는 보이는 VM이면 된다. */
+const VERB_PRIVILEGE: Partial<Record<Verb, Privilege>> = {
+  start: "vm.power",
+  stop: "vm.power",
+  reboot: "vm.power",
+  "force-stop": "vm.power",
+  migrate: "vm.migrate",
+  snapshot: "vm.snapshot",
+  console: "vm.console",
+};
 
 /** 노드 API 주소(`host:port`, `[v6]:port`)의 호스트 */
 function hostOf(address: string): string {
@@ -347,7 +359,9 @@ function usePaletteItems(
   const ha = useList("ha-group");
 
   const go = (to: string) => () => void navigate(to);
-  const operate = can(me.role, "operate", "vm");
+  const perms = usePermissions();
+  // VM마다 권한이 다르다(폴더·객체 grant). 어디서든 동작 권한이 하나라도 있어야 동작 항목을 찾는다.
+  const operate = (Object.values(VERB_PRIVILEGE) as Privilege[]).some((p) => perms.anywhere(p));
 
   const resources = useMemo(() => {
     const guest = new Map<string, string[]>();
@@ -423,7 +437,7 @@ function usePaletteItems(
   const navigation = useMemo(() => {
     const list: Omit<Item, "run">[] = [];
     for (const area of AREAS) {
-      for (const tab of visibleTabs(area, me.role)) {
+      for (const tab of visibleTabs(area, perms)) {
         const leaves = tab.views ?? [{ to: tab.to, key: tab.key }];
         for (const leaf of leaves) {
           const label = area.id === "home" ? t(area.key) : `${t(area.key)} › ${t(leaf.key)}`;
@@ -432,7 +446,7 @@ function usePaletteItems(
       }
     }
     return list;
-  }, [t, me.role]);
+  }, [t, perms]);
 
   // 지운 리소스는 빼고 이름은 지금 이름으로
   const lists = {
@@ -494,12 +508,23 @@ function usePaletteItems(
     const all = vms.data ?? [];
     if (command) {
       const target = command.target.toLowerCase();
-      return byPrefix(all, command.target)
+      return byPrefix(
+        all.filter((vm) => allowed(vm, command.verb)),
+        command.target,
+      )
         .slice(0, 8)
         .map((vm) => actionItem(vm, command.verb, vm.name.toLowerCase() === target, command.node));
     }
     const exact = all.find((vm) => vm.name.toLowerCase() === text.toLowerCase());
-    return exact ? VM_VERBS.map((verb) => actionItem(exact, verb, true)) : [];
+    return exact
+      ? VM_VERBS.filter((verb) => allowed(exact, verb)).map((verb) => actionItem(exact, verb, true))
+      : [];
+  }
+
+  /** 이 VM에 이 동작의 권한이 있다(없는 동작은 항목을 보이지 않는다) */
+  function allowed(vm: Vm, verb: Verb): boolean {
+    const privilege = VERB_PRIVILEGE[verb];
+    return !privilege || perms.has(privilege, objectTarget("vm", vm));
   }
 
   /**
@@ -552,7 +577,7 @@ function usePaletteItems(
   }
 
   function commands(): Item[] {
-    const list: Item[] = createItems(me.role).map((item) => ({
+    const list: Item[] = createItems(perms).map((item) => ({
       id: `create:${item.id}`,
       group: "commands",
       label: t("palette.create", { what: t(`create.${item.id}`) }),

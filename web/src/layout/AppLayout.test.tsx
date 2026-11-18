@@ -73,8 +73,11 @@ it("shows the tabs of the current area as links", async () => {
     "/nodes",
   );
   expect(within(crumbs).getByText("Storage pools")).toHaveAttribute("aria-current", "page");
-  // 보기가 없는 탭에는 보기 전환이 없다.
-  expect(screen.queryByRole("navigation", { name: /views$/ })).not.toBeInTheDocument();
+  // 풀 탭은 목록 | 폴더 보기 전환이 있다(계획 62).
+  expect(links(screen.getByRole("navigation", { name: "Storage pools views" }))).toEqual([
+    ["Storage pools", "/storage-pools"],
+    ["Storage folders", "/storage-folders"],
+  ]);
 });
 
 it("switches views inside a tab", async () => {
@@ -115,6 +118,7 @@ it("hides account and admin settings tabs from operators", async () => {
   expect(links(tabs)).toEqual([
     ["General", "/settings"],
     ["API tokens", "/settings/tokens"],
+    ["Two-step verification", "/settings/account"],
     ["Subscription", "/settings/subscription"],
   ]);
 });
@@ -126,7 +130,12 @@ it("shows every settings tab to admins", async () => {
     "General",
     "Users",
     "Realms",
+    "Permissions",
+    "Roles",
+    "Groups",
+    "Security",
     "API tokens",
+    "Two-step verification",
     "Remote clusters",
     "Notification targets",
     "Subscription",

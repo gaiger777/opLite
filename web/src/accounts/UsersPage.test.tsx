@@ -243,3 +243,32 @@ it("shows the realm of each user and no password reset for external users", asyn
   await userEvent.click(within(kim).getByRole("button", { name: "Actions for kim" }));
   expect(await screen.findByRole("menuitem", { name: "Reset password" })).toBeInTheDocument();
 });
+
+it("shows two-step verification and resets it for others but not for yourself", async () => {
+  users([
+    { ...ME, two_factor: true },
+    { ...KIM, two_factor: true },
+  ]);
+  const resets: string[] = [];
+  server.use(
+    http.delete(apiUrl("/users/:key/two-factor"), ({ params }) => {
+      resets.push(String(params.key));
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<UsersPage />);
+  const kim = (await screen.findByRole("cell", { name: "kim" })).closest("tr")!;
+  expect(within(kim).getByRole("cell", { name: "On" })).toBeInTheDocument();
+  await user.click(within(kim).getByRole("button", { name: "Actions for kim" }));
+  await user.click(screen.getByRole("menuitem", { name: "Reset two-step verification" }));
+  const confirm = screen.getByRole("alertdialog");
+  await user.click(within(confirm).getByRole("button", { name: "Reset two-step verification" }));
+  await waitFor(() => expect(resets).toEqual([KIM.id]));
+
+  const me = screen.getByRole("cell", { name: /^admin/ }).closest("tr")!;
+  await user.click(within(me).getByRole("button", { name: "Actions for admin" }));
+  expect(
+    screen.queryByRole("menuitem", { name: "Reset two-step verification" }),
+  ).not.toBeInTheDocument();
+});

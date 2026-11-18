@@ -1,4 +1,5 @@
-import type { Task } from "@/api/types";
+import type { Role, Task } from "@/api/types";
+import { Permissions } from "@/auth/permissions";
 import { latestTasks, type RetryContext, retryOf } from "@/tasks/retry";
 import { backup, backupJob, task, vm } from "@/test/fixtures";
 
@@ -9,7 +10,7 @@ const bk = backup("db-1", off, 1, { spec: { job: job.id } });
 
 function ctx(extra: Partial<RetryContext> = {}): RetryContext {
   return {
-    role: "operator",
+    perms: Permissions.fromRole("operator"),
     vm: new Map([
       [off.id, off],
       [on.id, on],
@@ -48,7 +49,9 @@ it("retries failed power operations of a VM that still exists", () => {
     retryOf({ ...failed("vm-start", off.id), status: { state: "running", error: null } }, ctx()),
   ).toBeNull();
   expect(retryOf(failed("vm-start", "gone"), ctx())).toBeNull();
-  expect(retryOf(failed("vm-start", off.id), ctx({ role: "viewer" }))).toBeNull();
+  expect(
+    retryOf(failed("vm-start", off.id), ctx({ perms: Permissions.fromRole("viewer" as Role) })),
+  ).toBeNull();
 });
 
 it("does not retry operations that need parameters", () => {
@@ -87,7 +90,10 @@ it("runs the backup job of a failed backup again", () => {
     ),
   ).toBeNull();
   expect(
-    retryOf(failed("vm-backup", off.id, { backup: bk.id }), ctx({ role: "viewer" })),
+    retryOf(
+      failed("vm-backup", off.id, { backup: bk.id }),
+      ctx({ perms: Permissions.fromRole("viewer" as Role) }),
+    ),
   ).toBeNull();
 });
 

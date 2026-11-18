@@ -8,8 +8,7 @@ import { listKey, useList, type List } from "@/api/live";
 import { optimistic, putResource } from "@/api/optimistic";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { parseLabels } from "@/backups/jobs";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
@@ -59,14 +58,14 @@ type NodeDialog =
  */
 export function useNodeActions({ onRemoved }: { onRemoved?(node: Node): void } = {}) {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const vms = useList("vm");
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const tasks = useTaskIndex();
   const [open, setOpen] = useState<{ dialog: NodeDialog; node: Node } | null>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
-  const write = can(me.role, "write", "node");
+  const write = perms.can("write", "node");
   const close = () => setOpen(null);
   const show = (dialog: NodeDialog, node: Node) => setOpen({ dialog, node });
   const node = open?.node;

@@ -7,8 +7,7 @@ import { toast } from "sonner";
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { SecurityGroup } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
 import { ResourceHeader } from "@/components/ResourceHeader";
@@ -56,8 +55,8 @@ export function SecurityGroupPage() {
 
 function RulesEditor({ group }: { group: SecurityGroup }) {
   const { t } = useTranslation();
-  const me = usePrincipal();
-  const write = can(me.role, "write", "security-group");
+  const perms = usePermissions();
+  const write = perms.can("write", "security-group");
   const vms = useList("vm");
   useVisit({ kind: "security-group", id: group.id, name: group.name });
   const [description, setDescription] = useState(group.spec.description ?? "");

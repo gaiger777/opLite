@@ -6,8 +6,7 @@ import { Link } from "react-router";
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Snapshot, Vm } from "@/api/types";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -44,7 +43,7 @@ import {
 /** VM 상세의 스냅샷 탭: 나무 목록과 만들기·되돌리기·삭제 */
 export function VmSnapshots({ vm }: { vm: Vm }) {
   const { t, i18n } = useTranslation();
-  const me = usePrincipal();
+  const can = useVmCan(vm);
   const snapshots = useList("snapshot");
   const volumes = useList("volume");
   const pools = useList("storage-pool");
@@ -58,7 +57,8 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
   // 트리거 없이 연 대화상자는 닫힐 때 포커스를 돌려줄 곳을 모르므로 연 버튼을 기억한다.
   const opener = useRef<HTMLElement | null>(null);
   const reasonBase = useId();
-  const operate = can(me.role, "operate", "vm");
+  // 만들기·되돌리기·지우기는 그 VM의 스냅샷 권한이다.
+  const operate = can("vm.snapshot");
   const mine = (snapshots.data ?? []).filter((s) => s.spec.vm === vm.id);
   const rows = snapshotTree(mine);
   const names = new Map(mine.map((s) => [s.id, s.spec.name]));
@@ -159,7 +159,7 @@ export function VmSnapshots({ vm }: { vm: Vm }) {
               : t("snapshots.noSchedule")}
           </p>
           {/* 예약은 VM 설정이라 VM 편집에서 바꾼다. */}
-          {can(me.role, "write", "vm") && (
+          {can("vm.config") && (
             <Link
               to={`/vms/${encodeURIComponent(vm.name)}/edit`}
               className="underline-offset-4 hover:underline"

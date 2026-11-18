@@ -7,8 +7,7 @@ import { useTranslation } from "react-i18next";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
-import { usePrincipal } from "@/auth/AuthProvider";
-import { can } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { CopyButton } from "@/components/CopyButton";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
@@ -50,7 +49,7 @@ export function joinCommand(url: string): string {
 
 export function ClusterPage() {
   const { t } = useTranslation();
-  const me = usePrincipal();
+  const perms = usePermissions();
   // 멤버·리더·온라인은 감시할 수 없으므로 이 화면에서만 주기적으로 다시 읽는다.
   const cluster = useQuery({
     queryKey: ["cluster"],
@@ -71,7 +70,7 @@ export function ClusterPage() {
       <PageHeader
         title={t("cluster.title", { name })}
         actions={
-          can(me.role, "write", "join-token") && (
+          perms.can("write", "join-token") && (
             <Button ref={opener} onClick={() => setIssuing(true)}>
               <Plus />
               {t("cluster.issue")}

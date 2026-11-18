@@ -102,7 +102,10 @@ export interface VmFormValues {
   /** 실행 중 늘릴 수 있는 메모리 상한(MiB, `max_memory_mib`). 비면 없음 */
   maxMemory: string;
   firmware: Schemas["Firmware"];
-  machine: Schemas["MachineType"];
+  /** 빈 문자열이면 서버가 클러스터 아키텍처의 기본값을 고른다(노드 목록을 못 읽는 폴더 사용자, 계획 62). */
+  machine: Schemas["MachineType"] | "";
+  /** VM 폴더 id. 빈 문자열이면 루트다(계획 62). 고칠 때는 바꾸지 않는다(옮기기는 폴더 보기). */
+  folder: string;
   disks: DiskRow[];
   cdroms: CdromRow[];
   nics: NicRow[];
@@ -173,7 +176,7 @@ export function emptyDisk(vmName: string, index: number): DiskRow {
   };
 }
 
-export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
+export function emptyForm(machine: VmFormValues["machine"], folder = ""): VmFormValues {
   return {
     name: "",
     sockets: 1,
@@ -184,6 +187,7 @@ export function emptyForm(machine: Schemas["MachineType"]): VmFormValues {
     maxMemory: "",
     firmware: "uefi",
     machine,
+    folder,
     disks: [],
     cdroms: [],
     nics: [{ network: "user", model: "virtio", mac: "", securityGroups: [] }],
@@ -213,6 +217,7 @@ export function fromVm(vm: Vm): VmFormValues {
     maxMemory: s.max_memory_mib == null ? "" : String(s.max_memory_mib),
     firmware: s.firmware ?? "uefi",
     machine: s.machine,
+    folder: s.folder ?? "",
     disks: (s.disks ?? []).map((d) => ({
       kind: "existing",
       volume: d.volume,
@@ -565,6 +570,7 @@ function maxErrors(v: VmFormValues): Record<string, string> {
 
 /** 폼 값을 VM spec으로. `power`는 만들 때만 정하고, 고칠 때는 지금 값을 그대로 둔다. */
 export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
+  // `machine`을 빼면 서버가 채운다(스키마는 늘 있는 값으로 적는다).
   return {
     cpu: {
       sockets: v.sockets,
@@ -576,7 +582,9 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
     memory_mib: Number(v.memory),
     ...(v.maxMemory !== "" && { max_memory_mib: Number(v.maxMemory) }),
     firmware: v.firmware,
-    machine: v.machine,
+    // 비면 보내지 않는다(서버가 고른다).
+    ...(v.machine !== "" && { machine: v.machine }),
+    ...(v.folder !== "" && { folder: v.folder }),
     disks: v.disks.map((d) => ({
       volume: d.volume,
       bus: d.bus,
@@ -638,7 +646,7 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
     }),
     // 고정하지 않으면 보내지 않는다(서버도 `pinned: false`를 저장하지 않고, 옛 클러스터는 이 필드를 모른다).
     ...(v.pinned && { placement: { pinned: true } }),
-  };
+  } as VmSpec;
 }
 
 /** 서버의 `ha_capable`: 위트니스가 아니고 펜싱이 켜진 노드. HA VM은 이런 노드에서만 돈다. */
