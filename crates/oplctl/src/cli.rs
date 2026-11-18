@@ -10,6 +10,10 @@ use opl_types::replication::{DEFAULT_INTERVAL, parse_interval};
 use reqwest::Method;
 use serde_json::{Value, json};
 
+use crate::access::{
+    FolderCmd, FolderFilter, GrantCmd, GroupCmd, PermCmd, RoleCmd, folder, grant, group, perm,
+    resolve_folder, role, scope_cell, token_scope,
+};
 use crate::alerts::{AlertCmd, NotifyCmd, alert, notify};
 use crate::ceph::{CephCmd, ceph, node_disks};
 use crate::client::{
@@ -32,6 +36,7 @@ use crate::template::{
     ImageCmd, TemplateCmd, VOLUME_HEADERS, image, linked_value, template, template_lines,
     volume_flatten, volume_row,
 };
+use crate::two_factor::{TwoFactorCmd, ask_terminal, second_step, two_factor};
 
 #[derive(Parser)]
 #[command(
@@ -167,6 +172,37 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TokenCmd,
     },
+    /// 인벤토리 폴더(VM·네트워크·스토리지 풀 트리), 리소스 옮기기, 할당량과 사용량
+    Folder {
+        #[command(subcommand)]
+        cmd: FolderCmd,
+    },
+    /// 역할: 내장(admin·operator·viewer)과 권한 목록으로 만든 사용자 정의 역할
+    Role {
+        #[command(subcommand)]
+        cmd: RoleCmd,
+    },
+    /// 로컬 그룹: 멤버와 연결한 외부 그룹(LDAP·OIDC). grant의 주체가 된다.
+    Group {
+        #[command(subcommand)]
+        cmd: GroupCmd,
+    },
+    /// 권한 주기: (사용자·그룹, 역할, 루트·폴더·객체). 하위로 내려간다(propagate).
+    Grant {
+        #[command(subcommand)]
+        cmd: GrantCmd,
+    },
+    /// 유효 권한: 내 것, 사용자의 대상 권한과 근거, 대상에 닿는 사람
+    Perm {
+        #[command(subcommand)]
+        cmd: PermCmd,
+    },
+    /// 내 2단계 인증(TOTP·복구 코드). 패스키는 웹에서 등록한다.
+    #[command(name = "2fa")]
+    TwoFactor {
+        #[command(subcommand)]
+        cmd: TwoFactorCmd,
+    },
     /// 인증 영역(admin만): 바깥 LDAP 디렉터리나 OIDC IdP로 로그인하게 한다.
     Realm {
         #[command(subcommand)]
@@ -222,6 +258,9 @@ struct LoginArgs {
     /// 비밀번호가 든 파일. 없으면 터미널에서 묻는다.
     #[arg(long, conflicts_with = "token_file")]
     password_file: Option<PathBuf>,
+    /// 2단계 인증 코드(인증 앱의 코드나 복구 코드). 없으면 필요할 때 터미널에서 묻는다.
+    #[arg(long, conflicts_with = "token_file")]
+    code: Option<String>,
     /// 웹 UI에서 만든 API 토큰이 든 파일(`-`면 표준 입력). 비밀번호 대신 이 토큰을 확인해 저장한다
     /// (SSO(OIDC) 사용자).
     #[arg(long)]
@@ -882,7 +921,7 @@ async fn node_updates(
 
 #[derive(Subcommand)]
 enum PoolCmd {
-    List,
+    List(FolderFilter),
     Get {
         pool: String,
     },
@@ -993,6 +1032,9 @@ struct PoolCreate {
     /// VM 백업을 담는 풀로 표시한다. 디렉터리·NFS 풀만 된다.
     #[arg(long, conflicts_with_all = ["lvm_thin", "zfs", "rbd", "lvm_shared"])]
     backups: bool,
+    /// 넣을 폴더(경로 `/teamA/prod`나 id). 없으면 트리의 맨 위다(루트에 만들 권한이 없으면 400 `folder_required`).
+    #[arg(long)]
+    folder: Option<String>,
 }
 
 /// `pool create`의 요청 본문. NFS·RBD·공유 LVM 풀의 `shared`는 적지 않는다(서버가 늘 공유로 둔다).
@@ -1013,6 +1055,7 @@ fn pool_create_body(args: PoolCreate) -> Value {
         shared,
         nodes,
         backups,
+        folder: _,
     } = args;
     let backend = match (nfs, lvm_thin, zfs, rbd, lvm_shared) {
         (Some(n), _, _, _, _) => json!({
@@ -1118,7 +1161,7 @@ fn parse_rbd(s: &str) -> Result<RbdSource, String> {
 
 #[derive(Subcommand)]
 enum NetworkCmd {
-    List,
+    List(FolderFilter),
     Get {
         network: String,
     },
@@ -1145,6 +1188,9 @@ struct NetworkCreate {
     /// VXLAN 네트워크의 MTU(1280-9000, 기본 1450)
     #[arg(long, conflicts_with = "bridge")]
     mtu: Option<u16>,
+    /// 넣을 폴더(경로 `/teamA/prod`나 id). 없으면 트리의 맨 위다(루트에 만들 권한이 없으면 400 `folder_required`).
+    #[arg(long)]
+    folder: Option<String>,
 }
 
 /// `network create`의 요청 본문(`POST /networks`). 주지 않은 값은 보내지 않는다.
@@ -1518,7 +1564,7 @@ impl HaPolicy {
 
 #[derive(Subcommand)]
 enum VmCmd {
-    List,
+    List(FolderFilter),
     Get {
         vm: String,
     },
@@ -1694,6 +1740,9 @@ struct VmCreate {
     nics: Vec<NicArg>,
     #[arg(long, value_enum, default_value = "never")]
     restart: Restart,
+    /// 넣을 폴더(경로 `/teamA/prod`나 id). 없으면 트리의 맨 위다(루트에 만들 권한이 없으면 400 `folder_required`).
+    #[arg(long)]
+    folder: Option<String>,
     /// 노드 이름이나 id. 생략하면 시작할 때 스케줄러가 고른다.
     #[arg(long)]
     node: Option<String>,
@@ -3451,6 +3500,10 @@ const SETTING_KEYS: &[&str] = &[
     "shutdown_policy",
     "ha_reserve",
     "ha_start_concurrency",
+    "two_factor",
+    "two_factor.roles",
+    "two_factor.realms",
+    "two_factor.rp_id",
 ];
 
 /// `ha_reserve` 값: `none`, `nodes:N`, `percent:P`. 범위는 API가 본다.
@@ -3469,9 +3522,17 @@ fn ha_reserve_value(v: &str) -> anyhow::Result<Value> {
     }
 }
 
-/// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다.
-fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
+/// `settings set`의 요청 본문(`PATCH /settings`). 준 키만 보낸다. 2단계 인증 정책은 통째로 바꾸므로
+/// `two_factor.*`는 지금 정책(`current_two_factor`, 없으면 null)에 준 칸을 덮어 보낸다.
+fn settings_set_body(values: &[String], current_two_factor: &Value) -> anyhow::Result<Value> {
     let mut body = json!({});
+    let list = |v: &str| -> Vec<String> {
+        v.split(',')
+            .map(str::trim)
+            .filter(|o| !o.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
     for value in values {
         let Some((key, v)) = value.split_once('=') else {
             bail!("expected KEY=VALUE, got {value:?}");
@@ -3500,6 +3561,29 @@ fn settings_set_body(values: &[String]) -> anyhow::Result<Value> {
                     anyhow::anyhow!("ha_start_concurrency must be a number 1-32 (got {v:?})")
                 })?;
                 body["ha_start_concurrency"] = json!(n);
+            }
+            "two_factor" => match v.trim() {
+                "off" => body["two_factor"] = json!({}),
+                _ => bail!(
+                    "two_factor=off clears the policy; set two_factor.roles, two_factor.realms or two_factor.rp_id"
+                ),
+            },
+            "two_factor.roles" | "two_factor.realms" | "two_factor.rp_id" => {
+                if !body["two_factor"].is_object() {
+                    body["two_factor"] = match current_two_factor {
+                        Value::Object(_) => current_two_factor.clone(),
+                        _ => json!({}),
+                    };
+                }
+                let field = &key["two_factor.".len()..];
+                body["two_factor"][field] = match field {
+                    "rp_id" if v.trim().is_empty() => Value::Null,
+                    "rp_id" => json!(v.trim()),
+                    _ => json!(list(v)),
+                };
+                if let Some(policy) = body["two_factor"].as_object_mut() {
+                    policy.retain(|_, v| !v.is_null());
+                }
             }
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
@@ -3544,8 +3628,13 @@ async fn settings(
             }
         }
         SettingsCmd::Set { values } => {
+            let current = if values.iter().any(|v| v.starts_with("two_factor.")) {
+                client.get("/settings").await?["spec"]["two_factor"].clone()
+            } else {
+                Value::Null
+            };
             client
-                .patch("/settings", &settings_set_body(&values)?)
+                .patch("/settings", &settings_set_body(&values, &current)?)
                 .await?;
             writeln!(out, "settings updated")?;
         }
@@ -4761,6 +4850,8 @@ enum Role {
     Admin,
     Operator,
     Viewer,
+    /// 전역 역할 없음: 권한은 grant로만 받는다(계획 62).
+    None,
 }
 
 #[derive(Subcommand)]
@@ -4785,6 +4876,11 @@ enum UserCmd {
     Delete {
         name: String,
     },
+    /// 사용자의 2단계 인증 요소를 모두 지우고 세션을 끝낸다(admin, 자기 자신은 안 된다). API 토큰은 남는다.
+    #[command(name = "2fa-reset")]
+    TwoFactorReset {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -4793,6 +4889,11 @@ enum TokenCmd {
     /// 새 토큰을 만들어 출력한다. 다시 볼 수 없다.
     Create {
         name: String,
+        /// 권한 범위 `PRIVILEGES@TARGET`(예: `vm.power,vm.console@/teamA`). 토큰의 권한은 내 권한과 이 범위의
+        /// 교집합이다. 대상을 여럿 주려면 같은 권한으로 여러 번 준다. 대상은 `root`, 폴더(`/teamA`, `network:/lan`),
+        /// `vm/NAME`, `network/NAME`, `storage-pool/NAME`.
+        #[arg(long, value_name = "PRIVILEGES@TARGET")]
+        scope: Vec<String>,
     },
     Delete {
         token: String,
@@ -4975,8 +5076,9 @@ fn parse_group_role(s: &str) -> Result<(String, Role), String> {
     let (group, role) = s
         .rsplit_once('=')
         .ok_or_else(|| format!("invalid group {s:?}: use <group DN>=<role>"))?;
-    let role = Role::from_str(role, true)
-        .map_err(|_| format!("invalid role {role:?} in {s:?}: use admin, operator or viewer"))?;
+    let role = Role::from_str(role, true).map_err(|_| {
+        format!("invalid role {role:?} in {s:?}: use admin, operator, viewer or none")
+    })?;
     if group.trim().is_empty() {
         return Err(format!("invalid group {s:?}: use <group DN>=<role>"));
     }
@@ -5619,7 +5721,11 @@ where
         };
         let (token, name) = match &args.token_file {
             Some(file) => token_login(&server, file, ca_pem.clone()).await?,
-            None => login(&server, args, ca_pem.clone()).await?,
+            None => {
+                let mut ask = ask_terminal;
+                let err = &mut std::io::stderr();
+                login(&server, args, ca_pem.clone(), &mut ask, err).await?
+            }
         };
         let previous = config.token.take().zip(config.server.take());
         config.server = Some(server.clone());
@@ -5730,8 +5836,9 @@ where
             NodeCmd::Disks { node } => node_disks(&client, &node, json_out, out).await?,
         },
         Cmd::Pool { cmd } => match cmd {
-            PoolCmd::List => {
+            PoolCmd::List(filter) => {
                 let list = client.get("/storage-pools").await?;
+                let list = filter.apply(&client, "storage", list).await?;
                 let nodes = if json_out {
                     Vec::new()
                 } else {
@@ -5753,9 +5860,15 @@ where
             }
             PoolCmd::Create(args) => {
                 let name = args.name.clone();
-                client
-                    .post("/storage-pools", &pool_create_body(*args))
-                    .await?;
+                let folder = match &args.folder {
+                    Some(f) => resolve_folder(&client, "storage", f).await?,
+                    None => None,
+                };
+                let mut body = pool_create_body(*args);
+                if let Some(id) = folder {
+                    body["spec"]["folder"] = json!(id);
+                }
+                client.post("/storage-pools", &body).await?;
                 writeln!(out, "storage pool {name} created")?;
             }
             PoolCmd::Set(set) => {
@@ -5780,8 +5893,9 @@ where
         },
         Cmd::Ceph { cmd } => ceph(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Network { cmd } => match cmd {
-            NetworkCmd::List => {
+            NetworkCmd::List(filter) => {
                 let list = client.get("/networks").await?;
+                let list = filter.apply(&client, "network", list).await?;
                 print_list(out, json_out, &list, NETWORK_HEADERS, network_row)?;
             }
             NetworkCmd::Get { network } => print_json(
@@ -5789,7 +5903,13 @@ where
                 &client.get(&format!("/networks/{}", seg(&network))).await?,
             )?,
             NetworkCmd::Create(c) => {
-                client.post("/networks", &network_create_body(&c)).await?;
+                let mut body = network_create_body(&c);
+                if let Some(f) = &c.folder
+                    && let Some(id) = resolve_folder(&client, "network", f).await?
+                {
+                    body["spec"]["folder"] = json!(id);
+                }
+                client.post("/networks", &body).await?;
                 writeln!(out, "network {} created", c.name)?;
             }
             NetworkCmd::Delete { network } => {
@@ -5922,8 +6042,9 @@ where
         Cmd::User { cmd } => match cmd {
             UserCmd::List => {
                 let list = client.get("/users").await?;
-                print_list(out, json_out, &list, &["NAME", "ROLE"], |u| {
-                    vec![cell(&u["name"]), cell(&u["role"])]
+                print_list(out, json_out, &list, &["NAME", "ROLE", "2FA"], |u| {
+                    let on = if u["two_factor"] == true { "on" } else { "-" };
+                    vec![cell(&u["name"]), cell(&u["role"]), on.into()]
                 })?;
             }
             UserCmd::Create {
@@ -5959,16 +6080,37 @@ where
                 client.delete(&format!("/users/{}", seg(&name))).await?;
                 writeln!(out, "user {name} deleted")?;
             }
+            UserCmd::TwoFactorReset { name } => {
+                client
+                    .delete(&format!("/users/{}/two-factor", seg(&name)))
+                    .await?;
+                writeln!(out, "two-factor authentication of {name} reset")?;
+            }
         },
         Cmd::Token { cmd } => match cmd {
             TokenCmd::List => {
                 let list = client.get("/tokens").await?;
-                print_list(out, json_out, &list, &["NAME", "ID", "USER"], |t| {
-                    vec![cell(&t["name"]), cell(&t["id"]), cell(&t["user"])]
-                })?;
+                print_list(
+                    out,
+                    json_out,
+                    &list,
+                    &["NAME", "ID", "USER", "SCOPE"],
+                    |t| {
+                        vec![
+                            cell(&t["name"]),
+                            cell(&t["id"]),
+                            cell(&t["user"]),
+                            scope_cell(&t["scope"]),
+                        ]
+                    },
+                )?;
             }
-            TokenCmd::Create { name } => {
-                let created = client.post("/tokens", &json!({ "name": name })).await?;
+            TokenCmd::Create { name, scope } => {
+                let mut body = json!({ "name": name });
+                if let Some(scope) = token_scope(&client, &scope).await? {
+                    body["scope"] = scope;
+                }
+                let created = client.post("/tokens", &body).await?;
                 writeln!(out, "{}", cell(&created["secret"]))?;
             }
             TokenCmd::Delete { token } => {
@@ -5976,6 +6118,15 @@ where
                 writeln!(out, "token {token} deleted")?;
             }
         },
+        Cmd::Folder { cmd } => folder(&client, cmd, json_out, out).await?,
+        Cmd::Role { cmd } => role(&client, cmd, json_out, out).await?,
+        Cmd::Group { cmd } => group(&client, cmd, json_out, out).await?,
+        Cmd::Grant { cmd } => grant(&client, cmd, json_out, out).await?,
+        Cmd::Perm { cmd } => perm(&client, cmd, json_out, out).await?,
+        Cmd::TwoFactor { cmd } => {
+            let mut ask = ask_terminal;
+            two_factor(&client, cmd, json_out, out, &mut ask).await?
+        }
         Cmd::Realm { cmd } => realm(&client, cmd, json_out, out).await?,
         Cmd::Settings { cmd } => settings(&client, cmd, json_out, out).await?,
         Cmd::Placement { cmd } => placement(&client, cmd, json_out, out).await?,
@@ -7608,8 +7759,9 @@ async fn vm(
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
     match cmd {
-        VmCmd::List => {
+        VmCmd::List(filter) => {
             let list = client.get("/vms").await?;
+            let list = filter.apply(client, "vm", list).await?;
             print_list(out, json_out, &list, VM_HEADERS, vm_row)?;
         }
         VmCmd::Get { vm } => vm_get(client, &vm, json_out, out, &mut std::io::stderr()).await?,
@@ -7630,7 +7782,15 @@ async fn vm(
                 Some(m) => m,
                 None if windows => Machine::Q35,
                 None => {
-                    let list = client.get("/nodes").await?;
+                    // 폴더 권한만 있는 사용자는 노드 목록(루트 `cluster.read`)을 읽지 못한다.
+                    let list = client.get("/nodes").await.map_err(|e| {
+                        match e.downcast_ref::<ApiError>() {
+                            Some(a) if a.code == "forbidden" => anyhow::anyhow!(
+                                "cannot read the nodes to choose a machine type; pass --machine virt or --machine q35"
+                            ),
+                            _ => e,
+                        }
+                    })?;
                     let nodes = list["items"].as_array().cloned().unwrap_or_default();
                     default_machine(node.as_ref(), &nodes)?
                 }
@@ -7680,6 +7840,11 @@ async fn vm(
             });
             if args.pinned {
                 body["spec"]["placement"] = json!({ "pinned": true });
+            }
+            if let Some(f) = &args.folder
+                && let Some(id) = resolve_folder(client, "vm", f).await?
+            {
+                body["spec"]["folder"] = json!(id);
             }
             if let Some(n) = args.max_vcpus {
                 body["spec"]["cpu"]["max_vcpus"] = json!(n);
@@ -8887,6 +9052,8 @@ async fn login(
     server: &str,
     args: &LoginArgs,
     ca_pem: Option<String>,
+    ask: crate::two_factor::Ask<'_>,
+    err: &mut (dyn Write + Send),
 ) -> anyhow::Result<(String, String)> {
     let anon = Client::new(server, None, ca_pem)?;
     if args.realm != opl_types::realm::LOCAL_REALM {
@@ -8916,6 +9083,18 @@ async fn login(
         .context("server did not return a session")?
         .to_string();
     let user: Value = resp.json().await.unwrap_or_default();
+    // 2단계 인증: 쿠키는 대기 세션이고, 둘째 단계를 마치면 같은 쿠키가 정식 세션이 된다.
+    if user["second_factor"].is_object() {
+        second_step(
+            &anon,
+            &cookie,
+            &user["second_factor"],
+            args.code.as_deref(),
+            ask,
+            err,
+        )
+        .await?;
+    }
     let user = user["name"].as_str().unwrap_or(&args.user).to_string();
     let name = format!(
         "{LOGIN_TOKEN_PREFIX}{}",
@@ -15068,42 +15247,52 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
     #[test]
     fn settings_set_body_maps_known_keys() {
         assert_eq!(
-            settings_set_body(&["updates.channel=testing".into()]).unwrap(),
+            settings_set_body(&["updates.channel=testing".into()], &Value::Null).unwrap(),
             json!({ "updates": { "channel": "testing" } })
         );
         assert_eq!(
-            settings_set_body(&["web_origins=https://a.example, https://b.example".into()])
-                .unwrap(),
+            settings_set_body(
+                &["web_origins=https://a.example, https://b.example".into()],
+                &Value::Null
+            )
+            .unwrap(),
             json!({ "web_origins": ["https://a.example", "https://b.example"] })
         );
         // 비우면 같은 출처만
         assert_eq!(
-            settings_set_body(&["web_origins=".into()]).unwrap(),
+            settings_set_body(&["web_origins=".into()], &Value::Null).unwrap(),
             json!({ "web_origins": [] })
         );
         assert_eq!(
-            settings_set_body(&["api_names=orbivisor.example.com, 192.168.0.200".into()]).unwrap(),
+            settings_set_body(
+                &["api_names=orbivisor.example.com, 192.168.0.200".into()],
+                &Value::Null
+            )
+            .unwrap(),
             json!({ "api_names": ["orbivisor.example.com", "192.168.0.200"] })
         );
         assert_eq!(
-            settings_set_body(&["voters=3".into()]).unwrap(),
+            settings_set_body(&["voters=3".into()], &Value::Null).unwrap(),
             json!({ "voters": 3 })
         );
         assert_eq!(
-            settings_set_body(&["shutdown_policy=migrate".into()]).unwrap(),
+            settings_set_body(&["shutdown_policy=migrate".into()], &Value::Null).unwrap(),
             json!({ "shutdown_policy": "migrate" })
         );
         assert_eq!(
-            settings_set_body(&["ha_reserve=nodes:1".into(), "ha_start_concurrency=8".into()])
-                .unwrap(),
+            settings_set_body(
+                &["ha_reserve=nodes:1".into(), "ha_start_concurrency=8".into()],
+                &Value::Null
+            )
+            .unwrap(),
             json!({ "ha_reserve": { "nodes": 1 }, "ha_start_concurrency": 8 })
         );
         assert_eq!(
-            settings_set_body(&["ha_reserve=percent:25".into()]).unwrap(),
+            settings_set_body(&["ha_reserve=percent:25".into()], &Value::Null).unwrap(),
             json!({ "ha_reserve": { "percent": 25 } })
         );
         assert_eq!(
-            settings_set_body(&["ha_reserve=none".into()]).unwrap(),
+            settings_set_body(&["ha_reserve=none".into()], &Value::Null).unwrap(),
             json!({ "ha_reserve": "none" })
         );
         for bad in [
@@ -15111,30 +15300,58 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             "ha_reserve=nodes",
             "ha_reserve=nodes:x",
         ] {
-            let err = settings_set_body(&[bad.into()]).unwrap_err();
+            let err = settings_set_body(&[bad.into()], &Value::Null).unwrap_err();
             assert!(
                 err.to_string()
                     .starts_with("ha_reserve must be none, nodes:N or percent:P"),
                 "{err}"
             );
         }
-        let err = settings_set_body(&["ha_start_concurrency=many".into()]).unwrap_err();
+        let err =
+            settings_set_body(&["ha_start_concurrency=many".into()], &Value::Null).unwrap_err();
         assert_eq!(
             err.to_string(),
             "ha_start_concurrency must be a number 1-32 (got \"many\")"
         );
-        let err = settings_set_body(&["voters=five".into()]).unwrap_err();
+        let err = settings_set_body(&["voters=five".into()], &Value::Null).unwrap_err();
         assert_eq!(err.to_string(), "voters must be 3, 5 or 7 (got \"five\")");
-        let err = settings_set_body(&["updates.mirror=x".into()]).unwrap_err();
+        let err = settings_set_body(&["updates.mirror=x".into()], &Value::Null).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, two_factor, two_factor.roles, two_factor.realms, two_factor.rp_id"
         );
-        let err = settings_set_body(&["updates.channel".into()]).unwrap_err();
+        let err = settings_set_body(&["updates.channel".into()], &Value::Null).unwrap_err();
         assert_eq!(
             err.to_string(),
             "expected KEY=VALUE, got \"updates.channel\""
         );
+    }
+
+    /// 2단계 인증 정책은 통째로 보내므로 지금 정책에 준 칸만 덮는다. `two_factor=off`는 지운다.
+    #[test]
+    fn settings_set_two_factor_policy() {
+        let current = json!({ "roles": ["admin"], "rp_id": "opl.example.com" });
+        assert_eq!(
+            settings_set_body(&["two_factor.realms=local, corp".into()], &current).unwrap(),
+            json!({ "two_factor": { "roles": ["admin"], "realms": ["local", "corp"], "rp_id": "opl.example.com" } })
+        );
+        assert_eq!(
+            settings_set_body(
+                &["two_factor.roles=".into(), "two_factor.rp_id=".into()],
+                &current
+            )
+            .unwrap(),
+            json!({ "two_factor": { "roles": [] } })
+        );
+        assert_eq!(
+            settings_set_body(&["two_factor.roles=operator".into()], &Value::Null).unwrap(),
+            json!({ "two_factor": { "roles": ["operator"] } })
+        );
+        assert_eq!(
+            settings_set_body(&["two_factor=off".into()], &current).unwrap(),
+            json!({ "two_factor": {} })
+        );
+        assert!(settings_set_body(&["two_factor=on".into()], &current).is_err());
     }
 
     /// `settings get`은 spec을 `키: 값` 줄로, `-o json`이면 리소스 그대로 보인다. `set`은 PATCH한다.
@@ -16096,7 +16313,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
 
         assert_eq!(
             parse_group_role("cn=a,dc=x=root").unwrap_err(),
-            "invalid role \"root\" in \"cn=a,dc=x=root\": use admin, operator or viewer"
+            "invalid role \"root\" in \"cn=a,dc=x=root\": use admin, operator, viewer or none"
         );
         assert!(parse_group_role("admins").is_err());
         assert!(parse_group_role("=admin").is_err());
@@ -16569,7 +16786,15 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 unreachable!()
             };
             assert_eq!(
-                login(&base, &args, None).await.unwrap(),
+                login(
+                    &base,
+                    &args,
+                    None,
+                    &mut |_: &str| -> anyhow::Result<String> { panic!("asked") },
+                    &mut Vec::new()
+                )
+                .await
+                .unwrap(),
                 ("opl_t_s".to_string(), "alice@corp".to_string())
             );
             let seen = seen.lock().unwrap();
@@ -16579,6 +16804,64 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             assert_eq!(sent.body["password"], "alice-pw");
             assert_eq!(sent.body.get("realm").and_then(Value::as_str), expected);
         }
+    }
+
+    /// 로그인 응답에 `second_factor`가 있으면 `--code`를 둘째 단계로 보낸 뒤(같은 쿠키) 토큰을 만든다.
+    #[tokio::test]
+    async fn login_sends_the_second_factor() {
+        let (base, seen) = fake_api_bodies(|path| match path {
+            "/api/v1/auth/login" => json!({
+                "name": "alice", "role": "operator",
+                "second_factor": { "methods": ["totp", "recovery"], "enroll": false, "expires_at": 1 }
+            }),
+            "/api/v1/tokens" => json!({ "secret": "opl_t_s" }),
+            _ => json!({ "name": "alice" }),
+        })
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let pw = dir.path().join("pw");
+        std::fs::write(&pw, "alice-pw\n").unwrap();
+        let argv = [
+            "oplctl",
+            "login",
+            "--user",
+            "alice",
+            "--password-file",
+            pw.to_str().unwrap(),
+            "--code",
+            "123 456",
+        ];
+        let Cmd::Login(args) = Cli::try_parse_from(argv).unwrap().cmd else {
+            unreachable!()
+        };
+        assert_eq!(
+            login(
+                &base,
+                &args,
+                None,
+                &mut |_: &str| -> anyhow::Result<String> { panic!("asked") },
+                &mut Vec::new()
+            )
+            .await
+            .unwrap(),
+            ("opl_t_s".to_string(), "alice".to_string())
+        );
+        let seen = seen.lock().unwrap();
+        let lines: Vec<&str> = seen.iter().map(|r| r.line.as_str()).collect();
+        assert_eq!(
+            lines,
+            [
+                "POST /api/v1/auth/login HTTP/1.1",
+                "POST /api/v1/auth/login/second-factor HTTP/1.1",
+                "POST /api/v1/tokens HTTP/1.1",
+                "POST /api/v1/auth/logout HTTP/1.1",
+            ]
+        );
+        assert_eq!(seen[1].body, json!({ "totp": "123456" }));
+        // 토큰 인자와 함께 줄 수 없다.
+        assert!(
+            Cli::try_parse_from(["oplctl", "login", "--token-file", "t", "--code", "1"]).is_err()
+        );
     }
 
     /// `realm add-oidc`는 issuer·client ID가 필요하고, 지우기와 설정은 함께 줄 수 없다.
@@ -16973,7 +17256,15 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         else {
             unreachable!()
         };
-        let e = login(&base, &args, None).await.unwrap_err();
+        let e = login(
+            &base,
+            &args,
+            None,
+            &mut |_: &str| -> anyhow::Result<String> { panic!("asked") },
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             e.to_string(),
             "sign in to okta in the web UI, create an API token there and run `orbivisorctl login --token-file`"
