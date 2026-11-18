@@ -25,15 +25,21 @@
 | 영역 (영역 주소) | 탭 → 주소 (보기 전환) |
 |---|---|
 | 홈 `/` | 없음(한 화면) |
-| 가상 머신 `/vms` | VM `/vms` · 템플릿 `/templates` · 이미지·ISO(이미지 라이브러리 `/images` \| ISO 이미지 `/isos`) · 가져오기 `/imports` |
-| 인프라 `/infra` | 노드(노드 `/nodes` \| 클러스터 `/cluster`) · 스토리지 풀 `/storage-pools` · 볼륨 `/volumes` · Ceph `/ceph` · 네트워크 `/networks` · 보안 그룹 `/security-groups` |
+| 가상 머신 `/vms` | VM(목록 `/vms` \| 폴더 `/vm-folders`) · 템플릿 `/templates` · 이미지·ISO(이미지 라이브러리 `/images` \| ISO 이미지 `/isos`) · 가져오기 `/imports` |
+| 인프라 `/infra` | 노드(노드 `/nodes` \| 클러스터 `/cluster`) · 스토리지 풀(목록 `/storage-pools` \| 폴더 `/storage-folders`) · 볼륨 `/volumes` · Ceph `/ceph` · 네트워크(목록 `/networks` \| 폴더 `/network-folders`) · 보안 그룹 `/security-groups` |
 | 보호 `/protect` | 백업 `/backups` · 백업 작업 `/backup-jobs` · 원격 복제 `/remotes`(원격 읽기 권한) · HA 그룹 `/ha-groups` · HA 검사 `/ha-checks` · 배치(배치 규칙 `/placement-rules` \| 최적 배치 `/placement`) |
 | 활동 `/activity` | 작업 `/tasks` · 경보 `/alerts` · 감사 로그 `/audit`(admin) |
-| 설정 `/settings` (아래 고정) | 일반 `/settings` · 사용자 `/settings/users`(사용자 읽기 권한) · 인증 영역 `/settings/realms`(영역 읽기 권한) · API 토큰 `/settings/tokens`(모두, 자기 토큰) · 원격 클러스터 `/settings/remotes`(admin) · 알림 대상 `/settings/notifications`(admin) · 구독 `/settings/subscription` |
+| 설정 `/settings` (아래 고정) | 일반 `/settings` · 사용자 `/settings/users`(사용자 읽기 권한) · 인증 영역 `/settings/realms`(영역 읽기 권한) · 권한 `/settings/permissions`(admin) · 역할 `/settings/roles`(admin) · 그룹 `/settings/groups`(그룹 읽기 권한) · 보안 `/settings/security`(admin, 2단계 인증 정책) · API 토큰 `/settings/tokens`(모두, 자기 토큰) · 2단계 인증 `/settings/account`(모두, 자기 요소) · 원격 클러스터 `/settings/remotes`(admin) · 알림 대상 `/settings/notifications`(admin) · 구독 `/settings/subscription` |
 
-- **권한.** 지금 역할로 볼 수 없는 탭은 숨기고, 보이는 탭이 하나도 없는 영역도 숨긴다. 서버가 실제로 막는 것은 그대로다.
+- **권한.** 화면은 `/permissions/mine`(전역 역할과 폴더·객체 grant를 합친 내 권한)으로 **객체마다** 할 수 있는 동작만 보인다.
+  루트에서 읽을 수 없는 종류의 탭(노드·Ceph·보안 그룹·백업 작업·HA·배치·설정 › 일반·구독 등)은 숨기고, 보이는 탭이 하나도 없는
+  영역도 숨긴다. 폴더 권한만 있는 사용자는 목록·트리·팔레트에 자기 폴더의 것만 본다. 서버가 실제로 막는 것은 그대로다
+  ([폴더와 권한](folders.md)).
+- **폴더 보기.** VM·스토리지 풀·네트워크 탭의 보기 전환 `목록 | 폴더`는 왼쪽 트리와 그 폴더의 표("하위 포함" 칩)다. 폴더
+  상세(`/vm-folders/:id` 등)는 `내용 | 할당량 | 권한` 탭이다. 행을 트리로 끌어 놓거나 일괄 막대의 "폴더로 옮기기…"로 옮긴다.
+  VM 상세에는 "권한" 탭이, 풀·네트워크 행에는 같은 내용을 서랍으로 여는 방패 단추가 있다([폴더와 권한](folders.md#웹-화면)).
 - **상세 화면은 그 탭에 속한다.** `/vms/web`·`/vms/-new`·`/vms/web/edit`은 VM 탭, `/nodes/node1`은 노드 탭,
-  `/security-groups/web`은 보안 그룹 탭, `/imports/x`는 가져오기 탭, `/remotes/dr`(원격 클러스터의 VM)은 원격 복제 탭이다.
+  `/vm-folders/x`는 VM 탭의 폴더 보기, `/security-groups/web`은 보안 그룹 탭, `/imports/x`는 가져오기 탭, `/remotes/dr`(원격 클러스터의 VM)은 원격 복제 탭이다.
   콘솔(`/vms/web/console`)만 영역 탭 없이 전체 폭이다.
 - **원격.** 보호 › 원격 복제는 원격 클러스터의 상태 카드, 원격 대상이 있는 백업 작업, 원격 VM 보기다. 주소·토큰의
   추가·고치기·지우기는 설정 › 원격 클러스터(admin)에 있다.
@@ -85,7 +91,8 @@
 
 - **검색 상자**는 팔레트를 연다(`⌘K` 표시). 1024px보다 좁으면 아이콘 단추다.
 - **+ 만들기**(`c`)는 가상 머신·VM 가져오기(OVA 올리기)·스토리지 풀·네트워크·백업 작업·ISO 올리기 메뉴다. 쓰기 권한이 있는
-  것만 보이고 viewer에게는 단추가 없다. VM은 `/vms/-new`로 가고 나머지는 그 화면을 `?create=1`로 열어 만들기 대화상자를
+  것만(루트든 어느 폴더든) 보이고 viewer에게는 단추가 없다. VM 만들기는 권한 있는 폴더를 골라 두고, 노드 목록을 읽지 못하는 폴더
+  사용자에게는 노드 칸을 숨긴다(머신 종류는 서버가 고른다). VM은 `/vms/-new`로 가고 나머지는 그 화면을 `?create=1`로 열어 만들기 대화상자를
   띄운다(이 주소를 북마크해도 된다).
 - **클러스터 전환**(1024px 이상)은 이 클러스터와 원격 클러스터 목록이다. 원격을 고르면 `/remotes/{이름}`(원격 VM 보기)으로,
   이 클러스터를 고르면 홈으로 간다. 원격 목록은 메뉴를 열 때만 읽는다.
@@ -237,3 +244,6 @@ VM·노드·스토리지 풀·볼륨·백업·작업·감사 로그 목록은 �
 - 일괄 동작은 VM 목록에만, 미리 보기 서랍은 VM·노드 목록에만 있다. 열 순서 바꾸기, 표 CSV 내보내기, 셀 안 편집, 사용자 정의
   대시보드, 여러 클러스터를 한 표로 보기는 없다.
 - 오른쪽에서 왼쪽으로 쓰는 언어와 고대비 테마는 없다.
+- 폴더 트리는 가상 스크롤이 없고(펼친 노드만 그린다) 템플릿 탭에는 트리가 없다. 끌어 놓기는 확인 없이 바로 옮긴다. 토큰 범위를
+  정하는 화면은 없다(CLI). 볼륨·ISO·이미지·가져오기·백업 복원·템플릿 배포 단추는 그 권한이 어디에든 있으면 보이고, 그 객체에서
+  되는지는 서버가 정한다.

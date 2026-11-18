@@ -325,3 +325,6 @@ grant를 만들려면 대상에 `permission.modify`가 있어야 하고, 역할�
 - 로그인: 응답의 `second_factor`로 둘째 단계(코드·복구 코드·패스키), `enroll`이면 강제 등록(인증 앱 QR, 도메인 접속이면 패스키, 복구 코드 한 번). 로그인 밖의 401 `second_factor_required`(새로 고친 대기 세션 포함)는 둘째 단계로 돌아간다(방법을 모르면 코드·복구 코드). 403 `enrollment_required`는 등록 화면으로 바꾼다. QR은 npm `qrcode-generator` `2.0.4`(MIT, 의존성 없음, 2025-08 배포)로 SVG 칸을 직접 그린다. 등록 화면은 lazy라 첫 화면에 들지 않는다.
 - Playwright `web/e2e/permissions.spec.ts`는 `web.rs`의 둘째 시험 `browser_shows_a_folder_user_only_their_folder`(QEMU 없음)가 돌린다. 두 시험은 spec 파일 하나씩만 돌리고(각 spec이 서로 다른 환경 변수를 요구한다) 뮤텍스로 하나씩 돈다. CI의 `opld/web-it` 실행에 그대로 든다.
 - 첫 화면 묶음(`eager.sh`): JS gzip 377,048 → 389,876 B(+12.8 KB, 그중 en·ko 문구 +6.6 KB), CSS 14,219 → 14,461 B.
+
+**스테이지 8(문서)**
+- 새 가이드 `docs/guide/folders.md`("폴더와 권한")에 폴더·권한·할당량·2단계 인증·웹·API·섞인 클러스터·한계를 모았다. "웹 화면 둘러보기"는 영역·탭 표(보기 전환 `목록 | 폴더`, 설정 탭 권한·역할·그룹·보안·2단계 인증)와 권한 항목(`/permissions/mine`으로 객체마다)을, "접근과 보안"은 전역 역할 `none`·그룹 연결·LDAP 사용자의 로컬 2FA·OIDC는 묻지 않음·토큰 범위 링크를 고쳤다. CLI 예는 `oplctl` 도움말과 opld E2E가 쓰는 명령 그대로다(`vm|network|pool move` 대신 `folder members move`).

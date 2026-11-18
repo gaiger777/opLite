@@ -18,6 +18,13 @@ cargo test -p opld --features qemu-it --test e2e                    # E2E: CLI �
 cargo test -p opld --features qemu-it --test backup                 # E2E: 실행 중 백업 → VM 지우기 → 복원(qemu-img, qemu-io 필요)
 cargo test -p opld --features qemu-it --test vm_import              # E2E: OVA 올리기 → 제안 → 가져오기 → 볼륨 내용(qemu-img 필요)
 cargo test -p opld --test cluster                                   # E2E: orbivisord 프로세스 3개로 클러스터 구성
+# 폴더·권한·할당량·2단계 인증(QEMU 없음, `cargo test --workspace`에도 든다): 폴더 사용자의 목록·404, 위임, 할당량 409,
+# 범위 토큰, TOTP 둘째 단계·복구 코드·관리자 초기화, 노드 둘에서 동시에 만들어도 할당량을 지킴
+cargo test -p opld --test permissions
+cargo test -p opl-api --test permissions --test quotas --test two_factor --test webauthn   # API: 경로 시행·watch 거르기, 할당량, 2FA, 소프트웨어 인증기로 WebAuthn
+cargo test -p opl-api --lib authz                                   # 권한 색인: 옛 역할과의 동치, insta 행렬, proptest(색인 = 참조 구현)
+cargo test -p opl-cluster --test three_nodes concurrent_creates_on_two_nodes_keep_the_folder_quota  # memnet 세 노드 할당량 경쟁
+cargo test --release -p opl-cluster --features scale-it --lib quota_apply_cost -- --nocapture       # VM 1만 개에서 할당량 apply 시간
 cargo test -p opld --features starve-it --test starve              # E2E: 리더의 API 실행기를 막아도 리스·Raft 리더 그대로
 # 지표 기록·경보(QEMU 없음, [test] 고리가 있는 metrics-it 빌드): SIGKILL 뒤 기록, Prometheus 긁기(엄격한 텍스트 형식 파서),
 # 127.0.0.1 webhook으로 시험 보내기·경보 발생·해제·보낸 기록
@@ -181,13 +188,19 @@ pnpm -C web test src/tokens.test.ts   # 색 토큰 대비만: index.css의 밝�
 pnpm -C web typecheck && pnpm -C web lint
 pnpm -C web gen:api          # API를 바꾼 뒤 src/api/schema.d.ts를 다시 만든다(CI가 확인한다)
 pnpm -C web exec playwright install chromium
-pnpm -C web build && cargo test -p opld --features web-it --test web   # E2E: 브라우저 → 업로드 → VM → 콘솔 → 정리
+pnpm -C web build && cargo test -p opld --features web-it --test web   # E2E: 브라우저 → 업로드 → VM → 콘솔 → 정리, 폴더 사용자·2FA
+pnpm -C web build && cargo test -p opld --features web-it --test web browser_shows_a_folder_user_only_their_folder   # 폴더 사용자만(QEMU 없이 돈다)
 ```
 
 브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 영역 탭으로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
 일괄 막대로 강제 정지하고, VM 동작 메뉴(⋯)로 복제·편집·지우기를 한다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
 시험이 잡지 못하는 경로 이동·렌더 문제가 있으므로 **웹을 바꾸면 커밋 전에 이 Mac에서 돌린다.** 실패하면
 `web/test-results/*/error-context.md`(화면 스냅숏)와 `trace.zip`이 남는다.
+
+둘째 브라우저 E2E(`web/e2e/permissions.spec.ts`)는 `web.rs`의 `browser_shows_a_folder_user_only_their_folder`가 돌린다. Rust 쪽이
+`/teamA`·`/teamB`와 VM, 그룹 grant로 `/teamA` operator를 받은 `none` 사용자를 준비하고, 브라우저는 그 사용자로 VM 목록·폴더
+트리·팔레트에 `/teamA`만 보이는지, + 만들기가 폴더를 골라 두고 노드 칸 없이 VM을 만드는지, 설정 › 2단계 인증에서 인증 앱을 켠
+뒤 둘째 단계로 다시 로그인하는지 본다. 두 시험은 spec 하나씩을 돌리고 하나씩 차례로 돈다.
 
 접근성 검사는 `src/test/axe.ts`의 `expectNoAxeViolations(container)`가 `axe-core`를 직접 부른다(jsdom에서 안 되는
 `color-contrast` 규칙은 끄고 `src/tokens.test.ts`가 대신한다). 머리줄·팔레트·서랍·목록·상세·설정·홈 시험에서 돈다. 새 색
