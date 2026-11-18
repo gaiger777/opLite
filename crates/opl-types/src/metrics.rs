@@ -543,6 +543,78 @@ pub struct HistoryReply {
     pub top: Vec<TopVm>,
 }
 
+/// 클러스터 모으기의 노드 줄은 이만큼까지다(넘으면 범위 평균 CPU 상위).
+pub const MAX_CLUSTER_NODE_ROWS: usize = 20;
+
+/// 클러스터 모으기(`GET /metrics/cluster`)의 답. 열은 노드 열을 시각 칸끼리 합친 AVG다(CPU %는 코어 수로 가중한
+/// 평균, 나머지는 합). 점 `i`의 시각은 `start + i × step_ms`다.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ClusterHistoryResponse {
+    pub tier: Tier,
+    pub step_ms: i64,
+    pub start: i64,
+    /// 칸 이름 → 클러스터 열(AVG만)
+    pub columns: BTreeMap<String, Cf>,
+    /// 답한 노드의 줄(이름 순). 20개 넘게 답했으면 범위 평균 CPU 상위 20개다.
+    pub nodes: Vec<ClusterNodeRow>,
+    /// 열을 합친 노드 수(줄을 줄이기 전)
+    pub node_count: u32,
+    /// 범위 평균 CPU 상위 VM(내림차순, 10개까지)
+    pub top: Vec<ClusterTopVm>,
+    /// 풀 사용량(Raft의 지금 값, 이름 순)
+    pub pools: Vec<ClusterPoolUsage>,
+    /// 답하지 않은 노드 이름
+    pub unreachable: Vec<String>,
+    /// 지표 기록을 모르는 옛 노드 이름
+    pub unsupported: Vec<String>,
+    /// 다른 노드와 다른 층·칸으로 답한 노드 이름(시계가 크게 어긋난 노드). 열과 줄에 넣지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub skewed: Vec<String>,
+}
+
+/// 클러스터 모으기의 노드 줄 하나
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ClusterNodeRow {
+    pub node: Uuid,
+    pub name: String,
+    /// CPU 코어 수
+    pub cpus: u32,
+    /// 칸 이름 → 범위 평균
+    pub avg: BTreeMap<String, Option<f32>>,
+    /// CPU % 열(AVG, 클러스터 열과 같은 시각)
+    pub cpu: Vec<Option<f32>>,
+}
+
+/// 클러스터 모으기의 상위 VM 하나(범위 평균)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ClusterTopVm {
+    pub vm: Uuid,
+    pub name: String,
+    /// VM의 노드 이름(모르면 없음)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub node: Option<String>,
+    /// 범위 평균 CPU %
+    pub cpu: Option<f32>,
+    /// 범위 평균 RSS(MiB)
+    pub mem_rss: Option<f32>,
+}
+
+/// 풀 하나의 지금 사용량. 공유 풀은 한 노드의 값, 노드 로컬 풀은 준비된 노드 값의 합이다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct ClusterPoolUsage {
+    pub pool: Uuid,
+    pub name: String,
+    pub shared: bool,
+    pub used_bytes: u64,
+    pub total_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

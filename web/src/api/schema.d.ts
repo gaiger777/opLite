@@ -769,6 +769,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 이 노드의 Prometheus 지표(텍스트 형식 0.0.4, gauge). 이 노드와 이 노드에서 잰 VM의 마지막 5초 점, 이 노드에서
+         *     준비된 풀, 클러스터 값(노드 수·VM 수·리더)이다. 노드마다 따로 긁는다. Node와 Vm 읽기 권한이 필요하고(viewer 토큰이면
+         *     된다), 설정 `prometheus.enabled`가 꺼져 있으면 404 `not_found`다. 5초 캐시한다.
+         */
+        get: operations["get_prometheus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/metrics/cluster": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 클러스터 전체의 기록 요약: 노드 열을 합친 클러스터 열(CPU %는 코어 수로 가중, 나머지는 합, AVG만), 노드 줄(20개
+         *     넘으면 범위 평균 CPU 상위 20개), 범위 평균 CPU 상위 VM 10개, 풀의 지금 사용량(Raft). 답하지 않은 노드는
+         *     `unreachable`, 기록을 모르는 옛 노드는 `unsupported`, 시계가 크게 어긋나 다른 층·칸으로 답한 노드는 `skewed`다.
+         *     같은 조건은 이 노드에서 10초 동안 다시 묻지 않는다.
+         */
+        get: operations["get_cluster_history"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/metrics/nodes": {
         parameters: {
             query?: never;
@@ -967,6 +1010,26 @@ export interface paths {
          *     `node_unreachable`, 지표를 모르는 옛 노드면 409 `cluster_upgrading`.
          */
         get: operations["get_node_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/metrics/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드 하나의 기록(노드 열 9개). 위트니스면 409 `node_unavailable`, 기록을 모르는 옛 노드면 409
+         *     `cluster_upgrading`, 꺼진 것으로 기록됐거나 닿지 않으면 503 `node_unreachable`이다.
+         */
+        get: operations["get_node_history"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1337,7 +1400,8 @@ export interface paths {
          *     `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
          *     않고 그대로 200이다. enterprise 채널은 모든 노드가 이 빌드 이상이고 구독이 active일 때만 고른다
          *     (이미 enterprise여도 다시 보내면 검사한다). 텔레메트리도 모든 노드가 이 빌드 이상일 때만 바꾸고,
-         *     켤 때 id가 없으면 만든다.
+         *     켤 때 id가 없으면 만든다. Prometheus 끝점은 모든 노드가 `metrics-history`를 알 때만 바꾸고(409
+         *     `cluster_upgrading`), 끄면 설정에서 지운다.
          */
         patch: operations["patch_settings"];
         trace?: never;
@@ -1397,6 +1461,27 @@ export interface paths {
          *     그대로 200이다.
          */
         patch: operations["patch_pool"];
+        trace?: never;
+    };
+    "/storage-pools/{key}/metrics/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 풀 하나의 기록(`pool_used`·`pool_total`, MiB). 그 풀이 `ready`인 노드 하나(이 노드 먼저, 없으면 이름 순으로 켜져 있고
+         *     기록을 아는 노드)에 묻는다. 노드 로컬 풀이면 그 노드의 값이다. 준비된 노드가 없으면 409 `pool_unavailable`, 모두
+         *     옛 노드면 409 `cluster_upgrading`, 모두 꺼져 있거나 닿지 않으면 503 `node_unreachable`이다.
+         */
+        get: operations["get_pool_history"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/subscription": {
@@ -1990,6 +2075,27 @@ export interface paths {
          *     이어진다. 같은 `t`가 두 노드에서 오면 둘 다 둔다.
          */
         get: operations["get_vm_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/metrics/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * VM 하나의 기록(VM 열 8개). VM의 주인 노드(`status.node`, 없으면 `spec.node`, 둘 다 없으면 이 노드)에만 묻는다.
+         *     마이그레이션 직후 앞 기록이 넘어오기 전이면 앞 칸이 `null`이고 `covered_from`이 알린다. 주인 노드가 기록을 모르면
+         *     409 `cluster_upgrading`, 닿지 않으면 503 `node_unreachable`이다.
+         */
+        get: operations["get_vm_history"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2915,6 +3021,15 @@ export interface components {
             tasks: string[];
         };
         /**
+         * @description 열 하나의 AVG·MAX·MIN. 모르는 칸(NaN)은 `null`이다. `Raw5s`는 세 열이 같고, `Digest`는 AVG만 있다(MAX·MIN은
+         *     비어 있고 쓰지 않는다).
+         */
+        Cf: {
+            avg: (number | null)[];
+            max?: (number | null)[];
+            min?: (number | null)[];
+        };
+        /**
          * @description 업데이트 채널. APT 소스 파일의 `Components`가 된다.
          * @enum {string}
          */
@@ -3036,6 +3151,84 @@ export interface components {
         CloudInitNet: {
             ipv4?: components["schemas"]["IpConfig"];
             ipv6?: components["schemas"]["IpConfig"];
+        };
+        /**
+         * @description 클러스터 모으기(`GET /metrics/cluster`)의 답. 열은 노드 열을 시각 칸끼리 합친 AVG다(CPU %는 코어 수로 가중한
+         *     평균, 나머지는 합). 점 `i`의 시각은 `start + i × step_ms`다.
+         */
+        ClusterHistoryResponse: {
+            /** @description 칸 이름 → 클러스터 열(AVG만) */
+            columns: {
+                [key: string]: components["schemas"]["Cf"];
+            };
+            /**
+             * Format: int32
+             * @description 열을 합친 노드 수(줄을 줄이기 전)
+             */
+            node_count: number;
+            /** @description 답한 노드의 줄(이름 순). 20개 넘게 답했으면 범위 평균 CPU 상위 20개다. */
+            nodes: components["schemas"]["ClusterNodeRow"][];
+            /** @description 풀 사용량(Raft의 지금 값, 이름 순) */
+            pools: components["schemas"]["ClusterPoolUsage"][];
+            /** @description 다른 노드와 다른 층·칸으로 답한 노드 이름(시계가 크게 어긋난 노드). 열과 줄에 넣지 않는다. */
+            skewed?: string[];
+            /** Format: int64 */
+            start: number;
+            /** Format: int64 */
+            step_ms: number;
+            tier: components["schemas"]["Tier"];
+            /** @description 범위 평균 CPU 상위 VM(내림차순, 10개까지) */
+            top: components["schemas"]["ClusterTopVm"][];
+            /** @description 답하지 않은 노드 이름 */
+            unreachable: string[];
+            /** @description 지표 기록을 모르는 옛 노드 이름 */
+            unsupported: string[];
+        };
+        /** @description 클러스터 모으기의 노드 줄 하나 */
+        ClusterNodeRow: {
+            /** @description 칸 이름 → 범위 평균 */
+            avg: {
+                [key: string]: number | null;
+            };
+            /** @description CPU % 열(AVG, 클러스터 열과 같은 시각) */
+            cpu: (number | null)[];
+            /**
+             * Format: int32
+             * @description CPU 코어 수
+             */
+            cpus: number;
+            name: string;
+            /** Format: uuid */
+            node: string;
+        };
+        /** @description 풀 하나의 지금 사용량. 공유 풀은 한 노드의 값, 노드 로컬 풀은 준비된 노드 값의 합이다. */
+        ClusterPoolUsage: {
+            name: string;
+            /** Format: uuid */
+            pool: string;
+            shared: boolean;
+            /** Format: int64 */
+            total_bytes: number;
+            /** Format: int64 */
+            used_bytes: number;
+        };
+        /** @description 클러스터 모으기의 상위 VM 하나(범위 평균) */
+        ClusterTopVm: {
+            /**
+             * Format: float
+             * @description 범위 평균 CPU %
+             */
+            cpu?: number | null;
+            /**
+             * Format: float
+             * @description 범위 평균 RSS(MiB)
+             */
+            mem_rss?: number | null;
+            name: string;
+            /** @description VM의 노드 이름(모르면 없음) */
+            node?: string;
+            /** Format: uuid */
+            vm: string;
         };
         ClusterView: {
             /** @description 클러스터 CA 인증서의 지문. `orbivisorctl login --ca-fingerprint`에 쓴다. */
@@ -3822,6 +4015,39 @@ export interface components {
         HealthCheck: "quorum" | "apply_lag" | "lease" | "runtimes" | "maintenance" | "role";
         /** @enum {string} */
         HealthStatus: "ok" | "unavailable";
+        /** @description 기록 조회의 답. 열은 웹 uPlot이 그대로 받는 배열이고, 점 `i`의 시각은 `start + i × step_ms`(칸 시작)다. */
+        HistoryReply: {
+            /** @description 칸 이름([`MetricField::as_str`]) → 열 */
+            columns: {
+                [key: string]: components["schemas"]["Cf"];
+            };
+            /**
+             * Format: int64
+             * @description 기록이 범위 시작보다 늦게 시작하면 실제로 아는 가장 이른 시각(재시작 직후·마이그레이션 직후)
+             */
+            covered_from?: number;
+            /** @description 칸 이름 → p50·p95 */
+            pct?: {
+                [key: string]: components["schemas"]["Pct"];
+            };
+            /**
+             * Format: int64
+             * @description 첫 점의 시각(유닉스 ms)
+             */
+            start: number;
+            /** @description 칸 이름 → 범위 요약 */
+            stats?: {
+                [key: string]: components["schemas"]["Stat"];
+            };
+            /**
+             * Format: int64
+             * @description 점 하나의 길이(층 간격 × 묶은 칸 수)
+             */
+            step_ms: number;
+            tier: components["schemas"]["Tier"];
+            /** @description `Digest`의 범위 평균 CPU 상위 VM(내림차순) */
+            top?: components["schemas"]["TopVm"][];
+        };
         /**
          * @description 핫플러그 배치(계획 54): 켤 때 둔 vCPU 자리·virtio-mem·빈 루트 포트와 지금 그 안에서 바뀐 것. 마이그레이션 대상은
          *     같은 배치로 켠다.
@@ -5571,6 +5797,15 @@ export interface components {
             current?: string | null;
             name: string;
         };
+        /** @description 백분위(최근순위) */
+        Pct: {
+            /** @description 5초 원본이 아니라 층의 AVG 값으로 셈한 근사(짧은 봉우리를 낮게 본다) */
+            approx: boolean;
+            /** Format: float */
+            p50?: number | null;
+            /** Format: float */
+            p95?: number | null;
+        };
         /** @description 실행 중에 적용하지 못해 다음 재시작 때 적용할 변경 하나 */
         PendingChange: {
             /** @description 이유의 자세한 설명(예: 실패한 까닭) */
@@ -5872,6 +6107,11 @@ export interface components {
             role: components["schemas"]["Role"];
             /** Format: uuid */
             user: string;
+        };
+        /** @description Prometheus 끝점에서 바꿀 값 */
+        PrometheusPatch: {
+            /** @description 켜면 각 노드가 `GET /api/v1/metrics`로 지표를 내보낸다(Node·Vm 읽기 권한 토큰). 끄면 404다. */
+            enabled?: boolean;
         };
         /** @description Prometheus 끝점 설정 */
         PrometheusSettings: {
@@ -7210,6 +7450,8 @@ export interface components {
             ha_start_concurrency?: number;
             /** @description 최적 배치: 점수 정책, 균형 조정기의 동작, 불균형 문턱. 준 값만 바꾼다. */
             placement?: components["schemas"]["PlacementPatch"];
+            /** @description Prometheus 끝점(`GET /api/v1/metrics`). 모든 노드가 `metrics-history`를 알아야 한다. */
+            prometheus?: components["schemas"]["PrometheusPatch"];
             /**
              * @description 호스트가 꺼지는 중(재부팅·전원 끄기)일 때 노드가 HA VM을 다루는 방법. `conditional`(기본: 재부팅이면
              *     `freeze`, 끄기면 `failover`), `freeze`, `failover`, `migrate`. `systemctl stop`에는 쓰지 않는다.
@@ -7386,6 +7628,24 @@ export interface components {
             nics: components["schemas"]["SourceNic"][];
             /** Format: int32 */
             vcpus: number;
+        };
+        /** @description 범위 전체의 요약. 아는 칸이 없으면 `null`이다. */
+        Stat: {
+            /**
+             * Format: float
+             * @description 아는 칸 수로 가중한 평균
+             */
+            avg?: number | null;
+            /**
+             * Format: float
+             * @description MAX 열의 최대
+             */
+            max?: number | null;
+            /**
+             * Format: float
+             * @description MIN 열의 최소
+             */
+            min?: number | null;
         };
         StoragePoolSpec: {
             backend: components["schemas"]["PoolBackend"];
@@ -7780,6 +8040,11 @@ export interface components {
              */
             vcpus: number;
         };
+        /**
+         * @description 기록 층. 칸 `b = floor(t / step)`(유닉스 기준)라서 모든 노드의 칸 경계가 같다.
+         * @enum {string}
+         */
+        Tier: "raw5s" | "min1" | "min30" | "hour6";
         TokenView: {
             /** Format: uuid */
             id: string;
@@ -7788,6 +8053,21 @@ export interface components {
             revision: number;
             /** Format: uuid */
             user: string;
+        };
+        /** @description `Digest`의 상위 VM 하나(범위 평균) */
+        TopVm: {
+            /**
+             * Format: float
+             * @description 범위 평균 CPU %
+             */
+            cpu?: number | null;
+            /**
+             * Format: float
+             * @description 범위 평균 RSS(MiB)
+             */
+            mem_rss?: number | null;
+            /** Format: uuid */
+            vm: string;
         };
         UpdateRequest_HaCheckSpec: {
             labels?: {
@@ -9933,6 +10213,70 @@ export interface operations {
             };
         };
     };
+    get_prometheus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Prometheus text format 0.0.4 */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/plain; version=0.0.4": string;
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_cluster_history: {
+        parameters: {
+            query?: {
+                /** @description 지금에서 끝나는 범위: `hour`, `day`, `week`, `month`(30일), `year`(365일). `from`·`until`과 함께 쓰지 않는다. */
+                range?: "hour" | "day" | "week" | "month" | "year";
+                /** @description 범위 시작(유닉스 밀리초) */
+                from?: number;
+                /** @description 범위 끝(유닉스 밀리초, 없으면 지금). `from`과 함께만 쓴다. 범위는 366일까지다. */
+                until?: number;
+                /** @description 돌려줄 점 수의 상한(1~1000). 기본은 300이고 클러스터 모으기는 120이다. */
+                points?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ClusterHistoryResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_node_metrics: {
         parameters: {
             query?: {
@@ -10429,6 +10773,53 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NodeSeries"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_node_history: {
+        parameters: {
+            query?: {
+                /** @description 지금에서 끝나는 범위: `hour`, `day`, `week`, `month`(30일), `year`(365일). `from`·`until`과 함께 쓰지 않는다. */
+                range?: "hour" | "day" | "week" | "month" | "year";
+                /** @description 범위 시작(유닉스 밀리초) */
+                from?: number;
+                /** @description 범위 끝(유닉스 밀리초, 없으면 지금). `from`과 함께만 쓴다. 범위는 366일까지다. */
+                until?: number;
+                /** @description 돌려줄 점 수의 상한(1~1000). 기본은 300이고 클러스터 모으기는 120이다. */
+                points?: number;
+            };
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryReply"];
                 };
             };
             503: {
@@ -11628,6 +12019,53 @@ export interface operations {
             };
         };
     };
+    get_pool_history: {
+        parameters: {
+            query?: {
+                /** @description 지금에서 끝나는 범위: `hour`, `day`, `week`, `month`(30일), `year`(365일). `from`·`until`과 함께 쓰지 않는다. */
+                range?: "hour" | "day" | "week" | "month" | "year";
+                /** @description 범위 시작(유닉스 밀리초) */
+                from?: number;
+                /** @description 범위 끝(유닉스 밀리초, 없으면 지금). `from`과 함께만 쓴다. 범위는 366일까지다. */
+                until?: number;
+                /** @description 돌려줄 점 수의 상한(1~1000). 기본은 300이고 클러스터 모으기는 120이다. */
+                points?: number;
+            };
+            header?: never;
+            path: {
+                /** @description pool id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryReply"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_subscription: {
         parameters: {
             query?: never;
@@ -12787,6 +13225,53 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["VmMetricsResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vm_history: {
+        parameters: {
+            query?: {
+                /** @description 지금에서 끝나는 범위: `hour`, `day`, `week`, `month`(30일), `year`(365일). `from`·`until`과 함께 쓰지 않는다. */
+                range?: "hour" | "day" | "week" | "month" | "year";
+                /** @description 범위 시작(유닉스 밀리초) */
+                from?: number;
+                /** @description 범위 끝(유닉스 밀리초, 없으면 지금). `from`과 함께만 쓴다. 범위는 366일까지다. */
+                until?: number;
+                /** @description 돌려줄 점 수의 상한(1~1000). 기본은 300이고 클러스터 모으기는 120이다. */
+                points?: number;
+            };
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HistoryReply"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {

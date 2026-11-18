@@ -31,6 +31,7 @@ mod janitor;
 pub mod ldap;
 pub mod limit;
 mod metrics;
+mod metrics_history;
 mod migration_disks;
 mod node_fence;
 pub mod oidc;
@@ -40,6 +41,7 @@ mod placement_api;
 pub mod placement_board;
 mod placement_rules;
 pub mod power_fence;
+mod prometheus;
 pub mod proxy;
 pub mod realms;
 pub mod remote_client;
@@ -183,6 +185,9 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(node_fence::test_node_fence))
         .routes(routes!(metrics::get_node_metrics))
         .routes(routes!(metrics::list_node_metrics))
+        .routes(routes!(metrics_history::get_node_history))
+        .routes(routes!(metrics_history::get_cluster_history))
+        .routes(routes!(prometheus::get_prometheus))
         .routes(routes!(cluster::get_cluster))
         .routes(routes!(cluster::get_ca))
         .routes(routes!(cluster::get_version))
@@ -207,6 +212,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(ceph::install_client))
         .routes(routes!(r::list_pools, r::create_pool))
         .routes(routes!(r::get_pool, r::patch_pool, r::delete_pool))
+        .routes(routes!(metrics_history::get_pool_history))
         .routes(routes!(r::list_networks, r::create_network))
         .routes(routes!(r::get_network, r::delete_network))
         .routes(routes!(
@@ -255,6 +261,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(guest::get_guest))
         .routes(routes!(guest::set_guest_password))
         .routes(routes!(metrics::get_vm_metrics))
+        .routes(routes!(metrics_history::get_vm_history))
         .routes(routes!(snapshots::list_snapshots))
         .routes(routes!(
             snapshots::list_vm_snapshots,

@@ -32,11 +32,14 @@ use opl_driver::{
     uefi_vars_path,
 };
 use opl_peer::pki::{ClusterCa, NodeTls, node_key_and_csr};
-use opl_peer::{GrpcNetwork, MetricsReply, MetricsSource, PeerService, Peers};
+use opl_peer::{GrpcNetwork, HistoryError, MetricsReply, MetricsSource, PeerService, Peers};
 use opl_reconciler::ha::LeaseRenewer;
 use opl_reconciler::{FirmwareFetcher, HaConfig, HaGuard, Reconciler};
 use opl_types::auth::{Role, SessionSpec, UserSpec};
-use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
+use opl_types::metrics::{
+    Cf as HistoryCf, HistoryQuery, HistoryReply, HistoryScope, MetricsQuery, MetricsScope,
+    NodeSample, NodeSeries, Tier, TopVm, VmSample, VmSeries,
+};
 use opl_types::node::{FEATURES, Fencing, NodeHa, NodeHotplug, NodeSpec, NodeStatus, PoolState};
 use opl_types::placement::{LoadSummary, PlacementRule, PlacementRuleSpec, RuleKind, VmLoad};
 use opl_types::resource::Resource;
@@ -2329,6 +2332,41 @@ struct FakeMetrics {
 }
 
 impl MetricsSource for FakeMetrics {
+    /// 기록: CPU 열은 노드 id 첫 바이트, `mem_used` 열은 VM·풀이면 1, 노드면 2다. `Digest`의 상위 VM은 이 노드가 주인인
+    /// VM이 없으므로 그 질의의 `top`을 CPU로 쓴 가짜 VM 하나다(Raft에 없어 API가 뺀다).
+    fn history(&self, q: &HistoryQuery) -> Result<HistoryReply, HistoryError> {
+        let digest = matches!(q.scope, HistoryScope::Digest { .. });
+        let mem = match q.scope {
+            HistoryScope::Node | HistoryScope::Digest { .. } => 2.0,
+            HistoryScope::Vm { .. } | HistoryScope::Pool { .. } => 1.0,
+        };
+        let cf = |v: f32| HistoryCf {
+            avg: vec![Some(v)],
+            ..HistoryCf::default()
+        };
+        Ok(HistoryReply {
+            tier: Tier::Raw5s,
+            step_ms: 5_000,
+            start: q.from.div_euclid(5_000) * 5_000,
+            columns: BTreeMap::from([
+                ("cpu".into(), cf(f32::from(self.node.as_bytes()[0]))),
+                ("mem_used".into(), cf(mem)),
+            ]),
+            stats: BTreeMap::new(),
+            pct: BTreeMap::new(),
+            covered_from: None,
+            top: if digest {
+                vec![TopVm {
+                    vm: Uuid::from_u128(u128::from(self.node.as_bytes()[0])),
+                    cpu: Some(1.0),
+                    mem_rss: None,
+                }]
+            } else {
+                vec![]
+            },
+        })
+    }
+
     fn read(&self, q: &MetricsQuery) -> MetricsReply {
         let after = |t: &i64| q.since.is_none_or(|since| *t > since);
         match q.scope {
@@ -2448,6 +2486,70 @@ async fn metrics_of_the_other_node_are_read_over_rpc() {
             .starts_with("node \"node2\" did not answer: "),
         "{body}"
     );
+}
+
+/// 기록 조회(계획 60): 노드 기록은 그 노드에, VM 기록은 주인 노드에만 노드 사이 RPC로 묻고, 클러스터 모으기는 두 노드의
+/// 열을 합친다. 닿지 않는 노드는 503·`unreachable`이다.
+#[tokio::test]
+async fn metrics_history_is_read_from_the_node_that_keeps_it() {
+    let (_root, a, mut b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let cpu = |n: &Node| f64::from(n.id.as_bytes()[0]);
+
+    let (status, body) = admin.get("/nodes/node2/metrics/history?range=day").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["columns"]["cpu"]["avg"], serde_json::json!([cpu(&b)]));
+    assert_eq!(body["columns"]["mem_used"]["avg"], serde_json::json!([2.0]));
+
+    // B에 놓인 VM의 기록은 B가 답한다.
+    let mut req = vm_request("web");
+    req["spec"]["node"] = serde_json::json!(b.id);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let (status, body) = admin.get("/vms/web/metrics/history").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["columns"]["cpu"]["avg"], serde_json::json!([cpu(&b)]));
+    assert_eq!(body["columns"]["mem_used"]["avg"], serde_json::json!([1.0]));
+
+    // 클러스터 모으기: 코어 수(둘 다 4)로 가중한 CPU, 나머지는 합. 가짜 VM은 Raft에 없어 빠진다.
+    let (status, body) = admin.get("/metrics/cluster").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node_count"], 2, "{body:#}");
+    let mean = ((cpu(&a) + cpu(&b)) / 2.0) as f32;
+    assert_eq!(
+        body["columns"]["cpu"]["avg"],
+        serde_json::json!([f64::from(mean)])
+    );
+    assert_eq!(body["columns"]["mem_used"]["avg"], serde_json::json!([4.0]));
+    assert_eq!(body["top"], serde_json::json!([]));
+    assert_eq!(body["unreachable"], serde_json::json!([]));
+
+    // B의 노드 간 서버를 멈추면 B는 닿지 않는다(캐시를 피해 다른 범위로 묻는다).
+    let _ = b.peer_stop.take().unwrap().send(());
+    b.peer_server.take().unwrap().await.unwrap();
+    let (status, body) = admin.get("/nodes/node2/metrics/history").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert_eq!(body["code"], "node_unreachable");
+    let (status, body) = admin.get("/vms/web/metrics/history").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let (status, body) = admin.get("/metrics/cluster?range=week").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["node_count"], 1);
+    assert_eq!(body["unreachable"], serde_json::json!(["node2"]));
+}
+
+/// 지표 소스가 없는 노드(옛 노드처럼 RPC가 `unimplemented`)의 기록은 409, 모으기에서는 `unsupported`다.
+#[tokio::test]
+async fn a_node_without_metrics_history_is_upgrading() {
+    let (_root, a, _b) = two_nodes_with(None, true, false, true).await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let (status, body) = admin.get("/nodes/node2/metrics/history").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    let (status, body) = admin.get("/metrics/cluster").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["unsupported"], serde_json::json!(["node2"]));
+    assert_eq!(body["node_count"], 1);
 }
 
 /// B의 Node 리소스를 `name`으로 다시 만든다(이름을 바꾸는 명령이 없다). A가 볼 때까지 기다린다.

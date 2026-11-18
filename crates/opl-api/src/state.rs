@@ -78,6 +78,10 @@ pub struct AppState {
     pub ceph_status_ttl: Duration,
     /// 마지막으로 읽은 Ceph 상태
     pub(crate) ceph_status: crate::ceph::CephStatusCache,
+    /// 클러스터 지표 모으기(`GET /metrics/cluster`)의 10초 캐시. 채우는 동안 잡고 있어 모으기가 겹치지 않는다.
+    pub(crate) digest_cache: tokio::sync::Mutex<crate::metrics_history::DigestCache>,
+    /// Prometheus 끝점(`GET /metrics`)의 5초 캐시
+    pub(crate) prometheus_cache: crate::prometheus::PrometheusCache,
 }
 
 impl AppState {
@@ -116,6 +120,8 @@ impl AppState {
             ceph: None,
             ceph_status_ttl: Duration::from_secs(5),
             ceph_status: Default::default(),
+            digest_cache: Default::default(),
+            prometheus_cache: Default::default(),
         }
     }
 }

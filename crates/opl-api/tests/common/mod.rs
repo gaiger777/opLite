@@ -6,6 +6,7 @@ pub mod esxi;
 pub mod fake_apt;
 pub mod idp;
 pub mod ldap;
+pub mod promtext;
 pub mod ustar;
 
 use std::collections::BTreeMap;

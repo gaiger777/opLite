@@ -7,13 +7,13 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{FAST_HA, HA_PLACEMENT, PLACEMENT};
+use opl_types::node::{FAST_HA, HA_PLACEMENT, METRICS_HISTORY, PLACEMENT};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
     Channel, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT,
     MAX_HA_START_CONCURRENCY, MAX_PLACEMENT_THRESHOLD, PlacementMode, PlacementPolicy,
-    PlacementSettings, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus, ShutdownPolicy,
-    TelemetrySettings, VOTER_LIMITS,
+    PlacementSettings, PrometheusSettings, SETTINGS_NAME, Settings, SettingsSpec, SettingsStatus,
+    ShutdownPolicy, TelemetrySettings, VOTER_LIMITS,
 };
 use opl_types::subscription::SubscriptionState;
 use opl_types::version::TELEMETRY_URL;
@@ -21,6 +21,7 @@ use serde::Deserialize;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
+use crate::audit::AuditNote;
 use crate::auth::{Action, Principal};
 use crate::error::{ApiError, Json};
 use crate::resources::if_match;
@@ -84,6 +85,20 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub placement: Option<PlacementPatch>,
+    /// Prometheus 끝점(`GET /api/v1/metrics`). 모든 노드가 `metrics-history`를 알아야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub prometheus: Option<PrometheusPatch>,
+}
+
+/// Prometheus 끝점에서 바꿀 값
+#[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PrometheusPatch {
+    /// 켜면 각 노드가 `GET /api/v1/metrics`로 지표를 내보낸다(Node·Vm 읽기 권한 토큰). 끄면 404다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub enabled: Option<bool>,
 }
 
 /// 최적 배치에서 바꿀 값
@@ -334,7 +349,8 @@ pub async fn get_settings(
 /// `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이 바뀌었으면 다시 읽어 바꾼다. 같은 값이면 쓰지
 /// 않고 그대로 200이다. enterprise 채널은 모든 노드가 이 빌드 이상이고 구독이 active일 때만 고른다
 /// (이미 enterprise여도 다시 보내면 검사한다). 텔레메트리도 모든 노드가 이 빌드 이상일 때만 바꾸고,
-/// 켤 때 id가 없으면 만든다.
+/// 켤 때 id가 없으면 만든다. Prometheus 끝점은 모든 노드가 `metrics-history`를 알 때만 바꾸고(409
+/// `cluster_upgrading`), 끄면 설정에서 지운다.
 #[utoipa::path(patch, path = "/settings", tag = "settings",
     params(("If-Match" = Option<u64>, Header)),
     request_body = SettingsPatch,
@@ -342,6 +358,7 @@ pub async fn get_settings(
 pub async fn patch_settings(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: AuditNote,
     headers: HeaderMap,
     Json(req): Json<SettingsPatch>,
 ) -> Result<Json<Settings>, ApiError> {
@@ -355,10 +372,15 @@ pub async fn patch_settings(
         && req.ha_reserve.is_none()
         && req.ha_start_concurrency.is_none()
         && req.placement.is_none()
+        && req.prometheus.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency or placement",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement or prometheus",
         ));
+    }
+    // 옛 노드는 Prometheus 필드를 풀지 못한다(계획 58·59처럼 검증보다 먼저 본다).
+    if req.prometheus.is_some() {
+        crate::cluster::require_feature(&state.cluster, METRICS_HISTORY)?;
     }
     if let Some(n) = req.placement.and_then(|p| p.threshold)
         && !(1..=MAX_PLACEMENT_THRESHOLD).contains(&n)
@@ -468,9 +490,19 @@ pub async fn patch_settings(
             let placement = patch.apply(spec.placement());
             spec.placement = (placement != PlacementSettings::default()).then_some(placement);
         }
+        // 꺼짐은 쓰지 않는다(없으면 꺼짐).
+        if let Some(enabled) = req.prometheus.and_then(|p| p.enabled) {
+            spec.prometheus = enabled.then_some(PrometheusSettings { enabled });
+        }
         Ok(())
     })
     .await?;
+    if let Some(enabled) = req.prometheus.and_then(|p| p.enabled) {
+        audit.detail(format!(
+            "settings prometheus {}",
+            if enabled { "on" } else { "off" }
+        ));
+    }
     let has_id = written
         .status
         .telemetry
