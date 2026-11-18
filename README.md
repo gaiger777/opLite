@@ -4,7 +4,7 @@ Rust로 작성하는 온프레미스 가상화·클라우드 플랫폼 (Proxmox 
 
 - 아키텍처: 대칭형 노드 + 내장 Raft, QEMU/KVM을 QMP로 직접 제어
 - 라이선스: Apache-2.0
-- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료, 설치 매체와 cloud-init(계획 57) 완료, 템플릿·링크드 클론·이미지 라이브러리(계획 58) 완료
+- 상태: 처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료, 설치 매체와 cloud-init(계획 57) 완료, 템플릿·링크드 클론·이미지 라이브러리(계획 58) 완료, vTPM·Secure Boot·게스트 에이전트(계획 59) 완료
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -1229,8 +1229,9 @@ disk_timeout = "12h"      # 로컬 디스크 복사가 따라잡기(ready)까지
   파일은 지우지 않는다. 모든 노드가 같은 펌웨어 빌드(같은 크기의 UEFI 변수 템플릿, `[hypervisor] uefi_vars`)를
   써야 한다 — 받은 변수 파일의 크기가 켜는 노드의 템플릿과 다르면 버리고 같은 경고 뒤 그 노드의 파일로 켠다.
   한계: 스냅샷의 변수 복사본은 받아 오지 않으므로, 스냅샷에서 복제하는 작업이 스냅샷을 찍은 노드가 아닌 곳에서
-  돌면 새 VM은 템플릿으로 켜고, 되돌리기가 그런 노드에서 돌면 변수는 되돌리지 않고 지금 것을 둔다(경고). VM이
-  거쳐 간 다른 노드의 변수 파일은 VM을 지워도 그 노드에 남는다.
+  돌면 새 VM은 템플릿으로 켜고, 되돌리기가 그런 노드에서 돌면 변수는 되돌리지 않고 지금 것을 둔다(경고). VM을
+  지우면 거쳐 간 노드의 변수 파일은 그 노드의 정리가 지운다(계획 59). TPM VM은 TPM 상태도 함께 옮겨지고, 꺼진 TPM VM은
+  지금 TPM 상태를 얻지 못하면 켜지 않는다([vTPM과 Secure Boot](#vtpm과-secure-boot)).
 - **공유 LVM.** 옮기는 동안 디스크 LV를 공유 잠금(`lvchange -asy`)으로 바꾸고, 대상이 넘겨받은 뒤 다시 배타로
   바꾼다.
 - **로컬 디스크 복사.** 노드 로컬 풀의 디스크는 대상 노드의 같은 풀(그 풀을 대상 노드에서도 쓸 수 있어야 한다 —
@@ -1480,7 +1481,8 @@ ping = "ping"                     # HA 검사의 ping 대상이 부르는 실행
   원래 노드로 되돌아가지 않는다(필요하면 마이그레이션한다). HA 그룹의 VM은 우선순위가 더 높은 그룹 노드로 되돌아간다
   (아래 "배치 규칙과 HA 정책"의 되돌아가기).
 - **한계.** 죽은 노드에만 있던 UEFI 변수는 잃는다 — 대상 노드는 변수를 그 노드에서 받으려다 실패하면 경고를 남기고
-  자기 노드의 옛 파일(없으면 템플릿)로 켠다. HA 아닌 VM은 노드가 돌아올 때까지 그 노드에 묶여 있다. Ceph RBD에는
+  자기 노드의 옛 파일(없으면 템플릿)로 켠다. TPM VM은 TPM 상태의 사본이 있는 노드에서만 복구하고, 없으면 켜지 않는다
+  (사본은 60초 시점 — [vTPM과 Secure Boot](#vtpm과-secure-boot)). HA 아닌 VM은 노드가 돌아올 때까지 그 노드에 묶여 있다. Ceph RBD에는
   디스크 잠금이 없어 펜싱만 믿는다(Orbivisor는 RBD 배타 잠금·blocklist를 쓰지 않는다). NFSv3에서는 죽은 노드의 잠금이
   그 노드가 돌아올 때까지 남을 수 있고, 그동안 VM은 "disk image is locked …; retrying"으로 기다린다. `process`
   펜싱 노드는 orbivisord만 멈추면(QEMU는 남음) HA VM을 끄지 못하므로 복구가 VM을 둘 돌게 할 수 있다(시험·개발용).
@@ -2391,6 +2393,264 @@ orbivisorctl volume download noble --pool nas --source-format qcow2 \
 
 **넣지 않은 것(나중).** 카탈로그 원격 피드·구독, 원격 클러스터 사이 템플릿 동기화, 체크섬 파일의 GPG 서명 확인.
 
+## vTPM과 Secure Boot
+
+VM에 **TPM 2.0**(VM마다 swtpm 하나)과 **Secure Boot**(Microsoft 키를 넣은 UEFI 변수)를 단다 — Windows 11, BitLocker,
+LUKS의 TPM 봉인, 서명된 부트로더만 켜기에 쓴다(Proxmox VE의 `tpmstate0`·`pre-enrolled-keys`, vSphere의 vTPM·Secure Boot와
+같은 자리). 모든 노드가 이 버전이어야 한다(노드가 알리는 기능 `vtpm` — 아니면 `tpm`·`secure_boot`가 든 VM 스펙 쓰기,
+`vm-firmware-reset` Task, TPM 상태가 든 백업 받기·복원은 **409** `cluster_upgrading`). 두 칸이 없는 VM의 JSON과 QEMU
+명령줄은 그대로다. 설계는 [vTPM·Secure Boot·게스트 에이전트 설계](docs/superpowers/specs/2026-11-18-vtpm-secure-boot-guest-agent-design.md).
+
+**필요한 것.**
+
+- **UEFI**: `tpm`·`secure_boot`는 `firmware: uefi` VM만 쓸 수 있다(**400** `tpm needs UEFI firmware`·`secure_boot needs
+  UEFI firmware`). 템플릿도 `tpm`을 가질 수 있다(배포한 VM은 새 TPM — 아래).
+- **swtpm**: 노드에 `swtpm`과 `swtpm-tools`(`swtpm_setup`)가 있어야 TPM VM을 켠다. 패키지는 둘을 `Recommends`로만 둔다
+  (TPM을 쓰지 않는 노드도 있다). 다른 경로면 `[hypervisor] swtpm`·`swtpm_setup`.
+- **Secure Boot 펌웨어**: QEMU 펌웨어 descriptor(`/etc/qemu/firmware`, `/usr/share/qemu/firmware`)에서 `secure-boot`과
+  `enrolled-keys`가 있는(x86_64는 `requires-smm`도) UEFI flash 펌웨어를 찾는다 — Debian·Ubuntu `ovmf`면
+  `OVMF_CODE_4M.secboot.fd`·`OVMF_VARS_4M.ms.fd`, aarch64는 배포판의 AAVMF descriptor에 `enrolled-keys`가 있을 때만이다.
+  Homebrew QEMU의 secure descriptor에는 `enrolled-keys`가 없으므로 macOS 노드는 Secure Boot를 못 한다(swtpm도 없어 TPM도
+  없다). 다른 파일을 쓰려면 `[hypervisor] secure_boot_code`·`secure_boot_vars`(둘 다 주거나 둘 다 생략). 보통 UEFI VM의
+  `uefi_code`·`uefi_vars`는 바뀌지 않는다.
+- **노드 능력**: orbivisord가 시작할 때 노드 기록에 `firmware_caps { tpm, secure_boot }`를 쓴다. `tpm`은 swtpm이 TPM 2.0을
+  알리고(`swtpm socket --print-capabilities`), QEMU에 `-tpmdev emulator`가 있고, 실제 상태·실행 디렉터리에서 swtpm을 VM과
+  같은 인자로 띄워 볼 수 있을 때다. 아니면 이유를 경고 `TPM is off on this node: …`로 남긴다. `secure_boot`는 찾은
+  펌웨어 파일이 있을 때다. 스케줄러·HA 대상·균형 조정기·마이그레이션 대상은 능력 없는 노드를 거른다(`node "x" has no
+  swtpm for the VM's TPM (install swtpm and swtpm-tools)`, `node "x" has no Secure Boot firmware for the VM (install ovmf
+  with Secure Boot keys)`). 능력을 알리지 않은 노드(옛 노드)는 능력 없음이다. `node list`의 `TPM`·`SB` 열, `node get`
+  stderr의 `firmware: tpm yes, secure boot no`, 웹 노드 목록의 "펌웨어" 열로 본다.
+- **AppArmor**: Ubuntu·Debian의 swtpm은 AppArmor 프로필(`/usr/bin/swtpm`)에 묶여 있다. 패키지는 기본 경로(`data_dir =
+  /var/lib/opl`, `run_dir = /run/opl`)의 규칙 `/etc/apparmor.d/abstractions/orbivisor-swtpm`(conffile)을 싣고, postinst가
+  `/etc/apparmor.d/local/usr.bin.swtpm`에 `include <abstractions/orbivisor-swtpm>`을 한 번 더한 뒤 프로필을 다시 읽힌다
+  (purge는 그 줄만 뺀다). **`data_dir`·`run_dir`을 바꿨으면** 그 경로로 같은 규칙을 local 파일에 더하고 다시 읽힌 뒤
+  orbivisord를 다시 시작한다. 막히면 VM 켜기가 실패하는 대신 노드가 `TPM no`를 알린다(위 경고).
+
+  ```
+  # /etc/apparmor.d/local/usr.bin.swtpm (data_dir = /srv/opl, run_dir = /run/opl일 때)
+  /srv/opl/vm/*/tpm/ rw,
+  /srv/opl/vm/*/tpm/** rwk,
+  /run/opl/vm/*/ r,
+  /run/opl/vm/*/tpm.sock rw,
+  /run/opl/vm/*/swtpm.pid rw,
+  /run/opl/vm/*/swtpm.log rw,
+  ```
+
+  ```bash
+  sudo apparmor_parser -r /etc/apparmor.d/usr.bin.swtpm && sudo systemctl restart orbivisord
+  ```
+
+**켜고 끄기.**
+
+```bash
+orbivisorctl vm create win --firmware uefi --machine q35 --tpm on --secure-boot on --disk win-disk0 --network lan
+orbivisorctl vm set web --tpm on                   # 실행 중이면 다음 재시작 때 붙는다(보류 tpm: off -> on)
+orbivisorctl vm set web --tpm off                  # TPM 장치만 뗀다. 상태 파일은 남아 다시 켜면 같은 TPM이다
+orbivisorctl vm get win                            # stderr: tpm: on (state on node node1, copies: node2) / secure boot: on
+```
+
+- API는 VM 스펙의 `tpm: true`·`secure_boot: true`다(`POST /vms`, `PUT /vms/{key}`). 끄면 칸을 뺀다.
+- **TPM**: q35는 `tpm-crb`, virt는 `tpm-tis-device`이고 명령줄 끝에 붙어 디스크·NIC의 PCI 주소는 바뀌지 않는다. 실행 중에
+  더하거나 빼면 [VM 무중단 유형 변경](#vm-무중단-유형-변경)의 보류(`tpm`, 재시작)다. 상태를 지우는 길은 초기화와 VM 지우기
+  뿐이다.
+- **Secure Boot**: 꺼진 VM에서만 바꾼다(**409** `vm_running` — 펌웨어와 SMM이 바뀐다). x86_64 q35는 `smm=on`과 secure
+  pflash를 쓴다. 처음 켤 때 MS 키를 넣은 변수 템플릿에서 변수를 만든다. **이미 UEFI 변수가 있는 VM**(한 번 켠 VM,
+  `status.firmware_node`가 있음)은 변수가 키 없이(또는 키와 함께) 만들어졌으므로 `PUT`만으로 바꾸면 **409**
+  `firmware_reset_required`(`VM "win" has UEFI variables made for Secure Boot off; reset them together with the change (vm
+  set win --secure-boot on --reset-uefi-vars, boot entries are lost) …`)다. 변수 초기화와 함께 바꾼다(아래). 몰래
+  초기화하지 않는다.
+
+**Windows 11 미리 채우기.** 스펙에 OS 종류 칸은 없고 클라이언트가 값을 채운다.
+
+```bash
+orbivisorctl vm create win11 --preset windows11 --disk win11-disk0 --cdrom win11.iso --network lan
+# note: the windows11 preset uses SATA disks and an e1000e NIC so Windows installs without drivers; …
+```
+
+q35·UEFI(다른 `--machine`·`--firmware`는 거절), `tpm`·`secure_boot`·`guest_agent: {}`, 소켓 1 × 코어 2, 4096 MiB(따로
+주지 않았을 때), 디스크 버스 SATA, NIC e1000e다 — 드라이버 없이 설치되게 한 것이고, VirtIO 드라이버를 넣은 뒤 VirtIO로
+바꾸라고 알린다. 따로 준 값(`--cores`, `--tpm off` 등)이 이긴다. CLI는 볼륨을 만들지 않으므로 `--disk`로 준 볼륨의 버스만
+바꾼다. 웹 새 VM 폼의 "Windows 11" 단추는 64 GiB 디스크까지 채운다.
+
+**초기화와 Secure Boot 바꾸기.** 꺼진 VM의 UEFI 변수(부팅 항목)나 TPM 상태를 지운다. 다음 켜기에서 새로 만든다.
+
+```bash
+orbivisorctl vm firmware reset win --uefi-vars           # POST /vms/{key}/firmware/reset {"uefi_vars": true} → 202 Task
+orbivisorctl vm firmware reset win --tpm                 # VM 이름을 쳐서 확인(터미널이 아니면 --yes), 새 TPM
+orbivisorctl vm set win --secure-boot on --reset-uefi-vars   # {"uefi_vars": true, "secure_boot": true} 한 요청
+```
+
+- Task `vm-firmware-reset`이 VM의 `firmware_epoch`(회차)를 1 올리고 그 노드의 파일을 지운다. TPM을 지우면 `tpm_sha256`·
+  사본을 지우고, 다른 온라인 노드에도 옛 TPM 상태를 지우라고 알린다(오프라인 노드의 낡은 파일은 회차가 달라 그 노드에서
+  다음에 켜거나 30분마다의 정리에서 지운다). 회차가 다른 노드의 낡은 변수·TPM은 쓰이지 않는다.
+- **TPM 초기화는 되돌릴 수 없다**: TPM에 봉인한 비밀(BitLocker 키, LUKS TPM 슬롯, 자격 증명)을 잃고 게스트가 복구 키를
+  묻는다. CLI는 그래서 VM 이름을 묻는다(웹 확인 창도 이름을 입력해야 함).
+- `secure_boot`(선택, `uefi_vars`가 있어야 함)를 주면 Task가 스펙의 `secure_boot`도 함께 바꾼다. `vm set --secure-boot …
+  --reset-uefi-vars`가 이 요청을 보내 Task를 기다린 뒤, 다른 변경이 있을 때만 `PUT`한다(`vm win: UEFI variables reset,
+  Secure Boot on`). Task가 끝날 때까지 켜기·재시작·켜는 `PUT`은 **409** `vm_busy`라 낡은 변수로 켜지지 않는다. 변수가 아직
+  없는 VM은 `vm set --secure-boot on`(PUT)으로 바로 바뀐다.
+- 거절: 아무것도 고르지 않음·`secure_boot`만 줌(**400**), 꺼져 있지 않음(**409** `vm_running`), 켜는 중·끄는 중이거나
+  전원·마이그레이션·스냅샷·복제·백업 Task가 있음(**409** `vm_busy`), TPM 상태가 있는 VM에서 `firmware_node`가 오프라인인데
+  변수만·TPM만 초기화(**409** `node_unavailable` — 그 노드의 변수가 엇갈리므로 둘 다 초기화하거나 그 노드가 돌아온 뒤).
+  Task는 온라인 `firmware_node`에서, 없으면 디스크를 가진 노드에서 돈다. 권한은 `Write` Vm, 감사 설명은 `vm firmware reset
+  win (uefi vars, tpm)`(+ `, secure boot on`).
+
+**TPM 상태는 어디에 있고 어떻게 따라다니나.** TPM 상태는 공유 풀이 아니라 **VM을 마지막으로 돌린 노드의 로컬 파일**
+`{data_dir}/vm/{id}/tpm/tpm2-00.permall`(디렉터리 0700, 파일 0600)이다. Raft에는 비밀을 두지 않고 해시와 위치만 둔다:
+`status.tpm_node`(TPM 상태의 노드), `status.tpm_sha256`(지금 상태의 SHA-256), `status.firmware_copies`(같은 해시의 사본을
+가진 다른 노드), `status.firmware_epoch`. UEFI 변수의 `status.firmware_node`([라이브 마이그레이션](#라이브-마이그레이션)의
+"UEFI 변수")와 같은 방식이지만 **엄격하다** — 변수를 잃으면 부팅 항목만 잃지만 TPM을 잃으면 봉인한 키를 잃으므로, 지금
+TPM 상태를 얻지 못하면 **켜지 않는다**.
+
+- **swtpm**: QEMU처럼 VM마다 떼어 낸 데몬(`--daemon --terminate`, systemd면 `opl-tpm-{id}.scope`)이라 orbivisord를 다시
+  시작해도 TPM은 VM과 함께 돈다. QEMU가 끝나면 swtpm도 끝난다. 처음 켤 때 `swtpm_setup`이 EK와 인증서를 만든다.
+- **켜기**: 이 노드 파일의 해시가 같거나 이 노드가 `tpm_node`면 그 파일로, 아니면 `tpm_node`에서, 그 노드가 오프라인이거나
+  받지 못하면 온라인 사본 노드에서 받아(해시 확인) 켠다. 기록된 상태가 없으면(처음 켜기·복제·TPM 초기화 뒤) 새로 만든다.
+  어디서도 얻지 못하면 켜지 않고 `last_error`(`the TPM state of VM "win" is on node "a" (offline) and no other node holds a
+  current copy; start it when "a" is back, or reset the TPM with vm firmware reset win --tpm`)를 남긴 채 다시 본다. 꺼진 VM의
+  `vm start`는 이 경우 미리 **409** `tpm_state_unavailable`이다.
+- **사본**: `tpm_node`의 작업자가 켤 때·멈출 때와 도는 동안 60초마다 해시를 다시 적고, 바뀌었으면 사본을 비운 뒤 사본
+  대상에 변수+TPM을 밀어 둔다(노드 사이 연결, 해시 확인). 사본 대상(셋까지)은 [로컬 디스크 복제](#로컬-디스크-복제와-ha)
+  대상이 먼저이고, 그다음은 HA VM이면 TPM 능력이 있는 다른 HA 가능 노드(HA 그룹 우선순위 순)다. **HA도 복제도 없는 VM은
+  사본을 두지 않는다.** `vm get`의 `tpm:` 줄과 웹 VM 요약의 "보안" 카드가 상태와 사본 노드를 보인다.
+- **HA**: `tpm_node`가 죽은 TPM VM은 **사본 노드에서만** 복구한다. 사본 노드가 없거나 모두 오프라인이면 켜지 않고 위 문구를
+  남긴다 — 새 TPM으로 몰래 켜면 게스트가 복구 키를 묻고 멈추므로 사람이 고르게 한다(노드가 돌아오기를 기다리거나 `vm
+  firmware reset --tpm`). [HA VM과 자기 펜싱](#ha-vm과-자기-펜싱)의 "죽은 노드에만 있던 UEFI 변수는 잃는다"는 TPM VM에선
+  사본으로 줄어든다.
+- **라이브 마이그레이션·로컬 디스크 마이그레이션**: QEMU가 swtpm 상태를 마이그레이션 스트림에 실어 대상 노드의 새 swtpm에
+  넣는다(대상에 TPM 능력이 없으면 거른다). Secure Boot의 pflash도 함께 간다. 확정이 `tpm_node`를 대상으로 바꾸고 사본을
+  비우며, 대상이 곧 해시를 다시 적고 사본을 밀어 둔다. 원본에 남은 파일은 낡은 사본이다. 노드 비우기도 같은 길이다.
+- **사본 지연**: 사본은 마지막 밀어 두기(60초 주기) 시점이다. 그 사이 TPM에 쓴 것(NV 카운터, 그때 만든 키)은 HA 복구나
+  사본으로 켜기에서 없어질 수 있다 — 복제 회차의 디스크와 TPM 시점이 다를 수 있는 것과 같다(TPM 영구 상태는 드물게 바뀐다).
+
+**스냅샷·백업·복제.**
+
+- **디스크 스냅샷**: 변수 복사본 옆에 TPM 복사본 `{data_dir}/vm/{id}/snapshots/{snap}.tpm`을 둔다(`snapshot.status.tpm_node`
+  가 그 노드). 되돌리기가 함께 돌려놓는다. 다른 노드에서 되돌리면 디스크·전원을 건드리기 전에 `the TPM copy of snapshot
+  "a" is on node "n"; revert it while the VM is on that node`로 실패한다. 메모리 스냅샷은 vmstate에 TPM 상태가 들어 있다
+  (TPM·Secure Boot·에이전트 채널이 찍을 때와 같아야 되돌린다). 스냅샷을 지우면 다른 노드의 TPM 복사본도 지운다.
+- **백업**: 백업 디렉터리에 `tpm2-00.permall`(0600)을 넣고 `tpm_state: true`로 적는다(증분 백업에도 늘 — 작다). TPM
+  상태를 얻지 못하면 TPM 없이 담지 않고 실패한다. **복원**은 새 VM에 그 TPM을 두므로 BitLocker VM도 복구 키 없이 켜진다.
+  백업 저장소를 읽을 수 있으면 TPM 상태도 읽을 수 있다(암호화는 없음 — [백업과 복원](#백업과-복원)의 한계). 원격 클러스터
+  받기·복원은 `vtpm`이 없는 노드가 있으면 버리지 않고 **409** `cluster_upgrading`이다. Orbivisor 없이 열 때는 백업의
+  `tpm2-00.permall`을 빈 디렉터리에 두고 `swtpm socket --tpm2 --tpmstate dir=그디렉터리 --ctrl type=unixio,path=tpm.sock`을
+  띄워 QEMU `-chardev socket,id=chrtpm,path=tpm.sock -tpmdev emulator,id=tpm0,chardev=chrtpm -device tpm-crb,tpmdev=tpm0`.
+- **복제(`vm clone`)·템플릿 배포·스냅샷에서 복제**: 새 VM은 **늘 새 TPM**이다(EK와 봉인한 비밀이 겹치지 않게 — 템플릿은
+  일반화된 원본이다). UEFI 변수와 Secure Boot 키는 복사한다. 원본에 TPM 상태가 있었으면 Task 경고 `VM "web-1" got a new
+  TPM; secrets sealed to the TPM of "tmpl" do not carry over`. TPM까지 옮기려면 백업 → 복원을 쓴다.
+- **VM 지우기**: 노드마다 30분마다 `{data_dir}/vm/{id}` 가운데 VM이 없어진 디렉터리(1시간 넘음, 그 VM의 Task 없음, 리더와
+  맞춘 클러스터 기록으로 확인)를 지운다. 거쳐 간 노드의 변수·TPM 비밀이 남지 않는다.
+
+**버전이 섞인 클러스터.** `vtpm`을 모르는 노드가 있으면 위 409이고, 옛 노드는 `tpm`·`secure_boot`가 든 VM 스펙을 풀지
+못하므로 그런 VM을 먼저 만들지 않는다. 업그레이드한 노드의 기존 UEFI VM은 변수를 그대로 쓴다. 기존 VM에 TPM을 켜면 처음
+켤 때 새 TPM을 만든다.
+
+**오류 코드.**
+
+| 코드 | 때 |
+|---|---|
+| 400 | UEFI가 아닌 VM의 `tpm`·`secure_boot`, 초기화할 것이 없음, `uefi_vars` 없는 `secure_boot` |
+| 409 `firmware_reset_required` | UEFI 변수가 있는 VM의 Secure Boot를 `PUT`으로 바꿈(`--reset-uefi-vars`로) |
+| 409 `tpm_state_unavailable` | 꺼진 TPM VM을 켜는데 고른 노드가 지금 TPM 상태를 얻을 수 없음 |
+| 409 `vm_running` | 실행 중 Secure Boot 바꾸기·초기화 |
+| 409 `vm_busy` | 초기화 중 켜기, 다른 Task 중 초기화 |
+| 409 `node_unavailable` | TPM VM의 `firmware_node`가 오프라인인데 변수만·TPM만 초기화 |
+| 409 `cluster_upgrading` | `vtpm` 기능이 없는 노드가 있을 때 TPM·Secure Boot·초기화·TPM 백업 받기·복원 |
+
+웹: VM 폼의 "보안" 카드(TPM 2.0, Secure Boot — 노드 능력이 없으면 막고 이유, 변수가 있는 VM의 Secure Boot는 초기화 창으로
+안내), 새 VM 폼의 "Windows 11" 단추, VM 요약의 "보안" 카드(TPM 상태의 노드·사본, "Secure Boot 켜기/끄기"), "UEFI 변수·TPM
+초기화" 확인 창(VM 이름 입력), 노드 목록의 "펌웨어" 열.
+
+**넣지 않은 것(나중).** TPM 1.2, 호스트 TPM 통과(passthrough), 공유 풀 위의 TPM 상태 볼륨, swtpm 상태·백업 암호화, 사용자
+Secure Boot 키(PK/KEK/db) 등록·dbx 갱신, 복제 때 TPM 복사, 측정 부팅 증명, Hyper-V enlightenment, VirtIO 드라이버 ISO.
+
+**한계.**
+
+- 노드 능력은 orbivisord가 시작할 때만 본다 — swtpm·ovmf를 나중에 설치하거나 AppArmor 규칙을 고쳤으면 orbivisord를 다시
+  시작한다.
+- 노드가 이미 정해진 VM(한 번 켠 VM)의 `vm start`는 스케줄러를 거치지 않으므로, 능력 없는 노드에서는 409 대신 켜다
+  실패해 `last_error`에 이유를 남긴다.
+- macOS 노드는 swtpm이 없어 TPM VM을 켜지 못하고(Homebrew에 swtpm 없음), Secure Boot 펌웨어도 찾지 못한다.
+- 사본은 60초 시점이다(위 "사본 지연"). 첫 해시 기록(멈출 때·60초) 전에 노드가 죽으면 다른 노드는 새 TPM으로 켠다.
+- 사본은 HA·복제 VM에만 있다 — 그 밖의 TPM VM은 `tpm_node`가 꺼져 있으면 켜지 못한다.
+
+## 게스트 에이전트
+
+VM 안의 **QEMU 게스트 에이전트**(`qemu-guest-agent`)와 이야기해 게스트 정보(OS·호스트 이름·IP·파일 시스템)를 보이고,
+에이전트로 끄고, 스냅샷·백업·복제 때 파일 시스템을 얼리고(fs-freeze), 게스트 사용자 비밀번호를 바꾼다(Proxmox VE의 QEMU
+Guest Agent, VMware Tools와 같은 자리). 모든 노드가 이 버전이어야 한다(기능 `guest-agent` — 아니면 `guest_agent`가 든 VM
+스펙 쓰기와 받기·복원, 비밀번호는 **409** `cluster_upgrading`). 게스트 안에 `qemu-guest-agent`가 돌아야 한다(cloud-init이면
+`vendor_data`의 `packages: [qemu-guest-agent]`, Windows는 VirtIO 드라이버 ISO의 guest agent).
+
+```bash
+orbivisorctl vm set web --guest-agent on                  # 채널(virtio-serial org.qemu.guest_agent.0)은 다음 재시작 때 붙는다
+orbivisorctl vm set web --agent-freeze off                # 스냅샷·백업·복제 때 얼리지 않기(기본 on)
+orbivisorctl vm set web --agent-shutdown acpi             # 끌 때 늘 ACPI(기본 agent)
+orbivisorctl vm guest web                                 # GET /vms/{key}/guest
+orbivisorctl vm guest web --refresh                       # 지금 묻기(?refresh=true)
+orbivisorctl vm guest password web --user root            # 터미널이면 두 번 묻기, 아니면 표준 입력의 첫 줄
+```
+
+- **스펙**: `guest_agent: { freeze_fs: true, shutdown: "agent" | "acpi" }`, 둘 다 기본값이면 `{}`이다. 끄면(`--guest-agent
+  off`) 칸을 뺀다. 채널은 장치라 실행 중에 붙이거나 떼면 보류(`guest_agent`, 재시작)이고 `freeze_fs`·`shutdown`은 바로
+  적용된다. HA 게스트 감시(`ha.guest_watch`)만 있는 VM도 같은 채널을 쓰므로 게스트 정보가 보인다.
+- **에이전트로 끄기**: `shutdown: agent`이고 이 QEMU에서 에이전트가 답한 적이 있으면 `vm stop`·`vm reboot` 등 노드가
+  VM을 끄는 길이 `guest-shutdown`을 보낸다(ACPI 단추를 무시하는 게스트도 꺼진다). 채널이 없거나 답하지 않거나 오류면 곧바로 ACPI로
+  넘어가고, 나머지는 지금처럼 `acpi_timeout` 뒤 강제 종료다.
+
+**게스트 정보.** VM을 돌리는 노드가 에이전트에 `guest-info`·`guest-get-osinfo`·`guest-get-host-name`·
+`guest-network-get-interfaces`·`guest-get-fsinfo`를 60초마다 물어 **노드 메모리**에 둔다(Raft에 쓰지 않는다 — 지표와 같다).
+API는 VM이 도는 노드에서 읽는다(다른 노드면 노드 사이 연결, 3초 제한).
+
+```
+os: Ubuntu 24.04.1 LTS (kernel 6.8.0-45-generic)
+hostname: web
+agent: 8.2.2
+collected: 2026-11-18 06:30:05 UTC (42s ago)
+
+NIC   MAC                ADDRESSES
+lo    00:00:00:00:00:00  127.0.0.1/8, ::1/128
+ens3  52:54:00:12:34:56  10.0.0.21/24, fe80::5054:ff:fe12:3456/64
+
+MOUNT  TYPE  USED    SIZE
+/      ext4  2.1GiB  19.2GiB
+```
+
+- `GET /vms/{key}/guest[?refresh=true]`(`Read` Vm) → **200** `{ state, info? }`. `state`는 `answered`(`info`가 있음),
+  `no_agent`(채널이 없거나 에이전트가 답한 적 없음), `not_running`, `unreachable`(VM의 노드가 답하지 않음), `unsupported`(VM의
+  노드가 옛 버전)이고, 에이전트 문제로 오류를 돌려주지 않는다. `info`는 `collected_at`·`agent_version`·`os {id, name, version,
+  kernel}`·`hostname`·`interfaces[] {name, mac, addresses[] {ip, prefix}}`·`filesystems[] {mountpoint, fstype, used_bytes,
+  total_bytes}`이다. 게스트가 보낸 값은 믿지 않고 자른다(NIC 64, NIC마다 주소 32, 파일 시스템 64, 문자열 256바이트).
+- `refresh=true`는 지금 묻는다(VM마다 5초에 한 번, 다른 노드면 25초 제한). 에이전트가 답하지 않으면 앞 정보를 둔다. VM이
+  꺼지거나 노드를 떠나면 정보를 지운다.
+- 웹: VM 요약의 "게스트 에이전트" 카드와 "게스트" 탭(OS·호스트 이름·IP·파일 시스템 사용량, 수집 시각, "새로 고치기"),
+  60초마다 다시 읽는다.
+
+**게스트 비밀번호.** `POST /vms/{key}/guest/password {user, password}`(`Write` Vm — 게스트 root와 같은 무게) → **200**
+`{user}`. 에이전트의 `guest-set-user-password`로 바꾼다. user는 1~64바이트(제어 문자 없음), password는 1~256바이트다
+(**400**). 비밀번호는 저장하지 않고 로그·감사·오류 문구에 넣지 않는다 — 감사에는 `vm guest password web user root`만
+남는다. CLI는 인자로 받지 않는다. VM이 돌지 않으면 **409** `vm_not_running`, 채널이 없거나(`VM "web" has no guest agent
+channel; turn on guest_agent and restart the VM`) 에이전트가 답하지 않으면 **409** `guest_agent_unavailable`, VM의 노드에
+닿지 않으면 **503** `node_unreachable`. 웹은 "게스트 비밀번호 설정" 창(Windows 게스트면 `Administrator`, 아니면 `root`로
+채움).
+
+**fs-freeze.** `freeze_fs`(기본 on)인 실행 중 VM은 디스크 스냅샷(메모리 없음)·백업(전체·증분)·[로컬 디스크
+복제](#로컬-디스크-복제와-ha) 회차가 시점을 고정하는 순간 바로 앞에서 `guest-fsfreeze-freeze`, 바로 뒤에서 `thaw`를
+보낸다(전송 내내 얼리지 않는다) — 그 시점은 crash-consistent가 아니라 파일 시스템이 일관된 시점이다(Windows는 VSS).
+
+- 얼리지 못하면(에이전트 없음, 10초 시간 초과, 오류) Task를 실패시키지 않고 경고 `guest agent did not freeze file systems
+  (…); the snapshot is crash-consistent`를 남긴다.
+- **블록 스냅샷 디스크**(LVM-thin·ZFS·RBD·공유 LVM)의 스냅샷은 VM을 잠깐 멈추고 저장소로 찍으므로 얼리지 않는다(멈춘 게스트의
+  에이전트는 답하지 않음) — 경고 `… (lvm-thin disks are snapshotted with the VM paused); the snapshot is crash-consistent`.
+- 녹이기는 실패해도 다시 해 보고, orbivisord가 그사이 죽어도 다시 붙을 때 표시 파일(`{run_dir}/vm/{id}/fsfrozen`)을 보고
+  녹인다.
+- 메모리 스냅샷은 얼리지 않는다(메모리째 담는다).
+
+**`guest-exec`는 없다.** API 권한만으로 게스트 안 root 명령이 되므로 넣지 않았다(`guest-file-*`도). 콘솔과 cloud-init을
+쓴다.
+
+**넣지 않은 것(나중).** `guest-exec`(관리자 전용이라도 감사·출력·시간 제한 설계가 따로 필요), VM 목록의 IP 열, `guest-fstrim`.
+
 ## VM 무중단 유형 변경
 
 실행 중인 VM의 vCPU·메모리를 늘리거나 줄이고 디스크·NIC를 붙이거나 뗀다(Proxmox VE의 hotplug, VMware의 CPU·메모리
@@ -2581,8 +2841,8 @@ orbivisorctl vm get web                                                 # 표준
   쓴다). 증분은 대상의 **겹층**(`{data_dir}/replicas/overlays/`의 qcow2, backing = 복제본)으로 받고, 회차가 끝까지 온 뒤에만
   `qemu-img commit`으로 복제본에 합친다 — 회차가 중간에 끊겨도 복제본은 앞 회차 그대로 쓸 수 있다. 받는 쪽은 끝까지 받은
   회차를 기록하고 곧바로 답하며 합치기는 그 뒤에 따로 한다(그 VM의 다음 받기·승격만 기다리고 다른 VM의 받기는 막지 않는다 —
-  합치기가 끊기면 다음 받기·청소·승격이 먼저 마저 합친다). 모든 디스크를 게스트를 멈춘 한 시점으로 떠 **crash-consistent**(백업과
-  같다 — 게스트 에이전트 fs-freeze는 아직 없다). 대역폭 상한은 `[replication] bandwidth_mib`(MiB/s, 디스크 수로 나눈다, 0이면 없음).
+  합치기가 끊기면 다음 받기·청소·승격이 먼저 마저 합친다). 모든 디스크를 게스트를 멈춘 한 시점으로 떠 **crash-consistent**다(백업과
+  같다 — `guest_agent.freeze_fs` VM은 그 직전에 파일 시스템을 얼린다, [게스트 에이전트](#게스트-에이전트)). 대역폭 상한은 `[replication] bandwidth_mib`(MiB/s, 디스크 수로 나눈다, 0이면 없음).
 - **잃는 데이터.** HA 복구는 **마지막으로 끝난 회차의 시점**으로 켠다. 그 뒤의 쓰기는 잃는다 — 최악은 "주기 + 회차가 걸린
   시간"이다(15분 주기면 대략 15분 남짓). 복구 문구가 그 시점을 말한다: `recovering: node node1 failed; restarting from the
   replica on node node2 taken at 2026-11-15 06:00:00 UTC (writes after that are lost)`(VM `status.last_error`). 이 문구는 VM이 켜지면
@@ -2654,7 +2914,7 @@ orbivisorctl vm get web                                                 # 표준
   `last_try`·`synced_at`이 클러스터 기록에 있어 일정이 이어진다.
 - **업그레이드.** 모든 노드가 `node-replication`을 알아야 복제를 켤 수 있고(아니면 **409** `cluster_upgrading`) 복제 Task·
   복제본 승격·따라잡기 마이그레이션을 한다. 받은 백업·복제(clone)·복원·가져오기로 만든 VM은 `replication`을 비운다.
-- **한계.** 게스트 에이전트 fs-freeze(일관된 파일 시스템 시점), 꺼진 VM 복제, 스냅샷까지 복제, HA가 아닌 VM을 손으로 복제본에서
+- **한계.** 꺼진 VM 복제, 스냅샷까지 복제, HA가 아닌 VM을 손으로 복제본에서
   켜기, 갈라진 옛 원본을 증분으로 되돌리기(늘 전체), raw 디스크 비트맵을 재시작 뒤에도 지키기, 시계에 맞춘 일정은 아직 없다.
 
 ## 제어부 가용성
@@ -3427,7 +3687,8 @@ orbivisorctl backup delete before-upgrade                    # 파일과 리소�
 
 **파일 형식과 Orbivisor 없이 열기.** 백업 하나는 백업 풀 루트의 `backups/{백업 id}/` 디렉터리다(id는 `orbivisorctl backup
 get NAME`의 `id`; NFS 풀이면 NFS 서버의 내보내기 아래 같은 경로). 그 안에 디스크마다 압축 qcow2 `disk0.qcow2`,
-`disk1.qcow2`…(backing file 없음, 스냅샷 없음), UEFI VM이면 변수 파일 `vars.fd`, 그리고 `manifest.json`(형식 버전
+`disk1.qcow2`…(backing file 없음, 스냅샷 없음), UEFI VM이면 변수 파일 `vars.fd`, TPM VM이면 TPM 상태
+`tpm2-00.permall`(매니페스트 `tpm_state: true`, swtpm `--tpmstate dir=`로 연다 — [vTPM과 Secure Boot](#vtpm과-secure-boot)), 그리고 `manifest.json`(형식 버전
 `version: 1`, 백업 id, VM id·이름, VM 스펙 전체, 디스크 목록과 크기, 만든 시각)이 있다. 증분 백업의 매니페스트는
 `version: 2`이고 부모 백업 id `parent`가 더 있다. 표준 qcow2라 Orbivisor 없이도 연다:
 
@@ -3512,7 +3773,7 @@ orbivisorctl backup-job delete nightly         # 작업만 지운다. 만든 백
   `POST /api/v1/backup-jobs/{name}/run`이고, 읽기는 모든 사용자, 쓰기는 operator 이상이다. 스케줄러의 확인 간격은
   `[backup] tick_secs`(기본 60초)다.
 
-- **한계.** 중복 제거, 암호화, 원격(S3) 저장소, 게스트 에이전트로 얼리기, 파일 단위 복원, 기존 VM 덮어쓰기는 없다.
+- **한계.** 중복 제거, 암호화(TPM 상태 `tpm2-00.permall`도 그대로 담긴다), 원격(S3) 저장소, 파일 단위 복원, 기존 VM 덮어쓰기는 없다.
   다른 Orbivisor 클러스터로 사본을 보내는 것은 아래 "원격 복제(DR)"다. 증분 백업은: 꺼진 VM은 늘 전체(매일 백업하는
   꺼진 VM은 매일 전체를 쓴다), 블록 풀 VM은 다시 켠 뒤 첫 백업이 전체, VM마다 비트맵이 하나라 두 풀에 번갈아 백업하면
   늘 전체, 체인 병합과 중간 백업 지우기 없음, 증분 파일만으로는 복원할 수 없음(Orbivisor 밖에서는 위처럼 체인을 적어
@@ -4542,6 +4803,14 @@ cargo test -p opld --features qemu-it --test templates              # E2E: 템�
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img OPL_TEST_CLOUD_SUMS=/tmp/SHA256SUMS \
   cargo test -p opld --features templates-it,qemu-it --test templates -- --nocapture
 cargo test -p oplctl --features catalog-it --test catalog -- --nocapture  # 내장 이미지 카탈로그 링크·체크섬 파일 확인(인터넷 필요)
+cargo test -p opld --features qemu-it --test vtpm                   # E2E: TPM·Secure Boot·게스트 에이전트 CLI 흐름(swtpm 없어도 됨 — 노드 능력대로)
+# Linux, swtpm·swtpm-tools: 실제 swtpm으로 TPM VM의 상태 만들기·해시·초기화, 드라이버의 swtpm 수명과 TPM VM 옮기기
+cargo test -p opld --features vtpm-it --test vtpm
+cargo test -p opl-driver --features vtpm-it --test qemu_driver --test qemu_migration
+# x86_64 Linux, KVM, swtpm·ovmf: 실제 게스트 — Ubuntu 24.04 클라우드 이미지를 Secure Boot·TPM·게스트 에이전트로 켜 /dev/tpm0·
+# SecureBoot 변수·EK 해시 보고, 게스트 정보·얼린 스냅샷·에이전트 끄기, 다시 켜기·복제의 EK(CI install-media 작업)
+OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
+  cargo test -p opld --features vtpm-it,install-media-it,qemu-it --test vtpm -- --nocapture
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -4722,6 +4991,7 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [제어부 가용성과 대규모 클러스터 설계 (하위 프로젝트 15: 계획 45~56)](docs/superpowers/specs/2026-11-11-availability-scale-design.md)
 - [설치 매체와 cloud-init 설계 (계획 57)](docs/superpowers/specs/2026-11-17-install-media-cloud-init-design.md)
 - [템플릿·연결 복제·이미지 라이브러리 설계 (계획 58)](docs/superpowers/specs/2026-11-17-templates-linked-clones-design.md)
+- [vTPM·Secure Boot·게스트 에이전트 설계 (계획 59)](docs/superpowers/specs/2026-11-18-vtpm-secure-boot-guest-agent-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](docs/superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](docs/superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](docs/superpowers/plans/2026-10-21-plan3-opl-cluster.md)
@@ -4780,3 +5050,4 @@ systemd가 있는 Linux에서는 `OPL_TEST_SYSTEMD=1`을 주면 QEMU 테스트�
 - [계획 56: Ceph 자동 구성](docs/superpowers/plans/2026-11-16-plan56-ceph-setup.md)
 - [계획 57: 설치 매체와 cloud-init](docs/superpowers/plans/2026-11-17-plan57-install-media.md)
 - [계획 58: 템플릿·링크드 클론·이미지 라이브러리](docs/superpowers/plans/2026-11-18-plan58-templates.md)
+- [계획 59: vTPM·Secure Boot·게스트 에이전트](docs/superpowers/plans/2026-11-18-plan59-vtpm.md)
