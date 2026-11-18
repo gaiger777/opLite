@@ -7,6 +7,7 @@ pub mod alerts;
 mod api_cert;
 pub mod audit;
 pub mod auth;
+pub mod authz;
 mod backup_jobs;
 mod backup_receive;
 mod backups;

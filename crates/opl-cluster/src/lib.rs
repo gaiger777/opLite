@@ -2,6 +2,7 @@
 
 mod cluster;
 mod exclusive;
+mod folders;
 mod follow;
 mod health;
 mod leader;

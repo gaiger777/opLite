@@ -121,6 +121,13 @@ impl From<ClusterError> for ApiError {
                     ),
                     // 리스 갱신만 받는 거부라 API 요청에서는 나오지 않는다.
                     Rejection::Fenced { .. } => ApiError::conflict("node_fenced", message),
+                    Rejection::FolderCycle { .. } => ApiError::conflict("folder_cycle", message),
+                    Rejection::FolderTooDeep { .. } => {
+                        ApiError::conflict("folder_too_deep", message)
+                    }
+                    Rejection::FolderNotEmpty { .. } => {
+                        ApiError::conflict("folder_not_empty", message)
+                    }
                 }
             }
             ClusterError::Timeout | ClusterError::Unreachable(_) => ApiError::new(
@@ -216,6 +223,31 @@ mod tests {
         assert_eq!(e.status, StatusCode::CONFLICT);
         assert_eq!(e.code, "mac_in_use");
         assert!(e.message.contains("52:54:00:00:00:01"));
+    }
+
+    #[test]
+    fn folder_rejections_are_conflicts() {
+        let id = uuid::Uuid::nil();
+        for (r, code) in [
+            (Rejection::FolderCycle { id, parent: id }, "folder_cycle"),
+            (
+                Rejection::FolderTooDeep { id, depth: 17 },
+                "folder_too_deep",
+            ),
+            (Rejection::FolderNotEmpty { id }, "folder_not_empty"),
+        ] {
+            let e = ApiError::from(ClusterError::Rejected(r));
+            assert_eq!(e.status, StatusCode::CONFLICT);
+            assert_eq!(e.code, code);
+        }
+        // 형제 이름 겹침은 이름 겹침과 같다.
+        let e = ApiError::from(ClusterError::Rejected(Rejection::InUse {
+            kind: opl_types::resource::Kind::Folder,
+            field: "name".into(),
+            value: "root-vm/prod".into(),
+            holder: id,
+        }));
+        assert_eq!(e.code, "name_taken");
     }
 
     #[test]

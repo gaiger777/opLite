@@ -59,6 +59,8 @@ utoipa-axum.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
+proptest.workspace = true
 # 시험용 가짜 LDAP 서버의 BER
 bytes.workspace = true
 lber.workspace = true

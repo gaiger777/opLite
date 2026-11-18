@@ -26,6 +26,8 @@ pub struct AppState {
     pub node: Uuid,
     pub hv: Arc<dyn Hypervisor>,
     pub authorizer: Arc<dyn Authorizer>,
+    /// 폴더·객체 권한의 평가 색인(계획 62). 스테이지 3 전까지는 경로가 부르지 않는다.
+    pub authz: Arc<crate::authz::Authz>,
     /// 올린 이미지를 가져오기 전에 잠시 두는 디렉터리. 볼륨 풀과 같은 파일시스템이면 좋다.
     pub upload_dir: PathBuf,
     /// NFS 풀을 마운트하는 디렉터리(opld의 `{data_dir}/pools`). 다른 클러스터가 보내는 백업 파일을 받을
@@ -95,6 +97,7 @@ impl AppState {
         upload_dir: PathBuf,
     ) -> Self {
         Self {
+            authz: Arc::new(crate::authz::Authz::new(cluster.clone())),
             cluster,
             node,
             hv,

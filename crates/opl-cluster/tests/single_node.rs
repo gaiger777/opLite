@@ -383,3 +383,63 @@ async fn members_include_the_observers_in_the_cluster_info() {
     assert_eq!(c.members().addr(observer), None);
     assert_eq!(c.link_book().links("node-9"), ["node-9"]);
 }
+
+fn folder(name: &str, parent: Option<uuid::Uuid>) -> opl_types::folder::Folder {
+    use opl_types::folder::{FolderKind, FolderSpec};
+    let mut f: opl_types::folder::Folder = Resource::new(
+        "",
+        FolderSpec {
+            name: name.into(),
+            kind: FolderKind::Vm,
+            parent,
+            quota: None,
+        },
+    );
+    f.name = f.id.to_string();
+    f
+}
+
+/// 두 폴더를 서로의 아래로 동시에 옮기면 하나만 이긴다. 같은 이름의 형제를 동시에 만들어도 하나만 된다(계획 62).
+#[tokio::test]
+async fn concurrent_folder_moves_and_names_resolve_in_commit_order() {
+    use opl_types::folder::FolderSpec;
+    let tc = TestCluster::start(1).await;
+    let c = tc.get(node(1));
+    let (a, b) = (folder("a", None), folder("b", None));
+    c.create(&a).await.unwrap();
+    c.create(&b).await.unwrap();
+    let a_under_b = FolderSpec {
+        parent: Some(b.id),
+        ..a.spec.clone()
+    };
+    let b_under_a = FolderSpec {
+        parent: Some(a.id),
+        ..b.spec.clone()
+    };
+    let (r1, r2) = tokio::join!(
+        c.update_spec(a.id, None, BTreeMap::new(), &a_under_b),
+        c.update_spec(b.id, None, BTreeMap::new(), &b_under_a),
+    );
+    let cycles = [&r1, &r2]
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Err(ClusterError::Rejected(Rejection::FolderCycle { .. }))
+            )
+        })
+        .count();
+    assert_eq!(cycles, 1, "{r1:?} {r2:?}");
+    assert_eq!([&r1, &r2].iter().filter(|r| r.is_ok()).count(), 1);
+
+    let (x, y) = (folder("Prod", None), folder("prod", None));
+    let (r1, r2) = tokio::join!(c.create(&x), c.create(&y));
+    assert_eq!([&r1, &r2].iter().filter(|r| r.is_ok()).count(), 1);
+    assert!([r1, r2].into_iter().any(|r| matches!(
+        r,
+        Err(ClusterError::Rejected(Rejection::InUse {
+            kind: Kind::Folder,
+            ..
+        }))
+    )));
+}

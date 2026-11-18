@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::exclusive::exclusive_values;
+use crate::folders;
 use crate::store::{
     KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA, KEY_SNAPSHOT_META, META, NAMES,
     OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
@@ -306,7 +307,7 @@ pub(crate) fn apply_feed(db: &Database, batch: &FeedBatch) -> Result<(), StoreEr
 
 /// 명령 하나를 적용한다. 거부는 결정적이므로 모든 노드가 같은 결과를 낸다.
 /// 바깥 `Err`는 저장소 오류이고, 안쪽 `Err`는 명령 거부다.
-fn apply_command(
+pub(crate) fn apply_command(
     objects: &mut Table<(&'static str, u128), &'static [u8]>,
     names: &mut Table<(&'static str, &'static str), u128>,
     cmd: Command,
@@ -348,6 +349,10 @@ fn apply_command(
             if let Err(r) = check_exclusive(objects, kind, resource.id, &resource.spec)? {
                 return Ok(Err(r));
             }
+            if let Err(r) = folders::check_write(objects, kind, resource.id, &resource.spec, None)?
+            {
+                return Ok(Err(r));
+            }
             names.insert(
                 (kind.as_str(), resource.name.as_str()),
                 resource.id.as_u128(),
@@ -369,6 +374,9 @@ fn apply_command(
                 return Ok(Err(r));
             }
             if let Err(r) = check_exclusive(objects, kind, id, &spec)? {
+                return Ok(Err(r));
+            }
+            if let Err(r) = folders::check_write(objects, kind, id, &spec, Some(&resource.spec))? {
                 return Ok(Err(r));
             }
             resource.labels = labels;
@@ -409,6 +417,9 @@ fn apply_command(
                 return Ok(Err(Rejection::NotFound { kind, id }));
             };
             if let Err(r) = check(expected_revision, resource.revision) {
+                return Ok(Err(r));
+            }
+            if let Err(r) = folders::check_delete(objects, kind, id, &resource.spec)? {
                 return Ok(Err(r));
             }
             objects.remove((kind.as_str(), id.as_u128()))?;

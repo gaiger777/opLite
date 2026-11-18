@@ -24,6 +24,8 @@ thiserror = "2.0.21"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs", "signal"] }
 uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 insta = "1.49.0"
+# 성질 시험(계획 62 권한 색인). fork·timeout 없이 std만 쓴다.
+proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 tempfile = "3.27.0"
 async-trait = "0.1.92"
 fs4 = "1.1.0"

@@ -89,6 +89,15 @@ pub enum Rejection {
     /// 리더가 이 노드를 펜싱하는 중이라 리스를 갱신해 주지 않는다(설계 §4.2).
     #[error("node {node} is being fenced")]
     Fenced { node: NodeId },
+    /// 폴더를 `parent` 아래로 옮기면 자기 자손 아래로 들어가 순환이 생긴다(계획 62). 폴더가 있을 때만 나온다.
+    #[error("folder {id} cannot move under its own descendant {parent}")]
+    FolderCycle { id: Uuid, parent: Uuid },
+    /// 폴더 트리가 너무 깊어진다(`MAX_FOLDER_DEPTH`). `depth`는 쓰기 뒤 가장 깊은 폴더의 단계다.
+    #[error("folder {id} would make the tree {depth} levels deep (limit 16)")]
+    FolderTooDeep { id: Uuid, depth: usize },
+    /// 자식 폴더나 그 폴더에 든 리소스가 있는 폴더는 지우거나 종류를 바꿀 수 없다.
+    #[error("folder {id} is not empty")]
+    FolderNotEmpty { id: Uuid },
 }
 
 /// 리더가 처리하는 요청. 팔로워는 받은 쓰기와 멤버십 변경을 이것으로 리더에 전달한다.
@@ -444,6 +453,30 @@ mod tests {
         let value = serde_json::to_value(&r).unwrap();
         assert_eq!(value, json!({"reason": "fenced", "node": node.to_string()}));
         assert_eq!(serde_json::from_value::<Rejection>(value).unwrap(), r);
+    }
+
+    /// 노드 사이로 오가는 형식이다. 폴더 검사의 거부(계획 62).
+    #[test]
+    fn folder_rejection_wire_format_is_stable() {
+        let (id, parent) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        for (r, want) in [
+            (
+                Rejection::FolderCycle { id, parent },
+                json!({"reason": "folder-cycle", "id": id, "parent": parent}),
+            ),
+            (
+                Rejection::FolderTooDeep { id, depth: 17 },
+                json!({"reason": "folder-too-deep", "id": id, "depth": 17}),
+            ),
+            (
+                Rejection::FolderNotEmpty { id },
+                json!({"reason": "folder-not-empty", "id": id}),
+            ),
+        ] {
+            let value = serde_json::to_value(&r).unwrap();
+            assert_eq!(value, want);
+            assert_eq!(serde_json::from_value::<Rejection>(value).unwrap(), r);
+        }
     }
 
     /// 노드 사이로 오가는 형식이다. 검사 결과를 실은 리스 갱신: 결과가 있으면 `checks`를 더하고, 옛 노드의 갱신
