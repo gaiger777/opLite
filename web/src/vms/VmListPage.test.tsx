@@ -1,13 +1,14 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import type { List } from "@/api/live";
+import { putResource } from "@/api/optimistic";
 import type { Task } from "@/api/types";
 import { snapshot, task, NODE, vm } from "@/test/fixtures";
 import { expectNoAxeViolations } from "@/test/axe";
-import { mockLists, renderPage } from "@/test/render";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { resetTasks } from "@/tasks/tasks";
 import { apiUrl, server } from "@/test/server";
 import { VmListPage } from "@/vms/VmListPage";
@@ -368,7 +369,7 @@ it("marks the sort order on header cells and ignores a bad saved sort", async ()
   expect(header).toHaveAttribute("aria-sort", "ascending");
   await userEvent.click(within(header).getByRole("button"));
   expect(header).toHaveAttribute("aria-sort", "descending");
-  expect(JSON.parse(window.localStorage.getItem("opl.cols.vms")!)).toEqual({
+  expect(JSON.parse(window.localStorage.getItem(`opl.${ADMIN.user}.cols.vms`)!)).toEqual({
     hidden: [],
     sort: "-name",
   });
@@ -508,10 +509,12 @@ it("deletes several VMs only after their count is typed", async () => {
   expect(within(dialog).getByRole("table", { name: "Affected VMs" })).toHaveTextContent("web");
   const confirm = within(dialog).getByRole("button", { name: "Delete" });
   expect(confirm).toBeDisabled();
-  await userEvent.type(within(dialog).getByLabelText("Type 3 to confirm"), "2");
+  // 입력할 수는 고른 3이 아니라 실제로 지울 2다.
+  expect(dialog).toHaveTextContent("2 of the 3 selected VMs will be affected.");
+  await userEvent.type(within(dialog).getByLabelText("Type 2 to confirm"), "3");
   expect(confirm).toBeDisabled();
-  await userEvent.clear(within(dialog).getByLabelText("Type 3 to confirm"));
-  await userEvent.type(within(dialog).getByLabelText("Type 3 to confirm"), "3");
+  await userEvent.clear(within(dialog).getByLabelText("Type 2 to confirm"));
+  await userEvent.type(within(dialog).getByLabelText("Type 2 to confirm"), "2");
   await userEvent.click(confirm);
   await waitFor(() => expect(deleted.sort()).toEqual([db.id, app.id].sort()));
   expect(
@@ -520,6 +523,29 @@ it("deletes several VMs only after their count is typed", async () => {
   // 고르기를 풀었다.
   await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
   expect(screen.getByRole("checkbox", { name: "Select web" })).not.toBeChecked();
+});
+
+it("shows the live state of the chosen VMs while the bulk dialog is open", async () => {
+  const app = vm("app", "stopped");
+  mockLists({ vm: [db, app], node: [NODE] });
+  const { queryClient } = renderPage(<VmListPage />);
+  await screen.findByRole("link", { name: "db" });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select all" }));
+  const dialog = await openBulk("Delete");
+  await userEvent.type(within(dialog).getByLabelText("Type 2 to confirm"), "2");
+  const confirm = within(dialog).getByRole("button", { name: "Delete" });
+  expect(confirm).toBeEnabled();
+
+  // 대화상자가 열린 동안 누가 app을 켰다.
+  act(() => putResource(queryClient, "vm", { ...vm("app", "running"), id: app.id, revision: 9 }));
+  const row = within(within(dialog).getByRole("table", { name: "Affected VMs" }))
+    .getByRole("cell", { name: "app" })
+    .closest("tr")!;
+  await waitFor(() => expect(within(row).getByTestId("vm-phase")).toHaveTextContent("Running"));
+  expect(row).toHaveTextContent("The VM is running.");
+  // 할 수가 1로 줄어 다시 입력해야 한다.
+  expect(within(dialog).getByLabelText("Type 1 to confirm")).toHaveValue("2");
+  expect(confirm).toBeDisabled();
 });
 
 it("sends at most four requests at once", async () => {

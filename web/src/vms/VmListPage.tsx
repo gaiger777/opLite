@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { FirstSteps } from "@/dashboard/FirstSteps";
 import { formatMib } from "@/lib/format";
 import { isTemplate } from "@/templates/templates";
-import { type BulkAction, BULK_ACTIONS, bulkReason } from "@/vms/bulk";
+import { type BulkAction, BULK_ACTIONS, bulkReason, snapshotVms } from "@/vms/bulk";
 import { haEnabled } from "@/vms/ha";
 import { VmBulkDialog } from "@/vms/VmBulkDialog";
 import { VmMenu } from "@/vms/VmMenu";
@@ -43,7 +43,10 @@ export function VmListPage() {
   // 머리줄의 클러스터 전환이 읽은 값만 본다("이 노드" 보기). 따로 묻지 않는다.
   const cluster = useQuery<{ node?: string }>({ queryKey: ["cluster"], enabled: false });
   const state = useTableState("vms", KEYS);
-  const [bulk, setBulk] = useState<{ action: BulkAction; vms: Vm[]; clear(): void } | null>(null);
+  // 고른 VM은 id로만 둔다. 대화상자가 실시간 목록에서 지금 값을 찾는다.
+  const [bulk, setBulk] = useState<{ action: BulkAction; ids: string[]; clear(): void } | null>(
+    null,
+  );
   const operate = can(me.role, "operate", "vm");
   const write = can(me.role, "write", "vm");
   const templatesOnly = state.get("template") === "1";
@@ -144,7 +147,8 @@ export function VmListPage() {
     ...(here ? [{ name: t("vms.view.thisNode"), query: `node=${encodeURIComponent(here)}` }] : []),
   ];
 
-  const ctx = { tasks: taskIndex, nodes: nodes.data ?? [], snapshots: snapshots.data ?? [] };
+  const withSnapshots = useMemo(() => snapshotVms(snapshots.data), [snapshots.data]);
+  const ctx = { tasks: taskIndex, nodes: nodes.data ?? [], snapshotVms: withSnapshots };
   const bulkBar = (chosen: Vm[], clear: () => void) =>
     BULK_ACTIONS.filter((a) => (a === "delete" ? write : operate)).map((action) => {
       // 옮기기는 대상 노드를 대화상자에서 고르므로 노드와 상관없는 까닭만 센다.
@@ -164,7 +168,7 @@ export function VmListPage() {
             able,
             blocked: chosen.length - able,
           })}
-          onClick={() => setBulk({ action, vms: chosen, clear })}
+          onClick={() => setBulk({ action, ids: chosen.map((vm) => vm.id), clear })}
         >
           {label}
           <span aria-hidden className="text-xs tabular-nums opacity-70">
@@ -223,7 +227,7 @@ export function VmListPage() {
       {bulk && (
         <VmBulkDialog
           action={bulk.action}
-          vms={bulk.vms}
+          ids={bulk.ids}
           onClose={() => setBulk(null)}
           onStarted={bulk.clear}
         />

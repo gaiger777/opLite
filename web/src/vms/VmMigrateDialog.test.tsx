@@ -9,7 +9,7 @@ import { NODE, pool, poolState, replicatedVm, snapshot, task, vm, volume } from 
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
-import { migrationTargets } from "@/vms/VmMigrateDialog";
+import { migrationTargets, VmMigrateDialog } from "@/vms/VmMigrateDialog";
 
 afterEach(() => {
   toast.dismiss();
@@ -69,6 +69,19 @@ it("offers online nodes of the same architecture other than the current one", ()
     "node-b",
     "node-g",
   ]);
+});
+
+it("says so when the node chosen in the palette is no longer a target", async () => {
+  mockLists({ vm: [web], node: NODES });
+  renderPage(<VmMigrateDialog vm={web} initialNode="n3" onClose={() => {}} />, { as: OPERATOR });
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  expect(
+    await within(dialog).findByText("node-c cannot take this VM now, so node-b is chosen instead."),
+  ).toBeInTheDocument();
+  expect(within(dialog).getByLabelText("Target node")).toHaveValue("n2");
+  // 직접 고르면 알림이 없어진다.
+  await userEvent.selectOptions(within(dialog).getByLabelText("Target node"), "n7");
+  expect(within(dialog).queryByText(/cannot take this VM now/)).not.toBeInTheDocument();
 });
 
 it("migrates a running VM to the chosen node", async () => {

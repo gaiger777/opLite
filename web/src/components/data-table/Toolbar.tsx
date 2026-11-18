@@ -2,6 +2,7 @@ import { Columns3, Bookmark, X } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 
+import { usePrincipal } from "@/auth/AuthProvider";
 import { readViews, type TableState, type View, writeViews } from "@/components/data-table/state";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -21,12 +22,13 @@ export function ViewMenu({
   defaults: View[];
 }) {
   const { t } = useTranslation();
-  const [saved, setSaved] = useState(() => readViews(table));
+  const { user } = usePrincipal();
+  const [saved, setSaved] = useState(() => readViews(user, table));
   const [name, setName] = useState("");
   const inputId = useId();
   const store = (next: View[]) => {
     setSaved(next);
-    writeViews(table, next);
+    writeViews(user, table, next);
   };
   const item = (view: View) => (
     <Button
@@ -65,7 +67,7 @@ export function ViewMenu({
                   store(saved.filter((v) => v.name !== view.name));
                   // 10초 동안 되돌린다(그 사이 같은 이름으로 저장했으면 그것을 둔다).
                   undoToast(t, t("table.viewDeleted", { name: view.name }), () => {
-                    const now = readViews(table);
+                    const now = readViews(user, table);
                     if (!now.some((v) => v.name === view.name)) {
                       store([...now, view]);
                     }

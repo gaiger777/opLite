@@ -1,11 +1,11 @@
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { expectNoAxeViolations } from "@/test/axe";
-import { mockLists, renderPage } from "@/test/render";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 
 interface Row {
   id: string;
@@ -98,7 +98,7 @@ it("keeps search, filter and sort in the address", async () => {
   // 정렬을 바꾸면 주소와 마지막 정렬(`cols.demo`)에 남긴다.
   await userEvent.click(screen.getByRole("button", { name: /Name/ }));
   expect(router.state.location.search).toContain("sort=name");
-  expect(JSON.parse(window.localStorage.getItem("opl.cols.demo")!)).toEqual({
+  expect(JSON.parse(window.localStorage.getItem(`opl.${ADMIN.user}.cols.demo`)!)).toEqual({
     hidden: [],
     sort: "name",
   });
@@ -131,6 +131,30 @@ it("selects a range with Shift and drops rows a filter hides", async () => {
   expect(screen.queryByRole("region", { name: "Bulk actions" })).not.toBeInTheDocument();
 });
 
+it("keeps the Shift anchor on the same row after the order changes", async () => {
+  const { router } = renderPage(<Harness />);
+  await screen.findByRole("table", { name: "Demo" });
+  await userEvent.click(screen.getByRole("checkbox", { name: "Select alpha" }));
+  // 다시 정렬하면 alpha는 둘째 행이다(gamma, alpha, delta, beta).
+  await act(() => router.navigate("/?sort=-size"));
+  expect(names()).toEqual(["gamma", "alpha", "delta", "beta"]);
+  const user = userEvent.setup();
+  await user.keyboard("{Shift>}");
+  await user.click(screen.getByRole("checkbox", { name: "Select delta" }));
+  await user.keyboard("{/Shift}");
+  // 첫 행(gamma)이 아니라 alpha부터 delta까지다.
+  expect(screen.getByRole("region", { name: "Bulk actions" })).toHaveTextContent(
+    "bulk:alpha,delta",
+  );
+
+  // 기준 행이 거름으로 사라지면 Shift도 그 행 하나만 바꾼다.
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Kind" }), "b");
+  await user.keyboard("{Shift>}");
+  await user.click(screen.getByRole("checkbox", { name: "Select beta" }));
+  await user.keyboard("{/Shift}");
+  expect(screen.getByRole("region", { name: "Bulk actions" })).toHaveTextContent("bulk:delta,beta");
+});
+
 it("moves, selects, peeks and opens rows from the keyboard", async () => {
   const { router } = renderPage(<Harness />);
   await screen.findByRole("table", { name: "Demo" });
@@ -155,6 +179,15 @@ it("moves, selects, peeks and opens rows from the keyboard", async () => {
   await waitFor(() => expect(router.state.location.pathname).toBe("/demo/gamma"));
 });
 
+it("reads j and x by the physical key in Korean input mode", async () => {
+  renderPage(<Harness />);
+  await screen.findByRole("table", { name: "Demo" });
+  fireEvent.keyDown(document.body, { key: "ㅓ", code: "KeyJ" });
+  expect(document.activeElement).toHaveTextContent("alpha");
+  fireEvent.keyDown(document.activeElement!, { key: "ㅌ", code: "KeyX" });
+  expect(screen.getByRole("checkbox", { name: "Select alpha" })).toBeChecked();
+});
+
 it("opens the peek from the eye button", async () => {
   renderPage(<Harness />);
   await screen.findByRole("table", { name: "Demo" });
@@ -169,7 +202,7 @@ it("saves, applies and deletes views", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Views" }));
   await userEvent.type(screen.getByLabelText("View name"), "Mine");
   await userEvent.click(screen.getByRole("button", { name: "Save view" }));
-  expect(JSON.parse(window.localStorage.getItem("opl.views.demo")!)).toEqual([
+  expect(JSON.parse(window.localStorage.getItem(`opl.${ADMIN.user}.views.demo`)!)).toEqual([
     { name: "Mine", query: "q=al" },
   ]);
   expect(screen.getByRole("button", { name: "Mine" })).toHaveAttribute("aria-pressed", "true");
@@ -182,12 +215,12 @@ it("saves, applies and deletes views", async () => {
 
   await userEvent.click(screen.getByRole("button", { name: "Delete view Mine" }));
   expect(screen.queryByRole("button", { name: "Mine" })).not.toBeInTheDocument();
-  expect(JSON.parse(window.localStorage.getItem("opl.views.demo")!)).toEqual([]);
+  expect(JSON.parse(window.localStorage.getItem(`opl.${ADMIN.user}.views.demo`)!)).toEqual([]);
   // 10초 동안 되돌린다.
   expect(await screen.findByText("View Mine deleted.")).toBeInTheDocument();
   // sonner 단추는 pointer capture를 쓰므로(jsdom에 없음) 클릭만 보낸다.
   fireEvent.click(screen.getByRole("button", { name: "Undo" }));
-  expect(JSON.parse(window.localStorage.getItem("opl.views.demo")!)).toEqual([
+  expect(JSON.parse(window.localStorage.getItem(`opl.${ADMIN.user}.views.demo`)!)).toEqual([
     { name: "Mine", query: "q=al" },
   ]);
 });
@@ -200,7 +233,9 @@ it("hides chosen columns and narrow-screen columns by priority", async () => {
   await userEvent.click(screen.getByRole("button", { name: "Columns" }));
   await userEvent.click(screen.getByRole("checkbox", { name: "Size" }));
   expect(screen.queryByRole("columnheader", { name: /Size/ })).not.toBeInTheDocument();
-  expect(JSON.parse(window.localStorage.getItem("opl.cols.demo")!)).toEqual({ hidden: ["size"] });
+  expect(JSON.parse(window.localStorage.getItem(`opl.${ADMIN.user}.cols.demo`)!)).toEqual({
+    hidden: ["size"],
+  });
 });
 
 it("shows skeleton rows while the first read is pending", async () => {

@@ -1,5 +1,5 @@
 import { useQueryClient } from "@tanstack/react-query";
-import { useId, useState } from "react";
+import { useId, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
@@ -37,6 +37,7 @@ import {
   bulkReason,
   runLimited,
   snapshotName,
+  snapshotVms,
   TYPED,
 } from "@/vms/bulk";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -45,18 +46,19 @@ import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 type Outcome = { state: "requested" } | { state: "done" } | { state: "failed"; error: string };
 
 /**
- * 고른 VM에 한 동작을 한다(설계 §5.3). 영향 목록(이름·노드·상태·못 하는 까닭)을 보이고, 지우기·강제 정지는 고른 수를
- * 입력해야 한다. 요청은 동시에 `BULK_LIMIT`개씩 보내고 VM마다 Task가 끝나기를 기다려 이 목록에 보인 뒤, 결과를 알림
+ * 고른 VM에 한 동작을 한다(설계 §5.3). 영향 목록(이름·노드·상태·못 하는 까닭)을 실시간 VM 목록의 지금 값으로 보이고,
+ * 지우기·강제 정지는 실제로 할 수(가능 수)를 입력해야 한다. 요청은 동시에 `BULK_LIMIT`개씩 보내고 VM마다 Task가 끝나기를 기다려 이 목록에 보인 뒤, 결과를 알림
  * 하나로 묶는다. 닫아도 기다림과 알림은 이어진다.
  */
 export function VmBulkDialog({
   action,
-  vms,
+  ids,
   onClose,
   onStarted,
 }: {
   action: BulkAction;
-  vms: Vm[];
+  /** 고른 VM id. 상태는 열려 있는 동안 실시간 목록에서 읽는다. */
+  ids: string[];
   onClose(): void;
   /** 요청을 보내기 시작했다(고르기를 푼다). */
   onStarted(): void;
@@ -67,6 +69,15 @@ export function VmBulkDialog({
   const tasks = useTaskIndex();
   const nodes = useList("node");
   const snapshots = useList("snapshot");
+  const live = useList("vm");
+  const byId = useMemo(() => new Map(live.data?.map((vm) => [vm.id, vm])), [live.data]);
+  // 연 때의 값: 목록에서 빠진 VM(지운 뒤 등)의 이름을 계속 보이는 데만 쓴다.
+  const [opened] = useState(() => byId);
+  const vms = ids.flatMap((id) => {
+    const vm = byId.get(id) ?? opened.get(id);
+    return vm ? [vm] : [];
+  });
+  const withSnapshots = useMemo(() => snapshotVms(snapshots.data), [snapshots.data]);
   const candidates = (nodes.data ?? []).filter(
     (n) => !n.spec.witness && n.status.online && !n.spec.maintenance,
   );
@@ -79,17 +90,24 @@ export function VmBulkDialog({
   const ctx = {
     tasks,
     nodes: nodes.data ?? [],
-    snapshots: snapshots.data ?? [],
+    snapshotVms: withSnapshots,
     target: target || candidates[0]?.id,
   };
   // 시작한 뒤에는 그때 고른 VM을 그대로 보인다(상태가 바뀌어도 까닭이 다시 붙지 않게).
   const [frozen, setFrozen] = useState<Set<string> | null>(null);
   const reasonOf = (vm: Vm) =>
-    frozen ? (frozen.has(vm.id) ? null : "vms.bulk.skippedReason") : bulkReason(vm, action, ctx);
+    frozen
+      ? frozen.has(vm.id)
+        ? null
+        : "vms.bulk.skippedReason"
+      : byId.has(vm.id)
+        ? bulkReason(vm, action, ctx)
+        : "vms.bulk.reason.gone";
   const able = vms.filter((vm) => reasonOf(vm) === null);
   const loaded = nodes.isSuccess && (action !== "delete" || snapshots.isSuccess);
   const label = t(`vms.bulk.action.${action}`);
-  const typedOk = !TYPED.includes(action) || typed.trim() === String(vms.length);
+  // 입력할 수는 실제로 할 VM 수다. 그 수가 바뀌면(누가 VM을 켰다 등) 다시 입력해야 한다.
+  const typedOk = !TYPED.includes(action) || typed.trim() === String(able.length);
   const started = outcomes !== null;
 
   async function request(vm: Vm, name: string): Promise<Task | null> {
@@ -257,7 +275,12 @@ export function VmBulkDialog({
           </p>
         )}
         {TYPED.includes(action) && !started && (
-          <TypeToConfirm id={typeId} expected={vms.length} value={typed} onChange={setTyped} />
+          <div className="flex flex-col gap-2">
+            <p className="text-sm">
+              {t("vms.bulk.willRun", { able: able.length, total: vms.length })}
+            </p>
+            <TypeToConfirm id={typeId} expected={able.length} value={typed} onChange={setTyped} />
+          </div>
         )}
         <DialogFooter>
           {started ? (

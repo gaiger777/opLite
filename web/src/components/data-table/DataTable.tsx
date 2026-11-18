@@ -12,6 +12,7 @@ import { type HTMLAttributes, type ReactNode, useEffect, useMemo, useRef, useSta
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
 
+import { usePrincipal } from "@/auth/AuthProvider";
 import { ColumnMenu, ViewMenu } from "@/components/data-table/Toolbar";
 import { readCols, type TableState, type View, writeCols } from "@/components/data-table/state";
 import { ACTION_ICONS } from "@/components/icons";
@@ -30,7 +31,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { isTyping } from "@/lib/shortcuts";
+import { isTyping, letterKey } from "@/lib/shortcuts";
 
 /** 표의 열 하나 */
 export interface Column<T> {
@@ -117,12 +118,14 @@ export function DataTable<T>(props: Props<T>) {
   const { state, filters = [], rowId, peek, rowHref, keys } = props;
   const rowName = props.rowName ?? rowId;
   const selectable = props.bulk !== undefined;
-  const [hidden, setHidden] = useState(() => readCols(props.id).hidden);
+  const { user } = usePrincipal();
+  const [hidden, setHidden] = useState(() => readCols(user, props.id).hidden);
   const [selected, setSelected] = useState<ReadonlySet<string>>(() => new Set());
   // 고른 행의 id(행이 바뀌거나 다시 정렬돼도 같은 행을 가리킨다)
   const [active, setActive] = useState<string | null>(null);
   const [peekOpen, setPeekOpen] = useState(false);
-  const anchor = useRef<number | null>(null);
+  // Shift 범위의 기준 행 id(색인을 두면 정렬·거름·상태가 바뀐 뒤 다른 행을 가리킨다)
+  const anchor = useRef<string | null>(null);
   const rowEls = useRef(new Map<number, HTMLElement>());
 
   const q = state?.q.trim().toLowerCase() ?? "";
@@ -212,8 +215,11 @@ export function DataTable<T>(props: Props<T>) {
   function toggle(index: number, range: boolean) {
     const target = rows[index]!;
     const on = !selected.has(rowId(target));
-    const from = range && anchor.current !== null ? Math.min(anchor.current, index) : index;
-    const to = range && anchor.current !== null ? Math.max(anchor.current, index) : index;
+    // 기준 행이 지금 보이지 않으면 범위 없이 이 행만 바꾼다.
+    const start =
+      range && anchor.current !== null ? rows.findIndex((r) => rowId(r) === anchor.current) : -1;
+    const from = start >= 0 ? Math.min(start, index) : index;
+    const to = start >= 0 ? Math.max(start, index) : index;
     const next = new Set(selected);
     for (const row of rows.slice(from, to + 1)) {
       if (on) {
@@ -222,7 +228,7 @@ export function DataTable<T>(props: Props<T>) {
         next.delete(rowId(row));
       }
     }
-    anchor.current = index;
+    anchor.current = rowId(target);
     setSelected(next);
   }
 
@@ -266,13 +272,14 @@ export function DataTable<T>(props: Props<T>) {
         }
       };
       const at = current ?? -1;
-      if (e.key === "j") {
+      const key = letterKey(e);
+      if (key === "j") {
         move(Math.min(at + 1, rows.length - 1));
-      } else if (e.key === "k") {
+      } else if (key === "k") {
         move(Math.max(at - 1, 0));
       } else if (onControl || current === null) {
         return;
-      } else if (e.key === "x" && selectable) {
+      } else if (key === "x" && selectable) {
         e.preventDefault();
         toggle(current, false);
       } else if (e.key === " " && peek) {
@@ -369,7 +376,7 @@ export function DataTable<T>(props: Props<T>) {
             hidden={hidden}
             onChange={(next) => {
               setHidden(next);
-              writeCols(props.id, { ...readCols(props.id), hidden: next });
+              writeCols(user, props.id, { ...readCols(user, props.id), hidden: next });
             }}
           />
         )}

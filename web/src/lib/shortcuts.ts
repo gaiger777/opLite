@@ -117,15 +117,28 @@ export function dialogOpen(): boolean {
   );
 }
 
+/**
+ * 눌린 글자. 한글 입력 상태에서는 `e.key`가 `ㅎ`처럼 영문이 아니므로, 영문이 아닌 한 글자이면 물리 키(`e.code`의
+ * `KeyG`)의 영문자로 바꾼다(Shift면 대문자). 영문 자판(AZERTY 등)은 `e.key`를 그대로 쓴다.
+ */
+export function letterKey(e: Pick<KeyboardEvent, "key" | "code" | "shiftKey">): string {
+  const letter = /^Key([A-Z])$/.exec(e.code ?? "")?.[1];
+  if (e.key.length === 1 && e.key > "\x7f" && letter) {
+    return e.shiftKey ? letter : letter.toLowerCase();
+  }
+  return e.key;
+}
+
 /** 키 이벤트를 표의 키 이름으로. 수정 키가 있으면 `mod+k` 말고는 null이다. */
 export function keyName(e: KeyboardEvent): string | null {
-  if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === "k") {
+  const key = letterKey(e);
+  if ((e.metaKey || e.ctrlKey) && !e.altKey && key.toLowerCase() === "k") {
     return "mod+k";
   }
   if (e.metaKey || e.ctrlKey || e.altKey) {
     return null;
   }
-  return e.key.length === 1 ? e.key : null;
+  return key.length === 1 ? key : null;
 }
 
 /**

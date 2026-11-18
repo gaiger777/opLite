@@ -27,6 +27,7 @@ import { AreaTabs, ViewSwitch } from "@/layout/AreaTabs";
 import { Breadcrumbs } from "@/layout/Breadcrumbs";
 import { ClusterSwitch, CreateMenu, SearchButton } from "@/layout/HeaderTools";
 import { AREAS, crumbsOf, isFullWidth, lastTab, rememberTab } from "@/layout/nav";
+import { NavProgress } from "@/layout/RouteError";
 import { NotificationBell } from "@/layout/NotificationBell";
 import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
 import { AreaLinks, Sidebar, useRail } from "@/layout/Sidebar";
@@ -63,7 +64,7 @@ export function AppLayout() {
     setPalette(!palette);
   };
   const goTo = Object.fromEntries(
-    AREAS.map((area) => [`go.${area.id}`, () => void navigate(lastTab(area, me.role))]),
+    AREAS.map((area) => [`go.${area.id}`, () => void navigate(lastTab(area, me))]),
   ) as Partial<Record<ShortcutId, () => void>>;
   // 콘솔 화면에서는 키를 모두 게스트에 넘긴다.
   useShortcuts(
@@ -80,7 +81,7 @@ export function AppLayout() {
     !full,
   );
 
-  useEffect(() => rememberTab(pathname, search), [pathname, search]);
+  useEffect(() => rememberTab(me.user, pathname, search), [me.user, pathname, search]);
 
   // 첫 화면은 그대로 두고, 화면이 바뀔 때만 본문 제목(없으면 본문)으로 포커스를 옮기고 화면 이름을 읽어 준다.
   const shown = useRef(pathname);
@@ -95,7 +96,7 @@ export function AppLayout() {
       target.focus({ preventScroll: true });
     }
     setAnnounce(
-      crumbsOf(pathname, me.role, t)
+      crumbsOf(pathname, me, t)
         .map((crumb) => crumb.label)
         .join(" › "),
     );
@@ -105,6 +106,7 @@ export function AppLayout() {
 
   return (
     <div className="flex min-h-svh">
+      <NavProgress />
       <a
         href="#main"
         className="sr-only z-50 rounded-md bg-background px-3 py-2 text-sm focus:not-sr-only focus:fixed focus:top-2 focus:left-2 focus:ring-2 focus:ring-ring"

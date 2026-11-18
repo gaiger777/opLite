@@ -81,4 +81,10 @@ it("names keys", () => {
   expect(key({ key: "?", shiftKey: true })).toBe("?");
   expect(key({ key: "g", ctrlKey: true })).toBeNull();
   expect(key({ key: "Enter" })).toBeNull();
+  // 한글 입력 상태: `e.key`가 자모여도 물리 키로 읽는다.
+  expect(key({ key: "ㅎ", code: "KeyG" })).toBe("g");
+  expect(key({ key: "ㅜ", code: "KeyN", shiftKey: true })).toBe("N");
+  expect(key({ key: "ㅏ", code: "KeyK", metaKey: true })).toBe("mod+k");
+  // 영문 자판은 `e.key` 그대로(AZERTY의 a는 KeyQ 자리)
+  expect(key({ key: "a", code: "KeyQ" })).toBe("a");
 });

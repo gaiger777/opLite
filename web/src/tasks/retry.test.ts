@@ -1,5 +1,5 @@
 import type { Task } from "@/api/types";
-import { type RetryContext, retryOf } from "@/tasks/retry";
+import { latestTasks, type RetryContext, retryOf } from "@/tasks/retry";
 import { backup, backupJob, task, vm } from "@/test/fixtures";
 
 const off = vm("db", "stopped");
@@ -89,4 +89,27 @@ it("runs the backup job of a failed backup again", () => {
   expect(
     retryOf(failed("vm-backup", off.id, { backup: bk.id }), ctx({ role: "viewer" })),
   ).toBeNull();
+});
+
+it("does not retry a failure that a newer task on the same target replaced", () => {
+  const old = { ...failed("vm-start", off.id), id: "019a0000-0000-7000-8000-000000000001" };
+  const later = {
+    ...task("t2", "vm-stop", off.id),
+    id: "019a0000-0000-7000-8000-000000000002",
+  } as Task;
+  // 다른 VM의 Task와 백업은 전원 동작과 따로 본다.
+  const other = { ...task("t3", "vm-start", on.id), id: "019a0000-0000-7000-8000-000000000003" };
+  const latest = latestTasks([later, old, other]);
+  expect(retryOf(old, ctx({ latest }))).toBeNull();
+  const backup = {
+    ...failed("vm-backup", off.id, { backup: bk.id }),
+    id: "019a0000-0000-7000-8000-000000000000",
+  };
+  expect(retryOf(backup, ctx({ latest: latestTasks([backup, later]) }))).toMatchObject({
+    kind: "job",
+  });
+  // 가장 새 것이면 그대로 다시 할 수 있다.
+  expect(retryOf(old, ctx({ latest: latestTasks([old, other]) }))).toMatchObject({
+    action: "start",
+  });
 });

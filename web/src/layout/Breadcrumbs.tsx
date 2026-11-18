@@ -11,7 +11,7 @@ export function Breadcrumbs() {
   const { t } = useTranslation();
   const me = usePrincipal();
   const { pathname } = useLocation();
-  const crumbs = crumbsOf(pathname, me.role, t);
+  const crumbs = crumbsOf(pathname, me, t);
   if (crumbs.length === 0) {
     return null;
   }

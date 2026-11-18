@@ -148,7 +148,8 @@ export type VmDialog =
   | "deploy"
   | "template"
   | "untemplate"
-  // 팔레트가 바로 하지 않고 확인을 받는 전원 동작과 스냅샷(설계 §5.2)
+  // 팔레트가 바로 하지 않고 확인을 받는 전원 동작과 스냅샷(설계 §5.2). 시작은 이름이 정확히 같지 않을 때만.
+  | "start"
   | "stop"
   | "reboot"
   | "snapshot";
@@ -186,7 +187,7 @@ export function VmConfirm({
         returnFocus={returnFocus}
         onConfirm={() => onRun(vm, "force-stop")}
       />
-      {(["stop", "reboot"] as const).map((action) => (
+      {(["start", "stop", "reboot"] as const).map((action) => (
         <ConfirmDialog
           key={action}
           open={which === action}

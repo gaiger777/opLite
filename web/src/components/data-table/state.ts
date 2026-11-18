@@ -1,9 +1,10 @@
-// 공통 표의 상태(설계 §5.3): 검색·정렬·거름은 URL 쿼리에(링크로 나눌 수 있게), 저장 보기는 `views.{table}`,
-// 숨긴 열과 마지막 정렬은 `cols.{table}`에 둔다(브라우저 저장, 실패는 무시).
+// 공통 표의 상태(설계 §5.3): 검색·정렬·거름은 URL 쿼리에(링크로 나눌 수 있게), 저장 보기는 `{user}.views.{table}`,
+// 숨긴 열과 마지막 정렬은 `{user}.cols.{table}`에 둔다(브라우저 저장, 실패는 무시, 사용자별).
 import { useCallback, useMemo, useState } from "react";
 import { useSearchParams } from "react-router";
 
-import { readPref, writePref } from "@/lib/prefs";
+import { usePrincipal } from "@/auth/AuthProvider";
+import { readUserPref, writeUserPref } from "@/lib/prefs";
 
 /** 한 열 정렬. URL에서는 `sort=name`(오름)·`sort=-memory`(내림)이다. */
 export interface Sort {
@@ -39,8 +40,8 @@ function parseJson(raw: string | null): unknown {
 }
 
 /** 저장해 둔 보기. 모양이 다르면 버린다. */
-export function readViews(table: string): View[] {
-  const value = parseJson(readPref(`views.${table}`));
+export function readViews(user: string, table: string): View[] {
+  const value = parseJson(readUserPref(user, `views.${table}`));
   return Array.isArray(value)
     ? value.filter(
         (v: unknown): v is View =>
@@ -52,8 +53,8 @@ export function readViews(table: string): View[] {
     : [];
 }
 
-export function writeViews(table: string, views: View[]) {
-  writePref(`views.${table}`, JSON.stringify(views));
+export function writeViews(user: string, table: string, views: View[]) {
+  writeUserPref(user, `views.${table}`, JSON.stringify(views));
 }
 
 /** 열 설정: 숨긴 열과 마지막으로 고른 정렬 */
@@ -65,8 +66,8 @@ export interface ColPrefs {
 /**
  * 열 설정을 읽는다. `cols.vms`가 없으면 옛 `vms.sort`(react-table의 `[{id, desc}]`)를 옮겨 읽는다.
  */
-export function readCols(table: string): ColPrefs {
-  const value = parseJson(readPref(`cols.${table}`)) as Partial<ColPrefs> | null;
+export function readCols(user: string, table: string): ColPrefs {
+  const value = parseJson(readUserPref(user, `cols.${table}`)) as Partial<ColPrefs> | null;
   if (value && typeof value === "object") {
     return {
       hidden: Array.isArray(value.hidden)
@@ -76,7 +77,7 @@ export function readCols(table: string): ColPrefs {
     };
   }
   if (table === "vms") {
-    const old = parseJson(readPref("vms.sort"));
+    const old = parseJson(readUserPref(user, "vms.sort"));
     const first: unknown = Array.isArray(old) ? old[0] : undefined;
     if (
       typeof first === "object" &&
@@ -90,8 +91,8 @@ export function readCols(table: string): ColPrefs {
   return { hidden: [] };
 }
 
-export function writeCols(table: string, cols: ColPrefs) {
-  writePref(`cols.${table}`, JSON.stringify(cols));
+export function writeCols(user: string, table: string, cols: ColPrefs) {
+  writeUserPref(user, `cols.${table}`, JSON.stringify(cols));
 }
 
 /** 표가 쓰는 쿼리 키만 남긴 쿼리 글(저장 보기와 비교에 쓴다) */
@@ -126,11 +127,12 @@ export interface TableState {
  * 거름 키다. 정렬이 주소에 없으면 마지막으로 고른 정렬(`cols.{table}`)을 쓴다.
  */
 export function useTableState(table: string, keys: readonly string[] = [], url = true): TableState {
+  const { user } = usePrincipal();
   const [params, setParams] = useSearchParams();
   const [local, setLocal] = useState(() => new URLSearchParams());
   const source = url ? params : local;
   const all = useMemo(() => ["q", "sort", ...keys], [keys]);
-  const [saved, setSaved] = useState(() => readCols(table).sort);
+  const [saved, setSaved] = useState(() => readCols(user, table).sort);
   const update = useCallback(
     (change: (next: URLSearchParams) => void) => {
       if (url) {
@@ -159,7 +161,7 @@ export function useTableState(table: string, keys: readonly string[] = [], url =
     get: (key) => source.get(key) ?? "",
     set: (key, value) => update((next) => (value ? next.set(key, value) : next.delete(key))),
     setSort: (sort) => {
-      writeCols(table, { ...readCols(table), sort: formatSort(sort) });
+      writeCols(user, table, { ...readCols(user, table), sort: formatSort(sort) });
       setSaved(formatSort(sort));
       update((next) => (sort ? next.set("sort", formatSort(sort)) : next.delete("sort")));
     },

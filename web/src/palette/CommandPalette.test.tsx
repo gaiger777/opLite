@@ -1,4 +1,4 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
@@ -178,6 +178,26 @@ it("asks before stopping but starts right away", async () => {
   await user.keyboard("{Enter}");
   await waitFor(() => expect(actions).toEqual([`stop:${web.id}`, `start:${app.id}`]));
   expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+});
+
+it("asks before starting a VM whose name only starts with the typed text", async () => {
+  shell();
+  const { user } = await search("start ap", "Start app…");
+  await user.keyboard("{Enter}");
+  const confirm = await screen.findByRole("alertdialog", { name: "Start app?" });
+  expect(actions).toEqual([]);
+  await user.click(within(confirm).getByRole("button", { name: "Start" }));
+  await waitFor(() => expect(actions).toEqual([`start:${app.id}`]));
+});
+
+it("ignores the Enter that finishes Korean input", async () => {
+  shell();
+  const { box } = await search("start app", "Start app");
+  fireEvent.keyDown(box, { key: "Enter", isComposing: true });
+  expect(screen.getByRole("dialog", { name: "Command palette" })).toBeInTheDocument();
+  expect(actions).toEqual([]);
+  fireEvent.keyDown(box, { key: "Enter" });
+  await waitFor(() => expect(actions).toEqual([`start:${app.id}`]));
 });
 
 it("dims an action the VM cannot do and says why", async () => {

@@ -36,7 +36,7 @@ export function AreaLinks({ rail = false, onNavigate }: { rail?: boolean; onNavi
     const label = t(area.key);
     const link = (
       <Link
-        to={lastTab(area, me.role)}
+        to={lastTab(area, me)}
         aria-current={current === area.id ? "page" : undefined}
         onClick={onNavigate}
         className={cn(

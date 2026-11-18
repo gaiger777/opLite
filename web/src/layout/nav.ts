@@ -1,9 +1,9 @@
 // 화면 구성의 한 곳(설계 §4). 사이드바·영역 탭·보기 전환·이동 경로·팔레트 이동 항목·넘기기 시험이 모두
 // 이 표를 읽는다. 사이드바에는 영역만 두고(둘째 단계 없음) 하위 화면은 영역 안 탭과 보기 전환으로 고른다.
-import type { Role } from "@/api/types";
+import type { Principal, Role } from "@/api/types";
 import { can, type Kind } from "@/auth/permissions";
 import type { AreaId } from "@/components/icons";
-import { readPref, writePref } from "@/lib/prefs";
+import { readUserPref, writeUserPref } from "@/lib/prefs";
 
 /** 탭 안의 보기(segmented). 이것도 경로 링크다. */
 export interface NavView {
@@ -182,12 +182,15 @@ export function areaOf(pathname: string): NavHit | null {
 
 const lastKey = (area: AreaId) => `nav.last.${area}`;
 
+/** 마지막 탭을 사용자별로 읽고 쓰는 데 필요한 것 */
+export type NavUser = Pick<Principal, "user" | "role">;
+
 /**
- * 영역에서 마지막으로 본 탭(경로와 쿼리). 기억이 없거나, 그 영역의 탭이 아니거나, 지금 권한으로 보이지 않으면
- * 보이는 첫 탭이다. 보이는 탭이 없으면 영역 주소다.
+ * 영역에서 마지막으로 본 탭(경로와 쿼리, 사용자별 `{user}.nav.last.{area}`). 기억이 없거나, 그 영역의 탭이
+ * 아니거나, 지금 권한으로 보이지 않으면 보이는 첫 탭이다. 보이는 탭이 없으면 영역 주소다.
  */
-export function lastTab(area: NavArea, role: Role): string {
-  const saved = readPref(lastKey(area.id));
+export function lastTab(area: NavArea, { user, role }: NavUser): string {
+  const saved = readUserPref(user, lastKey(area.id));
   if (saved) {
     const pathname = saved.split(/[?#]/)[0] ?? "";
     const hit = areaOf(pathname);
@@ -199,13 +202,13 @@ export function lastTab(area: NavArea, role: Role): string {
 }
 
 /** 지금 화면을 그 영역의 마지막 탭으로 기억한다. 상세 경로는 그 탭의 목록을 기억한다. */
-export function rememberTab(pathname: string, search: string) {
+export function rememberTab(user: string, pathname: string, search: string) {
   const hit = areaOf(pathname);
   if (!hit) {
     return;
   }
   const path = pathname.length > 1 ? pathname.replace(/\/+$/, "") : pathname;
-  writePref(lastKey(hit.area.id), path === hit.prefix ? `${path}${search}` : hit.prefix);
+  writeUserPref(user, lastKey(hit.area.id), path === hit.prefix ? `${path}${search}` : hit.prefix);
 }
 
 export interface Crumb {
@@ -217,12 +220,12 @@ export interface Crumb {
 /**
  * 이동 경로 `영역 › 탭(보기) › 리소스`. 리소스 이름은 탭 목록 주소 뒤 첫 경로 조각이다. `t`는 i18n 함수다.
  */
-export function crumbsOf(pathname: string, role: Role, t: (key: string) => string): Crumb[] {
+export function crumbsOf(pathname: string, me: NavUser, t: (key: string) => string): Crumb[] {
   const hit = areaOf(pathname);
   if (!hit) {
     return [];
   }
-  const area = { label: t(hit.area.key), to: lastTab(hit.area, role) };
+  const area = { label: t(hit.area.key), to: lastTab(hit.area, me) };
   if (hit.area.id === "home") {
     return [{ label: area.label }];
   }

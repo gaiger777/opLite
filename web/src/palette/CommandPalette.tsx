@@ -56,7 +56,7 @@ interface Item extends Candidate {
   run(): void;
 }
 
-/** 확인 없이 바로 하는 동작(설계 §5.2). 나머지는 같은 확인 대화상자를 연다. */
+/** 확인 없이 바로 하는 동작(설계 §5.2, 시작은 이름이 정확히 같을 때만). 나머지는 같은 확인 대화상자를 연다. */
 const DIRECT: ReadonlySet<Verb> = new Set(["start", "console", "open"]);
 /** VM 이름만 쳤을 때 보이는 동작의 순서 */
 const VM_VERBS: readonly Verb[] = [
@@ -179,7 +179,8 @@ function PaletteBody({
   };
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (items.length === 0) {
+    // 한글 입력의 마지막 글자를 끝내는 Enter는 항목을 실행하지 않는다.
+    if (items.length === 0 || e.nativeEvent.isComposing) {
       return;
     }
     switch (e.key) {
@@ -491,15 +492,20 @@ function usePaletteItems(
     const command = parseCommand(text);
     const all = vms.data ?? [];
     if (command) {
+      const target = command.target.toLowerCase();
       return byPrefix(all, command.target)
         .slice(0, 8)
-        .map((vm) => actionItem(vm, command.verb, command.node));
+        .map((vm) => actionItem(vm, command.verb, vm.name.toLowerCase() === target, command.node));
     }
     const exact = all.find((vm) => vm.name.toLowerCase() === text.toLowerCase());
-    return exact ? VM_VERBS.map((verb) => actionItem(exact, verb)) : [];
+    return exact ? VM_VERBS.map((verb) => actionItem(exact, verb, true)) : [];
   }
 
-  function actionItem(vm: Vm, verb: Verb, nodeText?: string): Item {
+  /**
+   * `exact`: 친 이름이 이 VM의 이름과 정확히 같다. 시작은 그때만 바로 하고(`start db`가 `db-prod`를 켜지 않게),
+   * 앞부분만 맞으면 확인 대화상자를 연다.
+   */
+  function actionItem(vm: Vm, verb: Verb, exact: boolean, nodeText?: string): Item {
     let node: Node | undefined;
     let disabled: string | undefined;
     if (verb === "migrate" && nodeText !== undefined) {
@@ -519,6 +525,7 @@ function usePaletteItems(
         disabled = t(able.reason);
       }
     }
+    const direct = DIRECT.has(verb) && (verb !== "start" || exact);
     const path = `/vms/${encodeURIComponent(vm.name)}`;
     const label = node
       ? t("palette.verb.migrateTo", { name: vm.name, node: node.name })
@@ -526,7 +533,7 @@ function usePaletteItems(
     return {
       id: `action:${verb}:${vm.id}`,
       group: "actions",
-      label: DIRECT.has(verb) ? label : `${label}…`,
+      label: direct ? label : `${label}…`,
       disabled,
       to: verb === "open" ? path : verb === "console" ? `${path}/console` : undefined,
       run: () => {
@@ -534,7 +541,7 @@ function usePaletteItems(
           void navigate(path);
         } else if (verb === "console") {
           void navigate(`${path}/console`);
-        } else if (verb === "start") {
+        } else if (direct) {
           void run(vm, "start");
         } else {
           host.open({ vm, which: verb, node: node?.id, returnFocus });

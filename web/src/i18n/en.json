@@ -104,6 +104,7 @@
     "in_use": "It is still in use: {{message}}"
   },
   "nav": {
+    "noTabs": "Nothing in this area is available to your role.",
     "vms": "Virtual machines",
     "imports": "Imports",
     "volumes": "Volumes",
@@ -185,6 +186,13 @@
       "no_role": "Your account at the identity provider has no role in Orbivisor. Ask an administrator to map one of your groups.",
       "realm_unavailable": "Cannot reach the identity provider of this realm. Try again later or ask an administrator."
     }
+  },
+  "routeError": {
+    "newVersion": "A new version is available",
+    "newVersionDescription": "Orbivisor was updated while this page was open. Reload to get the new version.",
+    "reload": "Reload",
+    "title": "Something went wrong on this page",
+    "loading": "Loading page"
   },
   "notFound": {
     "title": "Page not found",
@@ -570,6 +578,8 @@
         "again": "The passwords do not match."
       }
     },
+    "startTitle": "Start {{name}}?",
+    "startDescription": "The VM is turned on.",
     "stopTitle": "Stop {{name}}?",
     "stopDescription": "The guest OS is asked to shut down.",
     "rebootTitle": "Reboot {{name}}?",
@@ -607,11 +617,13 @@
       "skipped_one": "{{count}} VM skipped.",
       "skipped_other": "{{count}} VMs skipped.",
       "view": "View tasks",
+      "willRun": "{{able}} of the {{total}} selected VMs will be affected.",
       "reason": {
         "snapshots": "The VM has snapshots. Delete it from its own page.",
         "noTarget": "Choose a node.",
         "sameNode": "Already on this node.",
-        "target": "Cannot run on this node (offline, in maintenance or another architecture)."
+        "target": "Cannot run on this node (offline, in maintenance or another architecture).",
+        "gone": "Deleted"
       }
     },
     "startAgain": "Turn on again",
@@ -978,7 +990,8 @@
     "snapshots": "VMs with snapshots cannot be migrated with disks on node-local pools. Delete the VM's snapshots first.",
     "force": "Ignore placement rules",
     "forceHint": "Moves the VM even if it breaks hard placement rules or a restricted HA group. Node checks and memory still apply. The audit log records the broken rules.",
-    "replicaNote": "This node holds a replica, so only what changed since the last replication is copied."
+    "replicaNote": "This node holds a replica, so only what changed since the last replication is copied.",
+    "nodeDropped": "{{node}} cannot take this VM now, so {{target}} is chosen instead."
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."

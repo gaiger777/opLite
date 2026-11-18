@@ -150,7 +150,9 @@ it("links an area to the tab seen last", async () => {
     "href",
     "/ha-groups",
   );
-  await vi.waitFor(() => expect(localStorage.getItem("opl.nav.last.infra")).toBe("/volumes"));
+  await vi.waitFor(() =>
+    expect(localStorage.getItem(`opl.${ADMIN.user}.nav.last.infra`)).toBe("/volumes"),
+  );
 });
 
 it("collapses the sidebar to an icon rail and remembers it", async () => {

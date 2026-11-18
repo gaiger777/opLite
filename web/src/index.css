@@ -210,6 +210,30 @@ html[data-density="compact"] {
   animation: changed-flash 600ms var(--ease-out);
 }
 
+/* 늦게 받는 화면을 받는 동안의 위쪽 막대(`NavProgress`). 빨리 끝나는 이동에는 깜박이지 않게 조금 늦게 보인다. */
+@keyframes nav-progress-show {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes nav-progress-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+.nav-progress {
+  animation: nav-progress-show var(--duration-fast) 150ms both;
+}
+.nav-progress > div {
+  animation: nav-progress-slide 1s var(--ease-out) infinite;
+}
+
 /* 움직임 줄이기: 미끄러짐·흐려짐·깜박이는 강조·스켈레톤 맥박을 끈다(설계 §6). */
 @media (prefers-reduced-motion: reduce) {
   :root {

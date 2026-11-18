@@ -9,11 +9,31 @@ import { createQueryClient } from "@/api/queryClient";
 import type { Principal } from "@/api/types";
 import { AuthProvider } from "@/auth/AuthProvider";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { LEGACY_REDIRECTS } from "@/layout/nav";
+import { AREAS, LEGACY_REDIRECTS } from "@/layout/nav";
 import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
 import { ADMIN, mockLists } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
+
+// 새로 배포해 옛 조각이 없어진 것처럼: 구독 탭 화면을 받지 못한다(다른 시험은 이 화면을 열지 않는다).
+vi.mock("@/settings/SubscriptionPage", () => ({
+  get SubscriptionPage() {
+    throw new TypeError(
+      "Failed to fetch dynamically imported module: http://localhost/assets/SubscriptionPage-x1.js",
+    );
+  },
+}));
+
+// 감사 화면은 시험이 열어 줄 때까지 받지 못한다(받는 동안의 막대를 보려고).
+const auditGate = vi.hoisted(() => {
+  let open = () => {};
+  const ready = new Promise<void>((resolve) => (open = resolve));
+  return { ready, open: () => open() };
+});
+vi.mock("@/audit/AuditPage", async (importOriginal) => {
+  await auditGate.ready;
+  return importOriginal();
+});
 
 /** 계획 61 전 사이드바(`NAV`)의 26개 주소. 북마크가 깨지지 않아야 한다(설계 §10). */
 const OLD_NAV_PATHS = [
@@ -100,6 +120,48 @@ const where = (router: ReturnType<typeof renderApp>) => {
 };
 
 afterEach(() => localStorage.clear());
+
+it("shows a thin progress bar while a lazy page loads", async () => {
+  const router = renderApp("/");
+  await screen.findByRole("heading", { level: 1, name: "Home" });
+  void router.navigate("/audit");
+  expect(await screen.findByRole("progressbar", { name: "Loading page" })).toBeInTheDocument();
+  auditGate.open();
+  expect(
+    await screen.findByRole("heading", { level: 1, name: "Audit log" }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("progressbar", { name: "Loading page" })).not.toBeInTheDocument();
+});
+
+it("offers a reload inside the shell when a page chunk is gone after a deploy", async () => {
+  const user = userEvent.setup();
+  renderApp("/settings");
+  const tabs = await screen.findByRole("navigation", { name: "Settings menu" });
+  await user.click(within(tabs).getByRole("link", { name: "Subscription" }));
+  expect(
+    await screen.findByRole("heading", { level: 1, name: "A new version is available" }),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Reload" })).toBeInTheDocument();
+  // 셸(사이드바)은 그대로다.
+  expect(screen.getByRole("navigation", { name: "Main" })).toBeInTheDocument();
+  expect(screen.queryByText(/Unexpected Application Error/)).not.toBeInTheDocument();
+});
+
+it("shows an empty area instead of redirecting to itself when no tab is visible", async () => {
+  const infra = AREAS.find((a) => a.id === "infra")!;
+  const tabs = infra.tabs;
+  infra.tabs = tabs.map((tab) => ({ ...tab, admin: true }));
+  try {
+    const router = renderApp("/infra", { ...ADMIN, role: "viewer" });
+    expect(
+      await screen.findByText("Nothing in this area is available to your role."),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Infrastructure" })).toBeInTheDocument();
+    expect(where(router)).toBe("/infra");
+  } finally {
+    infra.tabs = tabs;
+  }
+});
 
 it.each(LEGACY_REDIRECTS)("moves $from to $to with its query and hash", async ({ from, to }) => {
   const router = renderApp(`${from}?x=1#h`);

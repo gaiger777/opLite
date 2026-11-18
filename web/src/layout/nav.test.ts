@@ -16,6 +16,9 @@ import {
 } from "@/layout/nav";
 
 const area = (id: string) => AREAS.find((a) => a.id === id)!;
+const U1 = "00000000-0000-0000-0000-0000000000a1";
+const U2 = "00000000-0000-0000-0000-0000000000a2";
+const as = (role: Role, user = U1) => ({ user, role });
 
 /** `nav.area.home` 같은 키를 영어 글로 바꾼다(i18n을 띄우지 않는 순수 시험). */
 function t(key: string): string {
@@ -88,7 +91,7 @@ it.each([
 it("knows nothing of unknown pages", () => {
   expect(areaOf("/somewhere")).toBeNull();
   expect(areaOf("/vmsx")).toBeNull();
-  expect(crumbsOf("/somewhere", "admin", t)).toEqual([]);
+  expect(crumbsOf("/somewhere", as("admin"), t)).toEqual([]);
 });
 
 it("shows the console full width", () => {
@@ -118,30 +121,43 @@ it.each(["operator", "viewer"] as const)("hides account and admin tabs from %s",
 });
 
 it("remembers the list of the last tab, not a detail page", () => {
-  rememberTab("/volumes", "?q=root");
-  expect(lastTab(area("infra"), "admin")).toBe("/volumes?q=root");
-  rememberTab("/nodes/node-a", "?tab=metrics");
-  expect(lastTab(area("infra"), "admin")).toBe("/nodes");
-  rememberTab("/cluster", "");
-  expect(lastTab(area("infra"), "admin")).toBe("/cluster");
+  rememberTab(U1, "/volumes", "?q=root");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/volumes?q=root");
+  rememberTab(U1, "/nodes/node-a", "?tab=metrics");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/nodes");
+  rememberTab(U1, "/cluster", "");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/cluster");
   // 다른 영역의 기억은 그대로다.
-  rememberTab("/backups", "");
-  expect(lastTab(area("infra"), "admin")).toBe("/cluster");
-  expect(lastTab(area("protect"), "admin")).toBe("/backups");
-  rememberTab("/somewhere", "");
+  rememberTab(U1, "/backups", "");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/cluster");
+  expect(lastTab(area("protect"), as("admin"))).toBe("/backups");
+  rememberTab(U1, "/somewhere", "");
 });
 
 it("falls back to the first visible tab", () => {
-  expect(lastTab(area("activity"), "viewer")).toBe("/tasks");
-  rememberTab("/audit", "");
-  expect(lastTab(area("activity"), "admin")).toBe("/audit");
+  expect(lastTab(area("activity"), as("viewer"))).toBe("/tasks");
+  rememberTab(U1, "/audit", "");
+  expect(lastTab(area("activity"), as("admin"))).toBe("/audit");
   // 권한 밖의 기억은 쓰지 않는다.
-  expect(lastTab(area("activity"), "viewer")).toBe("/tasks");
+  expect(lastTab(area("activity"), as("viewer"))).toBe("/tasks");
   // 다른 영역의 경로나 상세 경로를 손으로 넣어도 쓰지 않는다.
-  localStorage.setItem("opl.nav.last.activity", "/vms");
-  expect(lastTab(area("activity"), "admin")).toBe("/tasks");
-  localStorage.setItem("opl.nav.last.infra", "/nodes/node-a");
-  expect(lastTab(area("infra"), "admin")).toBe("/nodes");
+  localStorage.setItem(`opl.${U1}.nav.last.activity`, "/vms");
+  expect(lastTab(area("activity"), as("admin"))).toBe("/tasks");
+  localStorage.setItem(`opl.${U1}.nav.last.infra`, "/nodes/node-a");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/nodes");
+});
+
+it("remembers the last tab per user and moves an old shared memory to the first user once", () => {
+  rememberTab(U1, "/volumes", "?q=secret-vm");
+  // 같은 브라우저의 다른 사용자에게 앞 사용자의 검색이 넘어가지 않는다.
+  expect(lastTab(area("infra"), as("admin", U2))).toBe("/nodes");
+  expect(localStorage.getItem(`opl.${U1}.nav.last.infra`)).toBe("/volumes?q=secret-vm");
+
+  localStorage.setItem("opl.nav.last.protect", "/ha-groups");
+  expect(lastTab(area("protect"), as("admin", U2))).toBe("/ha-groups");
+  expect(localStorage.getItem(`opl.${U2}.nav.last.protect`)).toBe("/ha-groups");
+  expect(localStorage.getItem("opl.nav.last.protect")).toBeNull();
+  expect(lastTab(area("protect"), as("admin", U1))).toBe("/backups");
 });
 
 it("works when the browser storage throws", () => {
@@ -151,8 +167,8 @@ it("works when the browser storage throws", () => {
   const set = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
     throw new Error("denied");
   });
-  expect(() => rememberTab("/volumes", "")).not.toThrow();
-  expect(lastTab(area("infra"), "admin")).toBe("/nodes");
+  expect(() => rememberTab(U1, "/volumes", "")).not.toThrow();
+  expect(lastTab(area("infra"), as("admin"))).toBe("/nodes");
   get.mockRestore();
   set.mockRestore();
 });
@@ -171,7 +187,7 @@ it.each([
   ],
   ["/settings/tokens", [{ label: "Settings", to: "/settings" }, { label: "API tokens" }]],
 ])("builds the breadcrumb of %s", (pathname, crumbs) => {
-  expect(crumbsOf(pathname, "admin", t)).toEqual(crumbs);
+  expect(crumbsOf(pathname, as("admin"), t)).toEqual(crumbs);
 });
 
 it("redirects only addresses that no longer have a page", () => {

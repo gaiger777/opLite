@@ -1,12 +1,12 @@
 import type { Node, Task } from "@/api/types";
 import { NODE, snapshot, task, vm } from "@/test/fixtures";
-import { BULK_LIMIT, bulkReason, runLimited, snapshotName } from "@/vms/bulk";
+import { BULK_LIMIT, bulkReason, runLimited, snapshotName, snapshotVms } from "@/vms/bulk";
 
 const other: Node = { ...NODE, id: "n2", name: "node-b", status: { ...NODE.status, arch: null } };
 const ctx = (extra: Partial<Parameters<typeof bulkReason>[2]> = {}) => ({
   tasks: new Map<string, Task[]>(),
   nodes: [NODE, other],
-  snapshots: [],
+  snapshotVms: new Set<string>(),
   ...extra,
 });
 
@@ -27,7 +27,7 @@ it("says why each VM cannot take the action", () => {
 it("does not delete VMs with snapshots", () => {
   const db = vm("db", "stopped");
   expect(bulkReason(db, "delete", ctx())).toBeNull();
-  expect(bulkReason(db, "delete", ctx({ snapshots: [snapshot("s1", db, 1)] }))).toBe(
+  expect(bulkReason(db, "delete", ctx({ snapshotVms: snapshotVms([snapshot("s1", db, 1)]) }))).toBe(
     "vms.bulk.reason.snapshots",
   );
 });

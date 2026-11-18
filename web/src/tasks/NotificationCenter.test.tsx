@@ -157,3 +157,42 @@ it("shows no retry to viewers", async () => {
   const recent = await within(center).findByRole("list", { name: "Recent" });
   expect(within(recent).queryAllByRole("button")).toEqual([]);
 });
+
+it("asks before retrying a force stop and sends one start per click", async () => {
+  const calls = vi.fn();
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), async ({ params, request }) => {
+      calls(params.key, params.action, new URL(request.url).searchParams.get("mode"));
+      await new Promise((r) => setTimeout(r, 50));
+      return HttpResponse.json(t(9, { kind: "vm-start" }, db.id, {}), { status: 202 });
+    }),
+  );
+  mockLists({
+    vm: [web, db],
+    node: [NODE],
+    task: [
+      t(2, { kind: "vm-start" }, db.id, { state: "failed", error: "no firmware" }),
+      t(5, { kind: "vm-force-stop" }, web.id, { state: "failed", error: "busy" }),
+    ],
+  });
+  shell();
+  await userEvent.click(await screen.findByRole("button", { name: /^Tasks and alerts/ }));
+  const center = await screen.findByRole("dialog", { name: "Tasks and alerts" });
+
+  // 강제 정지는 다른 곳처럼 확인을 거친다.
+  await userEvent.click(
+    await within(center).findByRole("button", { name: "Retry: Force stop web" }),
+  );
+  const confirm = await screen.findByRole("alertdialog", { name: "Force stop web?" });
+  expect(calls).not.toHaveBeenCalled();
+  await userEvent.click(within(confirm).getByRole("button", { name: "Force stop" }));
+  await waitFor(() => expect(calls).toHaveBeenCalledWith(web.id, "stop", "force"));
+  calls.mockClear();
+
+  // 시작은 바로 보내되, 요청 중에는 단추를 막는다.
+  const startAgain = await within(center).findByRole("button", { name: "Retry: Start db" });
+  await userEvent.dblClick(startAgain);
+  await waitFor(() => expect(calls).toHaveBeenCalledWith(db.id, "start", null));
+  await waitFor(() => expect(startAgain).toBeEnabled());
+  expect(calls).toHaveBeenCalledTimes(1);
+});

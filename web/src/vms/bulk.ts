@@ -27,7 +27,8 @@ export interface BulkContext {
   /** VM id → 그 VM의 Task(`useTaskIndex`) */
   tasks: Map<string, Task[]>;
   nodes: readonly Node[];
-  snapshots: readonly Snapshot[];
+  /** 스냅샷이 있는 VM id(`snapshotVms`). 고른 VM마다 스냅샷 목록 전체를 훑지 않게 한 번 모아 둔다. */
+  snapshotVms: ReadonlySet<string>;
   /** 옮길 노드 id */
   target?: string;
 }
@@ -48,7 +49,7 @@ export function bulkReason(vm: Vm, action: BulkAction, ctx: BulkContext): string
   if (!able.ok) {
     return able.reason;
   }
-  if (action === "delete" && ctx.snapshots.some((s) => s.spec.vm === vm.id)) {
+  if (action === "delete" && ctx.snapshotVms.has(vm.id)) {
     return "vms.bulk.reason.snapshots";
   }
   if (action === "migrate") {
@@ -63,6 +64,11 @@ export function bulkReason(vm: Vm, action: BulkAction, ctx: BulkContext): string
     }
   }
   return null;
+}
+
+/** 스냅샷이 하나라도 있는 VM id */
+export function snapshotVms(snapshots: readonly Snapshot[] | undefined): ReadonlySet<string> {
+  return new Set(snapshots?.map((s) => s.spec.vm));
 }
 
 /** 일괄 스냅샷 이름 `bulk-YYYYMMDD-HHMM`(이 브라우저의 시각) */

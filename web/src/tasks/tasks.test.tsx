@@ -141,6 +141,45 @@ it("offers to turn a stopped VM on again", async () => {
   await waitFor(() => expect(start).toHaveBeenCalledWith(web.id, "start"));
 });
 
+it("does not turn a VM on again when it is already running", async () => {
+  const web = vm("web", "stopped");
+  const start = vi.fn();
+  server.use(
+    http.post(apiUrl("/vms/:key/actions/:action"), ({ params }) => {
+      start(params.key, params.action);
+      return HttpResponse.json(task("41", "pending"), { status: 202 });
+    }),
+  );
+  const queryClient = createQueryClient();
+  queryClient.setQueryData(["list", "vm"], { revision: 1, items: [web] });
+  const stop = {
+    ...task("40", "pending"),
+    spec: { op: { kind: "vm-force-stop" }, target: web.id, node: "n" },
+  } as Task;
+  queryClient.setQueryData(["list", "task"], {
+    revision: 2,
+    items: [{ ...stop, status: { state: "succeeded", error: null } }],
+  });
+  render(
+    <ThemeProvider>
+      <QueryClientProvider client={queryClient}>
+        <TaskToasts />
+        <Toaster />
+      </QueryClientProvider>
+    </ThemeProvider>,
+  );
+  trackTask(stop, "Force stop web");
+  expect(await screen.findByText("Force stop web: done")).toBeInTheDocument();
+  // 그 사이 누가 켰다.
+  queryClient.setQueryData(["list", "vm"], {
+    revision: 2,
+    items: [{ ...vm("web", "running"), revision: 2 }],
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Turn on again" }));
+  expect(await screen.findByText("The VM is running.")).toBeInTheDocument();
+  expect(start).not.toHaveBeenCalled();
+});
+
 it("settles a task that finished before it was tracked", async () => {
   const queryClient = createQueryClient();
   queryClient.setQueryData(["list", "task"], { revision: 2, items: [task("2", "succeeded")] });
