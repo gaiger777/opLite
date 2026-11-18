@@ -1687,6 +1687,7 @@ name = "opl-types"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "data-encoding",
  "ring",
  "serde",
  "serde_json",

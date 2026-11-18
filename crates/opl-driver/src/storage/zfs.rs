@@ -1560,6 +1560,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         )
     }

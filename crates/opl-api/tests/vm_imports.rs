@@ -44,6 +44,7 @@ async fn network(env: &Env, name: &str) {
             vlan: None,
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     env.cluster.create(&network).await.unwrap();
@@ -354,6 +355,7 @@ async fn pool(env: &Env, name: &str, nodes: Vec<Uuid>) {
             nodes,
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

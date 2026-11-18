@@ -1448,6 +1448,7 @@ mod tests {
                     nodes,
                     shared: false,
                     backups: false,
+                    folder: None,
                 },
             );
             self.cluster.create(&pool).await.unwrap();
@@ -2151,6 +2152,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         s.cluster.create(&local).await.unwrap();

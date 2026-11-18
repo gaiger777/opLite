@@ -45,6 +45,7 @@ fn rbd_pool() -> StoragePool {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     )
 }
@@ -59,6 +60,7 @@ fn dir_pool(dir: &Path) -> StoragePool {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     )
 }
@@ -492,6 +494,7 @@ async fn restricted_user_in_a_namespace_with_its_conf() {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     let storage = storage();

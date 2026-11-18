@@ -785,6 +785,7 @@ async fn ha_vm_reassigned_while_reattaching_is_not_started() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -1539,6 +1540,7 @@ async fn start_with_disk(storage: &Arc<GateStorage>) -> (Env, Ha, Vm) {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

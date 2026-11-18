@@ -3708,6 +3708,11 @@ export interface components {
                 /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
                 bridge?: string;
                 /**
+                 * Format: uuid
+                 * @description 든 네트워크 폴더(계획 62, `Folder` id). 없으면 네트워크 트리의 루트이고 쓰지 않아 옛 노드도 네트워크를 푼다.
+                 */
+                folder?: string;
+                /**
                  * Format: int32
                  * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
                  */
@@ -3781,6 +3786,11 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
                 backups?: boolean;
+                /**
+                 * Format: uuid
+                 * @description 든 스토리지 폴더(계획 62, `Folder` id). 없으면 스토리지 트리의 루트이고 쓰지 않아 옛 노드도 풀을 푼다.
+                 */
+                folder?: string;
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
                 /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -3801,6 +3811,12 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
+                /**
+                 * Format: uuid
+                 * @description 든 VM 폴더(계획 62, `Folder` id). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 VM을 푼다. 템플릿도 같은
+                 *     트리에 산다.
+                 */
+                folder?: string;
                 /**
                  * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
                  *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
@@ -5074,6 +5090,11 @@ export interface components {
                     /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
                     bridge?: string;
                     /**
+                     * Format: uuid
+                     * @description 든 네트워크 폴더(계획 62, `Folder` id). 없으면 네트워크 트리의 루트이고 쓰지 않아 옛 노드도 네트워크를 푼다.
+                     */
+                    folder?: string;
+                    /**
                      * Format: int32
                      * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
                      */
@@ -5371,6 +5392,11 @@ export interface components {
                     backend: components["schemas"]["PoolBackend"];
                     /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
                     backups?: boolean;
+                    /**
+                     * Format: uuid
+                     * @description 든 스토리지 폴더(계획 62, `Folder` id). 없으면 스토리지 트리의 루트이고 쓰지 않아 옛 노드도 풀을 푼다.
+                     */
+                    folder?: string;
                     /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                     nodes?: string[];
                     /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -5501,6 +5527,12 @@ export interface components {
                     cpu: components["schemas"]["CpuSpec"];
                     disks?: components["schemas"]["DiskSpec"][];
                     firmware?: components["schemas"]["Firmware"];
+                    /**
+                     * Format: uuid
+                     * @description 든 VM 폴더(계획 62, `Folder` id). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 VM을 푼다. 템플릿도 같은
+                     *     트리에 산다.
+                     */
+                    folder?: string;
                     /**
                      * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
                      *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
@@ -5802,6 +5834,11 @@ export interface components {
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
             bridge?: string;
+            /**
+             * Format: uuid
+             * @description 든 네트워크 폴더(계획 62, `Folder` id). 없으면 네트워크 트리의 루트이고 쓰지 않아 옛 노드도 네트워크를 푼다.
+             */
+            folder?: string;
             /**
              * Format: int32
              * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
@@ -7243,6 +7280,11 @@ export interface components {
                 /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
                 bridge?: string;
                 /**
+                 * Format: uuid
+                 * @description 든 네트워크 폴더(계획 62, `Folder` id). 없으면 네트워크 트리의 루트이고 쓰지 않아 옛 노드도 네트워크를 푼다.
+                 */
+                folder?: string;
+                /**
                  * Format: int32
                  * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
                  */
@@ -7486,6 +7528,8 @@ export interface components {
                 shutdown_policy?: components["schemas"]["ShutdownPolicy"];
                 /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
                 telemetry?: components["schemas"]["TelemetrySettings"];
+                /** @description 2단계 인증 정책(계획 62). 없으면 아무에게도 요구하지 않고 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+                two_factor?: components["schemas"]["TwoFactorPolicy"];
                 updates?: components["schemas"]["UpdateSettings"];
                 /**
                  * Format: int32
@@ -7583,6 +7627,11 @@ export interface components {
                 backend: components["schemas"]["PoolBackend"];
                 /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
                 backups?: boolean;
+                /**
+                 * Format: uuid
+                 * @description 든 스토리지 폴더(계획 62, `Folder` id). 없으면 스토리지 트리의 루트이고 쓰지 않아 옛 노드도 풀을 푼다.
+                 */
+                folder?: string;
                 /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
                 nodes?: string[];
                 /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -7701,6 +7750,12 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
+                /**
+                 * Format: uuid
+                 * @description 든 VM 폴더(계획 62, `Folder` id). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 VM을 푼다. 템플릿도 같은
+                 *     트리에 산다.
+                 */
+                folder?: string;
                 /**
                  * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
                  *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
@@ -7889,7 +7944,7 @@ export interface components {
             pool: string;
         };
         /** @enum {string} */
-        Role: "admin" | "operator" | "viewer";
+        Role: "admin" | "operator" | "viewer" | "none";
         /** @description 그룹에서 역할 정하기 */
         RoleMapping: {
             /** @description 맞는 그룹이 없을 때의 역할. 없으면 로그인을 거절한다. */
@@ -8056,6 +8111,8 @@ export interface components {
             shutdown_policy?: components["schemas"]["ShutdownPolicy"];
             /** @description 옵트인 텔레메트리. 기본값(꺼짐, 끝점 없음)이면 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             telemetry?: components["schemas"]["TelemetrySettings"];
+            /** @description 2단계 인증 정책(계획 62). 없으면 아무에게도 요구하지 않고 쓰지 않아 옛 노드도 설정을 계속 푼다. */
+            two_factor?: components["schemas"]["TwoFactorPolicy"];
             updates?: components["schemas"]["UpdateSettings"];
             /**
              * Format: int32
@@ -8240,6 +8297,11 @@ export interface components {
             backend: components["schemas"]["PoolBackend"];
             /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
             backups?: boolean;
+            /**
+             * Format: uuid
+             * @description 든 스토리지 폴더(계획 62, `Folder` id). 없으면 스토리지 트리의 루트이고 쓰지 않아 옛 노드도 풀을 푼다.
+             */
+            folder?: string;
             /** @description 이 풀을 쓸 수 있는 노드. 비어 있으면 모든 노드. */
             nodes?: string[];
             /** @description 모든 노드가 같은 데이터를 보는 공유 스토리지인지. NFS·RBD·공유 LVM 풀은 늘 공유다(`is_shared`). */
@@ -8678,6 +8740,15 @@ export interface components {
             /** Format: uuid */
             vm: string;
         };
+        /** @description 2단계 인증 정책(`SettingsSpec.two_factor`) */
+        TwoFactorPolicy: {
+            /** @description 이 영역의 사용자에게 요구한다. 로컬 사용자는 `local`이다. OIDC 영역은 받지 않는다(IdP가 MFA를 맡는다). */
+            realms?: string[];
+            /** @description 이 전역 역할의 사용자에게 요구한다. */
+            roles?: components["schemas"]["Role"][];
+            /** @description 패스키의 RP ID(도메인). 없으면 요청 호스트다. */
+            rp_id?: string;
+        };
         UpdateRequest_AlertRuleSpec: {
             labels?: {
                 [key: string]: string;
@@ -8831,6 +8902,12 @@ export interface components {
                 cpu: components["schemas"]["CpuSpec"];
                 disks?: components["schemas"]["DiskSpec"][];
                 firmware?: components["schemas"]["Firmware"];
+                /**
+                 * Format: uuid
+                 * @description 든 VM 폴더(계획 62, `Folder` id). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 VM을 푼다. 템플릿도 같은
+                 *     트리에 산다.
+                 */
+                folder?: string;
                 /**
                  * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
                  *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).
@@ -9107,6 +9184,12 @@ export interface components {
             cpu: components["schemas"]["CpuSpec"];
             disks?: components["schemas"]["DiskSpec"][];
             firmware?: components["schemas"]["Firmware"];
+            /**
+             * Format: uuid
+             * @description 든 VM 폴더(계획 62, `Folder` id). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 VM을 푼다. 템플릿도 같은
+             *     트리에 산다.
+             */
+            folder?: string;
             /**
              * @description 게스트 에이전트(계획 59): 채널을 달고 게스트 정보·에이전트 종료·fs-freeze에 쓴다. 없으면 쓰지 않아 옛 노드도
              *     VM을 푼다(`ha.guest_watch`가 있으면 채널은 그대로 단다).

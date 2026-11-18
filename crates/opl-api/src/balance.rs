@@ -1018,6 +1018,7 @@ mod tests {
                 tpm: false,
                 secure_boot: false,
                 guest_agent: None,
+                folder: None,
             },
         );
         v.status.phase = VmPhase::Running;
@@ -1044,6 +1045,7 @@ mod tests {
                 nodes: vec![],
                 shared,
                 backups: false,
+                folder: None,
             },
         )
     }

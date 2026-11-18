@@ -254,6 +254,7 @@ impl TemplateDraft {
             tpm: false,
             secure_boot: false,
             guest_agent: None,
+            folder: None,
         };
         spec.validate()?;
         Ok(spec)

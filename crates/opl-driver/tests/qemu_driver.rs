@@ -711,6 +711,7 @@ async fn incremental_backup_holds_only_changed_blocks() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     let restored = storage
@@ -884,6 +885,7 @@ async fn incremental_backup_holds_zeroed_and_discarded_blocks() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     let restored = storage
@@ -917,6 +919,7 @@ async fn inconsistent_bitmaps_do_not_block_offline_resize_or_restart() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     let storage = DirStorage::new("qemu-img", tmp.path().join("mnt"));
@@ -1228,6 +1231,7 @@ async fn a_linked_clone_disk_opens_its_backing_file() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     let storage = DirStorage::new("qemu-img", tmp.path().join("mnt"));

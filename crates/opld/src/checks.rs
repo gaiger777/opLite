@@ -1246,6 +1246,7 @@ mod tests {
             nodes,
             shared: true,
             backups: false,
+            folder: None,
         };
         s.cluster
             .create(&Resource::new("nas", pool(vec![])))
@@ -1320,6 +1321,7 @@ mod tests {
                     nodes: vec![],
                     shared: false,
                     backups: false,
+                    folder: None,
                 },
             ))
             .await

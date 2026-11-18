@@ -1009,6 +1009,7 @@ pub async fn create_ceph_pool(
         nodes: Vec::new(),
         shared: true,
         backups: false,
+        folder: None,
     };
     check_pool_spec(&state.cluster, &mut spec, true)?;
     // 이미 등록된 Ceph 풀(어느 conf로든)은 다시 만들지 않는다 — 이어서 하기가 쓰는 풀의 복제 수를 바꾸지 않게.

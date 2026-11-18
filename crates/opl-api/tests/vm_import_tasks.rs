@@ -179,6 +179,7 @@ async fn setup(env: &Env) {
             vlan: None,
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     env.cluster.create(&network).await.unwrap();
@@ -192,6 +193,7 @@ async fn setup(env: &Env) {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

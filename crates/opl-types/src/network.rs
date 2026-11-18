@@ -36,6 +36,10 @@ pub struct NetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub mtu: Option<u16>,
+    /// 든 네트워크 폴더(계획 62, `Folder` id). 없으면 네트워크 트리의 루트이고 쓰지 않아 옛 노드도 네트워크를 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub folder: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +189,7 @@ mod tests {
             vlan,
             vxlan: None,
             mtu: None,
+            folder: None,
         }
     }
 
@@ -194,6 +199,7 @@ mod tests {
             vlan: None,
             vxlan: Some(Vxlan { vni }),
             mtu,
+            folder: None,
         }
     }
 
@@ -249,6 +255,23 @@ mod tests {
         let s: NetworkSpec =
             serde_json::from_value(serde_json::json!({ "bridge": "vmbr0", "vlan": null })).unwrap();
         assert_eq!(s, spec("vmbr0", None));
+    }
+
+    /// 계획 62: 폴더가 없으면 옛 모양 그대로, 있으면 왕복한다.
+    #[test]
+    fn folder_is_written_only_when_set() {
+        let old = serde_json::json!({ "vxlan": { "vni": 1000 }, "mtu": 1400 });
+        let s: NetworkSpec = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(s.folder, None);
+        assert_eq!(serde_json::to_value(&s).unwrap(), old);
+        let folder = Uuid::from_u128(3);
+        let s = NetworkSpec {
+            folder: Some(folder),
+            ..s
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["folder"], folder.to_string());
+        assert_eq!(serde_json::from_value::<NetworkSpec>(json).unwrap(), s);
     }
 
     #[test]

@@ -207,6 +207,7 @@ fn dir_pool(name: &str, node: Uuid) -> StoragePool {
             nodes: vec![node],
             shared: false,
             backups: false,
+            folder: None,
         },
     )
 }

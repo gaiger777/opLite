@@ -63,9 +63,50 @@ pub enum Kind {
     Ceph,
     AlertRule,
     NotificationTarget,
+    Folder,
+    Grant,
+    AccessRole,
+    Group,
+    TwoFactor,
 }
 
 impl Kind {
+    /// 모든 종류(선언 순서). 종류마다 도는 시험과 권한 표가 쓴다.
+    pub const ALL: [Kind; 32] = [
+        Kind::Vm,
+        Kind::StoragePool,
+        Kind::Volume,
+        Kind::Node,
+        Kind::Task,
+        Kind::User,
+        Kind::ApiToken,
+        Kind::Cluster,
+        Kind::JoinToken,
+        Kind::Network,
+        Kind::Snapshot,
+        Kind::SecurityGroup,
+        Kind::Backup,
+        Kind::BackupJob,
+        Kind::VmImport,
+        Kind::Settings,
+        Kind::Realm,
+        Kind::Remote,
+        Kind::Session,
+        Kind::VipHolder,
+        Kind::HaGroup,
+        Kind::PlacementRule,
+        Kind::NodeFence,
+        Kind::HaCheck,
+        Kind::Ceph,
+        Kind::AlertRule,
+        Kind::NotificationTarget,
+        Kind::Folder,
+        Kind::Grant,
+        Kind::AccessRole,
+        Kind::Group,
+        Kind::TwoFactor,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Kind::Vm => "vm",
@@ -95,6 +136,11 @@ impl Kind {
             Kind::Ceph => "ceph",
             Kind::AlertRule => "alert-rule",
             Kind::NotificationTarget => "notification-target",
+            Kind::Folder => "folder",
+            Kind::Grant => "grant",
+            Kind::AccessRole => "access-role",
+            Kind::Group => "group",
+            Kind::TwoFactor => "two-factor",
         }
     }
 }
@@ -155,37 +201,21 @@ mod tests {
 
     #[test]
     fn kind_serializes_as_its_str() {
-        for kind in [
-            Kind::Vm,
-            Kind::StoragePool,
-            Kind::Volume,
-            Kind::Node,
-            Kind::Task,
-            Kind::User,
-            Kind::ApiToken,
-            Kind::Cluster,
-            Kind::JoinToken,
-            Kind::Network,
-            Kind::Snapshot,
-            Kind::SecurityGroup,
-            Kind::Backup,
-            Kind::BackupJob,
-            Kind::VmImport,
-            Kind::Settings,
-            Kind::Realm,
-            Kind::Remote,
-            Kind::Session,
-            Kind::VipHolder,
-            Kind::HaGroup,
-            Kind::PlacementRule,
-            Kind::NodeFence,
-            Kind::HaCheck,
-            Kind::Ceph,
-            Kind::AlertRule,
-            Kind::NotificationTarget,
-        ] {
+        for kind in Kind::ALL {
             assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
+            assert_eq!(
+                serde_json::from_value::<Kind>(kind.as_str().into()).unwrap(),
+                kind
+            );
         }
+        // ALL은 빠짐없고 겹치지 않는다(새 종류를 더하면 길이와 함께 고친다).
+        let set: std::collections::BTreeSet<Kind> = Kind::ALL.into_iter().collect();
+        assert_eq!(set.len(), Kind::ALL.len());
+        assert_eq!(
+            Kind::ALL.last().map(|k| k.as_str()),
+            Some("two-factor"),
+            "새 종류는 ALL 끝에도 더한다"
+        );
     }
 
     #[test]

@@ -373,6 +373,7 @@ async fn setup_full(schedule: &str, a_hotplug: bool, ha: bool) -> Setup {
             session_epoch: 0,
             realm: None,
             subject: None,
+            external_groups: vec![],
         },
     );
     a.cluster.create(&admin_user).await.unwrap();
@@ -386,6 +387,7 @@ async fn setup_full(schedule: &str, a_hotplug: bool, ha: bool) -> Setup {
                 nodes: vec![node],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         a.cluster.create(&pool).await.unwrap();
@@ -908,6 +910,7 @@ async fn replicate_requests_are_checked() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     s.a.cluster.create(&pool).await.unwrap();

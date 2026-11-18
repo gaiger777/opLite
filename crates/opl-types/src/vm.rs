@@ -98,6 +98,11 @@ pub struct VmSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub guest_agent: Option<GuestAgentSpec>,
+    /// 든 VM 폴더(계획 62, `Folder` id). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 VM을 푼다. 템플릿도 같은
+    /// 트리에 산다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub folder: Option<Uuid>,
 }
 
 /// VM의 게스트 에이전트 설정(계획 59). JSON `{}`은 기본값 그대로 켠다는 뜻이고, 기본값인 칸은 쓰지 않는다.
@@ -1526,6 +1531,22 @@ mod tests {
         assert!(!spec.pinned());
         json["placement"] = serde_json::json!({ "pinned": true, "weight": 1 });
         assert!(serde_json::from_value::<VmSpec>(json).is_err());
+    }
+
+    /// 계획 62: 폴더가 없으면(루트) 옛 VM 그대로 쓰고, 있으면 왕복한다.
+    #[test]
+    fn folder_is_written_only_when_set() {
+        let spec: VmSpec = serde_json::from_str(OLD_VM_JSON).unwrap();
+        assert_eq!(spec.folder, None);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), OLD_VM_JSON);
+        let folder = Uuid::from_u128(7);
+        let mut json = sample_json();
+        json["folder"] = serde_json::json!(folder.to_string());
+        let spec: VmSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.folder, Some(folder));
+        let back = serde_json::to_value(&spec).unwrap();
+        assert_eq!(back["folder"], folder.to_string());
+        assert_eq!(serde_json::from_value::<VmSpec>(back).unwrap(), spec);
     }
 
     /// 복제 대상이 없으면 옛 VM 그대로 쓰고, 있으면 왕복한다(주기 기본 `*/15`).

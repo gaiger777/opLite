@@ -54,6 +54,7 @@ async fn env_with_config(
             vlan: None,
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     env.cluster.create(&lan).await.unwrap();

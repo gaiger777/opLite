@@ -237,6 +237,7 @@ fn pool(name: &str, nodes: Vec<Uuid>) -> StoragePool {
             nodes,
             shared: false,
             backups: false,
+            folder: None,
         },
     )
 }
@@ -874,6 +875,7 @@ async fn nfs_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (StoragePool, opl
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&nas).await.unwrap();
@@ -932,6 +934,7 @@ async fn lvm_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&vg).await.unwrap();
@@ -977,6 +980,7 @@ async fn rbd_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&r).await.unwrap();
@@ -1055,6 +1059,7 @@ async fn lvm_shared_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, V
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&s).await.unwrap();
@@ -1121,6 +1126,7 @@ async fn zfs_vm(cluster: &opl_cluster::Cluster, node: Uuid) -> (Volume, Vm) {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&z).await.unwrap();
@@ -1212,6 +1218,7 @@ async fn resolves_bridge_networks_to_taps() {
             vlan: Some(10),
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     cluster.create(&lan).await.unwrap();
@@ -1245,6 +1252,7 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
             vlan: None,
             vxlan: Some(Vxlan { vni: 1000 }),
             mtu: None,
+            folder: None,
         },
     );
     cluster.create(&blue).await.unwrap();
@@ -1255,6 +1263,7 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
             vlan: None,
             vxlan: Some(Vxlan { vni: 2000 }),
             mtu: Some(8950),
+            folder: None,
         },
     );
     cluster.create(&jumbo).await.unwrap();
@@ -1494,6 +1503,7 @@ async fn resolves_one_disk_and_one_nic() {
             vlan: None,
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     cluster.create(&net).await.unwrap();
@@ -1685,6 +1695,7 @@ async fn cdrom_media_must_be_isos_in_file_pools() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&vg).await.unwrap();
@@ -1723,6 +1734,7 @@ async fn nfs_isos_follow_the_nfs_rules() {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     cluster.create(&nas).await.unwrap();

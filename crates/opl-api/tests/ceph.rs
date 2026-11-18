@@ -744,6 +744,7 @@ async fn creating_a_pool_checks_the_size_against_the_hosts() {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     c.env.cluster.create(&used).await.unwrap();
@@ -771,6 +772,7 @@ async fn creating_a_pool_checks_the_size_against_the_hosts() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     c.env.cluster.create(&taken).await.unwrap();
@@ -848,6 +850,7 @@ async fn the_status_is_read_from_a_monitor_and_cached() {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     c.env.cluster.create(&vms).await.unwrap();

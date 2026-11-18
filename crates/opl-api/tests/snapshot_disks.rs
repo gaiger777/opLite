@@ -80,6 +80,7 @@ async fn create_pool(env: &Env) {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -338,6 +339,7 @@ async fn unfinished_snapshot_tags_are_removed_at_startup() {
                     nodes: vec![],
                     shared: false,
                     backups: false,
+                    folder: None,
                 },
             );
             cluster.create(&pool).await.unwrap();

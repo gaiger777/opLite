@@ -289,6 +289,7 @@ async fn iso_volumes_follow_the_iso_rules() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&thin).await.unwrap();

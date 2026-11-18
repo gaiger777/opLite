@@ -807,6 +807,7 @@ pub(crate) fn import_spec(
         tpm: false,
         secure_boot: false,
         guest_agent: None,
+        folder: None,
     })
 }
 

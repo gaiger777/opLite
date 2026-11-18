@@ -45,14 +45,8 @@ pub struct Principal {
     pub role: Role,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Read,
-    /// 생성, 수정, 삭제
-    Write,
-    /// 시작·정지 같은 동작과 콘솔
-    Operate,
-}
+/// 종류 단위 확인의 동작. 권한 목록(계획 62)과 견주려고 opl-types에 둔다.
+pub use opl_types::authz::Action;
 
 /// 모든 핸들러가 거치는 권한 확인 훅(설계 4절). 엔터프라이즈 플러그인이 세분화된 RBAC로 바꾼다.
 pub trait Authorizer: Send + Sync {
@@ -64,7 +58,8 @@ pub struct RoleAuthorizer;
 
 impl Authorizer for RoleAuthorizer {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
-        // 계정과 비밀을 담은 종류(전원 끄기 펜싱의 BMC 비밀번호, 알림 대상의 SMTP 비밀번호·webhook 토큰)는 admin만 읽는다.
+        // 계정과 비밀을 담은 종류(전원 끄기 펜싱의 BMC 비밀번호, 알림 대상의 SMTP 비밀번호·webhook 토큰, 2FA 비밀,
+        // 누가 무엇을 받았는지 담은 grant·그룹)는 admin만 읽는다.
         let account = matches!(
             kind,
             Kind::User
@@ -74,6 +69,9 @@ impl Authorizer for RoleAuthorizer {
                 | Kind::Session
                 | Kind::NodeFence
                 | Kind::NotificationTarget
+                | Kind::Grant
+                | Kind::Group
+                | Kind::TwoFactor
         );
         match principal.role {
             Role::Admin => true,
@@ -87,6 +85,8 @@ impl Authorizer for RoleAuthorizer {
                 }
             },
             Role::Viewer => action == Action::Read && !account,
+            // 전역 역할 없음(계획 62): 권한은 grant로만 받는다.
+            Role::None => false,
         }
     }
 }
@@ -292,6 +292,7 @@ impl AppState {
                 user: user.id,
                 epoch: user.spec.session_epoch,
                 expires_at: now + SESSION_TTL.as_secs(),
+                pending: None,
             },
         );
         session.status.last_used = now;
@@ -421,6 +422,7 @@ impl AppState {
                 user: Uuid::nil(),
                 epoch: 0,
                 expires_at: unix_now(),
+                pending: None,
             },
         );
         match self.cluster.create(&mark).await {
@@ -647,6 +649,38 @@ mod tests {
         assert!(!a.check(&op, Action::Write, Kind::Ceph));
         assert!(!a.check(&op, Action::Operate, Kind::Ceph));
         assert!(a.check(&admin, Action::Write, Kind::Ceph));
+    }
+
+    /// 계획 62: 내장 역할의 권한 목록(`builtin_privileges`)과 종류 단위 권한(`kind_privilege`)이 모든
+    /// (역할, 동작, 종류)에서 지금 `RoleAuthorizer`와 같은 답을 낸다. `none`은 아무것도 못 하고, 2FA·grant·그룹은
+    /// 계정 종류라 admin만 읽는다.
+    #[test]
+    fn builtin_privileges_match_role_authorizer() {
+        use opl_types::authz::{builtin_privileges, kind_privilege};
+        let a = RoleAuthorizer;
+        for role in Role::ALL {
+            for action in Action::ALL {
+                for kind in Kind::ALL {
+                    assert_eq!(
+                        a.check(&principal(role), action, kind),
+                        builtin_privileges(role).contains(kind_privilege(action, kind)),
+                        "{role:?} {action:?} {kind:?}"
+                    );
+                }
+            }
+        }
+        let op = principal(Role::Operator);
+        for kind in [Kind::TwoFactor, Kind::Grant, Kind::Group] {
+            assert!(!a.check(&op, Action::Read, kind), "{kind:?}");
+        }
+        for kind in [Kind::Folder, Kind::AccessRole] {
+            assert!(
+                a.check(&principal(Role::Viewer), Action::Read, kind),
+                "{kind:?}"
+            );
+            assert!(!a.check(&op, Action::Write, kind), "{kind:?}");
+        }
+        assert!(!a.check(&principal(Role::None), Action::Read, Kind::Vm));
     }
 
     #[test]

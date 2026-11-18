@@ -65,6 +65,7 @@ async fn ready_volume(env: &Env, name: &str, format: ImageFormat) {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         env.cluster.create(&pool).await.unwrap();

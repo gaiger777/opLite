@@ -48,5 +48,8 @@ export function can(role: Role, action: Action, kind: Kind): boolean {
             kind === "vm-import";
     case "viewer":
       return action === "read" && !account;
+    case "none":
+      // 전역 역할 없음(계획 62): 권한은 폴더·객체 grant로만 받는다.
+      return false;
   }
 }

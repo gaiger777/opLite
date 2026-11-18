@@ -66,6 +66,8 @@ http-body-util = "0.1.5"
 native-tls = "0.2.18"
 ring = "0.17.14"
 base64 = "0.22.1"
+# TOTP 비밀의 base32(계획 62). 이미 트리에 있다.
+data-encoding = "2.11.1"
 rust-embed = { version = "8.13.0", features = ["mime-guess", "interpolate-folder-path"] }
 libc = "0.2.191"
 ldap3 = { version = "0.12.1", default-features = false, features = ["tls-rustls-ring"] }

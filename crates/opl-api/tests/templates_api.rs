@@ -28,6 +28,7 @@ async fn pool(env: &Env, name: &str, backend: PoolBackend, shared: bool) {
             nodes: vec![],
             shared,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

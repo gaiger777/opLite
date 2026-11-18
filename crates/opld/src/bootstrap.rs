@@ -78,6 +78,7 @@ pub async fn create_cluster(
             session_epoch: 0,
             realm: None,
             subject: None,
+            external_groups: vec![],
         },
     );
     cluster.create(&admin).await?;
@@ -810,7 +811,9 @@ pub(crate) mod tests {
                 "vtpm",
                 "guest-agent",
                 "metrics-history",
-                "notifications"
+                "notifications",
+                "folders",
+                "two-factor"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -849,7 +852,9 @@ pub(crate) mod tests {
                 "vtpm",
                 "guest-agent",
                 "metrics-history",
-                "notifications"
+                "notifications",
+                "folders",
+                "two-factor"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -907,7 +912,9 @@ pub(crate) mod tests {
                 "vtpm",
                 "guest-agent",
                 "metrics-history",
-                "notifications"
+                "notifications",
+                "folders",
+                "two-factor"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1140,6 +1147,8 @@ pub(crate) mod tests {
                     "guest-agent".into(),
                     "metrics-history".into(),
                     "notifications".into(),
+                    "folders".into(),
+                    "two-factor".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

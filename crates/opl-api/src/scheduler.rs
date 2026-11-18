@@ -522,6 +522,7 @@ mod tests {
                 nodes: vec![],
                 shared,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -568,6 +569,7 @@ mod tests {
             tpm: false,
             secure_boot: false,
             guest_agent: None,
+            folder: None,
         }
     }
 
@@ -773,6 +775,7 @@ mod tests {
                 nodes: vec![near.id],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         let far = with_pool(node(32000), &pool, true);
@@ -1127,6 +1130,7 @@ mod tests {
                     vlan: None,
                     vxlan: None,
                     mtu: None,
+                    folder: None,
                 },
             )],
             ..Default::default()
@@ -1516,6 +1520,7 @@ mod tests {
                     vlan,
                     vxlan: None,
                     mtu: None,
+                    folder: None,
                 },
             )
         };
@@ -1561,6 +1566,7 @@ mod tests {
                     vlan: None,
                     vxlan: Some(Vxlan { vni: 1000 }),
                     mtu: None,
+                    folder: None,
                 },
             )],
             ..Default::default()
@@ -1619,6 +1625,7 @@ mod tests {
                     vlan: None,
                     vxlan: None,
                     mtu: None,
+                    folder: None,
                 },
             )],
             ..Default::default()

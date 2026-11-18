@@ -365,6 +365,7 @@ async fn backups_left_receiving_are_deleted_with_their_files() {
             nodes: vec![],
             shared: false,
             backups: true,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -433,6 +434,7 @@ async fn expired_sessions_are_deleted() {
                 user: admin.id,
                 epoch: admin.spec.session_epoch,
                 expires_at,
+                pending: None,
             },
         )
     };

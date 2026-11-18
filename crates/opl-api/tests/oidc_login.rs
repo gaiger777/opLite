@@ -669,6 +669,7 @@ async fn users_without_a_subject_get_one() {
             session_epoch: 0,
             realm: Some("okta".into()),
             subject: None,
+            external_groups: vec![],
         },
     );
     env.cluster.create(&old).await.unwrap();

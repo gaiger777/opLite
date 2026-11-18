@@ -122,6 +122,7 @@ async fn nodes(slot: u16) -> Nodes {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     let storage = Storages::new(

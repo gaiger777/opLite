@@ -210,6 +210,7 @@ impl Env {
                 session_epoch: 0,
                 realm: None,
                 subject: None,
+                external_groups: vec![],
             },
         );
         cluster.create(&admin).await.unwrap();

@@ -51,6 +51,7 @@ async fn pool(env: &Env, nodes: Vec<Uuid>) {
             nodes,
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -346,6 +347,7 @@ async fn block_volume(
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         };
         env.cluster
             .create(&Resource::new(pool, spec))

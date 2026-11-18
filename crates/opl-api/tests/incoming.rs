@@ -589,6 +589,7 @@ async fn a_vm_with_security_groups_needs_the_firewall() {
             vlan: None,
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     s.env.cluster.create(&lan).await.unwrap();

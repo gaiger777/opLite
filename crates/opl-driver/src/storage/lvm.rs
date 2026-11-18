@@ -2088,6 +2088,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -2252,6 +2253,7 @@ mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         );
         let id = Uuid::now_v7();
@@ -3159,6 +3161,7 @@ mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         )
     }

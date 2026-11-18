@@ -202,23 +202,26 @@ impl RoleMapping {
     pub fn role_for(&self, groups: &[String]) -> Option<Role> {
         self.groups
             .iter()
-            .filter(|m| {
-                groups
-                    .iter()
-                    .any(|g| g.trim().eq_ignore_ascii_case(m.group.trim()))
-            })
+            .filter(|m| groups.iter().any(|g| same_group(g, &m.group)))
             .map(|m| m.role)
             .max_by_key(|r| rank(*r))
             .or(self.default)
     }
 }
 
-/// 역할의 높이: admin > operator > viewer
+/// 디렉터리 그룹 이름 비교: 앞뒤 공백을 떼고 ASCII 대소문자를 무시한다. 역할 매핑과 로컬 그룹의 외부 그룹
+/// 연결(계획 62)이 같은 규칙을 쓴다.
+pub fn same_group(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// 역할의 높이: admin > operator > viewer > none
 fn rank(role: Role) -> u8 {
     match role {
-        Role::Admin => 2,
-        Role::Operator => 1,
-        Role::Viewer => 0,
+        Role::Admin => 3,
+        Role::Operator => 2,
+        Role::Viewer => 1,
+        Role::None => 0,
     }
 }
 
@@ -924,6 +927,26 @@ mod tests {
             m.role_for(&groups(&["cn=viewers,dc=x"])),
             Some(Role::Viewer)
         );
+    }
+
+    /// 계획 62: `default: none`이면 맞는 그룹이 없는 사용자도 전역 역할 없이 로그인한다(권한은 grant로만).
+    /// `none` 매핑은 다른 어떤 역할보다 낮다.
+    #[test]
+    fn role_for_accepts_none() {
+        let mut m = mapping();
+        m.default = Some(Role::None);
+        assert_eq!(m.role_for(&groups(&["cn=other,dc=x"])), Some(Role::None));
+        m.groups.push(GroupRole {
+            group: "cn=guests,dc=x".into(),
+            role: Role::None,
+        });
+        assert_eq!(
+            m.role_for(&groups(&["cn=guests,dc=x", "cn=viewers,dc=x"])),
+            Some(Role::Viewer)
+        );
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["default"], "none");
+        assert_eq!(serde_json::from_value::<RoleMapping>(json).unwrap(), m);
     }
 
     #[test]

@@ -53,6 +53,7 @@ async fn create_pool(env: &Env, name: &str, backups: bool) {
             nodes: vec![],
             shared: false,
             backups,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

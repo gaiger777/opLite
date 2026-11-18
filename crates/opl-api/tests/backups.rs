@@ -49,6 +49,7 @@ async fn pool_with(env: &Env, name: &str, backend: PoolBackend, shared: bool, ba
             nodes: vec![],
             shared,
             backups,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -327,6 +328,7 @@ async fn backup_validates_the_request() {
             nodes: vec![n2],
             shared: false,
             backups: true,
+            folder: None,
         },
     );
     env.cluster.create(&far).await.unwrap();
@@ -451,6 +453,7 @@ async fn stopped_vms_without_a_node_run_where_the_disks_and_the_backup_pool_are(
             nodes: vec![a],
             shared: true,
             backups: true,
+            folder: None,
         },
     );
     env.cluster.create(&only_a).await.unwrap();
@@ -693,6 +696,7 @@ async fn restore_validates_the_request() {
             nodes: vec![Uuid::now_v7()],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&far).await.unwrap();
@@ -932,6 +936,7 @@ async fn backups_in_local_pools_are_handled_on_their_node() {
             nodes: vec![env.node],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&here).await.unwrap();

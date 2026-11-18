@@ -28,6 +28,7 @@ fn pool(dir: &Path) -> StoragePool {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     )
 }
@@ -639,6 +640,7 @@ async fn storages_copy_between_backends() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)))

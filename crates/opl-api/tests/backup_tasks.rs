@@ -74,6 +74,7 @@ async fn create_pool(env: &Env, name: &str, backups: bool) {
             nodes: vec![],
             shared: false,
             backups,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -650,6 +651,7 @@ async fn restore_into_a_block_pool_writes_raw_volumes() {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&thin).await.unwrap();

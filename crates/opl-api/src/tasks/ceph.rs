@@ -443,6 +443,7 @@ impl Run<'_> {
             nodes: Vec::new(),
             shared: true,
             backups: false,
+            folder: None,
         };
         check_name(name).map_err(|e| e.message)?;
         check_pool_spec(&self.ctx.cluster, &mut spec, true).map_err(|e| e.message)?;

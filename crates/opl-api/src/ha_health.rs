@@ -1298,6 +1298,7 @@ mod tests {
                 tpm: false,
                 secure_boot: false,
                 guest_agent: None,
+                folder: None,
             },
         )
     }
@@ -1310,6 +1311,7 @@ mod tests {
                 nodes: vec![],
                 shared,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -1339,6 +1341,7 @@ mod tests {
                 vlan: None,
                 vxlan: None,
                 mtu: None,
+                folder: None,
             },
         )
     }
@@ -1351,6 +1354,7 @@ mod tests {
                 vlan: None,
                 vxlan: Some(Vxlan { vni }),
                 mtu: None,
+                folder: None,
             },
         )
     }

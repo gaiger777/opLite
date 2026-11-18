@@ -1641,6 +1641,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -1763,6 +1764,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -1823,6 +1825,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -1861,6 +1864,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         assert_eq!(
@@ -1895,6 +1899,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         );
         assert_eq!(pool_root(&p, mnt.path()), PathBuf::new());
@@ -1940,6 +1945,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -1987,6 +1993,7 @@ pub(crate) mod tests {
                         nodes: vec![],
                         shared: true,
                         backups: false,
+                        folder: None,
                     },
                 )
             };
@@ -2034,6 +2041,7 @@ pub(crate) mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         let id = Uuid::nil();

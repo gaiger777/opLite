@@ -247,3 +247,12 @@ grant를 만들려면 대상에 `permission.modify`가 있어야 하고, 역할�
 8. **docs: README·가이드 "폴더와 권한"(위임 예, 거부 없는 설계로 빼기, 할당량, 2FA·패스키·IP 접속 한계, 이름 노출), 설계 문서 스테이지 보고, 계획 62 실행 기록**.
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
+
+**스테이지 1(opl-types)**
+
+- `Action`(Read·Write·Operate)을 opl-api에서 `opl_types::authz::Action`으로 옮기고 opl-api는 `pub use`로 그대로 쓴다. 종류 단위 확인이 요구하는 권한 `kind_privilege(Action, Kind)`를 opl-types에 두어 루트 shim과 동치 시험이 같은 표를 쓰게 했다. 동치 시험(모든 `Role`×`Action`×`Kind::ALL`)은 opl-types(옛 규칙 사본)와 opl-api(진짜 `RoleAuthorizer`) 둘 다에 넣었다.
+- 새 종류의 루트 확인 규칙: `TwoFactor`·`Grant`·`Group`은 계정 종류(`is_account_kind`, 읽기도 admin — 비밀이나 누가 무엇을 받았는지를 담는다), `Folder`·`AccessRole`은 누구나 읽고 쓰기는 admin(`inventory.folder`·`cluster.admin`)이다. `RoleAuthorizer`에 그 셋과 `Role::None => false`를 더했다(새 종류가 아직 없으므로 동작은 같다). 폴더 사용자가 자기 grant를 보는 길은 `/permissions/mine`(스테이지 3)이다.
+- 직렬화 모양: `PrincipalRef`·`RoleRef`·`GrantTarget`은 `{"type": …}` 태그(`{"type":"object","kind":"vm","id":…}` — `kind`가 객체 종류라 태그 이름을 `type`으로 했다), `RoleRef`는 `{"type":"builtin","role":"operator"}`·`{"type":"custom","id":…}`. `GrantSpec.propagate`는 기본 참이고 참이면 쓰지 않는다. `PrivSet`은 JSON에서 이름 목록이고 모르는 이름은 버린다. `Passkey.cose_key`는 base64url 문자열이다.
+- 설계에 없던 작은 것: `GroupSpec.description`, `AccessRoleSpec.description`(256자), `FolderSpec::validate`(이름 1~64자, `/`·제어 문자·앞뒤 공백 없음, 할당량은 VM 폴더만), `sibling_key`(`"{부모 id|root-<종류>}/{소문자 이름}"`), `parse_folder_path`, `Role::ALL`·`as_str`, `Kind::ALL`, 사용자 정의 역할 이름은 `none`도 예약, grant 객체 대상은 VM·네트워크·풀만, `TokenScope`는 권한·대상이 하나 이상, `TwoFactorPolicy.validate`(영역 이름 또는 `local`, RP ID는 IP가 아닌 소문자 도메인)·`requires`, `verify_totp`(±1칸, `last_step` 초과만), `realm::same_group`(역할 매핑과 그룹 연결의 같은 비교).
+- `authz_eval`의 참조 `effective(&AuthzSnapshot, user, &AuthzTarget)`와 토큰용 `effective_scoped`: 대상은 `Root`·`Folder(id)`·`Object{kind,id,folder}`, 없는 폴더를 가리키는 객체는 루트에 있는 것으로, 조상 걷기는 순환·깊이 16에서 멈춘다. 루트 grant가 propagate 거짓이면 루트 대상(클러스터 객체)에만 닿는다.
+- 스펙의 새 칸(`folder` 등)은 아직 API가 받을 때 막지 않는다. 기능 게이트·`PUT`의 `folder` 바꾸기 거절은 스테이지 3이 한다.

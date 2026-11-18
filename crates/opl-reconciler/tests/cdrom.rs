@@ -34,6 +34,7 @@ async fn iso_pool(env: &Env) -> Volume {
             nodes: vec![env.node],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

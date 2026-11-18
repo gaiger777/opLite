@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::authz::TokenScope;
 use crate::resource::{Kind, NameError, Resource, ResourceSpec, validate_name};
+use crate::two_factor::PendingLogin;
 
 /// 사용자. 리소스 이름이 로그인 이름이다. 외부 사용자는 `<사용자>@<영역>`이다.
 pub type User = Resource<UserSpec, UserStatus>;
@@ -11,7 +13,7 @@ pub type ApiToken = Resource<ApiTokenSpec, ApiTokenStatus>;
 /// 모든 노드가 같은 세션을 본다(앞단 프록시가 어느 노드로 보내도 이어진다).
 pub type Session = Resource<SessionSpec, SessionStatus>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum Role {
@@ -21,6 +23,22 @@ pub enum Role {
     Operator,
     /// 읽기만 한다.
     Viewer,
+    /// 전역 역할 없음(계획 62). 권한은 폴더·객체 grant로만 받는다. 옛 노드는 풀지 못하므로 기능 `folders` 뒤에만 쓴다.
+    None,
+}
+
+impl Role {
+    /// 이름표(`admin`·`operator`·`viewer`·`none`). 사용자 정의 역할 이름은 이것과 겹치지 못한다.
+    pub const ALL: [Role; 4] = [Role::Admin, Role::Operator, Role::Viewer, Role::None];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Admin => "admin",
+            Role::Operator => "operator",
+            Role::Viewer => "viewer",
+            Role::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +58,10 @@ pub struct UserSpec {
     /// 사람이 로그인하지 못하게 한다. 그 밖의 사용자는 None이고 쓰지 않는다(옛 노드가 읽을 수 있게).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// 외부 사용자가 마지막 로그인 때 받은 디렉터리 그룹(LDAP DN·OIDC `groups` 값, 계획 62). 로컬 그룹
+    /// `GroupSpec.external`과 맞춰 그룹 grant를 준다. 비면 쓰지 않는다(옛 노드가 읽을 수 있게).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_groups: Vec<String>,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -122,6 +144,9 @@ pub struct ApiTokenSpec {
     pub user: Uuid,
     /// 비밀 값의 SHA-256 (16진수)
     pub secret_hash: String,
+    /// 권한 범위(계획 62). 있으면 토큰 권한 = 주인 권한 ∩ 범위다. 없으면 주인과 같고 쓰지 않는다(옛 노드가 읽을 수 있게).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<TokenScope>,
 }
 
 impl ResourceSpec for ApiTokenSpec {
@@ -142,6 +167,10 @@ pub struct SessionSpec {
     pub epoch: u64,
     /// 끝나는 시각(유닉스 초). 지나면 쓸 수 없고 리더의 정리 작업이 지운다.
     pub expires_at: u64,
+    /// 둘째 단계를 기다리는 로그인(계획 62). 있으면 이 세션으로는 둘째 단계·등록 경로만 쓴다. 없으면 정식 세션이고
+    /// 쓰지 않는다(옛 노드가 읽을 수 있게).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingLogin>,
 }
 
 impl ResourceSpec for SessionSpec {
@@ -167,6 +196,7 @@ mod tests {
             user,
             epoch: 2,
             expires_at: 100,
+            pending: None,
         };
         let json = serde_json::to_value(&spec).unwrap();
         assert_eq!(
@@ -207,6 +237,7 @@ mod tests {
             session_epoch: 0,
             realm: None,
             subject: None,
+            external_groups: vec![],
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(
@@ -232,6 +263,7 @@ mod tests {
             session_epoch: 0,
             realm: Some("corp".into()),
             subject: None,
+            external_groups: vec![],
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(
@@ -249,6 +281,7 @@ mod tests {
             session_epoch: 0,
             realm: Some("okta".into()),
             subject: Some("https://idp.example.com u-1".into()),
+            external_groups: vec![],
         };
         let json = serde_json::to_value(&user).unwrap();
         assert_eq!(
@@ -257,6 +290,71 @@ mod tests {
                                 "subject": "https://idp.example.com u-1" })
         );
         assert_eq!(serde_json::from_value::<UserSpec>(json).unwrap(), user);
+    }
+
+    /// 계획 62: 새 칸이 비면 옛 모양 그대로 쓰고(옛 노드는 모르는 필드를 거절한다), 있으면 왕복한다.
+    #[test]
+    fn plan62_fields_are_written_only_when_set() {
+        let old = serde_json::json!({ "password_hash": "", "role": "viewer", "realm": "corp" });
+        let user: UserSpec = serde_json::from_value(old.clone()).unwrap();
+        assert!(user.external_groups.is_empty());
+        assert_eq!(serde_json::to_value(&user).unwrap(), old);
+        let user = UserSpec {
+            role: Role::None,
+            external_groups: vec!["cn=team-a,dc=corp".into()],
+            ..user
+        };
+        let json = serde_json::to_value(&user).unwrap();
+        assert_eq!(json["role"], "none");
+        assert_eq!(json["external_groups"][0], "cn=team-a,dc=corp");
+        assert_eq!(serde_json::from_value::<UserSpec>(json).unwrap(), user);
+
+        let owner = Uuid::from_u128(1);
+        let old = serde_json::json!({ "user": owner.to_string(), "secret_hash": "ab" });
+        let token: ApiTokenSpec = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(token.scope, None);
+        assert_eq!(serde_json::to_value(&token).unwrap(), old);
+        let token = ApiTokenSpec {
+            scope: Some(TokenScope {
+                privileges: vec!["vm.power".into()],
+                targets: vec![crate::authz::GrantTarget::Root],
+            }),
+            ..token
+        };
+        let json = serde_json::to_value(&token).unwrap();
+        assert_eq!(
+            json["scope"],
+            serde_json::json!({ "privileges": ["vm.power"], "targets": [{ "type": "root" }] })
+        );
+        assert_eq!(serde_json::from_value::<ApiTokenSpec>(json).unwrap(), token);
+
+        let session = SessionSpec {
+            user: owner,
+            epoch: 0,
+            expires_at: 9,
+            pending: Some(PendingLogin {
+                expires_at: 5,
+                enroll: true,
+                challenge: None,
+            }),
+        };
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(
+            json["pending"],
+            serde_json::json!({ "expires_at": 5, "enroll": true })
+        );
+        assert_eq!(
+            serde_json::from_value::<SessionSpec>(json).unwrap(),
+            session
+        );
+    }
+
+    #[test]
+    fn role_names() {
+        for role in Role::ALL {
+            assert_eq!(serde_json::to_value(role).unwrap(), role.as_str());
+        }
+        assert_eq!(Role::None.as_str(), "none");
     }
 
     #[test]

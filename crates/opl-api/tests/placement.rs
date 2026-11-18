@@ -110,6 +110,7 @@ async fn pools(env: &Env) {
                 nodes: vec![],
                 shared,
                 backups: false,
+                folder: None,
             },
         );
         env.cluster.create(&pool).await.unwrap();

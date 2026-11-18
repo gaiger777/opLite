@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::image_catalog::CatalogImage;
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::two_factor::TwoFactorPolicy;
 
 pub type Settings = Resource<SettingsSpec, SettingsStatus>;
 
@@ -77,6 +78,10 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub prometheus: Option<PrometheusSettings>,
+    /// 2단계 인증 정책(계획 62). 없으면 아무에게도 요구하지 않고 쓰지 않아 옛 노드도 설정을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub two_factor: Option<TwoFactorPolicy>,
 }
 
 /// Prometheus 끝점 설정
@@ -422,6 +427,7 @@ mod tests {
             placement: None,
             image_catalog: vec![],
             prometheus: None,
+            two_factor: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),
@@ -744,6 +750,30 @@ mod tests {
         assert_eq!(json["image_catalog"][0]["id"], "corp-ubuntu");
         assert_eq!(json["image_catalog"][0]["checksum"]["kind"], "sums");
         assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+    }
+
+    /// 계획 62: 2FA 정책이 없으면 옛 모양 그대로 쓰고, 있으면 함께 쓰고 푼다.
+    #[test]
+    fn two_factor_is_written_only_when_set() {
+        let old = r#"{"updates":{"channel":"stable"}}"#;
+        let spec: SettingsSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(spec.two_factor, None);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+        let spec = SettingsSpec {
+            two_factor: Some(TwoFactorPolicy {
+                roles: vec![crate::auth::Role::Admin],
+                realms: vec!["local".into()],
+                rp_id: None,
+            }),
+            ..SettingsSpec::default()
+        };
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            json["two_factor"],
+            serde_json::json!({ "roles": ["admin"], "realms": ["local"] })
+        );
+        assert_eq!(serde_json::from_value::<SettingsSpec>(json).unwrap(), spec);
+        assert!(serde_json::from_str::<SettingsSpec>(r#"{"two_factor":{"sms":true}}"#).is_err());
     }
 
     /// Prometheus 설정이 없으면 옛 모양 그대로 쓰고, 있으면 함께 쓰고 푼다(옛 노드는 풀지 못하므로 API가 기능

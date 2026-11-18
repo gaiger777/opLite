@@ -37,6 +37,7 @@ async fn dir_pool(env: &Env, name: &str, backups: bool, nodes: Vec<Uuid>) {
             nodes,
             shared: false,
             backups,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();

@@ -461,6 +461,7 @@ async fn a_replication_target_fits_with_its_replica_pool() {
             nodes: vec![target],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&rp).await.unwrap();

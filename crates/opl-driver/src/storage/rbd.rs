@@ -1423,6 +1423,7 @@ mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         )
     }
@@ -1808,6 +1809,7 @@ mod tests {
                 nodes: vec![],
                 shared: true,
                 backups: false,
+                folder: None,
             },
         );
         storage.capacity(&custom).await.unwrap();
@@ -2131,6 +2133,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         invalid(

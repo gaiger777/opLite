@@ -332,6 +332,7 @@ mod tests {
                 vlan: None,
                 vxlan: Some(Vxlan { vni }),
                 mtu,
+                folder: None,
             },
         )
     }
@@ -376,6 +377,7 @@ mod tests {
                 vlan: None,
                 vxlan: None,
                 mtu: None,
+                folder: None,
             },
         );
         let networks = vec![

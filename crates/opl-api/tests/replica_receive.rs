@@ -64,6 +64,7 @@ async fn setup() -> Setup {
                 nodes: vec![node],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         env.cluster.create(&pool).await.unwrap();

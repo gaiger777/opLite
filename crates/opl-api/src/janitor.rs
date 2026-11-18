@@ -571,6 +571,7 @@ mod tests {
                     tpm: false,
                     secure_boot: false,
                     guest_agent: None,
+                    folder: None,
                 },
                 hardware: None,
             },
@@ -1081,6 +1082,7 @@ mod tests {
                 session_epoch: epoch,
                 realm: None,
                 subject: None,
+                external_groups: vec![],
             },
         )
     }
@@ -1092,6 +1094,7 @@ mod tests {
                 user,
                 epoch,
                 expires_at,
+                pending: None,
             },
         );
         s.revision = 5;

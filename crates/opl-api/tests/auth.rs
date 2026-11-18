@@ -696,6 +696,7 @@ async fn a_user_keeps_at_most_32_sessions() {
                 user: admin.id,
                 epoch: admin.spec.session_epoch,
                 expires_at: now + 3600 + i,
+                pending: None,
             },
         );
         env.cluster.create(&session).await.unwrap();

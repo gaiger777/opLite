@@ -399,6 +399,7 @@ async fn two_nodes_with(
             session_epoch: 0,
             realm: None,
             subject: None,
+            external_groups: vec![],
         },
     );
     a.cluster.create(&admin).await.unwrap();
@@ -1335,6 +1336,7 @@ async fn running_vm_with_disk(a: &Node, admin: &common::Client) -> (opl_types::v
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     a.cluster.create(&pool).await.unwrap();
@@ -1941,6 +1943,7 @@ async fn dir_pool(a: &Node, pool: &str, shared: bool) {
             nodes: vec![],
             shared,
             backups: false,
+            folder: None,
         },
     );
     a.cluster.create(&pool).await.unwrap();

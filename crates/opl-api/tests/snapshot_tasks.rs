@@ -33,6 +33,7 @@ async fn pool_and_root(env: &Env) {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
@@ -970,6 +971,7 @@ async fn block_volumes(
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         };
         env.cluster
             .create(&Resource::new(*pool, spec))
@@ -1446,6 +1448,7 @@ async fn backup_fails_before_exporting_when_the_paused_vm_cannot_resume() {
         nodes: vec![],
         shared: false,
         backups: true,
+        folder: None,
     };
     env.cluster.create(&Resource::new("bk", bk)).await.unwrap();
     env.pool_ready("bk").await;

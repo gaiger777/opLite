@@ -46,6 +46,7 @@ fn shared_pool() -> StoragePool {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     )
 }
@@ -60,6 +61,7 @@ fn dir_pool(dir: &Path) -> StoragePool {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         },
     )
 }

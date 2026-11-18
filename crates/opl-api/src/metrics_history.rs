@@ -720,6 +720,7 @@ mod tests {
             nodes: vec![],
             shared,
             backups: false,
+            folder: None,
         }
     }
 

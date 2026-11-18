@@ -322,6 +322,7 @@ pub(crate) async fn upsert_external(
                         session_epoch: 0,
                         realm: Some(realm.into()),
                         subject: subject.map(str::to_string),
+                        external_groups: vec![],
                     },
                 );
                 state
@@ -432,6 +433,7 @@ pub async fn create_user(
             session_epoch: 0,
             realm: None,
             subject: None,
+            external_groups: vec![],
         },
     );
     user.revision = state.cluster.create(&user).await?;
@@ -595,6 +597,7 @@ pub async fn create_token(
         ApiTokenSpec {
             user: principal.user,
             secret_hash: String::new(),
+            scope: None,
         },
     );
     let (hash, secret) = new_token(token.id);

@@ -25,6 +25,10 @@ pub struct StoragePoolSpec {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub backups: bool,
+    /// 든 스토리지 폴더(계획 62, `Folder` id). 없으면 스토리지 트리의 루트이고 쓰지 않아 옛 노드도 풀을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub folder: Option<Uuid>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -560,6 +564,26 @@ pub enum VolumePhase {
 mod tests {
     use super::*;
 
+    /// 계획 62: 폴더가 없으면 옛 풀 JSON 그대로, 있으면 왕복한다.
+    #[test]
+    fn pool_folder_is_written_only_when_set() {
+        let old = r#"{"backend":{"kind":"dir","path":"/srv/a"},"nodes":[],"shared":false}"#;
+        let pool: StoragePoolSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(pool.folder, None);
+        assert_eq!(serde_json::to_string(&pool).unwrap(), old);
+        let folder = Uuid::from_u128(5);
+        let pool = StoragePoolSpec {
+            folder: Some(folder),
+            ..pool
+        };
+        let json = serde_json::to_value(&pool).unwrap();
+        assert_eq!(json["folder"], folder.to_string());
+        assert_eq!(
+            serde_json::from_value::<StoragePoolSpec>(json).unwrap(),
+            pool
+        );
+    }
+
     #[test]
     fn dir_pool_deserializes_with_defaults() {
         let spec: StoragePoolSpec = serde_json::from_value(serde_json::json!({
@@ -586,6 +610,7 @@ mod tests {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         }
     }
 
@@ -617,6 +642,7 @@ mod tests {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         };
         assert_eq!(dir("/srv/pool").validate(), Ok(()));
         assert_eq!(
@@ -700,6 +726,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         assert!(!is_shared(&pool));
@@ -736,6 +763,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         assert!(pool_usable_on(&dir, &node));
@@ -799,6 +827,7 @@ mod tests {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         }
     }
 
@@ -939,6 +968,7 @@ mod tests {
             nodes: vec![],
             shared: false,
             backups: false,
+            folder: None,
         }
     }
 
@@ -1041,6 +1071,7 @@ mod tests {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         }
     }
 
@@ -1194,6 +1225,7 @@ mod tests {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         }
     }
 

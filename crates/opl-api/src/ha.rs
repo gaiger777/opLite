@@ -2310,6 +2310,7 @@ mod tests {
                 tpm: false,
                 secure_boot: false,
                 guest_agent: None,
+                folder: None,
             },
         )
     }
@@ -2537,6 +2538,7 @@ mod tests {
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         let mut root: opl_types::storage::Volume = Resource::new(

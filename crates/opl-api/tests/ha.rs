@@ -396,6 +396,7 @@ async fn replicated_vm(env: &Env, name: &str, on: Uuid, targets: &[(Uuid, Option
                 nodes: vec![],
                 shared: false,
                 backups: false,
+                folder: None,
             },
         );
         env.cluster.create(&pool).await.unwrap();
@@ -2893,6 +2894,7 @@ async fn lan(env: &Env) {
             vlan: None,
             vxlan: None,
             mtu: None,
+            folder: None,
         },
     );
     env.cluster.create(&network).await.unwrap();
@@ -3030,6 +3032,7 @@ async fn nas(env: &Env, vms: &[&str]) {
             nodes: vec![],
             shared: true,
             backups: false,
+            folder: None,
         },
     );
     env.cluster.create(&pool).await.unwrap();
