@@ -186,6 +186,10 @@ export function DataTable<T>(props: Props<T>) {
     },
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
+    // 페이지 나누기를 쓰지 않으므로 행 모델이 바뀔 때의 페이지 되돌리기를 끈다. 켜 두면 react-table이 그릴 때마다
+    // 상태 바꾸기를 예약해, 경로 이동(startTransition)이 새 표를 그리다 처음부터 다시 시작하기를 끝없이
+    // 되풀이하고 화면이 바뀌지 않는다(브라우저에서 사이드바를 눌러도 주소만 바뀜).
+    autoResetAll: false,
   });
   const rows = table.getRowModel().rows.map((r) => r.original);
   const visible = allColumns.filter((c) => !hidden.includes(c.id));
