@@ -97,7 +97,7 @@
 - 리뷰 2(중대 0·중요 2·경미 8, 모두 고침, 리뷰 1 수정은 옳다고 확인): 기록 끈 노드로 밀기 물러서기(파일은 지킴), 15분 넘은 알림 버리기와 대상별 20건 상한, 대상 돌아가며 보내기, 풀린 경보의 발생 재시도 버리기, 열기 잠금 밖에서 파일 만들기, 디스크 오류 경고 묶기, 밀기 순서를 주인 노드별로 섞기, CLI의 부호 붙은 기간 거절, Prometheus 캐시 몰림 막기.
 - svc01 일반 시험: 첫 회는 시험 3280개 통과였으나 clippy가 svc01의 Rust 1.99에서만 나는 두 경고(`fetch_update` 사용 중단, `chunks_exact_to_as_chunks`)에 걸렸다. 옛·새 툴체인 모두에서 깨끗한 꼴로 고친 뒤 둘째 회에서 fmt·clippy·시험 3289개·starve·규모 100·저장소 시험 모두 통과.
 - GitHub 탐침: 세 번 모두 linux-kvm(KVM 마이그레이션의 기록 따라가기, promtool 2.45 검사 포함), install-media, ceph, ldap, package, iso-e2e(bios·uefi), catalog-links 통과.
-- 배포: (배포 후 채움)
+- **테스트 VM 배포(svc01·svc02):** svc02 → svc01 순서로 바이너리만 바꿨다(유닛은 같아 그대로). 두 노드 모두 sha256이 빌드와 같고, 헬스 `ok`, 두 voter 모두 online, 기능에 `metrics-history`·`notifications`가 있다. 첫 쓰기 뒤 `/var/lib/opl/metrics`에 `node.rrd`(376 KiB)와 svc02의 test-vm 파일(336 KiB, 0600)이 생겼다. `node stats svc02 --range hour`(svc01에서 다른 노드 기록 읽기), `vm stats test-vm --range hour`(p50·p95 포함), 클러스터 모으기(`node stats --range hour`, 2노드 합계)가 모두 답하고, 업그레이드 앞의 시점은 "no history before"로 알린다. `alert list`는 빈 목록, Prometheus는 기본 꺼짐(`/api/v1/metrics` 404). 웹 `/`·`/alerts`·`/settings/notifications`가 새 빌드(index-DPeApXwd.js)를 돌려준다. svc02의 test-vm은 QEMU PID 916 그대로 실행 중이고 저널에 경고·오류는 없다. CLI의 `--range`는 `hour|day|week|month|year`만 받는다(`1h`는 `--from 1h`).
 
 ## 다음 계획으로 넘길 사항
 
