@@ -98,6 +98,8 @@ pub(crate) struct Snapshot {
     pub leader_present: bool,
     /// 이 노드가 Raft 리더다.
     pub is_leader: bool,
+    /// 이 노드가 가진 `firing` 경보 수(info, warning, critical). 경보 장부가 없는 노드(위트니스)는 None이다.
+    pub alerts_firing: Option<[u64; 3]>,
 }
 
 /// VM 단계(레이블 `phase`). 없는 단계도 0으로 내보내 시리즈가 사라지지 않게 한다.
@@ -199,6 +201,7 @@ fn snapshot(state: &AppState) -> Result<Snapshot, ApiError> {
         phases,
         leader_present: health.quorum,
         is_leader: health.leader == Some(NodeId(state.node)),
+        alerts_firing: crate::alerts::firing_counts(state),
     })
 }
 
@@ -298,6 +301,16 @@ pub(crate) fn render(s: &Snapshot) -> String {
     );
     f.add(&node, Some(f64::from(u8::from(s.is_leader))));
     families.push(f);
+    if let Some(counts) = s.alerts_firing {
+        let mut f = Family::new(
+            "orbivisor_alerts_firing",
+            "Firing alerts this node holds (its node alerts, and the leader alerts on the leader), by severity.",
+        );
+        for (severity, n) in ["info", "warning", "critical"].iter().zip(counts) {
+            f.add(&[("severity", severity)], Some(n as f64));
+        }
+        families.push(f);
+    }
     if let Some(n) = &s.sample {
         let rows: [(&'static str, &'static str, Option<f64>); 9] = [
             (
@@ -485,6 +498,7 @@ mod tests {
             phases: [3, 0, 1, 0, 0, 0],
             leader_present: true,
             is_leader: false,
+            alerts_firing: Some([0, 2, 1]),
         };
         let expected = r#"# HELP orbivisor_cluster_leader_present Whether this node knows a cluster leader that has a quorum (1) or not (0).
 # TYPE orbivisor_cluster_leader_present gauge
@@ -505,6 +519,11 @@ orbivisor_cluster_vms{phase="migrating"} 0
 # HELP orbivisor_node_is_raft_leader Whether this node is the Raft leader (1) or not (0).
 # TYPE orbivisor_node_is_raft_leader gauge
 orbivisor_node_is_raft_leader{node="node1"} 0
+# HELP orbivisor_alerts_firing Firing alerts this node holds (its node alerts, and the leader alerts on the leader), by severity.
+# TYPE orbivisor_alerts_firing gauge
+orbivisor_alerts_firing{severity="info"} 0
+orbivisor_alerts_firing{severity="warning"} 2
+orbivisor_alerts_firing{severity="critical"} 1
 # HELP orbivisor_node_cpu_usage_ratio CPU usage of the node over all cores (0-1), last 5 s sample.
 # TYPE orbivisor_node_cpu_usage_ratio gauge
 orbivisor_node_cpu_usage_ratio{node="node1"} 0.25
@@ -569,6 +588,8 @@ orbivisor_vm_network_transmit_bytes_per_second{vm_id="00000000-0000-0000-0000-00
         assert!(text.contains("orbivisor_node_is_raft_leader{node=\"w\"} 0\n"));
         assert!(!text.contains("orbivisor_node_cpu"));
         assert!(!text.contains("orbivisor_vm_"));
+        // 경보 장부가 없는 노드(위트니스)는 경보 수를 내지 않는다.
+        assert!(!text.contains("orbivisor_alerts_firing"));
         assert!(!text.contains("orbivisor_pool_"));
     }
 }

@@ -11,6 +11,7 @@ use openraft::Raft;
 use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_cluster::{Cluster, FollowFrame, FollowGate};
 use opl_driver::{DriverError, Hypervisor, tpm_state_path, uefi_vars_path};
+use opl_types::alert::{AlertsQuery, AlertsReply, MAX_HISTORY_LIMIT};
 use opl_types::audit::AuditQuery;
 use opl_types::metrics::{HistoryQuery, HistoryReply, MetricsQuery};
 use opl_types::placement::PlacementStatus;
@@ -24,6 +25,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
+use crate::alerts::AlertsSource;
 use crate::audit::{AuditReply, AuditSource};
 use crate::ceph::{
     CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, NodeDisksRequest,
@@ -65,6 +67,8 @@ pub struct PeerService {
     migrations: Option<Arc<dyn MigrationReceiver>>,
     replicas: Option<Arc<dyn ReplicaReceiver>>,
     audit: Option<Arc<dyn AuditSource>>,
+    /// 이 노드의 경보와 보낸 기록(계획 60). 없으면 `unimplemented`로 거부한다(옛 노드·위트니스와 같다).
+    alerts: Option<Arc<dyn AlertsSource>>,
     metrics: Option<Arc<dyn MetricsSource>>,
     fence: Option<Arc<dyn FenceSource>>,
     placement: Option<Arc<dyn PlacementSource>>,
@@ -89,6 +93,7 @@ impl PeerService {
             migrations: None,
             replicas: None,
             audit: None,
+            alerts: None,
             metrics: None,
             fence: None,
             placement: None,
@@ -142,6 +147,12 @@ impl PeerService {
     /// 이 노드의 감사 로그를 `source`로 읽어 준다. 없으면 읽기 요청을 거부한다.
     pub fn with_audit(mut self, source: Arc<dyn AuditSource>) -> Self {
         self.audit = Some(source);
+        self
+    }
+
+    /// 이 노드의 경보와 보낸 기록(계획 60 `ReadAlerts`)을 `source`로 읽어 준다. 없으면 `unimplemented`로 거부한다.
+    pub fn with_alerts(mut self, source: Arc<dyn AlertsSource>) -> Self {
+        self.alerts = Some(source);
         self
     }
 
@@ -395,6 +406,26 @@ impl Peer for PeerService {
             .await?
             .map_err(Status::internal)?;
         Ok(Response::new(AuditReply { entries }))
+    }
+
+    async fn read_alerts(
+        &self,
+        req: Request<AlertsQuery>,
+    ) -> Result<Response<AlertsReply>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .alerts
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not evaluate alerts"))?;
+        let mut query = req.into_inner();
+        if let Some(w) = &mut query.history {
+            w.limit = w.limit.min(MAX_HISTORY_LIMIT);
+        }
+        let reply = self
+            .offload(async move { source.read(query).await })
+            .await?
+            .map_err(Status::internal)?;
+        Ok(Response::new(reply))
     }
 
     async fn read_metrics(

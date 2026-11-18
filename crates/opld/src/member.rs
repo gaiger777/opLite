@@ -12,12 +12,12 @@ use anyhow::Context;
 use axum::serve::ListenerExt;
 use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
-    ApiCertAgent, AppState, AuditLog, BackupJobScheduler, Balancer, CephAgent, CephPeerSource,
-    ClusterJanitor, FenceStatusSource, HaManager, HaManagerConfig, IncomingConfig,
-    IncomingMigrations, IncomingReplicas, PlacementBoard, PlacementStatusSource, PowerFence,
-    RemotePoller, ReplicaConfig, ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner,
-    TaskRunnerConfig, TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent,
-    VipManager, VipManagerConfig,
+    ALERTS_DIR, AlertBook, AlertEngine, ApiCertAgent, AppState, AuditLog, BackupJobScheduler,
+    Balancer, CephAgent, CephPeerSource, ClusterJanitor, FenceStatusSource, HaManager,
+    HaManagerConfig, IncomingConfig, IncomingMigrations, IncomingReplicas, PlacementBoard,
+    PlacementStatusSource, PowerFence, RemotePoller, ReplicaConfig, ReplicationScheduler,
+    RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter,
+    UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -228,6 +228,8 @@ struct Services {
     ceph: CephAgent,
     /// 리더가 텔레메트리 보고를 보낸다(설정에서 켰을 때).
     telemetry: TelemetryReporter,
+    /// 이 노드의 경보를 평가하고 알림을 보낸다(리더면 리더 경보도).
+    alerts: AlertEngine,
     /// 리더가 원격 클러스터의 상태를 모은다.
     remotes: RemotePoller,
     /// API가 멈춘 뒤 남은 감사 항목을 쓰고 닫는다.
@@ -266,6 +268,7 @@ impl Services {
         self.backups.shutdown().await;
         self.replication.shutdown().await;
         self.telemetry.shutdown().await;
+        self.alerts.shutdown().await;
         self.remotes.shutdown().await;
         self.recovery.shutdown().await;
         self.fence_watch.shutdown().await;
@@ -508,6 +511,26 @@ impl Member {
             }
             None => Arc::new(AuditLog::disabled()),
         };
+        // 경보 장부(계획 60): 경보 엔진이 적고, API와 다른 노드(노드 간 서버)가 읽는다.
+        let alert_book = {
+            let dir = config.data_dir.join(ALERTS_DIR);
+            let name = config.name.clone();
+            let opened = tokio::task::spawn_blocking(move || AlertBook::open(dir, name)).await;
+            match opened {
+                Ok(Ok(book)) => book,
+                Ok(Err(e)) => {
+                    let _ = cluster.shutdown().await;
+                    return Err(anyhow::Error::new(e).context(format!(
+                        "cannot open the alert state in {}",
+                        config.data_dir.join(ALERTS_DIR).display()
+                    )));
+                }
+                Err(e) => {
+                    let _ = cluster.shutdown().await;
+                    return Err(anyhow::anyhow!("opening the alert state failed: {e}"));
+                }
+            }
+        };
         // 측정기가 적고, API와 다른 노드(노드 간 서버)가 읽는다. 기록 파일(계획 60)의 지난 1시간을 측정기를 띄우기 전에
         // 저장소에 되살린다. 기록을 끄면 파일 없이 메모리 1시간만으로 기록 조회에 답한다.
         let metrics_store = Arc::new(MetricsStore::default());
@@ -569,6 +592,7 @@ impl Member {
             .with_firmware_copies(vars_templates)
             .with_guest_agent(guest.clone())
             .with_audit(audit.clone())
+            .with_alerts(Arc::new(alert_book.clone()))
             .with_metrics(metrics_source.clone())
             .with_fence(fence_source)
             .with_placement(placement_source)
@@ -611,6 +635,7 @@ impl Member {
             state.trusted_proxies = config.api.trusted_proxies.clone();
             state.audit = audit;
             state.metrics = Some(metrics_source);
+            state.alerts = Some(alert_book);
             state.guest = Some(guest.clone());
             state.fence = fence;
             state.placement = placement;
@@ -885,7 +910,7 @@ impl Member {
             "orbivisord is ready"
         );
         let (stop, rx) = oneshot::channel::<()>();
-        let (schedule, janitor, balancer, backups, replication, telemetry, remotes) =
+        let (schedule, janitor, balancer, backups, replication, telemetry, remotes, alerts) =
             on(&rt.work, || {
                 (
                     SnapshotScheduler::spawn(state.clone(), config.schedule.scheduler_config()),
@@ -898,6 +923,7 @@ impl Member {
                     ),
                     TelemetryReporter::spawn(state.clone(), telemetry_config),
                     RemotePoller::spawn(state.clone(), config.remotes.poller_config()),
+                    AlertEngine::spawn(state.clone(), config.alert_engine_config()),
                 )
             });
         let recovery = on(&rt.core, || {
@@ -956,6 +982,7 @@ impl Member {
                 backups,
                 replication,
                 telemetry,
+                alerts,
                 remotes,
                 audit,
                 recovery,

@@ -8,6 +8,7 @@ use axum::http::header::IF_MATCH;
 use axum::http::{HeaderMap, StatusCode};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError, Typed};
+use opl_types::alert::{AlertRuleSpec, AlertRuleStatus};
 use opl_types::backup_job::{BackupJobSpec, BackupJobStatus};
 use opl_types::ha_check::{HaCheckSpec, HaCheckStatus};
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, USER_NETWORK};
@@ -238,6 +239,15 @@ list_and_get!(
     "/ha-checks",
     "/ha-checks/{key}",
     "ha"
+);
+list_and_get!(
+    list_alert_rules,
+    get_alert_rule,
+    AlertRuleSpec,
+    AlertRuleStatus,
+    "/alert-rules",
+    "/alert-rules/{key}",
+    "alerts"
 );
 list_and_get!(
     list_placement_rules,

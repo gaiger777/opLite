@@ -64,7 +64,7 @@ pub struct RoleAuthorizer;
 
 impl Authorizer for RoleAuthorizer {
     fn check(&self, principal: &Principal, action: Action, kind: Kind) -> bool {
-        // 계정과 비밀을 담은 종류(전원 끄기 펜싱의 BMC 비밀번호)는 admin만 읽는다.
+        // 계정과 비밀을 담은 종류(전원 끄기 펜싱의 BMC 비밀번호, 알림 대상의 SMTP 비밀번호·webhook 토큰)는 admin만 읽는다.
         let account = matches!(
             kind,
             Kind::User
@@ -73,6 +73,7 @@ impl Authorizer for RoleAuthorizer {
                 | Kind::Realm
                 | Kind::Session
                 | Kind::NodeFence
+                | Kind::NotificationTarget
         );
         match principal.role {
             Role::Admin => true,

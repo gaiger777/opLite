@@ -29,6 +29,8 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 ldap3.workspace = true
+# 알림 메일(SMTP)
+lettre.workspace = true
 libc.workspace = true
 opl-cluster.workspace = true
 opl-driver.workspace = true

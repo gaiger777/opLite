@@ -50,6 +50,9 @@ pub struct AppState {
     pub audit: Arc<AuditLog>,
     /// 이 노드의 지표(opld의 측정기 저장소). 없으면 지표 API가 이 노드를 `unsupported`로 보인다.
     pub metrics: Option<Arc<dyn MetricsSource>>,
+    /// 이 노드의 경보 장부(계획 60, opld의 `{data_dir}/alerts`). 경보 엔진이 쓰고 API와 다른 노드(`ReadAlerts`)가 읽는다.
+    /// 없으면(위트니스) 경보 API가 이 노드를 `unsupported`로 보인다.
+    pub alerts: Option<crate::alerts::AlertBook>,
     /// 이 노드에서 도는 VM의 게스트 에이전트(opld의 게스트 정보 캐시, 계획 59). 없으면 게스트 정보 API가 이 노드의 VM을
     /// `unsupported`로 보인다.
     pub guest: Option<Arc<dyn GuestAgentSource>>,
@@ -107,6 +110,7 @@ impl AppState {
             import_credentials: Arc::default(),
             audit: Arc::new(AuditLog::disabled()),
             metrics: None,
+            alerts: None,
             guest: None,
             oidc: OidcCache::default(),
             receiving_files: Default::default(),

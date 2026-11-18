@@ -23,6 +23,7 @@ use opl_cluster::types::{LeaderRequest, NodeId, OrbNode, TypeConfig};
 use opl_cluster::{
     ClusterError, Failure, FollowClient, FollowFrame, Forwarder, LinkBook, LinkSelector, Pick,
 };
+use opl_types::alert::{AlertsQuery, AlertsReply};
 use opl_types::audit::{AuditEntry, AuditQuery};
 use opl_types::ceph::{CephReport, NodeDisk};
 use opl_types::fence::FenceMethodStatus;
@@ -732,6 +733,32 @@ impl Peers {
         match reply {
             Ok(reply) => Ok(Some(reply.into_inner().entries)),
             Err(s) if s.code() == Code::FailedPrecondition => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+}
+
+impl Peers {
+    /// 노드 `from`(첫 링크 `addr`)의 노드 경보와(`query.history`가 있으면) 보낸 기록을 읽는다(계획 60). 그 노드가 이
+    /// RPC를 모르면(옛 노드, 경보 소스가 없는 노드) None이다.
+    pub async fn read_alerts(
+        &self,
+        from: NodeId,
+        addr: &str,
+        query: AlertsQuery,
+        timeout: Duration,
+    ) -> Result<Option<AlertsReply>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(query.clone());
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(from));
+                async move { within(timeout, client.read_alerts(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner())),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }
     }

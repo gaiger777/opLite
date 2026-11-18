@@ -12,7 +12,11 @@ allow = [
 ]
 confidence-threshold = 0.9
 # rust-embed의 폴더 경로 치환(빌드할 때만 쓰는 proc-macro)이 끌어온다. 바이너리에는 들어가지 않는다.
-exceptions = [{ allow = ["MPL-2.0"], crate = "option-ext" }]
+# quoted_printable(0BSD, MIT보다 느슨한 공개 라이선스)은 알림 메일 본문 인코딩에 lettre가 끌어온다(계획 60).
+exceptions = [
+    { allow = ["MPL-2.0"], crate = "option-ext" },
+    { allow = ["0BSD"], crate = "quoted_printable" },
+]
 
 [bans]
 multiple-versions = "warn"

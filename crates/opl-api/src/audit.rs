@@ -356,7 +356,7 @@ async fn read_node(
 }
 
 /// 유닉스 밀리초나 RFC 3339 시각
-fn parse_time(field: &str, value: &str) -> Result<u64, ApiError> {
+pub(crate) fn parse_time(field: &str, value: &str) -> Result<u64, ApiError> {
     if let Ok(ms) = value.parse::<u64>() {
         return Ok(ms);
     }

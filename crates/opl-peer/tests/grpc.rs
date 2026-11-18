@@ -1523,6 +1523,120 @@ async fn audit_logs_are_read_from_a_member() {
     assert_eq!(audit.queries.lock().unwrap().len(), 2);
 }
 
+/// 받은 조건을 적고 경보 하나와 기록 하나를 돌려주는 경보 장부
+#[derive(Default)]
+struct FakeAlerts {
+    queries: std::sync::Mutex<Vec<opl_types::alert::AlertsQuery>>,
+}
+
+#[async_trait::async_trait]
+impl opl_peer::AlertsSource for FakeAlerts {
+    async fn read(
+        &self,
+        query: opl_types::alert::AlertsQuery,
+    ) -> Result<opl_types::alert::AlertsReply, String> {
+        use opl_types::alert::*;
+        self.queries.lock().unwrap().push(query.clone());
+        let rule = Uuid::nil();
+        Ok(AlertsReply {
+            active: vec![ActiveAlert {
+                rule,
+                subject: AlertSubject {
+                    kind: SubjectKind::Node,
+                    id: rule,
+                    name: "n2".into(),
+                    node: Some("n2".into()),
+                },
+                state: AlertState::Firing,
+                since: 1_000,
+                value: Some(97.5),
+                last_sent: Some(1_000),
+                clear_since: None,
+            }],
+            history: query
+                .history
+                .map(|_| {
+                    vec![NotificationRecord {
+                        at: 1_000,
+                        node: "n2".into(),
+                        rule: Some("cpu-hot".into()),
+                        subject: Some("n2".into()),
+                        state: NotificationState::Firing,
+                        target: "ops".into(),
+                        ok: true,
+                        error: None,
+                    }]
+                })
+                .unwrap_or_default(),
+            overflow: false,
+        })
+    }
+}
+
+#[tokio::test]
+async fn alerts_are_read_from_a_member() {
+    use opl_types::alert::{AlertsQuery, HistoryWindow, MAX_HISTORY_LIMIT};
+    let (ca, root, nodes) = start(1).await;
+    let alerts = Arc::new(FakeAlerts::default());
+    let source: Arc<dyn opl_peer::AlertsSource> = alerts.clone();
+    let target = Node::start_serving(&ca, &root, |s| s.with_alerts(source)).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(nodes[0].id()) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let peers = &nodes[0].peers;
+    let reply = peers
+        .read_alerts(target.id(), &target.addr, AlertsQuery::default(), WAIT)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.active.len(), 1);
+    assert!(reply.history.is_empty());
+    // 너무 큰 limit은 받는 쪽이 줄인다.
+    let window = |limit| HistoryWindow {
+        since: 0,
+        until: 10_000,
+        limit,
+    };
+    let reply = peers
+        .read_alerts(
+            target.id(),
+            &target.addr,
+            AlertsQuery {
+                history: Some(window(1_000_000)),
+            },
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.history.len(), 1);
+    assert_eq!(
+        alerts.queries.lock().unwrap()[1].history,
+        Some(window(MAX_HISTORY_LIMIT))
+    );
+    // 경보 장부가 없는 노드(옛 노드)는 None이다.
+    let reply = target
+        .peers
+        .read_alerts(nodes[0].id(), &nodes[0].addr, AlertsQuery::default(), WAIT)
+        .await
+        .unwrap();
+    assert!(reply.is_none());
+}
+
 #[tokio::test]
 async fn metrics_are_read_from_a_member() {
     let (ca, root, nodes) = start(1).await;

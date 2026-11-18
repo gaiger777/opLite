@@ -3,6 +3,7 @@
 //! API는 원하는 상태(spec)를 Raft에 기록하고 Task를 만들기만 한다. VM을 실제로 움직이는 것은
 //! 각 노드의 reconciler이고, Task의 진행은 대상 노드의 [`TaskRunner`]가 기록한다.
 
+pub mod alerts;
 mod api_cert;
 pub mod audit;
 pub mod auth;
@@ -79,6 +80,7 @@ use utoipa::{Modify, OpenApi};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
+pub use alerts::{ALERTS_DIR, AlertBook, AlertEngine, AlertEngineConfig, SenderConfig};
 pub use api_cert::{ApiCertAgent, ApiCertError};
 pub use audit::{AuditConfig, AuditLog};
 pub use auth::{Action, Authorizer, Principal, RoleAuthorizer, hash_password};
@@ -188,6 +190,24 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(metrics_history::get_node_history))
         .routes(routes!(metrics_history::get_cluster_history))
         .routes(routes!(prometheus::get_prometheus))
+        .routes(routes!(r::list_alert_rules, alerts::create_alert_rule))
+        .routes(routes!(
+            r::get_alert_rule,
+            alerts::update_alert_rule,
+            alerts::delete_alert_rule
+        ))
+        .routes(routes!(alerts::list_alerts))
+        .routes(routes!(alerts::list_alert_history))
+        .routes(routes!(
+            alerts::list_notification_targets,
+            alerts::create_notification_target
+        ))
+        .routes(routes!(
+            alerts::get_notification_target,
+            alerts::update_notification_target,
+            alerts::delete_notification_target
+        ))
+        .routes(routes!(alerts::test_notification_target))
         .routes(routes!(cluster::get_cluster))
         .routes(routes!(cluster::get_ca))
         .routes(routes!(cluster::get_version))

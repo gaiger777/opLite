@@ -111,6 +111,12 @@ fn main() {
                 .build(),
         )
         .method(json(
+            "read_alerts",
+            "ReadAlerts",
+            "opl_types::alert::AlertsQuery",
+            "opl_types::alert::AlertsReply",
+        ))
+        .method(json(
             "fence_status",
             "FenceStatus",
             "crate::fence::FenceStatusRequest",

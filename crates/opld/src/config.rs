@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use opl_api::{
-    AuditConfig, BackupJobSchedulerConfig, BalancerConfig, ClusterJanitorConfig, Fencer,
-    RemotePollerConfig, ReplicationSchedulerConfig, SnapshotSchedulerConfig, TelemetryConfig,
-    UpdatesConfig, VipAgentConfig,
+    AlertEngineConfig, AuditConfig, BackupJobSchedulerConfig, BalancerConfig, ClusterJanitorConfig,
+    Fencer, RemotePollerConfig, ReplicationSchedulerConfig, SnapshotSchedulerConfig,
+    TelemetryConfig, UpdatesConfig, VipAgentConfig,
 };
 use opl_driver::ceph::{
     CLIENT_PACKAGES, CephHost, CephOptions, CephPaths, DAEMON_PACKAGES, SystemRunner,
@@ -592,6 +592,15 @@ impl Config {
         c
     }
 
+    /// 경보 엔진 설정(5초 간격, 60초 해제 대기). 시험 빌드(`metrics-it`·`qemu-it`)는 `[test] alert_tick_ms`로 줄인다.
+    pub fn alert_engine_config(&self) -> AlertEngineConfig {
+        #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+        if let Some(ms) = self.test.alert_tick_ms {
+            return AlertEngineConfig::default().with_tick(Duration::from_millis(ms.max(1)));
+        }
+        AlertEngineConfig::default()
+    }
+
     /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
     pub fn checker_net(&self) -> NetFs {
         #[cfg(feature = "ha-it")]
@@ -1109,6 +1118,11 @@ pub struct TestSection {
     #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
     #[serde(default)]
     pub metrics_push_secs: Option<u64>,
+    /// 경보 엔진의 평가 간격(밀리초, 1 이상, 기본 5000, 계획 60). 해제 대기(기본 60초)도 같은 비율(12번)로 줄인다. 경보
+    /// 발생·해제 시험이 빨리 본다.
+    #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+    #[serde(default)]
+    pub alert_tick_ms: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]

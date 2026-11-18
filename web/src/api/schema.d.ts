@@ -1,6 +1,86 @@
 // 생성된 파일이다. 고치지 말고 `pnpm gen:api`로 다시 만든다.
 
 export interface paths {
+    "/alert-rules": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_alert_rules"];
+        put?: never;
+        /**
+         * 경보 규칙을 만든다. 지표 임계값(`node_metric`·`vm_metric`, `for_secs` 동안 참이면 알림)·상태(`pool_usage`·
+         *     `node_offline`·`vm_failed`)·이벤트(`task_failed`·`ha_recovery`·`backup_job_failed`) 조건과 알림 대상 이름(1~16개)을
+         *     받는다. admin만 쓰고 모든 노드가 `notifications`를 알아야 한다.
+         */
+        post: operations["create_alert_rule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/alert-rules/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_alert_rule"];
+        /** 규칙을 통째로 바꾼다. 활성 경보는 새 설정으로 다시 판단한다(조건이 거짓이 되면 해제, 대상이 빠지면 알림 없이 뺀다). */
+        put: operations["update_alert_rule"];
+        post?: never;
+        /** 규칙을 지운다. 그 규칙의 활성 경보는 알림 없이 사라진다. */
+        delete: operations["delete_alert_rule"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/alerts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 활성 경보(`pending` 포함): 리더 경보(Raft)와 모든 노드의 노드 경보를 합친다. `firing` 먼저, 심각도 높은 것 먼저,
+         *     오래된 것 먼저다. 답하지 않은 노드는 `unreachable`(그 노드의 노드 경보는 보이지 않고 `node_offline` 경보가 대신
+         *     보인다), 경보를 모르는 옛 노드는 `unsupported`다. 지운 규칙의 경보는 뺀다.
+         */
+        get: operations["list_alerts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/alerts/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 모든 노드가 보낸 알림 기록을 새 것부터 읽는다(보낸 노드의 `alerts/history.log`). `limit`보다 많으면 잘라
+         *     `truncated`다.
+         */
+        get: operations["list_alert_history"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/audit": {
         parameters: {
             query?: never;
@@ -1099,6 +1179,64 @@ export interface paths {
          *     남았으면 409 `cluster_upgrading`.
          */
         post: operations["upgrade_node"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notification-targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_notification_targets"];
+        put?: never;
+        /** 알림 대상을 만든다(SMTP 또는 webhook `json`·`slack`·`teams`·`ntfy`·`gotify`). admin만 쓴다. 비밀은 응답에 넣지 않는다. */
+        post: operations["create_notification_target"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notification-targets/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_notification_target"];
+        /**
+         * 대상을 통째로 바꾼다(비밀 규칙은 [`NotificationTargetRequest`]). `If-Match`가 없으면 읽은 revision에 쓰고, 그 사이
+         *     바뀌었으면 다시 읽어 바꾼다.
+         */
+        put: operations["update_notification_target"];
+        post?: never;
+        /** 대상을 지운다. 규칙이 쓰고 있으면 409 `in_use`(규칙에서 먼저 뺀다). */
+        delete: operations["delete_notification_target"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/notification-targets/{key}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 대상으로 시험 알림을 이 노드에서 바로 한 번 보낸다(다시 하지 않음, 10초 제한, 꺼진 대상도 보냄). 결과는 이 노드의
+         *     보낸 기록에 `test`로 남는다.
+         */
+        post: operations["test_notification_target"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2423,11 +2561,177 @@ export interface components {
     schemas: {
         /** @enum {string} */
         Action: "accept" | "drop";
+        /** @description 활성 경보 하나 */
+        ActiveAlert: {
+            /**
+             * Format: int64
+             * @description `firing`인데 조건이 거짓이 된 때(이만큼 [`RESOLVE_AFTER_MS`] 지나면 해제)
+             */
+            clear_since?: number;
+            /**
+             * Format: int64
+             * @description 마지막으로 알린 때
+             */
+            last_sent?: number;
+            /** Format: uuid */
+            rule: string;
+            /**
+             * Format: int64
+             * @description 조건이 참이 된 때
+             */
+            since: number;
+            state: components["schemas"]["AlertState"];
+            subject: components["schemas"]["AlertSubject"];
+            /**
+             * Format: double
+             * @description 마지막으로 본 값(지표·풀 조건)
+             */
+            value?: number;
+        };
         /**
          * @description 게스트 에이전트가 있는 VM을 끄는 방법
          * @enum {string}
          */
         AgentShutdown: "agent" | "acpi";
+        /** @description 경보 조건 */
+        AlertCondition: {
+            /** @enum {string} */
+            kind: "node_metric";
+            metric: components["schemas"]["NodeAlertMetric"];
+            op: components["schemas"]["AlertOp"];
+            /** Format: double */
+            value: number;
+        } | {
+            /** @enum {string} */
+            kind: "vm_metric";
+            metric: components["schemas"]["VmAlertMetric"];
+            op: components["schemas"]["AlertOp"];
+            /** Format: double */
+            value: number;
+        } | {
+            /** @enum {string} */
+            kind: "pool_usage";
+            /** Format: double */
+            percent: number;
+        } | {
+            /** @enum {string} */
+            kind: "node_offline";
+        } | {
+            /** @enum {string} */
+            kind: "vm_failed";
+        } | {
+            /** @enum {string} */
+            kind: "task_failed";
+            ops?: string[];
+        } | {
+            /** @enum {string} */
+            kind: "ha_recovery";
+        } | {
+            /** @enum {string} */
+            kind: "backup_job_failed";
+        };
+        /**
+         * @description 비교
+         * @enum {string}
+         */
+        AlertOp: "gt" | "lt";
+        /** @description 경보 규칙 하나 */
+        AlertRuleSpec: {
+            condition: components["schemas"]["AlertCondition"];
+            /**
+             * @description 끄면 평가하지 않고, 활성 경보는 알림 없이 해제한다.
+             * @default true
+             */
+            enabled: boolean;
+            /**
+             * Format: int32
+             * @description 조건이 이만큼(초) 참이어야 알린다(0~86400). 이벤트 조건은 0이다.
+             * @default 0
+             */
+            for_secs: number;
+            /** @description 이 노드(이름)들만. 비면 모든 노드 */
+            nodes?: string[];
+            /**
+             * Format: int32
+             * @description 경보가 이어지는 동안 이만큼(초)마다 다시 알린다. 0이면 다시 보내지 않는다.
+             * @default 14400
+             */
+            repeat_secs: number;
+            /**
+             * @description 해제도 알린다(이벤트 조건은 해제가 없다).
+             * @default true
+             */
+            send_resolved: boolean;
+            severity: components["schemas"]["Severity"];
+            /** @description 알릴 `NotificationTarget` 이름(1~16개) */
+            targets: string[];
+            /** @description 이 VM(이름)들만(VM 조건만). 비면 모든 VM */
+            vms?: string[];
+        };
+        /** @description 리더가 평가하는 규칙(`NodeOffline`·`BackupJobFailed`)의 활성 경보만 둔다. 노드 경보는 각 노드 파일에 있다. */
+        AlertRuleStatus: {
+            active?: components["schemas"]["ActiveAlert"][];
+            /**
+             * @description `BackupJobFailed`: 백업 작업(id)마다 이미 알린 마지막 실패 실행의 끝난 시각(ms). 리더가 바뀌어도 같은 실행을 다시
+             *     알리지 않는다.
+             */
+            notified?: {
+                [key: string]: number;
+            };
+        };
+        /**
+         * @description 경보의 단계
+         * @enum {string}
+         */
+        AlertState: "pending" | "firing";
+        /** @description 경보가 가리키는 것 */
+        AlertSubject: {
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["SubjectKind"];
+            /** @description 알릴 때의 이름 */
+            name: string;
+            /** @description 그 일이 일어난 노드 이름(노드·풀 경보는 평가한 노드) */
+            node?: string;
+        };
+        /** @description `GET /alerts`의 경보 하나(규칙 이름·심각도를 붙인 [`ActiveAlert`]) */
+        AlertView: {
+            /**
+             * Format: int64
+             * @description 해제를 기다리기 시작한 때(조건이 거짓이 됨)
+             */
+            clear_since?: number;
+            /** @description 조건 종류(`node_metric`, `node_offline` …) */
+            condition: string;
+            /** Format: int64 */
+            last_sent?: number;
+            /** Format: uuid */
+            rule: string;
+            rule_name: string;
+            severity: components["schemas"]["Severity"];
+            /** Format: int64 */
+            since: number;
+            state: components["schemas"]["AlertState"];
+            subject: components["schemas"]["AlertSubject"];
+            /**
+             * Format: double
+             * @description 문턱(지표·풀 조건)
+             */
+            threshold?: number;
+            /** Format: double */
+            value?: number;
+        };
+        /** @description `GET /alerts`의 응답 */
+        AlertsResponse: {
+            /** @description `firing` 먼저, 심각도 높은 것 먼저, 오래된 것 먼저 */
+            alerts: components["schemas"]["AlertView"][];
+            /** @description 활성 경보가 상한을 넘은 노드 이름 */
+            overflowing?: string[];
+            /** @description 답하지 않은 노드 이름(그 노드의 노드 경보는 보이지 않는다) */
+            unreachable: string[];
+            /** @description 경보를 모르는 옛 노드 이름 */
+            unsupported: string[];
+        };
         /** @description 앞단(로드 밸런서)이 부를 API 노드 하나 */
         ApiEndpoint: {
             /** @description API 주소(`host:port`) */
@@ -3278,6 +3582,45 @@ export interface components {
             name?: string | null;
             /** @description 백업 풀(`backups`를 켠 풀) */
             pool: string;
+        };
+        CreateRequest_AlertRuleSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description 경보 규칙 하나 */
+            spec: {
+                condition: components["schemas"]["AlertCondition"];
+                /**
+                 * @description 끄면 평가하지 않고, 활성 경보는 알림 없이 해제한다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 조건이 이만큼(초) 참이어야 알린다(0~86400). 이벤트 조건은 0이다.
+                 * @default 0
+                 */
+                for_secs: number;
+                /** @description 이 노드(이름)들만. 비면 모든 노드 */
+                nodes?: string[];
+                /**
+                 * Format: int32
+                 * @description 경보가 이어지는 동안 이만큼(초)마다 다시 알린다. 0이면 다시 보내지 않는다.
+                 * @default 14400
+                 */
+                repeat_secs: number;
+                /**
+                 * @description 해제도 알린다(이벤트 조건은 해제가 없다).
+                 * @default true
+                 */
+                send_resolved: boolean;
+                severity: components["schemas"]["Severity"];
+                /** @description 알릴 `NotificationTarget` 이름(1~16개) */
+                targets: string[];
+                /** @description 이 VM(이름)들만(VM 조건만). 비면 모든 VM */
+                vms?: string[];
+            };
         };
         CreateRequest_BackupJobSpec: {
             labels?: {
@@ -4378,6 +4721,20 @@ export interface components {
             revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_NotificationTargetView: {
+            items: {
+                enabled: boolean;
+                /** Format: uuid */
+                id: string;
+                name: string;
+                /** Format: int64 */
+                revision: number;
+                target: components["schemas"]["TargetConfigView"];
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_RealmView: {
             items: {
                 backend: components["schemas"]["RealmBackendView"];
@@ -4408,6 +4765,68 @@ export interface components {
                  */
                 token_id: string | null;
                 url: string;
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_AlertRuleSpec_AlertRuleStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 경보 규칙 하나 */
+                spec: {
+                    condition: components["schemas"]["AlertCondition"];
+                    /**
+                     * @description 끄면 평가하지 않고, 활성 경보는 알림 없이 해제한다.
+                     * @default true
+                     */
+                    enabled: boolean;
+                    /**
+                     * Format: int32
+                     * @description 조건이 이만큼(초) 참이어야 알린다(0~86400). 이벤트 조건은 0이다.
+                     * @default 0
+                     */
+                    for_secs: number;
+                    /** @description 이 노드(이름)들만. 비면 모든 노드 */
+                    nodes?: string[];
+                    /**
+                     * Format: int32
+                     * @description 경보가 이어지는 동안 이만큼(초)마다 다시 알린다. 0이면 다시 보내지 않는다.
+                     * @default 14400
+                     */
+                    repeat_secs: number;
+                    /**
+                     * @description 해제도 알린다(이벤트 조건은 해제가 없다).
+                     * @default true
+                     */
+                    send_resolved: boolean;
+                    severity: components["schemas"]["Severity"];
+                    /** @description 알릴 `NotificationTarget` 이름(1~16개) */
+                    targets: string[];
+                    /** @description 이 VM(이름)들만(VM 조건만). 비면 모든 VM */
+                    vms?: string[];
+                };
+                /** @description 리더가 평가하는 규칙(`NodeOffline`·`BackupJobFailed`)의 활성 경보만 둔다. 노드 경보는 각 노드 파일에 있다. */
+                status: {
+                    active?: components["schemas"]["ActiveAlert"][];
+                    /**
+                     * @description `BackupJobFailed`: 백업 작업(id)마다 이미 알린 마지막 실패 실행의 끝난 시각(ms). 리더가 바뀌어도 같은 실행을 다시
+                     *     알리지 않는다.
+                     */
+                    notified?: {
+                        [key: string]: number;
+                    };
+                };
             }[];
             /** Format: int64 */
             revision: number;
@@ -5407,6 +5826,11 @@ export interface components {
             /** @description 이 NIC에 거는 보안 그룹 이름(8개 이하, 겹치지 않게). 비어 있지 않으면 방화벽이 켜진다. */
             security_groups?: string[];
         };
+        /**
+         * @description 노드 지표 규칙의 값
+         * @enum {string}
+         */
+        NodeAlertMetric: "cpu" | "mem_percent" | "fs_percent" | "disk_read" | "disk_write" | "net_rx" | "net_tx";
         NodeCounts: {
             /** Format: int64 */
             total: number;
@@ -5715,6 +6139,74 @@ export interface components {
              */
             packages: components["schemas"]["PackageUpdate"][];
             truncated?: boolean;
+        };
+        /** @description `GET /alerts/history`의 응답 */
+        NotificationHistoryResponse: {
+            /** @description 새 것부터 */
+            records: components["schemas"]["NotificationRecord"][];
+            /** @description `limit`보다 많아 잘랐다. */
+            truncated: boolean;
+            unreachable: string[];
+            unsupported: string[];
+        };
+        /** @description 보낸 알림 하나(보낸 노드의 `alerts/history.log` 한 줄) */
+        NotificationRecord: {
+            /**
+             * Format: int64
+             * @description 보낸(또는 마지막으로 해 본) 때
+             */
+            at: number;
+            /** @description 실패 이유. 보낸 쪽이 비밀을 지운 문구다(대기열이 넘쳐 버렸으면 `dropped`로 시작). */
+            error?: string;
+            /** @description 보낸 노드 이름 */
+            node: string;
+            ok: boolean;
+            /** @description 규칙 이름(시험 보내기는 없음) */
+            rule?: string;
+            state: components["schemas"]["NotificationState"];
+            /** @description 대상 이름(예: VM 이름, 시험 보내기는 없음) */
+            subject?: string;
+            /** @description 알림 대상 이름 */
+            target: string;
+        };
+        /**
+         * @description 알림의 종류
+         * @enum {string}
+         */
+        NotificationState: "firing" | "resolved" | "event" | "test";
+        /**
+         * @description 알림 대상 만들기·바꾸기 본문. 바꾸기는 통째로 바꾸되 비밀은 다음처럼 지킨다(영역의 `bind_password`와 같은 규칙):
+         *     - SMTP `password`를 빼면 `host`·`port`·`user`가 모두 그대로일 때만 저장된 값을 두고(하나라도 바뀌면 400), 빈 글이면
+         *       지운다.
+         *     - webhook `url`에 응답의 줄인 URL(`scheme://host[:port]/…`)을 그대로 주면 저장된 URL을 둔다.
+         *     - webhook `token`을 빼면 URL의 출처(scheme·host·port)와 `ca_pem`이 그대로일 때만 저장된 값을 두고, 빈 글이면 지운다.
+         *     - webhook `headers`의 값이 빈 글이면 그 이름의 저장된 값을 둔다(출처·`ca_pem`이 그대로일 때만). 뺀 이름은 지운다.
+         */
+        NotificationTargetRequest: {
+            /**
+             * @description 끄면 보내지 않는다(시험 보내기는 된다).
+             * @default true
+             */
+            enabled: boolean;
+            /** @description 만들 때 필요하다. 바꿀 때 주면 지금 이름과 같아야 한다. */
+            name?: string;
+            target: components["schemas"]["TargetConfig"];
+        };
+        /** @description 응답의 알림 대상. 비밀(비밀번호·토큰·헤더 값·URL의 경로와 질의) 대신 있는지만 보인다. */
+        NotificationTargetView: {
+            enabled: boolean;
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** Format: int64 */
+            revision: number;
+            target: components["schemas"]["TargetConfigView"];
+        };
+        /** @description 시험 보내기의 결과 */
+        NotificationTestResult: {
+            /** @description 실패 이유(비밀을 지운 문구) */
+            error?: string;
+            ok: boolean;
         };
         /** @description OpenID Connect 제공자(IdP). 브라우저가 IdP에서 로그인하고(인증 코드 흐름과 PKCE) 돌아온다. */
         OidcRealm: {
@@ -6463,6 +6955,64 @@ export interface components {
              * @description 새 크기(바이트). 지금보다 크고 512의 배수여야 한다.
              */
             size_bytes: number;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_AlertRuleSpec_AlertRuleStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 경보 규칙 하나 */
+            spec: {
+                condition: components["schemas"]["AlertCondition"];
+                /**
+                 * @description 끄면 평가하지 않고, 활성 경보는 알림 없이 해제한다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 조건이 이만큼(초) 참이어야 알린다(0~86400). 이벤트 조건은 0이다.
+                 * @default 0
+                 */
+                for_secs: number;
+                /** @description 이 노드(이름)들만. 비면 모든 노드 */
+                nodes?: string[];
+                /**
+                 * Format: int32
+                 * @description 경보가 이어지는 동안 이만큼(초)마다 다시 알린다. 0이면 다시 보내지 않는다.
+                 * @default 14400
+                 */
+                repeat_secs: number;
+                /**
+                 * @description 해제도 알린다(이벤트 조건은 해제가 없다).
+                 * @default true
+                 */
+                send_resolved: boolean;
+                severity: components["schemas"]["Severity"];
+                /** @description 알릴 `NotificationTarget` 이름(1~16개) */
+                targets: string[];
+                /** @description 이 VM(이름)들만(VM 조건만). 비면 모든 VM */
+                vms?: string[];
+            };
+            /** @description 리더가 평가하는 규칙(`NodeOffline`·`BackupJobFailed`)의 활성 경보만 둔다. 노드 경보는 각 노드 파일에 있다. */
+            status: {
+                active?: components["schemas"]["ActiveAlert"][];
+                /**
+                 * @description `BackupJobFailed`: 백업 작업(id)마다 이미 알린 마지막 실패 실행의 끝난 시각(ms). 리더가 바뀌어도 같은 실행을 다시
+                 *     알리지 않는다.
+                 */
+                notified?: {
+                    [key: string]: number;
+                };
+            };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_BackupJobSpec_BackupJobStatus: {
@@ -7521,6 +8071,11 @@ export interface components {
             telemetry?: components["schemas"]["TelemetryStatus"];
         };
         /**
+         * @description 심각도(낮은 것부터)
+         * @enum {string}
+         */
+        Severity: "info" | "warning" | "critical";
+        /**
          * @description 호스트 종료 때 노드가 한 일
          * @enum {string}
          */
@@ -7530,6 +8085,37 @@ export interface components {
          * @enum {string}
          */
         ShutdownPolicy: "conditional" | "freeze" | "failover" | "migrate";
+        /** @description 메일(일반 텍스트 본문) */
+        SmtpTarget: {
+            /** @description 보내는 주소 */
+            from: string;
+            host: string;
+            /** @description AUTH 비밀번호. API는 내보내지 않는다. */
+            password?: string;
+            /** Format: int32 */
+            port: number;
+            tls?: components["schemas"]["SmtpTls"];
+            /** @description 받는 주소(1~20개) */
+            to: string[];
+            /** @description AUTH 사용자. 없으면 인증하지 않는다. */
+            user?: string;
+        };
+        /** @description [`SmtpTarget`]에서 `password`를 뺀 것 */
+        SmtpTargetView: {
+            from: string;
+            has_password: boolean;
+            host: string;
+            /** Format: int32 */
+            port: number;
+            tls: components["schemas"]["SmtpTls"];
+            to: string[];
+            user?: string;
+        };
+        /**
+         * @description SMTP 연결 보안
+         * @enum {string}
+         */
+        SmtpTls: "starttls" | "tls" | "none";
         /** @enum {string} */
         SnapshotPhase: "pending" | "ready";
         /** @description 예약 스냅샷: 주기마다 스냅샷을 만들고, 예약으로 만든 것을 `keep`개만 남긴다. */
@@ -7668,6 +8254,11 @@ export interface components {
              */
             total_bytes: number | null;
         };
+        /**
+         * @description 경보 대상의 종류
+         * @enum {string}
+         */
+        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job";
         /** @description 읽을 때 계산한 구독 상태. 키 문자열은 담지 않는다. */
         SubscriptionInfo: {
             customer?: string;
@@ -7702,6 +8293,21 @@ export interface components {
          * @enum {string}
          */
         SubscriptionState: "none" | "active" | "expired" | "invalid" | "over_limit";
+        /** @description 보내는 방법 */
+        TargetConfig: (components["schemas"]["SmtpTarget"] & {
+            /** @enum {string} */
+            kind: "smtp";
+        }) | (components["schemas"]["WebhookTarget"] & {
+            /** @enum {string} */
+            kind: "webhook";
+        });
+        TargetConfigView: (components["schemas"]["SmtpTargetView"] & {
+            /** @enum {string} */
+            kind: "smtp";
+        }) | (components["schemas"]["WebhookTargetView"] & {
+            /** @enum {string} */
+            kind: "webhook";
+        });
         TaskOp: {
             /** @enum {string} */
             kind: "vm-start";
@@ -8069,6 +8675,44 @@ export interface components {
             /** Format: uuid */
             vm: string;
         };
+        UpdateRequest_AlertRuleSpec: {
+            labels?: {
+                [key: string]: string;
+            };
+            /** @description 경보 규칙 하나 */
+            spec: {
+                condition: components["schemas"]["AlertCondition"];
+                /**
+                 * @description 끄면 평가하지 않고, 활성 경보는 알림 없이 해제한다.
+                 * @default true
+                 */
+                enabled: boolean;
+                /**
+                 * Format: int32
+                 * @description 조건이 이만큼(초) 참이어야 알린다(0~86400). 이벤트 조건은 0이다.
+                 * @default 0
+                 */
+                for_secs: number;
+                /** @description 이 노드(이름)들만. 비면 모든 노드 */
+                nodes?: string[];
+                /**
+                 * Format: int32
+                 * @description 경보가 이어지는 동안 이만큼(초)마다 다시 알린다. 0이면 다시 보내지 않는다.
+                 * @default 14400
+                 */
+                repeat_secs: number;
+                /**
+                 * @description 해제도 알린다(이벤트 조건은 해제가 없다).
+                 * @default true
+                 */
+                send_resolved: boolean;
+                severity: components["schemas"]["Severity"];
+                /** @description 알릴 `NotificationTarget` 이름(1~16개) */
+                targets: string[];
+                /** @description 이 VM(이름)들만(VM 조건만). 비면 모든 VM */
+                vms?: string[];
+            };
+        };
         UpdateRequest_HaCheckSpec: {
             labels?: {
                 [key: string]: string;
@@ -8281,6 +8925,11 @@ export interface components {
             /** @description 이 노드의 orbivisord 빌드 버전 */
             version: string;
         };
+        /**
+         * @description VM 지표 규칙의 값
+         * @enum {string}
+         */
+        VmAlertMetric: "cpu" | "mem_rss" | "disk_read" | "disk_write" | "disk_read_iops" | "disk_write_iops" | "net_rx" | "net_tx";
         VmCounts: {
             /**
              * Format: int64
@@ -8656,6 +9305,35 @@ export interface components {
              */
             vni: number;
         };
+        /**
+         * @description webhook 본문 형식
+         * @enum {string}
+         */
+        WebhookFormat: "json" | "slack" | "teams" | "ntfy" | "gotify";
+        /** @description HTTP(S) POST */
+        WebhookTarget: {
+            /** @description 있으면 이 CA(PEM)만 믿는다. */
+            ca_pem?: string;
+            format?: components["schemas"]["WebhookFormat"];
+            /** @description 더 붙일 헤더. 값은 비밀로 본다(API는 이름만 보인다). */
+            headers?: {
+                [key: string]: string;
+            };
+            /** @description ntfy·Gotify 토큰. API는 내보내지 않는다. */
+            token?: string;
+            /** @description `http(s)://…`. 경로·질의는 비밀로 본다(Slack·Teams URL). API는 [`redact_url`]로 줄여 보인다. */
+            url: string;
+        };
+        /** @description [`WebhookTarget`]에서 비밀을 뺀 것 */
+        WebhookTargetView: {
+            ca_pem?: string;
+            format: components["schemas"]["WebhookFormat"];
+            has_token: boolean;
+            /** @description 헤더 이름(값은 비밀) */
+            header_names: string[];
+            /** @description [`redact_url`]로 줄인 URL(`scheme://host[:port]/…`). 바꾸기 본문에 이 값을 그대로 주면 저장된 URL을 지킨다. */
+            url: string;
+        };
         /** @enum {string} */
         Weekday: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
     };
@@ -8667,6 +9345,222 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_alert_rules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_alert_rule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRequest_AlertRuleSpec"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_alert_rule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_alert_rule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateRequest_AlertRuleSpec"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_alert_rule: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_alerts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AlertsResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_alert_history: {
+        parameters: {
+            query?: {
+                /** @description 이 시각부터(포함): 유닉스 밀리초나 RFC 3339. 기본은 `until`의 24시간 전 */
+                since?: string;
+                /** @description 이 시각까지(포함): 유닉스 밀리초나 RFC 3339. 기본은 지금 */
+                until?: string;
+                /** @description 최대 개수(1~5000, 기본 200) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationHistoryResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_audit: {
         parameters: {
             query?: {
@@ -10918,6 +11812,191 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_notification_targets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_NotificationTargetView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_notification_target: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NotificationTargetRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationTargetView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_notification_target: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationTargetView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_notification_target: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NotificationTargetRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationTargetView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_notification_target: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    test_notification_target: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationTestResult"];
                 };
             };
             "4XX": {

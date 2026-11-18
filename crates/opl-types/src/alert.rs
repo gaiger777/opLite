@@ -87,6 +87,11 @@ pub struct AlertRuleStatus {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub active: Vec<ActiveAlert>,
+    /// `BackupJobFailed`: 백업 작업(id)마다 이미 알린 마지막 실패 실행의 끝난 시각(ms). 리더가 바뀌어도 같은 실행을 다시
+    /// 알리지 않는다.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub notified: BTreeMap<Uuid, i64>,
 }
 
 /// 심각도(낮은 것부터)
@@ -1050,6 +1055,198 @@ pub struct NotificationRecord {
     pub error: Option<String>,
 }
 
+// ---- 노드 사이 읽기(`ReadAlerts`)와 API 응답 ----
+
+/// `GET /alerts/history`의 기본·최대 개수
+pub const DEFAULT_HISTORY_LIMIT: u32 = 200;
+pub const MAX_HISTORY_LIMIT: u32 = 5000;
+
+/// 보낸 기록을 읽는 창(시각은 ms, 둘 다 포함)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryWindow {
+    pub since: i64,
+    pub until: i64,
+    /// 새 것부터 이만큼(+1, 잘렸는지 알려고)
+    pub limit: u32,
+}
+
+/// 한 노드의 경보 읽기(peer RPC `ReadAlerts`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AlertsQuery {
+    /// 있으면 보낸 기록도 읽는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryWindow>,
+}
+
+/// 한 노드가 가진 노드 경보와 보낸 기록
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AlertsReply {
+    /// 그 노드가 평가하는 활성 경보(`pending` 포함)
+    #[serde(default)]
+    pub active: Vec<ActiveAlert>,
+    /// 보낸 기록(새 것부터, 최대 `limit + 1`개)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<NotificationRecord>,
+    /// 활성 경보가 상한(노드마다 500개)을 넘어 더 생긴 경보를 따라가지 못하고 있다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overflow: bool,
+}
+
+/// `GET /alerts`의 경보 하나(규칙 이름·심각도를 붙인 [`ActiveAlert`])
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AlertView {
+    pub rule: Uuid,
+    pub rule_name: String,
+    pub severity: Severity,
+    /// 조건 종류(`node_metric`, `node_offline` …)
+    pub condition: String,
+    pub subject: AlertSubject,
+    pub state: AlertState,
+    pub since: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub value: Option<f64>,
+    /// 문턱(지표·풀 조건)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub threshold: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub last_sent: Option<i64>,
+    /// 해제를 기다리기 시작한 때(조건이 거짓이 됨)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub clear_since: Option<i64>,
+}
+
+/// `GET /alerts`의 응답
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct AlertsResponse {
+    /// `firing` 먼저, 심각도 높은 것 먼저, 오래된 것 먼저
+    pub alerts: Vec<AlertView>,
+    /// 답하지 않은 노드 이름(그 노드의 노드 경보는 보이지 않는다)
+    pub unreachable: Vec<String>,
+    /// 경보를 모르는 옛 노드 이름
+    pub unsupported: Vec<String>,
+    /// 활성 경보가 상한을 넘은 노드 이름
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub overflowing: Vec<String>,
+}
+
+/// `GET /alerts/history`의 응답
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NotificationHistoryResponse {
+    /// 새 것부터
+    pub records: Vec<NotificationRecord>,
+    pub unreachable: Vec<String>,
+    pub unsupported: Vec<String>,
+    /// `limit`보다 많아 잘랐다.
+    pub truncated: bool,
+}
+
+/// 시험 보내기의 결과
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NotificationTestResult {
+    pub ok: bool,
+    /// 실패 이유(비밀을 지운 문구)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
+}
+
+/// 응답의 알림 대상. 비밀(비밀번호·토큰·헤더 값·URL의 경로와 질의) 대신 있는지만 보인다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct NotificationTargetView {
+    pub id: Uuid,
+    pub name: String,
+    pub revision: u64,
+    pub enabled: bool,
+    pub target: TargetConfigView,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TargetConfigView {
+    Smtp(SmtpTargetView),
+    Webhook(WebhookTargetView),
+}
+
+/// [`SmtpTarget`]에서 `password`를 뺀 것
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SmtpTargetView {
+    pub host: String,
+    pub port: u16,
+    pub tls: SmtpTls,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub user: Option<String>,
+    pub has_password: bool,
+    pub from: String,
+    pub to: Vec<String>,
+}
+
+/// [`WebhookTarget`]에서 비밀을 뺀 것
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct WebhookTargetView {
+    /// [`redact_url`]로 줄인 URL(`scheme://host[:port]/…`). 바꾸기 본문에 이 값을 그대로 주면 저장된 URL을 지킨다.
+    pub url: String,
+    pub format: WebhookFormat,
+    /// 헤더 이름(값은 비밀)
+    pub header_names: Vec<String>,
+    pub has_token: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub ca_pem: Option<String>,
+}
+
+impl From<TargetConfig> for TargetConfigView {
+    fn from(t: TargetConfig) -> Self {
+        match t {
+            TargetConfig::Smtp(s) => Self::Smtp(SmtpTargetView {
+                host: s.host,
+                port: s.port,
+                tls: s.tls,
+                user: s.user,
+                has_password: s.password.is_some(),
+                from: s.from,
+                to: s.to,
+            }),
+            TargetConfig::Webhook(w) => Self::Webhook(WebhookTargetView {
+                url: redact_url(&w.url),
+                format: w.format,
+                header_names: w.headers.into_keys().collect(),
+                has_token: w.token.is_some(),
+                ca_pem: w.ca_pem,
+            }),
+        }
+    }
+}
+
+impl From<NotificationTarget> for NotificationTargetView {
+    fn from(t: NotificationTarget) -> Self {
+        Self {
+            id: t.id,
+            name: t.name,
+            revision: t.revision,
+            enabled: t.spec.enabled,
+            target: t.spec.target.into(),
+        }
+    }
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 fn yes() -> bool {
     true
 }
@@ -1552,7 +1749,10 @@ mod tests {
             serde_json::to_value(AlertRuleStatus::default()).unwrap(),
             json!({})
         );
-        let status = AlertRuleStatus { active: vec![a] };
+        let status = AlertRuleStatus {
+            active: vec![a],
+            ..Default::default()
+        };
         let v = serde_json::to_value(&status).unwrap();
         assert_eq!(
             serde_json::from_value::<AlertRuleStatus>(v).unwrap(),
