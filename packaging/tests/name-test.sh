@@ -51,7 +51,7 @@ RULES=(
 	'.github/workflows/ci.yml|\(oplite\)'
 	'.github/actions/build-deb/action.yml|transitional oplite package'
 	# docs/guide/getting-started.md의 "이름 바꾸기" 절이 보이는 옛 이름과 그대로 둔 저장소 주소 예
-	'docs/guide/getting-started.md|opLite → Orbivisor'
+	'docs/guide/getting-started.md|opLite → Orbivisor|#이름-바꾸기-oplite--orbivisor'
 	'docs/guide/getting-started.md|\| `oplite` \||새 판의 `oplite`는|`oplite` 두 줄'
 	'docs/guide/getting-started.md|`oplite\.iso`, "Install opLite"'
 	'docs/guide/getting-started.md|`/usr/share/oplite/opld\.toml\.example`'
