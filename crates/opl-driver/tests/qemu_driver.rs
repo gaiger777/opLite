@@ -55,6 +55,7 @@ fn spec() -> VmRuntimeSpec {
         tpm: None,
         secure_boot: false,
         freeze_fs: false,
+        firmware_epoch: 0,
     }
 }
 

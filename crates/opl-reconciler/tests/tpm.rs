@@ -197,9 +197,15 @@ async fn a_vm_whose_tpm_state_is_unreachable_waits() {
 /// 기록된 TPM 상태가 없으면(처음 켜기) 새로 만들고, 이 노드가 지금 것을 가졌으면 받지 않는다.
 #[tokio::test]
 async fn a_new_tpm_is_created_only_without_a_recorded_state() {
+    let state = tempfile::tempdir().unwrap();
     let fetcher = Arc::new(Fetcher::default());
     let f: Arc<dyn FirmwareFetcher> = fetcher.clone();
-    let env = Env::start_with(|c| c.firmware = Some(f)).await;
+    let dir = state.path().to_path_buf();
+    let env = Env::start_with(|c| {
+        c.firmware = Some(f);
+        c.state_dir = Some(dir);
+    })
+    .await;
     let v = tpm_vm(&env);
     env.create(&v).await;
     env.wait(v.id, "running", running).await;
@@ -211,10 +217,14 @@ async fn a_new_tpm_is_created_only_without_a_recorded_state() {
         })
     );
 
+    // firmware_node가 이 노드이고 파일이 있으면(해시는 기록 뒤 바뀌었을 수 있다) 이 노드의 상태로 켠다.
     let mut mine = vm("mine", env.node);
     mine.spec.tpm = true;
     mine.status.firmware_node = Some(env.node);
     mine.status.tpm_sha256 = Some("cd".repeat(32));
+    let permall = opl_driver::tpm_state_path(state.path(), mine.id);
+    std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+    std::fs::write(&permall, b"changed since the hash").unwrap();
     env.create(&mine).await;
     env.wait(mine.id, "running", running).await;
     assert_eq!(

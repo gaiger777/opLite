@@ -222,6 +222,10 @@ pub enum TaskOp {
         #[serde(default)]
         #[cfg_attr(feature = "openapi", schema(default))]
         tpm: bool,
+        /// 있으면 Task가 VM 스펙의 `secure_boot`도 이 값으로 바꾼다(UEFI 변수 초기화와 함께, 리뷰 1 M1). 스펙과 초기화를
+        /// 한 Task가 쓰므로 API가 실패해도 둘 중 하나만 적용되지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secure_boot: Option<bool>,
     },
 }
 
@@ -775,6 +779,7 @@ mod tests {
         let op = TaskOp::VmFirmwareReset {
             uefi_vars: true,
             tpm: false,
+            secure_boot: None,
         };
         let json = serde_json::to_value(&op).unwrap();
         assert_eq!(
@@ -789,8 +794,18 @@ mod tests {
             tpm_only,
             TaskOp::VmFirmwareReset {
                 uefi_vars: false,
-                tpm: true
+                tpm: true,
+                secure_boot: None,
             }
+        );
+        let sb = TaskOp::VmFirmwareReset {
+            uefi_vars: true,
+            tpm: false,
+            secure_boot: Some(true),
+        };
+        assert_eq!(
+            serde_json::to_value(&sb).unwrap()["secure_boot"],
+            serde_json::json!(true)
         );
         assert!(op.needs_vtpm());
         assert!(!op.needs_templates());

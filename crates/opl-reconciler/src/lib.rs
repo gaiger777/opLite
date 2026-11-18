@@ -19,7 +19,7 @@ pub use config::{
     RestartBackoff,
 };
 pub use firewall::FirewallGate;
-pub use firmware::{FirmwareCopy, FirmwareError, FirmwareFetcher};
+pub use firmware::{FirmwareCopy, FirmwareError, FirmwareFetcher, FirmwarePurge};
 pub use guest::GuestInfoSink;
 pub use ha::{HaConfig, HaGuard};
 pub use reconciler::{Reconciler, ReconcilerHandle};

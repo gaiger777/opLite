@@ -43,7 +43,9 @@ def main(argv):
     ctrl = args["--ctrl"]["path"]
     pidfile = args["--pid"]["file"]
     log = args.get("--log", {}).get("file")
-    if not os.path.isdir(state):
+    # `{state_dir}/fail-swtpm`(TPM 디렉터리 `{state_dir}/vm/{id}/tpm`의 세 단계 위)가 있으면 AppArmor 거절처럼 실패한다.
+    denied = os.path.exists(os.path.join(state, "..", "..", "..", "fail-swtpm"))
+    if denied or not os.path.isdir(state):
         print(f"swtpm: Could not open TPM state directory {state}", file=sys.stderr)
         return 1
     lock = os.open(os.path.join(state, ".lock"), os.O_RDWR | os.O_CREAT, 0o600)

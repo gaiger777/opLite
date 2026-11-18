@@ -1019,9 +1019,11 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         TaskOp::VolumeFlatten => template::flatten(ctx, id).await,
         TaskOp::VmUntemplate => template::untemplate(ctx, task).await,
-        TaskOp::VmFirmwareReset { uefi_vars, tpm } => {
-            firmware::reset(ctx, task, *uefi_vars, *tpm).await
-        }
+        TaskOp::VmFirmwareReset {
+            uefi_vars,
+            tpm,
+            secure_boot,
+        } => firmware::reset(ctx, task, (*uefi_vars, *tpm), *secure_boot).await,
     };
     done.map(|()| None)
 }

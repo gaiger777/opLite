@@ -30,8 +30,8 @@ pub use ceph::{CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, N
 pub use client::{ConsoleError, ConsoleReceiver, ConsoleSender, ConsoleStream, GrpcNetwork, Peers};
 pub use fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
 pub use firmware::{
-    PushFirmwareRequest, TpmStateError, UefiVarsChunk, UefiVarsError, VarsTemplates, read_chunks,
-    sha256_hex,
+    PurgeFirmwareRequest, PushFirmwareRequest, TpmStateError, UefiVarsChunk, UefiVarsError,
+    VarsTemplates, read_chunks, sha256_hex,
 };
 pub use guest::{
     GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,

@@ -1,6 +1,7 @@
 //! 펌웨어 상태(UEFI 변수·TPM) Task 도우미(계획 59 §5·§10): 스냅샷·백업이 담을 TPM 상태를 이 노드에 맞추기, 상태 파일을
 //! 0600으로 두기, 초기화 Task(`vm-firmware-reset`), 복제 회차 끝의 사본 밀어 두기, 지운 VM의 상태 디렉터리 정리.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_driver::{tpm_state_path, uefi_vars_path, vm_state_dir, vm_tpm_dir, write_firmware_epoch};
 use opl_peer::sha256_hex;
-use opl_reconciler::FirmwareCopy;
+use opl_reconciler::{FirmwareCopy, FirmwarePurge};
 use opl_types::firmware::{TpmSource, firmware_copy_nodes, tpm_source, tpm_unavailable};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::placement::HaGroupSpec;
@@ -211,8 +212,8 @@ pub(super) fn reset_status(
 pub(super) async fn reset(
     ctx: &Ctx,
     task: &Task,
-    uefi_vars: bool,
-    tpm: bool,
+    (uefi_vars, tpm): (bool, bool),
+    secure_boot: Option<bool>,
 ) -> Result<(), String> {
     if !uefi_vars && !tpm {
         return Err("nothing to reset: choose the UEFI variables, the TPM or both".into());
@@ -227,6 +228,9 @@ pub(super) async fn reset(
     }
     if !matches!(ctx.hv.inspect(id).await, Ok(None)) {
         return Err(format!("VM {:?} is still running on this node", vm.name));
+    }
+    if let Some(on) = secure_boot {
+        set_secure_boot(ctx, id, on).await?;
     }
     let epoch = write_reset(ctx, &vm, uefi_vars, tpm).await?;
     let Some(dir) = &ctx.config.state_dir else {
@@ -247,7 +251,59 @@ pub(super) async fn reset(
     write_firmware_epoch(dir, id, epoch)
         .map_err(|e| format!("cannot record the firmware epoch: {e}"))?;
     tracing::info!(vm = %id, uefi_vars, tpm, epoch, "reset VM firmware");
+    let purge = FirmwarePurge {
+        vm: id,
+        epoch: Some(epoch),
+        uefi_vars,
+        tpm,
+        snapshot: None,
+    };
+    purge_elsewhere(ctx, &purge).await;
     Ok(())
+}
+
+/// 다른 온라인 노드(위트니스 빼고)에 남은 초기화 전 파일을 지운다(리뷰 1 I5). 옛 TPM 상태는 비밀이라 사본 노드와 앞
+/// `firmware_node`에 남기지 않는다(어느 노드를 거쳐 갔는지 모두 기록하지 않으므로 모든 노드에 보낸다). 닿지 않는 노드는
+/// 남기고 경고만 한다 — 그 노드의 파일은 회차가 달라 켤 때 지워진다.
+async fn purge_elsewhere(ctx: &Ctx, purge: &FirmwarePurge) {
+    let Some(fetcher) = &ctx.config.firmware else {
+        return;
+    };
+    let Ok((_, nodes)) = ctx.cluster.list::<NodeSpec>() else {
+        return;
+    };
+    for node in nodes
+        .iter()
+        .filter(|n| n.id != ctx.config.node && n.status.online && !n.spec.witness)
+    {
+        if let Err(e) = fetcher.purge(node.id, purge).await {
+            tracing::warn!(vm = %purge.vm, node = %node.name, error = %e,
+                "cannot remove old firmware files on another node");
+        }
+    }
+}
+
+/// 스펙의 `secure_boot`를 `on`으로 쓴다(이미 그 값이면 쓰지 않는다 — 다시 해도 된다). 그 사이 누가 스펙을 썼으면 다시
+/// 읽어 쓴다.
+async fn set_secure_boot(ctx: &Ctx, id: Uuid, on: bool) -> Result<(), String> {
+    loop {
+        let vm = get_vm(ctx, id)?;
+        if vm.spec.secure_boot == on {
+            return Ok(());
+        }
+        let mut spec = vm.spec.clone();
+        spec.secure_boot = on;
+        spec.validate().map_err(|e| e.to_string())?;
+        match ctx
+            .cluster
+            .update_spec(id, Some(vm.revision), vm.labels.clone(), &spec)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
 }
 
 /// 초기화를 VM status에 쓰고 새 회차를 돌려준다. 쓰기 결과를 모르면(시간 초과 등) 다시 읽어, 회차가 이 Task가 쓴
@@ -278,6 +334,40 @@ async fn write_reset(ctx: &Ctx, vm: &Vm, uefi_vars: bool, tpm: bool) -> Result<u
                 }
                 current = now;
             }
+        }
+    }
+}
+
+/// 스냅샷의 변수·TPM 사본을 다른 노드(`tpm_node`)에 두었으면 거기서 지운다(리뷰 1 I5). 그 노드가 오프라인이거나
+/// 클러스터에 없으면 경고만 남긴다(스냅샷은 지운다). 온라인인데 지우지 못하면 실패다(다시 하면 된다).
+pub(super) async fn purge_snapshot_copy(
+    ctx: &Ctx,
+    vm: Uuid,
+    snapshot: Uuid,
+    node: Uuid,
+) -> Result<(), String> {
+    if node == ctx.config.node {
+        return Ok(());
+    }
+    let online = matches!(ctx.cluster.get::<NodeSpec>(node), Ok(Some(n)) if n.status.online);
+    let purge = FirmwarePurge {
+        vm,
+        snapshot: Some(snapshot),
+        ..Default::default()
+    };
+    let result = match &ctx.config.firmware {
+        Some(fetcher) => fetcher.purge(node, &purge).await.map_err(|e| e.to_string()),
+        None => Err("this node cannot remove files on other nodes".into()),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if online => Err(format!(
+            "cannot remove the TPM copy of the snapshot on node {node}: {e}"
+        )),
+        Err(e) => {
+            tracing::warn!(%vm, %snapshot, %node, error = %e,
+                "the TPM copy of a deleted snapshot stays on an offline node");
+            Ok(())
         }
     }
 }
@@ -342,44 +432,49 @@ pub(super) async fn push_replica_copy(ctx: &Ctx, vm: Uuid, to: Uuid) {
     }
 }
 
-/// 지운 VM의 상태 디렉터리를 시작할 때와 그 뒤 `tag_sweep`마다 지운다([`sweep_state_dirs`]). 실행기가 멈추면 함께
-/// 멈춘다.
+/// 지운 VM의 상태 디렉터리를 `tag_sweep`마다 지운다([`sweep_state_dirs`]). 시작할 때는 후보만 모으고, 다음 차례에도
+/// 후보이면 지운다(리뷰 1 I3): 다시 합류한 노드의 로컬 클러스터 상태가 아직 따라잡지 못해 VM 목록이 모자라도 그 사이에
+/// 따라잡으므로, 살아 있는 VM의 TPM 상태·UEFI 변수를 지우지 않는다. 실행기가 멈추면 함께 멈춘다.
 pub(super) async fn sweep_state_dirs_every(ctx: Arc<Ctx>) {
+    let mut candidates = HashSet::new();
     loop {
-        sweep_state_dirs(&ctx).await;
+        candidates = sweep_state_dirs(&ctx, &candidates).await;
         tokio::time::sleep(ctx.config.tag_sweep).await;
     }
 }
 
-/// 이 노드의 `{state_dir}/vm/{id}` 가운데 Raft에 VM이 없는 것을 지운다(설계 §10): 디렉터리가 마지막으로 바뀐 지
-/// `state_dir_min_age`(1시간)가 지났고 그 id를 대상으로 하는 끝나지 않은 Task가 없어야 한다(복원·복제는 VM을 만들기
-/// 전에 파일을 쓴다). 사용자가 VM을 지운 뜻대로 거쳐 간 노드의 UEFI 변수·TPM 상태(비밀)를 남기지 않는다. 다른 노드가
-/// 맡은 VM을 포함해 VM이 있는 디렉터리는 건드리지 않는다. 목록을 읽지 못하면 아무것도 지우지 않는다.
-pub(super) async fn sweep_state_dirs(ctx: &Ctx) {
+/// 이 노드의 `{state_dir}/vm/{id}` 가운데 Raft에 VM이 없는 것(후보)을 돌려주고, 그 가운데 앞 차례에도 후보였던
+/// (`before`) 것을 지운다(설계 §10): 디렉터리가 마지막으로 바뀐 지 `state_dir_min_age`(1시간)가 지났고 그 id를 대상으로
+/// 하는 끝나지 않은 Task가 없어야 한다(복원·복제는 VM을 만들기 전에 파일을 쓴다). 사용자가 VM을 지운 뜻대로 거쳐 간
+/// 노드의 UEFI 변수·TPM 상태(비밀)를 남기지 않는다. 다른 노드가 맡은 VM을 포함해 VM이 있는 디렉터리는 건드리지 않는다.
+/// 목록을 읽지 못하거나 이 노드가 받은 클러스터 기록을 아직 다 적용하지 않았으면 아무것도 지우지 않는다.
+pub(super) async fn sweep_state_dirs(ctx: &Ctx, before: &HashSet<Uuid>) -> HashSet<Uuid> {
+    let mut found = HashSet::new();
     let Some(state) = &ctx.config.state_dir else {
-        return;
+        return found;
     };
     let root = state.join("vm");
     let mut entries = match tokio::fs::read_dir(&root).await {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return found,
         Err(e) => {
             tracing::warn!(dir = %root.display(), error = %e, "cannot read VM state directories");
-            return;
+            return found;
         }
     };
+    let caught_up = ctx.cluster.revision() >= ctx.cluster.known_revision();
     let (Ok((_, vms)), Ok((_, tasks))) =
         (ctx.cluster.list::<VmSpec>(), ctx.cluster.list::<TaskSpec>())
     else {
-        return;
+        return found;
     };
     loop {
         let entry = match entries.next_entry().await {
             Ok(Some(entry)) => entry,
-            Ok(None) => return,
+            Ok(None) => return found,
             Err(e) => {
                 tracing::warn!(dir = %root.display(), error = %e, "cannot read VM state directories");
-                return;
+                return found;
             }
         };
         let Some(id) = entry
@@ -406,12 +501,17 @@ pub(super) async fn sweep_state_dirs(ctx: &Ctx) {
         if !meta.is_dir() || age.is_none_or(|a| a < ctx.config.state_dir_min_age) {
             continue;
         }
+        found.insert(id);
+        if !caught_up || !before.contains(&id) {
+            continue;
+        }
         // 목록을 읽은 뒤 만든 VM일 수 있다. 지우기 바로 전에 다시 본다.
         if !matches!(ctx.cluster.get::<VmSpec>(id), Ok(None)) {
             continue;
         }
         match tokio::fs::remove_dir_all(entry.path()).await {
             Ok(()) => {
+                found.remove(&id);
                 tracing::info!(vm = %id, "removed the state directory of a deleted VM");
             }
             Err(e) => {

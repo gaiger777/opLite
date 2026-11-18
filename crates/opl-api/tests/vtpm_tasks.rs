@@ -396,7 +396,11 @@ async fn firmware_reset_bumps_the_epoch_and_removes_this_nodes_files() {
     .await;
     let vars = uefi_vars_path(&state(&env), vm);
     let tpm = tpm_state_path(&state(&env), vm);
-    let reset = |uefi_vars, tpm| TaskOp::VmFirmwareReset { uefi_vars, tpm };
+    let reset = |uefi_vars, tpm| TaskOp::VmFirmwareReset {
+        uefi_vars,
+        tpm,
+        secure_boot: None,
+    };
 
     succeeded(&run_task(&env, &admin, reset(true, false), vm).await);
     let after = get_vm(&env, vm);
@@ -477,9 +481,20 @@ async fn state_directories_of_deleted_vms_are_removed() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(dir(deleted).exists());
 
+    // 시작할 때는 후보만 모은다(다시 합류한 노드의 클러스터 상태가 늦을 수 있다, 리뷰 1 I3).
     env.stop_runner().await;
     env.start_runner_config(Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)), |c| {
         c.state_dir_min_age = Duration::ZERO;
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(dir(deleted).exists());
+
+    // 다음 차례에도 후보이면 지운다.
+    env.stop_runner().await;
+    env.start_runner_config(Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)), |c| {
+        c.state_dir_min_age = Duration::ZERO;
+        c.tag_sweep = Duration::from_millis(50);
     })
     .await;
     let deadline = tokio::time::Instant::now() + common::WAIT;

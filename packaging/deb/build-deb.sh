@@ -112,6 +112,9 @@ install -m 0644 "$DEB_DIR/opld.service" "$STAGE/usr/lib/systemd/system/opld.serv
 ln -s opld.service "$STAGE/usr/lib/systemd/system/orbivisord.service"
 install -m 0644 "$DEB_DIR/opld.toml.example" "$STAGE/usr/share/orbivisor/opld.toml.example"
 install -m 0644 "$DEB_DIR/copyright" "$STAGE/usr/share/doc/orbivisor/copyright"
+# swtpm AppArmor 덧붙임(계획 59): Ubuntu·Debian swtpm 프로필의 local 파일이 이것을 include한다(postinst).
+mkdir -p "$STAGE/etc/apparmor.d/abstractions"
+install -m 0644 "$DEB_DIR/apparmor/orbivisor-swtpm" "$STAGE/etc/apparmor.d/abstractions/orbivisor-swtpm"
 # 저장소 공개 키: opld가 쓰는 소스 파일의 Signed-By(경로는 옛 이름 그대로)
 if [ -n "$APT_KEY" ]; then
 	mkdir -p "$STAGE/usr/share/keyrings"
@@ -136,6 +139,9 @@ debian_dir "$STAGE" "$DEB_DIR/control.in"
 for script in postinst prerm postrm; do
 	install -m 0755 "$DEB_DIR/$script" "$STAGE/DEBIAN/$script"
 done
+# /etc 아래 파일은 conffile이다(관리자가 고친 것을 업그레이드가 덮지 않는다).
+echo /etc/apparmor.d/abstractions/orbivisor-swtpm >"$STAGE/DEBIAN/conffiles"
+chmod 0644 "$STAGE/DEBIAN/conffiles"
 debian_dir "$TRANS" "$DEB_DIR/oplite.control.in"
 
 mkdir -p "$OUT_DIR"

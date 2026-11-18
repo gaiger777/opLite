@@ -22,7 +22,7 @@ use crate::resources::lookup;
 use crate::snapshots::{check_no_snapshot_task, check_no_task, check_not_busy, vm_node};
 use crate::state::AppState;
 use crate::tasks::create_task;
-use crate::vms::{is_stopped, modify_spec};
+use crate::vms::is_stopped;
 
 /// 초기화할 것. 적어도 하나는 참이어야 한다.
 #[derive(Debug, Deserialize, ToSchema)]
@@ -76,18 +76,16 @@ pub(crate) fn check_secure_boot_change(vm: &Vm, on: bool) -> Result<(), ApiError
 }
 
 /// 꺼진 TPM VM `vm`(스펙은 켤 모양, status는 지금 것)을 노드 `node`에서 켤 때 TPM 상태를 얻을 수 있는지 미리 본다(설계
-/// §5 켜기 규칙). 얻을 곳이 없으면 409 `tpm_state_unavailable`(작업자가 남길 문구와 같다). `node`가 사본 노드면 그
-/// 노드의 파일이 지금 해시와 같다고 본다.
+/// §5 켜기 규칙). 얻을 곳이 없으면 409 `tpm_state_unavailable`(작업자가 남길 문구와 같다). `node`가 `firmware_node`나
+/// 사본 노드면 그 노드의 파일이 지금 해시와 같다고 본다(API는 파일을 볼 수 없다 — 없으면 작업자가 사본에서 받는다).
 pub(crate) fn check_tpm_state(state: &AppState, vm: &Vm, node: Uuid) -> Result<(), ApiError> {
     if !vm.spec.tpm {
         return Ok(());
     }
     let nodes = state.cluster.list::<NodeSpec>()?.1;
-    let local = vm
-        .status
-        .tpm_sha256
-        .as_deref()
-        .filter(|_| vm.status.firmware_copies.contains(&node));
+    let local = vm.status.tpm_sha256.as_deref().filter(|_| {
+        vm.status.firmware_node == Some(node) || vm.status.firmware_copies.contains(&node)
+    });
     match tpm_source(vm, node, local, &nodes) {
         TpmSource::Unavailable(message) => {
             Err(ApiError::conflict("tpm_state_unavailable", message))
@@ -129,8 +127,8 @@ fn reset_node(state: &AppState, vm: &Vm, uefi_vars: bool, tpm: bool) -> Result<U
 /// 올린다(다른 노드의 사본은 회차가 달라 켤 때 지워진다). `uefi_vars`·`tpm`이 모두 거짓이면 400, VM이 꺼져 있지 않으면
 /// 409 `vm_running`, 켜거나 끄는 중이거나 마이그레이션·스냅샷·복제·백업 Task가 끝나지 않았으면 409 `vm_busy`, 모든
 /// 노드가 `vtpm`을 알아야 한다(409 `cluster_upgrading`). TPM 상태가 있는 VM의 변수만 초기화는 `firmware_node`가
-/// 오프라인이면 409 `node_unavailable`이다. `secure_boot`를 주면 Task를 만든 뒤 스펙의 `secure_boot`도 바꾼다(UEFI
-/// 펌웨어가 아니면 400). Task가 끝날 때까지 켜기는 409 `vm_busy`다.
+/// 오프라인이면 409 `node_unavailable`이다. `secure_boot`를 주면 Task가 스펙의 `secure_boot`도 바꾼다(UEFI 펌웨어가
+/// 아니면 400). Task가 끝날 때까지 켜기는 409 `vm_busy`다.
 #[utoipa::path(post, path = "/vms/{key}/firmware/reset", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     request_body = FirmwareResetRequest,
@@ -181,22 +179,14 @@ pub async fn reset_firmware(
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
     }
     let node = reset_node(&state, &vm, uefi_vars, tpm)?;
-    let task = create_task(
-        &state.cluster,
-        TaskOp::VmFirmwareReset { uefi_vars, tpm },
-        vm.id,
-        node,
-    )
-    .await?;
-    // Task를 먼저 만든다: 스펙 쓰기가 실패해도 사용자가 고른 초기화만 되고, Task가 끝날 때까지 켜지 않는다.
-    if let Some(on) = secure_boot {
-        modify_spec(&state, vm.id, |spec| {
-            spec.secure_boot = on;
-            spec.validate()
-                .map_err(|e| ApiError::bad_request(e.to_string()))
-        })
-        .await?;
-    }
+    // Secure Boot 바꾸기는 Task가 초기화와 함께 쓴다(리뷰 1 M1): Task를 만든 뒤 스펙 쓰기가 실패하면 되돌릴 수 없는 초기화만
+    // 남는다.
+    let op = TaskOp::VmFirmwareReset {
+        uefi_vars,
+        tpm,
+        secure_boot,
+    };
+    let task = create_task(&state.cluster, op, vm.id, node).await?;
     audit.detail(reset_detail(&vm.name, uefi_vars, tpm, secure_boot));
     Ok((StatusCode::ACCEPTED, Json(task)))
 }

@@ -32,6 +32,26 @@ pub trait FirmwareFetcher: Send + Sync {
             "this node cannot push firmware copies".into(),
         ))
     }
+
+    /// 노드 `to`의 펌웨어 파일을 `purge`대로 지운다(리뷰 1 I5: 초기화 전 TPM 상태, 지운 스냅샷의 사본).
+    async fn purge(&self, to: Uuid, purge: &FirmwarePurge) -> Result<(), FirmwareError> {
+        let _ = (to, purge);
+        Err(FirmwareError(
+            "this node cannot remove firmware files on other nodes".into(),
+        ))
+    }
+}
+
+/// 다른 노드에서 지울 펌웨어 파일
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FirmwarePurge {
+    pub vm: Uuid,
+    /// 초기화 뒤의 회차: 그 노드의 회차가 이와 다르면 `uefi_vars`·`tpm`을 지운다(그 노드에서 VM이 돌면 거절).
+    pub epoch: Option<u32>,
+    pub uefi_vars: bool,
+    pub tpm: bool,
+    /// 이 스냅샷의 변수·TPM 사본을 지운다.
+    pub snapshot: Option<Uuid>,
 }
 
 /// 밀어 둘 펌웨어 사본 하나

@@ -452,6 +452,7 @@ async fn sweep_stops_a_source_qemu_committed_elsewhere() {
         tpm: None,
         secure_boot: false,
         freeze_fs: false,
+        firmware_epoch: 0,
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(vm.id, &target, &opts).await.unwrap();
@@ -506,6 +507,7 @@ async fn sweep_stops_a_source_qemu_of_a_deleted_vm() {
         tpm: None,
         secure_boot: false,
         freeze_fs: false,
+        firmware_epoch: 0,
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(spec.id, &target, &opts).await.unwrap();

@@ -45,6 +45,10 @@ pub struct VmRuntimeSpec {
     /// 시점을 찍는 동작(디스크 스냅샷·백업·복제 회차)에서 게스트 파일 시스템을 얼린다(계획 59, `guest_agent.freeze_fs`).
     #[serde(default)]
     pub freeze_fs: bool,
+    /// VM의 펌웨어 초기화 회차(`VmStatus.firmware_epoch`, 리뷰 1 I1). TPM이 없는 UEFI VM도 노드의 `firmware.epoch`와
+    /// 다르면 그 노드의 UEFI 변수를 지우고 템플릿에서 새로 만든다. TPM VM은 `RuntimeTpm.epoch`와 같다.
+    #[serde(default)]
+    pub firmware_epoch: u32,
 }
 
 /// 켤 때의 TPM 상태 규칙(계획 59)

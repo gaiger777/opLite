@@ -30,8 +30,8 @@ use crate::ceph::{
 };
 use crate::fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
 use crate::firmware::{
-    PushFirmwareReply, PushFirmwareRequest, TpmStateRequest, UefiVarsChunk, UefiVarsRequest,
-    VarsTemplates,
+    PurgeFirmwareReply, PurgeFirmwareRequest, PushFirmwareReply, PushFirmwareRequest,
+    TpmStateRequest, UefiVarsChunk, UefiVarsRequest, VarsTemplates,
 };
 use crate::guest::{
     GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
@@ -572,6 +572,38 @@ impl Peer for PeerService {
         })
         .await??;
         Ok(Response::new(PushFirmwareReply))
+    }
+
+    async fn purge_firmware(
+        &self,
+        req: Request<PurgeFirmwareRequest>,
+    ) -> Result<Response<PurgeFirmwareReply>, Status> {
+        self.authorize(&req)?;
+        let Some(dir) = self.state_dir.clone() else {
+            return Err(Status::unimplemented("this node keeps no firmware files"));
+        };
+        let req = req.into_inner();
+        let hv = self.hv.clone();
+        self.offload(async move {
+            // 이 노드에서 도는 VM의 파일은 지금 것이다.
+            if req.epoch.is_some()
+                && let Some(hv) = hv
+                && hv
+                    .inspect(req.vm)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?
+                    .is_some()
+            {
+                return Err(Status::failed_precondition(format!(
+                    "VM {} is running on this node",
+                    req.vm
+                )));
+            }
+            crate::firmware::purge(&dir, &req)
+                .map_err(|e| Status::internal(format!("cannot remove firmware files: {e}")))
+        })
+        .await??;
+        Ok(Response::new(PurgeFirmwareReply {}))
     }
 
     async fn guest_agent(

@@ -338,6 +338,7 @@ async fn resolve(
         }),
         secure_boot: vm.spec.secure_boot,
         freeze_fs: vm.spec.guest_agent.is_some_and(|g| g.freeze_fs),
+        firmware_epoch: vm.status.firmware_epoch,
     };
     set_boot_order(&mut spec);
     if let Some(hw) = hardware {

@@ -12,9 +12,26 @@ set -eu
 # 시험(packaging/tests/maint-test.sh)이 바꿀 수 있게 환경 변수로 둔다.
 SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
 SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
+APPARMOR_DIR="${OPL_APPARMOR_DIR:-/etc/apparmor.d}"
+SWTPM_INCLUDE='include <abstractions/orbivisor-swtpm>'
+
+# swtpm AppArmor(계획 59): swtpm 프로필의 local 파일(swtpm 꾸러미가 만들고 소유하지 않는다)에 orbivisor 경로를 한 번만
+# 더하고, 프로필이 있고 AppArmor가 켜져 있으면 다시 읽힌다. swtpm을 나중에 설치하면 그 postinst가 이 줄과 함께 읽는다.
+swtpm_apparmor() {
+	local_file="$APPARMOR_DIR/local/usr.bin.swtpm"
+	mkdir -p "$APPARMOR_DIR/local"
+	if ! grep -qxF "$SWTPM_INCLUDE" "$local_file" 2>/dev/null; then
+		echo "$SWTPM_INCLUDE" >>"$local_file"
+	fi
+	if [ -f "$APPARMOR_DIR/usr.bin.swtpm" ] && command -v aa-enabled >/dev/null 2>&1 &&
+		aa-enabled --quiet 2>/dev/null; then
+		apparmor_parser -r -T -W "$APPARMOR_DIR/usr.bin.swtpm" || true
+	fi
+}
 
 case "$1" in
 configure | abort-remove | abort-deconfigure)
+	swtpm_apparmor
 	# configure의 $2: 이전에 설정한 버전. 비었으면 처음 설치다.
 	first=no
 	if [ "$1" = configure ] && [ -z "${2:-}" ]; then

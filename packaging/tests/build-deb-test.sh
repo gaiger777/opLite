@@ -121,6 +121,18 @@ if [ -f "$T/usr/share/orbivisor/opld.toml.example" ] && [ -f "$T/usr/share/doc/o
 else
 	fail "공유 파일: $(find "$T/usr/share" 2>&1)"
 fi
+# swtpm AppArmor 덧붙임(계획 59): conffile로 싣고, opld 기본 경로(/var/lib/opl, /run/opl)의 TPM 파일을 허용한다.
+AA_FILE="$T/etc/apparmor.d/abstractions/orbivisor-swtpm"
+if [ -f "$AA_FILE" ] && [ "$(cat "$T/DEBIAN/conffiles")" = /etc/apparmor.d/abstractions/orbivisor-swtpm ] &&
+	grep -qxF '  /var/lib/opl/vm/*/tpm/** rwk,' "$AA_FILE" &&
+	grep -qxF '  /run/opl/vm/*/tpm.sock rw,' "$AA_FILE" &&
+	grep -qxF '  /run/opl/vm/*/swtpm.pid rw,' "$AA_FILE" &&
+	grep -qxF '  /run/opl/vm/*/swtpm.log rw,' "$AA_FILE" &&
+	! grep -q orbivisor/ "$AA_FILE"; then
+	ok "swtpm AppArmor 덧붙임(conffile, 기본 경로)"
+else
+	fail "AppArmor: $(cat "$AA_FILE" "$T/DEBIAN/conffiles" 2>&1)"
+fi
 # md5sums에는 파일만(링크는 dpkg --verify가 보지 않는다)
 if [ "$(awk '{ print $2 }' "$T/DEBIAN/md5sums")" = "usr/bin/orbivisorctl
 usr/bin/orbivisord

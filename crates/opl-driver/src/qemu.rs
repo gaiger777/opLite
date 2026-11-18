@@ -68,6 +68,8 @@ const EXIT_GRACE: Duration = Duration::from_secs(5);
 const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
 /// 게스트 에이전트의 `guest-ping`을 기다리는 시간
 const GUEST_PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// 게스트 에이전트 잠금을 기다리는 한도(그 뒤는 바쁨으로 본다)
+const AGENT_LOCK_WAIT: Duration = Duration::from_secs(2);
 /// 내부 스냅샷(저장·불러오기·삭제) 하나를 기다리는 한도. 메모리 스냅샷은 메모리 크기만큼 걸린다.
 /// Task 한도(600초)보다 짧아야 Task가 먼저 끊기지 않고 이 오류(작업이 남아 있을 수 있음)를 받는다.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
@@ -380,6 +382,13 @@ impl QemuHypervisor {
                 &paths.uefi_vars,
             )
             .await?;
+        } else if vm.firmware == Firmware::Uefi {
+            tpm::prepare_vars(
+                &self.config.state_dir,
+                vm.id,
+                vm.firmware_epoch,
+                &paths.uefi_vars,
+            )?;
         }
         if vm.firmware == Firmware::Uefi && !paths.uefi_vars.exists() {
             // Secure Boot VM은 MS 키를 등록한 변수 원본에서 만든다.
@@ -1067,12 +1076,7 @@ impl Hypervisor for QemuHypervisor {
             job(save, "QMP snapshot-save").await?;
             Ok(Quiesced::No)
         } else {
-            let _agent = if quiesce {
-                Some(handle.agent.lock().await)
-            } else {
-                None
-            };
-            let mut freezer = Freezer::new(quiesce, &handle.paths);
+            let mut freezer = Freezer::new(quiesce, &handle.paths, &handle.agent);
             freezer.freeze(id).await;
             let r =
                 tokio::time::timeout(SNAPSHOT_TIMEOUT, handle.qmp.snapshot_disks(tag, &devices))
@@ -1104,12 +1108,7 @@ impl Hypervisor for QemuHypervisor {
                 ]
             })
             .collect();
-        let _agent = if quiesce {
-            Some(handle.agent.lock().await)
-        } else {
-            None
-        };
-        let mut freezer = Freezer::new(quiesce, &handle.paths);
+        let mut freezer = Freezer::new(quiesce, &handle.paths, &handle.agent);
         freezer.freeze(id).await;
         let r = tokio::time::timeout(SNAPSHOT_TIMEOUT, handle.qmp.transaction(&actions)).await;
         freezer.thaw(id).await;
@@ -1177,12 +1176,7 @@ impl Hypervisor for QemuHypervisor {
             )));
         }
         let mut opened = Vec::new();
-        let _agent = if quiesce {
-            Some(handle.agent.lock().await)
-        } else {
-            None
-        };
-        let mut freezer = Freezer::new(quiesce, &handle.paths);
+        let mut freezer = Freezer::new(quiesce, &handle.paths, &handle.agent);
         let mut result = backup_into(
             qmp,
             &disks,
@@ -1262,12 +1256,7 @@ impl Hypervisor for QemuHypervisor {
         let mut opened = Vec::new();
         let mut fleeces = Vec::new();
         let halt = self.fleece_halt(id, &handle);
-        let _agent = if req.quiesce {
-            Some(handle.agent.lock().await)
-        } else {
-            None
-        };
-        let mut freezer = Freezer::new(req.quiesce, &handle.paths);
+        let mut freezer = Freezer::new(req.quiesce, &handle.paths, &handle.agent);
         let mut result = send_replicas(
             qmp,
             &disks,
@@ -1488,14 +1477,19 @@ impl Hypervisor for QemuHypervisor {
     async fn guest_ping(&self, id: Uuid) -> Result<bool, DriverError> {
         let handle = self.running_handle(id)?;
         let sock = agent_socket(&handle, id)?;
-        let _agent = handle.agent.lock().await;
+        // 얼리는 중이면 답하지 않은 것으로 본다(게스트 감시는 한도 동안 이어진 무응답만 센다).
+        let Some(_agent) = agent_lock(&handle).await else {
+            return Ok(false);
+        };
+        agent::thaw_left(id, &handle.paths).await;
         Ok(opl_qemu::qga::ping(&sock, GUEST_PING_TIMEOUT).await?)
     }
 
     async fn guest_info(&self, id: Uuid) -> Result<GuestInfo, DriverError> {
         let handle = self.running_handle(id)?;
         let sock = agent_socket(&handle, id)?;
-        let _agent = handle.agent.lock().await;
+        let _agent = agent_lock(&handle).await.ok_or_else(agent_busy)?;
+        agent::thaw_left(id, &handle.paths).await;
         let mut session = Session::connect(&sock, qga::SYNC_TIMEOUT)
             .await
             .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
@@ -1513,7 +1507,7 @@ impl Hypervisor for QemuHypervisor {
     ) -> Result<(), DriverError> {
         let handle = self.running_handle(id)?;
         let sock = agent_socket(&handle, id)?;
-        let _agent = handle.agent.lock().await;
+        let _agent = agent_lock(&handle).await.ok_or_else(agent_busy)?;
         let mut session = Session::connect(&sock, qga::SYNC_TIMEOUT)
             .await
             .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
@@ -1932,7 +1926,13 @@ impl Hypervisor for QemuHypervisor {
     async fn firmware_caps(&self) -> FirmwareCaps {
         let host = &self.config.host;
         FirmwareCaps {
-            tpm: tpm::tpm_capable(&self.config.swtpm, &host.qemu_binary).await,
+            tpm: tpm::tpm_capable(
+                &self.config.swtpm,
+                &host.qemu_binary,
+                &self.config.state_dir,
+                &self.config.run_dir,
+            )
+            .await,
             secure_boot: host
                 .secure_boot
                 .as_ref()
@@ -2382,10 +2382,22 @@ fn agent_socket(handle: &VmHandle, id: Uuid) -> Result<PathBuf, DriverError> {
     Ok(sock)
 }
 
+/// VM의 에이전트 잠금을 [`AGENT_LOCK_WAIT`]까지 기다려 쥔다. 얼리기 창(그 사이 녹이기 포함)만 잠금을 오래
+/// 쥐므로, 넘으면 `None`(에이전트가 바쁨)이다. 작업자의 ping·정보 수집·종료가 그 창 뒤로 밀리지 않는다.
+async fn agent_lock(handle: &VmHandle) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+    tokio::time::timeout(AGENT_LOCK_WAIT, handle.agent.lock())
+        .await
+        .ok()
+}
+
+fn agent_busy() -> DriverError {
+    DriverError::GuestAgent("the guest agent is busy freezing or thawing file systems".into())
+}
+
 /// 게스트 에이전트로 끈다(`guest-shutdown`). 채널이 없거나, 동기화되지 않거나, 오류로 답하면 오류다.
 async fn agent_shutdown(handle: &VmHandle, id: Uuid) -> Result<(), DriverError> {
     let sock = agent_socket(handle, id)?;
-    let _agent = handle.agent.lock().await;
+    let _agent = agent_lock(handle).await.ok_or_else(agent_busy)?;
     let mut session = Session::connect(&sock, qga::SYNC_TIMEOUT)
         .await
         .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
@@ -2743,7 +2755,7 @@ async fn backup_into(
     (parent, new): (&str, &str),
     targets: &[BackupTarget],
     opened: &mut Vec<String>,
-    (id, freezer): (Uuid, &mut Freezer),
+    (id, freezer): (Uuid, &mut Freezer<'_>),
 ) -> Result<(), DriverError> {
     let mut actions = Vec::new();
     for ((i, target), disk) in targets.iter().enumerate().zip(disks) {
@@ -2945,7 +2957,7 @@ async fn start_fleecing(
     disks: &[BlockNode],
     indexes: &[usize],
     new: &[TransactionAction],
-    (dir, halt, freezer): (&Path, &FleeceHalt<'_>, &mut Freezer),
+    (dir, halt, freezer): (&Path, &FleeceHalt<'_>, &mut Freezer<'_>),
     error: fn(String) -> DriverError,
     fleeces: &mut Vec<Fleece>,
 ) -> Result<(), DriverError> {
@@ -3187,7 +3199,7 @@ async fn send_replicas(
     qmp: &QmpClient,
     disks: &[BlockNode],
     req: &ReplicateRequest,
-    fleece: (&Path, &FleeceHalt<'_>, &mut Freezer),
+    fleece: (&Path, &FleeceHalt<'_>, &mut Freezer<'_>),
     opened: &mut Vec<String>,
     fleeces: &mut Vec<Fleece>,
 ) -> Result<u64, DriverError> {
@@ -4214,6 +4226,7 @@ mod tests {
             tpm: None,
             secure_boot: false,
             freeze_fs: false,
+            firmware_epoch: 0,
         }
     }
 
@@ -9296,6 +9309,66 @@ time.sleep(60)
         let _hv = QemuHypervisor::new(cfg).await.unwrap();
         assert_eq!(*seen.lock().unwrap(), ["guest-fsfreeze-thaw"]);
         assert!(!dir.join(agent::FSFROZEN_MARK).exists());
+    }
+
+    /// 에이전트 잠금은 얼리기부터 녹이기까지만 쥔다(리뷰 1 C1). 그 사이 ping은 기다리지 않고 답 없음, 정보는 바쁨이며,
+    /// 녹인 뒤에는 곧바로 답한다.
+    #[tokio::test]
+    async fn the_agent_lock_covers_only_the_freeze_window() {
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        let paths = hv.paths(id).unwrap();
+        let seen = fake_agent(&paths.qga_socket, |_| Some(json!({ "return": 0 })));
+        let handle = hv.handle(id).unwrap();
+        let mut freezer = Freezer::new(true, &handle.paths, &handle.agent);
+        freezer.freeze(id).await;
+        let start = std::time::Instant::now();
+        assert!(!hv.guest_ping(id).await.unwrap());
+        let err = hv.guest_info(id).await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::GuestAgent(m) if m.contains("busy")),
+            "{err}"
+        );
+        assert!(start.elapsed() < AGENT_LOCK_WAIT * 3);
+        freezer.thaw(id).await;
+        assert!(hv.guest_ping(id).await.unwrap());
+        assert_eq!(freezer.outcome(), Quiesced::Yes);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["guest-fsfreeze-freeze", "guest-fsfreeze-thaw", "guest-ping"]
+        );
+    }
+
+    /// 녹이지 못해 표시가 남으면 다음 ping·정보 수집이 먼저 녹인다(리뷰 1 I4). 녹이기 전에 버려진 얼리기도 녹인다.
+    #[tokio::test]
+    async fn file_systems_left_frozen_are_thawed_by_the_next_poll() {
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        let paths = hv.paths(id).unwrap();
+        let mark = paths.dir.join(agent::FSFROZEN_MARK);
+        let seen = fake_agent(&paths.qga_socket, |_| Some(json!({ "return": 0 })));
+        std::fs::write(&mark, b"").unwrap();
+        assert!(hv.guest_ping(id).await.unwrap());
+        assert_eq!(*seen.lock().unwrap(), ["guest-fsfreeze-thaw", "guest-ping"]);
+        assert!(!mark.exists());
+
+        seen.lock().unwrap().clear();
+        let handle = hv.handle(id).unwrap();
+        let mut freezer = Freezer::new(true, &handle.paths, &handle.agent);
+        freezer.freeze(id).await;
+        assert!(mark.exists());
+        drop(freezer);
+        for _ in 0..100 {
+            if !mark.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!mark.exists());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["guest-fsfreeze-freeze", "guest-fsfreeze-thaw"]
+        );
     }
 
     #[tokio::test]

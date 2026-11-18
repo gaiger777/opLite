@@ -4,7 +4,9 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
-use opl_types::firmware::{TpmSource, firmware_copy_nodes, tpm_source, tpm_unavailable};
+use opl_types::firmware::{
+    TpmSource, firmware_copy_nodes, move_firmware_node, tpm_source, tpm_unavailable,
+};
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
 use opl_types::placement::HaGroupSpec;
@@ -123,11 +125,33 @@ struct GuestPoll {
     next: Instant,
 }
 
-/// 이 노드의 TPM 상태 파일을 마지막으로 본 모습(크기·mtime)과 그 SHA-256
+/// 이 노드의 TPM 상태 파일을 마지막으로 본 모습과 그 SHA-256
 struct TpmSeen {
+    /// 파일을 알아보는 열쇠(크기, mtime, inode, ctime). swtpm은 임시 파일을 rename하므로 inode가, 같은 초 안의 같은
+    /// 크기 쓰기는 ctime(나노초)이 바뀐 것을 알린다(리뷰 1 M2).
+    key: FileKey,
+    sha256: String,
+}
+
+/// [`TpmSeen`]의 파일 열쇠
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileKey {
     len: u64,
     modified: std::time::SystemTime,
-    sha256: String,
+    ino: u64,
+    ctime: (i64, i64),
+}
+
+impl FileKey {
+    fn of(meta: &std::fs::Metadata) -> std::io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified()?,
+            ino: meta.ino(),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1439,8 +1463,10 @@ impl Worker {
                 match fetcher.fetch_tpm(self.id, node, &hash, epoch).await {
                     Ok(()) => {
                         tracing::info!(vm = %self.id, from = %node, "fetched the TPM state");
-                        // 변수도 TPM 상태를 준 노드에서 받는다(사본은 둘을 함께 둔다).
+                        // 변수도 TPM 상태를 준 노드에서 받는다(사본은 둘을 함께 둔다). 이 노드가 `firmware_node`면(TPM을
+                        // 끈 동안 옮겨 옴) 이 노드의 변수가 지금 것이다.
                         if vm.spec.firmware == Firmware::Uefi
+                            && vm.status.firmware_node != Some(self.config.node)
                             && let Err(e) = fetcher.fetch(self.id, node).await
                         {
                             tracing::warn!(vm = %self.id, from = %node, error = %e, "cannot fetch UEFI variables; starting with this node's copy");
@@ -1456,7 +1482,8 @@ impl Worker {
                 }
             }
         }
-        let holder = vm.status.firmware_node.map(|id| {
+        let me = self.config.node;
+        let holder = vm.status.firmware_node.filter(|id| *id != me).map(|id| {
             nodes
                 .iter()
                 .find(|n| n.id == id)
@@ -1465,7 +1492,8 @@ impl Worker {
         Err(tpm_unavailable(&vm.name, holder.as_deref()))
     }
 
-    /// 이 노드에 있는 VM의 TPM 상태 파일의 SHA-256. 없으면 None이다. 크기·mtime이 지난번과 같으면 다시 셈하지 않는다.
+    /// 이 노드에 있는 VM의 TPM 상태 파일의 SHA-256. 없으면 None이다. 크기·mtime·inode·ctime이 지난번과 같으면 다시 셈하지
+    /// 않는다.
     async fn tpm_hash(&mut self, dir: &std::path::Path) -> std::io::Result<Option<String>> {
         use sha2::{Digest, Sha256};
         let path = opl_driver::tpm_state_path(dir, self.id);
@@ -1477,17 +1505,15 @@ impl Worker {
             }
             Err(e) => return Err(e),
         };
-        let (len, modified) = (meta.len(), meta.modified()?);
+        let key = FileKey::of(&meta)?;
         if let Some(seen) = &self.tpm_seen
-            && seen.len == len
-            && seen.modified == modified
+            && seen.key == key
         {
             return Ok(Some(seen.sha256.clone()));
         }
         let sha256 = hex::encode(Sha256::digest(tokio::fs::read(&path).await?));
         self.tpm_seen = Some(TpmSeen {
-            len,
-            modified,
+            key,
             sha256: sha256.clone(),
         });
         Ok(Some(sha256))
@@ -1651,12 +1677,11 @@ impl Worker {
 
     /// UEFI VM이 이 노드의 변수 파일로 돈다: 이 노드를 `firmware_node`로 남긴다. BIOS VM은 그대로 둔다. 다른 노드에서
     /// 넘어왔으면(마이그레이션을 확정보다 먼저 넘겨받음) 펌웨어 사본은 비운다(계획 59 §10, 해시 기록 뒤 다시 밀어 둔다).
+    /// TPM을 끈 채 넘어왔으면 TPM 상태를 가진 앞 노드를 사본으로 남긴다([`move_firmware_node`]).
     fn own_firmware(&self, vm: &Vm, status: &mut VmStatus) {
         if vm.spec.firmware == Firmware::Uefi {
-            if status.firmware_node != Some(self.config.node) {
-                status.firmware_copies.clear();
-            }
-            status.firmware_node = Some(self.config.node);
+            let tpm = vm.spec.tpm || status.hardware.as_ref().is_some_and(|hw| hw.tpm);
+            move_firmware_node(status, self.config.node, tpm);
         }
     }
 
@@ -2044,6 +2069,25 @@ fn postmigrate() -> RuntimeStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 크기·mtime이 같아도 다른 파일로 바뀌면(rename) TPM 해시 캐시의 열쇠가 다르다(리뷰 1 M2).
+    #[test]
+    fn the_tpm_hash_key_sees_a_replaced_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tpm2-00.permall");
+        std::fs::write(&path, b"aaaa").unwrap();
+        let first = std::fs::metadata(&path).unwrap();
+        let before = FileKey::of(&first).unwrap();
+        let other = tmp.path().join("new");
+        std::fs::write(&other, b"bbbb").unwrap();
+        let file = std::fs::File::options().write(true).open(&other).unwrap();
+        file.set_modified(first.modified().unwrap()).unwrap();
+        drop(file);
+        std::fs::rename(&other, &path).unwrap();
+        let after = FileKey::of(&std::fs::metadata(&path).unwrap()).unwrap();
+        assert_eq!((after.len, after.modified), (before.len, before.modified));
+        assert_ne!(after, before);
+    }
 
     /// 리더가 포기하며 오류를 쓴 사이 이 작업자가 꺼진 VM의 요청만 지웠으면 리더의 오류와 기록을 지킨다.
     #[test]

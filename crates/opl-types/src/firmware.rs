@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use crate::node::{Node, ha_capable};
 use crate::placement::HaGroupSpec;
-use crate::vm::Vm;
+use crate::vm::{Vm, VmStatus};
 
 /// 펌웨어 사본을 두는 노드 수의 상한
 pub const MAX_FIRMWARE_COPIES: usize = 3;
@@ -29,7 +29,8 @@ pub enum TpmSource {
 /// TPM VM `vm`을 노드 `node`에서 켤 때 TPM 상태를 얻는 곳(설계 §5의 켜기 규칙). `local_hash`는 이 노드에 있는 TPM
 /// 상태 파일의 SHA-256이다(없으면 None). `nodes`로 온라인 여부와 이름을 본다.
 ///
-/// 1. `firmware_node`가 이 노드이거나 이 노드의 파일 해시가 `tpm_sha256`과 같으면 [`TpmSource::Local`]
+/// 1. 이 노드의 파일 해시가 `tpm_sha256`과 같거나, `firmware_node`가 이 노드이고 파일이 있으면(그 노드의 파일은 해시
+///    기록 뒤에 바뀌었을 수 있다) [`TpmSource::Local`]. `firmware_node`라도 파일이 없으면(TPM을 끈 동안 옮겨 옴) 받는다.
 /// 2. 아니면 온라인인 `firmware_node`, 그다음 온라인인 `firmware_copies`에서 받는다([`TpmSource::Fetch`]).
 /// 3. `tpm_sha256`이 없으면(이것을 가장 먼저 본다) [`TpmSource::Fresh`]: 이 노드에 파일이 있으면 드라이버가 그대로
 ///    쓴다. 설계는 `firmware_node`도 없을 때만 새로 만들었으나, UEFI 변수만 있던 VM(`firmware_node` 있음)에 TPM을
@@ -39,7 +40,7 @@ pub fn tpm_source(vm: &Vm, node: Uuid, local_hash: Option<&str>, nodes: &[Node])
     let Some(hash) = vm.status.tpm_sha256.as_deref() else {
         return TpmSource::Fresh;
     };
-    if vm.status.firmware_node == Some(node) || local_hash == Some(hash) {
+    if local_hash == Some(hash) || (vm.status.firmware_node == Some(node) && local_hash.is_some()) {
         return TpmSource::Local;
     }
     let online = |id: Uuid| nodes.iter().any(|n| n.id == id && n.status.online);
@@ -57,13 +58,29 @@ pub fn tpm_source(vm: &Vm, node: Uuid, local_hash: Option<&str>, nodes: &[Node])
     if !from.is_empty() {
         return TpmSource::Fetch(from);
     }
-    let holder = vm.status.firmware_node.map(|id| {
+    // 이 노드가 `firmware_node`인데 파일이 없으면 오프라인 보유 노드를 알 수 없다.
+    let holder = vm.status.firmware_node.filter(|id| *id != node).map(|id| {
         nodes
             .iter()
             .find(|n| n.id == id)
             .map_or_else(|| id.to_string(), |n| n.name.clone())
     });
     TpmSource::Unavailable(tpm_unavailable(&vm.name, holder.as_deref()))
+}
+
+/// UEFI VM의 `firmware_node`를 `to`(그 VM의 변수 파일로 도는 노드)로 옮긴다. `tpm_here`면(TPM VM으로 돈다 — TPM 상태도
+/// `to`로 왔다) 사본은 낡으므로 비운다. 아니면(TPM을 끈 채 옮겨 감) 기록된 TPM 상태(`tpm_sha256`)는 앞 노드에 그대로
+/// 있으므로 앞 `firmware_node`를 사본 노드로 남겨 TPM을 다시 켤 때 거기서 받게 한다(리뷰 1 I2).
+pub fn move_firmware_node(status: &mut VmStatus, to: Uuid, tpm_here: bool) {
+    let Some(old) = status.firmware_node.replace(to).filter(|old| *old != to) else {
+        return;
+    };
+    if tpm_here || status.tpm_sha256.is_none() {
+        status.firmware_copies.clear();
+    } else {
+        status.firmware_copies.retain(|c| *c != to && *c != old);
+        status.firmware_copies.insert(0, old);
+    }
 }
 
 /// TPM 상태를 얻지 못해 VM을 켜지 않을 때의 문구. `holder`는 `firmware_node`의 이름이다(없으면 None).
@@ -183,10 +200,21 @@ mod tests {
         assert_eq!(tpm_source(&v, a.id, None, &nodes), TpmSource::Fresh);
         assert_eq!(tpm_source(&v, b.id, None, &nodes), TpmSource::Fresh);
 
-        // 1. firmware_node가 이 노드이거나 이 노드의 해시가 같다.
+        // 1. firmware_node가 이 노드이고 파일이 있거나(해시는 달라도 된다) 이 노드의 해시가 같다.
         v.status.tpm_sha256 = Some(hash.clone());
-        assert_eq!(tpm_source(&v, a.id, None, &nodes), TpmSource::Local);
+        assert_eq!(tpm_source(&v, a.id, Some("00"), &nodes), TpmSource::Local);
         assert_eq!(tpm_source(&v, b.id, Some(&hash), &nodes), TpmSource::Local);
+        // firmware_node인데 파일이 없으면(TPM을 끈 채 옮겨 옴, 리뷰 1 I2) 사본에서 받고, 없으면 켜지 않는다.
+        v.status.firmware_copies = vec![b.id];
+        assert_eq!(
+            tpm_source(&v, a.id, None, &nodes),
+            TpmSource::Fetch(vec![b.id])
+        );
+        v.status.firmware_copies.clear();
+        let TpmSource::Unavailable(msg) = tpm_source(&v, a.id, None, &nodes) else {
+            panic!("expected unavailable");
+        };
+        assert!(msg.starts_with("no online node holds"), "{msg}");
         // 2·3. firmware_node가 먼저, 그다음 사본(이 노드와 겹치는 것은 뺀다).
         v.status.firmware_copies = vec![b.id, c.id, a.id];
         assert_eq!(
@@ -220,6 +248,32 @@ mod tests {
             tpm_source(&v, b.id, None, &nodes),
             TpmSource::Fetch(vec![c.id])
         );
+    }
+
+    /// TPM을 끈 채 다른 노드로 옮기면 TPM 상태를 가진 앞 노드를 사본으로 남긴다(리뷰 1 I2). TPM VM으로 옮기면(상태도
+    /// 옮겨 옴) 사본을 비운다.
+    #[test]
+    fn moving_the_firmware_node_keeps_the_tpm_holder() {
+        let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let mut status = VmStatus {
+            firmware_node: Some(a),
+            firmware_copies: vec![c, b],
+            tpm_sha256: Some("ab".repeat(32)),
+            ..Default::default()
+        };
+        move_firmware_node(&mut status, a, false);
+        assert_eq!(status.firmware_copies, [c, b]);
+        move_firmware_node(&mut status, b, false);
+        assert_eq!(status.firmware_node, Some(b));
+        assert_eq!(status.firmware_copies, [a, c]);
+        move_firmware_node(&mut status, c, true);
+        assert_eq!(status.firmware_node, Some(c));
+        assert!(status.firmware_copies.is_empty());
+        // 기록된 TPM 상태가 없으면 지킬 것이 없다.
+        status.tpm_sha256 = None;
+        status.firmware_copies = vec![a];
+        move_firmware_node(&mut status, b, false);
+        assert!(status.firmware_copies.is_empty());
     }
 
     fn node_offline(n: &Node) -> Node {

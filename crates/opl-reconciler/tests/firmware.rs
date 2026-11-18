@@ -177,6 +177,7 @@ async fn received_vm_is_not_fetched() {
         tpm: None,
         secure_boot: false,
         freeze_fs: false,
+        firmware_epoch: 0,
     };
     env.hv
         .start_incoming(&spec, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])

@@ -1069,6 +1069,9 @@ pub(super) async fn delete(ctx: &Ctx, vm_id: Uuid, id: Uuid) -> Result<(), Strin
             Err(e) => return Err(format!("cannot remove {what} copy: {e}")),
         }
     }
+    if let Some(node) = snapshot.status.tpm_node {
+        super::firmware::purge_snapshot_copy(ctx, vm_id, id, node).await?;
+    }
 
     let (_, all) = ctx
         .cluster
@@ -1125,6 +1128,7 @@ mod tests {
             tpm: None,
             secure_boot: false,
             freeze_fs: false,
+            firmware_epoch: 0,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

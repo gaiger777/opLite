@@ -2673,6 +2673,82 @@ async fn tpm_state_is_fetched_only_when_its_hash_matches() {
     assert_eq!(err, TpmStateError::NotFound);
 }
 
+/// 펌웨어 파일 지우기(리뷰 1 I5): 회차가 다른(초기화 전) 파일만 지우고, 스냅샷 사본은 늘 지운다. 그 노드에서 VM이
+/// 돌면 초기화 지우기를 거절한다.
+#[tokio::test]
+async fn firmware_purge_removes_old_files_only() {
+    let templates = TempDir::new().unwrap();
+    let uefi = templates.path().join("vars.fd");
+    std::fs::write(&uefi, vec![0u8; 4096]).unwrap();
+    let t = VarsTemplates {
+        uefi,
+        secure_boot: None,
+    };
+    let (_ca, _root, nodes, target) = with_target(|s| s.with_firmware_copies(t)).await;
+    let vm = Uuid::now_v7();
+    let dir = &target.state_dir;
+    let permall = tpm_state_path(dir, vm);
+    let vars = uefi_vars_path(dir, vm);
+    let snap = Uuid::now_v7();
+    let snap_tpm = permall
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(format!("snapshots/{snap}.tpm"));
+    std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(snap_tpm.parent().unwrap()).unwrap();
+    std::fs::write(&permall, b"tpm").unwrap();
+    std::fs::write(&vars, b"vars").unwrap();
+    std::fs::write(&snap_tpm, b"snap tpm").unwrap();
+    opl_driver::write_firmware_epoch(dir, vm, 2).unwrap();
+    let peers = &nodes[0].peers;
+    let purge = |epoch: u32| opl_peer::PurgeFirmwareRequest {
+        vm,
+        epoch: Some(epoch),
+        uefi_vars: false,
+        tpm: true,
+        snapshot: None,
+    };
+    // 이미 새 회차면 남긴다.
+    peers
+        .purge_firmware(target.id(), &target.addr, purge(2))
+        .await
+        .unwrap();
+    assert!(permall.exists());
+    peers
+        .purge_firmware(target.id(), &target.addr, purge(3))
+        .await
+        .unwrap();
+    assert!(!permall.exists());
+    assert!(vars.exists());
+    assert!(snap_tpm.exists());
+    let snapshot = opl_peer::PurgeFirmwareRequest {
+        snapshot: Some(snap),
+        ..purge(3)
+    };
+    peers
+        .purge_firmware(target.id(), &target.addr, snapshot)
+        .await
+        .unwrap();
+    assert!(!snap_tpm.exists());
+
+    let spec: VmRuntimeSpec = serde_json::from_value(serde_json::json!({
+        "id": vm, "name": "win", "cpu": {"sockets": 1, "cores": 1}, "memory_mib": 256,
+        "firmware": "uefi", "machine": "virt", "disks": [], "nics": []
+    }))
+    .unwrap();
+    target.hv.start(&spec, None).await.unwrap();
+    let err = peers
+        .purge_firmware(target.id(), &target.addr, purge(4))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, TpmStateError::Invalid(m) if m.contains("running")),
+        "{err:?}"
+    );
+}
+
 /// 밀어 둔 사본은 TPM 해시와 변수 크기가 맞을 때 두고 회차를 적는다. 해시가 다르거나 VM이 그 노드에서 돌면 거절한다.
 #[tokio::test]
 async fn firmware_copies_are_checked_before_they_are_kept() {
@@ -2766,6 +2842,15 @@ async fn firmware_copies_are_checked_before_they_are_kept() {
         std::fs::read(uefi_vars_path(&target.state_dir, vm)).unwrap(),
         vars
     );
+    // 회차가 바뀐 사본에 변수가 없으면(보내는 노드에 없음) 이 노드의 낡은 변수를 지운다(리뷰 1 C2).
+    let mut newer = push(sha256_hex(&tpm), None, false);
+    newer.epoch = 4;
+    peers
+        .push_firmware(target.id(), &target.addr, newer)
+        .await
+        .unwrap();
+    assert!(!uefi_vars_path(&target.state_dir, vm).exists());
+    assert_eq!(read_firmware_epoch(&target.state_dir, vm).unwrap(), 4);
 
     // 그 노드에서 도는 VM에는 두지 않는다.
     let spec: VmRuntimeSpec = serde_json::from_value(serde_json::json!({

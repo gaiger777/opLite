@@ -254,6 +254,59 @@ impl Binary for PushFirmwareReply {
     }
 }
 
+/// 펌웨어 파일 지우기(`PurgeFirmware`, 리뷰 1 I5): 초기화 Task가 다른 노드에 남은 초기화 전 TPM 상태·UEFI 변수(비밀)를,
+/// 스냅샷 지우기 Task가 다른 노드에 둔 스냅샷의 TPM·변수 사본을 지운다.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PurgeFirmwareRequest {
+    pub vm: Uuid,
+    /// 초기화 뒤의 회차. 있으면 이 노드의 회차가 이와 다를 때(초기화 전 파일) `uefi_vars`·`tpm`을 지운다. 이 노드에서
+    /// VM이 돌면 거절한다.
+    #[serde(default)]
+    pub epoch: Option<u32>,
+    #[serde(default)]
+    pub uefi_vars: bool,
+    #[serde(default)]
+    pub tpm: bool,
+    /// 있으면 이 스냅샷의 변수·TPM 사본(`{state}/vm/{vm}/snapshots/{id}.vars|.tpm`)을 지운다.
+    #[serde(default)]
+    pub snapshot: Option<Uuid>,
+}
+
+/// `PurgeFirmware`의 답(내용 없음)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PurgeFirmwareReply {}
+
+/// 받는 쪽: [`PurgeFirmwareRequest`]대로 이 노드의 파일을 지운다(없으면 성공).
+pub(crate) fn purge(state_dir: &Path, req: &PurgeFirmwareRequest) -> std::io::Result<()> {
+    let gone = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    let dir = opl_driver::vm_state_dir(state_dir, req.vm);
+    if let Some(snapshot) = req.snapshot {
+        for ext in ["vars", "tpm"] {
+            gone(std::fs::remove_file(
+                dir.join("snapshots").join(format!("{snapshot}.{ext}")),
+            ))?;
+        }
+    }
+    if let Some(epoch) = req.epoch
+        && opl_driver::read_firmware_epoch(state_dir, req.vm).ok() != Some(epoch)
+    {
+        if req.uefi_vars {
+            gone(std::fs::remove_file(opl_driver::uefi_vars_path(
+                state_dir, req.vm,
+            )))?;
+        }
+        if req.tpm {
+            gone(std::fs::remove_dir_all(opl_driver::vm_tpm_dir(
+                state_dir, req.vm,
+            )))?;
+        }
+    }
+    Ok(())
+}
+
 /// 받는 노드의 UEFI 변수 템플릿. 밀어 둔 변수 파일의 크기가 VM에 맞는 템플릿과 다르면(다른 펌웨어 빌드) 받지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VarsTemplates {
@@ -306,6 +359,7 @@ pub(crate) async fn receive_push(
             "the TPM state does not match its SHA-256",
         ));
     }
+    let has_vars = req.vars.is_some();
     if let Some(vars) = req.vars {
         let template = if req.secure_boot {
             templates.secure_boot.as_deref().ok_or_else(|| {
@@ -345,7 +399,12 @@ pub(crate) async fn receive_push(
     )
     .await
     .map_err(invalid)?;
-    opl_driver::write_firmware_epoch(state_dir, req.vm, req.epoch)
+    // 회차가 바뀌면 받지 않은 낡은 변수를 지운다(리뷰 1 C2).
+    let keep = opl_driver::KeepFirmware {
+        vars: has_vars,
+        tpm: true,
+    };
+    opl_driver::adopt_firmware_epoch(state_dir, req.vm, req.epoch, keep)
         .map_err(|e| Status::internal(format!("cannot record the firmware epoch: {e}")))
 }
 

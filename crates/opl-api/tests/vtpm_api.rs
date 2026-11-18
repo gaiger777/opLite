@@ -325,7 +325,9 @@ async fn secure_boot_changes_with_a_reset_of_the_uefi_variables() {
         )
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
-    assert!(get_vm(&env, id).spec.secure_boot);
+    // 스펙은 Task가 초기화와 함께 쓴다(리뷰 1 M1).
+    assert_eq!(task["spec"]["op"]["secure_boot"], true, "{task}");
+    assert!(!get_vm(&env, id).spec.secure_boot);
     let (status, body) = admin.post("/vms/win/actions/start", Value::Null).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_busy");
@@ -334,6 +336,7 @@ async fn secure_boot_changes_with_a_reset_of_the_uefi_variables() {
     assert_eq!(body["code"], "vm_busy");
     env.start_runner().await;
     succeeded(&admin.wait_task(&task).await);
+    assert!(get_vm(&env, id).spec.secure_boot);
     // TPM VM의 변수만 초기화는 TPM 상태의 자리를 지킨다.
     assert_eq!(get_vm(&env, id).status.firmware_node, Some(env.node));
     let entries = audit_entries(&env, |es| {

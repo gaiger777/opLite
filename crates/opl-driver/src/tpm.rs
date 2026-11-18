@@ -81,6 +81,54 @@ pub fn write_firmware_epoch(state_dir: &Path, id: Uuid, epoch: u32) -> std::io::
     std::fs::rename(&tmp, dir.join(EPOCH_FILE))
 }
 
+/// [`adopt_firmware_epoch`]가 남길 이 노드의 펌웨어 파일
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeepFirmware {
+    /// UEFI 변수(막 받았다)
+    pub vars: bool,
+    /// TPM 상태(막 받았거나 해시가 VM의 지금 `tpm_sha256`과 같다)
+    pub tpm: bool,
+}
+
+/// 다른 노드에서 펌웨어 파일을 받은 뒤 이 노드의 회차를 VM의 `epoch`로 옮긴다(리뷰 1 C2). 이 노드의 회차가 다르면
+/// 이 노드의 파일은 초기화 전의 것이므로, `keep`에 없는 파일(받지 않은 변수, 지금 것이 아닌 TPM 상태)을 지운 뒤
+/// 회차를 적는다. 회차만 적으면 받지 않은 낡은 파일이 지금 것으로 보여 켤 때 지워지지 않는다(초기화가 되살아난다).
+pub fn adopt_firmware_epoch(
+    state_dir: &Path,
+    id: Uuid,
+    epoch: u32,
+    keep: KeepFirmware,
+) -> std::io::Result<()> {
+    if read_firmware_epoch(state_dir, id).ok() != Some(epoch) {
+        if !keep.vars {
+            remove_file(&crate::qemu::uefi_vars_path(state_dir, id))?;
+        }
+        if !keep.tpm {
+            match std::fs::remove_dir_all(vm_tpm_dir(state_dir, id)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+    }
+    write_firmware_epoch(state_dir, id, epoch)
+}
+
+/// TPM이 없는 UEFI VM을 켜기 전에(리뷰 1 I1): 이 노드의 회차가 VM의 `epoch`와 다르면 이 노드의 UEFI 변수는 초기화
+/// 전의 것이므로 지우고 회차를 적는다. 회차 파일이 없고 VM의 회차가 0이면(초기화한 적 없음) 아무것도 쓰지 않는다.
+pub(crate) fn prepare_vars(
+    state_dir: &Path,
+    id: Uuid,
+    epoch: u32,
+    uefi_vars: &Path,
+) -> Result<(), DriverError> {
+    if read_firmware_epoch(state_dir, id).ok() != Some(epoch) {
+        tracing::info!(%id, epoch, "UEFI variables on this node are from before a reset; removing them");
+        remove_file(uefi_vars)?;
+        write_firmware_epoch(state_dir, id, epoch)?;
+    }
+    Ok(())
+}
+
 /// 켜기 전에 TPM 상태를 맞춘다.
 ///
 /// 1. `tpm.epoch`가 이 노드의 회차와 다르면 이 노드의 파일은 초기화 전의 것이다. UEFI 변수(`uefi_vars`)를 지우고,
@@ -309,17 +357,102 @@ pub(crate) async fn terminate(paths: &RuntimePaths) -> bool {
 }
 
 /// 이 노드가 TPM 2.0 VM을 켤 수 있는지: `swtpm`·`swtpm_setup`이 있고, `swtpm socket --print-capabilities`에
-/// `tpm-2.0`이 있고, `qemu -tpmdev help`에 `emulator`가 있다. 읽지 못하면 못 하는 것이다.
-pub(crate) async fn tpm_capable(cfg: &SwtpmConfig, qemu_binary: &Path) -> bool {
+/// `tpm-2.0`이 있고, `qemu -tpmdev help`에 `emulator`가 있고, 실제 상태·실행 디렉터리(`state_dir`·`run_dir`의
+/// `vm/{id}`)에서 swtpm을 한 번 띄워 볼 수 있다([`try_swtpm`]). 마지막 것은 AppArmor(Ubuntu의 swtpm 프로필) 같은 막힘을
+/// VM 켜기 실패가 아니라 능력 없음으로 알리려는 것이다(리뷰 1 I6). 읽지 못하면 못 하는 것이다.
+pub(crate) async fn tpm_capable(
+    cfg: &SwtpmConfig,
+    qemu_binary: &Path,
+    state_dir: &Path,
+    run_dir: &Path,
+) -> bool {
     if !installed(&cfg.swtpm) || !installed(&cfg.swtpm_setup) {
         return false;
     }
     let caps = probe(&cfg.swtpm, &["socket", "--print-capabilities"]).await;
     let help = probe(qemu_binary, &["-tpmdev", "help"]).await;
-    match (caps, help) {
+    let listed = match (caps, help) {
         (Some(caps), Some(help)) => tpm_caps(&caps, &help),
         _ => false,
+    };
+    if !listed {
+        return false;
     }
+    match try_swtpm(cfg, state_dir, run_dir).await {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "swtpm cannot run with this node's state and run directories \
+                (on Ubuntu/Debian check the AppArmor include /etc/apparmor.d/abstractions/orbivisor-swtpm); TPM is off on this node");
+            false
+        }
+    }
+}
+
+/// 버릴 VM id의 상태·실행 디렉터리(`{state}/vm/{id}/tpm`, `{run}/vm/{id}`)에서 VM과 같은 인자로 swtpm을 띄워 제어
+/// 소켓과 pid 파일이 생기는지 본다([`PROBE_TIMEOUT`]까지). 띄운 swtpm은 끝내고 두 디렉터리를 지운다.
+async fn try_swtpm(cfg: &SwtpmConfig, state_dir: &Path, run_dir: &Path) -> Result<(), String> {
+    let id = Uuid::now_v7();
+    let paths = RuntimePaths::new(run_dir, id).map_err(|e| e.to_string())?;
+    let state = vm_state_dir(state_dir, id);
+    let result = run_swtpm(cfg, &state.join("tpm"), &paths).await;
+    for dir in [&state, &paths.dir] {
+        if let Err(e) = std::fs::remove_dir_all(dir)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(dir = %dir.display(), error = %e, "cannot remove the swtpm probe directory");
+        }
+    }
+    result
+}
+
+async fn run_swtpm(cfg: &SwtpmConfig, tpm_dir: &Path, paths: &RuntimePaths) -> Result<(), String> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(tpm_dir)
+        .map_err(|e| format!("cannot create {}: {e}", tpm_dir.display()))?;
+    std::fs::set_permissions(tpm_dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&paths.dir)
+        .map_err(|e| format!("cannot create {}: {e}", paths.dir.display()))?;
+    let mut args = swtpm_args(paths, tpm_dir);
+    // 떼어 내지 않고(`--daemon`·`--terminate` 빼기) 자식으로 두어 확인한 뒤 끝낸다.
+    args.retain(|a| a != "--daemon" && a != "--terminate");
+    args.extend(["--flags".into(), "not-need-init,startup-clear".into()]);
+    let mut child = tokio::process::Command::new(&cfg.swtpm)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("swtpm: {e}"))?;
+    let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
+    let outcome = loop {
+        if paths.tpm_socket.exists() && paths.tpm_pidfile.exists() {
+            break Ok(());
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            let mut msg = String::new();
+            if let Some(mut err) = child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = err.read_to_string(&mut msg).await;
+            }
+            if let Ok(log) = std::fs::read_to_string(paths.dir.join(LOG_FILE)) {
+                msg.push_str(&log);
+            }
+            break Err(format!("swtpm exited ({status}): {}", msg.trim()));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break Err("swtpm did not create its control socket in time".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _ = child.start_kill();
+    let _ = tokio::time::timeout(KILL_TIMEOUT, child.wait()).await;
+    outcome
 }
 
 /// `--print-capabilities`(JSON의 `features`)와 `-tpmdev help` 출력으로 본 TPM 2.0 능력
@@ -446,6 +579,60 @@ mod tests {
             tpm_state_path(tmp.path(), id),
             vm_state_dir(tmp.path(), id).join("tpm/tpm2-00.permall")
         );
+    }
+
+    /// 받은 뒤 회차를 옮기면 받지 않은 낡은 파일을 지운다(리뷰 1 C2). 회차가 같으면 아무것도 지우지 않는다.
+    #[test]
+    fn adopting_a_new_epoch_removes_files_not_received() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::now_v7();
+        let vars = crate::qemu::uefi_vars_path(tmp.path(), id);
+        let permall = tpm_state_path(tmp.path(), id);
+        let put = || {
+            std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+            std::fs::write(&vars, b"vars").unwrap();
+            std::fs::write(&permall, b"tpm").unwrap();
+        };
+        // 변수만 받았다(TPM 초기화 뒤 새로 켤 차례): 낡은 TPM을 지운다.
+        put();
+        let only_vars = KeepFirmware {
+            vars: true,
+            tpm: false,
+        };
+        adopt_firmware_epoch(tmp.path(), id, 1, only_vars).unwrap();
+        assert!(vars.exists());
+        assert!(!permall.exists());
+        assert_eq!(read_firmware_epoch(tmp.path(), id).unwrap(), 1);
+        // 같은 회차면 지우지 않는다.
+        put();
+        adopt_firmware_epoch(tmp.path(), id, 1, only_vars).unwrap();
+        assert!(permall.exists());
+        // TPM만 받았다: 낡은 변수를 지운다.
+        let only_tpm = KeepFirmware {
+            vars: false,
+            tpm: true,
+        };
+        adopt_firmware_epoch(tmp.path(), id, 2, only_tpm).unwrap();
+        assert!(!vars.exists());
+        assert!(permall.exists());
+    }
+
+    /// TPM이 없는 UEFI VM도 회차가 다르면 변수를 지운다(리뷰 1 I1).
+    #[test]
+    fn vars_of_an_older_epoch_are_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = Uuid::now_v7();
+        let vars = crate::qemu::uefi_vars_path(tmp.path(), id);
+        std::fs::create_dir_all(vars.parent().unwrap()).unwrap();
+        std::fs::write(&vars, b"vars").unwrap();
+        prepare_vars(tmp.path(), id, 0, &vars).unwrap();
+        assert!(vars.exists());
+        prepare_vars(tmp.path(), id, 1, &vars).unwrap();
+        assert!(!vars.exists());
+        assert_eq!(read_firmware_epoch(tmp.path(), id).unwrap(), 1);
+        std::fs::write(&vars, b"vars").unwrap();
+        prepare_vars(tmp.path(), id, 1, &vars).unwrap();
+        assert!(vars.exists());
     }
 
     /// 가짜 swtpm·swtpm_setup(`tests/fixtures`, python3)
@@ -668,16 +855,29 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(tpm_capable(&fake_swtpm(), &qemu).await);
+        let dirs = short_tempdir();
+        let (state, run) = (dirs.path().join("state"), dirs.path().join("run"));
+        let capable = |cfg: SwtpmConfig, qemu: PathBuf| {
+            let (state, run) = (state.clone(), run.clone());
+            async move { tpm_capable(&cfg, &qemu, &state, &run).await }
+        };
+        assert!(capable(fake_swtpm(), qemu.clone()).await);
+        // 띄워 본 swtpm은 끝내고 디렉터리를 지운다.
+        assert_eq!(std::fs::read_dir(state.join("vm")).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(run.join("vm")).unwrap().count(), 0);
         let no_setup = SwtpmConfig {
             swtpm_setup: "opl-no-such-swtpm_setup".into(),
             ..fake_swtpm()
         };
-        assert!(!tpm_capable(&no_setup, &qemu).await);
-        assert!(!tpm_capable(&fake_swtpm(), Path::new("/nonexistent/qemu")).await);
+        assert!(!capable(no_setup, qemu.clone()).await);
+        assert!(!capable(fake_swtpm(), "/nonexistent/qemu".into()).await);
+        // 상태 디렉터리에서 swtpm이 막히면(AppArmor 거절 흉내) 능력이 없다.
+        std::fs::write(state.join("fail-swtpm"), b"").unwrap();
+        assert!(!capable(fake_swtpm(), qemu.clone()).await);
+        assert_eq!(std::fs::read_dir(state.join("vm")).unwrap().count(), 0);
         // 기본 설정은 PATH의 swtpm을 찾는다(이 Mac에는 없다).
         if !installed(Path::new("swtpm")) {
-            assert!(!tpm_capable(&SwtpmConfig::default(), &qemu).await);
+            assert!(!capable(SwtpmConfig::default(), qemu).await);
         }
     }
 

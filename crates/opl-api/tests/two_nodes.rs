@@ -523,6 +523,83 @@ async fn uefi_vars_are_fetched_from_the_node_that_has_them() {
     assert_eq!(std::fs::read(&dest).unwrap(), b"vars b");
 }
 
+/// TPM을 초기화한 뒤 변수만 받아 오면 이 노드의 낡은 TPM 상태를 지운다(리뷰 1 C2: 회차만 적으면 낡은 TPM이 지금
+/// 것으로 보여 초기화가 되살아난다). 해시가 지금 것과 같은 TPM 상태는 남긴다.
+#[tokio::test]
+async fn fetching_vars_of_a_newer_epoch_drops_a_stale_tpm_state() {
+    let (root, a, b) = two_nodes().await;
+    let spec: VmSpec = serde_json::from_value(serde_json::json!({
+        "cpu": { "cores": 1 }, "memory_mib": 256, "firmware": "uefi", "machine": "q35", "tpm": true
+    }))
+    .unwrap();
+    let vm = Resource::new("win", spec);
+    a.cluster.create(&vm).await.unwrap();
+    let mut status = vm.status.clone();
+    status.firmware_epoch = 1;
+    a.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    write_vars(
+        &root,
+        &b,
+        vm.id,
+        &std::fs::read(template(&root, &a)).unwrap(),
+    );
+    let permall = opl_driver::tpm_state_path(&state_dir(&root, &a), vm.id);
+    std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+    std::fs::write(&permall, b"old tpm").unwrap();
+    let fetcher = UefiVarsFetcher::new(
+        a.cluster.clone(),
+        a.peers.clone(),
+        state_dir(&root, &a),
+        template(&root, &a),
+    );
+    fetcher.fetch(vm.id, b.id).await.unwrap();
+    assert!(!permall.exists());
+    let dir = state_dir(&root, &a);
+    assert_eq!(opl_driver::read_firmware_epoch(&dir, vm.id).unwrap(), 1);
+
+    // 다음 회차(변수만 초기화)에도 해시가 지금 것인 TPM 상태는 남긴다.
+    std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+    std::fs::write(&permall, b"current tpm").unwrap();
+    status.firmware_epoch = 2;
+    status.tpm_sha256 = Some(opl_peer::sha256_hex(b"current tpm"));
+    a.cluster
+        .update_status::<VmSpec>(vm.id, &status)
+        .await
+        .unwrap();
+    fetcher.fetch(vm.id, b.id).await.unwrap();
+    assert!(permall.exists());
+    assert_eq!(opl_driver::read_firmware_epoch(&dir, vm.id).unwrap(), 2);
+}
+
+/// TPM 초기화는 다른 노드에 남은 초기화 전 TPM 상태(비밀)도 지운다(리뷰 1 I5).
+#[tokio::test]
+async fn a_tpm_reset_removes_old_tpm_states_on_other_nodes() {
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    let mut req = vm_request("win");
+    req["spec"]["tpm"] = serde_json::json!(true);
+    req["spec"]["node"] = serde_json::json!(a.id);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let vm = a.cluster.get_by_name::<VmSpec>("win").unwrap().unwrap();
+    let permall = opl_driver::tpm_state_path(&state_dir(&root, &b), vm.id);
+    std::fs::create_dir_all(permall.parent().unwrap()).unwrap();
+    std::fs::write(&permall, b"old tpm").unwrap();
+    let (status, task) = admin
+        .post(
+            "/vms/win/firmware/reset",
+            serde_json::json!({ "tpm": true }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert!(!permall.exists());
+}
+
 /// 노드의 VM `vm` UEFI 변수 파일에 쓴다.
 fn write_vars(root: &TempDir, node: &Node, vm: Uuid, data: &[u8]) {
     let path = uefi_vars_path(&state_dir(root, node), vm);

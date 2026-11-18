@@ -38,8 +38,8 @@ use uuid::Uuid;
 use crate::ceph::{CephStatusRequest, NodeDisksRequest};
 use crate::fence::FenceStatusRequest;
 use crate::firmware::{
-    Expect, MAX_TPM_BYTES, PushFirmwareRequest, TpmStateError, TpmStateRequest, UefiVarsError,
-    UefiVarsRequest,
+    Expect, MAX_TPM_BYTES, PurgeFirmwareRequest, PushFirmwareRequest, TpmStateError,
+    TpmStateRequest, UefiVarsError, UefiVarsRequest,
 };
 use crate::guest::{GuestAgentError, GuestAgentReply, GuestAgentRequest};
 use crate::metrics::MetricsReply;
@@ -663,6 +663,24 @@ impl Peers {
                 req.set_timeout(PUSH_FIRMWARE_TIMEOUT);
                 addressed(&mut req, Some(to));
                 async move { client.push_firmware(req).await }
+            })
+            .await;
+        reply.map(|_| ()).map_err(Into::into)
+    }
+
+    /// 노드 `to`(첫 링크 `addr`)의 펌웨어 파일을 `req`대로 지운다(리뷰 1 I5). 이 RPC를 모르는 노드는 `Unsupported`다.
+    pub async fn purge_firmware(
+        &self,
+        to: NodeId,
+        addr: &str,
+        req: PurgeFirmwareRequest,
+    ) -> Result<(), TpmStateError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                req.set_timeout(PUSH_FIRMWARE_TIMEOUT);
+                addressed(&mut req, Some(to));
+                async move { client.purge_firmware(req).await }
             })
             .await;
         reply.map(|_| ()).map_err(Into::into)

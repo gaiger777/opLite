@@ -154,7 +154,7 @@ jobs:
   # HA 복구를 본다. 시험 디렉터리는 /tmp 아래라 Ubuntu swtpm AppArmor 프로필(`/tmp/** rwk`)이 막지 않는다.
   linux-kvm:
     runs-on: ubuntu-24.04
-    timeout-minutes: 65
+    timeout-minutes: 80
     # root로 도는 테스트도 runner가 설치한 브라우저를 쓴다.
     env:
       PLAYWRIGHT_BROWSERS_PATH: /home/runner/.cache/ms-playwright
@@ -390,11 +390,12 @@ jobs:
   # 템플릿·연결 복제(계획 58): 같은 클라우드 이미지와 SHA256SUMS를 관리자 카탈로그 항목으로 받아 템플릿을 만들고, 디스크를
   # 늘린 연결 복제 둘이 cloud-init으로 켜져 보고하는지, 기반 파일이 그대로인지, 평탄화한 VM이 다시 켜지는지 본다.
   # vTPM·Secure Boot·게스트 에이전트(계획 59): 같은 클라우드 이미지를 q35·Secure Boot(ovmf의 MS 키 변수)·TPM·게스트
-  # 에이전트로 켜 게스트가 /dev/tpm0·Secure Boot·EK를 보고하는지, `vm guest`가 OS·IP를 보이는지, 다시 켜도 EK가 같고
-  # 복제는 다른지 본다(게스트 안 apt가 1~2분 걸린다).
+  # 에이전트로 켜 게스트가 sysfs의 TPM 2.0·Secure Boot efivar·EK(/dev/tpmrm0의 TPM2_ReadPublic)를 보고하는지, 다시 켜도
+  # EK가 같고 복제는 다른지 본다(보고는 파이썬 표준 라이브러리만 쓴다). `vm guest`의 OS·IP와 에이전트 종료는 게스트가
+  # qemu-guest-agent를 apt로 받았을 때만 본다(1~2분, 받지 못하면 건너뜀).
   install-media:
     runs-on: ubuntu-24.04
-    timeout-minutes: 55
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -8,9 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use opl_cluster::Cluster;
 use opl_cluster::types::NodeId;
-use opl_driver::{tpm_state_path, uefi_vars_path, write_firmware_epoch};
-use opl_peer::{Peers, PushFirmwareRequest, read_chunks, sha256_hex};
-use opl_reconciler::{FirmwareCopy, FirmwareError, FirmwareFetcher};
+use opl_driver::{KeepFirmware, adopt_firmware_epoch, tpm_state_path, uefi_vars_path};
+use opl_peer::{Peers, PurgeFirmwareRequest, PushFirmwareRequest, read_chunks, sha256_hex};
+use opl_reconciler::{FirmwareCopy, FirmwareError, FirmwareFetcher, FirmwarePurge};
 use opl_types::node::NodeSpec;
 use opl_types::vm::VmSpec;
 use uuid::Uuid;
@@ -64,10 +64,22 @@ impl UefiVarsFetcher {
             .ok_or_else(|| FirmwareError(format!("node {node} is not a cluster member")))
     }
 
-    /// 받은 파일을 켤 때 지우지 않도록 이 노드의 펌웨어 회차를 VM의 것으로 적는다.
-    fn record_epoch(&self, vm: Uuid, epoch: u32) -> Result<(), FirmwareError> {
-        write_firmware_epoch(&self.state_dir, vm, epoch)
+    /// 받은 파일을 켤 때 지우지 않도록 이 노드의 펌웨어 회차를 VM의 것으로 옮긴다. 회차가 바뀌면 받지 않은 낡은
+    /// 파일(`keep`에 없는 것)을 먼저 지운다(리뷰 1 C2).
+    fn record_epoch(&self, vm: Uuid, epoch: u32, keep: KeepFirmware) -> Result<(), FirmwareError> {
+        adopt_firmware_epoch(&self.state_dir, vm, epoch, keep)
             .map_err(|e| FirmwareError(format!("cannot record the firmware epoch: {e}")))
+    }
+
+    /// 이 노드의 TPM 상태가 VM의 지금 해시(`tpm_sha256`)와 같은지. 해시가 없으면(초기화 뒤 새로 만들 차례) 아니다.
+    async fn tpm_current(&self, vm: Uuid, sha256: Option<&str>) -> bool {
+        let Some(want) = sha256 else {
+            return false;
+        };
+        match tokio::fs::read(tpm_state_path(&self.state_dir, vm)).await {
+            Ok(data) => sha256_hex(&data) == want,
+            Err(_) => false,
+        }
     }
 }
 
@@ -109,7 +121,11 @@ impl FirmwareFetcher for UefiVarsFetcher {
             .await
             .map_err(|e| FirmwareError(e.to_string()))?;
         match current {
-            Some(v) => self.record_epoch(vm, v.status.firmware_epoch),
+            Some(v) => {
+                let tpm = self.tpm_current(vm, v.status.tpm_sha256.as_deref()).await;
+                let keep = KeepFirmware { vars: true, tpm };
+                self.record_epoch(vm, v.status.firmware_epoch, keep)
+            }
             None => Ok(()),
         }
     }
@@ -132,7 +148,11 @@ impl FirmwareFetcher for UefiVarsFetcher {
             )
             .await
             .map_err(|e| FirmwareError(e.to_string()))?;
-        self.record_epoch(vm, epoch)
+        let keep = KeepFirmware {
+            vars: false,
+            tpm: true,
+        };
+        self.record_epoch(vm, epoch, keep)
     }
 
     async fn push(&self, copy: &FirmwareCopy) -> Result<(), FirmwareError> {
@@ -159,6 +179,21 @@ impl FirmwareFetcher for UefiVarsFetcher {
         };
         self.peers
             .push_firmware(NodeId(copy.to), &addr, req)
+            .await
+            .map_err(|e| FirmwareError(e.to_string()))
+    }
+
+    async fn purge(&self, to: Uuid, purge: &FirmwarePurge) -> Result<(), FirmwareError> {
+        let addr = self.addr(to)?;
+        let req = PurgeFirmwareRequest {
+            vm: purge.vm,
+            epoch: purge.epoch,
+            uefi_vars: purge.uefi_vars,
+            tpm: purge.tpm,
+            snapshot: purge.snapshot,
+        };
+        self.peers
+            .purge_firmware(NodeId(to), &addr, req)
             .await
             .map_err(|e| FirmwareError(e.to_string()))
     }

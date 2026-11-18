@@ -7,6 +7,23 @@ set -eu
 SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
 SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
 APT_SOURCES="${OPL_APT_SOURCES:-/etc/apt/sources.list.d/oplite.sources}"
+APPARMOR_DIR="${OPL_APPARMOR_DIR:-/etc/apparmor.d}"
+SWTPM_INCLUDE='include <abstractions/orbivisor-swtpm>'
+
+# purge는 conffile(abstractions/orbivisor-swtpm)을 지우므로 swtpm 프로필의 local 파일에서 include 줄을 뺀다(남으면
+# 프로필을 읽지 못한다). 다른 줄은 그대로 둔다.
+swtpm_apparmor_purge() {
+	local_file="$APPARMOR_DIR/local/usr.bin.swtpm"
+	[ -f "$local_file" ] && grep -qxF "$SWTPM_INCLUDE" "$local_file" || return 0
+	tmp="$local_file.orbivisor-tmp"
+	grep -vxF "$SWTPM_INCLUDE" "$local_file" >"$tmp" || true
+	cat "$tmp" >"$local_file"
+	rm -f "$tmp"
+	if [ -f "$APPARMOR_DIR/usr.bin.swtpm" ] && command -v aa-enabled >/dev/null 2>&1 &&
+		aa-enabled --quiet 2>/dev/null; then
+		apparmor_parser -r -T -W "$APPARMOR_DIR/usr.bin.swtpm" || true
+	fi
+}
 
 case "$1" in
 remove | purge)
@@ -15,6 +32,7 @@ remove | purge)
 		systemctl disable opld.service || true
 		# systemctl이 없거나 실패해도 링크가 남지 않게 한다.
 		rm -f "$SYSTEMD_ETC/multi-user.target.wants/opld.service"
+		swtpm_apparmor_purge
 	fi
 	if [ -f "$APT_SOURCES" ] && [ "$(head -n 1 "$APT_SOURCES")" = "# managed by opld; edits are overwritten" ]; then
 		rm -f "$APT_SOURCES"

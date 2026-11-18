@@ -47,5 +47,8 @@ pub use storage::{
     ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root, disk_location, is_iso_image,
     parse_ceph_df, parse_lvs, parse_vgs, parse_zfs_dataset, pool_root,
 };
-pub use tpm::{SwtpmConfig, read_firmware_epoch, tpm_state_path, vm_tpm_dir, write_firmware_epoch};
+pub use tpm::{
+    KeepFirmware, SwtpmConfig, adopt_firmware_epoch, read_firmware_epoch, tpm_state_path,
+    vm_tpm_dir, write_firmware_epoch,
+};
 pub use vip::{IpVip, VipAddress, VipNet, VipRecord, release_recorded};

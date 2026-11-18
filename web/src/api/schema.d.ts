@@ -1923,8 +1923,8 @@ export interface paths {
          *     올린다(다른 노드의 사본은 회차가 달라 켤 때 지워진다). `uefi_vars`·`tpm`이 모두 거짓이면 400, VM이 꺼져 있지 않으면
          *     409 `vm_running`, 켜거나 끄는 중이거나 마이그레이션·스냅샷·복제·백업 Task가 끝나지 않았으면 409 `vm_busy`, 모든
          *     노드가 `vtpm`을 알아야 한다(409 `cluster_upgrading`). TPM 상태가 있는 VM의 변수만 초기화는 `firmware_node`가
-         *     오프라인이면 409 `node_unavailable`이다. `secure_boot`를 주면 Task를 만든 뒤 스펙의 `secure_boot`도 바꾼다(UEFI
-         *     펌웨어가 아니면 400). Task가 끝날 때까지 켜기는 409 `vm_busy`다.
+         *     오프라인이면 409 `node_unavailable`이다. `secure_boot`를 주면 Task가 스펙의 `secure_boot`도 바꾼다(UEFI 펌웨어가
+         *     아니면 400). Task가 끝날 때까지 켜기는 409 `vm_busy`다.
          */
         post: operations["reset_firmware"];
         delete?: never;
@@ -7602,6 +7602,11 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "vm-firmware-reset";
+            /**
+             * @description 있으면 Task가 VM 스펙의 `secure_boot`도 이 값으로 바꾼다(UEFI 변수 초기화와 함께, 리뷰 1 M1). 스펙과 초기화를
+             *     한 Task가 쓰므로 API가 실패해도 둘 중 하나만 적용되지 않는다.
+             */
+            secure_boot?: boolean | null;
             tpm?: boolean;
             uefi_vars?: boolean;
         };

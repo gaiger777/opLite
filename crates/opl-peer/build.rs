@@ -149,6 +149,12 @@ fn main() {
                 .build(),
         )
         .method(json(
+            "purge_firmware",
+            "PurgeFirmware",
+            "crate::firmware::PurgeFirmwareRequest",
+            "crate::firmware::PurgeFirmwareReply",
+        ))
+        .method(json(
             "guest_agent",
             "GuestAgent",
             "crate::guest::GuestAgentRequest",

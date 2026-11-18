@@ -44,7 +44,8 @@ check() {
 	fi
 	# OPL_SYSTEMD_ETC·OPL_APT_SOURCES: postrm이 지우는 enable 링크와 소스 파일이 시험 디렉터리 안에 있게 한다.
 	if ! PATH="$WORK/bin:$PATH" OPL_FAKE_LOG="$log" OPL_SYSTEMD_DIR="$systemd_dir" \
-		OPL_SYSTEMD_ETC="$WORK/etc-systemd" OPL_APT_SOURCES="$WORK/oplite.sources" "$DEB_DIR/$1" "${@:2}"; then
+		OPL_SYSTEMD_ETC="$WORK/etc-systemd" OPL_APT_SOURCES="$WORK/oplite.sources" \
+		OPL_APPARMOR_DIR="$WORK/apparmor" "$DEB_DIR/$1" "${@:2}"; then
 		echo "FAIL $name: 스크립트가 0이 아닌 코드로 끝났다"
 		FAILED=1
 		return
@@ -158,6 +159,37 @@ if [ -e "$SOURCES" ]; then echo "ok   upgrade 뒤 소스 파일 남음"; else
 	FAILED=1
 fi
 rm -f "$SOURCES"
+
+# swtpm AppArmor(계획 59): postinst는 swtpm 프로필의 local 파일에 include 줄을 한 번만 더하고, 프로필이 있고
+# AppArmor가 켜져 있으면 다시 읽힌다. purge는 그 줄만 뺀다.
+AA="$WORK/apparmor"
+LOCAL="$AA/local/usr.bin.swtpm"
+INCLUDE='include <abstractions/orbivisor-swtpm>'
+rm -rf "$AA"
+check "AppArmor 프로필 없음(local 파일만)" no "" postinst configure 0.1.0
+check "AppArmor 두 번째 configure" no "" postinst configure 0.1.0
+if [ "$(grep -cxF "$INCLUDE" "$LOCAL")" = 1 ]; then echo "ok   local 파일에 include 한 줄"; else
+	echo "FAIL local 파일: $(cat "$LOCAL")"
+	FAILED=1
+fi
+printf '#include <tunables/global>\n' >"$AA/usr.bin.swtpm"
+printf '#!/bin/sh\n[ "${OPL_FAKE_AA:-yes}" = yes ]\n' >"$WORK/bin/aa-enabled"
+printf '#!/bin/sh\necho "apparmor_parser $*" >>"$OPL_FAKE_LOG"\n' >"$WORK/bin/apparmor_parser"
+chmod 0755 "$WORK/bin/aa-enabled" "$WORK/bin/apparmor_parser"
+check "AppArmor 켜짐: 프로필을 다시 읽힘" no "apparmor_parser -r -T -W $AA/usr.bin.swtpm" postinst configure 0.1.0
+OPL_FAKE_AA=no check "AppArmor 꺼짐: 읽히지 않음" no "" postinst configure 0.1.0
+echo '/srv/tpm/** rwk,' >>"$LOCAL"
+check "postrm remove(include 둠)" no "" postrm remove
+check "postrm purge(include 뺌)" no "disable opld.service
+apparmor_parser -r -T -W $AA/usr.bin.swtpm" postrm purge
+if ! grep -qxF "$INCLUDE" "$LOCAL" && grep -qxF '/srv/tpm/** rwk,' "$LOCAL"; then
+	echo "ok   purge가 include 줄만 뺐다"
+else
+	echo "FAIL purge 뒤 local 파일: $(cat "$LOCAL")"
+	FAILED=1
+fi
+rm -f "$WORK/bin/aa-enabled" "$WORK/bin/apparmor_parser"
+rm -rf "$AA"
 
 # 가짜 systemctl이 실패해도 maintainer 스크립트는 성공해야 한다(|| true).
 cat >"$WORK/bin/systemctl" <<'EOF'
