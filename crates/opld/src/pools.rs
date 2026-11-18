@@ -26,6 +26,8 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
+use crate::metrics::history::PoolLevels;
+
 /// `mount`·`umount`를 기다리는 시간
 pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(30);
 /// 쓰기 확인과 용량 읽기(LVM-thin은 `lvs`, ZFS는 `zfs get`, RBD는 `rbd ls`와 `ceph df`)를 기다리는 시간. NFS 서버가 멈추면 이 작업이 멈춘다.
@@ -382,13 +384,16 @@ pub struct PoolMounter {
 }
 
 impl PoolMounter {
+    /// 새로 고칠 때마다 이 노드에서 `ready`인 풀의 용량을 `levels`에 넣는다(지표 기록, 계획 60).
     pub fn spawn(
         cluster: Arc<Cluster>,
         mount_root: PathBuf,
         qemu_binary: PathBuf,
         refresh: Duration,
+        levels: Arc<PoolLevels>,
     ) -> Self {
-        let pools = Pools::new(cluster, mount_root, Arc::new(SystemMount { qemu_binary }));
+        let mut pools = Pools::new(cluster, mount_root, Arc::new(SystemMount { qemu_binary }));
+        pools.levels = Some(levels);
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
@@ -497,6 +502,8 @@ struct Pools {
     backoff: HashMap<Uuid, Backoff>,
     /// 마지막 언마운트 실패(같은 실패를 tick마다 기록하지 않는다)
     umount_errors: HashMap<PathBuf, String>,
+    /// 지표 기록에 넘길 풀 용량(1 GiB 거르기 전 값)
+    levels: Option<Arc<PoolLevels>>,
 }
 
 /// 끝난 마운트·언마운트 작업
@@ -561,6 +568,7 @@ impl Pools {
             done: Arc::default(),
             backoff: HashMap::new(),
             umount_errors: HashMap::new(),
+            levels: None,
         }
     }
 
@@ -668,6 +676,9 @@ impl Pools {
                     }
                 }
             }
+        }
+        if let Some(levels) = &self.levels {
+            levels.set(ready_levels(&states));
         }
         self.write(states).await
     }
@@ -1110,6 +1121,14 @@ fn keep_capacity(
     new
 }
 
+/// 준비된 풀의 (풀 id → 전체·남은 바이트)
+fn ready_levels(states: &BTreeMap<String, PoolState>) -> HashMap<Uuid, (u64, u64)> {
+    (states.values())
+        .filter(|s| s.ready)
+        .map(|s| (s.pool_id, (s.total_bytes, s.available_bytes)))
+        .collect()
+}
+
 fn not_ready(pool: Uuid, error: String) -> PoolState {
     PoolState {
         pool_id: pool,
@@ -1516,12 +1535,20 @@ mod tests {
         let after = s.cluster.get::<NodeSpec>(s.node).unwrap().unwrap().revision;
         assert_eq!(after, revision);
 
-        // 용량이 1 GiB 넘게 바뀌지 않았으면 다시 쓰지 않는다.
+        // 용량이 1 GiB 넘게 바뀌지 않았으면 다시 쓰지 않는다. 지표 기록에는 거르기 전 값과 준비된 풀만 넘긴다.
+        let levels = Arc::new(PoolLevels::default());
+        s.pools.levels = Some(levels.clone());
         s.fake.extra.store(GIB - 1, Ordering::SeqCst);
         s.pools.tick().await.unwrap();
         let after = s.cluster.get::<NodeSpec>(s.node).unwrap().unwrap().revision;
         assert_eq!(after, revision);
         assert_eq!(s.states()["nas"], ready(&nas));
+        let levels = levels.get();
+        assert_eq!(
+            levels.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([local.id, nas.id])
+        );
+        assert_eq!(levels[&nas.id].0, ready(&nas).total_bytes + GIB - 1);
         s.fake.extra.store(GIB, Ordering::SeqCst);
         s.pools.tick().await.unwrap();
         let state = &s.states()["nas"];

@@ -283,3 +283,19 @@ Prometheus 누적 카운터·OpenMetrics, Graphite·InfluxDB 밀어 보내기, �
 - **조회**: `read(tier, from, until)`은 `bucket_window` 칸을 칸(필드)마다 `Agg`로 돌려준다(`Raw5s`는 AVG=MAX=MIN, 모르면 NaN). 칸이 층 칸 수의 두 배보다 많으면 거절한다(366일 `Hour6`은 됨).
 - **합치기**: `merge(bytes)`는 받은 파일 바이트(머리 포함)와 층마다 새 `last`의 창 전체를 칸 단위로 합쳐 쓰고 commit 한다. 칸 목록이 다르면 같은 칸 id만 합친다. 종류가 다르거나 머리가 깨졌거나 짧으면 거절한다.
 - **로그**: 이 모듈은 로그를 남기지 않는다. `Opened`(Existing·Created·Migrated·Corrupt·Newer)와 `Append`(Written·Behind·Rewound)를 돌려주고 쓰는 쪽이 남긴다. opld가 바이너리 크레이트라 스테이지 3이 쓰기 전까지 `metrics.rs`에 `#[allow(dead_code)]`를 두었다.
+
+### 스테이지 3 (opld `metrics/history.rs`·opl-peer)
+
+- **구조**: `History`(파일 핸들·조회·받기, 막히는 호출)와 `HistoryWriter`(분마다 기록, 정리·밀어 넘기기 주기)로 나눴다. `History`는 위트니스가 아닌 노드에 늘 있고, `[metrics] history = false`면 파일 없이 메모리 1시간으로 조회에 답한다(밀어 넘기기는 `failed_precondition`으로 거절해 보낸 쪽이 파일을 지키게 함). 디렉터리를 만들지 못하면 경고하고 기록을 끈다(노드 시작을 막지 않음).
+- **가져갈 점 찾기**: `MetricsStore`에 시리즈마다 넣은 점 번호를 두고 기록 쓰기가 앞서 가져간 번호 뒤의 점만 가져간다(`take_pending`). 시각이 아니라 넣은 순서로 세므로 벽시계가 뒤로 가도 `Append::Behind`·`Rewound` 길로 간다. 새 VM 시리즈는 전체 점 수부터 세어 지워졌다 다시 생긴 시리즈도 놓치지 않는다.
+- **풀 점**: 풀은 5초마다 재지 않으므로 기록할 때 지난 기록 뒤의 5초 칸마다 `PoolMounter`가 마지막으로 잰 값(`PoolLevels`, 1 GiB 거르기 전, `ready`만)을 쓴다(처음은 지금 칸 하나, 이미 쓴 칸은 건너뜀). 그래야 1분 층이 xff 0.5를 넘는다.
+- **쉬는 파일 닫기**: 기록마다 열린 모든 파일의 거친 층을 닫되, 마지막 원본 칸이 든 6시간 경계까지만 닫는다(`close_until`). 멈춘 VM의 칸이 제때 닫히고, 그 뒤로는 분마다 NaN을 쓰고 `fdatasync` 하지 않는다.
+- **기록 시각**: 기록은 벽시계 주기 경계 + 1초에 한다. 멈출 때(`Services::shutdown`, 측정기 다음) 한 번 더 기록한다.
+- **5초 층 조회**: 파일의 빈 칸을 아직 쓰지 않은 메모리 점으로 메운다(파일 값 우선). 그래서 1시간 조회는 지금까지 이어지고 p50·p95가 정확하다(`approx: false`). `covered_from`은 앞 칸을 모를 때만 아는 첫 칸 시각이고, 아무 칸도 모르면 없다.
+- **`Digest`**: 노드 열은 AVG만(MAX·MIN 비움), `stats`·`pct`는 비운다. 상위 VM은 파일·메모리에 있는 VM 가운데 Raft에서 주인이 이 노드인 것만 범위 평균 CPU로 고른다(마이그레이션 직후 두 노드가 같은 VM을 내지 않게).
+- **밀어 넘기기·정리 주기**: 10분마다, 시작 1분 뒤 첫 차례(후보만 모음), 이 노드에 파일이 있는 VM이 바뀌거나 지워지면(watch) 30초 뒤로 앞당긴다. 마지막 점이 30초 안인 VM(아직 이 노드에서 잼)은 밀지도 지우지도 않는다. 받는 쪽이 온라인이고 `metrics-history`를 알릴 때만 보내고, `unimplemented`(옛 노드)·`failed_precondition`(기록 끔)이면 파일을 두고 다음 차례에 다시 본다. 받은 쪽이 합쳐 디스크에 쓴 뒤에만 지운다.
+- **정리 규칙**: 계획 59와 같다(두 차례 연속 후보, `read_index` 성공, 그 id를 대상으로 하는 끝나지 않은 Task 없음, 지우기 직전 다시 읽어 없음). 상태 디렉터리 정리의 "1시간 지난 것" 조건은 두지 않았다(기록 파일은 Task가 VM을 만들기 전에 쓰지 않는다). `node.rrd`는 지우지 않는다. 옆으로 옮긴 파일(`.corrupt`·`.v{n}`)과 임시 파일은 시리즈가 아니라 건드리지 않는다.
+- **peer RPC**: `ReadMetricsHistory(HistoryQuery) -> HistoryReply`(JSON, 서버가 `validate` 뒤 `spawn_blocking`), `PushMetricsHistory`(이진: VM id 16바이트 + 파일 바이트, 1 MiB 상한, 답은 빈 메시지). `MetricsSource`에 `history()`·`push_history()`를 기본 `Unsupported`로 더했다. 오류는 `HistoryError { Unsupported, Disabled, Invalid, Io, Unreachable }`이고 `unimplemented`·`failed_precondition`·`invalid_argument`·`internal`·그 밖으로 오간다. 클라이언트는 `Peers::read_metrics_history`·`push_metrics_history`.
+- **`Clock`**: `opl_types::clock::{Clock, SystemClock, ManualClock}`(스테이지 5 `AlertEngine`도 씀). 쓰기 작업 시험은 `ManualClock`과 실제 짧은 타이머로 한다(Raft가 있는 시험에서 `tokio::time::pause`는 쓰지 않음).
+- **설정**: `[metrics] history = true`, `flush_secs = 60`(60~600, 검증). 시험 고리 `[test] metrics_flush_secs`·`metrics_push_secs`(1 이상, 정리의 첫 차례·앞당김도 같은 값)는 새 기능 `metrics-it`(QEMU 없이 재시작 시험용)와 `qemu-it` 빌드에만 있다. `alert_tick_ms`는 경보 엔진과 함께 스테이지 5로 미뤘다.
+- **열린 파일 상한**: 4096개(`MAX_OPEN`)를 넘으면 가장 오래 쓰지 않은 VM·풀 파일을 닫는다(노드 파일은 둔다).

@@ -221,6 +221,29 @@ impl NodeSample {
             m(self.fs_total_mib),
         ]
     }
+
+    /// [`NodeSample::values`]를 되돌린다(기록 파일의 `Raw5s` 칸을 메모리 저장소로 되살릴 때). 값은 [`NODE_FIELDS`]
+    /// 순서이고, MiB 칸은 반올림한다. 모자란 값은 `None`이다.
+    pub fn from_values(t: i64, values: &[Option<f32>]) -> NodeSample {
+        let v = |i: usize| values.get(i).copied().flatten().filter(|v| v.is_finite());
+        NodeSample {
+            t,
+            cpu: v(0).map(f64::from),
+            mem_used_mib: v(1).map(to_mib),
+            mem_total_mib: v(2).map(to_mib),
+            disk_read_bps: v(3).map(f64::from),
+            disk_write_bps: v(4).map(f64::from),
+            net_rx_bps: v(5).map(f64::from),
+            net_tx_bps: v(6).map(f64::from),
+            fs_used_mib: v(7).map(to_mib),
+            fs_total_mib: v(8).map(to_mib),
+        }
+    }
+}
+
+/// f32 MiB 값을 정수 MiB로(음수는 0)
+fn to_mib(v: f32) -> u64 {
+    v.max(0.0).round() as u64
 }
 
 impl VmSample {
@@ -236,6 +259,22 @@ impl VmSample {
             f(self.net_rx_bps),
             f(self.net_tx_bps),
         ]
+    }
+
+    /// [`VmSample::values`]를 되돌린다([`NodeSample::from_values`]와 같다). 값은 [`VM_FIELDS`] 순서다.
+    pub fn from_values(t: i64, values: &[Option<f32>]) -> VmSample {
+        let v = |i: usize| values.get(i).copied().flatten().filter(|v| v.is_finite());
+        VmSample {
+            t,
+            cpu: v(0).map(f64::from),
+            mem_rss_mib: v(1).map(to_mib),
+            disk_read_bps: v(2).map(f64::from),
+            disk_write_bps: v(3).map(f64::from),
+            disk_read_iops: v(4).map(f64::from),
+            disk_write_iops: v(5).map(f64::from),
+            net_rx_bps: v(6).map(f64::from),
+            net_tx_bps: v(7).map(f64::from),
+        }
     }
 }
 
@@ -624,6 +663,42 @@ mod tests {
             [Some(6.0 * 1024.0), Some(10.0 * 1024.0)]
         );
         assert_eq!(pool_values(1, 5), [Some(0.0), Some(1.0 / 1048576.0)]);
+    }
+
+    /// 기록 파일에서 되살린 값은 같은 점이 된다(MiB는 반올림, 모르는 값은 `None`).
+    #[test]
+    fn samples_come_back_from_their_values() {
+        let n = NodeSample {
+            t: 5_000,
+            cpu: Some(12.5),
+            mem_used_mib: Some(2_048),
+            mem_total_mib: Some(4_096),
+            disk_read_bps: Some(1_000.0),
+            disk_write_bps: None,
+            net_rx_bps: Some(0.0),
+            net_tx_bps: Some(3.0),
+            fs_used_mib: Some(7),
+            fs_total_mib: None,
+        };
+        assert_eq!(NodeSample::from_values(5_000, &n.values()), n);
+        let v = VmSample {
+            t: 10_000,
+            cpu: Some(50.0),
+            mem_rss_mib: Some(512),
+            disk_read_bps: None,
+            disk_write_bps: Some(8.0),
+            disk_read_iops: Some(1.0),
+            disk_write_iops: None,
+            net_rx_bps: Some(2.0),
+            net_tx_bps: Some(4.0),
+        };
+        assert_eq!(VmSample::from_values(10_000, &v.values()), v);
+        // 반올림·음수·NaN·모자란 값
+        let short = NodeSample::from_values(0, &[Some(f32::NAN), Some(1.6), Some(-3.0)]);
+        assert_eq!(short.cpu, None);
+        assert_eq!(short.mem_used_mib, Some(2));
+        assert_eq!(short.mem_total_mib, Some(0));
+        assert_eq!(short.fs_total_mib, None);
     }
 
     #[test]

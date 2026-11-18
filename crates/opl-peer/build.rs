@@ -1,5 +1,5 @@
 //! 노드 간 gRPC 서비스 정의. `.proto` 대신 Rust 타입을 serde JSON으로 주고받는다(`protoc`가 필요 없다).
-//! 콘솔 스트림은 바이트를 그대로, UEFI 변수 조각은 이진 형식으로 보낸다. 관찰 노드의 Follow는 JSON 서버 스트림이다.
+//! 콘솔 스트림은 바이트를 그대로, UEFI 변수 조각과 지표 기록 파일은 이진 형식으로 보낸다. 관찰 노드의 Follow는 JSON 서버 스트림이다.
 
 use tonic_build::manual::{Builder, Method, Service};
 
@@ -95,6 +95,21 @@ fn main() {
             "opl_types::metrics::MetricsQuery",
             "crate::metrics::MetricsReply",
         ))
+        .method(json(
+            "read_metrics_history",
+            "ReadMetricsHistory",
+            "opl_types::metrics::HistoryQuery",
+            "opl_types::metrics::HistoryReply",
+        ))
+        .method(
+            Method::builder()
+                .name("push_metrics_history")
+                .route_name("PushMetricsHistory")
+                .input_type("crate::metrics::PushMetricsHistoryRequest")
+                .output_type("crate::metrics::PushMetricsHistoryReply")
+                .codec_path("crate::codec::BinaryCodec")
+                .build(),
+        )
         .method(json(
             "fence_status",
             "FenceStatus",

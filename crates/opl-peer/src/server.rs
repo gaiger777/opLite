@@ -12,7 +12,7 @@ use opl_cluster::types::{LeaderRequest, NodeId, TypeConfig};
 use opl_cluster::{Cluster, FollowFrame, FollowGate};
 use opl_driver::{DriverError, Hypervisor, tpm_state_path, uefi_vars_path};
 use opl_types::audit::AuditQuery;
-use opl_types::metrics::MetricsQuery;
+use opl_types::metrics::{HistoryQuery, HistoryReply, MetricsQuery};
 use opl_types::placement::PlacementStatus;
 use opl_types::vm::VmSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -36,7 +36,10 @@ use crate::firmware::{
 use crate::guest::{
     GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
 };
-use crate::metrics::{MetricsReply, MetricsSource};
+use crate::metrics::{
+    MAX_HISTORY_BYTES, MetricsReply, MetricsSource, PushMetricsHistoryReply,
+    PushMetricsHistoryRequest,
+};
 use crate::migration::{IncomingMigration, MigrateIncomingRequest, MigrationReceiver};
 use crate::pki::{NodeTls, node_id_of};
 use crate::placement::{PlacementRequest, PlacementSource};
@@ -142,7 +145,8 @@ impl PeerService {
         self
     }
 
-    /// 이 노드의 지표를 `source`로 읽어 준다. 없으면 읽기 요청을 `unimplemented`로 거부한다(옛 노드와 같다).
+    /// 이 노드의 지표와 기록(계획 60 `ReadMetricsHistory`·`PushMetricsHistory`)을 `source`로 읽고 받는다. 없으면
+    /// 요청을 `unimplemented`로 거부한다(옛 노드와 같다).
     pub fn with_metrics(mut self, source: Arc<dyn MetricsSource>) -> Self {
         self.metrics = Some(source);
         self
@@ -172,6 +176,12 @@ impl PeerService {
         self.ceph
             .clone()
             .ok_or_else(|| Status::unimplemented("this node does not set up Ceph"))
+    }
+
+    fn metrics_source(&self) -> Result<Arc<dyn MetricsSource>, Status> {
+        self.metrics
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not keep metrics"))
     }
 
     fn migrations(&self) -> Result<Arc<dyn MigrationReceiver>, Status> {
@@ -392,13 +402,50 @@ impl Peer for PeerService {
         req: Request<MetricsQuery>,
     ) -> Result<Response<MetricsReply>, Status> {
         self.authorize(&req)?;
-        let source = self
-            .metrics
-            .clone()
-            .ok_or_else(|| Status::unimplemented("this node does not keep metrics"))?;
+        let source = self.metrics_source()?;
         let query = req.into_inner();
         let reply = self.offload(async move { source.read(&query) }).await?;
         Ok(Response::new(reply))
+    }
+
+    async fn read_metrics_history(
+        &self,
+        req: Request<HistoryQuery>,
+    ) -> Result<Response<HistoryReply>, Status> {
+        self.authorize(&req)?;
+        let source = self.metrics_source()?;
+        let query = req.into_inner();
+        query
+            .validate()
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+        // 기록 파일을 읽으므로 막히는 일을 하는 스레드에서 한다.
+        let reply = self
+            .offload(
+                async move { tokio::task::spawn_blocking(move || source.history(&query)).await },
+            )
+            .await?
+            .map_err(|e| Status::internal(format!("metrics history read failed: {e}")))??;
+        Ok(Response::new(reply))
+    }
+
+    async fn push_metrics_history(
+        &self,
+        req: Request<PushMetricsHistoryRequest>,
+    ) -> Result<Response<PushMetricsHistoryReply>, Status> {
+        self.authorize(&req)?;
+        let source = self.metrics_source()?;
+        let PushMetricsHistoryRequest { vm, bytes } = req.into_inner();
+        if bytes.len() > MAX_HISTORY_BYTES {
+            return Err(Status::invalid_argument(format!(
+                "a metrics history file is at most {MAX_HISTORY_BYTES} bytes"
+            )));
+        }
+        self.offload(async move {
+            tokio::task::spawn_blocking(move || source.push_history(vm, &bytes)).await
+        })
+        .await?
+        .map_err(|e| Status::internal(format!("metrics history merge failed: {e}")))??;
+        Ok(Response::new(PushMetricsHistoryReply))
     }
 
     async fn fence_status(

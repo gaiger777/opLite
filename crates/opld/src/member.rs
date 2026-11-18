@@ -37,6 +37,7 @@ use opl_peer::{
 use opl_reconciler::{
     FirewallGate, FirmwareFetcher, GuestInfoSink, HaGuard, Reconciler, ReconcilerConfig,
 };
+use opl_types::clock::SystemClock;
 use opl_types::cluster::ClusterSpec;
 use opl_types::host::same_host;
 use opl_types::node::{NodeShutdown, NodeSpec, ShutdownAction};
@@ -55,6 +56,7 @@ use crate::fence_watch::FenceWatch;
 use crate::firewall::{FirewallAgent, FirewallRules};
 use crate::guest::GuestInfoStore;
 use crate::host::Host;
+use crate::metrics::history::{DIR as HISTORY_DIR, History, HistoryWriter, PeerPusher, PoolLevels};
 use crate::metrics::host as metrics_host;
 use crate::metrics::sampler::MetricsSampler;
 use crate::metrics::store::{MetricsStore, StoreSource};
@@ -212,6 +214,8 @@ struct Services {
     pools: PoolMounter,
     /// 이 노드와 그 VM의 사용량 지표를 잰다.
     metrics: MetricsSampler,
+    /// 지표를 분마다 기록 파일에 쓰고 VM 기록을 주인 노드에 밀어 넘긴다(`[metrics] history = false`면 없다).
+    history: Option<HistoryWriter>,
     /// VXLAN 네트워크의 장치를 맞춘다(호스트 네트워크가 없으면 없다).
     overlay: Option<OverlayAgent>,
     /// VM 방화벽 규칙을 맞춘다(방화벽이 없으면 없다).
@@ -268,6 +272,10 @@ impl Services {
         self.vip_manager.shutdown().await;
         self.pools.shutdown().await;
         self.metrics.shutdown().await;
+        // 측정기가 멈춘 뒤 마지막 점까지 쓴다.
+        if let Some(history) = self.history {
+            history.shutdown().await;
+        }
         if let Some(updates) = self.updates {
             updates.shutdown().await;
         }
@@ -500,9 +508,29 @@ impl Member {
             }
             None => Arc::new(AuditLog::disabled()),
         };
-        // 측정기가 적고, API와 다른 노드(노드 간 서버)가 읽는다.
+        // 측정기가 적고, API와 다른 노드(노드 간 서버)가 읽는다. 기록 파일(계획 60)의 지난 1시간을 측정기를 띄우기 전에
+        // 저장소에 되살린다. 기록을 끄면 파일 없이 메모리 1시간만으로 기록 조회에 답한다.
         let metrics_store = Arc::new(MetricsStore::default());
-        let metrics_source = Arc::new(StoreSource::new(node, metrics_store.clone()));
+        let history = {
+            let dir = config
+                .metrics
+                .history
+                .then(|| config.data_dir.join(HISTORY_DIR));
+            let store = metrics_store.clone();
+            let opened = tokio::task::spawn_blocking(move || {
+                History::open(dir, store, Arc::new(SystemClock))
+            })
+            .await;
+            match opened {
+                Ok(history) => Arc::new(history.with_owner(node, cluster.clone())),
+                Err(e) => {
+                    let _ = cluster.shutdown().await;
+                    return Err(anyhow::anyhow!("opening the metrics history failed: {e}"));
+                }
+            }
+        };
+        let metrics_source =
+            Arc::new(StoreSource::new(node, metrics_store.clone()).with_history(history.clone()));
         // 전원 끄기 펜싱: API(`fence-test`)와 다른 노드의 이웃 확인이 쓴다.
         let fence: Arc<dyn PowerFence> = Arc::new(config.ha.fencer());
         let fence_source = Arc::new(FenceStatusSource {
@@ -722,15 +750,18 @@ impl Member {
         let reconciler = on(&rt.work, || {
             Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config)
         });
+        // 풀 용량은 지표 기록에도 넘긴다.
+        let pool_levels = Arc::new(PoolLevels::default());
         let pools = on(&rt.work, || {
             PoolMounter::spawn(
                 cluster.clone(),
                 mount_root.clone(),
                 qemu_binary,
                 config.pools.refresh(),
+                pool_levels.clone(),
             )
         });
-        // 지표는 메모리에만 둔다(Raft에 쓰지 않는다).
+        // 지표는 메모리 1시간과 노드 로컬 기록 파일에 둔다(Raft에 쓰지 않는다).
         let metrics = on(&rt.work, || {
             MetricsSampler::spawn(
                 hv.clone(),
@@ -739,6 +770,21 @@ impl Member {
                 config.data_dir.clone(),
                 metrics_store,
             )
+        });
+        let history = history.enabled().then(|| {
+            let pusher = Arc::new(PeerPusher {
+                cluster: cluster.clone(),
+                peers: peers.clone(),
+            });
+            on(&rt.work, || {
+                HistoryWriter::spawn(
+                    history,
+                    cluster.clone(),
+                    pool_levels,
+                    pusher,
+                    config.history_writer_config(),
+                )
+            })
         });
         // Task 실행기는 시작할 때 이 노드가 남긴 고아를 지운다. 그것이 끝난 뒤에 API를 연다.
         let mut runner_config = TaskRunnerConfig::new(node);
@@ -919,6 +965,7 @@ impl Member {
                 vip,
                 pools,
                 metrics,
+                history,
                 overlay,
                 firewall,
                 ha,

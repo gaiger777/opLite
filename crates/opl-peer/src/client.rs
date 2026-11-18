@@ -26,7 +26,7 @@ use opl_cluster::{
 use opl_types::audit::{AuditEntry, AuditQuery};
 use opl_types::ceph::{CephReport, NodeDisk};
 use opl_types::fence::FenceMethodStatus;
-use opl_types::metrics::MetricsQuery;
+use opl_types::metrics::{HistoryQuery, HistoryReply, MetricsQuery};
 use opl_types::placement::PlacementStatus;
 use tokio::runtime::Handle;
 use tokio_stream::wrappers::ReceiverStream;
@@ -42,7 +42,7 @@ use crate::firmware::{
     TpmStateRequest, UefiVarsError, UefiVarsRequest,
 };
 use crate::guest::{GuestAgentError, GuestAgentReply, GuestAgentRequest};
-use crate::metrics::MetricsReply;
+use crate::metrics::{HistoryError, MetricsReply, PushMetricsHistoryRequest};
 use crate::migration::{
     IncomingError, IncomingMigration, MigrateIncomingRequest, MigrateIncomingResponse,
 };
@@ -760,6 +760,52 @@ impl Peers {
             Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }
+    }
+}
+
+impl Peers {
+    /// 노드 `from`(첫 링크 `addr`)의 지표 기록을 범위로 읽는다(계획 60 §7). 그 노드가 이 RPC를 모르면(옛 노드, 지표
+    /// 소스가 없는 노드) `Unsupported`, 닿지 못하면 `Unreachable`이다.
+    pub async fn read_metrics_history(
+        &self,
+        from: NodeId,
+        addr: &str,
+        query: HistoryQuery,
+        timeout: Duration,
+    ) -> Result<HistoryReply, HistoryError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(query.clone());
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(from));
+                async move { within(timeout, client.read_metrics_history(req)).await }
+            })
+            .await;
+        reply.map(|r| r.into_inner()).map_err(Into::into)
+    }
+
+    /// 노드 `to`(첫 링크 `addr`)에 VM `vm`의 기록 파일(`bytes`)을 밀어 넘긴다(계획 60 §6). 받은 쪽이 자기 파일과 합쳐
+    /// 디스크에 쓴 뒤에 `Ok`다. 그 노드가 이 RPC를 모르면 `Unsupported`, 기록을 끈 노드면 `Disabled`다.
+    pub async fn push_metrics_history(
+        &self,
+        to: NodeId,
+        addr: &str,
+        vm: Uuid,
+        bytes: Bytes,
+        timeout: Duration,
+    ) -> Result<(), HistoryError> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(PushMetricsHistoryRequest {
+                    vm,
+                    bytes: bytes.clone(),
+                });
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(to));
+                async move { within(timeout, client.push_metrics_history(req)).await }
+            })
+            .await;
+        reply.map(|_| ()).map_err(Into::into)
     }
 }
 

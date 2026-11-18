@@ -6,6 +6,7 @@ pub mod auth;
 pub mod backup;
 pub mod backup_job;
 pub mod ceph;
+pub mod clock;
 pub mod cloud_init;
 pub mod cluster;
 pub mod crypt;

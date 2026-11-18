@@ -165,6 +165,7 @@ fn layout(nfields: usize) -> ([u64; 4], u64) {
 }
 
 /// 칸 `nfields`개인 파일의 크기(바이트). VM(8칸)은 336 KiB다.
+#[cfg(test)]
 pub fn file_size(nfields: usize) -> u64 {
     layout(nfields).1
 }

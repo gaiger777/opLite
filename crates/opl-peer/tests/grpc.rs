@@ -23,13 +23,17 @@ use opl_peer::{
 };
 use opl_peer::{
     GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest, GuestAgentSource,
-    PushFirmwareRequest, TpmStateError, UefiVarsChunk, VarsTemplates, sha256_hex,
+    HistoryError, MAX_HISTORY_BYTES, PushFirmwareRequest, TpmStateError, UefiVarsChunk,
+    VarsTemplates, sha256_hex,
 };
 use opl_types::audit::{AuditAuth, AuditEntry, AuditQuery};
 use opl_types::ceph::{CephReport, DiskState, NodeDisk};
 use opl_types::cluster::{ClusterInfo, ClusterSpec, ClusterStatus};
 use opl_types::fence::{FenceKind, FenceMethodStatus, Power};
-use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries};
+use opl_types::metrics::{
+    HistoryQuery, HistoryReply, HistoryScope, MetricsQuery, MetricsScope, NodeSample, NodeSeries,
+    Tier,
+};
 use opl_types::node::{NodeSpec, NodeStatus};
 use opl_types::placement::{NodeLoadView, PlacementStatus};
 use opl_types::resource::Resource;
@@ -1575,6 +1579,144 @@ async fn metrics_are_read_from_a_member() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied, "{err:?}");
     assert_eq!(metrics.queries.lock().unwrap().len(), 1);
+}
+
+/// 받은 조회를 적고 범위 시작을 `start`로 돌려주는 기록, 받은 VM 기록 파일을 적는 받기(`disabled`면 기록을 끈 노드)
+#[derive(Default)]
+struct FakeHistory {
+    queries: std::sync::Mutex<Vec<HistoryQuery>>,
+    pushed: std::sync::Mutex<Vec<(Uuid, Vec<u8>)>>,
+    disabled: bool,
+}
+
+impl MetricsSource for FakeHistory {
+    fn read(&self, _: &MetricsQuery) -> MetricsReply {
+        MetricsReply {
+            node: None,
+            vms: vec![],
+        }
+    }
+
+    fn history(&self, q: &HistoryQuery) -> Result<HistoryReply, HistoryError> {
+        self.queries.lock().unwrap().push(q.clone());
+        Ok(HistoryReply {
+            tier: Tier::Raw5s,
+            step_ms: 5_000,
+            start: q.from,
+            columns: BTreeMap::new(),
+            stats: BTreeMap::new(),
+            pct: BTreeMap::new(),
+            covered_from: None,
+            top: vec![],
+        })
+    }
+
+    fn push_history(&self, vm: Uuid, bytes: &[u8]) -> Result<(), HistoryError> {
+        if self.disabled {
+            return Err(HistoryError::Disabled);
+        }
+        if bytes == b"bad" {
+            return Err(HistoryError::Invalid("not a history file".into()));
+        }
+        self.pushed.lock().unwrap().push((vm, bytes.to_vec()));
+        Ok(())
+    }
+}
+
+/// 기록 조회(`ReadMetricsHistory`)와 VM 기록 밀어 넘기기(`PushMetricsHistory`). 지표 소스가 없는 노드(옛 노드처럼)는
+/// `Unsupported`, 기록을 끈 노드는 받기를 `Disabled`로 거절한다.
+#[tokio::test]
+async fn metrics_history_is_read_and_pushed() {
+    let (ca, root, nodes) = start(1).await;
+    let mut targets = Vec::new();
+    for disabled in [false, true] {
+        let source = Arc::new(FakeHistory {
+            disabled,
+            ..Default::default()
+        });
+        let target =
+            Node::start_with(&ca, &root, None, None, Some(source.clone()), None, None).await;
+        nodes[0]
+            .cluster
+            .request(LeaderRequest::AddLearner {
+                id: target.id(),
+                addr: target.addr.clone(),
+                addrs: vec![],
+            })
+            .await
+            .unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !target.cluster.members().contains(nodes[0].id()) {
+            assert!(
+                Instant::now() < deadline,
+                "membership never reached the target"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        targets.push((target, source));
+    }
+    let peers = &nodes[0].peers;
+    let (target, source) = &targets[0];
+    let query = |from| HistoryQuery {
+        scope: HistoryScope::Vm { id: Uuid::nil() },
+        from,
+        until: 10_000,
+        points: 300,
+    };
+    let reply = peers
+        .read_metrics_history(target.id(), &target.addr, query(5_000), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(reply.start, 5_000);
+    assert_eq!(*source.queries.lock().unwrap(), [query(5_000)]);
+    // 서버가 조회를 검증한다.
+    let err = peers
+        .read_metrics_history(target.id(), &target.addr, query(10_000), WAIT)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, HistoryError::Invalid(_)), "{err:?}");
+    assert_eq!(source.queries.lock().unwrap().len(), 1);
+
+    let vm = Uuid::now_v7();
+    let file = vec![7u8; 336 * 1024];
+    peers
+        .push_metrics_history(target.id(), &target.addr, vm, file.clone().into(), WAIT)
+        .await
+        .unwrap();
+    assert_eq!(*source.pushed.lock().unwrap(), [(vm, file)]);
+    let bad = peers
+        .push_metrics_history(target.id(), &target.addr, vm, "bad".into(), WAIT)
+        .await
+        .unwrap_err();
+    assert!(matches!(bad, HistoryError::Invalid(_)), "{bad:?}");
+    let big = vec![0u8; MAX_HISTORY_BYTES + 1];
+    let big = peers
+        .push_metrics_history(target.id(), &target.addr, vm, big.into(), WAIT)
+        .await
+        .unwrap_err();
+    assert!(matches!(big, HistoryError::Invalid(_)), "{big:?}");
+    assert_eq!(source.pushed.lock().unwrap().len(), 1);
+
+    let (off, _) = &targets[1];
+    let disabled = peers
+        .push_metrics_history(off.id(), &off.addr, vm, "x".into(), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(disabled, HistoryError::Disabled);
+
+    // 지표 소스가 없는 노드(옛 노드처럼)
+    let old = target
+        .peers
+        .read_metrics_history(nodes[0].id(), &nodes[0].addr, query(5_000), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(old, HistoryError::Unsupported);
+    let old = target
+        .peers
+        .push_metrics_history(nodes[0].id(), &nodes[0].addr, vm, "x".into(), WAIT)
+        .await
+        .unwrap_err();
+    assert_eq!(old, HistoryError::Unsupported);
 }
 
 /// 받은 노드 id를 적고, 아는 노드면 방법 하나의 결과를 돌려주는 전원 읽기

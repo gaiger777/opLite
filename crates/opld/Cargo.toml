@@ -76,6 +76,9 @@ ha-it = ["opl-peer/fault-it"]
 # (`api` 실행기의 작업자를 모두 막음)·`GET /v1/test/raft`(리더·임기·리스 나이). 배포 빌드에는 넣지 않는다.
 # opld 셋으로 리더의 `api` 실행기를 막아도 HA 리스와 Raft 리더가 그대로인지 보는 시험(QEMU 없음).
 starve-it = []
+# 시험 빌드에만 있는 지표 기록 고리(계획 60): 설정 `[test] metrics_flush_secs`·`metrics_push_secs`로 기록·밀어 넘기기
+# 주기를 줄인다. QEMU 없이 재시작 뒤 기록을 보는 시험이 쓴다(qemu-it에도 같은 고리가 있다).
+metrics-it = []
 
 [dependencies]
 anyhow.workspace = true

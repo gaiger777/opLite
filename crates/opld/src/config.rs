@@ -20,6 +20,8 @@ use opl_types::node::{Fencing, NodeHa};
 use opl_types::security_group::Cidr;
 use serde::Deserialize;
 
+use crate::metrics::history::{MAX_FLUSH_SECS, MIN_FLUSH_SECS, WriterConfig};
+
 /// `opld --config <path>`로 읽는 TOML 설정.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -100,12 +102,16 @@ pub struct Config {
     pub ceph: CephSection,
     #[serde(default)]
     pub download: DownloadSection,
-    /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`)에만 있다. 배포 빌드는 `[test]`를 모르는 키로 거부한다.
+    #[serde(default)]
+    pub metrics: MetricsSection,
+    /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`·`metrics-it`)에만 있다. 배포 빌드는 `[test]`를 모르는
+    /// 키로 거부한다.
     #[cfg(any(
         feature = "starve-it",
         feature = "ha-it",
         feature = "migration-it",
-        feature = "qemu-it"
+        feature = "qemu-it",
+        feature = "metrics-it"
     ))]
     #[serde(default)]
     pub test: TestSection,
@@ -565,6 +571,27 @@ impl Config {
         opl_reconciler::FIRMWARE_SYNC_INTERVAL
     }
 
+    /// 지표 기록 쓰기 설정(`[metrics] flush_secs`). 시험 빌드(`metrics-it`·`qemu-it`)는 `[test] metrics_flush_secs`·
+    /// `metrics_push_secs`로 주기를 줄인다.
+    pub fn history_writer_config(&self) -> WriterConfig {
+        #[allow(unused_mut)]
+        let mut c = WriterConfig {
+            flush: Duration::from_secs(self.metrics.flush_secs),
+            ..WriterConfig::default()
+        };
+        #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+        {
+            if let Some(secs) = self.test.metrics_flush_secs {
+                c.flush = Duration::from_secs(secs.max(1));
+            }
+            if let Some(secs) = self.test.metrics_push_secs {
+                let d = Duration::from_secs(secs.max(1));
+                (c.scan, c.first_scan, c.after_change) = (d, d, d);
+            }
+        }
+        c
+    }
+
     /// HA 검사기가 읽는 sysfs·procfs의 뿌리. 시험 빌드(`ha-it`)는 `[test] health_root` 아래의 가짜 트리를 쓴다.
     pub fn checker_net(&self) -> NetFs {
         #[cfg(feature = "ha-it")]
@@ -891,6 +918,36 @@ pub struct DownloadSection {
     pub allow_private: bool,
 }
 
+/// 지표 기록(계획 60 §6). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetricsSection {
+    /// 지표를 `{data_dir}/metrics`의 기록 파일에 남긴다. 끄면 파일을 쓰지 않고 메모리 1시간만 둔다(SD 카드·USB 부팅
+    /// 노드).
+    #[serde(default = "default_metrics_history")]
+    pub history: bool,
+    /// 기록 파일에 쓰는 주기(초, 60~600). 늘리면 디스크 쓰기가 줄고, 전원이 나가면 그만큼 잃는다.
+    #[serde(default = "default_metrics_flush_secs")]
+    pub flush_secs: u64,
+}
+
+impl Default for MetricsSection {
+    fn default() -> Self {
+        Self {
+            history: default_metrics_history(),
+            flush_secs: default_metrics_flush_secs(),
+        }
+    }
+}
+
+fn default_metrics_history() -> bool {
+    true
+}
+
+fn default_metrics_flush_secs() -> u64 {
+    crate::metrics::history::DEFAULT_FLUSH_SECS
+}
+
 /// 이 노드에 대한 것
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1003,12 +1060,13 @@ fn default_runtime_threads() -> usize {
 }
 
 /// 시험 고리(시험 빌드에만): 굶김 시험(설계 §3.4), 호스트 종료 정책 시험, 균형 조정기 간격(마이그레이션 시험),
-/// 핫플러그 기다림(실제 QEMU 시험)
+/// 핫플러그 기다림(실제 QEMU 시험), 지표 기록 주기(계획 60)
 #[cfg(any(
     feature = "starve-it",
     feature = "ha-it",
     feature = "migration-it",
-    feature = "qemu-it"
+    feature = "qemu-it",
+    feature = "metrics-it"
 ))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1042,6 +1100,15 @@ pub struct TestSection {
     #[cfg(feature = "qemu-it")]
     #[serde(default)]
     pub firmware_sync_secs: Option<u64>,
+    /// 지표 기록 주기(초, 1 이상, 계획 60). 재시작 뒤 기록 시험이 빨리 본다. `[metrics] flush_secs`의 범위를 거치지 않는다.
+    #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+    #[serde(default)]
+    pub metrics_flush_secs: Option<u64>,
+    /// VM 기록 밀어 넘기기·정리 주기(초, 1 이상, 기본 600, 계획 60). 첫 정리와 VM이 바뀐 뒤 앞당기는 정리도 이만큼으로
+    /// 줄인다. 마이그레이션 뒤 기록 시험이 빨리 본다.
+    #[cfg(any(feature = "metrics-it", feature = "qemu-it"))]
+    #[serde(default)]
+    pub metrics_push_secs: Option<u64>,
 }
 
 #[cfg(feature = "starve-it")]
@@ -1403,6 +1470,12 @@ impl Config {
         if self.pools.refresh_secs == 0 {
             anyhow::bail!("pools.refresh_secs must be at least 1");
         }
+        if !(MIN_FLUSH_SECS..=MAX_FLUSH_SECS).contains(&self.metrics.flush_secs) {
+            anyhow::bail!(
+                "metrics.flush_secs must be {MIN_FLUSH_SECS}-{MAX_FLUSH_SECS} (got {})",
+                self.metrics.flush_secs
+            );
+        }
         if self.ceph.install_timeout_secs == 0 {
             anyhow::bail!("ceph.install_timeout_secs must be at least 1");
         }
@@ -1719,6 +1792,9 @@ mod tests {
         assert_eq!(replication.minute, Duration::from_secs(60));
         assert_eq!(c.replication.bandwidth(), None);
         assert_eq!(c.pools.refresh(), Duration::from_secs(15));
+        assert!(c.metrics.history);
+        assert_eq!(c.history_writer_config().flush, Duration::from_secs(60));
+        assert_eq!(c.history_writer_config().scan, Duration::from_secs(600));
         assert_eq!(c.migration.ports, 60000..=60099);
         assert_eq!(c.migration.bandwidth_mib, 0);
         assert_eq!(c.migration.timeout, Duration::from_secs(30 * 60));
@@ -1728,6 +1804,25 @@ mod tests {
         assert_eq!(
             c.cert_names(),
             ["10.0.0.5", "localhost", "127.0.0.1", "::1"]
+        );
+    }
+
+    #[test]
+    fn metrics_history_can_be_turned_off_and_its_flush_is_bounded() {
+        let c =
+            parse("name = \"n\"\naddress = \"h\"\n[metrics]\nhistory = false\nflush_secs = 600");
+        assert!(!c.metrics.history);
+        assert_eq!(c.history_writer_config().flush, Duration::from_secs(600));
+        c.validate().unwrap();
+        for secs in [59, 601] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[metrics]\nflush_secs = {secs}"
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.contains("metrics.flush_secs"), "{err}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[metrics]\nkeep = 1").is_err()
         );
     }
 

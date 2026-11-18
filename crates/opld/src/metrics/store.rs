@@ -4,10 +4,15 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use opl_peer::{MetricsReply, MetricsSource};
-use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample, VmSeries};
+use opl_peer::{HistoryError, MetricsReply, MetricsSource};
+use opl_types::metrics::{
+    HistoryQuery, HistoryReply, MetricsQuery, MetricsScope, NodeSample, NodeSeries, VmSample,
+    VmSeries,
+};
 use opl_types::placement::{LoadSummary, VmLoad};
 use uuid::Uuid;
+
+use super::history::History;
 
 /// 시리즈마다 두는 점 수(5초 × 1시간). 넘으면 앞을 버린다.
 pub const MAX_SAMPLES: usize = 720;
@@ -28,6 +33,37 @@ pub struct MetricsStore {
 struct Series {
     node: VecDeque<NodeSample>,
     vms: HashMap<Uuid, VecDeque<VmSample>>,
+    /// 시리즈마다 넣은 점의 번호(마지막 점까지 센 값). 기록 쓰기([`MetricsStore::take_pending`])가 앞서 가져간 뒤의 점을
+    /// 찾는다. 시각이 아니라 넣은 순서로 세므로 벽시계가 뒤로 가도 새 점을 놓치지 않는다. 새 VM 시리즈는 모든 시리즈에
+    /// 넣은 점 수(`total`)부터 세므로, 지워졌다 다시 생긴 시리즈도 앞서 가져간 자리보다 크다.
+    node_pushed: u64,
+    vm_pushed: HashMap<Uuid, u64>,
+    total: u64,
+}
+
+/// 기록 쓰기가 마지막으로 가져간 자리(시리즈마다 넣은 점 수)
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Marks {
+    node: u64,
+    vms: HashMap<Uuid, u64>,
+}
+
+/// 앞서 가져간 뒤에 들어온 점들(넣은 순서)
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Pending {
+    pub node: Vec<NodeSample>,
+    pub vms: Vec<(Uuid, Vec<VmSample>)>,
+}
+
+/// 시리즈의 마지막 점 번호가 `pushed`이고 앞서 `mark`까지 가져갔을 때 새 점(뒤쪽 `pushed - mark`개, 남은 것까지)
+fn newer<T: Clone>(series: &VecDeque<T>, pushed: u64, mark: u64) -> Vec<T> {
+    let n = if pushed >= mark {
+        usize::try_from(pushed - mark).unwrap_or(usize::MAX)
+    } else {
+        series.len()
+    };
+    let skip = series.len().saturating_sub(n);
+    series.iter().skip(skip).cloned().collect()
 }
 
 /// 저장소에서 읽은 점들(시각 순). 노드 id는 읽는 쪽이 붙인다.
@@ -48,23 +84,78 @@ fn push<T>(series: &mut VecDeque<T>, sample: T) {
 
 impl MetricsStore {
     pub fn push_node(&self, sample: NodeSample) {
-        push(&mut self.inner.lock().unwrap().node, sample);
+        let mut inner = self.inner.lock().unwrap();
+        push(&mut inner.node, sample);
+        inner.node_pushed += 1;
+        inner.total += 1;
     }
 
     pub fn push_vm(&self, vm: Uuid, sample: VmSample) {
-        push(
-            self.inner.lock().unwrap().vms.entry(vm).or_default(),
-            sample,
-        );
+        let inner = &mut *self.inner.lock().unwrap();
+        push(inner.vms.entry(vm).or_default(), sample);
+        *inner.vm_pushed.entry(vm).or_insert(inner.total) += 1;
+        inner.total += 1;
     }
 
     /// 마지막 점이 `now`(유닉스 밀리초)보다 [`VM_SERIES_TTL_MS`] 넘게 앞선 VM 시리즈를 지운다.
     pub fn prune(&self, now: i64) {
-        self.inner.lock().unwrap().vms.retain(|_, series| {
+        let inner = &mut *self.inner.lock().unwrap();
+        inner.vms.retain(|_, series| {
             series
                 .back()
                 .is_some_and(|last| now - last.t <= VM_SERIES_TTL_MS)
         });
+        let vms = &inner.vms;
+        inner.vm_pushed.retain(|id, _| vms.contains_key(id));
+    }
+
+    /// `marks` 뒤에 들어온 점들을 돌려주고 `marks`를 지금으로 옮긴다(기록 쓰기가 분마다 부른다). 저장소가 그 사이
+    /// 잘라 낸 점은 없다(1시간 안에 가져가므로).
+    pub fn take_pending(&self, marks: &mut Marks) -> Pending {
+        let inner = self.inner.lock().unwrap();
+        let node = newer(&inner.node, inner.node_pushed, marks.node);
+        marks.node = inner.node_pushed;
+        let mut vms = Vec::new();
+        for (id, series) in &inner.vms {
+            let pushed = inner.vm_pushed.get(id).copied().unwrap_or_default();
+            let mark = marks.vms.get(id).copied().unwrap_or_default();
+            let points = newer(series, pushed, mark);
+            if !points.is_empty() {
+                vms.push((*id, points));
+            }
+        }
+        vms.sort_by_key(|(id, _)| *id);
+        marks.vms = inner.vm_pushed.clone();
+        Pending { node, vms }
+    }
+
+    /// VM 시리즈의 마지막 점 시각(이 노드에서 잰 적이 없거나 지워졌으면 `None`)
+    pub fn last_vm_t(&self, vm: Uuid) -> Option<i64> {
+        let inner = self.inner.lock().unwrap();
+        inner.vms.get(&vm).and_then(|s| s.back()).map(|s| s.t)
+    }
+
+    /// 시리즈가 있는 VM들
+    pub fn vm_ids(&self) -> Vec<Uuid> {
+        self.inner.lock().unwrap().vms.keys().copied().collect()
+    }
+
+    /// `from ≤ t ≤ until`인 노드 점들
+    pub fn node_window(&self, from: i64, until: i64) -> Vec<NodeSample> {
+        let inner = self.inner.lock().unwrap();
+        (inner.node.iter())
+            .filter(|s| (from..=until).contains(&s.t))
+            .cloned()
+            .collect()
+    }
+
+    /// `from ≤ t ≤ until`인 VM 점들
+    pub fn vm_window(&self, vm: Uuid, from: i64, until: i64) -> Vec<VmSample> {
+        let inner = self.inner.lock().unwrap();
+        (inner.vms.get(&vm).into_iter().flatten())
+            .filter(|s| (from..=until).contains(&s.t))
+            .cloned()
+            .collect()
     }
 
     /// 리스 갱신에 실을 부하 요약(설계 §8.3). 노드 CPU는 `now`(유닉스 밀리초)까지 1분·5분 동안의 평균 ‰,
@@ -135,19 +226,44 @@ fn permille(values: impl Iterator<Item = f64>) -> Option<u16> {
     })
 }
 
-/// 이 노드(`node`)의 저장소를 지표 API와 노드 간 서버(`ReadMetrics`)에 읽어 준다.
+/// 이 노드(`node`)의 저장소를 지표 API와 노드 간 서버(`ReadMetrics`)에 읽어 준다. 기록([`History`])이 있으면 기록
+/// 조회(`ReadMetricsHistory`)와 밀어 넘긴 VM 기록 받기(`PushMetricsHistory`)도 한다.
 pub struct StoreSource {
     node: Uuid,
     store: Arc<MetricsStore>,
+    history: Option<Arc<History>>,
 }
 
 impl StoreSource {
     pub fn new(node: Uuid, store: Arc<MetricsStore>) -> Self {
-        Self { node, store }
+        Self {
+            node,
+            store,
+            history: None,
+        }
+    }
+
+    pub fn with_history(mut self, history: Arc<History>) -> Self {
+        self.history = Some(history);
+        self
     }
 }
 
 impl MetricsSource for StoreSource {
+    fn history(&self, q: &HistoryQuery) -> Result<HistoryReply, HistoryError> {
+        self.history
+            .as_ref()
+            .ok_or(HistoryError::Unsupported)?
+            .read(q)
+    }
+
+    fn push_history(&self, vm: Uuid, bytes: &[u8]) -> Result<(), HistoryError> {
+        self.history
+            .as_ref()
+            .ok_or(HistoryError::Unsupported)?
+            .receive(vm, bytes)
+    }
+
     fn read(&self, q: &MetricsQuery) -> MetricsReply {
         let local = self.store.read(q);
         let vms = match (&q.scope, local.vm) {
@@ -364,6 +480,65 @@ mod tests {
         let s = store.summary(now);
         assert_eq!(s.vms.len(), MAX_LOAD_VMS);
         assert_eq!(s.vms.iter().filter_map(|v| v.mem).min(), Some(10));
+    }
+
+    /// 기록 쓰기는 앞서 가져간 뒤의 점만 받는다. 넣은 순서로 세므로 시각이 뒤로 간 점도 받고, 지워졌다 다시 생긴
+    /// VM 시리즈는 처음부터 받는다.
+    #[test]
+    fn pending_points_are_the_ones_pushed_since_the_last_take() {
+        let store = MetricsStore::default();
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let mut marks = Marks::default();
+        assert_eq!(store.take_pending(&mut marks), Pending::default());
+        store.push_node(node(1_000));
+        store.push_vm(a, vm(1_000));
+        let p = store.take_pending(&mut marks);
+        assert_eq!(times(&p.node, |s| s.t), [1_000]);
+        assert_eq!(p.vms.len(), 1);
+        assert_eq!(p.vms[0].0, a);
+        // 아무것도 넣지 않으면 비었다.
+        assert_eq!(store.take_pending(&mut marks), Pending::default());
+        // 시계가 뒤로 간 점도 새 점이다.
+        store.push_node(node(500));
+        store.push_vm(b, vm(2_000));
+        store.push_vm(b, vm(3_000));
+        let p = store.take_pending(&mut marks);
+        assert_eq!(times(&p.node, |s| s.t), [500]);
+        assert_eq!(p.vms.len(), 1);
+        assert_eq!(
+            (p.vms[0].0, times(&p.vms[0].1, |s| s.t)),
+            (b, vec![2_000, 3_000])
+        );
+        // 지워진 뒤 다시 생긴 시리즈
+        store.prune(10_000_000);
+        store.push_vm(a, vm(10_000_000));
+        let p = store.take_pending(&mut marks);
+        assert_eq!(p.vms.len(), 1);
+        assert_eq!(times(&p.vms[0].1, |s| s.t), [10_000_000]);
+        // 상한보다 많이 쌓여도 남은 것까지만
+        for t in 0..(MAX_SAMPLES as i64 + 10) {
+            store.push_node(node(20_000_000 + t));
+        }
+        assert_eq!(store.take_pending(&mut marks).node.len(), MAX_SAMPLES);
+    }
+
+    #[test]
+    fn windows_and_last_points() {
+        let store = MetricsStore::default();
+        let id = Uuid::from_u128(9);
+        for t in [1_000, 2_000, 3_000] {
+            store.push_node(node(t));
+            store.push_vm(id, vm(t));
+        }
+        assert_eq!(
+            times(&store.node_window(2_000, 3_000), |s| s.t),
+            [2_000, 3_000]
+        );
+        assert_eq!(times(&store.vm_window(id, 0, 1_000), |s| s.t), [1_000]);
+        assert!(store.vm_window(Uuid::nil(), 0, 5_000).is_empty());
+        assert_eq!(store.last_vm_t(id), Some(3_000));
+        assert_eq!(store.last_vm_t(Uuid::nil()), None);
+        assert_eq!(store.vm_ids(), [id]);
     }
 
     #[test]
