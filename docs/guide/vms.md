@@ -1,6 +1,6 @@
 # 가상 머신
 
-설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, 라이브 마이그레이션. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, NUMA·전용 CPU·hugepages, 라이브 마이그레이션. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [설치 매체와 cloud-init](#설치-매체와-cloud-init)
 - [템플릿과 링크드 클론](#템플릿과-링크드-클론)
@@ -11,6 +11,7 @@
 - [VM 무중단 유형 변경](#vm-무중단-유형-변경)
 - [CPU 모델과 플래그](#cpu-모델과-플래그)
 - [취약점 때문에 CPU 기능 숨기기](#취약점-때문에-cpu-기능-숨기기)
+- [NUMA·전용 CPU·hugepages](#numa전용-cpuhugepages)
 - [라이브 마이그레이션](#라이브-마이그레이션)
 
 ## 설치 매체와 cloud-init
@@ -961,6 +962,126 @@ VM 하나만이면 1·2단계, 클러스터 전체면 1·3단계부터 따라 �
   게스트 쪽 일이고 Orbivisor가 관리하지 않는다.
 - 숨김은 모델의 정의보다 이긴다. `Icelake-Server-v7`처럼 그 기능이 정의에 든 모델도 `avx512vbmi=off`로 켜므로 모델은 바꾸지
   않아도 된다. 숨긴 VM도 지금처럼 다른 노드로 옮길 수 있다.
+
+## NUMA·전용 CPU·hugepages
+
+VM의 vCPU가 어느 호스트 CPU에서 돌고 메모리가 어느 호스트 NUMA 노드에 놓이는지를 정한다(OpenStack의 `hw:cpu_policy`·
+`hw:numa_nodes`·`hw:mem_page_size`, Proxmox VE의 `numa`·`affinity`·`hugepages`, vSphere의 Latency Sensitivity와 같은 자리).
+**아무것도 주지 않은 VM은 지금 그대로다** — 명령줄·`systemd-run` 인자·스펙과 기록 JSON이 바이트까지 같다. 노드 쪽 준비(어느
+CPU를 전용으로 둘지, hugepages 예약)는 [호스트 준비: 예약·전용 CPU와 hugepages](cluster.md#호스트-준비-예약전용-cpu와-hugepages)에
+있다. 새 칸은 모든 노드가 이 버전이어야 쓴다(노드가 알리는 기능 `numa`, 아니면 **409** `cluster_upgrading`).
+
+| 칸 | 값 | 뜻 |
+|---|---|---|
+| `cpu.policy` | `shared`(기본)·`dedicated` | 공유는 노드의 공유 CPU에서 다른 VM과 나눠 돈다. 전용은 **vCPU 자리마다 노드의 전용 CPU 하나를 독점**한다 |
+| `cpu.thread_policy` | `prefer`(기본)·`isolate`·`require` | 전용 VM만. `prefer`는 코어의 형제 스레드를 먼저 채우고, `isolate`는 vCPU마다 코어 하나(형제는 비워 두고 쓴 것으로 셈), `require`는 vCPU를 형제 짝으로(SMT 호스트만, 소켓당 vCPU 자리가 짝수) |
+| `cpu.emulator` | `shared`(기본)·`isolate` | 전용 VM만. QEMU 자신의 스레드(I/O·관리)를 노드의 공유 CPU에 둘지, 전용 CPU 하나를 더 잡아 거기 둘지 |
+| `numa.nodes` | `auto`·1~8·`[{"cpus":8,"memory_mib":16384}, …]` | 게스트가 보는 NUMA 노드(vNUMA). 노드는 **소켓 단위**라 개수는 `sockets`를 나눠야 하고, 직접 목록의 `cpus`는 vCPU 자리 수(핫플러그 상한 기준, 소켓당 자리의 배수) |
+| `numa.memory` | `strict`·`preferred` | 게스트 노드의 메모리를 맞춘 호스트 노드에 묶는다(QEMU `policy=bind`·`preferred`). 주면 공유 VM도 묶는다 |
+| `hugepages` | `2M`·`1G`·`any` | 게스트 메모리를 노드가 예약한 hugepages로 쓴다(memfd hugetlb + 미리 잡기). `any`는 노드에 있는 큰 것부터 |
+
+- **언제 쓰나.** 지연에 민감한 VM(DB·NFV·실시간 처리)은 `dedicated`로 다른 VM과 pCPU를 다투지 않게 한다. 호스트 NUMA 노드보다
+  큰 VM(vCPU나 메모리가 한 소켓보다 많음)은 게스트가 NUMA를 알도록 `numa`를 준다. 메모리가 큰 VM은 `hugepages`로 TLB 비용을
+  줄인다. 셋은 따로 써도 되고 함께 써도 된다.
+- **`auto`와 소켓.** 게스트 노드는 소켓을 나눠 갖는다(노드 i가 앞 소켓부터 차례로). 그래서 **소켓이 하나인 VM은 늘 노드 하나**다 —
+  나누려면 `--sockets`를 늘린다. `auto`는 소켓 수의 약수 가운데 노드에 맞는 가장 작은 수를 고른다: 묶는 VM(아래)은 호스트에
+  실제로 놓을 수 있는 수, 묶지 않는 VM은 게스트 노드 하나가 가장 작은 호스트 노드(CPU 수·hugepages 밖 메모리)에 들어가는 수다
+  (VMware처럼 호스트 노드보다 클 때만 나눈다). 호스트 노드가 하나면 1이다. 메모리는 고르게 나누고 남는 것을 마지막 노드에
+  준다 — 노드마다 2 MiB의 배수(1G hugepages면 1024 MiB의 배수)여야 한다(아니면 **400** `invalid_numa`).
+- **묶는 VM.** 전용, `hugepages`, `numa.memory` 가운데 하나라도 있으면 "묶는 VM"이다. 게스트 노드마다 **서로 다른** 호스트 NUMA
+  노드 하나를 고르고(OpenStack과 같다), 그 호스트 노드의 전용 CPU·hugepages·메모리에서 잡는다. `numa`를 주지 않은 전용·
+  hugepages VM은 `auto`로 보고 메모리 묶기는 `strict`다(OpenStack도 이런 VM에 NUMA 토폴로지를 준다). 고르는 순서는 호스트 노드
+  사이 거리가 짧은 것 → 맞춘 뒤 남는 것이 적은 것(채우기, 조각을 줄임) → 번호이고, 한 호스트 노드 안에서는 L3 캐시 묶음을 적게
+  걸치는 CPU다. 게스트가 보는 노드 사이 거리(ACPI SLIT)는 맞춘 호스트 노드 사이 거리다. 묶는 공유 VM은 CPU를 잡지 않고 vCPU를
+  그 호스트 노드의 공유 CPU에 둔다.
+- **전용 CPU는 핫플러그 상한까지 잡는다.** `max_vcpus`가 있는 전용 VM은 켤 때 상한만큼 pCPU를 잡는다 — 지금 꺼진 자리도 전용
+  CPU를 쓴다. 그래야 실행 중 vCPU를 붙일 때(`vm set --cores`) 새 pCPU를 구하다 실패하는 일이 없다. 붙인 vCPU는 그 자리의
+  pCPU에 고정되고(실패하면 `device_del`로 되돌리고 핫플러그 단계가 실패로 남는다), 뺀 자리의 pCPU는 그대로 잡혀 있다.
+  hugepages는 부팅 메모리(`memory_mib`)만 미리 잡는다. 메모리 핫플러그(virtio-mem)는 게스트 노드마다 장치 하나씩이고, 2M
+  hugepages면 꽂을 때 미리 잡아 모자라면 그 핫플러그가 실패로 남는다. **`1G` + 메모리 핫플러그(`max_memory_mib`)는 400**이다
+  (virtio-mem 블록이 2 MiB라서). `any` + 메모리 핫플러그는 2M으로 고른다.
+- **권한과 할당량.** 전용 정책이나 `hugepages`가 있는 VM을 만들거나, 그 칸(정책·스레드·에뮬레이터·hugepages)을 바꾸거나, 그런
+  VM을 복제·배포·가져오기·복원하려면 그 폴더에서 권한 **`vm.dedicated`**가 있어야 한다(**403** `dedicated CPUs and hugepages
+  need the vm.dedicated privilege`). 내장 `operator`에는 없다 — 노드의 드문 자원이라 관리자가 따로 준다. 이미 전용인 VM의 vCPU
+  수·메모리는 `vm.config`로 바꾼다. vNUMA·`numa.memory`만 쓰는 공유 VM은 권한이 들지 않는다. 폴더 할당량 **`dedicated_vcpus`**가
+  전용 VM의 `max_vcpus`(+ `emulator isolate`면 1)를 전원과 상관없이 센다([폴더와 권한](folders.md#할당량)). hugepages 메모리는
+  이미 `memory_mib` 할당량에 든다.
+- **전원 껐다 켜기 규칙.** 모양(게스트 노드·페이지 크기·정책)은 QEMU를 띄울 때 정해지고 실행 중에는 바꿀 수 없다. 실행 중인
+  VM의 `cpu.policy`·`thread_policy`·`emulator`·`numa`·`hugepages`를 바꾸면 보류 `numa`(이유 `restart`, `detail`에 바뀐 것 —
+  `shared → dedicated`, `hugepages 1G → 2M`, `NUMA 2 nodes → 1 node` … — 과 "power cycle required; a reboot inside the guest
+  does not apply it")가 생기고 **Orbivisor가 QEMU를 다시 띄울 때**(`vm reboot`, `vm stop` + `vm start`, HA 복구)만 적용된다.
+  게스트 안의 재부팅과 라이브 마이그레이션으로는 적용되지 않는다(CPU 모델의 보류 `cpu`와 같다, [CPU 모델과
+  플래그](#cpu-모델과-플래그)). `vm reboot`은 같은 노드에서 다시 켜므로 그 노드에 새 모양의 자리가 없으면 끄기 전에 **409**
+  `no_capacity`다. 작업자가 스스로 다시 켜는 때(크래시·게스트 감시)는 새 모양이 안 맞으면 꺼지기 전 모양으로 켜고 보류를 남긴다.
+- **켤 때 정하고 기록한다.** 어느 pCPU·어느 호스트 노드는 VM을 켜는 노드가 정해 `status.hardware.numa`(게스트가 보는 모양 —
+  노드마다 소켓·메모리, 거리, 페이지, 정책)와 `status.hardware.host_placement`(그 노드에만 맞는 것 — vCPU 자리마다 pCPU,
+  에뮬레이터 CPU, 게스트 노드마다 호스트 노드, `isolate`가 비워 둔 형제)에 남긴다. 고정은 `sched_setaffinity`로 vCPU 스레드마다,
+  나머지 스레드는 에뮬레이터 집합에 걸고 systemd 스코프의 `AllowedCPUs`가 상한을 쥔다. 누가 `taskset`으로 바꾸면 노드의 검사
+  루프가 30초 안에 기록대로 되돌리고 경고 로그를 남긴다. 켜지 못하면(`failed to start: cannot pin vCPU 3 to CPU 7: …`) QEMU를
+  끈다. hugepages·전용 VM은 메모리를 켤 때 모두 잡으므로 큰 VM은 켜는 데 시간이 걸린다(시간 제한 30초 + 미리 잡는 GiB마다 1초).
+- **노드 고르기.** 스케줄러가 노드마다 전용 CPU·hugepages·NUMA 모양이 맞는지 보고(묶는 VM은 토폴로지가 있는 Linux 노드만),
+  모두 안 되면 **409** `no_node`에 노드마다의 까닭을 준다(`node "n1" has 2 and 3 free dedicated CPUs on host NUMA nodes 0 and 1;
+  the VM needs 4 on one`, `node "n2" has no 1G hugepages`, `node "n3" cannot pin vCPUs (no topology)`). 두 API 노드가 같은 노드의
+  마지막 전용 CPU에 동시에 VM을 놓으면 Raft가 커밋 순서로 하나만 받고(**409** `no_capacity`, `details {node, resource, limit,
+  used}`), 켜기는 그 노드를 빼고 한 번 다시 고른다. macOS 노드는 토폴로지가 없어 공유 vNUMA VM만 켠다.
+- **마이그레이션·HA·균형 조정.** 라이브 마이그레이션은 게스트 모양·페이지 크기·거리를 **켤 때 기록 그대로** 두고 대상 노드가
+  pCPU·호스트 노드만 새로 고른다. 받는 QEMU가 메모리를 모두 미리 잡은 뒤 받으므로 옮기는 중 hugepages가 모자라 게스트가 죽는
+  일은 없다(대신 받는 쪽 준비가 길다). 대상에 자리가 없으면 **409** `migration_unsupported`(`node "n2" cannot place the VM: …`)이고
+  `vm migrate`는 대상의 까닭을 `warning:`으로 먼저 찍는다. 비우기·호스트 종료의 옮기기도 같은 확인으로 대상을 고르고, 모든 후보가
+  안 되면 첫 까닭을 적는다. **HA 복구는 다시 켜기**라 스펙으로 새로 모양을 정한다(`auto`·`any`도 다시 고름). **균형 조정기는 전용
+  VM을 옮기지 않는다**(자기 pCPU에서 돌아 다른 VM과 다투지 않으므로 옮겨 얻는 것이 없다) — 공유 vNUMA VM은 지금처럼 옮긴다.
+  배치 규칙(계획 50)은 그대로 먼저 거른다. 메모리 스냅샷 되돌리기는 찍을 때의 모양 그대로 켠다.
+
+```bash
+# 전용 4 vCPU(코어 독점), 에뮬레이터도 전용 CPU 하나, 1G hugepages, 게스트 NUMA 노드 둘
+orbivisorctl vm create db --sockets 2 --cores 2 --memory 16384 --disk db-root --nic lan \
+  --cpu-policy dedicated --cpu-threads isolate --emulator-threads isolate --numa 2 --hugepages 1G
+orbivisorctl vm start db
+orbivisorctl vm get db >/dev/null        # 표준 오류에 NUMA 줄(모두 기본이고 기록·보류가 없으면 줄 없음)
+# numa: 2 nodes x (2 vCPU, 8 GiB), dedicated (isolate threads, isolated emulator), hugepages 1G
+# numa running: 2 nodes x (2 vCPU, 8 GiB), dedicated, hugepages 1G, memory strict
+# placement: host nodes 0,1, vCPU 0-3 -> CPU 4,6,20,22, emulator 8
+orbivisorctl vm numa db                  # spec·running·placement·pending과 노드마다 NODE FITS PLAN REASON
+# 공유 VM을 호스트 NUMA 노드보다 크게: 소켓 넷, 게스트 노드 자동, 메모리는 선호로 묶기
+orbivisorctl vm create big --sockets 4 --cores 8 --memory 262144 --disk big-root --nic lan --numa auto --numa-memory preferred
+# 노드마다 직접(vCPU 자리:MiB) — 소켓 둘 × 코어 4면 노드마다 자리 4의 배수
+orbivisorctl vm create web --sockets 2 --cores 4 --memory 12288 --disk web-root --nic lan --numa 4:4096,4:8192
+orbivisorctl vm set web --hugepages 2M   # 실행 중이면 보류로 남는다
+# vm web: hardware updated
+# vm web: pending until restart:
+#   numa: 2 nodes -> 2 nodes, hugepages 2M, memory strict (restart: hugepages none → 2M, memory none → strict; power cycle required; a reboot inside the guest does not apply it)
+orbivisorctl vm reboot web               # 전원 껐다 켜기 — 보류 numa가 적용된다
+orbivisorctl vm set web --cpu-policy shared --numa none --hugepages none   # 모두 기본으로(shared는 스레드·에뮬레이터도 지움)
+```
+
+`--numa`는 `none`·`auto`·노드 수·`CPUS:MIB,…`, `--numa-memory`만 주면 vNUMA가 없을 때 `auto`로 만든다. `template deploy`·
+`vm clone`·`import run`·`image get --template`도 같은 여섯 플래그를 받는다(복제·배포의 `--numa none`·`--hugepages none`은 원본의
+값을 지운다). 템플릿은 VM 스펙이라 정책·모양이 복제로 그대로 가고, 백업 복원·원격 복제도 스펙 그대로다(받는 클러스터에 맞는
+노드가 없으면 꺼진 VM으로 만들어지고 켜기가 409와 까닭이다). VMware 가져오기는 공유·vNUMA 없음이 기본이다(VMX의 `numa.*`·
+Latency Sensitivity는 읽지 않는다).
+
+웹은 VM 만들기·편집 › 일반의 접힌 **"CPU 배치와 NUMA"**에 소켓 수, CPU 정책, (전용이면) SMT 스레드·에뮬레이터 스레드, 게스트 NUMA
+노드(없음·자동·개수·노드마다 직접), 호스트 메모리 묶기, Hugepages가 있다. 게스트 노드 개수는 소켓 수의 약수만 보이고, 소켓이
+하나면 "소켓을 늘리세요"라고 알린다. `vm.dedicated`가 없으면 전용·hugepages를 새로 고를 수 없고 까닭이 보인다. 아래에 "이 VM의
+전용 CPU·hugepages가 들어갈 노드"(어림)와, 실행 중 VM이면 "Orbivisor가 전원을 껐다 켤 때 적용"이 보인다. 복제·배포 대화상자와
+가져오기 실행에도 같은 칸이 접혀 있다. VM 상세 › 요약의 **"CPU 배치"**가 설정·켤 때 모양·호스트 NUMA 노드·에뮬레이터 CPU·비워
+둔 형제와 펼치는 vCPU 고정 표(vCPU 자리 → 게스트 노드 → 호스트 노드 → 호스트 CPU)를 보이고, 보류 `numa`는 "전원 껐다 켜기
+필요" 띠와 VM 목록의 "CPU 변경 대기" 보기에 함께 든다. 마이그레이션 대화상자는 둘 수 없는 노드를 "(VM의 CPU·메모리를 둘 수
+없음)"으로 막는다. 화면 위치는 [웹 화면 둘러보기](web-ui.md#numa-화면).
+
+API는 VM `spec.cpu.policy`·`thread_policy`·`emulator`, `spec.numa`, `spec.hugepages`, `status.hardware.numa`·`host_placement`,
+`GET /api/v1/vms/{key}/numa`(`spec`·`wanted`·`running`·`placement`·`pending`과 노드마다 `fits`·`reason`·`plan {host_nodes, pcpus,
+page}` — 루트 `cluster.read`가 없으면 `placement`·`nodes`가 비어 노드 이름·pCPU 번호가 보이지 않는다)다. 오류는 **400**
+`invalid_numa`(소켓을 나누지 않는 노드 수, 합이 맞지 않는 직접 목록, 공유 VM의 스레드·에뮬레이터 정책, `1G` + 메모리 핫플러그,
+`require`인데 소켓당 자리가 홀수 …), **403**(`vm.dedicated`), **409** `cluster_upgrading`·`no_node`·`no_capacity`·
+`migration_unsupported`·`quota_exceeded`(`dedicated_vcpus`)다. 감사 설명 예: `vm create db cpu.policy=dedicated numa=2
+hugepages=1G`.
+
+- **한계.** `mixed` 정책(한 VM 안에 전용·공유 vCPU 섞기)·실시간 vCPU·게스트에 SMT 보이기(게스트 스레드는 늘 1)·iothread와 그
+  고정·vhost 일꾼 따로 묶기·장치 통과의 NUMA 친화는 없다. 핫플러그 VM은 켤 때 vCPU가 소켓 0부터 채워지므로 켤 때 vCPU가 앞
+  게스트 노드에 몰린다. HA 용량 예약(`ha_capacity`)은 메모리만 보고 전용 CPU를 세지 않는다. 게스트 노드 둘 이상에서 실행 중
+  virtio-mem 크기 바꾸기는 명령줄 시험만 했고 실제 KVM으로는 보지 않았다. 웹의 "들어갈 노드"는 노드마다 남은 수만 보는 어림이고
+  호스트 노드 나눔은 켤 때 서버가 본다.
 
 ## 라이브 마이그레이션
 

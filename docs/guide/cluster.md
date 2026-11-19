@@ -1,6 +1,6 @@
 # 클러스터 운영
 
-제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 클러스터 CPU 기준, 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 클러스터 CPU 기준, 호스트 준비(예약·전용 CPU와 hugepages), 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [제어부 가용성](#제어부-가용성)
 - [앞단 프록시와 VIP (API 가용성)](#앞단-프록시와-vip-api-가용성)
@@ -8,6 +8,7 @@
 - [클러스터 통신 다중 링크](#클러스터-통신-다중-링크)
 - [노드 유지보수와 비우기](#노드-유지보수와-비우기)
 - [클러스터 CPU 기준](#클러스터-cpu-기준)
+- [호스트 준비: 예약·전용 CPU와 hugepages](#호스트-준비-예약전용-cpu와-hugepages)
 - [지표](#지표)
 - [알림](#알림)
 - [Prometheus](#prometheus)
@@ -709,6 +710,162 @@ orbivisorctl vm create app --cpu-model cluster ...       # 기준을 쓰는 VM
 - **한계.** 기준은 클러스터에 하나(아키텍처마다)다 — VM별 기준(vSphere per-VM EVC)·폴더 범위 숨김 목록은 없다. VMware VMX의
   EVC 모드는 가져오지 않는다. 노드의 마이크로코드·CPU 취약점 상태(`/sys/devices/system/cpu/vulnerabilities`)는 보이지 않는다.
   노드 목록에 "CPU 모델" 열은 없다(노드 상세에서 본다).
+
+## 호스트 준비: 예약·전용 CPU와 hugepages
+
+[전용 CPU·hugepages VM](vms.md#numa전용-cpuhugepages)을 받을 노드를 준비한다. **아무 설정이 없는 노드는 지금과 같다** — 모든
+CPU가 공유이고, VM에 친화·`AllowedCPUs`를 걸지 않는다. 노드는 자기 NUMA 토폴로지를 스스로 읽어 알리므로, 관리자가 정하는 것은
+CPU를 어떻게 나눌지와 hugepages를 얼마나 예약할지다. **Orbivisor는 커널 명령줄과 다른 호스트 서비스를 고치지 않는다** — 그것은
+아래 길로 관리자가 하고, Orbivisor는 어긋남을 경고로 알린다.
+
+**노드가 알리는 토폴로지.** Linux orbivisord가 등록할 때와 30초마다(검사 루프 여섯 회차, 노드 설정이 바뀐 회차에는 곧바로)
+`/sys/devices/system/{cpu,node}`를 읽어 소켓·코어당 스레드·온라인 CPU, 호스트 NUMA 노드마다 CPU·메모리·hugepages 풀(크기마다
+전체 수), 노드 사이 거리, SMT 형제 묶음, L3 캐시 묶음, 커널이 아는 페이지 크기, `isolcpus`·`nohz_full`을 노드 상태에 쓴다(바뀔
+때만, 2소켓 256 CPU에서 약 1.9 KB). 빈 자원(빈 전용 CPU·빈 hugepages)은 VM을 켤 때마다 바뀌므로 노드 상태에 넣지 않고 VM 기록에서
+셈한다. 커널에 NUMA가 없으면 노드 0 하나로 본다. CPU를 오프라인으로 만들거나 hugepages 수를 바꾸면 30초 안에 보인다. macOS
+노드·위트니스는 토폴로지가 없다(게스트 vNUMA만 되는 노드). 모든 노드가 기능 `numa`를 알릴 때까지는 읽기만 하고 쓰지 않는다.
+
+### 세 CPU 집합
+
+| 집합 | 무엇이 도나 | 정하는 법 |
+|---|---|---|
+| **예약**(`reserved_cpus`) | 호스트 OS·orbivisord. VM 스레드는 두지 않는다 | 관리자가 준다. 비우면 없음 |
+| **전용**(`dedicated_cpus`) | 전용 VM의 vCPU와 `emulator isolate`의 에뮬레이터 스레드만. 한 pCPU에 한 vCPU | 관리자가 준다. 비우면 이 노드는 전용 VM을 받지 않는다 |
+| **공유**(나머지) | 공유 VM 전체와 전용 VM의 `emulator shared` 에뮬레이터 스레드 | 온라인 CPU − 예약 − 전용. 비면 안 된다 |
+
+- 예약이 있으면 orbivisord가 자기 모든 스레드의 친화를 예약 CPU로 둔다(시작할 때와 바뀔 때, 빼면 전체로 되돌림). QEMU·swtpm은
+  띄울 때 공유 집합(전용 VM은 에뮬레이터 집합)으로 다시 걸므로 예약 CPU에 갇히지 않는다.
+- 공유 집합이 바뀌면 검사 루프가 도는 공유 VM의 스레드 친화와 스코프 `AllowedCPUs`를 곧바로 다시 건다(swtpm은 켤 때의 집합에
+  남는다). 전용 VM은 기록된 pCPU 그대로다.
+- 검증(**400** `invalid_host_resources`, `node "n1": …`): 온라인 CPU의 부분집합, 예약·전용이 겹치지 않음, 공유가 비지 않음, 예약의
+  호스트 노드가 있음, 같은 (크기, 호스트 노드)를 두 번 주지 않음. 토폴로지가 없는 노드(macOS·위트니스·아직 알리지 않음)에는 줄 수
+  없다.
+- **바꾸기와 도는 VM.** 도는 전용 VM의 pCPU가 새 전용 집합 밖으로 나가면 **409** `host_cpus_in_use`(`details.vms`), 예약을 Orbivisor
+  VM이 쓰는 hugepages 아래로 줄이면 **409** `hugepages_in_use`(`details.short`, `2M@0: 100 reserved, 128 used`)다. `--force`(웹 "그래도
+  저장")면 쓰고 응답 머리 `orbivisor-warning`에 VM과 밖으로 나간 CPU를 적는다 — 그 VM은 기록된 pCPU에 그대로 있다가 다음 전원 껐다
+  켜기 때 새 전용 집합에서 다시 고른다.
+- `PUT /nodes/{key}`에서 `host_resources` 칸이 **없으면 그대로 둔다**(이 칸을 모르는 옛 클라이언트가 노드 설정을 조용히 지우지
+  않게). 지우기는 `{}`(CLI `--clear`)다. 감사 설명 예: `node set n1 host_resources dedicated=4-31 reserved=0-1 hugepages=2M:1024@0`.
+
+```bash
+orbivisorctl node topology node1               # 토폴로지·세 집합·호스트 노드마다 사용·도는 VM의 고정·경고
+orbivisorctl node topology node1 --live        # 노드에 직접 물은 빈 메모리·빈/남는 hugepages·orbivisord 친화도
+orbivisorctl node resources node1              # 지금 설정(없으면 none)
+orbivisorctl node resources node1 --reserved-cpus 0,16,32,48 --dedicated-cpus 4-15,20-31,36-47,52-63 \
+  --hugepages 2M:4096@0,2M:4096@1             # 준 칸만 바꾼다(If-Match로 쓴다)
+# node node1: dedicated=4-15,20-31,36-47,52-63 reserved=0,16,32,48 hugepages=2M:4096@0,2M:4096@1
+orbivisorctl node resources node1 --dedicated-cpus 8-15,24-31,40-47,56-63 --force   # 도는 전용 VM이 있어도
+orbivisorctl node resources node1 --clear      # 설정 지우기(공유 = 모든 CPU, 지금과 같다)
+```
+
+웹은 인프라 › 노드 › 노드 상세의 **"NUMA 토폴로지"**(격자·호스트 노드 표·거리·경고)와 관리자의 **"호스트 자원 설정"** 대화상자,
+노드 목록의 "전용 CPU"·"Hugepages" 열이다([웹 화면 둘러보기](web-ui.md#numa-화면)). API는 `GET /api/v1/nodes/{key}/topology`·
+`GET /api/v1/topology/usage`(루트 `cluster.read`), `PUT /api/v1/nodes/{key}`의 `host_resources`(`cluster.admin`, `?force=true`)다.
+
+### hugepages: 부팅 때와 실행 중 예약
+
+Orbivisor VM은 hugepages를 memfd hugetlb로 쓰므로 **hugetlbfs 마운트는 필요 없다**. 노드가 가진 풀(크기·호스트 노드마다 전체
+수)을 스케줄러가 세고, VM을 켤 때 미리 잡는다(prealloc). 풀은 두 길로 만든다.
+
+- **부팅 때(커널 명령줄, 1G에 권함).** 1G 페이지는 연속된 1 GiB가 있어야 해서 부팅 뒤에는 조각 때문에 모자라기 쉽다.
+  `hugepagesz=1G hugepages=64`(커널이 노드에 고르게 나눔) 또는 노드마다 `hugepagesz=1G hugepages=0:32,1:32`. 2M도 이렇게 해도 된다.
+- **실행 중(노드 설정, 2M에 알맞음).** `node resources --hugepages 2M:4096@0,1G:8@1`(크기:페이지 수[@호스트 노드])을 주면
+  orbivisord가 시작할 때와 설정이 바뀔 때 `/sys/devices/system/node/node<N>/hugepages/hugepages-<kB>kB/nr_hugepages`(호스트 노드를
+  안 정하면 `/sys/kernel/mm/hugepages/…`)에 그 수를 쓴다. 커널이 덜 잡으면 다시 시도하지 않고 경고로 남긴다(다시 하려면 설정을
+  바꾸거나 orbivisord를 다시 시작). 설정에서 뺀 예약은 커널의 수를 **그대로 둔다**(다른 쓰임새일 수 있다 — 되돌리려면 직접
+  `echo 0 > …/nr_hugepages`). 부팅 때 예약한 수와 같은 값이면 쓰지 않는다.
+- **메모리 셈.** hugepages 풀은 보통 VM이 쓸 수 없으므로 스케줄러의 빈 메모리(순위·비우기·마이그레이션 확인)는 노드 메모리에서
+  풀을 뺀 값이고, hugepages VM의 메모리는 풀에서 센다. 풀을 크게 잡으면 공유 VM이 들어갈 메모리가 그만큼 준다.
+
+### 호스트 프로세스 떼어 두기: isolcpus와 cgroup
+
+전용 CPU에서 VM의 vCPU만 돌게 하려면 다른 호스트 프로세스와 인터럽트를 그 CPU 밖으로 보내야 한다. Orbivisor가 하는 것과 하지
+않는 것:
+
+- **Orbivisor가 하는 것.** VM마다 systemd 스코프(`opl-vm-<id>`)에 `AllowedCPUs=`(cgroup v2 `cpuset.cpus` — 전용 VM은 자기 pCPU ∪
+  에뮬레이터 CPU, 공유 VM은 공유 집합)를 걸고, QEMU의 모든 스레드에 `sched_setaffinity`를 건다(vCPU는 자리마다 pCPU 하나, 나머지는
+  에뮬레이터 집합). `AllowedCPUs`는 cgroup v2에 `cpuset` 컨트롤러가 있고 `[hypervisor] systemd_scope`가 켜져 있을 때만이다(노드
+  토폴로지의 `cpuset`). 없으면 친화만 건다 — root는 친화를 넓힐 수 있으므로 상한은 스코프가 쥔다. 커널 일꾼 스레드(`kvm-nx-lpage-
+  recovery`·`vhost-*`, `PF_USER_WORKER` 등)는 커널이 친화를 정하므로 건드리지 않는다(스코프 cpuset 안에 있다). 검사 루프가 30초마다
+  스레드 친화를 기록과 견줘 다르면 되돌린다.
+- **관리자가 하는 것(권함).**
+  1. **모든 서비스를 예약 ∪ 공유로**: `/etc/systemd/system.conf`의 `CPUAffinity=`(재부팅 뒤 PID 1과 모든 서비스가 물려받음).
+     orbivisord는 그 안에서 다시 예약 CPU로 좁히고, QEMU는 root로 친화를 넓혀 전용 CPU에 vCPU를 둔다.
+  2. **지연이 중요하면 커널에서 떼기**: `isolcpus=domain,managed_irq,<전용>`(스케줄러 부하 분산과 관리 인터럽트에서 뺌)과
+     `irqaffinity=<예약>`. 선택으로 `nohz_full=<전용>`·`rcu_nocbs=<전용>`(타이머 틱·RCU 콜백 떼기). `isolcpus`의 CPU는 커널이 부하를
+     옮기지 않으므로 고정한 스레드만 돌 곳에만 준다 — 공유 CPU에 주면 공유 VM의 스레드가 한 CPU에 몰린다.
+  3. **`system.slice`를 묶지 않는다.** VM 스코프가 `system.slice` 안에 있으므로 `systemctl set-property system.slice AllowedCPUs=`는
+     VM까지 묶는다(VM 스코프를 따로 된 슬라이스로 옮기는 것은 하지 않았다).
+- **"전용 CPU가 하는 일"과 SMT.** 한 코어의 두 스레드는 실행 장치를 나눠 쓴다. 전용 집합은 형제 짝을 통째로 넣는다(나누면 경고).
+  같은 코어의 형제를 다른 VM과도 나누기 싫으면 VM에 `--cpu-threads isolate`(vCPU마다 코어 하나, 형제는 비워 둠)를 준다.
+
+### opld가 보이는 경고
+
+`node topology`의 `warning:` 줄, 노드 상세의 경고 띠에 그대로 보인다. 노드 설정이 있을 때만 셈한다.
+
+| 경고 | 뜻과 할 일 |
+|---|---|
+| `host processes may run on the dedicated CPUs 4-5; see the host preparation guide` | 그 전용 CPU가 `isolcpus`에 없고 PID 1의 `Cpus_allowed_list`에 들어 있다. 위 1·2를 한다 |
+| `dedicated CPUs 7 are offline` (예약도 같은 꼴) | 설정의 CPU가 오프라인이다. 켜거나 설정에서 뺀다 |
+| `the dedicated CPUs split SMT sibling groups 0,32 1,33` | 전용 집합이 코어의 형제 짝을 나눈다. 짝을 함께 넣거나 함께 뺀다 |
+| `node 0: 2M hugepages 4096 wanted, 3900 reserved` | 실행 중 예약이 모자란다(조각). 수를 줄이거나 부팅 때 예약한다 |
+| `nr_hugepages`를 쓰지 못한 까닭, opld 친화를 걸지 못한 까닭 | 권한·커널 문제. 로그와 함께 본다 |
+| (`--live`) `live: orbivisord does not run on the reserved CPUs` | orbivisord의 친화가 예약 CPU와 다르다(웹 "orbivisord가 아직 예약 CPU에서 돌지 않습니다") |
+
+### 예: 2소켓 호스트
+
+소켓 2 × 코어 16 × 스레드 2 = 64 CPU, 메모리 512 GiB(호스트 노드마다 256 GiB). Linux 번호는 노드 0이 `0-15,32-47`, 노드 1이
+`16-31,48-63`이고 CPU i와 i+32가 형제다(`node topology`로 확인한다 — 번호 매김은 기계마다 다르다).
+
+| 쓰임 | CPU | 메모 |
+|---|---|---|
+| 예약 | `0,16,32,48` | 소켓마다 코어 하나(형제 포함) — 호스트·orbivisord·인터럽트 |
+| 공유 | `1-3,17-19,33-35,49-51` | 소켓마다 코어 셋 — 공유 VM, 전용 VM의 에뮬레이터 |
+| 전용 | `4-15,20-31,36-47,52-63` | 소켓마다 코어 열둘(형제 포함, 48 CPU) |
+| hugepages | 1G 64장(노드마다 32), 2M 8192장(노드마다 4096) | 1G는 부팅 때, 2M은 실행 중. 보통 메모리로 남는 것은 노드마다 약 216 GiB |
+
+```bash
+# 1) 커널 명령줄(/etc/default/grub의 GRUB_CMDLINE_LINUX에 더한 뒤 update-grub, 재부팅)
+#    hugepagesz=1G hugepages=0:32,1:32 isolcpus=domain,managed_irq,4-15,20-31,36-47,52-63 irqaffinity=0,16,32,48
+# 2) 모든 서비스를 예약 ∪ 공유로(/etc/systemd/system.conf, 재부팅 뒤)
+#    CPUAffinity=0-3 16-19 32-35 48-51
+# 3) Orbivisor 노드 설정
+orbivisorctl node resources node1 --reserved-cpus 0,16,32,48 --dedicated-cpus 4-15,20-31,36-47,52-63 --hugepages 2M:4096@0,2M:4096@1
+orbivisorctl node topology node1
+# cpus: 0-63 (2 socket(s), 2 thread(s) per core)
+# reserved: 0,16,32,48  dedicated: 4-15,20-31,36-47,52-63  shared: 1-3,17-19,33-35,49-51
+# isolcpus: 4-15,20-31,36-47,52-63
+# HOST-NODE  CPUS         MEMORY   DEDICATED(USED/ALL)  HUGEPAGES(USED/ALL)
+# 0          0-15,32-47   256 GiB  -/4-15,36-47         1G 0/32, 2M 0/4096
+# 1          16-31,48-63  256 GiB  -/20-31,52-63        1G 0/32, 2M 0/4096
+# distances: 10 21 | 21 10
+```
+
+이 노드에는 전용 VM의 vCPU가 노드 하나에 24개까지(`prefer`), `isolate`면 코어 단위라 12개까지 들어간다. 게스트 노드가 둘인 VM은
+두 호스트 노드에 하나씩 놓인다.
+
+### OpenStack·Proxmox VE와 견주기
+
+| | OpenStack Nova | Proxmox VE 8 | Orbivisor |
+|---|---|---|---|
+| 노드 CPU 나누기 | `nova.conf` `[compute] cpu_dedicated_set`·`cpu_shared_set` | 없음 | 노드 설정 `reserved_cpus`·`dedicated_cpus`, 공유는 나머지 |
+| VM CPU 정책 | flavor `hw:cpu_policy=shared\|dedicated\|mixed` | 없음(`affinity`: QEMU 프로세스 전체의 CPU 목록) | `cpu.policy` `shared`·`dedicated`(mixed 없음) |
+| 스레드·에뮬레이터 | `hw:cpu_thread_policy=prefer\|isolate\|require`, `hw:emulator_threads_policy=share\|isolate` | 없음 | `--cpu-threads` 같은 셋, `--emulator-threads shared\|isolate` |
+| vNUMA | `hw:numa_nodes`, `hw:numa_cpus.N`·`hw:numa_mem.N` | `numa: 1`, `numaN: cpus=,hostnodes=,memory=,policy=` | `--numa auto\|N\|CPUS:MIB,…`(노드는 소켓 단위) |
+| 메모리 묶기 | NUMA VM은 늘 strict | `policy=bind\|preferred\|interleave` | `--numa-memory strict\|preferred`(전용·hugepages는 strict) |
+| hugepages | `hw:mem_page_size=small\|large\|any\|2MB\|1GB`, 커널 명령줄로 예약 | `hugepages: 2\|1024\|any`, 켤 때 노드마다 할당·끌 때 반납 | `--hugepages 2M\|1G\|any`, 커널 명령줄이나 노드 설정의 실행 중 예약 |
+| 자원 세기 | placement `PCPU`·`VCPU` + NUMATopologyFilter | 없음(사람이 고름) | Raft 받아들이기 검사 + 스케줄러 NUMA 맞춤 + 노드 할당기 |
+| 마이그레이션 | 대상에서 고정을 다시 셈 | 같은 설정 그대로 | 게스트 모양은 기록 그대로, 대상이 pCPU를 다시 고름 |
+
+- OpenStack에서 오면: `cpu_dedicated_set` → `--dedicated-cpus`, `cpu_shared_set` → 남는 것(예약을 뺀), flavor 속성 → VM 플래그(값 이름이
+  거의 같다 — 에뮬레이터의 `share`는 `shared`). 호스트 예약 메모리(`reserved_host_memory_mb`)에 해당하는 것은 없다.
+- Proxmox VE에서 오면: `affinity`는 QEMU 프로세스 전체를 한 CPU 목록에 두는 것이라 vCPU마다 고정하지 않고 다른 VM도 막지 않는다 —
+  가장 가까운 것은 `dedicated`다. `hugepages`는 켤 때 할당하지 않고 노드 풀에서 쓴다(1G를 켤 때 할당하면 조각으로 실패하기 쉽고,
+  풀이어야 스케줄러가 셀 수 있다). `numaN: hostnodes=`처럼 호스트 노드를 손으로 고르지 않는다 — 켜는 노드가 고른다.
+
+- **한계.** 커널 명령줄·`CPUAffinity=`·IRQ 친화를 Orbivisor가 쓰지 않는다(보고만). VM 스코프를 따로 된 슬라이스로 옮겨 호스트를
+  cgroup으로 떼는 것, 호스트 예약 메모리, HA 용량 예약의 전용 CPU 셈, 노드 안 조각 모음(전용 VM 다시 고정), 메모리 대역폭·캐시
+  나누기(Intel RDT·AMD PQoS), 자동 NUMA 균형(`numa_balancing`) 상태 보이기는 없다. aarch64 64K 커널의 512M 풀은 세지 않는다(2M·1G만).
 
 ## 지표
 

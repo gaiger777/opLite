@@ -329,3 +329,20 @@
 - **노드 격자에 소켓 층은 없다**: 토폴로지에 CPU마다 소켓 번호가 없어 호스트 노드 › L3 › 코어(형제) › 스레드로 그린다. 호스트 자원 설정의 처음 값은 노드 스펙의 `host_resources`이고, 409 `host_cpus_in_use`·`hugepages_in_use`면 `details`(VM·모자란 것)를 보이고 단추가 "그래도 저장"(`?force=true`)이 되며 `orbivisor-warning`은 알림으로 보인다. 모두 비우면 `{}`로 지운다.
 - **노드 목록 열 둘**은 우선순위 3(1280px 미만에서 숨김), 폴더 할당량 "전용 vCPU"는 쓰거나 상한이 있을 때만 막대를 보인다.
 - 복제·배포·가져오기의 접힌 칸(`NumaChoice`)은 바꾼 칸만 보낸다. 스레드·에뮬레이터를 기본으로 되돌리면 `prefer`·`shared`를 보내고(덮어쓰기에 지움이 없다), 가져오기는 `no_numa`·`no_hugepages`를 쓰지 않는다.
+
+### 스테이지 7 (문서)
+
+- **"호스트 준비"는 `docs/guide/cluster.md`에 두었다**(§13 그대로, 따로 된 `numa.md`를 만들지 않음): 노드 설정·커널 명령줄·
+  systemd라 노드 운영 문서에 맞고, 바로 앞 절 "클러스터 CPU 기준"과 이웃한다. 절은 노드가 알리는 토폴로지, 세 CPU 집합(검증·409·
+  `force`·`PUT`에서 칸이 없으면 그대로), hugepages 부팅 때·실행 중 예약과 메모리 셈, `isolcpus`·`CPUAffinity=`·`system.slice`를 묶지
+  않는 까닭과 Orbivisor가 거는 `AllowedCPUs`·친화, opld 경고 표, 2소켓 64 CPU 예(커널 명령줄·`system.conf`·`node resources`·`node
+  topology` 출력), OpenStack·Proxmox VE 견주기다. opld 경고의 "see the host preparation guide"가 이 절을 가리킨다.
+- **`docs/guide/vms.md` "NUMA·전용 CPU·hugepages"**: 칸 표, `auto`와 소켓(웹 폼의 소켓 칸 — 스테이지 6 인계), 묶는 VM, 핫플러그 상한까지
+  잡기, 권한·할당량, 전원 껐다 켜기 규칙, 켤 때 기록과 어긋남 고치기, 노드 고르기의 까닭, 마이그레이션·HA·균형 조정, CLI·웹·API, 한계.
+  CLI 예의 출력 줄은 `oplctl/src/numa.rs`의 `numa_lines`·`spec_text`·`placement_text`와 opl-types `pending_change`·`describe`의 글꼴을
+  따라 손으로 적었다(cargo를 돌리지 않음 — 리뷰가 같은 때 코드를 읽는다).
+- **`docs/architecture.md`에 §9.7을 더했다**(탐침, 세 층의 자원 세기, 기록, 명령줄과 고정, 어긋남 고치기, 업그레이드)와 §3.2 표의
+  `HostResourcesExceeded` 줄, §6.1 `ReadTopology`(RPC 28개), §8.4 보류 `numa`, §9.1 vNUMA, §14 기능 `numa`. 줄 번호는 이 브랜치
+  `656c72d`의 것이다.
+- `web-ui.md` "NUMA 화면", `folders.md`의 `vm.dedicated`(operator에서 뺀 까닭)·`dedicated_vcpus`, `development.md`의 시험 명령(root로 도는
+  `numa-it`와 `install-media`의 게스트 vNUMA), README·`docs/index.md`, 계획 문서 `2026-11-19-plan64-numa.md`.

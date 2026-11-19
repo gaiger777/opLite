@@ -59,6 +59,26 @@ cargo test -p opld --features cpu-it --test cpu
 # 클라우드 이미지의 /proc/cpuinfo에 없음, 실행 중 --no-cpu-flags는 보류로 남고 vm reboot 뒤 다시 보임(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
   cargo test -p opld --features install-media-it,qemu-it --test install_media a_hidden_cpu_flag_is_absent_in_a_real_guest -- --nocapture
+# NUMA·전용 CPU·hugepages(계획 64)
+cargo test -p opl-types numa                                        # 순수: serde 하위 호환(옛 JSON 바이트 그대로), CpuSet, layout·fit·fit_fixed·demand·pinning 표, 장부 exceeded, 보류 numa
+cargo test -p opl-qemu cmdline                                      # 명령줄: 안 쓰는 VM은 바이트 그대로, 공유 vNUMA, 전용 1G 묶기·거리, 노드마다 virtio-mem, aarch64
+cargo test -p opld --lib topology                                   # 노드 탐침 고정물(crates/opld/tests/fixtures/topology/{x86-2s,aarch64-1n,x86-no-numa,x86-offline}), 경고, 크기 4 KB 안
+cargo test -p opl-cluster hosts                                     # Raft 받아들이기 검사: 노드마다 셈, 늘지 않는 쓰기, 마이그레이션 확정, any
+cargo test -p opl-cluster --test three_nodes concurrent_creates_and_starts_on_two_nodes_keep_the_dedicated_cpus   # 두 팔로워가 동시에 만들고 켜도 전용 CPU 4개에 4번만
+cargo test -p opl-reconciler --test numa                            # 노드 할당기(Mock): 전용 배치·기록·고정, /sys 빈 hugepages, 켜는 중 예약의 기다림, 다시 고정
+cargo test -p opl-api --test numa --test incoming                   # API(Mock 노드 셋): 검증·기능 게이트, vm.dedicated·dedicated_vcpus, host_resources 409·force, 켜기 배치, 받는 쪽 다시 고르기
+# 실제 Linux(QEMU 필요): 이 호스트 탐침(JSON을 찍음), 2M hugepages 실행 중 예약·되돌리기, 스레드 친화, 실제 VM의 vCPU·에뮬레이터 고정과
+# 스코프 cpuset, 2M hugepages 백엔드, 공유 VM, 동시에 켠 전용 VM 둘의 409, 실행 중 붙인 vCPU, 한 호스트의 orbivisord 둘 사이 마이그레이션 뒤
+# 다시 고정. /sys에 쓰는 시험(hugepages 예약)은 root와 OPL_TEST_NUMA_SYS=1일 때만 돈다 — 배포 서버에서 기능만 켜고 돌려도 호스트 설정을
+# 바꾸지 않게. 시험이 예약한 hugepages는 끝에 원래 수로 되돌린다. CI linux-kvm은 아래처럼 root로(FEATURES에 opld/numa-it, env에
+# OPL_TEST_NUMA_SYS=1, OPL_TEST_SYSTEMD=1) 돈다. 러너는 4 vCPU·NUMA 노드 하나라 호스트 노드 둘 이상의 맞춤·1G·SMT는 고정물·Mock만 본다.
+cargo test -p opld --features numa-it --lib topology::real -- --nocapture
+sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 OPL_TEST_NUMA_SYS=1 CARGO_TARGET_DIR=/tmp/opl-root-target \
+  cargo test -p opld --features qemu-it,numa-it --lib --test numa -- --nocapture
+# x86_64 Linux, KVM: 실제 게스트 — Ubuntu 24.04 클라우드 이미지를 --sockets 2 --numa 2로 켜 게스트의 /sys/devices/system/node/node*/
+# cpulist·MemTotal을 보고(노드 둘, 소켓마다 CPU 하나, 메모리 반씩), 기록 numa의 모양(CI install-media 작업)
+OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
+  cargo test -p opld --features install-media-it,qemu-it --test install_media a_guest_sees_its_numa_nodes -- --nocapture
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -200,6 +220,7 @@ pnpm -C web dev              # http://localhost:5173, /api는 OPLD_URL(기본 ht
 pnpm -C web test             # 단위·컴포넌트 테스트 (Vitest) — axe 접근성 검사와 색 토큰 대비 시험 포함
 pnpm -C web test src/tokens.test.ts   # 색 토큰 대비만: index.css의 밝음·어두움 oklch 값으로 글 4.5:1, 상태 칩 4.5:1, 포커스 링·차트 3:1
 pnpm -C web test src/cpu           # CPU 모델 고르기·플래그 칩·보류 표시·설정의 CPU 칸(msw)
+pnpm -C web test src/numa          # CPU 배치·NUMA 칸, 들어갈 노드 어림, vCPU 고정 표, 노드 토폴로지 격자, 호스트 자원 대화상자 409(msw)
 pnpm -C web typecheck && pnpm -C web lint
 pnpm -C web gen:api          # API를 바꾼 뒤 src/api/schema.d.ts를 다시 만든다(CI가 확인한다)
 pnpm -C web exec playwright install chromium
@@ -209,7 +230,8 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 
 브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 영역 탭으로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
 일괄 막대로 강제 정지하고, VM 동작 메뉴(⋯)로 복제·편집·지우기를 하고, 노드 상세의 "CPU 모델" 칸(실제 탐침이 읽은 QEMU와
-다시 읽기 단추)과 설정 › 일반의 CPU 기준 칸을 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
+다시 읽기 단추)과 설정 › 일반의 CPU 기준 칸을 보고, 꺼진 VM을 소켓 2·게스트 NUMA 노드 2로 고쳐 요약을 보며, 노드 상세의 "NUMA
+토폴로지"(Linux는 탐침 요약, macOS는 "알리지 않았습니다")를 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
 시험이 잡지 못하는 경로 이동·렌더 문제가 있으므로 **웹을 바꾸면 커밋 전에 이 Mac에서 돌린다.** 실패하면
 `web/test-results/*/error-context.md`(화면 스냅숏)와 `trace.zip`이 남는다.
 

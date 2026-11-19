@@ -4,7 +4,8 @@ Orbivisor가 안에서 어떻게 움직이는지를 한 문서로 모은다. 읽
 쓰는 법은 [사용 안내](guide/)에, 각 기능을 왜 그렇게 정했는지는 [설계 문서](index.md#설계와-계획)에 있다.
 
 - 이 문서는 2026-11-19의 `main`(계획 62까지) 코드를 읽고 썼다. 설계 문서와 코드가 다르면 코드를 따랐고, 다른 곳은
-  본문에 "설계와 다름"으로 적었다. 계획 63(게스트 CPU 모델·클러스터 CPU 기준)은 §4·§9.1·§9.6·§14에 더했다.
+  본문에 "설계와 다름"으로 적었다. 계획 63(게스트 CPU 모델·클러스터 CPU 기준)은 §4·§9.1·§9.6·§14에, 계획 64(NUMA·전용 CPU·hugepages)는
+  §3.2·§6.1·§8.4·§9.1·§9.7·§14에 더했다(그 인용의 줄 번호는 계획 64 브랜치 `656c72d`의 것).
 - 인용은 `crates/<크레이트>/src/<파일>:<줄>` 꼴이다. 줄 번호는 이 시점의 것이라 코드가 바뀌면 조금씩 어긋난다.
 - 확인하지 못한 것은 [§19 확인하지 못한 것](#19-확인하지-못한-것)에 모았다.
 
@@ -319,7 +320,8 @@ ReadIndex }`다(`types.rs:114-162`).
 | 종류 안에서 이름 중복 | `NameTaken` | 409 `name_taken` | 〃 |
 | 배타성: VM 디스크 볼륨·NIC MAC은 모든 VM에서 하나, 스냅샷 이름은 VM마다 하나, 폴더 이름은 형제끼리 대소문자 무시하고 하나 | `InUse` 등 | 409 `volume_in_use`·`mac_in_use`·`name_taken` | `crates/opl-cluster/src/exclusive.rs:11-38`, `state_machine.rs:478-524` |
 | 폴더: 부모가 같은 트리에 있음, 순환, 깊이 16, 빈 폴더만 지우기 | `FolderCycle`·`FolderTooDeep`·`FolderNotEmpty` | 409 | `crates/opl-cluster/src/folders.rs:127-227` |
-| 폴더 할당량(vcpus, memory_mib, disk_bytes, vms) | `QuotaExceeded` | 409 `quota_exceeded` | `folders.rs:272-460` |
+| 폴더 할당량(vcpus, memory_mib, disk_bytes, vms, dedicated_vcpus) | `QuotaExceeded` | 409 `quota_exceeded` | `folders.rs:272-460` |
+| 노드 자원(전용 CPU 수, 크기마다 hugepages MiB — 계획 64) | `HostResourcesExceeded` | 409 `no_capacity`(`details {node, resource, limit, used}`) | `crates/opl-cluster/src/hosts.rs:40,131` |
 
 - 할당량은 "상한을 넘고 **또 사용량이 느는** 쓰기"만 거부한다. 노드 바꾸기·이름 바꾸기·줄이기는 훑지 않는다.
   VM 사용량은 배타성 검사와 같은 훑기에서 센다.
@@ -629,7 +631,7 @@ Task는 이름 순으로 VM을 하나씩 라이브 마이그레이션하고 hard
 
 ### 6.1 opl-peer gRPC
 
-- 서비스 하나 `opl.peer.v1.Peer`에 RPC 27개다. **`.proto` 파일이 없다.** `crates/opl-peer/build.rs`가
+- 서비스 하나 `opl.peer.v1.Peer`에 RPC 28개다. **`.proto` 파일이 없다.** `crates/opl-peer/build.rs`가
   `tonic_build::manual`로 서비스를 정의하고, 메시지는 protobuf가 아니라 serde JSON 코덱이다(일부는 바이너리 코덱)
   (`build.rs:1-19`, `crates/opl-peer/src/codec.rs`).
 - 포트는 `cluster_listen`(기본 8007). 메시지 최대 64 MiB, HTTP/2·TCP keepalive 10초(제한 20초)
@@ -648,6 +650,7 @@ Task는 이름 순으로 VM을 하나씩 라이브 마이그레이션하고 hard
 | `GuestAgent` | 게스트 정보, 비밀번호 설정 |
 | `ReadAudit`, `ReadMetrics`, `ReadMetricsHistory`, `PushMetricsHistory`, `ReadAlerts` | 노드 로컬 자료 읽기·지표 기록 넘기기 |
 | `FenceStatus`, `ReadPlacement`, `NodeDisks`, `CephStatus` | 전원 상태, 배치 현황, Ceph 구성 |
+| `ReadTopology` | 노드의 실시간 빈 메모리·빈/남는 hugepages·orbivisord 친화(계획 64, 노드 토폴로지 화면) |
 
 ### 6.2 mTLS와 클러스터 CA
 
@@ -907,7 +910,9 @@ graph TD
   8개에 virtio-blk 디스크·NIC 더하기와 돌면서 더한 것 빼기, CD 미디어 바꾸기(`crates/opl-qemu/src/cmdline.rs:14-279`).
 - **미뤄짐(`status.hardware.pending`)**: 재시작이 필요한 것(CPU 모델·토폴로지, 최대값, 펌웨어, 머신, cloud-init, TPM,
   Secure Boot, 게스트 에이전트 …), 지원 안 됨, 한도, 실패(`vm.rs:953,991-1002`). 다음에 끄고 켜면 적용된다. 보류 `cpu`는
-  스펙뿐 아니라 클러스터 CPU 기준·숨김 목록이 바뀌어도 생기고, 그것은 각 노드의 검사 루프가 다시 셈해 쓴다(§9.6).
+  스펙뿐 아니라 클러스터 CPU 기준·숨김 목록이 바뀌어도 생기고, 그것은 각 노드의 검사 루프가 다시 셈해 쓴다(§9.6). 보류 `numa`(계획 64)는 CPU 정책·스레드·에뮬레이터·vNUMA·hugepages가 켤 때 기록
+  (`hardware.numa`)과 다를 때다(§9.7). 전용 VM의 vCPU 핫플러그는 켤 때 상한까지 잡아 둔 pCPU에 새 스레드를 고정하고, virtio-mem은
+  게스트 노드마다 장치 하나다.
 - 그 밖의 디스크·NIC 변경은 409로 거부한다.
 
 ---
@@ -922,6 +927,8 @@ graph TD
 - `-machine q35|virt[,smm=on],accel=kvm|hvf|tcg`, `-cpu <model>[,enforce][,<flag>=on|off]…`(계획 63, `cpu_option`
   `crates/opl-qemu/src/cmdline.rs:356`). 모델·플래그는 켤 때 해석해 기록한 `ResolvedCpu`에서 온다(§9.6). 기록이 없으면(계획 63
   전, 업그레이드 중) 예전처럼 `-cpu host`(TCG나 모델 Max면 `max`)다.
+- vNUMA·hugepages·호스트 노드 묶기(계획 64)는 켤 때 기록 `hardware.numa`가 있을 때만 게스트 노드마다 메모리 백엔드와 `-numa`를
+  더한다(§9.7). 없으면 `-m`만으로 지금과 바이트까지 같다.
 - 디스크는 `-blockdev`(file, host_device, rbd 드라이버) + virtio-blk-pci 또는 SATA(ide-hd). NIC는 virtio-net-pci 또는
   e1000e, tap(Linux) 또는 user(macOS). VXLAN 망이면 `host_mtu`.
 - VNC는 유닉스 소켓, QMP 소켓, pid 파일. QMP 클라이언트는 비동기(`crates/opl-qemu/src/qmp.rs`).
@@ -1022,6 +1029,67 @@ flowchart LR
 - **업그레이드.** 모든 노드가 기능 `cpu-models`를 알릴 때까지 노드는 카탈로그·`NodeStatus.cpu`를 쓰지 않고, 리더는 기준을
   쓰지 않으며, reconciler는 `cpu_resolved`를 기록하지 않는다(§14). 쓰는 법은 [CPU 모델과 플래그](guide/vms.md#cpu-모델과-플래그)·
   [클러스터 CPU 기준](guide/cluster.md#클러스터-cpu-기준).
+
+### 9.7 NUMA 토폴로지, 전용 CPU·hugepages 장부, vCPU 고정 (계획 64)
+
+```mermaid
+flowchart LR
+  S["/sys/devices/system"] -->|"TopologyWatch 30초"| N[opld 검사 루프]
+  N -->|"NodeStatus.topology, 바뀔 때만"| R[(Raft)]
+  A["API 스케줄러: Inventory.host_usage + numa::fit"] -->|spec.node| R
+  R -->|"HostCheck: 노드마다 합계"| R
+  R --> W["reconciler 켜기: HostAllocator.claim"]
+  W -->|"-numa·memfd·host-nodes, pre_exec 친화, AllowedCPUs"| Q[QEMU]
+  W -->|"hardware.numa + host_placement"| R
+  P["PinWatch 30초: host_alloc::repin"] --> Q
+```
+
+- **탐침.** `crates/opld/src/topology.rs:122` `probe(sys, proc)`가 `/sys/devices/system/{cpu,node}`·`/proc/meminfo`를 읽어
+  `NodeTopology`(소켓·코어당 스레드·온라인 CPU, 호스트 노드마다 CPU·메모리·hugepages 풀, 거리, SMT 형제·L3 묶음, 페이지 크기,
+  `isolated`·`nohz_full`, `pinning`·`cpuset` 능력)를 만든다. 뿌리 경로를 받으므로 고정물 트리(`crates/opld/tests/fixtures/topology/`)로
+  시험한다. `TopologyWatch`(`topology.rs:514`, Linux만)가 등록 전에 한 번, 검사 루프 여섯 회차(30초, `PROBE_EVERY`)마다와 노드
+  설정 `host_resources`가 바뀐 회차에 읽고, 값이 다를 때만 `NodeStatus.topology`에 쓴다(`probed_at`도 그때만 — 2소켓 256 CPU에서
+  1,924바이트). **빈 자원은 노드 상태에 넣지 않는다** — VM을 켤 때마다 Raft 쓰기가 생기므로, 빈 것은 VM 기록에서 셈하고 화면은
+  노드 RPC `ReadTopology`(빈 메모리·빈/남는 hugepages·orbivisord 친화)로 바로 묻는다. 같은 루프가 노드 설정을 적용한다: 예약 CPU로
+  opld 자기 스레드 친화, `nr_hugepages` 쓰기(설정이 바뀔 때만), 경고 문자열.
+- **세 층의 자원 세기.** 같은 순수 함수(`crates/opl-types/src/numa.rs` — `layout:1165`, `fit:1480`, `fit_fixed:1531`,
+  `demand:1952`, `HostLimits:2047`·`exceeded:2079`)를 셋이 쓴다. 위가 빠르고 거칠며 아래가 정확하고 마지막에 정한다.
+  1. **Raft 받아들이기 검사**(`crates/opl-cluster/src/hosts.rs:40` `HostCheck`, 폴더 할당량과 같은 VM 훑기): VM 만들기·스펙 쓰기
+     뒤 그 VM이 running·템플릿 아님·`node` 있음이고 `demand`가 0이 아니면, 그 노드의 전용 pCPU 합과 크기마다 hugepages MiB 합이
+     상한(`host_resources`의 전용 집합 크기, 토폴로지의 풀)을 **넘고 쓰기 전보다 늘 때만** `HostResourcesExceeded`(API 409
+     `no_capacity`, `details {node, resource, limit, used}`)다. 정확한 pCPU 번호는 셈하지 않는다 — 합계만 결정적으로 본다. 두 API
+     노드(또는 API와 HA 리더)가 같은 노드의 마지막 전용 CPU를 동시에 노리면 커밋 순서로 하나만 된다. 마이그레이션 확정 쓰기는 보지
+     않는다(받는 쪽 할당기가 이미 잡았다).
+  2. **스케줄러**(`crates/opl-api/src/scheduler.rs:284` `Inventory::host_usage`, `:342` `numa_fits`): 노드마다 도는 VM의 기록된
+     `host_placement`(그 노드의 것)는 정확히, 아직 켜지 않은 VM과 오는 마이그레이션은 `fit`·`fit_fixed`로 흉내 내 센 뒤 새 VM을
+     `fit`해 본다. 새로 켜기(배치·HA 복구·복제 배치)는 스펙 모양, 도는 VM 옮기기(마이그레이션·비우기·균형 조정·HA 되돌아가기)는
+     `fit_fixed(hardware.numa)`다. 켜기는 `HostResourcesExceeded`면 그 노드를 빼고 한 번 다시 고른다. 균형 조정기는 전용 VM을
+     옮기지 않는다. 빈 메모리 순위는 노드 메모리에서 hugepages 풀을 뺀 값이다. `numa_plan`(`:758`)이 `/vms/{key}/numa`에 같은 판정을 준다.
+  3. **노드 할당기**(`crates/opl-reconciler/src/host_alloc.rs:52` `HostAllocator`, opld마다 하나 — 작업자들과 `IncomingMigrations`가
+     `Arc`로 나눔): 켜기·받기 때 잠금 안에서 `claim`(`:70`)이 정확한 pCPU·호스트 노드·페이지를 고르고 예약을 만든다. 보는 것은 이
+     노드의 Raft 기록 + 켜는 중·받는 중 예약 + `/sys`의 실제 `free_hugepages`(다른 프로세스가 쓴 것)다. 한 노드의 QEMU는 그 노드의
+     opld만 띄우므로 이 잠금 하나로 pCPU가 두 번 잡히지 않는다. 다른 VM의 켜는 중 예약 때문에 안 되면 `Waiting`(실패로 세지 않음),
+     아니면 `Cannot`(꺼짐). 받는 중 예약은 실행 디렉터리의 `hardware.json`에 남아 opld가 다시 떠도 되살린다.
+- **기록.** 켤 때 `RunningHardware.numa`(게스트가 보는 것: 노드마다 소켓·메모리, 거리, 페이지, 정책 — 마이그레이션 양쪽이 같아야
+  한다)와 `host_placement`(이 노드에만 맞는 것: 자리마다 pCPU, 에뮬레이터 CPU, `isolate`가 비운 형제, 게스트 노드마다 호스트 노드)를
+  쓴다(계획 63 `cpu_resolved`와 같은 길). 라이브 마이그레이션은 받는 쪽이 `fit_fixed`로 고른 배치를 `MigrateIncomingResponse.host_placement`로
+  돌려주고 원본 Task가 확정 뒤 기록에 쓴다(`crates/opl-peer/src/migration.rs:47`). 스펙과 기록의 차이는 보류 `numa`(`Restart`)다(§8.4).
+- **명령줄과 고정.** `numa`가 있을 때만(없으면 바이트까지 같다) 게스트 노드마다 `memory-backend-ram|memfd`(`hugetlb`·`host-nodes`·
+  `policy=bind|preferred`·`prealloc`)와 `-numa node`·`-numa cpu`(소켓 단위)·`-numa dist`(`crates/opl-qemu/src/cmdline.rs:384`).
+  드라이버는 순수 함수 `numa::pinning`(`numa.rs:2282`)이 셈한 `RuntimePinning`만 건다: 스코프 `--property=AllowedCPUs`
+  (`crates/opl-driver/src/qemu.rs:4029`), `pre_exec`의 `sched_setaffinity`(QEMU·swtpm), QMP가 붙은 뒤(`-S`, `cont` 전) 모든 스레드
+  고정 — vCPU는 `query-cpus-fast`의 소켓·코어로 자리를 찾아 그 pCPU, 나머지는 에뮬레이터 집합, 커널 일꾼(`PF_USER_WORKER` 등,
+  `crates/opl-driver/src/affinity.rs:28`)은 건너뜀(`qemu.rs:4072` `pin_threads`). vCPU는 `/proc/<pid>/task/<tid>/status`로 확인하고
+  틀리면 QEMU를 끈다. 고정은 실행 디렉터리 `pinning.json`에 남아 실행 중 붙인 vCPU와 아래 루프가 읽는다. 노드에 예약·전용 집합이
+  없고 배치도 없으면 아무것도 걸지 않는다(opld가 예약 CPU로 자기를 묶었으면 공유 VM도 공유 집합으로 다시 건다 — 물려받지 않게).
+- **어긋남 고치기.** `crates/opld/src/checks.rs:191` `PinWatch`가 여섯 회차(30초)마다와 `host_resources`가 바뀐 회차에
+  `host_alloc::repin`(`host_alloc.rs:296`)을 부른다: 도는 VM마다 기록과 지금 세 집합으로 고정을 다시 셈해 스코프 `AllowedCPUs`
+  (`systemctl set-property --runtime`)와 스레드 친화가 다를 때만 다시 걸고 경고 로그를 남긴다(누가 `taskset`을 썼거나 공유 집합이
+  바뀜). swtpm은 다시 걸지 않는다.
+- **업그레이드.** 기능 `numa`(`crates/opl-types/src/node.rs:386`)를 모든 노드가 알릴 때까지 노드는 토폴로지를 쓰지 않고(읽기와 노드
+  설정 적용은 함), API는 새 칸을 409 `cluster_upgrading`으로 막는다. 기록·응답의 새 칸은 그 기능을 쓰는 VM에만 생기고, Raft 검사는
+  `demand > 0`인 VM에만 걸리므로 복제본마다 같은 판정이다. 쓰는 법은 [NUMA·전용 CPU·hugepages](guide/vms.md#numa전용-cpuhugepages)·
+  [호스트 준비](guide/cluster.md#호스트-준비-예약전용-cpu와-hugepages).
 
 ---
 
@@ -1227,7 +1295,7 @@ webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평
 
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
-  `metrics-history`, `vip`, `cpu-models` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+  `metrics-history`, `vip`, `cpu-models`, `numa` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.

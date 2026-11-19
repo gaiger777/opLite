@@ -99,6 +99,7 @@ orbivisorctl network create lan-a --bridge br0 --folder /teamA     # 네트워�
 | `vm.config` | 스펙 바꾸기, CD, cloud-init, 펌웨어 초기화, 핫플러그, 템플릿으로 바꾸기·되돌리기, 게스트 비밀번호 |
 | `vm.power` · `vm.console` | 켜기·끄기·재시작·에이전트 종료 · 콘솔 |
 | `vm.snapshot` · `vm.migrate` · `vm.clone` | 스냅샷 만들기·되돌리기·지우기 · 라이브·저장소 옮기기, 로컬 디스크 복제, 추천 적용 · 원본(템플릿) 쪽 복제·배포 |
+| `vm.dedicated` | 전용 CPU(`cpu.policy=dedicated`)나 hugepages가 있는 VM 만들기, 그 칸(정책·스레드·에뮬레이터·hugepages) 바꾸기, 그런 VM으로 복제·배포·가져오기·복원 — 새 VM의 폴더(바꾸기는 그 VM)에서 본다. `vm.create`·`vm.config`와 함께 필요하다([NUMA·전용 CPU·hugepages](vms.md#numa전용-cpuhugepages)) |
 | `backup.create` · `backup.restore` · `backup.delete` · `backup.job` | 지금 백업·원격 사본 · 복원 · 지우기 · 백업 작업(루트) |
 | `storage.allocate` · `storage.config` | 풀에 볼륨 만들기·늘리기·지우기, 이미지 받기 · 풀 만들기·바꾸기 |
 | `network.assign` · `network.config` | NIC를 그 네트워크에 붙이기 · 네트워크·보안 그룹 쓰기 |
@@ -115,12 +116,14 @@ orbivisorctl network create lan-a --bridge br0 --folder /teamA     # 네트워�
 | 내장 역할 | 권한 |
 |---|---|
 | `admin` | 전부 |
-| `operator` | `system.read`·`cluster.read`·`alert.read`, `vm.*` 8개, `backup.*` 4개, `storage.allocate`, `network.assign` |
+| `operator` | `system.read`·`cluster.read`·`alert.read`, `vm.*` 8개(`vm.dedicated` 빼고), `backup.*` 4개, `storage.allocate`, `network.assign` |
 | `viewer` | `system.read`·`cluster.read`·`alert.read` |
 
 내장 역할은 예전 역할과 뜻이 같다. 사용자의 전역 역할(`user create --role`)은 "루트에 그 내장 역할 grant"로 읽으므로 grant가
 하나도 없는 클러스터는 예전과 똑같이 동작한다. 새 전역 역할 **`none`**은 권한이 없다 — 폴더 grant로만 일하는 사용자에게 준다.
-`operator`에는 `inventory.*`·`permission.modify`·`network.config`·`storage.config`가 없다.
+`operator`에는 `inventory.*`·`permission.modify`·`network.config`·`storage.config`·`vm.dedicated`가 없다. `vm.dedicated`는 노드의
+드문 자원(전용 pCPU·hugepages)을 잡으므로 일부러 뺐다 — 운영자는 관리자가 만든 전용 VM의 vCPU 수·메모리를 `vm.config`로 바꿀 수
+있지만 공유 VM을 전용으로 바꾸거나 새 전용 VM을 만들지 못한다. 필요하면 그 폴더에 `vm.dedicated`가 든 사용자 정의 역할을 준다.
 
 ### 사용자 정의 역할
 
@@ -239,9 +242,14 @@ orbivisorctl token list                        # SCOPE 열
 
 ## 할당량
 
-- **VM 폴더만**(네트워크·풀 폴더에 주면 **400**). 차원은 vCPU, 메모리(MiB), 디스크(바이트), VM 수이고 비운 차원은 상한이 없다.
+- **VM 폴더만**(네트워크·풀 폴더에 주면 **400**). 차원은 vCPU, 메모리(MiB), 디스크(바이트), VM 수, 전용 vCPU이고 비운 차원은
+  상한이 없다.
 - **세는 것 = 할당량, 전원과 무관.** 하위 트리의 VM마다 vCPU 수, 메모리, 디스크로 붙은 볼륨 크기의 합(링크드 클론도 가상 크기),
   템플릿이 아닌 VM 수. 템플릿은 디스크만 센다. 붙지 않은 볼륨과 CD의 ISO는 세지 않는다.
+- **전용 vCPU(`dedicated_vcpus`, 계획 64).** 전용 CPU 정책인 VM마다 `max_vcpus`(없으면 소켓 × 코어) + `emulator isolate`면 1 —
+  노드의 전용 pCPU를 몇 개 잡는지와 같다(핫플러그 상한까지 잡으므로). 전원과 상관없이 세고 템플릿은 0이다. hugepages 메모리는
+  `memory_mib`에 이미 든다. `vcpus`와 따로 센다(전용 VM은 둘 다에 든다). 이 차원을 쓰는 할당량은 모든 노드가 기능 `numa`를 알릴
+  때만 줄 수 있다(**409** `cluster_upgrading`). 사용량은 쓰거나 상한이 있을 때만 보인다.
 - **중첩.** 사용량은 하위 트리 합이고, 쓰기는 경로 위의 **할당량 있는 모든 조상**을 지켜야 한다(가장 빡빡한 것이 묶는다). 자식
   상한 합이 부모를 넘어도 된다(미리 떼어 두지 않는다). 자식 상한이 부모 때문에 의미가 없으면 사용량에 "부모가 묶음"(`bound by
   /teamA`)으로 보인다.
@@ -249,7 +257,7 @@ orbivisorctl token list                        # SCOPE 열
   균형 조정(노드만 바꿈), 이름 바꾸기, 끄기는 막히지 않는다.
 - **노드 사이 경쟁에도 지킨다.** 확인은 Raft 상태 머신에서 커밋 순서대로 한다. 두 노드에서 동시에 만들어도 뒤에 커밋된 쪽만
   거절된다. 그 전에 API가 요청 때 같은 계산으로 먼저 거절한다: **409** `quota_exceeded` "folder /teamA would use 34 of 32 vCPUs",
-  `details`에 `folder`·`dimension`(`vcpus`·`memory_mib`·`disk_bytes`·`vms`)·`limit`·`used`. 미리 확인하는 곳: VM 만들기, 스펙
+  `details`에 `folder`·`dimension`(`vcpus`·`memory_mib`·`disk_bytes`·`vms`·`dedicated_vcpus`)·`limit`·`used`. 미리 확인하는 곳: VM 만들기, 스펙
   바꾸기(핫플러그·CD·템플릿 바꾸기 포함), 복제·배포, 복원, 가져오기 실행, 볼륨 늘리기, 폴더로 옮기기, 폴더 옮기기.
 - 복제·복원·가져오기 작업은 디스크를 만든 뒤 VM을 쓰므로, 경쟁에서 진 작업은 마지막 쓰기에서 실패하고 만든 볼륨을 지운다.
 - **사용량**: `GET /api/v1/folders/{id}/usage` → `{folder, path, usage, limits[{folder, path, quota, usage}], binding{차원: 폴더}}`
@@ -262,6 +270,7 @@ orbivisorctl token list                        # SCOPE 열
 ```bash
 orbivisorctl folder quota set /teamA --vcpus 32 --memory 128G --disk 2T --vms 20
 orbivisorctl folder quota set /teamA --disk none     # 준 차원만 바꾼다. none은 그 차원을 지운다
+orbivisorctl folder quota set /db --dedicated-vcpus 16   # 전용 vCPU 상한(권한 vm.dedicated와 따로)
 orbivisorctl folder quota clear /teamA
 orbivisorctl folder usage /teamA
 # folder /teamA
