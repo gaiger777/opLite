@@ -106,12 +106,23 @@ fn vcpu_cpus(pid: u64) -> Vec<String> {
         .collect()
 }
 
-/// vCPU 밖 스레드의 친화가 모두 `want`다.
-fn others_on(pid: u64, want: &str) {
-    for (name, cpus) in threads(pid) {
-        if !is_vcpu(&name) {
-            assert_eq!(cpus, want, "thread {name} of QEMU {pid}");
+/// vCPU 밖 스레드의 친화가 모두 `want`가 될 때까지 기다린다. QEMU는 일꾼 스레드(`worker`)를 필요할 때 만들고,
+/// vCPU 스레드가 만든 일꾼은 그 vCPU의 친화를 물려받는다 — 고정 정리(30초마다)가 바로잡으므로 그만큼 기다린다.
+async fn others_on(pid: u64, want: &str) {
+    let start = std::time::Instant::now();
+    loop {
+        let wrong: Vec<(String, String)> = threads(pid)
+            .into_iter()
+            .filter(|(name, cpus)| !is_vcpu(name) && cpus != want)
+            .collect();
+        if wrong.is_empty() {
+            return;
         }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(75),
+            "threads of QEMU {pid} not on {want}: {wrong:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
 
@@ -228,7 +239,7 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
     let mut vcpus = vcpu_cpus(p);
     vcpus.sort();
     assert_eq!(vcpus, ["2", "3"], "{:?}", threads(p));
-    others_on(p, "1");
+    others_on(p, "1").await;
     if std::env::var_os("OPL_TEST_SYSTEMD").is_some() && t["cpuset"] == true {
         let id = v["id"].as_str().unwrap();
         let out = std::process::Command::new("systemctl")
@@ -384,7 +395,7 @@ async fn migration_re_pins_on_the_target() {
     d[0].ctl(&["vm", "start", "web"]).await.unwrap();
     let p = pid(&c, "web").await;
     assert_eq!(vcpu_cpus(p), ["2"], "{:?}", threads(p));
-    others_on(p, "0-1,3");
+    others_on(p, "0-1,3").await;
 
     let task = c
         .post("/vms/web/migrate", &json!({ "node": "node2" }))
@@ -411,7 +422,7 @@ async fn migration_re_pins_on_the_target() {
     );
     let p = pid(&c, "web").await;
     assert_eq!(vcpu_cpus(p), ["3"], "{:?}", threads(p));
-    others_on(p, "0-2");
+    others_on(p, "0-2").await;
 
     d[0].ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
     d[0].ctl(&["vm", "delete", "web"]).await.unwrap();
