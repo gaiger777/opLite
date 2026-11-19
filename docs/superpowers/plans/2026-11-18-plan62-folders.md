@@ -101,7 +101,7 @@
 - **탐침이 찾은 스택 넘침:** `templates` 시험이 디버그 빌드에서 시험 스레드(2 MiB)를 넘쳤다. opld가 아니라 시험이 부르는 `oplctl::run`에서 clap 명령 만들기가 큰 poll 프레임 위에 올라간 것으로, main에서도 이미 약 100 KB만 남아 있었고 계획 62의 새 하위 명령이 넘겼다. `run`을 인자 해석과 `Box::pin(run_cli(..))`로 나눠 이 경로가 약 2.06 MB → 0.95 MB가 됐다(`f4468f9`). 시험의 스택 크기는 늘리지 않았다.
 - svc01 일반 시험(리뷰 2 수정 `a5257a0`에서): fmt·clippy(Rust 1.99)·시험 3439개·starve·규모 100·저장소 시험 모두 통과. 스택 넘침 수정 뒤 이 Mac에서 워크스페이스 시험 3354개 통과.
 - GitHub 탐침: `a5257a0`에서 install-media·linux-kvm이 위 스택 넘침으로 실패, 나머지(ceph·ldap·package·iso-e2e bios·uefi·catalog-links) 통과 → `f4468f9`에서 모두 통과(linux-kvm은 처음에 Ceph apt 받기가 미러가 느려 15분 제한에 걸려 다시 돌림). linux-kvm 시험 1131개, 브라우저 E2E 둘(`browser_shows_a_folder_user_only_their_folder`, `browser_uploads_image_runs_vm_and_cleans_up`) 통과.
-- 배포: (배포 후 채움)
+- **테스트 VM 배포(svc01·svc02):** main `5e877ad`를 svc01에서 릴리스로 빌드(웹 index-CbpA22Ye.js 포함)해 svc02 → svc01 순서로 바이너리만 바꿨다(유닛 그대로). orbivisord sha256 `200497ef…f85`, orbivisorctl `c06e9de7…438`. 두 노드 헬스 `ok`, 두 voter online, 두 노드 모두 기능 `folders`·`two-factor`를 알린다. `/api/v1/folders`(빈 트리)·`/auth/whoami`(연결 노드 포함)가 답하고, 새 웹 주소 `/vm-folders`·`/settings/account`·`/settings/roles`가 200이다. 기존 사용자·토큰은 내장 역할 그대로 동작한다. svc02의 test-vm은 QEMU PID 916 그대로 실행 중이고 저널에 경고·오류는 없다.
 
 ## 다음 계획으로 넘길 사항
 
