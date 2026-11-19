@@ -535,6 +535,38 @@ pub enum HostResourcesError {
 }
 
 impl HostResources {
+    /// 아무것도 정하지 않음(설정이 없는 것과 같다 — API는 `{}`를 지우기로 받는다)
+    pub fn is_empty(&self) -> bool {
+        *self == HostResources::default()
+    }
+
+    /// 감사·CLI의 짧은 이름: `dedicated=4-31 reserved=0-1 hugepages=2M:1024@0,1G:4`(빈 칸은 뺀다, 모두 비면 `none`)
+    pub fn describe(&self) -> String {
+        let mut out = Vec::new();
+        if !self.dedicated_cpus.is_empty() {
+            out.push(format!("dedicated={}", self.dedicated_cpus));
+        }
+        if !self.reserved_cpus.is_empty() {
+            out.push(format!("reserved={}", self.reserved_cpus));
+        }
+        if !self.hugepages.is_empty() {
+            let list: Vec<String> = self
+                .hugepages
+                .iter()
+                .map(|h| match h.host_node {
+                    Some(n) => format!("{}:{}@{n}", h.size, h.count),
+                    None => format!("{}:{}", h.size, h.count),
+                })
+                .collect();
+            out.push(format!("hugepages={}", list.join(",")));
+        }
+        if out.is_empty() {
+            "none".into()
+        } else {
+            out.join(" ")
+        }
+    }
+
     /// 노드 토폴로지에 맞는지 본다: 온라인 CPU의 부분집합, 서로 겹치지 않음, 공유가 비지 않음, 있는 호스트 노드.
     pub fn validate(&self, topology: &NodeTopology) -> Result<(), HostResourcesError> {
         for (field, set) in [
@@ -571,6 +603,144 @@ impl HostResources {
         }
         Ok(())
     }
+}
+
+/// 노드에 직접 물은 지금 값(노드 사이 RPC `ReadTopology`, 설계 §5·§13). 바뀔 때마다 쓰지 않도록 Raft에는 두지 않는다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct TopologyLive {
+    /// 호스트 NUMA 노드마다(id 순)
+    pub nodes: Vec<LiveNode>,
+    /// orbivisord의 CPU 친화가 노드 설정(예약 CPU)과 맞다.
+    pub affinity_ok: bool,
+}
+
+/// 호스트 NUMA 노드 하나의 지금 값
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LiveNode {
+    pub id: u16,
+    /// 빈 메모리(`MemFree`, hugepages 풀 밖)
+    pub memory_free_mib: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub hugepages: Vec<LivePool>,
+}
+
+/// hugepages 풀 하나의 지금 값
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LivePool {
+    pub size_kib: u32,
+    /// 아무도 쓰지 않는 페이지(`free_hugepages`)
+    pub free: u32,
+    /// 예약 밖에서 커널이 더 준 페이지(`surplus_hugepages`)
+    pub surplus: u32,
+}
+
+/// 복제·배포·가져오기·템플릿 초안의 CPU 배치 칸(계획 64 §12, 세 곳의 요청이 같은 이름을 쓴다). 빈 칸은 원본(또는 기본)
+/// 그대로다.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NumaOverrides {
+    pub cpu_policy: Option<CpuPolicy>,
+    pub cpu_thread_policy: Option<ThreadPolicy>,
+    pub cpu_emulator: Option<EmulatorPolicy>,
+    pub numa: Option<NumaSpec>,
+    /// vNUMA를 지운다.
+    pub no_numa: bool,
+    pub hugepages: Option<PageSize>,
+    /// hugepages를 지운다.
+    pub no_hugepages: bool,
+}
+
+impl NumaOverrides {
+    /// 바꾸는 것이 없는지
+    pub fn is_empty(&self) -> bool {
+        *self == NumaOverrides::default()
+    }
+
+    /// 스펙에 적용한다. 정책을 `shared`로 바꾸면 스레드·에뮬레이터 정책도 지운다(전용일 때만 쓰는 칸이다).
+    pub fn apply(&self, spec: &mut VmSpec) {
+        if let Some(policy) = self.cpu_policy {
+            spec.cpu.policy = policy;
+            if policy.is_shared() {
+                spec.cpu.thread_policy = None;
+                spec.cpu.emulator = None;
+            }
+        }
+        if let Some(t) = self.cpu_thread_policy {
+            spec.cpu.thread_policy = Some(t);
+        }
+        if let Some(e) = self.cpu_emulator {
+            spec.cpu.emulator = Some(e);
+        }
+        if self.no_numa {
+            spec.numa = None;
+        } else if let Some(n) = &self.numa {
+            spec.numa = Some(n.clone());
+        }
+        if self.no_hugepages {
+            spec.hugepages = None;
+        } else if let Some(h) = self.hugepages {
+            spec.hugepages = Some(h);
+        }
+    }
+}
+
+/// 권한 `vm.dedicated`가 드는 스펙: 전용 CPU나 hugepages(드문 노드 자원, 계획 64 §12)
+pub fn uses_host_resources(spec: &VmSpec) -> bool {
+    !spec.cpu.policy.is_shared() || spec.hugepages.is_some()
+}
+
+/// `vm.dedicated`를 다시 볼 바꾸기: 새 스펙이 노드 자원을 쓰고 정책·스레드·에뮬레이터·hugepages 가운데 하나가 바뀜
+pub fn host_resources_changed(old: &VmSpec, new: &VmSpec) -> bool {
+    uses_host_resources(new)
+        && (old.cpu.policy != new.cpu.policy
+            || old.cpu.thread_policy != new.cpu.thread_policy
+            || old.cpu.emulator != new.cpu.emulator
+            || old.hugepages != new.hugepages)
+}
+
+/// 감사 설명의 NUMA 부분(`cpu.policy=dedicated numa=auto hugepages=1G`). 계획 64 칸을 쓰지 않거나 `before`와 같으면 None.
+pub fn audit(spec: &VmSpec, before: Option<&VmSpec>) -> Option<String> {
+    let same = before.is_some_and(|b| {
+        b.cpu.policy == spec.cpu.policy
+            && b.cpu.thread_policy == spec.cpu.thread_policy
+            && b.cpu.emulator == spec.cpu.emulator
+            && b.numa == spec.numa
+            && b.hugepages == spec.hugepages
+    });
+    if same || (!in_use(spec) && before.is_none_or(|b| !in_use(b))) {
+        return None;
+    }
+    let mut out = vec![format!("cpu.policy={}", spec.cpu.policy.as_str())];
+    if let Some(t) = spec.cpu.thread_policy {
+        out.push(format!("cpu.thread_policy={}", t.as_str()));
+    }
+    if let Some(e) = spec.cpu.emulator {
+        out.push(format!("cpu.emulator={}", e.as_str()));
+    }
+    out.push(format!(
+        "numa={}",
+        match spec.numa.as_ref().map(|n| &n.nodes) {
+            None => "none".to_string(),
+            Some(NumaNodes::Auto) => "auto".to_string(),
+            Some(NumaNodes::Count(n)) => n.to_string(),
+            Some(NumaNodes::List(l)) => l
+                .iter()
+                .map(|n| format!("{}:{}", n.cpus, n.memory_mib))
+                .collect::<Vec<_>>()
+                .join(","),
+        }
+    ));
+    if let Some(m) = spec.numa.as_ref().and_then(|n| n.memory) {
+        out.push(format!("numa.memory={}", m.as_str()));
+    }
+    out.push(format!(
+        "hugepages={}",
+        spec.hugepages.map_or("none", PageSize::as_str)
+    ));
+    Some(out.join(" "))
 }
 
 /// 노드의 CPU·메모리 토폴로지(`NodeStatus.topology`, 설계 §6). 바뀔 때만 쓰므로 빈 자원은 넣지 않는다.
@@ -3415,5 +3585,51 @@ mod tests {
         assert_eq!(split_plugged(0, &[4, 4]), [0, 0]);
         assert_eq!(split_plugged(8, &[4, 4]), [4, 4]);
         assert_eq!(split_plugged(6, &[2, 4]), [2, 4]);
+    }
+    #[test]
+    fn audit_and_privilege_helpers() {
+        let plain = vm(json!({}));
+        assert_eq!(audit(&plain, None), None);
+        assert!(!uses_host_resources(&plain));
+        let db = vm(
+            json!({ "cpu": { "sockets": 2, "cores": 2, "policy": "dedicated" },
+            "numa": { "nodes": "auto" }, "hugepages": "1G", "memory_mib": 2048 }),
+        );
+        assert_eq!(
+            audit(&db, None).unwrap(),
+            "cpu.policy=dedicated numa=auto hugepages=1G"
+        );
+        assert_eq!(audit(&db, Some(&db)), None);
+        // 끄기도 적는다.
+        assert_eq!(
+            audit(&plain, Some(&db)).unwrap(),
+            "cpu.policy=shared numa=none hugepages=none"
+        );
+        assert!(uses_host_resources(&db));
+        assert!(host_resources_changed(&plain, &db));
+        assert!(!host_resources_changed(&db, &plain));
+        let mut more = db.clone();
+        more.cpu.cores = 4;
+        assert!(!host_resources_changed(&db, &more));
+        let numa_only = vm(json!({ "numa": { "nodes": 1, "memory": "strict" } }));
+        assert!(!uses_host_resources(&numa_only));
+        assert_eq!(
+            audit(&numa_only, None).unwrap(),
+            "cpu.policy=shared numa=1 numa.memory=strict hugepages=none"
+        );
+
+        let r: HostResources = serde_json::from_value(json!({
+            "reserved_cpus": "0-1", "dedicated_cpus": "4-31",
+            "hugepages": [{ "size": "2M", "count": 1024, "host_node": 0 }, { "size": "1G", "count": 4 }]
+        }))
+        .unwrap();
+        assert_eq!(
+            r.describe(),
+            "dedicated=4-31 reserved=0-1 hugepages=2M:1024@0,1G:4"
+        );
+        assert!(!r.is_empty());
+        let empty: HostResources = serde_json::from_value(json!({})).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.describe(), "none");
     }
 }

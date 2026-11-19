@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::cloud_init::CloudInit;
 use crate::cpu::CpuFlag;
+use crate::numa::{CpuPolicy, EmulatorPolicy, NumaOverrides, NumaSpec, PageSize, ThreadPolicy};
 use crate::vm::{
     Arch, CpuModel, CpuSpec, DiskBus, DiskSpec, Firmware, MachineType, NicModel, NicSpec,
     PowerState, RestartPolicy, ValidationError, VmSpec,
@@ -62,6 +63,34 @@ pub struct CloneOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cpu_flags: Option<Vec<CpuFlag>>,
+    /// 새 VM의 CPU 정책(계획 64). `shared`면 스레드·에뮬레이터 정책도 지운다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_policy: Option<CpuPolicy>,
+    /// 새 VM의 전용 CPU 스레드 정책(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_thread_policy: Option<ThreadPolicy>,
+    /// 새 VM의 에뮬레이터 스레드 정책(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_emulator: Option<EmulatorPolicy>,
+    /// 새 VM의 vNUMA(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub numa: Option<NumaSpec>,
+    /// 원본의 vNUMA를 지운다(계획 64).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub no_numa: bool,
+    /// 새 VM의 hugepages(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hugepages: Option<PageSize>,
+    /// 원본의 hugepages를 지운다(계획 64).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub no_hugepages: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -72,6 +101,19 @@ impl CloneOverrides {
     /// 바꾸는 것이 없는지
     pub fn is_empty(&self) -> bool {
         *self == CloneOverrides::default()
+    }
+
+    /// CPU 배치 칸(계획 64)
+    pub fn numa_overrides(&self) -> NumaOverrides {
+        NumaOverrides {
+            cpu_policy: self.cpu_policy,
+            cpu_thread_policy: self.cpu_thread_policy,
+            cpu_emulator: self.cpu_emulator,
+            numa: self.numa.clone(),
+            no_numa: self.no_numa,
+            hugepages: self.hugepages,
+            no_hugepages: self.no_hugepages,
+        }
     }
 }
 
@@ -129,6 +171,7 @@ pub fn apply_overrides(spec: &VmSpec, ov: &CloneOverrides) -> Result<VmSpec, Tem
     if let Some(flags) = &ov.cpu_flags {
         new.cpu.flags = flags.clone();
     }
+    ov.numa_overrides().apply(&mut new);
     for (nic, network) in new.nics.iter_mut().zip(&ov.nics) {
         if let Some(network) = network {
             nic.network = network.clone();
@@ -235,6 +278,26 @@ pub struct TemplateDraft {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub cpu_flags: Vec<CpuFlag>,
+    /// CPU 정책(계획 64). 없으면 `shared`다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_policy: Option<CpuPolicy>,
+    /// 전용 CPU 스레드 정책(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_thread_policy: Option<ThreadPolicy>,
+    /// 에뮬레이터 스레드 정책(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_emulator: Option<EmulatorPolicy>,
+    /// vNUMA(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub numa: Option<NumaSpec>,
+    /// hugepages(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hugepages: Option<PageSize>,
 }
 
 fn default_vcpus() -> u16 {
@@ -250,12 +313,12 @@ impl TemplateDraft {
     /// 꺼진 템플릿 VM 스펙
     pub fn vm_spec(&self, volume: &str) -> Result<VmSpec, TemplateError> {
         let spec = VmSpec {
-            hugepages: None,
-            numa: None,
+            hugepages: self.hugepages,
+            numa: self.numa.clone(),
             cpu: CpuSpec {
-                emulator: None,
-                policy: Default::default(),
-                thread_policy: None,
+                emulator: self.cpu_emulator,
+                policy: self.cpu_policy.unwrap_or_default(),
+                thread_policy: self.cpu_thread_policy,
                 sockets: 1,
                 cores: self.vcpus,
                 model: self.cpu_model.clone().unwrap_or_default(),
@@ -347,6 +410,7 @@ mod tests {
             folder: None,
             cpu_model: Some("Icelake-Server-v7".parse().unwrap()),
             cpu_flags: Some(vec!["-avx512vbmi".parse().unwrap()]),
+            ..CloneOverrides::default()
         };
         assert!(!ov.is_empty());
         let json = serde_json::to_value(&ov).unwrap();
@@ -565,5 +629,41 @@ mod tests {
             tiny.vm_spec("v"),
             Err(TemplateError::Invalid(ValidationError::TooLittleMemory))
         );
+    }
+    #[test]
+    fn numa_overrides_set_and_clear_the_placement_fields() {
+        use crate::numa::{CpuPolicy, NumaNodes, ThreadPolicy};
+        let ov: CloneOverrides = serde_json::from_value(serde_json::json!({
+            "cpu_policy": "dedicated", "cpu_thread_policy": "isolate",
+            "numa": { "nodes": 1 }, "hugepages": "2M"
+        }))
+        .unwrap();
+        let applied = apply_overrides(&template(), &ov).unwrap();
+        assert_eq!(applied.cpu.policy, CpuPolicy::Dedicated);
+        assert_eq!(applied.cpu.thread_policy, Some(ThreadPolicy::Isolate));
+        assert_eq!(applied.numa.as_ref().unwrap().nodes, NumaNodes::Count(1));
+        assert_eq!(applied.hugepages, Some(PageSize::Size2M));
+        // shared는 스레드 정책도 지우고, no_* 는 원본 칸을 지운다.
+        let back = CloneOverrides {
+            cpu_policy: Some(CpuPolicy::Shared),
+            no_numa: true,
+            no_hugepages: true,
+            ..CloneOverrides::default()
+        };
+        let json = serde_json::to_value(&back).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "cpu_policy": "shared", "no_numa": true, "no_hugepages": true })
+        );
+        let cleared = apply_overrides(&applied, &back).unwrap();
+        assert_eq!(cleared, template());
+        // 템플릿 초안도 같은 이름이다.
+        let draft: TemplateDraft = serde_json::from_value(serde_json::json!({
+            "name": "t", "network": "lan", "cpu_policy": "dedicated", "hugepages": "1G"
+        }))
+        .unwrap();
+        let spec = draft.vm_spec("v").unwrap();
+        assert_eq!(spec.cpu.policy, CpuPolicy::Dedicated);
+        assert_eq!(spec.hugepages, Some(PageSize::Size1G));
     }
 }

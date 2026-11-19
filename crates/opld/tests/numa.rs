@@ -1,10 +1,11 @@
 //! 실제 QEMU로 vCPU·에뮬레이터 스레드 고정과 hugepages를 본다(계획 64 스테이지 4, Linux). GitHub `linux-kvm`(root, KVM,
 //! 4 vCPU, NUMA 노드 하나)에서 돈다: `cargo test -p opld --features numa-it --test numa`
 //!
-//! 노드 설정(`host_resources`)과 VM의 새 칸은 스테이지 5 전이라 API가 막으므로 제어 소켓의 시험 고리
-//! (`/v1/test/host-resources`·`vm-spec`)로 클러스터에 바로 쓴다. 스레드 친화는 `/proc/<pid>/task/<tid>/status`의
-//! `Cpus_allowed_list`로 본다(vCPU 스레드는 `-name debug-threads=on`의 이름 `CPU n/KVM`). hugepages는 root와
-//! `OPL_TEST_NUMA_SYS=1`일 때만 실행 중 예약하고(`host_resources.hugepages`) 끝에 원래 수로 되돌린다.
+//! 노드 설정은 `node resources`, VM의 CPU 배치는 `vm create|set --cpu-policy/--hugepages`(계획 64 스테이지 5)로 준다.
+//! 스레드 친화는 `/proc/<pid>/task/<tid>/status`의 `Cpus_allowed_list`로 본다(vCPU 스레드는 `-name debug-threads=on`의
+//! 이름 `CPU n/KVM`). 커널 일꾼(`kvm-nx-lpage-recovery`·`vhost-*` — `stat` 플래그 `PF_USER_WORKER` 등)은 커널이 친화를
+//! 정하므로 보지 않는다(상한은 스코프 cpuset). hugepages는 root와 `OPL_TEST_NUMA_SYS=1`일 때만 실행 중 예약하고
+//! (`host_resources.hugepages`) 끝에 원래 수로 되돌린다.
 #![cfg(all(feature = "numa-it", target_os = "linux"))]
 
 mod common;
@@ -25,22 +26,6 @@ fn client(d: &Daemon) -> Client {
         config["ca_pem"].as_str().map(str::to_string),
     )
     .unwrap()
-}
-
-async fn hook(d: &Daemon, path: &str, body: Value) {
-    let http = reqwest::Client::builder()
-        .unix_socket(d.path("opld.sock"))
-        .build()
-        .unwrap();
-    let resp = http
-        .post(format!("http://opld/v1/test/{path}"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(status.is_success(), "{path}: {status} {text}");
 }
 
 /// `/sys`에 써도 되는 시험(root와 `OPL_TEST_NUMA_SYS=1`)
@@ -81,6 +66,15 @@ fn threads(pid: u64) -> BTreeMap<String, String> {
         let Ok(status) = std::fs::read_to_string(dir.join("status")) else {
             continue;
         };
+        // 커널 일꾼(PF_USER_WORKER·PF_KTHREAD·PF_NO_SETAFFINITY)은 커널이 친화를 정한다.
+        let kernel = std::fs::read_to_string(dir.join("stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(6)?.parse::<u64>().ok())
+                .is_some_and(|flags| flags & (0x4000 | 0x20_0000 | 0x400_0000) != 0)
+        });
+        if kernel {
+            continue;
+        }
         let cpus = status
             .lines()
             .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
@@ -168,16 +162,26 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
     }
     let hugepages = sys_writable();
     let _restore = hugepages.then(|| RestoreHugepages(std::fs::read_to_string(NR_2M).unwrap()));
-    let mut resources = json!({ "reserved_cpus": "0", "dedicated_cpus": "2-3" });
+    let mut resources = vec![
+        "node".to_string(),
+        "resources".into(),
+        "node1".into(),
+        "--reserved-cpus".into(),
+        "0".into(),
+        "--dedicated-cpus".into(),
+        "2-3".into(),
+    ];
     if hugepages {
         let now: u64 = std::fs::read_to_string(NR_2M)
             .unwrap()
             .trim()
             .parse()
             .unwrap();
-        resources["hugepages"] = json!([{ "size": "2M", "count": now + 128 }]);
+        resources.extend(["--hugepages".into(), format!("2M:{}", now + 128)]);
     }
-    hook(&d, "host-resources", json!({ "resources": resources })).await;
+    let args: Vec<&str> = resources.iter().map(String::as_str).collect();
+    let out = d.ctl(&args).await.unwrap();
+    assert!(out.contains("dedicated=2-3 reserved=0"), "{out}");
     if hugepages {
         topology(&c, "node1", |t| {
             t["nodes"][0]["hugepages"].as_array().is_some_and(|p| {
@@ -189,14 +193,21 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
     }
 
     // 전용 VM(vCPU 2, hugepages 2M 256 MiB)
-    d.ctl(&["vm", "create", "ded", "--memory", "256", "--cores", "2"])
-        .await
-        .unwrap();
-    let mut patch = json!({ "cpu": { "policy": "dedicated" } });
+    let mut create = vec![
+        "vm",
+        "create",
+        "ded",
+        "--memory",
+        "256",
+        "--cores",
+        "2",
+        "--cpu-policy",
+        "dedicated",
+    ];
     if hugepages {
-        patch["hugepages"] = json!("2M");
+        create.extend(["--hugepages", "2M"]);
     }
-    hook(&d, "vm-spec", json!({ "vm": "ded", "patch": patch })).await;
+    d.ctl(&create).await.unwrap();
     let free_before = meminfo("HugePages_Free:");
     let out = d.ctl(&["vm", "start", "ded"]).await.unwrap();
     assert!(out.contains("vm ded: start done"), "{out}");
@@ -249,15 +260,17 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
     );
 
     // 전용 CPU가 모자라면 켜지 않는다(409 no_capacity).
-    d.ctl(&["vm", "create", "ded2", "--memory", "128"])
-        .await
-        .unwrap();
-    hook(
-        &d,
-        "vm-spec",
-        json!({ "vm": "ded2", "patch": { "cpu": { "policy": "dedicated" } } }),
-    )
-    .await;
+    d.ctl(&[
+        "vm",
+        "create",
+        "ded2",
+        "--memory",
+        "128",
+        "--cpu-policy",
+        "dedicated",
+    ])
+    .await
+    .unwrap();
     let err = d.ctl(&["vm", "start", "ded2"]).await.unwrap_err();
     assert!(
         err.to_string().contains("dedicated CPUs"),
@@ -284,29 +297,19 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
             "1",
             "--max-vcpus",
             "2",
+            "--cpu-policy",
+            "dedicated",
         ])
         .await
         .unwrap();
-        hook(
-            &d,
-            "vm-spec",
-            json!({ "vm": "hot", "patch": { "cpu": { "policy": "dedicated" } } }),
-        )
-        .await;
         d.ctl(&["vm", "start", "hot"]).await.unwrap();
         let v = vm(&c, "hot").await;
         let slots = v["status"]["hardware"]["host_placement"]["vcpus"].clone();
         assert_eq!(slots.as_array().map(Vec::len), Some(2), "{v}");
         let p = pid(&c, "hot").await;
         assert_eq!(vcpu_cpus(p), [slots[0].to_string()], "{:?}", threads(p));
-        // API는 스테이지 5 전이라 전용 VM의 스펙을 받지 않는다: 고리로 바꾸고 핫플러그 Task를 부른다.
-        hook(
-            &d,
-            "vm-spec",
-            json!({ "vm": "hot", "patch": { "cpu": { "cores": 2 } } }),
-        )
-        .await;
-        d.ctl(&["vm", "hotplug", "hot"]).await.unwrap();
+        // 전용 VM의 `vm set`도 상한 안의 vCPU를 바로 붙인다(핫플러그 Task).
+        d.ctl(&["vm", "set", "hot", "--cores", "2"]).await.unwrap();
         eventually("two vCPU threads", || async { vcpu_cpus(p).len() == 2 }).await;
         let mut got = vcpu_cpus(p);
         got.sort();
@@ -317,7 +320,11 @@ async fn dedicated_vms_are_pinned_and_use_hugepages() {
     }
 
     d.ctl(&["vm", "stop", "plain", "--force"]).await.unwrap();
-    hook(&d, "host-resources", json!({ "resources": null })).await;
+    let out = d
+        .ctl(&["node", "resources", "node1", "--clear"])
+        .await
+        .unwrap();
+    assert!(out.contains("node node1: none"), "{out}");
     d.stop();
 }
 
@@ -355,28 +362,25 @@ async fn migration_re_pins_on_the_target() {
         }
         return;
     }
-    hook(
-        &d[0],
-        "host-resources",
-        json!({ "resources": { "dedicated_cpus": "2" } }),
-    )
-    .await;
-    hook(
-        &d[1],
-        "host-resources",
-        json!({ "resources": { "dedicated_cpus": "3" } }),
-    )
-    .await;
+    for (node, cpus) in [("node1", "2"), ("node2", "3")] {
+        d[0].ctl(&["node", "resources", node, "--dedicated-cpus", cpus])
+            .await
+            .unwrap();
+    }
 
-    d[0].ctl(&["vm", "create", "web", "--memory", "128", "--node", "node1"])
-        .await
-        .unwrap();
-    hook(
-        &d[0],
-        "vm-spec",
-        json!({ "vm": "web", "patch": { "cpu": { "policy": "dedicated" } } }),
-    )
-    .await;
+    d[0].ctl(&[
+        "vm",
+        "create",
+        "web",
+        "--memory",
+        "128",
+        "--node",
+        "node1",
+        "--cpu-policy",
+        "dedicated",
+    ])
+    .await
+    .unwrap();
     d[0].ctl(&["vm", "start", "web"]).await.unwrap();
     let p = pid(&c, "web").await;
     assert_eq!(vcpu_cpus(p), ["2"], "{:?}", threads(p));

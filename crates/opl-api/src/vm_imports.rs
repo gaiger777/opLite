@@ -785,7 +785,7 @@ pub(crate) fn import_spec(
             })
         })
         .collect::<Result<_, String>>()?;
-    Ok(VmSpec {
+    let mut spec = VmSpec {
         hugepages: None,
         numa: None,
         cpu: CpuSpec {
@@ -818,7 +818,10 @@ pub(crate) fn import_spec(
         secure_boot: false,
         guest_agent: None,
         folder: run.folder,
-    })
+    };
+    // CPU 정책·vNUMA·hugepages(계획 64)
+    run.numa_overrides().apply(&mut spec);
+    Ok(spec)
 }
 
 /// 가져오기 `id`를 다루는 끝나지 않은 Task가 하는 일(실행, 지우기)
@@ -994,6 +997,10 @@ pub async fn run_import(
         crate::cpu::require_cpu_feature(&state.cluster, &model, &run.cpu_flags)?;
         crate::cpu::check_flag_privilege(&state, &principal, &run.cpu_flags, &[])?;
     }
+    // CPU 정책·vNUMA·hugepages(계획 64)는 옛 노드가 풀지 못한다(검증보다 먼저).
+    if !run.numa_overrides().is_empty() {
+        require_feature(&state.cluster, opl_types::node::NUMA)?;
+    }
     let import = lookup::<VmImportSpec>(&state.cluster, &key)?;
     match import.status.phase {
         ImportPhase::Ready | ImportPhase::Importing => {
@@ -1059,6 +1066,12 @@ pub async fn run_import(
     state
         .authz
         .require_in_folder(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
+    crate::numa::require_privilege(
+        &state,
+        &principal,
+        opl_types::numa::uses_host_resources(&spec),
+        spec.folder,
+    )?;
     // 폴더 할당량: 만들 VM과 원본 디스크 크기
     let bytes = src
         .disks
@@ -1145,9 +1158,19 @@ pub async fn run_import(
         Err(e) => return Err(e.into()),
     }
     // 준 CPU 모델·플래그는 감사에 남긴다(별칭에서 고정한 이름 포함, 리뷰 2 #7).
-    let cpu_note =
+    let notes: Vec<String> =
         crate::cpu::audit_requested_cpu(run.cpu_model.as_ref(), asked_cpu.as_ref(), &run.cpu_flags)
-            .map(|cpu| format!("vm import {} -> {} {cpu}", import.name, run.name));
+            .into_iter()
+            .chain(opl_types::numa::audit(&spec, None))
+            .collect();
+    let cpu_note = (!notes.is_empty()).then(|| {
+        format!(
+            "vm import {} -> {} {}",
+            import.name,
+            run.name,
+            notes.join(" ")
+        )
+    });
     let op = TaskOp::VmImport {
         import: import.id,
         run,
@@ -1285,6 +1308,11 @@ mod tests {
             folder: None,
             cpu_model: None,
             cpu_flags: Vec::new(),
+            cpu_policy: None,
+            cpu_thread_policy: None,
+            cpu_emulator: None,
+            numa: None,
+            hugepages: None,
         }
     }
 

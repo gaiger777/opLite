@@ -19,6 +19,29 @@ pub fn thread_cpus(proc: &Path, pid: u32, tid: u32) -> Option<CpuSet> {
     allowed_list(&std::fs::read_to_string(path).ok()?)
 }
 
+/// 커널이 만든 일꾼의 `stat` 플래그: `PF_USER_WORKER`(0x4000, vhost_task — `kvm-nx-lpage-recovery`·`vhost-<pid>`가
+/// QEMU의 `task` 목록에 보인다), `PF_KTHREAD`(0x200000), `PF_NO_SETAFFINITY`(0x4000000)
+const KERNEL_WORKER_FLAGS: u64 = 0x4000 | 0x20_0000 | 0x400_0000;
+
+/// `/proc/<pid>/task/<tid>/stat` 한 줄이 커널 일꾼의 것인지(9번째 칸 `flags`). 이런 스레드의 친화는 커널이 정하고
+/// (`sched_setaffinity`는 EINVAL이거나 커널이 되돌린다) 상한은 스코프의 cpuset(`AllowedCPUs`)이 쥔다.
+pub fn is_kernel_worker_stat(stat: &str) -> bool {
+    // `comm`(둘째 칸)에 빈칸·괄호가 들 수 있어 마지막 `)` 뒤부터 센다: state ppid pgrp session tty_nr tpgid flags
+    let Some((_, rest)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    rest.split_whitespace()
+        .nth(6)
+        .and_then(|f| f.parse::<u64>().ok())
+        .is_some_and(|flags| flags & KERNEL_WORKER_FLAGS != 0)
+}
+
+/// 스레드 `tid`(프로세스 `pid`)가 커널 일꾼인지([`is_kernel_worker_stat`]). 읽지 못하면 false다.
+pub fn is_kernel_worker(proc: &Path, pid: u32, tid: u32) -> bool {
+    std::fs::read_to_string(proc.join(format!("{pid}/task/{tid}/stat")))
+        .is_ok_and(|s| is_kernel_worker_stat(&s))
+}
+
 /// 프로세스 `pid`의 스레드 id
 pub fn threads(proc: &Path, pid: u32) -> std::io::Result<Vec<u32>> {
     let mut out: Vec<u32> = std::fs::read_dir(proc.join(format!("{pid}/task")))?
@@ -116,6 +139,18 @@ pub fn pin_tasks(tasks: &Path, cpus: &CpuSet) -> Result<usize, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn kernel_workers_are_told_by_the_stat_flags() {
+        // 실제 x86 러너의 QEMU `task`: vCPU 스레드와 KVM의 vhost_task(PF_USER_WORKER 0x4000 등)
+        let vcpu = "43301 (CPU 0/KVM) S 1 43298 43298 0 -1 4194368 2003 0 0 0 512 31 0 0 20 0 9 0";
+        let nx = "43310 (kvm-nx-lpage-re) S 1 43298 43298 0 -1 4210752 0 0 0 0 0 0 0 0 20 0 9 0";
+        let odd = "7 (a) b (c)) S 1 1 1 0 -1 2097216 0 0";
+        assert!(!is_kernel_worker_stat(vcpu));
+        assert!(is_kernel_worker_stat(nx));
+        assert!(is_kernel_worker_stat(odd));
+        assert!(!is_kernel_worker_stat("garbage"));
+    }
 
     #[test]
     fn reads_the_allowed_list_of_a_thread() {

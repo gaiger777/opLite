@@ -603,6 +603,34 @@ async fn deploy_requests_are_checked_up_front() {
         task["spec"]["op"]["overrides"]["cpu_model"], "max",
         "{task}"
     );
+    // CPU 배치(계획 64): 같은 이름의 칸이 Task 덮어쓰기로 가고, 맞지 않으면 400 `invalid_numa`다.
+    let got = admin
+        .post(
+            "/vms/tmpl/clone",
+            json!({ "name": "x", "cpu_thread_policy": "isolate" }),
+        )
+        .await;
+    assert_error(&got, StatusCode::BAD_REQUEST, "invalid_numa");
+    let (status, task) = admin
+        .post(
+            "/vms/tmpl/clone",
+            json!({ "name": "z", "cpu_policy": "dedicated", "numa": { "nodes": 1 }, "hugepages": "2M" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let ov = &task["spec"]["op"]["overrides"];
+    assert_eq!(ov["cpu_policy"], "dedicated", "{task}");
+    assert_eq!(ov["numa"], json!({ "nodes": 1 }), "{task}");
+    assert_eq!(ov["hugepages"], "2M", "{task}");
+    // `vm.dedicated`가 없는 운영자는 전용 VM을 배포하지 못한다(공유는 된다).
+    let operator = env.user("op", "operator").await;
+    let got = operator
+        .post(
+            "/vms/tmpl/clone",
+            json!({ "name": "w", "cpu_policy": "dedicated" }),
+        )
+        .await;
+    assert_error(&got, StatusCode::FORBIDDEN, "forbidden");
     // 다른 노드의 로컬 풀에는 닿지 않는다.
     let mut other = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
     other.id = Uuid::now_v7();

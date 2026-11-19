@@ -14,8 +14,8 @@ use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, NUMA,
-    Node, NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
+    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node,
+    NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
@@ -316,14 +316,8 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     }
     // `host`·`max` 밖의 CPU 모델과 플래그는 옛 노드가 풀지 못한다(계획 63, 검증보다 먼저).
     crate::cpu::require_cpu_feature(&state.cluster, &spec.cpu.model, &spec.cpu.flags)?;
-    // CPU 정책·vNUMA·hugepages는 옛 노드가 풀지 못한다(계획 64, 검증보다 먼저). 켜기·배치가 이것을 다루기 전(스테이지
-    // 5에서 열기 전)에는 받지 않는다.
-    if opl_types::numa::in_use(spec) {
-        require_feature(&state.cluster, NUMA)?;
-        return Err(ApiError::bad_request(
-            "dedicated CPUs, NUMA and hugepages are not available yet",
-        ));
-    }
+    // CPU 정책·vNUMA·hugepages는 옛 노드가 풀지 못한다(계획 64, 검증보다 먼저).
+    crate::numa::require_numa_feature(&state.cluster, spec)?;
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate().map_err(crate::cpu::validation_error)?;
@@ -1012,6 +1006,7 @@ pub async fn create_vm(
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, req.spec.folder)?;
     check_attachments(&state, &principal, &req.spec, None)?;
     crate::cpu::check_flag_privilege(&state, &principal, &req.spec.cpu.flags, &[])?;
+    crate::numa::check_privilege(&state, &principal, &req.spec, None)?;
     crate::quota::precheck_vm(&state.cluster, None, &req.spec)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
@@ -1024,8 +1019,12 @@ pub async fn create_vm(
         .map_err(|e| hide_node_reasons(&state, &principal, e))?;
     vm.revision = state.cluster.create(&vm).await?;
     let from = (asked != vm.spec.cpu.model).then(|| asked.to_string());
-    if let Some(cpu) = crate::cpu::audit_cpu(&vm.spec.cpu, None, from.as_deref()) {
-        audit.detail(format!("vm create {} {cpu}", vm.name));
+    let notes: Vec<String> = crate::cpu::audit_cpu(&vm.spec.cpu, None, from.as_deref())
+        .into_iter()
+        .chain(opl_types::numa::audit(&vm.spec, None))
+        .collect();
+    if !notes.is_empty() {
+        audit.detail(format!("vm create {} {}", vm.name, notes.join(" ")));
     }
     let headers = warning_header(&vm.spec);
     Ok((StatusCode::CREATED, headers, Json(public_vm(vm))))
@@ -1127,6 +1126,11 @@ fn warning_header(spec: &VmSpec) -> HeaderMap {
 /// 실행 중이면 409 `vm_running`, UEFI 변수가 있으면(`status.firmware_node`) 409 `firmware_reset_required`다(변수 초기화와
 /// 함께 `POST /vms/{key}/firmware/reset`의 `secure_boot`로 바꾼다). 끝나지 않은 펌웨어 초기화 Task가 있으면 켜기는 409
 /// `vm_busy`다.
+///
+/// CPU 정책(`cpu.policy`·`thread_policy`·`emulator`)·vNUMA(`numa`)·`hugepages`(계획 64)는 모든 노드가 `numa`를 알아야
+/// 하고(409 `cluster_upgrading`) 맞지 않으면 400 `invalid_numa`다. 전용 CPU·hugepages를 켜거나 그 칸을 바꾸려면 그 VM의
+/// `vm.dedicated`가 든다(403). 실행 중에 바꾸면 보류 `numa`(다음 전원 껐다 켜기 때 적용)이고, 전용 VM의 vCPU·메모리는
+/// 핫플러그 상한 안에서 바로 바꾼다(켤 때 상한까지 pCPU를 잡아 두었다).
 #[utoipa::path(put, path = "/vms/{key}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = UpdateRequest<VmSpec>,
@@ -1147,10 +1151,10 @@ pub async fn update_vm(
 ) -> Result<(HeaderMap, Json<Vm>), ApiError> {
     let expected = if_match(&headers)?;
     let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
-    // 감사 설명의 CPU 부분(계획 63): 바꾸기 전 CPU
+    // 감사 설명의 CPU·NUMA 부분(계획 63·64): 바꾸기 전 스펙
     let before = std::sync::Mutex::new(None);
     let (headers, vm) = write_spec(&state, &key, expected, picks, |current| {
-        *before.lock().unwrap() = Some(current.spec.cpu.clone());
+        *before.lock().unwrap() = Some(current.spec.clone());
         // 옮기기는 원본·대상 폴더의 `inventory.move`를 따로 보는 `POST /folders/{id}/members`로만 한다.
         if req.spec.folder != current.spec.folder {
             return Err(ApiError::bad_request(
@@ -1164,6 +1168,7 @@ pub async fn update_vm(
             &req.spec.cpu.flags,
             &current.spec.cpu.flags,
         )?;
+        crate::numa::check_privilege(&state, &principal, &req.spec, Some(current))?;
         // 템플릿 표시는 바꾸기·되돌리기 경로(`/vms/{key}/template`)로만 바꾼다. 이 필드를 모르는 옛 클라이언트의
         // PUT이 템플릿을 보통 VM으로 만들지 않게 저장된 값을 둔다.
         let mut spec = req.spec.clone();
@@ -1174,8 +1179,16 @@ pub async fn update_vm(
     .map_err(|e| hide_node_reasons(&state, &principal, e))?;
     let from = (req.spec.cpu.model != vm.spec.cpu.model).then(|| req.spec.cpu.model.to_string());
     let before = before.into_inner().unwrap();
-    if let Some(cpu) = crate::cpu::audit_cpu(&vm.spec.cpu, before.as_ref(), from.as_deref()) {
-        audit.detail(format!("vm set {} {cpu}", vm.name));
+    let notes: Vec<String> = crate::cpu::audit_cpu(
+        &vm.spec.cpu,
+        before.as_ref().map(|s| &s.cpu),
+        from.as_deref(),
+    )
+    .into_iter()
+    .chain(opl_types::numa::audit(&vm.spec, before.as_ref()))
+    .collect();
+    if !notes.is_empty() {
+        audit.detail(format!("vm set {} {}", vm.name, notes.join(" ")));
     }
     Ok((headers, Json(vm)))
 }

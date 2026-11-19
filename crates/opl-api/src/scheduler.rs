@@ -281,7 +281,7 @@ impl Inventory {
     /// 노드로 오는 마이그레이션 포함)이 잡은 것과 그 요구 합. 도는 VM은 기록된 배치(`hardware.host_placement`, 정확)로,
     /// 아직 켜지 않은 VM(놓였으나 켜지 않음, HA 회차의 자리)과 오는 마이그레이션은 그 모양을 지금 빈 자원에 맞춰 본
     /// 배치로 센다. 합은 Raft 장부와 같이 스펙의 [`numa::demand`]다.
-    fn host_usage(
+    pub fn host_usage(
         &self,
         node: &Node,
         topology: &NodeTopology,
@@ -347,16 +347,28 @@ impl Inventory {
         cpu: VmCpu<'_>,
         assign: &Assign,
     ) -> Result<(), String> {
+        self.numa_plan(skip, spec, node, cpu, assign).map(drop)
+    }
+
+    /// [`Self::numa_fits`]이고 맞춘 배치(묶는 VM만, 아니면 None)를 돌려준다(`GET /vms/{key}/numa`의 계획).
+    fn numa_plan(
+        &self,
+        skip: Uuid,
+        spec: &VmSpec,
+        node: &Node,
+        cpu: VmCpu<'_>,
+        assign: &Assign,
+    ) -> Result<Option<numa::Fit>, String> {
         let name = &node.name;
         let topology = node.status.topology.as_ref();
         let shape = match cpu {
             VmCpu::Running(hw, _) => match &hw.numa {
                 Some(n) if n.memory.is_some() => VmShape::Fixed(n, &hw.cpu),
-                _ => return Ok(()),
+                _ => return Ok(None),
             },
             VmCpu::Start => match numa::layout(spec, topology) {
                 Ok(Some(l)) if l.binds() => VmShape::Spec(spec),
-                Ok(_) => return Ok(()),
+                Ok(_) => return Ok(None),
                 Err(e) => return Err(format!("the VM's NUMA settings are invalid: {e}")),
             },
         };
@@ -376,11 +388,11 @@ impl Inventory {
             VmShape::Fixed(n, cpu) => numa::fit_fixed(n, cpu, Some(&view)),
             VmShape::Spec(spec) => match numa::layout(spec, Some(topology)) {
                 Ok(Some(l)) => numa::fit(&l, Some(&view)),
-                Ok(None) => return Ok(()),
+                Ok(None) => return Ok(None),
                 Err(e) => return Err(format!("the VM's NUMA settings are invalid: {e}")),
             },
         };
-        fit.map_err(|e| e.for_node(name))?;
+        let fit = fit.map_err(|e| e.for_node(name))?;
         // 새로 켜면 Raft 장부가 볼 합계도(맞춰 보지 못한 앞 VM, `isolate`·`any`의 셈이 배치와 다를 때)
         if let VmShape::Spec(spec) = shape {
             let mut after = total.clone();
@@ -390,7 +402,7 @@ impl Inventory {
                 return Err(format!("node {name:?} {e}"));
             }
         }
-        Ok(())
+        Ok(Some(fit))
     }
 }
 
@@ -739,6 +751,12 @@ pub fn cpu_receives(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String>
 /// NUMA 부분, 계획 64). [`cpu_receives`]와 함께 쓴다.
 pub fn numa_receives(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
     inv.numa_fits(vm.id, &vm.spec, node, VmCpu::of(vm), &Assign::default())
+}
+
+/// [`numa_receives`]와 같은 판정이고 맞춘 배치(묶는 VM만)다: 도는 VM은 기록 모양으로 옮길 때, 아니면 스펙으로 켤 때
+/// (`GET /vms/{key}/numa`).
+pub fn numa_plan(vm: &Vm, inv: &Inventory, node: &Node) -> Result<Option<numa::Fit>, String> {
+    inv.numa_plan(vm.id, &vm.spec, node, VmCpu::of(vm), &Assign::default())
 }
 
 /// VM의 스펙을 노드에서 새로 켤 때 NUMA 모양이 맞는지만 본다(껐다 켜기, 계획 64). 이 VM이 잡은 것은 세지 않는다.

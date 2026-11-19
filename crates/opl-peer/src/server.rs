@@ -49,6 +49,7 @@ use crate::proto::peer_server::{Peer, PeerServer};
 use crate::replica::{
     ReplicaAbortRequest, ReplicaFinishRequest, ReplicaPrepareRequest, ReplicaReceiver,
 };
+use crate::topology::{TopologyRequest, TopologySource};
 use crate::wire::{
     AppendEntriesReply, AppendEntriesRequest, FollowRequest, IncomingReply, InstallSnapshotReply,
     InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, ReplicaPrepareReply, ReplicaReply,
@@ -58,6 +59,7 @@ use crate::{
     FIRMWARE_EPOCH_METADATA, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES,
     TARGET_METADATA, VM_METADATA,
 };
+use opl_types::numa::TopologyLive;
 
 /// 다른 노드가 부르는 서비스. 상대 인증서의 노드 id가 이 노드가 아는 멤버(투표 멤버·learner·관찰 노드)여야
 /// 한다. 아직 멤버십을 받지 못한 노드(막 합류하는 중)는 클러스터 CA가 서명한 인증서면 받는다. 관찰 노드는
@@ -74,6 +76,8 @@ pub struct PeerService {
     fence: Option<Arc<dyn FenceSource>>,
     placement: Option<Arc<dyn PlacementSource>>,
     ceph: Option<Arc<dyn CephSource>>,
+    /// 이 노드 토폴로지의 지금 값(계획 64). 없으면 `unimplemented`로 거부한다(옛 노드·macOS·위트니스와 같다).
+    topology: Option<Arc<dyn TopologySource>>,
     /// 드라이버의 `state_dir`. UEFI 변수·TPM 상태 파일을 여기서 찾아 보낸다.
     state_dir: Option<PathBuf>,
     /// 펌웨어 사본(`PushFirmware`)을 받을 때 변수 파일의 크기를 견줄 템플릿. 없으면 받지 않는다.
@@ -99,6 +103,7 @@ impl PeerService {
             fence: None,
             placement: None,
             ceph: None,
+            topology: None,
             state_dir: None,
             firmware_copies: None,
             guest: None,
@@ -181,6 +186,13 @@ impl PeerService {
     /// 같다).
     pub fn with_ceph(mut self, source: Arc<dyn CephSource>) -> Self {
         self.ceph = Some(source);
+        self
+    }
+
+    /// 이 노드 토폴로지의 지금 값(빈 메모리·빈 hugepages·친화)을 `source`가 읽어 준다(계획 64). 없으면 `unimplemented`로
+    /// 거부한다(옛 노드와 같다).
+    pub fn with_topology(mut self, source: Arc<dyn TopologySource>) -> Self {
+        self.topology = Some(source);
         self
     }
 
@@ -537,6 +549,22 @@ impl Peer for PeerService {
             .await?
             .map_err(Status::failed_precondition)?;
         Ok(Response::new(CephStatusReply { report }))
+    }
+
+    async fn read_topology(
+        &self,
+        req: Request<TopologyRequest>,
+    ) -> Result<Response<TopologyLive>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .topology
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node has no NUMA topology"))?;
+        let live = self
+            .offload(async move { source.live().await })
+            .await?
+            .map_err(Status::failed_precondition)?;
+        Ok(Response::new(live))
     }
 
     type UefiVarsStream = ReceiverStream<Result<UefiVarsChunk, Status>>;

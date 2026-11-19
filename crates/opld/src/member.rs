@@ -451,8 +451,6 @@ impl Member {
             };
         #[cfg(feature = "cpu-it")]
         crate::cpu_hook::set_member(Arc::downgrade(&cluster), &hv);
-        #[cfg(feature = "numa-it")]
-        crate::numa_hook::set_member(Arc::downgrade(&cluster));
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;
@@ -606,6 +604,16 @@ impl Member {
         // Ceph Task·에이전트와 API(디스크 목록, Ceph 상태), 다른 노드(노드 간 서버)가 같은 단계들을 쓴다.
         let ceph = Arc::new(config.ceph.host());
         let ceph_source = Arc::new(CephPeerSource::new(cluster.clone(), node, ceph.clone()));
+        // 토폴로지의 지금 값(계획 64 `ReadTopology`, Linux만): API와 다른 노드가 같은 읽기를 쓴다.
+        let topology_source: Option<Arc<dyn opl_peer::TopologySource>> =
+            topology_watch.is_some().then(|| {
+                Arc::new(crate::topology::LiveSource {
+                    cluster: cluster.clone(),
+                    node,
+                    sys: "/sys".into(),
+                    proc: "/proc".into(),
+                }) as Arc<dyn opl_peer::TopologySource>
+            });
         // 게스트 정보 캐시(계획 59): reconciler가 모아 넣고 API와 다른 노드가 읽는다.
         let guest = Arc::new(GuestInfoStore::new(cluster.clone(), hv.clone()));
         // 밀어 둔 펌웨어 사본의 변수 크기를 이 노드의 템플릿과 견준다.
@@ -618,7 +626,7 @@ impl Member {
                 .map(|p| p.vars_template.clone()),
         };
         // UEFI 변수·TPM 상태 파일은 드라이버의 state_dir(데이터 디렉터리)에 있다.
-        let service = PeerService::new(cluster.clone(), Some(hv.clone()))
+        let mut service = PeerService::new(cluster.clone(), Some(hv.clone()))
             .with_migrations(Arc::new(
                 incoming
                     .with_firewall(gate.clone())
@@ -636,6 +644,9 @@ impl Member {
             .with_placement(placement_source)
             .with_ceph(ceph_source)
             .with_work(rt.work.clone());
+        if let Some(source) = &topology_source {
+            service = service.with_topology(source.clone());
+        }
         let peer = on(&rt.core, || {
             serve_peer(peer_listener, &tls, service, exited_tx.clone())
         });
@@ -675,6 +686,7 @@ impl Member {
             state.metrics = Some(metrics_source);
             state.alerts = Some(alert_book);
             state.guest = Some(guest.clone());
+            state.topology = topology_source.clone();
             state.fence = fence;
             state.placement = placement;
             // 헬스 체크가 실행기 확인과 HA 리스(아래에서 띄운 뒤)를 본다.

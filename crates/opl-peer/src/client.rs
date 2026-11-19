@@ -54,6 +54,7 @@ use crate::replica::{
     ReplicaAbortRequest, ReplicaError, ReplicaFinishRequest, ReplicaPrepareRequest,
     ReplicaPrepareResponse,
 };
+use crate::topology::TopologyRequest;
 use crate::wire::FollowRequest;
 use crate::{
     FIRMWARE_EPOCH_METADATA, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES,
@@ -913,6 +914,29 @@ impl Peers {
             .await;
         match reply {
             Ok(reply) => Ok(Some(reply.into_inner().disks)),
+            Err(s) if s.code() == Code::Unimplemented => Ok(None),
+            Err(s) => Err(s),
+        }
+    }
+
+    /// 노드 `node`(첫 링크 `addr`) 토폴로지의 지금 값을 읽는다(계획 64). 그 노드가 이 RPC를 모르면(옛 노드, 토폴로지가
+    /// 없는 노드) None이다. 그 노드가 읽지 못하면 `failed_precondition`이다.
+    pub async fn read_topology(
+        &self,
+        node: NodeId,
+        addr: &str,
+        timeout: Duration,
+    ) -> Result<Option<opl_types::numa::TopologyLive>, Status> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(TopologyRequest {});
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(node));
+                async move { within(timeout, client.read_topology(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => Ok(Some(reply.into_inner())),
             Err(s) if s.code() == Code::Unimplemented => Ok(None),
             Err(s) => Err(s),
         }

@@ -32,6 +32,7 @@ use crate::media::{
     cdrom_lines, cdroms_value, cloud_init_lines, cloud_init_update, iso, parse_boot, vm_cdrom,
 };
 use crate::metrics::{PrometheusCmd, RangeArgs, cluster_history, history, prometheus};
+use crate::numa::{NumaArgs, ResourcesArgs, node_resources, node_topology, numa_lines, vm_numa};
 use crate::output::{bytes, cell, json as print_json, table};
 use crate::template::{
     ImageCmd, TemplateCmd, VOLUME_HEADERS, image, linked_value, template, template_lines,
@@ -343,6 +344,20 @@ enum NodeCmd {
         /// 먼저 노드 QEMU에 다시 묻는다(Task가 끝날 때까지 기다린다). 보통은 QEMU를 올리면 스스로 다시 읽는다.
         #[arg(long)]
         refresh: bool,
+    },
+    /// 노드의 NUMA 토폴로지(소켓·NUMA 노드·L3·거리·hugepages), 예약·전용·공유 CPU, 호스트 노드마다 사용, 도는 VM의
+    /// 고정과 경고
+    Topology {
+        node: String,
+        /// 노드에 직접 물은 빈 메모리·빈 hugepages·orbivisord 친화도 보인다.
+        #[arg(long)]
+        live: bool,
+    },
+    /// 노드의 호스트 자원 설정(예약·전용 CPU, 실행 중 hugepages 예약)을 보이거나 바꾼다. 준 칸만 바꾼다.
+    Resources {
+        node: String,
+        #[command(flatten)]
+        args: ResourcesArgs,
     },
     /// 노드의 업데이트 확인 결과(올릴 수 있는 패키지)를 보인다.
     Updates {
@@ -1588,6 +1603,10 @@ enum VmCmd {
     Cpu {
         vm: String,
     },
+    /// VM의 CPU 배치와 NUMA(스펙·켤 때 정한 모양·고정한 pCPU·보류)와 노드마다 맞는지·까닭·계획
+    Numa {
+        vm: String,
+    },
     /// NIC의 보안 그룹을 바꾼다. 실행 중이어도 곧바로 적용된다. 그룹을 주지 않으면 모두 뺀다.
     NicSg {
         vm: String,
@@ -1681,6 +1700,9 @@ enum VmCmd {
         /// 모든 디스크를 전체 복사로
         #[arg(long)]
         full: bool,
+        /// 새 VM의 CPU 배치(계획 64, `none`은 원본의 것을 지운다)
+        #[command(flatten)]
+        numa: NumaArgs,
     },
     /// VM 스냅샷(디스크, 실행 중이면 메모리, VM 설정)
     Snapshot {
@@ -1749,6 +1771,8 @@ struct VmCreate {
     cdroms: Vec<String>,
     #[command(flatten)]
     cpu: CpuArgs,
+    #[command(flatten)]
+    numa: NumaArgs,
     /// 부팅 순서(예: `cdrom,disk` — `disk`는 `disk0`, `cdrom`은 `cdrom0`). 목록에 없는 디스크로는 부팅하지 않는다(디스크를
     /// 하나도 적지 않으면 디스크는 목록 뒤에 차례로 온다).
     #[arg(long, value_name = "DEVICE,...")]
@@ -1887,7 +1911,8 @@ fn nic_body(nic: &NicArg) -> Value {
     "cloud_init", "ci_hostname", "ci_user", "ci_password_file", "ci_password_prompt",
     "ci_password_hash", "ci_ssh_keys", "ci_ip", "ci_ip6", "ci_dns", "ci_search", "ci_user_data",
     "ci_vendor_data", "no_cloud_init", "ci_no_password", "ci_clear_ssh_keys", "tpm", "secure_boot",
-    "guest_agent", "agent_freeze", "agent_shutdown", "cpu_model", "cpu_flags", "no_cpu_flags"
+    "guest_agent", "agent_freeze", "agent_shutdown", "cpu_model", "cpu_flags", "no_cpu_flags",
+    "cpu_policy", "cpu_threads", "emulator_threads", "numa", "numa_memory", "hugepages"
 ])))]
 struct VmSet {
     vm: String,
@@ -1932,6 +1957,8 @@ struct VmSet {
     no_max_memory: bool,
     #[command(flatten)]
     cpu: CpuArgs,
+    #[command(flatten)]
+    numa: NumaArgs,
     /// 복제 대상 목록을 이것으로 통째로 바꾼다(`vm create --replicate`와 같은 모양, 세 번까지).
     #[arg(long = "replicate", value_name = "NODE[,*/N][,pool=POOL]", value_parser = parse_replica_target)]
     replicate: Vec<ReplicateArg>,
@@ -2009,6 +2036,7 @@ impl VmSet {
             || self.fw.changes_other()
             || (self.fw.secure_boot.is_some() && !self.reset_uefi_vars)
             || self.cpu.given()
+            || self.numa.given()
     }
 
     /// CPU·메모리를 바꾸는지
@@ -3411,6 +3439,8 @@ struct ImportRunArgs {
     new_macs: bool,
     #[command(flatten)]
     cpu: CpuArgs,
+    #[command(flatten)]
+    numa: NumaArgs,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -3491,6 +3521,7 @@ fn import_run_body(args: &ImportRunArgs, sources: &[String]) -> anyhow::Result<V
         "keep_macs": !args.new_macs,
     });
     args.cpu.request_fields(&mut body);
+    args.numa.request_fields(&mut body, false)?;
     Ok(body)
 }
 
@@ -5869,6 +5900,12 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             NodeCmd::Cpu { node, refresh } => {
                 node_cpu(&client, &node, refresh, json_out, out).await?
             }
+            NodeCmd::Topology { node, live } => {
+                Box::pin(node_topology(&client, &node, live, json_out, out)).await?
+            }
+            NodeCmd::Resources { node, args } => {
+                Box::pin(node_resources(&client, &node, &args, json_out, out)).await?
+            }
             NodeCmd::Updates { node, refresh } => {
                 node_updates(&client, &node, refresh, json_out, out).await?
             }
@@ -7359,8 +7396,10 @@ async fn vm_migrate(
     if force {
         body["force"] = json!(true);
     }
-    // `host` VM을 CPU가 다른 노드로 옮기면 경고한다(막지 않는다, 계획 63).
+    // `host` VM을 CPU가 다른 노드로 옮기면 경고한다(막지 않는다, 계획 63). 대상이 NUMA 모양을 받을 수 없으면 그
+    // 까닭을 먼저 찍는다(계획 64 — API가 409로 막는다).
     migrate_warnings(client, vm, node, err).await?;
+    crate::numa::migrate_reason(client, vm, node, err).await?;
     // 확정이 복제 방향을 뒤집으므로 복제 대상은 보내기 전에 읽는다. 읽지 못하면 POST가 오류를 알린다.
     let before = client.get(&format!("/vms/{}", seg(vm))).await.ok();
     let task = client
@@ -7797,7 +7836,7 @@ async fn vm_get(
     let vm = client.get(&format!("/vms/{}", seg(vm))).await?;
     print_json(out, &vm)?;
     if !json_out {
-        for line in cpu_lines(&vm) {
+        for line in cpu_lines(&vm).into_iter().chain(numa_lines(&vm)) {
             writeln!(err, "{line}")?;
         }
         if let Some(line) = hardware_line(&vm) {
@@ -7856,6 +7895,7 @@ async fn vm(
         }
         VmCmd::Get { vm } => vm_get(client, &vm, json_out, out, &mut std::io::stderr()).await?,
         VmCmd::Cpu { vm } => vm_cpu(client, &vm, json_out, out).await?,
+        VmCmd::Numa { vm } => Box::pin(vm_numa(client, &vm, json_out, out)).await?,
         VmCmd::Create(args) => {
             let node = match &args.node {
                 Some(key) => Some(client.get(&format!("/nodes/{}", seg(key))).await?),
@@ -7944,6 +7984,7 @@ async fn vm(
                 body["spec"]["max_memory_mib"] = json!(n);
             }
             args.cpu.apply(&mut body["spec"]);
+            args.numa.apply(&mut body["spec"])?;
             if !args.replicate.is_empty() {
                 let list = client.get("/nodes").await?;
                 let nodes = list["items"].as_array().cloned().unwrap_or_default();
@@ -8005,6 +8046,7 @@ async fn vm(
             let task = if args.changes_spec() {
                 put_spec(client, &args.vm, |current| {
                     let mut body = vm_set_spec(current, &args);
+                    args.numa.apply(&mut body["spec"])?;
                     replication_set(&mut body, replication.as_ref(), args.no_replicate);
                     media_set(&mut body, current, &args, &ci_input)?;
                     Ok(body)
@@ -8051,6 +8093,12 @@ async fn vm(
             if args.cpu.given() {
                 done.push(format!(
                     "vm {}: CPU updated (a running VM gets it at the next power cycle: `vm reboot`, not a reboot inside the guest)",
+                    args.vm
+                ));
+            }
+            if args.numa.given() {
+                done.push(format!(
+                    "vm {}: CPU placement updated (a running VM gets it at the next power cycle: `vm reboot`)",
                     args.vm
                 ));
             }
@@ -8196,11 +8244,13 @@ async fn vm(
             pool,
             linked,
             full,
+            numa,
         } => {
             let mut body = json!({ "name": name, "snapshot": snapshot, "pool": pool });
             if let Some(linked) = linked_value(linked, full) {
                 body["linked"] = json!(linked);
             }
+            numa.request_fields(&mut body, true)?;
             let task = client
                 .post(&format!("/vms/{}/clone", seg(&vm)), &body)
                 .await?;
@@ -9412,7 +9462,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             cli.cmd,
-            Cmd::Vm { cmd: VmCmd::Clone { vm, name, snapshot: Some(s), pool: Some(p), linked: false, full: false } }
+            Cmd::Vm { cmd: VmCmd::Clone { vm, name, snapshot: Some(s), pool: Some(p), linked: false, full: false, .. } }
                 if vm == "web" && name == "copy" && s == "base" && p == "fast"
         ));
         let cli =
@@ -9824,12 +9874,13 @@ mod tests {
              vm web: migrating memory\n"
         );
         {
-            // CPU 경고(계획 63)와 복제 대상을 보려고 VM을 먼저 읽는다.
+            // CPU 경고(계획 63)·NUMA 까닭(계획 64)과 복제 대상을 보려고 VM을 먼저 읽는다.
             let seen = seen.lock().unwrap();
             assert_eq!(seen[0].line, "GET /api/v1/vms/web/cpu HTTP/1.1");
-            assert_eq!(seen[1].line, "GET /api/v1/vms/web HTTP/1.1");
-            assert_eq!(seen[2].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
-            assert_eq!(seen[2].body, json!({ "node": "n2", "pool": "fast" }));
+            assert_eq!(seen[1].line, "GET /api/v1/vms/web/numa HTTP/1.1");
+            assert_eq!(seen[2].line, "GET /api/v1/vms/web HTTP/1.1");
+            assert_eq!(seen[3].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
+            assert_eq!(seen[3].body, json!({ "node": "n2", "pool": "fast" }));
         }
 
         // 풀을 주지 않으면 본문에 `pool`이 없다.
@@ -9838,7 +9889,7 @@ mod tests {
         vm_migrate(&client, "web", "n2", None, false, &mut out, &mut Vec::new())
             .await
             .unwrap();
-        assert_eq!(seen.lock().unwrap()[2].body, json!({ "node": "n2" }));
+        assert_eq!(seen.lock().unwrap()[3].body, json!({ "node": "n2" }));
 
         // `--force`는 줄 때만 보낸다.
         seen.lock().unwrap().clear();
@@ -9854,7 +9905,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            seen.lock().unwrap()[2].body,
+            seen.lock().unwrap()[3].body,
             json!({ "node": "n2", "force": true })
         );
     }
@@ -14107,6 +14158,75 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         );
         assert!(Cli::try_parse_from(["oplctl", "node", "cpu", "n1", "--refresh"]).is_ok());
         assert!(Cli::try_parse_from(["oplctl", "vm", "cpu", "web"]).is_ok());
+        // 계획 64
+        assert!(Cli::try_parse_from(["oplctl", "vm", "numa", "web"]).is_ok());
+        assert!(Cli::try_parse_from(["oplctl", "node", "topology", "n1", "--live"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "oplctl",
+                "node",
+                "resources",
+                "n1",
+                "--dedicated-cpus",
+                "4-31",
+                "--hugepages",
+                "2M:1024@0",
+                "--force"
+            ])
+            .is_ok()
+        );
+        let Cli {
+            cmd: Cmd::Vm {
+                cmd: VmCmd::Set(set),
+            },
+            ..
+        } = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--cpu-policy", "dedicated"])
+            .unwrap()
+        else {
+            panic!("vm set");
+        };
+        let mut body = vm_set_spec(&json!({ "spec": { "cpu": { "cores": 2 } } }), &set);
+        set.numa.apply(&mut body["spec"]).unwrap();
+        assert_eq!(
+            body["spec"]["cpu"],
+            json!({ "cores": 2, "policy": "dedicated" })
+        );
+        for args in [
+            vec![
+                "oplctl",
+                "vm",
+                "create",
+                "db",
+                "--numa",
+                "auto",
+                "--hugepages",
+                "1G",
+            ],
+            vec!["oplctl", "vm", "clone", "a", "b", "--numa", "none"],
+            vec![
+                "oplctl",
+                "import",
+                "run",
+                "x",
+                "--name",
+                "y",
+                "--pool",
+                "p",
+                "--cpu-policy",
+                "dedicated",
+            ],
+            vec![
+                "oplctl",
+                "folder",
+                "quota",
+                "set",
+                "/db",
+                "--dedicated-vcpus",
+                "8",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(&args).is_ok(), "{args:?}");
+        }
     }
 
     #[tokio::test]

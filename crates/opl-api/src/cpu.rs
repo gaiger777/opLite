@@ -60,10 +60,11 @@ pub(crate) fn cpu_error(e: CpuError) -> ApiError {
     ApiError::bad_request(e.to_string()).with_code(code)
 }
 
-/// VM 스펙 검증 오류의 400. CPU 오류는 §13의 코드다.
+/// VM 스펙 검증 오류의 400. CPU 오류는 §13의 코드, NUMA·전용 CPU·hugepages 오류는 `invalid_numa`(계획 64)다.
 pub(crate) fn validation_error(e: ValidationError) -> ApiError {
     match e {
         ValidationError::Cpu(e) => cpu_error(e),
+        ValidationError::Numa(e) => crate::numa::numa_error(e),
         e => ApiError::bad_request(e.to_string()),
     }
 }

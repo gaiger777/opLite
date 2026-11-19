@@ -271,6 +271,26 @@ pub struct CatalogTemplate {
     #[serde(default)]
     #[schema(default)]
     pub cpu_flags: Vec<opl_types::cpu::CpuFlag>,
+    /// CPU 정책(계획 64, 없으면 `shared`). `dedicated`는 권한 `vm.dedicated`가 든다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_policy: Option<opl_types::numa::CpuPolicy>,
+    /// 전용 CPU 스레드 정책(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_thread_policy: Option<opl_types::numa::ThreadPolicy>,
+    /// 에뮬레이터 스레드 정책(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_emulator: Option<opl_types::numa::EmulatorPolicy>,
+    /// vNUMA(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub numa: Option<opl_types::numa::NumaSpec>,
+    /// hugepages(계획 64). 권한 `vm.dedicated`가 든다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub hugepages: Option<opl_types::numa::PageSize>,
 }
 
 fn default_vcpus() -> u16 {
@@ -338,6 +358,9 @@ pub async fn download_catalog_image(
     check_volume_name(&name)?;
     if let Some(t) = &req.template {
         crate::cpu::check_flag_privilege(&state, &principal, &t.cpu_flags, &[])?;
+        // 전용 CPU·hugepages 템플릿은 `vm.dedicated`(템플릿은 루트에 만든다, 계획 64)
+        let host = t.cpu_policy.is_some_and(|p| !p.is_shared()) || t.hugepages.is_some();
+        crate::numa::require_privilege(&state, &principal, host, None)?;
     }
     let template = match &req.template {
         Some(t) => Some(Box::new(draft(&state, &pool, image, &name, t)?)),
@@ -479,10 +502,24 @@ fn draft(
         firmware: Some(image.firmware),
         cpu_model: t.cpu_model.clone(),
         cpu_flags: t.cpu_flags.clone(),
+        cpu_policy: t.cpu_policy,
+        cpu_thread_policy: t.cpu_thread_policy,
+        cpu_emulator: t.cpu_emulator,
+        numa: t.numa.clone(),
+        hugepages: t.hugepages,
     };
     let mut draft = draft;
     let model = draft.cpu_model.clone().unwrap_or_default();
     crate::cpu::require_cpu_feature(&state.cluster, &model, &draft.cpu_flags)?;
+    // CPU 정책·vNUMA·hugepages(계획 64)는 옛 노드가 풀지 못한다(검증보다 먼저).
+    if draft.cpu_policy.is_some()
+        || draft.cpu_thread_policy.is_some()
+        || draft.cpu_emulator.is_some()
+        || draft.numa.is_some()
+        || draft.hugepages.is_some()
+    {
+        require_feature(&state.cluster, opl_types::node::NUMA)?;
+    }
     let spec = draft.vm_spec(volume).map_err(|e| match e {
         opl_types::template::TemplateError::Invalid(v) => crate::cpu::validation_error(v),
         e => ApiError::bad_request(format!("template: {e}")),

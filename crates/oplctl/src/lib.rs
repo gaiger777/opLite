@@ -13,6 +13,7 @@ mod fake_api;
 mod firmware;
 mod media;
 mod metrics;
+mod numa;
 mod output;
 mod template;
 mod two_factor;

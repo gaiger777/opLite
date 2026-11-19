@@ -119,6 +119,9 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     // CPU 탐침과 카탈로그(계획 63)
     ("GET", "/nodes/{key}/cpu", Root(ClusterRead)),
     ("POST", "/nodes/{key}/cpu/refresh", Root(ClusterAdmin)),
+    // NUMA 토폴로지(계획 64): 노드 번호·pCPU를 보이므로 루트 `cluster.read`
+    ("GET", "/nodes/{key}/topology", Root(ClusterRead)),
+    ("GET", "/topology/usage", Root(ClusterRead)),
     ("POST", "/nodes/{key}/upgrade", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/drain", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/unfreeze", Root(ClusterAdmin)),
@@ -248,6 +251,8 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/vms/{key}/firmware/reset", Object(Vm, VmConfig)),
     ("GET", "/vms/{key}/guest", Read(Vm)),
     ("GET", "/vms/{key}/cpu", Read(Vm)),
+    // VM 읽기. 루트 `cluster.read`가 없으면 핸들러가 노드 이름·pCPU를 뺀다(계획 64).
+    ("GET", "/vms/{key}/numa", Read(Vm)),
     ("POST", "/vms/{key}/guest/password", Object(Vm, VmConfig)),
     ("GET", "/vms/{key}/console", Object(Vm, VmConsole)),
     ("POST", "/vms/{key}/backups", Object(Vm, BackupCreate)),

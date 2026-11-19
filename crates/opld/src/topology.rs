@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use opl_cluster::Cluster;
 use opl_types::node::NUMA;
 use opl_types::numa::{
-    CpuSet, HostNode, HostResources, HugepagePool, HugepageReserve, NodeTopology,
+    CpuSet, HostNode, HostResources, HugepagePool, HugepageReserve, LiveNode, LivePool,
+    NodeTopology, TopologyLive,
 };
 
 /// 검사 회차(5초) 몇 번마다 `/sys`를 다시 읽는지(30초)
@@ -245,6 +246,111 @@ fn host_nodes(
         distances.clear();
     }
     Ok((nodes, distances))
+}
+
+/// `hugepages-<kB>kB/{free,surplus}_hugepages` 목록(크기 순, 계획 64 `ReadTopology`). 예약도 더 받은 것도 없는 크기는
+/// 뺀다.
+fn live_pools(dir: &Path) -> Vec<LivePool> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let count = |path: PathBuf| {
+        number(&path)
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0)
+    };
+    let mut found: Vec<LivePool> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name();
+            let size_kib = name
+                .to_str()?
+                .strip_prefix("hugepages-")?
+                .strip_suffix("kB")?
+                .parse()
+                .ok()?;
+            // 예약도 더 받은 것도 없는 크기는 뺀다(노드 상태의 풀처럼).
+            let total = count(e.path().join("nr_hugepages"));
+            let surplus = count(e.path().join("surplus_hugepages"));
+            (total > 0 || surplus > 0).then(|| LivePool {
+                size_kib,
+                free: count(e.path().join("free_hugepages")),
+                surplus,
+            })
+        })
+        .collect();
+    found.sort_by_key(|p| p.size_kib);
+    found
+}
+
+/// 이 노드 토폴로지의 지금 값(계획 64 `ReadTopology`): 호스트 노드마다 빈 메모리(`MemFree`)와 hugepages의 빈·더 받은
+/// 수, 그리고 orbivisord(`proc/self`)의 친화가 예약 CPU(`reserved`, 온라인과 교집합 — 비면 온라인 전체)와 맞는지.
+/// `node` 디렉터리가 없으면 노드 0 하나(`/proc/meminfo`, `/sys/kernel/mm/hugepages`)다.
+pub fn live(sys: &Path, proc: &Path, reserved: &CpuSet) -> Result<TopologyLive, String> {
+    let online = cpus(&cpu_dir(sys).join("online"))?;
+    let dir = node_dir(sys);
+    let ids = numbered(&dir, "node");
+    let mut nodes = Vec::new();
+    if ids.is_empty() {
+        let meminfo = read(&proc.join("meminfo"))?;
+        nodes.push(LiveNode {
+            id: 0,
+            memory_free_mib: meminfo_kib(&meminfo, "MemFree:").unwrap_or(0) / 1024,
+            hugepages: live_pools(&sys.join("kernel/mm/hugepages")),
+        });
+    }
+    for id in ids {
+        let node = dir.join(format!("node{id}"));
+        let id = u16::try_from(id).map_err(|_| format!("NUMA node {id} is out of range"))?;
+        let meminfo = read(&node.join("meminfo"))?;
+        nodes.push(LiveNode {
+            id,
+            memory_free_mib: meminfo_kib(&meminfo, "MemFree:").unwrap_or(0) / 1024,
+            hugepages: live_pools(&node.join("hugepages")),
+        });
+    }
+    let reserved = reserved.intersection(&online);
+    let want = if reserved.is_empty() {
+        online.clone()
+    } else {
+        reserved
+    };
+    let affinity_ok = std::fs::read_to_string(proc.join("self/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?
+                .trim()
+                .parse::<CpuSet>()
+                .ok()
+        })
+        .is_some_and(|allowed| allowed.intersection(&online) == want);
+    Ok(TopologyLive { nodes, affinity_ok })
+}
+
+/// 다른 노드와 이 노드의 API가 묻는 지금 값([`live`])을 답한다(Linux에서만 넣는다). 예약 CPU는 저장된 노드 설정이다.
+pub struct LiveSource {
+    pub cluster: std::sync::Arc<Cluster>,
+    pub node: uuid::Uuid,
+    pub sys: PathBuf,
+    pub proc: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl opl_peer::TopologySource for LiveSource {
+    async fn live(&self) -> Result<TopologyLive, String> {
+        let reserved = self
+            .cluster
+            .get::<opl_types::node::NodeSpec>(self.node)
+            .map_err(|e| e.to_string())?
+            .and_then(|n| n.spec.host_resources)
+            .map(|r| r.reserved_cpus)
+            .unwrap_or_default();
+        let (sys, proc) = (self.sys.clone(), self.proc.clone());
+        tokio::task::spawn_blocking(move || live(&sys, &proc, &reserved))
+            .await
+            .map_err(|e| format!("reading the topology panicked: {e}"))?
+    }
 }
 
 /// 예약된 풀만(노드 상태를 작게)
@@ -1041,5 +1147,36 @@ mod real {
             .parse()
             .unwrap();
         assert_eq!(allowed, last);
+    }
+    #[test]
+    fn live_values_are_read_per_host_node() {
+        let root = fixture("x86-2s");
+        let live = live(&root.join("sys"), &root.join("proc"), &CpuSet::new()).unwrap();
+        assert_eq!(live.nodes.len(), 2);
+        assert_eq!(live.nodes[0].id, 0);
+        assert_eq!(live.nodes[0].memory_free_mib, 32921966 / 1024);
+        let sizes: Vec<u32> = live.nodes[0].hugepages.iter().map(|p| p.size_kib).collect();
+        assert_eq!(sizes, [2048, 1048576]);
+        assert_eq!(live.nodes[0].hugepages[0].free, 512);
+        // 고정물에 `self/status`가 없으면 친화를 모른다.
+        assert!(!live.affinity_ok);
+
+        let dir = copy_fixture("x86-no-numa");
+        let (sys, proc) = (dir.path().join("sys"), dir.path().join("proc"));
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        let online = probe(&sys, &proc).unwrap().cpus;
+        std::fs::write(
+            proc.join("self/status"),
+            format!("Name:\topld\nCpus_allowed_list:\t{online}\n"),
+        )
+        .unwrap();
+        let live = super::live(&sys, &proc, &CpuSet::new()).unwrap();
+        assert_eq!(live.nodes.len(), 1);
+        assert_eq!(live.nodes[0].memory_free_mib, 8157184 / 1024);
+        assert!(live.affinity_ok);
+        // 예약 CPU가 있는데 opld가 온라인 전체에 돌면 맞지 않는다.
+        assert!(!super::live(&sys, &proc, &set("0")).unwrap().affinity_ok);
+        std::fs::write(proc.join("self/status"), "Cpus_allowed_list:\t0\n").unwrap();
+        assert!(super::live(&sys, &proc, &set("0")).unwrap().affinity_ok);
     }
 }

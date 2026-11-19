@@ -58,6 +58,9 @@ pub struct AppState {
     /// 이 노드에서 도는 VM의 게스트 에이전트(opld의 게스트 정보 캐시, 계획 59). 없으면 게스트 정보 API가 이 노드의 VM을
     /// `unsupported`로 보인다.
     pub guest: Option<Arc<dyn GuestAgentSource>>,
+    /// 이 노드 토폴로지의 지금 값(opld의 `/sys` 읽기, 계획 64 `ReadTopology`와 같은 것). 없으면(macOS·위트니스) 노드
+    /// 토폴로지 응답의 `live`가 없다.
+    pub topology: Option<Arc<dyn opl_peer::TopologySource>>,
     /// OIDC 영역의 discovery·JWKS(노드 메모리)
     pub(crate) oidc: OidcCache,
     /// 이 노드가 지금 받고 있는 백업 사본 파일(백업 id, 파일 이름). 같은 파일을 두 요청이 함께 쓰지 않게 한다.
@@ -115,6 +118,7 @@ impl AppState {
             metrics: None,
             alerts: None,
             guest: None,
+            topology: None,
             oidc: OidcCache::default(),
             receiving_files: Default::default(),
             receive_idle_timeout: Duration::from_secs(60),

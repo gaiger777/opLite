@@ -40,6 +40,7 @@ mod metrics;
 mod metrics_history;
 mod migration_disks;
 mod node_fence;
+mod numa;
 pub mod oidc;
 mod oidc_login;
 mod permissions;
@@ -197,6 +198,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(updates::refresh_updates))
         .routes(routes!(cpu::get_node_cpu))
         .routes(routes!(cpu::refresh_node_cpu))
+        .routes(routes!(numa::get_node_topology))
+        .routes(routes!(numa::topology_usage))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
         .routes(routes!(drain::unfreeze_node))
@@ -303,6 +306,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vms::convert_template, vms::untemplate_vm))
         .routes(routes!(vm_firmware::reset_firmware))
         .routes(routes!(cpu::get_vm_cpu))
+        .routes(routes!(numa::get_vm_numa))
         .routes(routes!(guest::get_guest))
         .routes(routes!(guest::set_guest_password))
         .routes(routes!(metrics::get_vm_metrics))

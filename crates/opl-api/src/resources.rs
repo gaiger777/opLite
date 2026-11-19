@@ -764,20 +764,41 @@ pub async fn delete_network(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 노드의 주소, 유지보수 모드, 역할(`roles`)을 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
-/// 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는 API가
-/// 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
+/// `PUT /nodes/{key}`의 쿼리
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateNodeQuery {
+    /// `host_resources`의 409 `host_cpus_in_use`·`hugepages_in_use`를 넘기고 쓴다(응답 헤더 `orbivisor-warning`).
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// 노드의 주소, 유지보수 모드, 역할(`roles`), 호스트 자원 설정(`host_resources`)을 바꾼다. 노드 리소스는 orbivisord가
+/// 시작할 때 스스로 만든다. 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는
+/// API가 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
+///
+/// `host_resources`(계획 64: 예약·전용 CPU, 실행 중 hugepages 예약)는 칸이 없으면 저장된 값을 그대로 두고(이 칸을
+/// 모르는 클라이언트의 PUT이 지우지 않게) `{}`면 지운다. 바꾸려면 모든 노드가 `numa`를 알아야 하고(409
+/// `cluster_upgrading`), 노드가 알린 토폴로지에 맞아야 한다(온라인 CPU, 예약·전용이 겹치지 않음, 공유 CPU가 남음, 있는
+/// 호스트 NUMA 노드 — 400 `invalid_host_resources`). 도는 VM이 고정된 pCPU가 새 전용 CPU 밖이면 409
+/// `host_cpus_in_use`(`details.vms`), Orbivisor VM이 쓰는 hugepages보다 적게 예약하면 409 `hugepages_in_use`이고
+/// `?force=true`면 쓰고 경고를 `orbivisor-warning`으로 준다.
 #[utoipa::path(put, path = "/nodes/{key}", tag = "nodes",
-    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
+    params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header), UpdateNodeQuery),
     request_body = UpdateRequest<NodeSpec>,
-    responses((status = 200, body = Resource<NodeSpec, NodeStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 200, body = Resource<NodeSpec, NodeStatus>, headers(
+            ("orbivisor-warning" = String, description = "what `force` let through (only when there is something)"),
+        )), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn update_node(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: crate::audit::AuditNote,
     Path(key): Path<String>,
+    crate::error::Query(query): crate::error::Query<UpdateNodeQuery>,
     headers: HeaderMap,
     Json(req): Json<UpdateRequest<NodeSpec>>,
-) -> Result<Json<Node>, ApiError> {
+) -> Result<(HeaderMap, Json<Node>), ApiError> {
     state.authorize(&principal, Action::Write, NodeSpec::KIND)?;
     let node = lookup::<NodeSpec>(&state.cluster, &key)?;
     let mut spec = NodeSpec {
@@ -795,16 +816,22 @@ pub async fn update_node(
         // 옛 노드는 `roles`가 든 Node를 풀지 못한다.
         require_feature(&state.cluster, "node-roles")?;
     }
-    // 호스트 자원 설정(계획 64)은 옛 노드가 풀지 못한다. 검증·적용이 들어오기 전(스테이지 5에서 열기 전)에는 받지 않는다.
-    if spec.host_resources.is_some() {
-        require_feature(&state.cluster, opl_types::node::NUMA)?;
-        return Err(ApiError::bad_request(
-            "host_resources (reserved and dedicated CPUs, hugepages) is not available yet",
-        ));
-    }
+    // 호스트 자원 설정(계획 64): 없으면 그대로, `{}`면 지움, 바꾸면 검증과 쓰기 전 확인
+    let change =
+        crate::numa::host_resources_change(&state, &node, spec.host_resources.take(), query.force)?;
+    spec.host_resources = change.value;
     state
         .cluster
         .update_spec(node.id, if_match(&headers)?, req.labels, &spec)
         .await?;
-    Ok(Json(lookup::<NodeSpec>(&state.cluster, &key)?))
+    if let Some(note) = change.audit {
+        audit.detail(note);
+    }
+    let mut out = HeaderMap::new();
+    if !change.warnings.is_empty()
+        && let Ok(v) = axum::http::HeaderValue::from_str(&change.warnings.join("; "))
+    {
+        out.insert(crate::revision::WARNING, v);
+    }
+    Ok((out, Json(lookup::<NodeSpec>(&state.cluster, &key)?)))
 }

@@ -259,6 +259,40 @@ pub struct ImportRun {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub cpu_flags: Vec<crate::cpu::CpuFlag>,
+    /// CPU 정책(계획 64). 없으면 `shared`다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_policy: Option<crate::numa::CpuPolicy>,
+    /// 전용 CPU 스레드 정책(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_thread_policy: Option<crate::numa::ThreadPolicy>,
+    /// 에뮬레이터 스레드 정책(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_emulator: Option<crate::numa::EmulatorPolicy>,
+    /// vNUMA(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub numa: Option<crate::numa::NumaSpec>,
+    /// hugepages(계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hugepages: Option<crate::numa::PageSize>,
+}
+
+impl ImportRun {
+    /// CPU 배치 칸(계획 64)
+    pub fn numa_overrides(&self) -> crate::numa::NumaOverrides {
+        crate::numa::NumaOverrides {
+            cpu_policy: self.cpu_policy,
+            cpu_thread_policy: self.cpu_thread_policy,
+            cpu_emulator: self.cpu_emulator,
+            numa: self.numa.clone(),
+            hugepages: self.hugepages,
+            ..Default::default()
+        }
+    }
 }
 
 fn yes() -> bool {

@@ -638,6 +638,8 @@ export interface paths {
          *     `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`. 증분 백업은 고른 노드가 증분 백업을
          *     알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`). TPM 상태가 있거나 VM 스펙에 `tpm`·`secure_boot`가 있는
          *     백업은 모든 노드가 `vtpm`을, `guest_agent`가 있는 백업은 `guest-agent`를 알아야 한다(409 `cluster_upgrading`).
+         *     전용 CPU·vNUMA·hugepages가 있는 백업은 모든 노드가 `numa`를 알아야 하고(409 `cluster_upgrading`), 전용 CPU·hugepages는
+         *     새 폴더의 `vm.dedicated`가 든다(403, 계획 64).
          */
         post: operations["restore_backup"];
         delete?: never;
@@ -1397,9 +1399,15 @@ export interface paths {
         };
         get: operations["get_node"];
         /**
-         * 노드의 주소, 유지보수 모드, 역할(`roles`)을 바꾼다. 노드 리소스는 orbivisord가 시작할 때 스스로 만든다.
-         *     위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는 API가
-         *     없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
+         * 노드의 주소, 유지보수 모드, 역할(`roles`), 호스트 자원 설정(`host_resources`)을 바꾼다. 노드 리소스는 orbivisord가
+         *     시작할 때 스스로 만든다. 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는
+         *     API가 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
+         * @description `host_resources`(계획 64: 예약·전용 CPU, 실행 중 hugepages 예약)는 칸이 없으면 저장된 값을 그대로 두고(이 칸을
+         *     모르는 클라이언트의 PUT이 지우지 않게) `{}`면 지운다. 바꾸려면 모든 노드가 `numa`를 알아야 하고(409
+         *     `cluster_upgrading`), 노드가 알린 토폴로지에 맞아야 한다(온라인 CPU, 예약·전용이 겹치지 않음, 공유 CPU가 남음, 있는
+         *     호스트 NUMA 노드 — 400 `invalid_host_resources`). 도는 VM이 고정된 pCPU가 새 전용 CPU 밖이면 409
+         *     `host_cpus_in_use`(`details.vms`), Orbivisor VM이 쓰는 hugepages보다 적게 예약하면 409 `hugepages_in_use`이고
+         *     `?force=true`면 쓰고 경고를 `orbivisor-warning`으로 준다.
          */
         put: operations["update_node"];
         post?: never;
@@ -1574,6 +1582,27 @@ export interface paths {
          *     `cluster_upgrading`, 꺼진 것으로 기록됐거나 닿지 않으면 503 `node_unreachable`이다.
          */
         get: operations["get_node_history"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/topology": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드의 NUMA 토폴로지(소켓·NUMA 노드·L3·형제·거리·hugepages 풀·`isolcpus`)와 세 CPU 집합(예약·전용·공유), 호스트
+         *     노드마다 사용(전용 CPU·hugepages), 이 노드에서 도는 VM이 잡은 pCPU·페이지, 노드에 직접 물은 지금 값(빈 메모리·빈
+         *     hugepages·orbivisord 친화, 노드 사이 RPC `ReadTopology` — 답이 없으면 `live`가 없다), 경고
+         */
+        get: operations["get_node_topology"];
         put?: never;
         post?: never;
         delete?: never;
@@ -2265,6 +2294,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/topology/usage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드마다 전용 CPU(전체·사용)와 크기마다 hugepages(전체·사용, MiB) — 노드 목록의 열과 VM 폼의 "들어갈 노드". 사용은
+         *     스케줄러의 셈(도는 VM의 기록 + 아직 켜지 않은 VM·오는 마이그레이션을 맞춰 본 것)이다.
+         */
+        get: operations["topology_usage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users": {
         parameters: {
             query?: never;
@@ -2544,6 +2593,11 @@ export interface paths {
          *     실행 중이면 409 `vm_running`, UEFI 변수가 있으면(`status.firmware_node`) 409 `firmware_reset_required`다(변수 초기화와
          *     함께 `POST /vms/{key}/firmware/reset`의 `secure_boot`로 바꾼다). 끝나지 않은 펌웨어 초기화 Task가 있으면 켜기는 409
          *     `vm_busy`다.
+         *
+         *     CPU 정책(`cpu.policy`·`thread_policy`·`emulator`)·vNUMA(`numa`)·`hugepages`(계획 64)는 모든 노드가 `numa`를 알아야
+         *     하고(409 `cluster_upgrading`) 맞지 않으면 400 `invalid_numa`다. 전용 CPU·hugepages를 켜거나 그 칸을 바꾸려면 그 VM의
+         *     `vm.dedicated`가 든다(403). 실행 중에 바꾸면 보류 `numa`(다음 전원 껐다 켜기 때 적용)이고, 전용 VM의 vCPU·메모리는
+         *     핫플러그 상한 안에서 바로 바꾼다(켤 때 상한까지 pCPU를 잡아 두었다).
          */
         put: operations["update_vm"];
         post?: never;
@@ -2836,6 +2890,26 @@ export interface paths {
          *     이름 없는 VM의 이름 바꾸기 포함) 다시 켤 때까지 409 `restart_required`다. 템플릿은 409 `vm_is_template`이다.
          */
         post: operations["migrate_vm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/numa": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * VM의 CPU 배치와 NUMA(마이그레이션 대화상자·`oplctl vm numa`): 스펙, 기록한 모양과 배치, 보류, 노드마다 맞는지와 그
+         *     노드에서 쓸 배치(호스트 노드·pCPU·페이지)
+         */
+        get: operations["get_vm_numa"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3764,10 +3838,18 @@ export interface components {
         CatalogTemplate: {
             /** @description cloud-init 기본 설정(사용자·비밀번호·SSH 키 등). 평문 비밀번호는 SHA-512 crypt로 바꿔 Task에 담는다. */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 에뮬레이터 스레드 정책(계획 64) */
+            cpu_emulator?: components["schemas"]["EmulatorPolicy"];
             /** @description CPU 플래그(`["-avx512vbmi"]`, 계획 63) */
             cpu_flags?: components["schemas"]["CpuFlag"][];
             /** @description CPU 모델(계획 63, 없으면 `host`). 별칭은 버전 모델로 고정된다. */
             cpu_model?: components["schemas"]["CpuModel"];
+            /** @description CPU 정책(계획 64, 없으면 `shared`). `dedicated`는 권한 `vm.dedicated`가 든다. */
+            cpu_policy?: components["schemas"]["CpuPolicy"];
+            /** @description 전용 CPU 스레드 정책(계획 64) */
+            cpu_thread_policy?: components["schemas"]["ThreadPolicy"];
+            /** @description hugepages(계획 64). 권한 `vm.dedicated`가 든다. */
+            hugepages?: components["schemas"]["PageSize"];
             /**
              * Format: int32
              * @default 2048
@@ -3777,6 +3859,8 @@ export interface components {
             name: string;
             /** @description NIC 하나의 네트워크 이름 */
             network: string;
+            /** @description vNUMA(계획 64) */
+            numa?: components["schemas"]["NumaSpec"];
             /**
              * Format: int64
              * @description 받은 디스크를 이 크기로 늘린다(바이트, 512의 배수, 이미지 크기 이상). 없으면 이미지 크기 그대로다.
@@ -4022,10 +4106,16 @@ export interface components {
         CloneOverrides: {
             /** @description 주어진·비지 않은 칸만 원본의 cloud-init 설정을 바꾼다. 비밀번호는 crypt 해시다. */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 새 VM의 에뮬레이터 스레드 정책(계획 64) */
+            cpu_emulator?: components["schemas"]["EmulatorPolicy"];
             /** @description 새 VM의 CPU 플래그 전체(`["-avx512vbmi"]`, `[]`는 지운다, 계획 63) */
             cpu_flags?: components["schemas"]["CpuFlag"][];
             /** @description 새 VM의 CPU 모델(계획 63). API가 별칭을 버전 모델로 고정해 넣는다. */
             cpu_model?: components["schemas"]["CpuModel"];
+            /** @description 새 VM의 CPU 정책(계획 64). `shared`면 스레드·에뮬레이터 정책도 지운다. */
+            cpu_policy?: components["schemas"]["CpuPolicy"];
+            /** @description 새 VM의 전용 CPU 스레드 정책(계획 64) */
+            cpu_thread_policy?: components["schemas"]["ThreadPolicy"];
             /** @description 디스크 순번별 새 크기(바이트, 늘리기만). null은 그대로다. */
             disks?: (number | null)[];
             /**
@@ -4033,15 +4123,23 @@ export interface components {
              * @description 새 VM을 둘 폴더(계획 62). 없으면 원본의 폴더다.
              */
             folder?: string;
+            /** @description 새 VM의 hugepages(계획 64) */
+            hugepages?: components["schemas"]["PageSize"];
             /** Format: int32 */
             memory_mib?: number;
             /** @description NIC 순번별 새 네트워크 이름. null은 그대로다. */
             nics?: (string | null)[];
+            /** @description 원본의 hugepages를 지운다(계획 64). */
+            no_hugepages?: boolean;
+            /** @description 원본의 vNUMA를 지운다(계획 64). */
+            no_numa?: boolean;
             /**
              * Format: uuid
              * @description 새 VM을 켤 노드(`spec.node`). 디스크가 닿아야 한다.
              */
             node?: string;
+            /** @description 새 VM의 vNUMA(계획 64) */
+            numa?: components["schemas"]["NumaSpec"];
             /** @description 만든 뒤 켠다(`power: running`). */
             start?: boolean;
             /**
@@ -4056,10 +4154,16 @@ export interface components {
              *     `********`는 원본의 비밀번호를 그대로 둔다.
              */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 새 VM의 에뮬레이터 스레드 정책(계획 64) */
+            cpu_emulator?: components["schemas"]["EmulatorPolicy"];
             /** @description 새 VM의 CPU 플래그 전체(`["-avx512vbmi"]`, `[]`는 지운다, 계획 63) */
             cpu_flags?: components["schemas"]["CpuFlag"][];
             /** @description 새 VM의 CPU 모델(계획 63). 별칭은 버전 모델로 고정된다. */
             cpu_model?: components["schemas"]["CpuModel"];
+            /** @description 새 VM의 CPU 정책(계획 64). `shared`면 스레드·에뮬레이터 정책도 지운다. */
+            cpu_policy?: components["schemas"]["CpuPolicy"];
+            /** @description 새 VM의 전용 CPU 스레드 정책(계획 64) */
+            cpu_thread_policy?: components["schemas"]["ThreadPolicy"];
             /** @description 디스크 순번별 새 크기(바이트, 늘리기만, 512의 배수). null은 그대로다. */
             disks?: (number | null)[];
             /**
@@ -4067,6 +4171,8 @@ export interface components {
              * @description 새 VM을 둘 폴더 id(계획 62). 없으면 원본의 폴더다. 대상 폴더의 `vm.create`가 있어야 한다.
              */
             folder?: string;
+            /** @description 새 VM의 hugepages(계획 64) */
+            hugepages?: components["schemas"]["PageSize"];
             /**
              * @description 연결 복제(계획 58, 템플릿에서만). 없으면 템플릿의 디스크 가운데 되는 것은 연결하고 안 되는 것은 전체 복사한다
              *     (Task 경고). `true`면 모두 연결하고(안 되면 400), `false`면 전체 복사다.
@@ -4078,8 +4184,14 @@ export interface components {
             name: string;
             /** @description NIC 순번별 새 네트워크 이름. null은 그대로다. */
             nics?: (string | null)[];
+            /** @description 원본의 hugepages를 지운다(계획 64). */
+            no_hugepages?: boolean;
+            /** @description 원본의 vNUMA를 지운다(계획 64). */
+            no_numa?: boolean;
             /** @description 새 VM을 켤 노드(이름이나 id, `spec.node`). 디스크가 닿아야 한다(공유 풀이거나 그 노드의 로컬 풀). */
             node?: string;
+            /** @description 새 VM의 vNUMA(계획 64) */
+            numa?: components["schemas"]["NumaSpec"];
             /** @description 새 디스크를 둘 풀. 없으면 원본 볼륨마다 그 볼륨의 풀이다. */
             pool?: string | null;
             /** @description 복제할 스냅샷(이름이나 id). 없으면 꺼진 VM의 지금 상태에서 복제한다. */
@@ -4355,6 +4467,12 @@ export interface components {
          * @example 0-3,8
          */
         CpuSet: string;
+        /** @description 노드의 세 CPU 집합(§7) */
+        CpuSets: {
+            dedicated: components["schemas"]["CpuSet"];
+            reserved: components["schemas"]["CpuSet"];
+            shared: components["schemas"]["CpuSet"];
+        };
         /** @description 설정 `cpu`(계획 63) */
         CpuSettings: {
             /**
@@ -5499,6 +5617,19 @@ export interface components {
              */
             memory_mib: number;
         };
+        /** @description 호스트 NUMA 노드 하나의 사용 */
+        HostNodeUse: {
+            cpus: components["schemas"]["CpuSet"];
+            /** @description 이 호스트 노드의 전용 CPU */
+            dedicated: components["schemas"]["CpuSet"];
+            /** @description 그 가운데 잡힌 것 */
+            dedicated_used: components["schemas"]["CpuSet"];
+            hugepages: components["schemas"]["PagesUse"][];
+            /** Format: int32 */
+            id: number;
+            /** Format: int64 */
+            memory_mib: number;
+        };
         /** @description 켠 노드에만 맞는 배치(`RunningHardware.host_placement`). 마이그레이션·HA는 대상에서 새로 고른다. */
         HostPlacement: {
             /** @description 에뮬레이터 스레드의 pCPU(`isolate`). 비면 노드의 공유 CPU(그때의 집합)다. */
@@ -5626,10 +5757,16 @@ export interface components {
         ImportRun: {
             /** Format: int32 */
             cores?: number | null;
+            /** @description 에뮬레이터 스레드 정책(계획 64) */
+            cpu_emulator?: components["schemas"]["EmulatorPolicy"];
             /** @description CPU 플래그(`["-avx512vbmi"]`, 계획 63) */
             cpu_flags?: components["schemas"]["CpuFlag"][];
             /** @description CPU 모델(계획 63). 없으면 `host`다. API가 별칭을 버전 모델로 고정해 넣는다. */
             cpu_model?: components["schemas"]["CpuModel"];
+            /** @description CPU 정책(계획 64). 없으면 `shared`다. */
+            cpu_policy?: components["schemas"]["CpuPolicy"];
+            /** @description 전용 CPU 스레드 정책(계획 64) */
+            cpu_thread_policy?: components["schemas"]["ThreadPolicy"];
             disk_bus?: components["schemas"]["DiskBus"] | null;
             firmware?: components["schemas"]["Firmware"] | null;
             /**
@@ -5637,6 +5774,8 @@ export interface components {
              * @description 만든 VM을 둘 폴더(계획 62). 없으면 VM 트리의 루트이고 쓰지 않아 옛 노드도 푼다.
              */
             folder?: string;
+            /** @description hugepages(계획 64) */
+            hugepages?: components["schemas"]["PageSize"];
             /**
              * @description 원본 MAC 주소를 그대로 쓴다. 끄면 새 MAC을 받는다.
              * @default true
@@ -5651,6 +5790,8 @@ export interface components {
                 [key: string]: string;
             };
             nic_model?: components["schemas"]["NicModel"] | null;
+            /** @description vNUMA(계획 64) */
+            numa?: components["schemas"]["NumaSpec"];
             /** @description 디스크 볼륨을 만들 풀 */
             pool: string;
             /** Format: int32 */
@@ -7043,6 +7184,32 @@ export interface components {
             /** Format: int64 */
             revision: number;
         };
+        /** @description 호스트 NUMA 노드 하나의 지금 값 */
+        LiveNode: {
+            hugepages?: components["schemas"]["LivePool"][];
+            /** Format: int32 */
+            id: number;
+            /**
+             * Format: int64
+             * @description 빈 메모리(`MemFree`, hugepages 풀 밖)
+             */
+            memory_free_mib: number;
+        };
+        /** @description hugepages 풀 하나의 지금 값 */
+        LivePool: {
+            /**
+             * Format: int32
+             * @description 아무도 쓰지 않는 페이지(`free_hugepages`)
+             */
+            free: number;
+            /** Format: int32 */
+            size_kib: number;
+            /**
+             * Format: int32
+             * @description 예약 밖에서 커널이 더 준 페이지(`surplus_hugepages`)
+             */
+            surplus: number;
+        };
         LoginRequest: {
             password: string;
             /** @description 없거나 `local`이면 로컬 사용자 */
@@ -7660,6 +7827,22 @@ export interface components {
              */
             warnings: string[];
         };
+        /** @description 노드의 토폴로지와 사용 */
+        NodeTopologyInfo: {
+            /** @description 호스트 NUMA 노드마다 사용(id 순) */
+            host_nodes: components["schemas"]["HostNodeUse"][];
+            host_resources?: components["schemas"]["HostResources"];
+            /** @description 노드에 직접 물은 지금 값(답이 없으면 없음) */
+            live?: components["schemas"]["TopologyLive"];
+            node: string;
+            sets?: components["schemas"]["CpuSets"];
+            /** @description 탐침 결과(Linux 노드, 모든 노드가 `numa`를 알린 뒤). 없으면 아래 칸이 빈다. */
+            topology?: components["schemas"]["NodeTopology"];
+            /** @description 이 노드에서 도는 묶는 VM(이름순) */
+            vms: components["schemas"]["VmPlacementUse"][];
+            /** @description 호스트 준비가 덜 된 것(`topology.warnings`) */
+            warnings: string[];
+        };
         /** @description 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지) */
         NodeUpdates: {
             /**
@@ -7679,6 +7862,18 @@ export interface components {
              */
             packages: components["schemas"]["PackageUpdate"][];
             truncated?: boolean;
+        };
+        /** @description 노드 목록 열용 요약 */
+        NodeUsageSummary: {
+            /** Format: int64 */
+            dedicated_total: number;
+            /** Format: int64 */
+            dedicated_used: number;
+            /** @description 풀이 있거나 쓰는 크기만 */
+            hugepages: components["schemas"]["PagesMib"][];
+            node: string;
+            /** @description vCPU를 고정할 수 있다(토폴로지가 있는 Linux 노드) */
+            pinning: boolean;
         };
         /** @description `GET /alerts/history`의 응답 */
         NotificationHistoryResponse: {
@@ -7751,6 +7946,13 @@ export interface components {
             error?: string;
             ok: boolean;
         };
+        /** @description 노드 하나가 VM을 받거나 켤 수 있는지 */
+        NumaNodeFit: {
+            fits: boolean;
+            node: string;
+            plan?: components["schemas"]["NumaPlan"];
+            reason?: string;
+        };
         /** @description "auto", a guest NUMA node count (1-8), or one {cpus, memory_mib} per node */
         NumaNodes: "auto" | number | {
             /**
@@ -7761,6 +7963,22 @@ export interface components {
             /** Format: int32 */
             memory_mib: number;
         }[];
+        /** @description 노드에서 쓸 배치(묶는 VM만) */
+        NumaPlan: {
+            /** @description 게스트 노드마다 호스트 NUMA 노드 */
+            host_nodes: number[];
+            page?: components["schemas"]["PageKind"];
+            /** @description 잡을 전용 pCPU(vCPU·비워 둘 형제·`isolate` 에뮬레이터, 공유 VM은 빔) */
+            pcpus: components["schemas"]["CpuSet"];
+        };
+        /** @description VM 스펙의 CPU 배치 칸 */
+        NumaSettings: {
+            emulator?: components["schemas"]["EmulatorPolicy"];
+            hugepages?: components["schemas"]["PageSize"];
+            numa?: components["schemas"]["NumaSpec"];
+            policy: components["schemas"]["CpuPolicy"];
+            thread_policy?: components["schemas"]["ThreadPolicy"];
+        };
         /** @description VM의 vNUMA(`VmSpec.numa`) */
         NumaSpec: {
             /**
@@ -7869,6 +8087,28 @@ export interface components {
          * @enum {string}
          */
         PageSize: "2M" | "1G" | "any";
+        /** @description 크기 하나의 hugepages 합(MiB) */
+        PagesMib: {
+            size: components["schemas"]["PageKind"];
+            /** Format: int64 */
+            total_mib: number;
+            /** Format: int64 */
+            used_mib: number;
+        };
+        /** @description 크기 하나의 hugepages(페이지 수) */
+        PagesUse: {
+            size: components["schemas"]["PageKind"];
+            /**
+             * Format: int64
+             * @description 풀의 페이지 수(노드가 알린 예약)
+             */
+            total: number;
+            /**
+             * Format: int64
+             * @description Orbivisor VM이 잡은 페이지 수
+             */
+            used: number;
+        };
         PasskeyAdded: {
             passkey: components["schemas"]["PasskeyView"];
             /** @description 첫 요소라 새로 만든 복구 코드(한 번만 보인다). 아니면 비어 있다. */
@@ -10588,12 +10828,20 @@ export interface components {
         TemplateDraft: {
             /** @description 없으면 빈 설정(cloud-init 기본)이다. 비밀번호는 crypt 해시다. */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 에뮬레이터 스레드 정책(계획 64) */
+            cpu_emulator?: components["schemas"]["EmulatorPolicy"];
             /** @description CPU 플래그(`["-avx512vbmi"]`, 계획 63) */
             cpu_flags?: components["schemas"]["CpuFlag"][];
             /** @description CPU 모델(계획 63). 없으면 `host`다. API가 별칭을 버전 모델로 고정해 넣는다. */
             cpu_model?: components["schemas"]["CpuModel"];
+            /** @description CPU 정책(계획 64). 없으면 `shared`다. */
+            cpu_policy?: components["schemas"]["CpuPolicy"];
+            /** @description 전용 CPU 스레드 정책(계획 64) */
+            cpu_thread_policy?: components["schemas"]["ThreadPolicy"];
             /** @description 펌웨어. API가 카탈로그 항목의 것으로 채운다(없으면 UEFI). */
             firmware?: components["schemas"]["Firmware"];
+            /** @description hugepages(계획 64) */
+            hugepages?: components["schemas"]["PageSize"];
             /** @description 머신 타입. API가 카탈로그 항목의 아키텍처로 채운다(없으면 이 노드의 것). */
             machine?: components["schemas"]["MachineType"];
             /**
@@ -10605,6 +10853,8 @@ export interface components {
             name: string;
             /** @description NIC 하나의 네트워크 이름 */
             network: string;
+            /** @description vNUMA(계획 64) */
+            numa?: components["schemas"]["NumaSpec"];
             /**
              * Format: int64
              * @description 받은 디스크를 이 크기로 늘린다(바이트). 없으면 이미지 크기 그대로다.
@@ -10657,6 +10907,18 @@ export interface components {
             mem_rss?: number | null;
             /** Format: uuid */
             vm: string;
+        };
+        /** @description 노드에 직접 물은 지금 값(노드 사이 RPC `ReadTopology`, 설계 §5·§13). 바뀔 때마다 쓰지 않도록 Raft에는 두지 않는다. */
+        TopologyLive: {
+            /** @description orbivisord의 CPU 친화가 노드 설정(예약 CPU)과 맞다. */
+            affinity_ok: boolean;
+            /** @description 호스트 NUMA 노드마다(id 순) */
+            nodes: components["schemas"]["LiveNode"][];
+        };
+        /** @description `GET /topology/usage` */
+        TopologyUsage: {
+            /** @description 위트니스가 아닌 노드(이름순) */
+            nodes: components["schemas"]["NodeUsageSummary"][];
         };
         /** @description TOTP 등록: 인증 앱에 넣을 비밀과 `otpauth://` URI(QR). 다시 볼 수 없다. */
         TotpEnrollment: {
@@ -11103,12 +11365,47 @@ export interface components {
             /** Format: uuid */
             vm: string;
         };
+        /** @description VM의 NUMA: 스펙, 지금 모양, 기록, 보류, 노드마다 맞는지 */
+        VmNumaInfo: {
+            /**
+             * @description 이 아키텍처의 노드마다(이름순): 도는 VM(하드웨어 기록이 있음)은 기록 모양으로 옮길 수 있는지, 꺼진 VM은 스펙으로
+             *     켤 수 있는지. 루트 `cluster.read`가 없으면 비어 있다.
+             */
+            nodes: components["schemas"]["NumaNodeFit"][];
+            /** @description 다음 전원 껐다 켜기 때 바뀔 것(`status.hardware.pending`의 `numa`) */
+            pending?: components["schemas"]["PendingChange"];
+            /** @description 켤 때 잡은 호스트 노드·pCPU. 루트 `cluster.read`가 없으면 없다(노드·pCPU 번호를 보이지 않는다). */
+            placement?: components["schemas"]["HostPlacement"];
+            /** @description 켤 때 기록한 게스트 모양(도는 VM, 계획 64 칸을 쓰지 않으면 없음) */
+            running?: components["schemas"]["ResolvedNuma"];
+            spec: components["schemas"]["NumaSettings"];
+            /** @description 스펙의 짧은 이름(`2 nodes, dedicated, hugepages 1G`, 쓰지 않으면 `none`) */
+            wanted: string;
+        };
         /** @enum {string} */
         VmPhase: "stopped" | "starting" | "running" | "stopping" | "failed" | "migrating";
         /** @description VM의 최적 배치 옵션 */
         VmPlacement: {
             /** @description 균형 조정기가 옮기지 않는다(HA 복구·비우기·사용자 마이그레이션은 그대로 옮긴다). */
             pinned?: boolean;
+        };
+        /** @description 이 노드에서 도는 VM 하나가 잡은 것(기록) */
+        VmPlacementUse: {
+            /** @description 에뮬레이터 스레드의 전용 pCPU(`isolate`, 아니면 빔) */
+            emulator: components["schemas"]["CpuSet"];
+            /** @description 게스트 노드마다 호스트 NUMA 노드(묶지 않으면 빔) */
+            host_nodes: number[];
+            page?: components["schemas"]["PageKind"];
+            /**
+             * Format: int64
+             * @description 잡은 페이지 수(hugepages VM)
+             */
+            pages: number;
+            /** @description `isolate`가 비워 둔 형제 */
+            siblings: components["schemas"]["CpuSet"];
+            /** @description 자리마다 pCPU(공유 VM은 빔) */
+            vcpus: number[];
+            vm: string;
         };
         VmReplicateRequest: {
             /** @description 복제할 대상 노드(이름이나 id). VM의 복제 대상이 하나면 생략할 수 있다. */
@@ -14500,7 +14797,10 @@ export interface operations {
     };
     update_node: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description `host_resources`의 409 `host_cpus_in_use`·`hugepages_in_use`를 넘기고 쓴다(응답 헤더 `orbivisor-warning`). */
+                force?: boolean;
+            };
             header?: {
                 "If-Match"?: number | null;
             };
@@ -14518,6 +14818,8 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description what `force` let through (only when there is something) */
+                    "orbivisor-warning"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -14903,6 +15205,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_node_topology: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeTopologyInfo"];
                 };
             };
             "4XX": {
@@ -16698,6 +17030,33 @@ export interface operations {
             };
         };
     };
+    topology_usage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TopologyUsage"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_users: {
         parameters: {
             query?: never;
@@ -17714,6 +18073,36 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vm_numa: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VmNumaInfo"];
                 };
             };
             "4XX": {

@@ -2146,6 +2146,66 @@ async fn disks_and_the_ceph_status_are_read_from_another_node() {
     assert_eq!(none, None);
 }
 
+/// 정해 둔 값을 돌려주는 토폴로지 소스(계획 64)
+struct FakeTopology(opl_types::numa::TopologyLive);
+
+#[async_trait::async_trait]
+impl opl_peer::TopologySource for FakeTopology {
+    async fn live(&self) -> Result<opl_types::numa::TopologyLive, String> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn the_live_topology_is_read_from_another_node() {
+    use opl_types::numa::{LiveNode, LivePool, TopologyLive};
+    let (ca, root, nodes) = start(1).await;
+    let live = TopologyLive {
+        nodes: vec![LiveNode {
+            id: 0,
+            memory_free_mib: 1234,
+            hugepages: vec![LivePool {
+                size_kib: 2048,
+                free: 100,
+                surplus: 0,
+            }],
+        }],
+        affinity_ok: true,
+    };
+    let source = Arc::new(FakeTopology(live.clone()));
+    let target = Node::start_serving(&ca, &root, move |s| s.with_topology(source)).await;
+    nodes[0]
+        .cluster
+        .request(LeaderRequest::AddLearner {
+            id: target.id(),
+            addr: target.addr.clone(),
+            addrs: vec![],
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + WAIT;
+    while !target.cluster.members().contains(nodes[0].id()) {
+        assert!(
+            Instant::now() < deadline,
+            "membership never reached the target"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let got = nodes[0]
+        .peers
+        .read_topology(target.id(), &target.addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(got, Some(live));
+    // 소스가 없는 노드(옛 노드·macOS·위트니스)는 None이다.
+    let none = target
+        .peers
+        .read_topology(nodes[0].id(), &nodes[0].addr, WAIT)
+        .await
+        .unwrap();
+    assert_eq!(none, None);
+}
+
 /// 리더가 클러스터 정보의 관찰 노드 목록(`ClusterStatus.observers`)을 `observers`(id, 클러스터 주소)로 바꾼다(없으면
 /// 정보를 만든다).
 async fn set_observers(leader: &Node, observers: &[(NodeId, String)]) {

@@ -28,8 +28,6 @@ mod join;
 mod member;
 mod metrics;
 mod notify;
-#[cfg(feature = "numa-it")]
-mod numa_hook;
 mod overlay;
 mod pools;
 mod runtime;

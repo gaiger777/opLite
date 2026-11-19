@@ -4065,7 +4065,8 @@ pub(crate) fn pin_child(cmd: &mut tokio::process::Command, cpus: &CpuSet) {
 }
 
 /// 실행 중 VM의 스레드를 고정한다: vCPU 스레드(QMP `query-cpus-fast`)는 자리의 CPU, 나머지는 에뮬레이터 집합(자식
-/// 친화로 이미 물려받았지만 스코프 cpuset에 들어갈 때 커널이 넓혔을 수 있다). 친화가 이미 같은 스레드는 건드리지 않고,
+/// 친화로 이미 물려받았지만 스코프 cpuset에 들어갈 때 커널이 넓혔을 수 있다). 커널 일꾼 스레드(`PF_USER_WORKER` 등 —
+/// `kvm-nx-lpage-recovery`·`vhost-*`)는 건너뛴다(스코프 `AllowedCPUs`가 상한). 친화가 이미 같은 스레드는 건드리지 않고,
 /// vCPU는 `/proc/<pid>/task/<tid>/status`로 확인한다. 바꾼 스레드 수를 돌려준다. vCPU를 고정하지 못하면
 /// `StartFailed("cannot pin vCPU 3 to CPU 7: …")`다.
 async fn pin_threads(handle: &VmHandle, pin: &RuntimePinning) -> Result<usize, DriverError> {
@@ -4080,6 +4081,11 @@ async fn pin_threads(handle: &VmHandle, pin: &RuntimePinning) -> Result<usize, D
     let mut changed = 0;
     for tid in crate::affinity::threads(proc, handle.pid)? {
         let slot = vcpus.iter().find(|(_, t)| *t == tid).map(|(slot, _)| *slot);
+        // 커널 일꾼(`kvm-nx-lpage-recovery`·`vhost-*`)은 커널이 친화를 정한다: 상한은 스코프 `AllowedCPUs`가 쥐고, 다시 걸면
+        // 실패하거나 검사 루프가 회차마다 커널과 다툰다.
+        if slot.is_none() && crate::affinity::is_kernel_worker(proc, handle.pid, tid) {
+            continue;
+        }
         let want = slot.map_or(&pin.emulator, |s| pin.vcpu(s));
         let Some(got) = crate::affinity::thread_cpus(proc, handle.pid, tid) else {
             // 그사이 끝난 스레드

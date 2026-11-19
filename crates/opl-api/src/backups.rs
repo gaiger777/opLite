@@ -562,6 +562,8 @@ pub(crate) async fn start_backup_delete(
 /// `backup_on_other_node`. 고른 노드가 오프라인이면 409 `node_offline`. 증분 백업은 고른 노드가 증분 백업을
 /// 알아야 한다(버전 2 매니페스트, 409 `cluster_upgrading`). TPM 상태가 있거나 VM 스펙에 `tpm`·`secure_boot`가 있는
 /// 백업은 모든 노드가 `vtpm`을, `guest_agent`가 있는 백업은 `guest-agent`를 알아야 한다(409 `cluster_upgrading`).
+/// 전용 CPU·vNUMA·hugepages가 있는 백업은 모든 노드가 `numa`를 알아야 하고(409 `cluster_upgrading`), 전용 CPU·hugepages는
+/// 새 폴더의 `vm.dedicated`가 든다(403, 계획 64).
 #[utoipa::path(post, path = "/backups/{key}/restore", tag = "backups",
     params(("key" = String, Path, description = "id or name")),
     request_body = RestoreRequest,
@@ -591,6 +593,14 @@ pub async fn restore_backup(
     state
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, folder)?;
+    // 전용 CPU·hugepages VM은 `vm.dedicated`, 계획 64 칸은 모든 노드가 `numa`를 알아야 한다.
+    crate::numa::require_privilege(
+        &state,
+        &principal,
+        opl_types::numa::uses_host_resources(&backup.spec.vm_spec),
+        folder,
+    )?;
+    crate::numa::require_numa_feature(&state.cluster, &backup.spec.vm_spec)?;
     state.authz.require_pool(&principal, &req.pool)?;
     state.authz.require_networks(
         &principal,

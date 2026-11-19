@@ -71,6 +71,8 @@ pub(crate) struct TemplateDeploy {
     memory: Option<u32>,
     #[command(flatten)]
     cpu: crate::cpu::CpuArgs,
+    #[command(flatten)]
+    numa: crate::numa::NumaArgs,
     /// NIC의 네트워크: `nicN=NETWORK`(`nicN=`이 없으면 준 순서대로 NIC 0, 1, …). NIC 수는 템플릿과 같다.
     #[arg(long = "network", value_name = "[nicN=]NETWORK", value_parser = parse_nic_network)]
     networks: Vec<(Option<usize>, String)>,
@@ -148,6 +150,8 @@ pub(crate) fn deploy_names(pattern: &str, count: u32, first: u32) -> anyhow::Res
 impl TemplateDeploy {
     /// 여러 VM에 같은 값을 줄 수 없는 cloud-init 값(호스트 이름·정적 IP)을 거절한다.
     fn check_identity(&self) -> anyhow::Result<()> {
+        // CPU 배치 칸의 조합(`--numa none --numa-memory`)도 여기서 본다(본문 만들기는 실패하지 않는다).
+        self.numa.request_fields(&mut json!({}), true)?;
         if self.count < 2 {
             return Ok(());
         }
@@ -191,6 +195,8 @@ impl TemplateDeploy {
         set("vcpus", self.cpus.map(|n| json!(n)));
         set("memory_mib", self.memory.map(|n| json!(n)));
         self.cpu.request_fields(&mut body);
+        // 조합은 `check_identity`가 이미 봤다.
+        let _ = self.numa.request_fields(&mut body, true);
         if !self.networks.is_empty() {
             body["nics"] = Value::Array(by_index(&self.networks));
         }
@@ -610,6 +616,8 @@ pub(crate) struct ImageGet {
     memory: Option<u32>,
     #[command(flatten)]
     cpu: crate::cpu::CpuArgs,
+    #[command(flatten)]
+    numa: crate::numa::NumaArgs,
     /// 받은 디스크를 이 크기로 늘린다(이미지보다 클 때). 단위 K, M, G, T.
     #[arg(long, value_parser = parse_size, requires = "template")]
     size: Option<u64>,
@@ -726,6 +734,7 @@ impl ImageGet {
                 t["size_bytes"] = json!(n);
             }
             self.cpu.request_fields(&mut t);
+            self.numa.request_fields(&mut t, false)?;
             if !cloud_init.is_null() {
                 t["cloud_init"] = cloud_init.clone();
             }
@@ -734,6 +743,8 @@ impl ImageGet {
             bail!("--ci-* options need --template");
         } else if self.cpu.given() {
             bail!("--cpu-model and --cpu-flags need --template");
+        } else if self.numa.given() {
+            bail!("--cpu-policy, --numa and --hugepages need --template");
         }
         Ok(body)
     }

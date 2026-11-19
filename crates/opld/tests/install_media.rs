@@ -10,7 +10,8 @@
 //! 호스트 이름·사용자·비밀번호 해시·SSH 키·고정 IPv4를 적용하고 vendor-data의 runcmd가 그 결과를 시험 서버에 보내는지,
 //! 호스트 이름을 바꾸고 다시 켜면 새 instance-id로 다시 적용하는지 본다. 계획 63: 러너 CPU에 있는 플래그를
 //! `vm create --cpu-flags=-FLAG`로 숨기면 게스트의 `/proc/cpuinfo`에 없고, 실행 중에 지우면 보류로 남다가 `vm reboot`(전원
-//! 껐다 켜기) 뒤에 보이는지 본다.
+//! 껐다 켜기) 뒤에 보이는지 본다. 계획 64: `vm create --sockets 2 --numa 2`로 켜면 게스트가 NUMA 노드 둘(소켓마다
+//! CPU 하나, 메모리 반씩)을 본다.
 //! `cargo test -p opld --features install-media-it,qemu-it --test install_media -- --nocapture`
 #![cfg(feature = "qemu-it")]
 
@@ -825,6 +826,115 @@ urllib.request.urlopen(request, timeout=30)
             .unwrap();
         d.ctl(&["vm", "delete", "cpu-probe"]).await.unwrap();
         d.ctl(&["volume", "delete", "noble-cpu"]).await.unwrap();
+        d.stop();
+    }
+    /// 부팅마다 `/sys/devices/system/node/node*/cpulist`·`meminfo`의 `MemTotal`을 보내는 vendor-data
+    fn numa_vendor_data(port: u16) -> String {
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import glob, json, os, urllib.request
+nodes = {{}}
+for d in sorted(glob.glob("/sys/devices/system/node/node[0-9]*")):
+    cpus = open(os.path.join(d, "cpulist")).read().strip()
+    total = 0
+    for line in open(os.path.join(d, "meminfo")):
+        if "MemTotal:" in line:
+            total = int(line.split()[-2])
+    nodes[os.path.basename(d)] = {{"cpus": cpus, "mem_kib": total}}
+request = urllib.request.Request("http://10.0.2.2:{port}/report", data=json.dumps({{"nodes": nodes}}).encode(),
+                                 headers={{"Content-Type": "application/json"}})
+urllib.request.urlopen(request, timeout=30)
+"#
+        );
+        let config = json!({
+            "write_files": [{
+                "path": "/var/lib/cloud/scripts/per-boot/orbi-numa-report",
+                "content": script,
+                "permissions": "0755",
+            }],
+        });
+        format!(
+            "#cloud-config\n{}\n",
+            serde_json::to_string_pretty(&config).unwrap()
+        )
+    }
+
+    /// 계획 64: 공유 vNUMA(소켓 둘, 게스트 노드 둘)로 클라우드 이미지를 켜면 게스트가 노드 둘을 보고 소켓마다의 CPU와
+    /// 메모리 반씩을 가진다. 기록 `numa`에 모양이 남는다.
+    #[tokio::test]
+    async fn a_guest_sees_its_numa_nodes() {
+        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let server = serve(&[("noble.img", &image)]).await;
+        let (mut d, _pool) = daemon("numa").await;
+        let url = format!("http://127.0.0.1:{}/files/noble.img", server.port);
+        d.ctl(&[
+            "volume",
+            "download",
+            "noble-numa",
+            "--pool",
+            "local",
+            "--url",
+            &url,
+            "--sha256",
+            &sha256(&image),
+            "--source-format",
+            "qcow2",
+        ])
+        .await
+        .unwrap();
+        let vendor = d.path("numa-vendor-data");
+        std::fs::write(&vendor, numa_vendor_data(server.port)).unwrap();
+        let started = d
+            .ctl(&[
+                "vm",
+                "create",
+                "numa-probe",
+                "--memory",
+                "2048",
+                "--sockets",
+                "2",
+                "--cores",
+                "1",
+                "--numa",
+                "2",
+                "--machine",
+                "q35",
+                "--disk",
+                "noble-numa",
+                "--nic",
+                "user",
+                "--ci-user",
+                "orbi",
+                "--ci-vendor-data",
+                vendor.to_str().unwrap(),
+                "--start",
+            ])
+            .await;
+        if let Err(e) = started {
+            diagnose(&d, &["numa-probe"], Some(&server)).await;
+            panic!("vm numa-probe did not start: {e}");
+        }
+        let vm = d.ctl_json(&["vm", "get", "numa-probe"]).await;
+        assert_eq!(
+            vm["status"]["hardware"]["numa"]["nodes"],
+            json!([{ "sockets": [0], "memory_mib": 1024 }, { "sockets": [1], "memory_mib": 1024 }]),
+            "{vm}"
+        );
+        let report = wait_report(&d, &server, 1).await;
+        let nodes = report["nodes"].as_object().cloned().unwrap_or_default();
+        assert_eq!(nodes.len(), 2, "{report}");
+        assert_eq!(report["nodes"]["node0"]["cpus"], "0", "{report}");
+        assert_eq!(report["nodes"]["node1"]["cpus"], "1", "{report}");
+        for n in nodes.values() {
+            // 게스트 커널이 쓰는 몫을 빼면 1 GiB보다 조금 적다.
+            let kib = n["mem_kib"].as_u64().unwrap();
+            assert!((700_000..=1_048_576).contains(&kib), "{report}");
+        }
+        d.ctl(&["vm", "stop", "numa-probe", "--force"])
+            .await
+            .unwrap();
+        d.ctl(&["vm", "delete", "numa-probe"]).await.unwrap();
+        d.ctl(&["volume", "delete", "noble-numa"]).await.unwrap();
         d.stop();
     }
 }

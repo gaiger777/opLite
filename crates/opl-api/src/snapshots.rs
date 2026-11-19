@@ -106,6 +106,32 @@ pub struct CloneRequest {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub cpu_flags: Option<Vec<CpuFlag>>,
+    /// 새 VM의 CPU 정책(계획 64). `shared`면 스레드·에뮬레이터 정책도 지운다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_policy: Option<opl_types::numa::CpuPolicy>,
+    /// 새 VM의 전용 CPU 스레드 정책(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_thread_policy: Option<opl_types::numa::ThreadPolicy>,
+    /// 새 VM의 에뮬레이터 스레드 정책(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_emulator: Option<opl_types::numa::EmulatorPolicy>,
+    /// 새 VM의 vNUMA(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub numa: Option<opl_types::numa::NumaSpec>,
+    /// 원본의 vNUMA를 지운다(계획 64).
+    #[serde(default)]
+    pub no_numa: bool,
+    /// 새 VM의 hugepages(계획 64)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub hugepages: Option<opl_types::numa::PageSize>,
+    /// 원본의 hugepages를 지운다(계획 64).
+    #[serde(default)]
+    pub no_hugepages: bool,
 }
 
 impl CloneRequest {
@@ -122,6 +148,13 @@ impl CloneRequest {
             || self.folder.is_some()
             || self.cpu_model.is_some()
             || self.cpu_flags.is_some()
+            || self.cpu_policy.is_some()
+            || self.cpu_thread_policy.is_some()
+            || self.cpu_emulator.is_some()
+            || self.numa.is_some()
+            || self.no_numa
+            || self.hugepages.is_some()
+            || self.no_hugepages
     }
 }
 
@@ -958,9 +991,12 @@ pub async fn clone_vm(
         crate::cpu::check_flag_privilege(&state, &principal, flags, &spec.cpu.flags)?;
     }
     let overrides = overrides(&state, &vm, &spec, &req, &disks, target.as_ref(), node)?;
-    let source_cpu = spec.cpu.clone();
+    let source = spec.clone();
     let spec = match &overrides {
-        Some(ov) => apply_overrides(&spec, ov).map_err(|e| ApiError::bad_request(e.to_string()))?,
+        Some(ov) => apply_overrides(&spec, ov).map_err(|e| match e {
+            opl_types::template::TemplateError::Invalid(v) => crate::cpu::validation_error(v),
+            e => ApiError::bad_request(e.to_string()),
+        })?,
         None => spec,
     };
     // 새 VM은 원본 스펙의 NIC를 그대로 가진다(VM 만들기와 같은 검사).
@@ -980,6 +1016,13 @@ pub async fn clone_vm(
     state
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
+    // 전용 CPU·hugepages VM을 만들면 새 폴더의 `vm.dedicated`(원본에서 물려받아도, 계획 64)
+    crate::numa::require_privilege(
+        &state,
+        &principal,
+        opl_types::numa::uses_host_resources(&spec),
+        spec.folder,
+    )?;
     state
         .authz
         .require_networks(&principal, spec.nics.iter().map(|n| n.network.as_str()))?;
@@ -1025,8 +1068,11 @@ pub async fn clone_vm(
         .as_ref()
         .filter(|m| **m != spec.cpu.model)
         .map(|m| m.to_string());
-    if let Some(cpu) = crate::cpu::audit_cpu(&spec.cpu, Some(&source_cpu), from.as_deref()) {
+    if let Some(cpu) = crate::cpu::audit_cpu(&spec.cpu, Some(&source.cpu), from.as_deref()) {
         detail.push_str(&format!(" {cpu}"));
+    }
+    if let Some(numa) = opl_types::numa::audit(&spec, Some(&source)) {
+        detail.push_str(&format!(" {numa}"));
     }
     // 확인한 폴더를 Task에 못 박는다: 줄에서 기다리는 사이 원본이 옮겨져도 복제본은 확인한 폴더에 든다(리뷰 1).
     // 루트면 비워 두고 Task가 루트에 둔다.
@@ -1094,9 +1140,20 @@ fn overrides(
         folder: req.folder,
         cpu_model: req.cpu_model.clone(),
         cpu_flags: req.cpu_flags.clone(),
+        cpu_policy: req.cpu_policy,
+        cpu_thread_policy: req.cpu_thread_policy,
+        cpu_emulator: req.cpu_emulator,
+        numa: req.numa.clone(),
+        no_numa: req.no_numa,
+        hugepages: req.hugepages,
+        no_hugepages: req.no_hugepages,
     };
     if ov.is_empty() {
         return Ok(None);
+    }
+    // CPU 정책·vNUMA·hugepages(계획 64)는 옛 노드가 풀지 못한다(검증보다 먼저).
+    if !ov.numa_overrides().is_empty() {
+        require_feature(&state.cluster, opl_types::node::NUMA)?;
     }
     let mut ov = ov;
     // CPU 모델·플래그(계획 63): 옛 노드가 풀지 못하고, 별칭은 버전 모델로 고정한다.

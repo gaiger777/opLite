@@ -140,6 +140,12 @@ fn main() {
             "crate::ceph::CephStatusRequest",
             "crate::ceph::CephStatusReply",
         ))
+        .method(json(
+            "read_topology",
+            "ReadTopology",
+            "crate::topology::TopologyRequest",
+            "opl_types::numa::TopologyLive",
+        ))
         .method(
             Method::builder()
                 .name("uefi_vars")

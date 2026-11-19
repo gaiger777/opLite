@@ -251,21 +251,29 @@ pub(crate) struct QuotaArgs {
     /// VM 수 상한(템플릿은 세지 않는다, `none`은 지우기)
     #[arg(long, value_name = "N|none")]
     vms: Option<String>,
+    /// 전용 CPU VM의 vCPU 수 상한(핫플러그 상한까지, 에뮬레이터 `isolate`는 하나 더, `none`은 지우기)
+    #[arg(long, value_name = "N|none")]
+    dedicated_vcpus: Option<String>,
 }
 
 impl QuotaArgs {
     fn is_empty(&self) -> bool {
-        self.vcpus.is_none() && self.memory.is_none() && self.disk.is_none() && self.vms.is_none()
+        self.vcpus.is_none()
+            && self.memory.is_none()
+            && self.disk.is_none()
+            && self.vms.is_none()
+            && self.dedicated_vcpus.is_none()
     }
 
     /// 지금 할당량(`null`이면 없음)에 준 차원을 덮은 새 할당량
     fn apply(&self, current: &Value) -> anyhow::Result<Value> {
         let mut q: Map<String, Value> = current.as_object().cloned().unwrap_or_default();
-        let dims: [(&str, &Option<String>, ParseFn); 4] = [
+        let dims: [(&str, &Option<String>, ParseFn); 5] = [
             ("vcpus", &self.vcpus, parse_count),
             ("memory_mib", &self.memory, parse_mib),
             ("disk_bytes", &self.disk, parse_size),
             ("vms", &self.vms, parse_count),
+            ("dedicated_vcpus", &self.dedicated_vcpus, parse_count),
         ];
         for (key, value, parse) in dims {
             match value.as_deref() {
@@ -318,6 +326,9 @@ fn quota_text(q: &Value) -> String {
     }
     if let Some(n) = q["vms"].as_u64() {
         parts.push(format!("{n} VMs"));
+    }
+    if let Some(n) = q["dedicated_vcpus"].as_u64() {
+        parts.push(format!("{n} dedicated vCPUs"));
     }
     if parts.is_empty() {
         "-".into()
@@ -467,6 +478,7 @@ fn usage_lines(view: &Value) -> Vec<String> {
         ("memory_mib", "memory (MiB)"),
         ("disk_bytes", "disk"),
         ("vms", "VMs"),
+        ("dedicated_vcpus", "dedicated vCPUs"),
     ];
     let paths: BTreeMap<String, String> = view["limits"]
         .as_array()
@@ -482,6 +494,10 @@ fn usage_lines(view: &Value) -> Vec<String> {
                 cell(v)
             }
         };
+        // 전용 vCPU(계획 64)는 쓰거나 할당량이 있을 때만(지금 출력 그대로)
+        if key == "dedicated_vcpus" && usage[key].is_null() && view["binding"][key].is_null() {
+            continue;
+        }
         let mut line = format!("{label}: {}", shown(&usage[key]));
         if let Some(binding) = view["binding"][key].as_str() {
             let limit = view["limits"]
@@ -1570,13 +1586,17 @@ mod tests {
             memory: Some("128G".into()),
             disk: Some("2T".into()),
             vms: None,
+            dedicated_vcpus: Some("8".into()),
         };
         let merged = q.apply(&json!({ "vcpus": 32, "vms": 2 })).unwrap();
         assert_eq!(
             merged,
-            json!({ "memory_mib": 131072, "disk_bytes": 2u64 << 40, "vms": 2 })
+            json!({ "memory_mib": 131072, "disk_bytes": 2u64 << 40, "vms": 2, "dedicated_vcpus": 8 })
         );
-        assert_eq!(quota_text(&merged), "128.0GiB memory, 2.0TiB disk, 2 VMs");
+        assert_eq!(
+            quota_text(&merged),
+            "128.0GiB memory, 2.0TiB disk, 2 VMs, 8 dedicated vCPUs"
+        );
         assert_eq!(quota_text(&Value::Null), "-");
         assert_eq!(parse_mib("512"), Ok(512));
         assert!(parse_mib("1000K").is_err());

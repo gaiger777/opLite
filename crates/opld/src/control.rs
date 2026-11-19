@@ -132,8 +132,6 @@ fn router(ctx: Ctx) -> Router {
     let router = router.merge(crate::fault::routes());
     #[cfg(feature = "cpu-it")]
     let router = router.merge(crate::cpu_hook::routes());
-    #[cfg(feature = "numa-it")]
-    let router = router.merge(crate::numa_hook::routes());
     router.with_state(ctx)
 }
 
