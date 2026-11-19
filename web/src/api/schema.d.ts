@@ -7538,13 +7538,6 @@ export interface components {
         Power: "on" | "off" | "unknown";
         /** @enum {string} */
         PowerState: "running" | "stopped";
-        /** @description 인증된 요청의 주체. 요청마다 저장소의 User에서 다시 읽으므로 역할 변경과 삭제가 곧바로 반영된다. */
-        Principal: {
-            name: string;
-            role: components["schemas"]["Role"];
-            /** Format: uuid */
-            user: string;
-        };
         /** @description grant를 받는 주체 */
         PrincipalRef: {
             /** Format: uuid */
@@ -9151,6 +9144,12 @@ export interface components {
             rules?: components["schemas"]["Rule"][];
         };
         SecurityGroupStatus: Record<string, never>;
+        /** @description 요청을 받은 노드. */
+        ServingNode: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+        };
         /** @description 설정에서 바꿀 값. 주어진 필드만 바꾼다. */
         SettingsPatch: {
             /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
@@ -10605,6 +10604,17 @@ export interface components {
         };
         /** @enum {string} */
         Weekday: "mon" | "tue" | "wed" | "thu" | "fri" | "sat" | "sun";
+        /**
+         * @description `GET /auth/whoami`의 응답: 주체에 요청을 받은 노드를 더한다(계획 62 리뷰 2 — 노드 목록을 읽지 못하는 폴더 사용자의
+         *     화면이 "이 노드"를 안다). 옛 응답과 같은 칸에 `node`만 더해진다(노드 기록을 읽지 못하면 빠진다).
+         */
+        WhoAmI: {
+            name: string;
+            node?: components["schemas"]["ServingNode"];
+            role: components["schemas"]["Role"];
+            /** Format: uuid */
+            user: string;
+        };
         /** @description 대상에 권한이 닿는 것: grant와 전역 역할 사용자 */
         WhoPermissions: {
             /** @description 이 대상에 직접 건 것과 조상에 propagate로 건 것 */
@@ -11462,7 +11472,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Principal"];
+                    "application/json": components["schemas"]["WhoAmI"];
                 };
             };
             "4XX": {

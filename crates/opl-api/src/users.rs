@@ -11,8 +11,8 @@ use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::audit::AuditAuth;
 use opl_types::auth::{ApiToken, ApiTokenSpec, Role, User, UserSpec, external_name};
-use opl_types::authz::TokenScope;
-use opl_types::node::FOLDERS;
+use opl_types::authz::{MAX_USER_TOKENS, TokenScope};
+use opl_types::node::{FOLDERS, NodeSpec};
 use opl_types::realm::{LOCAL_REALM, RealmBackend, RealmSpec};
 use opl_types::resource::{Resource, ResourceSpec, validate_name};
 use opl_types::two_factor::TwoFactorSpec;
@@ -458,10 +458,41 @@ pub async fn logout(
     }
 }
 
+/// `GET /auth/whoami`의 응답: 주체에 요청을 받은 노드를 더한다(계획 62 리뷰 2 — 노드 목록을 읽지 못하는 폴더 사용자의
+/// 화면이 "이 노드"를 안다). 옛 응답과 같은 칸에 `node`만 더해진다(노드 기록을 읽지 못하면 빠진다).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WhoAmI {
+    pub user: Uuid,
+    pub name: String,
+    pub role: Role,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub node: Option<ServingNode>,
+}
+
+/// 요청을 받은 노드.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServingNode {
+    pub id: Uuid,
+    pub name: String,
+}
+
 #[utoipa::path(get, path = "/auth/whoami", tag = "auth",
-    responses((status = 200, body = Principal), (status = "4XX", body = crate::error::ErrorBody)))]
-pub async fn whoami(principal: Principal) -> Json<Principal> {
-    Json(principal)
+    responses((status = 200, body = WhoAmI), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn whoami(State(state): State<Arc<AppState>>, principal: Principal) -> Json<WhoAmI> {
+    let node = match state.cluster.get::<NodeSpec>(state.node) {
+        Ok(Some(n)) => Some(ServingNode {
+            id: n.id,
+            name: n.name,
+        }),
+        _ => None,
+    };
+    Json(WhoAmI {
+        user: principal.user,
+        name: principal.name,
+        role: principal.role,
+        node,
+    })
 }
 
 #[utoipa::path(get, path = "/users", tag = "auth",
@@ -652,6 +683,8 @@ pub async fn delete_user(
             Err(e) => return Err(e.into()),
         }
     }
+    // 그 사용자의 grant와 그룹 멤버 자리(리뷰 2 N4). 지우지 못한 것은 리더의 정리 작업이 지운다.
+    crate::permissions::drop_orphans(&state.cluster).await;
     // 세션도 주인을 다시 읽으므로 이미 쓸 수 없다. 지우지 못한 것은 리더의 정리 작업이 지운다.
     if let Err(e) = state.end_user_sessions(user.id).await {
         tracing::warn!(user = %user.name, error = %e.message, "sessions not deleted");
@@ -712,6 +745,19 @@ pub async fn create_token(
             StatusCode::FORBIDDEN,
             "forbidden",
             "a scoped token cannot create tokens",
+        ));
+    }
+    let owned = state
+        .cluster
+        .list::<ApiTokenSpec>()?
+        .1
+        .iter()
+        .filter(|t| t.spec.user == principal.user)
+        .count();
+    if owned >= MAX_USER_TOKENS {
+        return Err(ApiError::conflict(
+            "too_many_tokens",
+            format!("a user can have at most {MAX_USER_TOKENS} API tokens"),
         ));
     }
     let mut token: ApiToken = Resource::new(

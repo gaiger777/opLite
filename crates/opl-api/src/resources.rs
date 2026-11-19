@@ -515,6 +515,7 @@ pub async fn delete_pool(
         .cluster
         .delete::<StoragePoolSpec>(pool.id, if_match(&headers)?)
         .await?;
+    crate::permissions::drop_orphans(&state.cluster).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -530,8 +531,8 @@ pub struct PoolPatch {
     pub backups: Option<bool>,
 }
 
-/// 디렉터리 풀의 `shared`(다른 백엔드는 400)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수 있다)를
-/// 바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
+/// 디렉터리 풀의 `shared`(다른 백엔드는 400, 루트 `cluster.admin`)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수
+/// 있다)를 바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
 /// 볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
 /// 백업이 남은 풀의 `backups`를 끄거나 `shared`를 바꾸면 409 `pool_in_use`다. 같은 값이면 쓰지 않고
 /// 그대로 200이다.
@@ -541,7 +542,7 @@ pub struct PoolPatch {
     responses((status = 200, body = Resource<StoragePoolSpec, StoragePoolStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn patch_pool(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(req): Json<PoolPatch>,
@@ -579,6 +580,13 @@ pub async fn patch_pool(
         let mut spec = pool.spec.clone();
         spec.shared = req.shared.unwrap_or(spec.shared);
         spec.backups = req.backups.unwrap_or(spec.backups);
+        // `shared`는 모든 노드가 같은 파일을 본다는 호스트 구성의 주장이라(마이그레이션·HA가 믿는다) 풀 만들기처럼
+        // 루트 `cluster.admin`이다(리뷰 2 N11). `backups`는 그 풀의 `storage.config`(경로표)로 충분하다.
+        if spec.shared != pool.spec.shared {
+            state
+                .authz
+                .require_root(&principal, Privilege::ClusterAdmin)?;
+        }
         spec.validate()
             .map_err(|e| ApiError::bad_request(e.to_string()))?;
         if spec == pool.spec {
@@ -752,6 +760,7 @@ pub async fn delete_network(
         .cluster
         .delete::<NetworkSpec>(network.id, if_match(&headers)?)
         .await?;
+    crate::permissions::drop_orphans(&state.cluster).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

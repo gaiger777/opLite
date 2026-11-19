@@ -717,6 +717,34 @@ async fn passkeys_register_and_sign_in() {
         (StatusCode::BAD_REQUEST, json!("proof_required")),
         "{err}"
     );
+    // 리뷰 2 I3: 새 앱의 코드가 틀리면 본인 확인(복구 코드)을 쓰지 않는다.
+    let right = code(&secret, 0);
+    let wrong = format!(
+        "{:06}",
+        (right.parse::<u32>().unwrap() + 500_000) % 1_000_000
+    );
+    // 다른 노드에서(이 노드의 메모리 시도 제한을 아래 확인들에 남겨 둔다)
+    let mut other = Browser::at(&serve_again(&env).await);
+    other.cookie = b.cookie.clone();
+    other.host = b.host.clone();
+    let (status, err) = other
+        .post(
+            "/auth/2fa/totp/confirm",
+            json!({ "code": wrong, "proof": { "code": recovery } }),
+        )
+        .await;
+    assert_eq!(
+        (status, err["code"].clone()),
+        (StatusCode::FORBIDDEN, json!("invalid_second_factor")),
+        "{err}"
+    );
+    let tf = env
+        .cluster
+        .list::<opl_types::two_factor::TwoFactorSpec>()
+        .unwrap()
+        .1
+        .remove(0);
+    assert_eq!(tf.spec.recovery.len(), 10, "the recovery code is kept");
     let (status, err) = b
         .post(
             "/auth/2fa/totp/confirm",
@@ -943,4 +971,47 @@ async fn the_admin_policy_covers_admins_by_grant() {
             "{name}: {body}"
         );
     }
+}
+
+/// 리뷰 2 N10: 요소를 빼거나 더할 때의 본인 확인 코드도 둘째 단계와 같은 사용자별 Raft 시도 수로 세고 막힘을 따른다
+/// (다른 노드의 메모리 제한을 피해도).
+#[tokio::test]
+async fn proof_codes_count_toward_the_lockout() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    create_user(&admin, "alice", "viewer").await;
+    let mut b = Browser::new(&env);
+    b.login("alice", "password-1").await;
+    let (secret, _) = enable_totp(&mut b).await;
+    let right = code(&secret, 1);
+    let wrong = format!(
+        "{:06}",
+        (right.parse::<u32>().unwrap() + 500_000) % 1_000_000
+    );
+    for _ in 0..5 {
+        let (status, err) = b.delete("/auth/2fa/totp", json!({ "code": wrong })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+    }
+    let tf = env
+        .cluster
+        .list::<opl_types::two_factor::TwoFactorSpec>()
+        .unwrap()
+        .1
+        .remove(0);
+    assert_eq!(tf.status.failures, 5);
+    assert!(tf.status.blocked_until > now(), "{:?}", tf.status);
+    // 다른 노드(새 메모리 제한)에서 맞는 코드도 막힌 동안은 429다.
+    let other = serve_again(&env).await;
+    let mut c = Browser::at(&other);
+    c.cookie = b.cookie.clone();
+    let (status, err) = c.delete("/auth/2fa/totp", json!({ "code": right })).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{err}");
+    assert_eq!(err["code"], "too_many_attempts");
+    let tf = env
+        .cluster
+        .list::<opl_types::two_factor::TwoFactorSpec>()
+        .unwrap()
+        .1
+        .remove(0);
+    assert!(tf.spec.has_factor(), "the factor is still there");
 }

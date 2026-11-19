@@ -328,3 +328,67 @@ async fn resizing_reserves_the_quota_before_the_disk_grows() {
     let (_, usage) = admin.get(&format!("/folders/{team}/usage")).await;
     assert_eq!(usage["usage"]["disk_bytes"], 3 * unit + GIB, "{usage}");
 }
+
+/// 리뷰 2 N8: 앞 늘리기가 지우지 못한 허가(`status.disk_bytes`)는 다음 늘리기가 몫을 잡기 전에 지운다. 남겨 두면 그
+/// 크기까지의 기록이 Raft 할당량을 건너뛴다.
+#[tokio::test]
+async fn a_leftover_resize_permit_is_cleared_first() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let pool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: env.dir.path().join("local"),
+            },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+            folder: None,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
+    let team = folder(&admin, "team", None, json!({"disk_bytes": 4 * GIB})).await;
+    volume(&env, "root", 2 * GIB).await;
+    let mut req = vm_in("a", Some(&team));
+    req["spec"]["disks"] = json!([{"volume": "root", "bus": "virtio-blk"}]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let cluster = env.cluster.clone();
+    let get = move || cluster.get_by_name::<VolumeSpec>("root").unwrap().unwrap();
+    // 기록하지 못한 허가가 남았다(8 GiB까지).
+    let mut root = get();
+    root.status.disk_bytes = Some(8 * GIB);
+    env.cluster
+        .update_status::<VolumeSpec>(root.id, &root.status)
+        .await
+        .unwrap();
+    let storage = Arc::new(FakeStorage::default());
+    storage.set_size(root.id, 2 * GIB);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/volumes/root/resize", json!({"size_bytes": 3 * GIB}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    let root = get();
+    assert_eq!(root.status.disk_bytes, None);
+    assert_eq!(root.spec.size_bytes, 3 * GIB);
+    // 허가가 없으니 상한을 넘는 기록은 Raft가 거절한다.
+    let mut spec = root.spec.clone();
+    spec.size_bytes = 7 * GIB;
+    assert!(
+        env.cluster
+            .update_spec(root.id, None, root.labels.clone(), &spec)
+            .await
+            .is_err()
+    );
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(get().status.disk_bytes, None);
+}

@@ -79,6 +79,10 @@ pub struct TwoFactorStatus {
     /// 이 시각(유닉스 초)까지 둘째 단계를 받지 않는다(`failures`가 [`SECOND_STEP_ATTEMPTS`] 이상일 때 두 배씩).
     #[serde(skip_serializing_if = "is_zero")]
     pub blocked_until: u64,
+    /// 마지막으로 센 시도의 시각(유닉스 초, 리뷰 2). 이보다 [`SECOND_STEP_DECAY`] 넘게 조용했으면 `failures`를 0부터
+    /// 다시 센다.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub last_attempt: u64,
 }
 
 fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
@@ -90,11 +94,16 @@ pub const SECOND_STEP_ATTEMPTS: u32 = 5;
 /// 처음 막는 시간(초). 더 틀릴 때마다 두 배, [`SECOND_STEP_MAX_BLOCK`]까지.
 pub const SECOND_STEP_BLOCK: u64 = 30;
 pub const SECOND_STEP_MAX_BLOCK: u64 = 15 * 60;
+/// 이만큼(초) 시도가 없었고 막혀 있지 않으면 센 시도를 잊는다(리뷰 2 — 몇 달에 걸친 오타가 쌓여 막지 않게).
+pub const SECOND_STEP_DECAY: u64 = 15 * 60;
 
 impl TwoFactorStatus {
-    /// 시도 하나를 센 상태. `failures`가 상한 이상이면 `now`부터 막는다(30초부터 두 배, 15분까지).
+    /// 시도 하나를 센 상태. `failures`가 상한 이상이면 `now`부터 막는다(30초부터 두 배, 15분까지). 마지막 시도에서
+    /// [`SECOND_STEP_DECAY`] 넘게 지났고 막혀 있지 않으면 앞의 시도는 잊고 이것을 첫 시도로 센다.
     pub fn count_attempt(&self, now: u64) -> TwoFactorStatus {
-        let failures = self.failures.saturating_add(1);
+        let quiet =
+            self.blocked_until <= now && now >= self.last_attempt.saturating_add(SECOND_STEP_DECAY);
+        let failures = if quiet { 0 } else { self.failures }.saturating_add(1);
         let blocked_until = if failures >= SECOND_STEP_ATTEMPTS {
             let doublings = (failures - SECOND_STEP_ATTEMPTS).min(16);
             now + (SECOND_STEP_BLOCK << doublings).min(SECOND_STEP_MAX_BLOCK)
@@ -104,6 +113,7 @@ impl TwoFactorStatus {
         TwoFactorStatus {
             failures,
             blocked_until,
+            last_attempt: now,
             ..self.clone()
         }
     }
@@ -386,6 +396,27 @@ mod tests {
         let back: TwoFactorStatus =
             serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
         assert_eq!(back, status);
+    }
+
+    /// 리뷰 2 N9: 조용한 시간이 지나면 센 시도를 잊는다(막혀 있는 동안은 잊지 않는다).
+    #[test]
+    fn second_step_attempts_decay_after_a_quiet_period() {
+        let mut status = TwoFactorStatus::default();
+        for _ in 0..4 {
+            status = status.count_attempt(1000);
+        }
+        assert_eq!(status.failures, 4);
+        let later = 1000 + SECOND_STEP_DECAY;
+        status = status.count_attempt(later - 1);
+        assert_eq!(status.failures, 5, "not quiet long enough");
+        assert_eq!(status.blocked_for(later - 1), Some(30));
+        // 막힌 동안의 시도(거절된다)는 잊지 않는다.
+        let blocked = status.count_attempt(later);
+        assert_eq!(blocked.failures, 6);
+        status = status.count_attempt(later - 1 + SECOND_STEP_DECAY);
+        assert_eq!(status.failures, 1);
+        assert_eq!(status.blocked_for(later - 1 + SECOND_STEP_DECAY), None);
+        assert_eq!(status.last_attempt, later - 1 + SECOND_STEP_DECAY);
     }
 
     #[test]

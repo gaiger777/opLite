@@ -14,6 +14,8 @@ pub type Folder = Resource<FolderSpec, FolderStatus>;
 pub const MAX_FOLDER_DEPTH: usize = 16;
 /// 폴더 화면 이름의 최대 길이(문자 수)
 pub const MAX_FOLDER_NAME: usize = 64;
+/// 클러스터 전체 폴더 수 상한(세 트리 합). 색인 다시 만들기가 폴더 수 × 깊이라서 둔다(리뷰 2 N6).
+pub const MAX_FOLDERS: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

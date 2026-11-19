@@ -367,6 +367,10 @@ pub enum AuthzError {
 pub const MAX_DESCRIPTION: usize = 256;
 /// 외부 그룹 이름(LDAP DN·OIDC 그룹 값)의 최대 길이(바이트)
 pub const MAX_EXTERNAL_GROUP: usize = 1024;
+/// 클러스터 전체 grant 수 상한(리뷰 2 N6)
+pub const MAX_GRANTS: usize = 10_000;
+/// 사용자 한 명의 API 토큰 수 상한(리뷰 2 N6)
+pub const MAX_USER_TOKENS: usize = 100;
 
 /// 사용자 정의 역할 이름 규칙: 리소스 이름 규칙이고 내장 역할 이름(`admin`·`operator`·`viewer`·`none`)이 아니다.
 pub fn validate_role_name(name: &str) -> Result<(), AuthzError> {

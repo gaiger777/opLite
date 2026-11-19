@@ -741,10 +741,15 @@ pub async fn restore_backup(
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn replicate_backup(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(key): Path<String>,
     Json(req): Json<ReplicateRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    // 원격 대상은 루트 `cluster.admin`(설계 §8, 리뷰 2 N3): 받는 클러스터는 폴더를 버리고 루트에 두므로 폴더의
+    // `backup.create`로 보내면 그쪽의 모든 읽기 사용자에게 드러난다. 백업 자체의 권한은 경로표가 먼저 본다(404).
+    state
+        .authz
+        .require_root(&principal, Privilege::ClusterAdmin)?;
     check_name(&req.pool)?;
     // 옛 노드는 복제 Task와 사본 기록을 모른다.
     require_current(&state.cluster)?;

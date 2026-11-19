@@ -10,7 +10,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::authz::Privilege;
 use opl_types::authz_eval::AuthzTarget;
-use opl_types::folder::{Folder, FolderKind, FolderQuota, FolderSpec, FolderStatus};
+use opl_types::folder::{Folder, FolderKind, FolderQuota, FolderSpec, FolderStatus, MAX_FOLDERS};
 use opl_types::network::NetworkSpec;
 use opl_types::node::FOLDERS;
 use opl_types::resource::{Kind, Resource};
@@ -57,6 +57,40 @@ fn parent_target(parent: Option<Uuid>) -> AuthzTarget {
         Some(p) => AuthzTarget::Folder(p),
         None => AuthzTarget::Root,
     }
+}
+
+/// 폴더 옮기기(리뷰 2 N1): 옮기는 하위 트리 전체를 다른 관리 아래로 넘기므로 옛 부모와 새 부모 **안 모두**에서
+/// `inventory.move`가 있어야 한다. 안 모두에 닿는 권한은 그 부모나 조상의 propagate grant뿐이라(grant 위임의
+/// `check_delegation`과 같은 셈) 부모 안 객체 층으로 본다. 옛 부모 안이면 옮기는 폴더 안도 덮는다. 그래서 폴더 자체에만
+/// 닿는(propagate가 아닌) `inventory.move`로 그 폴더를 자기가 다스리는 폴더 아래로 끌어오지 못한다(403).
+fn require_move_inside(
+    state: &AppState,
+    principal: &Principal,
+    folder: &Folder,
+    new_parent: Option<Uuid>,
+) -> Result<(), ApiError> {
+    let kind = folder.spec.kind.member_kind();
+    for parent in [folder.spec.parent, new_parent] {
+        let inside = AuthzTarget::Object {
+            kind,
+            id: Uuid::nil(),
+            folder: parent,
+        };
+        if !state
+            .authz
+            .allows(principal, Privilege::InventoryMove, inside)
+        {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                format!(
+                    "moving a folder needs inventory.move everywhere inside {} (a propagating grant there or above)",
+                    parent.map_or_else(|| "/".to_string(), |p| folder_path(&state.cluster, p))
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// 대상에서 `privilege`. 볼 수 없는 폴더는 없는 폴더와 같은 404다.
@@ -157,6 +191,12 @@ pub async fn create_folder(
             parent_target(spec.parent),
         )?;
     }
+    if state.cluster.list::<FolderSpec>()?.1.len() >= MAX_FOLDERS {
+        return Err(ApiError::conflict(
+            "too_many_folders",
+            format!("a cluster can have at most {MAX_FOLDERS} folders"),
+        ));
+    }
     let mut folder: Folder = Resource::new(id.to_string(), spec);
     folder.id = id;
     folder.revision = state.cluster.create(&folder).await?;
@@ -242,6 +282,7 @@ pub async fn patch_folder(
             Privilege::InventoryMove,
             parent_target(parent),
         )?;
+        require_move_inside(&state, &principal, &folder, parent)?;
         changes.push(format!(
             "move -> {}",
             parent.map_or_else(|| "/".to_string(), |p| folder_path(&state.cluster, p))
@@ -310,6 +351,7 @@ pub async fn delete_folder(
         .cluster
         .delete::<FolderSpec>(folder.id, if_match(&headers)?)
         .await?;
+    crate::permissions::drop_orphans(&state.cluster).await;
     audit.detail(format!("folder delete {path}"));
     Ok(StatusCode::NO_CONTENT)
 }

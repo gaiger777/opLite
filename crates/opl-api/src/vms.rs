@@ -20,7 +20,9 @@ use opl_types::node::{
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
 use opl_types::security_group::SecurityGroupSpec;
-use opl_types::storage::{Volume, VolumeContent, VolumePhase, is_shared, pool_usable_on};
+use opl_types::storage::{
+    Volume, VolumeContent, VolumePhase, VolumeSpec, is_shared, pool_usable_on,
+};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{
     Arch, CdromSpec, HaState, MacAddr, MachineType, PowerState, RunningHardware, ValidationError,
@@ -683,7 +685,28 @@ pub(crate) fn check_attachments(
             .iter()
             .filter_map(|d| d.iso.as_deref())
             .filter(|v| !had_iso(v)),
-    )
+    )?;
+    // 새 복제 대상(리뷰 2 N2): 복제본을 만들 풀마다 `storage.allocate`. 대상에 풀이 없으면 디스크마다 같은 이름의 풀이다.
+    let had_target = |t: &opl_types::replication::ReplicationTarget| {
+        current.is_some_and(|c| {
+            c.replication
+                .iter()
+                .any(|s| s.node == t.node && s.pool == t.pool)
+        })
+    };
+    for target in spec.replication.iter().filter(|t| !had_target(t)) {
+        match &target.pool {
+            Some(pool) => state.authz.require_pool(principal, pool)?,
+            None => {
+                for disk in &spec.disks {
+                    if let Some(v) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? {
+                        state.authz.require_pool(principal, &v.spec.pool)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// PUT 본문의 `user_data`·`vendor_data`가 [`PASSWORD_MASK`]면(가린 응답을 그대로 되보냄) 저장된 값을 둔다. 저장된 것이
@@ -1609,6 +1632,7 @@ pub async fn delete_vm(
         .cluster
         .delete::<VmSpec>(vm.id, if_match(&headers)?)
         .await?;
+    crate::permissions::drop_orphans(&state.cluster).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

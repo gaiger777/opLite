@@ -7,10 +7,11 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
+use opl_cluster::Cluster;
 use opl_types::auth::{Role, UserSpec};
 use opl_types::authz::{
     AccessRoleSpec, AccessRoleStatus, GrantSpec, GrantStatus, GrantTarget, GroupSpec, GroupStatus,
-    PrincipalRef, PrivSet, Privilege, RoleRef, builtin_privileges, validate_role_name,
+    MAX_GRANTS, PrincipalRef, PrivSet, Privilege, RoleRef, builtin_privileges, validate_role_name,
 };
 use opl_types::authz_eval::{AuthzTarget, chain_of, groups_of, reaches};
 use opl_types::folder::FolderSpec;
@@ -247,15 +248,118 @@ pub async fn delete_access_role(
 
 // ---- 그룹 ----
 
-/// 그룹의 멤버가 모두 있는 사용자인지(400)
-fn check_group(state: &AppState, spec: &GroupSpec) -> Result<(), ApiError> {
+/// 그룹의 멤버가 모두 있는 사용자인지(400). `stored`(고치기 전 멤버)에 있던 지운 사용자는 오류 대신 빼고 쓴다(리뷰 2 N4 —
+/// GET으로 받은 목록을 그대로 되보내도 된다).
+fn check_group(state: &AppState, spec: &mut GroupSpec, stored: &[Uuid]) -> Result<(), ApiError> {
     spec.validate().map_err(bad)?;
+    let mut gone = HashSet::new();
     for id in spec.member_set() {
         if state.cluster.get::<UserSpec>(id)?.is_none() {
-            return Err(ApiError::bad_request(format!("user {id} not found")));
+            if !stored.contains(&id) {
+                return Err(ApiError::bad_request(format!("user {id} not found")));
+            }
+            gone.insert(id);
         }
     }
+    spec.members.retain(|id| !gone.contains(id));
     Ok(())
+}
+
+/// 지운 주체·대상을 가리키는 grant와 그룹에 남은 지운 사용자(리뷰 2 N4·N5). 사용자·폴더·VM·네트워크·풀을 지운 뒤
+/// 그 핸들러가 부르고, 놓친 것(실패·옛 상태)은 리더의 정리 작업이 tick마다 부른다. 실패는 기록만 한다(다음에 다시).
+/// 색인은 이런 grant를 이미 무시하므로(없는 사용자·대상) 권한에는 영향이 없고, 쌓이지 않게 지우는 것이다.
+pub(crate) async fn drop_orphans(cluster: &Cluster) -> usize {
+    // grant·그룹을 먼저 읽는다: grant는 주체·대상이 있을 때만 만들어지므로 뒤에 읽은 목록에 없으면 그사이 지운 것이다
+    // (반대 순서면 막 만든 사용자의 새 grant를 고아로 잘못 볼 수 있다).
+    let found = (|| {
+        let grants = cluster.list::<GrantSpec>()?.1;
+        let groups = cluster.list::<GroupSpec>()?.1;
+        let users: HashSet<Uuid> = cluster.list::<UserSpec>()?.1.iter().map(|u| u.id).collect();
+        let mut objects: HashSet<(Kind, Uuid)> = HashSet::new();
+        objects.extend(
+            cluster
+                .list::<FolderSpec>()?
+                .1
+                .iter()
+                .map(|f| (Kind::Folder, f.id)),
+        );
+        objects.extend(cluster.list::<VmSpec>()?.1.iter().map(|v| (Kind::Vm, v.id)));
+        objects.extend(
+            cluster
+                .list::<NetworkSpec>()?
+                .1
+                .iter()
+                .map(|n| (Kind::Network, n.id)),
+        );
+        objects.extend(
+            cluster
+                .list::<StoragePoolSpec>()?
+                .1
+                .iter()
+                .map(|p| (Kind::StoragePool, p.id)),
+        );
+        Ok::<_, opl_cluster::ClusterError>((users, groups, objects, grants))
+    })();
+    let Ok((users, groups, objects, grants)) = found else {
+        return 0;
+    };
+    let group_ids: HashSet<Uuid> = groups.iter().map(|g| g.id).collect();
+    let mut dropped = 0;
+    for grant in grants
+        .iter()
+        .filter(|g| orphan_grant(&g.spec, &users, &group_ids, &objects))
+        .take(ORPHANS_PER_PASS)
+    {
+        match cluster
+            .delete::<GrantSpec>(grant.id, Some(grant.revision))
+            .await
+        {
+            Ok(_) => dropped += 1,
+            Err(e) => tracing::info!(grant = %grant.id, error = %e, "orphan grant not deleted"),
+        }
+    }
+    for group in groups
+        .iter()
+        .filter(|g| g.spec.members.iter().any(|m| !users.contains(m)))
+    {
+        let mut spec = group.spec.clone();
+        spec.members.retain(|m| users.contains(m));
+        match cluster
+            .update_spec(group.id, Some(group.revision), group.labels.clone(), &spec)
+            .await
+        {
+            Ok(_) => dropped += 1,
+            Err(e) => {
+                tracing::info!(group = %group.name, error = %e, "deleted members not removed")
+            }
+        }
+    }
+    dropped
+}
+
+/// 한 번에 지우는 고아 grant 수. 나머지는 다음 tick에 지운다.
+const ORPHANS_PER_PASS: usize = 200;
+
+/// 주체(사용자·그룹)나 대상(폴더·VM·네트워크·풀)이 없는 grant. 루트 grant의 대상은 늘 있다.
+fn orphan_grant(
+    grant: &GrantSpec,
+    users: &HashSet<Uuid>,
+    groups: &HashSet<Uuid>,
+    objects: &HashSet<(Kind, Uuid)>,
+) -> bool {
+    let principal = match grant.principal {
+        PrincipalRef::User { id } => users.contains(&id),
+        PrincipalRef::Group { id } => groups.contains(&id),
+    };
+    let target = match grant.target {
+        GrantTarget::Root => true,
+        GrantTarget::Folder { id } => objects.contains(&(Kind::Folder, id)),
+        GrantTarget::Object { kind, id } => {
+            !matches!(kind, Kind::Vm | Kind::Network | Kind::StoragePool)
+                || objects.contains(&(kind, id))
+        }
+    };
+    !(principal && target)
 }
 
 #[utoipa::path(get, path = "/groups", tag = "permissions",
@@ -287,8 +391,9 @@ pub async fn create_group(
         .require_root(&principal, Privilege::ClusterAdmin)?;
     require_feature(&state.cluster, FOLDERS)?;
     check_name(&req.name)?;
-    check_group(&state, &req.spec)?;
-    let mut group: Group = Resource::new(req.name, req.spec);
+    let mut spec = req.spec;
+    check_group(&state, &mut spec, &[])?;
+    let mut group: Group = Resource::new(req.name, spec);
     group.labels = req.labels;
     group.revision = state.cluster.create(&group).await?;
     audit.detail(format!("group create {}", group.name));
@@ -326,10 +431,11 @@ pub async fn update_group(
         .require_root(&principal, Privilege::ClusterAdmin)?;
     require_feature(&state.cluster, FOLDERS)?;
     let group = lookup::<GroupSpec>(&state.cluster, &key)?;
-    check_group(&state, &req.spec)?;
+    let mut spec = req.spec;
+    check_group(&state, &mut spec, &group.spec.members)?;
     state
         .cluster
-        .update_spec(group.id, if_match(&headers)?, req.labels, &req.spec)
+        .update_spec(group.id, if_match(&headers)?, req.labels, &spec)
         .await?;
     audit.detail(format!("group set {}", group.name));
     Ok(Json(lookup::<GroupSpec>(
@@ -717,6 +823,12 @@ pub async fn create_grant(
     let (privileges, role_name) = role_set(&state, &spec.role)?;
     let who = principal_name(&state, &spec.principal)?;
     check_delegation(&state, &principal, &spec.target, spec.propagate, privileges)?;
+    if state.cluster.list::<GrantSpec>()?.1.len() >= MAX_GRANTS {
+        return Err(ApiError::conflict(
+            "too_many_grants",
+            format!("a cluster can have at most {MAX_GRANTS} grants"),
+        ));
+    }
     let id = Uuid::now_v7();
     let mut grant: Grant = Resource::new(id.to_string(), spec);
     grant.id = id;

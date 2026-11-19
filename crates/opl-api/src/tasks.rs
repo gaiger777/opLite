@@ -54,7 +54,10 @@ use crate::vm_imports::ImportCredentials;
 use crate::vms::{is_stopped, vm_uses_volume};
 use crate::volumes::{block_pool_kind, usable_node};
 
-/// 새 Task를 저장소에 만든다. 이름은 id 문자열이다.
+/// Task를 만든 API 요청의 사용자 id를 담는 레이블(요청 밖에서 만든 Task — 스케줄러·HA·정리 작업 — 에는 없다)
+pub const REQUESTED_BY: &str = "requested-by";
+
+/// 새 Task를 저장소에 만든다. 이름은 id 문자열이다. API 요청 안이면 요청한 사용자를 [`REQUESTED_BY`] 레이블에 둔다.
 pub(crate) async fn create_task(
     cluster: &Cluster,
     op: TaskOp,
@@ -71,6 +74,11 @@ pub(crate) async fn create_task(
     }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
+    // 요청한 사용자(리뷰 2 N7). 레이블이라 옛 노드도 그대로 읽는다(`TaskSpec`은 모르는 칸을 거절한다).
+    if let Some(user) = crate::audit::requester() {
+        task.labels
+            .insert(REQUESTED_BY.to_string(), user.to_string());
+    }
     task.revision = cluster.create(&task).await?;
     Ok(task)
 }
@@ -1386,6 +1394,9 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
             vm.name
         ));
     }
+    // 앞 Task가 지우지 못한 허가(기록 실패·노드 죽음)가 남아 있으면 먼저 지운다(리뷰 2 N8): 남은 허가는 그 크기까지의
+    // 기록을 할당량 없이 통과시킨다.
+    clear_disk_bytes(ctx, id).await?;
     // 할당량을 미리 본 뒤(경로가 든 메시지) 스펙에 써서 Raft가 몫을 잡는다. 거절되면 디스크는 그대로다.
     crate::quota::precheck(
         &ctx.cluster,
@@ -1475,21 +1486,37 @@ async fn record_grown_size(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), S
         format!("the disk now has {size_bytes} bytes but the size was not recorded: {e}")
     })?;
     // 허가는 한 번만 쓴다: 남겨 두면 스냅샷 되돌리기로 작아진 뒤 그 크기까지 다시 늘리는 것이 할당량을 건너뛴다.
-    if let Some(volume) = ctx
-        .cluster
-        .get::<VolumeSpec>(id)
-        .map_err(|e| e.to_string())?
-        && volume.status.disk_bytes.is_some()
-    {
+    // 지우지 못하면 다음 늘리기·되돌리기가 지운다.
+    if let Err(e) = clear_disk_bytes(ctx, id).await {
+        tracing::warn!(volume = %id, error = %e, "cannot clear the recorded disk size");
+    }
+    Ok(())
+}
+
+/// 볼륨 상태의 `disk_bytes`(늘리기 허가)를 지운다. 쓰기가 실패하면 세 번까지 다시 한다. 볼륨이 없으면 할 일이 없다.
+async fn clear_disk_bytes(ctx: &Ctx, id: Uuid) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..3 {
+        let Some(volume) = ctx
+            .cluster
+            .get::<VolumeSpec>(id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+        if volume.status.disk_bytes.is_none() {
+            return Ok(());
+        }
         let status = VolumeStatus {
             disk_bytes: None,
             ..volume.status.clone()
         };
-        if let Err(e) = ctx.cluster.update_status::<VolumeSpec>(id, &status).await {
-            tracing::warn!(volume = %volume.name, error = %e, "cannot clear the recorded disk size");
+        match ctx.cluster.update_status::<VolumeSpec>(id, &status).await {
+            Ok(_) => return Ok(()),
+            Err(e) => last = e.to_string(),
         }
     }
-    Ok(())
+    Err(format!("cannot clear the recorded disk size: {last}"))
 }
 
 /// 볼륨을 지우지 못한 이유

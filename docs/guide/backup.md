@@ -380,7 +380,8 @@ tick = "5s"        # 모을 때가 된 원격을 찾는 간격
 백업을 등록한 원격 클러스터(위 "원격 클러스터")의 백업 풀로 복사해 두면, 주 사이트(클러스터 prod)를 통째로 잃어도
 DR 사이트(클러스터 dr)에서 그 사본을 복원해 VM을 되살린다. 사본은 dr의 **보통 백업**이다: dr의 `orbivisorctl backup
 list`·웹 백업 화면에 보이고, dr에서 복원하고 지운다. 백업 작업이 만든 백업은 저절로(`replicate`), 아무 백업이나 손으로
-(`backup replicate`) 보낸다. prod에서 원본을 지우면(사용자나 보존 규칙) dr의 사본도 지운다.
+(`backup replicate`) 보낸다. prod에서 원본을 지우면(사용자나 보존 규칙) dr의 사본도 지운다. 손으로 보내기와 백업 작업의 원격
+대상은 루트 `cluster.admin`이다(dr은 폴더를 버리고 루트에 두므로 dr의 모든 읽기 사용자에게 보인다, [폴더와 권한](folders.md)).
 
 - **보내는 길.** 복제는 prod의 Task(`backup-replicate`)가 한다. 백업 파일이 있는 노드(공유가 아닌 풀은 백업을 쓴
   노드, NFS면 그 풀을 쓸 수 있는 노드 — 지우기와 같다)가 원격 등록의 URL·CA·토큰으로 dr의 받기 API를 부른다:
@@ -457,11 +458,11 @@ orbivisorctl backup list
 ```
 
 - **수동 복제.** `orbivisorctl backup replicate <백업> --remote <원격> --pool <원격의 백업 풀> [--wait]`(API `POST
-  /api/v1/backups/{key}/actions/replicate {"remote", "pool"}`, operator 이상, **202** Task). 원격이 등록되지 않았으면
+  /api/v1/backups/{key}/actions/replicate {"remote", "pool"}`, 루트 `cluster.admin`, **202** Task). 원격이 등록되지 않았으면
   **404**, 원본이 `ready`가 아니면 **409** `backup_not_ready`, 지우는 중이거나 같은 전체 백업에서 시작한 체인의 어느
   백업이든(이 백업, 조상, 자식, 형제 — 전체 백업이면 그 증분들) 같은 원격으로 보내는 Task가 끝나지 않았으면 **409**
   `backup_busy`(복제 중인 그 백업의 이름), 파일이 있는 노드가 오프라인이면 **409**
-  `node_offline`이다. 웹은 백업 표(백업 화면·VM 상세의 백업 탭)의 "원격으로 복제" 버튼(ready 백업, operator 이상):
+  `node_offline`이다. 웹은 백업 표(백업 화면·VM 상세의 백업 탭)의 "원격으로 복제" 버튼(ready 백업, `cluster.admin`):
   원격을 고르면 그 원격의 백업 풀을 중계(`GET /storage-pools`)로 읽어 고르게 하고, 보낸 뒤 Task를 따라간다. 복제 중인
   백업을 지우면 **409** `backup_busy`("being replicated")다(보내는 동안 파일을 지우지 않게).
 - **작업 복제.** 백업 작업에 `replicate: {"remote", "pool"}`(`backup-job create|set --replicate <원격>/<풀>`, 웹 백업

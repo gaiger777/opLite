@@ -13,7 +13,6 @@ mod owners;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -21,7 +20,9 @@ use futures_util::FutureExt;
 use opl_cluster::Cluster;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_types::auth::{ApiTokenSpec, UserSpec};
-use opl_types::authz::{AccessRoleSpec, GrantSpec, GroupSpec, PrivSet, Privilege, TokenScope};
+use opl_types::authz::{
+    AccessRoleSpec, GrantSpec, GrantTarget, GroupSpec, PrincipalRef, PrivSet, Privilege,
+};
 use opl_types::authz_eval::{AuthzSnapshot, AuthzTarget, FolderNode, UserEntry};
 use opl_types::folder::{Folder, FolderSpec};
 use opl_types::network::Network;
@@ -166,11 +167,10 @@ impl AuthzObject for Folder {
     }
 }
 
-/// 세대 하나의 상태: 평가 스냅샷과 토큰(주인, 범위)
+/// 세대 하나의 상태: 평가 스냅샷
 struct Shared {
     generation: u64,
     snap: AuthzSnapshot,
-    tokens: HashMap<Uuid, (Uuid, Option<TokenScope>)>,
 }
 
 /// 이 노드의 권한 평가기
@@ -183,11 +183,13 @@ pub struct Authz {
     cache: Mutex<Lru<Subject, Arc<EffectiveIndex>>>,
 }
 
-/// 세대를 올리는 종류
+/// 세대를 올리는 종류. API 토큰은 올리지 않는다(리뷰 2 N6): 토큰의 주인·범위는 바뀌지 않으므로 색인을 만들 때
+/// 저장소에서 바로 읽고(캐시 열쇠가 토큰 id), 토큰 만들기·지우기가 모든 주체의 색인을 버리게 하지 않는다. 지운 토큰은
+/// 인증이 먼저 거절한다.
 fn bumps(kind: Kind) -> bool {
     matches!(
         kind,
-        Kind::Folder | Kind::Grant | Kind::AccessRole | Kind::Group | Kind::User | Kind::ApiToken
+        Kind::Folder | Kind::Grant | Kind::AccessRole | Kind::Group | Kind::User
     )
 }
 
@@ -277,23 +279,26 @@ impl Authz {
         for r in c.list::<AccessRoleSpec>()?.1 {
             snap.roles.insert(r.id, r.spec.privset().0);
         }
+        // 지운 사용자·그룹·폴더를 가리키는 grant(고아, 정리 작업이 지운다)는 아무에게도 닿지 않으므로 색인에 넣지
+        // 않는다(리뷰 2 N5 — 주체마다 없는 폴더 칸을 만들지 않게).
         snap.grants = c
             .list::<GrantSpec>()?
             .1
             .into_iter()
             .map(|g| g.spec)
+            .filter(|g| {
+                let principal = match g.principal {
+                    PrincipalRef::User { id } => snap.users.contains_key(&id),
+                    PrincipalRef::Group { id } => snap.groups.contains_key(&id),
+                };
+                let target = match g.target {
+                    GrantTarget::Folder { id } => snap.folders.contains_key(&id),
+                    _ => true,
+                };
+                principal && target
+            })
             .collect();
-        let tokens = c
-            .list::<ApiTokenSpec>()?
-            .1
-            .into_iter()
-            .map(|t| (t.id, (t.spec.user, t.spec.scope)))
-            .collect();
-        Ok(Shared {
-            generation,
-            snap,
-            tokens,
-        })
+        Ok(Shared { generation, snap })
     }
 
     /// 지금 세대의 평가 스냅샷(폴더 트리·사용자·그룹·역할·grant). 유효 권한의 근거를 찾을 때 쓴다.
@@ -311,17 +316,10 @@ impl Authz {
             return Ok(hit);
         }
         let mut shared = self.shared(generation)?;
-        // 이 노드에 막 적용된 사용자·토큰을 구독이 아직 알리지 않았을 수 있다(인증은 저장소를 바로 읽는다). 스냅샷에
+        // 이 노드에 막 적용된 사용자를 구독이 아직 알리지 않았을 수 있다(인증은 저장소를 바로 읽는다). 스냅샷에
         // 없는데 저장소에 있으면 세대를 올려 다시 뜬다.
         let stale = !shared.snap.users.contains_key(&subject.user)
-            && self.cluster.get::<UserSpec>(subject.user)?.is_some()
-            || subject.token.is_some_and(|t| {
-                !shared.tokens.contains_key(&t)
-                    && self
-                        .cluster
-                        .get::<ApiTokenSpec>(t)
-                        .is_ok_and(|found| found.is_some())
-            });
+            && self.cluster.get::<UserSpec>(subject.user)?.is_some();
         if stale {
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
             shared = self.shared(generation)?;
@@ -329,11 +327,11 @@ impl Authz {
         let built = Arc::new(match subject.token {
             None => EffectiveIndex::build(&shared.snap, subject.user, None, shared.generation),
             // 지워졌거나 남의 토큰이면 아무 권한도 없다.
-            Some(token) => match shared.tokens.get(&token) {
-                Some((owner, scope)) if *owner == subject.user => EffectiveIndex::build(
+            Some(token) => match self.cluster.get::<ApiTokenSpec>(token)? {
+                Some(t) if t.spec.user == subject.user => EffectiveIndex::build(
                     &shared.snap,
                     subject.user,
-                    scope.as_ref(),
+                    t.spec.scope.as_ref(),
                     shared.generation,
                 ),
                 _ => EffectiveIndex::empty(shared.generation),

@@ -1098,8 +1098,11 @@ pub async fn confirm_totp(
     Json(req): Json<CodeRequest>,
 ) -> Result<Json<RecoveryCodes>, ApiError> {
     let user = may_change(&state, &who.principal)?;
-    let proved = proof_for_adding(&state, ip, &who, &user, req.proof.as_ref()).await?;
     let attempt = state.attempts.begin(&limiter_key(user.id), ip)?;
+    // 새 앱의 코드부터 본다(리뷰 2 I3): 틀린 코드 때문에 본인 확인(복구 코드는 쓰면 없어진다)을 헛되이 쓰지 않게.
+    // 쓰기 안에서 다시 본다.
+    check_new_totp(&state.cluster, user.id, &req.code)?;
+    let proved = proof_for_adding(&state, ip, &who, &user, req.proof.as_ref()).await?;
     let (codes, hashes) = new_recovery_codes(RECOVERY_CODES);
     let mut issued = false;
     let mut step = None;
@@ -1136,6 +1139,25 @@ pub async fn confirm_totp(
     Ok(Json(RecoveryCodes {
         codes: if issued { codes } else { vec![] },
     }))
+}
+
+/// 등록 중인 TOTP의 확인 코드가 맞는지(아무것도 쓰지 않는다). 등록 중이 아니면 409 `no_totp_enrollment`, 틀리면 403.
+fn check_new_totp(cluster: &Cluster, user: Uuid, code: &str) -> Result<(), ApiError> {
+    let Some(totp) = load(cluster, user)?
+        .and_then(|t| t.spec.totp)
+        .filter(|t| !t.confirmed)
+    else {
+        return Err(ApiError::conflict(
+            "no_totp_enrollment",
+            "start the authenticator app enrollment first",
+        ));
+    };
+    let secret =
+        decode_secret(&totp.secret).ok_or_else(|| ApiError::internal("bad TOTP secret"))?;
+    if verify_totp(&secret, code, unix_now(), 0).is_none() {
+        return Err(invalid_second_factor(StatusCode::FORBIDDEN));
+    }
+    Ok(())
 }
 
 /// 확인 코드의 칸을 쓴 것으로 적는다(그 코드로 로그인하지 못하게). 엇갈리면 다시 읽어 다시 하고, 끝내 적지 못하면
@@ -1181,6 +1203,9 @@ async fn check_proof(
     let attempt = state.attempts.begin(&limiter_key(user.id), ip)?;
     let ok = match (&proof.code, &proof.password) {
         (Some(code), None) => {
+            // 코드는 둘째 단계와 같은 사용자별 Raft 시도 수로 센다(리뷰 2 N10): 막혀 있으면 429, 여러 노드·IP로 나눠
+            // 추측해도 합쳐 센다. 통과하면 `use_totp`·`use_recovery`가 지운다.
+            count_attempt(&state.cluster, user.id).await?;
             use_totp(&state.cluster, user.id, code).await?
                 || use_recovery(&state.cluster, user.id, code).await?
         }

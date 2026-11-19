@@ -116,7 +116,12 @@ struct Seen {
     orphans: HashMap<Uuid, Instant>,
     /// 끝난 Task와 처음 끝난 것으로 보인 시각
     finished: HashMap<Uuid, Instant>,
+    /// 고아 grant·그룹 멤버를 마지막으로 정리한 시각
+    grants_swept: Option<Instant>,
 }
+
+/// 고아 grant·그룹 멤버 정리 간격(지우기 핸들러가 바로 정리하므로 놓친 것만 줍는다)
+const GRANT_SWEEP_EVERY: Duration = Duration::from_secs(60);
 
 /// 정리 작업이 할 일. 읽은 revision에서만 쓴다(그사이 바뀌었으면 다음 tick에 다시 본다).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +384,20 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
                 crate::ceph::release_pending(cluster, id).await;
             }
             record_schedule(state, &tasks, &snapshots, id, error).await;
+        }
+    }
+    // 지운 사용자·대상의 grant와 그룹 멤버(리뷰 2 N4·N5): 지우기 핸들러가 놓친 것(실패·옛 상태)을 줍는다.
+    if seen
+        .grants_swept
+        .is_none_or(|at| now.duration_since(at) >= GRANT_SWEEP_EVERY)
+    {
+        seen.grants_swept = Some(now);
+        let dropped = crate::permissions::drop_orphans(cluster).await;
+        if dropped > 0 {
+            tracing::info!(
+                dropped,
+                "janitor: removed grants and group members of deleted objects"
+            );
         }
     }
     // 지우기 Task가 파일이 있는 노드에서 파일과 리소스를 지운다. 만들지 못하면(노드가 오프라인 등) 다음

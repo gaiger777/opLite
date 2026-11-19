@@ -374,6 +374,19 @@ pub(crate) fn parse_time(field: &str, value: &str) -> Result<u64, ApiError> {
 #[derive(Clone, Default)]
 pub(crate) struct AuditSlot(Arc<Mutex<SlotData>>);
 
+tokio::task_local! {
+    /// 지금 처리하는 바꾸는 요청의 감사 slot. 깊은 곳(Task 만들기)이 인자 없이 요청한 사용자를 찾는다.
+    static REQUEST: AuditSlot;
+}
+
+/// 지금 요청을 보낸 사용자(바꾸는 API 요청 안에서만, 인증 뒤). 정리 작업·스케줄러처럼 요청 밖이면 None.
+pub(crate) fn requester() -> Option<Uuid> {
+    REQUEST
+        .try_with(|slot| slot.0.lock().unwrap().principal.as_ref().map(|p| p.user))
+        .ok()
+        .flatten()
+}
+
 #[derive(Default)]
 struct SlotData {
     principal: Option<Principal>,
@@ -462,7 +475,7 @@ pub(crate) async fn layer(
     let slot = AuditSlot::default();
     req.extensions_mut().insert(slot.clone());
     let start = Instant::now();
-    let response = next.run(req).await;
+    let response = REQUEST.scope(slot.clone(), next.run(req)).await;
     let data = std::mem::take(&mut *slot.0.lock().unwrap());
     let principal = data.principal;
     state.audit.record(AuditEntry {

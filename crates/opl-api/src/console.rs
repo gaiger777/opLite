@@ -13,6 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use opl_cluster::types::NodeId;
 use opl_driver::DriverError;
 use opl_peer::{ConsoleError, ConsoleStream};
+use opl_types::authz::Privilege;
 use opl_types::vm::VmSpec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -26,12 +27,15 @@ use crate::state::AppState;
 /// 노드 때문에 요청이 매달리지 않게 한다. 열린 뒤의 스트림에는 적용하지 않는다.
 const CONSOLE_OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// 열린 콘솔이 아직 `vm.console`을 가졌는지 다시 보는 간격(리뷰 2 N7)
+const RECHECK: Duration = Duration::from_secs(2);
+
 #[utoipa::path(get, path = "/vms/{key}/console", tag = "vms",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 101, description = "WebSocket carrying the VNC (RFB) stream"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn console(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(key): Path<String>,
     ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
@@ -74,7 +78,8 @@ pub async fn console(
                 }
                 ConsoleError::Unavailable(_) => unavailable(),
             })?;
-        return Ok(ws.on_upgrade(move |socket| relay(socket, stream)));
+        let lost = revoked(state.clone(), principal, vm.id);
+        return Ok(ws.on_upgrade(move |socket| relay(socket, stream, lost)));
     }
     let path = match state.hv.console_endpoint(vm.id).await {
         Ok(path) => path,
@@ -85,12 +90,33 @@ pub async fn console(
     let vnc = UnixStream::connect(&path)
         .await
         .map_err(|_| not_running())?;
-    Ok(ws.on_upgrade(move |socket| bridge(socket, vnc)))
+    let lost = revoked(state.clone(), principal, vm.id);
+    Ok(ws.on_upgrade(move |socket| bridge(socket, vnc, lost)))
+}
+
+/// 콘솔을 연 사용자가 그 VM의 `vm.console`을 잃으면(grant 빼기, 역할 바꾸기, 다른 폴더로 옮기기, VM 지우기) 끝나는
+/// future(리뷰 2 N7). 권한은 열 때 한 번 보므로 열린 연결은 이것으로 닫는다. VM의 지금 폴더로 [`RECHECK`]마다 다시
+/// 본다(색인은 캐시라 싸다). 저장소를 읽지 못하면 다음 번에 다시 본다.
+async fn revoked(state: Arc<AppState>, principal: Principal, vm: uuid::Uuid) {
+    loop {
+        tokio::time::sleep(RECHECK).await;
+        let allowed = match state.cluster.get::<VmSpec>(vm) {
+            Ok(Some(v)) => state
+                .authz
+                .require(&principal, Privilege::VmConsole, &v)
+                .is_ok(),
+            Ok(None) => false,
+            Err(_) => continue,
+        };
+        if !allowed {
+            return;
+        }
+    }
 }
 
 /// WebSocket과 다른 노드의 콘솔 스트림을 잇는다. 한쪽이 막혀도 다른 쪽이 멈추지 않게 두 방향을
 /// 따로 돌리고, 어느 한 방향이 끝나면 끝낸다.
-async fn relay(socket: WebSocket, stream: ConsoleStream) {
+async fn relay(socket: WebSocket, stream: ConsoleStream, lost: impl Future<Output = ()>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
     let (sender, mut receiver) = stream.into_split();
     let to_vm = async {
@@ -116,14 +142,17 @@ async fn relay(socket: WebSocket, stream: ConsoleStream) {
     tokio::select! {
         _ = to_vm => {}
         _ = from_vm => {}
+        _ = lost => {}
     }
     let _ = ws_tx.send(Message::Close(None)).await;
 }
 
-async fn bridge(mut socket: WebSocket, mut vnc: UnixStream) {
+async fn bridge(mut socket: WebSocket, mut vnc: UnixStream, lost: impl Future<Output = ()>) {
     let mut buf = vec![0u8; 64 * 1024];
+    let mut lost = std::pin::pin!(lost);
     loop {
         tokio::select! {
+            _ = &mut lost => break,
             n = vnc.read(&mut buf) => match n {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {

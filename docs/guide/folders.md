@@ -40,7 +40,8 @@ alice는 VM 목록·`/watch`·작업·경보·팔레트에서 `/teamA`의 것만
 - **루트.** 트리마다 보이지 않는 루트가 있다. 폴더를 정하지 않은 리소스는 루트에 있고, 업그레이드 전의 리소스도 그렇다.
   CLI는 `/`, 웹은 "맨 위"(모든 VM·모든 네트워크·모든 스토리지 풀)다. 루트 권한(`grant --on root`, 전역 역할)은 세 트리와
   클러스터 객체(노드·설정·HA 등) 모두의 조상이다.
-- **중첩.** 깊이는 16단계까지(넘으면 **409** `folder_too_deep`). 이름은 1~64자이고 `/`·제어 문자·앞뒤 공백이 없어야 한다. 같은
+- **중첩.** 깊이는 16단계까지(넘으면 **409** `folder_too_deep`), 폴더는 클러스터 전체(세 트리 합)에 10,000개까지(**409**
+  `too_many_folders`). 이름은 1~64자이고 `/`·제어 문자·앞뒤 공백이 없어야 한다. 같은
   부모 아래 이름은 대소문자를 무시하고 하나다(**409** `name_taken`, 두 노드가 동시에 만들어도 하나만). 다른 부모 아래에는 같은
   이름(`/teamA/prod`, `/teamB/prod`)을 쓴다. 폴더 리소스의 이름은 폴더 id이고 화면 이름은 스펙에 있다.
 - **옮기기.** 폴더는 부모를 바꿔 옮긴다(`folder move /teamA/prod --to /teamB`, `--to /`는 맨 위). 자기 아래로 옮기면 **409**
@@ -180,16 +181,22 @@ orbivisorctl perm who /teamA                   # 이 대상에 닿는 grant와 �
 - 루트 grant, 사용자 정의 역할·그룹 쓰기는 `cluster.admin`이다(역할 하나를 고치면 모든 grant가 바뀌므로).
 - 할당량은 그 폴더의 **부모**에서 `inventory.quota`가 필요하다(맨 위 폴더는 루트). 팀 관리자는 자기 폴더의 상한을 올리지 못하고
   자식 폴더의 상한만 나눈다.
-- 폴더를 옮기려면 그 폴더와 새 부모 모두에 `inventory.move`, 리소스를 옮기려면 그 리소스와 대상 폴더 모두에 `inventory.move`가
-  필요하다.
-- grant 보기: `cluster.admin`은 전부, 그 밖에는 자기·자기 그룹의 grant와 `permission.modify`가 있는 대상의 grant다. 대상이 지워진
-  grant는 루트 관리자만 보고 뺀다.
+- 폴더를 옮기려면 그 폴더와 함께 **옛 부모와 새 부모 안 모두**에서 `inventory.move`가 필요하다. 안 모두에 닿는 권한은 그
+  부모나 조상에 아래로 내려가는 grant로 받은 것뿐이라서, `--no-propagate`로 그 폴더에만 받은 `inventory.move`로는 폴더를 자기가
+  다스리는 폴더 아래로 끌어와 하위 트리를 넘겨받지 못한다(**403** "moving a folder needs inventory.move everywhere inside …").
+  리소스를 옮기려면 그 리소스와 대상 폴더 모두에 `inventory.move`가 필요하다(vSphere처럼, 객체 하나에 받은 `inventory.move`로
+  그 객체를 자기 폴더로 옮기면 그 폴더의 관리를 받는다 — 객체 grant에 이 권한을 넣을 때 주의한다).
+- grant 보기: `cluster.admin`은 전부, 그 밖에는 자기·자기 그룹의 grant와 `permission.modify`가 있는 대상의 grant다.
+- **지운 사용자·대상.** 사용자를 지우면 그 사용자의 grant와 그룹 멤버 자리를, 폴더·VM·네트워크·풀을 지우면 그것에 건 grant를 함께
+  지운다(지운 뒤 곧바로, 놓친 것은 리더의 정리 작업이 1분마다). 그사이 남은 것은 아무에게도 닿지 않는다. 그룹 고치기는 이미
+  들어 있던 지운 사용자를 오류 없이 뺀다.
+- grant는 클러스터 전체에 10,000개(**409** `too_many_grants`), API 토큰은 사용자마다 100개(**409** `too_many_tokens`)까지다.
 - 사용자 목록(`GET /users`)은 `cluster.admin`만 읽는다. 위임자는 사용자 이름 대신 **id**로 준다(웹은 이미 접근하는 주체를 고르기
   목록으로 준다). `perm who`의 전역 역할 사용자 표도 `cluster.admin`에게만 채운다. 남의 유효 권한(`perm effective --user`)은 그
   대상의 `permission.modify`가 있어야 하고, 없으면 사용자가 있든 없든 **403**이다.
-- **노드 자원.** 스토리지 풀 만들기(dir 경로·LVM VG·ZFS 데이터셋·Ceph·NFS)와 브리지 네트워크 만들기(노드의 브리지·NIC·VLAN)는
-  루트 `cluster.admin`이다. 폴더의 `storage.config`·`network.config`로는 VXLAN 네트워크 만들기와 그 폴더의 풀·네트워크 바꾸기·
-  지우기만 한다.
+- **노드 자원.** 스토리지 풀 만들기(dir 경로·LVM VG·ZFS 데이터셋·Ceph·NFS), dir 풀의 `shared` 바꾸기(모든 노드가 같은 파일을
+  본다는 주장 — 마이그레이션·HA가 믿는다)와 브리지 네트워크 만들기(노드의 브리지·NIC·VLAN)는 루트 `cluster.admin`이다. 폴더의
+  `storage.config`·`network.config`로는 VXLAN 네트워크 만들기와 그 폴더의 풀 `backups` 바꾸기, 풀·네트워크 지우기만 한다.
 
 ### API 토큰의 범위
 
@@ -220,9 +227,13 @@ orbivisorctl token list                        # SCOPE 열
 - **파생 객체는 주인을 따른다**: 볼륨은 디스크로 붙은 VM(아니면 풀, CD의 ISO는 주인이 아니다), 스냅샷은 VM, 백업은 VM(지웠으면
   백업에 담긴 VM의 폴더), 작업은 대상이다. 가져오기(VM import)는 루트 객체다(올리기·ESXi 연결은 루트 `vm.create`).
 - **만들기·배포·복원**은 대상 폴더 `vm.create`, 템플릿 `vm.clone`, 풀 `storage.allocate`, NIC마다 `network.assign`(보안 그룹은 읽기)과
-  할당량을 본다. CD-ROM에 넣는 ISO는 그 풀을 읽을 수 있어야 하고(못 보면 **404**), 마이그레이션의 `pool`은 그 풀의
-  `storage.allocate`가 필요하다. 복제·배포는 확인한 폴더에 들고(작업이 기다리는 사이 원본을 옮겨도), 스냅샷 되돌리기는 VM의 지금
-  폴더를 둔다. 원격 대상은 `cluster.admin`, 감사 로그는 루트 `cluster.admin`, 콘솔은 `vm.console`이다.
+  할당량을 본다. CD-ROM에 넣는 ISO는 그 풀을 읽을 수 있어야 하고(못 보면 **404**), 마이그레이션의 `pool`과 새 복제
+  대상(`replication`)의 풀(없으면 디스크마다 같은 이름의 풀)은 그 풀의 `storage.allocate`가 필요하다. 복제·배포는 확인한 폴더에 들고(작업이 기다리는 사이 원본을 옮겨도), 스냅샷 되돌리기는 VM의 지금
+  폴더를 둔다. 원격 클러스터로 백업 보내기(`backup replicate`, 백업 작업의 원격 대상)는 루트 `cluster.admin`이다(받는 쪽은 폴더를
+  버리고 루트에 두므로 그쪽의 모든 읽기 사용자에게 보인다). 감사 로그는 루트 `cluster.admin`, 콘솔은 `vm.console`이다(열린 콘솔은
+  권한을 잃으면 — grant 빼기, 다른 폴더로 옮기기 — 2초 안에 닫힌다).
+- **작업의 요청자.** API 요청이 만든 작업(Task)은 레이블 `requested-by`에 요청한 사용자 id를 갖는다(스케줄러·HA·정리 작업이 만든
+  작업에는 없다).
 - 루트 `cluster.read`가 없는 폴더 사용자는 노드 목록을 못 본다. VM은 자동 배치이고 머신 종류는 서버가 클러스터 아키텍처로 고른다
   (웹은 노드 칸을 숨긴다). CLI `vm create`는 그때 `--machine virt|q35`를 달라고 한다.
 
@@ -278,7 +289,8 @@ orbivisorctl folder usage /teamA
   webauthn?, enroll, expires_at}`가 있다. `POST /api/v1/auth/login/second-factor {"totp"|"recovery"|"webauthn": …}`가 맞으면 같은
   쿠키가 정식 세션이 된다. 대기 세션으로 다른 경로를 부르면 **401** `second_factor_required`, 틀린 코드는 **401**
   `invalid_second_factor`이다. 틀린 횟수는 사용자마다 **모든 노드를 합쳐** Raft에 세고(확인 전에 올린다), 5번 틀리면 대기
-  세션이 끝나 비밀번호부터 다시 하고 30초부터 두 배로(15분까지) 막힌다(**429**, 맞는 코드도). 통과하면 지운다. 노드·IP마다의
+  세션이 끝나 비밀번호부터 다시 하고 30초부터 두 배로(15분까지) 막힌다(**429**, 맞는 코드도). 통과하면 지우고, 막혀 있지 않은 채
+  15분 동안 시도가 없어도 잊는다(드문 오타가 쌓여 막지 않게). 요소를 빼거나 더할 때의 본인 확인 코드도 같은 수로 센다. 노드·IP마다의
   메모리 제한도 그대로 있다.
 - **정책.** 설정의 `two_factor {roles, realms, rp_id}`: 전역 역할이 `roles`에 있거나 영역(`local` 포함)이 `realms`에 있는 사용자에게
   요구한다. OIDC 영역은 넣을 수 없다(**400**, IdP가 MFA를 맡는다). `roles`에 `admin`이 있으면 grant로 관리 권한을 받은 사용자 —
@@ -288,7 +300,8 @@ orbivisorctl folder usage /teamA
   마치면 로그인이 끝난다. 요구받는 사용자는 마지막 요소를 뺄 수 없다(**409** `two_factor_required`).
 - **본인 확인.** TOTP 끄기, 패스키 빼기, 복구 코드 다시 만들기는 코드·복구 코드 또는 로컬 사용자의 비밀번호가 필요하다(외부
   사용자는 코드만). 이미 요소가 있으면 **요소 더하기**(`/auth/2fa/totp/confirm`·`/auth/2fa/webauthn/register/finish`의 `proof
-  {code|password}`)도 같다(없으면 **400** `proof_required`) — 훔친 세션·토큰이 오래 가는 요소를 더하지 못하게. 강제 등록 중인 대기
+  {code|password}`)도 같다(없으면 **400** `proof_required`) — 훔친 세션·토큰이 오래 가는 요소를 더하지 못하게. 인증 앱 더하기는
+  새 앱의 코드를 먼저 보고 맞을 때만 본인 확인을 쓴다(틀린 앱 코드에 복구 코드가 없어지지 않게). 강제 등록 중인 대기
   세션은 그사이 본인이 등록했으면 **409** `already_enrolled`(다시 로그인)이다.
 - **관리자 초기화.** `orbivisorctl user 2fa-reset alice`(`DELETE /api/v1/users/{key}/two-factor`, `cluster.admin`)는 요소를 모두
   지우고 그 사용자의 세션을 끝낸다. API 토큰은 남는다. 자기 자신은 안 된다(**409** `cannot_reset_self`).
@@ -400,7 +413,13 @@ orbivisorctl user list                         # 2FA 열
 - 패스키는 증명(attestation)·MDS를 보지 않고, CLI에서 쓸 수 없고, IP 주소로 연 웹에서 쓸 수 없다. SMS·이메일 코드, OIDC의 `amr`
   요구는 없다. 패스키만 있는 LDAP 사용자는 패스키를 빼거나 복구 코드를 다시 만들 때 복구 코드로 확인한다(다 쓰면 관리자 초기화).
 - TOTP 비밀은 Raft에 평문으로 있다(보호는 0700 데이터 디렉터리, 따로 둔 암호화 키가 없다). 정책을 켜기 전 토큰을 따로 표시하지
-  않는다. 둘째 단계를 틀린 횟수는 사용자마다 세므로 비밀번호를 아는 공격자는 그 사용자의 둘째 단계를 잠시(15분까지) 막을 수 있다.
+  않는다. 둘째 단계를 틀린 횟수는 사용자마다 세므로 비밀번호를 아는 공격자는 그 사용자의 둘째 단계를 되풀이해 잠시(한 번에
+  15분까지) 막을 수 있다. 그때는 비밀번호를 바꾸고 관리자 초기화(`user 2fa-reset`)로 센 것을 지운다.
+- 합류에 반쯤 실패해 `two-factor` 기능을 알리지 않은 노드 기록이 있으면 대기 세션이 받은 노드의 메모리에만 있어, 고정(sticky)이
+  아닌 부하 분산기 뒤에서는 둘째 단계가 다른 노드로 가 **401**이 된다. 정책이 요구하는데 요소가 없는 사용자는 로그인이 **409**
+  `cluster_upgrading`이다. `node list`로 그 노드를 찾아 고치거나 뺀다.
+- 기다리는 작업(복제·배포·복원·가져오기)은 요청할 때 권한을 본다. 그 뒤 grant를 빼도 이미 줄에 선 작업은 그대로 돈다(vSphere와
+  같다, 레이블 `requested-by`로 누가 했는지는 남는다).
 - 폴더 사용자는 볼 수 있는 풀의 ISO만 CD에 넣는다. 루트 ISO 풀을 함께 쓰게 하려면 그 풀에 `viewer` grant를 준다.
 - 볼륨·백업·보안 그룹·노드 폴더, 태그로 주는 권한, 시간 제한 grant, 폴더별 감사 로그 읽기·Prometheus, 실행 중만 세는 할당량·풀별
   디스크 할당량은 없다.

@@ -1129,9 +1129,15 @@ async fn host_pools_and_bridges_need_cluster_admin() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 리뷰 2 N11: `shared`는 관리자만, `backups`는 그 풀의 storage.config
     let (status, body) = w
         .alice
         .patch("/storage-pools/pool-a", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = w
+        .alice
+        .patch("/storage-pools/pool-a", json!({ "backups": true }), None)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = w.alice.delete("/networks/overlay").await;
@@ -1335,4 +1341,400 @@ async fn permission_views_do_not_leak() {
     assert_eq!(w.alice.get("/metrics/cluster").await.0, StatusCode::OK);
     let viewer = w.env.user("carol", "viewer").await;
     assert_eq!(viewer.get("/metrics").await.0, StatusCode::NOT_FOUND);
+}
+
+/// 사용자에게 grant를 준다(관리자).
+async fn grant(admin: &Client, user: &str, role: Value, target: Value, propagate: bool) -> String {
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": user },
+                "role": role,
+                "target": target,
+                "propagate": propagate,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+/// 리뷰 2 N1: 폴더 자체에만 닿는(propagate가 아닌) `inventory.move`로 그 폴더를 자기가 다스리는 폴더 아래로 끌어와
+/// 하위 트리 전체를 넘겨받지 못한다. 옛 부모와 새 부모 안 모두에서 propagate로 받은 `inventory.move`가 있어야 한다.
+#[tokio::test]
+async fn moving_a_folder_needs_move_inside_both_parents() {
+    let w = world().await;
+    let sandbox = folder(&w.admin, "sandbox", "vm", None).await;
+    let (status, role) = w
+        .admin
+        .post(
+            "/access-roles",
+            json!({ "name": "organizer", "privileges": ["inventory.folder", "inventory.move"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let organizer = json!({ "type": "custom", "id": role["id"] });
+    grant(
+        &w.admin,
+        &w.alice_id,
+        organizer,
+        json!({ "type": "folder", "id": w.b }),
+        false,
+    )
+    .await;
+    grant(
+        &w.admin,
+        &w.alice_id,
+        json!({ "type": "builtin", "role": "admin" }),
+        json!({ "type": "folder", "id": sandbox }),
+        true,
+    )
+    .await;
+    // /teamB를 /sandbox 아래로: 폴더 자체의 권한과 새 부모의 권한은 있지만 옛 부모(루트) 안에는 없다.
+    let (status, body) = w
+        .alice
+        .patch(
+            &format!("/folders/{}", w.b),
+            json!({ "parent": sandbox }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("moving a folder needs inventory.move everywhere inside /"),
+        "{body}"
+    );
+    assert_eq!(w.alice.get("/vms/b1").await.0, StatusCode::NOT_FOUND);
+    // 이름 바꾸기(폴더 자체)는 된다.
+    let (status, body) = w
+        .alice
+        .patch(
+            &format!("/folders/{}", w.b),
+            json!({ "name": "teamB2" }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 자기 하위 트리 안의 옮기기는 된다.
+    let x = folder(&w.admin, "x", "vm", Some(&sandbox)).await;
+    let y = folder(&w.admin, "y", "vm", Some(&sandbox)).await;
+    let (status, body) = w
+        .alice
+        .patch(&format!("/folders/{x}"), json!({ "parent": y }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 자기 하위 트리 밖(루트)으로 꺼내기는 루트 안의 권한이 있어야 한다.
+    let (status, body) = w
+        .alice
+        .patch(&format!("/folders/{x}"), json!({ "parent": null }), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // 관리자는 된다.
+    let (status, body) = w
+        .admin
+        .patch(
+            &format!("/folders/{}", w.b),
+            json!({ "parent": sandbox }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 리뷰 2 N2·N3·N11: 복제 대상 풀은 `storage.allocate`, 원격 클러스터로 백업 보내기와 풀의 `shared` 바꾸기는 루트
+/// `cluster.admin`이다.
+#[tokio::test]
+async fn replica_pools_remote_backups_and_shared_pools_are_checked() {
+    let w = world().await;
+    w.seed_derived().await;
+    let (_, nodes) = w.admin.get("/nodes").await;
+    let node = nodes["items"][0]["id"].as_str().unwrap().to_string();
+    let (status, a1) = w.alice.get("/vms/a1").await;
+    assert_eq!(status, StatusCode::OK, "{a1}");
+    let with_replica = |pool: &str| {
+        let mut spec = a1["spec"].clone();
+        spec["replication"] = json!([{ "node": node, "pool": pool }]);
+        json!({ "spec": spec })
+    };
+    // 볼 수 없는 풀: 없는 것과 같은 404(풀 이름 알아내기 없음)
+    let (status, body) = w
+        .alice
+        .put("/vms/a1", with_replica("pool-root"), None)
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["message"], "storage pool \"pool-root\" not found");
+    // 자기 풀이면 권한은 지나가고 복제 검사가 답한다.
+    let (status, body) = w.alice.put("/vms/a1", with_replica("pool-a"), None).await;
+    assert_ne!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_ne!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // 원격으로 보내기: 백업을 볼 수 있어도 관리자만
+    let (status, body) = w
+        .alice
+        .post(
+            "/backups/bk-a1/actions/replicate",
+            json!({ "remote": "dr", "pool": "dr-bk" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = w
+        .admin
+        .post(
+            "/backups/bk-a1/actions/replicate",
+            json!({ "remote": "dr", "pool": "dr-bk" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // 풀의 shared는 관리자, backups는 그 풀의 storage.config
+    let (status, role) = w
+        .admin
+        .post(
+            "/access-roles",
+            json!({ "name": "storage", "privileges": ["storage.config"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    grant(
+        &w.admin,
+        &w.alice_id,
+        json!({ "type": "custom", "id": role["id"] }),
+        json!({ "type": "folder", "id": w.st_a }),
+        true,
+    )
+    .await;
+    let (status, body) = w
+        .alice
+        .patch("/storage-pools/pool-a", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = w
+        .alice
+        .patch("/storage-pools/pool-a", json!({ "backups": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = w
+        .admin
+        .patch("/storage-pools/pool-a", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 리뷰 2 N4·N5: 사용자를 지우면 그 grant와 그룹 멤버 자리가, 폴더·VM을 지우면 그것에 건 grant가 함께 없어진다. 이미
+/// 남은 지운 멤버는 그룹 고치기를 막지 않는다.
+#[tokio::test]
+async fn deleting_users_folders_and_objects_drops_their_grants() {
+    let w = world().await;
+    let (status, bob) = w
+        .admin
+        .post(
+            "/users",
+            json!({ "name": "bob", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{bob}");
+    let bob = bob["id"].as_str().unwrap().to_string();
+    let (status, body) = w
+        .admin
+        .put(
+            "/groups/team-a",
+            json!({ "spec": { "members": [w.alice_id, bob] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let viewer = json!({ "type": "builtin", "role": "viewer" });
+    let on_b = grant(
+        &w.admin,
+        &bob,
+        viewer.clone(),
+        json!({ "type": "folder", "id": w.b }),
+        true,
+    )
+    .await;
+    let empty = folder(&w.admin, "empty", "vm", None).await;
+    let on_empty = grant(
+        &w.admin,
+        &w.alice_id,
+        viewer.clone(),
+        json!({ "type": "folder", "id": empty }),
+        true,
+    )
+    .await;
+    let r1 = w.vm_id("r1").await;
+    let on_r1 = grant(
+        &w.admin,
+        &w.alice_id,
+        viewer.clone(),
+        json!({ "type": "object", "kind": "vm", "id": r1 }),
+        true,
+    )
+    .await;
+    // 이미 남은 고아(옛 상태): 지운 폴더를 가리키는 grant는 정리 작업이 지우고, 색인은 무시한다.
+    let stale: Resource<opl_types::authz::GrantSpec, _> = Resource::new(
+        "stale",
+        serde_json::from_value(json!({
+            "principal": { "type": "user", "id": w.alice_id },
+            "role": viewer,
+            "target": { "type": "folder", "id": Uuid::now_v7() },
+        }))
+        .unwrap(),
+    );
+    w.env.cluster.create(&stale).await.unwrap();
+
+    let (status, body) = w.admin.delete("/users/bob").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, group) = w.admin.get("/groups/team-a").await;
+    assert_eq!(group["spec"]["members"], json!([w.alice_id]), "{group}");
+    assert_eq!(
+        w.admin.get(&format!("/grants/{on_b}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, body) = w.admin.delete(&format!("/folders/{empty}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        w.admin.get(&format!("/grants/{on_empty}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, body) = w.admin.delete("/vms/r1").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(
+        w.admin.get(&format!("/grants/{on_r1}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // 지우기 뒤의 정리가 옛 고아도 함께 지웠다.
+    assert_eq!(
+        w.admin.get(&format!("/grants/{}", stale.id)).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // 정리를 놓친 지운 멤버(옛 상태)가 남아 있어도 GET으로 받은 그대로 되보낼 수 있고, 저장할 때 빠진다.
+    let gone = Uuid::now_v7();
+    let mut stored = w
+        .env
+        .cluster
+        .get_by_name::<opl_types::authz::GroupSpec>("team-a")
+        .unwrap()
+        .unwrap();
+    stored.spec.members.push(gone);
+    w.env
+        .cluster
+        .update_spec(stored.id, None, stored.labels.clone(), &stored.spec)
+        .await
+        .unwrap();
+    let (_, group) = w.admin.get("/groups/team-a").await;
+    let (status, body) = w
+        .admin
+        .put(
+            "/groups/team-a",
+            json!({ "spec": { "members": group["spec"]["members"], "description": "x" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["members"], json!([w.alice_id]), "{body}");
+    // 새로 넣는 없는 사용자는 여전히 400
+    let (status, _) = w
+        .admin
+        .put(
+            "/groups/team-a",
+            json!({ "spec": { "members": [w.alice_id, Uuid::now_v7()] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// 리뷰 2 N6·N7: 사용자마다 토큰 수 상한, Task에 요청한 사용자, 권한을 잃은 콘솔은 닫힌다.
+#[tokio::test]
+async fn token_cap_task_requester_and_console_revocation() {
+    let w = world().await;
+    // 로그인한 클라이언트도 토큰 하나를 쓴다.
+    let (_, mine) = w.alice.get("/tokens").await;
+    let have = mine["items"].as_array().unwrap().len();
+    for i in have..opl_types::authz::MAX_USER_TOKENS {
+        let (status, body) = w
+            .alice
+            .post("/tokens", json!({ "name": format!("t{i}") }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = w.alice.post("/tokens", json!({ "name": "one-more" })).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "too_many_tokens");
+
+    // Task는 요청한 사용자를 레이블로 갖는다.
+    let (status, task) = w
+        .alice
+        .post("/vms/a2/clone", json!({ "name": "a2-copy" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["labels"]["requested-by"], w.alice_id, "{task}");
+
+    // 콘솔: 열린 뒤 그룹 grant가 빠지면 닫힌다.
+    let tmp = tempfile::Builder::new()
+        .prefix("opl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    w.env.hv.set_console_dir(tmp.path());
+    w.admin.act("a1", "start").await;
+    let id = w.vm_id("a1").await;
+    let listener = tokio::net::UnixListener::bind(tmp.path().join(format!("{id}.vnc"))).unwrap();
+    tokio::spawn(async move {
+        let (conn, _) = listener.accept().await.unwrap();
+        // 닫힐 때까지 붙잡고 있는다.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(conn);
+    });
+    let mut ws = connect(&w.alice, "/vms/a1/console").await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .is_err(),
+        "the console stays open while allowed"
+    );
+    let (_, grants) = w.admin.get("/grants").await;
+    for g in grants["items"].as_array().unwrap() {
+        if g["spec"]["target"]["id"] == w.a {
+            let (status, body) = w
+                .admin
+                .delete(&format!("/grants/{}", g["id"].as_str().unwrap()))
+                .await;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        }
+    }
+    let closed = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(Ok(msg)) = ws.next().await {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the console closes after the grant is removed"
+    );
+}
+
+/// 리뷰 2(웹 I1): 노드 목록을 읽지 못하는 폴더 사용자도 `whoami`로 요청을 받은 노드를 안다.
+#[tokio::test]
+async fn whoami_names_the_serving_node() {
+    let w = world().await;
+    assert_eq!(w.alice.get("/nodes").await.0, StatusCode::FORBIDDEN);
+    let (status, me) = w.alice.get("/auth/whoami").await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["name"], "alice");
+    assert_eq!(me["role"], "none");
+    let node: Resource<opl_types::node::NodeSpec, opl_types::node::NodeStatus> =
+        w.env.cluster.get(w.env.node).unwrap().unwrap();
+    assert_eq!(
+        me["node"],
+        json!({ "id": node.id, "name": node.name }),
+        "{me}"
+    );
 }

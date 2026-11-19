@@ -738,7 +738,30 @@ async fn the_evaluator_follows_commits() {
             targets: vec![GrantTarget::Folder { id: a.id }],
         }),
     });
+    // 리뷰 2 N6: 토큰 만들기는 세대를 올리지 않는다(다른 주체의 색인을 버리지 않는다). 새 토큰은 저장소에서 읽는다.
+    let before = authz.generation();
     cluster.create(&token).await.unwrap();
+    let unscoped = named(ApiTokenSpec {
+        user: alice.id,
+        secret_hash: String::new(),
+        scope: None,
+    });
+    cluster.create(&unscoped).await.unwrap();
+    cluster
+        .delete::<ApiTokenSpec>(unscoped.id, None)
+        .await
+        .unwrap();
+    // 뒤따르는 폴더 쓰기 하나만 세대를 올린다(토큰 이벤트는 그 앞에 와 있다).
+    let c = named(FolderSpec {
+        name: "c".into(),
+        ..a.spec.clone()
+    });
+    cluster.create(&c).await.unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while authz.generation() == before && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(authz.generation(), before + 1);
     let scoped = authz
         .index(Subject {
             user: alice.id,

@@ -1046,6 +1046,10 @@ async fn record_size(ctx: &Ctx, volume: &Volume, pool: &StoragePool) {
     if let Err(e) = set_volume_size(ctx, volume.id, info.virtual_bytes).await {
         tracing::warn!(volume = %volume.id, error = %e, "cannot record volume size");
     }
+    // 되돌리기로 디스크가 작아졌을 수 있으니 남은 늘리기 허가를 지운다(리뷰 2 N8).
+    if let Err(e) = super::clear_disk_bytes(ctx, volume.id).await {
+        tracing::warn!(volume = %volume.id, error = %e, "cannot clear the recorded disk size");
+    }
 }
 
 /// 스냅샷을 지운다: 디스크의 태그(실행 중이면 하이퍼바이저로, 그 뒤 떼어 낸 디스크는 스토리지로),
