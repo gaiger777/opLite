@@ -7505,6 +7505,12 @@ export interface components {
             cpu?: boolean;
             /** @description virtio-mem 메모리 핫플러그(QEMU에 `virtio-mem-pci`가 있음) */
             memory?: boolean;
+            /**
+             * @description virtio-mem 장치가 꽂을 때 메모리를 미리 잡는다(`virtio-mem-pci`의 `prealloc`, QEMU 7.1+, 계획 64 리뷰 2). 없으면
+             *     hugepages VM은 메모리 핫플러그 없이 켠다(꽂은 hugepage가 모자라면 게스트가 SIGBUS로 죽는다). 거짓이면 쓰지
+             *     않는다(옛 노드와 같은 JSON).
+             */
+            memory_prealloc?: boolean;
         };
         /** @description 노드의 네트워크 인터페이스 하나(`ip -d addr`와 sysfs) */
         NodeInterface: {

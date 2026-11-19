@@ -114,11 +114,14 @@ pub fn kvm_available() -> bool {
 
 /// 노드의 핫플러그 능력. vCPU는 Linux(`linux`)의 x86_64만(aarch64 `virt`는 QEMU 11.1까지 CPU 핫플러그가 없고,
 /// macOS x86_64의 HVF도 아니다), 메모리는 `qemu-system-* -device help` 출력에 `virtio-mem-pci`가 있을 때다(macOS
-/// Homebrew QEMU에는 없다).
-pub fn hotplug_caps(arch: Arch, linux: bool, device_help: &str) -> NodeHotplug {
+/// Homebrew QEMU에는 없다). 장치가 꽂을 때 미리 잡기(`prealloc`, QEMU 7.1+)는 `-device virtio-mem-pci,help`
+/// 출력(`mem_help`)에 `prealloc=`이 있을 때다(계획 64 리뷰 2 — 없으면 hugepages VM을 메모리 핫플러그 없이 켠다).
+pub fn hotplug_caps(arch: Arch, linux: bool, device_help: &str, mem_help: &str) -> NodeHotplug {
+    let memory = device_help.contains("\"virtio-mem-pci\"");
     NodeHotplug {
         cpu: linux && arch == Arch::X86_64,
-        memory: device_help.contains("\"virtio-mem-pci\""),
+        memory,
+        memory_prealloc: memory && mem_help.contains("prealloc="),
     }
 }
 
@@ -136,6 +139,18 @@ mod tests {
         assert!(arm.uefi_vars_template.ends_with("AAVMF_VARS.fd"));
     }
 
+    /// 리뷰 2 N4: `-device virtio-mem-pci,help`에 `prealloc=<bool>`이 있는 QEMU(7.1+, svc01 8.2.2)만 미리 잡는다.
+    #[test]
+    fn virtio_mem_prealloc_is_read_from_the_device_help() {
+        let with = "name \"virtio-mem-pci\", bus PCI\n";
+        let q82 = "virtio-mem-pci options:\n  block-size=<size>\n  prealloc=<bool>        - (default: false)\n  requested-size=<size>\n";
+        let q62 = "virtio-mem-pci options:\n  block-size=<size>\n  requested-size=<size>\n";
+        assert!(hotplug_caps(Arch::X86_64, true, with, q82).memory_prealloc);
+        let old = hotplug_caps(Arch::X86_64, true, with, q62);
+        assert!(old.memory && !old.memory_prealloc);
+        assert!(!hotplug_caps(Arch::X86_64, true, "", q82).memory_prealloc);
+    }
+
     /// `-device help`의 한 줄 모양(QEMU 8.2·11.1): `name "virtio-mem-pci", bus PCI`
     #[test]
     fn hotplug_caps_read_the_arch_and_the_device_list() {
@@ -143,36 +158,40 @@ mod tests {
         let without =
             "Misc devices:\nname \"virtio-balloon-pci\", bus PCI\nname \"virtio-mem-pci-base\"\n";
         assert_eq!(
-            hotplug_caps(Arch::X86_64, true, with),
+            hotplug_caps(Arch::X86_64, true, with, ""),
             NodeHotplug {
                 cpu: true,
-                memory: true
+                memory: true,
+                memory_prealloc: false
             }
         );
         assert_eq!(
-            hotplug_caps(Arch::X86_64, true, without),
+            hotplug_caps(Arch::X86_64, true, without, ""),
             NodeHotplug {
                 cpu: true,
-                memory: false
+                memory: false,
+                memory_prealloc: false
             }
         );
         assert_eq!(
-            hotplug_caps(Arch::Aarch64, true, with),
+            hotplug_caps(Arch::Aarch64, true, with, ""),
             NodeHotplug {
                 cpu: false,
-                memory: true
+                memory: true,
+                memory_prealloc: false
             }
         );
         assert_eq!(
-            hotplug_caps(Arch::Aarch64, true, ""),
+            hotplug_caps(Arch::Aarch64, true, "", ""),
             NodeHotplug::default()
         );
         // macOS x86_64(HVF)는 vCPU 핫플러그를 하지 않는다.
         assert_eq!(
-            hotplug_caps(Arch::X86_64, false, with),
+            hotplug_caps(Arch::X86_64, false, with, ""),
             NodeHotplug {
                 cpu: false,
-                memory: true
+                memory: true,
+                memory_prealloc: false
             }
         );
     }

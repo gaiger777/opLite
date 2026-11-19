@@ -30,7 +30,9 @@ pub enum Shape<'a> {
     /// 스펙에서 새로 정한다(켜기·HA 복구). `cpu`는 켤 때의 CPU(`hw.cpu` — 노드가 핫플러그를 못 하면 상한이 없다)다.
     Spec(&'a VmSpec, &'a CpuSpec),
     /// 기록한 모양 그대로 호스트 쪽만 고른다(마이그레이션 받기·메모리 스냅샷·다시 켜기). None은 vNUMA 없이 켠 기록이다.
-    Fixed(Option<&'a ResolvedNuma>, &'a CpuSpec),
+    /// 셋째는 게스트 노드마다 꽂은 virtio-mem 메모리(MiB, [`numa::plugged_per_node`] — 받는 쪽이 지금 메모리만큼 잡는다,
+    /// 리뷰 2 N2)이고 비면 없다.
+    Fixed(Option<&'a ResolvedNuma>, &'a CpuSpec, &'a [u32]),
 }
 
 /// 고른 것: 기록할 모양·배치와 드라이버에 줄 고정
@@ -41,7 +43,7 @@ pub struct Claim {
     pub pinning: Option<RuntimePinning>,
 }
 
-/// 예약 하나(켜는 중이거나 받는 중인 VM의 배치)
+/// 예약 하나(켜는 중이거나 받는 중인 VM의 배치). `numa`는 셈하는 모양(꽂은 메모리 포함)이다.
 #[derive(Debug, Clone)]
 struct Held {
     numa: ResolvedNuma,
@@ -92,13 +94,16 @@ impl HostAllocator {
                 })?;
                 (Lay::Spec(layout), cpu)
             }
-            Shape::Fixed(numa, cpu) => (Lay::Fixed(numa), cpu),
+            Shape::Fixed(numa, cpu, plugged) => (
+                Lay::Fixed(numa, numa.map(|n| numa::with_extra(n, plugged))),
+                cpu,
+            ),
         };
         if !layout.binds() {
             let numa = match &layout {
-                Lay::Spec(None) | Lay::Fixed(None) => None,
+                Lay::Spec(None) | Lay::Fixed(None, _) => None,
                 Lay::Spec(Some(l)) => Some(numa::fit(l, None).map_err(cannot)?.numa),
-                Lay::Fixed(Some(n)) => Some((*n).clone()),
+                Lay::Fixed(Some(n), _) => Some((*n).clone()),
             };
             let pinning = topology.and_then(|t| {
                 numa::pinning(numa.as_ref(), None, cpu, t, &HostSets::new(resources, t))
@@ -126,9 +131,13 @@ impl HostAllocator {
             vms.iter()
                 .filter(|v| v.id != vm && !held.contains_key(&v.id))
                 .filter_map(|v| {
+                    // 꽂은 virtio-mem 메모리까지 센다(리뷰 2 N2).
                     let hw = v.status.hardware.as_ref()?;
-                    Some((hw.numa.as_ref()?, hw.host_placement.as_ref()?))
-                }),
+                    Some((numa::now(hw)?, hw.host_placement.as_ref()?))
+                })
+                .collect::<Vec<_>>()
+                .iter()
+                .map(|(n, p)| (n, *p)),
             self.node,
         );
         let starting = numa::usage(held.values().map(|h| (&h.numa, &h.placement)), self.node);
@@ -154,7 +163,7 @@ impl HostAllocator {
                 held.insert(
                     vm,
                     Held {
-                        numa: fit.numa.clone(),
+                        numa: layout.counted(&fit.numa),
                         placement: placement.clone(),
                     },
                 );
@@ -204,7 +213,7 @@ impl HostAllocator {
         );
         for vm in ids {
             if let Some(hw) = hv.saved_hardware(vm)
-                && let (Some(numa), Some(placement)) = (hw.numa, hw.host_placement)
+                && let (Some(numa), Some(placement)) = (numa::now(&hw), hw.host_placement)
             {
                 self.hold(vm, numa, placement);
             }
@@ -258,26 +267,39 @@ impl HostAllocator {
     }
 }
 
-/// 게스트 모양: 스펙에서 뽑은 것이나 기록
+/// 게스트 모양: 스펙에서 뽑은 것이나 기록(켤 때 기록, 꽂은 메모리를 더한 지금 모양)
 enum Lay<'a> {
     Spec(Option<numa::Layout>),
-    Fixed(Option<&'a ResolvedNuma>),
+    Fixed(Option<&'a ResolvedNuma>, Option<ResolvedNuma>),
 }
 
 impl Lay<'_> {
     fn binds(&self) -> bool {
         match self {
             Lay::Spec(l) => l.as_ref().is_some_and(numa::Layout::binds),
-            Lay::Fixed(n) => n.is_some_and(|n| n.memory.is_some()),
+            Lay::Fixed(n, _) => n.is_some_and(|n| n.memory.is_some()),
         }
     }
 
+    /// 지금 모양으로 맞추고 기록할 모양은 켤 때 기록 그대로 둔다(명령줄의 `ram-node<i>`는 켤 때 나눔이다).
     fn fit(&self, cpu: &CpuSpec, view: &HostView<'_>) -> Result<numa::Fit, NumaRefusal> {
         match self {
             Lay::Spec(Some(l)) => numa::fit(l, Some(view)),
-            Lay::Fixed(Some(n)) => numa::fit_fixed(n, cpu, Some(view)),
+            Lay::Fixed(Some(boot), Some(now)) => {
+                let mut fit = numa::fit_fixed(now, cpu, Some(view))?;
+                fit.numa = (*boot).clone();
+                Ok(fit)
+            }
             // 묶지 않는 모양은 여기 오지 않는다.
             _ => Err(NumaRefusal::NoTopology),
+        }
+    }
+
+    /// 예약에 셀 모양: 받는 VM은 꽂은 메모리까지
+    fn counted(&self, fit: &ResolvedNuma) -> ResolvedNuma {
+        match self {
+            Lay::Fixed(_, Some(now)) => now.clone(),
+            _ => fit.clone(),
         }
     }
 }
@@ -316,8 +338,9 @@ pub fn sys_free_pages(sys: &Path, node: u16, kind: PageKind) -> Option<u64> {
 /// 검사 루프(§7·§10): 이 노드에서 도는 VM마다 스레드 고정을 기록과 지금 세 집합으로 셈해 드라이버로 맞춘다. 기록은
 /// 실행 디렉터리의 것(`hardware.json` — 지금 도는 QEMU의 것)이다: 다시 켠 직후에는 Raft 기록이 아직 앞 QEMU의 배치라
 /// 그것으로 걸면 다른 VM에 준 pCPU에 고정한다(리뷰 1). 실행 디렉터리 기록이 없으면(켜는 중) 건너뛴다. 걸 것이 없는
-/// VM(노드 설정이 없음, 설정을 지움)은 공유 집합(= 온라인 CPU 전체)으로 둔다 — opld가 예약 CPU에 묶여 있던 동안 켠
-/// QEMU가 그 친화를 물려받았을 수 있다. 바꾼 VM 수를 돌려준다(경고 로그를 남긴다).
+/// VM은 opld가 고정했던 것(`pinning.json`이 있음 — 설정을 지움)만 한 번 풀어(opld가 뜰 때의 친화, 모르면 공유 집합)
+/// 고정 기록을 지우고, 고정한 적 없는 VM은 건드리지 않는다 — 관리자가 `taskset`·`CPUAffinity=`로 좁힌 VM을 넓히지
+/// 않는다(리뷰 2 N3). 바꾼 VM 수를 돌려준다(경고 로그를 남긴다).
 pub async fn repin(
     cluster: &Cluster,
     hv: &dyn Hypervisor,
@@ -340,18 +363,32 @@ pub async fn repin(
             continue;
         };
         let placement = hw.host_placement.as_ref().filter(|p| p.node == node);
-        let want = numa::pinning(hw.numa.as_ref(), placement, &hw.cpu, topology, &sets)
-            .unwrap_or_else(|| RuntimePinning {
-                emulator: sets.shared.clone(),
-                vcpus: Vec::new(),
-                slots_per_socket: numa::slots_per_socket(&hw.cpu),
-                // 스코프를 걸었던 VM만 넓힌다.
-                scope: hv
-                    .saved_pinning(vm.id)
-                    .and_then(|old| old.scope)
-                    .map(|_| sets.shared.clone()),
-            });
-        match hv.repin(vm.id, &want).await {
+        let (want, release) =
+            match numa::pinning(hw.numa.as_ref(), placement, &hw.cpu, topology, &sets) {
+                Some(want) => (want, false),
+                None => {
+                    let Some(old) = hv.saved_pinning(vm.id) else {
+                        continue;
+                    };
+                    let wide = opl_driver::affinity::start_cpus()
+                        .map(|c| c.intersection(&topology.cpus))
+                        .filter(|c| !c.is_empty())
+                        .unwrap_or_else(|| sets.shared.clone());
+                    let want = RuntimePinning {
+                        emulator: wide.clone(),
+                        vcpus: Vec::new(),
+                        slots_per_socket: numa::slots_per_socket(&hw.cpu),
+                        // 스코프를 걸었던 VM만 넓힌다.
+                        scope: old.scope.map(|_| wide),
+                    };
+                    (want, true)
+                }
+            };
+        let result = hv.repin(vm.id, &want).await;
+        if release && result.is_ok() {
+            hv.forget_pinning(vm.id);
+        }
+        match result {
             Ok(0) => {}
             Ok(n) => {
                 tracing::warn!(vm = %vm.id, changed = n, emulator = %want.emulator, "re-pinned the threads of the VM (they drifted or the host CPU sets changed)");

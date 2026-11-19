@@ -5,7 +5,6 @@
 //! 모양 그대로 호스트 쪽만 고른다. 같은 함수를 스케줄러(어림)·노드 할당기(정확)·상태 머신(합계, [`demand`])이 쓴다.
 //! 이 기능을 쓰지 않는 VM은 [`layout`]이 `None`이고 스펙·기록 JSON이 지금과 바이트까지 같다.
 
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
@@ -1072,8 +1071,14 @@ pub fn validate(spec: &VmSpec) -> Result<(), NumaError> {
                     max: cpu.max(),
                 });
             }
+            // 목록은 켤 때 나눔이다(리뷰 2): 메모리 핫플러그 VM은 실행 중 늘린 메모리(합보다 큰 것)를 목록을 고치지 않고
+            // 다음 전원 껐다 켜기 때 노드마다 더한다([`boot_split`]). 그 밖은 합이 메모리와 같아야 한다.
             let mem: u64 = list.iter().map(|n| u64::from(n.memory_mib)).sum();
-            if mem != u64::from(spec.memory_mib) {
+            let memory = u64::from(spec.memory_mib);
+            let grown = spec.max_memory_mib.is_some()
+                && mem < memory
+                && (memory - mem).is_multiple_of(u64::from(SMALL_UNIT_MIB));
+            if mem != memory && !grown {
                 return Err(NumaError::ListMemorySum {
                     sum: mem,
                     memory: spec.memory_mib,
@@ -1261,15 +1266,20 @@ pub fn layout(spec: &VmSpec, topology: Option<&NodeTopology>) -> Result<Option<L
 
 /// 나눔을 게스트 노드로: 소켓은 앞부터 차례로, 메모리는 직접 준 것이나 단위 `unit`의 고른 나눔
 fn guest_nodes(split: &[SplitNode], total: u32, unit: u32) -> Option<Vec<GuestNode>> {
-    let even = if split.iter().all(|n| n.memory_mib.is_some()) {
-        vec![0; split.len()]
-    } else {
-        even_split(total, split.len(), unit)?
+    let given: Option<Vec<u32>> = split.iter().map(|n| n.memory_mib).collect();
+    let sizes = match given {
+        // 목록(켤 때 나눔)보다 큰 메모리는 노드마다 더한다([`boot_split`], 리뷰 2).
+        Some(given) => {
+            if given.iter().sum::<u32>() > total {
+                return None;
+            }
+            boot_split(&given, total)
+        }
+        None => even_split(total, split.len(), unit)?,
     };
     let mut socket = 0u16;
     let mut out = Vec::with_capacity(split.len());
-    for (n, even) in split.iter().zip(even) {
-        let memory_mib = n.memory_mib.unwrap_or(even);
+    for (n, memory_mib) in split.iter().zip(sizes) {
         if memory_mib == 0 || !memory_mib.is_multiple_of(unit) {
             return None;
         }
@@ -1627,7 +1637,7 @@ struct Cell {
     shared: bool,
     pages: bool,
     memory: bool,
-    /// 맞춘 뒤 남는 전용 CPU 수, 페이지 MiB, 묶지 않은 보통 메모리 MiB(많이 남는 쪽부터 — 고르게 펴기)
+    /// 맞춘 뒤 남는 전용 CPU 수, 페이지 MiB, 묶지 않은 보통 메모리 MiB(VM이 쓰는 것만, 적게 남는 쪽부터 — 채우기)
     left: (u64, u64, u64),
 }
 
@@ -1728,23 +1738,30 @@ fn fit_one(
             // 묶는 보통 메모리는 그 호스트 노드에서 아직 묶이지 않은 몫에 들어야 한다(같은 노드에 묶인 VM들의 합이 노드
             // 메모리를 넘으면 prealloc·커널 OOM이 그 노드의 VM을 죽인다).
             let free_mem = host.free.memory(hn.id);
-            let mut left_mem = free_mem;
+            let left_mem;
+            // `preferred`는 넘쳐도 커널이 다른 노드에서 주므로 거절하지 않고 순서에만 쓴다(리뷰 2 N7).
             cell.memory = match page {
-                Some(_) => true,
+                Some(_) => {
+                    left_mem = 0;
+                    true
+                }
                 None => {
                     left_mem = free_mem.saturating_sub(u64::from(g.memory_mib));
                     free_mem >= u64::from(g.memory_mib)
+                        || layout.memory == Some(MemoryPolicy::Preferred)
                 }
             };
-            cell.left = (
-                (free_ded.len() - used.min(free_ded.len())) as u64,
-                left_pages,
-                left_mem,
-            );
+            let left_cpus = if dedicated {
+                (free_ded.len() - used.min(free_ded.len())) as u64
+            } else {
+                0
+            };
+            cell.left = (left_cpus, left_pages, left_mem);
         }
     }
-    // 순서: 가까운 노드들, 그다음 맞춘 뒤 많이 남는 쪽(전용 CPU → 페이지 → 보통 메모리)으로 펴고, 마지막은 번호. 가장 바쁜
-    // 노드부터 채우면 묶인 메모리가 한 호스트 노드에 몰린다(리뷰 1).
+    // 순서: 가까운 노드들, 그다음 VM이 쓰는 자원(전용 CPU → 페이지 → 묶는 보통 메모리, 쓰지 않는 것은 0)이 맞춘 뒤 적게
+    // 남는 쪽(채우기, best-fit), 마지막은 번호. 큰 VM이 들어갈 빈 호스트 노드를 남긴다. 묶인 메모리는 맞춤의 엄한
+    // 조건이라 채워도 넘치지 않는다(리뷰 2 N5 — 리뷰 1의 펴기는 작은 VM이 노드마다 조금씩 써서 큰 VM이 들지 못했다).
     let key = |a: &[usize]| -> Key {
         let mut far = 0;
         for (x, &p) in a.iter().enumerate() {
@@ -1760,9 +1777,9 @@ fn fit_one(
         }
         (
             far,
-            Reverse(cpus),
-            Reverse(pages),
-            Reverse(memory),
+            cpus,
+            pages,
+            memory,
             a.iter().map(|&h| topo.nodes[h].id).collect(),
         )
     };
@@ -1852,7 +1869,7 @@ fn fit_one(
     })
 }
 
-type Key = (u8, Reverse<u64>, Reverse<u64>, Reverse<u64>, Vec<u16>);
+type Key = (u8, u64, u64, u64, Vec<u16>);
 
 /// 게스트 노드 `0..k`를 서로 다른 호스트 노드 `0..hosts`에 놓는다(`ok(i, h)`). 순열이 적으면 모두 보고 `key`가 가장
 /// 작은 것을, 많으면 게스트 노드마다 욕심쟁이로 고른다.
@@ -2017,7 +2034,7 @@ pub struct Demand {
     pub pages: BTreeMap<PageKind, u64>,
     /// `any`의 hugepages 메모리(MiB, 두 크기 합에 센다)
     pub any_mib: u64,
-    /// hugepages 없이 호스트 노드에 묶는 보통 메모리(MiB, 전용·`numa.memory` VM)
+    /// hugepages 없이 호스트 노드에 `strict`로 묶는 보통 메모리(MiB, 전용·`numa.memory: strict` VM — `preferred`는 세지 않는다)
     pub bound_mib: u64,
 }
 
@@ -2053,7 +2070,8 @@ pub fn demand(spec: &VmSpec, topology: Option<&NodeTopology>) -> Demand {
     }
     let mib = u64::from(spec.memory_mib);
     match page_size(spec) {
-        None if memory_policy(spec).is_some() => d.bound_mib = mib,
+        // `preferred`는 넘쳐도 다른 노드에서 받으므로 장부의 상한에 세지 않는다(리뷰 2 N7).
+        None if memory_policy(spec) == Some(MemoryPolicy::Strict) => d.bound_mib = mib,
         None => {}
         Some(PageSize::Size2M) => {
             d.pages.insert(PageKind::Size2M, mib);
@@ -2347,12 +2365,16 @@ pub fn pending_change(spec: &VmSpec, hw: &RunningHardware) -> Option<PendingChan
         (None, Some(_)) | (Some(_), None) => false,
         (Some(NumaNodes::Auto), Some(_)) => true,
         (Some(NumaNodes::Count(n)), Some(r)) => usize::from(n) == r.nodes.len(),
+        // 목록의 메모리는 켤 때 나눔이다: 실행 중 늘린 메모리(virtio-mem)는 견주지 않는다(리뷰 2).
         (Some(NumaNodes::List(l)), Some(r)) => {
+            let mem: Vec<u32> = l.iter().map(|n| n.memory_mib).collect();
             l.len() == r.nodes.len()
-                && l.iter().zip(&r.nodes).all(|(w, g)| {
-                    u32::from(w.cpus) == g.sockets.len() as u32 * per
-                        && w.memory_mib == g.memory_mib
-                })
+                && l.iter()
+                    .zip(&r.nodes)
+                    .zip(boot_split(&mem, hw.memory_mib))
+                    .all(|((w, g), m)| {
+                        u32::from(w.cpus) == g.sockets.len() as u32 * per && m == g.memory_mib
+                    })
         }
     };
     if !nodes_ok {
@@ -2445,6 +2467,74 @@ pub fn split_blocks(total_mib: u32, n: usize) -> Vec<u32> {
     let mut out = vec![each; n];
     out[0] = total_mib - each * (n32 - 1);
     out
+}
+
+/// 노드 목록의 메모리(켤 때 나눔, `list`)를 켤 때 메모리 `total`에 맞춘다: 목록 합보다 크면(메모리 핫플러그 VM을
+/// 실행 중 늘림) 남는 것을 virtio-mem처럼 [`split_blocks`]로 노드마다 더한다(리뷰 2 — 늘린 만큼이 꽂혀 있던 노드에 그대로
+/// 켤 때 메모리가 된다). 합보다 작으면 목록 그대로다(검증이 막는다).
+pub fn boot_split(list: &[u32], total: u32) -> Vec<u32> {
+    let sum: u32 = list.iter().sum();
+    let extra = split_blocks(total.saturating_sub(sum), list.len());
+    list.iter().zip(extra).map(|(a, b)| a + b).collect()
+}
+
+/// 도는 VM의 게스트 노드마다 꽂은 virtio-mem 메모리(MiB): 드라이버·명령줄과 같은 나눔이다(자리 = (상한 − 켤 때 메모리)의
+/// [`split_blocks`], 꽂은 것 = [`split_plugged`]). 꽂은 것이 없으면 0들이다.
+pub fn plugged_per_node(hw: &RunningHardware, nodes: usize) -> Vec<u32> {
+    let Some(l) = hw.layout.as_ref().filter(|l| l.plugged_mib > 0) else {
+        return vec![0; nodes];
+    };
+    let sizes = split_blocks(l.max_memory_mib.saturating_sub(hw.memory_mib), nodes);
+    split_plugged(l.plugged_mib, &sizes)
+}
+
+/// 기록 `numa`의 게스트 노드마다 `extra`(MiB)를 더한 모양(셈·맞춤에만 쓴다 — 명령줄의 켤 때 나눔은 기록 그대로다)
+pub fn with_extra(numa: &ResolvedNuma, extra: &[u32]) -> ResolvedNuma {
+    let mut out = numa.clone();
+    for (g, e) in out.nodes.iter_mut().zip(extra) {
+        g.memory_mib += e;
+    }
+    out
+}
+
+/// 도는 VM이 지금 쓰는 모양: 켤 때 기록(`hw.numa`)에 꽂은 virtio-mem 메모리를 게스트 노드마다 더한 것. 꽂은 메모리도
+/// 같은 호스트 노드에 묶이므로(`vmem<i>`의 `host-nodes`) 장부·할당기·마이그레이션 대상이 이것으로 센다(리뷰 2 N2).
+pub fn now(hw: &RunningHardware) -> Option<ResolvedNuma> {
+    let numa = hw.numa.as_ref()?;
+    Some(with_extra(numa, &plugged_per_node(hw, numa.nodes.len())))
+}
+
+/// 도는 묶는 VM의 메모리를 실행 중에 늘릴 때 호스트 노드마다 드는지(리뷰 2 N2): `grown`은 늘린 뒤 모양([`with_extra`]),
+/// `free`는 이 VM을 뺀 빈 몫이다. hugepages는 페이지가, `strict` 보통 메모리는 묶이지 않은 몫이 있어야 한다(`preferred`는
+/// 넘쳐도 다른 노드에서 받는다).
+pub fn grown_fits(
+    grown: &ResolvedNuma,
+    placement: &HostPlacement,
+    free: &HostFree,
+) -> Result<(), NumaRefusal> {
+    let need = usage([(grown, placement)], placement.node);
+    for (&(h, kind), &n) in &need.pages {
+        if free.pages(h, kind) < n {
+            return Err(NumaRefusal::Pages {
+                kind,
+                free: vec![(h, free.pages(h, kind))],
+                need: n,
+                guests: 1,
+            });
+        }
+    }
+    if grown.memory == Some(MemoryPolicy::Strict) {
+        for (&h, &n) in &need.memory {
+            if free.memory(h) < n {
+                return Err(NumaRefusal::Memory {
+                    free: vec![(h, free.memory(h))],
+                    need: n,
+                    guests: 1,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 꽂을 크기 `plugged_mib`를 노드마다 자리(`sizes`)를 넘지 않게 나눈다: [`split_blocks`]로 나눈 뒤 자리를 넘는 것은 앞
@@ -3008,10 +3098,10 @@ mod tests {
         let spec = vm(json!({ "cpu": { "sockets": 1, "cores": 4, "policy": "dedicated" } }));
         let f = fit_on(&spec, &t, Some(&res), &HostUsage::default()).unwrap();
         let p = f.placement.unwrap();
-        // 예약 CPU가 노드 0에 있어 전용 CPU가 더 남는 노드 1로 편다. prefer: 코어 8(8·24), 코어 9(9·25) — 형제를 먼저
-        // 채운다.
-        assert_eq!(p.vcpus, vec![8, 24, 9, 25]);
-        assert_eq!(p.host_nodes, vec![1]);
+        // 예약 CPU가 노드 0에 있어 전용 CPU가 적게 남는 노드 0을 채운다(리뷰 2 best-fit). prefer: 코어 2(2·18), 코어
+        // 3(3·19) — 형제를 먼저 채운다.
+        assert_eq!(p.vcpus, vec![2, 18, 3, 19]);
+        assert_eq!(p.host_nodes, vec![0]);
         assert!(p.emulator.is_empty() && p.siblings.is_empty());
         assert_eq!(f.numa.memory, Some(MemoryPolicy::Strict));
         assert_eq!(f.numa.thread_policy, Some(ThreadPolicy::Prefer));
@@ -3030,30 +3120,30 @@ mod tests {
                 json!({ "cpu": { "sockets": 1, "cores": 4, "policy": "dedicated", "thread_policy": thread } }),
             )
         };
-        // isolate: 코어마다 하나, 형제는 비워 둔다(전용 CPU가 더 남는 노드 1).
+        // isolate: 코어마다 하나, 형제는 비워 둔다(전용 CPU가 적게 남는 노드 0).
         let p = fit_on(&spec("isolate"), &t, Some(&res), &none)
             .unwrap()
             .placement
             .unwrap();
-        assert_eq!(p.vcpus, vec![8, 9, 10, 11]);
-        assert_eq!(p.siblings, set("24-27"));
+        assert_eq!(p.vcpus, vec![2, 3, 4, 5]);
+        assert_eq!(p.siblings, set("18-21"));
         // require: 형제 짝
         let p = fit_on(&spec("require"), &t, Some(&res), &none)
             .unwrap()
             .placement
             .unwrap();
-        assert_eq!(p.vcpus, vec![8, 24, 9, 25]);
+        assert_eq!(p.vcpus, vec![2, 18, 3, 19]);
         // isolate는 형제 하나가 잡힌 코어를 쓰지 않는다.
         let used = HostUsage {
-            dedicated: set("24-28"),
+            dedicated: set("18-20"),
             ..HostUsage::default()
         };
         let p = fit_on(&spec("isolate"), &t, Some(&res), &used)
             .unwrap()
             .placement
             .unwrap();
-        // 노드 1에는 통째로 빈 코어가 13·14·15 셋뿐이라 노드 0으로
-        assert_eq!((p.vcpus, p.host_nodes), (vec![2, 3, 4, 5], vec![0]));
+        // 노드 0에는 통째로 빈 코어가 5·6·7 셋뿐이라 노드 1로
+        assert_eq!((p.vcpus, p.host_nodes), (vec![8, 9, 10, 11], vec![1]));
         // SMT 없는 호스트
         let q = quad();
         let qres = resources("0", "1-15");
@@ -3070,8 +3160,8 @@ mod tests {
                 .placement
                 .unwrap()
                 .vcpus,
-            // 예약 CPU 0이 있는 노드 0보다 빈 노드 1로(펴기)
-            vec![4, 5]
+            // 예약 CPU 0이 있어 적게 남는 노드 0을 채운다(best-fit)
+            vec![1, 2]
         );
     }
 
@@ -3288,7 +3378,7 @@ mod tests {
     }
 
     #[test]
-    fn fit_orders_by_distance_then_spreading_then_id() {
+    fn fit_orders_by_distance_then_packing_then_id() {
         let q = quad();
         let res = resources("", "0-15");
         let spec = vm(
@@ -3298,14 +3388,14 @@ mod tests {
         let f = fit_on(&spec, &q, Some(&res), &HostUsage::default()).unwrap();
         assert_eq!(f.placement.as_ref().unwrap().host_nodes, vec![0, 1]);
         assert_eq!(f.numa.distances, vec![vec![10, 12], vec![12, 10]]);
-        // 노드 1이 둘 잡혀 있으면: 거리가 같은 짝 가운데 많이 남는 2·3으로 편다(리뷰 1 — 가장 바쁜 노드부터 채우지 않음).
+        // 노드 1이 둘 잡혀 있으면: 거리가 같은 짝 가운데 적게 남는 0·1을 채운다(리뷰 2 best-fit — 2·3을 큰 VM에 남김).
         let used = HostUsage {
             dedicated: set("4-5"),
             ..HostUsage::default()
         };
         let f = fit_on(&spec, &q, Some(&res), &used).unwrap();
-        assert_eq!(f.placement.as_ref().unwrap().host_nodes, vec![2, 3]);
-        assert_eq!(f.placement.unwrap().vcpus, vec![8, 9, 12, 13]);
+        assert_eq!(f.placement.as_ref().unwrap().host_nodes, vec![0, 1]);
+        assert_eq!(f.placement.unwrap().vcpus, vec![0, 1, 6, 7]);
         // 노드 1이 셋 잡혀 있으면 0·1은 안 되고 2·3(가까움)이 0·2(멂)보다 앞선다.
         let used = HostUsage {
             dedicated: set("4-6"),
@@ -3313,20 +3403,21 @@ mod tests {
         };
         let f = fit_on(&spec, &q, Some(&res), &used).unwrap();
         assert_eq!(f.placement.unwrap().host_nodes, vec![2, 3]);
-        // 펴기: 노드 하나짜리 VM은 많이 남는 노드 가운데 번호가 낮은 0으로(1은 둘만 남음)
+        // 채우기: 노드 하나짜리 VM은 들어가는 노드 가운데 적게 남는 0으로(0은 둘만 남음)
         let one = vm(json!({ "cpu": { "sockets": 1, "cores": 2, "policy": "dedicated" } }));
         let used = HostUsage {
             dedicated: set("0-1"),
             ..HostUsage::default()
         };
         let f = fit_on(&one, &q, Some(&res), &used).unwrap();
-        assert_eq!(f.placement.unwrap().vcpus, vec![4, 5]);
+        assert_eq!(f.placement.unwrap().vcpus, vec![2, 3]);
     }
 
-    /// 리뷰 1 C1: 묶는 보통 메모리는 호스트 노드마다 센다. 전용 2 vCPU·24 GiB VM을 차례로 놓으면 두 노드에 번갈아
-    /// 놓이고(펴기), 노드마다 묶이지 않은 메모리(60416 − 24576 × 2)가 모자라면 전용 CPU가 남아도 거절한다.
+    /// 리뷰 1 C1: 묶는 보통 메모리는 호스트 노드마다 센다. 전용 2 vCPU·24 GiB VM을 차례로 놓으면 노드 0을 채운 뒤
+    /// (리뷰 2 best-fit) 노드 1로 가고, 노드마다 묶이지 않은 메모리(60416 − 24576 × 2)가 모자라면 전용 CPU가 남아도
+    /// 거절한다.
     #[test]
-    fn bound_memory_is_counted_per_host_node_and_spread() {
+    fn bound_memory_is_counted_per_host_node_and_packed() {
         let t = xeon();
         let res = resources("", "0-15");
         let spec = vm(
@@ -3340,7 +3431,7 @@ mod tests {
             nodes.push(p.host_nodes[0]);
             used.add(&usage([(&f.numa, &p)], NODE));
         }
-        assert_eq!(nodes, [0, 1, 0, 1]);
+        assert_eq!(nodes, [0, 0, 1, 1]);
         assert_eq!(used.memory, BTreeMap::from([(0, 49152), (1, 49152)]));
         let err = fit_on(&spec, &t, Some(&res), &used).unwrap_err();
         assert_eq!(
@@ -3506,14 +3597,19 @@ mod tests {
         assert_eq!(d.pages, BTreeMap::from([(PageKind::Size1G, 8192)]));
         let d = demand(&vm(json!({ "hugepages": "any" })), Some(&t));
         assert_eq!((d.pcpus, d.any_mib, d.bound_mib), (0, 8192, 0));
-        // 묶는 보통 메모리: 전용, `numa.memory`(hugepages 없이)
+        // 묶는 보통 메모리: 전용, `numa.memory: strict`(hugepages 없이). `preferred`는 세지 않는다(리뷰 2 N7).
         let d = demand(&vm(json!({ "cpu": { "policy": "dedicated" } })), Some(&t));
         assert_eq!(d.bound_mib, 8192);
+        let d = demand(
+            &vm(json!({ "numa": { "nodes": 2, "memory": "strict" } })),
+            Some(&t),
+        );
+        assert_eq!((d.pcpus, d.bound_mib), (0, 8192));
         let d = demand(
             &vm(json!({ "numa": { "nodes": 2, "memory": "preferred" } })),
             Some(&t),
         );
-        assert_eq!((d.pcpus, d.bound_mib), (0, 8192));
+        assert!(d.is_zero());
         assert_eq!(
             demand(&vm(json!({ "numa": { "nodes": 2 } })), Some(&t)).bound_mib,
             0
@@ -3895,5 +3991,145 @@ mod tests {
         let empty: HostResources = serde_json::from_value(json!({})).unwrap();
         assert!(empty.is_empty());
         assert_eq!(empty.describe(), "none");
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // 리뷰 2
+    // ---------------------------------------------------------------------------------------------------------
+
+    /// 리뷰 2 N5: 호스트 노드 둘 × 1G 8개. 2 GiB 1G VM 넷은 노드 0을 채우고(best-fit), 게스트 노드 하나짜리 8 GiB VM이
+    /// 노드 1에 들어간다(펴기는 4 + 4로 나눠 어디에도 들지 못했다). 공유 hugepages VM은 쓰지 않는 전용 CPU로 줄 서지 않는다.
+    #[test]
+    fn small_hugepage_vms_pack_so_a_whole_node_vm_still_fits() {
+        let mut t = xeon();
+        for n in &mut t.nodes {
+            n.hugepages = vec![HugepagePool {
+                size_kib: 1048576,
+                total: 8,
+            }];
+        }
+        // 노드 1에 전용 CPU가 더 남아도(노드 0에 예약 CPU) 페이지만 본다.
+        let res = resources("0-3", "4-15");
+        let small = vm(
+            json!({ "cpu": { "sockets": 1, "cores": 1 }, "hugepages": "1G", "memory_mib": 2048 }),
+        );
+        let mut used = HostUsage::default();
+        for _ in 0..4 {
+            let f = fit_on(&small, &t, Some(&res), &used).unwrap();
+            let p = f.placement.unwrap();
+            assert_eq!(p.host_nodes, [0]);
+            used.add(&usage([(&f.numa, &p)], NODE));
+        }
+        let big = vm(
+            json!({ "cpu": { "sockets": 1, "cores": 2 }, "hugepages": "1G", "memory_mib": 8192 }),
+        );
+        let f = fit_on(&big, &t, Some(&res), &used).unwrap();
+        assert_eq!(f.placement.unwrap().host_nodes, [1]);
+        assert_eq!(f.numa.nodes.len(), 1);
+    }
+
+    /// 리뷰 2 N7: `preferred`는 묶이지 않은 몫이 모자라도 맞추고(순서에만 씀), `strict`는 거절한다.
+    #[test]
+    fn preferred_memory_is_soft() {
+        let t = xeon();
+        let busy = HostUsage {
+            memory: BTreeMap::from([(0, 60000), (1, 60000)]),
+            ..HostUsage::default()
+        };
+        let spec = |policy: &str| {
+            vm(
+                json!({ "cpu": { "sockets": 1, "cores": 2 }, "numa": { "nodes": 1, "memory": policy }, "memory_mib": 4096 }),
+            )
+        };
+        assert!(fit_on(&spec("preferred"), &t, None, &busy).is_ok());
+        assert!(matches!(
+            fit_on(&spec("strict"), &t, None, &busy),
+            Err(NumaRefusal::Memory { .. })
+        ));
+    }
+
+    /// 리뷰 2(웹 중요 2): 노드 목록의 메모리는 켤 때 나눔이다. 메모리 핫플러그 VM은 목록 합보다 큰 메모리를 받고(다음
+    /// 전원 껐다 켜기에 노드마다 더함), 실행 중 늘린 메모리는 보류 `numa`를 만들지 않는다.
+    #[test]
+    fn the_node_list_is_the_boot_split_and_live_growth_is_not_pending() {
+        let list = json!({ "nodes": [{ "cpus": 4, "memory_mib": 2048 }, { "cpus": 4, "memory_mib": 2048 }] });
+        let spec = vm(json!({ "numa": list.clone(), "memory_mib": 4096, "max_memory_mib": 8192 }));
+        assert_eq!(validate(&spec), Ok(()));
+        let mut hw = hw_for(&spec);
+        hw.memory_mib = 4096;
+        assert_eq!(pending_change(&spec, &hw), None);
+        // 실행 중 6144로 늘림: 목록 그대로, 검증 통과, 보류 없음
+        let grown = vm(json!({ "numa": list.clone(), "memory_mib": 6144, "max_memory_mib": 8192 }));
+        assert_eq!(validate(&grown), Ok(()));
+        assert_eq!(pending_change(&grown, &hw), None);
+        // 다음 켜기는 늘린 것을 노드마다 더한다(virtio-mem과 같은 나눔).
+        let l = layout(&grown, None).unwrap().unwrap();
+        let f = fit(&l, None).unwrap();
+        let mem: Vec<u32> = f.numa.nodes.iter().map(|g| g.memory_mib).collect();
+        assert_eq!(mem, [3072, 3072]);
+        assert_eq!(boot_split(&[1024, 3072], 6144), [2048, 4096]);
+        // 그 기록(켤 때 6144)에 대해서도 보류가 없다.
+        let mut booted = hw.clone();
+        booted.memory_mib = 6144;
+        booted.numa.as_mut().unwrap().nodes[0].memory_mib = 3072;
+        booted.numa.as_mut().unwrap().nodes[1].memory_mib = 3072;
+        assert_eq!(pending_change(&grown, &booted), None);
+        // 목록을 바꾸면 보류다.
+        let changed = vm(json!({
+            "numa": { "nodes": [{ "cpus": 4, "memory_mib": 1024 }, { "cpus": 4, "memory_mib": 3072 }] },
+            "memory_mib": 4096, "max_memory_mib": 8192
+        }));
+        assert!(pending_change(&changed, &hw).is_some());
+        // 상한이 없으면 합이 메모리와 같아야 하고, 남는 것은 2 MiB 단위다.
+        let fixed = vm(json!({ "numa": list.clone(), "memory_mib": 6144 }));
+        assert!(matches!(
+            validate(&fixed),
+            Err(NumaError::ListMemorySum { .. })
+        ));
+        let odd = vm(json!({ "numa": list, "memory_mib": 4097, "max_memory_mib": 8192 }));
+        assert!(validate(&odd).is_err());
+    }
+
+    /// 리뷰 2 N2: 꽂은 virtio-mem 메모리도 게스트 노드의 호스트 노드에 센다(드라이버와 같은 나눔). 늘린 뒤 호스트 노드에
+    /// 묶이지 않은 몫이 모자라면 거절한다.
+    #[test]
+    fn plugged_memory_counts_on_its_host_node() {
+        let t = xeon();
+        let res = resources("", "0-15");
+        let spec = vm(json!({
+            "cpu": { "sockets": 2, "cores": 1, "policy": "dedicated" },
+            "numa": { "nodes": 2 }, "memory_mib": 4096, "max_memory_mib": 65536
+        }));
+        let f = fit_on(&spec, &t, Some(&res), &HostUsage::default()).unwrap();
+        let p = f.placement.unwrap();
+        let mut hw = hw_for(&spec);
+        hw.memory_mib = 4096;
+        hw.numa = Some(f.numa.clone());
+        hw.layout = Some(crate::runtime::HotplugLayout {
+            vcpus: 2,
+            max_memory_mib: 65536,
+            plugged_mib: 8192,
+            ports: 8,
+            boot_disks: 0,
+            boot_nics: 0,
+            disk_ports: Vec::new(),
+            nic_ports: Vec::new(),
+        });
+        assert_eq!(plugged_per_node(&hw, 2), [4096, 4096]);
+        let now = now(&hw).unwrap();
+        assert_eq!(now.nodes[0].memory_mib, 2048 + 4096);
+        let used = usage([(&now, &p)], NODE);
+        assert_eq!(used.memory.values().sum::<u64>(), 4096 + 8192);
+        // 다른 VM이 노드마다 56000 MiB를 묶었다: 4096 + 4096을 더 꽂으면 두 노드 모두 넘친다(60416 − 56000 < 6144).
+        let others = HostUsage {
+            memory: BTreeMap::from([(0, 56000), (1, 56000)]),
+            ..HostUsage::default()
+        };
+        let free = HostFree::new(&t, &HostSets::new(Some(&res), &t), &others);
+        assert!(matches!(
+            grown_fits(&now, &p, &free),
+            Err(NumaRefusal::Memory { .. })
+        ));
+        assert_eq!(grown_fits(&f.numa, &p, &free), Ok(()));
     }
 }

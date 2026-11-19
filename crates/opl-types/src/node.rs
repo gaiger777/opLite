@@ -181,6 +181,12 @@ pub struct NodeHotplug {
     /// virtio-mem 메모리 핫플러그(QEMU에 `virtio-mem-pci`가 있음)
     #[serde(default)]
     pub memory: bool,
+    /// virtio-mem 장치가 꽂을 때 메모리를 미리 잡는다(`virtio-mem-pci`의 `prealloc`, QEMU 7.1+, 계획 64 리뷰 2). 없으면
+    /// hugepages VM은 메모리 핫플러그 없이 켠다(꽂은 hugepage가 모자라면 게스트가 SIGBUS로 죽는다). 거짓이면 쓰지
+    /// 않는다(옛 노드와 같은 JSON).
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub memory_prealloc: bool,
 }
 
 /// 이웃 노드의 전원 읽기 결과(설계 §8.1). `error`가 있으면 모든 방법이 실패한 것이다(`fence_unreachable`).
@@ -950,6 +956,7 @@ mod tests {
             hotplug: Some(NodeHotplug {
                 cpu: true,
                 memory: false,
+                memory_prealloc: false,
             }),
             ..Default::default()
         };
@@ -965,7 +972,8 @@ mod tests {
             partial.hotplug,
             Some(NodeHotplug {
                 cpu: false,
-                memory: true
+                memory: true,
+                memory_prealloc: false
             })
         );
     }

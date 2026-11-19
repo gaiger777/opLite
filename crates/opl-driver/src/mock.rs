@@ -2209,6 +2209,7 @@ impl Hypervisor for MockHypervisor {
         caps.unwrap_or(NodeHotplug {
             cpu: true,
             memory: true,
+            memory_prealloc: true,
         })
     }
 
@@ -2435,6 +2436,10 @@ impl Hypervisor for MockHypervisor {
 
     fn saved_pinning(&self, id: Uuid) -> Option<RuntimePinning> {
         self.state.lock().unwrap().pinned.get(&id).cloned()
+    }
+
+    fn forget_pinning(&self, id: Uuid) {
+        self.state.lock().unwrap().pinned.remove(&id);
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -3849,7 +3854,8 @@ mod tests {
             hv.hotplug_caps().await,
             NodeHotplug {
                 cpu: true,
-                memory: true
+                memory: true,
+                memory_prealloc: true
             }
         );
         hv.set_hotplug_caps(NodeHotplug::default());

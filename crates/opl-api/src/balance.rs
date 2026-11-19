@@ -1536,6 +1536,7 @@ mod tests {
         let all = NodeHotplug {
             cpu: true,
             memory: true,
+            memory_prealloc: true,
         };
         let mut hw = RunningHardware::at_start(v.id, &v.name, &v.spec, all, true).0;
         let inv = |v: &Vm| Inventory {
@@ -1575,6 +1576,7 @@ mod tests {
         let all = NodeHotplug {
             cpu: true,
             memory: true,
+            memory_prealloc: true,
         };
         let mut hw = RunningHardware::at_start(v.id, &v.name, &v.spec, all, true).0;
         let inv = |v: &Vm| Inventory {
@@ -1631,6 +1633,7 @@ mod tests {
         let all = NodeHotplug {
             cpu: true,
             memory: true,
+            memory_prealloc: true,
         };
         v.status.hardware = Some(RunningHardware::at_start(v.id, &v.name, &v.spec, all, true).0);
         let inv = Inventory {
@@ -1645,6 +1648,7 @@ mod tests {
         b.status.hotplug = Some(NodeHotplug {
             cpu: true,
             memory: false,
+            memory_prealloc: false,
         });
         assert_eq!(ok(&b), Err("cannot run the VM's running hardware"));
         b.status.hotplug = Some(all);

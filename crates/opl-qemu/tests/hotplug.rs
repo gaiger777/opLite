@@ -317,11 +317,18 @@ async fn virtio_mem_takes_a_requested_size() {
         .args(["-device", "help"])
         .output()
         .unwrap();
+    let mem_help = std::process::Command::new(&host.qemu_binary)
+        .args(["-device", "virtio-mem-pci,help"])
+        .output()
+        .unwrap();
     let caps = hotplug_caps(
         host.arch,
         cfg!(target_os = "linux"),
         &String::from_utf8_lossy(&help.stdout),
+        &String::from_utf8_lossy(&mem_help.stdout),
     );
+    // 계획 64 리뷰 2 N4: QEMU 7.1+(러너의 8.2)는 virtio-mem이 꽂을 때 미리 잡는다.
+    assert_eq!(caps.memory_prealloc, caps.memory, "{caps:?}");
     if !caps.memory {
         assert!(
             !(cfg!(target_os = "linux") && host.arch == Arch::X86_64),

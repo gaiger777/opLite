@@ -1474,10 +1474,17 @@ impl Worker {
     ) -> Result<Claim, CpuRefusal> {
         let alloc = &self.config.host_alloc;
         if restore {
-            let shape = Shape::Fixed(hardware.numa.as_ref(), &hardware.cpu);
+            // 메모리 스냅샷은 꽂은 메모리 없이 담는다(`matches_boot`).
+            let shape = Shape::Fixed(hardware.numa.as_ref(), &hardware.cpu, &[]);
             return alloc.claim(&self.cluster, self.id, shape);
         }
-        match alloc.claim(&self.cluster, self.id, Shape::Spec(&vm.spec, &hardware.cpu)) {
+        // 이 노드가 메모리 핫플러그 없이 켜면(`hardware_at_start`가 상한을 두지 않음) 상한 = 메모리인 모양으로 고른다 —
+        // `any`가 2M에 묶이지 않는다(리뷰 2 N9, 스케줄러·장부의 `hotplug::start_spec`과 같다).
+        let mut spec = vm.spec.clone();
+        if spec.max_memory_mib.is_some() && hardware.max_memory_mib() <= hardware.memory_mib {
+            spec.max_memory_mib = Some(spec.memory_mib);
+        }
+        match alloc.claim(&self.cluster, self.id, Shape::Spec(&spec, &hardware.cpu)) {
             Err(CpuRefusal::Cannot(reason)) => {
                 let previous = self.restart_numa.as_ref().filter(|n| {
                     n.nodes.iter().map(|g| g.sockets.len()).sum::<usize>()
@@ -1491,7 +1498,7 @@ impl Worker {
                     .claim(
                         &self.cluster,
                         self.id,
-                        Shape::Fixed(Some(previous), &hardware.cpu),
+                        Shape::Fixed(Some(previous), &hardware.cpu, &[]),
                     )
                     .map_err(|_| CpuRefusal::Cannot(reason.clone()))?;
                 tracing::warn!(vm = %self.id, reason = %reason, numa = %opl_types::numa::describe(Some(previous)), "restarting the VM with the NUMA layout it ran with; the new layout stays pending");

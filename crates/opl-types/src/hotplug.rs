@@ -69,6 +69,33 @@ pub enum DeviceError {
 const NO_LAYOUT: &str = "the VM was started without hotplug support";
 const NO_CPU_HOTPLUG: &str = "this node cannot hot-plug vCPUs";
 const NO_VIRTIO_MEM: &str = "this node has no virtio-mem";
+const NO_PREALLOC: &str =
+    "this node's QEMU cannot preallocate hugepages for virtio-mem (needs QEMU 7.1)";
+
+/// 이 노드(능력 `caps`)가 VM을 메모리 핫플러그(virtio-mem)로 켜는지: 상한이 있고 노드에 virtio-mem이 있으며,
+/// hugepages VM이면 장치가 꽂을 때 미리 잡기(`prealloc`, QEMU 7.1+)를 한다(계획 64 리뷰 2 — 미리 잡지 않으면 모자란
+/// hugepage에 게스트가 SIGBUS로 죽는다).
+pub fn memory_hotplug(spec: &VmSpec, caps: NodeHotplug) -> bool {
+    spec.max_memory_mib.is_some() && memory_caps(spec, caps)
+}
+
+/// 노드가 이 VM의 메모리를 실행 중에 꽂을 수 있는지(상한은 보지 않음)
+fn memory_caps(spec: &VmSpec, caps: NodeHotplug) -> bool {
+    caps.memory && (spec.hugepages.is_none() || caps.memory_prealloc)
+}
+
+/// 이 노드에서 켤 때의 스펙: 메모리 핫플러그 없이 켜면([`memory_hotplug`]가 거짓) 상한이 메모리다(늘릴 자리가 없다 —
+/// 없애지 않는 것은 노드 목록의 검증이 상한 있는 VM의 늘린 메모리를 받기 때문). NUMA 맞춤(`any`의 페이지 크기)·장부가
+/// 노드에서 실제로 켜질 모양을 보게 한다(리뷰 2 N9).
+pub fn start_spec(spec: &VmSpec, caps: NodeHotplug) -> std::borrow::Cow<'_, VmSpec> {
+    if spec.max_memory_mib.is_none() || memory_hotplug(spec, caps) {
+        std::borrow::Cow::Borrowed(spec)
+    } else {
+        let mut s = spec.clone();
+        s.max_memory_mib = Some(s.memory_mib);
+        std::borrow::Cow::Owned(s)
+    }
+}
 
 impl RunningHardware {
     /// 핫플러그 배치 없이 켠 VM의 기록(계획 54 전에 켰거나 클러스터가 업그레이드 중일 때).
@@ -118,7 +145,7 @@ impl RunningHardware {
         let layout = HotplugLayout {
             vcpus: u16::try_from(spec.cpu.vcpus()).unwrap_or(u16::MAX),
             max_memory_mib: match spec.max_memory_mib {
-                Some(max) if caps.memory => max,
+                Some(max) if memory_hotplug(spec, caps) => max,
                 _ => spec.memory_mib,
             },
             plugged_mib: 0,
@@ -371,6 +398,15 @@ pub fn can_receive(hw: Option<&RunningHardware>, node: &Node) -> Result<(), Stri
     }
     if !caps.memory && layout.max_memory_mib > hw.memory_mib {
         return Err(format!("node {:?} has no virtio-mem", node.name));
+    }
+    if !caps.memory_prealloc
+        && layout.max_memory_mib > hw.memory_mib
+        && hw.numa.as_ref().is_some_and(|n| n.page.is_some())
+    {
+        return Err(format!(
+            "node {:?} cannot preallocate hugepages for virtio-mem (needs QEMU 7.1)",
+            node.name
+        ));
     }
     Ok(())
 }
@@ -725,7 +761,8 @@ fn memory_changes(
     let max = hw.max_memory_mib();
     let virtio = max > hw.memory_mib;
     let wanted_max = spec.max_memory_mib.unwrap_or(want);
-    let max_changed = caps.memory && wanted_max != max && (spec.max_memory_mib.is_some() || virtio);
+    let mem_caps = memory_caps(spec, caps);
+    let max_changed = mem_caps && wanted_max != max && (spec.max_memory_mib.is_some() || virtio);
     if max_changed {
         pending.push(change(
             "max_memory_mib",
@@ -743,6 +780,8 @@ fn memory_changes(
     } else if !virtio {
         if !caps.memory && spec.max_memory_mib.is_some() {
             Some((PendingReason::Unsupported, Some(NO_VIRTIO_MEM.to_string())))
+        } else if !mem_caps && spec.max_memory_mib.is_some() {
+            Some((PendingReason::Unsupported, Some(NO_PREALLOC.to_string())))
         } else {
             Some((
                 PendingReason::Limit,
@@ -814,6 +853,7 @@ mod tests {
     const ALL: NodeHotplug = NodeHotplug {
         cpu: true,
         memory: true,
+        memory_prealloc: true,
     };
 
     fn disk(volume: &str) -> DiskSpec {
@@ -1029,6 +1069,7 @@ mod tests {
         let no_cpu = NodeHotplug {
             cpu: false,
             memory: true,
+            memory_prealloc: true,
         };
         let mut s = spec();
         let hw = started(&s, no_cpu);
@@ -1093,6 +1134,7 @@ mod tests {
         let no_mem = NodeHotplug {
             cpu: true,
             memory: false,
+            memory_prealloc: false,
         };
         let mut s = spec();
         let hw = started(&s, no_mem);
@@ -1632,6 +1674,7 @@ mod tests {
             Some(NodeHotplug {
                 cpu: false,
                 memory: true,
+                memory_prealloc: true,
             }),
         );
         assert_eq!(
@@ -1643,11 +1686,36 @@ mod tests {
             Some(NodeHotplug {
                 cpu: true,
                 memory: false,
+                memory_prealloc: false,
             }),
         );
         assert_eq!(
             can_receive(Some(&hw), &no_mem),
             Err("node \"n2\" has no virtio-mem".into())
+        );
+        // 리뷰 2 N4: 꽂은 hugepages를 미리 잡지 못하는 노드는 hugepages + virtio-mem VM을 받지 않는다.
+        let no_prealloc = node(
+            true,
+            Some(NodeHotplug {
+                cpu: true,
+                memory: true,
+                memory_prealloc: false,
+            }),
+        );
+        assert_eq!(can_receive(Some(&hw), &no_prealloc), Ok(()));
+        let mut huge = hw.clone();
+        huge.numa = Some(crate::numa::ResolvedNuma {
+            nodes: Vec::new(),
+            distances: Vec::new(),
+            page: Some(crate::numa::PageKind::Size2M),
+            policy: Default::default(),
+            thread_policy: None,
+            emulator: None,
+            memory: None,
+        });
+        assert_eq!(
+            can_receive(Some(&huge), &no_prealloc),
+            Err("node \"n2\" cannot preallocate hugepages for virtio-mem (needs QEMU 7.1)".into())
         );
         // 상한 없이 켠 VM은 능력 없는 노드도 받는다.
         let mut plain = spec();
@@ -2218,5 +2286,34 @@ mod tests {
         let bare = spec();
         hw.guest_agent = true;
         assert!(!devices_match(&bare, &hw));
+    }
+
+    /// 리뷰 2 N4·N9: 장치가 미리 잡지 못하는 노드(QEMU < 7.1)에서는 hugepages VM을 메모리 핫플러그 없이 켜고(상한 =
+    /// 메모리라 `any`도 1G를 쓸 수 있다), 메모리 바꾸기는 그 까닭으로 보류다. hugepages 없는 VM은 그대로 핫플러그한다.
+    #[test]
+    fn hugepage_vms_skip_memory_hotplug_without_virtio_mem_prealloc() {
+        let old = NodeHotplug {
+            cpu: true,
+            memory: true,
+            memory_prealloc: false,
+        };
+        let mut s = spec();
+        assert!(memory_hotplug(&s, old));
+        assert!(matches!(start_spec(&s, old), std::borrow::Cow::Borrowed(_)));
+        s.hugepages = Some(crate::numa::PageSize::Any);
+        assert!(!memory_hotplug(&s, old));
+        assert!(memory_hotplug(&s, ALL));
+        let eff = start_spec(&s, old);
+        assert_eq!(eff.max_memory_mib, Some(s.memory_mib));
+        assert_eq!(start_spec(&s, ALL).max_memory_mib, Some(16384));
+        let hw = started(&s, old);
+        assert_eq!(hw.max_memory_mib(), 4096);
+        s.memory_mib = 8192;
+        // (기록에 NUMA 모양이 없어 보류 `numa`도 있다 — 여기서는 메모리만 본다)
+        let pending = only_pending(plan(VM, "web", &s, &hw, old).unwrap());
+        let memory = pending.iter().find(|p| p.field == "memory_mib").unwrap();
+        assert_eq!(memory.reason, PendingReason::Unsupported);
+        assert_eq!(memory.detail.as_deref(), Some(NO_PREALLOC));
+        assert!(!pending.iter().any(|p| p.field == "max_memory_mib"));
     }
 }

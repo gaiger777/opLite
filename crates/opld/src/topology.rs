@@ -310,8 +310,12 @@ pub fn live(sys: &Path, proc: &Path, reserved: &CpuSet) -> Result<TopologyLive, 
         });
     }
     let reserved = reserved.intersection(&online);
+    // 예약이 없으면 뜰 때의 친화(관리자가 좁힌 그대로, 리뷰 2 N3)
     let want = if reserved.is_empty() {
-        online.clone()
+        opl_driver::affinity::start_cpus()
+            .map(|c| c.intersection(&online))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| online.clone())
     } else {
         reserved
     };
@@ -681,7 +685,8 @@ impl TopologyWatch {
         self.last.insert(topology)
     }
 
-    /// 예약 CPU가 있으면 opld의 친화를 그것으로, 없어졌으면 온라인 CPU 전체로 되돌린다(바뀔 때만).
+    /// 예약 CPU가 있으면 opld의 친화를 그것으로, 없어졌으면 뜰 때의 친화(관리자가 좁힌 그대로, 모르면 온라인 CPU 전체)로
+    /// 되돌린다(바뀔 때만, 리뷰 2 N3). 좁혔는지를 드라이버에 알린다(고정 없는 QEMU가 예약 CPU를 물려받지 않게).
     fn pin(&mut self, resources: Option<&HostResources>, online: &CpuSet) {
         let reserved = resources
             .map(|r| r.reserved_cpus.intersection(online))
@@ -690,7 +695,7 @@ impl TopologyWatch {
         let want = if !reserved_empty {
             reserved
         } else if self.pinned.is_some() {
-            online.clone()
+            opl_driver::affinity::start_cpus().unwrap_or_else(|| online.clone())
         } else {
             return;
         };
@@ -700,8 +705,9 @@ impl TopologyWatch {
         match pin_self(&want) {
             Ok(()) => {
                 self.pin_error = None;
-                // 온라인 전체로 되돌렸으면 건 것이 없다.
+                // 뜰 때의 친화로 되돌렸으면 건 것이 없다.
                 self.pinned = (!reserved_empty).then_some(want);
+                opl_driver::affinity::set_narrowed(!reserved_empty);
             }
             Err(e) => {
                 tracing::warn!(error = %e, "cannot pin orbivisord to the reserved CPUs");

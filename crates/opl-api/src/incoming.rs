@@ -368,10 +368,20 @@ impl IncomingMigrations {
     /// 받는 QEMU의 배치와 고정(계획 64 §11): 게스트 모양·페이지는 원본의 기록 그대로이고 이 노드가 호스트 노드·pCPU를
     /// 새로 고른다(할당기가 예약한다). 맞지 않으면 받지 않는다.
     fn place(&self, vm: &Vm, spec: &mut opl_types::runtime::VmRuntimeSpec) -> Result<(), String> {
-        let numa = vm.status.hardware.as_ref().and_then(|hw| hw.numa.as_ref());
+        let hw = vm.status.hardware.as_ref();
+        let numa = hw.and_then(|hw| hw.numa.as_ref());
+        // 꽂은 virtio-mem 메모리까지 잡는다(리뷰 2 N2): 받는 QEMU는 같은 `requested-size`로 켜고 RAM을 받는다.
+        let plugged = match (hw, numa) {
+            (Some(hw), Some(n)) => opl_types::numa::plugged_per_node(hw, n.nodes.len()),
+            _ => Vec::new(),
+        };
         let claim = self
             .host_alloc
-            .claim(&self.cluster, vm.id, Shape::Fixed(numa, &spec.cpu))
+            .claim(
+                &self.cluster,
+                vm.id,
+                Shape::Fixed(numa, &spec.cpu, &plugged),
+            )
             .map_err(|e| match e {
                 CpuRefusal::Waiting(m) | CpuRefusal::Cannot(m) => {
                     format!("cannot place the VM on this node: {m}")

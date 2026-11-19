@@ -266,6 +266,80 @@ async fn dedicated_vms_need_the_privilege_and_count_in_the_quota() {
     assert_eq!(u["usage"]["dedicated_vcpus"], 2, "{u}");
 }
 
+/// 리뷰 2 N6: 전용 CPU·hugepages VM을 다른 폴더로 옮기려면 그 폴더에 `vm.dedicated`가 있어야 한다(복제·배포와 같다).
+/// 두 폴더의 `inventory.move`만 있는 사용자는 전용 VM을 옮기지 못하고, 공유 VM은 옮긴다.
+#[tokio::test]
+async fn moving_a_dedicated_vm_needs_the_privilege_in_the_new_folder() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut folders = Vec::new();
+    for name in ["a", "b"] {
+        let (status, f) = admin
+            .post("/folders", json!({ "name": name, "kind": "vm" }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{f}");
+        folders.push(f["id"].clone());
+    }
+    for (name, policy) in [("db", "dedicated"), ("web", "shared")] {
+        let mut req = vm_request(name);
+        req["spec"]["cpu"]["policy"] = json!(policy);
+        req["spec"]["folder"] = folders[0].clone();
+        let (status, body) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (_, role) = admin
+        .post(
+            "/access-roles",
+            json!({ "name": "mover", "privileges": ["inventory.move"] }),
+        )
+        .await;
+    let (status, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "mv", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    for f in &folders {
+        let (status, body) = admin
+            .post(
+                "/grants",
+                json!({
+                    "principal": { "type": "user", "id": user["id"] },
+                    "role": { "type": "custom", "id": role["id"] },
+                    "target": { "type": "folder", "id": f },
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let mover = env.login("mv", "password-1").await;
+    let (status, body) = mover
+        .post(
+            &format!("/folders/{}/members", folders[1].as_str().unwrap()),
+            json!({ "items": [{ "kind": "vm", "key": "db" }, { "kind": "vm", "key": "web" }] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["ok"], false, "{body}");
+    assert_eq!(
+        items[0]["error"]["message"],
+        "dedicated CPUs and hugepages need the vm.dedicated privilege",
+        "{body}"
+    );
+    assert_eq!(items[1]["ok"], true, "{body}");
+    // 관리자(어디서나 vm.dedicated)는 옮긴다.
+    let (status, body) = admin
+        .post(
+            &format!("/folders/{}/members", folders[1].as_str().unwrap()),
+            json!({ "items": [{ "kind": "vm", "key": "db" }] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"][0]["ok"], true, "{body}");
+}
+
 /// CPU 0-7(호스트 노드 하나)에 전용 `dedicated`인 aarch64 노드(다른 노드처럼 저장소에만 있다 — VM은 켜지지 않는다)
 async fn add_numa_node(env: &Env, name: &str, dedicated: &str) -> Uuid {
     let topology: NodeTopology = serde_json::from_value(json!({

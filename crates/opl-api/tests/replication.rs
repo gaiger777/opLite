@@ -362,6 +362,7 @@ async fn setup_full(schedule: &str, a_hotplug: bool, ha: bool) -> Setup {
             r.status.hotplug = Some(NodeHotplug {
                 cpu: true,
                 memory: true,
+                memory_prealloc: true,
             });
         }
         a.cluster.create(&r).await.unwrap();

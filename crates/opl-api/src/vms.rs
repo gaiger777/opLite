@@ -2066,6 +2066,37 @@ fn check_hotplug_memory(
                 ),
             ));
         }
+        // 묶는 VM의 꽂은 메모리는 같은 호스트 노드에 묶인다(`vmem<i>`의 `host-nodes`): 호스트 노드마다 들어야 한다 —
+        // 노드 전체로는 남아도 한 호스트 노드에 넘치게 묶으면 커널이 그 노드의 VM을 OOM으로 죽인다(리뷰 2 N2).
+        if want > now
+            && let (Some(numa), Some(place), Some(topology)) = (
+                hw.numa.as_ref(),
+                hw.host_placement.as_ref(),
+                node.status.topology.as_ref(),
+            )
+            && numa.memory.is_some()
+            && place.node == node.id
+        {
+            let mut grown = hw.clone();
+            if let Some(layout) = grown.layout.as_mut() {
+                layout.plugged_mib = plugged;
+            }
+            let sets = opl_types::numa::HostSets::new(node.spec.host_resources.as_ref(), topology);
+            let (usage, _) = inv.host_usage(node, topology, &sets, vm.id, &Assign::default());
+            let free = opl_types::numa::HostFree::new(topology, &sets, &usage);
+            if let Some(grown) = opl_types::numa::now(&grown)
+                && let Err(e) = opl_types::numa::grown_fits(&grown, place, &free)
+            {
+                return Err(ApiError::conflict(
+                    "no_capacity",
+                    format!(
+                        "VM {:?} cannot grow its memory to {want} MiB: {}",
+                        vm.name,
+                        e.for_node(&node.name)
+                    ),
+                ));
+            }
+        }
     }
     Ok(())
 }

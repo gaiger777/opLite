@@ -290,35 +290,50 @@ impl Inventory {
         assign: &Assign,
     ) -> (HostUsage, Demand) {
         let mut total = Demand::default();
-        let mut records: Vec<(&ResolvedNuma, &HostPlacement)> = Vec::new();
+        let mut records: Vec<(ResolvedNuma, &HostPlacement)> = Vec::new();
         let mut pending = Vec::new();
+        let caps = node.status.hotplug.unwrap_or_default();
         for v in self.vms.iter().filter(|v| v.id != skip) {
             if !placement::occupied(v, assign).contains(&node.id) {
                 continue;
             }
-            let mut d = numa::demand(&v.spec, Some(topology));
-            // Raft 장부처럼 도는 `any` VM은 켤 때 고른 크기로 센다.
+            let start = hotplug::start_spec(&v.spec, caps);
+            let mut d = numa::demand(&start, Some(topology));
+            // Raft 장부처럼 이 노드에서 도는 `any` VM은 켤 때 고른 크기로 센다(다른 노드의 기록 — HA가 옮기는 VM — 은
+            // 보지 않는다, 리뷰 2 N1).
             d.resolve_any(
                 v.status
                     .hardware
                     .as_ref()
+                    .filter(|hw| {
+                        v.status.node == Some(node.id)
+                            && hw.host_placement.as_ref().map(|p| p.node) == Some(node.id)
+                    })
                     .and_then(|hw| hw.numa.as_ref())
                     .and_then(|n| n.page),
             );
             total.add(&d);
             match &v.status.hardware {
-                Some(hw) => match (&hw.numa, &hw.host_placement) {
+                // 꽂은 virtio-mem 메모리까지 센다(리뷰 2 N2).
+                Some(hw) => match (numa::now(hw), &hw.host_placement) {
                     (Some(n), Some(p)) if p.node == node.id => records.push((n, p)),
-                    // 다른 노드에서 도는 VM(이 노드로 오는 마이그레이션)은 기록된 모양으로 다시 맞춘다.
-                    (Some(n), _) if n.memory.is_some() && v.status.node != Some(node.id) => {
+                    // 이 노드로 오는 마이그레이션은 지금 모양으로 다시 맞춘다.
+                    (Some(n), _)
+                        if n.memory.is_some()
+                            && v.status.migration.as_ref().map(|m| m.node) == Some(node.id) =>
+                    {
                         pending.push(VmShape::Fixed(n, &hw.cpu));
+                    }
+                    // 다른 노드의 기록을 가진 채 이 노드에 놓인 VM(HA가 옮김)은 스펙으로 새로 켠다(리뷰 2 N1).
+                    _ if v.status.node != Some(node.id) => {
+                        pending.push(VmShape::Spec(Box::new(start)))
                     }
                     _ => {}
                 },
-                None => pending.push(VmShape::Spec(&v.spec)),
+                None => pending.push(VmShape::Spec(Box::new(start))),
             }
         }
-        let mut usage = numa::usage(records, node.id);
+        let mut usage = numa::usage(records.iter().map(|(n, p)| (n, *p)), node.id);
         for shape in pending {
             let free = HostFree::new(topology, sets, &usage);
             let view = HostView {
@@ -327,7 +342,7 @@ impl Inventory {
                 sets,
                 free: &free,
             };
-            let fit = match shape {
+            let fit = match &shape {
                 VmShape::Fixed(n, cpu) => numa::fit_fixed(n, cpu, Some(&view)).ok(),
                 VmShape::Spec(spec) => match numa::layout(spec, Some(topology)) {
                     Ok(Some(l)) if l.binds() => numa::fit(&l, Some(&view)).ok(),
@@ -370,13 +385,23 @@ impl Inventory {
     ) -> Result<Option<numa::Fit>, String> {
         let name = &node.name;
         let topology = node.status.topology.as_ref();
+        // 이 노드가 메모리 핫플러그 없이 켜면 상한 없는 모양으로 맞춘다(리뷰 2 N9).
+        let start = hotplug::start_spec(spec, node.status.hotplug.unwrap_or_default());
+        let spec: &VmSpec = &start;
+        let mut boot = None;
         let shape = match cpu {
-            VmCpu::Running(hw, _) => match &hw.numa {
-                Some(n) if n.memory.is_some() => VmShape::Fixed(n, &hw.cpu),
+            // 옮기는 VM은 꽂은 메모리까지 받는 쪽에 잡는다(리뷰 2 N2). 돌려주는 모양은 켤 때 기록이다.
+            VmCpu::Running(hw, _) => match (&hw.numa, numa::now(hw)) {
+                (Some(b), Some(n)) if n.memory.is_some() => {
+                    boot = Some(b.clone());
+                    VmShape::Fixed(n, &hw.cpu)
+                }
                 _ => return Ok(None),
             },
             VmCpu::Start => match numa::layout(spec, topology) {
-                Ok(Some(l)) if l.binds() => VmShape::Spec(spec),
+                Ok(Some(l)) if l.binds() => {
+                    VmShape::Spec(Box::new(std::borrow::Cow::Borrowed(spec)))
+                }
                 Ok(_) => return Ok(None),
                 Err(e) => return Err(format!("the VM's NUMA settings are invalid: {e}")),
             },
@@ -393,7 +418,7 @@ impl Inventory {
             sets: &sets,
             free: &free,
         };
-        let fit = match shape {
+        let fit = match &shape {
             VmShape::Fixed(n, cpu) => numa::fit_fixed(n, cpu, Some(&view)),
             VmShape::Spec(spec) => match numa::layout(spec, Some(topology)) {
                 Ok(Some(l)) => numa::fit(&l, Some(&view)),
@@ -401,9 +426,12 @@ impl Inventory {
                 Err(e) => return Err(format!("the VM's NUMA settings are invalid: {e}")),
             },
         };
-        let fit = fit.map_err(|e| e.for_node(name))?;
+        let mut fit = fit.map_err(|e| e.for_node(name))?;
+        if let Some(boot) = boot {
+            fit.numa = boot;
+        }
         // 새로 켜면 Raft 장부가 볼 합계도(맞춰 보지 못한 앞 VM, `isolate`·`any`의 셈이 배치와 다를 때)
-        if let VmShape::Spec(spec) = shape {
+        if let VmShape::Spec(spec) = &shape {
             let mut after = total.clone();
             after.add(&numa::demand(spec, Some(topology)));
             let limits = HostLimits::new(node.spec.host_resources.as_ref(), Some(topology));
@@ -416,12 +444,11 @@ impl Inventory {
 }
 
 /// [`Inventory::host_usage`]·[`Inventory::numa_fits`]가 맞추는 VM의 모양
-#[derive(Clone, Copy)]
 enum VmShape<'a> {
-    /// 켤 때 기록한 모양(도는 VM)
-    Fixed(&'a ResolvedNuma, &'a opl_types::vm::CpuSpec),
-    /// 스펙에서 새로 정함(켜기)
-    Spec(&'a VmSpec),
+    /// 도는 VM의 지금 모양(켤 때 기록 + 꽂은 메모리, [`numa::now`])
+    Fixed(ResolvedNuma, &'a opl_types::vm::CpuSpec),
+    /// 스펙에서 새로 정함(켜기, 그 노드에서 켤 모양 — [`hotplug::start_spec`])
+    Spec(Box<std::borrow::Cow<'a, VmSpec>>),
 }
 
 /// 노드의 보통 메모리: 노드 메모리에서 hugepages 풀을 뺀 것(계획 64 §7). 토폴로지가 없으면 노드 메모리 그대로다.
@@ -2862,5 +2889,102 @@ mod tests {
             node_fits(&more, &inv, &n1),
             Err(r#"node "n1" would use 2050 of 1024 MiB of 2M hugepages"#.into())
         );
+    }
+
+    /// `pools`(크기 KiB, 수)의 풀이 노드 0에 있는 [`numa_node`]
+    fn pool_node(name: &str, pools: serde_json::Value) -> Node {
+        let mut n = numa_node(name, "");
+        n.status.topology.as_mut().unwrap().nodes[0].hugepages =
+            serde_json::from_value(pools).unwrap();
+        n
+    }
+
+    /// 리뷰 2 N1: HA가 1G 풀만 있던 죽은 노드에서 2M 풀만 있는 n2로 옮기는 `any` VM은 옛 기록(1G)으로 세지 않는다. 먼저
+    /// 놓인 VM은 스펙(2M)으로 맞춰 n2의 2M 풀에 센다.
+    #[test]
+    fn moved_any_vms_are_counted_by_their_spec_on_the_new_node() {
+        let dead = pool_node(
+            "dead",
+            serde_json::json!([{"size_kib": 1048576, "total": 4}]),
+        );
+        let n2 = pool_node("n2", serde_json::json!([{"size_kib": 2048, "total": 512}]));
+        let moved = |name: &str| {
+            let mut s = spec(512, Some(dead.id), PowerState::Running);
+            s.hugepages = Some(numa::PageSize::Any);
+            let mut v: Vm = Resource::new(name, s);
+            let mut hw = RunningHardware::legacy(&v.spec);
+            hw.numa = Some(numa::ResolvedNuma {
+                nodes: vec![numa::GuestNode {
+                    sockets: vec![0],
+                    memory_mib: 512,
+                }],
+                distances: Vec::new(),
+                page: Some(numa::PageKind::Size1G),
+                policy: Default::default(),
+                thread_policy: None,
+                emulator: None,
+                memory: Some(numa::MemoryPolicy::Strict),
+            });
+            hw.host_placement = Some(numa::HostPlacement {
+                node: dead.id,
+                vcpus: Vec::new(),
+                siblings: Default::default(),
+                emulator: Default::default(),
+                host_nodes: vec![0],
+            });
+            v.status.hardware = Some(hw);
+            v
+        };
+        let (a, b) = (moved("a"), moved("b"));
+        let inv = Inventory {
+            nodes: vec![n2.clone()],
+            vms: vec![a.clone(), b.clone()],
+            ..Inventory::default()
+        };
+        let mut assign = Assign::default();
+        assign.place(a.id, n2.id);
+        assign.unplace(b.id);
+        let topo = n2.status.topology.as_ref().unwrap();
+        let sets = HostSets::new(None, topo);
+        let (usage, total) = inv.host_usage(&n2, topo, &sets, b.id, &assign);
+        assert_eq!(usage.pages.get(&(0, numa::PageKind::Size2M)), Some(&256));
+        assert_eq!((total.any_mib, total.mib(numa::PageKind::Size1G)), (512, 0));
+        assert_eq!(vm_fits(&b, &inv, &n2, &assign), Ok(()));
+    }
+
+    /// 리뷰 2 N9: `any` + 메모리 상한은 메모리 핫플러그로 켜는 노드에서만 2M이다. 1G 풀만 있는 노드는 virtio-mem이 없거나
+    /// 미리 잡지 못하면 받는다.
+    #[test]
+    fn any_with_a_memory_maximum_fits_1g_where_memory_hotplug_is_off() {
+        let mut want = spec(1024, None, PowerState::Stopped);
+        want.hugepages = Some(numa::PageSize::Any);
+        want.max_memory_mib = Some(4096);
+        let mut n1 = pool_node("n1", serde_json::json!([{"size_kib": 1048576, "total": 4}]));
+        for (caps, fits) in [
+            (
+                opl_types::node::NodeHotplug {
+                    cpu: true,
+                    memory: true,
+                    memory_prealloc: true,
+                },
+                false,
+            ),
+            (
+                opl_types::node::NodeHotplug {
+                    cpu: true,
+                    memory: true,
+                    memory_prealloc: false,
+                },
+                true,
+            ),
+            (opl_types::node::NodeHotplug::default(), true),
+        ] {
+            n1.status.hotplug = Some(caps);
+            let inv = Inventory {
+                nodes: vec![n1.clone()],
+                ..Inventory::default()
+            };
+            assert_eq!(node_fits(&want, &inv, &n1).is_ok(), fits, "{caps:?}");
+        }
     }
 }

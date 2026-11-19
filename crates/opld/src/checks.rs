@@ -1216,6 +1216,7 @@ mod tests {
         let caps = NodeHotplug {
             cpu: true,
             memory: false,
+            memory_prealloc: false,
         };
         let mut state = s.state(&[]);
         state.config.hotplug = Some(caps);

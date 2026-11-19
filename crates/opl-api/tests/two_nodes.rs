@@ -984,6 +984,7 @@ async fn the_target_starts_with_the_running_hardware() {
     node.status.hotplug = Some(NodeHotplug {
         cpu: false,
         memory: true,
+        memory_prealloc: true,
     });
     a.cluster
         .update_status::<NodeSpec>(b.id, &node.status)

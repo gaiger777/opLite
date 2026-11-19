@@ -425,7 +425,7 @@ impl QemuHypervisor {
             .pinning
             .as_ref()
             .map(|p| p.emulator.clone())
-            .or_else(|| crate::affinity::unpinned_child(Path::new("/proc"), Path::new("/sys")));
+            .or_else(crate::affinity::unpinned_child);
         if vm.tpm.is_some() {
             // QEMU가 띄울 때 제어 채널에 연결하므로 먼저 띄운다. QEMU를 띄우지 못하면 kill_and_cleanup이 끝낸다.
             let dir = vm_tpm_dir(&self.config.state_dir, vm.id);
@@ -1967,7 +1967,25 @@ impl Hypervisor for QemuHypervisor {
             .output();
         match tokio::time::timeout(QMP_TIMEOUT, output).await {
             Ok(Ok(out)) if out.status.success() => {
-                opl_qemu::hotplug_caps(host.arch, LINUX, &String::from_utf8_lossy(&out.stdout))
+                let devices = String::from_utf8_lossy(&out.stdout);
+                // virtio-mem이 꽂을 때 미리 잡는지(`prealloc`, QEMU 7.1+, 리뷰 2): 없으면 hugepages VM은 메모리
+                // 핫플러그 없이 켠다.
+                let mem_help = if devices.contains("\"virtio-mem-pci\"") {
+                    let help = tokio::process::Command::new(&host.qemu_binary)
+                        .args(["-device", "virtio-mem-pci,help"])
+                        .stdin(Stdio::null())
+                        .kill_on_drop(true)
+                        .output();
+                    match tokio::time::timeout(QMP_TIMEOUT, help).await {
+                        Ok(Ok(out)) if out.status.success() => {
+                            String::from_utf8_lossy(&out.stdout).into_owned()
+                        }
+                        _ => String::new(),
+                    }
+                } else {
+                    String::new()
+                };
+                opl_qemu::hotplug_caps(host.arch, LINUX, &devices, &mem_help)
             }
             other => {
                 let error = match other {
@@ -1977,7 +1995,7 @@ impl Hypervisor for QemuHypervisor {
                 };
                 tracing::warn!(binary = ?host.qemu_binary, %error,
                     "cannot list QEMU devices; memory hotplug is off on this node");
-                opl_qemu::hotplug_caps(host.arch, LINUX, "")
+                opl_qemu::hotplug_caps(host.arch, LINUX, "", "")
             }
         }
     }
@@ -2464,8 +2482,17 @@ impl Hypervisor for QemuHypervisor {
             }
         }
         changed += pin_threads(&handle, pin).await?;
-        write_pinning(&handle.paths.dir, pin)?;
+        // 바뀐 때만 쓴다(리뷰 2 N3 — 30초마다 VM마다 쓰지 않는다).
+        if read_pinning(&handle.paths.dir).as_ref() != Some(pin) {
+            write_pinning(&handle.paths.dir, pin)?;
+        }
         Ok(changed)
+    }
+
+    fn forget_pinning(&self, id: Uuid) {
+        if let Ok(paths) = self.paths(id) {
+            let _ = std::fs::remove_file(paths.dir.join(PINNING_FILE));
+        }
     }
 
     fn saved_pinning(&self, id: Uuid) -> Option<RuntimePinning> {
@@ -4084,6 +4111,8 @@ async fn pin_threads(handle: &VmHandle, pin: &RuntimePinning) -> Result<usize, D
         crate::affinity::vcpu_threads(&flatten(r, "QMP query-cpus-fast")?, pin.slots_per_socket)
     };
     let proc = Path::new("/proc");
+    // 컨테이너·슬라이스의 cpuset이 자른 친화는 맞은 것으로 본다(리뷰 2 N3 — 아니면 회차마다 다시 건다).
+    let allowed = crate::affinity::cgroup_cpus(proc, Path::new("/sys"), handle.pid);
     let mut changed = 0;
     for tid in crate::affinity::threads(proc, handle.pid)? {
         let slot = vcpus.iter().find(|(_, t)| *t == tid).map(|(slot, _)| *slot);
@@ -4097,7 +4126,8 @@ async fn pin_threads(handle: &VmHandle, pin: &RuntimePinning) -> Result<usize, D
             // 그사이 끝난 스레드
             continue;
         };
-        if &got == want {
+        let bounded = crate::affinity::effective(want, allowed.as_ref());
+        if got == bounded {
             continue;
         }
         let set = crate::affinity::set_thread(tid, want);
@@ -4119,7 +4149,7 @@ async fn pin_threads(handle: &VmHandle, pin: &RuntimePinning) -> Result<usize, D
         };
         set.map_err(|e| failed(e.to_string()))?;
         match crate::affinity::thread_cpus(proc, handle.pid, tid) {
-            Some(got) if &got == want => changed += 1,
+            Some(got) if got == bounded => changed += 1,
             Some(got) => return Err(failed(format!("the thread runs on CPU {got}"))),
             None => return Err(failed(format!("cannot read thread {tid}"))),
         }
@@ -9124,7 +9154,7 @@ time.sleep(60)
         let qemu = tmp.path().join("qemu");
         std::fs::write(
             &qemu,
-            "#!/bin/sh\n[ \"$1 $2\" = \"-device help\" ] || exit 1\necho 'name \"virtio-mem-pci\", bus PCI'\n",
+            "#!/bin/sh\n[ \"$1 $2\" = \"-device virtio-mem-pci,help\" ] && { echo '  prealloc=<bool>'; exit 0; }\n[ \"$1 $2\" = \"-device help\" ] || exit 1\necho 'name \"virtio-mem-pci\", bus PCI'\n",
         )
         .unwrap();
         std::fs::set_permissions(&qemu, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -9135,7 +9165,8 @@ time.sleep(60)
             caps,
             NodeHotplug {
                 cpu: false,
-                memory: true
+                memory: true,
+                memory_prealloc: true
             }
         );
 
@@ -9147,7 +9178,8 @@ time.sleep(60)
             hv.hotplug_caps().await,
             NodeHotplug {
                 cpu: cfg!(target_os = "linux"),
-                memory: false
+                memory: false,
+                memory_prealloc: false
             }
         );
     }

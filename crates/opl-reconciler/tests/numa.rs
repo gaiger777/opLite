@@ -313,28 +313,44 @@ async fn repin_follows_the_running_qemu_record() {
     assert_eq!(env.hv.saved_pinning(db.id).unwrap().vcpus, [set("2")]);
 }
 
-/// 리뷰 1 I5: 걸 것이 없는 VM(노드 설정 없음)도 스레드가 온라인 CPU 전체(= 공유 집합)가 아니면 되돌린다 — opld가 예약
-/// CPU에 묶인 동안 켠 QEMU가 그 친화를 물려받았을 수 있다. 스코프는 건드리지 않는다.
+/// 리뷰 2 N3: 고정한 적 없는 VM(노드 설정 없음)은 검사 루프가 건드리지 않는다 — 관리자가 `taskset`으로 좁혀도
+/// 넓히지 않는다. 설정이 있을 때 켜 opld가 고정한 VM은 설정을 지우면 한 번 풀고(뜰 때의 친화 — 시험에서는 모름 →
+/// 공유 집합 = 온라인 0-3, 스코프도 넓힘) 고정 기록을 지운 뒤로는 건드리지 않는다.
 #[tokio::test]
-async fn repin_returns_unpinned_vms_to_every_online_cpu() {
+async fn repin_leaves_vms_it_never_pinned_and_releases_cleared_ones_once() {
     let env = Env::start().await;
     add_node(&env, None).await;
     let plain = vm("web", env.node);
     env.create(&plain).await;
     running(&env, plain.id).await;
     assert_eq!(env.hv.saved_pinning(plain.id), None);
-    repin(&env.cluster, &*env.hv, env.node).await.unwrap();
-    let pin = env.hv.saved_pinning(plain.id).unwrap();
-    assert_eq!(
-        (pin.emulator.clone(), pin.vcpus.is_empty(), pin.scope),
-        (set("0-3"), true, None)
-    );
-    let mut drifted = env.hv.saved_pinning(plain.id).unwrap();
-    drifted.emulator = set("0");
-    env.hv.drift_pinning(plain.id, drifted);
-    assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 1);
-    assert_eq!(env.hv.saved_pinning(plain.id).unwrap().emulator, set("0-3"));
     assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 0);
+    assert_eq!(env.hv.saved_pinning(plain.id), None);
+    assert!(env.hv.repins().is_empty());
+
+    let env = Env::start().await;
+    add_node(&env, Some(resources())).await;
+    let plain = vm("web", env.node);
+    env.create(&plain).await;
+    running(&env, plain.id).await;
+    assert_eq!(env.hv.saved_pinning(plain.id).unwrap().emulator, set("1"));
+    let node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    let mut spec = node.spec.clone();
+    spec.host_resources = None;
+    env.cluster
+        .update_spec(node.id, Some(node.revision), node.labels, &spec)
+        .await
+        .unwrap();
+    assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 1);
+    let (_, released) = env.hv.repins().pop().unwrap();
+    assert_eq!(
+        (released.emulator, released.vcpus.is_empty(), released.scope),
+        (set("0-3"), true, Some(set("0-3")))
+    );
+    assert_eq!(env.hv.saved_pinning(plain.id), None);
+    let calls = env.hv.repins().len();
+    assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 0);
+    assert_eq!(env.hv.repins().len(), calls);
 }
 
 /// 리뷰 1 M3: opld가 다시 뜨면 도는 QEMU의 저장된 배치를 예약으로 다시 잡는다(기록이 Raft에 닿기 전에 죽었을 때).
@@ -349,4 +365,50 @@ async fn a_restarted_allocator_holds_the_running_placements() {
     assert!(fresh.held().is_empty());
     fresh.hold_saved(&*env.hv).await;
     assert_eq!(fresh.held(), [db.id]);
+}
+
+/// 리뷰 2 N2: 마이그레이션을 받는 쪽은 꽂은 virtio-mem 메모리까지 그 호스트 노드에 잡는다(기록할 모양은 켤 때 나눔
+/// 그대로). 러너의 보통 메모리는 16384 − 512(2M 풀) = 15872 MiB라 켤 때 4096에 12288을 꽂은 VM은 들지 않는다.
+#[tokio::test]
+async fn an_incoming_vm_reserves_its_plugged_memory() {
+    let mut env = Env::start().await;
+    env.stop_reconciler().await;
+    add_node(&env, None).await;
+    let mut v = vm("db", env.node);
+    v.spec.power = PowerState::Stopped;
+    env.create(&v).await;
+    let numa = opl_types::numa::ResolvedNuma {
+        nodes: vec![opl_types::numa::GuestNode {
+            sockets: vec![0],
+            memory_mib: 4096,
+        }],
+        distances: Vec::new(),
+        page: None,
+        policy: CpuPolicy::Shared,
+        thread_policy: None,
+        emulator: None,
+        memory: Some(opl_types::numa::MemoryPolicy::Strict),
+    };
+    let alloc = &env.config.host_alloc;
+    let cpu = v.spec.cpu.clone();
+    match alloc.claim(
+        &env.cluster,
+        v.id,
+        Shape::Fixed(Some(&numa), &cpu, &[12288]),
+    ) {
+        Err(CpuRefusal::Cannot(m)) => assert!(m.contains("unbound memory"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let claim = alloc
+        .claim(&env.cluster, v.id, Shape::Fixed(Some(&numa), &cpu, &[8192]))
+        .unwrap();
+    assert_eq!(claim.numa.unwrap().nodes[0].memory_mib, 4096);
+    // 예약은 꽂은 것까지 센다: 같은 모양의 다른 VM(8192 + 4096 > 15872 − 12288)은 기다린다.
+    let mut w = vm("web", env.node);
+    w.spec.power = PowerState::Stopped;
+    env.create(&w).await;
+    match alloc.claim(&env.cluster, w.id, Shape::Fixed(Some(&numa), &cpu, &[])) {
+        Err(CpuRefusal::Waiting(_)) => {}
+        other => panic!("{other:?}"),
+    }
 }

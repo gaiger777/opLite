@@ -976,8 +976,8 @@ CPU를 전용으로 둘지, hugepages 예약)는 [호스트 준비: 예약·전�
 | `cpu.policy` | `shared`(기본)·`dedicated` | 공유는 노드의 공유 CPU에서 다른 VM과 나눠 돈다. 전용은 **vCPU 자리마다 노드의 전용 CPU 하나를 독점**한다 |
 | `cpu.thread_policy` | `prefer`(기본)·`isolate`·`require` | 전용 VM만. `prefer`는 코어의 형제 스레드를 먼저 채우고, `isolate`는 vCPU마다 코어 하나(형제는 비워 두고 쓴 것으로 셈), `require`는 vCPU를 형제 짝으로(SMT 호스트만, 소켓당 vCPU 자리가 짝수) |
 | `cpu.emulator` | `shared`(기본)·`isolate` | 전용 VM만. QEMU 자신의 스레드(I/O·관리)를 노드의 공유 CPU에 둘지, 전용 CPU 하나를 더 잡아 거기 둘지 |
-| `numa.nodes` | `auto`·1~8·`[{"cpus":8,"memory_mib":16384}, …]` | 게스트가 보는 NUMA 노드(vNUMA). 노드는 **소켓 단위**라 개수는 `sockets`를 나눠야 하고, 직접 목록의 `cpus`는 vCPU 자리 수(핫플러그 상한 기준, 소켓당 자리의 배수) |
-| `numa.memory` | `strict`·`preferred` | 게스트 노드의 메모리를 맞춘 호스트 노드에 묶는다(QEMU `policy=bind`·`preferred`). 주면 공유 VM도 묶는다 |
+| `numa.nodes` | `auto`·1~8·`[{"cpus":8,"memory_mib":16384}, …]` | 게스트가 보는 NUMA 노드(vNUMA). 노드는 **소켓 단위**라 개수는 `sockets`를 나눠야 하고, 직접 목록의 `cpus`는 vCPU 자리 수(핫플러그 상한 기준, 소켓당 자리의 배수), `memory_mib`는 **켤 때 나눔**(합 = `memory_mib`; 메모리 상한이 있는 VM은 합 ≤ 메모리이고 남는 것은 다음 켜기에 노드마다 고르게 더함) |
+| `numa.memory` | `strict`·`preferred` | 게스트 노드의 메모리를 맞춘 호스트 노드에 묶는다(QEMU `policy=bind`·`preferred`). 주면 공유 VM도 묶는다. `preferred`는 넘치면 커널이 다른 노드에서 주므로 노드 고르기에서 거절 사유가 아니고(덜 찬 호스트 노드를 고를 뿐) 장부의 묶인 메모리에도 세지 않는다 |
 | `hugepages` | `2M`·`1G`·`any` | 게스트 메모리를 노드가 예약한 hugepages로 쓴다(memfd hugetlb + 미리 잡기). `any`는 노드에 있는 큰 것부터 |
 
 - **언제 쓰나.** 지연에 민감한 VM(DB·NFV·실시간 처리)은 `dedicated`로 다른 VM과 pCPU를 다투지 않게 한다. 호스트 NUMA 노드보다
@@ -999,11 +999,21 @@ CPU를 전용으로 둘지, hugepages 예약)는 [호스트 준비: 예약·전�
   pCPU에 고정되고(실패하면 `device_del`로 되돌리고 핫플러그 단계가 실패로 남는다), 뺀 자리의 pCPU는 그대로 잡혀 있다.
   hugepages는 부팅 메모리(`memory_mib`)만 미리 잡는다. 메모리 핫플러그(virtio-mem)는 게스트 노드마다 장치 하나씩이고, 2M
   hugepages면 꽂을 때 미리 잡아 모자라면 그 핫플러그가 실패로 남는다. **`1G` + 메모리 핫플러그(`max_memory_mib`)는 400**이다
-  (virtio-mem 블록이 2 MiB라서). `any` + 메모리 핫플러그는 2M으로 고른다.
+  (virtio-mem 블록이 2 MiB라서). `any` + 메모리 핫플러그는 2M으로 고른다 — 그 노드가 메모리 핫플러그로 켤 때만이다. QEMU가
+  7.1보다 옛것이라 virtio-mem이 꽂을 때 미리 잡지 못하는 노드(`node get`의 `status.hotplug.memory_prealloc`이 없음, 예: Ubuntu
+  22.04의 QEMU 6.2)는 hugepages VM을 **메모리 핫플러그 없이** 켜고(상한 = 메모리, 메모리 바꾸기는 보류 `unsupported` "this node's
+  QEMU cannot preallocate hugepages for virtio-mem (needs QEMU 7.1)"), 그런 노드로는 hugepages + virtio-mem으로 도는 VM을 옮기지
+  않는다. 꽂은 메모리는 부팅 메모리와 같은 호스트 NUMA 노드에 묶이므로 거기에 센다: 묶는 VM의 메모리를 늘릴 때 그 호스트 노드에
+  들지 않으면 **409** `no_capacity`("VM "db" cannot grow its memory to 40960 MiB: node "n1" has … MiB of unbound memory on host
+  NUMA node 0 …")이고, 마이그레이션 대상은 꽂은 메모리까지 잡는다.
+- **직접 목록과 메모리 늘리기.** 노드 목록의 `memory_mib`는 켤 때 나눔이다. 메모리 상한이 있는 VM은 실행 중 메모리를 늘려도
+  목록을 고치지 않아도 되고(늘린 것은 virtio-mem이 노드마다 꽂는다) 보류 `numa`가 생기지 않는다. 다음 전원 껐다 켜기 때 남는
+  것(메모리 − 목록 합)을 virtio-mem과 같이 2 MiB 단위로 노드마다 고르게(나머지는 노드 0) 더해 켠다. 목록 자체를 바꾸면 보류다.
 - **권한과 할당량.** 전용 정책이나 `hugepages`가 있는 VM을 만들거나, 그 칸(정책·스레드·에뮬레이터·hugepages)을 바꾸거나, 그런
   VM을 복제·배포·가져오기·복원하려면 그 폴더에서 권한 **`vm.dedicated`**가 있어야 한다(**403** `dedicated CPUs and hugepages
   need the vm.dedicated privilege`). 내장 `operator`에는 없다 — 노드의 드문 자원이라 관리자가 따로 준다. 이미 전용인 VM의 vCPU
-  수·메모리는 `vm.config`로 바꾼다. vNUMA·`numa.memory`만 쓰는 공유 VM은 권한이 들지 않는다. 폴더 할당량 **`dedicated_vcpus`**가
+  수·메모리는 `vm.config`로 바꾼다. 그런 VM을 다른 폴더로 옮기는 것(`POST /folders/{id}/members`)도 옮길 폴더에 `vm.dedicated`가
+  있어야 한다(`inventory.move`만으로는 안 됨). vNUMA·`numa.memory`만 쓰는 공유 VM은 권한이 들지 않는다. 폴더 할당량 **`dedicated_vcpus`**가
   전용 VM의 `max_vcpus`(+ `emulator isolate`면 1)를 전원과 상관없이 센다([폴더와 권한](folders.md#할당량)). hugepages 메모리는
   이미 `memory_mib` 할당량에 든다.
 - **전원 껐다 켜기 규칙.** 모양(게스트 노드·페이지 크기·정책)은 QEMU를 띄울 때 정해지고 실행 중에는 바꿀 수 없다. 실행 중인

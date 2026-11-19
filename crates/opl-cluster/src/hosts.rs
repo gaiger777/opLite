@@ -5,6 +5,8 @@
 //! 전용 CPU·hugepages를 쓰지 않는 VM(`demand` 0)은 보지 않으므로 그런 VM만 있는 클러스터는 지금과 같고, 그런 VM은 모든
 //! 노드가 `numa`를 알릴 때만 생기므로 복제본마다 판정이 같다(계획 62 할당량과 같은 논리).
 
+use opl_types::hotplug;
+use opl_types::node::NodeHotplug;
 use opl_types::numa::{self, Demand, HostLimits, HostResources, NodeTopology, PageKind};
 use opl_types::resource::Kind;
 use opl_types::vm::VmSpec;
@@ -28,19 +30,37 @@ fn placed_on(spec: &Value) -> Option<Uuid> {
     spec.get("node")?.as_str()?.parse().ok()
 }
 
-/// VM 스펙의 요구. 풀 수 없는 스펙(API가 쓰지 않는다)은 0이다. `any`는 상태의 기록(`hardware.numa.page`)이 있으면 켤
-/// 때 고른 크기로 센다([`Demand::resolve_any`]).
-fn demand_of(spec: &Value, status: &Value, topology: Option<&NodeTopology>) -> Demand {
+/// 노드 `node`(능력 `caps`)에서 켤 VM 스펙의 요구. 풀 수 없는 스펙(API가 쓰지 않는다)은 0이다. 메모리 핫플러그 없이
+/// 켤 VM은 상한 없이 센다([`hotplug::start_spec`] — `any`가 2M으로 묶이지 않는다, 리뷰 2 N9). `any`는 그 노드에서 도는
+/// 기록(`hardware.numa.page`)이 있으면 켤 때 고른 크기로 센다([`Demand::resolve_any`]).
+fn demand_of(
+    spec: &Value,
+    status: &Value,
+    node: Uuid,
+    caps: NodeHotplug,
+    topology: Option<&NodeTopology>,
+) -> Demand {
     let mut d = VmSpec::deserialize(spec)
-        .map(|vm| numa::demand(&vm, topology))
+        .map(|vm| numa::demand(&hotplug::start_spec(&vm, caps), topology))
         .unwrap_or_default();
-    d.resolve_any(recorded_page(status));
+    d.resolve_any(recorded_page(status, node));
     d
 }
 
-/// 상태의 `hardware.numa.page`(켤 때 고른 hugepage 크기)
-fn recorded_page(status: &Value) -> Option<PageKind> {
-    PageKind::deserialize(status.get("hardware")?.get("numa")?.get("page")?).ok()
+/// 상태의 `hardware.numa.page`(켤 때 고른 hugepage 크기). 그 기록이 노드 `node`에서 도는 QEMU의 것일 때만이다 —
+/// HA가 옮긴 VM의 상태는 죽은 노드의 기록을 그대로 가지므로, 그 크기로 새 노드를 세면 다른 크기의 풀만 있는 노드가
+/// 늘 거절한다(리뷰 2 N1).
+fn recorded_page(status: &Value, node: Uuid) -> Option<PageKind> {
+    let here = |v: Option<&Value>| {
+        v.and_then(Value::as_str)
+            .and_then(|s| s.parse::<Uuid>().ok())
+            == Some(node)
+    };
+    let hw = status.get("hardware")?;
+    if !here(status.get("node")) || !here(hw.get("host_placement").and_then(|p| p.get("node"))) {
+        return None;
+    }
+    PageKind::deserialize(hw.get("numa")?.get("page")?).ok()
 }
 
 /// 장부 검사 하나. [`host_check`]가 만들고, VM을 한 번 훑으며 [`HostCheck::add`]로 그 노드의 다른 VM을 모은 뒤
@@ -50,6 +70,8 @@ pub(crate) struct HostCheck {
     node: Uuid,
     limits: HostLimits,
     topology: Option<NodeTopology>,
+    /// 그 노드의 핫플러그 능력(메모리 핫플러그 없이 켤 VM을 그 모양으로 센다)
+    caps: NodeHotplug,
     /// 이 VM의 쓰기 전·뒤 몫(그 노드에 켜기로 된 때만)
     old: Demand,
     new: Demand,
@@ -91,9 +113,9 @@ pub(crate) fn host_check(
     {
         return Ok(None);
     }
-    let (resources, topology) = match objects.get((Kind::Node.as_str(), node.as_u128()))? {
+    let (resources, topology, caps) = match objects.get((Kind::Node.as_str(), node.as_u128()))? {
         Some(v) => {
-            // 두 칸만 푼다(노드 스펙·상태의 다른 칸과 상관없이 같은 판정).
+            // 세 칸만 푼다(노드 스펙·상태의 다른 칸과 상관없이 같은 판정).
             let raw: RawResource = serde_json::from_slice(v.value())?;
             let field = |v: &Value, k: &str| v.get(k).cloned().unwrap_or(Value::Null);
             (
@@ -103,15 +125,24 @@ pub(crate) fn host_check(
                 Option::<NodeTopology>::deserialize(field(&raw.status, "topology"))
                     .ok()
                     .flatten(),
+                Option::<NodeHotplug>::deserialize(field(&raw.status, "hotplug"))
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             )
         }
-        None => (None, None),
+        None => (None, None, NodeHotplug::default()),
     };
-    let mut new = numa::demand(&vm, topology.as_ref());
-    // 스펙 쓰기는 상태를 바꾸지 않는다: 도는 VM의 `any`는 그 기록의 크기 그대로다.
-    new.resolve_any(old.and_then(|o| recorded_page(&o.status)));
+    let mut new = numa::demand(&hotplug::start_spec(&vm, caps), topology.as_ref());
+    // 스펙 쓰기는 상태를 바꾸지 않는다: 이 노드에서 도는 VM의 `any`는 그 기록의 크기 그대로다(다른 노드로 옮기는
+    // 쓰기는 옛 기록을 보지 않는다 — 리뷰 2 N1).
+    if was_on == Some(node) {
+        new.resolve_any(old.and_then(|o| recorded_page(&o.status, node)));
+    }
     let old = match old {
-        Some(o) if was_on == Some(node) => demand_of(&o.spec, &o.status, topology.as_ref()),
+        Some(o) if was_on == Some(node) => {
+            demand_of(&o.spec, &o.status, node, caps, topology.as_ref())
+        }
         _ => Demand::default(),
     };
     if new.within(&old) {
@@ -122,6 +153,7 @@ pub(crate) fn host_check(
         node,
         limits: HostLimits::new(resources.as_ref(), topology.as_ref()),
         topology,
+        caps,
         old,
         new,
         others: Demand::default(),
@@ -133,8 +165,13 @@ impl HostCheck {
     /// 훑기에서 만난 VM 하나(`id`, 저장된 리소스)를 센다.
     pub(crate) fn add(&mut self, id: Uuid, raw: &RawResource) {
         if id != self.vm && placed_on(&raw.spec) == Some(self.node) {
-            self.others
-                .add(&demand_of(&raw.spec, &raw.status, self.topology.as_ref()));
+            self.others.add(&demand_of(
+                &raw.spec,
+                &raw.status,
+                self.node,
+                self.caps,
+                self.topology.as_ref(),
+            ));
         }
     }
 
@@ -521,7 +558,7 @@ mod tests {
         .unwrap();
         sm.status(
             1,
-            json!({"hardware": {"numa": {"nodes": [], "page": "1G"}}}),
+            json!({"node": N1, "hardware": {"numa": {"nodes": [], "page": "1G"}, "host_placement": {"node": N1}}}),
         );
         assert_eq!(
             sm.update(2, one_g),
@@ -529,5 +566,88 @@ mod tests {
         );
         // 그 VM 자신의 스펙 쓰기(이름 등)는 같은 크기로 세어 늘지 않는다.
         sm.update(1, any).unwrap();
+    }
+
+    /// 노드 `id`: CPU 0-7, 노드 하나, 풀 `pools`(크기 KiB, 수), 핫플러그 능력 `hotplug`
+    fn pool_node(sm: &mut Sm, id: Uuid, pools: Value, hotplug: Value) {
+        let spec = json!({
+            "address": "127.0.0.1:1",
+            "host_resources": {"reserved_cpus": "", "dedicated_cpus": "2-3"},
+        });
+        let status = json!({
+            "hotplug": hotplug,
+            "topology": {
+                "sockets": 1, "threads_per_core": 1, "cpus": "0-7", "pinning": true, "cpuset": true,
+                "probed_at": 1,
+                "nodes": [{"id": 0, "cpus": "0-7", "memory_mib": 16384, "hugepages": pools}],
+            },
+        });
+        sm.create(Kind::Node, id, spec, status).unwrap();
+    }
+
+    /// 리뷰 2 N1: N1에서 1G로 풀린 `any` VM을 HA가 2M 풀만 있는 N2로 옮기면(상태는 죽은 노드의 기록 그대로, 노드 없음)
+    /// 받아들인다 — 옛 기록의 크기로 N2를 세지 않는다. N2에 놓인 다른 VM의 옛 기록도 마찬가지다.
+    #[test]
+    fn a_moved_any_vm_is_not_counted_in_the_size_of_its_old_node() {
+        let mut sm = Sm::new();
+        let all = json!({"cpu": true, "memory": true, "memory_prealloc": true});
+        pool_node(
+            &mut sm,
+            N1,
+            json!([{"size_kib": 1048576, "total": 4}]),
+            all.clone(),
+        );
+        pool_node(&mut sm, N2, json!([{"size_kib": 2048, "total": 2048}]), all);
+        let any = |node: Uuid| {
+            vm(
+                node,
+                "running",
+                json!({"hugepages": "any", "memory_mib": 2048}),
+            )
+        };
+        sm.vm(1, any(N1)).unwrap();
+        sm.vm(2, any(N1)).unwrap();
+        // N1에서 켤 때 1G를 골랐고, N1이 죽어 HA가 상태를 Stopped·노드 없음으로 쓴다(기록은 남음).
+        let dead = json!({"phase": "stopped", "hardware": {"numa": {"nodes": [], "page": "1G"}, "host_placement": {"node": N1}}});
+        sm.status(1, dead.clone());
+        sm.status(2, dead);
+        sm.update(1, any(N2)).unwrap();
+        sm.update(2, any(N2)).unwrap();
+    }
+
+    /// 리뷰 2 N9: 메모리 핫플러그 없이 켤 노드(virtio-mem이 없거나 hugepages를 미리 잡지 못함)에서는 상한 있는 `any`
+    /// VM도 2M에 묶이지 않는다(1G 풀만 있는 노드에 든다).
+    #[test]
+    fn any_with_a_memory_maximum_is_2m_only_where_memory_hotplug_runs() {
+        let hot = |node: Uuid| {
+            vm(
+                node,
+                "running",
+                json!({"hugepages": "any", "memory_mib": 1024, "max_memory_mib": 4096}),
+            )
+        };
+        let one_g = json!([{"size_kib": 1048576, "total": 4}]);
+        let mut sm = Sm::new();
+        pool_node(
+            &mut sm,
+            N1,
+            one_g.clone(),
+            json!({"cpu": true, "memory": true, "memory_prealloc": true}),
+        );
+        assert_eq!(
+            sm.vm(1, hot(N1)),
+            Err(exceeded(HostResource::Hugepages2M, 0, 1024))
+        );
+        let mut sm = Sm::new();
+        pool_node(
+            &mut sm,
+            N1,
+            one_g.clone(),
+            json!({"cpu": true, "memory": true}),
+        );
+        sm.vm(1, hot(N1)).unwrap();
+        let mut sm = Sm::new();
+        pool_node(&mut sm, N1, one_g, json!({"cpu": true}));
+        sm.vm(1, hot(N1)).unwrap();
     }
 }

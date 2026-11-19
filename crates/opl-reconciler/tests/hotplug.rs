@@ -41,6 +41,7 @@ async fn add_node(env: &Env, id: Uuid, features: &[&str], hotplug: Option<NodeHo
 const ALL: NodeHotplug = NodeHotplug {
     cpu: true,
     memory: true,
+    memory_prealloc: true,
 };
 
 /// 상한이 있는 VM(1×2 vCPU, 최대 8 / 1024 MiB, 최대 4096)과 NIC 하나

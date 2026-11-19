@@ -699,6 +699,7 @@ pub(crate) mod tests {
         host.hotplug = NodeHotplug {
             cpu: true,
             memory: false,
+            memory_prealloc: false,
         };
         register_node(&cluster, &config, &host).await.unwrap();
         let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();

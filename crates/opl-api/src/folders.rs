@@ -459,8 +459,15 @@ async fn move_one(
         Kind::Vm => {
             // VM 스펙 쓰기와 엇갈리지 않게 한다(이 노드의 검사·쓰기 잠금).
             let _lock = state.vm_lock.lock().await;
-            // 할당량 있는 폴더로 옮기면 그 VM의 몫이 더해진다.
+            // 할당량 있는 폴더로 옮기면 그 VM의 몫이 더해진다. 전용 CPU·hugepages VM은 복제·배포처럼 옮길 폴더에
+            // `vm.dedicated`가 있어야 한다(계획 64 리뷰 2 N6).
             move_resource!(VmSpec, |r: &opl_types::vm::Vm, spec: &VmSpec| {
+                crate::numa::require_privilege(
+                    state,
+                    principal,
+                    opl_types::numa::uses_host_resources(spec),
+                    spec.folder,
+                )?;
                 crate::quota::precheck_vm(&state.cluster, Some((r.id, &r.spec)), spec)
             })
         }

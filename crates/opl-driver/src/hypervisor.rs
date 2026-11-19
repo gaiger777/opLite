@@ -535,6 +535,11 @@ pub trait Hypervisor: Send + Sync {
         None
     }
 
+    /// 남긴 고정을 지운다: 그 뒤 검사 루프는 이 VM의 스레드를 건드리지 않는다(노드 설정을 지워 고정을 푼 VM, 리뷰 2 N3).
+    fn forget_pinning(&self, id: Uuid) {
+        let _ = id;
+    }
+
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;
 }

@@ -27,6 +27,7 @@ use uuid::Uuid;
 const ALL: NodeHotplug = NodeHotplug {
     cpu: true,
     memory: true,
+    memory_prealloc: true,
 };
 
 /// 노드 `node`의 핫플러그 능력을 기록한다(opld의 `record_node` 대신).
@@ -287,6 +288,7 @@ async fn memory_without_virtio_mem_is_left_pending() {
     let (env, _) = setup(NodeHotplug {
         cpu: true,
         memory: false,
+        memory_prealloc: false,
     })
     .await;
     let admin = env.admin().await;
@@ -681,6 +683,55 @@ async fn the_hotplug_action_checks_memory_and_busy_tasks() {
     succeeded(&admin.act("web", "hotplug").await);
 }
 
+/// 계획 64 리뷰 2 N2: 호스트 노드에 묶는 VM의 늘린 메모리(virtio-mem)는 같은 호스트 노드에 묶인다. 노드 전체(Raft
+/// 장부의 묶인 메모리 6144)로는 남아도 그 호스트 노드(3072)에 들지 않으면 409 `no_capacity`다(꽂지 않음).
+#[tokio::test]
+async fn bound_vms_grow_memory_only_within_their_host_node() {
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let mut n = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    n.status.memory_mib = 65536;
+    n.status.topology = Some(
+        serde_json::from_value(json!({
+            "sockets": 1, "threads_per_core": 1, "cpus": "0-3", "pinning": true, "cpuset": true,
+            "probed_at": 1, "nodes": [{"id": 0, "cpus": "0-1", "memory_mib": 3072},
+                                      {"id": 1, "cpus": "2-3", "memory_mib": 3072}],
+        }))
+        .unwrap(),
+    );
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &n.status)
+        .await
+        .unwrap();
+    let mut req = vm_request("web");
+    req["spec"]["cpu"] = json!({ "cores": 2 });
+    req["spec"]["memory_mib"] = json!(1024);
+    req["spec"]["max_memory_mib"] = json!(4096);
+    req["spec"]["numa"] = json!({ "nodes": 1, "memory": "strict" });
+    req["spec"]["disks"] = json!([{ "volume": "boot", "bus": "virtio-blk" }]);
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    succeeded(&admin.act("web", "start").await);
+    let id: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    let hw = hardware(&env, id);
+    assert_eq!(hw.host_placement.as_ref().unwrap().host_nodes, [0]);
+    change(&env, id, |s| s.memory_mib = 4096).await;
+    let (status, body) = admin.post("/vms/web/actions/hotplug", Value::Null).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_capacity", "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("cannot grow its memory to 4096 MiB"),
+        "{body}"
+    );
+    assert!(env.hv.hotplug_calls().is_empty());
+    // 호스트 노드에 드는 만큼(3072)은 꽂는다.
+    change(&env, id, |s| s.memory_mib = 3072).await;
+    succeeded(&admin.act("web", "hotplug").await);
+}
+
 /// 다시 적용 동작은 핫플러그 기록이 있는 실행 중 VM에만, 모든 노드가 `hotplug`를 알 때만 받는다.
 #[tokio::test]
 async fn the_hotplug_action_needs_a_running_vm_and_the_feature() {
@@ -774,6 +825,7 @@ async fn a_vm_with_virtio_mem_does_not_move_to_a_node_without_it() {
         NodeHotplug {
             cpu: true,
             memory: false,
+            memory_prealloc: false,
         },
     )
     .await;

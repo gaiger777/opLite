@@ -733,8 +733,12 @@ CPU를 어떻게 나눌지와 hugepages를 얼마나 예약할지다. **Orbiviso
 | **전용**(`dedicated_cpus`) | 전용 VM의 vCPU와 `emulator isolate`의 에뮬레이터 스레드만. 한 pCPU에 한 vCPU | 관리자가 준다. 비우면 이 노드는 전용 VM을 받지 않는다 |
 | **공유**(나머지) | 공유 VM 전체와 전용 VM의 `emulator shared` 에뮬레이터 스레드 | 온라인 CPU − 예약 − 전용. 비면 안 된다 |
 
-- 예약이 있으면 orbivisord가 자기 모든 스레드의 친화를 예약 CPU로 둔다(시작할 때와 바뀔 때, 빼면 전체로 되돌림). QEMU·swtpm은
-  띄울 때 공유 집합(전용 VM은 에뮬레이터 집합)으로 다시 걸므로 예약 CPU에 갇히지 않는다.
+- 예약이 있으면 orbivisord가 자기 모든 스레드의 친화를 예약 CPU로 둔다(시작할 때와 바뀔 때, 빼면 orbivisord가 뜰 때의 친화로
+  되돌림). QEMU·swtpm은 띄울 때 공유 집합(전용 VM은 에뮬레이터 집합)으로 다시 걸므로 예약 CPU에 갇히지 않는다.
+- 노드 설정이 없으면 Orbivisor는 VM 스레드의 친화를 건드리지 않는다: QEMU는 orbivisord의 친화를 물려받고, 검사 루프는 고정한 적
+  없는 VM을 보지 않는다. 관리자가 `opld.service`의 `CPUAffinity=`나 `taskset`, 컨테이너 cpuset으로 VM을 좁혀 둔 것은 그대로다.
+  설정을 지우면 Orbivisor가 고정했던 VM만 한 번 orbivisord가 뜰 때의 친화로 풀고 그 뒤로는 손대지 않는다. cgroup cpuset(컨테이너,
+  슬라이스 `AllowedCPUs`)이 자른 친화는 맞은 것으로 본다.
 - 공유 집합이 바뀌면 검사 루프가 도는 공유 VM의 스레드 친화와 스코프 `AllowedCPUs`를 곧바로 다시 건다(swtpm은 켤 때의 집합에
   남는다). 전용 VM은 기록된 pCPU 그대로다.
 - 검증(**400** `invalid_host_resources`, `node "n1": …`): 온라인 CPU의 부분집합, 예약·전용이 겹치지 않음, 공유가 비지 않음, 예약의

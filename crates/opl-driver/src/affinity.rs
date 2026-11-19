@@ -2,8 +2,15 @@
 //! `sched_setaffinity`는 Linux만이다. 다른 OS에서는 고정을 부르지 않는다(토폴로지가 없어 배치·고정이 생기지 않는다).
 
 use std::path::Path;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use opl_types::numa::CpuSet;
+
+/// opld가 뜰 때의 자신의 친화([`remember_start`])
+static START: OnceLock<CpuSet> = OnceLock::new();
+/// opld가 스스로 예약 CPU로 좁혔다([`set_narrowed`])
+static NARROWED: AtomicBool = AtomicBool::new(false);
 
 /// `/proc/<pid>/task/<tid>/status`의 `Cpus_allowed_list`
 pub fn allowed_list(status: &str) -> Option<CpuSet> {
@@ -23,17 +30,60 @@ pub fn systemd_cpus(text: &str) -> Option<CpuSet> {
         .ok()
 }
 
-/// 고정(`pinning`)이 없는 VM의 자식(QEMU·swtpm)에 걸 친화: opld 자신의 친화(`proc/self/status`)가 온라인 CPU
-/// (`sys/devices/system/cpu/online`) 전체와 다르면(예약 CPU에 묶여 있음 — 노드 설정을 지운 직후 opld가 아직 풀리기 전
-/// 등) 온라인 전체, 같거나 읽지 못하면 None(물려받아도 된다). 새 QEMU가 예약 CPU를 물려받지 않게 한다(리뷰 1).
-pub fn unpinned_child(proc: &Path, sys: &Path) -> Option<CpuSet> {
-    let own = allowed_list(&std::fs::read_to_string(proc.join("self/status")).ok()?)?;
-    let online: CpuSet = std::fs::read_to_string(sys.join("devices/system/cpu/online"))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    (!online.is_empty() && own != online).then_some(online)
+/// opld가 뜰 때(예약 CPU로 좁히기 전) 자신의 친화(`proc/self/status`)를 한 번 적어 둔다. 관리자가 `CPUAffinity=`·
+/// `taskset`·컨테이너 cpuset으로 좁힌 그대로이고, 고정 없는 VM이 받을 친화다(리뷰 2 N3). 두 번째부터는 하지 않는다.
+pub fn remember_start(proc: &Path) {
+    if START.get().is_none()
+        && let Some(own) = std::fs::read_to_string(proc.join("self/status"))
+            .ok()
+            .and_then(|s| allowed_list(&s))
+    {
+        let _ = START.set(own);
+    }
+}
+
+/// [`remember_start`]가 적은 친화(적지 않았으면 None)
+pub fn start_cpus() -> Option<CpuSet> {
+    START.get().cloned()
+}
+
+/// opld가 스스로 예약 CPU로 좁혔는지 알린다(노드 설정 `reserved_cpus`를 적용하거나 푼 뒤).
+pub fn set_narrowed(narrowed: bool) {
+    NARROWED.store(narrowed, Ordering::Relaxed);
+}
+
+/// 고정(`pinning`)이 없는 VM의 자식(QEMU·swtpm)에 걸 친화: opld가 스스로 예약 CPU로 좁혀 있을 때만(노드 설정을 지운
+/// 직후 opld가 아직 풀리기 전) 뜰 때의 친화, 아니면 None(물려받음 — 관리자가 좁힌 opld의 친화를 그대로 따른다, 리뷰 2
+/// N3). 새 QEMU가 예약 CPU를 물려받지 않게 한다(리뷰 1).
+pub fn unpinned_child() -> Option<CpuSet> {
+    child_cpus(NARROWED.load(Ordering::Relaxed), START.get())
+}
+
+fn child_cpus(narrowed: bool, start: Option<&CpuSet>) -> Option<CpuSet> {
+    if narrowed { start.cloned() } else { None }
+}
+
+/// 스레드가 실제로 받을 친화: 원하는 것(`want`)과 프로세스의 cgroup cpuset(`allowed`, 컨테이너·슬라이스 `AllowedCPUs`)의
+/// 교집합. 커널이 `sched_setaffinity`를 그 안으로 자르므로 이것과 같으면 맞은 것이다 — 아니면 검사 루프가 회차마다 다시
+/// 건다(리뷰 2 N3). 교집합이 비거나 cpuset을 모르면 `want` 그대로다.
+pub fn effective(want: &CpuSet, allowed: Option<&CpuSet>) -> CpuSet {
+    match allowed {
+        Some(a) if !want.is_disjoint(a) => want.intersection(a),
+        _ => want.clone(),
+    }
+}
+
+/// 프로세스 `pid`의 cgroup v2 cpuset(`/proc/<pid>/cgroup`의 `0::<경로>` → `sys/fs/cgroup<경로>/cpuset.cpus.effective`).
+/// 읽지 못하면 None
+pub fn cgroup_cpus(proc: &Path, sys: &Path, pid: u32) -> Option<CpuSet> {
+    let cgroup = std::fs::read_to_string(proc.join(format!("{pid}/cgroup"))).ok()?;
+    let path = cgroup.lines().find_map(|l| l.strip_prefix("0::"))?.trim();
+    let file = sys
+        .join("fs/cgroup")
+        .join(path.trim_start_matches('/'))
+        .join("cpuset.cpus.effective");
+    let text = std::fs::read_to_string(file).ok()?;
+    text.trim().parse().ok().filter(|c: &CpuSet| !c.is_empty())
 }
 
 /// 스레드 `tid`(프로세스 `pid`)의 친화. 읽지 못하면(끝난 스레드) None
@@ -199,26 +249,35 @@ mod tests {
         assert_eq!(systemd_cpus("x y"), None);
     }
 
-    /// 리뷰 1 I5: opld가 온라인 CPU 전체보다 좁게 묶여 있으면 고정 없는 자식은 온라인 전체로 둔다.
+    /// 리뷰 2 N3: 고정 없는 자식은 opld가 스스로 좁혔을 때만 뜰 때의 친화(관리자가 좁힌 것 그대로)를 받고, 아니면
+    /// 물려받는다(관리자의 `CPUAffinity=`를 넓히지 않는다).
     #[test]
-    fn unpinned_children_get_every_online_cpu_when_opld_is_narrowed() {
+    fn unpinned_children_get_the_start_affinity_only_when_opld_narrowed_itself() {
+        let start: CpuSet = "0-3".parse().unwrap();
+        assert_eq!(child_cpus(true, Some(&start)), Some(start.clone()));
+        assert_eq!(child_cpus(false, Some(&start)), None);
+        assert_eq!(child_cpus(true, None), None);
+    }
+
+    /// 리뷰 2 N3: 컨테이너·슬라이스의 cpuset이 자른 친화는 맞은 것으로 본다.
+    #[test]
+    fn the_cgroup_cpuset_bounds_the_wanted_affinity() {
         let tmp = tempfile::tempdir().unwrap();
         let (proc, sys) = (tmp.path().join("proc"), tmp.path().join("sys"));
-        std::fs::create_dir_all(proc.join("self")).unwrap();
-        std::fs::create_dir_all(sys.join("devices/system/cpu")).unwrap();
-        std::fs::write(sys.join("devices/system/cpu/online"), "0-7\n").unwrap();
-        let status = |cpus: &str| {
-            std::fs::write(
-                proc.join("self/status"),
-                format!("Name:\topld\nCpus_allowed_list:\t{cpus}\n"),
-            )
-            .unwrap()
-        };
-        status("0-1");
-        assert_eq!(unpinned_child(&proc, &sys), Some("0-7".parse().unwrap()));
-        status("0-7");
-        assert_eq!(unpinned_child(&proc, &sys), None);
-        assert_eq!(unpinned_child(&tmp.path().join("none"), &sys), None);
+        std::fs::create_dir_all(proc.join("42")).unwrap();
+        std::fs::write(proc.join("42/cgroup"), "0::/machine.slice/opl-vm-x.scope\n").unwrap();
+        let dir = sys.join("fs/cgroup/machine.slice/opl-vm-x.scope");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("cpuset.cpus.effective"), "0-3\n").unwrap();
+        let allowed = cgroup_cpus(&proc, &sys, 42);
+        assert_eq!(allowed, Some("0-3".parse().unwrap()));
+        let want: CpuSet = "2-7".parse().unwrap();
+        assert_eq!(effective(&want, allowed.as_ref()), "2-3".parse().unwrap());
+        // 겹치지 않으면(커널이 거절) 원하는 것 그대로
+        let far: CpuSet = "6-7".parse().unwrap();
+        assert_eq!(effective(&far, allowed.as_ref()), far);
+        assert_eq!(effective(&want, None), want);
+        assert_eq!(cgroup_cpus(&proc, &sys, 7), None);
     }
 
     #[test]

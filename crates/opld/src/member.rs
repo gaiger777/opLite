@@ -466,6 +466,10 @@ impl Member {
         host.cpu = Some(cpu_watch.probe_now().await.clone());
         // NUMA 토폴로지(계획 64, Linux만)도 등록 전에 읽는다. 노드 설정 `host_resources`(hugepages 예약·opld 친화)를 먼저
         // 적용한다. 그 뒤로는 검사 루프가 설정 바뀜과 30초마다 다시 읽는다.
+        // 예약 CPU로 좁히기 전의 opld 친화(관리자가 좁힌 그대로)를 적어 둔다 — 고정 없는 VM이 받을 친화다(리뷰 2 N3).
+        if cfg!(target_os = "linux") {
+            opl_driver::affinity::remember_start(std::path::Path::new("/proc"));
+        }
         let mut topology_watch = cfg!(target_os = "linux")
             .then(|| TopologyWatch::new("/sys", "/proc", host.systemd_scope));
         if let Some(watch) = &mut topology_watch {
