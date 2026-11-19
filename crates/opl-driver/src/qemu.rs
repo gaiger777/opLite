@@ -32,8 +32,8 @@ use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, AddOutcome, BackupTarget, DiskBitmaps, DiskCounters, EventKind, Hypervisor,
-    HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
+    ActualState, AddOutcome, BackupTarget, CpuProbe, DiskBitmaps, DiskCounters, EventKind,
+    Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
@@ -1930,6 +1930,19 @@ impl Hypervisor for QemuHypervisor {
                 .as_ref()
                 .is_some_and(|p| p.code.is_file() && p.vars_template.is_file()),
         }
+    }
+
+    async fn cpu_catalog(&self) -> Result<CpuProbe, DriverError> {
+        let host = &self.config.host;
+        opl_qemu::cpu::probe(
+            &host.qemu_binary,
+            host.arch,
+            host.accel,
+            &self.config.run_dir,
+            opl_qemu::cpu::PROBE_TIMEOUT,
+        )
+        .await
+        .map_err(|e| DriverError::CpuProbe(e.to_string()))
     }
 
     async fn set_vcpus(

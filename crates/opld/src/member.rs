@@ -52,6 +52,7 @@ use uuid::Uuid;
 use crate::bootstrap;
 use crate::checks::{CheckerConfig, HealthChecker};
 use crate::config::Config;
+use crate::cpu::CpuWatch;
 use crate::fence_watch::FenceWatch;
 use crate::firewall::{FirewallAgent, FirewallRules};
 use crate::guest::GuestInfoStore;
@@ -437,6 +438,13 @@ impl Member {
         // TPM·Secure Boot 능력(계획 59, swtpm·`-tpmdev help`·Secure Boot 펌웨어)도 등록 전에 살핀다.
         host.firmware_caps = hv.firmware_caps().await;
         let firmware_caps = host.firmware_caps;
+        // CPU 모델·플래그(계획 63)도 등록 전에 한 번 읽는다. 그 뒤로는 검사 루프가 QEMU 바뀜을 보고 다시 읽는다.
+        let mut cpu_watch = CpuWatch::new(
+            hv.clone(),
+            host.profile.qemu_binary.clone(),
+            host.profile.accel.as_str(),
+        );
+        host.cpu = Some(cpu_watch.probe_now().await.clone());
         // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
         let tls_dir = migration_tls_dir(&config.data_dir);
         if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
@@ -866,6 +874,7 @@ impl Member {
                     firmware_caps: Some(firmware_caps),
                 },
                 state.audit.clone(),
+                Some(cpu_watch),
             )
         });
         let monitor = on(&rt.core, || {

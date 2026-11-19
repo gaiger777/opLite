@@ -57,6 +57,9 @@ pub enum DriverError {
     /// 게스트 에이전트가 답하지 않았거나 오류로 답했다(계획 59). API는 409 `guest_agent_unavailable`로 알린다.
     #[error("guest agent unavailable: {0}")]
     GuestAgent(String),
+    /// 노드 CPU 탐침(계획 63)이 QEMU에서 모델·플래그를 읽지 못했다.
+    #[error("CPU probe failed: {0}")]
+    CpuProbe(String),
     #[error(transparent)]
     Qmp(#[from] QmpError),
     #[error("i/o error: {0}")]
@@ -98,6 +101,7 @@ impl DriverError {
             | DriverError::Rbd(_)
             | DriverError::Migration(_)
             | DriverError::Replication(_)
+            | DriverError::CpuProbe(_)
             | DriverError::GuestAgent(_)
             | DriverError::Overlay(_) => false,
         }

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 pub use opl_qemu::BitmapInfo;
+pub use opl_qemu::CpuProbe;
 use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::runtime::{RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
@@ -422,6 +423,10 @@ pub trait Hypervisor: Send + Sync {
     /// 이 노드의 펌웨어 능력(계획 59). TPM은 `swtpm`·`swtpm_setup`이 있고 swtpm이 TPM 2.0을 하며 QEMU에
     /// `emulator` TPM 백엔드가 있을 때, Secure Boot는 MS 키를 등록한 펌웨어(firmware descriptor·설정)가 있을 때다.
     async fn firmware_caps(&self) -> FirmwareCaps;
+
+    /// 이 노드 QEMU의 CPU 모델·플래그(계획 63 §6). QEMU를 VM과 같은 머신·가속기로 `-S`로 한 번 띄워 QMP로 묻고 끈다
+    /// (보통 1초 안쪽, 30초 제한). 카탈로그와 호스트 CPU(KVM의 `full host`)를 돌려준다.
+    async fn cpu_catalog(&self) -> Result<CpuProbe, DriverError>;
 
     /// 핫플러그 배치로 켠 VM의 켜진 vCPU 수를 `from`에서 `to`로 바꾸고 닿은 수를 돌려준다. `cpu`는 켤 때의 CPU
     /// 모양(소켓·상한으로 vCPU `i`의 자리를 정한다)이다. 늘리기(같은 수 포함)는 켤 때 수부터 `to` 아래의 빈 자리에

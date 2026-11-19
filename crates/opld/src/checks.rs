@@ -1,7 +1,8 @@
 //! HA 상태 검사의 노드 쪽 검사기(설계 §8.2). [`CHECK_INTERVAL`]마다 켜진 `HaCheck`와 클러스터 링크의 자동 검사
 //! (`cluster-link-<n>`)를 이 노드의 대상으로 동시에 돌려 결과를 리스 갱신에 싣고(`Cluster::set_lease_checks`),
 //! 저장된 것과 다르면 `NodeStatus.checks`에 쓴다(화면용). 인터페이스 목록(`NodeStatus.interfaces`)도 여기서
-//! 쓰고, 본딩 상태가 바뀌면 감사 항목과 기록 Task(`bond-degraded`)로 알린다. 위트니스는 띄우지 않는다.
+//! 쓰고, 본딩 상태가 바뀌면 감사 항목과 기록 Task(`bond-degraded`)로 알린다. 노드 CPU 탐침(계획 63, [`CpuWatch`])도
+//! 회차마다 거두어 카탈로그를 올리고 `NodeStatus.cpu`를 쓴다. 위트니스는 띄우지 않는다.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
@@ -30,6 +31,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::bootstrap;
+use crate::cpu::{self, CpuWatch, Probed};
 
 /// 검사 회차의 간격
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -92,8 +94,10 @@ impl HealthChecker {
         node_name: String,
         config: CheckerConfig,
         audit: Arc<AuditLog>,
+        cpu: Option<CpuWatch>,
     ) -> Self {
-        let state = State::new(cluster, node_name, config, audit);
+        let mut state = State::new(cluster, node_name, config, audit);
+        state.cpu = cpu;
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
@@ -167,6 +171,8 @@ pub struct State {
     pvs_cache: HashMap<String, (Instant, Result<Vec<String>, String>)>,
     /// 본딩 상태 알림
     bonds: BondWatch,
+    /// 노드 CPU 탐침(계획 63). 없으면 `NodeStatus.cpu`를 건드리지 않는다.
+    cpu: Option<CpuWatch>,
 }
 
 impl State {
@@ -212,6 +218,7 @@ impl State {
             stuck: HashMap::new(),
             pvs_cache: HashMap::new(),
             bonds: BondWatch::default(),
+            cpu: None,
         }
     }
 
@@ -541,9 +548,23 @@ impl State {
         }
     }
 
-    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이 있을 때만,
-    /// 64개까지).
+    /// 마지막 CPU 탐침 결과를 쓸 수 있으면(모든 노드가 `cpu-models`를 앎) 그것을 돌려주고, 성공한 탐침의 카탈로그가
+    /// 클러스터에 없으면 만든다(janitor가 지웠으면 다시).
+    async fn publish_cpu(&self) -> Option<&Probed> {
+        let probed = self.cpu.as_ref()?.last()?;
+        if !cpu::cpu_models_ready(&self.cluster, &self.name) {
+            return None;
+        }
+        if let Probed::Ok { catalog, cpu: now } = probed {
+            cpu::publish(&self.cluster, &now.catalog, catalog).await;
+        }
+        Some(probed)
+    }
+
+    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`·`cpu`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이
+    /// 있을 때만, 64개까지).
     async fn write_status(&self, checks: &[CheckReport]) {
+        let probed = self.publish_cpu().await;
         let interfaces = self
             .interfaces
             .as_deref()
@@ -573,6 +594,13 @@ impl State {
             {
                 status.firmware_caps = Some(caps);
                 changed = true;
+            }
+            if let Some(probed) = probed {
+                let cpu = probed.node_cpu(status.cpu.as_ref());
+                if status.cpu.as_ref() != Some(&cpu) {
+                    status.cpu = Some(cpu);
+                    changed = true;
+                }
             }
             changed
         })
@@ -607,6 +635,9 @@ fn not_responding(dir: &Path) -> String {
 
 /// 한 회차: 이 노드의 모든 검사를 동시에 돌려 리스 갱신에 싣고, 바뀌었으면 노드 상태에 쓴다. 결과는 이름 순이다.
 pub async fn run_once(state: &mut State) -> Vec<CheckReport> {
+    if let Some(watch) = &mut state.cpu {
+        watch.poll().await;
+    }
     state.resolve_hosts().await;
     state.refresh_interfaces().await;
     let checks = match state.cluster.list::<HaCheckSpec>() {
@@ -1127,6 +1158,129 @@ mod tests {
         run_once(&mut state).await;
         assert_eq!(s.node().status.hotplug, Some(caps));
         assert_eq!(s.node().status.firmware_caps, Some(firmware));
+    }
+
+    /// 탐침을 마친 CPU 감시(MockHypervisor)
+    async fn cpu_watch(hv: &Arc<opl_driver::MockHypervisor>) -> CpuWatch {
+        let mut watch = CpuWatch::new(hv.clone(), "/nonexistent/qemu".into(), "kvm");
+        watch.probe_now().await;
+        watch
+    }
+
+    fn catalogs(s: &Setup) -> Vec<opl_types::cpu::CpuCatalog> {
+        s.cluster
+            .list::<opl_types::cpu::CpuCatalogSpec>()
+            .unwrap()
+            .1
+    }
+
+    /// 모든 노드가 `cpu-models`를 알면 카탈로그를 해시 이름으로 한 번 올리고 `NodeStatus.cpu`를 쓴다. 지워지면(janitor,
+    /// 옛 리더) 다음 회차에 다시 쓴다. 같으면 쓰지 않는다.
+    #[tokio::test]
+    async fn the_cpu_catalog_is_published_by_hash() {
+        let s = setup().await;
+        let hv = Arc::new(opl_driver::MockHypervisor::default());
+        let mut state = s.state(&[]);
+        state.cpu = Some(cpu_watch(&hv).await);
+        run_once(&mut state).await;
+        let probe = opl_driver::mock_cpu_probe();
+        let hash = probe.catalog.hash();
+        let cpu = s.node().status.cpu.unwrap();
+        assert_eq!(
+            (cpu.catalog.as_str(), cpu.accel.as_str()),
+            (hash.as_str(), "kvm")
+        );
+        assert_eq!(cpu.model_id.as_deref(), Some("Mock Intel Xeon"));
+        let list = catalogs(&s);
+        assert_eq!(list.len(), 1);
+        assert_eq!(
+            (list[0].name.as_str(), &list[0].spec),
+            (hash.as_str(), &probe.catalog)
+        );
+        assert_eq!(list[0].spec.hash(), list[0].name);
+        let revision = s.node().revision;
+        run_once(&mut state).await;
+        assert_eq!(s.node().revision, revision);
+        assert_eq!(catalogs(&s)[0].revision, list[0].revision);
+
+        s.cluster
+            .delete::<opl_types::cpu::CpuCatalogSpec>(list[0].id, None)
+            .await
+            .unwrap();
+        bootstrap::update_node_status(&s.cluster, |status| {
+            status.cpu = None;
+            true
+        })
+        .await
+        .unwrap();
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.cpu, Some(cpu));
+        assert_eq!(catalogs(&s).len(), 1);
+        assert_eq!(hv.cpu_probes(), 1);
+    }
+
+    /// 다른 노드가 이미 같은 카탈로그를 올렸으면 그것을 쓴다.
+    #[tokio::test]
+    async fn a_catalog_another_node_published_is_reused() {
+        let s = setup().await;
+        let probe = opl_driver::mock_cpu_probe();
+        let hash = probe.catalog.hash();
+        s.cluster
+            .create(&Resource::new(hash.clone(), probe.catalog.clone()))
+            .await
+            .unwrap();
+        let hv = Arc::new(opl_driver::MockHypervisor::default());
+        let mut state = s.state(&[]);
+        state.cpu = Some(cpu_watch(&hv).await);
+        run_once(&mut state).await;
+        assert_eq!(catalogs(&s).len(), 1);
+        assert_eq!(s.node().status.cpu.unwrap().catalog, hash);
+    }
+
+    /// 옛 노드가 있으면(기능 `cpu-models`를 모름) 읽기만 하고 아무것도 쓰지 않는다. 탐침이 실패하면 앞 카탈로그를 두고
+    /// 오류만 쓴다.
+    #[tokio::test]
+    async fn the_cpu_probe_waits_for_the_feature_and_keeps_the_last_catalog() {
+        let s = setup().await;
+        let mut old: opl_types::node::Node = Resource::new(
+            "n2",
+            NodeSpec {
+                address: "h2:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        old.status.features = vec![HA_CHECKS.into()];
+        s.cluster.create(&old).await.unwrap();
+        let hv = Arc::new(opl_driver::MockHypervisor::default());
+        let mut state = s.state(&[]);
+        state.cpu = Some(cpu_watch(&hv).await);
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.cpu, None);
+        assert!(catalogs(&s).is_empty());
+
+        // 옛 노드가 올라옴
+        let mut n2 = s.cluster.get_by_name::<NodeSpec>("n2").unwrap().unwrap();
+        n2.status.features.push(opl_types::node::CPU_MODELS.into());
+        s.cluster
+            .update_status::<NodeSpec>(n2.id, &n2.status)
+            .await
+            .unwrap();
+        run_once(&mut state).await;
+        let cpu = s.node().status.cpu.unwrap();
+        assert_eq!(catalogs(&s).len(), 1);
+
+        // 다시 읽기가 실패함: 카탈로그는 그대로, 오류만
+        hv.set_cpu_catalog(Err("QEMU is gone".into()));
+        state.cpu.as_mut().unwrap().probe_now().await;
+        run_once(&mut state).await;
+        let failed = s.node().status.cpu.unwrap();
+        assert_eq!(failed.catalog, cpu.catalog);
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("CPU probe failed: QEMU is gone")
+        );
     }
 
     /// 링크 검사: carrier가 0이 되면 다음 회차에 실패이고 시작 시각이 붙으며 노드 상태에 쓴다. 결과가 같으면 다시

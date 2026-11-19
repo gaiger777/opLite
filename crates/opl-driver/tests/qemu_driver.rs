@@ -1294,3 +1294,26 @@ async fn a_linked_clone_disk_opens_its_backing_file() {
     hv.stop(vm.id, StopMode::Force).await.unwrap();
     assert_eq!(std::fs::read(&base_path).unwrap(), base_bytes);
 }
+
+/// 노드 CPU 탐침(계획 63): 이 호스트의 QEMU·가속기로 카탈로그를 읽는다. aarch64 KVM·HVF는 명명 모델을 켤 수 없다.
+#[tokio::test]
+async fn cpu_catalog_probes_the_host_qemu() {
+    let tmp = short_tempdir();
+    let cfg = config(tmp.path());
+    let host = cfg.host.clone();
+    let hv = QemuHypervisor::new(cfg).await.unwrap();
+    let probe = hv.cpu_catalog().await.unwrap();
+    let c = &probe.catalog;
+    assert_eq!((c.arch, c.accel.as_str()), (host.arch, host.accel.as_str()));
+    assert_eq!(c.qemu, hv.qemu_version().await.unwrap());
+    assert_eq!(c.machine, host.arch.machine());
+    assert!(!c.models.is_empty() && !c.supported.is_empty());
+    if host.arch == Arch::Aarch64 && host.accel != Accel::Tcg {
+        assert!(c.models.iter().all(|m| m.missing_other == ["accel"]));
+    }
+    if host.accel == Accel::Kvm && host.arch == Arch::X86_64 {
+        assert!(probe.vendor.is_some());
+    }
+    // 같은 QEMU면 같은 해시다.
+    assert_eq!(hv.cpu_catalog().await.unwrap().catalog.hash(), c.hash());
+}

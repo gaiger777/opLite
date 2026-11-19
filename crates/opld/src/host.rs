@@ -7,6 +7,7 @@ use opl_qemu::{Accel, HostProfile};
 use opl_types::node::{BridgeInfo, FirmwareCaps, NodeHotplug};
 
 use crate::config::{AccelSetting, Config};
+use crate::cpu::Probed;
 
 /// 이 노드가 VM을 실행하는 방법
 #[derive(Debug, Clone)]
@@ -27,6 +28,8 @@ pub struct Host {
     ///
     /// [`Hypervisor::firmware_caps`]: opl_driver::Hypervisor::firmware_caps
     pub firmware_caps: FirmwareCaps,
+    /// 등록 전에 읽은 CPU 탐침 결과(계획 63). 등록이 `NodeStatus.cpu`에 쓴다. 그 전에는 없다.
+    pub cpu: Option<Probed>,
     /// swtpm 실행 파일(`[hypervisor] swtpm`·`swtpm_setup`)
     pub swtpm: opl_driver::SwtpmConfig,
 }
@@ -54,6 +57,7 @@ impl Host {
             systemd_scope: config.hypervisor.systemd_scope,
             hotplug: NodeHotplug::default(),
             firmware_caps: FirmwareCaps::default(),
+            cpu: None,
             swtpm: config.swtpm(),
         })
     }

@@ -24,8 +24,8 @@ pub use hostcheck::{
     rados_args, rados_result, refresh_interfaces, reported_interfaces,
 };
 pub use hypervisor::{
-    ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
+    ActualState, AddOutcome, BackupTarget, BitmapInfo, CpuProbe, DiskBitmaps, DiskCounters,
+    EventKind, Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 pub use migration::{
     CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
@@ -34,7 +34,7 @@ pub use migration::{
 };
 pub use mock::{
     CatchUpCall, GuestAnswer, HotplugCall, IncrementalCall, MOCK_INCREMENT_BYTES, MockHypervisor,
-    ReplicationCall,
+    ReplicationCall, mock_cpu_probe,
 };
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};
 pub use opl_types::storage::SourceFormat;

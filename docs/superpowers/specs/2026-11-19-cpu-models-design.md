@@ -221,3 +221,15 @@
 - **명령줄(스테이지 3 전 임시)**: `cmdline.rs`는 `host`·`max` 밖의 모델을 `host`처럼 켠다(API가 막아 오지 않는다). `opld` 등록은 `NodeStatus.cpu`를 지우지 않고 둔다.
 - **임시 API 막기**: 타입이 새 모델 문자열·`flags`를 풀게 되었으므로 `vms.rs` `prepare`가 `host`·`max` 밖이나 플래그가 있으면 `require_feature(CPU_MODELS)`(409) 뒤 400으로 거절한다(`tests/cpu_models.rs`). 스테이지 5가 이 400을 검증·별칭 고정으로 바꾼다.
 - `schema.d.ts`를 다시 만들었다. 이 브랜치의 기준(`e04f9a8`)이 main의 `f83a523`(풀 설명 바뀜) 전이라 그 차이도 함께 들어갔다.
+
+### 스테이지 2 (노드 CPU 탐침)
+
+- **크기 측정**(이 Mac의 QEMU 11.1.2): x86_64 TCG 카탈로그는 모델 186개·플래그 407개(`max`가 주는 것 89개)로 **41,134바이트**(§7의 어림 40 KB와 같다). aarch64 TCG는 모델 12개·플래그 23개로 874바이트, aarch64 HVF는 12개·3개로 980바이트. 탐침은 x86 정적 확장 186번을 포함해 0.3초 안쪽이다.
+- **카탈로그에 넣는 모델**: `host`·`max`·`base`와 `CpuModel::Named`로 풀리지 않는 이름은 넣지 않는다(`host`·`max`는 API가 의사 항목으로 보인다). aarch64는 모델마다 `full` 확장을 묻고 `aarch64` 속성이 참이 아닌 모델(32비트 `cortex-a15`·`arm926`, M·R 프로필)을 뺀다 — `virt` aarch64 게스트로 켤 수 없고, 표를 박지 않고 QMP로 가린다. 38개 정의 가운데 12개가 남는다.
+- **플래그 이름**: x86은 설계대로 `-cpu help`의 "Recognized CPUID flags"(맞춘 뒤 407개 — `_`·`-` 짝이 하나가 된다), aarch64는 `full max`의 불 속성(거짓인 `pauth-impdef`도 이름이다). `supported`는 `full max`의 참을 맞춘 이름으로 셈한다(`lahf_lm`·`sse4-1` 같은 옛 이름도 들어간다).
+- **x86 별칭**: 정적 확장을 묻지 않고(`features` 없음) 벤더는 가리키는 버전 모델의 것을 쓴다. 별칭은 기준 후보가 아니고 스테이지 5가 버전 이름으로 바꾼다.
+- **고정물**은 탐침이 실제로 모으는 것(`CpuProbeReplies`) 그대로다. 탐침이 받을 때 카탈로그에 쓰지 않는 값(거짓인 불, `vendor` 밖의 값)을 버리므로 x86 고정물이 220 KB다(버리지 않으면 2.2 MB). `cargo test -p opl-qemu --features qemu-it --test cpu_probe`가 `OPL_RECORD_CPU_FIXTURES=DIR`이면 다시 기록하고, KVM이면 응답을 로그에 찍는다(GitHub `linux-kvm`의 KVM 고정물은 그 로그에서 옮긴다 — 아직 없다, 스테이지 3). KVM `full host`는 기록한 TCG 응답에 더한 합성 시험으로 본다. 고정물 x86 카탈로그의 해시는 시험에 고정했다(직렬화가 바뀌면 같은 노드가 새 카탈로그를 올리므로 알아차리게).
+- **탐침 결과에 호스트 CPU**: `Hypervisor::cpu_catalog()`는 `CpuCatalogSpec`이 아니라 `CpuProbe { catalog, vendor, model_id }`를 돌려준다. `NodeCpu.vendor`·`model_id`는 `full host`(KVM만)의 것이고, 카탈로그 `vendor`는 설계대로 `max`의 것이다. 실패는 새 `DriverError::CpuProbe`다. QMP는 `-qmp stdio` 대신 실행 디렉터리의 유닉스 소켓(`cpu-probe-{pid}-{n}.qmp`)으로 기존 `QmpClient`를 쓴다.
+- **`NodeCpu`도 기능 게이트 뒤다.** §12는 "카탈로그는 올리지 않고 `NodeCpu`만 쓴다"였으나, 옛 리더가 노드 상태를 다시 쓰며 모르는 `cpu`를 지우면 검사 루프가 회차마다 다시 쓰게 되고, 업그레이드 중 노드 상태도 바이트 그대로 두는 편이 낫다. 그래서 다른 모든 노드가 `cpu-models`를 알릴 때까지 탐침은 읽기만 하고 아무것도 쓰지 않는다(이 노드는 이 빌드라 게이트에서 뺀다 — 등록이 자기 기능을 함께 쓰므로).
+- **등록·검사 루프**: `member.rs`가 `firmware_caps` 옆에서 한 번 읽고(`CpuWatch::probe_now`) 등록(`record_node`)이 쓴다. 검사 루프는 회차(5초)마다 바이너리(이름이면 `PATH`에서 찾고 심볼릭 링크를 따라간 실제 파일)의 (경로, 크기, mtime)을 보고 바뀌면 탐침을 **뒤에서** 띄운다(검사 회차를 늦추지 않게, 다음 회차가 거둔다). 실패한 탐침은 바이너리가 그대로여도 10분마다 다시 한다(apt가 바꾸는 중에 읽어 실패한 경우). 카탈로그 리소스는 검사 회차가 만든다(없으면 만들고 `name_taken`은 성공) — janitor가 지운 뒤에도 다음 회차가 되살린다. 관리자 다시 읽기(Task `node-cpu-probe`)는 스테이지 5다.
+- **janitor**: 어느 노드의 `NodeStatus.cpu.catalog`도 아니고 만든 지(UUIDv7 id의 시각) 1시간이 넘은 카탈로그를 지운다(읽은 revision에서만).

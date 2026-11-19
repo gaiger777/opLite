@@ -8,18 +8,19 @@ use async_trait::async_trait;
 use opl_qemu::QmpError;
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::cloud_init::CloudInitSeed;
+use opl_types::cpu::{Bits, CatalogModel, CpuCatalogSpec};
 use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
-use opl_types::vm::{CpuSpec, DiskBus, RunningHardware};
+use opl_types::vm::{Arch, CpuSpec, DiskBus, MachineType, RunningHardware};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
 
 use crate::error::DriverError;
 use crate::hypervisor::{
-    ActualState, AddOutcome, BackupTarget, BitmapInfo, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
+    ActualState, AddOutcome, BackupTarget, BitmapInfo, CpuProbe, DiskBitmaps, DiskCounters,
+    EventKind, Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
@@ -29,6 +30,62 @@ use crate::replication::{ReceiverExport, ReplicaDiskTarget, ReplicateRequest};
 
 /// 따로 정하지 않았을 때 `qemu_version`이 돌려주는 버전
 pub const MOCK_QEMU_VERSION: &str = "8.2.2";
+
+/// 따로 정하지 않았을 때 `cpu_catalog`가 돌려주는 탐침 결과: x86_64 KVM Intel 노드, 플래그 다섯, 모델 셋(`Skylake-Server-v5`는
+/// 켤 수 있고, `Icelake-Server-v7`은 `avx512vbmi`가 없어 못 켜며, `Icelake-Server`는 그 별칭)
+pub fn mock_cpu_probe() -> CpuProbe {
+    let flags: Vec<String> = ["aes", "avx2", "avx512f", "avx512vbmi", "sse4.2"]
+        .map(String::from)
+        .to_vec();
+    let bits = |names: &[&str]| {
+        Bits::from_indices(
+            names
+                .iter()
+                .map(|n| flags.iter().position(|f| f == n).unwrap()),
+        )
+    };
+    let model = |name: &str, missing: &[&str], features: &[&str]| CatalogModel {
+        name: name.into(),
+        alias_of: None,
+        vendor: Some("GenuineIntel".into()),
+        missing: bits(missing),
+        missing_other: Vec::new(),
+        features: Some(bits(features)),
+        migration_safe: true,
+        deprecated: false,
+    };
+    let catalog = CpuCatalogSpec {
+        arch: Arch::X86_64,
+        accel: "kvm".into(),
+        qemu: MOCK_QEMU_VERSION.into(),
+        machine: MachineType::Q35,
+        supported: bits(&["aes", "avx2", "avx512f", "sse4.2"]),
+        vendor: Some("GenuineIntel".into()),
+        models: vec![
+            CatalogModel {
+                alias_of: Some("Icelake-Server-v7".into()),
+                features: None,
+                ..model("Icelake-Server", &["avx512vbmi"], &[])
+            },
+            model(
+                "Icelake-Server-v7",
+                &["avx512vbmi"],
+                &["aes", "avx2", "avx512f", "avx512vbmi", "sse4.2"],
+            ),
+            model(
+                "Skylake-Server-v5",
+                &[],
+                &["aes", "avx2", "avx512f", "sse4.2"],
+            ),
+        ],
+        flags: flags.clone(),
+    };
+    CpuProbe {
+        catalog,
+        vendor: Some("GenuineIntel".into()),
+        model_id: Some("Mock Intel Xeon".into()),
+    }
+}
 
 /// `mirror_disks`가 디스크 하나마다 복사한 것으로 알리는 바이트(가짜 진행률)
 pub const MOCK_MIRROR_BYTES: u64 = 1 << 30;
@@ -315,6 +372,10 @@ struct MockState {
     quiesce_calls: Vec<(Uuid, bool)>,
     /// `set_firmware_caps`로 정한 능력(없으면 TPM·Secure Boot 모두)
     firmware_caps: Option<FirmwareCaps>,
+    /// `set_cpu_catalog`로 정한 탐침 결과(없으면 [`mock_cpu_probe`]), 문자열은 실패
+    cpu_catalog: Option<Result<CpuProbe, String>>,
+    /// `cpu_catalog` 호출 수
+    cpu_probes: usize,
 }
 
 impl Default for MockHypervisor {
@@ -543,6 +604,16 @@ impl MockHypervisor {
     /// 이후 `firmware_caps`가 이 능력을 돌려준다.
     pub fn set_firmware_caps(&self, caps: FirmwareCaps) {
         self.state.lock().unwrap().firmware_caps = Some(caps);
+    }
+
+    /// 이후 `cpu_catalog`가 이 결과를 돌려준다(`Err`는 [`DriverError::CpuProbe`]).
+    pub fn set_cpu_catalog(&self, probe: Result<CpuProbe, String>) {
+        self.state.lock().unwrap().cpu_catalog = Some(probe);
+    }
+
+    /// `cpu_catalog` 호출 수(실패 포함)
+    pub fn cpu_probes(&self) -> usize {
+        self.state.lock().unwrap().cpu_probes
     }
 
     /// 에이전트가 답하는지: 정한 답, 없으면 채널을 달고 띄운 VM은 `Hang`, 아니면 `None`
@@ -2102,6 +2173,15 @@ impl Hypervisor for MockHypervisor {
         })
     }
 
+    async fn cpu_catalog(&self) -> Result<CpuProbe, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.cpu_probes += 1;
+        match &st.cpu_catalog {
+            None => Ok(mock_cpu_probe()),
+            Some(probe) => probe.clone().map_err(DriverError::CpuProbe),
+        }
+    }
+
     /// 실제 드라이버처럼 켤 때 수 아래·상한 위는 `InvalidSpec`이다. 지금 수에서 `to`로 바꾼다(`from`은 기록만).
     async fn set_vcpus(
         &self,
@@ -2436,6 +2516,39 @@ mod tests {
         );
         hv.set_firmware_caps(FirmwareCaps::default());
         assert_eq!(hv.firmware_caps().await, FirmwareCaps::default());
+    }
+
+    /// 기본 탐침 결과는 정렬된 카탈로그이고(해시가 응답 순서에 매이지 않게), 정한 결과·실패로 바꿀 수 있다.
+    #[tokio::test]
+    async fn cpu_catalog_returns_the_set_probe() {
+        use opl_types::cpu::{CpuSource, ResolvedCpu, can_run};
+        let hv = MockHypervisor::default();
+        let p = hv.cpu_catalog().await.unwrap();
+        let c = &p.catalog;
+        assert!(c.flags.windows(2).all(|w| w[0] < w[1]));
+        assert!(c.models.windows(2).all(|w| w[0].name < w[1].name));
+        let cpu = |model: &str| ResolvedCpu {
+            model: model.into(),
+            flags: BTreeMap::new(),
+            enforce: true,
+            source: CpuSource::Spec,
+        };
+        can_run(&cpu("Skylake-Server-v5"), c).unwrap();
+        assert_eq!(
+            can_run(&cpu("Icelake-Server-v7"), c).unwrap_err().missing,
+            ["avx512vbmi"]
+        );
+        let mut other = mock_cpu_probe();
+        other.catalog.accel = "tcg".into();
+        hv.set_cpu_catalog(Ok(other.clone()));
+        assert_eq!(hv.cpu_catalog().await.unwrap(), other);
+        hv.set_cpu_catalog(Err("no qemu".into()));
+        let err = hv.cpu_catalog().await.unwrap_err();
+        assert!(
+            matches!(&err, DriverError::CpuProbe(m) if m == "no qemu"),
+            "{err}"
+        );
+        assert_eq!(hv.cpu_probes(), 3);
     }
 
     #[tokio::test]

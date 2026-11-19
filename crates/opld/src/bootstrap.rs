@@ -209,10 +209,16 @@ async fn record_node(
     let bridges = host.bridges().await;
     let cpus = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
     let memory_mib = crate::host::memory_mib();
+    // 다른 노드가 모두 `cpu-models`를 알 때만 CPU 탐침 결과를 쓴다(계획 63 §12).
+    let cpu_ready = crate::cpu::cpu_models_ready(cluster, &config.name);
     update_node_status(cluster, |status| {
+        let previous = status.cpu.take();
         *status = NodeStatus {
-            // CPU 카탈로그(계획 63)는 탐침이 쓴다. 이미 적힌 것을 지우지 않는다.
-            cpu: status.cpu.take(),
+            // 탐침 결과(실패면 앞 카탈로그에 오류만). 쓰지 못하면 이미 적힌 것을 지우지 않는다.
+            cpu: match &host.cpu {
+                Some(probed) if cpu_ready => Some(probed.node_cpu(previous.as_ref())),
+                _ => previous,
+            },
             online: true,
             cpus,
             memory_mib,
@@ -698,6 +704,38 @@ pub(crate) mod tests {
         register_node(&cluster, &config, &host).await.unwrap();
         let node = cluster.get::<NodeSpec>(id.0).unwrap().unwrap();
         assert_eq!(node.status.firmware_caps, Some(host.firmware_caps));
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 등록 전에 읽은 CPU 탐침 결과를 기록한다(계획 63). 실패면 앞 카탈로그를 두고 오류만, 탐침이 없으면 기록된 것을
+    /// 지우지 않는다.
+    #[tokio::test]
+    async fn registration_records_the_cpu_probe() {
+        use crate::cpu::Probed;
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let cpu = || cluster.get::<NodeSpec>(id.0).unwrap().unwrap().status.cpu;
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(cpu(), None);
+        let ok = Probed::new(Ok(opl_driver::mock_cpu_probe()), "kvm", 7);
+        host.cpu = Some(ok.clone());
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(cpu(), Some(ok.node_cpu(None)));
+        host.cpu = Some(Probed::new(
+            Err(opl_driver::DriverError::CpuProbe("gone".into())),
+            "kvm",
+            8,
+        ));
+        register_node(&cluster, &config, &host).await.unwrap();
+        let failed = cpu().unwrap();
+        assert_eq!(failed.catalog, ok.node_cpu(None).catalog);
+        assert!(failed.error.is_some());
+        host.cpu = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(cpu(), Some(failed));
         cluster.shutdown().await.unwrap();
     }
 

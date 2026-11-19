@@ -15,6 +15,7 @@ mod bootstrap;
 mod checks;
 mod config;
 mod control;
+mod cpu;
 #[cfg(feature = "ha-it")]
 mod fault;
 mod fence_watch;

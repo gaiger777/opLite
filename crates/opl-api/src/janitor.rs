@@ -5,7 +5,8 @@
 //! 끝난 Task는 기간·개수 기준으로 지운다(웹 정리 설계 §2). 오래 `receiving`인 백업(보내던 클러스터가
 //! 끝내지 못한 사본)은 지우기 Task를 만들어 파일과 함께 지운다(엔터프라이즈 설계 §6.1).
 //! 끝났거나 쓸 수 없게 된(주인이 없거나 비밀번호가 바뀐) 로그인 세션을 지운다(가용성 설계 §4). 실패로 끝낸
-//! Ceph Task가 잡은 자리(`CephStatus.pending`)를 놓는다.
+//! Ceph Task가 잡은 자리(`CephStatus.pending`)를 놓는다. 어느 노드도 가리키지 않고 만든 지 1시간이 넘은 CPU 카탈로그
+//! (계획 63 §7)를 지운다.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::auth::{Session, SessionSpec, User, UserSpec};
 use opl_types::backup::{Backup, BackupPhase, BackupSpec};
+use opl_types::cpu::{CpuCatalog, CpuCatalogSpec};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -50,6 +52,10 @@ pub struct ClusterJanitorConfig {
 
 /// 한 tick에 지우는 끝난 Task의 최대 수. 나머지는 다음 tick에 지운다.
 const TASK_DELETES_PER_TICK: usize = 200;
+
+/// 어느 노드도 가리키지 않는 CPU 카탈로그를 지우기 전에 만든 뒤 기다리는 시간. 노드는 카탈로그를 만든 뒤 상태에 쓰므로
+/// 그 사이에 지우지 않게 넉넉히 둔다(그래도 지워지면 노드의 다음 검사 회차가 다시 만든다).
+const CATALOG_UNUSED_AGE: Duration = Duration::from_secs(3600);
 
 impl Default for ClusterJanitorConfig {
     fn default() -> Self {
@@ -140,6 +146,10 @@ enum Action {
         revision: u64,
     },
     DeleteSession {
+        id: Uuid,
+        revision: u64,
+    },
+    DeleteCatalog {
         id: Uuid,
         revision: u64,
     },
@@ -274,6 +284,25 @@ fn stale_sessions(now: u64, sessions: &[Session], users: &[User], limit: usize) 
         .collect()
 }
 
+/// 어느 노드의 `NodeStatus.cpu.catalog`도 아니고 만든 지 [`CATALOG_UNUSED_AGE`]가 넘은 CPU 카탈로그. 만든 시각은
+/// UUIDv7 id의 시각이다.
+fn unused_catalogs(now: SystemTime, nodes: &[Node], catalogs: &[CpuCatalog]) -> Vec<Action> {
+    let used: BTreeSet<&str> = nodes
+        .iter()
+        .filter_map(|n| n.status.cpu.as_ref())
+        .map(|c| c.catalog.as_str())
+        .collect();
+    catalogs
+        .iter()
+        .filter(|c| !used.contains(c.name.as_str()))
+        .filter(|c| now.duration_since(created(c.id)).unwrap_or_default() > CATALOG_UNUSED_AGE)
+        .map(|c| Action::DeleteCatalog {
+            id: c.id,
+            revision: c.revision,
+        })
+        .collect()
+}
+
 /// 만든 지, 그리고 마지막으로 파일을 받은 지(`received_at`) `receiving_max_age`가 넘은 `receiving` 백업
 /// 가운데 지우는 Task가 없는 것
 fn stale_receiving<'a>(
@@ -329,9 +358,10 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             cluster.list::<BackupSpec>()?.1,
             cluster.list::<SessionSpec>()?.1,
             cluster.list::<UserSpec>()?.1,
+            cluster.list::<CpuCatalogSpec>()?.1,
         ))
     })();
-    let Ok((nodes, tasks, snapshots, backups, sessions, users)) = lists else {
+    let Ok((nodes, tasks, snapshots, backups, sessions, users, catalogs)) = lists else {
         return;
     };
     let ids: BTreeSet<Uuid> = members
@@ -357,6 +387,7 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
         &users,
         TASK_DELETES_PER_TICK,
     ));
+    actions.extend(unused_catalogs(SystemTime::now(), &nodes, &catalogs));
     let mut skip_deletes = false;
     for action in actions {
         if skip_deletes && is_delete(&action) {
@@ -439,6 +470,9 @@ async fn apply(cluster: &Cluster, action: &Action) -> Result<u64, ClusterError> 
         }
         Action::DeleteSession { id, revision } => {
             cluster.delete::<SessionSpec>(*id, Some(*revision)).await
+        }
+        Action::DeleteCatalog { id, revision } => {
+            cluster.delete::<CpuCatalogSpec>(*id, Some(*revision)).await
         }
     }
 }
@@ -1158,5 +1192,42 @@ mod tests {
                 revision: 5
             }]
         );
+    }
+
+    fn catalog_made(now: SystemTime, ago: Duration, name: &str) -> CpuCatalog {
+        let at = (now - ago).duration_since(SystemTime::UNIX_EPOCH).unwrap();
+        let mut c: CpuCatalog = Resource::new(name, opl_driver::mock_cpu_probe().catalog);
+        c.id = Uuid::new_v7(uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            at.as_secs(),
+            at.subsec_nanos(),
+        ));
+        c.revision = 3;
+        c
+    }
+
+    /// 어느 노드도 가리키지 않고 1시간이 넘은 CPU 카탈로그만 지운다(계획 63 §7).
+    #[test]
+    fn unused_cpu_catalogs_go_after_an_hour() {
+        let now = SystemTime::now();
+        let old = Duration::from_secs(3601);
+        let used = catalog_made(now, old, "used");
+        let unused = catalog_made(now, old, "unused");
+        let fresh = catalog_made(now, Duration::from_secs(60), "fresh");
+        let mut n = node(true);
+        n.status.cpu = Some(opl_types::cpu::NodeCpu {
+            catalog: "used".into(),
+            ..Default::default()
+        });
+        // 카탈로그가 없는 노드(옛 노드·위트니스)는 아무것도 가리키지 않는다.
+        let nodes = [n, node(false)];
+        assert_eq!(
+            unused_catalogs(now, &nodes, &[used, unused.clone(), fresh.clone()]),
+            vec![Action::DeleteCatalog {
+                id: unused.id,
+                revision: 3
+            }]
+        );
+        assert_eq!(unused_catalogs(now, &[], &[fresh]), vec![]);
     }
 }
