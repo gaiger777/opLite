@@ -42,7 +42,7 @@ use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, looku
 use crate::revision::{TASK, WARNING};
 use crate::scheduler::{
     HaCapacity, Inventory, ScheduleError, cpu_receives, cpu_starts, disk_moves, ha_capacity,
-    host_cpu_warning, migration_fits, migration_moves, schedule_with,
+    host_cpu_warning, migration_fits, migration_moves, numa_receives, numa_starts, schedule_with,
 };
 use crate::score::{self, Scorer};
 use crate::snapshots::{
@@ -205,6 +205,34 @@ fn cpu_reason(state: &AppState, principal: &Principal, why: String) -> String {
     } else {
         opl_reconciler::cpu::without_node_name(&why)
     }
+}
+
+/// Raft 장부가 노드의 전용 CPU·hugepages가 모자라 쓰기를 거절했으면(`HostResourcesExceeded` → 409 `no_capacity`의
+/// `details.node`) 그 노드
+fn host_full(e: &ApiError) -> Option<Uuid> {
+    if e.code != "no_capacity" {
+        return None;
+    }
+    let details = e.details.as_ref()?;
+    details.get("resource")?;
+    details.get("node")?.as_str()?.parse().ok()
+}
+
+/// 꺼진 VM을 고정된 노드 `node`에서 켤 수 있는지(CPU 모델·플래그, 전용 CPU·hugepages·NUMA). `full`은 Raft 장부가 방금
+/// 자리가 없다고 거절한 노드와 그 문구다.
+fn starts_on(
+    vm: &Vm,
+    inv: &Inventory,
+    node: &Node,
+    full: Option<&(Uuid, String)>,
+) -> Result<(), String> {
+    if let Some((id, why)) = full
+        && *id == node.id
+    {
+        return Err(why.replace(&id.to_string(), &format!("{:?}", node.name)));
+    }
+    cpu_receives(vm, inv, node)?;
+    numa_receives(vm, inv, node)
 }
 
 /// 스케줄러가 노드를 고르지 못함: 노드 조건이면 409 `no_node`, hard 규칙이면 409 `placement_rule`
@@ -1748,8 +1776,10 @@ pub enum StopMode {
 /// (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
 /// `start`·`reboot`은 409 `vm_busy`다. 끝나지 않은 펌웨어 초기화 Task(`vm-firmware-reset`)가 있어도 `start`·`reboot`은 409
 /// `vm_busy`이고, 꺼진 TPM VM을 켤 노드가 지금 TPM 상태를 얻을 수 없으면(`firmware_node`가 오프라인이고 온라인 사본이
-/// 없음) `start`는 409 `tpm_state_unavailable`이다. 꺼진 VM이 고정된 노드가 VM의 CPU 모델·플래그를 켤 수 없으면 켤 수 있는
-/// 다른 노드를 고르고, 없으면 `start`는 409 `no_capacity`(까닭)다.
+/// 없음) `start`는 409 `tpm_state_unavailable`이다. 꺼진 VM이 고정된 노드가 VM의 CPU 모델·플래그를 켤 수 없거나 전용
+/// CPU·hugepages·NUMA 모양이 들지 않으면 켤 수 있는 다른 노드를 고르고, 없으면 `start`는 409 `no_capacity`(까닭)다. 고른
+/// 노드의 전용 CPU·hugepages를 그사이 다른 켜기가 잡았으면(클러스터 장부의 거절) 그 노드를 빼고 한 번 다시 고른다.
+/// `reboot`은 그 노드가 새 스펙의 CPU·NUMA를 켤 수 없으면 409 `no_capacity`다.
 #[utoipa::path(post, path = "/vms/{key}/actions/{action}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("action" = String, Path, description = "start, stop, reboot or hotplug"), ActionQuery),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1793,7 +1823,18 @@ pub async fn vm_action(
             let scoring = score::scorer(&state, start_picks(&state, &vm)?).await;
             let scorer = scoring.scorer();
             let _lock = state.vm_lock.lock().await;
-            let vm = modify_spec(&state, id, |spec| {
+            // 계획 64: 고른 노드에 전용 CPU·hugepages 자리가 없다고 Raft 장부가 거절하면(다른 API 노드·HA가 먼저
+            // 잡았다) 그 노드를 빼고 한 번 다시 고른다.
+            let mut full: Option<(Uuid, String)> = None;
+            let vm = loop {
+                let load = || -> Result<Inventory, ApiError> {
+                    let mut inv = Inventory::load(&state.cluster)?;
+                    if let Some((node, _)) = &full {
+                        inv.nodes.retain(|n| n.id != *node);
+                    }
+                    Ok(inv)
+                };
+                let result = Box::pin(modify_spec(&state, id, |spec| {
                 // 검사 뒤 템플릿으로 바뀌었을 수 있다(바꾸기와 엇갈림). 쓰기 직전의 스펙으로 다시 본다.
                 if spec.template {
                     return Err(vm_is_template(&vm.name));
@@ -1808,7 +1849,7 @@ pub async fn vm_action(
                     && let Some(node) = state.cluster.get::<NodeSpec>(node)?
                 {
                     if node.spec.maintenance && stopped_now(&state, id)? {
-                        let inv = Inventory::load(&state.cluster)?;
+                        let inv = load()?;
                         let other = schedule_with(&me, &inv, &scorer).map_err(|e| match e {
                             ScheduleError::NoNode => ApiError::conflict(
                                 "node_unavailable",
@@ -1822,7 +1863,7 @@ pub async fn vm_action(
                         spec.node = Some(other);
                     } else {
                         check_node_arch(&node, spec)?;
-                        let inv = Inventory::load(&state.cluster)?;
+                        let inv = load()?;
                         let broken = hard_violations(&me, &node, &inv, &Assign::default());
                         if !broken.is_empty() && stopped_now(&state, id)? {
                             let other = schedule_with(&me, &inv, &scorer).map_err(|e| {
@@ -1841,10 +1882,11 @@ pub async fn vm_action(
                                 )
                             })?;
                             spec.node = Some(other);
-                        } else if let Err(why) = cpu_receives(&me, &inv, &node)
+                        } else if let Err(why) = starts_on(&me, &inv, &node, full.as_ref())
                             && stopped_now(&state, id)?
                         {
                             // 계획 63: 고정된 노드가 VM의 CPU를 켤 수 없으면(작업자가 켜지 않는다) 켤 수 있는 노드로.
+                            // 계획 64: 전용 CPU·hugepages·NUMA 모양이 맞지 않아도 같다.
                             let other = schedule_with(&me, &inv, &scorer).map_err(|_| {
                                 ApiError::conflict(
                                     "no_capacity",
@@ -1856,7 +1898,7 @@ pub async fn vm_action(
                     }
                 }
                 if spec.node.is_none() {
-                    let inv = Inventory::load(&state.cluster)?;
+                    let inv = load()?;
                     spec.node = Some(
                         schedule_with(&me, &inv, &scorer).map_err(|e| no_node_error(&me, &inv, e))?,
                     );
@@ -1880,9 +1922,15 @@ pub async fn vm_action(
                 }
                 spec.power = PowerState::Running;
                 Ok(())
-            })
-            .await
-            .map_err(|e| hide_node_reasons(&state, &principal, e))?;
+            }))
+            .await;
+                match result {
+                    Err(e) if full.is_none() && host_full(&e).is_some() => {
+                        full = host_full(&e).map(|node| (node, e.message));
+                    }
+                    r => break r.map_err(|e| hide_node_reasons(&state, &principal, e))?,
+                }
+            };
             (TaskOp::VmStart, vm)
         }
         "stop" => {
@@ -1912,7 +1960,9 @@ pub async fn vm_action(
                 && let Some(node) = state.cluster.get::<NodeSpec>(node)?
             {
                 let inv = Inventory::load(&state.cluster)?;
-                if let Err(why) = cpu_starts(&vm.spec, &inv, &node) {
+                if let Err(why) =
+                    cpu_starts(&vm.spec, &inv, &node).and_then(|()| numa_starts(&vm, &inv, &node))
+                {
                     let why = cpu_reason(&state, &principal, why);
                     return Err(ApiError::conflict(
                         "no_capacity",
@@ -2050,7 +2100,8 @@ pub(crate) enum RuleCheck {
 /// 않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
 /// 유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
 /// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리, VM이 켤 때 기록한 CPU 모델·플래그를 켤 수 없음)면
-/// 409 `no_capacity`다. 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`)로 도는 VM은 409 `migration_unsupported`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
+/// 409 `no_capacity`다. 대상이 VM이 켤 때 기록한 NUMA 모양(전용 CPU·hugepages)을 받을 수 없으면 409
+/// `migration_unsupported`(까닭)다. 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`)로 도는 VM은 409 `migration_unsupported`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
 /// `cpu-warning: target node "n3" lacks …`를 남긴다. 대상 노드가 hard
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
 /// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
@@ -2338,10 +2389,14 @@ pub(crate) async fn start_migration_warned(
             ));
         }
     }
+    // 계획 64: 대상이 켤 때 기록한 NUMA 모양(전용 CPU·hugepages·호스트 노드)을 받을 수 없으면 옮길 수 없다.
+    numa_receives(&vm, &inv, &target)
+        .map_err(|e| ApiError::conflict("migration_unsupported", e))?;
     // CPU는 켤 때 기록한 것으로 본다(받는 쪽은 그대로 켠다).
     migration_fits(&vm, &inv, &target, &moves).map_err(|e| ApiError::conflict("no_capacity", e))?;
+    // hugepages VM은 풀에서 쓴다(계획 64 §7 — 페이지는 위 NUMA 맞춤이 본다).
     let free = inv.free_memory_mib(&target, vm.id);
-    if free < i64::from(vm.spec.memory_mib) {
+    if free < i64::from(crate::scheduler::vm_small_mib(&vm)) {
         return Err(ApiError::conflict(
             "no_capacity",
             format!(
@@ -2452,4 +2507,30 @@ pub(crate) async fn modify_spec(
         "busy",
         "the VM kept changing while being updated; try again",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use opl_types::numa::HostResource;
+
+    use super::*;
+
+    /// Raft 장부의 거절(409 `no_capacity`)에서 다시 고를 때 뺄 노드를 읽는다. 다른 `no_capacity`는 아니다.
+    #[test]
+    fn host_full_reads_the_node_of_a_ledger_refusal() {
+        let node = Uuid::from_u128(7);
+        let e = ApiError::from(ClusterError::Rejected(Rejection::HostResourcesExceeded {
+            node,
+            resource: HostResource::DedicatedCpus,
+            limit: 4,
+            used: 5,
+        }));
+        assert_eq!(host_full(&e), Some(node));
+        assert_eq!(
+            e.message,
+            format!("node {node} would use 5 of 4 dedicated CPUs")
+        );
+        assert_eq!(host_full(&ApiError::conflict("no_capacity", "full")), None);
+        assert_eq!(host_full(&ApiError::conflict("no_node", "none")), None);
+    }
 }

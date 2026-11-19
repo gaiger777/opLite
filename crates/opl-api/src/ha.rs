@@ -52,7 +52,8 @@ use crate::ha_health::{self, CheckWatch, Health, Place};
 use crate::placement::{self, Assign, Candidate};
 use crate::power_fence::{PowerFence, PowerOff, power_off};
 use crate::scheduler::{
-    Inventory, disk_moves, node_fits, replica_fits, replica_migration_fits, replica_moves,
+    Inventory, disk_moves, node_fits, replica_fits_with, replica_migration_fits,
+    replica_migration_fits_with, replica_moves, vm_fits,
 };
 use crate::score::{Loads, Scorer};
 use crate::state::AppState;
@@ -1163,10 +1164,11 @@ async fn recover_vm(
             && !health.blocks(vm, n, inv)
     };
     let starts = !stays_stopped(vm);
-    // 꺼진 채 두는 VM은 복제본으로 옮기지 않는다([`recovery_pick`]).
+    // 꺼진 채 두는 VM은 복제본으로 옮기지 않는다([`recovery_pick`]). 켜는 VM의 전용 CPU·hugepages는 이 회차에 먼저
+    // 옮긴 VM의 자리(`assign`)까지 센다(계획 64).
     let fits = |n: &Node| {
         if starts {
-            replica_fits(vm, inv, n).is_ok()
+            replica_fits_with(vm, inv, n, assign).is_ok()
         } else {
             node_fits(&vm.spec, inv, n).is_ok()
         }
@@ -1537,7 +1539,7 @@ pub(crate) enum Pick {
 
 /// 복구할 노드를 고른다: `eligible`이고 노드 조건에 맞는 노드 가운데 hard 규칙을 어기지 않는 노드를 [`placement::compare`]
 /// 순서(부하 점수 포함)로 견줘 가장 나은 것. `replicas`면 노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는
-/// 노드도 받고([`replica_fits`]) 복제본의 시점이 새로운 노드가 먼저다(잃는 데이터가 적은 쪽, [`data_point`]). 아니면
+/// 노드도 받고([`crate::scheduler::replica_fits`]) 복제본의 시점이 새로운 노드가 먼저다(잃는 데이터가 적은 쪽, [`data_point`]). 아니면
 /// (살아 있는 노드에서 옮기는 다시 켜기) 디스크가 있는 노드만 본다.
 pub(crate) fn pick(
     vm: &Vm,
@@ -1549,9 +1551,9 @@ pub(crate) fn pick(
 ) -> Pick {
     let fits_on = |n: &Node| {
         if replicas {
-            replica_fits(vm, inv, n).is_ok()
+            replica_fits_with(vm, inv, n, assign).is_ok()
         } else {
-            node_fits(&vm.spec, inv, n).is_ok()
+            vm_fits(vm, inv, n, assign).is_ok()
         }
     };
     pick_by(vm, inv, assign, eligible, scorer, replicas, fits_on)
@@ -1567,7 +1569,7 @@ pub(crate) fn pick_live(
     eligible: impl Fn(&Node) -> bool,
     scorer: &Scorer,
 ) -> Pick {
-    let fits_on = |n: &Node| replica_migration_fits(vm, inv, n).is_ok();
+    let fits_on = |n: &Node| replica_migration_fits_with(vm, inv, n, assign).is_ok();
     pick_by(vm, inv, assign, eligible, scorer, true, fits_on)
 }
 
@@ -2230,6 +2232,7 @@ mod tests {
     use opl_types::vm::{CpuSpec, MachineType, VmHa};
 
     use super::*;
+    use crate::scheduler::replica_fits;
 
     fn unknown_at(term: u64) -> Unknown {
         Unknown {

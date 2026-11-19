@@ -140,6 +140,22 @@ impl From<ClusterError> for ApiError {
                         limit,
                         used,
                     } => crate::quota::exceeded(folder, dimension, limit, used, message),
+                    // 노드 자원 장부(계획 64 §9): 그 노드에 전용 CPU·hugepages 자리가 없다.
+                    Rejection::HostResourcesExceeded {
+                        node,
+                        resource,
+                        limit,
+                        used,
+                    } => {
+                        let mut e = ApiError::conflict("no_capacity", message);
+                        e.details = Some(serde_json::json!({
+                            "node": node,
+                            "resource": resource,
+                            "limit": limit,
+                            "used": used,
+                        }));
+                        e
+                    }
                 }
             }
             ClusterError::Timeout | ClusterError::Unreachable(_) => ApiError::new(

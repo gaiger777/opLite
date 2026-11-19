@@ -24,7 +24,9 @@ use uuid::Uuid;
 use crate::ha::{RELOCATE_WINDOW, ready};
 use crate::ha_health::Health;
 use crate::placement::{self, Assign};
-use crate::scheduler::{Inventory, disk_moves, replica_migration_fits};
+use crate::scheduler::{
+    Inventory, disk_moves, replica_migration_fits, replica_migration_fits_with,
+};
 use crate::score::{LOAD_STALE, Loads, NodeUse, Scorer, node_use, vm_cpu_share};
 
 /// 균형 옮기기의 원본으로 보는 노드 수(사용률이 큰 것부터)
@@ -320,6 +322,14 @@ fn recent(at: u64, now: u64) -> bool {
     at.saturating_add(VM_COOLDOWN.as_secs()) > now
 }
 
+/// 전용 CPU로 도는 VM(켤 때 기록, 기록이 없으면 스펙)
+fn dedicated(vm: &Vm) -> bool {
+    match vm.status.hardware.as_ref() {
+        Some(hw) => hw.numa.as_ref().is_some_and(|n| !n.policy.is_shared()),
+        None => !vm.spec.cpu.policy.is_shared(),
+    }
+}
+
 /// 균형 조정기가 이 VM을 옮길 수 있는지. 아니면 그 이유다(시험·debug 로그).
 /// 템플릿이 아니고(계획 58 — 켜지지 않는다), 자리 잡고 실행 중이고 마이그레이션 중이 아니며, 고정(`pinned`)이 아니고, 로컬 풀 디스크가 없거나 복제 대상이 있고(그
 /// 복제본 노드로만 옮긴다 — [`target_ok`]), 끝나지 않은
@@ -345,6 +355,10 @@ pub fn movable(
     }
     if vm.spec.pinned() {
         return Err("pinned");
+    }
+    // 계획 64 §11: 전용 VM은 자기 pCPU에서 돌아 다른 VM과 다투지 않는다 — 옮겨도 얻는 것 없이 다시 고정하는 비용만 든다.
+    if dedicated(vm) {
+        return Err("dedicated CPUs");
     }
     if vm.spec.replication.is_empty() && !disk_moves(&vm.spec, inv, None).is_empty() {
         return Err("has disks on a node-local pool");
@@ -464,7 +478,7 @@ pub fn target_ok(
     if free_mib < i64::from(hotplug::allocated_memory_mib(vm)) {
         return Err("not enough unassigned memory");
     }
-    if replica_migration_fits(vm, inv, to).is_err() {
+    if replica_migration_fits_with(vm, inv, to, assign).is_err() {
         return Err("node does not fit");
     }
     if hotplug::can_receive(vm.status.hardware.as_ref(), to).is_err() {
@@ -934,7 +948,7 @@ fn awaits_failback(
                 .get(&n.id)
                 .is_some_and(|since| now.saturating_duration_since(*since) < FAILBACK_WAIT)
             && n.status.hypervisor != HVF
-            && inv.free_memory_mib(n, vm.id) >= i64::from(vm.spec.memory_mib)
+            && inv.free_memory_mib(n, vm.id) >= i64::from(crate::scheduler::vm_small_mib(vm))
             && replica_migration_fits(vm, inv, n).is_ok()
             && placement::hard_violations(vm, n, inv, &none).is_empty()
             && !health.blocks(vm, n, inv)
@@ -1511,6 +1525,44 @@ mod tests {
         // 복사 중인 복제본은 쓰지 않는다.
         inv.vms[0].status.replication[0].state = ReplicationState::Syncing;
         assert_eq!(ok(&inv, &b), Err("node does not fit"));
+    }
+
+    /// 전용 CPU로 도는 VM은 균형 조정기가 옮기지 않는다(계획 64 §11). 공유 vNUMA VM은 그대로 옮긴다.
+    #[test]
+    fn dedicated_vms_are_not_balanced() {
+        use opl_types::numa::{CpuPolicy, GuestNode, ResolvedNuma};
+        let (a, b) = (node("a", 4, 8192), node("b", 4, 8192));
+        let mut v = vm("v", 1, 1024, &a);
+        let all = NodeHotplug {
+            cpu: true,
+            memory: true,
+        };
+        let mut hw = RunningHardware::at_start(v.id, &v.name, &v.spec, all, true).0;
+        let inv = |v: &Vm| Inventory {
+            nodes: vec![a.clone(), b.clone()],
+            vms: vec![v.clone()],
+            ..Default::default()
+        };
+        let none = BTreeMap::new();
+        let mut numa = ResolvedNuma {
+            nodes: vec![GuestNode {
+                sockets: vec![0],
+                memory_mib: 1024,
+            }],
+            distances: Vec::new(),
+            page: None,
+            policy: CpuPolicy::Shared,
+            thread_policy: None,
+            emulator: None,
+            memory: None,
+        };
+        hw.numa = Some(numa.clone());
+        v.status.hardware = Some(hw.clone());
+        assert_eq!(movable(&v, &inv(&v), &[], &none, 0), Ok(()));
+        numa.policy = CpuPolicy::Dedicated;
+        hw.numa = Some(numa);
+        v.status.hardware = Some(hw);
+        assert_eq!(movable(&v, &inv(&v), &[], &none, 0), Err("dedicated CPUs"));
     }
 
     /// 하드웨어 변경이 끝나지 않은 VM은 옮기지 않고, 대상의 미할당 메모리는 도는 메모리(줄이기 실패로 스펙보다 큼)와

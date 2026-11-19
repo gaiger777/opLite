@@ -13,7 +13,7 @@ use opl_types::placement::{HaGroup, PlacementRule, RuleKind};
 use opl_types::vm::{PowerState, Vm};
 use uuid::Uuid;
 
-use crate::scheduler::{Inventory, node_fits};
+use crate::scheduler::{Inventory, small_memory_mib, vm_fits, vm_small_mib};
 use crate::score::{self, Scorer, node_use};
 
 /// 자리 덮어쓰기: VM id → 그 VM이 차지한 노드(None이면 자리 잡지 않은 것으로 본다)
@@ -38,7 +38,7 @@ impl Assign {
 }
 
 /// 이 VM이 차지한 노드
-fn occupied(vm: &Vm, assign: &Assign) -> Vec<Uuid> {
+pub(crate) fn occupied(vm: &Vm, assign: &Assign) -> Vec<Uuid> {
     if let Some(node) = assign.0.get(&vm.id) {
         return node.iter().copied().collect();
     }
@@ -93,7 +93,7 @@ pub fn candidates(vm: &Vm, inv: &Inventory, assign: &Assign) -> Vec<Candidate> {
     candidates_with(vm, inv, assign, &Scorer::default())
 }
 
-/// 노드 조건([`node_fits`])에 맞고 hard 규칙을 어기지 않는 노드들(나은 것부터)
+/// 노드 조건([`vm_fits`] — 전용 CPU·hugepages는 `assign`을 따름)에 맞고 hard 규칙을 어기지 않는 노드들(나은 것부터)
 pub fn candidates_with(
     vm: &Vm,
     inv: &Inventory,
@@ -103,7 +103,7 @@ pub fn candidates_with(
     let mut found: Vec<Candidate> = inv
         .nodes
         .iter()
-        .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
+        .filter(|n| vm_fits(vm, inv, n, assign).is_ok())
         .filter(|n| hard_violations(vm, n, inv, assign).is_empty())
         .map(|n| score_with(vm, n, inv, assign, scorer))
         .collect();
@@ -262,9 +262,23 @@ fn group<'a>(vm: &Vm, inv: &'a Inventory) -> Option<&'a HaGroup> {
     inv.groups.iter().find(|g| &g.name == name)
 }
 
-/// [`Inventory::free_memory_mib`]과 같되 [`Assign`]의 자리를 따른다.
+/// [`Inventory::free_memory_mib`]과 같되 [`Assign`]의 자리를 따른다(보통 메모리 — hugepages 풀과 hugepages VM은 빼고).
 fn free_mib(vm: &Vm, node: &Node, inv: &Inventory, assign: &Assign) -> i64 {
-    node.status.memory_mib as i64 - allocated_mib(node, inv, assign, &[vm.id]) as i64
+    let used: u64 = inv
+        .vms
+        .iter()
+        .filter(|v| v.id != vm.id && placed_on(v, node, assign))
+        .map(|v| u64::from(vm_small_mib(v)))
+        .sum();
+    small_memory_mib(node) as i64 - used as i64
+}
+
+/// 이 VM이 이 노드에서 실행하기로 됐다([`Assign`]의 자리를 따름).
+fn placed_on(v: &Vm, node: &Node, assign: &Assign) -> bool {
+    match assign.0.get(&v.id) {
+        Some(placed) => *placed == Some(node.id),
+        None => v.spec.node == Some(node.id) && v.spec.power == PowerState::Running,
+    }
 }
 
 /// 이 노드에서 실행하기로 된 VM(`skip` 빼고, [`Assign`]의 자리를 따름)에 배정된 메모리의 합
@@ -272,10 +286,7 @@ pub fn allocated_mib(node: &Node, inv: &Inventory, assign: &Assign, skip: &[Uuid
     inv.vms
         .iter()
         .filter(|v| !skip.contains(&v.id))
-        .filter(|v| match assign.0.get(&v.id) {
-            Some(placed) => *placed == Some(node.id),
-            None => v.spec.node == Some(node.id) && v.spec.power == PowerState::Running,
-        })
+        .filter(|v| placed_on(v, node, assign))
         .map(|v| u64::from(hotplug::allocated_memory_mib(v)))
         .sum()
 }

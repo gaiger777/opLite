@@ -633,3 +633,108 @@ async fn concurrent_creates_on_two_nodes_keep_the_folder_quota() {
         .await
         .unwrap();
 }
+
+/// 전용 CPU·hugepages는 Raft 안에서 센다(계획 64 설계 §9·§14): 두 팔로워(다른 API 노드)가 같은 노드에 전용 VM을 동시에
+/// 만들고 켜도 그 노드의 전용 CPU 수를 넘지 않고, 진 쪽은 `HostResourcesExceeded`다.
+#[tokio::test]
+async fn concurrent_creates_and_starts_on_two_nodes_keep_the_dedicated_cpus() {
+    use opl_types::node::{Node, NodeSpec, NodeStatus};
+    use opl_types::numa::{HostResource, HostResources, NodeTopology};
+    use opl_types::resource::Resource;
+    use opl_types::vm::{PowerState, Vm, VmSpec};
+
+    type Write<'a> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = Result<u64, ClusterError>> + Send + 'a>>;
+    const LIMIT: usize = 4;
+    const TRIES: usize = 12;
+    let tc = TestCluster::start_forwarding(3).await;
+    let leader = tc.leader().await;
+    let followers: Vec<NodeId> = tc
+        .nodes
+        .keys()
+        .copied()
+        .filter(|id| *id != leader)
+        .collect();
+    let topology: NodeTopology = serde_json::from_value(serde_json::json!({
+        "sockets": 1, "threads_per_core": 1, "cpus": "0-7", "pinning": true, "cpuset": true,
+        "probed_at": 1, "nodes": [{"id": 0, "cpus": "0-7", "memory_mib": 16384}],
+    }))
+    .unwrap();
+    let mut host: Node = Resource::new(
+        "host",
+        NodeSpec {
+            address: "127.0.0.1:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+            host_resources: Some(HostResources {
+                reserved_cpus: Default::default(),
+                dedicated_cpus: "0-3".parse().unwrap(),
+                hugepages: Vec::new(),
+            }),
+        },
+    );
+    host.status = NodeStatus {
+        topology: Some(topology),
+        ..NodeStatus::default()
+    };
+    tc.get(leader).create(&host).await.unwrap();
+    let vm = |name: String, power: &str| -> Vm {
+        let spec = serde_json::json!({
+            "cpu": {"sockets": 1, "cores": 1, "policy": "dedicated"}, "memory_mib": 256,
+            "machine": "virt", "node": host.id, "power": power,
+        });
+        Resource::new(name, serde_json::from_value(spec).unwrap())
+    };
+    // 둘째 팔로워가 켤 꺼진 VM
+    let mut stopped = Vec::new();
+    for i in 0..TRIES {
+        let v = vm(format!("off-{i}"), "stopped");
+        tc.get(leader).create(&v).await.unwrap();
+        stopped.push(v);
+    }
+    let creates = (0..TRIES).map(|i| {
+        let c = tc.get(followers[0]);
+        let v = vm(format!("on-{i}"), "running");
+        Box::pin(async move { c.create(&v).await }) as Write<'_>
+    });
+    let starts = stopped.iter().map(|v| {
+        let c = tc.get(followers[1]);
+        let mut spec = v.spec.clone();
+        spec.power = PowerState::Running;
+        let id = v.id;
+        Box::pin(async move { c.update_spec(id, None, BTreeMap::new(), &spec).await }) as Write<'_>
+    });
+    let results = futures_util::future::join_all(creates.chain(starts)).await;
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let refused = results
+        .iter()
+        .filter(|r| {
+            matches!(
+                r,
+                Err(ClusterError::Rejected(Rejection::HostResourcesExceeded {
+                    resource: HostResource::DedicatedCpus,
+                    limit: 4,
+                    used: 5,
+                    ..
+                }))
+            )
+        })
+        .count();
+    assert_eq!(ok, LIMIT, "{results:?}");
+    assert_eq!(refused, 2 * TRIES - LIMIT);
+    let last = results
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .max()
+        .copied();
+    for id in tc.nodes.keys().copied().collect::<Vec<_>>() {
+        tc.wait_applied(id, last.unwrap()).await;
+        let (_, vms) = tc.get(id).list::<VmSpec>().unwrap();
+        let running = vms
+            .iter()
+            .filter(|v| v.spec.power == PowerState::Running)
+            .count();
+        assert_eq!(running, LIMIT, "node {id}");
+    }
+}

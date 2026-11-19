@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::exclusive::exclusive_values;
-use crate::folders;
 use crate::store::{
     KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA, KEY_SNAPSHOT_META, META, NAMES,
     OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
@@ -21,6 +20,7 @@ use crate::store::{
 use crate::types::{Command, NodeId, OrbNode, RawResource, Rejection, Response, TypeConfig};
 use crate::watch::{FeedBatch, WatchEvent, WatchHub};
 use crate::writer::StoreWriter;
+use crate::{folders, hosts};
 
 type Membership = StoredMembership<NodeId, OrbNode>;
 type Meta = SnapshotMeta<NodeId, OrbNode>;
@@ -355,6 +355,7 @@ pub(crate) fn apply_command(
                 &resource.spec,
                 None,
             )?;
+            let mut host = hosts::host_check(objects, kind, resource.id, &resource.spec, None)?;
             if let Err(r) = check_exclusive(
                 objects,
                 names,
@@ -362,6 +363,7 @@ pub(crate) fn apply_command(
                 resource.id,
                 &resource.spec,
                 quota.as_mut(),
+                host.as_mut(),
             )? {
                 return Ok(Err(r));
             }
@@ -371,6 +373,11 @@ pub(crate) fn apply_command(
             }
             if let Some(quota) = quota
                 && let Err(r) = quota.finish(objects, names)?
+            {
+                return Ok(Err(r));
+            }
+            if let Some(host) = host
+                && let Err(r) = host.finish(objects)?
             {
                 return Ok(Err(r));
             }
@@ -403,7 +410,16 @@ pub(crate) fn apply_command(
                 &spec,
                 Some(&resource.spec),
             )?;
-            if let Err(r) = check_exclusive(objects, names, kind, id, &spec, quota.as_mut())? {
+            let mut host = hosts::host_check(objects, kind, id, &spec, Some(&resource))?;
+            if let Err(r) = check_exclusive(
+                objects,
+                names,
+                kind,
+                id,
+                &spec,
+                quota.as_mut(),
+                host.as_mut(),
+            )? {
                 return Ok(Err(r));
             }
             if let Err(r) = folders::check_write(objects, kind, id, &spec, Some(&resource.spec))? {
@@ -411,6 +427,11 @@ pub(crate) fn apply_command(
             }
             if let Some(quota) = quota
                 && let Err(r) = quota.finish(objects, names)?
+            {
+                return Ok(Err(r));
+            }
+            if let Some(host) = host
+                && let Err(r) = host.finish(objects)?
             {
                 return Ok(Err(r));
             }
@@ -473,8 +494,9 @@ pub(crate) fn apply_command(
     Ok(Ok(WatchEvent::Put { kind, resource }))
 }
 
-/// `spec`의 독점 값이 같은 종류의 다른 리소스나 같은 spec 안에서 겹치면 거부한다. VM 쓰기의 할당량 검사(`quota`)가
-/// 있으면 같은 VM 훑기에서 사용량도 센다(설계 §9: VM을 한 번만 푼다).
+/// `spec`의 독점 값이 같은 종류의 다른 리소스나 같은 spec 안에서 겹치면 거부한다. VM 쓰기의 할당량 검사(`quota`)와
+/// 노드 자원 장부 검사(`host`, 계획 64)가 있으면 같은 VM 훑기에서 사용량도 센다(설계 §9: VM을 한 번만 푼다).
+#[allow(clippy::too_many_arguments)]
 fn check_exclusive(
     objects: &Table<(&'static str, u128), &'static [u8]>,
     names: &Table<(&'static str, &'static str), u128>,
@@ -482,12 +504,14 @@ fn check_exclusive(
     id: Uuid,
     spec: &serde_json::Value,
     mut quota: Option<&mut folders::QuotaCheck>,
+    mut host: Option<&mut hosts::HostCheck>,
 ) -> Result<Result<(), Rejection>, StoreError> {
     let wanted = exclusive_values(kind, spec);
     if kind != Kind::Vm {
         quota = None;
+        host = None;
     }
-    if wanted.is_empty() && quota.is_none() {
+    if wanted.is_empty() && quota.is_none() && host.is_none() {
         return Ok(Ok(()));
     }
     let in_use = |field: &str, value: &str, holder: Uuid| Rejection::InUse {
@@ -511,6 +535,9 @@ fn check_exclusive(
         if let Some(q) = quota.as_deref_mut() {
             q.add(objects, names, other, &other_spec.spec)?;
         }
+        if let Some(h) = host.as_deref_mut() {
+            h.add(other, &other_spec.spec);
+        }
         for (field, value) in exclusive_values(kind, &other_spec.spec) {
             if wanted.iter().any(|(f, v)| *f == field && *v == value) {
                 return Ok(Err(in_use(field, &value, other)));
@@ -519,6 +546,9 @@ fn check_exclusive(
     }
     if let Some(q) = quota {
         q.scanned = true;
+    }
+    if let Some(h) = host {
+        h.scanned = true;
     }
     Ok(Ok(()))
 }

@@ -17,7 +17,9 @@ use super::{Ctx, TaskRunnerConfig};
 use crate::cluster::missing_feature;
 use crate::error::ApiError;
 use crate::placement::{self, Assign, affinity_partners, hard_violations};
-use crate::scheduler::{Inventory, disk_moves, migration_fits, migration_moves, replica_moves};
+use crate::scheduler::{
+    Inventory, disk_moves, migration_fits_with, migration_moves, replica_moves,
+};
 use crate::score::{self, Scorer};
 use crate::snapshots::count_snapshots;
 use crate::state::AppState;
@@ -264,10 +266,10 @@ async fn move_vm(
             )));
         }
         Err(_) => {
-            // 모든 후보가 CPU 때문에 받지 못하면 그 까닭이다(리뷰 2 #5 — 메모리를 찾게 하지 않는다).
+            // 모든 후보가 CPU·NUMA 때문에 받지 못하면 그 까닭이다(리뷰 2 #5 — 메모리를 찾게 하지 않는다).
             if let Some(reason) = bundle
                 .iter()
-                .find_map(|v| crate::scheduler::cpu_blocks_every_move(v, &inv, node))
+                .find_map(|v| crate::scheduler::blocks_every_move(v, &inv, node))
             {
                 return Ok(Outcome::NotMoved(reason));
             }
@@ -395,10 +397,14 @@ fn pick_target(
                 migration_moves(v, inv, n.id, None).unwrap_or_else(|_| m.clone())
             })
             .collect();
-        // 대상은 구성원이 도는 하드웨어(핫플러그 배치)로 켜야 한다.
+        // 대상은 구성원이 도는 하드웨어(핫플러그 배치)로 켜야 한다. 전용 CPU·hugepages는 앞 구성원이 그 노드로 간 것으로
+        // 센다(계획 64).
+        let mut ahead = Assign::default();
         let fits = bundle.iter().zip(&member_moves).all(|(v, m)| {
-            migration_fits(v, inv, n, m).is_ok()
-                && hotplug::can_receive(v.status.hardware.as_ref(), n).is_ok()
+            let ok = migration_fits_with(v, inv, n, m, &ahead).is_ok()
+                && hotplug::can_receive(v.status.hardware.as_ref(), n).is_ok();
+            ahead.place(v.id, n.id);
+            ok
         });
         if !fits {
             continue;
@@ -413,7 +419,8 @@ fn pick_target(
             .iter()
             .flat_map(|v| hard_violations(v, n, inv, &assign))
             .collect();
-        if candidate.free_mib < i64::from(lead.spec.memory_mib) {
+        // hugepages VM은 풀에서 쓰므로 보통 메모리는 0이다(계획 64 §7).
+        if candidate.free_mib < i64::from(crate::scheduler::vm_small_mib(lead)) {
             no_room |= broken.is_empty();
             continue;
         }

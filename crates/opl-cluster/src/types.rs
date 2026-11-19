@@ -3,6 +3,7 @@ use std::fmt;
 use std::io::Cursor;
 
 use opl_types::ha_check::CheckReport;
+use opl_types::numa::HostResource;
 use opl_types::placement::LoadSummary;
 use opl_types::quota::QuotaDimension;
 use opl_types::resource::{Kind, Resource};
@@ -105,6 +106,15 @@ pub enum Rejection {
     QuotaExceeded {
         folder: Uuid,
         dimension: QuotaDimension,
+        limit: u64,
+        used: u64,
+    },
+    /// 노드 `node`의 전용 CPU·hugepages가 모자란다(계획 64 설계 §9): 쓰기 뒤 그 노드에 켜기로 된 VM들의 합 `used`가
+    /// 상한 `limit`을 넘고 쓰기 전보다 늘었다. 전용 CPU·hugepages를 쓰는 VM을 쓸 때만 나온다.
+    #[error("node {node} would use {used} of {limit} {}", resource.unit())]
+    HostResourcesExceeded {
+        node: Uuid,
+        resource: HostResource,
         limit: u64,
         used: u64,
     },
@@ -491,6 +501,16 @@ mod tests {
                 },
                 json!({"reason": "quota-exceeded", "folder": id, "dimension": "memory_mib",
                        "limit": 1024, "used": 2048}),
+            ),
+            (
+                Rejection::HostResourcesExceeded {
+                    node: parent,
+                    resource: HostResource::Hugepages1G,
+                    limit: 4096,
+                    used: 5120,
+                },
+                json!({"reason": "host-resources-exceeded", "node": parent,
+                       "resource": "hugepages_1g", "limit": 4096, "used": 5120}),
             ),
         ] {
             let value = serde_json::to_value(&r).unwrap();

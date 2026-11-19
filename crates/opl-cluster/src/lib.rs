@@ -5,6 +5,7 @@ mod exclusive;
 mod folders;
 mod follow;
 mod health;
+mod hosts;
 mod leader;
 mod lease;
 pub mod links;

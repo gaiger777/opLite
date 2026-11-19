@@ -1122,6 +1122,16 @@ pub struct HostUsage {
     pub pages: BTreeMap<(u16, PageKind), u64>,
 }
 
+impl HostUsage {
+    /// 둘을 더한다.
+    pub fn add(&mut self, other: &HostUsage) {
+        self.dedicated = self.dedicated.union(&other.dedicated);
+        for (k, v) in &other.pages {
+            *self.pages.entry(*k).or_default() += v;
+        }
+    }
+}
+
 /// 기록(`hardware.numa`·`host_placement`) 가운데 노드 `node`의 것을 더한다. 다른 노드의 배치는 낡은 기록이라 건너뛴다.
 pub fn usage<'a>(
     records: impl IntoIterator<Item = (&'a ResolvedNuma, &'a HostPlacement)>,
@@ -1792,6 +1802,144 @@ pub fn demand(spec: &VmSpec, topology: Option<&NodeTopology>) -> Demand {
         Some(PageSize::Any) => d.any_mib = mib,
     }
     d
+}
+
+impl Demand {
+    /// 둘을 더한다.
+    pub fn add(&mut self, other: &Demand) {
+        self.pcpus += other.pcpus;
+        for (k, v) in &other.pages {
+            *self.pages.entry(*k).or_default() += v;
+        }
+        self.any_mib += other.any_mib;
+    }
+
+    /// 어느 자원도 `other`보다 많지 않다(이 쓰기는 장부를 늘리지 않는다).
+    pub fn within(&self, other: &Demand) -> bool {
+        self.pcpus <= other.pcpus
+            && self.any_mib <= other.any_mib
+            && self.pages.iter().all(|(k, v)| *v <= other.mib(*k))
+    }
+
+    /// 크기 `kind`의 hugepages 메모리(MiB, `any` 빼고)
+    pub fn mib(&self, kind: PageKind) -> u64 {
+        self.pages.get(&kind).copied().unwrap_or(0)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 노드 자원 장부(§9)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// 장부가 세는 노드 자원(Raft 거절 `HostResourcesExceeded`의 `resource`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum HostResource {
+    /// 전용 pCPU 수
+    #[serde(rename = "dedicated_cpus")]
+    DedicatedCpus,
+    /// 2M hugepages 메모리(MiB)
+    #[serde(rename = "hugepages_2m")]
+    Hugepages2M,
+    /// 1G hugepages 메모리(MiB)
+    #[serde(rename = "hugepages_1g")]
+    Hugepages1G,
+    /// 두 크기 합의 hugepages 메모리(MiB) — `any` VM이 여기에 센다
+    #[serde(rename = "hugepages")]
+    Hugepages,
+}
+
+impl HostResource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostResource::DedicatedCpus => "dedicated_cpus",
+            HostResource::Hugepages2M => "hugepages_2m",
+            HostResource::Hugepages1G => "hugepages_1g",
+            HostResource::Hugepages => "hugepages",
+        }
+    }
+
+    /// 문구의 단위
+    pub fn unit(self) -> &'static str {
+        match self {
+            HostResource::DedicatedCpus => "dedicated CPUs",
+            HostResource::Hugepages2M => "MiB of 2M hugepages",
+            HostResource::Hugepages1G => "MiB of 1G hugepages",
+            HostResource::Hugepages => "MiB of hugepages",
+        }
+    }
+}
+
+/// 노드가 내줄 수 있는 것: 전용 집합(온라인)의 크기와 크기마다 풀 전체(MiB). 노드 설정과 노드 상태에서 셈하므로
+/// 복제본마다 같다. 토폴로지가 없으면 모두 0이다(그 노드는 고정·hugepages를 못 한다).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HostLimits {
+    pub pcpus: u64,
+    pub mib_2m: u64,
+    pub mib_1g: u64,
+}
+
+impl HostLimits {
+    pub fn new(resources: Option<&HostResources>, topology: Option<&NodeTopology>) -> HostLimits {
+        let Some(t) = topology else {
+            return HostLimits::default();
+        };
+        let pool = |k: PageKind| t.pages(k) * u64::from(k.size_mib());
+        HostLimits {
+            pcpus: HostSets::new(resources, t).dedicated.len() as u64,
+            mib_2m: pool(PageKind::Size2M),
+            mib_1g: pool(PageKind::Size1G),
+        }
+    }
+}
+
+/// 상한을 넘는 자원 하나
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("would use {used} of {limit} {}", resource.unit())]
+pub struct HostExceeded {
+    pub resource: HostResource,
+    pub limit: u64,
+    pub used: u64,
+}
+
+/// 노드 하나의 장부 판정(§9): 쓰기 뒤 합 `after`가 상한을 넘고 쓰기 전 합 `before`보다 는 첫 자원(전용 CPU → 2M →
+/// 1G → 두 크기 합). 상한이 줄어 이미 넘친 노드에서도 늘리지 않는 쓰기는 된다. Raft 상태 머신과 스케줄러가 같은 것을
+/// 쓴다.
+pub fn exceeded(limits: &HostLimits, before: &Demand, after: &Demand) -> Option<HostExceeded> {
+    let hugepages = |d: &Demand| d.mib(PageKind::Size2M) + d.mib(PageKind::Size1G) + d.any_mib;
+    [
+        (
+            HostResource::DedicatedCpus,
+            limits.pcpus,
+            before.pcpus,
+            after.pcpus,
+        ),
+        (
+            HostResource::Hugepages2M,
+            limits.mib_2m,
+            before.mib(PageKind::Size2M),
+            after.mib(PageKind::Size2M),
+        ),
+        (
+            HostResource::Hugepages1G,
+            limits.mib_1g,
+            before.mib(PageKind::Size1G),
+            after.mib(PageKind::Size1G),
+        ),
+        (
+            HostResource::Hugepages,
+            limits.mib_2m + limits.mib_1g,
+            hugepages(before),
+            hugepages(after),
+        ),
+    ]
+    .into_iter()
+    .find(|(_, limit, was, now)| now > limit && now > was)
+    .map(|(resource, limit, _, used)| HostExceeded {
+        resource,
+        limit,
+        used,
+    })
 }
 
 /// 기록의 짧은 이름: `2 nodes, dedicated (isolate threads, isolated emulator), hugepages 1G, memory strict`
@@ -2880,6 +3028,96 @@ mod tests {
         assert_eq!(d.pages, BTreeMap::from([(PageKind::Size1G, 8192)]));
         let d = demand(&vm(json!({ "hugepages": "any" })), Some(&t));
         assert_eq!((d.pcpus, d.any_mib), (0, 8192));
+    }
+
+    #[test]
+    fn host_limits_count_the_dedicated_set_and_pools() {
+        let t = xeon();
+        assert_eq!(HostLimits::new(None, None), HostLimits::default());
+        let l = HostLimits::new(Some(&resources("0-1", "1-9")), Some(&t));
+        // 예약과 겹친 1은 전용이 아니다.
+        assert_eq!(l.pcpus, 8);
+        assert_eq!(l.mib_2m, 2 * 512 * 2);
+        assert_eq!(l.mib_1g, 2 * 4 * 1024);
+        assert_eq!(HostLimits::new(None, Some(&t)).pcpus, 0);
+    }
+
+    #[test]
+    fn exceeded_only_when_over_and_grown() {
+        let limits = HostLimits {
+            pcpus: 4,
+            mib_2m: 2048,
+            mib_1g: 4096,
+        };
+        let d = |pcpus: u64, m2: u64, m1: u64, any: u64| {
+            let mut d = Demand {
+                pcpus,
+                any_mib: any,
+                ..Demand::default()
+            };
+            if m2 > 0 {
+                d.pages.insert(PageKind::Size2M, m2);
+            }
+            if m1 > 0 {
+                d.pages.insert(PageKind::Size1G, m1);
+            }
+            d
+        };
+        assert_eq!(exceeded(&limits, &d(3, 0, 0, 0), &d(4, 0, 0, 0)), None);
+        let e = exceeded(&limits, &d(3, 0, 0, 0), &d(5, 0, 0, 0)).unwrap();
+        assert_eq!(
+            (e.resource, e.limit, e.used),
+            (HostResource::DedicatedCpus, 4, 5)
+        );
+        assert_eq!(e.to_string(), "would use 5 of 4 dedicated CPUs");
+        // 상한이 줄어 이미 넘친 노드: 늘리지 않는 쓰기는 된다.
+        assert_eq!(exceeded(&limits, &d(6, 0, 0, 0), &d(6, 0, 0, 0)), None);
+        assert_eq!(exceeded(&limits, &d(6, 0, 0, 0), &d(5, 0, 0, 0)), None);
+        assert_eq!(
+            exceeded(&limits, &d(0, 2048, 0, 0), &d(0, 2050, 0, 0))
+                .unwrap()
+                .resource,
+            HostResource::Hugepages2M
+        );
+        assert_eq!(
+            exceeded(&limits, &d(0, 0, 0, 0), &d(0, 0, 5120, 0))
+                .unwrap()
+                .resource,
+            HostResource::Hugepages1G
+        );
+        // `any`는 두 크기 합에 센다.
+        assert_eq!(
+            exceeded(&limits, &d(0, 0, 0, 0), &d(0, 2048, 0, 4096)),
+            None
+        );
+        let e = exceeded(&limits, &d(0, 2048, 0, 4096), &d(0, 2048, 0, 4098)).unwrap();
+        assert_eq!(
+            (e.resource, e.limit, e.used),
+            (HostResource::Hugepages, 6144, 6146)
+        );
+        assert_eq!(e.to_string(), "would use 6146 of 6144 MiB of hugepages");
+        assert_eq!(
+            serde_json::to_value(HostResource::Hugepages2M).unwrap(),
+            json!("hugepages_2m")
+        );
+    }
+
+    #[test]
+    fn demand_adds_and_compares() {
+        let mut a = Demand {
+            pcpus: 2,
+            ..Demand::default()
+        };
+        a.pages.insert(PageKind::Size2M, 512);
+        let mut b = a.clone();
+        b.add(&a);
+        assert_eq!((b.pcpus, b.mib(PageKind::Size2M)), (4, 1024));
+        assert!(a.within(&b));
+        assert!(!b.within(&a));
+        assert!(Demand::default().within(&a));
+        let mut c = Demand::default();
+        c.pages.insert(PageKind::Size1G, 1024);
+        assert!(!c.within(&b));
     }
 
     #[test]

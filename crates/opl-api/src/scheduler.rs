@@ -10,6 +10,10 @@ use opl_types::cpu::{self, Baseline, CpuCatalogSpec};
 use opl_types::hotplug;
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{CPU_MODELS, Node, NodeSpec, ShutdownAction, all_have, ha_capable};
+use opl_types::numa::{
+    self, Demand, HostFree, HostLimits, HostPlacement, HostSets, HostUsage, HostView, NodeTopology,
+    NumaRefusal, ResolvedNuma,
+};
 use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
 use opl_types::replication::{ReplicaVolume, replica_ready};
 use opl_types::runtime::ImageFormat;
@@ -29,7 +33,7 @@ use crate::volumes::block_pool_kind;
 pub enum ScheduleError {
     /// 노드 조건([`node_fits`])에 맞는 노드가 없다.
     #[error(
-        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups, can run its CPU model and, for an HA VM, has HA fencing)"
+        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups, can run its CPU model, has room for its dedicated CPUs, hugepages and NUMA layout and, for an HA VM, has HA fencing)"
     )]
     NoNode,
     /// 노드 조건에 맞는 노드는 있지만 모두 이 hard 규칙(이름 순)을 어긴다.
@@ -260,16 +264,167 @@ impl Inventory {
             })
     }
 
-    /// 실행하기로 된 다른 VM에 배정되지 않은 메모리
+    /// 실행하기로 된 다른 VM에 배정되지 않은 보통 메모리. hugepages 풀은 노드 메모리에서 빼고 hugepages VM의 메모리는
+    /// 풀에서 센다(계획 64 §7 — [`small_memory_mib`]·[`vm_small_mib`]).
     pub fn free_memory_mib(&self, node: &Node, vm: Uuid) -> i64 {
         let used: i64 = self
             .vms
             .iter()
             .filter(|v| v.id != vm && v.spec.node == Some(node.id))
             .filter(|v| v.spec.power == PowerState::Running)
-            .map(|v| i64::from(hotplug::allocated_memory_mib(v)))
+            .map(|v| i64::from(vm_small_mib(v)))
             .sum();
-        node.status.memory_mib as i64 - used
+        small_memory_mib(node) as i64 - used
+    }
+
+    /// 노드 `node`의 장부(계획 64 §9의 둘째 층, 어림): 그 노드에 자리 잡은 VM(`skip` 빼고, [`Assign`]을 따름 — 그
+    /// 노드로 오는 마이그레이션 포함)이 잡은 것과 그 요구 합. 도는 VM은 기록된 배치(`hardware.host_placement`, 정확)로,
+    /// 아직 켜지 않은 VM(놓였으나 켜지 않음, HA 회차의 자리)과 오는 마이그레이션은 그 모양을 지금 빈 자원에 맞춰 본
+    /// 배치로 센다. 합은 Raft 장부와 같이 스펙의 [`numa::demand`]다.
+    fn host_usage(
+        &self,
+        node: &Node,
+        topology: &NodeTopology,
+        sets: &HostSets,
+        skip: Uuid,
+        assign: &Assign,
+    ) -> (HostUsage, Demand) {
+        let mut total = Demand::default();
+        let mut records: Vec<(&ResolvedNuma, &HostPlacement)> = Vec::new();
+        let mut pending = Vec::new();
+        for v in self.vms.iter().filter(|v| v.id != skip) {
+            if !placement::occupied(v, assign).contains(&node.id) {
+                continue;
+            }
+            total.add(&numa::demand(&v.spec, Some(topology)));
+            match &v.status.hardware {
+                Some(hw) => match (&hw.numa, &hw.host_placement) {
+                    (Some(n), Some(p)) if p.node == node.id => records.push((n, p)),
+                    // 다른 노드에서 도는 VM(이 노드로 오는 마이그레이션)은 기록된 모양으로 다시 맞춘다.
+                    (Some(n), _) if n.memory.is_some() && v.status.node != Some(node.id) => {
+                        pending.push(VmShape::Fixed(n, &hw.cpu));
+                    }
+                    _ => {}
+                },
+                None => pending.push(VmShape::Spec(&v.spec)),
+            }
+        }
+        let mut usage = numa::usage(records, node.id);
+        for shape in pending {
+            let free = HostFree::new(topology, sets, &usage);
+            let view = HostView {
+                node: node.id,
+                topology,
+                sets,
+                free: &free,
+            };
+            let fit = match shape {
+                VmShape::Fixed(n, cpu) => numa::fit_fixed(n, cpu, Some(&view)).ok(),
+                VmShape::Spec(spec) => match numa::layout(spec, Some(topology)) {
+                    Ok(Some(l)) if l.binds() => numa::fit(&l, Some(&view)).ok(),
+                    _ => None,
+                },
+            };
+            if let Some(numa::Fit {
+                numa,
+                placement: Some(p),
+            }) = fit
+            {
+                usage.add(&numa::usage([(&numa, &p)], node.id));
+            }
+        }
+        (usage, total)
+    }
+
+    /// VM의 NUMA 모양이 노드에 맞는지(계획 64 §9). 묶지 않는 VM(`numa` 없는 공유 VM, 공유 vNUMA)은 늘 된다. 새로 켜면
+    /// 스펙의 모양을 빈 자원에 [`numa::fit`]으로 맞춰 본 뒤 Raft 장부와 같은 합계([`numa::exceeded`])도 보고, 도는 VM을
+    /// 옮기면 켤 때 기록한 모양을 [`numa::fit_fixed`]로 맞춰 본다 — 노드 할당기와 같은 함수다. `skip`은 이 VM(자리로 세지 않는다).
+    fn numa_fits(
+        &self,
+        skip: Uuid,
+        spec: &VmSpec,
+        node: &Node,
+        cpu: VmCpu<'_>,
+        assign: &Assign,
+    ) -> Result<(), String> {
+        let name = &node.name;
+        let topology = node.status.topology.as_ref();
+        let shape = match cpu {
+            VmCpu::Running(hw, _) => match &hw.numa {
+                Some(n) if n.memory.is_some() => VmShape::Fixed(n, &hw.cpu),
+                _ => return Ok(()),
+            },
+            VmCpu::Start => match numa::layout(spec, topology) {
+                Ok(Some(l)) if l.binds() => VmShape::Spec(spec),
+                Ok(_) => return Ok(()),
+                Err(e) => return Err(format!("the VM's NUMA settings are invalid: {e}")),
+            },
+        };
+        let Some(topology) = topology else {
+            return Err(NumaRefusal::NoTopology.for_node(name));
+        };
+        let sets = HostSets::new(node.spec.host_resources.as_ref(), topology);
+        let (usage, total) = self.host_usage(node, topology, &sets, skip, assign);
+        let free = HostFree::new(topology, &sets, &usage);
+        let view = HostView {
+            node: node.id,
+            topology,
+            sets: &sets,
+            free: &free,
+        };
+        let fit = match shape {
+            VmShape::Fixed(n, cpu) => numa::fit_fixed(n, cpu, Some(&view)),
+            VmShape::Spec(spec) => match numa::layout(spec, Some(topology)) {
+                Ok(Some(l)) => numa::fit(&l, Some(&view)),
+                Ok(None) => return Ok(()),
+                Err(e) => return Err(format!("the VM's NUMA settings are invalid: {e}")),
+            },
+        };
+        fit.map_err(|e| e.for_node(name))?;
+        // 새로 켜면 Raft 장부가 볼 합계도(맞춰 보지 못한 앞 VM, `isolate`·`any`의 셈이 배치와 다를 때)
+        if let VmShape::Spec(spec) = shape {
+            let mut after = total.clone();
+            after.add(&numa::demand(spec, Some(topology)));
+            let limits = HostLimits::new(node.spec.host_resources.as_ref(), Some(topology));
+            if let Some(e) = numa::exceeded(&limits, &total, &after) {
+                return Err(format!("node {name:?} {e}"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`Inventory::host_usage`]·[`Inventory::numa_fits`]가 맞추는 VM의 모양
+#[derive(Clone, Copy)]
+enum VmShape<'a> {
+    /// 켤 때 기록한 모양(도는 VM)
+    Fixed(&'a ResolvedNuma, &'a opl_types::vm::CpuSpec),
+    /// 스펙에서 새로 정함(켜기)
+    Spec(&'a VmSpec),
+}
+
+/// 노드의 보통 메모리: 노드 메모리에서 hugepages 풀을 뺀 것(계획 64 §7). 토폴로지가 없으면 노드 메모리 그대로다.
+pub fn small_memory_mib(node: &Node) -> u64 {
+    let pools: u64 = node.status.topology.as_ref().map_or(0, |t| {
+        t.nodes
+            .iter()
+            .map(|n| n.memory_mib.saturating_sub(n.small_memory_mib()))
+            .sum()
+    });
+    node.status.memory_mib.saturating_sub(pools)
+}
+
+/// VM이 쓰는 보통 메모리: hugepages VM(도는 VM은 기록, 아니면 스펙)은 풀에서 쓰므로 0, 아니면
+/// [`hotplug::allocated_memory_mib`]다.
+pub fn vm_small_mib(vm: &Vm) -> u32 {
+    let hugepages = match &vm.status.hardware {
+        Some(hw) => hw.numa.as_ref().is_some_and(|n| n.page.is_some()),
+        None => vm.spec.hugepages.is_some(),
+    };
+    if hugepages {
+        0
+    } else {
+        hotplug::allocated_memory_mib(vm)
     }
 }
 
@@ -308,7 +463,7 @@ pub fn blocked(vm: &Vm, inv: &Inventory, assign: &Assign) -> ScheduleError {
     let fits: Vec<&Node> = inv
         .nodes
         .iter()
-        .filter(|n| node_fits(&vm.spec, inv, n).is_ok())
+        .filter(|n| vm_fits(vm, inv, n, assign).is_ok())
         .collect();
     if fits.is_empty() {
         return ScheduleError::NoNode;
@@ -320,9 +475,16 @@ pub fn blocked(vm: &Vm, inv: &Inventory, assign: &Assign) -> ScheduleError {
     ScheduleError::PlacementRule(rules.into_iter().collect())
 }
 
-/// [`schedule`]가 이 노드를 후보로 보는지. 아니면 그 이유다. 메모리는 보지 않는다.
+/// 스펙 `spec`의 VM을 이 노드에서 켤 수 있는지. 아니면 그 이유다. 메모리는 보지 않는다. 전용 CPU·hugepages는 저장소의
+/// 어느 VM도 이 VM으로 보지 않고 센다 — 저장된 VM은 [`vm_fits`]를 쓴다.
 pub fn node_fits(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), String> {
     node_fits_with(spec, inv, node, &[])
+}
+
+/// [`schedule`]가 이 노드를 후보로 보는지(새로 켬): [`node_fits`]와 같되 저장소의 이 VM(같은 id)은 자리로 세지 않고
+/// 전용 CPU·hugepages·NUMA는 `assign`(HA 회차·묶음의 자리)을 따른다(계획 64 §9).
+pub fn vm_fits(vm: &Vm, inv: &Inventory, node: &Node, assign: &Assign) -> Result<(), String> {
+    fits(&vm.spec, inv, node, &[], VmCpu::Start, vm.id, assign)
 }
 
 /// 마이그레이션이 옮길 디스크(노드 로컬 풀의 디스크): 디스크마다 대상 풀(`pool`, 없으면 같은 이름의
@@ -429,21 +591,47 @@ pub fn migration_moves(
 /// 그 복제본의 풀로 본다([`replica_moves`]). HA 복구가 쓴다(새로 켜므로 CPU는 스펙을 해석한다). 도는 VM을 옮기는
 /// 되돌아가기·균형 조정기는 [`replica_migration_fits`]다.
 pub fn replica_fits(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
-    replica_fits_as(vm, inv, node, VmCpu::Start)
+    replica_fits_with(vm, inv, node, &Assign::default())
 }
 
-/// [`replica_fits`]와 같되 CPU는 도는 VM의 기록이다([`migration_fits`]).
+/// [`replica_fits`]와 같되 전용 CPU·hugepages·NUMA는 `assign`(HA 회차의 자리)을 따른다.
+pub fn replica_fits_with(
+    vm: &Vm,
+    inv: &Inventory,
+    node: &Node,
+    assign: &Assign,
+) -> Result<(), String> {
+    replica_fits_as(vm, inv, node, VmCpu::Start, assign)
+}
+
+/// [`replica_fits`]와 같되 CPU·NUMA는 도는 VM의 기록이다([`migration_fits`]).
 pub fn replica_migration_fits(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
-    replica_fits_as(vm, inv, node, VmCpu::of(vm))
+    replica_migration_fits_with(vm, inv, node, &Assign::default())
 }
 
-fn replica_fits_as(vm: &Vm, inv: &Inventory, node: &Node, cpu: VmCpu<'_>) -> Result<(), String> {
-    let plain = fits(&vm.spec, inv, node, &[], cpu);
+/// [`replica_migration_fits`]와 같되 전용 CPU·hugepages·NUMA는 `assign`(계획한 옮기기)을 따른다.
+pub fn replica_migration_fits_with(
+    vm: &Vm,
+    inv: &Inventory,
+    node: &Node,
+    assign: &Assign,
+) -> Result<(), String> {
+    replica_fits_as(vm, inv, node, VmCpu::of(vm), assign)
+}
+
+fn replica_fits_as(
+    vm: &Vm,
+    inv: &Inventory,
+    node: &Node,
+    cpu: VmCpu<'_>,
+    assign: &Assign,
+) -> Result<(), String> {
+    let plain = fits(&vm.spec, inv, node, &[], cpu, vm.id, assign);
     if plain.is_ok() {
         return plain;
     }
     match replica_moves(vm, inv, node.id) {
-        Some(moves) if !moves.is_empty() => fits(&vm.spec, inv, node, &moves, cpu),
+        Some(moves) if !moves.is_empty() => fits(&vm.spec, inv, node, &moves, cpu, vm.id, assign),
         _ => plain,
     }
 }
@@ -456,19 +644,39 @@ pub fn node_fits_with(
     node: &Node,
     moves: &[DiskMove],
 ) -> Result<(), String> {
-    fits(spec, inv, node, moves, VmCpu::Start)
+    fits(
+        spec,
+        inv,
+        node,
+        moves,
+        VmCpu::Start,
+        Uuid::nil(),
+        &Assign::default(),
+    )
 }
 
 /// 도는 VM을 옮길 대상(라이브 마이그레이션·비우기·균형 조정·되돌아가기): [`node_fits_with`]와 같되 CPU는 스펙을 새로
 /// 해석하지 않고 켤 때 기록한 것(`status.hardware.cpu_resolved`)을 본다 — 받는 쪽은 원본과 같은 CPUID로 켠다. 하드웨어
-/// 기록이 없으면(꺼진 VM) [`node_fits_with`]와 같다.
+/// 기록이 없으면(꺼진 VM) [`node_fits_with`]와 같다. NUMA도 켤 때 기록한 모양(`hardware.numa`)을 대상에 맞춰 본다(계획 64
+/// §11 — 받는 쪽 할당기가 같은 함수로 고른다).
 pub fn migration_fits(
     vm: &Vm,
     inv: &Inventory,
     node: &Node,
     moves: &[DiskMove],
 ) -> Result<(), String> {
-    fits(&vm.spec, inv, node, moves, VmCpu::of(vm))
+    migration_fits_with(vm, inv, node, moves, &Assign::default())
+}
+
+/// [`migration_fits`]와 같되 전용 CPU·hugepages·NUMA는 `assign`(함께 옮기는 묶음)을 따른다.
+pub fn migration_fits_with(
+    vm: &Vm,
+    inv: &Inventory,
+    node: &Node,
+    moves: &[DiskMove],
+    assign: &Assign,
+) -> Result<(), String> {
+    fits(&vm.spec, inv, node, moves, VmCpu::of(vm), vm.id, assign)
 }
 
 /// `host`·`max` VM을 `from`에서 `to`로 옮길 때의 경고(계획 63 §10, 막지 않는다): 두 노드의 카탈로그가 다르고 대상
@@ -527,10 +735,21 @@ pub fn cpu_receives(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String>
     inv.cpu_fits(&vm.spec, node, VmCpu::of(vm))
 }
 
-/// 도는 VM을 노드 `from`에서 옮길 수 있는 다른 노드(온라인, 유지보수·위트니스가 아님, 머신의 아키텍처)가 모두 CPU
-/// 때문에 받지 못하면 그 첫 까닭이다(리뷰 2 #5). 비우기·호스트 종료가 "no node with capacity" 대신 보인다. 받을 수
-/// 있는 노드가 하나라도 있거나 후보가 없으면 None이다(다른 까닭이다).
-pub fn cpu_blocks_every_move(vm: &Vm, inv: &Inventory, from: Uuid) -> Option<String> {
+/// 도는 VM의 기록된 NUMA 모양(꺼진 VM이면 스펙)을 노드의 빈 전용 CPU·hugepages에 맞출 수 있는지만 본다([`migration_fits`]의
+/// NUMA 부분, 계획 64). [`cpu_receives`]와 함께 쓴다.
+pub fn numa_receives(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
+    inv.numa_fits(vm.id, &vm.spec, node, VmCpu::of(vm), &Assign::default())
+}
+
+/// VM의 스펙을 노드에서 새로 켤 때 NUMA 모양이 맞는지만 본다(껐다 켜기, 계획 64). 이 VM이 잡은 것은 세지 않는다.
+pub fn numa_starts(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
+    inv.numa_fits(vm.id, &vm.spec, node, VmCpu::Start, &Assign::default())
+}
+
+/// 도는 VM을 노드 `from`에서 옮길 수 있는 다른 노드(온라인, 유지보수·위트니스가 아님, 머신의 아키텍처)가 모두 CPU나
+/// NUMA(전용 CPU·hugepages, 계획 64) 때문에 받지 못하면 그 첫 까닭이다(리뷰 2 #5). 비우기·호스트 종료가 "no node with
+/// capacity" 대신 보인다. 받을 수 있는 노드가 하나라도 있거나 후보가 없으면 None이다(다른 까닭이다).
+pub fn blocks_every_move(vm: &Vm, inv: &Inventory, from: Uuid) -> Option<String> {
     let arch = vm.spec.machine.arch();
     let mut first = None;
     for n in inv.nodes.iter().filter(|n| {
@@ -540,7 +759,7 @@ pub fn cpu_blocks_every_move(vm: &Vm, inv: &Inventory, from: Uuid) -> Option<Str
             && n.status.online
             && n.status.arch == Some(arch)
     }) {
-        match cpu_receives(vm, inv, n) {
+        match cpu_receives(vm, inv, n).and_then(|()| numa_receives(vm, inv, n)) {
             Ok(()) => return None,
             Err(e) => {
                 first.get_or_insert(e);
@@ -550,12 +769,15 @@ pub fn cpu_blocks_every_move(vm: &Vm, inv: &Inventory, from: Uuid) -> Option<Str
     first
 }
 
+/// 노드 조건. `skip`은 자리로 세지 않을 VM(이 VM), `assign`은 전용 CPU·hugepages·NUMA를 셀 때 따를 자리다.
 fn fits(
     spec: &VmSpec,
     inv: &Inventory,
     node: &Node,
     moves: &[DiskMove],
     cpu: VmCpu<'_>,
+    skip: Uuid,
+    assign: &Assign,
 ) -> Result<(), String> {
     // 템플릿(계획 58)은 켜지 않는다: 어느 노드에도 놓지 않는다(스케줄러·HA·균형 조정기·마이그레이션 대상 모두).
     // API가 켜기를 막지만 방어로.
@@ -634,7 +856,9 @@ fn fits(
         ));
     }
     // 계획 63: CPU 모델·플래그(작업자의 켤 때 확인과 같은 규칙)
-    inv.cpu_fits(spec, node, cpu)
+    inv.cpu_fits(spec, node, cpu)?;
+    // 계획 64: 전용 CPU·hugepages·NUMA 모양(노드 할당기와 같은 맞춤)
+    inv.numa_fits(skip, spec, node, cpu, assign)
 }
 
 /// HA 용량 예약을 넘는다: 예약을 뺀 메모리에 이 VM이 들어가지 않는다(MiB).
@@ -2280,13 +2504,13 @@ mod tests {
         assert_eq!(node_fits(&vm.spec, &inv, &nodes[1]), Ok(()));
         // 리뷰 2 #5: 비우기는 "no node with capacity" 대신 CPU 까닭을 보인다.
         assert_eq!(
-            cpu_blocks_every_move(&vm, &inv, nodes[0].id),
+            blocks_every_move(&vm, &inv, nodes[0].id),
             Some(migration_blocked(&["invtsc"]))
         );
         if let Some(hw) = &mut vm.status.hardware {
             hw.cpu_resolved.as_mut().unwrap().flags.clear();
         }
-        assert_eq!(cpu_blocks_every_move(&vm, &inv, nodes[0].id), None);
+        assert_eq!(blocks_every_move(&vm, &inv, nodes[0].id), None);
     }
 
     #[test]
@@ -2376,5 +2600,240 @@ mod tests {
         let mut named: Vm = Resource::new("db", x86_spec("Skylake-Server-v5", &[]));
         named.status.hardware = Some(RunningHardware::legacy(&named.spec));
         assert_eq!(host_cpu_warning(&named, &inv, &nodes[0], &nodes[1]), None);
+    }
+
+    // -------------------------------------------------------------------------------------------------------------
+    // 계획 64: 전용 CPU·hugepages·NUMA
+    // -------------------------------------------------------------------------------------------------------------
+
+    /// CPU 0-7(호스트 노드 하나, 16 GiB, 2M 풀 512개 = 1 GiB), 전용 `dedicated`
+    fn numa_node(name: &str, dedicated: &str) -> Node {
+        let mut n = node(16384);
+        n.name = name.into();
+        n.spec.host_resources = Some(numa::HostResources {
+            reserved_cpus: Default::default(),
+            dedicated_cpus: dedicated.parse().unwrap(),
+            hugepages: Vec::new(),
+        });
+        n.status.topology = Some(
+            serde_json::from_value(serde_json::json!({
+                "sockets": 1, "threads_per_core": 1, "cpus": "0-7", "pinning": true, "cpuset": true,
+                "probed_at": 1,
+                "nodes": [{"id": 0, "cpus": "0-7", "memory_mib": 16384,
+                           "hugepages": [{"size_kib": 2048, "total": 512}]}],
+            }))
+            .unwrap(),
+        );
+        n
+    }
+
+    /// `cores`개 vCPU의 전용 VM
+    fn dedicated_spec(cores: u16, node: Option<Uuid>, power: PowerState) -> VmSpec {
+        let mut s = spec(512, node, power);
+        s.cpu.cores = cores;
+        s.cpu.policy = numa::CpuPolicy::Dedicated;
+        s
+    }
+
+    /// 노드에서 켠 것처럼 기록을 채운다(노드 할당기 대신 같은 맞춤 함수로).
+    fn started_on(vm: &mut Vm, node: &Node, inv: &Inventory) {
+        let topo = node.status.topology.as_ref().unwrap();
+        let sets = HostSets::new(node.spec.host_resources.as_ref(), topo);
+        let (usage, _) = inv.host_usage(node, topo, &sets, vm.id, &Assign::default());
+        let free = HostFree::new(topo, &sets, &usage);
+        let view = HostView {
+            node: node.id,
+            topology: topo,
+            sets: &sets,
+            free: &free,
+        };
+        let layout = numa::layout(&vm.spec, Some(topo)).unwrap().unwrap();
+        let fit = numa::fit(&layout, Some(&view)).unwrap();
+        let mut hw = RunningHardware::legacy(&vm.spec);
+        hw.numa = Some(fit.numa);
+        hw.host_placement = fit.placement;
+        vm.status.hardware = Some(hw);
+        vm.status.node = Some(node.id);
+        vm.status.phase = opl_types::vm::VmPhase::Running;
+        vm.spec.node = Some(node.id);
+        vm.spec.power = PowerState::Running;
+    }
+
+    /// 스케줄러는 전용 CPU가 남은 노드만 고르고(토폴로지 없는 노드·전용 집합 없는 노드는 빼고), 도는 VM의 기록된
+    /// pCPU와 놓였으나 아직 켜지 않은 VM의 요구를 센다. 남은 노드가 없으면 노드마다 까닭이다.
+    #[test]
+    fn scheduler_places_dedicated_vms_only_where_cpus_are_free() {
+        let plain = node(16384);
+        let n1 = numa_node("n1", "4-7");
+        let n2 = numa_node("n2", "");
+        let mut inv = Inventory {
+            nodes: vec![plain.clone(), n1.clone(), n2.clone()],
+            ..Inventory::default()
+        };
+        let want = dedicated_spec(2, None, PowerState::Stopped);
+        assert_eq!(sched(&want, &inv), Ok(n1.id));
+        assert_eq!(
+            node_fits(&want, &inv, &plain),
+            Err(r#"node "n" cannot pin vCPUs or bind memory (no topology)"#.into())
+        );
+        assert_eq!(
+            node_fits(&want, &inv, &n2),
+            Err(r#"node "n2" has no dedicated CPUs"#.into())
+        );
+        // n1에서 도는 2 vCPU 전용 VM(기록 4-5)과 놓였으나 아직 켜지 않은 1 vCPU VM
+        let mut a: Vm = Resource::new("a", dedicated_spec(2, None, PowerState::Stopped));
+        started_on(&mut a, &n1, &inv);
+        assert_eq!(
+            a.status
+                .hardware
+                .as_ref()
+                .unwrap()
+                .host_placement
+                .as_ref()
+                .unwrap()
+                .vcpus,
+            vec![4, 5]
+        );
+        inv.vms.push(a);
+        assert_eq!(sched(&want, &inv), Ok(n1.id));
+        let b: Vm = Resource::new("b", dedicated_spec(1, Some(n1.id), PowerState::Running));
+        inv.vms.push(b);
+        assert_eq!(sched(&want, &inv), Err(NoNode));
+        assert_eq!(
+            node_fits(&want, &inv, &n1),
+            Err(
+                r#"node "n1" has 1 free dedicated CPUs on host NUMA node 0; the VM needs 2 on one"#
+                    .into()
+            )
+        );
+        // 1 vCPU는 아직 들어간다.
+        assert_eq!(
+            sched(&dedicated_spec(1, None, PowerState::Stopped), &inv),
+            Ok(n1.id)
+        );
+        // 공유 VM은 이 모든 것과 상관없다.
+        assert!(sched(&spec(512, None, PowerState::Stopped), &inv).is_ok());
+    }
+
+    /// HA 회차의 자리(`Assign`)도 센다: 앞서 옮긴 전용 VM이 잡은 CPU에 다음 VM을 놓지 않는다.
+    #[test]
+    fn assigned_vms_take_their_dedicated_cpus() {
+        let n1 = numa_node("n1", "4-7");
+        let dead = numa_node("dead", "4-7");
+        let a: Vm = Resource::new("a", dedicated_spec(3, Some(dead.id), PowerState::Running));
+        let b: Vm = Resource::new("b", dedicated_spec(2, Some(dead.id), PowerState::Running));
+        let inv = Inventory {
+            nodes: vec![n1.clone()],
+            vms: vec![a.clone(), b.clone()],
+            ..Inventory::default()
+        };
+        let mut assign = Assign::default();
+        assign.unplace(a.id);
+        assign.unplace(b.id);
+        assert!(vm_fits(&b, &inv, &n1, &assign).is_ok());
+        assign.place(a.id, n1.id);
+        assert_eq!(
+            vm_fits(&b, &inv, &n1, &assign),
+            Err(
+                r#"node "n1" has 1 free dedicated CPUs on host NUMA node 0; the VM needs 2 on one"#
+                    .into()
+            )
+        );
+        assert!(replica_fits_with(&b, &inv, &n1, &assign).is_err());
+    }
+
+    /// 도는 VM을 옮길 때는 켤 때 기록한 모양을 대상에 맞춘다(`fit_fixed`): 대상의 전용 CPU가 모자라면 그 까닭이고, 그
+    /// 노드로 오는 다른 마이그레이션의 몫도 센다. 다른 노드가 모두 막으면 비우기가 그 첫 까닭을 보인다.
+    #[test]
+    fn migrations_fit_the_recorded_shape() {
+        let n1 = numa_node("n1", "4-7");
+        let n2 = numa_node("n2", "6-7");
+        let n3 = numa_node("n3", "4-7");
+        let mut inv = Inventory {
+            nodes: vec![n1.clone(), n2.clone(), n3.clone()],
+            ..Inventory::default()
+        };
+        let mut a: Vm = Resource::new("a", dedicated_spec(2, None, PowerState::Stopped));
+        started_on(&mut a, &n1, &inv);
+        // 기록 뒤 스펙을 3 vCPU로 바꿔도(보류) 옮기기는 기록(2)으로 본다.
+        a.spec.cpu.cores = 3;
+        inv.vms.push(a.clone());
+        assert_eq!(migration_fits(&a, &inv, &n2, &[]), Ok(()));
+        assert_eq!(numa_receives(&a, &inv, &n2), Ok(()));
+        // 같은 2 vCPU VM이 n2로 옮겨 가는 중이면 n2에 자리가 없다.
+        let mut b: Vm = Resource::new("b", dedicated_spec(2, None, PowerState::Stopped));
+        started_on(&mut b, &n3, &inv);
+        b.status.migration = Some(opl_types::vm::MigrationStatus {
+            node: n2.id,
+            task: Uuid::nil(),
+            disks: Vec::new(),
+        });
+        inv.vms.push(b);
+        assert_eq!(
+            numa_receives(&a, &inv, &n2),
+            Err(
+                r#"node "n2" has 0 free dedicated CPUs on host NUMA node 0; the VM needs 2 on one"#
+                    .into()
+            )
+        );
+        assert!(migration_fits(&a, &inv, &n2, &[]).is_err());
+        // n3는 b가 떠나는 중이라 아직 잡혀 있고(4-5) 6-7이 남는다.
+        assert_eq!(migration_fits(&a, &inv, &n3, &[]), Ok(()));
+        let mut full3 = n3.clone();
+        full3.spec.host_resources.as_mut().unwrap().dedicated_cpus = "4-5".parse().unwrap();
+        inv.nodes = vec![n1.clone(), n2.clone(), full3];
+        assert_eq!(
+            blocks_every_move(&a, &inv, n1.id),
+            Some(
+                r#"node "n2" has 0 free dedicated CPUs on host NUMA node 0; the VM needs 2 on one"#
+                    .into()
+            )
+        );
+    }
+
+    /// hugepages: 크기 풀이 없는 노드는 빼고, 보통 메모리(`free_memory_mib`)는 풀을 빼고 hugepages VM을 세지 않는다.
+    #[test]
+    fn hugepages_need_a_pool_and_leave_small_memory_alone() {
+        let n1 = numa_node("n1", "");
+        let mut big = spec(1024, None, PowerState::Stopped);
+        big.hugepages = Some(numa::PageSize::Size1G);
+        let inv = Inventory {
+            nodes: vec![n1.clone()],
+            ..Inventory::default()
+        };
+        assert_eq!(
+            node_fits(&big, &inv, &n1),
+            Err(r#"node "n1" has no 1G hugepages"#.into())
+        );
+        let mut small = spec(1024, Some(n1.id), PowerState::Running);
+        small.hugepages = Some(numa::PageSize::Size2M);
+        let mut inv = inv;
+        assert_eq!(small_memory_mib(&n1), 16384 - 1024);
+        assert_eq!(inv.free_memory_mib(&n1, Uuid::nil()), 16384 - 1024);
+        inv.vms.push(Resource::new("hp", small.clone()));
+        inv.vms.push(Resource::new(
+            "plain",
+            spec(2048, Some(n1.id), PowerState::Running),
+        ));
+        assert_eq!(inv.free_memory_mib(&n1, Uuid::nil()), 16384 - 1024 - 2048);
+        // 풀(1 GiB)은 이미 다 잡혔다.
+        let mut more = spec(2, None, PowerState::Stopped);
+        more.hugepages = Some(numa::PageSize::Size2M);
+        assert_eq!(
+            node_fits(&more, &inv, &n1),
+            Err(
+                r#"node "n1" has 0 free 2M hugepages on host NUMA node 0; the VM needs 1 on one"#
+                    .into()
+            )
+        );
+        // 기록된 배치 없이 놓인 VM이 맞춰지지 않아도(이미 넘친 노드) 합계는 Raft 장부처럼 센다.
+        let mut over = spec(2048, Some(n1.id), PowerState::Running);
+        over.hugepages = Some(numa::PageSize::Size2M);
+        inv.vms.retain(|v| v.name != "hp");
+        inv.vms.push(Resource::new("over", over));
+        assert_eq!(
+            node_fits(&more, &inv, &n1),
+            Err(r#"node "n1" would use 2050 of 1024 MiB of 2M hugepages"#.into())
+        );
     }
 }

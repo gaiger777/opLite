@@ -2576,8 +2576,10 @@ export interface paths {
          *     (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
          *     `start`·`reboot`은 409 `vm_busy`다. 끝나지 않은 펌웨어 초기화 Task(`vm-firmware-reset`)가 있어도 `start`·`reboot`은 409
          *     `vm_busy`이고, 꺼진 TPM VM을 켤 노드가 지금 TPM 상태를 얻을 수 없으면(`firmware_node`가 오프라인이고 온라인 사본이
-         *     없음) `start`는 409 `tpm_state_unavailable`이다. 꺼진 VM이 고정된 노드가 VM의 CPU 모델·플래그를 켤 수 없으면 켤 수 있는
-         *     다른 노드를 고르고, 없으면 `start`는 409 `no_capacity`(까닭)다.
+         *     없음) `start`는 409 `tpm_state_unavailable`이다. 꺼진 VM이 고정된 노드가 VM의 CPU 모델·플래그를 켤 수 없거나 전용
+         *     CPU·hugepages·NUMA 모양이 들지 않으면 켤 수 있는 다른 노드를 고르고, 없으면 `start`는 409 `no_capacity`(까닭)다. 고른
+         *     노드의 전용 CPU·hugepages를 그사이 다른 켜기가 잡았으면(클러스터 장부의 거절) 그 노드를 빼고 한 번 다시 고른다.
+         *     `reboot`은 그 노드가 새 스펙의 CPU·NUMA를 켤 수 없으면 409 `no_capacity`다.
          */
         post: operations["vm_action"];
         delete?: never;
@@ -2825,7 +2827,8 @@ export interface paths {
          *     않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
          *     유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
          *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리, VM이 켤 때 기록한 CPU 모델·플래그를 켤 수 없음)면
-         *     409 `no_capacity`다. 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`)로 도는 VM은 409 `migration_unsupported`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
+         *     409 `no_capacity`다. 대상이 VM이 켤 때 기록한 NUMA 모양(전용 CPU·hugepages)을 받을 수 없으면 409
+         *     `migration_unsupported`(까닭)다. 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`)로 도는 VM은 409 `migration_unsupported`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
          *     `cpu-warning: target node "n3" lacks …`를 남긴다. 대상 노드가 hard
          *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
          *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
