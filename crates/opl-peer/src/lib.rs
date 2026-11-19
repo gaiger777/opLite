@@ -63,6 +63,10 @@ mod proto {
 /// 콘솔 스트림에서 VM id를 담는 메타데이터 키
 pub const VM_METADATA: &str = "opl-vm";
 
+/// `UefiVars`에서 요청한 노드가 아는 VM의 펌웨어 회차를 담는 메타데이터 키. 주는 노드는 자기 클러스터 상태가 아직
+/// 초기화를 받지 못했어도 이 회차보다 낡은 변수를 주지 않는다. 옛 노드는 키를 모르고 무시한다.
+pub const FIRMWARE_EPOCH_METADATA: &str = "opl-firmware-epoch";
+
 /// 호출이 가려는 노드의 id를 담는 메타데이터 키. 받는 노드는 이것이 자기 id가 아니면(다른 노드를 가리키는 링크)
 /// 처리하지 않고 `permission_denied`로 답하며 같은 키에 자기 id를 싣는다. 보내는 쪽은 그것을 링크 실패로 센다.
 pub const TARGET_METADATA: &str = "orbivisor-target";

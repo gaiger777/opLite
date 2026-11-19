@@ -55,7 +55,8 @@ use crate::wire::{
     VoteReply, VoteRequest,
 };
 use crate::{
-    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, TARGET_METADATA, VM_METADATA,
+    FIRMWARE_EPOCH_METADATA, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES,
+    TARGET_METADATA, VM_METADATA,
 };
 
 /// 다른 노드가 부르는 서비스. 상대 인증서의 노드 id가 이 노드가 아는 멤버(투표 멤버·learner·관찰 노드)여야
@@ -549,14 +550,22 @@ impl Peer for PeerService {
             .state_dir
             .clone()
             .ok_or_else(|| Status::unimplemented("this node does not serve UEFI variables"))?;
+        let requested = req
+            .metadata()
+            .get(FIRMWARE_EPOCH_METADATA)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u32>().ok());
         let vm = req.into_inner().vm;
         // 이 노드의 회차가 VM의 회차와 다르면 이 노드의 변수는 초기화 전의 것이다(오프라인 동안 초기화된 사본 노드 등):
-        // 주지 않는다(리뷰 2 #3). 회차 파일을 읽지 못하면 모르는 것이라 준다.
+        // 주지 않는다(리뷰 2 #3). 회차 파일을 읽지 못하면 모르는 것이라 준다. VM의 회차는 이 노드의 클러스터 상태와
+        // 요청한 노드가 아는 것 중 큰 것이다(회차는 늘기만 한다): 이 노드에 초기화가 아직 복제되지 않았어도 초기화 전
+        // 변수를 주지 않는다.
         let epoch = self
             .cluster
             .get::<VmSpec>(vm)
             .map_err(|e| Status::unavailable(e.to_string()))?
-            .map(|v| v.status.firmware_epoch);
+            .map(|v| v.status.firmware_epoch)
+            .max(requested);
         if let Some(epoch) = epoch
             && opl_driver::firmware_epoch_differs(&dir, vm, epoch)
         {

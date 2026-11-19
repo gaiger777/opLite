@@ -117,6 +117,7 @@ impl FirmwareFetcher for UefiVarsFetcher {
                 vm,
                 &uefi_vars_path(&self.state_dir, vm),
                 Some(len),
+                current.as_ref().map(|v| v.status.firmware_epoch),
             )
             .await
             .map_err(|e| FirmwareError(e.to_string()))?;

@@ -1397,7 +1397,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
     std::fs::write(&dest, b"stale").unwrap();
     let len = to
         .peers
-        .uefi_vars(from.id(), &from.addr, vm, &dest, None)
+        .uefi_vars(from.id(), &from.addr, vm, &dest, None, None)
         .await
         .unwrap();
     assert_eq!(len, vars.len() as u64);
@@ -1406,25 +1406,44 @@ async fn uefi_vars_are_fetched_from_a_member() {
     // 0만 있는 파일, 빈 파일도 크기 그대로 온다.
     std::fs::write(&src, vec![0u8; chunk + 1]).unwrap();
     to.peers
-        .uefi_vars(from.id(), &from.addr, vm, &dest, None)
+        .uefi_vars(from.id(), &from.addr, vm, &dest, None, None)
         .await
         .unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), vec![0u8; chunk + 1]);
     std::fs::write(&src, b"").unwrap();
     assert_eq!(
         to.peers
-            .uefi_vars(from.id(), &from.addr, vm, &dest, None)
+            .uefi_vars(from.id(), &from.addr, vm, &dest, None, None)
             .await
             .unwrap(),
         0
     );
     assert!(std::fs::read(&dest).unwrap().is_empty());
 
+    // 그 노드의 클러스터 상태가 초기화를 모르더라도 요청한 노드가 아는 회차보다 낡은 변수는 주지 않는다.
+    std::fs::write(&dest, b"kept").unwrap();
+    let err = to
+        .peers
+        .uefi_vars(from.id(), &from.addr, vm, &dest, None, Some(1))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, UefiVarsError::Unavailable(m) if m.contains("from before a firmware reset")),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"kept");
+    opl_driver::write_firmware_epoch(&from.state_dir, vm, 1).unwrap();
+    to.peers
+        .uefi_vars(from.id(), &from.addr, vm, &dest, None, Some(1))
+        .await
+        .unwrap();
+    assert!(std::fs::read(&dest).unwrap().is_empty());
+
     // 그 노드에 파일이 없으면 NotFound이고 받는 쪽 파일은 그대로다.
     std::fs::write(&dest, b"kept").unwrap();
     let err = to
         .peers
-        .uefi_vars(from.id(), &from.addr, Uuid::now_v7(), &dest, None)
+        .uefi_vars(from.id(), &from.addr, Uuid::now_v7(), &dest, None, None)
         .await
         .unwrap_err();
     assert_eq!(err, UefiVarsError::NotFound);
@@ -1439,6 +1458,7 @@ async fn uefi_vars_are_fetched_from_a_member() {
             &from.addr,
             vm,
             &root.path().join("outsider.fd"),
+            None,
             None,
         )
         .await

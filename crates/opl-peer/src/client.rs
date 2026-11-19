@@ -56,7 +56,8 @@ use crate::replica::{
 };
 use crate::wire::FollowRequest;
 use crate::{
-    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES, TARGET_METADATA, VM_METADATA,
+    FIRMWARE_EPOCH_METADATA, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES,
+    TARGET_METADATA, VM_METADATA,
 };
 
 /// 연결을 맺기까지 기다리는 최대 시간. 전달자가 쓰기 한 번을 기다리는 시간(`opl_cluster`의 3초)보다 짧아야
@@ -599,7 +600,8 @@ impl Peers {
 impl Peers {
     /// 노드 `from`(첫 링크 `addr`)에서 VM의 UEFI 변수 파일을 받아 `dest`를 바꾼다(같은 디렉터리의 임시 파일에
     /// 받아 fsync한 뒤 이름을 바꾼다). 받은 크기가 `expect_len`과 다르거나 실패하면 `dest`는 그대로다.
-    /// 받은 파일의 크기를 돌려준다.
+    /// 받은 파일의 크기를 돌려준다. `epoch`는 이 노드가 아는 VM의 펌웨어 회차다: 그 노드의 변수가 이보다 낡았으면
+    /// 그 노드가 주지 않는다(그 노드의 클러스터 상태가 초기화를 아직 받지 못했어도).
     pub async fn uefi_vars(
         &self,
         from: NodeId,
@@ -607,12 +609,17 @@ impl Peers {
         vm: Uuid,
         dest: &Path,
         expect_len: Option<u64>,
+        epoch: Option<u32>,
     ) -> Result<u64, UefiVarsError> {
         let reply = self
             .send_bulk(addr, |mut client| {
                 let mut req = Request::new(UefiVarsRequest { vm });
                 req.set_timeout(UEFI_VARS_TIMEOUT);
                 addressed(&mut req, Some(from));
+                if let Some(value) = epoch.and_then(|e| MetadataValue::try_from(e.to_string()).ok())
+                {
+                    req.metadata_mut().insert(FIRMWARE_EPOCH_METADATA, value);
+                }
                 async move { client.uefi_vars(req).await }
             })
             .await;
