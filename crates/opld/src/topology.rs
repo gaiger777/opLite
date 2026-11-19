@@ -1027,6 +1027,38 @@ mod tests {
         assert_eq!(keep_time(Some(&a), &c), c);
         assert_eq!(keep_time(None, &b), b);
     }
+
+    #[test]
+    fn live_values_are_read_per_host_node() {
+        let root = fixture("x86-2s");
+        let live = live(&root.join("sys"), &root.join("proc"), &CpuSet::new()).unwrap();
+        assert_eq!(live.nodes.len(), 2);
+        assert_eq!(live.nodes[0].id, 0);
+        assert_eq!(live.nodes[0].memory_free_mib, 32921966 / 1024);
+        let sizes: Vec<u32> = live.nodes[0].hugepages.iter().map(|p| p.size_kib).collect();
+        assert_eq!(sizes, [2048, 1048576]);
+        assert_eq!(live.nodes[0].hugepages[0].free, 512);
+        // 고정물에 `self/status`가 없으면 친화를 모른다.
+        assert!(!live.affinity_ok);
+
+        let dir = copy_fixture("x86-no-numa");
+        let (sys, proc) = (dir.path().join("sys"), dir.path().join("proc"));
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        let online = probe(&sys, &proc).unwrap().cpus;
+        std::fs::write(
+            proc.join("self/status"),
+            format!("Name:\topld\nCpus_allowed_list:\t{online}\n"),
+        )
+        .unwrap();
+        let live = super::live(&sys, &proc, &CpuSet::new()).unwrap();
+        assert_eq!(live.nodes.len(), 1);
+        assert_eq!(live.nodes[0].memory_free_mib, 8157184 / 1024);
+        assert!(live.affinity_ok);
+        // 예약 CPU가 있는데 opld가 온라인 전체에 돌면 맞지 않는다.
+        assert!(!super::live(&sys, &proc, &set("0")).unwrap().affinity_ok);
+        std::fs::write(proc.join("self/status"), "Cpus_allowed_list:\t0\n").unwrap();
+        assert!(super::live(&sys, &proc, &set("0")).unwrap().affinity_ok);
+    }
 }
 
 /// 실제 Linux 호스트에서(CI `linux-kvm`, root): 이 호스트를 읽고(고정물로 옮길 수 있게 찍는다), 2M hugepages를 실행 중
@@ -1147,36 +1179,5 @@ mod real {
             .parse()
             .unwrap();
         assert_eq!(allowed, last);
-    }
-    #[test]
-    fn live_values_are_read_per_host_node() {
-        let root = fixture("x86-2s");
-        let live = live(&root.join("sys"), &root.join("proc"), &CpuSet::new()).unwrap();
-        assert_eq!(live.nodes.len(), 2);
-        assert_eq!(live.nodes[0].id, 0);
-        assert_eq!(live.nodes[0].memory_free_mib, 32921966 / 1024);
-        let sizes: Vec<u32> = live.nodes[0].hugepages.iter().map(|p| p.size_kib).collect();
-        assert_eq!(sizes, [2048, 1048576]);
-        assert_eq!(live.nodes[0].hugepages[0].free, 512);
-        // 고정물에 `self/status`가 없으면 친화를 모른다.
-        assert!(!live.affinity_ok);
-
-        let dir = copy_fixture("x86-no-numa");
-        let (sys, proc) = (dir.path().join("sys"), dir.path().join("proc"));
-        std::fs::create_dir_all(proc.join("self")).unwrap();
-        let online = probe(&sys, &proc).unwrap().cpus;
-        std::fs::write(
-            proc.join("self/status"),
-            format!("Name:\topld\nCpus_allowed_list:\t{online}\n"),
-        )
-        .unwrap();
-        let live = super::live(&sys, &proc, &CpuSet::new()).unwrap();
-        assert_eq!(live.nodes.len(), 1);
-        assert_eq!(live.nodes[0].memory_free_mib, 8157184 / 1024);
-        assert!(live.affinity_ok);
-        // 예약 CPU가 있는데 opld가 온라인 전체에 돌면 맞지 않는다.
-        assert!(!super::live(&sys, &proc, &set("0")).unwrap().affinity_ok);
-        std::fs::write(proc.join("self/status"), "Cpus_allowed_list:\t0\n").unwrap();
-        assert!(super::live(&sys, &proc, &set("0")).unwrap().affinity_ok);
     }
 }
