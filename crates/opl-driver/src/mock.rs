@@ -2435,6 +2435,9 @@ mod tests {
             id: Uuid::now_v7(),
             name: "t".into(),
             cpu: CpuSpec {
+                emulator: None,
+                policy: Default::default(),
+                thread_policy: None,
                 flags: Vec::new(),
                 sockets: 1,
                 cores: 1,
@@ -3653,6 +3656,9 @@ mod tests {
     fn hot_spec() -> VmRuntimeSpec {
         VmRuntimeSpec {
             cpu: CpuSpec {
+                emulator: None,
+                policy: Default::default(),
+                thread_policy: None,
                 flags: Vec::new(),
                 sockets: 1,
                 cores: 2,

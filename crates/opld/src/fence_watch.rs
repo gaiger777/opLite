@@ -345,6 +345,7 @@ mod tests {
         let mut node = Resource::new(
             name,
             NodeSpec {
+                host_resources: None,
                 address: "127.0.0.1:1".into(),
                 maintenance: false,
                 witness: false,
@@ -383,6 +384,7 @@ mod tests {
         let mut node = Resource::new(
             "n1",
             NodeSpec {
+                host_resources: None,
                 address: "127.0.0.1:1".into(),
                 maintenance: false,
                 witness: false,

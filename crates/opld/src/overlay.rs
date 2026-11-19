@@ -311,6 +311,7 @@ mod tests {
         let mut node = Resource::new(
             name,
             NodeSpec {
+                host_resources: None,
                 address: format!("{name}:8006"),
                 maintenance: false,
                 witness,

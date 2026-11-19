@@ -174,6 +174,7 @@ impl Harness {
         let mut node = Resource::new(
             format!("n{i}"),
             NodeSpec {
+                host_resources: None,
                 address: format!("node-{i}:8006"),
                 maintenance: false,
                 witness: false,
@@ -564,6 +565,7 @@ async fn a_learner_that_never_registered_does_not_stop_the_keeper() {
     let mut node = Resource::new(
         "n9",
         NodeSpec {
+            host_resources: None,
             address: "node-9:8006".into(),
             maintenance: false,
             witness: false,

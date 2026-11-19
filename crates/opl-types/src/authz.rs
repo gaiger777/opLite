@@ -80,6 +80,9 @@ privileges! {
     VmMigrate = "vm.migrate",
     /// 원본(템플릿) 쪽 복제·배포
     VmClone = "vm.clone",
+    /// 전용 CPU·hugepages VM(계획 64): 스펙에 `cpu.policy: dedicated`나 `hugepages`가 있는 VM을 만들기·그 칸 바꾸기·
+    /// 복제·배포·가져오기·복원. 드문 노드 자원이라 operator에 넣지 않는다.
+    VmDedicated = "vm.dedicated",
     BackupCreate = "backup.create",
     BackupRestore = "backup.restore",
     BackupDelete = "backup.delete",
@@ -609,7 +612,7 @@ mod tests {
 
     #[test]
     fn privilege_names_round_trip() {
-        assert_eq!(Privilege::ALL.len(), 25);
+        assert_eq!(Privilege::ALL.len(), 26);
         assert!(Privilege::ALL.len() <= 64);
         for (i, p) in Privilege::ALL.iter().enumerate() {
             assert_eq!(*p as usize, i);
@@ -682,6 +685,7 @@ mod tests {
             Privilege::StorageConfig,
             Privilege::AlertManage,
             Privilege::ClusterAdmin,
+            Privilege::VmDedicated,
         ] {
             assert!(!op.contains(p), "{p}");
         }

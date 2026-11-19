@@ -382,6 +382,7 @@ async fn realm_logins_wait_until_every_node_runs_this_build() {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,
             witness: true,

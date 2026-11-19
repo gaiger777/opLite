@@ -117,6 +117,7 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
             let mut node = Resource::new(
                 config.name.clone(),
                 NodeSpec {
+                    host_resources: None,
                     address,
                     maintenance: false,
                     witness: config.witness,
@@ -222,7 +223,10 @@ async fn record_node(
     };
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
+        // NUMA 토폴로지는 탐침(계획 64 스테이지 2)이 쓴다. 등록은 이미 적힌 것을 지우지 않는다.
+        let topology = status.topology.take();
         *status = NodeStatus {
+            topology,
             // 탐침 결과(실패면 앞 카탈로그에 오류만). 쓰지 못하면 이미 적힌 것을 지우지 않는다.
             cpu: match &host.cpu {
                 Some(probed) if cpu_ready && published => Some(probed.node_cpu(previous.as_ref())),
@@ -871,7 +875,8 @@ pub(crate) mod tests {
                 "notifications",
                 "folders",
                 "two-factor",
-                "cpu-models"
+                "cpu-models",
+                "numa"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -913,7 +918,8 @@ pub(crate) mod tests {
                 "notifications",
                 "folders",
                 "two-factor",
-                "cpu-models"
+                "cpu-models",
+                "numa"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -974,7 +980,8 @@ pub(crate) mod tests {
                 "notifications",
                 "folders",
                 "two-factor",
-                "cpu-models"
+                "cpu-models",
+                "numa"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1210,6 +1217,7 @@ pub(crate) mod tests {
                     "folders".into(),
                     "two-factor".into(),
                     "cpu-models".into(),
+                    "numa".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

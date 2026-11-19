@@ -559,6 +559,7 @@ mod tests {
         let mut n: Node = Resource::new(
             "n",
             NodeSpec {
+                host_resources: None,
                 address: "h:1".into(),
                 maintenance: false,
                 witness: false,
@@ -601,7 +602,12 @@ mod tests {
                 description: String::new(),
                 scheduled: false,
                 vm_spec: VmSpec {
+                    hugepages: None,
+                    numa: None,
                     cpu: CpuSpec {
+                        emulator: None,
+                        policy: Default::default(),
+                        thread_policy: None,
                         flags: Vec::new(),
                         sockets: 1,
                         cores: 1,

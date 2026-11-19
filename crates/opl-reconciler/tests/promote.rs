@@ -228,6 +228,7 @@ async fn setup(promote: bool) -> Setup {
     let mut me: Resource<NodeSpec, NodeStatus> = Resource::new(
         "node-b",
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,

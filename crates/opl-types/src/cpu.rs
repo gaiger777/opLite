@@ -1430,6 +1430,9 @@ mod tests {
 
     fn cpu(model: &str, flags: &[&str]) -> CpuSpec {
         CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             sockets: 1,
             cores: 2,
             model: model.parse().unwrap(),
@@ -1585,6 +1588,7 @@ mod tests {
         let mut node = Node::new(
             name,
             NodeSpec {
+                host_resources: None,
                 address: format!("{name}:8006"),
                 maintenance: false,
                 witness: false,

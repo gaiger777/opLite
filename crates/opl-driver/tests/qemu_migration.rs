@@ -120,6 +120,9 @@ fn spec(disk: PathBuf) -> VmRuntimeSpec {
         id: Uuid::now_v7(),
         name: "mig-vm".into(),
         cpu: CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             flags: Vec::new(),
             sockets: 1,
             cores: 1,

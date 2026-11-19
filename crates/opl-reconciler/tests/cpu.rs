@@ -24,6 +24,7 @@ async fn add_node(env: &Env, features: &[&str], catalog: Option<&str>) {
     let mut node: Node = Resource::new(
         "n1",
         NodeSpec {
+            host_resources: None,
             address: "a".into(),
             maintenance: false,
             witness: false,

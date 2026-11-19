@@ -240,3 +240,25 @@
 7. **docs: README·가이드 "NUMA·전용 CPU·hugepages"·"호스트 준비", 설계 문서 스테이지 보고, 계획 64 실행 기록** — `docs/guide/vms.md`·`cluster.md`·`web-ui.md`·`development.md`, `docs/architecture.md`, `docs/index.md`.
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
+
+### 스테이지 1 (opl-types)
+
+- **순수 함수의 모양**: `layout(spec, topology) -> Result<Option<Layout>, NumaError>`는 게스트 모양 **후보**(`splits`, 묶는 VM의 `auto`만 소켓 수의 약수마다 여럿)와 정책·페이지 요구를 돌려주고, `fit(&Layout, Option<&HostView>)`가 후보 × 페이지 크기(`any`는 1G 먼저)를 앞부터 시도한다. 노드 쪽 입력은 `HostView { node, topology, sets: HostSets, free: HostFree }`로 묶었다. `HostSets::new(host_resources, topology)`(세 집합, 온라인으로 자름), `usage(records, node) -> HostUsage`(기록의 pCPU·페이지), `HostFree::new(topology, sets, usage)`. 묶지 않는 VM(공유, 페이지·`numa.memory` 없음)은 노드 없이 `fit(&l, None)`이 되고 `placement`가 없다.
+- **`HostPlacement.siblings`를 더했다**(`isolate`가 비워 둔 형제 스레드). 기록만으로 잡힌 pCPU를 정확히 세려면 필요하다(토폴로지가 바뀌어도). `emulator`가 비면 "그때의 공유 집합"이라 적지 않는다(공유 집합이 바뀌면 검사 루프가 다시 건다, §7).
+- **`ResolvedNuma`는 기본을 채운 값**을 적는다: 전용이면 `thread_policy`·`emulator`가 늘 있고(`prefer`·`shared`), `memory`는 실제 묶기(전용·hugepages면 `strict`)다. 그래서 `memory.is_some()` = 묶는 VM이다.
+- **`fit_fixed(numa, cpu, host)`는 거리까지 기록 그대로** 둔다(게스트 ACPI SLIT도 게스트가 보는 것이라 마이그레이션 양쪽이 같아야 한다). `cpu`는 `hw.cpu`(소켓당 자리 수).
+- **메모리 나눔**: "노드마다 단위 u의 배수(0 아님)"만 본다. 1G VM 3072 MiB를 둘로 나누면 1024 + 2048이 된다(§8의 "N × 1024의 배수"보다 느슨하다 — 남는 것을 마지막 노드에 주는 규칙과 맞춤). `any`의 검증 단위는 2 MiB이고, 1G로 나눌 수 없으면 그 후보는 2M으로 떨어진다.
+- **`require` 검증**: 소켓당 vCPU 자리 수가 홀수면 400(`RequireOdd`) — 게스트 노드는 소켓 단위라 이것이 "자리 수가 홀수"와 같고 맞춤까지 가지 않는다.
+- **`auto`(묶지 않는 VM)**: 가장 작은 호스트 노드(CPU 수, hugepages 풀 밖 메모리)와 견준다. 어떤 d도 들지 않으면 가장 큰 d.
+- **호스트 노드 고르기**: 순열이 5만 개 이하면 모두 보고(8 × 8도 4만), 넘으면 욕심쟁이(§8의 "16개를 넘으면" 대신 — 16P8은 5억이다). 순서 키는 (최대 거리, 남는 전용 CPU 합, 남는 페이지 MiB 합, 호스트 노드 id들).
+- **L3**: 하나에 다 들면 번호가 낮은 묶음, 아니면 **큰 묶음부터 채우고** 나머지를 다음 묶음에서(그래서 vCPU 순서가 `4,5,6,7,2`처럼 될 수 있다).
+- **거절 까닭**(`NumaRefusal`, `for_node(name)`이 `node "n1" …`을 붙임): 토폴로지 없음·고정 못 함·전용 집합 없음·SMT 없음·그 크기 풀 없음(`any`가 둘 다 없으면 "has no hugepages")·호스트 노드 수·전용 CPU(§8 문구 그대로)·페이지·공유 CPU·메모리·나눔·조합. 여러 후보가 모두 안 되면 **첫 후보의 마지막 페이지 시도**의 까닭이다.
+- **`demand`의 hugepages는 `memory_mib`**(부팅 메모리)만 센다. virtio-mem으로 꽂는 hugepages는 꽂을 때 prealloc이 실패하면 핫플러그 실패로 남는다(설계 그대로).
+- **`HostResources::validate(topology)`를 지금 두었다**(§7 검증: 온라인 부분집합·겹침·공유 비지 않음, 그리고 hugepages의 호스트 노드 있음·같은 (크기, 노드) 두 번). 스테이지 5 API가 쓴다. `NodeTopology.distances[i][j]`는 `nodes`의 **순번**으로 센다.
+- **`PageKind::from_kib`**: 2M·1G만 안다(aarch64 64K 커널의 512M 풀은 무시).
+- **`pending_change(spec, hw)`는 `hw.numa`만** 견준다(`hw.cpu`에도 정책 칸이 생기지만 기록은 `numa`가 정본). `auto`는 기록의 어느 모양이든, `any`는 기록의 어느 크기든 받는다. 설명은 `shared → dedicated`, `threads prefer → isolate`, `emulator threads …`, `hugepages 1G → 2M`, `memory none → strict`, `NUMA 2 nodes → 1 node` + `POWER_CYCLE`.
+- **권한 `vm.dedicated`는 `vm.clone` 바로 뒤**(비트 순서; `PrivSet`은 이름 목록으로 저장되므로 저장 값은 바뀌지 않는다). 웹의 권한 목록(`web/src/auth/permissions.ts`)은 스테이지 6.
+- **할당량 `dedicated_vcpus`는 임시 400 없이 기능 게이트만**(`folders.rs`, 만들기·바꾸기에서 `require_feature(NUMA)`): 상태 머신의 `of_vm_value`가 이미 `cpu.policy`·`max_vcpus`·`emulator`로 세므로 지금 받아도 맞게 동작한다. `FolderUsage.dedicated_vcpus`는 0이면 쓰지 않는다(지금 응답 그대로).
+- **임시 API 막기(스테이지 5 전)**: `vms.rs` `prepare`가 `numa::in_use(spec)`(정책·스레드·에뮬레이터·`numa`·`hugepages` 가운데 하나)면 `require_feature(NUMA)`(409) 뒤 400 "dedicated CPUs, NUMA and hugepages are not available yet". `PUT /nodes/{key}`(`resources.rs` `update_node`)도 `host_resources`가 있으면 같은 409 → 400. 시험 `crates/opl-api/tests/numa.rs`. 스테이지 5가 이 400을 검증·권한·할당량으로 바꾼다.
+- **opld 등록**은 `NodeStatus.topology`를 지우지 않고 둔다(`bootstrap.rs`, 계획 63의 `cpu`와 같다).
+- `schema.d.ts`를 다시 만들었다.

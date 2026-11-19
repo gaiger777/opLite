@@ -750,6 +750,7 @@ mod tests {
         let mut n = Resource::new(
             "n",
             NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
@@ -757,6 +758,7 @@ mod tests {
             },
         );
         n.status = NodeStatus {
+            topology: None,
             cpu: None,
             online: true,
             cpus: 4,
@@ -825,7 +827,12 @@ mod tests {
 
     fn spec(memory_mib: u32, node: Option<Uuid>, power: PowerState) -> VmSpec {
         VmSpec {
+            hugepages: None,
+            numa: None,
             cpu: CpuSpec {
+                emulator: None,
+                policy: Default::default(),
+                thread_policy: None,
                 flags: Vec::new(),
                 sockets: 1,
                 cores: 1,

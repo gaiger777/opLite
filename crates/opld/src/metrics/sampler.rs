@@ -508,6 +508,9 @@ mod tests {
     /// [`running_vm`]과 같고 NIC마다 네트워크를 정한다.
     async fn running_vm_on(f: &Fixture, networks: &[&str]) -> Uuid {
         let cpu = CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             flags: Vec::new(),
             sockets: 1,
             cores: 2,
@@ -526,6 +529,8 @@ mod tests {
         let vm = Resource::new(
             "web",
             VmSpec {
+                hugepages: None,
+                numa: None,
                 cpu: cpu.clone(),
                 memory_mib: 256,
                 firmware: Default::default(),
@@ -560,6 +565,9 @@ mod tests {
                 id,
                 name: "web".into(),
                 cpu: CpuSpec {
+                    emulator: None,
+                    policy: Default::default(),
+                    thread_policy: None,
                     flags: Vec::new(),
                     sockets: 1,
                     cores: 2,

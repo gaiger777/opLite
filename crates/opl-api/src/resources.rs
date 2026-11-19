@@ -795,6 +795,13 @@ pub async fn update_node(
         // 옛 노드는 `roles`가 든 Node를 풀지 못한다.
         require_feature(&state.cluster, "node-roles")?;
     }
+    // 호스트 자원 설정(계획 64)은 옛 노드가 풀지 못한다. 검증·적용이 들어오기 전(스테이지 5에서 열기 전)에는 받지 않는다.
+    if spec.host_resources.is_some() {
+        require_feature(&state.cluster, opl_types::node::NUMA)?;
+        return Err(ApiError::bad_request(
+            "host_resources (reserved and dedicated CPUs, hugepages) is not available yet",
+        ));
+    }
     state
         .cluster
         .update_spec(node.id, if_match(&headers)?, req.labels, &spec)

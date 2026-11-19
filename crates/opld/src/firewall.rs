@@ -321,7 +321,12 @@ mod tests {
         Resource::new(
             name,
             VmSpec {
+                hugepages: None,
+                numa: None,
                 cpu: CpuSpec {
+                    emulator: None,
+                    policy: Default::default(),
+                    thread_policy: None,
                     flags: Vec::new(),
                     sockets: 1,
                     cores: 1,

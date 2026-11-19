@@ -748,6 +748,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n1",
             NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
@@ -919,6 +920,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n1",
             NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
@@ -1049,6 +1051,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n1",
             NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
@@ -1201,6 +1204,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n1",
             crate::node::NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
@@ -1365,6 +1369,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n1",
             crate::node::NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,

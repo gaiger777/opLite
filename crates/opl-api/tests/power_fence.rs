@@ -25,6 +25,7 @@ fn node() -> Node {
     let mut n = Resource::new(
         "node-b",
         NodeSpec {
+            host_resources: None,
             address: "10.1.2.3:8006".into(),
             maintenance: false,
             witness: false,

@@ -25,6 +25,7 @@ async fn add_node(env: &Env, id: Uuid, features: &[&str], hotplug: Option<NodeHo
     let mut node: Node = Resource::new(
         format!("n-{id}"),
         NodeSpec {
+            host_resources: None,
             address: "a".into(),
             maintenance: false,
             witness: false,

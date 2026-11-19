@@ -347,6 +347,7 @@ mod tests {
         let mut n: Node = Resource::new(
             name,
             opl_types::node::NodeSpec {
+                host_resources: None,
                 address: format!("{name}:8006"),
                 maintenance: false,
                 witness: false,
@@ -519,6 +520,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n4",
             NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,
@@ -535,7 +537,12 @@ mod tests {
         };
         let vm = |model: CpuModel, phase: VmPhase| {
             let spec = VmSpec {
+                hugepages: None,
+                numa: None,
                 cpu: opl_types::vm::CpuSpec {
+                    emulator: None,
+                    policy: Default::default(),
+                    thread_policy: None,
                     flags: Vec::new(),
                     sockets: 1,
                     cores: 1,

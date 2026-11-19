@@ -167,6 +167,7 @@ impl Env {
         let mut me = Resource::new(
             "node1",
             NodeSpec {
+                host_resources: None,
                 address: "127.0.0.1:0".into(),
                 maintenance: false,
                 witness: false,
@@ -175,6 +176,7 @@ impl Env {
         );
         me.id = node;
         me.status = NodeStatus {
+            topology: None,
             cpu: None,
             online: true,
             cpus: 4,

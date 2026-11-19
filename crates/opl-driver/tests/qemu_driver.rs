@@ -38,6 +38,9 @@ fn spec() -> VmRuntimeSpec {
         id: Uuid::now_v7(),
         name: "it-vm".into(),
         cpu: CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             flags: Vec::new(),
             sockets: 1,
             cores: 1,
@@ -1104,6 +1107,9 @@ async fn a_vcpu_is_hotplugged_on_q35() {
     vm.machine = MachineType::Q35;
     vm.firmware = Firmware::Bios;
     vm.cpu = CpuSpec {
+        emulator: None,
+        policy: Default::default(),
+        thread_policy: None,
         flags: Vec::new(),
         sockets: 1,
         cores: 1,

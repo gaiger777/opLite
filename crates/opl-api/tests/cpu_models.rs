@@ -506,6 +506,7 @@ async fn add_x86_node(env: &Env, name: &str, catalog: &str) -> Uuid {
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: false,
@@ -513,6 +514,7 @@ async fn add_x86_node(env: &Env, name: &str, catalog: &str) -> Uuid {
         },
     );
     node.status = NodeStatus {
+        topology: None,
         cpu: Some(NodeCpu {
             catalog: catalog.into(),
             qemu: "9.2.0".into(),
@@ -582,7 +584,12 @@ async fn set_cpu_settings(env: &Env, cpu: CpuSettings) {
 /// 노드 `node`에 고정된 x86_64 VM 스펙(API를 거치지 않는다)
 fn x86_spec(model: &str, node: Uuid, power: PowerState) -> VmSpec {
     VmSpec {
+        hugepages: None,
+        numa: None,
         cpu: CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             flags: Vec::new(),
             sockets: 1,
             cores: 1,

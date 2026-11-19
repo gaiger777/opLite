@@ -318,6 +318,9 @@ mod tests {
             catalog,
         };
         let host = CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             sockets: 1,
             cores: 1,
             model: cpu::CpuModel::Host,

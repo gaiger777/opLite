@@ -507,6 +507,7 @@ mod tests {
         let mut node = Node::new(
             "node1",
             NodeSpec {
+                host_resources: None,
                 address: address.into(),
                 maintenance: false,
                 witness: false,

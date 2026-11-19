@@ -250,7 +250,12 @@ impl TemplateDraft {
     /// 꺼진 템플릿 VM 스펙
     pub fn vm_spec(&self, volume: &str) -> Result<VmSpec, TemplateError> {
         let spec = VmSpec {
+            hugepages: None,
+            numa: None,
             cpu: CpuSpec {
+                emulator: None,
+                policy: Default::default(),
+                thread_policy: None,
                 sockets: 1,
                 cores: self.vcpus,
                 model: self.cpu_model.clone().unwrap_or_default(),

@@ -74,6 +74,8 @@ impl RunningHardware {
     /// 핫플러그 배치 없이 켠 VM의 기록(계획 54 전에 켰거나 클러스터가 업그레이드 중일 때).
     pub fn legacy(spec: &VmSpec) -> Self {
         RunningHardware {
+            host_placement: None,
+            numa: None,
             cpu: CpuSpec {
                 max_vcpus: None,
                 ..spec.cpu.clone()
@@ -1535,6 +1537,7 @@ mod tests {
         let mut n = Resource::new(
             "n2",
             NodeSpec {
+                host_resources: None,
                 address: "10.0.0.2:8006".into(),
                 maintenance: false,
                 witness: false,

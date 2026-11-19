@@ -694,6 +694,7 @@ async fn nfs_disk_on_a_node_without_nfs_powers_off() {
     let mut me: Node = Resource::new(
         "n1",
         NodeSpec {
+            host_resources: None,
             address: "a".into(),
             maintenance: false,
             witness: false,
@@ -764,6 +765,7 @@ async fn unavailable_pool_is_retried_without_powering_off() {
     let mut me: Node = Resource::new(
         "n1",
         NodeSpec {
+            host_resources: None,
             address: "a".into(),
             maintenance: false,
             witness: false,

@@ -353,6 +353,7 @@ async fn two_nodes_with(
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             node.name.clone(),
             NodeSpec {
+                host_resources: None,
                 address: node.base.clone(),
                 maintenance: false,
                 witness: false,
@@ -361,6 +362,7 @@ async fn two_nodes_with(
         );
         r.id = node.id;
         r.status = NodeStatus {
+            topology: None,
             cpu: None,
             online: true,
             cpus: 4,

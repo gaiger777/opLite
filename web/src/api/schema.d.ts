@@ -954,7 +954,6 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 볼 수 있는 폴더의 평면 목록(부모 id로 트리를 이룬다). 부모를 볼 수 없는 폴더는 보는 사람에게 맨 위 폴더다. */
         get: operations["list_folders"];
         put?: never;
         /**
@@ -4343,6 +4342,16 @@ export interface components {
             /** @description 막지 않는 경고(`host` VM을 옮기면 대상에 없는 플래그) */
             warnings?: string[];
         };
+        /**
+         * @description vCPU 정책(OpenStack `hw:cpu_policy`)
+         * @enum {string}
+         */
+        CpuPolicy: "shared" | "dedicated";
+        /**
+         * @description Linux CPU list: numbers and ranges, e.g. 0-3,8,10-11
+         * @example 0-3,8
+         */
+        CpuSet: string;
         /** @description 설정 `cpu`(계획 63) */
         CpuSettings: {
             /**
@@ -4377,6 +4386,8 @@ export interface components {
         CpuSpec: {
             /** Format: int32 */
             cores: number;
+            /** @description 전용 VM의 에뮬레이터 스레드 정책(계획 64, 기본 `shared`). `dedicated`일 때만 준다. */
+            emulator?: components["schemas"]["EmulatorPolicy"];
             /** @description 켜고 끌 CPU 플래그(계획 63, `"+aes"`·`"-avx512vbmi"`). 비면 쓰지 않아 옛 노드도 VM을 계속 푼다. */
             flags?: components["schemas"]["CpuFlag"][];
             /**
@@ -4386,8 +4397,12 @@ export interface components {
              */
             max_vcpus?: number;
             model?: components["schemas"]["CpuModel"];
+            /** @description vCPU 정책(계획 64): `shared`(기본, 쓰지 않음)·`dedicated`(vCPU마다 노드의 전용 pCPU 하나) */
+            policy?: components["schemas"]["CpuPolicy"];
             /** Format: int32 */
             sockets?: number;
+            /** @description 전용 VM의 SMT 형제 스레드 정책(계획 64, 기본 `prefer`). `dedicated`일 때만 준다. */
+            thread_policy?: components["schemas"]["ThreadPolicy"];
         };
         CreateAccessRoleRequest: {
             description?: string;
@@ -4685,6 +4700,8 @@ export interface components {
                  *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                  */
                 ha?: components["schemas"]["HaSetting"];
+                /** @description 게스트 메모리를 hugepages로(계획 64, `2M`·`1G`·`any`). 없으면 보통 페이지이고 쓰지 않는다. */
+                hugepages?: components["schemas"]["PageSize"];
                 machine: components["schemas"]["MachineType"];
                 /**
                  * Format: int32
@@ -4700,6 +4717,11 @@ export interface components {
                  * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                  */
                 node?: string | null;
+                /**
+                 * @description 게스트 vNUMA(계획 64). 없으면 전용·hugepages VM은 `auto`, 그 밖은 vNUMA 없음(지금 그대로)이고 쓰지 않아 옛
+                 *     노드도 VM을 푼다.
+                 */
+                numa?: components["schemas"]["NumaSpec"];
                 /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                 placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
@@ -4860,6 +4882,11 @@ export interface components {
             /** Format: uuid */
             user: string;
         };
+        /**
+         * @description 전용 VM의 QEMU 에뮬레이터 스레드(메인 루프·I/O·일꾼) 정책(OpenStack `hw:emulator_threads_policy`)
+         * @enum {string}
+         */
+        EmulatorPolicy: "shared" | "isolate";
         /** @description 오류 응답 본문 */
         ErrorBody: {
             /** @description 기계가 읽는 오류 종류. 예: `not_found`, `revision_mismatch`, `cluster_no_quorum` */
@@ -5048,6 +5075,11 @@ export interface components {
         FolderQuota: {
             /**
              * Format: int64
+             * @description 전용 VM의 vCPU 자리(핫플러그 상한 + 에뮬레이터 `isolate` 1, 계획 64)
+             */
+            dedicated_vcpus?: number;
+            /**
+             * Format: int64
              * @description 붙은 볼륨의 가상 크기 합(바이트)
              */
             disk_bytes?: number;
@@ -5075,8 +5107,13 @@ export interface components {
             quota?: components["schemas"]["FolderQuota"];
         };
         FolderStatus: Record<string, never>;
-        /** @description 폴더 하위 트리의 사용량(할당 기준, 전원과 무관). 할당량과 같은 네 칸이다. */
+        /** @description 폴더 하위 트리의 사용량(할당 기준, 전원과 무관). 할당량과 같은 칸이다. */
         FolderUsage: {
+            /**
+             * Format: int64
+             * @description 전용 VM의 vCPU 자리(계획 64). 0이면 쓰지 않아 지금 응답 그대로다.
+             */
+            dedicated_vcpus?: number;
             /** Format: int64 */
             disk_bytes: number;
             /** Format: int64 */
@@ -5203,6 +5240,13 @@ export interface components {
             /** @description 하드웨어 주소(게스트가 보낸 문자열 그대로) */
             mac?: string;
             name: string;
+        };
+        /** @description 게스트 NUMA 노드 하나 */
+        GuestNode: {
+            /** Format: int32 */
+            memory_mib: number;
+            /** @description 이 노드의 소켓(QEMU `socket-id`, 연속) */
+            sockets: number[];
         };
         /** @description 게스트 OS(`guest-get-osinfo`의 `id`·`pretty-name`·`version`·`kernel-release`) */
         GuestOs: {
@@ -5431,6 +5475,52 @@ export interface components {
             /** @description `Digest`의 범위 평균 CPU 상위 VM(내림차순) */
             top?: components["schemas"]["TopVm"][];
         };
+        /** @description 호스트 NUMA 노드 하나 */
+        HostNode: {
+            /**
+             * @description 이 노드의 온라인 CPU
+             * @default
+             */
+            cpus: components["schemas"]["CpuSet"];
+            /** @default [] */
+            hugepages: components["schemas"]["HugepagePool"][];
+            /**
+             * Format: int32
+             * @default 0
+             */
+            id: number;
+            /**
+             * Format: int64
+             * @description 노드 메모리 전체(hugepages 풀 포함)
+             * @default 0
+             */
+            memory_mib: number;
+        };
+        /** @description 켠 노드에만 맞는 배치(`RunningHardware.host_placement`). 마이그레이션·HA는 대상에서 새로 고른다. */
+        HostPlacement: {
+            /** @description 에뮬레이터 스레드의 pCPU(`isolate`). 비면 노드의 공유 CPU(그때의 집합)다. */
+            emulator?: components["schemas"]["CpuSet"];
+            /** @description 게스트 노드마다 호스트 NUMA 노드 id. 비면 묶지 않는다. */
+            host_nodes?: number[];
+            /**
+             * Format: uuid
+             * @description 이 배치를 고른 노드. 지금 노드와 다르면 낡은 기록이다.
+             */
+            node: string;
+            /** @description 스레드 정책 `isolate`가 비워 둔 형제 스레드(이 VM 몫으로 센다) */
+            siblings?: components["schemas"]["CpuSet"];
+            /** @description vCPU 자리(핫플러그 상한까지)마다 pCPU. 공유 VM은 비고 vCPU가 게스트 노드의 호스트 노드 공유 CPU에서 돈다. */
+            vcpus?: number[];
+        };
+        /** @description 노드의 CPU 나누기와 hugepages 예약(`NodeSpec.host_resources`, 설계 §7). 공유 CPU는 `온라인 − 예약 − 전용`이다. */
+        HostResources: {
+            /** @description 전용 VM의 vCPU와 `isolate` 에뮬레이터만 쓰는 CPU */
+            dedicated_cpus?: components["schemas"]["CpuSet"];
+            /** @description 실행 중 hugepages 예약(opld가 `nr_hugepages`에 쓴다) */
+            hugepages?: components["schemas"]["HugepageReserve"][];
+            /** @description 호스트와 Orbivisor의 CPU. VM 스레드는 두지 않는다. */
+            reserved_cpus?: components["schemas"]["CpuSet"];
+        };
         /**
          * @description 핫플러그 배치(계획 54): 켤 때 둔 vCPU 자리·virtio-mem·빈 루트 포트와 지금 그 안에서 바뀐 것. 마이그레이션 대상은
          *     같은 배치로 켠다.
@@ -5470,6 +5560,30 @@ export interface components {
              * @description 지금 켜진 vCPU 수(켤 때 수 이상, 상한 이하)
              */
             vcpus: number;
+        };
+        /** @description 호스트 노드의 hugepages 풀 하나 */
+        HugepagePool: {
+            /** Format: int32 */
+            size_kib: number;
+            /**
+             * Format: int32
+             * @description 예약된 페이지 수(`nr_hugepages`)
+             */
+            total: number;
+        };
+        /** @description hugepages 예약 하나 */
+        HugepageReserve: {
+            /**
+             * Format: int32
+             * @description 페이지 수(전체가 이 수가 되게)
+             */
+            count: number;
+            /**
+             * Format: int32
+             * @description 호스트 NUMA 노드. 없으면 커널이 노드에 나눈다.
+             */
+            host_node?: number;
+            size: components["schemas"]["PageKind"];
         };
         /**
          * Format: binary
@@ -6280,6 +6394,8 @@ export interface components {
                 spec: {
                     /** @description API 주소 (`host:port`) */
                     address: string;
+                    /** @description 예약·전용 CPU와 hugepages 예약(계획 64 §7). 없으면 공유 = 모든 CPU — 지금과 같고 쓰지 않아 옛 노드도 푼다. */
+                    host_resources?: components["schemas"]["HostResources"];
                     /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                     maintenance?: boolean;
                     /**
@@ -6369,6 +6485,11 @@ export interface components {
                      *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
                      */
                     shutdown?: components["schemas"]["NodeShutdown"];
+                    /**
+                     * @description 이 노드의 CPU·메모리 NUMA 토폴로지(계획 64: 소켓·코어·스레드·NUMA 노드·hugepages·거리·L3). 노드가 시작할
+                     *     때와 검사 루프가 바뀔 때만 쓴다. 없으면(옛 노드·macOS·위트니스) 게스트 vNUMA만 된다. 옛 노드는 무시한다.
+                     */
+                    topology?: components["schemas"]["NodeTopology"];
                     /**
                      * Format: ip
                      * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
@@ -6699,6 +6820,8 @@ export interface components {
                      *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                      */
                     ha?: components["schemas"]["HaSetting"];
+                    /** @description 게스트 메모리를 hugepages로(계획 64, `2M`·`1G`·`any`). 없으면 보통 페이지이고 쓰지 않는다. */
+                    hugepages?: components["schemas"]["PageSize"];
                     machine: components["schemas"]["MachineType"];
                     /**
                      * Format: int32
@@ -6714,6 +6837,11 @@ export interface components {
                      * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                      */
                     node?: string | null;
+                    /**
+                     * @description 게스트 vNUMA(계획 64). 없으면 전용·hugepages VM은 `auto`, 그 밖은 vNUMA 없음(지금 그대로)이고 쓰지 않아 옛
+                     *     노드도 VM을 푼다.
+                     */
+                    numa?: components["schemas"]["NumaSpec"];
                     /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                     placement?: components["schemas"]["VmPlacement"];
                     power?: components["schemas"]["PowerState"];
@@ -6962,6 +7090,11 @@ export interface components {
             /** @description 위트니스 노드인지(VM을 돌리지 않는 투표 멤버) */
             witness: boolean;
         };
+        /**
+         * @description 게스트 노드 메모리를 호스트 NUMA 노드에 묶는 방법
+         * @enum {string}
+         */
+        MemoryPolicy: "strict" | "preferred";
         MgrReport: {
             active?: string;
             /** @default false */
@@ -7343,6 +7476,8 @@ export interface components {
         NodeSpec: {
             /** @description API 주소 (`host:port`) */
             address: string;
+            /** @description 예약·전용 CPU와 hugepages 예약(계획 64 §7). 없으면 공유 = 모든 CPU — 지금과 같고 쓰지 않아 옛 노드도 푼다. */
+            host_resources?: components["schemas"]["HostResources"];
             /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
             maintenance?: boolean;
             /**
@@ -7433,6 +7568,11 @@ export interface components {
              */
             shutdown?: components["schemas"]["NodeShutdown"];
             /**
+             * @description 이 노드의 CPU·메모리 NUMA 토폴로지(계획 64: 소켓·코어·스레드·NUMA 노드·hugepages·거리·L3). 노드가 시작할
+             *     때와 검사 루프가 바뀔 때만 쓴다. 없으면(옛 노드·macOS·위트니스) 게스트 vNUMA만 된다. 옛 노드는 무시한다.
+             */
+            topology?: components["schemas"]["NodeTopology"];
+            /**
              * Format: ip
              * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
              *     None).
@@ -7445,6 +7585,77 @@ export interface components {
             updates?: components["schemas"]["NodeUpdates"];
             /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
             version?: string;
+        };
+        /** @description 노드의 CPU·메모리 토폴로지(`NodeStatus.topology`, 설계 §6). 바뀔 때만 쓰므로 빈 자원은 넣지 않는다. */
+        NodeTopology: {
+            /**
+             * @description 온라인 CPU
+             * @default
+             */
+            cpus: components["schemas"]["CpuSet"];
+            /**
+             * @description cgroup v2 `cpuset`이 있고 VM 스코프를 쓴다(`AllowedCPUs`를 건다).
+             * @default false
+             */
+            cpuset: boolean;
+            /**
+             * @description `distances[i][j]`: `nodes[i]`와 `nodes[j]` 사이 거리(`/sys/.../distance`). 비면 모른다.
+             * @default []
+             */
+            distances: number[][];
+            /** @description 탐침 실패(있으면 나머지 칸은 믿지 않는다) */
+            error?: string;
+            /** @description 커널 `isolcpus` */
+            isolated?: components["schemas"]["CpuSet"];
+            /**
+             * @description L3 캐시를 나누는 CPU 묶음
+             * @default []
+             */
+            l3: components["schemas"]["CpuSet"][];
+            /**
+             * @description 호스트 NUMA 노드(id 순)
+             * @default []
+             */
+            nodes: components["schemas"]["HostNode"][];
+            /** @description 커널 `nohz_full` */
+            nohz_full?: components["schemas"]["CpuSet"];
+            /**
+             * @description 커널이 아는 hugepage 크기(KiB)
+             * @default []
+             */
+            page_sizes_kib: number[];
+            /**
+             * @description vCPU 스레드를 pCPU에 고정할 수 있다(Linux).
+             * @default false
+             */
+            pinning: boolean;
+            /**
+             * Format: int64
+             * @description 값이 바뀐 때(유닉스 초)
+             * @default 0
+             */
+            probed_at: number;
+            /**
+             * @description SMT 형제 묶음(스레드가 둘 이상인 코어만)
+             * @default []
+             */
+            siblings: components["schemas"]["CpuSet"][];
+            /**
+             * Format: int32
+             * @default 0
+             */
+            sockets: number;
+            /**
+             * Format: int32
+             * @description 코어마다 가장 많은 스레드 수(SMT가 없으면 1)
+             * @default 0
+             */
+            threads_per_core: number;
+            /**
+             * @description 호스트 준비가 덜 된 것(화면에 그대로)
+             * @default []
+             */
+            warnings: string[];
         };
         /** @description 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지) */
         NodeUpdates: {
@@ -7537,6 +7748,26 @@ export interface components {
             error?: string;
             ok: boolean;
         };
+        /** @description "auto", a guest NUMA node count (1-8), or one {cpus, memory_mib} per node */
+        NumaNodes: "auto" | number | {
+            /**
+             * Format: int32
+             * @description vCPU 자리 수(핫플러그 상한 기준). 소켓당 자리 수의 배수다.
+             */
+            cpus: number;
+            /** Format: int32 */
+            memory_mib: number;
+        }[];
+        /** @description VM의 vNUMA(`VmSpec.numa`) */
+        NumaSpec: {
+            /**
+             * @description 게스트 노드 메모리를 호스트 NUMA 노드에 묶는다. 주면 공유 VM도 묶는다. 전용·hugepages VM은 주지 않으면
+             *     `strict`다.
+             */
+            memory?: components["schemas"]["MemoryPolicy"];
+            /** @description `"auto"`, 노드 수(1~8), 또는 노드마다 `{cpus, memory_mib}` 목록 */
+            nodes?: components["schemas"]["NumaNodes"];
+        };
         /** @description 객체 하나의 권한 */
         ObjectPermissions: {
             /** Format: uuid */
@@ -7625,6 +7856,16 @@ export interface components {
             current?: string | null;
             name: string;
         };
+        /**
+         * @description hugepage 크기 하나
+         * @enum {string}
+         */
+        PageKind: "2M" | "1G";
+        /**
+         * @description VM이 원하는 hugepage 크기(`VmSpec.hugepages`)
+         * @enum {string}
+         */
+        PageSize: "2M" | "1G" | "any";
         PasskeyAdded: {
             passkey: components["schemas"]["PasskeyView"];
             /** @description 첫 요소라 새로 만든 복구 코드(한 번만 보인다). 아니면 비어 있다. */
@@ -7652,7 +7893,7 @@ export interface components {
             detail?: string;
             /**
              * @description `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine`, `tpm`,
-             *     `secure_boot`, `guest_agent`
+             *     `secure_boot`, `guest_agent`, `numa`
              */
             field: string;
             reason: components["schemas"]["PendingReason"];
@@ -8385,6 +8626,25 @@ export interface components {
             model: string;
             source?: components["schemas"]["CpuSource"];
         };
+        /**
+         * @description 켤 때 정한 게스트의 NUMA 모양(`RunningHardware.numa`). 게스트가 보는 것과 마이그레이션 양쪽이 같아야 하는 것이라
+         *     라이브 마이그레이션 동안 바꾸지 않는다.
+         */
+        ResolvedNuma: {
+            /** @description 게스트 노드 사이 거리(`-numa dist`). 비면 QEMU 기본(10·20)이다. */
+            distances?: number[][];
+            /** @description 전용 VM의 에뮬레이터 정책(기본을 채운 것). 공유 VM은 없다. */
+            emulator?: components["schemas"]["EmulatorPolicy"];
+            /** @description 호스트 노드에 묶는 방법. 없으면 묶지 않는다(공유 vNUMA VM). */
+            memory?: components["schemas"]["MemoryPolicy"];
+            /** @description 게스트 노드(순번 = QEMU `nodeid`) */
+            nodes: components["schemas"]["GuestNode"][];
+            /** @description hugepage 크기. 없으면 보통 페이지다. */
+            page?: components["schemas"]["PageKind"];
+            policy?: components["schemas"]["CpuPolicy"];
+            /** @description 전용 VM의 스레드 정책(기본을 채운 것). 공유 VM은 없다. */
+            thread_policy?: components["schemas"]["ThreadPolicy"];
+        };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource: {
             /** Format: uuid */
@@ -8798,6 +9058,8 @@ export interface components {
             spec: {
                 /** @description API 주소 (`host:port`) */
                 address: string;
+                /** @description 예약·전용 CPU와 hugepages 예약(계획 64 §7). 없으면 공유 = 모든 CPU — 지금과 같고 쓰지 않아 옛 노드도 푼다. */
+                host_resources?: components["schemas"]["HostResources"];
                 /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                 maintenance?: boolean;
                 /**
@@ -8887,6 +9149,11 @@ export interface components {
                  *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
                  */
                 shutdown?: components["schemas"]["NodeShutdown"];
+                /**
+                 * @description 이 노드의 CPU·메모리 NUMA 토폴로지(계획 64: 소켓·코어·스레드·NUMA 노드·hugepages·거리·L3). 노드가 시작할
+                 *     때와 검사 루프가 바뀔 때만 쓴다. 없으면(옛 노드·macOS·위트니스) 게스트 vNUMA만 된다. 옛 노드는 무시한다.
+                 */
+                topology?: components["schemas"]["NodeTopology"];
                 /**
                  * Format: ip
                  * @description VXLAN 패킷을 주고받는 이 노드의 주소. 없으면 이 노드에 VXLAN 장치를 만들지 않는다(위트니스는 늘
@@ -9259,6 +9526,8 @@ export interface components {
                  *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                  */
                 ha?: components["schemas"]["HaSetting"];
+                /** @description 게스트 메모리를 hugepages로(계획 64, `2M`·`1G`·`any`). 없으면 보통 페이지이고 쓰지 않는다. */
+                hugepages?: components["schemas"]["PageSize"];
                 machine: components["schemas"]["MachineType"];
                 /**
                  * Format: int32
@@ -9274,6 +9543,11 @@ export interface components {
                  * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                  */
                 node?: string | null;
+                /**
+                 * @description 게스트 vNUMA(계획 64). 없으면 전용·hugepages VM은 `auto`, 그 밖은 vNUMA 없음(지금 그대로)이고 쓰지 않아 옛
+                 *     노드도 VM을 푼다.
+                 */
+                numa?: components["schemas"]["NumaSpec"];
                 /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                 placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
@@ -9518,6 +9792,8 @@ export interface components {
              *     `ha.guest_watch`만 있는 VM은 거짓이어도 채널이 있을 수 있다.
              */
             guest_agent?: boolean;
+            /** @description 켠 노드의 호스트 NUMA 노드·pCPU(계획 64). 묶는 VM에만 있고 `node`가 지금 노드와 다르면 낡은 기록이다. */
+            host_placement?: components["schemas"]["HostPlacement"];
             /** @description 핫플러그 배치. 없으면 핫플러그 없이 켠 VM이다(계획 54 전이나 업그레이드 중에 켬). */
             layout?: components["schemas"]["HotplugLayout"];
             machine: components["schemas"]["MachineType"];
@@ -9528,6 +9804,11 @@ export interface components {
             memory_mib: number;
             /** @description 지금 QEMU에 붙은 NIC(순번 = QEMU의 `nic{i}`). 보안 그룹은 견주지 않는다. */
             nics?: components["schemas"]["NicSpec"][];
+            /**
+             * @description 켤 때 정한 게스트 NUMA 모양·페이지·CPU 정책(계획 64). 없으면 계획 64 전 기록이거나 이 기능을 쓰지 않는 VM이다.
+             *     받는 쪽 마이그레이션은 이것을 그대로 쓴다. 옛 노드는 이 필드를 무시한다.
+             */
+            numa?: components["schemas"]["ResolvedNuma"];
             /** @description 다음 재시작 때 적용할 변경. 핫플러그 Task가 쓴다. */
             pending?: components["schemas"]["PendingChange"][];
             /** @description 켤 때 Secure Boot 펌웨어로 켰다(계획 59). 거짓이면 쓰지 않는다. */
@@ -10333,6 +10614,11 @@ export interface components {
             vcpus: number;
         };
         /**
+         * @description 전용 VM의 SMT 형제 스레드 정책(OpenStack `hw:cpu_thread_policy`)
+         * @enum {string}
+         */
+        ThreadPolicy: "prefer" | "isolate" | "require";
+        /**
          * @description 기록 층. 칸 `b = floor(t / step)`(유닉스 기준)라서 모든 노드의 칸 경계가 같다.
          * @enum {string}
          */
@@ -10509,6 +10795,8 @@ export interface components {
             spec: {
                 /** @description API 주소 (`host:port`) */
                 address: string;
+                /** @description 예약·전용 CPU와 hugepages 예약(계획 64 §7). 없으면 공유 = 모든 CPU — 지금과 같고 쓰지 않아 옛 노드도 푼다. */
+                host_resources?: components["schemas"]["HostResources"];
                 /** @description 유지보수 중인 노드에는 스케줄러가 VM을 새로 배치하지 않는다. */
                 maintenance?: boolean;
                 /**
@@ -10587,6 +10875,8 @@ export interface components {
                  *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
                  */
                 ha?: components["schemas"]["HaSetting"];
+                /** @description 게스트 메모리를 hugepages로(계획 64, `2M`·`1G`·`any`). 없으면 보통 페이지이고 쓰지 않는다. */
+                hugepages?: components["schemas"]["PageSize"];
                 machine: components["schemas"]["MachineType"];
                 /**
                  * Format: int32
@@ -10602,6 +10892,11 @@ export interface components {
                  * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
                  */
                 node?: string | null;
+                /**
+                 * @description 게스트 vNUMA(계획 64). 없으면 전용·hugepages VM은 `auto`, 그 밖은 vNUMA 없음(지금 그대로)이고 쓰지 않아 옛
+                 *     노드도 VM을 푼다.
+                 */
+                numa?: components["schemas"]["NumaSpec"];
                 /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
                 placement?: components["schemas"]["VmPlacement"];
                 power?: components["schemas"]["PowerState"];
@@ -10886,6 +11181,8 @@ export interface components {
              *     JSON은 옛 bool(`false` = 없음, `true` = 기본 정책)이나 정책 객체다.
              */
             ha?: components["schemas"]["HaSetting"];
+            /** @description 게스트 메모리를 hugepages로(계획 64, `2M`·`1G`·`any`). 없으면 보통 페이지이고 쓰지 않는다. */
+            hugepages?: components["schemas"]["PageSize"];
             machine: components["schemas"]["MachineType"];
             /**
              * Format: int32
@@ -10901,6 +11198,11 @@ export interface components {
              * @description 배치된 노드의 id. None이면 시작할 때 스케줄러가 고른다.
              */
             node?: string | null;
+            /**
+             * @description 게스트 vNUMA(계획 64). 없으면 전용·hugepages VM은 `auto`, 그 밖은 vNUMA 없음(지금 그대로)이고 쓰지 않아 옛
+             *     노드도 VM을 푼다.
+             */
+            numa?: components["schemas"]["NumaSpec"];
             /** @description 최적 배치 옵션(계획 53). 없으면 쓰지 않아 옛 노드도 VM을 푼다. */
             placement?: components["schemas"]["VmPlacement"];
             power?: components["schemas"]["PowerState"];

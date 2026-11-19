@@ -9,6 +9,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::folder::{FolderQuota, FolderUsage, MAX_FOLDER_DEPTH};
+use crate::numa::EmulatorPolicy;
 use crate::vm::VmSpec;
 
 /// 할당량의 차원
@@ -20,14 +21,17 @@ pub enum QuotaDimension {
     MemoryMib,
     DiskBytes,
     Vms,
+    /// 전용 VM의 vCPU 자리(계획 64)
+    DedicatedVcpus,
 }
 
 impl QuotaDimension {
-    pub const ALL: [QuotaDimension; 4] = [
+    pub const ALL: [QuotaDimension; 5] = [
         QuotaDimension::Vcpus,
         QuotaDimension::MemoryMib,
         QuotaDimension::DiskBytes,
         QuotaDimension::Vms,
+        QuotaDimension::DedicatedVcpus,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -36,6 +40,7 @@ impl QuotaDimension {
             QuotaDimension::MemoryMib => "memory_mib",
             QuotaDimension::DiskBytes => "disk_bytes",
             QuotaDimension::Vms => "vms",
+            QuotaDimension::DedicatedVcpus => "dedicated_vcpus",
         }
     }
 
@@ -46,6 +51,7 @@ impl QuotaDimension {
             QuotaDimension::MemoryMib => "MiB of memory",
             QuotaDimension::DiskBytes => "bytes of disk",
             QuotaDimension::Vms => "VMs",
+            QuotaDimension::DedicatedVcpus => "dedicated vCPUs",
         }
     }
 
@@ -55,6 +61,7 @@ impl QuotaDimension {
             QuotaDimension::MemoryMib => quota.memory_mib,
             QuotaDimension::DiskBytes => quota.disk_bytes,
             QuotaDimension::Vms => quota.vms,
+            QuotaDimension::DedicatedVcpus => quota.dedicated_vcpus,
         }
     }
 
@@ -64,6 +71,7 @@ impl QuotaDimension {
             QuotaDimension::MemoryMib => usage.memory_mib,
             QuotaDimension::DiskBytes => usage.disk_bytes,
             QuotaDimension::Vms => usage.vms,
+            QuotaDimension::DedicatedVcpus => usage.dedicated_vcpus,
         }
     }
 }
@@ -81,6 +89,7 @@ impl FolderUsage {
         self.memory_mib = self.memory_mib.saturating_add(other.memory_mib);
         self.disk_bytes = self.disk_bytes.saturating_add(other.disk_bytes);
         self.vms = self.vms.saturating_add(other.vms);
+        self.dedicated_vcpus = self.dedicated_vcpus.saturating_add(other.dedicated_vcpus);
     }
 
     /// 어느 차원도 `other`보다 크지 않다.
@@ -97,18 +106,26 @@ impl FolderUsage {
             memory_mib: self.memory_mib.saturating_mul(n),
             disk_bytes: self.disk_bytes.saturating_mul(n),
             vms: self.vms.saturating_mul(n),
+            dedicated_vcpus: self.dedicated_vcpus.saturating_mul(n),
         }
     }
 
-    /// VM 하나의 몫: vCPU(`sockets × cores`)·메모리·VM 하나, 그리고 붙은 볼륨의 크기 합 `disk_bytes`. 템플릿은
-    /// 디스크만 센다.
+    /// VM 하나의 몫: vCPU(`sockets × cores`)·메모리·VM 하나, 그리고 붙은 볼륨의 크기 합 `disk_bytes`. 전용 VM은
+    /// vCPU 자리(핫플러그 상한 + 에뮬레이터 `isolate` 1)도 센다. 템플릿은 디스크만 센다.
     pub fn of_vm(spec: &VmSpec, disk_bytes: u64) -> FolderUsage {
+        let dedicated = if spec.cpu.policy.is_shared() {
+            0
+        } else {
+            u64::from(spec.cpu.max())
+                + u64::from(spec.cpu.emulator == Some(EmulatorPolicy::Isolate))
+        };
         vm_usage(
             spec.template,
             u64::from(spec.cpu.sockets),
             u64::from(spec.cpu.cores),
             u64::from(spec.memory_mib),
             disk_bytes,
+            dedicated,
         )
     }
 
@@ -117,17 +134,35 @@ impl FolderUsage {
     pub fn of_vm_value(spec: &Value, mut size: impl FnMut(&str) -> u64) -> FolderUsage {
         let disk_bytes = disk_names(spec).fold(0u64, |sum, name| sum.saturating_add(size(name)));
         let cpu = &spec["cpu"];
+        let sockets = cpu["sockets"].as_u64().unwrap_or(1);
+        let cores = cpu["cores"].as_u64().unwrap_or(0);
+        let dedicated = if cpu["policy"].as_str() == Some("dedicated") {
+            cpu["max_vcpus"]
+                .as_u64()
+                .unwrap_or(sockets.saturating_mul(cores))
+                .saturating_add(u64::from(cpu["emulator"].as_str() == Some("isolate")))
+        } else {
+            0
+        };
         vm_usage(
             spec["template"].as_bool().unwrap_or(false),
-            cpu["sockets"].as_u64().unwrap_or(1),
-            cpu["cores"].as_u64().unwrap_or(0),
+            sockets,
+            cores,
             spec["memory_mib"].as_u64().unwrap_or(0),
             disk_bytes,
+            dedicated,
         )
     }
 }
 
-fn vm_usage(template: bool, sockets: u64, cores: u64, memory: u64, disk_bytes: u64) -> FolderUsage {
+fn vm_usage(
+    template: bool,
+    sockets: u64,
+    cores: u64,
+    memory: u64,
+    disk_bytes: u64,
+    dedicated_vcpus: u64,
+) -> FolderUsage {
     if template {
         return FolderUsage {
             disk_bytes,
@@ -139,6 +174,7 @@ fn vm_usage(template: bool, sockets: u64, cores: u64, memory: u64, disk_bytes: u
         memory_mib: memory,
         disk_bytes,
         vms: 1,
+        dedicated_vcpus,
     }
 }
 
@@ -290,6 +326,7 @@ mod tests {
         .unwrap();
         let size = |n: &str| if n == "a" { 10 } else { 5 };
         let want = FolderUsage {
+            dedicated_vcpus: 0,
             vcpus: 6,
             memory_mib: 1024,
             disk_bytes: 15,
@@ -412,6 +449,7 @@ mod tests {
             assert_eq!(serde_json::to_value(d).unwrap(), d.as_str());
         }
         let u = FolderUsage {
+            dedicated_vcpus: 0,
             vcpus: 1,
             memory_mib: 2,
             disk_bytes: 3,
@@ -419,5 +457,41 @@ mod tests {
         };
         assert!(u.within(&u.times(2)));
         assert!(!u.times(2).within(&u));
+    }
+
+    #[test]
+    fn dedicated_vcpus_count_slots_and_isolated_emulator() {
+        let spec = |cpu: serde_json::Value| -> VmSpec {
+            serde_json::from_value(json!({ "cpu": cpu, "memory_mib": 1024, "machine": "q35" }))
+                .unwrap()
+        };
+        for (cpu, want) in [
+            (json!({ "sockets": 2, "cores": 2 }), 0),
+            (
+                json!({ "sockets": 2, "cores": 2, "policy": "dedicated" }),
+                4,
+            ),
+            (
+                json!({ "sockets": 2, "cores": 2, "max_vcpus": 8, "policy": "dedicated", "emulator": "isolate" }),
+                9,
+            ),
+        ] {
+            let s = spec(cpu.clone());
+            assert_eq!(FolderUsage::of_vm(&s, 0).dedicated_vcpus, want, "{cpu}");
+            let v = serde_json::to_value(&s).unwrap();
+            assert_eq!(
+                FolderUsage::of_vm_value(&v, |_| 0),
+                FolderUsage::of_vm(&s, 0)
+            );
+        }
+        let mut t = spec(json!({ "cores": 2, "policy": "dedicated" }));
+        t.template = true;
+        assert_eq!(FolderUsage::of_vm(&t, 0).dedicated_vcpus, 0);
+        assert_eq!(QuotaDimension::DedicatedVcpus.as_str(), "dedicated_vcpus");
+        let quota = FolderQuota {
+            dedicated_vcpus: Some(4),
+            ..FolderQuota::default()
+        };
+        assert_eq!(QuotaDimension::DedicatedVcpus.limit(&quota), Some(4));
     }
 }

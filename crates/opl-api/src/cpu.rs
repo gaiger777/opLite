@@ -411,6 +411,9 @@ fn start_fit(inv: &Inventory, node: &Node, cpu: &CpuSpec) -> CpuNodeFit {
 /// 모델 하나, 플래그 없는 vCPU 하나
 fn model_spec(model: CpuModel) -> CpuSpec {
     CpuSpec {
+        emulator: None,
+        policy: Default::default(),
+        thread_policy: None,
         sockets: 1,
         cores: 1,
         model,

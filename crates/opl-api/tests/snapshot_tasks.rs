@@ -1404,6 +1404,7 @@ async fn block_tags_of_pending_backups_are_kept_at_startup() {
     let mut n2: opl_types::node::Node = Resource::new(
         "n2",
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,
@@ -1550,6 +1551,7 @@ async fn shared_block_pool_tags_are_removed_by_one_usable_node_at_startup() {
     let mut low: opl_types::node::Node = Resource::new(
         "low",
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,

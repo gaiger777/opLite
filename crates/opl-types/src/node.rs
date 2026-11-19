@@ -6,6 +6,7 @@ use uuid::Uuid;
 
 use crate::cpu::NodeCpu;
 use crate::ha_check::{CheckReport, CheckState};
+use crate::numa::{HostResources, NodeTopology};
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::vm::Arch;
 
@@ -29,6 +30,10 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub roles: Option<Vec<NodeRole>>,
+    /// 예약·전용 CPU와 hugepages 예약(계획 64 §7). 없으면 공유 = 모든 CPU — 지금과 같고 쓰지 않아 옛 노드도 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub host_resources: Option<HostResources>,
 }
 
 /// 노드의 역할
@@ -147,6 +152,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cpu: Option<NodeCpu>,
+    /// 이 노드의 CPU·메모리 NUMA 토폴로지(계획 64: 소켓·코어·스레드·NUMA 노드·hugepages·거리·L3). 노드가 시작할
+    /// 때와 검사 루프가 바뀔 때만 쓴다. 없으면(옛 노드·macOS·위트니스) 게스트 vNUMA만 된다. 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub topology: Option<NodeTopology>,
 }
 
 /// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
@@ -373,6 +383,7 @@ pub const FEATURES: &[&str] = &[
     FOLDERS,
     TWO_FACTOR,
     CPU_MODELS,
+    NUMA,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -435,6 +446,11 @@ pub const TWO_FACTOR: &str = "two-factor";
 /// `ClusterStatus.cpu_baselines`, Task `cpu-baseline`·`node-cpu-probe`. 옛 노드는 새 모델 문자열·`flags`가 든 VM을
 /// 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
 pub const CPU_MODELS: &str = "cpu-models";
+
+/// NUMA·전용 CPU·hugepages(계획 64): VM `cpu.policy`·`cpu.thread_policy`·`cpu.emulator`·`numa`·`hugepages`, 노드
+/// `host_resources`, `NodeStatus.topology` 쓰기, 할당량 `dedicated_vcpus`, 노드 사이 RPC `ReadTopology`. 옛 노드는 이
+/// 칸이 든 VM·노드·폴더를 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
+pub const NUMA: &str = "numa";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -538,6 +554,7 @@ mod tests {
             let mut n: Node = Resource::new(
                 "n",
                 NodeSpec {
+                    host_resources: None,
                     address: "a".into(),
                     maintenance: false,
                     witness: false,
@@ -917,7 +934,8 @@ mod tests {
                 "notifications",
                 "folders",
                 "two-factor",
-                "cpu-models"
+                "cpu-models",
+                "numa"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1015,6 +1033,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n",
             NodeSpec {
+                host_resources: None,
                 address: "a".into(),
                 maintenance: false,
                 witness: false,

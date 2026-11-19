@@ -24,6 +24,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: false,
@@ -31,6 +32,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         },
     );
     node.status = NodeStatus {
+        topology: None,
         cpu: None,
         online: true,
         cpus: 4,

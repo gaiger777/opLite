@@ -398,7 +398,12 @@ mod tests {
         let mut vm: Vm = Resource::new(
             "web",
             VmSpec {
+                hugepages: None,
+                numa: None,
                 cpu: CpuSpec {
+                    emulator: None,
+                    policy: Default::default(),
+                    thread_policy: None,
                     flags: Vec::new(),
                     sockets: 1,
                     cores: 1,

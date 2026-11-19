@@ -84,6 +84,9 @@ fn spec(
         id,
         name: "it-cdrom".into(),
         cpu: CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             flags: Vec::new(),
             sockets: 1,
             cores: 1,

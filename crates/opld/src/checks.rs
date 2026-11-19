@@ -1007,6 +1007,7 @@ mod tests {
         let mut me: opl_types::node::Node = Resource::new(
             "n1",
             NodeSpec {
+                host_resources: None,
                 address: "h:8006".into(),
                 maintenance: false,
                 witness: false,
@@ -1285,6 +1286,7 @@ mod tests {
         let mut old: opl_types::node::Node = Resource::new(
             "n2",
             NodeSpec {
+                host_resources: None,
                 address: "h2:8006".into(),
                 maintenance: false,
                 witness: false,

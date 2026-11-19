@@ -42,6 +42,7 @@ async fn other_node(env: &Env, name: &str, online: bool) -> Uuid {
     let mut node = Resource::new(
         name,
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,

@@ -8,6 +8,10 @@ use uuid::Uuid;
 
 use crate::cloud_init::{CloudInit, CloudInitError};
 use crate::cpu::{CpuError, CpuFlag, ResolvedCpu, validate_flags};
+use crate::numa::{
+    CpuPolicy, EmulatorPolicy, HostPlacement, NumaError, NumaSpec, PageSize, ResolvedNuma,
+    ThreadPolicy,
+};
 use crate::replication::{
     MAX_REPLICATION_TARGETS, ReplicaRecovery, ReplicaStatus, ReplicationTarget, parse_interval,
 };
@@ -104,6 +108,15 @@ pub struct VmSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub folder: Option<Uuid>,
+    /// 게스트 vNUMA(계획 64). 없으면 전용·hugepages VM은 `auto`, 그 밖은 vNUMA 없음(지금 그대로)이고 쓰지 않아 옛
+    /// 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub numa: Option<NumaSpec>,
+    /// 게스트 메모리를 hugepages로(계획 64, `2M`·`1G`·`any`). 없으면 보통 페이지이고 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub hugepages: Option<PageSize>,
 }
 
 /// VM의 게스트 에이전트 설정(계획 59). JSON `{}`은 기본값 그대로 켠다는 뜻이고, 기본값인 칸은 쓰지 않는다.
@@ -383,6 +396,7 @@ impl VmSpec {
                 return Err(ValidationError::MemoryAlign);
             }
         }
+        crate::numa::validate(self)?;
         if self.cdroms.len() > MAX_CDROMS {
             return Err(ValidationError::TooManyCdroms);
         }
@@ -598,6 +612,9 @@ pub enum ValidationError {
     /// CPU 플래그 목록(64개까지, 겹침 없음)·아키텍처에 맞지 않는 수준(계획 63)
     #[error("cpu: {0}")]
     Cpu(#[from] CpuError),
+    /// vNUMA·CPU 정책·hugepages(계획 64)
+    #[error("{0}")]
+    Numa(#[from] NumaError),
 }
 
 /// 실제 부팅 순서(QEMU `bootindex`): 디스크와 CD-ROM 드라이브의 `boot_order`에서 정한다. CD-ROM이 없으면 그대로다
@@ -695,6 +712,18 @@ pub struct CpuSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub flags: Vec<CpuFlag>,
+    /// vCPU 정책(계획 64): `shared`(기본, 쓰지 않음)·`dedicated`(vCPU마다 노드의 전용 pCPU 하나)
+    #[serde(default, skip_serializing_if = "CpuPolicy::is_shared")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub policy: CpuPolicy,
+    /// 전용 VM의 SMT 형제 스레드 정책(계획 64, 기본 `prefer`). `dedicated`일 때만 준다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub thread_policy: Option<ThreadPolicy>,
+    /// 전용 VM의 에뮬레이터 스레드 정책(계획 64, 기본 `shared`). `dedicated`일 때만 준다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub emulator: Option<EmulatorPolicy>,
 }
 
 impl CpuSpec {
@@ -979,6 +1008,15 @@ pub struct RunningHardware {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub cpu_resolved: Option<ResolvedCpu>,
+    /// 켤 때 정한 게스트 NUMA 모양·페이지·CPU 정책(계획 64). 없으면 계획 64 전 기록이거나 이 기능을 쓰지 않는 VM이다.
+    /// 받는 쪽 마이그레이션은 이것을 그대로 쓴다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub numa: Option<ResolvedNuma>,
+    /// 켠 노드의 호스트 NUMA 노드·pCPU(계획 64). 묶는 VM에만 있고 `node`가 지금 노드와 다르면 낡은 기록이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub host_placement: Option<HostPlacement>,
 }
 
 /// 실행 중에 적용하지 못해 다음 재시작 때 적용할 변경 하나
@@ -986,7 +1024,7 @@ pub struct RunningHardware {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PendingChange {
     /// `vcpus`, `cpu`, `cpu.max_vcpus`, `memory_mib`, `max_memory_mib`, `firmware`, `machine`, `tpm`,
-    /// `secure_boot`, `guest_agent`
+    /// `secure_boot`, `guest_agent`, `numa`
     pub field: String,
     /// 도는 값
     pub running: String,
@@ -1830,6 +1868,9 @@ mod tests {
         assert_eq!(
             cpu,
             CpuSpec {
+                emulator: None,
+                policy: Default::default(),
+                thread_policy: None,
                 flags: Vec::new(),
                 sockets: 1,
                 cores: 2,

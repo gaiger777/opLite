@@ -489,6 +489,7 @@ mod tests {
         let mut n = Resource::new(
             format!("n{id}"),
             NodeSpec {
+                host_resources: None,
                 address: "h:1".into(),
                 maintenance: false,
                 witness,

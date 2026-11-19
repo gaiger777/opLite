@@ -12,7 +12,7 @@ use opl_types::authz::Privilege;
 use opl_types::authz_eval::AuthzTarget;
 use opl_types::folder::{Folder, FolderKind, FolderQuota, FolderSpec, FolderStatus, MAX_FOLDERS};
 use opl_types::network::NetworkSpec;
-use opl_types::node::FOLDERS;
+use opl_types::node::{FOLDERS, NUMA};
 use opl_types::resource::{Kind, Resource};
 use opl_types::storage::StoragePoolSpec;
 use opl_types::vm::VmSpec;
@@ -124,6 +124,14 @@ pub struct FolderQuery {
 }
 
 /// 볼 수 있는 폴더의 평면 목록(부모 id로 트리를 이룬다). 부모를 볼 수 없는 폴더는 보는 사람에게 맨 위 폴더다.
+/// 할당량 `dedicated_vcpus`(계획 64)는 옛 노드가 풀지 못한다.
+fn require_quota_feature(state: &AppState, quota: Option<&FolderQuota>) -> Result<(), ApiError> {
+    if quota.is_some_and(|q| q.dedicated_vcpus.is_some()) {
+        require_feature(&state.cluster, NUMA)?;
+    }
+    Ok(())
+}
+
 #[utoipa::path(get, path = "/folders", tag = "folders",
     params(FolderQuery),
     responses((status = 200, body = List<Resource<FolderSpec, FolderStatus>>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -175,6 +183,7 @@ pub async fn create_folder(
         parent: req.parent,
         quota: req.quota.filter(|q| !q.is_empty()),
     };
+    require_quota_feature(&state, spec.quota.as_ref())?;
     spec.validate(id)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     require_at(
@@ -292,6 +301,7 @@ pub async fn patch_folder(
     if let Some(quota) = req.quota {
         let quota = quota.filter(|q| !q.is_empty());
         if quota != folder.spec.quota {
+            require_quota_feature(&state, quota.as_ref())?;
             // 옮기면서 바꾸면 새 부모 쪽에서 본다.
             require_at(
                 &state,

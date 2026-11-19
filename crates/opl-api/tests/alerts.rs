@@ -458,6 +458,7 @@ async fn add_node(env: &Env, name: &str, status: NodeStatus) -> Uuid {
     let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
         name,
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,

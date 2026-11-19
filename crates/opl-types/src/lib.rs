@@ -25,6 +25,7 @@ pub mod metrics;
 pub mod metrics_math;
 pub mod network;
 pub mod node;
+pub mod numa;
 pub mod placement;
 pub mod quota;
 pub mod realm;

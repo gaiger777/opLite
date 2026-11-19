@@ -786,7 +786,12 @@ pub(crate) fn import_spec(
         })
         .collect::<Result<_, String>>()?;
     Ok(VmSpec {
+        hugepages: None,
+        numa: None,
         cpu: CpuSpec {
+            emulator: None,
+            policy: Default::default(),
+            thread_policy: None,
             flags: run.cpu_flags.clone(),
             sockets: run.sockets.unwrap_or(proposal.sockets),
             cores: run.cores.unwrap_or(proposal.cores),

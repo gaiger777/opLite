@@ -45,6 +45,7 @@ async fn setup() -> Setup {
     let mut source: Node = Resource::new(
         "source",
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: false,
@@ -611,6 +612,7 @@ async fn prepare_needs_every_node_and_a_target() {
     let old: Node = Resource::new(
         "old",
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.3:0".into(),
             maintenance: false,
             witness: false,

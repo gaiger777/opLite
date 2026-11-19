@@ -107,6 +107,10 @@ pub struct FolderQuota {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub vms: Option<u64>,
+    /// 전용 VM의 vCPU 자리(핫플러그 상한 + 에뮬레이터 `isolate` 1, 계획 64)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub dedicated_vcpus: Option<u64>,
 }
 
 impl FolderQuota {
@@ -116,7 +120,7 @@ impl FolderQuota {
     }
 }
 
-/// 폴더 하위 트리의 사용량(할당 기준, 전원과 무관). 할당량과 같은 네 칸이다.
+/// 폴더 하위 트리의 사용량(할당 기준, 전원과 무관). 할당량과 같은 칸이다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct FolderUsage {
@@ -124,6 +128,14 @@ pub struct FolderUsage {
     pub memory_mib: u64,
     pub disk_bytes: u64,
     pub vms: u64,
+    /// 전용 VM의 vCPU 자리(계획 64). 0이면 쓰지 않아 지금 응답 그대로다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub dedicated_vcpus: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

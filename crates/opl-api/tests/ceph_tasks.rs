@@ -842,6 +842,7 @@ async fn the_agent_writes_client_configs() {
     let mut witness = Resource::new(
         "witness1",
         NodeSpec {
+            host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: true,

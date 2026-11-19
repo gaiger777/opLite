@@ -14,8 +14,8 @@ use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node,
-    NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
+    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, NUMA,
+    Node, NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
@@ -288,6 +288,14 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     }
     // `host`·`max` 밖의 CPU 모델과 플래그는 옛 노드가 풀지 못한다(계획 63, 검증보다 먼저).
     crate::cpu::require_cpu_feature(&state.cluster, &spec.cpu.model, &spec.cpu.flags)?;
+    // CPU 정책·vNUMA·hugepages는 옛 노드가 풀지 못한다(계획 64, 검증보다 먼저). 켜기·배치가 이것을 다루기 전(스테이지
+    // 5에서 열기 전)에는 받지 않는다.
+    if opl_types::numa::in_use(spec) {
+        require_feature(&state.cluster, NUMA)?;
+        return Err(ApiError::bad_request(
+            "dedicated CPUs, NUMA and hugepages are not available yet",
+        ));
+    }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate().map_err(crate::cpu::validation_error)?;
