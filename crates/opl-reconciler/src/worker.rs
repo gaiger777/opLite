@@ -1224,21 +1224,26 @@ impl Worker {
             Some(tag) => self.snapshot_hardware(vm, tag),
             None => self.hardware_at_start(vm),
         };
-        // 새로 켜면 지금 기준·숨김 목록으로 CPU를 해석해 기록한다(계획 63). 메모리 스냅샷은 담을 때의 CPU 그대로다.
-        if restore.is_none() {
-            match self.cpu_at_start(vm) {
-                Ok(resolved) => hardware.cpu_resolved = resolved,
-                Err(CpuRefusal::Waiting(reason)) => {
-                    tracing::warn!(vm = %self.id, reason = %reason, "CPU not ready; not starting");
-                    self.deactivate_disks(vm).await;
-                    self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
-                    return Ok(Start::NotStarted);
-                }
-                Err(CpuRefusal::Cannot(reason)) => {
-                    self.deactivate_disks(vm).await;
-                    self.power_off = Some(Some(format!("failed to start: {reason}")));
-                    return Ok(Start::NotStarted);
-                }
+        // 새로 켜면 지금 기준·숨김 목록으로 CPU를 해석해 기록한다(계획 63). 메모리 스냅샷은 담을 때의 CPU 그대로이되,
+        // 이 노드가 그 CPU를 켤 수 없으면 QEMU가 실패하기 전에 까닭을 남긴다(리뷰 1 M4).
+        let cpu = match &restore {
+            None => self
+                .cpu_at_start(vm)
+                .map(|resolved| hardware.cpu_resolved = resolved),
+            Some(_) => self.cpu_restorable(&hardware),
+        };
+        match cpu {
+            Ok(()) => {}
+            Err(CpuRefusal::Waiting(reason)) => {
+                tracing::warn!(vm = %self.id, reason = %reason, "CPU not ready; not starting");
+                self.deactivate_disks(vm).await;
+                self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
+                return Ok(Start::NotStarted);
+            }
+            Err(CpuRefusal::Cannot(reason)) => {
+                self.deactivate_disks(vm).await;
+                self.power_off = Some(Some(format!("failed to start: {reason}")));
+                return Ok(Start::NotStarted);
             }
         }
         apply_hardware(&mut spec, &hardware, &vm.spec);
@@ -1378,14 +1383,38 @@ impl Worker {
         ctx.map(|ctx| ctx.start(&vm.spec.cpu)).transpose()
     }
 
+    /// 메모리 스냅샷이 담을 때 기록한 CPU를 이 노드가 켤 수 있는지(리뷰 1 M4). 기록이 없으면(계획 63 전) 모델만
+    /// 펴므로 보지 않는다. 기다리면 풀리는 것(카탈로그가 아직 없음)은 막지 않는다 — 스냅샷 태그는 이번 켜기에만 있다.
+    fn cpu_restorable(&self, hardware: &RunningHardware) -> Result<(), CpuRefusal> {
+        let Some(resolved) = &hardware.cpu_resolved else {
+            return Ok(());
+        };
+        let Ok(Some(ctx)) = CpuContext::load(&self.cluster, self.config.node) else {
+            return Ok(());
+        };
+        match ctx.check(resolved) {
+            Err(CpuRefusal::Cannot(reason)) => Err(CpuRefusal::Cannot(format!(
+                "{reason}; the memory snapshot was taken with that CPU"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// 메모리 스냅샷 `tag`(스냅샷 id)를 불러오며 켤 하드웨어: 메모리를 담을 때 도는 QEMU와 같은 장치여야 하므로
-    /// 스냅샷에 적은 하드웨어로 켠다. 적지 않은 스냅샷(계획 54 전, 롤링 업그레이드 중)은 핫플러그 배치 없이 켠다.
+    /// 스냅샷에 적은 하드웨어로 켠다. 적지 않은 스냅샷(계획 54 전, 롤링 업그레이드 중)은 핫플러그 배치 없이 스냅샷의
+    /// 스펙으로 켠다(담을 때의 CPU 모델 — 리뷰 1 M4). 스냅샷을 찾지 못하면 지금 스펙이다.
     fn snapshot_hardware(&self, vm: &Vm, tag: &str) -> RunningHardware {
-        tag.parse::<Uuid>()
+        match tag
+            .parse::<Uuid>()
             .ok()
             .and_then(|id| self.cluster.get::<SnapshotSpec>(id).ok().flatten())
-            .and_then(|s| s.spec.hardware)
-            .unwrap_or_else(|| RunningHardware::legacy(&vm.spec))
+        {
+            Some(s) => s
+                .spec
+                .hardware
+                .unwrap_or_else(|| RunningHardware::legacy(&s.spec.vm_spec)),
+            None => RunningHardware::legacy(&vm.spec),
+        }
     }
 
     /// HA VM을 켜거나 이어서 실행하기 직전에 다시 본다: 리스가 살아 있어야 하고, 로컬 저장소의 VM이

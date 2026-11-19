@@ -108,8 +108,7 @@ pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
 
 impl Env {
     pub async fn start() -> Self {
-        // 큰 future를 힙에 둔다: 여러 Env를 차례로 띄우는 시험이 디버그 빌드의 시험 스레드 스택(2 MiB)을 넘지 않게.
-        Box::pin(Self::start_with(|_| {}, |_| async {})).await
+        Self::start_with(|_| {}, |_| async {}).await
     }
 
     /// `tweak`로 reconciler 설정을 바꾸고, `before_runner`로 Task 실행기가 뜨기 전에 저장소를 채운다.
@@ -121,12 +120,14 @@ impl Env {
         F: FnOnce(Arc<Cluster>) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        Self::start_full(tweak, before_runner, |_| {}).await
+        // 큰 future를 힙에 둔다: 여러 Env를 차례로 띄우는 시험이 디버그 빌드의 시험 스레드 스택(2 MiB)을 넘지 않게
+        // (모든 길 — 리뷰 1 M5).
+        Box::pin(Self::start_full(tweak, before_runner, |_| {})).await
     }
 
     /// `tweak_state`로 API 상태를 바꾼다(예: 게스트 에이전트 소스).
     pub async fn start_with_state(tweak_state: impl FnOnce(&mut AppState)) -> Self {
-        Self::start_full(|_| {}, |_| async {}, tweak_state).await
+        Box::pin(Self::start_full(|_| {}, |_| async {}, tweak_state)).await
     }
 
     async fn start_full<F, Fut>(

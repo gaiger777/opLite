@@ -656,7 +656,8 @@ orbivisorctl vm create app --cpu-model cluster ...       # 기준을 쓰는 VM
   경로·크기·수정 시각을 보고 바뀌면(apt로 QEMU를 올림) 다시 읽는다. 실패한 읽기는 10분마다 다시 하고, 그동안 앞 카탈로그를
   쓴다(`node cpu`의 `error:`). 리더가 어느 노드도 가리키지 않고 1시간 넘은 카탈로그를 지운다. `orbivisorctl node cpu node3`이
   QEMU 버전·가속기·호스트 CPU·읽은 시각과 모델 표(MODEL USABLE MISSING NOTE)를, `--refresh`가 먼저 다시 읽기를 한다(10초
-  안팎). 카탈로그가 없는 노드(처음 읽기가 실패, 옛 노드)는 `host`·`max` VM만 받는다.
+  안팎). 카탈로그가 없는 노드(처음 읽기가 실패, 옛 노드)는 플래그 없는 `host`·`max` VM만 받는다 — 숨김 목록이 있으면 그
+  이름을 QEMU가 아는지 확인할 수 없어 아무 VM도 켜지 않는다(숨김을 빼고 켜서 감춘 기능을 드러내지 않는다).
 - **auto 셈(x86_64).** 위트니스가 아닌 이 아키텍처의 **등록된 노드 모두**가 대상이다 — 꺼진 노드·유지보수 노드도 센다(잠깐
   꺼진 노드 때문에 기준이 오르내리지 않게). 카탈로그가 아직 없는 노드는 빼고 경고(`node "x" has no CPU catalog yet and is left
   out`)로 적는다. 후보는 모든 대상 노드가 켤 수 있는 버전 모델(별칭이 아님, migration-safe, deprecated 아님) 가운데 모델 벤더가

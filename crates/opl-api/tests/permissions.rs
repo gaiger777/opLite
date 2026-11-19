@@ -76,6 +76,21 @@ fn vm_in(name: &str, folder: Option<&str>) -> Value {
     req
 }
 
+/// 이 노드의 유지보수 표시를 저장소에 바로 쓴다.
+async fn set_maintenance(env: &common::Env, on: bool) {
+    let node = env
+        .cluster
+        .get::<opl_types::node::NodeSpec>(env.node)
+        .unwrap()
+        .unwrap();
+    let mut spec = node.spec.clone();
+    spec.maintenance = on;
+    env.cluster
+        .update_spec(node.id, None, node.labels.clone(), &spec)
+        .await
+        .unwrap();
+}
+
 async fn id_of(client: &Client, path: &str) -> String {
     let (status, body) = client.get(path).await;
     assert_eq!(status, StatusCode::OK, "{path}: {body}");
@@ -396,6 +411,19 @@ async fn every_list_shows_only_the_folders_of_a_folder_user() {
             .0,
         StatusCode::FORBIDDEN
     );
+    // 노드 이름을 볼 수 없으면 노드로 거를 수도 없다(있는지 드러내지 않게, 리뷰 1 M2).
+    assert_eq!(
+        alice.get(&format!("/cpu/models?node={me}")).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        alice.get("/cpu/models?node=nope").await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        admin.get(&format!("/cpu/models?node={me}")).await.0,
+        StatusCode::OK
+    );
     // 아무 권한도 없는 사용자는 모델 목록도 못 본다.
     let nobody = w.env.user("nobody", "none").await;
     assert_eq!(nobody.get("/cpu/models").await.0, StatusCode::FORBIDDEN);
@@ -434,6 +462,32 @@ async fn objects_out_of_view_are_404_and_missing_privileges_are_403() {
         alice.get(&format!("/folders/{}", w.b)).await.0,
         StatusCode::NOT_FOUND
     );
+
+    // VM의 CPU는 읽되 노드마다 내용(노드 이름)은 루트 읽기 권한이 있을 때만(리뷰 1 M2)
+    let (status, cpu) = alice.get("/vms/a1/cpu").await;
+    assert_eq!(status, StatusCode::OK, "{cpu}");
+    assert_eq!(cpu["nodes"], serde_json::json!([]), "{cpu}");
+    let (_, cpu) = w.admin.get("/vms/a1/cpu").await;
+    assert!(
+        cpu["nodes"].as_array().is_some_and(|n| !n.is_empty()),
+        "{cpu}"
+    );
+    // 놓을 노드가 없는 409 no_node도 노드마다 까닭을 보이지 않는다(유일한 노드가 유지보수 중).
+    set_maintenance(&w.env, true).await;
+    let mut running = vm_in("busy", Some(&w.a));
+    running["spec"]["power"] = "running".into();
+    let (status, body) = alice.post("/vms", running.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_node", "{body}");
+    assert!(body.get("details").is_none_or(|d| d.is_null()), "{body}");
+    assert!(
+        !body["message"].as_str().unwrap().contains("maintenance\""),
+        "{body}"
+    );
+    let (status, body) = w.admin.post("/vms", running).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["details"]["nodes"].is_object(), "{body}");
+    set_maintenance(&w.env, false).await;
 
     // 자기 것은 읽는다.
     for path in [

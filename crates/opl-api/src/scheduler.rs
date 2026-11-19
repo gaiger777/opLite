@@ -61,8 +61,8 @@ pub struct Inventory {
 enum VmCpu<'a> {
     /// 새로 켠다(켜기·HA 복구·복제): 스펙을 그 노드에서 지금 기준·숨김 목록으로 해석한다.
     Start,
-    /// 도는 VM을 옮긴다: 켤 때 기록한 CPU 그대로다(받는 쪽은 기록으로 켠다).
-    Running(&'a RunningHardware),
+    /// 도는 VM을 옮긴다: 켤 때 기록한 CPU 그대로다(받는 쪽은 기록으로 켠다). 둘째는 지금 도는 노드다.
+    Running(&'a RunningHardware, Option<Uuid>),
 }
 
 impl<'a> VmCpu<'a> {
@@ -71,7 +71,7 @@ impl<'a> VmCpu<'a> {
         vm.status
             .hardware
             .as_ref()
-            .map_or(VmCpu::Start, VmCpu::Running)
+            .map_or(VmCpu::Start, |hw| VmCpu::Running(hw, vm.status.node))
     }
 }
 
@@ -134,7 +134,7 @@ impl Inventory {
         let name = &node.name;
         let resolved = match cpu {
             VmCpu::Start => ctx.resolve(&spec.cpu),
-            VmCpu::Running(hw) => match &hw.cpu_resolved {
+            VmCpu::Running(hw, _) => match &hw.cpu_resolved {
                 Some(r) => Ok(r.clone()),
                 // 계획 63 전 기록: 명령줄처럼 모델만 편다.
                 None => cpu::resolve(&hw.cpu, ctx.arch, ctx.accel, None, &[], None),
@@ -146,7 +146,45 @@ impl Inventory {
             CpuRefusal::Waiting(_) => format!(
                 "node {name:?} has no CPU catalog yet; only the host and max CPU models can run there"
             ),
-        })
+        })?;
+        if let VmCpu::Running(_, Some(from)) = cpu {
+            let exposed = self.newly_exposed(&resolved, from, node);
+            if !exposed.is_empty() {
+                return Err(format!(
+                    "node {name:?} would expose the hidden CPU flags {} that the VM's current node cannot hide; power cycle the VM instead",
+                    exposed.join(", ")
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// 도는 `host`·`max` VM을 `from`에서 `to`로 옮기면 새로 드러날 숨김 이름(계획 63 리뷰 1 C1). 켤 때 `from`의 QEMU가
+    /// 모르던 숨김 이름은 해석에서 빠졌다(그 QEMU는 그 기능을 주지 못한다). `to`의 QEMU가 그 이름을 알면 받는 쪽의
+    /// `-cpu host`는 그 기능을 준다 — 숨기려던 것이 드러나므로 막는다. `from`이 알았는데 꺼지지 않은 이름(숨김을 켠 뒤로
+    /// 껐다 켜지 않은 VM)은 이미 드러나 있어 옮겨도 달라지지 않는다. 명명 모델·수준은 버전 정의가 고정이라 상관없다.
+    fn newly_exposed(&self, resolved: &cpu::ResolvedCpu, from: Uuid, to: &Node) -> Vec<String> {
+        if !matches!(resolved.model.as_str(), "host" | "max") {
+            return Vec::new();
+        }
+        let catalog = |id: Uuid| {
+            let node = self.nodes.iter().find(|n| n.id == id)?;
+            self.cpu_catalogs
+                .get(&node.status.cpu.as_ref()?.catalog)
+                .cloned()
+        };
+        let (Some(source), Some(target)) = (catalog(from), catalog(to.id)) else {
+            return Vec::new();
+        };
+        self.cpu_mask
+            .iter()
+            .filter(|m| {
+                resolved.flags.get(m.as_str()) != Some(&false)
+                    && source.flag_index(m).is_none()
+                    && target.flag_index(m).is_some()
+            })
+            .cloned()
+            .collect()
     }
 
     /// 이 VM의 네트워크가 쓰는 브리지(VXLAN이면 `oplv<vni>`)가 모두 이 노드에 있는지.
@@ -435,6 +473,12 @@ pub fn host_cpu_warning(vm: &Vm, inv: &Inventory, from: &Node, to: &Node) -> Opt
         to.name,
         lacks.join(", ")
     ))
+}
+
+/// VM의 스펙을 노드에서 새로 켤 수 있는지 CPU만 본다(껐다 켜기 — 리뷰 1 I2). 다른 조건은 그 노드에서 이미 도는
+/// VM이라 보지 않는다(메모리를 두 번 세지 않게).
+pub fn cpu_starts(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), String> {
+    inv.cpu_fits(spec, node, VmCpu::Start)
 }
 
 /// 도는 VM의 기록된 CPU(꺼진 VM이면 스펙의 해석)를 노드가 켤 수 있는지만 본다([`migration_fits`]의 CPU 부분). 다른
@@ -2056,6 +2100,71 @@ mod tests {
         assert_eq!(migration_fits(&off, &inv, &nodes[1], &[]), Ok(()));
     }
 
+    /// 리뷰 1 C1: QEMU를 차례로 올리는 중 숨김 목록에 새 이름(`avx512vbmi`)이 있고 옛 노드의 QEMU는 그 이름을 모른다.
+    #[test]
+    fn hidden_flags_unknown_to_an_old_qemu_neither_break_starts_nor_leak_on_migration() {
+        let (strong, _) = catalogs();
+        let mut old_qemu = strong.clone();
+        old_qemu.flags.retain(|f| f != "avx512vbmi");
+        old_qemu.supported = cpu::Bits::from_indices(0..old_qemu.flags.len());
+        old_qemu.qemu = "9.2.0".into();
+        let nodes = vec![
+            x86("new", Some(&strong)),
+            x86("old", Some(&old_qemu)),
+            x86("none", None),
+            x86("twin", Some(&strong)),
+        ];
+        let mut inv = cpu_inv(nodes.clone(), &[&strong, &old_qemu]);
+        inv.cpu_mask = vec!["avx512vbmi".into()];
+        // 새로 켜기: 옛 노드는 모르는 숨김 이름을 빼고 켠다. 카탈로그가 없는 노드는 숨김을 확인할 수 없어 거절한다.
+        let host = x86_spec("host", &[]);
+        assert_eq!(node_fits(&host, &inv, &nodes[0]), Ok(()));
+        assert_eq!(node_fits(&host, &inv, &nodes[1]), Ok(()));
+        assert!(
+            node_fits(&host, &inv, &nodes[2])
+                .unwrap_err()
+                .contains("has no CPU catalog, so the CPU flags avx512vbmi cannot be checked")
+        );
+        // VM이 스스로 끈 이름은 빼지 않는다 — 옛 노드는 못 켠다.
+        let own = x86_spec("host", &["-avx512vbmi"]);
+        assert!(
+            node_fits(&own, &inv, &nodes[1])
+                .unwrap_err()
+                .contains("unknown flag avx512vbmi")
+        );
+        let running = |on: &Node, flags: &[(&str, bool)]| {
+            let mut vm: Vm = Resource::new("web", x86_spec("host", &[]));
+            let mut hw = RunningHardware::legacy(&vm.spec);
+            hw.cpu_resolved = Some(cpu::ResolvedCpu {
+                model: "host".into(),
+                flags: flags.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+                enforce: false,
+                source: cpu::CpuSource::Spec,
+            });
+            vm.status.hardware = Some(hw);
+            vm.status.node = Some(on.id);
+            vm
+        };
+        // 새 노드에서 켠 기록(avx512vbmi=off)은 옛 노드의 QEMU가 거절한다.
+        let on_new = running(&nodes[0], &[("avx512vbmi", false)]);
+        assert!(
+            migration_fits(&on_new, &inv, &nodes[1], &[])
+                .unwrap_err()
+                .contains("unknown flag avx512vbmi")
+        );
+        assert_eq!(migration_fits(&on_new, &inv, &nodes[3], &[]), Ok(()));
+        // 옛 노드에서 켠 기록(이름 없음)을 새 노드로 옮기면 -cpu host가 숨긴 기능을 준다 — 막는다.
+        let on_old = running(&nodes[1], &[]);
+        assert_eq!(
+            migration_fits(&on_old, &inv, &nodes[0], &[]),
+            Err("node \"new\" would expose the hidden CPU flags avx512vbmi that the VM's current node cannot hide; power cycle the VM instead".into())
+        );
+        assert!(cpu_receives(&on_old, &inv, &nodes[0]).is_err());
+        // 숨김을 켜기 전에 새 노드에서 켠 VM은 이미 드러나 있다 — 옮겨도 달라지지 않는다(보류로 껐다 켜기를 알린다).
+        let before_mask = running(&nodes[0], &[]);
+        assert_eq!(migration_fits(&before_mask, &inv, &nodes[3], &[]), Ok(()));
+    }
+
     #[test]
     fn ha_recovery_picks_only_nodes_that_can_run_the_cpu() {
         let (strong, weak) = catalogs();
@@ -2084,6 +2193,28 @@ mod tests {
             true,
         );
         assert_eq!(pick, crate::ha::Pick::Node(nodes[1].id));
+        // 리뷰 1 I3: HA 검사의 라이브 옮기기는 켤 때 기록한 CPU로 본다. Skylake로 도는 VM의 스펙이 Icelake로 바뀌었어도
+        // (보류) 약한 노드로 옮길 수 있다. 새로 켜는 복구는 스펙을 본다.
+        let mut vm: Vm = Resource::new("db", x86_spec("Icelake-Server-v7", &[]));
+        let mut hw = RunningHardware::legacy(&vm.spec);
+        hw.cpu_resolved = Some(cpu::ResolvedCpu {
+            model: "Skylake-Server-v5".into(),
+            flags: Default::default(),
+            enforce: true,
+            source: cpu::CpuSource::Spec,
+        });
+        vm.status.hardware = Some(hw);
+        vm.status.node = Some(nodes[0].id);
+        let away = |n: &Node| n.id != nodes[0].id;
+        let scorer = Scorer::default();
+        assert!(matches!(
+            crate::ha::pick(&vm, &inv, &Assign::default(), away, &scorer, true),
+            crate::ha::Pick::NoNode(_)
+        ));
+        assert_eq!(
+            crate::ha::pick_live(&vm, &inv, &Assign::default(), away, &scorer),
+            crate::ha::Pick::Node(nodes[1].id)
+        );
     }
 
     #[test]

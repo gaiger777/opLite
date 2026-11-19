@@ -41,8 +41,8 @@ use crate::replication::start_replication;
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::revision::{TASK, WARNING};
 use crate::scheduler::{
-    HaCapacity, Inventory, ScheduleError, cpu_receives, disk_moves, ha_capacity, host_cpu_warning,
-    migration_fits, migration_moves, schedule_with,
+    HaCapacity, Inventory, ScheduleError, cpu_receives, cpu_starts, disk_moves, ha_capacity,
+    host_cpu_warning, migration_fits, migration_moves, schedule_with,
 };
 use crate::score::{self, Scorer};
 use crate::snapshots::{
@@ -184,6 +184,17 @@ fn no_node_error(vm: &Vm, inv: &Inventory, e: ScheduleError) -> ApiError {
         err.details = Some(serde_json::json!({ "nodes": reasons }));
     }
     err
+}
+
+/// 루트 `cluster.read`가 없는 사용자에게는 `no_node`의 노드마다 까닭(노드 이름이 든다)을 보이지 않는다 — `/cpu/models`와
+/// 같은 규칙(리뷰 1 M2).
+fn hide_node_reasons(state: &AppState, principal: &Principal, mut e: ApiError) -> ApiError {
+    if e.code == "no_node" && e.details.is_some() && !crate::cpu::sees_node_names(state, principal)
+    {
+        e.message = ScheduleError::NoNode.to_string();
+        e.details = None;
+    }
+    e
 }
 
 /// 스케줄러가 노드를 고르지 못함: 노드 조건이면 409 `no_node`, hard 규칙이면 409 `placement_rule`
@@ -962,7 +973,8 @@ pub async fn create_vm(
     let scoring = score::scorer(&state, picks).await;
     let _lock = state.vm_lock.lock().await;
     let asked = vm.spec.cpu.model.clone();
-    prepare(&state, &mut vm, &scoring.scorer())?;
+    prepare(&state, &mut vm, &scoring.scorer())
+        .map_err(|e| hide_node_reasons(&state, &principal, e))?;
     vm.revision = state.cluster.create(&vm).await?;
     let from = (asked != vm.spec.cpu.model).then(|| asked.to_string());
     if let Some(cpu) = crate::cpu::audit_cpu(&vm.spec.cpu, None, from.as_deref()) {
@@ -1105,7 +1117,8 @@ pub async fn update_vm(
         spec.template = current.spec.template;
         Ok((spec, req.labels.clone()))
     })
-    .await?;
+    .await
+    .map_err(|e| hide_node_reasons(&state, &principal, e))?;
     let from = (req.spec.cpu.model != vm.spec.cpu.model).then(|| req.spec.cpu.model.to_string());
     let before = before.into_inner().unwrap();
     if let Some(cpu) = crate::cpu::audit_cpu(&vm.spec.cpu, before.as_ref(), from.as_deref()) {
@@ -1303,7 +1316,8 @@ pub async fn cdrom_media(
         cdrom.iso = req.iso.clone();
         Ok((spec, current.labels.clone()))
     })
-    .await?;
+    .await
+    .map_err(|e| hide_node_reasons(&state, &principal, e))?;
     let what = match &req.iso {
         Some(iso) => format!("insert {iso}"),
         None => "eject".into(),
@@ -1716,7 +1730,7 @@ pub enum StopMode {
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn vm_action(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path((key, action)): Path<(String, String)>,
     Query(query): Query<ActionQuery>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
@@ -1838,7 +1852,8 @@ pub async fn vm_action(
                 spec.power = PowerState::Running;
                 Ok(())
             })
-            .await?;
+            .await
+            .map_err(|e| hide_node_reasons(&state, &principal, e))?;
             (TaskOp::VmStart, vm)
         }
         "stop" => {
@@ -1860,6 +1875,23 @@ pub async fn vm_action(
                     "vm_not_running",
                     format!("VM {:?} is not running", vm.name),
                 ));
+            }
+            // 껐다 켜기는 같은 노드에서 지금 스펙을 새로 해석해 켠다(계획 63). 그 노드가 새 CPU를 켤 수 없으면 끈 뒤
+            // 켜지 못해 꺼진 채로 남는다 — 끄기 전에 거절한다(리뷰 1 I2). 다른 노드로 옮겨 켜기는 하지 않는다: 어디서
+            // 켤지는 끈 뒤에야 정할 수 있고, 그때 TPM 상태·디스크·규칙·HA 자리를 다시 보다 실패하면 같은 결과다.
+            if let Some(node) = vm.status.node.or(vm.spec.node)
+                && let Some(node) = state.cluster.get::<NodeSpec>(node)?
+            {
+                let inv = Inventory::load(&state.cluster)?;
+                if let Err(why) = cpu_starts(&vm.spec, &inv, &node) {
+                    return Err(ApiError::conflict(
+                        "no_capacity",
+                        format!(
+                            "{why}; migrate VM {:?} to a node that can run its CPU, then power cycle it",
+                            vm.name
+                        ),
+                    ));
+                }
             }
             (TaskOp::VmReboot, vm)
         }

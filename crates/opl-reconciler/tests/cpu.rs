@@ -404,3 +404,88 @@ async fn a_mask_marks_vms_started_before_the_upgrade() {
         ("host", "host -avx512vbmi")
     );
 }
+
+/// 메모리 스냅샷 `name`을 스펙 `vm_spec`과 하드웨어 기록 `hardware`로 남긴다.
+async fn memory_snapshot(
+    env: &Env,
+    vm: &Vm,
+    name: &str,
+    vm_spec: opl_types::vm::VmSpec,
+    hardware: Option<RunningHardware>,
+) -> Uuid {
+    let snapshot: Resource<opl_types::snapshot::SnapshotSpec, _> = Resource::new(
+        name,
+        opl_types::snapshot::SnapshotSpec {
+            vm: vm.id,
+            name: name.into(),
+            parent: None,
+            memory: true,
+            description: String::new(),
+            scheduled: false,
+            vm_spec,
+            hardware,
+        },
+    );
+    env.cluster.create(&snapshot).await.unwrap();
+    snapshot.id
+}
+
+/// 리뷰 1 M4: 메모리 스냅샷을 불러오며 켤 때 기록된 CPU를 이 노드가 켤 수 없으면 QEMU 전에 까닭을 남긴다. 기록이 없는
+/// 옛 스냅샷은 지금 스펙이 아니라 담을 때 스펙의 CPU 모델로 켠다.
+#[tokio::test]
+async fn a_memory_snapshot_restore_checks_its_recorded_cpu() {
+    let env = Env::start().await;
+    let hash = publish_catalog(&env).await;
+    add_node(&env, &[PLACEMENT, CPU_MODELS], Some(&hash)).await;
+    let mut vm = x86_vm("Skylake-Server-v5", &[]);
+    vm.spec.node = Some(env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.create(&vm).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+
+    // 옛 스냅샷(기록 없음): 담을 때 host였다.
+    let host_spec = x86_vm("host", &[]).spec;
+    let mut taken = host_spec.clone();
+    taken.node = Some(env.node);
+    let old = memory_snapshot(&env, &vm, "old", taken, None).await;
+    env.restore_on_start(vm.id, &old.to_string());
+    env.set_power(vm.id, PowerState::Running).await;
+    env.wait(vm.id, "restored", |v| {
+        v.status.phase == VmPhase::Running && v.status.hardware.is_some()
+    })
+    .await;
+    let launched = env
+        .hv
+        .launch_specs()
+        .into_iter()
+        .rfind(|s| s.id == vm.id)
+        .unwrap();
+    assert_eq!(launched.cpu.model.as_str(), "host");
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+
+    // 이 노드가 켤 수 없는 CPU로 담은 스냅샷
+    let mut hw = RunningHardware::legacy(&vm.spec);
+    hw.cpu_resolved = Some(ResolvedCpu {
+        model: "Icelake-Server-v7".into(),
+        flags: BTreeMap::new(),
+        enforce: true,
+        source: CpuSource::Spec,
+    });
+    let launches = env.hv.launches().len();
+    let ice = memory_snapshot(&env, &vm, "ice", vm.spec.clone(), Some(hw)).await;
+    env.restore_on_start(vm.id, &ice.to_string());
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env
+        .wait(vm.id, "refused", |v| v.status.last_error.is_some())
+        .await;
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some(
+            "failed to start: node \"n1\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi); the memory snapshot was taken with that CPU"
+        )
+    );
+    assert_eq!(env.hv.launches().len(), launches);
+}

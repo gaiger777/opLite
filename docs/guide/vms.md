@@ -813,11 +813,15 @@ VM `spec.cpu.max_vcpus`·`spec.max_memory_mib`, `status.hardware`(아래), Node 
   (`+aes`와 `-aes`도)은 **400** `invalid_cpu_flags`, 모르는 이름은 **400** `unknown_cpu_flag`다. `+`는 그 노드가 줄 수 있어야
   켠다(아니면 그 노드는 후보가 아니다). 모델을 못 쓰는 까닭이 플래그 하나뿐이면 그 플래그를 숨겨서 켤 수 있다
   (`Icelake-Server-v7 -avx512vbmi`). 클러스터 숨김 목록(설정 `cpu.mask`, 아래 따라 하기)은 `host`를 포함한 모든 VM에 걸리고
-  VM의 `+`보다 이긴다 — 숨김 목록에 든 이름을 `+`로 저장하면 **400** `cpu_flag_masked`다.
+  VM의 `+`보다 이긴다 — 숨김 목록에 든 이름을 `+`로 저장하면 **400** `cpu_flag_masked`다. QEMU를 차례로 올리는 중이라 어떤
+  노드의 QEMU가 숨김 목록의 이름을 모르면 그 노드는 그 이름을 빼고 켠다(그 QEMU는 그 기능을 게스트에 주지 못한다). 그렇게 켠
+  `host`·`max` VM은 그 이름을 아는 노드로 라이브 마이그레이션하지 않는다(대상의 `-cpu host`가 숨긴 기능을 준다 — 전원을 껐다
+  켠다). VM 자신의 플래그는 빼지 않는다: 그 노드의 QEMU가 모르는 이름이면(`unknown flag x`) 그 노드는 후보가 아니다.
 - **전원 껐다 켜기 규칙.** CPUID는 QEMU를 띄울 때 정해지고 실행 중에는 바꿀 수 없다. 실행 중인 VM의 모델·플래그를 바꾸거나
   클러스터 기준·숨김 목록이 바뀌면 VM에 보류 `cpu`(이유 `restart`, `detail`에 바뀐 것과 "power cycle required; a reboot inside
   the guest does not apply it")가 생기고, **Orbivisor가 QEMU를 다시 띄울 때**만 적용된다: `vm reboot`(ACPI로 끄고 새 QEMU로
-  켬), `vm stop` + `vm start`, HA 복구. **게스트 안의 재부팅**(같은 QEMU 프로세스)과 **라이브 마이그레이션**(대상이 원본의
+  켬), `vm stop` + `vm start`, HA 복구. `vm reboot`은 같은 노드에서 다시 켜므로 그 노드가 새 CPU를 켤 수 없으면 끄기 전에
+  **409** `no_capacity`(`…; migrate VM "x" to a node that can run its CPU, then power cycle it`)다 — 먼저 켤 수 있는 노드로 옮긴다. **게스트 안의 재부팅**(같은 QEMU 프로세스)과 **라이브 마이그레이션**(대상이 원본의
   CPU 기록을 그대로 씀)으로는 적용되지 않는다. 메모리 스냅샷으로 되돌리기는 스냅샷을 찍을 때의 CPU로 켠다(디스크만
   되돌리면 새로 해석한다). 기준·숨김 목록 때문인 보류는 각 노드의 검사 루프(5초)가 다시 셈해 쓴다. 켤 때 실제로 쓴 것은
   `status.hardware.cpu_resolved`(`{model, flags, enforce, source}`)에 남는다.

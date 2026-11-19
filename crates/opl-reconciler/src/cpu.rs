@@ -135,12 +135,25 @@ impl CpuContext {
         self.resolve(cpu).ok()
     }
 
-    /// 해석한 CPU를 이 노드가 켤 수 있는지. `host`·`max`는 늘 된다. 그 밖에는 카탈로그가 있고 `can_run`이어야 한다.
+    /// 해석한 CPU를 이 노드가 켤 수 있는지. 플래그 없는 `host`·`max`는 늘 된다. 그 밖에는 카탈로그가 있고 `can_run`
+    /// 이어야 한다 — 플래그(숨김 목록 포함)가 붙은 `host`·`max`도 그 이름을 QEMU가 아는지 카탈로그로 확인한다. 카탈로그가
+    /// 없는 노드는 확인할 수 없는 숨김을 명령줄에 두지 않고, 숨김을 빼고 켜서 감춘 기능을 드러내지도 않는다(거절).
     pub fn check(&self, resolved: &ResolvedCpu) -> Result<(), CpuRefusal> {
-        if matches!(resolved.model.as_str(), "host" | "max") {
+        let host = matches!(resolved.model.as_str(), "host" | "max");
+        if host && resolved.flags.is_empty() {
             return Ok(());
         }
         match &self.catalog {
+            NodeCatalog::None if host => Err(CpuRefusal::Cannot(format!(
+                "node {:?} has no CPU catalog, so the CPU flags {} cannot be checked there; only the host and max CPU models without flags or a cluster mask can run there",
+                self.node_name,
+                resolved
+                    .flags
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
             NodeCatalog::None => Err(CpuRefusal::Cannot(format!(
                 "node {:?} has no CPU catalog; only the host and max CPU models can run there",
                 self.node_name
@@ -246,6 +259,62 @@ mod tests {
             wanted: wanted.into(),
             reason: PendingReason::Restart,
             detail: None,
+        }
+    }
+
+    /// 리뷰 1 C1: 카탈로그 없는 노드는 확인할 수 없는 숨김을 명령줄에 두지 않는다.
+    #[test]
+    fn host_with_flags_needs_a_catalog_to_check_the_names() {
+        let ctx = |catalog| CpuContext {
+            node_name: "n1".into(),
+            arch: Arch::X86_64,
+            accel: Accel::Kvm,
+            baseline: None,
+            mask: vec!["avx512vbmi".into()],
+            catalog,
+        };
+        let host = CpuSpec {
+            sockets: 1,
+            cores: 1,
+            model: cpu::CpuModel::Host,
+            max_vcpus: None,
+            flags: Vec::new(),
+        };
+        let plain = ResolvedCpu {
+            model: "host".into(),
+            flags: BTreeMap::new(),
+            enforce: false,
+            source: cpu::CpuSource::Spec,
+        };
+        let none = ctx(NodeCatalog::None);
+        assert_eq!(none.check(&plain), Ok(()));
+        assert!(matches!(
+            none.start(&host),
+            Err(CpuRefusal::Cannot(m)) if m.contains("CPU flags avx512vbmi cannot be checked")
+        ));
+        assert!(matches!(
+            ctx(NodeCatalog::Missing("h".into())).start(&host),
+            Err(CpuRefusal::Waiting(_))
+        ));
+        let known = known_catalog();
+        let found = ctx(NodeCatalog::Found(Arc::new(known)));
+        assert_eq!(
+            found.start(&host).map(|r| r.flags),
+            Ok([("avx512vbmi".to_string(), false)].into())
+        );
+    }
+
+    /// `avx512vbmi`만 아는 x86 카탈로그
+    fn known_catalog() -> CpuCatalogSpec {
+        CpuCatalogSpec {
+            arch: Arch::X86_64,
+            accel: "kvm".into(),
+            qemu: "11.1.2".into(),
+            machine: Arch::X86_64.machine(),
+            flags: vec!["avx512vbmi".into()],
+            supported: cpu::Bits::from_indices([0]),
+            vendor: None,
+            models: Vec::new(),
         }
     }
 

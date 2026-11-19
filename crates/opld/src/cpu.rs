@@ -175,8 +175,11 @@ pub struct CpuRefresh {
     sender: mpsc::UnboundedSender<Reply>,
 }
 
-/// 탐침이 돌고 끝난 결과를 검사 회차가 거둘 때까지 기다리는 한도(탐침 30초 + 회차 둘)
-const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+/// 탐침이 돌고 끝난 결과를 검사 회차가 거둘 때까지 기다리는 한도. 요청이 도는 탐침 중에 오면 그 탐침(30초까지)이
+/// 끝나고 다음 회차에 새 탐침(30초까지)을 띄운 뒤 그다음 회차가 결과를 거둔다 — 탐침 둘 + 회차 셋(리뷰 1 M3).
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(
+    2 * opl_qemu::cpu::PROBE_TIMEOUT.as_secs() + 3 * crate::checks::CHECK_INTERVAL.as_secs(),
+);
 
 #[async_trait::async_trait]
 impl opl_api::CpuRefresher for CpuRefresh {
@@ -329,6 +332,13 @@ mod tests {
 
     fn write(path: &Path, text: &str) {
         std::fs::write(path, text).unwrap();
+    }
+
+    /// 리뷰 1 M3: 도는 탐침을 기다린 뒤 새 탐침까지 끝나도 다시 읽기 Task가 먼저 시간을 넘기지 않는다.
+    #[test]
+    fn a_refresh_outlasts_a_running_probe_and_a_new_one() {
+        let worst = 2 * opl_qemu::cpu::PROBE_TIMEOUT + 2 * crate::checks::CHECK_INTERVAL;
+        assert!(REFRESH_TIMEOUT > worst, "{REFRESH_TIMEOUT:?} <= {worst:?}");
     }
 
     #[test]

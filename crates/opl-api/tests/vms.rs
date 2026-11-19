@@ -2176,3 +2176,14 @@ async fn the_scheduler_keeps_a_local_iso_on_its_node() {
     assert_eq!(status, StatusCode::CREATED, "{b}");
     assert_eq!(b["spec"]["node"], node2.to_string());
 }
+
+/// 리뷰 1 M5: `Env`를 띄우는 길마다 큰 future는 힙에 있다 — 시험 future에 그대로 들어가 스레드 스택을 넘지 않게.
+#[test]
+fn every_env_start_keeps_its_large_future_on_the_heap() {
+    let sizes = [
+        std::mem::size_of_val(&Env::start()),
+        std::mem::size_of_val(&Env::start_with(|_| {}, |_| async {})),
+        std::mem::size_of_val(&Env::start_with_state(|_| {})),
+    ];
+    assert!(sizes.iter().all(|s| *s < 1024), "{sizes:?}");
+}

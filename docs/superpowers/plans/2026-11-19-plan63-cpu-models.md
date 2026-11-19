@@ -79,7 +79,7 @@
 - 메모리 스냅샷 되돌리기는 찍을 때의 CPU로 켠다(새 기준·숨김 목록을 쓰지 않는다).
 - `GET /vms/{key}/cpu`의 "실행 중"은 기록(`cpu_resolved`)이고 QMP로 읽은 실제 vCPU 속성이 아니다.
 - 리더 기록은 janitor 틱이라 노드·설정이 바뀐 뒤 10초 안팎 늦다. 기준 바뀜에 걸리는 경보 규칙 조건은 없다(활동·감사에만).
-- 노드 다시 읽기는 검사 회차를 기다려 10초 안팎 걸린다(시간 제한 60초).
+- 노드 다시 읽기는 검사 회차를 기다려 10초 안팎 걸린다(시간 제한 75초 — 도는 탐침과 새 탐침 둘 + 회차 셋, 리뷰 1 M3).
 - 웹은 별칭을 보이지 않고, 노드 목록에 "CPU 모델" 열이 없으며, CPU 화면에서 가이드로 가는 도움말 링크가 없다. 일괄 동작에 따로 "전원 껐다 켜기"는 없고 "재시작"이 그것이다. CLI에는 보류 VM 거름이 없다.
 - KVM 탐침 고정물(`x86_64-kvm.json`)은 기록하지 않았다. 약한 노드는 합성 카탈로그(Mock)로만 본다.
 - 이 Mac(HVF)의 Playwright는 숨길 안전한 플래그가 없어 "숨김 목록 저장 → 대기 거름 → 일괄 재시작" 흐름을 브라우저로 돌리지 않는다(vitest가 본다).
@@ -91,7 +91,7 @@
 - 카탈로그 크기(이 Mac의 QEMU 11.1.2): x86_64 TCG 모델 186개·플래그 407개(`max`가 주는 것 89개) **41,134바이트**(설계 어림 40 KB), aarch64 TCG 모델 12개·플래그 23개 874바이트, aarch64 HVF 12개·3개 980바이트. aarch64는 정의 38개 가운데 64비트 `virt`로 켤 수 있는 12개만 남는다. x86 고정물은 220 KB(거짓 값을 버리지 않으면 2.2 MB).
 - 탐침 시간: x86 정적 확장 186번을 포함해 **0.3초 안쪽**(설계 어림 2초, 시간 제한 30초).
 - 묶음 크기(`index.html`이 받는 JS gzip 합): 392,618 → 397,616 B(**+4,998 B**), CSS 14,461 → 14,477 B(+16).
-- **이른 GitHub 탐침(스테이지 3 뒤):** `linux-kvm`의 `opld/cpu-it` `masked_flags_are_off_in_every_vcpu`가 스테이지 1의 임시 API 막기에 걸렸다 — `vm set --cores 2`가 보내는 전체 스펙이 저장된 모델·플래그를 그대로 담아도 400이었다. 저장된 VM과 같으면 받도록 좁혔다(스테이지 4 커밋, 시험 `an_update_that_keeps_the_stored_cpu_model_and_flags_is_accepted`). 같은 회차에 `install-media`의 vTPM 시험 `a_cloud_image_boots_with_secure_boot_a_tpm_and_the_guest_agent`가 "no report 1 in 900s"로 실패했다. 코드 원인은 찾지 못했다 — 그 VM의 기록은 `cpu_resolved {model: host}`(enforce·플래그 없음)라 `-cpu host`로 스테이지 3 전과 바이트가 같고, 펌웨어·SMM·TPM 코드는 건드리지 않았으며 TPM 상태가 두 번 기록되어 swtpm·OVMF는 돌았다. 게스트 보고 스크립트가 cloud-init이 네트워크에서 `qemu-guest-agent`를 설치한 뒤 돌므로 apt 미러가 느리거나 실패한 흔들림으로 보고 다시 돌려 가리기로 했다.
+- **이른 GitHub 탐침(스테이지 3 뒤):** `linux-kvm`의 `opld/cpu-it` `masked_flags_are_off_in_every_vcpu`가 스테이지 1의 임시 API 막기에 걸렸다 — `vm set --cores 2`가 보내는 전체 스펙이 저장된 모델·플래그를 그대로 담아도 400이었다. 저장된 VM과 같으면 받도록 좁혔다(스테이지 4 커밋, 시험 `an_update_that_keeps_the_stored_cpu_model_and_flags_is_accepted`). 같은 회차에 `install-media`의 vTPM 시험 `a_cloud_image_boots_with_secure_boot_a_tpm_and_the_guest_agent`가 "no report 1 in 900s"로 실패했다. 코드 원인은 찾지 못했다 — 그 VM의 기록은 `cpu_resolved {model: host}`(enforce·플래그 없음)라 `-cpu host`로 스테이지 3 전과 바이트가 같고, 펌웨어·SMM·TPM 코드는 건드리지 않았으며 TPM 상태가 두 번 기록되어 swtpm·OVMF는 돌았다. 게스트 보고 스크립트가 cloud-init이 네트워크에서 `qemu-guest-agent`를 설치한 뒤 돌므로 apt 미러가 느리거나 실패한 흔들림으로 보고 다시 돌려 가리기로 했다. **풀림:** 스테이지 4 뒤 탐침에서 같은 `install-media` 시험이 통과했다 — 흔들림이었다(코드 원인 없음).
 - **이른 GitHub 탐침(스테이지 4 뒤):** `opld/cpu-it` `enforce_refuses_a_model_with_missing_features`의 기대가 옛것이었다. 시험은 노드를 고정하지 않은 VM이라 스케줄러의 일반 `no_node` 문구만 받았고 CPU 까닭을 찾지 못했다. 스테이지 5에서 `no_node`가 이 아키텍처 노드마다의 까닭(`node "n1" cannot run CPU model Broadwell-v1 (missing hle, rtm)`)과 `details.nodes`를 주게 하고, 시험이 고정된 꺼진 VM(409 `no_capacity`)과 고르는 켜기(`no_node`) 둘 다 보게 했다.
 - **스택 넘침 둘을 미리 막음(스테이지 5):** 디버그 빌드에서 opl-api `replica_receive`와 opld `member::tests::a_restart_with_new_links_signs_the_node_cert_again`이 시험 스레드 스택(2 MiB)을 넘었다. 계획 62처럼 `Env::start`·`Member::start`를 `Box::pin`으로 힙에 두었다. CLI 새 명령은 `run_cli` 안에서 dispatch해 `templates` 시험의 넘침이 다시 나지 않는다.
 - 리뷰: (채움)

@@ -4294,7 +4294,10 @@ export interface components {
         CpuModelEntry: {
             /** @description 별칭이면 가리키는 버전 모델(카탈로그마다 다르면 첫 것). VM에는 버전 모델로 저장된다. */
             alias_of?: string;
-            /** @description `cluster`: 지금 기준(`Skylake-Server-v5 +pcid`, 없으면 `host`처럼 켠다) */
+            /**
+             * @description `cluster`: 지금 기준(`Skylake-Server-v5 +pcid`). 기준이 없으면(off, 업그레이드 중) 없다 — 그때 `cluster`는
+             *     `host`처럼 켠다.
+             */
             current?: string;
             deprecated?: boolean;
             kind: components["schemas"]["CpuModelKind"];
@@ -10682,7 +10685,10 @@ export interface components {
         };
         /** @description VM의 CPU: 스펙, 지금 켜면 쓸 것, 도는 것, 보류, 노드마다 켤 수 있는지 */
         VmCpuInfo: {
-            /** @description 이 아키텍처의 노드마다(이름순): 도는 VM은 옮길 수 있는지(기록한 CPU), 꺼진 VM은 켤 수 있는지(스펙) */
+            /**
+             * @description 이 아키텍처의 노드마다(이름순): 도는 VM은 옮길 수 있는지(기록한 CPU), 꺼진 VM은 켤 수 있는지(스펙). 루트
+             *     `cluster.read`가 없으면 비어 있다(노드 이름을 보이지 않는다).
+             */
             nodes: components["schemas"]["CpuNodeFit"][];
             /** @description 다음 전원 껐다 켜기 때 바뀔 것(`status.hardware.pending`의 `cpu`) */
             pending?: components["schemas"]["PendingChange"];

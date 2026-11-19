@@ -443,8 +443,13 @@ fn expand(
 /// 기준(없으면 `cluster` = `host`), `mask`는 클러스터 숨김 목록, `catalog`는 켜는 노드의 카탈로그다.
 ///
 /// 순서: 모델 펴기(`host`는 TCG면 `max`, 수준은 `qemu64-v1` + 정의 플래그, `cluster`는 기준 모델·플래그) → 숨김
-/// 목록 끄기(카탈로그가 있으면 그 카탈로그가 모르는 이름은 건너뜀 — `sve`는 x86에서 무시. 카탈로그가 없으면 모두 끈다:
-/// 숨기기가 목적이라 켜기 실패가 조용히 드러내는 것보다 낫다) → VM 플래그 얹기(숨김 목록에 있는 이름은 숨김이 이긴다).
+/// 목록 끄기 → VM 플래그 얹기(숨김 목록에 있는 이름은 숨김이 이긴다).
+///
+/// 카탈로그가 있으면 클러스터가 끈 플래그(숨김 목록과 기준의 꺼진 플래그) 가운데 그 노드의 QEMU가 모르는 이름은
+/// 뺀다 — QEMU는 이름을 모르는 기능을 게스트에 주지 못하고(명명 모델 정의에 없고, `host`·`max`도 `migratable=on`이라
+/// 이름 있는 비트만 준다), 모르는 이름을 명령줄에 두면 켜기가 실패한다(`sve`는 x86에서 무시). VM이 스스로 단
+/// 플래그는 빼지 않는다 — 모르면 [`can_run`]이 그 노드를 거른다. 카탈로그가 없으면 모두 끈다(확인할 수 없으니
+/// 해석은 그대로 두고 켤지는 opl-reconciler `CpuContext::check`가 정한다).
 pub fn resolve(
     cpu: &CpuSpec,
     arch: Arch,
@@ -457,7 +462,12 @@ pub fn resolve(
         (CpuModel::Cluster, Some(b)) => {
             let base: CpuModel = b.model.parse()?;
             let (model, mut flags, enforce) = expand(&base, arch, accel)?;
-            flags.extend(b.flags.iter().map(|(k, v)| (k.clone(), *v)));
+            flags.extend(
+                b.flags
+                    .iter()
+                    .filter(|(k, on)| **on || catalog.is_none_or(|c| c.flag_index(k).is_some()))
+                    .map(|(k, v)| (k.clone(), *v)),
+            );
             (model, flags, enforce, CpuSource::Cluster)
         }
         (m, _) => {
@@ -518,20 +528,31 @@ impl CpuMismatch {
     }
 }
 
-/// 카탈로그 `catalog`의 노드가 해석된 CPU를 켤 수 있는지(순수). `host`·`max`는 늘 된다. 명명 모델은 카탈로그에
+/// 카탈로그 `catalog`의 노드가 해석된 CPU를 켤 수 있는지(순수). 켜든 끄든 모든 플래그 이름을 그 노드의 QEMU가 알아야
+/// 한다(모르는 속성이면 QEMU가 켜기를 거절한다 — `host`·`max`도). `host`·`max`는 그것만 본다. 명명 모델은 카탈로그에
 /// 있고, 그 `missing`이 모두 꺼진 플래그 안에 있으며(못 쓰는 까닭이 `avx512vbmi` 하나뿐인 모델은 `-avx512vbmi`로 켤
 /// 수 있다), 플래그 아닌 까닭이 없고, 켠 플래그가 모두 `supported`에 있어야 한다. aarch64 KVM·HVF 노드는 명명 모델을
 /// 못 켠다.
 pub fn can_run(resolved: &ResolvedCpu, catalog: &CpuCatalogSpec) -> Result<(), CpuMismatch> {
-    if matches!(resolved.model.as_str(), "host" | "max") {
-        return Ok(());
-    }
     let mut out = CpuMismatch {
         model: resolved.model.clone(),
         unknown_model: false,
         missing: Vec::new(),
         other: Vec::new(),
     };
+    let unknown: Vec<String> = resolved
+        .flags
+        .keys()
+        .filter(|name| catalog.flag_index(name).is_none())
+        .map(|name| format!("unknown flag {name}"))
+        .collect();
+    if matches!(resolved.model.as_str(), "host" | "max") {
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        out.other = unknown;
+        return Err(out);
+    }
     if catalog.arch == Arch::Aarch64 && catalog.accel() != Some(Accel::Tcg) {
         out.other.push("accel".into());
     }
@@ -553,11 +574,12 @@ pub fn can_run(resolved: &ResolvedCpu, catalog: &CpuCatalogSpec) -> Result<(), C
     for (name, _) in resolved.flags.iter().filter(|(_, on)| **on) {
         let ok = catalog
             .flag_index(name)
-            .is_some_and(|i| catalog.supported.contains(i));
+            .is_none_or(|i| catalog.supported.contains(i));
         if !ok && !out.missing.contains(name) {
             out.missing.push(name.clone());
         }
     }
+    out.other.extend(unknown);
     if out.unknown_model || !out.missing.is_empty() || !out.other.is_empty() {
         Err(out)
     } else {
@@ -1402,7 +1424,18 @@ mod tests {
     ];
 
     fn catalog(arch: Arch, accel: &str, supported: &[&str], models: &[M<'_>]) -> CpuCatalogSpec {
-        let mut flags: Vec<String> = ALL_FLAGS.iter().map(|f| f.to_string()).collect();
+        catalog_knowing(ALL_FLAGS, arch, accel, supported, models)
+    }
+
+    /// [`catalog`]와 같되 QEMU가 아는 플래그 이름이 `known`뿐이다.
+    fn catalog_knowing(
+        known: &[&str],
+        arch: Arch,
+        accel: &str,
+        supported: &[&str],
+        models: &[M<'_>],
+    ) -> CpuCatalogSpec {
+        let mut flags: Vec<String> = known.iter().map(|f| f.to_string()).collect();
         flags.sort();
         let bits = |names: &[&str]| {
             Bits::from_indices(
@@ -1906,6 +1939,97 @@ mod tests {
             assert_eq!(e.other, ["accel"]);
             assert_eq!(can_run(&res("max", &[("sve", false)]), &arm(accel)), Ok(()));
         }
+    }
+
+    /// 리뷰 1 C1: 어떤 노드의 QEMU가 모르는 꺼진 플래그(QEMU를 차례로 올리는 중 새 이름)
+    #[test]
+    fn flags_unknown_to_the_node_qemu_are_dropped_from_the_cluster_side_and_refused_from_the_vm() {
+        let x = Arch::X86_64;
+        // 옛 QEMU: gfni를 모른다.
+        let known: Vec<&str> = ALL_FLAGS.iter().copied().filter(|f| *f != "gfni").collect();
+        let old_qemu = catalog_knowing(
+            &known,
+            x,
+            "kvm",
+            V4ISH,
+            &[m("Skylake-Server-v5", &[], V4ISH)],
+        );
+        let mask = vec!["gfni".to_string()];
+        // 숨김 목록과 기준의 꺼진 플래그는 그 노드가 모르면 뺀다 — 켤 수 있다.
+        let b = Baseline {
+            model: "Skylake-Server-v5".into(),
+            flags: map(&[("gfni", false), ("pcid", true)]),
+            mode: BaselineSource::Auto,
+            nodes: Vec::new(),
+            limited_by: Vec::new(),
+            since: 0,
+            previous: None,
+            warnings: Vec::new(),
+        };
+        let cl = resolve(
+            &cpu("cluster", &[]),
+            x,
+            Accel::Kvm,
+            Some(&b),
+            &mask,
+            Some(&old_qemu),
+        )
+        .unwrap();
+        assert_eq!(cl.flags, map(&[("pcid", true)]));
+        let host = resolve(
+            &cpu("host", &[]),
+            x,
+            Accel::Kvm,
+            None,
+            &mask,
+            Some(&old_qemu),
+        )
+        .unwrap();
+        assert!(host.flags.is_empty());
+        assert_eq!(can_run(&host, &old_qemu), Ok(()));
+        // VM이 스스로 끈 플래그는 빼지 않는다 — 그 노드는 켤 수 없다(host도).
+        for model in ["host", "Skylake-Server-v5"] {
+            let own = resolve(
+                &cpu(model, &["-gfni"]),
+                x,
+                Accel::Kvm,
+                None,
+                &[],
+                Some(&old_qemu),
+            )
+            .unwrap();
+            assert_eq!(own.flags, map(&[("gfni", false)]));
+            let e = can_run(&own, &old_qemu).unwrap_err();
+            assert_eq!(e.other, ["unknown flag gfni"], "{model}");
+            assert!(
+                e.to_string().contains("not available: unknown flag gfni"),
+                "{e}"
+            );
+        }
+        // 새 QEMU 노드에서 켠 기록(gfni=off)은 옛 노드로 옮길 수 없다(QEMU가 명령줄을 거절한다).
+        let recorded = resolve(
+            &cpu("host", &[]),
+            x,
+            Accel::Kvm,
+            None,
+            &mask,
+            Some(&new_kvm()),
+        )
+        .unwrap();
+        assert_eq!(recorded.flags, map(&[("gfni", false)]));
+        assert_eq!(can_run(&recorded, &new_kvm()), Ok(()));
+        assert!(can_run(&recorded, &old_qemu).is_err());
+        // 켠 플래그도 이름을 알아야 한다.
+        let on = ResolvedCpu {
+            model: "Skylake-Server-v5".into(),
+            flags: map(&[("gfni", true)]),
+            enforce: true,
+            source: CpuSource::Spec,
+        };
+        assert_eq!(
+            can_run(&on, &old_qemu).unwrap_err().other,
+            ["unknown flag gfni"]
+        );
     }
 
     #[test]

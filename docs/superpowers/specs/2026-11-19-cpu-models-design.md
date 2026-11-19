@@ -291,3 +291,16 @@
 - **CLI에는 보류 VM 거름이 없다**(웹 `?cpu=pending`만). 따라 하기는 CLI 쪽을 `vm get`의 `cpu running: … (power cycle pending: …)` 줄과 `vm reboot`으로 적었다. `settings set cpu.mask=`와 `vm set --cpu-flags`가 목록 **전체**를 바꾼다는 것을 가이드에 적었다(더하기가 아니다).
 - **aarch64 숨김 이름의 한계**(스테이지 3: 모델에 없는 속성을 숨기면 QEMU가 켜지 않고 `can_run`이 미리 알지 못함)는 고치지 않고 가이드 한계에 적었다.
 - `docs/architecture.md`(main `104324e`·`6695eae`)는 이 브랜치의 기준(`e04f9a8`) 뒤에 들어와 그 두 커밋을 이 브랜치에 그대로 옮기고(cherry-pick — main으로 rebase하면 같은 패치라 빠진다) §4 리더 표·§9.1·새 §9.6·§14에 CPU 모델·카탈로그·리더의 기준을 적었다. §4와 §19의 "리더의 CPU 기준선 계산은 없다"는 지웠다.
+
+### 리뷰 1에서 고친 것 (서버)
+
+- **C1 노드 QEMU가 모르는 꺼진 플래그.** `can_run`은 켜든 끄든 모든 플래그 이름을 그 노드의 카탈로그가 알아야 한다(`host`·`max`도 — 모르는 속성이면 QEMU가 켜지 않는다, 까닭 `unknown flag x`). **결정:** 해석(`resolve`)은 **클러스터가 끈 이름**(숨김 목록과 기준의 꺼진 플래그)만 그 노드가 모르면 뺀다. QEMU는 이름을 모르는 기능을 게스트에 주지 못한다 — 명명 모델·수준은 그 QEMU의 정의에 없고, `host`·`max`도 기본 `migratable=on`이라 이름 있는 비트만 준다. 그래서 빼도 드러나지 않고 QEMU를 차례로 올리는 동안 옛 노드가 VM을 계속 켠다. **VM이 스스로 단 `-flag`는 빼지 않는다** — 그 노드는 후보가 아니다(관리자가 VM에 적은 것을 노드마다 다르게 켜지 않고, 아래 마이그레이션 구멍도 막는다). 빼서 생기는 구멍 하나를 막았다: 옛 노드에서 이름 없이 켠 `host`·`max` VM을 그 이름을 아는 노드로 라이브 마이그레이션하면 받는 쪽 `-cpu host`가 숨긴 기능을 준다 — `migration_fits`가 "원본 카탈로그는 모르고 대상은 아는 숨김 이름"이 꺼지지 않았으면 거절한다(`would expose the hidden CPU flags …; power cycle the VM instead`). 숨김을 켠 뒤 껐다 켜지 않은 VM(원본도 아는 이름)은 이미 드러나 있어 옮겨도 같으므로 막지 않는다. **카탈로그가 없는 노드**는 플래그 없는 `host`·`max`만 켠다(전과 같음). 숨김 목록이나 VM 플래그가 있으면 확인할 수 없는 이름을 명령줄에 두지도, 숨김을 빼고 켜서 드러내지도 않고 거절한다(`has no CPU catalog, so the CPU flags … cannot be checked there`) — 보안 숨김은 "켜지 않음"이 "조용히 드러냄"보다 낫다. 카탈로그 리소스가 아직 없으면(`Missing`) 플래그 있는 `host`도 기다린다(`Waiting`).
+- **I1 등록 때 카탈로그를 해시보다 먼저.** `record_node`가 `NodeStatus.cpu`를 쓰기 전에 카탈로그를 올린다(검사기와 같은 차례). 리더는 노드가 알린 해시의 카탈로그가 없는 동안(정리 작업이 같은 때 오래된 같은 해시를 지운 경우) 기준을 다시 셈하지 않고 앞 기록을 둔다 — 그 노드가 빠져 기준이 올랐다 내려오지 않게.
+- **I2 "지금 전원 껐다 켜기"(reboot).** 같은 노드에서 지금 스펙을 새로 해석해 켠다. 그 노드가 새 CPU를 켤 수 없으면 끄기 전에 **409** `no_capacity`(`…; migrate VM "x" to a node that can run its CPU, then power cycle it`). 다른 노드로 옮겨 켜기는 하지 않았다: 어디서 켤지는 끈 뒤에야 정할 수 있고 그때 TPM 상태·디스크·배치 규칙·HA 자리를 다시 보다 실패하면 VM이 꺼진 채 남는다 — 고치려던 바로 그 결과다.
+- **I3 HA 검사의 옮기기**는 `ha::pick_live`(복제본 노드도 받고 CPU는 켤 때 기록한 것, `replica_migration_fits`)로 고른다. `eligible`의 중복 `cpu_receives`는 뺐다. 끈 뒤 다른 노드에서 켜는 HA 검사 재시작 옮기기는 그대로 스펙을 본다.
+- **M1** 해석만 바뀐 보류 `cpu`(기준·숨김 목록)는 vCPU 검사를 건너뛰지 않는다 — 늘린 vCPU의 `Limit`·`Unsupported`·`cpu.max_vcpus`가 함께 보인다. 스펙의 토폴로지·모델·플래그가 바뀐 때만 `cpu` 하나로 끝낸다.
+- **M2** `GET /vms/{key}/cpu`의 `nodes`와 409 `no_node`의 노드마다 까닭(`details.nodes`, 문구 끝)은 루트 `cluster.read`가 있을 때만 보인다(`/cpu/models`와 같은 규칙). 노드 이름을 볼 수 없는 사용자의 `/cpu/models?node=`는 **403**이다(404·200으로 노드가 있는지 드러내지 않게).
+- **M3** 노드 다시 읽기 Task의 시간 제한을 60초에서 75초(탐침 둘 + 검사 회차 셋)로 늘렸다 — 도는 탐침 중에 온 요청은 그 탐침과 새 탐침을 모두 기다린다.
+- **M4** 메모리 스냅샷 되돌리기: 하드웨어 기록이 없는 옛 스냅샷은 지금 스펙이 아니라 스냅샷의 스펙으로 켜고(담을 때의 CPU 모델), 기록된 `cpu_resolved`를 이 노드가 켤 수 없으면 QEMU 전에 까닭을 남기고 끈다(`…; the memory snapshot was taken with that CPU`). 카탈로그가 아직 없는 것은 막지 않는다(스냅샷 태그는 그 켜기 한 번에만 있다). 리뷰의 첫 경우(되돌린 뒤 지금 스펙의 모델로 켬)는 되돌리기 Task가 스냅샷 스펙을 먼저 쓰므로 보통은 생기지 않는다.
+- **M5** opl-api 시험의 `Env::start_with`·`start_with_state`도 `start_full`을 `Box::pin`으로 힙에 둔다.
+- **웹 #1의 서버 쪽:** `/cpu/models`의 `cluster` 항목 `current`는 기준이 있을 때만 있다(전에는 없을 때 `"host"`라 기준이 있는 것과 구별되지 않았다). 선택 칸이라 하위 호환이고, 업그레이드 중에는 기준을 읽지 않으므로 없다. `oplctl cpu models`는 없을 때 `no baseline: runs as host`를 적는다.

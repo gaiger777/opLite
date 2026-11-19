@@ -302,6 +302,8 @@ pub(crate) async fn cpu(
                     }
                     if let Some(c) = m["current"].as_str() {
                         note.push(format!("now {c}"));
+                    } else if m["kind"] == "cluster" {
+                        note.push("no baseline: runs as host".into());
                     }
                     if m["deprecated"] == true {
                         note.push("deprecated".into());
@@ -573,6 +575,12 @@ mod tests {
                                    "reason": "node \"n4\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi)" } ] }
                 ] }),
             ),
+            ("GET", "/api/v1/cpu/models?arch=aarch64") => (
+                200,
+                json!({ "arch": "aarch64", "nodes": 1, "models": [
+                    { "name": "cluster", "kind": "cluster", "usable": 1 }
+                ] }),
+            ),
             ("GET", "/api/v1/cpu/flags") => (
                 200,
                 json!({ "arch": "x86_64", "nodes": 2, "flags": [
@@ -638,6 +646,18 @@ mod tests {
              host               basic    1/1\n\
              cluster            cluster  1/1    now Skylake-Server-v5\n\
              Icelake-Server-v7  qemu     0/1    missing avx512vbmi\n"
+        );
+        // 기준이 없으면 `current`가 없다(리뷰 1 웹 #1).
+        let text = run(CpuCmd::Models {
+            arch: Some("aarch64".into()),
+            node: None,
+            usable: false,
+        })
+        .await;
+        assert_eq!(
+            text,
+            "MODEL    KIND     NODES  NOTE\n\
+             cluster  cluster  1/1    no baseline: runs as host\n"
         );
         let text = run(CpuCmd::Flags { arch: None }).await;
         assert_eq!(

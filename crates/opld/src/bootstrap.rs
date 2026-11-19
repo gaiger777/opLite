@@ -211,6 +211,11 @@ async fn record_node(
     let memory_mib = crate::host::memory_mib();
     // 다른 노드가 모두 `cpu-models`를 알 때만 CPU 탐침 결과를 쓴다(계획 63 §12).
     let cpu_ready = crate::cpu::cpu_models_ready(cluster, &config.name);
+    // 해시보다 카탈로그를 먼저 만든다(검사기와 같은 차례) — 리더가 그 사이에 기준을 셈하면 이 노드가 빠져 기준이
+    // 올랐다 내려온다(리뷰 1 I1).
+    if cpu_ready && let Some(crate::cpu::Probed::Ok { catalog, cpu }) = &host.cpu {
+        crate::cpu::publish(cluster, &cpu.catalog, catalog).await;
+    }
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
         *status = NodeStatus {
@@ -724,6 +729,14 @@ pub(crate) mod tests {
         host.cpu = Some(ok.clone());
         register_node(&cluster, &config, &host).await.unwrap();
         assert_eq!(cpu(), Some(ok.node_cpu(None)));
+        // 해시가 가리키는 카탈로그는 해시와 함께 이미 있다(리뷰 1 I1 — 검사기 회차를 기다리지 않는다).
+        let hash = ok.node_cpu(None).catalog;
+        assert!(
+            cluster
+                .get_by_name::<opl_types::cpu::CpuCatalogSpec>(&hash)
+                .unwrap()
+                .is_some()
+        );
         host.cpu = Some(Probed::new(
             Err(opl_driver::DriverError::CpuProbe("gone".into())),
             "kvm",

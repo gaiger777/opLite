@@ -642,10 +642,16 @@ fn cpu_changes(
     steps: &mut Vec<Step>,
     pending: &mut Vec<PendingChange>,
 ) {
-    // 토폴로지·모델·플래그(계획 63)와 해석(기준·숨김 목록)은 켤 때만 정해진다.
-    if let Some(p) = crate::cpu::pending_change(&spec.cpu, hw, wanted) {
+    // 토폴로지·모델·플래그(계획 63)는 켤 때만 정해진다 — vCPU를 따로 보지 않는다.
+    if let Some(p) = crate::cpu::pending_change(&spec.cpu, hw, None) {
         pending.push(p);
         return;
+    }
+    // 해석(기준·숨김 목록)만 바뀌었으면 보류를 두되 vCPU는 그대로 본다(리뷰 1 M1 — 늘린 vCPU의 문제를 가리지 않게).
+    if wanted.is_some()
+        && let Some(p) = crate::cpu::pending_change(&spec.cpu, hw, wanted)
+    {
+        pending.push(p);
     }
     let boot = hw.boot_vcpus();
     let now = hw.vcpus();
@@ -1456,6 +1462,13 @@ mod tests {
         assert!(pending(VM, "web", &spec(), &hw, ALL, &[], Some(&now)).is_empty());
         // 문맥이 없으면 스펙만 견준다.
         assert!(pending(VM, "web", &spec(), &hw, ALL, &[], None).is_empty());
+        // 해석만 바뀐 보류는 vCPU 문제를 가리지 않는다(리뷰 1 M1).
+        let mut more = spec();
+        more.cpu.cores = hw.cpu.max() as u16 + 1;
+        let out = pending(VM, "web", &more, &hw, ALL, &[], Some(&masked));
+        let fields: Vec<&str> = out.iter().map(|p| p.field.as_str()).collect();
+        assert_eq!(fields, ["cpu", "vcpus"]);
+        assert_eq!(out[1].reason, PendingReason::Limit);
     }
 
     /// 게스트가 아직 내려 주지 않은 장치는 스펙의 같은 장치와 같지 않은 것으로 본다: 떼기를 먼저 마저 하고 스펙에

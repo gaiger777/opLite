@@ -1554,6 +1554,32 @@ pub(crate) fn pick(
             node_fits(&vm.spec, inv, n).is_ok()
         }
     };
+    pick_by(vm, inv, assign, eligible, scorer, replicas, fits_on)
+}
+
+/// [`pick`]과 같되 도는 VM을 라이브 마이그레이션으로 옮길 곳이다(HA 검사의 옮기기): 복제본이 있는 노드도 받고 CPU는
+/// 켤 때 기록한 것으로 본다([`replica_migration_fits`] — 리뷰 1 I3). 스펙을 새로 해석하면 보류 CPU 바뀜이 있는 VM이
+/// 옮길 곳을 잃는다.
+pub(crate) fn pick_live(
+    vm: &Vm,
+    inv: &Inventory,
+    assign: &Assign,
+    eligible: impl Fn(&Node) -> bool,
+    scorer: &Scorer,
+) -> Pick {
+    let fits_on = |n: &Node| replica_migration_fits(vm, inv, n).is_ok();
+    pick_by(vm, inv, assign, eligible, scorer, true, fits_on)
+}
+
+fn pick_by(
+    vm: &Vm,
+    inv: &Inventory,
+    assign: &Assign,
+    eligible: impl Fn(&Node) -> bool,
+    scorer: &Scorer,
+    replicas: bool,
+    fits_on: impl Fn(&Node) -> bool,
+) -> Pick {
     let fits: Vec<&Node> = inv
         .nodes
         .iter()

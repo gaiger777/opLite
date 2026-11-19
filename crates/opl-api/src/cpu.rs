@@ -388,7 +388,8 @@ pub struct VmCpuInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub pending: Option<PendingChange>,
-    /// 이 아키텍처의 노드마다(이름순): 도는 VM은 옮길 수 있는지(기록한 CPU), 꺼진 VM은 켤 수 있는지(스펙)
+    /// 이 아키텍처의 노드마다(이름순): 도는 VM은 옮길 수 있는지(기록한 CPU), 꺼진 VM은 켤 수 있는지(스펙). 루트
+    /// `cluster.read`가 없으면 비어 있다(노드 이름을 보이지 않는다).
     pub nodes: Vec<CpuNodeFit>,
 }
 
@@ -400,11 +401,16 @@ pub struct VmCpuInfo {
     responses((status = 200, body = VmCpuInfo), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_vm_cpu(
     State(state): State<Arc<AppState>>,
+    principal: Principal,
     Path(key): Path<String>,
 ) -> Result<Json<VmCpuInfo>, ApiError> {
     let vm: Vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let inv = Inventory::load(&state.cluster)?;
-    Ok(Json(vm_cpu_info(&inv, &vm)))
+    let mut info = vm_cpu_info(&inv, &vm);
+    if !sees_node_names(&state, &principal) {
+        info.nodes.clear();
+    }
+    Ok(Json(info))
 }
 
 fn vm_cpu_info(inv: &Inventory, vm: &Vm) -> VmCpuInfo {
@@ -675,7 +681,8 @@ pub struct CpuModelEntry {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(default)]
     pub deprecated: bool,
-    /// `cluster`: 지금 기준(`Skylake-Server-v5 +pcid`, 없으면 `host`처럼 켠다)
+    /// `cluster`: 지금 기준(`Skylake-Server-v5 +pcid`). 기준이 없으면(off, 업그레이드 중) 없다 — 그때 `cluster`는
+    /// `host`처럼 켠다.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub current: Option<String>,
@@ -716,12 +723,16 @@ fn pick_arch(inv: &Inventory, arch: Option<Arch>) -> Result<Arch, ApiError> {
     }
 }
 
-/// 노드 이름을 보일 수 있는지(루트 `cluster.read`). 없으면 VM을 만들거나 고칠 수 있어야 모델 목록을 본다.
-fn sees_nodes(state: &AppState, principal: &Principal) -> Result<bool, ApiError> {
-    if state
+/// 노드 이름을 보일 수 있는지(루트 `cluster.read`). VM 응답·오류의 노드마다 내용도 이 규칙을 따른다(리뷰 1 M2).
+pub(crate) fn sees_node_names(state: &AppState, principal: &Principal) -> bool {
+    state
         .authorize(principal, Action::Read, NodeSpec::KIND)
         .is_ok()
-    {
+}
+
+/// 노드 이름을 보일 수 있는지(루트 `cluster.read`). 없으면 VM을 만들거나 고칠 수 있어야 모델 목록을 본다.
+fn sees_nodes(state: &AppState, principal: &Principal) -> Result<bool, ApiError> {
+    if sees_node_names(state, principal) {
         return Ok(true);
     }
     state
@@ -747,6 +758,10 @@ pub async fn list_cpu_models(
     let arch = pick_arch(&inv, q.arch)?;
     let mut nodes = arch_nodes(&inv, arch);
     if let Some(key) = &q.node {
+        // 노드 이름을 볼 수 없으면 노드로 거를 수도 없다(404·200으로 노드가 있는지 드러나지 않게, 리뷰 1 M2).
+        if !show {
+            return Err(ApiError::forbidden());
+        }
         let node = lookup::<NodeSpec>(&state.cluster, key)?;
         nodes.retain(|n| n.id == node.id);
     }
@@ -776,11 +791,8 @@ fn cpu_models(inv: &Inventory, arch: Arch, nodes: &[&Node]) -> CpuModels {
         entries.push((entry(m.as_str(), CpuModelKind::Basic), m));
     }
     let mut cluster = entry("cluster", CpuModelKind::Cluster);
-    cluster.current = Some(
-        inv.cpu_baselines
-            .get(&arch)
-            .map_or_else(|| "host".to_string(), Baseline::describe),
-    );
+    // 기준이 없을 때 `host`를 적으면 기준이 있는 것과 구별되지 않는다(웹이 새 VM을 `cluster`로 두는 기준, 리뷰 1 웹 #1).
+    cluster.current = inv.cpu_baselines.get(&arch).map(Baseline::describe);
     entries.push((cluster, CpuModel::Cluster));
     if arch == Arch::X86_64 {
         for l in X86Level::ALL.into_iter().rev() {

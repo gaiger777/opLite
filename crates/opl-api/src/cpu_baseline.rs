@@ -151,6 +151,18 @@ pub(crate) async fn record(state: &AppState) {
     }
 }
 
+/// 어떤 노드가 알린 카탈로그 해시의 리소스가 아직 없는지(순수). 노드는 카탈로그를 먼저 만들고 해시를 쓰지만, 정리
+/// 작업이 같은 때 오래된 같은 해시를 지웠으면 잠깐 없다. 그동안 셈하면 그 노드가 빠져 기준이 올랐다 내려온다(리뷰 1
+/// I1) — 앞 기록을 그대로 두고 다음 tick에 셈한다.
+fn catalog_missing(nodes: &[Node], catalogs: &BTreeMap<String, CpuCatalogSpec>) -> bool {
+    nodes.iter().filter(|n| !n.spec.witness).any(|n| {
+        n.status
+            .cpu
+            .as_ref()
+            .is_some_and(|c| !c.catalog.is_empty() && !catalogs.contains_key(&c.catalog))
+    })
+}
+
 async fn try_record(state: &AppState) -> Result<(), ClusterError> {
     let cluster: &Cluster = &state.cluster;
     let (_, nodes) = cluster.list::<NodeSpec>()?;
@@ -166,6 +178,9 @@ async fn try_record(state: &AppState) -> Result<(), ClusterError> {
         .into_iter()
         .map(|c| (c.name, c.spec))
         .collect();
+    if catalog_missing(&nodes, &catalogs) {
+        return Ok(());
+    }
     let settings = crate::settings::current(cluster)?
         .spec
         .cpu
@@ -241,6 +256,39 @@ mod tests {
             previous: None,
             warnings: vec![],
         }
+    }
+
+    #[test]
+    fn a_node_whose_announced_catalog_is_not_there_yet_holds_the_baseline() {
+        let node = |name: &str, hash: Option<&str>, witness: bool| {
+            let mut n: Node = Resource::new(
+                name,
+                opl_types::node::NodeSpec {
+                    address: format!("{name}:8006"),
+                    maintenance: false,
+                    witness,
+                    roles: None,
+                },
+            );
+            n.status.cpu = hash.map(|h| cpu::NodeCpu {
+                catalog: h.into(),
+                ..Default::default()
+            });
+            n
+        };
+        let catalogs = BTreeMap::from([("h1".to_string(), opl_driver::mock_cpu_probe().catalog)]);
+        let ok = vec![
+            node("n1", Some("h1"), false),
+            node("n2", None, false),
+            node("n3", Some(""), false),
+        ];
+        assert!(!catalog_missing(&ok, &catalogs));
+        let mut gap = ok.clone();
+        gap.push(node("n4", Some("h2"), false));
+        assert!(catalog_missing(&gap, &catalogs));
+        let mut witness = ok;
+        witness.push(node("w", Some("h2"), true));
+        assert!(!catalog_missing(&witness, &catalogs));
     }
 
     #[test]

@@ -312,7 +312,36 @@ async fn cpu_views_show_what_each_node_can_run() {
     };
     assert_eq!(entry("Icelake-Server-v7")["usable"], 1);
     assert_eq!(entry("Skylake-Server-v5")["usable"], 2);
-    assert_eq!(entry("cluster")["current"], "host");
+    // 기준이 없으면 `current`가 없다(`host`라 적으면 기준이 있는 것과 구별되지 않는다 — 리뷰 1 웹 #1).
+    assert!(entry("cluster").get("current").is_none(), "{body}");
+    let info = env.cluster.list::<ClusterSpec>().unwrap().1.remove(0);
+    let mut status = info.status.clone();
+    status.cpu_baselines.insert(
+        Arch::X86_64,
+        Baseline {
+            model: "Skylake-Server-v5".into(),
+            flags: Default::default(),
+            mode: BaselineSource::Pinned,
+            nodes: vec![],
+            limited_by: vec![],
+            since: 1,
+            previous: None,
+            warnings: vec![],
+        },
+    );
+    env.cluster
+        .update_status::<ClusterSpec>(info.id, &status)
+        .await
+        .unwrap();
+    let (_, now) = admin.get("/cpu/models?arch=x86_64").await;
+    let cluster = now["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["name"] == "cluster")
+        .unwrap()
+        .clone();
+    assert_eq!(cluster["current"], "Skylake-Server-v5", "{now}");
     assert_eq!(entry("host")["usable"], 2);
     let (_, usable) = admin
         .get("/cpu/models?arch=x86_64&node=n4&usable=true")
@@ -835,6 +864,38 @@ async fn a_weaker_node_lowers_the_auto_baseline_and_running_vms_avoid_it() {
     janitor.shutdown().await;
 }
 
+/// 리뷰 1 I2: 껐다 켜기(reboot)는 같은 노드에서 새 CPU로 켠다. 그 노드가 켤 수 없으면 끄기 전에 409다.
+#[tokio::test]
+async fn a_power_cycle_is_refused_when_the_node_cannot_run_the_new_cpu() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (strong, weak) = add_catalogs(&env).await;
+    let n1 = add_x86_node(&env, "n1", &strong).await;
+    let n4 = add_x86_node(&env, "n4", &weak).await;
+    // 둘 다 Skylake로 돌다가 스펙을 Icelake로 바꿨다(보류 cpu).
+    for (name, node) in [("weak", n4), ("strong", n1)] {
+        running_vm(
+            &env,
+            name,
+            node,
+            "Icelake-Server-v7",
+            resolved("Skylake-Server-v5", CpuSource::Spec),
+        )
+        .await;
+    }
+    let (status, body) = admin.post("/vms/weak/actions/reboot", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "no_capacity", "{body}");
+    assert_eq!(
+        body["message"],
+        "node \"n4\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi); migrate VM \"weak\" to a node that can run its CPU, then power cycle it"
+    );
+    let weak_vm = env.cluster.get_by_name::<VmSpec>("weak").unwrap().unwrap();
+    assert_eq!(weak_vm.spec.power, PowerState::Running);
+    let (status, body) = admin.post("/vms/strong/actions/reboot", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
 /// 업그레이드 중(옛 노드 하나)에는 리더가 기준을 셈하지도 쓰지도 않는다.
 #[tokio::test]
 async fn the_leader_does_not_record_a_baseline_during_an_upgrade() {
@@ -862,4 +923,49 @@ async fn the_leader_does_not_record_a_baseline_during_an_upgrade() {
     assert!(info.status.cpu_baselines.is_empty());
     assert!(baseline_records(&env).is_empty());
     janitor.shutdown().await;
+}
+
+/// 리뷰 1 웹 #1: 업그레이드 중에는 기록된 기준이 있어도 `cluster`의 `current`가 없다(웹이 새 VM을 `cluster`로 두지 않게 —
+/// 그때 `host`·`max` 밖의 모델은 409 `cluster_upgrading`이다).
+#[tokio::test]
+async fn the_cluster_entry_has_no_current_baseline_during_an_upgrade() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (strong, _) = add_catalogs(&env).await;
+    add_x86_node(&env, "n1", &strong).await;
+    let info = env.cluster.list::<ClusterSpec>().unwrap().1.remove(0);
+    let mut status = info.status.clone();
+    status.cpu_baselines.insert(
+        Arch::X86_64,
+        Baseline {
+            model: "Skylake-Server-v5".into(),
+            flags: Default::default(),
+            mode: BaselineSource::Pinned,
+            nodes: vec![],
+            limited_by: vec![],
+            since: 1,
+            previous: None,
+            warnings: vec![],
+        },
+    );
+    env.cluster
+        .update_status::<ClusterSpec>(info.id, &status)
+        .await
+        .unwrap();
+    let current = |body: &serde_json::Value| {
+        body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == "cluster")
+            .unwrap()
+            .get("current")
+            .cloned()
+    };
+    let (_, body) = admin.get("/cpu/models?arch=x86_64").await;
+    assert_eq!(current(&body), Some(json!("Skylake-Server-v5")), "{body}");
+    drop_cpu_models(&env).await;
+    let (status, body) = admin.get("/cpu/models?arch=x86_64").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(current(&body), None, "{body}");
 }
