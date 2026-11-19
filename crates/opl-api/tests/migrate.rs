@@ -31,6 +31,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         },
     );
     node.status = NodeStatus {
+        cpu: None,
         online: true,
         cpus: 4,
         memory_mib: 8192,

@@ -173,6 +173,7 @@ impl Env {
         );
         me.id = node;
         me.status = NodeStatus {
+            cpu: None,
             online: true,
             cpus: 4,
             memory_mib: 8192,

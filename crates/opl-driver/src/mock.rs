@@ -2328,6 +2328,7 @@ mod tests {
             id: Uuid::now_v7(),
             name: "t".into(),
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 1,
                 model: CpuModel::Host,
@@ -3510,6 +3511,7 @@ mod tests {
     fn hot_spec() -> VmRuntimeSpec {
         VmRuntimeSpec {
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 2,
                 model: CpuModel::Max,

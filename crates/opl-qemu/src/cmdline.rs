@@ -77,9 +77,10 @@ pub fn build_cmdline(
         "-machine",
         format!("{machine}{smm_opt},accel={}", host.accel.as_str()),
     );
-    let cpu = match (spec.cpu.model, host.accel) {
-        (CpuModel::Host, Accel::Tcg) | (CpuModel::Max, _) => "max",
-        (CpuModel::Host, _) => "host",
+    // 계획 63 스테이지 3 전: 그 밖의 모델은 기능 게이트와 API 검증에 막혀 오지 않는다(오면 `host`처럼 켠다).
+    let cpu = match (&spec.cpu.model, host.accel) {
+        (CpuModel::Max, _) | (_, Accel::Tcg) => "max",
+        _ => "host",
     };
     a.opt("-cpu", cpu.to_string());
     let layout = spec.hotplug.as_ref();
@@ -562,6 +563,7 @@ mod tests {
             id: Uuid::nil(),
             name: "web-01".into(),
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 4,
                 model: CpuModel::Host,

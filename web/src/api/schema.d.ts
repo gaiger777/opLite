@@ -3524,6 +3524,11 @@ export interface components {
              */
             uefi_vars: boolean;
         };
+        /**
+         * @description 클러스터 기준 자동 셈
+         * @enum {string}
+         */
+        BaselineMode: "off" | "auto";
         /** @description 본딩 포트 하나 */
         BondPort: {
             /**
@@ -4057,11 +4062,39 @@ export interface components {
             /** @description 첫 줄에 `off`나 `on`을 찍는다(그 밖은 모름). */
             status: string;
         };
-        /** @enum {string} */
-        CpuModel: "host" | "max";
+        /**
+         * @description '+name' turns a CPU flag on, '-name' hides it
+         * @example -avx512vbmi
+         */
+        CpuFlag: string;
+        /**
+         * @description host, max, cluster, x86-64-v2, x86-64-v2-aes, x86-64-v3, x86-64-v4, or a versioned QEMU model (e.g. Icelake-Server-v7)
+         * @example host
+         */
+        CpuModel: string;
+        /** @description 설정 `cpu`(계획 63) */
+        CpuSettings: {
+            /**
+             * @description auto 기준에 모든 노드가 주는 플래그를 더한다.
+             * @default true
+             */
+            auto_flags: boolean;
+            baseline?: components["schemas"]["BaselineMode"];
+            /** @description 모든 VM(`host` 포함)에서 숨길 플래그(API가 `normalize_mask`로 맞춰 저장) */
+            mask?: string[];
+            /** @description 아키텍처마다 고정한 기준. 있는 아키텍처는 auto 대신 이것이다(`baseline`이 off여도). */
+            pinned?: components["schemas"]["PinnedBaseline"][];
+        };
+        /**
+         * @description 해석된 CPU가 어디서 왔나
+         * @enum {string}
+         */
+        CpuSource: "spec" | "cluster";
         CpuSpec: {
             /** Format: int32 */
             cores: number;
+            /** @description 켜고 끌 CPU 플래그(계획 63, `"+aes"`·`"-avx512vbmi"`). 비면 쓰지 않아 옛 노드도 VM을 계속 푼다. */
+            flags?: components["schemas"]["CpuFlag"][];
             /**
              * Format: int32
              * @description vCPU 핫플러그 상한(계획 54). 없으면 `sockets × cores`와 같다(핫플러그 꺼짐). 실행 중에는 `cores`를 이 안에서
@@ -5397,7 +5430,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog";
         /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
         LdapRealm: {
             /** @description 사용자를 찾을 기준 DN(subtree) */
@@ -5985,6 +6018,11 @@ export interface components {
                      *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
                      */
                     cluster_addresses?: string[];
+                    /**
+                     * @description 이 노드의 QEMU CPU 카탈로그(계획 63: 해시와 QEMU·가속기·호스트 CPU). 노드가 시작할 때와 QEMU가 바뀔 때 쓴다.
+                     *     없으면(옛 노드·위트니스) `host`·`max`만 켤 수 있다. 옛 노드는 이 필드를 무시한다.
+                     */
+                    cpu?: components["schemas"]["NodeCpu"];
                     /**
                      * Format: int32
                      * @default 0
@@ -6760,6 +6798,45 @@ export interface components {
             /** Format: int64 */
             witness: number;
         };
+        /** @description 노드가 알리는 CPU(약 250바이트). 카탈로그 본문은 해시 이름의 [`CpuCatalog`] 리소스다. */
+        NodeCpu: {
+            /**
+             * @description `kvm`·`hvf`·`tcg`
+             * @default
+             */
+            accel: string;
+            /**
+             * @description 카탈로그 리소스 이름(SHA-256 hex). 아직 읽지 못했으면 비어 있다.
+             * @default
+             */
+            catalog: string;
+            /**
+             * @description 마지막 읽기가 실패한 까닭. 앞 카탈로그는 그대로 둔다.
+             * @default null
+             */
+            error: string;
+            /**
+             * @description 호스트 CPU 이름(`model-id`)
+             * @default null
+             */
+            model_id: string;
+            /**
+             * Format: int64
+             * @description 읽은 시각(유닉스 초)
+             * @default 0
+             */
+            probed_at: number;
+            /**
+             * @description QEMU 버전
+             * @default
+             */
+            qemu: string;
+            /**
+             * @description 호스트 CPU 벤더(`GenuineIntel`·`AuthenticAMD`). TCG·aarch64는 없을 수 있다.
+             * @default null
+             */
+            vendor: string;
+        };
         /** @description 노드의 디스크 하나(`lsblk`의 최상위 디스크)와 OSD로 쓸 수 있는지 */
         NodeDisk: components["schemas"]["DiskState"] & {
             /** @description `/dev/disk/by-id/…`(재부팅해도 같은 디스크) */
@@ -6971,6 +7048,11 @@ export interface components {
              *     쓴다(옛 노드는 비어 있다). 리더가 Raft 멤버십의 링크를 이것에 맞춘다.
              */
             cluster_addresses?: string[];
+            /**
+             * @description 이 노드의 QEMU CPU 카탈로그(계획 63: 해시와 QEMU·가속기·호스트 CPU). 노드가 시작할 때와 QEMU가 바뀔 때 쓴다.
+             *     없으면(옛 노드·위트니스) `host`·`max`만 켤 수 있다. 옛 노드는 이 필드를 무시한다.
+             */
+            cpu?: components["schemas"]["NodeCpu"];
             /**
              * Format: int32
              * @default 0
@@ -7277,6 +7359,13 @@ export interface components {
              * @default 0
              */
             total: number;
+        };
+        /** @description 아키텍처 하나의 고정 기준 */
+        PinnedBaseline: {
+            arch: components["schemas"]["Arch"];
+            flags?: components["schemas"]["CpuFlag"][];
+            /** @description `cluster`·`host`·`max`는 안 된다. */
+            model: components["schemas"]["CpuModel"];
         };
         /**
          * @description 균형 조정기의 동작
@@ -7947,6 +8036,21 @@ export interface components {
              */
             size_bytes: number;
         };
+        /**
+         * @description 켤 때 실제로 쓴 CPU: QEMU `-cpu <model>[,enforce][,<flag>=on|off]…`. `RunningHardware.cpu_resolved`에 기록하고
+         *     받는 쪽 마이그레이션은 이것을 그대로 쓴다.
+         */
+        ResolvedCpu: {
+            /** @description 가속기가 못 주는 기능이 있으면 켜지 않는다(명명 모델·수준). */
+            enforce?: boolean;
+            /** @description 켜고(참) 끈(거짓) 플래그 */
+            flags?: {
+                [key: string]: boolean;
+            };
+            /** @description QEMU `-cpu` 모델 이름(`host`, `max`, `qemu64-v1`, `Icelake-Server-v7` …) */
+            model: string;
+            source?: components["schemas"]["CpuSource"];
+        };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource: {
             /** Format: uuid */
@@ -8387,6 +8491,11 @@ export interface components {
                  */
                 cluster_addresses?: string[];
                 /**
+                 * @description 이 노드의 QEMU CPU 카탈로그(계획 63: 해시와 QEMU·가속기·호스트 CPU). 노드가 시작할 때와 QEMU가 바뀔 때 쓴다.
+                 *     없으면(옛 노드·위트니스) `host`·`max`만 켤 수 있다. 옛 노드는 이 필드를 무시한다.
+                 */
+                cpu?: components["schemas"]["NodeCpu"];
+                /**
                  * Format: int32
                  * @default 0
                  */
@@ -8547,6 +8656,11 @@ export interface components {
                  *     비어 있으면 쓰지 않는다.
                  */
                 api_names?: string[];
+                /**
+                 * @description 게스트 CPU 클러스터 기준과 숨김 목록(계획 63). 없으면 기준 없음·숨김 없음이고 쓰지 않아 옛 노드도 설정을 계속
+                 *     푼다.
+                 */
+                cpu?: components["schemas"]["CpuSettings"];
                 /** @description HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다. */
                 ha_reserve?: components["schemas"]["HaReserve"];
                 /**
@@ -9057,6 +9171,11 @@ export interface components {
             cloud_init?: string;
             /** @description 켤 때의 토폴로지·모델·상한. 노드가 CPU 핫플러그를 못 하거나 핫플러그 배치 없이 켰으면 `max_vcpus`가 없다. */
             cpu: components["schemas"]["CpuSpec"];
+            /**
+             * @description 켤 때 실제로 쓴 CPU(계획 63: 해석된 모델·플래그). 없으면 계획 63 전 기록 = `cpu.model`대로 `host`·`max`로
+             *     켰다. 받는 쪽 마이그레이션은 이것을 그대로 쓴다. 옛 노드는 이 필드를 무시한다.
+             */
+            cpu_resolved?: components["schemas"]["ResolvedCpu"];
             /** @description 지금 QEMU에 붙은 디스크(순번 = QEMU의 `disk{i}`). 실행 중 붙이고 떼기를 스펙과 견준다. */
             disks?: components["schemas"]["DiskSpec"][];
             firmware: components["schemas"]["Firmware"];
@@ -9199,6 +9318,11 @@ export interface components {
              *     비어 있으면 쓰지 않는다.
              */
             api_names?: string[];
+            /**
+             * @description 게스트 CPU 클러스터 기준과 숨김 목록(계획 63). 없으면 기준 없음·숨김 없음이고 쓰지 않아 옛 노드도 설정을 계속
+             *     푼다.
+             */
+            cpu?: components["schemas"]["CpuSettings"];
             /** @description HA 복구를 위해 비워 두는 용량. 없으면 예약하지 않고(`none`), 쓰지 않아 옛 노드도 설정을 계속 푼다. */
             ha_reserve?: components["schemas"]["HaReserve"];
             /**

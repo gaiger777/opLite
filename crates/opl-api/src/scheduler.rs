@@ -477,6 +477,7 @@ mod tests {
             },
         );
         n.status = NodeStatus {
+            cpu: None,
             online: true,
             cpus: 4,
             memory_mib,
@@ -545,6 +546,7 @@ mod tests {
     fn spec(memory_mib: u32, node: Option<Uuid>, power: PowerState) -> VmSpec {
         VmSpec {
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 1,
                 model: Default::default(),

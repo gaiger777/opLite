@@ -41,6 +41,7 @@ fn spec(host: &HostProfile, id: Uuid, disk: PathBuf, layout: HotplugLayout) -> V
         id,
         name: "it-hotplug".into(),
         cpu: CpuSpec {
+            flags: Vec::new(),
             sockets: 1,
             cores: 1,
             model: CpuModel::Host,

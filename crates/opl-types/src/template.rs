@@ -231,6 +231,7 @@ impl TemplateDraft {
                 sockets: 1,
                 cores: self.vcpus,
                 model: CpuModel::default(),
+                flags: Vec::new(),
                 max_vcpus: None,
             },
             memory_mib: self.memory_mib,

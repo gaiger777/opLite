@@ -678,6 +678,7 @@ async fn write_observers(
     observers: BTreeMap<NodeId, OrbNode>,
 ) -> Result<u64, ClusterError> {
     let status = ClusterStatus {
+        cpu_baselines: BTreeMap::new(),
         observers: observers
             .iter()
             .map(|(id, node)| (id.0, node.addr().to_string()))

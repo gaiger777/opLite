@@ -23,6 +23,7 @@ fn spec(id: Uuid, disk: PathBuf) -> VmRuntimeSpec {
         id,
         name: "it-vm".into(),
         cpu: CpuSpec {
+            flags: Vec::new(),
             sockets: 1,
             cores: 1,
             model: CpuModel::Host,

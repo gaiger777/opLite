@@ -4,6 +4,7 @@ use std::net::IpAddr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cpu::NodeCpu;
 use crate::ha_check::{CheckReport, CheckState};
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::vm::Arch;
@@ -141,6 +142,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub firmware_caps: Option<FirmwareCaps>,
+    /// 이 노드의 QEMU CPU 카탈로그(계획 63: 해시와 QEMU·가속기·호스트 CPU). 노드가 시작할 때와 QEMU가 바뀔 때 쓴다.
+    /// 없으면(옛 노드·위트니스) `host`·`max`만 켤 수 있다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu: Option<NodeCpu>,
 }
 
 /// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
@@ -366,6 +372,7 @@ pub const FEATURES: &[&str] = &[
     NOTIFICATIONS,
     FOLDERS,
     TWO_FACTOR,
+    CPU_MODELS,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -423,6 +430,11 @@ pub const FOLDERS: &str = "folders";
 /// 2단계 인증(계획 62): 종류 `TwoFactor`, 세션 `pending`, 설정 `two_factor`. 모든 노드가 알릴 때만 쓴다(옛 노드가
 /// 대기 세션을 정식 세션으로 받지 않게).
 pub const TWO_FACTOR: &str = "two-factor";
+
+/// 게스트 CPU 모델(계획 63): `host`·`max`가 아니거나 플래그가 있는 VM `cpu`, 설정 `cpu`, 종류 `CpuCatalog`,
+/// `ClusterStatus.cpu_baselines`, Task `cpu-baseline`·`node-cpu-probe`. 옛 노드는 새 모델 문자열·`flags`가 든 VM을
+/// 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
+pub const CPU_MODELS: &str = "cpu-models";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -904,7 +916,8 @@ mod tests {
                 "metrics-history",
                 "notifications",
                 "folders",
-                "two-factor"
+                "two-factor",
+                "cpu-models"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);

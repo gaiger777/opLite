@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
+use crate::cpu::CpuSettings;
 use crate::image_catalog::CatalogImage;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::two_factor::TwoFactorPolicy;
@@ -82,6 +83,11 @@ pub struct SettingsSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub two_factor: Option<TwoFactorPolicy>,
+    /// 게스트 CPU 클러스터 기준과 숨김 목록(계획 63). 없으면 기준 없음·숨김 없음이고 쓰지 않아 옛 노드도 설정을 계속
+    /// 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu: Option<CpuSettings>,
 }
 
 /// Prometheus 끝점 설정
@@ -428,6 +434,7 @@ mod tests {
             image_catalog: vec![],
             prometheus: None,
             two_factor: None,
+            cpu: None,
         };
         assert_eq!(
             serde_json::to_value(&spec).unwrap(),

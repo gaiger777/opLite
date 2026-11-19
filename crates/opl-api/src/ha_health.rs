@@ -1259,6 +1259,7 @@ mod tests {
             name,
             VmSpec {
                 cpu: CpuSpec {
+                    flags: Vec::new(),
                     sockets: 1,
                     cores: 1,
                     model: Default::default(),

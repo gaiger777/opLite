@@ -205,3 +205,19 @@
 7. **docs: README·가이드 "CPU 모델과 플래그"·"클러스터 CPU 기준"·"취약점 때문에 CPU 기능 숨기기", 설계 문서 스테이지 보고, 계획 63 실행 기록** — `docs/guide/vms.md`·`cluster.md`·`web-ui.md`, `docs/index.md`.
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
+
+### 스테이지 1 (opl-types)
+
+- **`x86-64-v*` 정의를 Proxmox와 대조했다**(qemu-server `src/PVE/QemuServer/CPUConfig.pm`, GitHub 미러 커밋 `13007a1`, 2026-11-05). Proxmox는 모든 수준에 `+pni`를 넣는다(`qemu64`에 이미 있지만 같은 명령줄을 위해 그대로 둔다). §5의 목록에는 `pni`가 빠져 있었다. 나머지는 같다. Proxmox는 `-cpu qemu64`(버전 없음)이고 우리는 §8대로 `qemu64-v1`이다. Proxmox의 이름 `x86-64-v2-AES`도 받는다(수준·`host`·`max`·`cluster`는 대소문자를 가리지 않고 소문자로 저장).
+- **`resolve`에 `catalog: Option<&CpuCatalogSpec>`를 더했다.** "숨김 이름이 그 아키텍처 카탈로그에 없으면 건너뛴다"를 하려면 켜는 노드의 카탈로그가 있어야 한다. 카탈로그가 없으면(탐침 실패) 숨김 목록을 모두 끈다 — 숨기기가 목적이라, 모르는 이름 때문에 켜기가 실패하는 편이 조용히 드러내는 것보다 낫다.
+- **`Accel`을 opl-types(`cpu::Accel`)에 새로 두었다.** opl-qemu의 `Accel`은 그대로이고 스테이지 3이 잇는다. `NodeCpu.accel`·`CpuCatalogSpec.accel`은 설계대로 문자열이다(모르는 값이 와도 `NodeStatus`를 풀게).
+- **`pinned`는 `baseline: off`여도 쓴다.** "pinned에 있는 아키텍처는 auto 대신"이라 했으나 off일 때를 말하지 않았다. 관리자가 고정한 것은 쓰는 것으로 했다. off는 auto 셈만 끈다.
+- **`Baseline.previous`는 튜플 대신 `PreviousBaseline { model, flags }`**(JSON이 배열이 아니라 객체). `Baseline`에 `same_cpu`·`describe`를 두었다. `baseline()`은 `since`·`previous`를 비워 돌려주고 리더(스테이지 4)가 채운다.
+- **auto의 `limited_by`**: "그 노드를 빼면 더 좋은 후보가 고를 수 있게 되는 노드"로 셈한다(벤더 섞임·TCG 노드도 원인으로 잡힌다). 후보는 노드마다 한 번만 `can_run`해 노드 100대에도 가볍다.
+- **플래그 이름 맞추기**에 QEMU의 옛 별칭 `sse4-1`·`sse4-2` → `sse4.1`·`sse4.2`를 더했다(`_` → `-`만 하면 `sse4_1`이 `sse4-1`이 되어 카탈로그 이름과 어긋난다).
+- **보류 `cpu`**: 순수 함수 `cpu::pending_change(spec, hw, wanted)`. 핫플러그 계획(`hotplug::plan`·`pending`)은 해석 문맥이 없어 `wanted = None`으로 부른다(스펙의 소켓·모델·플래그만 견줌). 이제 `cpu` 보류에는 늘 `detail`(바뀐 것 + "power cycle required; …")이 붙는다.
+- **`CpuCatalogSpec`은 `deny_unknown_fields`가 아니다**(뒤 버전이 칸을 더해도 같은 기능의 노드가 읽게). `CatalogModel.migration_safe`는 기본 거짓, `deprecated`는 거짓이면 쓰지 않는다.
+- **`CpuModel`·`CpuFlag`의 API 문서 스키마는 문자열**(손으로 적음). `schema.d.ts`에서 `cpu.model`이 `"host" | "max"` 대신 `string`이 된다.
+- **명령줄(스테이지 3 전 임시)**: `cmdline.rs`는 `host`·`max` 밖의 모델을 `host`처럼 켠다(API가 막아 오지 않는다). `opld` 등록은 `NodeStatus.cpu`를 지우지 않고 둔다.
+- **임시 API 막기**: 타입이 새 모델 문자열·`flags`를 풀게 되었으므로 `vms.rs` `prepare`가 `host`·`max` 밖이나 플래그가 있으면 `require_feature(CPU_MODELS)`(409) 뒤 400으로 거절한다(`tests/cpu_models.rs`). 스테이지 5가 이 400을 검증·별칭 고정으로 바꾼다.
+- `schema.d.ts`를 다시 만들었다. 이 브랜치의 기준(`e04f9a8`)이 main의 `f83a523`(풀 설명 바뀜) 전이라 그 차이도 함께 들어갔다.

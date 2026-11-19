@@ -4201,6 +4201,7 @@ mod tests {
             id: Uuid::now_v7(),
             name: "t".into(),
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 1,
                 model: CpuModel::Host,
@@ -8119,6 +8120,7 @@ time.sleep(60)
     /// 소켓 2개, 켤 때 vCPU 2개(소켓마다 코어 1개), 상한 8(소켓마다 코어 자리 4개)
     fn hot_cpu() -> CpuSpec {
         CpuSpec {
+            flags: Vec::new(),
             sockets: 2,
             cores: 1,
             model: CpuModel::Max,

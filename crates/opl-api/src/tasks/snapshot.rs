@@ -1132,6 +1132,7 @@ mod tests {
             id,
             name: "web".into(),
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 1,
                 model: CpuModel::Host,

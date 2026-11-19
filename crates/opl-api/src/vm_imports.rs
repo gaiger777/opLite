@@ -787,6 +787,7 @@ pub(crate) fn import_spec(
         .collect::<Result<_, String>>()?;
     Ok(VmSpec {
         cpu: CpuSpec {
+            flags: Vec::new(),
             sockets: run.sockets.unwrap_or(proposal.sockets),
             cores: run.cores.unwrap_or(proposal.cores),
             model: CpuModel::Host,

@@ -211,6 +211,8 @@ async fn record_node(
     let memory_mib = crate::host::memory_mib();
     update_node_status(cluster, |status| {
         *status = NodeStatus {
+            // CPU 카탈로그(계획 63)는 탐침이 쓴다. 이미 적힌 것을 지우지 않는다.
+            cpu: status.cpu.take(),
             online: true,
             cpus,
             memory_mib,
@@ -813,7 +815,8 @@ pub(crate) mod tests {
                 "metrics-history",
                 "notifications",
                 "folders",
-                "two-factor"
+                "two-factor",
+                "cpu-models"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -854,7 +857,8 @@ pub(crate) mod tests {
                 "metrics-history",
                 "notifications",
                 "folders",
-                "two-factor"
+                "two-factor",
+                "cpu-models"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -914,7 +918,8 @@ pub(crate) mod tests {
                 "metrics-history",
                 "notifications",
                 "folders",
-                "two-factor"
+                "two-factor",
+                "cpu-models"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1149,6 +1154,7 @@ pub(crate) mod tests {
                     "notifications".into(),
                     "folders".into(),
                     "two-factor".into(),
+                    "cpu-models".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

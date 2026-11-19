@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
+use crate::cpu::Baseline;
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::vm::Arch;
 
 /// 클러스터에 하나만 있다. 리소스 이름이 클러스터 이름이다.
 pub type ClusterInfo = Resource<ClusterSpec, ClusterStatus>;
@@ -49,6 +51,10 @@ pub struct ClusterStatus {
     /// `observers`의 주소 하나다. 옛 노드는 모르는 필드를 무시하고 첫 링크만 쓴다.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub observer_links: BTreeMap<Uuid, Vec<String>>,
+    /// 아키텍처마다 클러스터 CPU 기준(계획 63). 리더가 노드·카탈로그·설정이 바뀌면 다시 셈해 달라졌을 때만 쓴다.
+    /// `cluster` 모델 VM이 켤 때 읽는다. 옛 노드는 모르는 필드를 무시한다.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cpu_baselines: BTreeMap<Arch, Baseline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

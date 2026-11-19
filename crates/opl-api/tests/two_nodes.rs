@@ -361,6 +361,7 @@ async fn two_nodes_with(
         );
         r.id = node.id;
         r.status = NodeStatus {
+            cpu: None,
             online: true,
             cpus: 4,
             memory_mib: 8192,

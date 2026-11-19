@@ -147,6 +147,7 @@ fn spec(disk: PathBuf) -> VmRuntimeSpec {
         id: Uuid::now_v7(),
         name: "repl-vm".into(),
         cpu: CpuSpec {
+            flags: Vec::new(),
             sockets: 1,
             cores: 1,
             model: CpuModel::Host,

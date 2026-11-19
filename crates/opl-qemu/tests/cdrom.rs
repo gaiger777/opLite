@@ -84,6 +84,7 @@ fn spec(
         id,
         name: "it-cdrom".into(),
         cpu: CpuSpec {
+            flags: Vec::new(),
             sockets: 1,
             cores: 1,
             model: CpuModel::Host,

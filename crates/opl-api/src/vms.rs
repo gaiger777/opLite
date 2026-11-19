@@ -14,8 +14,8 @@ use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node,
-    NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
+    CPU_MODELS, FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA,
+    NODE_REPLICATION, Node, NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
@@ -238,6 +238,14 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     }
     if spec.guest_agent.is_some() {
         require_feature(&state.cluster, GUEST_AGENT)?;
+    }
+    // `host`·`max` 밖의 CPU 모델과 플래그는 옛 노드가 풀지 못한다(계획 63). 모델 검증·해석은 스테이지 5에서 열기
+    // 전까지 받지 않는다.
+    if !spec.cpu.model.is_host_or_max() || !spec.cpu.flags.is_empty() {
+        require_feature(&state.cluster, CPU_MODELS)?;
+        return Err(ApiError::bad_request(
+            "CPU models other than host and max and CPU flags are not available yet",
+        ));
     }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.

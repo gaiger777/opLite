@@ -11,6 +11,7 @@ pub mod ceph;
 pub mod clock;
 pub mod cloud_init;
 pub mod cluster;
+pub mod cpu;
 pub mod crypt;
 pub mod fence;
 pub mod firmware;

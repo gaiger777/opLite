@@ -7,6 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::cloud_init::{CloudInit, CloudInitError};
+use crate::cpu::{CpuError, CpuFlag, ResolvedCpu, validate_flags};
 use crate::replication::{
     MAX_REPLICATION_TARGETS, ReplicaRecovery, ReplicaStatus, ReplicationTarget, parse_interval,
 };
@@ -347,6 +348,16 @@ impl VmSpec {
         if self.memory_mib < MIN_MEMORY_MIB {
             return Err(ValidationError::TooLittleMemory);
         }
+        validate_flags(&self.cpu.flags)?;
+        if let CpuModel::Level(l) = &self.cpu.model
+            && self.machine.arch() != Arch::X86_64
+        {
+            return Err(CpuError::Arch {
+                model: l.as_str().into(),
+                arch: self.machine.arch(),
+            }
+            .into());
+        }
         if let Some(max) = self.cpu.max_vcpus {
             let vcpus = self.cpu.vcpus();
             if u32::from(max) < vcpus {
@@ -584,6 +595,9 @@ pub enum ValidationError {
     TpmNeedsUefi,
     #[error("secure_boot needs UEFI firmware")]
     SecureBootNeedsUefi,
+    /// CPU 플래그 목록(64개까지, 겹침 없음)·아키텍처에 맞지 않는 수준(계획 63)
+    #[error("cpu: {0}")]
+    Cpu(#[from] CpuError),
 }
 
 /// 실제 부팅 순서(QEMU `bootindex`): 디스크와 CD-ROM 드라이브의 `boot_order`에서 정한다. CD-ROM이 없으면 그대로다
@@ -677,6 +691,10 @@ pub struct CpuSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub max_vcpus: Option<u16>,
+    /// 켜고 끌 CPU 플래그(계획 63, `"+aes"`·`"-avx512vbmi"`). 비면 쓰지 않아 옛 노드도 VM을 계속 푼다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub flags: Vec<CpuFlag>,
 }
 
 impl CpuSpec {
@@ -695,15 +713,7 @@ fn one() -> u16 {
     1
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "kebab-case")]
-pub enum CpuModel {
-    /// 호스트 CPU를 그대로 노출한다. TCG에서는 max로 대체된다.
-    #[default]
-    Host,
-    Max,
-}
+pub use crate::cpu::CpuModel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -735,7 +745,7 @@ impl MachineType {
 }
 
 /// CPU 아키텍처. 노드가 등록할 때 기록하고, 머신 타입마다 하나로 정해진다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum Arch {
@@ -964,6 +974,11 @@ pub struct RunningHardware {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub guest_agent: bool,
+    /// 켤 때 실제로 쓴 CPU(계획 63: 해석된 모델·플래그). 없으면 계획 63 전 기록 = `cpu.model`대로 `host`·`max`로
+    /// 켰다. 받는 쪽 마이그레이션은 이것을 그대로 쓴다. 옛 노드는 이 필드를 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_resolved: Option<ResolvedCpu>,
 }
 
 /// 실행 중에 적용하지 못해 다음 재시작 때 적용할 변경 하나
@@ -1815,6 +1830,7 @@ mod tests {
         assert_eq!(
             cpu,
             CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 2,
                 model: CpuModel::Host,

@@ -90,6 +90,7 @@ impl RunningHardware {
             tpm: spec.tpm,
             secure_boot: spec.secure_boot,
             guest_agent: spec.agent_channel(),
+            cpu_resolved: None,
         }
     }
 
@@ -625,14 +626,9 @@ fn cpu_changes(
     steps: &mut Vec<Step>,
     pending: &mut Vec<PendingChange>,
 ) {
-    if spec.cpu.sockets != hw.cpu.sockets || spec.cpu.model != hw.cpu.model {
-        pending.push(change(
-            "cpu",
-            cpu_name(&hw.cpu),
-            cpu_name(&spec.cpu),
-            PendingReason::Restart,
-            None,
-        ));
+    // 토폴로지·모델·플래그(계획 63)는 켤 때만 정해진다.
+    if let Some(p) = crate::cpu::pending_change(&spec.cpu, hw, None) {
+        pending.push(p);
         return;
     }
     let boot = hw.boot_vcpus();
@@ -764,11 +760,6 @@ fn change(
         reason,
         detail,
     }
-}
-
-/// `1x4 host` 모양(소켓 × 코어 모델)
-fn cpu_name(cpu: &CpuSpec) -> String {
-    format!("{}x{} {}", cpu.sockets, cpu.cores, kebab(cpu.model))
 }
 
 /// 열거형의 JSON 이름(`uefi`, `q35` …)
@@ -985,6 +976,22 @@ mod tests {
         let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
         assert_eq!(reasons(&pending), [("cpu", PendingReason::Restart)]);
         assert_eq!(pending[0].wanted, "1x2 max");
+
+        // 플래그(계획 63)도 켤 때만 정해진다. vCPU 수를 함께 바꿔도 `cpu` 보류 하나로 끝난다.
+        let mut s = spec();
+        s.cpu.flags = vec!["-avx512vbmi".parse().unwrap()];
+        s.cpu.cores = 4;
+        let pending = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
+        assert_eq!(reasons(&pending), [("cpu", PendingReason::Restart)]);
+        assert_eq!(pending[0].wanted, "1x4 host -avx512vbmi");
+        assert!(
+            pending[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("-avx512vbmi; power cycle required")),
+            "{:?}",
+            pending[0].detail
+        );
     }
 
     #[test]

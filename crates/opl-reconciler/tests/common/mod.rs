@@ -116,6 +116,7 @@ pub fn vm(name: &str, node: Uuid) -> Vm {
         name,
         VmSpec {
             cpu: CpuSpec {
+                flags: Vec::new(),
                 sockets: 1,
                 cores: 1,
                 model: CpuModel::Host,

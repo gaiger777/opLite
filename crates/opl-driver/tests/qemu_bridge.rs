@@ -85,6 +85,7 @@ fn spec(bridge: &str) -> VmRuntimeSpec {
             cores: 1,
             model: CpuModel::Host,
             max_vcpus: None,
+            flags: Vec::new(),
         },
         memory_mib: 256,
         firmware: Firmware::Uefi,

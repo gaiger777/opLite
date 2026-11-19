@@ -508,6 +508,7 @@ mod tests {
     /// [`running_vm`]과 같고 NIC마다 네트워크를 정한다.
     async fn running_vm_on(f: &Fixture, networks: &[&str]) -> Uuid {
         let cpu = CpuSpec {
+            flags: Vec::new(),
             sockets: 1,
             cores: 2,
             model: CpuModel::Host,
@@ -559,6 +560,7 @@ mod tests {
                 id,
                 name: "web".into(),
                 cpu: CpuSpec {
+                    flags: Vec::new(),
                     sockets: 1,
                     cores: 2,
                     model: CpuModel::Host,
