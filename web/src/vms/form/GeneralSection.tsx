@@ -285,6 +285,7 @@ export function GeneralSection({
         <NumaSection
           sockets={values.sockets}
           cores={values.cores}
+          maxVcpus={values.maxVcpus}
           value={values.numa}
           onChange={(numa) => onChange({ numa })}
           onSockets={(sockets) => {

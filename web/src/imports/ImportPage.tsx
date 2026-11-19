@@ -31,6 +31,7 @@ import { NumaChoice } from "@/numa/NumaSection";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import {
   runForm,
+  runNumaErrors,
   sourceNetworks,
   sourceText,
   toRun,
@@ -470,6 +471,7 @@ function RunSection({
                 sockets={Number(form.sockets) || 1}
                 value={form.numa}
                 onChange={(numa) => set({ numa })}
+                errors={runNumaErrors(form)}
               />
             </div>
           </CardContent>

@@ -10,6 +10,8 @@ import { cpuPending } from "@/cpu/cpu";
 import { usageBars } from "@/folders/UsageBars";
 import i18n from "@/i18n";
 import { NodeTopologySection } from "@/numa/NodeTopologySection";
+import { NumaChoice, NumaSection } from "@/numa/NumaSection";
+import { VmPlacement } from "@/numa/VmPlacement";
 import {
   coresFor,
   cpuGrid,
@@ -23,6 +25,7 @@ import {
   numaFrom,
   numaOverride,
   numaSpec,
+  overrideErrors,
   parseCpuList,
   ownUse,
   pinningRows,
@@ -855,4 +858,204 @@ it("clones a VM without its hugepages", async () => {
   await user.click(within(dialog).getByRole("button", { name: "Clone" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toEqual({ name: "db2", snapshot: null, pool: null, no_hugepages: true });
+});
+
+// ---- 리뷰 2 웹
+
+/** 리뷰 2 웹 I2: 메모리 상한이 있는 VM의 노드 목록은 켤 때 나눔이다 — 메모리를 늘려도 목록을 고치지 않는다. */
+it("treats the per-node memory as the boot split of a memory hotplug VM", () => {
+  const list = {
+    ...emptyNuma(),
+    mode: "list" as const,
+    list: [
+      { cpus: "4", memory: "2048" },
+      { cpus: "4", memory: "2048" },
+    ],
+  };
+  const running = { sockets: 2, cores: "4", maxVcpus: "", memory: "6144", maxMemory: "8192" };
+  expect(numaErrors(list, running)).toEqual({});
+  expect(numaErrors(list, { ...running, maxMemory: "" })).toEqual({
+    "numa.list": "numa.errors.listMemorySum",
+  });
+  expect(numaErrors(list, { ...running, memory: "2048" })).toEqual({
+    "numa.list": "numa.errors.listMemoryOver",
+  });
+  expect(numaErrors(list, { ...running, memory: "4097" })).toEqual({
+    "numa.list": "numa.errors.listMemoryUnit",
+  });
+});
+
+/** 리뷰 2 웹 I1: 배포의 vCPU 덮어쓰기는 소켓 1이고, 메모리 덮어쓰기는 노드 목록 합과 견준다. */
+it("checks the NUMA choice against the overridden vCPUs and memory", () => {
+  const spec = {
+    ...vm("t", "stopped").spec,
+    cpu: { sockets: 2, cores: 4, model: "host" as const },
+    memory_mib: 4096,
+  };
+  const two = { ...emptyNuma(), mode: "count" as const, count: "2" };
+  expect(overrideErrors(two, spec, "", "")).toEqual({});
+  expect(overrideErrors(two, spec, "8", "")).toEqual({ "numa.count": "numa.errors.count" });
+  const list = {
+    ...emptyNuma(),
+    mode: "list" as const,
+    list: [
+      { cpus: "4", memory: "2048" },
+      { cpus: "4", memory: "2048" },
+    ],
+  };
+  expect(overrideErrors(list, spec, "", "8192")).toEqual({
+    "numa.list": "numa.errors.listMemorySum",
+  });
+  expect(
+    overrideErrors({ ...emptyNuma(), policy: "dedicated", threadPolicy: "require" }, spec, "3", ""),
+  ).toEqual({ "numa.threads": "numa.errors.requireOdd" });
+});
+
+/** 리뷰 2 웹 M1: 서버는 한 크기로만 놓고, 메모리 핫플러그 VM의 `any`는 2M이다. */
+it("guesses room for any hugepages in one page size, and 2M with memory hotplug", () => {
+  const usage = [
+    {
+      node: "split",
+      pinning: true,
+      dedicated_total: 0,
+      dedicated_used: 0,
+      hugepages: [
+        { size: "2M" as const, total_mib: 2048, used_mib: 0 },
+        { size: "1G" as const, total_mib: 2048, used_mib: 0 },
+      ],
+    },
+    {
+      node: "big1g",
+      pinning: true,
+      dedicated_total: 0,
+      dedicated_used: 0,
+      hugepages: [{ size: "1G" as const, total_mib: 8192, used_mib: 0 }],
+    },
+  ];
+  const any = { ...vm("x", "stopped").spec, memory_mib: 4096, hugepages: "any" as const };
+  expect(roomOn(usage, any)).toEqual(["big1g"]);
+  expect(roomOn(usage, { ...any, max_memory_mib: 8192 })).toEqual([]);
+});
+
+/** 리뷰 2 웹 P1·M1·I2: 소켓 목록은 vCPU 상한도 나누고, 핫플러그 VM에 `any`·노드 목록의 도움말을 보인다. */
+it("offers sockets that divide the maximum vCPUs and explains hotplug memory", async () => {
+  const spec = {
+    ...vm("x", "stopped").spec,
+    cpu: { sockets: 1, cores: 6, max_vcpus: 8, model: "host" as const },
+    memory_mib: 4096,
+    max_memory_mib: 8192,
+    hugepages: "any" as const,
+  };
+  renderPage(
+    <NumaSection
+      sockets={1}
+      cores="6"
+      maxVcpus="8"
+      value={{
+        ...emptyNuma(),
+        hugepages: "any",
+        mode: "list",
+        list: [{ cpus: "8", memory: "4096" }],
+      }}
+      onChange={() => {}}
+      onSockets={() => {}}
+      errors={{}}
+      canDedicate
+      spec={spec}
+      running={false}
+    />,
+  );
+  const sockets = await screen.findByLabelText("Sockets");
+  // 6 vCPU를 나누는 1·2·3·6 가운데 상한 8도 나누는 것만
+  expect(
+    within(sockets)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["1", "2"]);
+  expect(screen.getByText(/With memory hotplug, Any uses 2 MiB pages/)).toBeInTheDocument();
+  expect(screen.getByText(/memory above their sum is spread evenly/)).toBeInTheDocument();
+});
+
+/** 리뷰 2 웹 I1: 복제·배포·가져오기의 NUMA 칸은 받은 오류를 보이며 펼친다. */
+it("opens the NUMA choice and shows errors from the overridden values", async () => {
+  renderPage(
+    <NumaChoice
+      id="x"
+      sockets={1}
+      value={{
+        ...emptyNuma(),
+        mode: "list",
+        list: [{ cpus: "4", memory: "2048" }],
+      }}
+      onChange={() => {}}
+      errors={{ "numa.list": "numa.errors.listMemorySum" }}
+    />,
+  );
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "The node memory must add up to the VM's memory.",
+  );
+  expect(screen.getByLabelText("Guest NUMA nodes")).toBeInTheDocument();
+});
+
+/** 리뷰 2 웹 M3: 폴더 사용자(루트 `cluster.read` 없음)에게는 호스트 노드·pCPU를 보이지 않는다. */
+it("hides host CPUs of the placement from folder-only users", async () => {
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  renderPage(<VmPlacement vm={DB} />, { as: { ...ADMIN, role: "operator" } });
+  const section = await screen.findByRole("region", { name: "CPU placement" });
+  await waitFor(() => expect(within(section).queryByText("Host NUMA nodes")).toBeNull());
+  expect(within(section).getByText("Running layout")).toBeInTheDocument();
+  expect(within(section).queryByText("Emulator CPUs")).toBeNull();
+  expect(within(section).queryByText("vCPU pinning")).toBeNull();
+});
+
+/** 리뷰 2 웹 M2·M4: VM별 배치 표, 격자는 Tab 한 번(화살표로 움직임), 목록을 고치면 "먼저 고치세요"가 사라진다. */
+it("lists the VMs on a node, roves the CPU grid and clears a fixed list error", async () => {
+  server.use(http.get(apiUrl("/nodes/:key/topology"), () => HttpResponse.json(INFO)));
+  const node = { ...NODE, spec: { ...NODE.spec, host_resources: INFO.host_resources } };
+  mockLists({ node: [node] });
+  renderPage(<NodeTopologySection node={node} />);
+  const section = await screen.findByRole("region", { name: "NUMA topology" });
+  const table = await within(section).findByRole("table", { name: "VMs on this node" });
+  expect(
+    within(table)
+      .getAllByRole("row")
+      .map((r) => r.textContent),
+  ).toEqual([
+    "VMHost NUMA nodesvCPU host CPUsHeld sibling threadsEmulator CPUsHugepages",
+    "db18-9——128 × 2M",
+  ]);
+
+  const user = userEvent.setup();
+  await user.click(within(section).getByRole("button", { name: "Host resources" }));
+  const dialog = await screen.findByRole("dialog", { name: "Host resources of node-a" });
+  const cpus = within(dialog).getAllByRole("button", { name: /^CPU \d+:/ });
+  expect(cpus).toHaveLength(16);
+  expect(cpus.filter((b) => b.tabIndex === 0)).toHaveLength(1);
+  cpus[0]!.focus();
+  await user.keyboard("{ArrowRight}");
+  expect(document.activeElement).toBe(cpus[1]);
+  expect(cpus[1]!.tabIndex).toBe(0);
+  expect(cpus[0]!.tabIndex).toBe(-1);
+  await user.keyboard("{End}");
+  expect(document.activeElement).toBe(cpus[15]);
+
+  const field = within(dialog).getByLabelText("Dedicated CPUs");
+  await user.clear(field);
+  await user.type(field, "8-");
+  await user.click(cpus[3]!);
+  const fixFirst = "Fix this CPU list before picking CPUs on the grid.";
+  expect(within(dialog).getByText(fixFirst)).toBeInTheDocument();
+  await user.type(field, "15");
+  expect(within(dialog).queryByText(fixFirst)).toBeNull();
 });

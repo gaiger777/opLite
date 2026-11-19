@@ -16,7 +16,13 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { archOf } from "@/cpu/cpu";
 import { CpuChoice, type CpuPick, cpuOverride } from "@/cpu/CpuChoice";
-import { numaFrom, numaOverride, type NumaValues } from "@/numa/numa";
+import {
+  memoryHotplug,
+  numaFrom,
+  numaOverride,
+  type NumaValues,
+  overrideErrors,
+} from "@/numa/numa";
 import { NumaChoice } from "@/numa/NumaSection";
 import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
@@ -85,6 +91,8 @@ export function DeployDialog({
   const templateNuma = numaFrom(template.spec);
   const [numa, setNuma] = useState<NumaValues | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // 덮어쓴 vCPU·메모리로 NUMA 칸을 다시 본다(리뷰 2 웹 — vCPU를 덮어쓰면 소켓 1이라 노드 수가 틀릴 수 있다).
+  const numaErrors = overrideErrors(numa ?? templateNuma, template.spec, cpus, memory);
   // 배포 Task는 서버가 정한 템플릿의 노드에서 돈다(`templateNode`). 그 노드에서 쓸 수 있는 풀만 고른다. 지난 노드가
   // 빠졌거나 꺼졌으면 접속한 노드(whoami)가 필요할 수 있다. 노드를 읽지 못하면 거르지 않는다.
   const serving = useOptionalPrincipal()?.node?.id;
@@ -152,7 +160,7 @@ export function DeployDialog({
       });
     }
     setErrors(found);
-    if (Object.keys(found).length > 0) {
+    if (Object.keys(found).length > 0 || Object.keys(numaErrors).length > 0) {
       return false;
     }
     const ci = toCloudInit(cloudInit, nicCount);
@@ -353,9 +361,14 @@ export function DeployDialog({
         />
         <NumaChoice
           id="deploy-numa"
-          sockets={template.spec.cpu.sockets ?? 1}
+          sockets={cpus !== "" ? 1 : (template.spec.cpu.sockets ?? 1)}
           value={numa ?? templateNuma}
           onChange={setNuma}
+          errors={numaErrors}
+          hotplug={memoryHotplug({
+            memory_mib: memory !== "" ? Number(memory) : template.spec.memory_mib,
+            max_memory_mib: template.spec.max_memory_mib,
+          })}
         />
         {bases.length > 0 && (
           <fieldset className="flex flex-col gap-3">

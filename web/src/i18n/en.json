@@ -3599,7 +3599,8 @@
       "2M": "2 MiB",
       "1G": "1 GiB",
       "any": "Any (largest first)",
-      "hint": "Back guest memory with the node's reserved hugepages."
+      "hint": "Back guest memory with the node's reserved hugepages.",
+      "anyHotplug": "With memory hotplug, Any uses 2 MiB pages (memory is hot-added in 2 MiB blocks)."
     },
     "list": {
       "title": "Guest NUMA nodes",
@@ -3607,7 +3608,8 @@
       "cpus": "Node {{n}} vCPU slots",
       "memory": "Node {{n}} memory (MiB)",
       "add": "Add node",
-      "remove": "Remove node {{n}}"
+      "remove": "Remove node {{n}}",
+      "hotplugHint": "These set how the boot memory is split. With memory hotplug, memory above their sum is spread evenly over the nodes (also while the VM runs), so growing the memory does not need a new list."
     },
     "errors": {
       "count": "Choose a node count that divides the number of sockets (1–8).",
@@ -3617,7 +3619,9 @@
       "listCpusSum": "The vCPU slots must add up to the maximum vCPUs.",
       "listMemorySum": "The node memory must add up to the VM's memory.",
       "requireOdd": "Sibling pairs need an even number of vCPU slots per socket.",
-      "hugepagesHotplug": "1 GiB hugepages cannot be used with memory hotplug."
+      "hugepagesHotplug": "1 GiB hugepages cannot be used with memory hotplug.",
+      "listMemoryOver": "The node memory must not add up to more than the VM's memory.",
+      "listMemoryUnit": "The memory above the node list must be a multiple of 2 MiB."
     },
     "summary": {
       "none": "Shared, no NUMA",
@@ -3662,7 +3666,12 @@
       "usedOf": "{{used}} of {{total}} used",
       "pages": "{{size}}: {{used}} of {{total}} used",
       "pagesLive": "({{free}} free, {{other}} other)",
-      "distances": "Distances"
+      "distances": "Distances",
+      "vms": "VMs on this node",
+      "vm": "VM",
+      "vcpus": "vCPU host CPUs",
+      "vmPages_one": "{{count}} × {{size}}",
+      "vmPages_other": "{{count}} × {{size}}"
     },
     "sets": {
       "reserved": "Reserved CPUs",
@@ -3677,7 +3686,8 @@
       "free": "Dedicated, free",
       "used": "Dedicated, in use",
       "cpu": "CPU {{cpu}}: {{role}}",
-      "cpuVm": "CPU {{cpu}}: {{role}} by {{vm}}"
+      "cpuVm": "CPU {{cpu}}: {{role}} by {{vm}}",
+      "keys": "Press Tab to reach the CPUs, then use the arrow keys to move and Enter to pick."
     },
     "columns": {
       "dedicated": "Dedicated CPUs",

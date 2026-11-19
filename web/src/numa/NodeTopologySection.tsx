@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { cn } from "cn";
 import { Plus, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { type KeyboardEvent, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -149,6 +149,7 @@ function TopologyView({ info, topology }: { info: NodeTopologyInfo; topology: To
       )}
       <CpuGrid topology={topology} roles={roles} />
       <HostNodes info={info} />
+      <VmsOnNode info={info} />
       <Distances topology={topology} />
     </>
   );
@@ -165,6 +166,30 @@ function CpuGrid({
   onPick?(cpu: number): void;
 }) {
   const { t } = useTranslation();
+  const grid = cpuGrid(topology);
+  // 고르는 격자는 Tab 한 번에 들어가고 화살표로 움직인다(roving tabindex, 리뷰 2 웹 — 256 스레드 노드에서 CPU마다 Tab이었다).
+  const order = grid.flatMap((n) => n.l3.flatMap((g) => g.cores.flat()));
+  const [active, setActive] = useState<number | undefined>(undefined);
+  const current = active !== undefined && order.includes(active) ? active : order[0];
+  const box = useRef<HTMLDivElement>(null);
+  const move = (e: KeyboardEvent, cpu: number) => {
+    const i = order.indexOf(cpu);
+    const next = {
+      ArrowRight: i + 1,
+      ArrowDown: i + 1,
+      ArrowLeft: i - 1,
+      ArrowUp: i - 1,
+      Home: 0,
+      End: order.length - 1,
+    }[e.key];
+    if (next === undefined) {
+      return;
+    }
+    e.preventDefault();
+    const to = order[Math.max(0, Math.min(order.length - 1, next))]!;
+    setActive(to);
+    box.current?.querySelector<HTMLButtonElement>(`[data-cpu="${to}"]`)?.focus();
+  };
   return (
     <div className="flex flex-col gap-2">
       <ul aria-label={t("numa.grid.legend")} className="flex flex-wrap gap-3 text-xs">
@@ -175,8 +200,9 @@ function CpuGrid({
           </li>
         ))}
       </ul>
-      <div className="flex flex-wrap gap-3">
-        {cpuGrid(topology).map((n) => (
+      {onPick && <p className="text-xs text-muted-foreground">{t("numa.grid.keys")}</p>}
+      <div ref={box} className="flex flex-wrap gap-3">
+        {grid.map((n) => (
           <div
             key={n.node}
             role="group"
@@ -204,7 +230,11 @@ function CpuGrid({
                             type="button"
                             title={label}
                             aria-label={label}
+                            data-cpu={cpu}
+                            tabIndex={cpu === current ? 0 : -1}
                             className={cn(cls, "cursor-pointer")}
+                            onFocus={() => setActive(cpu)}
+                            onKeyDown={(e) => move(e, cpu)}
                             onClick={() => onPick(cpu)}
                           >
                             {cpu}
@@ -295,6 +325,48 @@ function HostNodes({ info }: { info: NodeTopologyInfo }) {
   );
 }
 
+/**
+ * 이 노드에 자리 잡은 VM(`info.vms`): 호스트 노드·vCPU의 pCPU·비워 둔 형제·에뮬레이터·hugepages. 격자의 올림 글(title)은
+ * 키보드·전화로 볼 수 없어 표로도 보인다(리뷰 2 웹). 없으면 보이지 않는다.
+ */
+function VmsOnNode({ info }: { info: NodeTopologyInfo }) {
+  const { t } = useTranslation();
+  if (info.vms.length === 0) {
+    return null;
+  }
+  const list = (s: string) => s || "—";
+  return (
+    <Table aria-label={t("numa.node.vms")}>
+      <TableHeader>
+        <TableRow>
+          <TableHead>{t("numa.node.vm")}</TableHead>
+          <TableHead>{t("numa.vm.hostNodes")}</TableHead>
+          <TableHead>{t("numa.node.vcpus")}</TableHead>
+          <TableHead>{t("numa.vm.siblings")}</TableHead>
+          <TableHead>{t("numa.vm.emulator")}</TableHead>
+          <TableHead>{t("numa.node.hugepages")}</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {info.vms.map((v) => (
+          <TableRow key={v.vm}>
+            <TableHead scope="row" className="font-normal">
+              {v.vm}
+            </TableHead>
+            <TableCell>{v.host_nodes.length > 0 ? v.host_nodes.join(", ") : "—"}</TableCell>
+            <TableCell className="font-mono text-xs">{list(formatCpuList(v.vcpus))}</TableCell>
+            <TableCell className="font-mono text-xs">{list(v.siblings)}</TableCell>
+            <TableCell className="font-mono text-xs">{list(v.emulator)}</TableCell>
+            <TableCell>
+              {v.page ? t("numa.node.vmPages", { count: v.pages, size: v.page }) : "—"}
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  );
+}
+
 /** 호스트 노드 사이 거리(노드가 둘 이상이고 거리를 알 때) */
 function Distances({ topology }: { topology: Topology }) {
   const { t } = useTranslation();
@@ -355,6 +427,11 @@ function HostResourcesDialog({
   // 모두 비워 설정을 지우기 전 한 번 묻는다.
   const [confirmClear, setConfirmClear] = useState(false);
   const online = parseCpuList(topology.cpus) ?? [];
+  // 목록을 고치면 그 칸의 오류("먼저 고치세요" 포함)를 지운다(리뷰 2 웹 — 저장할 때까지 남았다).
+  const edit = (field: "reserved" | "dedicated", text: string) => {
+    change({ [field]: text });
+    setErrors((e) => Object.fromEntries(Object.entries(e).filter(([k]) => k !== field)));
+  };
   const change = (patch: Partial<ResourcesValues>) => {
     setValues((v) => ({ ...v, ...patch }));
     setConflict(null);
@@ -467,7 +544,7 @@ function HostResourcesDialog({
               className="font-mono"
               placeholder="0-1"
               value={values.reserved}
-              onChange={(e) => change({ reserved: e.target.value })}
+              onChange={(e) => edit("reserved", e.target.value)}
               {...a11y}
             />
           )}
@@ -484,7 +561,7 @@ function HostResourcesDialog({
               className="font-mono"
               placeholder="4-31"
               value={values.dedicated}
-              onChange={(e) => change({ dedicated: e.target.value })}
+              onChange={(e) => edit("dedicated", e.target.value)}
               {...a11y}
             />
           )}

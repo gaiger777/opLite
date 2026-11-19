@@ -5,6 +5,7 @@ import {
   importNameError,
   nameFromVm,
   runForm,
+  runNumaErrors,
   sourceNetworks,
   sourceText,
   toRun,
@@ -211,5 +212,19 @@ it("builds the connection body with every field", () => {
     password: "s3cret",
     datacenter: "ha-datacenter",
     fingerprint: "AB:CD",
+  });
+});
+
+/** 리뷰 2 웹 I1: 노드 수를 고른 뒤 소켓을 바꾸면 보내기 전에 알린다(서버는 400 `invalid_numa`). */
+it("checks the NUMA nodes against the sockets of the import", () => {
+  const form = {
+    ...runForm(two),
+    sockets: "2",
+    numa: { ...emptyNuma(), mode: "count" as const, count: "2" },
+  };
+  expect(runNumaErrors(form)).toEqual({});
+  expect(runNumaErrors({ ...form, sockets: "1" })).toEqual({ "numa.count": "numa.errors.count" });
+  expect(validateRun({ ...form, sockets: "1" }, two, NONE, ["lan"])).toMatchObject({
+    "numa.count": "numa.errors.count",
   });
 });

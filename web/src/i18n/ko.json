@@ -3599,7 +3599,8 @@
       "2M": "2 MiB",
       "1G": "1 GiB",
       "any": "아무것(큰 것부터)",
-      "hint": "게스트 메모리를 노드가 예약한 hugepages로 씁니다."
+      "hint": "게스트 메모리를 노드가 예약한 hugepages로 씁니다.",
+      "anyHotplug": "메모리 핫플러그 VM의 아무것은 2 MiB 페이지를 씁니다(메모리를 2 MiB 블록으로 더함)."
     },
     "list": {
       "title": "게스트 NUMA 노드",
@@ -3607,7 +3608,8 @@
       "cpus": "노드 {{n}} vCPU 자리",
       "memory": "노드 {{n}} 메모리(MiB)",
       "add": "노드 더하기",
-      "remove": "노드 {{n}} 빼기"
+      "remove": "노드 {{n}} 빼기",
+      "hotplugHint": "켤 때 메모리를 나누는 값입니다. 메모리 핫플러그 VM은 이 합보다 많은 메모리를 노드마다 고르게 더하므로(실행 중에도) 메모리를 늘려도 목록을 고치지 않아도 됩니다."
     },
     "errors": {
       "count": "소켓 수를 나누는 노드 수(1~8)를 고르세요.",
@@ -3617,7 +3619,9 @@
       "listCpusSum": "vCPU 자리 합이 최대 vCPU와 같아야 합니다.",
       "listMemorySum": "노드 메모리 합이 VM 메모리와 같아야 합니다.",
       "requireOdd": "형제 짝은 소켓당 vCPU 자리 수가 짝수여야 합니다.",
-      "hugepagesHotplug": "1 GiB hugepages는 메모리 핫플러그와 함께 쓸 수 없습니다."
+      "hugepagesHotplug": "1 GiB hugepages는 메모리 핫플러그와 함께 쓸 수 없습니다.",
+      "listMemoryOver": "노드 메모리 합이 VM 메모리보다 클 수 없습니다.",
+      "listMemoryUnit": "노드 목록보다 많은 메모리는 2 MiB의 배수여야 합니다."
     },
     "summary": {
       "none": "공유, NUMA 없음",
@@ -3662,7 +3666,12 @@
       "usedOf": "{{total}} 중 {{used}} 사용",
       "pages": "{{size}}: {{total}} 중 {{used}} 사용",
       "pagesLive": "(빈 것 {{free}}, 다른 쓰임 {{other}})",
-      "distances": "거리"
+      "distances": "거리",
+      "vms": "이 노드의 VM",
+      "vm": "VM",
+      "vcpus": "vCPU의 호스트 CPU",
+      "vmPages_one": "{{count}} × {{size}}",
+      "vmPages_other": "{{count}} × {{size}}"
     },
     "sets": {
       "reserved": "예약 CPU",
@@ -3677,7 +3686,8 @@
       "free": "전용, 빔",
       "used": "전용, 사용 중",
       "cpu": "CPU {{cpu}}: {{role}}",
-      "cpuVm": "CPU {{cpu}}: {{role}}({{vm}})"
+      "cpuVm": "CPU {{cpu}}: {{role}}({{vm}})",
+      "keys": "Tab으로 CPU에 들어가 화살표로 움직이고 Enter로 고릅니다."
     },
     "columns": {
       "dedicated": "전용 CPU",

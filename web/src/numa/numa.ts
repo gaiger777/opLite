@@ -258,13 +258,41 @@ export function numaErrors(
       cpus += c;
       memory += Number(n.memory);
     });
+    // 목록 메모리는 켤 때 나눔이다(리뷰 2): 메모리 상한이 있는 VM은 합이 메모리 이하이고 남는 것(2 MiB 단위)을 다음
+    // 전원 껐다 켜기 때 virtio-mem처럼 노드마다 고르게 더한다 — 실행 중 메모리를 늘려도 목록을 고치지 않는다.
+    const total = Number(vm.memory);
+    const hotplug = vm.maxMemory !== "";
     if (Object.keys(errors).length === 0 && cpus !== slots) {
       errors["numa.list"] = "numa.errors.listCpusSum";
-    } else if (Object.keys(errors).length === 0 && memory !== Number(vm.memory)) {
+    } else if (Object.keys(errors).length === 0 && !hotplug && memory !== total) {
       errors["numa.list"] = "numa.errors.listMemorySum";
+    } else if (Object.keys(errors).length === 0 && hotplug && memory > total) {
+      errors["numa.list"] = "numa.errors.listMemoryOver";
+    } else if (Object.keys(errors).length === 0 && hotplug && (total - memory) % 2 !== 0) {
+      errors["numa.list"] = "numa.errors.listMemoryUnit";
     }
   }
   return errors;
+}
+
+/**
+ * 복제·템플릿 배포·가져오기에서 덮어쓴 값으로 본 입력 오류(리뷰 2 웹): 서버는 덮어쓴 뒤 스펙 전체를 다시 검증한다 —
+ * vCPU 수를 덮어쓰면 소켓 1 × 코어 vCPU(`apply_overrides`), 메모리를 덮어쓰면 그 메모리다. `vcpus`·`memory`가 비면
+ * 원본 값이다.
+ */
+export function overrideErrors(
+  v: NumaValues,
+  spec: VmSpec,
+  vcpus: string,
+  memory: string,
+): Record<string, string> {
+  return numaErrors(v, {
+    sockets: vcpus !== "" ? 1 : (spec.cpu.sockets ?? 1),
+    cores: vcpus !== "" ? vcpus : String(spec.cpu.cores),
+    maxVcpus: spec.cpu.max_vcpus == null ? "" : String(spec.cpu.max_vcpus),
+    memory: memory !== "" ? memory : String(spec.memory_mib),
+    maxMemory: spec.max_memory_mib == null ? "" : String(spec.max_memory_mib),
+  });
 }
 
 /** 노드 수를 "2 nodes"처럼 */
@@ -411,13 +439,14 @@ export function ownUse(vm: Vm, nodeName: (id: string) => string | undefined): Ow
 }
 
 /**
- * `/topology/usage`로 이 스펙이 들어갈 만한 노드(이름). 전용 CPU는 남은 수, hugepages는 그 크기 풀(`any`는 두 크기
- * 합)의 남은 MiB만 견주는 어림이다 — 호스트 NUMA 노드 나눔은 서버가 켤 때 본다. 고치는 VM이 이미 잡은 것(`own`)은 그
- * 노드에서 빈 것으로 되돌려 센다(리뷰 1 웹 — 자기 pCPU 때문에 "들어갈 노드 없음"이라 하지 않게).
+ * `/topology/usage`로 이 스펙이 들어갈 만한 노드(이름). 전용 CPU는 남은 수, hugepages는 그 크기 풀의 남은 MiB만 견주는
+ * 어림이다 — 호스트 NUMA 노드 나눔은 서버가 켤 때 본다. 서버는 한 크기로만 놓으므로 `any`는 두 크기 가운데 더 많이 남은
+ * 한 풀이고, 메모리 상한이 있는(핫플러그) VM의 `any`는 2 MiB다(virtio-mem 블록, 리뷰 2 웹). 고치는 VM이 이미 잡은 것
+ * (`own`)은 그 노드에서 빈 것으로 되돌려 센다(리뷰 1 웹 — 자기 pCPU 때문에 "들어갈 노드 없음"이라 하지 않게).
  */
 export function roomOn(usage: readonly NodeUsageSummary[], spec: VmSpec, own?: OwnUse): string[] {
   const need = dedicatedNeed(spec);
-  const page = spec.hugepages;
+  const page = hugepagesUsed(spec);
   return usage
     .filter((n) => {
       const mine = own?.node === n.node ? own : undefined;
@@ -429,7 +458,8 @@ export function roomOn(usage: readonly NodeUsageSummary[], spec: VmSpec, own?: O
         const free = n.hugepages
           .filter((p) => page === "any" || p.size === page)
           .reduce(
-            (sum, p) => sum + p.total_mib - p.used_mib + (mine?.page === p.size ? mine.mib : 0),
+            (most, p) =>
+              Math.max(most, p.total_mib - p.used_mib + (mine?.page === p.size ? mine.mib : 0)),
             0,
           );
         if (free < spec.memory_mib) {
@@ -439,6 +469,16 @@ export function roomOn(usage: readonly NodeUsageSummary[], spec: VmSpec, own?: O
       return true;
     })
     .map((n) => n.node);
+}
+
+/** 메모리 핫플러그 VM(상한 > 메모리) */
+export function memoryHotplug(spec: Pick<VmSpec, "memory_mib" | "max_memory_mib">): boolean {
+  return spec.max_memory_mib != null && spec.max_memory_mib > spec.memory_mib;
+}
+
+/** VM이 쓸 hugepage 크기(서버의 `page_size`): 메모리 핫플러그 VM의 `any`는 2M이다. */
+export function hugepagesUsed(spec: VmSpec): PageSize | undefined {
+  return spec.hugepages === "any" && memoryHotplug(spec) ? "2M" : (spec.hugepages ?? undefined);
 }
 
 /**

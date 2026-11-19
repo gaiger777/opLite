@@ -388,3 +388,13 @@
 - **N9** `any` + 메모리 상한의 2M은 그 노드가 메모리 핫플러그로 켤 때만이다: 스케줄러(`host_usage`·`numa_plan`)와 Raft 장부(노드 상태의 `hotplug`)가 `hotplug::start_spec(spec, caps)`로, 작업자는 켤 하드웨어(`hardware.max_memory_mib() > memory_mib`)로 같은 모양을 본다. virtio-mem이 없거나 미리 잡지 못하는 노드에서는 1G 풀에도 든다.
 - **웹 중요 2(서버) 직접 목록은 켤 때 나눔.** 메모리 상한이 있는 VM은 목록 합 ≤ 메모리이고 남는 것이 2 MiB의 배수면 된다(`validate`). 다음 켜기의 게스트 노드 메모리는 목록에 남는 것을 virtio-mem처럼 `split_blocks`로 더한 것이다(`boot_split` — 늘린 만큼이 꽂혀 있던 노드에 그대로 켤 때 메모리가 된다). 보류 `numa`는 `boot_split(목록, hw.memory_mib)`과 기록을 견주므로 실행 중 메모리만 늘리면 생기지 않는다. 상한이 없으면 지금처럼 합 = 메모리다.
 - **GitHub 탐침(29d1023, 67ae027f) 브라우저 e2e.** `browser_uploads_image_runs_vm_and_cleans_up`이 메모리 스냅샷에서 QMP가 2분 답하지 않아 실패했다(설정 없는 노드의 보통 VM). 같은 잡의 `snapshots.rs`(실제 QEMU 메모리 스냅샷)는 지나갔고 opld 로그에 `repin`의 경고(다시 고정·실패)도 없어 원인을 로그로 못 박지 못했다. 리뷰 1 I5가 설정 없는 노드의 모든 VM에 손대게 한 두 길(30초마다 `repin`이 보통 VM의 모든 스레드를 읽고 `pinning.json`을 씀, opld 친화가 온라인과 다르면 `pre_exec`로 친화를 바꿈 — fork 경로도 바뀜)을 N3이 없앴다: 설정 없는 노드의 보통 VM은 스테이지 3(통과한 탐침)과 같이 드라이버가 친화·고정 기록을 건드리지 않는다. 시험: `repin_leaves_vms_it_never_pinned_and_releases_cleared_ones_once`(설정 없는 노드에서 `repin` 호출 0), `unpinned_children_get_the_start_affinity_only_when_opld_narrowed_itself`. 이 Mac의 브라우저 e2e(실제 QEMU)와 이 고침 뒤 GitHub 탐침 결과는 실행 기록에 적는다.
+
+### 리뷰 2에서 고친 것 (웹)
+
+- **I1** 템플릿 배포·가져오기의 NUMA 칸을 덮어쓴 값으로 다시 본다(`overrideErrors`·`runNumaErrors` — 같은 `numaErrors`): 배포의 vCPU 덮어쓰기는 서버의 `apply_overrides`처럼 소켓 1 × 코어 vCPU이고(노드 수 고르기도 소켓 1로), 메모리 덮어쓰기는 직접 표 합과 견준다. `NumaChoice`가 `errors`를 받아 칸을 펼치고 알리며(직접 표 오류는 한 줄), 오류가 있으면 보내지 않는다. 가져오기도 소켓·코어·메모리를 바꾸면 바로 알리고 `validateRun`이 막는다. 복제는 vCPU·메모리를 덮어쓰지 않아 그대로다.
+- **I2** 서버의 결정과 같게 직접 표의 메모리는 켤 때 나눔이다: 메모리 상한이 있는 VM은 합 ≤ 메모리이고 남는 것이 2 MiB의 배수면 된다(넘으면 `listMemoryOver`, 홀수면 `listMemoryUnit`; 상한이 없으면 지금처럼 같아야 함). 실행 중 메모리를 늘려도 표를 고치라고 하지 않으므로 "상한 안의 메모리는 바로 적용" 도움말이 맞다. 표 위에 "남는 메모리는 노드마다 고르게 더함" 도움말을 보인다.
+- **P1** 소켓 목록은 vCPU 수와 함께 핫플러그 vCPU 상한도 나누는 수만 보인다(`NumaSection`의 `maxVcpus`).
+- **M1** "들어갈 노드" 어림은 서버처럼 한 크기에만 놓는다: `any`는 두 풀의 합이 아니라 더 많이 남은 한 풀이고, 메모리 핫플러그 VM(상한 > 메모리)의 `any`는 2M(`hugepagesUsed`). `/topology/usage`에 노드의 핫플러그 능력이 없어 노드마다(N9) 가르지는 않는다 — 어림이 조금 엄할 뿐이다. 핫플러그 VM에 `any`를 고르면 "메모리 핫플러그 VM의 아무것은 2 MiB 페이지" 도움말.
+- **M2** 노드 상세에 "이 노드의 VM" 표(VM, 호스트 NUMA 노드, vCPU의 호스트 CPU, 비워 둔 형제, 에뮬레이터 CPU, hugepages, `info.vms`)를 더했다 — 격자의 올림 글을 키보드·전화로 볼 수 없었다. 호스트 자원 대화상자의 CPU 격자는 roving tabindex(Tab 한 번, 화살표·Home·End로 움직이고 Enter로 고름, 도움말 한 줄)라 256 스레드 노드에서 Tab 256번이 아니다.
+- **M3** VM 상세의 "CPU 배치"는 루트 `cluster.read`가 있을 때만 호스트 NUMA 노드·에뮬레이터·형제와 vCPU 고정 표를 보인다(`/vms/{key}/numa`와 같게). 설정·켤 때 모양은 모두 본다. 서버는 VM 객체를 거르지 않는다(웹만 숨김).
+- **M4** 예약·전용 목록 칸을 고치면 그 칸의 오류("먼저 고치세요" 포함)를 지운다.

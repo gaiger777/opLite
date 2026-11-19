@@ -13,6 +13,7 @@ import {
   type CpuPolicy,
   describeNuma,
   type EmulatorPolicy,
+  memoryHotplug,
   type MemoryPolicy,
   nodeCounts,
   type NumaMode,
@@ -43,6 +44,7 @@ function NumaFields({
   canDedicate,
   errors,
   list,
+  hotplug,
 }: {
   id: string;
   value: NumaValues;
@@ -51,6 +53,8 @@ function NumaFields({
   canDedicate: boolean;
   errors: Record<string, string>;
   list: boolean;
+  /** 메모리 핫플러그 VM(상한 > 메모리): `any`는 2 MiB 페이지다. */
+  hotplug: boolean;
 }) {
   const { t } = useTranslation();
   const set = (patch: Partial<NumaValues>) => onChange({ ...value, ...patch });
@@ -200,7 +204,13 @@ function NumaFields({
         id={`${id}-hugepages`}
         label={t("numa.hugepages.label")}
         error={errors["numa.hugepages"]}
-        hint={t(canDedicate ? "numa.hugepages.hint" : "numa.needsPrivilege")}
+        hint={
+          !canDedicate
+            ? t("numa.needsPrivilege")
+            : value.hugepages === "any" && hotplug
+              ? t("numa.hugepages.anyHotplug")
+              : t("numa.hugepages.hint")
+        }
       >
         {(a11y) => (
           <NativeSelect
@@ -232,10 +242,13 @@ function NodeList({
   value,
   onChange,
   errors,
+  hotplug,
 }: {
   value: NumaValues;
   onChange(value: NumaValues): void;
   errors: Record<string, string>;
+  /** 메모리 상한이 있는 VM: 목록은 켤 때 나눔이고 그 위의 메모리는 노드마다 고르게 더한다(리뷰 2). */
+  hotplug: boolean;
 }) {
   const { t } = useTranslation();
   const rows = value.list;
@@ -244,6 +257,7 @@ function NodeList({
   return (
     <fieldset className="flex flex-col gap-2 sm:col-span-2">
       <legend className="mb-1 text-sm font-medium">{t("numa.list.title")}</legend>
+      {hotplug && <p className="text-xs text-muted-foreground">{t("numa.list.hotplugHint")}</p>}
       {errors["numa.list"] && (
         <p role="alert" className="text-xs text-destructive">
           {t(errors["numa.list"])}
@@ -319,6 +333,7 @@ function NodeList({
 export function NumaSection({
   sockets,
   cores,
+  maxVcpus,
   value,
   onChange,
   onSockets,
@@ -331,6 +346,8 @@ export function NumaSection({
   sockets: number;
   /** 코어 칸(소켓당). 소켓을 바꿔도 vCPU 수가 같게 나눌 수 있는 소켓 수만 고르게 한다. */
   cores: string;
+  /** 핫플러그 vCPU 상한 칸(비면 없음). 상한도 소켓 수로 나뉘어야 한다(리뷰 2 웹). */
+  maxVcpus: string;
   value: NumaValues;
   onChange(value: NumaValues): void;
   onSockets(sockets: number): void;
@@ -356,9 +373,13 @@ export function NumaSection({
   const bound = value.policy === "dedicated" || value.hugepages !== "";
   const usage = useTopologyUsage(bound && perms.has("cluster.read"));
   const room = usage.data ? roomOn(usage.data.nodes, spec, own) : undefined;
-  // vCPU 수(소켓 × 코어)를 그대로 두는 소켓 수만(지금 값은 늘 보인다 — CLI로 만든 VM)
+  // vCPU 수(소켓 × 코어)를 그대로 두고 vCPU 상한도 나누는 소켓 수만(지금 값은 늘 보인다 — CLI로 만든 VM)
   const socketChoices = [...new Set([...SOCKET_CHOICES, sockets])]
-    .filter((n) => n === sockets || coresFor(sockets, cores, n) !== null)
+    .filter(
+      (n) =>
+        n === sockets ||
+        (coresFor(sockets, cores, n) !== null && (maxVcpus === "" || Number(maxVcpus) % n === 0)),
+    )
     .sort((a, b) => a - b);
   return (
     <details
@@ -405,8 +426,16 @@ export function NumaSection({
           canDedicate={canDedicate}
           errors={errors}
           list
+          hotplug={memoryHotplug(spec)}
         />
-        {value.mode === "list" && <NodeList value={value} onChange={onChange} errors={errors} />}
+        {value.mode === "list" && (
+          <NodeList
+            value={value}
+            onChange={onChange}
+            errors={errors}
+            hotplug={spec.max_memory_mib != null}
+          />
+        )}
         {room !== undefined && (
           <p
             role="status"
@@ -438,12 +467,18 @@ export function NumaChoice({
   sockets,
   value,
   onChange,
+  errors = {},
+  hotplug = false,
 }: {
   id: string;
-  /** 새 VM의 소켓 수(노드 수 고르기) */
+  /** 새 VM의 소켓 수(노드 수 고르기). 덮어쓴 vCPU 수가 있으면 1이다(서버의 `apply_overrides`). */
   sockets: number;
   value: NumaValues;
   onChange(value: NumaValues): void;
+  /** 덮어쓴 CPU·메모리로 다시 본 입력 오류([`numaErrors`], 리뷰 2 웹). 있으면 칸을 펼친다. */
+  errors?: Record<string, string>;
+  /** 새 VM이 메모리 핫플러그 VM이다(`any`는 2 MiB). */
+  hotplug?: boolean;
 }) {
   const { t } = useTranslation();
   const perms = usePermissions();
@@ -453,10 +488,19 @@ export function NumaChoice({
   const shown = { cpu: { cores: 1, ...n.cpu }, numa: n.numa, hugepages: n.hugepages } as VmSpec;
   // 전용·hugepages 원본을 권한 없이 복제하면 서버가 403이다: 미리 말하고 칸을 펼친다(리뷰 1 웹).
   const blocked = usesHostResources(shown) && !perms.anywhere("vm.dedicated");
+  const invalid = Object.keys(errors).length > 0;
+  // 직접 나누기는 여기서 고칠 수 없다(노드 수를 다시 고른다): 그 오류는 한 줄로 보인다.
+  const listErrors = [
+    ...new Set(
+      Object.entries(errors)
+        .filter(([k]) => k.startsWith("numa.list"))
+        .map(([, v]) => v),
+    ),
+  ];
   return (
     <details
       className="rounded-md border px-3 py-2"
-      open={open || blocked}
+      open={open || blocked || invalid}
       onToggle={(e) => setOpen(e.currentTarget.open)}
     >
       <summary className="cursor-pointer text-sm font-medium">
@@ -468,7 +512,12 @@ export function NumaChoice({
           {t("numa.form.needsPrivilege")}
         </p>
       )}
-      {(open || blocked) && (
+      {listErrors.length > 0 && (
+        <p role="alert" className="pt-2 text-sm text-destructive">
+          {listErrors.map((k) => t(k)).join(" ")}
+        </p>
+      )}
+      {(open || blocked || invalid) && (
         <div className="flex flex-col gap-3 pt-3">
           <NumaFields
             id={id}
@@ -476,8 +525,9 @@ export function NumaChoice({
             onChange={onChange}
             sockets={sockets}
             canDedicate={perms.anywhere("vm.dedicated")}
-            errors={{}}
+            errors={errors}
             list={false}
+            hotplug={hotplug}
           />
         </div>
       )}

@@ -270,3 +270,38 @@ it("explains why a running VM cannot become a template", async () => {
   // 연결 복제 디스크의 기반
   expect(await screen.findByText("disk0: linked clone of tmpl-root")).toBeInTheDocument();
 });
+
+/** 리뷰 2 웹 I1: vCPU를 덮어쓰면 소켓 1이라 템플릿의 게스트 NUMA 노드 둘은 틀린다 — 보내지 않고 알린다. */
+it("checks the template's NUMA nodes against an overridden vCPU count", async () => {
+  const numa = {
+    ...tmpl,
+    spec: {
+      ...tmpl.spec,
+      cpu: { ...tmpl.spec.cpu, sockets: 2, cores: 2 },
+      numa: { nodes: 2 },
+    },
+  };
+  mockLists({
+    vm: [numa],
+    volume: [root],
+    node: [NODE],
+    network: [lan, dmz],
+    "storage-pool": [pool("local")],
+  });
+  const bodies = captureDeploy();
+  renderPage(<TemplatesPage />);
+  const { user, dialog } = await openDeploy();
+  await user.type(within(dialog).getByLabelText("vCPUs"), "4");
+  expect(
+    await within(dialog).findByText(
+      "Choose a node count that divides the number of sockets (1–8).",
+    ),
+  ).toBeVisible();
+  await user.click(within(dialog).getByRole("button", { name: "Deploy" }));
+  expect(bodies).toEqual([]);
+  // 노드를 하나로 고르면 보낸다.
+  await user.selectOptions(within(dialog).getByLabelText("Guest NUMA nodes"), "1 NUMA node");
+  await user.click(within(dialog).getByRole("button", { name: "Deploy" }));
+  await waitFor(() => expect(bodies).toHaveLength(1));
+  expect(bodies[0]).toMatchObject({ vcpus: 4, numa: { nodes: 1 } });
+});

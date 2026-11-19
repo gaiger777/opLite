@@ -1,6 +1,6 @@
 import type { components } from "@/api/schema";
 import type { ImportRun, VmImport } from "@/api/types";
-import { emptyNuma, numaOverride, type NumaValues } from "@/numa/numa";
+import { emptyNuma, numaErrors, numaOverride, type NumaValues } from "@/numa/numa";
 import { MIN_MEMORY_MIB, validName } from "@/vms/form";
 
 type Schemas = components["schemas"];
@@ -191,6 +191,7 @@ export function validateRun(
   if (!intIn(form.memory, MIN_MEMORY_MIB, MAX_MEMORY_MIB)) {
     errors.memory = "vmForm.errors.memory";
   }
+  Object.assign(errors, runNumaErrors(form));
   for (const source of sourceNetworks(imp)) {
     // 제안한 네트워크가 그새 지워졌을 수도 있다.
     if (!networks.includes(form.networks[source] ?? "")) {
@@ -198,6 +199,20 @@ export function validateRun(
     }
   }
   return errors;
+}
+
+/**
+ * NUMA 칸을 폼의 소켓·코어·메모리로 다시 본 오류(리뷰 2 웹): 노드 수를 고른 뒤 소켓을 바꾸면 서버가 400
+ * `invalid_numa`로 거절했다. 가져오기에는 핫플러그 상한이 없다.
+ */
+export function runNumaErrors(form: RunForm): Record<string, string> {
+  return numaErrors(form.numa, {
+    sockets: Number(form.sockets) || 1,
+    cores: form.cores,
+    maxVcpus: "",
+    memory: form.memory,
+    maxMemory: "",
+  });
 }
 
 /** 실행 요청 본문. 폼의 값을 모두 보낸다(제안과 같아도). */
