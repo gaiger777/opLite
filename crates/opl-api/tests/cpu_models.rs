@@ -110,14 +110,9 @@ async fn models_are_pinned_and_checked_against_the_node_catalogs() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert_eq!(body["spec"]["cpu"]["model"], "Icelake-Server-v7");
     assert_eq!(body["spec"]["cpu"]["flags"], json!(["-avx512vbmi"]));
-    let details = audit_details(&env, "POST /vms").await;
-    assert!(
-        details.contains(
-            &"vm create web cpu=Icelake-Server-v7 (from Icelake-Server) cpu.flags=-avx512vbmi"
-                .to_string()
-        ),
-        "{details:?}"
-    );
+    let want = "vm create web cpu=Icelake-Server-v7 (from Icelake-Server) cpu.flags=-avx512vbmi";
+    let details = audit_details(&env, "POST /vms", |d| d.iter().any(|x| x == want)).await;
+    assert!(details.contains(&want.to_string()), "{details:?}");
     let (status, body) = admin
         .post("/vms", x86_request("lower", "skylake-server-v5", &[]))
         .await;
@@ -217,11 +212,9 @@ async fn models_are_pinned_and_checked_against_the_node_catalogs() {
     spec["cpu"]["flags"] = json!(["-avx512vbmi", "-aes"]);
     let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let details = audit_details(&env, "PUT /vms/{key}").await;
-    assert!(
-        details.contains(&"vm set web cpu.flags=-avx512vbmi,-aes".to_string()),
-        "{details:?}"
-    );
+    let want = "vm set web cpu.flags=-avx512vbmi,-aes";
+    let details = audit_details(&env, "PUT /vms/{key}", |d| d.iter().any(|x| x == want)).await;
+    assert!(details.contains(&want.to_string()), "{details:?}");
 }
 
 /// `GET /vms/{key}/cpu`·`/nodes/{key}/cpu`·`/cpu/models`·`/cpu/flags`·`/cpu/baseline`
@@ -409,11 +402,9 @@ async fn cpu_settings_are_checked_and_count_the_affected_vms() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["spec"]["cpu"]["mask"], json!(["aes", "avx512vbmi"]));
     assert_eq!(body["affected_running_vms"], 2, "{body}");
-    let details = audit_details(&env, "PATCH /settings").await;
-    assert!(
-        details.contains(&"settings cpu.mask=aes,avx512vbmi".to_string()),
-        "{details:?}"
-    );
+    let want = "settings cpu.mask=aes,avx512vbmi";
+    let details = audit_details(&env, "PATCH /settings", |d| d.iter().any(|x| x == want)).await;
+    assert!(details.contains(&want.to_string()), "{details:?}");
     let (status, body) = admin
         .patch(
             "/settings",
@@ -439,14 +430,11 @@ async fn cpu_settings_are_checked_and_count_the_affected_vms() {
         json!([{ "arch": "x86_64", "model": "Icelake-Server-v7" }])
     );
     // 리뷰 2 #7: 409를 넘었음을 감사에 남긴다.
-    let details = audit_details(&env, "PATCH /settings").await;
-    assert!(
-        details
-            .iter()
-            .any(|d| d.contains("cpu.pinned=x86_64:Icelake-Server-v7")
-                && d.contains("cpu.force=true")),
-        "{details:?}"
-    );
+    let forced = |d: &String| {
+        d.contains("cpu.pinned=x86_64:Icelake-Server-v7") && d.contains("cpu.force=true")
+    };
+    let details = audit_details(&env, "PATCH /settings", |d| d.iter().any(forced)).await;
+    assert!(details.iter().any(forced), "{details:?}");
     let (status, body) = admin
         .patch(
             "/settings",
@@ -686,22 +674,32 @@ fn baseline_records(env: &Env) -> Vec<TaskOp> {
 }
 
 /// 이 노드 감사 로그에서 `action`인 항목의 detail들
-async fn audit_details(env: &Env, action: &str) -> Vec<String> {
-    env.state
-        .audit
-        .read(AuditQuery {
-            since: 0,
-            until: u64::MAX,
-            user: None,
-            action: None,
-            limit: 1000,
-        })
-        .await
-        .unwrap()
-        .into_iter()
-        .filter(|e| e.action == action)
-        .filter_map(|e| e.detail)
-        .collect()
+/// `action`이 같은 감사 항목의 설명. 감사는 응답 뒤에 따로 적히므로 `ready`가 참이 될 때까지(아니면 `WAIT`까지)
+/// 다시 읽는다 — 느린 러너에서 아직 적히지 않은 항목을 놓치지 않게.
+async fn audit_details(env: &Env, action: &str, ready: impl Fn(&[String]) -> bool) -> Vec<String> {
+    let start = std::time::Instant::now();
+    loop {
+        let details: Vec<String> = env
+            .state
+            .audit
+            .read(AuditQuery {
+                since: 0,
+                until: u64::MAX,
+                user: None,
+                action: None,
+                limit: 1000,
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.action == action)
+            .filter_map(|e| e.detail)
+            .collect();
+        if ready(&details) || start.elapsed() > WAIT {
+            return details;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// 노드 셋에 약한 노드가 들어온다: 리더가 auto 기준을 내려 기록하고(기록 Task·감사), 앞 기준으로 도는 `cluster` VM은
@@ -801,14 +799,9 @@ async fn a_weaker_node_lowers_the_auto_baseline_and_running_vms_avoid_it() {
     // 기준이 그대로면 더 쓰지 않는다.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(baseline_records(&env).len(), 2);
-    let audits = audit_details(&env, "cpu.baseline").await;
-    assert!(
-        audits.contains(
-            &"cpu baseline x86_64 auto: Icelake-Server-v7 -> Skylake-Server-v5 (node n4)"
-                .to_string()
-        ),
-        "{audits:?}"
-    );
+    let want = "cpu baseline x86_64 auto: Icelake-Server-v7 -> Skylake-Server-v5 (node n4)";
+    let audits = audit_details(&env, "cpu.baseline", |d| d.iter().any(|x| x == want)).await;
+    assert!(audits.contains(&want.to_string()), "{audits:?}");
 
     // 앞 기준으로 도는 VM은 약한 노드로 옮기지 못한다.
     let (status, body) = admin
@@ -831,7 +824,7 @@ async fn a_weaker_node_lowers_the_auto_baseline_and_running_vms_avoid_it() {
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let start = std::time::Instant::now();
     loop {
-        let details = audit_details(&env, "POST /vms/{key}/migrate").await;
+        let details = audit_details(&env, "POST /vms/{key}/migrate", |_| true).await;
         if details.iter().any(|d| {
             d == "cpu-warning: target node \"n4\" lacks avx512vbmi that the guest may be using"
         }) {
