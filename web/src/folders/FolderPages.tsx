@@ -356,6 +356,17 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
   const [deleting, setDeleting] = useState(false);
   const kebab = useRef<HTMLButtonElement>(null);
   const usage = useFolderUsage(id, kind === "vm" && folder !== undefined);
+  // 읽을 수 없는 조상의 할당량은 서버가 빼고 보낸다(리뷰 1). 그런 조상이 있으면 안내한다.
+  const hiddenAbove = useMemo(() => {
+    let at = folder?.spec.parent;
+    for (let depth = 0; at && depth < 16; depth++) {
+      if (!perms.has("system.read", { type: "folder", id: at })) {
+        return true;
+      }
+      at = tree.byId.get(at)?.spec.parent;
+    }
+    return false;
+  }, [folder, perms, tree]);
   const tabs = DETAIL_TABS.filter((tab) => tab !== "quota" || kind === "vm");
   const tab = tabs.find((x) => x === params.get("tab")) ?? "contents";
 
@@ -445,6 +456,7 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
             <QuotaTab
               folder={folder}
               view={usage.data}
+              hiddenAbove={hiddenAbove}
               canEdit={canQuota}
               onEdit={() => setDialog("quota")}
             />
@@ -484,11 +496,14 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
 function QuotaTab({
   folder,
   view,
+  hiddenAbove,
   canEdit,
   onEdit,
 }: {
   folder: Folder;
   view: ReturnType<typeof useFolderUsage>["data"];
+  /** 읽을 수 없는 조상이 있다(그 할당량은 보이지 않는다) */
+  hiddenAbove: boolean;
   canEdit: boolean;
   onEdit(): void;
 }) {
@@ -498,6 +513,7 @@ function QuotaTab({
     <section className="flex flex-col gap-4 pt-2">
       <p className="text-sm text-muted-foreground">{t("folders.quotaHint")}</p>
       {!quota && <p className="text-sm">{t("folders.noQuota")}</p>}
+      {hiddenAbove && <p className="text-sm text-muted-foreground">{t("folders.hiddenLimits")}</p>}
       {view && view.limits.length > 0 && (
         <ul className="flex flex-col gap-1 text-sm">
           {view.limits.map((l) => (

@@ -78,13 +78,16 @@ export function NetworksPage() {
   // 계획 62: 네트워크마다 폴더가 다르다. 어딘가에 만들 수 있으면 만들기를, 행마다 그 네트워크의 권한으로 단추를
   // 보인다.
   const write = perms.anywhere("network.config");
+  // 브리지 네트워크(노드의 브리지 이름)는 루트 `cluster.admin`만 만든다. VXLAN 네트워크는 폴더의 `network.config`로
+  // 만든다(설계 §18 리뷰 1).
+  const bridges = perms.has("cluster.admin");
   const writes = (network: Network) =>
     perms.has("network.config", objectTarget("network", network));
   const delegates = (network: Network) =>
     perms.has("permission.modify", objectTarget("network", network));
   const actions = write || perms.anywhere("permission.modify");
   const [sharingPerms, setSharingPerms] = useState<Network | null>(null);
-  useCreateParam(() => setCreating(true), write);
+  useCreateParam(() => setCreating(true), write || bridges);
   // VM 목록을 다 읽기 전에는 모른다(undefined).
   const users = (network: Network) =>
     vms.isSuccess
@@ -97,7 +100,7 @@ export function NetworksPage() {
         id="networks-title"
         title={t("nav.networks")}
         actions={
-          write && (
+          (write || bridges) && (
             <Button onClick={() => setCreating(true)}>
               <Plus />
               {t("common.create")}
@@ -190,7 +193,7 @@ export function NetworksPage() {
           })}
         </TableBody>
       </Table>
-      {creating && <CreateNetworkDialog onClose={() => setCreating(false)} />}
+      {creating && <CreateNetworkDialog bridges={bridges} onClose={() => setCreating(false)} />}
       {sharingPerms && (
         <PermissionsSheet
           target={objectTarget("network", sharingPerms)}
@@ -219,13 +222,14 @@ export function NetworksPage() {
   );
 }
 
-function CreateNetworkDialog({ onClose }: { onClose(): void }) {
+/** `bridges`가 거짓이면(폴더 위임자) VXLAN만 만든다. */
+function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose(): void }) {
   const { t } = useTranslation();
   const folder = useNewFolder("network", "network.config");
   const nodes = useList("node");
   const bridgesId = useId();
   const [name, setName] = useState("");
-  const [kind, setKind] = useState<"bridge" | "vxlan">("bridge");
+  const [kind, setKind] = useState<"bridge" | "vxlan">(bridges ? "bridge" : "vxlan");
   const [bridge, setBridge] = useState("");
   const [vlan, setVlan] = useState("");
   const [vni, setVni] = useState("");
@@ -308,7 +312,9 @@ function CreateNetworkDialog({ onClose }: { onClose(): void }) {
             onChange={(e) => setKind(e.target.value as "bridge" | "vxlan")}
             {...a11y}
           >
-            <NativeSelectOption value="bridge">{t("networks.kinds.bridge")}</NativeSelectOption>
+            {bridges && (
+              <NativeSelectOption value="bridge">{t("networks.kinds.bridge")}</NativeSelectOption>
+            )}
             <NativeSelectOption value="vxlan">{t("networks.kinds.vxlan")}</NativeSelectOption>
           </NativeSelect>
         )}

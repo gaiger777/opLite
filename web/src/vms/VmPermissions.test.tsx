@@ -94,3 +94,40 @@ it("creates a VM in the user's folder without reading nodes or picking a machine
   expect(spec).not.toHaveProperty("machine");
   expect(nodesRead).toBe(false);
 });
+
+it("waits for the user's permissions before picking the new VM's folder", async () => {
+  // 폴더 목록이 먼저 오고 권한이 늦게 와도(새로 고침) 루트가 아니라 자기 폴더가 골라진다(리뷰 1).
+  let release!: () => void;
+  const late = new Promise<void>((resolve) => (release = resolve));
+  server.use(
+    http.get(apiUrl("/permissions/mine"), async () => {
+      await late;
+      return HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: { [A]: ["system.read"] },
+        contents: { [A]: ["system.read", "vm.create"] },
+        objects: [],
+      });
+    }),
+  );
+  mockLists({ folder: [folder("teamA")] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new", as: ALICE });
+  expect(await screen.findByText("Loading…")).toBeInTheDocument();
+  // 폴더 목록은 이미 왔다. 권한이 오기 전에는 폼을 열지 않는다(첫 값을 굳히므로).
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  expect(screen.queryByLabelText("Name")).not.toBeInTheDocument();
+  release();
+  expect(await screen.findByLabelText("Folder")).toHaveDisplayValue("/teamA");
+});
+
+it("keeps the VM name as the first column when folders exist", async () => {
+  mine(["system.read"]);
+  mockLists({ folder: [folder("teamA")], vm: [WEB] });
+  renderPage(<VmListPage />, { path: "/vms", as: ALICE });
+  await screen.findByRole("link", { name: "web" });
+  const headers = screen.getAllByRole("columnheader").map((h) => h.textContent);
+  expect(headers.indexOf("Name")).toBeLessThan(headers.indexOf("Folder"));
+  expect(headers.indexOf("State")).toBeLessThan(headers.indexOf("Folder"));
+});

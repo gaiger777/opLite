@@ -173,3 +173,93 @@ it("shows the forced enrollment with a QR code and recovery codes", async () => 
   await user.click(screen.getByRole("button", { name: "I saved them" }));
   await waitFor(() => expect(screen.getByText("home")).toBeInTheDocument());
 });
+
+it("tells the user to wait after too many wrong codes", async () => {
+  serverWith();
+  server.use(
+    http.post(apiUrl("/auth/login/second-factor"), () =>
+      HttpResponse.json(
+        { code: "too_many_attempts", message: "too many failed attempts; try again in 30 seconds" },
+        { status: 429 },
+      ),
+    ),
+  );
+  const user = userEvent.setup();
+  app();
+  await password(user);
+  await user.type(await screen.findByLabelText("Authentication code"), "000000");
+  await user.click(screen.getByRole("button", { name: "Verify" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Too many wrong attempts. Wait a while before trying again.",
+  );
+});
+
+it("finishes when another tab already passed the second step", async () => {
+  const { setState } = serverWith();
+  server.use(
+    http.post(apiUrl("/auth/login/second-factor"), () => {
+      setState("full");
+      return HttpResponse.json({ code: "already_signed_in", message: "done" }, { status: 409 });
+    }),
+  );
+  const user = userEvent.setup();
+  app("/login?next=%2F");
+  await password(user);
+  await user.type(await screen.findByLabelText("Authentication code"), "123456");
+  await user.click(screen.getByRole("button", { name: "Verify" }));
+  expect(await screen.findByText("home")).toBeInTheDocument();
+});
+
+it("says why sign-in is refused while the cluster is upgrading", async () => {
+  serverWith();
+  server.use(
+    http.post(apiUrl("/auth/login"), () =>
+      HttpResponse.json(
+        { code: "cluster_upgrading", message: "feature two-factor is not on every node" },
+        { status: 409 },
+      ),
+    ),
+  );
+  const user = userEvent.setup();
+  app();
+  await password(user);
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    /cannot accept it while it is being upgraded/,
+  );
+});
+
+it("explains a reloaded second step and offers to sign in again", async () => {
+  const { setState } = serverWith();
+  setState("pending");
+  app("/");
+  expect(await screen.findByText(/The page was reloaded/)).toBeInTheDocument();
+});
+
+it("explains instead of offering a passkey the browser cannot use", async () => {
+  // jsdom에는 WebAuthn이 없다(안전하지 않은 주소와 같다). 날것의 TypeError 대신 까닭을 보인다.
+  serverWith({
+    methods: ["webauthn", "recovery"],
+    enroll: false,
+    expires_at: 4102444800,
+    webauthn: {
+      allowCredentials: [],
+      challenge: "AA",
+      rpId: "opl.example.com",
+      timeout: 60000,
+      userVerification: "preferred",
+    },
+  });
+  const user = userEvent.setup();
+  app();
+  await password(user);
+  expect(await screen.findByText("This browser cannot use passkeys.")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Use a passkey" })).not.toBeInTheDocument();
+});
+
+it("hints that a passkey needs the domain name when only recovery codes are offered", async () => {
+  serverWith({ methods: ["recovery"], enroll: false, expires_at: 4102444800 });
+  const user = userEvent.setup();
+  app();
+  await password(user);
+  expect(await screen.findByText(/not an IP address/)).toBeInTheDocument();
+});

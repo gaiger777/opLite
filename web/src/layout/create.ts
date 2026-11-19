@@ -8,14 +8,15 @@ export interface CreateItem {
   to: string;
   /** 만드는 데 필요한 권한 */
   privilege: Privilege;
-  /** 루트에만 만든다(폴더가 없는 종류) */
+  /** 루트에서만 만든다(폴더가 없는 종류, 루트 권한만 받는 것) */
   root?: boolean;
 }
 
 export const CREATE_ITEMS: readonly CreateItem[] = [
   { id: "vm", to: "/vms/-new", privilege: "vm.create" },
   { id: "import", to: "/imports?create=1", privilege: "vm.create" },
-  { id: "pool", to: "/storage-pools?create=1", privilege: "storage.config" },
+  // 풀은 노드 자원이라 루트 `cluster.admin`만 만든다(계획 62 리뷰 1). 네트워크는 폴더에 VXLAN을 만들 수 있다.
+  { id: "pool", to: "/storage-pools?create=1", privilege: "cluster.admin", root: true },
   { id: "network", to: "/networks?create=1", privilege: "network.config" },
   { id: "backup-job", to: "/backup-jobs?create=1", privilege: "backup.job", root: true },
   { id: "iso", to: "/isos?create=1", privilege: "storage.allocate" },

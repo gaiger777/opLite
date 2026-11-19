@@ -7,6 +7,7 @@ import { Link } from "react-router";
 import { useAlerts } from "@/alerts/alerts";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
+import { usePermissions } from "@/auth/usePermissions";
 import type { Node, Vm } from "@/api/types";
 import { useIsPhone } from "@/components/data-table/DataTable";
 import { PageHeader } from "@/components/PageHeader";
@@ -64,12 +65,16 @@ function Stat({
 }
 
 /** 건강 띠(설계 §8.1): 노드 온라인, VM(실패), 울리는 경보, 리더. 혼합 버전 경고는 그 아래 줄이다. */
-function HealthStrip() {
+function HealthStrip({ clusterRead }: { clusterRead: boolean }) {
   const { t } = useTranslation();
   const nodes = useList("node");
   const vms = useList("vm");
   const alerts = useAlerts();
-  const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
+  const cluster = useQuery({
+    queryKey: ["cluster"],
+    queryFn: () => call(api.GET("/cluster")),
+    enabled: clusterRead,
+  });
   const allNodes = nodes.data ?? [];
   const allVms = vms.data ?? [];
   const count = (phase: Vm["status"]["phase"]) =>
@@ -90,15 +95,18 @@ function HealthStrip() {
   return (
     <section aria-label={t("dashboard.health")} className="flex flex-col gap-(--gap)">
       <div className="grid grid-cols-2 gap-(--gap) lg:grid-cols-4">
-        <Stat
-          title={t("dashboard.nodes")}
-          value={
-            nodes.data
-              ? `${allNodes.filter((n) => n.status.online).length} / ${allNodes.length}`
-              : waiting(t, nodes)
-          }
-          detail={nodes.data && t("dashboard.online")}
-        />
+        {/* 노드와 리더는 클러스터 읽기(루트 `cluster.read`)가 있어야 보인다(폴더 사용자는 VM과 경보만). */}
+        {clusterRead && (
+          <Stat
+            title={t("dashboard.nodes")}
+            value={
+              nodes.data
+                ? `${allNodes.filter((n) => n.status.online).length} / ${allNodes.length}`
+                : waiting(t, nodes)
+            }
+            detail={nodes.data && t("dashboard.online")}
+          />
+        )}
         <Stat
           title={t("dashboard.vms")}
           value={vms.data ? String(allVms.length) : waiting(t, vms)}
@@ -134,7 +142,9 @@ function HealthStrip() {
             </Link>
           }
         />
-        <Stat title={t("dashboard.leader")} value={leader} detail={cluster.data?.name} />
+        {clusterRead && (
+          <Stat title={t("dashboard.leader")} value={leader} detail={cluster.data?.name} />
+        )}
       </div>
       {/* 롤링 업그레이드 중이거나 멈춘 업그레이드가 있다. */}
       {versions.length > 1 && (
@@ -177,7 +187,13 @@ function RecentTasksWidget() {
 export function DashboardPage() {
   const { t } = useTranslation();
   const phone = useIsPhone();
+  // 용량·풀·차트·노드 부하·상위 VM은 클러스터 지표(`/metrics/cluster`)와 노드 목록을 읽어 루트 `cluster.read`가 있어야
+  // 한다. 없으면(폴더 사용자) 숨기고 한 줄로 알린다.
+  const clusterRead = usePermissions().has("cluster.read");
   const grid2 = "grid grid-cols-1 gap-(--gap) lg:grid-cols-2";
+  const hidden = !clusterRead && (
+    <p className="text-sm text-muted-foreground">{t("dashboard.clusterHidden")}</p>
+  );
   return (
     <div className="flex flex-col gap-(--gap)">
       <PageHeader title={t("nav.area.home")} />
@@ -186,29 +202,37 @@ export function DashboardPage() {
       {phone ? (
         <>
           <ActiveAlertsWidget />
-          <HealthStrip />
+          <HealthStrip clusterRead={clusterRead} />
           <FavoritesWidget />
-          <CapacityWidget />
-          <PoolUsageWidget />
+          {clusterRead && <CapacityWidget />}
+          {clusterRead && <PoolUsageWidget />}
           <RecentTasksWidget />
+          {hidden}
         </>
       ) : (
         <>
-          <HealthStrip />
-          <div className="grid grid-cols-1 gap-(--gap) lg:grid-cols-3">
+          <HealthStrip clusterRead={clusterRead} />
+          {clusterRead ? (
+            <>
+              <div className="grid grid-cols-1 gap-(--gap) lg:grid-cols-3">
+                <ActiveAlertsWidget />
+                <CapacityWidget />
+                <PoolUsageWidget />
+              </div>
+              <ClusterChartsWidget />
+              <div className={grid2}>
+                <NodeStripWidget />
+                <TopVmsWidget />
+              </div>
+            </>
+          ) : (
             <ActiveAlertsWidget />
-            <CapacityWidget />
-            <PoolUsageWidget />
-          </div>
-          <ClusterChartsWidget />
-          <div className={grid2}>
-            <NodeStripWidget />
-            <TopVmsWidget />
-          </div>
+          )}
           <div className={grid2}>
             <RecentTasksWidget />
             <FavoritesWidget />
           </div>
+          {hidden}
         </>
       )}
     </div>

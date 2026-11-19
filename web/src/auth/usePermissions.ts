@@ -19,6 +19,15 @@ export function fetchPermissions() {
  * admin처럼 모두 보인다.
  */
 export function usePermissions(): Permissions {
+  const { me, mine } = useMine();
+  const role = me?.role ?? "admin";
+  return useMemo(
+    () => (mine.data ? new Permissions(mine.data) : Permissions.fromRole(role)),
+    [mine.data, role],
+  );
+}
+
+function useMine() {
   const me = useOptionalPrincipal();
   const mine = useQuery({
     queryKey: PERMISSIONS_KEY,
@@ -27,11 +36,16 @@ export function usePermissions(): Permissions {
     retry: false,
     enabled: me !== null,
   });
-  const role = me?.role ?? "admin";
-  return useMemo(
-    () => (mine.data ? new Permissions(mine.data) : Permissions.fromRole(role)),
-    [mine.data, role],
-  );
+  return { me, mine };
+}
+
+/**
+ * 내 권한을 한 번이라도 받았거나 받지 못했는지(그 전의 `usePermissions()`는 전역 역할로 본 값이다). 권한으로 기본값을
+ * 정하는 화면(새 VM의 폴더)과 "권한 없음" 안내가 기다린다.
+ */
+export function usePermissionsReady(): boolean {
+  const { me, mine } = useMine();
+  return me === null || mine.isFetched;
 }
 
 /** 탭 보이기·마지막 탭 기억에 쓰는 사용자와 권한(`nav.ts`의 `NavUser`) */

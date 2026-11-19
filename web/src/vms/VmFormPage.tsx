@@ -7,7 +7,7 @@ import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
 import type { Permissions } from "@/auth/permissions";
-import { usePermissions } from "@/auth/usePermissions";
+import { usePermissions, usePermissionsReady } from "@/auth/usePermissions";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -52,12 +52,14 @@ import { useVmByName } from "@/vms/VmDetailPage";
 
 export function VmCreatePage() {
   const perms = usePermissions();
+  const ready = usePermissionsReady();
   const nodes = useList("node");
   const folders = useList("folder");
   const [params] = useSearchParams();
   // 노드 목록을 읽을 수 없는 폴더 사용자는 머신을 서버에 맡긴다(계획 62).
   const readsNodes = perms.reads("node");
-  if ((readsNodes && !nodes.data) || !folders.data) {
+  // 기본 폴더는 내 권한을 받은 뒤에 정한다(전역 역할만 본 값으로는 폴더 사용자가 루트를 받는다, 폼이 첫 값을 굳힌다).
+  if (!ready || (readsNodes && !nodes.data) || !folders.data) {
     return <ListPending error={nodes.error ?? folders.error} />;
   }
   const folder = defaultFolder(perms, folderTree(folders.data, "vm"), params.get("folder"));

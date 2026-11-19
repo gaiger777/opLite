@@ -64,18 +64,6 @@ export function VmListPage() {
   }, [nodes.data]);
 
   const columns: Column<Vm>[] = [
-    // 계획 62: 폴더가 하나라도 보이면 폴더 열을 둔다.
-    ...(tree.folders.length > 0
-      ? [
-          {
-            id: "folder",
-            header: t("folders.folder"),
-            value: (vm: Vm) => folderPath(tree, vm.spec.folder),
-            cell: (vm: Vm) => folderPath(tree, vm.spec.folder),
-            priority: 2 as const,
-          },
-        ]
-      : []),
     {
       id: "name",
       header: t("common.name"),
@@ -107,6 +95,18 @@ export function VmListPage() {
       value: (vm) => vm.status.phase,
       cell: (vm) => <VmPhaseBadge vm={vm} />,
     },
+    // 계획 62: 폴더가 하나라도 보이면 폴더 열을 둔다. 이름 뒤에 둔다(휴대폰 카드 제목은 첫 열이다).
+    ...(tree.folders.length > 0
+      ? [
+          {
+            id: "folder",
+            header: t("folders.folder"),
+            value: (vm: Vm) => folderPath(tree, vm.spec.folder),
+            cell: (vm: Vm) => folderPath(tree, vm.spec.folder),
+            priority: 2 as const,
+          },
+        ]
+      : []),
     {
       id: "node",
       header: t("common.node"),

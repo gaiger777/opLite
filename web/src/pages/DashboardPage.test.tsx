@@ -398,3 +398,45 @@ it("puts alerts, the health strip and favorites first on a phone", async () => {
     media.mockRestore();
   }
 });
+
+it("leaves out the cluster widgets for a folder-only user instead of loading forever", async () => {
+  // 루트 권한이 없는 폴더 사용자(계획 62 리뷰 1): 노드·리더·용량·차트를 묻지 않고 한 줄로 알린다.
+  const asked: string[] = [];
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/cluster"), () => {
+      asked.push("cluster");
+      return HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 });
+    }),
+    http.get(apiUrl("/metrics/cluster"), () => {
+      asked.push("metrics");
+      return HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 });
+    }),
+    http.get(apiUrl("/alerts"), () =>
+      HttpResponse.json({ alerts: [], unreachable: [], unsupported: [] }),
+    ),
+  );
+  mockLists({ vm: [vm("web", "running")] });
+  renderPage(<DashboardPage />, { as: { ...ADMIN, role: "none" } });
+  expect(
+    await screen.findByText(
+      "Nodes, capacity and cluster charts need permission to read the cluster.",
+    ),
+  ).toBeInTheDocument();
+  const health = screen.getByRole("region", { name: "Cluster health" });
+  expect(within(health).getByRole("group", { name: "Virtual machines" })).toBeInTheDocument();
+  expect(within(health).queryByRole("group", { name: "Nodes" })).not.toBeInTheDocument();
+  expect(within(health).queryByRole("group", { name: "Leader" })).not.toBeInTheDocument();
+  await vi.waitFor(() => expect(screen.queryByText("Loading…")).not.toBeInTheDocument());
+  expect(screen.queryByText("You do not have permission to do this.")).not.toBeInTheDocument();
+  expect(asked).toEqual([]);
+});

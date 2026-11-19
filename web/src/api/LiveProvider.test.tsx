@@ -2,7 +2,7 @@ import { QueryClientProvider } from "@tanstack/react-query";
 import { render, screen } from "@testing-library/react";
 import { http, HttpResponse, ws } from "msw";
 
-import { listKey, useList, useSettings, useSubscription } from "@/api/live";
+import { listKey, SETTINGS_KEY, useList, useSettings, useSubscription } from "@/api/live";
 import { LiveProvider, useLiveStatus } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
 import { apiUrl, server } from "@/test/server";
@@ -330,4 +330,35 @@ it("reads and watches only what a folder user can read at the root", async () =>
     "kinds=vm,volume,storage-pool,task,network,snapshot,backup,vm-import,folder&since=7",
   );
   expect(read).toEqual([]);
+});
+
+it("drops the lists of kinds the user can no longer read", async () => {
+  // 권한을 잃은 뒤 다시 연결하면(watch가 `permissions`로 닫힘) 읽을 수 없는 종류의 옛 목록을 버린다(리뷰 1).
+  server.use(
+    ...lists([vm("web", 3, "stopped")], 7),
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  const queryClient = createQueryClient();
+  queryClient.setQueryData(listKey("node"), { revision: 1, items: [{ id: "n1" }] });
+  queryClient.setQueryData(SETTINGS_KEY, { revision: 1 });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <LiveProvider>
+        <Probe />
+      </LiveProvider>
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText("live: web=stopped")).toBeInTheDocument();
+  expect(queryClient.getQueryData(listKey("node"))).toBeUndefined();
+  expect(queryClient.getQueryData(SETTINGS_KEY)).toBeUndefined();
+  expect(queryClient.getQueryData(listKey("vm"))).toBeDefined();
 });

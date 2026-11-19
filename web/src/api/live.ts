@@ -138,21 +138,28 @@ export function useList<K extends WatchKind>(kind: K) {
   });
 }
 
-/** 클러스터 설정. 아직 저장한 적이 없으면 서버가 기본값(revision 0)을 돌려준다. */
+/**
+ * 클러스터 설정. 아직 저장한 적이 없으면 서버가 기본값(revision 0)을 돌려준다. 루트 `cluster.read`가 없으면 묻지
+ * 않는다(403이고, 권한을 잃으면 `LiveProvider`가 옛 값을 버린다).
+ */
 export function useSettings() {
+  const readable = usePermissions().reads("settings");
   return useQuery({
     queryKey: SETTINGS_KEY,
     queryFn: () => call(api.GET("/settings")),
     staleTime: Infinity,
+    enabled: readable,
   });
 }
 
 /** 구독 상태. 노드 수와 시각으로 서버가 계산한다. 시각에 따라 만료되므로 한 시간마다 다시 읽는다. */
 export function useSubscription() {
+  const readable = usePermissions().reads("settings");
   return useQuery({
     queryKey: SUBSCRIPTION_KEY,
     queryFn: () => call(api.GET("/subscription")),
     staleTime: Infinity,
     refetchInterval: SUBSCRIPTION_REFRESH_MS,
+    enabled: readable,
   });
 }

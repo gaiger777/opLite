@@ -74,11 +74,20 @@ export function RecoveryCodes({ codes, onDone }: { codes: string[]; onDone(): vo
 
 type Enrollment = components["schemas"]["TotpEnrollment"];
 
+/** 본인 확인(지금 요소의 코드·복구 코드 또는 로컬 비밀번호) */
+export type Proof = { code: string } | { password: string };
+
+/**
+ * 이미 요소가 있으면 요소를 더하기 전에 본인 확인을 묻는다(서버 400 `proof_required`, 설계 §18 리뷰 1). 부르는 쪽이
+ * 확인 창을 열고 받은 확인으로 `send`를 부른다(실패하면 그 창에 오류를 보인다). 없으면(첫 요소·강제 등록) 바로 보낸다.
+ */
+export type Prove = (title: string, send: (proof: Proof) => Promise<void>) => void;
+
 /**
  * 인증 앱 등록: 시작하면 QR과 비밀(직접 입력용)을 보이고, 앱의 코드를 확인하면 끝난다. 첫 요소면 복구 코드를 준다
  * (`onDone(codes)`, 아니면 빈 목록).
  */
-export function TotpSetup({ onDone }: { onDone(codes: string[]): void }) {
+export function TotpSetup({ onDone, prove }: { onDone(codes: string[]): void; prove?: Prove }) {
   const { t } = useTranslation();
   const [enrollment, setEnrollment] = useState<Enrollment | null>(null);
   const [code, setCode] = useState("");
@@ -99,13 +108,21 @@ export function TotpSetup({ onDone }: { onDone(codes: string[]): void }) {
 
   async function confirm(e: React.FormEvent) {
     e.preventDefault();
+    const send = async (proof?: Proof) => {
+      const result = await call(
+        api.POST("/auth/2fa/totp/confirm", { body: { code: code.replace(/\s/g, ""), proof } }),
+      );
+      onDone(result.codes);
+    };
+    if (prove) {
+      setError(null);
+      prove(t("twoFactor.setUpApp"), send);
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
-      const result = await call(
-        api.POST("/auth/2fa/totp/confirm", { body: { code: code.replace(/\s/g, "") } }),
-      );
-      onDone(result.codes);
+      await send();
     } catch (err) {
       setError(errorMessage(t, err));
     } finally {
@@ -165,36 +182,48 @@ export function TotpSetup({ onDone }: { onDone(codes: string[]): void }) {
 }
 
 /** 패스키 등록: 이름을 받고 브라우저 창을 연다. 첫 요소면 복구 코드를 준다. */
-export function PasskeySetup({ onDone }: { onDone(codes: string[]): void }) {
+export function PasskeySetup({ onDone, prove }: { onDone(codes: string[]): void; prove?: Prove }) {
   const { t } = useTranslation();
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  async function add(e: React.FormEvent) {
-    e.preventDefault();
-    setBusy(true);
-    setError(null);
+  const send = async (proof?: Proof) => {
+    const start = await call(api.POST("/auth/2fa/webauthn/register"));
+    let cred: PublicKeyCredential | null;
     try {
-      const start = await call(api.POST("/auth/2fa/webauthn/register"));
-      const cred = (await navigator.credentials.create({
+      cred = (await navigator.credentials.create({
         publicKey: creationOptions(start.options),
       })) as PublicKeyCredential | null;
-      if (!cred) {
-        return;
-      }
-      const result = await call(
-        api.POST("/auth/2fa/webauthn/register/finish", {
-          body: { token: start.token, name: name.trim(), credential: registrationJson(cred) },
-        }),
-      );
-      onDone(result.recovery_codes);
     } catch (err) {
-      setError(
-        err instanceof DOMException && err.name === "NotAllowedError"
-          ? t("twoFactor.passkeyCancelled")
-          : errorMessage(t, err),
-      );
+      throw err instanceof DOMException && err.name === "NotAllowedError"
+        ? new Error(t("twoFactor.passkeyCancelled"))
+        : err;
+    }
+    if (!cred) {
+      return;
+    }
+    const result = await call(
+      api.POST("/auth/2fa/webauthn/register/finish", {
+        body: { token: start.token, name: name.trim(), credential: registrationJson(cred), proof },
+      }),
+    );
+    onDone(result.recovery_codes);
+  };
+
+  async function add(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    // 이미 요소가 있으면 본인 확인 창에서 등록 전체를 한다(창의 단추가 브라우저 패스키 창을 여는 사용자 동작이다).
+    if (prove) {
+      prove(t("twoFactor.addPasskey"), send);
+      return;
+    }
+    setBusy(true);
+    try {
+      await send();
+    } catch (err) {
+      setError(errorMessage(t, err));
     } finally {
       setBusy(false);
     }

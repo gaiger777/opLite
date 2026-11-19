@@ -86,13 +86,19 @@ export function ClusterSwitch() {
   const perms = usePermissions();
   const navigate = useNavigate();
   const [open, setOpen] = useState(false);
+  // 클러스터 이름은 루트 `cluster.read`가 있어야 읽는다(폴더 사용자에게는 전환을 두지 않는다).
+  const clusterRead = perms.has("cluster.read");
   const cluster = useQuery({
     queryKey: ["cluster"],
     queryFn: () => call(api.GET("/cluster")),
+    enabled: clusterRead,
   });
   const readRemotes = perms.can("read", "remote");
   const remotes = useRemotes(open && readRemotes);
   const name = cluster.data?.name ?? "";
+  if (!clusterRead) {
+    return null;
+  }
   return (
     <DropdownMenu open={open} onOpenChange={setOpen}>
       <DropdownMenuTrigger asChild>

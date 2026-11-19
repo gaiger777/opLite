@@ -71,6 +71,16 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           );
         kinds = KINDS.filter((kind) => perms.reads(kind));
         settings = perms.reads("settings");
+        // 더는 읽을 수 없는 종류(권한을 잃었다)의 옛 목록은 버린다. 남겨 두면 다시 바뀌지 않는 목록이 보인다.
+        for (const kind of KINDS) {
+          if (!kinds.includes(kind)) {
+            queryClient.removeQueries({ queryKey: listKey(kind) });
+          }
+        }
+        if (!settings) {
+          queryClient.removeQueries({ queryKey: SETTINGS_KEY });
+          queryClient.removeQueries({ queryKey: SUBSCRIPTION_KEY });
+        }
         const lists = await Promise.all(
           kinds.map((kind) =>
             // 다시 시도는 여기의 backoff만 한다.

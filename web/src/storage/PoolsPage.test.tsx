@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { PoolsPage } from "@/storage/PoolsPage";
-import { backup, CEPH, NODE, pool, poolState, vm, volume } from "@/test/fixtures";
+import { backup, CEPH, folder, folderId, NODE, pool, poolState, vm, volume } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -865,4 +865,26 @@ it("marks the pools of the Ceph cluster Orbivisor set up", async () => {
   const managed = (await within(table).findByText("vms")).closest("tr")!;
   expect(await within(managed).findByText("Orbivisor Ceph")).toBeInTheDocument();
   expect(within(table).getByText("ext").closest("tr")).not.toHaveTextContent("Orbivisor Ceph");
+});
+
+it("hides pool creation from a folder storage delegator", async () => {
+  // 풀 만들기는 노드 자원이라 루트 cluster.admin만(계획 62 리뷰 1). 폴더의 storage.config는 그 폴더 풀만 다룬다.
+  const A = folderId("store");
+  const mine = { ...pool("p1"), spec: { ...pool("p1").spec, folder: A } };
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: { [A]: ["system.read", "storage.config"] },
+        objects: [],
+      }),
+    ),
+  );
+  mockLists({ folder: [folder("store", "storage")], "storage-pool": [mine] });
+  renderPage(<PoolsPage />, { path: "/storage-pools", as: { ...ADMIN, role: "none" } });
+  expect(await screen.findByRole("button", { name: "Delete p1" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
 });

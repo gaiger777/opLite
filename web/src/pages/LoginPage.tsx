@@ -3,10 +3,10 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Navigate, useSearchParams } from "react-router";
 
-import { getAssertion } from "@/accounts/webauthn";
+import { getAssertion, passkeysSupported } from "@/accounts/webauthn";
 import { api, ApiError, call } from "@/api/client";
 import type { SecondFactorPrompt } from "@/api/types";
-import { useAuth } from "@/auth/AuthProvider";
+import { isUnknownPrompt, useAuth } from "@/auth/AuthProvider";
 import { safeNext } from "@/auth/RequireAuth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -101,7 +101,12 @@ export function LoginPage() {
     try {
       await login(username, password, realm === "local" ? undefined : realm);
     } catch (err) {
-      setError(errorMessage(t, err));
+      // 로그인 전용 문구(`login.<code>`, 예: 업그레이드 중이라 2단계 인증 등록을 받을 수 없다)를 먼저 찾는다.
+      setError(
+        err instanceof ApiError
+          ? codeMessage(t, err.code, err.message, "login")
+          : errorMessage(t, err),
+      );
     } finally {
       setBusy(false);
     }
@@ -221,12 +226,17 @@ function LoginCard({ children }: { children: React.ReactNode }) {
  */
 function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
   const { t } = useTranslation();
-  const { secondFactor, needEnrollment, logout } = useAuth();
+  const { secondFactor, needEnrollment, finishEnrollment, logout } = useAuth();
   const [recovery, setRecovery] = useState(!prompt.methods.includes("totp"));
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const passkey = prompt.methods.includes("webauthn") && prompt.webauthn;
+  // 새로 고침 뒤에는 둘째 단계의 방법(패스키·강제 등록)을 모른다. 다시 로그인하면 진짜 안내를 받는다.
+  const unknown = isUnknownPrompt(prompt);
+  // 인증 앱도 패스키도 묻지 않고 복구 코드만 물으면 요소는 패스키뿐인데 이 주소(IP)에서는 쓸 수 없다.
+  const passkeyElsewhere =
+    !unknown && !prompt.methods.includes("totp") && !prompt.methods.includes("webauthn");
 
   async function send(body: Parameters<typeof secondFactor>[0]) {
     setBusy(true);
@@ -236,6 +246,9 @@ function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
     } catch (err) {
       if (err instanceof ApiError && err.code === "enrollment_required") {
         needEnrollment();
+      } else if (err instanceof ApiError && err.code === "already_signed_in") {
+        // 다른 탭에서 둘째 단계를 이미 마쳤다(같은 쿠키가 정식 세션이다).
+        await finishEnrollment();
       } else if (
         err instanceof ApiError &&
         err.status === 401 &&
@@ -244,7 +257,12 @@ function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
         // 대기 세션이 끝났다(5분). 비밀번호부터 다시 한다.
         await logout();
       } else {
-        setError(errorMessage(t, err));
+        // 시도 제한(429)은 둘째 단계 전용 문구로 기다리라고 알린다.
+        setError(
+          err instanceof ApiError
+            ? codeMessage(t, err.code, err.message, "login.secondFactor")
+            : errorMessage(t, err),
+        );
       }
     } finally {
       setBusy(false);
@@ -255,21 +273,36 @@ function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
     if (!prompt.webauthn) {
       return;
     }
+    // 브라우저 패스키 창이 열린 동안 코드 폼을 내지 못하게 한다.
+    setBusy(true);
+    setError(null);
+    let credential;
     try {
-      const credential = await getAssertion(prompt.webauthn);
-      if (credential) {
-        await send({ webauthn: credential });
-      }
+      credential = await getAssertion(prompt.webauthn);
     } catch (err) {
       setError(errorMessage(t, err));
+      return;
+    } finally {
+      setBusy(false);
+    }
+    if (credential) {
+      await send({ webauthn: credential });
     }
   }
 
   return (
     <div className="flex flex-col gap-4">
+      {unknown && (
+        <p role="status" className="text-sm">
+          {t("login.secondFactor.reloaded")}
+        </p>
+      )}
       <p className="text-sm text-muted-foreground">
         {t(recovery ? "login.secondFactor.recoveryHint" : "login.secondFactor.hint")}
       </p>
+      {passkeyElsewhere && (
+        <p className="text-sm text-muted-foreground">{t("login.secondFactor.passkeyDomain")}</p>
+      )}
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -303,11 +336,14 @@ function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
           {t("login.secondFactor.verify")}
         </Button>
       </form>
-      {passkey && (
-        <Button variant="outline" disabled={busy} onClick={() => void signInWithPasskey()}>
-          {t("login.secondFactor.passkey")}
-        </Button>
-      )}
+      {passkey &&
+        (passkeysSupported() ? (
+          <Button variant="outline" disabled={busy} onClick={() => void signInWithPasskey()}>
+            {t("login.secondFactor.passkey")}
+          </Button>
+        ) : (
+          <p className="text-sm text-muted-foreground">{t("twoFactor.passkeyBrowser")}</p>
+        ))}
       <div className="flex flex-wrap justify-between gap-2">
         {prompt.methods.includes("recovery") && prompt.methods.includes("totp") && (
           <Button
@@ -322,7 +358,11 @@ function SecondFactorStep({ prompt }: { prompt: SecondFactorPrompt }) {
             {t(recovery ? "login.secondFactor.useCode" : "login.secondFactor.useRecovery")}
           </Button>
         )}
-        <Button variant="link" className="px-0" onClick={() => void logout()}>
+        <Button
+          variant={unknown ? "default" : "link"}
+          className={unknown ? undefined : "px-0"}
+          onClick={() => void logout()}
+        >
           {t("twoFactor.backToLogin")}
         </Button>
       </div>

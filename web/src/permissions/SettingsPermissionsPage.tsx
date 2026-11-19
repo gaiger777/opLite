@@ -10,6 +10,7 @@ import { api, ApiError, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { AccessRole, ExternalGroupRef, Grant, Group } from "@/api/types";
 import { PRIVILEGES, type Privilege, type Target } from "@/auth/permissions";
+import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
@@ -32,7 +33,9 @@ import {
 import { folderPath, folderTree } from "@/folders/folders";
 import { useFolderPaths } from "@/folders/useFolderPaths";
 import {
+  grantError,
   principalName,
+  revokesSelf,
   roleName,
   targetLabel,
   useAccessRoles,
@@ -71,6 +74,10 @@ export function GrantsPage() {
   const folders = useList("folder");
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<Grant | null>(null);
+  const me = usePrincipal();
+  const groups = useGroups(admin);
+  // 나(나의 그룹)에게 건 grant를 빼면 이름을 넣어 확인한다.
+  const self = removing !== null && revokesSelf(removing, me.user, { groups: groups.data });
   const changed = () =>
     Promise.all([
       queryClient.invalidateQueries({ queryKey: ["grants"] }),
@@ -173,10 +180,15 @@ export function GrantsPage() {
         title={t("permissions.removeTitle", {
           name: removing ? principalName(removing.spec.principal, names) : "",
         })}
-        description={t("permissions.removeDescription")}
+        description={t(self ? "permissions.removeSelf" : "permissions.removeDescription")}
+        typeToConfirm={self && removing ? principalName(removing.spec.principal, names) : undefined}
         confirmLabel={t("permissions.remove")}
         onConfirm={async () => {
-          await call(api.DELETE("/grants/{id}", { params: { path: { id: removing!.id } } }));
+          try {
+            await call(api.DELETE("/grants/{id}", { params: { path: { id: removing!.id } } }));
+          } catch (err) {
+            throw grantError(t, err);
+          }
           toast.success(t("permissions.removed"));
           await changed();
         }}

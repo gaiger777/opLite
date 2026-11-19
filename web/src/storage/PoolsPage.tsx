@@ -63,12 +63,15 @@ export function PoolsPage() {
   const [sharingOpen, setSharingOpen] = useState(false);
   // 계획 62: 풀마다 폴더가 다르다. 어딘가에 만들 수 있으면 만들기를, 행마다 그 풀의 권한으로 단추를 보인다.
   const write = perms.anywhere("storage.config");
+  // 풀 만들기는 노드 자원(경로·VG·데이터셋·Ceph·NFS)을 쓰므로 루트 `cluster.admin`만(설계 §18 리뷰 1). 폴더의
+  // `storage.config`는 그 폴더 풀의 바꾸기·지우기만 덮는다.
+  const create = perms.has("cluster.admin");
   const writes = (pool: StoragePool) =>
     perms.has("storage.config", objectTarget("storage-pool", pool));
   const delegates = (pool: StoragePool) =>
     perms.has("permission.modify", objectTarget("storage-pool", pool));
   const [sharingPerms, setSharingPerms] = useState<StoragePool | null>(null);
-  useCreateParam(() => setCreating(true), write);
+  useCreateParam(() => setCreating(true), create);
   const state = useTableState("pools");
 
   const nodeList = useMemo(() => nodes.data ?? [], [nodes.data]);
@@ -275,7 +278,7 @@ export function PoolsPage() {
         id="pools-title"
         title={t("nav.pools")}
         actions={
-          write && (
+          create && (
             <Button onClick={() => setCreating(true)}>
               <Plus />
               {t("common.create")}

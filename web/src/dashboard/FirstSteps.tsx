@@ -28,7 +28,8 @@ export function FirstSteps() {
       id: "pool",
       done: pools.data.length > 0,
       to: "/storage-pools?create=1",
-      allowed: perms.can("write", "storage-pool"),
+      // 풀 만들기는 루트 `cluster.admin`만(계획 62 리뷰 1)
+      allowed: perms.has("cluster.admin"),
     },
     {
       id: "media",

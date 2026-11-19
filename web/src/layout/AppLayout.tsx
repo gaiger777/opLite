@@ -1,4 +1,4 @@
-import { Lock, Menu, Monitor, Moon, Sun, User, WifiOff } from "lucide-react";
+import { Lock, Menu, Monitor, Moon, ShieldOff, Sun, User, WifiOff } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Outlet, useLocation, useNavigate } from "react-router";
@@ -6,7 +6,9 @@ import { Outlet, useLocation, useNavigate } from "react-router";
 import { ChangePasswordDialog } from "@/accounts/ChangePasswordDialog";
 import { useLiveStatus } from "@/api/LiveProvider";
 import { useAuth, usePrincipal } from "@/auth/AuthProvider";
-import { useNavUser } from "@/auth/usePermissions";
+import { useNavUser, usePermissionsReady } from "@/auth/usePermissions";
+import { EmptyState } from "@/components/EmptyState";
+import { PageHeader } from "@/components/PageHeader";
 import { ACTION_ICONS } from "@/components/icons";
 import { Button } from "@/components/ui/button";
 import {
@@ -27,7 +29,15 @@ import { type Language, setLanguage } from "@/i18n";
 import { AreaTabs, ViewSwitch } from "@/layout/AreaTabs";
 import { Breadcrumbs } from "@/layout/Breadcrumbs";
 import { ClusterSwitch, CreateMenu, SearchButton } from "@/layout/HeaderTools";
-import { AREAS, crumbsOf, isFullWidth, lastTab, rememberTab } from "@/layout/nav";
+import {
+  AREAS,
+  areaOf,
+  crumbsOf,
+  isFullWidth,
+  lastTab,
+  rememberTab,
+  tabVisible,
+} from "@/layout/nav";
 import { NavProgress } from "@/layout/RouteError";
 import { NotificationBell } from "@/layout/NotificationBell";
 import { ShortcutsHelp } from "@/layout/ShortcutsHelp";
@@ -51,6 +61,10 @@ export function AppLayout() {
   const main = useRef<HTMLElement>(null);
   const [announce, setAnnounce] = useState("");
   const full = isFullWidth(pathname);
+  // 숨긴 탭의 주소를 바로 열면(`/nodes` 등) 그 화면은 묻지 않는 목록을 끝없이 기다린다. 권한을 받은 뒤 안내로 바꾼다.
+  const ready = usePermissionsReady();
+  const hit = areaOf(pathname);
+  const denied = ready && hit !== null && !tabVisible(hit.tab, me.gate);
   const { rail, toggle: toggleRail } = useRail();
   const [palette, setPalette] = useState(false);
   const [help, setHelp] = useState(false);
@@ -140,7 +154,14 @@ export function AppLayout() {
           {!full && <AreaTabs />}
           {!full && <ViewSwitch />}
           <div className="min-w-0">
-            <Outlet />
+            {denied ? (
+              <div className="flex flex-col gap-4">
+                <PageHeader title={t(hit.tab.key)} />
+                <EmptyState icon={ShieldOff} title={t("nav.noAccess")} />
+              </div>
+            ) : (
+              <Outlet />
+            )}
           </div>
         </main>
         <div aria-live="polite" className="sr-only">

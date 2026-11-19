@@ -118,7 +118,9 @@
     "passkey_exists": "This passkey is already registered.",
     "too_many_passkeys": "You have the most passkeys allowed (16). Remove one first.",
     "role_in_use": "Permissions use this role. Remove them first: {{message}}",
-    "no_second_factor": "Set up an authenticator app or a passkey first."
+    "no_second_factor": "Set up an authenticator app or a passkey first.",
+    "proof_required": "Confirm it is you first: enter a code from a factor you already have, a recovery code, or your password.",
+    "already_enrolled": "Two-factor sign-in is already set up for this account. Sign in again."
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -179,7 +181,8 @@
     "roles": "Roles",
     "groups": "Groups",
     "security": "Security",
-    "account": "Two-step verification"
+    "account": "Two-step verification",
+    "noAccess": "You do not have permission to view this page."
   },
   "header": {
     "language": "Language",
@@ -220,8 +223,12 @@
       "verify": "Verify",
       "passkey": "Use a passkey",
       "useRecovery": "Use a recovery code",
-      "useCode": "Use the authenticator app"
-    }
+      "useCode": "Use the authenticator app",
+      "too_many_attempts": "Too many wrong attempts. Wait a while before trying again.",
+      "reloaded": "The page was reloaded, so other ways to sign in (such as a passkey) are not shown. Go back to sign in to see them.",
+      "passkeyDomain": "Your passkey works only when you open this page by its domain name, not an IP address."
+    },
+    "cluster_upgrading": "You must set up two-factor sign-in, but the cluster cannot accept it while it is being upgraded. Try again after the upgrade."
   },
   "routeError": {
     "newVersion": "A new version is available",
@@ -2067,7 +2074,8 @@
     "health": "Cluster health",
     "alerts": "Alerts firing",
     "ringing": "View alerts",
-    "failedCount": "{{count}} failed"
+    "failedCount": "{{count}} failed",
+    "clusterHidden": "Nodes, capacity and cluster charts need permission to read the cluster."
   },
   "settings": {
     "updates": "Updates",
@@ -3262,7 +3270,9 @@
     "usedOf": "{{used}} of {{limit}}",
     "noLimit": "No limit",
     "over": "Over the limit",
-    "boundBy": "Limited by {{path}}"
+    "boundBy": "Limited by {{path}}",
+    "badCount": "Enter a whole number of 0 or more.",
+    "hiddenLimits": "Folders above this one that you cannot see may also have quotas. If one of them blocks a change, the error says so."
   },
   "permissions": {
     "title": "Permissions of {{name}}",
@@ -3297,7 +3307,11 @@
     "removed": "Removed the permission.",
     "rootTarget": "Whole cluster",
     "openNamed": "Permissions of {{name}}",
-    "pageHint": "Every permission in the cluster. A permission gives a user or group a role on the whole cluster, a folder (and what is under it) or one object. Permissions add up; there is no deny."
+    "pageHint": "Every permission in the cluster. A permission gives a user or group a role on the whole cluster, a folder (and what is under it) or one object. Permissions add up; there is no deny.",
+    "escalation": "You do not hold every permission this needs: {{message}}",
+    "noGrantableRole": "No role is within the permissions you hold here.",
+    "removeSelf": "This grant gives you access. After removing it you may lose access here, including this tab, and you cannot add it back yourself. Type the name to confirm.",
+    "globalHidden": "Users with a cluster-wide role also have access. Only administrators see who they are."
   },
   "roleEditor": {
     "pageHint": "Built-in roles match the global roles. Custom roles are lists of privileges to use in permissions.",

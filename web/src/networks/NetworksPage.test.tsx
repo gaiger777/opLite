@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import type { Network } from "@/api/types";
 import { bridgeName, NetworksPage, validBridge } from "@/networks/NetworksPage";
-import { NODE, vm } from "@/test/fixtures";
+import { folder, folderId, NODE, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -311,4 +311,32 @@ it("hides changes from operators", async () => {
   renderPage(<NetworksPage />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByText("lan")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
+});
+
+it("lets a folder network delegator create only VXLAN networks", async () => {
+  // 브리지 네트워크는 루트 cluster.admin만 만든다(계획 62 리뷰 1). 폴더의 network.config는 VXLAN만.
+  const A = folderId("teamA");
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: { [A]: ["system.read", "network.config"] },
+        objects: [],
+      }),
+    ),
+  );
+  mockLists({ folder: [folder("teamA", "network")] });
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />, { as: { ...ADMIN, role: "none" } });
+  await user.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = screen.getByRole("dialog", { name: "Create a network" });
+  const kind = within(dialog).getByLabelText("Type");
+  expect(
+    within(kind)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["VXLAN"]);
 });

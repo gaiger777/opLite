@@ -44,6 +44,11 @@ const UNKNOWN_PROMPT: SecondFactorPrompt = {
   expires_at: 0,
 };
 
+/** 새로 고침 뒤라 진짜 둘째 단계 안내(패스키·강제 등록)를 모른다 */
+export function isUnknownPrompt(prompt: SecondFactorPrompt): boolean {
+  return prompt === UNKNOWN_PROMPT;
+}
+
 const AuthContext = createContext<Auth | null>(null);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {

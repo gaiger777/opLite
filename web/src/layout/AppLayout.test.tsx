@@ -242,3 +242,30 @@ it("has no accessibility violations in the shell", async () => {
   await screen.findByRole("navigation", { name: "Infrastructure menu" });
   await expectNoAxeViolations(container);
 });
+
+it("says a hidden tab is not permitted instead of loading forever", async () => {
+  // 폴더 사용자가 숨긴 탭의 주소(/nodes)를 바로 연다(계획 62 리뷰 1).
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  renderPage(<AppLayout />, {
+    path: "*",
+    url: "/nodes",
+    as: { ...ADMIN, name: "alice", role: "none" },
+  });
+  expect(
+    await screen.findByText("You do not have permission to view this page."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("heading", { level: 1, name: "Nodes" })).toBeInTheDocument();
+  // 클러스터 전환(이름은 cluster.read가 있어야 읽는다)도 없다.
+  expect(screen.queryByRole("button", { name: /^Switch cluster/ })).not.toBeInTheDocument();
+});

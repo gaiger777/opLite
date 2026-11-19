@@ -1,9 +1,10 @@
 // 권한(grant) 화면의 공통: 대상 이름, 역할 이름, 주체 이름, 목록 읽기(계획 62 설계 §6·§13).
 import { useQuery } from "@tanstack/react-query";
+import type { TFunction } from "i18next";
 
-import { api, call } from "@/api/client";
+import { api, ApiError, call } from "@/api/client";
 import type { AccessRole, Grant, GrantTarget, PrincipalRef, RoleRef } from "@/api/types";
-import { type Target } from "@/auth/permissions";
+import { type Permissions, type Privilege, type Target } from "@/auth/permissions";
 
 /** API 쿼리의 대상 글: `root`, `folder/<id>`, `vm/<id>` … */
 export function objectParam(target: Target): string {
@@ -81,6 +82,72 @@ export function targetLabel(
     case "object":
       return `${target.kind}/${objectName(target.kind, target.id) ?? target.id.slice(-8)}`;
   }
+}
+
+/**
+ * 이 역할을 이 대상에 줄 수 있는지(서버의 위임 상승 막기와 같은 셈, 설계 §18 리뷰 1): 대상에서 역할의 권한과
+ * `permission.modify`(루트면 `cluster.admin`)를 가져야 하고, propagate면 그 아래(폴더·루트 안 객체 층)에서도 가져야
+ * 한다. 화면은 줄 수 없는 역할을 고르지 못하게만 하고, 막는 것은 서버다.
+ */
+export function grantable(
+  perms: Pick<Permissions, "has">,
+  privileges: readonly string[],
+  target: Target,
+  propagate: boolean,
+): boolean {
+  const needed = privileges as readonly Privilege[];
+  const holds = (at: Target, extra: Privilege) => [...needed, extra].every((p) => perms.has(p, at));
+  switch (target.type) {
+    case "root":
+      return (
+        holds(target, "cluster.admin") &&
+        (!propagate || needed.every((p) => perms.has(p, { type: "object", kind: "vm" })))
+      );
+    case "folder":
+      return (
+        holds(target, "permission.modify") &&
+        (!propagate ||
+          holds({ type: "object", kind: "vm", folder: target.id }, "permission.modify"))
+      );
+    case "object":
+      return holds(target, "permission.modify");
+  }
+}
+
+/**
+ * grant 주기·빼기의 오류. 위임 상승(403 `forbidden`)은 서버가 무엇이 모자란지 말하므로 그 설명을 보인다(일반 "권한
+ * 없음" 문구 대신).
+ */
+export function grantError(t: TFunction, error: unknown): unknown {
+  if (error instanceof ApiError && error.status === 403 && error.code === "forbidden") {
+    return new Error(t("permissions.escalation", { message: error.message }));
+  }
+  return error;
+}
+
+/**
+ * 이 grant를 빼면 내 접근이 줄어드는지: 나에게 건 것이거나, 내가 든 그룹에 건 것이거나, 이 대상에서 내 권한의
+ * 근거(`/permissions/effective`의 `grants`)인 것.
+ */
+export function revokesSelf(
+  grant: Grant,
+  me: string,
+  {
+    mine,
+    groups,
+  }: {
+    mine?: readonly { id: string }[];
+    groups?: readonly { id: string; spec: { members?: string[] } }[];
+  },
+): boolean {
+  const p = grant.spec.principal;
+  if (p.type === "user") {
+    return p.id === me;
+  }
+  return (
+    (mine ?? []).some((g) => g.id === grant.id) ||
+    (groups ?? []).some((g) => g.id === p.id && (g.spec.members ?? []).includes(me))
+  );
 }
 
 export type { Grant };

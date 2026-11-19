@@ -9,6 +9,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Grant, GrantTarget, PrincipalRef, RoleRef } from "@/api/types";
 import { type Target } from "@/auth/permissions";
+import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
@@ -30,9 +31,12 @@ import {
 } from "@/components/ui/table";
 import { useFolderPaths } from "@/folders/useFolderPaths";
 import {
+  grantable,
+  grantError,
   grantTarget,
   objectParam,
   principalName,
+  revokesSelf,
   roleName,
   targetLabel,
   useAccessRoles,
@@ -117,6 +121,9 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
   const headingId = useId();
   const changed = () => queryClient.invalidateQueries({ queryKey: ["permissions"] });
   const grants = (who.data?.grants ?? []) as Grant[];
+  const me = usePrincipal();
+  // 내 접근의 근거를 빼면 이 탭과 grant 더하기를 잃을 수 있다. 이름을 넣어 확인한다.
+  const self = removing !== null && revokesSelf(removing, me.user, { mine: mine.data?.grants });
 
   return (
     <section
@@ -220,6 +227,10 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
               })}
             </TableBody>
           </Table>
+          {/* 전역 역할 사용자 목록은 관리자에게만 온다(서버가 비워 보낸다, 리뷰 1). */}
+          {!perms.has("cluster.admin") && (
+            <p className="text-sm text-muted-foreground">{t("permissions.globalHidden")}</p>
+          )}
         </div>
       )}
       {adding && (
@@ -237,11 +248,16 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
         title={t("permissions.removeTitle", {
           name: removing ? principalName(removing.spec.principal, names) : "",
         })}
-        description={t("permissions.removeDescription")}
+        description={t(self ? "permissions.removeSelf" : "permissions.removeDescription")}
+        typeToConfirm={self && removing ? principalName(removing.spec.principal, names) : undefined}
         confirmLabel={t("permissions.remove")}
         onConfirm={async () => {
           const grant = removing!;
-          await call(api.DELETE("/grants/{id}", { params: { path: { id: grant.id } } }));
+          try {
+            await call(api.DELETE("/grants/{id}", { params: { path: { id: grant.id } } }));
+          } catch (err) {
+            throw grantError(t, err);
+          }
           toast.success(t("permissions.removed"));
           await changed();
         }}
@@ -253,7 +269,7 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
 /**
  * grant 더하기. 주체는 사용자 목록을 읽을 수 있으면(admin) 사용자·그룹에서 고르고, 못 읽으면(폴더 위임자) 이미
  * 이 대상에 권한이 있는 주체에서 고르거나 id를 넣는다. 역할은 누구나 읽는 역할 목록에서 고른다. 서버가 위임
- * 상승을 막는다(가진 권한보다 넓은 역할은 403).
+ * 상승을 막고(가진 권한보다 넓은 역할은 403, 그 설명을 보인다), 화면은 줄 수 있는 역할만 보인다.
  */
 export function AddGrantDialog({
   target: initial,
@@ -281,11 +297,25 @@ export function AddGrantDialog({
   const names = usePrincipalNames();
   const [kind, setKind] = useState<PrincipalRef["type"]>("user");
   const [principal, setPrincipal] = useState("");
-  const [role, setRole] = useState("builtin:operator");
+  const [chosenRole, setRole] = useState<string | null>(null);
   const [propagate, setPropagate] = useState(true);
   const [error, setError] = useState<string | undefined>();
   const [targetIndex, setTargetIndex] = useState(0);
   const target = targets?.[targetIndex]?.target ?? initial;
+  // 줄 수 있는 역할만(내가 이 대상에서 가진 권한 안의 역할, 서버가 같은 셈으로 막는다)
+  const spread = target.type === "object" ? true : propagate;
+  const offered = (roles.data ?? [])
+    .filter((r) => r.builtin || r.id)
+    .filter((r) => grantable(perms, r.privileges, target, spread))
+    .map((r) => ({
+      value: r.builtin ? `builtin:${r.name}` : `custom:${r.id}`,
+      label: r.builtin ? t(`roles.${r.name}`) : r.name,
+    }));
+  // 고른 역할이 대상·propagate를 바꿔 줄 수 없게 되면 줄 수 있는 첫 역할로(운영자가 있으면 운영자)
+  const role =
+    chosenRole && offered.some((r) => r.value === chosenRole)
+      ? chosenRole
+      : ((offered.find((r) => r.value === "builtin:operator") ?? offered[0])?.value ?? "");
   const choices: { id: string; name: string }[] =
     kind === "user"
       ? admin
@@ -309,21 +339,28 @@ export function AddGrantDialog({
       setError("permissions.badPrincipal");
       return false;
     }
+    if (!role) {
+      return false;
+    }
     const [type, value] = role.split(":") as ["builtin" | "custom", string];
     const roleRef: RoleRef =
       type === "builtin"
         ? { type: "builtin", role: value as "admin" | "operator" | "viewer" }
         : { type: "custom", id: value };
-    await call(
-      api.POST("/grants", {
-        body: {
-          principal: { type: kind, id },
-          role: roleRef,
-          target: grantTarget(target),
-          propagate: target.type === "object" ? true : propagate,
-        },
-      }),
-    );
+    try {
+      await call(
+        api.POST("/grants", {
+          body: {
+            principal: { type: kind, id },
+            role: roleRef,
+            target: grantTarget(target),
+            propagate: spread,
+          },
+        }),
+      );
+    } catch (err) {
+      throw grantError(t, err);
+    }
     toast.success(t("permissions.added", { name: targets?.[targetIndex]?.label ?? label }));
     await onDone();
   }
@@ -410,27 +447,27 @@ export function AddGrantDialog({
           )
         }
       </Field>
-      <Field id="grant-role" label={t("permissions.role")}>
-        <NativeSelect
-          id="grant-role"
-          className="w-full"
-          value={role}
-          onChange={(e) => setRole(e.target.value)}
-        >
-          {(roles.data ?? [])
-            .filter((r) => r.builtin || r.id)
-            .map((r) => {
-              const value = r.builtin ? `builtin:${r.name}` : `custom:${r.id}`;
-              return (
-                <NativeSelectOption key={value} value={value}>
-                  {r.builtin ? t(`roles.${r.name}`) : r.name}
-                </NativeSelectOption>
-              );
-            })}
-          {!roles.data && (
-            <NativeSelectOption value="builtin:operator">{t("roles.operator")}</NativeSelectOption>
-          )}
-        </NativeSelect>
+      <Field
+        id="grant-role"
+        label={t("permissions.role")}
+        error={roles.data && offered.length === 0 ? "permissions.noGrantableRole" : undefined}
+      >
+        {(a11y) => (
+          <NativeSelect
+            id="grant-role"
+            className="w-full"
+            value={role}
+            onChange={(e) => setRole(e.target.value)}
+            {...a11y}
+          >
+            {offered.map((r) => (
+              <NativeSelectOption key={r.value} value={r.value}>
+                {r.label}
+              </NativeSelectOption>
+            ))}
+            {!roles.data && <NativeSelectOption value="">{t("common.loading")}</NativeSelectOption>}
+          </NativeSelect>
+        )}
       </Field>
       {target.type !== "object" && (
         <div className="flex items-center gap-2">

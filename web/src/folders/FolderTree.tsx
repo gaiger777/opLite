@@ -20,6 +20,17 @@ export function endDrag() {
   dragging = null;
 }
 
+/** `open`에 `id`와 그 조상을 더한 것 */
+function withAncestors(open: ReadonlySet<string>, tree: Tree, id: string): ReadonlySet<string> {
+  const out = new Set(open).add(id);
+  let at = tree.byId.get(id);
+  while (at?.spec.parent && tree.byId.has(at.spec.parent)) {
+    out.add(at.spec.parent);
+    at = tree.byId.get(at.spec.parent);
+  }
+  return out;
+}
+
 interface Row {
   id: string;
   name: string;
@@ -55,16 +66,18 @@ export function FolderTree({
 }) {
   const { t } = useTranslation();
   // 고른 폴더와 그 조상은 펼친다.
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => {
-    const open = new Set([ROOT_ID, selected]);
-    let at = tree.byId.get(selected);
-    while (at?.spec.parent && tree.byId.has(at.spec.parent)) {
-      open.add(at.spec.parent);
-      at = tree.byId.get(at.spec.parent);
-    }
-    return open;
-  });
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() =>
+    withAncestors(new Set([ROOT_ID]), tree, selected),
+  );
   const [focused, setFocused] = useState(selected);
+  // 처음 뒤에 고른 폴더(새로 만든 하위 폴더, 앞·뒤로 가기)도 조상을 펼쳐 보이게 한다. 새 폴더가 아직 트리에 없으면
+  // 들어온 뒤에 한 번 한다(그 뒤에 사용자가 접은 것은 그대로 둔다).
+  const [revealed, setRevealed] = useState(selected);
+  if (revealed !== selected && (selected === ROOT_ID || tree.byId.has(selected))) {
+    setRevealed(selected);
+    setExpanded((open) => withAncestors(open, tree, selected));
+    setFocused(selected);
+  }
   const [over, setOver] = useState<{ id: string; reason: string | null } | null>(null);
   const items = useRef(new Map<string, HTMLElement>());
 

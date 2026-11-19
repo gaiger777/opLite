@@ -142,14 +142,20 @@ export function DeleteFolderDialog({
 
 const GIB = 1024 ** 3;
 
-/** 칸의 글 → 상한(빈 칸은 상한 없음). 틀리면 undefined */
-function parseLimit(text: string, scale: number): number | null | undefined {
+/**
+ * 칸의 글 → 상한(빈 칸은 상한 없음). 틀리면 undefined. 개수(`scale` 1: vCPU·VM 수)는 0 이상의 정수만 받고(반올림하면
+ * 0.4가 0이 되어 모두 막는다), GiB 칸은 소수를 받아 MiB·바이트로 반올림한다.
+ */
+export function parseLimit(text: string, scale: number): number | null | undefined {
   const v = text.trim();
   if (v === "") {
     return null;
   }
   const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? Math.round(n * scale) : undefined;
+  if (!Number.isFinite(n) || n < 0 || (scale === 1 && !Number.isInteger(n))) {
+    return undefined;
+  }
+  return Math.round(n * scale);
 }
 
 /** 할당량: vCPU·메모리(GiB)·디스크(GiB)·VM 수. 빈 칸은 상한이 없다. 모두 비우면 할당량을 지운다. */
@@ -179,7 +185,8 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
       ["vms", "vms"],
     ] as const) {
       if (parsed[key] === undefined) {
-        found[field] = "folders.badLimit";
+        found[field] =
+          field === "vcpus" || field === "vms" ? "folders.badCount" : "folders.badLimit";
       }
     }
     setErrors(found);
@@ -203,7 +210,7 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
       {(a11y) => (
         <Input
           id={`quota-${id}`}
-          inputMode="decimal"
+          inputMode={id === "vcpus" || id === "vms" ? "numeric" : "decimal"}
           autoComplete="off"
           value={values[id]}
           onChange={(e) => setValues({ ...values, [id]: e.target.value })}

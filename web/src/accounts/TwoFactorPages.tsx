@@ -5,7 +5,13 @@ import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
-import { PasskeySetup, RecoveryCodes, TotpSetup } from "@/accounts/TwoFactorSetup";
+import {
+  PasskeySetup,
+  type Proof,
+  type Prove,
+  RecoveryCodes,
+  TotpSetup,
+} from "@/accounts/TwoFactorSetup";
 import { passkeysSupported } from "@/accounts/webauthn";
 import { api, call } from "@/api/client";
 import { useSettings } from "@/api/live";
@@ -27,10 +33,9 @@ import { patchSettings, settingsError } from "@/settings/save";
 
 const TWO_FACTOR_KEY = ["2fa"] as const;
 
-type Proof = { code: string } | { password: string };
-
 /**
- * 본인 확인: 인증 앱·복구 코드, 또는 로컬 비밀번호(외부 사용자는 코드만). 빼기·다시 만들기가 쓴다.
+ * 본인 확인: 인증 앱·복구 코드, 또는 로컬 비밀번호(외부 사용자는 코드만). 빼기·다시 만들기와, 요소가 있을 때의
+ * 요소 더하기가 쓴다.
  * `run`이 실패하면 창에 오류를 보인다.
  */
 function ProofDialog({
@@ -85,7 +90,10 @@ function ProofDialog({
 }
 
 type Dialog =
-  { kind: "disable" } | { kind: "regenerate" } | { kind: "passkey"; id: string; name: string };
+  | { kind: "disable" }
+  | { kind: "regenerate" }
+  | { kind: "passkey"; id: string; name: string }
+  | { kind: "add"; title: string; send(proof: Proof): Promise<void> };
 
 /** 설정 › 2단계 인증: 인증 앱·복구 코드·패스키 */
 export function AccountPage() {
@@ -112,6 +120,11 @@ export function AccountPage() {
     return <ListPending error={status.error} />;
   }
   const s = status.data;
+  // 이미 요소가 있으면 더하기 전에 본인 확인(서버 `proof_required`)
+  const prove: Prove | undefined =
+    s.totp || s.passkeys.length > 0
+      ? (title, send) => setDialog({ kind: "add", title, send })
+      : undefined;
   return (
     <div className="flex flex-col gap-4">
       <PageHeader
@@ -140,7 +153,9 @@ export function AccountPage() {
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
           <p className="text-sm">{t(s.totp ? "twoFactor.appOn" : "twoFactor.appOff")}</p>
-          {s.available && !s.totp && <TotpSetup onDone={(got) => void gotCodes(got)} />}
+          {s.available && !s.totp && (
+            <TotpSetup onDone={(got) => void gotCodes(got)} prove={prove} />
+          )}
           {s.available && s.totp && (
             <div>
               <Button variant="outline" onClick={() => setDialog({ kind: "disable" })}>
@@ -204,7 +219,7 @@ export function AccountPage() {
           ) : !passkeysSupported() ? (
             <p className="text-sm text-muted-foreground">{t("twoFactor.passkeyBrowser")}</p>
           ) : (
-            s.available && <PasskeySetup onDone={(got) => void gotCodes(got)} />
+            s.available && <PasskeySetup onDone={(got) => void gotCodes(got)} prove={prove} />
           )}
         </CardContent>
       </Card>
@@ -219,6 +234,14 @@ export function AccountPage() {
             toast.success(t("twoFactor.appDisabled"));
             await changed();
           }}
+        />
+      )}
+      {dialog?.kind === "add" && (
+        <ProofDialog
+          title={dialog.title}
+          submitLabel={t("twoFactor.confirm")}
+          onClose={() => setDialog(null)}
+          run={dialog.send}
         />
       )}
       {dialog?.kind === "regenerate" && (
@@ -273,10 +296,10 @@ export function SecurityPage() {
   if (!settings.data) {
     return <ListPending error={settings.error} />;
   }
-  // 저장된 정책이 바뀌면(watch) 폼을 새로 연다.
+  // 저장된 정책이 바뀌면(watch) 폼을 새로 연다. 다른 설정(원격 측정·HA …)이 바뀐 것으로는 고치던 값을 버리지 않는다.
   return (
     <PolicyForm
-      key={settings.data.revision}
+      key={JSON.stringify(settings.data.spec.two_factor ?? null)}
       revision={settings.data.revision}
       policy={settings.data.spec.two_factor ?? null}
     />

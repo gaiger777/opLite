@@ -211,7 +211,17 @@ it("creates, renames and quotas a folder from its detail page", async () => {
   await user.clear(within(dialog).getByLabelText("vCPUs"));
   await user.type(within(dialog).getByLabelText("VMs"), "x");
   await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getByText("Enter a whole number of 0 or more.")).toBeInTheDocument();
+  // 개수는 반올림하지 않는다(0.4 VM이 0이 되어 모두 막지 않게, 리뷰 1).
+  await user.clear(within(dialog).getByLabelText("VMs"));
+  await user.type(within(dialog).getByLabelText("VMs"), "0.4");
+  await user.type(within(dialog).getByLabelText("Memory (GiB)"), "x");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getByText("Enter a whole number of 0 or more.")).toBeInTheDocument();
   expect(within(dialog).getByText("Enter a number of 0 or more.")).toBeInTheDocument();
+  expect(requests).toEqual([]);
+  await user.clear(within(dialog).getByLabelText("Memory (GiB)"));
+  await user.type(within(dialog).getByLabelText("Memory (GiB)"), "16");
   await user.clear(within(dialog).getByLabelText("VMs"));
   await user.type(within(dialog).getByLabelText("VMs"), "20");
   await user.click(within(dialog).getByRole("button", { name: "Save" }));
