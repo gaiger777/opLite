@@ -5690,6 +5690,13 @@ where
     T: Into<OsString> + Clone,
 {
     let cli = Cli::try_parse_from(args)?;
+    // 명령 처리 future(명령마다의 future를 모두 품어 수 KB)는 힙에 둔다. 디버그 빌드에서는 이 future가 크면
+    // 이 함수를 await하는 쪽(E2E 시험은 `ctl` 호출마다)의 스택 틀이 함께 커지고, clap의 명령 트리 만들기(디버그
+    // 빌드에서 수백 KB)가 명령 처리의 큰 poll 틀 위에 쌓여 2 MiB 스레드 스택을 넘친다.
+    Box::pin(run_cli(cli, out)).await
+}
+
+async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
     if cli.output == Output::Haproxy
         && !matches!(
             cli.cmd,
