@@ -11,6 +11,7 @@ use opl_types::firmware::{
 };
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{HA_PLACEMENT, HOTPLUG, NodeSpec, all_have};
+use opl_types::numa::ResolvedNuma;
 use opl_types::placement::HaGroupSpec;
 use opl_types::runtime::{RuntimeTpm, VmRuntimeSpec};
 use opl_types::snapshot::SnapshotSpec;
@@ -29,6 +30,7 @@ use crate::config::ReconcilerConfig;
 use crate::cpu::{CpuContext, CpuRefusal};
 use crate::firmware::FirmwareCopy;
 use crate::ha::ArmError;
+use crate::host_alloc::{Claim, Shape};
 use crate::reconciler::{Held, Restores};
 use crate::replicas;
 use crate::resolve::{
@@ -202,6 +204,9 @@ pub(crate) struct Worker {
     /// CPU를 이 노드가 켤 수 없으면 이것으로 다시 켜고 바뀜은 보류로 남긴다 — 사용자가 하지 않은 전원 껐다 켜기 때문에
     /// VM이 꺼진 채 남지 않게. 켜지면, 또는 원하는 상태가 stopped가 되면 지운다.
     restart_cpu: Option<ResolvedCpu>,
+    /// 작업자가 스스로 다시 켜는 VM이 꺼지기 전에 쓰던 게스트 NUMA 모양(계획 64). 보류된 새 모양을 이 노드에 맞출 수
+    /// 없으면 이것으로 다시 켠다(`restart_cpu`와 같다).
+    restart_numa: Option<ResolvedNuma>,
     /// 마지막으로 조회했을 때 VM이 실행 중이었는지
     was_running: bool,
     /// 사라진 VM의 종료 이벤트를 이 시각까지 기다린다.
@@ -263,6 +268,7 @@ impl Worker {
             power_off: None,
             relocate: None,
             restart_cpu: None,
+            restart_numa: None,
             was_running: false,
             awaiting_event: None,
             disks_active: false,
@@ -385,6 +391,7 @@ impl Worker {
         }
         if vm.spec.power == PowerState::Stopped {
             self.restart_cpu = None;
+            self.restart_numa = None;
         }
         match trigger {
             Trigger::Event(kind) => self.on_event(&vm, kind),
@@ -488,6 +495,7 @@ impl Worker {
             .hardware
             .as_ref()
             .and_then(|hw| hw.cpu_resolved.clone());
+        self.restart_numa = vm.status.hardware.as_ref().and_then(|hw| hw.numa.clone());
     }
 
     /// 리스가 끝났으면(stale) 이 노드에서 도는 HA VM을 강제로 끈다(설계 §3.3). 그 사이 리더가 다른
@@ -812,6 +820,8 @@ impl Worker {
         if actual.is_none() {
             self.started = None;
             status.hardware = None;
+            // 이 노드의 pCPU·hugepages 예약도 푼다(계획 64).
+            self.config.host_alloc.release(self.id);
         }
         let now = Instant::now();
         if std::mem::replace(&mut self.was_running, actual.is_some()) && actual.is_none() {
@@ -842,6 +852,18 @@ impl Worker {
                             .or_else(|| self.hv.saved_hardware(self.id))
                             .unwrap_or_else(|| RunningHardware::legacy(&vm.spec)),
                     );
+                }
+                // 받은 마이그레이션(계획 64): 기록의 배치가 원본 노드의 것이면 받는 쪽이 고른 배치로 바꾼다.
+                let me = self.config.node;
+                if let Some(hw) = &mut status.hardware
+                    && hw.host_placement.as_ref().is_some_and(|p| p.node != me)
+                    && let Some(mine) = self
+                        .hv
+                        .saved_hardware(self.id)
+                        .and_then(|saved| saved.host_placement)
+                        .filter(|p| p.node == me)
+                {
+                    hw.host_placement = Some(mine);
                 }
                 if state.status != RuntimeStatus::Running
                     && let Some(reason) = self.ha_blocked(vm)
@@ -1268,24 +1290,40 @@ impl Worker {
             },
             Some(_) => self.cpu_restorable(&hardware),
         };
-        match cpu {
-            Ok(()) => {}
+        // 게스트 NUMA 모양과 이 노드의 pCPU·호스트 노드·hugepages(계획 64): 노드 할당기가 고르고 예약한다.
+        let claim = cpu.and_then(|()| self.numa_at_start(vm, restore.is_some(), &hardware));
+        let pinning = match claim {
+            Ok(claim) => {
+                hardware.numa = claim.numa;
+                hardware.host_placement = claim.placement;
+                // 앞 모양으로 다시 켰거나 스냅샷의 모양이면 스펙과 다른 것이 보류다.
+                hardware.pending.retain(|p| p.field != "numa");
+                hardware
+                    .pending
+                    .extend(opl_types::numa::pending_change(&vm.spec, &hardware));
+                Ok(claim.pinning)
+            }
+            Err(e) => Err(e),
+        };
+        let pinning = match pinning {
+            Ok(pinning) => pinning,
             Err(CpuRefusal::Waiting(reason)) => {
-                tracing::warn!(vm = %self.id, reason = %reason, "CPU not ready; not starting");
+                tracing::warn!(vm = %self.id, reason = %reason, "CPU or NUMA placement not ready; not starting");
                 self.deactivate_disks(vm).await;
                 self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
                 return Ok(Start::NotStarted);
             }
             Err(CpuRefusal::Cannot(reason)) => {
                 self.deactivate_disks(vm).await;
-                tracing::warn!(vm = %self.id, reason = %reason, "cannot start the VM's CPU on this node");
+                tracing::warn!(vm = %self.id, reason = %reason, "cannot start the VM's CPU or NUMA layout on this node");
                 // VM 상태는 노드 이름을 볼 수 없는 사용자도 읽는다(리뷰 2 #6).
                 let reason = crate::cpu::without_node_name(&reason);
                 self.power_off = Some(Some(format!("failed to start: {reason}")));
                 return Ok(Start::NotStarted);
             }
-        }
+        };
         apply_hardware(&mut spec, &hardware, &vm.spec);
+        spec.pinning = pinning;
         // 켜기 규칙으로 얻은 TPM 상태로 켠다(스냅샷 하드웨어에만 TPM이 있으면 이 노드의 상태 그대로).
         if spec.tpm.is_some() {
             spec.tpm = Some(tpm.unwrap_or(RuntimeTpm {
@@ -1297,6 +1335,7 @@ impl Worker {
         let started = self.hv.start(&spec, restore.as_deref()).await;
         if started.is_err() {
             self.deactivate_disks(vm).await;
+            self.config.host_alloc.release(self.id);
         }
         match (started, restore) {
             (Ok(()), _) => {
@@ -1306,6 +1345,7 @@ impl Worker {
                 }
                 self.started = Some(hardware);
                 self.restart_cpu = None;
+                self.restart_numa = None;
                 Ok(Start::Started)
             }
             // 태그 없이 다시 시도하면 스냅샷이 아닌 처음부터 부팅하게 되므로 일시 오류라도 멈춘다.
@@ -1421,6 +1461,44 @@ impl Worker {
         let ctx = CpuContext::load(&self.cluster, self.config.node)
             .map_err(|e| CpuRefusal::Waiting(format!("cannot read the CPU settings: {e}")))?;
         ctx.map(|ctx| ctx.start(&vm.spec.cpu)).transpose()
+    }
+
+    /// 이 노드에서 켤 VM의 게스트 NUMA 모양·배치·고정(계획 64 §10): 새로 켜면 스펙에서, 메모리 스냅샷은 담을 때의
+    /// 모양(`hardware.numa`) 그대로 호스트 쪽만 고른다. 작업자가 스스로 다시 켜는데 보류된 새 모양이 이 노드에 맞지
+    /// 않으면 꺼지기 전의 모양으로 켠다(소켓·메모리가 그대로일 때, 바뀜은 보류로 남는다).
+    fn numa_at_start(
+        &self,
+        vm: &Vm,
+        restore: bool,
+        hardware: &RunningHardware,
+    ) -> Result<Claim, CpuRefusal> {
+        let alloc = &self.config.host_alloc;
+        if restore {
+            let shape = Shape::Fixed(hardware.numa.as_ref(), &hardware.cpu);
+            return alloc.claim(&self.cluster, self.id, shape);
+        }
+        match alloc.claim(&self.cluster, self.id, Shape::Spec(&vm.spec, &hardware.cpu)) {
+            Err(CpuRefusal::Cannot(reason)) => {
+                let previous = self.restart_numa.as_ref().filter(|n| {
+                    n.nodes.iter().map(|g| g.sockets.len()).sum::<usize>()
+                        == usize::from(hardware.cpu.sockets)
+                        && n.nodes.iter().map(|g| g.memory_mib).sum::<u32>() == hardware.memory_mib
+                });
+                let Some(previous) = previous else {
+                    return Err(CpuRefusal::Cannot(reason));
+                };
+                let claim = alloc
+                    .claim(
+                        &self.cluster,
+                        self.id,
+                        Shape::Fixed(Some(previous), &hardware.cpu),
+                    )
+                    .map_err(|_| CpuRefusal::Cannot(reason.clone()))?;
+                tracing::warn!(vm = %self.id, reason = %reason, numa = %opl_types::numa::describe(Some(previous)), "restarting the VM with the NUMA layout it ran with; the new layout stays pending");
+                Ok(claim)
+            }
+            r => r,
+        }
     }
 
     /// 작업자가 스스로 다시 켜는데(크래시·호스트 SIGTERM·게스트 감시) 지금 스펙·기준·숨김 목록의 CPU를 이 노드가

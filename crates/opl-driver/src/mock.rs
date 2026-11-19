@@ -12,7 +12,9 @@ use opl_types::cpu::{Bits, CatalogModel, CpuCatalogSpec};
 use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
-use opl_types::runtime::{ImageFormat, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{
+    ImageFormat, RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning, VmRuntimeSpec,
+};
 use opl_types::vm::{Arch, CpuSpec, DiskBus, MachineType, RunningHardware};
 use tokio::sync::{Notify, broadcast};
 use uuid::Uuid;
@@ -338,6 +340,10 @@ struct MockState {
     hotplug_calls: Vec<HotplugCall>,
     /// `save_hardware`로 남긴 하드웨어 기록. VM이 꺼지면 사라진다.
     saved_hardware: HashMap<Uuid, RunningHardware>,
+    /// 켤 때(`VmRuntimeSpec.pinning`)나 `repin`으로 건 스레드 고정(계획 64). VM이 꺼지면 사라진다.
+    pinned: HashMap<Uuid, RuntimePinning>,
+    /// `repin` 호출
+    repins: Vec<(Uuid, RuntimePinning)>,
     /// `replicate_disks` 호출(실패 포함)
     replications: Vec<ReplicationCall>,
     /// 다음 `replicate_disks` 한 번을 실패시킬 오류. 새 비트맵은 만들지 않는다.
@@ -937,6 +943,16 @@ impl MockHypervisor {
         self.state.lock().unwrap().launch_specs.clone()
     }
 
+    /// `repin` 호출(계획 64)
+    pub fn repins(&self) -> Vec<(Uuid, RuntimePinning)> {
+        self.state.lock().unwrap().repins.clone()
+    }
+
+    /// 누가 스레드 친화를 바꾼 것(`taskset`)을 흉내 낸다: 건 고정을 `pin`으로 바꾼다.
+    pub fn drift_pinning(&self, id: Uuid, pin: RuntimePinning) {
+        self.state.lock().unwrap().pinned.insert(id, pin);
+    }
+
     /// `start_incoming`으로 받으려 한 VM의 런타임 스펙(실패한 시도 포함)
     pub fn incoming_specs(&self) -> Vec<VmRuntimeSpec> {
         self.state.lock().unwrap().incoming_specs.clone()
@@ -1106,6 +1122,9 @@ impl MockHypervisor {
 
     /// 새로 띄운 VM의 디스크 형식을 적고, 디스크 수에 맞춰 비트맵 목록을 늘리거나 줄인다.
     fn launched(st: &mut MockState, vm: &VmRuntimeSpec) {
+        if let Some(pin) = &vm.pinning {
+            st.pinned.insert(vm.id, pin.clone());
+        }
         let layout = vm.hotplug.as_ref();
         // 켤 때 단 장치는 `pcie.0`, 배치의 순번 뒤 장치는 그 루트 포트에 있다.
         let port = |boot: Option<u8>, ports: Option<&Vec<u8>>, i: usize| {
@@ -1229,6 +1248,7 @@ impl MockHypervisor {
         st.guest_channels.remove(&id);
         st.hot.remove(&id);
         st.saved_hardware.remove(&id);
+        st.pinned.remove(&id);
         if st.vms.remove(&id).is_some() {
             drop(st);
             let _ = self.events.send(HypervisorEvent { id, kind });
@@ -2403,6 +2423,20 @@ impl Hypervisor for MockHypervisor {
         self.state.lock().unwrap().saved_hardware.get(&id).cloned()
     }
 
+    /// 건 고정과 다르면 바꾼 것 하나로 센다.
+    async fn repin(&self, id: Uuid, pin: &RuntimePinning) -> Result<usize, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        st.repins.push((id, pin.clone()));
+        let changed = st.pinned.get(&id) != Some(pin);
+        st.pinned.insert(id, pin.clone());
+        Ok(usize::from(changed))
+    }
+
+    fn saved_pinning(&self, id: Uuid) -> Option<RuntimePinning> {
+        self.state.lock().unwrap().pinned.get(&id).cloned()
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }
@@ -2459,6 +2493,9 @@ mod tests {
             firmware_epoch: 0,
             keep_tpm: false,
             cpu_resolved: None,
+            numa: None,
+            host_placement: None,
+            pinning: None,
         }
     }
 

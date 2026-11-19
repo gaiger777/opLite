@@ -274,6 +274,7 @@ pub(crate) async fn start(
     id: Uuid,
     paths: &RuntimePaths,
     tpm_dir: &Path,
+    cpus: Option<&opl_types::numa::CpuSet>,
 ) -> Result<(), DriverError> {
     if !terminate(paths).await {
         return Err(DriverError::StartFailed(format!(
@@ -294,6 +295,10 @@ pub(crate) async fn start(
     cmd.args(swtpm_args(paths, tpm_dir))
         .stdin(Stdio::null())
         .kill_on_drop(true);
+    // 계획 64: opld의 친화(예약 CPU)를 물려받지 않게 QEMU의 에뮬레이터 집합에 둔다.
+    if let Some(cpus) = cpus {
+        crate::qemu::pin_child(&mut cmd, cpus);
+    }
     // --daemon: 소켓을 연 뒤 떼어 낸 자식이 남고 부모는 끝난다.
     let output = tokio::time::timeout(SWTPM_START_TIMEOUT, cmd.output())
         .await
@@ -914,12 +919,16 @@ mod tests {
         std::fs::create_dir_all(&paths.dir).unwrap();
         let dir = vm_tpm_dir(&tmp.path().join("state"), id);
         std::fs::create_dir_all(&dir).unwrap();
-        start(&fake_swtpm(), false, id, &paths, &dir).await.unwrap();
+        start(&fake_swtpm(), false, id, &paths, &dir, None)
+            .await
+            .unwrap();
         assert!(paths.tpm_socket.exists());
         let pid = alive(&paths).expect("swtpm runs");
         assert_ne!(pid, std::process::id());
         // 두 번째 swtpm은 남은 것을 끝내고 다시 띄운다.
-        start(&fake_swtpm(), false, id, &paths, &dir).await.unwrap();
+        start(&fake_swtpm(), false, id, &paths, &dir, None)
+            .await
+            .unwrap();
         let second = alive(&paths).unwrap();
         assert_ne!(second, pid);
         let qemu = std::os::unix::net::UnixStream::connect(&paths.tpm_socket).unwrap();
@@ -950,7 +959,9 @@ mod tests {
 
         let dir = vm_tpm_dir(&tmp.path().join("state"), id);
         std::fs::create_dir_all(&dir).unwrap();
-        start(&fake_swtpm(), false, id, &paths, &dir).await.unwrap();
+        start(&fake_swtpm(), false, id, &paths, &dir, None)
+            .await
+            .unwrap();
         assert!(alive(&paths).is_some());
         assert!(terminate(&paths).await);
         assert_eq!(alive(&paths), None);
@@ -963,9 +974,16 @@ mod tests {
         let paths = RuntimePaths::new(tmp.path(), id).unwrap();
         std::fs::create_dir_all(&paths.dir).unwrap();
         // 상태 디렉터리가 없으면 swtpm이 실패한다.
-        let err = start(&fake_swtpm(), false, id, &paths, &tmp.path().join("none"))
-            .await
-            .unwrap_err();
+        let err = start(
+            &fake_swtpm(),
+            false,
+            id,
+            &paths,
+            &tmp.path().join("none"),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(&err, DriverError::StartFailed(m) if m.starts_with("swtpm: swtpm: Could not open TPM state directory")),
             "{err}"
@@ -974,7 +992,7 @@ mod tests {
             swtpm: "/nonexistent/swtpm".into(),
             ..fake_swtpm()
         };
-        let err = start(&missing, false, id, &paths, tmp.path())
+        let err = start(&missing, false, id, &paths, tmp.path(), None)
             .await
             .unwrap_err();
         assert!(

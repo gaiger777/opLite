@@ -1662,6 +1662,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fs4",
+ "libc",
  "opl-qemu",
  "opl-types",
  "rcgen",

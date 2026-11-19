@@ -8,6 +8,7 @@ use crate::firewall::FirewallGate;
 use crate::firmware::FirmwareFetcher;
 use crate::guest::GuestInfoSink;
 use crate::ha::HaGuard;
+use crate::host_alloc::HostAllocator;
 use uuid::Uuid;
 
 /// 게스트 감시가 게스트 에이전트를 부르는 기본 간격
@@ -55,6 +56,8 @@ pub struct ReconcilerConfig {
     pub firewall: Option<Arc<dyn FirewallGate>>,
     /// 복제본 기록 파일의 디렉터리([`crate::replicas`], opld의 `{data_dir}/replicas`)
     pub replica_dir: PathBuf,
+    /// 이 노드의 할당기(계획 64): 켤 때 pCPU·호스트 노드·hugepages를 고른다. 마이그레이션 받는 쪽과 나눈다.
+    pub host_alloc: Arc<HostAllocator>,
 }
 
 /// 크래시나 일시적 기동 실패 뒤 다시 시작하는 규칙.
@@ -93,6 +96,7 @@ impl ReconcilerConfig {
             guest_info_interval: GUEST_INFO_INTERVAL,
             ha: None,
             firewall: None,
+            host_alloc: Arc::new(HostAllocator::new(node, None)),
         }
     }
 }

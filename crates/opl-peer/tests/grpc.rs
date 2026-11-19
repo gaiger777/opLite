@@ -211,6 +211,7 @@ impl MigrationReceiver for FakeReceiver {
             port: 60007,
             nbd_port: (!req.disks.is_empty()).then_some(60008),
             refused: Vec::new(),
+            host_placement: None,
         })
     }
 
@@ -1018,6 +1019,7 @@ async fn migration_requests_reach_the_receiver_of_a_member() {
             port: 60007,
             nbd_port: None,
             refused: Vec::new(),
+            host_placement: None,
         }
     );
     // 복사할 디스크는 요청에 실려 가고 NBD 포트가 돌아온다.
@@ -1119,6 +1121,7 @@ impl MigrationReceiver for ThreadReceiver {
             port: 60007,
             nbd_port: None,
             refused: Vec::new(),
+            host_placement: None,
         })
     }
 

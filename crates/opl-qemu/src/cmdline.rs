@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use opl_types::cpu::{self, CpuError, ResolvedCpu};
+use opl_types::numa::{self, HostPlacement, MemoryPolicy, PageKind, ResolvedNuma};
 use opl_types::runtime::{
     DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RbdTarget, VmRuntimeSpec,
 };
@@ -15,6 +16,9 @@ pub const HOTPLUG_SLOT: u8 = 0x1e;
 
 /// virtio-mem 블록 크기. 마이그레이션 양쪽이 같게 박아 둔다.
 pub const VIRTIO_MEM_BLOCK: &str = "2M";
+
+/// 메모리를 미리 잡는 스레드 수의 상한(`prealloc-threads`, 계획 64)
+pub const PREALLOC_THREADS: u32 = 16;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CmdlineError {
@@ -117,6 +121,10 @@ pub fn build_cmdline(
             format!("{}M,maxmem={}M", spec.memory_mib, l.max_memory_mib),
         ),
         None => a.opt("-m", format!("{}M", spec.memory_mib)),
+    }
+    // vNUMA(계획 64): 게스트 노드마다 메모리 백엔드와 `-numa`. 없으면 지금 그대로다.
+    if let Some(numa) = &spec.numa {
+        numa_args(&mut a, spec, numa);
     }
     // 실행 중 붙인 vCPU(원본과 같은 id·자리)
     if let (Some(l), Some(max)) = (layout, max_vcpus) {
@@ -263,8 +271,30 @@ pub fn build_cmdline(
         );
     }
 
-    // virtio-mem도 앞 장치들의 PCI 주소가 그대로이게 뒤에 단다. NUMA 노드는 `maxmem`이 있으면 QEMU가 만든다.
-    if let Some(l) = virtio_mem {
+    // virtio-mem도 앞 장치들의 PCI 주소가 그대로이게 뒤에 단다. NUMA 노드는 `maxmem`이 있으면 QEMU가 만든다. vNUMA
+    // VM(계획 64)은 게스트 노드마다 장치 하나다.
+    if let (Some(l), Some(numa)) = (virtio_mem, &spec.numa) {
+        let sizes = numa::split_blocks(l.max_memory_mib - spec.memory_mib, numa.nodes.len());
+        let plugged = numa::split_plugged(l.plugged_mib, &sizes);
+        for (i, (size, plugged)) in sizes.iter().zip(plugged).enumerate() {
+            // 2M 블록이라 1G hugepages는 쓰지 못한다(1G + virtio-mem은 검증이 막고, `any`는 할당기가 2M으로 고른다).
+            let page = numa.page.filter(|p| *p == PageKind::Size2M);
+            let id = format!("vmem{i}");
+            let place = spec.host_placement.as_ref();
+            a.opt("-object", backend(numa, place, i, &id, *size, page));
+            let prealloc = if numa.page == Some(PageKind::Size2M) {
+                ",prealloc=on"
+            } else {
+                ""
+            };
+            a.opt(
+                "-device",
+                format!(
+                    "virtio-mem-pci,id=vmem{i}-dev,memdev=vmem{i},node={i},block-size={VIRTIO_MEM_BLOCK},requested-size={plugged}M{prealloc}"
+                ),
+            );
+        }
+    } else if let Some(l) = virtio_mem {
         a.opt(
             "-object",
             format!(
@@ -349,6 +379,64 @@ pub fn build_cmdline(
     );
     a.opt("-pidfile", paths.pidfile.display().to_string());
     Ok(a.0)
+}
+
+/// vNUMA(계획 64 §10): 게스트 노드마다 `-object memory-backend-…,id=ram-node<i>` + `-numa node`, 모든 소켓의 `-numa cpu`,
+/// 거리가 있으면 `-numa dist`. 백엔드 id가 RAMBlock 이름이라 마이그레이션 양쪽이 같은 모양이어야 한다(기록).
+fn numa_args(a: &mut Args, spec: &VmRuntimeSpec, numa: &ResolvedNuma) {
+    for (i, node) in numa.nodes.iter().enumerate() {
+        let mut backend = backend(
+            numa,
+            spec.host_placement.as_ref(),
+            i,
+            &format!("ram-node{i}"),
+            node.memory_mib,
+            numa.page,
+        );
+        // 전용·hugepages VM은 켤 때 모두 잡는다(마이그레이션 받는 쪽도 받기 전에 — 옮기는 중 페이지가 모자라지 않게).
+        if numa.page.is_some() || !numa.policy.is_shared() {
+            let threads = spec.cpu.vcpus().clamp(1, PREALLOC_THREADS);
+            backend.push_str(&format!(",prealloc=on,prealloc-threads={threads}"));
+        }
+        a.opt("-object", backend);
+        a.opt("-numa", format!("node,nodeid={i},memdev=ram-node{i}"));
+    }
+    for (i, node) in numa.nodes.iter().enumerate() {
+        for socket in &node.sockets {
+            a.opt("-numa", format!("cpu,node-id={i},socket-id={socket}"));
+        }
+    }
+    for (i, row) in numa.distances.iter().enumerate() {
+        for (j, d) in row.iter().enumerate().skip(i + 1) {
+            a.opt("-numa", format!("dist,src={i},dst={j},val={d}"));
+        }
+    }
+}
+
+/// 게스트 노드 `i`의 메모리 백엔드 `id`(크기 `size_mib`): hugepages(`page`)면 memfd hugetlb, 아니면 ram. 묶는 VM은 그
+/// 노드의 호스트 노드에 `policy=bind|preferred`.
+fn backend(
+    numa: &ResolvedNuma,
+    placement: Option<&HostPlacement>,
+    i: usize,
+    id: &str,
+    size_mib: u32,
+    page: Option<PageKind>,
+) -> String {
+    let mut o = match page {
+        Some(p) => {
+            format!("memory-backend-memfd,id={id},size={size_mib}M,hugetlb=on,hugetlbsize={p}")
+        }
+        None => format!("memory-backend-ram,id={id},size={size_mib}M"),
+    };
+    if let (Some(policy), Some(host)) = (numa.memory, placement.and_then(|p| p.host_nodes.get(i))) {
+        let policy = match policy {
+            MemoryPolicy::Strict => "bind",
+            MemoryPolicy::Preferred => "preferred",
+        };
+        o.push_str(&format!(",host-nodes={host},policy={policy}"));
+    }
+    o
 }
 
 /// `-cpu`의 값: `<model>[,enforce][,<flag>=on|off]…`(플래그는 이름순). 플래그는 그 CPU 형식의 전역 속성이라 실행 중
@@ -637,6 +725,9 @@ mod tests {
             firmware_epoch: 0,
             keep_tpm: false,
             cpu_resolved: None,
+            numa: None,
+            host_placement: None,
+            pinning: None,
         }
     }
 
@@ -1415,5 +1506,190 @@ mod tests {
             build_cmdline(&bios, &host, &paths()).unwrap_err(),
             CmdlineError::SecureBootNeedsUefi
         );
+    }
+    // -------------------------------------------------------------------------------------------------------------
+    // vNUMA·메모리 백엔드·hugepages(계획 64)
+    // -------------------------------------------------------------------------------------------------------------
+
+    fn guest(sockets: &[u16], memory_mib: u32) -> opl_types::numa::GuestNode {
+        opl_types::numa::GuestNode {
+            sockets: sockets.to_vec(),
+            memory_mib,
+        }
+    }
+
+    fn shared_numa(nodes: Vec<opl_types::numa::GuestNode>) -> ResolvedNuma {
+        ResolvedNuma {
+            nodes,
+            distances: Vec::new(),
+            page: None,
+            policy: Default::default(),
+            thread_policy: None,
+            emulator: None,
+            memory: None,
+        }
+    }
+
+    /// `-m` 다음부터 장치 앞까지의 인자
+    fn after_memory(args: &[String]) -> Vec<String> {
+        let at = args.iter().position(|a| a == "-m").unwrap() + 2;
+        let end = args[at..]
+            .iter()
+            .position(|a| a == "-device" || a == "-drive")
+            .unwrap()
+            + at;
+        args[at..end].to_vec()
+    }
+
+    /// 기능을 쓰지 않는 VM(`host`·`max`, NUMA 없음)은 배치·고정이 있어도 명령줄이 바이트까지 같다.
+    #[test]
+    fn vms_without_numa_keep_the_old_command_line() {
+        for model in [CpuModel::Host, CpuModel::Max] {
+            let mut spec = x86_spec();
+            spec.cpu.model = model;
+            let before = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+            spec.pinning = Some(opl_types::runtime::RuntimePinning {
+                emulator: "1".parse().unwrap(),
+                vcpus: Vec::new(),
+                slots_per_socket: 4,
+                scope: None,
+            });
+            assert_eq!(build_cmdline(&spec, &x86_host(), &paths()).unwrap(), before);
+            assert!(
+                !before
+                    .iter()
+                    .any(|a| a == "-numa" || a.contains("memory-backend"))
+            );
+        }
+    }
+
+    #[test]
+    fn shared_vnuma_has_a_ram_backend_and_the_sockets_of_each_node() {
+        let mut spec = x86_spec();
+        spec.cpu.sockets = 2;
+        spec.cpu.cores = 2;
+        let before = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        spec.numa = Some(shared_numa(vec![guest(&[0], 4096), guest(&[1], 4096)]));
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert_eq!(
+            after_memory(&args),
+            [
+                "-object",
+                "memory-backend-ram,id=ram-node0,size=4096M",
+                "-numa",
+                "node,nodeid=0,memdev=ram-node0",
+                "-object",
+                "memory-backend-ram,id=ram-node1,size=4096M",
+                "-numa",
+                "node,nodeid=1,memdev=ram-node1",
+                "-numa",
+                "cpu,node-id=0,socket-id=0",
+                "-numa",
+                "cpu,node-id=1,socket-id=1",
+            ]
+        );
+        // 그 밖은 그대로다(장치 순서·PCI 주소, `-smp`·`-cpu`).
+        let rest: Vec<&String> = args
+            .iter()
+            .filter(|a| !after_memory(&args).contains(a))
+            .collect();
+        let old: Vec<&String> = before.iter().collect();
+        assert_eq!(rest, old);
+    }
+
+    #[test]
+    fn dedicated_1g_vms_bind_preallocated_hugetlb_memory_with_distances() {
+        let mut spec = x86_spec();
+        spec.cpu.sockets = 2;
+        spec.cpu.cores = 2;
+        let mut numa = shared_numa(vec![guest(&[0], 4096), guest(&[1], 4096)]);
+        numa.policy = opl_types::numa::CpuPolicy::Dedicated;
+        numa.page = Some(PageKind::Size1G);
+        numa.memory = Some(MemoryPolicy::Strict);
+        numa.distances = vec![vec![10, 21], vec![21, 10]];
+        spec.numa = Some(numa);
+        spec.host_placement = Some(HostPlacement {
+            node: Uuid::nil(),
+            vcpus: vec![4, 5, 12, 13],
+            siblings: Default::default(),
+            emulator: Default::default(),
+            host_nodes: vec![1, 0],
+        });
+        let args = after_memory(&build_cmdline(&spec, &x86_host(), &paths()).unwrap());
+        assert_eq!(
+            args[1],
+            "memory-backend-memfd,id=ram-node0,size=4096M,hugetlb=on,hugetlbsize=1G,host-nodes=1,policy=bind,prealloc=on,prealloc-threads=4"
+        );
+        assert_eq!(
+            args[5],
+            "memory-backend-memfd,id=ram-node1,size=4096M,hugetlb=on,hugetlbsize=1G,host-nodes=0,policy=bind,prealloc=on,prealloc-threads=4"
+        );
+        assert_eq!(args[args.len() - 2..], ["-numa", "dist,src=0,dst=1,val=21"]);
+        // 공유 VM의 `preferred`는 미리 잡지 않는다.
+        let numa = spec.numa.as_mut().unwrap();
+        numa.policy = Default::default();
+        numa.page = None;
+        numa.memory = Some(MemoryPolicy::Preferred);
+        let args = after_memory(&build_cmdline(&spec, &x86_host(), &paths()).unwrap());
+        assert_eq!(
+            args[1],
+            "memory-backend-ram,id=ram-node0,size=4096M,host-nodes=1,policy=preferred"
+        );
+    }
+
+    /// 핫플러그 배치의 virtio-mem은 게스트 노드마다 장치이고(`node=`), 2M hugepages VM은 장치가 미리 잡는다.
+    #[test]
+    fn virtio_mem_is_one_device_per_guest_node() {
+        let mut spec = hotplug_spec();
+        spec.cpu.sockets = 2;
+        spec.cpu.cores = 1;
+        let mut numa = shared_numa(vec![guest(&[0], 2048), guest(&[1], 2048)]);
+        numa.page = Some(PageKind::Size2M);
+        numa.memory = Some(MemoryPolicy::Strict);
+        spec.numa = Some(numa);
+        spec.host_placement = Some(HostPlacement {
+            node: Uuid::nil(),
+            vcpus: Vec::new(),
+            siblings: Default::default(),
+            emulator: Default::default(),
+            host_nodes: vec![0, 1],
+        });
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        let has = |s: &str| args.iter().any(|a| a == s);
+        // 상한 16384 − 4096 = 12288을 둘로, 꽂은 2048도 둘로
+        assert!(has(
+            "memory-backend-memfd,id=vmem0,size=6144M,hugetlb=on,hugetlbsize=2M,host-nodes=0,policy=bind"
+        ));
+        assert!(has(
+            "memory-backend-memfd,id=vmem1,size=6144M,hugetlb=on,hugetlbsize=2M,host-nodes=1,policy=bind"
+        ));
+        assert!(has(
+            "virtio-mem-pci,id=vmem0-dev,memdev=vmem0,node=0,block-size=2M,requested-size=1024M,prealloc=on"
+        ));
+        assert!(has(
+            "virtio-mem-pci,id=vmem1-dev,memdev=vmem1,node=1,block-size=2M,requested-size=1024M,prealloc=on"
+        ));
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("id=vmem0-dev,memdev=vmem0,block-size"))
+        );
+        // 실행 중 붙인 vCPU는 그대로다(노드는 QEMU가 매핑에서 채운다).
+        assert!(has(
+            "host-x86_64-cpu,id=cpu2,socket-id=0,core-id=2,thread-id=0"
+        ));
+    }
+
+    #[test]
+    fn aarch64_virt_gets_the_same_numa_options() {
+        let mut spec = x86_spec();
+        spec.machine = MachineType::Virt;
+        spec.disks.retain(|d| d.bus != DiskBus::Sata);
+        spec.cpu.sockets = 2;
+        spec.cpu.cores = 1;
+        spec.numa = Some(shared_numa(vec![guest(&[0], 4096), guest(&[1], 4096)]));
+        let args = build_cmdline(&spec, &mac_host(), &paths()).unwrap();
+        assert!(args.contains(&"cpu,node-id=1,socket-id=1".to_string()));
+        assert!(args.contains(&"memory-backend-ram,id=ram-node1,size=4096M".to_string()));
     }
 }

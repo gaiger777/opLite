@@ -24,6 +24,7 @@ use opl_reconciler::replicas::{self, RecordedReplica, ReplicaRecord, ReplicaStat
 use opl_reconciler::resolve::{apply_disk_moves, set_disks_shared};
 use opl_types::hotplug;
 use opl_types::node::NodeSpec;
+use opl_types::numa::HostPlacement;
 use opl_types::replication::{
     ReplicaStatus, ReplicaVolume, ReplicationState, ReplicationTarget, replica_bitmap,
 };
@@ -112,8 +113,10 @@ pub(super) async fn migrate(
     };
     // 보내기가 끝난 때가 스위치오버 시점이다(남긴 복제본의 시점).
     let mut switched = None;
+    let mut placement = None;
     let error = match sent {
-        Ok(()) => {
+        Ok(target_placement) => {
+            placement = target_placement;
             switched = Some(now());
             match record_kept(ctx, id, &kept).await {
                 Ok(()) => commit(ctx, id, &migration, &kept).await.err(),
@@ -134,7 +137,15 @@ pub(super) async fn migrate(
             Outcome::Committed => {}
         }
     }
-    finish(ctx, id, &migration, &kept, switched.unwrap_or_else(now)).await;
+    finish(
+        ctx,
+        id,
+        &migration,
+        &kept,
+        switched.unwrap_or_else(now),
+        placement,
+    )
+    .await;
     Ok(())
 }
 
@@ -383,7 +394,7 @@ async fn send(
     addr: &str,
     vm: &Vm,
     migration: &MigrationStatus,
-) -> Result<(), String> {
+) -> Result<Option<HostPlacement>, String> {
     let id = vm.id;
     // 받는 쪽은 스펙의 디스크·NIC와 하드웨어 기록의 배치로 켠다. 원본 QEMU가 다르면 받는 쪽을 켜거나 디스크를 복사하기
     // 전에 멈춘다(보내기 직전에도 다시 본다).
@@ -454,7 +465,8 @@ async fn send(
     peers
         .migrate_incoming_wait(addr, incoming)
         .await
-        .map_err(|e| format!("the target node did not receive the VM: {e}"))
+        .map_err(|e| format!("the target node did not receive the VM: {e}"))?;
+    Ok(reply.host_placement)
 }
 
 /// 복사할 디스크의 원본(풀·id·형식)을 이 노드의 기록 파일(`source`)에 쓰고, 대상 풀마다 할당량의 합이
@@ -964,6 +976,7 @@ async fn finish(
     migration: &MigrationStatus,
     kept: &[RecordedReplica],
     switched: u64,
+    placement: Option<HostPlacement>,
 ) {
     let deadline = Instant::now() + RECORD_TIMEOUT;
     // 복사한 디스크의 볼륨 기록을 옮긴 위치로 고친 뒤에만 표시를 지운다. 못 고치면 대상 노드의
@@ -994,6 +1007,10 @@ async fn finish(
         if status.node != Some(migration.node) {
             status.node = Some(migration.node);
             status.pid = None;
+        }
+        // 대상이 고른 pCPU·호스트 노드(계획 64). 게스트 모양(`numa`)은 그대로다.
+        if let (Some(hw), Some(p)) = (&mut status.hardware, &placement) {
+            hw.host_placement = Some(p.clone());
         }
         // QEMU가 UEFI 변수(pflash)를 대상 노드의 변수 파일로 옮겼다(설계 §5). TPM 상태도 swtpm이 대상 노드에 썼다
         // (계획 59 §10): 사본은 비우고 대상의 작업자가 곧 해시를 다시 적고 밀어 둔다.

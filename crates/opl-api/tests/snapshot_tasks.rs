@@ -1084,6 +1084,9 @@ async fn running_block_vm(env: &Env, admin: &Client, name: &str, disks: &[&str])
         firmware_epoch: 0,
         keep_tpm: false,
         cpu_resolved: None,
+        numa: None,
+        host_placement: None,
+        pinning: None,
     };
     env.hv.start(&runtime, None).await.unwrap();
     let mut spec = current.spec.clone();

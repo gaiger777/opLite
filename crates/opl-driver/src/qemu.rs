@@ -18,9 +18,11 @@ use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::guest::GuestInfo;
 use opl_types::network::{tap_name, tap_prefix};
 use opl_types::node::{FirmwareCaps, NodeHotplug};
+use opl_types::numa::CpuSet;
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{
-    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec,
+    DiskKind, ImageFormat, NicBackend, RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning,
+    VmRuntimeSpec,
 };
 use opl_types::vm::{CpuSpec, DiskBus, Firmware, NicModel, RunningHardware};
 use rustix::process::{Flock, FlockOffsetType, FlockType, Pid, Signal, fcntl_getlk, kill_process};
@@ -106,6 +108,8 @@ const MIRROR_JOB_PREFIX: &str = "opl-mirror-";
 const EXPORT_PREFIX: &str = "opl-export-";
 /// 켤 때의 하드웨어 기록을 남기는 실행 디렉터리의 파일([`Hypervisor::save_hardware`])
 const HARDWARE_FILE: &str = "hardware.json";
+/// 스레드 고정(계획 64)을 남기는 실행 디렉터리의 파일
+const PINNING_FILE: &str = "pinning.json";
 /// 복제 회차의 작업 id(`opl-repl-{i}`)와 그 NBD 대상 노드(`opl-repl-nbd-{i}`)의 접두사(i는 디스크 순서 번호)
 const REPLICA_JOB_PREFIX: &str = "opl-repl-";
 /// 복제 회차의 NBD 대상 노드 이름의 접두사(`opl-repl-nbd-{i}`)
@@ -424,13 +428,14 @@ impl QemuHypervisor {
                 vm.id,
                 paths,
                 &dir,
+                vm.pinning.as_ref().map(|p| &p.emulator),
             )
             .await?;
         }
         let mut cmd = if self.config.systemd_scope {
             clear_stale_scope(&format!("opl-vm-{}.scope", vm.id)).await;
             let mut cmd = tokio::process::Command::new("systemd-run");
-            cmd.args(scope_args(vm.id))
+            cmd.args(vm_scope_args(vm.id, vm.pinning.as_ref()))
                 .arg("--")
                 .arg(&self.config.host.qemu_binary);
             cmd
@@ -442,6 +447,10 @@ impl QemuHypervisor {
             // 타임아웃으로 기다림을 그만두면 부모 프로세스도 끝낸다. 이미 분리된 자식은
             // 실패 정리(kill_and_cleanup)가 pidfile 잠금으로 찾아 끝낸다.
             .kill_on_drop(true);
+        // 계획 64: QEMU의 모든 스레드(나중 일꾼·vhost 포함)가 물려받을 친화. opld가 예약 CPU에 묶여 있어도 늘 다시 건다.
+        if let Some(pin) = &vm.pinning {
+            pin_child(&mut cmd, &pin.emulator);
+        }
         if cfg!(target_os = "macos") {
             // macOS에서는 -daemonize의 fork 뒤 자식이 Objective-C 런타임을 초기화하다
             // "fork() was called ... Crashing instead"로 죽는다. 디스플레이/VNC 장치가 있으면
@@ -449,7 +458,8 @@ impl QemuHypervisor {
             cmd.env("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES");
         }
         // -daemonize: 초기화가 끝나면 부모 프로세스가 종료 코드로 성공 여부를 알려 주고, 자식은 세션에서 분리된다.
-        let output = tokio::time::timeout(START_TIMEOUT, cmd.output())
+        // 미리 잡는 메모리(계획 64)는 `-daemonize`의 부모가 끝나기 전에 잡는다.
+        let output = tokio::time::timeout(start_timeout(vm), cmd.output())
             .await
             .map_err(|_| DriverError::Timeout("QEMU to start"))??;
         if !output.status.success() {
@@ -466,6 +476,20 @@ impl QemuHypervisor {
             // 그새 끝났다. 모니터가 종료 이벤트를 보냈다.
             return Ok(());
         };
+        // vCPU 스레드는 `-S`로 멈춘 동안에도 있다: `cont`(받는 쪽은 마이그레이션) 전에 고정하고 확인한다.
+        if let Some(pin) = &vm.pinning {
+            let pinned = match pin_threads(&handle, pin).await {
+                Ok(_) => write_pinning(&paths.dir, pin),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = pinned {
+                drop(handle);
+                if let Err(stop) = self.stop(vm.id, StopMode::Force).await {
+                    tracing::error!(id = %vm.id, error = %stop, "failed to stop QEMU after pinning failed");
+                }
+                return Err(e);
+            }
+        }
         let restore = match how {
             Launch::Start { restore } => restore,
             // 받기를 마칠 때까지 멈춰 둔다.
@@ -2003,6 +2027,7 @@ impl Hypervisor for QemuHypervisor {
         }
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
+        let pin = read_pinning(&handle.paths.dir).filter(|p| !p.vcpus.is_empty());
         // 켤 때처럼 소켓마다 `max / sockets`개 코어 자리를 앞에서부터 채운다(cmdline과 같은 자리).
         let per_socket = max / u32::from(cpu.sockets);
         let mut now = from;
@@ -2034,6 +2059,15 @@ impl Hypervisor for QemuHypervisor {
                                 "core-id": core, "thread-id": s.thread_id.unwrap_or(0),
                             });
                             qmp_call(qmp.device_add(args), "QMP device_add").await?;
+                            // 계획 64: 새 vCPU 스레드를 켤 때 잡아 둔 그 자리의 pCPU에 고정한다. 안 되면 되돌린다.
+                            if let Some(pin) = &pin
+                                && let Err(e) = pin_threads(&handle, pin).await
+                            {
+                                if let Err(del) = unplug(qmp, &format!("cpu{i}"), timeout).await {
+                                    tracing::warn!(%id, vcpu = i, error = %del, "cannot remove the vCPU that could not be pinned");
+                                }
+                                return Err(e);
+                            }
                         }
                     }
                     if i >= from {
@@ -2087,6 +2121,11 @@ impl Hypervisor for QemuHypervisor {
     ) -> Result<u32, DriverError> {
         let handle = self.running_handle(id)?;
         let qmp = &handle.qmp;
+        // vNUMA VM(계획 64)은 게스트 노드마다 장치가 있다.
+        let nodes = virtio_mem_nodes(qmp).await?;
+        if nodes > 1 {
+            return set_memory_per_node(qmp, id, nodes, plugged_mib, timeout).await;
+        }
         let size = virtio_mem_size(qmp).await?;
         let requested = u64::from(plugged_mib) << 20;
         let set = qmp.qom_set(VIRTIO_MEM_PATH, "requested-size", json!(requested));
@@ -2403,6 +2442,28 @@ impl Hypervisor for QemuHypervisor {
                 None
             }
         }
+    }
+
+    async fn repin(&self, id: Uuid, pin: &RuntimePinning) -> Result<usize, DriverError> {
+        let handle = self.running_handle(id)?;
+        let mut changed = 0;
+        // 스코프를 먼저: cpuset이 좁아지면 커널이 스레드 친화를 그 안으로 자른다.
+        if self.config.systemd_scope
+            && let Some(cpus) = &pin.scope
+        {
+            let unit = format!("opl-vm-{id}.scope");
+            if scope_cpus(&unit).await.as_ref() != Some(cpus) {
+                set_scope_cpus(&unit, cpus).await?;
+                changed += 1;
+            }
+        }
+        changed += pin_threads(&handle, pin).await?;
+        write_pinning(&handle.paths.dir, pin)?;
+        Ok(changed)
+    }
+
+    fn saved_pinning(&self, id: Uuid) -> Option<RuntimePinning> {
+        read_pinning(&self.paths(id).ok()?.dir)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
@@ -3965,6 +4026,139 @@ async fn delete_taps(net: Option<&dyn HostNet>, id: Uuid) -> bool {
     true
 }
 
+/// VM 스코프의 인자: [`scope_args`]에 고정(계획 64)의 `AllowedCPUs`. 고정이 없거나 스코프를 묶지 않으면 지금 그대로다.
+fn vm_scope_args(id: Uuid, pinning: Option<&RuntimePinning>) -> Vec<String> {
+    let mut args = scope_args(id);
+    if let Some(cpus) = pinning.and_then(|p| p.scope.as_ref()) {
+        args.push(format!("--property=AllowedCPUs={cpus}"));
+    }
+    args
+}
+
+/// QEMU를 띄우는 시간 한도: 30초 + 미리 잡는 메모리(전용·hugepages VM, 계획 64) GiB마다 1초
+fn start_timeout(vm: &VmRuntimeSpec) -> Duration {
+    let prealloc = vm
+        .numa
+        .as_ref()
+        .is_some_and(|n| n.page.is_some() || !n.policy.is_shared());
+    let gib = if prealloc {
+        u64::from(vm.memory_mib).div_ceil(1024)
+    } else {
+        0
+    };
+    START_TIMEOUT + Duration::from_secs(gib)
+}
+
+/// 자식 프로세스(`fork` 뒤 `exec` 전)의 친화를 `cpus`로 둔다(Linux). 자식은 opld의 친화(예약 CPU)를 물려받으므로 늘
+/// 다시 건다.
+pub(crate) fn pin_child(cmd: &mut tokio::process::Command, cpus: &CpuSet) {
+    #[cfg(target_os = "linux")]
+    {
+        let mask = crate::affinity::mask(cpus);
+        // SAFETY: 닫는 함수는 시스템 호출 하나(sched_setaffinity)만 부른다 — fork 뒤에 불러도 되는 것이다.
+        unsafe {
+            cmd.pre_exec(move || crate::affinity::set_mask(0, &mask));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (cmd, cpus);
+}
+
+/// 실행 중 VM의 스레드를 고정한다: vCPU 스레드(QMP `query-cpus-fast`)는 자리의 CPU, 나머지는 에뮬레이터 집합(자식
+/// 친화로 이미 물려받았지만 스코프 cpuset에 들어갈 때 커널이 넓혔을 수 있다). 친화가 이미 같은 스레드는 건드리지 않고,
+/// vCPU는 `/proc/<pid>/task/<tid>/status`로 확인한다. 바꾼 스레드 수를 돌려준다. vCPU를 고정하지 못하면
+/// `StartFailed("cannot pin vCPU 3 to CPU 7: …")`다.
+async fn pin_threads(handle: &VmHandle, pin: &RuntimePinning) -> Result<usize, DriverError> {
+    let vcpus = if pin.vcpus.is_empty() {
+        Vec::new()
+    } else {
+        let r =
+            tokio::time::timeout(QMP_TIMEOUT, handle.qmp.execute("query-cpus-fast", None)).await;
+        crate::affinity::vcpu_threads(&flatten(r, "QMP query-cpus-fast")?, pin.slots_per_socket)
+    };
+    let proc = Path::new("/proc");
+    let mut changed = 0;
+    for tid in crate::affinity::threads(proc, handle.pid)? {
+        let slot = vcpus.iter().find(|(_, t)| *t == tid).map(|(slot, _)| *slot);
+        let want = slot.map_or(&pin.emulator, |s| pin.vcpu(s));
+        let Some(got) = crate::affinity::thread_cpus(proc, handle.pid, tid) else {
+            // 그사이 끝난 스레드
+            continue;
+        };
+        if &got == want {
+            continue;
+        }
+        let set = crate::affinity::set_thread(tid, want);
+        let Some(slot) = slot else {
+            match set {
+                Ok(()) => changed += 1,
+                // 그사이 끝난 스레드(ESRCH)
+                Err(e) if e.raw_os_error() == Some(3) => {}
+                Err(e) => {
+                    return Err(DriverError::Io(std::io::Error::other(format!(
+                        "cannot pin thread {tid} to CPU {want}: {e}"
+                    ))));
+                }
+            }
+            continue;
+        };
+        let failed = |why: String| {
+            DriverError::StartFailed(format!("cannot pin vCPU {slot} to CPU {want}: {why}"))
+        };
+        set.map_err(|e| failed(e.to_string()))?;
+        match crate::affinity::thread_cpus(proc, handle.pid, tid) {
+            Some(got) if &got == want => changed += 1,
+            Some(got) => return Err(failed(format!("the thread runs on CPU {got}"))),
+            None => return Err(failed(format!("cannot read thread {tid}"))),
+        }
+    }
+    Ok(changed)
+}
+
+/// 스코프 `unit`의 `AllowedCPUs`(systemd). 걸지 않았으면 빈 집합, 읽지 못하면 None
+async fn scope_cpus(unit: &str) -> Option<CpuSet> {
+    let out = tokio::process::Command::new("systemctl")
+        .args(["show", "--property=AllowedCPUs", "--value", unit])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(QMP_TIMEOUT, out).await.ok()?.ok()?;
+    out.status.success().then_some(())?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
+/// 도는 스코프 `unit`의 `AllowedCPUs`를 바꾼다(`systemctl set-property --runtime`).
+async fn set_scope_cpus(unit: &str, cpus: &CpuSet) -> Result<(), DriverError> {
+    let out = tokio::process::Command::new("systemctl")
+        .args(["set-property", "--runtime", unit])
+        .arg(format!("AllowedCPUs={cpus}"))
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(KILL_TIMEOUT, out)
+        .await
+        .map_err(|_| DriverError::Timeout("systemctl set-property"))??;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(DriverError::Io(std::io::Error::other(format!(
+            "cannot set AllowedCPUs={cpus} on {unit}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))))
+    }
+}
+
+/// 실행 디렉터리의 고정 기록(`pinning.json`): 실행 중 붙인 vCPU의 고정과 검사 루프의 어긋남 고치기가 읽는다.
+fn write_pinning(dir: &Path, pin: &RuntimePinning) -> Result<(), DriverError> {
+    let json = serde_json::to_vec(pin).map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
+    std::fs::write(dir.join(PINNING_FILE), json)?;
+    Ok(())
+}
+
+fn read_pinning(dir: &Path) -> Option<RuntimePinning> {
+    serde_json::from_slice(&std::fs::read(dir.join(PINNING_FILE)).ok()?).ok()
+}
+
 /// QEMU를 감싸는 `systemd-run`의 인자(`--` 앞). 스코프는 QEMU가 끝날 때까지 남고, `--collect`면 실패로
 /// 끝나도 남기지 않는다. `Before=opld.service`: 멈출 때는 순서가 거꾸로라 호스트가 꺼질 때 opld가 끝난 뒤에
 /// 스코프가 멈춘다(종료 정책이 VM이 살아 있을 때 돈다). `After=network-online.target remote-fs.target`: 망과
@@ -4113,11 +4307,14 @@ async fn check_devices(qmp: &QmpClient, expected: &[String]) -> Result<(), Drive
     )))
 }
 
-/// 마이그레이션 전에 견주는 장치 id인지: `disk{i}-dev`, `nic{i}`, `cpu{i}`, `vmem0-dev`, CD-ROM `cd{i}-dev`, cloud-init
+/// 마이그레이션 전에 견주는 장치 id인지: `disk{i}-dev`, `nic{i}`, `cpu{i}`, `vmem{i}-dev`, CD-ROM `cd{i}-dev`, cloud-init
 /// 씨앗 `cidata-dev`(CD 컨트롤러 `scsi0`는 견주지 않는다)
 fn tracked_device(id: &str) -> bool {
     let number = |rest: &str| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit());
-    id == "vmem0-dev"
+    // vNUMA VM(계획 64)은 게스트 노드마다 `vmem<i>-dev`다.
+    id.strip_prefix("vmem")
+        .and_then(|r| r.strip_suffix("-dev"))
+        .is_some_and(number)
         || id == "cidata-dev"
         || ["disk", "cd"].iter().any(|p| {
             id.strip_prefix(p)
@@ -4155,6 +4352,77 @@ async fn unplug(qmp: &QmpClient, id: &str, timeout: Duration) -> Result<bool, Dr
 /// "acpi: device unplug request for not supported device type: max-x86_64-cpu")
 fn vcpu_unplug_refused(desc: &str) -> bool {
     desc.contains("device unplug request for not supported device type")
+}
+
+/// virtio-mem 장치 수(`vmem<i>-dev`, vNUMA VM은 게스트 노드마다 하나, 계획 64)
+async fn virtio_mem_nodes(qmp: &QmpClient) -> Result<usize, DriverError> {
+    let ids = qmp_call(qmp.peripheral_ids(), "QMP qom-list").await?;
+    Ok(ids
+        .iter()
+        .filter(|n| {
+            n.strip_prefix("vmem")
+                .and_then(|r| r.strip_suffix("-dev"))
+                .is_some_and(|i| i.parse::<u32>().is_ok())
+        })
+        .count())
+}
+
+/// 게스트 노드마다 장치가 있는 virtio-mem의 꽂을 크기를 바꾼다: 장치마다 자리(백엔드 `vmem<i>`의 크기)를 넘지 않게
+/// 나누고([`numa::split_plugged`], 명령줄과 같은 나눔), 줄이기는 게스트가 모두 내려 주기를 기다린다. 시간이 넘으면
+/// 장치마다 지금 크기를 요청으로 되돌리고 그 합을 돌려준다.
+async fn set_memory_per_node(
+    qmp: &QmpClient,
+    id: Uuid,
+    nodes: usize,
+    plugged_mib: u32,
+    timeout: Duration,
+) -> Result<u32, DriverError> {
+    let dev = |i: usize| format!("/machine/peripheral/vmem{i}-dev");
+    let mut caps = Vec::with_capacity(nodes);
+    for i in 0..nodes {
+        let size = qmp_call(
+            qmp.qom_get(&format!("/objects/vmem{i}"), "size"),
+            "QMP qom-get",
+        )
+        .await?;
+        let bytes = size
+            .as_u64()
+            .ok_or_else(|| QmpError::Protocol(format!("virtio-mem backend size: {size}")))?;
+        caps.push(u32::try_from(bytes >> 20).unwrap_or(u32::MAX));
+    }
+    let wanted = opl_types::numa::split_plugged(plugged_mib, &caps);
+    for (i, mib) in wanted.iter().enumerate() {
+        let path = dev(i);
+        let set = qmp.qom_set(&path, "requested-size", json!(u64::from(*mib) << 20));
+        qmp_call(set, "QMP qom-set").await?;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut sizes = Vec::with_capacity(nodes);
+        for i in 0..nodes {
+            let size = qmp_call(qmp.qom_get(&dev(i), "size"), "QMP qom-get").await?;
+            sizes.push(size.as_u64().unwrap_or(u64::MAX));
+        }
+        if sizes
+            .iter()
+            .zip(&wanted)
+            .all(|(size, mib)| *size <= u64::from(*mib) << 20)
+        {
+            return Ok(wanted.iter().sum());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(%id, ?sizes, ?wanted, ?timeout, "the guest did not release memory");
+            let mut total = 0u32;
+            for (i, size) in sizes.iter().enumerate() {
+                let path = dev(i);
+                let set = qmp.qom_set(&path, "requested-size", json!(size));
+                qmp_call(set, "QMP qom-set").await?;
+                total += u32::try_from(size.div_ceil(1 << 20)).unwrap_or(u32::MAX);
+            }
+            return Ok(total);
+        }
+        tokio::time::sleep(VIRTIO_MEM_POLL).await;
+    }
 }
 
 /// virtio-mem 장치가 게스트에 꽂아 준 크기(`size`, 바이트)
@@ -4275,6 +4543,9 @@ mod tests {
             firmware_epoch: 0,
             keep_tpm: false,
             cpu_resolved: None,
+            numa: None,
+            host_placement: None,
+            pinning: None,
         }
     }
 
@@ -4361,6 +4632,42 @@ mod tests {
                 "--property=After=network-online.target remote-fs.target",
             ]
         );
+    }
+
+    /// 고정이 없으면 VM 스코프의 인자는 지금 그대로이고, 스코프를 묶는 고정은 `AllowedCPUs`를 더한다(계획 64). 미리 잡는
+    /// 메모리만큼 띄우는 시간이 늘어난다.
+    #[test]
+    fn pinned_vms_get_allowed_cpus_and_more_time_to_preallocate() {
+        let id = Uuid::nil();
+        assert_eq!(vm_scope_args(id, None), scope_args(id));
+        let mut pin = RuntimePinning {
+            emulator: "1".parse().unwrap(),
+            vcpus: vec!["2".parse().unwrap(), "3".parse().unwrap()],
+            slots_per_socket: 2,
+            scope: None,
+        };
+        assert_eq!(vm_scope_args(id, Some(&pin)), scope_args(id));
+        pin.scope = Some(pin.all());
+        let args = vm_scope_args(id, Some(&pin));
+        assert_eq!(args[..args.len() - 1], scope_args(id)[..]);
+        assert_eq!(args.last().unwrap(), "--property=AllowedCPUs=1-3");
+
+        let mut vm = spec();
+        vm.memory_mib = 4097;
+        assert_eq!(start_timeout(&vm), START_TIMEOUT);
+        vm.numa = Some(opl_types::numa::ResolvedNuma {
+            nodes: vec![opl_types::numa::GuestNode {
+                sockets: vec![0],
+                memory_mib: 4097,
+            }],
+            distances: Vec::new(),
+            page: Some(opl_types::numa::PageKind::Size2M),
+            policy: Default::default(),
+            thread_policy: None,
+            emulator: None,
+            memory: Some(opl_types::numa::MemoryPolicy::Strict),
+        });
+        assert_eq!(start_timeout(&vm), START_TIMEOUT + Duration::from_secs(5));
     }
 
     #[test]
@@ -9099,6 +9406,7 @@ time.sleep(60)
             vm.id,
             &paths,
             &vm_tpm_dir(&state, vm.id),
+            None,
         )
         .await
         .unwrap();
@@ -9130,7 +9438,7 @@ time.sleep(60)
         std::fs::create_dir_all(&paths.dir).unwrap();
         let dir = vm_tpm_dir(&cfg.state_dir, id);
         std::fs::create_dir_all(&dir).unwrap();
-        crate::tpm::start(&cfg.swtpm, false, id, &paths, &dir)
+        crate::tpm::start(&cfg.swtpm, false, id, &paths, &dir, None)
             .await
             .unwrap();
         assert!(crate::tpm::alive(&paths).is_some());

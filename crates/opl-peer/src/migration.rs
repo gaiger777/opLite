@@ -42,6 +42,9 @@ pub struct MigrateIncomingResponse {
     /// 바뀐 블록만 받을 수 없는 복제본 디스크(볼륨 id): 원본은 이 디스크들을 전체로 보낸다(복제본을 덮어쓴다).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub refused: Vec<Uuid>,
+    /// 받는 쪽이 고른 배치(계획 64, 묶는 VM만): 원본이 확정 뒤 `hardware.host_placement`로 쓴다. 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_placement: Option<opl_types::numa::HostPlacement>,
 }
 
 /// 받기 확인과 취소 요청: 어느 VM의 어느 마이그레이션인지
@@ -125,6 +128,7 @@ mod tests {
             port: 60000,
             nbd_port: None,
             refused: vec![],
+            host_placement: None,
         };
         let old = serde_json::json!({ "port": 60000 });
         assert_eq!(serde_json::to_value(&reply).unwrap(), old);
@@ -136,6 +140,7 @@ mod tests {
             port: 60000,
             nbd_port: Some(60001),
             refused: vec![],
+            host_placement: None,
         };
         let json = serde_json::to_value(&reply).unwrap();
         assert_eq!(
@@ -167,6 +172,7 @@ mod tests {
             port: 60000,
             nbd_port: Some(60001),
             refused: vec![volume],
+            host_placement: None,
         };
         let json = serde_json::to_value(&reply).unwrap();
         assert_eq!(json["refused"], serde_json::json!([volume]));

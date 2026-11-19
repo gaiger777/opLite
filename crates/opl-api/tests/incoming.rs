@@ -201,6 +201,115 @@ async fn receives_waits_and_aborts() {
     s.receiver.abort(migration).await.unwrap();
 }
 
+/// 묶는 VM(계획 64): 받는 쪽이 기록의 게스트 모양 그대로 이 노드의 전용 pCPU를 새로 고르고 예약하며, 받는 QEMU를 그
+/// 배치로 띄우고 응답으로 돌려준다(원본이 확정 뒤 기록에 쓴다). 취소하면 예약을 푼다.
+#[tokio::test]
+async fn a_dedicated_vm_is_placed_again_on_the_receiving_node() {
+    use opl_types::numa::{
+        CpuPolicy, EmulatorPolicy, GuestNode, HostNode, HostPlacement, HostResources, MemoryPolicy,
+        NodeTopology, ResolvedNuma, ThreadPolicy,
+    };
+    let s = setup().await;
+    let alloc = Arc::new(opl_reconciler::HostAllocator::new(s.env.node, None));
+    let receiver = s.receiver.clone().with_host_alloc(alloc.clone());
+    // 이 노드: CPU 4개, 전용 2-3
+    let me = s.env.cluster.get::<NodeSpec>(s.env.node).unwrap().unwrap();
+    let mut spec = me.spec.clone();
+    spec.host_resources = Some(HostResources {
+        reserved_cpus: "0".parse().unwrap(),
+        dedicated_cpus: "2-3".parse().unwrap(),
+        hugepages: Vec::new(),
+    });
+    s.env
+        .cluster
+        .update_spec(me.id, None, me.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let mut status = me.status.clone();
+    status.topology = Some(NodeTopology {
+        sockets: 1,
+        threads_per_core: 1,
+        cpus: "0-3".parse().unwrap(),
+        nodes: vec![HostNode {
+            id: 0,
+            cpus: "0-3".parse().unwrap(),
+            memory_mib: 8192,
+            hugepages: Vec::new(),
+        }],
+        pinning: true,
+        ..NodeTopology::default()
+    });
+    s.env
+        .cluster
+        .update_status::<NodeSpec>(me.id, &status)
+        .await
+        .unwrap();
+    // 원본에서 도는 전용 VM의 기록(원본의 pCPU 7)
+    let mut vm = vm_named(&s.env, "web");
+    vm.spec.cpu.policy = CpuPolicy::Dedicated;
+    s.env
+        .cluster
+        .update_spec(vm.id, None, vm.labels.clone(), &vm.spec)
+        .await
+        .unwrap();
+    let mut hw = opl_types::vm::RunningHardware::legacy(&vm.spec);
+    hw.numa = Some(ResolvedNuma {
+        nodes: vec![GuestNode {
+            sockets: vec![0],
+            memory_mib: hw.memory_mib,
+        }],
+        distances: Vec::new(),
+        page: None,
+        policy: CpuPolicy::Dedicated,
+        thread_policy: Some(ThreadPolicy::Prefer),
+        emulator: Some(EmulatorPolicy::Shared),
+        memory: Some(MemoryPolicy::Strict),
+    });
+    hw.host_placement = Some(HostPlacement {
+        node: s.source,
+        vcpus: vec![7],
+        siblings: Default::default(),
+        emulator: Default::default(),
+        host_nodes: vec![1],
+    });
+    let mut vm = vm_named(&s.env, "web");
+    vm.status.hardware = Some(hw.clone());
+    s.env
+        .cluster
+        .update_status::<VmSpec>(vm.id, &vm.status)
+        .await
+        .unwrap();
+    let task = Uuid::now_v7();
+    s.mark_migrating(s.env.node, task).await;
+
+    let reply = receiver.incoming(s.request(task)).await.unwrap();
+    let placed = reply.host_placement.expect("the target chose a placement");
+    assert_eq!(placed.node, s.env.node);
+    assert_eq!(placed.vcpus.len(), u32::from(vm.spec.cpu.cores) as usize);
+    assert!(
+        placed.vcpus.iter().all(|c| [2, 3].contains(c)),
+        "{placed:?}"
+    );
+    assert_eq!(placed.host_nodes, [0]);
+    let spec = s.env.hv.incoming_specs().pop().unwrap();
+    assert_eq!(spec.numa, hw.numa);
+    assert_eq!(spec.host_placement.as_ref(), Some(&placed));
+    let pin = spec.pinning.unwrap();
+    assert_eq!(pin.emulator, "1".parse().unwrap());
+    assert_eq!(alloc.held(), [s.vm]);
+    // 받는 QEMU의 배치가 실행 디렉터리에 남는다(opld 재시작·확정 뒤 기록 고치기).
+    assert_eq!(
+        s.env.hv.saved_hardware(s.vm).unwrap().host_placement,
+        Some(placed)
+    );
+
+    receiver
+        .abort(IncomingMigration { vm: s.vm, task })
+        .await
+        .unwrap();
+    assert!(alloc.held().is_empty());
+}
+
 #[tokio::test]
 async fn waits_for_the_migrating_status_to_arrive() {
     let s = setup().await;
@@ -456,6 +565,9 @@ async fn sweep_stops_a_source_qemu_committed_elsewhere() {
         firmware_epoch: 0,
         keep_tpm: false,
         cpu_resolved: None,
+        numa: None,
+        host_placement: None,
+        pinning: None,
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(vm.id, &target, &opts).await.unwrap();
@@ -513,6 +625,9 @@ async fn sweep_stops_a_source_qemu_of_a_deleted_vm() {
         firmware_epoch: 0,
         keep_tpm: false,
         cpu_resolved: None,
+        numa: None,
+        host_placement: None,
+        pinning: None,
     };
     s.env.hv.start(&spec, None).await.unwrap();
     s.env.hv.migrate(spec.id, &target, &opts).await.unwrap();

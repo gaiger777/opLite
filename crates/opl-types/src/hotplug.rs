@@ -432,7 +432,9 @@ pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> 
     {
         ids.extend((hw.boot_vcpus()..u32::from(layout.vcpus)).map(|i| format!("cpu{i}")));
         if layout.max_memory_mib > hw.memory_mib {
-            ids.push("vmem0-dev".into());
+            // vNUMA VM(계획 64)은 게스트 노드마다 장치가 있다.
+            let nodes = hw.numa.as_ref().map_or(1, |n| n.nodes.len().max(1));
+            ids.extend((0..nodes).map(|i| format!("vmem{i}-dev")));
         }
     }
     ids.sort();
@@ -440,7 +442,7 @@ pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> 
 }
 
 /// 스펙의 하드웨어가 바뀌었는지(CPU·메모리·상한·펌웨어·머신·디스크·보안 그룹을 뺀 NIC·CD-ROM 드라이브와 매체·
-/// cloud-init·TPM·Secure Boot·게스트 에이전트 채널). 실행 중이면 핫플러그 Task를 만든다. 에이전트의 `freeze_fs`·
+/// cloud-init·TPM·Secure Boot·게스트 에이전트 채널·vNUMA·hugepages). 실행 중이면 핫플러그 Task를 만든다. 에이전트의 `freeze_fs`·
 /// `shutdown`은 장치가 아니라서 견주지 않는다.
 pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
     old.cpu != new.cpu
@@ -456,6 +458,8 @@ pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
         || old.tpm != new.tpm
         || old.secure_boot != new.secure_boot
         || old.agent_channel() != new.agent_channel()
+        || old.numa != new.numa
+        || old.hugepages != new.hugepages
 }
 
 /// 같은 NIC 장치인지(보안 그룹은 방화벽 규칙이라 견주지 않는다)
@@ -540,6 +544,8 @@ fn changes(
     pending: &mut Vec<PendingChange>,
 ) {
     cpu_changes(spec, hw, caps, wanted, steps, pending);
+    // CPU 정책·vNUMA·hugepages(계획 64)는 켤 때만 정해진다.
+    pending.extend(crate::numa::pending_change(spec, hw));
     memory_changes(spec, hw, caps, steps, pending);
     if spec.firmware != hw.firmware {
         pending.push(change(
@@ -1472,6 +1478,56 @@ mod tests {
         let fields: Vec<&str> = out.iter().map(|p| p.field.as_str()).collect();
         assert_eq!(fields, ["cpu", "vcpus"]);
         assert_eq!(out[1].reason, PendingReason::Limit);
+    }
+
+    /// 실행 중 CPU 정책·vNUMA·hugepages를 바꾸면(계획 64) 보류 `numa`이고 나머지 계획은 그대로다. vNUMA VM은 virtio-mem
+    /// 장치가 게스트 노드마다 있다.
+    #[test]
+    fn numa_changes_are_pending_until_a_power_cycle() {
+        let hw = started(&spec(), ALL);
+        let mut s = spec();
+        s.hugepages = Some(crate::numa::PageSize::Size2M);
+        assert!(hardware_changed(&spec(), &s));
+        let mut numa = spec();
+        numa.numa = Some(crate::numa::NumaSpec {
+            nodes: crate::numa::NumaNodes::Count(1),
+            memory: None,
+        });
+        assert!(hardware_changed(&spec(), &numa));
+        let out = only_pending(plan(VM, "web", &s, &hw, ALL).unwrap());
+        assert_eq!(reasons(&out), [("numa", PendingReason::Restart)]);
+        assert!(
+            out[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("hugepages none → 2M")
+        );
+        // 기록과 같으면 보류가 없다.
+        assert!(only_pending(plan(VM, "web", &spec(), &hw, ALL).unwrap()).is_empty());
+
+        let mut hw = started(&spec(), ALL);
+        layout(&mut hw).max_memory_mib = hw.memory_mib + 1024;
+        hw.numa = Some(crate::numa::ResolvedNuma {
+            nodes: vec![
+                crate::numa::GuestNode {
+                    sockets: vec![0],
+                    memory_mib: hw.memory_mib / 2,
+                },
+                crate::numa::GuestNode {
+                    sockets: vec![1],
+                    memory_mib: hw.memory_mib / 2,
+                },
+            ],
+            distances: Vec::new(),
+            page: None,
+            policy: Default::default(),
+            thread_policy: None,
+            emulator: None,
+            memory: None,
+        });
+        let ids = qemu_devices(&spec(), Some(&hw));
+        assert!(ids.contains(&"vmem0-dev".to_string()) && ids.contains(&"vmem1-dev".to_string()));
     }
 
     /// 게스트가 아직 내려 주지 않은 장치는 스펙의 같은 장치와 같지 않은 것으로 본다: 떼기를 먼저 마저 하고 스펙에

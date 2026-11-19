@@ -8,7 +8,7 @@ pub use opl_qemu::BitmapInfo;
 pub use opl_qemu::CpuProbe;
 use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
-use opl_types::runtime::{RuntimeDisk, RuntimeMedium, RuntimeNic, VmRuntimeSpec};
+use opl_types::runtime::{RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning, VmRuntimeSpec};
 use opl_types::vm::{CpuSpec, RunningHardware};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -520,6 +520,20 @@ pub trait Hypervisor: Send + Sync {
 
     /// [`save_hardware`](Self::save_hardware)로 남긴 기록. 없거나 읽지 못하면 None이다(기록 없이 다시 붙은 VM).
     fn saved_hardware(&self, id: Uuid) -> Option<RunningHardware>;
+
+    /// 도는 VM의 스레드 고정(계획 64)을 `pin`에 맞춘다: 스코프 `AllowedCPUs`가 다르면 바꾸고, 스레드마다 친화가 다르면
+    /// 다시 건다(vCPU는 자리의 CPU, 나머지는 에뮬레이터 집합). 바꾼 것의 수를 돌려준다(0이면 이미 맞았다). 검사 루프의
+    /// 어긋남 고치기와 공유 집합이 바뀐 뒤의 다시 걸기가 부른다.
+    async fn repin(&self, id: Uuid, pin: &RuntimePinning) -> Result<usize, DriverError> {
+        let _ = (id, pin);
+        Ok(0)
+    }
+
+    /// 켤 때나 [`repin`](Self::repin)이 남긴 고정. 고정 없이 켰으면 None이다.
+    fn saved_pinning(&self, id: Uuid) -> Option<RuntimePinning> {
+        let _ = id;
+        None
+    }
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

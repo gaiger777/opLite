@@ -87,7 +87,9 @@ metrics-it = []
 cpu-it = ["qemu-it"]
 # 실제 Linux 호스트의 NUMA 토폴로지 탐침(계획 64): 이 호스트의 `/sys`를 읽어 찍고, 2M hugepages를 실행 중 예약했다가
 # 되돌리며(`nr_hugepages` 쓰기), 다른 프로세스의 스레드 친화를 건다. root와 `OPL_TEST_NUMA_SYS=1`이 있을 때만 `/sys`에 쓴다
-# (CI `linux-kvm`). 스테이지 4가 실제 VM의 vCPU 고정 시험을 더한다.
+# (CI `linux-kvm`). 실제 VM 시험(`tests/numa.rs`, 스테이지 4)은 전용 VM의 vCPU·에뮬레이터 스레드 고정과 스코프 cpuset,
+# 2M hugepages 백엔드, 공유 VM, 실행 중 붙인 vCPU, 한 호스트의 opld 둘 사이 마이그레이션 뒤 다시 고정을 본다. 제어 소켓에
+# 시험 고리(`/v1/test/vm-spec`·`host-resources`)를 더한다. qemu-it의 준비물이 필요하다.
 numa-it = []
 
 [dependencies]

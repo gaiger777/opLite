@@ -35,6 +35,7 @@ lvm-shared-it = []
 [dependencies]
 async-trait.workspace = true
 fs4.workspace = true
+libc.workspace = true
 opl-qemu.workspace = true
 opl-types.workspace = true
 rustix.workspace = true

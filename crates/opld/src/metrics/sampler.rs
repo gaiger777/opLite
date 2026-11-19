@@ -589,6 +589,9 @@ mod tests {
                 firmware_epoch: 0,
                 keep_tpm: false,
                 cpu_resolved: None,
+                numa: None,
+                host_placement: None,
+                pinning: None,
             },
             None,
         )

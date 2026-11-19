@@ -17,12 +17,13 @@ use opl_api::AuditLog;
 use opl_api::audit::system_entry;
 use opl_cluster::Cluster;
 use opl_cluster::types::NodeId;
-use opl_driver::{NetFs, PING_TIMEOUT, PROBE_TIMEOUT, ProbeError};
+use opl_driver::{Hypervisor, NetFs, PING_TIMEOUT, PROBE_TIMEOUT, ProbeError};
 use opl_types::audit::AuditTarget;
 use opl_types::ha_check::{AUTO_PREFIX, CheckReport, CheckState, HaCheckSpec, HaCheckTarget};
 use opl_types::node::{
     BondState, BondStatus, FirmwareCaps, HA_CHECKS, NodeHotplug, NodeInterface, NodeSpec, PortState,
 };
+use opl_types::numa::HostResources;
 use opl_types::resource::Resource;
 use opl_types::storage::{IscsiTarget, PoolBackend, StoragePool, StoragePoolSpec};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -33,7 +34,7 @@ use uuid::Uuid;
 
 use crate::bootstrap;
 use crate::cpu::{self, CpuWatch, Probed};
-use crate::topology::{self, TopologyWatch};
+use crate::topology::{self, PROBE_EVERY, TopologyWatch};
 
 /// 검사 회차의 간격
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -98,10 +99,12 @@ impl HealthChecker {
         audit: Arc<AuditLog>,
         cpu: Option<CpuWatch>,
         topology: Option<TopologyWatch>,
+        pins: Option<Arc<dyn Hypervisor>>,
     ) -> Self {
         let mut state = State::new(cluster, node_name, config, audit);
         state.cpu = cpu;
         state.topology = topology;
+        state.pins = pins.map(PinWatch::new);
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
@@ -179,6 +182,40 @@ pub struct State {
     cpu: Option<CpuWatch>,
     /// 노드 NUMA 토폴로지 탐침(계획 64, Linux). 없으면 `NodeStatus.topology`를 건드리지 않는다.
     topology: Option<TopologyWatch>,
+    /// 도는 VM의 스레드 고정 맞추기(계획 64). 없으면 하지 않는다.
+    pins: Option<PinWatch>,
+}
+
+/// 도는 VM의 스레드 고정을 [`PROBE_EVERY`] 회차(30초)마다, 노드 설정 `host_resources`가 바뀌면 곧바로 맞춘다(§7·§10:
+/// 어긋남 고치기, 공유 집합이 바뀐 뒤 다시 걸기).
+pub struct PinWatch {
+    hv: Arc<dyn Hypervisor>,
+    rounds: u32,
+    /// 마지막으로 맞출 때의 노드 설정(한 번도 맞추지 않았으면 None)
+    applied: Option<Option<HostResources>>,
+}
+
+impl PinWatch {
+    pub fn new(hv: Arc<dyn Hypervisor>) -> Self {
+        Self {
+            hv,
+            rounds: 0,
+            applied: None,
+        }
+    }
+
+    async fn poll(&mut self, cluster: &Cluster, node: Uuid, resources: Option<&HostResources>) {
+        self.rounds += 1;
+        let changed = self.applied.as_ref().map(Option::as_ref) != Some(resources);
+        if !changed && self.rounds < PROBE_EVERY {
+            return;
+        }
+        self.rounds = 0;
+        self.applied = Some(resources.cloned());
+        if let Err(e) = opl_reconciler::host_alloc::repin(cluster, &*self.hv, node).await {
+            tracing::warn!(error = %e, "cannot check the CPU pinning of the running VMs");
+        }
+    }
 }
 
 impl State {
@@ -226,6 +263,7 @@ impl State {
             bonds: BondWatch::default(),
             cpu: None,
             topology: None,
+            pins: None,
         }
     }
 
@@ -662,12 +700,18 @@ pub async fn run_once(state: &mut State) -> Vec<CheckReport> {
     if let Some(watch) = &mut state.cpu {
         watch.poll().await;
     }
-    if let Some(watch) = &mut state.topology {
+    if state.topology.is_some() || state.pins.is_some() {
         // 설정을 읽지 못하면 이번 회차는 건너뛴다(없는 것으로 보고 되돌리지 않게).
         match state.cluster.get::<NodeSpec>(state.node) {
             Ok(me) => {
                 let resources = me.and_then(|n| n.spec.host_resources);
-                watch.poll(resources.as_ref(), unix_now()).await;
+                if let Some(watch) = &mut state.topology {
+                    watch.poll(resources.as_ref(), unix_now()).await;
+                }
+                if let Some(pins) = &mut state.pins {
+                    pins.poll(&state.cluster, state.node, resources.as_ref())
+                        .await;
+                }
             }
             Err(e) => tracing::warn!(error = %e, "cannot read this node's host resources"),
         }

@@ -342,6 +342,9 @@ async fn resolve(
         // 새로 켤 때 작업자가 이 노드의 TPM 파일이 지금 것인지 보고 정한다(리뷰 2).
         keep_tpm: false,
         cpu_resolved: None,
+        numa: None,
+        host_placement: None,
+        pinning: None,
     };
     set_boot_order(&mut spec);
     if let Some(hw) = hardware {
@@ -375,6 +378,10 @@ pub fn apply_hardware(spec: &mut VmRuntimeSpec, hw: &RunningHardware, vm: &VmSpe
     spec.cpu = hw.cpu.clone();
     // 켤 때 해석한 CPU(계획 63): 받는 쪽은 이 노드의 기준·숨김 목록이 달라도 원본과 같은 `-cpu`로 켠다.
     spec.cpu_resolved = hw.cpu_resolved.clone();
+    // 켤 때의 게스트 NUMA 모양(계획 64): 받는 쪽도 같은 메모리 백엔드·노드로 켠다. 배치(`host-nodes`)는 받는 쪽이 다시
+    // 고른다(작업자·받는 쪽이 덮는다).
+    spec.numa = hw.numa.clone();
+    spec.host_placement = hw.host_placement.clone();
     spec.memory_mib = hw.memory_mib;
     spec.firmware = hw.firmware;
     spec.machine = hw.machine;

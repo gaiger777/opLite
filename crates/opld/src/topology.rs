@@ -369,39 +369,8 @@ pub fn reserve_hugepages(sys: &Path, wanted: &[HugepageReserve]) -> Vec<String> 
     errors
 }
 
-/// 프로세스 `tasks`(`/proc/<pid>/task`)의 모든 스레드 친화를 `cpus`로 둔다. 바꾼 스레드 수를 돌려준다. 그사이 끝난
-/// 스레드는 건너뛴다.
 #[cfg(target_os = "linux")]
-pub fn pin_tasks(tasks: &Path, cpus: &CpuSet) -> Result<usize, String> {
-    let max = usize::try_from(libc::CPU_SETSIZE).unwrap_or(1024);
-    // SAFETY: cpu_set_t는 비트 배열이라 0으로 채운 값이 빈 집합이고, CPU_SET은 범위 안의 번호만 받는다.
-    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-    for cpu in cpus.iter().map(usize::from).filter(|&c| c < max) {
-        unsafe { libc::CPU_SET(cpu, &mut mask) };
-    }
-    let entries =
-        std::fs::read_dir(tasks).map_err(|e| format!("cannot read {}: {e}", tasks.display()))?;
-    let mut pinned = 0;
-    for tid in entries
-        .filter_map(|e| e.ok())
-        .filter_map(|e| e.file_name().to_str()?.parse::<libc::pid_t>().ok())
-    {
-        // SAFETY: mask는 위에서 만든 cpu_set_t이고 크기를 함께 넘긴다.
-        let rc =
-            unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mask) };
-        if rc == 0 {
-            pinned += 1;
-            continue;
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() != Some(libc::ESRCH) {
-            return Err(format!(
-                "cannot set the CPU affinity of thread {tid}: {err}"
-            ));
-        }
-    }
-    Ok(pinned)
-}
+pub use opl_driver::affinity::pin_tasks;
 
 /// opld 자신(모든 스레드)의 친화를 `cpus`로 둔다. Linux가 아니면 하지 않는다.
 fn pin_self(cpus: &CpuSet) -> Result<(), String> {

@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::cloud_init::CloudInitSeed;
 use crate::cpu::ResolvedCpu;
+use crate::numa::{CpuSet, HostPlacement, ResolvedNuma};
 use crate::vm::{CpuSpec, DiskBus, Firmware, MacAddr, MachineType, NicModel};
 
 /// 하이퍼바이저 드라이버가 받는, 이름 참조가 모두 풀린 VM 정의.
@@ -59,6 +60,46 @@ pub struct VmRuntimeSpec {
     /// 클러스터 업그레이드 중) `cpu.model`을 이 노드의 가속기로 펴되 기준·숨김 목록 없이 켠다(`host`·`max`는 지금과 같다).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_resolved: Option<ResolvedCpu>,
+    /// 켤 때 정한 게스트 NUMA 모양(계획 64, `RunningHardware.numa`). 있으면 명령줄에 노드마다 메모리 백엔드와 `-numa`를
+    /// 둔다. 없으면 지금 명령줄 그대로다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub numa: Option<ResolvedNuma>,
+    /// 이 노드의 배치(계획 64, `RunningHardware.host_placement`): 메모리 백엔드의 `host-nodes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_placement: Option<HostPlacement>,
+    /// 스레드 고정(계획 64). 있으면 드라이버가 스코프 `AllowedCPUs`·자식 친화·vCPU 스레드 친화를 건다. 없으면 걸지
+    /// 않는다(`host_resources`가 없는 노드의 묶지 않는 VM — 지금 그대로).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinning: Option<RuntimePinning>,
+}
+
+/// QEMU 스레드를 둘 호스트 CPU(계획 64 §10). 작업자·받는 쪽이 이 노드의 세 집합과 배치로 셈해 드라이버에 준다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimePinning {
+    /// vCPU가 아닌 스레드(에뮬레이터·일꾼·vhost)와 swtpm의 CPU: 전용 VM의 `isolate` 에뮬레이터 pCPU, 아니면 공유 집합
+    pub emulator: CpuSet,
+    /// vCPU 자리(소켓 순, 핫플러그 상한까지)마다 CPU. 비면 vCPU도 `emulator`에서 돈다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vcpus: Vec<CpuSet>,
+    /// 소켓마다 vCPU 자리 수(QMP의 `socket-id`·`core-id`를 자리로 바꾼다)
+    pub slots_per_socket: u32,
+    /// 스코프의 `AllowedCPUs`(cgroup v2 cpuset이 있을 때만). 없으면 걸지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<CpuSet>,
+}
+
+impl RuntimePinning {
+    /// vCPU 자리 `slot`의 CPU(자리별 고정이 없으면 에뮬레이터 집합)
+    pub fn vcpu(&self, slot: usize) -> &CpuSet {
+        self.vcpus.get(slot).unwrap_or(&self.emulator)
+    }
+
+    /// 이 VM의 스레드가 쓰는 모든 CPU
+    pub fn all(&self) -> CpuSet {
+        self.vcpus
+            .iter()
+            .fold(self.emulator.clone(), |acc, s| acc.union(s))
+    }
 }
 
 /// 켤 때의 TPM 상태 규칙(계획 59)

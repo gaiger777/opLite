@@ -14,6 +14,9 @@ use opl_peer::{
     MigrateIncomingResponse, MigrationReceiver,
 };
 use opl_reconciler::FirewallGate;
+use opl_reconciler::HostAllocator;
+use opl_reconciler::cpu::CpuRefusal;
+use opl_reconciler::host_alloc::Shape;
 use opl_reconciler::resolve::incoming_spec;
 use opl_types::node::NodeSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
@@ -55,6 +58,8 @@ pub struct IncomingMigrations {
     firewall: Option<Arc<dyn FirewallGate>>,
     /// 이 노드의 복제본 받기(계획 55). 없으면 이 노드의 복제본으로 옮기는 마이그레이션을 받지 않는다.
     replicas: Option<IncomingReplicas>,
+    /// 이 노드의 할당기(계획 64, reconciler와 같다): 받는 QEMU의 pCPU·호스트 노드·hugepages를 고르고 예약한다.
+    host_alloc: Arc<HostAllocator>,
 }
 
 impl IncomingMigrations {
@@ -62,10 +67,17 @@ impl IncomingMigrations {
         Self {
             cluster,
             hv,
+            host_alloc: Arc::new(HostAllocator::new(config.node, None)),
             config: Arc::new(config),
             firewall: None,
             replicas: None,
         }
+    }
+
+    /// reconciler와 같은 할당기를 쓴다(계획 64).
+    pub fn with_host_alloc(mut self, alloc: Arc<HostAllocator>) -> Self {
+        self.host_alloc = alloc;
+        self
     }
 
     /// 이 노드의 복제본으로 옮기는 마이그레이션(계획 55)을 복제본 기록과 함께 받는다.
@@ -307,33 +319,67 @@ impl IncomingMigrations {
         // 실패하면 incoming_spec이 켠 볼륨을 끈다.
         let started =
             match incoming_spec(&self.cluster, &vm, c.node, &c.mount_root, &*c.storage).await {
-                Ok(spec) => match self
-                    .hv
-                    .start_incoming(&spec, req.task, &c.listen_host, c.ports.clone(), &exports)
-                    .await
-                {
-                    Ok(ports) => Ok(ports),
+                Ok(mut spec) => match self.place(&vm, &mut spec) {
                     Err(e) => {
                         deactivate_disks(&self.cluster, &*c.storage, &vm, &made).await;
-                        Err(e.to_string())
+                        Err(e)
                     }
+                    Ok(()) => match self
+                        .hv
+                        .start_incoming(&spec, req.task, &c.listen_host, c.ports.clone(), &exports)
+                        .await
+                    {
+                        Ok(ports) => Ok((ports, spec.host_placement)),
+                        Err(e) => {
+                            self.host_alloc.release(vm.id);
+                            deactivate_disks(&self.cluster, &*c.storage, &vm, &made).await;
+                            Err(e.to_string())
+                        }
+                    },
                 },
                 Err(e) => Err(e.to_string()),
             };
-        let ports = match started {
-            Ok(ports) => ports,
+        let (ports, host_placement) = match started {
+            Ok(started) => started,
             Err(error) => {
                 self.forget_made(&records, vm.id, req.task, &made).await;
                 return Err(IncomingError::Failed(error));
             }
         };
+        // 받는 QEMU의 배치를 실행 디렉터리에 남긴다: opld가 다시 떠도 예약을 잃지 않고, 확정 뒤 이 노드의 작업자가 기록을
+        // 이 노드의 배치로 고친다.
+        if let (Some(placement), Some(hw)) = (&host_placement, &vm.status.hardware) {
+            let mut hw = hw.clone();
+            hw.host_placement = Some(placement.clone());
+            if let Err(e) = self.hv.save_hardware(vm.id, &hw) {
+                tracing::warn!(vm = %vm.id, error = %e, "cannot save the placement of the receiving QEMU");
+            }
+        }
         drop(records);
         tracing::info!(vm = %vm.id, task = %req.task, port = ports.migration, nbd = ?ports.nbd, "receiving a live migration");
         Ok(MigrateIncomingResponse {
             port: ports.migration,
             nbd_port: ports.nbd,
             refused,
+            host_placement,
         })
+    }
+
+    /// 받는 QEMU의 배치와 고정(계획 64 §11): 게스트 모양·페이지는 원본의 기록 그대로이고 이 노드가 호스트 노드·pCPU를
+    /// 새로 고른다(할당기가 예약한다). 맞지 않으면 받지 않는다.
+    fn place(&self, vm: &Vm, spec: &mut opl_types::runtime::VmRuntimeSpec) -> Result<(), String> {
+        let numa = vm.status.hardware.as_ref().and_then(|hw| hw.numa.as_ref());
+        let claim = self
+            .host_alloc
+            .claim(&self.cluster, vm.id, Shape::Fixed(numa, &spec.cpu))
+            .map_err(|e| match e {
+                CpuRefusal::Waiting(m) | CpuRefusal::Cannot(m) => {
+                    format!("cannot place the VM on this node: {m}")
+                }
+            })?;
+        spec.host_placement = claim.placement;
+        spec.pinning = claim.pinning;
+        Ok(())
     }
 
     /// 받기가 실패했다: 이 받기가 만든 볼륨을 지우고 기록을 지운다(못 지우면 정리가 다시 한다).
@@ -569,6 +615,8 @@ impl IncomingMigrations {
             // 받는 중 표시가 없는 QEMU는 받는 QEMU가 아니다. 그 디스크도 쓰는 중이다.
             return Ok(());
         }
+        // 받는 QEMU의 예약을 푼다(계획 64).
+        self.host_alloc.release(req.vm);
         if let Some(vm) = &vm {
             // 복사하려고 만든 디스크는 기록의 풀에 있다.
             let copies = migration_disks::load(records.dir(), req.task)

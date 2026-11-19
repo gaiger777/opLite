@@ -35,7 +35,8 @@ use opl_peer::{
     GrpcNetwork, NodeMonitor, NodeMonitorConfig, PeerService, Peers, VarsTemplates, renew_liveness,
 };
 use opl_reconciler::{
-    FirewallGate, FirmwareFetcher, GuestInfoSink, HaGuard, Reconciler, ReconcilerConfig,
+    FirewallGate, FirmwareFetcher, GuestInfoSink, HaGuard, HostAllocator, Reconciler,
+    ReconcilerConfig,
 };
 use opl_types::clock::SystemClock;
 use opl_types::cluster::ClusterSpec;
@@ -450,6 +451,8 @@ impl Member {
             };
         #[cfg(feature = "cpu-it")]
         crate::cpu_hook::set_member(Arc::downgrade(&cluster), &hv);
+        #[cfg(feature = "numa-it")]
+        crate::numa_hook::set_member(Arc::downgrade(&cluster));
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;
@@ -508,6 +511,19 @@ impl Member {
         );
         // API 서버, 노드 간 서버, Raft 감시가 보낸다.
         let (exited_tx, exited) = mpsc::channel(3);
+        // 노드 할당기(계획 64): 작업자와 받는 쪽이 나눈다. Linux는 `/sys`의 실제 빈 hugepages를 본다. 받는 중인 QEMU의
+        // 배치(실행 디렉터리의 기록)는 opld가 다시 떠도 예약으로 남긴다.
+        let host_alloc = Arc::new(HostAllocator::new(
+            node,
+            cfg!(target_os = "linux").then(|| PathBuf::from("/sys")),
+        ));
+        for (vm, _task) in hv.list_incoming().await.unwrap_or_default() {
+            if let Some(hw) = hv.saved_hardware(vm)
+                && let (Some(numa), Some(placement)) = (hw.numa, hw.host_placement)
+            {
+                host_alloc.hold(vm, numa, placement);
+            }
+        }
         // 받는 VM은 원본 노드에 배정된 채이므로 reconciler 없이 받는다.
         let incoming = IncomingMigrations::new(
             cluster.clone(),
@@ -606,7 +622,8 @@ impl Member {
             .with_migrations(Arc::new(
                 incoming
                     .with_firewall(gate.clone())
-                    .with_replicas(replicas.clone()),
+                    .with_replicas(replicas.clone())
+                    .with_host_alloc(host_alloc.clone()),
             ))
             .with_replicas(Arc::new(replicas.clone()))
             .with_uefi_vars(config.data_dir.clone())
@@ -793,6 +810,7 @@ impl Member {
         reconciler_config.ha = ha.clone();
         state.ha = ha.clone();
         reconciler_config.firewall = gate.clone();
+        reconciler_config.host_alloc = host_alloc.clone();
         let reconciler = on(&rt.work, || {
             Reconciler::spawn(cluster.clone(), hv.clone(), reconciler_config)
         });
@@ -879,7 +897,7 @@ impl Member {
             TaskRunner::spawn(
                 cluster.clone(),
                 storage,
-                hv,
+                hv.clone(),
                 reconciler.handle(),
                 runner_config,
             ),
@@ -908,6 +926,7 @@ impl Member {
                 state.audit.clone(),
                 Some(cpu_watch),
                 topology_watch,
+                Some(hv),
             )
         });
         let monitor = on(&rt.core, || {

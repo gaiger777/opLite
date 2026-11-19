@@ -56,6 +56,7 @@ pub fn config(node: Uuid) -> ReconcilerConfig {
         ha: None,
         firewall: None,
         replica_dir: "/nonexistent/opl-replicas".into(),
+        host_alloc: Arc::new(opl_reconciler::HostAllocator::new(node, None)),
     }
 }
 

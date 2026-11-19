@@ -14,6 +14,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::cpu::POWER_CYCLE;
+use crate::runtime::RuntimePinning;
 use crate::vm::{CpuSpec, PendingChange, PendingReason, RunningHardware, VmSpec};
 
 /// 게스트 NUMA 노드 수의 상한
@@ -895,7 +896,7 @@ pub fn validate(spec: &VmSpec) -> Result<(), NumaError> {
 }
 
 /// 소켓마다 vCPU 자리 수(핫플러그 상한 / 소켓)
-fn slots_per_socket(cpu: &CpuSpec) -> u32 {
+pub fn slots_per_socket(cpu: &CpuSpec) -> u32 {
     cpu.max() / u32::from(cpu.sockets.max(1))
 }
 
@@ -2099,6 +2100,96 @@ pub fn pending_change(spec: &VmSpec, hw: &RunningHardware) -> Option<PendingChan
     })
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// 스레드 고정·virtio-mem 나눔(§10)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// QEMU 스레드를 둘 CPU(§10). `cpu`는 켤 때의 CPU(`hw.cpu`, 소켓당 자리 수), `numa`·`placement`는 켤 때 기록, `sets`는 이
+/// 노드의 지금 세 집합이다. 배치가 없고 노드에 예약·전용 집합이 없으면 None — 친화·`AllowedCPUs`를 걸지 않는다(지금
+/// 그대로). 에뮬레이터는 `isolate` pCPU, 아니면 공유 집합이다. vCPU는 전용이면 자리마다 그 pCPU, 묶는 공유 VM이면 게스트
+/// 노드의 (공유 ∩ 호스트 노드 CPU)(비면 공유 집합), 그 밖이면 자리별 고정 없이 에뮬레이터 집합이다. 스코프
+/// `AllowedCPUs`는 노드에 cgroup v2 cpuset이 있을 때만 모두의 합이다.
+pub fn pinning(
+    numa: Option<&ResolvedNuma>,
+    placement: Option<&HostPlacement>,
+    cpu: &CpuSpec,
+    topology: &NodeTopology,
+    sets: &HostSets,
+) -> Option<RuntimePinning> {
+    if placement.is_none() && sets.reserved.is_empty() && sets.dedicated.is_empty() {
+        return None;
+    }
+    let per = slots_per_socket(cpu);
+    let slots = per as usize * usize::from(cpu.sockets.max(1));
+    let emulator = match placement {
+        Some(p) if !p.emulator.is_empty() => p.emulator.clone(),
+        _ => sets.shared.clone(),
+    };
+    let vcpus: Vec<CpuSet> = match (numa, placement) {
+        (_, Some(p)) if !p.vcpus.is_empty() => {
+            p.vcpus.iter().map(|&c| [c].into_iter().collect()).collect()
+        }
+        (Some(n), Some(p)) if !p.host_nodes.is_empty() => (0..slots)
+            .map(|slot| {
+                let socket = u16::try_from(slot / per.max(1) as usize).unwrap_or(u16::MAX);
+                let host = n
+                    .nodes
+                    .iter()
+                    .position(|g| g.sockets.contains(&socket))
+                    .and_then(|g| p.host_nodes.get(g))
+                    .and_then(|h| topology.nodes.iter().find(|n| n.id == *h));
+                let set = host.map_or_else(CpuSet::new, |h| sets.shared.intersection(&h.cpus));
+                if set.is_empty() {
+                    sets.shared.clone()
+                } else {
+                    set
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut pin = RuntimePinning {
+        emulator,
+        vcpus,
+        slots_per_socket: per,
+        scope: None,
+    };
+    if topology.cpuset {
+        pin.scope = Some(pin.all());
+    }
+    Some(pin)
+}
+
+/// virtio-mem 자리 `total_mib`를 게스트 노드 `n`개에 나눈다(§10): 블록(2 MiB) 단위로 고르게 내리고 남는 것은 노드 0에.
+pub fn split_blocks(total_mib: u32, n: usize) -> Vec<u32> {
+    let n = n.max(1);
+    let n32 = u32::try_from(n).unwrap_or(u32::MAX);
+    let each = total_mib / SMALL_UNIT_MIB / n32 * SMALL_UNIT_MIB;
+    let mut out = vec![each; n];
+    out[0] = total_mib - each * (n32 - 1);
+    out
+}
+
+/// 꽂을 크기 `plugged_mib`를 노드마다 자리(`sizes`)를 넘지 않게 나눈다: [`split_blocks`]로 나눈 뒤 자리를 넘는 것은 앞
+/// 노드부터 남는 자리에 옮긴다. 자리 합보다 크면 자리 합까지다.
+pub fn split_plugged(plugged_mib: u32, sizes: &[u32]) -> Vec<u32> {
+    let mut out = split_blocks(plugged_mib, sizes.len());
+    out.truncate(sizes.len());
+    let mut spill = 0;
+    for (o, &cap) in out.iter_mut().zip(sizes) {
+        if *o > cap {
+            spill += *o - cap;
+            *o = cap;
+        }
+    }
+    for (o, &cap) in out.iter_mut().zip(sizes) {
+        let room = (cap - *o).min(spill);
+        *o += room;
+        spill -= room;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3247,5 +3338,82 @@ mod tests {
             json!({ "numa": { "nodes": [{ "cpus": 4, "memory_mib": 6144 }, { "cpus": 4, "memory_mib": 2048 }] } }),
         );
         assert!(pending_change(&list, &hw).is_some());
+    }
+    // ---------------------------------------------------------------------------------------------------------
+    // 스레드 고정·virtio-mem 나눔(스테이지 4)
+    // ---------------------------------------------------------------------------------------------------------
+
+    #[test]
+    fn plain_vms_on_a_node_without_host_resources_are_not_pinned() {
+        let topo = xeon();
+        let sets = HostSets::new(None, &topo);
+        let spec = vm(json!({}));
+        assert_eq!(pinning(None, None, &spec.cpu, &topo, &sets), None);
+        // 예약 집합만 있어도 공유 VM은 공유 집합에 둔다(opld 친화를 물려받지 않게).
+        let res = resources("0-1", "");
+        let sets = HostSets::new(Some(&res), &topo);
+        let pin = pinning(None, None, &spec.cpu, &topo, &sets).unwrap();
+        assert_eq!(pin.emulator, set("2-31"));
+        assert!(pin.vcpus.is_empty());
+        assert_eq!(pin.slots_per_socket, 4);
+        assert_eq!(pin.scope, Some(set("2-31")));
+        assert_eq!(pin.vcpu(3), &set("2-31"));
+    }
+
+    #[test]
+    fn dedicated_vms_pin_each_slot_and_the_emulator() {
+        let topo = xeon();
+        let res = resources("0", "4-15,20-31");
+        let spec = vm(json!({ "cpu": { "policy": "dedicated", "emulator": "isolate" } }));
+        let fit = fit_on(&spec, &topo, Some(&res), &HostUsage::default()).unwrap();
+        let place = fit.placement.unwrap();
+        let sets = HostSets::new(Some(&res), &topo);
+        let pin = pinning(Some(&fit.numa), Some(&place), &spec.cpu, &topo, &sets).unwrap();
+        assert_eq!(pin.vcpus.len(), 8);
+        for (slot, cpu) in place.vcpus.iter().enumerate() {
+            assert_eq!(pin.vcpu(slot), &[*cpu].into_iter().collect::<CpuSet>());
+        }
+        assert_eq!(pin.emulator, place.emulator);
+        let mut all: CpuSet = place.vcpus.iter().copied().collect();
+        all = all.union(&place.emulator);
+        assert_eq!(pin.scope, Some(all));
+        // cpuset이 없으면 스코프를 묶지 않는다.
+        let mut no_cpuset = topo.clone();
+        no_cpuset.cpuset = false;
+        let pin = pinning(Some(&fit.numa), Some(&place), &spec.cpu, &no_cpuset, &sets).unwrap();
+        assert_eq!(pin.scope, None);
+    }
+
+    #[test]
+    fn bound_shared_vms_run_each_guest_node_on_its_host_node() {
+        let topo = xeon();
+        let spec = vm(json!({ "numa": { "nodes": 2, "memory": "preferred" } }));
+        let fit = fit_on(&spec, &topo, None, &HostUsage::default()).unwrap();
+        let place = fit.placement.unwrap();
+        assert!(place.vcpus.is_empty());
+        let sets = HostSets::new(None, &topo);
+        let pin = pinning(Some(&fit.numa), Some(&place), &spec.cpu, &topo, &sets).unwrap();
+        let host = |g: usize| {
+            let h = place.host_nodes[g];
+            topo.nodes.iter().find(|n| n.id == h).unwrap().cpus.clone()
+        };
+        // 소켓마다 4자리, 게스트 노드 0 = 소켓 0
+        assert_eq!(pin.vcpus.len(), 8);
+        assert_eq!(pin.vcpu(0), &host(0));
+        assert_eq!(pin.vcpu(7), &host(1));
+        assert_eq!(pin.emulator, set("0-31"));
+    }
+
+    #[test]
+    fn virtio_mem_is_split_in_blocks_with_the_rest_on_node_zero() {
+        assert_eq!(split_blocks(8192, 1), [8192]);
+        assert_eq!(split_blocks(8192, 2), [4096, 4096]);
+        assert_eq!(split_blocks(10, 3), [6, 2, 2]);
+        assert_eq!(split_blocks(2, 2), [2, 0]);
+        // 꽂은 크기는 자리를 넘지 않는다(남는 블록은 앞 노드부터 자리에).
+        assert_eq!(split_plugged(10, &[4, 4, 4]), [4, 4, 2]);
+        assert_eq!(split_plugged(0, &[4, 4]), [0, 0]);
+        assert_eq!(split_plugged(8, &[4, 4]), [4, 4]);
+        assert_eq!(split_plugged(6, &[2, 4]), [2, 4]);
     }
 }
