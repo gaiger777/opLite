@@ -55,4 +55,5 @@ cargo run -p oplctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sh
 | [폴더와 권한](docs/guide/folders.md) | 폴더, 권한·역할·그룹·위임, 토큰 범위, 할당량, 2단계 인증 |
 | [구독과 텔레메트리](docs/guide/subscription.md) | 구독 키 발급·적용과 텔레메트리 |
 | [개발](docs/guide/development.md) | 빌드와 시험 명령 |
+| [아키텍처](docs/architecture.md) | 구성 요소, Raft 투표·리더 역할, 노드 간 통신, 웹·API, reconciler, 지표 수집, 보안, 규모 |
 | [설계와 계획](docs/index.md) | 하위 프로젝트 설계와 계획 1~62, 진행 내역 |

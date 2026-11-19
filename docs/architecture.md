@@ -1,0 +1,1405 @@
+# Orbivisor 아키텍처
+
+Orbivisor가 안에서 어떻게 움직이는지를 한 문서로 모은다. 읽는 사람은 시스템 전체를 이해하려는 개발자나 운영자다.
+쓰는 법은 [사용 안내](guide/)에, 각 기능을 왜 그렇게 정했는지는 [설계 문서](index.md#설계와-계획)에 있다.
+
+- 이 문서는 2026-11-19의 `main`(계획 62까지) 코드를 읽고 썼다. 설계 문서와 코드가 다르면 코드를 따랐고, 다른 곳은
+  본문에 "설계와 다름"으로 적었다.
+- 인용은 `crates/<크레이트>/src/<파일>:<줄>` 꼴이다. 줄 번호는 이 시점의 것이라 코드가 바뀌면 조금씩 어긋난다.
+- 확인하지 못한 것은 [§19 확인하지 못한 것](#19-확인하지-못한-것)에 모았다.
+
+## 목차
+
+1. [개요](#1-개요)
+2. [노드 프로세스 구조](#2-노드-프로세스-구조)
+3. [클러스터 상태와 합의(Raft)](#3-클러스터-상태와-합의raft)
+4. [리더의 일](#4-리더의-일)
+5. [노드 생존, 리스, HA와 펜싱](#5-노드-생존-리스-ha와-펜싱)
+6. [노드 간 통신](#6-노드-간-통신)
+7. [API와 웹 서비스](#7-api와-웹-서비스)
+8. [원하는 상태와 reconciler](#8-원하는-상태와-reconciler)
+9. [컴퓨트](#9-컴퓨트)
+10. [스토리지](#10-스토리지)
+11. [네트워크](#11-네트워크)
+12. [지표 수집과 감시](#12-지표-수집과-감시)
+13. [보안 모델](#13-보안-모델)
+14. [버전이 섞인 클러스터와 업그레이드](#14-버전이-섞인-클러스터와-업그레이드)
+15. [규모 특성](#15-규모-특성)
+16. [패키지와 배포](#16-패키지와-배포)
+17. [시험 전략](#17-시험-전략)
+18. [용어와 참고 문서](#18-용어와-참고-문서)
+19. [확인하지 못한 것](#19-확인하지-못한-것)
+
+---
+
+## 1. 개요
+
+Orbivisor는 Rust로 쓴 온프레미스 KVM/QEMU 가상화 클러스터다. 노드마다 같은 데몬 `orbivisord` 하나가 돌고, 관리는
+CLI `orbivisorctl`이나 그 데몬이 내장한 웹 UI로 한다.
+
+- **대칭형 노드.** 관리 전용 서버(vCenter 같은 것)가 없다. 모든 노드가 같은 바이너리로 API·웹·reconciler를 돌리고,
+  클러스터 상태는 노드 안에 내장한 Raft(openraft)로 복제한다. 어느 노드에 붙어도 클러스터 전체를 관리한다.
+- **QEMU 직접 제어.** libvirt 없이 QEMU 명령줄을 직접 만들고 QMP로 제어한다(`crates/opl-qemu`).
+- **원하는 상태 모델.** API는 Raft에 "이렇게 되어야 한다"(spec)만 쓰고, 각 노드의 reconciler가 자기에게 배정된 VM을
+  그 상태로 맞춘 뒤 결과(status)를 다시 Raft에 쓴다(Kubernetes와 비슷).
+- 바이너리 이름은 계획 43에서 바뀌었다. 크레이트는 여전히 `opld`·`oplctl`이고 `[[bin]] name`이 `orbivisord`·
+  `orbivisorctl`이다(`crates/opld/Cargo.toml:10-14`, `crates/oplctl/Cargo.toml:10-14`). 데이터 디렉터리·설정 파일·
+  유닛 이름에는 옛 이름(`opl`, `opld.toml`, `opld.service`)이 남아 있다.
+
+### 1.1 Proxmox VE·vSphere와 견주기
+
+| | Orbivisor | Proxmox VE | VMware vSphere |
+|---|---|---|---|
+| 관리 지점 | 모든 노드(대칭), 내장 VIP·앞단 프록시 | 모든 노드(대칭) | vCenter(따로 둔 VM) |
+| 클러스터 상태 | 내장 Raft(openraft + redb) | corosync + pmxcfs | vCenter DB |
+| 하이퍼바이저 제어 | QEMU/QMP 직접 | QEMU(qm, Perl) | ESXi |
+| 노드 수 | 투표 멤버 3/5/7 + learner·관찰 노드, 300노드 시험 | corosync 한계(수십 노드) | 클러스터당 96호스트 |
+| HA | 리스 + watchdog·IPMI/Redfish 펜싱, 기본 복구 약 22초 | watchdog 펜싱, 보통 2분 안팎 | HA 에이전트·하트비트 데이터스토어 |
+| SDN | 브리지·VLAN·정적 VXLAN, nftables 보안 그룹 | SDN(EVPN 포함) | NSX(따로) |
+
+Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
+
+### 1.2 크레이트 지도
+
+| 크레이트 | 줄 수(대략) | 하는 일 |
+|---|---|---|
+| `opl-types` | 30k | 리소스 모델(32종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
+| `opl-qemu` | 7k | QEMU 명령줄 만들기, QMP·QGA 클라이언트, 펌웨어 찾기, cloud-init ISO 만들기 |
+| `opl-driver` | 47k | `Hypervisor` 트레이트와 `QemuHypervisor`·`MockHypervisor`, 스토리지 백엔드, 브리지·VXLAN·nftables, VIP, Ceph 구성 |
+| `opl-cluster` | 16k | Raft(openraft + redb), 상태 머신, watch, 리스, 투표 멤버 관리(`VoterKeeper`), 관찰 노드 |
+| `opl-peer` | 9k | 노드 간 gRPC(tonic, mTLS), Raft 전송, 클러스터 CA·인증서, 노드 감시(`NodeMonitor`) |
+| `opl-reconciler` | 14k | 노드마다 VM을 원하는 상태로 맞추는 루프, HA watchdog(`HaGuard`), 펌웨어 사본 따라가기 |
+| `opl-api` | 138k | HTTPS REST API(axum, utoipa), 인증·권한, Task 실행기, 스케줄러, HA 관리자, 백업·복제·마이그레이션 Task, 알림 |
+| `oplctl` | 29k | CLI `orbivisorctl`(HTTP API를 부름) |
+| `opld` | 35k | 데몬 `orbivisord`: 설정, 실행기, 시작 순서, 지표 수집·기록, 웹 UI 내장, 제어 소켓 |
+| `web/` | 91k(TS) | React 웹 UI |
+
+```mermaid
+graph TD
+  types[opl-types]
+  qemu[opl-qemu] --> types
+  cluster[opl-cluster] --> types
+  driver[opl-driver] --> qemu
+  driver --> types
+  peer[opl-peer] --> cluster
+  peer --> driver
+  peer --> types
+  rec[opl-reconciler] --> cluster
+  rec --> driver
+  rec --> types
+  api[opl-api] --> cluster
+  api --> driver
+  api --> peer
+  api --> rec
+  api --> types
+  opld["opld (orbivisord)"] --> api
+  opld --> rec
+  opld --> peer
+  opld --> cluster
+  opld --> driver
+  opld --> qemu
+  opld --> types
+  ctl["oplctl (orbivisorctl)"] --> types
+  web["web/ (React)"] -. "web-ui 기능으로 내장" .-> opld
+  ctl -. HTTPS .-> api
+```
+
+의존은 각 `Cargo.toml`에서 확인했다(`crates/opl-peer/Cargo.toml:23-25`, `crates/opl-api/Cargo.toml:37-41`,
+`crates/opld/Cargo.toml:93-99`). `oplctl`은 `opl-types`만 쓰고 API와는 HTTPS로만 말한다.
+
+주요 외부 크레이트: openraft 0.9.25(`serde`, `storage-v2`), redb 4.4, tonic 0.14(gRPC), axum 0.8, utoipa 6·
+utoipa-axum, rustls 0.23(ring), rcgen(인증서), argon2, ldap3, lettre(메일), rust-embed(웹 내장)
+(`Cargo.toml:31-63`).
+
+### 1.3 구성 요소 한눈에
+
+```mermaid
+graph LR
+  subgraph clients[클라이언트]
+    browser[웹 브라우저]
+    cli[orbivisorctl]
+    prom[Prometheus]
+    lb["앞단 프록시 / VIP"]
+  end
+  subgraph nodeA["노드 A (orbivisord)"]
+    apiA["HTTPS API :8006<br/>(axum, 웹 UI)"]
+    raftA["Raft + redb<br/>cluster.redb"]
+    recA[reconciler]
+    taskA[Task 실행기]
+    metA[지표 수집·RRD]
+    peerA["노드 간 gRPC :8007<br/>(mTLS)"]
+    qemuA["QEMU 프로세스들<br/>(QMP·VNC·QGA 소켓)"]
+  end
+  subgraph nodeB["노드 B (orbivisord)"]
+    peerB["gRPC :8007"]
+    raftB[Raft + redb]
+    recB[reconciler]
+    qemuB[QEMU]
+  end
+  browser --> lb --> apiA
+  cli --> apiA
+  prom --> apiA
+  apiA --> raftA
+  raftA <--> peerA
+  peerA <-->|"Raft·리스·전달·콘솔·지표"| peerB
+  peerB <--> raftB
+  raftA --> recA --> qemuA
+  raftA --> taskA --> qemuA
+  raftB --> recB --> qemuB
+  metA --> qemuA
+  qemuA <-.->|"마이그레이션·NBD (QEMU TLS, 60000-60099)"| qemuB
+```
+
+---
+
+## 2. 노드 프로세스 구조
+
+### 2.1 실행 모드
+
+`orbivisord`에는 하위 명령이 없다. 인자는 `--config`(기본 `/etc/opl/opld.toml`)와 `--release-vips`뿐이다
+(`crates/opld/src/main.rs:66-73`). `--release-vips`는 systemd `ExecStopPost`가 부르는 VIP 떼기 전용이다
+(`main.rs:354-376`). 노드의 성격은 설정과 저장소가 정한다.
+
+| 상태 | 정하는 것 | 도는 것 |
+|---|---|---|
+| 초기화 전 노드 | `{data_dir}/pki`가 없음 | 제어 소켓만 열고 `init`·`join`을 기다린다(`main.rs:141-161`) |
+| 일반 멤버 | 기본 | 전부(API, reconciler, Task, 리더 루프 …) |
+| 위트니스 | 설정 `witness = true`(`crates/opld/src/config.rs:34-37`) | Raft 저장소와 노드 간 서버, 생존 리스만. API·QEMU·리더 루프 없음(`member.rs:999-1052`). 투표는 하지만 후보가 되지 않는다 |
+| 관찰 노드 | 저장소에 기록된 모드(`RoleKeeper`가 바꿈) | Raft 밖에서 투표 멤버 하나를 따라가며 상태를 받는 일반 노드(§3.5) |
+
+### 2.2 실행기와 스레드 (계획 45)
+
+API 폭주나 느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰 멀쩡한 노드가 펜싱되지 않도록 한 프로세스 안에서
+일을 나눈다(`crates/opld/src/runtime.rs:1-50`).
+
+| 실행기·스레드 | 스레드 이름 | 크기 | 도는 것 |
+|---|---|---|---|
+| tokio `core` | `orbivisor-core` | 2개 고정(`runtime.rs:20`) | Raft, 노드 간 서버(TLS·HTTP/2), 제어 레인 연결, HA 리스 갱신(`HaGuard`), `HaManager`, `NodeMonitor`, `VoterKeeper`, `RoleKeeper`, VIP, 생존 리스, 제어 소켓 |
+| tokio `api` | `orbivisor-api` | `[runtime] api_threads`(기본 CPU/2, 최소 2) | HTTPS API·웹·watch·콘솔 WebSocket |
+| tokio `work` | `orbivisor-work` | `[runtime] work_threads`(같은 기본) | reconciler, Task 실행기, 스케줄러, janitor, 지표, 풀, overlay·방화벽 에이전트, 텔레메트리, 업데이트, Ceph, 노드 간 서버가 받은 무거운 요청 처리기, 벌크 레인 연결 |
+| OS 스레드 | `orbivisor-watchdog` | 1 | HA watchdog 장치를 1초마다 쓰다듬기(`crates/opl-reconciler/src/ha.rs:333-339`) |
+| OS 스레드 | `orbivisor-store` | 1 | redb 쓰기 트랜잭션과 fsync를 하나씩(`crates/opl-cluster/src/writer.rs:1-34`) |
+| OS 스레드 | `orbivisor-notify` | 1 | 실행기 확인과 systemd 알림(`crates/opld/src/notify.rs:131`) |
+| OS 스레드 | `opl-audit` | 1 | 감사 로그 쓰기(`crates/opl-api/src/audit.rs:126`) |
+
+배치는 `member.rs:331-334`에서 정하고 각 spawn이 `on(&rt.core, …)`/`on(&rt.work, …)`으로 실행기를 고른다.
+`main`은 `runtimes.core.block_on(run)`으로 돈다(`main.rs:90-101`).
+
+**systemd watchdog.** 유닛은 `Type=notify`, `WatchdogSec=30s`, `WatchdogSignal=SIGKILL`이다
+(`packaging/deb/opld.service`). `orbivisor-notify`가 `WATCHDOG_USEC/3`(1~10초, 기본 10초)마다 세 실행기에 빈 작업을
+넣고, `core`와 `api`가 2초(간격의 절반이 더 짧으면 그만큼) 안에 돌려야만 `WATCHDOG=1`을 보낸다. `work`만 늦으면
+경고만 남기고 계속 보낸다(`notify.rs:1-39,137-150`). sd_notify 크레이트 없이 `$NOTIFY_SOCKET`에 직접 쓴다
+(`notify.rs:47-77`). `KillMode=process`라 데몬이 죽어도 QEMU는 그대로 돌고, 다시 뜬 데몬이 다시 붙는다(§8.2).
+
+`READY=1`은 세 곳에서 보낸다: 초기화 전 노드가 제어 소켓을 열었을 때(`main.rs:143`), 멤버가 Task 실행기의 고아
+정리 직전(`member.rs:833-836`, 정족수가 없으면 고아 정리가 오래 걸려 시작 제한에 걸리지 않게), 시작을 마쳤을 때
+(`main.rs:165`).
+
+HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는 [§5.3](#53-자기-펜싱-watchdog)과
+[클러스터 운영 안내](guide/cluster.md#제어부-가용성)에 있다.
+
+### 2.3 디렉터리와 파일
+
+설정은 TOML이고 모르는 키를 거부한다(`config.rs:25-27`). 기본 경로(`config.rs:1329-1349`):
+
+| 키 | 기본값 | 뜻 |
+|---|---|---|
+| `listen` | `0.0.0.0:8006` | HTTPS API·웹 |
+| `cluster_listen` | `0.0.0.0:8007` | 노드 간 gRPC(`listen`과 달라야 함, `config.rs:1548`) |
+| `cluster_addresses` | 비면 `address` 하나 | 다중 링크(§6.7) |
+| `data_dir` | `/var/lib/opl` | 영속 데이터(0700으로 만듦, `main.rs:380-391`) |
+| `run_dir` | `/run/opl` | 소켓·pid 파일 |
+| `control_socket` | `{run_dir}/opld.sock` | 로컬 제어 소켓(0600) |
+| `[migration] ports` | `60000-60099` | QEMU 마이그레이션·NBD(`config.rs:1812`) |
+
+설정 절: `[hypervisor] [reconciler] [schedule] [janitor] [backup] [replication] [pools] [migration] [ha] [network]
+[updates] [telemetry] [audit] [remotes] [runtime] [api] [vip] [web] [node] [ceph] [download] [metrics]`
+(`config.rs:63-106`). 예시는 `packaging/deb/opld.toml.example`.
+
+`data_dir` 아래:
+
+| 경로 | 내용 | 인용 |
+|---|---|---|
+| `opld.lock` | 두 데몬이 같은 디렉터리를 쓰지 않게 하는 flock | `main.rs:393-411` |
+| `node-id` | 노드 UUID | `crates/opld/src/bootstrap.rs:27` |
+| `pki/` | `ca.crt`, `node.crt`, `node.key`(0600) | `crates/opl-peer/src/pki.rs:31-35` |
+| `cluster/cluster.redb` | Raft 로그 + 상태 머신 + 스냅샷 | `crates/opl-cluster/src/cluster.rs:46` |
+| `migration-tls/` | QEMU 마이그레이션용 인증서 사본(시작마다 다시 씀) | `crates/opl-driver/src/migration.rs:144-185` |
+| `vm/<id>/` | VM의 영속 파일(UEFI 변수 `uefi-vars.fd`, `tpm/`) | `crates/opl-driver/src/qemu.rs:144-150` |
+| `pools/<id>` | 풀 마운트 지점 | `member.rs:457` |
+| `uploads/`, `migration-disks/`, `replicas/` | 업로드, 마이그레이션·복제 상태 | `member.rs:72-74,613` |
+| `audit/audit.log` | 감사 로그 | `crates/opl-api/src/audit.rs:53` |
+| `alerts/` | 노드 알림 상태·보낸 기록 | `crates/opl-api/src/alerts/book.rs:21` |
+| `metrics/*.rrd` | 지표 기록 | `crates/opld/src/metrics/rrd.rs:134-147` |
+| `vips` | 이 노드가 붙인 VIP 기록 | `crates/opl-driver/src/vip.rs:106` |
+
+`run_dir/vm/<id>/`에는 `qmp.sock`, `vnc.sock`, `qga.sock`, `tpm.sock`, `qemu.pid`, `swtpm.pid`, `cidata.iso`가 있다
+(`crates/opl-qemu/src/paths.rs:35-46`). `/etc/opl/opld.toml`은 유닛의 `ConditionPathExists`다.
+
+### 2.4 시작 순서
+
+```mermaid
+sequenceDiagram
+  participant M as main
+  participant R as run
+  participant Mem as Member.start
+  M->>M: tracing, 인자, Config::load
+  M->>M: 실행기 셋, Notifier, Liveness
+  M->>R: core.block_on(run)
+  R->>R: data_dir 준비·잠금, 남은 VIP 떼기, node-id
+  R->>R: 제어 소켓 열기
+  alt pki 없음
+    R-->>R: READY=1, init/join 기다림
+  else pki 있음
+    R->>Mem: start
+    Mem->>Mem: Peers, Cluster::open_node (core)
+    Mem->>Mem: 인증서 다시 서명(필요하면), 역할 확인
+    Mem->>Mem: (위트니스면 여기서 갈라짐)
+    Mem->>Mem: API·노드 간 포트 bind, Host·방화벽 감지
+    Mem->>Mem: QemuHypervisor (VM에 다시 붙기), 스토리지 백엔드
+    Mem->>Mem: 감사 로그, 알림 장부, 지표 기록
+    Mem->>Mem: serve_peer (core), 부트스트랩(Init/Join/Restart)
+    Mem->>Mem: AppState·API 인증서, 승격·RoleKeeper
+    Mem->>Mem: Overlay·Firewall 에이전트, HaGuard, Node 등록
+    Mem->>Mem: Reconciler, PoolMounter, 지표 수집
+    Mem-->>R: READY=1
+    Mem->>Mem: TaskRunner(고아 정리)
+    Mem->>Mem: FenceWatch, 상태 검사, NodeMonitor, VoterKeeper, 업데이트, Ceph, ApiCertAgent
+    Mem->>Mem: TLS 리스너(api), 스케줄러들, HaManager, VIP
+    Mem->>Mem: axum serve (API + 웹)
+    R-->>R: READY=1, 종료·leave 기다림
+  end
+```
+
+근거: `main.rs:76-212`, `member.rs:346-935`.
+
+---
+
+## 3. 클러스터 상태와 합의(Raft)
+
+### 3.1 무엇을 저장하나
+
+노드마다 redb 파일 하나(`cluster/cluster.redb`)에 Raft 로그와 상태 머신을 같이 둔다
+(`crates/opl-cluster/src/store.rs:1-43`).
+
+| redb 테이블 | 키 → 값 |
+|---|---|
+| `raft_log` | 로그 index → 항목(JSON) |
+| `objects` | (kind, id) → 리소스(JSON) |
+| `names` | (kind, name) → id (이름 유일성 색인) |
+| `meta` | `vote`, `committed`, `last_applied`, `last_purged`, `last_membership`, `snapshot_meta`, `snapshot_data`, `node_mode`, `schema_version` … |
+
+- **리소스 32종** (`crates/opl-types/src/resource.rs:38-108`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
+  Cluster, JoinToken, Network, Snapshot, SecurityGroup, Backup, BackupJob, VmImport, Settings, Realm, Remote, Session,
+  VipHolder, HaGroup, PlacementRule, NodeFence, HaCheck, Ceph, AlertRule, NotificationTarget, Folder, Grant,
+  AccessRole, Group, TwoFactor.
+- 모든 리소스는 같은 봉투 `Resource<S,T> { id, name, revision, labels, spec, status }`다(`resource.rs:7-18`).
+- **revision은 클러스터 전체에 하나인 순서다.** 리소스의 `revision`은 마지막으로 바꾼 Raft 로그 index이고
+  (`crates/opl-cluster/src/state_machine.rs:381,419,427,443`), 목록의 revision은 `last_applied`다
+  (`store.rs:283-299`). status 쓰기도 revision을 바꾼다.
+- **스키마 버전.** `SCHEMA_VERSION = 1`이고 더 새 파일·스냅샷은 거부한다(`store.rs:20,121-125`).
+- 모든 쓰기 트랜잭션은 `orbivisor-store` 스레드 하나에서 돈다. `append`는 fsync 커밋 뒤에 돌아온다
+  (`crates/opl-cluster/src/log_store.rs:195-196`).
+- **지표와 감사 로그, 노드 알림 상태는 Raft에 넣지 않는다**(§12, §13).
+
+### 3.2 명령과 상태 머신의 검사
+
+Raft에 들어가는 명령은 다섯 가지다: `Create`, `UpdateSpec`, `UpdateStatus`, `UpdateStatusIf`, `Delete`
+(`crates/opl-cluster/src/types.rs:39-68`). `UpdateSpec`·`Delete`는 `expected_revision`을 줄 수 있고, `UpdateStatusIf`는
+늘 준다. 리더에게 보내는 요청은 따로 `LeaderRequest { Write, AddLearner, AddVoter, Remove, RenewLease, RenewVip,
+ReadIndex }`다(`types.rs:114-162`).
+
+적용(`apply_command`, `state_machine.rs:310-474`)은 결정적이어야 하므로 클러스터 전체를 보는 검사를 여기서 한다.
+거부된 명령도 로그 index를 소비한다(그래서 revision에 빈 번호가 있다).
+
+| 검사 | 거부 | API 응답 | 인용 |
+|---|---|---|---|
+| 기대 revision 불일치 | `RevisionMismatch` | **412** `revision_mismatch`(`If-Match`) | `state_machine.rs:325-330`, `crates/opl-api/src/error.rs:114-118` |
+| 같은 id가 있음 | `AlreadyExists` | 409 `already_exists` | `state_machine.rs:334-348` |
+| 종류 안에서 이름 중복 | `NameTaken` | 409 `name_taken` | 〃 |
+| 배타성: VM 디스크 볼륨·NIC MAC은 모든 VM에서 하나, 스냅샷 이름은 VM마다 하나, 폴더 이름은 형제끼리 대소문자 무시하고 하나 | `InUse` 등 | 409 `volume_in_use`·`mac_in_use`·`name_taken` | `crates/opl-cluster/src/exclusive.rs:11-38`, `state_machine.rs:478-524` |
+| 폴더: 부모가 같은 트리에 있음, 순환, 깊이 16, 빈 폴더만 지우기 | `FolderCycle`·`FolderTooDeep`·`FolderNotEmpty` | 409 | `crates/opl-cluster/src/folders.rs:127-227` |
+| 폴더 할당량(vcpus, memory_mib, disk_bytes, vms) | `QuotaExceeded` | 409 `quota_exceeded` | `folders.rs:272-460` |
+
+- 할당량은 "상한을 넘고 **또 사용량이 느는** 쓰기"만 거부한다. 노드 바꾸기·이름 바꾸기·줄이기는 훑지 않는다.
+  VM 사용량은 배타성 검사와 같은 훑기에서 센다.
+- 배타성 훑기는 같은 종류의 모든 객체를 읽는다(O(N)). 비용은 [§15](#15-규모-특성).
+- "VM은 한 노드에서만 돈다"는 Raft 쪽 검사가 아니다. VM이 어느 노드에서 도는지는 `spec.node` 하나로 정해지므로
+  둘이 될 수 없고, 펜싱(§5)이 옛 노드의 프로세스를 끈다.
+- 상태 머신은 spec·status JSON이 종류에 맞는지 보지 않는다. 형식을 아는 API만 쓰게 한다(`cluster.rs:721-722`).
+- API 핸들러는 적용 전에 같은 검사를 먼저 해(예: `crates/opl-api/src/quota.rs`) 대개 빠르게 거절하지만, 경쟁하는
+  두 쓰기 사이의 최종 판정은 상태 머신이 한다.
+
+### 3.3 watch
+
+- `WatchHub`가 적용 묶음을 메모리에 1024개(`HISTORY`) 두고 redb 커밋 뒤 tokio broadcast로 보낸다
+  (`crates/opl-cluster/src/watch.rs:14,110-121`).
+- `watch(since)`는 revision이 `since`보다 큰 사건을 준다. `since`가 기록보다 오래되면 `Expired`, 구독자가 버퍼보다
+  뒤처지면 `Lagged`, 스냅샷을 설치하면 `Reset`(기록을 비움)이다(`watch.rs:124-169`). 다시 시작하면 기록은
+  `last_applied`부터라 그 전 revision은 모두 만료다(`watch.rs:98-107`).
+- 영속 watch 기록이나 따로 둔 압축은 없다. 클라이언트는 만료되면 목록을 다시 읽는다(§7.3).
+
+### 3.4 스냅샷과 로그 압축
+
+- opld의 `raft_config`(`crates/opld/src/member.rs:162-176`)는 스냅샷 정책을 정하지 않으므로 openraft 0.9.25 기본값을
+  쓴다: 로그 **5000개마다** 스냅샷(`LogsSinceLast(5000)`), 스냅샷 뒤 로그 **1000개** 남김. 바꾼 것은 조각 크기 1 MiB와
+  조각마다 제한 시간 10초뿐이다.
+- 스냅샷은 상태 전체를 JSON 문서 하나 `{schema_version, objects: [(Kind, Resource)]}`로 만든다
+  (`state_machine.rs:37-41`). `spawn_blocking`에서 만들고 같은 redb의 `meta.snapshot_data`에 둔다. 옛 스냅샷이 새것을
+  덮지 않는다(`state_machine.rs:147-161,528-543`).
+- 설치하면 `objects`·`names`를 지우고 다시 쓴 뒤 watch에 `Reset`을 보낸다(`state_machine.rs:180-212,590-609`).
+- 로그 지우기(purge)는 `last_purged`까지 지우고 기록한다(`log_store.rs:103-113`).
+
+### 3.5 투표: 투표 멤버, learner, 관찰 노드, 위트니스
+
+Raft 시간(`member.rs:167-169`): **하트비트 200 ms, 선거 제한 시간 1000~2000 ms.**
+
+```mermaid
+graph LR
+  subgraph raft["Raft 멤버십"]
+    V["투표 멤버<br/>상한 3/5/7, 기본 5"]
+    W["위트니스<br/>투표만, 후보 안 됨"]
+    L["대기 learner 2개<br/>로그를 받음, 투표 안 함"]
+  end
+  O["관찰 노드<br/>Raft 밖, Follow 스트림"]
+  V -- 강등 --> L
+  L -- 승격 --> V
+  L -- 넘치면 --> O
+  O -- 모자라면 --> L
+  O -. "투표 멤버 하나를 따라감" .-> V
+```
+
+- **투표 멤버 상한.** 설정 `voters`는 3·5·7 가운데 하나, 기본 5다(`crates/opl-types/src/settings.rs:250-264`).
+  홀수만 고를 수 있다.
+- **정족수.** 투표 멤버 n의 과반수(n=3이면 2, 5면 3, 7이면 4)가 살아 있어야 쓰기가 커밋된다. `VoterKeeper`는
+  "살아 있는 투표 멤버 × 2 > 투표 멤버 수"를 바꾸기 전과 뒤 모두 만족할 때만 멤버십을 바꾼다
+  (`crates/opl-cluster/src/voters.rs:178-199`).
+- **`VoterKeeper`** (`voters.rs`): 모든 노드에 뜨지만 리더에서만 1초마다 돈다(`voters.rs:73-83,365`). 판단 기준은
+  리스 갱신 나이다: 건강 = 10초 안, 살아 있음 = 3초 안, 오프라인 = 30초 넘게. learner가 리더 로그에서 64개 안이면
+  따라잡았다고 본다(`voters.rs:56`). 고르는 순서(`pick`, `voters.rs:162-280`):
+  1. 위트니스 learner를 먼저 올린다.
+  2. 상한보다 적으면 올린다. 투표 멤버가 적은 장애 영역(`[node] zone`)의 노드를 먼저.
+  3. 상한보다 많으면 내린다: 오프라인 > 살아 있지 않음 > 붐비는 영역 > 건강하지 않음 > 큰 id. 임기 첫 10초에는 안 한다.
+  4. 상한과 같은데 오프라인 투표 멤버가 있으면 따라잡은 learner와 한 번에 바꾼다(`Replace`).
+  5. 투표 멤버 밖에 건강한 learner를 2개(`STANDBY_LEARNERS`) 두고 나머지는 관찰 노드로 보낸다(`voters.rs:50`).
+- **관찰 노드(계획 48).** Raft 멤버가 아니다. 관찰 노드가 되면 Raft 로그를 지우고(`store.rs:166-190`), 투표 멤버 하나에
+  `Follow` 스트림을 열어 적용된 변경을 받는다. 1초마다 진행 표시가 오고, `since`가 만료면 전체 스냅샷을 받는다
+  (`crates/opl-cluster/src/follow.rs:20,272`). 3초 동안 진행이 없으면 다른 투표 멤버로 옮긴다(`FOLLOW_STALL`,
+  `crates/opl-cluster/src/replica.rs:29`). 노드마다 `RoleKeeper`가 1초마다 자기 역할을 맞춘다
+  (`crates/opl-cluster/src/roles.rs:1-36`). 리더가 learner 모두에 하트비트·로그를 보내는 일이 노드 수만큼 늘던 것을
+  줄이려는 것이다(§15).
+- **위트니스.** `enable_elect = false`라 투표는 하지만 후보가 되지 않는다(`member.rs:166`). 늘 투표 멤버이고 상한에
+  들어간다. VM·API·리더 일은 하지 않는다. 노드 둘 + 위트니스 하나로 정족수를 만드는 용도다.
+- **옛 방식.** 모든 노드가 `voter-limit` 기능을 알리기 전(롤링 업그레이드 중)에는 `VoterKeeper`가 쉬고 각 노드가
+  스스로 투표 멤버가 되려 한다(`promote_until_voter`, `member.rs:1500-1580`, 5→60초 재시도).
+- **리더 선출 시간.** 리더가 죽으면 openraft가 마지막 하트비트 뒤 리더 리스(약 2초)와 선거 제한 시간(1~2초)을 기다려
+  새 리더가 서기까지 **노드 수와 관계없이 3~4초**다(잰 값 3.2~3.6초, [클러스터 운영 안내](guide/cluster.md#대규모-클러스터)).
+
+### 3.6 합류와 떠나기
+
+```mermaid
+sequenceDiagram
+  participant Admin as 관리자
+  participant New as 새 노드
+  participant Any as 기존 노드 API
+  participant Leader as 리더
+  Admin->>Any: cluster join-token 만들기
+  Any-->>Admin: opl-join://host:8006?token=oplj_…&ca=sha256:…
+  Admin->>New: orbivisorctl cluster join <URL> (제어 소켓)
+  New->>Any: GET /api/v1/cluster/ca (검증 없이)
+  New->>New: CA 지문을 URL과 비교(고정)
+  New->>New: 키 만들기, CSR
+  New->>Any: POST /api/v1/cluster/join (CSR, 토큰)
+  Any->>Any: 토큰 확인(상수 시간), 버전·이름·링크 확인
+  Any->>Any: 클러스터 CA로 CSR 서명
+  Any->>Leader: 토큰 지우기(expected_revision) → 한 번만 성공
+  Any->>Leader: Node 리소스 쓰기, AddLearner
+  Leader-->>New: 로그·스냅샷 복제
+  Note over Leader,New: 이후 VoterKeeper가 승격·관찰 노드 여부를 정함
+```
+
+- 합류 토큰은 `oplj_<id>_<secret>`, TTL 기본 1시간·최대 7일, Raft에는 SHA-256만 둔다
+  (`crates/opl-api/src/cluster.rs:39-42,305-345`). 합류는 HTTPS API로 한다(gRPC가 아님).
+- 새 노드는 URL의 지문으로 CA를 고정한 뒤 그 CA만 믿는다(`crates/opld/src/join.rs:46-112`). 인증서 SAN에는 API 주소,
+  모든 링크 주소, localhost가 들어간다(`cluster.rs:535-556,664-677`).
+- **떠나기(`leave`).** 유일한 투표 멤버이거나 남는 투표 멤버가 모두 위트니스이거나 이 노드에 VM이 배정되어 있으면
+  거부한다. 아니면 `Node`를 지우고 `Remove`를 보낸다(`member.rs:1112-1134,1359-1377`).
+- **죽은 노드 지우기(`DELETE /nodes/{key}`).** 오프라인 노드만. Ceph 기록 → `Remove`(투표 멤버에서 빼고 노드 빼기) →
+  `Node` 삭제 → 펜싱 설정 → 복제 대상에서 빼기 순서다. **그 노드의 VM은 그대로 남는다**(HA VM이면 HA가 먼저
+  옮겼을 것이다)(`cluster.rs:769-815`, `crates/opl-cluster/src/leader.rs:211-244`).
+
+### 3.7 쓰기 경로: 팔로어에서 리더로
+
+```mermaid
+sequenceDiagram
+  participant C as 클라이언트
+  participant F as API 노드(팔로어)
+  participant L as 리더
+  participant V as 다른 투표 멤버
+  C->>F: PUT /api/v1/vms/web1
+  F->>F: 인증·권한(route table), 검증, 할당량·기능 확인
+  F->>F: cluster.update_spec → LeaderRequest::Write
+  F->>L: gRPC Leader (제어 레인, 시도마다 3초)
+  L->>L: raft.client_write → 로그 append (fsync)
+  L->>V: AppendEntries
+  V-->>L: 확인 (과반수)
+  L->>L: 커밋 → apply_command(검사) → redb
+  L-->>F: 적용 결과(index 또는 Rejection)
+  F->>F: 자기 노드가 그 index를 적용할 때까지 기다림
+  F-->>C: 200 + Orbivisor-Revision
+```
+
+- 리더가 아니면 `NotLeader`를 받고 `Forwarder`(opl-peer의 `Leader` RPC)로 보낸다
+  (`crates/opl-peer/src/client.rs:1053`, `crates/opl-peer/src/server.rs:306-313`). 시도마다 3초
+  (`FORWARD_ATTEMPT_TIMEOUT`), 실패하면 50 ms마다 다시 시도해 전체 **10초**(opld의 `WRITE_TIMEOUT`,
+  `member.rs:79,353`; 라이브러리 기본은 5초)까지 간다(`cluster.rs:36-43`).
+- 성공하면 자기 노드가 그 index를 적용할 때까지 기다리므로 같은 노드에서 자기 쓰기를 바로 읽는다
+  (`cluster.rs:780-797`).
+- **리더가 바뀌는 중의 쓰기.** 제한 시간이 지나면 `Timeout`이고 "나중에 커밋될 수도 있음"이다(`cluster.rs:93-96`). 응답이
+  없던 시도 뒤 다시 보낸 것이 거부되면, 같은 id의 `Create`가 `AlreadyExists`이거나 조건 없는 `Delete`가 `NotFound`이면
+  앞 시도가 적용된 것으로 본다(`cluster.rs:836-862`). 조건부 쓰기는 이렇게 풀지 않는다.
+  API는 `Timeout`을 503 `cluster_no_quorum`, `NotLeader`를 503 `not_leader`로 돌려준다.
+- **읽기.** 기본은 자기 노드의 저장소(리더를 거치지 않음). 모든 인증 응답에 `Orbivisor-Revision`이 붙고, 클라이언트가
+  `Orbivisor-Min-Revision`을 보내면 그 revision까지 5초 기다린다(없으면 503 `revision_unavailable`,
+  `crates/opl-api/src/revision.rs:1-40`). 리더 확인이 필요한 곳은 `read_barrier`(리더에서 `ensure_linearizable`) 또는
+  `read_index`(리더에게 `ReadIndex`를 묻고 자기 적용을 기다림, 팔로어·관찰 노드에서도 됨)를 쓴다
+  (`cluster.rs:1189-1214`).
+
+---
+
+## 4. 리더의 일
+
+**리더가 바뀔 때 무엇을 켜고 끄지 않는다.** 위트니스가 아닌 모든 노드가 시작할 때 아래 루프를 모두 띄우고
+(`member.rs:871-925`), 루프가 틱마다 "내가 지금 리더인가"(`cluster.members().leader == Some(cluster.id())`)를 본다.
+리더가 아니면 메모리 상태를 비우고 넘어간다. 리더면 대개 `read_barrier()`로 앞 임기의 커밋을 따라잡은 뒤 읽는다.
+그래서 리더가 바뀌면 새 리더의 루프가 다음 틱(대개 1~60초)에 일을 이어받는다. 진행 상태가 Raft에 있는 일(백업 작업,
+알림 상태, Task)은 그대로 이어지고, 메모리에만 있는 것(리스 표, 배치 추천 게시판)은 새로 쌓는다.
+
+| 루프 | 하는 일 | 주기 | 인용(`crates/opl-api/src/` 아래, 따로 적지 않으면) |
+|---|---|---|---|
+| `HaManager` | 리스가 끊긴 노드의 HA VM 복구, 전원 펜싱, HA 상태 검사 대응, 배치 규칙 위반 고치기, failback, 복구 대상 미리 계산 | 1초(failback 30초, 계획 10초) | `ha.rs:88-95,633` |
+| `NodeMonitor` | 리스 나이로 `NodeStatus.online` 쓰기(바뀔 때만) | 2초, 10초면 오프라인 | `crates/opl-peer/src/monitor.rs:34-41,131-136` |
+| `VoterKeeper` | 투표 멤버 승격·강등, 대기 learner·관찰 노드 목록 | 1초 | `crates/opl-cluster/src/voters.rs:73-83` |
+| `ClusterJanitor` | 오프라인(60초 넘게)·지워진 노드의 대기 Task 실패 처리, 고아 스냅샷, 끝난 Task 정리(7일·1000개), 만료 세션, `receiving`에 24시간 넘게 머문 백업, 고아 grant | 10초 | `janitor.rs:54-66,316` |
+| `SnapshotScheduler` | 예약 스냅샷 만들기·정리 | 60초 | `schedule.rs:39,234` |
+| `BackupJobScheduler` | 백업 작업 실행(진행은 Raft에 있어 새 리더가 잇는다) | 60초 | `backup_jobs.rs:346,395` |
+| `ReplicationScheduler` | 로컬 디스크 복제 Task 만들기(원본 노드당 2개까지) | 60초 | `replication.rs:175-183,320` |
+| `Balancer` | 부하 불균형 재기, 추천 게시 또는 자동 마이그레이션(계획 53) | 틱 10초, 실행 300초, 리더 된 뒤 첫 실행 60초 안 | `balancer.rs:34,50-57,121` |
+| `AlertEngine`(리더 몫) | `node_offline`, `backup_job_failed` 알림. 상태는 `AlertRule.status`(Raft) | 5초 | `alerts/engine.rs:548-588` |
+| `VipManager` | VIP마다 들 노드 정하기(`VipHolder`) | 1초 | `vip.rs:34-38,226` |
+| 배치 현황 | 리스로 받은 노드 부하를 다른 노드에 RPC(`ReadPlacement`)로 알려 줌 | 캐시 1초 | `placement_board.rs:154`, `score.rs:299-342` |
+| `TelemetryReporter` | 텔레메트리 보고 | 틱 60초, 24시간마다 | `telemetry.rs:221-229,292` |
+| `RemotePoller` | 원격 클러스터 상태 모으기 | 30초 | `remotes.rs:558-559,608` |
+| 리스 표 | 노드의 `RenewLease`를 받아 메모리에 기록(§5.1) | 요청마다 | `crates/opl-cluster/src/lease.rs` |
+
+리더 일이 **아닌** 것(오해하기 쉬운 것):
+
+- **VM 처음 배치(스케줄링).** 요청을 받은 노드의 API가 한다(`scheduler.rs:121-130`, `vms.rs:929,1080,1706`). 리더에게서는
+  부하 자료만 받는다(`score.rs:292-322`).
+- **클러스터 지표 요약.** 요청을 받은 API 노드가 모든 노드에서 모은다(§12.3).
+- **노드 알림 대부분.** 사건이 난 노드가 평가한다(§12.5).
+- **노드 비우기.** 비우는 노드의 Task로 돈다(§5.7).
+- **OvnSync, 리더의 CPU 기준선 계산, 구독 보고 루프는 없다.** OVN은 범위 밖이고(§11.4), 구독은 API(`subscription.rs`)만
+  있다.
+
+**리더 장애 때.** 새 리더가 3~4초 안에 선다(§3.5). 진행 중이던 쓰기는 §3.7처럼 다시 시도된다. 리스 표는 임기가 바뀌면
+비워지고 새 리더는 자기가 그 임기를 본 때를 기준(base)으로 나이를 센다(`lease.rs:58-65`,
+`crates/opl-peer/src/monitor.rs:213-260`). 그래서 HA 복구까지의 시간에 선거 시간이 더해진다. 펜싱 중인 노드 목록은
+임기가 바뀌어도 남는다(`lease.rs:51-53`).
+
+---
+
+## 5. 노드 생존, 리스, HA와 펜싱
+
+### 5.1 리스로 보는 노드 생존 (계획 47)
+
+- 리스 갱신은 `LeaderRequest::RenewLease { node, checks, load }`다. **Raft 로그에 쓰지 않는다.** 리더가 과반수 리더인지
+  확인(`ensure_linearizable`)한 뒤 현재 임기의 메모리 표에 노드별 갱신 시각, HA 상태 검사 결과, 부하 요약을 적는다.
+  펜싱 중인 노드는 `Rejected(Fenced)`를 받는다(`crates/opl-cluster/src/lease.rs:77-128`).
+- **확인 묶기.** 노드 수백 대가 갱신할 때 갱신마다 과반수 왕복을 하지 않도록 `ConfirmBatch`가 확인을 묶는다. 요청은
+  자기가 도착한 뒤 시작한 확인만 쓰므로 많아야 확인 두 번을 기다린다(`lease.rs:182-260,309-325`).
+- 노드 쪽은 돌려받은 index를 자기가 적용해야 성공으로 본다(`crates/opl-cluster/src/cluster.rs:922-957`).
+- **누가 얼마나 자주.** 펜싱을 쓰는 노드는 `HaGuard`가 `fence_after/10`(0.2~2초, `fast` 1초·`safe` 2초)마다
+  (`crates/opld/src/config.rs:616-622`), 펜싱을 끈 노드와 위트니스는 2초마다(`member.rs:84`).
+- **오프라인 판정.** 리더의 `NodeMonitor`가 마지막 갱신이 10초 넘으면 `online = false`를 쓴다(`monitor.rs:213-260`).
+  옛 버전 노드가 섞여 있으면(`lease-liveness` 기능 없음) Ping으로 판단한다(`monitor.rs:145-171`).
+
+### 5.2 HA 시간 묶음
+
+| `[ha] profile` | `fence_after` | watchdog | 복구 시작(watchdog 펜싱) | 복구 시작(`process` 펜싱) |
+|---|---|---|---|---|
+| `fast`(기본) | 10초 | 10초 | 10 + 10 + 2 = **22초** | 12초 |
+| `safe` | 30초 | 30초 | 62초 | 32초 |
+
+근거: `crates/opld/src/config.rs:440-457,480-486`(`RECOVER_MARGIN_SECS = 2`). 노드는 자기 값을 `NodeStatus.ha`에 쓰고
+리더는 노드마다 그 값을 쓴다. 옛 HA 설계 문서의 기본값(30초/30초, 복구 약 65초)은 이제 `safe`에 해당한다(설계와 다름).
+
+### 5.3 자기 펜싱: watchdog
+
+노드 쪽(`crates/opl-reconciler/src/ha.rs`):
+
+- `/dev/watchdog`(하드웨어 또는 softdog)는 리스가 신선하고 HA VM을 시작하거나 다시 붙일 때만 연다(`ha.rs:387-421`).
+  제한 시간은 `WDIOC_SETTIMEOUT`으로 5~3600초.
+- 전용 OS 스레드 `orbivisor-watchdog`가 1초마다 쓰다듬는다. **리스가 신선하지 않고 HA VM이 돌고 있으면** 쓰다듬기를
+  멈춘다(`ha.rs:509-540`). 실행기가 막혀도 이 스레드는 리스 규칙대로 움직인다.
+- 리스가 `fence_after` 넘게 끊기면 reconciler가 HA VM을 강제로 끈다(`crates/opl-reconciler/src/worker.rs:468-487`).
+  데몬 자체가 멈췄으면 watchdog이 노드를 재부팅한다. 둘 중 어느 쪽이든 리더가 복구를 시작하는 22초 전에 옛 VM은
+  꺼져 있다.
+- HA VM이 없을 때만 magic close로 깔끔하게 닫는다(`ha.rs:440-466`).
+
+### 5.4 전원 펜싱: IPMI·Redfish (계획 51)
+
+- 노드마다 IPMI, Redfish, 명령 가운데 4개까지 순서대로 시도한다(`crates/opl-types/src/fence.rs:15-41`).
+- 리더가 끊는 조건: 리스 나이 ≥ `fence_after`(10초), 그 노드에 펜싱 설정과 HA VM이 있음, 리더 자신의 리스가
+  `fence_after`보다 신선함(`crates/opl-api/src/ha.rs:926-945`). 한 임기에 (n−1)/2대(최소 1대)까지
+  (`ha.rs:396-399`).
+- 끄기 호출 15초, 꺼졌는지 1초마다 15초까지 확인(`crates/opl-api/src/power_fence.rs:21-25`). 꺼진 것이 확인되면 바로
+  복구한다. 실패하면 `recover_after`(22초)를 기다린다.
+- 다른 노드가 3600초마다 BMC에 닿는지 확인하고 60초마다 설정을 다시 본다(`crates/opld/src/fence_watch.rs:1-27`).
+  남의 전원 상태 읽기는 peer `FenceStatus` RPC다.
+
+### 5.5 HA 복구 타임라인
+
+```mermaid
+sequenceDiagram
+  participant N as 죽는 노드
+  participant WD as N의 watchdog
+  participant L as 리더(HaManager)
+  participant BMC as N의 BMC
+  participant T as 대상 노드
+  Note over N: s = 마지막 성공한 리스 갱신
+  N--xL: 갱신 끊김 (노드 장애 또는 고립)
+  Note over N: s+10s: 리스 만료 → reconciler가 HA VM 강제 끄기
+  L->>L: s+10s: NodeMonitor가 offline 표시
+  opt 전원 펜싱이 설정됨
+    L->>BMC: s+10s: 전원 끄기(IPMI/Redfish, 15초+15초)
+    BMC-->>L: 꺼짐 확인
+    L->>L: 바로 복구 (s+10s + BMC 시간)
+  end
+  Note over WD: s+20s: 쓰다듬기 멈춘 지 10초 → 노드 재부팅(데몬이 멈췄을 때)
+  L->>L: s+22s: recover_after 도달 (1초 틱)
+  L->>L: status → spec.node = T → vm-ha-recover Task
+  L->>T: (Raft로) spec.node 바뀜
+  T->>T: reconciler가 QEMU 시작
+  Note over T: 약 22~23초 + 게스트 부팅
+```
+
+- 리더는 노드가 죽었다고 보는 조건이 "리스 나이 ≥ `recover_after`" 또는 "전원 꺼짐 확인 뒤 갱신 없음"이다
+  (`ha.rs:2032-2066`).
+- 복구 순서는 우선순위, 이름 순이다. 대상 노드마다 시작을 기다리는 VM은 `ha_start_concurrency`(기본 4)개까지이고,
+  시작은 120초 뒤 세지 않는다(`ha.rs:69`). 쓰는 동안 그 노드를 펜싱 중으로 표시해 갱신을 거부한다.
+- 리더도 같이 죽었으면 선거 시간(§3.5)이 더해지고 나이는 새 리더의 기준부터 센다.
+- 사용 안내의 잰 값(`process` 펜싱, 12초 설정): 약 12~13초([HA 안내](guide/ha.md)).
+
+### 5.6 HA 정책, 배치 규칙, 상태 검사
+
+- **HaGroup**(노드 우선순위 0~1000, `restricted`, `nofailback`)과 **PlacementRule**(hard/soft × affinity/anti-affinity
+  × VM/노드, 무게 1~100, `ha_may_violate`)(`crates/opl-types/src/placement.rs:20-35,152-168`).
+- VM의 HA 설정: `max_restart`·`max_relocate` 기본 1, 우선순위 기본 50, `guest_watch` 기본 60초
+  (`crates/opl-types/src/vm.rs:170-246`). 옮긴 횟수는 600초 창으로 센다(`ha.rs:63`).
+- **HA 상태 검사(계획 52).** 노드마다 5초마다 링크·ping·풀 검사를 하고(`crates/opld/src/checks.rs:35`) 결과를 리스
+  갱신에 실어 보낸다. 리더는 유예(기본 10초) 뒤 warn·migrate·restart_elsewhere·fence 가운데 정해진 동작을 한다.
+  과반수 노드가 같은 검사에 실패하면 경고만 하고(망 전체 문제를 노드 문제로 오판하지 않게), 노드 복구가 진행 중인
+  틱에는 하지 않는다(`crates/opl-api/src/ha_health.rs:1-54`, `ha.rs:733-748`).
+
+### 5.7 로컬 디스크 HA: 복제 (계획 55)
+
+- VM마다 대상 노드 3개까지, 일정 `*/N`분(기본 `*/15`)(`crates/opl-types/src/replication.rs:10-56`).
+- 원본 노드의 `vm-replicate` Task가 처음에는 전체, 그다음부터는 대상마다의 dirty bitmap 증분을 보낸다. 원본 QEMU가
+  NBD+TLS로 대상 노드의 받는 QEMU에 직접 쓰고, 대상은 회차마다 overlay에 받아 끝나면 복제본에 합친다
+  (`crates/opl-api/src/tasks/vm_replicate.rs:1-11`, `crates/opl-peer/src/replica.rs:1-4`). 제어는 peer
+  `ReplicaPrepare/Finish/Abort` RPC다.
+- 장애 때 리더는 쓸 수 있는 복제본이 있는 노드로만, 가장 새로운 시점 순으로 복구한다. 마지막 복제 뒤의 쓰기는
+  잃는다. 복제 방향은 거꾸로 바뀐다(`ha.rs:1217-1240,1537-1562`). 대상 reconciler가 VM을 켜기 전에 복제본을 올린다
+  (`worker.rs:1124-1145`).
+
+### 5.8 노드 유지보수와 비우기
+
+`start_drain`이 `spec.maintenance = true`를 쓰고 그 노드에 `node-drain` Task를 만든다(`crates/opl-api/src/drain.rs:40-124`).
+Task는 이름 순으로 VM을 하나씩 라이브 마이그레이션하고 hard affinity로 묶인 VM은 함께 옮긴다
+(`crates/opl-api/src/tasks/drain.rs:1-4`). 유지보수 노드는 배치와 HA 대상에서 빠진다(`scheduler.rs:294,394`). 호스트 종료
+정책(`conditional` 기본: 재부팅은 freeze, 끄기는 failover; `freeze`, `failover`, `migrate`)은
+`crates/opld/src/shutdown.rs:74-81`에 있다.
+
+---
+
+## 6. 노드 간 통신
+
+### 6.1 opl-peer gRPC
+
+- 서비스 하나 `opl.peer.v1.Peer`에 RPC 27개다. **`.proto` 파일이 없다.** `crates/opl-peer/build.rs`가
+  `tonic_build::manual`로 서비스를 정의하고, 메시지는 protobuf가 아니라 serde JSON 코덱이다(일부는 바이너리 코덱)
+  (`build.rs:1-19`, `crates/opl-peer/src/codec.rs`).
+- 포트는 `cluster_listen`(기본 8007). 메시지 최대 64 MiB, HTTP/2·TCP keepalive 10초(제한 20초)
+  (`crates/opl-peer/src/lib.rs:68-77`).
+
+| RPC | 하는 일 |
+|---|---|
+| `AppendEntries`, `InstallSnapshot`, `Vote` | openraft |
+| `Leader` | 팔로어가 리더에게 `LeaderRequest`(쓰기, 멤버십, 리스·VIP 갱신, ReadIndex) 전달 |
+| `Ping` | 생존 확인(옛 버전과 섞였을 때의 노드 감시) |
+| `Follow` | 관찰 노드가 투표 멤버를 따라가는 서버 스트림 |
+| `MigrateIncoming`, `MigrateWait`, `MigrateAbort` | 라이브 마이그레이션 대상 준비·대기·취소 |
+| `ReplicaPrepare`, `ReplicaFinish`, `ReplicaAbort` | 로컬 디스크 복제 회차 |
+| `Console` | VNC 바이트 양방향 중계 |
+| `UefiVars`, `TpmState`, `PushFirmware`, `PurgeFirmware` | UEFI 변수·TPM 상태 가져오기·사본 밀어 넣기 |
+| `GuestAgent` | 게스트 정보, 비밀번호 설정 |
+| `ReadAudit`, `ReadMetrics`, `ReadMetricsHistory`, `PushMetricsHistory`, `ReadAlerts` | 노드 로컬 자료 읽기·지표 기록 넘기기 |
+| `FenceStatus`, `ReadPlacement`, `NodeDisks`, `CephStatus` | 전원 상태, 배치 현황, Ceph 구성 |
+
+### 6.2 mTLS와 클러스터 CA
+
+- **클러스터 CA.** `cluster init` 때 rcgen으로 ECDSA P-256, path length 0, CN `Orbivisor cluster {name} CA`, 20년 짜리를
+  만든다(`crates/opl-peer/src/pki.rs:23,59-81`, `crates/opld/src/main.rs:423-438`). **CA 개인 키는 파일이 아니라 Raft의
+  `ClusterSpec { ca_cert_pem, ca_key_pem }`에 있다**(`crates/opld/src/bootstrap.rs:57-67`). 그래서 어느 멤버든 합류하는
+  노드의 CSR에 서명할 수 있다.
+- **노드 인증서.** CN = 노드 UUID, EKU serverAuth + clientAuth, keyEncipherment(QEMU/GnuTLS가 필요), 824일
+  (`pki.rs:24-26,84-139`). 자동 갱신은 없다. 설정의 주소가 바뀌어 SAN이 모자라면 시작할 때 같은 키로 다시 서명한다
+  (`member.rs:100-135`).
+- **확인(`authorize`, `server.rs:246-277`).** 모든 RPC에서 클라이언트 인증서가 클러스터 CA에 이어지고, CN이 UUID이고,
+  그 노드가 멤버여야 한다(합류 중 멤버십이 빌 때만 예외). `orbivisor-target` 메타데이터가 자기 id와 다르면
+  `permission_denied`(다른 노드가 같은 주소를 쓰게 된 경우를 잡는다). `Follow` 스트림은 프레임마다 다시 본다.
+
+### 6.3 Raft 전송과 연결
+
+- `GrpcNetwork`가 openraft의 `RaftNetworkFactory`를 구현해 같은 이름의 RPC로 보낸다. 제한 시간은 openraft의
+  `hard_ttl`, `Unavailable` 등은 `Unreachable`로 바꿔 openraft가 물러나게 한다(`crates/opl-peer/src/client.rs:1064-1193`).
+- 연결은 (레인, 링크 주소)마다 tonic `Channel` 하나를 게으르게 열고 다시 쓴다. 연결 제한 시간 2초(`client.rs:65,377-410`).
+- **레인 둘.** 제어 레인(Raft, `Leader`, `Ping`, `Follow`)은 `core` 실행기, 벌크 레인(나머지: 콘솔, 마이그레이션 제어,
+  펌웨어, 감사·지표 읽기)은 `work` 실행기에서 돈다(`client.rs:120-123,211-216`). 벌크 일이 Raft 하트비트를 늦추지
+  않게 하려는 것이다.
+
+### 6.4 마이그레이션과 복제의 데이터 흐름
+
+gRPC는 **제어만** 한다. 데이터는 QEMU끼리 직접 TCP + QEMU 자체 TLS로 간다.
+
+- 대상 노드가 `MigrateIncoming`(120초)을 받으면 `-incoming defer`로 QEMU를 띄우고 `[migration] ports`(60000~60099)에서
+  빈 포트를 골라 돌려준다. 로컬 디스크가 있으면 NBD 서버 포트도 준다(`crates/opl-driver/src/migration.rs:36-46,200-206`).
+- 원본 QEMU가 `tcp:host:port`로 붙는다. 양쪽 모두 `tls-creds-x509`(`verify-peer: true`)에 `migration-tls/`의 노드 인증서를
+  쓴다(`crates/opl-qemu/src/qmp.rs:1036-1053`, `crates/opl-driver/src/qemu.rs:648-674`).
+- 로컬 디스크(계획 42)는 대상의 `nbd-server-start`(TLS)에 원본이 NBD `blockdev-add` 뒤 `blockdev-mirror`로 복사한다
+  (`qemu.rs:701-723,2512-2538`, `crates/opl-api/src/tasks/migrate.rs:594-620`).
+- 연결할 주소는 대상 노드의 지금 쓰는 링크다(`migrate.rs:415-433`). 대량 전송용 망을 따로 두는 것은 없다.
+
+### 6.5 콘솔 중계
+
+웹 콘솔은 `GET /api/v1/vms/{id}/console` WebSocket(VNC/RFB 바이너리 프레임) 하나다. VM이 다른 노드에 있으면 API 노드가
+벌크 레인의 양방향 `Console` RPC를 열고, 그 노드가 QEMU의 VNC 유닉스 소켓에 잇는다(`crates/opl-api/src/console.rs:51-82`,
+`server.rs:760-834`). 권한은 2초마다 다시 본다. 시리얼 콘솔은 없다.
+
+### 6.6 여러 노드에 묻기(fan-out)
+
+- `fan_out::gather`가 노드 32개(`FAN_OUT`)까지 동시에 묻고 결과를 순서대로 모은다(`crates/opl-api/src/fan_out.rs:9-25`).
+  지표, 감사 로그, 알림, 지표 기록 요약이 쓴다.
+- 노드마다 제한 시간: 지표 3초, 감사·알림·지표 기록 5초, Ceph 20초, 게스트 3/25/15초.
+- 캐시는 클러스터 지표 요약에만 있다(10초, §12.3).
+
+### 6.7 다중 링크 (계획 49)
+
+- `cluster_addresses`에 주소를 여러 개 두면 앞의 것을 먼저 쓴다. 모두 `cluster_listen` 포트다
+  (`crates/opld/src/config.rs:44-48,1639-1654`). 멤버십의 `OrbNode.addrs`로 다른 노드에 알린다.
+- 바꾸는 규칙(`crates/opl-cluster/src/links.rs:1-27`): 연결 실패면 바로, 제한 시간 초과는 연속 두 번이거나 마지막
+  성공에서 400 ms(`LINK_DEAD_AFTER`)가 지났을 때. 선호 링크는 30초마다 다시 시도. "400 ms + 하트비트 200 ms <
+  선거 최소 1000 ms − 하트비트 200 ms"라 링크 하나가 조용히 죽어도 선거가 나지 않게 맞췄다.
+- 보내지 못한 호출(연결 오류, 다른 노드)은 다른 링크로 한 번 다시 보낸다(`client.rs:185-200,311-348`). QEMU 마이그레이션·
+  NBD·복제도 지금 쓰는 링크를 쓴다.
+
+### 6.8 API 요청이 다른 노드에 관한 것일 때
+
+노드 사이에 일반 HTTP 프록시는 없다. 쓰기는 Raft로(§3.7), 읽기는 자기 복제본에서, 노드 로컬 작업은 정해진 RPC(콘솔,
+게스트 에이전트, 펌웨어, 감사·지표·알림 읽기, 전원 상태, Ceph)로 한다. 그 밖의 것은 원하는 상태를 Raft에 쓰면 그 노드의
+reconciler나 Task 실행기가 한다. `remote_proxy.rs`는 다른 **클러스터**로 보내는 프록시다.
+
+---
+
+## 7. API와 웹 서비스
+
+### 7.1 HTTPS 서버
+
+- axum 0.8 + rustls 0.23(ring). 자체 `TlsListener`가 핸드셰이크 제한 시간 10초, 동시 256개, ALPN `http/1.1`만
+  (WebSocket 때문)이다(`crates/opl-peer/src/tls.rs:23-158`). 클라이언트 인증서는 요구하지 않는다.
+- 포트 8006(`listen`). **평문 HTTP 리스너와 HTTP→HTTPS 넘기기는 없다.**
+- **API 인증서.** 설정 `[api] tls_cert`/`tls_key` 파일이 있으면 그것, 없으면 노드 인증서. 클러스터 설정 `api_names`가
+  있으면 `ApiCertAgent`가 그 이름을 넣은 serverAuth 인증서(CN `orbivisor-api`)를 클러스터 CA로 서명해 연결을 끊지 않고
+  바꾼다(`crates/opl-api/src/api_cert.rs:1-65`, `crates/opl-peer/src/tls.rs:28-53`). 인증서 올리기 API는 없다.
+- **제어 소켓** `opld.sock`(0600, 인증 없음, 루트 전용)은 `GET /v1/status`, `POST /v1/init|join|leave`만 있는 따로 된
+  axum 라우터다(`crates/opld/src/control.rs:95-132`). `orbivisorctl cluster init|join|leave`가 쓴다.
+
+### 7.2 REST 구조와 OpenAPI
+
+- 모두 `/api/v1` 아래다(`crates/opl-api/src/lib.rs:406-407`). `api()` 함수 하나가 utoipa-axum의
+  `OpenApiRouter::routes(routes!(…))`를 이어 붙여 **라우터와 OpenAPI 문서를 같은 정의에서** 만든다
+  (`lib.rs:150-381`).
+- 주요 묶음: `/auth/*`(로그인·2FA·OIDC), `/users`, `/tokens`, `/realms`, `/remotes`, `/nodes`, `/cluster`, `/health`,
+  `/settings`, `/storage-pools`, `/volumes`, `/networks`, `/security-groups`, `/vms`(동작·마이그레이션·콘솔·복제),
+  `/snapshots`, `/backups`, `/backup-jobs`, `/vm-imports`, `/images`, `/tasks`, `/watch`, `/audit`, 지표·알림·알림 대상,
+  HA 그룹·검사·배치, Ceph, `/folders`, `/access-roles`, `/groups`, `/grants`, `/permissions/*`.
+- `GET /api/v1/openapi.json`은 인증 없이 열려 있다(`lib.rs:394-400`). 보안 방식은 Bearer 토큰과 쿠키 `opl_session`.
+- 웹의 타입은 `pnpm gen:api`가 `cargo run -p opl-api --bin opl-api-openapi`로 문서를 뽑고 openapi-typescript로
+  `web/src/api/schema.d.ts`를 만든다(CI가 차이를 검사).
+
+**미들웨어 순서**(바깥부터): `proxy::layer`(신뢰하는 프록시의 `X-Forwarded-*`, CORS) → `revision::layer` → 맞은
+경로에만 `audit::layer`, `authz_routes::layer`(`lib.rs:385-411`).
+
+```mermaid
+sequenceDiagram
+  participant B as 브라우저/CLI
+  participant P as proxy·revision 층
+  participant Z as authz_routes 층
+  participant H as 핸들러
+  participant C as Cluster(Raft)
+  B->>P: HTTPS 요청 (쿠키 또는 Bearer)
+  P->>P: X-Forwarded-*, CORS, Min-Revision 기다리기
+  P->>Z: 통과
+  Z->>Z: 인증(세션·토큰·2FA 대기 상태), CSRF(Origin)
+  Z->>Z: ROUTES 표의 규칙으로 권한 확인 (없는 규칙은 403)
+  Z->>H: Principal 넘김
+  H->>H: 검증, 할당량 미리 확인, require_feature
+  alt 쓰기
+    H->>C: create/update_spec/delete → 리더(§3.7)
+  else 읽기
+    H->>C: 로컬 저장소 읽기 → 권한으로 거르기
+  end
+  H-->>B: JSON + Orbivisor-Revision (감사 층이 쓰기를 기록)
+```
+
+### 7.3 watch와 WebSocket
+
+SSE는 없다. WebSocket 둘이다.
+
+- `GET /watch?kinds=…&since=<revision>`: 커밋된 변경(`Put`, `Deleted`, `Reset`)을 19종에 대해 흘린다. 사용자·토큰은
+  해시가 있어 빠진다(`crates/opl-api/src/watch.rs:23-69`). `since`가 만료면 업그레이드 전에 409 `expired`, 도중이면
+  `{"type":"error","code":"expired|lagged|closed"}`를 보내고 닫는다. 클라이언트는 목록을 다시 읽는다.
+- 사건마다 권한으로 거른다. 보이던 객체가 안 보이게 되면 가짜 `deleted`를, 구독자의 권한이 바뀌면 `permissions`를
+  보내고 닫는다(`watch.rs:86-91,160-174`).
+- 웹은 `web/src/api/LiveProvider.tsx`가 watch 하나로 TanStack Query 캐시를 갱신한다.
+- 콘솔은 §6.5.
+
+### 7.4 인증
+
+| 방식 | 요점 | 인용 |
+|---|---|---|
+| 로컬 사용자 | argon2id(blocking 스레드). 없는 사용자도 가짜 해시로 확인해 시간 차이를 없앰 | `crates/opl-api/src/auth.rs:108-143` |
+| LDAP 영역 | ldap3 + rustls. 디렉터리 그룹을 역할로, 맞는 게 없으면 403 `no_role` | `users.rs:251-322` |
+| OIDC | code flow + PKCE S256 + nonce. 로그인 상태는 클러스터 CA 키에서 HKDF로 뽑은 키로 서명한 쿠키라 어느 노드든 콜백을 받음. RS256·ES256 | `oidc_login.rs:1-210` |
+| API 토큰 | `opl_<uuid>_<secret>`, SHA-256만 저장, 상수 시간 비교. 선택 `scope`(권한 × 대상)로 주인 권한과 교집합 | `auth.rs:155-176,591-611`, `crates/opl-types/src/auth.rs:142-150` |
+| 2단계 인증 | TOTP(SHA-1), 복구 코드 10개(SHA-256), 패스키(직접 쓴 최소 WebAuthn 검증기, attestation none). 대기 세션 300초. 역할·영역별 강제, OIDC 사용자는 제외. **API 토큰은 2FA를 건너뜀** | `two_factor.rs`, `webauthn.rs:1-8`, `auth.rs:795` |
+| 세션 | 쿠키 `opl_session`(HttpOnly, SameSite=Strict, Secure), 12시간. 모든 노드가 `shared-sessions`를 알리면 Raft `Session`(쿠키의 SHA-256이 이름)에, 아니면 노드 메모리에. 사용자마다 32개, 마지막 사용은 60초에 한 번 씀. 비밀번호를 바꾸면 `session_epoch`가 올라 모든 노드의 세션이 끝남 | `auth.rs:28-38,356-541,634-639` |
+
+- **CSRF.** 쿠키 요청은 `Origin`이 `Host`와 같거나 허용한 `web_origins`여야 한다(아니면 403 `cross_origin`). CSRF 토큰은
+  없다(`auth.rs:329-344,692-718`).
+- **로그인 제한.** 노드 메모리. (사용자, IP)는 연속 5번, IP는 20번 실패하면 30초부터 두 배씩 15분까지 잠그고 429와
+  `Retry-After`를 준다. IPv6는 /64로 센다(`crates/opl-api/src/limit.rs:1-25`). 2FA 실패는 노드 메모리와 Raft
+  `TwoFactorStatus` 둘에서 센다.
+
+### 7.5 권한(authz)
+
+- `authz_routes::layer`가 인증하고 `ROUTES: &[(method, template, Rule)]` 표(약 200개)에서 규칙을 찾는다. 규칙은
+  `Public`, `Handler`, `List`, `Root(권한)`, `Read(객체)`, `Object(객체, 권한)`이다. 표에 없는 경로는 403. 시험이 OpenAPI의
+  모든 경로가 표에 있는지 본다(`crates/opl-api/src/authz_routes.rs:46-67,477-516`).
+- 읽을 수 없는 객체는 404(있는지 숨김), 읽을 수는 있는데 권한이 없으면 403(`authz/mod.rs:355-370`).
+- 기본 역할 `Admin`, `Operator`, `Viewer`, `None`(grant로만 권한)에 사용자 정의 역할(`AccessRole`)·그룹·grant가 더해진다
+  (`crates/opl-types/src/auth.rs:19-28`).
+- **폴더(계획 62).** VM·네트워크·풀에 트리가 따로 있고 권한은 위 폴더에서 아래로 내려간다. 거부 규칙은 없다.
+- **권한 색인.** 설계의 이름은 `AuthzIndex`지만 코드의 타입은 `Authz`다(`crates/opl-api/src/authz/mod.rs:177-342`).
+  Folder·Grant·AccessRole·Group·User 커밋이 세대를 올리고(watch를 `now_or_never`로 기다리지 않고 읽음), 세대마다
+  `AuthzSnapshot` 하나를 만들고, 주체마다 `EffectiveIndex`를 1024개 LRU에 둔다. 색인은 `all`(전역 admin의 빠른 길),
+  `owner` 층(root, contents, folders, objects), 토큰 범위 `ceiling`으로 되어 있다(`authz/index.rs:128-196`).
+  확인은 해시 찾기 두 번이다. 비용은 §15.
+
+### 7.6 헬스 체크, VIP, 앞단 프록시
+
+- `GET /api/v1/health`(인증 없음). `?live`는 늘 200. 기본(`ready`)은 리더를 앎, 적용 지연 5초 미만, (펜싱을 쓰면) HA 리스
+  신선, `core`·`api` 실행기가 느리지 않음, 유지보수 아님, `api` 역할이면 200, 아니면 503이다. 익명에게는 `status`와
+  `failed`만 보인다(`crates/opl-api/src/health.rs:1-155`).
+- **내장 VIP(계획 46).** `[vip] addresses`/`interface`. 리더의 `VipManager`가 VIP마다 노드를 정해 Raft `VipHolder`에
+  적고, 각 노드의 `VipAgent`가 헬스 체크가 200인 동안 1초마다 3초짜리 VIP 리스를 갱신하고 끝나기 0.5초 전에 놓는다.
+  붙이기는 `ip addr add` + `arping -U -c 3`(gratuitous ARP)다(`crates/opl-api/src/vip.rs:1-40`,
+  `crates/opl-driver/src/vip.rs:1-97`). **VIP를 리더가 드는 것이 아니다**(리더는 정하기만). keepalived는 쓰지 않는다.
+- **앞단 프록시.** `[api] trusted_proxies`로 `X-Forwarded-*`를 믿는다. `orbivisorctl cluster api-endpoints -o haproxy`가
+  HAProxy 설정 줄을 낸다(`crates/oplctl/src/cli.rs:311`). 어느 노드든 API 전체를 내므로 헬스 체크로 노드를 고르면 된다.
+
+### 7.7 웹 UI를 만들고 내는 법
+
+- **스택.** React 19, Vite 8, react-router 7(지연 로딩 경로), TanStack Query 5, openapi-fetch, radix-ui/shadcn,
+  Tailwind 4, i18next, uPlot(차트), noVNC(콘솔), vitest·msw·Playwright(`web/package.json`).
+- **화면(계획 61).** 영역 여섯(홈, VM, 인프라, 보호, 활동, 설정)과 영역 안 탭, ⌘K 명령 팔레트(`web/src/layout/nav.ts:39-132`,
+  `web/src/palette/`).
+- **빌드와 내장.** `pnpm -C web build`가 `web/dist`를 만든다. opld의 `web-ui` 기능이 rust-embed로 `$OPL_WEB_DIST`
+  (`crates/opld/build.rs`가 `web/dist` 절대 경로로 정함)를 바이너리에 넣는다. 배포 빌드는 없으면 실패하고, 디버그
+  빌드는 디스크에서 읽고 없어도 된다(`crates/opld/src/web.rs:1-30`). `[web] enabled = false`면 웹을 내지 않는다
+  (`member.rs:929-934`).
+- **응답.** `assets/*`는 `public, max-age=31536000, immutable`, 그 밖(`index.html` 등)은 `no-cache` + SHA-256 강한
+  ETag(304). 모르는 경로는 `index.html`(SPA), 없는 `assets/`는 404, `/api/*`는 JSON 404, GET/HEAD 밖은 405. CSP·
+  `nosniff`·`no-referrer` 머리글(`web.rs:44-153`).
+- 웹을 따로 내려면 `packaging/portal/`(nginx, 같은 캐시 규칙)을 쓰고 클러스터 설정 `web_origins`에 그 주소를 넣는다
+  (`crates/opl-types/src/settings.rs:37`).
+- 개발 서버는 `/api`(WebSocket 포함)를 `https://localhost:8006`으로 넘긴다(`web/vite.config.ts`).
+
+---
+
+## 8. 원하는 상태와 reconciler
+
+### 8.1 spec과 status
+
+- spec은 API가 쓰는 "원하는 것", status는 노드가 쓰는 "실제"다. VM의 `spec.node`가 VM이 돌 노드다
+  (`crates/opl-types/src/vm.rs:34-105`). status에는 `phase`(Stopped, Starting, Running, Stopping, Failed, Migrating),
+  `node`, `pid`, `last_error`, `hardware`(돌고 있는 하드웨어와 미뤄진 변경), `migration`, `replication`, `ha` 등이 있다
+  (`vm.rs:845-1117`).
+- VM status를 쓰는 곳이 여럿이다: reconciler(기본), Task 실행기(snapshot, schedule_error), 리더(rule_violations,
+  last_recovery), hotplug Task(hardware), 복제 Task(replication). 모두 `update_status_checked`(revision을 비교하는
+  `UpdateStatusIf`)로 쓰고 남의 필드는 보존한다(`crates/opl-reconciler/src/worker.rs:1910-1965`).
+- `spec.node`를 쓰는 곳: 시작할 때 API의 스케줄러(`crates/opl-api/src/vms.rs:379,1762`), 마이그레이션 커밋
+  (`tasks/migrate.rs:808`), HA 복구(`ha.rs:1268,1510`).
+
+### 8.2 reconciler: Raft 상태에서 QEMU 프로세스로
+
+```mermaid
+graph TD
+  W["Raft watch<br/>(VM Put/Delete)"] --> D[Dispatcher]
+  HV["하이퍼바이저 사건<br/>(QEMU 종료, 게스트 끄기)"] --> D
+  LS["HA 리스 변화"] --> D
+  RS["30초 resync / Reset·Lagged"] --> D
+  D -->|"spec.node == 이 노드"| WK1["Worker (VM 1)"]
+  D --> WK2["Worker (VM 2)"]
+  WK1 --> QH["QemuHypervisor<br/>시작·끄기·QMP"]
+  WK1 --> ST["status 쓰기<br/>(UpdateStatusIf)"]
+```
+
+- 노드마다 `Dispatcher` 하나, 배정된 VM마다 `Worker` 태스크 하나. 같은 VM은 하나씩, 다른 VM은 동시에 처리한다
+  (`crates/opl-reconciler/src/lib.rs:1-4`, `reconciler.rs:156-167`).
+- 하이퍼바이저 사건을 먼저 구독하고 목록을 읽은 뒤 그 revision부터 watch한다(`reconciler.rs:175-294`). "내 VM"은
+  `spec.node`로만 정한다. 배정되지 않은 QEMU가 이 노드에 돌고 있으면 경고만 하고 건드리지 않는다.
+- 주기: resync 30초, ACPI 끄기 제한 60초, 오류 재시도 2초, 게스트 ping 5초, 펌웨어 동기화·게스트 정보 60초
+  (`crates/opl-reconciler/src/config.rs:13-88`).
+- **다시 시작.** 1초에서 두 배씩 60초까지, 600초에 5번 실패하면 멈춘다(`backoff.rs:21-23`). 재시작 정책 `Never`면 Failed,
+  `OnFailure`면 물러나며 다시, HA VM은 `max_restart` 뒤 리더에게 다른 노드로 옮겨 달라고 한다. 게스트가 스스로 끄면
+  `spec.power = stopped`(`worker.rs:423-468`).
+- **데몬 재시작을 견디기.** QEMU는 `-daemonize`로 뜨고, Linux에서는 `systemd-run --scope --unit=opl-vm-<id>`로 감싼다
+  (`crates/opl-driver/src/qemu.rs:407-436`). 살아 있는지는 pid 파일의 fcntl 잠금으로 본다. 시작할 때
+  `QemuHypervisor::new`가 `{run_dir}/vm/*`를 훑어 산 VM에 QMP로 다시 붙고, 죽은 데몬이 얼려 둔 파일 시스템을 녹이고,
+  죽은 VM의 런타임 디렉터리를 지운다(`qemu.rs:228-289`). reconciler를 멈춰도 VM은 계속 돈다.
+
+### 8.3 Task
+
+- `Task { op, target, node }`, `op`은 약 40가지(`crates/opl-types/src/task.rs:20-225`). status는 `state`(Pending,
+  Running, Succeeded, Failed), `error`, `progress`(단계 + 바이트)다.
+- 노드마다 `TaskRunner` 하나가 자기 노드의 Pending Task를 watch해 CAS로 Running으로 바꾸고 tokio 태스크로 돌린다
+  (`crates/opl-api/src/tasks.rs:247-325,863-898`). 크기를 정한 작업자 풀은 없다. **순서**는 대상마다의 줄
+  (`by_target`)로 맞춘다: 같은 VM·볼륨·백업·노드·Ceph의 앞 Task가 끝나야 다음이 돈다(`tasks.rs:600-664`).
+- **다시 시작해도 이어지지 않는다.** 데몬이 다시 뜰 때 Running인 Task는 "interrupted: orbivisord restarted"로 실패
+  처리한다. 노드 업그레이드(`NodeUpgrade`)만 이어간다(`tasks.rs:282-288,664-686`).
+- 제한 시간 기본 600초. 마이그레이션·백업·복원·복제·가져오기·업그레이드·비우기·내려받기·flatten·Ceph는 없음.
+- **잠금.** 클러스터 전체의 VM 잠금은 없다. 노드 로컬 `vm_lock`이 그 노드에서의 VM spec 검증·쓰기를 줄 세우고
+  (`crates/opl-api/src/state.rs:46-48`), 노드 사이 경쟁은 revision 비교(412)로 막는다. 라이브 마이그레이션 동안은
+  reconciler의 "hold"(`begin_migration`/`end_migration`)가 그 VM을 건드리지 않게 한다(`reconciler.rs:73-90`).
+- Task를 취소하는 API는 없다. 정리는 리더의 janitor(§4).
+
+### 8.4 미뤄진 변경과 핫플러그 (계획 54)
+
+- 돌고 있는 VM의 spec을 바꾸면 `vm-hotplug` Task를 만들고 그 id를 `orbivisor-task` 머리글로 준다
+  (`crates/opl-api/src/vms.rs:1007-1038,1821-1835`). 계획은 순수 함수 `hotplug::plan`이 세운다: NIC 빼기 → 디스크
+  빼기 → vCPU → 메모리 → CD 미디어 → 디스크 더하기 → NIC 더하기(`crates/opl-types/src/hotplug.rs:17-41`). 첫 실패에서
+  멈추고 spec의 디스크·NIC 목록을 되돌린다.
+- **바로 적용:** 시작할 때 정한 최대 안의 vCPU(Linux x86_64만), virtio-mem 메모리(2 MiB 단위), 미리 만든 `pcie-root-port`
+  8개에 virtio-blk 디스크·NIC 더하기와 돌면서 더한 것 빼기, CD 미디어 바꾸기(`crates/opl-qemu/src/cmdline.rs:14-279`).
+- **미뤄짐(`status.hardware.pending`)**: 재시작이 필요한 것(CPU 모델·토폴로지, 최대값, 펌웨어, 머신, cloud-init, TPM,
+  Secure Boot, 게스트 에이전트 …), 지원 안 됨, 한도, 실패(`vm.rs:953,991-1002`). 다음에 끄고 켜면 적용된다.
+- 그 밖의 디스크·NIC 변경은 409로 거부한다.
+
+---
+
+## 9. 컴퓨트
+
+### 9.1 QEMU 명령줄
+
+순수 함수 `build_cmdline`(`crates/opl-qemu/src/cmdline.rs:53-349`)이 만든다.
+
+- 늘 `-S -nodefaults -no-user-config`로 멈춘 채 띄우고 QMP `cont`로 시작한다.
+- `-machine q35|virt[,smm=on],accel=kvm|hvf|tcg`, `-cpu host`(TCG나 모델 Max면 `max`).
+- 디스크는 `-blockdev`(file, host_device, rbd 드라이버) + virtio-blk-pci 또는 SATA(ide-hd). NIC는 virtio-net-pci 또는
+  e1000e, tap(Linux) 또는 user(macOS). VXLAN 망이면 `host_mtu`.
+- VNC는 유닉스 소켓, QMP 소켓, pid 파일. QMP 클라이언트는 비동기(`crates/opl-qemu/src/qmp.rs`).
+- **하이퍼바이저 추상.** `Hypervisor` 트레이트(`crates/opl-driver/src/hypervisor.rs:156-511`)의 구현은 `QemuHypervisor`와
+  시험용 `MockHypervisor`다. KVM과 HVF는 따로 된 드라이버가 아니라 `HostProfile`의 가속기 차이다
+  (`crates/opl-qemu/src/host.rs:9-94`): Linux는 `/dev/kvm`이 열리면 KVM, 아니면 TCG, macOS는 Homebrew
+  `qemu-system-aarch64` + HVF. macOS는 개발용이다(tap·브리지·방화벽·vCPU 핫플러그·virtio-mem·Secure Boot 없음).
+
+### 9.2 펌웨어, Secure Boot, vTPM
+
+- UEFI는 OVMF(x86_64)/AAVMF(aarch64). Secure Boot는 `/etc/qemu/firmware`·`/usr/share/qemu/firmware`의 QEMU 펌웨어
+  설명으로 Microsoft 키가 든 것을 찾고 q35에 `smm=on`과 `secure=on` pflash를 쓴다(`crates/opl-qemu/src/firmware.rs:1-25`).
+- UEFI 변수 파일은 노드 로컬(`{data_dir}/vm/<id>/uefi-vars.fd`)이다. VM이 다른 노드에서 켜지면 `FirmwareFetcher`가
+  `status.firmware_node`에서 peer `UefiVars`/`TpmState`로 가져오고, 다른 노드에 사본을 미리 밀어 둔다
+  (`crates/opl-reconciler/src/firmware.rs:1-70`). 사본은 `firmware_epoch`, `firmware_copies`로 추적한다.
+- vTPM은 VM마다 swtpm 하나(`--daemon --terminate`, 따로 된 systemd scope). 상태는 `{data_dir}/vm/<id>/tpm/`, QEMU에는
+  `tpm-crb`(q35)/`tpm-tis-device`(virt)(`crates/opl-driver/src/tpm.rs:1-6`). Debian의 swtpm AppArmor 프로필에
+  `packaging/deb/apparmor/orbivisor-swtpm`을 더한다.
+
+### 9.3 게스트 에이전트와 cloud-init
+
+- QGA는 `qga.sock` virtserialport(`org.qemu.guest_agent.0`). 정보(`guest-info`, OS, 호스트 이름, 망 인터페이스, 파일
+  시스템)와 동작(ping, 끄기, fsfreeze, 비밀번호 설정)(`crates/opl-qemu/src/qga.rs:177-315`). 백업·복제 때 fsfreeze를
+  쓴다. 다른 노드의 VM이면 peer `GuestAgent` RPC.
+- cloud-init은 NoCloud. 직접 쓴 ISO9660/Joliet 쓰개로 `cidata` ISO를 만든다(genisoimage 없음). 날짜를 고정해
+  마이그레이션 양쪽이 같은 바이트를 만들고, 켤 때마다 다시 만든다(`crates/opl-qemu/src/iso9660.rs:1-140`).
+
+### 9.4 템플릿과 링크드 클론 (계획 58)
+
+링크드 클론은 템플릿에서만, 한 단계, 같은 풀 안에서 만든다(`crates/opl-api/src/tasks/clone.rs:117,357-361`).
+dir·NFS는 모든 형식, LVM-thin·ZFS·RBD는 raw만, 공유 LVM은 안 된다(`crates/opl-types/src/storage.rs:461-469`).
+`flatten`으로 부모에서 떼어낸다. 이미지 라이브러리는 §10.4.
+
+### 9.5 라이브 마이그레이션과 무중단 크기 바꾸기
+
+```mermaid
+sequenceDiagram
+  participant API as API 노드
+  participant S as 원본 노드(Task)
+  participant T as 대상 노드
+  API->>API: VmMigrate Task (spec.node 그대로)
+  S->>T: MigrateIncoming (peer gRPC)
+  T->>T: QEMU -incoming defer, 포트·NBD 포트 고르기
+  T-->>S: port, nbd_port
+  opt 로컬 디스크
+    S->>T: NBD(TLS) blockdev-mirror
+  end
+  S->>T: QEMU migrate tcp:host:port (TLS, auto-converge, pause-before-switchover)
+  S->>S: 전환
+  S->>S: Raft: spec.node = T (커밋)
+  T->>T: reconciler가 이어받아 Running
+  S->>S: 원본 QEMU 정리
+```
+
+- 마이그레이션 동안 원본 reconciler는 hold로 VM을 건드리지 않는다. `spec.node`를 커밋한 뒤에야 대상 reconciler가 그
+  VM을 자기 것으로 본다(`crates/opl-api/src/tasks/migrate.rs:1-9,808`).
+- 진행은 Task `progress`에 쓴다. 꺼진 VM의 저장소 옮기기는 없다(계획 42의 범위 밖).
+- 크기 늘리기: 블록 풀이면 저장소를 먼저 늘리고 실제 크기를 QMP `block_resize`에 준다(`crates/opl-api/src/tasks.rs:1428-1466`).
+
+---
+
+## 10. 스토리지
+
+### 10.1 풀 백엔드
+
+`Storage` 트레이트(`crates/opl-driver/src/storage.rs:71-450`)가 만들기·가져오기·지우기, 활성화(공유·배타), 스냅샷,
+크기 바꾸기, 복사·내보내기, 백업 대상·비트맵, overlay, link_clone, flatten을 정한다. `Storages`가 풀 종류에 따라
+보낸다(`storage/storages.rs:16-37`).
+
+| 백엔드(`PoolBackend`) | 공유 | 볼륨 | 스냅샷 | 메모 |
+|---|---|---|---|---|
+| Dir | 로컬 | qcow2·raw 파일 | qcow2 내부 | 백업 저장 가능 |
+| Nfs | 공유 | 〃 | 〃 | 노드마다 마운트(`PoolMounter`), 백업 저장 가능 |
+| LvmThin | 로컬 | thin LV `opl-{id}` | `-s-{tag}` LV(raw) | `crates/opl-driver/src/storage/lvm.rs:1-3` |
+| Zfs | 로컬 | sparse zvol | `@tag`(raw) | `storage/zfs.rs:1-2` |
+| Rbd | 공유 | Ceph RBD 이미지 | RBD 스냅샷(raw) | QEMU rbd 드라이버로 직접(커널 map 없음), `storage/rbd.rs:1-3` |
+| LvmShared(+iSCSI) | 공유 | thick LV, 한 노드에서 배타 활성화 | 없음 | `lvm.rs:1563-1565` |
+
+출처: `crates/opl-types/src/storage.rs:46-102`.
+
+**Ceph 자동 구성(계획 56).** apt 패키지(ceph-mon, mgr, osd, volume)를 깔고 `ceph-mon --mkfs`, `ceph-volume lvm create`를
+돈다. cephadm을 쓰지 않고 cephadm이 쓰는 디스크는 거부한다. 단계마다 다시 해도 같다
+(`crates/opl-driver/src/ceph/host.rs:1-38`). 노드 디스크·Ceph 상태는 peer `NodeDisks`/`CephStatus`로 묻는다.
+
+### 10.2 볼륨과 스냅샷
+
+볼륨은 Raft `Volume` 리소스이고, 실제 할당·지우기는 Task가 저장소 드라이버로 한다. VM 스냅샷은 `Snapshot` 리소스
+(VM마다 이름 하나)이고 예약 스냅샷은 리더의 `SnapshotScheduler`가 만든다(§4). LVM·ZFS·RBD 스냅샷은 raw가 필요하다.
+
+### 10.3 백업과 복제
+
+- **백업**은 dir·NFS 풀의 `backups/{id}/`에 디스크마다 압축 qcow2, 펌웨어 변수, 매니페스트로 둔다
+  (`crates/opl-types/src/backup.rs:1-2`). 전체 백업은 임시 스냅샷을 내보내고, **증분**은 영속 dirty bitmap(`opl-{id}`)을
+  쓴다(`crates/opl-api/src/tasks/backup.rs:24-30,392-396`). 백업 작업은 리더가 돌린다(§4).
+- **원격 복제(DR)**는 다른 클러스터로 준비된 백업을 HTTPS로 밀고 SHA-256으로 확인한다
+  (`crates/opl-api/src/tasks/replicate.rs:1-9`).
+- **로컬 디스크 복제(HA)**는 §5.7.
+- VMware 가져오기(OVA, ESXi)는 `VmImport` 리소스와 Task다([백업·복제·가져오기 안내](guide/backup.md)).
+
+### 10.4 이미지 라이브러리
+
+내장 클라우드 이미지 목록과 관리자가 더한 항목을 `(id, arch)`로 둔다(`crates/opl-types/src/image_catalog.rs:1-3`).
+내려받기는 Task(`tasks/download.rs`)다. CI의 `catalog-links`(주 1회)가 내장 링크가 살아 있는지 본다.
+
+---
+
+## 11. 네트워크
+
+### 11.1 브리지와 VLAN
+
+브리지는 관리자가 만든다(ISO 설치는 기본 경로 NIC를 `vmbr0`에 넣는다). VLAN은 `vlan_filtering`을 켠 VLAN 인식
+브리지를 쓴다(`crates/opl-types/src/network.rs:23-32`). tap은 iproute2로 만든다(`crates/opl-driver/src/net.rs:1-3`).
+노드는 자기 브리지 목록을 60초마다 다시 알리고 스케줄러는 그 망이 있는 노드에만 놓는다.
+
+### 11.2 VXLAN
+
+- 평범한 커널 장치: `oplv<vni>` 브리지 + `oplx<vni>`(`type vxlan id … local … dstport 4789`)(`net.rs:488-499`).
+- BUM 트래픽은 다른 모든 노드의 정적 목록으로 head-end 복제한다(MAC 0의 FDB 항목, `net.rs:552-593`). opld의 overlay
+  에이전트가 60초마다(바뀌면 1초 뒤) 맞춘다(`crates/opld/src/overlay.rs:1-28`). 기본 MTU 1450.
+
+### 11.3 보안 그룹(nftables)
+
+보안 그룹을 nftables **bridge 계열** 테이블 `opl_<tag>` 하나에 tap마다 체인으로 그려 `nft -f -`로 한 번에 적용한다.
+conntrack을 쓰고 원본 MAC을 확인한다(`crates/opl-driver/src/firewall.rs:1-110`). 에이전트가 60초마다 다시 맞추고
+(`crates/opld/src/firewall.rs:1-24`), 보안 그룹이 걸린 NIC가 있는 VM은 방화벽 동기화가 성공해야 켠다
+(`crates/opl-reconciler/src/firewall.rs`).
+
+### 11.4 SDN 현황
+
+**OVN, OvnSync, EVPN/BGP/FRR은 없다.** 네트워크 설계가 일부러 뺐다(`docs/superpowers/specs/2026-11-03-network-sdn-design.md`).
+VXLAN의 정적 head-end 복제는 노드 수에 비례해 BUM 트래픽이 늘므로 노드가 아주 많을 때는 한계다. 로드맵의 SDN 계획은
+아직 코드에 없다.
+
+---
+
+## 12. 지표 수집과 감시
+
+### 12.1 수집
+
+- **주기 5초**(`INTERVAL`, `MissedTickBehavior::Skip`), `work` 실행기의 태스크(`crates/opld/src/metrics/sampler.rs:26,64`).
+- **노드 9개 값**(`crates/opl-types/src/metrics.rs:172`): CPU %, 메모리 사용/전체, 디스크 읽기/쓰기 B/s, 망 받기/보내기
+  B/s, `data_dir` 파일 시스템 사용/전체. Linux에서 `/proc/stat`, `/proc/meminfo`, `/proc/diskstats`(전체 디스크만),
+  `/sys/class/net/*/statistics`(물리 장치만), `statvfs`(`crates/opld/src/metrics/host.rs:56-227`).
+- **VM 8개 값**: CPU(`/proc/<pid>/stat`을 vCPU 수로 나눔), RSS, 디스크 읽기/쓰기 B/s·IOPS(QMP `query-blockstats`, VM마다
+  1초 제한), 망 받기/보내기(tap 카운터를 게스트 쪽에서 본 방향으로)(`sampler.rs:164-366`). Running·Paused VM만.
+  cgroup이나 load average는 쓰지 않는다.
+- 틱마다 부하 요약(`LoadSummary`: 1·5분 CPU ‰, 메모리, VM 256개까지)을 리스 갱신에 실어 리더에 보낸다
+  (`sampler.rs:248-253`). 리더가 받는 지표는 이것뿐이고 배치·HA·균형에 쓴다.
+- **지표는 Raft에 쓰지 않는다**(`crates/opld/src/member.rs:772`).
+
+### 12.2 저장: 메모리와 RRD
+
+- **메모리**: 계열마다 `VecDeque` 720개(5초 × 1시간). 1시간 동안 새 점이 없는 VM 계열은 지운다
+  (`crates/opld/src/metrics/store.rs:17-105`).
+- **디스크(RRD)**: `{data_dir}/metrics/node.rrd`, `metrics/vm/{id}.rrd`, `metrics/pool/{id}.rrd`.
+
+| 단 | 간격 × 칸 | 보존 | 칸 내용 |
+|---|---|---|---|
+| Raw5s | 5초 × 720 | 1시간 | 값 하나 |
+| Min1 | 1분 × 1440 | 1일 | 평균·최대·최소 |
+| Min30 | 30분 × 336 | 1주 | 〃 |
+| Hour6 | 6시간 × 1460 | 1년 | 〃 |
+
+- 파일 형식(`crates/opld/src/metrics/rrd.rs:1-47`): 매직 `OPLRRD`, 리틀 엔디언 f32(NaN = 모름), 첫 4 KiB에 머리글 두 벌
+  (A/B를 번갈아, SHA-256 앞 8바이트), 단마다 4 KiB 정렬, 칸 = `floor(t/step) mod rows`. 크기는 VM 336 KiB, 노드
+  376 KiB, 풀 92 KiB로 고정이다(`rrd.rs:1035-1038`).
+- 60초(`[metrics] flush_secs` 60~600)마다 자료 → fdatasync → 머리글 → fdatasync 순으로 쓴다. 잃는 것은 많아야 마지막
+  간격이다. 다시 시작하면 Raw5s를 메모리로 되살린다(`crates/opld/src/metrics/history.rs:44-74,305`).
+- 지워진 VM·풀의 파일은 스캐너가 두 번 연속 후보, `read_index` 성공, 그 id의 미완료 Task 없음, 지우기 직전 다시
+  확인을 모두 만족할 때만 지운다(`history.rs:1099-1192`).
+
+### 12.3 클러스터 요약
+
+- `GET /api/v1/metrics/cluster`를 받은 **API 노드**가 직접 모은다(리더를 거치지 않음). 위트니스를 빼고, 오프라인으로
+  기록된 노드는 부르지 않고 `unreachable`로 적는다(`crates/opl-api/src/metrics_history.rs:131,362-416`).
+- peer `ReadMetricsHistory`(`Digest { top: 10 }`, 점 120개)를 노드 32개까지 동시에, 노드마다 5초 제한으로 묻는다.
+- **10초 캐시**(키 64개, 같은 요청은 한 번만 채움)(`metrics_history.rs:45-47,100-108`). 응답은 클러스터 합(CPU는 코어
+  수로 가중), 바쁜 노드 20개, VM 상위 10개(Raft에 없는 VM은 뺌), 풀 사용량(Raft `NodeStatus.pools`). VM·풀 목록은 캐시
+  뒤에 호출자의 권한으로 거른다.
+- 웹 대시보드는 1시간 범위면 5초, 그 밖은 60초마다 다시 묻는다(`web/src/charts/metrics.ts:19-21`).
+- 그 밖: 마지막 값 `/metrics/nodes`, `/nodes/{key}/metrics`, `/vms/{key}/metrics`(peer `ReadMetrics`), 기록
+  `/nodes|vms|storage-pools/{key}/metrics/history`.
+
+```mermaid
+graph LR
+  subgraph each["각 노드 (work 실행기)"]
+    P["/proc, /sys, statvfs"] --> S[MetricsSampler 5초]
+    Q["QMP query-blockstats<br/>tap 카운터"] --> S
+    S --> MEM["메모리 1시간<br/>(720점)"]
+    S --> HW["HistoryWriter<br/>60초마다 flush"]
+    HW --> RRD["metrics/*.rrd<br/>5초·1분·30분·6시간"]
+    S -->|"LoadSummary<br/>(리스 갱신에 실음)"| LEAD["리더: 배치·HA·균형"]
+    S --> AE["AlertEngine<br/>노드 규칙 5초"]
+  end
+  API["API 노드"] -->|"ReadMetricsHistory<br/>fan-out 32, 5초"| RRD
+  API --> CACHE["요약 캐시 10초"]
+  CACHE --> WEB["웹 대시보드"]
+  PROM["Prometheus"] -->|"GET /api/v1/metrics<br/>노드마다"| MEM
+  RRD -->|"PushMetricsHistory<br/>VM이 옮겨 가면"| OTHER["새 주인 노드"]
+  AE --> NT["알림: SMTP·webhook"]
+```
+
+### 12.4 VM이 옮겨 갈 때의 기록
+
+마이그레이션이 직접 부르지 않는다. 기록 스캐너가 10분마다(VM 사건 뒤면 30초 뒤에) 자기 `vm/*.rrd` 가운데 주인
+(`status.node`, 없으면 `spec.node`)이 다른 노드인 것을 찾아 peer `PushMetricsHistory`(16바이트 VM UUID + 파일, 1 MiB
+까지)로 보낸다. 받는 쪽은 칸마다 합친다. 최근 30초 안에 점이 있거나 아직 쓰지 않은 점이 있으면 건너뛴다. 한 번에 30초,
+동시 8개, 회차당 120초. 거부되면 600초부터 두 배씩 하루까지 물러난다(`history.rs:57-68,713-781,1136-1252`).
+
+### 12.5 알림과 통지
+
+- **규칙 종류**: `node_metric`, `vm_metric`, `pool_usage`, `node_offline`, `vm_failed`, `task_failed`, `ha_recovery`,
+  `backup_job_failed`(`crates/opl-types/src/alert.rs:256-286`).
+- **누가 평가하나.** 모든 비위트니스 노드에서 5초 틱 + watch로 돈다. 노드 규칙(지표, VM 실패, Task 실패, HA 복구, 로컬
+  풀)은 사건이 난 노드가, 공유 풀은 온라인 노드 가운데 id가 가장 작은 노드가, `node_offline`과 `backup_job_failed`만
+  리더가 한다(`crates/opl-api/src/alerts/engine.rs:1-8,548-588`).
+- **상태.** 노드 알림은 `{data_dir}/alerts/state.json`(임시 파일 → fsync → rename, Raft 아님), 리더 알림은
+  `AlertRule.status.active`(Raft, 쓰기에 성공해야 통지)(`alerts/book.rs:1-30`). `pending → firing`(`for_secs` 뒤),
+  `repeat_secs`(기본 4시간)마다 다시 알림, 조건이 60초 동안 거짓이면 해제. 노드당 활성 500개까지.
+- **통지 대상**: SMTP(lettre, starttls/tls/none)와 webhook(json, slack, teams, ntfy, gotify). 동시 4, 대상마다 1, 제한
+  10초, 재시도 30·120·600초, 대상마다 60초에 20개(넘치면 "N개 더" 하나), 큐 1000, 15분 지나면 버림
+  (`crates/opl-api/src/alerts/send.rs:400-418`). 보낸 기록은 `alerts/history.log`(4 MiB에서 돌림).
+- `/alerts`, `/alerts/history`는 peer `ReadAlerts` fan-out으로 모은다.
+
+### 12.6 Prometheus
+
+`GET /api/v1/metrics`(텍스트 형식 0.0.4)는 **노드마다** 자기 노드, 자기 VM, 자기 준비된 풀, 클러스터 게이지
+(`orbivisor_cluster_*`, `orbivisor_node_is_raft_leader`, `orbivisor_alerts_firing`)를 낸다. 설정 `prometheus.enabled`가
+꺼져 있으면 404, Node 읽기와 루트 VM 읽기 권한이 필요하다(viewer 토큰이면 됨). 5초 캐시, 15초보다 오래된 VM 점은 뺀다
+(`crates/opl-api/src/prometheus.rs:1-456`). 그래서 Prometheus는 모든 노드를 긁어야 한다.
+
+---
+
+## 13. 보안 모델
+
+| 영역 | 어떻게 | 인용·절 |
+|---|---|---|
+| 노드 간 | gRPC mTLS, 클러스터 CA, CN = 노드 UUID, 멤버만 | §6.2 |
+| QEMU 마이그레이션·NBD·복제 | QEMU TLS, 양쪽 `verify-peer` | §6.4 |
+| API | HTTPS만(평문 리스너 없음), 쿠키 Secure·HttpOnly·SameSite=Strict, Origin 검사 | §7.1, §7.4 |
+| 합류 | 한 번 쓰는 토큰(해시만 저장) + CA 지문 고정 | §3.6 |
+| 인증 | argon2id, LDAP, OIDC(PKCE), 범위 토큰, TOTP·패스키·복구 코드 | §7.4 |
+| 권한 | 경로 표의 규칙, 폴더로 내려가는 grant, 역할·그룹, 404/403로 존재 숨김, watch·콘솔 계속 다시 확인 | §7.5 |
+| 할당량 | 폴더마다 vCPU·메모리·디스크·VM 수, Raft 적용에서 최종 판정 | §3.2 |
+| 감사 로그 | 노드마다 `{data_dir}/audit/audit.log`(JSON 줄, 1초마다 fsync, 16 MiB × 8). 쓰기 요청·콘솔 열기·OIDC 콜백. `GET /audit`이 fan-out으로 모음. **Raft에 없다** | `crates/opl-api/src/audit.rs:1-470` |
+| 제어 소켓 | 0600 유닉스 소켓, 인증 없음(루트 전용) | §7.1 |
+| swtpm | AppArmor 추가 규칙 | §9.2 |
+
+**저장된 비밀은 암호화하지 않는다.** LDAP `bind_password`, OIDC `client_secret`, IPMI/Redfish 비밀번호, SMTP 비밀번호,
+webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평문으로 있다. API 응답·watch·`Debug` 출력에서만 숨긴다
+(`crates/opl-types/src/` 아래 `realm.rs:59,111`, `fence.rs:92,123`, `alert.rs:764`, `two_factor.rs:133`, `cluster.rs:23`).
+보호는 0700 데이터 디렉터리뿐이다(계획 62 설계도 그렇게 적었다). 그래서 노드 하나의 `cluster.redb`나 백업을 얻으면
+클러스터 CA로 노드 인증서를 만들 수 있다. 복구 코드와 API 토큰·세션·합류 토큰은 해시, 패스키는 공개 키만, cloud-init
+비밀번호는 SHA-512 crypt 해시(`crates/opl-types/src/crypt.rs:1-2`)로 둔다.
+
+인증서 자동 갱신·CA 교체는 없다. 노드 인증서는 824일, CA는 20년이다.
+
+---
+
+## 14. 버전이 섞인 클러스터와 업그레이드
+
+- 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
+  `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
+  `metrics-history`, `vip` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+- 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
+  준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
+  (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.
+- 배경 루프도 같은 방식으로 옛 동작으로 돌아간다: `VoterKeeper`(`voter-limit`), 관찰 노드(`observer`), 리스 기반
+  생존(`lease-liveness`, 없으면 Ping), 세션 공유(`shared-sessions`, 없으면 노드 메모리), 지표 기록 넘기기
+  (`metrics-history`).
+- **직렬화 호환.** 새 필드는 `#[serde(default, skip_serializing_if…)]`로 더해 옛 노드가 읽고 쓸 수 있게 한다
+  (`crates/opl-cluster/src/types.rs:127-148`). 옛 노드가 몰래 덮어쓰면 안 되는 변경은 새 필드 대신 **새 명령**으로
+  만들어 옛 노드가 아예 실패하게 한다(예: `UpdateStatusIf`, `types.rs:54-56`). 단일 링크 노드의 `OrbNode`는 openraft
+  `BasicNode`와 바이트가 같다(`types.rs:169-237`). 모르는 명령은 역직렬화에 실패한다.
+- **업그레이드.** APT 채널(stable, testing, enterprise)에서 패키지를 받는 `NodeUpgrade` Task가 노드를 하나씩 올린다.
+  데몬을 다시 시작해도 이어지는 유일한 Task다(§8.3). 자세한 것은 [시작하기](guide/getting-started.md).
+
+---
+
+## 15. 규모 특성
+
+잰 값은 설계 문서와 사용 안내에 기록된 것이고 이 문서를 쓰며 다시 재지 않았다. 규모 시험 코드는
+`crates/opl-cluster/tests/scale.rs`(`--features scale-it`, 기본 노드 300, CI 100)다.
+
+**노드 수에 따른 Raft (계획 48 뒤, 개발 Mac Apple Silicon 10코어, 시험 빌드, 메모리 저장소, 투표 5 + 대기 learner 2 + 관찰
+노드)** — [클러스터 운영 안내](guide/cluster.md#대규모-클러스터), [설계 §14](superpowers/specs/2026-11-11-availability-scale-design.md):
+
+| 항목 | 기준(`scale.rs`) | 노드 30 | 노드 100 | 노드 300 |
+|---|---|---|---|---|
+| 쓰기 지연 p99(리더에서 하나씩) | < 50 ms(CI 200 ms) | 1.7~1.8 ms | 4.2~4.4 ms | 11.7~12.6 ms |
+| 관찰 노드 뒤처짐 p99 | < 500 ms | 0.8~0.85 ms | 2.3~2.4 ms | 6.8~7.1 ms |
+| 리더의 초당 RPC | < 35 + 노드당 4.5 | 93 | 254~255 | 352~355 |
+| 노드 하나 추가 | < 2초 | 1 ms | 3 ms | 5~8 ms |
+| 투표 멤버 장애 뒤 관찰 노드가 다시 붙기까지 | < 5초 | 0.2초 | 1.2초 | 1.2초 |
+| 리더 장애 뒤 새 리더 | < 5초 | 3.2초 | 3.3~3.6초 | 3.4~3.6초 |
+
+- 계획 47(관찰 노드 없이 나머지가 learner)에서는 노드 300의 리더 RPC가 1,320(그 3분의 2가 learner 하트비트), 쓰기 p99가
+  31~33 ms였다.
+- 실제 디스크: 투표 멤버 다섯을 파일 저장소에 두면 같은 컴퓨터에서 노드 6이 p99 64 ms, 노드 300이 67 ms였다(다섯이 디스크
+  하나에서 fsync를 줄 섬). 실제 노드의 쓰기 지연에는 그 노드 디스크의 fsync가 더해진다.
+- 리더 장애 3~4초는 openraft 0.9.25의 리더 리스와 선거 제한 시간에서 온다. 설계 §5의 목표 3초 미만보다 길어 시험 기준을
+  5초로 두었다(설계와 다름).
+
+**VM 1만 개에서 Raft 적용 비용**(`crates/opl-cluster/src/folders.rs:1054-1136`의 `quota_apply_cost_with_10k_vms`, 디스크·NIC
+하나씩, 폴더 20개 중 10개에 할당량; [폴더 설계](superpowers/specs/2026-11-18-folders-permissions-quotas-2fa-design.md),
+[폴더 안내](guide/folders.md)):
+
+| VM 쓰기 하나의 apply | 배포 빌드 | 디버그 빌드 |
+|---|---|---|
+| 할당량 없는 폴더에 만들기(배타성 훑기) | 17.8 ms | 145 ms |
+| 할당량 폴더에 만들기 | 27.5 ms | 221 ms |
+| 할당량 폴더에서 노드 바꾸기(훑기 건너뜀) | 17.1 ms | 146 ms |
+
+배타성 훑기가 VM 수에 비례하므로 VM이 아주 많은 클러스터에서는 이것이 VM 쓰기 처리량의 상한이 된다(적용은 하나씩이라
+17.8 ms면 계산상 초당 약 56개. 잰 값은 아니다).
+할당량이 없는 클러스터는 더하는 비용이 없다.
+
+**권한 색인 비용**(계획 62 설계의 단계 보고, 디버그 빌드): VM 1만·grant 500·폴더 200에서 색인 만들기 약 1.5 ms, 목록
+거르기 약 6 ms(시험 상한 100 ms). 전역 admin은 색인 없이 바로 통과한다.
+
+**한도.** 폴더 10,000개·깊이 16, grant 10,000개, 사용자마다 API 토큰 100개, 세션 32개, 노드당 활성 알림 500개, watch 기록
+1024 묶음, 노드 간 메시지 64 MiB, fan-out 32.
+
+---
+
+## 16. 패키지와 배포
+
+### 16.1 Debian 패키지
+
+- 패키지 `orbivisor`(amd64). 의존: qemu-system-x86, qemu-utils, ovmf, iproute2, nftables, systemd. 추천: nfs-common,
+  lvm2, ceph-common, swtpm 등. 옛 이름 `oplite`은 빈 전환 패키지다(`packaging/deb/control.in`, `oplite.control.in`).
+- 빌드: `pnpm -C web build && OPL_VERSION=… cargo build --release -p opld --features web-ui -p oplctl`
+  (`packaging/deb/build-deb.sh:6`).
+
+| 설치 경로 | 내용 |
+|---|---|
+| `/usr/bin/orbivisord`, `/usr/bin/orbivisorctl` | 바이너리(+ `opld`, `oplctl` 심볼릭 링크) |
+| `/usr/lib/systemd/system/opld.service` | 유닛(+ 별칭 `orbivisord.service`) |
+| `/usr/share/orbivisor/opld.toml.example` | 설정 예시 |
+| `/etc/apparmor.d/abstractions/orbivisor-swtpm` | swtpm 규칙(conffile) |
+| `/etc/opl/opld.toml` | 노드 설정(설치기나 관리자가 씀) |
+| `/var/lib/opl`, `/run/opl` | 데이터, 런타임(§2.3) |
+
+**유닛 `opld.service`**: `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`, `WatchdogSignal=SIGKILL`,
+`Restart=on-failure`, `RestartSec=2`, `KillMode=process`(VM을 죽이지 않음), `TimeoutStopSec=15min`,
+`LimitNOFILE=1048576`, `ConditionPathExists=/etc/opl/opld.toml`, `StartLimitIntervalSec=60`, `StartLimitBurst=10`,
+`ExecStopPost=… --release-vips`(`packaging/deb/opld.service:6-29`).
+
+VM은 `opl-vm-<id>.scope`, swtpm은 `opl-tpm-<id>.scope`로 데몬과 따로 돈다(§8.2).
+
+postinst는 swtpm AppArmor include를 더하고 첫 설치면 서비스를 켜고 시작한다(chroot 안이면 켜기만). postrm은
+`/var/lib/opl`, `/etc/opl`을 지우지 않는다.
+
+### 16.2 설치 ISO
+
+Debian 13(trixie) netinst(SHA-256 고정, `packaging/iso/debian.lock`)에 preseed를 더한다. LVM 분할, ssh 서버, 일반 사용자
+없음. `late_command`의 `orbivisor-setup.sh`가 CD의 패키지 설치 → 기본 경로 NIC를 `vmbr0` 브리지로 → 호스트 이름과
+주소로 `/etc/opl/opld.toml` 쓰기 → 콘솔 안내(`/etc/issue.d`)를 한다(`packaging/iso/preseed/orbivisor-setup.sh`).
+`orbivisor-ci-init.service`는 무인 설치 시험 전용이다(cloud-init과 무관). 첫 부팅 뒤 `orbivisorctl cluster init` 또는
+`join`으로 클러스터를 만든다.
+
+### 16.3 저장소와 웹 포털
+
+APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packaging/repo/build-repo.sh`). `packaging/portal/`은
+`web/dist`를 nginx로 따로 내는 이미지다(§7.7).
+
+---
+
+## 17. 시험 전략
+
+- **단위 시험.** `cargo test --workspace`. 순수 함수(명령줄 만들기, 핫플러그 계획, 권한 평가, 스케줄러, RRD)를 따로 시험하고,
+  `MockHypervisor`와 메모리 저장소로 여러 노드 클러스터를 한 프로세스에 띄운다. insta 스냅샷, proptest(권한 색인이 참조
+  구현과 같은지).
+- **실제 시험(기능으로 켬).** 실제 QEMU·커널·저장소가 필요해 기본으로는 돌지 않는다.
+
+| 기능 | 크레이트 | 시험하는 것 |
+|---|---|---|
+| `qemu-it`, `net-it`, `vtpm-it` | opl-qemu, opl-driver, opl-reconciler, opld | 실제 QEMU, 브리지·tap, swtpm |
+| `storage-it`, `nfs-it`, `lvm-it`, `zfs-it`, `rbd-it`, `lvm-shared-it`, `ceph-it` | opl-driver, opl-api, opld | 저장소 백엔드, Ceph 자동 구성 |
+| `migration-it`, `ha-it`(+ `opl-peer/fault-it`) | opld | 실제 프로세스 마이그레이션, HA·펜싱, 장애 주입 |
+| `install-media-it`, `templates-it` | opld | 설치 매체·cloud-init, 템플릿 |
+| `web-it`(= `qemu-it` + `web-ui`) | opld | 웹 내장과 실제 VM |
+| `starve-it` | opld | 실행기를 일부러 막고 Raft·리스가 견디는지(§2.2) |
+| `metrics-it` | opld | 지표 수집·기록 |
+| `scale-it` | opl-cluster | 수백 노드 규모(§15) |
+| `ldap-it` | opl-api | 실제 LDAP 서버 |
+| `catalog-it` | oplctl | 이미지 목록의 링크 |
+
+출처: 각 `Cargo.toml`의 `[features]`, [개발 안내](guide/development.md).
+
+- **웹.** vitest(+msw), 타입 검사, lint, `gen:api` 차이 검사, Playwright e2e.
+- **패키지.** `packaging/tests/*.sh`(shellcheck 포함), deb 설치·APT 저장소 시험(debian:13 컨테이너), ISO.
+
+**CI** (`.github/workflows/`):
+
+| 작업 | 도는 것 |
+|---|---|
+| `ci.yml` `check`(Ubuntu, macOS) | fmt, clippy `--all-features -D warnings`, `cargo test --workspace`, `starve-it`, `metrics-it`, `scale-it`(노드 100, p99 기준 200 ms), `storage-it`(Linux) |
+| `ci.yml` `web` | pnpm typecheck·lint·test·gen:api 차이·audit·build |
+| `ci.yml` `shell`, `package` | 패키지 스크립트, deb 빌드와 설치 |
+| `ci.yml` `linux-kvm`(root, 80분) | qemu·net·web·nfs·lvm·zfs·rbd·lvm-shared·migration·ha·vtpm 실제 시험, `OPL_TEST_SYSTEMD=1` |
+| `ci.yml` `ceph`, `install-media`, `ldap`, `deny` | Ceph, 설치 매체·템플릿·vTPM 실제 게스트, LDAP, cargo-deny |
+| `iso.yml` `iso-e2e` | BIOS·UEFI 설치 ISO 끝까지(주 1회, 태그, `ci-probe/**` 가지) |
+| `catalog.yml` `catalog-links` | 이미지 목록 링크(주 1회) |
+
+`ci-probe/**` 가지에 밀어 GitHub 러너에서만 되는 시험(KVM·LDAP·패키지)을 따로 돌리는 것이 "GitHub 탐침"이다. 일반 시험은
+배포 서버에서도 돈다.
+
+---
+
+## 18. 용어와 참고 문서
+
+| 용어 | 뜻 |
+|---|---|
+| 투표 멤버(voter) | Raft 정족수에 드는 노드. 3/5/7 |
+| learner | 로그를 받지만 투표하지 않는 Raft 멤버. 대기 learner 2개를 둔다 |
+| 관찰 노드(observer) | Raft 밖에서 투표 멤버를 따라가는 노드(계획 48) |
+| 위트니스(witness) | 투표만 하고 VM·API·리더 일을 하지 않는 노드 |
+| 리스(lease) | 노드가 리더에게 주기적으로 갱신하는 생존 표시. Raft 로그에 쓰지 않는다 |
+| 펜싱(fencing) | 죽었다고 본 노드의 VM을 확실히 끄는 것(watchdog 재부팅, 전원 끄기) |
+| `fence_after` / `recover_after` | 리스가 끊기고 VM을 끄기까지 / 리더가 다른 노드에서 켜기까지 |
+| spec / status | 원하는 상태 / 실제 상태 |
+| revision | 리소스를 마지막으로 바꾼 Raft 로그 index |
+| reconciler | 노드에서 VM을 spec에 맞추는 루프 |
+| Task | 노드에서 도는 오래 걸리는 작업(Raft 리소스) |
+| 제어 레인 / 벌크 레인 | 노드 간 연결 둘: Raft·리스(`core`) / 콘솔·마이그레이션·읽기(`work`) |
+| 기능 문자열 | 노드가 아는 기능 이름. 모두가 알아야 새 기능을 씀(409 `cluster_upgrading`) |
+
+**사용 안내**: [시작하기](guide/getting-started.md), [가상 머신](guide/vms.md), [스토리지](guide/storage.md),
+[네트워크](guide/network.md), [고가용성](guide/ha.md), [클러스터 운영](guide/cluster.md),
+[백업·복제·가져오기](guide/backup.md), [웹 화면](guide/web-ui.md), [접근과 보안](guide/access.md),
+[폴더와 권한](guide/folders.md), [구독과 텔레메트리](guide/subscription.md), [개발](guide/development.md).
+
+**설계 문서**(코드와 다르면 코드가 맞다):
+
+- 핵심: [노드 코어](superpowers/specs/2026-10-20-opl-node-core-design.md),
+  [견고성](superpowers/specs/2026-10-27-robustness-design.md),
+  [API·보안](superpowers/specs/2026-10-28-api-security-design.md)
+- HA·규모: [HA·펜싱·위트니스](superpowers/specs/2026-11-02-ha-fencing-witness-design.md)(기본값이 옛것),
+  [제어부 가용성과 대규모 클러스터(계획 45~56)](superpowers/specs/2026-11-11-availability-scale-design.md)
+- 마이그레이션·저장소: [라이브 마이그레이션](superpowers/specs/2026-10-30-live-migration-design.md),
+  [로컬 디스크 마이그레이션](superpowers/specs/2026-11-10-storage-migration-design.md),
+  [공유 스토리지 NFS](superpowers/specs/2026-10-28-shared-storage-nfs-design.md)와 이후 LVM-thin·ZFS·Ceph·iSCSI 설계,
+  [백업](superpowers/specs/2026-11-04-backup-design.md), [증분 백업](superpowers/specs/2026-11-09-incremental-backup-design.md)
+- 네트워크: [네트워크·SDN](superpowers/specs/2026-11-03-network-sdn-design.md)
+- 지표: [실시간 지표(계획 44)](superpowers/specs/2026-11-11-monitoring-ui-design.md),
+  [지표 기록·대시보드·알림·Prometheus(계획 60)](superpowers/specs/2026-11-18-dashboard-metrics-notifications-design.md)
+- 화면·권한: [웹 UI](superpowers/specs/2026-10-23-web-ui-design.md),
+  [UI·UX 개편(계획 61)](superpowers/specs/2026-11-18-ui-ux-redesign-design.md),
+  [폴더·권한·할당량·2FA(계획 62)](superpowers/specs/2026-11-18-folders-permissions-quotas-2fa-design.md)
+- 컴퓨트: [설치 매체·cloud-init](superpowers/specs/2026-11-17-install-media-cloud-init-design.md),
+  [템플릿·링크드 클론](superpowers/specs/2026-11-17-templates-linked-clones-design.md),
+  [vTPM·Secure Boot·게스트 에이전트](superpowers/specs/2026-11-18-vtpm-secure-boot-guest-agent-design.md)
+- 배포: [설치·업데이트·구독](superpowers/specs/2026-11-05-install-update-subscription-design.md)
+- 전체 목록: [docs/index.md](index.md)
+
+### 설계 문서와 코드가 다른 곳(요약)
+
+| 설계 문서 | 문서의 말 | 코드 |
+|---|---|---|
+| HA·펜싱·위트니스 §3.1·§7 | `fence_after` 30초, watchdog 30초, 복구 약 65초. IPMI·HA 그룹·failback 범위 밖 | 기본 `fast` 10/10초, 복구 22초. 계획 50·51에서 모두 구현 |
+| 노드 코어 §8 | 리더가 2초마다 ping, 10초면 오프라인 | 리스 기반(계획 47). Ping은 옛 버전과 섞였을 때만 |
+| 노드 코어 §3.1 | 클러스터 기능 수준 | 노드마다 기능 문자열 |
+| 가용성 §5 | 리더 장애 3초 미만, 오프라인 투표 멤버는 내린 뒤 올림 | 3~4초(기준 5초), `Replace` 한 번 |
+| 가용성 §8.3 | 균형 문턱 0.15 | 정수 퍼센트 15(`settings.rs:131`) |
+| 라이브 마이그레이션 | 인증서가 바뀌면 TLS 파일을 다시 씀, 로컬 디스크 안 옮김, 주소는 `members().addr` | 시작마다 다시 씀, 계획 42가 NBD로 옮김, 지금 쓰는 링크 |
+| 네트워크·SDN | 돌고 있는 VM의 NIC 더하기·빼기 막음 | 계획 54부터 핫플러그 |
+| API·보안(계획 13) | 세션은 노드마다, `X-Forwarded-For`·감사 로그·버전 섞임 범위 밖, 콘솔은 권한 바뀌어도 안 닫힘 | Raft 세션 공유, 모두 구현, 콘솔 2초마다 다시 확인 |
+| 폴더(계획 62) | `AuthzIndex`가 `cluster.follow`, ApiToken도 세대를 올림 | `Authz`가 `cluster.watch`, ApiToken은 안 올림 |
+| 지표(계획 60) | 노드 RRD 약 380 KiB, 풀 약 90 KiB, `fallocate`, 넘친 알림은 하나로 합침 | 376 KiB, 92 KiB, NaN 파일 쓰고 rename, 넘치면 추적 멈추고 `overflow` 표시 |
+
+---
+
+## 19. 확인하지 못한 것
+
+- **잰 값.** §15의 숫자(쓰기 p99, 적용 비용, 권한 색인 비용, 리더 장애 시간)와 §5.5의 HA 복구 잰 값은 설계 문서와 사용
+  안내에 기록된 것을 옮겼다. 이 문서를 쓰며 다시 재지 않았다(cargo를 돌리지 않았다).
+- **openraft 기본값.** 스냅샷 5000개·남기는 로그 1000개는 opld가 정하지 않아 openraft 0.9.25의 기본값이라고 판단한 것이다.
+  저장소 안 코드에는 그 숫자가 없다.
+- **Proxmox VE·vSphere 비교**(§1.1)는 일반적인 공개 정보이고 이 저장소에서 확인하지 않았다.
+- **확인하지 않은 세부**: `ha_reserve`(HA 예약 용량) 적용 코드, `guest_watch`의 실행 상수, 균형기의 동시 이동 한도(설계는
+  2), 리더가 받은 `LoadSummary`를 어디에 얼마나 두는지, API 요청 본문 크기 제한(`DefaultBodyLimit`를 찾지 못함 — axum
+  기본값을 쓰는 것으로 보인다).
+- **없는 것으로 확인한 것**(찾았지만 없음): `.proto` 파일, OVN/OvnSync/EVPN, 리더의 CPU 기준선 계산, 구독 보고 루프,
+  SSE, 평문 HTTP 리스너, 시리얼 콘솔, Task 취소, 데몬 재시작 뒤 Task 이어가기(업그레이드 제외), 클러스터 전체 VM 잠금,
+  인증서 자동 갱신과 CA 교체, 저장 비밀 암호화, keepalived, 대량 전송용 망, 꺼진 VM의 저장소 옮기기.
