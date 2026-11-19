@@ -1247,7 +1247,7 @@ webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평
 ### 16.1 Debian 패키지
 
 - 패키지 `orbivisor`(amd64). 의존: qemu-system-x86, qemu-utils, ovmf, iproute2, nftables, systemd. 추천: nfs-common,
-  lvm2, ceph-common, swtpm 등. 옛 이름 `oplite`은 빈 전환 패키지다(`packaging/deb/control.in`, `oplite.control.in`).
+  lvm2, ceph-common, swtpm 등. 옛 제품 이름의 패키지는 빈 전환 패키지로 남아 있다(`packaging/deb/`).
 - 빌드: `pnpm -C web build && OPL_VERSION=… cargo build --release -p opld --features web-ui -p oplctl`
   (`packaging/deb/build-deb.sh:6`).
 
