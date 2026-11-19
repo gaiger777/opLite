@@ -2012,8 +2012,8 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * 디렉터리 풀의 `shared`(다른 백엔드는 400)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수 있다)를
-         *     바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
+         * 디렉터리 풀의 `shared`(다른 백엔드는 400, 루트 `cluster.admin`)와 백업 풀 표시 `backups`(dir·NFS 풀만 켤 수
+         *     있다)를 바꾼다. 둘 다 없으면 400이다. 로컬 → 공유는 언제나 된다. 공유 → 로컬은 풀의 볼륨을 쓰는 VM이 그
          *     볼륨을 만든 노드가 아닌 노드에 있거나 끝나지 않은 마이그레이션 Task가 있으면 409 `pool_in_use`다.
          *     백업이 남은 풀의 `backups`를 끄거나 `shared`를 바꾸면 409 `pool_in_use`다. 같은 값이면 쓰지 않고
          *     그대로 200이다.
