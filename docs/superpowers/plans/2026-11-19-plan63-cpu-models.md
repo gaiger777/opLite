@@ -99,7 +99,7 @@
 - 리베이스: main의 `f83a523`(schema.d.ts)·아키텍처 문서 두 커밋 위로 옮겼다(브랜치에 cherry-pick해 둔 둘은 같은 패치라 빠짐).
 - svc01 일반 시험: 처음(`5ef203c`)에 clippy·시험 빌드가 rustc 1.99의 "queries overflow the depth limit"로 실패 — opl-api 시험 공용 `start_runner_config`의 `TaskRunner::spawn` future 타입이 깊어 그 async 본문의 레이아웃 셈이 쿼리 깊이 한도를 넘음(이 Mac의 rustc는 괜찮음). 그 future를 `Box::pin`으로 나눠(`66a54bc`, 시험 코드만) fmt·clippy·시험 3537개·starve·규모 100·저장소 시험 모두 통과.
 - GitHub 탐침: 스테이지 3·4·5마다 미리 돌림(위 기록) → 마지막 `5ef203c`에서 linux-kvm(`cpu-it` 넷: 숨긴 플래그가 모든 vCPU에서 꺼짐, `enforce` 거절, 받는 쪽은 기록 그대로 둘)·install-media(실제 게스트에서 `avx512vbmi`를 숨기고 `/proc/cpuinfo`에서 사라짐·껐다 켜면 돌아옴)·브라우저 E2E 둘·ceph·ldap·package·iso-e2e(bios·uefi)·catalog-links 모두 통과. 중간의 linux-kvm 실패 두 번은 ZFS 연결 복제(알려진 udev 경쟁)와 Ceph apt 미러 15분 제한이었다.
-- 배포: (배포 후 채움)
+- **테스트 VM 배포(svc01·svc02):** main `1361773`을 svc01에서 릴리스로 빌드(웹 index-DXVGJBv_.js 포함)해 svc02 → svc01 순서로 바이너리만 바꿨다. orbivisord sha256 `b80020a6…573`, orbivisorctl `6faa6a78…5a9`. 두 노드 헬스 `ok`, 두 voter online, 두 노드 모두 기능 `cpu-models`를 알리고 같은 카탈로그 해시(`43928290…`, QEMU 8.2.2, TCG)를 낸다. `/cpu/baseline`은 `off`(aarch64, cluster VM 0), `/cpu/models`가 답한다. svc02의 test-vm은 QEMU PID 916 그대로 실행 중이고 `/vms/test-vm/cpu`가 spec `host` → TCG에서 `max`로 풀리며 보류 바뀜은 없다(업그레이드 뒤 거짓 "껐다 켜기" 없음). 저널에 경고·오류 없음.
 
 ## 다음 계획으로 넘길 사항
 
