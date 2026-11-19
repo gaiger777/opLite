@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -427,6 +428,14 @@ pub trait Hypervisor: Send + Sync {
     /// 이 노드 QEMU의 CPU 모델·플래그(계획 63 §6). QEMU를 VM과 같은 머신·가속기로 `-S`로 한 번 띄워 QMP로 묻고 끈다
     /// (보통 1초 안쪽, 30초 제한). 카탈로그와 호스트 CPU(KVM의 `full host`)를 돌려준다.
     async fn cpu_catalog(&self) -> Result<CpuProbe, DriverError>;
+
+    /// 실행 중인 VM의 vCPU마다(켜진 것 모두, QMP `query-cpus-fast` 순서) CPU 속성 `names`의 값(QMP `qom-get`)을 읽는다
+    /// (계획 63: 숨긴 플래그가 실제로 꺼졌는지). 불이 아닌 속성과 없는 속성은 빠진다.
+    async fn vcpu_props(
+        &self,
+        id: Uuid,
+        names: &[String],
+    ) -> Result<Vec<BTreeMap<String, bool>>, DriverError>;
 
     /// 핫플러그 배치로 켠 VM의 켜진 vCPU 수를 `from`에서 `to`로 바꾸고 닿은 수를 돌려준다. `cpu`는 켤 때의 CPU
     /// 모양(소켓·상한으로 vCPU `i`의 자리를 정한다)이다. 늘리기(같은 수 포함)는 켤 때 수부터 `to` 아래의 빈 자리에

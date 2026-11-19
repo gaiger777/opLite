@@ -174,6 +174,7 @@ fn spec(disk: PathBuf) -> VmRuntimeSpec {
         freeze_fs: false,
         firmware_epoch: 0,
         keep_tpm: false,
+        cpu_resolved: None,
     }
 }
 

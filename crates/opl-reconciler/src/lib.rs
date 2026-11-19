@@ -5,6 +5,7 @@
 
 mod backoff;
 mod config;
+pub mod cpu;
 mod firewall;
 mod firmware;
 mod guest;

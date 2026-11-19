@@ -10,6 +10,7 @@ use std::time::Duration;
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_driver::AddOutcome;
+use opl_reconciler::cpu::CpuContext;
 use opl_reconciler::resolve::{runtime_disk, runtime_medium, runtime_nic};
 use opl_types::hotplug::{self, Step};
 use opl_types::node::{NodeHotplug, NodeSpec};
@@ -155,7 +156,8 @@ fn skipped(
         .collect()
 }
 
-/// Task 끝의 보류를 쓴다: 지금 셈한 것에 실패한 것(`failed`)과 게스트가 아직 내려 주지 않은 장치를 더한다.
+/// Task 끝의 보류를 쓴다: 지금 셈한 것에 실패한 것(`failed`)과 게스트가 아직 내려 주지 않은 장치를 더한다. 보류 `cpu`는
+/// 이 노드의 지금 해석(기준·숨김 목록, 계획 63)으로 셈해 검사 루프가 쓴 것을 지우지 않는다.
 async fn write_pending(
     ctx: &Ctx,
     id: Uuid,
@@ -163,10 +165,20 @@ async fn write_pending(
     caps: NodeHotplug,
     failed: &[PendingChange],
 ) -> Result<RunningHardware, Stop> {
+    let cpu = CpuContext::load(&ctx.cluster, ctx.config.node).map_err(|e| e.to_string())?;
     update_hardware(ctx, id, qemu, |hw, vm| {
         let mut failed = failed.to_vec();
         failed.extend(still_unplugging(hw));
-        hw.pending = hotplug::pending(vm.id, &vm.name, &vm.spec, hw, caps, &failed);
+        let wanted = cpu.as_ref().and_then(|c| c.wanted(&vm.spec.cpu));
+        hw.pending = hotplug::pending(
+            vm.id,
+            &vm.name,
+            &vm.spec,
+            hw,
+            caps,
+            &failed,
+            wanted.as_ref(),
+        );
     })
     .await
 }

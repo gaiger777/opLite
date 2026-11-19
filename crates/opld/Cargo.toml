@@ -80,6 +80,11 @@ starve-it = []
 # 주기를, `alert_tick_ms`로 경보 평가 간격과 해제 대기를 줄인다. QEMU 없이 재시작 뒤 기록과 경보 발생·해제를 보는 시험이
 # 쓴다(qemu-it에도 같은 고리가 있다).
 metrics-it = []
+# 실제 QEMU로 CPU 모델·플래그를 보는 E2E(계획 63): 노드 탐침의 카탈로그, 숨긴 플래그가 vCPU에서 꺼졌는지(QMP `qom-get`),
+# 실행 중 붙인 vCPU와 마이그레이션 받는 쪽도 같은지, 노드가 못 주는 플래그를 켜면 `enforce`로 켜지 않는지. 제어 소켓에
+# 시험 고리(`/v1/test/vm-cpu`·`cpu-mask`·`vcpu-props`)를 더한다. qemu-it의 준비물이 필요하고, x86_64 시험은 KVM이 있는
+# Linux(CI `linux-kvm`), 이 Mac(aarch64)은 TCG로 명명 모델과 `sve` 숨기기만 본다.
+cpu-it = ["qemu-it"]
 
 [dependencies]
 anyhow.workspace = true

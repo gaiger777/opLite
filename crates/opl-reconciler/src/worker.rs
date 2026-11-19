@@ -4,6 +4,7 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use opl_types::cpu::ResolvedCpu;
 use opl_types::firmware::{
     TpmSource, firmware_copy_nodes, move_firmware_node, tpm_is_current, tpm_source,
     tpm_unavailable, vars_source,
@@ -25,6 +26,7 @@ use uuid::Uuid;
 
 use crate::backoff::{FailureTracker, Next};
 use crate::config::ReconcilerConfig;
+use crate::cpu::{CpuContext, CpuRefusal};
 use crate::firmware::FirmwareCopy;
 use crate::ha::ArmError;
 use crate::reconciler::{Held, Restores};
@@ -1218,10 +1220,27 @@ impl Worker {
         }
         // 실패해도 다시 쓰지 않는다.
         let restore = self.restores.lock().unwrap().remove(&self.id);
-        let hardware = match &restore {
+        let mut hardware = match &restore {
             Some(tag) => self.snapshot_hardware(vm, tag),
             None => self.hardware_at_start(vm),
         };
+        // 새로 켜면 지금 기준·숨김 목록으로 CPU를 해석해 기록한다(계획 63). 메모리 스냅샷은 담을 때의 CPU 그대로다.
+        if restore.is_none() {
+            match self.cpu_at_start(vm) {
+                Ok(resolved) => hardware.cpu_resolved = resolved,
+                Err(CpuRefusal::Waiting(reason)) => {
+                    tracing::warn!(vm = %self.id, reason = %reason, "CPU not ready; not starting");
+                    self.deactivate_disks(vm).await;
+                    self.backoff = Some((Instant::now() + self.config.retry_interval, reason));
+                    return Ok(Start::NotStarted);
+                }
+                Err(CpuRefusal::Cannot(reason)) => {
+                    self.deactivate_disks(vm).await;
+                    self.power_off = Some(Some(format!("failed to start: {reason}")));
+                    return Ok(Start::NotStarted);
+                }
+            }
+        }
         apply_hardware(&mut spec, &hardware, &vm.spec);
         // 켜기 규칙으로 얻은 TPM 상태로 켠다(스냅샷 하드웨어에만 TPM이 있으면 이 노드의 상태 그대로).
         if spec.tpm.is_some() {
@@ -1349,6 +1368,14 @@ impl Worker {
             .and_then(|n| n.status.hotplug)
             .unwrap_or_default();
         RunningHardware::at_start(vm.id, &vm.name, &vm.spec, caps, all_have(&nodes, HOTPLUG)).0
+    }
+
+    /// 이 노드에서 켤 VM의 CPU(계획 63): 클러스터 기준·숨김 목록·이 노드의 카탈로그로 해석하고 켤 수 있는지 본다.
+    /// 문맥이 없으면(업그레이드 중, 노드의 아키텍처·가속기를 모름) None이다(명령줄이 모델만 편다, 기록은 지금과 같다).
+    fn cpu_at_start(&self, vm: &Vm) -> Result<Option<ResolvedCpu>, CpuRefusal> {
+        let ctx = CpuContext::load(&self.cluster, self.config.node)
+            .map_err(|e| CpuRefusal::Waiting(format!("cannot read the CPU settings: {e}")))?;
+        ctx.map(|ctx| ctx.start(&vm.spec.cpu)).transpose()
     }
 
     /// 메모리 스냅샷 `tag`(스냅샷 id)를 불러오며 켤 하드웨어: 메모리를 담을 때 도는 QEMU와 같은 장치여야 하므로

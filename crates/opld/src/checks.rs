@@ -633,7 +633,8 @@ fn not_responding(dir: &Path) -> String {
     format!("{} is not responding", dir.display())
 }
 
-/// 한 회차: 이 노드의 모든 검사를 동시에 돌려 리스 갱신에 싣고, 바뀌었으면 노드 상태에 쓴다. 결과는 이름 순이다.
+/// 한 회차: 이 노드의 모든 검사를 동시에 돌려 리스 갱신에 싣고, 바뀌었으면 노드 상태에 쓴다. 이 노드에서 도는 VM의
+/// 보류 `cpu`도 다시 셈한다. 결과는 이름 순이다.
 pub async fn run_once(state: &mut State) -> Vec<CheckReport> {
     if let Some(watch) = &mut state.cpu {
         watch.poll().await;
@@ -736,6 +737,10 @@ pub async fn run_once(state: &mut State) -> Vec<CheckReport> {
     state.cluster.set_lease_checks(reports.clone());
     state.notify_bonds().await;
     state.write_status(&reports).await;
+    // 기준·숨김 목록·카탈로그가 바뀌었으면 이 노드에서 도는 VM의 보류 `cpu`를 다시 쓴다(계획 63, 달라졌을 때만).
+    if let Err(e) = opl_reconciler::cpu::refresh_pending(&state.cluster, state.node).await {
+        tracing::warn!(error = %e, "cannot refresh the pending CPU changes");
+    }
     reports
 }
 

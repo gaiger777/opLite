@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::cloud_init::CloudInitSeed;
+use crate::cpu::ResolvedCpu;
 use crate::vm::{CpuSpec, DiskBus, Firmware, MacAddr, MachineType, NicModel};
 
 /// 하이퍼바이저 드라이버가 받는, 이름 참조가 모두 풀린 VM 정의.
@@ -54,6 +55,10 @@ pub struct VmRuntimeSpec {
     /// 지금 상태일 수 있다).
     #[serde(default)]
     pub keep_tpm: bool,
+    /// 켤 때 해석한 CPU(계획 63, `RunningHardware.cpu_resolved`). 명령줄의 `-cpu`가 이것이다. 없으면(계획 63 전 기록,
+    /// 클러스터 업그레이드 중) `cpu.model`을 이 노드의 가속기로 펴되 기준·숨김 목록 없이 켠다(`host`·`max`는 지금과 같다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_resolved: Option<ResolvedCpu>,
 }
 
 /// 켤 때의 TPM 상태 규칙(계획 59)

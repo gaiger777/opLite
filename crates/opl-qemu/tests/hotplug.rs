@@ -72,6 +72,7 @@ fn spec(host: &HostProfile, id: Uuid, disk: PathBuf, layout: HotplugLayout) -> V
         freeze_fs: false,
         firmware_epoch: 0,
         keep_tpm: false,
+        cpu_resolved: None,
     }
 }
 

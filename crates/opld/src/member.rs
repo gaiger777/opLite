@@ -432,6 +432,8 @@ impl Member {
                     return Err(e.into());
                 }
             };
+        #[cfg(feature = "cpu-it")]
+        crate::cpu_hook::set_member(Arc::downgrade(&cluster), &hv);
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;

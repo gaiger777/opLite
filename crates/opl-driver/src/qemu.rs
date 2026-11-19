@@ -1444,6 +1444,43 @@ impl Hypervisor for QemuHypervisor {
         }
     }
 
+    async fn vcpu_props(
+        &self,
+        id: Uuid,
+        names: &[String],
+    ) -> Result<Vec<std::collections::BTreeMap<String, bool>>, DriverError> {
+        let handle = self.running_handle(id)?;
+        let r =
+            tokio::time::timeout(QMP_TIMEOUT, handle.qmp.execute("query-cpus-fast", None)).await;
+        let cpus = flatten(r, "QMP query-cpus-fast")?;
+        let mut out = Vec::new();
+        for cpu in cpus.as_array().into_iter().flatten() {
+            let Some(path) = cpu["qom-path"].as_str() else {
+                continue;
+            };
+            let mut props = std::collections::BTreeMap::new();
+            for name in names {
+                let args = json!({ "path": path, "property": name });
+                let r =
+                    tokio::time::timeout(QMP_TIMEOUT, handle.qmp.execute("qom-get", Some(args)))
+                        .await;
+                // 없는 속성은 QMP 오류다(빼고 넘어간다). 시간 초과는 오류다.
+                match r {
+                    Err(_) => return Err(DriverError::Timeout("QMP qom-get")),
+                    Ok(Ok(v)) => {
+                        if let Some(b) = v.as_bool() {
+                            props.insert(name.clone(), b);
+                        }
+                    }
+                    Ok(Err(QmpError::Command { .. })) => {}
+                    Ok(Err(e)) => return Err(e.into()),
+                }
+            }
+            out.push(props);
+        }
+        Ok(out)
+    }
+
     async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError> {
         let handle = self.running_handle(id)?;
         let r = tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_version()).await;
@@ -4234,6 +4271,7 @@ mod tests {
             freeze_fs: false,
             firmware_epoch: 0,
             keep_tpm: false,
+            cpu_resolved: None,
         }
     }
 

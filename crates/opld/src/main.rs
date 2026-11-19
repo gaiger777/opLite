@@ -16,6 +16,8 @@ mod checks;
 mod config;
 mod control;
 mod cpu;
+#[cfg(feature = "cpu-it")]
+mod cpu_hook;
 #[cfg(feature = "ha-it")]
 mod fault;
 mod fence_watch;

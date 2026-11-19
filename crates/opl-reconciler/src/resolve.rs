@@ -341,6 +341,7 @@ async fn resolve(
         firmware_epoch: vm.status.firmware_epoch,
         // 새로 켤 때 작업자가 이 노드의 TPM 파일이 지금 것인지 보고 정한다(리뷰 2).
         keep_tpm: false,
+        cpu_resolved: None,
     };
     set_boot_order(&mut spec);
     if let Some(hw) = hardware {
@@ -363,7 +364,7 @@ fn set_boot_order(spec: &mut VmRuntimeSpec) {
     }
 }
 
-/// 런타임 정의를 실행 중 하드웨어 기록의 모양(켤 때의 cpu·메모리·펌웨어·머신과 핫플러그 배치, CD-ROM 부팅 순서,
+/// 런타임 정의를 실행 중 하드웨어 기록의 모양(켤 때의 cpu와 해석한 CPU·메모리·펌웨어·머신과 핫플러그 배치, CD-ROM 부팅 순서,
 /// cloud-init 씨앗 드라이브 유무, TPM·Secure Boot·게스트 에이전트 채널)으로 덮는다. 스펙은 실행 중에 바뀌어도(다음 재시작 때 적용) 마이그레이션 대상은 원본
 /// QEMU와 같은 장치로 켜야 한다. CD 매체는 [`runtime_spec`]이 기록의 것으로 이미 풀었다(드라이브 수가 다르면 부팅
 /// 순서는 덮지 않는다).
@@ -372,6 +373,8 @@ fn set_boot_order(spec: &mut VmRuntimeSpec) {
 /// 채널은 실행 중에 바꿀 수 없는 `ha.guest_watch`가 정한 그대로라 `vm`의 채널로 본다(`hotplug::devices_match`와 같은 규칙).
 pub fn apply_hardware(spec: &mut VmRuntimeSpec, hw: &RunningHardware, vm: &VmSpec) {
     spec.cpu = hw.cpu.clone();
+    // 켤 때 해석한 CPU(계획 63): 받는 쪽은 이 노드의 기준·숨김 목록이 달라도 원본과 같은 `-cpu`로 켠다.
+    spec.cpu_resolved = hw.cpu_resolved.clone();
     spec.memory_mib = hw.memory_mib;
     spec.firmware = hw.firmware;
     spec.machine = hw.machine;

@@ -1,14 +1,13 @@
 use std::path::Path;
 
+use opl_types::cpu::{self, CpuError, ResolvedCpu};
 use opl_types::runtime::{
     DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RbdTarget, VmRuntimeSpec,
 };
-use opl_types::vm::{
-    Arch, CpuModel, DiskBus, Firmware, MAX_CDROMS, MachineType, NicModel, Q35_SATA_PORTS,
-};
+use opl_types::vm::{Arch, DiskBus, Firmware, MAX_CDROMS, MachineType, NicModel, Q35_SATA_PORTS};
 use thiserror::Error;
 
-use crate::host::{Accel, HostProfile};
+use crate::host::HostProfile;
 use crate::paths::RuntimePaths;
 
 /// 핫플러그 루트 포트를 모아 두는 `pcie.0` 슬롯. 멀티펑션 8개(`0x1e.0`~`0x1e.7`)라 자동 주소를 밀지 않는다.
@@ -45,6 +44,8 @@ pub enum CmdlineError {
         "this node has no Secure Boot firmware (a QEMU firmware descriptor with secure-boot and enrolled-keys)"
     )]
     NoSecureBootFirmware,
+    #[error(transparent)]
+    Cpu(#[from] CpuError),
 }
 
 /// QEMU 인자 목록(바이너리 제외)을 만든다. 부수 효과가 없는 순수 함수다.
@@ -77,12 +78,13 @@ pub fn build_cmdline(
         "-machine",
         format!("{machine}{smm_opt},accel={}", host.accel.as_str()),
     );
-    // 계획 63 스테이지 3 전: 그 밖의 모델은 기능 게이트와 API 검증에 막혀 오지 않는다(오면 `host`처럼 켠다).
-    let cpu = match (&spec.cpu.model, host.accel) {
-        (CpuModel::Max, _) | (_, Accel::Tcg) => "max",
-        _ => "host",
+    // 켤 때 해석한 CPU(계획 63). 없으면(옛 기록) 모델만 이 노드의 가속기로 편다(`host`는 TCG면 `max`).
+    let resolved = match &spec.cpu_resolved {
+        Some(r) => r.clone(),
+        None => cpu::resolve(&spec.cpu, host.arch, host.accel.into(), None, &[], None)?,
     };
-    a.opt("-cpu", cpu.to_string());
+    let cpu = resolved.model.as_str();
+    a.opt("-cpu", cpu_option(&resolved));
     let layout = spec.hotplug.as_ref();
     let boot_vcpus = spec.cpu.vcpus();
     // vCPU 자리: 상한이 켤 때 수보다 크면 소켓마다 `max / sockets`개 코어 자리를 두고 앞에서부터 켠다.
@@ -349,6 +351,19 @@ pub fn build_cmdline(
     Ok(a.0)
 }
 
+/// `-cpu`의 값: `<model>[,enforce][,<flag>=on|off]…`(플래그는 이름순). 플래그는 그 CPU 형식의 전역 속성이라 실행 중
+/// 붙이는 vCPU(`<model>-x86_64-cpu`)에도 똑같이 걸린다.
+pub fn cpu_option(cpu: &ResolvedCpu) -> String {
+    let mut s = cpu.model.clone();
+    if cpu.enforce {
+        s.push_str(",enforce");
+    }
+    for (name, on) in &cpu.flags {
+        s.push_str(&format!(",{name}={}", if *on { "on" } else { "off" }));
+    }
+    s
+}
+
 /// 라이브 마이그레이션을 받을 QEMU의 인자. [`build_cmdline`]과 같은 장치에 `-incoming defer`를 더한다.
 /// QEMU는 QMP `migrate-incoming`을 받을 때까지 기다리고, 받은 뒤에도 `-S`라 `cont` 전까지 멈춰 있다.
 pub fn build_incoming_cmdline(
@@ -508,13 +523,15 @@ fn esc_path(p: &Path) -> String {
 mod tests {
     use std::path::PathBuf;
 
+    use opl_types::cpu::CpuSource;
     use opl_types::runtime::{
         DiskKind, RbdTarget, RuntimeCdrom, RuntimeDisk, RuntimeMedium, RuntimeNic,
     };
-    use opl_types::vm::CpuSpec;
+    use opl_types::vm::{CpuModel, CpuSpec};
     use uuid::Uuid;
 
     use super::*;
+    use crate::host::Accel;
 
     #[test]
     fn replica_receiver_has_no_guest_devices() {
@@ -616,6 +633,7 @@ mod tests {
             freeze_fs: false,
             firmware_epoch: 0,
             keep_tpm: false,
+            cpu_resolved: None,
         }
     }
 
@@ -739,6 +757,106 @@ mod tests {
         let i = args.iter().position(|a| a == "-cpu").unwrap();
         assert_eq!(args[i + 1], "max");
         assert!(args.contains(&"q35,accel=tcg".to_string()));
+    }
+
+    fn cpu_arg(args: &[String]) -> &str {
+        let i = args.iter().position(|a| a == "-cpu").unwrap();
+        &args[i + 1]
+    }
+
+    fn resolved(model: &str, flags: &[(&str, bool)], enforce: bool) -> Option<ResolvedCpu> {
+        Some(ResolvedCpu {
+            model: model.into(),
+            flags: flags.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            enforce,
+            source: CpuSource::Spec,
+        })
+    }
+
+    /// 켤 때 해석한 CPU(계획 63)가 `-cpu`가 된다: 명명 모델·수준에는 `enforce`, 플래그는 이름순 `=on|off`.
+    #[test]
+    fn the_resolved_cpu_is_the_cpu_option() {
+        let mut spec = x86_spec();
+        spec.cpu_resolved = resolved("Icelake-Server-v7", &[("avx512vbmi", false)], true);
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert_eq!(cpu_arg(&args), "Icelake-Server-v7,enforce,avx512vbmi=off");
+        // `host`에 숨김(KVM)
+        spec.cpu_resolved = resolved("host", &[("avx512vbmi", false)], false);
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert_eq!(cpu_arg(&args), "host,avx512vbmi=off");
+        // TCG의 `host`는 `max`로 해석해 둔다(명령줄은 기록을 그대로 쓴다).
+        spec.cpu_resolved = resolved("max", &[("avx512vbmi", false)], false);
+        let tcg = HostProfile {
+            accel: Accel::Tcg,
+            ..x86_host()
+        };
+        let args = build_cmdline(&spec, &tcg, &paths()).unwrap();
+        assert_eq!(cpu_arg(&args), "max,avx512vbmi=off");
+        // 수준
+        let level: CpuModel = "x86-64-v2-aes".parse().unwrap();
+        let r = cpu::resolve(
+            &CpuSpec {
+                model: level,
+                ..spec.cpu.clone()
+            },
+            Arch::X86_64,
+            cpu::Accel::Kvm,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        spec.cpu_resolved = Some(r);
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert_eq!(
+            cpu_arg(&args),
+            "qemu64-v1,enforce,aes=on,pni=on,popcnt=on,sse4.1=on,sse4.2=on,ssse3=on"
+        );
+        // aarch64
+        let mut mac = mac_spec();
+        mac.cpu_resolved = resolved("max", &[("sve", false)], false);
+        let args = build_cmdline(&mac, &mac_host(), &paths()).unwrap();
+        assert_eq!(cpu_arg(&args), "max,sve=off");
+    }
+
+    /// 해석이 없으면(계획 63 전 기록) 모델만 이 노드의 가속기로 편다: `host`·`max`는 지금과 같고 명명 모델은 `enforce`다.
+    #[test]
+    fn without_a_resolution_the_model_is_expanded_here() {
+        let mut spec = x86_spec();
+        assert_eq!(
+            cpu_arg(&build_cmdline(&spec, &x86_host(), &paths()).unwrap()),
+            "host"
+        );
+        spec.cpu.model = CpuModel::Max;
+        assert_eq!(
+            cpu_arg(&build_cmdline(&spec, &x86_host(), &paths()).unwrap()),
+            "max"
+        );
+        spec.cpu.model = "Skylake-Server-v5".parse().unwrap();
+        spec.cpu.flags = vec!["-hle".parse().unwrap()];
+        assert_eq!(
+            cpu_arg(&build_cmdline(&spec, &x86_host(), &paths()).unwrap()),
+            "Skylake-Server-v5,enforce,hle=off"
+        );
+        // 수준은 aarch64에서 켤 수 없다.
+        let mut mac = mac_spec();
+        mac.cpu.model = "x86-64-v3".parse().unwrap();
+        assert!(matches!(
+            build_cmdline(&mac, &mac_host(), &paths()).unwrap_err(),
+            CmdlineError::Cpu(_)
+        ));
+    }
+
+    /// 실행 중 붙인 vCPU(받는 쪽 명령줄)는 해석한 모델의 CPU 형식이다.
+    #[test]
+    fn hotplugged_vcpus_use_the_resolved_model() {
+        let mut spec = hotplug_spec();
+        spec.cpu_resolved = resolved("Icelake-Server-v7", &[("avx512vbmi", false)], true);
+        let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        assert!(args.contains(
+            &"Icelake-Server-v7-x86_64-cpu,id=cpu2,socket-id=0,core-id=2,thread-id=0".to_string()
+        ));
+        assert!(!args.iter().any(|a| a.starts_with("host-x86_64-cpu")));
     }
 
     #[test]

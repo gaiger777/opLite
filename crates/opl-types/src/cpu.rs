@@ -433,7 +433,9 @@ fn expand(
             let flags = l.flags().iter().map(|f| (f.to_string(), true)).collect();
             (LEVEL_BASE_MODEL.into(), flags, true)
         }
-        CpuModel::Named(n) => (n.clone(), BTreeMap::new(), true),
+        // aarch64 QEMU의 CPU에는 `enforce` 속성이 없다(`-cpu neoverse-n1,enforce`는 켜기 오류). 명명 모델의 기능은
+        // 가속기가 바꾸지 않는다(TCG만 켠다).
+        CpuModel::Named(n) => (n.clone(), BTreeMap::new(), arch == Arch::X86_64),
     })
 }
 
@@ -1258,7 +1260,8 @@ fn flag_diff(from: &BTreeMap<String, bool>, to: &BTreeMap<String, bool>) -> Vec<
 
 /// 실행 중 VM의 보류 `cpu`(순수). 스펙의 토폴로지(소켓)·모델·플래그가 켤 때의 기록(`hw.cpu`)과 다르면 그것이다.
 /// 같아도 지금 해석(`wanted`, 노드 검사 루프가 지금 기준·숨김 목록으로 셈함)이 켤 때 해석(`hw.cpu_resolved`)과 다르면
-/// 보류다(기준·숨김 목록이 바뀜). 기록이나 `wanted`가 없으면(계획 63 전 기록, 핫플러그 Task) 스펙만 견준다. 이유는
+/// 보류다(기준·숨김 목록이 바뀜). `wanted`가 없으면(해석 문맥이 없는 핫플러그 계획) 스펙만 견준다. 켤 때 해석이 없는
+/// 계획 63 전 기록은 `host`·`max`를 플래그 없이 편 것으로 본다. 이유는
 /// 늘 `Restart`(= 전원 껐다 켜기)이고 설명은 바뀐 것과 [`POWER_CYCLE`]이다.
 pub fn pending_change(
     spec: &CpuSpec,
@@ -1286,8 +1289,22 @@ pub fn pending_change(
             detail: Some(format!("{}; {POWER_CYCLE}", what.join(", "))),
         });
     }
-    let (Some(now), Some(want)) = (hw.cpu_resolved.as_ref(), wanted) else {
-        return None;
+    let want = wanted?;
+    // 계획 63 전 기록(해석 없음)은 `host`·`max`를 이 노드의 가속기로 편 것(플래그·enforce 없음)으로 켰다. 같은 노드의
+    // `wanted`가 같은 모델로 폈으므로 그 이름을 쓴다(숨김 목록을 더하면 옛 VM도 보류가 생긴다).
+    let legacy;
+    let now = match &hw.cpu_resolved {
+        Some(now) => now,
+        None if hw.cpu.model.is_host_or_max() && hw.cpu.flags.is_empty() => {
+            legacy = ResolvedCpu {
+                model: want.model.clone(),
+                flags: BTreeMap::new(),
+                enforce: false,
+                source: CpuSource::Spec,
+            };
+            &legacy
+        }
+        None => return None,
     };
     if now.same_cpu(want) {
         return None;
@@ -1773,6 +1790,17 @@ mod tests {
                 arch: Arch::Aarch64
             })
         );
+        // aarch64 QEMU에는 `enforce`가 없다.
+        let arm = resolve(
+            &cpu("neoverse-n1", &["-pauth"]),
+            Arch::Aarch64,
+            Accel::Tcg,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!((arm.model.as_str(), arm.enforce), ("neoverse-n1", false));
         // 카탈로그가 없으면 숨김 목록을 모두 끈다.
         let none = resolve(
             &cpu("host", &[]),
@@ -2279,12 +2307,29 @@ mod tests {
             p.detail.unwrap(),
             format!("avx512vbmi=default; {POWER_CYCLE}")
         );
-        // 계획 63 전 기록(해석 없음)은 스펙만 견준다.
+        // 계획 63 전 기록(해석 없음)은 `host`를 플래그 없이 편 것이다: 같은 해석이면 없고, 숨김 목록이 더해지면 보류다.
         let legacy = hw_for(&cpu("host", &[]), None);
+        let host = ResolvedCpu {
+            model: "host".into(),
+            flags: BTreeMap::new(),
+            enforce: false,
+            source: CpuSource::Spec,
+        };
         assert_eq!(
-            pending_change(&cpu("host", &[]), &legacy, Some(&want)),
+            pending_change(&cpu("host", &[]), &legacy, Some(&host)),
             None
         );
+        assert_eq!(pending_change(&cpu("host", &[]), &legacy, None), None);
+        let masked = ResolvedCpu {
+            flags: map(&[("avx512vbmi", false)]),
+            ..host.clone()
+        };
+        let p = pending_change(&cpu("host", &[]), &legacy, Some(&masked)).unwrap();
+        assert_eq!(
+            (p.running.as_str(), p.wanted.as_str()),
+            ("host", "host -avx512vbmi")
+        );
+        assert_eq!(p.detail.unwrap(), format!("-avx512vbmi; {POWER_CYCLE}"));
         let p = pending_change(&cpu("max", &[]), &legacy, None).unwrap();
         assert_eq!(p.detail.unwrap(), format!("host → max; {POWER_CYCLE}"));
     }

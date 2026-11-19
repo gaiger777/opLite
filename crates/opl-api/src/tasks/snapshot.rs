@@ -1152,6 +1152,7 @@ mod tests {
             freeze_fs: false,
             firmware_epoch: 0,
             keep_tpm: false,
+            cpu_resolved: None,
         };
         hv.start(&vm, None).await.unwrap();
         hv.pause(id).await.unwrap();

@@ -8,6 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::cloud_init;
+use crate::cpu::ResolvedCpu;
 use crate::node::{HOTPLUG, Node, NodeHotplug};
 use crate::runtime::{HOTPLUG_PORTS, HotplugLayout};
 use crate::vm::{
@@ -227,7 +228,7 @@ pub fn plan(
     let mut steps: Vec<Step> = nics.removed.iter().map(|&i| Step::RemoveNic(i)).collect();
     steps.extend(disks.removed.iter().map(|&i| Step::RemoveDisk(i)));
     let mut pending = Vec::new();
-    changes(id, name, spec, hw, caps, &mut steps, &mut pending);
+    changes(id, name, spec, hw, caps, None, &mut steps, &mut pending);
     steps.extend(
         spec.cdroms
             .iter()
@@ -283,7 +284,16 @@ pub fn plan_resources(
     caps: NodeHotplug,
 ) -> Plan {
     let mut plan = Plan::default();
-    changes(id, name, spec, hw, caps, &mut plan.steps, &mut plan.pending);
+    changes(
+        id,
+        name,
+        spec,
+        hw,
+        caps,
+        None,
+        &mut plan.steps,
+        &mut plan.pending,
+    );
     plan
 }
 
@@ -307,6 +317,8 @@ pub fn device_name(hw: &RunningHardware, device: &str) -> String {
 }
 
 /// 핫플러그 Task 끝에 쓸 보류 목록: 지금 셈한 보류에 실패한 항목(`failed`)을 같은 `field` 자리에 덮어 더한다.
+/// `wanted`는 VM이 도는 노드에서 지금 스펙을 해석한 CPU다(계획 63, 기준·숨김 목록). 있으면 그것이 켤 때 해석과 다를 때의
+/// 보류 `cpu`도 남긴다(없으면 검사 루프가 쓴 보류를 지운다).
 pub fn pending(
     id: Uuid,
     name: &str,
@@ -314,10 +326,11 @@ pub fn pending(
     hw: &RunningHardware,
     caps: NodeHotplug,
     failed: &[PendingChange],
+    wanted: Option<&ResolvedCpu>,
 ) -> Vec<PendingChange> {
     let mut steps = Vec::new();
     let mut out = Vec::new();
-    changes(id, name, spec, hw, caps, &mut steps, &mut out);
+    changes(id, name, spec, hw, caps, wanted, &mut steps, &mut out);
     for f in failed {
         match out.iter_mut().find(|p| p.field == f.field) {
             Some(p) => *p = f.clone(),
@@ -513,16 +526,18 @@ fn device_changes<T>(
 }
 
 /// vCPU·메모리·펌웨어·머신·CD-ROM 부팅 순서·cloud-init: 바로 할 단계는 `steps`에, 못 하는 것은 `pending`에 더한다.
+#[allow(clippy::too_many_arguments)]
 fn changes(
     id: Uuid,
     name: &str,
     spec: &VmSpec,
     hw: &RunningHardware,
     caps: NodeHotplug,
+    wanted: Option<&ResolvedCpu>,
     steps: &mut Vec<Step>,
     pending: &mut Vec<PendingChange>,
 ) {
-    cpu_changes(spec, hw, caps, steps, pending);
+    cpu_changes(spec, hw, caps, wanted, steps, pending);
     memory_changes(spec, hw, caps, steps, pending);
     if spec.firmware != hw.firmware {
         pending.push(change(
@@ -623,11 +638,12 @@ fn cpu_changes(
     spec: &VmSpec,
     hw: &RunningHardware,
     caps: NodeHotplug,
+    wanted: Option<&ResolvedCpu>,
     steps: &mut Vec<Step>,
     pending: &mut Vec<PendingChange>,
 ) {
-    // 토폴로지·모델·플래그(계획 63)는 켤 때만 정해진다.
-    if let Some(p) = crate::cpu::pending_change(&spec.cpu, hw, None) {
+    // 토폴로지·모델·플래그(계획 63)와 해석(기준·숨김 목록)은 켤 때만 정해진다.
+    if let Some(p) = crate::cpu::pending_change(&spec.cpu, hw, wanted) {
         pending.push(p);
         return;
     }
@@ -1401,13 +1417,13 @@ mod tests {
             reason: PendingReason::Failed,
             detail: Some("the guest did not release vCPU 3 within 60s".into()),
         };
-        let out = pending(VM, "web", &s, &hw, ALL, std::slice::from_ref(&failed));
+        let out = pending(VM, "web", &s, &hw, ALL, std::slice::from_ref(&failed), None);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].field, "firmware");
         assert_eq!(out[1], failed);
         // 셈한 항목과 같은 field면 그 자리를 덮는다.
         s.cpu.cores = 12;
-        let out = pending(VM, "web", &s, &hw, ALL, std::slice::from_ref(&failed));
+        let out = pending(VM, "web", &s, &hw, ALL, std::slice::from_ref(&failed), None);
         assert_eq!(
             reasons(&out),
             [
@@ -1415,7 +1431,31 @@ mod tests {
                 ("firmware", PendingReason::Restart)
             ]
         );
-        assert!(pending(VM, "web", &spec(), &started(&spec(), ALL), ALL, &[]).is_empty());
+        assert!(pending(VM, "web", &spec(), &started(&spec(), ALL), ALL, &[], None).is_empty());
+    }
+
+    /// 핫플러그 Task 끝의 보류는 노드의 지금 해석(`wanted`)을 받아, 기준·숨김 목록에서 온 보류 `cpu`를 지우지 않는다.
+    #[test]
+    fn pending_keeps_a_cpu_change_from_the_resolution() {
+        let mut hw = started(&spec(), ALL);
+        let now = crate::cpu::ResolvedCpu {
+            model: "host".into(),
+            flags: Default::default(),
+            enforce: false,
+            source: crate::cpu::CpuSource::Spec,
+        };
+        hw.cpu_resolved = Some(now.clone());
+        let mut masked = now.clone();
+        masked.flags.insert("avx512vbmi".into(), false);
+        let out = pending(VM, "web", &spec(), &hw, ALL, &[], Some(&masked));
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            (out[0].field.as_str(), out[0].wanted.as_str()),
+            ("cpu", "host -avx512vbmi")
+        );
+        assert!(pending(VM, "web", &spec(), &hw, ALL, &[], Some(&now)).is_empty());
+        // 문맥이 없으면 스펙만 견준다.
+        assert!(pending(VM, "web", &spec(), &hw, ALL, &[], None).is_empty());
     }
 
     /// 게스트가 아직 내려 주지 않은 장치는 스펙의 같은 장치와 같지 않은 것으로 본다: 떼기를 먼저 마저 하고 스펙에
@@ -1645,6 +1685,7 @@ mod tests {
             &hw,
             ALL,
             &[],
+            None,
         );
         assert!(!hw.matches_boot());
     }
@@ -1827,7 +1868,10 @@ mod tests {
             }]
         );
         // Task 끝의 보류에도 남는다.
-        assert_eq!(super::pending(VM, "web", &want, &hw, ALL, &[]), pending);
+        assert_eq!(
+            super::pending(VM, "web", &want, &hw, ALL, &[], None),
+            pending
+        );
         // 부팅 순서만 다르면 마이그레이션 대상이 기록의 값으로 켠다.
         assert!(devices_match(&want, &hw));
     }
@@ -1972,7 +2016,10 @@ mod tests {
             detail: None,
         }];
         assert_eq!(only_pending(plan_fn(&changed, &hw)), want);
-        assert_eq!(super::pending(VM, "web", &changed, &hw, ALL, &[]), want);
+        assert_eq!(
+            super::pending(VM, "web", &changed, &hw, ALL, &[], None),
+            want
+        );
         assert_eq!(plan_resources(VM, "web", &changed, &hw, ALL).pending, want);
 
         // 켬·끔

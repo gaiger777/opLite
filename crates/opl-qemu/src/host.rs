@@ -22,6 +22,16 @@ impl Accel {
     }
 }
 
+impl From<Accel> for opl_types::cpu::Accel {
+    fn from(a: Accel) -> Self {
+        match a {
+            Accel::Kvm => Self::Kvm,
+            Accel::Hvf => Self::Hvf,
+            Accel::Tcg => Self::Tcg,
+        }
+    }
+}
+
 /// 이 호스트에서 QEMU를 어떻게 실행할지에 대한 정보.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostProfile {

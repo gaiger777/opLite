@@ -1743,6 +1743,33 @@ impl Hypervisor for MockHypervisor {
         Ok(Self::version(&self.state.lock().unwrap()))
     }
 
+    /// 마지막으로 켠 스펙의 해석한 CPU 플래그(없는 이름은 빠진다)를 켜진 vCPU마다 돌려준다.
+    async fn vcpu_props(
+        &self,
+        id: Uuid,
+        names: &[String],
+    ) -> Result<Vec<BTreeMap<String, bool>>, DriverError> {
+        let st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        let spec = st.launch_specs.iter().rfind(|s| s.id == id);
+        let props: BTreeMap<String, bool> = spec
+            .and_then(|s| s.cpu_resolved.as_ref())
+            .map(|r| {
+                names
+                    .iter()
+                    .filter_map(|n| r.flags.get(n).map(|v| (n.clone(), *v)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let vcpus = st
+            .hot
+            .get(&id)
+            .map(|h| u32::from(h.vcpus))
+            .or_else(|| spec.map(|s| s.cpu.vcpus()))
+            .unwrap_or(1);
+        Ok(vec![props; vcpus as usize])
+    }
+
     async fn running_qemu_version(&self, id: Uuid) -> Result<String, DriverError> {
         let st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
@@ -2428,6 +2455,7 @@ mod tests {
             freeze_fs: false,
             firmware_epoch: 0,
             keep_tpm: false,
+            cpu_resolved: None,
         }
     }
 
