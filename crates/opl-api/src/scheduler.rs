@@ -1,19 +1,23 @@
 //! `spec.node`가 비어 있는 VM을 시작할 때 노드를 고른다(설계 3.3).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use opl_cluster::{Cluster, ClusterError};
+use opl_reconciler::cpu::{CpuContext, CpuRefusal};
+use opl_types::cluster::ClusterSpec;
+use opl_types::cpu::{self, Baseline, CpuCatalogSpec};
 use opl_types::hotplug;
 use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
-use opl_types::node::{Node, NodeSpec, ShutdownAction, ha_capable};
+use opl_types::node::{CPU_MODELS, Node, NodeSpec, ShutdownAction, all_have, ha_capable};
 use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
 use opl_types::replication::{ReplicaVolume, replica_ready};
 use opl_types::runtime::ImageFormat;
-use opl_types::settings::{HaReserve, SettingsSpec};
+use opl_types::settings::{HaReserve, SETTINGS_NAME, SettingsSpec};
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
 };
-use opl_types::vm::{DiskMove, HaState, PowerState, Vm, VmSpec};
+use opl_types::vm::{Arch, DiskMove, HaState, PowerState, RunningHardware, Vm, VmSpec};
 use uuid::Uuid;
 
 use crate::placement::{self, Assign};
@@ -25,7 +29,7 @@ use crate::volumes::block_pool_kind;
 pub enum ScheduleError {
     /// 노드 조건([`node_fits`])에 맞는 노드가 없다.
     #[error(
-        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups and, for an HA VM, has HA fencing)"
+        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups, can run its CPU model and, for an HA VM, has HA fencing)"
     )]
     NoNode,
     /// 노드 조건에 맞는 노드는 있지만 모두 이 hard 규칙(이름 순)을 어긴다.
@@ -44,11 +48,36 @@ pub struct Inventory {
     /// 배치 규칙과 HA 그룹([`crate::placement`])
     pub rules: Vec<PlacementRule>,
     pub groups: Vec<HaGroup>,
+    /// CPU 카탈로그(이름 = 해시, 계획 63). 모든 노드가 `cpu-models`를 알릴 때만 읽는다.
+    pub cpu_catalogs: BTreeMap<String, Arc<CpuCatalogSpec>>,
+    /// 아키텍처마다 클러스터 CPU 기준(`ClusterStatus.cpu_baselines`)
+    pub cpu_baselines: BTreeMap<Arch, Baseline>,
+    /// 클러스터 숨김 목록(설정 `cpu.mask`)
+    pub cpu_mask: Vec<String>,
+}
+
+/// 노드 조건이 보는 VM의 CPU
+#[derive(Debug, Clone, Copy)]
+enum VmCpu<'a> {
+    /// 새로 켠다(켜기·HA 복구·복제): 스펙을 그 노드에서 지금 기준·숨김 목록으로 해석한다.
+    Start,
+    /// 도는 VM을 옮긴다: 켤 때 기록한 CPU 그대로다(받는 쪽은 기록으로 켠다).
+    Running(&'a RunningHardware),
+}
+
+impl<'a> VmCpu<'a> {
+    /// 하드웨어 기록이 있으면(도는 VM) 그것, 없으면 새로 켜는 것으로 본다.
+    fn of(vm: &'a Vm) -> Self {
+        vm.status
+            .hardware
+            .as_ref()
+            .map_or(VmCpu::Start, VmCpu::Running)
+    }
 }
 
 impl Inventory {
     pub fn load(cluster: &Cluster) -> Result<Self, ClusterError> {
-        Ok(Self {
+        let mut inv = Self {
             nodes: cluster.list::<NodeSpec>()?.1,
             vms: cluster.list::<VmSpec>()?.1,
             volumes: cluster.list::<VolumeSpec>()?.1,
@@ -56,6 +85,67 @@ impl Inventory {
             networks: cluster.list::<NetworkSpec>()?.1,
             rules: cluster.list::<PlacementRuleSpec>()?.1,
             groups: cluster.list::<HaGroupSpec>()?.1,
+            ..Self::default()
+        };
+        // 업그레이드 중에는 작업자도 CPU를 보지 않는다(카탈로그·기준도 아직 없다).
+        if all_have(&inv.nodes, CPU_MODELS) {
+            inv.cpu_catalogs = cluster
+                .list::<CpuCatalogSpec>()?
+                .1
+                .into_iter()
+                .map(|c| (c.name, Arc::new(c.spec)))
+                .collect();
+            inv.cpu_baselines = cluster
+                .list::<ClusterSpec>()?
+                .1
+                .into_iter()
+                .next()
+                .map(|c| c.status.cpu_baselines)
+                .unwrap_or_default();
+            inv.cpu_mask = cluster
+                .get_by_name::<SettingsSpec>(SETTINGS_NAME)?
+                .and_then(|s| s.spec.cpu)
+                .map(|c| c.mask)
+                .unwrap_or_default();
+        }
+        Ok(inv)
+    }
+
+    /// 노드 `node`의 CPU 해석 문맥. 작업자가 켤 때 쓰는 것과 같은 규칙이다([`CpuContext::from_parts`]) — 그래야 고른
+    /// 노드가 켜기를 거절하지 않는다. 업그레이드 중이거나 노드의 아키텍처·가속기를 모르면 None(작업자도 CPU를 보지
+    /// 않는다).
+    pub fn cpu_context(&self, node: &Node) -> Option<CpuContext> {
+        CpuContext::from_parts(
+            &self.nodes,
+            node,
+            |hash| self.cpu_catalogs.get(hash).cloned(),
+            &self.cpu_baselines,
+            &self.cpu_mask,
+        )
+    }
+
+    /// VM의 CPU를 노드가 켤 수 있는지(계획 63 §10). `host`·`max`는 늘 된다. 그 밖에는 노드가 카탈로그를 알렸고 그
+    /// 리소스가 있으며 `can_run`이어야 한다 — `NodeStatus.cpu`가 없거나 빈 해시이거나 카탈로그가 아직 없는 노드는
+    /// `host`·`max`만 켠다.
+    fn cpu_fits(&self, spec: &VmSpec, node: &Node, cpu: VmCpu<'_>) -> Result<(), String> {
+        let Some(ctx) = self.cpu_context(node) else {
+            return Ok(());
+        };
+        let name = &node.name;
+        let resolved = match cpu {
+            VmCpu::Start => ctx.resolve(&spec.cpu),
+            VmCpu::Running(hw) => match &hw.cpu_resolved {
+                Some(r) => Ok(r.clone()),
+                // 계획 63 전 기록: 명령줄처럼 모델만 편다.
+                None => cpu::resolve(&hw.cpu, ctx.arch, ctx.accel, None, &[], None),
+            },
+        }
+        .map_err(|e| format!("node {name:?} cannot use the VM's CPU: {e}"))?;
+        ctx.check(&resolved).map_err(|e| match e {
+            CpuRefusal::Cannot(message) => message,
+            CpuRefusal::Waiting(_) => format!(
+                "node {name:?} has no CPU catalog yet; only the host and max CPU models can run there"
+            ),
         })
     }
 
@@ -258,14 +348,24 @@ pub fn migration_moves(
 }
 
 /// [`node_fits`]와 같되 노드 로컬 풀 디스크가 있어 그 노드에서 쓸 수 없는 VM은 그 노드에 쓸 수 있는 복제본이 있으면
-/// 그 복제본의 풀로 본다([`replica_moves`]). HA 복구·되돌아가기·균형 조정기가 쓴다.
+/// 그 복제본의 풀로 본다([`replica_moves`]). HA 복구가 쓴다(새로 켜므로 CPU는 스펙을 해석한다). 도는 VM을 옮기는
+/// 되돌아가기·균형 조정기는 [`replica_migration_fits`]다.
 pub fn replica_fits(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
-    let plain = node_fits(&vm.spec, inv, node);
+    replica_fits_as(vm, inv, node, VmCpu::Start)
+}
+
+/// [`replica_fits`]와 같되 CPU는 도는 VM의 기록이다([`migration_fits`]).
+pub fn replica_migration_fits(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
+    replica_fits_as(vm, inv, node, VmCpu::of(vm))
+}
+
+fn replica_fits_as(vm: &Vm, inv: &Inventory, node: &Node, cpu: VmCpu<'_>) -> Result<(), String> {
+    let plain = fits(&vm.spec, inv, node, &[], cpu);
     if plain.is_ok() {
         return plain;
     }
     match replica_moves(vm, inv, node.id) {
-        Some(moves) if !moves.is_empty() => node_fits_with(&vm.spec, inv, node, &moves),
+        Some(moves) if !moves.is_empty() => fits(&vm.spec, inv, node, &moves, cpu),
         _ => plain,
     }
 }
@@ -277,6 +377,78 @@ pub fn node_fits_with(
     inv: &Inventory,
     node: &Node,
     moves: &[DiskMove],
+) -> Result<(), String> {
+    fits(spec, inv, node, moves, VmCpu::Start)
+}
+
+/// 도는 VM을 옮길 대상(라이브 마이그레이션·비우기·균형 조정·되돌아가기): [`node_fits_with`]와 같되 CPU는 스펙을 새로
+/// 해석하지 않고 켤 때 기록한 것(`status.hardware.cpu_resolved`)을 본다 — 받는 쪽은 원본과 같은 CPUID로 켠다. 하드웨어
+/// 기록이 없으면(꺼진 VM) [`node_fits_with`]와 같다.
+pub fn migration_fits(
+    vm: &Vm,
+    inv: &Inventory,
+    node: &Node,
+    moves: &[DiskMove],
+) -> Result<(), String> {
+    fits(&vm.spec, inv, node, moves, VmCpu::of(vm))
+}
+
+/// `host`·`max` VM을 `from`에서 `to`로 옮길 때의 경고(계획 63 §10, 막지 않는다): 두 노드의 카탈로그가 다르고 대상
+/// `supported`에 원본 `supported`의 플래그(VM이 끈 것 빼고)가 빠졌으면 `target node "n3" lacks avx512vbmi, amx-tile that
+/// the guest may be using`이다. 게스트는 켤 때 본 CPUID를 쓰므로 대상이 원본의 상위 집합이면 경고가 없다. 같은 해시,
+/// 카탈로그를 모르는 노드, 명명 모델·수준·`cluster` VM(대상이 켤 수 있는지를 노드 조건이 본다)도 None이다.
+pub fn host_cpu_warning(vm: &Vm, inv: &Inventory, from: &Node, to: &Node) -> Option<String> {
+    let (model, off): (&str, Vec<&str>) = match &vm.status.hardware {
+        Some(hw) => match &hw.cpu_resolved {
+            Some(r) => (
+                r.model.as_str(),
+                r.flags
+                    .iter()
+                    .filter(|(_, on)| !**on)
+                    .map(|(f, _)| f.as_str())
+                    .collect(),
+            ),
+            None => (hw.cpu.model.as_str(), Vec::new()),
+        },
+        None => (vm.spec.cpu.model.as_str(), Vec::new()),
+    };
+    if !matches!(model, "host" | "max") {
+        return None;
+    }
+    let hash = |n: &Node| n.status.cpu.as_ref().map(|c| c.catalog.clone());
+    let (source, target) = (hash(from)?, hash(to)?);
+    if source == target {
+        return None;
+    }
+    let source = inv.cpu_catalogs.get(&source)?;
+    let target = inv.cpu_catalogs.get(&target)?;
+    let there: BTreeSet<&str> = target.names(&target.supported).collect();
+    let lacks: Vec<&str> = source
+        .names(&source.supported)
+        .filter(|f| !there.contains(f) && !off.contains(f))
+        .collect();
+    if lacks.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "target node {:?} lacks {} that the guest may be using",
+        to.name,
+        lacks.join(", ")
+    ))
+}
+
+/// 도는 VM의 기록된 CPU(꺼진 VM이면 스펙의 해석)를 노드가 켤 수 있는지만 본다([`migration_fits`]의 CPU 부분). 다른
+/// 조건을 따로 보는 라이브 마이그레이션 후보 거름(HA 검사의 옮기기)이 쓴다.
+pub fn cpu_receives(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
+    inv.cpu_fits(&vm.spec, node, VmCpu::of(vm))
+}
+
+fn fits(
+    spec: &VmSpec,
+    inv: &Inventory,
+    node: &Node,
+    moves: &[DiskMove],
+    cpu: VmCpu<'_>,
 ) -> Result<(), String> {
     // 템플릿(계획 58)은 켜지 않는다: 어느 노드에도 놓지 않는다(스케줄러·HA·균형 조정기·마이그레이션 대상 모두).
     // API가 켜기를 막지만 방어로.
@@ -354,7 +526,8 @@ pub fn node_fits_with(
             "node {name:?} has no Secure Boot firmware for the VM (install ovmf with Secure Boot keys)"
         ));
     }
-    Ok(())
+    // 계획 63: CPU 모델·플래그(작업자의 켤 때 확인과 같은 규칙)
+    inv.cpu_fits(spec, node, cpu)
 }
 
 /// HA 용량 예약을 넘는다: 예약을 뺀 메모리에 이 VM이 들어가지 않는다(MiB).
@@ -800,6 +973,7 @@ mod tests {
             networks: vec![],
             rules: vec![],
             groups: vec![],
+            ..Inventory::default()
         };
         let mut me = spec(512, None, PowerState::Running);
         me.disks.push(DiskSpec {
@@ -1692,5 +1866,258 @@ mod tests {
             node_fits(&me, &inv, &ready),
             Err("node \"n\" does not have the bridges of the VM's networks".into())
         );
+    }
+
+    // ---- 계획 63: CPU 모델 ----
+
+    /// Mock 카탈로그(`Icelake-Server-v7`은 `avx512vbmi`가 없어 못 켬)와, 그것을 켤 수 있는 강한 카탈로그
+    fn catalogs() -> (CpuCatalogSpec, CpuCatalogSpec) {
+        let weak = opl_driver::mock_cpu_probe().catalog;
+        let mut strong = weak.clone();
+        for m in &mut strong.models {
+            m.missing = cpu::Bits::default();
+        }
+        strong.supported = cpu::Bits::from_indices(0..strong.flags.len());
+        (strong, weak)
+    }
+
+    /// `cpu-models`를 아는 x86_64 KVM 노드. `catalog`가 None이면 `NodeStatus.cpu`가 없다.
+    fn x86(name: &str, catalog: Option<&CpuCatalogSpec>) -> Node {
+        let mut n = node(8192);
+        n.name = name.into();
+        n.status.arch = Some(Arch::X86_64);
+        n.status.hypervisor = "qemu-kvm".into();
+        n.status.features = opl_types::node::FEATURES
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        n.status.cpu = catalog.map(|c| cpu::NodeCpu {
+            catalog: c.hash(),
+            qemu: c.qemu.clone(),
+            accel: "kvm".into(),
+            vendor: Some("GenuineIntel".into()),
+            model_id: None,
+            probed_at: 0,
+            error: None,
+        });
+        n
+    }
+
+    fn cpu_inv(nodes: Vec<Node>, catalogs: &[&CpuCatalogSpec]) -> Inventory {
+        Inventory {
+            nodes,
+            cpu_catalogs: catalogs
+                .iter()
+                .map(|c| (c.hash(), Arc::new((*c).clone())))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn x86_spec(model: &str, flags: &[&str]) -> VmSpec {
+        let mut me = spec(512, None, PowerState::Running);
+        me.machine = MachineType::Q35;
+        me.cpu.model = model.parse().unwrap();
+        me.cpu.flags = flags.iter().map(|f| f.parse().unwrap()).collect();
+        me
+    }
+
+    fn baseline(model: &str) -> Baseline {
+        Baseline {
+            model: model.into(),
+            flags: Default::default(),
+            mode: cpu::BaselineSource::Auto,
+            nodes: vec![],
+            limited_by: vec![],
+            since: 0,
+            previous: None,
+            warnings: vec![],
+        }
+    }
+
+    #[test]
+    fn named_cpu_models_need_a_node_whose_catalog_can_run_them() {
+        let (strong, weak) = catalogs();
+        let mut missing = x86("missing", Some(&strong));
+        missing.status.cpu.as_mut().unwrap().catalog = "0".repeat(64);
+        let mut empty = x86("empty", Some(&strong));
+        empty.status.cpu.as_mut().unwrap().catalog = String::new();
+        let nodes = vec![
+            x86("strong", Some(&strong)),
+            x86("weak", Some(&weak)),
+            x86("none", None),
+            missing,
+            empty,
+        ];
+        let inv = cpu_inv(nodes.clone(), &[&strong, &weak]);
+        let icelake = x86_spec("Icelake-Server-v7", &[]);
+        assert_eq!(node_fits(&icelake, &inv, &nodes[0]), Ok(()));
+        assert_eq!(
+            node_fits(&icelake, &inv, &nodes[1]),
+            Err("node \"weak\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi)".into())
+        );
+        assert_eq!(
+            node_fits(&icelake, &inv, &nodes[2]),
+            Err(
+                "node \"none\" has no CPU catalog; only the host and max CPU models can run there"
+                    .into()
+            )
+        );
+        assert_eq!(
+            node_fits(&icelake, &inv, &nodes[3]),
+            Err("node \"missing\" has no CPU catalog yet; only the host and max CPU models can run there".into())
+        );
+        assert!(node_fits(&icelake, &inv, &nodes[4]).is_err());
+        // 스케줄러는 켤 수 있는 노드만 고른다.
+        assert_eq!(sched(&icelake, &inv), Ok(nodes[0].id));
+        // 빠진 기능을 끄면 약한 노드도 켠다.
+        let hidden = x86_spec("Icelake-Server-v7", &["-avx512vbmi"]);
+        assert_eq!(node_fits(&hidden, &inv, &nodes[1]), Ok(()));
+        // host·max는 카탈로그가 없어도 어디서나 된다.
+        for model in ["host", "max"] {
+            let me = x86_spec(model, &[]);
+            for n in &nodes {
+                assert_eq!(node_fits(&me, &inv, n), Ok(()), "{model} on {}", n.name);
+            }
+        }
+        // 지원하지 않는 플래그를 켜면 못 켠다.
+        let plus = x86_spec("Skylake-Server-v5", &["+avx512vbmi"]);
+        assert!(node_fits(&plus, &inv, &nodes[1]).is_err());
+        assert_eq!(node_fits(&plus, &inv, &nodes[0]), Ok(()));
+        // 업그레이드 중(한 노드가 `cpu-models`를 모름)에는 작업자처럼 CPU를 보지 않는다.
+        let mut old = inv.clone();
+        old.nodes[2].status.features.clear();
+        assert_eq!(node_fits(&icelake, &old, &old.nodes[1]), Ok(()));
+        // 수준은 qemu64-v1 위의 플래그다(Mock 카탈로그에는 qemu64-v1이 없다).
+        let level = x86_spec("x86-64-v3", &[]);
+        assert!(
+            node_fits(&level, &inv, &nodes[0])
+                .unwrap_err()
+                .contains("cannot run CPU model qemu64-v1")
+        );
+    }
+
+    #[test]
+    fn cluster_vms_resolve_the_recorded_baseline_and_mask_on_each_node() {
+        let (strong, weak) = catalogs();
+        let nodes = vec![x86("strong", Some(&strong)), x86("weak", Some(&weak))];
+        let mut inv = cpu_inv(nodes.clone(), &[&strong, &weak]);
+        let me = x86_spec("cluster", &[]);
+        // 기준이 없으면 host처럼 어디서나 켠다.
+        assert_eq!(node_fits(&me, &inv, &nodes[1]), Ok(()));
+        inv.cpu_baselines
+            .insert(Arch::X86_64, baseline("Icelake-Server-v7"));
+        assert_eq!(node_fits(&me, &inv, &nodes[0]), Ok(()));
+        assert!(
+            node_fits(&me, &inv, &nodes[1])
+                .unwrap_err()
+                .contains("cannot run CPU model Icelake-Server-v7")
+        );
+        // 클러스터 숨김 목록이 빠진 기능을 끄면 약한 노드도 켠다.
+        inv.cpu_mask = vec!["avx512vbmi".into()];
+        assert_eq!(node_fits(&me, &inv, &nodes[1]), Ok(()));
+        inv.cpu_mask.clear();
+        inv.cpu_baselines
+            .insert(Arch::X86_64, baseline("Skylake-Server-v5"));
+        assert_eq!(node_fits(&me, &inv, &nodes[1]), Ok(()));
+    }
+
+    #[test]
+    fn running_vms_move_only_where_their_recorded_cpu_runs() {
+        let (strong, weak) = catalogs();
+        let nodes = vec![x86("strong", Some(&strong)), x86("weak", Some(&weak))];
+        let mut inv = cpu_inv(nodes.clone(), &[&strong, &weak]);
+        // 약한 노드가 들어와 기준이 내려갔다. VM은 앞 기준(Icelake)으로 돈다.
+        inv.cpu_baselines
+            .insert(Arch::X86_64, baseline("Skylake-Server-v5"));
+        let mut vm: Vm = Resource::new("web", x86_spec("cluster", &[]));
+        let mut hw = RunningHardware::legacy(&vm.spec);
+        hw.cpu_resolved = Some(cpu::ResolvedCpu {
+            model: "Icelake-Server-v7".into(),
+            flags: Default::default(),
+            enforce: true,
+            source: cpu::CpuSource::Cluster,
+        });
+        vm.status.hardware = Some(hw);
+        // 새로 켜면(HA 복구) 새 기준이라 약한 노드도 되지만, 도는 VM은 기록대로 옮긴다.
+        assert_eq!(node_fits(&vm.spec, &inv, &nodes[1]), Ok(()));
+        assert_eq!(replica_fits(&vm, &inv, &nodes[1]), Ok(()));
+        assert!(migration_fits(&vm, &inv, &nodes[1], &[]).is_err());
+        assert!(replica_migration_fits(&vm, &inv, &nodes[1]).is_err());
+        assert!(cpu_receives(&vm, &inv, &nodes[1]).is_err());
+        assert_eq!(migration_fits(&vm, &inv, &nodes[0], &[]), Ok(()));
+        // 계획 63 전 기록(host)은 어디로든 옮긴다.
+        let mut legacy: Vm = Resource::new("old", x86_spec("host", &[]));
+        legacy.status.hardware = Some(RunningHardware::legacy(&legacy.spec));
+        assert_eq!(migration_fits(&legacy, &inv, &nodes[1], &[]), Ok(()));
+        // 꺼진 VM(기록 없음)은 스펙을 해석한다.
+        let mut off = vm.clone();
+        off.status.hardware = None;
+        assert_eq!(migration_fits(&off, &inv, &nodes[1], &[]), Ok(()));
+    }
+
+    #[test]
+    fn ha_recovery_picks_only_nodes_that_can_run_the_cpu() {
+        let (strong, weak) = catalogs();
+        let mut big_weak = x86("weak", Some(&weak));
+        big_weak.status.memory_mib = 65536;
+        let nodes = vec![x86("strong", Some(&strong)), big_weak];
+        let inv = cpu_inv(nodes.clone(), &[&strong, &weak]);
+        let vm: Vm = Resource::new("web", x86_spec("Icelake-Server-v7", &[]));
+        let pick = crate::ha::pick(
+            &vm,
+            &inv,
+            &Assign::default(),
+            |_| true,
+            &Scorer::default(),
+            true,
+        );
+        assert_eq!(pick, crate::ha::Pick::Node(nodes[0].id));
+        // 메모리가 넉넉한 약한 노드라도 host VM이면 고른다(CPU 확인이 막는 것은 명명 모델뿐).
+        let vm: Vm = Resource::new("web", x86_spec("host", &[]));
+        let pick = crate::ha::pick(
+            &vm,
+            &inv,
+            &Assign::default(),
+            |_| true,
+            &Scorer::default(),
+            true,
+        );
+        assert_eq!(pick, crate::ha::Pick::Node(nodes[1].id));
+    }
+
+    #[test]
+    fn host_vms_warn_when_the_target_lacks_flags_of_the_source() {
+        let (strong, weak) = catalogs();
+        let nodes = vec![
+            x86("strong", Some(&strong)),
+            x86("weak", Some(&weak)),
+            x86("twin", Some(&weak)),
+            x86("none", None),
+        ];
+        let inv = cpu_inv(nodes.clone(), &[&strong, &weak]);
+        let mut vm: Vm = Resource::new("web", x86_spec("host", &[]));
+        vm.status.hardware = Some(RunningHardware::legacy(&vm.spec));
+        assert_eq!(
+            host_cpu_warning(&vm, &inv, &nodes[0], &nodes[1]).as_deref(),
+            Some("target node \"weak\" lacks avx512vbmi that the guest may be using")
+        );
+        // 대상이 상위 집합, 같은 카탈로그, 카탈로그를 모르는 노드는 경고하지 않는다.
+        assert_eq!(host_cpu_warning(&vm, &inv, &nodes[1], &nodes[0]), None);
+        assert_eq!(host_cpu_warning(&vm, &inv, &nodes[1], &nodes[2]), None);
+        assert_eq!(host_cpu_warning(&vm, &inv, &nodes[0], &nodes[3]), None);
+        // 게스트에게 숨긴 플래그는 쓰지 않는다.
+        let mut masked = vm.clone();
+        masked.status.hardware.as_mut().unwrap().cpu_resolved = Some(cpu::ResolvedCpu {
+            model: "host".into(),
+            flags: [("avx512vbmi".to_string(), false)].into(),
+            enforce: false,
+            source: cpu::CpuSource::Spec,
+        });
+        assert_eq!(host_cpu_warning(&masked, &inv, &nodes[0], &nodes[1]), None);
+        // 명명 모델은 노드 조건이 본다.
+        let mut named: Vm = Resource::new("db", x86_spec("Skylake-Server-v5", &[]));
+        named.status.hardware = Some(RunningHardware::legacy(&named.spec));
+        assert_eq!(host_cpu_warning(&named, &inv, &nodes[0], &nodes[1]), None);
     }
 }

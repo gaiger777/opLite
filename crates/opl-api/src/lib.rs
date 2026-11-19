@@ -18,6 +18,7 @@ mod ceph;
 mod ceph_agent;
 pub mod cluster;
 mod console;
+mod cpu_baseline;
 mod drain;
 pub mod error;
 mod fan_out;

@@ -2,11 +2,14 @@
 //! [`CpuContext::start`]로 `-cpu`를 정해 `RunningHardware.cpu_resolved`에 기록하고, 검사 루프([`refresh_pending`])와
 //! 핫플러그 Task가 [`CpuContext::wanted`]로 실행 중 VM의 보류 `cpu`를 다시 셈한다.
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::cluster::ClusterSpec;
 use opl_types::cpu::{self, Accel, Baseline, CpuCatalogSpec, CpuError, ResolvedCpu};
-use opl_types::node::{CPU_MODELS, NodeSpec, all_have};
+use opl_types::node::{CPU_MODELS, Node, NodeSpec, all_have};
 use opl_types::settings::{SETTINGS_NAME, SettingsSpec};
 use opl_types::vm::{Arch, CpuSpec, PendingChange, VmPhase, VmSpec};
 use uuid::Uuid;
@@ -18,7 +21,8 @@ pub enum NodeCatalog {
     None,
     /// 노드가 알린 해시의 카탈로그 리소스가 아직 없다(검사 회차가 곧 만든다).
     Missing(String),
-    Found(Box<CpuCatalogSpec>),
+    /// 여러 노드가 같은 카탈로그를 나눠 쓴다(스케줄러는 노드마다 문맥을 만든다 — 40 KB를 베끼지 않게).
+    Found(Arc<CpuCatalogSpec>),
 }
 
 /// 켜지 않는 까닭
@@ -48,42 +52,63 @@ impl CpuContext {
     /// 아키텍처·가속기를 모르면 None이다(그때 명령줄은 모델만 편다).
     pub fn load(cluster: &Cluster, node: Uuid) -> Result<Option<Self>, ClusterError> {
         let (_, nodes) = cluster.list::<NodeSpec>()?;
-        if !all_have(&nodes, CPU_MODELS) {
-            return Ok(None);
-        }
         let Some(me) = nodes.iter().find(|n| n.id == node) else {
             return Ok(None);
         };
-        let (Some(arch), Some(accel)) = (me.status.arch, Accel::parse(&me.status.hypervisor))
-        else {
+        if !all_have(&nodes, CPU_MODELS) {
             return Ok(None);
-        };
+        }
         let catalog = match me.status.cpu.as_ref().map(|c| c.catalog.as_str()) {
-            None | Some("") => NodeCatalog::None,
-            Some(hash) => match cluster.get_by_name::<CpuCatalogSpec>(hash)? {
-                Some(c) => NodeCatalog::Found(Box::new(c.spec)),
-                None => NodeCatalog::Missing(hash.to_string()),
-            },
+            None | Some("") => None,
+            Some(hash) => cluster
+                .get_by_name::<CpuCatalogSpec>(hash)?
+                .map(|c| Arc::new(c.spec)),
         };
         let mask = cluster
             .get_by_name::<SettingsSpec>(SETTINGS_NAME)?
             .and_then(|s| s.spec.cpu)
             .map(|c| c.mask)
             .unwrap_or_default();
-        let baseline = cluster
+        let baselines = cluster
             .list::<ClusterSpec>()?
             .1
             .into_iter()
             .next()
-            .and_then(|c| c.status.cpu_baselines.get(&arch).cloned());
-        Ok(Some(CpuContext {
-            node_name: me.name.clone(),
+            .map(|c| c.status.cpu_baselines)
+            .unwrap_or_default();
+        Ok(Self::from_parts(&nodes, me, |_| catalog, &baselines, &mask))
+    }
+
+    /// 이미 읽은 것으로 노드 `node`의 문맥을 만든다(순수, [`CpuContext::load`]와 같은 규칙). `catalog`는 노드가 알린
+    /// 해시로 카탈로그 리소스를 찾는다. 스케줄러(opl-api `Inventory`)가 작업자와 같은 규칙으로 노드를 거르려고 쓴다 —
+    /// 그래야 배치한 노드가 켜기를 거절하지 않는다.
+    pub fn from_parts(
+        nodes: &[Node],
+        node: &Node,
+        catalog: impl FnOnce(&str) -> Option<Arc<CpuCatalogSpec>>,
+        baselines: &BTreeMap<Arch, Baseline>,
+        mask: &[String],
+    ) -> Option<Self> {
+        if !all_have(nodes, CPU_MODELS) {
+            return None;
+        }
+        let arch = node.status.arch?;
+        let accel = Accel::parse(&node.status.hypervisor)?;
+        let catalog = match node.status.cpu.as_ref().map(|c| c.catalog.as_str()) {
+            None | Some("") => NodeCatalog::None,
+            Some(hash) => match catalog(hash) {
+                Some(c) => NodeCatalog::Found(c),
+                None => NodeCatalog::Missing(hash.to_string()),
+            },
+        };
+        Some(CpuContext {
+            node_name: node.name.clone(),
             arch,
             accel,
-            baseline,
-            mask,
+            baseline: baselines.get(&arch).cloned(),
+            mask: mask.to_vec(),
             catalog,
-        }))
+        })
     }
 
     fn found(&self) -> Option<&CpuCatalogSpec> {

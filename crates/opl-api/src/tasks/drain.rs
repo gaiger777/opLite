@@ -17,7 +17,7 @@ use super::{Ctx, TaskRunnerConfig};
 use crate::cluster::missing_feature;
 use crate::error::ApiError;
 use crate::placement::{self, Assign, affinity_partners, hard_violations};
-use crate::scheduler::{Inventory, disk_moves, migration_moves, node_fits_with, replica_moves};
+use crate::scheduler::{Inventory, disk_moves, migration_fits, migration_moves, replica_moves};
 use crate::score::{self, Scorer};
 use crate::snapshots::count_snapshots;
 use crate::state::AppState;
@@ -390,7 +390,7 @@ fn pick_target(
             .collect();
         // 대상은 구성원이 도는 하드웨어(핫플러그 배치)로 켜야 한다.
         let fits = bundle.iter().zip(&member_moves).all(|(v, m)| {
-            node_fits_with(&v.spec, inv, n, m).is_ok()
+            migration_fits(v, inv, n, m).is_ok()
                 && hotplug::can_receive(v.status.hardware.as_ref(), n).is_ok()
         });
         if !fits {

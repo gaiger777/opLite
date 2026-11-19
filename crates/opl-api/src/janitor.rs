@@ -6,7 +6,7 @@
 //! 끝내지 못한 사본)은 지우기 Task를 만들어 파일과 함께 지운다(엔터프라이즈 설계 §6.1).
 //! 끝났거나 쓸 수 없게 된(주인이 없거나 비밀번호가 바뀐) 로그인 세션을 지운다(가용성 설계 §4). 실패로 끝낸
 //! Ceph Task가 잡은 자리(`CephStatus.pending`)를 놓는다. 어느 노드도 가리키지 않고 만든 지 1시간이 넘은 CPU 카탈로그
-//! (계획 63 §7)를 지운다.
+//! (계획 63 §7)를 지우고, 클러스터 CPU 기준을 다시 셈해 기록한다([`crate::cpu_baseline`], 계획 63 §9).
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -431,6 +431,8 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             );
         }
     }
+    // 클러스터 CPU 기준: 노드·카탈로그·설정이 바뀌었으면 다시 셈해 쓰고 바뀜을 기록한다.
+    crate::cpu_baseline::record(state).await;
     // 지우기 Task가 파일이 있는 노드에서 파일과 리소스를 지운다. 만들지 못하면(노드가 오프라인 등) 다음
     // tick에 다시 한다.
     for backup in stale_receiving(SystemTime::now(), config, &backups, &tasks) {

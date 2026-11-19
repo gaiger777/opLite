@@ -40,7 +40,7 @@ use crate::ha::{
     update_status_checked,
 };
 use crate::placement::Assign;
-use crate::scheduler::Inventory;
+use crate::scheduler::{Inventory, cpu_receives};
 use crate::score::Scorer;
 use crate::vms::{RuleCheck, start_migration};
 
@@ -734,9 +734,12 @@ async fn migrate(
             continue;
         }
         let eligible = |n: &Node| {
-            n.id != node && ready(place.now, place.b, place.leases, n) && !health.blocks(vm, n, inv)
+            n.id != node
+                && ready(place.now, place.b, place.leases, n)
+                && !health.blocks(vm, n, inv)
+                && cpu_receives(vm, inv, n).is_ok()
         };
-        // 라이브 마이그레이션이므로 복제본이 있는 노드도 받는다.
+        // 라이브 마이그레이션이므로 복제본이 있는 노드도 받는다. CPU는 켤 때 기록한 것으로 본다.
         let target = match pick(vm, inv, &assign, eligible, &scorer, true) {
             Pick::Node(t) | Pick::Violating(t, _) => t,
             Pick::NoNode(_) | Pick::Blocked(_) => {

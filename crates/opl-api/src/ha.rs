@@ -51,7 +51,9 @@ use crate::auth::unix_now;
 use crate::ha_health::{self, CheckWatch, Health, Place};
 use crate::placement::{self, Assign, Candidate};
 use crate::power_fence::{PowerFence, PowerOff, power_off};
-use crate::scheduler::{Inventory, disk_moves, node_fits, replica_fits, replica_moves};
+use crate::scheduler::{
+    Inventory, disk_moves, node_fits, replica_fits, replica_migration_fits, replica_moves,
+};
 use crate::score::{Loads, Scorer};
 use crate::state::AppState;
 use crate::vms::{RuleCheck, start_migration};
@@ -1824,7 +1826,7 @@ impl Failback {
 
     /// 이 VM이 되돌아갈 노드: 그룹이 있고 `nofailback`이 아니면, 지금 노드보다 그룹 우선순위가 높고
     /// `after` 넘게 살아 있으며 노드 조건(노드 로컬 풀 디스크가 있는 VM은 쓸 수 있는 복제본이 있는 노드만 —
-    /// [`replica_fits`])과 hard 규칙에 맞고 이 VM에 영향을 주는 HA 검사가 실패하지 않는 노드 가운데 가장 나은 것.
+    /// [`replica_migration_fits`], CPU는 켤 때 기록한 것)과 hard 규칙에 맞고 이 VM에 영향을 주는 HA 검사가 실패하지 않는 노드 가운데 가장 나은 것.
     fn target(
         &self,
         vm: &Vm,
@@ -1851,7 +1853,7 @@ impl Failback {
                     .get(&n.id)
                     .is_some_and(|since| now.saturating_duration_since(*since) >= after)
             })
-            .filter(|n| replica_fits(vm, inv, n).is_ok())
+            .filter(|n| replica_migration_fits(vm, inv, n).is_ok())
             .filter(|n| placement::hard_violations(vm, n, inv, &assign).is_empty())
             .filter(|n| !health.blocks(vm, n, inv))
             .map(|n| placement::score_with(vm, n, inv, &assign, scorer))
@@ -2325,6 +2327,7 @@ mod tests {
             networks: vec![],
             rules: vec![],
             groups: vec![],
+            ..Inventory::default()
         }
     }
 

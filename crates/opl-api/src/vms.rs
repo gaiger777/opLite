@@ -41,8 +41,8 @@ use crate::replication::start_replication;
 use crate::resources::{CreateRequest, UpdateRequest, check_name, if_match, lookup};
 use crate::revision::{TASK, WARNING};
 use crate::scheduler::{
-    HaCapacity, Inventory, ScheduleError, disk_moves, ha_capacity, migration_moves, node_fits_with,
-    schedule_with,
+    HaCapacity, Inventory, ScheduleError, cpu_receives, disk_moves, ha_capacity, host_cpu_warning,
+    migration_fits, migration_moves, schedule_with,
 };
 use crate::score::{self, Scorer};
 use crate::snapshots::{
@@ -240,8 +240,12 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         require_feature(&state.cluster, GUEST_AGENT)?;
     }
     // `host`·`max` 밖의 CPU 모델과 플래그는 옛 노드가 풀지 못한다(계획 63). 모델 검증·해석은 스테이지 5에서 열기
-    // 전까지 받지 않는다.
-    if !spec.cpu.model.is_host_or_max() || !spec.cpu.flags.is_empty() {
+    // 전까지 받지 않는다. 저장된 VM의 모델·플래그를 그대로 두는 바꾸기(`vm set --cores`)는 받는다.
+    let unchanged =
+        inv.vms.iter().find(|v| v.id == id).is_some_and(|v| {
+            v.spec.cpu.model == spec.cpu.model && v.spec.cpu.flags == spec.cpu.flags
+        });
+    if (!spec.cpu.model.is_host_or_max() || !spec.cpu.flags.is_empty()) && !unchanged {
         require_feature(&state.cluster, CPU_MODELS)?;
         return Err(ApiError::bad_request(
             "CPU models other than host and max and CPU flags are not available yet",
@@ -1670,7 +1674,8 @@ pub enum StopMode {
 /// (409 `no_capacity`). 템플릿의 `start`·`reboot`은 409 `vm_is_template`이고, 템플릿 되돌리기 Task가 끝나지 않은 VM의
 /// `start`·`reboot`은 409 `vm_busy`다. 끝나지 않은 펌웨어 초기화 Task(`vm-firmware-reset`)가 있어도 `start`·`reboot`은 409
 /// `vm_busy`이고, 꺼진 TPM VM을 켤 노드가 지금 TPM 상태를 얻을 수 없으면(`firmware_node`가 오프라인이고 온라인 사본이
-/// 없음) `start`는 409 `tpm_state_unavailable`이다.
+/// 없음) `start`는 409 `tpm_state_unavailable`이다. 꺼진 VM이 고정된 노드가 VM의 CPU 모델·플래그를 켤 수 없으면 켤 수 있는
+/// 다른 노드를 고르고, 없으면 `start`는 409 `no_capacity`(까닭)다.
 #[utoipa::path(post, path = "/vms/{key}/actions/{action}", tag = "vms",
     params(("key" = String, Path, description = "id or name"), ("action" = String, Path, description = "start, stop, reboot or hotplug"), ActionQuery),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1761,6 +1766,13 @@ pub async fn vm_action(
                                     rules,
                                 )
                             })?;
+                            spec.node = Some(other);
+                        } else if let Err(why) = cpu_receives(&me, &inv, &node)
+                            && stopped_now(&state, id)?
+                        {
+                            // 계획 63: 고정된 노드가 VM의 CPU를 켤 수 없으면(작업자가 켜지 않는다) 켤 수 있는 노드로.
+                            let other = schedule_with(&me, &inv, &scorer)
+                                .map_err(|_| ApiError::conflict("no_capacity", why))?;
                             spec.node = Some(other);
                         }
                     }
@@ -1938,7 +1950,9 @@ pub(crate) enum RuleCheck {
 /// 있어야 하고(`hotplug` 기능, vCPU 핫플러그, virtio-mem — 아니면 409 `migration_unsupported`), 핫플러그 Task가 끝나지
 /// 않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
 /// 유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
-/// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리)면 409 `no_capacity`다. 대상 노드가 hard
+/// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리, VM이 켤 때 기록한 CPU 모델·플래그를 켤 수 없음)면
+/// 409 `no_capacity`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
+/// `cpu-warning: target node "n3" lacks …`를 남긴다. 대상 노드가 hard
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
 /// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
 /// ISO가 들어 있으면 409 `cdrom_local`이다(매체를 빼거나 공유 풀의 ISO를 쓴다). 실행 중 cloud-init을 바꿨으면(호스트
@@ -1967,9 +1981,18 @@ pub async fn migrate_vm(
     if let Some(pool) = &req.pool {
         state.authz.require_pool(&principal, pool)?;
     }
-    let (task, forced) = start_migration(&state, vm.id, target.id, req.pool, None, rules).await?;
+    let (task, forced, cpu_warning) =
+        start_migration_warned(&state, vm.id, target.id, req.pool, None, rules).await?;
+    let mut detail = Vec::new();
     if req.force {
-        audit.detail(format!("force rules={}", forced.join(",")));
+        detail.push(format!("force rules={}", forced.join(",")));
+    }
+    // `host`·`max` VM의 교차 CPU 옮기기는 막지 않고 감사에 남긴다(계획 63 §10).
+    if let Some(w) = cpu_warning {
+        detail.push(format!("cpu-warning: {w}"));
+    }
+    if !detail.is_empty() {
+        audit.detail(detail.join("; "));
     }
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
@@ -2025,6 +2048,7 @@ pub async fn replicate_vm(
 /// `VmMigrate` Task를 원본 노드에 만든다. 노드 비우기 Task도 쓴다. 오류는 [`migrate_vm`]과 같다. `source`가
 /// 있으면(비우기) VM이 아직 그 노드에 있는지도 보고, 아니면 409 `vm_moved`다(이미 다른 데로 갔다). 배치 규칙은
 /// `rules`대로 보고, Task와 함께 대상 노드에서 어기는 hard 규칙(넘은 규칙, `Force`일 때만 빌 수 없음)을 돌려준다.
+/// `host`·`max` VM의 교차 CPU 경고([`host_cpu_warning`])는 로그에만 남긴다.
 pub(crate) async fn start_migration(
     state: &AppState,
     vm: Uuid,
@@ -2033,6 +2057,19 @@ pub(crate) async fn start_migration(
     source: Option<Uuid>,
     rules: RuleCheck,
 ) -> Result<(Task, Vec<String>), ApiError> {
+    let (task, forced, _) = start_migration_warned(state, vm, target, pool, source, rules).await?;
+    Ok((task, forced))
+}
+
+/// [`start_migration`]과 같되 `host`·`max` VM의 교차 CPU 경고도 돌려준다(마이그레이션 API가 감사에 남긴다).
+pub(crate) async fn start_migration_warned(
+    state: &AppState,
+    vm: Uuid,
+    target: Uuid,
+    pool: Option<String>,
+    source: Option<Uuid>,
+    rules: RuleCheck,
+) -> Result<(Task, Vec<String>, Option<String>), ApiError> {
     // 두 요청이 함께 검사를 지나 Task를 둘 만들지 않게 한다.
     let _lock = state.vm_lock.lock().await;
     let vm = lookup::<VmSpec>(&state.cluster, &vm.to_string())?;
@@ -2183,8 +2220,8 @@ pub(crate) async fn start_migration(
             format!("cannot migrate VM {:?}: {e}", vm.name),
         )
     })?;
-    node_fits_with(&vm.spec, &inv, &target, &moves)
-        .map_err(|e| ApiError::conflict("no_capacity", e))?;
+    // CPU는 켤 때 기록한 것으로 본다(받는 쪽은 그대로 켠다).
+    migration_fits(&vm, &inv, &target, &moves).map_err(|e| ApiError::conflict("no_capacity", e))?;
     let free = inv.free_memory_mib(&target, vm.id);
     if free < i64::from(vm.spec.memory_mib) {
         return Err(ApiError::conflict(
@@ -2218,8 +2255,16 @@ pub(crate) async fn start_migration(
         node: target.id,
         pool,
     };
+    let cpu_warning = inv
+        .nodes
+        .iter()
+        .find(|n| n.id == source)
+        .and_then(|from| host_cpu_warning(&vm, &inv, from, &target));
     let task = create_task(&state.cluster, op, vm.id, source).await?;
-    Ok((task, broken))
+    if let Some(w) = &cpu_warning {
+        tracing::warn!(vm = %vm.name, task = %task.id, "migrating a host-CPU VM: {w}");
+    }
+    Ok((task, broken, cpu_warning))
 }
 
 /// VM 디스크의 크기 늘리기·평탄화 Task가 끝나지 않았으면 409 `vm_busy`. 실행 중인 VM의 디스크는 QMP로

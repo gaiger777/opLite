@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::ha::{RELOCATE_WINDOW, ready};
 use crate::ha_health::Health;
 use crate::placement::{self, Assign};
-use crate::scheduler::{Inventory, disk_moves, replica_fits};
+use crate::scheduler::{Inventory, disk_moves, replica_migration_fits};
 use crate::score::{LOAD_STALE, Loads, NodeUse, Scorer, node_use, vm_cpu_share};
 
 /// 균형 옮기기의 원본으로 보는 노드 수(사용률이 큰 것부터)
@@ -443,7 +443,7 @@ pub fn live(node: &Node, leases: &Leases, now: Instant, b: Instant) -> bool {
 
 /// 균형 옮기기의 대상 조건: 원본·대상이 HVF가 아니고, 대상에 VM 메모리(도는 메모리가 더 크면 그것 —
 /// [`hotplug::allocated_memory_mib`])만큼 미할당 메모리(`free_mib` — 계획한 옮기기 반영)가 있고, 노드 조건(노드 로컬 풀 디스크가
-/// 있는 VM은 그 노드에 쓸 수 있는 복제본이 있어야 한다 — [`replica_fits`])에 맞고, VM이 도는 하드웨어(핫플러그 배치)로 켤 수 있고, 이 VM에 영향을 주는 HA 검사가 실패한 노드가 아니고,
+/// 있는 VM은 그 노드에 쓸 수 있는 복제본이 있어야 한다 — [`replica_migration_fits`], CPU는 켤 때 기록한 것)에 맞고, VM이 도는 하드웨어(핫플러그 배치)로 켤 수 있고, 이 VM에 영향을 주는 HA 검사가 실패한 노드가 아니고,
 /// `assign`(계획한 옮기기)으로 hard 규칙을 어기지 않고, soft 벌점이 지금보다 늘지 않고, HA 그룹 VM은 그룹 우선순위가
 /// 지금 노드 이상이다(되돌아가기와 핑퐁하지 않게). `ha_reserve`는 메모리 합이라 옮겨도 바뀌지 않아 보지 않는다.
 pub fn target_ok(
@@ -464,7 +464,7 @@ pub fn target_ok(
     if free_mib < i64::from(hotplug::allocated_memory_mib(vm)) {
         return Err("not enough unassigned memory");
     }
-    if replica_fits(vm, inv, to).is_err() {
+    if replica_migration_fits(vm, inv, to).is_err() {
         return Err("node does not fit");
     }
     if hotplug::can_receive(vm.status.hardware.as_ref(), to).is_err() {
@@ -935,7 +935,7 @@ fn awaits_failback(
                 .is_some_and(|since| now.saturating_duration_since(*since) < FAILBACK_WAIT)
             && n.status.hypervisor != HVF
             && inv.free_memory_mib(n, vm.id) >= i64::from(vm.spec.memory_mib)
-            && replica_fits(vm, inv, n).is_ok()
+            && replica_migration_fits(vm, inv, n).is_ok()
             && placement::hard_violations(vm, n, inv, &none).is_empty()
             && !health.blocks(vm, n, inv)
     })

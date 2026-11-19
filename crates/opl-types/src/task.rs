@@ -3,11 +3,13 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::cpu::BaselineSource;
 use crate::fence::FenceKind;
 use crate::ha_check::HaCheckAction;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::storage::SourceFormat;
 use crate::template::{CloneOverrides, TemplateDraft};
+use crate::vm::Arch;
 use crate::vm_import::ImportRun;
 
 /// 오래 걸리는 작업. API가 만들고 `node`의 작업 실행기가 실행해 status를 기록한다.
@@ -232,6 +234,29 @@ pub enum TaskOp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secure_boot: Option<bool>,
     },
+    /// 리더의 클러스터 CPU 기준 기록(계획 63): 아키텍처 `arch`의 기준 CPU가 `previous`에서 `current`로 바뀌었다
+    /// (`Skylake-Server-v5 +pcid` 모양, 없으면 기준 없음 — `cluster` VM은 `host`처럼 켠다). `limited_by`는 기준을 낮춘
+    /// 노드의 이름, `running_vms`는 바뀌기 전 기준으로 도는 `cluster` 모델 VM 수다(다음 전원 껐다 켜기에 새 기준이 된다).
+    /// 대상은 클러스터 리소스, 노드는 리더다. 끝난 상태로 만들고 실행기는 실행하지 않는다. 모든 노드가 `cpu-models`를
+    /// 알릴 때만 만든다.
+    CpuBaseline {
+        arch: Arch,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        mode: Option<BaselineSource>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        previous: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        current: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        limited_by: Vec<String>,
+        #[serde(default)]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        running_vms: u32,
+    },
 }
 
 impl TaskOp {
@@ -317,6 +342,44 @@ impl TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_baseline_record_is_tagged_and_omits_empty_fields() {
+        let op = TaskOp::CpuBaseline {
+            arch: Arch::X86_64,
+            mode: Some(BaselineSource::Auto),
+            previous: Some("Cascadelake-Server-v5".into()),
+            current: Some("Skylake-Server-v5 +pcid".into()),
+            limited_by: vec!["n4".into()],
+            running_vms: 3,
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "cpu-baseline",
+                "arch": "x86_64",
+                "mode": "auto",
+                "previous": "Cascadelake-Server-v5",
+                "current": "Skylake-Server-v5 +pcid",
+                "limited_by": ["n4"],
+                "running_vms": 3
+            })
+        );
+        assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        let first = TaskOp::CpuBaseline {
+            arch: Arch::Aarch64,
+            mode: None,
+            previous: None,
+            current: None,
+            limited_by: vec![],
+            running_vms: 0,
+        };
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::json!({ "kind": "cpu-baseline", "arch": "aarch64", "running_vms": 0 })
+        );
+    }
 
     #[test]
     fn op_is_tagged_by_kind() {

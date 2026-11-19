@@ -968,6 +968,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         TaskOp::HaCheck { .. } => Err("an HA check task is a record and is not run".into()),
         TaskOp::BondDegraded { .. } => Err("a bond warning task is a record and is not run".into()),
+        TaskOp::CpuBaseline { .. } => Err("a CPU baseline task is a record and is not run".into()),
         TaskOp::VmBackup { backup } => return backup::backup(ctx, task, *backup).await,
         TaskOp::BackupDelete => return backup::delete(ctx, id).await,
         // 비운 CD-ROM 드라이브는 경고로 남긴다.
