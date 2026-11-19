@@ -770,6 +770,7 @@ mod tests {
             flags: flags.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             enforce,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         })
     }
 

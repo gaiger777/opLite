@@ -2560,6 +2560,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: true,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         can_run(&cpu("Skylake-Server-v5"), c).unwrap();
         assert_eq!(

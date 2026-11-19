@@ -198,6 +198,10 @@ pub(crate) struct Worker {
     /// HA VM이 이 노드에서 `max_restart`보다 많이 크래시했다. 다시 켜지 않고 리더에게 다른 노드로 옮겨 달라고
     /// 한다(`status.ha.relocate_from`). 안쪽 값은 status에 남길 오류다. 요청이 저장소에 보이면 지운다.
     relocate: Option<String>,
+    /// 작업자가 스스로 다시 켜는 VM(크래시, 호스트 SIGTERM, 게스트 감시)이 꺼지기 전에 쓰던 CPU(리뷰 2 #4). 보류된 새
+    /// CPU를 이 노드가 켤 수 없으면 이것으로 다시 켜고 바뀜은 보류로 남긴다 — 사용자가 하지 않은 전원 껐다 켜기 때문에
+    /// VM이 꺼진 채 남지 않게. 켜지면, 또는 원하는 상태가 stopped가 되면 지운다.
+    restart_cpu: Option<ResolvedCpu>,
     /// 마지막으로 조회했을 때 VM이 실행 중이었는지
     was_running: bool,
     /// 사라진 VM의 종료 이벤트를 이 시각까지 기다린다.
@@ -258,6 +262,7 @@ impl Worker {
             backoff: None,
             power_off: None,
             relocate: None,
+            restart_cpu: None,
             was_running: false,
             awaiting_event: None,
             disks_active: false,
@@ -378,6 +383,9 @@ impl Worker {
         if let Some(kind) = self.held_event.take() {
             self.on_event(&vm, kind);
         }
+        if vm.spec.power == PowerState::Stopped {
+            self.restart_cpu = None;
+        }
         match trigger {
             Trigger::Event(kind) => self.on_event(&vm, kind),
             // running을 원할 때 온 명령은 버린다. 남겨 두면 나중의 종료가 ACPI 없이 강제 종료된다.
@@ -456,15 +464,30 @@ impl Worker {
             // 그대로 두므로 실패로 세지 않고 다시 시작한다.
             EventKind::Stopped {
                 guest_initiated: false,
-            } => {}
+            } => self.keep_restart_cpu(vm),
             // HA VM(`started`)은 재시작 정책과 관계없이 다시 켜고, 횟수를 넘으면 옮겨 달라고 한다.
-            EventKind::Crashed => match (self.ha_restarts(vm), vm.spec.restart) {
-                (Some(max), _) => self.record_crash(max, "VM crashed"),
-                (None, RestartPolicy::Never) => self.power_off = Some(Some("VM crashed".into())),
-                (None, RestartPolicy::OnFailure) => self.record_failure("VM crashed".into()),
-            },
+            EventKind::Crashed => {
+                self.keep_restart_cpu(vm);
+                match (self.ha_restarts(vm), vm.spec.restart) {
+                    (Some(max), _) => self.record_crash(max, "VM crashed"),
+                    (None, RestartPolicy::Never) => {
+                        self.power_off = Some(Some("VM crashed".into()))
+                    }
+                    (None, RestartPolicy::OnFailure) => self.record_failure("VM crashed".into()),
+                }
+            }
             EventKind::Started | EventKind::Reset | EventKind::PauseChanged => {}
         }
+    }
+
+    /// 작업자가 스스로 다시 켤 VM의 켤 때 CPU를 기억한다([`Worker::restart_cpu`]). 계획 63 전 기록(해석 없음)이면
+    /// 없다.
+    fn keep_restart_cpu(&mut self, vm: &Vm) {
+        self.restart_cpu = vm
+            .status
+            .hardware
+            .as_ref()
+            .and_then(|hw| hw.cpu_resolved.clone());
     }
 
     /// 리스가 끝났으면(stale) 이 노드에서 도는 HA VM을 강제로 끈다(설계 §3.3). 그 사이 리더가 다른
@@ -735,6 +758,7 @@ impl Worker {
         let secs = guest_watch(vm).unwrap_or_default().as_secs();
         tracing::warn!(vm = %self.id, secs, "guest agent stopped answering; restarting the VM");
         let reason = format!("guest agent did not answer for {secs}s");
+        self.keep_restart_cpu(vm);
         self.stopped_by_us = Some(Instant::now());
         self.stop_requested = None;
         self.force_requested = false;
@@ -1227,9 +1251,21 @@ impl Worker {
         // 새로 켜면 지금 기준·숨김 목록으로 CPU를 해석해 기록한다(계획 63). 메모리 스냅샷은 담을 때의 CPU 그대로이되,
         // 이 노드가 그 CPU를 켤 수 없으면 QEMU가 실패하기 전에 까닭을 남긴다(리뷰 1 M4).
         let cpu = match &restore {
-            None => self
-                .cpu_at_start(vm)
-                .map(|resolved| hardware.cpu_resolved = resolved),
+            None => match self.cpu_at_start(vm) {
+                Ok(resolved) => {
+                    hardware.cpu_resolved = resolved;
+                    Ok(())
+                }
+                // 작업자가 스스로 다시 켜는 VM: 보류된 새 CPU를 이 노드가 켤 수 없으면 쓰던 CPU로 켠다(리뷰 2 #4).
+                Err(CpuRefusal::Cannot(reason)) => match self.restart_fallback(&reason) {
+                    Some(previous) => {
+                        hardware.cpu_resolved = Some(previous);
+                        Ok(())
+                    }
+                    None => Err(CpuRefusal::Cannot(reason)),
+                },
+                Err(e) => Err(e),
+            },
             Some(_) => self.cpu_restorable(&hardware),
         };
         match cpu {
@@ -1242,6 +1278,9 @@ impl Worker {
             }
             Err(CpuRefusal::Cannot(reason)) => {
                 self.deactivate_disks(vm).await;
+                tracing::warn!(vm = %self.id, reason = %reason, "cannot start the VM's CPU on this node");
+                // VM 상태는 노드 이름을 볼 수 없는 사용자도 읽는다(리뷰 2 #6).
+                let reason = crate::cpu::without_node_name(&reason);
                 self.power_off = Some(Some(format!("failed to start: {reason}")));
                 return Ok(Start::NotStarted);
             }
@@ -1266,6 +1305,7 @@ impl Worker {
                     tracing::warn!(vm = %self.id, error = %e, "cannot save the hardware record of the started VM");
                 }
                 self.started = Some(hardware);
+                self.restart_cpu = None;
                 Ok(Start::Started)
             }
             // 태그 없이 다시 시도하면 스냅샷이 아닌 처음부터 부팅하게 되므로 일시 오류라도 멈춘다.
@@ -1383,8 +1423,32 @@ impl Worker {
         ctx.map(|ctx| ctx.start(&vm.spec.cpu)).transpose()
     }
 
+    /// 작업자가 스스로 다시 켜는데(크래시·호스트 SIGTERM·게스트 감시) 지금 스펙·기준·숨김 목록의 CPU를 이 노드가
+    /// 켤 수 없으면(`reason`) 꺼지기 전에 쓰던 CPU를 돌려준다(리뷰 2 #4). 그 CPU도 이 노드가 켤 수 있어야 하고 숨김
+    /// 이름을 새로 드러내지 않아야 한다(그 사이 QEMU를 올렸을 수 있다). 보류 `cpu`는 검사 루프가 다시 적는다 — 다음
+    /// 사용자 전원 껐다 켜기(다른 노드로 옮긴 뒤)가 새 CPU를 쓴다.
+    fn restart_fallback(&self, reason: &str) -> Option<ResolvedCpu> {
+        let previous = self.restart_cpu.clone()?;
+        let ctx = CpuContext::load(&self.cluster, self.config.node).ok()??;
+        if ctx.check(&previous).is_err()
+            || ctx
+                .check_exposed(&previous, "when the VM restarts")
+                .is_err()
+        {
+            return None;
+        }
+        tracing::warn!(
+            vm = %self.id,
+            reason = %reason,
+            cpu = %previous.describe(),
+            "restarting the VM with the CPU it ran with; the new CPU stays pending"
+        );
+        Some(previous)
+    }
+
     /// 메모리 스냅샷이 담을 때 기록한 CPU를 이 노드가 켤 수 있는지(리뷰 1 M4). 기록이 없으면(계획 63 전) 모델만
     /// 펴므로 보지 않는다. 기다리면 풀리는 것(카탈로그가 아직 없음)은 막지 않는다 — 스냅샷 태그는 이번 켜기에만 있다.
+    /// 다만 켤 때 뺀 숨김 이름이 있으면 이 노드의 카탈로그로 드러나지 않음을 확인해야 켠다(리뷰 2 #1).
     fn cpu_restorable(&self, hardware: &RunningHardware) -> Result<(), CpuRefusal> {
         let Some(resolved) = &hardware.cpu_resolved else {
             return Ok(());
@@ -1392,12 +1456,15 @@ impl Worker {
         let Ok(Some(ctx)) = CpuContext::load(&self.cluster, self.config.node) else {
             return Ok(());
         };
-        match ctx.check(resolved) {
-            Err(CpuRefusal::Cannot(reason)) => Err(CpuRefusal::Cannot(format!(
+        if let Err(CpuRefusal::Cannot(reason)) = ctx.check(resolved) {
+            return Err(CpuRefusal::Cannot(format!(
                 "{reason}; the memory snapshot was taken with that CPU"
-            ))),
-            _ => Ok(()),
+            )));
         }
+        // 담을 때 그 노드의 QEMU가 몰라 뺀 숨김 이름을 이 노드의 QEMU가 알면 되돌린 게스트에 드러난다(리뷰 2 #1).
+        // 카탈로그를 모르면 확인할 수 없으니 막는다(기다리면 스냅샷 태그가 사라진다).
+        ctx.check_exposed(resolved, "when the memory snapshot is restored")
+            .map_err(CpuRefusal::Cannot)
     }
 
     /// 메모리 스냅샷 `tag`(스냅샷 id)를 불러오며 켤 하드웨어: 메모리를 담을 때 도는 QEMU와 같은 장치여야 하므로

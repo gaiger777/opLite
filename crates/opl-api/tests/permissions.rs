@@ -1834,3 +1834,39 @@ async fn whoami_names_the_serving_node() {
         "{me}"
     );
 }
+
+/// 리뷰 2 #3: 루트 `cluster.admin`이 아닌 사용자는 허용 목록의 플래그만 켠다(`+invtsc`는 403). 숨기기와 허용 목록의
+/// 켜기는 이 검사를 지난다(그 뒤 검증은 카탈로그가 정한다). 관리자는 무엇이든 켤 수 있다.
+#[tokio::test]
+async fn only_cluster_admins_turn_on_restricted_cpu_flags() {
+    let w = world().await;
+    let with_flags = |name: &str, flags: &[&str]| {
+        let mut req = vm_in(name, Some(&w.a));
+        req["spec"]["cpu"]["flags"] = json!(flags);
+        req
+    };
+    let (status, body) = w.alice.post("/vms", with_flags("tsc", &["+invtsc"])).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], "cpu_flag_restricted", "{body}");
+    assert_eq!(body["details"]["flags"], json!(["+invtsc"]), "{body}");
+    for flags in [&["-invtsc"][..], &["+pcid"]] {
+        let (_, body) = w.alice.post("/vms", with_flags("ok", flags)).await;
+        assert_ne!(body["code"], "cpu_flag_restricted", "{flags:?}: {body}");
+    }
+    let (_, body) = w.admin.post("/vms", with_flags("tsc", &["+invtsc"])).await;
+    assert_ne!(body["code"], "cpu_flag_restricted", "{body}");
+    // 고치기도 같다(이미 저장된 플래그는 다시 보지 않는다).
+    let (_, vm) = w.alice.get("/vms/a1").await;
+    let mut spec = vm["spec"].clone();
+    spec["cpu"]["flags"] = json!(["+vmx"]);
+    let (status, body) = w
+        .alice
+        .put("/vms/a1", json!({ "spec": spec, "labels": {} }), None)
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    // 플래그 목록은 이 사용자가 제한된 플래그를 켤 수 있는지 알린다.
+    let (_, flags) = w.alice.get("/cpu/flags").await;
+    assert_eq!(flags["turn_on_restricted"], false, "{flags}");
+    let (_, flags) = w.admin.get("/cpu/flags").await;
+    assert_eq!(flags["turn_on_restricted"], true, "{flags}");
+}

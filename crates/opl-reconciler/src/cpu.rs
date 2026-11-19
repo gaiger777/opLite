@@ -167,6 +167,39 @@ impl CpuContext {
         }
     }
 
+    /// 다른 노드에서 켠 기록 `resolved`를 이 노드의 QEMU로 그대로 켜면(받는 쪽 마이그레이션, 메모리 스냅샷 되돌리기)
+    /// 드러날 숨김 이름(리뷰 2 #1). 켤 때 그 노드의 QEMU가 몰라 뺀 이름(`dropped_mask`)을 이 노드의 QEMU가 알면
+    /// `-cpu host`가 그 기능을 준다. 이 노드의 카탈로그를 모르면(없음·아직 없음) 확인할 수 없으니 뺀 이름 모두를
+    /// 드러날 것으로 본다. 빈 목록이면 안전하다.
+    pub fn exposed(&self, resolved: &ResolvedCpu) -> Vec<String> {
+        match self.found() {
+            Some(c) => resolved
+                .dropped_mask
+                .iter()
+                .filter(|m| c.flag_index(m).is_some())
+                .cloned()
+                .collect(),
+            None => resolved.dropped_mask.clone(),
+        }
+    }
+
+    /// [`CpuContext::exposed`]가 비지 않으면 그 까닭(`what`은 무엇을 하려다 막혔나)
+    pub fn check_exposed(&self, resolved: &ResolvedCpu, what: &str) -> Result<(), String> {
+        let exposed = self.exposed(resolved);
+        if exposed.is_empty() {
+            return Ok(());
+        }
+        let known = match self.catalog {
+            NodeCatalog::Found(_) => "",
+            _ => " (its CPU catalog is unknown, so the hidden flags cannot be checked)",
+        };
+        Err(format!(
+            "node {:?}{known} would expose the hidden CPU flags {} {what}: the QEMU that started the VM did not know them; power cycle the VM instead",
+            self.node_name,
+            exposed.join(", ")
+        ))
+    }
+
     /// 켤 때의 CPU: 해석하고 이 노드가 켤 수 있는지 본다.
     pub fn start(&self, cpu: &CpuSpec) -> Result<ResolvedCpu, CpuRefusal> {
         let resolved = self
@@ -175,6 +208,17 @@ impl CpuContext {
         self.check(&resolved)?;
         Ok(resolved)
     }
+}
+
+/// 까닭의 앞 `node "n3" `를 `the VM's node `로 바꾼다(리뷰 2 #6). VM 상태(`last_error`)는 노드 이름을 볼 수 없는 폴더
+/// 사용자도 읽으므로 작업자가 남기는 CPU 까닭에는 노드 이름을 쓰지 않는다. 노드로 시작하지 않으면 그대로다.
+pub fn without_node_name(reason: &str) -> String {
+    if let Some(rest) = reason.strip_prefix("node \"")
+        && let Some(end) = rest.find("\" ")
+    {
+        return format!("the VM's node {}", &rest[end + 2..]);
+    }
+    reason.to_string()
 }
 
 /// 보류 목록 `pending`의 `cpu` 항목을 `cpu`로 바꾼다(없으면 뺀다, 새로 생기면 앞에 둔다 — 핫플러그 계획과 같은 자리).
@@ -285,6 +329,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: false,
             source: cpu::CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         let none = ctx(NodeCatalog::None);
         assert_eq!(none.check(&plain), Ok(()));
@@ -304,6 +349,48 @@ mod tests {
         );
     }
 
+    /// 리뷰 2 #1: 켤 때 뺀 숨김 이름은 그 이름을 아는 노드나 카탈로그를 모르는 노드에서 드러난다.
+    #[test]
+    fn dropped_mask_names_are_exposed_where_qemu_knows_them_or_cannot_tell() {
+        let ctx = |catalog| CpuContext {
+            node_name: "n2".into(),
+            arch: Arch::X86_64,
+            accel: Accel::Kvm,
+            baseline: None,
+            mask: vec!["avx512vbmi".into()],
+            catalog,
+        };
+        let mut rec = ResolvedCpu {
+            model: "host".into(),
+            flags: BTreeMap::new(),
+            enforce: false,
+            source: cpu::CpuSource::Spec,
+            dropped_mask: vec!["avx512vbmi".into()],
+        };
+        let knows = ctx(NodeCatalog::Found(Arc::new(known_catalog())));
+        assert_eq!(knows.exposed(&rec), ["avx512vbmi"]);
+        let e = knows.check_exposed(&rec, "on migration").unwrap_err();
+        assert!(
+            e.starts_with("node \"n2\" would expose the hidden CPU flags avx512vbmi on migration"),
+            "{e}"
+        );
+        let mut old = known_catalog();
+        old.flags = vec!["aes".into()];
+        assert!(
+            ctx(NodeCatalog::Found(Arc::new(old)))
+                .exposed(&rec)
+                .is_empty()
+        );
+        for unknown in [NodeCatalog::None, NodeCatalog::Missing("h".into())] {
+            let e = ctx(unknown)
+                .check_exposed(&rec, "on migration")
+                .unwrap_err();
+            assert!(e.contains("cannot be checked"), "{e}");
+        }
+        rec.dropped_mask.clear();
+        assert_eq!(ctx(NodeCatalog::None).check_exposed(&rec, "x"), Ok(()));
+    }
+
     /// `avx512vbmi`만 아는 x86 카탈로그
     fn known_catalog() -> CpuCatalogSpec {
         CpuCatalogSpec {
@@ -316,6 +403,15 @@ mod tests {
             vendor: None,
             models: Vec::new(),
         }
+    }
+
+    #[test]
+    fn stored_reasons_do_not_name_the_node() {
+        assert_eq!(
+            without_node_name("node \"n3\" cannot run CPU model X (missing a)"),
+            "the VM's node cannot run CPU model X (missing a)"
+        );
+        assert_eq!(without_node_name("unknown CPU model"), "unknown CPU model");
     }
 
     #[test]

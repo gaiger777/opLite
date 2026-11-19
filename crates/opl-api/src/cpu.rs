@@ -222,6 +222,46 @@ fn check_flags(
     Ok(())
 }
 
+/// 사용자가 아무 플래그나 켤(`+flag`) 수 있는지: 루트 `cluster.admin`(리뷰 2 #3)
+pub(crate) fn may_turn_on_any_flag(state: &AppState, principal: &Principal) -> bool {
+    state.authz.allows(
+        principal,
+        Privilege::ClusterAdmin,
+        opl_types::authz_eval::AuthzTarget::Root,
+    )
+}
+
+/// 루트 `cluster.admin`이 아닌 사용자는 [`cpu::USER_FLAGS`]만 켤 수 있다(리뷰 2 #3 — Proxmox의 VM 플래그 허용 목록).
+/// 라이브 마이그레이션을 막는 `invtsc`나 중첩 가상화 `vmx`처럼 노드 관리에 닿는 플래그를 폴더 사용자가 켜지 못하게
+/// 한다. 끄기(`-flag`)와 `known`(이미 저장된 플래그 — 관리자가 켠 것을 그대로 두는 PUT)은 보지 않는다. 아니면 403
+/// `cpu_flag_restricted`다.
+pub(crate) fn check_flag_privilege(
+    state: &AppState,
+    principal: &Principal,
+    flags: &[CpuFlag],
+    known: &[CpuFlag],
+) -> Result<(), ApiError> {
+    let restricted: Vec<String> = flags
+        .iter()
+        .filter(|f| f.on && !cpu::user_flag(&f.name) && !known.contains(f))
+        .map(|f| f.to_string())
+        .collect();
+    if restricted.is_empty() || may_turn_on_any_flag(state, principal) {
+        return Ok(());
+    }
+    let mut e = ApiError::new(
+        StatusCode::FORBIDDEN,
+        "cpu_flag_restricted",
+        format!(
+            "only a cluster administrator can turn on the CPU flags {}; others can turn on only {} (hiding any flag is allowed)",
+            restricted.join(", "),
+            cpu::USER_FLAGS.join(", ")
+        ),
+    );
+    e.details = Some(serde_json::json!({ "flags": restricted, "allowed": cpu::USER_FLAGS }));
+    Err(e)
+}
+
 /// VM의 CPU를 검증하고 명명 모델의 별칭을 버전 모델로 고정한다(§8). `previous`는 저장된 VM의 CPU다 — 모델이 그대로면
 /// 다시 해석하지 않고 저장된 플래그는 다시 보지 않는다. 모델 문법·아키텍처·플래그 문법은 `VmSpec::validate`가 본다.
 pub(crate) fn check_cpu(
@@ -266,6 +306,28 @@ pub(crate) fn audit_cpu(
     }
     if previous.map_or(!cpu.flags.is_empty(), |p| p.flags != cpu.flags) {
         let flags: Vec<String> = cpu.flags.iter().map(|f| f.to_string()).collect();
+        parts.push(format!("cpu.flags={}", flags.join(",")));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
+}
+
+/// 요청이 준 CPU(복제·가져오기·이미지 템플릿)의 감사 조각: `cpu=Icelake-Server-v1 (from Icelake-Server) cpu.flags=-x`
+/// (리뷰 2 #7). `model`은 고정한 모델, `asked`는 요청에 적힌 이름이다. 준 것이 없으면 None.
+pub(crate) fn audit_requested_cpu(
+    model: Option<&CpuModel>,
+    asked: Option<&CpuModel>,
+    flags: &[CpuFlag],
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(m) = model {
+        let mut s = format!("cpu={m}");
+        if let Some(a) = asked.filter(|a| *a != m) {
+            s.push_str(&format!(" (from {a})"));
+        }
+        parts.push(s);
+    }
+    if !flags.is_empty() {
+        let flags: Vec<String> = flags.iter().map(|f| f.to_string()).collect();
         parts.push(format!("cpu.flags={}", flags.join(",")));
     }
     (!parts.is_empty()).then(|| parts.join(" "))
@@ -432,6 +494,7 @@ fn vm_cpu_info(inv: &Inventory, vm: &Vm) -> VmCpuInfo {
                 flags: BTreeMap::new(),
                 enforce: false,
                 source: cpu::CpuSource::Spec,
+                dropped_mask: Vec::new(),
             })
         }
     });
@@ -857,6 +920,14 @@ pub struct CpuFlagEntry {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[schema(default)]
     pub masked: bool,
+    /// 루트 `cluster.admin`만 켤 수 있다(관리자가 아닌 사용자의 허용 목록 밖, 리뷰 2 #3). 끄기는 누구나 된다.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(default)]
+    pub restricted: bool,
+    /// 켜면 QEMU가 라이브 마이그레이션을 막는다(`invtsc`). 그런 VM은 비우기·균형 조정·HA 검사가 옮기지 않는다.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[schema(default)]
+    pub blocks_migration: bool,
 }
 
 /// 아키텍처 하나의 CPU 플래그
@@ -865,6 +936,8 @@ pub struct CpuFlags {
     pub arch: Arch,
     /// 카탈로그를 알린 노드 수
     pub nodes: u32,
+    /// 이 사용자가 `restricted` 플래그도 켤 수 있다(루트 `cluster.admin`).
+    pub turn_on_restricted: bool,
     pub flags: Vec<CpuFlagEntry>,
 }
 
@@ -881,10 +954,11 @@ pub async fn list_cpu_flags(
     sees_nodes(&state, &principal)?;
     let inv = Inventory::load(&state.cluster)?;
     let arch = pick_arch(&inv, q.arch)?;
-    Ok(Json(cpu_flags(&inv, arch)))
+    let admin = may_turn_on_any_flag(&state, &principal);
+    Ok(Json(cpu_flags(&inv, arch, admin)))
 }
 
-fn cpu_flags(inv: &Inventory, arch: Arch) -> CpuFlags {
+fn cpu_flags(inv: &Inventory, arch: Arch, admin: bool) -> CpuFlags {
     let mut counts: BTreeMap<String, (u32, u32)> = BTreeMap::new();
     let mut probed = 0;
     for node in arch_nodes(inv, arch) {
@@ -908,10 +982,13 @@ fn cpu_flags(inv: &Inventory, arch: Arch) -> CpuFlags {
     CpuFlags {
         arch,
         nodes: probed,
+        turn_on_restricted: admin,
         flags: counts
             .into_iter()
             .map(|(name, (supported, known))| CpuFlagEntry {
                 masked: inv.cpu_mask.contains(&name),
+                restricted: !cpu::user_flag(&name),
+                blocks_migration: cpu::MIGRATION_BLOCKERS.contains(&name.as_str()),
                 name,
                 supported,
                 known,
@@ -1110,6 +1187,10 @@ pub(crate) fn apply_settings(
             .collect();
         notes.push(format!("cpu.pinned={}", described.join(";")));
     }
+    // 켤 수 없는 노드를 두고 고정했음을 남긴다(리뷰 2 #7).
+    if patch.force && patch.pinned.is_some() {
+        notes.push("cpu.force=true".into());
+    }
     next.validate().map_err(cpu_error)?;
     for p in &next.pinned {
         check_flags(inv, p.arch, &p.flags, &[])?;
@@ -1150,7 +1231,14 @@ fn new_baselines(inv: &Inventory, settings: &CpuSettings) -> BTreeMap<Arch, Base
         .iter()
         .map(|(k, v)| (k.clone(), v.as_ref().clone()))
         .collect();
-    cpu::baseline(&inv.nodes, &catalogs, settings)
+    // 리더가 기록할 것과 같은 셈(빠진 카탈로그 동안의 붙잡기 포함, 리뷰 2 #2)
+    crate::cpu_baseline::compute(
+        &inv.nodes,
+        &catalogs,
+        settings,
+        &inv.cpu_baselines,
+        crate::auth::unix_now(),
+    )
 }
 
 /// 설정 `cpu`를 `next`로 바꾼 뒤 보류 `cpu`(다음 전원 껐다 켜기에 CPU가 바뀜)를 가질 실행 중 VM 수(§11 — 화면의
@@ -1185,6 +1273,22 @@ pub(crate) fn affected_running_vms(inv: &Inventory, next: &CpuSettings) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_cpu_audit_names_the_pinned_model_and_flags() {
+        let ice: CpuModel = "Icelake-Server-v1".parse().unwrap();
+        let alias: CpuModel = "Icelake-Server".parse().unwrap();
+        let flags: Vec<CpuFlag> = vec!["-avx512vbmi".parse().unwrap()];
+        assert_eq!(
+            audit_requested_cpu(Some(&ice), Some(&alias), &flags).as_deref(),
+            Some("cpu=Icelake-Server-v1 (from Icelake-Server) cpu.flags=-avx512vbmi")
+        );
+        assert_eq!(
+            audit_requested_cpu(Some(&ice), Some(&ice), &[]).as_deref(),
+            Some("cpu=Icelake-Server-v1")
+        );
+        assert_eq!(audit_requested_cpu(None, None, &[]), None);
+    }
 
     #[test]
     fn distance_counts_edits_ignoring_case() {

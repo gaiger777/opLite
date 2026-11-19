@@ -345,10 +345,19 @@ pub(crate) async fn cpu(
                 .into_iter()
                 .flatten()
                 .map(|f| {
+                    // 숨김 목록, 관리자만 켬(허용 목록 밖), 켜면 라이브 마이그레이션이 막힘(리뷰 2 #3)
+                    let note: Vec<&str> = [
+                        (f["masked"] == true, "masked"),
+                        (f["restricted"] == true, "admin only"),
+                        (f["blocks_migration"] == true, "blocks migration"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(on, word)| on.then_some(word))
+                    .collect();
                     vec![
                         cell(&f["name"]),
                         format!("{}/{total}", f["supported"].as_u64().unwrap_or(0)),
-                        if f["masked"] == true { "masked" } else { "" }.into(),
+                        note.join(", "),
                     ]
                 })
                 .collect();
@@ -585,7 +594,8 @@ mod tests {
                 200,
                 json!({ "arch": "x86_64", "nodes": 2, "flags": [
                     { "name": "aes", "supported": 2, "known": 2 },
-                    { "name": "avx512vbmi", "supported": 1, "known": 2, "masked": true }
+                    { "name": "avx512vbmi", "supported": 1, "known": 2, "masked": true, "restricted": true },
+                    { "name": "invtsc", "supported": 2, "known": 2, "restricted": true, "blocks_migration": true }
                 ] }),
             ),
             ("GET", "/api/v1/cpu/baseline") => (
@@ -662,7 +672,10 @@ mod tests {
         let text = run(CpuCmd::Flags { arch: None }).await;
         assert_eq!(
             text,
-            "FLAG        SUPPORTED  NOTE\naes         2/2\navx512vbmi  1/2        masked\n"
+            "FLAG        SUPPORTED  NOTE\n\
+             aes         2/2\n\
+             avx512vbmi  1/2        masked, admin only\n\
+             invtsc      2/2        admin only, blocks migration\n"
         );
         let text = run(CpuCmd::Baseline).await;
         assert_eq!(

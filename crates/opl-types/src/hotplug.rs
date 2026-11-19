@@ -1449,6 +1449,7 @@ mod tests {
             flags: Default::default(),
             enforce: false,
             source: crate::cpu::CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         hw.cpu_resolved = Some(now.clone());
         let mut masked = now.clone();

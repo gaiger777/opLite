@@ -362,10 +362,9 @@ async fn cpu_views_show_what_each_node_can_run() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["nodes"], 2);
     assert!(
-        body["flags"]
-            .as_array()
-            .unwrap()
-            .contains(&json!({ "name": "avx512vbmi", "supported": 1, "known": 2 })),
+        body["flags"].as_array().unwrap().contains(
+            &json!({ "name": "avx512vbmi", "supported": 1, "known": 2, "restricted": true })
+        ),
         "{body}"
     );
 
@@ -438,6 +437,15 @@ async fn cpu_settings_are_checked_and_count_the_affected_vms() {
     assert_eq!(
         body["spec"]["cpu"]["pinned"],
         json!([{ "arch": "x86_64", "model": "Icelake-Server-v7" }])
+    );
+    // 리뷰 2 #7: 409를 넘었음을 감사에 남긴다.
+    let details = audit_details(&env, "PATCH /settings").await;
+    assert!(
+        details
+            .iter()
+            .any(|d| d.contains("cpu.pinned=x86_64:Icelake-Server-v7")
+                && d.contains("cpu.force=true")),
+        "{details:?}"
     );
     let (status, body) = admin
         .patch(
@@ -643,6 +651,7 @@ fn resolved(model: &str, source: CpuSource) -> ResolvedCpu {
         flags: Default::default(),
         enforce: model != "host",
         source,
+        dropped_mask: Vec::new(),
     }
 }
 
@@ -968,4 +977,20 @@ async fn the_cluster_entry_has_no_current_baseline_during_an_upgrade() {
     let (status, body) = admin.get("/cpu/models?arch=x86_64").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(current(&body), None, "{body}");
+}
+
+/// 리뷰 2 #9: `Inventory`는 노드가 알린 카탈로그만 읽고 해시마다 한 번만 푼다(같은 `Arc`).
+#[tokio::test]
+async fn the_inventory_reads_only_announced_catalogs_and_parses_each_once() {
+    let env = Env::start().await;
+    let (strong, weak) = add_catalogs(&env).await;
+    add_x86_node(&env, "n1", &strong).await;
+    let a = opl_api::scheduler::Inventory::load(&env.cluster).unwrap();
+    assert!(a.cpu_catalogs.contains_key(&strong));
+    assert!(!a.cpu_catalogs.contains_key(&weak));
+    let b = opl_api::scheduler::Inventory::load(&env.cluster).unwrap();
+    assert!(std::sync::Arc::ptr_eq(
+        &a.cpu_catalogs[&strong],
+        &b.cpu_catalogs[&strong]
+    ));
 }

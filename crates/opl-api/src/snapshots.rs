@@ -954,7 +954,11 @@ pub async fn clone_vm(
             }
         }
     }
+    if let Some(flags) = &req.cpu_flags {
+        crate::cpu::check_flag_privilege(&state, &principal, flags, &spec.cpu.flags)?;
+    }
     let overrides = overrides(&state, &vm, &spec, &req, &disks, target.as_ref(), node)?;
+    let source_cpu = spec.cpu.clone();
     let spec = match &overrides {
         Some(ov) => apply_overrides(&spec, ov).map_err(|e| ApiError::bad_request(e.to_string()))?,
         None => spec,
@@ -1014,7 +1018,16 @@ pub async fn clone_vm(
         (true, _) => " (linked)",
         (false, _) => "",
     };
-    let detail = format!("vm clone {} -> {}{how}", vm.name, req.name);
+    let mut detail = format!("vm clone {} -> {}{how}", vm.name, req.name);
+    // 복제가 바꾼 CPU 모델·플래그(별칭에서 고정한 이름 포함, 리뷰 2 #7)
+    let from = req
+        .cpu_model
+        .as_ref()
+        .filter(|m| **m != spec.cpu.model)
+        .map(|m| m.to_string());
+    if let Some(cpu) = crate::cpu::audit_cpu(&spec.cpu, Some(&source_cpu), from.as_deref()) {
+        detail.push_str(&format!(" {cpu}"));
+    }
     // 확인한 폴더를 Task에 못 박는다: 줄에서 기다리는 사이 원본이 옮겨져도 복제본은 확인한 폴더에 든다(리뷰 1).
     // 루트면 비워 두고 Task가 루트에 둔다.
     let overrides = match spec.folder {

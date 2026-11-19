@@ -213,15 +213,19 @@ async fn record_node(
     let cpu_ready = crate::cpu::cpu_models_ready(cluster, &config.name);
     // 해시보다 카탈로그를 먼저 만든다(검사기와 같은 차례) — 리더가 그 사이에 기준을 셈하면 이 노드가 빠져 기준이
     // 올랐다 내려온다(리뷰 1 I1).
-    if cpu_ready && let Some(crate::cpu::Probed::Ok { catalog, cpu }) = &host.cpu {
-        crate::cpu::publish(cluster, &cpu.catalog, catalog).await;
-    }
+    // 올리지 못하면 새 해시를 쓰지 않고 앞 것을 둔다(리뷰 2 #2). 검사 회차가 다시 올리고 쓴다.
+    let published = match &host.cpu {
+        Some(crate::cpu::Probed::Ok { catalog, cpu }) if cpu_ready => {
+            crate::cpu::publish(cluster, &cpu.catalog, catalog).await
+        }
+        _ => true,
+    };
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
         *status = NodeStatus {
             // 탐침 결과(실패면 앞 카탈로그에 오류만). 쓰지 못하면 이미 적힌 것을 지우지 않는다.
             cpu: match &host.cpu {
-                Some(probed) if cpu_ready => Some(probed.node_cpu(previous.as_ref())),
+                Some(probed) if cpu_ready && published => Some(probed.node_cpu(previous.as_ref())),
                 _ => previous,
             },
             online: true,

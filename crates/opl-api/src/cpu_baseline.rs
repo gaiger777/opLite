@@ -9,7 +9,10 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::audit::AuditTarget;
 use opl_types::cluster::ClusterSpec;
-use opl_types::cpu::{self, Baseline, CpuCatalogSpec, CpuModel, PreviousBaseline};
+use opl_types::cpu::{
+    self, Baseline, BaselineMode, BaselineSource, CpuCatalogSpec, CpuModel, CpuSettings,
+    PreviousBaseline,
+};
 use opl_types::node::{CPU_MODELS, Node, NodeSpec, all_have};
 use opl_types::resource::Resource;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState, TaskStatus};
@@ -151,16 +154,85 @@ pub(crate) async fn record(state: &AppState) {
     }
 }
 
-/// 어떤 노드가 알린 카탈로그 해시의 리소스가 아직 없는지(순수). 노드는 카탈로그를 먼저 만들고 해시를 쓰지만, 정리
-/// 작업이 같은 때 오래된 같은 해시를 지웠으면 잠깐 없다. 그동안 셈하면 그 노드가 빠져 기준이 올랐다 내려온다(리뷰 1
-/// I1) — 앞 기록을 그대로 두고 다음 tick에 셈한다.
-fn catalog_missing(nodes: &[Node], catalogs: &BTreeMap<String, CpuCatalogSpec>) -> bool {
-    nodes.iter().filter(|n| !n.spec.witness).any(|n| {
-        n.status
-            .cpu
-            .as_ref()
-            .is_some_and(|c| !c.catalog.is_empty() && !catalogs.contains_key(&c.catalog))
-    })
+/// 노드가 알린 해시의 카탈로그가 없을 때 앞 기록을 붙잡는 가장 긴 시간(그 탐침부터, 리뷰 2 #2)
+pub(crate) const CATALOG_HOLD_SECS: u64 = 600;
+
+/// 리더가 기록할 기준을 셈한다(순수). [`cpu::baseline`]에 더해, 노드가 알린 해시의 카탈로그 리소스가 없는 동안(정리
+/// 작업이 같은 때 오래된 같은 해시를 지움, 올리기 실패) 그 아키텍처의 auto 기준은 앞 기록을 붙잡는다 — 그 노드가 빠져
+/// 기준이 올랐다 내려오지 않게(리뷰 1 I1). 붙잡기에는 끝이 있다(리뷰 2 #2):
+///
+/// - 그 노드가 온라인이고 그 탐침이 [`CATALOG_HOLD_SECS`]보다 오래되지 않았을 때만이다. 그 뒤에는 그 노드를 빼고 셈하고
+///   기준의 `warnings`에 적는다(꺼진 노드의 사라진 카탈로그가 기준을 영영 묶지 않게).
+/// - 그 노드의 아키텍처만이다(aarch64 노드가 x86_64 기준을 묶지 않는다).
+/// - 설정이 auto이고 앞 기록도 auto일 때만이다 — 고정·끔·auto로 바꾸기는 곧바로 적용된다. 붙잡는 동안에도 숨김 목록과
+///   `auto_flags` 끄기는 적용한다(모델과 더한 플래그만 앞 것).
+///
+/// `old`는 지금 기록(`ClusterStatus.cpu_baselines`), `now`는 유닉스 초다.
+pub(crate) fn compute(
+    nodes: &[Node],
+    catalogs: &BTreeMap<String, CpuCatalogSpec>,
+    settings: &CpuSettings,
+    old: &BTreeMap<Arch, Baseline>,
+    now: u64,
+) -> BTreeMap<Arch, Baseline> {
+    let mut fresh = cpu::baseline(nodes, catalogs, settings);
+    let mut holding: BTreeMap<Arch, Vec<&str>> = BTreeMap::new();
+    for n in nodes.iter().filter(|n| !n.spec.witness) {
+        let (Some(arch), Some(c)) = (n.status.arch, n.status.cpu.as_ref()) else {
+            continue;
+        };
+        if c.catalog.is_empty() || catalogs.contains_key(&c.catalog) {
+            continue;
+        }
+        if n.status.online && now.saturating_sub(c.probed_at) < CATALOG_HOLD_SECS {
+            holding.entry(arch).or_default().push(&n.name);
+        }
+    }
+    for (arch, names) in holding {
+        let auto = settings.pinned_for(arch).is_none() && settings.baseline == BaselineMode::Auto;
+        let Some(prev) = old
+            .get(&arch)
+            .filter(|o| auto && o.mode == BaselineSource::Auto)
+        else {
+            continue;
+        };
+        let mut kept = prev.clone();
+        // 모델과 더한 플래그는 앞 것, 꺼진 플래그(숨김 목록)는 지금 설정의 것이다.
+        let now_off = fresh
+            .get(&arch)
+            .map(|f| f.flags.clone())
+            .unwrap_or_default();
+        kept.flags = prev
+            .flags
+            .iter()
+            .filter(|(_, on)| **on && settings.auto_flags)
+            .chain(now_off.iter().filter(|(_, on)| !**on))
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        let left_out: Vec<String> = names
+            .iter()
+            .map(|name| {
+                format!(
+                    "node {name:?} announced a CPU catalog that is missing from the cluster and is left out"
+                )
+            })
+            .collect();
+        kept.warnings = fresh
+            .get(&arch)
+            .map(|f| f.warnings.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|w| !left_out.contains(w))
+            .collect();
+        for name in names {
+            kept.warnings.push(format!(
+                "node {name:?} announced a CPU catalog that is missing from the cluster; the previous baseline is kept for up to {} minutes",
+                CATALOG_HOLD_SECS / 60
+            ));
+        }
+        fresh.insert(arch, kept);
+    }
+    fresh
 }
 
 async fn try_record(state: &AppState) -> Result<(), ClusterError> {
@@ -172,23 +244,36 @@ async fn try_record(state: &AppState) -> Result<(), ClusterError> {
     let Some(info) = cluster.list::<ClusterSpec>()?.1.into_iter().next() else {
         return Ok(());
     };
-    let catalogs: BTreeMap<String, CpuCatalogSpec> = cluster
-        .list::<CpuCatalogSpec>()?
-        .1
-        .into_iter()
-        .map(|c| (c.name, c.spec))
-        .collect();
-    if catalog_missing(&nodes, &catalogs) {
-        return Ok(());
-    }
+    // 노드가 알린 카탈로그만, 풀어 둔 것으로(리뷰 2 #9)
+    let catalogs: BTreeMap<String, CpuCatalogSpec> =
+        crate::scheduler::node_catalogs(cluster, &nodes)?
+            .into_iter()
+            .map(|(k, v)| (k, v.as_ref().clone()))
+            .collect();
     let settings = crate::settings::current(cluster)?
         .spec
         .cpu
         .unwrap_or_default();
-    let fresh = cpu::baseline(&nodes, &catalogs, &settings);
-    let (merged, changes) = merge(&info.status.cpu_baselines, fresh, crate::auth::unix_now());
+    let now = crate::auth::unix_now();
+    let fresh = compute(
+        &nodes,
+        &catalogs,
+        &settings,
+        &info.status.cpu_baselines,
+        now,
+    );
+    let (merged, changes) = merge(&info.status.cpu_baselines, fresh, now);
     if merged == info.status.cpu_baselines {
         return Ok(());
+    }
+    // 새로 생긴 경고(카탈로그 없는 노드, 붙잡기, 켤 수 없는 노드)는 로그에도 남긴다.
+    for (arch, b) in &merged {
+        let before = info.status.cpu_baselines.get(arch);
+        for w in &b.warnings {
+            if before.is_none_or(|o| !o.warnings.contains(w)) {
+                tracing::warn!(arch = %arch_name(*arch), "cluster CPU baseline: {w}");
+            }
+        }
     }
     let mut status = info.status.clone();
     status.cpu_baselines = merged;
@@ -258,37 +343,105 @@ mod tests {
         }
     }
 
+    fn cat_node(name: &str, arch: Arch, hash: Option<&str>, online: bool, probed_at: u64) -> Node {
+        let mut n: Node = Resource::new(
+            name,
+            opl_types::node::NodeSpec {
+                address: format!("{name}:8006"),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        n.status.arch = Some(arch);
+        n.status.online = online;
+        n.status.hypervisor = "qemu-kvm".into();
+        n.status.cpu = hash.map(|h| cpu::NodeCpu {
+            catalog: h.into(),
+            accel: "kvm".into(),
+            vendor: Some("GenuineIntel".into()),
+            probed_at,
+            ..Default::default()
+        });
+        n
+    }
+
+    /// 리뷰 1 I1·리뷰 2 #2: 알린 카탈로그가 없는 노드는 auto 기준을 잠깐만 붙잡는다 — 온라인이고 탐침이 10분 안일
+    /// 때, 그 아키텍처만, 설정이 auto일 때만. 그 뒤에는 그 노드를 빼고 셈하고 경고를 남긴다.
     #[test]
-    fn a_node_whose_announced_catalog_is_not_there_yet_holds_the_baseline() {
-        let node = |name: &str, hash: Option<&str>, witness: bool| {
-            let mut n: Node = Resource::new(
-                name,
-                opl_types::node::NodeSpec {
-                    address: format!("{name}:8006"),
-                    maintenance: false,
-                    witness,
-                    roles: None,
-                },
-            );
-            n.status.cpu = hash.map(|h| cpu::NodeCpu {
-                catalog: h.into(),
-                ..Default::default()
-            });
-            n
+    fn a_missing_catalog_holds_the_auto_baseline_only_briefly_and_only_for_its_arch() {
+        let x = Arch::X86_64;
+        let probe = opl_driver::mock_cpu_probe().catalog;
+        let catalogs = BTreeMap::from([(probe.hash(), probe.clone())]);
+        let h = probe.hash();
+        let auto = CpuSettings {
+            baseline: BaselineMode::Auto,
+            auto_flags: false,
+            mask: vec!["avx512vbmi".into()],
+            ..CpuSettings::default()
         };
-        let catalogs = BTreeMap::from([("h1".to_string(), opl_driver::mock_cpu_probe().catalog)]);
-        let ok = vec![
-            node("n1", Some("h1"), false),
-            node("n2", None, false),
-            node("n3", Some(""), false),
-        ];
-        assert!(!catalog_missing(&ok, &catalogs));
-        let mut gap = ok.clone();
-        gap.push(node("n4", Some("h2"), false));
-        assert!(catalog_missing(&gap, &catalogs));
-        let mut witness = ok;
-        witness.push(node("w", Some("h2"), true));
-        assert!(!catalog_missing(&witness, &catalogs));
+        let now = 10_000;
+        let mut prev = base(
+            "Cascadelake-Server-v5",
+            &[("pcid", true), ("avx512vbmi", false)],
+        );
+        prev.since = 7;
+        let old = BTreeMap::from([(x, prev.clone())]);
+        let n1 = cat_node("n1", x, Some(&h), true, now);
+        // 붙잡기: 온라인이고 방금 탐침했다. 모델과 더한 플래그는 앞 것, 꺼진 플래그는 지금 숨김 목록이다.
+        let fresh_gap = cat_node("n5", x, Some("gone"), true, now - 30);
+        let held = compute(&[n1.clone(), fresh_gap], &catalogs, &auto, &old, now);
+        let b = &held[&x];
+        assert_eq!(b.model, "Cascadelake-Server-v5");
+        assert_eq!(b.flags, BTreeMap::from([("avx512vbmi".to_string(), false)]));
+        assert!(
+            b.warnings.iter().any(|w| w.contains("node \"n5\" announced a CPU catalog that is missing from the cluster; the previous baseline is kept")),
+            "{:?}",
+            b.warnings
+        );
+        let auto_flags = CpuSettings {
+            auto_flags: true,
+            ..auto.clone()
+        };
+        let held = compute(
+            &[n1.clone(), cat_node("n5", x, Some("gone"), true, now - 30)],
+            &catalogs,
+            &auto_flags,
+            &old,
+            now,
+        );
+        assert_eq!(held[&x].flags.get("pcid"), Some(&true));
+        // 오래된 탐침이나 꺼진 노드는 붙잡지 않는다: 그 노드를 빼고 셈하고 경고한다.
+        for gap in [
+            cat_node("n5", x, Some("gone"), true, now - CATALOG_HOLD_SECS),
+            cat_node("n5", x, Some("gone"), false, now),
+        ] {
+            let got = compute(&[n1.clone(), gap], &catalogs, &auto, &old, now);
+            let b = &got[&x];
+            assert_ne!(b.model, "Cascadelake-Server-v5");
+            assert!(b.warnings.contains(
+                &"node \"n5\" announced a CPU catalog that is missing from the cluster and is left out".to_string()
+            ));
+        }
+        // 고정·끔으로 바꾸기는 붙잡기와 상관없이 곧바로 적용된다.
+        let gap = || cat_node("n5", x, Some("gone"), true, now);
+        let off = CpuSettings::default();
+        assert!(compute(&[n1.clone(), gap()], &catalogs, &off, &old, now).is_empty());
+        let pinned = CpuSettings {
+            pinned: vec![cpu::PinnedBaseline {
+                arch: x,
+                model: "Skylake-Server-v5".parse().unwrap(),
+                flags: Vec::new(),
+            }],
+            ..CpuSettings::default()
+        };
+        let got = compute(&[n1.clone(), gap()], &catalogs, &pinned, &old, now);
+        assert_eq!(got[&x].model, "Skylake-Server-v5");
+        assert_eq!(got[&x].mode, BaselineSource::Pinned);
+        // 다른 아키텍처의 빠진 카탈로그는 x86_64 기준을 묶지 않는다.
+        let arm = cat_node("a1", Arch::Aarch64, Some("gone"), true, now);
+        let got = compute(&[n1.clone(), arm], &catalogs, &auto, &old, now);
+        assert_ne!(got[&x].model, "Cascadelake-Server-v5");
     }
 
     #[test]

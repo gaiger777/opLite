@@ -23,6 +23,34 @@ pub const MAX_CPU_FLAGS: usize = 64;
 /// `x86-64-v*` 수준의 기반 QEMU 모델(버전 고정). Proxmox는 버전 없는 `qemu64`를 쓰지만 우리는 별칭을 고정한다(§8).
 pub const LEVEL_BASE_MODEL: &str = "qemu64-v1";
 
+/// 루트 `cluster.admin`이 아닌 사용자가 VM에서 켤(`+flag`) 수 있는 플래그(계획 63 리뷰 2). Proxmox VE가 VM마다
+/// 허용하는 목록(qemu-server `CPUFlags.pm`의 `supported_cpu_flags`: 보안 완화·`pdpe1gb`·`aes`·Hyper-V 둘)을 따른다.
+/// 라이브 마이그레이션을 막거나 호스트 기능을 드러내는 것(`invtsc`, 중첩 가상화 `vmx`·`svm` …)은 없다. 끄기(`-flag`)는
+/// QEMU가 아는 이름이면 누구나 된다.
+pub const USER_FLAGS: &[&str] = &[
+    "aes",
+    "amd-no-ssb",
+    "amd-ssbd",
+    "hv-evmcs",
+    "hv-tlbflush",
+    "ibpb",
+    "md-clear",
+    "pcid",
+    "pdpe1gb",
+    "spec-ctrl",
+    "ssbd",
+    "virt-ssbd",
+];
+
+/// 켜면 QEMU가 라이브 마이그레이션을 막는 플래그(QEMU `unmigratable_flags` — `invtsc`는 `tsc-frequency` 없이
+/// 마이그레이션 막이를 단다). 이런 VM은 비우기·균형 조정·HA 검사가 옮기지 않는다(관리자만 켤 수 있다).
+pub const MIGRATION_BLOCKERS: &[&str] = &["invtsc"];
+
+/// 관리자가 아닌 사용자가 켤 수 있는 플래그인지([`USER_FLAGS`])
+pub fn user_flag(name: &str) -> bool {
+    USER_FLAGS.contains(&name)
+}
+
 /// 보류 `cpu`의 설명 끝에 붙는 말: CPUID는 QEMU를 띄울 때만 정해진다.
 pub const POWER_CYCLE: &str = "power cycle required; a reboot inside the guest does not apply it";
 
@@ -387,9 +415,24 @@ pub struct ResolvedCpu {
     pub enforce: bool,
     #[serde(default)]
     pub source: CpuSource,
+    /// 켤 때 이 노드의 QEMU가 몰라 뺀 클러스터 숨김 이름(`host`·`max`, 리뷰 2). 그 QEMU는 그 기능을 주지 못해 숨긴 것과
+    /// 같지만, 그 이름을 아는 QEMU로 옮기거나(받는 쪽은 이 기록 그대로 켠다) 메모리 스냅샷을 되돌리면 드러난다 —
+    /// 마이그레이션 확인과 되돌리기가 이것으로 막는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub dropped_mask: Vec<String>,
 }
 
 impl ResolvedCpu {
+    /// 켜 둔 플래그 가운데 라이브 마이그레이션을 막는 것([`MIGRATION_BLOCKERS`])
+    pub fn migration_blockers(&self) -> Vec<&str> {
+        MIGRATION_BLOCKERS
+            .iter()
+            .copied()
+            .filter(|f| self.flags.get(*f) == Some(&true))
+            .collect()
+    }
+
     /// `Icelake-Server-v7 +aes -avx512vbmi` 모양(플래그는 이름순)
     pub fn describe(&self) -> String {
         let mut s = self.model.clone();
@@ -476,11 +519,17 @@ pub fn resolve(
         }
     };
     let mut masked = BTreeSet::new();
+    let mut dropped_mask = Vec::new();
+    let host = matches!(model.as_str(), "host" | "max");
     for m in mask {
         let Ok(name) = normalize_flag(m) else {
             continue;
         };
         if catalog.is_some_and(|c| c.flag_index(&name).is_none()) {
+            // 버전 모델의 정의는 QEMU를 올려도 바뀌지 않는다 — 드러날 수 있는 것은 `host`·`max`뿐이다.
+            if host {
+                dropped_mask.push(name);
+            }
             continue;
         }
         flags.insert(name.clone(), false);
@@ -491,11 +540,14 @@ pub fn resolve(
             flags.insert(f.name.clone(), f.on);
         }
     }
+    dropped_mask.sort();
+    dropped_mask.dedup();
     Ok(ResolvedCpu {
         model,
         flags,
         enforce,
         source,
+        dropped_mask,
     })
 }
 
@@ -958,6 +1010,7 @@ impl Baseline {
             flags: self.flags.clone(),
             enforce: false,
             source: CpuSource::Cluster,
+            dropped_mask: Vec::new(),
         }
         .describe()
     }
@@ -1009,6 +1062,7 @@ fn node_runs(
             flags: f,
             enforce,
             source: CpuSource::Cluster,
+            dropped_mask: Vec::new(),
         },
         node.catalog,
     )
@@ -1054,6 +1108,14 @@ pub fn baseline(
                     vendor: c.vendor.as_deref(),
                     catalog: cat,
                 }),
+                // 알린 해시의 카탈로그 리소스가 없다(올리기 실패, 정리 작업과 겹침). 리더가 잠깐 앞 기록을 붙잡은 뒤에야
+                // 여기까지 온다(opl-api `cpu_baseline`, 리뷰 2 #2).
+                None if n.status.cpu.as_ref().is_some_and(|c| !c.catalog.is_empty()) => {
+                    warnings.push(format!(
+                        "node {:?} announced a CPU catalog that is missing from the cluster and is left out",
+                        n.name
+                    ))
+                }
                 None => warnings.push(format!(
                     "node {:?} has no CPU catalog yet and is left out",
                     n.name
@@ -1323,6 +1385,7 @@ pub fn pending_change(
                 flags: BTreeMap::new(),
                 enforce: false,
                 source: CpuSource::Spec,
+                dropped_mask: Vec::new(),
             };
             &legacy
         }
@@ -1866,6 +1929,7 @@ mod tests {
             flags: map(flags),
             enforce: true,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         let old = old_kvm();
         assert_eq!(
@@ -1941,6 +2005,32 @@ mod tests {
         }
     }
 
+    /// 리뷰 2 #3: 관리자가 아닌 사용자가 켤 수 있는 플래그와 마이그레이션을 막는 플래그
+    #[test]
+    fn the_user_flag_allowlist_excludes_migration_blockers() {
+        assert!(user_flag("pcid") && user_flag("aes") && user_flag("md-clear"));
+        assert!(!user_flag("invtsc") && !user_flag("vmx") && !user_flag("svm"));
+        for f in MIGRATION_BLOCKERS {
+            assert!(!user_flag(f), "{f}");
+        }
+        // 이름은 normalize_flag가 만든 모양이다.
+        for f in USER_FLAGS {
+            assert_eq!(normalize_flag(f).as_deref(), Ok(*f));
+        }
+        let mut r = resolve(
+            &cpu("host", &["+invtsc"]),
+            Arch::X86_64,
+            Accel::Kvm,
+            None,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r.migration_blockers(), ["invtsc"]);
+        r.flags.insert("invtsc".into(), false);
+        assert!(r.migration_blockers().is_empty());
+    }
+
     /// 리뷰 1 C1: 어떤 노드의 QEMU가 모르는 꺼진 플래그(QEMU를 차례로 올리는 중 새 이름)
     #[test]
     fn flags_unknown_to_the_node_qemu_are_dropped_from_the_cluster_side_and_refused_from_the_vm() {
@@ -1987,6 +2077,31 @@ mod tests {
         .unwrap();
         assert!(host.flags.is_empty());
         assert_eq!(can_run(&host, &old_qemu), Ok(()));
+        // 리뷰 2 #1: 뺀 숨김 이름을 기록한다(`host`만 — 버전 모델은 정의가 고정이라 드러날 일이 없다).
+        assert_eq!(host.dropped_mask, ["gfni"]);
+        assert!(cl.dropped_mask.is_empty());
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(json["dropped_mask"], serde_json::json!(["gfni"]));
+        // 아는 QEMU에서는 끄고 빼지 않는다. 빈 목록은 JSON에 없다(앞 기록과 바이트까지 같다).
+        let new_qemu = catalog_knowing(ALL_FLAGS, x, "kvm", V4ISH, &[]);
+        let hidden = resolve(
+            &cpu("host", &[]),
+            x,
+            Accel::Kvm,
+            None,
+            &mask,
+            Some(&new_qemu),
+        )
+        .unwrap();
+        assert!(hidden.dropped_mask.is_empty());
+        assert!(
+            serde_json::to_value(&hidden)
+                .unwrap()
+                .get("dropped_mask")
+                .is_none()
+        );
+        let back: ResolvedCpu = serde_json::from_str(r#"{"model":"host"}"#).unwrap();
+        assert!(back.dropped_mask.is_empty());
         // VM이 스스로 끈 플래그는 빼지 않는다 — 그 노드는 켤 수 없다(host도).
         for model in ["host", "Skylake-Server-v5"] {
             let own = resolve(
@@ -2025,6 +2140,7 @@ mod tests {
             flags: map(&[("gfni", true)]),
             enforce: true,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         assert_eq!(
             can_run(&on, &old_qemu).unwrap_err().other,
@@ -2343,6 +2459,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: false,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         });
         let json = serde_json::to_value(&hw).unwrap();
         assert_eq!(
@@ -2387,6 +2504,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: true,
             source: CpuSource::Cluster,
+            dropped_mask: Vec::new(),
         };
         let hw = hw_for(&running, Some(now.clone()));
         // 같으면 없다.
@@ -2438,6 +2556,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: false,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         assert_eq!(
             pending_change(&cpu("host", &[]), &legacy, Some(&host)),

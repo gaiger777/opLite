@@ -197,6 +197,16 @@ fn hide_node_reasons(state: &AppState, principal: &Principal, mut e: ApiError) -
     e
 }
 
+/// 노드 이름을 볼 수 없는 사용자(루트 `cluster.read` 없음)에게는 CPU 까닭의 앞 노드 이름을 감춘다(리뷰 2 #6, `no_node`의
+/// [`hide_node_reasons`]와 같은 규칙).
+fn cpu_reason(state: &AppState, principal: &Principal, why: String) -> String {
+    if crate::cpu::sees_node_names(state, principal) {
+        why
+    } else {
+        opl_reconciler::cpu::without_node_name(&why)
+    }
+}
+
 /// 스케줄러가 노드를 고르지 못함: 노드 조건이면 409 `no_node`, hard 규칙이면 409 `placement_rule`
 fn schedule_error(e: ScheduleError) -> ApiError {
     let message = e.to_string();
@@ -965,6 +975,7 @@ pub async fn create_vm(
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, req.spec.folder)?;
     check_attachments(&state, &principal, &req.spec, None)?;
+    crate::cpu::check_flag_privilege(&state, &principal, &req.spec.cpu.flags, &[])?;
     crate::quota::precheck_vm(&state.cluster, None, &req.spec)?;
     let mut vm: Vm = Resource::new(req.name, req.spec);
     vm.labels = req.labels;
@@ -1111,6 +1122,12 @@ pub async fn update_vm(
             ));
         }
         check_attachments(&state, &principal, &req.spec, Some(&current.spec))?;
+        crate::cpu::check_flag_privilege(
+            &state,
+            &principal,
+            &req.spec.cpu.flags,
+            &current.spec.cpu.flags,
+        )?;
         // 템플릿 표시는 바꾸기·되돌리기 경로(`/vms/{key}/template`)로만 바꾼다. 이 필드를 모르는 옛 클라이언트의
         // PUT이 템플릿을 보통 VM으로 만들지 않게 저장된 값을 둔다.
         let mut spec = req.spec.clone();
@@ -1820,8 +1837,12 @@ pub async fn vm_action(
                             && stopped_now(&state, id)?
                         {
                             // 계획 63: 고정된 노드가 VM의 CPU를 켤 수 없으면(작업자가 켜지 않는다) 켤 수 있는 노드로.
-                            let other = schedule_with(&me, &inv, &scorer)
-                                .map_err(|_| ApiError::conflict("no_capacity", why))?;
+                            let other = schedule_with(&me, &inv, &scorer).map_err(|_| {
+                                ApiError::conflict(
+                                    "no_capacity",
+                                    cpu_reason(&state, &principal, why),
+                                )
+                            })?;
                             spec.node = Some(other);
                         }
                     }
@@ -1884,6 +1905,7 @@ pub async fn vm_action(
             {
                 let inv = Inventory::load(&state.cluster)?;
                 if let Err(why) = cpu_starts(&vm.spec, &inv, &node) {
+                    let why = cpu_reason(&state, &principal, why);
                     return Err(ApiError::conflict(
                         "no_capacity",
                         format!(
@@ -2020,7 +2042,7 @@ pub(crate) enum RuleCheck {
 /// 않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
 /// 유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
 /// 스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리, VM이 켤 때 기록한 CPU 모델·플래그를 켤 수 없음)면
-/// 409 `no_capacity`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
+/// 409 `no_capacity`다. 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`)로 도는 VM은 409 `migration_unsupported`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
 /// `cpu-warning: target node "n3" lacks …`를 남긴다. 대상 노드가 hard
 /// 배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
 /// (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
@@ -2289,6 +2311,25 @@ pub(crate) async fn start_migration_warned(
             format!("cannot migrate VM {:?}: {e}", vm.name),
         )
     })?;
+    // 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`, 관리자만 켠다)로 도는 VM은 QEMU가 옮기지 못한다(리뷰 2 #3).
+    if let Some(r) = vm
+        .status
+        .hardware
+        .as_ref()
+        .and_then(|h| h.cpu_resolved.as_ref())
+    {
+        let blockers = r.migration_blockers();
+        if !blockers.is_empty() {
+            return Err(ApiError::conflict(
+                "migration_unsupported",
+                format!(
+                    "cannot migrate VM {:?}: {}",
+                    vm.name,
+                    crate::scheduler::migration_blocked(&blockers)
+                ),
+            ));
+        }
+    }
     // CPU는 켤 때 기록한 것으로 본다(받는 쪽은 그대로 켠다).
     migration_fits(&vm, &inv, &target, &moves).map_err(|e| ApiError::conflict("no_capacity", e))?;
     let free = inv.free_memory_mib(&target, vm.id);

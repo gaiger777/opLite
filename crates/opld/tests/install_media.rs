@@ -652,16 +652,23 @@ urllib.request.urlopen(request, timeout=30)
         d.stop();
     }
 
-    /// 숨길 플래그: 러너 호스트의 `/proc/cpuinfo`에 있는 것 가운데 앞의 것(QEMU 이름, `/proc/cpuinfo` 이름). 러너 CPU를
-    /// 모르므로 차례로 본다.
-    fn host_flag() -> (&'static str, &'static str) {
-        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap();
-        let flags: Vec<&str> = cpuinfo
+    /// 숨길 플래그(QEMU 이름, `/proc/cpuinfo` 이름): 노드의 CPU 카탈로그(`node cpu` JSON)가 줄 수 있다고 한(`supported`)
+    /// 것 가운데 러너 호스트의 `/proc/cpuinfo`에도 있는 앞의 것(리뷰 2 #8 — KVM이 넘기지 않는 기능, 중첩 가상화가
+    /// 거르는 AVX-512를 고르지 않게). 없으면 None(시험을 건너뛴다).
+    fn pick_flag(node_cpu: &Value) -> Option<(&'static str, &'static str)> {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+        let host: Vec<&str> = cpuinfo
             .lines()
             .find(|l| l.starts_with("flags"))
             .and_then(|l| l.split_once(':'))
             .map(|(_, f)| f.split_whitespace().collect())
             .unwrap_or_default();
+        let supported = |name: &str| {
+            node_cpu["flags"].as_array().is_some_and(|f| {
+                f.iter()
+                    .any(|x| x["name"] == name && x["supported"] == true)
+            })
+        };
         [
             ("avx512vbmi", "avx512vbmi"),
             ("avx2", "avx2"),
@@ -669,8 +676,7 @@ urllib.request.urlopen(request, timeout=30)
             ("sse4.2", "sse4_2"),
         ]
         .into_iter()
-        .find(|(_, name)| flags.contains(name))
-        .expect("the runner CPU has none of avx512vbmi, avx2, pcid, sse4_2")
+        .find(|(qemu, cpuinfo)| supported(qemu) && host.contains(cpuinfo))
     }
 
     /// 부팅마다 `/proc/cpuinfo`의 플래그와 boot_id를 보내는 vendor-data(cloud-init per-boot 스크립트, 첫 부팅에도 돈다)
@@ -711,10 +717,26 @@ urllib.request.urlopen(request, timeout=30)
     #[tokio::test]
     async fn a_hidden_cpu_flag_is_absent_in_a_real_guest() {
         let image = env_path("OPL_TEST_CLOUD_IMAGE");
-        let (qemu_name, cpuinfo_name) = host_flag();
-        eprintln!("hiding {qemu_name} ({cpuinfo_name} in /proc/cpuinfo)");
         let server = serve(&[("noble.img", &image)]).await;
         let (mut d, _pool) = daemon("cpu-flags").await;
+        // 플래그 이름은 노드가 올린 CPU 카탈로그로 본다(첫 검사 회차가 올린다).
+        common::eventually("the node CPU catalog", || async {
+            d.ctl(&["-o", "json", "node", "cpu", "node1"])
+                .await
+                .ok()
+                .and_then(|out| serde_json::from_str::<Value>(&out).ok())
+                .is_some_and(|v| v["flags"].as_array().is_some_and(|f| !f.is_empty()))
+        })
+        .await;
+        let node_cpu = d.ctl_json(&["node", "cpu", "node1"]).await;
+        let Some((qemu_name, cpuinfo_name)) = pick_flag(&node_cpu) else {
+            eprintln!(
+                "skipping: this node's QEMU gives the guest none of avx512vbmi, avx2, pcid, sse4.2: {node_cpu}"
+            );
+            d.stop();
+            return;
+        };
+        eprintln!("hiding {qemu_name} ({cpuinfo_name} in /proc/cpuinfo)");
         let url = format!("http://127.0.0.1:{}/files/noble.img", server.port);
         d.ctl(&[
             "volume",
@@ -731,15 +753,6 @@ urllib.request.urlopen(request, timeout=30)
         ])
         .await
         .unwrap();
-        // 플래그 이름은 노드가 올린 CPU 카탈로그로 본다(첫 검사 회차가 올린다).
-        common::eventually("the node CPU catalog", || async {
-            d.ctl(&["-o", "json", "node", "cpu", "node1"])
-                .await
-                .ok()
-                .and_then(|out| serde_json::from_str::<Value>(&out).ok())
-                .is_some_and(|v| v["flags"].as_array().is_some_and(|f| !f.is_empty()))
-        })
-        .await;
         let vendor = d.path("cpu-vendor-data");
         std::fs::write(&vendor, cpu_vendor_data(server.port)).unwrap();
         let hide = format!("--cpu-flags=-{qemu_name}");

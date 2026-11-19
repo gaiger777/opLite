@@ -2826,7 +2826,7 @@ export interface paths {
          *     않았거나 스펙의 디스크·NIC가 도는 장치와 다르면 409 `vm_busy`다. 대상 노드가 위트니스이거나 오프라인이거나
          *     유지보수 중이거나 호스트 종료 중이면 409 `node_unavailable`, HA VM인데 대상이 HA 가능 노드가 아니면 409 `ha_unsupported`,
          *     스케줄러가 고를 수 없는 노드(풀, 대상 풀, 네트워크, 남은 메모리, VM이 켤 때 기록한 CPU 모델·플래그를 켤 수 없음)면
-         *     409 `no_capacity`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
+         *     409 `no_capacity`다. 라이브 마이그레이션을 막는 CPU 플래그(`+invtsc`)로 도는 VM은 409 `migration_unsupported`다. `host`·`max` VM을 원본에 있던 CPU 플래그가 없는 노드로 옮기면 막지 않고 감사 detail에
          *     `cpu-warning: target node "n3" lacks …`를 남긴다. 대상 노드가 hard
          *     배치 규칙을 어기면(자리 잡은 hard affinity 상대가 있는 VM 하나만 옮기기 포함) 409 `placement_rule`
          *     (`details.rules`)이고, 관리자는 `force`로 넘을 수 있다(감사 detail `force rules=<이름들>`). CD-ROM에 노드 로컬 풀의
@@ -4261,6 +4261,8 @@ export interface components {
         CpuFlag: string;
         /** @description 플래그 하나 */
         CpuFlagEntry: {
+            /** @description 켜면 QEMU가 라이브 마이그레이션을 막는다(`invtsc`). 그런 VM은 비우기·균형 조정·HA 검사가 옮기지 않는다. */
+            blocks_migration?: boolean;
             /**
              * Format: int32
              * @description 이 이름을 아는 노드 수(끌 수 있다)
@@ -4269,6 +4271,8 @@ export interface components {
             /** @description 클러스터 숨김 목록에 있다. */
             masked?: boolean;
             name: string;
+            /** @description 루트 `cluster.admin`만 켤 수 있다(관리자가 아닌 사용자의 허용 목록 밖, 리뷰 2 #3). 끄기는 누구나 된다. */
+            restricted?: boolean;
             /**
              * Format: int32
              * @description 이 플래그를 줄 수 있는 노드 수(`full max`)
@@ -4284,6 +4288,8 @@ export interface components {
              * @description 카탈로그를 알린 노드 수
              */
             nodes: number;
+            /** @description 이 사용자가 `restricted` 플래그도 켤 수 있다(루트 `cluster.admin`). */
+            turn_on_restricted: boolean;
         };
         /**
          * @description host, max, cluster, x86-64-v2, x86-64-v2-aes, x86-64-v3, x86-64-v4, or a versioned QEMU model (e.g. Icelake-Server-v7)
@@ -8363,6 +8369,12 @@ export interface components {
          *     받는 쪽 마이그레이션은 이것을 그대로 쓴다.
          */
         ResolvedCpu: {
+            /**
+             * @description 켤 때 이 노드의 QEMU가 몰라 뺀 클러스터 숨김 이름(`host`·`max`, 리뷰 2). 그 QEMU는 그 기능을 주지 못해 숨긴 것과
+             *     같지만, 그 이름을 아는 QEMU로 옮기거나(받는 쪽은 이 기록 그대로 켠다) 메모리 스냅샷을 되돌리면 드러난다 —
+             *     마이그레이션 확인과 되돌리기가 이것으로 막는다.
+             */
+            dropped_mask?: string[];
             /** @description 가속기가 못 주는 기능이 있으면 켜지 않는다(명명 모델·수준). */
             enforce?: boolean;
             /** @description 켜고(참) 끈(거짓) 플래그 */

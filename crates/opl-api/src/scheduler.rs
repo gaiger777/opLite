@@ -56,6 +56,58 @@ pub struct Inventory {
     pub cpu_mask: Vec<String>,
 }
 
+/// 풀어 둔 CPU 카탈로그(이름 = 내용의 해시라 한 번 풀면 바뀌지 않는다). `Inventory::load`는 VM API·HA·균형 조정·건강
+/// tick마다 불리고 x86 카탈로그 하나가 40 KB이므로 해시마다 한 번만 푼다(리뷰 2 #9).
+static CATALOG_CACHE: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, Arc<CpuCatalogSpec>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// 캐시가 이보다 커지면 지금 노드가 알린 것만 남긴다.
+const CATALOG_CACHE_MAX: usize = 64;
+
+/// 노드들이 알린 카탈로그(이름 = 해시). 노드가 알리지 않은 카탈로그(정리 작업이 1시간 뒤 지움)는 읽지 않는다. 리소스가
+/// 아직 없는 해시는 빠진다(작업자처럼 "카탈로그가 아직 없음"으로 본다). 풀어 둔 것은 다시 풀지 않는다.
+pub(crate) fn node_catalogs(
+    cluster: &Cluster,
+    nodes: &[Node],
+) -> Result<BTreeMap<String, Arc<CpuCatalogSpec>>, ClusterError> {
+    let hashes: BTreeSet<&str> = nodes
+        .iter()
+        .filter_map(|n| n.status.cpu.as_ref())
+        .map(|c| c.catalog.as_str())
+        .filter(|h| !h.is_empty())
+        .collect();
+    let mut out = BTreeMap::new();
+    let mut missing = Vec::new();
+    {
+        let cache = CATALOG_CACHE.lock().unwrap();
+        for h in &hashes {
+            match cache.get(*h) {
+                Some(c) => {
+                    out.insert(h.to_string(), c.clone());
+                }
+                None => missing.push(*h),
+            }
+        }
+    }
+    let mut found = Vec::new();
+    for h in missing {
+        if let Some(c) = cluster.get_by_name::<CpuCatalogSpec>(h)? {
+            found.push((c.name, Arc::new(c.spec)));
+        }
+    }
+    if !found.is_empty() {
+        let mut cache = CATALOG_CACHE.lock().unwrap();
+        for (name, c) in found {
+            cache.insert(name.clone(), c.clone());
+            out.insert(name, c);
+        }
+        if cache.len() > CATALOG_CACHE_MAX {
+            cache.retain(|k, _| hashes.contains(k.as_str()));
+        }
+    }
+    Ok(out)
+}
+
 /// 노드 조건이 보는 VM의 CPU
 #[derive(Debug, Clone, Copy)]
 enum VmCpu<'a> {
@@ -89,12 +141,7 @@ impl Inventory {
         };
         // 업그레이드 중에는 작업자도 CPU를 보지 않는다(카탈로그·기준도 아직 없다).
         if all_have(&inv.nodes, CPU_MODELS) {
-            inv.cpu_catalogs = cluster
-                .list::<CpuCatalogSpec>()?
-                .1
-                .into_iter()
-                .map(|c| (c.name, Arc::new(c.spec)))
-                .collect();
+            inv.cpu_catalogs = node_catalogs(cluster, &inv.nodes)?;
             inv.cpu_baselines = cluster
                 .list::<ClusterSpec>()?
                 .1
@@ -128,6 +175,17 @@ impl Inventory {
     /// 리소스가 있으며 `can_run`이어야 한다 — `NodeStatus.cpu`가 없거나 빈 해시이거나 카탈로그가 아직 없는 노드는
     /// `host`·`max`만 켠다.
     fn cpu_fits(&self, spec: &VmSpec, node: &Node, cpu: VmCpu<'_>) -> Result<(), String> {
+        // 라이브 마이그레이션을 막는 플래그(`+invtsc`)로 도는 VM은 어디로도 옮기지 못한다(리뷰 2 #3). 비우기·균형
+        // 조정·HA 검사가 이 까닭을 보인다.
+        if let VmCpu::Running(hw, Some(from)) = cpu
+            && from != node.id
+            && let Some(r) = &hw.cpu_resolved
+        {
+            let blockers = r.migration_blockers();
+            if !blockers.is_empty() {
+                return Err(migration_blocked(&blockers));
+            }
+        }
         let Some(ctx) = self.cpu_context(node) else {
             return Ok(());
         };
@@ -147,44 +205,14 @@ impl Inventory {
                 "node {name:?} has no CPU catalog yet; only the host and max CPU models can run there"
             ),
         })?;
-        if let VmCpu::Running(_, Some(from)) = cpu {
-            let exposed = self.newly_exposed(&resolved, from, node);
-            if !exposed.is_empty() {
-                return Err(format!(
-                    "node {name:?} would expose the hidden CPU flags {} that the VM's current node cannot hide; power cycle the VM instead",
-                    exposed.join(", ")
-                ));
-            }
+        // 켤 때 그 노드의 QEMU가 몰라 뺀 숨김 이름을 대상의 QEMU가 알면(또는 대상의 카탈로그를 모르면) 받는 쪽의
+        // `-cpu host`가 숨긴 기능을 준다(리뷰 2 #1 — 제자리 QEMU 올리기 뒤 원본의 지금 카탈로그로는 알 수 없다).
+        if let VmCpu::Running(_, Some(from)) = cpu
+            && from != node.id
+        {
+            ctx.check_exposed(&resolved, "if the VM moved there")?;
         }
         Ok(())
-    }
-
-    /// 도는 `host`·`max` VM을 `from`에서 `to`로 옮기면 새로 드러날 숨김 이름(계획 63 리뷰 1 C1). 켤 때 `from`의 QEMU가
-    /// 모르던 숨김 이름은 해석에서 빠졌다(그 QEMU는 그 기능을 주지 못한다). `to`의 QEMU가 그 이름을 알면 받는 쪽의
-    /// `-cpu host`는 그 기능을 준다 — 숨기려던 것이 드러나므로 막는다. `from`이 알았는데 꺼지지 않은 이름(숨김을 켠 뒤로
-    /// 껐다 켜지 않은 VM)은 이미 드러나 있어 옮겨도 달라지지 않는다. 명명 모델·수준은 버전 정의가 고정이라 상관없다.
-    fn newly_exposed(&self, resolved: &cpu::ResolvedCpu, from: Uuid, to: &Node) -> Vec<String> {
-        if !matches!(resolved.model.as_str(), "host" | "max") {
-            return Vec::new();
-        }
-        let catalog = |id: Uuid| {
-            let node = self.nodes.iter().find(|n| n.id == id)?;
-            self.cpu_catalogs
-                .get(&node.status.cpu.as_ref()?.catalog)
-                .cloned()
-        };
-        let (Some(source), Some(target)) = (catalog(from), catalog(to.id)) else {
-            return Vec::new();
-        };
-        self.cpu_mask
-            .iter()
-            .filter(|m| {
-                resolved.flags.get(m.as_str()) != Some(&false)
-                    && source.flag_index(m).is_none()
-                    && target.flag_index(m).is_some()
-            })
-            .cloned()
-            .collect()
     }
 
     /// 이 VM의 네트워크가 쓰는 브리지(VXLAN이면 `oplv<vni>`)가 모두 이 노드에 있는지.
@@ -243,6 +271,18 @@ impl Inventory {
             .sum();
         node.status.memory_mib as i64 - used
     }
+}
+
+/// 라이브 마이그레이션을 막는 플래그로 도는 VM의 까닭(리뷰 2 #3)
+pub fn migration_blocked(flags: &[&str]) -> String {
+    format!(
+        "the VM runs with the CPU flags {} that QEMU cannot live-migrate; power cycle it on another node instead",
+        flags
+            .iter()
+            .map(|f| format!("+{f}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 /// [`schedule_with`]와 같되 부하를 모른다(할당 메모리만 본다).
@@ -485,6 +525,29 @@ pub fn cpu_starts(spec: &VmSpec, inv: &Inventory, node: &Node) -> Result<(), Str
 /// 조건을 따로 보는 라이브 마이그레이션 후보 거름(HA 검사의 옮기기)이 쓴다.
 pub fn cpu_receives(vm: &Vm, inv: &Inventory, node: &Node) -> Result<(), String> {
     inv.cpu_fits(&vm.spec, node, VmCpu::of(vm))
+}
+
+/// 도는 VM을 노드 `from`에서 옮길 수 있는 다른 노드(온라인, 유지보수·위트니스가 아님, 머신의 아키텍처)가 모두 CPU
+/// 때문에 받지 못하면 그 첫 까닭이다(리뷰 2 #5). 비우기·호스트 종료가 "no node with capacity" 대신 보인다. 받을 수
+/// 있는 노드가 하나라도 있거나 후보가 없으면 None이다(다른 까닭이다).
+pub fn cpu_blocks_every_move(vm: &Vm, inv: &Inventory, from: Uuid) -> Option<String> {
+    let arch = vm.spec.machine.arch();
+    let mut first = None;
+    for n in inv.nodes.iter().filter(|n| {
+        n.id != from
+            && !n.spec.witness
+            && !n.spec.maintenance
+            && n.status.online
+            && n.status.arch == Some(arch)
+    }) {
+        match cpu_receives(vm, inv, n) {
+            Ok(()) => return None,
+            Err(e) => {
+                first.get_or_insert(e);
+            }
+        }
+    }
+    first
 }
 
 fn fits(
@@ -2081,6 +2144,7 @@ mod tests {
             flags: Default::default(),
             enforce: true,
             source: cpu::CpuSource::Cluster,
+            dropped_mask: Vec::new(),
         });
         vm.status.hardware = Some(hw);
         // 새로 켜면(HA 복구) 새 기준이라 약한 노드도 되지만, 도는 VM은 기록대로 옮긴다.
@@ -2132,7 +2196,7 @@ mod tests {
                 .unwrap_err()
                 .contains("unknown flag avx512vbmi")
         );
-        let running = |on: &Node, flags: &[(&str, bool)]| {
+        let running = |on: &Node, flags: &[(&str, bool)], dropped: &[&str]| {
             let mut vm: Vm = Resource::new("web", x86_spec("host", &[]));
             let mut hw = RunningHardware::legacy(&vm.spec);
             hw.cpu_resolved = Some(cpu::ResolvedCpu {
@@ -2140,29 +2204,82 @@ mod tests {
                 flags: flags.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
                 enforce: false,
                 source: cpu::CpuSource::Spec,
+                dropped_mask: dropped.iter().map(|d| d.to_string()).collect(),
             });
             vm.status.hardware = Some(hw);
             vm.status.node = Some(on.id);
             vm
         };
         // 새 노드에서 켠 기록(avx512vbmi=off)은 옛 노드의 QEMU가 거절한다.
-        let on_new = running(&nodes[0], &[("avx512vbmi", false)]);
+        let on_new = running(&nodes[0], &[("avx512vbmi", false)], &[]);
         assert!(
             migration_fits(&on_new, &inv, &nodes[1], &[])
                 .unwrap_err()
                 .contains("unknown flag avx512vbmi")
         );
         assert_eq!(migration_fits(&on_new, &inv, &nodes[3], &[]), Ok(()));
-        // 옛 노드에서 켠 기록(이름 없음)을 새 노드로 옮기면 -cpu host가 숨긴 기능을 준다 — 막는다.
-        let on_old = running(&nodes[1], &[]);
-        assert_eq!(
-            migration_fits(&on_old, &inv, &nodes[0], &[]),
-            Err("node \"new\" would expose the hidden CPU flags avx512vbmi that the VM's current node cannot hide; power cycle the VM instead".into())
+        // 옛 노드에서 켠 기록(이름을 뺌)을 새 노드로 옮기면 -cpu host가 숨긴 기능을 준다 — 막는다.
+        let on_old = running(&nodes[1], &[], &["avx512vbmi"]);
+        let e = migration_fits(&on_old, &inv, &nodes[0], &[]).unwrap_err();
+        assert!(
+            e.starts_with(
+                "node \"new\" would expose the hidden CPU flags avx512vbmi if the VM moved there"
+            ),
+            "{e}"
         );
         assert!(cpu_receives(&on_old, &inv, &nodes[0]).is_err());
-        // 숨김을 켜기 전에 새 노드에서 켠 VM은 이미 드러나 있다 — 옮겨도 달라지지 않는다(보류로 껐다 켜기를 알린다).
-        let before_mask = running(&nodes[0], &[]);
+        // 리뷰 2 #1 경우 B: 카탈로그가 없는 대상은 확인할 수 없으니 막는다.
+        assert!(
+            migration_fits(&on_old, &inv, &nodes[2], &[])
+                .unwrap_err()
+                .contains("cannot be checked")
+        );
+        // 리뷰 2 #1 경우 A(제자리 QEMU 올리기): 옛 QEMU로 켠 VM이 도는 노드가 이제 그 이름을 아는 카탈로그를 알려도
+        // 기록이 뺀 이름을 기억하므로 같은 새 QEMU 노드로도 옮기지 않는다.
+        let upgraded = running(&nodes[3], &[], &["avx512vbmi"]);
+        assert!(migration_fits(&upgraded, &inv, &nodes[0], &[]).is_err());
+        // 숨김을 켜기 전에 켠 VM(뺀 이름 없음)은 이미 드러나 있다 — 옮겨도 달라지지 않는다(보류로 껐다 켜기를 알린다).
+        let before_mask = running(&nodes[0], &[], &[]);
         assert_eq!(migration_fits(&before_mask, &inv, &nodes[3], &[]), Ok(()));
+        assert_eq!(migration_fits(&before_mask, &inv, &nodes[2], &[]), Ok(()));
+    }
+
+    /// 리뷰 2 #3: 라이브 마이그레이션을 막는 플래그로 도는 VM은 어느 대상에도 맞지 않고 까닭을 말한다.
+    #[test]
+    fn a_vm_running_with_invtsc_is_not_live_migratable() {
+        let (mut strong, _) = catalogs();
+        strong.flags.push("invtsc".into());
+        strong.flags.sort();
+        strong.supported = cpu::Bits::from_indices(0..strong.flags.len());
+        let nodes = vec![x86("a", Some(&strong)), x86("b", Some(&strong))];
+        let inv = cpu_inv(nodes.clone(), &[&strong]);
+        let mut vm: Vm = Resource::new("tsc", x86_spec("host", &["+invtsc"]));
+        let mut hw = RunningHardware::legacy(&vm.spec);
+        hw.cpu_resolved = Some(cpu::ResolvedCpu {
+            model: "host".into(),
+            flags: [("invtsc".to_string(), true)].into(),
+            enforce: false,
+            source: cpu::CpuSource::Spec,
+            dropped_mask: Vec::new(),
+        });
+        vm.status.hardware = Some(hw);
+        vm.status.node = Some(nodes[0].id);
+        let e = migration_fits(&vm, &inv, &nodes[1], &[]).unwrap_err();
+        assert_eq!(e, migration_blocked(&["invtsc"]));
+        assert!(e.contains("+invtsc that QEMU cannot live-migrate"), "{e}");
+        assert!(replica_migration_fits(&vm, &inv, &nodes[1]).is_err());
+        assert!(cpu_receives(&vm, &inv, &nodes[1]).is_err());
+        // 꺼진 뒤 다시 켜기(HA 복구)는 막지 않는다.
+        assert_eq!(node_fits(&vm.spec, &inv, &nodes[1]), Ok(()));
+        // 리뷰 2 #5: 비우기는 "no node with capacity" 대신 CPU 까닭을 보인다.
+        assert_eq!(
+            cpu_blocks_every_move(&vm, &inv, nodes[0].id),
+            Some(migration_blocked(&["invtsc"]))
+        );
+        if let Some(hw) = &mut vm.status.hardware {
+            hw.cpu_resolved.as_mut().unwrap().flags.clear();
+        }
+        assert_eq!(cpu_blocks_every_move(&vm, &inv, nodes[0].id), None);
     }
 
     #[test]
@@ -2202,6 +2319,7 @@ mod tests {
             flags: Default::default(),
             enforce: true,
             source: cpu::CpuSource::Spec,
+            dropped_mask: Vec::new(),
         });
         vm.status.hardware = Some(hw);
         vm.status.node = Some(nodes[0].id);
@@ -2244,6 +2362,7 @@ mod tests {
             flags: [("avx512vbmi".to_string(), false)].into(),
             enforce: false,
             source: cpu::CpuSource::Spec,
+            dropped_mask: Vec::new(),
         });
         assert_eq!(host_cpu_warning(&masked, &inv, &nodes[0], &nodes[1]), None);
         // 명명 모델은 노드 조건이 본다.

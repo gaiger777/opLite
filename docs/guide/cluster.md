@@ -660,7 +660,11 @@ orbivisorctl vm create app --cpu-model cluster ...       # 기준을 쓰는 VM
   이름을 QEMU가 아는지 확인할 수 없어 아무 VM도 켜지 않는다(숨김을 빼고 켜서 감춘 기능을 드러내지 않는다).
 - **auto 셈(x86_64).** 위트니스가 아닌 이 아키텍처의 **등록된 노드 모두**가 대상이다 — 꺼진 노드·유지보수 노드도 센다(잠깐
   꺼진 노드 때문에 기준이 오르내리지 않게). 카탈로그가 아직 없는 노드는 빼고 경고(`node "x" has no CPU catalog yet and is left
-  out`)로 적는다. 후보는 모든 대상 노드가 켤 수 있는 버전 모델(별칭이 아님, migration-safe, deprecated 아님) 가운데 모델 벤더가
+  out`)로 적는다. 노드가 알린 해시의 카탈로그 리소스가 클러스터에 없으면(올리기가 실패했거나 정리 작업과 겹침) 리더는 그 노드가
+  **온라인이고 그 읽기가 10분 안일 때만** 그 아키텍처의 auto 기준을 앞 기록 그대로 붙잡고(경고 `… the previous baseline is
+  kept for up to 10 minutes`), 그 뒤에는 그 노드를 빼고 셈한다(경고 `node "n5" announced a CPU catalog that is missing from the
+  cluster and is left out`, 리더 로그에도). 붙잡기는 그 노드의 아키텍처만이고 auto끼리만이다 — 고정·끔·auto로 바꾸기와 숨김
+  목록은 곧바로 적용된다. 노드는 카탈로그를 올리지 못하면 새 해시를 알리지 않고 앞 것을 둔 채 다음 검사 회차에 다시 한다. 후보는 모든 대상 노드가 켤 수 있는 버전 모델(별칭이 아님, migration-safe, deprecated 아님) 가운데 모델 벤더가
   모든 노드의 호스트 벤더와 같은 것이고, 정적 확장의 기능이 가장 많은 것(같으면 이름순 뒤, 곧 높은 버전)을 고른다. 호스트
   벤더가 섞였거나(Intel + AMD) TCG 노드가 있으면 QEMU 모델 후보가 없어 모두 켤 수 있는 가장 높은 `x86-64-v*`, 그것도 없으면
   `qemu64-v1`이다. `auto_flags`(기본 켬)면 모든 노드가 줄 수 있고 QEMU가 어느 모델 정의에든 쓰는 플래그를 더한다. 마지막에
@@ -684,9 +688,17 @@ orbivisorctl vm create app --cpu-model cluster ...       # 기준을 쓰는 VM
 - **마이그레이션·HA·배치가 기준을 쓰는 법.** 켜기·배치·복제 배치·HA 복구는 **새로 켜는 것**이라 스펙을 대상 노드에서 지금
   기준·숨김 목록으로 해석해 그 노드의 카탈로그로 켤 수 있는지 본다 — 기준이 내려가도 HA 복구는 새 기준으로 어디서든 켠다.
   라이브 마이그레이션·비우기·균형 조정·HA 되돌아가기는 **도는 VM을 옮기는 것**이라 켤 때 기록한 CPU를 대상이 켤 수 있어야
-  한다. 비우기는 갈 곳이 없는 VM을 지금처럼 "옮길 곳 없음"으로 남긴다. 꺼진 VM이 고정된 노드가 그 CPU를 켤 수 없으면 켜기가
+  한다. 비우기는 갈 곳이 없는 VM을 지금처럼 "옮길 곳 없음"으로 남기되, 모든 후보가 CPU 때문에 받지 못하면 "no node with
+  capacity" 대신 그 CPU 까닭을 적는다(라이브 마이그레이션을 막는 `+invtsc`로 도는 VM은 `the VM runs with the CPU flags +invtsc
+  that QEMU cannot live-migrate; power cycle it on another node instead`). 꺼진 VM이 고정된 노드가 그 CPU를 켤 수 없으면 켜기가
   켤 수 있는 다른 노드를 고르고, 없으면 **409** `no_capacity`와 노드마다의 까닭이다. 스케줄러가 먼저 거르므로 노드가 켜다가
-  실패하는 일은 보통 없다(그래도 노드는 켜기 전에 다시 보고, 못 켜면 `failed to start: node "n1" cannot run CPU model …`).
+  실패하는 일은 보통 없다(그래도 노드는 켜기 전에 다시 보고, 못 켜면 `failed to start: the VM's node cannot run CPU model …` —
+  VM 상태는 노드 이름을 볼 수 없는 폴더 사용자도 읽으므로 노드 이름을 적지 않는다). **작업자가 스스로 다시 켜는 VM**(크래시,
+  호스트의 SIGTERM, 게스트 감시가 멈춘 게스트를 다시 켬)은 다르다: 보류된 새 CPU(바뀐 기준·고정, 실행 중에 바꾼 모델)를 그
+  노드가 켤 수 없으면 꺼지기 전에 쓰던 CPU(`cpu_resolved`)로 다시 켜고 바뀜은 보류로 남긴다(로그 `restarting the VM with the
+  CPU it ran with; the new CPU stays pending`). 사용자가 하지 않은 전원 껐다 켜기 때문에 VM이 꺼진 채 남지 않게 한 것이다. 그
+  CPU도 이 노드가 켤 수 있어야 하고(그 사이 QEMU를 올렸으면 안 될 수 있다) 숨긴 기능을 새로 드러내지 않아야 한다 — 아니면
+  지금처럼 꺼진다. 새 CPU는 사용자의 전원 껐다 켜기(`vm reboot`, 정지 후 시작, 켤 수 있는 노드로 옮긴 뒤)에서 적용된다.
 - **aarch64.** auto 셈을 하지 않는다(QEMU가 aarch64 모델의 버전·못 쓰는 기능·정적 확장을 주지 않는다). 고정만 되고, QEMU
   모델은 모든 대상 노드가 TCG일 때만 받는다(svc01·svc02 같은 `qemu-tcg` 노드 — 예 `aarch64:neoverse-n1`). KVM·HVF aarch64는
   `host`·`max`뿐이라 `cluster` VM은 `host`로 켜고 `cpu baseline`이 `host (no baseline)`로 적는다. aarch64 QEMU 모델에는

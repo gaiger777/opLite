@@ -264,6 +264,13 @@ async fn move_vm(
             )));
         }
         Err(_) => {
+            // 모든 후보가 CPU 때문에 받지 못하면 그 까닭이다(리뷰 2 #5 — 메모리를 찾게 하지 않는다).
+            if let Some(reason) = bundle
+                .iter()
+                .find_map(|v| crate::scheduler::cpu_blocks_every_move(v, &inv, node))
+            {
+                return Ok(Outcome::NotMoved(reason));
+            }
             // 옮길 디스크가 없었다면(공유 디스크처럼) 받을 노드가 있었으면 풀 때문이다.
             let stripped: Vec<Vm> = bundle
                 .iter()

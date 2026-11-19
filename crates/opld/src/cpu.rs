@@ -121,26 +121,33 @@ pub fn cpu_models_ready(cluster: &Cluster, me: &str) -> bool {
     }
 }
 
-/// 카탈로그 리소스(이름 = 해시)가 없으면 만든다. 다른 노드가 먼저 만들었으면(`name_taken`) 된 것이다. 실패하면 다음
-/// 검사 회차가 다시 한다.
-pub async fn publish(cluster: &Cluster, hash: &str, catalog: &CpuCatalogSpec) {
+/// 카탈로그 리소스(이름 = 해시)가 없으면 만든다. 다른 노드가 먼저 만들었으면(`name_taken`) 된 것이다. 카탈로그가
+/// 클러스터에 있으면 true다. 실패하면(false) 부르는 쪽은 `NodeStatus.cpu`를 새 해시로 옮기지 않고 앞 것을 두며, 다음
+/// 검사 회차가 다시 한다(리뷰 2 #2 — 없는 카탈로그의 해시를 알리지 않게).
+pub async fn publish(cluster: &Cluster, hash: &str, catalog: &CpuCatalogSpec) -> bool {
     match cluster.get_by_name::<CpuCatalogSpec>(hash) {
-        Ok(Some(_)) => return,
+        Ok(Some(_)) => return true,
         Ok(None) => {}
         Err(e) => {
             tracing::warn!(error = %e, "cannot read the CPU catalogs");
-            return;
+            return false;
         }
     }
     let resource: CpuCatalog = Resource::new(hash, catalog.clone());
     match cluster.create(&resource).await {
-        Ok(_) => tracing::info!(
-            catalog = %hash,
-            models = catalog.models.len(),
-            "published this node's CPU catalog"
-        ),
-        Err(ClusterError::Rejected(Rejection::NameTaken { .. })) => {}
-        Err(e) => tracing::warn!(error = %e, "cannot publish this node's CPU catalog; will retry"),
+        Ok(_) => {
+            tracing::info!(
+                catalog = %hash,
+                models = catalog.models.len(),
+                "published this node's CPU catalog"
+            );
+            true
+        }
+        Err(ClusterError::Rejected(Rejection::NameTaken { .. })) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot publish this node's CPU catalog; will retry");
+            false
+        }
     }
 }
 
@@ -195,8 +202,10 @@ impl opl_api::CpuRefresher for CpuRefresh {
         if !cpu_models_ready(&self.cluster, &self.name) {
             return Err("not every node knows the cpu-models feature yet".into());
         }
-        if let Probed::Ok { catalog, cpu } = &probed {
-            publish(&self.cluster, &cpu.catalog, catalog).await;
+        if let Probed::Ok { catalog, cpu } = &probed
+            && !publish(&self.cluster, &cpu.catalog, catalog).await
+        {
+            return Err("cannot publish the CPU catalog; the node keeps its previous one".into());
         }
         crate::bootstrap::update_node_status(&self.cluster, |status| {
             let cpu = probed.node_cpu(status.cpu.as_ref());

@@ -336,6 +336,9 @@ pub async fn download_catalog_image(
         .clone()
         .unwrap_or_else(|| image.default_volume_name());
     check_volume_name(&name)?;
+    if let Some(t) = &req.template {
+        crate::cpu::check_flag_privilege(&state, &principal, &t.cpu_flags, &[])?;
+    }
     let template = match &req.template {
         Some(t) => Some(Box::new(draft(&state, &pool, image, &name, t)?)),
         None => None,
@@ -349,6 +352,12 @@ pub async fn download_catalog_image(
     let mut detail = format!("image download {} to pool {}", image.id, pool.name);
     if let Some(t) = &template {
         detail.push_str(&format!(" (template {})", t.name));
+        let asked = req.template.as_ref().and_then(|r| r.cpu_model.as_ref());
+        if let Some(cpu) =
+            crate::cpu::audit_requested_cpu(t.cpu_model.as_ref(), asked, &t.cpu_flags)
+        {
+            detail.push_str(&format!(" {cpu}"));
+        }
     }
     let op = TaskOp::VolumeDownload {
         url: image.url.clone(),

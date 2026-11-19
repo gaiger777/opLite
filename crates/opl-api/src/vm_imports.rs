@@ -974,9 +974,11 @@ async fn check_credentials(state: &AppState, import: &VmImport) -> Result<(), Ap
 pub async fn run_import(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: crate::audit::AuditNote,
     Path(key): Path<String>,
     Json(mut run): Json<ImportRun>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    let asked_cpu = run.cpu_model.clone();
     // 가져오기의 `vm.create`는 경로표가 봤다. 만들 VM의 폴더·풀·네트워크는 아래에서 본다.
     if run.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
@@ -985,6 +987,7 @@ pub async fn run_import(
     if run.cpu_model.is_some() || !run.cpu_flags.is_empty() {
         let model = run.cpu_model.clone().unwrap_or_default();
         crate::cpu::require_cpu_feature(&state.cluster, &model, &run.cpu_flags)?;
+        crate::cpu::check_flag_privilege(&state, &principal, &run.cpu_flags, &[])?;
     }
     let import = lookup::<VmImportSpec>(&state.cluster, &key)?;
     match import.status.phase {
@@ -1136,12 +1139,21 @@ pub async fn run_import(
         }
         Err(e) => return Err(e.into()),
     }
+    // 준 CPU 모델·플래그는 감사에 남긴다(별칭에서 고정한 이름 포함, 리뷰 2 #7).
+    let cpu_note =
+        crate::cpu::audit_requested_cpu(run.cpu_model.as_ref(), asked_cpu.as_ref(), &run.cpu_flags)
+            .map(|cpu| format!("vm import {} -> {} {cpu}", import.name, run.name));
     let op = TaskOp::VmImport {
         import: import.id,
         run,
     };
     match create_task(&state.cluster, op, Uuid::now_v7(), import.spec.node).await {
-        Ok(task) => Ok((StatusCode::ACCEPTED, Json(task))),
+        Ok(task) => {
+            if let Some(note) = cpu_note {
+                audit.detail(note);
+            }
+            Ok((StatusCode::ACCEPTED, Json(task)))
+        }
         Err(e) => {
             // 실행할 Task가 없으면 다시 실행할 수 있게 되돌린다.
             if let Err(d) = state

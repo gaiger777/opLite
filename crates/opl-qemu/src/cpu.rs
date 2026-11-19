@@ -553,6 +553,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: true,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         let err = can_run(&cpu, &c).unwrap_err();
         assert!(err.missing.contains(&"avx512vbmi".to_string()), "{err}");
@@ -644,6 +645,7 @@ mod tests {
             flags: BTreeMap::new(),
             enforce: true,
             source: CpuSource::Spec,
+            dropped_mask: Vec::new(),
         };
         assert_eq!(can_run(&cpu, &c).unwrap_err().other, ["accel"]);
         // 같은 QEMU라도 TCG와 다른 카탈로그다.

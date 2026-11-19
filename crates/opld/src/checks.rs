@@ -549,14 +549,17 @@ impl State {
     }
 
     /// 마지막 CPU 탐침 결과를 쓸 수 있으면(모든 노드가 `cpu-models`를 앎) 그것을 돌려주고, 성공한 탐침의 카탈로그가
-    /// 클러스터에 없으면 만든다(janitor가 지웠으면 다시).
+    /// 클러스터에 없으면 만든다(janitor가 지웠으면 다시). 만들지 못했으면 None이다(앞 기록을 둔다).
     async fn publish_cpu(&self) -> Option<&Probed> {
         let probed = self.cpu.as_ref()?.last()?;
         if !cpu::cpu_models_ready(&self.cluster, &self.name) {
             return None;
         }
-        if let Probed::Ok { catalog, cpu: now } = probed {
-            cpu::publish(&self.cluster, &now.catalog, catalog).await;
+        // 올리지 못했으면 `status.cpu`를 새 해시로 옮기지 않는다(리뷰 2 #2). 다음 회차가 다시 한다.
+        if let Probed::Ok { catalog, cpu: now } = probed
+            && !cpu::publish(&self.cluster, &now.catalog, catalog).await
+        {
+            return None;
         }
         Some(probed)
     }

@@ -172,6 +172,7 @@ async fn the_cpu_is_resolved_at_start_and_recorded() {
         flags: [("aes".to_string(), true), ("avx512vbmi".to_string(), false)].into(),
         enforce: true,
         source: CpuSource::Spec,
+        dropped_mask: Vec::new(),
     };
     assert_eq!(hardware(&got).cpu_resolved, Some(want.clone()));
     assert_eq!(launched_cpu(&env, vm.id), Some(want));
@@ -210,7 +211,7 @@ async fn a_node_without_a_catalog_runs_only_host_and_max() {
     assert_eq!(
         got.status.last_error.as_deref(),
         Some(
-            "failed to start: node \"n1\" has no CPU catalog; only the host and max CPU models can run there"
+            "failed to start: the VM's node has no CPU catalog; only the host and max CPU models can run there"
         )
     );
     assert!(env.hv.launches().is_empty());
@@ -231,7 +232,7 @@ async fn a_model_the_node_cannot_run_is_refused() {
     assert_eq!(
         got.status.last_error.as_deref(),
         Some(
-            "failed to start: node \"n1\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi)"
+            "failed to start: the VM's node cannot run CPU model Icelake-Server-v7 (missing avx512vbmi)"
         )
     );
     assert!(env.hv.launches().is_empty());
@@ -345,6 +346,7 @@ async fn the_receiving_side_uses_the_recorded_cpu() {
         flags: [("avx512vbmi".to_string(), false)].into(),
         enforce: false,
         source: CpuSource::Spec,
+        dropped_mask: Vec::new(),
     };
     hw.cpu_resolved = Some(recorded.clone());
     vm.status.hardware = Some(hw);
@@ -473,6 +475,7 @@ async fn a_memory_snapshot_restore_checks_its_recorded_cpu() {
         flags: BTreeMap::new(),
         enforce: true,
         source: CpuSource::Spec,
+        dropped_mask: Vec::new(),
     });
     let launches = env.hv.launches().len();
     let ice = memory_snapshot(&env, &vm, "ice", vm.spec.clone(), Some(hw)).await;
@@ -484,8 +487,105 @@ async fn a_memory_snapshot_restore_checks_its_recorded_cpu() {
     assert_eq!(
         got.status.last_error.as_deref(),
         Some(
-            "failed to start: node \"n1\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi); the memory snapshot was taken with that CPU"
+            "failed to start: the VM's node cannot run CPU model Icelake-Server-v7 (missing avx512vbmi); the memory snapshot was taken with that CPU"
         )
     );
     assert_eq!(env.hv.launches().len(), launches);
+}
+
+/// 리뷰 2 #1: 담을 때 그 노드의 QEMU가 몰라 뺀 숨김 이름이 있는 메모리 스냅샷은 그 이름을 아는 노드에서 되돌리지
+/// 않는다(되돌린 게스트에 숨긴 기능이 드러난다).
+#[tokio::test]
+async fn a_memory_snapshot_with_dropped_mask_names_is_not_restored_where_qemu_knows_them() {
+    let env = Env::start().await;
+    let hash = publish_catalog(&env).await;
+    add_node(&env, &[PLACEMENT, CPU_MODELS], Some(&hash)).await;
+    set_mask(&env, &["avx512vbmi"]).await;
+    let mut vm = x86_vm("host", &[]);
+    vm.spec.node = Some(env.node);
+    vm.spec.power = PowerState::Stopped;
+    env.create(&vm).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    let mut hw = RunningHardware::legacy(&vm.spec);
+    hw.cpu_resolved = Some(ResolvedCpu {
+        model: "host".into(),
+        flags: BTreeMap::new(),
+        enforce: false,
+        source: CpuSource::Spec,
+        dropped_mask: vec!["avx512vbmi".into()],
+    });
+    let launches = env.hv.launches().len();
+    let snap = memory_snapshot(&env, &vm, "old-qemu", vm.spec.clone(), Some(hw)).await;
+    env.restore_on_start(vm.id, &snap.to_string());
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env
+        .wait(vm.id, "refused", |v| v.status.last_error.is_some())
+        .await;
+    let e = got.status.last_error.unwrap();
+    assert!(
+        e.starts_with(
+            "failed to start: the VM's node would expose the hidden CPU flags avx512vbmi when the memory snapshot is restored"
+        ),
+        "{e}"
+    );
+    assert_eq!(env.hv.launches().len(), launches);
+}
+
+/// 리뷰 2 #4: 작업자가 스스로 다시 켜는 VM(크래시)은 이 노드가 보류된 새 CPU를 켤 수 없으면 쓰던 CPU로 다시 켜고
+/// 바뀜은 보류로 남긴다. 사용자가 끈 뒤 켜면(전원 껐다 켜기) 새 CPU로 켜려다 거절한다.
+#[tokio::test]
+async fn a_crash_restarts_with_the_running_cpu_when_the_new_one_cannot_run_here() {
+    let env = Env::start().await;
+    let hash = publish_catalog(&env).await;
+    add_node(&env, &[PLACEMENT, CPU_MODELS], Some(&hash)).await;
+    let mut vm = x86_vm("Skylake-Server-v5", &[]);
+    vm.spec.node = Some(env.node);
+    vm.spec.restart = opl_types::vm::RestartPolicy::OnFailure;
+    env.create(&vm).await;
+    let before = env
+        .wait(vm.id, "running", |v| {
+            v.status.phase == VmPhase::Running && v.status.hardware.is_some()
+        })
+        .await;
+    let running = hardware(&before).cpu_resolved.unwrap();
+    assert_eq!(running.model, "Skylake-Server-v5");
+
+    // 이 노드가 켤 수 없는 모델로 바꾼다(실행 중이라 보류).
+    let current = env.get(vm.id);
+    let mut spec = current.spec.clone();
+    spec.cpu.model = "Icelake-Server-v7".parse().unwrap();
+    env.cluster
+        .update_spec(vm.id, Some(current.revision), current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    let launches = env.hv.launches().len();
+    env.hv.crash(vm.id);
+    let got = env
+        .wait(vm.id, "restarted", |v| {
+            v.status.phase == VmPhase::Running
+                && v.status.pid.is_some()
+                && v.status.pid != before.status.pid
+                && v.status.hardware.is_some()
+        })
+        .await;
+    assert_eq!(got.spec.power, PowerState::Running);
+    assert_eq!(env.hv.launches().len(), launches + 1);
+    assert_eq!(launched_cpu(&env, vm.id), Some(running.clone()));
+    assert_eq!(hardware(&got).cpu_resolved, Some(running));
+
+    // 사용자의 끄기·켜기는 새 CPU다: 이 노드는 켤 수 없으니 까닭을 남긴다.
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    env.set_power(vm.id, PowerState::Running).await;
+    let got = env
+        .wait(vm.id, "refused", |v| v.status.last_error.is_some())
+        .await;
+    assert_eq!(
+        got.status.last_error.as_deref(),
+        Some(
+            "failed to start: the VM's node cannot run CPU model Icelake-Server-v7 (missing avx512vbmi)"
+        )
+    );
 }
