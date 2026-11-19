@@ -1,0 +1,19 @@
+19fa
+Name: OVN_Northbound
+Cluster ID: not yet known
+Server ID: 19fa (19faadac-f694-4ea4-859a-4f9be55328b3)
+Address: ssl:127.0.0.2:6643
+Status: joining cluster
+Remotes for joining: ssl:127.0.0.1:6643
+Role: follower
+Term: 0
+Leader: unknown
+Vote: unknown
+
+Election timer: 1000
+Log: [1, 1]
+Entries not yet committed: 0
+Entries not yet applied: 0
+Connections: ->0000
+Disconnections: 0
+Servers:

@@ -1,0 +1,20 @@
+ea4d
+Name: OVN_Southbound
+Cluster ID: c381 (c3815d2b-00fb-45ec-afea-de92f8f9bf3e)
+Server ID: ea4d (ea4d0814-d232-4930-bb1e-f6b99abac862)
+Address: ssl:127.0.0.1:6644
+Status: cluster member
+Role: leader
+Term: 1
+Leader: self
+Vote: self
+
+Last Election won: 3007 ms ago
+Election timer: 1000
+Log: [2, 3]
+Entries not yet committed: 0
+Entries not yet applied: 0
+Connections:
+Disconnections: 0
+Servers:
+    ea4d (ea4d at ssl:127.0.0.1:6644) (self) next_index=2 match_index=2

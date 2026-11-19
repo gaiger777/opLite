@@ -66,6 +66,7 @@ use crate::notify::Notifier;
 use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 use crate::runtime::{Handles, on, run_on};
+use crate::sdn::{SdnAgent, SdnReport};
 use crate::shutdown;
 use crate::topology::TopologyWatch;
 
@@ -229,6 +230,8 @@ struct Services {
     updates: Option<UpdateAgent>,
     /// 관리 Ceph의 클라이언트 설정과 데몬 노드의 `mon_host`를 맞춘다.
     ceph: CephAgent,
+    /// SDN(OVN) chassis·중앙 단위를 맞추고 상태를 읽는다(Linux가 아니면 없다, 계획 65).
+    sdn: Option<SdnAgent>,
     /// 리더가 텔레메트리 보고를 보낸다(설정에서 켰을 때).
     telemetry: TelemetryReporter,
     /// 이 노드의 경보를 평가하고 알림을 보낸다(리더면 리더 경보도).
@@ -286,6 +289,9 @@ impl Services {
             updates.shutdown().await;
         }
         self.ceph.shutdown().await;
+        if let Some(sdn) = self.sdn {
+            sdn.shutdown(left).await;
+        }
         if let Some(overlay) = self.overlay {
             overlay.shutdown(left).await;
         }
@@ -451,6 +457,8 @@ impl Member {
             };
         #[cfg(feature = "cpu-it")]
         crate::cpu_hook::set_member(Arc::downgrade(&cluster), &hv);
+        #[cfg(feature = "sdn-it")]
+        crate::sdn_hook::set_member(Arc::downgrade(&cluster));
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;
@@ -601,6 +609,9 @@ impl Member {
         ));
         // Ceph Task·에이전트와 API(디스크 목록, Ceph 상태), 다른 노드(노드 간 서버)가 같은 단계들을 쓴다.
         let ceph = Arc::new(config.ceph.host());
+        // SDN Task와 에이전트가 같은 단계들을 쓴다(계획 65). OVS 포트·chassis의 표시는 클러스터 태그다.
+        let ovn = Arc::new(config.sdn.host(&config.data_dir, &tag));
+        let sdn_report = SdnReport::default();
         let ceph_source = Arc::new(CephPeerSource::new(cluster.clone(), node, ceph.clone()));
         // 토폴로지의 지금 값(계획 64 `ReadTopology`, Linux만): API와 다른 노드가 같은 읽기를 쓴다.
         let topology_source: Option<Arc<dyn opl_peer::TopologySource>> =
@@ -885,6 +896,7 @@ impl Member {
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         runner_config.ceph = Some(ceph.clone());
+        runner_config.sdn = Some(ovn.clone());
         state.ceph = Some(ceph.clone());
         state.ceph_status_ttl = config.ceph.status_cache();
         // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.
@@ -932,6 +944,7 @@ impl Member {
                         .collect(),
                     hotplug: Some(hotplug),
                     firmware_caps: Some(firmware_caps),
+                    sdn: Some(sdn_report.clone()),
                 },
                 state.audit.clone(),
                 Some(cpu_watch),
@@ -949,6 +962,9 @@ impl Member {
             updates.map(|u| UpdateAgent::spawn(cluster.clone(), node, u))
         });
         let ceph = on(&rt.work, || CephAgent::spawn(cluster.clone(), node, ceph));
+        let sdn = on(&rt.work, || {
+            SdnAgent::spawn(cluster.clone(), ovn, sdn_report, config.sdn.refresh())
+        });
 
         let api_cert = config.api.tls_cert.is_none().then(|| {
             on(&rt.work, || {
@@ -1052,6 +1068,7 @@ impl Member {
                 ha,
                 updates,
                 ceph,
+                sdn,
                 state: services_state,
                 stop_ha_vms: None,
             }),

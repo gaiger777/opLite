@@ -91,6 +91,12 @@ cpu-it = ["qemu-it"]
 # 2M hugepages 백엔드, 공유 VM, 실행 중 붙인 vCPU, 한 호스트의 opld 둘 사이 마이그레이션 뒤 다시 고정을 본다(설정은
 # `node resources`·`vm create --cpu-policy` 명령으로). qemu-it의 준비물이 필요하다.
 numa-it = []
+# Orbivisor가 OVN을 설치·구성하는 E2E(계획 65): OVN이 없는 깨끗한 호스트에서 orbivisord가 apt로 `ovn-central`·`ovn-host`·
+# `openvswitch-switch`를 받아 노드 하나에 NB·SB Raft 클러스터와 northd(Orbivisor 단위, 노드 주소의 `pssl`만, 클러스터 CA mTLS)를
+# 세우고 chassis로 구성한다(`sdn-init`). 같은 호스트에 `ovsdb-server` 한 쌍을 127.0.0.2로 띄워 두 번째 중앙의 합류·떠나기를
+# 실제 ovsdb로 본다. 제어 소켓에 시험 고리(`/v1/test/sdn-task`·`sdn`)를 더한다(`/sdn` API는 스테이지 6). Linux(Ubuntu 24.04 =
+# OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하고, 호스트에 OVN 꾸러미와 데몬을 남기므로 CI 러너(`ovn` 작업)에서만 돌린다.
+sdn-it = []
 
 [dependencies]
 anyhow.workspace = true

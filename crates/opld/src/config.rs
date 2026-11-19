@@ -12,6 +12,7 @@ use opl_api::{
 use opl_driver::ceph::{
     CLIENT_PACKAGES, CephHost, CephOptions, CephPaths, DAEMON_PACKAGES, SystemRunner,
 };
+use opl_driver::ovn::{CENTRAL_PACKAGES, HOST_PACKAGES, OvnHost, OvnOptions, OvnPaths};
 use opl_driver::{NetFs, VipAddress};
 use opl_qemu::{Accel, HostProfile, kvm_available};
 use opl_reconciler::HaConfig;
@@ -100,6 +101,8 @@ pub struct Config {
     pub node: NodeSection,
     #[serde(default)]
     pub ceph: CephSection,
+    #[serde(default)]
+    pub sdn: SdnSection,
     #[serde(default)]
     pub download: DownloadSection,
     #[serde(default)]
@@ -1042,6 +1045,68 @@ fn default_ceph_status_cache_secs() -> u64 {
     5
 }
 
+/// SDN(OVN, 계획 65)이 이 노드에서 쓰는 값. 위트니스는 쓰지 않는다. 관리자가 `sdn init`을 하기 전에는 아무것도 하지
+/// 않는다(꾸러미를 찾지도 않는다).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SdnSection {
+    /// OVN 중앙 노드에 까는 꾸러미
+    #[serde(default = "default_sdn_central_packages")]
+    pub central_packages: Vec<String>,
+    /// chassis에 까는 꾸러미
+    #[serde(default = "default_sdn_host_packages")]
+    pub host_packages: Vec<String>,
+    /// `apt-get update`·`install` 하나의 시간 한도(초)
+    #[serde(default = "default_ceph_install_timeout_secs")]
+    pub install_timeout_secs: u64,
+    /// 노드 SDN 에이전트가 바뀐 것이 없어도 다시 맞추고 상태를 읽는 간격(초)
+    #[serde(default = "default_sdn_refresh_secs")]
+    pub refresh_secs: u64,
+}
+
+impl Default for SdnSection {
+    fn default() -> Self {
+        Self {
+            central_packages: default_sdn_central_packages(),
+            host_packages: default_sdn_host_packages(),
+            install_timeout_secs: default_ceph_install_timeout_secs(),
+            refresh_secs: default_sdn_refresh_secs(),
+        }
+    }
+}
+
+impl SdnSection {
+    /// 이 노드에서 OVN을 세우는 단계들(실제 명령). 노드 TLS 원본은 `{data_dir}/pki`, `tag`는 클러스터 태그다. Linux가
+    /// 아닌 노드도 만들고 Task가 거절한다.
+    pub fn host(&self, data_dir: &Path, tag: &str) -> OvnHost {
+        let paths = OvnPaths {
+            pki: data_dir.join(opl_peer::pki::PKI_DIR),
+            ..OvnPaths::default()
+        };
+        let options = OvnOptions {
+            central_packages: self.central_packages.clone(),
+            host_packages: self.host_packages.clone(),
+            install_timeout: Duration::from_secs(self.install_timeout_secs),
+            ..OvnOptions::default()
+        };
+        OvnHost::new(Arc::new(SystemRunner), paths, options, tag.to_string())
+    }
+
+    pub fn refresh(&self) -> Duration {
+        Duration::from_secs(self.refresh_secs)
+    }
+}
+
+fn default_sdn_central_packages() -> Vec<String> {
+    CENTRAL_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_sdn_host_packages() -> Vec<String> {
+    HOST_PACKAGES.iter().map(|p| p.to_string()).collect()
+}
+fn default_sdn_refresh_secs() -> u64 {
+    60
+}
+
 /// 실행기 크기(설계 §3.1). `core` 실행기는 2로 고정이다.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1492,6 +1557,12 @@ impl Config {
         }
         if self.ceph.install_timeout_secs == 0 {
             anyhow::bail!("ceph.install_timeout_secs must be at least 1");
+        }
+        if self.sdn.install_timeout_secs == 0 {
+            anyhow::bail!("sdn.install_timeout_secs must be at least 1");
+        }
+        if self.sdn.refresh_secs == 0 {
+            anyhow::bail!("sdn.refresh_secs must be at least 1");
         }
         // 등록하는 RBD 풀의 `conf`가 된다(절대 경로, `,:=` 없음).
         let client_dir = self.ceph.client_dir.to_string_lossy();
@@ -2082,6 +2153,37 @@ mod tests {
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[replication]\nevery = 1")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn sdn_section_defaults_and_overrides() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        c.validate().unwrap();
+        let host = c.sdn.host(Path::new("/var/lib/opl"), "abc");
+        assert_eq!(host.paths().pki, Path::new("/var/lib/opl/pki"));
+        assert_eq!(host.paths().etc, Path::new("/etc/opl/ovn"));
+        assert_eq!(host.paths().var_lib, Path::new("/var/lib/opl/ovn"));
+        assert_eq!(host.options().central_packages, CENTRAL_PACKAGES);
+        assert_eq!(host.options().host_packages, HOST_PACKAGES);
+        assert_eq!(host.options().install_timeout, Duration::from_secs(1800));
+        assert!(!host.options().any_os);
+        assert_eq!(host.tag(), "abc");
+        assert_eq!(c.sdn.refresh(), Duration::from_secs(60));
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[sdn]\ncentral_packages = [\"ovn\"]\nhost_packages = []\n\
+             install_timeout_secs = 60\nrefresh_secs = 5",
+        );
+        c.validate().unwrap();
+        let host = c.sdn.host(Path::new("/d"), "t");
+        assert_eq!(host.options().central_packages, ["ovn"]);
+        assert!(host.options().host_packages.is_empty());
+        assert_eq!(c.sdn.refresh(), Duration::from_secs(5));
+        for bad in ["install_timeout_secs = 0", "refresh_secs = 0", "x = 1"] {
+            let text = format!("name = \"n\"\naddress = \"h\"\n[sdn]\n{bad}");
+            let parsed: Result<Config, _> = toml::from_str(&text);
+            assert!(parsed.map_or(true, |c| c.validate().is_err()), "{bad}");
+        }
     }
 
     #[test]

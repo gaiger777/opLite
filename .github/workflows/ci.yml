@@ -404,6 +404,28 @@ jobs:
           sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features opld/ceph-it,opld/qemu-it -p opld --test ceph -- --nocapture
 
+  # SDN(OVN) 설치·구성(계획 65): 깨끗한 Ubuntu 24.04 러너에서 orbivisord가 직접 ovn-central·ovn-host·openvswitch-switch를 apt로
+  # 받아 NB·SB Raft 클러스터·northd(Orbivisor 단위, 노드 주소의 pssl, 클러스터 CA mTLS)와 chassis를 세우고, 127.0.0.2의
+  # ovsdb-server 한 쌍으로 두 번째 중앙의 합류·떠나기를 본다. 실제 OVN 출력(판, cluster/status, ovs-vsctl JSON)을 로그에 남긴다.
+  ovn:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: QEMU (OVN itself is installed by orbivisord)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils
+          test ! -e /etc/ovn
+          test ! -e /etc/openvswitch
+          if dpkg -s ovn-central >/dev/null 2>&1 || dpkg -s openvswitch-switch >/dev/null 2>&1; then exit 1; fi
+      # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
+      - name: OVN setup E2E as root
+        run: |
+          sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+            cargo test --features opld/sdn-it -p opld --test sdn -- --nocapture
+
   # 설치 매체와 cloud-init(계획 57)의 실제 게스트: 받아 둔 Alpine virt ISO로 BIOS·UEFI VM이 CD에서 부팅하는지, Ubuntu
   # 24.04 클라우드 이미지에 cloud-init이 호스트 이름·사용자·비밀번호 해시·키·고정 IP를 적용하는지 본다. 게스트 OS가 있어야
   # 보이는 것만 여기서 보고, 나머지 CD·씨앗 시험은 linux-kvm의 qemu-it·migration-it가 돌린다.

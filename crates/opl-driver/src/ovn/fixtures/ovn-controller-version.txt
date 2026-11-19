@@ -1,0 +1,4 @@
+ovn-controller 24.03.8
+Open vSwitch Library 3.3.9
+OpenFlow versions 0x6:0x6
+SB DB Schema 20.33.0

@@ -1,0 +1,20 @@
+19fa
+Name: OVN_Northbound
+Cluster ID: 5f8b (5f8bebd0-7593-4d24-8db5-23678d1f6ce6)
+Server ID: 19fa (19faadac-f694-4ea4-859a-4f9be55328b3)
+Address: ssl:127.0.0.2:6643
+Status: cluster member
+Role: follower
+Term: 1
+Leader: 4f28
+Vote: unknown
+
+Election timer: 1000
+Log: [2, 6]
+Entries not yet committed: 0
+Entries not yet applied: 0
+Connections: ->0000 <-4f28
+Disconnections: 0
+Servers:
+    19fa (19fa at ssl:127.0.0.2:6643) (self)
+    4f28 (4f28 at ssl:127.0.0.1:6643) last msg 331 ms ago

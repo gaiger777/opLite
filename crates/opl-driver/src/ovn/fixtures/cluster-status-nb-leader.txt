@@ -1,0 +1,20 @@
+4f28
+Name: OVN_Northbound
+Cluster ID: 5f8b (5f8bebd0-7593-4d24-8db5-23678d1f6ce6)
+Server ID: 4f28 (4f28dad5-42cb-46b0-aa86-97bbc5da8166)
+Address: ssl:127.0.0.1:6643
+Status: cluster member
+Role: leader
+Term: 1
+Leader: self
+Vote: self
+
+Last Election won: 3011 ms ago
+Election timer: 1000
+Log: [2, 3]
+Entries not yet committed: 0
+Entries not yet applied: 0
+Connections:
+Disconnections: 0
+Servers:
+    4f28 (4f28 at ssl:127.0.0.1:6643) (self) next_index=2 match_index=2

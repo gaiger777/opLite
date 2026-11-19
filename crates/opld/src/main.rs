@@ -31,6 +31,9 @@ mod notify;
 mod overlay;
 mod pools;
 mod runtime;
+mod sdn;
+#[cfg(feature = "sdn-it")]
+mod sdn_hook;
 mod shutdown;
 #[cfg(feature = "starve-it")]
 mod starve;

@@ -1,0 +1,1 @@
+{"data":[[["map",[["hostname","runnervm8axu0.u2aw1uldo4tu3nnbqxlboydcff.cx.internal.cloudapp.net"],["orbivisor-cluster","3ff07b431d8e"],["ovn-encap-ip","127.0.0.1"],["ovn-encap-type","geneve"],["ovn-remote","ssl:127.0.0.1:6642"],["rundir","/var/run/openvswitch"],["system-id","01a1f5c3-80d3-736d-87b4-16dc80b56c67"]]]]],"headings":["external_ids"]}

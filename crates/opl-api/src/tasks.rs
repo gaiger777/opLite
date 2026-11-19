@@ -13,6 +13,7 @@ mod hotplug;
 mod import;
 mod migrate;
 mod replicate;
+mod sdn;
 mod snapshot;
 mod template;
 mod vm_replicate;
@@ -28,6 +29,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::watch::WatchEvent;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::ceph::CephHost;
+use opl_driver::ovn::OvnHost;
 use opl_driver::{DriverError, Hypervisor, ISO_HEADER_LEN, Storage, is_iso_image};
 use opl_peer::Peers;
 use opl_reconciler::{FirewallGate, FirmwareFetcher, ReconcilerHandle};
@@ -142,6 +144,8 @@ pub struct TaskRunnerConfig {
     pub replica_dir: Option<PathBuf>,
     /// 이 노드에서 Ceph를 세우는 단계들(opld `[ceph]`). 없으면 Ceph Task는 실패한다.
     pub ceph: Option<Arc<CephHost>>,
+    /// 이 노드에서 OVN을 세우는 단계들(opld `[sdn]`, 계획 65). 없으면 SDN Task는 실패한다.
+    pub sdn: Option<Arc<OvnHost>>,
     /// URL에서 받기(`volume-download`)가 루프백·링크 로컬·사설망 주소에서도 받는지(opld `[download] allow_private`,
     /// 기본 false — 노드 안쪽이나 클라우드 메타데이터에 닿지 않게)
     pub download_allow_private: bool,
@@ -178,6 +182,7 @@ impl TaskRunnerConfig {
             replication_stall: migrate::DISK_STALL,
             replica_dir: None,
             ceph: None,
+            sdn: None,
             download_allow_private: false,
             state_dir_min_age: firmware::STATE_DIR_MIN_AGE,
             cpu: None,
@@ -611,9 +616,13 @@ fn is_snapshot_op(op: &TaskOp) -> bool {
 /// `Ceph` 리소스의 줄에 서서 한 노드 안에서 차례로 돈다(같은 노드의 apt·`/etc/ceph`를 함께 만지지 않게). 평탄화(계획 58)는
 /// 크기 늘리기처럼 그 볼륨을 쓰는 VM의 줄에 서서 스냅샷·복제·백업과 섞이지 않는다. 템플릿 되돌리기는 템플릿 VM의 줄에
 /// 서서 앞서 받은 배포(복제) Task가 끝난 뒤 남은 연결 복제를 본다. 펌웨어 초기화(계획 59)도 VM의 줄에 서서 스냅샷·백업·복제가
-/// 펌웨어 파일을 담는 중에 지우지 않는다.
+/// 펌웨어 파일을 담는 중에 지우지 않는다. SDN Task(계획 65)는 chassis 설치까지 `Sdn` 리소스의 줄에 서서 한 노드 안에서
+/// 차례로 돈다(Ceph와 같은 까닭 — 같은 노드의 apt·OVS DB).
 fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     let target = task.spec.target;
+    if task.spec.op.is_sdn() {
+        return Some(sdn::queue(ctx, task));
+    }
     match task.spec.op {
         TaskOp::BackupRestore { backup, .. } => return Some(backup),
         TaskOp::VmImport { import, .. } => return Some(import),
@@ -708,7 +717,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
     // 업그레이드도 오래 걸릴 수 있고 apt를 중간에 끊으면 더 나쁘다. 노드 비우기는 마이그레이션을 여럿
     // 하므로 VM마다 기다리는 시간만 둔다(`migration_timeout`). 로컬 디스크 복제는 전체 회차가 디스크 크기만큼
     // 걸리므로 보낸 양이 늘지 않는 시간만 본다(`replication_stall`). Ceph Task는 꾸러미 설치·디스크 지우기처럼
-    // 오래 걸리는 단계마다 한도가 따로 있다. URL 받기는 이미지 크기만큼 걸리므로 연결·읽기 쉼 한도만 둔다. 평탄화는
+    // 오래 걸리는 단계마다 한도가 따로 있다(SDN Task도 같다 — apt, Raft 기다리기). URL 받기는 이미지 크기만큼 걸리므로 연결·읽기 쉼 한도만 둔다. 평탄화는
     // 기반 데이터를 디스크 크기만큼 복사한다(`qemu-img rebase`, `zfs send`).
     let unlimited = matches!(
         task.spec.op,
@@ -722,7 +731,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::VmReplicate { .. }
             | TaskOp::VolumeDownload { .. }
             | TaskOp::VolumeFlatten
-    ) || task.spec.op.is_ceph();
+    ) || task.spec.op.is_ceph()
+        || task.spec.op.is_sdn();
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -743,6 +753,9 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             }
             if task.spec.op.is_ceph() {
                 ceph::finished(ctx, &task, None).await;
+            }
+            if task.spec.op.is_sdn() {
+                sdn::finished(ctx, &task, None).await;
             }
             set_status(ctx, task.id, TaskState::Succeeded, warning).await
         }
@@ -801,7 +814,7 @@ async fn unfinished_error(ctx: &Ctx, task: &Task, error: String) -> String {
 /// 블록 디스크의 태그는 뒤에서 다시 지운다([`snapshot::remove_unfinished_tags`]). 실패한 로컬 디스크 복제는 그
 /// 대상의 상태에 `error`를 남기고 원본 QEMU에 남은 플리싱을 치운 뒤 대상 노드에 회차를 버리게 한다. 실패한
 /// Ceph 부트스트랩은 `Ceph` 리소스에 `last_error`를 남기고(다시 하면 이어서 한다), Ceph Task는 잡아 둔 자리
-/// (`pending`)를 놓는다.
+/// (`pending`)를 놓는다. SDN Task도 같다(첫 세우기의 실패는 `Sdn` 리소스의 `last_error`).
 async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     if let TaskOp::SnapshotCreate { snapshot } = task.spec.op {
         if unfinished {
@@ -834,6 +847,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if task.spec.op.is_ceph() {
         ceph::finished(ctx, task, Some(error)).await;
+    }
+    if task.spec.op.is_sdn() {
+        sdn::finished(ctx, task, Some(error)).await;
     }
     if matches!(
         task.spec.op,
@@ -1015,11 +1031,11 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
         | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
-        // SDN 설치·구성(계획 65)은 스테이지 2가 단다. API가 아직 이 Task를 만들지 않는다.
+        // SDN 설치·구성(계획 65). `br-int`의 남의 포트·짝수 중앙은 경고로 남긴다.
         TaskOp::SdnInit { .. }
         | TaskOp::SdnCentralAdd
         | TaskOp::SdnCentralRemove
-        | TaskOp::SdnChassisInstall => Err("SDN (OVN) setup is not available yet".into()),
+        | TaskOp::SdnChassisInstall => return sdn::perform(ctx, task).await,
         TaskOp::VolumeDownload {
             url,
             sha256,

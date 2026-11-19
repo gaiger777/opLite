@@ -3,7 +3,8 @@
 //! 저장된 것과 다르면 `NodeStatus.checks`에 쓴다(화면용). 인터페이스 목록(`NodeStatus.interfaces`)도 여기서
 //! 쓰고, 본딩 상태가 바뀌면 감사 항목과 기록 Task(`bond-degraded`)로 알린다. 노드 CPU 탐침(계획 63, [`CpuWatch`])도
 //! 회차마다 거두어 카탈로그를 올리고 `NodeStatus.cpu`를 쓴다. 노드 NUMA 토폴로지 탐침(계획 64, [`TopologyWatch`])도
-//! 회차마다 노드 설정 `host_resources`를 적용하고 30초마다 다시 읽어 `NodeStatus.topology`를 쓴다. 위트니스는 띄우지 않는다.
+//! 회차마다 노드 설정 `host_resources`를 적용하고 30초마다 다시 읽어 `NodeStatus.topology`를 쓴다. 노드 SDN 에이전트(계획 65,
+//! [`SdnReport`])가 읽은 `NodeStatus.sdn`도 여기서 쓴다. 위트니스는 띄우지 않는다.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
@@ -34,6 +35,7 @@ use uuid::Uuid;
 
 use crate::bootstrap;
 use crate::cpu::{self, CpuWatch, Probed};
+use crate::sdn::{self, SdnReport};
 use crate::topology::{self, PROBE_EVERY, TopologyWatch};
 
 /// 검사 회차의 간격
@@ -68,6 +70,8 @@ pub struct CheckerConfig {
     /// 이 노드의 TPM·Secure Boot 능력(계획 59). 핫플러그 능력처럼 노드 상태의 값이 다르면 다시 쓴다. None이면 건드리지
     /// 않는다.
     pub firmware_caps: Option<FirmwareCaps>,
+    /// 노드 SDN 에이전트가 읽은 상태(계획 65). 없거나 아직 읽지 않았으면 `NodeStatus.sdn`을 건드리지 않는다.
+    pub sdn: Option<SdnReport>,
 }
 
 /// 디렉터리 풀 probe. 시험은 멈추는 가짜로 바꾼다.
@@ -609,7 +613,7 @@ impl State {
         Some(probed)
     }
 
-    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`·`cpu`·`topology`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이
+    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`·`cpu`·`topology`·`sdn`을 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이
     /// 있을 때만, 64개까지).
     async fn write_status(&self, checks: &[CheckReport]) {
         let probed = self.publish_cpu().await;
@@ -619,6 +623,13 @@ impl State {
             .as_ref()
             .and_then(TopologyWatch::last)
             .filter(|_| topology::numa_ready(&self.cluster, &self.name));
+        // 모든 노드가 `sdn`을 알 때만 쓴다(계획 65 §7.2).
+        let node_sdn = self
+            .config
+            .sdn
+            .as_ref()
+            .and_then(SdnReport::get)
+            .filter(|_| sdn::sdn_ready(&self.cluster, &self.name));
         let interfaces = self
             .interfaces
             .as_deref()
@@ -662,6 +673,12 @@ impl State {
                     status.topology = Some(t);
                     changed = true;
                 }
+            }
+            if let Some(s) = &node_sdn
+                && status.sdn.as_ref() != Some(s)
+            {
+                status.sdn = Some(s.clone());
+                changed = true;
             }
             changed
         })
@@ -1125,6 +1142,7 @@ mod tests {
                     hosts: hosts.iter().map(|h| h.to_string()).collect(),
                     hotplug: None,
                     firmware_caps: None,
+                    sdn: None,
                 },
                 self.audit.clone(),
             );
@@ -1398,6 +1416,52 @@ mod tests {
             failed.error.as_deref(),
             Some("CPU probe failed: QEMU is gone")
         );
+    }
+
+    /// SDN 상태(계획 65): 옛 노드가 있으면(기능 `sdn`을 모름) 쓰지 않는다. 모두 알면 에이전트가 읽은 값을 쓰고, 같으면 다시
+    /// 쓰지 않으며, 에이전트가 아직 읽지 않았으면(None) 저장된 값을 지우지 않는다.
+    #[tokio::test]
+    async fn the_sdn_report_waits_for_the_feature() {
+        use opl_types::sdn::{ChassisState, NodeSdn};
+        let s = setup().await;
+        let mut old: opl_types::node::Node = Resource::new(
+            "n2",
+            NodeSpec {
+                host_resources: None,
+                address: "h2:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        old.status.features = vec![HA_CHECKS.into()];
+        s.cluster.create(&old).await.unwrap();
+        let report = SdnReport::default();
+        let value = NodeSdn {
+            chassis: ChassisState::Ready,
+            ovn_version: Some("24.03.8".into()),
+            ..NodeSdn::default()
+        };
+        report.set(Some(value.clone()));
+        let mut state = s.state(&[]);
+        state.config.sdn = Some(report.clone());
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.sdn, None);
+
+        let mut n2 = s.cluster.get_by_name::<NodeSpec>("n2").unwrap().unwrap();
+        n2.status.features.push(opl_types::node::SDN.into());
+        s.cluster
+            .update_status::<NodeSpec>(n2.id, &n2.status)
+            .await
+            .unwrap();
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.sdn, Some(value.clone()));
+        let revision = s.node().revision;
+        run_once(&mut state).await;
+        assert_eq!(s.node().revision, revision);
+        report.set(None);
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.sdn, Some(value));
     }
 
     /// NUMA 토폴로지(계획 64): 옛 노드가 있으면(기능 `numa`를 모름) 읽기만 하고 쓰지 않는다. 모두 알면 쓰고, 같은 값이면

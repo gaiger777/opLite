@@ -152,7 +152,7 @@ pub fn valid_key(s: &str) -> bool {
 }
 
 /// 노드 주소(`host:port`·`[v6]:port`)의 호스트가 IP면 그 IP
-fn address_ip(address: &str) -> Option<IpAddr> {
+pub(crate) fn address_ip(address: &str) -> Option<IpAddr> {
     let (host, port) = address.rsplit_once(':')?;
     port.parse::<u16>().ok()?;
     let host = host

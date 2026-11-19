@@ -10,6 +10,7 @@ pub mod migration;
 pub mod mock;
 pub mod mounts;
 pub mod net;
+pub mod ovn;
 pub mod qemu;
 pub mod replication;
 pub mod storage;

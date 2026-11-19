@@ -65,6 +65,12 @@ pub struct SdnStatus {
     /// 리더 `OvnSync`의 마지막 NB 동기화. 바뀔 때만 쓴다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sync: Option<SdnSync>,
+    /// OVN NB Raft 클러스터 id(`sdn-init`이 DB를 만들며 적는다). 노드에 남은 DB가 이 클러스터 것인지 본다(§7.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nb_cid: Option<Uuid>,
+    /// OVN SB Raft 클러스터 id
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sb_cid: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -297,6 +303,12 @@ pub struct SdnChassisView {
     pub sdn: Option<NodeSdn>,
 }
 
+/// 노드 `node`의 OVN 중앙 주소(NB·SB가 듣고 Raft가 쓰는 주소): 노드 주소(`NodeSpec.address`)의 호스트가 IP면 그것 —
+/// 노드 인증서의 SAN이다 — 아니면 underlay(`NodeStatus.underlay`). 둘 다 없으면 None
+pub fn central_address(node: &Node) -> Option<IpAddr> {
+    crate::ceph::address_ip(&node.spec.address).or(node.status.underlay)
+}
+
 impl SdnView {
     /// `sdn`이 없으면 설정 전 모양(중앙 없음)이다. 노드 표는 설정 전에도 채운다.
     pub fn new(sdn: Option<&Sdn>, nodes: &[Node], tasks: Vec<Uuid>) -> Self {
@@ -388,9 +400,12 @@ mod tests {
                 nb_cfg: 7,
                 hv_cfg: 6,
             }),
+            nb_cid: Some(Uuid::now_v7()),
+            sb_cid: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["centrals"][0]["address"], "10.0.0.1");
+        assert!(json.get("sb_cid").is_none(), "{json}");
         assert_eq!(json["pending"]["op"], json!({ "kind": "sdn-central-add" }));
         assert!(json["sync"].get("error").is_none(), "{json}");
         assert_eq!(serde_json::from_value::<SdnStatus>(json).unwrap(), status);
@@ -464,6 +479,19 @@ mod tests {
             ..NodeStatus::default()
         };
         n
+    }
+
+    /// 중앙 주소: 노드 주소의 IP, 이름이면 underlay, 둘 다 없으면 None
+    #[test]
+    fn central_addresses() {
+        let mut n = node("n1", false, None);
+        assert_eq!(central_address(&n), None);
+        n.status.underlay = Some(ip("10.1.0.5"));
+        assert_eq!(central_address(&n), Some(ip("10.1.0.5")));
+        n.spec.address = "10.0.0.1:8006".into();
+        assert_eq!(central_address(&n), Some(ip("10.0.0.1")));
+        n.spec.address = "[fd00::1]:8006".into();
+        assert_eq!(central_address(&n), Some(ip("fd00::1")));
     }
 
     #[test]

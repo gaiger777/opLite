@@ -311,3 +311,28 @@ graph LR
 - **권한**: `Kind::Sdn`은 `kind_privilege`의 기본 갈래로 읽기 `cluster.read`, 쓰기 `cluster.admin`이다(코드는 그대로, 권한 설명 글만 "Ceph·SDN"). `Kind::ALL` 34.
 - **`RuntimeNic`**는 이 스테이지에서 바뀌지 않는다(`ovn_port`는 스테이지 5가 더하고 그때 옛 JSON 시험을 둔다).
 - 컴파일 고치기: `NicSpec`·`NetworkSpec`·`NodeStatus` 리터럴(Linux 전용 파일 포함, 모두 빈 값). `schema.d.ts`를 다시 만들었다.
+
+### 스테이지 2 (opl-driver·opl-api·opld, `ovn` 작업)
+
+**GitHub 러너(Ubuntu 24.04)에서 확인한 꾸러미 사실**(OVN 24.03.8, OVS 3.3.9 — `ci-probe` 탐색 작업과 `ovn` 작업, 출력은 `opl-driver/src/ovn/fixtures/`):
+
+- 꾸러미: `ovn-central`(`/usr/bin/ovn-northd`, 스키마 `/usr/share/ovn/ovn-{nb,sb}.ovsschema`), `ovn-host`(`ovn-controller`), `ovn-common`(`ovn-nbctl`·`ovn-sbctl`·`ovn-appctl`), `openvswitch-common`(`/usr/sbin/ovsdb-server`, `ovsdb-tool`, `ovsdb-client`, `ovs-appctl`), `openvswitch-switch`(`ovs-vsctl`). §7.3의 경로가 맞다.
+- 배포판 중앙 단위는 넷이다: `ovn-central.service`(enabled oneshot, 나머지를 Wants), `ovn-northd.service`(static), `ovn-ovsdb-server-nb.service`·`-sb.service`(enabled, 별명 `ovn-nb-ovsdb`·`ovn-sb-ovsdb`). `systemctl disable --now` 넷 + `mask` 넷으로 모두 멈추고 별명도 지워진다. 설치하자마자 배포판 DB(`/var/lib/ovn/ovnnb_db.db`, 독립형)·northd가 돈다.
+- chassis 쪽은 `ovn-host.service`(enabled oneshot)가 `ovn-controller.service`(static)를 Wants한다. static 단위의 `systemctl enable`은 뜻이 없으므로 **`enable --now ovn-host.service` + `start ovn-controller.service`**로 바꿨다(§7.1의 `systemctl enable --now ovn-controller` 대신). ovn-controller는 설치 직후 원격 없이 떠서 `br-int`(fail_mode secure)를 만들고, `external_ids:ovn-remote`와 OVS `SSL` 표(`ovs-vsctl set-ssl`)를 다시 시작 없이 읽는다.
+- **`system-id`**: `openvswitch-switch`의 `ovsdb-server.service`가 `ovs-ctl --system-id=random`이라 설치 때 무작위 UUID를 `/etc/openvswitch/system-id.conf`에 두고 OVS가 켜질 때마다 `external_ids:system-id`로 다시 쓴다. 그래서 (1) §7.4의 "`system-id`가 노드 UUID가 아니고 비어 있지도 않으면 거절"은 **모든 새 설치를 거절**하므로 뺐다 — 거절은 `ovn-remote`가 있는데 내 태그가 없거나 다른 태그일 때만이다(꾸러미의 무작위 id는 덮는다). (2) chassis 구성은 `system-id.conf`에도 노드 UUID를 쓴다(아니면 재부팅 뒤 chassis 이름이 바뀐다).
+- `ovsdb-tool create-cluster`·`join-cluster`·`db-cid`(합류 중이면 "cluster ID not yet known"을 **종료 0**으로 찍는다), `ovs-appctl -t CTL cluster/status|cluster/leave DB`, `ovsdb-client needs-conversion`(stdout `yes`/`no`, stderr에 클러스터의 ephemeral 열 경고)·`convert`가 설계대로다. **`cluster/leave` 뒤 `ovsdb-server`는 살아 있고 그 DB만 내린다**(`cluster/status`가 `unknown cluster`) — 떠남은 그것으로 확인하고 단위를 멈춘다.
+- `pssl:PORT:ADDR`이면 Raft 포트(6643·6644)도 그 주소에만 듣는다. 다른 CA의 인증서, 인증서 없음, 평문 TCP는 모두 실패한다(mTLS). OVS는 상대 인증서의 SAN을 보지 않는다(CA만).
+- 팔로어의 로컬 소켓에는 `ovn-nbctl`이 기본(`--leader-only`)으로 붙지 못한다 — 문제 풀기 안내(스테이지 8)는 리더 노드의 소켓이나 `--no-leader-only`를 쓴다.
+
+**결정**
+
+- **자리**: `opl-driver/src/ovn/{host,units,status}.rs`(+ `host/tests.rs`, `fixtures/`), Task `opl-api/src/tasks/sdn.rs`, 에이전트 `opld/src/sdn.rs`, opld `[sdn]`(`central_packages`·`host_packages`·`install_timeout_secs`·`refresh_secs` 60), 시험 고리 `opld/src/sdn_hook.rs`(기능 `sdn-it`), 실제 시험 `opld/tests/sdn.rs`, CI `ovn` 작업. 명령 실행기는 Ceph의 `CommandRunner`·`FakeRunner`를 그대로 쓴다(`opl_driver::ovn`이 다시 내보냄).
+- **`SdnStatus.nb_cid`·`sb_cid`(새 칸, 빈 값은 빼고 씀)**: §7.4의 "DB의 클러스터 id가 `SdnStatus`가 아는 것과 다름"에 필요한 칸이 스테이지 1에 없었다. `sdn-init`은 DB를 임시 파일(`.nb.db.opl-new`)에 만들어 id를 Raft에 **먼저 적고** 제자리로 옮긴다 — 그래서 제자리의 DB는 늘 Raft가 아는 id이고, Raft가 모르는 id의 DB는 남의 것이다(합류 중이라 id가 없는 DB는 `central-add`·중앙의 chassis 설치에서만 받는다).
+- **중앙 주소**: `opl_types::sdn::central_address(node)` = 노드 주소의 IP(노드 인증서 SAN), 이름이면 underlay. `SdnInit.address`가 있으면 그것. 이미 중앙이면 Raft의 주소. 스테이지 6 API가 같은 함수로 미리 400을 낸다(주소를 직접 주면 SAN 밖일 수 있다 — 스테이지 3의 OVSDB 클라이언트가 SAN을 보므로 API가 노드 인증서 이름 안의 주소만 받게 한다).
+- **Task**: `sdn-init`은 첫 세우기 노드이고 자리가 다른 Task 것이 아닐 때만, `central-add`·`remove`는 **자리(`pending`)를 이 Task가 가졌을 때만** 돈다(`require_slot`). chassis 설치는 자리를 잡지 않고 노드마다 함께 돈다. 넷 모두 Task 시간 제한이 없고(apt·Raft), `Sdn` 리소스의 줄에 서서 한 노드 안에서 차례로 돌며(chassis 설치의 대상은 노드지만 줄은 같다), 끝나면(실패·중단 포함) 자리를 놓고 실패한 첫 세우기는 `last_error`를 남긴다(계획 56 Ceph와 같은 `is_sdn()` 갈래 셋 — 줄·시간 제한·뒤처리). 단계 이름에 `checking`·`leaving-cluster`·`stopping`을 더했고, 합류의 멤버 기다리기도 `waiting-for-leader`다. underlay가 없으면 꾸러미를 깔기 전에 멈춘다. 중앙의 판은 Raft `release`와 주·부 판이 같아야 한다. 이미 준비된 SDN에서 `sdn-init`을 다시 하면 리더 대신 멤버를 기다린다. 중앙이 짝수가 되면 Task 경고로도 남긴다.
+- **배포판 중앙 단위**는 꾸러미 설치 **뒤** 배포판 NB DB를 다시 보고(이미 깔려 있던 `ovn-central`의 DB — 막 깔린 빈 DB는 돌고 있는 채로 `ovsdb-tool query`로 읽는다) 끄고 가리며, 끈 단위를 `/etc/opl/ovn/distro-units`에 적는다(되돌리기 안내용).
+- **단위 파일**: `ExecStartPre=/bin/mkdir -p /run/opl/ovn /var/log/opl`, 로그는 `-vconsole:emer -vsyslog:err -vfile:info`(배포판과 같음), `Restart=on-failure`. 관리 표시(첫 줄)가 없는 같은 이름의 파일은 덮지 않는다. 바뀐 단위만 다시 시작한다.
+- **에이전트**: `Sdn`·`Node` watch는 (중앙 목록, 자리, 내 underlay)가 바뀔 때만 맞추고(노드 상태는 검사 루프가 5초마다 쓰므로), 나머지는 `refresh_secs`마다다. 이 노드에서 중앙 Task가 도는 동안은 단위를 건드리지 않는다. `ChassisState`: 내 태그가 아니면 `Missing`, ovn-controller가 SB에 붙지 않았으면 `Down`, 붙었는데 SB에 `Chassis` 행이 없으면 `Configuring`, 아니면 `Ready`(행은 `ovn-sbctl --no-leader-only find Chassis name=<UUID>`를 노드 TLS로 — 읽지 못하면 연결만 본다). 노드 상태 쓰기는 `CheckerConfig.sdn`(공유 칸)으로 검사 루프가 한다. 청소는 내 태그이고 `ofport` < 0이며 이 노드에 배정된 VM의 tap 이름이 아닌 포트만 지운다.
+- **`cluster leave`**: 에이전트가 멈출 때 chassis면 `orbivisor-cluster`·`ovn-remote` 두 칸만 지우고 ovn-controller를 멈춘다.
+- **시험 고리**: API(스테이지 6)가 생기기 전이라 `sdn-it` 빌드의 제어 소켓 `POST /v1/test/sdn-task`가 API처럼 리소스를 만들고 자리를 리비전 확인 쓰기로 잡아 Task를 만든다. 스테이지 6은 이 일을 `/sdn` API로 옮기고(바쁨 409 `sdn_busy`, 다시 하기, 주소 검사), 노드 지우기의 409 `sdn_central_on_node`를 단다.
+- **실제 시험의 범위**(§14 1·4·5): 설치·단위·`pssl`만 듣기·mTLS(다른 CA·인증서 없음·평문)·SB Chassis·노드 상태, 다시 하기(DB를 다시 만들지 않음)·chassis 설치·마지막 중앙 빼기 거절, `OvnHost`(임시 경로·`SystemRunner`)로 127.0.0.2의 `ovsdb-server` 한 쌍이 합류·떠나기와 그 뒤 첫 NB 쓰기, 에이전트의 멈춘 단위 켜기·오래된 포트 청소(남의 포트는 둠), opld 다시 띄우기. §14 2·3(DHCP·QEMU 바인딩)은 스테이지 4·5.
