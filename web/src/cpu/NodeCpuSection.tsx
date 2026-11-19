@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -37,23 +37,41 @@ export function NodeCpuSection({ node }: { node: Node }) {
   const info = useNodeCpu(node.id, readable);
   const [query, setQuery] = useState("");
   const [refreshing, setRefreshing] = useState(false);
+  // 화면을 떠나면 Task 기다리기를 그만둔다(결과는 Task 알림이 알린다).
+  const leaving = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    leaving.current = controller;
+    return () => controller.abort();
+  }, []);
   if (!readable) {
     return null;
   }
 
   async function refresh() {
+    const signal = leaving.current?.signal;
     setRefreshing(true);
+    let task;
     try {
-      const task = await call(
+      task = await call(
         api.POST("/nodes/{key}/cpu/refresh", { params: { path: { key: node.id } } }),
       );
-      trackTask(task, t("tasks.op.node-cpu-probe", { target: node.name }));
-      await waitForTask(queryClient, task.id);
-      await queryClient.invalidateQueries({ queryKey: CPU_KEY });
     } catch (err) {
       toast.error(t("cpu.node.refreshFailed", { error: errorMessage(t, err) }));
-    } finally {
       setRefreshing(false);
+      return;
+    }
+    // Task가 실패하면 Task 알림(`trackTask`)이 한 번 알린다 — 여기서 또 알리지 않는다(리뷰 1 웹 #7).
+    trackTask(task, t("tasks.op.node-cpu-probe", { target: node.name }));
+    try {
+      await waitForTask(queryClient, task.id, signal);
+      await queryClient.invalidateQueries({ queryKey: CPU_KEY });
+    } catch {
+      // 실패·떠남: 위 알림이 맡는다.
+    } finally {
+      if (!signal?.aborted) {
+        setRefreshing(false);
+      }
     }
   }
 

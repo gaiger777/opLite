@@ -3446,7 +3446,8 @@
       "clusterNow": "지금 클러스터 기준은 {{model}}입니다. VM은 전원을 껐다 켤 때마다 그때의 기준을 씁니다.",
       "clusterOff": "클러스터 기준이 없어 host처럼 켭니다.",
       "missing": "{{node}}에서 켤 수 없음(빠진 것: {{flags}})",
-      "cannot": "{{node}}에서 켤 수 없음: {{reason}}"
+      "cannot": "{{node}}에서 켤 수 없음: {{reason}}",
+      "archReset": "머신 유형이 아키텍처를 바꿔 CPU 모델과 플래그를 처음으로 돌렸습니다."
     },
     "flags": {
       "label": "CPU 플래그",
@@ -3454,8 +3455,8 @@
       "liveHint": "CPU 모델과 플래그는 다음 전원 껐다 켜기(재시작, 또는 정지 후 시작) 때 적용됩니다. 게스트 안 재부팅으로는 적용되지 않습니다.",
       "hide": "숨기기",
       "show": "켜기",
-      "hideOne": "{{name}} 숨기기로 바꾸기",
-      "showOne": "{{name}} 켜기로 바꾸기",
+      "onHide": "{{name}} 켜짐 — 숨기기로 바꾸기",
+      "offShow": "{{name}} 숨김 — 켜기로 바꾸기",
       "remove": "{{name}} 빼기",
       "unknown": "모름",
       "masked": "클러스터 전체에서 숨김"
@@ -3524,7 +3525,9 @@
       "force": "그래도 고정",
       "affected_one": "실행 중 VM {{count}}개는 전원을 껐다 켤 때까지 지금 CPU 그대로입니다.",
       "affected_other": "실행 중 VM {{count}}개는 전원을 껐다 켤 때까지 지금 CPU 그대로입니다.",
-      "affectedLink": "목록 보기"
+      "affectedLink": "목록 보기",
+      "affectedDelay": "각 노드가 자기 VM을 확인하므로 몇 초 안에 목록이 채워집니다.",
+      "reload": "내 변경을 버리고 다시 읽기"
     }
   }
 }

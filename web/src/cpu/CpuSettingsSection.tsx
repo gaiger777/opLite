@@ -29,6 +29,8 @@ export interface CpuValues {
   pinned: Partial<Record<Arch, { model: string; flags: string[] }>>;
   autoFlags: boolean;
   mask: string[];
+  /** 저장된 `baseline`(고정이 있으면 모드는 "고정"이어도 `auto`일 수 있다 — CLI로 둘 다 둔 설정) */
+  stored?: "off" | "auto";
 }
 
 /** 저장된 설정의 폼 값. 고정이 하나라도 있으면 "고정"이다(서버는 `baseline: off`여도 고정을 쓴다). */
@@ -43,6 +45,7 @@ export function cpuValues(spec: Settings["spec"]): CpuValues {
     pinned,
     autoFlags: cpu?.auto_flags ?? true,
     mask: cpu?.mask ?? [],
+    stored: cpu?.baseline ?? "off",
   };
 }
 
@@ -57,8 +60,9 @@ function pinnedList(v: CpuValues): Schemas["PinnedBaseline"][] {
 }
 
 /**
- * 폼 값의 설정 바꾸기(`PATCH /settings`의 `cpu`). 바뀐 칸만 보낸다 — 고정을 보내면 서버가 켤 수 없는 노드를 다시 보므로
- * 숨김 목록만 바꿀 때 409를 받지 않게 한다. 바뀐 것이 없으면 빈 객체다.
+ * 폼 값의 설정 바꾸기(`PATCH /settings`의 `cpu`). `current`는 고치기 시작할 때 읽은 설정이고 그것과 다른 칸만 보낸다 —
+ * 고정을 보내면 서버가 켤 수 없는 노드를 다시 보므로 숨김 목록만 바꿀 때 409를 받지 않게 하고, 그 사이 다른 사람이 바꾼
+ * 칸을 되돌리지 않는다. 바뀐 것이 없으면 빈 객체다.
  */
 export function cpuPatch(
   v: CpuValues,
@@ -66,10 +70,12 @@ export function cpuPatch(
   force = false,
 ): Schemas["CpuSettingsPatch"] {
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
-  const baseline = (x: CpuValues) => (x.mode === "auto" ? "auto" : "off");
+  const want = v.mode === "auto" ? "auto" : "off";
+  // 저장된 값과 견준다: `auto` + 고정인 설정에서 "끔"을 고르면 `baseline: off`도 보내야 한다(리뷰 1 웹 #5).
+  const had = current.stored ?? (current.mode === "auto" ? "auto" : "off");
   const pinned = pinnedList(v);
   const patch: Schemas["CpuSettingsPatch"] = {
-    ...(baseline(v) !== baseline(current) && { baseline: baseline(v) }),
+    ...(want !== had && { baseline: want }),
     ...(!same(pinned, pinnedList(current)) && { pinned }),
     ...(v.autoFlags !== current.autoFlags && { auto_flags: v.autoFlags }),
     ...(!same([...v.mask].sort(), [...current.mask].sort()) && { mask: v.mask }),
@@ -103,7 +109,14 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
   const settings = useSettings();
   const nodes = useList("node");
   const baseline = useCpuBaseline(perms.has("cluster.read"));
-  const [edited, setEdited] = useState<CpuValues | null>(null);
+  // 고치기 시작할 때의 설정과 revision(리뷰 1 웹 #3): 그것과 다른 칸만 보내고 그 revision으로 쓴다 — 그 사이 다른
+  // 사람이 바꿨으면 412로 알리고 조용히 되돌리지 않는다.
+  const [draft, setDraft] = useState<{
+    base: CpuValues;
+    revision: number;
+    values: CpuValues;
+  } | null>(null);
+  const [conflict, setConflict] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [blocked, setBlocked] = useState<Unsupported | null>(null);
@@ -113,10 +126,17 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
     return null;
   }
   const current = cpuValues(settings.data.spec);
-  const values = edited ?? current;
-  const revision = settings.data.revision;
+  const base = draft?.base ?? current;
+  const values = draft?.values ?? current;
+  const revision = draft?.revision ?? settings.data.revision;
   const change = (patch: Partial<CpuValues>) => {
-    setEdited({ ...values, ...patch });
+    setDraft({ base, revision, values: { ...values, ...patch } });
+    setBlocked(null);
+  };
+  const discard = () => {
+    setDraft(null);
+    setConflict(false);
+    setError(null);
     setBlocked(null);
   };
   // 고정할 아키텍처: 노드들의 아키텍처(위트니스 제외)와 기준이 있는 아키텍처, 이미 고정한 것
@@ -129,7 +149,7 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
       ...(Object.keys(values.pinned) as Arch[]),
     ]),
   ].sort();
-  const unchanged = Object.keys(cpuPatch(values, current)).length === 0;
+  const unchanged = Object.keys(cpuPatch(values, base)).length === 0;
 
   async function save(force: boolean) {
     setBusy(true);
@@ -138,12 +158,13 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
       const updated = await call(
         api.PATCH("/settings", {
           params: { header: { "If-Match": revision } },
-          body: { cpu: cpuPatch(values, current, force) },
+          body: { cpu: cpuPatch(values, base, force) },
         }),
       );
       storeSettings(queryClient, updated);
       void queryClient.invalidateQueries({ queryKey: CPU_KEY });
-      setEdited(null);
+      setDraft(null);
+      setConflict(false);
       setBlocked(null);
       setAffected(updated.affected_running_vms ?? null);
       toast.success(t("settings.saved"));
@@ -152,6 +173,9 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
       setBlocked(found);
       if (!found) {
         setError(settingsError(t, err));
+        setConflict(
+          err instanceof ApiError && (err.status === 412 || err.code === "revision_mismatch"),
+        );
       }
     } finally {
       setBusy(false);
@@ -169,9 +193,14 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
     >
       <h2 className="font-medium">{t("cpu.settings.title")}</h2>
       {error && (
-        <p role="alert" className="text-sm text-destructive">
-          {error}
-        </p>
+        <div role="alert" className="flex flex-wrap items-center gap-2 text-sm text-destructive">
+          <p>{error}</p>
+          {conflict && (
+            <Button type="button" variant="outline" size="sm" onClick={discard}>
+              {t("cpu.settings.reload")}
+            </Button>
+          )}
+        </div>
       )}
       <Field
         id="settings-cpu-mode"
@@ -185,12 +214,18 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
             disabled={!write || busy}
             onChange={(e) => {
               const mode = e.target.value as CpuMode;
-              // 고정으로 바꾸면 지금 기준을 미리 채운다.
+              // 고정으로 바꾸면 지금 기준을 플래그까지 미리 채운다(모델만 두면 cluster VM이 자동 플래그를 잃는다).
+              // 숨김 목록이 끈 이름은 기준에도 꺼져 있지만 고정에 넣지 않는다(숨김 목록을 빼도 남지 않게).
               const pinned = { ...values.pinned };
               if (mode === "pinned") {
                 for (const a of baseline.data?.arches ?? []) {
                   if (!pinned[a.arch] && a.baseline) {
-                    pinned[a.arch] = { model: a.baseline.model, flags: [] };
+                    pinned[a.arch] = {
+                      model: a.baseline.model,
+                      flags: Object.entries(a.baseline.flags ?? {})
+                        .filter(([name, on]) => on || !values.mask.includes(name))
+                        .map(([name, on]) => `${on ? "+" : "-"}${name}`),
+                    };
                   }
                 }
               }
@@ -302,7 +337,8 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
           {t("cpu.settings.affected", { count: affected })}{" "}
           <Link to="/vms?cpu=pending" className="underline underline-offset-4">
             {t("cpu.settings.affectedLink")}
-          </Link>
+          </Link>{" "}
+          <span className="text-muted-foreground">{t("cpu.settings.affectedDelay")}</span>
         </p>
       )}
       {write && (

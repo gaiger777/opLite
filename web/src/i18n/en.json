@@ -3446,7 +3446,8 @@
       "clusterNow": "The cluster baseline is now {{model}}. The VM uses the baseline at each power cycle.",
       "clusterOff": "No cluster baseline is set, so the VM runs like host.",
       "missing": "{{node}} cannot run it (missing {{flags}})",
-      "cannot": "{{node}} cannot run it: {{reason}}"
+      "cannot": "{{node}} cannot run it: {{reason}}",
+      "archReset": "The machine type changed the architecture, so the CPU model and flags were reset."
     },
     "flags": {
       "label": "CPU flags",
@@ -3454,8 +3455,8 @@
       "liveHint": "CPU model and flag changes apply at the next power cycle (Reboot, or Stop and Start). A reboot inside the guest does not apply them.",
       "hide": "Hide",
       "show": "Turn on",
-      "hideOne": "Hide {{name}} instead",
-      "showOne": "Turn {{name}} on instead",
+      "onHide": "{{name}} is on — hide it instead",
+      "offShow": "{{name}} is hidden — turn it on instead",
       "remove": "Remove {{name}}",
       "unknown": "unknown",
       "masked": "hidden cluster-wide"
@@ -3524,7 +3525,9 @@
       "force": "Pin anyway",
       "affected_one": "{{count}} running VM keeps its CPU until it is power cycled.",
       "affected_other": "{{count}} running VMs keep their CPU until they are power cycled.",
-      "affectedLink": "Show them"
+      "affectedLink": "Show them",
+      "affectedDelay": "The list fills in within a few seconds as each node checks its VMs.",
+      "reload": "Discard my changes and reload"
     }
   }
 }

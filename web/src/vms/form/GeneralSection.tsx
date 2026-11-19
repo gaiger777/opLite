@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useList } from "@/api/live";
@@ -69,9 +69,25 @@ export function GeneralSection({
 }) {
   const { t } = useTranslation();
   // 클러스터 기준이 있으면(auto·pinned) 새 VM의 기본 모델은 `cluster`다(설계 §13). 사용자가 고르면 그대로 둔다.
+  // 서버는 기준이 있을 때만 `current`를 준다(끔·업그레이드 중에는 없다 — 리뷰 1 웹 #1).
   const chose = useRef(false);
-  const models = useCpuModels(archOf(values.machine), creating);
+  const arch = archOf(values.machine);
+  const models = useCpuModels(arch, creating);
   const clusterNow = models.data?.models.find((m) => m.kind === "cluster")?.current;
+  // 머신 유형이 아키텍처를 바꾸면 그 아키텍처에 없는 모델·플래그를 처음으로 돌리고 그렇다고 말한다(리뷰 1 웹 #8).
+  const [archReset, setArchReset] = useState(false);
+  const withMachine = (next: Partial<VmFormValues>): Partial<VmFormValues> => {
+    const to = next.machine === undefined ? arch : archOf(next.machine);
+    const portable = ["host", "max", "cluster"].includes(values.model);
+    if (arch === undefined || to === undefined || to === arch) {
+      return next;
+    }
+    if (portable && values.cpuFlags.length === 0) {
+      return next;
+    }
+    setArchReset(true);
+    return { ...next, model: portable ? values.model : "host", cpuFlags: [] };
+  };
   useEffect(() => {
     if (creating && !chose.current && clusterNow && values.model === "host") {
       chose.current = true;
@@ -175,9 +191,15 @@ export function GeneralSection({
           arch={archOf(values.machine)}
           onChange={(model) => {
             chose.current = true;
+            setArchReset(false);
             onChange({ model });
           }}
         />
+        {archReset && (
+          <p role="status" className="text-xs text-muted-foreground sm:col-span-2">
+            {t("cpu.model.archReset")}
+          </p>
+        )}
         <Field id="vm-firmware" label={t("vms.firmware")}>
           <NativeSelect
             id="vm-firmware"
@@ -196,7 +218,7 @@ export function GeneralSection({
             value={values.machine}
             onChange={(e) => {
               onMachineChosen();
-              onChange({ machine: e.target.value as VmFormValues["machine"] });
+              onChange(withMachine({ machine: e.target.value as VmFormValues["machine"] }));
             }}
           >
             {/* 노드를 모르면(폴더 사용자) 서버가 클러스터 아키텍처로 고른다. */}
@@ -230,7 +252,9 @@ export function GeneralSection({
               onChange={(e) => {
                 const node = e.target.value;
                 onChange(
-                  autoMachine ? { node, machine: defaultMachine(nodes ?? [], node) } : { node },
+                  autoMachine
+                    ? withMachine({ node, machine: defaultMachine(nodes ?? [], node) })
+                    : { node },
                 );
               }}
             >

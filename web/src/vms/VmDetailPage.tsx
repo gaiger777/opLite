@@ -968,6 +968,8 @@ function PendingChanges({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
   const can = useVmCan(vm);
   const host = useVmActionHost();
+  // 확인 대화상자를 닫으면 이 단추로 돌아온다(리뷰 1 웹 #11).
+  const powerCycle = useRef<HTMLButtonElement>(null);
   const pending = vm.status.hardware?.pending ?? [];
   if (pending.length === 0) {
     return null;
@@ -1018,7 +1020,12 @@ function PendingChanges({ vm }: { vm: Vm }) {
         <div className="flex flex-wrap items-center gap-2 rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm">
           <span>{t("cpu.pending.required")}</span>
           {can("vm.power") && (
-            <Button variant="outline" size="sm" onClick={() => host.open({ vm, which: "reboot" })}>
+            <Button
+              ref={powerCycle}
+              variant="outline"
+              size="sm"
+              onClick={() => host.open({ vm, which: "reboot", returnFocus: powerCycle })}
+            >
               {t("cpu.pending.now")}
             </Button>
           )}

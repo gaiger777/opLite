@@ -25,6 +25,8 @@ export const server = setupServer(
     HttpResponse.json({ code: "not_found", message: "no Ceph cluster is set up" }, { status: 404 }),
   ),
   http.get(apiUrl("/vms/:key/guest"), () => HttpResponse.json({ state: "no_agent" })),
+  // CPU(계획 63): 서버가 x86_64 노드 하나(카탈로그를 아직 알리지 않음), 기준 끔일 때 주는 그대로다. 기준이 없으면
+  // `cluster`에 `current`가 없다(리뷰 1 웹 #1 — 있으면 새 VM이 `cluster`로 시작한다).
   http.get(apiUrl("/cpu/models"), () =>
     HttpResponse.json({
       arch: "x86_64",
@@ -33,17 +35,27 @@ export const server = setupServer(
         { name: "host", kind: "basic", usable: 1 },
         { name: "max", kind: "basic", usable: 1 },
         { name: "cluster", kind: "cluster", usable: 1 },
+        { name: "x86-64-v2", kind: "level", usable: 0 },
+        { name: "x86-64-v2-aes", kind: "level", usable: 0 },
+        { name: "x86-64-v3", kind: "level", usable: 0 },
+        { name: "x86-64-v4", kind: "level", usable: 0 },
       ],
     }),
   ),
-  http.get(apiUrl("/cpu/flags"), () => HttpResponse.json({ arch: "x86_64", nodes: 1, flags: [] })),
+  http.get(apiUrl("/cpu/flags"), () => HttpResponse.json({ arch: "x86_64", nodes: 0, flags: [] })),
   http.get(apiUrl("/cpu/baseline"), () =>
-    HttpResponse.json({ mode: "off", auto_flags: true, arches: [] }),
+    HttpResponse.json({
+      mode: "off",
+      auto_flags: true,
+      arches: [{ arch: "x86_64", pinned: false, cluster_vms: 0 }],
+    }),
   ),
   http.get(apiUrl("/nodes/:key/cpu"), ({ params }) =>
-    HttpResponse.json({ node: String(params.key), flags: [], models: [] }),
+    HttpResponse.json({ node: String(params.key), arch: "x86_64", models: [], flags: [] }),
   ),
-  http.get(apiUrl("/vms/:key/cpu"), () => HttpResponse.json({ spec: { cores: 1 }, nodes: [] })),
+  http.get(apiUrl("/vms/:key/cpu"), () =>
+    HttpResponse.json({ spec: { sockets: 1, cores: 1, model: "host" }, nodes: [] }),
+  ),
   http.get(apiUrl("/metrics/cluster"), () =>
     HttpResponse.json({
       tier: "raw5s",

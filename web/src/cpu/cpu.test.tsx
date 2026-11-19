@@ -21,6 +21,7 @@ import { CpuModelPicker } from "@/cpu/CpuModelPicker";
 import { cpuPatch, CpuSettingsSection, cpuValues } from "@/cpu/CpuSettingsSection";
 import { NodeCpuSection } from "@/cpu/NodeCpuSection";
 import i18n from "@/i18n";
+import { SETTINGS_KEY } from "@/api/live";
 import { describeDetail, describeTask, resetTasks } from "@/tasks/tasks";
 import { hardware, NODE, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
@@ -166,7 +167,13 @@ describe("pure helpers", () => {
 
   it("turns settings into a patch of only the changed fields", () => {
     const current = cpuValues({ cpu: { auto_flags: true, mask: ["avx512vbmi"] } });
-    expect(current).toEqual({ mode: "off", pinned: {}, autoFlags: true, mask: ["avx512vbmi"] });
+    expect(current).toEqual({
+      mode: "off",
+      pinned: {},
+      autoFlags: true,
+      mask: ["avx512vbmi"],
+      stored: "off",
+    });
     expect(cpuPatch(current, current)).toEqual({});
     expect(cpuPatch({ ...current, mask: ["avx512vbmi", "pcid"] }, current)).toEqual({
       mask: ["avx512vbmi", "pcid"],
@@ -189,6 +196,16 @@ describe("pure helpers", () => {
         },
       }).mode,
     ).toBe("pinned");
+    // `auto` + 고정(CLI로 둔 설정)에서 "끔"을 고르면 `baseline: off`도 보낸다(리뷰 1 웹 #5).
+    const both = cpuValues({
+      cpu: {
+        auto_flags: true,
+        baseline: "auto",
+        pinned: [{ arch: "x86_64", model: "Haswell-v4" }],
+      },
+    });
+    expect(both.mode).toBe("pinned");
+    expect(cpuPatch({ ...both, mode: "off" }, both)).toEqual({ baseline: "off", pinned: [] });
   });
 });
 
@@ -235,7 +252,10 @@ it("picks a model, shows the nodes that cannot run it and edits flags", async ()
     "Icelake-Server-v7 -avx512vbmi -sse4.2 +aes",
   );
   // 칩을 누르면 켜기·숨기기가 바뀌고, ×로 뺀다.
-  await userEvent.click(screen.getByRole("button", { name: "Turn avx512vbmi on instead" }));
+  // 칩의 이름에 지금 상태가 있다(리뷰 1 웹 #11).
+  await userEvent.click(
+    screen.getByRole("button", { name: "avx512vbmi is hidden — turn it on instead" }),
+  );
   await userEvent.click(screen.getByRole("button", { name: "Remove sse4.2" }));
   expect(screen.getByRole("status")).toHaveTextContent("Icelake-Server-v7 +avx512vbmi +aes");
   // 클러스터 전체에서 숨긴 플래그를 켜면 그렇다고 말한다.
@@ -477,6 +497,8 @@ it("saves the hide list and links to the VMs waiting for a power cycle", async (
     "/vms?cpu=pending",
   );
   expect(sent).toEqual([{ cpu: { mask: ["avx512vbmi"] } }]);
+  // 보류는 각 노드의 검사 회차가 쓰므로 목록이 몇 초 늦게 찬다고 말한다(리뷰 1 웹 #6).
+  expect(screen.getByText(/fills in within a few seconds/)).toBeInTheDocument();
 });
 
 it("explains nodes that cannot run a pinned baseline and pins anyway with force", async () => {
@@ -567,4 +589,245 @@ it("offers a power cycle for a pending CPU change and says a guest reboot does n
   expect(dialog).toHaveTextContent("a reboot inside the guest would not apply them");
   await userEvent.click(within(dialog).getByRole("button", { name: "Reboot" }));
   await waitFor(() => expect(actions).toEqual(["reboot"]));
+});
+
+// ---- 리뷰 1 (웹)
+
+it("keeps host for a new VM when the cluster has no baseline", async () => {
+  // 기본 msw 응답은 서버 그대로다: 기준이 없으면 `cluster`에 `current`가 없다.
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const model = await screen.findByLabelText("CPU model");
+  await screen.findByRole("option", { name: /^cluster/ });
+  await new Promise((r) => setTimeout(r, 50));
+  expect(model).toHaveValue("host");
+  await userEvent.selectOptions(model, "cluster");
+  expect(screen.getByText(/No cluster baseline is set/)).toBeInTheDocument();
+});
+
+it("honors the sign typed before a flag, and suggests each name once", async () => {
+  mockCpu();
+  server.use(
+    http.get(apiUrl("/cpu/flags"), ({ request }) =>
+      HttpResponse.json({
+        arch: new URL(request.url).searchParams.get("arch"),
+        nodes: 1,
+        flags: FLAGS,
+      }),
+    ),
+  );
+  function Harness() {
+    const [flags, setFlags] = useState<string[]>([]);
+    return (
+      <>
+        <CpuFlagsInput
+          id="f"
+          label="CPU flags"
+          flags={flags}
+          onChange={setFlags}
+          arches={["x86_64", "aarch64"]}
+          signed
+        />
+        <output>{flags.join(" ")}</output>
+      </>
+    );
+  }
+  renderPage(<Harness />);
+  await waitFor(() =>
+    expect(document.querySelectorAll('#f-names option[value="aes"]')).toHaveLength(1),
+  );
+  const input = screen.getByLabelText("CPU flags", { selector: "input" });
+  await userEvent.type(input, "+aes{Enter}");
+  await userEvent.type(input, "+sse4.2");
+  await userEvent.click(screen.getByRole("button", { name: "Hide" }));
+  await userEvent.type(input, "-avx512vbmi");
+  await userEvent.click(screen.getByRole("button", { name: "Turn on" }));
+  expect(screen.getByRole("status")).toHaveTextContent("+aes +sse4.2 -avx512vbmi");
+  expect(screen.getByRole("button", { name: "aes is on — hide it instead" })).toBeInTheDocument();
+});
+
+it("saves only what was edited and shows a concurrent settings change", async () => {
+  const sent: { body: unknown; revision: string | null }[] = [];
+  mockCpu();
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
+  server.use(
+    http.get(apiUrl("/settings"), () => HttpResponse.json(SETTINGS)),
+    http.patch(apiUrl("/settings"), async ({ request }) => {
+      sent.push({ body: await request.json(), revision: request.headers.get("If-Match") });
+      return HttpResponse.json({ code: "revision_mismatch", message: "stale" }, { status: 412 });
+    }),
+  );
+  const { queryClient } = renderPage(<CpuSettingsSection write />, { as: ADMIN });
+  const input = await screen.findByLabelText("Hide from every VM", { selector: "input" });
+  await waitFor(() =>
+    expect(
+      document.querySelector('#settings-cpu-mask-names option[value="avx512vbmi"]'),
+    ).not.toBeNull(),
+  );
+  await userEvent.type(input, "avx512vbmi{Enter}");
+  // 그 사이 다른 관리자가 자동 플래그를 껐다(watch가 새 설정을 넣는다).
+  queryClient.setQueryData(SETTINGS_KEY, {
+    ...SETTINGS,
+    revision: 7,
+    spec: { ...SETTINGS.spec, cpu: { auto_flags: false } },
+  });
+  await userEvent.click(screen.getByRole("button", { name: "Save CPU settings" }));
+  const alert = await screen.findByRole("alert");
+  // 고친 칸만, 고치기 시작할 때의 revision으로 보낸다 — 남의 auto_flags를 되돌리지 않는다.
+  expect(sent).toEqual([{ body: { cpu: { mask: ["avx512vbmi"] } }, revision: "3" }]);
+  expect(alert).toHaveTextContent("Someone else changed it first");
+  await userEvent.click(
+    within(alert).getByRole("button", { name: "Discard my changes and reload" }),
+  );
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.queryByText("avx512vbmi", { selector: "li span" })).not.toBeInTheDocument();
+});
+
+it("pre-fills a pinned baseline with the current model and its flags", async () => {
+  const sent: unknown[] = [];
+  mockCpu();
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
+  server.use(
+    http.get(apiUrl("/settings"), () =>
+      HttpResponse.json({
+        ...SETTINGS,
+        spec: { ...SETTINGS.spec, cpu: { baseline: "auto", auto_flags: true, mask: ["gfni"] } },
+      }),
+    ),
+    http.get(apiUrl("/cpu/baseline"), () =>
+      HttpResponse.json({
+        mode: "auto",
+        auto_flags: true,
+        mask: ["gfni"],
+        arches: [
+          {
+            arch: "x86_64",
+            pinned: false,
+            cluster_vms: 1,
+            baseline: {
+              model: "Skylake-Server-v5",
+              flags: { pcid: true, gfni: false, hle: false },
+              mode: "auto",
+              since: 1,
+            },
+          },
+        ],
+      }),
+    ),
+    http.patch(apiUrl("/settings"), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json({ ...SETTINGS, revision: 4, affected_running_vms: 0 });
+    }),
+  );
+  renderPage(<CpuSettingsSection write />, { as: ADMIN });
+  await screen.findByText(/Now on x86_64/);
+  await userEvent.selectOptions(screen.getByLabelText("Cluster CPU baseline"), "pinned");
+  await userEvent.click(screen.getByRole("button", { name: "Save CPU settings" }));
+  await waitFor(() => expect(sent).toHaveLength(1));
+  // 숨김 목록이 끈 gfni는 고정에 넣지 않는다.
+  expect(sent[0]).toEqual({
+    cpu: {
+      baseline: "off",
+      pinned: [{ arch: "x86_64", model: "Skylake-Server-v5", flags: ["+pcid", "-hle"] }],
+    },
+  });
+});
+
+it("re-reports a failed node CPU refresh only once", async () => {
+  server.use(
+    http.post(apiUrl("/nodes/:key/cpu/refresh"), () =>
+      HttpResponse.json(task("t9", "node-cpu-probe", "n1"), { status: 202 }),
+    ),
+  );
+  mockLists({
+    node: [NODE],
+    task: [
+      {
+        ...task("t9", "node-cpu-probe", "n1"),
+        status: { state: "failed", error: "timed out waiting for the CPU probe" },
+      } as never,
+    ],
+  });
+  renderPage(<NodeCpuSection node={NODE} />);
+  const section = await screen.findByRole("region", { name: "CPU models" });
+  const button = within(section).getByRole("button", { name: "Re-read CPU models" });
+  await userEvent.click(button);
+  await waitFor(() => expect(button).toBeEnabled());
+  expect(screen.queryByText(/Could not re-read CPU models/)).not.toBeInTheDocument();
+});
+
+it("resets an x86 model and flags when the machine type switches the architecture", async () => {
+  mockCpu();
+  mockLists({ node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }] });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const machine = await screen.findByLabelText("Machine type");
+  await user.selectOptions(machine, "q35");
+  await screen.findAllByRole("option", { name: /Skylake-Server-v5/ });
+  await user.selectOptions(screen.getByLabelText("CPU model"), "Skylake-Server-v5");
+  const flags = screen.getByLabelText("CPU flags", { selector: "input" });
+  await waitFor(() =>
+    expect(document.querySelector('#vm-cpu-flags-names option[value="aes"]')).not.toBeNull(),
+  );
+  await user.type(flags, "aes{Enter}");
+  await user.selectOptions(machine, "virt");
+  await waitFor(() => expect(screen.getByLabelText("CPU model")).toHaveValue("host"));
+  expect(screen.queryByRole("button", { name: /aes is hidden/ })).not.toBeInTheDocument();
+  expect(screen.getByText(/so the CPU model and flags were reset/)).toBeInTheDocument();
+});
+
+it("does not migrate before the VM's CPU check has loaded", async () => {
+  const web = vm("web", "running");
+  mockLists({ vm: [web], node: [cpuNode("n1", "node-a"), cpuNode("n2", "node-b")] });
+  let answer: () => void = () => {};
+  const gate = new Promise<void>((r) => (answer = r));
+  server.use(
+    http.get(apiUrl("/vms/:key/cpu"), async () => {
+      await gate;
+      return HttpResponse.json({
+        spec: { sockets: 1, cores: 2, model: "host" },
+        nodes: [{ node: "node-b", can_run: true }],
+      });
+    }),
+  );
+  renderPage(<VmMigrateDialog vm={web} onClose={() => {}} />);
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  await within(dialog).findByRole("option", { name: "node-b" });
+  const submit = within(dialog).getByRole("button", { name: "Migrate" });
+  await new Promise((r) => setTimeout(r, 50));
+  expect(submit).toBeDisabled();
+  answer();
+  await waitFor(() => expect(submit).toBeEnabled());
+});
+
+it("renders the model × node table only when it is opened", async () => {
+  server.use(
+    http.get(apiUrl("/cpu/baseline"), () =>
+      HttpResponse.json({
+        mode: "off",
+        auto_flags: true,
+        arches: [{ arch: "x86_64", pinned: false, cluster_vms: 0 }],
+      }),
+    ),
+  );
+  mockCpu();
+  renderPage(<ClusterCpuSection />);
+  const section = await screen.findByRole("region", { name: "CPU baseline" });
+  const summary = await within(section).findByText(/models × nodes|model/i, {
+    selector: "summary",
+  });
+  expect(within(section).queryByRole("table")).not.toBeInTheDocument();
+  await userEvent.click(summary);
+  expect(await within(section).findByRole("table")).toBeInTheDocument();
+  expect(within(section).getAllByText("✓").length).toBeGreaterThan(0);
+});
+
+it("returns focus to Power cycle now when the confirmation closes", async () => {
+  mockLists({ vm: [PENDING_VM], node: [NODE] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  const button = await screen.findByRole("button", { name: "Power cycle now" });
+  await userEvent.click(button);
+  const dialog = await screen.findByRole("alertdialog", { name: "Reboot web?" });
+  await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await waitFor(() => expect(button).toHaveFocus());
 });

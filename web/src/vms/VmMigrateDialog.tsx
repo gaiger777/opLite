@@ -155,6 +155,8 @@ export function VmMigrateDialog({
         !loaded ||
         snapshotted ||
         missingPool !== undefined ||
+        // CPU 확인을 읽는 동안은 보내지 않는다(읽지 못하면 서버가 정한다 — 리뷰 1 웹 #9).
+        cpu.isPending ||
         fit?.can_run === false
       }
       returnFocus={returnFocus}

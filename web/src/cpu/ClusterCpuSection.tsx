@@ -14,7 +14,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { describeBaseline, describeResolved, useCpuBaseline, useCpuModels } from "@/cpu/cpu";
+import {
+  type CpuModelEntry,
+  describeBaseline,
+  describeResolved,
+  useCpuBaseline,
+  useCpuModels,
+} from "@/cpu/cpu";
 import { formatTime } from "@/lib/format";
 
 type BaselineInfo = components["schemas"]["CpuBaselineInfo"];
@@ -110,20 +116,47 @@ function ArchBaseline({ info }: { info: BaselineInfo }) {
 function ModelMatrix({ arch }: { arch: components["schemas"]["Arch"] }) {
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
+  // 접혀 있으면 표를 그리지 않는다(모델 186개 × 노드 — 리뷰 1 웹 #10).
+  const [open, setOpen] = useState(false);
   const models = useCpuModels(arch);
   const all = (models.data?.models ?? []).filter((m) => !m.alias_of && m.kind !== "basic");
   const nodes = [...new Set(all.flatMap((m) => (m.nodes ?? []).map((n) => n.node)))].sort();
   if (all.length === 0 || nodes.length === 0) {
     return null;
   }
-  const q = query.trim().toLowerCase();
-  const shown = all.filter((m) => q === "" || m.name.toLowerCase().includes(q));
   const id = `cpu-matrix-${arch}`;
   return (
-    <details className="flex flex-col gap-2">
+    <details
+      className="flex flex-col gap-2"
+      open={open}
+      onToggle={(e) => setOpen(e.currentTarget.open)}
+    >
       <summary id={id} className="cursor-pointer text-xs font-medium">
         {t("cpu.cluster.matrix", { count: all.length })}
       </summary>
+      {open && <MatrixTable id={id} nodes={nodes} models={all} query={query} setQuery={setQuery} />}
+    </details>
+  );
+}
+
+function MatrixTable({
+  id,
+  nodes,
+  models,
+  query,
+  setQuery,
+}: {
+  id: string;
+  nodes: string[];
+  models: CpuModelEntry[];
+  query: string;
+  setQuery(q: string): void;
+}) {
+  const { t } = useTranslation();
+  const q = query.trim().toLowerCase();
+  const shown = models.filter((m) => q === "" || m.name.toLowerCase().includes(q));
+  return (
+    <>
       <Input
         type="search"
         className="my-2 max-w-xs"
@@ -143,26 +176,29 @@ function ModelMatrix({ arch }: { arch: components["schemas"]["Arch"] }) {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {shown.map((m) => (
-              <TableRow key={m.name}>
-                <TableCell className="font-mono text-xs">{m.name}</TableCell>
-                {nodes.map((n) => {
-                  const fit = m.nodes?.find((f) => f.node === n);
-                  return (
-                    <TableCell key={n} className="font-mono text-xs whitespace-normal">
-                      {!fit
-                        ? "—"
-                        : fit.can_run
-                          ? "✓"
-                          : (fit.missing ?? []).join(", ") || t("cpu.node.unusable")}
-                    </TableCell>
-                  );
-                })}
-              </TableRow>
-            ))}
+            {shown.map((m) => {
+              const fits = new Map((m.nodes ?? []).map((f) => [f.node, f]));
+              return (
+                <TableRow key={m.name}>
+                  <TableCell className="font-mono text-xs">{m.name}</TableCell>
+                  {nodes.map((n) => {
+                    const fit = fits.get(n);
+                    return (
+                      <TableCell key={n} className="font-mono text-xs whitespace-normal">
+                        {!fit
+                          ? "—"
+                          : fit.can_run
+                            ? "✓"
+                            : (fit.missing ?? []).join(", ") || t("cpu.node.unusable")}
+                      </TableCell>
+                    );
+                  })}
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       </div>
-    </details>
+    </>
   );
 }

@@ -43,18 +43,22 @@ export function CpuFlagsInput({
   // 모두 읽었을 때만 이름을 거른다.
   const known = lists.every((q) => q.isSuccess) ? new Set(entries.map((f) => f.name)) : undefined;
   const masked = new Set(entries.filter((f) => f.masked).map((f) => f.name));
+  // 두 아키텍처가 같이 아는 이름은 한 번만 제안한다.
+  const suggestions = [...new Set(entries.map((f) => f.name))];
   const signedFlags = signed ? flags : flags.map((f) => `-${f}`);
   const listId = `${id}-names`;
   const errorId = `${id}-error`;
   const hintId = `${id}-hint`;
 
-  function add(on: boolean) {
+  /** `fallback`은 부호를 적지 않았을 때다(Enter·"숨기기"는 숨기기, "켜기"는 켜기). 적은 `+`·`-`가 늘 이긴다. */
+  function add(fallback: boolean) {
     const found = flagProblem(text, signedFlags, known);
     setProblem(found);
     if (found !== null) {
       return;
     }
-    const flag = toFlag(text, signed ? on : false);
+    const typed = /^[+-]/.test(text.trim());
+    const flag = toFlag(text, signed ? (typed ? undefined : fallback) : false);
     onChange([...flags, signed ? flag : splitFlag(flag).name]);
     setText("");
   }
@@ -86,8 +90,8 @@ export function CpuFlagsInput({
                     type="button"
                     disabled={disabled}
                     className="underline-offset-2 hover:underline"
-                    aria-label={t(on ? "cpu.flags.hideOne" : "cpu.flags.showOne", { name })}
-                    title={t(on ? "cpu.flags.hideOne" : "cpu.flags.showOne", { name })}
+                    aria-label={t(on ? "cpu.flags.onHide" : "cpu.flags.offShow", { name })}
+                    title={t(on ? "cpu.flags.onHide" : "cpu.flags.offShow", { name })}
                     onClick={() => toggle(i)}
                   >
                     {on ? "+" : "−"}
@@ -135,8 +139,8 @@ export function CpuFlagsInput({
           }}
         />
         <datalist id={listId}>
-          {entries.map((f) => (
-            <option key={f.name} value={f.name} />
+          {suggestions.map((name) => (
+            <option key={name} value={name} />
           ))}
         </datalist>
         <Button
