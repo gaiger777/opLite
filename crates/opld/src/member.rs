@@ -343,6 +343,21 @@ impl Member {
         rt: &Handles,
         runtimes: Option<Arc<dyn RuntimeProbe>>,
     ) -> anyhow::Result<(Self, Option<Created>)> {
+        // 큰 future를 힙에 둔다(디버그 빌드에서 부르는 쪽 스택을 넘지 않게, 계획 62의 `oplctl::run`과 같다).
+        Box::pin(Self::start_inner(
+            config, node, tls, bootstrap, rt, runtimes,
+        ))
+        .await
+    }
+
+    async fn start_inner(
+        config: &Config,
+        node: Uuid,
+        tls: NodeTls,
+        bootstrap: Bootstrap,
+        rt: &Handles,
+        runtimes: Option<Arc<dyn RuntimeProbe>>,
+    ) -> anyhow::Result<(Self, Option<Created>)> {
         // `[telemetry] ca_file`을 읽지 못하면 아무것도 열기 전에 실패한다.
         let telemetry_config = config.telemetry.telemetry_config()?;
         let id = NodeId(node);
@@ -840,6 +855,8 @@ impl Member {
             .updates_config()
             .map(|c| Arc::new(Updates::new(c)));
         runner_config.updates = updates.clone();
+        // 관리자 CPU 다시 읽기(Task `node-cpu-probe`)는 검사 루프의 탐침에 맡긴다(계획 63).
+        runner_config.cpu = Some(Arc::new(cpu_watch.refresher(cluster.clone(), &config.name)));
         // Task 실행기의 고아 정리는 쓰기마다 10초까지 기다리므로 정족수 없이 다시 켤 때 systemd의 시작
         // 제한(90초)을 넘길 수 있다. 정리는 API보다 먼저 끝나야 하므로(API가 막 받는 업로드 파일을
         // 고아로 지우지 않게) 뒤로 미루지 않고 READY=1을 그 전에 보낸다(API가 뜬 뒤 다시 보낸다).

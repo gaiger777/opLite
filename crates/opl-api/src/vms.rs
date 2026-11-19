@@ -14,8 +14,8 @@ use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
 use opl_types::network::USER_NETWORK;
 use opl_types::node::{
-    CPU_MODELS, FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA,
-    NODE_REPLICATION, Node, NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
+    FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node,
+    NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
 };
 use opl_types::placement::PlacementRuleSpec;
 use opl_types::resource::{Kind, Resource, ResourceSpec};
@@ -160,6 +160,32 @@ pub(crate) fn placement_rule(message: String, rules: Vec<String>) -> ApiError {
     e
 }
 
+/// 노드를 고르지 못한 VM의 409: [`schedule_error`]에 더해 `no_node`면 노드마다 맞지 않는 까닭(이 VM 아키텍처의 위트니스
+/// 아닌 노드)을 문구 끝과 `details.nodes`에 붙인다 — 예: CPU 모델을 켤 수 있는 노드가 없음(계획 63).
+fn no_node_error(vm: &Vm, inv: &Inventory, e: ScheduleError) -> ApiError {
+    let mut err = schedule_error(e);
+    if err.code != "no_node" {
+        return err;
+    }
+    let arch = vm.spec.machine.arch();
+    let reasons: BTreeMap<String, String> = inv
+        .nodes
+        .iter()
+        .filter(|n| !n.spec.witness && n.status.arch == Some(arch))
+        .filter_map(|n| {
+            crate::scheduler::node_fits(&vm.spec, inv, n)
+                .err()
+                .map(|why| (n.name.clone(), why))
+        })
+        .collect();
+    if !reasons.is_empty() {
+        let list: Vec<&str> = reasons.values().map(String::as_str).collect();
+        err.message = format!("{}: {}", err.message, list.join("; "));
+        err.details = Some(serde_json::json!({ "nodes": reasons }));
+    }
+    err
+}
+
 /// 스케줄러가 노드를 고르지 못함: 노드 조건이면 409 `no_node`, hard 규칙이면 409 `placement_rule`
 fn schedule_error(e: ScheduleError) -> ApiError {
     let message = e.to_string();
@@ -239,22 +265,15 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     if spec.guest_agent.is_some() {
         require_feature(&state.cluster, GUEST_AGENT)?;
     }
-    // `host`·`max` 밖의 CPU 모델과 플래그는 옛 노드가 풀지 못한다(계획 63). 모델 검증·해석은 스테이지 5에서 열기
-    // 전까지 받지 않는다. 저장된 VM의 모델·플래그를 그대로 두는 바꾸기(`vm set --cores`)는 받는다.
-    let unchanged =
-        inv.vms.iter().find(|v| v.id == id).is_some_and(|v| {
-            v.spec.cpu.model == spec.cpu.model && v.spec.cpu.flags == spec.cpu.flags
-        });
-    if (!spec.cpu.model.is_host_or_max() || !spec.cpu.flags.is_empty()) && !unchanged {
-        require_feature(&state.cluster, CPU_MODELS)?;
-        return Err(ApiError::bad_request(
-            "CPU models other than host and max and CPU flags are not available yet",
-        ));
-    }
+    // `host`·`max` 밖의 CPU 모델과 플래그는 옛 노드가 풀지 못한다(계획 63, 검증보다 먼저).
+    crate::cpu::require_cpu_feature(&state.cluster, &spec.cpu.model, &spec.cpu.flags)?;
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
-    spec.validate()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    spec.validate().map_err(crate::cpu::validation_error)?;
+    // 모델·플래그가 노드 카탈로그에 있는지 보고 별칭을 버전 모델로 고정한다(계획 63 §8). 모델이 그대로면 다시 해석하지
+    // 않는다.
+    let stored_cpu = inv.vms.iter().find(|v| v.id == id).map(|v| &v.spec.cpu);
+    spec.cpu.model = crate::cpu::check_cpu(&inv, spec.machine.arch(), &spec.cpu, stored_cpu)?.model;
     // 핫플러그 상한은 옛 노드가 풀지 못한다.
     if spec.cpu.max_vcpus.is_some() || spec.max_memory_mib.is_some() {
         require_feature(&state.cluster, HOTPLUG)?;
@@ -388,7 +407,8 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         }
     }
     if vm.spec.power == PowerState::Running && vm.spec.node.is_none() {
-        vm.spec.node = Some(schedule_with(vm, &inv, scorer).map_err(schedule_error)?);
+        vm.spec.node =
+            Some(schedule_with(vm, &inv, scorer).map_err(|e| no_node_error(vm, &inv, e))?);
         // 스케줄러가 고른 노드도 복제 대상이면 안 된다.
         if vm
             .spec
@@ -921,6 +941,7 @@ fn start_picks(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
 pub async fn create_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: AuditNote,
     Json(req): Json<CreateRequest<serde_json::Value>>,
 ) -> Result<(StatusCode, HeaderMap, Json<Vm>), ApiError> {
     check_name(&req.name)?;
@@ -940,8 +961,13 @@ pub async fn create_vm(
     let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
     let scoring = score::scorer(&state, picks).await;
     let _lock = state.vm_lock.lock().await;
+    let asked = vm.spec.cpu.model.clone();
     prepare(&state, &mut vm, &scoring.scorer())?;
     vm.revision = state.cluster.create(&vm).await?;
+    let from = (asked != vm.spec.cpu.model).then(|| asked.to_string());
+    if let Some(cpu) = crate::cpu::audit_cpu(&vm.spec.cpu, None, from.as_deref()) {
+        audit.detail(format!("vm create {} {cpu}", vm.name));
+    }
     let headers = warning_header(&vm.spec);
     Ok((StatusCode::CREATED, headers, Json(public_vm(vm))))
 }
@@ -1055,13 +1081,17 @@ fn warning_header(spec: &VmSpec) -> HeaderMap {
 pub async fn update_vm(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: AuditNote,
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(req): Json<UpdateRequest<VmSpec>>,
 ) -> Result<(HeaderMap, Json<Vm>), ApiError> {
     let expected = if_match(&headers)?;
     let picks = req.spec.power == PowerState::Running && req.spec.node.is_none();
+    // 감사 설명의 CPU 부분(계획 63): 바꾸기 전 CPU
+    let before = std::sync::Mutex::new(None);
     let (headers, vm) = write_spec(&state, &key, expected, picks, |current| {
+        *before.lock().unwrap() = Some(current.spec.cpu.clone());
         // 옮기기는 원본·대상 폴더의 `inventory.move`를 따로 보는 `POST /folders/{id}/members`로만 한다.
         if req.spec.folder != current.spec.folder {
             return Err(ApiError::bad_request(
@@ -1076,6 +1106,11 @@ pub async fn update_vm(
         Ok((spec, req.labels.clone()))
     })
     .await?;
+    let from = (req.spec.cpu.model != vm.spec.cpu.model).then(|| req.spec.cpu.model.to_string());
+    let before = before.into_inner().unwrap();
+    if let Some(cpu) = crate::cpu::audit_cpu(&vm.spec.cpu, before.as_ref(), from.as_deref()) {
+        audit.detail(format!("vm set {} {cpu}", vm.name));
+    }
     Ok((headers, Json(vm)))
 }
 
@@ -1779,7 +1814,9 @@ pub async fn vm_action(
                 }
                 if spec.node.is_none() {
                     let inv = Inventory::load(&state.cluster)?;
-                    spec.node = Some(schedule_with(&me, &inv, &scorer).map_err(schedule_error)?);
+                    spec.node = Some(
+                        schedule_with(&me, &inv, &scorer).map_err(|e| no_node_error(&me, &inv, e))?,
+                    );
                 }
                 // 끄는 중에 디스크·NIC를 바꾼 VM은 QEMU가 끝난 뒤 켠다.
                 if spec.power != PowerState::Running

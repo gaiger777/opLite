@@ -787,10 +787,10 @@ pub(crate) fn import_spec(
         .collect::<Result<_, String>>()?;
     Ok(VmSpec {
         cpu: CpuSpec {
-            flags: Vec::new(),
+            flags: run.cpu_flags.clone(),
             sockets: run.sockets.unwrap_or(proposal.sockets),
             cores: run.cores.unwrap_or(proposal.cores),
-            model: CpuModel::Host,
+            model: run.cpu_model.clone().unwrap_or(CpuModel::Host),
             max_vcpus: None,
         },
         memory_mib: run.memory_mib.unwrap_or(proposal.memory_mib),
@@ -975,11 +975,16 @@ pub async fn run_import(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Path(key): Path<String>,
-    Json(run): Json<ImportRun>,
+    Json(mut run): Json<ImportRun>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     // 가져오기의 `vm.create`는 경로표가 봤다. 만들 VM의 폴더·풀·네트워크는 아래에서 본다.
     if run.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
+    }
+    // CPU 모델·플래그(계획 63)는 옛 노드가 풀지 못한다.
+    if run.cpu_model.is_some() || !run.cpu_flags.is_empty() {
+        let model = run.cpu_model.clone().unwrap_or_default();
+        crate::cpu::require_cpu_feature(&state.cluster, &model, &run.cpu_flags)?;
     }
     let import = lookup::<VmImportSpec>(&state.cluster, &key)?;
     match import.status.phase {
@@ -1034,8 +1039,15 @@ pub async fn run_import(
         }
     }
     let spec = import_spec(src, proposal, &run, &volumes).map_err(ApiError::bad_request)?;
-    spec.validate()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    spec.validate().map_err(crate::cpu::validation_error)?;
+    // 별칭은 버전 모델로 고정해 Task에 넣는다(계획 63 §8).
+    if run.cpu_model.is_some() || !run.cpu_flags.is_empty() {
+        let inv = crate::scheduler::Inventory::load(&state.cluster)?;
+        let pinned = crate::cpu::check_cpu(&inv, spec.machine.arch(), &spec.cpu, None)?;
+        if run.cpu_model.is_some() {
+            run.cpu_model = Some(pinned.model);
+        }
+    }
     state
         .authz
         .require_in_folder(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
@@ -1254,6 +1266,8 @@ mod tests {
             memory_mib: None,
             keep_macs: true,
             folder: None,
+            cpu_model: None,
+            cpu_flags: Vec::new(),
         }
     }
 

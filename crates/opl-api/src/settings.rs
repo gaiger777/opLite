@@ -7,7 +7,7 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, Uri};
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::node::{FAST_HA, HA_PLACEMENT, METRICS_HISTORY, PLACEMENT, TWO_FACTOR};
+use opl_types::node::{CPU_MODELS, FAST_HA, HA_PLACEMENT, METRICS_HISTORY, PLACEMENT, TWO_FACTOR};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::settings::{
     Channel, DEFAULT_HA_START_CONCURRENCY, HaReserve, MAX_HA_RESERVE_NODES, MAX_HA_RESERVE_PERCENT,
@@ -17,7 +17,7 @@ use opl_types::settings::{
 };
 use opl_types::subscription::SubscriptionState;
 use opl_types::version::TELEMETRY_URL;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -95,7 +95,46 @@ pub struct SettingsPatch {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub two_factor: Option<opl_types::two_factor::TwoFactorPolicy>,
+    /// 게스트 CPU(계획 63): 클러스터 기준 모드·고정 기준·자동 플래그·숨김 목록. 준 칸만 바꾼다. 실행 중 VM은 다음 전원
+    /// 껐다 켜기까지 그대로이고 응답의 `affected_running_vms`가 그 수다. 모든 노드가 `cpu-models`를 알아야 한다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu: Option<crate::cpu::CpuSettingsPatch>,
 }
+
+/// `PATCH /settings`의 응답: 저장한 설정과, `cpu`를 바꿨으면 다음 전원 껐다 켜기에 CPU가 바뀌는 실행 중 VM 수
+#[derive(Debug, Serialize)]
+pub struct SettingsPatched {
+    #[serde(flatten)]
+    pub settings: Settings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected_running_vms: Option<u32>,
+}
+
+// 제네릭 리소스를 펼친 모양은 derive가 이름을 잘못 잇는다(다른 `Resource`를 가리킴). 손으로 allOf로 적는다.
+impl utoipa::PartialSchema for SettingsPatched {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{AllOfBuilder, ObjectBuilder, Type};
+        let extra = ObjectBuilder::new().property(
+            "affected_running_vms",
+            ObjectBuilder::new()
+                .schema_type(Type::Integer)
+                .format(Some(utoipa::openapi::SchemaFormat::KnownFormat(
+                    utoipa::openapi::KnownFormat::Int32,
+                )))
+                .minimum(Some(0))
+                .description(Some(
+                    "running VMs whose CPU changes at their next power cycle (only when cpu was given)",
+                )),
+        );
+        AllOfBuilder::new()
+            .item(<Resource<SettingsSpec, SettingsStatus> as utoipa::PartialSchema>::schema())
+            .item(extra)
+            .into()
+    }
+}
+
+impl ToSchema for SettingsPatched {}
 
 /// Prometheus 끝점에서 바꿀 값
 #[derive(Debug, Clone, Copy, Deserialize, ToSchema)]
@@ -360,14 +399,14 @@ pub async fn get_settings(
 #[utoipa::path(patch, path = "/settings", tag = "settings",
     params(("If-Match" = Option<u64>, Header)),
     request_body = SettingsPatch,
-    responses((status = 200, body = Resource<SettingsSpec, SettingsStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 200, body = SettingsPatched), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn patch_settings(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     audit: AuditNote,
     headers: HeaderMap,
     Json(req): Json<SettingsPatch>,
-) -> Result<Json<Settings>, ApiError> {
+) -> Result<Json<SettingsPatched>, ApiError> {
     state.authorize(&principal, Action::Write, SettingsSpec::KIND)?;
     if req.updates.is_none()
         && req.telemetry.is_none()
@@ -380,11 +419,22 @@ pub async fn patch_settings(
         && req.placement.is_none()
         && req.prometheus.is_none()
         && req.two_factor.is_none()
+        && req.cpu.is_none()
     {
         return Err(ApiError::bad_request(
-            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus or two_factor",
+            "give updates, telemetry, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, placement, prometheus, two_factor or cpu",
         ));
     }
+    // 옛 노드는 설정 `cpu`를 풀지 못한다(계획 63, 검증보다 먼저). 검증·별칭 고정은 쓰기 안에서 지금 설정에 합쳐 한다.
+    let cpu_inv = match &req.cpu {
+        Some(_) => {
+            crate::cluster::require_feature(&state.cluster, CPU_MODELS)?;
+            Some(crate::scheduler::Inventory::load(&state.cluster)?)
+        }
+        None => None,
+    };
+    let cpu_notes = std::sync::Mutex::new(Vec::new());
+    let affected = std::sync::Mutex::new(None);
     // 옛 노드는 2단계 인증 정책을 풀지 못하고 대기 세션을 모른다.
     if let Some(policy) = &req.two_factor {
         crate::cluster::require_feature(&state.cluster, TWO_FACTOR)?;
@@ -510,9 +560,22 @@ pub async fn patch_settings(
         if let Some(policy) = &req.two_factor {
             spec.two_factor = (*policy != Default::default()).then(|| policy.clone());
         }
+        // 모두 기본값이면 쓰지 않는다.
+        if let (Some(patch), Some(inv)) = (&req.cpu, &cpu_inv) {
+            let current = spec.cpu.clone().unwrap_or_default();
+            let (next, notes) = crate::cpu::apply_settings(inv, &current, patch)?;
+            *affected.lock().unwrap() = Some(crate::cpu::affected_running_vms(inv, &next));
+            *cpu_notes.lock().unwrap() = notes;
+            spec.cpu = (next != opl_types::cpu::CpuSettings::default()).then_some(next);
+        }
         Ok(())
     })
     .await?;
+    let cpu_notes = cpu_notes.into_inner().unwrap();
+    if !cpu_notes.is_empty() {
+        audit.detail(format!("settings {}", cpu_notes.join(" ")));
+    }
+    let affected_running_vms = affected.into_inner().unwrap();
     if let Some(enabled) = req.prometheus.and_then(|p| p.enabled) {
         audit.detail(format!(
             "settings prometheus {}",
@@ -532,8 +595,12 @@ pub async fn patch_settings(
         .telemetry
         .as_ref()
         .is_some_and(|t| t.id.is_some());
+    let patched = |settings| SettingsPatched {
+        settings,
+        affected_running_vms,
+    };
     if !written.spec.telemetry.enabled || has_id {
-        return Ok(Json(public(written)));
+        return Ok(Json(patched(public(written))));
     }
     // 처음 켰다: 보고에 붙일 id를 만든다(다른 요청이 먼저 만들었으면 그대로).
     let written = write_status(&state.cluster, |status| {
@@ -543,7 +610,7 @@ pub async fn patch_settings(
         }
     })
     .await?;
-    Ok(Json(public(written)))
+    Ok(Json(patched(public(written))))
 }
 
 /// 텔레메트리 id를 새로 만든다. 설정이 아직 없으면 만든다.

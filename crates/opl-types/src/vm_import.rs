@@ -251,6 +251,14 @@ pub struct ImportRun {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub folder: Option<uuid::Uuid>,
+    /// CPU 모델(계획 63). 없으면 `host`다. API가 별칭을 버전 모델로 고정해 넣는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_model: Option<crate::cpu::CpuModel>,
+    /// CPU 플래그(`["-avx512vbmi"]`, 계획 63)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cpu_flags: Vec<crate::cpu::CpuFlag>,
 }
 
 fn yes() -> bool {

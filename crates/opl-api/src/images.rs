@@ -263,6 +263,14 @@ pub struct CatalogTemplate {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub cloud_init: Option<CloudInit>,
+    /// CPU 모델(계획 63, 없으면 `host`). 별칭은 버전 모델로 고정된다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_model: Option<opl_types::cpu::CpuModel>,
+    /// CPU 플래그(`["-avx512vbmi"]`, 계획 63)
+    #[serde(default)]
+    #[schema(default)]
+    pub cpu_flags: Vec<opl_types::cpu::CpuFlag>,
 }
 
 fn default_vcpus() -> u16 {
@@ -460,9 +468,23 @@ fn draft(
         cloud_init,
         machine: Some(image.arch.machine()),
         firmware: Some(image.firmware),
+        cpu_model: t.cpu_model.clone(),
+        cpu_flags: t.cpu_flags.clone(),
     };
-    draft
-        .vm_spec(volume)
-        .map_err(|e| ApiError::bad_request(format!("template: {e}")))?;
+    let mut draft = draft;
+    let model = draft.cpu_model.clone().unwrap_or_default();
+    crate::cpu::require_cpu_feature(&state.cluster, &model, &draft.cpu_flags)?;
+    let spec = draft.vm_spec(volume).map_err(|e| match e {
+        opl_types::template::TemplateError::Invalid(v) => crate::cpu::validation_error(v),
+        e => ApiError::bad_request(format!("template: {e}")),
+    })?;
+    // 별칭은 버전 모델로 고정해 Task에 넣는다(계획 63 §8).
+    if draft.cpu_model.is_some() || !draft.cpu_flags.is_empty() {
+        let inv = crate::scheduler::Inventory::load(&state.cluster)?;
+        let pinned = crate::cpu::check_cpu(&inv, image.arch, &spec.cpu, None)?;
+        if draft.cpu_model.is_some() {
+            draft.cpu_model = Some(pinned.model);
+        }
+    }
     Ok(draft)
 }

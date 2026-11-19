@@ -1,5 +1,5 @@
-//! 계획 63 API: CPU 모델·플래그의 기능 게이트(스테이지 1 — 모델 API를 열기 전에는 `host`·`max` 밖을 받지 않는다),
-//! 리더의 클러스터 기준 기록과 마이그레이션의 CPU 확인(스테이지 4).
+//! 계획 63 API: CPU 모델·플래그의 기능 게이트와 검증·별칭 고정, CPU 보기(VM·노드·모델·플래그·기준), 설정 `cpu`, 노드
+//! 다시 읽기(스테이지 5), 리더의 클러스터 기준 기록과 마이그레이션의 CPU 확인(스테이지 4).
 
 mod common;
 
@@ -37,11 +37,23 @@ async fn drop_cpu_models(env: &Env) {
         .unwrap();
 }
 
+/// x86_64(q35) VM 만들기 요청
+fn x86_request(name: &str, model: &str, flags: &[&str]) -> serde_json::Value {
+    let mut req = vm_request(name);
+    req["spec"]["machine"] = json!("q35");
+    req["spec"]["cpu"]["model"] = json!(model);
+    if !flags.is_empty() {
+        req["spec"]["cpu"]["flags"] = json!(flags);
+    }
+    req
+}
+
+/// 옛 노드가 있으면 `host`·`max` 밖의 모델과 플래그는 검증보다 먼저 409 `cluster_upgrading`이다. 문법이 틀린 모델·플래그는
+/// JSON을 풀지 못한다.
 #[tokio::test]
 async fn cpu_models_and_flags_are_gated() {
     let env = Env::start().await;
     let admin = env.admin().await;
-    // host·max는 지금처럼 된다.
     for (name, model) in [("h", "host"), ("m", "max")] {
         let mut req = vm_request(name);
         req["spec"]["cpu"]["model"] = json!(model);
@@ -50,35 +62,27 @@ async fn cpu_models_and_flags_are_gated() {
         assert_eq!(body["spec"]["cpu"]["model"], model);
         assert!(body["spec"]["cpu"].get("flags").is_none(), "{body}");
     }
-    let tries = [
-        json!({ "model": "x86-64-v3" }),
-        json!({ "model": "cluster" }),
-        json!({ "model": "Icelake-Server-v7" }),
-        json!({ "model": "host", "flags": ["-avx512vbmi"] }),
-    ];
-    // 모든 노드가 알려도 스테이지 5 전에는 400이다.
-    for cpu in &tries {
-        let mut req = vm_request("new");
-        req["spec"]["cpu"]["model"] = cpu["model"].clone();
-        if let Some(f) = cpu.get("flags") {
-            req["spec"]["cpu"]["flags"] = f.clone();
-        }
-        let (status, body) = admin.post("/vms", req).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{cpu}: {body}");
-    }
-    // 옛 노드가 있으면 검증보다 먼저 409다.
     drop_cpu_models(&env).await;
-    for cpu in &tries {
-        let mut req = vm_request("new");
-        req["spec"]["cpu"]["model"] = cpu["model"].clone();
-        if let Some(f) = cpu.get("flags") {
-            req["spec"]["cpu"]["flags"] = f.clone();
-        }
-        let (status, body) = admin.post("/vms", req).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{cpu}: {body}");
+    let tries = [
+        x86_request("new", "x86-64-v3", &[]),
+        x86_request("new", "cluster", &[]),
+        x86_request("new", "Icelake-Server-v7", &[]),
+        x86_request("new", "host", &["-avx512vbmi"]),
+    ];
+    for req in tries {
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{req}: {body}");
         assert_eq!(body["code"], "cluster_upgrading", "{body}");
     }
-    // 문법이 틀린 모델·플래그는 JSON을 풀지 못한다.
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "cpu": { "mask": ["avx512vbmi"] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading", "{body}");
     for (model, flags) in [("base", json!([])), ("host", json!(["avx"]))] {
         let mut req = vm_request("bad");
         req["spec"]["cpu"]["model"] = json!(model);
@@ -88,30 +92,369 @@ async fn cpu_models_and_flags_are_gated() {
     }
 }
 
-/// 저장된 VM의 모델·플래그를 그대로 두는 바꾸기(`vm set --cores`)는 스테이지 5 전에도 받는다(바꾸면 400).
+/// 만들 때 별칭을 버전 모델로 고정하고(대소문자는 카탈로그 표기로) 감사에 적는다. 모르는 모델·플래그, 다른 아키텍처,
+/// 숨김 목록의 `+flag`, 겹친 플래그는 §13의 400 코드다. 바꾸기에서 모델이 그대로면 다시 해석하지 않는다.
 #[tokio::test]
-async fn an_update_that_keeps_the_stored_cpu_model_and_flags_is_accepted() {
+async fn models_are_pinned_and_checked_against_the_node_catalogs() {
     let env = Env::start().await;
     let admin = env.admin().await;
-    let (status, body) = admin.post("/vms", vm_request("web")).await;
+    let (strong, _) = add_catalogs(&env).await;
+    add_x86_node(&env, "n1", &strong).await;
+
+    let (status, body) = admin
+        .post(
+            "/vms",
+            x86_request("web", "Icelake-Server", &["-avx512vbmi"]),
+        )
+        .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    // 테스트 고리처럼 저장소에 바로 플래그를 쓴다.
-    let mut vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
-    vm.spec.cpu.flags = vec!["-sve".parse().unwrap()];
-    env.cluster
-        .update_spec(vm.id, None, vm.labels.clone(), &vm.spec)
-        .await
-        .unwrap();
+    assert_eq!(body["spec"]["cpu"]["model"], "Icelake-Server-v7");
+    assert_eq!(body["spec"]["cpu"]["flags"], json!(["-avx512vbmi"]));
+    let details = audit_details(&env, "POST /vms").await;
+    assert!(
+        details.contains(
+            &"vm create web cpu=Icelake-Server-v7 (from Icelake-Server) cpu.flags=-avx512vbmi"
+                .to_string()
+        ),
+        "{details:?}"
+    );
+    let (status, body) = admin
+        .post("/vms", x86_request("lower", "skylake-server-v5", &[]))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["cpu"]["model"], "Skylake-Server-v5");
+    for model in ["x86-64-v3", "cluster"] {
+        let (status, body) = admin
+            .post(
+                "/vms",
+                x86_request(&format!("l{}", model.len()), model, &[]),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{model}: {body}");
+    }
+
+    let bad = [
+        (
+            x86_request("x", "Icelake-Servr-v7", &[]),
+            "unknown_cpu_model",
+        ),
+        (
+            x86_request("x", "host", &["-nonexistent"]),
+            "unknown_cpu_flag",
+        ),
+        (
+            x86_request("x", "host", &["-aes", "+aes"]),
+            "invalid_cpu_flags",
+        ),
+        (
+            {
+                let mut r = vm_request("x");
+                r["spec"]["cpu"]["model"] = json!("x86-64-v3");
+                r
+            },
+            "cpu_model_arch",
+        ),
+        (
+            {
+                let mut r = vm_request("x");
+                r["spec"]["cpu"]["model"] = json!("Skylake-Server-v5");
+                r
+            },
+            "cpu_model_arch",
+        ),
+    ];
+    for (req, code) in bad {
+        let (status, body) = admin.post("/vms", req.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{req}: {body}");
+        assert_eq!(body["code"], code, "{req}: {body}");
+    }
+    let (_, body) = admin
+        .post("/vms", x86_request("x", "Icelake-Servr-v7", &[]))
+        .await;
+    assert_eq!(body["details"]["similar"][0], "Icelake-Server-v7", "{body}");
+
+    // 숨김 목록의 이름은 켤 수 없다.
+    set_cpu_settings(
+        &env,
+        CpuSettings {
+            mask: vec!["avx512vbmi".into()],
+            ..Default::default()
+        },
+    )
+    .await;
+    let (status, body) = admin
+        .post("/vms", x86_request("x", "host", &["+avx512vbmi"]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "cpu_flag_masked");
+
+    // 별칭의 뜻이 노드마다 다르면 버전 이름을 요구한다.
+    let mut other = opl_driver::mock_cpu_probe().catalog;
+    other.qemu = "8.2.2".into();
+    other.models[0].alias_of = Some("Icelake-Server-v1".into());
+    let hash = other.hash();
+    let r: CpuCatalog = Resource::new(&hash, other);
+    env.cluster.create(&r).await.unwrap();
+    add_x86_node(&env, "n2", &hash).await;
+    let (status, body) = admin
+        .post("/vms", x86_request("x", "Icelake-Server", &[]))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "cpu_model_ambiguous");
+    assert_eq!(
+        body["details"]["candidates"],
+        json!(["Icelake-Server-v1", "Icelake-Server-v7"])
+    );
+
+    // 모델을 그대로 두는 바꾸기는 다시 해석하지 않는다(코어만 바꿈).
+    let vm = env.cluster.get_by_name::<VmSpec>("web").unwrap().unwrap();
     let mut spec = serde_json::to_value(&vm.spec).unwrap();
     spec["cpu"]["cores"] = json!(2);
     let (status, body) = admin
         .put("/vms/web", json!({ "spec": spec.clone() }), None)
         .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["spec"]["cpu"]["flags"], json!(["-sve"]), "{body}");
-    spec["cpu"]["flags"] = json!(["-pauth"]);
+    spec["cpu"]["flags"] = json!(["-avx512vbmi", "-aes"]);
     let (status, body) = admin.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let details = audit_details(&env, "PUT /vms/{key}").await;
+    assert!(
+        details.contains(&"vm set web cpu.flags=-avx512vbmi,-aes".to_string()),
+        "{details:?}"
+    );
+}
+
+/// `GET /vms/{key}/cpu`·`/nodes/{key}/cpu`·`/cpu/models`·`/cpu/flags`·`/cpu/baseline`
+#[tokio::test]
+async fn cpu_views_show_what_each_node_can_run() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (strong, weak) = add_catalogs(&env).await;
+    add_x86_node(&env, "n1", &strong).await;
+    add_x86_node(&env, "n4", &weak).await;
+    let (status, body) = admin
+        .post("/vms", x86_request("web", "Icelake-Server-v7", &[]))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = admin.get("/vms/web/cpu").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["model"], "Icelake-Server-v7");
+    assert_eq!(
+        body["nodes"],
+        json!([
+            { "node": "n1", "can_run": true },
+            {
+                "node": "n4",
+                "can_run": false,
+                "missing": ["avx512vbmi"],
+                "reason": "node \"n4\" cannot run CPU model Icelake-Server-v7 (missing avx512vbmi)"
+            }
+        ])
+    );
+
+    let (status, body) = admin.get("/nodes/n4/cpu").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["cpu"]["catalog"], weak);
+    let models = body["models"].as_array().unwrap();
+    let v7 = models
+        .iter()
+        .find(|m| m["name"] == "Icelake-Server-v7")
+        .unwrap();
+    assert_eq!(v7["usable"], false);
+    assert_eq!(v7["missing"], json!(["avx512vbmi"]));
+    let alias = models
+        .iter()
+        .find(|m| m["name"] == "Icelake-Server")
+        .unwrap();
+    assert_eq!(alias["alias_of"], "Icelake-Server-v7");
+    let flag = body["flags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "avx512vbmi")
+        .unwrap()
+        .clone();
+    assert_eq!(flag, json!({ "name": "avx512vbmi", "supported": false }));
+
+    let (status, body) = admin.get("/cpu/models?arch=x86_64").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], 2);
+    let names: Vec<&str> = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "host",
+            "max",
+            "cluster",
+            "x86-64-v2",
+            "x86-64-v2-aes",
+            "x86-64-v3",
+            "x86-64-v4",
+            "Icelake-Server",
+            "Icelake-Server-v7",
+            "Skylake-Server-v5"
+        ]
+    );
+    let entry = |name: &str| {
+        body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(entry("Icelake-Server-v7")["usable"], 1);
+    assert_eq!(entry("Skylake-Server-v5")["usable"], 2);
+    assert_eq!(entry("cluster")["current"], "host");
+    assert_eq!(entry("host")["usable"], 2);
+    let (_, usable) = admin
+        .get("/cpu/models?arch=x86_64&node=n4&usable=true")
+        .await;
+    assert!(
+        usable["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["name"] != "Icelake-Server-v7"),
+        "{usable}"
+    );
+    // aarch64(이 노드)는 카탈로그가 없어 host·max·cluster만 켠다.
+    let (_, arm) = admin.get("/cpu/models?arch=aarch64").await;
+    assert_eq!(arm["models"].as_array().unwrap().len(), 3, "{arm}");
+
+    let (status, body) = admin.get("/cpu/flags?arch=x86_64").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["nodes"], 2);
+    assert!(
+        body["flags"]
+            .as_array()
+            .unwrap()
+            .contains(&json!({ "name": "avx512vbmi", "supported": 1, "known": 2 })),
+        "{body}"
+    );
+
+    let (status, body) = admin.get("/cpu/baseline").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["mode"], "off");
+    assert!(
+        body["arches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["cluster_vms"] == 0)
+    );
+}
+
+/// 설정 `cpu`: 숨김 목록은 맞춰 저장하고 영향 받는 실행 중 VM 수를 돌려준다. 모르는 이름은 400, 고정 기준을 켤 수 없는
+/// 노드가 있으면 409 `cpu_baseline_unsupported`이고 `force`로 넘는다. 별칭은 버전 모델로 고정한다.
+#[tokio::test]
+async fn cpu_settings_are_checked_and_count_the_affected_vms() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (strong, weak) = add_catalogs(&env).await;
+    let n1 = add_x86_node(&env, "n1", &strong).await;
+    add_x86_node(&env, "n4", &weak).await;
+    running_vm(&env, "web", n1, "host", resolved("host", CpuSource::Spec)).await;
+    running_vm(
+        &env,
+        "db",
+        n1,
+        "Skylake-Server-v5",
+        resolved("Skylake-Server-v5", CpuSource::Spec),
+    )
+    .await;
+
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "cpu": { "mask": ["AVX512VBMI", "aes", "aes"] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["spec"]["cpu"]["mask"], json!(["aes", "avx512vbmi"]));
+    assert_eq!(body["affected_running_vms"], 2, "{body}");
+    let details = audit_details(&env, "PATCH /settings").await;
+    assert!(
+        details.contains(&"settings cpu.mask=aes,avx512vbmi".to_string()),
+        "{details:?}"
+    );
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "cpu": { "mask": ["nonexistent"] } }),
+            None,
+        )
+        .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "unknown_cpu_flag");
+
+    // 숨김 목록이 `avx512vbmi`를 끄면 약한 노드도 고정 기준을 켤 수 있으므로 지운 뒤에 고정한다.
+    let pin = json!({ "cpu": { "mask": [], "pinned": [ { "arch": "x86_64", "model": "Icelake-Server" } ] } });
+    let (status, body) = admin.patch("/settings", pin.clone(), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cpu_baseline_unsupported");
+    assert_eq!(body["details"]["nodes"], json!(["n4"]));
+    let mut forced = pin;
+    forced["cpu"]["force"] = json!(true);
+    let (status, body) = admin.patch("/settings", forced, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["spec"]["cpu"]["pinned"],
+        json!([{ "arch": "x86_64", "model": "Icelake-Server-v7" }])
+    );
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "cpu": { "pinned": [ { "arch": "x86_64", "model": "host" } ] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // 모두 지우면 설정에서 `cpu`가 빠진다.
+    let (status, body) = admin
+        .patch("/settings", json!({ "cpu": { "pinned": [] } }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["spec"].get("cpu").is_none(), "{body}");
+    assert_eq!(body["affected_running_vms"], 0, "{body}");
+}
+
+/// 노드 다시 읽기는 그 노드의 Task `node-cpu-probe`다(끝나지 않은 것이 있으면 그것). 위트니스는 400.
+#[tokio::test]
+async fn a_node_cpu_refresh_is_a_task_on_that_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let me = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    let (status, body) = admin
+        .post(&format!("/nodes/{}/cpu/refresh", me.name), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["spec"]["op"]["kind"], "node-cpu-probe");
+    assert_eq!(body["spec"]["node"], env.node.to_string());
+    // 이 시험 노드의 실행기는 다시 읽기가 없어 실패한다.
+    let id = body["id"].as_str().unwrap().to_string();
+    let start = std::time::Instant::now();
+    loop {
+        let (_, task) = admin.get(&format!("/tasks/{id}")).await;
+        if task["status"]["state"] == "failed" {
+            break;
+        }
+        assert!(start.elapsed() < WAIT, "{task}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    drop_cpu_models(&env).await;
+    let (status, body) = admin
+        .post(&format!("/nodes/{}/cpu/refresh", me.name), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
 }
 
 /// Mock 카탈로그(`Icelake-Server-v7`은 `avx512vbmi`가 없어 못 켬 — 약한 노드)와 그것을 켤 수 있는 강한 카탈로그를 만들고
@@ -164,7 +507,14 @@ async fn add_x86_node(env: &Env, name: &str, catalog: &str) -> Uuid {
         ha: None,
         underlay: None,
         firewall: false,
-        version: None,
+        // 이 노드와 같은 빌드(설정 쓰기가 업그레이드 중이 아니게)
+        version: env
+            .cluster
+            .get::<NodeSpec>(env.node)
+            .unwrap()
+            .unwrap()
+            .status
+            .version,
         updates: None,
         features: FEATURES.iter().map(|f| f.to_string()).collect(),
         cluster_addresses: vec![],
@@ -179,7 +529,7 @@ async fn add_x86_node(env: &Env, name: &str, catalog: &str) -> Uuid {
     node.id
 }
 
-/// 설정 `cpu`를 저장소에 바로 쓴다(설정 API의 `cpu`는 스테이지 5).
+/// 설정 `cpu`를 저장소에 바로 쓴다(리더 기록 시험이 API의 카탈로그 검사를 거치지 않게).
 async fn set_cpu_settings(env: &Env, cpu: CpuSettings) {
     match env
         .cluster
@@ -204,7 +554,7 @@ async fn set_cpu_settings(env: &Env, cpu: CpuSettings) {
     }
 }
 
-/// 노드 `node`에 고정된 x86_64 VM 스펙(API를 거치지 않는다 — 모델 API는 스테이지 5)
+/// 노드 `node`에 고정된 x86_64 VM 스펙(API를 거치지 않는다)
 fn x86_spec(model: &str, node: Uuid, power: PowerState) -> VmSpec {
     VmSpec {
         cpu: CpuSpec {

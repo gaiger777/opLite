@@ -8,6 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::cloud_init::CloudInit;
+use crate::cpu::CpuFlag;
 use crate::vm::{
     Arch, CpuModel, CpuSpec, DiskBus, DiskSpec, Firmware, MachineType, NicModel, NicSpec,
     PowerState, RestartPolicy, ValidationError, VmSpec,
@@ -53,6 +54,14 @@ pub struct CloneOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub folder: Option<Uuid>,
+    /// 새 VM의 CPU 모델(계획 63). API가 별칭을 버전 모델로 고정해 넣는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_model: Option<CpuModel>,
+    /// 새 VM의 CPU 플래그 전체(`["-avx512vbmi"]`, `[]`는 지운다, 계획 63)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_flags: Option<Vec<CpuFlag>>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -113,6 +122,12 @@ pub fn apply_overrides(spec: &VmSpec, ov: &CloneOverrides) -> Result<VmSpec, Tem
     }
     if let Some(memory) = ov.memory_mib {
         new.memory_mib = memory;
+    }
+    if let Some(model) = &ov.cpu_model {
+        new.cpu.model = model.clone();
+    }
+    if let Some(flags) = &ov.cpu_flags {
+        new.cpu.flags = flags.clone();
     }
     for (nic, network) in new.nics.iter_mut().zip(&ov.nics) {
         if let Some(network) = network {
@@ -212,6 +227,14 @@ pub struct TemplateDraft {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub firmware: Option<Firmware>,
+    /// CPU 모델(계획 63). 없으면 `host`다. API가 별칭을 버전 모델로 고정해 넣는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub cpu_model: Option<CpuModel>,
+    /// CPU 플래그(`["-avx512vbmi"]`, 계획 63)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cpu_flags: Vec<CpuFlag>,
 }
 
 fn default_vcpus() -> u16 {
@@ -230,8 +253,8 @@ impl TemplateDraft {
             cpu: CpuSpec {
                 sockets: 1,
                 cores: self.vcpus,
-                model: CpuModel::default(),
-                flags: Vec::new(),
+                model: self.cpu_model.clone().unwrap_or_default(),
+                flags: self.cpu_flags.clone(),
                 max_vcpus: None,
             },
             memory_mib: self.memory_mib,
@@ -317,10 +340,17 @@ mod tests {
             }),
             start: true,
             folder: None,
+            cpu_model: Some("Icelake-Server-v7".parse().unwrap()),
+            cpu_flags: Some(vec!["-avx512vbmi".parse().unwrap()]),
         };
         assert!(!ov.is_empty());
         let json = serde_json::to_value(&ov).unwrap();
         assert_eq!(json["nics"], serde_json::json!([null, "dmz"]));
+        assert_eq!(json["cpu_model"], "Icelake-Server-v7");
+        assert_eq!(json["cpu_flags"], serde_json::json!(["-avx512vbmi"]));
+        let applied = apply_overrides(&template(), &ov).unwrap();
+        assert_eq!(applied.cpu.model.as_str(), "Icelake-Server-v7");
+        assert_eq!(applied.cpu.flags, ov.cpu_flags.clone().unwrap());
         assert_eq!(serde_json::from_value::<CloneOverrides>(json).unwrap(), ov);
         assert!(
             serde_json::from_value::<CloneOverrides>(serde_json::json!({ "cpus": 2 })).is_err()

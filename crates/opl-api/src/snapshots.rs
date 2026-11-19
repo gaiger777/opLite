@@ -9,6 +9,7 @@ use axum::http::StatusCode;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::authz::Privilege;
 use opl_types::cloud_init::{CloudInit, PASSWORD_MASK, is_crypt_hash};
+use opl_types::cpu::{CpuFlag, CpuModel};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::node::{FOLDERS, HOTPLUG, NodeSpec, TEMPLATES};
 use opl_types::resource::{Kind, Resource};
@@ -97,6 +98,14 @@ pub struct CloneRequest {
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub folder: Option<Uuid>,
+    /// 새 VM의 CPU 모델(계획 63). 별칭은 버전 모델로 고정된다.
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_model: Option<CpuModel>,
+    /// 새 VM의 CPU 플래그 전체(`["-avx512vbmi"]`, `[]`는 지운다, 계획 63)
+    #[serde(default)]
+    #[schema(nullable = false, default)]
+    pub cpu_flags: Option<Vec<CpuFlag>>,
 }
 
 impl CloneRequest {
@@ -111,6 +120,8 @@ impl CloneRequest {
             || self.cloud_init.is_some()
             || self.start
             || self.folder.is_some()
+            || self.cpu_model.is_some()
+            || self.cpu_flags.is_some()
     }
 }
 
@@ -1068,9 +1079,29 @@ fn overrides(
         cloud_init,
         start: req.start,
         folder: req.folder,
+        cpu_model: req.cpu_model.clone(),
+        cpu_flags: req.cpu_flags.clone(),
     };
     if ov.is_empty() {
         return Ok(None);
+    }
+    let mut ov = ov;
+    // CPU 모델·플래그(계획 63): 옛 노드가 풀지 못하고, 별칭은 버전 모델로 고정한다.
+    if ov.cpu_model.is_some() || ov.cpu_flags.is_some() {
+        let mut cpu = spec.cpu.clone();
+        if let Some(m) = &ov.cpu_model {
+            cpu.model = m.clone();
+        }
+        if let Some(f) = &ov.cpu_flags {
+            cpu.flags = f.clone();
+        }
+        crate::cpu::require_cpu_feature(&state.cluster, &cpu.model, &cpu.flags)?;
+        opl_types::cpu::validate_flags(&cpu.flags).map_err(crate::cpu::cpu_error)?;
+        let inv = crate::scheduler::Inventory::load(&state.cluster)?;
+        let pinned = crate::cpu::check_cpu(&inv, spec.machine.arch(), &cpu, Some(&spec.cpu))?;
+        if ov.cpu_model.is_some() {
+            ov.cpu_model = Some(pinned.model);
+        }
     }
     if let Some(size) = ov.disks.iter().flatten().find(|s| *s % 512 != 0) {
         return Err(ApiError::bad_request(format!(

@@ -69,6 +69,8 @@ pub(crate) struct TemplateDeploy {
     /// 메모리(MiB)
     #[arg(long)]
     memory: Option<u32>,
+    #[command(flatten)]
+    cpu: crate::cpu::CpuArgs,
     /// NIC의 네트워크: `nicN=NETWORK`(`nicN=`이 없으면 준 순서대로 NIC 0, 1, …). NIC 수는 템플릿과 같다.
     #[arg(long = "network", value_name = "[nicN=]NETWORK", value_parser = parse_nic_network)]
     networks: Vec<(Option<usize>, String)>,
@@ -188,6 +190,7 @@ impl TemplateDeploy {
         set("pool", self.pool.as_ref().map(|p| json!(p)));
         set("vcpus", self.cpus.map(|n| json!(n)));
         set("memory_mib", self.memory.map(|n| json!(n)));
+        self.cpu.request_fields(&mut body);
         if !self.networks.is_empty() {
             body["nics"] = Value::Array(by_index(&self.networks));
         }
@@ -605,6 +608,8 @@ pub(crate) struct ImageGet {
     /// 템플릿의 메모리(MiB, 기본 2048)
     #[arg(long, requires = "template")]
     memory: Option<u32>,
+    #[command(flatten)]
+    cpu: crate::cpu::CpuArgs,
     /// 받은 디스크를 이 크기로 늘린다(이미지보다 클 때). 단위 K, M, G, T.
     #[arg(long, value_parser = parse_size, requires = "template")]
     size: Option<u64>,
@@ -720,12 +725,15 @@ impl ImageGet {
             if let Some(n) = self.size {
                 t["size_bytes"] = json!(n);
             }
+            self.cpu.request_fields(&mut t);
             if !cloud_init.is_null() {
                 t["cloud_init"] = cloud_init.clone();
             }
             body["template"] = t;
         } else if self.cloud_init.wanted() {
             bail!("--ci-* options need --template");
+        } else if self.cpu.given() {
+            bail!("--cpu-model and --cpu-flags need --template");
         }
         Ok(body)
     }

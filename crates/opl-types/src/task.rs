@@ -159,6 +159,9 @@ pub enum TaskOp {
     /// 대상 노드(Task의 `node`와 같다)의 패키지를 `apt-get dist-upgrade`로 올린다. orbivisord 밖의 일시
     /// systemd 유닛에서 돌므로 orbivisord가 다시 시작해도 이어서 지켜본다.
     NodeUpgrade,
+    /// 대상 노드(Task의 `node`와 같다)의 QEMU에 CPU 모델·플래그를 다시 묻는다(계획 63, 관리자 다시 읽기). 카탈로그를
+    /// 올리고 Node `status.cpu`를 쓴다. 모든 노드가 `cpu-models`를 알릴 때만 만든다.
+    NodeCpuProbe,
     /// 대상 노드(Task의 `node`와 같다)를 비운다: 실행 중인 VM을 하나씩 다른 노드로 라이브 마이그레이션한다.
     /// 노드는 API가 먼저 유지보수로 바꾼다.
     NodeDrain,
@@ -738,6 +741,16 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<TaskOp>(json).unwrap(),
             TaskOp::NodeUpdateCheck
+        );
+    }
+
+    #[test]
+    fn node_cpu_probe_op_is_tagged_by_kind() {
+        let json = serde_json::json!({ "kind": "node-cpu-probe" });
+        assert_eq!(serde_json::to_value(TaskOp::NodeCpuProbe).unwrap(), json);
+        assert_eq!(
+            serde_json::from_value::<TaskOp>(json).unwrap(),
+            TaskOp::NodeCpuProbe
         );
     }
 

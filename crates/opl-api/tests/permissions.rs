@@ -360,9 +360,45 @@ async fn every_list_shows_only_the_folders_of_a_folder_user() {
         "/cluster",
         "/groups",
         "/users",
+        "/cpu/baseline",
     ] {
         assert_eq!(alice.get(path).await.0, StatusCode::FORBIDDEN, "{path}");
     }
+    // CPU 모델·플래그(계획 63): VM을 만들 수 있으면 읽되 노드 이름은 루트 읽기 권한이 있을 때만
+    let (status, models) = alice.get("/cpu/models").await;
+    assert_eq!(status, StatusCode::OK, "{models}");
+    assert!(
+        models["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m.get("nodes").is_none()),
+        "{models}"
+    );
+    assert!(
+        admin.get("/cpu/models").await.1["models"][0]["nodes"]
+            .as_array()
+            .is_some_and(|n| !n.is_empty())
+    );
+    assert_eq!(alice.get("/cpu/flags").await.0, StatusCode::OK);
+    let me = admin.get("/nodes").await.1["items"][0]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        alice.get(&format!("/nodes/{me}/cpu")).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        alice
+            .post(&format!("/nodes/{me}/cpu/refresh"), json!({}))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    // 아무 권한도 없는 사용자는 모델 목록도 못 본다.
+    let nobody = w.env.user("nobody", "none").await;
+    assert_eq!(nobody.get("/cpu/models").await.0, StatusCode::FORBIDDEN);
 }
 
 /// 남의 객체는 404(없는 것과 같은 문구), 볼 수 있으나 권한 밖 동작은 403, 만들기는 폴더가 있어야 한다.
@@ -377,7 +413,12 @@ async fn objects_out_of_view_are_404_and_missing_privileges_are_403() {
     let (_, missing) = alice.get("/vms/nope").await;
     assert_eq!(body["message"], "vm \"b1\" not found");
     assert_eq!(missing["code"], body["code"]);
-    for path in ["/vms/b1/metrics", "/vms/b1/snapshots", "/vms/b1/guest"] {
+    for path in [
+        "/vms/b1/metrics",
+        "/vms/b1/snapshots",
+        "/vms/b1/guest",
+        "/vms/b1/cpu",
+    ] {
         assert_eq!(alice.get(path).await.0, StatusCode::NOT_FOUND, "{path}");
     }
     assert_eq!(alice.delete("/vms/b1").await.0, StatusCode::NOT_FOUND);
@@ -397,6 +438,7 @@ async fn objects_out_of_view_are_404_and_missing_privileges_are_403() {
     // 자기 것은 읽는다.
     for path in [
         "/vms/a1",
+        "/vms/a1/cpu",
         "/volumes/vol-a1",
         "/backups/bk-a1",
         "/tasks/task-a1",

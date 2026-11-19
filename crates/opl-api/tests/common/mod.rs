@@ -108,7 +108,8 @@ pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
 
 impl Env {
     pub async fn start() -> Self {
-        Self::start_with(|_| {}, |_| async {}).await
+        // 큰 future를 힙에 둔다: 여러 Env를 차례로 띄우는 시험이 디버그 빌드의 시험 스레드 스택(2 MiB)을 넘지 않게.
+        Box::pin(Self::start_with(|_| {}, |_| async {})).await
     }
 
     /// `tweak`로 reconciler 설정을 바꾸고, `before_runner`로 Task 실행기가 뜨기 전에 저장소를 채운다.

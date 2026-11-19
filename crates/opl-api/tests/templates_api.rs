@@ -574,6 +574,35 @@ async fn deploy_requests_are_checked_up_front() {
         assert_error(&got, StatusCode::BAD_REQUEST, "invalid_request");
         assert_eq!(got.1["message"], message);
     }
+    // CPU 모델·플래그(계획 63)는 노드 카탈로그로 본다(이 aarch64 노드는 카탈로그가 없다).
+    for (body, code) in [
+        (
+            json!({ "name": "x", "cpu_model": "neoverse-n1" }),
+            "unknown_cpu_model",
+        ),
+        (
+            json!({ "name": "x", "cpu_flags": ["-sve"] }),
+            "unknown_cpu_flag",
+        ),
+        (
+            json!({ "name": "x", "cpu_flags": ["-sve", "+sve"] }),
+            "invalid_cpu_flags",
+        ),
+    ] {
+        let got = admin.post("/vms/tmpl/clone", body).await;
+        assert_error(&got, StatusCode::BAD_REQUEST, code);
+    }
+    let (status, task) = admin
+        .post(
+            "/vms/tmpl/clone",
+            json!({ "name": "y", "cpu_model": "max" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(
+        task["spec"]["op"]["overrides"]["cpu_model"], "max",
+        "{task}"
+    );
     // 다른 노드의 로컬 풀에는 닿지 않는다.
     let mut other = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
     other.id = Uuid::now_v7();

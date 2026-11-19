@@ -4,8 +4,8 @@
 //! `enforce`와 Orbivisor의 카탈로그 확인).
 //! `cargo test -p opld --features cpu-it --test cpu`
 //!
-//! API는 스테이지 5 전까지 `host`·`max` 밖의 모델·플래그와 설정 `cpu`를 받지 않으므로 제어 소켓의 시험 고리
-//! (`/v1/test/vm-cpu`·`cpu-mask`·`vcpu-props`·`cpu-catalog`)로 쓴다. 숨길 플래그는 러너 CPU를 모르므로 `host`로 켠 vCPU에
+//! 모델·플래그와 숨김 목록은 CLI(`vm set --cpu-model/--cpu-flags`, `settings set cpu.mask=…`)로 바꾸고, vCPU 속성과
+//! 카탈로그는 제어 소켓의 시험 고리(`/v1/test/vcpu-props`·`cpu-catalog`)로 읽는다. 숨길 플래그는 러너 CPU를 모르므로 `host`로 켠 vCPU에
 //! 있는 것을 고른다(x86_64: `avx512vbmi` → `avx2` → `sse4.2`, aarch64: `sve` → `pauth`). 이 Mac(aarch64 HVF)은 TCG로 돌리고
 //! (HVF는 명명 모델을 못 켜고 마이그레이션도 막혀 있다) 명명 모델 `neoverse-n1`을 켠다. vCPU 핫플러그와 `enforce`는 x86_64만이다.
 #![cfg(feature = "cpu-it")]
@@ -69,14 +69,22 @@ async fn hook(d: &Daemon, path: &str, body: Value) -> Value {
     }
 }
 
-/// 스펙의 CPU 모델·플래그를 바로 쓴다(꺼진 VM).
+/// 꺼진 VM `web`의 CPU 모델·플래그를 CLI로 바꾼다(`vm set --cpu-model --cpu-flags`).
 async fn set_cpu(d: &Daemon, model: &str, flags: &[&str]) {
-    hook(
-        d,
-        "vm-cpu",
-        json!({ "vm": "web", "model": model, "flags": flags }),
-    )
-    .await;
+    let flags = if flags.is_empty() {
+        "--no-cpu-flags".to_string()
+    } else {
+        format!("--cpu-flags={}", flags.join(","))
+    };
+    d.ctl(&["vm", "set", "web", "--cpu-model", model, &flags])
+        .await
+        .unwrap();
+}
+
+/// 클러스터 숨김 목록을 CLI로 바꾼다(`settings set cpu.mask=…`).
+async fn set_mask(d: &Daemon, mask: &[&str]) {
+    let value = format!("cpu.mask={}", mask.join(","));
+    d.ctl(&["settings", "set", &value]).await.unwrap();
 }
 
 /// 도는 VM `web`의 vCPU마다 속성 `names`
@@ -192,7 +200,7 @@ async fn masked_flags_are_off_in_every_vcpu() {
 
     // 숨김 목록을 더하면 검사 루프가 보류 `cpu`를 쓰고(실행 중 CPU는 그대로), 빼면 지운다.
     if let Some(other) = &other {
-        hook(&d, "cpu-mask", json!({ "mask": [other] })).await;
+        set_mask(&d, &[other.as_str()]).await;
         eventually("pending cpu change", || async {
             let v = vm(&c).await;
             v["status"]["hardware"]["pending"]
@@ -219,7 +227,7 @@ async fn masked_flags_are_off_in_every_vcpu() {
             props(&d, &[other]).await[0].get(other),
             Some(&Value::Bool(false))
         );
-        hook(&d, "cpu-mask", json!({ "mask": [] })).await;
+        set_mask(&d, &[]).await;
         eventually("pending cpu change", || async {
             vm(&c).await["status"]["hardware"]["pending"]
                 .as_array()
@@ -378,12 +386,13 @@ async fn enforce_refuses_a_model_with_missing_features() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Orbivisor: 카탈로그로 켜지 않고 까닭을 남긴다. 빠진 기능을 끄면 켠다.
+    // Orbivisor: 스케줄러가 카탈로그로 먼저 거절하고(409 `no_node`) 노드마다 까닭을 붙인다. 빠진 기능을 끄면 켠다.
     d.ctl(&["vm", "create", "web", "--memory", "256"])
         .await
         .unwrap();
     set_cpu(&d, &model, &[]).await;
     let err = d.ctl(&["vm", "start", "web"]).await.unwrap_err();
+    assert!(err.to_string().contains("no node can run this VM"), "{err}");
     assert!(
         err.to_string()
             .contains(&format!("cannot run CPU model {model} (missing")),
@@ -440,7 +449,7 @@ async fn the_receiving_side_keeps_the_recorded_cpu() {
         .chain(other.as_deref())
         .collect();
     if let Some(other) = &other {
-        hook(&d[0], "cpu-mask", json!({ "mask": [other] })).await;
+        set_mask(&d[0], &[other.as_str()]).await;
     }
 
     let task = c

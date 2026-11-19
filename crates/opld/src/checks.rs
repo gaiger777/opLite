@@ -1224,6 +1224,38 @@ mod tests {
         assert_eq!(hv.cpu_probes(), 1);
     }
 
+    /// 관리자 다시 읽기(Task `node-cpu-probe`의 [`crate::cpu::CpuRefresh`]): 검사 회차의 탐침이 다시 읽고, 새 카탈로그와
+    /// `NodeStatus.cpu`를 쓴다. 다음 회차도 새 결과를 그대로 둔다(앞 결과로 되돌리지 않는다).
+    #[tokio::test]
+    async fn a_refresh_reads_again_through_the_checker() {
+        use opl_api::CpuRefresher;
+        let s = setup().await;
+        let hv = Arc::new(opl_driver::MockHypervisor::default());
+        let mut state = s.state(&[]);
+        let watch = cpu_watch(&hv).await;
+        let refresh = watch.refresher(s.cluster.clone(), &state.name);
+        state.cpu = Some(watch);
+        run_once(&mut state).await;
+        let mut newer = opl_driver::mock_cpu_probe();
+        newer.catalog.qemu = "9.9.0".into();
+        hv.set_cpu_catalog(Ok(newer.clone()));
+        let asked = tokio::spawn(async move { refresh.refresh().await });
+        while !asked.is_finished() {
+            run_once(&mut state).await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        asked.await.unwrap().unwrap();
+        assert_eq!(hv.cpu_probes(), 2);
+        let cpu = s.node().status.cpu.unwrap();
+        assert_eq!(
+            (cpu.qemu.as_str(), cpu.catalog.clone()),
+            ("9.9.0", newer.catalog.hash())
+        );
+        assert!(catalogs(&s).iter().any(|c| c.name == newer.catalog.hash()));
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.cpu.unwrap().qemu, "9.9.0");
+    }
+
     /// 다른 노드가 이미 같은 카탈로그를 올렸으면 그것을 쓴다.
     #[tokio::test]
     async fn a_catalog_another_node_published_is_reused() {

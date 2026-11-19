@@ -116,6 +116,9 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("DELETE", "/nodes/{key}", Root(ClusterAdmin)),
     ("GET", "/nodes/{key}/disks", Root(ClusterRead)),
     ("POST", "/nodes/{key}/updates/refresh", Root(ClusterAdmin)),
+    // CPU 탐침과 카탈로그(계획 63)
+    ("GET", "/nodes/{key}/cpu", Root(ClusterRead)),
+    ("POST", "/nodes/{key}/cpu/refresh", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/upgrade", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/drain", Root(ClusterAdmin)),
     ("POST", "/nodes/{key}/unfreeze", Root(ClusterAdmin)),
@@ -165,6 +168,10 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/settings", Root(ClusterRead)),
     ("PATCH", "/settings", Root(ClusterAdmin)),
     ("POST", "/telemetry/reset-id", Root(ClusterAdmin)),
+    // CPU 모델·플래그(계획 63): VM을 만들거나 고칠 수 있으면 읽고, 노드 이름은 루트 `cluster.read`만(핸들러)
+    ("GET", "/cpu/models", Handler),
+    ("GET", "/cpu/flags", Handler),
+    ("GET", "/cpu/baseline", Root(ClusterRead)),
     ("GET", "/telemetry/preview", Root(ClusterAdmin)),
     ("GET", "/subscription", Root(ClusterRead)),
     ("PUT", "/subscription", Root(ClusterAdmin)),
@@ -240,6 +247,7 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("DELETE", "/vms/{key}/template", Object(Vm, VmConfig)),
     ("POST", "/vms/{key}/firmware/reset", Object(Vm, VmConfig)),
     ("GET", "/vms/{key}/guest", Read(Vm)),
+    ("GET", "/vms/{key}/cpu", Read(Vm)),
     ("POST", "/vms/{key}/guest/password", Object(Vm, VmConfig)),
     ("GET", "/vms/{key}/console", Object(Vm, VmConsole)),
     ("POST", "/vms/{key}/backups", Object(Vm, BackupCreate)),

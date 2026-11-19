@@ -7,6 +7,7 @@ mod cli;
 mod client;
 mod config;
 mod console;
+mod cpu;
 #[cfg(test)]
 mod fake_api;
 mod firmware;

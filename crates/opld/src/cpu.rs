@@ -18,6 +18,7 @@ use opl_driver::{CpuProbe, DriverError, Hypervisor};
 use opl_types::cpu::{CpuCatalog, CpuCatalogSpec, NodeCpu};
 use opl_types::node::CPU_MODELS;
 use opl_types::resource::Resource;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -143,6 +144,9 @@ pub async fn publish(cluster: &Cluster, hash: &str, catalog: &CpuCatalogSpec) {
     }
 }
 
+/// 관리자 다시 읽기 요청(Task `node-cpu-probe`): 요청 뒤에 띄운 탐침의 결과를 받는다.
+type Reply = oneshot::Sender<Probed>;
+
 /// 탐침의 상태: 마지막 결과와, 그때의 바이너리, 도는 탐침
 pub struct CpuWatch {
     hv: Arc<dyn Hypervisor>,
@@ -154,11 +158,64 @@ pub struct CpuWatch {
     /// 마지막 탐침을 띄운 때
     started: Option<Instant>,
     running: Option<JoinHandle<Result<CpuProbe, DriverError>>>,
+    /// 다시 읽기 요청(검사 회차가 거둔다)
+    requests: mpsc::UnboundedReceiver<Reply>,
+    sender: mpsc::UnboundedSender<Reply>,
+    /// 아직 띄우지 않은 요청
+    queued: Vec<Reply>,
+    /// 도는 탐침을 기다리는 요청
+    waiting: Vec<Reply>,
+}
+
+/// 다시 읽기를 검사 루프의 탐침([`CpuWatch`])에 맡긴다. 검사 루프가 다음 회차에 같은 결과를 쓰므로 앞 결과로 되돌아가지
+/// 않는다. 결과를 받으면 카탈로그를 올리고 `NodeStatus.cpu`를 바로 쓴다(검사 회차를 기다리지 않게).
+pub struct CpuRefresh {
+    cluster: Arc<Cluster>,
+    name: String,
+    sender: mpsc::UnboundedSender<Reply>,
+}
+
+/// 탐침이 돌고 끝난 결과를 검사 회차가 거둘 때까지 기다리는 한도(탐침 30초 + 회차 둘)
+const REFRESH_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[async_trait::async_trait]
+impl opl_api::CpuRefresher for CpuRefresh {
+    async fn refresh(&self) -> Result<(), String> {
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(tx)
+            .map_err(|_| "the node health checker is not running".to_string())?;
+        let probed = tokio::time::timeout(REFRESH_TIMEOUT, rx)
+            .await
+            .map_err(|_| "timed out waiting for the CPU probe".to_string())?
+            .map_err(|_| "the node health checker stopped".to_string())?;
+        if !cpu_models_ready(&self.cluster, &self.name) {
+            return Err("not every node knows the cpu-models feature yet".into());
+        }
+        if let Probed::Ok { catalog, cpu } = &probed {
+            publish(&self.cluster, &cpu.catalog, catalog).await;
+        }
+        crate::bootstrap::update_node_status(&self.cluster, |status| {
+            let cpu = probed.node_cpu(status.cpu.as_ref());
+            if status.cpu.as_ref() == Some(&cpu) {
+                return false;
+            }
+            status.cpu = Some(cpu);
+            true
+        })
+        .await
+        .map_err(|e| format!("cannot record the CPU probe: {e:#}"))?;
+        match probed {
+            Probed::Ok { .. } => Ok(()),
+            Probed::Failed { error, .. } => Err(error),
+        }
+    }
 }
 
 impl CpuWatch {
     /// `binary`는 드라이버가 띄우는 QEMU(`HostProfile::qemu_binary`), `accel`은 그 가속기다.
     pub fn new(hv: Arc<dyn Hypervisor>, binary: PathBuf, accel: &str) -> Self {
+        let (sender, requests) = mpsc::unbounded_channel();
         Self {
             hv,
             binary,
@@ -167,6 +224,19 @@ impl CpuWatch {
             stamp: None,
             started: None,
             running: None,
+            requests,
+            sender,
+            queued: Vec::new(),
+            waiting: Vec::new(),
+        }
+    }
+
+    /// 관리자 다시 읽기(`node-cpu-probe` Task 실행기에 넘긴다). `name`은 이 노드 이름이다.
+    pub fn refresher(&self, cluster: Arc<Cluster>, name: &str) -> CpuRefresh {
+        CpuRefresh {
+            cluster,
+            name: name.to_string(),
+            sender: self.sender.clone(),
         }
     }
 
@@ -194,13 +264,19 @@ impl CpuWatch {
         {
             self.finish(task.await);
         }
+        while let Ok(reply) = self.requests.try_recv() {
+            self.queued.push(reply);
+        }
         if self.running.is_some() {
             return;
         }
         let changed = self.stamp.as_ref() != Some(&stamp(&self.binary));
         let retry = matches!(self.last, Some(Probed::Failed { .. }))
             && self.started.is_some_and(|at| at.elapsed() >= RETRY_FAILED);
-        if changed || retry {
+        if !self.queued.is_empty() {
+            tracing::info!("reading the CPU models again (requested)");
+            self.start();
+        } else if changed || retry {
             if changed && self.stamp.is_some() {
                 tracing::info!(binary = ?self.binary, "the QEMU binary changed; reading the CPU models again");
             }
@@ -209,6 +285,7 @@ impl CpuWatch {
     }
 
     fn start(&mut self) {
+        self.waiting.append(&mut self.queued);
         self.stamp = Some(stamp(&self.binary));
         self.started = Some(Instant::now());
         let hv = self.hv.clone();
@@ -230,6 +307,9 @@ impl CpuWatch {
             Probed::Failed { error, .. } => {
                 tracing::warn!(%error, "cannot read this node's CPU models; keeping the last catalog")
             }
+        }
+        for reply in self.waiting.drain(..) {
+            let _ = reply.send(probed.clone());
         }
         self.last = Some(probed);
     }
@@ -337,6 +417,47 @@ mod tests {
             watch.last().unwrap().node_cpu(None).catalog,
             newer.catalog.hash()
         );
+    }
+
+    /// 다시 읽기 요청은 바이너리가 그대로여도 새 탐침을 띄우고, 요청 뒤에 띄운 탐침의 결과를 받는다. 마지막 결과도 그것이라
+    /// 검사 루프가 앞 결과로 되돌리지 않는다.
+    #[tokio::test]
+    async fn a_request_probes_again_and_gets_the_new_result() {
+        let hv = Arc::new(MockHypervisor::default());
+        let mut watch = CpuWatch::new(hv.clone(), "/nonexistent/qemu".into(), "kvm");
+        watch.probe_now().await;
+        watch.poll().await;
+        assert_eq!(hv.cpu_probes(), 1);
+        let mut newer = mock_cpu_probe();
+        newer.catalog.qemu = "9.0.0".into();
+        hv.set_cpu_catalog(Ok(newer.clone()));
+        let (tx, mut rx) = oneshot::channel();
+        watch.sender.send(tx).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let probed = loop {
+            watch.poll().await;
+            if let Ok(p) = rx.try_recv() {
+                break p;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert_eq!(hv.cpu_probes(), 2);
+        assert!(matches!(&probed, Probed::Ok { cpu, .. } if cpu.qemu == "9.0.0"));
+        assert_eq!(watch.last(), Some(&probed));
+        // 실패도 그대로 받는다.
+        hv.set_cpu_catalog(Err("boom".into()));
+        let (tx, mut rx) = oneshot::channel();
+        watch.sender.send(tx).unwrap();
+        let failed = loop {
+            watch.poll().await;
+            if let Ok(p) = rx.try_recv() {
+                break p;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        assert!(matches!(failed, Probed::Failed { .. }));
     }
 
     /// 실패는 바이너리가 그대로여도 [`RETRY_FAILED`] 뒤에 다시 읽는다.

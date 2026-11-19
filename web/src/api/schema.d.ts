@@ -886,6 +886,67 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cpu/baseline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 클러스터 CPU 기준(§9): 설정의 모드·자동 플래그·숨김 목록과 아키텍처마다 리더가 기록한 기준·셈에 든 노드·낮춘 노드·
+         *     경고·`cluster` VM 수
+         */
+        get: operations["get_cpu_baseline"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cpu/flags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 아키텍처의 CPU 플래그(노드 QEMU가 아는 이름, 이름순)와 그것을 줄 수 있는 노드 수. VM 플래그·숨김 목록 입력의 자동
+         *     완성에 쓴다.
+         */
+        get: operations["list_cpu_flags"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/cpu/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 아키텍처의 CPU 모델(§13): `host`·`max`·`cluster`(지금 기준)·`x86-64-v*`(x86_64)와 노드 카탈로그의 QEMU 모델(이름순,
+         *     별칭 포함 — 별칭은 저장할 때 버전 모델로 고정된다). 모델마다 켤 수 있는 노드 수와, 루트 `cluster.read`가 있으면
+         *     노드마다 켤 수 있는지·빠진 플래그다(숨김 목록·기준을 지금처럼 적용). VM을 만들거나 고칠 수 있는 사용자가 읽는다.
+         */
+        get: operations["list_cpu_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/folders": {
         parameters: {
             query?: never;
@@ -1349,6 +1410,47 @@ export interface paths {
          *     노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200).
          */
         delete: operations["delete_node"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/cpu": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 노드의 CPU 탐침 결과(QEMU 버전·가속기·호스트 CPU·읽은 시각·오류)와 카탈로그(모델마다 켤 수 있는지·빠진 플래그,
+         *     플래그마다 이 가속기가 주는지)
+         */
+        get: operations["get_node_cpu"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{key}/cpu/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드의 QEMU에 CPU 모델·플래그를 다시 묻는 Task(`node-cpu-probe`, 그 노드에서 돈다)를 돌려준다(202). 탐침은 보통
+         *     QEMU 바이너리가 바뀔 때 스스로 한다. 끝나지 않은 다시 읽기가 있으면 그것이다. 위트니스는 400, 오프라인이면 409
+         *     `node_offline`, 옛 노드가 남았으면 409 `cluster_upgrading`.
+         */
+        post: operations["refresh_node_cpu"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2573,6 +2675,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/{key}/cpu": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * VM의 CPU와 노드마다 켤 수 있는지(마이그레이션 대화상자·`oplctl vm cpu`). 도는 VM은 켤 때 기록한 CPU로 옮길 수
+         *     있는지를, 꺼진 VM은 스펙을 그 노드에서 해석해 켤 수 있는지를 본다. `host`·`max` VM을 옮기면 대상에 없는 플래그가
+         *     경고다.
+         */
+        get: operations["get_vm_cpu"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms/{key}/firmware/reset": {
         parameters: {
             query?: never;
@@ -3527,6 +3650,27 @@ export interface components {
              */
             uefi_vars: boolean;
         };
+        /** @description 아키텍처 하나의 클러스터 기준(`ClusterStatus.cpu_baselines`, 리더가 쓴다). `cluster` 모델 VM이 켤 때 쓴다. */
+        Baseline: {
+            /** @description 모델 위에 켜고 끈 플래그(auto 플래그·고정 플래그·숨김 목록) */
+            flags?: {
+                [key: string]: boolean;
+            };
+            /** @description 기준을 낮춘 노드(auto: 빼면 더 좋은 모델이 됨, pinned: 이 기준을 켤 수 없음) */
+            limited_by?: string[];
+            mode: components["schemas"]["BaselineSource"];
+            /** @description [`CpuModel`] 이름(버전 모델, `x86-64-v*`, `qemu64-v1`) */
+            model: string;
+            /** @description 셈에 든 노드 */
+            nodes?: string[];
+            previous?: components["schemas"]["PreviousBaseline"];
+            /**
+             * Format: int64
+             * @description 이 모델·플래그가 된 시각(유닉스 초, 리더가 채운다)
+             */
+            since?: number;
+            warnings?: string[];
+        };
         /**
          * @description 클러스터 기준 자동 셈
          * @enum {string}
@@ -3618,6 +3762,10 @@ export interface components {
         CatalogTemplate: {
             /** @description cloud-init 기본 설정(사용자·비밀번호·SSH 키 등). 평문 비밀번호는 SHA-512 crypt로 바꿔 Task에 담는다. */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description CPU 플래그(`["-avx512vbmi"]`, 계획 63) */
+            cpu_flags?: components["schemas"]["CpuFlag"][];
+            /** @description CPU 모델(계획 63, 없으면 `host`). 별칭은 버전 모델로 고정된다. */
+            cpu_model?: components["schemas"]["CpuModel"];
             /**
              * Format: int32
              * @default 2048
@@ -3872,6 +4020,10 @@ export interface components {
         CloneOverrides: {
             /** @description 주어진·비지 않은 칸만 원본의 cloud-init 설정을 바꾼다. 비밀번호는 crypt 해시다. */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 새 VM의 CPU 플래그 전체(`["-avx512vbmi"]`, `[]`는 지운다, 계획 63) */
+            cpu_flags?: components["schemas"]["CpuFlag"][];
+            /** @description 새 VM의 CPU 모델(계획 63). API가 별칭을 버전 모델로 고정해 넣는다. */
+            cpu_model?: components["schemas"]["CpuModel"];
             /** @description 디스크 순번별 새 크기(바이트, 늘리기만). null은 그대로다. */
             disks?: (number | null)[];
             /**
@@ -3902,6 +4054,10 @@ export interface components {
              *     `********`는 원본의 비밀번호를 그대로 둔다.
              */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description 새 VM의 CPU 플래그 전체(`["-avx512vbmi"]`, `[]`는 지운다, 계획 63) */
+            cpu_flags?: components["schemas"]["CpuFlag"][];
+            /** @description 새 VM의 CPU 모델(계획 63). 별칭은 버전 모델로 고정된다. */
+            cpu_model?: components["schemas"]["CpuModel"];
             /** @description 디스크 순번별 새 크기(바이트, 늘리기만, 512의 배수). null은 그대로다. */
             disks?: (number | null)[];
             /**
@@ -4070,16 +4226,114 @@ export interface components {
             /** @description 첫 줄에 `off`나 `on`을 찍는다(그 밖은 모름). */
             status: string;
         };
+        /** @description 아키텍처 하나의 클러스터 기준 */
+        CpuBaselineInfo: {
+            arch: components["schemas"]["Arch"];
+            /** @description 리더가 기록한 기준(없으면 `cluster` VM은 `host`처럼 켠다) */
+            baseline?: components["schemas"]["Baseline"];
+            /**
+             * Format: int32
+             * @description `cluster` 모델 VM 수
+             */
+            cluster_vms: number;
+            /** @description `Skylake-Server-v5 +pcid` 모양 */
+            cpu?: string;
+            /** @description 기준을 낮춘(고정이면 켤 수 없는) 노드 이름 */
+            limited_by?: string[];
+            /** @description 셈에 든 노드 이름 */
+            nodes?: string[];
+            /** @description 설정 `cpu.pinned`에 고정했다. */
+            pinned: boolean;
+        };
+        /** @description 클러스터 CPU 기준 */
+        CpuBaselines: {
+            /** @description 노드가 있거나 기준이 있는 아키텍처마다 */
+            arches: components["schemas"]["CpuBaselineInfo"][];
+            auto_flags: boolean;
+            /** @description 모든 VM에서 숨기는 플래그 */
+            mask?: string[];
+            mode: components["schemas"]["BaselineMode"];
+        };
         /**
          * @description '+name' turns a CPU flag on, '-name' hides it
          * @example -avx512vbmi
          */
         CpuFlag: string;
+        /** @description 플래그 하나 */
+        CpuFlagEntry: {
+            /**
+             * Format: int32
+             * @description 이 이름을 아는 노드 수(끌 수 있다)
+             */
+            known: number;
+            /** @description 클러스터 숨김 목록에 있다. */
+            masked?: boolean;
+            name: string;
+            /**
+             * Format: int32
+             * @description 이 플래그를 줄 수 있는 노드 수(`full max`)
+             */
+            supported: number;
+        };
+        /** @description 아키텍처 하나의 CPU 플래그 */
+        CpuFlags: {
+            arch: components["schemas"]["Arch"];
+            flags: components["schemas"]["CpuFlagEntry"][];
+            /**
+             * Format: int32
+             * @description 카탈로그를 알린 노드 수
+             */
+            nodes: number;
+        };
         /**
          * @description host, max, cluster, x86-64-v2, x86-64-v2-aes, x86-64-v3, x86-64-v4, or a versioned QEMU model (e.g. Icelake-Server-v7)
          * @example host
          */
         CpuModel: string;
+        /** @description 모델 하나 */
+        CpuModelEntry: {
+            /** @description 별칭이면 가리키는 버전 모델(카탈로그마다 다르면 첫 것). VM에는 버전 모델로 저장된다. */
+            alias_of?: string;
+            /** @description `cluster`: 지금 기준(`Skylake-Server-v5 +pcid`, 없으면 `host`처럼 켠다) */
+            current?: string;
+            deprecated?: boolean;
+            kind: components["schemas"]["CpuModelKind"];
+            name: string;
+            /** @description 노드마다(루트 `cluster.read`가 있을 때만) */
+            nodes?: components["schemas"]["CpuNodeFit"][];
+            /**
+             * Format: int32
+             * @description 켤 수 있는 노드 수
+             */
+            usable: number;
+            vendor?: string;
+        };
+        /**
+         * @description 모델의 종류
+         * @enum {string}
+         */
+        CpuModelKind: "basic" | "cluster" | "level" | "qemu";
+        /** @description 아키텍처 하나의 CPU 모델 */
+        CpuModels: {
+            arch: components["schemas"]["Arch"];
+            models: components["schemas"]["CpuModelEntry"][];
+            /**
+             * Format: int32
+             * @description 이 아키텍처의 노드 수(위트니스 제외, `node`를 주면 1)
+             */
+            nodes: number;
+        };
+        /** @description 노드 하나가 CPU를 켤 수 있는지 */
+        CpuNodeFit: {
+            can_run: boolean;
+            /** @description 빠진 플래그(끄지 않았는데 가속기가 못 주는 것, 켰는데 지원하지 않는 것) */
+            missing?: string[];
+            node: string;
+            /** @description 켤 수 없는 까닭 */
+            reason?: string;
+            /** @description 막지 않는 경고(`host` VM을 옮기면 대상에 없는 플래그) */
+            warnings?: string[];
+        };
         /** @description 설정 `cpu`(계획 63) */
         CpuSettings: {
             /**
@@ -4091,6 +4345,19 @@ export interface components {
             /** @description 모든 VM(`host` 포함)에서 숨길 플래그(API가 `normalize_mask`로 맞춰 저장) */
             mask?: string[];
             /** @description 아키텍처마다 고정한 기준. 있는 아키텍처는 auto 대신 이것이다(`baseline`이 off여도). */
+            pinned?: components["schemas"]["PinnedBaseline"][];
+        };
+        /** @description 설정 `cpu`에서 바꿀 값. 준 칸만 바꾼다. */
+        CpuSettingsPatch: {
+            /** @description auto 기준에 모든 노드가 주는 플래그를 더한다(기본 참). */
+            auto_flags?: boolean;
+            /** @description `off`(기본)이나 `auto`(리더가 모든 노드가 켤 수 있는 가장 좋은 모델을 셈함, x86_64만) */
+            baseline?: components["schemas"]["BaselineMode"];
+            /** @description 고정 기준을 켤 수 없는 노드가 있어도 저장한다(그 노드는 `cluster` VM을 받지 않는다). */
+            force?: boolean;
+            /** @description 모든 VM(`host` 포함)에서 숨길 플래그 전체(`[]`는 지운다). 다음 전원 껐다 켜기부터 적용된다. */
+            mask?: string[];
+            /** @description 아키텍처마다 고정한 기준 전체(`[]`는 지운다). 별칭은 버전 모델로 고정된다. */
             pinned?: components["schemas"]["PinnedBaseline"][];
         };
         /**
@@ -5233,6 +5500,10 @@ export interface components {
         ImportRun: {
             /** Format: int32 */
             cores?: number | null;
+            /** @description CPU 플래그(`["-avx512vbmi"]`, 계획 63) */
+            cpu_flags?: components["schemas"]["CpuFlag"][];
+            /** @description CPU 모델(계획 63). 없으면 `host`다. API가 별칭을 버전 모델로 고정해 넣는다. */
+            cpu_model?: components["schemas"]["CpuModel"];
             disk_bus?: components["schemas"]["DiskBus"] | null;
             firmware?: components["schemas"]["Firmware"] | null;
             /**
@@ -6845,6 +7116,39 @@ export interface components {
              */
             vendor: string;
         };
+        /** @description 노드 QEMU가 아는 플래그 하나 */
+        NodeCpuFlag: {
+            name: string;
+            /** @description 이 가속기가 줄 수 있다(`full max`). */
+            supported: boolean;
+        };
+        /** @description 노드의 CPU: 탐침 결과와 카탈로그를 펼친 것 */
+        NodeCpuInfo: {
+            arch?: components["schemas"]["Arch"];
+            /** @description 이 노드가 클러스터 CPU 기준을 켤 수 없는 까닭(`cluster` VM을 받지 않는다) */
+            baseline_problem?: string;
+            /** @description 탐침 결과(없으면 아직 읽지 않았거나 업그레이드 중 — `host`·`max`만) */
+            cpu?: components["schemas"]["NodeCpu"];
+            /** @description 카탈로그의 플래그(이름순) */
+            flags: components["schemas"]["NodeCpuFlag"][];
+            /** @description 카탈로그의 모델(이름순, 카탈로그가 없으면 빈 것) */
+            models: components["schemas"]["NodeCpuModel"][];
+            node: string;
+        };
+        /** @description 노드 카탈로그의 모델 하나 */
+        NodeCpuModel: {
+            alias_of?: string;
+            deprecated?: boolean;
+            migration_safe: boolean;
+            /** @description 이 가속기가 못 주는 플래그(끄면 켤 수 있다) */
+            missing?: string[];
+            /** @description 플래그 아닌 까닭(`type`, aarch64 KVM·HVF의 `accel`) */
+            missing_other?: string[];
+            name: string;
+            /** @description 플래그를 끄지 않고 이 노드에서 켤 수 있다. */
+            usable: boolean;
+            vendor?: string;
+        };
         /** @description 노드의 디스크 하나(`lsblk`의 최상위 디스크)와 OSD로 쓸 수 있는지 */
         NodeDisk: components["schemas"]["DiskState"] & {
             /** @description `/dev/disk/by-id/…`(재부팅해도 같은 디스크) */
@@ -7635,6 +7939,13 @@ export interface components {
         Power: "on" | "off" | "unknown";
         /** @enum {string} */
         PowerState: "running" | "stopped";
+        /** @description 바뀌기 전 기준 */
+        PreviousBaseline: {
+            flags?: {
+                [key: string]: boolean;
+            };
+            model: string;
+        };
         /** @description grant를 받는 주체 */
         PrincipalRef: {
             /** Format: uuid */
@@ -9282,6 +9593,11 @@ export interface components {
             /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
             api_names?: string[];
             /**
+             * @description 게스트 CPU(계획 63): 클러스터 기준 모드·고정 기준·자동 플래그·숨김 목록. 준 칸만 바꾼다. 실행 중 VM은 다음 전원
+             *     껐다 켜기까지 그대로이고 응답의 `affected_running_vms`가 그 수다. 모든 노드가 `cpu-models`를 알아야 한다.
+             */
+            cpu?: components["schemas"]["CpuSettingsPatch"];
+            /**
              * @description HA 복구를 위해 비워 둘 용량: `{"nodes": N}`(메모리가 가장 큰 노드 N대, 1~8), `{"percent": P}`(1~90),
              *     `"none"`(예약 없음). HA VM을 켤 때 넘으면 409 `ha_capacity`다.
              */
@@ -9319,6 +9635,27 @@ export interface components {
              *     `https://`만 받는다(개발용 `http://localhost`·`127.0.0.1`·`[::1]`은 예외).
              */
             web_origins?: string[];
+        };
+        SettingsPatched: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: components["schemas"]["SettingsSpec"];
+            status: components["schemas"]["SettingsStatus"];
+        } & {
+            /**
+             * Format: int32
+             * @description running VMs whose CPU changes at their next power cycle (only when cpu was given)
+             */
+            affected_running_vms?: number;
         };
         SettingsSpec: {
             /**
@@ -9752,6 +10089,9 @@ export interface components {
             kind: "node-upgrade";
         } | {
             /** @enum {string} */
+            kind: "node-cpu-probe";
+        } | {
+            /** @enum {string} */
             kind: "node-drain";
         } | {
             /** @enum {string} */
@@ -9949,6 +10289,10 @@ export interface components {
         TemplateDraft: {
             /** @description 없으면 빈 설정(cloud-init 기본)이다. 비밀번호는 crypt 해시다. */
             cloud_init?: components["schemas"]["CloudInit"];
+            /** @description CPU 플래그(`["-avx512vbmi"]`, 계획 63) */
+            cpu_flags?: components["schemas"]["CpuFlag"][];
+            /** @description CPU 모델(계획 63). 없으면 `host`다. API가 별칭을 버전 모델로 고정해 넣는다. */
+            cpu_model?: components["schemas"]["CpuModel"];
             /** @description 펌웨어. API가 카탈로그 항목의 것으로 채운다(없으면 UEFI). */
             firmware?: components["schemas"]["Firmware"];
             /** @description 머신 타입. API가 카탈로그 항목의 아키텍처로 채운다(없으면 이 노드의 것). */
@@ -10335,6 +10679,18 @@ export interface components {
             running: number;
             /** Format: int64 */
             total: number;
+        };
+        /** @description VM의 CPU: 스펙, 지금 켜면 쓸 것, 도는 것, 보류, 노드마다 켤 수 있는지 */
+        VmCpuInfo: {
+            /** @description 이 아키텍처의 노드마다(이름순): 도는 VM은 옮길 수 있는지(기록한 CPU), 꺼진 VM은 켤 수 있는지(스펙) */
+            nodes: components["schemas"]["CpuNodeFit"][];
+            /** @description 다음 전원 껐다 켜기 때 바뀔 것(`status.hardware.pending`의 `cpu`) */
+            pending?: components["schemas"]["PendingChange"];
+            /** @description 지금 VM의 노드에서 켜면 쓸 CPU(노드가 없거나 해석할 수 없으면 없음) */
+            resolved?: components["schemas"]["ResolvedCpu"];
+            /** @description 켤 때 기록한 CPU(도는 VM). 계획 63 전에 켠 VM은 모델만 편 것이다. */
+            running?: components["schemas"]["ResolvedCpu"];
+            spec: components["schemas"]["CpuSpec"];
         };
         /** @description VM의 HA 정책. */
         VmHa: {
@@ -12490,6 +12846,97 @@ export interface operations {
             };
         };
     };
+    get_cpu_baseline: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CpuBaselines"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_cpu_flags: {
+        parameters: {
+            query?: {
+                /** @description 아키텍처. 없으면 노드들의 아키텍처(섞였으면 400)다. */
+                arch?: components["schemas"]["Arch"];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CpuFlags"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_cpu_models: {
+        parameters: {
+            query?: {
+                /** @description 아키텍처(`x86_64`·`aarch64`). 없으면 노드들의 아키텍처(섞였으면 400)다. */
+                arch?: components["schemas"]["Arch"];
+                /** @description 이 노드(id나 이름)에서 켤 수 있는지만 본다. */
+                node?: string;
+                /** @description 켤 수 있는 노드가 있는 모델만 */
+                usable?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CpuModels"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_folders: {
         parameters: {
             query?: {
@@ -13791,6 +14238,66 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_node_cpu: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeCpuInfo"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    refresh_node_cpu: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
             };
             "4XX": {
                 headers: {
@@ -15343,7 +15850,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Resource_SettingsSpec_SettingsStatus"];
+                    "application/json": components["schemas"]["SettingsPatched"];
                 };
             };
             "4XX": {
@@ -16632,6 +17139,36 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vm_cpu: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VmCpuInfo"];
+                };
             };
             "4XX": {
                 headers: {

@@ -21,6 +21,7 @@ use crate::client::{
     UPGRADE_WAIT, fetch_ca, fingerprint, local, seg, task_header, warning_header,
 };
 use crate::config::{CliConfig, default_path};
+use crate::cpu::{CpuArgs, CpuCmd, cpu, cpu_lines, migrate_warnings, node_cpu, vm_cpu};
 use crate::firmware::{
     FirmwareArgs, FirmwareCmd, GuestArgs, Preset, WINDOWS11_CORES, WINDOWS11_MEMORY,
     WINDOWS11_NOTE, apply_preset, caps_cell, check_preset, firmware, firmware_done,
@@ -112,6 +113,11 @@ enum Cmd {
     Vm {
         #[command(subcommand)]
         cmd: VmCmd,
+    },
+    /// 게스트 CPU 모델·플래그와 클러스터 CPU 기준: 쓸 수 있는 모델, 플래그, 기준
+    Cpu {
+        #[command(subcommand)]
+        cmd: CpuCmd,
     },
     /// 템플릿(켤 수 없는 원본 VM): 바꾸기·되돌리기, 목록, 배포(연결 복제·여러 VM)
     Template {
@@ -330,6 +336,13 @@ enum NodeCmd {
     List,
     Get {
         node: String,
+    },
+    /// 노드의 CPU 탐침 결과(QEMU·가속기·호스트 CPU)와 그 노드 QEMU의 CPU 모델(쓸 수 있음·빠진 플래그)
+    Cpu {
+        node: String,
+        /// 먼저 노드 QEMU에 다시 묻는다(Task가 끝날 때까지 기다린다). 보통은 QEMU를 올리면 스스로 다시 읽는다.
+        #[arg(long)]
+        refresh: bool,
     },
     /// 노드의 업데이트 확인 결과(올릴 수 있는 패키지)를 보인다.
     Updates {
@@ -1571,6 +1584,10 @@ enum VmCmd {
     Create(Box<VmCreate>),
     /// VM 설정을 바꾼다. 실행 중이어도 된다.
     Set(VmSet),
+    /// VM의 CPU(스펙·켤 때 쓴 것·전원 껐다 켜기 보류)와 노드마다 켤 수 있는지·빠진 플래그·경고
+    Cpu {
+        vm: String,
+    },
     /// NIC의 보안 그룹을 바꾼다. 실행 중이어도 곧바로 적용된다. 그룹을 주지 않으면 모두 뺀다.
     NicSg {
         vm: String,
@@ -1730,6 +1747,8 @@ struct VmCreate {
     /// CD-ROM 드라이브에 넣을 ISO(`none`은 빈 드라이브). 4번까지 줄 수 있다. 부팅 순서는 디스크 뒤다.
     #[arg(long = "cdrom", value_name = "ISO|none")]
     cdroms: Vec<String>,
+    #[command(flatten)]
+    cpu: CpuArgs,
     /// 부팅 순서(예: `cdrom,disk` — `disk`는 `disk0`, `cdrom`은 `cdrom0`). 목록에 없는 디스크로는 부팅하지 않는다(디스크를
     /// 하나도 적지 않으면 디스크는 목록 뒤에 차례로 온다).
     #[arg(long, value_name = "DEVICE,...")]
@@ -1868,7 +1887,7 @@ fn nic_body(nic: &NicArg) -> Value {
     "cloud_init", "ci_hostname", "ci_user", "ci_password_file", "ci_password_prompt",
     "ci_password_hash", "ci_ssh_keys", "ci_ip", "ci_ip6", "ci_dns", "ci_search", "ci_user_data",
     "ci_vendor_data", "no_cloud_init", "ci_no_password", "ci_clear_ssh_keys", "tpm", "secure_boot",
-    "guest_agent", "agent_freeze", "agent_shutdown"
+    "guest_agent", "agent_freeze", "agent_shutdown", "cpu_model", "cpu_flags", "no_cpu_flags"
 ])))]
 struct VmSet {
     vm: String,
@@ -1911,6 +1930,8 @@ struct VmSet {
     /// 메모리 상한을 뺀다(지금 메모리와 같음).
     #[arg(long, conflicts_with = "max_memory")]
     no_max_memory: bool,
+    #[command(flatten)]
+    cpu: CpuArgs,
     /// 복제 대상 목록을 이것으로 통째로 바꾼다(`vm create --replicate`와 같은 모양, 세 번까지).
     #[arg(long = "replicate", value_name = "NODE[,*/N][,pool=POOL]", value_parser = parse_replica_target)]
     replicate: Vec<ReplicateArg>,
@@ -1987,6 +2008,7 @@ impl VmSet {
             || self.changes_cloud_init()
             || self.fw.changes_other()
             || (self.fw.secure_boot.is_some() && !self.reset_uefi_vars)
+            || self.cpu.given()
     }
 
     /// CPU·메모리를 바꾸는지
@@ -2043,6 +2065,7 @@ fn vm_set_spec(current: &Value, args: &VmSet) -> Value {
     {
         spec.remove("max_memory_mib");
     }
+    args.cpu.apply(spec);
     body
 }
 
@@ -3386,6 +3409,8 @@ struct ImportRunArgs {
     /// 원본 MAC 주소 대신 새 MAC을 받는다.
     #[arg(long)]
     new_macs: bool,
+    #[command(flatten)]
+    cpu: CpuArgs,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -3453,7 +3478,7 @@ fn import_run_body(args: &ImportRunArgs, sources: &[String]) -> anyhow::Result<V
         };
         networks.insert(source, json!(net.network));
     }
-    Ok(json!({
+    let mut body = json!({
         "name": args.name,
         "pool": args.pool,
         "networks": networks,
@@ -3464,7 +3489,9 @@ fn import_run_body(args: &ImportRunArgs, sources: &[String]) -> anyhow::Result<V
         "cores": args.cores,
         "memory_mib": args.memory,
         "keep_macs": !args.new_macs,
-    }))
+    });
+    args.cpu.request_fields(&mut body);
+    Ok(body)
 }
 
 #[derive(Subcommand)]
@@ -3481,7 +3508,10 @@ enum SettingsCmd {
     /// 출처, 쉼표로 여럿, 비우면 같은 출처만), `api_names`(노드 API 인증서에 더할 DNS 이름·IP, 쉼표로 여럿),
     /// `voters`(투표 멤버 상한 3|5|7, 위트니스도 센다), `shutdown_policy`(호스트가 꺼질 때 HA VM:
     /// conditional|freeze|failover|migrate), `ha_reserve`(HA 복구 자리로 비워 둘 용량:
-    /// none|nodes:N|percent:P), `ha_start_concurrency`(HA 복구 때 대상 노드당 동시 시작 수 1~32, 기본 4)
+    /// none|nodes:N|percent:P), `ha_start_concurrency`(HA 복구 때 대상 노드당 동시 시작 수 1~32, 기본 4),
+    /// `cpu.baseline`(클러스터 CPU 기준 off|auto), `cpu.pinned`(아키텍처마다 고정 기준 `x86_64:Haswell-v4,-hle`, `;`로 여럿,
+    /// 비우면 없음), `cpu.auto_flags`(true|false), `cpu.mask`(모든 VM에서 숨길 플래그, 쉼표로 여럿, 비우면 없음 — 다음 전원
+    /// 껐다 켜기부터), `cpu.force=true`(고정 기준을 켤 수 없는 노드가 있어도)
     Set {
         /// 예: `updates.channel=testing`, `web_origins=https://portal.example.com`,
         /// `api_names=orbivisor.example.com,192.168.0.200`, `voters=3`, `shutdown_policy=migrate`,
@@ -3504,7 +3534,34 @@ const SETTING_KEYS: &[&str] = &[
     "two_factor.roles",
     "two_factor.realms",
     "two_factor.rp_id",
+    "cpu.baseline",
+    "cpu.pinned",
+    "cpu.auto_flags",
+    "cpu.mask",
+    "cpu.force",
 ];
+
+/// `cpu.pinned` 값: `x86_64:Haswell-v4,-hle;aarch64:neoverse-n1`(빈 값은 없음)
+fn cpu_pinned_value(v: &str) -> anyhow::Result<Value> {
+    let mut out = Vec::new();
+    for item in v.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        let (arch, rest) = item
+            .split_once(':')
+            .with_context(|| format!("cpu.pinned must be ARCH:MODEL[,±FLAG...] (got {item:?})"))?;
+        let mut parts = rest.split(',').map(str::trim);
+        let model = parts
+            .next()
+            .filter(|m| !m.is_empty())
+            .with_context(|| format!("cpu.pinned {item:?} has no model"))?;
+        let flags = crate::cpu::parse_flags(&parts.collect::<Vec<_>>().join(","))?;
+        let mut pin = json!({ "arch": arch.trim(), "model": model });
+        if !flags.is_empty() {
+            pin["flags"] = json!(flags);
+        }
+        out.push(pin);
+    }
+    Ok(Value::Array(out))
+}
 
 /// `ha_reserve` 값: `none`, `nodes:N`, `percent:P`. 범위는 API가 본다.
 fn ha_reserve_value(v: &str) -> anyhow::Result<Value> {
@@ -3585,6 +3642,16 @@ fn settings_set_body(values: &[String], current_two_factor: &Value) -> anyhow::R
                     policy.retain(|_, v| !v.is_null());
                 }
             }
+            "cpu.baseline" => body["cpu"]["baseline"] = json!(v.trim()),
+            "cpu.pinned" => body["cpu"]["pinned"] = cpu_pinned_value(v)?,
+            "cpu.mask" => body["cpu"]["mask"] = json!(list(v)),
+            "cpu.auto_flags" | "cpu.force" => {
+                let on: bool = v
+                    .trim()
+                    .parse()
+                    .map_err(|_| anyhow::anyhow!("{key} must be true or false (got {v:?})"))?;
+                body["cpu"][&key["cpu.".len()..]] = json!(on);
+            }
             _ => bail!("unknown setting {key}; known: {}", SETTING_KEYS.join(", ")),
         }
     }
@@ -3633,10 +3700,17 @@ async fn settings(
             } else {
                 Value::Null
             };
-            client
+            let written = client
                 .patch("/settings", &settings_set_body(&values, &current)?)
                 .await?;
             writeln!(out, "settings updated")?;
+            // 설정 `cpu`(계획 63): 실행 중 VM은 다음 전원 껐다 켜기까지 그대로다.
+            if let Some(n) = written["affected_running_vms"].as_u64().filter(|n| *n > 0) {
+                writeln!(
+                    out,
+                    "{n} running VM(s) keep their CPU until their next power cycle (`vm reboot`; a reboot inside the guest does not apply it)"
+                )?;
+            }
         }
     }
     Ok(())
@@ -5792,6 +5866,9 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
                     eprintln!("{line}");
                 }
             }
+            NodeCmd::Cpu { node, refresh } => {
+                node_cpu(&client, &node, refresh, json_out, out).await?
+            }
             NodeCmd::Updates { node, refresh } => {
                 node_updates(&client, &node, refresh, json_out, out).await?
             }
@@ -6021,6 +6098,7 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         },
         Cmd::Iso { cmd } => iso(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Vm { cmd } => vm(&client, cmd, json_out, out).await?,
+        Cmd::Cpu { cmd } => cpu(&client, cmd, json_out, out).await?,
         Cmd::Template { cmd } => {
             template(&client, cmd, json_out, out, &mut std::io::stderr()).await?
         }
@@ -7281,6 +7359,8 @@ async fn vm_migrate(
     if force {
         body["force"] = json!(true);
     }
+    // `host` VM을 CPU가 다른 노드로 옮기면 경고한다(막지 않는다, 계획 63).
+    migrate_warnings(client, vm, node, err).await?;
     // 확정이 복제 방향을 뒤집으므로 복제 대상은 보내기 전에 읽는다. 읽지 못하면 POST가 오류를 알린다.
     let before = client.get(&format!("/vms/{}", seg(vm))).await.ok();
     let task = client
@@ -7717,6 +7797,9 @@ async fn vm_get(
     let vm = client.get(&format!("/vms/{}", seg(vm))).await?;
     print_json(out, &vm)?;
     if !json_out {
+        for line in cpu_lines(&vm) {
+            writeln!(err, "{line}")?;
+        }
         if let Some(line) = hardware_line(&vm) {
             writeln!(err, "{line}")?;
         }
@@ -7772,6 +7855,7 @@ async fn vm(
             print_list(out, json_out, &list, VM_HEADERS, vm_row)?;
         }
         VmCmd::Get { vm } => vm_get(client, &vm, json_out, out, &mut std::io::stderr()).await?,
+        VmCmd::Cpu { vm } => vm_cpu(client, &vm, json_out, out).await?,
         VmCmd::Create(args) => {
             let node = match &args.node {
                 Some(key) => Some(client.get(&format!("/nodes/{}", seg(key))).await?),
@@ -7859,6 +7943,7 @@ async fn vm(
             if let Some(n) = args.max_memory {
                 body["spec"]["max_memory_mib"] = json!(n);
             }
+            args.cpu.apply(&mut body["spec"]);
             if !args.replicate.is_empty() {
                 let list = client.get("/nodes").await?;
                 let nodes = list["items"].as_array().cloned().unwrap_or_default();
@@ -7962,6 +8047,12 @@ async fn vm(
             let mut done = Vec::new();
             if args.changes_hardware() {
                 done.push(format!("vm {}: hardware updated", args.vm));
+            }
+            if args.cpu.given() {
+                done.push(format!(
+                    "vm {}: CPU updated (a running VM gets it at the next power cycle: `vm reboot`, not a reboot inside the guest)",
+                    args.vm
+                ));
             }
             if let Some(list) = &args.boot {
                 done.push(format!("vm {}: boot order {list}", args.vm));
@@ -9733,11 +9824,12 @@ mod tests {
              vm web: migrating memory\n"
         );
         {
-            // 복제 대상을 보려고 VM을 먼저 읽는다.
+            // CPU 경고(계획 63)와 복제 대상을 보려고 VM을 먼저 읽는다.
             let seen = seen.lock().unwrap();
-            assert_eq!(seen[0].line, "GET /api/v1/vms/web HTTP/1.1");
-            assert_eq!(seen[1].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
-            assert_eq!(seen[1].body, json!({ "node": "n2", "pool": "fast" }));
+            assert_eq!(seen[0].line, "GET /api/v1/vms/web/cpu HTTP/1.1");
+            assert_eq!(seen[1].line, "GET /api/v1/vms/web HTTP/1.1");
+            assert_eq!(seen[2].line, "POST /api/v1/vms/web/migrate HTTP/1.1");
+            assert_eq!(seen[2].body, json!({ "node": "n2", "pool": "fast" }));
         }
 
         // 풀을 주지 않으면 본문에 `pool`이 없다.
@@ -9746,7 +9838,7 @@ mod tests {
         vm_migrate(&client, "web", "n2", None, false, &mut out, &mut Vec::new())
             .await
             .unwrap();
-        assert_eq!(seen.lock().unwrap()[1].body, json!({ "node": "n2" }));
+        assert_eq!(seen.lock().unwrap()[2].body, json!({ "node": "n2" }));
 
         // `--force`는 줄 때만 보낸다.
         seen.lock().unwrap().clear();
@@ -9762,7 +9854,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            seen.lock().unwrap()[1].body,
+            seen.lock().unwrap()[2].body,
             json!({ "node": "n2", "force": true })
         );
     }
@@ -13926,6 +14018,97 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
 
     /// `node updates`는 확인 시각, 오류, 패키지 표, 잘렸는지를 보인다. `--refresh`면 다시 확인 Task를
     /// 기다린 뒤 읽는다.
+    #[test]
+    fn settings_set_takes_cpu_keys() {
+        let body = settings_set_body(
+            &[
+                "cpu.baseline=auto".into(),
+                "cpu.mask=avx512vbmi, aes".into(),
+                "cpu.pinned=x86_64:Haswell-v4,-hle;aarch64:neoverse-n1".into(),
+                "cpu.auto_flags=false".into(),
+                "cpu.force=true".into(),
+            ],
+            &Value::Null,
+        )
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({ "cpu": {
+                "baseline": "auto",
+                "mask": ["avx512vbmi", "aes"],
+                "pinned": [
+                    { "arch": "x86_64", "model": "Haswell-v4", "flags": ["-hle"] },
+                    { "arch": "aarch64", "model": "neoverse-n1" }
+                ],
+                "auto_flags": false,
+                "force": true
+            } })
+        );
+        assert_eq!(
+            settings_set_body(&["cpu.mask=".into(), "cpu.pinned=".into()], &Value::Null).unwrap(),
+            json!({ "cpu": { "mask": [], "pinned": [] } })
+        );
+        assert!(settings_set_body(&["cpu.pinned=Haswell".into()], &Value::Null).is_err());
+        assert!(
+            settings_set_body(&["cpu.pinned=x86_64:Haswell,hle".into()], &Value::Null).is_err()
+        );
+    }
+
+    #[test]
+    fn vm_cpu_options_parse() {
+        let Cmd::Vm {
+            cmd: VmCmd::Set(set),
+        } = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "set",
+            "web",
+            "--cpu-model",
+            "Icelake-Server",
+            "--cpu-flags",
+            "-avx512vbmi,+aes",
+        ])
+        .unwrap()
+        .cmd
+        else {
+            unreachable!()
+        };
+        let vm = json!({ "spec": { "cpu": { "sockets": 1, "cores": 2 } } });
+        assert_eq!(
+            vm_set_spec(&vm, &set)["spec"]["cpu"],
+            json!({ "sockets": 1, "cores": 2, "model": "Icelake-Server", "flags": ["-avx512vbmi", "+aes"] })
+        );
+        assert!(Cli::try_parse_from(["oplctl", "vm", "set", "web", "--cpu-flags", "avx"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "oplctl",
+                "vm",
+                "set",
+                "web",
+                "--cpu-flags",
+                "-aes",
+                "--no-cpu-flags"
+            ])
+            .is_err()
+        );
+        let Cmd::Vm {
+            cmd: VmCmd::Set(set),
+        } = Cli::try_parse_from(["oplctl", "vm", "set", "web", "--no-cpu-flags"])
+            .unwrap()
+            .cmd
+        else {
+            unreachable!()
+        };
+        let vm = json!({ "spec": { "cpu": { "cores": 2, "flags": ["-aes"] } } });
+        assert_eq!(vm_set_spec(&vm, &set)["spec"]["cpu"], json!({ "cores": 2 }));
+        assert!(
+            Cli::try_parse_from(["oplctl", "cpu", "models", "--arch", "x86_64", "--usable"])
+                .is_ok()
+        );
+        assert!(Cli::try_parse_from(["oplctl", "node", "cpu", "n1", "--refresh"]).is_ok());
+        assert!(Cli::try_parse_from(["oplctl", "vm", "cpu", "web"]).is_ok());
+    }
+
     #[tokio::test]
     async fn node_updates_shows_the_check() {
         fn reply(path: &str) -> Value {
@@ -15325,7 +15508,7 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         let err = settings_set_body(&["updates.mirror=x".into()], &Value::Null).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, two_factor, two_factor.roles, two_factor.realms, two_factor.rp_id"
+            "unknown setting updates.mirror; known: updates.channel, web_origins, api_names, voters, shutdown_policy, ha_reserve, ha_start_concurrency, two_factor, two_factor.roles, two_factor.realms, two_factor.rp_id, cpu.baseline, cpu.pinned, cpu.auto_flags, cpu.mask, cpu.force"
         );
         let err = settings_set_body(&["updates.channel".into()], &Value::Null).unwrap_err();
         assert_eq!(

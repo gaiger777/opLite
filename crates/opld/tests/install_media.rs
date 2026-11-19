@@ -8,7 +8,9 @@
 //! (`OPL_TEST_INSTALL_ISO`, Alpine virt)를 시험의 127.0.0.1 HTTP 서버에서 `iso download`로 받아 BIOS·UEFI VM이 CD에서
 //! 부트로더·커널을 읽는지, 클라우드 이미지(`OPL_TEST_CLOUD_IMAGE`, Ubuntu 24.04)를 `volume download`로 받아 cloud-init이
 //! 호스트 이름·사용자·비밀번호 해시·SSH 키·고정 IPv4를 적용하고 vendor-data의 runcmd가 그 결과를 시험 서버에 보내는지,
-//! 호스트 이름을 바꾸고 다시 켜면 새 instance-id로 다시 적용하는지 본다.
+//! 호스트 이름을 바꾸고 다시 켜면 새 instance-id로 다시 적용하는지 본다. 계획 63: 러너 CPU에 있는 플래그를
+//! `vm create --cpu-flags=-FLAG`로 숨기면 게스트의 `/proc/cpuinfo`에 없고, 실행 중에 지우면 보류로 남다가 `vm reboot`(전원
+//! 껐다 켜기) 뒤에 보이는지 본다.
 //! `cargo test -p opld --features install-media-it,qemu-it --test install_media -- --nocapture`
 #![cfg(feature = "qemu-it")]
 
@@ -647,6 +649,169 @@ urllib.request.urlopen(request, timeout=30)
         d.ctl(&["vm", "stop", "probe", "--force"]).await.unwrap();
         d.ctl(&["vm", "delete", "probe"]).await.unwrap();
         d.ctl(&["volume", "delete", "noble"]).await.unwrap();
+        d.stop();
+    }
+
+    /// 숨길 플래그: 러너 호스트의 `/proc/cpuinfo`에 있는 것 가운데 앞의 것(QEMU 이름, `/proc/cpuinfo` 이름). 러너 CPU를
+    /// 모르므로 차례로 본다.
+    fn host_flag() -> (&'static str, &'static str) {
+        let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap();
+        let flags: Vec<&str> = cpuinfo
+            .lines()
+            .find(|l| l.starts_with("flags"))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, f)| f.split_whitespace().collect())
+            .unwrap_or_default();
+        [
+            ("avx512vbmi", "avx512vbmi"),
+            ("avx2", "avx2"),
+            ("pcid", "pcid"),
+            ("sse4.2", "sse4_2"),
+        ]
+        .into_iter()
+        .find(|(_, name)| flags.contains(name))
+        .expect("the runner CPU has none of avx512vbmi, avx2, pcid, sse4_2")
+    }
+
+    /// 부팅마다 `/proc/cpuinfo`의 플래그와 boot_id를 보내는 vendor-data(cloud-init per-boot 스크립트, 첫 부팅에도 돈다)
+    fn cpu_vendor_data(port: u16) -> String {
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, urllib.request
+flags = ""
+for line in open("/proc/cpuinfo"):
+    if line.startswith("flags"):
+        flags = line.split(":", 1)[1].strip()
+        break
+report = {{
+    "flags": flags.split(),
+    "boot": open("/proc/sys/kernel/random/boot_id").read().strip(),
+}}
+request = urllib.request.Request("http://10.0.2.2:{port}/report", data=json.dumps(report).encode(),
+                                 headers={{"Content-Type": "application/json"}})
+urllib.request.urlopen(request, timeout=30)
+"#
+        );
+        let config = json!({
+            "write_files": [{
+                "path": "/var/lib/cloud/scripts/per-boot/orbi-cpu-report",
+                "content": script,
+                "permissions": "0755",
+            }],
+        });
+        format!(
+            "#cloud-config\n{}\n",
+            serde_json::to_string_pretty(&config).unwrap()
+        )
+    }
+
+    /// 계획 63: 러너 CPU에 있는 플래그를 VM 플래그(`-FLAG`)로 숨겨 클라우드 이미지를 켜면 게스트 `/proc/cpuinfo`에 없다.
+    /// 실행 중에 플래그를 지우면 보류 `cpu`로 남고(CPUID는 QEMU를 띄울 때 정해진다), `vm reboot`(전원 껐다 켜기) 뒤 새
+    /// 부팅에서 보인다.
+    #[tokio::test]
+    async fn a_hidden_cpu_flag_is_absent_in_a_real_guest() {
+        let image = env_path("OPL_TEST_CLOUD_IMAGE");
+        let (qemu_name, cpuinfo_name) = host_flag();
+        eprintln!("hiding {qemu_name} ({cpuinfo_name} in /proc/cpuinfo)");
+        let server = serve(&[("noble.img", &image)]).await;
+        let (mut d, _pool) = daemon("cpu-flags").await;
+        let url = format!("http://127.0.0.1:{}/files/noble.img", server.port);
+        d.ctl(&[
+            "volume",
+            "download",
+            "noble-cpu",
+            "--pool",
+            "local",
+            "--url",
+            &url,
+            "--sha256",
+            &sha256(&image),
+            "--source-format",
+            "qcow2",
+        ])
+        .await
+        .unwrap();
+        // 플래그 이름은 노드가 올린 CPU 카탈로그로 본다(첫 검사 회차가 올린다).
+        common::eventually("the node CPU catalog", || async {
+            d.ctl(&["-o", "json", "node", "cpu", "node1"])
+                .await
+                .ok()
+                .and_then(|out| serde_json::from_str::<Value>(&out).ok())
+                .is_some_and(|v| v["flags"].as_array().is_some_and(|f| !f.is_empty()))
+        })
+        .await;
+        let vendor = d.path("cpu-vendor-data");
+        std::fs::write(&vendor, cpu_vendor_data(server.port)).unwrap();
+        let hide = format!("--cpu-flags=-{qemu_name}");
+        let started = d
+            .ctl(&[
+                "vm",
+                "create",
+                "cpu-probe",
+                "--memory",
+                "1024",
+                "--machine",
+                "q35",
+                "--disk",
+                "noble-cpu",
+                "--nic",
+                "user",
+                &hide,
+                "--ci-user",
+                "orbi",
+                "--ci-vendor-data",
+                vendor.to_str().unwrap(),
+                "--start",
+            ])
+            .await;
+        if let Err(e) = started {
+            diagnose(&d, &["cpu-probe"], Some(&server)).await;
+            panic!("vm cpu-probe did not start: {e}");
+        }
+        let vm = d.ctl_json(&["vm", "get", "cpu-probe"]).await;
+        assert_eq!(
+            vm["status"]["hardware"]["cpu_resolved"]["flags"],
+            json!({ qemu_name: false }),
+            "{vm}"
+        );
+        let has = |report: &Value| {
+            report["flags"]
+                .as_array()
+                .is_some_and(|f| f.iter().any(|x| x == cpuinfo_name))
+        };
+        let first = wait_report(&d, &server, 1).await;
+        assert!(
+            first["flags"].as_array().is_some_and(|f| !f.is_empty()),
+            "{first}"
+        );
+        assert!(
+            !has(&first),
+            "{cpuinfo_name} is visible in the guest: {first}"
+        );
+
+        // 실행 중에 지우면 보류로 남는다(도는 QEMU의 CPUID는 그대로).
+        d.ctl(&["vm", "set", "cpu-probe", "--no-cpu-flags"])
+            .await
+            .unwrap();
+        let vm = d.ctl_json(&["vm", "get", "cpu-probe"]).await;
+        let pending = vm["status"]["hardware"]["pending"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(pending.iter().any(|p| p["field"] == "cpu"), "{vm}");
+        d.ctl(&["vm", "reboot", "cpu-probe"]).await.unwrap();
+        let second = wait_report(&d, &server, 2).await;
+        assert_ne!(second["boot"], first["boot"], "{second}");
+        assert!(
+            has(&second),
+            "{cpuinfo_name} is not back after a power cycle: {second}"
+        );
+
+        d.ctl(&["vm", "stop", "cpu-probe", "--force"])
+            .await
+            .unwrap();
+        d.ctl(&["vm", "delete", "cpu-probe"]).await.unwrap();
+        d.ctl(&["volume", "delete", "noble-cpu"]).await.unwrap();
         d.stop();
     }
 }

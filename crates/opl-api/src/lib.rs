@@ -18,6 +18,7 @@ mod ceph;
 mod ceph_agent;
 pub mod cluster;
 mod console;
+mod cpu;
 mod cpu_baseline;
 mod drain;
 pub mod error;
@@ -96,6 +97,7 @@ pub use backup_jobs::{BackupJobScheduler, BackupJobSchedulerConfig};
 pub use balancer::{Balancer, BalancerConfig};
 pub use ceph::CephPeerSource;
 pub use ceph_agent::CephAgent;
+pub use cpu::CpuRefresher;
 pub use drain::start_drain;
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, LEASE_EXPIRED, RecoveryWriter};
@@ -193,6 +195,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_node, r::update_node, cluster::delete_node))
         .routes(routes!(ceph::list_node_disks))
         .routes(routes!(updates::refresh_updates))
+        .routes(routes!(cpu::get_node_cpu))
+        .routes(routes!(cpu::refresh_node_cpu))
         .routes(routes!(updates::upgrade_node))
         .routes(routes!(drain::drain_node))
         .routes(routes!(drain::unfreeze_node))
@@ -234,6 +238,9 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(cluster::join))
         .routes(routes!(settings::get_settings, settings::patch_settings))
         .routes(routes!(settings::reset_telemetry_id))
+        .routes(routes!(cpu::list_cpu_models))
+        .routes(routes!(cpu::list_cpu_flags))
+        .routes(routes!(cpu::get_cpu_baseline))
         .routes(routes!(telemetry::preview_telemetry))
         .routes(routes!(
             subscription::get_subscription,
@@ -295,6 +302,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vms::replicate_vm))
         .routes(routes!(vms::convert_template, vms::untemplate_vm))
         .routes(routes!(vm_firmware::reset_firmware))
+        .routes(routes!(cpu::get_vm_cpu))
         .routes(routes!(guest::get_guest))
         .routes(routes!(guest::set_guest_password))
         .routes(routes!(metrics::get_vm_metrics))

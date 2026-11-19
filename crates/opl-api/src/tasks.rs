@@ -148,6 +148,8 @@ pub struct TaskRunnerConfig {
     /// 지운 VM의 상태 디렉터리(`{state_dir}/vm/{id}`)는 마지막으로 바뀐 지 이만큼 지나야 지운다(계획 59 §10, 기본
     /// 1시간). 정리는 `tag_sweep`마다 돈다.
     pub state_dir_min_age: Duration,
+    /// 이 노드의 CPU 다시 읽기(계획 63). 없으면 `node-cpu-probe` Task는 실패한다.
+    pub cpu: Option<Arc<dyn crate::cpu::CpuRefresher>>,
 }
 
 impl TaskRunnerConfig {
@@ -178,6 +180,7 @@ impl TaskRunnerConfig {
             ceph: None,
             download_allow_private: false,
             state_dir_min_age: firmware::STATE_DIR_MIN_AGE,
+            cpu: None,
         }
     }
 }
@@ -998,6 +1001,10 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             None => Err("updates are not enabled on this node".into()),
         },
         TaskOp::NodeDrain => drain::drain(ctx, id).await,
+        TaskOp::NodeCpuProbe => match &ctx.config.cpu {
+            Some(cpu) => cpu.refresh().await,
+            None => Err("this node does not read CPU models (a witness)".into()),
+        },
         // 성공해도 다음 재시작 때 적용할 변경이 있으면 경고로 남긴다.
         TaskOp::VmHotplug => return hotplug::hotplug(ctx, task).await,
         // VM이 이 노드에서 돌지 않아 건너뛴 회차는 경고로 남긴다.
