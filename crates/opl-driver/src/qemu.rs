@@ -88,6 +88,11 @@ const INCOMING_MARK: &str = "incoming";
 const MIGRATION_POLL: Duration = Duration::from_secs(1);
 /// 원본이 끝난 뒤 받는 쪽이 마지막 장치 상태를 다 읽기를 기다리는 한도
 const INCOMING_WAIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// 받는 쪽이 받는 QEMU를 띄우기 전에 SDN NIC의 OVN 포트가 이 노드에서 켜지기(`ovn-installed`)를 기다리는 시간(계획 65 §10).
+/// 넘으면 받기를 거절해 마이그레이션이 시작 전에 실패한다(VM은 원본에 그대로).
+const OVN_INCOMING_WAIT: Duration = Duration::from_secs(30);
+/// 켤 때는 OVN 바인딩을 기다리지 않는다. 이만큼 지나도 `ovn-installed`가 없으면 경고만 남긴다.
+const OVN_START_WARN: Duration = Duration::from_secs(10);
 /// 시간 제한으로 `migrate_cancel`한 뒤 마이그레이션이 끝나기를 기다리는 한도
 const CANCEL_WAIT: Duration = Duration::from_secs(30);
 /// 마이그레이션이 끝난 뒤 원본이 `finish-migrate`를 벗어났는지 다시 묻는 간격
@@ -418,7 +423,8 @@ impl QemuHypervisor {
             // 띄우는 도중에 opld가 죽어도 남은 QEMU가 받는 쪽임을 알 수 있게 먼저 쓴다.
             std::fs::write(paths.dir.join(INCOMING_MARK), task.to_string())?;
         }
-        self.create_taps(vm).await?;
+        let taps = self.create_taps(vm).await?;
+        self.wait_ovn_ports(vm.id, &taps, incoming).await?;
         // 계획 64: QEMU·swtpm의 모든 스레드(나중 일꾼·vhost 포함)가 물려받을 친화. 고정이 있으면 에뮬레이터 집합이고, 없어도
         // opld가 예약 CPU에 묶여 있으면 온라인 CPU 전체로 다시 건다(설정을 지운 직후 등 — 리뷰 1).
         let child_cpus = vm
@@ -529,27 +535,16 @@ impl QemuHypervisor {
         Ok(())
     }
 
-    /// 브리지 NIC마다 tap을 만들어 브리지에 붙인다. 하나라도 실패하면 만든 것을 지운다.
-    async fn create_taps(&self, vm: &VmRuntimeSpec) -> Result<(), DriverError> {
+    /// 브리지 NIC마다 tap을 만들어 브리지에 붙인다(SDN NIC는 OVS `br-int`에). 하나라도 실패하면 만든 것을 지운다.
+    /// 만든 tap을 돌려준다.
+    async fn create_taps(&self, vm: &VmRuntimeSpec) -> Result<Vec<Tap>, DriverError> {
         let taps: Vec<Tap> = vm
             .nics
             .iter()
-            .filter_map(|nic| match &nic.backend {
-                NicBackend::Tap {
-                    ifname,
-                    bridge,
-                    vlan,
-                    ..
-                } => Some(Tap {
-                    ifname: ifname.clone(),
-                    bridge: bridge.clone(),
-                    vlan: *vlan,
-                }),
-                NicBackend::User => None,
-            })
+            .filter_map(|nic| Tap::from_nic(vm.id, nic))
             .collect();
         if taps.is_empty() {
-            return Ok(());
+            return Ok(taps);
         }
         // create_tap은 같은 이름의 장치를 먼저 지우므로, 이 VM의 이름이 아니면 호스트 인터페이스를 지울 수 있다.
         let prefix = tap_prefix(vm.id);
@@ -570,6 +565,46 @@ impl QemuHypervisor {
                 return Err(e);
             }
         }
+        Ok(taps)
+    }
+
+    /// SDN tap의 OVN 포트가 이 노드에서 켜지기를(`ovn-installed`) 기다린다(계획 65 §10). 마이그레이션을 받을 때(`incoming`)는
+    /// 받는 QEMU를 띄우기 전에 [`OVN_INCOMING_WAIT`]까지 기다리고, 오지 않으면 실패한다(호출자가 tap을 지운다) — 원본 Task가
+    /// `requested-chassis`를 "원본,대상"으로 바꿨으므로 이 노드도 포트를 바인딩하고, `activation-strategy=rarp`라 QEMU가
+    /// 끝에 보내는 RARP 전까지 막혀 있다. 켤 때는 기다리지 않는다: OvnSync가 `requested-chassis`를 이 노드로 바꾸기 전에는
+    /// 바인딩되지 않을 수 있고 게스트 DHCP가 다시 묻는다. [`OVN_START_WARN`] 뒤에도 오지 않으면 경고만 남긴다.
+    async fn wait_ovn_ports(
+        &self,
+        id: Uuid,
+        taps: &[Tap],
+        incoming: bool,
+    ) -> Result<(), DriverError> {
+        let ovn: Vec<String> = taps
+            .iter()
+            .filter(|t| t.ovn.is_some())
+            .map(|t| t.ifname.clone())
+            .collect();
+        let Some(net) = self.config.net.clone().filter(|_| !ovn.is_empty()) else {
+            return Ok(());
+        };
+        if incoming {
+            for ifname in &ovn {
+                if let Err(e) = net.wait_ovn_installed(ifname, OVN_INCOMING_WAIT).await {
+                    return Err(DriverError::Migration(format!(
+                        "OVN did not activate the SDN port {ifname} on this node in {}s: {e}",
+                        OVN_INCOMING_WAIT.as_secs()
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        tokio::spawn(async move {
+            for ifname in &ovn {
+                if let Err(e) = net.wait_ovn_installed(ifname, OVN_START_WARN).await {
+                    tracing::warn!(%id, tap = %ifname, error = %e, "the SDN port is not bound on this node yet; the guest gets its network once OVN binds it");
+                }
+            }
+        });
         Ok(())
     }
 
@@ -2303,18 +2338,14 @@ impl Hypervisor for QemuHypervisor {
         if devices.contains(&format!("nic{index}")) {
             return Ok(AddOutcome::AlreadyPresent);
         }
-        // 브리지 NIC는 켤 때(create_taps)처럼 이 VM 이름의 tap을 먼저 만든다.
-        let tap = match &nic.backend {
-            NicBackend::Tap {
-                ifname,
-                bridge,
-                vlan,
-                ..
-            } => {
+        // 브리지 NIC는 켤 때(create_taps)처럼 이 VM 이름의 tap을 먼저 만든다(SDN NIC는 OVS `br-int`에).
+        let tap = match Tap::from_nic(id, nic) {
+            Some(tap) => {
                 let prefix = tap_prefix(id);
-                if !ifname.starts_with(&prefix) {
+                if !tap.ifname.starts_with(&prefix) {
                     return Err(DriverError::InvalidSpec(format!(
-                        "tap name {ifname:?} does not start with {prefix:?}"
+                        "tap name {:?} does not start with {prefix:?}",
+                        tap.ifname
                     )));
                 }
                 let Some(net) = &self.config.net else {
@@ -2322,15 +2353,10 @@ impl Hypervisor for QemuHypervisor {
                         "bridge networks are not supported on this node".into(),
                     ));
                 };
-                let tap = Tap {
-                    ifname: ifname.clone(),
-                    bridge: bridge.clone(),
-                    vlan: *vlan,
-                };
                 net.create_tap(&tap).await?;
                 Some((net, tap.ifname))
             }
-            NicBackend::User => None,
+            None => None,
         };
         let backend = match &nic.backend {
             NicBackend::User => json!({ "type": "user", "id": netdev }),
@@ -8418,6 +8444,7 @@ time.sleep(60)
                 bridge: "vmbr0".into(),
                 vlan: None,
                 mtu: None,
+                ovn_port: None,
             },
         });
         let err = hv.start(&vm, None).await.unwrap_err();
@@ -8440,6 +8467,7 @@ time.sleep(60)
                 bridge: "vmbr0".into(),
                 vlan: None,
                 mtu: None,
+                ovn_port: None,
             },
         });
         match hv.start(&vm, None).await.unwrap_err() {
@@ -8470,6 +8498,8 @@ time.sleep(60)
         calls: Mutex<Vec<String>>,
         /// 참이면 tap 하나 지우기가 실패한다.
         fail_delete: Mutex<bool>,
+        /// 참이면 OVN 포트가 켜지지 않는다(`wait_ovn_installed`가 시간을 넘긴다).
+        ovn_down: Mutex<bool>,
     }
 
     #[async_trait]
@@ -8478,8 +8508,23 @@ time.sleep(60)
             Ok(vec![])
         }
         async fn create_tap(&self, tap: &Tap) -> Result<(), DriverError> {
-            let call = format!("create {} {} {:?}", tap.ifname, tap.bridge, tap.vlan);
+            let mut call = format!("create {} {} {:?}", tap.ifname, tap.bridge, tap.vlan);
+            if let Some(ovn) = &tap.ovn {
+                call.push_str(&format!(" ovn={} {} {:?}", ovn.iface_id, ovn.mac, ovn.mtu));
+            }
             self.calls.lock().unwrap().push(call);
+            Ok(())
+        }
+        async fn wait_ovn_installed(
+            &self,
+            ifname: &str,
+            timeout: Duration,
+        ) -> Result<(), DriverError> {
+            let call = format!("wait {ifname} {}s", timeout.as_secs());
+            self.calls.lock().unwrap().push(call);
+            if *self.ovn_down.lock().unwrap() {
+                return Err(DriverError::Timeout("ovn-installed"));
+            }
             Ok(())
         }
         async fn delete_vm_taps(&self, vm: Uuid) -> Result<(), DriverError> {
@@ -8920,6 +8965,113 @@ time.sleep(60)
         );
     }
 
+    /// SDN(OVN) NIC: br-int의 tap과 논리 포트
+    fn sdn_nic(id: Uuid, index: usize) -> RuntimeNic {
+        let mac = "52:54:00:12:34:58".parse().unwrap();
+        RuntimeNic {
+            mac,
+            model: NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: tap_name(id, index),
+                bridge: "br-int".into(),
+                vlan: None,
+                mtu: Some(1442),
+                ovn_port: Some(opl_types::sdn::port_name(id, mac)),
+            },
+        }
+    }
+
+    /// 마이그레이션을 받는 쪽은 받는 QEMU를 띄우기 전에 SDN tap을 붙이고 OVN 포트가 켜지기를 30초까지 기다린다. 켜지지
+    /// 않으면 QEMU 없이 tap을 지우고 마이그레이션 오류다(원본 Task가 시작 전에 실패한다).
+    #[tokio::test]
+    async fn incoming_waits_for_the_ovn_port_before_qemu() {
+        let tmp = short_tempdir();
+        let net = Arc::new(RecordingNet::default());
+        let mut cfg = config(tmp.path(), PathBuf::from("false"));
+        cfg.net = Some(net.clone());
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let mut vm = spec();
+        vm.nics.push(tap_nic(vm.id, 0));
+        vm.nics.push(sdn_nic(vm.id, 1));
+        let (plain, sdn) = (tap_name(vm.id, 0), tap_name(vm.id, 1));
+        let port = opl_types::sdn::port_name(vm.id, vm.nics[1].mac);
+
+        *net.ovn_down.lock().unwrap() = true;
+        let err = hv
+            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
+            .await
+            .unwrap_err();
+        match err {
+            DriverError::Migration(msg) => {
+                assert!(msg.contains("OVN did not activate"), "{msg}");
+                assert!(msg.contains(&sdn), "{msg}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        assert_eq!(
+            *net.calls.lock().unwrap(),
+            [
+                format!("create {plain} br0 Some(10)"),
+                format!("create {sdn} br-int None ovn={port} 52:54:00:12:34:58 Some(1442)"),
+                format!("wait {sdn} 30s"),
+                format!("delete-vm {}", vm.id),
+            ]
+        );
+        assert!(!tmp.path().join("run/vm").join(vm.id.to_string()).exists());
+
+        // 포트가 켜지면 QEMU를 띄운다(여기서는 곧바로 끝나는 `false`).
+        net.calls.lock().unwrap().clear();
+        *net.ovn_down.lock().unwrap() = false;
+        let err = hv
+            .start_incoming(&vm, Uuid::now_v7(), "127.0.0.1", 60000..=60099, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::StartFailed(_)), "{err:?}");
+        assert_eq!(
+            net.calls.lock().unwrap()[2..4],
+            [format!("wait {sdn} 30s"), format!("delete-vm {}", vm.id)]
+        );
+    }
+
+    /// 켤 때는 OVN 바인딩을 기다리지 않는다(뒤에서 10초 지켜보고 경고만). SDN NIC가 없는 VM은 OVN을 보지 않는다.
+    #[tokio::test]
+    async fn start_does_not_wait_for_ovn_and_plain_taps_never_look() {
+        let tmp = short_tempdir();
+        let net = Arc::new(RecordingNet::default());
+        let mut cfg = config(tmp.path(), PathBuf::from("false"));
+        cfg.net = Some(net.clone());
+        let hv = QemuHypervisor::new(cfg).await.unwrap();
+        let mut vm = spec();
+        vm.nics.push(tap_nic(vm.id, 0));
+        let plain = tap_name(vm.id, 0);
+        assert!(hv.start(&vm, None).await.is_err());
+        assert_eq!(
+            *net.calls.lock().unwrap(),
+            [
+                format!("create {plain} br0 Some(10)"),
+                format!("delete-vm {}", vm.id),
+            ]
+        );
+
+        net.calls.lock().unwrap().clear();
+        *net.ovn_down.lock().unwrap() = true;
+        vm.nics.push(sdn_nic(vm.id, 1));
+        let sdn = tap_name(vm.id, 1);
+        // 포트가 켜지지 않아도 켜기는 QEMU까지 간다(`false`라 실패).
+        assert!(matches!(
+            hv.start(&vm, None).await,
+            Err(DriverError::StartFailed(_))
+        ));
+        let wait = format!("wait {sdn} 10s");
+        for _ in 0..100 {
+            if net.calls.lock().unwrap().contains(&wait) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(net.calls.lock().unwrap().contains(&wait));
+    }
+
     fn tap_nic(id: Uuid, index: usize) -> RuntimeNic {
         RuntimeNic {
             mac: "52:54:00:12:34:57".parse().unwrap(),
@@ -8929,6 +9081,7 @@ time.sleep(60)
                 bridge: "br0".into(),
                 vlan: Some(10),
                 mtu: Some(1450),
+                ovn_port: None,
             },
         }
     }

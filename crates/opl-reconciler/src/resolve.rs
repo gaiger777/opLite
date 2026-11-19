@@ -487,7 +487,6 @@ pub async fn runtime_medium(
     result.map(Some)
 }
 
-/// NIC 하나(`vm.spec.nics[index]`)의 런타임 정의. tap 이름은 순번으로 정한다([`tap_name`]).
 /// NIC들 `nics`가 쓰는 SDN 네트워크마다 그 서브넷(cloud-init network-config용, 계획 65). 단순 네트워크는 넣지 않는다.
 fn sdn_subnets(
     cluster: &Cluster,
@@ -507,8 +506,11 @@ fn sdn_subnets(
     Ok(out)
 }
 
+/// NIC 하나(`vm.spec.nics[index]`)의 런타임 정의. tap 이름은 순번으로 정한다([`tap_name`]). SDN(OVN) 네트워크면
+/// `bridge`가 `br-int`이고 논리 포트 이름(`ovn_port`, OVS 포트의 `iface-id`)을 단다(계획 65).
 pub fn runtime_nic(cluster: &Cluster, vm: &Vm, index: usize) -> Result<RuntimeNic, ResolveError> {
     let nic = vm.spec.nics.get(index).ok_or(ResolveError::NoNic(index))?;
+    let mac = nic.mac.ok_or(ResolveError::MissingMac(index))?;
     let backend = if nic.network == USER_NETWORK {
         NicBackend::User
     } else {
@@ -520,10 +522,14 @@ pub fn runtime_nic(cluster: &Cluster, vm: &Vm, index: usize) -> Result<RuntimeNi
             bridge: network.spec.bridge_name(),
             vlan: network.spec.vlan,
             mtu: network.spec.mtu(),
+            ovn_port: network
+                .spec
+                .is_sdn()
+                .then(|| opl_types::sdn::port_name(vm.id, mac)),
         }
     };
     Ok(RuntimeNic {
-        mac: nic.mac.ok_or(ResolveError::MissingMac(index))?,
+        mac,
         model: nic.model,
         backend,
     })

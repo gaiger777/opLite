@@ -17,6 +17,7 @@ use opl_types::numa::{
 use opl_types::placement::{HaGroup, HaGroupSpec, PlacementRule, PlacementRuleSpec};
 use opl_types::replication::{ReplicaVolume, replica_ready};
 use opl_types::runtime::ImageFormat;
+use opl_types::sdn::ChassisState;
 use opl_types::settings::{HaReserve, SETTINGS_NAME, SettingsSpec};
 use opl_types::storage::{
     StoragePool, StoragePoolSpec, Volume, VolumeSpec, is_shared, pool_usable_on,
@@ -33,7 +34,7 @@ use crate::volumes::block_pool_kind;
 pub enum ScheduleError {
     /// 노드 조건([`node_fits`])에 맞는 노드가 없다.
     #[error(
-        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, has a firewall (nftables) for VMs with security groups, can run its CPU model, has room for its dedicated CPUs, hugepages and NUMA layout and, for an HA VM, has HA fencing)"
+        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, is an SDN (OVN) chassis for VMs on SDN networks, has a firewall (nftables) for VMs with security groups, can run its CPU model, has room for its dedicated CPUs, hugepages and NUMA layout and, for an HA VM, has HA fencing)"
     )]
     NoNode,
     /// 노드 조건에 맞는 노드는 있지만 모두 이 hard 규칙(이름 순)을 어긴다.
@@ -220,7 +221,7 @@ impl Inventory {
     }
 
     /// 이 VM의 네트워크가 쓰는 브리지(VXLAN이면 `oplv<vni>`)가 모두 이 노드에 있는지.
-    /// VLAN을 쓰면 VLAN-aware여야 한다.
+    /// VLAN을 쓰면 VLAN-aware여야 한다. SDN 네트워크(OVS `br-int`)는 [`Self::has_sdn`]이 본다.
     fn has_bridges(&self, spec: &VmSpec, node: &Node) -> bool {
         spec.nics
             .iter()
@@ -229,11 +230,29 @@ impl Inventory {
                 let Some(network) = self.networks.iter().find(|n| n.name == nic.network) else {
                     return false;
                 };
+                if network.spec.is_sdn() {
+                    return true;
+                }
                 node.status.bridges.iter().any(|b| {
                     b.name == network.spec.bridge_name()
                         && (network.spec.vlan.is_none() || b.vlan_filtering)
                 })
             })
+    }
+
+    /// SDN(OVN) 네트워크 NIC가 있는 VM이면 이 노드가 준비된 chassis인지(계획 65 §10). 위트니스·macOS·chassis를 깔지 않은
+    /// 노드는 `NodeStatus.sdn`이 없거나 `Ready`가 아니다. SDN NIC가 없는 VM은 보지 않는다.
+    fn has_sdn(&self, spec: &VmSpec, node: &Node) -> bool {
+        let sdn = spec.nics.iter().any(|nic| {
+            self.networks
+                .iter()
+                .any(|n| n.name == nic.network && n.spec.is_sdn())
+        });
+        !sdn || node
+            .status
+            .sdn
+            .as_ref()
+            .is_some_and(|s| s.chassis == ChassisState::Ready)
     }
 
     /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지. 공유가 아닌 풀의 볼륨은 그 파일이 있는
@@ -890,6 +909,11 @@ fn fits(
     if !inv.has_bridges(spec, node) {
         return Err(format!(
             "node {name:?} does not have the bridges of the VM's networks"
+        ));
+    }
+    if !inv.has_sdn(spec, node) {
+        return Err(format!(
+            "node {name:?} is not a ready SDN (OVN) chassis for the VM's SDN networks"
         ));
     }
     if spec.has_firewall() && !node.status.firewall {
@@ -2157,6 +2181,55 @@ mod tests {
             security_groups: Vec::new(),
         }];
         assert_eq!(sched(&me, &inv), Ok(ready.id));
+    }
+
+    /// SDN(OVN) NIC가 있는 VM은 준비된 chassis에만 간다(br-int는 Linux 브리지 목록에 없다). SDN NIC가 없는 VM은
+    /// chassis를 보지 않는다.
+    #[test]
+    fn sdn_vms_need_a_ready_chassis() {
+        use opl_types::sdn::NodeSdn;
+        let chassis = |n: &mut Node, state: ChassisState| {
+            n.status.sdn = Some(NodeSdn {
+                chassis: state,
+                ..Default::default()
+            });
+        };
+        // 가장 넉넉한 노드부터: 없음, 구성 중, 끊김, 준비됨(가장 작다)
+        let none = node(64000);
+        let mut configuring = node(32000);
+        chassis(&mut configuring, ChassisState::Configuring);
+        let mut down = node(16000);
+        chassis(&mut down, ChassisState::Down);
+        let mut ready = node(1024);
+        chassis(&mut ready, ChassisState::Ready);
+        let tenant: Network = Resource::new(
+            "tenant",
+            serde_json::from_value(serde_json::json!({ "sdn": {} })).unwrap(),
+        );
+        let inv = Inventory {
+            nodes: vec![none.clone(), configuring.clone(), down, ready.clone()],
+            networks: vec![tenant],
+            ..Default::default()
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        assert_eq!(sched(&me, &inv), Ok(none.id));
+        me.nics = vec![NicSpec {
+            ips: Vec::new(),
+            network: "tenant".into(),
+            model: NicModel::Virtio,
+            mac: None,
+            security_groups: Vec::new(),
+        }];
+        assert_eq!(sched(&me, &inv), Ok(ready.id));
+        assert_eq!(
+            node_fits(&me, &inv, &configuring),
+            Err("node \"n\" is not a ready SDN (OVN) chassis for the VM's SDN networks".into())
+        );
+        let inv = Inventory {
+            nodes: vec![none, configuring],
+            ..inv
+        };
+        assert_eq!(sched(&me, &inv), Err(NoNode));
     }
 
     #[test]

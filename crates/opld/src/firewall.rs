@@ -2,6 +2,7 @@
 //! `bridge opl_<태그>` 하나로 넣는다(VM이 어느 노드에 있든 — 마이그레이션·복구로 언제 올지 모른다).
 //! 워커가 VM을 켜기 직전에 부르는 확인([`FirewallGate`])도 같은 일을 한다.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,7 +12,7 @@ use opl_cluster::Cluster;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::{Firewall, FirewallNic, ruleset};
 use opl_reconciler::FirewallGate;
-use opl_types::network::tap_name;
+use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::resource::Kind;
 use opl_types::security_group::{Action, Direction, Rule, SecurityGroup, SecurityGroupSpec};
 use opl_types::vm::{NicSpec, Vm, VmSpec};
@@ -31,8 +32,19 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// 보되 그 NIC의 규칙 끝에 나가기 차단을 더한다(들어오기·나가기 모두 앞 규칙에 맞는 것만 통한다).
 /// 실행 중인 VM은 스펙의 NIC에 더해 도는 QEMU에 아직 붙은 NIC(`status.hardware.nics`, MAC으로 맞춤 — 스펙에서
 /// 뺐지만 게스트가 아직 내려 주지 않은 것)도 기록된 보안 그룹으로 막는다. 같은 순번(같은 tap)에 스펙의 다른 NIC가
-/// 있으면 tap은 QEMU에 붙은 NIC의 것이므로 기록된 NIC가 이긴다.
-pub fn firewall_nics(vms: &[Vm], groups: &[SecurityGroup]) -> Vec<FirewallNic> {
+/// 있으면 tap은 QEMU에 붙은 NIC의 것이므로 기록된 NIC가 이긴다. SDN(OVN) 네트워크(`networks`에서 `sdn`인 것)의 NIC는
+/// 건너뛴다: 그 tap은 OVS 포트라 Linux 브리지 nftables 훅을 타지 않는다(계획 65 — API가 SDN NIC의 보안 그룹을 받지
+/// 않으므로 방어로, 66이 OVN ACL로 옮긴다).
+pub fn firewall_nics(
+    vms: &[Vm],
+    groups: &[SecurityGroup],
+    networks: &[Network],
+) -> Vec<FirewallNic> {
+    let sdn: BTreeSet<&str> = networks
+        .iter()
+        .filter(|n| n.spec.is_sdn())
+        .map(|n| n.name.as_str())
+        .collect();
     let mut nics = Vec::new();
     for vm in vms {
         let running = vm.status.hardware.iter().flat_map(|hw| {
@@ -56,7 +68,7 @@ pub fn firewall_nics(vms: &[Vm], groups: &[SecurityGroup]) -> Vec<FirewallNic> {
             .enumerate()
             .filter(|(i, nic)| !taken(*i, nic));
         for (i, nic) in wanted.chain(running) {
-            if nic.security_groups.is_empty() {
+            if nic.security_groups.is_empty() || sdn.contains(nic.network.as_str()) {
                 continue;
             }
             let Some(mac) = nic.mac else {
@@ -126,7 +138,8 @@ impl FirewallRules {
         const READ: &str = "cannot read cluster state for the firewall";
         let (_, vms) = self.cluster.list::<VmSpec>().context(READ)?;
         let (_, groups) = self.cluster.list::<SecurityGroupSpec>().context(READ)?;
-        let text = ruleset(&self.tag, &firewall_nics(&vms, &groups));
+        let (_, networks) = self.cluster.list::<NetworkSpec>().context(READ)?;
+        let text = ruleset(&self.tag, &firewall_nics(&vms, &groups, &networks));
         if !force && last.as_deref() == Some(text.as_str()) {
             return Ok(false);
         }
@@ -399,7 +412,7 @@ mod tests {
         );
         let c = vm("c", None, vec![nic(Some(mac(6)), &[])]);
         assert_eq!(
-            firewall_nics(&[a.clone(), b.clone(), c], &groups),
+            firewall_nics(&[a.clone(), b.clone(), c], &groups, &[]),
             vec![
                 FirewallNic {
                     tap: tap_name(a.id, 1),
@@ -418,7 +431,38 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(firewall_nics(&[], &groups), vec![]);
+        assert_eq!(firewall_nics(&[], &groups, &[]), vec![]);
+    }
+
+    /// SDN(OVN) 네트워크의 NIC는 방화벽 NIC가 아니다(그 tap은 OVS 포트다). 같은 VM의 단순 NIC는 그대로다.
+    #[test]
+    fn sdn_nics_are_skipped() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let groups = vec![group("ssh", vec![ssh.clone()])];
+        let mut sdn_nic = nic(Some(mac(2)), &["ssh"]);
+        sdn_nic.network = "tenant".into();
+        let a = [vm("a", None, vec![nic(Some(mac(1)), &["ssh"]), sdn_nic])];
+        let tenant: Network = Resource::new(
+            "tenant",
+            serde_json::from_value(serde_json::json!({ "sdn": {} })).unwrap(),
+        );
+        let lan: Network = Resource::new(
+            "lan",
+            serde_json::from_value(serde_json::json!({ "bridge": "vmbr0" })).unwrap(),
+        );
+        let plain = FirewallNic {
+            tap: tap_name(a[0].id, 0),
+            mac: mac(1),
+            rules: vec![ssh.clone()],
+        };
+        assert_eq!(
+            firewall_nics(&a, &groups, &[tenant, lan.clone()]),
+            vec![plain.clone()]
+        );
+        // 네트워크가 SDN이 아니면 둘 다다.
+        assert_eq!(firewall_nics(&a, &groups, &[lan]).len(), 2);
     }
 
     /// 스펙에서 뺐지만 도는 QEMU에 아직 붙은 NIC(게스트가 내려 주지 않음)는 기록된 보안 그룹으로 계속 막는다.
@@ -436,7 +480,7 @@ mod tests {
         a.status.hardware = Some(opl_types::vm::RunningHardware::legacy(&a.spec));
         a.spec.nics.pop();
         assert_eq!(
-            firewall_nics(&[a.clone()], &groups),
+            firewall_nics(&[a.clone()], &groups, &[]),
             vec![FirewallNic {
                 tap: tap_name(a.id, 1),
                 mac: mac(2),
@@ -445,7 +489,7 @@ mod tests {
         );
         // QEMU가 내려 주면(기록에서도 빠지면) 규칙이 없다.
         a.status.hardware = Some(opl_types::vm::RunningHardware::legacy(&a.spec));
-        assert_eq!(firewall_nics(&[a], &groups), vec![]);
+        assert_eq!(firewall_nics(&[a], &groups, &[]), vec![]);
     }
 
     /// 스펙의 NIC와 QEMU에 아직 붙은 다른 NIC가 같은 순번(같은 tap)이면 QEMU의 NIC 규칙이 이긴다.
@@ -467,7 +511,7 @@ mod tests {
         // NIC 1을 떼고 다른 NIC를 붙이는 중: 게스트가 아직 mac(2)를 내려 주지 않았다.
         a.spec.nics[1] = nic(Some(mac(3)), &["web"]);
         assert_eq!(
-            firewall_nics(&[a.clone()], &groups),
+            firewall_nics(&[a.clone()], &groups, &[]),
             vec![FirewallNic {
                 tap: tap_name(a.id, 1),
                 mac: mac(2),

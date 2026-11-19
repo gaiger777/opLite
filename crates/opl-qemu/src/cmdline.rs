@@ -713,6 +713,7 @@ mod tests {
                         bridge: "vmbr0".into(),
                         vlan: Some(10),
                         mtu: None,
+                        ovn_port: None,
                     },
                 },
                 RuntimeNic {
@@ -797,6 +798,7 @@ mod tests {
             bridge: "oplv1000".into(),
             vlan: None,
             mtu: Some(1450),
+            ovn_port: None,
         };
         spec.nics[0].backend = tap.clone();
         spec.nics[1].backend = tap;
@@ -805,6 +807,31 @@ mod tests {
             &"virtio-net-pci,netdev=net0,mac=52:54:00:12:34:56,id=nic0,host_mtu=1450".to_string()
         ));
         assert!(args.contains(&"e1000e,netdev=net1,mac=52:54:00:12:34:57,id=nic1".to_string()));
+    }
+
+    /// SDN(OVN) NIC의 명령줄은 같은 MTU의 tap NIC와 바이트까지 같다(계획 65 §10): 논리 포트는 드라이버가 tap을 OVS에
+    /// 붙일 때만 쓴다. 그래서 SDN NIC가 없는 VM의 명령줄도 그대로다.
+    #[test]
+    fn sdn_tap_has_the_command_line_of_a_tap() {
+        let tap = |ovn_port: Option<&str>| NicBackend::Tap {
+            ifname: "tap0i0".into(),
+            bridge: "br-int".into(),
+            vlan: None,
+            mtu: Some(1442),
+            ovn_port: ovn_port.map(Into::into),
+        };
+        let mut plain = x86_spec();
+        plain.nics[0].backend = tap(None);
+        let mut sdn = plain.clone();
+        sdn.nics[0].backend = tap(Some("opl-x-525400123456"));
+        for build in [build_cmdline, build_incoming_cmdline] {
+            let args = build(&sdn, &x86_host(), &paths()).unwrap();
+            assert_eq!(args, build(&plain, &x86_host(), &paths()).unwrap());
+            assert!(
+                args.contains(&"tap,id=net0,ifname=tap0i0,script=no,downscript=no".to_string())
+            );
+            assert!(!args.iter().any(|a| a.contains("opl-x")), "{args:?}");
+        }
     }
 
     /// 게스트 감시를 켠 VM만 QGA 채널(소켓 서버, virtio-serial 포트)을 단다. 받는 쪽도 같다. aarch64(virt)도

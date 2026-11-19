@@ -1,13 +1,18 @@
 //! VM NIC를 Linux 브리지에 잇는 tap 장치와 VXLAN 네트워크의 장치. iproute2(`ip`, `bridge`) 명령을
 //! 부르므로 opld가 root(또는 CAP_NET_ADMIN)로 돌아야 한다. `bridge` 네트워크의 브리지는 관리자가
 //! 미리 만들고, VXLAN 네트워크의 브리지(`oplv<vni>`)와 VXLAN 장치(`oplx<vni>`)는 opld가 만든다.
+//! SDN(OVN) 네트워크의 tap은 `ovs-vsctl`로 OVS 통합 브리지 `br-int`에 붙이고 `external_ids:iface-id`를 논리 포트
+//! 이름으로 둔다(계획 65) — ovn-controller가 그 포트를 바인딩한다.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use opl_types::network::{VXLAN_PORT, is_managed_ifname, tap_prefix, vxlan_bridge, vxlan_device};
 use opl_types::node::BridgeInfo;
+use opl_types::runtime::{NicBackend, RuntimeNic};
+use opl_types::vm::MacAddr;
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -19,7 +24,55 @@ pub struct Tap {
     pub ifname: String,
     pub bridge: String,
     pub vlan: Option<u16>,
+    /// SDN(OVN) NIC면 OVS 포트로 붙일 때 쓰는 것(계획 65). 없으면 Linux 브리지 tap이다.
+    pub ovn: Option<OvnPort>,
 }
+
+/// OVS 통합 브리지에 붙이는 SDN tap의 OVN 칸(`Interface.external_ids`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OvnPort {
+    /// 논리 포트 이름(`iface-id`)
+    pub iface_id: String,
+    /// 게스트 NIC의 MAC(`attached-mac`)
+    pub mac: MacAddr,
+    /// VM id(`vm-uuid`)
+    pub vm: Uuid,
+    /// 망 MTU. tap을 이 MTU로 만든다(OVS 브리지에는 맞출 Linux 브리지 MTU가 없다).
+    pub mtu: Option<u16>,
+}
+
+impl Tap {
+    /// VM `vm`의 런타임 NIC가 tap이면 그 tap(SDN NIC면 OVN 칸과 함께). user NIC는 None.
+    pub fn from_nic(vm: Uuid, nic: &RuntimeNic) -> Option<Self> {
+        match &nic.backend {
+            NicBackend::Tap {
+                ifname,
+                bridge,
+                vlan,
+                mtu,
+                ovn_port,
+            } => Some(Self {
+                ifname: ifname.clone(),
+                bridge: bridge.clone(),
+                vlan: *vlan,
+                ovn: ovn_port.as_ref().map(|port| OvnPort {
+                    iface_id: port.clone(),
+                    mac: nic.mac,
+                    vm,
+                    mtu: *mtu,
+                }),
+            }),
+            NicBackend::User => None,
+        }
+    }
+}
+
+/// `ovs-vsctl`이 ovsdb-server·ovs-vswitchd를 기다리는 한도(초). 없으면 OVS가 멈춘 노드에서 끝없이 기다린다.
+const OVS_TIMEOUT: &str = "--timeout=10";
+/// `wait_ovn_installed`가 다시 보는 간격
+const OVN_INSTALLED_POLL: Duration = Duration::from_millis(250);
+/// OVS의 커널 데이터패스 장치. OVS 포트인 장치의 `master`다.
+const OVS_MASTER: &str = "ovs-system";
 
 /// 이 노드가 가져야 할 VXLAN 네트워크 하나
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +103,14 @@ pub trait HostNet: Send + Sync + std::fmt::Debug {
     async fn delete_vm_taps(&self, vm: Uuid) -> Result<(), DriverError>;
     /// tap 하나를 지운다(실행 중 뗀 NIC). 없으면 아무것도 하지 않는다.
     async fn delete_tap(&self, ifname: &str) -> Result<(), DriverError>;
+    /// OVS 포트 `ifname`(SDN tap)에 ovn-controller가 흐름을 다 깔았다고(`Interface.external_ids:ovn-installed=true`)
+    /// 쓸 때까지 `timeout`까지 기다린다. OVS가 없는 호스트 네트워크(시험의 가짜)는 기본으로 거절한다.
+    async fn wait_ovn_installed(&self, ifname: &str, timeout: Duration) -> Result<(), DriverError> {
+        let _ = timeout;
+        Err(DriverError::InvalidSpec(format!(
+            "{ifname}: SDN (OVN) ports are not supported on this node"
+        )))
+    }
     /// VXLAN 네트워크의 장치를 `desired`에 맞춘다. alias가 `opl:<tag>`인 관리 이름 장치만 내 것으로 보고,
     /// `desired`에 없는 내 장치는 지운다. 한 네트워크가 실패해도 나머지는 맞추고 오류를 모아 돌려준다.
     async fn sync_overlays(
@@ -83,12 +144,41 @@ impl IpRoute {
         self
     }
 
+    /// 명령 하나. `ip`·`bridge`는 시험 이름공간에서 부른다(`ovs-vsctl`은 이름공간이 없다 — OVS DB는 호스트에 하나다).
     async fn run(
         &self,
         program: &'static str,
         args: &[impl AsRef<str>],
     ) -> Result<String, DriverError> {
+        if program == "ovs-vsctl" {
+            return run(program, args).await;
+        }
         run(program, &netns_args(self.netns.as_deref(), args)).await
+    }
+
+    /// 장치 `ifname`을 지운다. `ovs`면(OVS 포트) 먼저 OVS 포트를 지운다(아니면 OVS DB에 장치 없는 포트가 남는다).
+    async fn delete_port_and_link(&self, ifname: &str, ovs: bool) -> Result<(), DriverError> {
+        if ovs {
+            self.run(
+                "ovs-vsctl",
+                &[OVS_TIMEOUT, "--if-exists", "del-port", ifname],
+            )
+            .await?;
+        }
+        self.delete_link(ifname).await
+    }
+
+    /// SDN tap(`ovn`)을 만들어 OVS 통합 브리지에 붙인다. 실패하면 OVS 포트와 장치를 지운다.
+    async fn create_ovs_tap(&self, tap: &Tap, ovn: &OvnPort) -> Result<(), DriverError> {
+        // 이전 VM 인스턴스가 남긴 같은 이름의 tap(OVS 포트는 `--may-exist`로 다시 쓴다)
+        self.delete_link(&tap.ifname).await?;
+        for (program, args) in ovs_tap_commands(tap, ovn, self.tag.as_deref()) {
+            if let Err(e) = self.run(program, &args).await {
+                let _ = self.delete_port_and_link(&tap.ifname, true).await;
+                return Err(e);
+            }
+        }
+        Ok(())
     }
 
     async fn delete_link(&self, ifname: &str) -> Result<(), DriverError> {
@@ -161,6 +251,9 @@ impl HostNet for IpRoute {
     }
 
     async fn create_tap(&self, tap: &Tap) -> Result<(), DriverError> {
+        if let Some(ovn) = &tap.ovn {
+            return self.create_ovs_tap(tap, ovn).await;
+        }
         let out = self
             .run("ip", &["-j", "-d", "link", "show", "type", "bridge"])
             .await?;
@@ -201,7 +294,10 @@ impl HostNet for IpRoute {
         // 하나가 실패해도 나머지 tap은 지운다.
         let mut result = Ok(());
         for link in links.iter().filter(|l| l.ifname.starts_with(&prefix)) {
-            if let Err(e) = self.delete_link(&link.ifname).await {
+            if let Err(e) = self
+                .delete_port_and_link(&link.ifname, link.is_ovs_port())
+                .await
+            {
                 result = result.and(Err(e));
             }
         }
@@ -209,7 +305,38 @@ impl HostNet for IpRoute {
     }
 
     async fn delete_tap(&self, ifname: &str) -> Result<(), DriverError> {
-        self.delete_link(ifname).await
+        let out = self.run("ip", &["-j", "link", "show"]).await?;
+        let links: Vec<Link> = serde_json::from_str(&out).map_err(bad_output)?;
+        let ovs = links.iter().any(|l| l.ifname == ifname && l.is_ovs_port());
+        self.delete_port_and_link(ifname, ovs).await
+    }
+
+    async fn wait_ovn_installed(&self, ifname: &str, timeout: Duration) -> Result<(), DriverError> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let out = self
+                .run(
+                    "ovs-vsctl",
+                    &[
+                        OVS_TIMEOUT,
+                        "--if-exists",
+                        "get",
+                        "Interface",
+                        ifname,
+                        "external_ids:ovn-installed",
+                    ],
+                )
+                .await?;
+            if ovn_installed(&out) {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DriverError::Timeout(
+                    "ovn-controller to install the port (ovn-installed)",
+                ));
+            }
+            tokio::time::sleep(OVN_INSTALLED_POLL).await;
+        }
     }
 
     async fn sync_overlays(
@@ -666,6 +793,45 @@ fn tap_commands(tap: &Tap, default_pvid: u16, mtu: Option<u32>) -> Vec<Command> 
     cmds
 }
 
+/// SDN tap을 만들어 OVS 통합 브리지에 붙이고 올리는 명령(설계 §10): 장치 → 망 MTU → `ovs-vsctl add-port`와
+/// `Interface.external_ids`(`iface-id` = 논리 포트, `attached-mac`, `iface-status`, `vm-uuid`, 이 클러스터의 태그 —
+/// 에이전트의 오래된 포트 청소가 보는 표시) → 올리기. `--may-exist`라 이전 인스턴스가 남긴 같은 이름의 OVS 포트는 칸만
+/// 다시 쓴다.
+fn ovs_tap_commands(tap: &Tap, ovn: &OvnPort, tag: Option<&str>) -> Vec<Command> {
+    let dev = tap.ifname.as_str();
+    let mut cmds = vec![("ip", args(&["tuntap", "add", "dev", dev, "mode", "tap"]))];
+    if let Some(mtu) = ovn.mtu {
+        let mtu = mtu.to_string();
+        cmds.push(("ip", args(&["link", "set", "dev", dev, "mtu", &mtu])));
+    }
+    let mut ovs = args(&[
+        OVS_TIMEOUT,
+        "--may-exist",
+        "add-port",
+        &tap.bridge,
+        dev,
+        "--",
+        "set",
+        "Interface",
+        dev,
+    ]);
+    ovs.push(format!("external_ids:iface-id={}", ovn.iface_id));
+    ovs.push(format!("external_ids:attached-mac=\"{}\"", ovn.mac));
+    ovs.push("external_ids:iface-status=active".into());
+    ovs.push(format!("external_ids:vm-uuid={}", ovn.vm));
+    if let Some(tag) = tag {
+        ovs.push(format!("external_ids:orbivisor-cluster={tag}"));
+    }
+    cmds.push(("ovs-vsctl", ovs));
+    cmds.push(("ip", args(&["link", "set", "dev", dev, "up"])));
+    cmds
+}
+
+/// `ovs-vsctl --if-exists get Interface X external_ids:ovn-installed`의 출력이 참인지(값은 따옴표 친 문자열이다)
+fn ovn_installed(out: &str) -> bool {
+    out.trim().trim_matches('"') == "true"
+}
+
 fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
@@ -707,7 +873,16 @@ struct Link {
     #[serde(default)]
     mtu: Option<u32>,
     #[serde(default)]
+    master: Option<String>,
+    #[serde(default)]
     linkinfo: Option<LinkInfo>,
+}
+
+impl Link {
+    /// OVS 브리지의 포트인지(커널 데이터패스 `ovs-system`이 master)
+    fn is_ovs_port(&self) -> bool {
+        self.master.as_deref() == Some(OVS_MASTER)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -767,7 +942,78 @@ mod tests {
             ifname: "op0123456789n0".into(),
             bridge: "vmbr0".into(),
             vlan,
+            ovn: None,
         }
+    }
+
+    #[test]
+    fn sdn_tap_joins_br_int_with_its_iface_id() {
+        let vm: Uuid = "01234567-89ab-cdef-0123-456789abcdef".parse().unwrap();
+        let mac: MacAddr = "52:54:00:12:34:56".parse().unwrap();
+        let nic = RuntimeNic {
+            mac,
+            model: opl_types::vm::NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: "op6789abcdefn1".into(),
+                bridge: "br-int".into(),
+                vlan: None,
+                mtu: Some(1442),
+                ovn_port: Some(opl_types::sdn::port_name(vm, mac)),
+            },
+        };
+        let tap = Tap::from_nic(vm, &nic).unwrap();
+        let ovn = tap.ovn.clone().unwrap();
+        assert_eq!(
+            joined(ovs_tap_commands(&tap, &ovn, Some("0123456789ab"))),
+            [
+                "ip tuntap add dev op6789abcdefn1 mode tap",
+                "ip link set dev op6789abcdefn1 mtu 1442",
+                "ovs-vsctl --timeout=10 --may-exist add-port br-int op6789abcdefn1 -- set Interface op6789abcdefn1 \
+                 external_ids:iface-id=opl-01234567-89ab-cdef-0123-456789abcdef-525400123456 \
+                 external_ids:attached-mac=\"52:54:00:12:34:56\" external_ids:iface-status=active \
+                 external_ids:vm-uuid=01234567-89ab-cdef-0123-456789abcdef external_ids:orbivisor-cluster=0123456789ab",
+                "ip link set dev op6789abcdefn1 up",
+            ]
+        );
+        // 태그가 없으면(클러스터 전) 표시를 달지 않는다.
+        let untagged = joined(ovs_tap_commands(&tap, &ovn, None));
+        assert!(!untagged[2].contains("orbivisor-cluster"), "{untagged:?}");
+    }
+
+    #[test]
+    fn plain_taps_have_no_ovn_port() {
+        // 계획 65 전의 런타임 NIC(브리지·VXLAN)는 OVN 칸이 없는 tap이다 — tap 명령도 그대로다.
+        let vm = Uuid::nil();
+        let nic = RuntimeNic {
+            mac: "52:54:00:12:34:56".parse().unwrap(),
+            model: opl_types::vm::NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: "op0123456789n0".into(),
+                bridge: "vmbr0".into(),
+                vlan: Some(10),
+                mtu: Some(1450),
+                ovn_port: None,
+            },
+        };
+        assert_eq!(Tap::from_nic(vm, &nic), Some(tap(Some(10))));
+        let user = RuntimeNic {
+            backend: NicBackend::User,
+            ..nic
+        };
+        assert_eq!(Tap::from_nic(vm, &user), None);
+    }
+
+    #[test]
+    fn reads_ovn_installed_and_ovs_ports() {
+        assert!(ovn_installed("\"true\"\n"));
+        assert!(!ovn_installed(""));
+        assert!(!ovn_installed("\"false\"\n"));
+        let links: Vec<Link> = serde_json::from_str(
+            r#"[{"ifname":"op0123456789n0","master":"ovs-system"},{"ifname":"op0123456789n1","master":"vmbr0"},{"ifname":"op0123456789n2"}]"#,
+        )
+        .unwrap();
+        let ovs: Vec<bool> = links.iter().map(Link::is_ovs_port).collect();
+        assert_eq!(ovs, [true, false, false]);
     }
 
     fn joined(cmds: Vec<(&'static str, Vec<String>)>) -> Vec<String> {

@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 use crate::node::Node;
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::vm::MacAddr;
 
 pub type Sdn = Resource<SdnSpec, SdnStatus>;
 
@@ -31,6 +32,13 @@ pub const GENEVE_PORT: u16 = 6081;
 pub const DEFAULT_SDN_MTU: u16 = 1442;
 /// 구성할 수 있는 OVN의 가장 낮은 판(24.03 LTS)
 pub const MIN_OVN: (u32, u32) = (24, 3);
+
+/// VM `vm`의 NIC(MAC `mac`) 논리 포트 이름 `opl-<VM id>-<MAC 12자리 16진>`. MAC은 클러스터에서 하나라 겹치지 않고 NIC
+/// 순서가 바뀌어도 같은 포트다. 노드의 OVS 포트 `external_ids:iface-id`가 이 이름이다(reconciler가 실행 정의에 넣는다).
+pub fn port_name(vm: Uuid, mac: MacAddr) -> String {
+    let hex: String = mac.0.iter().map(|b| format!("{b:02x}")).collect();
+    format!("opl-{vm}-{hex}")
+}
 
 /// 지금은 칸이 없다(계획 66이 게이트웨이 노드를 더한다).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

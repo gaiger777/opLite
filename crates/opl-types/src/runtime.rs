@@ -224,9 +224,14 @@ pub enum NicBackend {
         ifname: String,
         bridge: String,
         vlan: Option<u16>,
-        /// VXLAN 네트워크의 MTU. virtio NIC에 `host_mtu`로 알린다.
+        /// VXLAN·SDN 네트워크의 MTU. virtio NIC에 `host_mtu`로 알린다.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mtu: Option<u16>,
+        /// SDN(OVN) 네트워크의 논리 포트 이름(계획 65, [`crate::sdn::port_name`]). 있으면 `bridge`는 OVS 통합 브리지
+        /// `br-int`이고, 드라이버가 tap을 OVS 포트로 붙여 `external_ids:iface-id`를 이 이름으로 둔다. 없으면 Linux 브리지 tap
+        /// 그대로다(옛 정의는 바이트까지 같다).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ovn_port: Option<String>,
     },
 }
 
@@ -327,10 +332,48 @@ mod tests {
             bridge: "oplv1000".into(),
             vlan: None,
             mtu: Some(1450),
+            ovn_port: None,
         };
         let json = serde_json::to_value(&vxlan).unwrap();
         assert_eq!(json["mtu"], 1450);
         assert_eq!(serde_json::from_value::<NicBackend>(json).unwrap(), vxlan);
+    }
+
+    #[test]
+    fn runtime_nic_ovn_port_is_optional() {
+        // 계획 65 전의 정의(브리지·VXLAN tap, user)는 ovn_port 없이 읽히고 다시 쓰면 바이트까지 같다.
+        for old in [
+            r#"{"mac":"52:54:00:12:34:56","model":"virtio","backend":{"kind":"tap","ifname":"op0123456789n0","bridge":"vmbr0","vlan":10}}"#,
+            r#"{"mac":"52:54:00:12:34:56","model":"virtio","backend":{"kind":"tap","ifname":"op0123456789n0","bridge":"oplv1000","vlan":null,"mtu":1450}}"#,
+            r#"{"mac":"52:54:00:12:34:56","model":"e1000e","backend":{"kind":"user"}}"#,
+        ] {
+            let nic: RuntimeNic = serde_json::from_str(old).unwrap();
+            assert!(
+                !matches!(
+                    nic.backend,
+                    NicBackend::Tap {
+                        ovn_port: Some(_),
+                        ..
+                    }
+                ),
+                "{old}"
+            );
+            assert_eq!(serde_json::to_string(&nic).unwrap(), old);
+        }
+        let sdn = RuntimeNic {
+            mac: "52:54:00:12:34:56".parse().unwrap(),
+            model: NicModel::Virtio,
+            backend: NicBackend::Tap {
+                ifname: "op0123456789n0".into(),
+                bridge: "br-int".into(),
+                vlan: None,
+                mtu: Some(1442),
+                ovn_port: Some("opl-x-525400123456".into()),
+            },
+        };
+        let json = serde_json::to_value(&sdn).unwrap();
+        assert_eq!(json["backend"]["ovn_port"], "opl-x-525400123456");
+        assert_eq!(serde_json::from_value::<RuntimeNic>(json).unwrap(), sdn);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use opl_driver::ovn::ovsdb::{
 use opl_types::ipam;
 use opl_types::network::{Network, Subnet};
 use opl_types::node::Node;
-use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase};
+use opl_types::vm::{PowerState, Vm, VmPhase};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -96,12 +96,8 @@ pub const ACTIVATION_STRATEGY: &str = "activation-strategy";
 /// DHCP 임대 시간(초)
 pub const LEASE_TIME: u32 = 86400;
 
-/// VM `vm`의 NIC(MAC `mac`) 논리 포트 이름 `opl-<VM id>-<MAC 12자리 16진>`. MAC은 클러스터에서 하나라 겹치지 않고 NIC
-/// 순서가 바뀌어도 같은 포트다. 노드의 OVS 포트 `external_ids:iface-id`가 이 이름이다(스테이지 5).
-pub fn port_name(vm: Uuid, mac: MacAddr) -> String {
-    let hex: String = mac.0.iter().map(|b| format!("{b:02x}")).collect();
-    format!("opl-{vm}-{hex}")
-}
+/// 논리 포트 이름(노드의 OVS 포트 `iface-id`와 같다 — reconciler와 함께 쓰므로 opl-types에 있다)
+pub use opl_types::sdn::port_name;
 
 /// IPv4 서브넷 `subnet`(네트워크 `network`)의 DHCP_Options 칸(§8.3): 서버 주소 = 게이트웨이, 서버 MAC, 임대 시간, 망 MTU,
 /// DNS 서버(IPv4만, 있을 때). `router`는 넣지 않는다 — 65에는 라우터가 없고, 단순 네트워크 NIC를 함께 쓰는 VM의 기본
