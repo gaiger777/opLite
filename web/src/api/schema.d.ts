@@ -3891,6 +3891,13 @@ export interface components {
             /** @description 넣은 ISO 볼륨(`content: iso`)의 이름. 없으면 빈 드라이브다. */
             iso?: string;
         };
+        /** @description 중앙 노드의 ovsdb Raft 역할과 northd */
+        CentralHealth: {
+            nb: components["schemas"]["RaftRole"];
+            /** @description 이 노드의 northd가 SB 잠금을 가져 일하고 있다(나머지는 대기). */
+            northd_active?: boolean;
+            sb: components["schemas"]["RaftRole"];
+        };
         CephHealth: {
             /** @default [] */
             checks: components["schemas"]["CephHealthCheck"][];
@@ -4070,6 +4077,8 @@ export interface components {
          * @enum {string}
          */
         Channel: "stable" | "testing" | "enterprise";
+        /** @enum {string} */
+        ChassisState: "missing" | "configuring" | "ready" | "down" | "unknown";
         /** @description 한 노드에서 검사 하나의 결과. 노드가 리스 갱신에 실어 리더에 보내고(판단용), 노드 상태에도 쓴다(화면용). */
         CheckReport: {
             /** @description 실패·degraded·unknown의 이유(200바이트까지) */
@@ -4697,7 +4706,7 @@ export interface components {
                 [key: string]: string;
             };
             name: string;
-            /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
+            /** @description `bridge`·`vxlan`·`sdn` 중 정확히 하나를 쓴다. */
             spec: {
                 /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
                 bridge?: string;
@@ -4708,9 +4717,13 @@ export interface components {
                 folder?: string;
                 /**
                  * Format: int32
-                 * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+                 * @description VXLAN·SDN 네트워크의 MTU(1280~9000, 기본 1450·1442). `vxlan`·`sdn`과만 쓴다.
                  */
                 mtu?: number;
+                /** @description OVN 논리 스위치(Geneve)로 만드는 SDN 네트워크(계획 65). 없으면 쓰지 않아 옛 노드도 네트워크를 푼다. */
+                sdn?: components["schemas"]["SdnNet"];
+                /** @description SDN 네트워크의 서브넷(주소 체계마다 하나까지, 계획 65). `sdn`과만 쓰고 비면 쓰지 않는다. */
+                subnets?: components["schemas"]["Subnet"][];
                 /**
                  * Format: int32
                  * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
@@ -5823,6 +5836,13 @@ export interface components {
             /** @enum {string} */
             mode: "static";
         };
+        /** @description 주소 범위(양 끝 포함) */
+        IpRange: {
+            /** Format: ip */
+            end: string;
+            /** Format: ip */
+            start: string;
+        };
         /**
          * @description `ipmitool [-I lanplus] -H address -p port -U user -E chassis power off|status`. 비밀번호는 명령 인자가 아니라
          *     `IPMI_PASSWORD` 환경 변수로 넘긴다.
@@ -5975,7 +5995,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn";
         /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
         LdapRealm: {
             /** @description 사용자를 찾을 기준 DN(subtree) */
@@ -6493,7 +6513,7 @@ export interface components {
                  * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
                  */
                 revision: number;
-                /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
+                /** @description `bridge`·`vxlan`·`sdn` 중 정확히 하나를 쓴다. */
                 spec: {
                     /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
                     bridge?: string;
@@ -6504,9 +6524,13 @@ export interface components {
                     folder?: string;
                     /**
                      * Format: int32
-                     * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+                     * @description VXLAN·SDN 네트워크의 MTU(1280~9000, 기본 1450·1442). `vxlan`·`sdn`과만 쓴다.
                      */
                     mtu?: number;
+                    /** @description OVN 논리 스위치(Geneve)로 만드는 SDN 네트워크(계획 65). 없으면 쓰지 않아 옛 노드도 네트워크를 푼다. */
+                    sdn?: components["schemas"]["SdnNet"];
+                    /** @description SDN 네트워크의 서브넷(주소 체계마다 하나까지, 계획 65). `sdn`과만 쓰고 비면 쓰지 않는다. */
+                    subnets?: components["schemas"]["Subnet"][];
                     /**
                      * Format: int32
                      * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
@@ -6623,6 +6647,11 @@ export interface components {
                     pools: {
                         [key: string]: components["schemas"]["PoolState"];
                     };
+                    /**
+                     * @description 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
+                     *     쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
+                     */
+                    sdn?: components["schemas"]["NodeSdn"];
                     /**
                      * @description 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
                      *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
@@ -7344,7 +7373,7 @@ export interface components {
             /** @description 루트에 있는 객체(폴더 없음)의 권한 */
             root_contents: string[];
         };
-        /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
+        /** @description `bridge`·`vxlan`·`sdn` 중 정확히 하나를 쓴다. */
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
             bridge?: string;
@@ -7355,9 +7384,13 @@ export interface components {
             folder?: string;
             /**
              * Format: int32
-             * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+             * @description VXLAN·SDN 네트워크의 MTU(1280~9000, 기본 1450·1442). `vxlan`·`sdn`과만 쓴다.
              */
             mtu?: number;
+            /** @description OVN 논리 스위치(Geneve)로 만드는 SDN 네트워크(계획 65). 없으면 쓰지 않아 옛 노드도 네트워크를 푼다. */
+            sdn?: components["schemas"]["SdnNet"];
+            /** @description SDN 네트워크의 서브넷(주소 체계마다 하나까지, 계획 65). `sdn`과만 쓰고 비면 쓰지 않는다. */
+            subnets?: components["schemas"]["Subnet"][];
             /**
              * Format: int32
              * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
@@ -7370,6 +7403,11 @@ export interface components {
         /** @enum {string} */
         NicModel: "virtio" | "e1000e";
         NicSpec: {
+            /**
+             * @description SDN 네트워크 NIC의 주소(주소 체계마다 하나까지, 계획 65). 네트워크에 서브넷이 있으면 API가 IPAM으로 채운다(MAC
+             *     처럼). 비면 쓰지 않아 옛 노드도 VM을 푼다.
+             */
+            ips?: string[];
             mac?: components["schemas"]["MacAddr"] | null;
             model: components["schemas"]["NicModel"];
             /** @description Network 리소스 이름 */
@@ -7631,6 +7669,23 @@ export interface components {
              */
             t: number;
         };
+        /** @description 노드의 SDN 상태(`NodeStatus.sdn`). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만 쓴다. */
+        NodeSdn: {
+            /** @description 이 노드가 중앙이면 NB·SB Raft 역할과 northd */
+            central?: components["schemas"]["CentralHealth"];
+            /** @default missing */
+            chassis: components["schemas"]["ChassisState"];
+            /**
+             * Format: ip
+             * @description Geneve 터널의 이 노드 주소(`ovn-encap-ip`)
+             */
+            encap_ip?: string;
+            error?: string;
+            /** @description `ovn-controller --version`의 판 */
+            ovn_version?: string;
+            /** @description `ovs-vsctl --version`의 판 */
+            ovs_version?: string;
+        };
         /** @description 한 노드의 점들(시각 순) */
         NodeSeries: {
             /** Format: uuid */
@@ -7737,6 +7792,11 @@ export interface components {
             pools: {
                 [key: string]: components["schemas"]["PoolState"];
             };
+            /**
+             * @description 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
+             *     쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
+             */
+            sdn?: components["schemas"]["NodeSdn"];
             /**
              * @description 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
              *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
@@ -8464,6 +8524,11 @@ export interface components {
             quota: components["schemas"]["FolderQuota"];
             usage: components["schemas"]["FolderUsage"];
         };
+        /**
+         * @description ovsdb 클러스터에서 이 서버의 역할(`cluster/status`)
+         * @enum {string}
+         */
+        RaftRole: "leader" | "follower" | "candidate" | "joining" | "down" | "unknown";
         /** @description 영역이 사용자를 확인하는 방법 */
         RealmBackend: (components["schemas"]["LdapRealm"] & {
             /** @enum {string} */
@@ -9248,7 +9313,7 @@ export interface components {
              * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
              */
             revision: number;
-            /** @description `bridge`와 `vxlan` 중 정확히 하나를 쓴다. */
+            /** @description `bridge`·`vxlan`·`sdn` 중 정확히 하나를 쓴다. */
             spec: {
                 /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
                 bridge?: string;
@@ -9259,9 +9324,13 @@ export interface components {
                 folder?: string;
                 /**
                  * Format: int32
-                 * @description VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+                 * @description VXLAN·SDN 네트워크의 MTU(1280~9000, 기본 1450·1442). `vxlan`·`sdn`과만 쓴다.
                  */
                 mtu?: number;
+                /** @description OVN 논리 스위치(Geneve)로 만드는 SDN 네트워크(계획 65). 없으면 쓰지 않아 옛 노드도 네트워크를 푼다. */
+                sdn?: components["schemas"]["SdnNet"];
+                /** @description SDN 네트워크의 서브넷(주소 체계마다 하나까지, 계획 65). `sdn`과만 쓰고 비면 쓰지 않는다. */
+                subnets?: components["schemas"]["Subnet"][];
                 /**
                  * Format: int32
                  * @description VLAN 태그(1~4094). `bridge`와만 쓰고, 브리지가 VLAN-aware(`vlan_filtering 1`)여야 한다.
@@ -9374,6 +9443,11 @@ export interface components {
                 pools: {
                     [key: string]: components["schemas"]["PoolState"];
                 };
+                /**
+                 * @description 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
+                 *     쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
+                 */
+                sdn?: components["schemas"]["NodeSdn"];
                 /**
                  * @description 호스트가 꺼지는 중이라 이 노드가 종료 정책대로 정리하며 남긴 표시. 노드가 다시 등록할 때 지운다. 리더는
                  *     `freeze` 표시가 있는 오프라인 노드의 HA VM을 옮기지 않는다(옛 노드는 이 필드를 무시한다).
@@ -10066,6 +10140,8 @@ export interface components {
         };
         /** @enum {string} */
         ScheduleEvery: "hourly" | "daily" | "weekly";
+        /** @description SDN(OVN) 네트워크. 지금은 칸이 없다(계획 66이 공급자 네트워크 `provider`를 더한다). */
+        SdnNet: Record<string, never>;
         /**
          * @description 둘째 단계 방법
          * @enum {string}
@@ -10433,6 +10509,26 @@ export interface components {
          * @enum {string}
          */
         SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job";
+        /** @description SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다. */
+        Subnet: {
+            /**
+             * @description 범위(IPv4 `/8`~`/29`, IPv6 `/48`~`/124`). 접두사 밖 비트가 켜져 있으면 받지 않는다.
+             * @example 10.10.0.0/24
+             */
+            cidr: string;
+            description?: string;
+            /** @description OVN DHCP로 주소를 준다. 없으면 IPv4는 참, IPv6는 거짓(IPv6 DHCP는 아직 없어 거짓만 받는다). */
+            dhcp?: boolean;
+            /** @description DHCP·cloud-init이 알려 줄 DNS 서버(4개까지) */
+            dns_servers?: string[];
+            /**
+             * Format: ip
+             * @description 게이트웨이 주소. 없으면 첫 호스트 주소다. 라우터가 없어도 늘 예약해 VM에 주지 않는다.
+             */
+            gateway?: string;
+            /** @description 자동 할당 범위(16개까지, 겹치지 않게). 없으면 CIDR 전체에서 예약을 뺀 것이다. */
+            pools?: components["schemas"]["IpRange"][];
+        };
         /** @description 읽을 때 계산한 구독 상태. 키 문자열은 담지 않는다. */
         SubscriptionInfo: {
             customer?: string;
@@ -10691,6 +10787,20 @@ export interface components {
             previous?: string;
             /** Format: int32 */
             running_vms?: number;
+        } | {
+            /** Format: ip */
+            address?: string;
+            /** @enum {string} */
+            kind: "sdn-init";
+        } | {
+            /** @enum {string} */
+            kind: "sdn-central-add";
+        } | {
+            /** @enum {string} */
+            kind: "sdn-central-remove";
+        } | {
+            /** @enum {string} */
+            kind: "sdn-chassis-install";
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

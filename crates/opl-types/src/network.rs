@@ -1,9 +1,17 @@
-//! VM NIC가 연결하는 네트워크: 관리자가 미리 만든 Linux 브리지나 opld가 만드는 VXLAN 네트워크.
+//! VM NIC가 연결하는 네트워크: 관리자가 미리 만든 Linux 브리지, opld가 만드는 VXLAN 네트워크, OVN 논리 스위치로
+//! 만드는 SDN 네트워크(계획 65).
+
+use std::collections::BTreeSet;
+use std::fmt;
+use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::ipam;
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::sdn::DEFAULT_SDN_MTU;
+use crate::security_group::Cidr;
 
 /// 예약된 네트워크 이름. 리소스가 없고 QEMU user-mode NAT로 연결한다(macOS 개발·데모용).
 pub const USER_NETWORK: &str = "user";
@@ -14,9 +22,21 @@ pub const DEFAULT_VXLAN_MTU: u16 = 1450;
 /// VXLAN UDP 포트(IANA)
 pub const VXLAN_PORT: u16 = 4789;
 
+/// SDN NIC의 tap이 붙는 OVS 통합 브리지(ovn-controller가 만든다)
+pub const OVN_BRIDGE: &str = "br-int";
+
+/// 서브넷 하나의 DNS 서버 수 상한
+pub const MAX_DNS_SERVERS: usize = 4;
+
+/// 서브넷 하나의 할당 풀 수 상한
+pub const MAX_POOLS: usize = 16;
+
+/// 서브넷 설명의 길이 상한(글자)
+pub const MAX_SUBNET_DESCRIPTION: usize = 200;
+
 pub type Network = Resource<NetworkSpec, NetworkStatus>;
 
-/// `bridge`와 `vxlan` 중 정확히 하나를 쓴다.
+/// `bridge`·`vxlan`·`sdn` 중 정확히 하나를 쓴다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
@@ -32,10 +52,18 @@ pub struct NetworkSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub vxlan: Option<Vxlan>,
-    /// VXLAN 네트워크의 MTU(1280~9000, 기본 1450). `vxlan`과만 쓴다.
+    /// OVN 논리 스위치(Geneve)로 만드는 SDN 네트워크(계획 65). 없으면 쓰지 않아 옛 노드도 네트워크를 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub sdn: Option<SdnNet>,
+    /// VXLAN·SDN 네트워크의 MTU(1280~9000, 기본 1450·1442). `vxlan`·`sdn`과만 쓴다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub mtu: Option<u16>,
+    /// SDN 네트워크의 서브넷(주소 체계마다 하나까지, 계획 65). `sdn`과만 쓰고 비면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub subnets: Vec<Subnet>,
     /// 든 네트워크 폴더(계획 62, `Folder` id). 없으면 네트워크 트리의 루트이고 쓰지 않아 옛 노드도 네트워크를 푼다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
@@ -50,6 +78,135 @@ pub struct Vxlan {
     pub vni: u32,
 }
 
+/// SDN(OVN) 네트워크. 지금은 칸이 없다(계획 66이 공급자 네트워크 `provider`를 더한다).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SdnNet {}
+
+/// SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Subnet {
+    /// 범위(IPv4 `/8`~`/29`, IPv6 `/48`~`/124`). 접두사 밖 비트가 켜져 있으면 받지 않는다.
+    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "10.10.0.0/24"))]
+    pub cidr: Cidr,
+    /// 게이트웨이 주소. 없으면 첫 호스트 주소다. 라우터가 없어도 늘 예약해 VM에 주지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(
+        feature = "openapi",
+        schema(value_type = String, format = "ip", nullable = false, default)
+    )]
+    pub gateway: Option<IpAddr>,
+    /// OVN DHCP로 주소를 준다. 없으면 IPv4는 참, IPv6는 거짓(IPv6 DHCP는 아직 없어 거짓만 받는다).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub dhcp: Option<bool>,
+    /// DHCP·cloud-init이 알려 줄 DNS 서버(4개까지)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, default))]
+    pub dns_servers: Vec<IpAddr>,
+    /// 자동 할당 범위(16개까지, 겹치지 않게). 없으면 CIDR 전체에서 예약을 뺀 것이다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub pools: Vec<IpRange>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub description: String,
+}
+
+/// 주소 범위(양 끝 포함)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct IpRange {
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = "ip"))]
+    pub start: IpAddr,
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = "ip"))]
+    pub end: IpAddr,
+}
+
+impl fmt::Display for IpRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}-{}", self.start, self.end)
+    }
+}
+
+impl Subnet {
+    pub fn is_ipv4(&self) -> bool {
+        self.cidr.addr.is_ipv4()
+    }
+
+    /// 게이트웨이(주지 않았으면 첫 호스트 주소)
+    pub fn gateway(&self) -> IpAddr {
+        self.gateway.unwrap_or_else(|| ipam::first_host(&self.cidr))
+    }
+
+    /// OVN DHCP를 쓰는지(없으면 IPv4만 참)
+    pub fn dhcp(&self) -> bool {
+        self.dhcp.unwrap_or(self.is_ipv4())
+    }
+
+    pub fn validate(&self) -> Result<(), SubnetError> {
+        let prefix = self.cidr.prefix;
+        if self.is_ipv4() && !(8..=29).contains(&prefix) {
+            return Err(SubnetError::PrefixV4(prefix));
+        }
+        if !self.is_ipv4() && !(48..=124).contains(&prefix) {
+            return Err(SubnetError::PrefixV6(prefix));
+        }
+        let edges = ipam::edges(&self.cidr);
+        if let Some(gw) = self.gateway {
+            if !self.cidr.contains(gw) || gw.is_ipv4() != self.is_ipv4() {
+                return Err(SubnetError::GatewayOutside(gw));
+            }
+            if edges.contains(&gw.to_canonical()) {
+                return Err(SubnetError::GatewayReserved(gw));
+            }
+        }
+        if !self.is_ipv4() && self.dhcp == Some(true) {
+            return Err(SubnetError::Dhcpv6);
+        }
+        if self.dns_servers.len() > MAX_DNS_SERVERS {
+            return Err(SubnetError::TooManyDns);
+        }
+        if self.pools.len() > MAX_POOLS {
+            return Err(SubnetError::TooManyPools);
+        }
+        let gateway = self.gateway();
+        let (first, last) = ipam::span(&self.cidr);
+        let bits = |ip: IpAddr| crate::security_group::Cidr::bits(ip);
+        for pool in &self.pools {
+            let inside = |ip: IpAddr| ip.is_ipv4() == self.is_ipv4() && self.cidr.contains(ip);
+            if !inside(pool.start) || !inside(pool.end) {
+                return Err(SubnetError::PoolOutside(*pool));
+            }
+            let (start, end) = (bits(pool.start), bits(pool.end));
+            if start > end {
+                return Err(SubnetError::PoolReversed(*pool));
+            }
+            if start == first || (self.is_ipv4() && end == last) {
+                return Err(SubnetError::PoolReserved(*pool));
+            }
+            if (start..=end).contains(&bits(gateway)) {
+                return Err(SubnetError::GatewayInPool(*pool, gateway));
+            }
+        }
+        let mut pools = self.pools.clone();
+        pools.sort_by_key(|p| bits(p.start));
+        for pair in pools.windows(2) {
+            if bits(pair[1].start) <= bits(pair[0].end) {
+                return Err(SubnetError::PoolsOverlap(pair[0], pair[1]));
+            }
+        }
+        if self.description.chars().count() > MAX_SUBNET_DESCRIPTION {
+            return Err(SubnetError::LongDescription);
+        }
+        Ok(())
+    }
+}
+
 impl ResourceSpec for NetworkSpec {
     const KIND: Kind = Kind::Network;
     type Status = NetworkStatus;
@@ -62,8 +219,8 @@ pub struct NetworkStatus {}
 
 impl NetworkSpec {
     pub fn validate(&self) -> Result<(), NetworkError> {
-        match (&self.bridge, &self.vxlan) {
-            (Some(bridge), None) => {
+        match (&self.bridge, &self.vxlan, &self.sdn) {
+            (Some(bridge), None, None) => {
                 if !valid_ifname(bridge) {
                     return Err(NetworkError::BadBridge(bridge.clone()));
                 }
@@ -79,7 +236,7 @@ impl NetworkSpec {
                     return Err(NetworkError::BadVlan(vlan));
                 }
             }
-            (None, Some(vxlan)) => {
+            (None, Some(vxlan), None) => {
                 if self.vlan.is_some() {
                     return Err(NetworkError::VlanWithVxlan);
                 }
@@ -92,22 +249,53 @@ impl NetworkSpec {
                     return Err(NetworkError::BadMtu(mtu));
                 }
             }
+            (None, None, Some(_)) => {
+                if self.vlan.is_some() {
+                    return Err(NetworkError::VlanWithSdn);
+                }
+                if let Some(mtu) = self.mtu
+                    && !(1280..=9000).contains(&mtu)
+                {
+                    return Err(NetworkError::BadMtu(mtu));
+                }
+            }
             _ => return Err(NetworkError::KindRequired),
+        }
+        if self.sdn.is_none() && !self.subnets.is_empty() {
+            return Err(NetworkError::SubnetsWithoutSdn);
+        }
+        let mut families = BTreeSet::new();
+        for (i, subnet) in self.subnets.iter().enumerate() {
+            subnet
+                .validate()
+                .map_err(|e| NetworkError::Subnet(i + 1, e))?;
+            if !families.insert(subnet.is_ipv4()) {
+                return Err(NetworkError::DuplicateFamily);
+            }
         }
         Ok(())
     }
 
-    /// VM NIC가 붙을 브리지 이름: `bridge` 또는 `oplv<vni>`. 검증을 통과한 스펙에서만 뜻이 있다.
+    /// SDN(OVN) 네트워크인지
+    pub fn is_sdn(&self) -> bool {
+        self.sdn.is_some()
+    }
+
+    /// VM NIC가 붙을 브리지 이름: `bridge`, `oplv<vni>`, SDN이면 OVS `br-int`. 검증을 통과한 스펙에서만 뜻이 있다.
     pub fn bridge_name(&self) -> String {
         match (&self.bridge, self.vni()) {
             (Some(bridge), _) => bridge.clone(),
             (None, Some(vni)) => vxlan_bridge(vni),
+            (None, None) if self.is_sdn() => OVN_BRIDGE.to_string(),
             (None, None) => String::new(),
         }
     }
 
-    /// VXLAN 네트워크의 MTU(없으면 기본값). 브리지 네트워크는 None.
+    /// VXLAN·SDN 네트워크의 MTU(없으면 기본값). 브리지 네트워크는 None.
     pub fn mtu(&self) -> Option<u16> {
+        if self.is_sdn() {
+            return Some(self.mtu.unwrap_or(DEFAULT_SDN_MTU));
+        }
         self.vxlan.map(|_| self.mtu.unwrap_or(DEFAULT_VXLAN_MTU))
     }
 
@@ -165,11 +353,13 @@ pub enum NetworkError {
     BadBridge(String),
     #[error("invalid VLAN tag {0}: use 1-4094")]
     BadVlan(u16),
-    #[error("set exactly one of bridge or vxlan")]
+    #[error("set exactly one of bridge, vxlan or sdn")]
     KindRequired,
     #[error("vlan can only be used with bridge, not with vxlan")]
     VlanWithVxlan,
-    #[error("mtu can only be used with vxlan; a bridge network uses the bridge's MTU")]
+    #[error("vlan can only be used with bridge, not with sdn")]
+    VlanWithSdn,
+    #[error("mtu can only be used with vxlan or sdn; a bridge network uses the bridge's MTU")]
     MtuWithBridge,
     #[error("invalid VNI {0}: use 1-16777215")]
     BadVni(u32),
@@ -177,6 +367,45 @@ pub enum NetworkError {
     BadMtu(u16),
     #[error("bridge name {0:?} is reserved for Orbivisor VXLAN networks")]
     ReservedBridge(String),
+    #[error("subnets can only be used with sdn")]
+    SubnetsWithoutSdn,
+    #[error("a network can have at most one IPv4 and one IPv6 subnet")]
+    DuplicateFamily,
+    #[error("subnet {0}: {1}")]
+    Subnet(usize, SubnetError),
+}
+
+/// 서브넷 하나의 문제. `NetworkError::Subnet`이 서브넷 번호(1부터)를 붙인다.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SubnetError {
+    #[error("an IPv4 subnet must be /8 to /29, not /{0}")]
+    PrefixV4(u8),
+    #[error("an IPv6 subnet must be /48 to /124, not /{0}")]
+    PrefixV6(u8),
+    #[error("gateway {0} is not in the subnet")]
+    GatewayOutside(IpAddr),
+    #[error("gateway {0} is the subnet's network or broadcast address")]
+    GatewayReserved(IpAddr),
+    #[error(
+        "dhcp is not available for IPv6 subnets yet; set dhcp to false (cloud-init sets the address)"
+    )]
+    Dhcpv6,
+    #[error("a subnet can have at most {MAX_DNS_SERVERS} dns_servers")]
+    TooManyDns,
+    #[error("a subnet can have at most {MAX_POOLS} pools")]
+    TooManyPools,
+    #[error("pool {0} is not in the subnet")]
+    PoolOutside(IpRange),
+    #[error("pool {0} starts after it ends")]
+    PoolReversed(IpRange),
+    #[error("pool {0} includes the subnet's network or broadcast address")]
+    PoolReserved(IpRange),
+    #[error("pool {0} includes the gateway {1}")]
+    GatewayInPool(IpRange, IpAddr),
+    #[error("pools {0} and {1} overlap")]
+    PoolsOverlap(IpRange, IpRange),
+    #[error("description must be at most {MAX_SUBNET_DESCRIPTION} characters")]
+    LongDescription,
 }
 
 #[cfg(test)]
@@ -188,7 +417,9 @@ mod tests {
             bridge: Some(bridge.into()),
             vlan,
             vxlan: None,
+            sdn: None,
             mtu: None,
+            subnets: Vec::new(),
             folder: None,
         }
     }
@@ -198,7 +429,9 @@ mod tests {
             bridge: None,
             vlan: None,
             vxlan: Some(Vxlan { vni }),
+            sdn: None,
             mtu,
+            subnets: Vec::new(),
             folder: None,
         }
     }
@@ -371,5 +604,277 @@ mod tests {
         assert!(is_managed_ifname(&vxlan_bridge(42)));
         // tap 이름과 겹치지 않는다.
         assert!(!is_managed_ifname(&tap_name(Uuid::now_v7(), 0)));
+    }
+
+    fn sdn(subnets: Vec<Subnet>) -> NetworkSpec {
+        NetworkSpec {
+            bridge: None,
+            vlan: None,
+            vxlan: None,
+            sdn: Some(SdnNet {}),
+            mtu: None,
+            subnets,
+            folder: None,
+        }
+    }
+
+    fn subnet(v: serde_json::Value) -> Subnet {
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    fn range(a: &str, b: &str) -> IpRange {
+        IpRange {
+            start: ip(a),
+            end: ip(b),
+        }
+    }
+
+    /// 계획 65: 새 칸이 없으면 옛 모양 그대로, SDN 네트워크와 서브넷은 왕복한다.
+    #[test]
+    fn sdn_fields_are_written_only_when_set() {
+        for old in [
+            r#"{"bridge":"vmbr0","vlan":10}"#,
+            r#"{"vxlan":{"vni":1000},"mtu":1400,"folder":"00000000-0000-0000-0000-000000000003"}"#,
+        ] {
+            let s: NetworkSpec = serde_json::from_str(old).unwrap();
+            assert_eq!((s.sdn, s.subnets.len()), (None, 0));
+            assert_eq!(serde_json::to_string(&s).unwrap(), old);
+        }
+        let json = serde_json::json!({
+            "sdn": {},
+            "mtu": 1400,
+            "subnets": [
+                {
+                    "cidr": "10.10.0.0/24",
+                    "gateway": "10.10.0.254",
+                    "dhcp": false,
+                    "dns_servers": ["1.1.1.1"],
+                    "pools": [{ "start": "10.10.0.10", "end": "10.10.0.99" }],
+                    "description": "web"
+                },
+                { "cidr": "2001:db8::/64" }
+            ]
+        });
+        let s: NetworkSpec = serde_json::from_value(json.clone()).unwrap();
+        assert!(s.is_sdn());
+        assert_eq!(s.subnets[0].pools, [range("10.10.0.10", "10.10.0.99")]);
+        assert_eq!(serde_json::to_value(&s).unwrap(), json);
+        assert_eq!(s.validate(), Ok(()));
+        for bad in [
+            serde_json::json!({ "sdn": { "provider": "physnet1" } }),
+            serde_json::json!({ "sdn": {}, "subnets": [{ "cidr": "10.0.0.0/24", "x": 1 }] }),
+            serde_json::json!({ "sdn": {}, "subnets": [{ "cidr": "10.0.0.1/24" }] }),
+        ] {
+            assert!(
+                serde_json::from_value::<NetworkSpec>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn validates_the_three_kinds() {
+        assert_eq!(sdn(Vec::new()).validate(), Ok(()));
+        let two = NetworkSpec {
+            vxlan: Some(Vxlan { vni: 5 }),
+            ..sdn(Vec::new())
+        };
+        assert_eq!(two.validate(), Err(NetworkError::KindRequired));
+        let two = NetworkSpec {
+            bridge: Some("vmbr0".into()),
+            ..sdn(Vec::new())
+        };
+        assert_eq!(two.validate(), Err(NetworkError::KindRequired));
+        assert_eq!(
+            NetworkError::KindRequired.to_string(),
+            "set exactly one of bridge, vxlan or sdn"
+        );
+        let tagged = NetworkSpec {
+            vlan: Some(10),
+            ..sdn(Vec::new())
+        };
+        assert_eq!(tagged.validate(), Err(NetworkError::VlanWithSdn));
+        for (mtu, ok) in [(1279, false), (1280, true), (9000, true), (9001, false)] {
+            let s = NetworkSpec {
+                mtu: Some(mtu),
+                ..sdn(Vec::new())
+            };
+            assert_eq!(s.validate().is_ok(), ok, "{mtu}");
+        }
+        let plain = subnet(serde_json::json!({ "cidr": "10.0.0.0/24" }));
+        let bridged = NetworkSpec {
+            subnets: vec![plain.clone()],
+            ..spec("vmbr0", None)
+        };
+        assert_eq!(bridged.validate(), Err(NetworkError::SubnetsWithoutSdn));
+        let overlay = NetworkSpec {
+            subnets: vec![plain.clone()],
+            ..vxlan(10, None)
+        };
+        assert_eq!(overlay.validate(), Err(NetworkError::SubnetsWithoutSdn));
+        let two_v4 = sdn(vec![
+            plain.clone(),
+            subnet(serde_json::json!({ "cidr": "10.0.1.0/24" })),
+        ]);
+        assert_eq!(two_v4.validate(), Err(NetworkError::DuplicateFamily));
+        let bad = sdn(vec![
+            plain,
+            subnet(serde_json::json!({ "cidr": "2001:db8::/32" })),
+        ]);
+        assert_eq!(
+            bad.validate(),
+            Err(NetworkError::Subnet(2, SubnetError::PrefixV6(32)))
+        );
+        assert_eq!(
+            bad.validate().unwrap_err().to_string(),
+            "subnet 2: an IPv6 subnet must be /48 to /124, not /32"
+        );
+    }
+
+    #[test]
+    fn names_the_bridge_and_mtu_of_sdn_networks() {
+        let s = sdn(Vec::new());
+        assert_eq!(s.bridge_name(), OVN_BRIDGE);
+        assert_eq!(s.mtu(), Some(DEFAULT_SDN_MTU));
+        assert_eq!(s.vni(), None);
+        let s = NetworkSpec {
+            mtu: Some(8900),
+            ..sdn(Vec::new())
+        };
+        assert_eq!(s.mtu(), Some(8900));
+        assert!(!spec("vmbr0", None).is_sdn());
+    }
+
+    #[test]
+    fn subnet_defaults() {
+        let v4 = subnet(serde_json::json!({ "cidr": "10.0.0.0/24" }));
+        assert_eq!(v4.gateway(), ip("10.0.0.1"));
+        assert!(v4.dhcp());
+        let v6 = subnet(serde_json::json!({ "cidr": "2001:db8::/64", "gateway": "2001:db8::ff" }));
+        assert_eq!(v6.gateway(), ip("2001:db8::ff"));
+        assert!(!v6.dhcp());
+        let off = subnet(serde_json::json!({ "cidr": "10.0.0.0/24", "dhcp": false }));
+        assert!(!off.dhcp());
+    }
+
+    #[test]
+    fn validates_subnets() {
+        let check = |v: serde_json::Value| subnet(v).validate();
+        for ok in [
+            serde_json::json!({ "cidr": "10.0.0.0/8" }),
+            serde_json::json!({ "cidr": "10.0.0.0/29" }),
+            serde_json::json!({ "cidr": "2001:db8::/48" }),
+            serde_json::json!({ "cidr": "2001:db8::/124", "dhcp": false }),
+            serde_json::json!({
+                "cidr": "10.0.0.0/24",
+                "gateway": "10.0.0.254",
+                "dns_servers": ["1.1.1.1", "8.8.8.8", "2001:4860::8888", "9.9.9.9"],
+                "pools": [
+                    { "start": "10.0.0.100", "end": "10.0.0.200" },
+                    { "start": "10.0.0.2", "end": "10.0.0.99" },
+                    { "start": "10.0.0.201", "end": "10.0.0.201" }
+                ]
+            }),
+        ] {
+            assert_eq!(check(ok.clone()), Ok(()), "{ok}");
+        }
+        let pool = |a: &str, b: &str| serde_json::json!({ "start": a, "end": b });
+        let cases = [
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/7" }),
+                SubnetError::PrefixV4(7),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/30" }),
+                SubnetError::PrefixV4(30),
+            ),
+            (
+                serde_json::json!({ "cidr": "2001:db8::/47" }),
+                SubnetError::PrefixV6(47),
+            ),
+            (
+                serde_json::json!({ "cidr": "2001:db8::/125" }),
+                SubnetError::PrefixV6(125),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "gateway": "10.0.1.1" }),
+                SubnetError::GatewayOutside(ip("10.0.1.1")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "gateway": "2001:db8::1" }),
+                SubnetError::GatewayOutside(ip("2001:db8::1")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "gateway": "10.0.0.255" }),
+                SubnetError::GatewayReserved(ip("10.0.0.255")),
+            ),
+            (
+                serde_json::json!({ "cidr": "2001:db8::/64", "gateway": "2001:db8::" }),
+                SubnetError::GatewayReserved(ip("2001:db8::")),
+            ),
+            (
+                serde_json::json!({ "cidr": "2001:db8::/64", "dhcp": true }),
+                SubnetError::Dhcpv6,
+            ),
+            (
+                serde_json::json!({
+                    "cidr": "10.0.0.0/24",
+                    "dns_servers": ["1.1.1.1", "1.1.1.2", "1.1.1.3", "1.1.1.4", "1.1.1.5"]
+                }),
+                SubnetError::TooManyDns,
+            ),
+            (
+                serde_json::json!({
+                    "cidr": "10.0.0.0/16",
+                    "pools": (0..17).map(|i| pool(&format!("10.0.{i}.10"), &format!("10.0.{i}.20"))).collect::<Vec<_>>()
+                }),
+                SubnetError::TooManyPools,
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "pools": [pool("10.0.0.10", "10.0.1.5")] }),
+                SubnetError::PoolOutside(range("10.0.0.10", "10.0.1.5")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "pools": [pool("10.0.0.10", "2001:db8::5")] }),
+                SubnetError::PoolOutside(range("10.0.0.10", "2001:db8::5")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "pools": [pool("10.0.0.20", "10.0.0.10")] }),
+                SubnetError::PoolReversed(range("10.0.0.20", "10.0.0.10")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "pools": [pool("10.0.0.0", "10.0.0.10")] }),
+                SubnetError::PoolReserved(range("10.0.0.0", "10.0.0.10")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "pools": [pool("10.0.0.200", "10.0.0.255")] }),
+                SubnetError::PoolReserved(range("10.0.0.200", "10.0.0.255")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "pools": [pool("10.0.0.1", "10.0.0.10")] }),
+                SubnetError::GatewayInPool(range("10.0.0.1", "10.0.0.10"), ip("10.0.0.1")),
+            ),
+            (
+                serde_json::json!({
+                    "cidr": "10.0.0.0/24",
+                    "pools": [pool("10.0.0.50", "10.0.0.60"), pool("10.0.0.10", "10.0.0.50")]
+                }),
+                SubnetError::PoolsOverlap(
+                    range("10.0.0.10", "10.0.0.50"),
+                    range("10.0.0.50", "10.0.0.60"),
+                ),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "description": "x".repeat(201) }),
+                SubnetError::LongDescription,
+            ),
+        ];
+        for (v, err) in cases {
+            assert_eq!(check(v.clone()), Err(err), "{v}");
+        }
     }
 }

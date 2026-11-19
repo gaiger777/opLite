@@ -329,6 +329,8 @@ mod tests {
         Resource::new(
             name,
             NetworkSpec {
+                sdn: None,
+                subnets: Vec::new(),
                 bridge: None,
                 vlan: None,
                 vxlan: Some(Vxlan { vni }),
@@ -374,6 +376,8 @@ mod tests {
         let bridge = Resource::new(
             "lan",
             NetworkSpec {
+                sdn: None,
+                subnets: Vec::new(),
                 bridge: Some("vmbr0".into()),
                 vlan: None,
                 vxlan: None,

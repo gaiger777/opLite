@@ -116,6 +116,7 @@ async fn node_with(
         },
     );
     node.status = NodeStatus {
+        sdn: None,
         topology: None,
         cpu: None,
         online: true,
@@ -2893,6 +2894,8 @@ async fn lan(env: &Env) {
     let network = Resource::new(
         "lan",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("vmbr0".into()),
             vlan: None,
             vxlan: None,

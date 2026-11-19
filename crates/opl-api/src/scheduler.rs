@@ -1036,6 +1036,7 @@ mod tests {
             },
         );
         n.status = NodeStatus {
+            sdn: None,
             topology: None,
             cpu: None,
             online: true,
@@ -1694,6 +1695,8 @@ mod tests {
             networks: vec![Resource::new(
                 "lan",
                 NetworkSpec {
+                    sdn: None,
+                    subnets: Vec::new(),
                     bridge: Some("vmbr0".into()),
                     vlan: None,
                     vxlan: None,
@@ -1711,6 +1714,7 @@ mod tests {
         }
         let mut me = spec(512, None, PowerState::Running);
         me.nics = vec![NicSpec {
+            ips: Vec::new(),
             network: "lan".into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2084,6 +2088,8 @@ mod tests {
             Resource::new(
                 name,
                 NetworkSpec {
+                    sdn: None,
+                    subnets: Vec::new(),
                     bridge: Some("vmbr0".into()),
                     vlan,
                     vxlan: None,
@@ -2098,6 +2104,7 @@ mod tests {
             ..Default::default()
         };
         let nic = |network: &str| NicSpec {
+            ips: Vec::new(),
             network: network.into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2130,6 +2137,8 @@ mod tests {
             networks: vec![Resource::new(
                 "overlay",
                 NetworkSpec {
+                    sdn: None,
+                    subnets: Vec::new(),
                     bridge: None,
                     vlan: None,
                     vxlan: Some(Vxlan { vni: 1000 }),
@@ -2141,6 +2150,7 @@ mod tests {
         };
         let mut me = spec(512, None, PowerState::Running);
         me.nics = vec![NicSpec {
+            ips: Vec::new(),
             network: "overlay".into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2189,6 +2199,8 @@ mod tests {
             networks: vec![Resource::new(
                 "lan",
                 NetworkSpec {
+                    sdn: None,
+                    subnets: Vec::new(),
                     bridge: Some("vmbr0".into()),
                     vlan: None,
                     vxlan: None,
@@ -2249,6 +2261,7 @@ mod tests {
             Err("node \"n\" cannot use the storage pools of the VM's disks".into())
         );
         me.nics.push(NicSpec {
+            ips: Vec::new(),
             network: "lan".into(),
             model: NicModel::Virtio,
             mac: None,

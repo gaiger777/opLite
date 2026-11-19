@@ -1285,6 +1285,7 @@ mod tests {
                 nics: nics
                     .iter()
                     .map(|n| NicSpec {
+                        ips: Vec::new(),
                         network: n.to_string(),
                         model: NicModel::Virtio,
                         mac: None,
@@ -1344,6 +1345,8 @@ mod tests {
         Resource::new(
             name,
             NetworkSpec {
+                sdn: None,
+                subnets: Vec::new(),
                 bridge: Some(bridge.into()),
                 vlan: None,
                 vxlan: None,
@@ -1357,6 +1360,8 @@ mod tests {
         Resource::new(
             name,
             NetworkSpec {
+                sdn: None,
+                subnets: Vec::new(),
                 bridge: None,
                 vlan: None,
                 vxlan: Some(Vxlan { vni }),

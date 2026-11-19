@@ -335,6 +335,7 @@ impl TemplateDraft {
                 boot_order: Some(1),
             }],
             nics: vec![NicSpec {
+                ips: Vec::new(),
                 network: self.network.clone(),
                 model: NicModel::Virtio,
                 mac: None,

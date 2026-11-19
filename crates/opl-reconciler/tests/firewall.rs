@@ -50,6 +50,8 @@ async fn env_with_config(
     let lan = Resource::new(
         "lan",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("vmbr0".into()),
             vlan: None,
             vxlan: None,
@@ -65,6 +67,7 @@ async fn env_with_config(
 fn vm_with_groups(env: &Env, groups: &[&str]) -> Vm {
     let mut vm = vm("web", env.node);
     vm.spec.nics = vec![NicSpec {
+        ips: Vec::new(),
         network: "lan".into(),
         model: NicModel::Virtio,
         mac: Some(MacAddr([0x52, 0x54, 0, 1, 2, 3])),

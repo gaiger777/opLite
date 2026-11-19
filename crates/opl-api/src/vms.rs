@@ -318,6 +318,14 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     crate::cpu::require_cpu_feature(&state.cluster, &spec.cpu.model, &spec.cpu.flags)?;
     // CPU 정책·vNUMA·hugepages는 옛 노드가 풀지 못한다(계획 64, 검증보다 먼저).
     crate::numa::require_numa_feature(&state.cluster, spec)?;
+    // NIC 주소(계획 65)는 옛 노드가 풀지 못한다(검증보다 먼저). IPAM이 들어오기 전(스테이지 6에서 열기 전)에는 받지
+    // 않는다.
+    if spec.nics.iter().any(|n| !n.ips.is_empty()) {
+        require_feature(&state.cluster, opl_types::node::SDN)?;
+        return Err(ApiError::bad_request(
+            "NIC addresses (ips) are for SDN networks, which are not available yet",
+        ));
+    }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate().map_err(crate::cpu::validation_error)?;

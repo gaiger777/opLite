@@ -362,6 +362,7 @@ async fn two_nodes_with(
         );
         r.id = node.id;
         r.status = NodeStatus {
+            sdn: None,
             topology: None,
             cpu: None,
             online: true,

@@ -1015,6 +1015,11 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::CephOsdAdd { .. }
         | TaskOp::CephPoolCreate { .. }
         | TaskOp::CephClientInstall => ceph::perform(ctx, task).await,
+        // SDN 설치·구성(계획 65)은 스테이지 2가 단다. API가 아직 이 Task를 만들지 않는다.
+        TaskOp::SdnInit { .. }
+        | TaskOp::SdnCentralAdd
+        | TaskOp::SdnCentralRemove
+        | TaskOp::SdnChassisInstall => Err("SDN (OVN) setup is not available yet".into()),
         TaskOp::VolumeDownload {
             url,
             sha256,

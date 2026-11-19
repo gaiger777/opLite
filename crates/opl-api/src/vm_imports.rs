@@ -778,6 +778,7 @@ pub(crate) fn import_spec(
                 .or_else(|| proposal.networks.get(&nic.network).and_then(Option::as_ref))
                 .ok_or_else(|| format!("no network mapping for {:?}", nic.network))?;
             Ok(NicSpec {
+                ips: Vec::new(),
                 network: network.clone(),
                 model,
                 mac: nic.mac.filter(|_| run.keep_macs),

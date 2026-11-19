@@ -703,6 +703,8 @@ async fn a_vm_with_security_groups_needs_the_firewall() {
     let lan = Resource::new(
         "lan",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("vmbr0".into()),
             vlan: None,
             vxlan: None,

@@ -297,3 +297,17 @@ graph LR
 8. **docs: 네트워크 가이드 "SDN(OVN)", 아키텍처의 OvnSync·SDN 현황, 설계 문서 스테이지 보고, 계획 65 실행 기록** — `docs/guide/network.md`·`web-ui.md`·`development.md`(`ovn` 작업), `docs/architecture.md` §4·§11.4·§19, `docs/index.md`, README 한 줄.
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
+
+### 스테이지 1 (opl-types)
+
+- **자리**: `sdn.rs`는 리소스(`Sdn`·`SdnStatus`·`SdnPending`·`SdnSync`)·노드 상태(`NodeSdn`·`ChassisState`·`CentralHealth`·`RaftRole`)·요청·보기와 상수, `network.rs`는 `SdnNet`·`Subnet`·`IpRange`·`SubnetError`(검증), `ipam.rs`는 순수 계산이다. `DEFAULT_SDN_MTU`는 `sdn.rs`, `OVN_BRIDGE = "br-int"`·`MAX_DNS_SERVERS`·`MAX_POOLS`·`MAX_SUBNET_DESCRIPTION`(200, 보안 그룹과 같음)은 `network.rs`.
+- **`TaskOp::SdnInit { address: Option<IpAddr> }`**(§6은 칸 없는 `SdnInit`): `SdnInitRequest.address`를 Task까지 나를 자리가 필요해 칸으로 두었다(없으면 쓰지 않아 `{"kind":"sdn-init"}`). `SdnCentralAdd`·`SdnCentralRemove`·`SdnChassisInstall`은 칸이 없다. `is_sdn()`은 넷 모두다(`is_ceph()`와 달리 `SdnChassisInstall`의 대상은 노드라, 스테이지 2가 "대상이 `Sdn` 리소스"인 셋만 볼 일이 있으면 따로 둔다).
+- **`ChassisState`에도 `#[serde(other)] Unknown`**(§6은 `RaftRole`에만): 뒤 버전이 상태를 더해도 옛 노드가 `NodeStatus` 전체를 못 읽게 되지 않게.
+- **`SdnSync.nb_cfg`·`hv_cfg`는 `i64`**(OVSDB integer). `SdnView`는 `phase: Option<SdnPhase>`(없으면 설정 전), 중앙마다 노드 이름·주소·`CentralHealth`, 위트니스가 아닌 노드마다(이름 순) `NodeSdn`, 끝나지 않은 Task로 했다. `SdnChassisRequest::validate`는 `nodes`와 `all` 가운데 정확히 하나.
+- **서브넷 검증에 더한 것**(§6 밖): 게이트웨이가 망 주소·브로드캐스트면 400(`GatewayReserved`), 풀이 망 주소·IPv4 브로드캐스트를 품으면 400(`PoolReserved`), 시작 > 끝이면 400(`PoolReversed`), 다른 체계의 게이트웨이·풀 끝(IPv4 대응 IPv6 포함)은 "밖"이다. IPv6 `dhcp: true`는 400(`Dhcpv6`). 서브넷 번호는 1부터("subnet 2: …", 보안 그룹 규칙과 같다). VLAN과 sdn은 `VlanWithSdn`. `KindRequired` 문구는 "set exactly one of bridge, vxlan or sdn", `MtuWithBridge`는 "…with vxlan or sdn…"으로 바뀌었다(API 400 문구).
+- **IPAM**: `allocate`는 원하는 주소를 IPv4 대응 IPv6에서 IPv4로 바꿔 보고, 풀 밖이어도 서브넷 안이면 받는다(Neutron 고정 IP). 빈 주소 찾기는 풀 앞에서부터 예약·사용을 건너뛰므로 드는 시간이 앞에서 이어 쓴 주소 수에 비례한다(`/16`에 1만 개 시험). `server_mac`의 입력은 네트워크 id의 16바이트다. `reserved`는 IPv6에서 망 주소(subnet-router anycast)와 게이트웨이다.
+- **`NicSpec.ips`**: `VmSpec::validate`가 NIC마다 체계마다 하나까지만 본다(`NicIps`). SDN 네트워크인지(`IpsWithoutSdn`)는 네트워크를 아는 API(스테이지 4·6)가 본다.
+- **임시 API 막기(스테이지 6 전)**: `POST /networks`(`resources.rs` `create_network`)는 `sdn`이나 `subnets`가 있으면 `require_feature(SDN)`(409) 뒤 400 "SDN (OVN) networks are not available yet". `vms.rs` `prepare`(만들기·바꾸기·스냅샷 되돌리기)는 NIC `ips`가 있으면 같은 409 → 400. Task 실행기(`tasks.rs`)의 `sdn-*`는 "not available yet" 실패(API가 아직 만들지 않는다). 시험 `crates/opl-api/tests/sdn.rs`. `Kind::Sdn` 리소스·`NodeStatus.sdn`을 쓰는 길은 아직 없다.
+- **권한**: `Kind::Sdn`은 `kind_privilege`의 기본 갈래로 읽기 `cluster.read`, 쓰기 `cluster.admin`이다(코드는 그대로, 권한 설명 글만 "Ceph·SDN"). `Kind::ALL` 34.
+- **`RuntimeNic`**는 이 스테이지에서 바뀌지 않는다(`ovn_port`는 스테이지 5가 더하고 그때 옛 JSON 시험을 둔다).
+- 컴파일 고치기: `NicSpec`·`NetworkSpec`·`NodeStatus` 리터럴(Linux 전용 파일 포함, 모두 빈 값). `schema.d.ts`를 다시 만들었다.

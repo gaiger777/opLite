@@ -40,6 +40,8 @@ async fn network(env: &Env, name: &str) {
     let network = Resource::new(
         name,
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("br0".into()),
             vlan: None,
             vxlan: None,

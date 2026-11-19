@@ -175,6 +175,8 @@ async fn setup(env: &Env) {
     let network = Resource::new(
         "lan",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("br0".into()),
             vlan: None,
             vxlan: None,

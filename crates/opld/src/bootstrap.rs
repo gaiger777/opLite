@@ -227,6 +227,7 @@ async fn record_node(
         let previous = status.cpu.take();
         let stored = status.topology.take();
         *status = NodeStatus {
+            sdn: None,
             topology: match &host.topology {
                 Some(t) if numa_ready => Some(crate::topology::keep_time(stored.as_ref(), t)),
                 _ => stored,
@@ -921,7 +922,8 @@ pub(crate) mod tests {
                 "folders",
                 "two-factor",
                 "cpu-models",
-                "numa"
+                "numa",
+                "sdn"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -964,7 +966,8 @@ pub(crate) mod tests {
                 "folders",
                 "two-factor",
                 "cpu-models",
-                "numa"
+                "numa",
+                "sdn"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1026,7 +1029,8 @@ pub(crate) mod tests {
                 "folders",
                 "two-factor",
                 "cpu-models",
-                "numa"
+                "numa",
+                "sdn"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1263,6 +1267,7 @@ pub(crate) mod tests {
                     "two-factor".into(),
                     "cpu-models".into(),
                     "numa".into(),
+                    "sdn".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

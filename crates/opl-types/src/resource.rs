@@ -69,11 +69,12 @@ pub enum Kind {
     Group,
     TwoFactor,
     CpuCatalog,
+    Sdn,
 }
 
 impl Kind {
     /// 모든 종류(선언 순서). 종류마다 도는 시험과 권한 표가 쓴다.
-    pub const ALL: [Kind; 33] = [
+    pub const ALL: [Kind; 34] = [
         Kind::Vm,
         Kind::StoragePool,
         Kind::Volume,
@@ -107,6 +108,7 @@ impl Kind {
         Kind::Group,
         Kind::TwoFactor,
         Kind::CpuCatalog,
+        Kind::Sdn,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -144,6 +146,7 @@ impl Kind {
             Kind::Group => "group",
             Kind::TwoFactor => "two-factor",
             Kind::CpuCatalog => "cpu-catalog",
+            Kind::Sdn => "sdn",
         }
     }
 }
@@ -216,7 +219,7 @@ mod tests {
         assert_eq!(set.len(), Kind::ALL.len());
         assert_eq!(
             Kind::ALL.last().map(|k| k.as_str()),
-            Some("cpu-catalog"),
+            Some("sdn"),
             "새 종류는 ALL 끝에도 더한다"
         );
     }

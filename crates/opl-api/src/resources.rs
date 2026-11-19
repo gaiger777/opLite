@@ -710,6 +710,14 @@ pub async fn create_network(
     if req.spec.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
     }
+    // SDN 네트워크와 서브넷(계획 65)은 옛 노드가 풀지 못한다(검증보다 먼저). OVN 설치·동기화가 들어오기 전(스테이지
+    // 6에서 열기 전)에는 받지 않는다.
+    if req.spec.sdn.is_some() || !req.spec.subnets.is_empty() {
+        require_feature(&state.cluster, opl_types::node::SDN)?;
+        return Err(ApiError::bad_request(
+            "SDN (OVN) networks are not available yet",
+        ));
+    }
     state.authz.require_new(
         &principal,
         Privilege::NetworkConfig,

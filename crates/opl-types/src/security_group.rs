@@ -205,14 +205,14 @@ impl Cidr {
     }
 
     /// 접두사 밖(호스트) 비트의 마스크. 128비트를 모두 밀면 넘치므로 그때는 전부.
-    fn host_mask(self) -> u128 {
+    pub(crate) fn host_mask(self) -> u128 {
         let max = Self::max_prefix(self.addr);
         1u128
             .checked_shl(u32::from(max - self.prefix))
             .map_or(u128::MAX, |b| b - 1)
     }
 
-    fn bits(addr: IpAddr) -> u128 {
+    pub(crate) fn bits(addr: IpAddr) -> u128 {
         match addr {
             IpAddr::V4(a) => u128::from(u32::from(a)),
             IpAddr::V6(a) => u128::from(a),

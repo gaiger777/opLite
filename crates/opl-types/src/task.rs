@@ -260,6 +260,22 @@ pub enum TaskOp {
         #[cfg_attr(feature = "openapi", schema(default))]
         running_vms: u32,
     },
+    /// 이 노드에 OVN을 설치하고 첫 중앙(NB·SB ovsdb 클러스터, northd)을 세운 뒤 chassis로 구성한다(계획 65). `address`는
+    /// NB·SB가 들을 주소(없으면 노드 주소의 IP)다. 대상은 `Sdn` 리소스다.
+    SdnInit {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(
+            feature = "openapi",
+            schema(value_type = String, format = "ip", nullable = false, default)
+        )]
+        address: Option<std::net::IpAddr>,
+    },
+    /// 이 노드를 OVN 중앙으로 더한다(NB·SB Raft에 붙고 chassis로 구성). 대상은 `Sdn` 리소스다.
+    SdnCentralAdd,
+    /// 이 노드를 OVN 중앙에서 뺀다(Raft에서 나가고 단위를 멈춤, DB 파일은 이름만 바꿈). 대상은 `Sdn` 리소스다.
+    SdnCentralRemove,
+    /// 대상 노드에 OVS·ovn-controller를 설치하고 chassis로 구성한다. 대상은 그 노드다(노드마다 함께 돈다).
+    SdnChassisInstall,
 }
 
 impl TaskOp {
@@ -273,6 +289,17 @@ impl TaskOp {
                 | TaskOp::CephOsdAdd { .. }
                 | TaskOp::CephPoolCreate { .. }
                 | TaskOp::CephClientInstall
+        )
+    }
+
+    /// SDN(OVN) 설치·구성 Task(계획 65, `node::SDN`)
+    pub fn is_sdn(&self) -> bool {
+        matches!(
+            self,
+            TaskOp::SdnInit { .. }
+                | TaskOp::SdnCentralAdd
+                | TaskOp::SdnCentralRemove
+                | TaskOp::SdnChassisInstall
         )
     }
 
@@ -833,6 +860,42 @@ mod tests {
         }
         assert!(!TaskOp::VmHotplug.is_ceph());
         assert!(!TaskOp::NodeUpgrade.is_ceph());
+    }
+
+    /// SDN Task 네 가지(계획 65). `sdn-init`의 주소는 없으면 쓰지 않는다.
+    #[test]
+    fn sdn_ops_are_tagged_by_kind() {
+        for (op, json) in [
+            (
+                TaskOp::SdnInit { address: None },
+                serde_json::json!({ "kind": "sdn-init" }),
+            ),
+            (
+                TaskOp::SdnInit {
+                    address: Some("10.0.0.1".parse().unwrap()),
+                },
+                serde_json::json!({ "kind": "sdn-init", "address": "10.0.0.1" }),
+            ),
+            (
+                TaskOp::SdnCentralAdd,
+                serde_json::json!({ "kind": "sdn-central-add" }),
+            ),
+            (
+                TaskOp::SdnCentralRemove,
+                serde_json::json!({ "kind": "sdn-central-remove" }),
+            ),
+            (
+                TaskOp::SdnChassisInstall,
+                serde_json::json!({ "kind": "sdn-chassis-install" }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+            assert!(op.is_sdn(), "{op:?}");
+            assert!(!op.is_ceph(), "{op:?}");
+        }
+        assert!(!TaskOp::CephInit.is_sdn());
+        assert!(!TaskOp::VmHotplug.is_sdn());
     }
 
     #[test]

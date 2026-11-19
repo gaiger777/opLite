@@ -454,6 +454,11 @@ impl VmSpec {
                     return Err(ValidationError::DuplicateSecurityGroup(i, group.clone()));
                 }
             }
+            if nic.ips.len() > 2
+                || (nic.ips.len() == 2 && nic.ips[0].is_ipv4() == nic.ips[1].is_ipv4())
+            {
+                return Err(ValidationError::NicIps(i));
+            }
         }
         if let Some(schedule) = &self.snapshot_schedule
             && !(1..=MAX_SCHEDULE_KEEP).contains(&schedule.keep)
@@ -587,6 +592,8 @@ pub enum ValidationError {
     TooManySecurityGroups(usize),
     #[error("nics[{0}]: security group {1:?} is listed more than once")]
     DuplicateSecurityGroup(usize, String),
+    #[error("nics[{0}]: a NIC can have at most one IPv4 and one IPv6 address")]
+    NicIps(usize),
     #[error("ha.max_restart and ha.max_relocate must be between 0 and {MAX_HA_COUNT}")]
     HaCount,
     #[error("ha.priority must be between 0 and {MAX_HA_PRIORITY}")]
@@ -849,6 +856,11 @@ pub struct NicSpec {
     /// 이 NIC에 거는 보안 그룹 이름(8개 이하, 겹치지 않게). 비어 있지 않으면 방화벽이 켜진다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security_groups: Vec<String>,
+    /// SDN 네트워크 NIC의 주소(주소 체계마다 하나까지, 계획 65). 네트워크에 서브넷이 있으면 API가 IPAM으로 채운다(MAC
+    /// 처럼). 비면 쓰지 않아 옛 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, default))]
+    pub ips: Vec<std::net::IpAddr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2591,5 +2603,43 @@ mod tests {
         assert_eq!(json["guest_agent"], true);
         assert!(json.get("secure_boot").is_none(), "{json}");
         assert_eq!(serde_json::from_value::<RunningHardware>(json).unwrap(), hw);
+    }
+
+    /// 계획 65: 주소가 없는 NIC는 옛 JSON 그대로, 주소는 왕복하고 체계마다 하나까지다.
+    #[test]
+    fn nic_ips_are_omitted_when_empty_and_one_per_family() {
+        for old in [
+            r#"{"network":"lan","model":"virtio","mac":null}"#,
+            r#"{"network":"lan","model":"e1000e","mac":"52:54:00:12:34:56","security_groups":["web"]}"#,
+        ] {
+            let nic: NicSpec = serde_json::from_str(old).unwrap();
+            assert!(nic.ips.is_empty());
+            assert_eq!(serde_json::to_string(&nic).unwrap(), old);
+        }
+        let json = serde_json::json!({
+            "network": "tenant",
+            "model": "virtio",
+            "mac": "52:54:00:12:34:56",
+            "ips": ["10.0.0.5", "2001:db8::5"]
+        });
+        let nic: NicSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(nic.ips.len(), 2);
+        assert_eq!(serde_json::to_value(&nic).unwrap(), json);
+
+        let with = |ips: &[&str]| {
+            let mut s = sample();
+            s.nics[0].ips = ips.iter().map(|i| i.parse().unwrap()).collect();
+            s.validate()
+        };
+        assert_eq!(with(&["10.0.0.5"]), Ok(()));
+        assert_eq!(with(&["2001:db8::5", "10.0.0.5"]), Ok(()));
+        assert_eq!(
+            with(&["10.0.0.5", "10.0.0.6"]),
+            Err(ValidationError::NicIps(0))
+        );
+        assert_eq!(
+            with(&["10.0.0.5", "2001:db8::5", "2001:db8::6"]),
+            Err(ValidationError::NicIps(0))
+        );
     }
 }

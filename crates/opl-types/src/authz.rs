@@ -107,9 +107,9 @@ privileges! {
     AlertRead = "alert.read",
     /// 경보 규칙 쓰기(루트)
     AlertManage = "alert.manage",
-    /// 노드·클러스터·설정·HA·배치·Ceph·원격 읽기, 노드·클러스터 지표, Prometheus
+    /// 노드·클러스터·설정·HA·배치·Ceph·SDN·원격 읽기, 노드·클러스터 지표, Prometheus
     ClusterRead = "cluster.read",
-    /// 계정·영역·남의 토큰·알림 대상·감사 로그·설정·노드·HA·배치·Ceph·원격 쓰기, 역할·그룹·루트 grant
+    /// 계정·영역·남의 토큰·알림 대상·감사 로그·설정·노드·HA·배치·Ceph·SDN·원격 쓰기, 역할·그룹·루트 grant
     ClusterAdmin = "cluster.admin",
 }
 

@@ -8,6 +8,7 @@ use crate::cpu::NodeCpu;
 use crate::ha_check::{CheckReport, CheckState};
 use crate::numa::{HostResources, NodeTopology};
 use crate::resource::{Kind, Resource, ResourceSpec};
+use crate::sdn::NodeSdn;
 use crate::vm::Arch;
 
 /// 클러스터 노드. 리소스 id는 그 노드의 Raft 노드 id와 같다.
@@ -157,6 +158,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub topology: Option<NodeTopology>,
+    /// 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
+    /// 쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub sdn: Option<NodeSdn>,
 }
 
 /// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
@@ -390,6 +396,7 @@ pub const FEATURES: &[&str] = &[
     TWO_FACTOR,
     CPU_MODELS,
     NUMA,
+    SDN,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -457,6 +464,10 @@ pub const CPU_MODELS: &str = "cpu-models";
 /// `host_resources`, `NodeStatus.topology` 쓰기, 할당량 `dedicated_vcpus`, 노드 사이 RPC `ReadTopology`. 옛 노드는 이
 /// 칸이 든 VM·노드·폴더를 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
 pub const NUMA: &str = "numa";
+
+/// SDN(OVN)(계획 65): 종류 `Sdn`, 네트워크 `sdn`·`subnets`, NIC `ips`, `NodeStatus.sdn` 쓰기, Task `sdn-*`. 옛 노드는 이
+/// 칸이 든 네트워크·VM을 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
+pub const SDN: &str = "sdn";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -941,7 +952,8 @@ mod tests {
                 "folders",
                 "two-factor",
                 "cpu-models",
-                "numa"
+                "numa",
+                "sdn"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1140,5 +1152,25 @@ mod tests {
                 secure_boot: true
             })
         );
+    }
+
+    /// SDN 상태(계획 65)가 없으면 옛 노드 상태 JSON이 바이트까지 같고, 있으면 그대로 오간다.
+    #[test]
+    fn status_sdn_round_trips_and_old_json_is_unchanged() {
+        let old = r#"{"online":true,"cpus":8,"memory_mib":16384,"hypervisor":"qemu-kvm","bridges":[],"arch":"x86_64","pools":{},"underlay":"10.0.0.11","firewall":true,"version":"0.64.0","features":["node-drain","numa"]}"#;
+        let status: NodeStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(status.sdn, None);
+        assert_eq!(serde_json::to_string(&status).unwrap(), old);
+        let status = NodeStatus {
+            sdn: Some(crate::sdn::NodeSdn {
+                chassis: crate::sdn::ChassisState::Configuring,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
+        assert_eq!(FEATURES.last(), Some(&SDN));
     }
 }

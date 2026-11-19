@@ -52,6 +52,7 @@ fn hot_vm(node: Uuid) -> Vm {
     vm.spec.memory_mib = 1024;
     vm.spec.max_memory_mib = Some(4096);
     vm.spec.nics.push(NicSpec {
+        ips: Vec::new(),
         network: "user".into(),
         model: NicModel::Virtio,
         mac: Some(MacAddr::generate()),

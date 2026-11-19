@@ -520,6 +520,7 @@ mod tests {
         let nics = networks
             .iter()
             .map(|network| NicSpec {
+                ips: Vec::new(),
                 network: network.to_string(),
                 model: NicModel::Virtio,
                 mac: None,

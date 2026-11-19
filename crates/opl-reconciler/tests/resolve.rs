@@ -265,6 +265,7 @@ fn disk(volume: &str) -> DiskSpec {
 
 fn nic(network: &str, mac: Option<MacAddr>) -> NicSpec {
     NicSpec {
+        ips: Vec::new(),
         network: network.into(),
         model: NicModel::Virtio,
         mac,
@@ -1214,6 +1215,8 @@ async fn resolves_bridge_networks_to_taps() {
     let lan: Network = Resource::new(
         "lan",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("vmbr0".into()),
             vlan: Some(10),
             vxlan: None,
@@ -1248,6 +1251,8 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
     let blue: Network = Resource::new(
         "blue",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: None,
             vlan: None,
             vxlan: Some(Vxlan { vni: 1000 }),
@@ -1259,6 +1264,8 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
     let jumbo: Network = Resource::new(
         "jumbo",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: None,
             vlan: None,
             vxlan: Some(Vxlan { vni: 2000 }),
@@ -1500,6 +1507,8 @@ async fn resolves_one_disk_and_one_nic() {
     let net: Network = Resource::new(
         "lan",
         NetworkSpec {
+            sdn: None,
+            subnets: Vec::new(),
             bridge: Some("br0".into()),
             vlan: None,
             vxlan: None,
