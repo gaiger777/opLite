@@ -33,6 +33,7 @@ mod ha_health;
 pub mod health;
 mod images;
 mod incoming;
+mod ipam;
 mod janitor;
 pub mod ldap;
 pub mod limit;

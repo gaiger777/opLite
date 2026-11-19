@@ -121,10 +121,22 @@ pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<(), String> {
         if !vm.spec.template {
             return recheck_clones(ctx, id, None).await;
         }
-        let spec = VmSpec {
+        let mut spec = VmSpec {
             template: false,
             ..vm.spec.clone()
         };
+        // 보통 VM이 된 NIC는 SDN 주소를 새로 받는다(계획 65 §9). 빈 주소가 없으면 주소 없이 두고 알린다(`network ips
+        // --fill`로 나중에 채운다).
+        let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+        let (_, networks) = ctx
+            .cluster
+            .list::<opl_types::network::NetworkSpec>()
+            .map_err(|e| e.to_string())?;
+        let others: Vec<&opl_types::vm::Vm> = vms.iter().filter(|v| v.id != id).collect();
+        if let Err(e) = crate::ipam::assign_new(&mut spec, &others, &networks) {
+            tracing::warn!(vm = %id, error = %e, "cannot give the untemplated VM SDN addresses; leaving them empty");
+            spec.nics.iter_mut().for_each(|n| n.ips.clear());
+        }
         match ctx
             .cluster
             .update_spec(id, Some(vm.revision), vm.labels.clone(), &spec)
@@ -132,6 +144,8 @@ pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<(), String> {
         {
             Ok(_) => break spec,
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            // 다른 노드가 그새 같은 주소를 잡았다: 다시 고른다.
+            Err(e) if crate::ipam::is_ip_taken(&e) => {}
             Err(e) => {
                 // 적용됐는지 모른다(시간 초과 뒤 적용). 표시가 남았으면 다시 하면 되고, 지워졌으면 다시 본다.
                 if get_vm(ctx, id)?.spec.template {

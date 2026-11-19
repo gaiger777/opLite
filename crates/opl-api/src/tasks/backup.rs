@@ -1127,7 +1127,8 @@ pub(super) async fn restore(
     new.spec
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
-    create_vm(ctx, task, new, None, false).await?;
+    // SDN 주소(계획 65 §9): 원래 주소가 비어 있으면 그대로, 아니면 새로 받고 경고에 적는다.
+    create_vm(ctx, task, new, None, false, &mut warnings).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 

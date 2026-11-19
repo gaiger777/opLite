@@ -326,10 +326,20 @@ async fn resolve(
         cdroms,
         // 씨앗은 지금 스펙의 cloud-init으로 만든다. NIC 입력(MAC)은 새로 켜면 스펙의 NIC, 다시 붙거나 받을 때는 기록의
         // 켤 때 단 NIC다(실행 중 붙인 NIC는 원본 QEMU의 씨앗에 없다) — 받는 쪽이 원본과 같은 바이트를 만든다.
-        cloud_init: vm.spec.cloud_init.as_ref().map(|ci| {
-            let nics = hardware.map_or(&vm.spec.nics[..], |hw| hw.boot_nics());
-            cloud_init::render(vm.id, &vm.name, ci, nics)
-        }),
+        // SDN NIC(계획 65)는 그 네트워크의 서브넷으로 주소 설정을 만든다.
+        cloud_init: match vm.spec.cloud_init.as_ref() {
+            Some(ci) => {
+                let nics = hardware.map_or(&vm.spec.nics[..], |hw| hw.boot_nics());
+                Some(cloud_init::render_sdn(
+                    vm.id,
+                    &vm.name,
+                    ci,
+                    nics,
+                    &sdn_subnets(cluster, nics)?,
+                ))
+            }
+            None => None,
+        },
         // TPM(계획 59)은 이 노드에 있는 상태로 켠다(`fresh: false` — 몰래 새로 만들지 않는다). 새로 켤 때는 작업자가 켜기
         // 규칙(`firmware::tpm_source`)으로 상태를 얻은 뒤 바꾼다. 다시 붙거나 받을 때는 기록의 장치를 따른다.
         tpm: (vm.spec.tpm || hardware.is_some_and(|hw| hw.tpm)).then_some(RuntimeTpm {
@@ -478,6 +488,25 @@ pub async fn runtime_medium(
 }
 
 /// NIC 하나(`vm.spec.nics[index]`)의 런타임 정의. tap 이름은 순번으로 정한다([`tap_name`]).
+/// NIC들 `nics`가 쓰는 SDN 네트워크마다 그 서브넷(cloud-init network-config용, 계획 65). 단순 네트워크는 넣지 않는다.
+fn sdn_subnets(
+    cluster: &Cluster,
+    nics: &[opl_types::vm::NicSpec],
+) -> Result<cloud_init::SdnSubnets, ResolveError> {
+    let mut out = cloud_init::SdnSubnets::new();
+    for nic in nics.iter().filter(|n| n.network != USER_NETWORK) {
+        if out.contains_key(&nic.network) {
+            continue;
+        }
+        if let Some(net) = cluster.get_by_name::<NetworkSpec>(&nic.network)?
+            && net.spec.is_sdn()
+        {
+            out.insert(nic.network.clone(), net.spec.subnets);
+        }
+    }
+    Ok(out)
+}
+
 pub fn runtime_nic(cluster: &Cluster, vm: &Vm, index: usize) -> Result<RuntimeNic, ResolveError> {
     let nic = vm.spec.nics.get(index).ok_or(ResolveError::NoNic(index))?;
     let backend = if nic.network == USER_NETWORK {

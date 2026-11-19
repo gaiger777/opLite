@@ -1,4 +1,5 @@
-//! 리더 `OvnSync`(계획 65 §8): Raft의 SDN 네트워크를 OVN northbound DB(NB)에 옮겨 쓴다. NB는 Raft에서 다시 만들 수
+//! 리더 `OvnSync`(계획 65 §8): Raft의 SDN 네트워크·서브넷·VM NIC를 OVN northbound DB(NB)의 논리 스위치·DHCP_Options·
+//! 논리 포트로 옮겨 쓴다. NB는 Raft에서 다시 만들 수
 //! 있는 파생물이다 — 리더가 바뀌거나 누가 NB를 바꾸거나 비워도 다음 차례가 되살린다.
 //!
 //! 위트니스가 아닌 모든 노드가 띄우고 리더에서만 일한다. 차례는 리더가 된 직후, Network·Vm·Sdn 변경과 노드 지우기
@@ -29,6 +30,7 @@ use opl_types::network::NetworkSpec;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Kind;
 use opl_types::sdn::{NB_PORT, SB_PORT, SDN_NAME, SdnPhase, SdnSpec, SdnSync};
+use opl_types::vm::VmSpec;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -154,11 +156,17 @@ impl OvnSyncer {
             Err(e) => return SyncOutcome::Skipped(e.to_string()),
         };
         let index = cluster.revision();
-        let (networks, nodes) = match (cluster.list::<NetworkSpec>(), cluster.list::<NodeSpec>()) {
-            (Ok((_, n)), Ok((_, m))) => (n, m),
-            (Err(e), _) | (_, Err(e)) => return SyncOutcome::Skipped(e.to_string()),
+        let (networks, vms, nodes) = match (
+            cluster.list::<NetworkSpec>(),
+            cluster.list::<VmSpec>(),
+            cluster.list::<NodeSpec>(),
+        ) {
+            (Ok((_, n)), Ok((_, v)), Ok((_, m))) => (n, v, m),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                return SyncOutcome::Skipped(e.to_string());
+            }
         };
-        let want = nb::desired(&networks, &self.config.tag);
+        let want = nb::desired(&networks, &vms, &nodes, &self.config.tag);
         let centrals: Vec<(std::net::IpAddr, Option<String>)> = sdn
             .status
             .centrals

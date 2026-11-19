@@ -1244,6 +1244,40 @@ async fn resolves_bridge_networks_to_taps() {
 }
 
 #[tokio::test]
+async fn cloud_init_of_sdn_nics_uses_the_subnets() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    let tenant: Network = Resource::new(
+        "tenant",
+        serde_json::from_value(serde_json::json!({
+            "sdn": {}, "subnets": [{ "cidr": "10.0.0.0/24", "dhcp": false }]
+        }))
+        .unwrap(),
+    );
+    cluster.create(&tenant).await.unwrap();
+    let mut vm = common::vm("web", node);
+    let mut sdn_nic = nic("tenant", Some(MacAddr::generate()));
+    sdn_nic.ips = vec!["10.0.0.5".parse().unwrap()];
+    vm.spec.nics = vec![nic("user", Some(MacAddr::generate())), sdn_nic];
+    let ci = CloudInit::default();
+    vm.spec.cloud_init = Some(ci.clone());
+    let spec = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    let seed = spec.cloud_init.unwrap();
+    let net: serde_json::Value =
+        serde_json::from_str(seed.network_config.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        net["config"][1]["subnets"],
+        serde_json::json!([{ "type": "static", "address": "10.0.0.5/24" }])
+    );
+    // instance-id는 핫플러그의 견주기(서브넷 없이)와 같다.
+    assert_eq!(
+        seed.instance_id,
+        render(vm.id, "web", &ci, &vm.spec.nics).instance_id
+    );
+}
+
+#[tokio::test]
 async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
     let dir = TempDir::new().unwrap();
     let cluster = common::single_node(&MemRouter::default(), dir.path()).await;

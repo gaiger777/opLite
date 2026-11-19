@@ -12,7 +12,10 @@ use opl_driver::ovn::ovsdb::{
     cond, map_value, named_uuid, parse_bool, parse_int, parse_map, parse_strings, parse_uuids,
     set_value, string_set, uuid_value,
 };
-use opl_types::network::Network;
+use opl_types::ipam;
+use opl_types::network::{Network, Subnet};
+use opl_types::node::Node;
+use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
@@ -82,8 +85,86 @@ pub struct DhcpRow {
     pub external_ids: BTreeMap<String, String>,
 }
 
-/// 클러스터 `tag`의 바라는 NB 상태. 스테이지 3은 SDN 네트워크마다 논리 스위치이고, 포트·DHCP는 스테이지 4가 채운다.
-pub fn desired(networks: &[Network], tag: &str) -> NbState {
+/// VM id(`orbivisor:vm`, 포트)
+pub const VM_KEY: &str = "orbivisor:vm";
+/// NIC 순번(`orbivisor:nic`, 포트 — 보기용)
+pub const NIC_KEY: &str = "orbivisor:nic";
+/// 포트를 바인딩할 수 있는 chassis(쉼표 목록이면 첫 것이 주 chassis — 라이브 마이그레이션)
+pub const REQUESTED_CHASSIS: &str = "requested-chassis";
+/// 추가 chassis가 포트를 열기 전에 기다릴 패킷
+pub const ACTIVATION_STRATEGY: &str = "activation-strategy";
+/// DHCP 임대 시간(초)
+pub const LEASE_TIME: u32 = 86400;
+
+/// VM `vm`의 NIC(MAC `mac`) 논리 포트 이름 `opl-<VM id>-<MAC 12자리 16진>`. MAC은 클러스터에서 하나라 겹치지 않고 NIC
+/// 순서가 바뀌어도 같은 포트다. 노드의 OVS 포트 `external_ids:iface-id`가 이 이름이다(스테이지 5).
+pub fn port_name(vm: Uuid, mac: MacAddr) -> String {
+    let hex: String = mac.0.iter().map(|b| format!("{b:02x}")).collect();
+    format!("opl-{vm}-{hex}")
+}
+
+/// IPv4 서브넷 `subnet`(네트워크 `network`)의 DHCP_Options 칸(§8.3): 서버 주소 = 게이트웨이, 서버 MAC, 임대 시간, 망 MTU,
+/// DNS 서버(IPv4만, 있을 때). `router`는 넣지 않는다 — 65에는 라우터가 없고, 단순 네트워크 NIC를 함께 쓰는 VM의 기본
+/// 경로를 빼앗지 않게(66이 라우터에 붙은 서브넷에만 넣는다).
+fn dhcp_options(network: &Network, subnet: &Subnet) -> BTreeMap<String, String> {
+    let mut options = BTreeMap::from([
+        ("server_id".to_string(), subnet.gateway().to_string()),
+        (
+            "server_mac".to_string(),
+            ipam::server_mac(network.id).to_string(),
+        ),
+        ("lease_time".to_string(), LEASE_TIME.to_string()),
+    ]);
+    if let Some(mtu) = network.spec.mtu() {
+        options.insert("mtu".into(), mtu.to_string());
+    }
+    let dns: Vec<String> = subnet
+        .dns_servers
+        .iter()
+        .filter(|ip| ip.is_ipv4())
+        .map(ToString::to_string)
+        .collect();
+    if !dns.is_empty() {
+        options.insert("dns_server".into(), format!("{{{}}}", dns.join(", ")));
+    }
+    options
+}
+
+/// VM의 포트를 바인딩할 chassis(노드 UUID)와 추가 chassis가 열릴 때를 기다릴 패킷. 노드에서 돌거나 켜지는 중이면 그
+/// 노드, 라이브 마이그레이션 중이면 `"원본,대상"`과 `rarp`(QEMU가 끝에 보내는 RARP가 대상을 연다), 꺼져 있으면 없다.
+/// 클러스터에 없는 노드는 적지 않는다.
+fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static str>) {
+    let active = matches!(
+        vm.status.phase,
+        VmPhase::Starting | VmPhase::Running | VmPhase::Stopping | VmPhase::Migrating
+    );
+    let here = if active {
+        vm.status.node
+    } else if vm.spec.power == PowerState::Running {
+        // 켜는 중이지만 노드의 reconciler가 아직 상태를 쓰지 않았다(`status.node`는 지난번 노드일 수 있다).
+        vm.spec.node
+    } else {
+        None
+    };
+    let Some(here) = here.filter(|n| nodes.contains(n)) else {
+        return (None, None);
+    };
+    match vm
+        .status
+        .migration
+        .as_ref()
+        .filter(|m| active && nodes.contains(&m.node))
+    {
+        Some(m) if m.node != here => (Some(format!("{here},{}", m.node)), Some("rarp")),
+        _ => (Some(here.to_string()), None),
+    }
+}
+
+/// 클러스터 `tag`의 바라는 NB 상태(§8.3): SDN 네트워크마다 논리 스위치, 그 네트워크의 DHCP를 켠 IPv4 서브넷마다
+/// DHCP_Options, 템플릿이 아닌 VM의 그 네트워크 NIC마다(전원과 상관없이) 논리 포트(주소·포트 보안 = `"MAC IP4 IP6"`,
+/// 주소가 없으면 `"MAC"`, IPv4 주소의 서브넷이 DHCP면 그 DHCP 행, `requested-chassis`). `nodes`는 클러스터의 노드다.
+pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> NbState {
+    let node_ids: BTreeSet<Uuid> = nodes.iter().map(|n| n.id).collect();
     let mut switches: Vec<SwitchRow> = networks
         .iter()
         .filter(|n| n.spec.is_sdn())
@@ -96,12 +177,75 @@ pub fn desired(networks: &[Network], tag: &str) -> NbState {
             if let Some(folder) = n.spec.folder {
                 external_ids.insert(FOLDER_KEY.into(), folder.to_string());
             }
+            let dhcp = n
+                .spec
+                .subnets
+                .iter()
+                .filter(|s| s.is_ipv4() && s.dhcp())
+                .map(|s| DhcpRow {
+                    cidr: s.cidr.to_string(),
+                    options: dhcp_options(n, s),
+                    external_ids: BTreeMap::from([
+                        (CLUSTER_KEY.to_string(), tag.to_string()),
+                        (ID_KEY.to_string(), n.id.to_string()),
+                        (SUBNET_KEY.to_string(), s.cidr.to_string()),
+                    ]),
+                })
+                .collect();
+            let mut ports: Vec<PortRow> = vms
+                .iter()
+                .filter(|v| !v.spec.template)
+                .flat_map(|v| {
+                    v.spec
+                        .nics
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, nic)| nic.network == n.name)
+                        .filter_map(move |(i, nic)| Some((v, i, nic, nic.mac?)))
+                })
+                .map(|(v, i, nic, mac)| {
+                    let mut ips = nic.ips.clone();
+                    ips.sort_by_key(|ip| !ip.is_ipv4());
+                    let address = std::iter::once(mac.to_string())
+                        .chain(ips.iter().map(ToString::to_string))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let dhcpv4 = ips
+                        .iter()
+                        .filter(|ip| ip.is_ipv4())
+                        .find_map(|ip| ipam::nic_subnet(&n.spec, *ip))
+                        .filter(|s| s.dhcp())
+                        .map(|s| s.cidr.to_string());
+                    let mut options = BTreeMap::new();
+                    let (requested, activation) = chassis(v, &node_ids);
+                    if let Some(c) = requested {
+                        options.insert(REQUESTED_CHASSIS.to_string(), c);
+                    }
+                    if let Some(a) = activation {
+                        options.insert(ACTIVATION_STRATEGY.to_string(), a.to_string());
+                    }
+                    PortRow {
+                        name: port_name(v.id, mac),
+                        addresses: vec![address.clone()],
+                        port_security: vec![address],
+                        dhcpv4,
+                        enabled: Some(true),
+                        options,
+                        external_ids: BTreeMap::from([
+                            (CLUSTER_KEY.to_string(), tag.to_string()),
+                            (VM_KEY.to_string(), v.id.to_string()),
+                            (NIC_KEY.to_string(), i.to_string()),
+                        ]),
+                    }
+                })
+                .collect();
+            ports.sort_by(|a, b| a.name.cmp(&b.name));
             SwitchRow {
                 network: n.id,
                 name: switch_name(n.id),
                 external_ids,
-                ports: Vec::new(),
-                dhcp: Vec::new(),
+                ports,
+                dhcp,
             }
         })
         .collect();

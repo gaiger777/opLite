@@ -265,6 +265,47 @@ async fn a_volume_or_mac_belongs_to_one_vm() {
     ));
 }
 
+/// SDN NIC 하나(계획 65)의 VM
+fn sdn_vm(name: &str, network: &str, ip: &str, template: bool) -> opl_types::vm::Vm {
+    let spec = serde_json::json!({
+        "cpu": {"sockets": 1, "cores": 1},
+        "memory_mib": 256,
+        "machine": "virt",
+        "disks": [],
+        "nics": [{"network": network, "model": "virtio", "ips": [ip]}],
+        "template": template,
+    });
+    opl_types::resource::Resource::new(name, serde_json::from_value(spec).unwrap())
+}
+
+#[tokio::test]
+async fn an_sdn_address_belongs_to_one_nic_per_network() {
+    let tc = TestCluster::start(1).await;
+    let c = tc.get(node(1));
+    let a = sdn_vm("a", "tenant-a", "10.0.0.5", false);
+    c.create(&a).await.unwrap();
+    // 같은 네트워크의 같은 주소는 하나만이다(두 쓰기가 같은 주소를 노리면 뒤의 것이 거부된다).
+    let err = c
+        .create(&sdn_vm("b", "tenant-a", "10.0.0.5", false))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, ClusterError::Rejected(Rejection::InUse { field, holder, .. })
+            if field == "ip" && *holder == a.id),
+        "{err}"
+    );
+    // 다른 네트워크(다른 폴더의 같은 CIDR)의 같은 주소는 된다.
+    c.create(&sdn_vm("c", "tenant-b", "10.0.0.5", false))
+        .await
+        .unwrap();
+    // 템플릿은 주소를 세지 않는다(API가 템플릿의 주소를 지운다).
+    c.create(&sdn_vm("t", "tenant-a", "10.0.0.5", true))
+        .await
+        .unwrap();
+    // 주소가 없는 VM은 겹치지 않는다.
+    c.create(&vm("d", &[], &[])).await.unwrap();
+}
+
 fn snapshot(vm_id: uuid::Uuid, name: &str) -> opl_types::snapshot::Snapshot {
     let spec = serde_json::json!({
         "vm": vm_id,

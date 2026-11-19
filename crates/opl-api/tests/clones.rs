@@ -524,6 +524,37 @@ fn failed_with(task: &Value, error: &str) {
     assert!(got.contains(error), "{task}");
 }
 
+/// SDN 네트워크(계획 65, 서브넷 `cidr`)를 저장소에 바로 만든다(`POST /networks`의 SDN은 스테이지 6에서 열린다).
+async fn sdn_network(env: &Env, name: &str, cidr: &str) {
+    let net: opl_types::network::Network = Resource::new(
+        name,
+        serde_json::from_value(json!({ "sdn": {}, "subnets": [{ "cidr": cidr }] })).unwrap(),
+    );
+    env.cluster.create(&net).await.unwrap();
+}
+
+#[tokio::test]
+async fn clones_get_new_sdn_addresses() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    pool(&env, "local", vec![]).await;
+    let root = volume(&env, "root").await;
+    let _storage = fake_storage(&mut env, &[root]).await;
+    sdn_network(&env, "tenant", "10.10.0.0/24").await;
+    let mut req = vm_request("web");
+    req["spec"]["disks"] = json!([{ "volume": "root", "bus": "virtio-blk" }]);
+    req["spec"]["nics"] = json!([{ "network": "tenant", "model": "virtio" }]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["nics"][0]["ips"], json!(["10.10.0.2"]));
+    succeeded(&clone_and_wait(&admin, "web", json!({ "name": "web-2" })).await);
+    let copy = get_vm(&env, "web-2").unwrap();
+    assert_eq!(
+        copy.spec.nics[0].ips,
+        ["10.10.0.3".parse::<std::net::IpAddr>().unwrap()]
+    );
+}
+
 #[tokio::test]
 async fn clone_copies_disks_into_a_new_stopped_vm() {
     let mut env = Env::start().await;

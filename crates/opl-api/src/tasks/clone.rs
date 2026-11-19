@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use opl_cluster::ClusterError;
 use opl_driver::uefi_vars_path;
 use opl_types::cloud_init::IpConfig;
+use opl_types::network::NetworkSpec;
 use opl_types::node::{NodeSpec, PLACEMENT, TEMPLATES};
 use opl_types::placement::HaGroupSpec;
 use opl_types::resource::Resource;
@@ -323,9 +324,10 @@ pub(super) async fn clone(
     for (disk, (copy, _)) in new.spec.disks.iter_mut().zip(&copies) {
         disk.volume = copy.name.clone();
     }
-    // 복제본은 MAC을 새로 받는다.
+    // 복제본은 MAC과 SDN 주소를 새로 받는다(계획 65 §9).
     for nic in &mut new.spec.nics {
         nic.mac = None;
+        nic.ips.clear();
     }
     warnings.extend(identity_warning(
         "the clone",
@@ -349,7 +351,15 @@ pub(super) async fn clone(
             }
         },
     };
-    create_vm(ctx, task, new, start.or(node), start.is_some()).await?;
+    create_vm(
+        ctx,
+        task,
+        new,
+        start.or(node),
+        start.is_some(),
+        &mut warnings,
+    )
+    .await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
@@ -465,7 +475,8 @@ pub(super) fn identity_warning(what: &str, spec: &VmSpec) -> Option<String> {
     })
 }
 
-/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, 예약 없는 VM이다. 노드는 `node`이고
+/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, SDN NIC 주소를 채우며(스펙에 있던
+/// 주소는 비어 있으면 그대로, 아니면 새로 받고 `warnings`에 적는다 — 계획 65 §9), 예약 없는 VM이다. 노드는 `node`이고
 /// (복원·가져오기는 없음), `start`면 켠 채로(그 노드의 reconciler가 켠다), 아니면 꺼진 채로 만든다. `placement`를 모르는
 /// 노드가 있으면 VM 고정을, `templates`를 모르는 노드가 있으면 템플릿 표시(복원)를 버린다. 성공하면 Task가 만든 것을 더는
 /// 정리하지 않는다.
@@ -475,6 +486,7 @@ pub(super) async fn create_vm(
     mut new: Vm,
     node: Option<Uuid>,
     start: bool,
+    warnings: &mut Vec<String>,
 ) -> Result<(), String> {
     let name = new.name.clone();
     let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
@@ -528,8 +540,33 @@ pub(super) async fn create_vm(
     {
         crate::backup_receive::drop_templates(&mut new.spec);
     }
-    // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
-    if let Err(e) = ctx.cluster.create(&new).await {
+    // SDN 주소(계획 65): 다른 노드가 그새 같은 주소를 잡았으면 저장소가 거부하고 다시 고른다.
+    let wanted = new.spec.nics.clone();
+    let mut retries = 0;
+    let result = loop {
+        let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+        let (_, networks) = ctx
+            .cluster
+            .list::<NetworkSpec>()
+            .map_err(|e| e.to_string())?;
+        let others: Vec<&Vm> = vms.iter().filter(|v| v.id != new.id).collect();
+        new.spec.nics.clone_from(&wanted);
+        let notes = crate::ipam::assign_new(&mut new.spec, &others, &networks)
+            .map_err(|e| format!("cannot give the VM addresses: {e}"))?;
+        // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
+        match ctx.cluster.create(&new).await {
+            Err(e) if crate::ipam::is_ip_taken(&e) && retries < crate::ipam::RETRIES => {
+                retries += 1;
+            }
+            r => {
+                if r.is_ok() {
+                    warnings.extend(notes);
+                }
+                break r;
+            }
+        }
+    };
+    if let Err(e) = result {
         // 나중에 만들어질 수도 있으면 새 VM이 볼륨을 쓸 수 있으므로 지우지 않고 남긴다(설계 §11).
         if matches!(e, ClusterError::Timeout | ClusterError::Unreachable(_)) {
             ctx.cloned.lock().unwrap().remove(&task.id);

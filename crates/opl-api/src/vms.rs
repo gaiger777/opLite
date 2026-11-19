@@ -318,13 +318,14 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     crate::cpu::require_cpu_feature(&state.cluster, &spec.cpu.model, &spec.cpu.flags)?;
     // CPU 정책·vNUMA·hugepages는 옛 노드가 풀지 못한다(계획 64, 검증보다 먼저).
     crate::numa::require_numa_feature(&state.cluster, spec)?;
-    // NIC 주소(계획 65)는 옛 노드가 풀지 못한다(검증보다 먼저). IPAM이 들어오기 전(스테이지 6에서 열기 전)에는 받지
-    // 않는다.
-    if spec.nics.iter().any(|n| !n.ips.is_empty()) {
+    // NIC 주소와 SDN NIC(계획 65)는 옛 노드가 풀지 못한다(검증보다 먼저).
+    let sdn_nic = |n: &opl_types::vm::NicSpec| {
+        inv.networks
+            .iter()
+            .any(|net| net.name == n.network && net.spec.is_sdn())
+    };
+    if spec.nics.iter().any(|n| !n.ips.is_empty() || sdn_nic(n)) {
         require_feature(&state.cluster, opl_types::node::SDN)?;
-        return Err(ApiError::bad_request(
-            "NIC addresses (ips) are for SDN networks, which are not available yet",
-        ));
     }
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
@@ -370,6 +371,14 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
             )));
         }
     }
+    // SDN NIC 주소(계획 65 §9): 검사하고 새 NIC에 채운다. 보안 그룹 검사보다 먼저(SDN NIC의 그룹은 400).
+    let others_list: Vec<&Vm> = others.clone().collect();
+    crate::ipam::assign(
+        spec,
+        inv.vms.iter().find(|v| v.id == id).map(|v| &v.spec),
+        &others_list,
+        &inv.networks,
+    )?;
     check_security_groups(state, spec)?;
     if spec.template {
         check_template_spec(&vm.name, spec, &inv)?;
@@ -1023,9 +1032,24 @@ pub async fn create_vm(
     let scoring = score::scorer(&state, picks).await;
     let _lock = state.vm_lock.lock().await;
     let asked = vm.spec.cpu.model.clone();
-    prepare(&state, &mut vm, &scoring.scorer())
-        .map_err(|e| hide_node_reasons(&state, &principal, e))?;
-    vm.revision = state.cluster.create(&vm).await?;
+    // 다른 API 노드가 그새 같은 SDN 주소를 잡았으면(Raft가 거절) 요청 그대로 다시 고른다(계획 65 §9).
+    let wanted = vm.spec.clone();
+    let mut retries = 0;
+    loop {
+        prepare(&state, &mut vm, &scoring.scorer())
+            .map_err(|e| hide_node_reasons(&state, &principal, e))?;
+        match state.cluster.create(&vm).await {
+            Ok(revision) => {
+                vm.revision = revision;
+                break;
+            }
+            Err(e) if crate::ipam::is_ip_taken(&e) && retries < crate::ipam::RETRIES => {
+                retries += 1;
+                vm.spec = wanted.clone();
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
     let from = (asked != vm.spec.cpu.model).then(|| asked.to_string());
     let notes: Vec<String> = crate::cpu::audit_cpu(&vm.spec.cpu, None, from.as_deref())
         .into_iter()
@@ -1212,6 +1236,7 @@ async fn write_spec(
     edit: impl Fn(&Vm) -> Result<(VmSpec, BTreeMap<String, String>), ApiError>,
 ) -> Result<(HeaderMap, Vm), ApiError> {
     let scoring = score::scorer(state, picks).await;
+    let mut ip_retries = 0;
     for _ in 0..10 {
         let _lock = state.vm_lock.lock().await;
         let current = lookup::<VmSpec>(&state.cluster, key)?;
@@ -1248,6 +1273,9 @@ async fn write_spec(
         let (spec, labels) = (next.spec, next.labels);
         if spec.node != current.spec.node && !is_stopped(&current) {
             return Err(vm_running(&current, "move"));
+        }
+        if !is_stopped(&current) {
+            check_running_ips(&current, &spec)?;
         }
         // Secure Boot는 꺼진 VM에서, UEFI 변수가 없을 때만 바꾼다(변수 초기화와 함께 바꾸기는
         // `POST /vms/{key}/firmware/reset`).
@@ -1310,6 +1338,11 @@ async fn write_spec(
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. }))
                 if expected.is_none() =>
             {
+                continue;
+            }
+            // 다른 API 노드가 그새 같은 SDN 주소를 잡았다: 다시 고른다(계획 65 §9).
+            Err(e) if crate::ipam::is_ip_taken(&e) && ip_retries < crate::ipam::RETRIES => {
+                ip_retries += 1;
                 continue;
             }
             Err(e) => return Err(e.into()),
@@ -1511,6 +1544,29 @@ fn power_task_running(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
                 TaskOp::VmStart | TaskOp::VmStop | TaskOp::VmForceStop | TaskOp::VmReboot
             )
     }))
+}
+
+/// 켜져 있는 VM의 있던 NIC(같은 MAC·네트워크) 주소는 바꾸지 않는다(409 `vm_running`, 계획 65): OVN 포트 보안이 곧바로
+/// 새 주소만 받으므로 게스트가 아직 쓰는 옛 주소가 막힌다. 주소는 핫플러그 장치 변경이 아니다(`hotplug::plan`은 견주지
+/// 않는다) — 그래서 핫플러그 길에서도 여기서 막는다.
+fn check_running_ips(current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
+    for (i, nic) in spec.nics.iter().enumerate() {
+        let old = current
+            .spec
+            .nics
+            .iter()
+            .find(|n| n.mac.is_some() && n.mac == nic.mac && n.network == nic.network);
+        if old.is_some_and(|old| old.ips != nic.ips) {
+            return Err(ApiError::conflict(
+                "vm_running",
+                format!(
+                    "cannot change the addresses of NIC {i} of VM {:?} while it is running; stop it first",
+                    current.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `hotplug` 기능이 모자란 클러스터에서 실행 중인 VM의 디스크·NIC 변경을 거절한다(409 `vm_running`).
@@ -2584,5 +2640,36 @@ mod tests {
         );
         assert_eq!(host_full(&ApiError::conflict("no_capacity", "full")), None);
         assert_eq!(host_full(&ApiError::conflict("no_node", "none")), None);
+    }
+
+    /// 켜진 VM의 있던 NIC 주소는 바꾸지 않는다(핫플러그 장치 변경이 아니라서 따로 막는다, 계획 65).
+    #[test]
+    fn running_vms_keep_the_addresses_of_their_nics() {
+        let vm: Vm = Resource::new(
+            "web",
+            serde_json::from_value(serde_json::json!({
+                "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt", "power": "running",
+                "nics": [{ "network": "tenant", "model": "virtio", "mac": "52:54:00:00:00:01",
+                           "ips": ["10.0.0.5"] }]
+            }))
+            .unwrap(),
+        );
+        let mut spec = vm.spec.clone();
+        check_running_ips(&vm, &spec).unwrap();
+        // 새로 붙이는 NIC(새 MAC)는 주소를 받아도 된다.
+        let mut added = spec.nics[0].clone();
+        added.mac = Some("52:54:00:00:00:02".parse().unwrap());
+        added.ips = vec!["10.0.0.6".parse().unwrap()];
+        spec.nics.push(added);
+        check_running_ips(&vm, &spec).unwrap();
+        spec.nics[0].ips = vec!["10.0.0.7".parse().unwrap()];
+        let e = check_running_ips(&vm, &spec).unwrap_err();
+        assert_eq!((e.status, e.code), (StatusCode::CONFLICT, "vm_running"));
+        // 핫플러그 계획은 주소를 장치 변경으로 보지 않는다(그래서 위 검사가 막는다).
+        assert!(!hotplug::hardware_changed(&vm.spec, &{
+            let mut s = vm.spec.clone();
+            s.nics[0].ips.clear();
+            s
+        }));
     }
 }

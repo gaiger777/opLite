@@ -1,5 +1,5 @@
-//! 계획 65 API: SDN(OVN)의 기능 게이트(스테이지 1 — API를 열기 전에는 네트워크 `sdn`·`subnets`와 NIC `ips`를 받지
-//! 않는다).
+//! 계획 65 API: SDN(OVN)의 기능 게이트(스테이지 1 — API를 열기 전에는 네트워크 `sdn`·`subnets`를 받지 않는다. NIC
+//! `ips`는 옛 노드가 있으면 409, SDN 네트워크가 아니면 400 — 스테이지 4).
 
 mod common;
 
@@ -61,7 +61,8 @@ async fn sdn_fields_are_gated() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     assert!(body["spec"]["nics"][0].get("ips").is_none(), "{body}");
 
-    // 모든 노드가 알려도 스테이지 6 전에는 400이다.
+    // 모든 노드가 알려도 SDN 네트워크는 스테이지 6 전에는 400이다. `user` 네트워크 NIC의 주소는 400
+    // `ips_without_sdn`(스테이지 4)이다.
     for req in network_tries() {
         let (status, body) = admin.post("/networks", req.clone()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{req}: {body}");
@@ -72,6 +73,7 @@ async fn sdn_fields_are_gated() {
     }
     let (status, body) = admin.post("/vms", vm_try()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "ips_without_sdn", "{body}");
     // 바꾸기도 같다.
     let (_, vm) = admin.get("/vms/plain").await;
     let mut spec = vm["spec"].clone();

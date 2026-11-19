@@ -138,7 +138,12 @@ fn desired_has_a_switch_per_sdn_network_in_id_order() {
             ..spec()
         },
     );
-    let want = desired(&[foldered.clone(), vxlan, b.clone(), a.clone()], TAG);
+    let want = desired(
+        &[foldered.clone(), vxlan, b.clone(), a.clone()],
+        &[],
+        &[],
+        TAG,
+    );
     let names: Vec<&str> = want.switches.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(
         names,
@@ -163,7 +168,219 @@ fn desired_has_a_switch_per_sdn_network_in_id_order() {
             .all(|s| s.ports.is_empty() && s.dhcp.is_empty())
     );
     // 같은 입력이면 같은 출력
-    assert_eq!(want, desired(&[a, b, foldered], TAG));
+    assert_eq!(want, desired(&[a, b, foldered], &[], &[], TAG));
+}
+
+fn vm_on(name: &str, nics: serde_json::Value) -> opl_types::vm::Vm {
+    Resource::new(
+        name,
+        serde_json::from_value(json!({
+            "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt", "nics": nics
+        }))
+        .unwrap(),
+    )
+}
+
+fn node_res(name: &str) -> opl_types::node::Node {
+    Resource::new(
+        name,
+        serde_json::from_value(json!({ "address": "127.0.0.1:7443" })).unwrap(),
+    )
+}
+
+#[test]
+fn desired_has_dhcp_rows_and_a_port_per_sdn_nic() {
+    use opl_types::vm::{MigrationStatus, PowerState, VmPhase};
+    let mut net = sdn_net("tenant");
+    net.spec.subnets = serde_json::from_value(json!([
+        { "cidr": "10.0.0.0/24", "dns_servers": ["10.0.0.53", "2001:db8::53", "1.1.1.1"] },
+        { "cidr": "10.9.0.0/24", "dhcp": false },
+        { "cidr": "2001:db8::/64" }
+    ]))
+    .unwrap();
+    let bare = sdn_net("bare");
+    let (n1, n2) = (node_res("n1"), node_res("n2"));
+    let nodes = [n1.clone(), n2.clone()];
+    // 꺼진 VM: 포트는 있고 chassis는 없다. 단순 네트워크 NIC는 포트가 없다.
+    let off = vm_on(
+        "off",
+        json!([
+            { "network": "lan", "model": "virtio", "mac": "52:54:00:00:00:09" },
+            { "network": "tenant", "model": "virtio", "mac": "52:54:00:00:00:01",
+              "ips": ["2001:db8::5", "10.0.0.5"] }
+        ]),
+    );
+    // 켜진 VM(서브넷 밖 주소 없음, DHCP 꺼진 서브넷의 주소)
+    let mut on = vm_on(
+        "on",
+        json!([{ "network": "tenant", "model": "virtio", "mac": "52:54:00:00:00:02",
+                 "ips": ["10.9.0.7"] }]),
+    );
+    on.status.phase = VmPhase::Running;
+    on.status.node = Some(n1.id);
+    // 옮기는 VM: 두 chassis와 rarp
+    let mut moving = vm_on(
+        "moving",
+        json!([{ "network": "bare", "model": "virtio", "mac": "52:54:00:00:00:03" }]),
+    );
+    moving.status.phase = VmPhase::Migrating;
+    moving.status.node = Some(n1.id);
+    moving.status.migration = Some(MigrationStatus {
+        node: n2.id,
+        task: Uuid::now_v7(),
+        disks: Vec::new(),
+    });
+    // 켜는 중(상태가 아직 지난번 노드): 스펙의 노드
+    let mut starting = vm_on(
+        "starting",
+        json!([{ "network": "bare", "model": "virtio", "mac": "52:54:00:00:00:04" }]),
+    );
+    starting.spec.power = PowerState::Running;
+    starting.spec.node = Some(n2.id);
+    starting.status.node = Some(n1.id);
+    // 템플릿은 포트가 없다. 클러스터에 없는 노드는 적지 않는다.
+    let mut template = vm_on(
+        "template",
+        json!([{ "network": "tenant", "model": "virtio", "mac": "52:54:00:00:00:05" }]),
+    );
+    template.spec.template = true;
+    let mut gone = vm_on(
+        "gone",
+        json!([{ "network": "bare", "model": "virtio", "mac": "52:54:00:00:00:06" }]),
+    );
+    gone.status.phase = VmPhase::Running;
+    gone.status.node = Some(Uuid::now_v7());
+
+    let vms = [
+        off.clone(),
+        on.clone(),
+        moving.clone(),
+        starting.clone(),
+        template,
+        gone.clone(),
+    ];
+    let want = desired(&[net.clone(), bare.clone()], &vms, &nodes, TAG);
+    let sw = want.switches.iter().find(|s| s.network == net.id).unwrap();
+    // DHCP는 DHCP를 켠 IPv4 서브넷만이고 `router`가 없다. DNS는 IPv4만.
+    assert_eq!(sw.dhcp.len(), 1);
+    let mac = opl_types::ipam::server_mac(net.id).to_string();
+    assert_eq!(
+        sw.dhcp[0],
+        DhcpRow {
+            cidr: "10.0.0.0/24".into(),
+            options: ids(&[
+                ("server_id", "10.0.0.1"),
+                ("server_mac", &mac),
+                ("lease_time", "86400"),
+                ("mtu", "1442"),
+                ("dns_server", "{10.0.0.53, 1.1.1.1}"),
+            ]),
+            external_ids: ids(&[
+                (CLUSTER_KEY, TAG),
+                (ID_KEY, &net.id.to_string()),
+                (SUBNET_KEY, "10.0.0.0/24"),
+            ]),
+        }
+    );
+    let port = |sw: &SwitchRow, vm: &opl_types::vm::Vm, mac: &str| {
+        let name = port_name(vm.id, mac.parse().unwrap());
+        sw.ports.iter().find(|p| p.name == name).cloned().unwrap()
+    };
+    assert_eq!(sw.ports.len(), 2, "{:?}", sw.ports);
+    let p = port(sw, &off, "52:54:00:00:00:01");
+    assert_eq!(p.name, format!("opl-{}-525400000001", off.id));
+    // IPv4가 먼저다.
+    assert_eq!(p.addresses, ["52:54:00:00:00:01 10.0.0.5 2001:db8::5"]);
+    assert_eq!(p.port_security, p.addresses);
+    assert_eq!(p.dhcpv4.as_deref(), Some("10.0.0.0/24"));
+    assert_eq!(p.enabled, Some(true));
+    assert!(p.options.is_empty());
+    assert_eq!(
+        p.external_ids,
+        ids(&[
+            (CLUSTER_KEY, TAG),
+            (VM_KEY, &off.id.to_string()),
+            (NIC_KEY, "1"),
+        ])
+    );
+    let p = port(sw, &on, "52:54:00:00:00:02");
+    assert_eq!(p.addresses, ["52:54:00:00:00:02 10.9.0.7"]);
+    assert_eq!(p.dhcpv4, None);
+    assert_eq!(p.options, ids(&[(REQUESTED_CHASSIS, &n1.id.to_string())]));
+
+    let sw = want.switches.iter().find(|s| s.network == bare.id).unwrap();
+    assert!(sw.dhcp.is_empty());
+    let p = port(sw, &moving, "52:54:00:00:00:03");
+    assert_eq!(p.addresses, ["52:54:00:00:00:03"]);
+    assert_eq!(
+        p.options,
+        ids(&[
+            (REQUESTED_CHASSIS, &format!("{},{}", n1.id, n2.id)),
+            (ACTIVATION_STRATEGY, "rarp"),
+        ])
+    );
+    let p = port(sw, &starting, "52:54:00:00:00:04");
+    assert_eq!(p.options, ids(&[(REQUESTED_CHASSIS, &n2.id.to_string())]));
+    assert!(port(sw, &gone, "52:54:00:00:00:06").options.is_empty());
+    // 같은 입력이면 같은 출력(VM 순서와 상관없이)
+    let mut shuffled = vms.to_vec();
+    shuffled.reverse();
+    assert_eq!(want, desired(&[bare, net], &shuffled, &nodes, TAG));
+}
+
+#[tokio::test]
+async fn ports_and_dhcp_reach_the_nb_and_follow_spec_changes() {
+    let nb = Nb::new().await;
+    let mut net = sdn_net("tenant");
+    net.spec.subnets = serde_json::from_value(json!([{ "cidr": "10.0.0.0/24" }])).unwrap();
+    let mut vm = vm_on(
+        "web",
+        json!([{ "network": "tenant", "model": "virtio", "mac": "52:54:00:00:00:01",
+                 "ips": ["10.0.0.5"] }]),
+    );
+    let want = desired(
+        std::slice::from_ref(&net),
+        std::slice::from_ref(&vm),
+        &[],
+        TAG,
+    );
+    assert_eq!(nb.sync(&want, "1:1").await, 1);
+    let ports = nb.rows("Logical_Switch_Port");
+    assert_eq!(ports.len(), 1);
+    let dhcp = nb.rows("DHCP_Options");
+    assert_eq!(dhcp.len(), 1);
+    assert_eq!(
+        parse_uuids(&ports[0]["dhcpv4_options"]),
+        parse_uuids(&dhcp[0]["_uuid"])
+    );
+    assert_eq!(
+        parse_strings(&ports[0]["port_security"]),
+        ["52:54:00:00:00:01 10.0.0.5"]
+    );
+    // 다시 견주면 할 일이 없다.
+    assert_eq!(nb.sync(&want, "1:2").await, 0);
+    // 주소가 바뀌면 포트만 바뀐다. VM을 지우면 포트가 사라지고 DHCP 행은 남는다.
+    vm.spec.nics[0].ips = vec!["10.0.0.6".parse().unwrap()];
+    let want = desired(
+        std::slice::from_ref(&net),
+        std::slice::from_ref(&vm),
+        &[],
+        TAG,
+    );
+    assert_eq!(nb.sync(&want, "1:3").await, 1);
+    assert_eq!(
+        parse_strings(&nb.rows("Logical_Switch_Port")[0]["addresses"]),
+        ["52:54:00:00:00:01 10.0.0.6"]
+    );
+    let want = desired(std::slice::from_ref(&net), &[], &[], TAG);
+    assert_eq!(nb.sync(&want, "1:4").await, 1);
+    assert!(nb.rows("Logical_Switch_Port").is_empty());
+    assert_eq!(nb.rows("DHCP_Options").len(), 1);
+    // 서브넷을 빼면 DHCP 행도 사라진다.
+    net.spec.subnets.clear();
+    let want = desired(std::slice::from_ref(&net), &[], &[], TAG);
+    assert_eq!(nb.sync(&want, "1:5").await, 1);
+    assert!(nb.rows("DHCP_Options").is_empty());
 }
 
 #[test]

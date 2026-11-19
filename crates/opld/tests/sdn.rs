@@ -4,7 +4,8 @@
 //! (다른 CA·인증서 없음·평문 TCP는 실패), SB `Chassis`가 노드 UUID·Geneve·underlay인지, 노드 상태(`NodeStatus.sdn`)를 본다.
 //! 같은 호스트에 `ovsdb-server` 한 쌍을 127.0.0.2로 띄워 두 번째 중앙의 합류·떠나기를 실제 ovsdb로 보고, 에이전트가 멈춘
 //! 단위를 다시 켜고 장치 없는 OVS 포트를 지우는지, opld를 다시 띄워도 그대로인지 본다. 끝에 실제 출력(판, `cluster/status`,
-//! `ovs-vsctl` JSON)을 찍고 opl-driver 해석기로 읽는다(시험 고정물과 견주기). Task는 제어 소켓의 시험 고리로 만든다(`/sdn`
+//! `ovs-vsctl` JSON)을 찍고 opl-driver 해석기로 읽는다(시험 고정물과 견주기). 리더 OvnSync(스테이지 3)와 IPAM·DHCP
+//! (스테이지 4 — 이름공간의 OVS 내부 포트가 busybox udhcpc로 IPAM 주소를 받고, 포트 보안이 위조 주소를 막는지)도 본다. Task는 제어 소켓의 시험 고리로 만든다(`/sdn`
 //! API는 스테이지 6).
 //! `sudo -E env "PATH=$PATH" cargo test -p opld --features sdn-it --test sdn -- --nocapture`
 //! Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하다. OVN이 설치되지 않은 호스트여야 하고 시험은
@@ -843,4 +844,201 @@ async fn orbivisord_sets_up_ovn() {
         },
     )
     .await;
+
+    // 7. IPAM·DHCP(스테이지 4): 서브넷이 있는 SDN 네트워크와 꺼진 VM 둘 → NB의 DHCP_Options·논리 포트(주소·포트 보안).
+    // 이름공간 둘에 OVS 내부 포트를 그 두 포트의 iface-id·MAC으로 붙여(게스트 OS 없는 "VM") busybox udhcpc가 IPAM 주소·
+    // MTU·DNS를 받고, 서로 ping하고, 주소를 바꾼 위조 패킷은 포트 보안이 막는다.
+    Box::pin(dhcp_section(&d, &tag)).await;
+}
+
+/// 이름공간 `ns`의 OVS 내부 포트 `dev`(논리 포트 `port`, MAC `mac`)
+fn namespace_port(ns: &str, dev: &str, port: &str, mac: &str) {
+    let _ = try_run("ip", &["netns", "del", ns]);
+    run("ip", &["netns", "add", ns]);
+    run(
+        "ovs-vsctl",
+        &[
+            "--may-exist",
+            "add-port",
+            "br-int",
+            dev,
+            "--",
+            "set",
+            "Interface",
+            dev,
+            "type=internal",
+            &format!("external_ids:iface-id={port}"),
+        ],
+    );
+    run("ip", &["link", "set", dev, "netns", ns]);
+    let in_ns = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", ns, "ip"];
+        all.extend_from_slice(args);
+        run("ip", &all)
+    };
+    in_ns(&["link", "set", dev, "address", mac]);
+    in_ns(&["link", "set", "lo", "up"]);
+    in_ns(&["link", "set", dev, "up"]);
+}
+
+/// 이름공간 `ns`에서 udhcpc로 주소를 받는다. 스크립트가 받은 `ip mask mtu dns`를 `out`에 적는다.
+fn udhcpc(ns: &str, dev: &str, script: &std::path::Path, out: &std::path::Path) -> bool {
+    let _ = std::fs::remove_file(out);
+    let (ok, stdout, stderr) = try_run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            ns,
+            "busybox",
+            "udhcpc",
+            "-i",
+            dev,
+            "-f",
+            "-q",
+            "-n",
+            "-t",
+            "5",
+            "-T",
+            "1",
+            "-O",
+            "mtu",
+            "-s",
+            &script.to_string_lossy(),
+        ],
+    );
+    eprintln!("udhcpc {ns}: ok={ok}\n{stdout}{stderr}");
+    ok && out.exists()
+}
+
+async fn dhcp_section(d: &Daemon, tag: &str) {
+    let net = hook(
+        d,
+        "sdn-network",
+        json!({ "name": "tenant-d", "subnets": [
+            { "cidr": "10.77.0.0/24", "dns_servers": ["10.77.0.53"] }
+        ] }),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let c = client(d);
+    let mut vms = Vec::new();
+    for name in ["dhcp-a", "dhcp-b"] {
+        let vm = c
+            .post(
+                "/vms",
+                &json!({ "name": name, "spec": {
+                    "cpu": { "cores": 1 }, "memory_mib": 256,
+                    "nics": [{ "network": "tenant-d", "model": "virtio" }]
+                } }),
+            )
+            .await
+            .unwrap();
+        let id = vm["id"].as_str().unwrap().to_string();
+        let mac = vm["spec"]["nics"][0]["mac"].as_str().unwrap().to_string();
+        let ip = vm["spec"]["nics"][0]["ips"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let port = format!("opl-{id}-{}", mac.replace(':', ""));
+        vms.push((name, id, mac, ip, port));
+    }
+    assert_eq!(vms[0].3, "10.77.0.2");
+    assert_eq!(vms[1].3, "10.77.0.3");
+    wait_for("the ports and DHCP row of tenant-d", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        rows.ports
+            .iter()
+            .filter(|p| vms.iter().any(|v| v.4 == p.name))
+            .count()
+            == 2
+            && !rows.dhcp.is_empty()
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    let dhcp = rows
+        .dhcp
+        .iter()
+        .find(|r| r.external_ids.get("orbivisor:id") == Some(&net))
+        .unwrap();
+    eprintln!("DHCP_Options: {dhcp:?}");
+    assert_eq!(dhcp.cidr, "10.77.0.0/24");
+    assert_eq!(dhcp.options["server_id"], "10.77.0.1");
+    assert_eq!(dhcp.options["mtu"], "1442");
+    assert!(!dhcp.options.contains_key("router"), "{dhcp:?}");
+    for (_, _, mac, ip, port) in &vms {
+        let p = rows.ports.iter().find(|p| &p.name == port).unwrap();
+        assert_eq!(p.addresses, [format!("{mac} {ip}")]);
+        assert_eq!(p.port_security, p.addresses);
+        assert_eq!(p.dhcpv4.as_deref(), Some(dhcp.uuid.as_str()));
+        // 꺼진 VM은 chassis를 정하지 않는다.
+        assert!(!p.options.contains_key("requested-chassis"), "{p:?}");
+    }
+
+    let script = d.path("udhcpc.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\nbound|renew)\n  ip addr flush dev \"$interface\"\n  ip addr add \"$ip/$mask\" dev \"$interface\"\n  [ -n \"$mtu\" ] && ip link set \"$interface\" mtu \"$mtu\"\n  echo \"$ip $mask $mtu $dns\" > \"{}.$interface\"\n  ;;\nesac\n",
+            d.path("lease").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    run("chmod", &["755", &script.to_string_lossy()]);
+    let mut leases = Vec::new();
+    for (i, (_, _, mac, _, port)) in vms.iter().enumerate() {
+        let (ns, dev) = (format!("oplns{i}"), format!("opldh{i}"));
+        namespace_port(&ns, &dev, port, mac);
+        let out = d.path(&format!("lease.{dev}"));
+        wait_for(&format!("a DHCP lease in {ns}"), AGENT_WAIT, || async {
+            udhcpc(&ns, &dev, &script, &out)
+        })
+        .await;
+        let lease = std::fs::read_to_string(&out).unwrap();
+        eprintln!("lease {ns}: {lease}");
+        leases.push((ns, dev, lease));
+    }
+    for ((_, _, _, ip, _), (_, _, lease)) in vms.iter().zip(&leases) {
+        assert_eq!(lease.trim(), format!("{ip} 24 1442 10.77.0.53"));
+    }
+    let ping = |ns: &str, to: &str| {
+        try_run(
+            "ip",
+            &["netns", "exec", ns, "ping", "-c", "2", "-W", "2", to],
+        )
+        .0
+    };
+    let (ns_a, dev_a) = (leases[0].0.clone(), leases[0].1.clone());
+    let (ip_a, ip_b) = (vms[0].3.clone(), vms[1].3.clone());
+    assert!(ping(&ns_a, &ip_b), "ping {ip_a} -> {ip_b}");
+    assert!(ping(&leases[1].0, &ip_a), "ping {ip_b} -> {ip_a}");
+    // 위조: IPAM 주소가 아닌 주소로 보내면 포트 보안이 막는다. 제 주소로 돌리면 다시 된다.
+    let in_a = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", ns_a.as_str(), "ip"];
+        all.extend_from_slice(args);
+        run("ip", &all);
+    };
+    in_a(&["addr", "flush", "dev", &dev_a]);
+    in_a(&["addr", "add", "10.77.0.200/24", "dev", &dev_a]);
+    assert!(!ping(&ns_a, &ip_b), "a spoofed source got through");
+    in_a(&["addr", "flush", "dev", &dev_a]);
+    in_a(&["addr", "add", &format!("{ip_a}/24"), "dev", &dev_a]);
+    assert!(ping(&ns_a, &ip_b), "ping {ip_a} -> {ip_b} after restoring");
+
+    // VM을 지우면 그 포트가 사라진다(주소도 풀린다).
+    c.delete(&format!("/vms/{}", vms[1].1)).await.unwrap();
+    wait_for("dhcp-b's port to go", AGENT_WAIT, || async {
+        !nb_rows(d, tag)
+            .await
+            .ports
+            .iter()
+            .any(|p| p.name == vms[1].4)
+    })
+    .await;
+    for (ns, dev, _) in &leases {
+        let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
+        let _ = try_run("ip", &["netns", "del", ns]);
+    }
 }

@@ -407,6 +407,7 @@ jobs:
   # SDN(OVN) 설치·구성(계획 65): 깨끗한 Ubuntu 24.04 러너에서 orbivisord가 직접 ovn-central·ovn-host·openvswitch-switch를 apt로
   # 받아 NB·SB Raft 클러스터·northd(Orbivisor 단위, 노드 주소의 pssl, 클러스터 CA mTLS)와 chassis를 세우고, 127.0.0.2의
   # ovsdb-server 한 쌍으로 두 번째 중앙의 합류·떠나기를 본다. 실제 OVN 출력(판, cluster/status, ovs-vsctl JSON)을 로그에 남긴다.
+  # 리더 OvnSync의 NB 쓰기·펜싱과, 이름공간 둘의 OVS 내부 포트(게스트 없는 "VM")로 OVN DHCP(busybox udhcpc)·ping·포트 보안을 본다.
   ovn:
     runs-on: ubuntu-24.04
     timeout-minutes: 40
@@ -416,7 +417,7 @@ jobs:
       - name: QEMU (OVN itself is installed by orbivisord)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils busybox
           test ! -e /etc/ovn
           test ! -e /etc/openvswitch
           if dpkg -s ovn-central >/dev/null 2>&1 || dpkg -s openvswitch-switch >/dev/null 2>&1; then exit 1; fi

@@ -1,6 +1,7 @@
 //! VM의 cloud-init 설정(계획 57). Orbivisor가 이것으로 NoCloud 씨앗(meta-data·user-data·network-config·
 //! vendor-data)을 만들어 VM에 읽기 전용 CD로 넣는다.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -8,8 +9,13 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::host::valid_host;
+use crate::network::Subnet as NetSubnet;
 use crate::resource::Kind;
 use crate::vm::NicSpec;
+
+/// SDN 네트워크(이름)마다 그 서브넷(계획 65). network-config가 SDN NIC의 주소 설정을 IPAM 주소(`NicSpec.ips`)와 서브넷으로
+/// 만든다. 단순 네트워크는 넣지 않는다.
+pub type SdnSubnets = BTreeMap<String, Vec<NetSubnet>>;
 
 /// 응답에서 비밀번호(해시) 대신 보이는 값. PUT 본문의 이 값은 "저장된 해시를 그대로 둠"이다.
 pub const PASSWORD_MASK: &str = "********";
@@ -430,20 +436,40 @@ enum Subnet<'a> {
     #[serde(rename = "ipv6_slaac")]
     Ipv6Slaac,
     Static {
-        address: &'a str,
+        address: std::borrow::Cow<'a, str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         gateway: Option<&'a str>,
+        /// SDN 서브넷의 DNS 서버(계획 65, DHCP가 없는 서브넷). 비면 쓰지 않는다.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dns_nameservers: Vec<String>,
     },
     Static6 {
-        address: &'a str,
+        address: std::borrow::Cow<'a, str>,
         #[serde(skip_serializing_if = "Option::is_none")]
         gateway: Option<&'a str>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        dns_nameservers: Vec<String>,
     },
 }
 
 /// VM `vm_id`(이름 `vm_name`, NIC `nics`)의 cloud-init 설정 `ci`로 NoCloud 씨앗을 만든다. 같은 입력이면 같은
-/// 바이트다. YAML 파일은 JSON으로 쓴다(JSON은 YAML이고 cloud-init이 그대로 읽는다).
+/// 바이트다. YAML 파일은 JSON으로 쓴다(JSON은 YAML이고 cloud-init이 그대로 읽는다). SDN NIC의 서브넷을 모를 때(핫플러그의
+/// instance-id 견주기)의 꼴이다 — instance-id는 [`render_sdn`]과 같다.
 pub fn render(vm_id: Uuid, vm_name: &str, ci: &CloudInit, nics: &[NicSpec]) -> CloudInitSeed {
+    render_sdn(vm_id, vm_name, ci, nics, &SdnSubnets::new())
+}
+
+/// [`render`]에 SDN 네트워크의 서브넷 `sdn`을 더한 것(계획 65 §9): SDN NIC의 network-config를 IPAM 주소로 만든다.
+/// instance-id는 서브넷이 아니라 NIC 주소(`ips`)로 셈한다 — 그래서 서브넷을 모르는 핫플러그의 견주기
+/// (`hotplug::seed_matches`)와 같은 값이고, 주소가 바뀌면 바뀐다. 서브넷의 DHCP·DNS만 바꾸면 instance-id는 그대로다
+/// (게스트가 이미 적용한 설정을 다시 적용하지 않는다). 주소가 없는 VM은 계획 64와 바이트까지 같다.
+pub fn render_sdn(
+    vm_id: Uuid,
+    vm_name: &str,
+    ci: &CloudInit,
+    nics: &[NicSpec],
+    sdn: &SdnSubnets,
+) -> CloudInitSeed {
     let host = ci.hostname.as_deref().unwrap_or(vm_name);
     let label = host.split('.').next().unwrap_or(host);
     let user_data = match &ci.user_data {
@@ -463,13 +489,14 @@ pub fn render(vm_id: Uuid, vm_name: &str, ci: &CloudInit, nics: &[NicSpec]) -> C
             format!("#cloud-config\n{}\n", pretty(&data))
         }
     };
-    let network_config = network_config(ci, nics);
+    let network_config = network_config(ci, nics, sdn);
+    let key = seed_network_key(ci, nics);
     let instance_id = instance_id(
         vm_id,
         label,
         &user_data,
         ci.vendor_data.as_deref(),
-        network_config.as_deref(),
+        key.as_deref(),
     );
     let meta_data = pretty(&MetaData {
         instance_id: &instance_id,
@@ -518,21 +545,76 @@ pub fn instance_id(
     format!("iid-{hex}")
 }
 
-/// network-config. 주소 설정도 DNS도 없으면 파일을 두지 않는다(cloud-init 기본 — 첫 NIC DHCP). 있으면 모든 NIC를
-/// 적고, 설정이 없는(항목이 없거나 빈) NIC는 IPv4 DHCP다. IPv6만 설정한 NIC에는 IPv4를 두지 않는다(IPv6 전용 망에
-/// DHCPv4를 기다리지 않게).
-fn network_config(ci: &CloudInit, nics: &[NicSpec]) -> Option<String> {
+/// instance-id에 넣는 network-config 자리: SDN 서브넷 없이 만든 network-config에, NIC 주소(`ips`)가 하나라도 있으면
+/// NIC마다의 주소 줄을 붙인 것. 주소가 없으면 계획 64의 network-config 그대로다.
+fn seed_network_key(ci: &CloudInit, nics: &[NicSpec]) -> Option<String> {
+    let base = network_config(ci, nics, &SdnSubnets::new());
+    if nics.iter().all(|n| n.ips.is_empty()) {
+        return base;
+    }
+    let mut key = base.unwrap_or_default();
+    for (i, nic) in nics.iter().enumerate() {
+        let ips: Vec<String> = nic.ips.iter().map(ToString::to_string).collect();
+        key.push_str(&format!("# nic{i} ips {}\n", ips.join(" ")));
+    }
+    Some(key)
+}
+
+/// SDN NIC 하나의 주소 설정(계획 65 §9): IPv4 주소의 서브넷이 DHCP면 `dhcp`, 아니면 `static`(주소/접두사, 서브넷 DNS),
+/// IPv6는 `static6`이다(게이트웨이는 라우터가 오는 66부터). 주소가 없으면 IPv4 DHCP다. 서브넷에 들지 않는 주소(서브넷을
+/// 뺀 뒤)는 적지 않는다.
+fn sdn_subnets<'a>(nic: &NicSpec, subnets: &[NetSubnet]) -> Vec<Subnet<'a>> {
+    let mut ips = nic.ips.clone();
+    ips.sort_by_key(|ip| !ip.is_ipv4());
+    if ips.is_empty() {
+        return vec![Subnet::Dhcp];
+    }
+    ips.iter()
+        .filter_map(|ip| {
+            let subnet = subnets.iter().find(|s| s.cidr.contains(*ip))?;
+            let address = format!("{ip}/{}", subnet.cidr.prefix).into();
+            let dns = || subnet.dns_servers.iter().map(ToString::to_string).collect();
+            Some(match (ip.is_ipv4(), subnet.dhcp()) {
+                (true, true) => Subnet::Dhcp,
+                (true, false) => Subnet::Static {
+                    address,
+                    gateway: None,
+                    dns_nameservers: dns(),
+                },
+                (false, _) => Subnet::Static6 {
+                    address,
+                    gateway: None,
+                    dns_nameservers: dns(),
+                },
+            })
+        })
+        .collect()
+}
+
+/// network-config. 주소 설정도 DNS도 SDN NIC(`sdn`의 네트워크)도 없으면 파일을 두지 않는다(cloud-init 기본 — 첫 NIC
+/// DHCP). 있으면 모든 NIC를 적고, 설정이 없는(항목이 없거나 빈) NIC는 IPv4 DHCP다. IPv6만 설정한 NIC에는 IPv4를 두지
+/// 않는다(IPv6 전용 망에 DHCPv4를 기다리지 않게). SDN NIC는 `cloud_init.networks` 대신 IPAM 주소로 적는다
+/// ([`sdn_subnets`] — SDN NIC가 있으면 늘 파일이 있다: 첫 NIC DHCP 기본이면 둘째 NIC의 고정 IPv6가 빠진다).
+fn network_config(ci: &CloudInit, nics: &[NicSpec], sdn: &SdnSubnets) -> Option<String> {
     let dns = ci
         .dns
         .as_ref()
         .filter(|d| !d.servers.is_empty() || !d.search.is_empty());
-    if ci.networks.is_empty() && dns.is_none() {
+    let has_sdn = nics.iter().any(|n| sdn.contains_key(&n.network));
+    if ci.networks.is_empty() && dns.is_none() && !has_sdn {
         return None;
     }
     let mut config: Vec<NetEntry> = nics
         .iter()
         .enumerate()
         .map(|(i, nic)| {
+            if let Some(subnets) = sdn.get(&nic.network) {
+                return NetEntry::Physical {
+                    name: format!("eth{i}"),
+                    mac_address: nic.mac.map(|m| m.to_string()),
+                    subnets: sdn_subnets(nic, subnets),
+                };
+            }
             let net = ci.networks.get(i);
             let ipv6_only = net.is_some_and(|n| n.ipv4.is_none() && n.ipv6.is_some());
             let mut subnets = Vec::new();
@@ -540,8 +622,9 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec]) -> Option<String> {
                 subnets.push(match net.and_then(|n| n.ipv4.as_ref()) {
                     None | Some(IpConfig::Dhcp) | Some(IpConfig::Slaac) => Subnet::Dhcp,
                     Some(IpConfig::Static { address, gateway }) => Subnet::Static {
-                        address,
+                        address: address.as_str().into(),
                         gateway: gateway.as_deref(),
+                        dns_nameservers: Vec::new(),
                     },
                 });
             }
@@ -550,8 +633,9 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec]) -> Option<String> {
                 Some(IpConfig::Dhcp) => subnets.push(Subnet::Dhcp6),
                 Some(IpConfig::Slaac) => subnets.push(Subnet::Ipv6Slaac),
                 Some(IpConfig::Static { address, gateway }) => subnets.push(Subnet::Static6 {
-                    address,
+                    address: address.as_str().into(),
                     gateway: gateway.as_deref(),
+                    dns_nameservers: Vec::new(),
                 }),
             }
             NetEntry::Physical {
@@ -1162,6 +1246,65 @@ mod tests {
         assert_eq!(
             net["config"][2],
             serde_json::json!({ "type": "nameserver", "address": ["2001:db8::53"] })
+        );
+    }
+
+    #[test]
+    fn sdn_nics_take_their_addresses_from_ipam() {
+        // eth0: SDN(DHCP 서브넷 + 고정 IPv6), eth1: 단순, eth2: SDN(DHCP 없는 서브넷), eth3: 주소 없는 SDN
+        let nics: Vec<NicSpec> = serde_json::from_value(serde_json::json!([
+            { "network": "tenant", "model": "virtio", "mac": "52:54:00:00:00:01",
+              "ips": ["2001:db8::5", "10.0.0.5"] },
+            { "network": "lan", "model": "virtio", "mac": "52:54:00:00:00:02" },
+            { "network": "static", "model": "virtio", "mac": "52:54:00:00:00:03",
+              "ips": ["10.9.0.7"] },
+            { "network": "bare", "model": "virtio", "mac": "52:54:00:00:00:04" }
+        ]))
+        .unwrap();
+        let sdn: SdnSubnets = serde_json::from_value(serde_json::json!({
+            "tenant": [{ "cidr": "10.0.0.0/24" }, { "cidr": "2001:db8::/64", "dns_servers": ["2001:db8::53"] }],
+            "static": [{ "cidr": "10.9.0.0/16", "dhcp": false, "dns_servers": ["10.9.0.53"] }],
+            "bare": []
+        }))
+        .unwrap();
+        // 주소 설정이 없어도 SDN NIC가 있으면 파일이 있다. 단순 NIC는 지금처럼 DHCP다.
+        let c = CloudInit::default();
+        let seed = render_sdn(Uuid::nil(), "web", &c, &nics, &sdn);
+        let net: serde_json::Value =
+            serde_json::from_str(seed.network_config.as_deref().unwrap()).unwrap();
+        let subnets: Vec<_> = (0..4)
+            .map(|i| net["config"][i]["subnets"].clone())
+            .collect();
+        assert_eq!(
+            subnets,
+            [
+                serde_json::json!([
+                    { "type": "dhcp" },
+                    { "type": "static6", "address": "2001:db8::5/64", "dns_nameservers": ["2001:db8::53"] }
+                ]),
+                serde_json::json!([{ "type": "dhcp" }]),
+                serde_json::json!([
+                    { "type": "static", "address": "10.9.0.7/16", "dns_nameservers": ["10.9.0.53"] }
+                ]),
+                serde_json::json!([{ "type": "dhcp" }]),
+            ]
+        );
+        // instance-id는 서브넷을 모르는 견주기(핫플러그)와 같고, 주소가 바뀌면 바뀐다.
+        assert_eq!(
+            seed.instance_id,
+            render(Uuid::nil(), "web", &c, &nics).instance_id
+        );
+        let mut moved = nics.clone();
+        moved[0].ips[1] = "10.0.0.6".parse().unwrap();
+        assert_ne!(
+            seed.instance_id,
+            render_sdn(Uuid::nil(), "web", &c, &moved, &sdn).instance_id
+        );
+        // 주소가 없는 VM의 씨앗은 SDN 서브넷과 상관없이 계획 64와 같다(SDN NIC가 없으면 바이트까지).
+        let plain = render(Uuid::nil(), "web", &hashed(), &super::tests::nics());
+        assert_eq!(
+            plain,
+            render_sdn(Uuid::nil(), "web", &hashed(), &super::tests::nics(), &sdn)
         );
     }
 

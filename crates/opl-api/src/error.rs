@@ -116,10 +116,11 @@ impl From<ClusterError> for ApiError {
                         "revision_mismatch",
                         message,
                     ),
-                    // 배타 값: VM의 MAC·볼륨, 스냅샷의 VM 안 이름
+                    // 배타 값: VM의 MAC·볼륨·SDN NIC 주소, 스냅샷의 VM 안 이름
                     Rejection::InUse { field, .. } => ApiError::conflict(
                         match field.as_str() {
                             "mac" => "mac_in_use",
+                            "ip" => "ip_in_use",
                             "name" => "name_taken",
                             _ => "volume_in_use",
                         },
@@ -251,6 +252,13 @@ mod tests {
         assert_eq!(e.status, StatusCode::CONFLICT);
         assert_eq!(e.code, "mac_in_use");
         assert!(e.message.contains("52:54:00:00:00:01"));
+        let e = ApiError::from(ClusterError::Rejected(Rejection::InUse {
+            kind: opl_types::resource::Kind::Vm,
+            field: "ip".into(),
+            value: "tenant-a/10.0.0.5".into(),
+            holder: uuid::Uuid::nil(),
+        }));
+        assert_eq!((e.status, e.code), (StatusCode::CONFLICT, "ip_in_use"));
     }
 
     #[test]
