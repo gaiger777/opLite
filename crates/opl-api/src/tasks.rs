@@ -13,7 +13,7 @@ mod hotplug;
 mod import;
 mod migrate;
 mod replicate;
-mod sdn;
+pub(crate) mod sdn;
 mod snapshot;
 mod template;
 mod vm_replicate;

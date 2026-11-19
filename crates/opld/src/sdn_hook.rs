@@ -3,6 +3,8 @@
 //!
 //! - `POST /v1/test/sdn-task` `{op, node?}`: Task를 만들고 `{id}`(노드는 이름, 없으면 이 노드)
 //! - `POST /v1/test/sdn`: `Sdn` 리소스(없으면 null)
+//! - `POST /v1/test/sdn-network` `{name, delete?}`: SDN 네트워크(서브넷 없음)를 만들거나 지우고 `{id}`(스테이지 3 — `POST
+//!   /networks`의 SDN은 스테이지 6까지 막혀 있다)
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -12,6 +14,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
+use opl_types::network::{Network, NetworkSpec, SdnNet};
 use opl_types::node::NodeSpec;
 use opl_types::resource::Resource;
 use opl_types::sdn::{SDN_NAME, Sdn, SdnPending, SdnSpec, SdnStatus};
@@ -43,12 +46,50 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
     Router::new()
         .route("/v1/test/sdn-task", post(sdn_task))
         .route("/v1/test/sdn", post(get_sdn))
+        .route("/v1/test/sdn-network", post(sdn_network))
 }
 
 #[derive(Deserialize)]
 struct Body {
     op: TaskOp,
     node: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NetworkBody {
+    name: String,
+    #[serde(default)]
+    delete: bool,
+}
+
+async fn sdn_network(Json(b): Json<NetworkBody>) -> Result<Json<Value>, Failure> {
+    let cluster = member()?;
+    if b.delete {
+        let net = cluster
+            .get_by_name::<NetworkSpec>(&b.name)
+            .map_err(bad)?
+            .ok_or_else(|| bad("no such network"))?;
+        cluster
+            .delete::<NetworkSpec>(net.id, None)
+            .await
+            .map_err(bad)?;
+        return Ok(Json(json!({ "id": net.id })));
+    }
+    let net: Network = Resource::new(
+        b.name,
+        NetworkSpec {
+            bridge: None,
+            vlan: None,
+            vxlan: None,
+            sdn: Some(SdnNet::default()),
+            mtu: None,
+            subnets: Vec::new(),
+            folder: None,
+        },
+    );
+    net.spec.validate().map_err(bad)?;
+    cluster.create(&net).await.map_err(bad)?;
+    Ok(Json(json!({ "id": net.id })))
 }
 
 async fn get_sdn() -> Result<Json<Value>, Failure> {

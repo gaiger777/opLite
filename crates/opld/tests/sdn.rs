@@ -20,9 +20,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::Daemon;
+use opl_api::ovn_sync::nb::{NbActual, fence_key, fence_ops, parse_actual, read_ops};
 use opl_driver::ovn::{
-    Db, KnownCids, OvnHost, OvnOptions, OvnPaths, SystemRunner, TAG_KEY, ovsdb_server_args,
-    parse_cluster_status, parse_external_ids, parse_interfaces, parse_version, quote,
+    Db, Endpoint, KnownCids, NB_DB, OvnHost, OvnOptions, OvnPaths, OvsdbClient, OvsdbTls,
+    SystemRunner, TAG_KEY, Transport, ovsdb_server_args, parse_cluster_status, parse_external_ids,
+    parse_interfaces, parse_version, quote,
 };
 use oplctl::Client;
 use serde_json::{Value, json};
@@ -223,6 +225,34 @@ fn foreign_tls(dir: &std::path::Path) -> (String, String, String) {
         write("other.crt", &cert.pem()),
         write("other-ca.crt", &ca.pem()),
     )
+}
+
+/// 노드 TLS로 `ip`의 NB에 붙는다(서버 인증서는 노드 주소 127.0.0.1의 것이다).
+fn nb_endpoint(ip: &str) -> Endpoint {
+    Endpoint {
+        addr: format!("{ip}:6641").parse().unwrap(),
+        names: vec!["127.0.0.1".into()],
+    }
+}
+
+fn client_tls(d: &Daemon) -> Transport {
+    Transport::Tls(OvsdbTls::from_dir(&d.data_dir().join("pki")).unwrap())
+}
+
+/// NB 리더(127.0.0.1)의 우리 행
+async fn nb_rows(d: &Daemon, tag: &str) -> NbActual {
+    let c = OvsdbClient::connect(
+        &client_tls(d),
+        &nb_endpoint("127.0.0.1"),
+        Duration::from_secs(10),
+    )
+    .await
+    .unwrap();
+    parse_actual(&c.transact(NB_DB, read_ops(tag)).await.unwrap())
+}
+
+fn has_switch(rows: &NbActual, name: &str) -> bool {
+    rows.switches.iter().any(|s| s.name == name)
 }
 
 /// 시험이 띄운 `ovsdb-server`(풀릴 때 죽인다)
@@ -560,6 +590,35 @@ async fn orbivisord_sets_up_ovn() {
                 .any(|v| v.address == format!("ssl:127.0.0.2:{}", db.raft_port()))
         );
     }
+    // 팔로어(127.0.0.2)는 리더만 받는 클라이언트가 쓰지 않는다(`ovn-nbctl`의 기본 `--leader-only`가 팔로어 소켓을
+    // 거절하는 것과 같다). OvnSync는 리더로 옮기고, 읽기만 하는 쪽은 팔로어도 쓴다. 인증서 이름이 맞지 않으면 붙지 않는다.
+    let tls = client_tls(&d);
+    let both = [nb_endpoint("127.0.0.2"), nb_endpoint("127.0.0.1")];
+    let t10 = Duration::from_secs(10);
+    let c = OvsdbClient::connect_any(&tls, &both, NB_DB, true, t10)
+        .await
+        .unwrap();
+    assert_eq!(c.endpoint().addr, both[1].addr);
+    let f = OvsdbClient::connect_any(&tls, &both, NB_DB, false, t10)
+        .await
+        .unwrap();
+    assert_eq!(f.endpoint().addr, both[0].addr);
+    let s = f.server_db(NB_DB).await.unwrap().unwrap();
+    assert!(!s.is_leader() && s.connected, "{s:?}");
+    assert_eq!(s.cid, known.nb.map(|u| u.to_string()));
+    f.select(NB_DB, "NB_Global", vec![], &["_uuid"])
+        .await
+        .unwrap();
+    let e = OvsdbClient::connect_any(&tls, &both[..1], NB_DB, true, t10)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("not the cluster leader"), "{e}");
+    let wrong = Endpoint {
+        addr: both[1].addr,
+        names: vec!["10.255.0.1".into()],
+    };
+    assert!(OvsdbClient::connect(&tls, &wrong, t10).await.is_err());
+    drop((c, f));
     second
         .check_foreign("node2", known, true)
         .await
@@ -645,15 +704,136 @@ async fn orbivisord_sets_up_ovn() {
         &["--if-exists", "del-port", "br-int", "othertest0"],
     );
 
-    // 5. opld를 다시 띄워도 그대로다(OVN 단위는 opld 밖의 systemd 단위).
+    // 5. 리더 OvnSync(스테이지 3): SDN 네트워크 → NB 논리 스위치, 펜싱 토큰, 되살리기, SB chassis 청소
+    let sync_of = |sdn: &Value| sdn["status"]["sync"].clone();
+    let net_a = hook(&d, "sdn-network", json!({ "name": "tenant-a" })).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ls_a = format!("opl-{net_a}");
+    wait_for("the logical switch of tenant-a", AGENT_WAIT, || async {
+        has_switch(&nb_rows(&d, &tag).await, &ls_a)
+    })
+    .await;
+    let rows = nb_rows(&d, &tag).await;
+    let sw = rows.switches.iter().find(|s| s.name == ls_a).unwrap();
+    assert_eq!(sw.external_ids["orbivisor:cluster"], tag);
+    assert_eq!(sw.external_ids["orbivisor:id"], net_a);
+    assert_eq!(sw.external_ids["orbivisor:name"], "tenant-a");
+    wait_for("the sync record", AGENT_WAIT, || async {
+        sync_of(&hook(&d, "sdn", json!({})).await)["nb_cfg"].as_i64() >= Some(1)
+    })
+    .await;
+    let sync = sync_of(&hook(&d, "sdn", json!({})).await);
+    eprintln!("sync: {sync}");
+    assert!(sync.get("error").is_none(), "{sync}");
+    let term = sync["term"].as_u64().unwrap();
+    let global = rows.global.clone().unwrap();
+    let token = global.external_ids[&fence_key(&tag)].clone();
+    assert!(token.starts_with(&format!("{term}:")), "{token} {sync}");
+    // 관리자가 만든 태그 없는 스위치는 남는다.
+    let nbctl = |args: &[&str]| {
+        let mut all = vec!["--db=unix:/run/opl/ovn/nb.sock"];
+        all.extend_from_slice(args);
+        run("ovn-nbctl", &all)
+    };
+    nbctl(&["ls-add", "admin-ls"]);
+
+    // 펜싱: 읽은 뒤 다른 쓰는 이(더 큰 임기)가 토큰을 바꾸면 옛 쓰는 이의 트랜잭션은 실제 NB가 거절한다.
+    let writer = OvsdbClient::connect(&client_tls(&d), &nb_endpoint("127.0.0.1"), t10)
+        .await
+        .unwrap();
+    let stale = nb_rows(&d, &tag).await;
+    let (newer, _) = fence_ops(stale.global.as_ref(), &tag, &format!("{}:0", term + 1));
+    writer.transact(NB_DB, newer).await.unwrap();
+    let (mut old, _) = fence_ops(stale.global.as_ref(), &tag, &format!("{term}:999999"));
+    old.push(json!({"op": "insert", "table": "Logical_Switch", "row": {"name": "stale-writer"}}));
+    let e = writer.transact(NB_DB, old).await.unwrap_err();
+    assert!(e.is_wait_failed(), "{e}");
+    assert!(!nbctl(&["ls-list"]).contains("stale-writer"));
+    // 더 큰 임기의 토큰을 본 opld의 OvnSync도 쓰지 않는다.
+    let net_b = hook(&d, "sdn-network", json!({ "name": "tenant-b" })).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ls_b = format!("opl-{net_b}");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(!has_switch(&nb_rows(&d, &tag).await, &ls_b));
+    assert_eq!(sync_of(&hook(&d, "sdn", json!({})).await)["term"], term);
+    // 토큰을 이 리더의 임기로 되돌리고, 누가 우리 스위치를 지우고, 지운 노드의 chassis와 관리자 chassis를 SB에 둔다.
+    // 다음 다시 맞추기(60초)가 모두 고친다.
+    let now = nb_rows(&d, &tag).await;
+    let (back, _) = fence_ops(now.global.as_ref(), &tag, &format!("{term}:0"));
+    writer.transact(NB_DB, back).await.unwrap();
+    nbctl(&["ls-del", &ls_a]);
+    let sbctl = |args: &[&str]| {
+        let mut all = vec!["--db=unix:/run/opl/ovn/sb.sock"];
+        all.extend_from_slice(args);
+        run("ovn-sbctl", &all)
+    };
+    let gone = "8a0f6f8e-5d1c-4f4e-9a55-0d6b6f1d2c3b";
+    sbctl(&["chassis-add", gone, "geneve", "127.0.0.9"]);
+    sbctl(&["chassis-add", "admin-chassis", "geneve", "127.0.0.8"]);
+    wait_for(
+        "the resync to restore tenant-a, add tenant-b and drop the removed chassis",
+        Duration::from_secs(120),
+        || async {
+            let rows = nb_rows(&d, &tag).await;
+            let chassis = sbctl(&["--columns=name", "list", "Chassis"]);
+            has_switch(&rows, &ls_a) && has_switch(&rows, &ls_b) && !chassis.contains(gone)
+        },
+    )
+    .await;
+    let chassis = sbctl(&["--columns=name", "list", "Chassis"]);
+    assert!(
+        chassis.contains("admin-chassis") && chassis.contains(&node),
+        "{chassis}"
+    );
+    assert!(nbctl(&["ls-list"]).contains("admin-ls"));
+    // 네트워크를 지우면 스위치가 곧 사라진다(변경이 차례를 부른다).
+    hook(
+        &d,
+        "sdn-network",
+        json!({ "name": "tenant-b", "delete": true }),
+    )
+    .await;
+    wait_for("tenant-b's switch to go", AGENT_WAIT, || async {
+        !has_switch(&nb_rows(&d, &tag).await, &ls_b)
+    })
+    .await;
+    drop(writer);
+
+    // 6. opld를 다시 띄워도 그대로다(OVN 단위는 opld 밖의 systemd 단위).
+    // 멈춘 동안 누가 우리 스위치를 지워도, 다시 뜬 리더가 리더가 되자마자 되살리고 새 토큰을 쓴다. 투표 멤버가 하나뿐인
+    // Raft는 다시 떠도 임기가 그대로일 수 있다(실제로 그렇다) — 토큰은 (임기, 인덱스)로 앞선다.
+    let before = nb_rows(&d, &tag).await.global.unwrap().external_ids[&fence_key(&tag)].clone();
+    let parse = |t: &str| -> (u64, u64) {
+        let (a, b) = t.split_once(':').unwrap();
+        (a.parse().unwrap(), b.parse().unwrap())
+    };
     d.stop();
     assert_eq!(
         run("systemctl", &["is-active", "opl-ovn-nb.service"]).trim(),
         "active"
     );
+    nbctl(&["ls-del", &ls_a]);
     d.start().await;
     let sdn = hook(&d, "sdn", json!({})).await;
     assert_eq!(sdn["status"]["phase"], "ready");
+    wait_for(
+        "the restarted leader to restore tenant-a",
+        AGENT_WAIT,
+        || async { has_switch(&nb_rows(&d, &tag).await, &ls_a) },
+    )
+    .await;
+    let rows = nb_rows(&d, &tag).await;
+    let token = rows.global.unwrap().external_ids[&fence_key(&tag)].clone();
+    let (new_term, _) = parse(&token);
+    assert!(parse(&token) > parse(&before), "{token} after {before}");
+    wait_for("the sync record of the new term", AGENT_WAIT, || async {
+        sync_of(&hook(&d, "sdn", json!({})).await)["term"].as_u64() == Some(new_term)
+    })
+    .await;
     wait_for(
         "the node SDN status after a restart",
         AGENT_WAIT,

@@ -14,10 +14,11 @@ use opl_api::cluster::{DEFAULT_JOIN_TTL, issue_join_token};
 use opl_api::{
     ALERTS_DIR, AlertBook, AlertEngine, ApiCertAgent, AppState, AuditLog, BackupJobScheduler,
     Balancer, CephAgent, CephPeerSource, ClusterJanitor, FenceStatusSource, HaManager,
-    HaManagerConfig, IncomingConfig, IncomingMigrations, IncomingReplicas, PlacementBoard,
-    PlacementStatusSource, PowerFence, RemotePoller, ReplicaConfig, ReplicationScheduler,
-    RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig, TelemetryReporter,
-    UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager, VipManagerConfig,
+    HaManagerConfig, IncomingConfig, IncomingMigrations, IncomingReplicas, OvnSync, OvnSyncConfig,
+    OvnTransport, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller, ReplicaConfig,
+    ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
+    TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager,
+    VipManagerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -205,6 +206,8 @@ struct Services {
     backups: BackupJobScheduler,
     /// 리더가 주기가 지난 로컬 디스크 복제를 요청한다.
     replication: ReplicationScheduler,
+    /// 리더가 SDN 네트워크를 OVN NB에 맞추고 지운 노드의 SB chassis를 지운다(계획 65).
+    ovn_sync: OvnSync,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
     recovery: HaManager,
     /// 이 노드의 전원 끄기 펜싱을 이웃이 읽을 수 있는지 확인한다.
@@ -273,6 +276,7 @@ impl Services {
         self.balancer.shutdown().await;
         self.backups.shutdown().await;
         self.replication.shutdown().await;
+        self.ovn_sync.shutdown().await;
         self.telemetry.shutdown().await;
         self.alerts.shutdown().await;
         self.remotes.shutdown().await;
@@ -611,6 +615,13 @@ impl Member {
         let ceph = Arc::new(config.ceph.host());
         // SDN Task와 에이전트가 같은 단계들을 쓴다(계획 65). OVS 포트·chassis의 표시는 클러스터 태그다.
         let ovn = Arc::new(config.sdn.host(&config.data_dir, &tag));
+        // 리더 OvnSync는 노드 TLS(클러스터 CA mTLS)로 NB·SB에 붙는다. 붙을 때마다 파일을 읽어 다시 서명한 인증서를 쓴다.
+        let ovn_sync_config = OvnSyncConfig::new(
+            tag.clone(),
+            OvnTransport::Tls {
+                pki: pki_dir(config),
+            },
+        );
         let sdn_report = SdnReport::default();
         let ceph_source = Arc::new(CephPeerSource::new(cluster.clone(), node, ceph.clone()));
         // 토폴로지의 지금 값(계획 64 `ReadTopology`, Linux만): API와 다른 노드가 같은 읽기를 쓴다.
@@ -996,6 +1007,10 @@ impl Member {
                     AlertEngine::spawn(state.clone(), config.alert_engine_config()),
                 )
             });
+        // 리더가 Raft의 SDN 네트워크를 OVN NB에 맞춘다(계획 65 — `Sdn`이 준비되기 전에는 쉰다).
+        let ovn_sync = on(&rt.work, || {
+            OvnSync::spawn(cluster.clone(), ovn_sync_config)
+        });
         let recovery = on(&rt.core, || {
             HaManager::spawn(state.clone(), HaManagerConfig::default())
         });
@@ -1051,6 +1066,7 @@ impl Member {
                 balancer,
                 backups,
                 replication,
+                ovn_sync,
                 telemetry,
                 alerts,
                 remotes,

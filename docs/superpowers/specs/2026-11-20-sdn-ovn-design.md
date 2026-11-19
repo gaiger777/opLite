@@ -336,3 +336,28 @@ graph LR
 - **`cluster leave`**: 에이전트가 멈출 때 chassis면 `orbivisor-cluster`·`ovn-remote` 두 칸만 지우고 ovn-controller를 멈춘다.
 - **시험 고리**: API(스테이지 6)가 생기기 전이라 `sdn-it` 빌드의 제어 소켓 `POST /v1/test/sdn-task`가 API처럼 리소스를 만들고 자리를 리비전 확인 쓰기로 잡아 Task를 만든다. 스테이지 6은 이 일을 `/sdn` API로 옮기고(바쁨 409 `sdn_busy`, 다시 하기, 주소 검사), 노드 지우기의 409 `sdn_central_on_node`를 단다.
 - **실제 시험의 범위**(§14 1·4·5): 설치·단위·`pssl`만 듣기·mTLS(다른 CA·인증서 없음·평문)·SB Chassis·노드 상태, 다시 하기(DB를 다시 만들지 않음)·chassis 설치·마지막 중앙 빼기 거절, `OvnHost`(임시 경로·`SystemRunner`)로 127.0.0.2의 `ovsdb-server` 한 쌍이 합류·떠나기와 그 뒤 첫 NB 쓰기, 에이전트의 멈춘 단위 켜기·오래된 포트 청소(남의 포트는 둠), opld 다시 띄우기. §14 2·3(DHCP·QEMU 바인딩)은 스테이지 4·5.
+
+### 스테이지 3 (OVSDB 클라이언트·리더 OvnSync)
+
+**실제 ovsdb-server에서 받아 둔 사실**(OVN 24.03.8, 127.0.0.1·127.0.0.2 두 서버 NB 클러스터 — 탐침 작업, 요청과 답은 `opl-driver/src/ovn/fixtures/ovsdb-rpc.jsonl`):
+
+- `_Server` DB의 `Database` 행은 `leader`·`connected`·`model`(`clustered`)·`cid`·`sid`·`index`를 준다. 팔로어도 쓰기를 받아 리더에 넘긴다(그래서 "리더만"은 서버가 아니라 클라이언트가 정한다 — 팔로어가 주는 읽기는 낡았을 수 있다).
+- 원소가 하나인 집합은 원소 그대로 온다(`"ports": ["uuid", …]`, `"addresses": "02:… 10.0.0.5"`), 정수는 그대로(`"nb_cfg": 1`), 빈 선택 값은 `["set", []]`.
+- 오류는 RFC 7047 그대로다: 실패한 연산 자리에 `{"error","details"}`, 뒤는 `null`. 커밋 실패(남은 참조가 있는 포트 지우기의 `referential integrity violation`)는 연산 수 뒤의 한 칸이다. 펜싱 `wait` 실패는 `"timed out"`(`"where" clause test failed`), 없는 표는 `"syntax error"`.
+- 참조가 없는 `Logical_Switch_Port`를 넣으면 성공하고 커밋 때 사라진다. 스위치를 지우면 그 포트는 커밋 때 사라진다(같은 트랜잭션 안의 `select`에는 아직 보인다). 빈 NB에는 `NB_Global` 행이 없다(northd가 만든다).
+
+**결정**
+
+- **자리**: 클라이언트 `opl-driver/src/ovn/ovsdb.rs`(+ `ovsdb/tests.rs`), 가짜 서버 `opl-driver/src/ovn/fake_ovsdb.rs`(공개 모듈 — opl-api 시험도 쓴다, `MockHypervisor`와 같은 자리), OvnSync `opl-api/src/ovn_sync/{mod,nb,tests}.rs`(`nb`는 순수 부분: `desired`·읽기·`plan`·`batches`·`fence_ops`), 시험 `opl-api/tests/ovn_sync.rs`. opl-driver가 작업 공간의 `rustls`·`rustls-pki-types`·`tokio-rustls`를 쓴다(새 크레이트 없음). 메서드는 §8.1의 셋에 `list_dbs`를 더했다.
+- **연결**: 연결마다 읽기·쓰기 작업 하나가 답을 `id`로 짝짓고 서버의 `echo`에 곧바로 답한다(OvnSync는 연결을 차례 사이에 들고 있으므로 쉬는 동안의 비활성 탐침에 답해야 한다). 메시지는 구분자 없이 이어진 JSON이라 덜 받은 끝은 버퍼에 남긴다(256 MiB 상한).
+- **서버 인증서 이름**(§8.1의 "SAN = 중앙 주소"에 더함): 클러스터 CA로 서명했고 **중앙 주소 IP나 그 노드 주소(`NodeSpec.address`)의 호스트 이름 가운데 하나**에 맞으면 믿는다. 스테이지 2의 `central_address`는 노드 주소가 이름이면 underlay IP를 쓰는데, 노드 인증서의 SAN에는 그 IP가 없을 수 있다. 붙을 때마다 `{data_dir}/pki`를 읽는다(다시 서명한 인증서를 곧바로 씀).
+- **리더만**(스테이지 2 보고의 "팔로어의 로컬 소켓은 리더만 받는 클라이언트를 거절"): `OvsdbClient::connect_any(…, leader_only)`가 붙자마자 `_Server`의 `Database` 행을 읽어 `leader_only`면 클러스터의 연결된 리더(독립 DB는 늘)만, 아니면 클러스터에 붙은 서버면 받고, 아니면 다음 중앙으로 간다(오류에 서버마다의 까닭). OvnSync는 NB·SB 모두 리더만 쓰고, 들고 있던 연결도 차례마다 아직 리더인지 다시 본다(지난 리더를 먼저 붙어 본다). 읽기만 하는 쪽(스테이지 6의 `/networks/{key}/ips`)은 `leader_only = false`로 팔로어도 쓴다. 실제 시험이 127.0.0.2 팔로어로 이 길을 본다.
+- **펜싱**: 토큰은 `"<Raft 임기>:<읽은 Raft revision>"`이고 임기는 새 `Cluster::leader_term()`(리더일 때만 `current_term`)이다. 차례는 임기를 잡고 `read_barrier()` 뒤 임기가 그대로인지 다시 본다. NB 토큰의 임기가 내 임기보다 크면 쓰지 않고, `SdnStatus.sync`도 쓰지 않고 SB 청소도 하지 않는다(새 리더의 몫). 같거나 작으면 쓴다. 트랜잭션마다 `wait`(`NB_Global` 행의 `external_ids`가 읽은 맵 그대로, `_uuid`로) + `update`(토큰을 바꾼 맵 전체 — `wait`이 다른 키도 그대로임을 보장) + `mutate nb_cfg += 1`이다. **`NB_Global`이 없으면**(northd 전) `wait`(행 없음) + `insert`다 — 둘이 함께 넣으려 하면 하나만 된다. 그래서 `nb_cfg`는 차례마다가 아니라 트랜잭션마다 1 오른다.
+- **나누기**: 합이 2000 이하면 트랜잭션 하나, 넘으면 네트워크마다(지울 스위치 하나, 주인 없는 DHCP 행 묶음 하나도 저마다) 하나이고 한 네트워크가 2000을 넘어도 나누지 않는다. `wait`이 실패하면 남은 묶음을 그 차례에 하지 않고(다음 차례가 다시 읽는다), 다른 연산 오류는 그 묶음만 실패로 세고 다음 묶음을 한다. 오류는 앞 셋만 `sync.error`에 잇는다.
+- **견주기**: 엔진은 스위치·포트·DHCP_Options를 모두 다룬다(규모 시험이 5천 포트로 본다). 스테이지 3의 `desired`는 스위치만 내고(`external_ids`: `orbivisor:cluster`·`id`·`name`·`folder`), 포트·DHCP는 스테이지 4가 채운다. 같은 이름의 우리 스위치가 여럿이면 첫 것만 남긴다. 포트가 다른 네트워크로 옮겨 가면(같은 이름) 같은 행을 두 스위치의 `ports` `mutate`로 옮긴다(옮겨 갈 네트워크의 묶음 안). 우리 스위치에 관리자가 넣은 태그 없는 포트는 둔다. named-uuid는 묶음끼리 겹치지 않는 이름(`s<n>`·`p<n>_<i>`·`d<n>_<i>`)이고, 넣는 순서는 DHCP → 포트 → 스위치다.
+- **차례를 부르는 것**: Network·Vm·Sdn의 바뀜·지움과 **Node는 지움만**(§8.2의 "Node watch" — 노드 상태는 검사 루프가 5초마다 쓰므로 Node 바뀜마다 돌면 NB를 5초마다 다 읽는다. 65의 바라는 행은 노드에 매이지 않고, 스테이지 5의 `requested-chassis`는 VM `status`에서 온다). 리더가 되었는지는 1초마다 본다(§8.2의 "리더가 된 직후"). 우리가 쓴 `SdnStatus.sync`도 Sdn 바뀜이라 한 차례가 더 돌지만 할 일이 없다.
+- **SB 청소**: 차례마다(펜싱으로 멈춘 차례 빼고) SB 리더에서 `Chassis`·`Chassis_Private`의 이름이 UUID이고 Raft `Node`에 없는 행을 지운다(그 `Encap`은 참조가 없어져 따라 사라진다). UUID가 아닌 이름은 두고, NB가 안 되어도 한다. Raft 읽기가 실패한 차례는 아무것도 하지 않는다.
+- **`SdnStatus.sync`**: `term`·`index`는 NB에 있는 토큰(이번에 썼으면 내 것), `nb_cfg`·`hv_cfg`는 읽은 `NB_Global`(+ 쓴 트랜잭션 수), 오류는 지난 차례의 것이다. `at`만 바뀌면 60초에 한 번 쓴다. `Ready`가 아니면 쓰지 않는다.
+- **규모**(기록): 네트워크 50개·포트 5천을 빈 가짜 NB에 넣으면 트랜잭션 50개, 이어서 다 맞은 NB를 읽고 견주기까지 Mac 디버그 빌드에서 약 1.7초(대부분 가짜 서버의 JSON 처리)다.
+- **opld**: `OvnSync`를 리더 루프로 `rt.work`에 띄운다(`OvnTransport::Tls { pki }`, 태그는 노드의 클러스터 태그). 시험 고리 `POST /v1/test/sdn-network {name, delete?}`(SDN 네트워크 만들기·지우기 — `POST /networks`의 SDN은 스테이지 6까지 막혀 있다).
+- **실제 시험**(`ovn` 작업, §14 3의 NB 부분을 앞당김): 127.0.0.2 팔로어가 리더만 받는 클라이언트에 쓰이지 않고 읽기에는 쓰이는지와 인증서 이름 검사, SDN 네트워크 → NB 스위치와 칸, 펜싱 토큰과 `SdnStatus.sync`, 실제 NB에서 낡은 토큰을 읽은 쓰는 이의 트랜잭션이 거절되는지, 더 큰 임기의 토큰을 본 opld가 쓰지 않는지, 토큰을 돌려놓으면 다음 다시 맞추기(60초)가 `ovn-nbctl ls-del`한 우리 스위치를 되살리고 새 네트워크를 넣고 지운 노드의 SB chassis를 지우는지(관리자 스위치·chassis는 남음), 네트워크 지우기, opld가 멈춘 동안 지운 스위치를 다시 뜬 리더가 곧바로 되살리고 앞선 토큰을 쓰는지. 러너에서 본 것: 투표 멤버가 하나뿐인 Raft는 다시 떠도 임기가 그대로였다(토큰은 같은 임기에 인덱스만 늘었다) — 같은 임기는 같은 리더이므로 펜싱이 막지 않는다.

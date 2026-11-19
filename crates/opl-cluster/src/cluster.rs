@@ -1047,6 +1047,19 @@ impl Cluster {
         self.node.leases.end_fence(node);
     }
 
+    /// 이 노드가 지금 리더면 그 Raft 임기(openraft `current_term`), 아니면 None. 리더 `OvnSync`가 OVN NB에 쓰는 펜싱
+    /// 토큰의 앞이다(계획 65 §8.2): 임기는 줄지 않고 한 임기에 리더는 하나라, 더 큰 임기를 본 옛 리더는 쓰지 않는다.
+    pub fn leader_term(&self) -> Option<u64> {
+        match self.node.backend() {
+            Backend::Member { raft, .. } => {
+                let m = raft.metrics();
+                let m = m.borrow();
+                (m.current_leader == Some(self.id)).then_some(m.current_term)
+            }
+            Backend::Observer(_) => None,
+        }
+    }
+
     /// 이 노드가 아는 멤버십과 리더
     /// 관찰 노드는 저장소에 적용된 멤버십과 붙은 노드가 알린 리더다.
     pub fn members(&self) -> Members {
@@ -1643,7 +1656,9 @@ mod tests {
             .metrics()
             .borrow()
             .current_term;
+        assert_eq!(nodes[&leader].leader_term(), Some(term));
         let slow = *nodes.keys().find(|id| **id != leader).unwrap();
+        assert_eq!(nodes[&slow].leader_term(), None);
         // openraft 0.9의 Raft 루프는 자기 로그 쓰기가 끝나기를 기다리므로 느린 노드의 루프는 3초 멈추고,
         // 그 뒤 선거에 나설 수 있다. 여기서 보는 것은 실행기와 다른 노드라 선거는 끈다.
         nodes[&slow].raft().unwrap().runtime_config().elect(false);
