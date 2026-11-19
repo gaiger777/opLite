@@ -202,6 +202,67 @@ it("downloads an image and creates a template from it", async () => {
   ).toBeInTheDocument();
 });
 
+it("explains the catalog to users without root system.read", async () => {
+  // `GET /image-catalog`는 루트 system.read다. 묻지 않고 한 줄로 알린다(리뷰 2).
+  let asked = false;
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: ["storage.allocate"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/image-catalog"), () => {
+      asked = true;
+      return HttpResponse.json({ items: [] });
+    }),
+  );
+  renderPage(<ImagesPage />, { as: { ...OPERATOR, role: "none" } });
+  expect(await screen.findByText(/needs permission to read the system/)).toBeInTheDocument();
+  expect(screen.queryByRole("table", { name: "Image library" })).not.toBeInTheDocument();
+  expect(asked).toBe(false);
+});
+
+it("offers the template step only with root vm.create, and every pool without node read", async () => {
+  // 템플릿 VM은 루트에 만든다(폴더의 vm.create로는 서버가 막는다). 노드를 읽지 못하면 풀을 거르지 않는다(리뷰 2).
+  const A = "019a0f3c-0000-7000-8009-00000000000a";
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read", "storage.allocate"],
+        root_contents: ["system.read", "storage.allocate"],
+        folders: { [A]: ["vm.create"] },
+        contents: { [A]: ["vm.create"] },
+        objects: [],
+      }),
+    ),
+  );
+  mockLists({ node: [], "storage-pool": [pool("local"), pool("far", { nodes: ["n2"] })] });
+  mockCatalog([entry()]);
+  renderPage(<ImagesPage />, { as: { ...OPERATOR, role: "none" } });
+  const user = userEvent.setup();
+  await user.click(
+    await screen.findByRole("button", { name: "Download Ubuntu 24.04 LTS (x86_64)" }),
+  );
+  const dialog = await screen.findByRole("dialog", { name: "Download Ubuntu 24.04 LTS (x86_64)" });
+  const pools = within(dialog).getByLabelText("Storage pool");
+  await waitFor(() =>
+    expect(
+      within(pools)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(expect.arrayContaining(["local", "far"])),
+  );
+  expect(
+    within(dialog).queryByLabelText("Create a template after downloading"),
+  ).not.toBeInTheDocument();
+});
+
 it("lets admins add and remove custom entries", async () => {
   mockLists({ node: [NODE] });
   mockCatalog([entry(), custom]);

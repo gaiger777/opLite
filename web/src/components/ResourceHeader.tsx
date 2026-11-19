@@ -61,7 +61,8 @@ export function ResourceHeader({
           <h1 className="text-xl font-semibold break-all">{title}</h1>
           {pin && <PinButton resource={pin} />}
           {status}
-          {meta && <span className="text-sm text-muted-foreground">{meta}</span>}
+          {/* 긴 폴더 경로가 휴대폰에서 가로로 넘치지 않게 줄을 바꾼다(리뷰 2). */}
+          {meta && <span className="min-w-0 text-sm break-all text-muted-foreground">{meta}</span>}
         </div>
         {(actions || menu) && (
           <div className="flex flex-wrap items-center gap-2">

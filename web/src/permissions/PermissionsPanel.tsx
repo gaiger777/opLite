@@ -38,7 +38,9 @@ import {
   principalName,
   revokesSelf,
   roleName,
+  rolePrivileges,
   targetLabel,
+  targetName,
   useAccessRoles,
   useGroups,
 } from "@/permissions/grants";
@@ -189,7 +191,13 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
               ))}
               {grants.map((g) => {
                 const p = g.spec.principal;
-                const removable = perms.has("permission.modify", asTarget(g.spec.target, target));
+                // 빼기도 서버가 위임 규칙(역할의 권한이 grant가 닿는 곳에 다 있을 것)으로 본다(리뷰 2).
+                const removable = grantable(
+                  perms,
+                  rolePrivileges(g.spec.role, roles.data),
+                  asTarget(g.spec.target, target),
+                  g.spec.propagate !== false,
+                );
                 const who = principalName(p, names);
                 return (
                   <TableRow key={g.id}>
@@ -249,7 +257,9 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
           name: removing ? principalName(removing.spec.principal, names) : "",
         })}
         description={t(self ? "permissions.removeSelf" : "permissions.removeDescription")}
-        typeToConfirm={self && removing ? principalName(removing.spec.principal, names) : undefined}
+        typeToConfirm={
+          self && removing ? targetName(removing.spec.target, folderPath, objectName, t) : undefined
+        }
         confirmLabel={t("permissions.remove")}
         onConfirm={async () => {
           const grant = removing!;

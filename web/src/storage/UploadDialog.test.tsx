@@ -6,7 +6,7 @@ import { resetUploads } from "@/storage/upload";
 import { VolumesPage } from "@/storage/VolumesPage";
 import { FakeXhr } from "@/test/fakeXhr";
 import { NODE, pool, poolState } from "@/test/fixtures";
-import { mockLists, renderPage } from "@/test/render";
+import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
 beforeEach(() => vi.stubGlobal("XMLHttpRequest", FakeXhr));
@@ -104,16 +104,42 @@ it("imports into LVM-thin pools as raw", async () => {
 
 it("says when it cannot tell the node it is connected to", async () => {
   mockLists({ "storage-pool": [pool("local")], node: [NODE] });
-  server.use(
-    http.get(apiUrl("/cluster"), () =>
-      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
-    ),
-  );
-  renderPage(<VolumesPage />);
+  // whoami가 노드를 알리지 않았다(노드를 읽지 못한다).
+  renderPage(<VolumesPage />, { as: { user: ADMIN.user, name: ADMIN.name, role: ADMIN.role } });
   await userEvent.click(await screen.findByRole("button", { name: "Upload image" }));
   const dialog = await screen.findByRole("dialog", { name: "Upload a disk image" });
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "Cannot tell which node you are connected to. You do not have permission to do this.",
+    "Cannot tell which node you are connected to.",
+  );
+});
+
+it("offers every visible pool to a folder user who cannot read nodes", async () => {
+  // 노드 목록은 루트 cluster.read다. 노드 상태로 거르면 풀이 하나도 없었다(리뷰 2). 서버가 막는다.
+  const far = pool("far", { nodes: ["n2"] });
+  mockLists({ "storage-pool": [pool("local"), far], node: [] });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: ["system.read", "storage.allocate"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  renderPage(<VolumesPage />, { as: { ...ADMIN, role: "none" } });
+  await userEvent.click(await screen.findByRole("button", { name: "Upload image" }));
+  const dialog = await screen.findByRole("dialog", { name: "Upload a disk image" });
+  expect(await within(dialog).findByText(/connected to \(node-a\)/)).toBeInTheDocument();
+  const select = within(dialog).getByLabelText("Storage pool");
+  await vi.waitFor(() =>
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((o) => o.textContent),
+    ).toEqual(["—", "local", "far"]),
   );
 });
 

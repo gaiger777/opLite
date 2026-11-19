@@ -5,6 +5,7 @@ import { useSearchParams } from "react-router";
 import { AlertList } from "@/alerts/AlertList";
 import { AlertRulesTab } from "@/alerts/AlertRulesTab";
 import { HISTORY_PERIODS, useAlertHistory, useAlerts, type HistoryPeriod } from "@/alerts/alerts";
+import { usePermissions } from "@/auth/usePermissions";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { StatusChip } from "@/components/StatusChip";
@@ -27,8 +28,11 @@ const TABS = ["active", "rules", "history"] as const;
 /** 경보: 활성 경보, 규칙, 보낸 알림 기록(`?tab=active|rules|history`) */
 export function AlertsPage() {
   const { t } = useTranslation();
+  const perms = usePermissions();
   const [params, setParams] = useSearchParams();
-  const tab = TABS.find((id) => id === params.get("tab")) ?? "active";
+  // 규칙 목록은 루트 `alert.read`다(서버 `Root(AlertRead)`). 폴더에만 있으면 탭을 보이지 않는다.
+  const tabs = TABS.filter((id) => id !== "rules" || perms.has("alert.read"));
+  const tab = tabs.find((id) => id === params.get("tab")) ?? "active";
   return (
     <div className="flex flex-col gap-4">
       <PageHeader title={t("nav.alerts")} />
@@ -45,7 +49,7 @@ export function AlertsPage() {
         }
       >
         <TabsList>
-          {TABS.map((id) => (
+          {tabs.map((id) => (
             <TabsTrigger key={id} value={id}>
               {t(`alerts.tab.${id}`)}
             </TabsTrigger>

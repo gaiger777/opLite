@@ -14,7 +14,8 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { type CatalogEntry, defaultVolumeName } from "@/images/images";
 import { formatBytes } from "@/lib/format";
-import { poolUsableSomewhere } from "@/storage/pools";
+import { choosablePools } from "@/storage/pools";
+import { usePoolNodes } from "@/storage/usePoolNodes";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
 import { cloudInitErrors, emptyCloudInit, toCloudInit, validateKeys } from "@/vms/cloudInit";
@@ -40,13 +41,14 @@ export function ImageDownloadDialog({ entry, onClose }: { entry: CatalogEntry; o
   const { t } = useTranslation();
   const perms = usePermissions();
   const pools = useList("storage-pool");
-  const nodes = useList("node");
+  const nodes = usePoolNodes();
   const volumes = useList("volume");
   const vms = useList("vm");
   const networks = useList("network");
-  const usable = (pools.data ?? []).filter((p) => poolUsableSomewhere(p, nodes.data ?? []));
-  // 템플릿 VM을 만들려면 VM 쓰기 권한도 있어야 한다.
-  const canTemplate = perms.anywhere("vm.create");
+  // 노드를 읽지 못하면 거르지 않는다(서버가 막는다).
+  const usable = choosablePools(pools.data ?? [], nodes);
+  // 템플릿 VM은 폴더 없이 루트에 만든다: 루트 vm.create가 있어야 한다(설계 §18).
+  const canTemplate = perms.has("vm.create");
   const suggested = defaultVolumeName(entry);
   const [pool, setPool] = useState("");
   const [name, setName] = useState("");

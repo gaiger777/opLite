@@ -145,9 +145,10 @@ export function PoolsPage() {
       id: "sharing",
       header: t("pools.sharing"),
       priority: 3,
-      // 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유).
+      // 디렉터리 풀만 바꿀 수 있다. 다른 풀은 종류가 정한다(NFS·RBD·공유 LVM은 늘 공유). 공유 여부는 노드의
+      // 저장소를 묶는 일이라 루트 `cluster.admin`이다(계획 62 리뷰 2, 서버도 같다).
       cell: (pool) =>
-        writes(pool) && pool.spec.backend.kind === "dir" ? (
+        create && pool.spec.backend.kind === "dir" ? (
           <Switch
             aria-label={t("pools.sharedNamed", { name: pool.name })}
             checked={isShared(pool)}

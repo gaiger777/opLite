@@ -36,9 +36,12 @@ export function ImagesPage() {
   const perms = usePermissions();
   const queryClient = useQueryClient();
   const [arch, setArch] = useState<Arch | null>(null);
+  // 카탈로그 목록은 루트 `system.read`다(서버 `Root(SystemRead)`). 없으면 묻지 않고 한 줄로 알린다.
+  const readable = perms.has("system.read");
   const catalog = useQuery({
     queryKey: [...CATALOG_KEY, arch],
     queryFn: () => call(api.GET("/image-catalog", { params: { query: arch ? { arch } : {} } })),
+    enabled: readable,
   });
   const tasks = useList("task");
   const [downloading, setDownloading] = useState<CatalogEntry | null>(null);
@@ -55,6 +58,15 @@ export function ImagesPage() {
     void queryClient.invalidateQueries({ queryKey: CATALOG_KEY });
   }, [finished, queryClient]);
   const columns = write || admin ? 7 : 6;
+
+  if (!readable) {
+    return (
+      <div className="flex flex-col gap-4">
+        <PageHeader title={t("nav.images")} />
+        <p className="text-sm text-muted-foreground">{t("images.needsRead")}</p>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col gap-4">

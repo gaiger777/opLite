@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -56,6 +56,30 @@ it("hides the upload from viewers", async () => {
   renderPage(<ImportsPage />, { as: { ...ADMIN, role: "viewer" } });
   expect(await screen.findByText("web01")).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Upload OVA" })).not.toBeInTheDocument();
+});
+
+it("hides OVA and ESXi import from users with vm.create only in a folder", async () => {
+  // 서버는 가져오기를 루트 vm.create로 막는다. 파일을 다 올린 뒤 403을 받지 않게 숨긴다(리뷰 2).
+  mockLists({ "vm-import": [done] });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: ["system.read"],
+        folders: { "019a0f3c-0000-7000-8009-00000000000a": ["system.read", "vm.create"] },
+        contents: { "019a0f3c-0000-7000-8009-00000000000a": ["system.read", "vm.create"] },
+        objects: [],
+      }),
+    ),
+  );
+  // 전역 역할로 본 값(operator)이 받은 권한으로 바뀌면 사라진다.
+  renderPage(<ImportsPage />, { as: { ...ADMIN, role: "operator" } });
+  expect(await screen.findByText("web01")).toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "Upload OVA" })).not.toBeInTheDocument(),
+  );
+  expect(screen.queryByRole("button", { name: /ESXi/ })).not.toBeInTheDocument();
 });
 
 it("uploads an OVA under a name taken from the file", async () => {

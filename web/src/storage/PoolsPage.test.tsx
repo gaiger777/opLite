@@ -1,4 +1,4 @@
-import { act, screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -887,4 +887,26 @@ it("hides pool creation from a folder storage delegator", async () => {
   renderPage(<PoolsPage />, { path: "/storage-pools", as: { ...ADMIN, role: "none" } });
   expect(await screen.findByRole("button", { name: "Delete p1" })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
+});
+
+it("leaves the shared switch to cluster admins", async () => {
+  // 공유 여부 바꾸기는 루트 cluster.admin이다(리뷰 2, 서버와 같다). storage.config만으로는 글로 보인다.
+  mockLists({ "storage-pool": [pool("local")], node: [NODE] });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read", "cluster.read", "storage.config"],
+        root_contents: ["system.read", "cluster.read", "storage.config"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  renderPage(<PoolsPage />, { as: { ...ADMIN, role: "operator" } });
+  expect(await screen.findByText("local")).toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.queryByRole("switch", { name: "Shared storage: local" })).not.toBeInTheDocument(),
+  );
 });

@@ -328,10 +328,14 @@ function PolicyForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // OIDC 영역은 IdP가 MFA를 맡는다(서버도 400).
-  const realmNames = [
+  const known = [
     "local",
     ...(realms.data ?? []).filter((r) => r.backend.kind === "ldap").map((r) => r.name),
   ];
+  // 정책에 남은 지운 영역도 보인다: 서버가 모르는 영역을 400으로 막으니 여기서 끌 수 있어야 한다(리뷰 2).
+  const existing = new Set(["local", ...(realms.data ?? []).map((r) => r.name)]);
+  const gone = realms.isSuccess ? (policy?.realms ?? []).filter((r) => !existing.has(r)) : [];
+  const realmNames = [...known, ...gone];
   const flip = (set: ReadonlySet<string>, value: string, on: boolean) => {
     const next = new Set(set);
     if (on) {
@@ -393,7 +397,11 @@ function PolicyForm({
               onCheckedChange={(v) => setRealmSet(flip(realmSet, realm, v === true))}
             />
             <Label htmlFor={`policy-realm-${realm}`}>
-              {realm === "local" ? t("login.localRealm") : realm}
+              {realm === "local"
+                ? t("login.localRealm")
+                : gone.includes(realm)
+                  ? t("common.deletedName", { name: realm })
+                  : realm}
             </Label>
           </div>
         ))}

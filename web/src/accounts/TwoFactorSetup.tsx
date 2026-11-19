@@ -79,7 +79,8 @@ export type Proof = { code: string } | { password: string };
 
 /**
  * 이미 요소가 있으면 요소를 더하기 전에 본인 확인을 묻는다(서버 400 `proof_required`, 설계 §18 리뷰 1). 부르는 쪽이
- * 확인 창을 열고 받은 확인으로 `send`를 부른다(실패하면 그 창에 오류를 보인다). 없으면(첫 요소·강제 등록) 바로 보낸다.
+ * 확인 창을 열고 받은 확인으로 `send`를 부른다(던지면 그 창에 오류를 보이고, 끝나면 창을 닫는다). 인증 앱은 실패를
+ * 받아 창을 닫는다. 없으면(첫 요소·강제 등록) 바로 보낸다.
  */
 export type Prove = (title: string, send: (proof: Proof) => Promise<void>) => void;
 
@@ -116,7 +117,16 @@ export function TotpSetup({ onDone, prove }: { onDone(codes: string[]): void; pr
     };
     if (prove) {
       setError(null);
-      prove(t("twoFactor.setUpApp"), send);
+      // 실패하면 확인 창을 닫고 앱 코드를 비워 오류를 여기 보인다. 창에서 다시 누르면 지난 앱 코드를 또 보내게
+      // 된다(그 사이 코드가 바뀌었거나 틀린 코드였다, 계획 62 리뷰 2).
+      prove(t("twoFactor.setUpApp"), async (proof) => {
+        try {
+          await send(proof);
+        } catch (err) {
+          setCode("");
+          setError(errorMessage(t, err));
+        }
+      });
       return;
     }
     setBusy(true);

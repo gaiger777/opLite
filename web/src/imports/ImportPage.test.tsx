@@ -52,6 +52,29 @@ it("shows the source VM, its warnings and the last error", async () => {
   );
 });
 
+it("hides the run form and delete from users with vm.create only in a folder", async () => {
+  mockLists({ "vm-import": [web01], node: [NODE] });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: ["system.read"],
+        folders: { "019a0f3c-0000-7000-8009-00000000000a": ["system.read", "vm.create"] },
+        contents: { "019a0f3c-0000-7000-8009-00000000000a": ["system.read", "vm.create"] },
+        objects: [],
+      }),
+    ),
+  );
+  // 전역 역할로 본 값(operator)이 받은 권한으로 바뀌면 사라진다.
+  open(web01, { ...ADMIN, role: "operator" });
+  expect(await screen.findByRole("heading", { name: "web01" })).toBeInTheDocument();
+  await waitFor(() =>
+    expect(screen.queryByRole("button", { name: "Delete import web01" })).not.toBeInTheDocument(),
+  );
+  expect(screen.queryByRole("button", { name: "Import" })).not.toBeInTheDocument();
+});
+
 it("shows an ESXi source and explains lost credentials", async () => {
   const lost = esxiImport("web01", 1, {
     phase: "failed",

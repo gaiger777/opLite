@@ -146,7 +146,10 @@ export function VmMigrateDialog({
       onSubmit={submit}
     >
       {!able.ok && <p className="text-sm text-muted-foreground">{t(able.reason)}</p>}
-      {!nodes.data ? (
+      {!perms.reads("node") ? (
+        // 노드 목록은 루트 `cluster.read`다. 없으면 목록이 오지 않으니 기다리지 않고 그렇다고 말한다.
+        <p className="text-sm text-muted-foreground">{t("migrate.needsClusterRead")}</p>
+      ) : !nodes.data ? (
         <ListPending error={nodes.error} />
       ) : (
         targets.length === 0 && (

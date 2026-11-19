@@ -217,6 +217,33 @@ it("does not offer migration to a stopped VM or a viewer", async () => {
   expect(screen.queryByRole("button", { name: "Migrate" })).not.toBeInTheDocument();
 });
 
+it("hides migrate from a folder user who cannot read nodes", async () => {
+  // vm.migrate는 있지만 루트 cluster.read가 없어 대상 노드를 고를 수 없다(리뷰 2).
+  const mine = {
+    all: false,
+    root: [],
+    root_contents: ["system.read", "vm.power", "vm.migrate"],
+    folders: {},
+    contents: {},
+    objects: [],
+  };
+  server.use(http.get(apiUrl("/permissions/mine"), () => HttpResponse.json(mine)));
+  mockLists({ vm: [web], node: NODES });
+  const alice = { ...OPERATOR, name: "alice", role: "none" as const };
+  const { unmount } = openDetail(alice);
+  expect(await screen.findByRole("button", { name: "Stop" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Migrate" })).not.toBeInTheDocument();
+  unmount();
+
+  // 대화상자를 열어도(주소·옛 화면) 끝없이 기다리지 않고 그렇다고 말한다.
+  renderPage(<VmMigrateDialog vm={web} onClose={() => {}} />, { as: alice });
+  const dialog = await screen.findByRole("dialog", { name: "Migrate web" });
+  expect(
+    await within(dialog).findByText(/needs permission to read the cluster/),
+  ).toBeInTheDocument();
+  expect(within(dialog).queryByText("Loading…")).not.toBeInTheDocument();
+});
+
 /** 로컬 디렉터리 풀 `local`의 디스크 `web-root`(16 GiB)로 도는 VM */
 const local = served(
   vm("web", "running", {

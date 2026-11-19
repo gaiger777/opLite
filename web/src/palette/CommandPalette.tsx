@@ -13,6 +13,8 @@ import { usePermissions } from "@/auth/usePermissions";
 import { ACTION_ICONS } from "@/components/icons";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { Kbd } from "@/components/ui/kbd";
+import { FOLDER_PATHS } from "@/folders/folders";
+import { useFolderPaths } from "@/folders/useFolderPaths";
 import { createItems } from "@/layout/create";
 import { AREAS, visibleTabs } from "@/layout/nav";
 import { useDensity } from "@/lib/density";
@@ -39,6 +41,7 @@ const GROUPS = [
   "securityGroups",
   "backupJobs",
   "haGroups",
+  "folders",
   "navigation",
   "commands",
 ] as const;
@@ -357,6 +360,9 @@ function usePaletteItems(
   const groups = useList("security-group");
   const jobs = useList("backup-job");
   const ha = useList("ha-group");
+  // 읽을 수 있는 폴더만 온다(서버가 거른다). 이름은 경로다.
+  const folders = useList("folder");
+  const folderPath = useFolderPaths();
 
   const go = (to: string) => () => void navigate(to);
   const perms = usePermissions();
@@ -420,6 +426,14 @@ function usePaletteItems(
     );
     simple("backupJobs", "backup-job", jobs.data, () => "/backup-jobs");
     simple("haGroups", "ha-group", ha.data, () => "/ha-groups");
+    for (const f of folders.data ?? []) {
+      list.push({
+        id: `folder:${f.id}`,
+        group: "folders",
+        label: folderPath(f.id),
+        to: `${FOLDER_PATHS[f.spec.kind]}/${f.id}`,
+      });
+    }
     return list;
   }, [
     t,
@@ -432,6 +446,8 @@ function usePaletteItems(
     groups.data,
     jobs.data,
     ha.data,
+    folders.data,
+    folderPath,
   ]);
 
   const navigation = useMemo(() => {
@@ -521,9 +537,12 @@ function usePaletteItems(
       : [];
   }
 
-  /** 이 VM에 이 동작의 권한이 있다(없는 동작은 항목을 보이지 않는다) */
+  /** 이 VM에 이 동작의 권한이 있다(없는 동작은 항목을 보이지 않는다). 옮기기는 대상 노드를 알아야 한다. */
   function allowed(vm: Vm, verb: Verb): boolean {
     const privilege = VERB_PRIVILEGE[verb];
+    if (verb === "migrate" && !perms.reads("node")) {
+      return false;
+    }
     return !privilege || perms.has(privilege, objectTarget("vm", vm));
   }
 

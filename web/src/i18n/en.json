@@ -339,6 +339,7 @@
   },
   "common": {
     "loading": "Loading…",
+    "deletedName": "{{name}} (deleted)",
     "copied": "Copied.",
     "copyFailed": "Could not copy. Select the text and copy it yourself.",
     "cancel": "Cancel",
@@ -1025,6 +1026,7 @@
     "description": "The running VM moves to another node without stopping. Disks on node-local pools are copied to the target node. Both nodes need the same QEMU version and CPU.",
     "node": "Target node",
     "noTarget": "No other online node with the VM's architecture is available.",
+    "needsClusterRead": "Choosing a node needs permission to read the cluster (cluster.read on the root).",
     "submit": "Migrate",
     "op": "Migrate {{vm}} to {{node}}",
     "localDisks": "Disks to copy",
@@ -1100,6 +1102,7 @@
     "processing": "Processing {{name}}…",
     "noResponse": "{{name}}: no response from the server. Check the volume list for the result.",
     "dropped": "The server rejected the upload or the connection was lost.",
+    "unknownNode": "Cannot tell which node you are connected to.",
     "noNode": "Cannot tell which node you are connected to. {{error}}",
     "errors": {
       "file": "Choose a file."
@@ -1740,6 +1743,7 @@
     }
   },
   "remotes": {
+    "needsRead": "{{label}}: choosing a remote cluster needs permission to read the cluster (cluster.read on the root).",
     "pageHint": "Other Orbivisor clusters this cluster can see. The status is collected every 30 seconds. What you can do on a remote cluster also depends on the role of the user who owns its API token there.",
     "empty": "No remote clusters.",
     "add": "Add",
@@ -2710,6 +2714,7 @@
     }
   },
   "images": {
+    "needsRead": "The image catalog needs permission to read the system (system.read on the root). Ask an administrator.",
     "note": "Well-known cloud images. The downloading node checks each image against the publisher's checksum file and can make a template from the disk right away.",
     "add": "Add entry",
     "arch": "Architecture",
@@ -3068,6 +3073,7 @@
       "securityGroups": "Security groups",
       "backupJobs": "Backup jobs",
       "haGroups": "HA groups",
+      "folders": "Folders",
       "navigation": "Go to",
       "commands": "Commands"
     },
@@ -3324,6 +3330,7 @@
     "editNamed": "Edit {{name}}",
     "badName": "Use a resource name that is not admin, operator, viewer or none.",
     "noPrivileges": "Choose at least one privilege.",
+    "kept": "Kept: {{privileges}} — not known to this version of the web interface.",
     "saved": "Saved role {{name}}.",
     "deleteTitle": "Delete role {{name}}?",
     "deleteDescription": "A role that permissions use cannot be deleted.",
@@ -3339,6 +3346,8 @@
     "addExternal": "Link a directory group",
     "removeExternal": "Remove the directory group",
     "badExternal": "Choose a realm and enter a group name.",
+    "deletedRealm": "A mapping names a realm that was deleted. Choose another realm or remove the mapping.",
+    "longExternal": "A group name can be at most 1024 characters.",
     "empty": "No groups.",
     "createTitle": "Create a group",
     "editTitle": "Edit group {{name}}",

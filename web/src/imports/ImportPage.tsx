@@ -36,7 +36,8 @@ import {
 } from "@/imports/imports";
 import { ImportedVm, ImportPhaseBadge, useImportError } from "@/imports/ImportsPage";
 import { formatBytes, formatMib } from "@/lib/format";
-import { poolsUsableOn } from "@/storage/pools";
+import { choosablePoolsOn } from "@/storage/pools";
+import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
 
 /** 사용자 네트워크(NAT). 네트워크 리소스가 아니어도 매핑할 수 있다. */
@@ -69,7 +70,8 @@ function ImportView({ imp }: { imp: VmImport }) {
   const perms = usePermissions();
   const navigate = useNavigate();
   const nodes = useList("node");
-  const write = perms.anywhere("vm.create");
+  // 실행·지우기는 가져오기(루트의 객체)의 vm.create다: 폴더의 vm.create로는 서버가 막는다.
+  const write = perms.has("vm.create");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
   // 폼은 가져오기마다 하나다. 실행이 실패해 `ready`로 돌아와도 고친 값이 남는다.
@@ -279,13 +281,13 @@ function RunSection({
   const volumes = useList("volume");
   const pools = useList("storage-pool");
   const networks = useList("network");
-  const nodes = useList("node");
+  const nodes = usePoolNodes();
   const [errors, setErrors] = useState<Record<string, string>>({});
   // `name_taken`의 서버 메시지(VM과 만들 볼륨 가운데 어느 이름인지)
   const [taken, setTaken] = useState("");
   const [failure, setFailure] = useState<string | null>(null);
-  // Task는 OVA가 있는 노드에서 돈다. 그 노드에서 준비된 풀만 고른다.
-  const usable = poolsUsableOn(pools.data ?? [], nodes.data ?? [], imp.spec.node);
+  // Task는 OVA가 있는 노드에서 돈다. 그 노드에서 준비된 풀만 고른다(노드를 읽지 못하면 모두).
+  const usable = choosablePoolsOn(pools.data ?? [], nodes, imp.spec.node);
   const networkNames = [USER_NETWORK, ...(networks.data ?? []).map((n) => n.name)];
   const set = (patch: Partial<RunForm>) => setForm((f) => ({ ...f, ...patch }));
 

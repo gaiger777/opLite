@@ -226,6 +226,8 @@ function VmHeader({ vm }: { vm: Vm }) {
   const progress = migrationTask ? describeProgress(migrationTask, t) : null;
   // 이 VM의 권한(폴더·객체 grant). 없는 동작은 숨긴다.
   const can = useVmCan(vm);
+  // 옮기기는 대상 노드를 골라야 한다: 노드를 읽지 못하면(루트 `cluster.read` 없음) 보이지 않는다.
+  const migrate = can("vm.migrate") && perms.reads("node");
   const operate = can("vm.power");
   const write = can("vm.config");
   // Task 목록을 아직 모르면 Task 때문에는 막지 않는다(서버에 맡긴다).
@@ -238,7 +240,7 @@ function VmHeader({ vm }: { vm: Vm }) {
   const reasons = [
     ...(operate ? PRIMARY.map(reasonOf) : []),
     ...(can("vm.console") ? [consoleReason] : []),
-    ...(can("vm.migrate") ? [reasonOf("migrate")] : []),
+    ...(migrate ? [reasonOf("migrate")] : []),
   ];
   const button = (action: VmAction) => (
     <ReasonButton
@@ -337,7 +339,7 @@ function VmHeader({ vm }: { vm: Vm }) {
         },
       ]}
       actions={
-        (operate || can("vm.console") || can("vm.migrate")) && (
+        (operate || can("vm.console") || migrate) && (
           <>
             {operate && PRIMARY.map(button)}
             {/* 막혀도 같은 링크로 두어 상태가 바뀔 때 포커스를 잃지 않는다. 막히면 눌러도 열리지 않는다. */}
@@ -354,7 +356,7 @@ function VmHeader({ vm }: { vm: Vm }) {
                 </Link>
               </ReasonButton>
             )}
-            {can("vm.migrate") && (
+            {migrate && (
               <ReasonButton
                 variant="outline"
                 size="sm"

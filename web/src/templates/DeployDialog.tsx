@@ -1,4 +1,3 @@
-import { useQuery } from "@tanstack/react-query";
 import { type RefObject, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -7,6 +6,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import type { Vm } from "@/api/types";
+import { useOptionalPrincipal } from "@/auth/AuthProvider";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
@@ -16,7 +16,8 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
-import { poolsUsableOn } from "@/storage/pools";
+import { choosablePoolsOn } from "@/storage/pools";
+import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
 import { deployNames, diskVolumes, linkableDisks, templateNode } from "@/templates/templates";
 import { cloudInitErrors, emptyCloudInit, toCloudInit } from "@/vms/cloudInit";
@@ -72,13 +73,11 @@ export function DeployDialog({
   const [start, setStart] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 배포 Task는 서버가 정한 템플릿의 노드에서 돈다(`templateNode`). 그 노드에서 쓸 수 있는 풀만 고른다. 지난 노드가
-  // 빠졌거나 꺼졌으면 접속한 노드가 필요할 수 있다.
-  const cluster = useQuery({
-    queryKey: ["cluster"],
-    queryFn: () => call(api.GET("/cluster")),
-  });
-  const taskNode = templateNode(template, volumes.data, pools.data, nodes.data, cluster.data?.node);
-  const usablePools = poolsUsableOn(pools.data ?? [], nodes.data ?? [], taskNode);
+  // 빠졌거나 꺼졌으면 접속한 노드(whoami)가 필요할 수 있다. 노드를 읽지 못하면 거르지 않는다.
+  const serving = useOptionalPrincipal()?.node?.id;
+  const poolNodes = usePoolNodes();
+  const taskNode = templateNode(template, volumes.data, pools.data, nodes.data, serving);
+  const usablePools = choosablePoolsOn(pools.data ?? [], poolNodes, taskNode);
   const linkable = linkableDisks(bases, pools.data ?? [], pool);
   const parsed = deployNames(name, Number(count), Number(first));
   const preview = "names" in parsed && Number(count) > 1 ? parsed.names : [];

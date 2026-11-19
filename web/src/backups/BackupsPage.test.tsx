@@ -247,12 +247,15 @@ it("explains a backup that is busy", async () => {
   );
 });
 
-it("lets operators restore and delete", async () => {
+it("lets operators restore and delete but leaves copying to a remote to admins", async () => {
+  // 원격으로 보내기는 루트 cluster.admin이다(계획 62 리뷰 2, 서버와 같다).
   mockLists({ vm: [web], backup: [ofWeb] });
   renderPage(<BackupsPage />, { as: { ...ADMIN, role: "operator" } });
   expect(await screen.findByRole("button", { name: "Restore web-1" })).toBeEnabled();
   expect(screen.getByRole("button", { name: "Delete backup web-1" })).toBeEnabled();
-  expect(screen.getByRole("button", { name: "Copy web-1 to a remote cluster" })).toBeEnabled();
+  expect(
+    screen.queryByRole("button", { name: "Copy web-1 to a remote cluster" }),
+  ).not.toBeInTheDocument();
 });
 
 it("does not let viewers copy backups", async () => {

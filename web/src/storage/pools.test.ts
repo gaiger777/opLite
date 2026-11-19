@@ -1,4 +1,6 @@
 import {
+  choosablePools,
+  choosablePoolsOn,
   cephNameError,
   cephUserError,
   iscsiPortalError,
@@ -379,4 +381,14 @@ it("offers the pools a node can use, like the server's pool_usable_on", () => {
   expect(poolsUsableOn([lvm], [unknown], "n1")).toEqual([]);
   expect(poolsUsableOn([lvm], [fast({})], "n1")).toEqual([lvm]);
   expect(poolsUsableOn([lvm], [fast({ ready: false, error: "x" })], "n1")).toEqual([]);
+});
+
+it("offers every pool when the nodes cannot be read", () => {
+  // 노드를 읽지 못하는 폴더 사용자(null)는 노드 상태로 거르지 않는다. 서버가 막는다(리뷰 2).
+  const pools = [pool("local"), pool("far", { nodes: ["n2"] })];
+  expect(choosablePoolsOn(pools, null, undefined).map((p) => p.name)).toEqual(["local", "far"]);
+  expect(choosablePools(pools, null).map((p) => p.name)).toEqual(["local", "far"]);
+  // 읽을 수 있으면 예전처럼 거른다(노드 n1에는 far가 없다).
+  expect(choosablePoolsOn(pools, [NODE], "n1").map((p) => p.name)).toEqual(["local"]);
+  expect(choosablePools(pools, []).map((p) => p.name)).toEqual([]);
 });

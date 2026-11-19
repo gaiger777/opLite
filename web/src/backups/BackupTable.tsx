@@ -96,7 +96,9 @@ export function BackupTable({
   // 복원은 원래 VM의 backup.restore와 새 VM을 둘 곳의 vm.create다(계획 62, 폴더마다 다르므로 서버가 막는다).
   const restore = perms.anywhere("backup.restore") && perms.anywhere("vm.create");
   const remove = perms.anywhere("backup.delete");
-  const actions = restore || remove;
+  // 원격으로 보내기는 루트 `cluster.admin`이다(계획 62 리뷰 2, 서버도 같다). 원격 목록도 루트 권한이다.
+  const replicate = perms.has("cluster.admin");
+  const actions = restore || remove || replicate;
   const state = useTableState("backups", [], url);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));
   const originHint = (origin: NonNullable<Backup["spec"]["origin"]>) =>
@@ -350,8 +352,8 @@ export function BackupTable({
                       {t("backups.restore")}
                     </Button>
                   )}
-                  {/* 복제 API는 백업 쓰기 권한이다(지우기와 같다). 원격 쪽 권한은 원격 토큰의 역할이다. */}
-                  {remove && (
+                  {/* 원격 쪽 권한은 원격 토큰의 역할이다. */}
+                  {replicate && (
                     <Button
                       variant="outline"
                       size="sm"

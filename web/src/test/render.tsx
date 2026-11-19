@@ -47,6 +47,7 @@ export const ADMIN: Principal = {
   user: "00000000-0000-0000-0000-000000000001",
   name: "admin",
   role: "admin",
+  node: { id: "n1", name: "node-a" },
 };
 
 /** 화면 하나를 라우터와 함께 그린다. `as`로 로그인한 사용자를 정한다. */

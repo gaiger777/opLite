@@ -339,6 +339,7 @@
   },
   "common": {
     "loading": "불러오는 중…",
+    "deletedName": "{{name}} (지워짐)",
     "copied": "복사했습니다.",
     "copyFailed": "복사하지 못했습니다. 글을 선택해 직접 복사하세요.",
     "cancel": "취소",
@@ -1025,6 +1026,7 @@
     "description": "실행 중인 VM을 멈추지 않고 다른 노드로 옮깁니다. 노드 로컬 풀의 디스크는 대상 노드로 복사합니다. 두 노드의 QEMU 버전과 CPU가 같아야 합니다.",
     "node": "대상 노드",
     "noTarget": "VM의 아키텍처를 가진 다른 온라인 노드가 없습니다.",
+    "needsClusterRead": "노드를 고르려면 클러스터를 읽을 권한(루트의 cluster.read)이 있어야 합니다.",
     "submit": "마이그레이션",
     "op": "{{vm}}을(를) {{node}}(으)로 마이그레이션",
     "localDisks": "복사할 디스크",
@@ -1100,6 +1102,7 @@
     "processing": "{{name}} 처리 중…",
     "noResponse": "{{name}}: 서버 응답이 없습니다. 볼륨 목록에서 결과를 확인하세요.",
     "dropped": "서버가 업로드를 거절했거나 연결이 끊겼습니다.",
+    "unknownNode": "접속한 노드를 알 수 없습니다.",
     "noNode": "접속한 노드를 알 수 없습니다. {{error}}",
     "errors": {
       "file": "파일을 고르세요."
@@ -1740,6 +1743,7 @@
     }
   },
   "remotes": {
+    "needsRead": "{{label}}: 원격 클러스터를 고르려면 클러스터를 읽을 권한(루트의 cluster.read)이 있어야 합니다.",
     "pageHint": "이 클러스터가 보는 다른 Orbivisor 클러스터입니다. 상태는 30초마다 모읍니다. 원격 클러스터에서 할 수 있는 일은 그곳 API 토큰 주인의 역할로도 정해집니다.",
     "empty": "원격 클러스터가 없습니다.",
     "add": "추가",
@@ -2710,6 +2714,7 @@
     }
   },
   "images": {
+    "needsRead": "이미지 카탈로그를 보려면 시스템을 읽을 권한(루트의 system.read)이 있어야 합니다. 관리자에게 물어보세요.",
     "note": "잘 알려진 클라우드 이미지 목록입니다. 받는 노드가 배포처의 체크섬 파일로 이미지를 확인하고, 원하면 받은 디스크로 템플릿을 바로 만듭니다.",
     "add": "항목 더하기",
     "arch": "아키텍처",
@@ -3068,6 +3073,7 @@
       "securityGroups": "보안 그룹",
       "backupJobs": "백업 작업",
       "haGroups": "HA 그룹",
+      "folders": "폴더",
       "navigation": "이동",
       "commands": "명령"
     },
@@ -3324,6 +3330,7 @@
     "editNamed": "{{name}} 고치기",
     "badName": "admin·operator·viewer·none이 아닌 리소스 이름을 쓰세요.",
     "noPrivileges": "권한을 하나 이상 고르세요.",
+    "kept": "그대로 둠: {{privileges}} — 이 버전의 웹 화면이 모르는 권한입니다.",
     "saved": "역할 {{name}}을(를) 저장했습니다.",
     "deleteTitle": "역할 {{name}}을(를) 지울까요?",
     "deleteDescription": "권한이 쓰는 역할은 지울 수 없습니다.",
@@ -3339,6 +3346,8 @@
     "addExternal": "디렉터리 그룹 연결",
     "removeExternal": "디렉터리 그룹 빼기",
     "badExternal": "영역을 고르고 그룹 이름을 넣으세요.",
+    "deletedRealm": "지운 영역을 쓰는 연결이 있습니다. 다른 영역을 고르거나 그 연결을 빼세요.",
+    "longExternal": "그룹 이름은 1024자까지입니다.",
     "empty": "그룹이 없습니다.",
     "createTitle": "그룹 만들기",
     "editTitle": "그룹 {{name}} 고치기",

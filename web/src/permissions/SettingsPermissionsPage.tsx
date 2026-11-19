@@ -38,11 +38,15 @@ import {
   revokesSelf,
   roleName,
   targetLabel,
+  targetName,
   useAccessRoles,
   useGroups,
 } from "@/permissions/grants";
 import { AddGrantDialog, useObjectNames, usePrincipalNames } from "@/permissions/PermissionsPanel";
 import { validName } from "@/vms/form";
+
+/** 디렉터리 그룹 이름의 최대 길이(서버 `MAX_EXTERNAL_GROUP`) */
+const MAX_EXTERNAL_GROUP = 1024;
 
 /** 관리자가 아니면 읽지 않고 안내한다(주소로 바로 들어올 수 있다). */
 function AdminOnly({ title }: { title: string }) {
@@ -76,8 +80,17 @@ export function GrantsPage() {
   const [removing, setRemoving] = useState<Grant | null>(null);
   const me = usePrincipal();
   const groups = useGroups(admin);
-  // 나(나의 그룹)에게 건 grant를 빼면 이름을 넣어 확인한다.
-  const self = removing !== null && revokesSelf(removing, me.user, { groups: groups.data });
+  // 루트에서 내 권한의 근거(디렉터리 그룹 연결로 든 그룹의 grant도 들어 있다, 리뷰 2)
+  const mine = useQuery({
+    queryKey: ["permissions", "effective", "root"],
+    queryFn: () =>
+      call(api.GET("/permissions/effective", { params: { query: { object: "root" } } })),
+    enabled: admin,
+  });
+  // 나(나의 그룹)에게 건 grant를 빼면 대상 이름을 넣어 확인한다.
+  const self =
+    removing !== null &&
+    revokesSelf(removing, me.user, { mine: mine.data?.grants, groups: groups.data });
   const changed = () =>
     Promise.all([
       queryClient.invalidateQueries({ queryKey: ["grants"] }),
@@ -181,7 +194,9 @@ export function GrantsPage() {
           name: removing ? principalName(removing.spec.principal, names) : "",
         })}
         description={t(self ? "permissions.removeSelf" : "permissions.removeDescription")}
-        typeToConfirm={self && removing ? principalName(removing.spec.principal, names) : undefined}
+        typeToConfirm={
+          self && removing ? targetName(removing.spec.target, paths, objectName, t) : undefined
+        }
         confirmLabel={t("permissions.remove")}
         onConfirm={async () => {
           try {
@@ -328,6 +343,10 @@ function RoleDialog({
   const [description, setDescription] = useState(role?.description ?? "");
   const [chosen, setChosen] = useState<ReadonlySet<string>>(() => new Set(role?.privileges ?? []));
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // 이 웹이 모르는 권한(새 서버가 더한 것). 고를 칸이 없으니 그대로 두고 함께 보낸다(PUT은 목록을 바꿔 쓴다).
+  const unknown = (role?.privileges ?? []).filter(
+    (p) => !(PRIVILEGES as readonly string[]).includes(p),
+  );
   const toggle = (p: string, on: boolean) =>
     setChosen((prev) => {
       const next = new Set(prev);
@@ -351,7 +370,7 @@ function RoleDialog({
     if (Object.keys(found).length > 0) {
       return false;
     }
-    const privileges = PRIVILEGES.filter((p) => chosen.has(p));
+    const privileges = [...PRIVILEGES.filter((p) => chosen.has(p)), ...unknown];
     if (role) {
       await call(
         api.PUT("/access-roles/{key}", {
@@ -423,6 +442,11 @@ function RoleDialog({
             </div>
           ))}
         </div>
+        {unknown.length > 0 && (
+          <p className="text-xs text-muted-foreground">
+            {t("roleEditor.kept", { privileges: unknown.join(", ") })}
+          </p>
+        )}
       </fieldset>
     </FormDialog>
   );
@@ -562,6 +586,9 @@ function GroupDialog({
   );
   const [external, setExternal] = useState<ExternalGroupRef[]>(group?.spec.external ?? []);
   const [errors, setErrors] = useState<Record<string, string>>({});
+  // 지운 영역(목록을 읽은 뒤에만 안다). 선택 칸에 "(지워짐)"으로 보이고 저장을 막는다(리뷰 2).
+  const deleted = (realm: string) =>
+    realm !== "" && realms.isSuccess && !realms.data.some((r) => r.name === realm);
 
   async function submit() {
     const found: Record<string, string> = {};
@@ -570,6 +597,10 @@ function GroupDialog({
     }
     if (external.some((e) => !e.realm || !e.group.trim())) {
       found.external = "groupEditor.badExternal";
+    } else if (external.some((e) => deleted(e.realm))) {
+      found.external = "groupEditor.deletedRealm";
+    } else if (external.some((e) => e.group.trim().length > MAX_EXTERNAL_GROUP)) {
+      found.external = "groupEditor.longExternal";
     }
     setErrors(found);
     if (Object.keys(found).length > 0) {
@@ -670,6 +701,11 @@ function GroupDialog({
               }
             >
               <NativeSelectOption value="">{t("groupEditor.realm")}</NativeSelectOption>
+              {deleted(e.realm) && (
+                <NativeSelectOption value={e.realm}>
+                  {t("common.deletedName", { name: e.realm })}
+                </NativeSelectOption>
+              )}
               {(realms.data ?? []).map((r) => (
                 <NativeSelectOption key={r.name} value={r.name}>
                   {r.name}

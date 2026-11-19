@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { BackupJobsPage } from "@/backups/BackupJobsPage";
+import { RemoteTargetFields } from "@/backups/RemoteTargetFields";
 import { backupJob, pool, remote } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
@@ -322,4 +323,39 @@ it("makes incremental backups between full ones", async () => {
   await userEvent.click(within(dialog).getByRole("button", { name: "Save" }));
   expect(await screen.findByText("Backup job weekly saved.")).toBeInTheDocument();
   expect(body).toEqual({ full_every: 6, replicate: { remote: "dr", pool: "dr-bk" } });
+});
+
+it("explains the remote picker to users who cannot read remotes", async () => {
+  // `GET /remotes`는 루트 cluster.read다. 빈 목록이나 오류 대신 한 줄로 알린다(리뷰 2).
+  let asked = false;
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read", "backup.job"],
+        root_contents: ["system.read", "backup.job"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/remotes"), () => {
+      asked = true;
+      return HttpResponse.json({ revision: 1, items: [] });
+    }),
+  );
+  renderPage(
+    <RemoteTargetFields
+      id="t"
+      label="Copy to a remote cluster"
+      none="Do not copy"
+      value={{ remote: "", pool: "" }}
+      errors={{}}
+      onChange={() => {}}
+    />,
+    { as: { ...ADMIN, role: "none" } },
+  );
+  expect(await screen.findByText(/choosing a remote cluster needs permission/)).toBeInTheDocument();
+  expect(screen.queryByLabelText("Copy to a remote cluster")).not.toBeInTheDocument();
+  expect(asked).toBe(false);
 });

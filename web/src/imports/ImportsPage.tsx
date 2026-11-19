@@ -1,13 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
 import { Server, Upload } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate } from "react-router";
 
-import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import type { VmImport } from "@/api/types";
+import { useOptionalPrincipal } from "@/auth/AuthProvider";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -24,7 +23,6 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { errorMessage } from "@/i18n/errors";
 import { EsxiImportDialog } from "@/imports/EsxiImportDialog";
 import { CREDENTIALS_LOST, importNameError, sourceText } from "@/imports/imports";
 import { startOvaUpload } from "@/imports/ova";
@@ -89,8 +87,8 @@ export function ImportsPage() {
   const nodes = useList("node");
   const [uploading, setUploading] = useState(false);
   const [esxi, setEsxi] = useState(false);
-  // 가져오기는 대상 폴더의 vm.create다(계획 62).
-  const write = perms.anywhere("vm.create");
+  // OVA 올리기·ESXi 가져오기는 루트 vm.create다(서버 `Root(VmCreate)`, 설계 §18).
+  const write = perms.has("vm.create");
   useCreateParam(() => setUploading(true), write);
   const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? "—";
 
@@ -166,10 +164,9 @@ function OvaUploadDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const imports = useList("vm-import");
-  const nodes = useList("node");
-  // 파일은 접속한 노드로 간다(이미지 올리기와 같은 질의).
-  const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
-  const here = nodes.data?.find((n) => n.id === cluster.data?.node)?.name ?? "—";
+  // 파일은 접속한 노드로 간다(whoami가 알린다, 이미지 올리기와 같다).
+  const serving = useOptionalPrincipal()?.node;
+  const here = serving?.name ?? "—";
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -206,9 +203,9 @@ function OvaUploadDialog({ onClose }: { onClose(): void }) {
       onClose={onClose}
       onSubmit={submit}
     >
-      {cluster.isError && (
+      {!serving && (
         <p role="alert" className="text-sm text-destructive">
-          {t("uploads.noNode", { error: errorMessage(t, cluster.error) })}
+          {t("uploads.unknownNode")}
         </p>
       )}
       <Field

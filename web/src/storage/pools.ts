@@ -255,6 +255,24 @@ export function poolUsableSomewhere(pool: StoragePool, nodes: Node[]): boolean {
 }
 
 /**
+ * 노드 `nodeId`에서 고를 수 있는 풀. 노드를 읽지 못하는 사용자(루트 `cluster.read`가 없는 폴더 사용자)는 `nodes`가
+ * null이다: 노드 상태로 거르지 않고 보이는 풀을 모두 내고, 쓸 수 없는 풀은 서버가 `pool_not_on_node`·
+ * `pool_unavailable`로 막는다.
+ */
+export function choosablePoolsOn(
+  pools: StoragePool[],
+  nodes: Node[] | null,
+  nodeId: string | undefined,
+): StoragePool[] {
+  return nodes === null ? pools : poolsUsableOn(pools, nodes, nodeId);
+}
+
+/** 어느 노드에서라도 고를 수 있는 풀. `nodes`가 null이면 `choosablePoolsOn`처럼 모두다. */
+export function choosablePools(pools: StoragePool[], nodes: Node[] | null): StoragePool[] {
+  return nodes === null ? pools : pools.filter((p) => poolUsableSomewhere(p, nodes));
+}
+
+/**
  * 풀을 쓸 수 있는 노드와 그 노드가 알린 풀 상태. 노드 목록이 비었으면 위트니스가 아닌 모든 노드다.
  * 꺼진 노드는 `offline`이다.
  */

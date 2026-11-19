@@ -23,8 +23,9 @@ import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select"
 import { DownloadDialog } from "@/isos/DownloadDialog";
 import { isIso } from "@/isos/isos";
 import { formatBytes } from "@/lib/format";
-import { poolFormats, poolUsableSomewhere } from "@/storage/pools";
+import { choosablePools, poolFormats } from "@/storage/pools";
 import { UploadDialog } from "@/storage/UploadDialog";
+import { usePoolNodes } from "@/storage/usePoolNodes";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
 import { isTemplate } from "@/templates/templates";
@@ -359,9 +360,9 @@ function CreateVolumeDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
-  const nodes = useList("node");
-  // 서버는 풀을 쓸 수 있는 온라인 노드에 볼륨을 만든다. 그런 노드가 없는 풀은 고를 수 없다.
-  const usable = (pools.data ?? []).filter((p) => poolUsableSomewhere(p, nodes.data ?? []));
+  const nodes = usePoolNodes();
+  // 서버는 풀을 쓸 수 있는 온라인 노드에 볼륨을 만든다. 그런 노드가 없는 풀은 고를 수 없다(노드를 읽지 못하면 모두).
+  const usable = choosablePools(pools.data ?? [], nodes);
   const [name, setName] = useState("");
   const [pool, setPool] = useState("");
   const [sizeGib, setSizeGib] = useState("16");

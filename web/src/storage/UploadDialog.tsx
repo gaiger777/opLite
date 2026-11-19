@@ -1,20 +1,19 @@
-import { useQuery } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
+import { useOptionalPrincipal } from "@/auth/AuthProvider";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { errorMessage } from "@/i18n/errors";
 import { isoPools } from "@/isos/isos";
 import { formatBytes } from "@/lib/format";
-import { poolFormats, poolsUsableOn } from "@/storage/pools";
+import { choosablePoolsOn, poolFormats } from "@/storage/pools";
 import { nameFromFile, sourceFormatOf, startUpload } from "@/storage/upload";
+import { usePoolNodes } from "@/storage/usePoolNodes";
 import { volumeNameError } from "@/storage/volumes";
 
 type Schemas = components["schemas"];
@@ -30,13 +29,14 @@ export function UploadDialog({
   const { t } = useTranslation();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
-  const nodes = useList("node");
-  const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
+  const nodes = usePoolNodes();
+  // 접속한 노드는 whoami가 알린다(노드를 읽지 못하면 없다).
+  const serving = useOptionalPrincipal()?.node;
   // 서버는 받은 노드에서 쓸 수 있는(준비된) 풀로만 가져온다.
   const iso = content === "iso";
-  const onNode = poolsUsableOn(pools.data ?? [], nodes.data ?? [], cluster.data?.node);
+  const onNode = choosablePoolsOn(pools.data ?? [], nodes, serving?.id);
   const usable = iso ? isoPools(onNode) : onNode;
-  const here = nodes.data?.find((n) => n.id === cluster.data?.node)?.name ?? "—";
+  const here = serving?.name ?? "—";
   const [file, setFile] = useState<File | null>(null);
   const [name, setName] = useState("");
   const [pool, setPool] = useState("");
@@ -92,9 +92,9 @@ export function UploadDialog({
       onClose={onClose}
       onSubmit={submit}
     >
-      {cluster.isError && (
+      {!serving && (
         <p role="alert" className="text-sm text-destructive">
-          {t("uploads.noNode", { error: errorMessage(t, cluster.error) })}
+          {t("uploads.unknownNode")}
         </p>
       )}
       <Field
@@ -129,7 +129,7 @@ export function UploadDialog({
         label={t("volumes.pool")}
         error={errors.pool}
         hint={
-          usable.length === 0 && cluster.data && pools.isSuccess
+          usable.length === 0 && serving && pools.isSuccess
             ? t(iso ? "uploads.noIsoPool" : "uploads.noPool")
             : undefined
         }

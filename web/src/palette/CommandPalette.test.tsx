@@ -8,7 +8,7 @@ import type { Node, Principal, Vm } from "@/api/types";
 import { AppLayout } from "@/layout/AppLayout";
 import { resetTasks } from "@/tasks/tasks";
 import { expectNoAxeViolations } from "@/test/axe";
-import { NODE, pool, task, vm } from "@/test/fixtures";
+import { folder, folderId, NODE, pool, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -266,6 +266,41 @@ it("gives viewers no actions", async () => {
   // 만들기 명령도 없다.
   await user.type(box, "create");
   expect(await screen.findByText("No matches.")).toBeInTheDocument();
+});
+
+it("lists readable folders by path and hides migrate without cluster read", async () => {
+  // 폴더 사용자: VM 동작은 있지만 루트 `cluster.read`가 없어 노드를 고를 수 없다(리뷰 2).
+  const FOLDER_USER: Principal = { ...VIEWER, name: "alice", role: "none" };
+  mockLists({
+    vm: [web, webDb, app],
+    node: NODES,
+    folder: [folder("teamA"), folder("sub", "vm", "teamA")],
+  });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: ["system.read", "vm.power", "vm.migrate"],
+        folders: { [folderId("teamA")]: ["system.read"], [folderId("sub")]: ["system.read"] },
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  const { router } = shell("/", FOLDER_USER);
+  const { user, box } = await search("ap", /^app/);
+  await user.keyboard("{Tab}");
+  const group = await screen.findByRole("group", { name: "Actions" });
+  expect(within(group).getByRole("option", { name: "Start app" })).toBeInTheDocument();
+  expect(within(group).queryByRole("option", { name: /^Migrate/ })).not.toBeInTheDocument();
+  await user.clear(box);
+  await user.type(box, "sub");
+  const folders = await screen.findByRole("group", { name: "Folders" });
+  await user.click(within(folders).getByRole("option", { name: "/teamA/sub" }));
+  await waitFor(() =>
+    expect(router.state.location.pathname).toBe(`/vm-folders/${folderId("sub")}`),
+  );
 });
 
 it("goes to every sub-screen, including views", async () => {

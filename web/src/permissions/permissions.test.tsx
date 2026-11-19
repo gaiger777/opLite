@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import { Permissions } from "@/auth/permissions";
 import { grantable } from "@/permissions/grants";
 import { PermissionsPanel } from "@/permissions/PermissionsPanel";
-import { RolesPage } from "@/permissions/SettingsPermissionsPage";
+import { GroupsPage, RolesPage } from "@/permissions/SettingsPermissionsPage";
 import { folder, folderId } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
@@ -152,6 +152,78 @@ it("creates a custom role from the privilege checklist", async () => {
   );
 });
 
+it("keeps privileges this web build does not know when saving a role", async () => {
+  // 새 서버가 더한 권한은 고를 칸이 없다. 그대로 보내야 PUT이 지우지 않는다(리뷰 2).
+  const puts: unknown[] = [];
+  const role = { ...ROLES.items[2], privileges: ["vm.power", "vm.console", "net.future"] };
+  server.use(
+    http.get(apiUrl("/access-roles"), () =>
+      HttpResponse.json({ ...ROLES, items: [...ROLES.items.slice(0, 2), role] }),
+    ),
+    http.put(apiUrl("/access-roles/:key"), async ({ request }) => {
+      puts.push(await request.json());
+      return HttpResponse.json({});
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<RolesPage />, { as: ADMIN });
+  await user.click(await screen.findByRole("button", { name: "Edit vm-user" }));
+  const dialog = screen.getByRole("dialog", { name: "Edit role vm-user" });
+  expect(within(dialog).getByText(/Kept: net\.future/)).toBeInTheDocument();
+  await user.click(within(dialog).getByRole("checkbox", { name: "vm.console" }));
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(puts).toEqual([
+      { privileges: ["vm.power", "net.future"], description: "power and console" },
+    ]),
+  );
+});
+
+it("shows a mapping to a deleted realm and checks the directory group length", async () => {
+  // 지운 영역은 선택 칸에 보이지 않아 저장이 죽은 연결을 다시 보냈다(리뷰 2).
+  const puts: unknown[] = [];
+  server.use(
+    http.get(apiUrl("/users"), () => HttpResponse.json({ revision: 1, items: [] })),
+    http.get(apiUrl("/realms"), () =>
+      HttpResponse.json({ revision: 1, items: [{ name: "corp", backend: { kind: "ldap" } }] }),
+    ),
+    http.get(apiUrl("/groups"), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [
+          {
+            id: GROUP,
+            name: "ops",
+            revision: 2,
+            spec: { members: [], external: [{ realm: "old", group: "cn=ops" }] },
+            status: {},
+          },
+        ],
+      }),
+    ),
+    http.put(apiUrl("/groups/:key"), async ({ request }) => {
+      puts.push(await request.json());
+      return HttpResponse.json({});
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<GroupsPage />, { as: ADMIN });
+  await user.click(await screen.findByRole("button", { name: "Edit ops" }));
+  const dialog = screen.getByRole("dialog", { name: "Edit group ops" });
+  const realm = within(dialog).getByLabelText("Realm");
+  await waitFor(() => expect(realm).toHaveDisplayValue("old (deleted)"));
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getByText(/names a realm that was deleted/)).toBeInTheDocument();
+  await user.selectOptions(realm, "corp");
+  const name = within(dialog).getByLabelText("Directory group");
+  await user.clear(name);
+  await user.click(name);
+  await user.paste("x".repeat(1025));
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(within(dialog).getByText(/at most 1024 characters/)).toBeInTheDocument();
+  expect(puts).toEqual([]);
+});
+
 describe("grantable", () => {
   const perms = new Permissions({
     all: false,
@@ -215,7 +287,22 @@ it("shows the server's reason when a grant is refused and confirms removing your
     ),
     http.get(apiUrl("/permissions/who"), () =>
       // 관리자가 아니면 전역 역할 사용자는 비어 온다(리뷰 1).
-      HttpResponse.json({ object: `folder/${A}`, users: [], grants: [MINE] }),
+      HttpResponse.json({
+        object: `folder/${A}`,
+        users: [],
+        grants: [
+          MINE,
+          {
+            ...MINE,
+            id: "00000000-0000-0000-0000-0000000000e3",
+            spec: {
+              ...MINE.spec,
+              principal: { type: "group", id: GROUP },
+              role: { type: "builtin", role: "admin" },
+            },
+          },
+        ],
+      }),
     ),
     http.get(apiUrl("/access-roles"), () => HttpResponse.json(ROLES)),
     http.post(apiUrl("/grants"), () =>
@@ -246,7 +333,11 @@ it("shows the server's reason when a grant is refused and confirms removing your
   ).toBeInTheDocument();
   await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
 
-  // 나에게 건 grant를 빼면 이름을 넣어야 한다.
+  // 줄 수 없는 역할(admin)의 grant는 서버가 빼기도 막으니 빼기 단추가 없다(리뷰 2).
+  expect(
+    screen.queryByRole("button", { name: `Remove the permission of ${GROUP.slice(-8)}` }),
+  ).not.toBeInTheDocument();
+  // 나에게 건 grant를 빼면 대상(폴더) 이름을 넣어야 한다. 주체 id 끝이 아니다(리뷰 2).
   const name = BOB.user.slice(-8);
   await user.click(screen.getByRole("button", { name: `Remove the permission of ${name}` }));
   const confirm = await screen.findByRole("alertdialog");
@@ -254,6 +345,9 @@ it("shows the server's reason when a grant is refused and confirms removing your
   const remove = within(confirm).getByRole("button", { name: "Remove" });
   expect(remove).toBeDisabled();
   await user.type(within(confirm).getByRole("textbox"), name);
+  expect(remove).toBeDisabled();
+  await user.clear(within(confirm).getByRole("textbox"));
+  await user.type(within(confirm).getByRole("textbox"), "teamA");
   await user.click(remove);
   await waitFor(() => expect(deleted).toEqual([MINE.id]));
 });

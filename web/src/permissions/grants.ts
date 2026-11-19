@@ -62,6 +62,15 @@ export function roleName(
   return roles?.find((r) => r.id === role.id)?.name ?? role.id.slice(-8);
 }
 
+/** 역할 참조의 권한. 역할 목록을 아직 모르거나 없는 역할이면 빈 목록이다(그때는 `permission.modify`만 본다). */
+export function rolePrivileges(role: RoleRef, roles: readonly AccessRole[] | undefined): string[] {
+  const found =
+    role.type === "builtin"
+      ? roles?.find((r) => r.builtin && r.name === role.role)
+      : roles?.find((r) => r.id === role.id);
+  return found?.privileges ?? [];
+}
+
 /** 주체 이름: 아는 사용자·그룹이면 이름, 모르면 id 끝(위임자는 사용자 목록을 읽지 못한다) */
 export function principalName(principal: PrincipalRef, names: ReadonlyMap<string, string>): string {
   return names.get(principal.id) ?? principal.id.slice(-8);
@@ -81,6 +90,26 @@ export function targetLabel(
       return folderPath(target.id);
     case "object":
       return `${target.kind}/${objectName(target.kind, target.id) ?? target.id.slice(-8)}`;
+  }
+}
+
+/**
+ * 대상 이름: 폴더는 경로의 마지막 이름, 객체는 그 이름(모르면 id 끝), 루트는 "클러스터 전체". 내 접근을 빼는
+ * 확인에 넣게 한다(위임자는 주체 이름을 몰라 id 끝을 넣어야 했다, 리뷰 2).
+ */
+export function targetName(
+  target: GrantTarget,
+  folderPath: (id: string) => string,
+  objectName: (kind: string, id: string) => string | undefined,
+  t: (key: string) => string,
+): string {
+  switch (target.type) {
+    case "root":
+      return t("permissions.rootTarget");
+    case "folder":
+      return folderPath(target.id).split("/").pop() || target.id.slice(-8);
+    case "object":
+      return objectName(target.kind, target.id) ?? target.id.slice(-8);
   }
 }
 

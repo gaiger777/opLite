@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -232,4 +232,27 @@ it("lists sent notifications for the chosen period", async () => {
   await vi.waitFor(() => expect(since).toHaveLength(2));
   // 24시간 전부터, 그다음 7일 전부터
   expect(since[0]! - since[1]!).toBeGreaterThan(5.9 * 86_400_000);
+});
+
+it("hides the rules tab from users with alert.read only in a folder", async () => {
+  // `GET /alert-rules`는 루트 alert.read다(리뷰 2).
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read"],
+        root_contents: ["system.read"],
+        folders: { "019a0f3c-0000-7000-8009-00000000000a": ["alert.read"] },
+        contents: { "019a0f3c-0000-7000-8009-00000000000a": ["alert.read"] },
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/alerts"), () =>
+      HttpResponse.json({ alerts: [], unreachable: [], unsupported: [] }),
+    ),
+  );
+  // 전역 역할로 본 값(viewer)이 받은 권한으로 바뀌면 탭이 사라진다.
+  renderPage(<AlertsPage />, { path: "/alerts", url: "/alerts", as: VIEWER });
+  expect(await screen.findByRole("tab", { name: "Active" })).toBeInTheDocument();
+  await waitFor(() => expect(screen.queryByRole("tab", { name: "Rules" })).not.toBeInTheDocument());
 });

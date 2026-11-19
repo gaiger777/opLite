@@ -14,7 +14,8 @@ export interface CreateItem {
 
 export const CREATE_ITEMS: readonly CreateItem[] = [
   { id: "vm", to: "/vms/-new", privilege: "vm.create" },
-  { id: "import", to: "/imports?create=1", privilege: "vm.create" },
+  // OVA·ESXi 가져오기는 루트 `vm.create`다(서버 `Root(VmCreate)`, 계획 62 리뷰 2).
+  { id: "import", to: "/imports?create=1", privilege: "vm.create", root: true },
   // 풀은 노드 자원이라 루트 `cluster.admin`만 만든다(계획 62 리뷰 1). 네트워크는 폴더에 VXLAN을 만들 수 있다.
   { id: "pool", to: "/storage-pools?create=1", privilege: "cluster.admin", root: true },
   { id: "network", to: "/networks?create=1", privilege: "network.config" },

@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
+import { usePermissions } from "@/auth/usePermissions";
 import { backupPools } from "@/backups/backups";
 import { Field } from "@/components/Field";
 import { ListPending } from "@/components/ListPending";
@@ -37,10 +38,13 @@ export function RemoteTargetFields({
   onChange(value: RemoteTarget): void;
 }) {
   const { t } = useTranslation();
+  // 원격 목록은 루트 `cluster.read`다. 없으면 묻지 않고 한 줄로 알린다(정한 값은 그대로 둔다).
+  const readable = usePermissions().reads("remote");
   const remotes = useQuery({
     queryKey: ["remotes"],
     queryFn: () => call(api.GET("/remotes")),
     select: (list) => list.items.map((r) => r.name).sort((a, b) => a.localeCompare(b)),
+    enabled: readable,
   });
   const pools = useQuery({
     queryKey: ["remotes", value.remote, "storage-pools"],
@@ -57,6 +61,9 @@ export function RemoteTargetFields({
     poolNames.unshift(value.pool);
   }
 
+  if (!readable) {
+    return <p className="text-sm text-muted-foreground">{t("remotes.needsRead", { label })}</p>;
+  }
   return (
     <>
       {!remotes.isSuccess && <ListPending error={remotes.error} />}

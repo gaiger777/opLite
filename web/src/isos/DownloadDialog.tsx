@@ -10,7 +10,8 @@ import { ListPending } from "@/components/ListPending";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { isoPools, nameFromUrl, sha256Error, urlError } from "@/isos/isos";
-import { poolFormats, poolUsableSomewhere } from "@/storage/pools";
+import { choosablePools, poolFormats } from "@/storage/pools";
+import { usePoolNodes } from "@/storage/usePoolNodes";
 import { volumeNameError } from "@/storage/volumes";
 import { trackTask } from "@/tasks/tasks";
 
@@ -31,9 +32,10 @@ export function DownloadDialog({
   const { t } = useTranslation();
   const pools = useList("storage-pool");
   const volumes = useList("volume");
-  const nodes = useList("node");
+  const nodes = usePoolNodes();
   const iso = content === "iso";
-  const somewhere = (pools.data ?? []).filter((p) => poolUsableSomewhere(p, nodes.data ?? []));
+  // 노드를 읽지 못하면 거르지 않는다(서버가 막는다).
+  const somewhere = choosablePools(pools.data ?? [], nodes);
   const usable = iso ? isoPools(somewhere) : somewhere;
   const [url, setUrl] = useState("");
   const [name, setName] = useState("");

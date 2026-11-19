@@ -351,18 +351,8 @@ it("offers the pools of the connected node when the VM has no node", async () =>
     volume: [volume("db-root", "local", { node: null })],
     "storage-pool": [pool("all"), pool("here", { nodes: ["n2"] }), pool("far", { nodes: ["n1"] })],
   });
-  server.use(
-    http.get(apiUrl("/cluster"), () =>
-      HttpResponse.json({
-        name: "lab",
-        ca_fingerprint: "x",
-        leader: "n1",
-        node: "n2",
-        members: [],
-      }),
-    ),
-  );
-  openDetail(free);
+  // 접속한 노드는 whoami가 알린다.
+  openDetail(free, { ...OPERATOR, node: { id: "n2", name: "node-b" } });
   await openMenu("Clone");
   const dialog = await screen.findByRole("dialog", { name: "Clone db" });
   const pools = within(dialog).getByLabelText("Storage pool for the disks");

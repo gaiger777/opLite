@@ -28,7 +28,7 @@ export function useAlerts() {
   });
 }
 
-/** 경보 규칙(이름 순). 누구나 읽는다. */
+/** 경보 규칙(이름 순). 루트 `alert.read`가 읽는다(없으면 규칙 탭을 보이지 않는다). */
 export function useAlertRules() {
   return useQuery({
     queryKey: ["alert-rules"],
