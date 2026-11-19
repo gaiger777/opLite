@@ -45,6 +45,20 @@ cargo test -p opl-driver --features vtpm-it --test qemu_driver --test qemu_migra
 # SecureBoot 변수·EK 해시 보고, 게스트 정보·얼린 스냅샷·에이전트 끄기, 다시 켜기·복제의 EK(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
   cargo test -p opld --features vtpm-it,install-media-it,qemu-it --test vtpm -- --nocapture
+# 게스트 CPU 모델·플래그(계획 63)
+cargo test -p opl-types cpu                                         # 순수: 모델·플래그 serde 하위 호환, resolve·can_run·baseline 표, 보류 cpu
+cargo test -p opl-api --test cpu_models                             # API(Mock 노드 셋·카탈로그 둘): 별칭 고정·모호, 기준 auto·고정 409, 약한 노드 합류, 마이그레이션 409, host 경고
+cargo test -p opl-qemu --features qemu-it --test cpu_probe -- --nocapture   # 노드 CPU 탐침: 실제 QEMU에 QMP로 묻기(이 Mac은 HVF·TCG, KVM이면 응답을 로그에)
+OPL_RECORD_CPU_FIXTURES=$PWD/crates/opl-qemu/tests/fixtures/cpu \
+  cargo test -p opl-qemu --features qemu-it --test cpu_probe -- --nocapture  # 탐침 고정물(tests/fixtures/cpu/{arch}-{accel}.json) 다시 기록
+# 실제 QEMU(게스트 OS 없음): 숨긴 플래그가 모든 vCPU에서 꺼짐(QMP qom-get), 숨김 목록 → 검사 루프 보류 → 전원 껐다 켜기, 명명 모델,
+# 받는 쪽은 기록된 CPU 그대로(노드 둘). x86_64만: vCPU 핫플러그 뒤 새 vCPU도 꺼짐, 못 주는 기능이 있는 모델은 enforce로 거절.
+# 이 Mac은 TCG로 aarch64(neoverse-n1)를 돌리고, x86 시험은 CI linux-kvm(FEATURES에 opld/cpu-it)
+cargo test -p opld --features cpu-it --test cpu
+# x86_64 Linux, KVM: 실제 게스트 — 러너 CPU에 있는 플래그(avx512vbmi → avx2 → pcid → sse4_2)를 --cpu-flags=-FLAG로 숨긴 Ubuntu 24.04
+# 클라우드 이미지의 /proc/cpuinfo에 없음, 실행 중 --no-cpu-flags는 보류로 남고 vm reboot 뒤 다시 보임(CI install-media 작업)
+OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
+  cargo test -p opld --features install-media-it,qemu-it --test install_media a_hidden_cpu_flag_is_absent_in_a_real_guest -- --nocapture
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -185,6 +199,7 @@ pnpm -C web install
 pnpm -C web dev              # http://localhost:5173, /api는 OPLD_URL(기본 https://localhost:8006)로 넘긴다
 pnpm -C web test             # 단위·컴포넌트 테스트 (Vitest) — axe 접근성 검사와 색 토큰 대비 시험 포함
 pnpm -C web test src/tokens.test.ts   # 색 토큰 대비만: index.css의 밝음·어두움 oklch 값으로 글 4.5:1, 상태 칩 4.5:1, 포커스 링·차트 3:1
+pnpm -C web test src/cpu           # CPU 모델 고르기·플래그 칩·보류 표시·설정의 CPU 칸(msw)
 pnpm -C web typecheck && pnpm -C web lint
 pnpm -C web gen:api          # API를 바꾼 뒤 src/api/schema.d.ts를 다시 만든다(CI가 확인한다)
 pnpm -C web exec playwright install chromium
@@ -193,7 +208,8 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 ```
 
 브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 영역 탭으로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
-일괄 막대로 강제 정지하고, VM 동작 메뉴(⋯)로 복제·편집·지우기를 한다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
+일괄 막대로 강제 정지하고, VM 동작 메뉴(⋯)로 복제·편집·지우기를 하고, 노드 상세의 "CPU 모델" 칸(실제 탐침이 읽은 QEMU와
+다시 읽기 단추)과 설정 › 일반의 CPU 기준 칸을 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
 시험이 잡지 못하는 경로 이동·렌더 문제가 있으므로 **웹을 바꾸면 커밋 전에 이 Mac에서 돌린다.** 실패하면
 `web/test-results/*/error-context.md`(화면 스냅숏)와 `trace.zip`이 남는다.
 

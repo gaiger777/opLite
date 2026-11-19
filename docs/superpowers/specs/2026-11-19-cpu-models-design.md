@@ -284,3 +284,10 @@
 - **클러스터 보기 "CPU 기준"**: 아키텍처마다 기준·이전·때·셈에 든 노드·제한한 노드·경고·`cluster` VM 수와 접힌 모델 × 노드 표(`/cpu/models`의 `nodes`). 기록 Task 링크 대신 Task는 활동·알림에 `tasks.op.cpu-baseline`(+ `describeDetail`: 제한한 노드·영향 VM 수)으로 보인다.
 - **도움말 링크 "취약점 때문에 CPU 기능 숨기기"**(§13)는 웹에 문서 링크 틀이 없어 넣지 않았다. 숨김 목록의 도움말 문장이 쓰임새를 말한다.
 - **Playwright**: §14의 "숨김 목록 저장 → 대기 거름 → 일괄 재시작"은 이 Mac(aarch64 HVF)의 E2E에서 숨길 안전한 플래그가 없어(`host`에 `pauth=off`가 HVF에서 켜지는지 모름) 넣지 않고, 기존 `vm.spec.ts`에 노드 상세 "CPU 모델"(실제 탐침의 QEMU 칸·다시 읽기 단추)과 설정의 기준 칸을 보는 몇 줄만 더했다. 그 흐름은 vitest(msw)가 본다.
+
+### 스테이지 7 (문서)
+
+- **가이드**: `docs/guide/vms.md`에 "CPU 모델과 플래그"와 따라 하기 "취약점 때문에 CPU 기능 숨기기"(Java4Shell, VM 하나 `--cpu-flags -avx512vbmi`·클러스터 `cpu.mask` → "CPU 변경 대기" 보기 → 일괄 재시작 → 게스트 `grep -c avx512vbmi /proc/cpuinfo`가 0, CPUID만 숨긴다는 한계, JDK 올리기), `cluster.md`에 "클러스터 CPU 기준", `web-ui.md`에 "CPU 모델 화면", `development.md`에 새 시험 명령. §13의 "웹 도움말 링크"는 스테이지 6대로 없고 가이드가 화면 위치를 적는다.
+- **CLI에는 보류 VM 거름이 없다**(웹 `?cpu=pending`만). 따라 하기는 CLI 쪽을 `vm get`의 `cpu running: … (power cycle pending: …)` 줄과 `vm reboot`으로 적었다. `settings set cpu.mask=`와 `vm set --cpu-flags`가 목록 **전체**를 바꾼다는 것을 가이드에 적었다(더하기가 아니다).
+- **aarch64 숨김 이름의 한계**(스테이지 3: 모델에 없는 속성을 숨기면 QEMU가 켜지 않고 `can_run`이 미리 알지 못함)는 고치지 않고 가이드 한계에 적었다.
+- `docs/architecture.md`(main `104324e`·`6695eae`)는 이 브랜치의 기준(`e04f9a8`) 뒤에 들어와 그 두 커밋을 이 브랜치에 그대로 옮기고(cherry-pick — main으로 rebase하면 같은 패치라 빠진다) §4 리더 표·§9.1·새 §9.6·§14에 CPU 모델·카탈로그·리더의 기준을 적었다. §4와 §19의 "리더의 CPU 기준선 계산은 없다"는 지웠다.

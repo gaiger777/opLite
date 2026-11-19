@@ -1,12 +1,13 @@
 # 클러스터 운영
 
-제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+제어부 가용성, 앞단 프록시·VIP, 대규모 클러스터, 다중 링크, 노드 유지보수, 클러스터 CPU 기준, 지표 기록·대시보드, 알림, Prometheus. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [제어부 가용성](#제어부-가용성)
 - [앞단 프록시와 VIP (API 가용성)](#앞단-프록시와-vip-api-가용성)
 - [대규모 클러스터](#대규모-클러스터)
 - [클러스터 통신 다중 링크](#클러스터-통신-다중-링크)
 - [노드 유지보수와 비우기](#노드-유지보수와-비우기)
+- [클러스터 CPU 기준](#클러스터-cpu-기준)
 - [지표](#지표)
 - [알림](#알림)
 - [Prometheus](#prometheus)
@@ -613,6 +614,88 @@ orbivisorctl node maintenance node1 on   # VM은 옮기지 않고 배치만 막�
   한 번에 하나씩 옮기고, 진행률은 각 `vm-migrate` 작업으로 본다. 유지보수가 끝나도 VM을 원래 노드로 되돌리지 않는다. 옮기지
   못한 VM을 끄는 선택과 롤링 업그레이드 자동화(노드를 차례로 비우고 올리고 재부팅)는 없다. 볼륨 만들기·백업 같은
   작업의 노드 고르기는 유지보수를 보지 않는다.
+
+## 클러스터 CPU 기준
+
+CPU 세대가 섞인 클러스터에서 모든 노드가 켤 수 있는 공통 CPU를 정한다(vSphere EVC와 같은 자리). 기준은 **모델이 `cluster`인
+VM에만** 쓰인다 — `host`·`max`·`x86-64-v*`·QEMU 모델 VM은 기준과 상관없다(클러스터 숨김 목록 `cpu.mask`만 모든 VM에 걸린다,
+[취약점 때문에 CPU 기능 숨기기](vms.md#취약점-때문에-cpu-기능-숨기기)). 모델과 플래그 자체는 [CPU 모델과
+플래그](vms.md#cpu-모델과-플래그).
+
+| 모드 | 뜻 |
+|---|---|
+| `off`(기본) | 기준이 없다. `cluster` VM은 `host`처럼 켠다 |
+| `auto` | 리더가 x86_64 노드들이 모두 켤 수 있는 가장 좋은 모델을 고른다(아래 셈) |
+| 고정(`cpu.pinned`) | 관리자가 아키텍처마다 모델·플래그를 고정한다. 고정이 있는 아키텍처는 모드가 `off`여도 고정을 쓴다(`off`는 auto 셈만 끈다) |
+
+```bash
+orbivisorctl settings set cpu.baseline=auto
+orbivisorctl cpu baseline
+# mode: auto
+# auto flags: on
+# mask: avx512vbmi
+# ARCH    CPU                MODE  LIMITED-BY  CLUSTER-VMS
+# x86_64  Skylake-Server-v5  auto  node4       12
+orbivisorctl settings set cpu.auto_flags=false           # 모델 밖의 공통 플래그를 더하지 않는다
+orbivisorctl settings set cpu.pinned='x86_64:Skylake-Server-v5,-hle;aarch64:neoverse-n1'   # 아키텍처마다 고정(`;`로 여럿)
+orbivisorctl settings set cpu.pinned=                    # 고정을 모두 뺀다
+orbivisorctl settings set cpu.pinned=x86_64:Icelake-Server-v7 cpu.force=true   # 켤 수 없는 노드가 있어도 고정
+orbivisorctl vm create app --cpu-model cluster ...       # 기준을 쓰는 VM
+```
+
+웹은 설정 › 일반 › **CPU**(모드 끔·자동·고정, 고정 모델·플래그, "공통 플래그 더하기", "모든 VM에서 숨기기"), 인프라 › 노드 ›
+클러스터 보기의 **"CPU 기준"** 카드(아키텍처마다 기준·이전·바뀐 때·셈에 든 노드·기준을 낮춘 노드·경고·`cluster` VM 수와 접힌
+모델 × 노드 표), 노드 상세의 **"CPU 모델"**(QEMU·가속기·벤더·호스트 CPU·읽은 시각, 모델 표, "CPU 모델 다시 읽기")이다. 기준이
+있으면 새 VM은 `cluster`로 시작한다. API는 `GET /api/v1/cpu/baseline`(루트 `cluster.read`), `PATCH /api/v1/settings {"cpu":
+{"baseline", "pinned", "auto_flags", "mask", "force"}}`(루트 `cluster.admin`, 준 칸만 바꿈, 응답에 `affected_running_vms`),
+`GET /api/v1/nodes/{key}/cpu`·`POST /api/v1/nodes/{key}/cpu/refresh`(**202** Task `node-cpu-probe`, `cluster.admin`)다.
+
+- **노드가 CPU를 알리는 법.** orbivisord가 시작할 때 자기 QEMU를 VM과 같은 머신·가속기로 한 번 띄워 QMP로 모델·플래그를 읽고
+  (x86 TCG에서 0.3초 안쪽), 결과(**카탈로그**)를 해시 이름의 클러스터 리소스 하나로 올린다. 같은 QEMU·CPU·가속기인 노드는 같은
+  카탈로그를 나눠 쓰고 노드 상태에는 해시만 있다(x86 카탈로그 약 41 KB, aarch64 약 1 KB). 검사 루프가 5초마다 QEMU 바이너리의
+  경로·크기·수정 시각을 보고 바뀌면(apt로 QEMU를 올림) 다시 읽는다. 실패한 읽기는 10분마다 다시 하고, 그동안 앞 카탈로그를
+  쓴다(`node cpu`의 `error:`). 리더가 어느 노드도 가리키지 않고 1시간 넘은 카탈로그를 지운다. `orbivisorctl node cpu node3`이
+  QEMU 버전·가속기·호스트 CPU·읽은 시각과 모델 표(MODEL USABLE MISSING NOTE)를, `--refresh`가 먼저 다시 읽기를 한다(10초
+  안팎). 카탈로그가 없는 노드(처음 읽기가 실패, 옛 노드)는 `host`·`max` VM만 받는다.
+- **auto 셈(x86_64).** 위트니스가 아닌 이 아키텍처의 **등록된 노드 모두**가 대상이다 — 꺼진 노드·유지보수 노드도 센다(잠깐
+  꺼진 노드 때문에 기준이 오르내리지 않게). 카탈로그가 아직 없는 노드는 빼고 경고(`node "x" has no CPU catalog yet and is left
+  out`)로 적는다. 후보는 모든 대상 노드가 켤 수 있는 버전 모델(별칭이 아님, migration-safe, deprecated 아님) 가운데 모델 벤더가
+  모든 노드의 호스트 벤더와 같은 것이고, 정적 확장의 기능이 가장 많은 것(같으면 이름순 뒤, 곧 높은 버전)을 고른다. 호스트
+  벤더가 섞였거나(Intel + AMD) TCG 노드가 있으면 QEMU 모델 후보가 없어 모두 켤 수 있는 가장 높은 `x86-64-v*`, 그것도 없으면
+  `qemu64-v1`이다. `auto_flags`(기본 켬)면 모든 노드가 줄 수 있고 QEMU가 어느 모델 정의에든 쓰는 플래그를 더한다. 마지막에
+  숨김 목록을 끈다.
+- **리더가 기록한다.** 리더가 10초마다(정리 작업의 틱) 다시 셈해 결과를 클러스터 상태에 쓰고, 모든 노드가 켤 때 이 기록만
+  읽는다 — 그래서 모든 노드가 같은 기준을 쓴다. 모델·플래그가 바뀌면 기록 Task **`cpu-baseline`**(아키텍처, 이전 → 새 모델·
+  플래그, 기준을 낮춘 노드 `limited_by`, 영향 받는 실행 중 `cluster` VM 수)이 활동 › 작업과 알림 센터에 보이고(처음부터 성공인
+  기록이다 — 실행되는 작업이 아니다), 감사 로그에 `cpu.baseline`(`cpu baseline x86_64 auto: Icelake-Server-v7 ->
+  Skylake-Server-v5 (node n4)`)이 남는다. 기준이 없어지면(끔·고정 빼기·그 아키텍처 노드가 모두 빠짐) 새 값 없는 기록이다.
+  노드 목록·경고만 바뀌면 기록은 고치지만 Task는 남기지 않는다. 기준 바뀜에 걸리는 경보 규칙 조건은 없다.
+- **약한 노드가 들어오면(auto).** 기준이 내려간다 — 합류를 거부하지 않는다(VMware EVC와 다름). **실행 중인 `cluster` VM은
+  그대로다**: 켤 때 기록한 CPU로 계속 돌고, 보류 `cpu`(`Icelake-Server-v7 → Skylake-Server-v5 (cluster baseline changed)`)를
+  얻으며, 약한 노드로는 옮겨지지 않고(`vm migrate`는 **409** `no_capacity` `node "n4" cannot run CPU model Icelake-Server-v7
+  (missing …)`, 웹 마이그레이션 대화상자는 그 노드를 막음) 나머지 노드 사이에서는 지금처럼 옮겨진다. 전원을 껐다 켜면 새
+  기준으로 켜져 어디로든 옮길 수 있다. 새로 켜는 `cluster` VM은 처음부터 새 기준이다. 약한 노드를 빼면 기준이 다시 오를 수 있고
+  (같은 기록 Task), 실행 중 VM은 "다음 전원 껐다 켜기 때 더 나은 CPU" 보류를 얻는다.
+- **고정에서 약한 노드.** 기준은 바뀌지 않는다. 그 노드는 `cluster` VM을 받지 않고, `cpu baseline`의 경고와 LIMITED-BY,
+  노드 상세의 "이 노드는 클러스터 기준 VM을 받지 않습니다" 띠로 보인다. 고정을 설정할 때 켤 수 없는 노드가 있으면 **409**
+  `cpu_baseline_unsupported`(`details.nodes`·`warnings`)이고 `cpu.force=true`(웹 "그래도 고정")로 넘는다. 숨김 목록이 빠진
+  플래그를 끄면 그 노드도 켤 수 있으므로 409가 아니다.
+- **마이그레이션·HA·배치가 기준을 쓰는 법.** 켜기·배치·복제 배치·HA 복구는 **새로 켜는 것**이라 스펙을 대상 노드에서 지금
+  기준·숨김 목록으로 해석해 그 노드의 카탈로그로 켤 수 있는지 본다 — 기준이 내려가도 HA 복구는 새 기준으로 어디서든 켠다.
+  라이브 마이그레이션·비우기·균형 조정·HA 되돌아가기는 **도는 VM을 옮기는 것**이라 켤 때 기록한 CPU를 대상이 켤 수 있어야
+  한다. 비우기는 갈 곳이 없는 VM을 지금처럼 "옮길 곳 없음"으로 남긴다. 꺼진 VM이 고정된 노드가 그 CPU를 켤 수 없으면 켜기가
+  켤 수 있는 다른 노드를 고르고, 없으면 **409** `no_capacity`와 노드마다의 까닭이다. 스케줄러가 먼저 거르므로 노드가 켜다가
+  실패하는 일은 보통 없다(그래도 노드는 켜기 전에 다시 보고, 못 켜면 `failed to start: node "n1" cannot run CPU model …`).
+- **aarch64.** auto 셈을 하지 않는다(QEMU가 aarch64 모델의 버전·못 쓰는 기능·정적 확장을 주지 않는다). 고정만 되고, QEMU
+  모델은 모든 대상 노드가 TCG일 때만 받는다(svc01·svc02 같은 `qemu-tcg` 노드 — 예 `aarch64:neoverse-n1`). KVM·HVF aarch64는
+  `host`·`max`뿐이라 `cluster` VM은 `host`로 켜고 `cpu baseline`이 `host (no baseline)`로 적는다. aarch64 QEMU 모델에는
+  `enforce`가 없고, 숨김 이름이 그 모델에 없는 속성이면(`neoverse-n1`의 `pauth`) QEMU가 켜지 않는다.
+- **업그레이드.** 모든 노드(위트니스 포함)가 기능 `cpu-models`를 알릴 때까지 노드는 카탈로그를 올리지 않고 리더는 기준을
+  기록하지 않으며, 설정 `cpu`와 `host`·`max` 밖의 모델은 **409** `cluster_upgrading`이다. 그동안 VM은 지금과 바이트까지 같은
+  `-cpu host|max`로 켠다. 올린 뒤 숨김 목록을 더하면 업그레이드 전에 켠 VM에도 보류가 생긴다.
+- **한계.** 기준은 클러스터에 하나(아키텍처마다)다 — VM별 기준(vSphere per-VM EVC)·폴더 범위 숨김 목록은 없다. VMware VMX의
+  EVC 모드는 가져오지 않는다. 노드의 마이크로코드·CPU 취약점 상태(`/sys/devices/system/cpu/vulnerabilities`)는 보이지 않는다.
+  노드 목록에 "CPU 모델" 열은 없다(노드 상세에서 본다).
 
 ## 지표
 

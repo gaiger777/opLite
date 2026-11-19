@@ -1,6 +1,6 @@
 # 가상 머신
 
-설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, 라이브 마이그레이션. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, 라이브 마이그레이션. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [설치 매체와 cloud-init](#설치-매체와-cloud-init)
 - [템플릿과 링크드 클론](#템플릿과-링크드-클론)
@@ -9,6 +9,8 @@
 - [vTPM과 Secure Boot](#vtpm과-secure-boot)
 - [게스트 에이전트](#게스트-에이전트)
 - [VM 무중단 유형 변경](#vm-무중단-유형-변경)
+- [CPU 모델과 플래그](#cpu-모델과-플래그)
+- [취약점 때문에 CPU 기능 숨기기](#취약점-때문에-cpu-기능-숨기기)
 - [라이브 마이그레이션](#라이브-마이그레이션)
 
 ## 설치 매체와 cloud-init
@@ -777,6 +779,168 @@ VM `spec.cpu.max_vcpus`·`spec.max_memory_mib`, `status.hardware`(아래), Node 
   붙이거나 디스크·NIC 목록을 바꿀 수 있다. 실행 디렉터리의 `hardware.json`은 켤 때의 모양만이라, 기록 없이 다시 붙은
   노드는 그 뒤 실행 중에 바꾼 것을 모른다. 최대 메모리가 호스트 CPU의 물리 주소 폭을 넘으면
   QEMU가 켜지지 않는다(`maxmem` — 상한을 512 GiB로 둔 까닭).
+
+## CPU 모델과 플래그
+
+게스트가 보는 CPU(CPUID — 모델 이름, 기능 플래그)를 VM마다 정한다(Proxmox VE의 `cpu:`, OpenStack의 `cpu_mode`·
+`cpu_model_extra_flags`와 같은 자리, 클러스터 공통 CPU는 vSphere EVC에 해당하는 [클러스터 CPU 기준](cluster.md#클러스터-cpu-기준)).
+**모델 목록은 Orbivisor에 박혀 있지 않다.** 노드마다 자기 QEMU에 QMP로 물어(`query-cpu-definitions`, 모델마다 정적 확장,
+`-cpu help`의 플래그 이름) 결과를 클러스터에 알리므로, 노드의 QEMU를 올리면 새 모델이 Orbivisor 업데이트 없이 들어온다.
+`host`·`max`(플래그 없음) 밖의 모델·플래그는 모든 노드가 이 버전이어야 쓴다(노드가 알리는 기능 `cpu-models`, 아니면
+**409** `cluster_upgrading`).
+
+| 모델 | 뜻 | 쓰임 |
+|---|---|---|
+| `host`(기본) | 노드 CPU 그대로(`-cpu host`, TCG 노드는 `max`) | 성능이 먼저인 VM. 어디로든 옮기지만 CPU가 다른 노드로 옮길 때 경고만 한다(아래) |
+| `max` | 이 노드의 QEMU·가속기가 줄 수 있는 모든 것 | 시험용. 뜻이 QEMU 버전마다 바뀐다 |
+| `cluster` | 켤 때의 클러스터 기준 모델·플래그. 기준이 없으면 `host`처럼 켠다 | 세대가 섞인 클러스터에서 어디로든 안전하게 옮길 VM |
+| `x86-64-v2`·`x86-64-v2-aes`·`x86-64-v3`·`x86-64-v4` | x86-64 psABI 수준 = `qemu64-v1` + 그 수준의 플래그(Proxmox VE 8과 같은 정의) | 벤더가 섞인(Intel + AMD) 클러스터, 배포판이 요구하는 수준(RHEL 9는 v2). x86_64만 |
+| QEMU 모델(`Icelake-Server-v7`, `EPYC-Milan-v2`, aarch64 `neoverse-n1` …) | 노드 QEMU가 아는 이름 그대로 | 정해진 CPU 세대를 고정할 VM |
+
+- **버전 고정.** 버전 없는 이름(`Icelake-Server`)은 QEMU 별칭이고 뜻은 QEMU가 머신 유형마다 정한다(지금 `q35`에서는
+  가장 옛 `-v1`). 그래서 API가 만들 때·바꿀 때 별칭을 **버전 모델로 바꿔 저장한다**(`Icelake-Server` → `Icelake-Server-v1`,
+  `Icelake-Server-noTSX` → `-v2`). 응답과 감사 설명이 고정한 이름을 적는다(`vm create web cpu=Icelake-Server-v1 (from
+  Icelake-Server)`). 버전 이름의 정의는 QEMU가 바꾸지 않으므로 한 노드의 QEMU를 먼저 올려도 그 노드로 옮긴 VM이 같은
+  CPUID로 켜진다. 노드마다 QEMU 버전이 달라 별칭의 뜻이 갈리면 **400** `cpu_model_ambiguous`(`details.candidates`)이고 버전
+  이름을 직접 준다. 대소문자는 가리지 않고 노드가 알린 표기로 저장한다.
+- **이름 확인.** 어느 노드도 모르는 이름은 **400** `unknown_cpu_model`(`details.similar`에 비슷한 이름 셋), 다른 아키텍처의
+  모델(aarch64 VM에 `x86-64-v3`, x86 VM에 `neoverse-n1`)은 **400** `cpu_model_arch`다. 어느 노드도 켤 수 없는 모델은 꺼진 VM으로
+  받지만 켜기는 **409** `no_capacity`에 노드마다의 까닭(`node "n1" cannot run CPU model Broadwell-v1 (missing hle, rtm)`)이다.
+- **`enforce`.** QEMU 모델과 `x86-64-v*`는 x86_64에서 `enforce`로 켠다. 노드가 못 주는 기능이 하나라도 있으면 QEMU가
+  다른 CPUID로 조용히 켜는 대신 켜지 않는다. 스케줄러가 노드 카탈로그로 먼저 거르므로 보통은 거기까지 가지 않는다.
+- **플래그.** `-이름`은 게스트에게 숨기고 `+이름`은 켠다(`cpu.flags: ["-avx512vbmi", "+pcid"]`). 이름은 노드 QEMU가 아는
+  CPUID 플래그(`orbivisorctl cpu flags`)이고 소문자, `_`는 `-`, `sse4_1`은 `sse4.1`로 맞춘다. 64개까지, 같은 이름 두 번
+  (`+aes`와 `-aes`도)은 **400** `invalid_cpu_flags`, 모르는 이름은 **400** `unknown_cpu_flag`다. `+`는 그 노드가 줄 수 있어야
+  켠다(아니면 그 노드는 후보가 아니다). 모델을 못 쓰는 까닭이 플래그 하나뿐이면 그 플래그를 숨겨서 켤 수 있다
+  (`Icelake-Server-v7 -avx512vbmi`). 클러스터 숨김 목록(설정 `cpu.mask`, 아래 따라 하기)은 `host`를 포함한 모든 VM에 걸리고
+  VM의 `+`보다 이긴다 — 숨김 목록에 든 이름을 `+`로 저장하면 **400** `cpu_flag_masked`다.
+- **전원 껐다 켜기 규칙.** CPUID는 QEMU를 띄울 때 정해지고 실행 중에는 바꿀 수 없다. 실행 중인 VM의 모델·플래그를 바꾸거나
+  클러스터 기준·숨김 목록이 바뀌면 VM에 보류 `cpu`(이유 `restart`, `detail`에 바뀐 것과 "power cycle required; a reboot inside
+  the guest does not apply it")가 생기고, **Orbivisor가 QEMU를 다시 띄울 때**만 적용된다: `vm reboot`(ACPI로 끄고 새 QEMU로
+  켬), `vm stop` + `vm start`, HA 복구. **게스트 안의 재부팅**(같은 QEMU 프로세스)과 **라이브 마이그레이션**(대상이 원본의
+  CPU 기록을 그대로 씀)으로는 적용되지 않는다. 메모리 스냅샷으로 되돌리기는 스냅샷을 찍을 때의 CPU로 켠다(디스크만
+  되돌리면 새로 해석한다). 기준·숨김 목록 때문인 보류는 각 노드의 검사 루프(5초)가 다시 셈해 쓴다. 켤 때 실제로 쓴 것은
+  `status.hardware.cpu_resolved`(`{model, flags, enforce, source}`)에 남는다.
+- **`host`·`max` VM의 마이그레이션.** 오늘처럼 어디로든 옮긴다. 원본 노드가 주는 플래그 가운데 대상 노드에 없는 것이 있으면
+  막지 않고 경고한다(`target node "n3" lacks avx512vbmi, amx-tile that the guest may be using`): `vm migrate`가 먼저
+  `warning:`으로 찍고, 웹 마이그레이션 대화상자가 띠로 보이고, 감사 detail에 `cpu-warning: …`이 남는다. 그 밖의 모델은
+  대상 노드가 VM의 **켤 때 기록된** CPU를 켤 수 있어야 옮긴다(아니면 **409** `no_capacity`와 까닭). 비우기·균형 조정·HA
+  되돌아가기도 같은 확인으로 대상을 고른다.
+
+```bash
+orbivisorctl cpu models --usable          # MODEL KIND NODES NOTE — 켤 수 있는 노드가 있는 모델, NODES는 "켤 수 있는 수/전체"
+orbivisorctl cpu models --node node3      # 그 노드에서 못 켜는 모델의 빠진 플래그(NOTE: missing …)
+orbivisorctl cpu flags | grep avx512      # FLAG SUPPORTED NOTE — 플래그를 줄 수 있는 노드 수, 숨김 목록이면 masked
+orbivisorctl vm create db --cores 4 --memory 8192 --disk root --nic lan --cpu-model Icelake-Server --cpu-flags -avx512vbmi
+orbivisorctl vm get db                    # 표준 오류에 CPU 줄(모두 host이고 보류가 없으면 줄 없음)
+# cpu: 1x4 Icelake-Server-v1 -avx512vbmi
+orbivisorctl vm set db --cpu-flags=-avx512vbmi,+pcid   # 목록 전체를 바꾼다. --no-cpu-flags는 모두 지움
+orbivisorctl vm set web --cpu-flags -avx512vbmi        # 실행 중이면 보류로 남는다
+# vm web: hardware updated
+# vm web: pending until restart:
+#   cpu: 1x2 host -> 1x2 host -avx512vbmi (restart: -avx512vbmi; power cycle required; a reboot inside the guest does not apply it)
+orbivisorctl vm cpu web                   # spec·resolved·running·pending과 노드마다 NODE CAN-RUN MISSING NOTE(까닭·경고)
+orbivisorctl vm reboot web                # 전원 껐다 켜기 — 보류 cpu가 적용된다
+```
+
+`template deploy`·`image get --template`·`import run`도 `--cpu-model`·`--cpu-flags`·`--no-cpu-flags`를 받는다(API가 Task를
+만들기 전에 확인·고정한다). 템플릿은 VM 스펙이라 모델·플래그가 연결·전체 복제로 그대로 가고, 스냅샷에서 복제(`vm clone`)와
+백업 복원도 원본 그대로다(받는 클러스터가 모르는 모델이면 꺼진 VM으로 만들어지고 켜기가 409와 까닭이다). VMware 가져오기는
+지금처럼 `host`가 기본이다(VMX의 EVC·`featMask`는 읽지 않는다).
+
+웹은 VM 만들기·편집의 일반 절에 **"CPU 모델"**(찾기 상자 + 묶음 목록: 기본·클러스터 기준·호환 수준·QEMU 모델(버전), 항목마다
+"노드 n/m에서 켤 수 있음", 고르면 못 켜는 노드와 빠진 것)과 **"CPU 플래그"**(칩 입력 — 이름을 넣고 Enter나 "숨기기"는 `-`,
+"켜기"는 `+`, 칩을 누르면 바뀜, 노드가 모르는 이름은 받지 않음)가 있다. 별칭은 목록에 없고 별칭 이름으로 찾으면 버전 모델이
+나온다. 클러스터 기준이 있으면 새 VM은 `cluster`로 시작한다. VM 상세 요약의 CPU 줄은 스펙과 "지금 … (으)로 실행 중"을,
+보류 `cpu`가 있으면 **"전원 껐다 켜기 필요"** 띠와 **"지금 전원 껐다 켜기"** 단추(재시작 확인 대화상자)를 보인다. 마이그레이션
+대화상자는 VM의 CPU를 켤 수 없는 노드를 "(VM의 CPU를 켤 수 없음)"으로 막고 까닭을 보인다. 화면 위치는 [웹 화면
+둘러보기](web-ui.md#cpu-모델-화면).
+
+API는 VM `spec.cpu.model`(문자열)·`spec.cpu.flags`, `status.hardware.cpu_resolved`, `GET /api/v1/vms/{key}/cpu`(스펙·지금
+해석·실행 중·보류, 노드마다 `can_run`·`missing`·`reason`·`warnings`), `GET /api/v1/cpu/models?arch=&node=&usable=`(의사 항목
+`host`·`max`·`cluster`(`current`에 지금 기준)·수준과 노드 QEMU 모델), `GET /api/v1/cpu/flags?arch=`다. CPU 칸은 VM 설정 권한
+(`vm.config`)이고, `/cpu/models`·`/cpu/flags`는 VM을 만들거나 설정할 수 있는 사용자 누구나 읽되 루트 `cluster.read`가 없으면
+노드 이름 없이 "n/m 노드"만 받는다([폴더와 권한](folders.md)).
+
+- **한계.** `host` VM을 CPU가 다른 노드로 옮기는 것은 경고만 하고 막지 않는다. 사용자 정의 모델 객체(Proxmox
+  `cpu-models.conf`), `phys-bits`·`hv-vendor-id`·Hyper-V enlightenment, 머신 유형 버전 고정은 없다. aarch64는 QEMU 모델을 TCG
+  노드에서만 켜고(KVM·HVF aarch64는 `host`·`max`뿐 — macOS 노드도 같다) `enforce`가 없다. aarch64에서 숨김 이름이 고른 모델에
+  없는 속성이면(`neoverse-n1`의 `pauth`) QEMU가 켜지 않는데, aarch64 카탈로그에는 모델별 기능 표가 없어 미리 알지 못한다.
+  웹 VM 목록 밖에서(CLI) 보류 VM만 고르는 거름은 없다 — `vm get`의 `cpu running: … (power cycle pending: …)` 줄로 본다.
+
+## 취약점 때문에 CPU 기능 숨기기
+
+CPU 기능 하나 때문에 게스트 소프트웨어가 잘못 동작할 때, 고친 버전이 나올 때까지 그 기능을 게스트에게 숨기는 따라 하기다.
+예는 **Java4Shell(CVE-2026-114938)** — JDK 17.0.6 이상이 AVX-512 VBMI가 있는 CPU에서 고르는 Base64 내장 함수(intrinsic)의
+버그다. JDK는 시작할 때 CPUID를 보고 내장 함수를 고르므로 게스트에게 `avx512vbmi`를 숨기면 그 코드 경로를 쓰지 않는다.
+VM 하나만이면 1·2단계, 클러스터 전체면 1·3단계부터 따라 한다.
+
+1. **노드가 이 기능을 주는지 본다.** 노드 QEMU가 `avx512vbmi`를 주는 노드 수와 게스트가 지금 보는지:
+
+   ```bash
+   orbivisorctl cpu flags | grep avx512vbmi
+   # avx512vbmi  3/3
+   # (게스트 안에서)
+   grep -c avx512vbmi /proc/cpuinfo        # vCPU 수만큼(0보다 큼)이면 보이는 것이다
+   ```
+
+2. **VM 하나에서 숨기기.** VM 플래그에 `-avx512vbmi`를 더한다. `--cpu-flags`는 목록 전체를 바꾸므로 이미 있는 플래그도 함께
+   준다(`vm cpu app1`의 spec 줄). 웹은 VM 편집 › 일반 › "CPU 플래그"에 `avx512vbmi`를 넣고 Enter.
+
+   ```bash
+   orbivisorctl vm set app1 --cpu-flags -avx512vbmi
+   # vm app1: hardware updated
+   # vm app1: pending until restart:
+   #   cpu: 1x4 host -> 1x4 host -avx512vbmi (restart: -avx512vbmi; power cycle required; a reboot inside the guest does not apply it)
+   ```
+
+3. **클러스터 전체에서 숨기기.** 설정의 숨김 목록 `cpu.mask`에 넣으면 `host`를 포함한 **모든 VM**(앞으로 만들 VM도)에 걸린다.
+   이 값도 목록 전체를 바꾸므로 `orbivisorctl cpu baseline`의 `mask:` 줄에 있던 이름을 함께 준다(`cpu.mask=avx512vbmi,amx-tile`).
+   루트 `cluster.admin` 권한이 필요하다.
+
+   ```bash
+   orbivisorctl settings set cpu.mask=avx512vbmi
+   # settings updated
+   # 12 running VM(s) keep their CPU until their next power cycle (`vm reboot`; a reboot inside the guest does not apply it)
+   ```
+
+   웹은 설정 › 일반 › CPU › **"모든 VM에서 숨기기"**에 `avx512vbmi`를 넣고 **"CPU 설정 저장"**. 저장하면 "실행 중 VM N개는
+   전원을 껐다 켤 때까지 지금 CPU 그대로입니다."와 **"목록 보기"** 링크가 뜬다. 노드가 모르는 이름은 **400**
+   `unknown_cpu_flag`이고, 감사 로그에 `settings cpu.mask=avx512vbmi`가 남는다. 몇 초 안에 각 노드가 자기 실행 중 VM에 보류
+   `cpu`를 쓴다.
+
+4. **보류 VM을 찾는다.** 웹은 VM 목록의 **"CPU 변경 대기"** 보기(주소 `/vms?cpu=pending`, 3단계의 "목록 보기"가 여기로
+   간다) — 이름 옆에 "CPU 변경 대기" 배지가 있다. CLI는 VM마다 `vm get`의 CPU 줄로 본다:
+
+   ```bash
+   orbivisorctl vm get app2 >/dev/null
+   # cpu: 1x2 host
+   # cpu running: host (power cycle pending: -avx512vbmi)
+   ```
+
+5. **전원을 껐다 켠다.** 웹은 그 보기에서 모두 고르고 일괄 막대의 **"재시작"**(대화상자가 "VM마다 끄고 다시 켭니다(전원 껐다
+   켜기). 보류 중인 CPU 변경이 적용됩니다."라고 적는다), VM 하나는 상세의 **"지금 전원 껐다 켜기"**. CLI는 `orbivisorctl vm
+   reboot app2`다. 게스트를 내리는 일이므로 서비스는 한 대씩, HA·부하 분산 뒤의 VM부터 돌린다. **게스트 안에서 `reboot`하거나
+   VM을 라이브 마이그레이션해도 적용되지 않는다.** 새로 켜는 VM과 HA 복구로 다시 켜지는 VM은 처음부터 숨긴 채로 켜진다.
+
+6. **게스트 안에서 확인한다.**
+
+   ```bash
+   grep -c avx512vbmi /proc/cpuinfo        # 0
+   ```
+
+   클러스터 쪽에서는 `vm get`에 보류가 없고 VM의 `status.hardware.cpu_resolved.flags`에 `"avx512vbmi": false`가 있다(`vm cpu
+   app2`의 running 줄에 `-avx512vbmi`).
+
+7. **JDK를 고친 버전으로 올린다.** 숨기기는 우회일 뿐이다. 고친 JDK로 올린 뒤 숨김을 빼고(`settings set cpu.mask=`, VM은
+   `vm set app1 --no-cpu-flags`) 다시 전원을 껐다 켜면 그 기능의 성능을 되찾는다.
+
+- **한계 — CPUID만 숨긴다.** 숨기기는 "이 기능이 있다고 알리지 않기"다. CPU 하드웨어는 그 명령을 여전히 실행할 수 있으므로,
+  CPUID를 보지 않고 명령을 바로 쓰는 코드는 막지 못한다. JDK는 CPUID를 보고 내장 함수를 고르므로 이 쓰임새에는 맞다. 다른
+  소프트웨어에 쓰기 전에 그것이 CPUID로 기능을 고르는지 확인한다. 게스트 안의 우회(JVM 옵션으로 AVX-512 내장 함수 끄기 등)는
+  게스트 쪽 일이고 Orbivisor가 관리하지 않는다.
+- 숨김은 모델의 정의보다 이긴다. `Icelake-Server-v7`처럼 그 기능이 정의에 든 모델도 `avx512vbmi=off`로 켜므로 모델은 바꾸지
+  않아도 된다. 숨긴 VM도 지금처럼 다른 노드로 옮길 수 있다.
 
 ## 라이브 마이그레이션
 

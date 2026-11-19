@@ -4,7 +4,7 @@ Orbivisor가 안에서 어떻게 움직이는지를 한 문서로 모은다. 읽
 쓰는 법은 [사용 안내](guide/)에, 각 기능을 왜 그렇게 정했는지는 [설계 문서](index.md#설계와-계획)에 있다.
 
 - 이 문서는 2026-11-19의 `main`(계획 62까지) 코드를 읽고 썼다. 설계 문서와 코드가 다르면 코드를 따랐고, 다른 곳은
-  본문에 "설계와 다름"으로 적었다.
+  본문에 "설계와 다름"으로 적었다. 계획 63(게스트 CPU 모델·클러스터 CPU 기준)은 §4·§9.1·§9.6·§14에 더했다.
 - 인용은 `crates/<크레이트>/src/<파일>:<줄>` 꼴이다. 줄 번호는 이 시점의 것이라 코드가 바뀌면 조금씩 어긋난다.
 - 확인하지 못한 것은 [§19 확인하지 못한 것](#19-확인하지-못한-것)에 모았다.
 
@@ -480,7 +480,7 @@ sequenceDiagram
 | `HaManager` | 리스가 끊긴 노드의 HA VM 복구, 전원 펜싱, HA 상태 검사 대응, 배치 규칙 위반 고치기, failback, 복구 대상 미리 계산 | 1초(failback 30초, 계획 10초) | `ha.rs:88-95,633` |
 | `NodeMonitor` | 리스 나이로 `NodeStatus.online` 쓰기(바뀔 때만) | 2초, 10초면 오프라인 | `crates/opl-peer/src/monitor.rs:34-41,131-136` |
 | `VoterKeeper` | 투표 멤버 승격·강등, 대기 learner·관찰 노드 목록 | 1초 | `crates/opl-cluster/src/voters.rs:73-83` |
-| `ClusterJanitor` | 오프라인(60초 넘게)·지워진 노드의 대기 Task 실패 처리, 고아 스냅샷, 끝난 Task 정리(7일·1000개), 만료 세션, `receiving`에 24시간 넘게 머문 백업, 고아 grant | 10초 | `janitor.rs:54-66,316` |
+| `ClusterJanitor` | 오프라인(60초 넘게)·지워진 노드의 대기 Task 실패 처리, 고아 스냅샷, 끝난 Task 정리(7일·1000개), 만료 세션, `receiving`에 24시간 넘게 머문 백업, 고아 grant, 어느 노드도 가리키지 않고 1시간 넘은 CPU 카탈로그, 클러스터 CPU 기준 다시 셈·기록(§9.6) | 10초 | `janitor.rs:54-66,289,316,435`, `cpu_baseline.rs:148` |
 | `SnapshotScheduler` | 예약 스냅샷 만들기·정리 | 60초 | `schedule.rs:39,234` |
 | `BackupJobScheduler` | 백업 작업 실행(진행은 Raft에 있어 새 리더가 잇는다) | 60초 | `backup_jobs.rs:346,395` |
 | `ReplicationScheduler` | 로컬 디스크 복제 Task 만들기(원본 노드당 2개까지) | 60초 | `replication.rs:175-183,320` |
@@ -499,8 +499,10 @@ sequenceDiagram
 - **클러스터 지표 요약.** 요청을 받은 API 노드가 모든 노드에서 모은다(§12.3).
 - **노드 알림 대부분.** 사건이 난 노드가 평가한다(§12.5).
 - **노드 비우기.** 비우는 노드의 Task로 돈다(§5.7).
-- **OvnSync, 리더의 CPU 기준선 계산, 구독 보고 루프는 없다.** OVN은 범위 밖이고(§11.4), 구독은 API(`subscription.rs`)만
-  있다.
+- **CPU 카탈로그 읽기.** 노드마다 자기 QEMU에 묻고 자기가 올린다(§9.6). 리더는 그 결과로 **클러스터 CPU 기준만** 셈해
+  `ClusterStatus.cpu_baselines`에 쓴다(위 `ClusterJanitor` 틱, 계획 63). 노드가 VM을 켤 때는 이 기록만 읽으므로 리더가
+  바뀌어도 모든 노드가 같은 기준을 쓰고, 새 리더는 다음 틱에 같은 값을 셈한다(같으면 쓰지 않는다).
+- **OvnSync, 구독 보고 루프는 없다.** OVN은 범위 밖이고(§11.4), 구독은 API(`subscription.rs`)만 있다.
 
 **리더 장애 때.** 새 리더가 3~4초 안에 선다(§3.5). 진행 중이던 쓰기는 §3.7처럼 다시 시도된다. 리스 표는 임기가 바뀌면
 비워지고 새 리더는 자기가 그 임기를 본 때를 기준(base)으로 나이를 센다(`lease.rs:58-65`,
@@ -904,7 +906,8 @@ graph TD
 - **바로 적용:** 시작할 때 정한 최대 안의 vCPU(Linux x86_64만), virtio-mem 메모리(2 MiB 단위), 미리 만든 `pcie-root-port`
   8개에 virtio-blk 디스크·NIC 더하기와 돌면서 더한 것 빼기, CD 미디어 바꾸기(`crates/opl-qemu/src/cmdline.rs:14-279`).
 - **미뤄짐(`status.hardware.pending`)**: 재시작이 필요한 것(CPU 모델·토폴로지, 최대값, 펌웨어, 머신, cloud-init, TPM,
-  Secure Boot, 게스트 에이전트 …), 지원 안 됨, 한도, 실패(`vm.rs:953,991-1002`). 다음에 끄고 켜면 적용된다.
+  Secure Boot, 게스트 에이전트 …), 지원 안 됨, 한도, 실패(`vm.rs:953,991-1002`). 다음에 끄고 켜면 적용된다. 보류 `cpu`는
+  스펙뿐 아니라 클러스터 CPU 기준·숨김 목록이 바뀌어도 생기고, 그것은 각 노드의 검사 루프가 다시 셈해 쓴다(§9.6).
 - 그 밖의 디스크·NIC 변경은 409로 거부한다.
 
 ---
@@ -916,7 +919,9 @@ graph TD
 순수 함수 `build_cmdline`(`crates/opl-qemu/src/cmdline.rs:53-349`)이 만든다.
 
 - 늘 `-S -nodefaults -no-user-config`로 멈춘 채 띄우고 QMP `cont`로 시작한다.
-- `-machine q35|virt[,smm=on],accel=kvm|hvf|tcg`, `-cpu host`(TCG나 모델 Max면 `max`).
+- `-machine q35|virt[,smm=on],accel=kvm|hvf|tcg`, `-cpu <model>[,enforce][,<flag>=on|off]…`(계획 63, `cpu_option`
+  `crates/opl-qemu/src/cmdline.rs:356`). 모델·플래그는 켤 때 해석해 기록한 `ResolvedCpu`에서 온다(§9.6). 기록이 없으면(계획 63
+  전, 업그레이드 중) 예전처럼 `-cpu host`(TCG나 모델 Max면 `max`)다.
 - 디스크는 `-blockdev`(file, host_device, rbd 드라이버) + virtio-blk-pci 또는 SATA(ide-hd). NIC는 virtio-net-pci 또는
   e1000e, tap(Linux) 또는 user(macOS). VXLAN 망이면 `host_mtu`.
 - VNC는 유닉스 소켓, QMP 소켓, pid 파일. QMP 클라이언트는 비동기(`crates/opl-qemu/src/qmp.rs`).
@@ -975,6 +980,48 @@ sequenceDiagram
   VM을 자기 것으로 본다(`crates/opl-api/src/tasks/migrate.rs:1-9,808`).
 - 진행은 Task `progress`에 쓴다. 꺼진 VM의 저장소 옮기기는 없다(계획 42의 범위 밖).
 - 크기 늘리기: 블록 풀이면 저장소를 먼저 늘리고 실제 크기를 QMP `block_resize`에 준다(`crates/opl-api/src/tasks.rs:1428-1466`).
+
+### 9.6 CPU 모델, 노드 카탈로그, 클러스터 기준 (계획 63)
+
+```mermaid
+flowchart LR
+  Q[노드 QEMU] -->|QMP 탐침| N[opld 검사 루프]
+  N -->|해시 이름| C[(CpuCatalog 리소스)]
+  N -->|NodeStatus.cpu = 해시| R[(Raft)]
+  C --> L[리더 janitor 틱: cpu::baseline]
+  L -->|ClusterStatus.cpu_baselines| R
+  R --> S[API 스케줄러: Inventory 카탈로그·기준·숨김 목록]
+  R --> W[reconciler 켜기: resolve → can_run → -cpu]
+  W -->|RunningHardware.cpu_resolved| R
+```
+
+- **모델.** `CpuModel`은 `host`·`max`·`cluster`·`x86-64-v2|v2-aes|v3|v4`·QEMU 이름(`Named`)이고 `CpuSpec.flags`는 `+이름`/`-이름`
+  이다(`crates/opl-types/src/cpu.rs`). 수준 넷만 코드에 얼린 정의(Proxmox와 같음)이고, 그 밖의 모델 목록은 코드에 없다.
+  API는 별칭(`Icelake-Server`)을 노드들이 알린 카탈로그로 버전 모델(`-v1`)로 바꿔 저장한다(`crates/opl-api/src/cpu.rs`).
+- **노드 탐침.** opld가 시작할 때와 QEMU 바이너리(경로·크기·mtime)가 바뀔 때 QEMU를 VM과 같은 머신·가속기로 띄워
+  `query-cpu-definitions`·모델마다 `query-cpu-model-expansion`·`-cpu help`를 읽어 `CpuCatalogSpec`을 만든다
+  (`crates/opl-qemu/src/cpu.rs:268`, `crates/opld/src/cpu.rs:151` `CpuWatch`). 카탈로그 본문은 이름이 SHA-256인 `CpuCatalog`
+  리소스 하나이고(같은 QEMU·CPU·가속기 노드가 나눠 씀, x86 약 41 KB), `NodeStatus.cpu`에는 해시·QEMU 버전·가속기·호스트
+  벤더만 있다 — 주기적으로 다시 쓰이는 노드 상태에 40 KB를 싣지 않으려고. 다른 노드에 RPC로 묻지 않으므로 스케줄러·HA
+  리더가 오프라인 노드의 능력도 안다.
+- **리더의 기준.** 리더의 janitor 틱(10초)이 순수 함수 `cpu::baseline(nodes, catalogs, settings)`(`crates/opl-types/src/cpu.rs:1004`)로
+  아키텍처마다 기준을 셈해 달라졌으면 `ClusterStatus.cpu_baselines`에 쓰고, 모델·플래그가 바뀌면 기록 Task `cpu-baseline`과
+  감사 `cpu.baseline`을 남긴다(`crates/opl-api/src/cpu_baseline.rs:148`). auto는 x86_64만이다(위트니스 아닌 등록된 노드 모두,
+  공통 버전 모델 가운데 기능이 가장 많은 것, 벤더가 섞이면 `x86-64-v*`).
+- **켜기.** reconciler가 `CpuContext`(노드 아키텍처·가속기, 기준, 숨김 목록, 노드 카탈로그, `crates/opl-reconciler/src/cpu.rs:39`)로
+  `resolve`(모델 펴기 → 숨김 목록 → VM 플래그, 숨김이 이김, `cpu.rs:448`)와 `can_run`(`cpu.rs:525`)을 하고, 결과를
+  `RunningHardware.cpu_resolved`에 기록한다. 마이그레이션 받는 쪽·다시 붙기는 이 기록을 그대로 써서 대상의 기준·숨김 목록이
+  달라도 같은 CPUID다. 명명 모델·수준은 x86_64에서 `enforce`다.
+- **스케줄러.** `Inventory`가 카탈로그·기준·숨김 목록을 들고 같은 `CpuContext`를 만든다. 새로 켜기(배치·HA 복구·복제
+  배치)는 스펙을 대상에서 해석하고, 도는 VM 옮기기(마이그레이션·비우기·균형 조정·HA 되돌아가기)는 `cpu_resolved`를 본다
+  (`crates/opl-api/src/scheduler.rs:387` `migration_fits`). `host`·`max` VM은 막지 않고 원본에 있고 대상에 없는 플래그를
+  경고한다(`scheduler.rs:400`).
+- **보류.** CPUID는 실행 중 바꿀 수 없어 차이는 보류 `cpu`(`Restart`, "power cycle required")다. 스펙 변경은 핫플러그
+  Task가, 기준·숨김 목록·카탈로그 변경은 각 노드의 검사 루프 끝 `refresh_pending`(`crates/opl-reconciler/src/cpu.rs:192`)이
+  자기 VM에 쓴다.
+- **업그레이드.** 모든 노드가 기능 `cpu-models`를 알릴 때까지 노드는 카탈로그·`NodeStatus.cpu`를 쓰지 않고, 리더는 기준을
+  쓰지 않으며, reconciler는 `cpu_resolved`를 기록하지 않는다(§14). 쓰는 법은 [CPU 모델과 플래그](guide/vms.md#cpu-모델과-플래그)·
+  [클러스터 CPU 기준](guide/cluster.md#클러스터-cpu-기준).
 
 ---
 
@@ -1180,7 +1227,7 @@ webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평
 
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
-  `metrics-history`, `vip` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+  `metrics-history`, `vip`, `cpu-models` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.
@@ -1400,6 +1447,6 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 - **확인하지 않은 세부**: `ha_reserve`(HA 예약 용량) 적용 코드, `guest_watch`의 실행 상수, 균형기의 동시 이동 한도(설계는
   2), 리더가 받은 `LoadSummary`를 어디에 얼마나 두는지, API 요청 본문 크기 제한(`DefaultBodyLimit`를 찾지 못함 — axum
   기본값을 쓰는 것으로 보인다).
-- **없는 것으로 확인한 것**(찾았지만 없음): `.proto` 파일, OVN/OvnSync/EVPN, 리더의 CPU 기준선 계산, 구독 보고 루프,
+- **없는 것으로 확인한 것**(찾았지만 없음): `.proto` 파일, OVN/OvnSync/EVPN, 구독 보고 루프,
   SSE, 평문 HTTP 리스너, 시리얼 콘솔, Task 취소, 데몬 재시작 뒤 Task 이어가기(업그레이드 제외), 클러스터 전체 VM 잠금,
   인증서 자동 갱신과 CA 교체, 저장 비밀 암호화, keepalived, 대량 전송용 망, 꺼진 VM의 저장소 옮기기.
