@@ -2,7 +2,8 @@
 //! (`cluster-link-<n>`)를 이 노드의 대상으로 동시에 돌려 결과를 리스 갱신에 싣고(`Cluster::set_lease_checks`),
 //! 저장된 것과 다르면 `NodeStatus.checks`에 쓴다(화면용). 인터페이스 목록(`NodeStatus.interfaces`)도 여기서
 //! 쓰고, 본딩 상태가 바뀌면 감사 항목과 기록 Task(`bond-degraded`)로 알린다. 노드 CPU 탐침(계획 63, [`CpuWatch`])도
-//! 회차마다 거두어 카탈로그를 올리고 `NodeStatus.cpu`를 쓴다. 위트니스는 띄우지 않는다.
+//! 회차마다 거두어 카탈로그를 올리고 `NodeStatus.cpu`를 쓴다. 노드 NUMA 토폴로지 탐침(계획 64, [`TopologyWatch`])도
+//! 회차마다 노드 설정 `host_resources`를 적용하고 30초마다 다시 읽어 `NodeStatus.topology`를 쓴다. 위트니스는 띄우지 않는다.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
@@ -32,6 +33,7 @@ use uuid::Uuid;
 
 use crate::bootstrap;
 use crate::cpu::{self, CpuWatch, Probed};
+use crate::topology::{self, TopologyWatch};
 
 /// 검사 회차의 간격
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -95,9 +97,11 @@ impl HealthChecker {
         config: CheckerConfig,
         audit: Arc<AuditLog>,
         cpu: Option<CpuWatch>,
+        topology: Option<TopologyWatch>,
     ) -> Self {
         let mut state = State::new(cluster, node_name, config, audit);
         state.cpu = cpu;
+        state.topology = topology;
         let (shutdown, rx) = oneshot::channel();
         Self {
             shutdown,
@@ -173,6 +177,8 @@ pub struct State {
     bonds: BondWatch,
     /// 노드 CPU 탐침(계획 63). 없으면 `NodeStatus.cpu`를 건드리지 않는다.
     cpu: Option<CpuWatch>,
+    /// 노드 NUMA 토폴로지 탐침(계획 64, Linux). 없으면 `NodeStatus.topology`를 건드리지 않는다.
+    topology: Option<TopologyWatch>,
 }
 
 impl State {
@@ -219,6 +225,7 @@ impl State {
             pvs_cache: HashMap::new(),
             bonds: BondWatch::default(),
             cpu: None,
+            topology: None,
         }
     }
 
@@ -564,10 +571,16 @@ impl State {
         Some(probed)
     }
 
-    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`·`cpu`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이
+    /// `NodeStatus.checks`·`interfaces`·`hotplug`·`firmware_caps`·`cpu`·`topology`를 저장된 값과 다를 때만 쓴다(인터페이스는 읽은 적이
     /// 있을 때만, 64개까지).
     async fn write_status(&self, checks: &[CheckReport]) {
         let probed = self.publish_cpu().await;
+        // 모든 노드가 `numa`를 알 때만 쓴다(계획 64 §6).
+        let probed_topology = self
+            .topology
+            .as_ref()
+            .and_then(TopologyWatch::last)
+            .filter(|_| topology::numa_ready(&self.cluster, &self.name));
         let interfaces = self
             .interfaces
             .as_deref()
@@ -602,6 +615,13 @@ impl State {
                 let cpu = probed.node_cpu(status.cpu.as_ref());
                 if status.cpu.as_ref() != Some(&cpu) {
                     status.cpu = Some(cpu);
+                    changed = true;
+                }
+            }
+            if let Some(t) = probed_topology {
+                let t = topology::keep_time(status.topology.as_ref(), t);
+                if status.topology.as_ref() != Some(&t) {
+                    status.topology = Some(t);
                     changed = true;
                 }
             }
@@ -641,6 +661,16 @@ fn not_responding(dir: &Path) -> String {
 pub async fn run_once(state: &mut State) -> Vec<CheckReport> {
     if let Some(watch) = &mut state.cpu {
         watch.poll().await;
+    }
+    if let Some(watch) = &mut state.topology {
+        // 설정을 읽지 못하면 이번 회차는 건너뛴다(없는 것으로 보고 되돌리지 않게).
+        match state.cluster.get::<NodeSpec>(state.node) {
+            Ok(me) => {
+                let resources = me.and_then(|n| n.spec.host_resources);
+                watch.poll(resources.as_ref(), unix_now()).await;
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot read this node's host resources"),
+        }
     }
     state.resolve_hosts().await;
     state.refresh_interfaces().await;
@@ -1323,6 +1353,88 @@ mod tests {
             failed.error.as_deref(),
             Some("CPU probe failed: QEMU is gone")
         );
+    }
+
+    /// NUMA 토폴로지(계획 64): 옛 노드가 있으면(기능 `numa`를 모름) 읽기만 하고 쓰지 않는다. 모두 알면 쓰고, 같은 값이면
+    /// 다시 쓰지 않는다(`probed_at` 그대로). 노드 설정 `host_resources`가 바뀌면 다음 회차에 hugepages를 예약하고 쓴다.
+    #[tokio::test]
+    async fn the_topology_probe_waits_for_the_feature_and_applies_host_resources() {
+        use opl_types::numa::{HostResources, HugepageReserve, PageKind};
+        let s = setup().await;
+        let mut old: opl_types::node::Node = Resource::new(
+            "n2",
+            NodeSpec {
+                host_resources: None,
+                address: "h2:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        old.status.features = vec![HA_CHECKS.into()];
+        s.cluster.create(&old).await.unwrap();
+        // 고정물(x86 2소켓)을 임시 트리로 옮긴다(예약이 그 파일에 쓴다).
+        let root = s.dir.path().join("topology");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/topology/x86-2s");
+        assert!(
+            std::process::Command::new("cp")
+                .arg("-R")
+                .arg(&fixture)
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut state = s.state(&[]);
+        state.topology = Some(TopologyWatch::new(
+            root.join("sys"),
+            root.join("proc"),
+            true,
+        ));
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.topology, None);
+        assert!(state.topology.as_ref().unwrap().last().is_some());
+
+        // 옛 노드가 올라옴
+        let mut n2 = s.cluster.get_by_name::<NodeSpec>("n2").unwrap().unwrap();
+        n2.status.features.push(opl_types::node::NUMA.into());
+        s.cluster
+            .update_status::<NodeSpec>(n2.id, &n2.status)
+            .await
+            .unwrap();
+        run_once(&mut state).await;
+        let written = s.node().status.topology.unwrap();
+        assert_eq!((written.sockets, written.nodes.len()), (2, 2));
+        let revision = s.node().revision;
+        run_once(&mut state).await;
+        assert_eq!(s.node().revision, revision);
+
+        // 설정: 노드 1에 2M 1024개
+        let me = s.node();
+        let spec = NodeSpec {
+            host_resources: Some(HostResources {
+                hugepages: vec![HugepageReserve {
+                    size: PageKind::Size2M,
+                    count: 1024,
+                    host_node: Some(1),
+                }],
+                ..HostResources::default()
+            }),
+            ..me.spec
+        };
+        s.cluster
+            .update_spec(me.id, None, me.labels, &spec)
+            .await
+            .unwrap();
+        run_once(&mut state).await;
+        let nr = std::fs::read_to_string(
+            root.join("sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages"),
+        )
+        .unwrap();
+        assert_eq!(nr, "1024\n");
+        let t = s.node().status.topology.unwrap();
+        assert_eq!(t.nodes[1].pages(PageKind::Size2M), 1024);
+        assert!(t.probed_at >= written.probed_at);
     }
 
     /// 링크 검사: carrier가 0이 되면 다음 회차에 실패이고 시작 시각이 붙으며 노드 상태에 쓴다. 결과가 같으면 다시

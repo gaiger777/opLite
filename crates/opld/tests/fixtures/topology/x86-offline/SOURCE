@@ -1,0 +1,2 @@
+Hand-built (plan 64 stage 2): one NUMA node, 4 cores x 2 threads (siblings i and i+4), CPU 7 offline,
+isolcpus=2-3,6, an old kernel's nohz_full "(null)", PID 1 confined to 0-1,4-5.

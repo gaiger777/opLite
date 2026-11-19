@@ -221,12 +221,16 @@ async fn record_node(
         }
         _ => true,
     };
+    // NUMA 토폴로지(계획 64)도 모든 노드가 `numa`를 알 때만 쓴다. 아니면 이미 적힌 것을 지우지 않는다.
+    let numa_ready = host.topology.is_some() && crate::topology::numa_ready(cluster, &config.name);
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
-        // NUMA 토폴로지는 탐침(계획 64 스테이지 2)이 쓴다. 등록은 이미 적힌 것을 지우지 않는다.
-        let topology = status.topology.take();
+        let stored = status.topology.take();
         *status = NodeStatus {
-            topology,
+            topology: match &host.topology {
+                Some(t) if numa_ready => Some(crate::topology::keep_time(stored.as_ref(), t)),
+                _ => stored,
+            },
             // 탐침 결과(실패면 앞 카탈로그에 오류만). 쓰지 못하면 이미 적힌 것을 지우지 않는다.
             cpu: match &host.cpu {
                 Some(probed) if cpu_ready && published => Some(probed.node_cpu(previous.as_ref())),
@@ -757,6 +761,46 @@ pub(crate) mod tests {
         host.cpu = None;
         register_node(&cluster, &config, &host).await.unwrap();
         assert_eq!(cpu(), Some(failed));
+        cluster.shutdown().await.unwrap();
+    }
+
+    /// 등록 전에 읽은 NUMA 토폴로지를 기록한다(계획 64). `probed_at`만 다르면 저장된 것을 두고, 탐침이 없으면(macOS)
+    /// 기록된 것을 지우지 않는다.
+    #[tokio::test]
+    async fn registration_records_the_topology() {
+        use opl_types::numa::NodeTopology;
+        let dir = tempfile::tempdir().unwrap();
+        let (cluster, id) = single_node(dir.path()).await;
+        let config = test_config();
+        let mut host = Host::from_config(&config, "t").unwrap();
+        host.net = None;
+        let topology = || {
+            cluster
+                .get::<NodeSpec>(id.0)
+                .unwrap()
+                .unwrap()
+                .status
+                .topology
+        };
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(topology(), None);
+        let probed = NodeTopology {
+            sockets: 2,
+            probed_at: 5,
+            ..NodeTopology::default()
+        };
+        host.topology = Some(probed.clone());
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(topology(), Some(probed.clone()));
+        host.topology = Some(NodeTopology {
+            probed_at: 9,
+            ..probed.clone()
+        });
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(topology(), Some(probed.clone()));
+        host.topology = None;
+        register_node(&cluster, &config, &host).await.unwrap();
+        assert_eq!(topology(), Some(probed));
         cluster.shutdown().await.unwrap();
     }
 

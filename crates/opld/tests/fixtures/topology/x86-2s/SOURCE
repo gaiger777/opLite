@@ -1,0 +1,3 @@
+Hand-built (plan 64 stage 2): the shape of a 2-socket Xeon dump (2 sockets x 8 cores x 2 threads,
+2 NUMA nodes, distance 10/21, one L3 per socket, 4x1G + 512x2M hugepages per node).
+Only the value files the topology probe reads; not a copy of a real machine.

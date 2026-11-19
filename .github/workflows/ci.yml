@@ -365,7 +365,7 @@ jobs:
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it,opld/numa-it
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl
@@ -376,6 +376,8 @@ jobs:
           OPL_TEST_LVM_SHARED: oplshared
           OPL_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
           OPL_TEST_PROMTOOL: promtool
+          # 계획 64: NUMA 탐침 시험이 2M hugepages를 실행 중 예약했다가 되돌린다(`/sys` 쓰기).
+          OPL_TEST_NUMA_SYS: "1"
 
   # Ceph 자동 구성(계획 56): Ceph가 없는 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 mon·mgr, 루프 장치
   # 위 OSD(ceph-volume LVM), RBD 풀을 세워 그 풀의 볼륨으로 VM을 켠다. linux-kvm은 손으로 띄운 Ceph(바깥 Ceph를

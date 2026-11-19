@@ -30,6 +30,8 @@ pub struct Host {
     pub firmware_caps: FirmwareCaps,
     /// 등록 전에 읽은 CPU 탐침 결과(계획 63). 등록이 `NodeStatus.cpu`에 쓴다. 그 전에는 없다.
     pub cpu: Option<Probed>,
+    /// 등록 전에 읽은 NUMA 토폴로지(계획 64). 등록이 `NodeStatus.topology`에 쓴다. Linux가 아니면 없다.
+    pub topology: Option<opl_types::numa::NodeTopology>,
     /// swtpm 실행 파일(`[hypervisor] swtpm`·`swtpm_setup`)
     pub swtpm: opl_driver::SwtpmConfig,
 }
@@ -58,6 +60,7 @@ impl Host {
             hotplug: NodeHotplug::default(),
             firmware_caps: FirmwareCaps::default(),
             cpu: None,
+            topology: None,
             swtpm: config.swtpm(),
         })
     }

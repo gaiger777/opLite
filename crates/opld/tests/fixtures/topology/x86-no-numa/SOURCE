@@ -1,0 +1,2 @@
+Hand-built (plan 64 stage 2): a kernel without CONFIG_NUMA (no devices/system/node), 2 cores x 2 threads,
+128 x 2M hugepages, cgroup v2 without the cpuset controller.

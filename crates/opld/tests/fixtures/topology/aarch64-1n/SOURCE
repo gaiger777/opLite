@@ -1,0 +1,3 @@
+Recorded read-only on svc01 (aarch64, UTM, TCG host, 4 CPUs, one NUMA node, no hugepages) on 2026-11-19:
+the value files under /sys/devices/system/{cpu,node}, /sys/kernel/mm/hugepages, /sys/fs/cgroup/cgroup.controllers,
+/proc/meminfo and the Name/Pid/Cpus_allowed_list lines of /proc/1/status.

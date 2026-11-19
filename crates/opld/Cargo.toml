@@ -85,6 +85,10 @@ metrics-it = []
 # 시험 고리(`/v1/test/vm-cpu`·`cpu-mask`·`vcpu-props`)를 더한다. qemu-it의 준비물이 필요하고, x86_64 시험은 KVM이 있는
 # Linux(CI `linux-kvm`), 이 Mac(aarch64)은 TCG로 명명 모델과 `sve` 숨기기만 본다.
 cpu-it = ["qemu-it"]
+# 실제 Linux 호스트의 NUMA 토폴로지 탐침(계획 64): 이 호스트의 `/sys`를 읽어 찍고, 2M hugepages를 실행 중 예약했다가
+# 되돌리며(`nr_hugepages` 쓰기), 다른 프로세스의 스레드 친화를 건다. root와 `OPL_TEST_NUMA_SYS=1`이 있을 때만 `/sys`에 쓴다
+# (CI `linux-kvm`). 스테이지 4가 실제 VM의 vCPU 고정 시험을 더한다.
+numa-it = []
 
 [dependencies]
 anyhow.workspace = true

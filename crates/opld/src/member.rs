@@ -66,6 +66,7 @@ use crate::overlay::{OverlayAgent, cluster_tag};
 use crate::pools::PoolMounter;
 use crate::runtime::{Handles, on, run_on};
 use crate::shutdown;
+use crate::topology::TopologyWatch;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
 pub const CLUSTER_DIR: &str = "cluster";
@@ -462,6 +463,18 @@ impl Member {
             host.profile.accel.as_str(),
         );
         host.cpu = Some(cpu_watch.probe_now().await.clone());
+        // NUMA 토폴로지(계획 64, Linux만)도 등록 전에 읽는다. 노드 설정 `host_resources`(hugepages 예약·opld 친화)를 먼저
+        // 적용한다. 그 뒤로는 검사 루프가 설정 바뀜과 30초마다 다시 읽는다.
+        let mut topology_watch = cfg!(target_os = "linux")
+            .then(|| TopologyWatch::new("/sys", "/proc", host.systemd_scope));
+        if let Some(watch) = &mut topology_watch {
+            let resources = cluster
+                .get::<opl_types::node::NodeSpec>(cluster.id().0)
+                .ok()
+                .flatten()
+                .and_then(|n| n.spec.host_resources);
+            host.topology = Some(watch.refresh(resources.as_ref(), unix_now()).await.clone());
+        }
         // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
         let tls_dir = migration_tls_dir(&config.data_dir);
         if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
@@ -894,6 +907,7 @@ impl Member {
                 },
                 state.audit.clone(),
                 Some(cpu_watch),
+                topology_watch,
             )
         });
         let monitor = on(&rt.core, || {

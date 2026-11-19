@@ -262,3 +262,16 @@
 - **임시 API 막기(스테이지 5 전)**: `vms.rs` `prepare`가 `numa::in_use(spec)`(정책·스레드·에뮬레이터·`numa`·`hugepages` 가운데 하나)면 `require_feature(NUMA)`(409) 뒤 400 "dedicated CPUs, NUMA and hugepages are not available yet". `PUT /nodes/{key}`(`resources.rs` `update_node`)도 `host_resources`가 있으면 같은 409 → 400. 시험 `crates/opl-api/tests/numa.rs`. 스테이지 5가 이 400을 검증·권한·할당량으로 바꾼다.
 - **opld 등록**은 `NodeStatus.topology`를 지우지 않고 둔다(`bootstrap.rs`, 계획 63의 `cpu`와 같다).
 - `schema.d.ts`를 다시 만들었다.
+
+### 스테이지 2 (opld 탐침)
+
+- **`topology::probe(sys, proc)`는 설계 그대로**이고 `warnings`·`probed_at`은 비워 돌려준다. `cpuset`은 탐침이 cgroup v2 컨트롤러만 보고, 검사 루프의 `TopologyWatch`가 `[hypervisor] systemd_scope`와 AND 한다. `pinning`은 늘 참(Linux에서만 띄움 — macOS·위트니스는 `TopologyWatch`가 없다).
+- **노드 상태를 작게**: `HostNode.hugepages`에는 0이 아닌 풀만 둔다(크기 목록은 `page_sizes_kib`에, aarch64 svc01은 `64·2048·32768·1048576`). `node` 디렉터리가 없으면 노드 0의 풀은 `/sys/kernel/mm/hugepages`의 것이고 거리는 비운다. `distance` 줄 하나라도 노드 수와 어긋나면 거리 전체를 비운다. 패키지 번호가 없거나 -1이면 소켓 0(svc01 aarch64는 `physical_package_id` 36 — 소켓 수는 서로 다른 번호의 수라 1이다).
+- **크기 측정**: 2소켓 × 64코어 × 2스레드(256 CPU, 노드 2, L3 16, 풀 둘) JSON 1,924바이트, x86 2소켓 고정물 571바이트. 4 KB 안쪽이라 형제 묶음을 줄이지 않는다(시험 `a_large_topology_stays_small`이 4 KB를 넘으면 실패).
+- **경고 문구**: `dedicated CPUs 7 are offline`(예약도 같은 꼴), `host processes may run on the dedicated CPUs 4-5; see the host preparation guide`(전용 − `isolated`, PID 1 `Cpus_allowed_list`와 겹침, PID 1을 못 읽으면 생략), `the dedicated CPUs split SMT sibling groups 0,4 1,5`, `node 0: 2M hugepages 100 wanted, 64 reserved`(호스트 노드를 안 정하면 `node …:` 없이 전체와 견줌). 더해 `nr_hugepages`를 쓰지 못한 까닭과 opld 친화를 걸지 못한 까닭도 경고로 둔다.
+- **hugepages 예약은 설정이 바뀔 때만** 쓴다(시작할 때 + `host_resources`가 바뀐 회차). 커널이 모자라게 잡은 수는 회차마다 다시 쓰지 않고(1G의 조각 모음을 30초마다 부르지 않게) 경고로만 남는다 — 다시 하려면 설정을 바꾸거나 opld를 다시 시작한다. 지금 수와 같은 예약은 쓰지 않는다.
+- **탐침 주기**: 검사 회차(5초)마다 노드 설정만 읽고, 설정이 바뀐 회차와 여섯 회차(30초)마다 `/sys`를 읽는다. 읽기·쓰기는 `spawn_blocking`. 값이 같으면 `probed_at`을 바꾸지 않아(`keep_time`, 저장된 값과도 견줌 — 다시 시작해도) 노드 상태를 다시 쓰지 않는다. 읽지 못하면 앞 값에 `error`만 단다. 노드 설정을 읽지 못한 회차는 건너뛴다(없는 것으로 보고 친화를 되돌리지 않게).
+- **opld 자기 친화**: 예약 CPU(온라인과 교집합)가 있으면 `/proc/self/task`의 모든 스레드에 `sched_setaffinity`, 예약을 빼면 온라인 CPU 전체로 되돌린다(바뀔 때만). **QEMU·swtpm은 opld의 친화를 물려받으므로** 스테이지 4 드라이버는 예약이 있을 때 `pre_exec`에서 공유 집합(또는 전용 VM의 에뮬레이터 집합)으로 늘 다시 걸어야 한다 — 아니면 공유 VM이 예약 CPU에 갇힌다(지금은 API가 `host_resources`를 막으므로 생기지 않는다).
+- **등록**: `member.rs`가 `firmware_caps`·CPU 탐침 다음에 저장된 `host_resources`로 한 번 적용·읽고 `Host.topology`에 둔다. `record_node`는 모든 노드가 `numa`를 알 때만 그것을 쓰고(`probed_at`만 다르면 저장된 것), 아니면 저장된 것을 둔다.
+- **고정물**(`crates/opld/tests/fixtures/topology/`, 각 디렉터리의 `SOURCE`에 출처): `x86-2s`(손으로 만든 2소켓 Xeon 모양), `aarch64-1n`(svc01에서 읽기만 해서 기록), `x86-no-numa`(`node` 없음·cpuset 없음), `x86-offline`(CPU 7 오프라인·`isolcpus`·`nohz_full` `(null)`·PID 1 친화). **GitHub 러너의 x86 노드 하나는 아직 없다**: `numa-it`의 `probes_this_host`가 러너의 탐침 JSON을 로그에 찍으므로 그것으로 나중에 옮긴다.
+- **`opld/numa-it`를 스테이지 2에서 만들었다**(스테이지 4가 VM 시험을 더한다): 이 호스트 읽기(JSON 찍기), 노드 0에 2M 16개를 더 예약했다가 되돌리기(끝에 원래 글을 다시 씀), `sleep` 자식의 스레드 친화 걸기. `/sys`에 쓰는 시험은 root와 `OPL_TEST_NUMA_SYS=1`일 때만 돈다(배포 서버에서 기능을 켜고 돌려도 호스트 설정을 바꾸지 않게). CI `linux-kvm`의 `FEATURES`와 `env`에 더했다.

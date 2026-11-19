@@ -34,6 +34,7 @@ mod runtime;
 mod shutdown;
 #[cfg(feature = "starve-it")]
 mod starve;
+mod topology;
 mod web;
 
 use std::fs::File;
