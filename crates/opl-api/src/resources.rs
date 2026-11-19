@@ -423,11 +423,30 @@ pub async fn create_pool(
         StoragePoolSpec::KIND,
         spec.folder,
     )?;
+    // 풀의 백엔드는 노드의 경로·VG·데이터셋·Ceph·NFS를 가리킨다: 만들기는 루트 `cluster.admin`이다(폴더의
+    // `storage.config`는 있는 풀의 바꾸기·지우기만, 리뷰 1).
+    require_host_admin(&state, &principal, "creating a storage pool")?;
     check_pool_spec(&state.cluster, &mut spec, shared_given)?;
     let mut pool = Resource::new(req.name, spec);
     pool.labels = req.labels;
     pool.revision = state.cluster.create(&pool).await?;
     Ok((StatusCode::CREATED, Json(pool)))
+}
+
+/// 노드의 자원(경로·장치·브리지)을 가리키는 쓰기: 루트 `cluster.admin`이 없으면 403.
+fn require_host_admin(state: &AppState, principal: &Principal, what: &str) -> Result<(), ApiError> {
+    if state.authz.allows(
+        principal,
+        Privilege::ClusterAdmin,
+        opl_types::authz_eval::AuthzTarget::Root,
+    ) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        "forbidden",
+        format!("{what} needs cluster.admin: it points at host paths, devices or bridges"),
+    ))
 }
 
 /// 풀 spec의 값을 검사하고 늘 공유인 백엔드(NFS·RBD·공유 LVM)의 `shared`를 채운다. `shared_given`은 요청이
@@ -680,6 +699,11 @@ pub async fn create_network(
         NetworkSpec::KIND,
         req.spec.folder,
     )?;
+    // 브리지 네트워크는 노드의 브리지·NIC·VLAN에 VM을 붙인다: 루트 `cluster.admin`이다. 폴더의 `network.config`로는
+    // orbivisord가 만드는 VXLAN 네트워크만 만든다(리뷰 1).
+    if req.spec.bridge.is_some() {
+        require_host_admin(&state, &principal, "creating a bridge network")?;
+    }
     if req.name == USER_NETWORK {
         return Err(ApiError::bad_request(format!(
             "network name {USER_NETWORK:?} is reserved for user-mode NAT"

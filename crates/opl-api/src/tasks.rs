@@ -1346,6 +1346,11 @@ async fn delete_volume(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 /// 본다. 블록 볼륨(LVM-thin, ZFS, RBD, 공유 LVM)은 스토리지로 먼저 늘린다), 아니면 스토리지로 늘린 뒤 실제 크기를
 /// 스펙에 기록한다. API가 확인한 뒤 VM이 켜지거나 꺼졌을 수 있고 앞의 Task가 크기를 바꿨을 수 있어 여기서
 /// 다시 본다.
+///
+/// 폴더 할당량(계획 62 리뷰 1): 저장소를 건드리기 전에 요청한 크기를 스펙에 먼저 써서 Raft의 할당량 검사로 몫을
+/// 잡는다(두 노드가 동시에 늘려도 하나만 잡는다). 늘린 뒤의 실제 크기(LVM extent·ZFS 단위 올림)는 상태
+/// `disk_bytes`에 적은 뒤 스펙에 기록해 할당량에 막히지 않는다(사용량을 적게 세지 않는다). 늘리지 못하면 디스크의
+/// 실제 크기로 되돌린다.
 async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
     let (volume, pool) = volume_and_pool(ctx, id)?;
     if volume.status.phase != VolumePhase::Ready {
@@ -1366,8 +1371,22 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
             volume.name, vm.name
         ));
     }
-    // 저장소를 늘리기 전에 폴더 할당량을 다시 본다(요청 뒤 다른 노드가 몫을 썼을 수 있다). 늘린 뒤 크기 기록이
-    // 할당량에 막히면 디스크만 커진 채로 남는다.
+    let user = vms.iter().find_map(|vm| {
+        let disk = vm.spec.disks.iter().position(|d| d.volume == volume.name)?;
+        Some((vm, disk))
+    });
+    // 꺼진 VM의 경로(저장소로 늘린다)는 원하는 상태도 꺼짐일 때만 탄다. 켜는 중에 늘리면 그동안
+    // 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
+    if let Some((vm, _)) = user
+        && vm.status.phase != VmPhase::Running
+        && !is_stopped(vm)
+    {
+        return Err(format!(
+            "VM {:?} is starting or stopping; try again when it has settled",
+            vm.name
+        ));
+    }
+    // 할당량을 미리 본 뒤(경로가 든 메시지) 스펙에 써서 Raft가 몫을 잡는다. 거절되면 디스크는 그대로다.
     crate::quota::precheck(
         &ctx.cluster,
         crate::quota::Change::Volume {
@@ -1376,33 +1395,47 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
         },
     )
     .map_err(|e| e.message)?;
-    let user = vms.iter().find_map(|vm| {
-        let disk = vm.spec.disks.iter().position(|d| d.volume == volume.name)?;
-        Some((vm, disk))
-    });
-    match user {
-        // 꺼진 VM의 경로(저장소로 늘린다)는 원하는 상태도 꺼짐일 때만 탄다. 켜는 중에 늘리면 그동안
-        // 시작한 QEMU가 늘리는 중인 볼륨을 열 수 있다.
-        Some((vm, _)) if vm.status.phase != VmPhase::Running && !is_stopped(vm) => {
-            return Err(format!(
-                "VM {:?} is starting or stopping; try again when it has settled",
-                vm.name
-            ));
+    set_volume_size(ctx, id, size_bytes).await?;
+    if let Err(e) = grow_storage(ctx, &volume, &pool, user, size_bytes).await {
+        // 늘리지 못했다: 잡아 둔 크기를 디스크의 실제 크기로 되돌린다(읽지 못하면 크게 센 채로 둔다).
+        if let Ok(info) = ctx.storage.volume_info(&pool, id, volume.spec.format).await
+            && let Err(undo) = record_grown_size(ctx, id, info.virtual_bytes).await
+        {
+            tracing::warn!(volume = %volume.name, error = %undo, "cannot record the volume size after a failed resize");
         }
+        return Err(e);
+    }
+    let info = ctx
+        .storage
+        .volume_info(&pool, id, volume.spec.format)
+        .await
+        .map_err(|e| format!("cannot read the new size: {e}"))?;
+    record_grown_size(ctx, id, info.virtual_bytes).await
+}
+
+/// 저장소(실행 중이면 QEMU도)로 볼륨을 늘린다.
+async fn grow_storage(
+    ctx: &Ctx,
+    volume: &Volume,
+    pool: &StoragePool,
+    user: Option<(&Vm, usize)>,
+    size_bytes: u64,
+) -> Result<(), String> {
+    let id = volume.id;
+    match user {
         // 실행 중에는 디스크를 바꿀 수 없으므로 스펙의 순서가 QEMU의 디스크 번호다. 블록 볼륨은
         // QEMU가 늘릴 수 없으므로 저장소로 먼저 늘린 뒤 QEMU에 볼륨의 실제 크기(LVM은 extent,
-        // ZFS는 1 MiB 단위로 올린다)를 알린다. 그래야 게스트가 보는 크기가 아래에서 기록하는
-        // 크기와 같다.
+        // ZFS는 1 MiB 단위로 올린다)를 알린다. 그래야 게스트가 보는 크기가 기록하는 크기와 같다.
         Some((vm, disk)) if vm.status.phase == VmPhase::Running => {
             let mut size_bytes = size_bytes;
-            if block_pool_kind(&pool).is_some() {
+            if block_pool_kind(pool).is_some() {
                 ctx.storage
-                    .resize_volume(&pool, id, volume.spec.format, size_bytes)
+                    .resize_volume(pool, id, volume.spec.format, size_bytes)
                     .await
                     .map_err(|e| e.to_string())?;
                 size_bytes = ctx
                     .storage
-                    .volume_info(&pool, id, volume.spec.format)
+                    .volume_info(pool, id, volume.spec.format)
                     .await
                     .map_err(|e| format!("cannot read the new size: {e}"))?
                     .virtual_bytes;
@@ -1410,20 +1443,53 @@ async fn resize_volume(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), Strin
             ctx.hv
                 .block_resize(vm.id, disk, size_bytes)
                 .await
-                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())
         }
         _ => ctx
             .storage
-            .resize_volume(&pool, id, volume.spec.format, size_bytes)
+            .resize_volume(pool, id, volume.spec.format, size_bytes)
             .await
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| e.to_string()),
     }
-    let info = ctx
-        .storage
-        .volume_info(&pool, id, volume.spec.format)
-        .await
-        .map_err(|e| format!("cannot read the new size: {e}"))?;
-    set_volume_size(ctx, id, info.virtual_bytes).await
+}
+
+/// 늘린 디스크의 실제 크기를 기록한다. 상태 `disk_bytes`를 먼저 적어 스펙 기록이 폴더 할당량에 막히지 않게 하고
+/// (Raft 쪽 `quota_check`) 기록한 뒤 지운다. 기록하지 못하면 오류다(Task가 실패로 알린다).
+async fn record_grown_size(ctx: &Ctx, id: Uuid, size_bytes: u64) -> Result<(), String> {
+    let volume = ctx
+        .cluster
+        .get::<VolumeSpec>(id)
+        .map_err(|e| e.to_string())?
+        .ok_or("volume was deleted")?;
+    if volume.status.disk_bytes != Some(size_bytes) {
+        let status = VolumeStatus {
+            disk_bytes: Some(size_bytes),
+            ..volume.status.clone()
+        };
+        ctx.cluster
+            .update_status::<VolumeSpec>(id, &status)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    set_volume_size(ctx, id, size_bytes).await.map_err(|e| {
+        format!("the disk now has {size_bytes} bytes but the size was not recorded: {e}")
+    })?;
+    // 허가는 한 번만 쓴다: 남겨 두면 스냅샷 되돌리기로 작아진 뒤 그 크기까지 다시 늘리는 것이 할당량을 건너뛴다.
+    if let Some(volume) = ctx
+        .cluster
+        .get::<VolumeSpec>(id)
+        .map_err(|e| e.to_string())?
+        && volume.status.disk_bytes.is_some()
+    {
+        let status = VolumeStatus {
+            disk_bytes: None,
+            ..volume.status.clone()
+        };
+        if let Err(e) = ctx.cluster.update_status::<VolumeSpec>(id, &status).await {
+            tracing::warn!(volume = %volume.name, error = %e, "cannot clear the recorded disk size");
+        }
+    }
+    Ok(())
 }
 
 /// 볼륨을 지우지 못한 이유

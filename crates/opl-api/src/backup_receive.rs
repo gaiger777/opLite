@@ -319,6 +319,8 @@ pub async fn receive_backup(
         );
         drop_templates(&mut manifest.vm_spec);
     }
+    // 보낸 클러스터의 폴더 id는 여기서 뜻이 없고 옛 노드는 그 칸을 풀지 못한다: 버린다(복원은 루트나 요청한 폴더, 리뷰 1).
+    manifest.vm_spec.folder = None;
     // TPM 상태·Secure Boot·게스트 에이전트(계획 59)는 버리지 않는다: TPM 상태를 버리면 봉인한 비밀을 잃는다. 옛 노드는
     // 그 VM 스펙을 풀지 못하므로 모든 노드가 그 기능을 알 때만 받는다(409 `cluster_upgrading`).
     if manifest.tpm_state || manifest.vm_spec.tpm || manifest.vm_spec.secure_boot {

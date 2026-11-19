@@ -50,14 +50,6 @@ fn load_folders(objects: &Objects) -> Result<HashMap<Uuid, Node>, StoreError> {
     Ok(out)
 }
 
-fn any_folder(objects: &Objects) -> Result<bool, StoreError> {
-    let kind = Kind::Folder.as_str();
-    Ok(objects
-        .range((kind, 0u128)..=(kind, u128::MAX))?
-        .next()
-        .is_some())
-}
-
 /// 리소스 스펙의 `folder` 칸
 fn folder_of(spec: &Value) -> Option<Uuid> {
     spec.get("folder")?.as_str()?.parse().ok()
@@ -159,7 +151,9 @@ pub(crate) fn check_write(
         }
         None => false,
     };
-    if found || !any_folder(objects)? {
+    // 폴더가 하나도 없어도 거절한다(리뷰 1): 마지막 폴더를 지운 뒤 커밋된 넣기가 없는 폴더를 가리키면 그 VM은 루트로
+    // 평가되고 할당량 밖에 놓인다. `folder` 칸은 기능 게이트 뒤라 옛 노드는 쓰지 않는다.
+    if found {
         return Ok(Ok(()));
     }
     Ok(Err(Rejection::NotFound {
@@ -309,11 +303,22 @@ pub(crate) fn quota_check(
     if !matches!(kind, Kind::Vm | Kind::Volume | Kind::Folder) {
         return Ok(None);
     }
-    // 볼륨은 늘릴 때만 본다(붙지 않은 볼륨은 세지 않는다).
+    // 볼륨은 늘릴 때만 본다(붙지 않은 볼륨은 세지 않는다). 늘리기 Task가 이미 늘린 디스크의 실제 크기
+    // (`status.disk_bytes`, Task만 쓴다)까지 올리는 기록은 막지 않는다: 디스크는 이미 컸고, 막으면 사용량이 실제보다
+    // 적게 남는다(리뷰 1). 할당량은 Task가 저장소를 늘리기 전에 요청한 크기로 미리 잡는다.
     if kind == Kind::Volume {
         let size = |v: &Value| v["size_bytes"].as_u64().unwrap_or(0);
         if old.is_none_or(|o| size(spec) <= size(o)) {
             return Ok(None);
+        }
+        if let Some(v) = objects.get((kind.as_str(), id.as_u128()))? {
+            let raw: RawResource = decode(v.value())?;
+            if raw.status["disk_bytes"]
+                .as_u64()
+                .is_some_and(|disk| size(spec) <= disk)
+            {
+                return Ok(None);
+            }
         }
     }
     let tree = load_quota_tree(objects)?;
@@ -528,6 +533,27 @@ mod tests {
             })
         }
 
+        /// 검사 없이 저장소에 바로 쓴다(검사가 생기기 전의 데이터 흉내).
+        fn raw_put(&mut self, kind: Kind, id: Uuid, spec: Value) {
+            let mut resource: RawResource = Resource::new(id.to_string(), spec);
+            resource.id = id;
+            let txn = self.db.begin_write().unwrap();
+            {
+                let mut objects = txn.open_table(OBJECTS).unwrap();
+                let mut names = txn.open_table(NAMES).unwrap();
+                objects
+                    .insert(
+                        (kind.as_str(), id.as_u128()),
+                        serde_json::to_vec(&resource).unwrap().as_slice(),
+                    )
+                    .unwrap();
+                names
+                    .insert((kind.as_str(), resource.name.as_str()), id.as_u128())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
         fn folder(&mut self, id: Uuid, name: &str, parent: Option<Uuid>) -> Result<(), Rejection> {
             self.create(Kind::Folder, id, folder(name, "vm", parent))
         }
@@ -561,17 +587,29 @@ mod tests {
         })
     }
 
-    /// 폴더가 하나도 없는 동안에는 `folder` 칸을 보지 않는다(옛 노드와 같은 결과).
+    /// 리뷰 1: 폴더가 하나도 없어도(마지막 폴더를 지운 뒤) 없는 폴더를 가리키는 쓰기는 거절한다. 폴더 없는 쓰기와
+    /// 폴더를 바꾸지 않는 쓰기는 그대로 받는다.
     #[test]
-    fn without_folders_nothing_is_checked() {
+    fn a_missing_folder_is_refused_even_when_no_folder_is_left() {
         let mut sm = Sm::new();
-        assert_eq!(sm.create(Kind::Vm, id(1), vm(Some(id(99)))), Ok(()));
-        assert_eq!(sm.update(Kind::Vm, id(1), vm(Some(id(98)))), Ok(()));
+        sm.folder(id(10), "a", None).unwrap();
+        assert_eq!(sm.create(Kind::Vm, id(1), vm(Some(id(10)))), Ok(()));
+        assert_eq!(sm.update(Kind::Vm, id(1), vm(None)), Ok(()));
+        assert_eq!(sm.delete(Kind::Folder, id(10)), Ok(()));
         assert_eq!(
-            sm.create(Kind::Network, id(2), json!({"folder": id(97)})),
-            Ok(())
+            sm.create(Kind::Vm, id(2), vm(Some(id(10)))),
+            not_found(id(10))
         );
-        assert_eq!(sm.delete(Kind::Vm, id(1)), Ok(()));
+        assert_eq!(
+            sm.update(Kind::Vm, id(1), vm(Some(id(10)))),
+            not_found(id(10))
+        );
+        assert_eq!(
+            sm.create(Kind::Network, id(3), json!({"folder": id(97)})),
+            not_found(id(97))
+        );
+        assert_eq!(sm.create(Kind::Vm, id(4), vm(None)), Ok(()));
+        assert_eq!(sm.update(Kind::Vm, id(4), vm(None)), Ok(()));
     }
 
     #[test]
@@ -612,11 +650,11 @@ mod tests {
         assert_eq!(sm.update(Kind::Vm, id(2), vm(Some(id(10)))), Ok(()));
     }
 
-    /// 폴더가 없던 때 들어간 `folder` 값은 그대로 두면 다른 칸을 바꿀 수 있다.
+    /// 없는 폴더를 가리키는 `folder` 값(이 검사가 생기기 전에 들어간 것)은 그대로 두면 다른 칸을 바꿀 수 있다.
     #[test]
     fn an_unchanged_folder_reference_is_not_checked() {
         let mut sm = Sm::new();
-        sm.create(Kind::Vm, id(1), vm(Some(id(99)))).unwrap();
+        sm.raw_put(Kind::Vm, id(1), vm(Some(id(99))));
         sm.folder(id(10), "a", None).unwrap();
         let mut spec = vm(Some(id(99)));
         spec["memory_mib"] = json!(512);
@@ -892,6 +930,31 @@ mod tests {
             sm.create(Kind::Vm, id(11), sized_vm(Some(id(3)), 2, 1, &[])),
             Ok(())
         );
+    }
+
+    /// 리뷰 1 I6: 늘리기 Task가 상태 `disk_bytes`에 적은 실제 크기까지는 할당량을 넘어도 기록한다(디스크는 이미
+    /// 컸다). 그보다 큰 크기는 여전히 막는다.
+    #[test]
+    fn a_grown_disk_is_recorded_even_past_the_quota() {
+        let mut sm = Sm::new();
+        sm.create(
+            Kind::Folder,
+            id(1),
+            quota_folder(None, json!({"disk_bytes": 100})),
+        )
+        .unwrap();
+        sm.create(Kind::Volume, id(20), volume(90)).unwrap();
+        sm.create(Kind::Vm, id(10), sized_vm(Some(id(1)), 1, 1, &[id(20)]))
+            .unwrap();
+        assert!(exceeded(sm.update(Kind::Volume, id(20), volume(104))).is_some());
+        sm.apply(Command::UpdateStatus {
+            kind: Kind::Volume,
+            id: id(20),
+            status: json!({"phase": "ready", "disk_bytes": 104}),
+        })
+        .unwrap();
+        assert_eq!(sm.update(Kind::Volume, id(20), volume(104)), Ok(()));
+        assert!(exceeded(sm.update(Kind::Volume, id(20), volume(105))).is_some());
     }
 
     #[test]

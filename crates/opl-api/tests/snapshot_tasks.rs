@@ -723,6 +723,48 @@ async fn revert_checks_volumes_of_another_node_before_stopping() {
     assert!(!storage.calls().iter().any(|(call, _)| *call == "revert"));
 }
 
+/// 리뷰 1 I2: 되돌려도 폴더는 지금 것이다(스냅샷 때의 폴더로 옮기면 옮기기 권한 없이 폴더를 바꾸게 된다).
+#[tokio::test]
+async fn revert_keeps_the_current_folder() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let vm = running_vm(&admin, "bare", &[]).await;
+    let mut folders = Vec::new();
+    for name in ["dev", "prod"] {
+        let (status, body) = admin
+            .post("/folders", json!({ "name": name, "kind": "vm" }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        folders.push(body["id"].as_str().unwrap().to_string());
+    }
+    let move_to = |folder: String| {
+        let admin = &admin;
+        async move {
+            let (status, body) = admin
+                .post(
+                    &format!("/folders/{folder}/members"),
+                    json!({ "items": [{ "kind": "vm", "key": "bare" }] }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["items"][0]["ok"], true, "{body}");
+        }
+    };
+    move_to(folders[0].clone()).await;
+    succeeded(&snapshot(&admin, "bare", json!({ "name": "cfg" })).await);
+    move_to(folders[1].clone()).await;
+    let (status, task) = admin
+        .post("/vms/bare/snapshots/cfg/revert", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    succeeded(&admin.wait_task(&task).await);
+    let got = env.cluster.get::<VmSpec>(vm).unwrap().unwrap();
+    assert_eq!(
+        got.spec.folder.map(|f| f.to_string()),
+        Some(folders[1].clone())
+    );
+}
+
 #[tokio::test]
 async fn resize_keeps_volume_labels_written_meanwhile() {
     let mut env = Env::start().await;

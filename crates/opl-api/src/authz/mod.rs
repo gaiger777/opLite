@@ -506,6 +506,32 @@ impl Authz {
         Ok(())
     }
 
+    /// VM CD-ROM에 넣을 ISO 볼륨마다 그 주인(보통 풀)의 `system.read`. 없는 볼륨은 보지 않는다(검증이 400을 낸다).
+    pub fn require_isos<'a>(
+        &self,
+        principal: &Principal,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ApiError> {
+        for name in names.into_iter().collect::<std::collections::BTreeSet<_>>() {
+            let Some(v) = self
+                .cluster
+                .get_by_name::<opl_types::storage::VolumeSpec>(name)?
+            else {
+                continue;
+            };
+            let target = Owners::around_volume(&self.cluster, &v.name, &v.spec.pool)?;
+            self.require(
+                principal,
+                Privilege::SystemRead,
+                &Found {
+                    owned: Owned::object(target),
+                    missing: format!("volume {name:?} not found"),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// 새 객체(VM·네트워크·풀)를 `folder`에 만들 권한. 폴더를 주지 않았는데 루트에는 권한이 없고 다른 어딘가(폴더)에는
     /// 있으면 400 `folder_required`다(설계 §5).
     pub fn require_new(

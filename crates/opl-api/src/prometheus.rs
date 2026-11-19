@@ -68,8 +68,8 @@ impl PrometheusCache {
 }
 
 /// 이 노드의 Prometheus 지표(텍스트 형식 0.0.4, gauge). 이 노드와 이 노드에서 잰 VM의 마지막 5초 점, 이 노드에서
-/// 준비된 풀, 클러스터 값(노드 수·VM 수·리더)이다. 노드마다 따로 긁는다. Node와 Vm 읽기 권한이 필요하고(viewer 토큰이면
-/// 된다), 설정 `prometheus.enabled`가 꺼져 있으면 404 `not_found`다. 5초 캐시한다.
+/// 준비된 풀, 클러스터 값(노드 수·VM 수·리더)이다. 노드마다 따로 긁는다. 루트 `cluster.read`와 루트 아래 모든 VM의
+/// 읽기(전역 역할이나 propagate 루트 grant)가 필요하고(viewer 토큰이면 된다), 설정 `prometheus.enabled`가 꺼져 있으면 404 `not_found`다. 5초 캐시한다.
 #[utoipa::path(get, path = "/metrics", tag = "metrics",
     responses((status = 200, description = "Prometheus text format 0.0.4", body = String,
         content_type = "text/plain; version=0.0.4"),
@@ -79,6 +79,21 @@ pub async fn get_prometheus(
     principal: Principal,
 ) -> Result<Response, ApiError> {
     state.authorize(&principal, Action::Read, NodeSpec::KIND)?;
+    // 모든 VM의 값이 들어 있다: 루트에서 아래 모두를 읽는 주체(전역 viewer 이상, 그런 토큰)만이다. propagate가 아닌
+    // 루트 grant의 `cluster.read`만으로는 못 읽는다(리뷰 1).
+    if state.authorizer.builtin()
+        && !state.authz.allows(
+            &principal,
+            opl_types::authz::Privilege::SystemRead,
+            opl_types::authz_eval::AuthzTarget::Object {
+                kind: opl_types::resource::Kind::Vm,
+                id: uuid::Uuid::nil(),
+                folder: None,
+            },
+        )
+    {
+        return Err(ApiError::forbidden());
+    }
     if !crate::settings::current(&state.cluster)?
         .spec
         .prometheus_enabled()

@@ -135,6 +135,16 @@ impl From<Realm> for RealmView {
 }
 
 /// 요청을 저장할 spec으로. `stored`는 바꿀 때의 지금 값이다(빠진 비밀번호를 채운다).
+/// 역할 `none`으로 매핑하면 모든 노드가 `folders`를 알아야 한다(옛 노드는 그 영역도, 그렇게 만든 사용자도 풀지
+/// 못한다, 리뷰 1).
+fn require_none_role(state: &AppState, spec: &RealmSpec) -> Result<(), ApiError> {
+    let roles = &spec.roles;
+    if roles.default == Some(Role::None) || roles.groups.iter().any(|g| g.role == Role::None) {
+        crate::cluster::require_feature(&state.cluster, opl_types::node::FOLDERS)?;
+    }
+    Ok(())
+}
+
 fn spec_of(req: &RealmRequest, stored: Option<&RealmSpec>) -> Result<RealmSpec, ApiError> {
     let backend = match req.backend.clone() {
         RealmBackend::Ldap(ldap) => RealmBackend::Ldap(ldap_of(ldap, stored)?),
@@ -238,6 +248,7 @@ pub async fn create_realm(
     let spec = spec_of(&req, None)?;
     // 옛 노드는 새 종류를 풀지 못한다.
     crate::cluster::require_current(&state.cluster)?;
+    require_none_role(&state, &spec)?;
     let mut realm: Realm = Resource::new(name, spec);
     realm.revision = state.cluster.create(&realm).await?;
     Ok((StatusCode::CREATED, Json(realm.into())))
@@ -293,6 +304,7 @@ pub async fn update_realm(
             return Ok(Json(realm.into()));
         }
         crate::cluster::require_current(&state.cluster)?;
+        require_none_role(&state, &spec)?;
         match state
             .cluster
             .update_spec(realm.id, Some(realm.revision), realm.labels.clone(), &spec)

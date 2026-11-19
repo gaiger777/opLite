@@ -984,3 +984,355 @@ async fn watch_of_derived_kinds_closes_when_a_vm_moves_out() {
     let ev = next_json(&mut ws, Duration::from_secs(10)).await.unwrap();
     assert_eq!(ev["code"], "permissions", "{ev}");
 }
+
+/// 리뷰 1 C1: propagate가 아닌 폴더 grant로 받은 권한을 propagate grant로 넓히지 못한다(주기·빼기 모두 grant가 닿는
+/// 모든 곳에서 역할의 권한과 `permission.modify`가 있어야 한다).
+#[tokio::test]
+async fn a_non_propagating_grant_cannot_be_widened() {
+    let w = world().await;
+    let (status, role) = w
+        .admin
+        .post(
+            "/access-roles",
+            json!({ "name": "escal", "privileges": ["permission.modify", "vm.delete", "vm.console", "vm.config"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let escal = json!({ "type": "custom", "id": role["id"] });
+    let on_b = |user: &str, role: &Value, propagate: bool| {
+        json!({
+            "principal": { "type": "user", "id": user },
+            "role": role,
+            "target": { "type": "folder", "id": w.b },
+            "propagate": propagate,
+        })
+    };
+    let (status, body) = w
+        .admin
+        .post("/grants", on_b(&w.alice_id, &escal, false))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 자기에게 같은 역할을 propagate로: /teamB 안의 VM에는 권한이 없다.
+    let (status, body) = w
+        .alice
+        .post("/grants", on_b(&w.alice_id, &escal, true))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("cannot grant privileges you do not hold everywhere inside:"),
+        "{body}"
+    );
+    assert!(message.contains("vm.delete"), "{body}");
+    assert_eq!(w.alice.get("/vms/b1").await.0, StatusCode::NOT_FOUND);
+    // 폴더 자체에만 닿는 grant는 줄 수 있다.
+    let (status, own) = w
+        .alice
+        .post("/grants", on_b(&w.alice_id, &escal, false))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{own}");
+    // 남의 propagate grant 빼기도 아래 모두의 권한이 있어야 한다.
+    let (status, bob) = w
+        .admin
+        .post(
+            "/users",
+            json!({ "name": "bob", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{bob}");
+    let viewer = json!({ "type": "builtin", "role": "viewer" });
+    let (status, given) = w
+        .admin
+        .post("/grants", on_b(bob["id"].as_str().unwrap(), &viewer, true))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{given}");
+    let (status, body) = w
+        .alice
+        .delete(&format!("/grants/{}", given["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = w
+        .alice
+        .delete(&format!("/grants/{}", own["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    // /teamA는 그룹 operator(propagate)와 lead가 없으니 permission.modify가 없다: 기존 규칙 그대로 403.
+    let (status, _) = w
+        .alice
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": bob["id"] },
+                "role": viewer,
+                "target": { "type": "folder", "id": w.a },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// 리뷰 1 I7: 풀 만들기와 브리지 네트워크 만들기는 루트 `cluster.admin`이다. 폴더의 `storage.config`·
+/// `network.config`로는 VXLAN 네트워크 만들기와 있는 풀·네트워크의 바꾸기·지우기만 한다.
+#[tokio::test]
+async fn host_pools_and_bridges_need_cluster_admin() {
+    let w = world().await;
+    let (status, role) = w
+        .admin
+        .post(
+            "/access-roles",
+            json!({ "name": "infra", "privileges": ["storage.config", "network.config"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    for target in [&w.st_a, &w.net_a] {
+        let (status, body) = w
+            .admin
+            .post(
+                "/grants",
+                json!({
+                    "principal": { "type": "user", "id": w.alice_id },
+                    "role": { "type": "custom", "id": role["id"] },
+                    "target": { "type": "folder", "id": target },
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = w
+        .alice
+        .post(
+            "/storage-pools",
+            json!({ "name": "etc", "spec": { "backend": { "kind": "dir", "path": "/etc" }, "folder": w.st_a } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("creating a storage pool needs cluster.admin"),
+        "{body}"
+    );
+    let (status, body) = w
+        .alice
+        .post(
+            "/networks",
+            json!({ "name": "host-nic", "spec": { "bridge": "vmbr0", "vlan": 10, "folder": w.net_a } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = w
+        .alice
+        .post(
+            "/networks",
+            json!({ "name": "overlay", "spec": { "vxlan": { "vni": 4242 }, "folder": w.net_a } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = w
+        .alice
+        .patch("/storage-pools/pool-a", json!({ "shared": true }), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = w.alice.delete("/networks/overlay").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// 리뷰 1 I1·M1·M2: 옮기기의 대상 풀, CD-ROM의 ISO를 확인하고, 복제 Task에 확인한 폴더를 못 박는다.
+#[tokio::test]
+async fn migrate_pools_isos_and_clone_folders_are_checked() {
+    let w = world().await;
+    let (_, nodes) = w.admin.get("/nodes").await;
+    let node = nodes["items"][0]["name"].as_str().unwrap().to_string();
+    // 볼 수 없는 풀로 옮기기: 그 풀이 없는 것과 같은 404
+    let (status, body) = w
+        .alice
+        .post(
+            "/vms/a1/migrate",
+            json!({ "node": node, "pool": "pool-root" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["message"], "storage pool \"pool-root\" not found");
+    let (status, body) = w
+        .admin
+        .post(
+            "/vms/a1/migrate",
+            json!({ "node": node, "pool": "pool-root" }),
+        )
+        .await;
+    assert_ne!(
+        (status, body["message"].clone()),
+        (
+            StatusCode::NOT_FOUND,
+            json!("storage pool \"pool-root\" not found")
+        ),
+        "{body}"
+    );
+
+    // 볼 수 없는 풀의 ISO는 CD-ROM에 넣지 못한다.
+    let mut iso: Resource<VolumeSpec, _> = Resource::new(
+        "iso-root",
+        serde_json::from_value(
+            json!({ "pool": "pool-root", "size_bytes": 1048576, "format": "raw", "content": "iso" }),
+        )
+        .unwrap(),
+    );
+    w.env.cluster.create(&iso).await.unwrap();
+    iso.status.phase = opl_types::storage::VolumePhase::Ready;
+    w.env
+        .cluster
+        .update_status::<VolumeSpec>(iso.id, &iso.status)
+        .await
+        .unwrap();
+    let mut req = vm_in("a-iso", Some(&w.a));
+    req["spec"]["cdroms"] = json!([{ "iso": "iso-root" }]);
+    let (status, body) = w.alice.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["message"], "volume \"iso-root\" not found");
+    let (status, body) = w.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // 복제 Task는 확인한 폴더를 덮어쓰기로 갖는다(원본이 그사이 옮겨져도).
+    let (status, task) = w
+        .alice
+        .post("/vms/a2/clone", json!({ "name": "a2-copy" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let op = task["spec"]["op"].to_string();
+    assert!(op.contains(&format!("\"folder\":\"{}\"", w.a)), "{task}");
+}
+
+/// 리뷰 1 M7: 남의 유효 권한은 사용자를 찾기 전에 막고(이름 알아내기 없음), 전역 역할 사용자 목록은 관리자만, 볼 수
+/// 없는 조상의 할당량 사용량은 보이지 않고, Prometheus는 루트 아래 모두를 읽는 주체만이다.
+#[tokio::test]
+async fn permission_views_do_not_leak() {
+    let w = world().await;
+    let object = format!("folder/{}", w.a);
+    for user in ["admin", "nobody-here"] {
+        let (status, body) = w
+            .alice
+            .get(&format!(
+                "/permissions/effective?user={user}&object={object}"
+            ))
+            .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{user}: {body}");
+    }
+    let (status, body) = w
+        .alice
+        .get(&format!(
+            "/permissions/effective?user=alice&object={object}"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // permission.modify를 /teamA에 주면 who를 보지만 전역 역할 사용자는 비어 있다.
+    let (status, role) = w
+        .admin
+        .post(
+            "/access-roles",
+            json!({ "name": "lead", "privileges": ["permission.modify"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let (status, body) = w
+        .admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": w.alice_id },
+                "role": { "type": "custom", "id": role["id"] },
+                "target": { "type": "folder", "id": w.a },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = w
+        .alice
+        .get(&format!("/permissions/who?object={object}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["users"], json!([]), "{body}");
+    let (_, body) = w
+        .admin
+        .get(&format!("/permissions/who?object={object}"))
+        .await;
+    assert!(
+        body["users"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["name"] == "admin"),
+        "{body}"
+    );
+
+    // 할당량: 볼 수 없는 조상(/top)은 사용량 보기에 없다.
+    let (status, top) = w
+        .admin
+        .post(
+            "/folders",
+            json!({ "name": "top", "kind": "vm", "quota": { "vms": 10 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{top}");
+    let (status, kid) = w
+        .admin
+        .post(
+            "/folders",
+            json!({ "name": "kid", "kind": "vm", "parent": top["id"], "quota": { "vms": 5 } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{kid}");
+    let kid = kid["id"].as_str().unwrap().to_string();
+    let (status, body) = w
+        .admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": w.alice_id },
+                "role": { "type": "builtin", "role": "viewer" },
+                "target": { "type": "folder", "id": kid },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = w.alice.get(&format!("/folders/{kid}/usage")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let limits: Vec<&str> = body["limits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(limits, ["/top/kid"], "{body}");
+    assert_eq!(body["binding"], json!({ "vms": kid }), "{body}");
+    let (_, body) = w.admin.get(&format!("/folders/{kid}/usage")).await;
+    assert_eq!(body["limits"].as_array().unwrap().len(), 2, "{body}");
+
+    // Prometheus: propagate가 아닌 루트 cluster.read만으로는 403, 전역 viewer는 통과(꺼져 있어 404).
+    let (status, role) = w
+        .admin
+        .post(
+            "/access-roles",
+            json!({ "name": "reader", "privileges": ["cluster.read"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let (status, body) = w
+        .admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": w.alice_id },
+                "role": { "type": "custom", "id": role["id"] },
+                "target": { "type": "root" },
+                "propagate": false,
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(w.alice.get("/metrics").await.0, StatusCode::FORBIDDEN);
+    assert_eq!(w.alice.get("/metrics/cluster").await.0, StatusCode::OK);
+    let viewer = w.env.user("carol", "viewer").await;
+    assert_eq!(viewer.get("/metrics").await.0, StatusCode::NOT_FOUND);
+}

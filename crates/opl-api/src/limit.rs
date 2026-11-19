@@ -165,7 +165,7 @@ impl AttemptLimiter {
     }
 }
 
-fn too_many_attempts(wait: Duration) -> ApiError {
+pub(crate) fn too_many_attempts(wait: Duration) -> ApiError {
     // 남은 시간을 올림한 초. 0초로 알려 주지 않는다.
     let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
     let mut e = ApiError::new(

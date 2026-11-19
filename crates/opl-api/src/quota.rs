@@ -231,13 +231,13 @@ pub struct FolderUsageView {
 }
 
 /// 폴더의 하위 트리 사용량(vCPU·메모리·붙은 디스크·VM 수)과 그 폴더·조상의 할당량, 차원마다 묶는 폴더. 볼 수 없는
-/// 조상의 할당량도 보인다(그 상한이 이 폴더의 쓰기를 막으므로).
+/// 조상(폴더 자체를 읽지 못함)은 `limits`·`binding`에서 뺀다.
 #[utoipa::path(get, path = "/folders/{id}/usage", tag = "folders",
     params(("id" = String, Path, description = "folder id")),
     responses((status = 200, body = FolderUsageView), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn folder_usage(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(id): Path<String>,
 ) -> Result<Json<FolderUsageView>, ApiError> {
     let folder = lookup::<FolderSpec>(&state.cluster, &id)?;
@@ -249,6 +249,14 @@ pub async fn folder_usage(
         let Some(quota) = tree[&f].quota.filter(|q| !q.is_empty()) else {
             continue;
         };
+        // 볼 수 없는 조상의 경로·사용량은 보이지 않는다(리뷰 1). 그 상한에 걸린 쓰기는 409가 알린다.
+        if !state.authz.allows(
+            &principal,
+            opl_types::authz::Privilege::SystemRead,
+            opl_types::authz_eval::AuthzTarget::Folder(f),
+        ) {
+            continue;
+        }
         let usage = subtree_usage(&tree, &direct, f);
         for d in QuotaDimension::ALL {
             if let Some(limit) = d.limit(&quota) {

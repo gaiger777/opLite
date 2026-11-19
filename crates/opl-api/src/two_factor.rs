@@ -10,6 +10,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::StatusCode;
@@ -17,14 +18,15 @@ use axum::http::header::HOST;
 use axum::http::request::Parts;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
-use opl_types::auth::{ApiTokenSpec, User, UserSpec};
+use opl_types::auth::{ApiTokenSpec, Role, User, UserSpec};
+use opl_types::authz::Privilege;
 use opl_types::node::TWO_FACTOR;
 use opl_types::realm::{RealmBackend, RealmSpec};
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::two_factor::{
-    PENDING_LOGIN_SECS, Passkey, PendingLogin, RECOVERY_CODES, TOTP_DIGITS, TOTP_PERIOD,
-    TOTP_SECRET_BYTES, Totp, TwoFactor, TwoFactorPolicy, TwoFactorSpec, TwoFactorStatus,
-    decode_secret, encode_secret, verify_totp,
+    PENDING_LOGIN_SECS, Passkey, PendingLogin, RECOVERY_CODES, SECOND_STEP_ATTEMPTS, TOTP_DIGITS,
+    TOTP_PERIOD, TOTP_SECRET_BYTES, Totp, TwoFactor, TwoFactorPolicy, TwoFactorSpec,
+    TwoFactorStatus, decode_secret, encode_secret, verify_totp,
 };
 use ring::hmac;
 use serde::{Deserialize, Serialize};
@@ -35,6 +37,7 @@ use crate::audit::AuditNote;
 use crate::auth::{
     Action, PendingPrincipal, Principal, constant_time_eq, sha256_hex, unix_now, verify_password,
 };
+use crate::authz::Subject;
 use crate::error::{ApiError, Json};
 use crate::limit::ClientIp;
 use crate::resources::lookup;
@@ -181,6 +184,10 @@ pub struct FinishRegistrationRequest {
     /// 패스키 이름(1~64자)
     pub name: String,
     pub credential: RegistrationCredential,
+    /// 이미 요소가 있으면 본인 확인(지금 요소의 코드·복구 코드 또는 로컬 비밀번호). 없으면 400 `proof_required`.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub proof: Option<ProofRequest>,
 }
 
 /// `AuthenticatorAssertionResponse`(base64url)
@@ -222,6 +229,10 @@ pub struct SecondFactorRequest {
 #[serde(deny_unknown_fields)]
 pub struct CodeRequest {
     pub code: String,
+    /// 이미 요소(패스키)가 있으면 본인 확인(그 밖의 코드·복구 코드 또는 로컬 비밀번호). 없으면 400 `proof_required`.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub proof: Option<ProofRequest>,
 }
 
 /// 요소를 빼거나 복구 코드를 다시 만들 때의 본인 확인: TOTP 코드나 복구 코드(`code`), 또는 로컬 사용자의 비밀번호
@@ -331,12 +342,82 @@ fn oidc_user(cluster: &Cluster, user: &User) -> Result<bool, ApiError> {
         .is_some_and(|r| matches!(r.spec.backend, RealmBackend::Oidc(_))))
 }
 
-/// 정책이 이 사용자에게 2단계 인증을 요구한다(OIDC 사용자는 아니다).
-fn required(cluster: &Cluster, user: &User) -> Result<bool, ApiError> {
+/// 정책이 이 사용자에게 2단계 인증을 요구한다(OIDC 사용자는 아니다). 정책이 `admin`을 요구하면 grant로 관리 권한
+/// (`cluster.admin` 또는 어디서든 `permission.modify` — 남에게 권한을 줄 수 있다)을 받은 사용자도 요구한다(리뷰 1).
+fn required(state: &AppState, user: &User) -> Result<bool, ApiError> {
+    let cluster = &state.cluster;
     let Some(policy) = policy(cluster)? else {
         return Ok(false);
     };
-    Ok(policy.requires(user.spec.role, user.spec.realm.as_deref()) && !oidc_user(cluster, user)?)
+    let by_role = policy.requires(user.spec.role, user.spec.realm.as_deref());
+    let by_grant = || -> Result<bool, ApiError> {
+        if !policy.roles.contains(&Role::Admin) {
+            return Ok(false);
+        }
+        let index = state.authz.index(Subject {
+            user: user.id,
+            token: None,
+        })?;
+        Ok(index.anywhere(Privilege::ClusterAdmin) || index.anywhere(Privilege::PermissionModify))
+    };
+    Ok((by_role || by_grant()?) && !oidc_user(cluster, user)?)
+}
+
+/// 둘째 단계 시도 하나를 Raft에 센다(확인 전에, 모든 노드를 합쳐). 막혀 있으면 429 `too_many_attempts`.
+async fn count_attempt(cluster: &Cluster, user: Uuid) -> Result<(), ApiError> {
+    for _ in 0..CAS_RETRIES {
+        let Some(tf) = load(cluster, user)? else {
+            return Ok(());
+        };
+        let now = unix_now();
+        if let Some(wait) = tf.status.blocked_for(now) {
+            return Err(crate::limit::too_many_attempts(Duration::from_secs(wait)));
+        }
+        match cluster
+            .update_status_checked::<TwoFactorSpec>(
+                tf.id,
+                tf.revision,
+                &tf.status.count_attempt(now),
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if retryable(&e) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the second factors changed concurrently; try again",
+    ))
+}
+
+/// 통과했으면 센 시도를 지운다(이미 0이면 쓰지 않는다). 놓치면 다음 로그인의 남은 시도가 줄 뿐이다.
+async fn reset_attempts(cluster: &Cluster, user: Uuid) {
+    for _ in 0..CAS_RETRIES {
+        let Ok(Some(tf)) = load(cluster, user) else {
+            return;
+        };
+        if tf.status.failures == 0 && tf.status.blocked_until == 0 {
+            return;
+        }
+        let status = TwoFactorStatus {
+            failures: 0,
+            blocked_until: 0,
+            ..tf.status.clone()
+        };
+        match cluster
+            .update_status_checked::<TwoFactorSpec>(tf.id, tf.revision, &status)
+            .await
+        {
+            Ok(_) => return,
+            Err(e) if retryable(&e) => continue,
+            Err(e) => {
+                tracing::debug!(%user, error = %e, "second-step attempts not reset");
+                return;
+            }
+        }
+    }
 }
 
 /// 요청의 호스트와 scheme(믿는 프록시가 알린 것)
@@ -551,9 +632,11 @@ async fn use_totp(cluster: &Cluster, user: Uuid, code: &str) -> Result<bool, Api
         let Some(step) = verify_totp(&secret, code, now, tf.status.last_totp_step) else {
             return Ok(false);
         };
+        // 통과했으니 센 시도도 지운다.
         let status = TwoFactorStatus {
             last_totp_step: step,
             last_used: now,
+            ..TwoFactorStatus::default()
         };
         match cluster
             .update_status_checked::<TwoFactorSpec>(tf.id, tf.revision, &status)
@@ -599,6 +682,8 @@ async fn use_recovery(cluster: &Cluster, user: Uuid, code: &str) -> Result<bool,
             Ok(revision) => {
                 let status = TwoFactorStatus {
                     last_used: now,
+                    failures: 0,
+                    blocked_until: 0,
                     ..tf.status.clone()
                 };
                 // 마지막 사용 시각은 놓쳐도 된다.
@@ -677,23 +762,23 @@ async fn use_passkey(
     Ok(false)
 }
 
-/// 로그인 때 둘째 단계가 필요하면 대기 세션 내용과 안내. 모든 노드가 `two-factor`를 알 때만이다(옛 노드는 대기
-/// 세션을 정식 세션으로 받는다).
+/// 로그인 때 둘째 단계가 필요하면 대기 세션 내용과 안내. 닫힌 실패다(리뷰 1): 요소가 있는 사용자는 어느 노드가
+/// `two-factor`를 아직 적지 않았어도(합류 중인 노드 등) 늘 둘째 단계를 묻는다(그때 대기 세션은 이 노드의 메모리에만
+/// 둔다 — `AppState::create_session`). 정책이 요구하는데 요소가 없는 사용자는 등록 쓰기를 받을 수 없으므로 로그인을
+/// 409 `cluster_upgrading`으로 거절한다.
 pub(crate) fn login_prompt(
     state: &AppState,
     user: &User,
     host: &RequestHost,
 ) -> Result<Option<(PendingLogin, SecondFactorPrompt)>, ApiError> {
-    if !all_nodes_know(&state.cluster) {
-        return Ok(None);
-    }
     let tf = load(&state.cluster, user.id)?;
     let has_factor = tf.as_ref().is_some_and(|t| t.spec.has_factor());
     let expires_at = unix_now() + PENDING_LOGIN_SECS;
     if !has_factor {
-        if !required(&state.cluster, user)? {
+        if !required(state, user)? {
             return Ok(None);
         }
+        crate::cluster::require_feature(&state.cluster, TWO_FACTOR)?;
         let pending = PendingLogin {
             expires_at,
             enroll: true,
@@ -785,6 +870,8 @@ pub async fn second_factor(
     }
     let user = login.user.id;
     let attempt = state.attempts.begin(&limiter_key(user), ip)?;
+    // 이 노드·IP의 제한에 더해 사용자마다 모든 노드를 합쳐 센다(확인 전에 Raft로 올린다).
+    count_attempt(&state.cluster, user).await?;
     let (ok, method) = if let Some(code) = &req.totp {
         (use_totp(&state.cluster, user, code).await?, "totp")
     } else if let Some(code) = &req.recovery {
@@ -804,8 +891,18 @@ pub async fn second_factor(
     };
     audit.detail(format!("second factor {method}"));
     if !ok {
+        // 모두 합쳐 다섯 번 틀렸으면 대기 세션을 끝낸다(비밀번호부터 다시, 그 단계도 시도 제한을 받는다).
+        if load(&state.cluster, user)?.is_some_and(|t| t.status.failures >= SECOND_STEP_ATTEMPTS) {
+            state.end_pending(&login, ip).await?;
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_second_factor",
+                "the second factor is wrong; too many wrong codes, sign in again",
+            ));
+        }
         return Err(invalid_second_factor(StatusCode::UNAUTHORIZED));
     }
+    reset_attempts(&state.cluster, user).await;
     state.attempts.success(&limiter_key(user), ip, attempt);
     state.complete_login(&login).await?;
     Ok(Json(crate::users::view(&state.cluster, login.user)?))
@@ -882,6 +979,47 @@ fn may_change(state: &AppState, principal: &Principal) -> Result<User, ApiError>
     Ok(user)
 }
 
+/// 요소를 더하기 전(리뷰 1): 이미 요소가 있으면 본인 확인(`proof`)을 받아야 한다(훔친 세션·토큰이 오래 가는 요소를
+/// 더하지 못하게). 강제 등록 중인 대기 세션은 요소가 없을 때만 더한다(그사이 본인이 등록했으면 409 `already_enrolled`
+/// — 다시 로그인한다). 돌려준 값은 본인 확인을 했는지이고, 쓰기 안에서 [`check_adding`]으로 다시 본다.
+async fn proof_for_adding(
+    state: &AppState,
+    ip: IpAddr,
+    who: &Enroller,
+    user: &User,
+    proof: Option<&ProofRequest>,
+) -> Result<bool, ApiError> {
+    if !load(&state.cluster, user.id)?.is_some_and(|t| t.spec.has_factor()) {
+        return Ok(false);
+    }
+    check_adding(who, true, proof.is_some())?;
+    let Some(proof) = proof else {
+        return Ok(false);
+    };
+    check_proof(state, ip, user, proof).await?;
+    Ok(true)
+}
+
+/// 쓰기 안의 다시 보기: 요소가 있는데 본인 확인을 하지 않았거나, 강제 등록 세션인데 요소가 생겼으면 거절한다.
+fn check_adding(who: &Enroller, has_factor: bool, proved: bool) -> Result<(), ApiError> {
+    if !has_factor {
+        return Ok(());
+    }
+    if who.pending.is_some() {
+        return Err(ApiError::conflict(
+            "already_enrolled",
+            "a second factor was enrolled meanwhile; sign in again",
+        ));
+    }
+    if !proved {
+        return Err(ApiError::bad_request(
+            "you already have a second factor: confirm with proof (a code from it, a recovery code or your password)",
+        )
+        .with_code("proof_required"));
+    }
+    Ok(())
+}
+
 /// 강제 등록 중이면 등록을 마쳤으니 로그인을 끝낸다.
 async fn finish_enrollment(state: &AppState, who: &Enroller) -> Result<(), ApiError> {
     match &who.pending {
@@ -909,7 +1047,7 @@ pub async fn get_two_factor(
             .as_ref()
             .map(|s| s.webauthn.iter().map(PasskeyView::from).collect())
             .unwrap_or_default(),
-        required: required(&state.cluster, &user)?,
+        required: required(&state, &user)?,
         enrolling: who.pending.is_some(),
         rp_id: rp_id(&state.cluster, &host)?,
         available: all_nodes_know(&state.cluster),
@@ -960,11 +1098,13 @@ pub async fn confirm_totp(
     Json(req): Json<CodeRequest>,
 ) -> Result<Json<RecoveryCodes>, ApiError> {
     let user = may_change(&state, &who.principal)?;
+    let proved = proof_for_adding(&state, ip, &who, &user, req.proof.as_ref()).await?;
     let attempt = state.attempts.begin(&limiter_key(user.id), ip)?;
     let (codes, hashes) = new_recovery_codes(RECOVERY_CODES);
     let mut issued = false;
     let mut step = None;
     let written = write_spec(&state.cluster, user.id, |spec| {
+        check_adding(&who, spec.has_factor(), proved)?;
         let Some(totp) = spec.totp.as_mut().filter(|t| !t.confirmed) else {
             return Err(ApiError::conflict(
                 "no_totp_enrollment",
@@ -989,23 +1129,46 @@ pub async fn confirm_totp(
     .ok_or_else(|| ApiError::internal("two-factor record vanished"))?;
     state.attempts.success(&limiter_key(user.id), ip, attempt);
     if let Some(step) = step {
-        let status = TwoFactorStatus {
-            last_totp_step: step.max(written.status.last_totp_step),
-            last_used: unix_now(),
-        };
-        if let Err(e) = state
-            .cluster
-            .update_status_checked::<TwoFactorSpec>(written.id, written.revision, &status)
-            .await
-        {
-            tracing::debug!(user = %user.name, error = %e, "TOTP confirmation step not recorded");
-        }
+        mark_step_used(&state.cluster, &written, step).await?;
     }
     audit.detail("2fa totp on");
     finish_enrollment(&state, &who).await?;
     Ok(Json(RecoveryCodes {
         codes: if issued { codes } else { vec![] },
     }))
+}
+
+/// 확인 코드의 칸을 쓴 것으로 적는다(그 코드로 로그인하지 못하게). 엇갈리면 다시 읽어 다시 하고, 끝내 적지 못하면
+/// 409 `busy`다(리뷰 1 — 예전에는 기록만 남기고 넘어가 확인 코드를 한 번 더 쓸 수 있었다).
+async fn mark_step_used(cluster: &Cluster, written: &TwoFactor, step: u64) -> Result<(), ApiError> {
+    let (mut id, mut revision, mut status) = (written.id, written.revision, written.status.clone());
+    for _ in 0..CAS_RETRIES {
+        if status.last_totp_step >= step {
+            return Ok(());
+        }
+        let next = TwoFactorStatus {
+            last_totp_step: step,
+            last_used: unix_now(),
+            ..status.clone()
+        };
+        match cluster
+            .update_status_checked::<TwoFactorSpec>(id, revision, &next)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(e) if retryable(&e) => {
+                let Some(tf) = load(cluster, written.spec.user)? else {
+                    return Ok(());
+                };
+                (id, revision, status) = (tf.id, tf.revision, tf.status);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the second factors changed concurrently; try again",
+    ))
 }
 
 /// 본인 확인: TOTP 코드, 복구 코드(쓰면 없어진다), 또는 로컬 사용자의 비밀번호. 시도 제한을 받는다.
@@ -1078,7 +1241,7 @@ pub async fn disable_totp(
     if confirmed {
         check_proof(&state, ip, &user, &req).await?;
     }
-    let required = required(&state.cluster, &user)?;
+    let required = required(&state, &user)?;
     write_spec(&state.cluster, user.id, |spec| {
         spec.totp = None;
         after_removal(spec, required)
@@ -1243,6 +1406,7 @@ fn check_passkey_name(name: &str) -> Result<(), ApiError> {
     responses((status = 201, body = PasskeyAdded), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn finish_passkey(
     State(state): State<Arc<AppState>>,
+    ClientIp(ip): ClientIp,
     host: RequestHost,
     audit: AuditNote,
     who: Enroller,
@@ -1250,6 +1414,7 @@ pub async fn finish_passkey(
 ) -> Result<(StatusCode, Json<PasskeyAdded>), ApiError> {
     let user = may_change(&state, &who.principal)?;
     check_passkey_name(&req.name)?;
+    let proved = proof_for_adding(&state, ip, &who, &user, req.proof.as_ref()).await?;
     let reg = open(&registration_key(&state)?, &req.token)
         .filter(|r| r.user == user.id && r.expires_at > unix_now())
         .ok_or_else(|| {
@@ -1288,6 +1453,7 @@ pub async fn finish_passkey(
     let (codes, hashes) = new_recovery_codes(RECOVERY_CODES);
     let mut issued = false;
     write_spec(&state.cluster, user.id, |spec| {
+        check_adding(&who, spec.has_factor(), proved)?;
         if spec.webauthn.iter().any(|p| p.id == id) {
             return Err(ApiError::conflict(
                 "passkey_exists",
@@ -1339,7 +1505,7 @@ pub async fn delete_passkey(
         .map(|p| p.name)
         .ok_or_else(|| ApiError::not_found(format!("passkey {id:?} not found")))?;
     check_proof(&state, ip, &user, &req).await?;
-    let required = required(&state.cluster, &user)?;
+    let required = required(&state, &user)?;
     write_spec(&state.cluster, user.id, |spec| {
         spec.webauthn.retain(|p| p.id != id);
         after_removal(spec, required)
@@ -1376,6 +1542,7 @@ pub async fn reset_two_factor(
     }
     // 세션 세대를 올려 모든 노드의 세션(대기 세션 포함)을 끊는다.
     let mut current = user.clone();
+    let mut bumped = false;
     for _ in 0..CAS_RETRIES {
         let mut spec = current.spec.clone();
         spec.session_epoch += 1;
@@ -1389,12 +1556,22 @@ pub async fn reset_two_factor(
             )
             .await
         {
-            Ok(_) => break,
+            Ok(_) => {
+                bumped = true;
+                break;
+            }
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {
                 current = lookup::<UserSpec>(&state.cluster, &user.id.to_string())?;
             }
             Err(e) => return Err(e.into()),
         }
+    }
+    // 세대를 올리지 못하면 세션이 남는다: 성공으로 답하지 않는다(리뷰 1).
+    if !bumped {
+        return Err(ApiError::conflict(
+            "busy",
+            "the user changed concurrently; the second factors are removed but sessions remain, try again",
+        ));
     }
     if let Err(e) = state.end_user_sessions(user.id).await {
         tracing::warn!(user = %user.name, error = %e.message, "sessions not deleted");

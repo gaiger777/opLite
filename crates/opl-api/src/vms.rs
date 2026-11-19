@@ -673,6 +673,16 @@ pub(crate) fn check_attachments(
             .iter()
             .map(|d| d.volume.as_str())
             .filter(|v| !had_disk(v)),
+    )?;
+    let had_iso = |name: &str| {
+        current.is_some_and(|c| c.cdroms.iter().any(|d| d.iso.as_deref() == Some(name)))
+    };
+    state.authz.require_isos(
+        principal,
+        spec.cdroms
+            .iter()
+            .filter_map(|d| d.iso.as_deref())
+            .filter(|v| !had_iso(v)),
     )
 }
 
@@ -1198,15 +1208,17 @@ pub struct CdromMediaRequest {
     ))]
 pub async fn cdrom_media(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
     Json(req): Json<CdromMediaRequest>,
 ) -> Result<(HeaderMap, Json<Vm>), ApiError> {
     require_feature(&state.cluster, INSTALL_MEDIA)?;
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    if req.iso.is_some() {
+    if let Some(iso) = &req.iso {
         check_not_template(&vm)?;
+        // 넣을 ISO를 볼 수 있어야 한다(볼 수 없는 풀의 ISO를 게스트에서 읽지 못하게, 리뷰 1).
+        state.authz.require_isos(&principal, [iso.as_str()])?;
     }
     let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
     let drive = usize::from(req.drive);
@@ -1919,6 +1931,10 @@ pub async fn migrate_vm(
     };
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
     let target = lookup::<NodeSpec>(&state.cluster, &req.node)?;
+    // 디스크를 옮겨 갈 풀에도 볼륨을 만들 권한이 있어야 한다(복제·복원·가져오기와 같다).
+    if let Some(pool) = &req.pool {
+        state.authz.require_pool(&principal, pool)?;
+    }
     let (task, forced) = start_migration(&state, vm.id, target.id, req.pool, None, rules).await?;
     if req.force {
         audit.detail(format!("force rules={}", forced.join(",")));

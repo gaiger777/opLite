@@ -21,8 +21,13 @@ struct Browser {
 
 impl Browser {
     fn new(env: &Env) -> Self {
+        Self::at(&env.base)
+    }
+
+    /// 다른 API 주소(`serve_again`)
+    fn at(base: &str) -> Self {
         Self {
-            base: env.base.clone(),
+            base: base.to_string(),
             http: reqwest::Client::new(),
             cookie: None,
             host: None,
@@ -509,8 +514,10 @@ async fn an_admin_reset_ends_sessions_and_tokens_bypass_two_factor() {
     );
 }
 
+/// 리뷰 1: 틀린 둘째 단계는 사용자마다 Raft에 센다(노드·IP와 관계없이). 다섯 번 틀리면 대기 세션이 끝나고, 다른
+/// 노드(메모리 제한이 비어 있는 API)에서 새로 로그인해도 막힌 동안은 맞는 코드도 받지 않는다.
 #[tokio::test]
-async fn wrong_codes_are_rate_limited() {
+async fn wrong_codes_are_rate_limited_across_nodes() {
     let env = Env::start().await;
     let admin = env.admin().await;
     create_user(&admin, "alice", "viewer").await;
@@ -524,18 +531,91 @@ async fn wrong_codes_are_rate_limited() {
         "{:06}",
         (right.parse::<u32>().unwrap() + 500_000) % 1_000_000
     );
-    for _ in 0..5 {
-        let (status, _) = p
+    for i in 0..5 {
+        let (status, err) = p
             .post("/auth/login/second-factor", json!({ "totp": wrong }))
             .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{err}");
+        assert_eq!(err["code"], "invalid_second_factor");
+        assert_eq!(
+            err["message"].as_str().unwrap().contains("sign in again"),
+            i == 4,
+            "{err}"
+        );
     }
-    // 막힌 동안은 맞는 코드도 받지 않는다.
+    // 대기 세션이 끝났다: 맞는 코드도 쓸 곳이 없다.
     let (status, err) = p
+        .post("/auth/login/second-factor", json!({ "totp": right }))
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{err}");
+    assert_ne!(err["code"], "invalid_second_factor", "{err}");
+    let tf = env
+        .cluster
+        .list::<opl_types::two_factor::TwoFactorSpec>()
+        .unwrap()
+        .1
+        .remove(0);
+    assert_eq!(tf.status.failures, 5);
+    assert!(tf.status.blocked_until > now(), "{:?}", tf.status);
+
+    // 다른 노드: 이 노드의 메모리 시도 제한을 모른다.
+    let other = serve_again(&env).await;
+    let mut q = Browser::at(&other);
+    let body = q.login("alice", "password-1").await;
+    assert!(body.get("second_factor").is_some(), "{body}");
+    let (status, err) = q
         .post("/auth/login/second-factor", json!({ "totp": right }))
         .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{err}");
     assert_eq!(err["code"], "too_many_attempts");
+
+    // 막힘이 풀리면(시각을 지난 것으로 둔다) 맞는 코드로 들어오고 센 것이 지워진다.
+    let mut tf = env
+        .cluster
+        .list::<opl_types::two_factor::TwoFactorSpec>()
+        .unwrap()
+        .1
+        .remove(0);
+    tf.status.blocked_until = 1;
+    env.cluster
+        .update_status::<opl_types::two_factor::TwoFactorSpec>(tf.id, &tf.status)
+        .await
+        .unwrap();
+    let mut r = Browser::at(&other);
+    r.login("alice", "password-1").await;
+    let (status, who) = r
+        .post("/auth/login/second-factor", json!({ "totp": right }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{who}");
+    let tf = env
+        .cluster
+        .list::<opl_types::two_factor::TwoFactorSpec>()
+        .unwrap()
+        .1
+        .remove(0);
+    assert_eq!((tf.status.failures, tf.status.blocked_until), (0, 0));
+}
+
+/// 같은 클러스터를 새 `AppState`(새 메모리 시도 제한·세션)로 한 번 더 서비스한다(다른 노드의 API 흉내).
+async fn serve_again(env: &Env) -> String {
+    let state = opl_api::AppState::new(
+        env.cluster.clone(),
+        env.node,
+        env.hv.clone(),
+        env.dir.path().join("uploads"),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = opl_api::router(std::sync::Arc::new(state));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    base
 }
 
 #[tokio::test]
@@ -599,15 +679,64 @@ async fn passkeys_register_and_sign_in() {
     assert_eq!(status, StatusCode::CREATED, "{added}");
     assert_eq!(added["passkey"]["id"], key.id());
     let recovery = added["recovery_codes"][0].as_str().unwrap().to_string();
-    // 같은 패스키를 두 번 넣지 않는다.
-    let (status, _) = b
+    // 리뷰 1: 요소가 있으면 더하기에 본인 확인이 필요하다(훔친 세션이 요소를 더하지 못하게).
+    let (status, err) = b
         .post(
             "/auth/2fa/webauthn/register/finish",
             json!({ "token": start["token"], "name": "again",
                     "credential": key.register("localhost", &challenge, &b.origin()) }),
         )
         .await;
+    assert_eq!(
+        (status, err["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("proof_required")),
+        "{err}"
+    );
+    // 같은 패스키를 두 번 넣지 않는다.
+    let (status, _) = b
+        .post(
+            "/auth/2fa/webauthn/register/finish",
+            json!({ "token": start["token"], "name": "again",
+                    "credential": key.register("localhost", &challenge, &b.origin()),
+                    "proof": { "password": "password-1" } }),
+        )
+        .await;
     assert_eq!(status, StatusCode::CONFLICT);
+    // 인증 앱 더하기도 본인 확인을 받는다.
+    let (status, enrol) = b.post("/auth/2fa/totp", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{enrol}");
+    let secret = enrol["secret"].as_str().unwrap().to_string();
+    let (status, err) = b
+        .post(
+            "/auth/2fa/totp/confirm",
+            json!({ "code": code(&secret, 0) }),
+        )
+        .await;
+    assert_eq!(
+        (status, err["code"].clone()),
+        (StatusCode::BAD_REQUEST, json!("proof_required")),
+        "{err}"
+    );
+    let (status, err) = b
+        .post(
+            "/auth/2fa/totp/confirm",
+            json!({ "code": code(&secret, 0), "proof": { "password": "wrong-password" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+    let (status, codes) = b
+        .post(
+            "/auth/2fa/totp/confirm",
+            json!({ "code": code(&secret, 0), "proof": { "password": "password-1" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{codes}");
+    // 첫 요소가 아니라 새 복구 코드는 없다.
+    assert_eq!(codes["codes"], json!([]));
+    let (status, _) = b
+        .delete("/auth/2fa/totp", json!({ "password": "password-1" }))
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
 
     // 패스키로 로그인
     let mut l = Browser::on_localhost(&env);
@@ -656,16 +785,26 @@ async fn passkeys_register_and_sign_in() {
     assert!(body.get("second_factor").is_none(), "{body}");
 }
 
-/// 기능 게이트(설계 §11): 모든 노드가 `two-factor`를 알기 전에는 2FA 쓰기·정책이 409 `cluster_upgrading`이고,
-/// 대기 세션을 만들지 않는다(옛 노드가 대기 세션을 정식 세션으로 받는다).
+/// 기능 게이트(설계 §11)와 닫힌 실패(리뷰 1): 어느 노드가 `two-factor`를 적지 않았어도(합류 중인 노드) 요소가 있는
+/// 사용자는 둘째 단계를 거친다(대기 세션은 이 노드의 메모리에만). 정책이 요구하는데 요소가 없는 사용자는 등록할 수
+/// 없으므로 로그인이 409 `cluster_upgrading`이다. 2FA 쓰기·정책은 409 `cluster_upgrading`이다.
 #[tokio::test]
-async fn two_factor_waits_for_every_node() {
+async fn two_factor_fails_closed_while_a_node_lacks_the_feature() {
     let env = Env::start().await;
     let admin = env.admin().await;
     create_user(&admin, "alice", "viewer").await;
+    create_user(&admin, "bob", "operator").await;
     let mut b = Browser::new(&env);
     b.login("alice", "password-1").await;
-    enable_totp(&mut b).await;
+    let (secret, _) = enable_totp(&mut b).await;
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "two_factor": { "roles": ["operator"] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let mut node = env
         .cluster
         .get::<opl_types::node::NodeSpec>(env.node)
@@ -680,7 +819,25 @@ async fn two_factor_waits_for_every_node() {
         .unwrap();
     let mut c = Browser::new(&env);
     let body = c.login("alice", "password-1").await;
-    assert!(body.get("second_factor").is_none(), "{body}");
+    assert!(body.get("second_factor").is_some(), "{body}");
+    let (status, _) = c.get("/vms").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // 대기 세션은 Raft에 쓰지 않는다(그 노드가 정식 세션으로 읽지 못하게).
+    assert!(
+        env.cluster
+            .list::<opl_types::auth::SessionSpec>()
+            .unwrap()
+            .1
+            .iter()
+            .all(|s| s.spec.pending.is_none())
+    );
+    let (status, who) = c
+        .post(
+            "/auth/login/second-factor",
+            json!({ "totp": code(&secret, 1) }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{who}");
     let (status, err) = c
         .post("/auth/2fa/recovery", json!({ "password": "password-1" }))
         .await;
@@ -693,6 +850,19 @@ async fn two_factor_waits_for_every_node() {
         (status, view["available"].clone()),
         (StatusCode::OK, json!(false))
     );
+    // 정책이 요구하는데 요소가 없다: 등록할 수 없으니 들이지 않는다.
+    let (status, err) = Browser::new(&env)
+        .send(
+            Method::POST,
+            "/auth/login",
+            Some(json!({ "username": "bob", "password": "password-1" })),
+        )
+        .await;
+    assert_eq!(
+        (status, err["code"].clone()),
+        (StatusCode::CONFLICT, json!("cluster_upgrading")),
+        "{err}"
+    );
     let (status, err) = admin
         .patch(
             "/settings",
@@ -704,4 +874,73 @@ async fn two_factor_waits_for_every_node() {
         (status, err["code"].clone()),
         (StatusCode::CONFLICT, json!("cluster_upgrading"))
     );
+}
+
+/// 리뷰 1: 정책의 `admin`은 grant로 관리 권한(`cluster.admin`, 어디서든 `permission.modify`)을 받은 사용자도 덮는다.
+#[tokio::test]
+async fn the_admin_policy_covers_admins_by_grant() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    for name in ["root-admin", "delegator", "plain"] {
+        create_user(&admin, name, "none").await;
+    }
+    let (status, folder) = admin
+        .post("/folders", json!({ "name": "team", "kind": "vm" }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let (status, role) = admin
+        .post(
+            "/access-roles",
+            json!({ "name": "lead", "privileges": ["permission.modify", "vm.power"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let id_of = |name: &str| {
+        env.cluster
+            .get_by_name::<opl_types::auth::UserSpec>(name)
+            .unwrap()
+            .unwrap()
+            .id
+    };
+    for (user, role, target) in [
+        (
+            id_of("root-admin"),
+            json!({ "type": "builtin", "role": "admin" }),
+            json!({ "type": "root" }),
+        ),
+        (
+            id_of("delegator"),
+            json!({ "type": "custom", "id": role["id"] }),
+            json!({ "type": "folder", "id": folder["id"] }),
+        ),
+        (
+            id_of("plain"),
+            json!({ "type": "builtin", "role": "operator" }),
+            json!({ "type": "folder", "id": folder["id"] }),
+        ),
+    ] {
+        let (status, body) = admin
+            .post(
+                "/grants",
+                json!({ "principal": { "type": "user", "id": user }, "role": role, "target": target }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = admin
+        .patch(
+            "/settings",
+            json!({ "two_factor": { "roles": ["admin"] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for (name, required) in [("root-admin", true), ("delegator", true), ("plain", false)] {
+        let body = Browser::new(&env).login(name, "password-1").await;
+        assert_eq!(
+            body["second_factor"]["enroll"].as_bool().unwrap_or(false),
+            required,
+            "{name}: {body}"
+        );
+    }
 }

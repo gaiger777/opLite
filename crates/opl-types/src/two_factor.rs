@@ -73,6 +73,46 @@ pub struct TwoFactorStatus {
     pub last_totp_step: u64,
     /// 마지막으로 둘째 단계를 통과한 시각(유닉스 초)
     pub last_used: u64,
+    /// 통과하지 못한 둘째 단계 시도 수(클러스터 전체, 계획 62 리뷰 1). 시도마다 확인 전에 올리고 통과하면 0이다.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub failures: u32,
+    /// 이 시각(유닉스 초)까지 둘째 단계를 받지 않는다(`failures`가 [`SECOND_STEP_ATTEMPTS`] 이상일 때 두 배씩).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub blocked_until: u64,
+}
+
+fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
+}
+
+/// 둘째 단계를 막기 전에 틀릴 수 있는 횟수(사용자마다, 모든 노드를 합쳐). 이만큼 틀리면 대기 세션도 끝난다.
+pub const SECOND_STEP_ATTEMPTS: u32 = 5;
+/// 처음 막는 시간(초). 더 틀릴 때마다 두 배, [`SECOND_STEP_MAX_BLOCK`]까지.
+pub const SECOND_STEP_BLOCK: u64 = 30;
+pub const SECOND_STEP_MAX_BLOCK: u64 = 15 * 60;
+
+impl TwoFactorStatus {
+    /// 시도 하나를 센 상태. `failures`가 상한 이상이면 `now`부터 막는다(30초부터 두 배, 15분까지).
+    pub fn count_attempt(&self, now: u64) -> TwoFactorStatus {
+        let failures = self.failures.saturating_add(1);
+        let blocked_until = if failures >= SECOND_STEP_ATTEMPTS {
+            let doublings = (failures - SECOND_STEP_ATTEMPTS).min(16);
+            now + (SECOND_STEP_BLOCK << doublings).min(SECOND_STEP_MAX_BLOCK)
+        } else {
+            self.blocked_until
+        };
+        TwoFactorStatus {
+            failures,
+            blocked_until,
+            ..self.clone()
+        }
+    }
+
+    /// 지금 막혀 있으면 남은 초
+    pub fn blocked_for(&self, now: u64) -> Option<u64> {
+        (self.failures >= SECOND_STEP_ATTEMPTS && self.blocked_until > now)
+            .then(|| self.blocked_until - now)
+    }
 }
 
 /// TOTP 요소
@@ -319,6 +359,33 @@ mod tests {
         for bad in ["", "12345", "1234567", "abcdef", "12345a"] {
             assert_eq!(verify_totp(RFC_SECRET, bad, now, 0), None, "{bad}");
         }
+    }
+
+    /// 리뷰 1 I4: 시도는 다섯 번까지, 그 뒤로는 30초부터 두 배씩(15분까지) 막는다. 옛 JSON은 그대로다.
+    #[test]
+    fn second_step_attempts_block_with_backoff() {
+        let mut status = TwoFactorStatus::default();
+        assert_eq!(
+            serde_json::to_string(&status).unwrap(),
+            r#"{"last_totp_step":0,"last_used":0}"#
+        );
+        for _ in 0..4 {
+            status = status.count_attempt(1000);
+            assert_eq!(status.blocked_for(1000), None);
+        }
+        status = status.count_attempt(1000);
+        assert_eq!(status.failures, 5);
+        assert_eq!(status.blocked_for(1000), Some(30));
+        assert_eq!(status.blocked_for(1030), None);
+        status = status.count_attempt(1030);
+        assert_eq!(status.blocked_for(1030), Some(60));
+        for _ in 0..20 {
+            status = status.count_attempt(5000);
+        }
+        assert_eq!(status.blocked_for(5000), Some(SECOND_STEP_MAX_BLOCK));
+        let back: TwoFactorStatus =
+            serde_json::from_str(&serde_json::to_string(&status).unwrap()).unwrap();
+        assert_eq!(back, status);
     }
 
     #[test]

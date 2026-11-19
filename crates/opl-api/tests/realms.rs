@@ -872,3 +872,34 @@ async fn realm_changes_are_audited() {
     let text = serde_json::to_string(&entries).unwrap();
     assert!(!text.contains("svc-secret"), "{text}");
 }
+
+/// 리뷰 1 M4: 역할 `none`으로 매핑하는 영역은 모든 노드가 `folders`를 알아야 쓴다(옛 노드는 그 영역도, 그렇게 만든
+/// 사용자도 풀지 못한다).
+#[tokio::test]
+async fn mapping_to_none_waits_for_folders() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.status
+        .features
+        .retain(|f| f != opl_types::node::FOLDERS);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &node.status)
+        .await
+        .unwrap();
+    let mut body = okta();
+    body["roles"]["default"] = json!("none");
+    assert_error(
+        &admin.post("/realms", body.clone()).await,
+        StatusCode::CONFLICT,
+        "cluster_upgrading",
+    );
+    let (status, created) = admin.post("/realms", okta()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    body["roles"] = json!({ "groups": [{ "group": "guests", "role": "none" }] });
+    assert_error(
+        &admin.put("/realms/okta", body, None).await,
+        StatusCode::CONFLICT,
+        "cluster_upgrading",
+    );
+}

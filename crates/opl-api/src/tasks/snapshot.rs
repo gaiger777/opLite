@@ -1003,6 +1003,8 @@ async fn write_reverted_spec(ctx: &Ctx, vm_id: Uuid, snapshot: &Snapshot) -> Res
         spec.snapshot_schedule = vm.spec.snapshot_schedule;
         spec.ha = vm.spec.ha.clone();
         spec.placement = vm.spec.placement;
+        // 폴더도 지금 것이다: 되돌리기가 VM을 옛 폴더로 옮기면 옮기기 권한 없이 폴더를 바꾸게 된다.
+        spec.folder = vm.spec.folder;
         if snapshot.spec.memory && spec.node.is_none() {
             // 이 노드의 arch가 머신과 다르면 여기서 시작할 수 없다. 다른 노드로 보내면 메모리 상태를
             // 이어 쓸 수 없으므로 고정하지 않고 Task를 실패로 끝낸다(디스크를 건드리기 전이다).

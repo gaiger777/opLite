@@ -606,47 +606,93 @@ fn target_name(state: &AppState, t: &GrantTarget) -> String {
     }
 }
 
-/// grant를 줄 수 있는지(설계 §6.5): 루트 grant는 `cluster.admin`, 아니면 대상의 `permission.modify`와 역할 권한 ⊆ 그
-/// 대상에서의 자기 유효 권한(403 `cannot grant privileges you do not hold: …`). 대상이 없거나 볼 수 없으면 404다.
+/// grant를 주거나 뺄 수 있는지(설계 §6.5, 리뷰 1): grant가 닿는 모든 곳에서 역할의 권한과 `permission.modify`(루트
+/// grant는 `cluster.admin`)가 자기 유효 권한 안이어야 한다(403 `cannot grant privileges you do not hold: …`). 닿는 곳은
+/// 대상 자체이고, propagate면 그 아래 모두다. 아래 모두에 닿는 자기 권한은 대상이나 조상의 propagate grant뿐이라서
+/// 폴더 안 객체 층(루트면 루트의 객체 층)으로 본다. 그래서 propagate가 아닌 폴더 grant로 받은 권한을 propagate grant로
+/// 넓히지 못한다. 대상이 없거나 볼 수 없으면 404다.
 fn check_delegation(
     state: &AppState,
     principal: &Principal,
     target: &GrantTarget,
-    privileges: Option<PrivSet>,
+    propagate: bool,
+    privileges: PrivSet,
 ) -> Result<(), ApiError> {
-    if *target == GrantTarget::Root {
-        return state.authz.require_root(principal, Privilege::ClusterAdmin);
+    // (확인할 대상, 그곳에서 있어야 하는 권한, 메시지에 붙일 곳)
+    let mut layers: Vec<(AuthzTarget, PrivSet, &str)> = Vec::new();
+    match target {
+        GrantTarget::Root => {
+            state
+                .authz
+                .require_root(principal, Privilege::ClusterAdmin)?;
+            layers.push((AuthzTarget::Root, privileges, ""));
+            if propagate {
+                layers.push((contents_of(None, Kind::Vm), privileges, " everywhere below"));
+            }
+        }
+        GrantTarget::Folder { id } => {
+            let missing = format!("folder {id} not found");
+            let folder = state
+                .cluster
+                .get::<FolderSpec>(*id)?
+                .ok_or_else(|| ApiError::not_found(missing.clone()))?;
+            let found = Found {
+                owned: Owned::object(AuthzTarget::Folder(*id)),
+                missing,
+            };
+            state
+                .authz
+                .require(principal, Privilege::PermissionModify, &found)?;
+            let needed = privileges | PrivSet::from(Privilege::PermissionModify);
+            layers.push((AuthzTarget::Folder(*id), needed, ""));
+            if propagate {
+                let kind = folder.spec.kind.member_kind();
+                layers.push((contents_of(Some(*id), kind), needed, " everywhere inside"));
+            }
+        }
+        GrantTarget::Object { kind, id } => {
+            let missing = format!("{} {id} not found", kind.as_str());
+            let Some(at) = grant_target(state, target)? else {
+                return Err(ApiError::not_found(missing));
+            };
+            let found = Found {
+                owned: Owned::object(at),
+                missing,
+            };
+            state
+                .authz
+                .require(principal, Privilege::PermissionModify, &found)?;
+            layers.push((
+                at,
+                privileges | PrivSet::from(Privilege::PermissionModify),
+                "",
+            ));
+        }
     }
-    let missing = match target {
-        GrantTarget::Folder { id } => format!("folder {id} not found"),
-        GrantTarget::Object { kind, id } => format!("{} {id} not found", kind.as_str()),
-        GrantTarget::Root => unreachable!(),
-    };
-    let Some(at) = grant_target(state, target)? else {
-        return Err(ApiError::not_found(missing));
-    };
-    let found = Found {
-        owned: Owned::object(at),
-        missing,
-    };
-    state
-        .authz
-        .require(principal, Privilege::PermissionModify, &found)?;
-    if let Some(wanted) = privileges {
-        let mine = state.authz.effective(principal, &found)?;
-        let extra = wanted.difference(mine);
+    for (at, needed, place) in layers {
+        let mine = state.authz.effective(principal, &at)?;
+        let extra = needed.difference(mine);
         if !extra.is_empty() {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "forbidden",
                 format!(
-                    "cannot grant privileges you do not hold: {}",
+                    "cannot grant privileges you do not hold{place}: {}",
                     extra.names().join(", ")
                 ),
             ));
         }
     }
     Ok(())
+}
+
+/// 폴더 `folder`(없으면 루트) 안에 놓일 객체 층: 그 폴더나 조상의 propagate grant만 닿는다.
+fn contents_of(folder: Option<Uuid>, kind: Kind) -> AuthzTarget {
+    AuthzTarget::Object {
+        kind,
+        id: Uuid::nil(),
+        folder,
+    }
 }
 
 /// grant를 준다. 루트 grant는 `cluster.admin`, 폴더·객체 grant는 대상의 `permission.modify`가 있어야 하고 역할의 권한이
@@ -670,7 +716,7 @@ pub async fn create_grant(
     spec.validate().map_err(bad)?;
     let (privileges, role_name) = role_set(&state, &spec.role)?;
     let who = principal_name(&state, &spec.principal)?;
-    check_delegation(&state, &principal, &spec.target, Some(privileges))?;
+    check_delegation(&state, &principal, &spec.target, spec.propagate, privileges)?;
     let id = Uuid::now_v7();
     let mut grant: Grant = Resource::new(id.to_string(), spec);
     grant.id = id;
@@ -723,7 +769,14 @@ pub async fn delete_grant(
 ) -> Result<StatusCode, ApiError> {
     let grant = visible_grant(&state, &principal, &id)?;
     match grant_target(&state, &grant.spec.target)? {
-        Some(_) => check_delegation(&state, &principal, &grant.spec.target, None)?,
+        // 빼기도 주기와 같은 규칙이다(닿는 모든 곳에 그 역할의 권한). 지워진 사용자 정의 역할은 아무것도 주지 않는다.
+        Some(_) => check_delegation(
+            &state,
+            &principal,
+            &grant.spec.target,
+            grant.spec.propagate,
+            role_set(&state, &grant.spec.role).map_or(PrivSet::EMPTY, |(set, _)| set),
+        )?,
         None => state
             .authz
             .require_root(&principal, Privilege::ClusterAdmin)?,
@@ -878,16 +931,20 @@ pub async fn effective_permissions(
     Query(q): Query<EffectiveQuery>,
 ) -> Result<Json<EffectivePermissions>, ApiError> {
     let target = object_target(&state, &principal, &q.object)?;
-    let user = match &q.user {
-        None => lookup::<UserSpec>(&state.cluster, &principal.user.to_string())?,
-        Some(key) => lookup::<UserSpec>(&state.cluster, key)?,
-    };
-    let me = user.id == principal.user;
+    // 남의 것은 사용자를 찾기 전에 권한을 본다(404·403으로 사용자 이름을 알아내지 못하게, 리뷰 1).
+    let me = q.user.as_deref().is_none_or(|key| {
+        key == principal.name || Uuid::try_parse(key).is_ok_and(|id| id == principal.user)
+    });
     if !me {
         state
             .authz
             .require(&principal, Privilege::PermissionModify, &target)?;
     }
+    let user = match &q.user {
+        None => lookup::<UserSpec>(&state.cluster, &principal.user.to_string())?,
+        Some(key) => lookup::<UserSpec>(&state.cluster, key)?,
+    };
+    let me = user.id == principal.user;
     let (privileges, grants) = state.authz.with_snapshot(|snap| {
         let privileges = if me {
             None
@@ -950,11 +1007,12 @@ pub struct WhoPermissions {
     pub object: String,
     /// 이 대상에 직접 건 것과 조상에 propagate로 건 것
     pub grants: Vec<Grant>,
-    /// 전역 역할(`none`이 아닌)이 있는 사용자 — 루트에 건 암묵 grant다.
+    /// 전역 역할(`none`이 아닌)이 있는 사용자 — 루트에 건 암묵 grant다. 루트 `cluster.admin`이 아니면 비어 있다.
     pub users: Vec<RoleHolder>,
 }
 
 /// 대상에 권한이 닿는 grant와 전역 역할 사용자. 대상의 `permission.modify`가 있어야 한다(403, 볼 수 없으면 404).
+/// 전역 역할 사용자 목록은 사용자 목록을 읽는 루트 `cluster.admin`에게만 채운다(리뷰 1).
 #[utoipa::path(get, path = "/permissions/who", tag = "permissions",
     params(WhoQuery),
     responses((status = 200, body = WhoPermissions), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -973,12 +1031,15 @@ pub async fn who_permissions(
         .into_iter()
         .filter(|g| reaches(&g.spec.target, g.spec.propagate, &target, &chain))
         .collect();
+    let admin = state
+        .authz
+        .allows(&principal, Privilege::ClusterAdmin, AuthzTarget::Root);
     let users = state
         .cluster
         .list::<UserSpec>()?
         .1
         .into_iter()
-        .filter(|u| u.spec.role != Role::None)
+        .filter(|u| admin && u.spec.role != Role::None)
         .map(|u| RoleHolder {
             id: u.id,
             name: u.name,

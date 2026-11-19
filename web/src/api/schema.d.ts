@@ -959,7 +959,7 @@ export interface paths {
         };
         /**
          * 폴더의 하위 트리 사용량(vCPU·메모리·붙은 디스크·VM 수)과 그 폴더·조상의 할당량, 차원마다 묶는 폴더. 볼 수 없는
-         *     조상의 할당량도 보인다(그 상한이 이 폴더의 쓰기를 막으므로).
+         *     조상(폴더 자체를 읽지 못함)은 `limits`·`binding`에서 뺀다.
          */
         get: operations["folder_usage"];
         put?: never;
@@ -1221,8 +1221,8 @@ export interface paths {
         };
         /**
          * 이 노드의 Prometheus 지표(텍스트 형식 0.0.4, gauge). 이 노드와 이 노드에서 잰 VM의 마지막 5초 점, 이 노드에서
-         *     준비된 풀, 클러스터 값(노드 수·VM 수·리더)이다. 노드마다 따로 긁는다. Node와 Vm 읽기 권한이 필요하고(viewer 토큰이면
-         *     된다), 설정 `prometheus.enabled`가 꺼져 있으면 404 `not_found`다. 5초 캐시한다.
+         *     준비된 풀, 클러스터 값(노드 수·VM 수·리더)이다. 노드마다 따로 긁는다. 루트 `cluster.read`와 루트 아래 모든 VM의
+         *     읽기(전역 역할이나 propagate 루트 grant)가 필요하고(viewer 토큰이면 된다), 설정 `prometheus.enabled`가 꺼져 있으면 404 `not_found`다. 5초 캐시한다.
          */
         get: operations["get_prometheus"];
         put?: never;
@@ -1650,7 +1650,10 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** 대상에 권한이 닿는 grant와 전역 역할 사용자. 대상의 `permission.modify`가 있어야 한다(403, 볼 수 없으면 404). */
+        /**
+         * 대상에 권한이 닿는 grant와 전역 역할 사용자. 대상의 `permission.modify`가 있어야 한다(403, 볼 수 없으면 404).
+         *     전역 역할 사용자 목록은 사용자 목록을 읽는 루트 `cluster.admin`에게만 채운다(리뷰 1).
+         */
         get: operations["who_permissions"];
         put?: never;
         post?: never;
@@ -4041,6 +4044,8 @@ export interface components {
         };
         CodeRequest: {
             code: string;
+            /** @description 이미 요소(패스키)가 있으면 본인 확인(그 밖의 코드·복구 코드 또는 로컬 비밀번호). 없으면 400 `proof_required`. */
+            proof?: components["schemas"]["ProofRequest"];
         };
         /**
          * @description 리더 노드에서 `/bin/sh -c`로 돌리는 명령. 환경 변수 `ORBIVISOR_NODE_NAME`·`ORBIVISOR_NODE_ID`·
@@ -4681,6 +4686,8 @@ export interface components {
             credential: components["schemas"]["RegistrationCredential"];
             /** @description 패스키 이름(1~64자) */
             name: string;
+            /** @description 이미 요소가 있으면 본인 확인(지금 요소의 코드·복구 코드 또는 로컬 비밀번호). 없으면 400 `proof_required`. */
+            proof?: components["schemas"]["ProofRequest"];
             /** @description 등록 시작이 준 토큰 */
             token: string;
         };
@@ -6527,6 +6534,12 @@ export interface components {
                      * @default null
                      */
                     attached_to: string | null;
+                    /**
+                     * Format: int64
+                     * @description 늘리기 Task가 저장소를 늘린 뒤 읽은 실제 크기(계획 62 리뷰 1). 스펙 크기를 이 값까지 올리는 기록은 폴더
+                     *     할당량에 막히지 않는다(이미 커진 디스크를 기록에서 숨기지 않게). Task가 기록한 뒤 지운다. 없으면 쓰지 않는다.
+                     */
+                    disk_bytes?: number;
                     /**
                      * Format: uuid
                      * @description 볼륨을 만든 Task를 실행하는 노드. 그 노드만 시작할 때 남은 고아 볼륨을 정리한다.
@@ -8963,6 +8976,12 @@ export interface components {
                  */
                 attached_to: string | null;
                 /**
+                 * Format: int64
+                 * @description 늘리기 Task가 저장소를 늘린 뒤 읽은 실제 크기(계획 62 리뷰 1). 스펙 크기를 이 값까지 올리는 기록은 폴더
+                 *     할당량에 막히지 않는다(이미 커진 디스크를 기록에서 숨기지 않게). Task가 기록한 뒤 지운다. 없으면 쓰지 않는다.
+                 */
+                disk_bytes?: number;
+                /**
                  * Format: uuid
                  * @description 볼륨을 만든 Task를 실행하는 노드. 그 노드만 시작할 때 남은 고아 볼륨을 정리한다.
                  * @default null
@@ -10528,6 +10547,12 @@ export interface components {
              */
             attached_to: string | null;
             /**
+             * Format: int64
+             * @description 늘리기 Task가 저장소를 늘린 뒤 읽은 실제 크기(계획 62 리뷰 1). 스펙 크기를 이 값까지 올리는 기록은 폴더
+             *     할당량에 막히지 않는다(이미 커진 디스크를 기록에서 숨기지 않게). Task가 기록한 뒤 지운다. 없으면 쓰지 않는다.
+             */
+            disk_bytes?: number;
+            /**
              * Format: uuid
              * @description 볼륨을 만든 Task를 실행하는 노드. 그 노드만 시작할 때 남은 고아 볼륨을 정리한다.
              * @default null
@@ -10585,7 +10610,7 @@ export interface components {
             /** @description 이 대상에 직접 건 것과 조상에 propagate로 건 것 */
             grants: components["schemas"]["Resource"][];
             object: string;
-            /** @description 전역 역할(`none`이 아닌)이 있는 사용자 — 루트에 건 암묵 grant다. */
+            /** @description 전역 역할(`none`이 아닌)이 있는 사용자 — 루트에 건 암묵 grant다. 루트 `cluster.admin`이 아니면 비어 있다. */
             users: components["schemas"]["RoleHolder"][];
         };
     };

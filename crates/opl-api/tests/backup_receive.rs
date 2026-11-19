@@ -1308,3 +1308,15 @@ async fn tpm_backups_wait_for_vtpm_and_keep_the_tpm_state() {
         b"tpm"
     );
 }
+
+/// 리뷰 1 M4: 보낸 클러스터의 폴더 id는 버린다(여기서 뜻이 없고 옛 노드가 풀지 못한다).
+#[tokio::test]
+async fn the_folder_of_the_sending_cluster_is_dropped() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    let mut m = manifest();
+    m["vm_spec"]["folder"] = json!(Uuid::now_v7());
+    let id = receive_ok(&admin, receive_body(&m)).await;
+    assert_eq!(get_backup(&env, id).unwrap().spec.vm_spec.folder, None);
+}

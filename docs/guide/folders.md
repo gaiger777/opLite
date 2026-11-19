@@ -172,8 +172,11 @@ orbivisorctl perm who /teamA                   # 이 대상에 닿는 grant와 �
 
 ### 위임과 상승 막기
 
-- grant를 주거나 빼려면 대상에 `permission.modify`가 있어야 하고, 주는 역할의 권한이 **그 대상에서 자기 유효 권한의 부분집합**
-  이어야 한다. 아니면 **403** `forbidden` "cannot grant privileges you do not hold: vm.delete".
+- grant를 주거나 빼려면 **grant가 닿는 모든 곳**에서 역할의 권한과 `permission.modify`가 자기 유효 권한 안이어야 한다. 닿는
+  곳은 대상 자체이고, 아래로 내려가는 grant면 그 아래 모두다. 아래 모두에 닿는 자기 권한은 그 폴더나 조상에 **아래로 내려가는
+  grant**로 받은 것뿐이라서, `--no-propagate`로 받은 권한은 그 폴더 자체에만 다시 줄 수 있다. 아니면 **403** `forbidden`
+  "cannot grant privileges you do not hold: vm.delete"(아래 모두가 모자라면 "… do not hold everywhere inside: …"). 빼기도 같은
+  규칙이다(자기가 가진 것보다 넓은 grant는 빼지 못한다).
 - 루트 grant, 사용자 정의 역할·그룹 쓰기는 `cluster.admin`이다(역할 하나를 고치면 모든 grant가 바뀌므로).
 - 할당량은 그 폴더의 **부모**에서 `inventory.quota`가 필요하다(맨 위 폴더는 루트). 팀 관리자는 자기 폴더의 상한을 올리지 못하고
   자식 폴더의 상한만 나눈다.
@@ -182,7 +185,11 @@ orbivisorctl perm who /teamA                   # 이 대상에 닿는 grant와 �
 - grant 보기: `cluster.admin`은 전부, 그 밖에는 자기·자기 그룹의 grant와 `permission.modify`가 있는 대상의 grant다. 대상이 지워진
   grant는 루트 관리자만 보고 뺀다.
 - 사용자 목록(`GET /users`)은 `cluster.admin`만 읽는다. 위임자는 사용자 이름 대신 **id**로 준다(웹은 이미 접근하는 주체를 고르기
-  목록으로 준다).
+  목록으로 준다). `perm who`의 전역 역할 사용자 표도 `cluster.admin`에게만 채운다. 남의 유효 권한(`perm effective --user`)은 그
+  대상의 `permission.modify`가 있어야 하고, 없으면 사용자가 있든 없든 **403**이다.
+- **노드 자원.** 스토리지 풀 만들기(dir 경로·LVM VG·ZFS 데이터셋·Ceph·NFS)와 브리지 네트워크 만들기(노드의 브리지·NIC·VLAN)는
+  루트 `cluster.admin`이다. 폴더의 `storage.config`·`network.config`로는 VXLAN 네트워크 만들기와 그 폴더의 풀·네트워크 바꾸기·
+  지우기만 한다.
 
 ### API 토큰의 범위
 
@@ -202,8 +209,10 @@ orbivisorctl token list                        # SCOPE 열
   없으면 **403**이다.
 - **목록**(VM·볼륨·스냅샷·백업·작업·가져오기·네트워크·풀·폴더 등)은 볼 수 있는 것만 돌려준다.
 - **`/watch`**는 이벤트마다 거른다. 보이던 객체가 옮겨져 안 보이게 되면 이름·id만 담은 `deleted`가 온다.
-- **지표**: VM 지표·기록은 그 VM의 `system.read`, 풀 기록은 풀의 `system.read`. 노드 지표·`/metrics/cluster`·Prometheus
-  `/metrics`는 루트 `cluster.read`다(노드 합계가 다른 팀의 부하를 드러내므로). 대시보드 요약의 상위 VM·풀은 거른다.
+- **지표**: VM 지표·기록은 그 VM의 `system.read`, 풀 기록은 풀의 `system.read`. 노드 지표·`/metrics/cluster`는 루트
+  `cluster.read`다(노드 합계가 다른 팀의 부하를 드러내므로). 대시보드 요약의 상위 VM·풀은 거른다. Prometheus `/metrics`는 모든
+  VM의 값을 담으므로 루트 `cluster.read`에 더해 루트 아래 모두를 읽어야 한다(전역 `viewer` 이상이나 아래로 내려가는 루트 grant —
+  예전 viewer 토큰은 그대로 된다).
 - **경보**: 활성 경보·기록은 대상의 `alert.read`로 거르고(노드·백업 작업 경보는 루트), 규칙 쓰기는 루트 `alert.manage`, 알림
   대상은 `cluster.admin`이다.
 - **작업(Task)**: 목록·상세는 대상을 읽을 수 있어야 하고, 취소는 그 작업의 권한이다. 대상이 없는 작업(노드 비우기·Ceph·HA 등)은
@@ -211,7 +220,9 @@ orbivisorctl token list                        # SCOPE 열
 - **파생 객체는 주인을 따른다**: 볼륨은 디스크로 붙은 VM(아니면 풀, CD의 ISO는 주인이 아니다), 스냅샷은 VM, 백업은 VM(지웠으면
   백업에 담긴 VM의 폴더), 작업은 대상이다. 가져오기(VM import)는 루트 객체다(올리기·ESXi 연결은 루트 `vm.create`).
 - **만들기·배포·복원**은 대상 폴더 `vm.create`, 템플릿 `vm.clone`, 풀 `storage.allocate`, NIC마다 `network.assign`(보안 그룹은 읽기)과
-  할당량을 본다. 원격 대상은 `cluster.admin`, 감사 로그는 루트 `cluster.admin`, 콘솔은 `vm.console`이다.
+  할당량을 본다. CD-ROM에 넣는 ISO는 그 풀을 읽을 수 있어야 하고(못 보면 **404**), 마이그레이션의 `pool`은 그 풀의
+  `storage.allocate`가 필요하다. 복제·배포는 확인한 폴더에 들고(작업이 기다리는 사이 원본을 옮겨도), 스냅샷 되돌리기는 VM의 지금
+  폴더를 둔다. 원격 대상은 `cluster.admin`, 감사 로그는 루트 `cluster.admin`, 콘솔은 `vm.console`이다.
 - 루트 `cluster.read`가 없는 폴더 사용자는 노드 목록을 못 본다. VM은 자동 배치이고 머신 종류는 서버가 클러스터 아키텍처로 고른다
   (웹은 노드 칸을 숨긴다). CLI `vm create`는 그때 `--machine virt|q35`를 달라고 한다.
 
@@ -231,7 +242,11 @@ orbivisorctl token list                        # SCOPE 열
   바꾸기(핫플러그·CD·템플릿 바꾸기 포함), 복제·배포, 복원, 가져오기 실행, 볼륨 늘리기, 폴더로 옮기기, 폴더 옮기기.
 - 복제·복원·가져오기 작업은 디스크를 만든 뒤 VM을 쓰므로, 경쟁에서 진 작업은 마지막 쓰기에서 실패하고 만든 볼륨을 지운다.
 - **사용량**: `GET /api/v1/folders/{id}/usage` → `{folder, path, usage, limits[{folder, path, quota, usage}], binding{차원: 폴더}}`
-  (그 노드의 상태로 바로 셈, 캐시 없음).
+  (그 노드의 상태로 바로 셈, 캐시 없음). 읽을 수 없는 조상 폴더의 상한은 `limits`·`binding`에 없다(그 상한에 걸린 쓰기는 409가
+  알린다).
+- **볼륨 늘리기**는 저장소를 늘리기 전에 요청한 크기를 먼저 기록해 Raft에서 몫을 잡는다(그동안 같은 폴더의 다른 늘리기는 409).
+  저장소가 크기를 올려(LVM extent·ZFS 단위) 상한을 조금 넘더라도 실제 크기를 기록한다(사용량을 적게 세지 않는다). 늘리지 못하면
+  디스크의 실제 크기로 되돌린다.
 
 ```bash
 orbivisorctl folder quota set /teamA --vcpus 32 --memory 128G --disk 2T --vms 20
@@ -262,13 +277,19 @@ orbivisorctl folder usage /teamA
 - **로그인.** 비밀번호가 맞고 요소가 있거나 정책이 요구하면, 쿠키는 5분짜리 **대기 세션**이고 응답에 `second_factor {methods,
   webauthn?, enroll, expires_at}`가 있다. `POST /api/v1/auth/login/second-factor {"totp"|"recovery"|"webauthn": …}`가 맞으면 같은
   쿠키가 정식 세션이 된다. 대기 세션으로 다른 경로를 부르면 **401** `second_factor_required`, 틀린 코드는 **401**
-  `invalid_second_factor`이고 5번 틀리면 30초부터 두 배로 막힌다(**429**).
+  `invalid_second_factor`이다. 틀린 횟수는 사용자마다 **모든 노드를 합쳐** Raft에 세고(확인 전에 올린다), 5번 틀리면 대기
+  세션이 끝나 비밀번호부터 다시 하고 30초부터 두 배로(15분까지) 막힌다(**429**, 맞는 코드도). 통과하면 지운다. 노드·IP마다의
+  메모리 제한도 그대로 있다.
 - **정책.** 설정의 `two_factor {roles, realms, rp_id}`: 전역 역할이 `roles`에 있거나 영역(`local` 포함)이 `realms`에 있는 사용자에게
-  요구한다. OIDC 영역은 넣을 수 없다(**400**, IdP가 MFA를 맡는다). 사용자 정의 역할 grant로는 정하지 않는다. 정책이 요구하는데
+  요구한다. OIDC 영역은 넣을 수 없다(**400**, IdP가 MFA를 맡는다). `roles`에 `admin`이 있으면 grant로 관리 권한을 받은 사용자 —
+  루트 `cluster.admin`이나 어디서든 `permission.modify`(남에게 권한을 줄 수 있다) — 도 요구한다. 그 밖의 사용자 정의 역할
+  grant로는 정하지 않는다. 정책이 요구하는데
   요소가 없으면 로그인이 **강제 등록**으로 간다(웹: 인증 앱 QR이나 패스키, 그다음 복구 코드. CLI: 터미널에서 TOTP 등록). 등록을
   마치면 로그인이 끝난다. 요구받는 사용자는 마지막 요소를 뺄 수 없다(**409** `two_factor_required`).
-- **빼기와 다시 만들기의 본인 확인.** TOTP 끄기, 패스키 빼기, 복구 코드 다시 만들기는 코드·복구 코드 또는 로컬 사용자의 비밀번호가
-  필요하다(외부 사용자는 코드만). 요소 더하기는 확인 없이 받는다.
+- **본인 확인.** TOTP 끄기, 패스키 빼기, 복구 코드 다시 만들기는 코드·복구 코드 또는 로컬 사용자의 비밀번호가 필요하다(외부
+  사용자는 코드만). 이미 요소가 있으면 **요소 더하기**(`/auth/2fa/totp/confirm`·`/auth/2fa/webauthn/register/finish`의 `proof
+  {code|password}`)도 같다(없으면 **400** `proof_required`) — 훔친 세션·토큰이 오래 가는 요소를 더하지 못하게. 강제 등록 중인 대기
+  세션은 그사이 본인이 등록했으면 **409** `already_enrolled`(다시 로그인)이다.
 - **관리자 초기화.** `orbivisorctl user 2fa-reset alice`(`DELETE /api/v1/users/{key}/two-factor`, `cluster.admin`)는 요소를 모두
   지우고 그 사용자의 세션을 끝낸다. API 토큰은 남는다. 자기 자신은 안 된다(**409** `cannot_reset_self`).
 - **다른 인증과.** LDAP 사용자는 디렉터리 바인드 뒤 로컬 요소를 묻는다(요소는 `alice@corp`에 붙는다). OIDC 사용자에게는 묻지 않고
@@ -277,7 +298,9 @@ orbivisorctl folder usage /teamA
   비밀번호만 훔쳐서는 토큰을 만들 수 없다. 정책을 켜기 전에 만든 토큰은 그대로 남으니 `token list`로 보고 정리한다. 자동화에는
   [범위 토큰](#api-토큰의-범위)을 쓴다.
 - **저장.** TOTP 비밀은 서버가 다시 계산해야 하므로 Raft에 평문으로 있다(LDAP 서비스 계정 비밀번호와 같이 API 응답·watch·감사
-  로그에는 나오지 않는다). 복구 코드는 SHA-256, 패스키는 공개 키만 둔다.
+  로그에는 나오지 않는다). 따로 암호화하지 않는다: 쓸 수 있는 클러스터 키(CA 개인키)도 같은 Raft 상태에 있어 스냅샷이 새면
+  함께 새기 때문이다. 확인하지 않은 등록 중 비밀은 다음 등록이나 TOTP 끄기 때까지 남는다. 복구 코드는 SHA-256, 패스키는 공개 키만
+  둔다.
 - **감사 로그.** `2fa totp on|off`, `2fa recovery regenerate`, `2fa passkey add|remove NAME`, `second factor totp|recovery|webauthn`,
   `user 2fa-reset NAME`, `settings two-factor roles=[…] realms=[…]`(비밀·코드는 적지 않는다).
 
@@ -351,8 +374,11 @@ orbivisorctl user list                         # 2FA 열
 새 기능은 두 노드 기능으로 가린다. **`folders`**는 폴더·grant·역할·그룹, 리소스의 `folder` 칸, 전역 역할 `none`, 외부 그룹 저장,
 토큰 범위, 할당량이고, **`two-factor`**는 2단계 인증 요소·대기 세션·정책이다. 모든 노드가 그 기능을 알릴 때만 쓰기를 받고, 아니면
 **409** `cluster_upgrading`이다. 옛 노드는 grant를 모르므로 하나라도 있으면 권한을 잘못 볼 수 있어서다. 새 것이 하나도 없는 동안
-새 노드의 판단은 옛 노드와 같다. 모든 노드가 `two-factor`를 알기 전에는 대기 세션을 만들지 않으므로 둘째 단계도 없고, 웹의
-2단계 인증 화면은 "모든 노드를 올리기 전에는 쓸 수 없습니다"를 보인다.
+새 노드의 판단은 옛 노드와 같다. 역할 `none`으로 매핑하는 영역도 `folders` 뒤다. 2단계 인증은 **닫힌 실패**다: 어느 노드가
+`two-factor`를 아직 알리지 않았어도(합류 중인 노드 등) 요소가 있는 사용자는 둘째 단계를 거치고, 그 대기 세션은 로그인한 노드의
+메모리에만 둔다. 정책이 요구하는데 요소가 없는 사용자는 등록할 수 없으므로 로그인이 **409** `cluster_upgrading`이다. 2FA 쓰기와
+정책 바꾸기도 **409**이고, 웹의 2단계 인증 화면은 "모든 노드를 올리기 전에는 쓸 수 없습니다"를 보인다. 받은 백업의 폴더 칸은
+버린다(보낸 클러스터의 폴더 id다).
 
 ## 한계
 
@@ -361,8 +387,7 @@ orbivisorctl user list                         # 2FA 열
 - **거부 규칙이 없다.** 위 폴더에서 받은 권한을 아래에서 빼지 못한다. 뺄 것은 형제 폴더로 옮긴다.
 - 외부 사용자의 그룹은 로그인할 때만 읽는다. 디렉터리에서 그룹을 빼도 다음 로그인 전까지(토큰만 쓰면 마지막 로그인의 그룹으로)
   그룹 grant가 남는다. 바로 막으려면 그 사용자를 지우거나 grant를 뺀다.
-- **볼륨 늘리기의 틈.** 볼륨 늘리기 작업은 저장소를 늘리기 직전에 할당량을 다시 보지만, 그 뒤 다른 노드와의 경쟁(또는 LVM·ZFS의
-  크기 올림)으로 크기 기록이 할당량에 걸리면 디스크만 커진 채 기록은 옛 크기로 남고 작업이 실패한다.
+- **볼륨 늘리기의 올림.** 저장소가 요청보다 크게 올리면(LVM extent·ZFS 단위) 폴더가 그만큼 상한을 넘을 수 있다(기록은 실제 크기).
 - **Raft 적용 비용.** 할당량이 걸린 폴더의 VM 쓰기는 적용할 때 모든 VM을 한 번 훑는다. VM 1만 개에서 VM 쓰기 하나의 적용이 약
   17.8 ms(할당량 없음) → 27.5 ms(할당량 폴더)였다(릴리스 빌드). 할당량이 없는 클러스터는 더하는 비용이 없다.
 - `/watch`는 목록을 읽은 뒤 구독하기 전(밀리초) 사이에 옮겨진 객체를 놓칠 수 있다(웹은 다시 연결할 때 목록을 다시 읽는다).
@@ -374,6 +399,8 @@ orbivisorctl user list                         # 2FA 열
 - 끌어 놓기는 확인 없이 바로 옮긴다("폴더로 옮기기…"는 확인 창을 거친다).
 - 패스키는 증명(attestation)·MDS를 보지 않고, CLI에서 쓸 수 없고, IP 주소로 연 웹에서 쓸 수 없다. SMS·이메일 코드, OIDC의 `amr`
   요구는 없다. 패스키만 있는 LDAP 사용자는 패스키를 빼거나 복구 코드를 다시 만들 때 복구 코드로 확인한다(다 쓰면 관리자 초기화).
-- TOTP 비밀은 Raft에 평문으로 있다(보호는 0700 데이터 디렉터리). 정책을 켜기 전 토큰을 따로 표시하지 않는다.
+- TOTP 비밀은 Raft에 평문으로 있다(보호는 0700 데이터 디렉터리, 따로 둔 암호화 키가 없다). 정책을 켜기 전 토큰을 따로 표시하지
+  않는다. 둘째 단계를 틀린 횟수는 사용자마다 세므로 비밀번호를 아는 공격자는 그 사용자의 둘째 단계를 잠시(15분까지) 막을 수 있다.
+- 폴더 사용자는 볼 수 있는 풀의 ISO만 CD에 넣는다. 루트 ISO 풀을 함께 쓰게 하려면 그 풀에 `viewer` grant를 준다.
 - 볼륨·백업·보안 그룹·노드 폴더, 태그로 주는 권한, 시간 제한 grant, 폴더별 감사 로그 읽기·Prometheus, 실행 중만 세는 할당량·풀별
   디스크 할당량은 없다.

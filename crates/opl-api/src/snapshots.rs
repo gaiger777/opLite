@@ -1004,6 +1004,16 @@ pub async fn clone_vm(
         (false, _) => "",
     };
     let detail = format!("vm clone {} -> {}{how}", vm.name, req.name);
+    // 확인한 폴더를 Task에 못 박는다: 줄에서 기다리는 사이 원본이 옮겨져도 복제본은 확인한 폴더에 든다(리뷰 1).
+    // 루트면 비워 두고 Task가 루트에 둔다.
+    let overrides = match spec.folder {
+        Some(folder) => {
+            let mut ov = overrides.unwrap_or_default();
+            ov.folder = Some(folder);
+            Some(ov)
+        }
+        None => overrides,
+    };
     let op = TaskOp::VmClone {
         name: req.name,
         snapshot,

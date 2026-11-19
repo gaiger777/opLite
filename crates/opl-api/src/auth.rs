@@ -371,6 +371,14 @@ impl AppState {
         if !crate::cluster::missing_feature(&self.cluster, SHARED_SESSIONS)?.is_empty() {
             return Ok(memory());
         }
+        // 대기 세션을 모르는 노드(합류 중이라 `two-factor`를 아직 적지 않은 노드 등)가 있으면 이 노드의 메모리에만 둔다.
+        // 그런 노드가 Raft 세션을 정식 세션으로 읽지 못하게(닫힌 실패, 리뷰 1).
+        if pending.is_some()
+            && !crate::cluster::missing_feature(&self.cluster, opl_types::node::TWO_FACTOR)?
+                .is_empty()
+        {
+            return Ok(memory());
+        }
         if !self.cluster.health().quorum {
             tracing::warn!(user = %user.name, "the cluster has no quorum; the session works only on this node");
             return Ok(memory());
@@ -637,6 +645,15 @@ impl AppState {
 
     /// 대기 세션의 둘째 단계가 끝났다: `pending`을 지우고 수명을 [`SESSION_TTL`]로 늘린다(Raft 세션은 revision
     /// CAS). 그사이 다른 요청이 먼저 끝냈으면 그대로 성공이고, 세션이 없어졌으면 401이다.
+    /// 대기 세션을 끝낸다(둘째 단계를 너무 많이 틀렸다). 비밀번호부터 다시 해야 한다.
+    pub(crate) async fn end_pending(
+        &self,
+        login: &PendingPrincipal,
+        ip: IpAddr,
+    ) -> Result<(), ApiError> {
+        self.end_session(&login.cookie, ip).await
+    }
+
     pub(crate) async fn complete_login(&self, login: &PendingPrincipal) -> Result<(), ApiError> {
         let Some(shared) = &login.shared else {
             return if self.sessions.complete(&login.cookie) {

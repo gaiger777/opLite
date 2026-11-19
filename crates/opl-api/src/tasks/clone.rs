@@ -292,6 +292,10 @@ pub(super) async fn clone(
         None => spec,
     };
     spec.template = false;
+    // API가 확인한 폴더만 쓴다: 덮어쓰기에 폴더가 없으면 루트였다(원본이 그사이 옮겨졌어도, 리뷰 1).
+    if overrides.is_none_or(|ov| ov.folder.is_none()) {
+        spec.folder = None;
+    }
     let mut new: Vm = Resource::new(name, spec);
     if let Some(dir) = &ctx.config.state_dir {
         let from = match snapshot {

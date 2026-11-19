@@ -547,6 +547,11 @@ pub struct VolumeStatus {
     pub attached_to: Option<Uuid>,
     /// 볼륨을 만든 Task를 실행하는 노드. 그 노드만 시작할 때 남은 고아 볼륨을 정리한다.
     pub node: Option<Uuid>,
+    /// 늘리기 Task가 저장소를 늘린 뒤 읽은 실제 크기(계획 62 리뷰 1). 스펙 크기를 이 값까지 올리는 기록은 폴더
+    /// 할당량에 막히지 않는다(이미 커진 디스크를 기록에서 숨기지 않게). Task가 기록한 뒤 지운다. 없으면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub disk_bytes: Option<u64>,
 }
 
 /// 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.

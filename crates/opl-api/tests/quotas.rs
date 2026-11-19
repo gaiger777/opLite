@@ -3,11 +3,13 @@
 
 mod common;
 
-use common::{Client, Env, vm_request};
+use std::sync::Arc;
+
+use common::{Client, Env, FakeStorage, vm_request};
 use opl_types::backup::{BackupDisk, BackupSpec, BackupStatus};
 use opl_types::resource::Resource;
 use opl_types::runtime::ImageFormat;
-use opl_types::storage::{VolumePhase, VolumeSpec};
+use opl_types::storage::{PoolBackend, StoragePoolSpec, VolumePhase, VolumeSpec};
 use opl_types::vm::VmSpec;
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -254,4 +256,75 @@ async fn clone_and_restore_are_checked_before_the_task() {
         )
         .await;
     assert_exceeded(status, &body, "folder /team would use 2 of 1 VMs");
+}
+
+/// 리뷰 1 I6: 늘리기 Task는 저장소를 건드리기 전에 요청한 크기를 Raft에 써서 몫을 잡고(그동안 다른 늘리기는 409),
+/// 올림(LVM extent 등)으로 상한을 넘은 실제 크기도 기록한다(사용량을 적게 세지 않는다).
+#[tokio::test]
+async fn resizing_reserves_the_quota_before_the_disk_grows() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    let pool = Resource::new(
+        "local",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir {
+                path: env.dir.path().join("local"),
+            },
+            nodes: vec![],
+            shared: false,
+            backups: false,
+            folder: None,
+        },
+    );
+    env.cluster.create(&pool).await.unwrap();
+    env.pool_ready("local").await;
+    let team = folder(&admin, "team", None, json!({"disk_bytes": 4 * GIB})).await;
+    volume(&env, "root", 2 * GIB).await;
+    volume(&env, "other", GIB).await;
+    for (name, disk) in [("a", "root"), ("b", "other")] {
+        let mut req = vm_in(name, Some(&team));
+        req["spec"]["disks"] = json!([{"volume": disk, "bus": "virtio-blk"}]);
+        let (status, body) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let cluster = env.cluster.clone();
+    let id = move |name: &str| cluster.get_by_name::<VolumeSpec>(name).unwrap().unwrap();
+    let storage = Arc::new(FakeStorage::default());
+    storage.set_size(id("root").id, 2 * GIB);
+    storage.set_size(id("other").id, GIB);
+    env.stop_runner().await;
+    env.start_runner_with(storage.clone()).await;
+
+    storage.pause();
+    let (status, task) = admin
+        .post("/volumes/root/resize", json!({"size_bytes": 3 * GIB}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    storage.reached().await;
+    // 저장소가 늘리는 중인데 몫은 이미 잡혔다.
+    assert_eq!(id("root").spec.size_bytes, 3 * GIB);
+    let (status, body) = admin
+        .post("/volumes/other/resize", json!({"size_bytes": 2 * GIB}))
+        .await;
+    assert_exceeded(
+        status,
+        &body,
+        &format!(
+            "folder /team would use {} of {} bytes of disk",
+            5 * GIB,
+            4 * GIB
+        ),
+    );
+    // 저장소가 1.25 GiB 단위로 올린다: 3.75 GiB, 폴더는 4.75 GiB가 되어 상한을 넘지만 기록한다.
+    let unit = 5 * GIB / 4;
+    storage.round_resizes(unit);
+    storage.resume();
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let root = id("root");
+    assert_eq!(root.spec.size_bytes, 3 * unit);
+    // 허가는 기록한 뒤 지운다.
+    assert_eq!(root.status.disk_bytes, None);
+    let (_, usage) = admin.get(&format!("/folders/{team}/usage")).await;
+    assert_eq!(usage["usage"]["disk_bytes"], 3 * unit + GIB, "{usage}");
 }
