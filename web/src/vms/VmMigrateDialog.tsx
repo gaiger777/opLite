@@ -15,6 +15,7 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { useVmCpu } from "@/cpu/cpu";
 import { formatBytes } from "@/lib/format";
+import { numaInUse, useVmNuma } from "@/numa/numa";
 import { isShared, poolsUsableOn } from "@/storage/pools";
 import { trackTask } from "@/tasks/tasks";
 import { availability } from "@/vms/actions";
@@ -95,13 +96,19 @@ export function VmMigrateDialog({
   // 서버가 409로 알린다.
   const cpu = useVmCpu(vm.id);
   const fitOf = (n: Node) => cpu.data?.nodes.find((f) => f.node === n.name);
-  const cpuOk = (n: Node) => fitOf(n)?.can_run !== false;
-  // 고르지 않았으면 CPU를 받을 수 있는 첫 후보
+  // 전용 CPU·hugepages·vNUMA를 받을 수 있는지(계획 64 `GET /vms/{key}/numa`): 그 칸을 쓰는 VM만 묻는다. 못 받는 노드는
+  // CPU처럼 고를 수 없고 까닭을 보인다.
+  const usesNuma = numaInUse(vm.spec) || vm.status.hardware?.numa != null;
+  const numa = useVmNuma(vm.id, usesNuma);
+  const numaFitOf = (n: Node) => numa.data?.nodes.find((f) => f.node === n.name);
+  const cpuOk = (n: Node) => fitOf(n)?.can_run !== false && numaFitOf(n)?.fits !== false;
+  // 고르지 않았으면 CPU·NUMA를 받을 수 있는 첫 후보
   const target =
     dropped !== undefined
       ? undefined
       : (targets.find((n) => n.id === chosen) ?? targets.find(cpuOk) ?? targets[0]);
   const fit = target && fitOf(target);
+  const numaFit = target && numaFitOf(target);
   // 대화상자를 연 사이 VM이 멈추거나 옮기기 시작했을 수 있다.
   const able = availability(vm, "migrate", vmTasks);
   // 복사할 디스크와 스냅샷을 알 때까지 보내지 않는다.
@@ -157,7 +164,9 @@ export function VmMigrateDialog({
         missingPool !== undefined ||
         // CPU 확인을 읽는 동안은 보내지 않는다(읽지 못하면 서버가 정한다 — 리뷰 1 웹 #9).
         cpu.isPending ||
-        fit?.can_run === false
+        fit?.can_run === false ||
+        (usesNuma && numa.isPending) ||
+        numaFit?.fits === false
       }
       returnFocus={returnFocus}
       onClose={onClose}
@@ -193,7 +202,11 @@ export function VmMigrateDialog({
             )}
             {targets.map((n) => (
               <NativeSelectOption key={n.id} value={n.id} disabled={!cpuOk(n)}>
-                {cpuOk(n) ? n.name : t("migrate.cpuCannot", { node: n.name })}
+                {fitOf(n)?.can_run === false
+                  ? t("migrate.cpuCannot", { node: n.name })
+                  : numaFitOf(n)?.fits === false
+                    ? t("migrate.numaCannot", { node: n.name })
+                    : n.name}
               </NativeSelectOption>
             ))}
           </NativeSelect>
@@ -202,6 +215,11 @@ export function VmMigrateDialog({
       {fit?.can_run === false && (
         <p role="alert" className="text-sm text-destructive">
           {fit.reason ?? t("migrate.cpuCannot", { node: fit.node })}
+        </p>
+      )}
+      {fit?.can_run !== false && numaFit?.fits === false && (
+        <p role="alert" className="text-sm text-destructive">
+          {numaFit.reason ?? t("migrate.numaCannot", { node: numaFit.node })}
         </p>
       )}
       {/* `host`·`max` VM: 대상에 없는 플래그를 게스트가 쓰고 있을 수 있다(막지 않는다, 설계 §10). */}

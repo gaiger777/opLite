@@ -35,7 +35,7 @@ import {
 } from "@/folders/folders";
 import { endDrag, FolderTree, startDrag } from "@/folders/FolderTree";
 import { announceMove, MoveButton, MoveDialog } from "@/folders/MoveDialog";
-import { formatDimension, UsageBars, useFolderUsage } from "@/folders/UsageBars";
+import { DIMENSIONS, formatDimension, UsageBars, useFolderUsage } from "@/folders/UsageBars";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
@@ -519,8 +519,7 @@ function QuotaTab({
           {view.limits.map((l) => (
             <li key={l.folder}>
               <span className="font-medium">{l.path}</span>:{" "}
-              {(["vcpus", "memory_mib", "disk_bytes", "vms"] as const)
-                .filter((d) => l.quota[d] !== undefined && l.quota[d] !== null)
+              {DIMENSIONS.filter((d) => l.quota[d] !== undefined && l.quota[d] !== null)
                 .map((d) => `${t(`folders.dim.${d}`)} ${formatDimension(d, l.quota[d]!)}`)
                 .join(" · ")}
             </li>

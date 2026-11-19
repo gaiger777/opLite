@@ -7,6 +7,7 @@ import { Link } from "react-router";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Node, Vm } from "@/api/types";
+import { usePermissions } from "@/auth/usePermissions";
 import { cephRoles, useCeph } from "@/ceph/ceph";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
@@ -18,13 +19,14 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { formatCapacity } from "@/lib/format";
+import { formatCapacity, formatMib } from "@/lib/format";
 import { failingChecks } from "@/ha-checks/checks";
 import { isFrozen, labelText, useNodeActions, vmCount } from "@/nodes/NodeActions";
 import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodePeek } from "@/nodes/NodePeek";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { PoolStatus } from "@/storage/PoolStatus";
+import { useTopologyUsage } from "@/numa/numa";
 import { replicasOn } from "@/vms/replication";
 
 /** 그 노드가 복제본을 둔 VM의 수. 누르면 VM 이름과 복제 상태를 펼친다. */
@@ -139,6 +141,10 @@ export function NodesPage() {
   const vms = useList("vm");
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const ceph = useCeph();
+  const perms = usePermissions();
+  // 전용 CPU·hugepages 열(계획 64)은 한 번 읽는다(루트 `cluster.read`).
+  const usage = useTopologyUsage(perms.has("cluster.read"));
+  const usageOf = (node: Node) => usage.data?.nodes.find((n) => n.node === node.name);
   const actions = useNodeActions();
   const [showingUpdates, setShowingUpdates] = useState<Node | null>(null);
   const [showingInterfaces, setShowingInterfaces] = useState<Node | null>(null);
@@ -338,6 +344,38 @@ export function NodesPage() {
       value: (node) => node.status.memory_mib,
       priority: 2,
       cell: (node) => formatCapacity(node.status.memory_mib),
+    },
+    {
+      id: "dedicated",
+      header: t("numa.columns.dedicated"),
+      priority: 3,
+      value: (node) => usageOf(node)?.dedicated_used ?? -1,
+      // 고정할 수 없거나(macOS·위트니스·옛 노드) 전용 CPU가 없는 노드는 비어 있다.
+      cell: (node) => {
+        const u = usageOf(node);
+        return u && u.dedicated_total > 0
+          ? t("numa.node.usedOf", { used: u.dedicated_used, total: u.dedicated_total })
+          : "—";
+      },
+    },
+    {
+      id: "hugepages",
+      header: t("numa.columns.hugepages"),
+      priority: 3,
+      cell: (node) => {
+        const pools = usageOf(node)?.hugepages ?? [];
+        return pools.length === 0
+          ? "—"
+          : pools.map((p) => (
+              <span key={p.size} className="block">
+                {t("numa.columns.pages", {
+                  size: p.size,
+                  used: formatMib(p.used_mib),
+                  total: formatMib(p.total_mib),
+                })}
+              </span>
+            ));
+      },
     },
     {
       id: "bridges",

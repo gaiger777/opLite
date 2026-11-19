@@ -14,6 +14,7 @@ import { archOf, useCpuModels } from "@/cpu/cpu";
 import { CpuFlagsInput } from "@/cpu/CpuFlagsInput";
 import { CpuModelPicker } from "@/cpu/CpuModelPicker";
 import { folderPath, folderTree } from "@/folders/folders";
+import { NumaSection } from "@/numa/NumaSection";
 import {
   defaultMachine,
   haActive,
@@ -21,6 +22,7 @@ import {
   MAX_HOTPLUG_MEMORY_MIB,
   MAX_VCPUS,
   MEMORY_HOTPLUG_ALIGN_MIB,
+  toSpec,
   type VmFormValues,
 } from "@/vms/form";
 import {
@@ -46,6 +48,7 @@ export function GeneralSection({
   autoMachine,
   onMachineChosen,
   noReplica,
+  vmId,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -66,8 +69,17 @@ export function GeneralSection({
   onMachineChosen: () => void;
   /** 활성 HA인데 복제가 없는 노드 로컬 풀의 디스크. 그 노드가 죽으면 다른 노드에서 켤 수 없다. */
   noReplica?: { volume: string; pool: string } | null;
+  /** 고치는 VM의 id(만들 때는 없음). 전용 CPU·hugepages의 권한 `vm.dedicated`를 그 VM에서 본다(만들 때는 폴더). */
+  vmId?: string;
 }) {
   const { t } = useTranslation();
+  const perms = usePermissions();
+  const canDedicate = perms.has("vm.dedicated", {
+    type: "object",
+    kind: "vm",
+    id: vmId,
+    folder: values.folder || null,
+  });
   // 클러스터 기준이 있으면(auto·pinned) 새 VM의 기본 모델은 `cluster`다(설계 §13). 사용자가 고르면 그대로 둔다.
   // 서버는 기준이 있을 때만 `current`를 준다(끔·업그레이드 중에는 없다 — 리뷰 1 웹 #1).
   const chose = useRef(false);
@@ -253,6 +265,16 @@ export function GeneralSection({
           arches={[archOf(values.machine)]}
           signed
           onChange={(cpuFlags) => onChange({ cpuFlags })}
+        />
+        <NumaSection
+          sockets={values.sockets}
+          value={values.numa}
+          onChange={(numa) => onChange({ numa })}
+          onSockets={(sockets) => onChange({ sockets })}
+          errors={errors}
+          canDedicate={canDedicate}
+          spec={toSpec(values, "stopped")}
+          running={!creating && locked}
         />
         {creating && (
           <FolderField value={values.folder} onChange={(folder) => onChange({ folder })} />

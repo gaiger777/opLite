@@ -1057,6 +1057,7 @@
     "nodeDropped": "{{node}} cannot take this VM now. Choose another node.",
     "chooseNode": "Choose a node",
     "cpuCannot": "{{node}} (cannot run the VM's CPU)",
+    "numaCannot": "{{node}} (cannot place the VM's CPUs or memory)",
     "cpuWarning": "The target node lacks CPU features the guest may be using:"
   },
   "forms": {
@@ -3287,7 +3288,8 @@
       "vcpus": "vCPUs",
       "memory_mib": "Memory",
       "disk_bytes": "Disk",
-      "vms": "VMs"
+      "vms": "VMs",
+      "dedicated_vcpus": "Dedicated vCPUs"
     },
     "usedOf": "{{used}} of {{limit}}",
     "noLimit": "No limit",
@@ -3536,6 +3538,175 @@
       "affectedLink": "Show them",
       "affectedDelay": "The list fills in within a few seconds as each node checks its VMs.",
       "reload": "Discard my changes and reload"
+    }
+  },
+  "numa": {
+    "needsPrivilege": "Dedicated CPUs and hugepages need the vm.dedicated privilege.",
+    "form": {
+      "title": "CPU placement and NUMA",
+      "powerCycle": "Changes here apply at the next power cycle by Orbivisor, not on a reboot inside the guest.",
+      "sockets": "Sockets",
+      "socketsHint": "A guest NUMA node holds whole sockets: to split the VM into several NUMA nodes, give it several sockets.",
+      "room": "Room for this VM's dedicated CPUs and hugepages on: {{nodes}}",
+      "noRoom": "No node has free dedicated CPUs or hugepages for this VM right now."
+    },
+    "policy": {
+      "label": "CPU policy",
+      "shared": "Shared",
+      "dedicated": "Dedicated",
+      "hint": "Dedicated gives each vCPU slot (up to the maximum vCPUs) its own physical CPU from the node's dedicated CPUs."
+    },
+    "threads": {
+      "label": "SMT threads",
+      "prefer": "Prefer siblings",
+      "isolate": "Isolate cores",
+      "require": "Require sibling pairs",
+      "hint": {
+        "prefer": "Fill sibling threads of a core first.",
+        "isolate": "One vCPU per core; the sibling threads stay empty and count as used.",
+        "require": "vCPUs run in pairs on sibling threads (SMT hosts only)."
+      }
+    },
+    "emulator": {
+      "label": "Emulator threads",
+      "shared": "On shared CPUs",
+      "isolate": "Own dedicated CPU",
+      "hint": "QEMU's own threads run on the node's shared CPUs, or on one more dedicated CPU."
+    },
+    "nodes": {
+      "label": "Guest NUMA nodes",
+      "off": "None",
+      "auto": "Automatic",
+      "list": "Per node…",
+      "hint": "Automatic splits the VM only when it is larger than a host NUMA node.",
+      "oneSocket": "With one socket the guest has one NUMA node. Add sockets to split it.",
+      "implicitAuto": "Dedicated CPUs and hugepages always use automatic NUMA."
+    },
+    "memory": {
+      "label": "Host memory binding",
+      "default": "Default",
+      "strict": "Strict",
+      "preferred": "Preferred",
+      "hint": "Bind each guest node's memory to its host NUMA node. Dedicated and hugepages VMs are strict by default."
+    },
+    "hugepages": {
+      "label": "Hugepages",
+      "none": "None",
+      "2M": "2 MiB",
+      "1G": "1 GiB",
+      "any": "Any (largest first)",
+      "hint": "Back guest memory with the node's reserved hugepages."
+    },
+    "list": {
+      "title": "Guest NUMA nodes",
+      "node": "Guest node {{n}}",
+      "cpus": "Node {{n}} vCPU slots",
+      "memory": "Node {{n}} memory (MiB)",
+      "add": "Add node",
+      "remove": "Remove node {{n}}"
+    },
+    "errors": {
+      "count": "Choose a node count that divides the number of sockets (1–8).",
+      "listCount": "Give 1 to 8 guest nodes.",
+      "listCpus": "A multiple of the vCPU slots per socket.",
+      "listMemory": "Enter memory in MiB.",
+      "listCpusSum": "The vCPU slots must add up to the maximum vCPUs.",
+      "listMemorySum": "The node memory must add up to the VM's memory.",
+      "requireOdd": "Sibling pairs need an even number of vCPU slots per socket.",
+      "hugepagesHotplug": "1 GiB hugepages cannot be used with memory hotplug."
+    },
+    "summary": {
+      "none": "Shared, no NUMA",
+      "auto": "automatic NUMA",
+      "nodes_one": "{{count}} NUMA node",
+      "nodes_other": "{{count}} NUMA nodes",
+      "running_one": "{{count}} node ({{nodes}})",
+      "running_other": "{{count}} nodes ({{nodes}})",
+      "node": "{{cpus}} vCPU slots, {{memory}} MiB",
+      "hugepages": "hugepages {{size}}"
+    },
+    "vm": {
+      "title": "CPU placement",
+      "wanted": "Settings",
+      "running": "Running layout",
+      "hostNodes": "Host NUMA nodes",
+      "emulator": "Emulator CPUs",
+      "sharedCpus": "Shared CPUs",
+      "siblings": "Held sibling threads",
+      "pinning": "vCPU pinning",
+      "slot": "vCPU slot",
+      "guestNode": "Guest node",
+      "hostNode": "Host node",
+      "pcpu": "Host CPU",
+      "pinningNote": "Slots above the running vCPU count keep their CPU for hotplug."
+    },
+    "node": {
+      "title": "NUMA topology",
+      "none": "This node has not reported a NUMA topology. Only Linux nodes do, once every node knows NUMA.",
+      "summary": "{{sockets}} sockets · {{nodes}} NUMA nodes · {{cpus}} CPUs · {{threads}} threads per core",
+      "pinning": "vCPU pinning available",
+      "noPinning": "no vCPU pinning",
+      "cpuset": "cgroup cpuset",
+      "affinity": "orbivisord does not run on the reserved CPUs yet.",
+      "hostNodes": "Host NUMA nodes",
+      "hostNode": "Node",
+      "cpus": "CPUs",
+      "memory": "Memory",
+      "free": "{{free}} free",
+      "dedicated": "Dedicated CPUs",
+      "hugepages": "Hugepages",
+      "usedOf": "{{used}} of {{total}} used",
+      "pages": "{{size}}: {{used}} of {{total}} used",
+      "pagesLive": "({{free}} free, {{other}} other)",
+      "distances": "Distances"
+    },
+    "sets": {
+      "reserved": "Reserved CPUs",
+      "dedicated": "Dedicated CPUs",
+      "shared": "Shared CPUs"
+    },
+    "grid": {
+      "legend": "CPU legend",
+      "node": "Host node {{id}}",
+      "reserved": "Reserved",
+      "shared": "Shared",
+      "free": "Dedicated, free",
+      "used": "Dedicated, in use",
+      "cpu": "CPU {{cpu}}: {{role}}",
+      "cpuVm": "CPU {{cpu}}: {{role}} by {{vm}}"
+    },
+    "columns": {
+      "dedicated": "Dedicated CPUs",
+      "hugepages": "Hugepages",
+      "pages": "{{size}}: {{used}} of {{total}}"
+    },
+    "resources": {
+      "open": "Host resources",
+      "title": "Host resources of {{name}}",
+      "description": "Split the node's CPUs and reserve hugepages. CPUs that are neither reserved nor dedicated are shared. Clear everything to remove the settings.",
+      "reservedHint": "For the host and Orbivisor. No VM threads run here.",
+      "dedicatedHint": "Only vCPUs of dedicated VMs run here.",
+      "pick": "Click CPUs to add them to:",
+      "hugepages": "Hugepage reservations",
+      "hugepagesHint": "Orbivisor writes these counts at runtime. 1 GiB pages are best reserved on the kernel command line.",
+      "reserve": "Reservation {{n}}",
+      "size": "Size",
+      "count": "Pages",
+      "hostNode": "Host node",
+      "anyNode": "Any",
+      "addReserve": "Add reservation",
+      "removeReserve": "Remove reservation {{n}}",
+      "force": "Save anyway",
+      "forceHint": "Saving anyway keeps the running VMs where they are; they move to the new CPUs at their next power cycle.",
+      "saved": "Saved the host resources of {{name}}.",
+      "errors": {
+        "cpuList": "Use a CPU list such as 0-3,8.",
+        "offline": "Only online CPUs of this node.",
+        "overlap": "Reserved and dedicated CPUs overlap.",
+        "noShared": "Leave at least one CPU shared.",
+        "count": "Enter a number of pages.",
+        "duplicate": "This size and host node is already reserved."
+      }
     }
   }
 }

@@ -13,6 +13,7 @@ import {
   volumeNames,
   type ConnectionForm,
 } from "@/imports/imports";
+import { emptyNuma } from "@/numa/numa";
 import { esxiImport, vmImport } from "@/test/fixtures";
 
 const NONE = { vms: [], volumes: [] };
@@ -66,6 +67,8 @@ it("fills the form from the proposal", () => {
     // CPU는 서버 기본(host)이다. 클러스터 기준이 있으면 화면이 cluster를 미리 고른다.
     cpuModel: "host",
     cpuFlags: [],
+    // CPU 배치는 공유·vNUMA 없음(계획 64 — 보내지 않는다)
+    numa: emptyNuma(),
   });
 });
 

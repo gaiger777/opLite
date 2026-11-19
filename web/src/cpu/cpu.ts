@@ -166,9 +166,12 @@ export function pinnedName(models: readonly CpuModelEntry[], name: string): stri
   return models.find((m) => m.name === name)?.alias_of ?? name;
 }
 
-/** 보류 `cpu`(다음 전원 껐다 켜기 때 CPU가 바뀜). 없으면 undefined */
+/**
+ * 보류 `cpu`(다음 전원 껐다 켜기 때 CPU가 바뀜)나 `numa`(CPU 배치·NUMA가 바뀜, 계획 64) — 둘 다 전원 껐다 켜기로만
+ * 적용된다. 없으면 undefined
+ */
 export function cpuPending(vm: Vm): PendingChange | undefined {
-  return (vm.status.hardware?.pending ?? []).find((c) => c.field === "cpu");
+  return (vm.status.hardware?.pending ?? []).find((c) => c.field === "cpu" || c.field === "numa");
 }
 
 /** 해석된 CPU를 한 줄로: `Icelake-Server-v7 -avx512vbmi +pcid`(서버의 `describe`와 같은 모양) */

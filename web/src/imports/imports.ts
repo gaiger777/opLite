@@ -1,5 +1,6 @@
 import type { components } from "@/api/schema";
 import type { ImportRun, VmImport } from "@/api/types";
+import { emptyNuma, numaOverride, type NumaValues } from "@/numa/numa";
 import { MIN_MEMORY_MIB, validName } from "@/vms/form";
 
 type Schemas = components["schemas"];
@@ -130,6 +131,8 @@ export interface RunForm {
   /** CPU 모델(`host`면 보내지 않는다 — 서버 기본)과 플래그 */
   cpuModel: string;
   cpuFlags: string[];
+  /** CPU 배치와 NUMA(계획 64). 기본(공유·vNUMA 없음)이면 보내지 않는다. */
+  numa: NumaValues;
 }
 
 /** 제안으로 채운 실행 폼. VM 이름은 가져오기 이름, 풀은 고르게 비워 둔다. */
@@ -148,6 +151,7 @@ export function runForm(imp: VmImport): RunForm {
     keepMacs: true,
     cpuModel: "host",
     cpuFlags: [],
+    numa: emptyNuma(),
   };
 }
 
@@ -211,5 +215,6 @@ export function toRun(form: RunForm): ImportRun {
     keep_macs: form.keepMacs,
     ...(form.cpuModel !== "host" && { cpu_model: form.cpuModel }),
     ...(form.cpuFlags.length > 0 && { cpu_flags: form.cpuFlags }),
+    ...numaOverride(form.numa, emptyNuma(), false),
   };
 }

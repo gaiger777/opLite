@@ -158,7 +158,9 @@ export function parseLimit(text: string, scale: number): number | null | undefin
   return Math.round(n * scale);
 }
 
-/** 할당량: vCPU·메모리(GiB)·디스크(GiB)·VM 수. 빈 칸은 상한이 없다. 모두 비우면 할당량을 지운다. */
+/**
+ * 할당량: vCPU·메모리(GiB)·디스크(GiB)·VM 수·전용 vCPU(계획 64). 빈 칸은 상한이 없다. 모두 비우면 할당량을 지운다.
+ */
 export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): void }) {
   const { t } = useTranslation();
   const q = folder.spec.quota ?? {};
@@ -167,6 +169,7 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
     memory: q.memory_mib !== undefined ? String(q.memory_mib / 1024) : "",
     disk: q.disk_bytes !== undefined ? String(q.disk_bytes / GIB) : "",
     vms: q.vms?.toString() ?? "",
+    dedicated: q.dedicated_vcpus?.toString() ?? "",
   });
   const [errors, setErrors] = useState<Record<string, string>>({});
 
@@ -176,6 +179,7 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
       memory_mib: parseLimit(values.memory, 1024),
       disk_bytes: parseLimit(values.disk, GIB),
       vms: parseLimit(values.vms, 1),
+      dedicated_vcpus: parseLimit(values.dedicated, 1),
     };
     const found: Record<string, string> = {};
     for (const [key, field] of [
@@ -183,10 +187,11 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
       ["memory_mib", "memory"],
       ["disk_bytes", "disk"],
       ["vms", "vms"],
+      ["dedicated_vcpus", "dedicated"],
     ] as const) {
       if (parsed[key] === undefined) {
         found[field] =
-          field === "vcpus" || field === "vms" ? "folders.badCount" : "folders.badLimit";
+          field === "memory" || field === "disk" ? "folders.badLimit" : "folders.badCount";
       }
     }
     setErrors(found);
@@ -210,7 +215,7 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
       {(a11y) => (
         <Input
           id={`quota-${id}`}
-          inputMode={id === "vcpus" || id === "vms" ? "numeric" : "decimal"}
+          inputMode={id === "memory" || id === "disk" ? "decimal" : "numeric"}
           autoComplete="off"
           value={values[id]}
           onChange={(e) => setValues({ ...values, [id]: e.target.value })}
@@ -232,6 +237,7 @@ export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): vo
       {field("memory", t("folders.memoryGib"))}
       {field("disk", t("folders.diskGib"))}
       {field("vms", t("folders.dim.vms"))}
+      {field("dedicated", t("folders.dim.dedicated_vcpus"))}
     </FormDialog>
   );
 }

@@ -318,3 +318,14 @@
 - **실제 VM 시험(`opld/tests/numa.rs`)은 CLI로 바꾸고 시험 고리(`numa_hook.rs`, `/v1/test/vm-spec`·`host-resources`)를 지웠다.** `install_media.rs`에 게스트 vNUMA 단계(`--sockets 2 --numa 2`, 게스트의 `/sys/devices/system/node/node*/cpulist`·`MemTotal`)를 더했다(GitHub `install-media`).
 - **스테이지 4 GitHub 탐침의 실패 고침**: x86 러너의 QEMU `task` 목록에 커널 일꾼 `kvm-nx-lpage-recovery`(vhost_task, `PF_USER_WORKER`)가 보이고 그 친화는 커널이 정한다(vCPU 친화를 따라감). 드라이버 `pin_threads`(켤 때·받을 때·검사 루프의 `repin`)는 `/proc/<pid>/task/<tid>/stat`의 플래그(`PF_USER_WORKER 0x4000`·`PF_KTHREAD 0x200000`·`PF_NO_SETAFFINITY 0x4000000`)가 있는 vCPU 아닌 스레드를 건너뛴다(`affinity::is_kernel_worker`) — 상한은 스코프 `AllowedCPUs`가 쥐고, 검사 루프가 30초마다 커널과 다투지 않는다. `vhost-*` 일꾼도 같다. 시험도 같은 플래그로 그 스레드를 뺀다.
 - `schema.d.ts`를 다시 만들었다.
+
+### 스테이지 6 (웹)
+
+- **VM 폼 › 일반의 접힌 "CPU 배치와 NUMA"에 소켓 수를 더했다**: 웹 폼에는 소켓 입력이 없어(`sockets`는 스펙 값을 그대로 돌려보냄) vNUMA 노드를 둘 이상 고를 길이 없었다. 고르기(1·2·3·4·6·8·12·16, 지금 값이 밖이면 그것도)로 두고 노드 수는 소켓 수의 약수(8까지)만 보인다. 소켓이 하나면 "소켓을 늘리세요", 노드 없음 + 전용·hugepages면 "늘 자동 NUMA"라고 말한다. 직접 나누기(노드마다 vCPU 자리·MiB)는 VM 폼에만 두었다.
+- **권한**: 전용 정책·hugepages는 `vm.dedicated`가 없으면 새로 고를 수 없고(지금 값이면 그대로 둠) 까닭을 보인다. 만들 때는 고른 폴더, 고칠 때는 그 VM에서 본다. 복제·배포·가져오기는 어딘가에 권한이 있으면 고르게 하고 폴더는 서버가 본다(403). `permissions.ts`의 목록에 `vm.dedicated`(operator 밖)를 더해 설정 › 역할에도 보인다.
+- **"들어갈 노드"는 어림**: `/topology/usage`로 전용 CPU 남은 수(vCPU 자리 + 에뮬레이터 `isolate` 1, `isolate` 형제는 노드의 SMT를 몰라 빼고)와 그 크기 풀의 남은 MiB만 견준다. 호스트 노드 나눔은 서버가 켤 때 본다.
+- **VM 상세 › 요약의 "CPU 배치"는 VM 기록(`status.hardware.numa`·`host_placement`)을 바로 쓴다**(`/vms/{key}/numa`를 묻지 않음 — VM을 읽을 수 있으면 기록도 보인다). 보류 `numa`는 계획 63의 전원 껐다 켜기 띠와 VM 목록의 "CPU 변경 보류" 배지·거름을 함께 쓴다(`cpuPending`이 `numa`도 본다).
+- **마이그레이션 대화상자**: 계획 64 칸을 쓰거나 기록에 `numa`가 있는 VM만 `/vms/{key}/numa`를 묻고, 맞지 않는 노드는 "(VM의 CPU·메모리를 둘 수 없음)"으로 막고 고른 노드면 까닭을 보인다.
+- **노드 격자에 소켓 층은 없다**: 토폴로지에 CPU마다 소켓 번호가 없어 호스트 노드 › L3 › 코어(형제) › 스레드로 그린다. 호스트 자원 설정의 처음 값은 노드 스펙의 `host_resources`이고, 409 `host_cpus_in_use`·`hugepages_in_use`면 `details`(VM·모자란 것)를 보이고 단추가 "그래도 저장"(`?force=true`)이 되며 `orbivisor-warning`은 알림으로 보인다. 모두 비우면 `{}`로 지운다.
+- **노드 목록 열 둘**은 우선순위 3(1280px 미만에서 숨김), 폴더 할당량 "전용 vCPU"는 쓰거나 상한이 있을 때만 막대를 보인다.
+- 복제·배포·가져오기의 접힌 칸(`NumaChoice`)은 바꾼 칸만 보낸다. 스레드·에뮬레이터를 기본으로 되돌리면 `prefer`·`shared`를 보내고(덮어쓰기에 지움이 없다), 가져오기는 `no_numa`·`no_hugepages`를 쓰지 않는다.

@@ -383,6 +383,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                   autoMachine={creating && !machineChosen}
                   onMachineChosen={() => setMachineChosen(true)}
                   noReplica={noReplica}
+                  vmId={vm?.id}
                 />
               </StepSection>
               <StepSection step="disks">

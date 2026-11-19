@@ -69,6 +69,7 @@ import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 import { VmSnapshots } from "@/vms/VmSnapshots";
+import { VmPlacement } from "@/numa/VmPlacement";
 
 /** 머리의 단추로 두는 전원 동작. 나머지 전원 동작은 케밥에 있다. */
 const PRIMARY: readonly VmAction[] = ["start", "stop"];
@@ -146,6 +147,7 @@ export function VmDetailPage() {
         </TabsList>
         <TabsContent value="summary">
           <Summary vm={vm} />
+          <VmPlacement vm={vm} />
           <Replication vm={vm} />
           <VmSecurity vm={vm} />
           <VmGuestCard vm={vm} />
@@ -975,7 +977,7 @@ function PendingChanges({ vm }: { vm: Vm }) {
     return null;
   }
   const retry = failedChanges(vm).length > 0 && can("vm.config") && vm.status.phase === "running";
-  // 보류 `cpu`는 Orbivisor의 다시 시작(전원 껐다 켜기)으로만 적용된다(게스트 안 재부팅은 아님, 계획 63).
+  // 보류 `cpu`·`numa`는 Orbivisor의 다시 시작(전원 껐다 켜기)으로만 적용된다(게스트 안 재부팅은 아님, 계획 63·64).
   const cpu = cpuPending(vm);
 
   async function applyAgain() {

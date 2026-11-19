@@ -1057,6 +1057,7 @@
     "nodeDropped": "{{node}}은(는) 지금 이 VM을 받을 수 없습니다. 다른 노드를 고르세요.",
     "chooseNode": "노드 고르기",
     "cpuCannot": "{{node}}(VM의 CPU를 켤 수 없음)",
+    "numaCannot": "{{node}}(VM의 CPU·메모리를 둘 수 없음)",
     "cpuWarning": "대상 노드에는 게스트가 쓰고 있을 수 있는 CPU 기능이 없습니다:"
   },
   "forms": {
@@ -3287,7 +3288,8 @@
       "vcpus": "vCPU",
       "memory_mib": "메모리",
       "disk_bytes": "디스크",
-      "vms": "VM 수"
+      "vms": "VM 수",
+      "dedicated_vcpus": "전용 vCPU"
     },
     "usedOf": "{{limit}} 중 {{used}}",
     "noLimit": "상한 없음",
@@ -3536,6 +3538,175 @@
       "affectedLink": "목록 보기",
       "affectedDelay": "각 노드가 자기 VM을 확인하므로 몇 초 안에 목록이 채워집니다.",
       "reload": "내 변경을 버리고 다시 읽기"
+    }
+  },
+  "numa": {
+    "needsPrivilege": "전용 CPU와 hugepages는 vm.dedicated 권한이 있어야 합니다.",
+    "form": {
+      "title": "CPU 배치와 NUMA",
+      "powerCycle": "여기서 바꾼 것은 Orbivisor가 전원을 껐다 켤 때 적용됩니다. 게스트 안 재부팅으로는 적용되지 않습니다.",
+      "sockets": "소켓",
+      "socketsHint": "게스트 NUMA 노드는 소켓 단위입니다. VM을 여러 NUMA 노드로 나누려면 소켓을 여럿 주세요.",
+      "room": "이 VM의 전용 CPU·hugepages가 들어갈 노드: {{nodes}}",
+      "noRoom": "지금은 이 VM에 줄 전용 CPU나 hugepages가 남은 노드가 없습니다."
+    },
+    "policy": {
+      "label": "CPU 정책",
+      "shared": "공유",
+      "dedicated": "전용",
+      "hint": "전용은 vCPU 자리(최대 vCPU까지)마다 노드의 전용 CPU 가운데 물리 CPU 하나를 줍니다."
+    },
+    "threads": {
+      "label": "SMT 스레드",
+      "prefer": "형제 먼저",
+      "isolate": "코어 독점",
+      "require": "형제 짝 필수",
+      "hint": {
+        "prefer": "코어의 형제 스레드를 먼저 채웁니다.",
+        "isolate": "코어마다 vCPU 하나. 형제 스레드는 비워 두고 쓴 것으로 셉니다.",
+        "require": "vCPU를 형제 스레드 짝으로 둡니다(SMT 호스트만)."
+      }
+    },
+    "emulator": {
+      "label": "에뮬레이터 스레드",
+      "shared": "공유 CPU에서",
+      "isolate": "전용 CPU 하나 더",
+      "hint": "QEMU 자신의 스레드를 노드의 공유 CPU나 전용 CPU 하나에 둡니다."
+    },
+    "nodes": {
+      "label": "게스트 NUMA 노드",
+      "off": "없음",
+      "auto": "자동",
+      "list": "노드마다 직접…",
+      "hint": "자동은 VM이 호스트 NUMA 노드보다 클 때만 나눕니다.",
+      "oneSocket": "소켓이 하나면 게스트 NUMA 노드도 하나입니다. 나누려면 소켓을 늘리세요.",
+      "implicitAuto": "전용 CPU와 hugepages는 늘 자동 NUMA를 씁니다."
+    },
+    "memory": {
+      "label": "호스트 메모리 묶기",
+      "default": "기본",
+      "strict": "엄격",
+      "preferred": "선호",
+      "hint": "게스트 노드의 메모리를 그 호스트 NUMA 노드에 묶습니다. 전용·hugepages VM은 기본이 엄격입니다."
+    },
+    "hugepages": {
+      "label": "Hugepages",
+      "none": "없음",
+      "2M": "2 MiB",
+      "1G": "1 GiB",
+      "any": "아무것(큰 것부터)",
+      "hint": "게스트 메모리를 노드가 예약한 hugepages로 씁니다."
+    },
+    "list": {
+      "title": "게스트 NUMA 노드",
+      "node": "게스트 노드 {{n}}",
+      "cpus": "노드 {{n}} vCPU 자리",
+      "memory": "노드 {{n}} 메모리(MiB)",
+      "add": "노드 더하기",
+      "remove": "노드 {{n}} 빼기"
+    },
+    "errors": {
+      "count": "소켓 수를 나누는 노드 수(1~8)를 고르세요.",
+      "listCount": "게스트 노드를 1~8개 주세요.",
+      "listCpus": "소켓당 vCPU 자리 수의 배수여야 합니다.",
+      "listMemory": "메모리를 MiB로 넣으세요.",
+      "listCpusSum": "vCPU 자리 합이 최대 vCPU와 같아야 합니다.",
+      "listMemorySum": "노드 메모리 합이 VM 메모리와 같아야 합니다.",
+      "requireOdd": "형제 짝은 소켓당 vCPU 자리 수가 짝수여야 합니다.",
+      "hugepagesHotplug": "1 GiB hugepages는 메모리 핫플러그와 함께 쓸 수 없습니다."
+    },
+    "summary": {
+      "none": "공유, NUMA 없음",
+      "auto": "자동 NUMA",
+      "nodes_one": "NUMA 노드 {{count}}개",
+      "nodes_other": "NUMA 노드 {{count}}개",
+      "running_one": "노드 {{count}}개({{nodes}})",
+      "running_other": "노드 {{count}}개({{nodes}})",
+      "node": "vCPU 자리 {{cpus}}, {{memory}} MiB",
+      "hugepages": "hugepages {{size}}"
+    },
+    "vm": {
+      "title": "CPU 배치",
+      "wanted": "설정",
+      "running": "켤 때 모양",
+      "hostNodes": "호스트 NUMA 노드",
+      "emulator": "에뮬레이터 CPU",
+      "sharedCpus": "공유 CPU",
+      "siblings": "비워 둔 형제 스레드",
+      "pinning": "vCPU 고정",
+      "slot": "vCPU 자리",
+      "guestNode": "게스트 노드",
+      "hostNode": "호스트 노드",
+      "pcpu": "호스트 CPU",
+      "pinningNote": "지금 켜진 vCPU 수보다 뒤의 자리도 핫플러그를 위해 CPU를 잡아 둡니다."
+    },
+    "node": {
+      "title": "NUMA 토폴로지",
+      "none": "이 노드는 NUMA 토폴로지를 알리지 않았습니다. Linux 노드만, 모든 노드가 NUMA를 알게 된 뒤 알립니다.",
+      "summary": "소켓 {{sockets}} · NUMA 노드 {{nodes}} · CPU {{cpus}} · 코어당 스레드 {{threads}}",
+      "pinning": "vCPU 고정 가능",
+      "noPinning": "vCPU 고정 불가",
+      "cpuset": "cgroup cpuset",
+      "affinity": "orbivisord가 아직 예약 CPU에서 돌지 않습니다.",
+      "hostNodes": "호스트 NUMA 노드",
+      "hostNode": "노드",
+      "cpus": "CPU",
+      "memory": "메모리",
+      "free": "{{free}} 빔",
+      "dedicated": "전용 CPU",
+      "hugepages": "Hugepages",
+      "usedOf": "{{total}} 중 {{used}} 사용",
+      "pages": "{{size}}: {{total}} 중 {{used}} 사용",
+      "pagesLive": "(빈 것 {{free}}, 다른 쓰임 {{other}})",
+      "distances": "거리"
+    },
+    "sets": {
+      "reserved": "예약 CPU",
+      "dedicated": "전용 CPU",
+      "shared": "공유 CPU"
+    },
+    "grid": {
+      "legend": "CPU 범례",
+      "node": "호스트 노드 {{id}}",
+      "reserved": "예약",
+      "shared": "공유",
+      "free": "전용, 빔",
+      "used": "전용, 사용 중",
+      "cpu": "CPU {{cpu}}: {{role}}",
+      "cpuVm": "CPU {{cpu}}: {{role}}({{vm}})"
+    },
+    "columns": {
+      "dedicated": "전용 CPU",
+      "hugepages": "Hugepages",
+      "pages": "{{size}}: {{total}} 중 {{used}}"
+    },
+    "resources": {
+      "open": "호스트 자원 설정",
+      "title": "{{name}} 호스트 자원 설정",
+      "description": "노드의 CPU를 나누고 hugepages를 예약합니다. 예약도 전용도 아닌 CPU는 공유입니다. 모두 비우면 설정을 지웁니다.",
+      "reservedHint": "호스트와 Orbivisor용. VM 스레드는 두지 않습니다.",
+      "dedicatedHint": "전용 VM의 vCPU만 돕니다.",
+      "pick": "CPU를 눌러 더할 곳:",
+      "hugepages": "Hugepages 예약",
+      "hugepagesHint": "Orbivisor가 실행 중에 이 수를 씁니다. 1 GiB 페이지는 커널 명령줄로 예약하는 것이 좋습니다.",
+      "reserve": "예약 {{n}}",
+      "size": "크기",
+      "count": "페이지 수",
+      "hostNode": "호스트 노드",
+      "anyNode": "아무 노드",
+      "addReserve": "예약 더하기",
+      "removeReserve": "예약 {{n}} 빼기",
+      "force": "그래도 저장",
+      "forceHint": "그래도 저장하면 도는 VM은 지금 CPU에 그대로 두고, 다음 전원 껐다 켜기 때 새 CPU로 옮깁니다.",
+      "saved": "{{name}}의 호스트 자원 설정을 저장했습니다.",
+      "errors": {
+        "cpuList": "0-3,8처럼 CPU 목록을 쓰세요.",
+        "offline": "이 노드의 온라인 CPU만 쓸 수 있습니다.",
+        "overlap": "예약 CPU와 전용 CPU가 겹칩니다.",
+        "noShared": "공유 CPU를 하나 이상 남기세요.",
+        "count": "페이지 수를 넣으세요.",
+        "duplicate": "이 크기와 호스트 노드는 이미 예약했습니다."
+      }
     }
   }
 }

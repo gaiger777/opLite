@@ -6,7 +6,7 @@ import { api, call } from "@/api/client";
 import type { FolderUsageView } from "@/api/types";
 import { formatBytes, formatMib } from "@/lib/format";
 
-export const DIMENSIONS = ["vcpus", "memory_mib", "disk_bytes", "vms"] as const;
+export const DIMENSIONS = ["vcpus", "memory_mib", "disk_bytes", "vms", "dedicated_vcpus"] as const;
 export type Dimension = (typeof DIMENSIONS)[number];
 
 export function formatDimension(dim: Dimension, value: number): string {
@@ -34,16 +34,23 @@ export interface Bar {
  * 경로를 보인다(설계 §9 "부모가 묶음"). 상한이 없는 차원은 이 폴더의 사용량만이다.
  */
 export function usageBars(view: FolderUsageView): Bar[] {
-  return DIMENSIONS.map((dim) => {
+  // 전용 vCPU(계획 64)는 쓰거나 상한이 있을 때만 막대가 있다(지금 화면 그대로).
+  const dims = DIMENSIONS.filter(
+    (dim) =>
+      dim !== "dedicated_vcpus" ||
+      (view.usage.dedicated_vcpus ?? 0) > 0 ||
+      view.limits.some((l) => l.quota.dedicated_vcpus != null),
+  );
+  return dims.map((dim) => {
     const binder = view.binding[dim];
     const limit = binder ? view.limits.find((l) => l.folder === binder) : undefined;
     const max = limit?.quota[dim];
     if (!limit || max === undefined || max === null) {
-      return { dim, used: view.usage[dim] };
+      return { dim, used: view.usage[dim] ?? 0 };
     }
     return {
       dim,
-      used: limit.usage[dim],
+      used: limit.usage[dim] ?? 0,
       limit: max,
       boundBy: limit.folder === view.folder ? undefined : limit.path,
     };

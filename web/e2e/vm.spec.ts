@@ -298,6 +298,19 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await expect(off).toBeVisible();
   await expect(page.getByText("Last scheduled snapshot failed:")).toHaveCount(0);
 
+  // 계획 64: 꺼진 VM을 소켓 둘·게스트 NUMA 노드 둘로 바꿔 저장하면 요약의 "CPU 배치"가 그것을 보인다.
+  await vmMenu(page, "web", "Edit");
+  await expect(page.getByRole("heading", { name: "Edit web" })).toBeVisible();
+  // 접힌 칸의 요약 줄(제목 뒤에 지금 값이 붙는다)
+  await page.locator("summary", { hasText: "CPU placement and NUMA" }).click();
+  await page.getByLabel("Sockets", { exact: true }).selectOption("2");
+  await page.getByLabel("Guest NUMA nodes", { exact: true }).selectOption("count:2");
+  await page.getByRole("button", { name: "Save" }).click();
+  await expect(page.getByRole("heading", { name: "web" })).toBeVisible();
+  await expect(
+    page.getByRole("region", { name: "CPU placement" }).getByText("2 NUMA nodes", { exact: true }),
+  ).toBeVisible();
+
   // 스냅샷이 있는 VM은 스냅샷도 지우겠다고 골라야 지울 수 있다.
   await vmMenu(page, "web", "Delete");
   confirm = page.getByRole("alertdialog");
@@ -337,6 +350,11 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   const cpu = page.getByRole("region", { name: "CPU models" });
   await expect(cpu.getByText("QEMU", { exact: true })).toBeVisible();
   await expect(cpu.getByRole("button", { name: "Re-read CPU models" })).toBeEnabled();
+  // 계획 64: 노드 상세의 NUMA 토폴로지(Linux 노드는 탐침 결과, macOS는 없다고 말한다)
+  const topology = page.getByRole("region", { name: "NUMA topology" });
+  await expect(
+    topology.getByText(/NUMA nodes ·|has not reported a NUMA topology/).first(),
+  ).toBeVisible();
   await page.goto("/settings");
   await expect(page.getByLabel("Cluster CPU baseline")).toHaveValue("off");
 

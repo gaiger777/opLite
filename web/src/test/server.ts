@@ -13,7 +13,8 @@ export function apiUrl(path: string) {
  * 화면이 읽으므로 기본으로 없다. 게스트 정보도 VM 요약이 읽으므로 기본으로 에이전트가 없다. 대시보드 위젯이 읽는
  * 클러스터 지표 모으기와 활성 경보도 기본으로 비어 있다. 내 권한(`/permissions/mine`)은 기본으로 없어(404)
  * 화면이 전역 역할로 본다. 폴더 목록도 기본으로 비어 있다. CPU 질의(계획 63)는 VM 폼·상세·노드·클러스터·설정 화면이
- * 읽으므로 기본으로 `host`·`max`만 있고 기준·카탈로그가 없는 클러스터다.
+ * 읽으므로 기본으로 `host`·`max`만 있고 기준·카탈로그가 없는 클러스터다. NUMA 질의(계획 64)도 노드 화면이 읽으므로 기본으로
+ * 토폴로지를 알린 노드가 없다.
  */
 export const server = setupServer(
   http.get(apiUrl("/permissions/mine"), () =>
@@ -63,6 +64,14 @@ export const server = setupServer(
       resolved: { model: "host", source: "spec" },
       nodes: [],
     }),
+  ),
+  // NUMA(계획 64): 토폴로지를 알린 노드가 없는 클러스터(macOS·옛 노드와 같은 모양). 노드 화면·VM 폼이 읽는다.
+  http.get(apiUrl("/topology/usage"), () => HttpResponse.json({ nodes: [] })),
+  http.get(apiUrl("/nodes/:key/topology"), ({ params }) =>
+    HttpResponse.json({ node: String(params.key), host_nodes: [], vms: [], warnings: [] }),
+  ),
+  http.get(apiUrl("/vms/:key/numa"), () =>
+    HttpResponse.json({ spec: { policy: "shared" }, wanted: "none", nodes: [] }),
   ),
   http.get(apiUrl("/metrics/cluster"), () =>
     HttpResponse.json({

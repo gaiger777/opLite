@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/table";
 import { useCpuModels } from "@/cpu/cpu";
 import { CpuChoice } from "@/cpu/CpuChoice";
+import { NumaChoice } from "@/numa/NumaSection";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import {
   runForm,
@@ -461,6 +462,14 @@ function RunSection({
                   choseCpu.current = true;
                   set({ cpuModel: model, cpuFlags: flags });
                 }}
+              />
+            </div>
+            <div className="sm:col-span-2">
+              <NumaChoice
+                id="run-numa"
+                sockets={Number(form.sockets) || 1}
+                value={form.numa}
+                onChange={(numa) => set({ numa })}
               />
             </div>
           </CardContent>

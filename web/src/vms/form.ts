@@ -1,5 +1,6 @@
 import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
+import { emptyNuma, numaErrors, numaFrom, numaSpec, type NumaValues } from "@/numa/numa";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
 import { effectiveBoot, MAX_BOOT_ORDER } from "@/vms/boot";
 import {
@@ -103,6 +104,8 @@ export interface VmFormValues {
   maxVcpus: string;
   /** 실행 중 늘릴 수 있는 메모리 상한(MiB, `max_memory_mib`). 비면 없음 */
   maxMemory: string;
+  /** CPU 배치와 NUMA(계획 64): 정책·스레드·에뮬레이터·vNUMA·hugepages */
+  numa: NumaValues;
   firmware: Schemas["Firmware"];
   /** 빈 문자열이면 서버가 클러스터 아키텍처의 기본값을 고른다(노드 목록을 못 읽는 폴더 사용자, 계획 62). */
   machine: Schemas["MachineType"] | "";
@@ -188,6 +191,7 @@ export function emptyForm(machine: VmFormValues["machine"], folder = ""): VmForm
     memory: "2048",
     maxVcpus: "",
     maxMemory: "",
+    numa: emptyNuma(),
     firmware: "uefi",
     machine,
     folder,
@@ -219,6 +223,7 @@ export function fromVm(vm: Vm): VmFormValues {
     memory: String(s.memory_mib),
     maxVcpus: s.cpu.max_vcpus == null ? "" : String(s.cpu.max_vcpus),
     maxMemory: s.max_memory_mib == null ? "" : String(s.max_memory_mib),
+    numa: numaFrom(s),
     firmware: s.firmware ?? "uefi",
     machine: s.machine,
     folder: s.folder ?? "",
@@ -370,6 +375,7 @@ export function validate(
     errors.memory = "vmForm.errors.memory";
   }
   Object.assign(errors, maxErrors(v));
+  Object.assign(errors, numaErrors(v.numa, v));
   // 서버의 `TpmNeedsUefi`·`SecureBootNeedsUefi`
   if (v.firmware !== "uefi" && v.tpm) {
     errors.tpm = "vmForm.errors.needsUefi";
@@ -574,6 +580,8 @@ function maxErrors(v: VmFormValues): Record<string, string> {
 
 /** 폼 값을 VM spec으로. `power`는 만들 때만 정하고, 고칠 때는 지금 값을 그대로 둔다. */
 export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
+  // 기본(공유·vNUMA 없음·보통 페이지)이면 빈 칸이다(옛 클러스터는 이 필드를 모른다).
+  const numa = numaSpec(v.numa);
   // `machine`을 빼면 서버가 채운다(스키마는 늘 있는 값으로 적는다).
   return {
     cpu: {
@@ -584,9 +592,12 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
       ...(v.cpuFlags.length > 0 && { flags: v.cpuFlags }),
       // 상한이 없으면 보내지 않는다(옛 클러스터는 이 필드를 모른다).
       ...(v.maxVcpus !== "" && { max_vcpus: Number(v.maxVcpus) }),
+      ...numa.cpu,
     },
     memory_mib: Number(v.memory),
     ...(v.maxMemory !== "" && { max_memory_mib: Number(v.maxMemory) }),
+    ...(numa.numa && { numa: numa.numa }),
+    ...(numa.hugepages && { hugepages: numa.hugepages }),
     firmware: v.firmware,
     // 비면 보내지 않는다(서버가 고른다).
     ...(v.machine !== "" && { machine: v.machine }),

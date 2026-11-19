@@ -32,6 +32,8 @@ export const PRIVILEGES = [
   "vm.snapshot",
   "vm.migrate",
   "vm.clone",
+  // 전용 CPU·hugepages(계획 64). 드문 노드 자원이라 내장 operator에는 없다.
+  "vm.dedicated",
   "backup.create",
   "backup.restore",
   "backup.delete",

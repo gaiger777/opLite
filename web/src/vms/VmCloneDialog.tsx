@@ -12,6 +12,8 @@ import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { archOf } from "@/cpu/cpu";
 import { CpuChoice, type CpuPick, cpuOverride } from "@/cpu/CpuChoice";
+import { numaFrom, numaOverride, type NumaValues } from "@/numa/numa";
+import { NumaChoice } from "@/numa/NumaSection";
 import { choosablePoolsOn } from "@/storage/pools";
 import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
@@ -82,6 +84,9 @@ export function VmCloneDialog({
     flags: sourceSpec.cpu.flags ?? [],
   };
   const [cpu, setCpu] = useState<CpuPick | null>(null);
+  // CPU 배치와 NUMA(계획 64): 고치지 않았으면 null — 원본 그대로
+  const sourceNuma = numaFrom(sourceSpec);
+  const [numa, setNuma] = useState<NumaValues | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 놓인 노드가 없을 때만 접속한 노드(whoami)가 필요하다.
   const serving = useOptionalPrincipal()?.node?.id;
@@ -115,6 +120,7 @@ export function VmCloneDialog({
             snapshot: source === CURRENT ? null : source,
             pool: pool === "" ? null : pool,
             ...cpuOverride(cpu, sourceCpu),
+            ...numaOverride(numa, sourceNuma),
           },
         }),
       );
@@ -206,6 +212,12 @@ export function VmCloneDialog({
         value={cpu ?? sourceCpu}
         onChange={setCpu}
         collapsed
+      />
+      <NumaChoice
+        id="clone-numa"
+        sockets={sourceSpec.cpu.sockets ?? 1}
+        value={numa ?? sourceNuma}
+        onChange={setNuma}
       />
     </FormDialog>
   );
