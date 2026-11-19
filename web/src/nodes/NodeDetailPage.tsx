@@ -8,6 +8,7 @@ import { NODE_CHARTS, useNodeHistory } from "@/charts/metrics";
 import { RangePicker } from "@/charts/RangePicker";
 import { useTimeRange } from "@/charts/useTimeRange";
 import { ListPending } from "@/components/ListPending";
+import { NodeCpuSection } from "@/cpu/NodeCpuSection";
 import { TableMessage } from "@/components/TableMessage";
 import {
   Table,
@@ -22,7 +23,7 @@ import { NodeHeader } from "@/nodes/NodeHeader";
 import { vcpus } from "@/vms/VmListPage";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
-/** 노드 상세(`/nodes/:name`): 머리, 지표 차트 넷(범위 고르기), 그 노드의 VM */
+/** 노드 상세(`/nodes/:name`): 머리, 지표 차트 넷(범위 고르기), CPU(계획 63), 그 노드의 VM */
 export function NodeDetailPage() {
   const { t } = useTranslation();
   const { name = "" } = useParams();
@@ -46,6 +47,7 @@ export function NodeDetailPage() {
     <div className="flex flex-col gap-6">
       <NodeHeader node={node} vms={vms.data ? vmsOn(node, vms.data).length : undefined} />
       <NodeMetrics node={node} />
+      <NodeCpuSection node={node} />
       <NodeVms node={node} />
     </div>
   );

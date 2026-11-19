@@ -96,6 +96,8 @@ export interface VmFormValues {
   sockets: number;
   cores: string;
   model: Schemas["CpuModel"];
+  /** CPU 플래그(`-avx512vbmi` 숨기기, `+aes` 켜기, 계획 63) */
+  cpuFlags: string[];
   memory: string;
   /** 실행 중 늘릴 수 있는 vCPU 상한(`cpu.max_vcpus`). 비면 없음 */
   maxVcpus: string;
@@ -182,6 +184,7 @@ export function emptyForm(machine: VmFormValues["machine"], folder = ""): VmForm
     sockets: 1,
     cores: "2",
     model: "host",
+    cpuFlags: [],
     memory: "2048",
     maxVcpus: "",
     maxMemory: "",
@@ -212,6 +215,7 @@ export function fromVm(vm: Vm): VmFormValues {
     sockets: s.cpu.sockets ?? 1,
     cores: String(s.cpu.cores),
     model: s.cpu.model ?? "host",
+    cpuFlags: s.cpu.flags ?? [],
     memory: String(s.memory_mib),
     maxVcpus: s.cpu.max_vcpus == null ? "" : String(s.cpu.max_vcpus),
     maxMemory: s.max_memory_mib == null ? "" : String(s.max_memory_mib),
@@ -576,6 +580,8 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
       sockets: v.sockets,
       cores: Number(v.cores),
       model: v.model,
+      // 플래그가 없으면 보내지 않는다(옛 클러스터는 이 필드를 모른다).
+      ...(v.cpuFlags.length > 0 && { flags: v.cpuFlags }),
       // 상한이 없으면 보내지 않는다(옛 클러스터는 이 필드를 모른다).
       ...(v.maxVcpus !== "" && { max_vcpus: Number(v.maxVcpus) }),
     },

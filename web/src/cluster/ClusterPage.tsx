@@ -9,6 +9,7 @@ import { useList } from "@/api/live";
 import type { components } from "@/api/schema";
 import { usePermissions } from "@/auth/usePermissions";
 import { CopyButton } from "@/components/CopyButton";
+import { ClusterCpuSection } from "@/cpu/ClusterCpuSection";
 import { Field } from "@/components/Field";
 import { focusBack } from "@/components/focusBack";
 import { FormDialog } from "@/components/FormDialog";
@@ -154,6 +155,7 @@ export function ClusterPage() {
         </Table>
         <p className="text-sm text-muted-foreground">{t("cluster.membersNote")}</p>
       </section>
+      <ClusterCpuSection />
       {issuing && (
         <IssueDialog
           returnFocus={opener}

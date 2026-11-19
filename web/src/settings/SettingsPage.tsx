@@ -7,6 +7,7 @@ import { useSettings, useSubscription } from "@/api/live";
 import type { Channel } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
+import { CpuSettingsSection } from "@/cpu/CpuSettingsSection";
 import { ListPending } from "@/components/ListPending";
 import { PageHeader } from "@/components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -19,7 +20,7 @@ import { TelemetrySection } from "@/settings/TelemetrySection";
 
 const CHANNELS: Channel[] = ["stable", "testing", "enterprise"];
 
-/** 설정 › 일반: 업데이트·종료·HA·텔레메트리·Prometheus. 누구나 읽고 admin만 바꾼다. 구독은 따로 탭이다. */
+/** 설정 › 일반: 업데이트·종료·HA·CPU·텔레메트리·Prometheus. 누구나 읽고 admin만 바꾼다. 구독은 따로 탭이다. */
 export function SettingsPage() {
   const { t } = useTranslation();
   const perms = usePermissions();
@@ -103,6 +104,7 @@ export function SettingsPage() {
       </form>
       <ShutdownSection write={write} />
       <HaSection write={write} />
+      <CpuSettingsSection write={write} />
       <TelemetrySection write={write} />
       <PrometheusSection write={write} />
     </div>

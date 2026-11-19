@@ -120,7 +120,14 @@
     "role_in_use": "Permissions use this role. Remove them first: {{message}}",
     "no_second_factor": "Set up an authenticator app or a passkey first.",
     "proof_required": "Confirm it is you first: enter a code from a factor you already have, a recovery code, or your password.",
-    "already_enrolled": "Two-factor sign-in is already set up for this account. Sign in again."
+    "already_enrolled": "Two-factor sign-in is already set up for this account. Sign in again.",
+    "unknown_cpu_model": "Unknown CPU model: {{message}}",
+    "unknown_cpu_flag": "Unknown CPU flag: {{message}}",
+    "cpu_model_arch": "The CPU model is for another architecture: {{message}}",
+    "cpu_model_ambiguous": "Choose a versioned CPU model: {{message}}",
+    "cpu_flag_masked": "The flag is hidden cluster-wide: {{message}}",
+    "invalid_cpu_flags": "Invalid CPU flags: {{message}}",
+    "cpu_baseline_unsupported": "Some nodes cannot run the pinned CPU model: {{message}}"
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -302,7 +309,9 @@
       "volume-download": "Download volume {{target}}",
       "vm-untemplate": "Convert {{target}} back to a VM",
       "volume-flatten": "Flatten volume {{target}}",
-      "vm-firmware-reset": "Reset the firmware of {{target}}"
+      "vm-firmware-reset": "Reset the firmware of {{target}}",
+      "cpu-baseline": "CPU baseline for {{arch}}: {{previous}} → {{current}}",
+      "node-cpu-probe": "Re-read CPU models on {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -316,7 +325,10 @@
       "template": "Creating the template VM"
     },
     "detail": {
-      "vms": "VMs: {{vms}}."
+      "vms": "VMs: {{vms}}.",
+      "limitedBy": "Limited by {{nodes}}.",
+      "runningVms_one": "{{count}} running VM changes at its next power cycle.",
+      "runningVms_other": "{{count}} running VMs change at their next power cycle."
     },
     "cephStage": {
       "checking": "Checking the node",
@@ -477,11 +489,11 @@
     "hotplugPorts": "{{used}}/{{ports}} hotplug ports used",
     "hotplugOff": "Not available (started without it)",
     "hotAdded": "Added while running",
-    "pendingTitle": "Applies at the next restart",
+    "pendingTitle": "Applies at the next power cycle",
     "pendingNote": "These changes could not be applied while the VM runs. Rebooting inside the guest does not apply them; reboot or stop and start the VM.",
     "pendingValue": "{{running}} → {{wanted}}",
     "pendingReason": {
-      "restart": "set only when the VM starts",
+      "restart": "set only when the VM is powered on",
       "unsupported": "not supported on this node",
       "limit": "outside the range set when the VM started",
       "failed": "failed"
@@ -630,7 +642,7 @@
     "stopTitle": "Stop {{name}}?",
     "stopDescription": "The guest OS is asked to shut down.",
     "rebootTitle": "Reboot {{name}}?",
-    "rebootDescription": "The guest OS is asked to restart.",
+    "rebootDescription": "The guest OS is shut down and the VM is started again (a power cycle). Pending changes apply; a reboot inside the guest would not apply them.",
     "view": {
       "running": "Running",
       "failed": "Failed",
@@ -672,7 +684,8 @@
         "target": "Cannot run on this node (offline, in maintenance or another architecture).",
         "gone": "Deleted",
         "denied": "You do not have permission for this VM."
-      }
+      },
+      "rebootNote": "Each VM is shut down and started again (a power cycle). Pending CPU changes apply."
     },
     "startAgain": "Turn on again",
     "powerButton": {
@@ -1041,7 +1054,9 @@
     "forceHint": "Moves the VM even if it breaks hard placement rules or a restricted HA group. Node checks and memory still apply. The audit log records the broken rules.",
     "replicaNote": "This node holds a replica, so only what changed since the last replication is copied.",
     "nodeDropped": "{{node}} cannot take this VM now. Choose another node.",
-    "chooseNode": "Choose a node"
+    "chooseNode": "Choose a node",
+    "cpuCannot": "{{node}} (cannot run the VM's CPU)",
+    "cpuWarning": "The target node lacks CPU features the guest may be using:"
   },
   "forms": {
     "name": "Use 1–63 lowercase letters, digits and -, not starting or ending with -."
@@ -3404,5 +3419,112 @@
     "policyRealms": "Realms",
     "rpId": "Passkey domain (RP ID)",
     "rpIdHint": "Optional. Empty: the host name the browser uses."
+  },
+  "cpu": {
+    "none": "none",
+    "running": "Running as {{cpu}}",
+    "kind": {
+      "basic": "Basic",
+      "cluster": "Cluster baseline",
+      "level": "Compatibility level",
+      "qemu": "QEMU models (versioned)"
+    },
+    "mode": {
+      "off": "Off",
+      "auto": "Automatic",
+      "pinned": "Pinned"
+    },
+    "source": {
+      "auto": "automatic",
+      "pinned": "pinned"
+    },
+    "model": {
+      "search": "Search CPU models",
+      "choose": "Choose a model",
+      "usable": "runs on {{usable}}/{{total}} nodes",
+      "deprecated": "deprecated",
+      "clusterNow": "The cluster baseline is now {{model}}. The VM uses the baseline at each power cycle.",
+      "clusterOff": "No cluster baseline is set, so the VM runs like host.",
+      "missing": "{{node}} cannot run it (missing {{flags}})",
+      "cannot": "{{node}} cannot run it: {{reason}}"
+    },
+    "flags": {
+      "label": "CPU flags",
+      "hint": "Type a flag and press Enter to hide it from the guest (for example avx512vbmi). Click a flag to switch between hidden (−) and on (+).",
+      "liveHint": "CPU model and flag changes apply at the next power cycle (Reboot, or Stop and Start). A reboot inside the guest does not apply them.",
+      "hide": "Hide",
+      "show": "Turn on",
+      "hideOne": "Hide {{name}} instead",
+      "showOne": "Turn {{name}} on instead",
+      "remove": "Remove {{name}}",
+      "unknown": "unknown",
+      "masked": "hidden cluster-wide"
+    },
+    "errors": {
+      "flagName": "Use a CPU flag name such as avx512vbmi.",
+      "unknownFlag": "No node's QEMU knows this flag.",
+      "duplicateFlag": "This flag is already in the list.",
+      "tooManyFlags": "Use at most 64 flags."
+    },
+    "pending": {
+      "badge": "CPU change pending",
+      "filter": "CPU change",
+      "view": "CPU change pending",
+      "required": "Power cycle required: the CPU changes when the VM is powered off and on by Orbivisor. A reboot inside the guest or a live migration does not apply it.",
+      "now": "Power cycle now"
+    },
+    "node": {
+      "title": "CPU models",
+      "refresh": "Re-read CPU models",
+      "refreshing": "Reading… (about 10 s)",
+      "refreshFailed": "Could not re-read CPU models: {{error}}",
+      "qemu": "QEMU",
+      "accel": "Accelerator",
+      "vendor": "Vendor",
+      "modelId": "Host CPU",
+      "probedAt": "Read at",
+      "counts": "Models",
+      "countsValue": "{{usable}} of {{models}} usable · {{flags}} flags",
+      "none": "This node has not reported its CPU models yet (or the cluster is upgrading). Only the host and max models can run here.",
+      "error": "The last read failed: {{error}}",
+      "baselineProblem": "This node does not take cluster-baseline VMs: {{problem}}",
+      "model": "Model",
+      "missing": "Missing",
+      "usable": "Usable",
+      "unusable": "Not usable"
+    },
+    "cluster": {
+      "title": "CPU baseline",
+      "mode": "Baseline: {{mode}}. Change it in Settings › General.",
+      "mask": "Hidden from every VM: {{flags}}",
+      "noBaseline": "No baseline. VMs with the cluster model run like host.",
+      "since": "Since {{time}}",
+      "previous": "before: {{cpu}}",
+      "counts": "Nodes: {{nodes}} · VMs using the baseline: {{vms}}",
+      "limitedBy": "Limited by: {{nodes}}",
+      "matrix": "Models by node ({{count}})"
+    },
+    "settings": {
+      "title": "CPU",
+      "mode": "Cluster CPU baseline",
+      "modeHint": {
+        "off": "VMs with the cluster model run like host.",
+        "auto": "The leader picks the best CPU model every node can run. A weaker node lowers it; running VMs keep their CPU until a power cycle.",
+        "pinned": "You choose the model per architecture. Nodes that cannot run it do not take cluster-model VMs."
+      },
+      "now": "Now on {{arch}}: {{cpu}}",
+      "pinnedModel": "Model",
+      "pinnedFlags": "Flags",
+      "autoFlags": "Add common flags",
+      "autoFlagsHint": "Also turn on flags every node supports beyond the chosen model.",
+      "mask": "Hide from every VM",
+      "maskHint": "These flags are hidden from all VMs, including host VMs, at their next power cycle. Use this to hide a CPU feature because of a vulnerability.",
+      "save": "Save CPU settings",
+      "unsupported": "Some nodes cannot run the pinned model: {{nodes}}",
+      "force": "Pin anyway",
+      "affected_one": "{{count}} running VM keeps its CPU until it is power cycled.",
+      "affected_other": "{{count}} running VMs keep their CPU until they are power cycled.",
+      "affectedLink": "Show them"
+    }
   }
 }

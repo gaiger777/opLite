@@ -70,7 +70,7 @@ it("shows TPM and Secure Boot changes that wait for a restart", async () => {
   renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/win" });
   expect(await screen.findByText("TPM 2.0: off → on at the next restart")).toBeInTheDocument();
   // 요약 아래의 다음 재시작 목록도 이름을 붙인다.
-  expect(screen.getByRole("list", { name: "Applies at the next restart" })).toHaveTextContent(
+  expect(screen.getByRole("list", { name: "Applies at the next power cycle" })).toHaveTextContent(
     "TPM 2.0",
   );
 });

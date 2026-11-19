@@ -13,6 +13,7 @@ import { ListPending } from "@/components/ListPending";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { useVmCpu } from "@/cpu/cpu";
 import { formatBytes } from "@/lib/format";
 import { isShared, poolsUsableOn } from "@/storage/pools";
 import { trackTask } from "@/tasks/tasks";
@@ -90,9 +91,17 @@ export function VmMigrateDialog({
     chosen !== null && nodes.data !== undefined && !targets.some((n) => n.id === chosen)
       ? (nodes.data.find((n) => n.id === chosen)?.name ?? chosen)
       : undefined;
-  // 고르지 않았으면 첫 후보
+  // VM의 CPU를 받을 수 있는지(계획 63 `GET /vms/{key}/cpu`): 못 받는 노드는 고를 수 없고 까닭을 보인다. 읽지 못하면
+  // 서버가 409로 알린다.
+  const cpu = useVmCpu(vm.id);
+  const fitOf = (n: Node) => cpu.data?.nodes.find((f) => f.node === n.name);
+  const cpuOk = (n: Node) => fitOf(n)?.can_run !== false;
+  // 고르지 않았으면 CPU를 받을 수 있는 첫 후보
   const target =
-    dropped !== undefined ? undefined : (targets.find((n) => n.id === chosen) ?? targets[0]);
+    dropped !== undefined
+      ? undefined
+      : (targets.find((n) => n.id === chosen) ?? targets.find(cpuOk) ?? targets[0]);
+  const fit = target && fitOf(target);
   // 대화상자를 연 사이 VM이 멈추거나 옮기기 시작했을 수 있다.
   const able = availability(vm, "migrate", vmTasks);
   // 복사할 디스크와 스냅샷을 알 때까지 보내지 않는다.
@@ -140,7 +149,14 @@ export function VmMigrateDialog({
       title={t("migrate.title", { name: vm.name })}
       description={t("migrate.description")}
       submitLabel={t("migrate.submit")}
-      submitDisabled={!able.ok || !target || !loaded || snapshotted || missingPool !== undefined}
+      submitDisabled={
+        !able.ok ||
+        !target ||
+        !loaded ||
+        snapshotted ||
+        missingPool !== undefined ||
+        fit?.can_run === false
+      }
       returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
@@ -174,13 +190,32 @@ export function VmMigrateDialog({
               </NativeSelectOption>
             )}
             {targets.map((n) => (
-              <NativeSelectOption key={n.id} value={n.id}>
-                {n.name}
+              <NativeSelectOption key={n.id} value={n.id} disabled={!cpuOk(n)}>
+                {cpuOk(n) ? n.name : t("migrate.cpuCannot", { node: n.name })}
               </NativeSelectOption>
             ))}
           </NativeSelect>
         )}
       </Field>
+      {fit?.can_run === false && (
+        <p role="alert" className="text-sm text-destructive">
+          {fit.reason ?? t("migrate.cpuCannot", { node: fit.node })}
+        </p>
+      )}
+      {/* `host`·`max` VM: 대상에 없는 플래그를 게스트가 쓰고 있을 수 있다(막지 않는다, 설계 §10). */}
+      {(fit?.warnings ?? []).length > 0 && (
+        <div
+          role="status"
+          className="rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
+        >
+          <p className="font-medium">{t("migrate.cpuWarning")}</p>
+          <ul className="list-disc pl-5">
+            {(fit?.warnings ?? []).map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
       {disks.length > 0 && (
         <>
           <div className="flex flex-col gap-1 text-sm">

@@ -120,7 +120,14 @@
     "role_in_use": "권한이 쓰는 역할입니다. 먼저 그 권한을 빼세요: {{message}}",
     "no_second_factor": "먼저 인증 앱이나 패스키를 설정하세요.",
     "proof_required": "먼저 본인임을 확인하세요: 이미 있는 요소의 코드, 복구 코드 또는 비밀번호를 넣으세요.",
-    "already_enrolled": "이 계정에는 이미 2단계 인증이 등록되어 있습니다. 다시 로그인하세요."
+    "already_enrolled": "이 계정에는 이미 2단계 인증이 등록되어 있습니다. 다시 로그인하세요.",
+    "unknown_cpu_model": "모르는 CPU 모델입니다: {{message}}",
+    "unknown_cpu_flag": "모르는 CPU 플래그입니다: {{message}}",
+    "cpu_model_arch": "다른 아키텍처의 CPU 모델입니다: {{message}}",
+    "cpu_model_ambiguous": "버전이 있는 CPU 모델을 고르세요: {{message}}",
+    "cpu_flag_masked": "클러스터 전체에서 숨긴 플래그입니다: {{message}}",
+    "invalid_cpu_flags": "CPU 플래그가 잘못되었습니다: {{message}}",
+    "cpu_baseline_unsupported": "고정 CPU 모델을 켤 수 없는 노드가 있습니다: {{message}}"
   },
   "nav": {
     "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",
@@ -302,7 +309,9 @@
       "volume-download": "볼륨 {{target}} 받기",
       "vm-untemplate": "{{target}}을(를) VM으로 되돌리기",
       "volume-flatten": "볼륨 {{target}} 평탄화",
-      "vm-firmware-reset": "{{target}} 펌웨어 초기화"
+      "vm-firmware-reset": "{{target}} 펌웨어 초기화",
+      "cpu-baseline": "{{arch}} CPU 기준: {{previous}} → {{current}}",
+      "node-cpu-probe": "{{target}}의 CPU 모델 다시 읽기"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -316,7 +325,10 @@
       "template": "템플릿 VM 만드는 중"
     },
     "detail": {
-      "vms": "VM: {{vms}}."
+      "vms": "VM: {{vms}}.",
+      "limitedBy": "기준을 낮춘 노드: {{nodes}}.",
+      "runningVms_one": "실행 중 VM {{count}}개가 다음 전원 껐다 켜기 때 바뀝니다.",
+      "runningVms_other": "실행 중 VM {{count}}개가 다음 전원 껐다 켜기 때 바뀝니다."
     },
     "cephStage": {
       "checking": "노드 확인",
@@ -477,11 +489,11 @@
     "hotplugPorts": "핫플러그 포트 {{used}}/{{ports}} 사용",
     "hotplugOff": "없음(핫플러그 없이 켬)",
     "hotAdded": "실행 중 붙임",
-    "pendingTitle": "다음 재시작 때 적용",
+    "pendingTitle": "다음 전원 껐다 켜기 때 적용",
     "pendingNote": "실행 중에 적용하지 못한 변경입니다. 게스트 안에서 재부팅하면 적용되지 않습니다. VM을 재시작하거나 끄고 켜세요.",
     "pendingValue": "{{running}} → {{wanted}}",
     "pendingReason": {
-      "restart": "켤 때만 정해짐",
+      "restart": "전원을 켤 때만 정해짐",
       "unsupported": "이 노드가 지원하지 않음",
       "limit": "켤 때 정한 범위 밖",
       "failed": "실패"
@@ -630,7 +642,7 @@
     "stopTitle": "{{name}}을(를) 정지할까요?",
     "stopDescription": "게스트 OS에 종료를 요청합니다.",
     "rebootTitle": "{{name}}을(를) 재시작할까요?",
-    "rebootDescription": "게스트 OS에 재시작을 요청합니다.",
+    "rebootDescription": "게스트 OS를 끄고 VM을 다시 켭니다(전원 껐다 켜기). 보류 중인 변경이 적용됩니다. 게스트 안 재부팅으로는 적용되지 않습니다.",
     "view": {
       "running": "실행 중",
       "failed": "실패",
@@ -672,7 +684,8 @@
         "target": "이 노드에서 돌 수 없습니다(꺼짐, 유지보수 또는 다른 아키텍처).",
         "gone": "지워짐",
         "denied": "이 VM에 대한 권한이 없습니다."
-      }
+      },
+      "rebootNote": "VM마다 끄고 다시 켭니다(전원 껐다 켜기). 보류 중인 CPU 변경이 적용됩니다."
     },
     "startAgain": "다시 켜기",
     "powerButton": {
@@ -1041,7 +1054,9 @@
     "forceHint": "반드시 배치 규칙이나 그룹 노드만 쓰는 HA 그룹을 어겨도 옮깁니다. 노드 조건과 메모리는 그대로 봅니다. 어긴 규칙은 감사 로그에 남습니다.",
     "replicaNote": "이 노드에는 복제본이 있어 마지막 복제 뒤 바뀐 것만 복사합니다.",
     "nodeDropped": "{{node}}은(는) 지금 이 VM을 받을 수 없습니다. 다른 노드를 고르세요.",
-    "chooseNode": "노드 고르기"
+    "chooseNode": "노드 고르기",
+    "cpuCannot": "{{node}}(VM의 CPU를 켤 수 없음)",
+    "cpuWarning": "대상 노드에는 게스트가 쓰고 있을 수 있는 CPU 기능이 없습니다:"
   },
   "forms": {
     "name": "소문자·숫자·-로 1–63자, -로 시작하거나 끝날 수 없습니다."
@@ -3404,5 +3419,112 @@
     "policyRealms": "영역",
     "rpId": "패스키 도메인(RP ID)",
     "rpIdHint": "선택. 비우면 브라우저가 쓰는 호스트 이름입니다."
+  },
+  "cpu": {
+    "none": "없음",
+    "running": "지금 {{cpu}}(으)로 실행 중",
+    "kind": {
+      "basic": "기본",
+      "cluster": "클러스터 기준",
+      "level": "호환 수준",
+      "qemu": "QEMU 모델(버전)"
+    },
+    "mode": {
+      "off": "끔",
+      "auto": "자동",
+      "pinned": "고정"
+    },
+    "source": {
+      "auto": "자동",
+      "pinned": "고정"
+    },
+    "model": {
+      "search": "CPU 모델 찾기",
+      "choose": "모델을 고르세요",
+      "usable": "노드 {{usable}}/{{total}}에서 켤 수 있음",
+      "deprecated": "곧 없어짐",
+      "clusterNow": "지금 클러스터 기준은 {{model}}입니다. VM은 전원을 껐다 켤 때마다 그때의 기준을 씁니다.",
+      "clusterOff": "클러스터 기준이 없어 host처럼 켭니다.",
+      "missing": "{{node}}에서 켤 수 없음(빠진 것: {{flags}})",
+      "cannot": "{{node}}에서 켤 수 없음: {{reason}}"
+    },
+    "flags": {
+      "label": "CPU 플래그",
+      "hint": "플래그를 입력하고 Enter를 누르면 게스트에게 숨깁니다(예: avx512vbmi). 플래그를 누르면 숨기기(−)와 켜기(+)가 바뀝니다.",
+      "liveHint": "CPU 모델과 플래그는 다음 전원 껐다 켜기(재시작, 또는 정지 후 시작) 때 적용됩니다. 게스트 안 재부팅으로는 적용되지 않습니다.",
+      "hide": "숨기기",
+      "show": "켜기",
+      "hideOne": "{{name}} 숨기기로 바꾸기",
+      "showOne": "{{name}} 켜기로 바꾸기",
+      "remove": "{{name}} 빼기",
+      "unknown": "모름",
+      "masked": "클러스터 전체에서 숨김"
+    },
+    "errors": {
+      "flagName": "avx512vbmi 같은 CPU 플래그 이름을 쓰세요.",
+      "unknownFlag": "이 플래그를 아는 노드 QEMU가 없습니다.",
+      "duplicateFlag": "이미 목록에 있는 플래그입니다.",
+      "tooManyFlags": "플래그는 64개까지입니다."
+    },
+    "pending": {
+      "badge": "CPU 변경 대기",
+      "filter": "CPU 변경",
+      "view": "CPU 변경 대기",
+      "required": "전원 껐다 켜기 필요: Orbivisor가 VM을 껐다 켤 때 CPU가 바뀝니다. 게스트 안 재부팅이나 라이브 마이그레이션으로는 적용되지 않습니다.",
+      "now": "지금 전원 껐다 켜기"
+    },
+    "node": {
+      "title": "CPU 모델",
+      "refresh": "CPU 모델 다시 읽기",
+      "refreshing": "읽는 중…(10초쯤)",
+      "refreshFailed": "CPU 모델을 다시 읽지 못했습니다: {{error}}",
+      "qemu": "QEMU",
+      "accel": "가속기",
+      "vendor": "벤더",
+      "modelId": "호스트 CPU",
+      "probedAt": "읽은 시각",
+      "counts": "모델",
+      "countsValue": "{{models}}개 중 {{usable}}개 사용 가능 · 플래그 {{flags}}개",
+      "none": "이 노드가 아직 CPU 모델을 알리지 않았습니다(또는 클러스터 업그레이드 중). 여기서는 host와 max 모델만 켤 수 있습니다.",
+      "error": "마지막 읽기가 실패했습니다: {{error}}",
+      "baselineProblem": "이 노드는 클러스터 기준 VM을 받지 않습니다: {{problem}}",
+      "model": "모델",
+      "missing": "빠진 것",
+      "usable": "사용 가능",
+      "unusable": "사용 불가"
+    },
+    "cluster": {
+      "title": "CPU 기준",
+      "mode": "기준: {{mode}}. 설정 › 일반에서 바꿉니다.",
+      "mask": "모든 VM에서 숨김: {{flags}}",
+      "noBaseline": "기준이 없습니다. cluster 모델 VM은 host처럼 켭니다.",
+      "since": "{{time}}부터",
+      "previous": "이전: {{cpu}}",
+      "counts": "노드: {{nodes}} · 기준을 쓰는 VM: {{vms}}",
+      "limitedBy": "기준을 낮춘 노드: {{nodes}}",
+      "matrix": "노드별 모델({{count}})"
+    },
+    "settings": {
+      "title": "CPU",
+      "mode": "클러스터 CPU 기준",
+      "modeHint": {
+        "off": "cluster 모델 VM은 host처럼 켭니다.",
+        "auto": "리더가 모든 노드가 켤 수 있는 가장 좋은 CPU 모델을 고릅니다. 약한 노드가 들어오면 낮아지고, 실행 중 VM은 전원을 껐다 켤 때까지 그대로입니다.",
+        "pinned": "아키텍처마다 모델을 직접 고릅니다. 켤 수 없는 노드는 cluster 모델 VM을 받지 않습니다."
+      },
+      "now": "지금 {{arch}}: {{cpu}}",
+      "pinnedModel": "모델",
+      "pinnedFlags": "플래그",
+      "autoFlags": "공통 플래그 더하기",
+      "autoFlagsHint": "고른 모델 밖에 모든 노드가 지원하는 플래그도 켭니다.",
+      "mask": "모든 VM에서 숨기기",
+      "maskHint": "이 플래그는 다음 전원 껐다 켜기부터 host VM을 포함한 모든 VM에게 숨겨집니다. 취약점 때문에 CPU 기능을 숨길 때 씁니다.",
+      "save": "CPU 설정 저장",
+      "unsupported": "고정 모델을 켤 수 없는 노드가 있습니다: {{nodes}}",
+      "force": "그래도 고정",
+      "affected_one": "실행 중 VM {{count}}개는 전원을 껐다 켤 때까지 지금 CPU 그대로입니다.",
+      "affected_other": "실행 중 VM {{count}}개는 전원을 껐다 켤 때까지 지금 CPU 그대로입니다.",
+      "affectedLink": "목록 보기"
+    }
   }
 }

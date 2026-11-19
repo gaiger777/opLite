@@ -128,6 +128,10 @@ export function describeTask(
   const pool = op.kind === "ceph-pool-create" ? op.pool : undefined;
   const name = op.kind === "ceph-pool-create" ? op.name : undefined;
   const size = op.kind === "ceph-pool-create" ? op.size : undefined;
+  // 클러스터 CPU 기준 기록(계획 63): 아키텍처와 앞·새 모델(없으면 "없음")
+  const arch = op.kind === "cpu-baseline" ? op.arch : undefined;
+  const previous = op.kind === "cpu-baseline" ? (op.previous ?? t("cpu.none")) : undefined;
+  const current = op.kind === "cpu-baseline" ? (op.current ?? t("cpu.none")) : undefined;
   // 모르는 작업(새 서버)은 번역 키 대신 종류를 그대로 보여 준다.
   return t(`tasks.op.${op.kind}`, {
     target,
@@ -141,12 +145,15 @@ export function describeTask(
     pool,
     name,
     size,
+    arch,
+    previous,
+    current,
     defaultValue: `${op.kind} ${target}`,
   });
 }
 
 /**
- * 기록 Task가 남긴 설명(실행하지 않는 Task라 오류 칸에는 실패만 있다): HA 검사 대응의 설명과 옮긴 VM, 본딩
+ * 기록 Task가 남긴 설명(실행하지 않는 Task라 오류 칸에는 실패만 있다): HA 검사 대응의 설명과 옮긴 VM, CPU 기준 기록의 제한한 노드·영향 VM 수, 본딩
  * 포트의 상태. 없거나 오류와 같으면 null이다.
  */
 export function describeDetail(task: Task, t: TFunction): string | null {
@@ -159,6 +166,14 @@ export function describeDetail(task: Task, t: TFunction): string | null {
   }
   if (op.kind === "bond-degraded") {
     return op.ports.join(", ") || null;
+  }
+  if (op.kind === "cpu-baseline") {
+    const limited = op.limited_by ?? [];
+    const parts = [
+      limited.length > 0 ? t("tasks.detail.limitedBy", { nodes: limited.join(", ") }) : "",
+      op.running_vms ? t("tasks.detail.runningVms", { count: op.running_vms }) : "",
+    ];
+    return parts.filter(Boolean).join(" ") || null;
   }
   return null;
 }

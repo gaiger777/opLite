@@ -31,6 +31,7 @@ import {
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
+import { cpuPending, describeResolved, describeSpec } from "@/cpu/cpu";
 import { choosableIsos } from "@/isos/isos";
 import { formatBytes, formatMib, formatTime, uuidTime } from "@/lib/format";
 import { describeProgress, trackTask } from "@/tasks/tasks";
@@ -488,8 +489,14 @@ function Summary({ vm }: { vm: Vm }) {
         {t("vms.cpuValue", {
           sockets: cpu.sockets ?? 1,
           cores: cpu.cores,
-          model: cpu.model ?? "host",
+          model: describeSpec(cpu),
         })}
+        {/* 켤 때 실제로 쓴 CPU(기준·숨김 목록을 적용한 것, 계획 63) */}
+        {hw?.cpu_resolved && (
+          <span className="block text-xs text-muted-foreground">
+            {t("cpu.running", { cpu: describeResolved(hw.cpu_resolved) })}
+          </span>
+        )}
       </Field>
       <Field label={t("vms.vcpus")}>{withMax(vcpus, String)}</Field>
       <Field label={t("vms.memory")}>{withMax(memory, formatMib)}</Field>
@@ -960,11 +967,14 @@ function HotAdded({ vm, kind, index }: { vm: Vm; kind: "disk" | "nic"; index: nu
 function PendingChanges({ vm }: { vm: Vm }) {
   const { t } = useTranslation();
   const can = useVmCan(vm);
+  const host = useVmActionHost();
   const pending = vm.status.hardware?.pending ?? [];
   if (pending.length === 0) {
     return null;
   }
   const retry = failedChanges(vm).length > 0 && can("vm.config") && vm.status.phase === "running";
+  // 보류 `cpu`는 Orbivisor의 다시 시작(전원 껐다 켜기)으로만 적용된다(게스트 안 재부팅은 아님, 계획 63).
+  const cpu = cpuPending(vm);
 
   async function applyAgain() {
     try {
@@ -1004,6 +1014,16 @@ function PendingChanges({ vm }: { vm: Vm }) {
           </li>
         ))}
       </ul>
+      {cpu && (
+        <div className="flex flex-wrap items-center gap-2 rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm">
+          <span>{t("cpu.pending.required")}</span>
+          {can("vm.power") && (
+            <Button variant="outline" size="sm" onClick={() => host.open({ vm, which: "reboot" })}>
+              {t("cpu.pending.now")}
+            </Button>
+          )}
+        </div>
+      )}
       {retry && (
         <div>
           <Button variant="outline" size="sm" onClick={() => void applyAgain()}>

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useList } from "@/api/live";
@@ -9,6 +10,9 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Switch } from "@/components/ui/switch";
+import { archOf, useCpuModels } from "@/cpu/cpu";
+import { CpuFlagsInput } from "@/cpu/CpuFlagsInput";
+import { CpuModelPicker } from "@/cpu/CpuModelPicker";
 import { folderPath, folderTree } from "@/folders/folders";
 import {
   defaultMachine,
@@ -64,6 +68,16 @@ export function GeneralSection({
   noReplica?: { volume: string; pool: string } | null;
 }) {
   const { t } = useTranslation();
+  // 클러스터 기준이 있으면(auto·pinned) 새 VM의 기본 모델은 `cluster`다(설계 §13). 사용자가 고르면 그대로 둔다.
+  const chose = useRef(false);
+  const models = useCpuModels(archOf(values.machine), creating);
+  const clusterNow = models.data?.models.find((m) => m.kind === "cluster")?.current;
+  useEffect(() => {
+    if (creating && !chose.current && clusterNow && values.model === "host") {
+      chose.current = true;
+      onChange({ model: "cluster" });
+    }
+  }, [creating, clusterNow, values.model, onChange]);
   const noHa = haLocked ? { key: "vmForm.haRunning" } : haUnavailable(nodes, values.node);
   // 그룹 목록에 없는 그룹(지운 그룹)도 고른 값으로 보인다(서버가 저장할 때 거절한다).
   const groupNames = [...(groups ?? [])];
@@ -154,17 +168,16 @@ export function GeneralSection({
             />
           )}
         </Field>
-        <Field id="vm-cpu-model" label={t("vmForm.cpuModel")}>
-          <NativeSelect
-            id="vm-cpu-model"
-            className="w-full"
-            value={values.model}
-            onChange={(e) => onChange({ model: e.target.value as VmFormValues["model"] })}
-          >
-            <NativeSelectOption value="host">host</NativeSelectOption>
-            <NativeSelectOption value="max">max</NativeSelectOption>
-          </NativeSelect>
-        </Field>
+        <CpuModelPicker
+          id="vm-cpu-model"
+          label={t("vmForm.cpuModel")}
+          value={values.model}
+          arch={archOf(values.machine)}
+          onChange={(model) => {
+            chose.current = true;
+            onChange({ model });
+          }}
+        />
         <Field id="vm-firmware" label={t("vms.firmware")}>
           <NativeSelect
             id="vm-firmware"
@@ -194,6 +207,15 @@ export function GeneralSection({
             <NativeSelectOption value="virt">virt (aarch64)</NativeSelectOption>
           </NativeSelect>
         </Field>
+        <CpuFlagsInput
+          id="vm-cpu-flags"
+          label={t("cpu.flags.label")}
+          hint={live ? t("cpu.flags.liveHint") : t("cpu.flags.hint")}
+          flags={values.cpuFlags}
+          arches={[archOf(values.machine)]}
+          signed
+          onChange={(cpuFlags) => onChange({ cpuFlags })}
+        />
         {creating && (
           <FolderField value={values.folder} onChange={(folder) => onChange({ folder })} />
         )}

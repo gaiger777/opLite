@@ -275,6 +275,10 @@ export function VmBulkDialog({
             </TableBody>
           </Table>
         </div>
+        {/* 다시 시작은 전원 껐다 켜기다: 보류 CPU 변경이 이때 적용된다(게스트 안 재부팅으로는 아님, 계획 63). */}
+        {action === "reboot" && !started && (
+          <p className="text-sm text-muted-foreground">{t("vms.bulk.rebootNote")}</p>
+        )}
         {action === "snapshot" && !started && (
           <p className="text-sm text-muted-foreground">
             {t("vms.bulk.snapshotName", { name: snapshotName(new Date()) })}

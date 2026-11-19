@@ -413,13 +413,13 @@ it("shows the running hardware, what was added while running and what waits for 
   expect(screen.getByText("4 (max 8)")).toBeInTheDocument();
   expect(screen.getByText("4 GiB (max 16 GiB)")).toBeInTheDocument();
   expect(screen.getByText("1/8 hotplug ports used")).toBeInTheDocument();
-  const pending = screen.getByRole("list", { name: "Applies at the next restart" });
+  const pending = screen.getByRole("list", { name: "Applies at the next power cycle" });
   expect(
     within(pending)
       .getAllByRole("listitem")
       .map((li) => li.textContent),
   ).toEqual([
-    "Firmware: uefi → bios — set only when the VM starts",
+    "Firmware: uefi → bios — set only when the VM is powered on",
     "Maximum vCPUs: 8 → 16 — not supported on this node",
   ]);
   // 실패한 변경이 없으면 다시 적용할 것이 없다.
@@ -738,7 +738,7 @@ describe("install media", () => {
     expect(screen.getByText("instance iid-0123456789abcdef")).toBeInTheDocument();
     expect(screen.getByText("Changed settings apply at the next restart.")).toBeInTheDocument();
     // 보류 목록은 CD-ROM 드라이브 번호를 넣어 보인다.
-    const pending = screen.getByRole("list", { name: "Applies at the next restart" });
+    const pending = screen.getByRole("list", { name: "Applies at the next power cycle" });
     expect(pending).toHaveTextContent("Boot order of CD-ROM drive 1");
     expect(pending).toHaveTextContent("cloud-init");
   });

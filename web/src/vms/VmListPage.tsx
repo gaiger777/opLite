@@ -14,6 +14,7 @@ import { useTableState } from "@/components/data-table/state";
 import { PageHeader } from "@/components/PageHeader";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { cpuPending } from "@/cpu/cpu";
 import { FirstSteps } from "@/dashboard/FirstSteps";
 import { folderPath, folderTree, membersOf } from "@/folders/folders";
 import { MoveButton, MoveDialog } from "@/folders/MoveDialog";
@@ -33,7 +34,7 @@ export function vcpus(vm: Vm): number {
 
 const PHASES = ["running", "stopped", "failed", "starting", "stopping", "migrating"] as const;
 /** 주소 쿼리의 거름 키 */
-const KEYS = ["phase", "node", "template", "folder"];
+const KEYS = ["phase", "node", "template", "folder", "cpu"];
 
 export function VmListPage() {
   const { t } = useTranslation();
@@ -84,6 +85,11 @@ export function VmListPage() {
           {isTemplate(vm) && (
             <Badge variant="secondary" className="ml-2">
               {t("vms.template")}
+            </Badge>
+          )}
+          {cpuPending(vm) && (
+            <Badge variant="outline" className="ml-2" title={cpuPending(vm)?.detail}>
+              {t("cpu.pending.badge")}
             </Badge>
           )}
         </>
@@ -158,6 +164,13 @@ export function VmListPage() {
       // 하위 폴더의 VM도 보인다.
       test: (vm, value) => membersOf(tree, [vm], value, true).length > 0,
     },
+    // 보류 `cpu`(다음 전원 껐다 켜기에 CPU가 바뀜, 계획 63). 설정의 숨김 목록 저장 뒤 이 거름으로 온다.
+    {
+      id: "cpu",
+      label: t("cpu.pending.filter"),
+      options: [{ value: "pending", label: t("cpu.pending.badge") }],
+      test: (vm, value) => value !== "pending" || cpuPending(vm) !== undefined,
+    },
     {
       id: "template",
       label: t("vms.templatesOnly"),
@@ -169,6 +182,7 @@ export function VmListPage() {
   const views = [
     { name: t("vms.view.running"), query: "phase=running" },
     { name: t("vms.view.failed"), query: "phase=failed" },
+    { name: t("cpu.pending.view"), query: "cpu=pending" },
     ...(here ? [{ name: t("vms.view.thisNode"), query: `node=${encodeURIComponent(here)}` }] : []),
   ];
 
