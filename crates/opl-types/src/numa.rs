@@ -767,18 +767,23 @@ pub struct NodeTopology {
     pub cpus: CpuSet,
     /// 호스트 NUMA 노드(id 순)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub nodes: Vec<HostNode>,
     /// `distances[i][j]`: `nodes[i]`와 `nodes[j]` 사이 거리(`/sys/.../distance`). 비면 모른다.
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub distances: Vec<Vec<u8>>,
     /// SMT 형제 묶음(스레드가 둘 이상인 코어만)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub siblings: Vec<CpuSet>,
     /// L3 캐시를 나누는 CPU 묶음
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub l3: Vec<CpuSet>,
     /// 커널이 아는 hugepage 크기(KiB)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub page_sizes_kib: Vec<u32>,
     /// 커널 `isolcpus`
     #[serde(skip_serializing_if = "CpuSet::is_empty")]
@@ -794,6 +799,7 @@ pub struct NodeTopology {
     pub cpuset: bool,
     /// 호스트 준비가 덜 된 것(화면에 그대로)
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub warnings: Vec<String>,
     /// 탐침 실패(있으면 나머지 칸은 믿지 않는다)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -814,6 +820,7 @@ pub struct HostNode {
     /// 노드 메모리 전체(hugepages 풀 포함)
     pub memory_mib: u64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub hugepages: Vec<HugepagePool>,
 }
 

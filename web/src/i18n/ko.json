@@ -513,7 +513,8 @@
       "cloud_init": "cloud-init",
       "tpm": "TPM 2.0",
       "secure_boot": "Secure Boot",
-      "guest_agent": "게스트 에이전트"
+      "guest_agent": "게스트 에이전트",
+      "numa": "CPU 배치와 NUMA"
     },
     "applyAgain": "다시 적용",
     "replication": {
@@ -2053,7 +2054,9 @@
       "noTemplates": "아직 템플릿이 없습니다. 템플릿 화면에서 VM을 바꾸세요.",
       "deploy": "{{name}} 배포…"
     },
-    "machineAuto": "자동(클러스터 기본값)"
+    "machineAuto": "자동(클러스터 기본값)",
+    "coresPerSocket": "소켓당 코어",
+    "totalVcpus": "소켓 {{sockets}} × 코어 = vCPU {{count}}개"
   },
   "console": {
     "connecting": "연결 중…",
@@ -3481,7 +3484,7 @@
       "badge": "CPU 변경 대기",
       "filter": "CPU 변경",
       "view": "CPU 변경 대기",
-      "required": "전원 껐다 켜기 필요: Orbivisor가 VM을 껐다 켤 때 CPU가 바뀝니다. 게스트 안 재부팅이나 라이브 마이그레이션으로는 적용되지 않습니다.",
+      "required": "전원 껐다 켜기 필요: Orbivisor가 VM을 껐다 켤 때 CPU나 그 배치가 바뀝니다. 게스트 안 재부팅이나 라이브 마이그레이션으로는 적용되지 않습니다.",
       "now": "지금 전원 껐다 켜기"
     },
     "node": {
@@ -3546,9 +3549,10 @@
       "title": "CPU 배치와 NUMA",
       "powerCycle": "여기서 바꾼 것은 Orbivisor가 전원을 껐다 켤 때 적용됩니다. 게스트 안 재부팅으로는 적용되지 않습니다.",
       "sockets": "소켓",
-      "socketsHint": "게스트 NUMA 노드는 소켓 단위입니다. VM을 여러 NUMA 노드로 나누려면 소켓을 여럿 주세요.",
+      "socketsHint": "게스트 NUMA 노드는 소켓 단위입니다. VM을 여러 NUMA 노드로 나누려면 소켓을 여럿 주세요. vCPU {{count}}개는 그대로이고 소켓당 코어 수가 소켓에 맞춰 바뀝니다.",
       "room": "이 VM의 전용 CPU·hugepages가 들어갈 노드: {{nodes}}",
-      "noRoom": "지금은 이 VM에 줄 전용 CPU나 hugepages가 남은 노드가 없습니다."
+      "noRoom": "지금은 이 VM에 줄 전용 CPU나 hugepages가 남은 노드가 없습니다.",
+      "needsPrivilege": "이 VM은 전용 CPU나 hugepages를 씁니다. vm.dedicated 권한이 필요하며, 권한이 없으면 여기서 공유 CPU와 hugepages 없음을 고르세요."
     },
     "policy": {
       "label": "CPU 정책",
@@ -3705,8 +3709,12 @@
         "overlap": "예약 CPU와 전용 CPU가 겹칩니다.",
         "noShared": "공유 CPU를 하나 이상 남기세요.",
         "count": "페이지 수를 넣으세요.",
-        "duplicate": "이 크기와 호스트 노드는 이미 예약했습니다."
-      }
+        "duplicate": "이 크기와 호스트 노드는 이미 예약했습니다.",
+        "fixFirst": "격자에서 CPU를 고르기 전에 이 CPU 목록을 고치세요.",
+        "mixed": "한 페이지 크기는 호스트 NUMA 노드마다 또는 노드 전체로만 예약하세요(둘을 섞지 않음)."
+      },
+      "clear": "설정 지우기",
+      "clearConfirm": "모든 칸이 비어 있습니다. 저장하면 이 노드의 호스트 자원 설정이 지워지고 모든 CPU가 공유 CPU가 됩니다. 확인하려면 \"설정 지우기\"를 누르세요."
     }
   }
 }

@@ -5603,8 +5603,7 @@ export interface components {
              * @default
              */
             cpus: components["schemas"]["CpuSet"];
-            /** @default [] */
-            hugepages: components["schemas"]["HugepagePool"][];
+            hugepages?: components["schemas"]["HugepagePool"][];
             /**
              * Format: int32
              * @default 0
@@ -7768,32 +7767,20 @@ export interface components {
              * @default false
              */
             cpuset: boolean;
-            /**
-             * @description `distances[i][j]`: `nodes[i]`와 `nodes[j]` 사이 거리(`/sys/.../distance`). 비면 모른다.
-             * @default []
-             */
-            distances: number[][];
+            /** @description `distances[i][j]`: `nodes[i]`와 `nodes[j]` 사이 거리(`/sys/.../distance`). 비면 모른다. */
+            distances?: number[][];
             /** @description 탐침 실패(있으면 나머지 칸은 믿지 않는다) */
             error?: string;
             /** @description 커널 `isolcpus` */
             isolated?: components["schemas"]["CpuSet"];
-            /**
-             * @description L3 캐시를 나누는 CPU 묶음
-             * @default []
-             */
-            l3: components["schemas"]["CpuSet"][];
-            /**
-             * @description 호스트 NUMA 노드(id 순)
-             * @default []
-             */
-            nodes: components["schemas"]["HostNode"][];
+            /** @description L3 캐시를 나누는 CPU 묶음 */
+            l3?: components["schemas"]["CpuSet"][];
+            /** @description 호스트 NUMA 노드(id 순) */
+            nodes?: components["schemas"]["HostNode"][];
             /** @description 커널 `nohz_full` */
             nohz_full?: components["schemas"]["CpuSet"];
-            /**
-             * @description 커널이 아는 hugepage 크기(KiB)
-             * @default []
-             */
-            page_sizes_kib: number[];
+            /** @description 커널이 아는 hugepage 크기(KiB) */
+            page_sizes_kib?: number[];
             /**
              * @description vCPU 스레드를 pCPU에 고정할 수 있다(Linux).
              * @default false
@@ -7805,11 +7792,8 @@ export interface components {
              * @default 0
              */
             probed_at: number;
-            /**
-             * @description SMT 형제 묶음(스레드가 둘 이상인 코어만)
-             * @default []
-             */
-            siblings: components["schemas"]["CpuSet"][];
+            /** @description SMT 형제 묶음(스레드가 둘 이상인 코어만) */
+            siblings?: components["schemas"]["CpuSet"][];
             /**
              * Format: int32
              * @default 0
@@ -7821,11 +7805,8 @@ export interface components {
              * @default 0
              */
             threads_per_core: number;
-            /**
-             * @description 호스트 준비가 덜 된 것(화면에 그대로)
-             * @default []
-             */
-            warnings: string[];
+            /** @description 호스트 준비가 덜 된 것(화면에 그대로) */
+            warnings?: string[];
         };
         /** @description 노드의 토폴로지와 사용 */
         NodeTopologyInfo: {

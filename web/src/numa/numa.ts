@@ -4,7 +4,7 @@ import type { TFunction } from "i18next";
 
 import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
-import type { PendingChange, RunningHardware, Vm, VmSpec } from "@/api/types";
+import type { RunningHardware, Vm, VmSpec } from "@/api/types";
 
 type Schemas = components["schemas"];
 export type CpuPolicy = Schemas["CpuPolicy"];
@@ -114,11 +114,6 @@ export function numaInUse(spec: VmSpec): boolean {
 /** 전용 CPU나 hugepages를 쓴다(만들기·바꾸기·복제에 `vm.dedicated`가 든다, 설계 §12) */
 export function usesHostResources(spec: VmSpec): boolean {
   return (spec.cpu.policy ?? "shared") === "dedicated" || spec.hugepages != null;
-}
-
-/** 보류 `numa`(다음 전원 껐다 켜기 때 배치가 바뀜). 없으면 undefined */
-export function numaPending(vm: Vm): PendingChange | undefined {
-  return (vm.status.hardware?.pending ?? []).find((c) => c.field === "numa");
 }
 
 /** VM 폼의 vNUMA 나누기: 없음·자동·노드 수·노드마다 직접 */
@@ -389,22 +384,54 @@ export function dedicatedNeed(spec: VmSpec): number {
   );
 }
 
+/** 고치는 VM이 지금 잡은 것(노드 이름, pCPU 수, hugepages 크기와 MiB) — "들어갈 노드" 어림에서 되돌려 센다 */
+export interface OwnUse {
+  node: string;
+  pcpus: number;
+  page?: PageKind;
+  mib: number;
+}
+
+/** VM 기록(`hardware.numa`·`host_placement`)이 잡은 것. 배치가 없으면 undefined. `nodeName`은 노드 id → 이름. */
+export function ownUse(vm: Vm, nodeName: (id: string) => string | undefined): OwnUse | undefined {
+  const hw = vm.status.hardware;
+  const place = hw?.host_placement;
+  const node = place ? nodeName(place.node) : undefined;
+  if (!hw || !place || node === undefined) {
+    return undefined;
+  }
+  const parse = (s: string | undefined) => parseCpuList(s ?? "") ?? [];
+  const page = hw.numa?.page ?? undefined;
+  return {
+    node,
+    pcpus: (place.vcpus ?? []).length + parse(place.siblings).length + parse(place.emulator).length,
+    ...(page && { page }),
+    mib: page ? (hw.numa?.nodes ?? []).reduce((sum, n) => sum + n.memory_mib, 0) : 0,
+  };
+}
+
 /**
  * `/topology/usage`로 이 스펙이 들어갈 만한 노드(이름). 전용 CPU는 남은 수, hugepages는 그 크기 풀(`any`는 두 크기
- * 합)의 남은 MiB만 견주는 어림이다 — 호스트 NUMA 노드 나눔은 서버가 켤 때 본다.
+ * 합)의 남은 MiB만 견주는 어림이다 — 호스트 NUMA 노드 나눔은 서버가 켤 때 본다. 고치는 VM이 이미 잡은 것(`own`)은 그
+ * 노드에서 빈 것으로 되돌려 센다(리뷰 1 웹 — 자기 pCPU 때문에 "들어갈 노드 없음"이라 하지 않게).
  */
-export function roomOn(usage: readonly NodeUsageSummary[], spec: VmSpec): string[] {
+export function roomOn(usage: readonly NodeUsageSummary[], spec: VmSpec, own?: OwnUse): string[] {
   const need = dedicatedNeed(spec);
   const page = spec.hugepages;
   return usage
     .filter((n) => {
-      if (need > 0 && (!n.pinning || n.dedicated_total - n.dedicated_used < need)) {
+      const mine = own?.node === n.node ? own : undefined;
+      const freeCpus = n.dedicated_total - n.dedicated_used + (mine?.pcpus ?? 0);
+      if (need > 0 && (!n.pinning || freeCpus < need)) {
         return false;
       }
       if (page) {
         const free = n.hugepages
           .filter((p) => page === "any" || p.size === page)
-          .reduce((sum, p) => sum + p.total_mib - p.used_mib, 0);
+          .reduce(
+            (sum, p) => sum + p.total_mib - p.used_mib + (mine?.page === p.size ? mine.mib : 0),
+            0,
+          );
         if (free < spec.memory_mib) {
           return false;
         }
@@ -413,6 +440,47 @@ export function roomOn(usage: readonly NodeUsageSummary[], spec: VmSpec): string
     })
     .map((n) => n.node);
 }
+
+/**
+ * 소켓 수를 바꿀 때 vCPU 수를 그대로 두는 코어 수(서버는 vCPU = 소켓 × 코어). 지금 vCPU 수가 새 소켓 수로 나뉘지
+ * 않거나 코어 칸이 숫자가 아니면 null(그 소켓 수는 고르지 못하게 한다).
+ */
+export function coresFor(sockets: number, cores: string, next: number): number | null {
+  const total = sockets * Number(cores);
+  if (!/^\d+$/.test(cores) || total <= 0 || total % next !== 0) {
+    return null;
+  }
+  return total / next;
+}
+
+/**
+ * 토폴로지 응답의 빈 칸 채우기: 서버는 빈 목록(`nodes`·`distances`·`siblings`·`l3`·`page_sizes_kib`·`warnings`, 노드의
+ * `hugepages`)을 보내지 않는다 — SMT·L3가 없는 노드(svc01)는 `siblings`·`l3`가 없다(리뷰 1 웹).
+ */
+export function fullTopology(t: Schemas["NodeTopology"]): FullTopology {
+  return {
+    ...t,
+    nodes: (t.nodes ?? []).map((n) => ({ ...n, hugepages: n.hugepages ?? [] })),
+    distances: t.distances ?? [],
+    siblings: t.siblings ?? [],
+    l3: t.l3 ?? [],
+    page_sizes_kib: t.page_sizes_kib ?? [],
+    warnings: t.warnings ?? [],
+  };
+}
+
+/** 빈 칸을 채운 토폴로지([`fullTopology`]) */
+export type FullTopology = Omit<
+  Schemas["NodeTopology"],
+  "nodes" | "distances" | "siblings" | "l3" | "page_sizes_kib" | "warnings"
+> & {
+  nodes: (Omit<Schemas["HostNode"], "hugepages"> & { hugepages: Schemas["HugepagePool"][] })[];
+  distances: number[][];
+  siblings: string[];
+  l3: string[];
+  page_sizes_kib: number[];
+  warnings: string[];
+};
 
 /** 복제·배포·가져오기의 덮어쓰기 칸(서버의 `NumaOverrides`) */
 export interface NumaOverride {
@@ -467,15 +535,6 @@ export function numaOverride(
     }
   }
   return out;
-}
-
-/** hugepage 크기(KiB)의 이름: 2048 → `2M`, 1048576 → `1G` */
-export function pageName(kib: number): string {
-  return kib >= 1024 * 1024 && kib % (1024 * 1024) === 0
-    ? `${kib / (1024 * 1024)}G`
-    : kib >= 1024 && kib % 1024 === 0
-      ? `${kib / 1024}M`
-      : `${kib}K`;
 }
 
 /** `PageKind`의 KiB */
@@ -553,6 +612,14 @@ export function resourcesTo(
     }
     seen.add(key);
   });
+  // 같은 크기를 노드마다와 노드 전체로 섞지 않는다(서버의 `Mixed`).
+  v.hugepages.forEach((h, i) => {
+    const whole = v.hugepages.some((o) => o.size === h.size && o.hostNode === "");
+    const perNode = v.hugepages.some((o) => o.size === h.size && o.hostNode !== "");
+    if (whole && perNode) {
+      errors[`hugepages.${i}.count`] ??= "numa.resources.errors.mixed";
+    }
+  });
   if (Object.keys(errors).length > 0) {
     return { errors };
   }
@@ -606,8 +673,9 @@ export function cpuRoles(info: NodeTopologyInfo): Map<number, { role: CpuRole; v
  * 코어 하나다.
  */
 export function cpuGrid(
-  topology: Schemas["NodeTopology"],
+  raw: Schemas["NodeTopology"],
 ): { node: number; l3: { cores: number[][] }[] }[] {
+  const topology = fullTopology(raw);
   const parse = (s: string) => parseCpuList(s) ?? [];
   const siblings = topology.siblings.map(parse);
   const l3 = topology.l3.map(parse);

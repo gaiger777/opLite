@@ -101,6 +101,21 @@ export const NODE: Node = {
   },
 };
 
+/**
+ * svc01(aarch64, 계획 64)이 알린 토폴로지의 서버 모양 그대로: CPU 4개·NUMA 노드 하나, SMT·L3 없음, hugepages 예약 없음.
+ * 서버는 빈 목록(`siblings`·`l3`·`distances`·`warnings`·노드의 `hugepages`)을 보내지 않는다.
+ */
+export const SVC01_TOPOLOGY = {
+  sockets: 1,
+  threads_per_core: 1,
+  cpus: "0-3",
+  nodes: [{ id: 0, cpus: "0-3", memory_mib: 7940 }],
+  page_sizes_kib: [64, 2048, 32768, 1048576],
+  pinning: true,
+  cpuset: true,
+  probed_at: 1795107585,
+};
+
 export function task(id: string, kind: Task["spec"]["op"]["kind"], target: string): Task {
   return {
     id,

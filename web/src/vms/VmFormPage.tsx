@@ -33,6 +33,7 @@ import { DisksSection } from "@/vms/form/DisksSection";
 import { GuestAgentSection, SecuritySection } from "@/vms/form/FirmwareSection";
 import { GeneralSection } from "@/vms/form/GeneralSection";
 import { haEnabled } from "@/vms/ha";
+import { ownUse } from "@/numa/numa";
 import { deviceMode } from "@/vms/hotplug";
 import { NicsSection } from "@/vms/form/NicsSection";
 import { ReplicationSection } from "@/vms/form/ReplicationSection";
@@ -384,6 +385,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                   onMachineChosen={() => setMachineChosen(true)}
                   noReplica={noReplica}
                   vmId={vm?.id}
+                  own={
+                    vm ? ownUse(vm, (id) => nodes.data?.find((n) => n.id === id)?.name) : undefined
+                  }
                 />
               </StepSection>
               <StepSection step="disks">

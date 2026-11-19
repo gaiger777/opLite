@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import {
+  coresFor,
   type CpuPolicy,
   describeNuma,
   type EmulatorPolicy,
@@ -17,8 +18,10 @@ import {
   type NumaMode,
   numaSpec,
   type NumaValues,
+  type OwnUse,
   type PageSize,
   roomOn,
+  usesHostResources,
   type ThreadPolicy,
   useTopologyUsage,
 } from "@/numa/numa";
@@ -315,6 +318,7 @@ function NodeList({
  */
 export function NumaSection({
   sockets,
+  cores,
   value,
   onChange,
   onSockets,
@@ -322,8 +326,11 @@ export function NumaSection({
   canDedicate,
   spec,
   running,
+  own,
 }: {
   sockets: number;
+  /** 코어 칸(소켓당). 소켓을 바꿔도 vCPU 수가 같게 나눌 수 있는 소켓 수만 고르게 한다. */
+  cores: string;
   value: NumaValues;
   onChange(value: NumaValues): void;
   onSockets(sockets: number): void;
@@ -333,6 +340,8 @@ export function NumaSection({
   spec: VmSpec;
   /** 멈추지 않은 VM: 바꾸면 보류 `numa`(전원 껐다 켜기) */
   running: boolean;
+  /** 고치는 VM이 지금 잡은 전용 CPU·hugepages(들어갈 노드 어림에서 되돌려 셈) */
+  own?: OwnUse;
 }) {
   const { t } = useTranslation();
   const perms = usePermissions();
@@ -346,7 +355,11 @@ export function NumaSection({
   );
   const bound = value.policy === "dedicated" || value.hugepages !== "";
   const usage = useTopologyUsage(bound && perms.has("cluster.read"));
-  const room = usage.data ? roomOn(usage.data.nodes, spec) : undefined;
+  const room = usage.data ? roomOn(usage.data.nodes, spec, own) : undefined;
+  // vCPU 수(소켓 × 코어)를 그대로 두는 소켓 수만(지금 값은 늘 보인다 — CLI로 만든 VM)
+  const socketChoices = [...new Set([...SOCKET_CHOICES, sockets])]
+    .filter((n) => n === sockets || coresFor(sockets, cores, n) !== null)
+    .sort((a, b) => a - b);
   return (
     <details
       className="rounded-md border px-3 py-2 sm:col-span-2"
@@ -361,7 +374,13 @@ export function NumaSection({
         {running && (
           <p className="text-sm text-muted-foreground sm:col-span-2">{t("numa.form.powerCycle")}</p>
         )}
-        <Field id="vm-sockets" label={t("numa.form.sockets")} hint={t("numa.form.socketsHint")}>
+        <Field
+          id="vm-sockets"
+          label={t("numa.form.sockets")}
+          hint={t("numa.form.socketsHint", {
+            count: sockets * (Number(cores) || 0),
+          })}
+        >
           {(a11y) => (
             <NativeSelect
               id="vm-sockets"
@@ -370,14 +389,11 @@ export function NumaSection({
               onChange={(e) => onSockets(Number(e.target.value))}
               {...a11y}
             >
-              {/* 지금 값이 목록 밖(CLI로 만든 VM)이어도 그대로 보인다. */}
-              {[...new Set([...SOCKET_CHOICES, sockets])]
-                .sort((a, b) => a - b)
-                .map((n) => (
-                  <NativeSelectOption key={n} value={n}>
-                    {n}
-                  </NativeSelectOption>
-                ))}
+              {socketChoices.map((n) => (
+                <NativeSelectOption key={n} value={n}>
+                  {n}
+                </NativeSelectOption>
+              ))}
             </NativeSelect>
           )}
         </Field>
@@ -435,17 +451,24 @@ export function NumaChoice({
   const n = numaSpec(value);
   // 요약은 배치 칸만 본다(CPU 수·메모리와 상관없다).
   const shown = { cpu: { cores: 1, ...n.cpu }, numa: n.numa, hugepages: n.hugepages } as VmSpec;
+  // 전용·hugepages 원본을 권한 없이 복제하면 서버가 403이다: 미리 말하고 칸을 펼친다(리뷰 1 웹).
+  const blocked = usesHostResources(shown) && !perms.anywhere("vm.dedicated");
   return (
     <details
       className="rounded-md border px-3 py-2"
-      open={open}
+      open={open || blocked}
       onToggle={(e) => setOpen(e.currentTarget.open)}
     >
       <summary className="cursor-pointer text-sm font-medium">
         {t("numa.form.title")}{" "}
         <span className="font-normal text-muted-foreground">{describeNuma(t, shown)}</span>
       </summary>
-      {open && (
+      {blocked && (
+        <p role="status" className="pt-2 text-sm text-warning-fg">
+          {t("numa.form.needsPrivilege")}
+        </p>
+      )}
+      {(open || blocked) && (
         <div className="flex flex-col gap-3 pt-3">
           <NumaFields
             id={id}

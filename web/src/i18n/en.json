@@ -513,7 +513,8 @@
       "cloud_init": "cloud-init",
       "tpm": "TPM 2.0",
       "secure_boot": "Secure Boot",
-      "guest_agent": "Guest agent"
+      "guest_agent": "Guest agent",
+      "numa": "CPU placement and NUMA"
     },
     "applyAgain": "Apply again",
     "replication": {
@@ -2053,7 +2054,9 @@
       "noTemplates": "There are no templates yet. Convert a VM on the Templates page.",
       "deploy": "Deploy {{name}}…"
     },
-    "machineAuto": "Automatic (cluster default)"
+    "machineAuto": "Automatic (cluster default)",
+    "coresPerSocket": "Cores per socket",
+    "totalVcpus": "{{sockets}} sockets × cores = {{count}} vCPUs"
   },
   "console": {
     "connecting": "Connecting…",
@@ -3481,7 +3484,7 @@
       "badge": "CPU change pending",
       "filter": "CPU change",
       "view": "CPU change pending",
-      "required": "Power cycle required: the CPU changes when the VM is powered off and on by Orbivisor. A reboot inside the guest or a live migration does not apply it.",
+      "required": "Power cycle required: the CPU or its placement changes when the VM is powered off and on by Orbivisor. A reboot inside the guest or a live migration does not apply it.",
       "now": "Power cycle now"
     },
     "node": {
@@ -3546,9 +3549,10 @@
       "title": "CPU placement and NUMA",
       "powerCycle": "Changes here apply at the next power cycle by Orbivisor, not on a reboot inside the guest.",
       "sockets": "Sockets",
-      "socketsHint": "A guest NUMA node holds whole sockets: to split the VM into several NUMA nodes, give it several sockets.",
+      "socketsHint": "A guest NUMA node holds whole sockets: to split the VM into several NUMA nodes, give it several sockets. The VM keeps its {{count}} vCPUs: the cores per socket change with the sockets.",
       "room": "Room for this VM's dedicated CPUs and hugepages on: {{nodes}}",
-      "noRoom": "No node has free dedicated CPUs or hugepages for this VM right now."
+      "noRoom": "No node has free dedicated CPUs or hugepages for this VM right now.",
+      "needsPrivilege": "This VM uses dedicated CPUs or hugepages, which need the vm.dedicated privilege. Without it, choose shared CPUs and no hugepages here."
     },
     "policy": {
       "label": "CPU policy",
@@ -3705,8 +3709,12 @@
         "overlap": "Reserved and dedicated CPUs overlap.",
         "noShared": "Leave at least one CPU shared.",
         "count": "Enter a number of pages.",
-        "duplicate": "This size and host node is already reserved."
-      }
+        "duplicate": "This size and host node is already reserved.",
+        "fixFirst": "Fix this CPU list before picking CPUs on the grid.",
+        "mixed": "Reserve a page size either per host NUMA node or for the whole node, not both."
+      },
+      "clear": "Clear settings",
+      "clearConfirm": "Every field is empty: saving clears the host resource settings of this node, and every CPU becomes shared. Press \"Clear settings\" to confirm."
     }
   }
 }

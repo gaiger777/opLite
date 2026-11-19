@@ -7,7 +7,6 @@ import { toast } from "sonner";
 
 import { ApiError, api, call } from "@/api/client";
 import { putResource } from "@/api/optimistic";
-import type { components } from "@/api/schema";
 import type { Node } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
@@ -31,6 +30,8 @@ import {
   type CpuRole,
   cpuRoles,
   formatCpuList,
+  type FullTopology,
+  fullTopology,
   NUMA_KEY,
   type NodeTopologyInfo,
   type PageKind,
@@ -42,7 +43,7 @@ import {
   useNodeTopology,
 } from "@/numa/numa";
 
-type Topology = components["schemas"]["NodeTopology"];
+type Topology = FullTopology;
 
 const ROLE_CLASS: Record<CpuRole, string> = {
   reserved: "bg-muted text-muted-foreground",
@@ -70,7 +71,8 @@ export function NodeTopologySection({ node }: { node: Node }) {
     return null;
   }
   const data = info.data;
-  const topology = data?.topology;
+  // 서버는 빈 목록을 보내지 않는다(SMT·L3 없는 노드) — 채워 쓴다.
+  const topology = data?.topology ? fullTopology(data.topology) : undefined;
   return (
     <section aria-labelledby="node-topology" className="flex flex-col gap-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -341,16 +343,22 @@ function HostResourcesDialog({
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  // 연 때의 노드(판·스펙·레이블): 그사이 다른 곳에서 바꿨으면 서버가 412로 알린다(리뷰 1 웹 — 지켜보기가 갱신한 판으로
+  // 쓰면 남의 설정을 덮거나 지운다).
+  const [opened] = useState(node);
   const [values, setValues] = useState<ResourcesValues>(() =>
-    resourcesFrom(node.spec.host_resources),
+    resourcesFrom(opened.spec.host_resources),
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [target, setTarget] = useState<"reserved" | "dedicated">("dedicated");
   const [conflict, setConflict] = useState<{ message: string; items: string[] } | null>(null);
+  // 모두 비워 설정을 지우기 전 한 번 묻는다.
+  const [confirmClear, setConfirmClear] = useState(false);
   const online = parseCpuList(topology.cpus) ?? [];
   const change = (patch: Partial<ResourcesValues>) => {
     setValues((v) => ({ ...v, ...patch }));
     setConflict(null);
+    setConfirmClear(false);
   };
   // 격자의 색은 입력한 값으로(쓰는 전용 CPU는 지금 응답의 VM)
   const reserved = parseCpuList(values.reserved) ?? [];
@@ -366,11 +374,16 @@ function HostResourcesDialog({
 
   function pick(cpu: number) {
     const other = target === "reserved" ? "dedicated" : "reserved";
-    const mine = target === "reserved" ? reserved : dedicated;
-    const theirs = target === "reserved" ? dedicated : reserved;
+    const mine = parseCpuList(values[target]);
+    const theirs = parseCpuList(values[other]);
+    // 고치는 중인(틀린) 목록을 눌러 덮어쓰지 않는다: 먼저 고치라고 알린다.
+    if (mine === null) {
+      setErrors((e) => ({ ...e, [target]: "numa.resources.errors.fixFirst" }));
+      return;
+    }
     change({
       [target]: formatCpuList(mine.includes(cpu) ? mine.filter((c) => c !== cpu) : [...mine, cpu]),
-      [other]: formatCpuList(theirs.filter((c) => c !== cpu)),
+      ...(theirs !== null && { [other]: formatCpuList(theirs.filter((c) => c !== cpu)) }),
     });
   }
 
@@ -380,17 +393,27 @@ function HostResourcesDialog({
     if (!value) {
       return false;
     }
+    // `{}`는 지우기다: 설정이 없었으면 보낼 것이 없고, 있었으면 한 번 묻는다.
+    if (Object.keys(value).length === 0) {
+      if (!opened.spec.host_resources) {
+        return;
+      }
+      if (!confirmClear) {
+        setConfirmClear(true);
+        return false;
+      }
+    }
     let response: Response | undefined;
     try {
       const updated = await call(
         api
           .PUT("/nodes/{key}", {
             params: {
-              path: { key: node.id },
-              header: { "If-Match": node.revision },
+              path: { key: opened.id },
+              header: { "If-Match": opened.revision },
               ...(conflict && { query: { force: true } }),
             },
-            body: { labels: node.labels, spec: { ...node.spec, host_resources: value } },
+            body: { labels: opened.labels, spec: { ...opened.spec, host_resources: value } },
           })
           .then((result) => {
             response = result.response;
@@ -419,8 +442,14 @@ function HostResourcesDialog({
     <FormDialog
       title={t("numa.resources.title", { name: node.name })}
       description={t("numa.resources.description")}
-      submitLabel={conflict ? t("numa.resources.force") : t("common.save")}
-      destructive={conflict !== null}
+      submitLabel={
+        conflict
+          ? t("numa.resources.force")
+          : confirmClear
+            ? t("numa.resources.clear")
+            : t("common.save")
+      }
+      destructive={conflict !== null || confirmClear}
       className="sm:max-w-3xl"
       onClose={onClose}
       onSubmit={submit}
@@ -557,6 +586,14 @@ function HostResourcesDialog({
           </Button>
         </div>
       </fieldset>
+      {confirmClear && (
+        <p
+          role="alert"
+          className="rounded-md border border-warning/50 bg-warning-soft px-3 py-2 text-sm"
+        >
+          {t("numa.resources.clearConfirm")}
+        </p>
+      )}
       {conflict && (
         <div
           role="alert"

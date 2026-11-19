@@ -14,6 +14,7 @@ import { archOf, useCpuModels } from "@/cpu/cpu";
 import { CpuFlagsInput } from "@/cpu/CpuFlagsInput";
 import { CpuModelPicker } from "@/cpu/CpuModelPicker";
 import { folderPath, folderTree } from "@/folders/folders";
+import { coresFor, type OwnUse } from "@/numa/numa";
 import { NumaSection } from "@/numa/NumaSection";
 import {
   defaultMachine,
@@ -49,6 +50,7 @@ export function GeneralSection({
   onMachineChosen,
   noReplica,
   vmId,
+  own,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -71,6 +73,8 @@ export function GeneralSection({
   noReplica?: { volume: string; pool: string } | null;
   /** 고치는 VM의 id(만들 때는 없음). 전용 CPU·hugepages의 권한 `vm.dedicated`를 그 VM에서 본다(만들 때는 폴더). */
   vmId?: string;
+  /** 고치는 VM이 지금 잡은 전용 CPU·hugepages("들어갈 노드" 어림) */
+  own?: OwnUse;
 }) {
   const { t } = useTranslation();
   const perms = usePermissions();
@@ -148,7 +152,19 @@ export function GeneralSection({
             )}
           </Field>
         )}
-        <Field id="vm-cores" label={t("vmForm.cores")} error={errors.cores}>
+        <Field
+          id="vm-cores"
+          label={values.sockets > 1 ? t("vmForm.coresPerSocket") : t("vmForm.cores")}
+          error={errors.cores}
+          hint={
+            values.sockets > 1 && /^\d+$/.test(values.cores)
+              ? t("vmForm.totalVcpus", {
+                  sockets: values.sockets,
+                  count: values.sockets * Number(values.cores),
+                })
+              : undefined
+          }
+        >
           {(a11y) => (
             <Input
               id="vm-cores"
@@ -268,9 +284,15 @@ export function GeneralSection({
         />
         <NumaSection
           sockets={values.sockets}
+          cores={values.cores}
           value={values.numa}
           onChange={(numa) => onChange({ numa })}
-          onSockets={(sockets) => onChange({ sockets })}
+          onSockets={(sockets) => {
+            // vCPU 수(소켓 × 코어)를 그대로 둔다(리뷰 1 웹 — 소켓을 늘리면 vCPU가 곱해졌다).
+            const cores = coresFor(values.sockets, values.cores, sockets);
+            onChange(cores === null ? { sockets } : { sockets, cores: String(cores) });
+          }}
+          own={own}
           errors={errors}
           canDedicate={canDedicate}
           spec={toSpec(values, "stopped")}

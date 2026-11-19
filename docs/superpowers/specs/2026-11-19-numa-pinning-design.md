@@ -363,3 +363,14 @@
 - **M6** 도는 `any` VM은 켤 때 고른 크기(`hardware.numa.page`)로 센다(`Demand::resolve_any`): Raft(`HostCheck`가 다른 VM의 상태 JSON에서 `hardware.numa.page`를 읽음, 그 VM 자신의 스펙 쓰기도 같은 크기)와 스케줄러 합계가 같다.
 - **M7** 설정 뒤 CPU가 오프라인이 되어 공유 집합이 비면 `HostSets::new`가 온라인 CPU 전체를 공유로 둔다(빈 친화로는 QEMU를 띄울 수 없다). opld 경고 `no shared CPU is online (…); shared VMs and emulator threads run on all online CPUs`.
 - **GitHub 탐침(656c72d)**: `oplctl node resources`가 레이블 없는 노드(GET이 빈 `labels`를 뺌)를 `"labels": null`로 PUT해 400이었다 — `labels`가 없으면 `{}`를 보낸다. 같은 꼴의 `group set`도 고쳤다. 서버의 `UpdateRequest.labels`는 `null`을 "레이블 없음"(칸이 없는 것과 같음)으로 받는다 — "그대로 둠"으로 받지 않은 것은 칸이 없을 때의 뜻(바꾼 뒤 전체 = 없음)과 맞추기 위해서다. 시험: oplctl 단위 시험(가짜 API로 PUT 본문), macOS에서도 도는 opld `cluster.rs`(`node resources node1 --clear`)·`permissions.rs`(`group set`). 러너의 형제 짝이 이어지지 않는 모양(`0,2`·`1,3`)은 opl-types 시험으로 고정·스코프를 확인했다(코드는 이미 형제 묶음을 집합으로 다룬다).
+
+### 리뷰 1에서 고친 것 (웹)
+
+- **C1** 서버는 `NodeTopology`의 빈 목록(`nodes`·`distances`·`siblings`·`l3`·`page_sizes_kib`·`warnings`, `HostNode.hugepages`)을 보내지 않는다 — 그 칸에 `schema(default)`를 달아 `schema.d.ts`에서 선택 칸이 되었고, 웹은 `fullTopology`로 채워 쓴다(`cpuGrid`도 안에서 채움). 시험 고정물 `SVC01_TOPOLOGY`(svc01이 알린 서버 모양: SMT·L3·거리·풀 없음)로 노드 화면과 대화상자를 그린다. 앞 시험의 토폴로지에서 서버가 보내지 않는 `warnings: []`를 뺐다.
+- **I1** VM 폼의 소켓 고르기는 vCPU 수(소켓 × 코어)를 그대로 둔다: 바꾸면 코어 = vCPU ÷ 소켓(`coresFor`), 나눌 수 없는 소켓 수는 목록에 없다(지금 값은 늘 보임). 소켓이 둘 이상이면 코어 칸 이름이 "소켓당 코어"이고 `소켓 2 × 코어 = vCPU 4개`를 보인다. 소켓 도움말도 vCPU 수가 그대로라고 말한다.
+- **I2** 호스트 자원 대화상자는 연 때의 노드(판·스펙·레이블)로 쓴다 — 그사이 바뀌었으면 412(`revision_mismatch`, "다른 사람이 먼저 바꿨습니다")를 보인다. 모두 비우면 설정이 있었을 때만 한 번 묻고("설정 지우기") `{}`를 보내며, 없었으면 보내지 않고 닫는다.
+- **M1** 보류 이름 `vms.pendingField.numa`("CPU 배치와 NUMA")를 더했고 전원 껐다 켜기 띠 문구가 "CPU나 그 배치"를 말한다. 배지("CPU 변경 대기")는 그대로 두었다.
+- **M2** "들어갈 노드" 어림은 고치는 VM의 기록(`host_placement`·`numa.page`)이 잡은 pCPU·페이지를 그 노드에서 빈 것으로 되돌려 센다(`ownUse`).
+- **M3** 복제·배포·가져오기에서 원본이 전용·hugepages인데 어디에도 `vm.dedicated`가 없으면 접힌 칸을 펼치고 "이 VM은 전용 CPU나 hugepages를 씁니다 …"를 보인다.
+- **M4** 격자 누르기는 고르는 칸의 목록이 틀리면 덮지 않고 "먼저 고치세요"를 보인다(다른 칸이 틀리면 그 칸은 그대로 둔다).
+- **M5** 쓰지 않는 `numaPending`·`pageName`을 지웠다. `usesHostResources`는 M3에 쓴다.

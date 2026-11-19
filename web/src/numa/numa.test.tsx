@@ -1,7 +1,8 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
+import { useState } from "react";
 
 import type { Node, Vm } from "@/api/types";
 import { builtinPrivileges, PRIVILEGES } from "@/auth/permissions";
@@ -10,6 +11,7 @@ import { usageBars } from "@/folders/UsageBars";
 import i18n from "@/i18n";
 import { NodeTopologySection } from "@/numa/NodeTopologySection";
 import {
+  coresFor,
   cpuGrid,
   cpuRoles,
   describeNuma,
@@ -22,12 +24,13 @@ import {
   numaOverride,
   numaSpec,
   parseCpuList,
+  ownUse,
   pinningRows,
   resourcesTo,
   roomOn,
 } from "@/numa/numa";
 import { NodesPage } from "@/nodes/NodesPage";
-import { hardware, NODE, task, vm } from "@/test/fixtures";
+import { hardware, NODE, SVC01_TOPOLOGY, task, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { emptyForm, toSpec } from "@/vms/form";
@@ -35,6 +38,7 @@ import { VmCloneDialog } from "@/vms/VmCloneDialog";
 import { VmDetailPage } from "@/vms/VmDetailPage";
 import { VmCreatePage } from "@/vms/VmFormPage";
 import { VmMigrateDialog } from "@/vms/VmMigrateDialog";
+import { pendingFieldLabel } from "@/vms/hotplug";
 
 afterEach(() => {
   toast.dismiss();
@@ -61,7 +65,6 @@ const TOPOLOGY: NodeTopologyInfo["topology"] = {
   pinning: true,
   cpuset: true,
   probed_at: 1,
-  warnings: [],
 };
 
 const INFO: NodeTopologyInfo = {
@@ -278,6 +281,25 @@ it("guesses which nodes have room for dedicated CPUs and hugepages", () => {
     roomOn(usage, { ...DB.spec, cpu: { ...DB.spec.cpu, max_vcpus: 4 }, hugepages: undefined }),
   ).toEqual(["n2"]);
   expect(roomOn(usage, vm("x", "stopped").spec)).toEqual(["n1", "n2", "n3"]);
+  // 리뷰 1 웹 M2: 고치는 VM이 이미 잡은 것은 그 노드에서 빈 것으로 센다.
+  const full = [
+    {
+      ...usage[0]!,
+      dedicated_used: 4,
+      hugepages: [{ size: "2M" as const, total_mib: 4096, used_mib: 4096 }],
+    },
+  ];
+  expect(roomOn(full, DB.spec)).toEqual([]);
+  const own = ownUse(DB, (id) => (id === "n1" ? "n1" : undefined));
+  expect(own).toEqual({ node: "n1", pcpus: 2, page: "2M", mib: 2048 });
+  expect(roomOn(full, DB.spec, own)).toEqual(["n1"]);
+});
+
+it("keeps the vCPU count when the sockets change", () => {
+  expect(coresFor(1, "4", 2)).toBe(2);
+  expect(coresFor(2, "2", 4)).toBe(1);
+  expect(coresFor(1, "4", 3)).toBeNull();
+  expect(coresFor(1, "", 2)).toBeNull();
 });
 
 it("checks host resources and clears them with an empty object", () => {
@@ -335,6 +357,23 @@ it("checks host resources and clears them with an empty object", () => {
     "hugepages.0.count": "numa.resources.errors.count",
     "hugepages.1.count": "numa.resources.errors.duplicate",
   });
+  // 리뷰 1 M5: 같은 크기를 노드마다와 노드 전체로 섞지 않는다.
+  expect(
+    resourcesTo(
+      {
+        reserved: "",
+        dedicated: "",
+        hugepages: [
+          { size: "2M", count: "1", hostNode: "0" },
+          { size: "2M", count: "2", hostNode: "" },
+        ],
+      },
+      online,
+    ).errors,
+  ).toEqual({
+    "hugepages.0.count": "numa.resources.errors.mixed",
+    "hugepages.1.count": "numa.resources.errors.mixed",
+  });
 });
 
 it("groups CPUs by host node, L3 and core, and colours them by set and VM", () => {
@@ -377,6 +416,9 @@ it("treats a pending NUMA change as a power cycle, and keeps vm.dedicated out of
     },
   };
   expect(cpuPending(pending)?.field).toBe("numa");
+  // 리뷰 1 웹 M1: 보류 이름과 띠 문구
+  expect(pendingFieldLabel("numa", t)).toBe("CPU placement and NUMA");
+  expect(t("cpu.pending.required")).toMatch(/the CPU or its placement changes/);
   expect(PRIVILEGES).toContain("vm.dedicated");
   expect(builtinPrivileges("operator")).not.toContain("vm.dedicated");
 });
@@ -428,7 +470,16 @@ it("saves CPU placement and NUMA from the VM form and shows where it fits", asyn
   await user.click(screen.getByText("CPU placement and NUMA"));
   // 소켓이 하나면 노드 수는 1뿐이고 그렇다고 말한다.
   expect(screen.getByText(/With one socket the guest has one NUMA node/)).toBeInTheDocument();
+  // vCPU 2개를 나눌 수 있는 소켓 수만(리뷰 1 웹 I1)
+  expect(
+    within(screen.getByLabelText("Sockets"))
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["1", "2"]);
   await user.selectOptions(screen.getByLabelText("Sockets"), "2");
+  // vCPU 수는 그대로이고 코어 칸이 소켓당 코어가 된다.
+  expect(screen.getByLabelText("Cores per socket")).toHaveValue(1);
+  expect(screen.getByText("2 sockets × cores = 2 vCPUs")).toBeInTheDocument();
   await user.selectOptions(screen.getByLabelText("Guest NUMA nodes"), "2 NUMA nodes");
   await user.selectOptions(screen.getByLabelText("CPU policy"), "dedicated");
   await user.selectOptions(screen.getByLabelText("Emulator threads"), "isolate");
@@ -440,7 +491,7 @@ it("saves CPU placement and NUMA from the VM form and shows where it fits", asyn
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toMatchObject({
     spec: {
-      cpu: { sockets: 2, cores: 2, policy: "dedicated", emulator: "isolate" },
+      cpu: { sockets: 2, cores: 1, policy: "dedicated", emulator: "isolate" },
       numa: { nodes: 2 },
       hugepages: "2M",
     },
@@ -558,6 +609,127 @@ it("shows the node topology and saves host resources through a forced 409", asyn
   expect(await screen.findByText("db is pinned outside the dedicated CPUs")).toBeInTheDocument();
 });
 
+/** 리뷰 1 웹 C1: svc01처럼 SMT·L3·거리·hugepages가 없는 노드(서버가 빈 목록을 보내지 않음)도 그린다. */
+it("shows a node without SMT, L3 or hugepages like svc01", async () => {
+  server.use(
+    http.get(apiUrl("/nodes/:key/topology"), () =>
+      HttpResponse.json({
+        node: "node-a",
+        topology: SVC01_TOPOLOGY,
+        host_nodes: [
+          {
+            id: 0,
+            cpus: "0-3",
+            memory_mib: 7940,
+            dedicated: "",
+            dedicated_used: "",
+            hugepages: [],
+          },
+        ],
+        vms: [],
+        warnings: [],
+      }),
+    ),
+  );
+  mockLists({ node: [NODE] });
+  renderPage(<NodeTopologySection node={NODE} />);
+  const section = await screen.findByRole("region", { name: "NUMA topology" });
+  expect(
+    await within(section).findByText("1 sockets · 1 NUMA nodes · 4 CPUs · 1 threads per core", {
+      exact: false,
+    }),
+  ).toBeInTheDocument();
+  for (const cpu of [0, 1, 2, 3]) {
+    expect(within(section).getByRole("img", { name: `CPU ${cpu}: Shared` })).toBeInTheDocument();
+  }
+  expect(within(section).queryByRole("table", { name: "Distances" })).not.toBeInTheDocument();
+  expect(cpuGrid(SVC01_TOPOLOGY)).toEqual([{ node: 0, l3: [{ cores: [[0], [1], [2], [3]] }] }]);
+  // 대화상자도 열린다.
+  await userEvent.click(within(section).getByRole("button", { name: "Host resources" }));
+  expect(
+    await screen.findByRole("dialog", { name: "Host resources of node-a" }),
+  ).toBeInTheDocument();
+});
+
+/**
+ * 리뷰 1 웹 I2: 대화상자는 연 때의 판으로 쓴다(지켜보기가 노드를 갱신해도) — 그사이 바뀌었으면 412를 보인다. 모두
+ * 비우면 한 번 묻고서야 `{}`를 보낸다. 리뷰 1 웹 M4: 틀린 목록은 격자를 눌러 덮지 않는다.
+ */
+it("writes host resources with the revision it opened with and asks before clearing", async () => {
+  const puts: { ifMatch: string | null; body: unknown }[] = [];
+  let stale = true;
+  server.use(
+    http.get(apiUrl("/nodes/:key/topology"), () => HttpResponse.json(INFO)),
+    http.put(apiUrl("/nodes/:key"), async ({ request }) => {
+      puts.push({ ifMatch: request.headers.get("if-match"), body: await request.json() });
+      if (stale) {
+        return HttpResponse.json(
+          { code: "revision_mismatch", message: "revision mismatch" },
+          { status: 412 },
+        );
+      }
+      return HttpResponse.json(NODE);
+    }),
+  );
+  const first = {
+    ...NODE,
+    revision: 5,
+    spec: { ...NODE.spec, host_resources: INFO.host_resources },
+  };
+  function Live() {
+    const [node, setNode] = useState<Node>(first);
+    return (
+      <>
+        <button
+          type="button"
+          onClick={() =>
+            setNode({
+              ...first,
+              revision: 6,
+              spec: { ...first.spec, host_resources: { dedicated_cpus: "4-15" } },
+            })
+          }
+        >
+          bump
+        </button>
+        <NodeTopologySection node={node} />
+      </>
+    );
+  }
+  mockLists({ node: [first] });
+  renderPage(<Live />);
+  const user = userEvent.setup();
+  const section = await screen.findByRole("region", { name: "NUMA topology" });
+  await user.click(await within(section).findByRole("button", { name: "Host resources" }));
+  const dialog = await screen.findByRole("dialog", { name: "Host resources of node-a" });
+  // 다른 곳에서 바뀐 노드가 지켜보기로 들어온다.
+  fireEvent.click(screen.getByText("bump"));
+  // 틀린 목록은 격자를 눌러도 그대로이고 먼저 고치라고 한다.
+  await user.clear(within(dialog).getByLabelText("Dedicated CPUs"));
+  await user.type(within(dialog).getByLabelText("Dedicated CPUs"), "8-");
+  await user.click(within(dialog).getByRole("button", { name: /^CPU 10:/ }));
+  expect(within(dialog).getByLabelText("Dedicated CPUs")).toHaveValue("8-");
+  expect(
+    within(dialog).getByText("Fix this CPU list before picking CPUs on the grid."),
+  ).toBeInTheDocument();
+  // 모두 비우면 묻는다(보내지 않음).
+  await user.clear(within(dialog).getByLabelText("Dedicated CPUs"));
+  await user.clear(within(dialog).getByLabelText("Reserved CPUs"));
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  expect(
+    await within(dialog).findByText(/saving clears the host resource settings/),
+  ).toBeInTheDocument();
+  expect(puts).toHaveLength(0);
+  await user.click(within(dialog).getByRole("button", { name: "Clear settings" }));
+  await waitFor(() => expect(puts).toHaveLength(1));
+  expect(puts[0]).toEqual({
+    ifMatch: "5",
+    body: { labels: {}, spec: { ...first.spec, host_resources: {} } },
+  });
+  expect(await within(dialog).findByText(/Someone else changed it first/)).toBeInTheDocument();
+  stale = false;
+});
+
 it("says when a node has no topology", async () => {
   renderPage(<NodeTopologySection node={NODE} />);
   expect(await screen.findByText(/has not reported a NUMA topology/)).toBeInTheDocument();
@@ -627,6 +799,36 @@ it("disables migration targets that cannot place the VM's dedicated CPUs", async
   dialog = await screen.findByRole("dialog", { name: "Migrate db" });
   expect(await within(dialog).findByRole("alert")).toHaveTextContent("has 1 free dedicated CPUs");
   expect(within(dialog).getByRole("button", { name: "Migrate" })).toBeDisabled();
+});
+
+/** 리뷰 1 웹 M3: `vm.dedicated`가 없는 사용자가 전용·hugepages VM을 복제하면 미리 말하고 칸을 펼친다. */
+it("warns before cloning a dedicated VM without vm.dedicated", async () => {
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read", "cluster.read", "vm.create", "vm.config", "vm.clone"],
+        root_contents: ["system.read", "vm.create", "vm.config", "vm.clone"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  const stopped = {
+    ...DB,
+    spec: { ...DB.spec, power: "stopped" as const },
+    status: vm("db", "stopped").status,
+  };
+  mockLists({ vm: [stopped], node: [NODE] });
+  renderPage(<VmCloneDialog vm={stopped} onClose={() => {}} />, {
+    as: { ...ADMIN, role: "operator" },
+  });
+  const dialog = await screen.findByRole("dialog", { name: "Clone db" });
+  expect(
+    await within(dialog).findByText(/This VM uses dedicated CPUs or hugepages/),
+  ).toBeInTheDocument();
+  expect(within(dialog).getByLabelText("Hugepages")).toBeInTheDocument();
 });
 
 it("clones a VM without its hugepages", async () => {
