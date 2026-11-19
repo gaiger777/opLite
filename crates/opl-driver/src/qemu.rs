@@ -419,6 +419,13 @@ impl QemuHypervisor {
             std::fs::write(paths.dir.join(INCOMING_MARK), task.to_string())?;
         }
         self.create_taps(vm).await?;
+        // 계획 64: QEMU·swtpm의 모든 스레드(나중 일꾼·vhost 포함)가 물려받을 친화. 고정이 있으면 에뮬레이터 집합이고, 없어도
+        // opld가 예약 CPU에 묶여 있으면 온라인 CPU 전체로 다시 건다(설정을 지운 직후 등 — 리뷰 1).
+        let child_cpus = vm
+            .pinning
+            .as_ref()
+            .map(|p| p.emulator.clone())
+            .or_else(|| crate::affinity::unpinned_child(Path::new("/proc"), Path::new("/sys")));
         if vm.tpm.is_some() {
             // QEMU가 띄울 때 제어 채널에 연결하므로 먼저 띄운다. QEMU를 띄우지 못하면 kill_and_cleanup이 끝낸다.
             let dir = vm_tpm_dir(&self.config.state_dir, vm.id);
@@ -428,7 +435,7 @@ impl QemuHypervisor {
                 vm.id,
                 paths,
                 &dir,
-                vm.pinning.as_ref().map(|p| &p.emulator),
+                child_cpus.as_ref(),
             )
             .await?;
         }
@@ -447,9 +454,8 @@ impl QemuHypervisor {
             // 타임아웃으로 기다림을 그만두면 부모 프로세스도 끝낸다. 이미 분리된 자식은
             // 실패 정리(kill_and_cleanup)가 pidfile 잠금으로 찾아 끝낸다.
             .kill_on_drop(true);
-        // 계획 64: QEMU의 모든 스레드(나중 일꾼·vhost 포함)가 물려받을 친화. opld가 예약 CPU에 묶여 있어도 늘 다시 건다.
-        if let Some(pin) = &vm.pinning {
-            pin_child(&mut cmd, &pin.emulator);
+        if let Some(cpus) = &child_cpus {
+            pin_child(&mut cmd, cpus);
         }
         if cfg!(target_os = "macos") {
             // macOS에서는 -daemonize의 fork 뒤 자식이 Objective-C 런타임을 초기화하다
@@ -4130,7 +4136,7 @@ async fn scope_cpus(unit: &str) -> Option<CpuSet> {
         .output();
     let out = tokio::time::timeout(QMP_TIMEOUT, out).await.ok()?.ok()?;
     out.status.success().then_some(())?;
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    crate::affinity::systemd_cpus(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// 도는 스코프 `unit`의 `AllowedCPUs`를 바꾼다(`systemctl set-property --runtime`).

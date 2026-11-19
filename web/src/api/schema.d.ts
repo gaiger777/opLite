@@ -10957,6 +10957,10 @@ export interface components {
             privileges: string[];
         };
         UpdateRequest_AlertRuleSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };
@@ -10995,6 +10999,10 @@ export interface components {
             };
         };
         UpdateRequest_GroupSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };
@@ -11008,6 +11016,10 @@ export interface components {
             };
         };
         UpdateRequest_HaCheckSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };
@@ -11040,6 +11052,10 @@ export interface components {
             };
         };
         UpdateRequest_HaGroupSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };
@@ -11054,6 +11070,10 @@ export interface components {
             };
         };
         UpdateRequest_NodeSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };
@@ -11074,6 +11094,10 @@ export interface components {
             };
         };
         UpdateRequest_PlacementRuleSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };
@@ -11112,6 +11136,10 @@ export interface components {
             };
         };
         UpdateRequest_VmSpec: {
+            /**
+             * @description 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+             *     `null`을 보낼 수 있다).
+             */
             labels?: {
                 [key: string]: string;
             };

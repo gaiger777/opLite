@@ -368,6 +368,14 @@ async fn health_and_api_endpoints_follow_roles_and_maintenance() {
         .await
         .unwrap();
     assert_eq!(health(&d, "").await.0, 200);
+
+    // 계획 64 GitHub 탐침: `node resources`는 레이블이 없는 노드(GET이 `labels`를 뺌)를 `labels: null`로 PUT해 400이었다.
+    // 지우기는 토폴로지가 없어도(macOS) 되는 쓰기다.
+    let out = d
+        .ctl(&["node", "resources", "node1", "--clear"])
+        .await
+        .unwrap();
+    assert_eq!(out.trim(), "node node1: none");
     d.stop();
 }
 

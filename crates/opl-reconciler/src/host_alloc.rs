@@ -16,7 +16,7 @@ use opl_driver::Hypervisor;
 use opl_types::node::NodeSpec;
 use opl_types::numa::{
     self, HostFree, HostPlacement, HostSets, HostUsage, HostView, NodeTopology, NumaRefusal,
-    PageKind, PageSize, ResolvedNuma,
+    PageKind, ResolvedNuma,
 };
 use opl_types::runtime::RuntimePinning;
 use opl_types::vm::{CpuSpec, Vm, VmPhase, VmSpec};
@@ -86,16 +86,10 @@ impl HostAllocator {
             Shape::Spec(spec, cpu) => {
                 let mut s = spec.clone();
                 s.cpu = cpu.clone();
-                let mut layout = numa::layout(&s, topology).map_err(|e| {
+                // 메모리 핫플러그 VM의 `any`는 `layout`이 2M으로 고른다(스케줄러·장부와 같게).
+                let layout = numa::layout(&s, topology).map_err(|e| {
                     CpuRefusal::Cannot(format!("the VM's NUMA settings are invalid: {e}"))
                 })?;
-                // virtio-mem 블록이 2M이라 메모리 핫플러그 VM의 `any`는 2M이다(1G는 검증이 막는다).
-                if let Some(l) = &mut layout
-                    && l.page == Some(PageSize::Any)
-                    && spec.max_memory_mib.is_some_and(|m| m > spec.memory_mib)
-                {
-                    l.page = Some(PageSize::Size2M);
-                }
                 (Lay::Spec(layout), cpu)
             }
             Shape::Fixed(numa, cpu) => (Lay::Fixed(numa), cpu),
@@ -120,10 +114,12 @@ impl HostAllocator {
             return Err(cannot(NumaRefusal::NoTopology));
         };
         let sets = HostSets::new(resources, topology);
+        // 잠금을 먼저 잡고 VM을 읽는다: 읽은 뒤에 잠그면 그사이 기록이 Raft에 닿은 VM의 예약을 다른 작업자가 지우고
+        // (`prune`), 이 읽기에는 그 기록도 예약도 없어 같은 pCPU를 두 번 준다(리뷰 1).
+        let mut held = self.held.lock().unwrap();
         let (_, vms) = cluster
             .list::<VmSpec>()
             .map_err(|e| CpuRefusal::Waiting(format!("cannot read the VMs: {e}")))?;
-        let mut held = self.held.lock().unwrap();
         self.prune(&mut held, &vms);
         held.remove(&vm);
         let records = numa::usage(
@@ -185,6 +181,33 @@ impl HostAllocator {
                 .lock()
                 .unwrap()
                 .insert(vm, Held { numa, placement });
+        }
+    }
+
+    /// opld가 다시 떴을 때: 이 노드에서 도는 QEMU와 받는 중인 QEMU의 저장된 기록(`hardware.json`)의 배치를 예약으로
+    /// 다시 잡는다. 기록이 Raft에 아직 닿지 않은 VM(켠 직후 opld가 죽음)의 pCPU·페이지를 다른 VM에 주지 않게 한다(리뷰
+    /// 1). Raft 기록이 같은 배치면 다음 `claim`이 지운다.
+    pub async fn hold_saved(&self, hv: &dyn Hypervisor) {
+        let mut ids: Vec<Uuid> = hv
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        ids.extend(
+            hv.list_incoming()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(vm, _)| vm),
+        );
+        for vm in ids {
+            if let Some(hw) = hv.saved_hardware(vm)
+                && let (Some(numa), Some(placement)) = (hw.numa, hw.host_placement)
+            {
+                self.hold(vm, numa, placement);
+            }
         }
     }
 
@@ -290,9 +313,11 @@ pub fn sys_free_pages(sys: &Path, node: u16, kind: PageKind) -> Option<u64> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// 검사 루프(§7·§10): 이 노드에서 도는 VM마다 스레드 고정을 기록과 지금 세 집합으로 셈해 드라이버로 맞춘다. 고정 없이
-/// 켰고 지금도 걸 것이 없는 VM은 건드리지 않는다. 고정했던 VM이 이제 걸 것이 없으면(노드 설정을 지움) 온라인 CPU 전체로
-/// 되돌린다. 바꾼 VM 수를 돌려준다(경고 로그를 남긴다).
+/// 검사 루프(§7·§10): 이 노드에서 도는 VM마다 스레드 고정을 기록과 지금 세 집합으로 셈해 드라이버로 맞춘다. 기록은
+/// 실행 디렉터리의 것(`hardware.json` — 지금 도는 QEMU의 것)이다: 다시 켠 직후에는 Raft 기록이 아직 앞 QEMU의 배치라
+/// 그것으로 걸면 다른 VM에 준 pCPU에 고정한다(리뷰 1). 실행 디렉터리 기록이 없으면(켜는 중) 건너뛴다. 걸 것이 없는
+/// VM(노드 설정이 없음, 설정을 지움)은 공유 집합(= 온라인 CPU 전체)으로 둔다 — opld가 예약 CPU에 묶여 있던 동안 켠
+/// QEMU가 그 친화를 물려받았을 수 있다. 바꾼 VM 수를 돌려준다(경고 로그를 남긴다).
 pub async fn repin(
     cluster: &Cluster,
     hv: &dyn Hypervisor,
@@ -311,22 +336,21 @@ pub async fn repin(
         if vm.status.node != Some(node) || vm.status.phase != VmPhase::Running {
             continue;
         }
-        let Some(hw) = &vm.status.hardware else {
+        let Some(hw) = hv.saved_hardware(vm.id) else {
             continue;
         };
         let placement = hw.host_placement.as_ref().filter(|p| p.node == node);
-        let want =
-            numa::pinning(hw.numa.as_ref(), placement, &hw.cpu, topology, &sets).or_else(|| {
-                hv.saved_pinning(vm.id).map(|old| RuntimePinning {
-                    emulator: topology.cpus.clone(),
-                    vcpus: Vec::new(),
-                    slots_per_socket: old.slots_per_socket,
-                    scope: old.scope.map(|_| topology.cpus.clone()),
-                })
+        let want = numa::pinning(hw.numa.as_ref(), placement, &hw.cpu, topology, &sets)
+            .unwrap_or_else(|| RuntimePinning {
+                emulator: sets.shared.clone(),
+                vcpus: Vec::new(),
+                slots_per_socket: numa::slots_per_socket(&hw.cpu),
+                // 스코프를 걸었던 VM만 넓힌다.
+                scope: hv
+                    .saved_pinning(vm.id)
+                    .and_then(|old| old.scope)
+                    .map(|_| sets.shared.clone()),
             });
-        let Some(want) = want else {
-            continue;
-        };
         match hv.repin(vm.id, &want).await {
             Ok(0) => {}
             Ok(n) => {
@@ -371,12 +395,14 @@ mod tests {
         let mut free = HostFree {
             dedicated: Default::default(),
             pages: [(key, 100)].into(),
+            memory: Default::default(),
         };
         clamp_pages(&mut free, &[(key, 40)].into(), None);
         assert_eq!(free.pages[&key], 40);
         let starting = HostUsage {
             dedicated: Default::default(),
             pages: [(key, 30)].into(),
+            memory: Default::default(),
         };
         clamp_pages(&mut free, &[(key, 40)].into(), Some(&starting));
         assert_eq!(free.pages[&key], 10);

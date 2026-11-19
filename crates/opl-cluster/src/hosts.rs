@@ -5,7 +5,7 @@
 //! 전용 CPU·hugepages를 쓰지 않는 VM(`demand` 0)은 보지 않으므로 그런 VM만 있는 클러스터는 지금과 같고, 그런 VM은 모든
 //! 노드가 `numa`를 알릴 때만 생기므로 복제본마다 판정이 같다(계획 62 할당량과 같은 논리).
 
-use opl_types::numa::{self, Demand, HostLimits, HostResources, NodeTopology};
+use opl_types::numa::{self, Demand, HostLimits, HostResources, NodeTopology, PageKind};
 use opl_types::resource::Kind;
 use opl_types::vm::VmSpec;
 use redb::{ReadableTable, Table};
@@ -28,11 +28,19 @@ fn placed_on(spec: &Value) -> Option<Uuid> {
     spec.get("node")?.as_str()?.parse().ok()
 }
 
-/// VM 스펙의 요구. 풀 수 없는 스펙(API가 쓰지 않는다)은 0이다.
-fn demand_of(spec: &Value, topology: Option<&NodeTopology>) -> Demand {
-    VmSpec::deserialize(spec)
+/// VM 스펙의 요구. 풀 수 없는 스펙(API가 쓰지 않는다)은 0이다. `any`는 상태의 기록(`hardware.numa.page`)이 있으면 켤
+/// 때 고른 크기로 센다([`Demand::resolve_any`]).
+fn demand_of(spec: &Value, status: &Value, topology: Option<&NodeTopology>) -> Demand {
+    let mut d = VmSpec::deserialize(spec)
         .map(|vm| numa::demand(&vm, topology))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    d.resolve_any(recorded_page(status));
+    d
+}
+
+/// 상태의 `hardware.numa.page`(켤 때 고른 hugepage 크기)
+fn recorded_page(status: &Value) -> Option<PageKind> {
+    PageKind::deserialize(status.get("hardware")?.get("numa")?.get("page")?).ok()
 }
 
 /// 장부 검사 하나. [`host_check`]가 만들고, VM을 한 번 훑으며 [`HostCheck::add`]로 그 노드의 다른 VM을 모은 뒤
@@ -99,9 +107,11 @@ pub(crate) fn host_check(
         }
         None => (None, None),
     };
-    let new = numa::demand(&vm, topology.as_ref());
+    let mut new = numa::demand(&vm, topology.as_ref());
+    // 스펙 쓰기는 상태를 바꾸지 않는다: 도는 VM의 `any`는 그 기록의 크기 그대로다.
+    new.resolve_any(old.and_then(|o| recorded_page(&o.status)));
     let old = match old {
-        Some(o) if was_on == Some(node) => demand_of(&o.spec, topology.as_ref()),
+        Some(o) if was_on == Some(node) => demand_of(&o.spec, &o.status, topology.as_ref()),
         _ => Demand::default(),
     };
     if new.within(&old) {
@@ -120,10 +130,11 @@ pub(crate) fn host_check(
 }
 
 impl HostCheck {
-    /// 훑기에서 만난 VM 하나(`id`, 저장된 스펙)를 센다.
-    pub(crate) fn add(&mut self, id: Uuid, spec: &Value) {
-        if id != self.vm && placed_on(spec) == Some(self.node) {
-            self.others.add(&demand_of(spec, self.topology.as_ref()));
+    /// 훑기에서 만난 VM 하나(`id`, 저장된 리소스)를 센다.
+    pub(crate) fn add(&mut self, id: Uuid, raw: &RawResource) {
+        if id != self.vm && placed_on(&raw.spec) == Some(self.node) {
+            self.others
+                .add(&demand_of(&raw.spec, &raw.status, self.topology.as_ref()));
         }
     }
 
@@ -134,7 +145,7 @@ impl HostCheck {
             for item in objects.range((kind, 0u128)..=(kind, u128::MAX))? {
                 let (key, v) = item?;
                 let raw: RawResource = serde_json::from_slice(v.value())?;
-                self.add(Uuid::from_u128(key.value().1), &raw.spec);
+                self.add(Uuid::from_u128(key.value().1), &raw);
             }
         }
         let mut before = self.others.clone();
@@ -447,5 +458,76 @@ mod tests {
         );
         // 쓰지 않는 VM은 늘 된다.
         sm.vm(5, vm(none, "running", json!({}))).unwrap();
+    }
+
+    /// 리뷰 1 C1: 호스트 노드에 묶는 보통 메모리(전용·`numa.memory`, hugepages 없이)는 노드의 보통 메모리 합(16384 −
+    /// 2M 풀 1024 = 15360 MiB)과 견준다. 묶지 않는 VM은 세지 않는다.
+    #[test]
+    fn bound_memory_is_counted_against_the_small_memory() {
+        let mut sm = Sm::new();
+        sm.node(N1, "2-3");
+        let bound = |mib: u32| {
+            vm(
+                N1,
+                "running",
+                json!({"cpu": {"cores": 1}, "numa": {"nodes": 1, "memory": "strict"}, "memory_mib": mib}),
+            )
+        };
+        sm.vm(1, bound(8192)).unwrap();
+        sm.vm(2, vm(N1, "running", json!({"memory_mib": 8192})))
+            .unwrap();
+        assert_eq!(
+            sm.vm(3, bound(8192)),
+            Err(exceeded(HostResource::BoundMemory, 15360, 16384))
+        );
+        sm.vm(3, bound(7168)).unwrap();
+    }
+
+    /// 리뷰 1 M6: 켤 때 1G로 풀린 `any` VM은 1G 몫에도 센다(기록 `hardware.numa.page`).
+    #[test]
+    fn running_any_vms_count_in_the_size_they_got() {
+        let mut sm = Sm::new();
+        let spec = json!({
+            "address": "127.0.0.1:1",
+            "host_resources": {"reserved_cpus": "", "dedicated_cpus": "2-3"},
+        });
+        let status = json!({"topology": {
+            "sockets": 1, "threads_per_core": 1, "cpus": "0-7", "pinning": true, "cpuset": true,
+            "probed_at": 1,
+            "nodes": [{"id": 0, "cpus": "0-7", "memory_mib": 16384,
+                       "hugepages": [{"size_kib": 2048, "total": 512}, {"size_kib": 1048576, "total": 2}]}],
+        }});
+        sm.create(Kind::Node, N1, spec, status).unwrap();
+        let any = vm(
+            N1,
+            "running",
+            json!({"hugepages": "any", "memory_mib": 2048}),
+        );
+        sm.vm(1, any.clone()).unwrap();
+        let one_g = vm(
+            N1,
+            "running",
+            json!({"hugepages": "1G", "memory_mib": 1024}),
+        );
+        // 아직 켜지 않음: `any`는 두 크기 합에만 센다.
+        sm.vm(
+            2,
+            vm(
+                N1,
+                "stopped",
+                json!({"hugepages": "1G", "memory_mib": 1024}),
+            ),
+        )
+        .unwrap();
+        sm.status(
+            1,
+            json!({"hardware": {"numa": {"nodes": [], "page": "1G"}}}),
+        );
+        assert_eq!(
+            sm.update(2, one_g),
+            Err(exceeded(HostResource::Hugepages1G, 2048, 3072))
+        );
+        // 그 VM 자신의 스펙 쓰기(이름 등)는 같은 크기로 세어 늘지 않는다.
+        sm.update(1, any).unwrap();
     }
 }

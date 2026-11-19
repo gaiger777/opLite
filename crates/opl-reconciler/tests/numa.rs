@@ -283,3 +283,70 @@ async fn repin_fixes_drift_and_follows_the_shared_set() {
     assert_eq!(pin.emulator, set("0-1"));
     assert_eq!(pin.vcpus.len(), 1);
 }
+
+/// 리뷰 1 M2: 검사 루프는 실행 디렉터리의 기록(지금 도는 QEMU의 것)으로 고정한다. 다시 켠 직후 Raft 기록이 아직 앞
+/// QEMU의 배치여도 그 pCPU로 옮기지 않는다.
+#[tokio::test]
+async fn repin_follows_the_running_qemu_record() {
+    let env = Env::start().await;
+    add_node(&env, Some(resources())).await;
+    let db = dedicated(&env, "db", 1);
+    env.create(&db).await;
+    let got = running(&env, db.id).await;
+    let mine = got
+        .status
+        .hardware
+        .as_ref()
+        .unwrap()
+        .host_placement
+        .clone()
+        .unwrap();
+    assert_eq!(mine.vcpus, [2]);
+    let mut status = got.status.clone();
+    let hw = status.hardware.as_mut().unwrap();
+    hw.host_placement.as_mut().unwrap().vcpus = vec![3];
+    env.cluster
+        .update_status::<opl_types::vm::VmSpec>(db.id, &status)
+        .await
+        .unwrap();
+    assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 0);
+    assert_eq!(env.hv.saved_pinning(db.id).unwrap().vcpus, [set("2")]);
+}
+
+/// 리뷰 1 I5: 걸 것이 없는 VM(노드 설정 없음)도 스레드가 온라인 CPU 전체(= 공유 집합)가 아니면 되돌린다 — opld가 예약
+/// CPU에 묶인 동안 켠 QEMU가 그 친화를 물려받았을 수 있다. 스코프는 건드리지 않는다.
+#[tokio::test]
+async fn repin_returns_unpinned_vms_to_every_online_cpu() {
+    let env = Env::start().await;
+    add_node(&env, None).await;
+    let plain = vm("web", env.node);
+    env.create(&plain).await;
+    running(&env, plain.id).await;
+    assert_eq!(env.hv.saved_pinning(plain.id), None);
+    repin(&env.cluster, &*env.hv, env.node).await.unwrap();
+    let pin = env.hv.saved_pinning(plain.id).unwrap();
+    assert_eq!(
+        (pin.emulator.clone(), pin.vcpus.is_empty(), pin.scope),
+        (set("0-3"), true, None)
+    );
+    let mut drifted = env.hv.saved_pinning(plain.id).unwrap();
+    drifted.emulator = set("0");
+    env.hv.drift_pinning(plain.id, drifted);
+    assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 1);
+    assert_eq!(env.hv.saved_pinning(plain.id).unwrap().emulator, set("0-3"));
+    assert_eq!(repin(&env.cluster, &*env.hv, env.node).await.unwrap(), 0);
+}
+
+/// 리뷰 1 M3: opld가 다시 뜨면 도는 QEMU의 저장된 배치를 예약으로 다시 잡는다(기록이 Raft에 닿기 전에 죽었을 때).
+#[tokio::test]
+async fn a_restarted_allocator_holds_the_running_placements() {
+    let env = Env::start().await;
+    add_node(&env, Some(resources())).await;
+    let db = dedicated(&env, "db", 2);
+    env.create(&db).await;
+    running(&env, db.id).await;
+    let fresh = HostAllocator::new(env.node, None);
+    assert!(fresh.held().is_empty());
+    fresh.hold_saved(&*env.hv).await;
+    assert_eq!(fresh.held(), [db.id]);
+}

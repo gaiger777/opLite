@@ -1186,7 +1186,8 @@ pub(crate) async fn group(
             if let Some(d) = description {
                 spec["description"] = json!(d);
             }
-            let body = json!({ "labels": current["labels"], "spec": spec });
+            let labels = current.get("labels").cloned().unwrap_or_else(|| json!({}));
+            let body = json!({ "labels": labels, "spec": spec });
             let r = client
                 .request(reqwest::Method::PUT, &path)
                 .json(&body)

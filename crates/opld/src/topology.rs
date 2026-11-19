@@ -393,6 +393,16 @@ pub fn warnings(
             out.push(format!("{name} CPUs {off} are offline"));
         }
     }
+    if topology
+        .cpus
+        .difference(&r.reserved_cpus)
+        .difference(&r.dedicated_cpus)
+        .is_empty()
+    {
+        out.push(
+            "no shared CPU is online (reserved and dedicated CPUs cover every online CPU); shared VMs and emulator threads run on all online CPUs".into(),
+        );
+    }
     let dedicated = r.dedicated_cpus.intersection(&topology.cpus);
     if let Some(pid1) = pid1 {
         let exposed = dedicated.difference(&topology.isolated).intersection(pid1);
@@ -527,6 +537,36 @@ pub struct TopologyWatch {
     last: Option<NodeTopology>,
     /// 마지막으로 읽은 뒤 지난 회차
     rounds: u32,
+    /// `systemctl --version`의 판(읽지 않았으면 None, 읽지 못했으면 Some(None)). `AllowedCPUs=`는 systemd 244부터다.
+    systemd: Option<Option<u32>>,
+}
+
+/// 스코프에 `AllowedCPUs=`를 걸 수 있는 가장 낮은 systemd 판
+const SYSTEMD_ALLOWED_CPUS: u32 = 244;
+
+/// `systemctl --version` 첫 줄의 판(`systemd 255 (255.4-1ubuntu8.18)` → 255)
+pub fn systemd_version(text: &str) -> Option<u32> {
+    text.lines()
+        .next()?
+        .strip_prefix("systemd ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// 이 호스트의 systemd 판(읽지 못하면 None)
+async fn read_systemd_version() -> Option<u32> {
+    let out = tokio::process::Command::new("systemctl")
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), out)
+        .await
+        .ok()?
+        .ok()?;
+    systemd_version(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// 막히는 쪽(spawn_blocking)에서 한 일
@@ -549,7 +589,15 @@ impl TopologyWatch {
             pin_error: None,
             last: None,
             rounds: 0,
+            systemd: None,
         }
+    }
+
+    /// systemd 판을 읽지 않고 정한다(시험).
+    #[cfg(test)]
+    pub fn with_systemd_version(mut self, version: Option<u32>) -> Self {
+        self.systemd = Some(version);
+        self
     }
 
     /// 마지막 결과(아직 읽지 않았으면 None)
@@ -570,6 +618,9 @@ impl TopologyWatch {
     /// `now`다. 읽지 못하면 앞 결과에 `error`만 단다.
     pub async fn refresh(&mut self, resources: Option<&HostResources>, now: u64) -> &NodeTopology {
         self.rounds = 0;
+        if self.systemd_scope && self.systemd.is_none() {
+            self.systemd = Some(read_systemd_version().await);
+        }
         let changed = self.applied.as_ref().map(Option::as_ref) != Some(resources);
         let (sys, proc) = (self.sys.clone(), self.proc.clone());
         let wanted = resources
@@ -597,9 +648,21 @@ impl TopologyWatch {
         self.applied = Some(resources.cloned());
         let mut topology = match outcome.result {
             Ok(mut t) => {
-                t.cpuset = t.cpuset && self.systemd_scope;
+                // 옛 systemd(244 전)는 `--property=AllowedCPUs=`를 모르는 칸으로 거절해 모든 VM 켜기가 실패한다: 스코프에는
+                // 걸지 않고 스레드 친화만 건다(리뷰 1).
+                let version = self.systemd.flatten();
+                let old_systemd = t.cpuset
+                    && self.systemd_scope
+                    && version.is_none_or(|v| v < SYSTEMD_ALLOWED_CPUS);
+                t.cpuset = t.cpuset && self.systemd_scope && !old_systemd;
                 self.pin(resources, &t.cpus);
                 let mut warn = warnings(&t, resources, outcome.pid1.as_ref());
+                if old_systemd && resources.is_some() {
+                    warn.push(format!(
+                        "systemd {} cannot limit VM scopes to CPUs (AllowedCPUs needs systemd {SYSTEMD_ALLOWED_CPUS}); only the thread affinity is set",
+                        version.map_or_else(|| "of unknown version".into(), |v| v.to_string())
+                    ));
+                }
                 warn.extend(self.reserve_errors.iter().cloned());
                 warn.extend(self.pin_error.iter().cloned());
                 t.warnings = warn;
@@ -843,6 +906,20 @@ mod tests {
         );
         // PID 1을 모르면 그 경고는 없다.
         assert_eq!(warnings(&t, Some(&r), None).len(), 3);
+
+        // 리뷰 1 M7: CPU가 오프라인이 되어 공유가 비면 알린다(공유 VM·에뮬레이터는 온라인 CPU 전체에서 돈다).
+        let all = resources(
+            "0-1",
+            &format!("2-{}", t.cpus.iter().max().unwrap()),
+            vec![],
+        );
+        assert!(
+            warnings(&t, Some(&all), None)
+                .iter()
+                .any(|w| w.starts_with("no shared CPU is online")),
+            "{:?}",
+            warnings(&t, Some(&all), None)
+        );
     }
 
     /// 예약은 노드마다·전체 `nr_hugepages`에 지금 수와 다를 때만 쓰고, 다음 탐침이 얻은 수를 읽는다. 쓰지 못하면 까닭을
@@ -905,7 +982,8 @@ mod tests {
     async fn the_watch_applies_settings_and_keeps_the_time_when_nothing_changes() {
         let dir = copy_fixture("x86-2s");
         let sys = dir.path().join("sys");
-        let mut watch = TopologyWatch::new(&sys, dir.path().join("proc"), true);
+        let mut watch =
+            TopologyWatch::new(&sys, dir.path().join("proc"), true).with_systemd_version(Some(255));
         watch.poll(None, 100).await;
         let first = watch.last().unwrap().clone();
         assert_eq!(first.probed_at, 100);
@@ -955,6 +1033,34 @@ mod tests {
 
         let mut unscoped = TopologyWatch::new(fixture("x86-2s/sys"), fixture("x86-2s/proc"), false);
         assert!(!unscoped.refresh(None, 1).await.cpuset);
+    }
+
+    /// 리뷰 1 M4: systemd 244 전(또는 판을 모름)이면 스코프에 `AllowedCPUs`를 걸지 않고(`cpuset` 거짓) 노드 설정이 있을
+    /// 때 경고한다.
+    #[tokio::test]
+    async fn old_systemd_gets_no_allowed_cpus() {
+        assert_eq!(
+            systemd_version("systemd 255 (255.4-1ubuntu8.18)\n+PAM +AUDIT"),
+            Some(255)
+        );
+        assert_eq!(systemd_version("systemd 241 (241)"), Some(241));
+        assert_eq!(systemd_version("nope"), None);
+        let r = resources("", "4-15", Vec::new());
+        let root = (fixture("x86-2s/sys"), fixture("x86-2s/proc"));
+        let mut old = TopologyWatch::new(&root.0, &root.1, true).with_systemd_version(Some(241));
+        let t = old.refresh(Some(&r), 1).await.clone();
+        assert!(!t.cpuset);
+        assert!(
+            t.warnings
+                .iter()
+                .any(|w| w.contains("systemd 241 cannot limit VM scopes")),
+            "{:?}",
+            t.warnings
+        );
+        let mut unknown = TopologyWatch::new(&root.0, &root.1, true).with_systemd_version(None);
+        assert!(!unknown.refresh(None, 1).await.cpuset);
+        let mut new = TopologyWatch::new(&root.0, &root.1, true).with_systemd_version(Some(244));
+        assert!(new.refresh(Some(&r), 1).await.cpuset);
     }
 
     /// 크기(§6): 2소켓 × 64코어 × 2스레드(256 CPU), 노드 2, L3 16의 JSON. 4 KB를 넘으면 형제 묶음을 줄여야 한다.

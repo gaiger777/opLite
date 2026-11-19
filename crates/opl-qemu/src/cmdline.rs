@@ -281,7 +281,13 @@ pub fn build_cmdline(
             let page = numa.page.filter(|p| *p == PageKind::Size2M);
             let id = format!("vmem{i}");
             let place = spec.host_placement.as_ref();
-            a.opt("-object", backend(numa, place, i, &id, *size, page));
+            let mut object = backend(numa, place, i, &id, *size, page);
+            if page.is_some() {
+                // hugetlb mmap은 MAP_NORESERVE 없이는 상한 전체의 페이지를 띄울 때 예약한다(`HugePages_Rsvd`): 꽂을 때
+                // 장치의 `prealloc=on`이 잡게 하고 띄울 때는 잡지 않는다(리뷰 1, QEMU 6.1+ `reserve`, 7.1+ 장치 `prealloc`).
+                object.push_str(",reserve=off");
+            }
+            a.opt("-object", object);
             let prealloc = if numa.page == Some(PageKind::Size2M) {
                 ",prealloc=on"
             } else {
@@ -1656,13 +1662,20 @@ mod tests {
         });
         let args = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
         let has = |s: &str| args.iter().any(|a| a == s);
-        // 상한 16384 − 4096 = 12288을 둘로, 꽂은 2048도 둘로
+        // 상한 16384 − 4096 = 12288을 둘로, 꽂은 2048도 둘로. 리뷰 1: 상한의 페이지를 띄울 때 예약하지 않는다(`reserve=off`).
         assert!(has(
-            "memory-backend-memfd,id=vmem0,size=6144M,hugetlb=on,hugetlbsize=2M,host-nodes=0,policy=bind"
+            "memory-backend-memfd,id=vmem0,size=6144M,hugetlb=on,hugetlbsize=2M,host-nodes=0,policy=bind,reserve=off"
         ));
         assert!(has(
-            "memory-backend-memfd,id=vmem1,size=6144M,hugetlb=on,hugetlbsize=2M,host-nodes=1,policy=bind"
+            "memory-backend-memfd,id=vmem1,size=6144M,hugetlb=on,hugetlbsize=2M,host-nodes=1,policy=bind,reserve=off"
         ));
+        // 켤 때 메모리는 그대로 예약하고 미리 잡는다.
+        assert!(
+            args.iter()
+                .filter(|a| a.contains("id=ram-node"))
+                .all(|a| !a.contains("reserve=off") && a.contains("prealloc=on")),
+            "{args:?}"
+        );
         assert!(has(
             "virtio-mem-pci,id=vmem0-dev,memdev=vmem0,node=0,block-size=2M,requested-size=1024M,prealloc=on"
         ));

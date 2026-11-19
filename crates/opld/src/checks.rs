@@ -1430,11 +1430,10 @@ mod tests {
                 .success()
         );
         let mut state = s.state(&[]);
-        state.topology = Some(TopologyWatch::new(
-            root.join("sys"),
-            root.join("proc"),
-            true,
-        ));
+        state.topology = Some(
+            TopologyWatch::new(root.join("sys"), root.join("proc"), true)
+                .with_systemd_version(Some(255)),
+        );
         run_once(&mut state).await;
         assert_eq!(s.node().status.topology, None);
         assert!(state.topology.as_ref().unwrap().last().is_some());

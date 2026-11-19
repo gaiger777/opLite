@@ -536,7 +536,7 @@ fn check_exclusive(
             q.add(objects, names, other, &other_spec.spec)?;
         }
         if let Some(h) = host.as_deref_mut() {
-            h.add(other, &other_spec.spec);
+            h.add(other, &other_spec);
         }
         for (field, value) in exclusive_values(kind, &other_spec.spec) {
             if wanted.iter().any(|(f, v)| *f == field && *v == value) {

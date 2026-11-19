@@ -676,8 +676,21 @@ async fn host_resources_are_checked_and_kept() {
     assert_eq!(nobody.get("/topology/usage").await.0, StatusCode::FORBIDDEN);
     assert_eq!(nobody.get("/vms/db/numa").await.0, StatusCode::NOT_FOUND);
 
-    // `{}`는 지운다.
+    // `{}`는 지운다. 리뷰 1 M1: 고정된 VM(db)이 있으면 지우기도 409 `host_cpus_in_use`(공유 VM이 그 pCPU로 퍼짐),
+    // force면 지우고 경고한다.
     let (status, body) = admin.put("/nodes/n1", put(Some(json!({}))), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "host_cpus_in_use", "{body}");
+    assert_eq!(body["details"]["vms"], json!(["db"]), "{body}");
+    let (status, headers, body) = admin
+        .send_headers(
+            reqwest::Method::PUT,
+            "/nodes/n1?force=true",
+            put(Some(json!({}))),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["spec"].get("host_resources").is_none(), "{body}");
+    let warning = headers["orbivisor-warning"].to_str().unwrap();
+    assert!(warning.contains("db (4-5)"), "{warning}");
 }

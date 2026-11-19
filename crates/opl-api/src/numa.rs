@@ -155,11 +155,15 @@ pub(crate) fn host_resources_change(
             .map_or_else(|| "none".into(), HostResources::describe)
     ));
     let Some(r) = &value else {
-        // 지우기: 공유 = 모든 CPU로 돌아간다. 도는 전용 VM은 다음 검사 회차에 온라인 CPU 전체로 풀린다.
+        // 지우기: 공유 = 모든 CPU로 돌아간다. 도는 전용 VM은 껐다 켤 때까지 기록된 pCPU에 고정된 채이고 공유 VM이 그
+        // pCPU로도 퍼지므로(전용이 아니게 됨) 고정된 VM이 있으면 409 `host_cpus_in_use`, `force`면 경고다(리뷰 1). hugepages
+        // 예약을 빼도 커널 수는 그대로라 보지 않는다.
+        let inv = Inventory::load(&state.cluster)?;
+        let warnings = pinned_conflict(&pinned_outside(&inv, node, &CpuSet::new()), node, force)?;
         return Ok(HostResourcesChange {
             value,
             audit,
-            warnings: Vec::new(),
+            warnings,
         });
     };
     require_feature(&state.cluster, NUMA)?;
@@ -179,26 +183,8 @@ pub(crate) fn host_resources_change(
     r.validate(topology)
         .map_err(|e| invalid(format!("node {:?}: {e}", node.name)))?;
     let inv = Inventory::load(&state.cluster)?;
-    let mut warnings = Vec::new();
-    let pinned = pinned_outside(&inv, node, &r.dedicated_cpus);
-    if !pinned.is_empty() {
-        let names: Vec<&str> = pinned.iter().map(|(n, _)| n.as_str()).collect();
-        let message = format!(
-            "running VMs are pinned to CPUs outside the new dedicated CPUs of node {:?}: {}",
-            node.name,
-            pinned
-                .iter()
-                .map(|(n, cpus)| format!("{n} ({cpus})"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        if !force {
-            let mut e = ApiError::conflict("host_cpus_in_use", message);
-            e.details = Some(serde_json::json!({ "vms": names }));
-            return Err(e);
-        }
-        warnings.push(message);
-    }
+    let mut warnings =
+        pinned_conflict(&pinned_outside(&inv, node, &r.dedicated_cpus), node, force)?;
     let short = hugepages_short(&inv, node, topology, r);
     if !short.is_empty() {
         let message = format!(
@@ -218,6 +204,33 @@ pub(crate) fn host_resources_change(
         audit,
         warnings,
     })
+}
+
+/// 고정된 pCPU가 새 전용 CPU 밖인 VM(`pinned`)이 있으면 409 `host_cpus_in_use`(`details.vms`), `force`면 경고 하나
+fn pinned_conflict(
+    pinned: &[(String, CpuSet)],
+    node: &Node,
+    force: bool,
+) -> Result<Vec<String>, ApiError> {
+    if pinned.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names: Vec<&str> = pinned.iter().map(|(n, _)| n.as_str()).collect();
+    let message = format!(
+        "running VMs are pinned to CPUs outside the new dedicated CPUs of node {:?}: {}",
+        node.name,
+        pinned
+            .iter()
+            .map(|(n, cpus)| format!("{n} ({cpus})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if !force {
+        let mut e = ApiError::conflict("host_cpus_in_use", message);
+        e.details = Some(serde_json::json!({ "vms": names }));
+        return Err(e);
+    }
+    Ok(vec![message])
 }
 
 /// 노드 `node`에서 도는 VM 가운데 기록된 고정 pCPU(vCPU·비워 둔 형제·`isolate` 에뮬레이터)가 `dedicated` 밖인 것(이름,

@@ -47,9 +47,18 @@ pub struct CreateRequest<S> {
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateRequest<S> {
-    #[serde(default)]
+    /// 바꾼 뒤의 레이블 전체. 없거나 `null`이면 레이블이 없다(GET은 빈 레이블을 빼므로 읽어 다시 쓰는 클라이언트가
+    /// `null`을 보낼 수 있다).
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub labels: BTreeMap<String, String>,
     pub spec: S,
+}
+
+/// `null`을 빈 레이블로 받는다.
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    Ok(Option::<BTreeMap<String, String>>::deserialize(d)?.unwrap_or_default())
 }
 
 /// 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다.
@@ -834,4 +843,22 @@ pub async fn update_node(
         out.insert(crate::revision::WARNING, v);
     }
     Ok((out, Json(lookup::<NodeSpec>(&state.cluster, &key)?)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 읽어 다시 쓰는 클라이언트가 보낸 `labels: null`은 레이블 없음이다(없는 칸과 같다).
+    #[test]
+    fn null_labels_mean_no_labels() {
+        let r: UpdateRequest<serde_json::Value> =
+            serde_json::from_str(r#"{"labels": null, "spec": {}}"#).unwrap();
+        assert!(r.labels.is_empty());
+        let r: UpdateRequest<serde_json::Value> =
+            serde_json::from_str(r#"{"labels": {"a": "b"}, "spec": {}}"#).unwrap();
+        assert_eq!(r.labels["a"], "b");
+        let r: UpdateRequest<serde_json::Value> = serde_json::from_str(r#"{"spec": {}}"#).unwrap();
+        assert!(r.labels.is_empty());
+    }
 }

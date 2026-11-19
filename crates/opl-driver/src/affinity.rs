@@ -13,6 +13,29 @@ pub fn allowed_list(status: &str) -> Option<CpuSet> {
         .and_then(|v| v.trim().parse().ok())
 }
 
+/// systemd가 보이는 CPU 목록(`systemctl show --property=AllowedCPUs`): 범위를 빈칸으로 가른다(`0-1 4-15`). 비면 빈
+/// 집합이다(걸지 않음).
+pub fn systemd_cpus(text: &str) -> Option<CpuSet> {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(",")
+        .parse()
+        .ok()
+}
+
+/// 고정(`pinning`)이 없는 VM의 자식(QEMU·swtpm)에 걸 친화: opld 자신의 친화(`proc/self/status`)가 온라인 CPU
+/// (`sys/devices/system/cpu/online`) 전체와 다르면(예약 CPU에 묶여 있음 — 노드 설정을 지운 직후 opld가 아직 풀리기 전
+/// 등) 온라인 전체, 같거나 읽지 못하면 None(물려받아도 된다). 새 QEMU가 예약 CPU를 물려받지 않게 한다(리뷰 1).
+pub fn unpinned_child(proc: &Path, sys: &Path) -> Option<CpuSet> {
+    let own = allowed_list(&std::fs::read_to_string(proc.join("self/status")).ok()?)?;
+    let online: CpuSet = std::fs::read_to_string(sys.join("devices/system/cpu/online"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    (!online.is_empty() && own != online).then_some(online)
+}
+
 /// 스레드 `tid`(프로세스 `pid`)의 친화. 읽지 못하면(끝난 스레드) None
 pub fn thread_cpus(proc: &Path, pid: u32, tid: u32) -> Option<CpuSet> {
     let path = proc.join(format!("{pid}/task/{tid}/status"));
@@ -162,6 +185,40 @@ mod tests {
             Some("0-3,8".parse().unwrap())
         );
         assert_eq!(allowed_list("Name:\tx\n"), None);
+    }
+
+    /// 리뷰 1 I4: systemd는 범위를 빈칸으로 가른다.
+    #[test]
+    fn systemd_cpu_lists_use_spaces() {
+        assert_eq!(
+            systemd_cpus("0-1 4-15\n"),
+            Some("0-1,4-15".parse().unwrap())
+        );
+        assert_eq!(systemd_cpus("3"), Some("3".parse().unwrap()));
+        assert_eq!(systemd_cpus(""), Some(CpuSet::new()));
+        assert_eq!(systemd_cpus("x y"), None);
+    }
+
+    /// 리뷰 1 I5: opld가 온라인 CPU 전체보다 좁게 묶여 있으면 고정 없는 자식은 온라인 전체로 둔다.
+    #[test]
+    fn unpinned_children_get_every_online_cpu_when_opld_is_narrowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (proc, sys) = (tmp.path().join("proc"), tmp.path().join("sys"));
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        std::fs::create_dir_all(sys.join("devices/system/cpu")).unwrap();
+        std::fs::write(sys.join("devices/system/cpu/online"), "0-7\n").unwrap();
+        let status = |cpus: &str| {
+            std::fs::write(
+                proc.join("self/status"),
+                format!("Name:\topld\nCpus_allowed_list:\t{cpus}\n"),
+            )
+            .unwrap()
+        };
+        status("0-1");
+        assert_eq!(unpinned_child(&proc, &sys), Some("0-7".parse().unwrap()));
+        status("0-7");
+        assert_eq!(unpinned_child(&proc, &sys), None);
+        assert_eq!(unpinned_child(&tmp.path().join("none"), &sys), None);
     }
 
     #[test]

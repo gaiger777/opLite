@@ -152,6 +152,10 @@ async fn folder_grants_quotas_scoped_tokens_and_two_factor_on_one_node() {
     d.ctl(&["group", "create", "team-a", "--member", "alice"])
         .await
         .unwrap();
+    // 레이블 없는 그룹을 읽어 다시 쓴다(`labels: null`을 보내 400이던 것, 계획 64 리뷰 1).
+    d.ctl(&["group", "set", "team-a", "--description", "team A"])
+        .await
+        .unwrap();
     d.ctl(&[
         "grant", "add", "--group", "team-a", "--role", "operator", "--on", "/teamA",
     ])

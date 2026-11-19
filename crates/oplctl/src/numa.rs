@@ -834,7 +834,9 @@ pub(crate) async fn node_resources(
     if args.force {
         target.push_str("?force=true");
     }
-    let body = json!({ "spec": spec, "labels": current["labels"] });
+    // GET은 빈 레이블을 빼므로 그대로 옮기면 `null`이다(리뷰 1 GitHub 탐침).
+    let labels = current.get("labels").cloned().unwrap_or_else(|| json!({}));
+    let body = json!({ "spec": spec, "labels": labels });
     let req = client
         .request(Method::PUT, &target)
         .header("if-match", current["revision"].to_string())
@@ -1032,5 +1034,45 @@ mod tests {
         assert!(parse_reserves("3M:1").is_err());
         assert!(parse_reserves("2M:x").is_err());
         assert!(R::try_parse_from(["r", "--clear", "--dedicated-cpus", "1"]).is_err());
+    }
+
+    /// 계획 64 GitHub 탐침: 레이블이 없는 노드(GET이 `labels`를 뺌)를 `labels: null`로 PUT해 서버가 400이었다. 빈 맵을
+    /// 보내고 `If-Match`·나머지 스펙은 읽은 그대로다.
+    #[tokio::test]
+    async fn node_resources_send_labels_as_a_map() {
+        let (client, seen) = crate::fake_api::fake_api(|method, _| {
+            let node = json!({
+                "id": "n", "name": "node1", "revision": 9,
+                "spec": { "address": "a:1", "maintenance": false },
+                "status": {}
+            });
+            if method == "PUT" {
+                let mut n = node;
+                n["spec"]["host_resources"] = json!({ "dedicated_cpus": "2-3" });
+                (200, n)
+            } else {
+                (200, node)
+            }
+        })
+        .await;
+        let args = R::try_parse_from(["r", "--dedicated-cpus", "2-3"])
+            .unwrap()
+            .res;
+        let mut out = Vec::new();
+        node_resources(&client, "node1", &args, false, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "node node1: dedicated=2-3\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[1].line, "PUT /api/v1/nodes/node1 HTTP/1.1");
+        assert_eq!(seen[1].if_match.as_deref(), Some("9"));
+        assert_eq!(
+            seen[1].body,
+            json!({ "labels": {}, "spec": { "address": "a:1", "maintenance": false,
+                    "host_resources": { "dedicated_cpus": "2-3" } } })
+        );
     }
 }

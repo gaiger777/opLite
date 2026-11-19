@@ -509,19 +509,13 @@ impl Member {
         );
         // API 서버, 노드 간 서버, Raft 감시가 보낸다.
         let (exited_tx, exited) = mpsc::channel(3);
-        // 노드 할당기(계획 64): 작업자와 받는 쪽이 나눈다. Linux는 `/sys`의 실제 빈 hugepages를 본다. 받는 중인 QEMU의
-        // 배치(실행 디렉터리의 기록)는 opld가 다시 떠도 예약으로 남긴다.
+        // 노드 할당기(계획 64): 작업자와 받는 쪽이 나눈다. Linux는 `/sys`의 실제 빈 hugepages를 본다. 도는 QEMU와 받는
+        // 중인 QEMU의 배치(실행 디렉터리의 기록)는 opld가 다시 떠도 예약으로 남긴다.
         let host_alloc = Arc::new(HostAllocator::new(
             node,
             cfg!(target_os = "linux").then(|| PathBuf::from("/sys")),
         ));
-        for (vm, _task) in hv.list_incoming().await.unwrap_or_default() {
-            if let Some(hw) = hv.saved_hardware(vm)
-                && let (Some(numa), Some(placement)) = (hw.numa, hw.host_placement)
-            {
-                host_alloc.hold(vm, numa, placement);
-            }
-        }
+        host_alloc.hold_saved(&*hv).await;
         // 받는 VM은 원본 노드에 배정된 채이므로 reconciler 없이 받는다.
         let incoming = IncomingMigrations::new(
             cluster.clone(),

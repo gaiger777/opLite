@@ -296,7 +296,16 @@ impl Inventory {
             if !placement::occupied(v, assign).contains(&node.id) {
                 continue;
             }
-            total.add(&numa::demand(&v.spec, Some(topology)));
+            let mut d = numa::demand(&v.spec, Some(topology));
+            // Raft 장부처럼 도는 `any` VM은 켤 때 고른 크기로 센다.
+            d.resolve_any(
+                v.status
+                    .hardware
+                    .as_ref()
+                    .and_then(|hw| hw.numa.as_ref())
+                    .and_then(|n| n.page),
+            );
+            total.add(&d);
             match &v.status.hardware {
                 Some(hw) => match (&hw.numa, &hw.host_placement) {
                     (Some(n), Some(p)) if p.node == node.id => records.push((n, p)),
