@@ -5,7 +5,7 @@ import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { api, ApiError, call } from "@/api/client";
-import { useList, useSettings } from "@/api/live";
+import { SETTINGS_KEY, useList, useSettings } from "@/api/live";
 import type { components } from "@/api/schema";
 import type { Settings } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
@@ -71,11 +71,13 @@ export function cpuPatch(
 ): Schemas["CpuSettingsPatch"] {
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
   const want = v.mode === "auto" ? "auto" : "off";
-  // 저장된 값과 견준다: `auto` + 고정인 설정에서 "끔"을 고르면 `baseline: off`도 보내야 한다(리뷰 1 웹 #5).
+  // 저장된 값과 견준다: `auto` + 고정인 설정에서 "끔"을 고르면 `baseline: off`도 보내야 한다(리뷰 1 웹 #5). 모드를
+  // 바꿨을 때만 보낸다 — 고정은 "고정"으로 보이지만 저장된 `baseline`은 `auto`일 수 있다(CLI로 x86_64 자동 + aarch64
+  // 고정). 고정에서 고정은 `baseline`을 건드리지 않는다(리뷰 2 웹 #1).
   const had = current.stored ?? (current.mode === "auto" ? "auto" : "off");
   const pinned = pinnedList(v);
   const patch: Schemas["CpuSettingsPatch"] = {
-    ...(want !== had && { baseline: want }),
+    ...(v.mode !== current.mode && want !== had && { baseline: want }),
     ...(!same(pinned, pinnedList(current)) && { pinned }),
     ...(v.autoFlags !== current.autoFlags && { auto_flags: v.autoFlags }),
     ...(!same([...v.mask].sort(), [...current.mask].sort()) && { mask: v.mask }),
@@ -128,12 +130,19 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
   const current = cpuValues(settings.data.spec);
   const base = draft?.base ?? current;
   const values = draft?.values ?? current;
-  const revision = draft?.revision ?? settings.data.revision;
+  // 그 사이 CPU 칸이 그대로면(같은 페이지의 다른 절, 다른 사람의 다른 설정, 원격 측정 상태 쓰기) 새 revision을 쓴다 —
+  // CPU를 바꾼 때만 412로 알린다(리뷰 2 웹 #2).
+  const revision =
+    draft && JSON.stringify(current) !== JSON.stringify(draft.base)
+      ? draft.revision
+      : settings.data.revision;
   const change = (patch: Partial<CpuValues>) => {
     setDraft({ base, revision, values: { ...values, ...patch } });
     setBlocked(null);
   };
   const discard = () => {
+    // 연결이 끊겨 watch가 새 설정을 밀어 주지 않았을 수 있으니 다시 읽는다(리뷰 2 웹 #4).
+    void queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
     setDraft(null);
     setConflict(false);
     setError(null);
@@ -223,7 +232,8 @@ export function CpuSettingsSection({ write }: { write: boolean }) {
                     pinned[a.arch] = {
                       model: a.baseline.model,
                       flags: Object.entries(a.baseline.flags ?? {})
-                        .filter(([name, on]) => on || !values.mask.includes(name))
+                        // 저장된 숨김 목록으로 거른다: 기준의 `-이름`은 저장된 목록에서 왔다(리뷰 2 웹 #7).
+                        .filter(([name, on]) => on || !base.mask.includes(name))
                         .map(([name, on]) => `${on ? "+" : "-"}${name}`),
                     };
                   }

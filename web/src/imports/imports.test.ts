@@ -63,6 +63,9 @@ it("fills the form from the proposal", () => {
     // 이름이 같은 네트워크가 없는 원본 네트워크는 비워 둔다.
     networks: { "VM Network": "lan", Backup: "" },
     keepMacs: true,
+    // CPU는 서버 기본(host)이다. 클러스터 기준이 있으면 화면이 cluster를 미리 고른다.
+    cpuModel: "host",
+    cpuFlags: [],
   });
 });
 

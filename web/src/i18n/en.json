@@ -126,6 +126,7 @@
     "cpu_model_arch": "The CPU model is for another architecture: {{message}}",
     "cpu_model_ambiguous": "Choose a versioned CPU model: {{message}}",
     "cpu_flag_masked": "The flag is hidden cluster-wide: {{message}}",
+    "cpu_flag_restricted": "Only a cluster administrator can turn on these CPU flags: {{message}}",
     "invalid_cpu_flags": "Invalid CPU flags: {{message}}",
     "cpu_baseline_unsupported": "Some nodes cannot run the pinned CPU model: {{message}}"
   },
@@ -490,7 +491,7 @@
     "hotplugOff": "Not available (started without it)",
     "hotAdded": "Added while running",
     "pendingTitle": "Applies at the next power cycle",
-    "pendingNote": "These changes could not be applied while the VM runs. Rebooting inside the guest does not apply them; reboot or stop and start the VM.",
+    "pendingNote": "These changes could not be applied while the VM runs. Rebooting inside the guest does not apply them; power cycle the VM (Reboot, or Stop and Start).",
     "pendingValue": "{{running}} → {{wanted}}",
     "pendingReason": {
       "restart": "set only when the VM is powered on",
@@ -3449,6 +3450,9 @@
       "cannot": "{{node}} cannot run it: {{reason}}",
       "archReset": "The machine type changed the architecture, so the CPU model and flags were reset."
     },
+    "choice": {
+      "title": "CPU model and flags"
+    },
     "flags": {
       "label": "CPU flags",
       "hint": "Type a flag and press Enter to hide it from the guest (for example avx512vbmi). Click a flag to switch between hidden (−) and on (+).",
@@ -3459,7 +3463,11 @@
       "offShow": "{{name}} is hidden — turn it on instead",
       "remove": "Remove {{name}}",
       "unknown": "unknown",
-      "masked": "hidden cluster-wide"
+      "masked": "hidden cluster-wide",
+      "restricted": "Only a cluster administrator can turn on {{name}}. You can hide any flag.",
+      "restrictedToggle": "{{name}} is hidden — only a cluster administrator can turn it on",
+      "allowedOnly": "You can turn on only {{flags}}. Other flags can only be hidden: turning them on needs a cluster administrator, because some stop live migration or expose host features.",
+      "blocksMigration": "blocks live migration"
     },
     "errors": {
       "flagName": "Use a CPU flag name such as avx512vbmi.",

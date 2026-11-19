@@ -131,3 +131,22 @@ it("keeps the VM name as the first column when folders exist", async () => {
   expect(headers.indexOf("Name")).toBeLessThan(headers.indexOf("Folder"));
   expect(headers.indexOf("State")).toBeLessThan(headers.indexOf("Folder"));
 });
+
+// 리뷰 2 웹 #5: 자동 머신(노드를 모름)에서 고른 x86 수준은 virt로 바꾸면 host로 돌아간다(저장하면 400이 될 것).
+it("resets an x86 level when the automatic machine becomes virt", async () => {
+  mine(["system.read", "vm.create", "vm.config"]);
+  mockLists({ folder: [folder("teamA")] });
+  server.use(
+    http.get(apiUrl("/nodes"), () =>
+      HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<VmCreatePage />, { path: "/vms/-new", as: ALICE });
+  const machine = await screen.findByLabelText("Machine type");
+  expect(machine).toHaveValue("");
+  await screen.findAllByRole("option", { name: /x86-64-v3/ });
+  await user.selectOptions(screen.getByLabelText("CPU model"), "x86-64-v3");
+  await user.selectOptions(machine, "virt");
+  await waitFor(() => expect(screen.getByLabelText("CPU model")).toHaveValue("host"));
+});

@@ -1,5 +1,5 @@
 import type { TFunction } from "i18next";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router";
 
@@ -25,6 +25,8 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { useCpuModels } from "@/cpu/cpu";
+import { CpuChoice } from "@/cpu/CpuChoice";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import {
   runForm,
@@ -290,6 +292,18 @@ function RunSection({
   const usable = choosablePoolsOn(pools.data ?? [], nodes, imp.spec.node);
   const networkNames = [USER_NETWORK, ...(networks.data ?? []).map((n) => n.name)];
   const set = (patch: Partial<RunForm>) => setForm((f) => ({ ...f, ...patch }));
+  // 가져온 VM은 OVA가 있는 노드의 아키텍처다(노드를 읽지 못하면 서버가 고른다). 클러스터 기준이 있으면(auto·pinned)
+  // `cluster`를 미리 고른다(설계 §12, 리뷰 2 웹 #3). 사용자가 고르면 그대로 둔다.
+  const allNodes = useList("node");
+  const arch = allNodes.data?.find((n) => n.id === imp.spec.node)?.status.arch ?? undefined;
+  const clusterNow = useCpuModels(arch).data?.models.find((m) => m.kind === "cluster")?.current;
+  const choseCpu = useRef(false);
+  useEffect(() => {
+    if (!choseCpu.current && clusterNow && form.cpuModel === "host") {
+      choseCpu.current = true;
+      setForm((f) => ({ ...f, cpuModel: "cluster" }));
+    }
+  }, [clusterNow, form.cpuModel, setForm]);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -438,6 +452,17 @@ function RunSection({
               ["virtio", "e1000e"],
               (v) => set({ nicModel: v as RunForm["nicModel"] }),
             )}
+            <div className="sm:col-span-2">
+              <CpuChoice
+                id="run-cpu"
+                arch={arch}
+                value={{ model: form.cpuModel, flags: form.cpuFlags }}
+                onChange={({ model, flags }) => {
+                  choseCpu.current = true;
+                  set({ cpuModel: model, cpuFlags: flags });
+                }}
+              />
+            </div>
           </CardContent>
         </Card>
         <Card>

@@ -71,6 +71,8 @@ export function GeneralSection({
   // 클러스터 기준이 있으면(auto·pinned) 새 VM의 기본 모델은 `cluster`다(설계 §13). 사용자가 고르면 그대로 둔다.
   // 서버는 기준이 있을 때만 `current`를 준다(끔·업그레이드 중에는 없다 — 리뷰 1 웹 #1).
   const chose = useRef(false);
+  // 효과가 고른 `cluster`(사용자가 고르지 않음). 아키텍처가 바뀌면 되돌리고 새 아키텍처에서 다시 고르게 한다(리뷰 2 웹 #5).
+  const autoCluster = useRef(false);
   const arch = archOf(values.machine);
   const models = useCpuModels(arch, creating);
   const clusterNow = models.data?.models.find((m) => m.kind === "cluster")?.current;
@@ -79,8 +81,20 @@ export function GeneralSection({
   const withMachine = (next: Partial<VmFormValues>): Partial<VmFormValues> => {
     const to = next.machine === undefined ? arch : archOf(next.machine);
     const portable = ["host", "max", "cluster"].includes(values.model);
-    if (arch === undefined || to === undefined || to === arch) {
+    if (to === undefined || to === arch) {
       return next;
+    }
+    // 자동 머신(`""`)은 아키텍처를 모른다: 다른 아키텍처일 수 있으니 옮길 수 없는 모델·플래그만 되돌린다.
+    if (arch === undefined && portable && values.cpuFlags.length === 0) {
+      return next;
+    }
+    // 효과가 고른 `cluster`는 그 아키텍처의 기준이었다 — `host`로 돌리고 새 아키텍처에 기준이 있으면 다시 고른다.
+    if (autoCluster.current && values.model === "cluster") {
+      autoCluster.current = false;
+      chose.current = false;
+      return values.cpuFlags.length === 0
+        ? { ...next, model: "host" }
+        : { ...next, model: "host", cpuFlags: [] };
     }
     if (portable && values.cpuFlags.length === 0) {
       return next;
@@ -91,6 +105,7 @@ export function GeneralSection({
   useEffect(() => {
     if (creating && !chose.current && clusterNow && values.model === "host") {
       chose.current = true;
+      autoCluster.current = true;
       onChange({ model: "cluster" });
     }
   }, [creating, clusterNow, values.model, onChange]);
@@ -191,6 +206,7 @@ export function GeneralSection({
           arch={archOf(values.machine)}
           onChange={(model) => {
             chose.current = true;
+            autoCluster.current = false;
             setArchReset(false);
             onChange({ model });
           }}

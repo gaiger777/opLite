@@ -10,6 +10,8 @@ import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
 import { Input } from "@/components/ui/input";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { archOf } from "@/cpu/cpu";
+import { CpuChoice, type CpuPick, cpuOverride } from "@/cpu/CpuChoice";
 import { choosablePoolsOn } from "@/storage/pools";
 import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
@@ -73,6 +75,13 @@ export function VmCloneDialog({
   // 고른 스냅샷이 사라졌거나 ready가 아니게 되었다. 다른 것으로 바꾸지 않고 다시 고르게 한다.
   const gone = source !== CURRENT && !ready.some((s) => s.id === source);
   const [pool, setPool] = useState("");
+  // 원본(지금 상태나 스냅샷)의 CPU와 고친 것(고치지 않았으면 null — 원본 그대로, 리뷰 2 웹 #3)
+  const sourceSpec = ready.find((s) => s.id === source)?.spec.vm_spec ?? vm.spec;
+  const sourceCpu: CpuPick = {
+    model: sourceSpec.cpu.model ?? "host",
+    flags: sourceSpec.cpu.flags ?? [],
+  };
+  const [cpu, setCpu] = useState<CpuPick | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 놓인 노드가 없을 때만 접속한 노드(whoami)가 필요하다.
   const serving = useOptionalPrincipal()?.node?.id;
@@ -105,6 +114,7 @@ export function VmCloneDialog({
             name,
             snapshot: source === CURRENT ? null : source,
             pool: pool === "" ? null : pool,
+            ...cpuOverride(cpu, sourceCpu),
           },
         }),
       );
@@ -190,6 +200,13 @@ export function VmCloneDialog({
           </NativeSelect>
         )}
       </Field>
+      <CpuChoice
+        id="clone-cpu"
+        arch={archOf(sourceSpec.machine)}
+        value={cpu ?? sourceCpu}
+        onChange={setCpu}
+        collapsed
+      />
     </FormDialog>
   );
 }

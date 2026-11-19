@@ -127,6 +127,9 @@ export interface RunForm {
   /** 원본 네트워크 → Orbivisor 네트워크(고르지 않았으면 빈 문자열) */
   networks: Record<string, string>;
   keepMacs: boolean;
+  /** CPU 모델(`host`면 보내지 않는다 — 서버 기본)과 플래그 */
+  cpuModel: string;
+  cpuFlags: string[];
 }
 
 /** 제안으로 채운 실행 폼. VM 이름은 가져오기 이름, 풀은 고르게 비워 둔다. */
@@ -143,6 +146,8 @@ export function runForm(imp: VmImport): RunForm {
     nicModel: p?.nic_model ?? "virtio",
     networks: Object.fromEntries(sourceNetworks(imp).map((n) => [n, p?.networks[n] ?? ""])),
     keepMacs: true,
+    cpuModel: "host",
+    cpuFlags: [],
   };
 }
 
@@ -204,5 +209,7 @@ export function toRun(form: RunForm): ImportRun {
     cores: Number(form.cores),
     memory_mib: Number(form.memory),
     keep_macs: form.keepMacs,
+    ...(form.cpuModel !== "host" && { cpu_model: form.cpuModel }),
+    ...(form.cpuFlags.length > 0 && { cpu_flags: form.cpuFlags }),
   };
 }

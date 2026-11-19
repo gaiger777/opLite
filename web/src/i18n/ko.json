@@ -126,6 +126,7 @@
     "cpu_model_arch": "다른 아키텍처의 CPU 모델입니다: {{message}}",
     "cpu_model_ambiguous": "버전이 있는 CPU 모델을 고르세요: {{message}}",
     "cpu_flag_masked": "클러스터 전체에서 숨긴 플래그입니다: {{message}}",
+    "cpu_flag_restricted": "클러스터 관리자만 켤 수 있는 CPU 플래그입니다: {{message}}",
     "invalid_cpu_flags": "CPU 플래그가 잘못되었습니다: {{message}}",
     "cpu_baseline_unsupported": "고정 CPU 모델을 켤 수 없는 노드가 있습니다: {{message}}"
   },
@@ -490,7 +491,7 @@
     "hotplugOff": "없음(핫플러그 없이 켬)",
     "hotAdded": "실행 중 붙임",
     "pendingTitle": "다음 전원 껐다 켜기 때 적용",
-    "pendingNote": "실행 중에 적용하지 못한 변경입니다. 게스트 안에서 재부팅하면 적용되지 않습니다. VM을 재시작하거나 끄고 켜세요.",
+    "pendingNote": "실행 중에 적용하지 못한 변경입니다. 게스트 안에서 재부팅하면 적용되지 않습니다. 재시작, 또는 정지 후 시작으로 전원을 껐다 켜세요.",
     "pendingValue": "{{running}} → {{wanted}}",
     "pendingReason": {
       "restart": "전원을 켤 때만 정해짐",
@@ -3449,6 +3450,9 @@
       "cannot": "{{node}}에서 켤 수 없음: {{reason}}",
       "archReset": "머신 유형이 아키텍처를 바꿔 CPU 모델과 플래그를 처음으로 돌렸습니다."
     },
+    "choice": {
+      "title": "CPU 모델과 플래그"
+    },
     "flags": {
       "label": "CPU 플래그",
       "hint": "플래그를 입력하고 Enter를 누르면 게스트에게 숨깁니다(예: avx512vbmi). 플래그를 누르면 숨기기(−)와 켜기(+)가 바뀝니다.",
@@ -3459,7 +3463,11 @@
       "offShow": "{{name}} 숨김 — 켜기로 바꾸기",
       "remove": "{{name}} 빼기",
       "unknown": "모름",
-      "masked": "클러스터 전체에서 숨김"
+      "masked": "클러스터 전체에서 숨김",
+      "restricted": "{{name}}은(는) 클러스터 관리자만 켤 수 있습니다. 숨기기는 어떤 플래그든 됩니다.",
+      "restrictedToggle": "{{name}} 숨김 — 클러스터 관리자만 켤 수 있음",
+      "allowedOnly": "켤 수 있는 플래그는 {{flags}}뿐입니다. 다른 플래그는 숨기기만 됩니다: 라이브 마이그레이션을 막거나 호스트 기능을 드러내는 것이 있어 켜기는 클러스터 관리자가 합니다.",
+      "blocksMigration": "라이브 마이그레이션을 막음"
     },
     "errors": {
       "flagName": "avx512vbmi 같은 CPU 플래그 이름을 쓰세요.",

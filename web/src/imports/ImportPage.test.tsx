@@ -364,3 +364,43 @@ it("says when the import does not exist", async () => {
   open(vmImport("nope", 9));
   expect(await screen.findByText("Import nope not found")).toBeInTheDocument();
 });
+
+// 설계 §12, 리뷰 2 웹 #3: 클러스터 기준이 있으면 가져오기가 `cluster`를 미리 고르고, 고친 모델·플래그를 보낸다.
+it("preselects the cluster CPU model when the cluster has a baseline", async () => {
+  mockLists({
+    "vm-import": [web01],
+    node: [{ ...NODE, status: { ...NODE.status, arch: "x86_64" } }],
+    network: [lan],
+    "storage-pool": [pool("local")],
+    vm: [],
+  });
+  let body: Record<string, unknown> | undefined;
+  server.use(
+    http.get(apiUrl("/cpu/models"), () =>
+      HttpResponse.json({
+        arch: "x86_64",
+        nodes: 1,
+        models: [
+          { name: "host", kind: "basic", usable: 1 },
+          { name: "max", kind: "basic", usable: 1 },
+          { name: "cluster", kind: "cluster", usable: 1, current: "Skylake-Server-v5" },
+        ],
+      }),
+    ),
+    http.post(apiUrl("/vm-imports/:key/run"), async ({ request }) => {
+      body = (await request.json()) as Record<string, unknown>;
+      return HttpResponse.json(task("t1", "vm-import", "web01"), { status: 202 });
+    }),
+  );
+  open(web01);
+  const model = await screen.findByLabelText("CPU model");
+  await waitFor(() => expect(model).toHaveValue("cluster"));
+  await screen.findAllByRole("option", { name: "lan" });
+  await screen.findByRole("option", { name: "local" });
+  await userEvent.selectOptions(screen.getByLabelText("Storage pool for the disks"), "local");
+  await userEvent.selectOptions(screen.getByLabelText("Backup"), "user");
+  await userEvent.click(screen.getByRole("button", { name: "Import" }));
+  await waitFor(() => expect(body).toBeDefined());
+  expect(body).toMatchObject({ name: "web01", cpu_model: "cluster" });
+  expect(body).not.toHaveProperty("cpu_flags");
+});

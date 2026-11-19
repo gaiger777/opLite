@@ -14,6 +14,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { archOf } from "@/cpu/cpu";
+import { CpuChoice, type CpuPick, cpuOverride } from "@/cpu/CpuChoice";
 import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
 import { choosablePoolsOn } from "@/storage/pools";
@@ -71,6 +73,12 @@ export function DeployDialog({
   const [sizes, setSizes] = useState<string[]>(() => (template.spec.disks ?? []).map(() => ""));
   const [cloudInit, setCloudInit] = useState(emptyCloudInit);
   const [start, setStart] = useState(false);
+  // 템플릿의 CPU를 바꿔 배포한다(바꾸지 않았으면 null — 템플릿 그대로, 리뷰 2 웹 #3).
+  const templateCpu: CpuPick = {
+    model: template.spec.cpu.model ?? "host",
+    flags: template.spec.cpu.flags ?? [],
+  };
+  const [cpu, setCpu] = useState<CpuPick | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 배포 Task는 서버가 정한 템플릿의 노드에서 돈다(`templateNode`). 그 노드에서 쓸 수 있는 풀만 고른다. 지난 노드가
   // 빠졌거나 꺼졌으면 접속한 노드(whoami)가 필요할 수 있다. 노드를 읽지 못하면 거르지 않는다.
@@ -154,6 +162,7 @@ export function DeployDialog({
       ...(diskBytes.some((b) => b !== null) && { disks: diskBytes }),
       ...(ci && Object.keys(ci).length > 0 && { cloud_init: ci }),
       ...(start && { start: true }),
+      ...cpuOverride(cpu, templateCpu),
     });
     let made = 0;
     for (const vmName of names) {
@@ -329,6 +338,13 @@ export function DeployDialog({
             )}
           </Field>
         </div>
+        <CpuChoice
+          id="deploy-cpu"
+          arch={archOf(template.spec.machine)}
+          value={cpu ?? templateCpu}
+          onChange={setCpu}
+          collapsed
+        />
         {bases.length > 0 && (
           <fieldset className="flex flex-col gap-3">
             <legend className="mb-2 text-sm font-medium">{t("templates.disks")}</legend>

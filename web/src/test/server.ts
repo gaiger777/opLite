@@ -25,8 +25,10 @@ export const server = setupServer(
     HttpResponse.json({ code: "not_found", message: "no Ceph cluster is set up" }, { status: 404 }),
   ),
   http.get(apiUrl("/vms/:key/guest"), () => HttpResponse.json({ state: "no_agent" })),
-  // CPU(계획 63): 서버가 x86_64 노드 하나(카탈로그를 아직 알리지 않음), 기준 끔일 때 주는 그대로다. 기준이 없으면
-  // `cluster`에 `current`가 없다(리뷰 1 웹 #1 — 있으면 새 VM이 `cluster`로 시작한다).
+  // CPU(계획 63): x86_64 노드 하나(카탈로그를 아직 알리지 않음), 기준 끔인 클러스터의 관리자 응답 모양이다. 기준이
+  // 없으면 `cluster`에 `current`가 없다(리뷰 1 웹 #1 — 있으면 새 VM이 `cluster`로 시작한다). 다만 노드마다의 목록
+  // (`/cpu/models`·`/vms/{key}/cpu`의 `nodes`)은 비워 두었다 — 노드 이름은 테스트마다 다르므로 "켤 수 없는 노드"를
+  // 보는 테스트는 제 응답을 둔다(리뷰 2 웹 #6). `/nodes/{key}/cpu`의 `node`는 서버와 달리 경로 키를 그대로 돌려준다.
   http.get(apiUrl("/cpu/models"), () =>
     HttpResponse.json({
       arch: "x86_64",
@@ -42,7 +44,9 @@ export const server = setupServer(
       ],
     }),
   ),
-  http.get(apiUrl("/cpu/flags"), () => HttpResponse.json({ arch: "x86_64", nodes: 0, flags: [] })),
+  http.get(apiUrl("/cpu/flags"), () =>
+    HttpResponse.json({ arch: "x86_64", nodes: 0, turn_on_restricted: true, flags: [] }),
+  ),
   http.get(apiUrl("/cpu/baseline"), () =>
     HttpResponse.json({
       mode: "off",
@@ -54,7 +58,11 @@ export const server = setupServer(
     HttpResponse.json({ node: String(params.key), arch: "x86_64", models: [], flags: [] }),
   ),
   http.get(apiUrl("/vms/:key/cpu"), () =>
-    HttpResponse.json({ spec: { sockets: 1, cores: 1, model: "host" }, nodes: [] }),
+    HttpResponse.json({
+      spec: { sockets: 1, cores: 1, model: "host" },
+      resolved: { model: "host", source: "spec" },
+      nodes: [],
+    }),
   ),
   http.get(apiUrl("/metrics/cluster"), () =>
     HttpResponse.json({
