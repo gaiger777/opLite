@@ -113,6 +113,15 @@ fn code(secret: &str, offset: u64) -> String {
     format!("{:06}", totp(&secret, totp_step(now()) + offset, 6))
 }
 
+/// 지금 TOTP 칸(30초)이 적어도 20초 남을 때까지 기다린다. 칸을 다시 쓰지 못함을 보는 시험이 도중에 칸이 넘어가
+/// "같은 코드"가 새 칸의 코드가 되어 받아들여지지 않게(느린 러너에서 본 깜빡임).
+async fn wait_for_fresh_totp_step() {
+    let left = 30 - now() % 30;
+    if left < 20 {
+        tokio::time::sleep(std::time::Duration::from_secs(left + 1)).await;
+    }
+}
+
 /// `name` 사용자(비밀번호 `password-1`)를 만든다.
 async fn create_user(admin: &Client, name: &str, role: &str) {
     let (status, body) = admin
@@ -152,6 +161,7 @@ async fn enable_totp(b: &mut Browser) -> (String, Vec<String>) {
 #[tokio::test]
 async fn totp_login_rejects_reuse_and_recovery_codes_work_once() {
     let env = Env::start().await;
+    wait_for_fresh_totp_step().await;
     let admin = env.admin().await;
     create_user(&admin, "alice", "operator").await;
     let mut b = Browser::new(&env);
