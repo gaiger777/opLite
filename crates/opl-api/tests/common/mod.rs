@@ -346,14 +346,16 @@ impl Env {
         config.import_credentials = self.state.import_credentials.clone();
         config.api = Some(self.state.clone());
         tweak(&mut config);
+        // 실행기 future를 힙에 둔다: 그 타입이 깊어 새 rustc(1.99)가 이 async 본문의 레이아웃을 셈할 때 쿼리
+        // 깊이 한도를 넘는다("queries overflow the depth limit").
         self.runner = Some(
-            TaskRunner::spawn(
+            Box::pin(TaskRunner::spawn(
                 self.cluster.clone(),
                 storage,
                 self.hv.clone(),
                 self.reconciler.as_ref().unwrap().handle(),
                 config,
-            )
+            ))
             .await,
         );
     }
