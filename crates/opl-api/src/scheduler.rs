@@ -945,6 +945,12 @@ fn fits(
             "node {name:?} does not have a firewall (nftables) for the VM's security groups"
         ));
     }
+    // 계획 67 §8.2: 단순 NIC의 속도 제한은 tap의 tc(`NodeStatus.qos`)
+    if spec.has_simple_qos(&inv.networks) && !node.status.qos {
+        return Err(format!(
+            "node {name:?} cannot rate-limit NICs (tc) for the VM's QoS"
+        ));
+    }
     // 계획 59: TPM·Secure Boot 능력. 능력을 알리지 않은 노드(옛 노드)는 없는 것으로 본다.
     let caps = node.status.firmware_caps.unwrap_or_default();
     if spec.tpm && !caps.tpm {
@@ -1732,6 +1738,46 @@ mod tests {
         assert_eq!(ha_capacity(&inv, &one, &me), Ok(()));
         me.spec.memory_mib = 2001;
         assert_eq!(ha_capacity(&inv, &one, &me).unwrap_err().used_mib, 2000);
+    }
+
+    #[test]
+    fn vms_with_plain_nic_rate_limits_go_only_to_nodes_with_tc() {
+        // 계획 67 §8.2: 단순 NIC 속도 제한은 `NodeStatus.qos`(tc)가 있는 노드만
+        let bare = node(64000);
+        let mut shaped = node(1024);
+        shaped.status.qos = true;
+        let mut inv = Inventory {
+            nodes: vec![bare.clone(), shaped.clone()],
+            networks: vec![Resource::new(
+                "lan",
+                serde_json::from_value(serde_json::json!({ "bridge": "vmbr0" })).unwrap(),
+            )],
+            ..Default::default()
+        };
+        for n in &mut inv.nodes {
+            n.status.bridges = vec![BridgeInfo {
+                name: "vmbr0".into(),
+                vlan_filtering: false,
+            }];
+        }
+        let mut me = spec(512, None, PowerState::Running);
+        me.nics = vec![
+            serde_json::from_value(serde_json::json!({
+                "network": "lan", "model": "virtio", "qos": { "dscp": 10 }
+            }))
+            .unwrap(),
+        ];
+        // DSCP만은 tc가 할 일이 없다(단순 NIC의 DSCP는 API가 막는다).
+        assert_eq!(sched(&me, &inv), Ok(bare.id));
+        me.nics[0].qos = Some(opl_types::qos::NicQos {
+            out_mbps: Some(100),
+            ..Default::default()
+        });
+        assert_eq!(sched(&me, &inv), Ok(shaped.id));
+        assert_eq!(
+            node_fits(&me, &inv, &inv.nodes[0]),
+            Err("node \"n\" cannot rate-limit NICs (tc) for the VM's QoS".into())
+        );
     }
 
     #[test]

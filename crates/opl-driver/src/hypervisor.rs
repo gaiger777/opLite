@@ -518,6 +518,15 @@ pub trait Hypervisor: Send + Sync {
         medium: Option<&RuntimeMedium>,
     ) -> Result<(), DriverError>;
 
+    /// 실행 중인 VM의 `index`번째 NIC 속도 제한을 런타임 정의 `nic`의 것으로 맞춘다(계획 67 §8.2): Linux 브리지 tap이면
+    /// tc를 바꾸고(QEMU는 그대로), SDN tap(OVN `QoS` 행이 함)과 user NIC는 할 일이 없다. tap 이름은 이 VM의 것이어야 한다.
+    async fn set_nic_qos(
+        &self,
+        id: Uuid,
+        index: usize,
+        nic: &RuntimeNic,
+    ) -> Result<(), DriverError>;
+
     /// 이 노드가 켠 VM의 하드웨어 기록(`status.hardware`, 핫플러그 배치 포함)을 VM 실행 디렉터리에 남긴다(QMP
     /// 소켓 옆 `hardware.json`). QEMU가 끝나면 실행 디렉터리와 함께 지워진다. VM이 없으면 `NotRunning`.
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError>;

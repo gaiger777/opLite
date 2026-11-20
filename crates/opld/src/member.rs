@@ -447,6 +447,7 @@ impl Member {
         };
         // 등록 때 방화벽 여부를 기록하므로 등록 전에 찾는다.
         host.detect_firewall(&tag).await;
+        host.detect_qos().await;
         // 워커와 마이그레이션 받기가 VM을 켜기 직전에 규칙을 넣는다. 에이전트는 아래에서 띄운다.
         let firewall = FirewallRules::new(cluster.clone(), config, &host, tag.clone());
         let gate = firewall.clone().map(|f| f as Arc<dyn FirewallGate>);
@@ -461,12 +462,15 @@ impl Member {
             };
         #[cfg(feature = "cpu-it")]
         crate::cpu_hook::set_member(Arc::downgrade(&cluster), &hv);
+        #[cfg(feature = "sdn-it")]
+        crate::sdn_hook::set_member(Arc::downgrade(&cluster));
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;
         // TPM·Secure Boot 능력(계획 59, swtpm·`-tpmdev help`·Secure Boot 펌웨어)도 등록 전에 살핀다.
         host.firmware_caps = hv.firmware_caps().await;
         let firmware_caps = host.firmware_caps;
+        let host_qos = host.qos;
         // CPU 모델·플래그(계획 63)도 등록 전에 한 번 읽는다. 그 뒤로는 검사 루프가 QEMU 바뀜을 보고 다시 읽는다.
         let mut cpu_watch = CpuWatch::new(
             hv.clone(),
@@ -955,6 +959,7 @@ impl Member {
                         .collect(),
                     hotplug: Some(hotplug),
                     firmware_caps: Some(firmware_caps),
+                    qos: Some(host_qos),
                     sdn: Some(sdn_report.clone()),
                 },
                 state.audit.clone(),

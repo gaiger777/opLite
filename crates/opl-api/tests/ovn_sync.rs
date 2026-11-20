@@ -534,3 +534,69 @@ async fn the_loop_ignores_vm_writes_that_do_not_touch_ports() {
     assert!(reads() > before);
     sync.shutdown().await;
 }
+
+/// 계획 67 §7.2: 새 네트워크·라우터·LB가 한 차례에 함께 생겨도 그 차례 안에 붙는다(미룬 붙이기를 곧바로 한 번 더 맞춤).
+/// LB 쓰기는 반복 작업을 깨운다.
+#[tokio::test]
+async fn a_new_load_balancer_is_attached_in_the_same_round_and_wakes_the_loop() {
+    use opl_types::load_balancer::LoadBalancer;
+    use opl_types::router::Router;
+    let ovn = Ovn::start().await;
+    ovn.sdn(SdnPhase::Ready).await;
+    let t1: Network = Resource::new(
+        "t1",
+        serde_json::from_value(json!({"sdn": {}, "subnets": [{"cidr": "10.10.0.0/24"}]})).unwrap(),
+    );
+    ovn.env.cluster.create(&t1).await.unwrap();
+    let r1: Router = Resource::new(
+        "r1",
+        serde_json::from_value(json!({"interfaces": [{"network": "t1"}]})).unwrap(),
+    );
+    ovn.env.cluster.create(&r1).await.unwrap();
+    let lb = |name: &str, vip: &str| -> LoadBalancer {
+        Resource::new(
+            name,
+            serde_json::from_value(json!({
+                "network": "t1", "vip": vip,
+                "listeners": [{"protocol": "tcp", "port": 80, "members": [{"ip": "10.10.0.9", "port": 80}]}]
+            }))
+            .unwrap(),
+        )
+    };
+    ovn.env
+        .cluster
+        .create(&lb("web", "10.10.0.50"))
+        .await
+        .unwrap();
+    let mut s = ovn.syncer();
+    assert!(matches!(
+        s.sync().await,
+        SyncOutcome::Synced { failed: 0, .. }
+    ));
+    let lbs = ovn.nb.rows("Load_Balancer");
+    assert_eq!(lbs.len(), 1);
+    let uuid = lbs[0]["_uuid"].clone();
+    for table in ["Logical_Switch", "Logical_Router"] {
+        let rows = ovn.nb.rows(table);
+        assert_eq!(rows[0]["load_balancer"], uuid, "{table}: {rows:?}");
+    }
+    drop(s);
+
+    let sync = OvnSync::spawn(ovn.env.cluster.clone(), ovn.config());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    ovn.env
+        .cluster
+        .create(&lb("api", "10.10.0.51"))
+        .await
+        .unwrap();
+    let mut seen = false;
+    for _ in 0..100 {
+        if ovn.nb.rows("Load_Balancer").len() == 2 {
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(seen);
+    sync.shutdown().await;
+}

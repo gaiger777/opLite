@@ -1241,6 +1241,7 @@ async fn resolves_bridge_networks_to_taps() {
             vlan: Some(10),
             mtu: None,
             ovn_port: None,
+            qos: None,
         }
     );
 }
@@ -1307,6 +1308,7 @@ async fn cloud_init_of_sdn_nics_uses_the_subnets() {
             vlan: None,
             mtu: Some(1442),
             ovn_port: Some(opl_types::sdn::port_name(vm.id, mac)),
+            qos: None,
         }
     );
 }
@@ -1356,6 +1358,7 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
             vlan: None,
             mtu: Some(1450),
             ovn_port: None,
+            qos: None,
         }
     );
     assert_eq!(
@@ -1366,8 +1369,46 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
             vlan: None,
             mtu: Some(8950),
             ovn_port: None,
+            qos: None,
         }
     );
+}
+
+/// 계획 67 §8.2: 단순 NIC의 속도 제한은 런타임 tap에 실리고(드라이버가 tc로 건다), SDN NIC(OVN `QoS` 행)와 DSCP만인
+/// 단순 NIC(속도가 없음)는 싣지 않는다.
+#[tokio::test]
+async fn only_plain_nic_rates_reach_the_runtime_tap() {
+    let dir = TempDir::new().unwrap();
+    let cluster = common::single_node(&MemRouter::default(), dir.path()).await;
+    let node = cluster.id().0;
+    for (name, spec) in [
+        ("lan", serde_json::json!({ "bridge": "vmbr0" })),
+        (
+            "tenant",
+            serde_json::json!({ "sdn": {}, "subnets": [{ "cidr": "10.0.0.0/24" }] }),
+        ),
+    ] {
+        let n: Network = Resource::new(name, serde_json::from_value(spec).unwrap());
+        cluster.create(&n).await.unwrap();
+    }
+    let qos = |v: serde_json::Value| Some(serde_json::from_value(v).unwrap());
+    let mut vm = common::vm("web", node);
+    let mut plain = nic("lan", Some(MacAddr::generate()));
+    plain.qos = qos(serde_json::json!({ "out_mbps": 100, "in_mbps": 200 }));
+    let mut dscp_only = nic("lan", Some(MacAddr::generate()));
+    dscp_only.qos = qos(serde_json::json!({ "dscp": 46 }));
+    let mut sdn = nic("tenant", Some(MacAddr::generate()));
+    sdn.qos = qos(serde_json::json!({ "out_mbps": 100 }));
+    sdn.ips = vec!["10.0.0.5".parse().unwrap()];
+    vm.spec.nics = vec![plain.clone(), dscp_only, sdn];
+    let spec = resolve(&cluster, &vm, node, Path::new(MNT)).await.unwrap();
+    let qos_of = |i: usize| match &spec.nics[i].backend {
+        NicBackend::Tap { qos, .. } => *qos,
+        NicBackend::User => panic!("user NIC"),
+    };
+    assert_eq!(qos_of(0), plain.qos);
+    assert_eq!(qos_of(1), None);
+    assert_eq!(qos_of(2), None);
 }
 
 #[tokio::test]

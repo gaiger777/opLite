@@ -437,6 +437,39 @@ async fn apply(
             .await?;
             Ok(())
         }
+        Step::SetNicQos(index) => {
+            let wanted = vm.spec.nics[index].qos;
+            let show = |q: Option<opl_types::qos::NicQos>| {
+                q.map_or_else(|| "none".to_string(), |q| format!("{q:?}"))
+            };
+            let set = match runtime_nic(&ctx.cluster, vm, index) {
+                Ok(nic) => ctx
+                    .hv
+                    .set_nic_qos(id, index, &nic)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            };
+            if let Err(detail) = set {
+                failed.push(failure(
+                    &format!("nics[{index}].qos"),
+                    show(hw.nics[index].qos),
+                    show(wanted),
+                    detail.clone(),
+                ));
+                return Err(Stop::Failed(format!(
+                    "cannot change the QoS of NIC {index} of VM {:?}: {detail}",
+                    vm.name
+                )));
+            }
+            *hw = update_hardware(ctx, id, qemu, |hw, _| {
+                if let Some(n) = hw.nics.get_mut(index) {
+                    n.qos = wanted;
+                }
+            })
+            .await?;
+            Ok(())
+        }
         Step::RemoveNic(index) => {
             let network = hw.nics[index].network.clone();
             let device = format!("nic{index}");
@@ -629,8 +662,11 @@ async fn undo_devices(ctx: &Ctx, id: Uuid, qemu: Qemu, hw: &RunningHardware) -> 
             .filter(|(i, _)| !held(format!("nic{i}")))
             .map(|(_, n)| {
                 let mut nic = n.clone();
+                // 보안 그룹과 QoS(계획 67)는 장치가 아니라 사용자가 바꾼 그대로 둔다(QoS 실패는 `failed` 보류로 남아 다시
+                // 해 보기가 맞춘다).
                 if let Some(now) = vm.spec.nics.iter().find(|s| s.mac == n.mac) {
                     nic.security_groups = now.security_groups.clone();
+                    nic.qos = now.qos;
                 }
                 nic
             })

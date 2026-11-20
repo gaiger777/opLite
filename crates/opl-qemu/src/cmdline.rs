@@ -714,6 +714,7 @@ mod tests {
                         vlan: Some(10),
                         mtu: None,
                         ovn_port: None,
+                        qos: None,
                     },
                 },
                 RuntimeNic {
@@ -799,6 +800,7 @@ mod tests {
             vlan: None,
             mtu: Some(1450),
             ovn_port: None,
+            qos: None,
         };
         spec.nics[0].backend = tap.clone();
         spec.nics[1].backend = tap;
@@ -819,6 +821,7 @@ mod tests {
             vlan: None,
             mtu: Some(1442),
             ovn_port: ovn_port.map(Into::into),
+            qos: None,
         };
         let mut plain = x86_spec();
         plain.nics[0].backend = tap(None);

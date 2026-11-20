@@ -17,12 +17,12 @@ use uuid::Uuid;
 use super::nb::*;
 use super::tests::{Nb, TAG, ids, node_res, vm_on};
 
-fn net(name: &str, spec: Value) -> Network {
+pub(super) fn net(name: &str, spec: Value) -> Network {
     Resource::new(name, serde_json::from_value(spec).unwrap())
 }
 
 /// 게이트웨이 우선순위 `gateway`, physnet `ready`(이름들), 유지보수 `maintenance`인 노드
-fn gw_node(name: &str, gateway: Option<u16>, ready: &[&str], maintenance: bool) -> Node {
+pub(super) fn gw_node(name: &str, gateway: Option<u16>, ready: &[&str], maintenance: bool) -> Node {
     let mut n = node_res(name);
     n.spec.sdn = gateway.map(|g| opl_types::sdn::NodeSdnConfig {
         physnets: BTreeMap::new(),
@@ -40,7 +40,7 @@ fn gw_node(name: &str, gateway: Option<u16>, ready: &[&str], maintenance: bool) 
     n
 }
 
-fn router(name: &str, spec: Value) -> Router {
+pub(super) fn router(name: &str, spec: Value) -> Router {
     Resource::new(name, serde_json::from_value(spec).unwrap())
 }
 
@@ -56,22 +56,24 @@ fn fip(address: &str, target: Option<(&Vm, &str)>) -> FloatingIp {
     )
 }
 
-fn running(mut vm: Vm, node: &Node) -> Vm {
+pub(super) fn running(mut vm: Vm, node: &Node) -> Vm {
     vm.status.phase = VmPhase::Running;
     vm.status.node = Some(node.id);
     vm.spec.power = PowerState::Running;
     vm
 }
 
-struct World {
-    networks: Vec<Network>,
-    nodes: Vec<Node>,
-    t1: Network,
-    t2: Network,
-    ext: Network,
+pub(super) struct World {
+    pub(super) networks: Vec<Network>,
+    pub(super) nodes: Vec<Node>,
+    pub(super) t1: Network,
+    pub(super) t2: Network,
+    pub(super) ext: Network,
+    /// [`r1`] 하나(계획 67 서비스 시험이 쓴다)
+    pub(super) r1: Router,
 }
 
-fn world() -> World {
+pub(super) fn world() -> World {
     let t1 = net(
         "t1",
         json!({"sdn": {}, "subnets": [
@@ -111,10 +113,11 @@ fn world() -> World {
         t1,
         t2,
         ext,
+        r1: r1(),
     }
 }
 
-fn r1() -> Router {
+pub(super) fn r1() -> Router {
     router(
         "r1",
         json!({

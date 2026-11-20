@@ -102,12 +102,14 @@ async fn taps_join_bridges_with_vlans_and_are_removed_per_vm() {
         bridge: aware.0.clone(),
         vlan: Some(10),
         ovn: None,
+        qos: None,
     };
     let untagged = Tap {
         ifname: tap_name(vm, 1),
         bridge: plain.0.clone(),
         vlan: None,
         ovn: None,
+        qos: None,
     };
     net.create_tap(&tagged).await.unwrap();
     net.create_tap(&untagged).await.unwrap();
@@ -127,6 +129,7 @@ async fn taps_join_bridges_with_vlans_and_are_removed_per_vm() {
         bridge: plain.0.clone(),
         vlan: None,
         ovn: None,
+        qos: None,
     };
     net.create_tap(&other_tap).await.unwrap();
     net.delete_vm_taps(vm).await.unwrap();
@@ -150,6 +153,7 @@ async fn missing_or_vlan_unaware_bridges_are_refused() {
         bridge: "oplt-missing".into(),
         vlan: None,
         ovn: None,
+        qos: None,
     };
     let err = net.create_tap(&missing).await.unwrap_err();
     assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
@@ -159,6 +163,7 @@ async fn missing_or_vlan_unaware_bridges_are_refused() {
         bridge: plain.0.clone(),
         vlan: Some(10),
         ovn: None,
+        qos: None,
     };
     let err = net.create_tap(&vlan_on_plain).await.unwrap_err();
     assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
@@ -183,10 +188,90 @@ async fn taps_take_the_bridge_mtu() {
         bridge: br.0.clone(),
         vlan: None,
         ovn: None,
+        qos: None,
     };
     net.create_tap(&tap).await.unwrap();
     assert_eq!(master_of(&tap.ifname), Some(br.0.clone()));
     assert_eq!(mtu_of(&tap.ifname), 1450);
     assert_eq!(mtu_of(&br.0), 1450);
+    net.delete_vm_taps(vm).await.unwrap();
+}
+
+fn tc(args: &[&str]) -> String {
+    let out = Command::new("tc").args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "tc {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// 계획 67 §8.2: 속도 제한이 있는 단순 tap은 만들 때 `clsact`와 우선순위 49152의 matchall police(보내기 = ingress,
+/// 받기 = egress)를 단다. 실제 tc가 바이트 버스트를 받고, 되읽은 상태로 같은 값이면 그대로, 바꾸면 지우고 다시 넣으며,
+/// 빼면 `clsact`도 지운다. 탐침은 시험 장치를 남기지 않는다.
+#[tokio::test]
+async fn tap_rate_limits_use_tc_police() {
+    use opl_types::qos::NicQos;
+    let br = TestBridge::new(false);
+    let net = IpRoute::default();
+    assert!(net.probe_qos().await);
+    assert!(
+        Command::new("ip")
+            .args(["link", "show", "oplqosprobe"])
+            .output()
+            .unwrap()
+            .stdout
+            .is_empty()
+    );
+    let vm = Uuid::now_v7();
+    let qos = NicQos {
+        out_mbps: Some(100),
+        in_mbps: Some(50),
+        ..Default::default()
+    };
+    let tap = Tap {
+        ifname: tap_name(vm, 0),
+        bridge: br.0.clone(),
+        vlan: None,
+        ovn: None,
+        qos: Some(qos),
+    };
+    net.create_tap(&tap).await.unwrap();
+    let dev = tap.ifname.as_str();
+    assert!(tc(&["qdisc", "show", "dev", dev]).contains("clsact"));
+    let ingress = tc(&["filter", "show", "dev", dev, "ingress"]);
+    let egress = tc(&["filter", "show", "dev", dev, "egress"]);
+    eprintln!("ingress:\n{ingress}egress:\n{egress}");
+    assert!(
+        ingress.contains("pref 49152") && ingress.contains("rate 100Mbit"),
+        "{ingress}"
+    );
+    assert!(
+        egress.contains("pref 49152") && egress.contains("rate 50Mbit"),
+        "{egress}"
+    );
+    let index = |hook: &str| {
+        let out = tc(&["filter", "show", "dev", dev, hook]);
+        let words: Vec<String> = out.split_whitespace().map(String::from).collect();
+        let i = words.iter().position(|w| w == "police").unwrap();
+        words[i + 1].clone()
+    };
+    let (i0, e0) = (index("ingress"), index("egress"));
+    net.set_tap_qos(dev, Some(&qos)).await.unwrap();
+    assert_eq!(
+        (index("ingress"), index("egress")),
+        (i0.clone(), e0.clone())
+    );
+    let slower = NicQos {
+        out_mbps: Some(10),
+        ..qos
+    };
+    net.set_tap_qos(dev, Some(&slower)).await.unwrap();
+    assert_ne!(index("ingress"), i0);
+    assert_eq!(index("egress"), e0);
+    assert!(tc(&["filter", "show", "dev", dev, "ingress"]).contains("rate 10Mbit"));
+    net.set_tap_qos(dev, None).await.unwrap();
+    assert!(!tc(&["qdisc", "show", "dev", dev]).contains("clsact"));
     net.delete_vm_taps(vm).await.unwrap();
 }

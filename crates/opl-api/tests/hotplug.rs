@@ -545,6 +545,53 @@ async fn nics_are_added_and_removed() {
     assert_eq!(hw.nics.len(), 1);
 }
 
+/// 계획 67 §8.2: 그대로 남는 NIC의 QoS 바꾸기는 장치를 건드리지 않는 단계 `SetNicQos`다(드라이버가 tap의 tc를 바꾸고
+/// 기록의 그 NIC QoS를 고침). 실패하면 스펙의 QoS는 사용자가 바꾼 그대로 두고 `failed` 보류로 남아, 다시 해 보기가 맞춘다.
+#[tokio::test]
+async fn nic_qos_changes_without_touching_the_device() {
+    use opl_driver::HotplugCall;
+    let (env, _) = setup(ALL).await;
+    let admin = env.admin().await;
+    let id = running_web(&env, &admin).await;
+    let qos = opl_types::qos::NicQos {
+        out_mbps: Some(100),
+        in_mbps: Some(200),
+        ..Default::default()
+    };
+    change(&env, id, |s| s.nics[0].qos = Some(qos)).await;
+    succeeded(&admin.act("web", "hotplug").await);
+    // user NIC는 tap이 없어 런타임 QoS가 없다(드라이버는 할 일이 없음).
+    assert_eq!(
+        env.hv.hotplug_calls(),
+        [HotplugCall::SetNicQos {
+            id,
+            index: 0,
+            qos: None
+        }]
+    );
+    assert_eq!(hardware(&env, id).nics[0].qos, Some(qos));
+    assert!(env.hv.devices(id).contains(&"nic0".to_string()));
+
+    env.hv.fail_next_hotplug("tc is gone");
+    change(&env, id, |s| s.nics[0].qos = None).await;
+    let error = failed(&admin.act("web", "hotplug").await);
+    assert!(error.contains("QoS of NIC 0"), "{error}");
+    assert!(!error.contains("undone"), "{error}");
+    assert_eq!(vm(&env, id).spec.nics[0].qos, None);
+    let hw = hardware(&env, id);
+    assert_eq!(hw.nics[0].qos, Some(qos));
+    assert!(
+        hw.pending
+            .iter()
+            .any(|p| p.field == "nics[0].qos" && p.reason == PendingReason::Failed),
+        "{:?}",
+        hw.pending
+    );
+    succeeded(&admin.act("web", "hotplug").await);
+    assert_eq!(hardware(&env, id).nics[0].qos, None);
+    assert!(hardware(&env, id).pending.is_empty());
+}
+
 /// 실행 중 하드웨어 기록을 `f`로 고쳐 쓴다(Task가 기록하기 전에 멈춘 것처럼).
 async fn set_hardware(env: &Env, id: Uuid, f: impl Fn(&mut RunningHardware)) {
     loop {

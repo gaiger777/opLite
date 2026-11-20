@@ -67,6 +67,8 @@ fn switch(network: Uuid, ports: Vec<PortRow>, dhcp: Vec<DhcpRow>) -> SwitchRow {
         external_ids: ids(&[(CLUSTER_KEY, TAG), (ID_KEY, &network.to_string())]),
         ports,
         dhcp,
+        load_balancers: Vec::new(),
+        qos: Vec::new(),
     }
 }
 
@@ -404,6 +406,7 @@ async fn creates_updates_and_removes_switches_ports_and_dhcp() {
     let (n1, n2) = (Uuid::now_v7(), Uuid::now_v7());
     let mut want = NbState {
         port_groups: Vec::new(),
+        load_balancers: Vec::new(),
         routers: Vec::new(),
         switches: vec![
             switch(
@@ -528,6 +531,7 @@ async fn duplicate_switches_of_ours_are_collapsed() {
     let n = Uuid::now_v7();
     let want = NbState {
         port_groups: Vec::new(),
+        load_balancers: Vec::new(),
         routers: Vec::new(),
         switches: vec![switch(n, vec![], vec![])],
     };
@@ -550,6 +554,7 @@ async fn fencing_refuses_a_writer_that_read_an_older_token() {
     let n = Uuid::now_v7();
     let want = NbState {
         port_groups: Vec::new(),
+        load_balancers: Vec::new(),
         routers: Vec::new(),
         switches: vec![switch(n, vec![], vec![])],
     };
@@ -595,6 +600,7 @@ async fn one_failing_network_does_not_block_the_others() {
     let (n1, n2) = (Uuid::now_v7(), Uuid::now_v7());
     let want = NbState {
         port_groups: Vec::new(),
+        load_balancers: Vec::new(),
         routers: Vec::new(),
         switches: vec![
             switch(n1, vec![port("opl-taken", "10.0.0.5", None)], vec![]),
@@ -675,6 +681,7 @@ async fn five_thousand_ports_resync_quickly() {
     let networks: Vec<Uuid> = (0..50).map(|_| Uuid::now_v7()).collect();
     let want = NbState {
         port_groups: Vec::new(),
+        load_balancers: Vec::new(),
         routers: Vec::new(),
         switches: networks
             .iter()

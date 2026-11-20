@@ -467,6 +467,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         check_ha_capable(node, &vm.spec)?;
         check_node_arch(node, &vm.spec)?;
         check_firewall(node, &vm.spec, &inv.networks)?;
+        check_qos_node(node, &vm.spec, &inv.networks)?;
         check_cdrom_node(&inv, node, &vm.spec, current)?;
         // 켜진 채 노드를 준 요청은 hard 배치 규칙도 지켜야 한다. 이미 그 노드에 자리 잡은 VM(실행 중 고치기)은
         // 새 규칙을 어겨도 옮기거나 막지 않는다(위반으로 보인다).
@@ -982,6 +983,21 @@ fn check_firewall(node: &Node, spec: &VmSpec, networks: &[Network]) -> Result<()
             "firewall_unsupported",
             format!(
                 "node {:?} has no firewall (nftables) for security groups",
+                node.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 속도 제한을 건 단순 네트워크 NIC가 있는데 노드가 tap에 tc를 걸 수 없으면(`NodeStatus.qos`가 거짓 — macOS·옛 노드)
+/// 409 `qos_unsupported`(계획 67 §8.2). SDN NIC의 QoS는 OVN `QoS` 행이라 노드 tc가 필요 없다.
+fn check_qos_node(node: &Node, spec: &VmSpec, networks: &[Network]) -> Result<(), ApiError> {
+    if spec.has_simple_qos(networks) && !node.status.qos {
+        return Err(ApiError::conflict(
+            "qos_unsupported",
+            format!(
+                "node {:?} cannot rate-limit NICs (tc) for the VM's QoS",
                 node.name
             ),
         ));

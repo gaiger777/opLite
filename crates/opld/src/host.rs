@@ -17,6 +17,9 @@ pub struct Host {
     pub net: Option<Arc<dyn HostNet>>,
     /// VM 방화벽(nftables)을 넣는다. Linux에서 규칙을 넣을 수 있을 때만 있다([`Host::detect_firewall`]).
     pub firewall: Option<Arc<dyn Firewall>>,
+    /// tap에 tc 속도 제한을 걸 수 있다(계획 67 §8.2, `NodeStatus.qos`). Linux에서 `clsact`를 만들어 볼 수 있을 때만
+    /// 참이다([`Host::detect_qos`]).
+    pub qos: bool,
     pub systemd_scope: bool,
     /// 이 노드의 핫플러그 능력(계획 54). 드라이버를 만든 뒤 한 번 읽는다([`Hypervisor::hotplug_caps`]). 그 전에는
     /// 아무것도 못 한다.
@@ -56,6 +59,7 @@ impl Host {
             profile,
             net,
             firewall: None,
+            qos: false,
             systemd_scope: config.hypervisor.systemd_scope,
             hotplug: NodeHotplug::default(),
             firmware_caps: FirmwareCaps::default(),
@@ -72,6 +76,14 @@ impl Host {
             return;
         }
         self.firewall = probe_firewall(Arc::new(Nft::default()), tag).await;
+    }
+
+    /// Linux에서 tap에 tc(`clsact`·police)를 걸 수 있는지 본다(시험 장치 하나를 만들었다 지운다). 안 되면 단순 NIC에
+    /// 속도 제한을 건 VM이 이 노드에서 돌지 않는다.
+    pub async fn detect_qos(&mut self) {
+        if let Some(net) = &self.net {
+            self.qos = net.probe_qos().await;
+        }
     }
 
     pub fn qemu_config(&self, config: &Config) -> QemuConfig {

@@ -1175,6 +1175,9 @@ async fn physnet_section(d: &Daemon, tag: &str, node: &str) {
     // 10. 라우터·SNAT·유동 IP·IPv6(스테이지 3)
     Box::pin(routing_section(d, tag, node)).await;
 
+    // 12. 계획 67 스테이지 2: 부하 분산(VIP·건강 검사 넘김·바깥 VIP·출발지 고정)과 QoS(OVN 행·단순 NIC tc)
+    Box::pin(services_section(d, tag)).await;
+
     // 빼기: 내 매핑 항목·veth·OVS 브리지·게이트웨이 낱말만 사라지고 남의 것은 남는다.
     d.ctl(&["network", "delete", "ext"]).await.unwrap();
     wait_for("ext's switch to go", AGENT_WAIT, || async {
@@ -2625,4 +2628,550 @@ async fn security_section(d: &Daemon, tag: &str) {
     for ns in [&ovn.vm, &ovn.c1, &ovn.c2, &nft.vm, &nft.c1, &nft.c2] {
         let _ = try_run("ip", &["netns", "del", ns]);
     }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 계획 67 스테이지 2: 부하 분산·건강 검사 넘김·바깥 VIP·QoS(OVN `QoS` 행과 단순 NIC tc)
+// ---------------------------------------------------------------------------------------------------------------
+
+/// 제어 소켓의 시험 고리 `POST /v1/test/put`(스테이지 5가 지운다)
+async fn test_put(d: &Daemon, kind: &str, name: &str, spec: Value) {
+    let http = reqwest::Client::builder()
+        .unix_socket(d.path("opld.sock"))
+        .build()
+        .unwrap();
+    let resp = http
+        .post("http://opld/v1/test/put")
+        .json(&json!({ "kind": kind, "name": name, "spec": spec }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "put {kind} {name}: {status} {text}");
+}
+
+/// 붙으면 제 이름과 상대 주소 한 줄을 보내고 끊는 TCP 서버(`NAME PORT`)
+const NAME_SERVER: &str = r#"
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[2]))); s.listen(64)
+while True:
+    c, peer = s.accept()
+    try: c.sendall(("%s %s\n" % (sys.argv[1], peer[0])).encode())
+    except OSError: pass
+    c.close()
+"#;
+
+/// 붙어 한 줄을 받는다: 받은 줄, 또는 `refused`·`timeout`·`error`
+const HIT: &str = r#"
+import socket, sys
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+    s.settimeout(2); print(s.recv(200).decode().strip())
+except ConnectionRefusedError: print("refused")
+except socket.timeout: print("timeout")
+except OSError as e: print("error", e)
+"#;
+
+fn hit(ns: &str, to: &str, port: u16) -> String {
+    let out = py_in(ns, HIT, &[to, &port.to_string()]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// 이름공간 `ns`의 이름 서버(포트 `port`)
+fn name_server(ns: &str, name: &str, port: u16) -> Server {
+    Server(
+        py_in(ns, NAME_SERVER, &[name, &port.to_string()])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// 이름공간 "VM"에 고정 주소와 기본 경로, 오버레이 MTU
+fn static_ip(ns: &str, dev: &str, ip: &str, gw: &str) {
+    let in_ns = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", ns, "ip"];
+        all.extend_from_slice(args);
+        run("ip", &all)
+    };
+    in_ns(&["link", "set", dev, "mtu", "1442"]);
+    in_ns(&["addr", "add", &format!("{ip}/24"), "dev", dev]);
+    in_ns(&["route", "add", "default", "via", gw]);
+}
+
+/// SB `Service_Monitor`의 (주소 → 상태)(상태가 비면 빈 글)
+fn service_monitors() -> std::collections::BTreeMap<String, String> {
+    let out = run(
+        "ovn-sbctl",
+        &[
+            "--db=unix:/run/opl/ovn/sb.sock",
+            "--format=json",
+            "--columns=ip,port,status",
+            "list",
+            "Service_Monitor",
+        ],
+    );
+    let v: Value = serde_json::from_str(&out).unwrap();
+    v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|r| {
+            let status = r[2].as_str().map(String::from).unwrap_or_default();
+            (r[0].as_str().unwrap_or_default().to_string(), status)
+        })
+        .collect()
+}
+
+/// iperf3 클라이언트(이름공간 `ns` → `to`, `reverse`면 받기) — 받은 쪽 Mbit/s. 폴리싱의 버스트(기본 속도의 0.8초분)가
+/// 처음 몇 초를 부풀리므로 앞 3초를 빼고 6초를 잰다(`-O 3`).
+fn iperf(ns: &str, to: &str, reverse: bool) -> f64 {
+    let mut args = vec![
+        "netns", "exec", ns, "iperf3", "-c", to, "-t", "6", "-O", "3", "-J",
+    ];
+    if reverse {
+        args.push("-R");
+    }
+    let (ok, out, err) = try_run("ip", &args);
+    assert!(ok, "iperf3 {ns} -> {to}: {out}{err}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    v["end"]["sum_received"]["bits_per_second"]
+        .as_f64()
+        .unwrap()
+        / 1e6
+}
+
+fn near(measured: f64, want: f64) -> bool {
+    (measured - want).abs() <= want * 0.15
+}
+
+/// 계획 67 스테이지 2: 오버레이 `lb-t1`(멤버 b1·b2, 같은 서브넷 클라이언트 c0)·`lb-t2`(클라이언트 c)를 잇는 라우터 `lr1`
+/// (바깥 `ext`)에 LB `web`(VIP 10.40.0.50, 바깥 VIP 203.0.113.130, tcp/80 → 8080, 건강 검사)을 시험 고리로 만들고 실제
+/// 트래픽을 본다. 이어서 SDN NIC QoS(OVN `QoS` 행 — iperf3·DSCP)와 단순 NIC tc(드라이버 `set_tap_qos`)를 잰다.
+async fn services_section(d: &Daemon, tag: &str) {
+    sdn_network(d, "lb-t1", &["--subnet", "10.40.0.0/24"]).await;
+    sdn_network(d, "lb-t2", &["--subnet", "10.41.0.0/24"]).await;
+    let b1 = api_vm(d, "lb-b1", "lb-t1").await;
+    let b2 = api_vm(d, "lb-b2", "lb-t1").await;
+    let c0 = api_vm(d, "lb-c0", "lb-t1").await;
+    let c = api_vm(d, "lb-c", "lb-t2").await;
+    d.ctl(&[
+        "router",
+        "create",
+        "lr1",
+        "--external",
+        "ext,ip=203.0.113.60",
+        "--interface",
+        "lb-t1",
+        "--interface",
+        "lb-t2",
+    ])
+    .await
+    .unwrap();
+    let worlds = [
+        ("oplb1", "oplb1d", &b1, "10.40.0.1"),
+        ("oplb2", "oplb2d", &b2, "10.40.0.1"),
+        ("oplc0", "oplc0d", &c0, "10.40.0.1"),
+        ("oplc", "oplcd", &c, "10.41.0.1"),
+    ];
+    for (ns, dev, vm, gw) in worlds {
+        namespace_port(ns, dev, &vm.3, &vm.1);
+        static_ip(ns, dev, &vm.2, gw);
+    }
+    wait_for("a ping across lr1", AGENT_WAIT, || async {
+        ping_from("oplc", &[], &b1.2)
+    })
+    .await;
+    let mut s1 = Some(name_server("oplb1", "lb-b1", 8080));
+    let mut s2 = Some(name_server("oplb2", "lb-b2", 8080));
+
+    // LB(시험 고리 — 스테이지 5까지 API가 없다)
+    let spec = |affinity: Option<u32>| {
+        json!({
+            "network": "lb-t1", "vip": "10.40.0.50",
+            "external": {"network": "ext", "ip": "203.0.113.130"},
+            "affinity_secs": affinity,
+            "listeners": [{"protocol": "tcp", "port": 80,
+                "health": {"interval_secs": 2, "timeout_secs": 1, "rise": 1, "fall": 2},
+                "members": [{"vm": b1.0, "mac": b1.1, "port": 8080}, {"vm": b2.0, "mac": b2.1, "port": 8080}]}],
+            "monitors": [{"network": "lb-t1", "ip": "10.40.0.250"}]
+        })
+    };
+    test_put(d, "load-balancer", "web", spec(None)).await;
+    wait_for("the load balancer rows", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        !rows.load_balancers.is_empty() && rows.routers.iter().any(|r| !r.load_balancers.is_empty())
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    eprintln!(
+        "load balancers: {:?}\nhealth checks: {:?}",
+        rows.load_balancers, rows.health_checks
+    );
+    show("ovn-nbctl", &["--db=unix:/run/opl/ovn/nb.sock", "lb-list"]);
+
+    // 다른 서브넷의 클라이언트(분산 DNAT): 두 멤버가 모두 답한다.
+    wait_for("the VIP to answer from lb-t2", AGENT_WAIT, || async {
+        hit("oplc", "10.40.0.50", 80).starts_with("lb-b")
+    })
+    .await;
+    let seen = |ns: &str, to: &str, n: usize| -> std::collections::BTreeMap<String, usize> {
+        let mut m = std::collections::BTreeMap::new();
+        for _ in 0..n {
+            let got = hit(ns, to, 80);
+            *m.entry(got.split(' ').next().unwrap_or_default().to_string())
+                .or_insert(0) += 1;
+        }
+        m
+    };
+    let spread = seen("oplc", "10.40.0.50", 30);
+    eprintln!("PROBE LB spread from another subnet: {spread:?}");
+    assert!(
+        spread.contains_key("lb-b1") && spread.contains_key("lb-b2"),
+        "{spread:?}"
+    );
+    // 같은 서브넷 클라이언트(§7.2 탐침): 라우터가 VIP의 ARP에 답하는지, 라우터를 지나 되돌아오는지
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut same = String::new();
+    while Instant::now() < deadline {
+        same = hit("oplc0", "10.40.0.50", 80);
+        if same.starts_with("lb-b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    eprintln!("PROBE same-subnet client -> VIP: {same:?}");
+    show("ip", &["netns", "exec", "oplc0", "ip", "neigh"]);
+
+    // 건강 검사: 둘 다 online → b1 듣기 멈춤 → offline까지의 시간과 그동안의 성공률 → b2만 → 되살림 → 둘
+    wait_for("both members online", AGENT_WAIT, || async {
+        let m = service_monitors();
+        eprintln!("service monitors: {m:?}");
+        m.get(&b1.2).map(String::as_str) == Some("online")
+            && m.get(&b2.2).map(String::as_str) == Some("online")
+    })
+    .await;
+    s1.take();
+    let t0 = Instant::now();
+    let (mut tries, mut ok) = (0, 0);
+    while service_monitors().get(&b1.2).map(String::as_str) != Some("offline") {
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "b1 did not go offline"
+        );
+        tries += 1;
+        if hit("oplc", "10.40.0.50", 80).starts_with("lb-b") {
+            ok += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    eprintln!(
+        "PROBE health check failover: b1 offline after {:.1}s; {ok}/{tries} connections succeeded meanwhile",
+        t0.elapsed().as_secs_f64()
+    );
+    let only = seen("oplc", "10.40.0.50", 10);
+    assert_eq!(only.keys().collect::<Vec<_>>(), ["lb-b2"], "{only:?}");
+    s1 = Some(name_server("oplb1", "lb-b1", 8080));
+    let t0 = Instant::now();
+    wait_for("b1 back online", AGENT_WAIT, || async {
+        service_monitors().get(&b1.2).map(String::as_str) == Some("online")
+    })
+    .await;
+    eprintln!(
+        "PROBE health check recovery: b1 online after {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
+    wait_for("both members answer again", AGENT_WAIT, || async {
+        seen("oplc", "10.40.0.50", 20).len() == 2
+    })
+    .await;
+    // 둘 다 죽으면 reject: 조용히 버리지 않고 곧바로 거절(RST)
+    s1.take();
+    s2.take();
+    wait_for("both members offline", AGENT_WAIT, || async {
+        let m = service_monitors();
+        m.get(&b1.2).map(String::as_str) == Some("offline")
+            && m.get(&b2.2).map(String::as_str) == Some("offline")
+    })
+    .await;
+    let dead = hit("oplc", "10.40.0.50", 80);
+    eprintln!("PROBE no live member: {dead:?}");
+    assert_eq!(dead, "refused");
+    s1 = Some(name_server("oplb1", "lb-b1", 8080));
+    s2 = Some(name_server("oplb2", "lb-b2", 8080));
+    wait_for("both members online again", AGENT_WAIT, || async {
+        let m = service_monitors();
+        m.get(&b1.2).map(String::as_str) == Some("online")
+            && m.get(&b2.2).map(String::as_str) == Some("online")
+    })
+    .await;
+
+    // 바깥 VIP: 물리 망 `ext`에서 들어오고 멤버가 본 출발 주소가 `ext` 주소다(SNAT 없음).
+    wait_for("the external VIP to answer", AGENT_WAIT, || async {
+        hit("ext", "203.0.113.130", 80).starts_with("lb-b")
+    })
+    .await;
+    let outside = hit("ext", "203.0.113.130", 80);
+    eprintln!("PROBE external VIP: {outside:?}");
+    assert!(outside.ends_with(" 203.0.113.1"), "{outside}");
+
+    // 출발지 고정: 같은 클라이언트는 같은 멤버
+    test_put(d, "load-balancer", "web", spec(Some(60))).await;
+    wait_for("affinity in the NB", AGENT_WAIT, || async {
+        nb_rows(d, tag)
+            .await
+            .load_balancers
+            .iter()
+            .any(|l| l.options.get("affinity_timeout").map(String::as_str) == Some("60"))
+    })
+    .await;
+    let sticky = seen("oplc", "10.40.0.50", 10);
+    eprintln!("PROBE affinity: {sticky:?}");
+    assert_eq!(sticky.len(), 1, "{sticky:?}");
+
+    // DGP 없는 라우터(§7.2 탐침): 바깥을 떼어도 안쪽 VIP가 닿는지
+    d.ctl(&["router", "external", "clear", "lr1"])
+        .await
+        .unwrap();
+    wait_for("lr1 without its gateway port", AGENT_WAIT, || async {
+        !nb_rows(d, tag)
+            .await
+            .router_ports
+            .iter()
+            .any(|p| p.name.starts_with("opl-gw-"))
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    eprintln!(
+        "PROBE VIP without a gateway port: other subnet {:?}, same subnet {:?}",
+        hit("oplc", "10.40.0.50", 80),
+        hit("oplc0", "10.40.0.50", 80)
+    );
+
+    // LB를 지우면 행이 사라진다.
+    test_put(d, "load-balancer", "web", Value::Null).await;
+    wait_for("the load balancer rows to go", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        rows.load_balancers.is_empty() && rows.health_checks.is_empty()
+    })
+    .await;
+    drop((s1, s2));
+
+    // SDN NIC QoS(OVN `QoS` 행 — 미터 폴리싱): b1이 보내는 속도·받는 속도, 실행 중 바꾸기, DSCP
+    let iperf_server = Server(
+        Command::new("ip")
+            .args(["netns", "exec", "oplc", "iperf3", "-s"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let free = iperf("oplb1", &c.2, false);
+    eprintln!("PROBE iperf3 without QoS: {free:.1} Mbit/s");
+    let set_qos = |qos: Value| {
+        let c = client(d);
+        async move {
+            let mut vm = c.get("/vms/lb-b1").await.unwrap();
+            vm["spec"]["nics"][0]["qos"] = qos;
+            test_put(d, "vm", "lb-b1", vm["spec"].clone()).await;
+        }
+    };
+    let qos_rows = || async { nb_rows(d, tag).await.qos };
+    set_qos(json!({"out_mbps": 50})).await;
+    wait_for("the QoS row", AGENT_WAIT, || async {
+        !qos_rows().await.is_empty()
+    })
+    .await;
+    eprintln!("qos rows: {:?}", qos_rows().await);
+    show(
+        "ovn-nbctl",
+        &["--db=unix:/run/opl/ovn/nb.sock", "list", "QoS"],
+    );
+    show("ovs-ofctl", &["-O", "OpenFlow15", "dump-meters", "br-int"]);
+    let out50 = iperf("oplb1", &c.2, false);
+    eprintln!("PROBE SDN QoS out_mbps=50: {out50:.1} Mbit/s");
+    assert!(near(out50, 50.0), "out_mbps=50 measured {out50:.1}");
+    set_qos(json!({"out_mbps": 50, "in_mbps": 30})).await;
+    wait_for("two QoS rows", AGENT_WAIT, || async {
+        qos_rows().await.len() == 2
+    })
+    .await;
+    let in30 = iperf("oplb1", &c.2, true);
+    eprintln!("PROBE SDN QoS in_mbps=30: {in30:.1} Mbit/s");
+    assert!(near(in30, 30.0), "in_mbps=30 measured {in30:.1}");
+    set_qos(json!({"out_mbps": 20, "in_mbps": 30})).await;
+    wait_for("the changed QoS row", AGENT_WAIT, || async {
+        qos_rows()
+            .await
+            .iter()
+            .any(|q| q.row.bandwidth.get("rate").map(String::as_str) == Some("20000"))
+    })
+    .await;
+    let out20 = iperf("oplb1", &c.2, false);
+    eprintln!("PROBE SDN QoS changed to out_mbps=20: {out20:.1} Mbit/s");
+    assert!(near(out20, 20.0), "out_mbps=20 measured {out20:.1}");
+    set_qos(json!({"dscp": 46})).await;
+    wait_for("the DSCP row", AGENT_WAIT, || async {
+        qos_rows()
+            .await
+            .iter()
+            .any(|q| q.row.action.get("dscp").map(String::as_str) == Some("46"))
+    })
+    .await;
+    let marked = captured(
+        "oplc",
+        "oplcd",
+        &format!("src host {} and ip[1] & 0xfc == 184", b1.2),
+        || {
+            ping_from("oplb1", &[], &c.2);
+        },
+    );
+    eprintln!("PROBE DSCP 46 seen by the receiver: {marked:?}");
+    assert_ne!(marked, Some(false), "the receiver did not see DSCP 46");
+    set_qos(Value::Null).await;
+    wait_for("the QoS rows to go", AGENT_WAIT, || async {
+        qos_rows().await.is_empty()
+    })
+    .await;
+    drop(iperf_server);
+
+    Box::pin(plain_tc_section()).await;
+
+    // 치우기
+    for (ns, dev, _, _) in worlds {
+        let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
+        let _ = try_run("ip", &["netns", "del", ns]);
+    }
+    let api = client(d);
+    for net in ["lb-t1", "lb-t2"] {
+        d.ctl(&["router", "interface", "remove", "lr1", net])
+            .await
+            .unwrap();
+    }
+    d.ctl(&["router", "delete", "lr1"]).await.unwrap();
+    for vm in [&b1.0, &b2.0, &c0.0, &c.0] {
+        api.delete(&format!("/vms/{vm}")).await.unwrap();
+    }
+    for name in ["lb-t1", "lb-t2"] {
+        d.ctl(&["network", "delete", name]).await.unwrap();
+    }
+}
+
+/// `tc filter show dev X HOOK`의 우리 police 행동 번호(`police 0x…`) — 다시 넣으면 바뀐다.
+fn police_index(dev: &str, hook: &str) -> Option<String> {
+    let out = run("tc", &["filter", "show", "dev", dev, hook]);
+    let words: Vec<&str> = out.split_whitespace().collect();
+    words
+        .iter()
+        .position(|w| *w == "police")
+        .and_then(|i| words.get(i + 1))
+        .map(|s| s.to_string())
+}
+
+/// 단순 NIC tc(계획 67 §8.2): Linux 브리지에 veth 둘(이름공간 둘 — 한쪽이 tap 자리)을 잇고 드라이버의 `set_tap_qos`로
+/// 보내기·받기 속도를 걸어 iperf3로 잰다. 같은 값이면 tc를 건드리지 않고(police 번호 그대로), 바꾸면 지우고 다시 넣고,
+/// 빼면 `clsact`까지 사라지며 남의 필터가 있으면 `clsact`와 그 필터를 둔다.
+async fn plain_tc_section() {
+    use opl_driver::HostNet;
+    use opl_types::qos::NicQos;
+    let net = opl_driver::IpRoute::default();
+    assert!(net.probe_qos().await, "tc clsact is not available");
+    let _ = try_run("ip", &["link", "del", "oplqbr"]);
+    run("ip", &["link", "add", "oplqbr", "type", "bridge"]);
+    run("ip", &["link", "set", "oplqbr", "up"]);
+    for (i, ns) in ["oplq1", "oplq2"].iter().enumerate() {
+        let _ = try_run("ip", &["netns", "del", ns]);
+        run("ip", &["netns", "add", ns]);
+        let (host, inner) = (format!("{ns}h"), format!("{ns}n"));
+        run(
+            "ip",
+            &["link", "add", &host, "type", "veth", "peer", "name", &inner],
+        );
+        run("ip", &["link", "set", &host, "master", "oplqbr", "up"]);
+        run("ip", &["link", "set", &inner, "netns", ns]);
+        let in_ns = |args: &[&str]| {
+            let mut all = vec!["netns", "exec", ns, "ip"];
+            all.extend_from_slice(args);
+            run("ip", &all)
+        };
+        in_ns(&[
+            "addr",
+            "add",
+            &format!("192.168.77.{}/24", i + 1),
+            "dev",
+            &inner,
+        ]);
+        in_ns(&["link", "set", &inner, "up"]);
+        in_ns(&["link", "set", "lo", "up"]);
+    }
+    let server = Server(
+        Command::new("ip")
+            .args(["netns", "exec", "oplq2", "iperf3", "-s"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let tap = "oplq1h";
+    let qos = |out: Option<u32>, inn: Option<u32>| NicQos {
+        out_mbps: out,
+        in_mbps: inn,
+        ..Default::default()
+    };
+    net.set_tap_qos(tap, Some(&qos(Some(40), Some(25))))
+        .await
+        .unwrap();
+    show("tc", &["qdisc", "show", "dev", tap]);
+    show("tc", &["filter", "show", "dev", tap, "ingress"]);
+    show("tc", &["filter", "show", "dev", tap, "egress"]);
+    let out40 = iperf("oplq1", "192.168.77.2", false);
+    let in25 = iperf("oplq1", "192.168.77.2", true);
+    eprintln!("PROBE tc out_mbps=40: {out40:.1} Mbit/s, in_mbps=25: {in25:.1} Mbit/s");
+    assert!(near(out40, 40.0), "tc out 40 measured {out40:.1}");
+    assert!(near(in25, 25.0), "tc in 25 measured {in25:.1}");
+    // 같은 값이면 아무것도 하지 않는다(되읽은 속도·버스트가 같음).
+    let (i0, e0) = (police_index(tap, "ingress"), police_index(tap, "egress"));
+    net.set_tap_qos(tap, Some(&qos(Some(40), Some(25))))
+        .await
+        .unwrap();
+    assert_eq!(
+        (police_index(tap, "ingress"), police_index(tap, "egress")),
+        (i0.clone(), e0.clone())
+    );
+    // 보내기만 바꾸면 그 필터만 지우고 다시 넣는다(matchall은 제자리 바꾸기를 받지 않는다).
+    net.set_tap_qos(tap, Some(&qos(Some(15), Some(25))))
+        .await
+        .unwrap();
+    assert_ne!(police_index(tap, "ingress"), i0);
+    assert_eq!(police_index(tap, "egress"), e0);
+    let out15 = iperf("oplq1", "192.168.77.2", false);
+    eprintln!("PROBE tc changed to out_mbps=15: {out15:.1} Mbit/s");
+    assert!(near(out15, 15.0), "tc out 15 measured {out15:.1}");
+    // 받기만 빼면 egress 필터만 사라진다.
+    net.set_tap_qos(tap, Some(&qos(Some(15), None)))
+        .await
+        .unwrap();
+    assert_eq!(police_index(tap, "egress"), None);
+    assert!(police_index(tap, "ingress").is_some());
+    // 남의 필터가 있으면 다 빼도 clsact와 그 필터는 남는다.
+    run(
+        "tc",
+        &[
+            "filter", "add", "dev", tap, "egress", "pref", "10", "matchall", "action", "pass",
+        ],
+    );
+    net.set_tap_qos(tap, None).await.unwrap();
+    assert!(run("tc", &["qdisc", "show", "dev", tap]).contains("clsact"));
+    assert!(run("tc", &["filter", "show", "dev", tap, "egress"]).contains("pref 10"));
+    assert_eq!(police_index(tap, "ingress"), None);
+    run("tc", &["filter", "del", "dev", tap, "egress", "pref", "10"]);
+    net.set_tap_qos(tap, None).await.unwrap();
+    assert!(!run("tc", &["qdisc", "show", "dev", tap]).contains("clsact"));
+    drop(server);
+    for ns in ["oplq1", "oplq2"] {
+        let _ = try_run("ip", &["netns", "del", ns]);
+    }
+    let _ = try_run("ip", &["link", "del", "oplqbr"]);
 }

@@ -45,6 +45,9 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
             ("name", Str),
             ("ports", Ref("Logical_Switch_Port", true)),
             ("acls", Set),
+            // 계획 67: 부하 분산(약한 참조 — LB 행은 뿌리)과 QoS(강한 참조)
+            ("load_balancer", Ref("Load_Balancer", false)),
+            ("qos_rules", Ref("QoS", true)),
             ("external_ids", Map),
             ("other_config", Map),
         ],
@@ -68,6 +71,7 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
             ("ports", Ref("Logical_Router_Port", true)),
             ("static_routes", Ref("Logical_Router_Static_Route", true)),
             ("nat", Ref("NAT", true)),
+            ("load_balancer", Ref("Load_Balancer", false)),
             ("enabled", Set),
             ("options", Map),
             ("external_ids", Map),
@@ -134,6 +138,26 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
             ("options", Map),
             ("external_ids", Map),
         ],
+        // 계획 67: OVN 내장 부하 분산과 QoS(뿌리 여부·참조는 OVN 24.03 스키마 7.3.0대로)
+        "Load_Balancer" => &[
+            ("name", Str),
+            ("vips", Map),
+            ("protocol", Set),
+            ("health_check", Ref("Load_Balancer_Health_Check", true)),
+            ("ip_port_mappings", Map),
+            ("selection_fields", Set),
+            ("options", Map),
+            ("external_ids", Map),
+        ],
+        "Load_Balancer_Health_Check" => &[("vip", Str), ("options", Map), ("external_ids", Map)],
+        "QoS" => &[
+            ("priority", Int),
+            ("direction", Str),
+            ("match", Str),
+            ("action", Map),
+            ("bandwidth", Map),
+            ("external_ids", Map),
+        ],
         "SB_Global" => &[("nb_cfg", Int), ("external_ids", Map), ("options", Map)],
         "Chassis" => &[
             ("name", Str),
@@ -171,6 +195,8 @@ fn is_root(table: &str) -> bool {
             | "NAT"
             | "HA_Chassis"
             | "ACL"
+            | "Load_Balancer_Health_Check"
+            | "QoS"
     )
 }
 

@@ -11,6 +11,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use opl_types::network::{VXLAN_PORT, is_managed_ifname, tap_prefix, vxlan_bridge, vxlan_device};
 use opl_types::node::BridgeInfo;
+use opl_types::qos::{NicQos, TC_PREF, TcPolice, TcState, tc_commands};
 use opl_types::runtime::{NicBackend, RuntimeNic};
 use opl_types::vm::MacAddr;
 use serde::Deserialize;
@@ -26,6 +27,8 @@ pub struct Tap {
     pub vlan: Option<u16>,
     /// SDN(OVN) NIC면 OVS 포트로 붙일 때 쓰는 것(계획 65). 없으면 Linux 브리지 tap이다.
     pub ovn: Option<OvnPort>,
+    /// Linux 브리지 tap의 속도 제한(계획 67 §8.2 — tc). SDN tap은 늘 None이다(OVN `QoS` 행).
+    pub qos: Option<NicQos>,
 }
 
 /// OVS 통합 브리지에 붙이는 SDN tap의 OVN 칸(`Interface.external_ids`)
@@ -51,6 +54,7 @@ impl Tap {
                 vlan,
                 mtu,
                 ovn_port,
+                qos,
             } => Some(Self {
                 ifname: ifname.clone(),
                 bridge: bridge.clone(),
@@ -61,6 +65,7 @@ impl Tap {
                     vm,
                     mtu: *mtu,
                 }),
+                qos: *qos,
             }),
             NicBackend::User => None,
         }
@@ -110,6 +115,21 @@ pub trait HostNet: Send + Sync + std::fmt::Debug {
         Err(DriverError::InvalidSpec(format!(
             "{ifname}: SDN (OVN) ports are not supported on this node"
         )))
+    }
+    /// Linux 브리지 tap `ifname`의 속도 제한을 `qos`(None이면 없음)에 맞춘다(계획 67 §8.2 — `clsact`와 우선순위
+    /// [`TC_PREF`]의 matchall police). 읽은 tc 상태에서 다른 것만 바꾸고, 남의 우선순위 필터는 건드리지 않는다. tc가 없는
+    /// 호스트 네트워크(시험의 가짜)는 속도 제한이 없을 때만 된다.
+    async fn set_tap_qos(&self, ifname: &str, qos: Option<&NicQos>) -> Result<(), DriverError> {
+        if qos.is_some_and(NicQos::has_rate) {
+            return Err(DriverError::InvalidSpec(format!(
+                "{ifname}: NIC rate limits (tc) are not supported on this node"
+            )));
+        }
+        Ok(())
+    }
+    /// 이 노드가 tap에 tc 속도 제한을 걸 수 있는지(`NodeStatus.qos`): `tc`가 있고 `clsact`를 만들 수 있다.
+    async fn probe_qos(&self) -> bool {
+        false
     }
     /// VXLAN 네트워크의 장치를 `desired`에 맞춘다. alias가 `opl:<tag>`인 관리 이름 장치만 내 것으로 보고,
     /// `desired`에 없는 내 장치는 지운다. 한 네트워크가 실패해도 나머지는 맞추고 오류를 모아 돌려준다.
@@ -179,6 +199,33 @@ impl IpRoute {
             }
         }
         Ok(())
+    }
+
+    /// tap `ifname`의 tc 상태: `clsact`가 있으면 두 훅의 필터를 읽는다(우리 우선순위의 police 속도·버스트, 남의 필터).
+    async fn tc_state(&self, ifname: &str) -> Result<TcState, DriverError> {
+        let qdiscs = self
+            .run("tc", &["-j", "qdisc", "show", "dev", ifname])
+            .await?;
+        let mut state = TcState {
+            clsact: has_clsact(&qdiscs)?,
+            ..TcState::default()
+        };
+        if !state.clsact {
+            return Ok(state);
+        }
+        for hook in ["ingress", "egress"] {
+            let text = self
+                .run("tc", &["filter", "show", "dev", ifname, hook])
+                .await?;
+            let (ours, foreign) = parse_tc_filters(&text);
+            state.foreign |= foreign;
+            if hook == "ingress" {
+                state.ingress = ours;
+            } else {
+                state.egress = ours;
+            }
+        }
+        Ok(state)
     }
 
     async fn delete_link(&self, ifname: &str) -> Result<(), DriverError> {
@@ -284,7 +331,49 @@ impl HostNet for IpRoute {
                 return Err(e);
             }
         }
+        // 속도 제한(계획 67 §8.2). 새 tap이라 읽을 것이 없다.
+        if let Some(qos) = tap.qos.filter(NicQos::has_rate) {
+            for cmd in tc_commands(&tap.ifname, Some(&qos), &TcState::default()) {
+                if let Err(e) = self.run("tc", &cmd[1..]).await {
+                    let _ = self.delete_link(&tap.ifname).await;
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
+    }
+
+    async fn set_tap_qos(&self, ifname: &str, qos: Option<&NicQos>) -> Result<(), DriverError> {
+        let actual = self.tc_state(ifname).await?;
+        let actual = snap_burst(actual, qos);
+        for cmd in tc_commands(ifname, qos, &actual) {
+            self.run("tc", &cmd[1..]).await?;
+        }
+        Ok(())
+    }
+
+    async fn probe_qos(&self) -> bool {
+        // 장치 이름은 이 탐침만 쓴다(앞서 멈춘 탐침이 남긴 것은 먼저 지운다).
+        const PROBE: &str = "oplqosprobe";
+        let _ = self.delete_link(PROBE).await;
+        let made = self
+            .run("ip", &["link", "add", PROBE, "type", "dummy"])
+            .await;
+        if let Err(e) = made {
+            tracing::warn!(error = %e, "cannot probe tc; NIC rate limits are off on this node");
+            return false;
+        }
+        let tc = self
+            .run("tc", &["qdisc", "add", "dev", PROBE, "clsact"])
+            .await;
+        let _ = self.delete_link(PROBE).await;
+        match tc {
+            Ok(_) => true,
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot add a tc clsact qdisc; NIC rate limits are off on this node");
+                false
+            }
+        }
     }
 
     async fn delete_vm_taps(&self, vm: Uuid) -> Result<(), DriverError> {
@@ -832,6 +921,104 @@ fn ovn_installed(out: &str) -> bool {
     out.trim().trim_matches('"') == "true"
 }
 
+/// `tc -j qdisc show dev X`에 `clsact`가 있는지
+fn has_clsact(json: &str) -> Result<bool, DriverError> {
+    let qdiscs: Vec<serde_json::Value> = serde_json::from_str(json).map_err(bad_output)?;
+    Ok(qdiscs.iter().any(|q| q["kind"] == "clsact"))
+}
+
+/// `tc filter show dev X ingress|egress`(글)에서 우선순위 [`TC_PREF`] 필터의 police(속도·버스트)와 다른 우선순위 필터가
+/// 있는지. iproute2 6.x의 JSON은 police의 속도·버스트를 내지 않아 글을 읽는다:
+/// `filter protocol all pref 49152 matchall chain 0 handle 0x1` 다음 줄들의 `police 0x1 rate 50Mbit burst 6250b …`.
+/// 우리 필터인데 police를 읽지 못하면(모양이 다름) 속도 0으로 두어 다시 넣게 한다.
+fn parse_tc_filters(text: &str) -> (Option<TcPolice>, bool) {
+    let mut pref = None;
+    let mut ours = None;
+    let mut foreign = false;
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let after = |key: &str| {
+            words
+                .iter()
+                .position(|w| *w == key)
+                .and_then(|i| words.get(i + 1).copied())
+        };
+        if words.first() == Some(&"filter") {
+            pref = after("pref").and_then(|p| p.parse::<u32>().ok());
+            match pref {
+                Some(TC_PREF) => {
+                    ours.get_or_insert(TcPolice {
+                        rate_mbps: 0,
+                        burst_kbit: 0,
+                    });
+                }
+                Some(_) => foreign = true,
+                None => {}
+            }
+        } else if pref == Some(TC_PREF) && words.contains(&"police") {
+            let rate = after("rate").and_then(parse_tc_rate);
+            let burst = after("burst").and_then(parse_tc_size);
+            if let (Some(rate), Some(burst)) = (rate, burst) {
+                ours = Some(TcPolice {
+                    rate_mbps: u32::try_from(rate.div_ceil(1_000_000)).unwrap_or(u32::MAX),
+                    burst_kbit: u32::try_from(burst.div_ceil(125)).unwrap_or(u32::MAX),
+                });
+            }
+        }
+    }
+    (ours, foreign)
+}
+
+/// tc가 찍는 속도(`50Mbit`, `1Gbit`, `800Kbit`, `100bit` — SI)를 bit/s로
+fn parse_tc_rate(s: &str) -> Option<u64> {
+    let digits = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (n, unit) = s.split_at(digits);
+    let n: f64 = n.parse().ok()?;
+    let scale = match unit {
+        "bit" => 1.0,
+        "Kbit" => 1e3,
+        "Mbit" => 1e6,
+        "Gbit" => 1e9,
+        "Tbit" => 1e12,
+        _ => return None,
+    };
+    Some((n * scale).round() as u64)
+}
+
+/// tc가 찍는 크기(`6250b`, `5Kb`, `2Mb` — `Kb`·`Mb`는 1024 바이트 단위)를 바이트로
+fn parse_tc_size(s: &str) -> Option<u64> {
+    let digits = s.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (n, unit) = s.split_at(digits);
+    let n: f64 = n.parse().ok()?;
+    let scale = match unit {
+        "b" => 1.0,
+        "Kb" => 1024.0,
+        "Mb" => 1024.0 * 1024.0,
+        "Gb" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+    Some((n * scale).round() as u64)
+}
+
+/// 커널은 버스트를 시간(틱)으로 들고 있어 tc가 되읽는 바이트는 쓴 값과 조금 다르다. 읽은 버스트가 바라는 값의 2%
+/// (또는 16 kbit) 안이면 같은 것으로 본다 — 차례마다 지우고 다시 넣지 않게.
+fn snap_burst(mut actual: TcState, qos: Option<&NicQos>) -> TcState {
+    let near = |have: Option<TcPolice>, rate: Option<u32>| -> Option<TcPolice> {
+        let mut h = have?;
+        if let (Some(q), Some(m)) = (qos, rate) {
+            let want = q.burst_for(m);
+            let slack = (want / 50).max(16);
+            if h.rate_mbps == m && h.burst_kbit.abs_diff(want) <= slack {
+                h.burst_kbit = want;
+            }
+        }
+        Some(h)
+    };
+    actual.ingress = near(actual.ingress, qos.and_then(|q| q.out_mbps));
+    actual.egress = near(actual.egress, qos.and_then(|q| q.in_mbps));
+    actual
+}
+
 fn args(a: &[&str]) -> Vec<String> {
     a.iter().map(|s| s.to_string()).collect()
 }
@@ -943,7 +1130,85 @@ mod tests {
             bridge: "vmbr0".into(),
             vlan,
             ovn: None,
+            qos: None,
         }
+    }
+
+    /// iproute2 6.1(Ubuntu 24.04)이 찍는 matchall police 필터(계획 67 §8.2)
+    const TC_FILTERS: &str = "filter protocol all pref 49152 matchall chain 0 \n\
+filter protocol all pref 49152 matchall chain 0 handle 0x1 \n\
+  not_in_hw\n\
+\taction order 1:  police 0x1 rate 50Mbit burst 5000000b mtu 2Kb action drop overhead 0b \n\
+\tref 1 bind 1\n\n";
+
+    #[test]
+    fn parses_our_police_filter_and_foreign_ones() {
+        assert_eq!(
+            parse_tc_filters(TC_FILTERS),
+            (
+                Some(TcPolice {
+                    rate_mbps: 50,
+                    burst_kbit: 40000
+                }),
+                false
+            )
+        );
+        let foreign = format!(
+            "filter protocol ip pref 10 u32 chain 0 \nfilter protocol ip pref 10 u32 chain 0 fh 800: ht divisor 1 \n{TC_FILTERS}"
+        );
+        assert!(parse_tc_filters(&foreign).1);
+        // 우리 우선순위인데 police를 읽지 못하면 다시 넣도록 속도 0
+        assert_eq!(
+            parse_tc_filters("filter protocol all pref 49152 matchall chain 0 \n"),
+            (
+                Some(TcPolice {
+                    rate_mbps: 0,
+                    burst_kbit: 0
+                }),
+                false
+            )
+        );
+        assert_eq!(parse_tc_filters(""), (None, false));
+        assert_eq!(parse_tc_rate("1Gbit"), Some(1_000_000_000));
+        assert_eq!(parse_tc_rate("800Kbit"), Some(800_000));
+        assert_eq!(parse_tc_rate("12bit"), Some(12));
+        assert_eq!(parse_tc_rate("fast"), None);
+        assert_eq!(parse_tc_size("5Kb"), Some(5120));
+        assert_eq!(parse_tc_size("2Mb"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_tc_size("6250b"), Some(6250));
+        assert!(has_clsact(r#"[{"kind":"noqueue","handle":"0:"},{"kind":"clsact","handle":"ffff:","parent":"ffff:fff1"}]"#).unwrap());
+        assert!(!has_clsact(r#"[{"kind":"noqueue","handle":"0:"}]"#).unwrap());
+    }
+
+    /// 되읽은 버스트가 조금 달라도(커널의 틱 반올림) 같은 것으로 보아 다시 넣지 않는다. 속도가 다르면 그대로 둔다.
+    #[test]
+    fn a_nearly_equal_burst_is_the_same_filter() {
+        let qos = NicQos {
+            out_mbps: Some(50),
+            in_mbps: Some(30),
+            ..Default::default()
+        };
+        let read = TcState {
+            clsact: true,
+            ingress: Some(TcPolice {
+                rate_mbps: 50,
+                burst_kbit: 40_003,
+            }),
+            egress: Some(TcPolice {
+                rate_mbps: 31,
+                burst_kbit: 24_000,
+            }),
+            foreign: false,
+        };
+        let snapped = snap_burst(read, Some(&qos));
+        assert_eq!(snapped.ingress.unwrap().burst_kbit, 40_000);
+        assert_eq!(snapped.egress, read.egress);
+        let cmds = tc_commands("op0123456789n0", Some(&qos), &snapped);
+        assert!(
+            cmds.iter().all(|c| !c.contains(&"ingress".to_string())),
+            "{cmds:?}"
+        );
+        assert_eq!(cmds.len(), 2, "{cmds:?}");
     }
 
     #[test]
@@ -959,6 +1224,7 @@ mod tests {
                 vlan: None,
                 mtu: Some(1442),
                 ovn_port: Some(opl_types::sdn::port_name(vm, mac)),
+                qos: None,
             },
         };
         let tap = Tap::from_nic(vm, &nic).unwrap();
@@ -993,6 +1259,7 @@ mod tests {
                 vlan: Some(10),
                 mtu: Some(1450),
                 ovn_port: None,
+                qos: None,
             },
         };
         assert_eq!(Tap::from_nic(vm, &nic), Some(tap(Some(10))));

@@ -524,7 +524,8 @@ fn sdn_subnets(
 }
 
 /// NIC 하나(`vm.spec.nics[index]`)의 런타임 정의. tap 이름은 순번으로 정한다([`tap_name`]). SDN(OVN) 네트워크면
-/// `bridge`가 `br-int`이고 논리 포트 이름(`ovn_port`, OVS 포트의 `iface-id`)을 단다(계획 65).
+/// `bridge`가 `br-int`이고 논리 포트 이름(`ovn_port`, OVS 포트의 `iface-id`)을 단다(계획 65). 단순 NIC의 속도 제한(`qos`)은
+/// 드라이버가 tap의 tc로 건다(계획 67 §8.2).
 pub fn runtime_nic(cluster: &Cluster, vm: &Vm, index: usize) -> Result<RuntimeNic, ResolveError> {
     let nic = vm.spec.nics.get(index).ok_or(ResolveError::NoNic(index))?;
     let mac = || nic.mac.ok_or(ResolveError::MissingMac(index));
@@ -544,6 +545,8 @@ pub fn runtime_nic(cluster: &Cluster, vm: &Vm, index: usize) -> Result<RuntimeNi
                 .is_sdn()
                 .then(|| mac().map(|m| opl_types::sdn::port_name(vm.id, m)))
                 .transpose()?,
+            // 단순 NIC의 속도 제한만 tap의 tc로(계획 67 §8.2). SDN NIC는 OVN `QoS` 행이 한다.
+            qos: nic.qos.filter(|q| q.has_rate() && !network.spec.is_sdn()),
         }
     };
     Ok(RuntimeNic {

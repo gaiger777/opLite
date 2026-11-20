@@ -30,6 +30,9 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::acl::{self, AclRow, ActualAcl, ActualPortGroup, PortGroupRow};
+use super::lb::{self, ActualHealth, ActualLb, LbRow};
+use super::qos::{self, ActualQos, QosNbRow};
+use opl_types::load_balancer::LoadBalancer;
 
 /// 클러스터 태그(주인 표시)
 pub const CLUSTER_KEY: &str = "orbivisor:cluster";
@@ -105,6 +108,8 @@ pub struct NbState {
     pub routers: Vec<RouterRow>,
     /// SDN NIC 보안 그룹의 목록 Port_Group(이름 순, 계획 66 §11)
     pub port_groups: Vec<PortGroupRow>,
+    /// 부하 분산의 `Load_Balancer` 행(이름 순, 계획 67 §7.2)
+    pub load_balancers: Vec<LbRow>,
 }
 
 /// 논리 라우터 하나(Router 하나, 계획 66 §9.1)
@@ -119,6 +124,8 @@ pub struct RouterRow {
     pub nat: Vec<NatRow>,
     /// 게이트웨이 후보가 있을 때만
     pub ha: Option<HaGroupRow>,
+    /// 붙일 `Load_Balancer` 행 이름(계획 67 — VIP 네트워크가 이 라우터의 인터페이스인 LB, 이름 순)
+    pub load_balancers: Vec<String>,
 }
 
 /// 라우터 포트 하나(인터페이스 또는 DGP)
@@ -172,6 +179,10 @@ pub struct SwitchRow {
     pub external_ids: BTreeMap<String, String>,
     pub ports: Vec<PortRow>,
     pub dhcp: Vec<DhcpRow>,
+    /// 붙일 `Load_Balancer` 행 이름(계획 67 — 이 네트워크가 인터페이스인 라우터의 LB, 이름 순)
+    pub load_balancers: Vec<String>,
+    /// 이 스위치 SDN NIC들의 `QoS` 행(계획 67 §8.1, 정렬됨)
+    pub qos: Vec<QosNbRow>,
 }
 
 /// 논리 스위치 포트 하나(VM NIC 하나, 스테이지 4 — 계획 66부터 localnet·router 포트도)
@@ -418,6 +429,32 @@ pub fn desired_all(
     security_groups: &[SecurityGroup],
     tag: &str,
 ) -> NbState {
+    desired_services(
+        networks,
+        vms,
+        nodes,
+        routers,
+        floating_ips,
+        security_groups,
+        &[],
+        tag,
+    )
+}
+
+/// [`desired_all`]에 계획 67의 서비스를 더한 것: LB마다 프로토콜별 `Load_Balancer` 행([`lb::desired_rows`])과 그 붙이기
+/// (VIP 네트워크 라우터와 그 모든 인터페이스 스위치), SDN NIC `qos`의 `QoS` 행([`qos::rows`]). LB와 `qos`가 없으면
+/// [`desired_all`]과 같은 행이다.
+#[allow(clippy::too_many_arguments)]
+pub fn desired_services(
+    networks: &[Network],
+    vms: &[Vm],
+    nodes: &[Node],
+    routers: &[Router],
+    floating_ips: &[FloatingIp],
+    security_groups: &[SecurityGroup],
+    load_balancers: &[LoadBalancer],
+    tag: &str,
+) -> NbState {
     let lists: std::cell::RefCell<BTreeMap<String, PortGroupRow>> = Default::default();
     let node_ids: BTreeSet<Uuid> = nodes.iter().map(|n| n.id).collect();
     let sdn: BTreeMap<&str, &Network> = networks
@@ -474,6 +511,33 @@ pub fn desired_all(
         })
         .collect();
 
+    // 부하 분산(계획 67 §7.2): VIP 네트워크를 인터페이스로 가진 라우터에 붙인다(LB id 순).
+    let mut lbs: Vec<&LoadBalancer> = load_balancers.iter().collect();
+    lbs.sort_by_key(|l| l.id);
+    let mut lb_rows: Vec<LbRow> = Vec::new();
+    let mut router_lbs: BTreeMap<Uuid, Vec<String>> = BTreeMap::new();
+    for l in lbs {
+        let plan = owner
+            .get(l.spec.network.as_str())
+            .and_then(|r| plans.iter().find(|p| p.router.id == *r));
+        let attach = plan.map(|p| lb::Attach {
+            router: p.router.id,
+            interfaces: &p.interfaces,
+            external: p.external.as_ref().map(|e| e.network.name.as_str()),
+        });
+        let rows = lb::desired_rows(l, attach.as_ref(), vms, tag);
+        if let Some(a) = &attach {
+            router_lbs
+                .entry(a.router)
+                .or_default()
+                .extend(rows.iter().map(|r| r.name.clone()));
+        }
+        lb_rows.extend(rows);
+    }
+    lb_rows.sort_by(|a, b| a.name.cmp(&b.name));
+    for names in router_lbs.values_mut() {
+        names.sort();
+    }
     let mut switches: Vec<SwitchRow> =
         sdn.values()
             .map(|n| {
@@ -630,12 +694,38 @@ pub fn desired_all(
                     }
                 }
                 ports.sort_by(|a, b| a.name.cmp(&b.name));
+                // SDN NIC의 QoS(계획 67 §8.1)
+                let mut qos_rows: Vec<QosNbRow> = vms
+                    .iter()
+                    .filter(|v| !v.spec.template)
+                    .flat_map(|v| {
+                        v.spec
+                            .nics
+                            .iter()
+                            .filter(|nic| nic.network == n.name)
+                            .filter_map(move |nic| {
+                                Some(qos::rows(
+                                    &port_name(v.id, nic.mac?),
+                                    nic.qos.as_ref()?,
+                                    tag,
+                                ))
+                            })
+                    })
+                    .flatten()
+                    .collect();
+                qos_rows.sort();
                 SwitchRow {
                     network: n.id,
                     name: switch_name(n.id),
                     external_ids,
                     ports,
                     dhcp,
+                    load_balancers: owner
+                        .get(n.name.as_str())
+                        .and_then(|r| router_lbs.get(r))
+                        .cloned()
+                        .unwrap_or_default(),
+                    qos: qos_rows,
                 }
             })
             .collect();
@@ -646,12 +736,17 @@ pub fn desired_all(
     fips.sort_by_key(|f| f.id);
     let routers = plans
         .iter()
-        .map(|plan| router_row(plan, vms, &fips, &by_id, &node_ids, tag))
+        .map(|plan| {
+            let mut row = router_row(plan, vms, &fips, &by_id, &node_ids, tag);
+            row.load_balancers = router_lbs.get(&plan.router.id).cloned().unwrap_or_default();
+            row
+        })
         .collect();
     NbState {
         switches,
         routers,
         port_groups: lists.into_inner().into_values().collect(),
+        load_balancers: lb_rows,
     }
 }
 
@@ -809,6 +904,7 @@ fn router_row(
         routes,
         nat,
         ha,
+        load_balancers: Vec::new(),
     }
 }
 
@@ -901,6 +997,10 @@ pub struct ActualSwitch {
     pub name: String,
     pub external_ids: BTreeMap<String, String>,
     pub ports: Vec<String>,
+    /// 붙은 `Load_Balancer`(누구 것이든, 계획 67)
+    pub load_balancers: Vec<String>,
+    /// `QoS` 행(누구 것이든, 계획 67)
+    pub qos_rules: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -944,6 +1044,8 @@ pub struct ActualRouter {
     pub ports: Vec<String>,
     pub static_routes: Vec<String>,
     pub nat: Vec<String>,
+    /// 붙은 `Load_Balancer`(누구 것이든, 계획 67)
+    pub load_balancers: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1011,10 +1113,14 @@ pub struct NbActual {
     pub ha_chassis: Vec<ActualHaChassis>,
     pub port_groups: Vec<ActualPortGroup>,
     pub acls: Vec<ActualAcl>,
+    /// 계획 67: 우리 `Load_Balancer`·`Load_Balancer_Health_Check`·`QoS` 행
+    pub load_balancers: Vec<ActualLb>,
+    pub health_checks: Vec<ActualHealth>,
+    pub qos: Vec<ActualQos>,
 }
 
 /// 우리 행을 읽는 연산들(한 트랜잭션): 스위치·포트·DHCP(태그 조건)와 `NB_Global`, 라우터·라우터 포트·경로·NAT·HA 그룹·
-/// HA chassis, Port_Group·ACL(태그 조건)
+/// HA chassis, Port_Group·ACL, 부하 분산·건강 검사·QoS(태그 조건)
 pub fn read_ops(tag: &str) -> Vec<Value> {
     let ours = || {
         vec![cond(
@@ -1028,7 +1134,7 @@ pub fn read_ops(tag: &str) -> Vec<Value> {
     };
     vec![
         json!({"op": "select", "table": "Logical_Switch", "where": ours(),
-               "columns": ["_uuid", "name", "external_ids", "ports"]}),
+               "columns": ["_uuid", "name", "external_ids", "ports", "load_balancer", "qos_rules"]}),
         json!({"op": "select", "table": "Logical_Switch_Port", "where": ours(),
                "columns": ["_uuid", "name", "type", "addresses", "port_security", "dhcpv4_options",
                            "dhcpv6_options", "enabled", "tag", "options", "external_ids"]}),
@@ -1037,7 +1143,8 @@ pub fn read_ops(tag: &str) -> Vec<Value> {
         json!({"op": "select", "table": "NB_Global", "where": [],
                "columns": ["_uuid", "external_ids", "nb_cfg", "hv_cfg"]}),
         json!({"op": "select", "table": "Logical_Router", "where": ours(),
-               "columns": ["_uuid", "name", "options", "external_ids", "ports", "static_routes", "nat"]}),
+               "columns": ["_uuid", "name", "options", "external_ids", "ports", "static_routes", "nat",
+                           "load_balancer"]}),
         json!({"op": "select", "table": "Logical_Router_Port", "where": ours(),
                "columns": ["_uuid", "name", "mac", "networks", "enabled", "ha_chassis_group", "options",
                            "ipv6_ra_configs", "status", "external_ids"]}),
@@ -1054,6 +1161,13 @@ pub fn read_ops(tag: &str) -> Vec<Value> {
                "columns": ["_uuid", "name", "ports", "acls", "external_ids"]}),
         json!({"op": "select", "table": "ACL", "where": ours(),
                "columns": ["_uuid", "priority", "direction", "match", "action", "external_ids"]}),
+        json!({"op": "select", "table": "Load_Balancer", "where": ours(),
+               "columns": ["_uuid", "name", "protocol", "vips", "ip_port_mappings", "options", "external_ids",
+                           "health_check"]}),
+        json!({"op": "select", "table": "Load_Balancer_Health_Check", "where": ours(),
+               "columns": ["_uuid", "vip", "options", "external_ids"]}),
+        json!({"op": "select", "table": "QoS", "where": ours(),
+               "columns": ["_uuid", "priority", "direction", "match", "action", "bandwidth", "external_ids"]}),
     ]
 }
 
@@ -1124,6 +1238,8 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
             name: text(r, "name"),
             external_ids: parse_map(&r["external_ids"]),
             ports: sorted(parse_uuids(&r["ports"])),
+            load_balancers: sorted(r.get("load_balancer").map(parse_uuids).unwrap_or_default()),
+            qos_rules: sorted(r.get("qos_rules").map(parse_uuids).unwrap_or_default()),
         })
         .collect();
     let ports = rows(&results[1])
@@ -1177,6 +1293,7 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
             ports: sorted(parse_uuids(&r["ports"])),
             static_routes: sorted(parse_uuids(&r["static_routes"])),
             nat: sorted(parse_uuids(&r["nat"])),
+            load_balancers: sorted(r.get("load_balancer").map(parse_uuids).unwrap_or_default()),
         })
         .collect();
     let router_ports = at(5)
@@ -1256,6 +1373,45 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
             },
         })
         .collect();
+    let load_balancers = at(12)
+        .iter()
+        .map(|r| ActualLb {
+            uuid: uuid_of(r),
+            name: text(r, "name"),
+            protocol: r
+                .get("protocol")
+                .map(parse_strings)
+                .and_then(|v| v.into_iter().next()),
+            vips: parse_map(&r["vips"]),
+            ip_port_mappings: parse_map(&r["ip_port_mappings"]),
+            options: parse_map(&r["options"]),
+            external_ids: parse_map(&r["external_ids"]),
+            health_check: sorted(parse_uuids(&r["health_check"])),
+        })
+        .collect();
+    let health_checks = at(13)
+        .iter()
+        .map(|r| ActualHealth {
+            uuid: uuid_of(r),
+            vip: text(r, "vip"),
+            options: parse_map(&r["options"]),
+            external_ids: parse_map(&r["external_ids"]),
+        })
+        .collect();
+    let qos = at(14)
+        .iter()
+        .map(|r| ActualQos {
+            uuid: uuid_of(r),
+            row: QosNbRow {
+                direction: text(r, "direction"),
+                priority: parse_int(&r["priority"]).unwrap_or(0),
+                r#match: text(r, "match"),
+                action: parse_map(&r["action"]),
+                bandwidth: parse_map(&r["bandwidth"]),
+                external_ids: parse_map(&r["external_ids"]),
+            },
+        })
+        .collect();
     NbActual {
         switches,
         ports,
@@ -1269,6 +1425,9 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
         ha_chassis,
         port_groups,
         acls,
+        load_balancers,
+        health_checks,
+        qos,
     }
 }
 
@@ -1397,6 +1556,20 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
             });
         }
     }
+    // LB마다 한 묶음(네트워크 묶음보다 먼저 — 새 LB 행을 이미 있는 스위치·라우터에 같은 트랜잭션에서 붙인다, 계획 67 §7.2)
+    let mut by_lb: BTreeMap<Uuid, Vec<&LbRow>> = BTreeMap::new();
+    for r in &want.load_balancers {
+        by_lb.entry(r.lb).or_default().push(r);
+    }
+    for (n, (id, rows)) in by_lb.iter().enumerate() {
+        let ops = lb::plan_lb(n, *id, rows, want, have);
+        if !ops.is_empty() {
+            out.push(Batch {
+                key: format!("opl-lb-{id}"),
+                ops,
+            });
+        }
+    }
 
     for (n, sw) in want.switches.iter().enumerate() {
         let mut ops = Vec::new();
@@ -1509,15 +1682,52 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
             }
         }
 
+        // QoS 행(계획 67 §8.1 — 포트와 한 트랜잭션)
+        let (qos_ops, qos_add, qos_remove) = qos::plan(
+            n,
+            &sw.qos,
+            current.map_or(&[][..], |c| c.qos_rules.as_slice()),
+            &have.qos,
+        );
+        ops.extend(qos_ops);
         match current {
             None => {
+                let mut row = Map::new();
+                row.insert("name".into(), json!(sw.name));
+                row.insert("external_ids".into(), map_value(&sw.external_ids));
+                row.insert("ports".into(), set_value(add));
+                // 계획 67의 칸은 비면 쓰지 않는다(계획 66 스위치의 연산 그대로).
+                let lbs = lb::attach_insert(&sw.load_balancers, have);
+                if !lbs.is_empty() {
+                    row.insert("load_balancer".into(), set_value(lbs));
+                }
+                if !qos_add.is_empty() {
+                    row.insert("qos_rules".into(), set_value(qos_add));
+                }
                 ops.push(
                     json!({"op": "insert", "table": "Logical_Switch", "uuid-name": format!("s{n}"),
-                    "row": {"name": sw.name, "external_ids": map_value(&sw.external_ids),
-                            "ports": set_value(add)}}),
+                    "row": row}),
                 );
             }
             Some(c) => {
+                let (lb_add, lb_remove) =
+                    lb::attach_changes(&sw.load_balancers, &c.load_balancers, have);
+                mutate_set(
+                    &mut ops,
+                    "Logical_Switch",
+                    &c.uuid,
+                    "load_balancer",
+                    lb_remove,
+                    lb_add,
+                );
+                mutate_set(
+                    &mut ops,
+                    "Logical_Switch",
+                    &c.uuid,
+                    "qos_rules",
+                    qos_remove,
+                    qos_add,
+                );
                 if c.external_ids != sw.external_ids {
                     ops.push(
                         json!({"op": "update", "table": "Logical_Switch", "where": by_uuid(&c.uuid),
@@ -1592,6 +1802,10 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
                 ops,
             });
         }
+    }
+    // 바라지 않는 LB(라우터 묶음 뒤 — 붙인 약한 참조는 OVSDB가 비운다, 계획 67)
+    for (key, ops) in lb::stale(want, have) {
+        out.push(Batch { key, ops });
     }
     // 쓰이지 않는 목록 Port_Group(포트를 옮기는 네트워크 묶음 뒤, `ports`가 빈 때만 — §11.3)
     let wanted_groups: BTreeSet<&str> = want.port_groups.iter().map(|g| g.name.as_str()).collect();
@@ -1855,11 +2069,17 @@ fn plan_router(n: usize, r: &RouterRow, have: &NbActual) -> Vec<Value> {
 
     match current {
         None => {
+            let mut row = json!({"name": r.name, "options": map_value(&r.options),
+                    "external_ids": map_value(&r.external_ids), "ports": set_value(add),
+                    "static_routes": set_value(add_routes), "nat": set_value(add_nat)});
+            // 계획 67: 비면 쓰지 않는다(계획 66 라우터의 연산 그대로).
+            let lbs = lb::attach_insert(&r.load_balancers, have);
+            if !lbs.is_empty() {
+                row["load_balancer"] = set_value(lbs);
+            }
             ops.push(
                 json!({"op": "insert", "table": "Logical_Router", "uuid-name": format!("lr{n}"),
-                "row": {"name": r.name, "options": map_value(&r.options),
-                        "external_ids": map_value(&r.external_ids), "ports": set_value(add),
-                        "static_routes": set_value(add_routes), "nat": set_value(add_nat)}}),
+                "row": row}),
             );
         }
         Some(c) => {
@@ -1883,6 +2103,16 @@ fn plan_router(n: usize, r: &RouterRow, have: &NbActual) -> Vec<Value> {
                 "nat",
                 remove_nat,
                 add_nat,
+            );
+            let (lb_add, lb_remove) =
+                lb::attach_changes(&r.load_balancers, &c.load_balancers, have);
+            mutate_set(
+                &mut ops,
+                "Logical_Router",
+                &c.uuid,
+                "load_balancer",
+                lb_remove,
+                lb_add,
             );
         }
     }
@@ -2004,8 +2234,14 @@ pub fn fence(
     (ops, ids)
 }
 
-/// NIC 하나의 칸(네트워크, MAC, 주소, 보안 그룹)
-type NicInputs = (String, Option<String>, Vec<std::net::IpAddr>, Vec<String>);
+/// NIC 하나의 칸(네트워크, MAC, 주소, 보안 그룹, QoS — 계획 67)
+type NicInputs = (
+    String,
+    Option<String>,
+    Vec<std::net::IpAddr>,
+    Vec<String>,
+    Option<opl_types::qos::NicQos>,
+);
 
 /// 논리 포트([`desired`])에 쓰이는 VM의 칸: 템플릿인지, NIC(네트워크·MAC·주소·보안 그룹), 전원·배정 노드, 실행 단계·노드·
 /// 마이그레이션 대상. 이것이 그대로인 VM 쓰기(복제 기록·통계 같은 상태 쓰기)로는 OvnSync가 NB를 다시 읽지 않는다(리뷰 2
@@ -2034,6 +2270,7 @@ impl VmInputs {
                         n.mac.map(|m| m.to_string()),
                         n.ips.clone(),
                         n.security_groups.clone(),
+                        n.qos,
                     )
                 })
                 .collect(),

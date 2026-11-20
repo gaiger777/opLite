@@ -232,6 +232,10 @@ pub enum NicBackend {
         /// 그대로다(옛 정의는 바이트까지 같다).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ovn_port: Option<String>,
+        /// 단순 NIC의 속도 제한(계획 67 §8.2 — 드라이버가 tap의 tc로 건다). SDN NIC는 늘 None이다(OVN `QoS` 행이 한다).
+        /// 없으면 옛 정의와 바이트까지 같다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        qos: Option<crate::qos::NicQos>,
     },
 }
 
@@ -333,6 +337,7 @@ mod tests {
             vlan: None,
             mtu: Some(1450),
             ovn_port: None,
+            qos: None,
         };
         let json = serde_json::to_value(&vxlan).unwrap();
         assert_eq!(json["mtu"], 1450);
@@ -369,6 +374,7 @@ mod tests {
                 vlan: None,
                 mtu: Some(1442),
                 ovn_port: Some("opl-x-525400123456".into()),
+                qos: None,
             },
         };
         let json = serde_json::to_value(&sdn).unwrap();

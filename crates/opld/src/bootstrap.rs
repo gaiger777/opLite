@@ -224,12 +224,14 @@ async fn record_node(
     };
     // NUMA 토폴로지(계획 64)도 모든 노드가 `numa`를 알 때만 쓴다. 아니면 이미 적힌 것을 지우지 않는다.
     let numa_ready = host.topology.is_some() && crate::topology::numa_ready(cluster, &config.name);
+    // tc 속도 제한(계획 67)은 모든 노드가 `sdn-services`를 알 때만 쓴다. 아니면 이미 적힌 것을 지우지 않는다.
+    let qos_ready = crate::sdn::services_ready(cluster, &config.name);
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
         let stored = status.topology.take();
         *status = NodeStatus {
             sdn: None,
-            qos: false,
+            qos: if qos_ready { host.qos } else { status.qos },
             topology: match &host.topology {
                 Some(t) if numa_ready => Some(crate::topology::keep_time(stored.as_ref(), t)),
                 _ => stored,

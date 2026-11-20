@@ -2,7 +2,8 @@
 //! 논리 포트로 옮겨 쓴다. NB는 Raft에서 다시 만들 수
 //! 있는 파생물이다 — 리더가 바뀌거나 누가 NB를 바꾸거나 비워도 다음 차례가 되살린다.
 //!
-//! 위트니스가 아닌 모든 노드가 띄우고 리더에서만 일한다. 차례는 리더가 된 직후, Network·Vm·Sdn·Router·FloatingIp·SecurityGroup 변경과
+//! 위트니스가 아닌 모든 노드가 띄우고 리더에서만 일한다. 차례는 리더가 된 직후, Network·Vm·Sdn·Router·FloatingIp·SecurityGroup·
+//! LoadBalancer(계획 67) 변경과
 //! 노드 지우기, 라우터에 쓰이는 노드 칸([`nb::NodeInputs`])의 변경(0.5초 모아 한 번), 60초마다다. `Sdn`이 없거나 `Ready`가 아니면 쉰다. 한 차례는
 //!
 //! 1. 내 Raft 임기를 잡고 `read_barrier()` 뒤 Raft에서 읽어 바라는 행([`nb::desired`])을 만든다. Raft 읽기가 실패하면
@@ -17,7 +18,9 @@
 //! 5. `SdnStatus.sync`를 바뀔 때만(성공이 이어지면 60초에 한 번) 쓴다.
 
 pub mod acl;
+pub mod lb;
 pub mod nb;
+pub mod qos;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -30,6 +33,7 @@ use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::ovn::ovsdb::{cond, parse_uuids};
 use opl_driver::ovn::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB, Transport};
 use opl_types::floating_ip::FloatingIpSpec;
+use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::network::NetworkSpec;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Kind;
@@ -198,6 +202,10 @@ impl OvnSyncer {
                 return SyncOutcome::Skipped(e.to_string());
             }
         };
+        let lbs = match cluster.list::<LoadBalancerSpec>() {
+            Ok((_, l)) => l,
+            Err(e) => return SyncOutcome::Skipped(e.to_string()),
+        };
         self.seen = vms
             .iter()
             .map(|v| (v.id, nb::VmInputs::of(&v.spec, &v.status)))
@@ -206,19 +214,37 @@ impl OvnSyncer {
             .iter()
             .map(|n| (n.id, nb::NodeInputs::of(&n.spec, &n.status)))
             .collect();
-        let want = nb::desired_all(
+        let want = nb::desired_services(
             &networks,
             &vms,
             &nodes,
             &routers,
             &fips,
             &groups,
+            &lbs,
             &self.config.tag,
         );
         let centrals = central_hosts(&sdn, &nodes);
         let old = sdn.status.sync.clone();
 
-        let outcome = Box::pin(self.write_nb(&want, &centrals, term, index)).await;
+        let mut outcome = Box::pin(self.write_nb(&want, &centrals, term, index)).await;
+        // 새 LB와 새 스위치·라우터가 함께 생겨 미룬 붙이기(계획 67 §7.2)는 곧바로 한 번 더 맞춘다(다시 읽은 uuid로).
+        if let Ok(NbResult::Done(first)) = &outcome
+            && first.deferred
+            && first.error.is_none()
+        {
+            let first = first.clone();
+            outcome = Box::pin(self.write_nb(&want, &centrals, term, index))
+                .await
+                .map(|again| match again {
+                    NbResult::Done(mut d) => {
+                        d.transactions += first.transactions;
+                        d.operations += first.operations;
+                        NbResult::Done(d)
+                    }
+                    fenced => fenced,
+                });
+        }
         let mut sync = old.clone().unwrap_or_default();
         sync.at = now();
         let result = match outcome {
@@ -370,6 +396,7 @@ impl OvnSyncer {
         }
         let plan = nb::plan(want, &have);
         let mut done = Done {
+            deferred: lb::deferred(want, &have),
             token: seen.unwrap_or((0, 0)),
             nb_cfg: have.global.as_ref().map_or(0, |g| g.nb_cfg),
             hv_cfg: have.global.as_ref().map_or(0, |g| g.hv_cfg),
@@ -538,8 +565,10 @@ enum NbResult {
     Done(Done),
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Done {
+    /// 새 LB와 새 스위치·라우터의 붙이기를 다음 차례로 미뤘다(계획 67).
+    deferred: bool,
     /// NB에 있는 토큰(이번에 썼으면 내 것)
     token: (u64, u64),
     nb_cfg: i64,
@@ -641,7 +670,7 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
     }
 }
 
-/// 맞출 일이 생길 때까지 기다린다: Network·Sdn·Router·FloatingIp·SecurityGroup 변경, 논리 포트에 쓰이는 칸이 바뀐 VM 쓰기(지난 차례가
+/// 맞출 일이 생길 때까지 기다린다: Network·Sdn·Router·FloatingIp·SecurityGroup·LoadBalancer 변경, 논리 포트에 쓰이는 칸이 바뀐 VM 쓰기(지난 차례가
 /// 본 것과 견줌 — 리뷰 2 m-2), 라우터 행에 쓰이는 칸이 바뀐 노드 쓰기(계획 66), VM·노드 지우기(SB chassis 청소). 구독이 끊기면 버리고 돌아가 다시 맞추게 한다.
 async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
     let Some(w) = watch else {
@@ -685,7 +714,12 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
             }
             Ok(WatchEvent::Put {
                 kind:
-                    Kind::Network | Kind::Sdn | Kind::Router | Kind::FloatingIp | Kind::SecurityGroup,
+                    Kind::Network
+                    | Kind::Sdn
+                    | Kind::Router
+                    | Kind::FloatingIp
+                    | Kind::SecurityGroup
+                    | Kind::LoadBalancer,
                 ..
             })
             | Ok(WatchEvent::Deleted {
@@ -696,7 +730,8 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
                     | Kind::Node
                     | Kind::Router
                     | Kind::FloatingIp
-                    | Kind::SecurityGroup,
+                    | Kind::SecurityGroup
+                    | Kind::LoadBalancer,
                 ..
             }) => return,
             Ok(WatchEvent::Reset { .. }) | Err(_) => {
@@ -712,6 +747,8 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
 mod acl_tests;
 #[cfg(test)]
 mod routing_tests;
+#[cfg(test)]
+mod services_tests;
 #[cfg(test)]
 mod tests;
 

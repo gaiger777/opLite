@@ -70,6 +70,9 @@ pub struct CheckerConfig {
     /// 이 노드의 TPM·Secure Boot 능력(계획 59). 핫플러그 능력처럼 노드 상태의 값이 다르면 다시 쓴다. None이면 건드리지
     /// 않는다.
     pub firmware_caps: Option<FirmwareCaps>,
+    /// tap에 tc 속도 제한을 걸 수 있는지(계획 67 §8.2). 모든 노드가 `sdn-services`를 알 때만 `NodeStatus.qos`에 쓴다
+    /// (다르면 다시 쓴다). None이면 건드리지 않는다.
+    pub qos: Option<bool>,
     /// 노드 SDN 에이전트가 읽은 상태(계획 65). 없거나 아직 읽지 않았으면 `NodeStatus.sdn`을 건드리지 않는다.
     pub sdn: Option<SdnReport>,
 }
@@ -638,6 +641,11 @@ impl State {
                 }
                 s
             });
+        // 모든 노드가 `sdn-services`를 알 때만 쓴다(계획 67 §13).
+        let qos = self
+            .config
+            .qos
+            .filter(|_| sdn::services_ready(&self.cluster, &self.name));
         let interfaces = self
             .interfaces
             .as_deref()
@@ -681,6 +689,12 @@ impl State {
                     status.topology = Some(t);
                     changed = true;
                 }
+            }
+            if let Some(q) = qos
+                && status.qos != q
+            {
+                status.qos = q;
+                changed = true;
             }
             if let Some(s) = &node_sdn
                 && status.sdn.as_ref() != Some(s)
@@ -1151,6 +1165,7 @@ mod tests {
                     hosts: hosts.iter().map(|h| h.to_string()).collect(),
                     hotplug: None,
                     firmware_caps: None,
+                    qos: None,
                     sdn: None,
                 },
                 self.audit.clone(),
@@ -1525,6 +1540,49 @@ mod tests {
             .unwrap();
         run_once(&mut state).await;
         assert_eq!(s.node().status.sdn, Some(value));
+    }
+
+    /// tc 속도 제한 능력(계획 67 §8.2): 옛 노드(기능 `sdn-services`를 모름)가 있으면 쓰지 않고, 모두 알면 쓴다. 옛 리더가
+    /// 지우면 다시 쓴다.
+    #[tokio::test]
+    async fn the_qos_capability_waits_for_sdn_services() {
+        let s = setup().await;
+        let mut old: opl_types::node::Node = Resource::new(
+            "n2",
+            NodeSpec {
+                sdn: None,
+                host_resources: None,
+                address: "h2:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        old.status.features = vec![HA_CHECKS.into()];
+        s.cluster.create(&old).await.unwrap();
+        let mut state = s.state(&[]);
+        state.config.qos = Some(true);
+        run_once(&mut state).await;
+        assert!(!s.node().status.qos);
+
+        let mut n2 = s.cluster.get_by_name::<NodeSpec>("n2").unwrap().unwrap();
+        n2.status
+            .features
+            .push(opl_types::node::SDN_SERVICES.into());
+        s.cluster
+            .update_status::<NodeSpec>(n2.id, &n2.status)
+            .await
+            .unwrap();
+        run_once(&mut state).await;
+        assert!(s.node().status.qos);
+        bootstrap::update_node_status(&s.cluster, |status| {
+            status.qos = false;
+            true
+        })
+        .await
+        .unwrap();
+        run_once(&mut state).await;
+        assert!(s.node().status.qos);
     }
 
     /// NUMA 토폴로지(계획 64): 옛 노드가 있으면(기능 `numa`를 모름) 읽기만 하고 쓰지 않는다. 모두 알면 쓰고, 같은 값이면

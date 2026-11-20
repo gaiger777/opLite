@@ -160,6 +160,12 @@ pub enum HotplugCall {
         index: usize,
         medium: Option<PathBuf>,
     },
+    /// NIC `index`의 속도 제한(계획 67 — 런타임 tap의 `qos`, SDN·user NIC는 None)
+    SetNicQos {
+        id: Uuid,
+        index: usize,
+        qos: Option<opl_types::qos::NicQos>,
+    },
 }
 
 /// 실행 중인 VM의 핫플러그 상태(켤 때 런타임 스펙에서 정하고 핫플러그 호출이 바꾼다)
@@ -1071,7 +1077,8 @@ impl MockHypervisor {
             | HotplugCall::RemoveDisk { id, .. }
             | HotplugCall::AddNic { id, .. }
             | HotplugCall::RemoveNic { id, .. }
-            | HotplugCall::ChangeMedium { id, .. } => id,
+            | HotplugCall::ChangeMedium { id, .. }
+            | HotplugCall::SetNicQos { id, .. } => id,
         };
         st.hotplug_calls.push(call);
         Self::controllable(st, id)?;
@@ -2440,6 +2447,20 @@ impl Hypervisor for MockHypervisor {
             })?;
         *drive = path;
         Ok(())
+    }
+
+    async fn set_nic_qos(
+        &self,
+        id: Uuid,
+        index: usize,
+        nic: &RuntimeNic,
+    ) -> Result<(), DriverError> {
+        let qos = match &nic.backend {
+            opl_types::runtime::NicBackend::Tap { qos, .. } => *qos,
+            opl_types::runtime::NicBackend::User => None,
+        };
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::SetNicQos { id, index, qos })
     }
 
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {

@@ -23,7 +23,7 @@ use opl_cluster::types::NodeId;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::ovn::{Chassis, ChassisProbe, Db, OvnHost};
 use opl_types::network::tap_name;
-use opl_types::node::{NodeSpec, SDN, SDN_ROUTING};
+use opl_types::node::{NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::Kind;
 use opl_types::sdn::{
     ChassisState, NodeSdn, NodeSdnConfig, PhysnetState, SDN_NAME, SdnCentral, SdnPending, SdnPhase,
@@ -66,6 +66,18 @@ pub fn sdn_ready(cluster: &Cluster, me: &str) -> bool {
 /// 다시 쓰기를 되풀이하지 않게).
 pub fn routing_ready(cluster: &Cluster, me: &str) -> bool {
     match opl_api::cluster::missing_feature(cluster, SDN_ROUTING) {
+        Ok(old) => old.iter().all(|n| n == me),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the node features");
+            false
+        }
+    }
+}
+
+/// 모든 노드가 `sdn-services`를 알 때만 계획 67의 노드 상태 칸(`NodeStatus.qos` 따위)을 쓴다(옛 리더가 모르는 칸을
+/// 지우고 다시 쓰기를 되풀이하지 않게 — 계획 66 `routing_ready`와 같다).
+pub fn services_ready(cluster: &Cluster, me: &str) -> bool {
+    match opl_api::cluster::missing_feature(cluster, SDN_SERVICES) {
         Ok(old) => old.iter().all(|n| n == me),
         Err(e) => {
             tracing::warn!(error = %e, "cannot read the node features");

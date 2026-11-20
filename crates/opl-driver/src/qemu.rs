@@ -2607,6 +2607,32 @@ impl Hypervisor for QemuHypervisor {
         )
     }
 
+    async fn set_nic_qos(
+        &self,
+        id: Uuid,
+        index: usize,
+        nic: &RuntimeNic,
+    ) -> Result<(), DriverError> {
+        self.running_handle(id)?;
+        let Some(tap) = Tap::from_nic(id, nic).filter(|t| t.ovn.is_none()) else {
+            return Ok(());
+        };
+        let prefix = tap_prefix(id);
+        if tap.ifname != opl_types::network::tap_name(id, index) || !tap.ifname.starts_with(&prefix)
+        {
+            return Err(DriverError::InvalidSpec(format!(
+                "tap name {:?} is not NIC {index} of this VM",
+                tap.ifname
+            )));
+        }
+        let Some(net) = &self.config.net else {
+            return Err(DriverError::InvalidSpec(
+                "bridge networks are not supported on this node".into(),
+            ));
+        };
+        net.set_tap_qos(&tap.ifname, tap.qos.as_ref()).await
+    }
+
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {
         let dir = self.paths(id)?.dir;
         if !dir.is_dir() {
@@ -8704,6 +8730,7 @@ time.sleep(60)
                 vlan: None,
                 mtu: None,
                 ovn_port: None,
+                qos: None,
             },
         });
         let err = hv.start(&vm, None).await.unwrap_err();
@@ -8727,6 +8754,7 @@ time.sleep(60)
                 vlan: None,
                 mtu: None,
                 ovn_port: None,
+                qos: None,
             },
         });
         match hv.start(&vm, None).await.unwrap_err() {
@@ -9236,6 +9264,7 @@ time.sleep(60)
                 vlan: None,
                 mtu: Some(1442),
                 ovn_port: Some(opl_types::sdn::port_name(id, mac)),
+                qos: None,
             },
         }
     }
@@ -9341,6 +9370,7 @@ time.sleep(60)
                 vlan: Some(10),
                 mtu: Some(1450),
                 ovn_port: None,
+                qos: None,
             },
         }
     }

@@ -103,6 +103,7 @@ fn spec(bridge: &str) -> VmRuntimeSpec {
                 vlan: Some(20),
                 mtu: None,
                 ovn_port: None,
+                qos: None,
             },
         }],
         guest_agent: false,
@@ -190,6 +191,7 @@ async fn missing_bridge_fails_the_start_without_leftovers() {
             vlan: None,
             mtu: None,
             ovn_port: None,
+            qos: None,
         },
     });
     let err = hv.start(&vm, None).await.unwrap_err();

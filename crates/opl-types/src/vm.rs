@@ -554,6 +554,19 @@ impl VmSpec {
                     .any(|net| net.name == n.network && net.spec.is_sdn())
         })
     }
+
+    /// 속도 제한(`qos.out_mbps`·`in_mbps`)을 건 **단순 네트워크** NIC가 있는지(계획 67 §8.2). 이런 VM은 tap의 tc를 걸 수
+    /// 있는 노드(`NodeStatus.qos`)에서만 돈다. SDN NIC의 QoS는 OVN이 하고, user NIC는 tap이 없어 세지 않는다. 찾지 못한
+    /// 네트워크의 NIC는 단순 NIC로 본다(막는 쪽).
+    pub fn has_simple_qos(&self, networks: &[crate::network::Network]) -> bool {
+        self.nics.iter().any(|n| {
+            n.qos.is_some_and(|q| q.has_rate())
+                && n.network != crate::network::USER_NETWORK
+                && !networks
+                    .iter()
+                    .any(|net| net.name == n.network && net.spec.is_sdn())
+        })
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -1432,6 +1445,34 @@ mod tests {
         // SDN NIC의 그룹은 OVN이 집행한다.
         s.nics[1].network = "tenant".into();
         assert!(!s.has_simple_firewall(&networks));
+    }
+
+    #[test]
+    fn has_simple_qos_only_for_rates_on_simple_tap_nics() {
+        let sdn = crate::resource::Resource::new(
+            "tenant",
+            serde_json::from_value::<crate::network::NetworkSpec>(serde_json::json!({"sdn": {}}))
+                .unwrap(),
+        );
+        let networks = [sdn];
+        let mut s = sample();
+        assert!(!s.has_simple_qos(&networks));
+        // DSCP만은 tc가 할 일이 없다.
+        s.nics[0].qos = Some(crate::qos::NicQos {
+            dscp: Some(46),
+            ..Default::default()
+        });
+        assert!(!s.has_simple_qos(&networks));
+        s.nics[0].qos = Some(crate::qos::NicQos {
+            in_mbps: Some(10),
+            ..Default::default()
+        });
+        assert!(s.has_simple_qos(&networks));
+        // SDN NIC는 OVN이, user NIC는 tap이 없다.
+        for network in ["tenant", "user"] {
+            s.nics[0].network = network.into();
+            assert!(!s.has_simple_qos(&networks), "{network}");
+        }
     }
 
     #[test]

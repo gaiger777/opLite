@@ -39,6 +39,9 @@ pub enum Step {
         index: usize,
         port: u8,
     },
+    /// 그대로 남는 NIC `index`의 QoS(계획 67 §8)를 스펙의 것으로 맞춘다. 장치 변경이 아니다(QEMU는 그대로) — 단순 NIC는
+    /// tap의 tc를 바꾸고, SDN NIC는 OVN `QoS` 행(리더 OvnSync)이 하므로 기록만 고친다.
+    SetNicQos(usize),
 }
 
 /// 스펙에 맞추는 계획: 바로 할 단계와 다음 재시작 때 적용할 변경
@@ -266,6 +269,17 @@ pub fn plan(
             .filter(|(_, (want, now))| want.iso != now.iso)
             .map(|(index, _)| Step::ChangeMedium { index }),
     );
+    // 그대로 남는 NIC의 QoS(떼거나 다시 붙이는 NIC는 붙일 때 새 QoS로 켠다)
+    steps.extend(
+        spec.nics
+            .iter()
+            .zip(&hw.nics)
+            .enumerate()
+            .filter(|(i, (want, now))| {
+                same_nic(want, now) && want.qos != now.qos && !nics.removed.contains(i)
+            })
+            .map(|(i, _)| Step::SetNicQos(i)),
+    );
 
     if disks.is_empty() && nics.is_empty() {
         return Ok(Plan { steps, pending });
@@ -477,7 +491,7 @@ pub fn qemu_devices(spec: &VmSpec, hw: Option<&RunningHardware>) -> Vec<String> 
     ids
 }
 
-/// 스펙의 하드웨어가 바뀌었는지(CPU·메모리·상한·펌웨어·머신·디스크·보안 그룹을 뺀 NIC·CD-ROM 드라이브와 매체·
+/// 스펙의 하드웨어가 바뀌었는지(CPU·메모리·상한·펌웨어·머신·디스크·보안 그룹을 뺀 NIC(QoS 포함 — 계획 67)·CD-ROM 드라이브와 매체·
 /// cloud-init·TPM·Secure Boot·게스트 에이전트 채널·vNUMA·hugepages). 실행 중이면 핫플러그 Task를 만든다. 에이전트의 `freeze_fs`·
 /// `shutdown`은 장치가 아니라서 견주지 않는다.
 pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
@@ -488,7 +502,11 @@ pub fn hardware_changed(old: &VmSpec, new: &VmSpec) -> bool {
         || old.machine != new.machine
         || old.disks != new.disks
         || old.nics.len() != new.nics.len()
-        || old.nics.iter().zip(&new.nics).any(|(a, b)| !same_nic(a, b))
+        || old
+            .nics
+            .iter()
+            .zip(&new.nics)
+            .any(|(a, b)| !same_nic(a, b) || a.qos != b.qos)
         || old.cdroms != new.cdroms
         || old.cloud_init != new.cloud_init
         || old.tpm != new.tpm
@@ -1377,6 +1395,55 @@ mod tests {
             plan(VM, "web", &swap, &hw, ALL).unwrap().steps,
             [Step::RemoveNic(4), Step::AddNic { index: 4, port: 7 }]
         );
+    }
+
+    /// 계획 67 §8.2: 그대로 남는 NIC의 QoS 바꾸기는 장치 변경이 아니라 바로 할 단계 `SetNicQos`다(그 NIC만). 떼고 다시
+    /// 붙이는 NIC는 붙일 때 새 QoS로 켜므로 따로 단계가 없다. 핫플러그 배치 없이 켠 VM도 된다.
+    #[test]
+    fn nic_qos_changes_are_a_step_not_a_device_change() {
+        let mut s = spec();
+        s.nics.push(nic(2));
+        let hw = started(&s, ALL);
+        let qos = crate::qos::NicQos {
+            out_mbps: Some(100),
+            ..Default::default()
+        };
+        let mut next = s.clone();
+        next.nics[1].qos = Some(qos);
+        assert!(hardware_changed(&s, &next));
+        assert_eq!(
+            plan(VM, "web", &next, &hw, ALL).unwrap(),
+            Plan {
+                steps: vec![Step::SetNicQos(1)],
+                pending: Vec::new(),
+            }
+        );
+        let mut legacy = hw.clone();
+        legacy.layout = None;
+        assert_eq!(
+            plan(VM, "web", &next, &legacy, ALL).unwrap().steps,
+            [Step::SetNicQos(1)]
+        );
+        // 실행 중 붙인 NIC를 바꾸면(떼고 붙임) 붙일 때의 QoS다.
+        let mut hot = s.clone();
+        hot.nics.push(nic(3));
+        let mut hw = started(&s, ALL);
+        hw.nics = hot.nics.clone();
+        layout(&mut hw).nic_ports = vec![0];
+        let mut swap = hot.clone();
+        swap.nics[2] = nic(4);
+        swap.nics[2].qos = Some(qos);
+        swap.nics[0].qos = Some(qos);
+        assert_eq!(
+            plan(VM, "web", &swap, &hw, ALL).unwrap().steps,
+            [
+                Step::RemoveNic(2),
+                Step::SetNicQos(0),
+                Step::AddNic { index: 2, port: 0 }
+            ]
+        );
+        // 같으면 할 일이 없다.
+        assert!(!hardware_changed(&next, &next.clone()));
     }
 
     #[test]
