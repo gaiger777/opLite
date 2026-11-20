@@ -99,7 +99,7 @@ fn given_addresses_are_checked() {
     for bad in ["10.0.0.1", "10.0.0.7", "10.0.1.5"] {
         assert_eq!(try_ip(bad).unwrap_err().code, "invalid_request", "{bad}");
     }
-    // 단순 네트워크의 주소, SDN NIC의 보안 그룹·cloud-init 주소는 400이다.
+    // 단순 네트워크의 주소, SDN NIC의 cloud-init 주소는 400이다.
     let mut s = spec(vec![nic("lan", 2, &["10.0.0.5"])]);
     assert_eq!(
         assign(&mut s, None, &[], &nets, &|_| true)
@@ -107,14 +107,10 @@ fn given_addresses_are_checked() {
             .code,
         "ips_without_sdn"
     );
+    // SDN NIC의 보안 그룹은 계획 66부터 받는다(OVN ACL — 기능 검사는 check_security_groups).
     let mut s = spec(vec![nic("tenant", 2, &[])]);
     s.nics[0].security_groups = vec!["web".into()];
-    assert_eq!(
-        assign(&mut s, None, &[], &nets, &|_| true)
-            .unwrap_err()
-            .code,
-        "sdn_security_groups"
-    );
+    assign(&mut s, None, &[], &nets, &|_| true).unwrap();
     let mut s = spec(vec![nic("tenant", 2, &[]), nic("lan", 3, &[])]);
     let static_net = CloudInitNet {
         ipv4: Some(IpConfig::Static {
@@ -279,7 +275,17 @@ fn sdn_nics_of_new_vms_lose_groups_and_static_cloud_init() {
         networks: vec![static_net.clone(), static_net.clone()],
         ..CloudInit::default()
     });
-    let warnings = strip_sdn_nic_config(&mut s, &nets);
+    // 모든 노드가 sdn-routing을 알면 그룹은 그대로 두고 cloud-init 주소만 뺀다.
+    let mut kept = s.clone();
+    let warnings = strip_sdn_nic_config(&mut kept, &nets, true);
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(kept.nics[0].security_groups, ["ssh"]);
+    assert_eq!(
+        kept.cloud_init.as_ref().unwrap().networks[0],
+        CloudInitNet::default()
+    );
+    // 섞인 클러스터는 계획 65 그대로 그룹도 뺀다.
+    let warnings = strip_sdn_nic_config(&mut s, &nets, false);
     assert_eq!(warnings.len(), 2, "{warnings:?}");
     assert!(warnings[0].contains("ssh"), "{warnings:?}");
     assert!(s.nics[0].security_groups.is_empty());
@@ -289,7 +295,7 @@ fn sdn_nics_of_new_vms_lose_groups_and_static_cloud_init() {
     assert_eq!(ci.networks[1], static_net);
     // 이제 API 검사를 지난다.
     assign(&mut s, None, &[], &nets, &|_| true).unwrap();
-    assert!(strip_sdn_nic_config(&mut s, &nets).is_empty());
+    assert!(strip_sdn_nic_config(&mut s, &nets, false).is_empty());
 }
 
 /// 리뷰 2 N-4: 서브넷을 더하면 주소가 하나도 없는 NIC만 새 서브넷의 주소를 받고(템플릿 빼고), 모두 줄 수 없으면 모자란

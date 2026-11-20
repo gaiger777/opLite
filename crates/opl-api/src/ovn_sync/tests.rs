@@ -56,6 +56,7 @@ fn port(name: &str, ip: &str, dhcp: Option<&str>) -> PortRow {
         tag: None,
         options: BTreeMap::new(),
         external_ids: ids(&[(CLUSTER_KEY, TAG)]),
+        port_group: None,
     }
 }
 
@@ -402,6 +403,7 @@ async fn creates_updates_and_removes_switches_ports_and_dhcp() {
     let nb = Nb::new().await;
     let (n1, n2) = (Uuid::now_v7(), Uuid::now_v7());
     let mut want = NbState {
+        port_groups: Vec::new(),
         routers: Vec::new(),
         switches: vec![
             switch(
@@ -525,6 +527,7 @@ async fn duplicate_switches_of_ours_are_collapsed() {
     let nb = Nb::new().await;
     let n = Uuid::now_v7();
     let want = NbState {
+        port_groups: Vec::new(),
         routers: Vec::new(),
         switches: vec![switch(n, vec![], vec![])],
     };
@@ -546,6 +549,7 @@ async fn fencing_refuses_a_writer_that_read_an_older_token() {
     let nb = Nb::new().await;
     let n = Uuid::now_v7();
     let want = NbState {
+        port_groups: Vec::new(),
         routers: Vec::new(),
         switches: vec![switch(n, vec![], vec![])],
     };
@@ -590,6 +594,7 @@ async fn one_failing_network_does_not_block_the_others() {
     let nb = Nb::new().await;
     let (n1, n2) = (Uuid::now_v7(), Uuid::now_v7());
     let want = NbState {
+        port_groups: Vec::new(),
         routers: Vec::new(),
         switches: vec![
             switch(n1, vec![port("opl-taken", "10.0.0.5", None)], vec![]),
@@ -669,6 +674,7 @@ async fn five_thousand_ports_resync_quickly() {
     let nb = Nb::new().await;
     let networks: Vec<Uuid> = (0..50).map(|_| Uuid::now_v7()).collect();
     let want = NbState {
+        port_groups: Vec::new(),
         routers: Vec::new(),
         switches: networks
             .iter()

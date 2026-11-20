@@ -550,9 +550,14 @@ impl MigrationReceiver for IncomingMigrations {
             tracing::info!(vm = %req.vm, task = %req.task, "stopping the receiving QEMU of an earlier migration");
             self.hv.stop(req.vm, StopMode::Force).await.map_err(fail)?;
         }
-        // 보안 그룹을 건 NIC가 있으면 받는 QEMU(tap)를 띄우기 전에 방화벽 규칙을 넣는다. 넣지 못하면
-        // 받지 않는다.
-        if vm.spec.has_firewall() {
+        // 보안 그룹을 건 단순 네트워크 NIC가 있으면 받는 QEMU(tap)를 띄우기 전에 방화벽 규칙을 넣는다. 넣지 못하면
+        // 받지 않는다. 네트워크를 읽지 못하면 모든 NIC를 단순 NIC로 본다(넣는 쪽). SDN NIC의 그룹은 OVN ACL이다(계획 66 §11.4).
+        let networks = self
+            .cluster
+            .list::<opl_types::network::NetworkSpec>()
+            .map(|(_, n)| n)
+            .unwrap_or_default();
+        if vm.spec.has_simple_firewall(&networks) {
             let Some(gate) = &self.firewall else {
                 return Err(IncomingError::Failed(
                     "firewall: this node has no firewall (nftables)".into(),

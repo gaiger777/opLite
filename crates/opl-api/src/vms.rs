@@ -12,7 +12,7 @@ use opl_types::authz_eval::AuthzTarget;
 use opl_types::cloud_init::{PASSWORD_MASK, is_crypt_hash};
 use opl_types::crypt::{CRYPT_SALT_CHARS, sha512_crypt};
 use opl_types::hotplug;
-use opl_types::network::USER_NETWORK;
+use opl_types::network::{Network, NetworkSpec, USER_NETWORK};
 use opl_types::node::{
     FAST_HA, FOLDERS, GUEST_AGENT, HA_PLACEMENT, HOTPLUG, INSTALL_MEDIA, NODE_REPLICATION, Node,
     NodeSpec, PLACEMENT, TEMPLATES, VTPM, ha_capable,
@@ -376,7 +376,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
             )));
         }
     }
-    // SDN NIC 주소(계획 65 §9): 검사하고 새 NIC에 채운다. 보안 그룹 검사보다 먼저(SDN NIC의 그룹은 400).
+    // SDN NIC 주소(계획 65 §9): 검사하고 새 NIC에 채운다.
     let others_list: Vec<&Vm> = others.clone().collect();
     let principal = crate::audit::principal();
     crate::ipam::assign(
@@ -460,7 +460,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         }
         check_ha_capable(node, &vm.spec)?;
         check_node_arch(node, &vm.spec)?;
-        check_firewall(node, &vm.spec)?;
+        check_firewall(node, &vm.spec, &inv.networks)?;
         check_cdrom_node(&inv, node, &vm.spec, current)?;
         // 켜진 채 노드를 준 요청은 hard 배치 규칙도 지켜야 한다. 이미 그 노드에 자리 잡은 VM(실행 중 고치기)은
         // 새 규칙을 어겨도 옮기거나 막지 않는다(위반으로 보인다).
@@ -882,15 +882,24 @@ pub(crate) fn local_cdrom(vm: &Vm, inv: &Inventory) -> Option<String> {
     })
 }
 
-/// NIC의 보안 그룹이 모두 있고, 그룹을 건 NIC가 `user` 네트워크가 아닌지. 아니면 400.
+/// NIC의 보안 그룹이 모두 있고, 그룹을 건 NIC가 `user` 네트워크가 아닌지(아니면 400). SDN NIC에 그룹을 걸면 모든 노드가
+/// `sdn-routing`을 알아야 한다(아니면 409 `cluster_upgrading`).
 pub(crate) fn check_security_groups(state: &AppState, spec: &VmSpec) -> Result<(), ApiError> {
     if spec.nics.iter().all(|n| n.security_groups.is_empty()) {
         return Ok(());
     }
     let (_, groups) = state.cluster.list::<SecurityGroupSpec>()?;
+    let (_, networks) = state.cluster.list::<NetworkSpec>()?;
     for (i, nic) in spec.nics.iter().enumerate() {
         if nic.security_groups.is_empty() {
             continue;
+        }
+        // SDN NIC의 그룹은 OVN ACL(계획 66 §11)이다. 옛 노드는 그 뜻을 모르므로(계획 65는 400) 모두 알 때만 받는다.
+        if networks
+            .iter()
+            .any(|n| n.name == nic.network && n.spec.is_sdn())
+        {
+            require_feature(&state.cluster, opl_types::node::SDN_ROUTING)?;
         }
         // user 네트워크는 QEMU 안의 NAT라 노드의 방화벽 규칙이 닿지 않는다.
         if nic.network == USER_NETWORK {
@@ -948,9 +957,10 @@ fn check_ha_capable(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// 보안 그룹을 건 NIC가 있는데 노드에 방화벽(nftables)이 없으면 409 `firewall_unsupported`.
-fn check_firewall(node: &Node, spec: &VmSpec) -> Result<(), ApiError> {
-    if spec.has_firewall() && !node.status.firewall {
+/// 보안 그룹을 건 단순 네트워크 NIC가 있는데 노드에 방화벽(nftables)이 없으면 409 `firewall_unsupported`. SDN NIC의
+/// 그룹은 OVN ACL이라 노드 방화벽이 필요 없다(계획 66 §11.4).
+fn check_firewall(node: &Node, spec: &VmSpec, networks: &[Network]) -> Result<(), ApiError> {
+    if spec.has_simple_firewall(networks) && !node.status.firewall {
         return Err(ApiError::conflict(
             "firewall_unsupported",
             format!(

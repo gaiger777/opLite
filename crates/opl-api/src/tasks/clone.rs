@@ -546,12 +546,20 @@ pub(super) async fn create_vm(
     {
         crate::backup_receive::drop_templates(&mut new.spec);
     }
-    // SDN NIC는 보안 그룹·cloud-init 주소 항목을 갖지 않는다(배포가 NIC를 SDN으로 옮겼을 때 — 리뷰 1 웹 #2).
+    // SDN NIC는 cloud-init 주소 항목을 갖지 않는다(배포가 NIC를 SDN으로 옮겼을 때 — 리뷰 1 웹 #2). 보안 그룹은 섞인
+    // 클러스터(`sdn-routing`을 모르는 노드가 있음)에서만 뺀다 — 계획 66부터 OVN ACL로 그대로 집행한다.
     let (_, networks) = ctx
         .cluster
         .list::<NetworkSpec>()
         .map_err(|e| e.to_string())?;
-    warnings.extend(crate::ipam::strip_sdn_nic_config(&mut new.spec, &networks));
+    let keep_groups = crate::cluster::missing_feature(&ctx.cluster, opl_types::node::SDN_ROUTING)
+        .map_err(|e| e.to_string())?
+        .is_empty();
+    warnings.extend(crate::ipam::strip_sdn_nic_config(
+        &mut new.spec,
+        &networks,
+        keep_groups,
+    ));
     // SDN 주소(계획 65): 다른 노드가 그새 같은 주소를 잡았으면 저장소가 거부하고 다시 고른다.
     let wanted = new.spec.nics.clone();
     let mut retries = 0;

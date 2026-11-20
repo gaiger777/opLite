@@ -245,6 +245,17 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
+    /// 보안 그룹을 건 단순 네트워크 NIC가 있는지(노드 방화벽이 걸러야 하는 VM). 네트워크를 읽지 못하면 모든 NIC를 단순
+    /// NIC로 본다(규칙을 넣는 쪽).
+    fn simple_firewall(&self, vm: &Vm) -> bool {
+        let networks = self
+            .cluster
+            .list::<opl_types::network::NetworkSpec>()
+            .map(|(_, n)| n)
+            .unwrap_or_default();
+        vm.spec.has_simple_firewall(&networks)
+    }
+
     pub(crate) fn new(
         id: Uuid,
         cluster: Arc<Cluster>,
@@ -1248,9 +1259,9 @@ impl Worker {
                 return Ok(Start::Changed(current));
             }
         }
-        // 보안 그룹을 건 NIC가 있으면 켜기 직전에 지금 클러스터 상태로 이 노드의 방화벽 규칙을 넣는다.
-        // 넣지 못하면 켜지 않는다(방화벽 없이 도는 순간이 없게).
-        if vm.spec.has_firewall() {
+        // 보안 그룹을 건 단순 네트워크 NIC가 있으면 켜기 직전에 지금 클러스터 상태로 이 노드의 방화벽 규칙을 넣는다.
+        // 넣지 못하면 켜지 않는다(방화벽 없이 도는 순간이 없게). SDN NIC의 그룹은 OVN ACL이다(계획 66 §11.4).
+        if self.simple_firewall(vm) {
             let Some(gate) = &self.config.firewall else {
                 self.deactivate_disks(vm).await;
                 self.restores.lock().unwrap().remove(&self.id);
@@ -2101,7 +2112,7 @@ impl Worker {
     /// 보안 그룹을 건 NIC가 있으면 멈춘 채 남은 VM을 이어서 실행하거나 다시 붙기 전에 방화벽 규칙을
     /// 넣는다. 넣지 못하면 이어서 실행하지 않고 다음 차례에 다시 본다.
     async fn sync_firewall(&self, vm: &Vm) -> Result<(), ContinueError> {
-        if !vm.spec.has_firewall() {
+        if !self.simple_firewall(vm) {
             return Ok(());
         }
         let unresponsive = |e: &dyn std::fmt::Display| ContinueError::Unresponsive(e.to_string());

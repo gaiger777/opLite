@@ -664,10 +664,10 @@ async fn mapped_ipv6_addresses_count_as_ipv4() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
-/// 리뷰 1 웹 #2: 복제가 NIC를 SDN 네트워크로 옮기면 그 NIC의 보안 그룹과 cloud-init 고정 주소가 빠진다(경고). 새 VM은
-/// 그대로 다시 저장할 수 있다.
+/// 리뷰 1 웹 #2: 복제가 NIC를 SDN 네트워크로 옮기면 그 NIC의 cloud-init 고정 주소가 빠진다(경고). 보안 그룹은 계획 66부터
+/// SDN NIC에서도 OVN ACL이라 그대로 따라간다(모든 노드가 `sdn-routing`을 알 때). 새 VM은 그대로 다시 저장할 수 있다.
 #[tokio::test]
-async fn clones_onto_sdn_drop_groups_and_static_cloud_init() {
+async fn clones_onto_sdn_keep_groups_and_drop_static_cloud_init() {
     let env = Env::start().await;
     let admin = env.admin().await;
     ready_sdn(&env, &[env.node]).await;
@@ -700,12 +700,12 @@ async fn clones_onto_sdn_drop_groups_and_static_cloud_init() {
     let done = admin.wait_task(&task).await;
     assert_eq!(done["status"]["state"], "succeeded", "{done}");
     let warning = done["status"]["error"].as_str().unwrap_or_default();
-    assert!(warning.contains("dropped security groups ssh"), "{done}");
+    assert!(!warning.contains("security groups"), "{done}");
     assert!(warning.contains("cloud-init"), "{done}");
     let (_, copy) = admin.get("/vms/copy").await;
     let nic = &copy["spec"]["nics"][0];
     assert_eq!(nic["network"], "tenant", "{copy}");
-    assert!(nic.get("security_groups").is_none(), "{copy}");
+    assert_eq!(nic["security_groups"], json!(["ssh"]), "{copy}");
     assert_eq!(nic["ips"], json!(["10.10.0.9"]), "{copy}");
     assert_eq!(
         copy["spec"]["cloud_init"]["networks"],

@@ -539,9 +539,16 @@ impl VmSpec {
         self.placement.is_some_and(|p| p.pinned)
     }
 
-    /// 보안 그룹을 건(방화벽이 켜진) NIC가 있는지. 이런 VM은 방화벽이 있는 노드에서만 돈다.
-    pub fn has_firewall(&self) -> bool {
-        self.nics.iter().any(|n| !n.security_groups.is_empty())
+    /// 보안 그룹을 건 **단순 네트워크** NIC가 있는지(`networks`는 클러스터의 네트워크). 이런 VM은 노드의 방화벽
+    /// (nftables)이 있는 노드에서만 돌고 켜기 직전에 그 규칙을 넣는다. SDN(OVN) 네트워크 NIC의 그룹은 OVN ACL이 집행하므로
+    /// 세지 않는다(계획 66 §11.4). 찾지 못한 네트워크의 NIC는 단순 NIC로 본다(막는 쪽).
+    pub fn has_simple_firewall(&self, networks: &[crate::network::Network]) -> bool {
+        self.nics.iter().any(|n| {
+            !n.security_groups.is_empty()
+                && !networks
+                    .iter()
+                    .any(|net| net.name == n.network && net.spec.is_sdn())
+        })
     }
 }
 
@@ -1397,13 +1404,23 @@ mod tests {
     }
 
     #[test]
-    fn has_firewall_when_any_nic_has_groups() {
+    fn has_simple_firewall_when_a_simple_nic_has_groups() {
+        let sdn = crate::resource::Resource::new(
+            "tenant",
+            serde_json::from_value::<crate::network::NetworkSpec>(serde_json::json!({"sdn": {}}))
+                .unwrap(),
+        );
+        let networks = [sdn];
         let mut s = sample();
-        assert!(!s.has_firewall());
+        assert!(!s.has_simple_firewall(&networks));
         let mut second = s.nics[0].clone();
         second.security_groups = vec!["web".into()];
-        s.nics.push(second);
-        assert!(s.has_firewall());
+        s.nics.push(second.clone());
+        // 모르는 네트워크(여기서는 sample의 네트워크)는 단순 NIC다.
+        assert!(s.has_simple_firewall(&networks));
+        // SDN NIC의 그룹은 OVN이 집행한다.
+        s.nics[1].network = "tenant".into();
+        assert!(!s.has_simple_firewall(&networks));
     }
 
     #[test]

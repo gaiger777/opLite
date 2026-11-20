@@ -101,15 +101,8 @@ async fn sdn_nics_get_addresses_from_the_subnets() {
         json!(["10.10.0.6", "2001:db8::4"])
     );
 
-    // SDN NIC의 보안 그룹·cloud-init 주소는 400이다.
-    let mut req = vm_on(
-        "d",
-        json!([{ "network": "tenant", "model": "virtio", "security_groups": ["web"] }]),
-    );
-    let (status, body) = admin.post("/vms", req.clone()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["code"], "sdn_security_groups");
-    req["spec"]["nics"][0]["security_groups"] = json!([]);
+    // SDN NIC의 cloud-init 주소는 400이다(보안 그룹은 계획 66부터 받는다 — sdn_routing.rs).
+    let mut req = vm_on("d", json!([{ "network": "tenant", "model": "virtio" }]));
     req["spec"]["cloud_init"] = json!({ "networks": [{ "ipv4": { "mode": "dhcp" } }] });
     let (status, body) = admin.post("/vms", req).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");

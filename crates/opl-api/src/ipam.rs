@@ -77,8 +77,9 @@ fn exhausted(network: &str, e: IpamError) -> ApiError {
 /// API의 VM 스펙 `spec`(지금 저장된 스펙 `current`, 다른 VM들 `others`)의 SDN NIC 주소를 검사하고 채운다.
 ///
 /// - 템플릿은 주소를 갖지 않는다(지운다).
-/// - SDN이 아닌 네트워크의 NIC에 주소가 있으면 400 `ips_without_sdn`. SDN NIC에는 보안 그룹(400
-///   `sdn_security_groups` — 계획 66)과 cloud-init 주소 항목(400 `cloud_init_sdn_nic` — 빈 `{}`만 받는다)을 받지 않는다.
+/// - SDN이 아닌 네트워크의 NIC에 주소가 있으면 400 `ips_without_sdn`. SDN NIC에는 cloud-init 주소 항목(400
+///   `cloud_init_sdn_nic` — 빈 `{}`만 받는다)을 받지 않는다. SDN NIC의 보안 그룹은 계획 66부터 OVN ACL이다(기능 검사는
+///   [`crate::vms::check_security_groups`]).
 /// - 이미 있던 NIC(같은 MAC·같은 네트워크, 템플릿이 아니던 스펙)가 주소 없이 오면 지금 주소를 그대로 둔다(주소를 모르는
 ///   클라이언트의 PUT이 주소를 지우지 않게). 그 주소는 다시 보지 않는다(풀을 줄여도 남는다).
 /// - 새로 준 주소는 그 네트워크의 서브넷 안(400)이고 예약이 아니며(400) 다른 NIC가 쓰지 않아야 한다(409 `ip_in_use`).
@@ -105,12 +106,6 @@ pub(crate) fn assign(
             }
             continue;
         };
-        if !nic.security_groups.is_empty() {
-            return Err(ApiError::bad_request(format!(
-                "NIC {i}: security groups on SDN networks come with plan 66; this NIC is protected by port security only"
-            ))
-            .with_code("sdn_security_groups"));
-        }
         if spec
             .cloud_init
             .as_ref()
@@ -199,6 +194,11 @@ pub(crate) fn assign(
     Ok(())
 }
 
+/// SDN NIC에 보안 그룹을 걸 수 있는지(모든 노드가 `sdn-routing`을 앎 — 계획 66 §11.4)
+pub(crate) fn sdn_groups_allowed(cluster: &Cluster) -> Result<bool, ApiError> {
+    Ok(crate::cluster::missing_feature(cluster, opl_types::node::SDN_ROUTING)?.is_empty())
+}
+
 /// 복제·배포·가져오기 요청이 NIC 순번별로 준 주소 `requested`(새 VM의 스펙 `spec`)를 미리 본다(설계 §12). 옛 노드가
 /// 있으면 409 `cluster_upgrading`, NIC보다 많으면·SDN이 아닌 네트워크·서브넷 밖·예약 주소는 400, 다른 NIC가 쓰면 409
 /// `ip_in_use`, 서브넷이 다 쓰였으면 409 `ip_exhausted`. 새 VM의 다른 NIC는 Task가 새로 받으므로 주소 없이 본다.
@@ -242,23 +242,30 @@ pub(crate) fn check_requested(
     }
     let (_, vms) = cluster.list::<VmSpec>()?;
     let (_, networks) = cluster.list::<NetworkSpec>()?;
-    // Task가 SDN NIC의 보안 그룹·cloud-init 주소 항목을 뺀다(아래 [`strip_sdn_nic_config`]) — 미리 보기도 같게.
-    strip_sdn_nic_config(&mut new, &networks);
+    // Task가 SDN NIC의 cloud-init 주소 항목(섞인 클러스터면 보안 그룹도)을 뺀다(아래 [`strip_sdn_nic_config`]) — 미리
+    // 보기도 같게.
+    let groups = sdn_groups_allowed(cluster)?;
+    strip_sdn_nic_config(&mut new, &networks, groups);
     let others: Vec<&Vm> = vms.iter().collect();
     assign(&mut new, None, &others, &networks, sees)
 }
 
-/// 복제·배포·가져오기·복원이 만드는 새 VM `spec`에서 SDN 네트워크 NIC의 보안 그룹과 cloud-init 주소 항목을 뺀다(리뷰 1
-/// 웹 #2 — 배포의 네트워크 바꾸기가 그룹이나 고정 주소를 가진 템플릿 NIC를 SDN으로 옮기면 그 VM은 저장할 수 없는 스펙이
-/// 된다: API는 SDN NIC의 둘을 400으로 받지 않는다). 뺀 것마다 경고 한 줄을 돌려준다.
-pub(crate) fn strip_sdn_nic_config(spec: &mut VmSpec, networks: &[Network]) -> Vec<String> {
+/// 복제·배포·가져오기·복원이 만드는 새 VM `spec`에서 SDN 네트워크 NIC의 cloud-init 주소 항목을 뺀다(리뷰 1 웹 #2 —
+/// 배포의 네트워크 바꾸기가 고정 주소를 가진 템플릿 NIC를 SDN으로 옮기면 그 VM은 저장할 수 없는 스펙이 된다). 보안 그룹은
+/// `keep_groups`(모든 노드가 `sdn-routing`을 앎 — 계획 66 §11.4, OVN ACL로 그대로 집행)가 거짓일 때만 뺀다(섞인
+/// 클러스터는 계획 65 동작). 뺀 것마다 경고 한 줄을 돌려준다.
+pub(crate) fn strip_sdn_nic_config(
+    spec: &mut VmSpec,
+    networks: &[Network],
+    keep_groups: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     for i in 0..spec.nics.len() {
         let Some(net) = sdn_network(networks, &spec.nics[i].network) else {
             continue;
         };
         let nic = &mut spec.nics[i];
-        if !nic.security_groups.is_empty() {
+        if !keep_groups && !nic.security_groups.is_empty() {
             warnings.push(format!(
                 "NIC {i}: dropped security groups {} — SDN network {:?} protects NICs with port security only",
                 nic.security_groups.join(", "),

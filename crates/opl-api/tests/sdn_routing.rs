@@ -158,3 +158,58 @@ async fn routing_fields_are_gated_until_the_api_stage() {
     let (status, body) = admin.put(&node, json!({ "spec": with_sdn }), None).await;
     upgrading(status, &body);
 }
+
+/// 계획 66 스테이지 4: SDN NIC에 보안 그룹을 건다(OVN ACL). 옛 노드가 남았으면 409 `cluster_upgrading`(계획 65는 400
+/// `sdn_security_groups`), 노드 방화벽(nftables)은 단순 NIC만 본다(`firewall_unsupported`가 SDN NIC에는 없다).
+#[tokio::test]
+async fn sdn_nics_take_security_groups() {
+    use opl_types::network::Network;
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let net: Network = Resource::new(
+        "tenant",
+        serde_json::from_value(json!({ "sdn": {}, "subnets": [{ "cidr": "10.10.0.0/24" }] }))
+            .unwrap(),
+    );
+    env.cluster.create(&net).await.unwrap();
+    let rule = json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" });
+    let (status, body) = admin
+        .post(
+            "/security-groups",
+            json!({ "name": "ssh", "spec": { "rules": [rule] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 노드에 방화벽이 없어도 SDN NIC의 그룹은 된다.
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.firewall = false;
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let vm = |name: &str, groups: Value| {
+        let mut req = common::vm_request(name);
+        req["spec"]["nics"] =
+            json!([{ "network": "tenant", "model": "virtio", "security_groups": groups }]);
+        req["spec"]["node"] = json!(env.node);
+        req
+    };
+    let (status, body) = admin.post("/vms", vm("a", json!(["ssh"]))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["spec"]["nics"][0]["security_groups"], json!(["ssh"]));
+    // 없는 그룹은 단순 NIC처럼 400이다.
+    let (status, body) = admin.post("/vms", vm("b", json!(["nope"]))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    drop_routing(&env).await;
+    let (status, body) = admin.post("/vms", vm("c", json!(["ssh"]))).await;
+    upgrading(status, &body);
+    // 그룹이 없는 SDN NIC는 그대로 된다.
+    let (status, body) = admin.post("/vms", vm("c", json!([]))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}

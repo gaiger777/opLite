@@ -861,6 +861,11 @@ async fn orbivisord_sets_up_ovn() {
     // localnet 포트)로 이름공간 "VM"이 물리 망 이름공간 `ext`에 ping한다. veth가 사라지면(재부팅) 다시 만든다. 라우터·SNAT·
     // 유동 IP·IPv6(스테이지 3)를 본 뒤, 빼면 내 것만 다 치운다.
     Box::pin(physnet_section(&d, &tag, &node)).await;
+
+    // 11. SDN NIC의 보안 그룹(계획 66 스테이지 4): 그룹 목록 Port_Group·ACL로 허용·막기, 처음 맞는 규칙(그룹 순서),
+    // 그룹을 바꾸는 동안 열린 순간이 없음, 허용을 빼면 맺은 연결이 끊김 — 같은 그룹을 단순 브리지의 nftables(방화벽 에이전트의
+    // `ruleset`)에도 걸어 같은 탐침 표가 같은지 본다(다른 것은 맺은 연결뿐 — 설계 §11.4).
+    Box::pin(security_section(&d, &tag)).await;
 }
 
 /// 제어 소켓의 시험 고리(`POST /v1/test/…`)
@@ -2093,5 +2098,438 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
     }
     for name in ["rt-t1", "rt-t2"] {
         d.ctl(&["network", "delete", name]).await.unwrap();
+    }
+}
+
+/// 이름공간의 파이썬 메아리 서버(tcp 22·8080, 받은 바이트를 돌려줌)
+const ECHO_SERVER: &str = r#"
+import socket, threading
+def serve(port):
+    s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", port)); s.listen(64)
+    while True:
+        c, _ = s.accept()
+        def h(c):
+            try:
+                while True:
+                    d = c.recv(64)
+                    if not d: break
+                    c.sendall(d)
+            except OSError: pass
+        threading.Thread(target=h, args=(c,), daemon=True).start()
+for p in (22, 8080): threading.Thread(target=serve, args=(p,), daemon=True).start()
+threading.Event().wait()
+"#;
+
+/// TCP로 붙어 한 바이트가 돌아오는지(2초)
+const TCP_PROBE: &str = r#"
+import socket, sys
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+    s.sendall(b"x"); sys.exit(0 if s.recv(1) == b"x" else 1)
+except OSError: sys.exit(1)
+"#;
+
+/// 맺은 연결 하나로 0.2초마다 메아리를 받는다. 1초 안에 돌아오지 않으면 3으로 끝난다.
+const HELD_CONNECTION: &str = r#"
+import socket, sys, time
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+s.settimeout(1)
+while True:
+    s.sendall(b"x")
+    try:
+        if s.recv(1) != b"x": sys.exit(2)
+    except OSError: sys.exit(3)
+    print("ok", flush=True); time.sleep(0.2)
+"#;
+
+/// `seconds` 동안 20ms마다 tcp 22·8080에 붙어 본다. 붙은 수를 찍는다.
+const CONTINUOUS_PROBE: &str = r#"
+import socket, sys, time
+end = time.time() + float(sys.argv[2]); hits = 0; tries = 0
+while time.time() < end:
+    for port in (22, 8080):
+        tries += 1
+        try:
+            s = socket.create_connection((sys.argv[1], port), timeout=0.05); s.close(); hits += 1
+        except OSError: pass
+    time.sleep(0.02)
+print(hits, tries)
+"#;
+
+fn py_in(ns: &str, script: &str, args: &[&str]) -> Command {
+    let mut cmd = Command::new("ip");
+    cmd.args(["netns", "exec", ns, "python3", "-c", script]);
+    cmd.args(args);
+    cmd
+}
+
+fn tcp_from(ns: &str, to: &str, port: u16) -> bool {
+    py_in(ns, TCP_PROBE, &[to, &port.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// 보안 그룹 탐침 표의 "세계" 하나: 지키는 VM 이름공간과 손님 둘(c1 = 허용된 원격, c2 = 다른 주소)
+struct SgWorld {
+    vm: String,
+    c1: String,
+    c2: String,
+}
+
+const VM_IP: &str = "10.88.0.2";
+const C1_IP: &str = "10.88.0.3";
+
+impl SgWorld {
+    /// (탐침, 닿았는지): 손님 둘의 ICMP·tcp 22, c1의 tcp 8080, VM에서 나가는 ping
+    fn probes(&self) -> Vec<(&'static str, bool)> {
+        vec![
+            ("icmp from c1", ping_from(&self.c1, &[], VM_IP)),
+            ("icmp from c2", ping_from(&self.c2, &[], VM_IP)),
+            ("tcp 22 from c1", tcp_from(&self.c1, VM_IP, 22)),
+            ("tcp 22 from c2", tcp_from(&self.c2, VM_IP, 22)),
+            ("tcp 8080 from c1", tcp_from(&self.c1, VM_IP, 8080)),
+            ("ping out to c1", ping_from(&self.vm, &[], C1_IP)),
+        ]
+    }
+
+    fn tcp22_c1(&self) -> bool {
+        tcp_from(&self.c1, VM_IP, 22)
+    }
+
+    /// c1에서 tcp 22로 맺어 둔 연결(메아리가 끊기면 끝남)
+    fn hold(&self) -> Server {
+        Server(
+            py_in(&self.c1, HELD_CONNECTION, &[VM_IP, "22"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        )
+    }
+}
+
+/// 맺은 연결 `held`가 `within` 안에 끊기는지(끝난 상태 코드). 끊기지 않으면 None.
+fn cut_within(held: &mut Server, within: Duration) -> Option<std::process::ExitStatus> {
+    let end = Instant::now() + within;
+    while Instant::now() < end {
+        if let Some(s) = held.0.try_wait().unwrap() {
+            return Some(s);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    None
+}
+
+const ALLOWED: [(&str, bool); 6] = [
+    ("icmp from c1", true),
+    ("icmp from c2", true),
+    ("tcp 22 from c1", true),
+    ("tcp 22 from c2", false),
+    ("tcp 8080 from c1", false),
+    ("ping out to c1", true),
+];
+
+async fn security_section(d: &Daemon, tag: &str) {
+    let c = client(d);
+    sdn_network(d, "sg-t", &["--subnet", "10.88.0.0/24"]).await;
+    for (name, rules) in [
+        (
+            "sg-icmp",
+            json!([{"direction": "in", "action": "accept", "protocol": "icmp"}]),
+        ),
+        (
+            "sg-ssh",
+            json!([{"direction": "in", "action": "accept", "protocol": "tcp", "ports": "22",
+                    "remote": format!("{C1_IP}/32")}]),
+        ),
+        (
+            "sg-no22",
+            json!([{"direction": "in", "action": "drop", "protocol": "tcp", "ports": "22"}]),
+        ),
+    ] {
+        c.post(
+            "/security-groups",
+            &json!({ "name": name, "spec": { "rules": rules } }),
+        )
+        .await
+        .unwrap();
+    }
+    // 지키는 VM(그룹 icmp, ssh)과 손님 둘(그룹 없음). IPAM이 .2, .3, .4를 준다.
+    let mut ports = Vec::new();
+    for (name, groups) in [
+        ("sg-vm", json!(["sg-icmp", "sg-ssh"])),
+        ("sg-c1", json!([])),
+        ("sg-c2", json!([])),
+    ] {
+        let vm = c
+            .post(
+                "/vms",
+                &json!({ "name": name, "spec": {
+                    "cpu": { "cores": 1 }, "memory_mib": 256,
+                    "nics": [{ "network": "sg-t", "model": "virtio", "security_groups": groups }]
+                } }),
+            )
+            .await
+            .unwrap();
+        let id = vm["id"].as_str().unwrap().to_string();
+        let mac = vm["spec"]["nics"][0]["mac"].as_str().unwrap().to_string();
+        let ip = vm["spec"]["nics"][0]["ips"][0]
+            .as_str()
+            .unwrap()
+            .to_string();
+        ports.push((format!("opl-{id}-{}", mac.replace(':', "")), mac, ip));
+    }
+    assert_eq!(
+        ports.iter().map(|p| p.2.as_str()).collect::<Vec<_>>(),
+        [VM_IP, C1_IP, "10.88.0.4"]
+    );
+    let vm_port = ports[0].0.clone();
+    // Port_Group 하나에 지키는 VM의 포트만, ACL 다섯(DHCP, 규칙 둘, 기본 둘)
+    wait_for("the port group of sg-vm", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        let Some(port) = rows.ports.iter().find(|p| p.name == vm_port) else {
+            return false;
+        };
+        rows.port_groups.len() == 1 && rows.port_groups[0].ports == std::slice::from_ref(&port.uuid)
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    let pg = &rows.port_groups[0];
+    eprintln!("port group {pg:?}\nacls {:?}", rows.acls);
+    assert_eq!(pg.external_ids["orbivisor:sg-list"], "sg-icmp,sg-ssh");
+    assert_eq!(pg.acls.len(), 5);
+
+    // OVN 세계: 이름공간 셋(OVS 내부 포트, 고정 주소)
+    let ovn = SgWorld {
+        vm: "oplsgv".into(),
+        c1: "oplsg1".into(),
+        c2: "oplsg2".into(),
+    };
+    for ((port, mac, ip), (ns, dev)) in ports.iter().zip([
+        (&ovn.vm, "oplsgv0"),
+        (&ovn.c1, "oplsg10"),
+        (&ovn.c2, "oplsg20"),
+    ]) {
+        namespace_port(ns, dev, port, mac);
+        run(
+            "ip",
+            &[
+                "netns",
+                "exec",
+                ns,
+                "ip",
+                "addr",
+                "add",
+                &format!("{ip}/24"),
+                "dev",
+                dev,
+            ],
+        );
+    }
+
+    // nftables 세계: 단순 Linux 브리지와 veth 셋(브리지 쪽 이름이 tap 이름), 같은 주소·MAC
+    let nft = SgWorld {
+        vm: "oplsbv".into(),
+        c1: "oplsb1".into(),
+        c2: "oplsb2".into(),
+    };
+    let _ = try_run("ip", &["link", "del", "oplsgbr"]);
+    run("ip", &["link", "add", "oplsgbr", "type", "bridge"]);
+    run("ip", &["link", "set", "oplsgbr", "up"]);
+    // 러너에 br_netfilter가 있으면 브리지 프레임이 iptables FORWARD(도커의 DROP)를 지난다.
+    for f in [
+        "/proc/sys/net/bridge/bridge-nf-call-iptables",
+        "/proc/sys/net/bridge/bridge-nf-call-ip6tables",
+    ] {
+        if std::path::Path::new(f).exists() {
+            std::fs::write(f, "0").unwrap();
+        }
+    }
+    let taps = ["opsgv", "opsgc1", "opsgc2"];
+    for (((_, mac, ip), ns), tap) in ports.iter().zip([&nft.vm, &nft.c1, &nft.c2]).zip(taps) {
+        let _ = try_run("ip", &["netns", "del", ns]);
+        run("ip", &["netns", "add", ns]);
+        run(
+            "ip",
+            &[
+                "link", "add", tap, "type", "veth", "peer", "name", "eth0", "netns", ns,
+            ],
+        );
+        run("ip", &["link", "set", tap, "master", "oplsgbr", "up"]);
+        for args in [
+            vec!["link", "set", "eth0", "address", mac],
+            vec!["link", "set", "lo", "up"],
+            vec!["link", "set", "eth0", "up"],
+            vec!["addr", "add", &format!("{ip}/24"), "dev", "eth0"],
+        ] {
+            let mut all = vec!["netns", "exec", ns.as_str(), "ip"];
+            all.extend(args);
+            run("ip", &all);
+        }
+    }
+    let groups: Vec<opl_types::security_group::SecurityGroup> =
+        serde_json::from_value(c.get("/security-groups").await.unwrap()["items"].clone()).unwrap();
+    let vm_mac: opl_types::vm::MacAddr = ports[0].1.parse().unwrap();
+    let apply_nft = |names: &[&str]| {
+        let names: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+        let nic = opl_driver::firewall::FirewallNic {
+            tap: taps[0].into(),
+            mac: vm_mac,
+            rules: opl_types::security_group::nic_policy(&names, &groups).rules,
+        };
+        let text = opl_driver::firewall::ruleset("sgcmp", &[nic]);
+        let mut child = Command::new("nft")
+            .args(["-f", "-"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success(), "nft -f:\n{text}");
+    };
+    // 그룹 전: 둘 다 열려 있다(OVN은 그룹 없는 포트를 거르지 않는다 — 여기서는 c1→c2로 본다).
+    assert!(ping_from(&nft.c1, &[], "10.88.0.4"));
+    assert!(ping_from(&ovn.c1, &[], "10.88.0.4"));
+    let _servers: Vec<Server> = [&ovn.vm, &nft.vm]
+        .iter()
+        .map(|ns| Server(py_in(ns, ECHO_SERVER, &[]).spawn().unwrap()))
+        .collect();
+    std::thread::sleep(Duration::from_secs(1));
+    apply_nft(&["sg-icmp", "sg-ssh"]);
+
+    // 1. 같은 그룹 [icmp, ssh]: ICMP는 누구나, tcp 22는 c1만, 8080은 막힘, 나가기는 됨
+    let got_ovn = ovn.probes();
+    let got_nft = nft.probes();
+    eprintln!("probes ovn {got_ovn:?}\nprobes nft {got_nft:?}");
+    assert_eq!(got_ovn, ALLOWED);
+    assert_eq!(got_nft, ALLOWED);
+
+    // 2. 처음 맞는 것이 이긴다: [no22, icmp, ssh]면 c1의 22도 막히고, [icmp, ssh, no22]면 다시 열린다.
+    d.ctl(&["vm", "nic-sg", "sg-vm", "0", "sg-no22", "sg-icmp", "sg-ssh"])
+        .await
+        .unwrap();
+    apply_nft(&["sg-no22", "sg-icmp", "sg-ssh"]);
+    wait_for(
+        "the drop group first to close tcp 22",
+        AGENT_WAIT,
+        || async { !ovn.tcp22_c1() },
+    )
+    .await;
+    assert!(!nft.tcp22_c1());
+    let mut first_drop = ALLOWED.to_vec();
+    first_drop[2].1 = false;
+    assert_eq!(ovn.probes(), first_drop);
+    assert_eq!(nft.probes(), first_drop);
+    d.ctl(&["vm", "nic-sg", "sg-vm", "0", "sg-icmp", "sg-ssh", "sg-no22"])
+        .await
+        .unwrap();
+    apply_nft(&["sg-icmp", "sg-ssh", "sg-no22"]);
+    wait_for(
+        "the drop group last to reopen tcp 22",
+        AGENT_WAIT,
+        || async { ovn.tcp22_c1() },
+    )
+    .await;
+    assert_eq!(ovn.probes(), ALLOWED);
+    assert_eq!(nft.probes(), ALLOWED);
+
+    // 3. 그룹을 바꾸는 동안 열린 순간이 없다: c2가 20ms마다 22·8080에 붙어 보는 동안 목록을 네 번 바꾼다(포트가 새
+    // Port_Group으로 옮겨 가고 옛 것은 지워진다).
+    let probe = py_in(&ovn.c2, CONTINUOUS_PROBE, &[VM_IP, "14"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    for (i, list) in [
+        &["sg-ssh", "sg-icmp"][..],
+        &["sg-icmp", "sg-ssh"],
+        &["sg-ssh", "sg-icmp", "sg-no22"],
+        &["sg-icmp", "sg-ssh"],
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut args = vec!["vm", "nic-sg", "sg-vm", "0"];
+        args.extend_from_slice(list);
+        d.ctl(&args).await.unwrap();
+        let want = list.join(",");
+        wait_for(
+            &format!("group change {i} in the NB"),
+            AGENT_WAIT,
+            || async {
+                let rows = nb_rows(d, tag).await;
+                rows.port_groups.len() == 1
+                    && rows.port_groups[0].external_ids["orbivisor:sg-list"] == want
+                    && !rows.port_groups[0].ports.is_empty()
+            },
+        )
+        .await;
+    }
+    let out = probe.wait_with_output().unwrap();
+    let counts = String::from_utf8_lossy(&out.stdout).to_string();
+    eprintln!("continuous probe from c2 (hits tries): {counts}");
+    let mut it = counts.split_whitespace();
+    let hits: u32 = it.next().unwrap().parse().unwrap();
+    let tries: u32 = it.next().unwrap().parse().unwrap();
+    assert!(tries > 100, "{counts}");
+    assert_eq!(hits, 0, "c2 got through while the groups changed");
+    assert_eq!(ovn.probes(), ALLOWED);
+
+    // 4. 허용을 빼면(ssh 그룹 떼기) OVN은 맺은 연결도 끊는다(ct_mark.blocked). nftables는 conntrack 항목이 끝날 때까지
+    // 둔다(설계 §11.4의 차이 그대로).
+    let mut held_ovn = ovn.hold();
+    let mut held_nft = nft.hold();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        held_ovn.0.try_wait().unwrap().is_none(),
+        "the OVN connection is up"
+    );
+    assert!(
+        held_nft.0.try_wait().unwrap().is_none(),
+        "the nft connection is up"
+    );
+    d.ctl(&["vm", "nic-sg", "sg-vm", "0", "sg-icmp"])
+        .await
+        .unwrap();
+    apply_nft(&["sg-icmp"]);
+    let cut = cut_within(&mut held_ovn, Duration::from_secs(20));
+    eprintln!("OVN held connection after removing sg-ssh: {cut:?}");
+    assert_eq!(
+        cut.and_then(|s| s.code()),
+        Some(3),
+        "the OVN connection was not cut"
+    );
+    assert!(
+        cut_within(&mut held_nft, Duration::from_secs(4)).is_none(),
+        "nftables keeps established connections"
+    );
+    assert!(!ovn.tcp22_c1());
+    assert!(!nft.tcp22_c1());
+    drop(held_nft);
+
+    // 5. 그룹을 모두 떼면 Port_Group이 사라지고 포트는 거르지 않는다(단순 NIC처럼).
+    d.ctl(&["vm", "nic-sg", "sg-vm", "0"]).await.unwrap();
+    wait_for("the port group to go", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        rows.port_groups.is_empty() && rows.acls.is_empty()
+    })
+    .await;
+    assert!(tcp_from(&ovn.c2, VM_IP, 8080));
+
+    // 치우기
+    let _ = try_run("nft", &["delete", "table", "bridge", "opl_sgcmp"]);
+    for tap in taps {
+        let _ = try_run("ip", &["link", "del", tap]);
+    }
+    let _ = try_run("ip", &["link", "del", "oplsgbr"]);
+    for dev in ["oplsgv0", "oplsg10", "oplsg20"] {
+        let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
+    }
+    for ns in [&ovn.vm, &ovn.c1, &ovn.c2, &nft.vm, &nft.c1, &nft.c2] {
+        let _ = try_run("ip", &["netns", "del", ns]);
     }
 }

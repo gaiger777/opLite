@@ -940,7 +940,7 @@ fn fits(
             "node {name:?} does not have physnet {physnet:?} ready for the VM's provider network"
         ));
     }
-    if spec.has_firewall() && !node.status.firewall {
+    if spec.has_simple_firewall(&inv.networks) && !node.status.firewall {
         return Err(format!(
             "node {name:?} does not have a firewall (nftables) for the VM's security groups"
         ));

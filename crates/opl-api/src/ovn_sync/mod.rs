@@ -2,7 +2,7 @@
 //! 논리 포트로 옮겨 쓴다. NB는 Raft에서 다시 만들 수
 //! 있는 파생물이다 — 리더가 바뀌거나 누가 NB를 바꾸거나 비워도 다음 차례가 되살린다.
 //!
-//! 위트니스가 아닌 모든 노드가 띄우고 리더에서만 일한다. 차례는 리더가 된 직후, Network·Vm·Sdn·Router·FloatingIp 변경과
+//! 위트니스가 아닌 모든 노드가 띄우고 리더에서만 일한다. 차례는 리더가 된 직후, Network·Vm·Sdn·Router·FloatingIp·SecurityGroup 변경과
 //! 노드 지우기, 라우터에 쓰이는 노드 칸([`nb::NodeInputs`])의 변경(0.5초 모아 한 번), 60초마다다. `Sdn`이 없거나 `Ready`가 아니면 쉰다. 한 차례는
 //!
 //! 1. 내 Raft 임기를 잡고 `read_barrier()` 뒤 Raft에서 읽어 바라는 행([`nb::desired`])을 만든다. Raft 읽기가 실패하면
@@ -16,6 +16,7 @@
 //!    같다 — 65에서 SB에 쓰는 유일한 일). 쓰기 바로 앞에서 아직 같은 임기의 리더인지 다시 본다(리뷰 1 m-1).
 //! 5. `SdnStatus.sync`를 바뀔 때만(성공이 이어지면 60초에 한 번) 쓴다.
 
+pub mod acl;
 pub mod nb;
 
 use std::collections::HashMap;
@@ -34,6 +35,7 @@ use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Kind;
 use opl_types::router::RouterSpec;
 use opl_types::sdn::{NB_PORT, SB_PORT, SDN_NAME, SdnPhase, SdnSpec, SdnSync};
+use opl_types::security_group::SecurityGroupSpec;
 use opl_types::vm::VmSpec;
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -186,12 +188,15 @@ impl OvnSyncer {
                 return SyncOutcome::Skipped(e.to_string());
             }
         };
-        let (routers, fips) = match (
+        let (routers, fips, groups) = match (
             cluster.list::<RouterSpec>(),
             cluster.list::<FloatingIpSpec>(),
+            cluster.list::<SecurityGroupSpec>(),
         ) {
-            (Ok((_, r)), Ok((_, f))) => (r, f),
-            (Err(e), _) | (_, Err(e)) => return SyncOutcome::Skipped(e.to_string()),
+            (Ok((_, r)), Ok((_, f)), Ok((_, g))) => (r, f, g),
+            (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => {
+                return SyncOutcome::Skipped(e.to_string());
+            }
         };
         self.seen = vms
             .iter()
@@ -201,7 +206,15 @@ impl OvnSyncer {
             .iter()
             .map(|n| (n.id, nb::NodeInputs::of(&n.spec, &n.status)))
             .collect();
-        let want = nb::desired_routing(&networks, &vms, &nodes, &routers, &fips, &self.config.tag);
+        let want = nb::desired_all(
+            &networks,
+            &vms,
+            &nodes,
+            &routers,
+            &fips,
+            &groups,
+            &self.config.tag,
+        );
         let centrals = central_hosts(&sdn, &nodes);
         let old = sdn.status.sync.clone();
 
@@ -382,10 +395,9 @@ impl OvnSyncer {
                     bumped |= bump;
                     global = Some(bumped_global(global, ids, &results, bump));
                 }
-                Err(e)
-                    if e.is_wait_failed()
-                        || matches!(&e, OvsdbError::Op { index, .. } if *index < n_fence) =>
-                {
+                // 펜싱 연산(앞 `n_fence`개)의 실패만 "NB가 바뀜"이다. 묶음 안의 `wait`(목록 Port_Group이 있는지 — 계획 66
+                // §11.3)이 실패한 것은 그 묶음만의 실패다.
+                Err(e) if matches!(&e, OvsdbError::Op { index, .. } if *index < n_fence) => {
                     // 읽은 뒤 누가 NB_Global을 바꿨다(새 리더나 northd). 남은 묶음은 다음 차례에 다시 읽고 한다.
                     done.failed += plan.len() - i;
                     errors.push(format!(
@@ -629,7 +641,7 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
     }
 }
 
-/// 맞출 일이 생길 때까지 기다린다: Network·Sdn·Router·FloatingIp 변경, 논리 포트에 쓰이는 칸이 바뀐 VM 쓰기(지난 차례가
+/// 맞출 일이 생길 때까지 기다린다: Network·Sdn·Router·FloatingIp·SecurityGroup 변경, 논리 포트에 쓰이는 칸이 바뀐 VM 쓰기(지난 차례가
 /// 본 것과 견줌 — 리뷰 2 m-2), 라우터 행에 쓰이는 칸이 바뀐 노드 쓰기(계획 66), VM·노드 지우기(SB chassis 청소). 구독이 끊기면 버리고 돌아가 다시 맞추게 한다.
 async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
     let Some(w) = watch else {
@@ -672,12 +684,19 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
                 }
             }
             Ok(WatchEvent::Put {
-                kind: Kind::Network | Kind::Sdn | Kind::Router | Kind::FloatingIp,
+                kind:
+                    Kind::Network | Kind::Sdn | Kind::Router | Kind::FloatingIp | Kind::SecurityGroup,
                 ..
             })
             | Ok(WatchEvent::Deleted {
                 kind:
-                    Kind::Network | Kind::Vm | Kind::Sdn | Kind::Node | Kind::Router | Kind::FloatingIp,
+                    Kind::Network
+                    | Kind::Vm
+                    | Kind::Sdn
+                    | Kind::Node
+                    | Kind::Router
+                    | Kind::FloatingIp
+                    | Kind::SecurityGroup,
                 ..
             }) => return,
             Ok(WatchEvent::Reset { .. }) | Err(_) => {
@@ -689,6 +708,8 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
     }
 }
 
+#[cfg(test)]
+mod acl_tests;
 #[cfg(test)]
 mod routing_tests;
 #[cfg(test)]
