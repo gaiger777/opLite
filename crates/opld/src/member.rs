@@ -461,8 +461,6 @@ impl Member {
             };
         #[cfg(feature = "cpu-it")]
         crate::cpu_hook::set_member(Arc::downgrade(&cluster), &hv);
-        #[cfg(feature = "sdn-it")]
-        crate::sdn_hook::set_member(Arc::downgrade(&cluster));
         // 등록 때 핫플러그 능력을 기록하므로 등록 전에 읽는다(QEMU `-device help`).
         host.hotplug = hv.hotplug_caps().await;
         let hotplug = host.hotplug;
@@ -909,6 +907,8 @@ impl Member {
         runner_config.ceph = Some(ceph.clone());
         runner_config.sdn = Some(ovn.clone());
         state.ceph = Some(ceph.clone());
+        // 네트워크 주소 목록이 논리 포트 상태를 OvnSync와 같은 TLS로 읽는다(계획 65).
+        state.ovn = Some(ovn_sync_config.clone());
         state.ceph_status_ttl = config.ceph.status_cache();
         // 노드 비우기 Task가 이 노드의 API와 같은 확인으로 마이그레이션 Task를 만든다.
         let state = Arc::new(state);
@@ -1795,9 +1795,10 @@ mod tests {
                 name: "c".into(),
                 ca,
             };
-            let (member, created) = Member::start(&config, node, tls, bootstrap, &rt, None)
-                .await
-                .unwrap();
+            let (member, created) =
+                Box::pin(Member::start(&config, node, tls, bootstrap, &rt, None))
+                    .await
+                    .unwrap();
             assert!(created.is_some());
             let here = tokio::runtime::Handle::current();
             assert_eq!(alive(&here), 0, "tasks left on the caller's runtime");
@@ -1839,7 +1840,7 @@ mod tests {
                 name: "c".into(),
                 ca,
             };
-            let (mut member, _) = Member::start(&config, node, tls, bootstrap, &rt, None)
+            let (mut member, _) = Box::pin(Member::start(&config, node, tls, bootstrap, &rt, None))
                 .await
                 .unwrap();
             assert!(
@@ -1868,49 +1869,59 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        caller.block_on(async {
-            let node = Uuid::now_v7();
-            let (ca, tls) = crate::new_cluster_tls(&config, node, "c").unwrap();
-            let old = tls.cert_pem.clone();
-            let key_pem = tls.key_pem.clone();
-            let bootstrap = Bootstrap::Init {
-                name: "c".into(),
-                ca,
-            };
-            let (member, _) = Member::start(&config, node, tls, bootstrap, &rt, None)
-                .await
-                .unwrap();
-            member.close(false).await.unwrap();
-            assert_eq!(cert_names(&old).unwrap(), ["127.0.0.1", "localhost", "::1"]);
-
-            let config = Config {
-                cluster_addresses: vec!["127.0.0.2".into(), "127.0.0.1".into()],
-                ..config
-            };
-            let restart = |config: Config| {
-                let rt = rt.clone();
-                async move {
-                    let member = restart_member(&config, node, &rt).await;
+        // 다시 시작 세 번(인증서 다시 서명 포함)의 디버그 빌드 poll 틀은 2 MiB 시험 스레드 스택의 끝에 닿는다(계획 65
+        // 스테이지 6에서 넘쳤다). 큰 스택의 스레드에서 돌린다.
+        std::thread::Builder::new()
+            .stack_size(8 << 20)
+            .spawn(move || {
+                caller.block_on(async {
+                    let node = Uuid::now_v7();
+                    let (ca, tls) = crate::new_cluster_tls(&config, node, "c").unwrap();
+                    let old = tls.cert_pem.clone();
+                    let key_pem = tls.key_pem.clone();
+                    let bootstrap = Bootstrap::Init {
+                        name: "c".into(),
+                        ca,
+                    };
+                    let (member, _) =
+                        Box::pin(Member::start(&config, node, tls, bootstrap, &rt, None))
+                            .await
+                            .unwrap();
                     member.close(false).await.unwrap();
-                    NodeTls::load(&pki_dir(&config)).unwrap().unwrap()
-                }
-            };
-            let saved = restart(config.clone()).await;
-            assert_eq!(
-                cert_names(&saved.cert_pem).unwrap(),
-                ["127.0.0.1", "localhost", "::1", "127.0.0.2"]
-            );
-            let der = opl_peer::pki::first_cert(&saved.cert_pem).unwrap();
-            assert_eq!(opl_peer::pki::node_id_of(&der), Some(node));
-            // 같은 키다(공개키가 같은 것은 opl-peer `pki` 시험이 본다).
-            assert_eq!(saved.key_pem, key_pem);
-            // 이름이 다 있으면 다시 서명하지 않는다.
-            let again = restart(config.clone()).await;
-            assert_eq!(again.cert_pem, saved.cert_pem);
-            // 빠진 것처럼 닫아 root로 도는 Linux CI에서 만든 방화벽 테이블도 지운다.
-            let member = restart_member(&config, node, &rt).await;
-            member.close(true).await.unwrap();
-        });
+                    assert_eq!(cert_names(&old).unwrap(), ["127.0.0.1", "localhost", "::1"]);
+
+                    let config = Config {
+                        cluster_addresses: vec!["127.0.0.2".into(), "127.0.0.1".into()],
+                        ..config
+                    };
+                    let restart = |config: Config| {
+                        let rt = rt.clone();
+                        async move {
+                            let member = restart_member(&config, node, &rt).await;
+                            member.close(false).await.unwrap();
+                            NodeTls::load(&pki_dir(&config)).unwrap().unwrap()
+                        }
+                    };
+                    let saved = Box::pin(restart(config.clone())).await;
+                    assert_eq!(
+                        cert_names(&saved.cert_pem).unwrap(),
+                        ["127.0.0.1", "localhost", "::1", "127.0.0.2"]
+                    );
+                    let der = opl_peer::pki::first_cert(&saved.cert_pem).unwrap();
+                    assert_eq!(opl_peer::pki::node_id_of(&der), Some(node));
+                    // 같은 키다(공개키가 같은 것은 opl-peer `pki` 시험이 본다).
+                    assert_eq!(saved.key_pem, key_pem);
+                    // 이름이 다 있으면 다시 서명하지 않는다.
+                    let again = Box::pin(restart(config.clone())).await;
+                    assert_eq!(again.cert_pem, saved.cert_pem);
+                    // 빠진 것처럼 닫아 root로 도는 Linux CI에서 만든 방화벽 테이블도 지운다.
+                    let member = restart_member(&config, node, &rt).await;
+                    member.close(true).await.unwrap();
+                });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// 닫은 멤버를 다시 시작한다. openraft의 `shutdown`은 상태 머신 태스크가 끝나기를 기다리지 않아 그 태스크가
@@ -1919,7 +1930,16 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             let tls = NodeTls::load(&pki_dir(config)).unwrap().unwrap();
-            match Member::start(config, node, tls, Bootstrap::Restart, rt, None).await {
+            match Box::pin(Member::start(
+                config,
+                node,
+                tls,
+                Bootstrap::Restart,
+                rt,
+                None,
+            ))
+            .await
+            {
                 Err(e)
                     if format!("{e:#}").contains("Database already open")
                         && std::time::Instant::now() < deadline =>

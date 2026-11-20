@@ -42,7 +42,7 @@ const PEER_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 자리(`CephStatus.pending`)를 잡은 Task가 아직 저장소에 없을 때 도는 것으로 보는 시간(API는 자리를 잡은 뒤 Task를
 /// 만든다). 그 사이에 API가 멈췄으면 이 시간 뒤 다른 요청이 자리를 넘겨받는다.
-const PENDING_GRACE: Duration = Duration::from_secs(60);
+pub(crate) const PENDING_GRACE: Duration = Duration::from_secs(60);
 
 /// Ceph 상태를 마지막으로 읽어 본 결과. 웹이 10초마다 묻고 여러 화면이 함께 부르므로 잠깐 둔다(읽지 못한 것도 —
 /// 닿지 않는 mon 노드를 요청마다 기다리지 않게). 읽는 동안 잠가 함께 온 요청이 한 번만 읽게 한다.
@@ -197,7 +197,7 @@ fn pending_running(cluster: &Cluster, p: &CephPending) -> Result<bool, ApiError>
 }
 
 /// UUIDv7 `id`가 지금부터 `within` 안에 만들어졌는지
-fn made_within(id: Uuid, within: Duration) -> bool {
+pub(crate) fn made_within(id: Uuid, within: Duration) -> bool {
     let Some(ts) = id.get_timestamp() else {
         return false;
     };

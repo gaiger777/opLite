@@ -771,14 +771,15 @@ pub(crate) fn import_spec(
     let nics = src
         .nics
         .iter()
-        .map(|nic| {
+        .enumerate()
+        .map(|(i, nic)| {
             let network = run
                 .networks
                 .get(&nic.network)
                 .or_else(|| proposal.networks.get(&nic.network).and_then(Option::as_ref))
                 .ok_or_else(|| format!("no network mapping for {:?}", nic.network))?;
             Ok(NicSpec {
-                ips: Vec::new(),
+                ips: run.ips.get(i).cloned().unwrap_or_default(),
                 network: network.clone(),
                 model,
                 mac: nic.mac.filter(|_| run.keep_macs),
@@ -1056,6 +1057,8 @@ pub async fn run_import(
     }
     let spec = import_spec(src, proposal, &run, &volumes).map_err(ApiError::bad_request)?;
     spec.validate().map_err(crate::cpu::validation_error)?;
+    // 준 SDN 주소(계획 65)는 미리 본다(Task가 만들 때 다시 본다).
+    crate::ipam::check_requested(&state.cluster, &spec, &run.ips)?;
     // 별칭은 버전 모델로 고정해 Task에 넣는다(계획 63 §8).
     if run.cpu_model.is_some() || !run.cpu_flags.is_empty() {
         let inv = crate::scheduler::Inventory::load(&state.cluster)?;
@@ -1305,6 +1308,7 @@ mod tests {
             sockets: None,
             cores: None,
             memory_mib: None,
+            ips: Vec::new(),
             keep_macs: true,
             folder: None,
             cpu_model: None,

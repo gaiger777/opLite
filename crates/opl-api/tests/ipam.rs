@@ -1,5 +1,5 @@
 //! 계획 65 §9 API: SDN NIC 주소(IPAM) — 새 NIC의 자동 할당, 준 주소의 검사, 있던 NIC의 주소 유지, 템플릿, 오류 코드.
-//! SDN 네트워크는 저장소에 바로 만든다(`POST /networks`의 SDN은 스테이지 6에서 열린다).
+//! SDN 네트워크는 저장소에 바로 만든다(`POST /networks`는 세운 OVN이 있어야 한다 — `tests/sdn.rs`).
 
 mod common;
 

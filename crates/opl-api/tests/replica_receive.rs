@@ -651,30 +651,30 @@ async fn prepare_needs_every_node_and_a_target() {
 #[tokio::test]
 async fn sweep_deletes_replicas_no_longer_wanted() {
     // 대상에서 뺐다.
-    let s = setup().await;
+    let s = Box::pin(setup()).await;
     let run = s.full_run(1700).await;
     let mut vm = s.vm();
     vm.spec.replication.clear();
     s.update_vm(&vm).await;
     // 끝나지 않은 복제 Task가 있으면 기다린다.
-    s.receiver.sweep().await;
+    Box::pin(s.receiver.sweep()).await;
     assert!(s.record().is_some());
     s.end_task(run).await;
-    s.receiver.sweep().await;
+    Box::pin(s.receiver.sweep()).await;
     assert_eq!(s.record(), None);
     assert_eq!(s.storage.deleted(), [s.volume]);
 
     // VM을 지웠다.
-    let s = setup().await;
+    let s = Box::pin(setup()).await;
     let run = s.full_run(1700).await;
     s.end_task(run).await;
     s.env.cluster.delete::<VmSpec>(s.vm, None).await.unwrap();
-    s.receiver.sweep().await;
+    Box::pin(s.receiver.sweep()).await;
     assert_eq!(s.record(), None);
     assert_eq!(s.storage.deleted(), [s.volume]);
 
     // 디스크 하나를 뗐다: 그 복제본만 지운다.
-    let s = setup().await;
+    let s = Box::pin(setup()).await;
     let mut other: Volume = Resource::new(
         "data",
         VolumeSpec {
@@ -702,7 +702,7 @@ async fn sweep_deletes_replicas_no_longer_wanted() {
     s.finish(run, true, 1700).await.unwrap();
     vm.spec.disks.pop();
     s.update_vm(&vm).await;
-    s.receiver.sweep().await;
+    Box::pin(s.receiver.sweep()).await;
     assert_eq!(s.storage.deleted(), [other.id]);
     let record = s.record().unwrap();
     assert_eq!(record.volumes.len(), 1);

@@ -34,6 +34,7 @@ use crate::media::{
 use crate::metrics::{PrometheusCmd, RangeArgs, cluster_history, history, prometheus};
 use crate::numa::{NumaArgs, ResourcesArgs, node_resources, node_topology, numa_lines, vm_numa};
 use crate::output::{bytes, cell, json as print_json, table};
+use crate::sdn::{NetworkIps, SdnCmd, SubnetCmd, network_ips, network_subnet, sdn};
 use crate::template::{
     ImageCmd, TemplateCmd, VOLUME_HEADERS, image, linked_value, template, template_lines,
     volume_flatten, volume_row,
@@ -92,7 +93,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CephCmd,
     },
-    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지나 orbivisord가 만드는 VXLAN 네트워크)
+    /// Orbivisor가 노드에 설치·구성하는 OVN(SDN): 첫 중앙 세우기, 중앙 더하기·빼기, chassis 설치, 상태(admin만
+    /// 바꾼다)
+    Sdn {
+        #[command(subcommand)]
+        cmd: SdnCmd,
+    },
+    /// VM NIC가 연결하는 네트워크(노드에 미리 만든 Linux 브리지, orbivisord가 만드는 VXLAN 네트워크, OVN 논리 스위치인
+    /// SDN 네트워크)
     Network {
         #[command(subcommand)]
         cmd: NetworkCmd,
@@ -1193,15 +1201,22 @@ enum NetworkCmd {
     Get {
         network: String,
     },
-    /// 노드에 있는 Linux 브리지를 가리키는 네트워크나 VXLAN 네트워크를 만든다.
+    /// 노드에 있는 Linux 브리지를 가리키는 네트워크, VXLAN 네트워크, SDN(OVN) 네트워크를 만든다.
     Create(NetworkCreate),
     Delete {
         network: String,
     },
+    /// SDN 네트워크의 서브넷
+    Subnet {
+        #[command(subcommand)]
+        cmd: SubnetCmd,
+    },
+    /// SDN 네트워크의 주소(서브넷 사용, NIC마다 주소와 OVN 포트 상태)
+    Ips(NetworkIps),
 }
 
 #[derive(Args)]
-#[command(group(ArgGroup::new("kind").required(true).args(["bridge", "vxlan"])))]
+#[command(group(ArgGroup::new("kind").required(true).args(["bridge", "vxlan", "sdn"])))]
 struct NetworkCreate {
     name: String,
     /// 브리지 이름(예: vmbr0). 이 네트워크를 쓰는 VM은 이 브리지가 있는 노드에서만 돈다.
@@ -1213,7 +1228,15 @@ struct NetworkCreate {
     /// VXLAN 네트워크 식별자(VNI, 1-16777215). orbivisord가 모든 노드에 브리지 oplv<VNI>를 만든다.
     #[arg(long, value_name = "VNI")]
     vxlan: Option<u32>,
-    /// VXLAN 네트워크의 MTU(1280-9000, 기본 1450)
+    /// SDN(OVN) 네트워크: OVN 논리 스위치(Geneve). `sdn init`으로 OVN을 세운 뒤 만든다.
+    #[arg(long, conflicts_with = "vlan")]
+    sdn: bool,
+    /// SDN 네트워크의 서브넷 `CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D]`(IPv4·IPv6 하나씩까지).
+    /// NIC는 서브넷에서 주소를 받는다(IPv4는 OVN DHCP).
+    #[arg(long = "subnet", value_name = "CIDR[,OPTION=VALUE...]", requires = "sdn",
+        value_parser = crate::sdn::parse_subnet)]
+    subnets: Vec<opl_types::network::Subnet>,
+    /// VXLAN·SDN 네트워크의 MTU(1280-9000, 기본 VXLAN 1450·SDN 1442)
     #[arg(long, conflicts_with = "bridge")]
     mtu: Option<u16>,
     /// 넣을 폴더(경로 `/teamA/prod`나 id). 없으면 트리의 맨 위다(루트에 만들 권한이 없으면 400 `folder_required`).
@@ -1232,6 +1255,12 @@ fn network_create_body(c: &NetworkCreate) -> Value {
     }
     if let Some(vni) = c.vxlan {
         spec.insert("vxlan".into(), json!({ "vni": vni }));
+    }
+    if c.sdn {
+        spec.insert("sdn".into(), json!({}));
+    }
+    if !c.subnets.is_empty() {
+        spec.insert("subnets".into(), json!(c.subnets));
     }
     if let Some(mtu) = c.mtu {
         spec.insert("mtu".into(), json!(mtu));
@@ -1703,6 +1732,9 @@ enum VmCmd {
         /// 새 VM의 CPU 배치(계획 64, `none`은 원본의 것을 지운다)
         #[command(flatten)]
         numa: NumaArgs,
+        /// NIC의 SDN 주소 `[nicN=]A[+B]`(계획 65, `nicN=`이 없으면 준 순서대로 NIC 0, 1, …). 없는 NIC는 서브넷에서 받는다.
+        #[arg(long = "ip", value_name = "[nicN=]ADDRESS[+ADDRESS]", value_parser = crate::sdn::parse_nic_ips)]
+        ips: Vec<(Option<usize>, Vec<std::net::IpAddr>)>,
     },
     /// VM 스냅샷(디스크, 실행 중이면 메모리, VM 설정)
     Snapshot {
@@ -1778,8 +1810,8 @@ struct VmCreate {
     #[arg(long, value_name = "DEVICE,...")]
     boot: Option<String>,
     /// 연결할 네트워크 이름(`user`는 QEMU NAT). 여러 번 줄 수 있다. `,sg=A+B`를 붙이면 그 NIC에
-    /// 보안 그룹을 건다(예: `lan,sg=web+db`).
-    #[arg(long = "nic", value_name = "NETWORK[,sg=GROUP+...]", value_parser = parse_nic)]
+    /// 보안 그룹을 건다(예: `lan,sg=web+db`). SDN 네트워크면 `,ip=A[+B]`로 주소를 고른다(없으면 서브넷에서 받는다).
+    #[arg(long = "nic", value_name = "NETWORK[,sg=GROUP+...][,ip=ADDRESS+...]", value_parser = parse_nic)]
     nics: Vec<NicArg>,
     #[arg(long, value_enum, default_value = "never")]
     restart: Restart,
@@ -1808,33 +1840,48 @@ struct VmCreate {
     cloud_init: CloudInitArgs,
 }
 
-/// `--nic`으로 받은 네트워크와 보안 그룹
+/// `--nic`으로 받은 네트워크와 보안 그룹, SDN 주소
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NicArg {
     network: String,
     security_groups: Vec<String>,
+    ips: Vec<std::net::IpAddr>,
 }
 
-/// `lan`, `lan,sg=web+db`처럼 쓴다. 그룹이 있는지는 API가 본다.
+/// `lan`, `lan,sg=web+db`, `tenant,ip=10.0.0.5+fd00::5`처럼 쓴다. 그룹이 있는지와 주소가 서브넷 안인지는 API가 본다.
 fn parse_nic(s: &str) -> Result<NicArg, String> {
-    let bad = || format!("invalid nic {s:?}: use NETWORK or NETWORK,sg=GROUP+GROUP");
-    let (network, groups) = match s.split_once(',') {
-        Some((network, option)) => {
-            let groups = option.strip_prefix("sg=").ok_or_else(bad)?;
-            let groups: Vec<String> = groups.split('+').map(str::to_string).collect();
-            if groups.iter().any(|g| g.is_empty() || g.contains(',')) {
+    let bad = || format!("invalid nic {s:?}: use NETWORK[,sg=GROUP+GROUP][,ip=ADDRESS+ADDRESS]");
+    let mut parts = s.split(',');
+    let network = parts.next().unwrap_or_default();
+    let (mut groups, mut ips) = (None, None);
+    for part in parts {
+        if let Some(list) = part.strip_prefix("sg=")
+            && groups.is_none()
+        {
+            let list: Vec<String> = list.split('+').map(str::to_string).collect();
+            if list.iter().any(String::is_empty) {
                 return Err(bad());
             }
-            (network, groups)
+            groups = Some(list);
+        } else if let Some(list) = part.strip_prefix("ip=")
+            && ips.is_none()
+        {
+            let list: Vec<std::net::IpAddr> = list
+                .split('+')
+                .map(|a| a.parse().map_err(|_| bad()))
+                .collect::<Result<_, _>>()?;
+            ips = Some(list);
+        } else {
+            return Err(bad());
         }
-        None => (s, Vec::new()),
-    };
+    }
     if network.is_empty() {
         return Err(bad());
     }
     Ok(NicArg {
         network: network.into(),
-        security_groups: groups,
+        security_groups: groups.unwrap_or_default(),
+        ips: ips.unwrap_or_default(),
     })
 }
 
@@ -1899,6 +1946,9 @@ fn nic_body(nic: &NicArg) -> Value {
     let mut body = json!({ "network": nic.network, "model": "virtio" });
     if !nic.security_groups.is_empty() {
         body["security_groups"] = json!(nic.security_groups);
+    }
+    if !nic.ips.is_empty() {
+        body["ips"] = json!(nic.ips);
     }
     body
 }
@@ -2168,7 +2218,7 @@ enum VmNicCmd {
     /// 보안 그룹을 건다.
     Add {
         vm: String,
-        #[arg(value_name = "NETWORK[,sg=GROUP+...]", value_parser = parse_nic)]
+        #[arg(value_name = "NETWORK[,sg=GROUP+...][,ip=ADDRESS+...]", value_parser = parse_nic)]
         nic: NicArg,
         #[arg(long, value_enum, default_value = "virtio")]
         model: NicModel,
@@ -3437,6 +3487,10 @@ struct ImportRunArgs {
     /// 원본 MAC 주소 대신 새 MAC을 받는다.
     #[arg(long)]
     new_macs: bool,
+    /// 원본 NIC의 SDN 주소 `[nicN=]A[+B]`(계획 65, `nicN=`이 없으면 준 순서대로 NIC 0, 1, …). 없는 NIC는 서브넷에서 받는다.
+    #[arg(long = "ip", value_name = "[nicN=]ADDRESS[+ADDRESS]", value_parser = crate::sdn::parse_nic_ips)]
+    ips: Vec<(Option<usize>, Vec<std::net::IpAddr>)>,
+
     #[command(flatten)]
     cpu: CpuArgs,
     #[command(flatten)]
@@ -3520,6 +3574,9 @@ fn import_run_body(args: &ImportRunArgs, sources: &[String]) -> anyhow::Result<V
         "memory_mib": args.memory,
         "keep_macs": !args.new_macs,
     });
+    if !args.ips.is_empty() {
+        body["ips"] = crate::sdn::ips_by_index(&args.ips);
+    }
     args.cpu.request_fields(&mut body);
     args.numa.request_fields(&mut body, false)?;
     Ok(body)
@@ -6013,6 +6070,7 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             }
         },
         Cmd::Ceph { cmd } => ceph(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
+        Cmd::Sdn { cmd } => sdn(&client, cmd, json_out, out, &mut std::io::stderr()).await?,
         Cmd::Network { cmd } => match cmd {
             NetworkCmd::List(filter) => {
                 let list = client.get("/networks").await?;
@@ -6038,6 +6096,10 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
                     .delete(&format!("/networks/{}", seg(&network)))
                     .await?;
                 writeln!(out, "network {network} deleted")?;
+            }
+            NetworkCmd::Subnet { cmd } => network_subnet(&client, cmd, out).await?,
+            NetworkCmd::Ips(args) => {
+                network_ips(&client, &args, json_out, out, &mut std::io::stderr()).await?
             }
         },
         Cmd::SecurityGroup { cmd } => security_group(&client, cmd, json_out, out).await?,
@@ -7826,6 +7888,21 @@ async fn warn_ha_without_replica(
 
 /// `vm get`: 표준 출력에는 VM JSON만 쓰고(스크립트가 그대로 읽는다), 실행 중 하드웨어(`hardware:`)와 다음 재시작 때
 /// 적용할 변경(`pending:`) 요약은 `err`(stderr)에 쓴다. `-o json`이면 요약을 쓰지 않는다.
+/// `vm get`의 SDN NIC 주소 줄(계획 65, 주소가 있는 NIC만): `nic 0 (tenant): 10.0.0.5, fd00::5`
+fn nic_ip_lines(vm: &Value) -> Vec<String> {
+    vm["spec"]["nics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(i, n)| {
+            let ips: Vec<String> = n["ips"].as_array()?.iter().map(cell).collect();
+            (!ips.is_empty())
+                .then(|| format!("nic {i} ({}): {}", cell(&n["network"]), ips.join(", ")))
+        })
+        .collect()
+}
+
 async fn vm_get(
     client: &Client,
     vm: &str,
@@ -7847,6 +7924,7 @@ async fn vm_get(
             .into_iter()
             .chain(boot_line(&vm))
             .chain(cloud_init_lines(&vm))
+            .chain(nic_ip_lines(&vm))
         {
             writeln!(err, "{line}")?;
         }
@@ -8245,8 +8323,12 @@ async fn vm(
             linked,
             full,
             numa,
+            ips,
         } => {
             let mut body = json!({ "name": name, "snapshot": snapshot, "pool": pool });
+            if !ips.is_empty() {
+                body["ips"] = crate::sdn::ips_by_index(&ips);
+            }
             if let Some(linked) = linked_value(linked, full) {
                 body["linked"] = json!(linked);
             }
@@ -8819,7 +8901,7 @@ fn node_roles_cell(spec: &Value) -> String {
 }
 
 /// `network list`의 열
-const NETWORK_HEADERS: &[&str] = &["NAME", "TYPE", "BRIDGE", "VLAN/VNI", "MTU"];
+const NETWORK_HEADERS: &[&str] = &["NAME", "TYPE", "BRIDGE", "VLAN/VNI", "MTU", "SUBNETS"];
 
 /// VXLAN 네트워크의 기본 MTU(서버의 `DEFAULT_VXLAN_MTU`)
 const DEFAULT_VXLAN_MTU: u64 = 1450;
@@ -8827,7 +8909,27 @@ const DEFAULT_VXLAN_MTU: u64 = 1450;
 /// `network list`의 한 행. VXLAN 네트워크의 브리지는 opld가 만드는 `oplv<vni>`다.
 fn network_row(n: &Value) -> Vec<String> {
     let spec = &n["spec"];
-    match spec["vxlan"]["vni"].as_u64() {
+    if spec["sdn"].is_object() {
+        let subnets: Vec<String> = spec["subnets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|s| cell(&s["cidr"]))
+            .collect();
+        return vec![
+            cell(&n["name"]),
+            "sdn".into(),
+            "br-int".into(),
+            "-".into(),
+            spec["mtu"].as_u64().unwrap_or(1442).to_string(),
+            if subnets.is_empty() {
+                "-".into()
+            } else {
+                subnets.join(",")
+            },
+        ];
+    }
+    let mut row = match spec["vxlan"]["vni"].as_u64() {
         Some(vni) => vec![
             cell(&n["name"]),
             "vxlan".into(),
@@ -8845,7 +8947,9 @@ fn network_row(n: &Value) -> Vec<String> {
             cell(&spec["vlan"]),
             "-".into(),
         ],
-    }
+    };
+    row.push("-".into());
+    row
 }
 
 /// `cluster status`의 표와 경고
@@ -9480,6 +9584,29 @@ mod tests {
         assert!(
             Cli::try_parse_from(["oplctl", "vm", "clone", "t", "w", "--linked", "--full"]).is_err()
         );
+        // SDN 주소(계획 65): NIC 순번별
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "clone",
+            "t",
+            "w",
+            "--ip",
+            "nic1=10.0.0.5",
+            "--ip",
+            "nic0=10.0.0.6",
+        ])
+        .unwrap();
+        let Cmd::Vm {
+            cmd: VmCmd::Clone { ips, .. },
+        } = cli.cmd
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            crate::sdn::ips_by_index(&ips),
+            json!([["10.0.0.6"], ["10.0.0.5"]])
+        );
         // 체크섬 방법은 하나만
         assert!(
             Cli::try_parse_from([
@@ -9554,6 +9681,15 @@ mod tests {
         ] {
             assert!(schedule(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn nic_ip_lines_show_sdn_addresses() {
+        let vm = json!({ "spec": { "nics": [
+            { "network": "lan" },
+            { "network": "t", "ips": ["10.0.0.5", "fd00::5"] }
+        ] } });
+        assert_eq!(nic_ip_lines(&vm), ["nic 1 (t): 10.0.0.5, fd00::5"]);
     }
 
     #[test]
@@ -11805,6 +11941,22 @@ mod tests {
             create(&["--vxlan", "100", "--mtu", "1400"]).unwrap(),
             json!({ "name": "lan", "spec": { "vxlan": { "vni": 100 }, "mtu": 1400 } })
         );
+        assert_eq!(
+            create(&["--sdn"]).unwrap(),
+            json!({ "name": "lan", "spec": { "sdn": {} } })
+        );
+        assert_eq!(
+            create(&[
+                "--sdn",
+                "--mtu",
+                "1400",
+                "--subnet",
+                "10.0.0.0/24,dns=10.0.0.53"
+            ])
+            .unwrap(),
+            json!({ "name": "lan", "spec": { "sdn": {}, "mtu": 1400,
+                "subnets": [{ "cidr": "10.0.0.0/24", "dns_servers": ["10.0.0.53"] }] } })
+        );
         for args in [
             &[][..],
             &["--bridge", "vmbr0", "--vxlan", "100"],
@@ -11813,6 +11965,9 @@ mod tests {
             &["--vlan", "10"],
             &["--mtu", "1400"],
             &["--vxlan", "-1"],
+            &["--sdn", "--vxlan", "100"],
+            &["--sdn", "--vlan", "10"],
+            &["--sdn", "--subnet", "10.0.0.0/24,bad=1"],
         ] {
             assert!(create(args).is_err(), "{args:?}");
         }
@@ -11826,6 +11981,9 @@ mod tests {
             json!({ "name": "dmz", "spec": { "bridge": "vmbr0", "vlan": 20 } }),
             json!({ "name": "ov", "spec": { "vxlan": { "vni": 100 } } }),
             json!({ "name": "jumbo", "spec": { "vxlan": { "vni": 7 }, "mtu": 8950 } }),
+            json!({ "name": "t", "spec": { "sdn": {}, "subnets": [
+                { "cidr": "10.0.0.0/24" }, { "cidr": "fd00::/64", "dhcp": false }
+            ] } }),
         ]
         .iter()
         .map(network_row)
@@ -11834,11 +11992,12 @@ mod tests {
         table(&mut out, NETWORK_HEADERS, &rows).unwrap();
         assert_eq!(
             String::from_utf8(out).unwrap(),
-            "NAME   TYPE    BRIDGE   VLAN/VNI  MTU\n\
-             lan    bridge  vmbr0    -         -\n\
-             dmz    bridge  vmbr0    20        -\n\
-             ov     vxlan   oplv100  100       1450\n\
-             jumbo  vxlan   oplv7    7         8950\n"
+            "NAME   TYPE    BRIDGE   VLAN/VNI  MTU   SUBNETS\n\
+             lan    bridge  vmbr0    -         -     -\n\
+             dmz    bridge  vmbr0    20        -     -\n\
+             ov     vxlan   oplv100  100       1450  -\n\
+             jumbo  vxlan   oplv7    7         8950  -\n\
+             t      sdn     br-int   -         1442  10.0.0.0/24,fd00::/64\n"
         );
     }
 
@@ -13384,9 +13543,20 @@ mod tests {
             "lan,sg=+web",
             "lan,group=web",
             "lan,sg=web,sg=db",
+            "t,ip=10.0.0",
+            "t,ip=",
+            "t,ip=10.0.0.5,ip=10.0.0.6",
         ] {
             assert!(nics(&["--nic", bad]).is_err(), "{bad:?}");
         }
+        // SDN 주소(계획 65)
+        assert_eq!(
+            nics(&["--nic", "t,ip=10.0.0.5+fd00::5,sg=web"]).unwrap(),
+            vec![
+                json!({ "network": "t", "model": "virtio", "security_groups": ["web"],
+                "ips": ["10.0.0.5", "fd00::5"] })
+            ]
+        );
     }
 
     #[test]

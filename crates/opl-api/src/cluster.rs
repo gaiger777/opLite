@@ -792,6 +792,8 @@ pub async fn delete_node(
             ),
         ));
     }
+    // OVN 중앙은 먼저 중앙에서 빼야 한다(계획 65 §7.1).
+    crate::sdn::check_node_removal(&state.cluster, &node)?;
     // Ceph 기록에서 먼저 뺀다(노드를 지운 뒤 실패하면 다시 부를 노드가 없다).
     let warnings = crate::ceph::forget_node(&state, &node).await?;
     state

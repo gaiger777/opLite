@@ -86,6 +86,11 @@ pub struct CloneRequest {
     /// 디스크 순번별 새 크기(바이트, 늘리기만, 512의 배수). null은 그대로다.
     #[serde(default)]
     pub disks: Vec<Option<u64>>,
+    /// NIC 순번별 SDN 주소(계획 65, 주소 체계마다 하나까지 — 예 `[[], ["10.10.0.5"]]`). 빈 목록은 서브넷에서 새로
+    /// 받는다. 그 네트워크의 `network.assign`이 있어야 하고, 쓰이고 있으면 409 `ip_in_use`다.
+    #[serde(default)]
+    #[schema(value_type = Vec<Vec<String>>)]
+    pub ips: Vec<Vec<std::net::IpAddr>>,
     /// 주어진·비지 않은 칸만 원본의 cloud-init 설정을 바꾼다. 평문 비밀번호는 SHA-512 crypt로 바꿔 Task에 담고,
     /// `********`는 원본의 비밀번호를 그대로 둔다.
     #[serde(default)]
@@ -143,6 +148,7 @@ impl CloneRequest {
             || self.memory_mib.is_some()
             || !self.nics.is_empty()
             || !self.disks.is_empty()
+            || !self.ips.is_empty()
             || self.cloud_init.is_some()
             || self.start
             || self.folder.is_some()
@@ -1013,6 +1019,8 @@ pub async fn clone_vm(
         }
     }
     check_security_groups(&state, &spec)?;
+    // 준 SDN 주소(계획 65 §12)는 미리 본다(Task가 만들 때 다시 본다).
+    crate::ipam::check_requested(&state.cluster, &spec, &req.ips)?;
     state
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
@@ -1134,6 +1142,7 @@ fn overrides(
         vcpus: req.vcpus,
         memory_mib: req.memory_mib,
         nics: req.nics.clone(),
+        ips: req.ips.clone(),
         disks: req.disks.clone(),
         cloud_init,
         start: req.start,
@@ -1150,6 +1159,10 @@ fn overrides(
     };
     if ov.is_empty() {
         return Ok(None);
+    }
+    // NIC 주소(계획 65)는 옛 노드가 풀지 못한다(검증보다 먼저).
+    if !ov.ips.is_empty() {
+        require_feature(&state.cluster, opl_types::node::SDN)?;
     }
     // CPU 정책·vNUMA·hugepages(계획 64)는 옛 노드가 풀지 못한다(검증보다 먼저).
     if !ov.numa_overrides().is_empty() {

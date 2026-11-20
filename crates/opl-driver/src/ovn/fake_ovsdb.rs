@@ -76,6 +76,8 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
             ("nb_cfg", Int),
             ("external_ids", Map),
         ],
+        // 주소 목록(`GET /networks/{key}/ips`)이 읽는 칸만
+        "Port_Binding" => &[("logical_port", Str), ("chassis", Ref("Chassis", false))],
         "Encap" => &[
             ("type", Str),
             ("ip", Str),

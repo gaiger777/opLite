@@ -243,6 +243,10 @@ pub struct ImportRun {
     pub cores: Option<u16>,
     #[serde(default)]
     pub memory_mib: Option<u32>,
+    /// 원본 NIC 순번별 SDN 주소(계획 65, 주소 체계마다 하나까지). 빈 목록은 서브넷에서 받는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Vec<String>>, default))]
+    pub ips: Vec<Vec<std::net::IpAddr>>,
     /// 원본 MAC 주소를 그대로 쓴다. 끄면 새 MAC을 받는다.
     #[serde(default = "yes")]
     #[cfg_attr(feature = "openapi", schema(default = true))]

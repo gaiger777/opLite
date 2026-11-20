@@ -6,13 +6,14 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
-use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
+use opl_cluster::{Cluster, ClusterError};
 use opl_types::cloud_init::CloudInitNet;
 use opl_types::ipam::{self, IpamError};
-use opl_types::network::Network;
+use opl_types::network::{Network, NetworkSpec};
 use opl_types::vm::{Vm, VmSpec};
 
+use crate::cluster::require_feature;
 use crate::error::ApiError;
 
 /// Raft가 주소 겹침으로 거절했을 때 다시 고르는 횟수
@@ -172,6 +173,38 @@ pub(crate) fn assign(
         spec.nics[i].ips = ips;
     }
     Ok(())
+}
+
+/// 복제·배포·가져오기 요청이 NIC 순번별로 준 주소 `requested`(새 VM의 스펙 `spec`)를 미리 본다(설계 §12). 옛 노드가
+/// 있으면 409 `cluster_upgrading`, NIC보다 많으면·SDN이 아닌 네트워크·서브넷 밖·예약 주소는 400, 다른 NIC가 쓰면 409
+/// `ip_in_use`, 서브넷이 다 쓰였으면 409 `ip_exhausted`. 새 VM의 다른 NIC는 Task가 새로 받으므로 주소 없이 본다.
+/// Task가 VM을 만들 때 다시 보고, 그새 쓰였으면 실패한다.
+pub(crate) fn check_requested(
+    cluster: &Cluster,
+    spec: &VmSpec,
+    requested: &[Vec<IpAddr>],
+) -> Result<(), ApiError> {
+    if requested.iter().all(Vec::is_empty) {
+        return Ok(());
+    }
+    require_feature(cluster, opl_types::node::SDN)?;
+    if requested.len() > spec.nics.len() {
+        return Err(ApiError::bad_request(format!(
+            "ips: {} given but the VM has {} NIC(s)",
+            requested.len(),
+            spec.nics.len()
+        )));
+    }
+    let mut new = spec.clone();
+    new.template = false;
+    for (i, nic) in new.nics.iter_mut().enumerate() {
+        nic.mac = None;
+        nic.ips = requested.get(i).cloned().unwrap_or_default();
+    }
+    let (_, vms) = cluster.list::<VmSpec>()?;
+    let (_, networks) = cluster.list::<NetworkSpec>()?;
+    let others: Vec<&Vm> = vms.iter().collect();
+    assign(&mut new, None, &others, &networks)
 }
 
 /// Task가 만드는 새 VM(복제·템플릿 배포·가져오기·복원·템플릿 되돌리기)의 스펙 `spec`에 주소를 채운다. `vms`는 이미 있는

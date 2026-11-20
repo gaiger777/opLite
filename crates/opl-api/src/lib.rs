@@ -65,6 +65,7 @@ pub mod revision;
 mod schedule;
 pub mod scheduler;
 pub mod score;
+mod sdn;
 mod security_groups;
 mod settings;
 mod snapshots;
@@ -264,7 +265,16 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::get_pool, r::patch_pool, r::delete_pool))
         .routes(routes!(metrics_history::get_pool_history))
         .routes(routes!(r::list_networks, r::create_network))
-        .routes(routes!(r::get_network, r::delete_network))
+        .routes(routes!(
+            r::get_network,
+            r::delete_network,
+            sdn::patch_network
+        ))
+        .routes(routes!(sdn::network_ips))
+        .routes(routes!(sdn::get_sdn, sdn::init_sdn))
+        .routes(routes!(sdn::add_central))
+        .routes(routes!(sdn::remove_central))
+        .routes(routes!(sdn::install_chassis))
         .routes(routes!(
             r::list_security_groups,
             security_groups::create_security_group

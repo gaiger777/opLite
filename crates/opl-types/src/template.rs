@@ -39,6 +39,10 @@ pub struct CloneOverrides {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub nics: Vec<Option<String>>,
+    /// NIC 순번별 SDN 주소(계획 65, 주소 체계마다 하나까지). 빈 목록은 서브넷에서 새로 받는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Vec<String>>, default))]
+    pub ips: Vec<Vec<std::net::IpAddr>>,
     /// 디스크 순번별 새 크기(바이트, 늘리기만). null은 그대로다.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
@@ -121,6 +125,8 @@ impl CloneOverrides {
 pub enum TemplateError {
     #[error("nics: {given} given but the VM has {has} NIC(s)")]
     TooManyNics { given: usize, has: usize },
+    #[error("ips: {given} given but the VM has {has} NIC(s)")]
+    TooManyIps { given: usize, has: usize },
     #[error("disks: {given} given but the VM has {has} disk(s)")]
     TooManyDisks { given: usize, has: usize },
     #[error(
@@ -142,6 +148,12 @@ pub fn apply_overrides(spec: &VmSpec, ov: &CloneOverrides) -> Result<VmSpec, Tem
     if ov.nics.len() > spec.nics.len() {
         return Err(TemplateError::TooManyNics {
             given: ov.nics.len(),
+            has: spec.nics.len(),
+        });
+    }
+    if ov.ips.len() > spec.nics.len() {
+        return Err(TemplateError::TooManyIps {
+            given: ov.ips.len(),
             has: spec.nics.len(),
         });
     }
@@ -175,6 +187,12 @@ pub fn apply_overrides(spec: &VmSpec, ov: &CloneOverrides) -> Result<VmSpec, Tem
     for (nic, network) in new.nics.iter_mut().zip(&ov.nics) {
         if let Some(network) = network {
             nic.network = network.clone();
+        }
+    }
+    // 주소는 새 VM이 늘 새로 받는다(복제 Task가 MAC과 함께 지운다). 준 주소만 그대로 둔다.
+    for (nic, ips) in new.nics.iter_mut().zip(&ov.ips) {
+        if !ips.is_empty() {
+            nic.ips.clone_from(ips);
         }
     }
     if let Some(ci) = &ov.cloud_init {
@@ -449,6 +467,37 @@ mod tests {
         assert!(new.template);
         assert_eq!(new.disks, template().disks);
         assert_eq!(new.cloud_init, template().cloud_init);
+    }
+
+    #[test]
+    fn ip_overrides_set_only_the_given_nics() {
+        let ip: std::net::IpAddr = "10.10.0.5".parse().unwrap();
+        let ov = CloneOverrides {
+            ips: vec![vec![], vec![ip]],
+            ..CloneOverrides::default()
+        };
+        let json = serde_json::to_value(&ov).unwrap();
+        assert_eq!(json, serde_json::json!({ "ips": [[], ["10.10.0.5"]] }));
+        let new = apply_overrides(&template(), &ov).unwrap();
+        assert!(new.nics[0].ips.is_empty());
+        assert_eq!(new.nics[1].ips, [ip]);
+        let too_many = CloneOverrides {
+            ips: vec![vec![], vec![], vec![ip]],
+            ..CloneOverrides::default()
+        };
+        assert_eq!(
+            apply_overrides(&template(), &too_many),
+            Err(TemplateError::TooManyIps { given: 3, has: 2 })
+        );
+        // 주소 체계마다 하나까지(VM 검증)
+        let two = CloneOverrides {
+            ips: vec![vec![ip, "10.10.0.6".parse().unwrap()]],
+            ..CloneOverrides::default()
+        };
+        assert!(matches!(
+            apply_overrides(&template(), &two),
+            Err(TemplateError::Invalid(_))
+        ));
     }
 
     #[test]

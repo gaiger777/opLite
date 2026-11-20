@@ -86,6 +86,9 @@ pub struct AppState {
     pub ceph_status_ttl: Duration,
     /// 마지막으로 읽은 Ceph 상태
     pub(crate) ceph_status: crate::ceph::CephStatusCache,
+    /// OVN에 붙는 방법(리더 OvnSync와 같은 것, 계획 65). 네트워크 주소 목록의 논리 포트 상태를 읽는다. 없으면(위트니스·
+    /// 시험) 읽지 않는다.
+    pub ovn: Option<crate::ovn_sync::OvnSyncConfig>,
     /// 클러스터 지표 모으기(`GET /metrics/cluster`)의 10초 캐시. 조건마다 모으기는 한 번만 돈다.
     pub(crate) digest_cache: std::sync::Mutex<crate::metrics_history::DigestCache>,
     /// Prometheus 끝점(`GET /metrics`)의 5초 캐시
@@ -131,6 +134,7 @@ impl AppState {
             ceph: None,
             ceph_status_ttl: Duration::from_secs(5),
             ceph_status: Default::default(),
+            ovn: None,
             digest_cache: Default::default(),
             prometheus_cache: Default::default(),
         }

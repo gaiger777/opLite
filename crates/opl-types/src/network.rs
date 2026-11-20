@@ -227,6 +227,9 @@ impl NetworkSpec {
                 if is_managed_ifname(bridge) {
                     return Err(NetworkError::ReservedBridge(bridge.clone()));
                 }
+                if bridge == OVN_BRIDGE {
+                    return Err(NetworkError::OvnBridge);
+                }
                 if self.mtu.is_some() {
                     return Err(NetworkError::MtuWithBridge);
                 }
@@ -367,6 +370,10 @@ pub enum NetworkError {
     BadMtu(u16),
     #[error("bridge name {0:?} is reserved for Orbivisor VXLAN networks")]
     ReservedBridge(String),
+    #[error(
+        "bridge name {OVN_BRIDGE:?} is the OVN integration bridge; create an SDN network (sdn) instead"
+    )]
+    OvnBridge,
     #[error("subnets can only be used with sdn")]
     SubnetsWithoutSdn,
     #[error("a network can have at most one IPv4 and one IPv6 subnet")]
@@ -566,6 +573,12 @@ mod tests {
             );
         }
         assert_eq!(spec("oplv", None).validate(), Ok(()));
+        // SDN 네트워크의 OVS 브리지는 브리지 네트워크가 가리킬 수 없다(계획 65).
+        assert_eq!(
+            spec("br-int", None).validate(),
+            Err(NetworkError::OvnBridge)
+        );
+        assert_eq!(spec("br-int0", None).validate(), Ok(()));
     }
 
     #[test]

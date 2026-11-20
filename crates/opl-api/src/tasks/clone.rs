@@ -324,10 +324,13 @@ pub(super) async fn clone(
     for (disk, (copy, _)) in new.spec.disks.iter_mut().zip(&copies) {
         disk.volume = copy.name.clone();
     }
-    // 복제본은 MAC과 SDN 주소를 새로 받는다(계획 65 §9).
-    for nic in &mut new.spec.nics {
+    // 복제본은 MAC과 SDN 주소를 새로 받는다(계획 65 §9). 배포 때 준 주소(`ips`)만 그대로 둔다.
+    for (i, nic) in new.spec.nics.iter_mut().enumerate() {
         nic.mac = None;
-        nic.ips.clear();
+        nic.ips = overrides
+            .and_then(|ov| ov.ips.get(i))
+            .cloned()
+            .unwrap_or_default();
     }
     warnings.extend(identity_warning(
         "the clone",
@@ -357,6 +360,7 @@ pub(super) async fn clone(
         new,
         start.or(node),
         start.is_some(),
+        true,
         &mut warnings,
     )
     .await?;
@@ -486,6 +490,7 @@ pub(super) async fn create_vm(
     mut new: Vm,
     node: Option<Uuid>,
     start: bool,
+    strict_ips: bool,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
     let name = new.name.clone();
@@ -553,6 +558,13 @@ pub(super) async fn create_vm(
         new.spec.nics.clone_from(&wanted);
         let notes = crate::ipam::assign_new(&mut new.spec, &others, &networks)
             .map_err(|e| format!("cannot give the VM addresses: {e}"))?;
+        // 요청이 준 주소(복제·배포·가져오기의 `ips`)는 바꿔 주지 않는다: 그새 쓰였으면 실패다.
+        if strict_ips && !notes.is_empty() {
+            return Err(format!(
+                "cannot give the VM the requested addresses: {}",
+                notes.join("; ")
+            ));
+        }
         // 이름이나 MAC이 그새 쓰였으면 저장소가 거부한다.
         match ctx.cluster.create(&new).await {
             Err(e) if crate::ipam::is_ip_taken(&e) && retries < crate::ipam::RETRIES => {

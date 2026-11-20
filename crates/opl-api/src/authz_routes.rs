@@ -206,6 +206,15 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/networks", Handler),
     ("GET", "/networks/{key}", Read(Network)),
     ("DELETE", "/networks/{key}", Object(Network, NetworkConfig)),
+    // SDN 네트워크의 서브넷 바꾸기와 주소 목록(계획 65): 그 네트워크의 `network.config`·읽기
+    ("PATCH", "/networks/{key}", Object(Network, NetworkConfig)),
+    ("GET", "/networks/{key}/ips", Read(Network)),
+    // SDN(OVN) 설치·구성(계획 65): 루트 객체
+    ("GET", "/sdn", Root(ClusterRead)),
+    ("POST", "/sdn", Root(ClusterAdmin)),
+    ("POST", "/sdn/centrals", Root(ClusterAdmin)),
+    ("DELETE", "/sdn/centrals/{node}", Root(ClusterAdmin)),
+    ("POST", "/sdn/chassis", Root(ClusterAdmin)),
     ("GET", "/security-groups", Root(ClusterRead)),
     ("POST", "/security-groups", Root(NetworkConfig)),
     ("GET", "/security-groups/{key}", Root(ClusterRead)),

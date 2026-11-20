@@ -211,8 +211,8 @@ pub(super) async fn import(
         .map_err(|e| format!("invalid VM spec: {e}"))?;
     let mut new: Vm = Resource::new(run.name.as_str(), spec);
     new.id = task.spec.target;
-    // 가져온 스펙에는 주소가 없다(SDN NIC는 새로 받는다 — 경고가 생기지 않는다).
-    create_vm(ctx, task, new, None, false, &mut Vec::new()).await?;
+    // 가져온 스펙의 주소는 요청이 준 것뿐이다(그새 쓰였으면 실패). 나머지 SDN NIC는 새로 받는다.
+    create_vm(ctx, task, new, None, false, true, &mut Vec::new()).await?;
 
     let vm = task.spec.target;
     update_import(ctx, id, |s| {

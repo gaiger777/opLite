@@ -1347,7 +1347,9 @@ export interface paths {
         get: operations["list_networks"];
         put?: never;
         /**
-         * 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
+         * 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크, 또는 OVN 논리 스위치인 SDN
+         *     네트워크(`sdn`, 서브넷 `subnets` — 계획 65). 이름 `user`와 브리지 `br-int`는 예약되어 있다. SDN 네트워크는 폴더의
+         *     `network.config`로 만들고, SDN(OVN)이 세워지지 않았으면 409 `sdn_not_ready`, 서브넷 검증은 400 `invalid_subnet`.
          *     VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
          */
         post: operations["create_network"];
@@ -1369,6 +1371,34 @@ export interface paths {
         post?: never;
         /** VM이 쓰고 있으면 409 */
         delete: operations["delete_network"];
+        options?: never;
+        head?: never;
+        /**
+         * SDN 네트워크의 서브넷을 바꾼다(`If-Match`로 리비전 확인): 서브넷 더하기, `dns_servers`·`pools`·`dhcp` 바꾸기, 쓰는
+         *     NIC가 없는 서브넷 빼기. 이미 있는 NIC에는 새 서브넷의 주소를 저절로 주지 않는다(`orbivisorctl network ips NAME
+         *     --fill`). 풀을 줄여도 이미 준 풀 밖 주소는 남는다. 단순 네트워크면 409 `network_immutable`, 서브넷 검증·`gateway`
+         *     바꾸기는 400 `invalid_subnet`, 빼는 서브넷의 주소를 쓰는 VM이 있으면 409 `subnet_in_use`, 옛 노드가 남았으면 409
+         *     `cluster_upgrading`.
+         */
+        patch: operations["patch_network"];
+        trace?: never;
+    };
+    "/networks/{key}/ips": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * SDN 네트워크의 주소: 서브넷마다 크기·사용·남음, NIC마다 VM·MAC·주소와 OVN 논리 포트의 `up`·바인딩 노드(API 노드가
+         *     NB·SB 팔로어에서도 읽는다 — 못 읽으면 `live` null과 `live_error`). 네트워크 읽기 권한. 단순 네트워크면 409
+         *     `network_immutable`.
+         */
+        get: operations["network_ips"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2025,6 +2055,100 @@ export interface paths {
         put?: never;
         /** 원격 상태를 곧 다시 모아 적고 돌려준다. */
         post: operations["refresh_remote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sdn": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * SDN(OVN)의 상태: 단계, 중앙과 각 중앙이 알린 Raft 역할·northd, 리더 OvnSync의 마지막 동기화, 위트니스가 아닌 노드마다의
+         *     chassis 상태, 끝나지 않은 SDN Task. 설정 전이면 `phase`가 없다.
+         */
+        get: operations["get_sdn"];
+        put?: never;
+        /**
+         * SDN(OVN)을 세운다: 노드 `node`에 OVN 꾸러미를 apt로 설치하고 NB·SB ovsdb Raft 클러스터와 northd를 Orbivisor 단위로
+         *     세우고 chassis로 구성하는 `sdn-init` Task(202). `address`는 NB·SB가 들을 주소(없으면 노드 주소의 IP, 노드 인증서의
+         *     이름 안이어야 한다). 실패했으면 같은 노드로 다시 부르면 이어서 하고, 첫 세우기 노드가 꺼졌거나 지워졌고 아직 중앙이
+         *     없으면 다른 노드로 옮겨 다시 한다. 노드가 없거나 위트니스·macOS·유지보수·underlay 없음·인증서 밖 주소면 400,
+         *     오프라인이면 409 `node_offline`, 옛 노드가 남았으면 409 `cluster_upgrading`, 이미 세웠거나 다른 노드에서 세우는 중이면
+         *     409 `sdn_exists`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
+         */
+        post: operations["init_sdn"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sdn/centrals": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드 `node`를 OVN 중앙으로 더하는 `sdn-central-add` Task(202): NB·SB Raft 클러스터에 합류하고 northd를 띄우고
+         *     chassis로 구성한다. 중앙은 5개까지(409 `sdn_limit`)이고 홀수(3·5)가 정족수를 가장 잘 지킨다(짝수가 되면 응답 헤더
+         *     `orbivisor-warning`). SDN이 준비되지 않았으면 409 `sdn_not_ready`, 이미 중앙이면 409 `sdn_exists`, 다른 중앙 Task가
+         *     끝나지 않았으면 409 `sdn_busy`, 노드 오류는 `POST /sdn`과 같다.
+         */
+        post: operations["add_central"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sdn/centrals/{node}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 노드 `node`를 OVN 중앙에서 빼는 `sdn-central-remove` Task(202): NB·SB Raft 클러스터를 떠나고 단위를 멈추고 DB 파일은
+         *     이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이
+         *     아니면 400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`,
+         *     다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
+         */
+        delete: operations["remove_central"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sdn/chassis": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 노드들(`nodes`, 또는 `all`이면 아직 준비된 chassis가 아닌 모든 온라인 Linux 노드)에 OVN chassis 꾸러미를 깔고 구성하는
+         *     `sdn-chassis-install` Task(노드마다 하나, 함께 돈다, 202). 새로 합류한 노드에 저절로 깔지 않는다. `all`이 건너뛴
+         *     오프라인 노드는 응답 헤더 `orbivisor-warning`으로 알린다. `nodes`와 `all`을 함께·둘 다 안 주면 400, SDN이 준비되지
+         *     않았으면 409 `sdn_not_ready`, 노드 오류는 `POST /sdn`과 같다(유지보수 노드도 된다).
+         */
+        post: operations["install_chassis"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4134,6 +4258,8 @@ export interface components {
             folder?: string;
             /** @description 새 VM의 hugepages(계획 64) */
             hugepages?: components["schemas"]["PageSize"];
+            /** @description NIC 순번별 SDN 주소(계획 65, 주소 체계마다 하나까지). 빈 목록은 서브넷에서 새로 받는다. */
+            ips?: string[][];
             /** Format: int32 */
             memory_mib?: number;
             /** @description NIC 순번별 새 네트워크 이름. null은 그대로다. */
@@ -4182,6 +4308,11 @@ export interface components {
             folder?: string;
             /** @description 새 VM의 hugepages(계획 64) */
             hugepages?: components["schemas"]["PageSize"];
+            /**
+             * @description NIC 순번별 SDN 주소(계획 65, 주소 체계마다 하나까지 — 예 `[[], ["10.10.0.5"]]`). 빈 목록은 서브넷에서 새로
+             *     받는다. 그 네트워크의 `network.assign`이 있어야 하고, 쓰이고 있으면 409 `ip_in_use`다.
+             */
+            ips?: string[][];
             /**
              * @description 연결 복제(계획 58, 템플릿에서만). 없으면 템플릿의 디스크 가운데 되는 것은 연결하고 안 되는 것은 전체 복사한다
              *     (Task 경고). `true`면 모두 연결하고(안 되면 400), `false`면 전체 복사다.
@@ -5788,6 +5919,8 @@ export interface components {
             folder?: string;
             /** @description hugepages(계획 64) */
             hugepages?: components["schemas"]["PageSize"];
+            /** @description 원본 NIC 순번별 SDN 주소(계획 65, 주소 체계마다 하나까지). 빈 목록은 서브넷에서 받는다. */
+            ips?: string[][];
             /**
              * @description 원본 MAC 주소를 그대로 쓴다. 끄면 새 MAC을 받는다.
              * @default true
@@ -5822,6 +5955,17 @@ export interface components {
          * @enum {string}
          */
         InterfaceKind: "ethernet" | "bond" | "bridge" | "vlan" | "dummy" | "veth" | "other";
+        /** @description NIC 하나의 주소 */
+        IpAllocation: {
+            ips: string[];
+            live?: components["schemas"]["PortLive"] | null;
+            mac?: string;
+            /** @description NIC 순번(0부터) */
+            nic: number;
+            /** Format: uuid */
+            vm: string;
+            vm_name: string;
+        };
         /** @description 주소를 얻는 방법 */
         IpConfig: {
             /** @enum {string} */
@@ -7373,6 +7517,23 @@ export interface components {
             /** @description 루트에 있는 객체(폴더 없음)의 권한 */
             root_contents: string[];
         };
+        /** @description `GET /networks/{key}/ips` */
+        NetworkIps: {
+            /** @description 템플릿이 아닌 VM의 이 네트워크 NIC마다(VM 이름, NIC 순) */
+            allocations: components["schemas"]["IpAllocation"][];
+            /** @description OVN을 읽지 못한 까닭(그때 `live`는 모두 null) */
+            live_error?: string;
+            network: string;
+            subnets: components["schemas"]["SubnetUsage"][];
+        };
+        /** @description `PATCH /networks/{key}`: SDN 네트워크의 서브넷 목록 전체(계획 65 §9) */
+        NetworkPatch: {
+            /**
+             * @description 새 서브넷 목록. 이미 있는 서브넷(같은 `cidr`)은 `gateway`를 바꿀 수 없고 `dns_servers`·`pools`·`dhcp`·
+             *     `description`을 바꾼다. 빠진 서브넷은 쓰는 NIC가 없어야 한다.
+             */
+            subnets: components["schemas"]["Subnet"][];
+        };
         /** @description `bridge`·`vxlan`·`sdn` 중 정확히 하나를 쓴다. */
         NetworkSpec: {
             /** @description 노드에 미리 만들어 둔 Linux 브리지 이름(예: `vmbr0`) */
@@ -8466,6 +8627,13 @@ export interface components {
              * @default 0
              */
             total_bytes: number;
+        };
+        /** @description OVN의 논리 포트 상태 */
+        PortLive: {
+            /** @description 바인딩한 노드(이름, 모르는 chassis면 그 이름). 바인딩 전이거나 SB를 읽지 못했으면 없다. */
+            node?: string;
+            /** @description 포트가 바인딩되어 흐름이 깔렸다(NB `up`). */
+            up: boolean;
         };
         /**
          * @description 본딩 포트의 상태
@@ -10140,8 +10308,98 @@ export interface components {
         };
         /** @enum {string} */
         ScheduleEvery: "hourly" | "daily" | "weekly";
+        /** @description 중앙 하나와 그 노드가 알린 Raft 역할 */
+        SdnCentralView: {
+            /** Format: ip */
+            address: string;
+            health?: components["schemas"]["CentralHealth"];
+            /** @description 노드 이름(노드가 없어졌으면 id) */
+            name: string;
+            /** Format: uuid */
+            node: string;
+        };
+        /** @description `POST /sdn/chassis`: `nodes`의 노드나(`all`이면) chassis가 아닌 모든 Linux 노드에 chassis를 설치한다. */
+        SdnChassisRequest: {
+            all?: boolean;
+            /** @description 이름이나 id */
+            nodes?: string[];
+        };
+        /** @description 노드 하나의 chassis 상태 */
+        SdnChassisView: {
+            name: string;
+            /** Format: uuid */
+            node: string;
+            sdn?: components["schemas"]["NodeSdn"];
+        };
+        /** @description `POST /sdn`: 노드 `node`에 첫 중앙을 세운다. */
+        SdnInitRequest: {
+            /**
+             * Format: ip
+             * @description NB·SB가 들을 주소. 없으면 노드 주소의 IP
+             */
+            address?: string;
+            /** @description 이름이나 id */
+            node: string;
+        };
         /** @description SDN(OVN) 네트워크. 지금은 칸이 없다(계획 66이 공급자 네트워크 `provider`를 더한다). */
         SdnNet: Record<string, never>;
+        /** @description `POST /sdn/centrals` */
+        SdnNodeRequest: {
+            /** @description 이름이나 id */
+            node: string;
+        };
+        /** @enum {string} */
+        SdnPhase: "bootstrapping" | "ready";
+        /** @description 리더 `OvnSync`가 NB에 쓴 마지막 기록 */
+        SdnSync: {
+            /**
+             * Format: int64
+             * @description 마지막으로 맞춘 시각(유닉스 초). 성공이 이어지면 60초 넘게 낡을 때만 바꾼다.
+             * @default 0
+             */
+            at: number;
+            /** @description 마지막 차례가 실패한 이유 */
+            error?: string;
+            /**
+             * Format: int64
+             * @description NB `NB_Global.hv_cfg`: 모든 chassis가 반영한 `nb_cfg`
+             * @default 0
+             */
+            hv_cfg: number;
+            /**
+             * Format: int64
+             * @description 읽은 Raft 로그 인덱스(펜싱 토큰의 뒤)
+             * @default 0
+             */
+            index: number;
+            /**
+             * Format: int64
+             * @description NB `NB_Global.nb_cfg`(쓸 때마다 1 올림)
+             * @default 0
+             */
+            nb_cfg: number;
+            /**
+             * Format: int64
+             * @description 쓴 리더의 Raft 임기(펜싱 토큰의 앞)
+             * @default 0
+             */
+            term: number;
+        };
+        /** @description `GET /sdn` */
+        SdnView: {
+            centrals: components["schemas"]["SdnCentralView"][];
+            /** @description 위트니스가 아닌 노드마다(이름 순)의 chassis 상태 */
+            chassis: components["schemas"]["SdnChassisView"][];
+            /** Format: uuid */
+            init_node?: string;
+            last_error?: string;
+            /** @description 없으면 SDN을 아직 설정하지 않았다(`sdn init` 전). */
+            phase?: components["schemas"]["SdnPhase"];
+            release?: string;
+            sync?: components["schemas"]["SdnSync"];
+            /** @description 끝나지 않은 SDN Task */
+            tasks: string[];
+        };
         /**
          * @description 둘째 단계 방법
          * @enum {string}
@@ -10528,6 +10786,25 @@ export interface components {
             gateway?: string;
             /** @description 자동 할당 범위(16개까지, 겹치지 않게). 없으면 CIDR 전체에서 예약을 뺀 것이다. */
             pools?: components["schemas"]["IpRange"][];
+        };
+        /** @description 서브넷 하나의 크기와 사용 */
+        SubnetUsage: {
+            cidr: string;
+            /**
+             * Format: int64
+             * @description 자동 할당 범위에서 남은 주소 수
+             */
+            free: number;
+            /**
+             * Format: int64
+             * @description 자동 할당 범위의 주소 수(예약 빼고, 아주 크면 u64 끝에서 멈춤)
+             */
+            size: number;
+            /**
+             * Format: int64
+             * @description 이 서브넷에서 NIC가 쓰는 주소 수(풀 밖 주소 포함)
+             */
+            used: number;
         };
         /** @description 읽을 때 계산한 구독 상태. 키 문자열은 담지 않는다. */
         SubscriptionInfo: {
@@ -14863,6 +15140,72 @@ export interface operations {
             };
         };
     };
+    patch_network: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NetworkPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_NetworkSpec_NetworkStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    network_ips: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NetworkIps"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_nodes: {
         parameters: {
             query?: never;
@@ -16416,6 +16759,162 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RemoteView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_sdn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SdnView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    init_sdn: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnInitRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_central: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnNodeRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    /** @description the central count becomes even (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_central: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description node id or name */
+                node: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    /** @description the central count becomes even (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    install_chassis: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnChassisRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    /** @description offline nodes `all` skipped (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"][];
                 };
             };
             "4XX": {

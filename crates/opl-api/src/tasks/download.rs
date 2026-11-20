@@ -213,6 +213,7 @@ async fn make_template(ctx: &Ctx, task: &Task, draft: &TemplateDraft) -> Result<
         Resource::new(draft.name.clone(), spec),
         None,
         false,
+        false,
         // 템플릿은 주소를 갖지 않는다.
         &mut Vec::new(),
     )

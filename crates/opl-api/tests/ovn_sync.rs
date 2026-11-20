@@ -369,3 +369,78 @@ async fn the_loop_follows_network_changes() {
     let txs = ovn.nb.with(|n| n.transacts.clone());
     assert!(txs.iter().any(|t| t[1]["op"] == "wait"));
 }
+
+/// 주소 목록(스테이지 6)은 API 노드가 NB의 `up`과 SB의 바인딩 chassis를 읽어 NIC마다 보인다.
+#[tokio::test]
+async fn the_ip_list_shows_live_port_state() {
+    let nb = FakeOvsdb::start(NB_DB).await;
+    let sb = FakeOvsdb::start(SB_DB).await;
+    let mut config = OvnSyncConfig::new(TAG, OvnTransport::Tcp);
+    config.nb_port = nb.addr().port();
+    config.sb_port = sb.addr().port();
+    config.timeout = Duration::from_secs(5);
+    let for_state = config.clone();
+    let env = Box::pin(Env::start_with_state(move |s| s.ovn = Some(for_state))).await;
+    let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+    sdn.status.phase = SdnPhase::Ready;
+    sdn.status.centrals = vec![SdnCentral {
+        node: env.node,
+        address: "127.0.0.1".parse().unwrap(),
+    }];
+    env.cluster.create(&sdn).await.unwrap();
+    let admin = env.admin().await;
+    let (status, body) = admin
+        .post(
+            "/networks",
+            json!({ "name": "tenant", "spec": { "sdn": {}, "subnets": [{ "cidr": "10.10.0.0/24" }] } }),
+        )
+        .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{body}");
+    let mut req = common::vm_request("a");
+    req["spec"]["nics"] = json!([{ "network": "tenant", "model": "virtio" }]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{vm}");
+    let mut s = OvnSyncer::new(env.cluster.clone(), config);
+    assert!(matches!(s.sync().await, SyncOutcome::Synced { .. }));
+    // 바인딩 전: up 거짓, 노드 없음
+    let (_, ips) = admin.get("/networks/tenant/ips").await;
+    assert_eq!(
+        ips["allocations"][0]["live"],
+        json!({ "up": false }),
+        "{ips}"
+    );
+    assert!(ips.get("live_error").is_none(), "{ips}");
+    // northd·ovn-controller가 한 것처럼
+    let port = nb.rows("Logical_Switch_Port")[0]["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    nb.with(|st| {
+        for row in st
+            .tables
+            .get_mut("Logical_Switch_Port")
+            .unwrap()
+            .values_mut()
+        {
+            row.insert("up".into(), json!(true));
+        }
+    });
+    sb.with(|st| {
+        let chassis = st.insert("Chassis", json!({ "name": env.node.to_string() }));
+        st.insert(
+            "Port_Binding",
+            json!({ "logical_port": port, "chassis": ["uuid", chassis] }),
+        );
+    });
+    let (_, ips) = admin.get("/networks/tenant/ips").await;
+    assert_eq!(
+        ips["allocations"][0]["live"],
+        json!({ "up": true, "node": "node1" }),
+        "{ips}"
+    );
+    // NB가 없으면 live는 null이고 까닭이 있다.
+    drop(nb);
+    let (_, ips) = admin.get("/networks/tenant/ips").await;
+    assert!(ips["allocations"][0]["live"].is_null(), "{ips}");
+    assert!(ips["live_error"].is_string(), "{ips}");
+}

@@ -696,7 +696,9 @@ fn check_pool_local(state: &AppState, pool: &StoragePool) -> Result<(), ApiError
     Ok(())
 }
 
-/// 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크. 이름 `user`는 예약되어 있다.
+/// 노드에 미리 만든 Linux 브리지를 가리키거나 orbivisord가 만드는 VXLAN 네트워크, 또는 OVN 논리 스위치인 SDN
+/// 네트워크(`sdn`, 서브넷 `subnets` — 계획 65). 이름 `user`와 브리지 `br-int`는 예약되어 있다. SDN 네트워크는 폴더의
+/// `network.config`로 만들고, SDN(OVN)이 세워지지 않았으면 409 `sdn_not_ready`, 서브넷 검증은 400 `invalid_subnet`.
 /// VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
 #[utoipa::path(post, path = "/networks", tag = "networks",
     request_body = CreateRequest<NetworkSpec>,
@@ -710,13 +712,9 @@ pub async fn create_network(
     if req.spec.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
     }
-    // SDN 네트워크와 서브넷(계획 65)은 옛 노드가 풀지 못한다(검증보다 먼저). OVN 설치·동기화가 들어오기 전(스테이지
-    // 6에서 열기 전)에는 받지 않는다.
+    // SDN 네트워크와 서브넷(계획 65)은 옛 노드가 풀지 못한다(검증보다 먼저).
     if req.spec.sdn.is_some() || !req.spec.subnets.is_empty() {
         require_feature(&state.cluster, opl_types::node::SDN)?;
-        return Err(ApiError::bad_request(
-            "SDN (OVN) networks are not available yet",
-        ));
     }
     state.authz.require_new(
         &principal,
@@ -734,9 +732,18 @@ pub async fn create_network(
             "network name {USER_NETWORK:?} is reserved for user-mode NAT"
         )));
     }
-    req.spec
-        .validate()
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    req.spec.validate().map_err(|e| {
+        let e2 = ApiError::bad_request(e.to_string());
+        if matches!(e, opl_types::network::NetworkError::Subnet(..)) {
+            e2.with_code("invalid_subnet")
+        } else {
+            e2
+        }
+    })?;
+    // SDN 네트워크는 OVN이 세워진 뒤에만(409 `sdn_not_ready` — 계획 65 §13)
+    if req.spec.is_sdn() {
+        crate::sdn::require_ready(&state.cluster)?;
+    }
     if let Some(vni) = req.spec.vni() {
         let (_, networks) = state.cluster.list::<NetworkSpec>()?;
         if let Some(other) = networks.iter().find(|n| n.spec.vni() == Some(vni)) {

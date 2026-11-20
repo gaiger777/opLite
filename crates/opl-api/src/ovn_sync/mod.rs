@@ -167,19 +167,7 @@ impl OvnSyncer {
             }
         };
         let want = nb::desired(&networks, &vms, &nodes, &self.config.tag);
-        let centrals: Vec<(std::net::IpAddr, Option<String>)> = sdn
-            .status
-            .centrals
-            .iter()
-            .map(|c| {
-                let host = nodes
-                    .iter()
-                    .find(|n| n.id == c.node)
-                    .and_then(|n| host_of(&n.spec.address))
-                    .map(String::from);
-                (c.address, host)
-            })
-            .collect();
+        let centrals = central_hosts(&sdn, &nodes);
         let old = sdn.status.sync.clone();
 
         let outcome = Box::pin(self.write_nb(&want, &centrals, term, index)).await;
@@ -236,7 +224,7 @@ impl OvnSyncer {
     }
 
     /// 중앙들의 `port` 주소. 서버 인증서는 중앙 주소 IP나 노드 주소의 호스트 이름 가운데 하나에 맞으면 된다.
-    fn endpoints(
+    pub(crate) fn endpoints(
         centrals: &[(std::net::IpAddr, Option<String>)],
         port: u16,
         prefer: Option<SocketAddr>,
@@ -585,3 +573,117 @@ async fn changed(watch: &mut Option<Watch>) {
 
 #[cfg(test)]
 mod tests;
+
+/// 중앙마다 (주소, 노드 주소의 호스트 이름) — 서버 인증서가 맞아야 할 이름들([`OvnSyncer::endpoints`])
+pub(crate) fn central_hosts(
+    sdn: &opl_types::sdn::Sdn,
+    nodes: &[Node],
+) -> Vec<(std::net::IpAddr, Option<String>)> {
+    sdn.status
+        .centrals
+        .iter()
+        .map(|c| {
+            let host = nodes
+                .iter()
+                .find(|n| n.id == c.node)
+                .and_then(|n| host_of(&n.spec.address))
+                .map(String::from);
+            (c.address, host)
+        })
+        .collect()
+}
+
+/// 논리 포트의 지금 상태(`GET /networks/{key}/ips`)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PortState {
+    /// NB `Logical_Switch_Port.up`(northd가 씀 — chassis가 포트를 바인딩했다)
+    pub up: bool,
+    /// SB `Port_Binding.chassis`의 이름(노드 UUID). SB를 읽지 못했으면 None
+    pub chassis: Option<String>,
+}
+
+/// API 노드가 우리 논리 포트(이름 → 상태)를 읽는다(설계 §9 보기). 읽기만 하므로 팔로어도 쓴다(`leader_only = false` —
+/// 조금 낡았을 수 있다). NB를 읽지 못하면 오류, SB(바인딩 chassis)를 읽지 못하면 chassis 없이 돌려준다.
+pub(crate) async fn read_ports(
+    config: &OvnSyncConfig,
+    centrals: &[(std::net::IpAddr, Option<String>)],
+) -> Result<std::collections::BTreeMap<String, PortState>, OvsdbError> {
+    let transport = match &config.transport {
+        OvnTransport::Tcp => Transport::Tcp,
+        OvnTransport::Tls { pki } => Transport::Tls(OvsdbTls::from_dir(pki)?),
+    };
+    let nb = OvsdbClient::connect_any(
+        &transport,
+        &OvnSyncer::endpoints(centrals, config.nb_port, None),
+        NB_DB,
+        false,
+        config.timeout,
+    )
+    .await?;
+    let ours = vec![cond(
+        "external_ids",
+        "includes",
+        opl_driver::ovn::ovsdb::map_value(&std::collections::BTreeMap::from([(
+            nb::CLUSTER_KEY.to_string(),
+            config.tag.clone(),
+        )])),
+    )];
+    let mut out = std::collections::BTreeMap::new();
+    for row in nb
+        .select(NB_DB, "Logical_Switch_Port", ours, &["name", "up"])
+        .await?
+    {
+        let Some(name) = row.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let up = row
+            .get("up")
+            .and_then(opl_driver::ovn::ovsdb::parse_bool)
+            .unwrap_or(false);
+        out.insert(name.to_string(), PortState { up, chassis: None });
+    }
+    match Box::pin(read_bindings(config, &transport, centrals)).await {
+        Ok(bindings) => {
+            for (port, state) in &mut out {
+                state.chassis = bindings.get(port).cloned();
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "cannot read the OVN port bindings"),
+    }
+    Ok(out)
+}
+
+/// SB의 논리 포트 → 바인딩한 chassis 이름
+async fn read_bindings(
+    config: &OvnSyncConfig,
+    transport: &Transport,
+    centrals: &[(std::net::IpAddr, Option<String>)],
+) -> Result<std::collections::BTreeMap<String, String>, OvsdbError> {
+    let sb = OvsdbClient::connect_any(
+        transport,
+        &OvnSyncer::endpoints(centrals, config.sb_port, None),
+        SB_DB,
+        false,
+        config.timeout,
+    )
+    .await?;
+    let chassis: std::collections::BTreeMap<String, String> = sb
+        .select(SB_DB, "Chassis", vec![], &["_uuid", "name"])
+        .await?
+        .into_iter()
+        .filter_map(|r| {
+            let uuid = parse_uuids(r.get("_uuid")?).into_iter().next()?;
+            Some((uuid, r.get("name")?.as_str()?.to_string()))
+        })
+        .collect();
+    Ok(sb
+        .select(SB_DB, "Port_Binding", vec![], &["logical_port", "chassis"])
+        .await?
+        .into_iter()
+        .filter_map(|r| {
+            let port = r.get("logical_port")?.as_str()?.to_string();
+            let uuid = parse_uuids(r.get("chassis")?).into_iter().next()?;
+            Some((port, chassis.get(&uuid)?.clone()))
+        })
+        .collect())
+}

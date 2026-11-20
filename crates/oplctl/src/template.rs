@@ -76,6 +76,10 @@ pub(crate) struct TemplateDeploy {
     /// NIC의 네트워크: `nicN=NETWORK`(`nicN=`이 없으면 준 순서대로 NIC 0, 1, …). NIC 수는 템플릿과 같다.
     #[arg(long = "network", value_name = "[nicN=]NETWORK", value_parser = parse_nic_network)]
     networks: Vec<(Option<usize>, String)>,
+    /// NIC의 SDN 주소 `[nicN=]A[+B]`(계획 65, `nicN=`이 없으면 준 순서대로 NIC 0, 1, …). 없는 NIC는 서브넷에서 받는다.
+    #[arg(long = "ip", value_name = "[nicN=]ADDRESS[+ADDRESS]", value_parser = crate::sdn::parse_nic_ips)]
+    ips: Vec<(Option<usize>, Vec<std::net::IpAddr>)>,
+
     /// 디스크의 새 크기(늘리기만): `diskN=SIZE`(`diskN=`이 없으면 준 순서대로). 단위 K, M, G, T.
     #[arg(long = "disk-size", value_name = "[diskN=]SIZE", value_parser = parse_disk_size)]
     disk_sizes: Vec<(Option<usize>, u64)>,
@@ -155,6 +159,13 @@ impl TemplateDeploy {
         if self.count < 2 {
             return Ok(());
         }
+        if !self.ips.is_empty() {
+            bail!(
+                "--ip cannot be used with --count {}: every VM would get the same address (without it each VM gets \
+                 its own from the subnet)",
+                self.count
+            );
+        }
         if self.cloud_init.ci_hostname.is_some() {
             bail!(
                 "--ci-hostname cannot be used with --count {}: every VM would get the same host name (without it the \
@@ -202,6 +213,9 @@ impl TemplateDeploy {
         }
         if !self.disk_sizes.is_empty() {
             body["disks"] = Value::Array(by_index(&self.disk_sizes));
+        }
+        if !self.ips.is_empty() {
+            body["ips"] = crate::sdn::ips_by_index(&self.ips);
         }
         if !cloud_init.is_null() {
             body["cloud_init"] = cloud_init.clone();

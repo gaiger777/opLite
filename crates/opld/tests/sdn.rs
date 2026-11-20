@@ -5,8 +5,8 @@
 //! 같은 호스트에 `ovsdb-server` 한 쌍을 127.0.0.2로 띄워 두 번째 중앙의 합류·떠나기를 실제 ovsdb로 보고, 에이전트가 멈춘
 //! 단위를 다시 켜고 장치 없는 OVS 포트를 지우는지, opld를 다시 띄워도 그대로인지 본다. 끝에 실제 출력(판, `cluster/status`,
 //! `ovs-vsctl` JSON)을 찍고 opl-driver 해석기로 읽는다(시험 고정물과 견주기). 리더 OvnSync(스테이지 3)와 IPAM·DHCP
-//! (스테이지 4 — 이름공간의 OVS 내부 포트가 busybox udhcpc로 IPAM 주소를 받고, 포트 보안이 위조 주소를 막는지)도 본다. Task는 제어 소켓의 시험 고리로 만든다(`/sdn`
-//! API는 스테이지 6). 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM tap이 br-int에 붙어 이 chassis에 바인딩되는지, 클라우드
+//! (스테이지 4 — 이름공간의 OVS 내부 포트가 busybox udhcpc로 IPAM 주소를 받고, 포트 보안이 위조 주소를 막는지)도 본다. Task와 SDN
+//! 네트워크는 `/sdn`·`/networks` API와 orbivisorctl로 만든다(스테이지 6). 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM tap이 br-int에 붙어 이 chassis에 바인딩되는지, 클라우드
 //! 이미지(`OPL_TEST_CLOUD_IMAGE`, 있으면)의 게스트가 OVN DHCP로 IPAM 주소를 받는지 본다. 러너 하나는 OVS 하나라 두 chassis
 //! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험).
 //! `sudo -E env "PATH=$PATH" cargo test -p opld --features sdn-it --test sdn -- --nocapture`
@@ -155,43 +155,43 @@ where
     }
 }
 
-/// 제어 소켓의 시험 고리(`POST /v1/test/…`)
-async fn hook(d: &Daemon, path: &str, body: Value) -> Value {
-    let http = reqwest::Client::builder()
-        .unix_socket(d.path("opld.sock"))
-        .timeout(Duration::from_secs(10))
-        .build()
-        .unwrap();
-    let resp = http
-        .post(format!("http://opld/v1/test/{path}"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(status.is_success(), "{path}: {status} {text}");
-    serde_json::from_str(&text).unwrap()
-}
-
-/// SDN Task를 만들고 끝날 때까지 기다린다.
-async fn sdn_task(d: &Daemon, op: Value, limit: Duration) -> Value {
-    let id = hook(d, "sdn-task", json!({ "op": op })).await["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+/// Task가 끝날 때까지 기다린다.
+async fn wait_task(d: &Daemon, task: &Value, limit: Duration) -> Value {
+    let id = task["id"].as_str().unwrap().to_string();
     let c = client(d);
     let deadline = Instant::now() + limit;
     loop {
         let task = c.get(&format!("/tasks/{id}")).await.unwrap();
         let state = task["status"]["state"].as_str().unwrap_or("pending");
         if state == "succeeded" || state == "failed" {
-            eprintln!("task {op}: {task}");
+            eprintln!("task {}: {task}", task["spec"]["op"]);
             return task;
         }
         assert!(Instant::now() < deadline, "task did not finish: {task}");
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// `GET /sdn`
+async fn sdn_view(d: &Daemon) -> Value {
+    client(d).get("/sdn").await.unwrap()
+}
+
+/// `orbivisorctl network create NAME --sdn ARGS…`로 SDN 네트워크를 만들고 id를 돌려준다.
+async fn sdn_network(d: &Daemon, name: &str, args: &[&str]) -> String {
+    let mut argv = vec!["network", "create", name, "--sdn"];
+    argv.extend_from_slice(args);
+    d.ctl(&argv).await.unwrap();
+    client(d).get(&format!("/networks/{name}")).await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// OVN DB 파일의 클러스터 id
+fn db_cid(db: &str) -> Option<uuid::Uuid> {
+    let out = run("ovsdb-tool", &["db-cid", db]);
+    out.trim().parse().ok()
 }
 
 /// `ovsdb-client`로 NB에 붙어 본다(성공, stderr).
@@ -288,23 +288,25 @@ async fn orbivisord_sets_up_ovn() {
     assert_eq!(me["status"]["underlay"], "127.0.0.1", "{me}");
 
     // 1. 첫 세우기: 실제 apt 설치와 Orbivisor 단위
-    let task = sdn_task(&d, json!({ "kind": "sdn-init" }), INSTALL_WAIT).await;
-    assert_eq!(task["status"]["state"], "succeeded", "{task}");
-    let sdn = hook(&d, "sdn", json!({})).await;
-    let status = &sdn["status"];
-    assert_eq!(status["phase"], "ready", "{sdn}");
-    assert_eq!(
-        status["centrals"],
-        json!([{ "node": node, "address": "127.0.0.1" }])
-    );
+    // 노드 인증서 밖의 주소는 API가 받지 않는다.
+    let err = client(&d)
+        .post("/sdn", &json!({ "node": "node1", "address": "192.0.2.9" }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not in the certificate"), "{err}");
+    d.ctl(&["sdn", "init", "node1"]).await.unwrap();
+    let status = sdn_view(&d).await;
+    assert_eq!(status["phase"], "ready", "{status}");
+    assert_eq!(status["centrals"][0]["node"], node.as_str(), "{status}");
+    assert_eq!(status["centrals"][0]["address"], "127.0.0.1", "{status}");
     let release = status["release"].as_str().unwrap();
     assert!(release.starts_with("24.03."), "{release}");
-    assert!(status.get("pending").is_none(), "{sdn}");
+    assert_eq!(status["tasks"], json!([]), "{status}");
     let known = KnownCids {
-        nb: status["nb_cid"].as_str().map(|s| s.parse().unwrap()),
-        sb: status["sb_cid"].as_str().map(|s| s.parse().unwrap()),
+        nb: db_cid("/var/lib/opl/ovn/nb.db"),
+        sb: db_cid("/var/lib/opl/ovn/sb.db"),
     };
-    assert!(known.nb.is_some() && known.sb.is_some(), "{sdn}");
+    assert!(known.nb.is_some() && known.sb.is_some(), "{status}");
 
     let dpkg = run(
         "dpkg-query",
@@ -518,20 +520,23 @@ async fn orbivisord_sets_up_ovn() {
         std::fs::metadata("/var/lib/opl/ovn/nb.db").unwrap().ino()
     };
     let created = inode();
-    let task = sdn_task(&d, json!({ "kind": "sdn-init" }), INSTALL_WAIT).await;
+    let c = client(&d);
+    let task = c.post("/sdn", &json!({ "node": "node1" })).await.unwrap();
+    let task = wait_task(&d, &task, INSTALL_WAIT).await;
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
     assert_eq!(inode(), created);
-    let task = sdn_task(&d, json!({ "kind": "sdn-chassis-install" }), INSTALL_WAIT).await;
-    assert_eq!(task["status"]["state"], "succeeded", "{task}");
-    let task = sdn_task(&d, json!({ "kind": "sdn-central-remove" }), AGENT_WAIT).await;
-    assert_eq!(task["status"]["state"], "failed");
-    assert!(
-        task["status"]["error"]
-            .as_str()
-            .unwrap()
-            .contains("last OVN central node"),
-        "{task}"
-    );
+    d.ctl(&["sdn", "chassis", "install", "node1"])
+        .await
+        .unwrap();
+    // 마지막 중앙은 API가 미리 거절한다(Task를 만들지 않는다).
+    let err = d
+        .ctl(&["sdn", "central", "remove", "node1"])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("last OVN central node"), "{err}");
+    let status = d.ctl(&["sdn", "status"]).await.unwrap();
+    eprintln!("{status}");
+    assert!(status.contains("node1"), "{status}");
 
     // 3. 두 번째 중앙(같은 호스트의 127.0.0.2): 실제 ovsdb로 합류·떠나기
     let root = tempfile::tempdir().unwrap();
@@ -710,11 +715,8 @@ async fn orbivisord_sets_up_ovn() {
     );
 
     // 5. 리더 OvnSync(스테이지 3): SDN 네트워크 → NB 논리 스위치, 펜싱 토큰, 되살리기, SB chassis 청소
-    let sync_of = |sdn: &Value| sdn["status"]["sync"].clone();
-    let net_a = hook(&d, "sdn-network", json!({ "name": "tenant-a" })).await["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let sync_of = |sdn: &Value| sdn["sync"].clone();
+    let net_a = sdn_network(&d, "tenant-a", &[]).await;
     let ls_a = format!("opl-{net_a}");
     wait_for("the logical switch of tenant-a", AGENT_WAIT, || async {
         has_switch(&nb_rows(&d, &tag).await, &ls_a)
@@ -726,10 +728,10 @@ async fn orbivisord_sets_up_ovn() {
     assert_eq!(sw.external_ids["orbivisor:id"], net_a);
     assert_eq!(sw.external_ids["orbivisor:name"], "tenant-a");
     wait_for("the sync record", AGENT_WAIT, || async {
-        sync_of(&hook(&d, "sdn", json!({})).await)["nb_cfg"].as_i64() >= Some(1)
+        sync_of(&sdn_view(&d).await)["nb_cfg"].as_i64() >= Some(1)
     })
     .await;
-    let sync = sync_of(&hook(&d, "sdn", json!({})).await);
+    let sync = sync_of(&sdn_view(&d).await);
     eprintln!("sync: {sync}");
     assert!(sync.get("error").is_none(), "{sync}");
     let term = sync["term"].as_u64().unwrap();
@@ -757,14 +759,11 @@ async fn orbivisord_sets_up_ovn() {
     assert!(e.is_wait_failed(), "{e}");
     assert!(!nbctl(&["ls-list"]).contains("stale-writer"));
     // 더 큰 임기의 토큰을 본 opld의 OvnSync도 쓰지 않는다.
-    let net_b = hook(&d, "sdn-network", json!({ "name": "tenant-b" })).await["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let net_b = sdn_network(&d, "tenant-b", &[]).await;
     let ls_b = format!("opl-{net_b}");
     tokio::time::sleep(Duration::from_secs(5)).await;
     assert!(!has_switch(&nb_rows(&d, &tag).await, &ls_b));
-    assert_eq!(sync_of(&hook(&d, "sdn", json!({})).await)["term"], term);
+    assert_eq!(sync_of(&sdn_view(&d).await)["term"], term);
     // 토큰을 이 리더의 임기로 되돌리고, 누가 우리 스위치를 지우고, 지운 노드의 chassis와 관리자 chassis를 SB에 둔다.
     // 다음 다시 맞추기(60초)가 모두 고친다.
     let now = nb_rows(&d, &tag).await;
@@ -796,12 +795,7 @@ async fn orbivisord_sets_up_ovn() {
     );
     assert!(nbctl(&["ls-list"]).contains("admin-ls"));
     // 네트워크를 지우면 스위치가 곧 사라진다(변경이 차례를 부른다).
-    hook(
-        &d,
-        "sdn-network",
-        json!({ "name": "tenant-b", "delete": true }),
-    )
-    .await;
+    d.ctl(&["network", "delete", "tenant-b"]).await.unwrap();
     wait_for("tenant-b's switch to go", AGENT_WAIT, || async {
         !has_switch(&nb_rows(&d, &tag).await, &ls_b)
     })
@@ -823,8 +817,7 @@ async fn orbivisord_sets_up_ovn() {
     );
     nbctl(&["ls-del", &ls_a]);
     d.start().await;
-    let sdn = hook(&d, "sdn", json!({})).await;
-    assert_eq!(sdn["status"]["phase"], "ready");
+    assert_eq!(sdn_view(&d).await["phase"], "ready");
     wait_for(
         "the restarted leader to restore tenant-a",
         AGENT_WAIT,
@@ -836,7 +829,7 @@ async fn orbivisord_sets_up_ovn() {
     let (new_term, _) = parse(&token);
     assert!(parse(&token) > parse(&before), "{token} after {before}");
     wait_for("the sync record of the new term", AGENT_WAIT, || async {
-        sync_of(&hook(&d, "sdn", json!({})).await)["term"].as_u64() == Some(new_term)
+        sync_of(&sdn_view(&d).await)["term"].as_u64() == Some(new_term)
     })
     .await;
     wait_for(
@@ -921,17 +914,7 @@ fn udhcpc(ns: &str, dev: &str, script: &std::path::Path, out: &std::path::Path) 
 }
 
 async fn dhcp_section(d: &Daemon, tag: &str) {
-    let net = hook(
-        d,
-        "sdn-network",
-        json!({ "name": "tenant-d", "subnets": [
-            { "cidr": "10.77.0.0/24", "dns_servers": ["10.77.0.53"] }
-        ] }),
-    )
-    .await["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let net = sdn_network(d, "tenant-d", &["--subnet", "10.77.0.0/24,dns=10.77.0.53"]).await;
     let c = client(d);
     let mut vms = Vec::new();
     for name in ["dhcp-a", "dhcp-b"] {
@@ -1035,6 +1018,28 @@ async fn dhcp_section(d: &Daemon, tag: &str) {
     in_a(&["addr", "flush", "dev", &dev_a]);
     in_a(&["addr", "add", &format!("{ip_a}/24"), "dev", &dev_a]);
     assert!(ping(&ns_a, &ip_b), "ping {ip_a} -> {ip_b} after restoring");
+    // 주소 목록(스테이지 6): API 노드가 NB·SB에서 포트의 up과 바인딩 노드를 읽는다.
+    wait_for("the IP list to show bound ports", AGENT_WAIT, || async {
+        let ips = c.get("/networks/tenant-d/ips").await.unwrap();
+        eprintln!("ips: {ips}");
+        ips["allocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|a| a["live"]["up"] == true && a["live"]["node"] == "node1")
+    })
+    .await;
+    let table = d.ctl(&["network", "ips", "tenant-d"]).await.unwrap();
+    assert!(
+        table.contains("dhcp-a") && table.contains("10.77.0.2"),
+        "{table}"
+    );
+    // 쓰는 서브넷은 뺄 수 없다.
+    let err = d
+        .ctl(&["network", "subnet", "remove", "tenant-d", "10.77.0.0/24"])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("dhcp-a"), "{err}");
 
     // VM을 지우면 그 포트가 사라진다(주소도 풀린다).
     c.delete(&format!("/vms/{}", vms[1].1)).await.unwrap();
@@ -1076,12 +1081,7 @@ fn iface_id_field(tap: &str, key: &str) -> String {
 }
 
 async fn binding_section(d: &Daemon, tag: &str, node: &str) {
-    hook(
-        d,
-        "sdn-network",
-        json!({ "name": "tenant-q", "subnets": [{ "cidr": "10.78.0.0/24" }] }),
-    )
-    .await;
+    sdn_network(d, "tenant-q", &["--subnet", "10.78.0.0/24"]).await;
     // 클라우드 이미지(CI `ovn` 작업이 받아 둔다)가 있으면 게스트 OS로 켜 DHCP까지 본다. 없으면 디스크 없는 VM(펌웨어만 돈다)으로
     // 바인딩만 본다.
     let image = std::env::var_os("OPL_TEST_CLOUD_IMAGE").map(PathBuf::from);
