@@ -350,6 +350,7 @@ async fn a_node_older_than_the_cluster_is_refused() {
     let mut witness: Resource<NodeSpec, NodeStatus> = Resource::new(
         "w",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,

@@ -1093,6 +1093,7 @@ async fn resize_only_grows_and_runs_where_the_volume_is_used() {
     let node: Node = Resource::new(
         "n2",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

@@ -1,9 +1,10 @@
 //! 인벤토리 폴더(계획 62). 종류마다(VM·네트워크·스토리지 풀) 따로 중첩 트리를 이루고, 권한(grant)이 아래로
-//! 전파되며, VM 폴더에는 할당량을 건다.
+//! 전파되며, VM 폴더와 네트워크 폴더(계획 66: 라우터·유동 IP 수)에는 할당량을 건다.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::quota::QuotaDimension;
 use crate::resource::{Kind, Resource, ResourceSpec};
 
 /// 폴더. 리소스 이름은 폴더 id 문자열이다(이름 표는 종류 전체에서 하나라서, 형제마다 같은 화면 이름 `prod`를
@@ -29,7 +30,7 @@ pub struct FolderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub parent: Option<Uuid>,
-    /// 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다.
+    /// 하위 트리 할당량. VM 폴더(VM 차원)와 네트워크 폴더(`routers`·`floating_ips`, 계획 66)에만 둔다. 없으면 상한이 없다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub quota: Option<FolderQuota>,
@@ -72,18 +73,33 @@ impl FolderKind {
     pub fn of(kind: Kind) -> Option<FolderKind> {
         match kind {
             Kind::Vm => Some(FolderKind::Vm),
-            Kind::Network => Some(FolderKind::Network),
+            Kind::Network | Kind::Router | Kind::FloatingIp => Some(FolderKind::Network),
             Kind::StoragePool => Some(FolderKind::Storage),
             _ => None,
         }
     }
 
-    /// 이 트리에 드는 리소스 종류
-    pub fn member_kind(self) -> Kind {
+    /// 이 트리에 드는 리소스 종류(앞이 트리의 주 종류). 네트워크 폴더에는 라우터·유동 IP도 든다(계획 66).
+    pub fn member_kinds(self) -> &'static [Kind] {
         match self {
-            FolderKind::Vm => Kind::Vm,
-            FolderKind::Network => Kind::Network,
-            FolderKind::Storage => Kind::StoragePool,
+            FolderKind::Vm => &[Kind::Vm],
+            FolderKind::Network => &[Kind::Network, Kind::Router, Kind::FloatingIp],
+            FolderKind::Storage => &[Kind::StoragePool],
+        }
+    }
+
+    /// 이 트리의 폴더에 걸 수 있는 할당량 차원
+    pub fn quota_dimensions(self) -> &'static [QuotaDimension] {
+        match self {
+            FolderKind::Vm => &[
+                QuotaDimension::Vcpus,
+                QuotaDimension::MemoryMib,
+                QuotaDimension::DiskBytes,
+                QuotaDimension::Vms,
+                QuotaDimension::DedicatedVcpus,
+            ],
+            FolderKind::Network => &[QuotaDimension::Routers, QuotaDimension::FloatingIps],
+            FolderKind::Storage => &[],
         }
     }
 }
@@ -111,6 +127,14 @@ pub struct FolderQuota {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub dedicated_vcpus: Option<u64>,
+    /// 라우터 수(계획 66, 네트워크 폴더만)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub routers: Option<u64>,
+    /// 유동 IP 수(계획 66, 네트워크 폴더만)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub floating_ips: Option<u64>,
 }
 
 impl FolderQuota {
@@ -132,6 +156,14 @@ pub struct FolderUsage {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub dedicated_vcpus: u64,
+    /// 라우터 수(계획 66). 0이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub routers: u64,
+    /// 유동 IP 수(계획 66). 0이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub floating_ips: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -144,8 +176,10 @@ pub enum FolderError {
         "invalid folder name {0:?}: use 1-64 characters without '/', control characters or surrounding spaces"
     )]
     BadName(String),
-    #[error("a quota can only be set on a vm folder")]
+    #[error("a quota can only be set on a vm or network folder")]
     QuotaOnNonVm,
+    #[error("quota {0} cannot be set on a {1} folder")]
+    QuotaDimension(QuotaDimension, &'static str),
     #[error("a folder cannot be its own parent")]
     OwnParent,
 }
@@ -154,8 +188,17 @@ impl FolderSpec {
     /// 스펙만으로 보는 검사. 부모가 있는지·종류가 같은지·순환·깊이는 상태 머신이 본다.
     pub fn validate(&self, id: Uuid) -> Result<(), FolderError> {
         validate_folder_name(&self.name)?;
-        if self.quota.is_some() && self.kind != FolderKind::Vm {
-            return Err(FolderError::QuotaOnNonVm);
+        if let Some(quota) = &self.quota {
+            let allowed = self.kind.quota_dimensions();
+            if allowed.is_empty() {
+                return Err(FolderError::QuotaOnNonVm);
+            }
+            if let Some(d) = QuotaDimension::ALL
+                .into_iter()
+                .find(|d| d.limit(quota).is_some() && !allowed.contains(d))
+            {
+                return Err(FolderError::QuotaDimension(d, self.kind.as_str()));
+            }
         }
         if self.parent == Some(id) {
             return Err(FolderError::OwnParent);
@@ -272,13 +315,47 @@ mod tests {
             vms: Some(1),
             ..FolderQuota::default()
         });
-        for kind in [FolderKind::Network, FolderKind::Storage] {
-            let f = FolderSpec {
-                quota,
-                ..spec("a", kind)
-            };
-            assert_eq!(f.validate(id), Err(FolderError::QuotaOnNonVm));
-        }
+        let f = FolderSpec {
+            quota,
+            ..spec("a", FolderKind::Storage)
+        };
+        assert_eq!(f.validate(id), Err(FolderError::QuotaOnNonVm));
+        // 계획 66: 네트워크 폴더에는 라우터·유동 IP 수만, VM 폴더에는 VM 차원만
+        let f = FolderSpec {
+            quota,
+            ..spec("a", FolderKind::Network)
+        };
+        assert_eq!(
+            f.validate(id),
+            Err(FolderError::QuotaDimension(QuotaDimension::Vms, "network"))
+        );
+        let net_quota = Some(FolderQuota {
+            routers: Some(2),
+            floating_ips: Some(5),
+            ..FolderQuota::default()
+        });
+        let f = FolderSpec {
+            quota: net_quota,
+            ..spec("a", FolderKind::Network)
+        };
+        assert_eq!(f.validate(id), Ok(()));
+        let f = FolderSpec {
+            quota: net_quota,
+            ..spec("a", FolderKind::Vm)
+        };
+        assert_eq!(
+            f.validate(id),
+            Err(FolderError::QuotaDimension(QuotaDimension::Routers, "vm"))
+        );
+        assert_eq!(
+            f.validate(id).unwrap_err().to_string(),
+            "quota routers cannot be set on a vm folder"
+        );
+        let f = FolderSpec {
+            quota: net_quota,
+            ..spec("a", FolderKind::Storage)
+        };
+        assert_eq!(f.validate(id), Err(FolderError::QuotaOnNonVm));
         let f = FolderSpec {
             parent: Some(id),
             ..spec("a", FolderKind::Vm)
@@ -304,8 +381,17 @@ mod tests {
     #[test]
     fn folder_kind_maps_resource_kinds() {
         for fk in FolderKind::ALL {
-            assert_eq!(FolderKind::of(fk.member_kind()), Some(fk));
+            for kind in fk.member_kinds() {
+                assert_eq!(FolderKind::of(*kind), Some(fk));
+            }
             assert_eq!(serde_json::to_value(fk).unwrap(), fk.as_str());
+        }
+        assert_eq!(FolderKind::Network.member_kinds()[0], Kind::Network);
+        // 폴더에 드는 종류는 모두 어느 트리의 member_kinds에 있다.
+        for kind in Kind::ALL {
+            if let Some(fk) = FolderKind::of(kind) {
+                assert!(fk.member_kinds().contains(&kind), "{kind:?}");
+            }
         }
         assert_eq!(FolderKind::of(Kind::Volume), None);
         assert_eq!(FolderKind::of(Kind::Folder), None);
@@ -332,5 +418,35 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(serde_json::to_string(&q).unwrap(), "{}");
         assert!(serde_json::from_str::<FolderQuota>(r#"{"cpus":1}"#).is_err());
+    }
+
+    /// 계획 66: 새 차원이 없으면 옛 할당량·사용량 JSON이 바이트까지 같고, 있으면 왕복한다.
+    #[test]
+    fn network_quota_fields_are_written_only_when_set() {
+        let old = r#"{"vcpus":32,"memory_mib":65536,"vms":20,"dedicated_vcpus":4}"#;
+        let q: FolderQuota = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&q).unwrap(), old);
+        let old = r#"{"vcpus":2,"memory_mib":1024,"disk_bytes":10,"vms":1}"#;
+        let u: FolderUsage = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&u).unwrap(), old);
+        let q = FolderQuota {
+            routers: Some(1),
+            floating_ips: Some(4),
+            ..FolderQuota::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(json, r#"{"routers":1,"floating_ips":4}"#);
+        assert_eq!(serde_json::from_str::<FolderQuota>(&json).unwrap(), q);
+        let u = FolderUsage {
+            routers: 1,
+            floating_ips: 2,
+            ..FolderUsage::default()
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(
+            json,
+            r#"{"vcpus":0,"memory_mib":0,"disk_bytes":0,"vms":0,"routers":1,"floating_ips":2}"#
+        );
+        assert_eq!(serde_json::from_str::<FolderUsage>(&json).unwrap(), u);
     }
 }

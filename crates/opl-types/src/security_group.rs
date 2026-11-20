@@ -93,6 +93,55 @@ pub enum Protocol {
     Icmpv6,
 }
 
+/// NIC 하나의 보안 그룹을 펼친 것(계획 66 §11): NIC의 그룹 순서 → 그룹 안 순서로 이은 규칙. 없는 그룹이 하나라도
+/// 있으면 찾은 그룹의 규칙 뒤에 나가기 막기를 더한다(들어오기는 원래 기본 막기). nftables(단순 NIC)와 OVN ACL(SDN NIC)이
+/// 같은 함수로 펼쳐 같은 뜻이 된다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NicPolicy {
+    /// 찾은 그룹의 id(NIC의 순서)
+    pub groups: Vec<uuid::Uuid>,
+    /// 찾지 못한 그룹 이름(NIC의 순서)
+    pub missing: Vec<String>,
+    pub rules: Vec<Rule>,
+}
+
+impl NicPolicy {
+    /// 같은 뜻의 NIC를 묶는 열쇠: 찾은 그룹 id(순서대로)와 없는 그룹 이름. 같은 열쇠면 같은 규칙이다.
+    pub fn key(&self) -> String {
+        let mut out: Vec<String> = self.groups.iter().map(|g| g.to_string()).collect();
+        out.extend(self.missing.iter().map(|m| format!("missing:{m}")));
+        out.join(",")
+    }
+}
+
+/// NIC의 그룹 이름 목록 `nic_groups`를 클러스터의 그룹 `groups`로 펼친다([`NicPolicy`]).
+pub fn nic_policy(nic_groups: &[String], groups: &[SecurityGroup]) -> NicPolicy {
+    let mut policy = NicPolicy {
+        groups: Vec::new(),
+        missing: Vec::new(),
+        rules: Vec::new(),
+    };
+    for name in nic_groups {
+        match groups.iter().find(|g| &g.name == name) {
+            Some(g) => {
+                policy.groups.push(g.id);
+                policy.rules.extend(g.spec.rules.iter().cloned());
+            }
+            None => policy.missing.push(name.clone()),
+        }
+    }
+    if !policy.missing.is_empty() {
+        policy.rules.push(Rule {
+            direction: Direction::Out,
+            action: Action::Drop,
+            protocol: None,
+            ports: None,
+            remote: None,
+        });
+    }
+    policy
+}
+
 impl SecurityGroupSpec {
     pub fn validate(&self) -> Result<(), SecurityGroupError> {
         if let Some(d) = &self.description
@@ -653,5 +702,43 @@ mod tests {
             SecurityGroupError::Rule(3, RuleError::PortsNeedTcpOrUdp).to_string(),
             "rule 3: ports can only be used with protocol tcp or udp"
         );
+    }
+
+    /// 계획 66: NIC의 그룹 순서 → 그룹 안 순서로 펼치고, 없는 그룹이 있으면 끝에 나가기 막기. 열쇠는 같은 뜻끼리 같다.
+    #[test]
+    fn nic_policy_expands_groups_in_nic_order() {
+        let ssh = rule(
+            json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22" }),
+        );
+        let web = rule(
+            json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "80" }),
+        );
+        let smtp =
+            rule(json!({ "direction": "out", "action": "drop", "protocol": "tcp", "ports": "25" }));
+        let out_drop = rule(json!({ "direction": "out", "action": "drop" }));
+        let groups = vec![
+            Resource::new("ssh", group(vec![ssh.clone()])),
+            Resource::new("web", group(vec![web.clone(), smtp.clone()])),
+        ];
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let p = nic_policy(&names(&["web", "ssh"]), &groups);
+        assert_eq!(p.groups, vec![groups[1].id, groups[0].id]);
+        assert!(p.missing.is_empty());
+        assert_eq!(p.rules, vec![web.clone(), smtp.clone(), ssh.clone()]);
+        let q = nic_policy(&names(&["ssh", "web"]), &groups);
+        assert_eq!(q.rules, vec![ssh.clone(), web.clone(), smtp.clone()]);
+        // 순서가 다르면 뜻이 다르다.
+        assert_ne!(p.key(), q.key());
+        assert_eq!(p.key(), nic_policy(&names(&["web", "ssh"]), &groups).key());
+        let g = nic_policy(&names(&["ssh", "gone", "web"]), &groups);
+        assert_eq!(g.missing, vec!["gone".to_string()]);
+        assert_eq!(g.rules, vec![ssh, web, smtp, out_drop.clone()]);
+        assert_eq!(
+            g.key(),
+            format!("{},{},missing:gone", groups[0].id, groups[1].id)
+        );
+        let none = nic_policy(&names(&["gone"]), &groups);
+        assert_eq!(none.rules, vec![out_drop]);
+        assert!(nic_policy(&[], &groups).rules.is_empty());
     }
 }

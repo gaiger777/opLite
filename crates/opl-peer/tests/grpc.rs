@@ -622,6 +622,7 @@ async fn leader_records_when_nodes_go_offline_and_come_back() {
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             format!("node-{i}"),
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: node.addr.clone(),
                 maintenance: false,
@@ -688,6 +689,7 @@ async fn new_leader_does_not_revive_nodes_recorded_offline() {
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             format!("node-{i}"),
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: node.addr.clone(),
                 maintenance: false,
@@ -771,6 +773,7 @@ async fn register_nodes(
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             format!("node-{i}"),
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: node.addr.clone(),
                 maintenance: false,
@@ -939,6 +942,7 @@ async fn a_leftover_record_of_a_removed_node_does_not_keep_pinging() {
     let gone: Resource<NodeSpec, NodeStatus> = Resource::new(
         "gone",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

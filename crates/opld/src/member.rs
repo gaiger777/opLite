@@ -2012,6 +2012,7 @@ mod tests {
             let mut node: Typed<NodeSpec> = Resource::new(
                 format!("n{n}"),
                 NodeSpec {
+                    sdn: None,
                     host_resources: None,
                     address: format!("h{n}:8006"),
                     maintenance: false,
@@ -2062,6 +2063,7 @@ mod tests {
             let mut node = Resource::new(
                 "n",
                 NodeSpec {
+                    sdn: None,
                     host_resources: None,
                     address: "h:8006".into(),
                     maintenance: false,
@@ -2102,6 +2104,7 @@ mod tests {
         let mut node: Typed<NodeSpec> = Resource::new(
             "n1",
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: "h:8006".into(),
                 maintenance: false,

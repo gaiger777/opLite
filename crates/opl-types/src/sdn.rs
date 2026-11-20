@@ -3,6 +3,7 @@
 //! 담는다. 노드마다의 chassis 상태는 [`NodeSdn`](`NodeStatus.sdn`)이다. 원하는 논리 스위치·포트는 네트워크·VM
 //! 리소스에 있고 NB는 그 파생물이다.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use serde::{Deserialize, Serialize};
@@ -40,7 +41,162 @@ pub fn port_name(vm: Uuid, mac: MacAddr) -> String {
     format!("opl-{vm}-{hex}")
 }
 
-/// 지금은 칸이 없다(계획 66이 게이트웨이 노드를 더한다).
+/// 라우터 하나의 게이트웨이 chassis 수 상한(계획 66 §9.3, `HA_Chassis` 행)
+pub const MAX_GATEWAYS: usize = 5;
+/// 가장 높은 `HA_Chassis.priority`(OVN 0~32767)
+pub const TOP_GATEWAY_PRIORITY: u16 = 32767;
+/// 노드 하나의 physnet 수 상한
+pub const MAX_PHYSNETS: usize = 8;
+/// 노드의 게이트웨이 우선순위 범위(관리자가 고름)
+pub const GATEWAY_PRIORITIES: std::ops::RangeInclusive<u16> = 1..=1000;
+
+/// SHA-256
+fn sha256(parts: &[&[u8]]) -> ring::digest::Digest {
+    let mut c = ring::digest::Context::new(&ring::digest::SHA256);
+    for p in parts {
+        c.update(p);
+    }
+    c.finish()
+}
+
+/// physnet 이름 규칙 `[a-z][a-z0-9-]{0,30}`(OVN `ovn-bridge-mappings`의 `:`·`,`가 들지 않는다)
+pub fn valid_physnet(name: &str) -> bool {
+    let b = name.as_bytes();
+    (1..=31).contains(&b.len())
+        && b[0].is_ascii_lowercase()
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// physnet 연결 장치 이름(계획 66 §7): `(OVS 쪽 veth, Linux 브리지 쪽 veth, OVS 브리지)` =
+/// `oplp<h8>o`·`oplp<h8>b`·`oplp<h8>x`(h8 = SHA-256(`<태그>/<physnet>`) 앞 8자 16진, 13자). 같은 클러스터·physnet은 노드마다
+/// 같은 이름이다. VXLAN 장치 `oplx<vni>`와 겹치지 않게 접두사를 `oplp`로 같이 쓴다.
+pub fn physnet_ifnames(tag: &str, physnet: &str) -> (String, String, String) {
+    let d = sha256(&[tag.as_bytes(), b"/", physnet.as_bytes()]);
+    let h8: String = d.as_ref()[..4].iter().map(|b| format!("{b:02x}")).collect();
+    (
+        format!("oplp{h8}o"),
+        format!("oplp{h8}b"),
+        format!("oplp{h8}x"),
+    )
+}
+
+/// [`physnet_ifnames`]의 이름 모양(`^oplp[0-9a-f]{8}[obx]$`)인지
+pub fn is_physnet_ifname(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("oplp") else {
+        return false;
+    };
+    let b = rest.as_bytes();
+    b.len() == 9
+        && b[..8]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c))
+        && matches!(b[8], b'o' | b'b' | b'x')
+}
+
+/// 라우터 `router`가 네트워크 `network`에 둔 포트의 MAC: `02:` + SHA-256(`router` ‖ 라우터 id ‖ 네트워크 id) 앞 5바이트.
+/// [`crate::ipam::server_mac`](네트워크 id만)과 입력 모양이 달라 겹치지 않는다. 리더가 바뀌어도 같다.
+pub fn router_mac(router: Uuid, network: Uuid) -> MacAddr {
+    let d = sha256(&[b"router", router.as_bytes(), network.as_bytes()]);
+    let d = d.as_ref();
+    MacAddr([0x02, d[0], d[1], d[2], d[3], d[4]])
+}
+
+/// 라우터 `router`의 게이트웨이 chassis 순위(계획 66 §9.3): 후보 `(노드, 관리자 우선순위)`를 관리자 우선순위 내림, 같으면
+/// HRW 해시 SHA-256(라우터 id ‖ 노드 id) 내림으로 세워 앞 [`MAX_GATEWAYS`]개에 `HA_Chassis.priority` 32767, 32766, …을
+/// 준다. 같은 우선순위의 노드에 라우터들이 고르게 흩어지고, 노드를 더하거나 빼도 그 노드가 이기거나 지던 라우터만
+/// 주인이 바뀐다.
+pub fn gateway_ranking(router: Uuid, candidates: &[(Uuid, u16)]) -> Vec<(Uuid, u16)> {
+    let mut ranked: Vec<(u16, [u8; 32], Uuid)> = candidates
+        .iter()
+        .map(|(node, priority)| {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(sha256(&[router.as_bytes(), node.as_bytes()]).as_ref());
+            (*priority, h, *node)
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.cmp(a));
+    ranked
+        .into_iter()
+        .take(MAX_GATEWAYS)
+        .zip((0..).map(|i: u16| TOP_GATEWAY_PRIORITY - i))
+        .map(|((_, _, node), priority)| (node, priority))
+        .collect()
+}
+
+/// 노드의 SDN 설정(`NodeSpec.sdn`, 계획 66 §7). 관리자가 노드 쓰기(`cluster.admin`)로 바꾼다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct NodeSdnConfig {
+    /// physnet 이름 → 이 노드의 Linux 브리지 이름(관리자가 만든 것, 8개까지). SDN 에이전트가 veth로 OVS 브리지를 잇는다.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub physnets: BTreeMap<String, String>,
+    /// 게이트웨이 노드 후보의 우선순위(1~1000, 클수록 먼저). 없으면 게이트웨이가 아니다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub gateway: Option<u16>,
+}
+
+impl NodeSdnConfig {
+    pub fn validate(&self) -> Result<(), NodeSdnError> {
+        if self.physnets.len() > MAX_PHYSNETS {
+            return Err(NodeSdnError::TooManyPhysnets);
+        }
+        for (physnet, bridge) in &self.physnets {
+            if !valid_physnet(physnet) {
+                return Err(NodeSdnError::BadPhysnet(physnet.clone()));
+            }
+            if !crate::network::valid_ifname(bridge)
+                || bridge == crate::network::OVN_BRIDGE
+                || crate::network::is_managed_ifname(bridge)
+            {
+                return Err(NodeSdnError::BadBridge(physnet.clone(), bridge.clone()));
+            }
+        }
+        if let Some(p) = self.gateway
+            && !GATEWAY_PRIORITIES.contains(&p)
+        {
+            return Err(NodeSdnError::BadGateway(p));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum NodeSdnError {
+    #[error("a node can have at most {MAX_PHYSNETS} physnets")]
+    TooManyPhysnets,
+    #[error(
+        "invalid physnet {0:?}: use 1-31 lowercase letters, digits and '-', starting with a letter"
+    )]
+    BadPhysnet(String),
+    #[error(
+        "physnet {0:?}: bridge {1:?} must be an existing Linux bridge name (1-15 characters), not br-int or an Orbivisor device"
+    )]
+    BadBridge(String, String),
+    #[error("invalid gateway priority {0}: use 1-1000")]
+    BadGateway(u16),
+}
+
+/// 노드의 physnet 연결 상태(`NodeSdn.physnets`, 계획 66 §7)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct PhysnetState {
+    pub name: String,
+    /// 이 노드의 Linux 브리지
+    pub bridge: String,
+    /// veth·OVS 브리지·`ovn-bridge-mappings`가 다 있다.
+    #[serde(default)]
+    pub ready: bool,
+    /// 준비되지 않은 까닭(브리지 없음, 매핑 충돌, 명령 실패)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
+}
+
+/// 지금은 칸이 없다(게이트웨이 노드는 `NodeSpec.sdn`에 둔다 — 계획 66).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SdnSpec {}
@@ -181,6 +337,21 @@ pub struct NodeSdn {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub error: Option<String>,
+    /// physnet 연결(계획 66, `NodeSpec.sdn.physnets`마다 이름 순). 비면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub physnets: Vec<PhysnetState>,
+    /// `ovn-cms-options`에 `enable-chassis-as-gw`를 적었다(계획 66). 거짓이면 쓰지 않는다.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub gateway: bool,
+}
+
+impl NodeSdn {
+    /// physnet `name`이 이 노드에서 준비됐다.
+    pub fn physnet_ready(&self, name: &str) -> bool {
+        self.physnets.iter().any(|p| p.name == name && p.ready)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -499,6 +670,8 @@ mod tests {
             json!({ "chassis": "missing" })
         );
         let full = NodeSdn {
+            physnets: Vec::new(),
+            gateway: false,
             chassis: ChassisState::Ready,
             ovn_version: Some("24.03.4".into()),
             ovs_version: Some("3.3.0".into()),
@@ -548,6 +721,7 @@ mod tests {
         let mut n = Resource::new(
             name,
             NodeSpec {
+                sdn: None,
                 address: format!("{name}:8006"),
                 maintenance: false,
                 witness,
@@ -677,5 +851,200 @@ mod tests {
         });
         let view = SdnView::new(Some(&sdn), &nodes, Vec::new());
         assert_eq!(view.strays.len(), 1);
+    }
+
+    /// 계획 66: 노드 상태의 physnet·게이트웨이는 비면 쓰지 않아 계획 65 JSON이 바이트 그대로다.
+    #[test]
+    fn node_sdn_routing_fields_are_written_only_when_set() {
+        let old = r#"{"chassis":"ready","ovn_version":"24.03.8","encap_ip":"10.0.0.2"}"#;
+        let s: NodeSdn = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&s).unwrap(), old);
+        let s = NodeSdn {
+            physnets: vec![
+                PhysnetState {
+                    name: "ext".into(),
+                    bridge: "vmbr1".into(),
+                    ready: true,
+                    error: None,
+                },
+                PhysnetState {
+                    name: "dmz".into(),
+                    bridge: "vmbr2".into(),
+                    ready: false,
+                    error: Some("bridge vmbr2 does not exist".into()),
+                },
+            ],
+            gateway: true,
+            ..s
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        assert_eq!(json["gateway"], true);
+        assert_eq!(
+            json["physnets"][0],
+            json!({ "name": "ext", "bridge": "vmbr1", "ready": true })
+        );
+        assert_eq!(serde_json::from_value::<NodeSdn>(json).unwrap(), s);
+        assert!(s.physnet_ready("ext"));
+        assert!(!s.physnet_ready("dmz"));
+        assert!(!s.physnet_ready("lan"));
+    }
+
+    #[test]
+    fn node_sdn_config_validates_and_round_trips() {
+        assert_eq!(
+            serde_json::to_string(&NodeSdnConfig::default()).unwrap(),
+            "{}"
+        );
+        let c: NodeSdnConfig = serde_json::from_value(json!({
+            "physnets": { "ext": "vmbr1", "dmz": "br-dmz" },
+            "gateway": 200
+        }))
+        .unwrap();
+        assert_eq!(c.validate(), Ok(()));
+        assert_eq!(
+            serde_json::to_value(&c).unwrap(),
+            json!({ "physnets": { "dmz": "br-dmz", "ext": "vmbr1" }, "gateway": 200 })
+        );
+        assert!(serde_json::from_value::<NodeSdnConfig>(json!({ "gw": 1 })).is_err());
+        let with = |physnets: &[(&str, &str)], gateway: Option<u16>| NodeSdnConfig {
+            physnets: physnets
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect(),
+            gateway,
+        };
+        assert_eq!(
+            with(&[("Ext", "vmbr1")], None).validate(),
+            Err(NodeSdnError::BadPhysnet("Ext".into()))
+        );
+        for bad in ["", "br-int", "oplv10", "a/b", "abcdefghijklmnop"] {
+            assert_eq!(
+                with(&[("ext", bad)], None).validate(),
+                Err(NodeSdnError::BadBridge("ext".into(), bad.into())),
+                "{bad}"
+            );
+        }
+        let (_, veth, _) = physnet_ifnames("0123456789ab", "ext");
+        assert!(with(&[("ext", &veth)], None).validate().is_err());
+        for (p, ok) in [(0, false), (1, true), (1000, true), (1001, false)] {
+            assert_eq!(with(&[], Some(p)).validate().is_ok(), ok, "{p}");
+        }
+        let many: Vec<(String, String)> =
+            (0..9).map(|i| (format!("p{i}"), "vmbr1".into())).collect();
+        let many: Vec<(&str, &str)> = many.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        assert_eq!(
+            with(&many, None).validate(),
+            Err(NodeSdnError::TooManyPhysnets)
+        );
+    }
+
+    #[test]
+    fn physnet_device_names() {
+        let (o, b, x) = physnet_ifnames("0123456789ab", "ext");
+        let h8 = &o[4..12];
+        assert_eq!((o.len(), b.len(), x.len()), (13, 13, 13));
+        assert_eq!(o, format!("oplp{h8}o"));
+        assert_eq!(b, format!("oplp{h8}b"));
+        assert_eq!(x, format!("oplp{h8}x"));
+        for n in [&o, &b, &x] {
+            assert!(is_physnet_ifname(n), "{n}");
+        }
+        // 노드마다 같고, 클러스터·physnet이 다르면 다르다.
+        assert_eq!(physnet_ifnames("0123456789ab", "ext"), (o.clone(), b, x));
+        assert_ne!(physnet_ifnames("0123456789ab", "dmz").0, o);
+        assert_ne!(physnet_ifnames("ba9876543210", "ext").0, o);
+        // VXLAN 장치(`oplx<vni>`)와 겹치지 않는다.
+        assert!(!is_physnet_ifname("oplx12345678"));
+        assert!(!is_physnet_ifname("oplp1234567o"));
+        assert!(!is_physnet_ifname("oplp12345678oo"));
+    }
+
+    #[test]
+    fn valid_physnet_names() {
+        for ok in ["ext", "a", "physnet-1", &"a".repeat(31)] {
+            assert!(valid_physnet(ok), "{ok}");
+        }
+        for bad in ["", "1a", "-a", "A", "a_b", "a:b", "a,b", &"a".repeat(32)] {
+            assert!(!valid_physnet(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn router_macs_are_stable_local_and_distinct() {
+        let (r1, r2, n1, n2) = (
+            Uuid::from_u128(1),
+            Uuid::from_u128(2),
+            Uuid::from_u128(11),
+            Uuid::from_u128(12),
+        );
+        let m = router_mac(r1, n1);
+        assert_eq!(m, router_mac(r1, n1));
+        assert_eq!(m.0[0], 0x02);
+        let all = [
+            m,
+            router_mac(r1, n2),
+            router_mac(r2, n1),
+            router_mac(r2, n2),
+        ];
+        let set: std::collections::BTreeSet<_> = all.iter().collect();
+        assert_eq!(set.len(), 4);
+        // DHCP 서버 MAC(네트워크 id만)과 겹치지 않는다.
+        assert_ne!(router_mac(r1, n1), crate::ipam::server_mac(n1));
+    }
+
+    #[test]
+    fn gateway_ranking_orders_by_priority_then_hash() {
+        let router = Uuid::from_u128(77);
+        let nodes: Vec<Uuid> = (1..=7).map(Uuid::from_u128).collect();
+        let candidates: Vec<(Uuid, u16)> = nodes.iter().map(|n| (*n, 100)).collect();
+        let ranked = gateway_ranking(router, &candidates);
+        assert_eq!(ranked.len(), MAX_GATEWAYS);
+        assert_eq!(
+            ranked.iter().map(|r| r.1).collect::<Vec<_>>(),
+            vec![32767, 32766, 32765, 32764, 32763]
+        );
+        // 같은 입력은 같은 답(순서와 상관없이)
+        let mut reversed = candidates.clone();
+        reversed.reverse();
+        assert_eq!(gateway_ranking(router, &reversed), ranked);
+        // 관리자 우선순위가 해시보다 먼저다.
+        let mut favoured = candidates.clone();
+        favoured[6].1 = 200;
+        assert_eq!(gateway_ranking(router, &favoured)[0], (nodes[6], 32767));
+        assert!(gateway_ranking(router, &[]).is_empty());
+        assert_eq!(
+            gateway_ranking(router, &[(nodes[0], 1)]),
+            vec![(nodes[0], 32767)]
+        );
+    }
+
+    /// HRW: 같은 우선순위의 노드 넷에 라우터 1000개가 고르게 흩어지고, 노드 하나를 더하면 그 노드가 이긴 라우터만
+    /// 주인이 바뀐다.
+    #[test]
+    fn gateway_ranking_spreads_routers_and_moves_few() {
+        let nodes: Vec<(Uuid, u16)> = (1..=4).map(|i| (Uuid::from_u128(i), 100)).collect();
+        let routers: Vec<Uuid> = (0..1000u128)
+            .map(|i| Uuid::from_u128(1_000_000 + i))
+            .collect();
+        let owner = |r: Uuid, c: &[(Uuid, u16)]| gateway_ranking(r, c)[0].0;
+        let mut count = std::collections::BTreeMap::new();
+        for r in &routers {
+            *count.entry(owner(*r, &nodes)).or_insert(0) += 1;
+        }
+        for (node, n) in &count {
+            assert!((150..=350).contains(n), "{node}: {n}");
+        }
+        let new = (Uuid::from_u128(5), 100);
+        let mut more = nodes.clone();
+        more.push(new);
+        let mut moved = 0;
+        for r in &routers {
+            let (before, after) = (owner(*r, &nodes), owner(*r, &more));
+            if before != after {
+                assert_eq!(after, new.0, "only the new node takes routers");
+                moved += 1;
+            }
+        }
+        assert!((100..=300).contains(&moved), "{moved}");
     }
 }

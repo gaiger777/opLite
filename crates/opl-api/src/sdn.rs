@@ -16,7 +16,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::ipam;
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, Subnet};
-use opl_types::node::{Node, NodeSpec, SDN};
+use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING};
 use opl_types::resource::{Kind, Resource};
 use opl_types::sdn::{
     MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest, SdnNodeRequest,
@@ -64,6 +64,21 @@ pub(crate) fn require_ready(cluster: &Cluster) -> Result<Sdn, ApiError> {
             "SDN (OVN) is not set up; run `orbivisorctl sdn init NODE` first",
         )),
     }
+}
+
+/// 계획 66 SDN 라우팅의 새 칸·종류(공급자 네트워크, 서브넷 `floating_pools`·`ipv6_mode`, 노드 `sdn`, 할당량
+/// `routers`·`floating_ips`, 라우터·유동 IP 옮기기)는 API 스테이지(계획 66 스테이지 5) 전까지 쓰지 않는다: 옛 노드가 남았으면
+/// 409 `cluster_upgrading`(검증보다 먼저 — 옛 노드는 이 칸을 풀지 못한다), 아니면 400. 스테이지 5가 지운다.
+pub(crate) fn routing_not_yet(cluster: &Cluster, what: &str) -> ApiError {
+    match require_feature(cluster, SDN_ROUTING) {
+        Err(e) => e,
+        Ok(()) => ApiError::bad_request(format!("{what} are not available yet (SDN routing)")),
+    }
+}
+
+/// 서브넷이 계획 66의 칸(`floating_pools`·`ipv6_mode`)을 쓴다.
+pub(crate) fn subnet_uses_routing(subnet: &Subnet) -> bool {
+    !subnet.floating_pools.is_empty() || subnet.ipv6_mode.is_some()
 }
 
 /// 요청 본문의 노드(이름이나 id). 없으면 400이다.
@@ -935,6 +950,12 @@ pub async fn patch_network(
     Json(req): Json<NetworkPatch>,
 ) -> Result<(HeaderMap, Json<Network>), ApiError> {
     require_feature(&state.cluster, SDN)?;
+    if req.subnets.iter().any(subnet_uses_routing) {
+        return Err(routing_not_yet(
+            &state.cluster,
+            "floating_pools and ipv6_mode",
+        ));
+    }
     let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
     if !network.spec.is_sdn() {
         return Err(ApiError::conflict(
@@ -1411,6 +1432,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n1",
             NodeSpec {
+                sdn: None,
                 address: "10.0.0.5:8006".into(),
                 maintenance: false,
                 witness: false,

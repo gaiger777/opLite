@@ -5359,8 +5359,18 @@ export interface components {
              * @description 붙은 볼륨의 가상 크기 합(바이트)
              */
             disk_bytes?: number;
+            /**
+             * Format: int64
+             * @description 유동 IP 수(계획 66, 네트워크 폴더만)
+             */
+            floating_ips?: number;
             /** Format: int64 */
             memory_mib?: number;
+            /**
+             * Format: int64
+             * @description 라우터 수(계획 66, 네트워크 폴더만)
+             */
+            routers?: number;
             /** Format: int64 */
             vcpus?: number;
             /**
@@ -5379,7 +5389,7 @@ export interface components {
              * @description 부모 폴더. 없으면 그 종류의 루트 바로 아래다. 부모는 같은 종류여야 한다.
              */
             parent?: string;
-            /** @description 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다. */
+            /** @description 하위 트리 할당량. VM 폴더(VM 차원)와 네트워크 폴더(`routers`·`floating_ips`, 계획 66)에만 둔다. 없으면 상한이 없다. */
             quota?: components["schemas"]["FolderQuota"];
         };
         FolderStatus: Record<string, never>;
@@ -5392,8 +5402,18 @@ export interface components {
             dedicated_vcpus?: number;
             /** Format: int64 */
             disk_bytes: number;
+            /**
+             * Format: int64
+             * @description 유동 IP 수(계획 66). 0이면 쓰지 않는다.
+             */
+            floating_ips?: number;
             /** Format: int64 */
             memory_mib: number;
+            /**
+             * Format: int64
+             * @description 라우터 수(계획 66). 0이면 쓰지 않는다.
+             */
+            routers?: number;
             /** Format: int64 */
             vcpus: number;
             /** Format: int64 */
@@ -6029,6 +6049,11 @@ export interface components {
             port: number;
             user: string;
         };
+        /**
+         * @description IPv6 서브넷의 주소 알리기(계획 66 §10). 라우터 인터페이스인 네트워크에서는 라우터 포트가 RA로 알린다.
+         * @enum {string}
+         */
+        Ipv6Mode: "slaac" | "dhcpv6-stateful" | "dhcpv6-stateless";
         /** @description 노드가 로그인할 iSCSI 타깃 */
         IscsiTarget: {
             /** @description `호스트[:포트]` 또는 `[IPv6][:포트]` */
@@ -6150,7 +6175,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip";
         /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
         LdapRealm: {
             /** @description 사용자를 찾을 기준 DN(subtree) */
@@ -6514,7 +6539,7 @@ export interface components {
                      * @description 부모 폴더. 없으면 그 종류의 루트 바로 아래다. 부모는 같은 종류여야 한다.
                      */
                     parent?: string;
-                    /** @description 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다. */
+                    /** @description 하위 트리 할당량. VM 폴더(VM 차원)와 네트워크 폴더(`routers`·`floating_ips`, 계획 66)에만 둔다. 없으면 상한이 없다. */
                     quota?: components["schemas"]["FolderQuota"];
                 };
                 status: Record<string, never>;
@@ -6725,6 +6750,8 @@ export interface components {
                      *     쓰지 않는다.
                      */
                     roles?: components["schemas"]["NodeRole"][];
+                    /** @description SDN physnet 연결과 게이트웨이 노드(계획 66 §7). 없으면 쓰지 않아 옛 노드도 푼다. */
+                    sdn?: components["schemas"]["NodeSdnConfig"];
                     /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                     witness?: boolean;
                 };
@@ -7855,10 +7882,26 @@ export interface components {
              */
             encap_ip?: string;
             error?: string;
+            /** @description `ovn-cms-options`에 `enable-chassis-as-gw`를 적었다(계획 66). 거짓이면 쓰지 않는다. */
+            gateway?: boolean;
             /** @description `ovn-controller --version`의 판 */
             ovn_version?: string;
             /** @description `ovs-vsctl --version`의 판 */
             ovs_version?: string;
+            /** @description physnet 연결(계획 66, `NodeSpec.sdn.physnets`마다 이름 순). 비면 쓰지 않는다. */
+            physnets?: components["schemas"]["PhysnetState"][];
+        };
+        /** @description 노드의 SDN 설정(`NodeSpec.sdn`, 계획 66 §7). 관리자가 노드 쓰기(`cluster.admin`)로 바꾼다. */
+        NodeSdnConfig: {
+            /**
+             * Format: int32
+             * @description 게이트웨이 노드 후보의 우선순위(1~1000, 클수록 먼저). 없으면 게이트웨이가 아니다.
+             */
+            gateway?: number;
+            /** @description physnet 이름 → 이 노드의 Linux 브리지 이름(관리자가 만든 것, 8개까지). SDN 에이전트가 veth로 OVS 브리지를 잇는다. */
+            physnets?: {
+                [key: string]: string;
+            };
         };
         /** @description 한 노드의 점들(시각 순) */
         NodeSeries: {
@@ -7889,6 +7932,8 @@ export interface components {
              *     쓰지 않는다.
              */
             roles?: components["schemas"]["NodeRole"][];
+            /** @description SDN physnet 연결과 게이트웨이 노드(계획 66 §7). 없으면 쓰지 않아 옛 노드도 푼다. */
+            sdn?: components["schemas"]["NodeSdnConfig"];
             /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
             witness?: boolean;
         };
@@ -8386,6 +8431,16 @@ export interface components {
              */
             total: number;
         };
+        /** @description 노드의 physnet 연결 상태(`NodeSdn.physnets`, 계획 66 §7) */
+        PhysnetState: {
+            /** @description 이 노드의 Linux 브리지 */
+            bridge: string;
+            /** @description 준비되지 않은 까닭(브리지 없음, 매핑 충돌, 명령 실패) */
+            error?: string;
+            name: string;
+            /** @description veth·OVS 브리지·`ovn-bridge-mappings`가 다 있다. */
+            ready?: boolean;
+        };
         /** @description 아키텍처 하나의 고정 기준 */
         PinnedBaseline: {
             arch: components["schemas"]["Arch"];
@@ -8696,6 +8751,16 @@ export interface components {
         };
         /** @enum {string} */
         Protocol: "tcp" | "udp" | "icmp" | "icmpv6";
+        /** @description 공급자 네트워크가 붙는 물리 망(계획 66 §8) */
+        Provider: {
+            /** @description 물리 망 이름(`[a-z][a-z0-9-]{0,30}`). 노드마다 `NodeSpec.sdn.physnets`가 이 이름을 그 노드의 Linux 브리지에 잇는다. */
+            physnet: string;
+            /**
+             * Format: int32
+             * @description VLAN 태그(1~4094). 없으면 flat(태그 없는 프레임)이다.
+             */
+            vlan?: number;
+        };
         /** @description 할당량 있는 폴더 하나의 상한과 하위 트리 사용량 */
         QuotaLimit: {
             /** Format: uuid */
@@ -9360,7 +9425,7 @@ export interface components {
                  * @description 부모 폴더. 없으면 그 종류의 루트 바로 아래다. 부모는 같은 종류여야 한다.
                  */
                 parent?: string;
-                /** @description 하위 트리 할당량. VM 폴더에만 둔다. 없으면 상한이 없다. */
+                /** @description 하위 트리 할당량. VM 폴더(VM 차원)와 네트워크 폴더(`routers`·`floating_ips`, 계획 66)에만 둔다. 없으면 상한이 없다. */
                 quota?: components["schemas"]["FolderQuota"];
             };
             status: Record<string, never>;
@@ -9547,6 +9612,8 @@ export interface components {
                  *     쓰지 않는다.
                  */
                 roles?: components["schemas"]["NodeRole"][];
+                /** @description SDN physnet 연결과 게이트웨이 노드(계획 66 §7). 없으면 쓰지 않아 옛 노드도 푼다. */
+                sdn?: components["schemas"]["NodeSdnConfig"];
                 /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                 witness?: boolean;
             };
@@ -10354,8 +10421,11 @@ export interface components {
             /** @description 이름이나 id */
             node: string;
         };
-        /** @description SDN(OVN) 네트워크. 지금은 칸이 없다(계획 66이 공급자 네트워크 `provider`를 더한다). */
-        SdnNet: Record<string, never>;
+        /** @description SDN(OVN) 네트워크. 칸이 없으면 오버레이(Geneve) 네트워크다. */
+        SdnNet: {
+            /** @description 공급자(외부) 네트워크(계획 66): 노드의 물리 망(physnet)에 붙는 OVN `localnet` 네트워크. 없으면 쓰지 않는다. */
+            provider?: components["schemas"]["Provider"];
+        };
         /** @description `POST /sdn/centrals` */
         SdnNodeRequest: {
             /** @description 이름이나 id */
@@ -10806,10 +10876,17 @@ export interface components {
             /** @description DHCP·cloud-init이 알려 줄 DNS 서버(4개까지) */
             dns_servers?: string[];
             /**
+             * @description 라우터 외부 주소와 유동 IP를 고르는 범위(계획 66, 공급자 네트워크의 IPv4 서브넷만, 16개까지, `pools`·게이트웨이와
+             *     겹치지 않게). 없으면 `pools`에서 고른다.
+             */
+            floating_pools?: components["schemas"]["IpRange"][];
+            /**
              * Format: ip
              * @description 게이트웨이 주소. 없으면 첫 호스트 주소다. 라우터가 없어도 늘 예약해 VM에 주지 않는다.
              */
             gateway?: string;
+            /** @description IPv6 주소 알리기(계획 66, IPv6 서브넷만). 없으면 cloud-init 고정 주소다. */
+            ipv6_mode?: components["schemas"]["Ipv6Mode"];
             /** @description 자동 할당 범위(16개까지, 겹치지 않게). 없으면 CIDR 전체에서 예약을 뺀 것이다. */
             pools?: components["schemas"]["IpRange"][];
         };
@@ -11496,6 +11573,8 @@ export interface components {
                  *     쓰지 않는다.
                  */
                 roles?: components["schemas"]["NodeRole"][];
+                /** @description SDN physnet 연결과 게이트웨이 노드(계획 66 §7). 없으면 쓰지 않아 옛 노드도 푼다. */
+                sdn?: components["schemas"]["NodeSdnConfig"];
                 /** @description 위트니스 노드: Raft 투표만 하고 VM을 돌리지 않는다. 합류할 때 정해지고 바뀌지 않는다. */
                 witness?: boolean;
             };

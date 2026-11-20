@@ -32,6 +32,7 @@ async fn add_node(env: &Env, name: &str, edit: impl FnOnce(&mut Node)) -> Uuid {
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,

@@ -1119,6 +1119,7 @@ async fn with_an_old_node_ha_vm_crashes_follow_the_restart_policy() {
     let old: Node = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

@@ -1367,6 +1367,7 @@ mod tests {
         let mut node = Resource::new(
             format!("n{n}"),
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: format!("node-{n}:8006"),
                 maintenance: false,

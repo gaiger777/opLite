@@ -352,6 +352,7 @@ async fn vips_wait_until_every_node_knows_them() {
     let mut old = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

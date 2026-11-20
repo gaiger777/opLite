@@ -431,6 +431,7 @@ impl Keepers {
                 let mut node = Resource::new(
                     format!("n{i}"),
                     NodeSpec {
+                        sdn: None,
                         host_resources: None,
                         address: format!("node-{i}:8006"),
                         maintenance: false,

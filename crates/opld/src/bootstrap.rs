@@ -117,6 +117,7 @@ async fn ensure_node(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
             let mut node = Resource::new(
                 config.name.clone(),
                 NodeSpec {
+                    sdn: None,
                     host_resources: None,
                     address,
                     maintenance: false,
@@ -923,7 +924,8 @@ pub(crate) mod tests {
                 "two-factor",
                 "cpu-models",
                 "numa",
-                "sdn"
+                "sdn",
+                "sdn-routing"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -967,7 +969,8 @@ pub(crate) mod tests {
                 "two-factor",
                 "cpu-models",
                 "numa",
-                "sdn"
+                "sdn",
+                "sdn-routing"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1030,7 +1033,8 @@ pub(crate) mod tests {
                 "two-factor",
                 "cpu-models",
                 "numa",
-                "sdn"
+                "sdn",
+                "sdn-routing"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1268,6 +1272,7 @@ pub(crate) mod tests {
                     "cpu-models".into(),
                     "numa".into(),
                     "sdn".into(),
+                    "sdn-routing".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

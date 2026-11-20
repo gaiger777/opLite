@@ -78,11 +78,55 @@ pub struct Vxlan {
     pub vni: u32,
 }
 
-/// SDN(OVN) 네트워크. 지금은 칸이 없다(계획 66이 공급자 네트워크 `provider`를 더한다).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// SDN(OVN) 네트워크. 칸이 없으면 오버레이(Geneve) 네트워크다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(deny_unknown_fields)]
-pub struct SdnNet {}
+pub struct SdnNet {
+    /// 공급자(외부) 네트워크(계획 66): 노드의 물리 망(physnet)에 붙는 OVN `localnet` 네트워크. 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub provider: Option<Provider>,
+}
+
+/// 공급자 네트워크가 붙는 물리 망(계획 66 §8)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct Provider {
+    /// 물리 망 이름(`[a-z][a-z0-9-]{0,30}`). 노드마다 `NodeSpec.sdn.physnets`가 이 이름을 그 노드의 Linux 브리지에 잇는다.
+    pub physnet: String,
+    /// VLAN 태그(1~4094). 없으면 flat(태그 없는 프레임)이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub vlan: Option<u16>,
+}
+
+/// 공급자 네트워크의 기본 MTU(물리 망)
+pub const DEFAULT_PROVIDER_MTU: u16 = 1500;
+
+/// 서브넷 하나의 유동 IP 풀 수 상한
+pub const MAX_FLOATING_POOLS: usize = 16;
+
+/// IPv6 서브넷의 주소 알리기(계획 66 §10). 라우터 인터페이스인 네트워크에서는 라우터 포트가 RA로 알린다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum Ipv6Mode {
+    /// RA의 접두사로 게스트가 주소를 만든다(IPAM은 EUI-64, `/64`만).
+    Slaac,
+    /// DHCPv6가 주소를 준다(IPAM은 풀에서).
+    Dhcpv6Stateful,
+    /// 주소는 SLAAC(EUI-64, `/64`만), 나머지(DNS)는 DHCPv6
+    Dhcpv6Stateless,
+}
+
+impl Ipv6Mode {
+    /// 주소를 게스트가 MAC에서 만든다(EUI-64).
+    pub fn is_slaac(self) -> bool {
+        matches!(self, Ipv6Mode::Slaac | Ipv6Mode::Dhcpv6Stateless)
+    }
+}
 
 /// SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,6 +155,15 @@ pub struct Subnet {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub pools: Vec<IpRange>,
+    /// 라우터 외부 주소와 유동 IP를 고르는 범위(계획 66, 공급자 네트워크의 IPv4 서브넷만, 16개까지, `pools`·게이트웨이와
+    /// 겹치지 않게). 없으면 `pools`에서 고른다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub floating_pools: Vec<IpRange>,
+    /// IPv6 주소 알리기(계획 66, IPv6 서브넷만). 없으면 cloud-init 고정 주소다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub ipv6_mode: Option<Ipv6Mode>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub description: String,
@@ -174,24 +227,9 @@ impl Subnet {
         if self.pools.len() > MAX_POOLS {
             return Err(SubnetError::TooManyPools);
         }
-        let gateway = self.gateway();
-        let (first, last) = ipam::span(&self.cidr);
         let bits = |ip: IpAddr| crate::security_group::Cidr::bits(ip);
         for pool in &self.pools {
-            let inside = |ip: IpAddr| ip.is_ipv4() == self.is_ipv4() && self.cidr.contains(ip);
-            if !inside(pool.start) || !inside(pool.end) {
-                return Err(SubnetError::PoolOutside(*pool));
-            }
-            let (start, end) = (bits(pool.start), bits(pool.end));
-            if start > end {
-                return Err(SubnetError::PoolReversed(*pool));
-            }
-            if start == first || (self.is_ipv4() && end == last) {
-                return Err(SubnetError::PoolReserved(*pool));
-            }
-            if (start..=end).contains(&bits(gateway)) {
-                return Err(SubnetError::GatewayInPool(*pool, gateway));
-            }
+            self.check_range(pool)?;
         }
         let mut pools = self.pools.clone();
         pools.sort_by_key(|p| bits(p.start));
@@ -200,8 +238,56 @@ impl Subnet {
                 return Err(SubnetError::PoolsOverlap(pair[0], pair[1]));
             }
         }
+        if !self.floating_pools.is_empty() && !self.is_ipv4() {
+            return Err(SubnetError::FloatingPoolsOnIpv6);
+        }
+        if self.floating_pools.len() > MAX_FLOATING_POOLS {
+            return Err(SubnetError::TooManyFloatingPools);
+        }
+        for pool in &self.floating_pools {
+            self.check_range(pool)?;
+        }
+        // 유동 IP 풀끼리, 유동 IP 풀과 할당 풀은 겹치지 않는다(같은 주소를 두 쓰임이 고르지 않게).
+        for (i, a) in self.floating_pools.iter().enumerate() {
+            let others = self.floating_pools[i + 1..].iter().chain(&self.pools);
+            for b in others {
+                if bits(a.start) <= bits(b.end) && bits(b.start) <= bits(a.end) {
+                    return Err(SubnetError::FloatingPoolOverlap(*a, *b));
+                }
+            }
+        }
+        if let Some(mode) = self.ipv6_mode {
+            if self.is_ipv4() {
+                return Err(SubnetError::Ipv6ModeOnIpv4);
+            }
+            if mode.is_slaac() && prefix != 64 {
+                return Err(SubnetError::SlaacNeeds64(prefix));
+            }
+        }
         if self.description.chars().count() > MAX_SUBNET_DESCRIPTION {
             return Err(SubnetError::LongDescription);
+        }
+        Ok(())
+    }
+
+    /// 할당 범위 하나(풀·유동 IP 풀): 서브넷 안 같은 체계, 시작 ≤ 끝, 망 주소·브로드캐스트와 게이트웨이를 품지 않음
+    fn check_range(&self, pool: &IpRange) -> Result<(), SubnetError> {
+        let bits = |ip: IpAddr| crate::security_group::Cidr::bits(ip);
+        let gateway = self.gateway();
+        let (first, last) = ipam::span(&self.cidr);
+        let inside = |ip: IpAddr| ip.is_ipv4() == self.is_ipv4() && self.cidr.contains(ip);
+        if !inside(pool.start) || !inside(pool.end) {
+            return Err(SubnetError::PoolOutside(*pool));
+        }
+        let (start, end) = (bits(pool.start), bits(pool.end));
+        if start > end {
+            return Err(SubnetError::PoolReversed(*pool));
+        }
+        if start == first || (self.is_ipv4() && end == last) {
+            return Err(SubnetError::PoolReserved(*pool));
+        }
+        if (start..=end).contains(&bits(gateway)) {
+            return Err(SubnetError::GatewayInPool(*pool, gateway));
         }
         Ok(())
     }
@@ -252,9 +338,12 @@ impl NetworkSpec {
                     return Err(NetworkError::BadMtu(mtu));
                 }
             }
-            (None, None, Some(_)) => {
+            (None, None, Some(sdn)) => {
                 if self.vlan.is_some() {
                     return Err(NetworkError::VlanWithSdn);
+                }
+                if let Some(provider) = &sdn.provider {
+                    provider.validate()?;
                 }
                 if let Some(mtu) = self.mtu
                     && !(1280..=9000).contains(&mtu)
@@ -272,6 +361,12 @@ impl NetworkSpec {
             subnet
                 .validate()
                 .map_err(|e| NetworkError::Subnet(i + 1, e))?;
+            if !subnet.floating_pools.is_empty() && !self.is_provider() {
+                return Err(NetworkError::Subnet(
+                    i + 1,
+                    SubnetError::FloatingPoolsWithoutProvider,
+                ));
+            }
             if !families.insert(subnet.is_ipv4()) {
                 return Err(NetworkError::DuplicateFamily);
             }
@@ -284,6 +379,29 @@ impl NetworkSpec {
         self.sdn.is_some()
     }
 
+    /// 공급자(외부) SDN 네트워크인지(계획 66)
+    pub fn is_provider(&self) -> bool {
+        self.provider().is_some()
+    }
+
+    /// 공급자 네트워크의 물리 망
+    pub fn provider(&self) -> Option<&Provider> {
+        self.sdn.as_ref().and_then(|s| s.provider.as_ref())
+    }
+
+    /// 공급자 네트워크의 physnet 이름
+    pub fn physnet(&self) -> Option<&str> {
+        self.provider().map(|p| p.physnet.as_str())
+    }
+
+    /// 서브넷 `subnet`이 OVN DHCP를 쓰는지. 칸이 없으면 오버레이의 IPv4 서브넷만 참이다(공급자 네트워크는 물리 망에
+    /// DHCP 서버가 있을 수 있어 기본 거짓 — 계획 66 §8). 계획 66부터 [`Subnet::dhcp`] 대신 이것을 쓴다.
+    pub fn subnet_dhcp(&self, subnet: &Subnet) -> bool {
+        subnet
+            .dhcp
+            .unwrap_or(subnet.is_ipv4() && !self.is_provider())
+    }
+
     /// VM NIC가 붙을 브리지 이름: `bridge`, `oplv<vni>`, SDN이면 OVS `br-int`. 검증을 통과한 스펙에서만 뜻이 있다.
     pub fn bridge_name(&self) -> String {
         match (&self.bridge, self.vni()) {
@@ -294,8 +412,11 @@ impl NetworkSpec {
         }
     }
 
-    /// VXLAN·SDN 네트워크의 MTU(없으면 기본값). 브리지 네트워크는 None.
+    /// VXLAN·SDN 네트워크의 MTU(없으면 기본값 — 공급자 네트워크는 물리 망의 1500). 브리지 네트워크는 None.
     pub fn mtu(&self) -> Option<u16> {
+        if self.is_provider() {
+            return Some(self.mtu.unwrap_or(DEFAULT_PROVIDER_MTU));
+        }
         if self.is_sdn() {
             return Some(self.mtu.unwrap_or(DEFAULT_SDN_MTU));
         }
@@ -317,8 +438,11 @@ pub fn vxlan_device(vni: u32) -> String {
     format!("oplx{vni}")
 }
 
-/// opld가 관리하는 장치 이름 모양(`^opl[vx][0-9]+$`)인지
+/// opld가 관리하는 장치 이름 모양(`^opl[vx][0-9]+$`, 계획 66의 physnet 장치 `^oplp[0-9a-f]{8}[obx]$`)인지
 pub fn is_managed_ifname(name: &str) -> bool {
+    if crate::sdn::is_physnet_ifname(name) {
+        return true;
+    }
     let Some(rest) = name
         .strip_prefix("oplv")
         .or_else(|| name.strip_prefix("oplx"))
@@ -380,6 +504,10 @@ pub enum NetworkError {
     DuplicateFamily,
     #[error("subnet {0}: {1}")]
     Subnet(usize, SubnetError),
+    #[error(
+        "invalid physnet {0:?}: use 1-31 lowercase letters, digits and '-', starting with a letter"
+    )]
+    BadPhysnet(String),
 }
 
 /// 서브넷 하나의 문제. `NetworkError::Subnet`이 서브넷 번호(1부터)를 붙인다.
@@ -413,6 +541,40 @@ pub enum SubnetError {
     PoolsOverlap(IpRange, IpRange),
     #[error("description must be at most {MAX_SUBNET_DESCRIPTION} characters")]
     LongDescription,
+    #[error("floating_pools can only be used on a provider network (sdn.provider)")]
+    FloatingPoolsWithoutProvider,
+    #[error("floating_pools can only be used on an IPv4 subnet")]
+    FloatingPoolsOnIpv6,
+    #[error("a subnet can have at most {MAX_FLOATING_POOLS} floating_pools")]
+    TooManyFloatingPools,
+    #[error("floating pool {0} overlaps {1}")]
+    FloatingPoolOverlap(IpRange, IpRange),
+    #[error("ipv6_mode can only be used on an IPv6 subnet")]
+    Ipv6ModeOnIpv4,
+    #[error("ipv6_mode slaac and dhcpv6-stateless need a /64 subnet (EUI-64), not /{0}")]
+    SlaacNeeds64(u8),
+}
+
+impl Provider {
+    pub fn validate(&self) -> Result<(), NetworkError> {
+        if !crate::sdn::valid_physnet(&self.physnet) {
+            return Err(NetworkError::BadPhysnet(self.physnet.clone()));
+        }
+        if let Some(vlan) = self.vlan
+            && !(1..=4094).contains(&vlan)
+        {
+            return Err(NetworkError::BadVlan(vlan));
+        }
+        Ok(())
+    }
+
+    /// 클러스터에서 하나뿐이어야 하는 열쇠 `<physnet>/<vlan|flat>`(Raft 겹침 `physnet`)
+    pub fn key(&self) -> String {
+        match self.vlan {
+            Some(vlan) => format!("{}/{vlan}", self.physnet),
+            None => format!("{}/flat", self.physnet),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -624,7 +786,7 @@ mod tests {
             bridge: None,
             vlan: None,
             vxlan: None,
-            sdn: Some(SdnNet {}),
+            sdn: Some(SdnNet::default()),
             mtu: None,
             subnets,
             folder: None,
@@ -654,7 +816,7 @@ mod tests {
             r#"{"vxlan":{"vni":1000},"mtu":1400,"folder":"00000000-0000-0000-0000-000000000003"}"#,
         ] {
             let s: NetworkSpec = serde_json::from_str(old).unwrap();
-            assert_eq!((s.sdn, s.subnets.len()), (None, 0));
+            assert_eq!((s.sdn.clone(), s.subnets.len()), (None, 0));
             assert_eq!(serde_json::to_string(&s).unwrap(), old);
         }
         let json = serde_json::json!({
@@ -889,5 +1051,239 @@ mod tests {
         for (v, err) in cases {
             assert_eq!(check(v.clone()), Err(err), "{v}");
         }
+    }
+
+    /// 계획 66: 계획 65 모양(공급자·유동 IP 풀·IPv6 모드 없음)은 바이트 그대로, 새 칸은 왕복한다. 계획 65의
+    /// `{"sdn": {"provider": "physnet1"}}`(문자열)은 여전히 거절한다(모양이 객체).
+    #[test]
+    fn routing_fields_are_written_only_when_set() {
+        for old in [
+            r#"{"sdn":{},"mtu":1400,"subnets":[{"cidr":"10.10.0.0/24","gateway":"10.10.0.254","dhcp":false,"dns_servers":["1.1.1.1"],"pools":[{"start":"10.10.0.10","end":"10.10.0.99"}],"description":"web"},{"cidr":"2001:db8::/64"}],"folder":"00000000-0000-0000-0000-000000000003"}"#,
+            r#"{"sdn":{}}"#,
+        ] {
+            let s: NetworkSpec = serde_json::from_str(old).unwrap();
+            assert!(!s.is_provider());
+            assert_eq!(serde_json::to_string(&s).unwrap(), old);
+        }
+        let json = serde_json::json!({
+            "sdn": { "provider": { "physnet": "ext", "vlan": 100 } },
+            "subnets": [
+                {
+                    "cidr": "203.0.113.0/24",
+                    "pools": [{ "start": "203.0.113.10", "end": "203.0.113.99" }],
+                    "floating_pools": [{ "start": "203.0.113.100", "end": "203.0.113.199" }]
+                },
+                { "cidr": "2001:db8::/64", "ipv6_mode": "dhcpv6-stateless" }
+            ]
+        });
+        let s: NetworkSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&s).unwrap(), json);
+        assert_eq!(s.validate(), Ok(()));
+        assert!(s.is_provider());
+        assert_eq!(s.physnet(), Some("ext"));
+        assert_eq!(s.provider().unwrap().key(), "ext/100");
+        assert_eq!(s.subnets[1].ipv6_mode, Some(Ipv6Mode::Dhcpv6Stateless));
+        for (mode, text) in [
+            (Ipv6Mode::Slaac, "slaac"),
+            (Ipv6Mode::Dhcpv6Stateful, "dhcpv6-stateful"),
+            (Ipv6Mode::Dhcpv6Stateless, "dhcpv6-stateless"),
+        ] {
+            assert_eq!(serde_json::to_value(mode).unwrap(), text);
+        }
+        for bad in [
+            serde_json::json!({ "sdn": { "provider": "physnet1" } }),
+            serde_json::json!({ "sdn": { "provider": { "physnet": "ext", "x": 1 } } }),
+            serde_json::json!({ "sdn": { "provider": { "vlan": 5 } } }),
+            serde_json::json!({ "sdn": {}, "subnets": [{ "cidr": "2001:db8::/64", "ipv6_mode": "eui64" }] }),
+        ] {
+            assert!(
+                serde_json::from_value::<NetworkSpec>(bad.clone()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    fn provider(physnet: &str, vlan: Option<u16>, subnets: Vec<Subnet>) -> NetworkSpec {
+        NetworkSpec {
+            sdn: Some(SdnNet {
+                provider: Some(Provider {
+                    physnet: physnet.into(),
+                    vlan,
+                }),
+            }),
+            ..sdn(subnets)
+        }
+    }
+
+    #[test]
+    fn validates_provider_networks() {
+        assert_eq!(provider("ext", None, Vec::new()).validate(), Ok(()));
+        assert_eq!(provider("a", Some(4094), Vec::new()).validate(), Ok(()));
+        assert_eq!(
+            provider("ext", None, Vec::new()).provider().unwrap().key(),
+            "ext/flat"
+        );
+        for bad in ["", "Ext", "1ext", "ext:1", "ext,b", "ex t", &"a".repeat(32)] {
+            assert_eq!(
+                provider(bad, None, Vec::new()).validate(),
+                Err(NetworkError::BadPhysnet(bad.into())),
+                "{bad:?}"
+            );
+        }
+        assert!(
+            provider(&"a".repeat(31), None, Vec::new())
+                .validate()
+                .is_ok()
+        );
+        for bad in [0, 4095] {
+            assert_eq!(
+                provider("ext", Some(bad), Vec::new()).validate(),
+                Err(NetworkError::BadVlan(bad))
+            );
+        }
+        // 브리지용 `vlan` 칸은 여전히 sdn과 못 쓴다(공급자 VLAN은 provider.vlan).
+        let tagged = NetworkSpec {
+            vlan: Some(10),
+            ..provider("ext", None, Vec::new())
+        };
+        assert_eq!(tagged.validate(), Err(NetworkError::VlanWithSdn));
+        // MTU 기본은 물리 망의 1500, 바꿀 수 있다. 브리지 이름은 늘 br-int다.
+        let p = provider("ext", None, Vec::new());
+        assert_eq!(p.mtu(), Some(DEFAULT_PROVIDER_MTU));
+        assert_eq!(p.bridge_name(), OVN_BRIDGE);
+        let p = NetworkSpec {
+            mtu: Some(9000),
+            ..p
+        };
+        assert_eq!(p.mtu(), Some(9000));
+        assert_eq!(sdn(Vec::new()).mtu(), Some(DEFAULT_SDN_MTU));
+        // 공급자 서브넷의 DHCP 기본은 거짓이다(오버레이 IPv4는 참).
+        let v4 = subnet(serde_json::json!({ "cidr": "10.0.0.0/24" }));
+        let on = subnet(serde_json::json!({ "cidr": "10.0.0.0/24", "dhcp": true }));
+        assert!(!provider("ext", None, Vec::new()).subnet_dhcp(&v4));
+        assert!(provider("ext", None, Vec::new()).subnet_dhcp(&on));
+        assert!(sdn(Vec::new()).subnet_dhcp(&v4));
+        // 유동 IP 풀은 공급자 네트워크에만
+        let floating = subnet(serde_json::json!({
+            "cidr": "203.0.113.0/24",
+            "floating_pools": [{ "start": "203.0.113.100", "end": "203.0.113.199" }]
+        }));
+        assert_eq!(
+            provider("ext", None, vec![floating.clone()]).validate(),
+            Ok(())
+        );
+        assert_eq!(
+            sdn(vec![floating]).validate(),
+            Err(NetworkError::Subnet(
+                1,
+                SubnetError::FloatingPoolsWithoutProvider
+            ))
+        );
+    }
+
+    #[test]
+    fn validates_floating_pools_and_ipv6_modes() {
+        let check = |v: serde_json::Value| subnet(v).validate();
+        let pool = |a: &str, b: &str| serde_json::json!({ "start": a, "end": b });
+        assert_eq!(
+            check(serde_json::json!({
+                "cidr": "203.0.113.0/24",
+                "pools": [pool("203.0.113.10", "203.0.113.99")],
+                "floating_pools": [pool("203.0.113.100", "203.0.113.149"), pool("203.0.113.150", "203.0.113.199")]
+            })),
+            Ok(())
+        );
+        for mode in ["slaac", "dhcpv6-stateless", "dhcpv6-stateful"] {
+            assert_eq!(
+                check(serde_json::json!({ "cidr": "2001:db8::/64", "ipv6_mode": mode })),
+                Ok(()),
+                "{mode}"
+            );
+        }
+        assert_eq!(
+            check(serde_json::json!({ "cidr": "2001:db8::/80", "ipv6_mode": "dhcpv6-stateful" })),
+            Ok(())
+        );
+        let cases = [
+            (
+                serde_json::json!({ "cidr": "2001:db8::/64", "floating_pools": [pool("2001:db8::10", "2001:db8::20")] }),
+                SubnetError::FloatingPoolsOnIpv6,
+            ),
+            (
+                serde_json::json!({
+                    "cidr": "10.0.0.0/16",
+                    "floating_pools": (0..17).map(|i| pool(&format!("10.0.{i}.10"), &format!("10.0.{i}.20"))).collect::<Vec<_>>()
+                }),
+                SubnetError::TooManyFloatingPools,
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "floating_pools": [pool("10.0.0.10", "10.0.1.5")] }),
+                SubnetError::PoolOutside(range("10.0.0.10", "10.0.1.5")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "floating_pools": [pool("10.0.0.1", "10.0.0.5")] }),
+                SubnetError::GatewayInPool(range("10.0.0.1", "10.0.0.5"), ip("10.0.0.1")),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "floating_pools": [pool("10.0.0.200", "10.0.0.255")] }),
+                SubnetError::PoolReserved(range("10.0.0.200", "10.0.0.255")),
+            ),
+            (
+                serde_json::json!({
+                    "cidr": "10.0.0.0/24",
+                    "pools": [pool("10.0.0.10", "10.0.0.100")],
+                    "floating_pools": [pool("10.0.0.100", "10.0.0.120")]
+                }),
+                SubnetError::FloatingPoolOverlap(
+                    range("10.0.0.100", "10.0.0.120"),
+                    range("10.0.0.10", "10.0.0.100"),
+                ),
+            ),
+            (
+                serde_json::json!({
+                    "cidr": "10.0.0.0/24",
+                    "floating_pools": [pool("10.0.0.10", "10.0.0.20"), pool("10.0.0.15", "10.0.0.30")]
+                }),
+                SubnetError::FloatingPoolOverlap(
+                    range("10.0.0.10", "10.0.0.20"),
+                    range("10.0.0.15", "10.0.0.30"),
+                ),
+            ),
+            (
+                serde_json::json!({ "cidr": "10.0.0.0/24", "ipv6_mode": "slaac" }),
+                SubnetError::Ipv6ModeOnIpv4,
+            ),
+            (
+                serde_json::json!({ "cidr": "2001:db8::/80", "ipv6_mode": "slaac" }),
+                SubnetError::SlaacNeeds64(80),
+            ),
+            (
+                serde_json::json!({ "cidr": "2001:db8::/56", "ipv6_mode": "dhcpv6-stateless" }),
+                SubnetError::SlaacNeeds64(56),
+            ),
+            // IPv6 `dhcp: true`는 여전히 400이다(`ipv6_mode`가 그 자리).
+            (
+                serde_json::json!({ "cidr": "2001:db8::/64", "dhcp": true, "ipv6_mode": "dhcpv6-stateful" }),
+                SubnetError::Dhcpv6,
+            ),
+        ];
+        for (v, err) in cases {
+            assert_eq!(check(v.clone()), Err(err), "{v}");
+        }
+    }
+
+    #[test]
+    fn physnet_devices_are_managed_names() {
+        let (o, b, x) = crate::sdn::physnet_ifnames("0123456789ab", "ext");
+        for name in [&o, &b, &x] {
+            assert!(is_managed_ifname(name), "{name}");
+            assert!(valid_ifname(name), "{name}");
+        }
+        assert!(!is_managed_ifname("oplp0123abcdz"));
+        assert!(!is_managed_ifname("oplp0123ABCDo"));
+        assert_eq!(
+            spec(&b, None).validate(),
+            Err(NetworkError::ReservedBridge(b.clone()))
+        );
     }
 }

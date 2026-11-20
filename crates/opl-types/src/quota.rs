@@ -23,15 +23,21 @@ pub enum QuotaDimension {
     Vms,
     /// 전용 VM의 vCPU 자리(계획 64)
     DedicatedVcpus,
+    /// 라우터 수(계획 66, 네트워크 폴더)
+    Routers,
+    /// 유동 IP 수(계획 66, 네트워크 폴더)
+    FloatingIps,
 }
 
 impl QuotaDimension {
-    pub const ALL: [QuotaDimension; 5] = [
+    pub const ALL: [QuotaDimension; 7] = [
         QuotaDimension::Vcpus,
         QuotaDimension::MemoryMib,
         QuotaDimension::DiskBytes,
         QuotaDimension::Vms,
         QuotaDimension::DedicatedVcpus,
+        QuotaDimension::Routers,
+        QuotaDimension::FloatingIps,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -41,6 +47,8 @@ impl QuotaDimension {
             QuotaDimension::DiskBytes => "disk_bytes",
             QuotaDimension::Vms => "vms",
             QuotaDimension::DedicatedVcpus => "dedicated_vcpus",
+            QuotaDimension::Routers => "routers",
+            QuotaDimension::FloatingIps => "floating_ips",
         }
     }
 
@@ -52,6 +60,8 @@ impl QuotaDimension {
             QuotaDimension::DiskBytes => "bytes of disk",
             QuotaDimension::Vms => "VMs",
             QuotaDimension::DedicatedVcpus => "dedicated vCPUs",
+            QuotaDimension::Routers => "routers",
+            QuotaDimension::FloatingIps => "floating IPs",
         }
     }
 
@@ -62,6 +72,8 @@ impl QuotaDimension {
             QuotaDimension::DiskBytes => quota.disk_bytes,
             QuotaDimension::Vms => quota.vms,
             QuotaDimension::DedicatedVcpus => quota.dedicated_vcpus,
+            QuotaDimension::Routers => quota.routers,
+            QuotaDimension::FloatingIps => quota.floating_ips,
         }
     }
 
@@ -72,6 +84,8 @@ impl QuotaDimension {
             QuotaDimension::DiskBytes => usage.disk_bytes,
             QuotaDimension::Vms => usage.vms,
             QuotaDimension::DedicatedVcpus => usage.dedicated_vcpus,
+            QuotaDimension::Routers => usage.routers,
+            QuotaDimension::FloatingIps => usage.floating_ips,
         }
     }
 }
@@ -90,6 +104,8 @@ impl FolderUsage {
         self.disk_bytes = self.disk_bytes.saturating_add(other.disk_bytes);
         self.vms = self.vms.saturating_add(other.vms);
         self.dedicated_vcpus = self.dedicated_vcpus.saturating_add(other.dedicated_vcpus);
+        self.routers = self.routers.saturating_add(other.routers);
+        self.floating_ips = self.floating_ips.saturating_add(other.floating_ips);
     }
 
     /// 어느 차원도 `other`보다 크지 않다.
@@ -107,6 +123,18 @@ impl FolderUsage {
             disk_bytes: self.disk_bytes.saturating_mul(n),
             vms: self.vms.saturating_mul(n),
             dedicated_vcpus: self.dedicated_vcpus.saturating_mul(n),
+            routers: self.routers.saturating_mul(n),
+            floating_ips: self.floating_ips.saturating_mul(n),
+        }
+    }
+
+    /// 네트워크 폴더에 드는 리소스 하나의 몫(계획 66): 라우터 하나, 유동 IP 하나. 다른 종류는 0이다.
+    pub fn of_network_member(kind: crate::resource::Kind) -> FolderUsage {
+        use crate::resource::Kind;
+        FolderUsage {
+            routers: u64::from(kind == Kind::Router),
+            floating_ips: u64::from(kind == Kind::FloatingIp),
+            ..FolderUsage::default()
         }
     }
 
@@ -175,6 +203,7 @@ fn vm_usage(
         disk_bytes,
         vms: 1,
         dedicated_vcpus,
+        ..FolderUsage::default()
     }
 }
 
@@ -326,6 +355,8 @@ mod tests {
         .unwrap();
         let size = |n: &str| if n == "a" { 10 } else { 5 };
         let want = FolderUsage {
+            routers: 0,
+            floating_ips: 0,
             dedicated_vcpus: 0,
             vcpus: 6,
             memory_mib: 1024,
@@ -454,9 +485,47 @@ mod tests {
             memory_mib: 2,
             disk_bytes: 3,
             vms: 4,
+            routers: 5,
+            floating_ips: 6,
         };
         assert!(u.within(&u.times(2)));
         assert!(!u.times(2).within(&u));
+        // 라우터 수만 늘어도 넘는다(계획 66).
+        let more = FolderUsage { routers: 6, ..u };
+        assert!(!more.within(&u));
+    }
+
+    /// 계획 66: 네트워크 폴더의 라우터·유동 IP 수
+    #[test]
+    fn network_members_count_routers_and_floating_ips() {
+        use crate::resource::Kind;
+        assert_eq!(FolderUsage::of_network_member(Kind::Router).routers, 1);
+        assert_eq!(
+            FolderUsage::of_network_member(Kind::FloatingIp).floating_ips,
+            1
+        );
+        assert_eq!(
+            FolderUsage::of_network_member(Kind::Network),
+            FolderUsage::default()
+        );
+        let quota = FolderQuota {
+            floating_ips: Some(1),
+            ..FolderQuota::default()
+        };
+        let tree: QuotaTree = [(id(1), node(None, Some(quota)))].into();
+        let one: DirectUsage = [(id(1), FolderUsage::of_network_member(Kind::FloatingIp))].into();
+        let mut two = one.clone();
+        two.get_mut(&id(1))
+            .unwrap()
+            .add(&FolderUsage::of_network_member(Kind::FloatingIp));
+        assert_eq!(
+            quota_exceeded((&tree, &DirectUsage::new()), (&tree, &one)),
+            None
+        );
+        assert_eq!(
+            quota_exceeded((&tree, &one), (&tree, &two)).map(|e| (e.dimension, e.limit, e.used)),
+            Some((QuotaDimension::FloatingIps, 1, 2))
+        );
     }
 
     #[test]

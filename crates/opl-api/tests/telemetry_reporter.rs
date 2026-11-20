@@ -161,6 +161,7 @@ async fn nothing_is_sent_while_an_old_node_remains() {
     let mut old: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.9.8.7:8006".into(),
             maintenance: false,

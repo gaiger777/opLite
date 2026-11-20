@@ -6,9 +6,14 @@ use opl_types::resource::Kind;
 use serde::Deserialize;
 use serde_json::Value;
 
+/// 종류가 달라도 한 키 공간을 쓰는 필드(계획 66): 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP가 함께 쓴다.
+pub(crate) const SHARED_IP_KINDS: [Kind; 3] = [Kind::Vm, Kind::Router, Kind::FloatingIp];
+
 /// spec에서 다른 리소스와 겹치면 안 되는 값을 `(필드, 값)`으로 꺼낸다. 지금은 VM이 붙인
 /// 볼륨 이름과 NIC의 MAC 주소, SDN NIC 주소의 `{네트워크 이름}/{주소}`(계획 65 — 템플릿은 보지 않는다), 스냅샷의
-/// `{vm id}/{이름}`, 폴더의 형제 이름 키(`FolderSpec::sibling_key`)다.
+/// `{vm id}/{이름}`, 폴더의 형제 이름 키(`FolderSpec::sibling_key`)다. 계획 66: 라우터 외부 주소와 유동 IP도 같은
+/// `ip` 키(종류 사이에서 겹치지 않음 — [`SHARED_IP_KINDS`]), 라우터 인터페이스 네트워크 `router-net`(한 네트워크는
+/// 라우터 하나에만), 유동 IP가 붙은 NIC `fip-nic`(`{vm id}/{MAC}`), 공급자 네트워크의 `physnet`(`{physnet}/{vlan|flat}`).
 pub(crate) fn exclusive_values(kind: Kind, spec: &Value) -> Vec<(&'static str, String)> {
     if kind == Kind::Folder {
         // 풀 수 없는 폴더 스펙은 API가 쓰지 않는다. 겹침 검사에서는 없는 것으로 본다.
@@ -22,8 +27,44 @@ pub(crate) fn exclusive_values(kind: Kind, spec: &Value) -> Vec<(&'static str, S
             _ => Vec::new(),
         };
     }
-    if kind != Kind::Vm {
-        return Vec::new();
+    let ip = |network: &Value, ip: &Value| {
+        let network = network.as_str()?;
+        let ip = ip.as_str()?.parse::<std::net::IpAddr>().ok()?;
+        Some(("ip", format!("{network}/{}", ip.to_canonical())))
+    };
+    match kind {
+        Kind::Router => {
+            let mut values: Vec<_> = spec["interfaces"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|i| i["network"].as_str())
+                .map(|n| ("router-net", n.to_string()))
+                .collect();
+            let external = &spec["external"];
+            for a in external["ips"].as_array().into_iter().flatten() {
+                values.extend(ip(&external["network"], a));
+            }
+            return values;
+        }
+        Kind::FloatingIp => {
+            let mut values: Vec<_> = ip(&spec["network"], &spec["address"]).into_iter().collect();
+            let target = &spec["target"];
+            if let (Some(vm), Some(mac)) = (target["vm"].as_str(), target["mac"].as_str()) {
+                values.push(("fip-nic", format!("{vm}/{}", mac.to_ascii_lowercase())));
+            }
+            return values;
+        }
+        Kind::Network => {
+            let provider = &spec["sdn"]["provider"];
+            return match (provider["physnet"].as_str(), provider["vlan"].as_u64()) {
+                (Some(p), Some(vlan)) => vec![("physnet", format!("{p}/{vlan}"))],
+                (Some(p), None) => vec![("physnet", format!("{p}/flat"))],
+                _ => Vec::new(),
+            };
+        }
+        Kind::Vm => {}
+        _ => return Vec::new(),
     }
     let field = |list: &str, key: &str, name: &'static str| {
         spec[list]
@@ -38,13 +79,8 @@ pub(crate) fn exclusive_values(kind: Kind, spec: &Value) -> Vec<(&'static str, S
     // NIC 주소는 네트워크마다 하나다(폴더가 다른 네트워크는 같은 CIDR을 쓸 수 있다). 템플릿은 주소를 갖지 않는다.
     if spec["template"].as_bool() != Some(true) {
         for nic in spec["nics"].as_array().into_iter().flatten() {
-            let Some(network) = nic["network"].as_str() else {
-                continue;
-            };
-            for ip in nic["ips"].as_array().into_iter().flatten() {
-                if let Some(ip) = ip.as_str().and_then(|s| s.parse::<std::net::IpAddr>().ok()) {
-                    values.push(("ip", format!("{network}/{}", ip.to_canonical())));
-                }
+            for a in nic["ips"].as_array().into_iter().flatten() {
+                values.extend(ip(&nic["network"], a));
             }
         }
     }
@@ -134,5 +170,56 @@ mod tests {
             vec![("name", "root-network/a".to_string())]
         );
         assert!(exclusive_values(Kind::Folder, &json!({"name": 1})).is_empty());
+    }
+
+    /// 계획 66: 라우터·유동 IP·공급자 네트워크의 독점 값
+    #[test]
+    fn extracts_routing_values() {
+        let router = json!({
+            "interfaces": [{"network": "t1"}, {"network": "t2"}],
+            "external": {"network": "ext", "ips": ["203.0.113.10", "2001:db8::10"]}
+        });
+        assert_eq!(
+            exclusive_values(Kind::Router, &router),
+            vec![
+                ("router-net", "t1".to_string()),
+                ("router-net", "t2".to_string()),
+                ("ip", "ext/203.0.113.10".to_string()),
+                ("ip", "ext/2001:db8::10".to_string()),
+            ]
+        );
+        assert!(exclusive_values(Kind::Router, &json!({})).is_empty());
+        let vm = "0195f7a0-0000-7000-8000-000000000001";
+        let fip = json!({
+            "network": "ext",
+            "address": "203.0.113.120",
+            "target": {"vm": vm, "mac": "52:54:00:AA:00:01"}
+        });
+        assert_eq!(
+            exclusive_values(Kind::FloatingIp, &fip),
+            vec![
+                ("ip", "ext/203.0.113.120".to_string()),
+                ("fip-nic", format!("{vm}/52:54:00:aa:00:01")),
+            ]
+        );
+        // 주소를 아직 고르지 않은 유동 IP는 값이 없다.
+        assert!(exclusive_values(Kind::FloatingIp, &json!({"network": "ext"})).is_empty());
+        assert_eq!(
+            exclusive_values(
+                Kind::Network,
+                &json!({"sdn": {"provider": {"physnet": "ext", "vlan": 100}}})
+            ),
+            vec![("physnet", "ext/100".to_string())]
+        );
+        assert_eq!(
+            exclusive_values(
+                Kind::Network,
+                &json!({"sdn": {"provider": {"physnet": "ext"}}})
+            ),
+            vec![("physnet", "ext/flat".to_string())]
+        );
+        // 오버레이·브리지 네트워크는 값이 없다(지금 그대로).
+        assert!(exclusive_values(Kind::Network, &json!({"sdn": {}})).is_empty());
+        assert!(exclusive_values(Kind::Network, &json!({"bridge": "vmbr0"})).is_empty());
     }
 }

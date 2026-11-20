@@ -350,6 +350,7 @@ async fn add_numa_node(env: &Env, name: &str, dedicated: &str) -> Uuid {
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
             witness: false,

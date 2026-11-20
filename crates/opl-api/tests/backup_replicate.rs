@@ -726,6 +726,7 @@ async fn replicate_requests_are_checked() {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,
@@ -1057,6 +1058,7 @@ async fn incremental_backups_need_a_remote_that_knows_them() {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,

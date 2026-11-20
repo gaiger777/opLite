@@ -8,7 +8,7 @@ use crate::cpu::NodeCpu;
 use crate::ha_check::{CheckReport, CheckState};
 use crate::numa::{HostResources, NodeTopology};
 use crate::resource::{Kind, Resource, ResourceSpec};
-use crate::sdn::NodeSdn;
+use crate::sdn::{NodeSdn, NodeSdnConfig};
 use crate::vm::Arch;
 
 /// 클러스터 노드. 리소스 id는 그 노드의 Raft 노드 id와 같다.
@@ -35,6 +35,10 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub host_resources: Option<HostResources>,
+    /// SDN physnet 연결과 게이트웨이 노드(계획 66 §7). 없으면 쓰지 않아 옛 노드도 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub sdn: Option<NodeSdnConfig>,
 }
 
 /// 노드의 역할
@@ -397,6 +401,7 @@ pub const FEATURES: &[&str] = &[
     CPU_MODELS,
     NUMA,
     SDN,
+    SDN_ROUTING,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -468,6 +473,11 @@ pub const NUMA: &str = "numa";
 /// SDN(OVN)(계획 65): 종류 `Sdn`, 네트워크 `sdn`·`subnets`, NIC `ips`, `NodeStatus.sdn` 쓰기, Task `sdn-*`. 옛 노드는 이
 /// 칸이 든 네트워크·VM을 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
 pub const SDN: &str = "sdn";
+
+/// SDN 라우팅(계획 66): 네트워크 `sdn.provider`, 서브넷 `floating_pools`·`ipv6_mode`, 노드 `sdn`, `NodeStatus.sdn`의
+/// `physnets`·`gateway` 쓰기, 종류 `Router`·`FloatingIp`, 할당량 `routers`·`floating_ips`, SDN NIC의 `security_groups`.
+/// 옛 노드는 이 칸·종류를 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
+pub const SDN_ROUTING: &str = "sdn-routing";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -571,6 +581,7 @@ mod tests {
             let mut n: Node = Resource::new(
                 "n",
                 NodeSpec {
+                    sdn: None,
                     host_resources: None,
                     address: "a".into(),
                     maintenance: false,
@@ -953,7 +964,8 @@ mod tests {
                 "two-factor",
                 "cpu-models",
                 "numa",
-                "sdn"
+                "sdn",
+                "sdn-routing"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1053,6 +1065,7 @@ mod tests {
         let mut node: Node = Resource::new(
             "n",
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: "a".into(),
                 maintenance: false,
@@ -1171,6 +1184,32 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&SDN));
+        assert_eq!(FEATURES.last(), Some(&SDN_ROUTING));
+    }
+
+    /// 계획 66: 노드 SDN 설정이 없으면 옛 노드 스펙 JSON이 바이트까지 같고, 있으면 그대로 오간다.
+    #[test]
+    fn spec_sdn_round_trips_and_old_json_is_unchanged() {
+        let old =
+            r#"{"address":"10.0.0.1:8006","maintenance":false,"witness":false,"roles":["api"]}"#;
+        let spec: NodeSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(spec.sdn, None);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+        let spec: NodeSpec = serde_json::from_value(serde_json::json!({
+            "address": "10.0.0.1:8006",
+            "sdn": { "physnets": { "ext": "vmbr1" }, "gateway": 100 }
+        }))
+        .unwrap();
+        let sdn = spec.sdn.as_ref().unwrap();
+        assert_eq!(sdn.physnets["ext"], "vmbr1");
+        assert_eq!(sdn.gateway, Some(100));
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(serde_json::from_value::<NodeSpec>(json).unwrap(), spec);
+        assert!(
+            serde_json::from_value::<NodeSpec>(serde_json::json!({
+                "address": "a", "sdn": { "bridges": {} }
+            }))
+            .is_err()
+        );
     }
 }

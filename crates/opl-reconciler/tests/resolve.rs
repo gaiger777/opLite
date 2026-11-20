@@ -1416,6 +1416,7 @@ async fn refuses_pools_this_node_reports_not_ready() {
     let mut me: Node = Resource::new(
         "n1",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "a".into(),
             maintenance: false,

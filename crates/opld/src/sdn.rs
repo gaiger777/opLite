@@ -245,6 +245,8 @@ impl Agent {
             tracing::warn!(errors = ?errors, "SDN agent");
         }
         self.report.set(Some(NodeSdn {
+            physnets: Vec::new(),
+            gateway: false,
             chassis,
             ovn_version: Some(versions.ovn),
             ovs_version: Some(versions.ovs),
@@ -419,6 +421,7 @@ mod tests {
         let mut me: opl_types::node::Node = Resource::new(
             "n1",
             NodeSpec {
+                sdn: None,
                 address: "10.0.0.1:8006".into(),
                 maintenance: false,
                 witness: false,
@@ -748,6 +751,7 @@ mod tests {
         let mut other: opl_types::node::Node = Resource::new(
             "old",
             NodeSpec {
+                sdn: None,
                 address: "10.0.0.9:8006".into(),
                 maintenance: false,
                 witness: false,

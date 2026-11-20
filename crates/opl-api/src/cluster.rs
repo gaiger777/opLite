@@ -691,6 +691,7 @@ pub async fn join(
     // 온라인으로 기록해 첫 핑 전에 노드가 제거되지 않게 한다. 핑이 계속 실패하면 리더가 오프라인으로 바꾼다.
     // 버전은 보낸 값으로 적어, 등록 전에도 버전 검사가 이 노드를 센다.
     let spec = NodeSpec {
+        sdn: None,
         host_resources: None,
         address: req.address.clone(),
         maintenance: false,

@@ -241,6 +241,7 @@ async fn add_node(env: &Env, name: &str, address: &str, witness: bool, features:
     let mut node = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: address.into(),
             maintenance: false,
@@ -400,6 +401,7 @@ async fn start_observer(env: &Env) -> Arc<Cluster> {
     let mut node = Resource::new(
         "observer",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:0".into(),
             maintenance: false,

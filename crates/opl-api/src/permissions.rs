@@ -752,7 +752,7 @@ fn check_delegation(
             let needed = privileges | PrivSet::from(Privilege::PermissionModify);
             layers.push((AuthzTarget::Folder(*id), needed, ""));
             if propagate {
-                let kind = folder.spec.kind.member_kind();
+                let kind = folder.spec.kind.member_kinds()[0];
                 layers.push((contents_of(Some(*id), kind), needed, " everywhere inside"));
             }
         }

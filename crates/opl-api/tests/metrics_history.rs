@@ -85,6 +85,7 @@ async fn add_node(env: &Env, name: &str, witness: bool, status: NodeStatus) -> U
     let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

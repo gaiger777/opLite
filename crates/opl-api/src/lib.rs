@@ -399,12 +399,27 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
 
 /// API 문서. 라우터와 같은 정의에서 만들므로 경로가 어긋나지 않는다.
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    api().into_openapi()
+    api_parts().1
+}
+
+/// [`api_parts`]가 쓰는 스레드의 스택(16 MiB)
+const API_STACK: usize = 16 << 20;
+
+/// 라우트 표와 API 문서. 경로·스키마가 많아 만들 때 디버그 빌드에서 스택을 많이 쓰므로(계획 66 스테이지 1에서 2 MiB 시험
+/// 스레드가 넘쳤다) 넉넉한 스택의 스레드에서 만든다.
+fn api_parts() -> (Router<Arc<AppState>>, utoipa::openapi::OpenApi) {
+    std::thread::Builder::new()
+        .name("opl-api-routes".into())
+        .stack_size(API_STACK)
+        .spawn(|| api().split_for_parts())
+        .expect("spawn the API route builder thread")
+        .join()
+        .expect("building the API routes panicked")
 }
 
 /// `/api/v1` 아래의 API와 인증 없이 읽는 `/api/v1/openapi.json`
 pub fn router(state: Arc<AppState>) -> Router {
-    let (api, doc) = api().split_for_parts();
+    let (api, doc) = api_parts();
     let doc = Arc::new(doc);
     // 라우트가 맞은 요청만 경로표대로 권한을 보고(계획 62), 감사 로그에 적는다(라우트 템플릿이 동작 이름이다).
     // 감사가 바깥이라 권한 거절(403·404)도 적는다.

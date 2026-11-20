@@ -716,6 +716,19 @@ pub async fn create_network(
     if req.spec.sdn.is_some() || !req.spec.subnets.is_empty() {
         require_feature(&state.cluster, opl_types::node::SDN)?;
     }
+    // 공급자 네트워크와 서브넷의 유동 IP 풀·IPv6 모드(계획 66)는 API 스테이지 전까지 막는다.
+    if req.spec.is_provider() {
+        return Err(crate::sdn::routing_not_yet(
+            &state.cluster,
+            "provider networks (sdn.provider)",
+        ));
+    }
+    if req.spec.subnets.iter().any(crate::sdn::subnet_uses_routing) {
+        return Err(crate::sdn::routing_not_yet(
+            &state.cluster,
+            "floating_pools and ipv6_mode",
+        ));
+    }
     state.authz.require_new(
         &principal,
         Privilege::NetworkConfig,
@@ -840,6 +853,17 @@ pub async fn update_node(
         // 옛 노드는 `roles`가 든 Node를 풀지 못한다.
         require_feature(&state.cluster, "node-roles")?;
     }
+    // 노드 SDN 설정(계획 66 physnet·게이트웨이): 칸이 없으면 저장된 값 그대로다. 바꾸기는 API 스테이지 전까지 막는다.
+    match spec.sdn.take() {
+        Some(asked) if Some(&asked) != node.spec.sdn.as_ref() => {
+            return Err(crate::sdn::routing_not_yet(
+                &state.cluster,
+                "node SDN settings (physnets, gateway)",
+            ));
+        }
+        _ => {}
+    }
+    spec.sdn = node.spec.sdn.clone();
     // 호스트 자원 설정(계획 64): 없으면 그대로, `{}`면 지움, 바꾸면 검증과 쓰기 전 확인
     let change =
         crate::numa::host_resources_change(&state, &node, spec.host_resources.take(), query.force)?;

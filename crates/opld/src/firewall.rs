@@ -14,7 +14,7 @@ use opl_driver::{Firewall, FirewallNic, ruleset};
 use opl_reconciler::FirewallGate;
 use opl_types::network::{Network, NetworkSpec, tap_name};
 use opl_types::resource::Kind;
-use opl_types::security_group::{Action, Direction, Rule, SecurityGroup, SecurityGroupSpec};
+use opl_types::security_group::{SecurityGroup, SecurityGroupSpec, nic_policy};
 use opl_types::vm::{NicSpec, Vm, VmSpec};
 use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
@@ -33,8 +33,8 @@ const DEBOUNCE: Duration = Duration::from_millis(500);
 /// 실행 중인 VM은 스펙의 NIC에 더해 도는 QEMU에 아직 붙은 NIC(`status.hardware.nics`, MAC으로 맞춤 — 스펙에서
 /// 뺐지만 게스트가 아직 내려 주지 않은 것)도 기록된 보안 그룹으로 막는다. 같은 순번(같은 tap)에 스펙의 다른 NIC가
 /// 있으면 tap은 QEMU에 붙은 NIC의 것이므로 기록된 NIC가 이긴다. SDN(OVN) 네트워크(`networks`에서 `sdn`인 것)의 NIC는
-/// 건너뛴다: 그 tap은 OVS 포트라 Linux 브리지 nftables 훅을 타지 않는다(계획 65 — API가 SDN NIC의 보안 그룹을 받지
-/// 않으므로 방어로, 66이 OVN ACL로 옮긴다).
+/// 건너뛴다: 그 tap은 OVS 포트라 Linux 브리지 nftables 훅을 타지 않는다(계획 66부터 SDN NIC의 그룹은 리더 `OvnSync`가
+/// OVN ACL로 건다). 펼치기는 OVN 쪽과 같은 [`nic_policy`]다.
 pub fn firewall_nics(
     vms: &[Vm],
     groups: &[SecurityGroup],
@@ -74,28 +74,10 @@ pub fn firewall_nics(
             let Some(mac) = nic.mac else {
                 continue;
             };
-            let found: Vec<_> = nic
-                .security_groups
-                .iter()
-                .filter_map(|name| groups.iter().find(|g| &g.name == name))
-                .collect();
-            let mut rules: Vec<Rule> = found
-                .iter()
-                .flat_map(|g| g.spec.rules.iter().cloned())
-                .collect();
-            if found.len() < nic.security_groups.len() {
-                rules.push(Rule {
-                    direction: Direction::Out,
-                    action: Action::Drop,
-                    protocol: None,
-                    ports: None,
-                    remote: None,
-                });
-            }
             nics.push(FirewallNic {
                 tap: tap_name(vm.id, i),
                 mac,
-                rules,
+                rules: nic_policy(&nic.security_groups, groups).rules,
             });
         }
     }
@@ -277,6 +259,7 @@ mod tests {
     use opl_cluster::types::NodeId;
     use opl_driver::DriverError;
     use opl_types::resource::Resource;
+    use opl_types::security_group::Rule;
     use opl_types::vm::{CpuSpec, MacAddr, MachineType, NicModel, NicSpec, PowerState};
     use uuid::Uuid;
 
@@ -432,6 +415,36 @@ mod tests {
             ]
         );
         assert_eq!(firewall_nics(&[], &groups, &[]), vec![]);
+    }
+
+    /// 계획 66: 펼치기를 `nic_policy`로 옮겨도 nftables 규칙 글이 바이트까지 같다(옮기기 전 글을 그대로 적어 둠).
+    #[test]
+    fn the_ruleset_text_is_unchanged() {
+        let ssh = rule(
+            serde_json::json!({ "direction": "in", "action": "accept", "protocol": "tcp", "ports": "22", "remote": "10.0.0.0/8" }),
+        );
+        let web = rule(
+            serde_json::json!({ "direction": "in", "action": "drop", "protocol": "tcp", "ports": "8000-8080" }),
+        );
+        let smtp = rule(
+            serde_json::json!({ "direction": "out", "action": "drop", "protocol": "tcp", "ports": "25" }),
+        );
+        let groups = vec![group("ssh", vec![ssh]), group("web", vec![web, smtp])];
+        let mut a = vm(
+            "a",
+            None,
+            vec![
+                nic(Some(mac(1)), &["web", "ssh"]),
+                nic(Some(mac(2)), &["ssh", "gone"]),
+                nic(Some(mac(3)), &[]),
+            ],
+        );
+        a.id = Uuid::from_u128(0x0195_f7a0_0000_7000_8000_0000_0000_00a1);
+        let text = ruleset("0123456789ab", &firewall_nics(&[a], &groups, &[]));
+        assert_eq!(
+            text,
+            "table bridge opl_0123456789ab {}\ndelete table bridge opl_0123456789ab\ntable bridge opl_0123456789ab {\n\tchain o_op00000000a1n0 {\n\t\tether saddr != 52:54:00:00:00:01 drop\n\t\tmeta protocol arp return\n\t\tct state established,related return\n\t\tct state invalid drop\n\t\tmeta l4proto tcp th dport 25 drop\n\t}\n\tchain i_op00000000a1n0 {\n\t\tmeta protocol arp accept\n\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept\n\t\tudp sport 67 udp dport 68 accept\n\t\tudp sport 547 udp dport 546 accept\n\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tmeta l4proto tcp th dport 8000-8080 drop\n\t\tmeta protocol ip ip saddr 10.0.0.0/8 meta l4proto tcp th dport 22 accept\n\t\tdrop\n\t}\n\tchain o_op00000000a1n1 {\n\t\tether saddr != 52:54:00:00:00:02 drop\n\t\tmeta protocol arp return\n\t\tct state established,related return\n\t\tct state invalid drop\n\t\tdrop\n\t}\n\tchain i_op00000000a1n1 {\n\t\tmeta protocol arp accept\n\t\ticmpv6 type { nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } accept\n\t\tudp sport 67 udp dport 68 accept\n\t\tudp sport 547 udp dport 546 accept\n\t\tct state established,related accept\n\t\tct state invalid drop\n\t\tmeta protocol ip ip saddr 10.0.0.0/8 meta l4proto tcp th dport 22 accept\n\t\tdrop\n\t}\n\tmap out_nics {\n\t\ttype ifname : verdict\n\t\telements = { \"op00000000a1n0\" : jump o_op00000000a1n0, \"op00000000a1n1\" : jump o_op00000000a1n1 }\n\t}\n\tmap in_nics {\n\t\ttype ifname : verdict\n\t\telements = { \"op00000000a1n0\" : jump i_op00000000a1n0, \"op00000000a1n1\" : jump i_op00000000a1n1 }\n\t}\n\tchain forward {\n\t\ttype filter hook forward priority 0; policy accept;\n\t\tiifname vmap @out_nics\n\t\toifname vmap @in_nics\n\t}\n\tchain input {\n\t\ttype filter hook input priority 0; policy accept;\n\t\tiifname vmap @out_nics\n\t}\n\tchain output {\n\t\ttype filter hook output priority 0; policy accept;\n\t\toifname vmap @in_nics\n\t}\n}\n"
+        );
     }
 
     /// SDN(OVN) 네트워크의 NIC는 방화벽 NIC가 아니다(그 tap은 OVS 포트다). 같은 VM의 단순 NIC는 그대로다.

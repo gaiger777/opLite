@@ -228,6 +228,7 @@ async fn replicate_is_checked_and_waits_for_every_node_to_run_this_build() {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,
@@ -307,6 +308,7 @@ async fn full_every_is_checked_and_needs_every_node_to_know_incremental_backups(
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,
@@ -398,6 +400,7 @@ async fn patch_turns_replication_on_and_off() {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,

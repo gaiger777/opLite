@@ -1239,6 +1239,7 @@ mod tests {
         let mut n = Resource::new(
             name,
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: "a".into(),
                 maintenance: false,

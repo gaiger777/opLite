@@ -142,6 +142,15 @@ pub fn server_mac(network: Uuid) -> MacAddr {
     MacAddr([0x02, d[0], d[1], d[2], d[3], d[4]])
 }
 
+/// 수정 EUI-64 주소(RFC 4291 부록 A, 계획 66 §10): `prefix`의 위 64비트 + MAC에서 만든 인터페이스 id(가운데 `ff:fe`,
+/// 첫 바이트의 U/L 비트 뒤집기). SLAAC 게스트가 스스로 만드는 주소라 IPAM이 같은 주소를 포트 보안에 적는다.
+pub fn eui64(prefix: std::net::Ipv6Addr, mac: MacAddr) -> std::net::Ipv6Addr {
+    let m = mac.0;
+    let iid = u64::from_be_bytes([m[0] ^ 0x02, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]]);
+    let net = u128::from(prefix) & !u128::from(u64::MAX);
+    (net | u128::from(iid)).into()
+}
+
 /// 주소 `ip`가 든 네트워크의 서브넷
 pub fn nic_subnet(network: &NetworkSpec, ip: IpAddr) -> Option<&Subnet> {
     network.subnets.iter().find(|s| s.cidr.contains(ip))
@@ -159,6 +168,8 @@ mod tests {
 
     fn subnet(cidr: &str) -> Subnet {
         Subnet {
+            floating_pools: Vec::new(),
+            ipv6_mode: None,
             cidr: cidr.parse().unwrap(),
             gateway: None,
             dhcp: None,
@@ -346,7 +357,7 @@ mod tests {
             bridge: None,
             vlan: None,
             vxlan: None,
-            sdn: Some(crate::network::SdnNet {}),
+            sdn: Some(crate::network::SdnNet::default()),
             mtu: None,
             subnets: vec![subnet("10.0.0.0/24"), subnet("2001:db8::/64")],
             folder: None,
@@ -370,5 +381,28 @@ mod tests {
         let c: Cidr = "2001:db8::/124".parse().unwrap();
         assert_eq!(first_host(&c), ip("2001:db8::1"));
         assert_eq!(edges(&c), [ip("2001:db8::")]);
+    }
+
+    /// RFC 4291 부록 A의 예: MAC 34-56-78-9A-BC-DE → 인터페이스 id 3656:78ff:fe9a:bcde(U/L 비트 뒤집기)
+    #[test]
+    fn eui64_follows_rfc_4291() {
+        let mac = MacAddr([0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde]);
+        let prefix: std::net::Ipv6Addr = "2001:db8:1:2::".parse().unwrap();
+        assert_eq!(
+            eui64(prefix, mac),
+            "2001:db8:1:2:3656:78ff:fe9a:bcde"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+        );
+        // 접두사의 아래 64비트는 무시한다. 로컬 관리 MAC(02:…)은 U/L 비트가 꺼진다.
+        let host: std::net::Ipv6Addr = "2001:db8:1:2::99".parse().unwrap();
+        assert_eq!(eui64(host, mac), eui64(prefix, mac));
+        let local = MacAddr([0x02, 0, 0, 0, 0, 1]);
+        assert_eq!(
+            eui64(prefix, local),
+            "2001:db8:1:2::ff:fe00:1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+        );
     }
 }

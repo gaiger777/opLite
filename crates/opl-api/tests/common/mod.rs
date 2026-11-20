@@ -168,6 +168,7 @@ impl Env {
         let mut me = Resource::new(
             "node1",
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: "127.0.0.1:0".into(),
                 maintenance: false,

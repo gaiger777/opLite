@@ -316,6 +316,8 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             | Kind::Backup
             | Kind::VmImport
             | Kind::Network
+            | Kind::Router
+            | Kind::FloatingIp
             | Kind::StoragePool
             | Kind::Task
             | Kind::Folder => SystemRead,
@@ -328,7 +330,7 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             Kind::Backup => BackupCreate,
             Kind::BackupJob => BackupJob,
             Kind::StoragePool => StorageConfig,
-            Kind::Network | Kind::SecurityGroup => NetworkConfig,
+            Kind::Network | Kind::SecurityGroup | Kind::Router | Kind::FloatingIp => NetworkConfig,
             Kind::AlertRule => AlertManage,
             Kind::Folder => InventoryFolder,
             _ => ClusterAdmin,

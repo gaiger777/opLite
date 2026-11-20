@@ -107,8 +107,12 @@ fn has_contents(
     }
     // 종류를 모르면(풀 수 없는 스펙) 세 트리를 다 본다.
     let member_kinds: Vec<Kind> = match kind {
-        Some(k) => vec![k.member_kind()],
-        None => FolderKind::ALL.iter().map(|k| k.member_kind()).collect(),
+        Some(k) => k.member_kinds().to_vec(),
+        None => FolderKind::ALL
+            .iter()
+            .flat_map(|k| k.member_kinds())
+            .copied()
+            .collect(),
     };
     for member in member_kinds {
         let name = member.as_str();
@@ -269,17 +273,20 @@ fn vm_usage(objects: &Objects, names: &Names, spec: &Value) -> Result<FolderUsag
     Ok(usage)
 }
 
-/// 할당량 검사(설계 §9) 하나. [`quota_check`]가 만들고, VM을 한 번 훑으며 [`QuotaCheck::add`]로 사용량을 모은 뒤
-/// [`QuotaCheck::finish`]가 판정한다. VM 쓰기는 `check_exclusive`의 VM 훑기에 붙여 한 번만 푼다.
+/// 할당량 검사(설계 §9) 하나. [`quota_check`]가 만들고, 폴더에 드는 리소스(VM, 계획 66의 라우터·유동 IP)를 한 번
+/// 훑으며 [`QuotaCheck::add`]로 사용량을 모은 뒤 [`QuotaCheck::finish`]가 판정한다. VM 쓰기는 `check_exclusive`의 VM
+/// 훑기에 붙여 한 번만 푼다.
 pub(crate) struct QuotaCheck {
     before: QuotaTree,
     after: QuotaTree,
-    /// 할당량 있는 조상이 있는 폴더(쓰기 전이나 뒤). 그 밖의 VM은 세지 않는다.
+    /// 할당량 있는 조상이 있는 폴더(쓰기 전이나 뒤). 그 밖의 리소스는 세지 않는다.
     relevant: HashSet<Uuid>,
-    /// 쓰는 VM(훑기에서 빼고 전·후 몫을 따로 더한다)
-    vm: Option<Uuid>,
-    old_vm: Option<(Option<Uuid>, FolderUsage)>,
-    new_vm: Option<(Option<Uuid>, FolderUsage)>,
+    /// 셀 종류: VM 쓰기·볼륨 늘리기는 VM, 라우터·유동 IP 쓰기는 그 둘, 폴더 옮기기는 셋 모두
+    members: &'static [Kind],
+    /// 쓰는 리소스(훑기에서 빼고 전·후 몫을 따로 더한다)
+    this: Option<Uuid>,
+    old_this: Option<(Option<Uuid>, FolderUsage)>,
+    new_this: Option<(Option<Uuid>, FolderUsage)>,
     /// 늘리는 볼륨의 이름과 새 크기
     resized: Option<(String, u64)>,
     before_direct: DirectUsage,
@@ -287,6 +294,9 @@ pub(crate) struct QuotaCheck {
     /// VM을 이미 다 훑었다.
     pub(crate) scanned: bool,
 }
+
+/// 네트워크 폴더에 드는 할당량 대상(계획 66)
+const NETWORK_MEMBERS: &[Kind] = &[Kind::Router, Kind::FloatingIp];
 
 /// 이 쓰기가 할당량을 넘길 수 있으면 검사를 준비한다. 할당량이 걸린 조상이 없거나 아무것도 늘리지 않는 쓰기(HA·
 /// 마이그레이션·끄기 같은 노드·전원 바꾸기, 이름 바꾸기, 줄이기)는 None이라 VM을 훑지 않는다. `name`은 쓰는 리소스의
@@ -300,7 +310,10 @@ pub(crate) fn quota_check(
     spec: &Value,
     old: Option<&Value>,
 ) -> Result<Option<QuotaCheck>, StoreError> {
-    if !matches!(kind, Kind::Vm | Kind::Volume | Kind::Folder) {
+    if !matches!(
+        kind,
+        Kind::Vm | Kind::Volume | Kind::Folder | Kind::Router | Kind::FloatingIp
+    ) {
         return Ok(None);
     }
     // 볼륨은 늘릴 때만 본다(붙지 않은 볼륨은 세지 않는다). 늘리기 Task가 이미 늘린 디스크의 실제 크기
@@ -333,9 +346,10 @@ pub(crate) fn quota_check(
         before: tree,
         after: QuotaTree::new(),
         relevant: HashSet::new(),
-        vm: None,
-        old_vm: None,
-        new_vm: None,
+        members: &[Kind::Vm],
+        this: None,
+        old_this: None,
+        new_this: None,
         resized: None,
         before_direct: DirectUsage::new(),
         after_direct: DirectUsage::new(),
@@ -355,10 +369,27 @@ pub(crate) fn quota_check(
                 if new.within(&was) && subset(&bound, &quota_ancestors(&check.before, from)) {
                     return Ok(None);
                 }
-                check.old_vm = Some((from, was));
+                check.old_this = Some((from, was));
             }
-            check.vm = Some(id);
-            check.new_vm = Some((to, new));
+            check.this = Some(id);
+            check.new_this = Some((to, new));
+        }
+        Kind::Router | Kind::FloatingIp => {
+            // 몫은 늘 하나라 만들기와 할당량 있는 조상이 늘어나는 옮기기만 본다(계획 66).
+            let (to, from) = (folder_of(spec), old.and_then(folder_of));
+            let bound = quota_ancestors(&check.before, to);
+            if bound.is_empty()
+                || (old.is_some() && subset(&bound, &quota_ancestors(&check.before, from)))
+            {
+                return Ok(None);
+            }
+            let usage = FolderUsage::of_network_member(kind);
+            if old.is_some() {
+                check.old_this = Some((from, usage));
+            }
+            check.members = NETWORK_MEMBERS;
+            check.this = Some(id);
+            check.new_this = Some((to, usage));
         }
         Kind::Volume => {
             check.resized = Some((name.to_string(), spec["size_bytes"].as_u64().unwrap_or(0)));
@@ -383,6 +414,7 @@ pub(crate) fn quota_check(
             if subset(&bound, &quota_ancestors(&check.before, from)) {
                 return Ok(None);
             }
+            check.members = &[Kind::Vm, Kind::Router, Kind::FloatingIp];
         }
         _ => unreachable!(),
     }
@@ -400,20 +432,27 @@ pub(crate) fn quota_check(
 }
 
 impl QuotaCheck {
-    /// 훑기에서 만난 VM 하나(`id`, 저장된 스펙)를 센다.
+    /// 훑기에서 만난 리소스 하나(종류 `kind`, `id`, 저장된 스펙)를 센다.
     pub(crate) fn add(
         &mut self,
         objects: &Objects,
         names: &Names,
+        kind: Kind,
         id: Uuid,
         spec: &Value,
     ) -> Result<(), StoreError> {
-        if self.vm == Some(id) {
+        if self.this == Some(id) {
             return Ok(());
         }
         let Some(folder) = folder_of(spec).filter(|f| self.relevant.contains(f)) else {
             return Ok(());
         };
+        if kind != Kind::Vm {
+            let usage = FolderUsage::of_network_member(kind);
+            self.before_direct.entry(folder).or_default().add(&usage);
+            self.after_direct.entry(folder).or_default().add(&usage);
+            return Ok(());
+        }
         let before = vm_usage(objects, names, spec)?;
         let mut after = before;
         if let Some((name, size)) = &self.resized {
@@ -430,24 +469,33 @@ impl QuotaCheck {
         Ok(())
     }
 
-    /// 아직 훑지 않았으면 VM을 훑고, 할당량을 넘으면 `QuotaExceeded`.
+    /// 아직 훑지 않은 대상을 훑고, 할당량을 넘으면 `QuotaExceeded`.
     pub(crate) fn finish(
         mut self,
         objects: &Objects,
         names: &Names,
     ) -> Result<Result<(), Rejection>, StoreError> {
-        if !self.scanned {
-            let kind = Kind::Vm.as_str();
-            for item in objects.range((kind, 0u128)..=(kind, u128::MAX))? {
+        for kind in self.members {
+            if *kind == Kind::Vm && self.scanned {
+                continue;
+            }
+            let name = kind.as_str();
+            for item in objects.range((name, 0u128)..=(name, u128::MAX))? {
                 let (key, v) = item?;
                 let raw: RawResource = decode(v.value())?;
-                self.add(objects, names, Uuid::from_u128(key.value().1), &raw.spec)?;
+                self.add(
+                    objects,
+                    names,
+                    *kind,
+                    Uuid::from_u128(key.value().1),
+                    &raw.spec,
+                )?;
             }
         }
-        if let Some((Some(f), usage)) = self.old_vm {
+        if let Some((Some(f), usage)) = self.old_this {
             self.before_direct.entry(f).or_default().add(&usage);
         }
-        if let Some((Some(f), usage)) = self.new_vm {
+        if let Some((Some(f), usage)) = self.new_this {
             self.after_direct.entry(f).or_default().add(&usage);
         }
         Ok(
@@ -1134,5 +1182,202 @@ mod tests {
             moved < plain * 2 + Duration::from_millis(5),
             "{moved:?} vs {plain:?}"
         );
+    }
+
+    fn net_quota_folder(parent: Option<Uuid>, quota: Value) -> Value {
+        let mut v = folder("nq", "network", parent);
+        v["quota"] = quota;
+        v
+    }
+
+    fn router(folder: Option<Uuid>) -> Value {
+        let mut v = json!({});
+        if let Some(f) = folder {
+            v["folder"] = json!(f);
+        }
+        v
+    }
+
+    fn fip(folder: Option<Uuid>, address: &str) -> Value {
+        let mut v = json!({"network": "ext", "address": address});
+        if let Some(f) = folder {
+            v["folder"] = json!(f);
+        }
+        v
+    }
+
+    /// 계획 66: 네트워크 폴더의 라우터·유동 IP 수 할당량. 늘리는 쓰기(만들기·옮겨 넣기)만 막는다.
+    #[test]
+    fn router_and_floating_ip_quotas_count_network_folder_members() {
+        let mut sm = Sm::new();
+        sm.create(
+            Kind::Folder,
+            id(1),
+            net_quota_folder(None, json!({"routers": 1, "floating_ips": 2})),
+        )
+        .unwrap();
+        sm.create(Kind::Folder, id(2), folder("sub", "network", Some(id(1))))
+            .unwrap();
+        assert_eq!(sm.create(Kind::Router, id(10), router(Some(id(2)))), Ok(()));
+        assert_eq!(
+            exceeded(sm.create(Kind::Router, id(11), router(Some(id(1))))),
+            Some((id(1), QuotaDimension::Routers, 1, 2))
+        );
+        // 루트의 라우터는 세지 않고, 루트에서 할당량 폴더로 옮기면 넘는다.
+        assert_eq!(sm.create(Kind::Router, id(11), router(None)), Ok(()));
+        assert!(exceeded(sm.update(Kind::Router, id(11), router(Some(id(2))))).is_some());
+        // 같은 폴더 안의 바꾸기는 늘리지 않는다.
+        let mut described = router(Some(id(2)));
+        described["description"] = json!("edge");
+        assert_eq!(sm.update(Kind::Router, id(10), described), Ok(()));
+        // 라우터 수와 유동 IP 수는 따로 센다. 네트워크는 세지 않는다.
+        assert_eq!(
+            sm.create(Kind::Network, id(20), json!({"sdn": {}, "folder": id(2)})),
+            Ok(())
+        );
+        assert_eq!(
+            sm.create(Kind::FloatingIp, id(30), fip(Some(id(2)), "203.0.113.10")),
+            Ok(())
+        );
+        assert_eq!(
+            sm.create(Kind::FloatingIp, id(31), fip(Some(id(1)), "203.0.113.11")),
+            Ok(())
+        );
+        assert_eq!(
+            exceeded(sm.create(Kind::FloatingIp, id(32), fip(Some(id(2)), "203.0.113.12"))),
+            Some((id(1), QuotaDimension::FloatingIps, 2, 3))
+        );
+        // 하위 트리를 할당량 폴더로 옮기면 그 라우터·유동 IP가 더해진다.
+        sm.create(Kind::Folder, id(3), folder("other", "network", None))
+            .unwrap();
+        sm.create(Kind::Router, id(12), router(Some(id(3))))
+            .unwrap();
+        assert!(
+            exceeded(sm.update(Kind::Folder, id(3), folder("other", "network", Some(id(1)))))
+                .is_some()
+        );
+        sm.delete(Kind::Router, id(10)).unwrap();
+        assert_eq!(
+            sm.update(Kind::Folder, id(3), folder("other", "network", Some(id(1)))),
+            Ok(())
+        );
+        // 라우터·유동 IP가 든 폴더는 지우지 않는다.
+        assert_eq!(
+            sm.delete(Kind::Folder, id(3)),
+            Err(Rejection::FolderNotEmpty { id: id(3) })
+        );
+        // 라우터는 네트워크 폴더에만 든다.
+        sm.create(Kind::Folder, id(4), folder("vms", "vm", None))
+            .unwrap();
+        assert_eq!(
+            sm.create(Kind::Router, id(13), router(Some(id(4)))),
+            not_found(id(4))
+        );
+    }
+
+    fn in_use(r: Result<(), Rejection>) -> Option<(Kind, String, String, Uuid)> {
+        match r {
+            Err(Rejection::InUse {
+                kind,
+                field,
+                value,
+                holder,
+            }) => Some((kind, field, value, holder)),
+            _ => None,
+        }
+    }
+
+    /// 계획 66: 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP 사이에서도 겹치지 않는다. 라우터 인터페이스 네트워크, 유동
+    /// IP의 NIC, 공급자 네트워크의 physnet·VLAN도 하나뿐이다.
+    #[test]
+    fn routing_values_are_exclusive_across_kinds() {
+        let mut sm = Sm::new();
+        let nic_vm = |ip: &str| {
+            let mut v = vm(None);
+            v["nics"] = json!([{"network": "ext", "mac": "52:54:00:00:00:01", "ips": [ip]}]);
+            v
+        };
+        sm.create(Kind::Vm, id(1), nic_vm("203.0.113.5")).unwrap();
+        let ext = |ip: &str| json!({"external": {"network": "ext", "ips": [ip]}});
+        assert_eq!(
+            in_use(sm.create(Kind::Router, id(10), ext("203.0.113.5"))),
+            Some((Kind::Router, "ip".into(), "ext/203.0.113.5".into(), id(1)))
+        );
+        sm.create(Kind::Router, id(10), ext("203.0.113.6")).unwrap();
+        assert_eq!(
+            in_use(sm.create(Kind::FloatingIp, id(20), fip(None, "203.0.113.6"))),
+            Some((
+                Kind::FloatingIp,
+                "ip".into(),
+                "ext/203.0.113.6".into(),
+                id(10)
+            ))
+        );
+        sm.create(Kind::FloatingIp, id(20), fip(None, "203.0.113.7"))
+            .unwrap();
+        // VM 쪽에서 본 겹침도 같다.
+        assert_eq!(
+            in_use(sm.create(Kind::Vm, id(2), {
+                let mut v = nic_vm("203.0.113.7");
+                v["nics"][0]["mac"] = json!("52:54:00:00:00:02");
+                v
+            })),
+            Some((Kind::Vm, "ip".into(), "ext/203.0.113.7".into(), id(20)))
+        );
+        // 다른 네트워크의 같은 주소는 된다.
+        assert_eq!(
+            sm.create(
+                Kind::FloatingIp,
+                id(21),
+                json!({"network": "ext2", "address": "203.0.113.5"})
+            ),
+            Ok(())
+        );
+        // 한 네트워크는 라우터 하나의 인터페이스
+        sm.create(
+            Kind::Router,
+            id(11),
+            json!({"interfaces": [{"network": "t1"}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            in_use(sm.create(
+                Kind::Router,
+                id(12),
+                json!({"interfaces": [{"network": "t2"}, {"network": "t1"}]})
+            )),
+            Some((Kind::Router, "router-net".into(), "t1".into(), id(11)))
+        );
+        // NIC 하나에 유동 IP 하나
+        let target = json!({"vm": id(1), "mac": "52:54:00:00:00:01"});
+        let mut a = fip(None, "203.0.113.8");
+        a["target"] = target.clone();
+        sm.create(Kind::FloatingIp, id(22), a).unwrap();
+        let mut b = fip(None, "203.0.113.9");
+        b["target"] = target;
+        assert_eq!(
+            in_use(sm.create(Kind::FloatingIp, id(23), b)).map(|r| r.1),
+            Some("fip-nic".into())
+        );
+        // 같은 physnet·VLAN의 공급자 네트워크는 하나뿐이다(flat과 VLAN은 다르다).
+        let provider = |vlan: Option<u16>| {
+            let mut p = json!({"physnet": "ext"});
+            if let Some(v) = vlan {
+                p["vlan"] = json!(v);
+            }
+            json!({"sdn": {"provider": p}})
+        };
+        sm.create(Kind::Network, id(30), provider(None)).unwrap();
+        sm.create(Kind::Network, id(31), provider(Some(100)))
+            .unwrap();
+        assert_eq!(
+            in_use(sm.create(Kind::Network, id(32), provider(Some(100)))),
+            Some((Kind::Network, "physnet".into(), "ext/100".into(), id(31)))
+        );
+        // 오버레이 네트워크는 지금처럼 겹침 값이 없다.
+        sm.create(Kind::Network, id(33), json!({"sdn": {}}))
+            .unwrap();
+        sm.create(Kind::Network, id(34), json!({"sdn": {}}))
+            .unwrap();
     }
 }

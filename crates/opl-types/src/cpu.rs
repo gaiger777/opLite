@@ -1588,6 +1588,7 @@ mod tests {
         let mut node = Node::new(
             name,
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: format!("{name}:8006"),
                 maintenance: false,

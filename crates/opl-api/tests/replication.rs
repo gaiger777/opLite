@@ -333,6 +333,7 @@ async fn setup_full(schedule: &str, a_hotplug: bool, ha: bool) -> Setup {
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             node.name.clone(),
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: node.base.clone(),
                 maintenance: false,
@@ -894,6 +895,7 @@ async fn replicate_requests_are_checked() {
     let mut c: Resource<NodeSpec, NodeStatus> = Resource::new(
         "node3",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.3:0".into(),
             maintenance: false,

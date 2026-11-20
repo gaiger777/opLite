@@ -353,6 +353,7 @@ async fn two_nodes_with(
         let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
             node.name.clone(),
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: node.base.clone(),
                 maintenance: false,

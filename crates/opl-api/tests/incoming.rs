@@ -43,6 +43,7 @@ async fn setup() -> Setup {
     let source: Node = Resource::new(
         "node2",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,

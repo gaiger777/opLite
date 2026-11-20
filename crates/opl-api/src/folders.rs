@@ -69,7 +69,7 @@ fn require_move_inside(
     folder: &Folder,
     new_parent: Option<Uuid>,
 ) -> Result<(), ApiError> {
-    let kind = folder.spec.kind.member_kind();
+    let kind = folder.spec.kind.member_kinds()[0];
     for parent in [folder.spec.parent, new_parent] {
         let inside = AuthzTarget::Object {
             kind,
@@ -128,6 +128,13 @@ pub struct FolderQuery {
 fn require_quota_feature(state: &AppState, quota: Option<&FolderQuota>) -> Result<(), ApiError> {
     if quota.is_some_and(|q| q.dedicated_vcpus.is_some()) {
         require_feature(&state.cluster, NUMA)?;
+    }
+    // 네트워크 폴더의 라우터·유동 IP 수(계획 66)는 API 스테이지 전까지 막는다.
+    if quota.is_some_and(|q| q.routers.is_some() || q.floating_ips.is_some()) {
+        return Err(crate::sdn::routing_not_yet(
+            &state.cluster,
+            "routers and floating_ips quotas",
+        ));
     }
     Ok(())
 }
@@ -482,6 +489,10 @@ async fn move_one(
                 ()
             ))
         }
+        Kind::Router | Kind::FloatingIp => Err(crate::sdn::routing_not_yet(
+            &state.cluster,
+            "routers and floating IPs",
+        )),
         _ => unreachable!("FolderKind::of"),
     }
 }

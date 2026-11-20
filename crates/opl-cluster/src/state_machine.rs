@@ -12,7 +12,7 @@ use redb::{Database, ReadableDatabase, ReadableTable, Table};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::exclusive::exclusive_values;
+use crate::exclusive::{SHARED_IP_KINDS, exclusive_values};
 use crate::store::{
     KEY_LAST_APPLIED, KEY_LAST_MEMBERSHIP, KEY_SNAPSHOT_DATA, KEY_SNAPSHOT_META, META, NAMES,
     OBJECTS, SCHEMA_VERSION, StoreError, get_json, put_json,
@@ -533,7 +533,7 @@ fn check_exclusive(
         }
         let other_spec: RawResource = serde_json::from_slice(v.value())?;
         if let Some(q) = quota.as_deref_mut() {
-            q.add(objects, names, other, &other_spec.spec)?;
+            q.add(objects, names, kind, other, &other_spec.spec)?;
         }
         if let Some(h) = host.as_deref_mut() {
             h.add(other, &other_spec);
@@ -541,6 +541,21 @@ fn check_exclusive(
         for (field, value) in exclusive_values(kind, &other_spec.spec) {
             if wanted.iter().any(|(f, v)| *f == field && *v == value) {
                 return Ok(Err(in_use(field, &value, other)));
+            }
+        }
+    }
+    // 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP가 한 키 공간을 쓴다(계획 66). 다른 두 종류는 주소가 있을 때만 훑는다.
+    if SHARED_IP_KINDS.contains(&kind) && wanted.iter().any(|(f, _)| *f == "ip") {
+        for other_kind in SHARED_IP_KINDS.into_iter().filter(|k| *k != kind) {
+            let name = other_kind.as_str();
+            for item in objects.range((name, 0u128)..=(name, u128::MAX))? {
+                let (key, v) = item?;
+                let other_spec: RawResource = serde_json::from_slice(v.value())?;
+                for (field, value) in exclusive_values(other_kind, &other_spec.spec) {
+                    if field == "ip" && wanted.iter().any(|(f, v)| *f == field && *v == value) {
+                        return Ok(Err(in_use(field, &value, Uuid::from_u128(key.value().1))));
+                    }
+                }
             }
         }
     }

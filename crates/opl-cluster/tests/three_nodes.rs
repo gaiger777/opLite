@@ -663,6 +663,7 @@ async fn concurrent_creates_and_starts_on_two_nodes_keep_the_dedicated_cpus() {
     let mut host: Node = Resource::new(
         "host",
         NodeSpec {
+            sdn: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
             witness: false,

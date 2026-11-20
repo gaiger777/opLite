@@ -52,6 +52,7 @@ async fn add_node(env: &Env, name: &str, witness: bool, version: Option<&str>) {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,

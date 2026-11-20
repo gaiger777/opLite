@@ -467,6 +467,7 @@ async fn a_witness_cannot_hold_vms() {
     let mut witness: Node = Resource::new(
         "w",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
@@ -523,6 +524,7 @@ async fn create_without_machine_uses_the_cluster_architecture() {
     let mut witness: Node = Resource::new(
         "w",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
@@ -540,6 +542,7 @@ async fn create_without_machine_uses_the_cluster_architecture() {
     let mut x86: Node = Resource::new(
         "x86",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.3:0".into(),
             maintenance: false,
@@ -575,6 +578,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,
@@ -1643,6 +1647,7 @@ async fn add_full_node(env: &Env, name: &str, witness: bool) -> Uuid {
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.2:0".into(),
             maintenance: false,

@@ -724,6 +724,7 @@ async fn logging_out_on_another_node_ends_a_node_local_session() {
     let mut old = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
@@ -788,6 +789,7 @@ async fn sessions_stay_on_the_node_while_a_node_is_not_upgraded() {
     let mut old = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

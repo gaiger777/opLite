@@ -192,6 +192,7 @@ async fn settings_wait_until_every_node_is_upgraded() {
         let old = Resource::new(
             name,
             NodeSpec {
+                sdn: None,
                 host_resources: None,
                 address: "10.0.0.9:8006".into(),
                 maintenance: false,
@@ -296,6 +297,7 @@ async fn shutdown_policy_is_written_unless_default_and_waits_for_the_feature() {
     let mut old: opl_types::node::Node = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,

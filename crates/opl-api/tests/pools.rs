@@ -365,6 +365,7 @@ async fn volume_tasks_go_to_the_lowest_ready_node(backend: Value) {
     let mut low: Node = Resource::new(
         "low",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
@@ -427,6 +428,7 @@ async fn volume_tasks_never_go_to_a_witness() {
     let mut witness: Node = Resource::new(
         "w",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,
@@ -525,6 +527,7 @@ async fn other_node(env: &Env, name: &str, online: bool, pools: &[&str]) -> Uuid
     let mut node: Node = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.1:1".into(),
             maintenance: false,

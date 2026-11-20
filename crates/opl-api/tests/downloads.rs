@@ -465,6 +465,7 @@ async fn download_requests_are_checked() {
     let mut node: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "10.0.0.9:8006".into(),
             maintenance: false,

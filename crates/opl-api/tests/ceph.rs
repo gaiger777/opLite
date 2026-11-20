@@ -259,6 +259,7 @@ async fn add_node(env: &Env, name: &str, address: &str, witness: bool, online: b
     let mut r: Resource<NodeSpec, NodeStatus> = Resource::new(
         name,
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: address.into(),
             maintenance: false,
@@ -433,6 +434,7 @@ async fn init_checks_the_request() {
     let mut old: Resource<NodeSpec, NodeStatus> = Resource::new(
         "old",
         NodeSpec {
+            sdn: None,
             host_resources: None,
             address: "127.0.0.5:1".into(),
             maintenance: false,
