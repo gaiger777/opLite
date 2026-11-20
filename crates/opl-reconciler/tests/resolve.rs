@@ -1239,6 +1239,7 @@ async fn resolves_bridge_networks_to_taps() {
             bridge: "vmbr0".into(),
             vlan: Some(10),
             mtu: None,
+            ovn_port: None,
         }
     );
 }
@@ -1274,6 +1275,19 @@ async fn cloud_init_of_sdn_nics_uses_the_subnets() {
     assert_eq!(
         seed.instance_id,
         render(vm.id, "web", &ci, &vm.spec.nics).instance_id
+    );
+    // SDN NIC는 br-int의 tap이고 논리 포트 이름(OVS iface-id)을 단다. user NIC는 그대로다.
+    let mac = vm.spec.nics[1].mac.unwrap();
+    assert_eq!(spec.nics[0].backend, NicBackend::User);
+    assert_eq!(
+        spec.nics[1].backend,
+        NicBackend::Tap {
+            ifname: tap_name(vm.id, 1),
+            bridge: "br-int".into(),
+            vlan: None,
+            mtu: Some(1442),
+            ovn_port: Some(opl_types::sdn::port_name(vm.id, mac)),
+        }
     );
 }
 
@@ -1321,6 +1335,7 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
             bridge: "oplv1000".into(),
             vlan: None,
             mtu: Some(1450),
+            ovn_port: None,
         }
     );
     assert_eq!(
@@ -1330,6 +1345,7 @@ async fn resolves_vxlan_networks_to_taps_on_the_managed_bridge() {
             bridge: "oplv2000".into(),
             vlan: None,
             mtu: Some(8950),
+            ovn_port: None,
         }
     );
 }

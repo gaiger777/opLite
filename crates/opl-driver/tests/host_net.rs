@@ -101,11 +101,13 @@ async fn taps_join_bridges_with_vlans_and_are_removed_per_vm() {
         ifname: tap_name(vm, 0),
         bridge: aware.0.clone(),
         vlan: Some(10),
+        ovn: None,
     };
     let untagged = Tap {
         ifname: tap_name(vm, 1),
         bridge: plain.0.clone(),
         vlan: None,
+        ovn: None,
     };
     net.create_tap(&tagged).await.unwrap();
     net.create_tap(&untagged).await.unwrap();
@@ -124,6 +126,7 @@ async fn taps_join_bridges_with_vlans_and_are_removed_per_vm() {
         ifname: tap_name(other, 0),
         bridge: plain.0.clone(),
         vlan: None,
+        ovn: None,
     };
     net.create_tap(&other_tap).await.unwrap();
     net.delete_vm_taps(vm).await.unwrap();
@@ -146,6 +149,7 @@ async fn missing_or_vlan_unaware_bridges_are_refused() {
         ifname: tap_name(vm, 0),
         bridge: "oplt-missing".into(),
         vlan: None,
+        ovn: None,
     };
     let err = net.create_tap(&missing).await.unwrap_err();
     assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
@@ -154,6 +158,7 @@ async fn missing_or_vlan_unaware_bridges_are_refused() {
         ifname: tap_name(vm, 0),
         bridge: plain.0.clone(),
         vlan: Some(10),
+        ovn: None,
     };
     let err = net.create_tap(&vlan_on_plain).await.unwrap_err();
     assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
@@ -177,6 +182,7 @@ async fn taps_take_the_bridge_mtu() {
         ifname: tap_name(vm, 0),
         bridge: br.0.clone(),
         vlan: None,
+        ovn: None,
     };
     net.create_tap(&tap).await.unwrap();
     assert_eq!(master_of(&tap.ifname), Some(br.0.clone()));

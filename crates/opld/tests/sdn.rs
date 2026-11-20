@@ -6,7 +6,9 @@
 //! 단위를 다시 켜고 장치 없는 OVS 포트를 지우는지, opld를 다시 띄워도 그대로인지 본다. 끝에 실제 출력(판, `cluster/status`,
 //! `ovs-vsctl` JSON)을 찍고 opl-driver 해석기로 읽는다(시험 고정물과 견주기). 리더 OvnSync(스테이지 3)와 IPAM·DHCP
 //! (스테이지 4 — 이름공간의 OVS 내부 포트가 busybox udhcpc로 IPAM 주소를 받고, 포트 보안이 위조 주소를 막는지)도 본다. Task는 제어 소켓의 시험 고리로 만든다(`/sdn`
-//! API는 스테이지 6).
+//! API는 스테이지 6). 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM tap이 br-int에 붙어 이 chassis에 바인딩되는지, 클라우드
+//! 이미지(`OPL_TEST_CLOUD_IMAGE`, 있으면)의 게스트가 OVN DHCP로 IPAM 주소를 받는지 본다. 러너 하나는 OVS 하나라 두 chassis
+//! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험).
 //! `sudo -E env "PATH=$PATH" cargo test -p opld --features sdn-it --test sdn -- --nocapture`
 //! Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하다. OVN이 설치되지 않은 호스트여야 하고 시험은
 //! 호스트에 OVN 꾸러미와 데몬을 남긴다(CI 러너용).
@@ -34,6 +36,8 @@ use serde_json::{Value, json};
 const INSTALL_WAIT: Duration = Duration::from_secs(15 * 60);
 /// 에이전트(`refresh_secs = 5`)가 맞추기를 기다리는 시간
 const AGENT_WAIT: Duration = Duration::from_secs(60);
+/// 클라우드 이미지 게스트가 켜져 DHCP로 주소를 받기까지(TCG면 몇 분)
+const GUEST_WAIT: Duration = Duration::from_secs(8 * 60);
 
 /// `oplctl login`이 저장한 로그인 정보로 API 클라이언트를 만든다.
 fn client(d: &Daemon) -> Client {
@@ -849,6 +853,11 @@ async fn orbivisord_sets_up_ovn() {
     // 이름공간 둘에 OVS 내부 포트를 그 두 포트의 iface-id·MAC으로 붙여(게스트 OS 없는 "VM") busybox udhcpc가 IPAM 주소·
     // MTU·DNS를 받고, 서로 ping하고, 주소를 바꾼 위조 패킷은 포트 보안이 막는다.
     Box::pin(dhcp_section(&d, &tag)).await;
+
+    // 8. 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM은 tap이 br-int의 OVS 포트(iface-id = 논리 포트)이고, ovn-controller가
+    // 이 chassis에 바인딩한다(SB Port_Binding.chassis·up, NB up, ovn-installed). 클라우드 이미지가 있으면 게스트가 OVN DHCP로
+    // IPAM 주소를 받았는지 같은 스위치의 이름공간 포트에서 ping으로 본다. 끄면 OVS 포트와 chassis 요청이 사라진다.
+    Box::pin(binding_section(&d, &tag, &node)).await;
 }
 
 /// 이름공간 `ns`의 OVS 내부 포트 `dev`(논리 포트 `port`, MAC `mac`)
@@ -1040,5 +1049,260 @@ async fn dhcp_section(d: &Daemon, tag: &str) {
     for (ns, dev, _) in &leases {
         let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
         let _ = try_run("ip", &["netns", "del", ns]);
+    }
+}
+
+/// OVN 소켓으로 부르는 `ovn-sbctl`·`ovn-nbctl`의 `--bare` 출력(앞뒤 공백 없이)
+fn ovn_bare(program: &str, sock: &str, args: &[&str]) -> String {
+    let db = format!("--db=unix:/run/opl/ovn/{sock}.sock");
+    let mut all = vec![db.as_str(), "--bare"];
+    all.extend_from_slice(args);
+    run(program, &all).trim().to_string()
+}
+
+/// OVS 포트 `tap`의 `Interface.external_ids` 칸 하나(없으면 빈 글)
+fn iface_id_field(tap: &str, key: &str) -> String {
+    let (_, out, _) = try_run(
+        "ovs-vsctl",
+        &[
+            "--if-exists",
+            "get",
+            "Interface",
+            tap,
+            &format!("external_ids:{key}"),
+        ],
+    );
+    out.trim().trim_matches('"').to_string()
+}
+
+async fn binding_section(d: &Daemon, tag: &str, node: &str) {
+    hook(
+        d,
+        "sdn-network",
+        json!({ "name": "tenant-q", "subnets": [{ "cidr": "10.78.0.0/24" }] }),
+    )
+    .await;
+    // 클라우드 이미지(CI `ovn` 작업이 받아 둔다)가 있으면 게스트 OS로 켜 DHCP까지 본다. 없으면 디스크 없는 VM(펌웨어만 돈다)으로
+    // 바인딩만 본다.
+    let image = std::env::var_os("OPL_TEST_CLOUD_IMAGE").map(PathBuf::from);
+    let mut create = vec!["vm", "create", "sdn-guest", "--nic", "tenant-q"];
+    if let Some(image) = &image {
+        let pool = d.path("pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        d.ctl(&["pool", "create", "local", "--path", pool.to_str().unwrap()])
+            .await
+            .unwrap();
+        d.wait_pool_ready("local").await;
+        d.ctl(&[
+            "volume",
+            "import",
+            "noble",
+            "--pool",
+            "local",
+            "--file",
+            image.to_str().unwrap(),
+            "--source-format",
+            "qcow2",
+        ])
+        .await
+        .unwrap();
+        create.extend([
+            "--memory",
+            "1024",
+            "--machine",
+            "q35",
+            "--disk",
+            "noble",
+            "--ci-hostname",
+            "sdn-guest",
+        ]);
+    } else {
+        create.extend(["--memory", "256"]);
+    }
+    create.push("--start");
+    let started = d.ctl(&create).await;
+    if let Err(e) = started {
+        panic!("vm sdn-guest did not start: {e}\n{}", d.log());
+    }
+    let vm = d.ctl_json(&["vm", "get", "sdn-guest"]).await;
+    assert_eq!(vm["status"]["phase"], "running", "{vm}");
+    let id: uuid::Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let mac: opl_types::vm::MacAddr = vm["spec"]["nics"][0]["mac"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let ip = vm["spec"]["nics"][0]["ips"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(ip, "10.78.0.2");
+    let port = opl_types::sdn::port_name(id, mac);
+    let tap = opl_types::network::tap_name(id, 0);
+
+    // tap은 br-int의 OVS 포트이고 OVN 칸을 단다. Linux 브리지에는 없다.
+    assert_eq!(run("ovs-vsctl", &["port-to-br", &tap]).trim(), "br-int");
+    assert_eq!(iface_id_field(&tap, "iface-id"), port);
+    assert_eq!(iface_id_field(&tap, "attached-mac"), mac.to_string());
+    assert_eq!(iface_id_field(&tap, "vm-uuid"), id.to_string());
+    assert_eq!(iface_id_field(&tap, "orbivisor-cluster"), tag);
+    let link = run("ip", &["-j", "link", "show", "dev", &tap]);
+    assert!(link.contains("\"master\":\"ovs-system\""), "{link}");
+    assert!(link.contains("\"mtu\":1442"), "{link}");
+    let args = std::fs::read_to_string(format!(
+        "/proc/{}/cmdline",
+        vm["status"]["pid"].as_u64().unwrap()
+    ))
+    .unwrap()
+    .replace('\0', " ");
+    assert!(
+        args.contains(&format!("tap,id=net0,ifname={tap},script=no,downscript=no")),
+        "{args}"
+    );
+    assert!(args.contains("host_mtu=1442"), "{args}");
+
+    // NB는 이 노드를 요청하고, ovn-controller가 바인딩해 흐름을 다 깔면 OVS·SB·NB가 모두 안다.
+    wait_for("the port to request this chassis", AGENT_WAIT, || async {
+        nb_rows(d, tag).await.ports.iter().any(|p| {
+            p.name == port && p.options.get("requested-chassis").map(String::as_str) == Some(node)
+        })
+    })
+    .await;
+    wait_for("ovn-installed on the tap", AGENT_WAIT, || async {
+        iface_id_field(&tap, "ovn-installed") == "true"
+    })
+    .await;
+    let chassis = ovn_bare(
+        "ovn-sbctl",
+        "sb",
+        &[
+            "--columns=_uuid",
+            "find",
+            "Chassis",
+            &format!("name={node}"),
+        ],
+    );
+    let binding = |column: &str| {
+        ovn_bare(
+            "ovn-sbctl",
+            "sb",
+            &[
+                &format!("--columns={column}"),
+                "find",
+                "Port_Binding",
+                &format!("logical_port={port}"),
+            ],
+        )
+    };
+    wait_for("the SB port binding", AGENT_WAIT, || async {
+        binding("chassis") == chassis && binding("up") == "true"
+    })
+    .await;
+    wait_for("the NB port to be up", AGENT_WAIT, || async {
+        ovn_bare("ovn-nbctl", "nb", &["lsp-get-up", &port]) == "up"
+    })
+    .await;
+    eprintln!(
+        "Port_Binding {port}: chassis={} up={}",
+        binding("chassis"),
+        binding("up")
+    );
+
+    // 게스트 OS가 있으면: cloud-init network-config의 DHCP로 OVN이 IPAM 주소를 주었는지, 같은 스위치의 다른 포트(꺼진 VM의
+    // 포트에 붙인 이름공간)에서 ping으로 본다.
+    if image.is_some() {
+        let c = client(d);
+        let probe = c
+            .post(
+                "/vms",
+                &json!({ "name": "sdn-probe", "spec": {
+                    "cpu": { "cores": 1 }, "memory_mib": 256,
+                    "nics": [{ "network": "tenant-q", "model": "virtio" }]
+                } }),
+            )
+            .await
+            .unwrap();
+        let probe_id: uuid::Uuid = probe["id"].as_str().unwrap().parse().unwrap();
+        let probe_mac = probe["spec"]["nics"][0]["mac"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let probe_port = opl_types::sdn::port_name(probe_id, probe_mac.parse().unwrap());
+        wait_for("sdn-probe's port", AGENT_WAIT, || async {
+            nb_rows(d, tag)
+                .await
+                .ports
+                .iter()
+                .any(|p| p.name == probe_port)
+        })
+        .await;
+        let lease = d.path("lease.q");
+        let script = d.path("udhcpc-q.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nbound|renew)\n  ip addr flush dev \"$interface\"\n  ip addr add \"$ip/$mask\" dev \"$interface\"\n  echo \"$ip\" > \"{}\"\n  ;;\nesac\n",
+                lease.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        run("chmod", &["755", &script.to_string_lossy()]);
+        let (ns, dev) = ("oplnsq", "opldhq");
+        namespace_port(ns, dev, &probe_port, &probe_mac);
+        wait_for(
+            "a DHCP lease for the probe namespace",
+            AGENT_WAIT,
+            || async { udhcpc(ns, dev, &script, &lease) },
+        )
+        .await;
+        assert_eq!(std::fs::read_to_string(&lease).unwrap().trim(), "10.78.0.3");
+        // 게스트 부팅(KVM이면 수십 초, TCG면 몇 분)
+        wait_for(
+            "the guest to answer on its IPAM address",
+            GUEST_WAIT,
+            || async {
+                try_run(
+                    "ip",
+                    &["netns", "exec", ns, "ping", "-c", "1", "-W", "2", &ip],
+                )
+                .0
+            },
+        )
+        .await;
+        let neigh = run("ip", &["netns", "exec", ns, "ip", "neigh", "show", &ip]);
+        assert!(neigh.contains(&mac.to_string()), "{neigh}");
+        let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
+        let _ = try_run("ip", &["netns", "del", ns]);
+        c.delete(&format!("/vms/{probe_id}")).await.unwrap();
+    }
+
+    // 끄면 tap과 OVS 포트가 사라지고(장치 없는 포트를 남기지 않는다), 꺼진 VM의 포트는 chassis를 요청하지 않는다.
+    d.ctl(&["vm", "stop", "sdn-guest", "--force"])
+        .await
+        .unwrap();
+    wait_for("the tap and its OVS port to go", AGENT_WAIT, || async {
+        let ports = run("ovs-vsctl", &["list-ports", "br-int"]);
+        !ports.lines().any(|p| p == tap) && !try_run("ip", &["link", "show", "dev", &tap]).0
+    })
+    .await;
+    wait_for(
+        "the stopped VM's port to release the chassis",
+        AGENT_WAIT,
+        || async {
+            nb_rows(d, tag)
+                .await
+                .ports
+                .iter()
+                .any(|p| p.name == port && !p.options.contains_key("requested-chassis"))
+        },
+    )
+    .await;
+    wait_for("the SB port binding to go", AGENT_WAIT, || async {
+        binding("chassis").is_empty()
+    })
+    .await;
+    d.ctl(&["vm", "delete", "sdn-guest"]).await.unwrap();
+    if image.is_some() {
+        d.ctl(&["volume", "delete", "noble"]).await.unwrap();
     }
 }
