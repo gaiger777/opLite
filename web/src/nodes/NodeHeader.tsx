@@ -10,6 +10,7 @@ import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { formatCapacity } from "@/lib/format";
 import { isFrozen, useNodeActions } from "@/nodes/NodeActions";
+import { NodeSdnCell } from "@/sdn/chips";
 
 /**
  * 노드 상세의 머리(`ResourceHeader`): 이름·상태·★, 주 동작(유지보수·비우기), 케밥(업데이트·인터페이스·디스크·
@@ -82,6 +83,10 @@ export function NodeHeader({ node, vms }: { node: Node; vms?: number }) {
           { label: t("nodes.cpus"), value: node.status.cpus },
           { label: t("nodes.memory"), value: formatCapacity(node.status.memory_mib) },
           { label: t("nodes.vms"), value: vms ?? "—" },
+          // SDN(OVN) chassis·중앙 역할(계획 65). SDN을 세우지 않았으면 없다.
+          ...(node.status.sdn
+            ? [{ label: t("nodes.sdn"), value: <NodeSdnCell sdn={node.status.sdn} /> }]
+            : []),
         ]}
       >
         <ReasonList base={hint} reasons={[drain]} className="basis-full" />

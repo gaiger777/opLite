@@ -15,6 +15,7 @@ export type Kind =
   | "remote"
   | "ha-check"
   | "ceph"
+  | "sdn"
   | "alert-rule"
   | "notification-target"
   | "grant"

@@ -365,3 +365,24 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await page.goto("/vms");
   await expect(page).toHaveURL(/\/login\?next=%2Fvms/);
 });
+
+// SDN(계획 65): 설정 전에는 네트워크 탭의 SDN 보기가 빈 상태이고, 네트워크 만들기의 SDN 종류는 막혀 있다.
+test("SDN is not set up: the empty state and the blocked SDN type", async ({ page }) => {
+  await signIn(page);
+  await openTab(page, "Infrastructure", "Networks");
+  await page
+    .getByRole("navigation", { name: "Networks views" })
+    .getByRole("link", { name: "SDN", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/sdn$/);
+  await expect(page.getByText("SDN is not set up")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start the SDN setup" })).toBeVisible();
+  await page
+    .getByRole("navigation", { name: "Networks views" })
+    .getByRole("link", { name: "Networks", exact: true })
+    .click();
+  // 머리줄의 전역 "Create" 메뉴가 아니라 목록의 만들기 단추
+  await page.getByRole("main").getByRole("button", { name: "Create", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Create a network" });
+  await expect(dialog.getByRole("option", { name: "SDN (OVN) — not set up" })).toBeDisabled();
+});

@@ -4,8 +4,18 @@ import { http, HttpResponse } from "msw";
 
 import type { Network } from "@/api/types";
 import { bridgeName, NetworksPage, validBridge } from "@/networks/NetworksPage";
-import { folder, folderId, NODE, vm } from "@/test/fixtures";
+import {
+  folder,
+  folderId,
+  NODE,
+  readyChassis,
+  sdnNetwork,
+  sdnNode,
+  sdnView,
+  vm,
+} from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
+import { expectNoAxeViolations } from "@/test/axe";
 import { apiUrl, server } from "@/test/server";
 
 function network(name: string, bridge: string, vlan: number | null = null): Network {
@@ -313,8 +323,9 @@ it("hides changes from operators", async () => {
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
 });
 
-it("lets a folder network delegator create only VXLAN networks", async () => {
-  // 브리지 네트워크는 루트 cluster.admin만 만든다(계획 62 리뷰 1). 폴더의 network.config는 VXLAN만.
+it("lets a folder network delegator create only VXLAN and SDN networks", async () => {
+  // 브리지 네트워크는 루트 cluster.admin만 만든다(계획 62 리뷰 1). 폴더의 network.config는 VXLAN과 SDN(계획 65 §11,
+  // 기본 응답은 SDN을 세우기 전이라 막혀 있다).
   const A = folderId("teamA");
   server.use(
     http.get(apiUrl("/permissions/mine"), () =>
@@ -338,5 +349,224 @@ it("lets a folder network delegator create only VXLAN networks", async () => {
     within(kind)
       .getAllByRole("option")
       .map((o) => o.textContent),
-  ).toEqual(["VXLAN"]);
+  ).toEqual(["VXLAN", "SDN (OVN) — not set up"]);
+});
+
+// --- SDN 네트워크(계획 65) ---
+
+const TENANT = sdnNetwork("tenant", [{ cidr: "10.10.0.0/24", dns_servers: ["10.0.0.53"] }]);
+
+/** 서버 `GET /networks/{key}/ips`의 모양: NB를 읽었으면 `live`(up·노드), 못 읽었으면 `live: null`과 `live_error` */
+function ips(live: boolean) {
+  return {
+    network: "tenant",
+    subnets: [{ cidr: "10.10.0.0/24", size: 253, used: 2, free: 251 }],
+    allocations: [
+      {
+        vm: vm("db", "stopped").id,
+        vm_name: "db",
+        nic: 1,
+        mac: "52:54:00:aa:bb:02",
+        ips: ["10.10.0.3"],
+        live: live ? { up: false } : null,
+      },
+      {
+        vm: vm("web", "running").id,
+        vm_name: "web",
+        nic: 0,
+        mac: "52:54:00:aa:bb:01",
+        ips: ["10.10.0.2"],
+        live: live ? { up: true, node: "node-a" } : null,
+      },
+    ],
+    ...(!live && { live_error: "cannot reach the OVN NB: connection refused" }),
+  };
+}
+
+it("lists SDN networks with their subnets, usage and ready chassis", async () => {
+  const a = sdnNode(1, readyChassis(1, "leader"));
+  const b = sdnNode(2, { chassis: "down" });
+  mockLists({ network: [TENANT], node: [a, b] });
+  server.use(http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(ips(true))));
+  renderPage(<NetworksPage />);
+  const table = await screen.findByRole("table", { name: "Networks" });
+  const headers = within(table).getAllByRole("columnheader");
+  const row = (await within(table).findByText("tenant")).closest("tr")!;
+  const cell = (name: string) =>
+    within(row).getAllByRole("cell")[headers.findIndex((h) => h.textContent === name)];
+  expect(cell("Type")).toHaveTextContent("SDN (OVN)");
+  expect(cell("Bridge")).toHaveTextContent("br-int");
+  expect(cell("VLAN/VNI")).toHaveTextContent("—");
+  expect(cell("MTU")).toHaveTextContent("1442");
+  expect(cell("Nodes with the bridge")).toHaveTextContent("node-a");
+  expect(cell("Nodes with the bridge")).not.toHaveTextContent("node-b");
+  expect(cell("Subnets")).toHaveTextContent("10.10.0.0/24");
+  expect(await within(cell("Subnets")!).findByText("2/253")).toBeInTheDocument();
+  expect(within(cell("Subnets")!).getByRole("meter", { name: "Subnet usage" })).toHaveAttribute(
+    "aria-valuenow",
+    "2",
+  );
+});
+
+it("blocks the SDN type until SDN is set up", async () => {
+  mockLists({ node: [bridged] });
+  renderPage(<NetworksPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  const option = await within(dialog).findByRole("option", { name: "SDN (OVN) — not set up" });
+  expect(option).toBeDisabled();
+  expect(
+    within(dialog).getByText("SDN networks need SDN (OVN) set up first, under Networks › SDN."),
+  ).toBeInTheDocument();
+});
+
+it("creates an SDN network with subnets", async () => {
+  const a = sdnNode(1, readyChassis(1, "leader"));
+  mockLists({ node: [a] });
+  let body: unknown;
+  server.use(
+    http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([a], [a]))),
+    http.post(apiUrl("/networks"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(TENANT, { status: 201 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  await user.type(within(dialog).getByLabelText("Name"), "tenant");
+  await within(dialog).findByRole("option", { name: "SDN (OVN)" });
+  await user.selectOptions(within(dialog).getByLabelText("Type"), "sdn");
+  expect(within(dialog).queryByLabelText("VNI")).not.toBeInTheDocument();
+  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(
+    /Defaults to 1442/,
+  );
+  await user.click(within(dialog).getByRole("button", { name: "Add a subnet" }));
+  await user.click(within(dialog).getByRole("button", { name: "Add a subnet" }));
+  const first = within(dialog).getByRole("group", { name: "Subnet 1" });
+  const second = within(dialog).getByRole("group", { name: "Subnet 2" });
+  await user.type(within(first).getByLabelText("CIDR"), "10.10.0.0/24");
+  await user.type(within(first).getByLabelText("DNS servers"), "10.0.0.53, 1.1.1.1");
+  await user.type(within(first).getByLabelText("Allocation ranges"), "10.10.0.100-10.10.0.199");
+  await user.click(within(first).getByLabelText("DHCP"));
+  await user.type(within(second).getByLabelText("CIDR"), "10.20.0.0/24");
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  // 한 네트워크에 IPv4 서브넷은 하나다.
+  expect(
+    within(second).getByText("A network has at most one IPv4 and one IPv6 subnet."),
+  ).toBeVisible();
+  await user.clear(within(second).getByLabelText("CIDR"));
+  await user.type(within(second).getByLabelText("CIDR"), "fd00:10::/64");
+  // IPv6 서브넷에는 DHCP가 없다.
+  expect(within(second).queryByLabelText("DHCP")).not.toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created network tenant.")).toBeInTheDocument();
+  expect(body).toEqual({
+    name: "tenant",
+    spec: {
+      sdn: {},
+      subnets: [
+        {
+          cidr: "10.10.0.0/24",
+          dhcp: false,
+          dns_servers: ["10.0.0.53", "1.1.1.1"],
+          pools: [{ start: "10.10.0.100", end: "10.10.0.199" }],
+        },
+        { cidr: "fd00:10::/64" },
+      ],
+    },
+  });
+});
+
+it("shows the addresses of an SDN network and the OVN port state", async () => {
+  mockLists({ network: [TENANT], node: [sdnNode(1, readyChassis(1))] });
+  let live = true;
+  server.use(http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(ips(live))));
+  const user = userEvent.setup();
+  const { queryClient } = renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Open tenant" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
+  const table = await within(sheet).findByRole("table", { name: "IP addresses" });
+  const web = within(table).getByRole("link", { name: "web" }).closest("tr")!;
+  expect(web).toHaveTextContent("#0");
+  expect(web).toHaveTextContent("52:54:00:aa:bb:01");
+  expect(web).toHaveTextContent("10.10.0.2");
+  expect(web).toHaveTextContent("Up");
+  expect(web).toHaveTextContent("node-a");
+  expect(within(table).getByText("db").closest("tr")).toHaveTextContent("Down");
+  expect(within(sheet).getByText("2 used of 253, 251 free")).toBeInTheDocument();
+  await expectNoAxeViolations(sheet, { disable: ["region"] });
+  // OVN을 읽지 못하면 상태를 모른다고 하고 까닭을 보인다.
+  live = false;
+  await queryClient.invalidateQueries({ queryKey: ["network-ips"] });
+  expect(
+    await within(sheet).findByText(
+      "Could not read the port state from OVN: cannot reach the OVN NB: connection refused",
+    ),
+  ).toBeInTheDocument();
+  expect(within(table).getByText("web").closest("tr")).not.toHaveTextContent("Up");
+});
+
+it("saves the whole subnet list with If-Match and names the VMs using a removed subnet", async () => {
+  mockLists({ network: [TENANT], node: [] });
+  const sent: { ifMatch: string | null; body: unknown }[] = [];
+  let inUse = true;
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(ips(true))),
+    http.patch(apiUrl("/networks/:key"), async ({ request }) => {
+      sent.push({ ifMatch: request.headers.get("If-Match"), body: await request.json() });
+      if (inUse) {
+        return HttpResponse.json(
+          {
+            code: "subnet_in_use",
+            message:
+              'subnet 10.10.0.0/24 of network "tenant" has addresses of VMs db, web; remove those NICs or change their addresses first',
+          },
+          { status: 409 },
+        );
+      }
+      return HttpResponse.json({
+        ...TENANT,
+        revision: 5,
+        spec: { sdn: {}, subnets: [{ cidr: "fd00::/64" }] },
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Open tenant" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
+  await user.click(within(sheet).getByRole("button", { name: "Edit subnets" }));
+  // 저장된 서브넷의 CIDR·게이트웨이는 바꿀 수 없다.
+  const saved = within(sheet).getByRole("group", { name: "Subnet 1" });
+  expect(within(saved).getByLabelText("CIDR")).toBeDisabled();
+  expect(within(saved).getByLabelText("Gateway")).toBeDisabled();
+  await user.click(within(sheet).getByRole("button", { name: "Remove subnet 1" }));
+  await user.click(within(sheet).getByRole("button", { name: "Add a subnet" }));
+  await user.type(
+    within(within(sheet).getByRole("group", { name: "Subnet 1" })).getByLabelText("CIDR"),
+    "fd00::/64",
+  );
+  await user.click(within(sheet).getByRole("button", { name: "Save" }));
+  expect(await within(sheet).findByRole("alert")).toHaveTextContent(
+    'The subnet is still in use: subnet 10.10.0.0/24 of network "tenant" has addresses of VMs db, web',
+  );
+  expect(sent).toEqual([{ ifMatch: "4", body: { subnets: [{ cidr: "fd00::/64" }] } }]);
+  inUse = false;
+  await user.click(within(sheet).getByRole("button", { name: "Save" }));
+  expect(await screen.findByText("Saved the subnets of tenant.")).toBeInTheDocument();
+  expect(sent).toHaveLength(2);
+});
+
+it("lets only network writers edit the subnets", async () => {
+  mockLists({ network: [TENANT] });
+  server.use(http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(ips(true))));
+  renderPage(<NetworksPage />, { as: { ...ADMIN, role: "viewer" } });
+  await userEvent.click(await screen.findByRole("button", { name: "Open tenant" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
+  expect(await within(sheet).findByRole("table", { name: "Subnets" })).toHaveTextContent(
+    "10.0.0.53",
+  );
+  expect(within(sheet).queryByRole("button", { name: "Edit subnets" })).not.toBeInTheDocument();
 });

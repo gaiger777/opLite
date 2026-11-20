@@ -40,6 +40,7 @@ import {
 } from "@/imports/imports";
 import { ImportedVm, ImportPhaseBadge, useImportError } from "@/imports/ImportsPage";
 import { formatBytes, formatMib } from "@/lib/format";
+import { sdnNetworkNamed } from "@/sdn/ips";
 import { choosablePoolsOn } from "@/storage/pools";
 import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
@@ -293,6 +294,11 @@ function RunSection({
   // Task는 OVA가 있는 노드에서 돈다. 그 노드에서 준비된 풀만 고른다(노드를 읽지 못하면 모두).
   const usable = choosablePoolsOn(pools.data ?? [], nodes, imp.spec.node);
   const networkNames = [USER_NETWORK, ...(networks.data ?? []).map((n) => n.name)];
+  // 원본 NIC마다 고른 네트워크가 SDN인지(계획 65 — 그 NIC의 주소 칸)
+  const sourceNics = imp.status.source_vm?.nics ?? [];
+  const sdnNics = sourceNics.map((n) =>
+    sdnNetworkNamed(networks.data, form.networks[n.network] ?? ""),
+  );
   const set = (patch: Partial<RunForm>) => setForm((f) => ({ ...f, ...patch }));
   // 가져온 VM은 OVA가 있는 노드의 아키텍처다(노드를 읽지 못하면 서버가 고른다). 클러스터 기준이 있으면(auto·pinned)
   // `cluster`를 미리 고른다(설계 §12, 리뷰 2 웹 #3). 사용자가 고르면 그대로 둔다.
@@ -329,7 +335,7 @@ function RunSection({
       const task = await call(
         api.POST("/vm-imports/{key}/run", {
           params: { path: { key: imp.id } },
-          body: toRun(form),
+          body: toRun(form, sdnNics),
         }),
       );
       trackTask(task, t("tasks.op.vm-import", { target: form.name }));
@@ -497,7 +503,13 @@ function RunSection({
                       className="w-full"
                       value={form.networks[source] ?? ""}
                       onChange={(e) =>
-                        set({ networks: { ...form.networks, [source]: e.target.value } })
+                        // 네트워크를 바꾸면 그 네트워크를 쓰는 NIC의 주소 입력을 비운다.
+                        set({
+                          networks: { ...form.networks, [source]: e.target.value },
+                          ips: sourceNics.map((n, j) =>
+                            n.network === source ? "" : (form.ips?.[j] ?? ""),
+                          ),
+                        })
                       }
                       {...a11y}
                     >
@@ -514,6 +526,34 @@ function RunSection({
                   )}
                 </Field>
               ))}
+              {sourceNics.map(
+                (nic, i) =>
+                  sdnNics[i] && (
+                    <Field
+                      key={`ips-${i}`}
+                      id={`run-ips-${i}`}
+                      label={t("imports.nicIps", { n: i, network: nic.network })}
+                      error={errors[`ips${i}`]}
+                      hint={t("vmForm.nicIpsHint")}
+                    >
+                      {(a11y) => (
+                        <Input
+                          id={`run-ips-${i}`}
+                          placeholder={t("vmForm.nicIpsAuto")}
+                          value={form.ips?.[i] ?? ""}
+                          onChange={(e) =>
+                            set({
+                              ips: sourceNics.map((_, j) =>
+                                j === i ? e.target.value : (form.ips?.[j] ?? ""),
+                              ),
+                            })
+                          }
+                          {...a11y}
+                        />
+                      )}
+                    </Field>
+                  ),
+              )}
             </div>
             <div className="flex flex-col gap-1">
               <div className="flex items-center gap-2">

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
 import { usePermissions } from "@/auth/usePermissions";
-import { areaOf, visibleTabs } from "@/layout/nav";
+import { areaOf, viewVisible, visibleTabs } from "@/layout/nav";
 
 /**
  * 영역 탭: 본문 위의 링크 목록이다. 경로가 바뀌므로 `role=tablist`가 아니라 `<nav>`이고 지금 탭은
@@ -49,9 +49,10 @@ export function AreaTabs() {
 /** 탭 안의 보기 전환(segmented). 보기가 있는 탭의 목록 화면에서만 보인다(상세 화면에는 없다). */
 export function ViewSwitch() {
   const { t } = useTranslation();
+  const gate = usePermissions();
   const { pathname } = useLocation();
   const hit = areaOf(pathname);
-  const views = hit?.tab.views;
+  const views = hit?.tab.views?.filter((view) => viewVisible(view, gate));
   if (!hit || !views || !hit.view || pathname.replace(/\/+$/, "") !== hit.prefix) {
     return null;
   }

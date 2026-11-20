@@ -15,6 +15,7 @@ import { Label } from "@/components/ui/label";
 import { folderPath, folderTree, type FolderTree } from "@/folders/folders";
 import { errorMessage, HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
 import { choosableIsos } from "@/isos/isos";
+import { sdnNetworkNamed } from "@/sdn/ips";
 import { poolFormats } from "@/storage/pools";
 import { isStopped } from "@/vms/actions";
 import {
@@ -127,6 +128,8 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const volumes = useList("volume");
   const groups = useList("ha-group");
   const [values, setValues] = useState(initial);
+  // NIC마다 SDN 네트워크인지(계획 65 — 주소 칸과 cloud-init 주소). 목록을 읽기 전에는 모른다(빈 목록 → 단순으로 본다).
+  const sdnNics = values.nics.map((n) => sdnNetworkNamed(networks.data, n.network));
   const [revision, setRevision] = useState(vm?.revision);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [failure, setFailure] = useState<{ message: string; conflict: boolean } | null>(null);
@@ -226,6 +229,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       values,
       creating,
       (volumes.data ?? []).map((v) => v.name),
+      sdnNics,
     );
     // 오류를 바로 그려야 그 입력에 포커스를 줄 수 있다.
     flushSync(() => setErrors(found));
@@ -270,12 +274,12 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
         if (signal.aborted) {
           return;
         }
-        await createVm(values);
+        await createVm(values, sdnNics);
         if (!signal.aborted) {
           void navigate(`/vms/${encodeURIComponent(values.name)}`);
         }
       } else {
-        const task = await updateVm(vm, revision, values);
+        const task = await updateVm(vm, revision, values, sdnNics);
         // 실행 중인 VM의 하드웨어를 바꾸는 Task를 알림으로 지켜본다.
         if (task) {
           void trackHotplug(task, t("tasks.op.vm-hotplug", { target: vm.name }));
@@ -457,6 +461,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                   errors={errors}
                   onChange={change}
                   running={mode !== "free"}
+                  sdn={sdnNics}
                 />
               </StepSection>
               <StepSection step="schedule">

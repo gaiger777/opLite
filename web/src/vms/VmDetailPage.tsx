@@ -65,6 +65,7 @@ import {
   type ReplicaRow,
 } from "@/vms/replication";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
+import { formatIps } from "@/sdn/ips";
 import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -776,13 +777,14 @@ function Hardware({ vm }: { vm: Vm }) {
               <TableHead>{t("vms.network")}</TableHead>
               <TableHead>{t("vms.model")}</TableHead>
               <TableHead>{t("vms.mac")}</TableHead>
+              <TableHead>{t("vms.addresses")}</TableHead>
               <TableHead>{t("vmForm.securityGroups")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {(vm.spec.nics ?? []).length === 0 && (
               <TableRow>
-                <TableCell colSpan={4} className="text-center text-muted-foreground">
+                <TableCell colSpan={5} className="text-center text-muted-foreground">
                   {t("vms.noNics")}
                 </TableCell>
               </TableRow>
@@ -795,6 +797,8 @@ function Hardware({ vm }: { vm: Vm }) {
                 </TableCell>
                 <TableCell>{nic.model}</TableCell>
                 <TableCell className="font-mono text-xs">{nic.mac ?? "—"}</TableCell>
+                {/* SDN NIC의 IPAM 주소(계획 65). 단순 네트워크 NIC는 Orbivisor가 주소를 모른다. */}
+                <TableCell className="font-mono text-xs">{formatIps(nic.ips) || "—"}</TableCell>
                 <TableCell>
                   {nic.security_groups?.length ? nic.security_groups.join(", ") : "—"}
                 </TableCell>

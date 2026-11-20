@@ -24,7 +24,13 @@ it("checks values the server would reject", () => {
       { ...emptyDisk("web", 1), pool: "local", bootOrder: "1" },
     ],
     nics: [
-      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34", securityGroups: [] },
+      {
+        network: "user",
+        model: "virtio" as const,
+        mac: "52:54:00:12:34",
+        securityGroups: [],
+        ips: "",
+      },
     ],
   };
   expect(validate(v, true)).toEqual({
@@ -76,6 +82,7 @@ it("allows up to eight security groups on an interface", () => {
     model: "virtio" as const,
     mac: "",
     securityGroups: Array.from({ length: count }, (_, i) => `g${i}`),
+    ips: "",
   });
   const v = { ...emptyForm("q35"), name: "web", nics: [nic(8), nic(9)] };
   expect(validate(v, true)).toEqual({ "nics.1.securityGroups": "vmForm.errors.securityGroups" });
@@ -137,9 +144,27 @@ it("matches the server's limits on cores, boot order and MACs", () => {
       { ...emptyDisk("web", 2), pool: "local", bootOrder: "02" },
     ],
     nics: [
-      { network: "user", model: "virtio" as const, mac: "01:00:5e:00:00:01", securityGroups: [] },
-      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56", securityGroups: [] },
-      { network: "user", model: "virtio" as const, mac: "52:54:00:12:34:56", securityGroups: [] },
+      {
+        network: "user",
+        model: "virtio" as const,
+        mac: "01:00:5e:00:00:01",
+        securityGroups: [],
+        ips: "",
+      },
+      {
+        network: "user",
+        model: "virtio" as const,
+        mac: "52:54:00:12:34:56",
+        securityGroups: [],
+        ips: "",
+      },
+      {
+        network: "user",
+        model: "virtio" as const,
+        mac: "52:54:00:12:34:56",
+        securityGroups: [],
+        ips: "",
+      },
     ],
   };
   expect(validate(v, true)).toEqual({
@@ -443,7 +468,7 @@ it("fills in Windows 11 like the CLI preset", () => {
     firmware: "bios" as const,
     sockets: 2,
     disks: [emptyDisk("win", 0)],
-    nics: [{ network: "lan", model: "virtio" as const, mac: "", securityGroups: [] }],
+    nics: [{ network: "lan", model: "virtio" as const, mac: "", securityGroups: [], ips: "" }],
   };
   const w = windows11(v);
   expect(w).toMatchObject({

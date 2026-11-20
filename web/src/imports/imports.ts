@@ -1,6 +1,7 @@
 import type { components } from "@/api/schema";
 import type { ImportRun, VmImport } from "@/api/types";
 import { emptyNuma, numaErrors, numaOverride, type NumaValues } from "@/numa/numa";
+import { ipsOverride } from "@/sdn/ips";
 import { MIN_MEMORY_MIB, validName } from "@/vms/form";
 
 type Schemas = components["schemas"];
@@ -133,6 +134,8 @@ export interface RunForm {
   cpuFlags: string[];
   /** CPU 배치와 NUMA(계획 64). 기본(공유·vNUMA 없음)이면 보내지 않는다. */
   numa: NumaValues;
+  /** 원본 NIC 순번별 SDN 주소 입력(계획 65, 비면 서브넷에서 받음). 없으면 모두 자동이다. */
+  ips?: string[];
 }
 
 /** 제안으로 채운 실행 폼. VM 이름은 가져오기 이름, 풀은 고르게 비워 둔다. */
@@ -192,6 +195,7 @@ export function validateRun(
     errors.memory = "vmForm.errors.memory";
   }
   Object.assign(errors, runNumaErrors(form));
+  ipsOverride(form.ips ?? [], errors, "ips");
   for (const source of sourceNetworks(imp)) {
     // 제안한 네트워크가 그새 지워졌을 수도 있다.
     if (!networks.includes(form.networks[source] ?? "")) {
@@ -215,8 +219,16 @@ export function runNumaErrors(form: RunForm): Record<string, string> {
   });
 }
 
-/** 실행 요청 본문. 폼의 값을 모두 보낸다(제안과 같아도). */
-export function toRun(form: RunForm): ImportRun {
+/**
+ * 실행 요청 본문. 폼의 값을 모두 보낸다(제안과 같아도). `sdn[i]`는 원본 NIC `i`가 고른 네트워크가 SDN인지다(그 NIC의
+ * 주소만 보낸다).
+ */
+export function toRun(form: RunForm, sdn: readonly boolean[] = []): ImportRun {
+  const ips = ipsOverride(
+    (form.ips ?? []).map((text, i) => (sdn[i] ? text : "")),
+    {},
+    "ips",
+  );
   return {
     name: form.name,
     pool: form.pool,
@@ -231,5 +243,6 @@ export function toRun(form: RunForm): ImportRun {
     ...(form.cpuModel !== "host" && { cpu_model: form.cpuModel }),
     ...(form.cpuFlags.length > 0 && { cpu_flags: form.cpuFlags }),
     ...numaOverride(form.numa, emptyNuma(), false),
+    ...(ips && { ips }),
   };
 }

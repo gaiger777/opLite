@@ -29,6 +29,7 @@ export function CloudInitSection({
   errors,
   onChange,
   running,
+  sdn = [],
 }: {
   /** VM 폼의 값. 배포 창은 이름(패턴)·NIC·cloud-init만 준다. */
   values: Pick<VmFormValues, "name" | "nics" | "cloudInit">;
@@ -36,6 +37,8 @@ export function CloudInitSection({
   onChange: (patch: Pick<VmFormValues, "cloudInit">) => void;
   /** 실행 중인 VM이다(바꾸면 다시 시작할 때 적용) */
   running: boolean;
+  /** NIC마다 SDN 네트워크인지(계획 65 — 그 NIC의 주소는 IPAM이 정해 칸이 없다) */
+  sdn?: readonly boolean[];
 }) {
   const { t } = useTranslation();
   const ci = values.cloudInit;
@@ -151,6 +154,17 @@ export function CloudInitSection({
             </Field>
             {values.nics.map((_, i) => {
               const net = ci.networks[i] ?? DEFAULT_NET;
+              if (sdn[i]) {
+                return (
+                  <fieldset
+                    key={i}
+                    aria-label={t("vmForm.ciNic", { n: i })}
+                    className="rounded-md border p-3 text-sm text-muted-foreground"
+                  >
+                    {t("vmForm.ciSdn", { n: i })}
+                  </fieldset>
+                );
+              }
               return (
                 <fieldset
                   key={i}

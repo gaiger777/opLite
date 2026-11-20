@@ -55,7 +55,7 @@ it("resets the Windows devices when another preset replaces Windows", () => {
   const current = {
     ...blank,
     disks: [emptyDisk("web", 0), emptyDisk("web", 1)],
-    nics: [{ network: "user", model: "virtio" as const, mac: "", securityGroups: [] }],
+    nics: [{ network: "user", model: "virtio" as const, mac: "", securityGroups: [], ips: "" }],
   };
   const windows = applyPreset("windows", "blank", current);
   expect(windows).toMatchObject({ tpm: true, secureBoot: true, memory: "4096", machine: "q35" });

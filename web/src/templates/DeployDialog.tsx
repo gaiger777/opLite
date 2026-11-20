@@ -26,6 +26,7 @@ import {
 import { NumaChoice } from "@/numa/NumaSection";
 import { errorMessage } from "@/i18n/errors";
 import { formatBytes } from "@/lib/format";
+import { ipsOverride, sdnNetworkNamed } from "@/sdn/ips";
 import { choosablePoolsOn } from "@/storage/pools";
 import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
@@ -78,6 +79,12 @@ export function DeployDialog({
   const [cpus, setCpus] = useState("");
   const [memory, setMemory] = useState("");
   const [nics, setNics] = useState<string[]>(() => templateNics.map(() => ""));
+  // SDN NIC마다의 주소(계획 65, 비면 서브넷에서 새로 받음)
+  const [ips, setIps] = useState<string[]>(() => templateNics.map(() => ""));
+  // 배포한 VM의 NIC가 붙을 네트워크(바꾸지 않았으면 템플릿 그대로)가 SDN인지
+  const sdnNics = templateNics.map((nic, i) =>
+    sdnNetworkNamed(networks.data, nics[i] || nic.network),
+  );
   const [sizes, setSizes] = useState<string[]>(() => (template.spec.disks ?? []).map(() => ""));
   const [cloudInit, setCloudInit] = useState(emptyCloudInit);
   const [start, setStart] = useState(false);
@@ -144,7 +151,17 @@ export function DeployDialog({
       }
       return size ?? null;
     });
-    Object.assign(found, cloudInitErrors(cloudInit, nicCount));
+    Object.assign(found, cloudInitErrors(cloudInit, nicCount, sdnNics));
+    const ipTexts = ips.map((text, i) => (sdnNics[i] ? text : ""));
+    const wantIps = ipsOverride(ipTexts, found, "ips");
+    // 같은 주소를 여러 VM에 줄 수 없다(CLI의 `--ip`도 `--count` 2 이상과 함께 못 쓴다).
+    if (names.length > 1 && wantIps) {
+      ipTexts.forEach((text, i) => {
+        if (text.trim() !== "") {
+          found[`ips${i}`] = "sdn.errors.ipCount";
+        }
+      });
+    }
     // 여러 VM에 같은 값을 줄 수 없다(CLI와 같은 거절).
     if (names.length > 1 && cloudInit.enabled) {
       if (cloudInit.hostname.trim() !== "") {
@@ -163,7 +180,7 @@ export function DeployDialog({
     if (Object.keys(found).length > 0 || Object.keys(numaErrors).length > 0) {
       return false;
     }
-    const ci = toCloudInit(cloudInit, nicCount);
+    const ci = toCloudInit(cloudInit, nicCount, sdnNics);
     const body = (vmName: string): CloneRequest => ({
       name: vmName,
       ...(mode !== "auto" && { linked: mode === "linked" }),
@@ -172,6 +189,7 @@ export function DeployDialog({
       ...(cpus !== "" && { vcpus: Number(cpus) }),
       ...(memory !== "" && { memory_mib: Number(memory) }),
       ...(nics.some((n) => n !== "") && { nics: nics.map((n) => (n === "" ? null : n)) }),
+      ...(wantIps && { ips: wantIps }),
       ...(diskBytes.some((b) => b !== null) && { disks: diskBytes }),
       ...(ci && Object.keys(ci).length > 0 && { cloud_init: ci }),
       ...(start && { start: true }),
@@ -420,9 +438,10 @@ export function DeployDialog({
                   id={`deploy-nic-${i}`}
                   className="w-full"
                   value={nics[i] ?? ""}
-                  onChange={(e) =>
-                    setNics((list) => list.map((v, j) => (j === i ? e.target.value : v)))
-                  }
+                  onChange={(e) => {
+                    setNics((list) => list.map((v, j) => (j === i ? e.target.value : v)));
+                    setIps((list) => list.map((v, j) => (j === i ? "" : v)));
+                  }}
                 >
                   <NativeSelectOption value="">
                     {t("templates.keepNetwork", { network: nic.network })}
@@ -437,6 +456,30 @@ export function DeployDialog({
                 </NativeSelect>
               </Field>
             ))}
+            {templateNics.map(
+              (_, i) =>
+                sdnNics[i] && (
+                  <Field
+                    key={`ips-${i}`}
+                    id={`deploy-ips-${i}`}
+                    label={t("templates.nicIps", { n: i })}
+                    error={errors[`ips${i}`]}
+                    hint={t("vmForm.nicIpsHint")}
+                  >
+                    {(a11y) => (
+                      <Input
+                        id={`deploy-ips-${i}`}
+                        placeholder={t("vmForm.nicIpsAuto")}
+                        value={ips[i] ?? ""}
+                        onChange={(e) =>
+                          setIps((list) => list.map((v, j) => (j === i ? e.target.value : v)))
+                        }
+                        {...a11y}
+                      />
+                    )}
+                  </Field>
+                ),
+            )}
           </fieldset>
         )}
         <p className="text-sm text-muted-foreground">{t("templates.ciNote")}</p>
@@ -448,12 +491,14 @@ export function DeployDialog({
               model: n.model,
               mac: "",
               securityGroups: [],
+              ips: "",
             })),
             cloudInit,
           }}
           errors={errors}
           onChange={(patch) => setCloudInit(patch.cloudInit)}
           running={false}
+          sdn={sdnNics}
         />
         <div className="flex items-center gap-2">
           <Checkbox

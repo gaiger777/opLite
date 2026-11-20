@@ -106,6 +106,7 @@ export const appRoutes: RouteObject[] = [
                 path: "networks",
                 lazy: page(() => import("@/networks/NetworksPage"), "NetworksPage"),
               },
+              { path: "sdn", lazy: page(() => import("@/sdn/SdnPage"), "SdnPage") },
               {
                 path: "security-groups",
                 lazy: page(

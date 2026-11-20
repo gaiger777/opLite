@@ -4,10 +4,11 @@ import type { Kind, Permissions } from "@/auth/permissions";
 import type { AreaId } from "@/components/icons";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 
-/** 탭 안의 보기(segmented). 이것도 경로 링크다. */
+/** 탭 안의 보기(segmented). 이것도 경로 링크다. `kind`가 있으면 그 종류를 읽을 수 있는 사용자에게만 보인다. */
 export interface NavView {
   to: string;
   key: string;
+  kind?: Kind;
 }
 
 /** 탭을 보일지 정하는 권한(`usePermissions()`) */
@@ -92,6 +93,8 @@ export const AREAS: NavArea[] = [
         views: [
           { to: "/networks", key: "nav.networks" },
           { to: "/network-folders", key: "nav.networkFolders" },
+          // SDN(OVN) 설정·상태(계획 65). 사이드바 항목이 아니라 네트워크 탭의 보기다.
+          { to: "/sdn", key: "nav.sdn", kind: "sdn" },
         ],
       },
       { to: "/security-groups", key: "nav.securityGroups", kind: "security-group" },
@@ -161,6 +164,10 @@ export const LEGACY_REDIRECTS: { from: string; to: string }[] = [
 /** 영역 탭 없이 전체 폭으로 보이는 경로(콘솔) */
 export function isFullWidth(pathname: string) {
   return /^\/vms\/[^/]+\/console\/?$/.test(pathname);
+}
+
+export function viewVisible(view: NavView, gate: Gate) {
+  return !view.kind || gate.reads(view.kind);
 }
 
 export function tabVisible(tab: NavTab, gate: Gate) {

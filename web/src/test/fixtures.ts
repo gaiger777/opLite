@@ -777,3 +777,92 @@ export function folder(
 export function folderId(name: string): string {
   return `019a0f3c-0000-7000-8009-${name.padStart(12, "0").slice(-12)}`;
 }
+
+/**
+ * SDN(계획 65) 시험의 노드: `NODE`와 같은 Linux 노드에 id·이름·underlay 주소(`10.0.0.<n>`)를 주고 `sdn`이 있으면
+ * `NodeStatus.sdn`(서버 `NodeSdn` 모양 — 빈 칸은 빠진다)을 둔다.
+ */
+export function sdnNode(
+  n: number,
+  sdn?: Node["status"]["sdn"],
+  extra: Partial<Node["status"]> = {},
+): Node {
+  return {
+    ...NODE,
+    id: `n${n}`,
+    name: `node-${String.fromCharCode(96 + n)}`,
+    spec: { ...NODE.spec, address: `10.0.0.${n}:8006` },
+    status: { ...NODE.status, underlay: `10.0.0.${n}`, ...(sdn && { sdn }), ...extra },
+  };
+}
+
+/** 준비된 chassis의 `NodeSdn`(서버가 보내는 칸 차례). `central`이면 NB·SB 역할과 northd */
+export function readyChassis(
+  n: number,
+  central?: "leader" | "follower",
+): NonNullable<Node["status"]["sdn"]> {
+  return {
+    chassis: "ready",
+    ovn_version: "24.03.8",
+    ovs_version: "3.3.9",
+    encap_ip: `10.0.0.${n}`,
+    ...(central && { central: { nb: central, sb: central, northd_active: central === "leader" } }),
+  };
+}
+
+/**
+ * 서버 `SdnView::new(Some(sdn), nodes, tasks)`의 모양: 준비된 SDN, `centrals`의 노드가 중앙, `nodes`마다 chassis 행(이름
+ * 순, `sdn`은 노드의 것 그대로). 빈 칸(`last_error` 등)은 서버처럼 빠진다.
+ */
+export function sdnView(centrals: Node[], nodes: Node[], extra: Record<string, unknown> = {}) {
+  return {
+    phase: "ready",
+    centrals: centrals.map((n) => ({
+      node: n.id,
+      name: n.name,
+      address: n.status.underlay!,
+      ...(n.status.sdn?.central && { health: n.status.sdn.central }),
+    })),
+    release: "24.03.8",
+    init_node: centrals[0]?.id,
+    sync: { term: 3, index: 120, at: 1795107585, nb_cfg: 7, hv_cfg: 7 },
+    chassis: [...nodes]
+      .filter((n) => !n.spec.witness)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map((n) => ({ node: n.id, name: n.name, ...(n.status.sdn && { sdn: n.status.sdn }) })),
+    tasks: [],
+    ...extra,
+  };
+}
+
+/** SDN 네트워크(서버 모양: `sdn: {}`, 빈 `mtu`·`subnets`·`labels`는 빠진다) */
+export function sdnNetwork(name: string, subnets: Record<string, unknown>[] = [], mtu?: number) {
+  return {
+    id: `019a0f3c-0000-7000-8003-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 4,
+    spec: {
+      sdn: {},
+      ...(mtu !== undefined && { mtu }),
+      ...(subnets.length > 0 && { subnets }),
+    },
+    status: {},
+  } as unknown as import("@/api/types").Network;
+}
+
+/** SDN Task(서버 `create_exclusive`·`create_task`의 응답 모양 — 요청한 사용자 레이블 포함) */
+export function sdnTask(
+  id: string,
+  kind: "sdn-init" | "sdn-central-add" | "sdn-central-remove" | "sdn-chassis-install",
+  node: string,
+  status: Partial<Task["status"]> = {},
+): Task {
+  return {
+    id,
+    name: id,
+    revision: 2,
+    labels: { "requested-by": "admin" },
+    spec: { op: { kind }, target: kind === "sdn-chassis-install" ? node : "sdn-0001", node },
+    status: { state: "pending", error: null, ...status },
+  } as Task;
+}

@@ -14,6 +14,7 @@ import { archOf } from "@/cpu/cpu";
 import { CpuChoice, type CpuPick, cpuOverride } from "@/cpu/CpuChoice";
 import { numaFrom, numaOverride, type NumaValues } from "@/numa/numa";
 import { NumaChoice } from "@/numa/NumaSection";
+import { ipsOverride, sdnNetworkNamed } from "@/sdn/ips";
 import { choosablePoolsOn } from "@/storage/pools";
 import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
@@ -64,6 +65,7 @@ export function VmCloneDialog({
   const snapshots = useList("snapshot");
   const pools = useList("storage-pool");
   const volumes = useList("volume");
+  const networks = useList("network");
   const nodes = usePoolNodes();
   // 만들어진 차례(UUIDv7)의 역순: 최근 스냅샷이 위에 온다.
   const ready = (snapshots.data ?? [])
@@ -87,6 +89,10 @@ export function VmCloneDialog({
   // CPU 배치와 NUMA(계획 64): 고치지 않았으면 null — 원본 그대로
   const sourceNuma = numaFrom(sourceSpec);
   const [numa, setNuma] = useState<NumaValues | null>(null);
+  // SDN NIC마다의 주소(계획 65, 비면 서브넷에서 새로 받음 — 복제는 MAC과 주소를 새로 받는다)
+  const sourceNics = sourceSpec.nics ?? [];
+  const sdnNics = sourceNics.map((n) => sdnNetworkNamed(networks.data, n.network));
+  const [ips, setIps] = useState<string[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
   // 놓인 노드가 없을 때만 접속한 노드(whoami)가 필요하다.
   const serving = useOptionalPrincipal()?.node?.id;
@@ -106,6 +112,11 @@ export function VmCloneDialog({
     } else if ((vms.data ?? []).some((v) => v.name === name)) {
       found.name = "clone.errors.exists";
     }
+    const wantIps = ipsOverride(
+      sourceNics.map((_, i) => (sdnNics[i] ? (ips[i] ?? "") : "")),
+      found,
+      "ips",
+    );
     setErrors(found);
     if (Object.keys(found).length > 0) {
       return false;
@@ -121,6 +132,7 @@ export function VmCloneDialog({
             pool: pool === "" ? null : pool,
             ...cpuOverride(cpu, sourceCpu),
             ...numaOverride(numa, sourceNuma),
+            ...(wantIps && { ips: wantIps }),
           },
         }),
       );
@@ -206,6 +218,34 @@ export function VmCloneDialog({
           </NativeSelect>
         )}
       </Field>
+      {sourceNics.map(
+        (nic, i) =>
+          sdnNics[i] && (
+            <Field
+              key={i}
+              id={`clone-ips-${i}`}
+              label={t("clone.nicIps", { n: i, network: nic.network })}
+              error={errors[`ips${i}`]}
+              hint={t("vmForm.nicIpsHint")}
+            >
+              {(a11y) => (
+                <Input
+                  id={`clone-ips-${i}`}
+                  placeholder={t("vmForm.nicIpsAuto")}
+                  value={ips[i] ?? ""}
+                  onChange={(e) =>
+                    setIps((list) => {
+                      const next = [...list];
+                      next[i] = e.target.value;
+                      return next;
+                    })
+                  }
+                  {...a11y}
+                />
+              )}
+            </Field>
+          ),
+      )}
       <CpuChoice
         id="clone-cpu"
         arch={archOf(sourceSpec.machine)}

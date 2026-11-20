@@ -70,7 +70,11 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
     return { name: node.name, href: `/nodes/${enc(node.name)}` };
   }
   const name = task.spec.target.slice(-8);
-  return op.kind.startsWith("ceph-") ? { name, href: "/ceph" } : { name };
+  return op.kind.startsWith("ceph-")
+    ? { name, href: "/ceph" }
+    : op.kind.startsWith("sdn-")
+      ? { name, href: "/sdn" }
+      : { name };
 }
 
 /** 경보 대상의 화면: 노드·VM은 상세, 풀은 목록 검색, 백업 작업·Task는 그 목록 */

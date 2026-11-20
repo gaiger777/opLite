@@ -121,7 +121,7 @@ export function describeTask(
   const node =
     op.kind === "vm-replicate"
       ? (nodeName(op.node) ?? op.node)
-      : op.kind.startsWith("ceph-")
+      : op.kind.startsWith("ceph-") || op.kind.startsWith("sdn-")
         ? (nodeName(task.spec.node) ?? task.spec.node)
         : undefined;
   const device = op.kind === "ceph-osd-add" ? op.device : undefined;
@@ -226,6 +226,10 @@ export function describeProgress(task: Task, t: TFunction): string | null {
   // Ceph Task는 단계 이름만 알린다(바이트 0/0).
   if (progress && task.spec.op.kind.startsWith("ceph-")) {
     return t(`tasks.cephStage.${progress.stage}`, { defaultValue: progress.stage });
+  }
+  // SDN(OVN) Task도 단계 이름만 알린다.
+  if (progress && task.spec.op.kind.startsWith("sdn-")) {
+    return t(`tasks.sdnStage.${progress.stage}`, { defaultValue: progress.stage });
   }
   return null;
 }

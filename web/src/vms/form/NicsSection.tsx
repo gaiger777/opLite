@@ -9,11 +9,14 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { sdnNetworkNamed } from "@/sdn/ips";
 import { MAX_NICS, type NicRow, type VmFormValues } from "@/vms/form";
 import { type DeviceMode, liveRemovable, savedCount } from "@/vms/hotplug";
 
 /**
  * 네트워크 카드 행. 실행 중(`live`)에는 끝에 붙이기, 실행 중 붙인 것을 끝에서부터 떼기, 보안 그룹 바꾸기만 한다.
+ * SDN 네트워크(계획 65)의 NIC는 주소 칸(비면 자동)이 있고 보안 그룹을 걸 수 없다(포트 보안만, 계획 66에 옴). 켜진 VM의
+ * 있던 NIC 주소는 바꿀 수 없다(서버 409 `vm_running`).
  */
 export function NicsSection({
   values,
@@ -69,6 +72,11 @@ export function NicsSection({
         {values.nics.map((nic, i) => {
           // 도는 장치: 네트워크·모델·MAC은 바꾸지 못한다(보안 그룹은 된다).
           const fixed = mode === "restart" || (live && i < savedRows);
+          const sdn = sdnNetworkNamed(networks, nic.network);
+          // 켜진 VM의 저장된 NIC(같은 MAC·네트워크)는 주소를 바꿀 수 없다.
+          const ipsFixed =
+            mode !== "free" &&
+            saved.some((s) => s.network === nic.network && (s.mac ?? "") === nic.mac.toLowerCase());
           const removable = live ? liveRemovable(i, savedRows, boot) : !locked;
           return (
             <fieldset
@@ -82,13 +90,13 @@ export function NicsSection({
                   className="w-full"
                   disabled={fixed}
                   value={nic.network}
-                  // `user` 네트워크(QEMU NAT)에는 보안 그룹을 걸 수 없다.
+                  // `user` 네트워크(QEMU NAT)와 SDN 네트워크에는 보안 그룹을 걸 수 없다. 주소는 네트워크마다다.
                   onChange={(e) =>
                     setNic(
                       i,
-                      e.target.value === "user"
-                        ? { network: e.target.value, securityGroups: [] }
-                        : { network: e.target.value },
+                      e.target.value === "user" || sdnNetworkNamed(networks, e.target.value)
+                        ? { network: e.target.value, securityGroups: [], ips: "" }
+                        : { network: e.target.value, ips: "" },
                     )
                   }
                 >
@@ -134,7 +142,29 @@ export function NicsSection({
               >
                 <X />
               </Button>
-              {nic.network !== "user" && (
+              {sdn && (
+                <div className="col-span-full flex flex-col gap-1.5">
+                  <Field
+                    id={`nic-${i}-ips`}
+                    label={t("vmForm.nicIps")}
+                    error={errors[`nics.${i}.ips`]}
+                    hint={t(ipsFixed ? "vmForm.nicIpsRunning" : "vmForm.nicIpsHint")}
+                  >
+                    {(a11y) => (
+                      <Input
+                        id={`nic-${i}-ips`}
+                        {...a11y}
+                        placeholder={t("vmForm.nicIpsAuto")}
+                        disabled={ipsFixed}
+                        value={nic.ips}
+                        onChange={(e) => setNic(i, { ips: e.target.value })}
+                      />
+                    )}
+                  </Field>
+                  <p className="text-xs text-muted-foreground">{t("vmForm.sdnNoGroups")}</p>
+                </div>
+              )}
+              {nic.network !== "user" && !sdn && (
                 <NicGroups
                   index={i}
                   chosen={nic.securityGroups}
@@ -155,7 +185,7 @@ export function NicsSection({
               onClick={() =>
                 onRowsChange([
                   ...values.nics,
-                  { network: "user", model: "virtio", mac: "", securityGroups: [] },
+                  { network: "user", model: "virtio", mac: "", securityGroups: [], ips: "" },
                 ])
               }
             >

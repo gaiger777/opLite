@@ -34,10 +34,10 @@ export async function createVolume(
 }
 
 /** VM을 만든다. `values.start`면 켜진 상태로 만든다. */
-export async function createVm(values: VmFormValues): Promise<void> {
+export async function createVm(values: VmFormValues, sdn: readonly boolean[] = []): Promise<void> {
   await call(
     api.POST("/vms", {
-      body: { name: values.name, spec: toSpec(values, values.start ? "running" : "stopped") },
+      body: { name: values.name, spec: toSpec(values, values.start ? "running" : "stopped", sdn) },
     }),
   );
 }
@@ -53,6 +53,7 @@ export async function updateVm(
   vm: Vm,
   revision: Vm["revision"] | undefined,
   values: VmFormValues,
+  sdn: readonly boolean[] = [],
 ): Promise<string | null> {
   let response: Response | undefined;
   await call(
@@ -62,7 +63,7 @@ export async function updateVm(
           path: { key: vm.id },
           header: { "If-Match": revision },
         },
-        body: { labels: vm.labels, spec: toSpec(values, vm.spec.power ?? "stopped") },
+        body: { labels: vm.labels, spec: toSpec(values, vm.spec.power ?? "stopped", sdn) },
       })
       .then((result) => {
         response = result.response;

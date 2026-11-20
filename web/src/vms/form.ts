@@ -2,6 +2,7 @@ import type { components } from "@/api/schema";
 import type { Node, Vm, VmSpec } from "@/api/types";
 import { emptyNuma, numaErrors, numaFrom, numaSpec, type NumaValues } from "@/numa/numa";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
+import { formatIps, parseIps } from "@/sdn/ips";
 import { effectiveBoot, MAX_BOOT_ORDER } from "@/vms/boot";
 import {
   cloudInitErrors,
@@ -72,8 +73,13 @@ export interface NicRow {
   network: string;
   model: Schemas["NicModel"];
   mac: string;
-  /** 거는 보안 그룹 이름. `user` 네트워크는 쓸 수 없다. */
+  /** 거는 보안 그룹 이름. `user` 네트워크와 SDN 네트워크(계획 65)는 쓸 수 없다. */
   securityGroups: string[];
+  /**
+   * SDN 네트워크의 주소(계획 65, 쉼표로 나눈 IPv4·IPv6 하나씩). 비면 자동이다: 새 NIC는 서브넷에서 받고, 있던 NIC는
+   * 서버가 지금 주소를 그대로 둔다.
+   */
+  ips: string;
 }
 
 /** 예약 스냅샷 입력. 끄더라도 보관 개수와 메모리는 남겨 두어 다시 켤 때 쓴다. */
@@ -197,7 +203,7 @@ export function emptyForm(machine: VmFormValues["machine"], folder = ""): VmForm
     folder,
     disks: [],
     cdroms: [],
-    nics: [{ network: "user", model: "virtio", mac: "", securityGroups: [] }],
+    nics: [{ network: "user", model: "virtio", mac: "", securityGroups: [], ips: "" }],
     cloudInit: emptyCloudInit(),
     node: "",
     restart: "never",
@@ -244,6 +250,7 @@ export function fromVm(vm: Vm): VmFormValues {
       model: n.model,
       mac: n.mac ?? "",
       securityGroups: n.security_groups ?? [],
+      ips: formatIps(n.ips),
     })),
     cloudInit: cloudInitFrom(s.cloud_init),
     node: s.node ?? "",
@@ -363,6 +370,7 @@ export function validate(
   v: VmFormValues,
   creating: boolean,
   volumes: readonly string[] = [],
+  sdn: readonly boolean[] = [],
 ): Record<string, string> {
   const errors: Record<string, string> = {};
   if (creating && !validName(v.name)) {
@@ -428,6 +436,10 @@ export function validate(
     if (n.securityGroups.length > MAX_NIC_SECURITY_GROUPS) {
       errors[`nics.${i}.securityGroups`] = "vmForm.errors.securityGroups";
     }
+    const ips = parseIps(n.ips);
+    if ("error" in ips) {
+      errors[`nics.${i}.ips`] = ips.error;
+    }
     if (n.mac === "") {
       return;
     }
@@ -447,7 +459,7 @@ export function validate(
     errors["schedule.keep"] = "vmForm.errors.keep";
   }
   Object.assign(errors, replicationErrors(v));
-  Object.assign(errors, cloudInitErrors(v.cloudInit, v.nics.length));
+  Object.assign(errors, cloudInitErrors(v.cloudInit, v.nics.length, sdn));
   if (v.ha) {
     for (const [field, value] of [
       ["maxRestart", v.maxRestart],
@@ -578,8 +590,21 @@ function maxErrors(v: VmFormValues): Record<string, string> {
   return errors;
 }
 
-/** 폼 값을 VM spec으로. `power`는 만들 때만 정하고, 고칠 때는 지금 값을 그대로 둔다. */
-export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
+/** NIC 행의 주소(틀린 입력은 검사가 막으므로 빈 목록) */
+function nicIps(n: NicRow): string[] {
+  const parsed = parseIps(n.ips);
+  return "ips" in parsed ? parsed.ips : [];
+}
+
+/**
+ * 폼 값을 VM spec으로. `power`는 만들 때만 정하고, 고칠 때는 지금 값을 그대로 둔다. `sdn[i]`는 NIC `i`가 SDN 네트워크에
+ * 있는지다(주소를 보내고 cloud-init 주소 칸을 비운다).
+ */
+export function toSpec(
+  v: VmFormValues,
+  power: Schemas["PowerState"],
+  sdn: readonly boolean[] = [],
+): VmSpec {
   // 기본(공유·vNUMA 없음·보통 페이지)이면 빈 칸이다(옛 클러스터는 이 필드를 모른다).
   const numa = numaSpec(v.numa);
   // `machine`을 빼면 서버가 채운다(스키마는 늘 있는 값으로 적는다).
@@ -614,13 +639,14 @@ export function toSpec(v: VmFormValues, power: Schemas["PowerState"]): VmSpec {
         ...(c.bootOrder !== "" && { boot_order: Number(c.bootOrder) }),
       })),
     }),
-    nics: v.nics.map((n) => ({
+    nics: v.nics.map((n, i) => ({
       network: n.network,
       model: n.model,
       mac: n.mac === "" ? null : n.mac.toLowerCase(),
       ...(n.securityGroups.length > 0 && { security_groups: n.securityGroups }),
+      ...(sdn[i] !== false && nicIps(n).length > 0 && { ips: nicIps(n) }),
     })),
-    ...(v.cloudInit.enabled && { cloud_init: toCloudInit(v.cloudInit, v.nics.length) }),
+    ...(v.cloudInit.enabled && { cloud_init: toCloudInit(v.cloudInit, v.nics.length, sdn) }),
     node: v.node === "" ? null : v.node,
     power,
     restart: v.restart,

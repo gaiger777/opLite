@@ -128,7 +128,21 @@
     "cpu_flag_masked": "The flag is hidden cluster-wide: {{message}}",
     "cpu_flag_restricted": "Only a cluster administrator can turn on these CPU flags: {{message}}",
     "invalid_cpu_flags": "Invalid CPU flags: {{message}}",
-    "cpu_baseline_unsupported": "Some nodes cannot run the pinned CPU model: {{message}}"
+    "cpu_baseline_unsupported": "Some nodes cannot run the pinned CPU model: {{message}}",
+    "sdn_not_ready": "SDN (OVN) is not set up yet. Set it up under Networks › SDN.",
+    "sdn_exists": "{{message}}",
+    "sdn_limit": "SDN (OVN) can have at most 5 central nodes.",
+    "sdn_last_central": "The last OVN central node cannot be removed.",
+    "sdn_busy": "Another SDN central task is running: {{message}}",
+    "sdn_central_on_node": "{{message}}",
+    "invalid_subnet": "The subnet is not valid: {{message}}",
+    "subnet_in_use": "The subnet is still in use: {{message}}",
+    "network_immutable": "{{message}}",
+    "ip_in_use": "That IP address is used by another interface on this network: {{message}}",
+    "ip_exhausted": "The subnet has no free addresses left: {{message}}",
+    "ips_without_sdn": "IP addresses can be given only on SDN networks: {{message}}",
+    "cloud_init_sdn_nic": "{{message}}",
+    "sdn_security_groups": "Security groups do not apply on SDN networks yet: {{message}}"
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -190,7 +204,8 @@
     "groups": "Groups",
     "security": "Security",
     "account": "Two-step verification",
-    "noAccess": "You do not have permission to view this page."
+    "noAccess": "You do not have permission to view this page.",
+    "sdn": "SDN"
   },
   "header": {
     "language": "Language",
@@ -312,7 +327,11 @@
       "volume-flatten": "Flatten volume {{target}}",
       "vm-firmware-reset": "Reset the firmware of {{target}}",
       "cpu-baseline": "CPU baseline for {{arch}}: {{previous}} → {{current}}",
-      "node-cpu-probe": "Re-read CPU models on {{target}}"
+      "node-cpu-probe": "Re-read CPU models on {{target}}",
+      "sdn-init": "Set up SDN (OVN) on {{node}}",
+      "sdn-central-add": "Add an OVN central on {{node}}",
+      "sdn-central-remove": "Remove the OVN central on {{node}}",
+      "sdn-chassis-install": "Install the OVN chassis on {{node}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -342,6 +361,18 @@
       "preparing-osd": "Preparing the OSD",
       "creating-pool": "Creating the Ceph pool",
       "registering-pool": "Registering the storage pool"
+    },
+    "sdnStage": {
+      "checking": "Checking the node",
+      "installing-packages": "Installing packages",
+      "writing-tls": "Writing the TLS files",
+      "creating-cluster": "Creating the NB and SB databases",
+      "joining-cluster": "Joining the NB and SB databases",
+      "starting": "Starting ovsdb-server and northd",
+      "waiting-for-leader": "Waiting for the database leader",
+      "configuring-chassis": "Configuring the chassis",
+      "leaving-cluster": "Leaving the databases",
+      "stopping": "Stopping the services"
     }
   },
   "pager": {
@@ -693,7 +724,8 @@
     "powerButton": {
       "start": "Start {{name}}",
       "stop": "Stop {{name}}"
-    }
+    },
+    "addresses": "Addresses"
   },
   "snapshots": {
     "created": "Created",
@@ -771,7 +803,8 @@
       "exists": "A VM with this name already exists.",
       "poolNotOnNode": "That storage pool is not available on the node holding the VM.",
       "poolUnavailable": "That storage pool is not ready on the node holding the VM."
-    }
+    },
+    "nicIps": "Interface {{n}} ({{network}}) IP addresses"
   },
   "backups": {
     "vm": "VM",
@@ -1034,7 +1067,8 @@
     "chosenVm": "Source",
     "esxiSource": "ESXi",
     "diskFileEsxi": "File on the datastore",
-    "credentialsLost": "The ESXi password is no longer on this node (orbivisord restarted or the request was interrupted). Delete this import and create it again."
+    "credentialsLost": "The ESXi password is no longer on this node (orbivisord restarted or the request was interrupted). Delete this import and create it again.",
+    "nicIps": "Interface {{n}} ({{network}}) IP addresses"
   },
   "migrate": {
     "title": "Migrate {{name}}",
@@ -1239,11 +1273,13 @@
     "kind": "Type",
     "kinds": {
       "bridge": "Bridge",
-      "vxlan": "VXLAN"
+      "vxlan": "VXLAN",
+      "sdn": "SDN (OVN)"
     },
     "kindHint": {
       "bridge": "A Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
-      "vxlan": "orbivisord creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789."
+      "vxlan": "orbivisord creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789.",
+      "sdn": "An OVN logical switch over Geneve tunnels between the chassis nodes, with subnets, IP addresses that Orbivisor assigns and built-in DHCP. Isolated: no router yet."
     },
     "bridge": "Bridge",
     "vlanVni": "VLAN/VNI",
@@ -1550,7 +1586,8 @@
     "firmwareUnknown": "unknown",
     "notFound": "Node {{name}} not found",
     "backToList": "Back to nodes",
-    "noVms": "No VMs on this node."
+    "noVms": "No VMs on this node.",
+    "sdn": "SDN"
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -2056,7 +2093,13 @@
     },
     "machineAuto": "Automatic (cluster default)",
     "coresPerSocket": "Cores per socket",
-    "totalVcpus": "{{sockets}} sockets × cores = {{count}} vCPUs"
+    "totalVcpus": "{{sockets}} sockets × cores = {{count}} vCPUs",
+    "nicIps": "IP addresses",
+    "nicIpsHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to get free addresses from the subnets.",
+    "nicIpsRunning": "Stop the VM to change the addresses of this interface.",
+    "nicIpsAuto": "Automatic",
+    "sdnNoGroups": "Security groups do not apply on SDN networks yet; port security allows only this interface's MAC and addresses.",
+    "ciSdn": "NIC {{n}} is on an SDN network: its addresses come from the subnet (IPAM)."
   },
   "console": {
     "connecting": "Connecting…",
@@ -2731,7 +2774,8 @@
       "memory": "Enter a whole number of at least 64 MiB.",
       "hostname": "Several VMs cannot share one host name. Leave it empty to use the VM names.",
       "staticIp": "Several VMs cannot share one static address."
-    }
+    },
+    "nicIps": "Interface {{n}} IP addresses"
   },
   "images": {
     "needsRead": "The image catalog needs permission to read the system (system.read on the root). Ask an administrator.",
@@ -3725,6 +3769,179 @@
       },
       "clear": "Clear settings",
       "clearConfirm": "Every field is empty: saving clears the host resource settings of this node, and every CPU becomes shared. Press \"Clear settings\" to confirm."
+    }
+  },
+  "sdn": {
+    "pageHint": "OVN that Orbivisor installs and runs: central nodes (NB and SB databases, northd) and a chassis (ovn-controller) on every Linux node. SDN networks are logical switches with subnets, IP addresses and DHCP.",
+    "empty": {
+      "title": "SDN is not set up",
+      "admin": "Set up OVN on the cluster nodes step by step. Nothing is installed until you start.",
+      "start": "Start the SDN setup"
+    },
+    "none": "SDN (OVN) is not set up. An administrator can set it up here.",
+    "blocked": {
+      "witness": "witness",
+      "macos": "macOS node",
+      "underlay": "no underlay address",
+      "maintenance": "in maintenance",
+      "offline": "offline"
+    },
+    "warn": {
+      "even": "{{count}} central nodes tolerate no more failures than one fewer. Use 3 or 5.",
+      "notVoter": "Central nodes that are not voting cluster members: {{names}}.",
+      "offline": "Central nodes that are offline: {{names}}."
+    },
+    "errors": {
+      "ip": "Use IPv4 or IPv6 addresses, separated by commas.",
+      "ipFamily": "Give at most one IPv4 and one IPv6 address.",
+      "ipCount": "One address cannot go to several VMs. Deploy one VM or leave it empty.",
+      "cidr": "Use a CIDR like 10.10.0.0/24 (IPv4 /8–/29, IPv6 /48–/124).",
+      "family": "A network has at most one IPv4 and one IPv6 subnet.",
+      "gateway": "Use an address of the subnet's family.",
+      "dns": "Give at most 4 IP addresses, separated by commas.",
+      "pools": "Use ranges like 10.10.0.100-10.10.0.199 (at most 16), in the subnet's family.",
+      "description": "Use at most 200 characters."
+    },
+    "subnets": {
+      "title": "Subnets",
+      "none": "No subnets: interfaces get no addresses.",
+      "n": "Subnet {{n}}",
+      "cidr": "CIDR",
+      "gateway": "Gateway",
+      "gatewayHint": "Optional. Defaults to the first host address; always reserved.",
+      "dns": "DNS servers",
+      "dnsHint": "Optional, up to 4.",
+      "pools": "Allocation ranges",
+      "poolsHint": "Optional. Defaults to the whole subnet.",
+      "description": "Description",
+      "dhcp": "DHCP",
+      "noDhcp6": "IPv6: addresses go in through cloud-init (no DHCPv6 yet).",
+      "remove": "Remove subnet {{n}}",
+      "add": "Add a subnet",
+      "saved": "Saved the subnets of {{name}}.",
+      "edit": "Edit subnets",
+      "editHint": "The CIDR and gateway of a saved subnet cannot change (remove it and add it again). A subnet can be removed only when no interface uses its addresses. Existing interfaces do not get addresses from a new subnet by themselves (orbivisorctl network ips NAME --fill).",
+      "firstHost": "first host",
+      "wholeRange": "whole subnet"
+    },
+    "sheet": {
+      "title": "Network {{name}}",
+      "open": "Open {{name}}"
+    },
+    "ips": {
+      "title": "IP addresses",
+      "usage": "Subnet usage",
+      "used": "{{used}} used of {{size}}, {{free}} free",
+      "usedShort": "{{used}}/{{size}}",
+      "liveError": "Could not read the port state from OVN: {{error}}",
+      "vm": "VM",
+      "nic": "Interface",
+      "nicN": "#{{n}}",
+      "addresses": "Addresses",
+      "port": "Port",
+      "node": "Bound on",
+      "empty": "No interfaces on this network.",
+      "noAddress": "no address",
+      "up": "Up",
+      "down": "Down"
+    },
+    "noChassis": "No node is a ready OVN chassis",
+    "kindNotReady": "SDN (OVN) — not set up",
+    "notReadyHint": "SDN networks need SDN (OVN) set up first, under Networks › SDN.",
+    "statusUnknown": "Cannot read the SDN state ({{error}}); the server checks it when you create the network.",
+    "mtuHint": "1280–9000. Defaults to 1442: a 1500-byte underlay minus the 58-byte Geneve header.",
+    "wizard": {
+      "title": "Set up SDN (OVN)",
+      "steps": {
+        "centrals": "Central nodes",
+        "progress": "Installation",
+        "chassis": "Chassis"
+      },
+      "centralsHint": "Central nodes run the OVN NB and SB databases (Raft) and northd. Choose 1, 3 or 5; the first is set up first and the others join it one at a time. Three voting members are chosen for you. Packages are installed with apt.",
+      "centralNodes": "Central nodes",
+      "voter": "voting member",
+      "initNode": "set up first",
+      "address": "Central address of the first node (optional)",
+      "addressHint": "The address the databases listen on. Defaults to the node's address; must be in the node's certificate.",
+      "start": "Install",
+      "stages": "Setup steps",
+      "moreCentrals": "More central nodes",
+      "addCentral": "{{node}}: {{state}}",
+      "addState": {
+        "done": "central",
+        "waiting": "waiting",
+        "later": "after the first node",
+        "pending": "queued",
+        "running": "joining",
+        "succeeded": "central",
+        "failed": "failed"
+      },
+      "failed": "The setup failed: {{error}}",
+      "addFailed": "Adding {{node}} failed: {{error}}",
+      "next": "Next",
+      "chassisHint": "Every node that runs VMs on SDN networks must be a ready chassis. Central nodes already are. New nodes that join later are not installed by themselves.",
+      "finish": "Finish"
+    },
+    "retry": "Retry",
+    "retryOn": "Retry the setup on {{node}}",
+    "phase": "State",
+    "phases": {
+      "bootstrapping": "Setting up",
+      "ready": "Ready"
+    },
+    "release": "OVN version",
+    "sync": {
+      "title": "Last sync",
+      "never": "Not synced yet",
+      "at": "{{at}}",
+      "caughtUp": "All chassis applied it.",
+      "behind": "Chassis applied {{hv}} of {{nb}}."
+    },
+    "tasks": "Tasks",
+    "running_one": "{{count}} SDN task running",
+    "running_other": "{{count}} SDN tasks running",
+    "lastError": "The last setup failed: {{error}}",
+    "centralRole": "central ({{role}})",
+    "centrals": {
+      "title": "Central nodes",
+      "add": "Add a central",
+      "hint": "A fixed set you choose (1, 3 or 5). Changing it copies the databases; one change runs at a time.",
+      "address": "Address",
+      "nb": "NB",
+      "sb": "SB",
+      "northd": "northd",
+      "none": "No central nodes yet.",
+      "active": "active",
+      "standby": "standby",
+      "removeNamed": "Remove central {{name}}",
+      "removeTitle": "Remove the OVN central on {{name}}?",
+      "removeDescription": "The node leaves the NB and SB databases and stops them; its database files are renamed, not deleted. It stays a chassis. The node must be online.",
+      "remove": "Remove",
+      "addTitle": "Add an OVN central",
+      "addDescription": "Installs the OVN central packages on the node with apt and joins it to the NB and SB databases."
+    },
+    "noNodes": "No other node can become a central.",
+    "chassis": {
+      "title": "Chassis",
+      "installAll": "Install on all nodes",
+      "install": "Install",
+      "installNamed": "Install the chassis on {{name}}",
+      "encap": "Geneve address",
+      "versions": "Versions",
+      "versionText": "OVN {{ovn}}, OVS {{ovs}}",
+      "missing": "Not installed",
+      "configuring": "Configuring",
+      "ready": "Ready",
+      "down": "Down",
+      "unknown": "Unknown"
+    },
+    "role": {
+      "leader": "leader",
+      "follower": "follower",
+      "candidate": "candidate",
+      "joining": "joining",
+      "down": "down",
+      "unknown": "unknown"
     }
   }
 }

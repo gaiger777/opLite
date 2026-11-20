@@ -25,6 +25,7 @@ import { isFrozen, labelText, useNodeActions, vmCount } from "@/nodes/NodeAction
 import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodePeek } from "@/nodes/NodePeek";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
+import { NodeSdnCell } from "@/sdn/chips";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { useTopologyUsage } from "@/numa/numa";
 import { replicasOn } from "@/vms/replication";
@@ -376,6 +377,13 @@ export function NodesPage() {
               </span>
             ));
       },
+    },
+    {
+      id: "sdn",
+      header: t("nodes.sdn"),
+      priority: 3,
+      // OVN chassis 상태와 중앙이면 NB Raft 역할(계획 65). SDN을 세우지 않은 노드는 없다.
+      cell: (node) => <NodeSdnCell sdn={node.status.sdn} />,
     },
     {
       id: "bridges",

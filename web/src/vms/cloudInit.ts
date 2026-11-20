@@ -163,13 +163,21 @@ function sameNet(a: NetRow, b: NetRow): boolean {
   return (Object.keys(a) as (keyof NetRow)[]).every((k) => a[k] === b[k]);
 }
 
-/** 입력을 VM spec의 `cloud_init`으로. 꺼져 있으면 undefined. 빈 칸은 보내지 않는다. */
-export function toCloudInit(v: CloudInitValues, nics: number): CloudInit | undefined {
+/**
+ * 입력을 VM spec의 `cloud_init`으로. 꺼져 있으면 undefined. 빈 칸은 보내지 않는다. `sdn[i]`가 참인 NIC(SDN 네트워크,
+ * 계획 65)는 주소를 IPAM이 정하므로 빈 항목 `{}`만 보낸다(서버는 그 자리에 다른 것을 받지 않는다 — 400
+ * `cloud_init_sdn_nic`).
+ */
+export function toCloudInit(
+  v: CloudInitValues,
+  nics: number,
+  sdn: readonly boolean[] = [],
+): CloudInit | undefined {
   if (!v.enabled) {
     return undefined;
   }
   const rows = Array.from({ length: nics }, (_, i) => v.networks[i] ?? DEFAULT_NET);
-  const custom = v.explicitNetworks || rows.some((r) => !sameNet(r, DEFAULT_NET));
+  const custom = v.explicitNetworks || rows.some((r, i) => !sdn[i] && !sameNet(r, DEFAULT_NET));
   const keys = keyLines(v.sshKeys);
   const servers = list(v.dns);
   const search = list(v.search);
@@ -181,7 +189,10 @@ export function toCloudInit(v: CloudInitValues, nics: number): CloudInit | undef
     ...(keys.length > 0 && { ssh_keys: keys }),
     ...(custom &&
       rows.length > 0 && {
-        networks: rows.map((r) => {
+        networks: rows.map((r, i) => {
+          if (sdn[i]) {
+            return {};
+          }
           const ipv6 = ipConfigFrom(r.ipv6, r.ipv6Address, r.ipv6Gateway);
           return {
             ipv4: ipConfigFrom(r.ipv4, r.ipv4Address, r.ipv4Gateway),
@@ -284,7 +295,11 @@ export function validHostname(name: string): boolean {
  * 입력 오류: 필드(`ci.<칸>`, NIC는 `ci.networks.<i>.<칸>`) → 번역 키. 서버의 `CloudInit::validate`와 같은 규칙이고, 꺼져
  * 있으면 보지 않는다. 오류 값이 필요한 것(키 줄 번호)은 `keyError`로 따로 준다.
  */
-export function cloudInitErrors(v: CloudInitValues, nics: number): Record<string, string> {
+export function cloudInitErrors(
+  v: CloudInitValues,
+  nics: number,
+  sdn: readonly boolean[] = [],
+): Record<string, string> {
   const errors: Record<string, string> = {};
   if (!v.enabled) {
     return errors;
@@ -311,6 +326,10 @@ export function cloudInitErrors(v: CloudInitValues, nics: number): Record<string
     errors["ci.sshKeys"] = validateKeys(v.sshKeys)!.key;
   }
   for (let i = 0; i < Math.min(nics, v.networks.length); i++) {
+    // SDN NIC의 주소 칸은 쓰지 않는다(IPAM이 정함).
+    if (sdn[i]) {
+      continue;
+    }
     const r = v.networks[i]!;
     for (const ipv6 of [false, true]) {
       const [mode, address, gateway, field] = ipv6
