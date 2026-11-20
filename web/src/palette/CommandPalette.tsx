@@ -16,7 +16,7 @@ import { Kbd } from "@/components/ui/kbd";
 import { FOLDER_PATHS } from "@/folders/folders";
 import { useFolderPaths } from "@/folders/useFolderPaths";
 import { createItems } from "@/layout/create";
-import { AREAS, visibleTabs } from "@/layout/nav";
+import { AREAS, viewVisible, visibleTabs } from "@/layout/nav";
 import { useDensity } from "@/lib/density";
 import { alive, type ResourceRef, useRefs } from "@/lib/recent";
 import { keyLabel } from "@/lib/shortcuts";
@@ -454,7 +454,10 @@ function usePaletteItems(
     const list: Omit<Item, "run">[] = [];
     for (const area of AREAS) {
       for (const tab of visibleTabs(area, perms)) {
-        const leaves = tab.views ?? [{ to: tab.to, key: tab.key }];
+        // 읽을 수 없는 보기(예: 루트 cluster.read가 없는 사용자의 SDN)는 내지 않는다(리뷰 1 #6).
+        const leaves = tab.views?.filter((view) => viewVisible(view, perms)) ?? [
+          { to: tab.to, key: tab.key },
+        ];
         for (const leaf of leaves) {
           const label = area.id === "home" ? t(area.key) : `${t(area.key)} › ${t(leaf.key)}`;
           list.push({ id: `nav:${leaf.to}`, group: "navigation", label, to: leaf.to });

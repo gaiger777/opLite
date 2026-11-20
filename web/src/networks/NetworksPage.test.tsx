@@ -324,9 +324,10 @@ it("hides changes from operators", async () => {
 });
 
 it("lets a folder network delegator create only VXLAN and SDN networks", async () => {
-  // 브리지 네트워크는 루트 cluster.admin만 만든다(계획 62 리뷰 1). 폴더의 network.config는 VXLAN과 SDN(계획 65 §11,
-  // 기본 응답은 SDN을 세우기 전이라 막혀 있다).
+  // 브리지 네트워크는 루트 cluster.admin만 만든다(계획 62 리뷰 1). 폴더의 network.config는 VXLAN과 SDN(계획 65 §11).
+  // 폴더 위임자는 루트 cluster.read가 없어 서버가 `GET /sdn`에 403이다 — 화면은 묻지 않고 서버에 맡긴다(리뷰 1 #5).
   const A = folderId("teamA");
+  let sdnReads = 0;
   server.use(
     http.get(apiUrl("/permissions/mine"), () =>
       HttpResponse.json({
@@ -338,6 +339,10 @@ it("lets a folder network delegator create only VXLAN and SDN networks", async (
         objects: [],
       }),
     ),
+    http.get(apiUrl("/sdn"), () => {
+      sdnReads += 1;
+      return HttpResponse.json({ code: "forbidden", message: "forbidden" }, { status: 403 });
+    }),
   );
   mockLists({ folder: [folder("teamA", "network")] });
   const user = userEvent.setup();
@@ -349,7 +354,15 @@ it("lets a folder network delegator create only VXLAN and SDN networks", async (
     within(kind)
       .getAllByRole("option")
       .map((o) => o.textContent),
-  ).toEqual(["VXLAN", "SDN (OVN) — not set up"]);
+  ).toEqual(["VXLAN", "SDN (OVN)"]);
+  await user.selectOptions(kind, "sdn");
+  expect(
+    within(dialog).getByText(
+      "The server checks that SDN (OVN) is set up when you create the network.",
+    ),
+  ).toBeInTheDocument();
+  expect(within(dialog).queryByText(/Cannot read the SDN state/)).not.toBeInTheDocument();
+  expect(sdnReads).toBe(0);
 });
 
 // --- SDN 네트워크(계획 65) ---
@@ -387,7 +400,13 @@ it("lists SDN networks with their subnets, usage and ready chassis", async () =>
   const a = sdnNode(1, readyChassis(1, "leader"));
   const b = sdnNode(2, { chassis: "down" });
   mockLists({ network: [TENANT], node: [a, b] });
-  server.use(http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(ips(true))));
+  const queries: string[] = [];
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), ({ request }) => {
+      queries.push(new URL(request.url).search);
+      return HttpResponse.json(ips(true));
+    }),
+  );
   renderPage(<NetworksPage />);
   const table = await screen.findByRole("table", { name: "Networks" });
   const headers = within(table).getAllByRole("columnheader");
@@ -406,6 +425,42 @@ it("lists SDN networks with their subnets, usage and ready chassis", async () =>
     "aria-valuenow",
     "2",
   );
+  // 목록은 OVN 포트 상태를 읽지 않는다(행마다 NB·SB를 읽지 않게, 리뷰 1 #10).
+  expect(queries).toEqual(["?live=false"]);
+});
+
+it("shows IPv6 subnet sizes readably and counts the interfaces of hidden VMs", async () => {
+  const v6 = sdnNetwork("six", [{ cidr: "fd00::/64", dhcp: false }]);
+  mockLists({ network: [v6], node: [sdnNode(1, readyChassis(1))] });
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), () =>
+      HttpResponse.json({
+        network: "six",
+        subnets: [
+          // 서버의 u64 2^64-2: JSON 수로는 정확하지 않다.
+          { cidr: "fd00::/64", size: 2 ** 64, used: 2, free: 2 ** 64 },
+        ],
+        allocations: [],
+        hidden: 2,
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  const table = await screen.findByRole("table", { name: "Networks" });
+  expect(await within(table).findByText("2/≈1.8e19")).toBeInTheDocument();
+  // 크기가 아주 크면 막대는 늘 0%라 그리지 않는다.
+  expect(within(table).queryByRole("meter")).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Open six" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network six" });
+  expect(await within(sheet).findByText("2 used of ≈1.8e19, ≈1.8e19 free")).toBeInTheDocument();
+  // 다른 폴더 VM의 NIC는 서버가 빼고 수만 준다(리뷰 1 #3).
+  expect(
+    within(sheet).getByText(
+      "2 more interfaces belong to VMs you cannot see; they count in the usage above.",
+    ),
+  ).toBeInTheDocument();
+  expect(within(sheet).queryByText("No interfaces on this network.")).not.toBeInTheDocument();
 });
 
 it("blocks the SDN type until SDN is set up", async () => {

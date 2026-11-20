@@ -28,6 +28,14 @@ import {
 } from "@/sdn/sdn";
 import { trackTask } from "@/tasks/tasks";
 
+/** 세우기 계획: 첫 세우기 Task·노드·준 주소(다시 하기가 같은 주소를 보낸다 — 리뷰 1 #1)와 나머지 중앙 */
+interface Plan {
+  task: string;
+  init: string;
+  address?: string;
+  rest: string[];
+}
+
 /** 마법사의 단계: 중앙 노드 고르기, 설치 진행, chassis */
 const STEPS = ["centrals", "progress", "chassis"] as const;
 type Step = (typeof STEPS)[number];
@@ -48,7 +56,7 @@ export function SdnWizard({
 }) {
   const { t } = useTranslation();
   const [step, setStep] = useState<Step>("centrals");
-  const [plan, setPlan] = useState<{ task: string; init: string; rest: string[] } | null>(null);
+  const [plan, setPlan] = useState<Plan | null>(null);
 
   return (
     <Card className="max-w-3xl">
@@ -97,11 +105,7 @@ export function SdnWizard({
 }
 
 /** ① 중앙 노드. 막힌 노드(위트니스·macOS·underlay 없음·유지보수·오프라인)는 까닭과 함께 고를 수 없다. */
-function CentralsStep({
-  onCreated,
-}: {
-  onCreated(plan: { task: string; init: string; rest: string[] }): void;
-}) {
+function CentralsStep({ onCreated }: { onCreated(plan: Plan): void }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const nodes = useList("node");
@@ -136,15 +140,14 @@ function CentralsStep({
     setAddressError(undefined);
     setBusy(true);
     setError(null);
+    const given = address.trim() !== "" ? address.trim() : undefined;
     try {
       const task = await call(
-        api.POST("/sdn", {
-          body: { node: init, ...(address.trim() !== "" && { address: address.trim() }) },
-        }),
+        api.POST("/sdn", { body: { node: init, ...(given && { address: given }) } }),
       );
       trackTask(task, t("tasks.op.sdn-init", { node: nodeName(nodes.data, init) }));
       await queryClient.invalidateQueries({ queryKey: SDN_KEY });
-      onCreated({ task: task.id, init, rest });
+      onCreated({ task: task.id, init, ...(given && { address: given }), rest });
     } catch (err) {
       setError(errorMessage(t, err));
     } finally {
@@ -229,7 +232,7 @@ function ProgressStep({
   onNext,
 }: {
   sdn: SdnView;
-  plan: { task: string; init: string; rest: string[] };
+  plan: Plan;
   onRetried(task: string): void;
   onNext(): void;
 }) {
@@ -262,7 +265,10 @@ function ProgressStep({
       const { data, warning } = await callWarned(api.POST("/sdn/centrals", { body: { node } }));
       trackTask(data, t("tasks.op.sdn-central-add", { node: nodeName(nodes.data, node) }));
       setAdds((a) => ({ ...a, [node]: data.id }));
-      if (warning) {
+      // 짝수 경고는 마지막 중앙의 것만 보인다: 셋을 고르면 둘째를 더할 때의 "2개" 경고는 곧 셋이 되므로 틀린 말이다
+      // (리뷰 1 #8).
+      const last = plan.rest.every((n) => n === node || isCentral(n));
+      if (warning && last) {
         toast.warning(warning);
       }
     } catch (err) {
@@ -288,7 +294,12 @@ function ProgressStep({
     setError(null);
     if (failed) {
       try {
-        const again = await call(api.POST("/sdn", { body: { node: plan.init } }));
+        // 처음 준 주소를 다시 보낸다(서버도 주소 없는 다시 하기에 지난번 주소를 쓴다 — 리뷰 1 #1).
+        const again = await call(
+          api.POST("/sdn", {
+            body: { node: plan.init, ...(plan.address && { address: plan.address }) },
+          }),
+        );
         trackTask(again, t("tasks.op.sdn-init", { node: nodeName(nodes.data, plan.init) }));
         onRetried(again.id);
       } catch (err) {

@@ -7,7 +7,7 @@ import { toast } from "sonner";
 import type { Vm } from "@/api/types";
 import { resetTasks } from "@/tasks/tasks";
 import { TemplatesPage } from "@/templates/TemplatesPage";
-import { NODE, pool, securityGroup, sdnNetwork, task, vm, volume } from "@/test/fixtures";
+import { NODE, pool, securityGroup, sdnNetwork, snapshot, task, vm, volume } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -190,4 +190,83 @@ it("deploys a template with an address only for one VM", async () => {
   await user.click(within(dialog).getByRole("button", { name: /^Deploy/ }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toMatchObject({ ips: [["10.10.0.9"]] });
+});
+
+it("drops security groups left on an SDN interface and keeps saved addresses when empty", async () => {
+  // 리뷰 1 #2·#9: 그룹이 남은 옛 SDN NIC도 저장할 수 있고, 저장된 NIC의 빈 주소 칸은 "지금 주소를 둠"이다.
+  const web = withNics(vm("web", "stopped"), [
+    {
+      network: "tenant",
+      model: "virtio",
+      mac: "52:54:00:00:00:01",
+      ips: ["10.10.0.2"],
+      security_groups: ["ssh"],
+    },
+  ]);
+  mockLists({
+    vm: [web],
+    node: [NODE],
+    network: [TENANT],
+    "security-group": [securityGroup("ssh")],
+  });
+  let body: { spec: Vm["spec"] } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(web);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const ips = await screen.findByLabelText("IP addresses");
+  expect(ips).toBeEnabled();
+  expect(ips).toHaveAccessibleDescription(/Leave empty to keep the current addresses/);
+  await userEvent.click(screen.getByRole("button", { name: "Save" }));
+  await vi.waitFor(() => expect(body).toBeDefined());
+  expect(body!.spec.nics).toEqual([
+    { network: "tenant", model: "virtio", mac: "52:54:00:00:00:01", ips: ["10.10.0.2"] },
+  ]);
+});
+
+it("has no address field for a template's SDN interface", async () => {
+  // 리뷰 1 #9: 서버가 템플릿의 주소를 늘 지운다.
+  const tmpl = withNics(
+    vm("tmpl", "stopped"),
+    [{ network: "tenant", model: "virtio", mac: "52:54:00:00:00:09" }],
+    { template: true },
+  );
+  mockLists({ vm: [tmpl], node: [NODE], network: [TENANT] });
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/tmpl/edit" });
+  const nic = await screen.findByRole("group", { name: "Network interface 1" });
+  expect(
+    await within(nic).findByText(/Security groups do not apply on SDN networks yet/),
+  ).toBeVisible();
+  expect(within(nic).queryByLabelText("IP addresses")).not.toBeInTheDocument();
+});
+
+it("clears typed clone addresses when the source changes", async () => {
+  // 리뷰 1 #11: 주소는 NIC 순번별이다. 스냅샷의 NIC가 다르면 다른 NIC에 가면 안 된다.
+  const db = withNics(
+    vm("db", "stopped"),
+    [{ network: "tenant", model: "virtio", mac: "52:54:00:00:00:02" }],
+    { disks: [{ volume: "db-root", bus: "virtio-blk", boot_order: 1 }] },
+  );
+  const old = snapshot("before", db, 1);
+  mockLists({
+    vm: [db],
+    snapshot: [old],
+    node: [NODE],
+    network: [LAN, TENANT],
+    volume: [volume("db-root", "local")],
+    "storage-pool": [pool("local")],
+  });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/db" });
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: /^Actions for / }));
+  await user.click(screen.getByRole("menuitem", { name: "Clone" }));
+  const dialog = await screen.findByRole("dialog", { name: /Clone db/ });
+  const ips = await within(dialog).findByLabelText("Interface 0 (tenant) IP addresses");
+  await user.type(ips, "10.10.0.9");
+  await within(dialog).findByRole("option", { name: "Snapshot before" });
+  await user.selectOptions(within(dialog).getByLabelText("Source"), old.id);
+  expect(within(dialog).getByLabelText("Interface 0 (tenant) IP addresses")).toHaveValue("");
 });

@@ -43,16 +43,25 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
   const warnings = sdnWarnings(sdn, nodes.data, voters);
   const [error, setError] = useState<string | null>(null);
   const sync = sdn.sync;
-  const initName = nodes.data?.find((n) => n.id === sdn.init_node)?.name ?? sdn.init_node;
+  const initNode = nodes.data?.find((n) => n.id === sdn.init_node);
+  const initName = initNode?.name ?? sdn.init_node;
+  // 세우다 멈췄고(도는 Task 없음) 아직 중앙이 없다. 첫 세우기 노드가 꺼졌거나 지워졌으면 다른 노드로 옮길 수 있다(서버
+  // `moved_init` — 리뷰 1 #4). 켜져 있으면 그 노드에서 다시 한다.
+  const stalled = admin && sdn.phase !== "ready" && sdn.tasks.length === 0 && !!sdn.init_node;
+  const movable =
+    stalled && sdn.centrals.length === 0 && nodes.isSuccess && !initNode?.status.online;
+  const targets = [...(nodes.data ?? [])]
+    .filter((n) => n.id !== sdn.init_node && nodeBlocker(n, true) === null)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const [moveTo, setMoveTo] = useState("");
+  const target = moveTo || (targets[0]?.id ?? "");
 
-  async function retryInit() {
-    if (!sdn.init_node) {
-      return;
-    }
+  async function startInit(node: string, name: string | undefined) {
     setError(null);
     try {
-      const task = await call(api.POST("/sdn", { body: { node: sdn.init_node } }));
-      trackTask(task, t("tasks.op.sdn-init", { node: initName }));
+      // 주소는 보내지 않는다: 같은 노드면 서버가 지난번 주소로, 옮기면 그 노드의 주소로 한다.
+      const task = await call(api.POST("/sdn", { body: { node } }));
+      trackTask(task, t("tasks.op.sdn-init", { node: name ?? node }));
     } catch (err) {
       setError(errorMessage(t, err));
     } finally {
@@ -117,18 +126,56 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
           {t("sdn.lastError", { error: sdn.last_error })}
         </p>
       )}
-      {admin && sdn.phase !== "ready" && sdn.tasks.length === 0 && sdn.init_node && (
+      {stalled && (
         <div className="flex flex-col gap-2">
           {error && (
             <p role="alert" className="text-sm text-destructive">
               {error}
             </p>
           )}
-          <div>
-            <Button variant="outline" onClick={() => void retryInit()}>
-              {t("sdn.retryOn", { node: initName })}
-            </Button>
-          </div>
+          {movable ? (
+            <div className="flex flex-col gap-2">
+              <p className="text-sm text-muted-foreground">
+                {t("sdn.move.hint", { node: initName })}
+              </p>
+              {targets.length === 0 ? (
+                <p className="text-sm text-muted-foreground">{t("sdn.noNodes")}</p>
+              ) : (
+                <div className="flex flex-wrap items-end gap-2">
+                  <Field id="sdn-move-node" label={t("sdn.move.node")}>
+                    <NativeSelect
+                      id="sdn-move-node"
+                      value={target}
+                      onChange={(e) => setMoveTo(e.target.value)}
+                    >
+                      {targets.map((n) => (
+                        <NativeSelectOption key={n.id} value={n.id}>
+                          {n.name}
+                        </NativeSelectOption>
+                      ))}
+                    </NativeSelect>
+                  </Field>
+                  <Button
+                    variant="outline"
+                    disabled={target === ""}
+                    onClick={() =>
+                      void startInit(target, targets.find((n) => n.id === target)?.name)
+                    }
+                  >
+                    {t("sdn.move.start")}
+                  </Button>
+                </div>
+              )}
+            </div>
+          ) : (
+            initNode?.status.online && (
+              <div>
+                <Button variant="outline" onClick={() => void startInit(sdn.init_node!, initName)}>
+                  {t("sdn.retryOn", { node: initName })}
+                </Button>
+              </div>
+            )
+          )}
         </div>
       )}
       <CentralsTable sdn={sdn} admin={admin} />
@@ -359,7 +406,10 @@ export function ChassisTable({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
           <Button
             variant="outline"
             size="sm"
-            disabled={busy || sdn.chassis.every((c) => c.sdn?.chassis === "ready")}
+            // 될 수 없는 노드(macOS·위트니스·underlay 없음·오프라인)는 세지 않는다 — 서버 `all`도 건너뛴다(리뷰 1 #7).
+            disabled={
+              busy || sdn.chassis.every((c) => c.sdn?.chassis === "ready" || !installable(c.node))
+            }
             onClick={() => void install({ all: true })}
           >
             {t("sdn.chassis.installAll")}

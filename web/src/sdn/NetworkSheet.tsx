@@ -30,14 +30,35 @@ export function ipsKey(id: string) {
   return ["network-ips", id] as const;
 }
 
-/** SDN 네트워크의 주소(서브넷 사용·NIC 주소·OVN 포트 상태). `live`는 OVN을 읽지 못했으면 null이다. */
-export function useNetworkIps(network: Network, enabled = true) {
+/**
+ * SDN 네트워크의 주소(서브넷 사용·NIC 주소·OVN 포트 상태). `live`는 OVN을 읽지 못했으면 null이다. `live`가 거짓이면
+ * OVN을 읽지 않는 목록용 질의다(네트워크 목록의 사용률 — 행마다 NB·SB를 읽지 않게, 리뷰 1 #10).
+ */
+export function useNetworkIps(network: Network, enabled = true, live = true) {
   return useQuery({
-    queryKey: ipsKey(network.id),
-    queryFn: () => call(api.GET("/networks/{key}/ips", { params: { path: { key: network.id } } })),
+    queryKey: [...ipsKey(network.id), live ? "live" : "usage"],
+    queryFn: () =>
+      call(
+        api.GET("/networks/{key}/ips", {
+          params: { path: { key: network.id }, ...(!live && { query: { live: false } }) },
+        }),
+      ),
     enabled,
     staleTime: 10_000,
   });
+}
+
+/** JSON 수의 정확한 끝(2^53). IPv6 서브넷의 크기는 이보다 커서 정확하지 않다. */
+const EXACT = 2 ** 53;
+
+/** 주소 수: IPv6 /64처럼 아주 크면 "≈1.8e19"(리뷰 1 #10) */
+export function addressCount(n: number): string {
+  return n >= EXACT ? `≈${n.toExponential(1).replace("e+", "e")}` : String(n);
+}
+
+/** 사용률 막대가 뜻이 있는지(크기가 아주 크면 늘 0%라 그리지 않는다) */
+export function hasUsageBar(size: number): boolean {
+  return size > 0 && size < EXACT;
 }
 
 /** 서브넷 사용률 막대 하나 */
@@ -233,9 +254,13 @@ function IpsSection({ network }: { network: Network }) {
               {data.subnets.map((s) => (
                 <li key={s.cidr} className="flex flex-wrap items-center gap-2">
                   <span className="font-mono text-xs">{s.cidr}</span>
-                  <UsageBar used={s.used} size={s.size} />
+                  {hasUsageBar(s.size) && <UsageBar used={s.used} size={s.size} />}
                   <span className="text-muted-foreground">
-                    {t("sdn.ips.used", { used: s.used, size: s.size, free: s.free })}
+                    {t("sdn.ips.used", {
+                      used: s.used,
+                      size: addressCount(s.size),
+                      free: addressCount(s.free),
+                    })}
                   </span>
                 </li>
               ))}
@@ -258,7 +283,7 @@ function IpsSection({ network }: { network: Network }) {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {data.allocations.length === 0 && (
+              {data.allocations.length === 0 && !data.hidden && (
                 <TableRow>
                   <TableCell colSpan={6} className="text-muted-foreground">
                     {t("sdn.ips.empty")}
@@ -292,6 +317,12 @@ function IpsSection({ network }: { network: Network }) {
               ))}
             </TableBody>
           </Table>
+          {/* 다른 폴더 VM의 NIC는 서버가 빼고 수만 준다(리뷰 1 #3). */}
+          {!!data.hidden && (
+            <p className="text-sm text-muted-foreground">
+              {t("sdn.ips.hidden", { count: data.hidden })}
+            </p>
+          )}
         </>
       )}
     </section>

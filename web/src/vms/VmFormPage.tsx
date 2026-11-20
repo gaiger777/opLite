@@ -421,6 +421,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                   mode={mode}
                   saved={vm?.spec.nics ?? []}
                   boot={layout?.boot_nics ?? 0}
+                  template={vm?.spec.template === true}
                 />
               </StepSection>
               <StepSection step="cdroms">

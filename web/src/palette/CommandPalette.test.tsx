@@ -303,6 +303,31 @@ it("lists readable folders by path and hides migrate without cluster read", asyn
   );
 });
 
+it("offers only the views the user can read", async () => {
+  // 리뷰 1 #6: SDN 보기는 루트 cluster.read다. 폴더 사용자의 팔레트에는 없다(관리자에게는 있다).
+  const FOLDER_USER: Principal = { ...VIEWER, name: "alice", role: "none" };
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: { [folderId("teamA")]: ["system.read"] },
+        objects: [],
+      }),
+    ),
+  );
+  shell("/", FOLDER_USER);
+  await search("infra", "Infrastructure › Networks");
+  expect(screen.queryByRole("option", { name: "Infrastructure › SDN" })).not.toBeInTheDocument();
+});
+
+it("offers the SDN view to admins", async () => {
+  shell();
+  await search("sdn", "Infrastructure › SDN");
+});
+
 it("goes to every sub-screen, including views", async () => {
   const { router } = shell();
   const { user } = await search("cluster", "Infrastructure › Cluster");

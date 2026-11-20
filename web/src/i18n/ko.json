@@ -133,7 +133,7 @@
     "sdn_exists": "{{message}}",
     "sdn_limit": "SDN(OVN) 중앙 노드는 5개까지입니다.",
     "sdn_last_central": "마지막 OVN 중앙 노드는 뺄 수 없습니다.",
-    "sdn_busy": "다른 SDN 중앙 작업이 돌고 있습니다: {{message}}",
+    "sdn_busy": "SDN 중앙 작업은 한 번에 하나입니다: {{message}}",
     "sdn_central_on_node": "{{message}}",
     "invalid_subnet": "서브넷이 맞지 않습니다: {{message}}",
     "subnet_in_use": "서브넷을 아직 쓰고 있습니다: {{message}}",
@@ -2099,7 +2099,8 @@
     "nicIpsRunning": "이 인터페이스의 주소를 바꾸려면 VM을 멈추세요.",
     "nicIpsAuto": "자동",
     "sdnNoGroups": "SDN 네트워크에는 아직 보안 그룹을 걸 수 없습니다. 포트 보안이 이 인터페이스의 MAC과 주소만 통과시킵니다.",
-    "ciSdn": "NIC {{n}}은 SDN 네트워크에 있어 주소를 IPAM(서브넷)이 정합니다."
+    "ciSdn": "NIC {{n}}은 SDN 네트워크에 있어 주소를 IPAM(서브넷)이 정합니다.",
+    "nicIpsKeepHint": "IPv4와 IPv6 주소를 하나씩까지, 쉼표로 나눠 씁니다. 비우면 지금 주소를 그대로 둡니다."
   },
   "console": {
     "connecting": "연결 중…",
@@ -3843,7 +3844,9 @@
       "empty": "이 네트워크에 인터페이스가 없습니다.",
       "noAddress": "주소 없음",
       "up": "켜짐",
-      "down": "꺼짐"
+      "down": "꺼짐",
+      "hidden_one": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다.",
+      "hidden_other": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다."
     },
     "noChassis": "준비된 OVN chassis 노드가 없음",
     "kindNotReady": "SDN(OVN) — 설정 안 됨",
@@ -3942,6 +3945,12 @@
       "joining": "합류 중",
       "down": "꺼짐",
       "unknown": "알 수 없음"
-    }
+    },
+    "move": {
+      "hint": "중앙이 서기 전에 {{node}}에서 설정이 멈췄고 그 노드는 꺼졌거나 없습니다. 다른 노드로 설정을 옮기세요.",
+      "node": "설정할 노드",
+      "start": "이 노드로 설정 옮기기"
+    },
+    "serverChecks": "네트워크를 만들 때 서버가 SDN(OVN)이 설정되었는지 확인합니다."
   }
 }

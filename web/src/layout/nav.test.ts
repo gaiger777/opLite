@@ -206,3 +206,18 @@ it("redirects only addresses that no longer have a page", () => {
     expect(areaOf(from)).toBeNull();
   }
 });
+
+it("does not restore a remembered view the user can no longer read", () => {
+  // 리뷰 1 #6: SDN 보기는 루트 cluster.read다. 폴더 사용자에게 기억한 /sdn은 네트워크 탭의 첫 주소다.
+  rememberTab(U1, "/sdn", "");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/sdn");
+  const folderOnly = new Permissions({
+    all: false,
+    root: [],
+    root_contents: [],
+    folders: {},
+    contents: { "00000000-0000-0000-0000-0000000000f1": ["system.read"] },
+    objects: [],
+  });
+  expect(lastTab(area("infra"), { user: U1, gate: folderOnly })).toBe("/networks");
+});

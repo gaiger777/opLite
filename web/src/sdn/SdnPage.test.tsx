@@ -140,10 +140,10 @@ it("sets up the centrals one at a time and installs the chassis", async () => {
       ["add", { node: "n3" }],
     ]),
   );
-  // 중앙이 둘이 될 때의 서버 경고를 그대로 보인다.
-  expect(await screen.findByText(/will have 2 central nodes/)).toBeInTheDocument();
   const next = screen.getByRole("button", { name: "Next" });
   await waitFor(() => expect(next).toBeEnabled());
+  // 셋으로 가는 길의 "2개" 경고는 보이지 않는다(리뷰 1 #8 — 곧 셋이 된다).
+  expect(screen.queryByText(/will have 2 central nodes/)).not.toBeInTheDocument();
   await user.click(next);
   await user.click(await screen.findByRole("button", { name: "Install on all nodes" }));
   expect(await screen.findByText(/skipped offline nodes: node-d/)).toBeInTheDocument();
@@ -181,7 +181,130 @@ it("shows why the setup failed and retries on the same node", async () => {
   const stages = screen.getByRole("list", { name: "Setup steps" });
   expect(within(stages).getByText("Checking the node")).toHaveClass("line-through");
   await user.click(screen.getByRole("button", { name: "Retry" }));
-  await waitFor(() => expect(posts).toEqual([{ node: "n1", address: "10.0.0.1" }, { node: "n1" }]));
+  // 처음 준 주소를 다시 보낸다(리뷰 1 #1).
+  await waitFor(() =>
+    expect(posts).toEqual([
+      { node: "n1", address: "10.0.0.1" },
+      { node: "n1", address: "10.0.0.1" },
+    ]),
+  );
+});
+
+it("shows the server's even-count warning when the chosen centrals end even", async () => {
+  const a = sdnNode(1);
+  const b = sdnNode(2);
+  const nodes = [a, b];
+  cluster(nodes, ["n1", "n2"]);
+  const centrals: Node[] = [];
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        centrals.length === 0 ? { centrals: [], chassis: [], tasks: [] } : sdnView(centrals, nodes),
+      ),
+    ),
+    http.post(apiUrl("/sdn"), () => {
+      centrals.push(a);
+      return HttpResponse.json(sdnTask("t-init", "sdn-init", "n1"), { status: 202 });
+    }),
+    http.post(apiUrl("/sdn/centrals"), () => {
+      centrals.push(b);
+      return HttpResponse.json(sdnTask("t-add-n2", "sdn-central-add", "n2"), {
+        status: 202,
+        headers: {
+          "orbivisor-warning":
+            "SDN (OVN) will have 2 central nodes; an even number tolerates no more failures than one fewer; use 3 or 5",
+        },
+      });
+    }),
+  );
+  mockLists({
+    node: nodes,
+    task: [
+      sdnTask("t-init", "sdn-init", "n1", { state: "succeeded" }),
+      sdnTask("t-add-n2", "sdn-central-add", "n2", { state: "succeeded" }),
+    ],
+  });
+  renderPage(<SdnPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Start the SDN setup" }));
+  const pick = await screen.findByRole("group", { name: "Central nodes" });
+  await waitFor(() => expect(within(pick).getByLabelText("node-b")).toBeChecked());
+  await user.click(screen.getByRole("button", { name: "Install" }));
+  expect(await screen.findByText(/will have 2 central nodes/)).toBeInTheDocument();
+});
+
+it("moves a setup stuck on a dead node to another node", async () => {
+  // 리뷰 1 #4: 첫 세우기 노드가 꺼졌고 중앙이 없으면 "다시 하기" 대신 다른 노드를 고른다.
+  const dead = sdnNode(1, undefined, { online: false });
+  const b = sdnNode(2);
+  const mac = sdnNode(3, undefined, { hypervisor: "qemu-hvf" });
+  const nodes = [dead, b, mac];
+  cluster(nodes, ["n1", "n2"]);
+  const posts: unknown[] = [];
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        sdnView([], nodes, {
+          phase: "bootstrapping",
+          init_node: "n1",
+          last_error: "node went away",
+          sync: undefined,
+        }),
+      ),
+    ),
+    http.post(apiUrl("/sdn"), async ({ request }) => {
+      posts.push(await request.json());
+      return HttpResponse.json(sdnTask("t-init", "sdn-init", "n2"), { status: 202 });
+    }),
+  );
+  mockLists({ node: nodes });
+  renderPage(<SdnPage />);
+  const user = userEvent.setup();
+  const select = await screen.findByLabelText("Node to set up on");
+  expect(screen.queryByRole("button", { name: /Retry the setup/ })).not.toBeInTheDocument();
+  // 막힌 노드(macOS)는 고를 수 없다.
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["node-b"]);
+  await user.click(screen.getByRole("button", { name: "Move the setup here" }));
+  await waitFor(() => expect(posts).toEqual([{ node: "n2" }]));
+});
+
+it("retries a stuck setup only while its node is online", async () => {
+  const a = sdnNode(1);
+  cluster([a], ["n1"]);
+  const posts: unknown[] = [];
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        sdnView([], [a], { phase: "bootstrapping", init_node: "n1", sync: undefined }),
+      ),
+    ),
+    http.post(apiUrl("/sdn"), async ({ request }) => {
+      posts.push(await request.json());
+      return HttpResponse.json(sdnTask("t-init", "sdn-init", "n1"), { status: 202 });
+    }),
+  );
+  mockLists({ node: [a] });
+  renderPage(<SdnPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Retry the setup on node-a" }));
+  // 주소는 보내지 않는다: 서버가 지난번 주소로 이어서 한다.
+  await waitFor(() => expect(posts).toEqual([{ node: "n1" }]));
+  expect(screen.queryByLabelText("Node to set up on")).not.toBeInTheDocument();
+});
+
+it("does not offer installing on all nodes when only nodes that cannot be chassis are left", async () => {
+  // 리뷰 1 #7: macOS 노드는 chassis가 될 수 없다.
+  const a = sdnNode(1, readyChassis(1, "leader"));
+  const mac = sdnNode(2, undefined, { hypervisor: "qemu-hvf" });
+  cluster([a, mac], ["n1"]);
+  server.use(http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([a], [a, mac]))));
+  mockLists({ node: [a, mac] });
+  renderPage(<SdnPage />);
+  expect(await screen.findByRole("button", { name: "Install on all nodes" })).toBeDisabled();
 });
 
 it("shows centrals, roles, sync and chassis, and removes a central", async () => {

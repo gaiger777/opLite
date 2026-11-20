@@ -133,7 +133,7 @@
     "sdn_exists": "{{message}}",
     "sdn_limit": "SDN (OVN) can have at most 5 central nodes.",
     "sdn_last_central": "The last OVN central node cannot be removed.",
-    "sdn_busy": "Another SDN central task is running: {{message}}",
+    "sdn_busy": "{{message}}",
     "sdn_central_on_node": "{{message}}",
     "invalid_subnet": "The subnet is not valid: {{message}}",
     "subnet_in_use": "The subnet is still in use: {{message}}",
@@ -2099,7 +2099,8 @@
     "nicIpsRunning": "Stop the VM to change the addresses of this interface.",
     "nicIpsAuto": "Automatic",
     "sdnNoGroups": "Security groups do not apply on SDN networks yet; port security allows only this interface's MAC and addresses.",
-    "ciSdn": "NIC {{n}} is on an SDN network: its addresses come from the subnet (IPAM)."
+    "ciSdn": "NIC {{n}} is on an SDN network: its addresses come from the subnet (IPAM).",
+    "nicIpsKeepHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to keep the current addresses."
   },
   "console": {
     "connecting": "Connecting…",
@@ -3843,7 +3844,9 @@
       "empty": "No interfaces on this network.",
       "noAddress": "no address",
       "up": "Up",
-      "down": "Down"
+      "down": "Down",
+      "hidden_one": "1 more interface belongs to a VM you cannot see; it counts in the usage above.",
+      "hidden_other": "{{count}} more interfaces belong to VMs you cannot see; they count in the usage above."
     },
     "noChassis": "No node is a ready OVN chassis",
     "kindNotReady": "SDN (OVN) — not set up",
@@ -3942,6 +3945,12 @@
       "joining": "joining",
       "down": "down",
       "unknown": "unknown"
-    }
+    },
+    "move": {
+      "hint": "The setup stopped on {{node}}, which is offline or gone, before any central was up. Move the setup to another node.",
+      "node": "Node to set up on",
+      "start": "Move the setup here"
+    },
+    "serverChecks": "The server checks that SDN (OVN) is set up when you create the network."
   }
 }

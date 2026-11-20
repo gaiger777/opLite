@@ -28,7 +28,13 @@ import {
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { useCreateParam } from "@/lib/createParam";
-import { NetworkSheet, UsageBar, useNetworkIps } from "@/sdn/NetworkSheet";
+import {
+  addressCount,
+  hasUsageBar,
+  NetworkSheet,
+  UsageBar,
+  useNetworkIps,
+} from "@/sdn/NetworkSheet";
 import { isSdnNetwork } from "@/sdn/ips";
 import { DEFAULT_SDN_MTU, sdnReady, useSdn } from "@/sdn/sdn";
 import { SubnetsEditor } from "@/sdn/SubnetsEditor";
@@ -277,7 +283,7 @@ export function NetworksPage() {
 /** SDN 네트워크 행의 서브넷과 사용률 막대(`GET /networks/{key}/ips`) */
 function SubnetsCell({ network }: { network: Network }) {
   const { t } = useTranslation();
-  const ips = useNetworkIps(network);
+  const ips = useNetworkIps(network, true, false);
   const subnets = network.spec.subnets ?? [];
   if (subnets.length === 0) {
     return <span className="text-muted-foreground">{t("sdn.subnets.none")}</span>;
@@ -291,8 +297,8 @@ function SubnetsCell({ network }: { network: Network }) {
             <span className="font-mono text-xs">{s.cidr}</span>
             {usage && (
               <span className="flex items-center gap-2 text-xs text-muted-foreground">
-                <UsageBar used={usage.used} size={usage.size} />
-                {t("sdn.ips.usedShort", { used: usage.used, size: usage.size })}
+                {hasUsageBar(usage.size) && <UsageBar used={usage.used} size={usage.size} />}
+                {t("sdn.ips.usedShort", { used: usage.used, size: addressCount(usage.size) })}
               </span>
             )}
           </li>
@@ -310,7 +316,9 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
   const { t } = useTranslation();
   const folder = useNewFolder("network", "network.config");
   const nodes = useList("node");
-  const sdn = useSdn();
+  // 루트 cluster.read가 없는 폴더 위임자는 `GET /sdn`을 읽지 못한다(403) — 묻지 않고 서버에 맡긴다(리뷰 1 #5).
+  const readsSdn = usePermissions().reads("sdn");
+  const sdn = useSdn(false, readsSdn);
   const sdnBlocked = sdn.isSuccess && !sdnReady(sdn.data);
   const bridgesId = useId();
   const [name, setName] = useState("");
@@ -428,6 +436,9 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
         )}
       </Field>
       {sdnBlocked && <p className="text-xs text-muted-foreground">{t("sdn.notReadyHint")}</p>}
+      {!readsSdn && kind === "sdn" && (
+        <p className="text-xs text-muted-foreground">{t("sdn.serverChecks")}</p>
+      )}
       {sdn.isError && kind === "sdn" && (
         <p className="text-xs text-muted-foreground">
           {t("sdn.statusUnknown", { error: errorMessage(t, sdn.error) })}

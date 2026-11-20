@@ -180,7 +180,11 @@ export function VmCloneDialog({
             id="clone-source"
             className="w-full"
             value={source}
-            onChange={(e) => setChosen(e.target.value)}
+            onChange={(e) => {
+              setChosen(e.target.value);
+              // 주소는 NIC 순번별이다: 원본(스냅샷)의 NIC가 다르면 다른 NIC에 가지 않게 비운다(리뷰 1 #11).
+              setIps([]);
+            }}
             {...a11y}
           >
             <NativeSelectOption value={CURRENT}>{t("clone.current")}</NativeSelectOption>

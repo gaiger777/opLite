@@ -229,7 +229,8 @@ export interface NavUser {
 
 /**
  * 영역에서 마지막으로 본 탭(경로와 쿼리, 사용자별 `{user}.nav.last.{area}`). 기억이 없거나, 그 영역의 탭이
- * 아니거나, 지금 권한으로 보이지 않으면 보이는 첫 탭이다. 보이는 탭이 없으면 영역 주소다.
+ * 아니거나, 지금 권한으로 보이지 않으면 보이는 첫 탭이다(탭은 보이지만 기억한 보기를 읽을 수 없으면 그 탭의 주소).
+ * 보이는 탭이 없으면 영역 주소다.
  */
 export function lastTab(area: NavArea, { user, gate }: NavUser): string {
   const saved = readUserPref(user, lastKey(area.id));
@@ -237,7 +238,8 @@ export function lastTab(area: NavArea, { user, gate }: NavUser): string {
     const pathname = saved.split(/[?#]/)[0] ?? "";
     const hit = areaOf(pathname);
     if (hit && hit.area.id === area.id && hit.prefix === pathname && tabVisible(hit.tab, gate)) {
-      return saved;
+      // 기억한 보기를 이제 읽을 수 없으면 그 탭의 첫 주소다(리뷰 1 #6).
+      return !hit.view || viewVisible(hit.view, gate) ? saved : hit.tab.to;
     }
   }
   return visibleTabs(area, gate)[0]?.to ?? area.to;

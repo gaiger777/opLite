@@ -48,6 +48,13 @@ it("translates API error codes and falls back to the server message", async () =
   expect(errorMessage(t, new ApiError(409, "vm_running", "cannot delete VM"))).toBe(
     "Stop the VM first.",
   );
+  // 서버 문장이 이미 "another SDN central task is running"이라 앞말을 되풀이하지 않는다(리뷰 1 #11).
+  expect(
+    errorMessage(
+      t,
+      new ApiError(409, "sdn_busy", "another SDN central task is running (task 019a)"),
+    ),
+  ).toBe("another SDN central task is running (task 019a)");
   expect(errorMessage(t, new ApiError(409, "no_node", "no node has bridge br0"))).toBe(
     "No node can run this VM: no node has bridge br0",
   );

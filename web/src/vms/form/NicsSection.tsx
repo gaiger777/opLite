@@ -28,6 +28,7 @@ export function NicsSection({
   mode,
   saved,
   boot,
+  template = false,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -45,6 +46,8 @@ export function NicsSection({
   saved: readonly NicSpec[];
   /** 켤 때 단 NIC 수. 그 뒤의 것만 실행 중에 뗄 수 있다. */
   boot: number;
+  /** 템플릿을 고친다: 서버가 템플릿의 주소를 늘 지우므로 주소 칸을 보이지 않는다(리뷰 1 #9). */
+  template?: boolean;
 }) {
   const { t } = useTranslation();
   const locked = mode === "locked" || mode === "restart";
@@ -74,9 +77,10 @@ export function NicsSection({
           const fixed = mode === "restart" || (live && i < savedRows);
           const sdn = sdnNetworkNamed(networks, nic.network);
           // 켜진 VM의 저장된 NIC(같은 MAC·네트워크)는 주소를 바꿀 수 없다.
-          const ipsFixed =
-            mode !== "free" &&
-            saved.some((s) => s.network === nic.network && (s.mac ?? "") === nic.mac.toLowerCase());
+          const stored = saved.some(
+            (s) => s.network === nic.network && (s.mac ?? "") === nic.mac.toLowerCase(),
+          );
+          const ipsFixed = mode !== "free" && stored;
           const removable = live ? liveRemovable(i, savedRows, boot) : !locked;
           return (
             <fieldset
@@ -144,23 +148,32 @@ export function NicsSection({
               </Button>
               {sdn && (
                 <div className="col-span-full flex flex-col gap-1.5">
-                  <Field
-                    id={`nic-${i}-ips`}
-                    label={t("vmForm.nicIps")}
-                    error={errors[`nics.${i}.ips`]}
-                    hint={t(ipsFixed ? "vmForm.nicIpsRunning" : "vmForm.nicIpsHint")}
-                  >
-                    {(a11y) => (
-                      <Input
-                        id={`nic-${i}-ips`}
-                        {...a11y}
-                        placeholder={t("vmForm.nicIpsAuto")}
-                        disabled={ipsFixed}
-                        value={nic.ips}
-                        onChange={(e) => setNic(i, { ips: e.target.value })}
-                      />
-                    )}
-                  </Field>
+                  {!template && (
+                    <Field
+                      id={`nic-${i}-ips`}
+                      label={t("vmForm.nicIps")}
+                      error={errors[`nics.${i}.ips`]}
+                      // 저장된 NIC를 비워 보내면 서버가 지금 주소를 둔다(새 NIC만 자동으로 받는다).
+                      hint={t(
+                        ipsFixed
+                          ? "vmForm.nicIpsRunning"
+                          : stored
+                            ? "vmForm.nicIpsKeepHint"
+                            : "vmForm.nicIpsHint",
+                      )}
+                    >
+                      {(a11y) => (
+                        <Input
+                          id={`nic-${i}-ips`}
+                          {...a11y}
+                          placeholder={stored ? undefined : t("vmForm.nicIpsAuto")}
+                          disabled={ipsFixed}
+                          value={nic.ips}
+                          onChange={(e) => setNic(i, { ips: e.target.value })}
+                        />
+                      )}
+                    </Field>
+                  )}
                   <p className="text-xs text-muted-foreground">{t("vmForm.sdnNoGroups")}</p>
                 </div>
               )}
