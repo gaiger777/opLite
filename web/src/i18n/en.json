@@ -19,7 +19,7 @@
     "console_unavailable": "The console is not available right now.",
     "cluster_no_quorum": "The cluster has no quorum. The change may still be applied later.",
     "not_leader": "The cluster leader is changing. Try again shortly.",
-    "network_in_use": "A VM uses this network. Remove its interface first.",
+    "network_in_use": "This network is still in use: {{message}}",
     "vni_in_use": "Another network already uses this VNI.",
     "node_online": "The node is online. Run orbivisorctl cluster leave on it instead.",
     "pool_not_on_node": "That storage pool is not available on the node you are connected to.",
@@ -142,7 +142,13 @@
     "ip_exhausted": "The subnet has no free addresses left: {{message}}",
     "ips_without_sdn": "IP addresses can be given only on SDN networks: {{message}}",
     "cloud_init_sdn_nic": "{{message}}",
-    "sdn_security_groups": "Security groups do not apply on SDN networks yet: {{message}}"
+    "invalid_router": "The router is not valid: {{message}}",
+    "router_in_use": "The router still has interfaces. Remove them first.",
+    "fip_in_use": "A floating IP is in the way: {{message}}",
+    "fip_not_routable": "That interface cannot take a floating IP: {{message}}",
+    "physnet_in_use": "VMs on this node use that physical network: {{message}}",
+    "physnet_conflict": "Another network already uses that physical network and VLAN: {{message}}",
+    "invalid_node_sdn": "The SDN settings are not valid: {{message}}"
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -205,7 +211,9 @@
     "security": "Security",
     "account": "Two-step verification",
     "noAccess": "You do not have permission to view this page.",
-    "sdn": "SDN"
+    "sdn": "SDN",
+    "routers": "Routers",
+    "floatingIps": "Floating IPs"
   },
   "header": {
     "language": "Language",
@@ -1276,12 +1284,14 @@
     "kinds": {
       "bridge": "Bridge",
       "vxlan": "VXLAN",
-      "sdn": "SDN (OVN)"
+      "sdn": "SDN (OVN)",
+      "provider": "External (provider)"
     },
     "kindHint": {
       "bridge": "A Linux bridge that already exists on the nodes. VMs on this network run only on nodes with the bridge.",
       "vxlan": "orbivisord creates the bridge oplv<VNI> and a VXLAN device on every node and links them over UDP 4789.",
-      "sdn": "An OVN logical switch over Geneve tunnels between the chassis nodes, with subnets, IP addresses that Orbivisor assigns and built-in DHCP. Isolated: no router yet."
+      "sdn": "An OVN logical switch over Geneve tunnels between the chassis nodes, with subnets, IP addresses that Orbivisor assigns and built-in DHCP. Connect it to a router to reach other networks and the outside.",
+      "provider": "An SDN network on a physical network (physnet) of the nodes, flat or with a VLAN tag. VMs can attach to it directly, and routers and floating IPs use it as their outside. Administrators only."
     },
     "bridge": "Bridge",
     "vlanVni": "VLAN/VNI",
@@ -1360,7 +1370,10 @@
       "remote": "Use a CIDR like 10.0.0.0/8 or 2001:db8::/32.",
       "icmpRemote": "ICMP rules take only IPv4 addresses.",
       "icmpv6Remote": "ICMPv6 rules take only IPv6 addresses."
-    }
+    },
+    "nics": "Interfaces",
+    "nicCounts": "{{simple}} simple · {{sdn}} SDN",
+    "sdnNote": "The same groups apply to SDN interfaces through OVN ACLs, with the same order and defaults. Differences: on SDN interfaces, taking away an allow rule also cuts connections already open, and port security blocks spoofed source addresses."
   },
   "nodes": {
     "address": "API address",
@@ -2102,10 +2115,10 @@
     "nicIpsHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to get free addresses from the subnets.",
     "nicIpsRunning": "Stop the VM to change the addresses of this interface.",
     "nicIpsAuto": "Automatic",
-    "sdnNoGroups": "Security groups do not apply on SDN networks yet; port security lets this interface send only from its MAC and addresses. On a network with subnets, an interface without an address sends nothing until it gets one.",
     "ciSdn": "NIC {{n}} is on an SDN network: its addresses come from the subnet (IPAM).",
     "nicIpsKeepHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to keep the current addresses.",
-    "nicIpsGiveRunning": "This interface has no address, so its port is off. You can give it one now; the guest picks it up at its next DHCP renewal."
+    "nicIpsGiveRunning": "This interface has no address, so its port is off. You can give it one now; the guest picks it up at its next DHCP renewal.",
+    "sdnPortSecurity": "Port security lets this interface send only from its MAC and addresses. On a network with subnets, an interface without an address sends nothing until it gets one."
   },
   "console": {
     "connecting": "Connecting…",
@@ -3342,14 +3355,17 @@
       "memory_mib": "Memory",
       "disk_bytes": "Disk",
       "vms": "VMs",
-      "dedicated_vcpus": "Dedicated vCPUs"
+      "dedicated_vcpus": "Dedicated vCPUs",
+      "routers": "Routers",
+      "floating_ips": "Floating IPs"
     },
     "usedOf": "{{used}} of {{limit}}",
     "noLimit": "No limit",
     "over": "Over the limit",
     "boundBy": "Limited by {{path}}",
     "badCount": "Enter a whole number of 0 or more.",
-    "hiddenLimits": "Folders above this one that you cannot see may also have quotas. If one of them blocks a change, the error says so."
+    "hiddenLimits": "Folders above this one that you cannot see may also have quotas. If one of them blocks a change, the error says so.",
+    "networkQuotaDescription": "Limits for this folder and everything below it. Floating IPs are usually the scarce public addresses."
   },
   "permissions": {
     "title": "Permissions of {{name}}",
@@ -3806,7 +3822,9 @@
       "gateway": "Use an address of the subnet's family.",
       "dns": "Give at most 4 IP addresses, separated by commas.",
       "pools": "Use ranges like 10.10.0.100-10.10.0.199 (at most 16), in the subnet's family.",
-      "description": "Use at most 200 characters."
+      "description": "Use at most 200 characters.",
+      "floating": "Use start-end ranges of IPv4 addresses, up to 16.",
+      "slaac64": "SLAAC modes need a /64 subnet."
     },
     "subnets": {
       "title": "Subnets",
@@ -3821,7 +3839,7 @@
       "poolsHint": "Optional. Defaults to the whole subnet.",
       "description": "Description",
       "dhcp": "DHCP",
-      "noDhcp6": "IPv6: addresses go in through cloud-init (no DHCPv6 yet).",
+      "noDhcp6": "IPv6: no DHCP switch here; choose an IPv6 mode for RA or DHCPv6.",
       "remove": "Remove subnet {{n}}",
       "add": "Add a subnet",
       "saved": "Saved the subnets of {{name}}.",
@@ -3832,7 +3850,12 @@
       "fillNotice_one": "1 interface on this network has no address; saving gives it one from the new subnet. Its port is off until then.",
       "fillNotice_other": "{{count}} interfaces on this network have no address; saving gives each one from the new subnet. Their ports are off until then.",
       "conflict": "Someone changed the subnets meanwhile (now: {{subnets}}). Your rows are kept; check them and save again.",
-      "noneShort": "none"
+      "noneShort": "none",
+      "floating": "Floating IP ranges",
+      "floatingHint": "Optional. Router outside addresses and floating IPs come from here; without it they share the allocation ranges.",
+      "floatingFromPools": "from the allocation ranges",
+      "ipv6Mode": "IPv6 mode",
+      "ipv6ModeHint": "Router advertisements go out only when the network is a router interface. SLAAC modes need a /64 and give EUI-64 addresses."
     },
     "sheet": {
       "title": "Network {{name}}",
@@ -3857,7 +3880,11 @@
       "hidden_one": "1 more interface belongs to a VM you cannot see; it counts in the usage above.",
       "hidden_other": "{{count}} more interfaces belong to VMs you cannot see; they count in the usage above.",
       "off": "Off: no address",
-      "offHint": "Its port passes nothing until it gets an address: type one in Edit (the VM may keep running), or run orbivisorctl network ips NAME --fill."
+      "offHint": "Its port passes nothing until it gets an address: type one in Edit (the VM may keep running), or run orbivisorctl network ips NAME --fill.",
+      "router": "Router {{name}}",
+      "fip": "Floating IP {{name}}",
+      "fipTo": "Floating IP {{name}} → {{vm}}",
+      "floating": "floating IPs: {{used}} used of {{size}}, {{free}} free"
     },
     "noChassis": "No node is a ready OVN chassis",
     "kindNotReady": "SDN (OVN) — not set up",
@@ -3974,6 +4001,183 @@
       "removeNamed": "Remove the leftover central databases of {{name}}",
       "removeTitle": "Remove the leftover OVN central databases of {{name}}?",
       "removeDescription": "An online node leaves the databases and stops them (its files are renamed, not deleted). An offline or removed node is kicked out by a live central."
+    },
+    "providerNotReady": "External (provider) — SDN not set up",
+    "ipv6Mode": {
+      "none": "None (cloud-init static address)",
+      "slaac": "SLAAC",
+      "dhcpv6-stateful": "DHCPv6 (stateful)",
+      "dhcpv6-stateless": "SLAAC + DHCPv6 (stateless)"
+    },
+    "physnet": {
+      "title": "SDN physical networks",
+      "edit": "Edit",
+      "editTitle": "SDN settings of {{name}}",
+      "editDescription": "Link physical networks (physnets) to Linux bridges you made on this node, and make the node a gateway candidate for routers.",
+      "rows": "Physical networks",
+      "name": "Physical network",
+      "nameN": "Physical network {{n}}",
+      "bridge": "Bridge",
+      "bridgeN": "Bridge {{n}}",
+      "bridgeHint": "The bridge must exist on the node. The SDN agent links it to OVS with a veth pair and does not change the bridge.",
+      "add": "Add a physical network",
+      "remove": "Remove physical network {{n}}",
+      "none": "No physical networks.",
+      "gateway": "Gateway candidate for routers",
+      "priority": "Gateway priority",
+      "priorityHint": "1–1000. Higher goes first; routers spread across candidates with the same priority.",
+      "gatewayOn": "Gateway candidate, priority {{priority}}.",
+      "gatewayOff": "Not a gateway candidate.",
+      "gatewayPending": "(the SDN agent has not applied it yet)",
+      "ready": "ready",
+      "notReady": "not ready",
+      "pending": "applying",
+      "removing": "removing",
+      "saved": "Saved the SDN settings of {{name}}.",
+      "noNode": "No node has physnet {{physnet}} ready",
+      "pickHint": "The name nodes link to a bridge under Nodes › node › SDN physical networks.",
+      "noneHint": "No node has a physical network yet. Add one on a node's page first (Nodes › node › SDN physical networks).",
+      "vlanHint": "Optional, 1–4094. Without it the network is flat (untagged).",
+      "mtuHint": "1280–9000. Defaults to 1500 (the physical network).",
+      "errors": {
+        "name": "Use a lowercase letter, then up to 30 lowercase letters, digits or -.",
+        "duplicate": "This physical network is listed twice.",
+        "bridge": "Use the name of a Linux bridge (1–15 characters, not br-int).",
+        "priority": "Use a number from 1 to 1000.",
+        "tooMany": "At most 8 physical networks."
+      }
+    }
+  },
+  "router": {
+    "pageHint": "Routers connect SDN networks to each other and, through an external (provider) network, to the outside with SNAT and floating IPs.",
+    "sdnNotReady": "Routers and floating IPs need SDN (OVN) set up first, under Networks › SDN.",
+    "empty": {
+      "title": "No routers",
+      "description": "Create a router to connect SDN networks and reach the outside."
+    },
+    "create": "Create a router",
+    "createTitle": "Create a router",
+    "createDescription": "Pick the SDN networks to connect and, optionally, an external network for the way out.",
+    "created": "Created router {{name}}.",
+    "saved": "Saved router {{name}}.",
+    "deleted": "Deleted router {{name}}.",
+    "deleteTitle": "Delete router {{name}}?",
+    "deleteDescription": "The router has no interfaces left. Its outside addresses go back to the external network.",
+    "removeFirst": "Remove the interfaces first.",
+    "open": "Open router {{name}}",
+    "sheetTitle": "Router {{name}}",
+    "descriptionOptional": "Description (optional)",
+    "external": "External network",
+    "externalHint": "A provider network. Without one, the router only connects its SDN networks to each other.",
+    "externalIps": "Outside addresses",
+    "externalChangeHint": "Keeping the same network keeps the outside addresses. Floating IPs routed through this router must be detached before you change or clear it.",
+    "editExternal": "Change",
+    "noExternal": "None",
+    "noExternalHint": "No external network: the router only connects its SDN networks.",
+    "snat": "SNAT",
+    "snatLabel": "Translate inside IPv4 addresses to the outside address (SNAT)",
+    "snatOffHint": "Without SNAT the physical router needs routes to the inside subnets via the router's outside address.",
+    "on": "on",
+    "off": "off",
+    "interfaces": "Interfaces",
+    "interfacesHint": "An SDN network can be an interface of one router. Its subnet gateways become the router's addresses; guests get the default route at their next DHCP renewal.",
+    "portAddresses": "Router addresses",
+    "noInterfaces": "No interfaces.",
+    "noAttachable": "No SDN network with subnets is free to connect.",
+    "addInterface": "Add an interface",
+    "add": "Add",
+    "removeInterface": "Remove interface {{network}}",
+    "routes": "Static routes",
+    "destination": "Destination",
+    "nexthop": "Next hop",
+    "noRoutes": "No static routes.",
+    "noRoutesDefault": "No static routes. The default route goes to the external network's gateway.",
+    "addRoute": "Add a route",
+    "removeRoute": "Remove the route to {{destination}}",
+    "gateway": "Gateway",
+    "gateways": "Gateway nodes",
+    "gatewaysHint": "OVN moves the router's outside port to the next node when the active one fails (BFD). Open SNAT connections are cut then.",
+    "node": "Node",
+    "nodePriority": "Node priority",
+    "haPriority": "Rank",
+    "active": "Active",
+    "activeNow": "active",
+    "standby": "standby",
+    "noGateway": "No gateway node",
+    "gatewayError": "{{error}}. The router's outside port stays off (no SNAT or floating IPs) until a gateway node has the physical network ready: set it under Nodes › node › SDN physical networks.",
+    "liveError": "Could not read the active gateway from OVN: {{error}}",
+    "hostingOutside": "Active now: {{node}}.",
+    "upstreamHint": "These routes are not translated. The physical router needs them:",
+    "errors": {
+      "description": "Use at most 200 characters.",
+      "tooMany": "At most 16 interfaces.",
+      "destination": "Use a CIDR like 10.20.0.0/16.",
+      "nexthop": "Use an address of the same family as the destination.",
+      "defaultRoute": "With an external network the default route is set automatically."
+    }
+  },
+  "fip": {
+    "pageHint": "Public addresses from an external network, mapped one to one to a VM interface. They are distributed (leave from the VM's node) when that node has the physical network, otherwise the gateway node handles them.",
+    "empty": {
+      "title": "No floating IPs",
+      "description": "Create a floating IP from an external network and attach it to a routed VM interface."
+    },
+    "create": "Create a floating IP",
+    "createTitle": "Create a floating IP",
+    "createDescription": "Takes a free address from the external network's floating IP ranges.",
+    "created": "Created floating IP {{address}}.",
+    "deleted": "Deleted floating IP {{name}}.",
+    "deleteTitle": "Delete floating IP {{name}}?",
+    "deleteDescription": "The address goes back to the external network.",
+    "deleteAttached": "It is attached: its NAT goes away and the address goes back to the external network.",
+    "attach": "Attach",
+    "attachNamed": "Attach {{name}}",
+    "attachTitle": "Attach {{name}}",
+    "attachDescription": "Interfaces on SDN networks routed to {{network}} can take it.",
+    "attached": "Attached {{name}} to {{vm}}.",
+    "detach": "Detach",
+    "detachNamed": "Detach {{name}}",
+    "detachTitle": "Detach {{name}}?",
+    "detachDescription": "The VM keeps its private address; connections through the floating IP stop.",
+    "detached": "Detached {{name}}.",
+    "address": "Address",
+    "addressOptional": "Address (optional)",
+    "addressHint": "Leave empty to take the next free one.",
+    "nameOptional": "Name (optional)",
+    "nameHint": "Defaults to the address with dashes (203-0-113-120).",
+    "network": "External network",
+    "noProvider": "No external network you can use",
+    "target": "Attached to",
+    "unattached": "not attached",
+    "hiddenVm": "a VM you cannot see",
+    "nic": "Interface",
+    "attachOptional": "Attach to (optional)",
+    "nicHint": "Only interfaces on a network that is an interface of a router with this external network, and that have an IPv4 address.",
+    "noAttach": "Do not attach",
+    "pickNic": "Choose an interface",
+    "nicLabel": "{{vm}} #{{n}} ({{network}})",
+    "blockedNic": "{{nic}} — {{reason}}",
+    "noRoutableNic": "No interface is routed to this external network yet: connect its network to a router whose external network is this one.",
+    "column": "Floating IP",
+    "onNic": "Floating IP {{address}}",
+    "state": {
+      "unattached": "not attached",
+      "distributed": "distributed",
+      "distributedOn": "distributed · {{node}}",
+      "centralized": "centralized",
+      "unrouted": "not routed"
+    },
+    "why": {
+      "template": "template",
+      "noRouter": "{{network}} is not on a router to {{external}}",
+      "noIpv4": "no IPv4 address on {{network}}",
+      "taken": "has {{fip}}",
+      "denied": "no permission"
+    },
+    "errors": {
+      "network": "Choose an external network.",
+      "address": "Use an IPv4 address.",
+      "nic": "Choose an interface."
     }
   }
 }

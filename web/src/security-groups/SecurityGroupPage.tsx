@@ -36,6 +36,7 @@ import {
   toRule,
   validateRules,
 } from "@/security-groups/rules";
+import { groupNics } from "@/routing/routing";
 import { groupUsers } from "@/security-groups/SecurityGroupsPage";
 
 /** 보안 그룹 하나: 설명과 규칙 표. 쓰기 권한이 없으면 읽기만 한다. */
@@ -58,6 +59,9 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
   const perms = usePermissions();
   const write = perms.can("write", "security-group");
   const vms = useList("vm");
+  const networks = useList("network");
+  // 단순 NIC(nftables)와 SDN NIC(OVN ACL, 계획 66)
+  const nics = vms.data && networks.data ? groupNics(group, vms.data, networks.data) : undefined;
   useVisit({ kind: "security-group", id: group.id, name: group.name });
   const [description, setDescription] = useState(group.spec.description ?? "");
   const [rows, setRows] = useState(() => (group.spec.rules ?? []).map(fromRule));
@@ -145,8 +149,13 @@ function RulesEditor({ group }: { group: SecurityGroup }) {
         summary={[
           { label: t("securityGroups.rules"), value: (group.spec.rules ?? []).length },
           { label: t("securityGroups.vms"), value: vms.data ? groupUsers(group, vms.data) : "—" },
+          {
+            label: t("securityGroups.nics"),
+            value: nics ? t("securityGroups.nicCounts", nics) : "—",
+          },
         ]}
       />
+      <p className="text-sm text-muted-foreground">{t("securityGroups.sdnNote")}</p>
       <p className="text-sm text-muted-foreground">{t("securityGroups.order")}</p>
       <p className="text-sm text-muted-foreground">{t("securityGroups.always")}</p>
       {/* 보내는 동안이나 읽기 권한뿐이면 고치지 못하게 한다. */}

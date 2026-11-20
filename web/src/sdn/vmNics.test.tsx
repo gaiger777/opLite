@@ -7,7 +7,17 @@ import { toast } from "sonner";
 import type { Vm } from "@/api/types";
 import { resetTasks } from "@/tasks/tasks";
 import { TemplatesPage } from "@/templates/TemplatesPage";
-import { NODE, pool, securityGroup, sdnNetwork, snapshot, task, vm, volume } from "@/test/fixtures";
+import {
+  floatingIpView,
+  NODE,
+  pool,
+  securityGroup,
+  sdnNetwork,
+  snapshot,
+  task,
+  vm,
+  volume,
+} from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -25,7 +35,7 @@ function withNics(v: Vm, nics: Vm["spec"]["nics"], extra: Partial<Vm["spec"]> = 
   return { ...v, spec: { ...v.spec, nics, ...extra } };
 }
 
-it("gives an SDN interface addresses instead of security groups", async () => {
+it("gives an SDN interface addresses and keeps its security groups", async () => {
   mockLists({
     node: [NODE],
     network: [LAN, TENANT],
@@ -45,10 +55,10 @@ it("gives an SDN interface addresses instead of security groups", async () => {
   await within(nic).findByRole("option", { name: "tenant" });
   await user.selectOptions(within(nic).getByLabelText("Network"), "lan");
   await user.click(await within(nic).findByRole("checkbox", { name: "ssh" }));
-  // SDN 네트워크로 옮기면 그룹이 빠지고 주소 칸이 생긴다.
+  // SDN 네트워크로 옮기면 주소 칸이 생기고 그룹은 그대로다(계획 66 — OVN ACL).
   await user.selectOptions(within(nic).getByLabelText("Network"), "tenant");
-  expect(within(nic).queryByRole("checkbox", { name: "ssh" })).not.toBeInTheDocument();
-  expect(within(nic).getByText(/Security groups do not apply on SDN networks yet/)).toBeVisible();
+  expect(within(nic).getByRole("checkbox", { name: "ssh" })).toBeChecked();
+  expect(within(nic).getByText(/Port security lets this interface send only/)).toBeVisible();
   const ips = within(nic).getByLabelText("IP addresses");
   expect(ips).toHaveAttribute("placeholder", "Automatic");
   await user.type(ips, "10.10.0.5, 10.10.0.6");
@@ -66,7 +76,13 @@ it("gives an SDN interface addresses instead of security groups", async () => {
   await user.click(screen.getByRole("button", { name: "Create" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]!.spec.nics).toEqual([
-    { network: "tenant", model: "virtio", mac: null, ips: ["10.10.0.5"] },
+    {
+      network: "tenant",
+      model: "virtio",
+      mac: null,
+      security_groups: ["ssh"],
+      ips: ["10.10.0.5"],
+    },
   ]);
   expect(bodies[0]!.spec.cloud_init?.networks).toBeUndefined();
 });
@@ -233,8 +249,8 @@ it("deploys a template with an address only for one VM", async () => {
   expect(bodies[0]).toMatchObject({ ips: [["10.10.0.9"]] });
 });
 
-it("drops security groups left on an SDN interface and keeps saved addresses when empty", async () => {
-  // 리뷰 1 #2·#9: 그룹이 남은 옛 SDN NIC도 저장할 수 있고, 저장된 NIC의 빈 주소 칸은 "지금 주소를 둠"이다.
+it("keeps security groups on an SDN interface and saved addresses when empty", async () => {
+  // 계획 66: SDN NIC의 그룹은 OVN ACL로 걸리므로 그대로 보낸다. 리뷰 1 #9: 저장된 NIC의 빈 주소 칸은 "지금 주소를 둠"이다.
   const web = withNics(vm("web", "stopped"), [
     {
       network: "tenant",
@@ -264,7 +280,13 @@ it("drops security groups left on an SDN interface and keeps saved addresses whe
   await userEvent.click(screen.getByRole("button", { name: "Save" }));
   await vi.waitFor(() => expect(body).toBeDefined());
   expect(body!.spec.nics).toEqual([
-    { network: "tenant", model: "virtio", mac: "52:54:00:00:00:01", ips: ["10.10.0.2"] },
+    {
+      network: "tenant",
+      model: "virtio",
+      mac: "52:54:00:00:00:01",
+      security_groups: ["ssh"],
+      ips: ["10.10.0.2"],
+    },
   ]);
 });
 
@@ -278,9 +300,7 @@ it("has no address field for a template's SDN interface", async () => {
   mockLists({ vm: [tmpl], node: [NODE], network: [TENANT] });
   renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/tmpl/edit" });
   const nic = await screen.findByRole("group", { name: "Network interface 1" });
-  expect(
-    await within(nic).findByText(/Security groups do not apply on SDN networks yet/),
-  ).toBeVisible();
+  expect(await within(nic).findByText(/Port security lets this interface send only/)).toBeVisible();
   expect(within(nic).queryByLabelText("IP addresses")).not.toBeInTheDocument();
 });
 
@@ -310,4 +330,35 @@ it("clears typed clone addresses when the source changes", async () => {
   await within(dialog).findByRole("option", { name: "Snapshot before" });
   await user.selectOptions(within(dialog).getByLabelText("Source"), old.id);
   expect(within(dialog).getByLabelText("Interface 1 (tenant) IP addresses")).toHaveValue("");
+});
+
+it("shows the floating IP of an SDN interface on the VM page", async () => {
+  // 계획 66: 유동 IP는 SDN NIC의 MAC으로 붙는다(서버 `FloatingIpView.spec.target`).
+  const web = withNics(vm("web", "running"), [
+    { network: "tenant", model: "virtio", mac: "52:54:00:00:00:01", ips: ["10.10.0.2"] },
+    { network: "tenant", model: "virtio", mac: "52:54:00:00:00:03", ips: ["10.10.0.3"] },
+  ]);
+  mockLists({ vm: [web], node: [NODE], network: [TENANT] });
+  server.use(
+    http.get(apiUrl("/floating-ips"), () =>
+      HttpResponse.json({
+        revision: 3,
+        items: [
+          floatingIpView(
+            "203.0.113.120",
+            "ext",
+            { kind: "distributed", node: "node-a" },
+            { target: { vm: web.id, mac: "52:54:00:00:00:01" }, vm_name: "web" },
+          ),
+        ],
+      }),
+    ),
+  );
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  await userEvent.click(await screen.findByRole("tab", { name: "Hardware" }));
+  const table = screen.getByRole("table", { name: "Network interfaces" });
+  expect(await within(table).findByRole("columnheader", { name: "Floating IP" })).toBeVisible();
+  const link = await within(table).findByRole("link", { name: "Floating IP 203.0.113.120" });
+  expect(link).toHaveAttribute("href", "/floating-ips");
+  expect(within(table).getByText("10.10.0.3").closest("tr")).toHaveTextContent(/—$/);
 });

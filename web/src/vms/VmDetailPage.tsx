@@ -66,7 +66,8 @@ import {
 } from "@/vms/replication";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
 import { PortOffChip } from "@/sdn/chips";
-import { formatIps, portOff } from "@/sdn/ips";
+import { fipOn, useFloatingIps } from "@/routing/routing";
+import { formatIps, isSdnNetwork, portOff } from "@/sdn/ips";
 import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -734,6 +735,11 @@ function Hardware({ vm }: { vm: Vm }) {
   // SDN NIC의 포트가 꺼졌는지 보려고(서브넷이 있는데 주소 없음 — 리뷰 2 웹 I-1)
   const networks = useList("network");
   const { t } = useTranslation();
+  // 유동 IP(계획 66)는 SDN NIC에만 붙는다. SDN NIC가 있을 때만 목록을 읽는다.
+  const sdnNics = (vm.spec.nics ?? []).some((nic) =>
+    isSdnNetwork(networks.data?.find((n) => n.name === nic.network)),
+  );
+  const fips = useFloatingIps(sdnNics);
   return (
     <div className="flex flex-col gap-6 pt-2">
       <section className="flex flex-col gap-2">
@@ -782,6 +788,7 @@ function Hardware({ vm }: { vm: Vm }) {
               <TableHead>{t("vms.mac")}</TableHead>
               <TableHead>{t("vms.addresses")}</TableHead>
               <TableHead>{t("vmForm.securityGroups")}</TableHead>
+              {sdnNics && <TableHead>{t("fip.column")}</TableHead>}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -814,12 +821,34 @@ function Hardware({ vm }: { vm: Vm }) {
                 <TableCell>
                   {nic.security_groups?.length ? nic.security_groups.join(", ") : "—"}
                 </TableCell>
+                {sdnNics && (
+                  <TableCell className="font-mono text-xs">
+                    <NicFip fip={fipOn(fips.data, vm.id, nic.mac)} />
+                  </TableCell>
+                )}
               </TableRow>
             ))}
           </TableBody>
         </Table>
       </section>
     </div>
+  );
+}
+
+/** NIC에 붙은 유동 IP: 유동 IP 보기로 가는 링크(붙이기·떼기는 그 보기에서) */
+function NicFip({ fip }: { fip: ReturnType<typeof fipOn> }) {
+  const { t } = useTranslation();
+  if (!fip) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  return (
+    <Link
+      to="/floating-ips"
+      className="underline"
+      aria-label={t("fip.onNic", { address: fip.spec.address ?? fip.name })}
+    >
+      {fip.spec.address ?? fip.name}
+    </Link>
   );
 }
 

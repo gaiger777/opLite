@@ -97,11 +97,12 @@ export function NicsSection({
                   className="w-full"
                   disabled={fixed}
                   value={nic.network}
-                  // `user` 네트워크(QEMU NAT)와 SDN 네트워크에는 보안 그룹을 걸 수 없다. 주소는 네트워크마다다.
+                  // `user` 네트워크(QEMU NAT)에는 보안 그룹을 걸 수 없다(SDN 네트워크는 계획 66부터 OVN ACL로 건다).
+                  // 주소는 네트워크마다다.
                   onChange={(e) =>
                     setNic(
                       i,
-                      e.target.value === "user" || sdnNetworkNamed(networks, e.target.value)
+                      e.target.value === "user"
                         ? { network: e.target.value, securityGroups: [], ips: "" }
                         : { network: e.target.value, ips: "" },
                     )
@@ -179,10 +180,10 @@ export function NicsSection({
                       )}
                     </Field>
                   )}
-                  <p className="text-xs text-muted-foreground">{t("vmForm.sdnNoGroups")}</p>
+                  <p className="text-xs text-muted-foreground">{t("vmForm.sdnPortSecurity")}</p>
                 </div>
               )}
-              {nic.network !== "user" && !sdn && (
+              {nic.network !== "user" && (
                 <NicGroups
                   index={i}
                   chosen={nic.securityGroups}

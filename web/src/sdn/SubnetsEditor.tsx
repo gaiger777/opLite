@@ -6,26 +6,32 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { emptySubnetRow, rowFamily, type SubnetRow } from "@/sdn/subnets";
+import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { emptySubnetRow, type Ipv6ModeValue, rowFamily, type SubnetRow } from "@/sdn/subnets";
+
+/** 서버 `Ipv6Mode`(계획 66) */
+const IPV6_MODES = ["slaac", "dhcpv6-stateful", "dhcpv6-stateless"] as const;
 
 /** 서버는 주소 체계마다 서브넷 하나다. */
 const MAX_SUBNETS = 2;
 
 /**
  * SDN 네트워크의 서브넷 표(만들기 대화상자와 서랍). 저장된 서브넷은 CIDR·게이트웨이를 바꿀 수 없다. `id`는 칸 id의
- * 앞이다.
+ * 앞이다. `provider`면 공급자(외부) 네트워크다: IPv4 서브넷에 유동 IP 풀 칸이 있고 DHCP는 기본 끔이다(계획 66).
  */
 export function SubnetsEditor({
   id,
   rows,
   errors,
   disabled,
+  provider = false,
   onChange,
 }: {
   id: string;
   rows: SubnetRow[];
   errors: Record<string, string>;
   disabled?: boolean;
+  provider?: boolean;
   onChange(rows: SubnetRow[]): void;
 }) {
   const { t } = useTranslation();
@@ -107,6 +113,49 @@ export function SubnetsEditor({
                 />
               )}
             </Field>
+            {provider && v4 && (
+              <Field
+                id={at("floating")}
+                label={t("sdn.subnets.floating")}
+                error={err("floating")}
+                hint={t("sdn.subnets.floatingHint")}
+              >
+                {(a11y) => (
+                  <Input
+                    id={at("floating")}
+                    placeholder="203.0.113.100-203.0.113.199"
+                    value={row.floating}
+                    onChange={(e) => set(i, { floating: e.target.value })}
+                    {...a11y}
+                  />
+                )}
+              </Field>
+            )}
+            {!v4 && (
+              <Field
+                id={at("ipv6Mode")}
+                label={t("sdn.subnets.ipv6Mode")}
+                error={err("ipv6Mode")}
+                hint={t("sdn.subnets.ipv6ModeHint")}
+              >
+                {(a11y) => (
+                  <NativeSelect
+                    id={at("ipv6Mode")}
+                    className="w-full"
+                    value={row.ipv6Mode}
+                    onChange={(e) => set(i, { ipv6Mode: e.target.value as Ipv6ModeValue })}
+                    {...a11y}
+                  >
+                    <NativeSelectOption value="">{t("sdn.ipv6Mode.none")}</NativeSelectOption>
+                    {IPV6_MODES.map((m) => (
+                      <NativeSelectOption key={m} value={m}>
+                        {t(`sdn.ipv6Mode.${m}`)}
+                      </NativeSelectOption>
+                    ))}
+                  </NativeSelect>
+                )}
+              </Field>
+            )}
             <Field
               id={at("description")}
               label={t("sdn.subnets.description")}
@@ -153,7 +202,7 @@ export function SubnetsEditor({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => onChange([...rows, emptySubnetRow()])}
+            onClick={() => onChange([...rows, emptySubnetRow(provider)])}
           >
             <Plus />
             {t("sdn.subnets.add")}

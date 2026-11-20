@@ -229,3 +229,52 @@ it("creates, renames and quotas a folder from its detail page", async () => {
     expect(requests).toEqual([{ ifMatch: "1", body: { quota: { memory_mib: 16384, vms: 20 } } }]),
   );
 });
+
+it("sets the router and floating IP quota of a network folder", async () => {
+  // 계획 66: 네트워크 폴더의 할당량은 라우터·유동 IP 수다(서버 `FolderKind::quota_dimensions`).
+  const T = folderId("tenant");
+  mockLists({ folder: [folder("tenant", "network", undefined, { quota: { floating_ips: 4 } })] });
+  const requests: unknown[] = [];
+  server.use(
+    // 서버 `FolderUsage`: VM 칸은 늘, 라우터·유동 IP는 0이면 빠진다.
+    http.get(apiUrl("/folders/:id/usage"), () =>
+      HttpResponse.json({
+        folder: T,
+        path: "/tenant",
+        usage: { vcpus: 0, memory_mib: 0, disk_bytes: 0, vms: 0, routers: 1, floating_ips: 3 },
+        limits: [
+          {
+            folder: T,
+            path: "/tenant",
+            quota: { floating_ips: 4 },
+            usage: { vcpus: 0, memory_mib: 0, disk_bytes: 0, vms: 0, routers: 1, floating_ips: 3 },
+          },
+        ],
+        binding: { floating_ips: T },
+      }),
+    ),
+    http.patch(apiUrl("/folders/:id"), async ({ request }) => {
+      requests.push({ ifMatch: request.headers.get("If-Match"), body: await request.json() });
+      return HttpResponse.json(folder("tenant", "network"));
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<FolderDetailPage kind="network" />, {
+    path: "/network-folders/:id",
+    url: `/network-folders/${T}`,
+    as: ADMIN,
+  });
+  expect(await screen.findByText("3 of 4")).toBeInTheDocument();
+  expect(screen.getByRole("meter", { name: "Floating IPs" })).toBeInTheDocument();
+  expect(screen.queryByRole("meter", { name: "vCPUs" })).not.toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Actions for tenant" }));
+  await user.click(screen.getByRole("menuitem", { name: "Set quota" }));
+  const dialog = screen.getByRole("dialog", { name: "Quota of tenant" });
+  expect(within(dialog).getByLabelText("Floating IPs")).toHaveValue("4");
+  expect(within(dialog).queryByLabelText("vCPUs")).not.toBeInTheDocument();
+  await user.type(within(dialog).getByLabelText("Routers"), "2");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() =>
+    expect(requests).toEqual([{ ifMatch: "1", body: { quota: { routers: 2, floating_ips: 4 } } }]),
+  );
+});

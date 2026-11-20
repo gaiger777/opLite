@@ -8,6 +8,7 @@ import {
   folder,
   folderId,
   NODE,
+  providerNetwork,
   readyChassis,
   sdnNetwork,
   sdnNode,
@@ -312,7 +313,7 @@ it("deletes an unused network and shows why a delete failed", async () => {
   const dialog = await screen.findByRole("alertdialog");
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "A VM uses this network. Remove its interface first.",
+    'This network is still in use: network "lab" is used by VM "x"',
   );
 });
 
@@ -735,4 +736,97 @@ it("reloads the revision after a conflict and keeps the typed rows", async () =>
   await user.click(within(sheet).getByRole("button", { name: "Save" }));
   await waitFor(() => expect(sent).toEqual(["4", "7"]));
   expect((await screen.findAllByText("Saved the subnets of tenant.")).length).toBeGreaterThan(0);
+});
+
+it("lists a provider network with its physnet, MTU and the nodes that have the physnet", async () => {
+  const a = sdnNode(1, {
+    ...readyChassis(1, "leader"),
+    physnets: [{ name: "ext", bridge: "vmbr1", ready: true }],
+  });
+  const b = sdnNode(2, {
+    ...readyChassis(2),
+    physnets: [{ name: "ext", bridge: "vmbr1", ready: false, error: "no bridge vmbr1" }],
+  });
+  const ext = providerNetwork("ext", "ext", [], 100);
+  const lone = providerNetwork("lone", "dmz");
+  mockLists({ node: [a, b], network: [ext, lone] });
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), () =>
+      HttpResponse.json({ network: "ext", subnets: [], allocations: [] }),
+    ),
+  );
+  renderPage(<NetworksPage />);
+  const table = await screen.findByRole("table", { name: "Networks" });
+  const row = (await within(table).findByRole("button", { name: "Open ext" })).closest("tr")!;
+  expect(row).toHaveTextContent("External (provider)");
+  expect(row).toHaveTextContent("ext:100");
+  expect(row).toHaveTextContent("1500");
+  expect(await within(row).findByText("node-a")).toBeVisible();
+  const other = within(table).getByRole("button", { name: "Open lone" }).closest("tr")!;
+  expect(other).toHaveTextContent("No node has physnet dmz ready");
+});
+
+it("creates a provider network with a physnet, VLAN and floating IP ranges", async () => {
+  const a = sdnNode(1, {
+    ...readyChassis(1, "leader"),
+    physnets: [{ name: "ext", bridge: "vmbr1", ready: true }],
+  });
+  mockLists({ node: [a] });
+  let body: unknown;
+  server.use(
+    http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([a], [a]))),
+    http.post(apiUrl("/networks"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json(providerNetwork("ext", "ext", [], 100), {
+        status: 201,
+        headers: { "orbivisor-warning": "no node has physnet ext ready yet" },
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a network" });
+  await user.type(within(dialog).getByLabelText("Name"), "ext");
+  await within(dialog).findByRole("option", { name: "External (provider)" });
+  await user.selectOptions(within(dialog).getByLabelText("Type"), "provider");
+  expect(within(dialog).getByLabelText("MTU (optional)")).toHaveAccessibleDescription(
+    /Defaults to 1500/,
+  );
+  await user.type(within(dialog).getByLabelText("Physical network"), "Ext");
+  await user.type(within(dialog).getByLabelText("VLAN tag (optional)"), "100");
+  await user.click(within(dialog).getByRole("button", { name: "Add a subnet" }));
+  const subnet = within(dialog).getByRole("group", { name: "Subnet 1" });
+  // 공급자 서브넷의 DHCP는 기본 끔(물리 망의 DHCP 서버)
+  expect(within(subnet).getByLabelText("DHCP")).not.toBeChecked();
+  await user.type(within(subnet).getByLabelText("CIDR"), "203.0.113.0/24");
+  await user.type(within(subnet).getByLabelText("Gateway"), "203.0.113.1");
+  await user.type(
+    within(subnet).getByLabelText("Floating IP ranges"),
+    "203.0.113.100-203.0.113.199",
+  );
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(
+    within(dialog).getByText(
+      "Use a lowercase letter, then up to 30 lowercase letters, digits or -.",
+    ),
+  ).toBeVisible();
+  await user.clear(within(dialog).getByLabelText("Physical network"));
+  await user.type(within(dialog).getByLabelText("Physical network"), "ext");
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  expect(await screen.findByText("Created network ext.")).toBeInTheDocument();
+  expect(await screen.findByText("no node has physnet ext ready yet")).toBeInTheDocument();
+  expect(body).toEqual({
+    name: "ext",
+    spec: {
+      sdn: { provider: { physnet: "ext", vlan: 100 } },
+      subnets: [
+        {
+          cidr: "203.0.113.0/24",
+          gateway: "203.0.113.1",
+          floating_pools: [{ start: "203.0.113.100", end: "203.0.113.199" }],
+        },
+      ],
+    },
+  });
 });

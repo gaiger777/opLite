@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import { SecurityGroupsPage } from "@/security-groups/SecurityGroupsPage";
-import { securityGroup, vm } from "@/test/fixtures";
+import { sdnNetwork, securityGroup, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -113,4 +113,26 @@ it("hides changes from operators", async () => {
   expect(await screen.findByRole("link", { name: "ssh" })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Create" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Delete ssh" })).not.toBeInTheDocument();
+});
+
+it("counts the simple and SDN interfaces that use a group", async () => {
+  const tenant = sdnNetwork("tenant", [{ cidr: "10.10.0.0/24" }]);
+  const both = {
+    ...web,
+    spec: {
+      ...web.spec,
+      nics: [
+        { network: "lan", model: "virtio" as const, security_groups: ["ssh"] },
+        { network: "tenant", model: "virtio" as const, security_groups: ["ssh"] },
+      ],
+    },
+  };
+  mockLists({ "security-group": [ssh], vm: [both], network: [tenant] });
+  renderPage(<SecurityGroupsPage />);
+  const table = await screen.findByRole("table", { name: "Security groups" });
+  const row = (await within(table).findByRole("link", { name: "ssh" })).closest("tr")!;
+  expect(await within(row).findByText("1 simple · 1 SDN")).toBeVisible();
+  expect(
+    screen.getByText(/The same groups apply to SDN interfaces through OVN ACLs/),
+  ).toBeVisible();
 });

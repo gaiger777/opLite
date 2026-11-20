@@ -23,6 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { groupNics } from "@/routing/routing";
 import { MAX_DESCRIPTION } from "@/security-groups/rules";
 import { validName } from "@/vms/form";
 
@@ -37,6 +38,7 @@ export function SecurityGroupsPage() {
   const perms = usePermissions();
   const groups = useList("security-group");
   const vms = useList("vm");
+  const networks = useList("network");
   const [creating, setCreating] = useState(false);
   const [deleting, setDeleting] = useState<SecurityGroup | null>(null);
   const write = perms.can("write", "security-group");
@@ -56,6 +58,7 @@ export function SecurityGroupsPage() {
         }
       />
       <p className="text-sm text-muted-foreground">{t("securityGroups.note")}</p>
+      <p className="text-sm text-muted-foreground">{t("securityGroups.sdnNote")}</p>
       <Table aria-labelledby="security-groups-title">
         <TableHeader>
           <TableRow>
@@ -63,6 +66,7 @@ export function SecurityGroupsPage() {
             <TableHead>{t("securityGroups.rules")}</TableHead>
             <TableHead>{t("securityGroups.description")}</TableHead>
             <TableHead>{t("securityGroups.vms")}</TableHead>
+            <TableHead>{t("securityGroups.nics")}</TableHead>
             {write && (
               <TableHead>
                 <span className="sr-only">{t("vms.actions")}</span>
@@ -73,7 +77,7 @@ export function SecurityGroupsPage() {
         <TableBody>
           {(groups.data ?? []).length === 0 && (
             <TableMessage
-              colSpan={write ? 5 : 4}
+              colSpan={write ? 6 : 5}
               query={groups}
               empty={t("securityGroups.empty")}
             />
@@ -81,6 +85,11 @@ export function SecurityGroupsPage() {
           {(groups.data ?? []).map((group) => {
             // VM 목록을 다 읽기 전에는 모른다.
             const used = vms.isSuccess ? groupUsers(group, vms.data) : undefined;
+            // 단순 NIC(nftables)와 SDN NIC(OVN ACL, 계획 66). 서버 `status.nics`는 목록 응답에만 있어 화면이 센다.
+            const nics =
+              vms.isSuccess && networks.isSuccess
+                ? groupNics(group, vms.data, networks.data)
+                : undefined;
             return (
               <TableRow key={group.id}>
                 <TableCell>
@@ -99,6 +108,7 @@ export function SecurityGroupsPage() {
                     <div className="text-xs text-muted-foreground">{t("securityGroups.inUse")}</div>
                   )}
                 </TableCell>
+                <TableCell>{nics ? t("securityGroups.nicCounts", nics) : "—"}</TableCell>
                 {write && (
                   <TableCell className="text-right">
                     <Button

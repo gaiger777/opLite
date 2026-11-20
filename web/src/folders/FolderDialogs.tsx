@@ -159,6 +159,78 @@ export function parseLimit(text: string, scale: number): number | null | undefin
 }
 
 /**
+ * 네트워크 폴더의 할당량(계획 66): 라우터 수·유동 IP 수. 빈 칸은 상한이 없고, 모두 비우면 할당량을 지운다. 옛 노드가 남은
+ * 클러스터는 서버가 409 `cluster_upgrading`이다.
+ */
+export function NetworkQuotaDialog({ folder, onClose }: { folder: Folder; onClose(): void }) {
+  const { t } = useTranslation();
+  const q = folder.spec.quota ?? {};
+  const [values, setValues] = useState({
+    routers: q.routers?.toString() ?? "",
+    floating_ips: q.floating_ips?.toString() ?? "",
+  });
+  const [errors, setErrors] = useState<Record<string, string>>({});
+
+  async function submit() {
+    const parsed = {
+      routers: parseLimit(values.routers, 1),
+      floating_ips: parseLimit(values.floating_ips, 1),
+    };
+    const found: Record<string, string> = {};
+    for (const key of ["routers", "floating_ips"] as const) {
+      if (parsed[key] === undefined) {
+        found[key] = "folders.badCount";
+      }
+    }
+    setErrors(found);
+    if (Object.keys(found).length > 0) {
+      return false;
+    }
+    const quota: FolderQuota = Object.fromEntries(
+      Object.entries(parsed).filter(([, v]) => v !== null),
+    );
+    await call(
+      api.PATCH("/folders/{id}", {
+        params: { path: { id: folder.id }, header: { "If-Match": folder.revision } },
+        body: { quota: Object.keys(quota).length > 0 ? quota : null },
+      }),
+    );
+    toast.success(t("folders.quotaSaved", { name: folder.spec.name }));
+  }
+
+  return (
+    <FormDialog
+      title={t("folders.quotaTitle", { name: folder.spec.name })}
+      description={t("folders.networkQuotaDescription")}
+      submitLabel={t("common.save")}
+      onClose={onClose}
+      onSubmit={submit}
+    >
+      {(["routers", "floating_ips"] as const).map((id) => (
+        <Field
+          key={id}
+          id={`quota-${id}`}
+          label={t(`folders.dim.${id}`)}
+          error={errors[id]}
+          hint={t("folders.noLimitHint")}
+        >
+          {(a11y) => (
+            <Input
+              id={`quota-${id}`}
+              inputMode="numeric"
+              autoComplete="off"
+              value={values[id]}
+              onChange={(e) => setValues({ ...values, [id]: e.target.value })}
+              {...a11y}
+            />
+          )}
+        </Field>
+      ))}
+    </FormDialog>
+  );
+}
+
+/**
  * 할당량: vCPU·메모리(GiB)·디스크(GiB)·VM 수·전용 vCPU(계획 64). 빈 칸은 상한이 없다. 모두 비우면 할당량을 지운다.
  */
 export function QuotaDialog({ folder, onClose }: { folder: Folder; onClose(): void }) {

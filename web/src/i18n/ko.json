@@ -19,7 +19,7 @@
     "console_unavailable": "지금은 콘솔을 열 수 없습니다.",
     "cluster_no_quorum": "클러스터 과반수가 없습니다. 변경은 나중에 적용될 수 있습니다.",
     "not_leader": "클러스터 리더가 바뀌는 중입니다. 잠시 뒤 다시 시도하세요.",
-    "network_in_use": "이 네트워크를 쓰는 VM이 있습니다. 먼저 그 인터페이스를 빼세요.",
+    "network_in_use": "네트워크를 아직 쓰고 있습니다: {{message}}",
     "vni_in_use": "다른 네트워크가 이미 이 VNI를 씁니다.",
     "node_online": "온라인인 노드입니다. 그 노드에서 orbivisorctl cluster leave를 실행하세요.",
     "pool_not_on_node": "지금 접속한 노드에서 쓸 수 없는 스토리지 풀입니다.",
@@ -142,7 +142,13 @@
     "ip_exhausted": "서브넷에 남은 주소가 없습니다: {{message}}",
     "ips_without_sdn": "IP 주소는 SDN 네트워크에서만 줄 수 있습니다: {{message}}",
     "cloud_init_sdn_nic": "{{message}}",
-    "sdn_security_groups": "SDN 네트워크에는 아직 보안 그룹을 걸 수 없습니다: {{message}}"
+    "invalid_router": "라우터가 올바르지 않습니다: {{message}}",
+    "router_in_use": "라우터에 인터페이스가 남아 있습니다. 먼저 빼세요.",
+    "fip_in_use": "유동 IP가 걸려 있습니다: {{message}}",
+    "fip_not_routable": "그 인터페이스에는 유동 IP를 붙일 수 없습니다: {{message}}",
+    "physnet_in_use": "이 노드의 VM이 그 물리 네트워크를 씁니다: {{message}}",
+    "physnet_conflict": "다른 네트워크가 이미 그 물리 네트워크와 VLAN을 씁니다: {{message}}",
+    "invalid_node_sdn": "SDN 설정이 올바르지 않습니다: {{message}}"
   },
   "nav": {
     "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",
@@ -205,7 +211,9 @@
     "security": "보안",
     "account": "2단계 인증",
     "noAccess": "이 화면을 볼 권한이 없습니다.",
-    "sdn": "SDN"
+    "sdn": "SDN",
+    "routers": "라우터",
+    "floatingIps": "유동 IP"
   },
   "header": {
     "language": "언어",
@@ -1276,12 +1284,14 @@
     "kinds": {
       "bridge": "브리지",
       "vxlan": "VXLAN",
-      "sdn": "SDN(OVN)"
+      "sdn": "SDN(OVN)",
+      "provider": "외부(공급자)"
     },
     "kindHint": {
       "bridge": "노드에 이미 있는 Linux 브리지입니다. 이 네트워크의 VM은 그 브리지가 있는 노드에서만 실행됩니다.",
       "vxlan": "orbivisord가 모든 노드에 브리지 oplv<VNI>와 VXLAN 장치를 만들고 UDP 4789로 잇습니다.",
-      "sdn": "chassis 노드 사이 Geneve 터널 위의 OVN 논리 스위치입니다. 서브넷, Orbivisor가 정하는 IP 주소, 내장 DHCP가 있습니다. 아직 라우터가 없어 다른 네트워크와 떨어져 있습니다."
+      "sdn": "chassis 노드 사이 Geneve 터널 위의 OVN 논리 스위치입니다. 서브넷, Orbivisor가 정하는 IP 주소, 내장 DHCP가 있습니다. 다른 네트워크와 밖으로 나가려면 라우터에 붙이세요.",
+      "provider": "노드의 물리 네트워크(physnet)에 붙는 SDN 네트워크입니다(flat 또는 VLAN 태그). VM을 곧바로 붙일 수 있고 라우터와 유동 IP가 바깥으로 씁니다. 관리자만 만듭니다."
     },
     "bridge": "브리지",
     "vlanVni": "VLAN/VNI",
@@ -1360,7 +1370,10 @@
       "remote": "10.0.0.0/8이나 2001:db8::/32 같은 CIDR로 입력하세요.",
       "icmpRemote": "ICMP 규칙에는 IPv4 주소만 씁니다.",
       "icmpv6Remote": "ICMPv6 규칙에는 IPv6 주소만 씁니다."
-    }
+    },
+    "nics": "인터페이스",
+    "nicCounts": "단순 {{simple}} · SDN {{sdn}}",
+    "sdnNote": "같은 그룹이 SDN 인터페이스에는 OVN ACL로 같은 순서와 기본 정책으로 걸립니다. 다른 점: SDN 인터페이스는 허용 규칙을 빼면 이미 맺은 연결도 끊기고, 포트 보안이 보낸 주소 위조를 막습니다."
   },
   "nodes": {
     "address": "API 주소",
@@ -2102,10 +2115,10 @@
     "nicIpsHint": "IPv4와 IPv6 주소를 하나씩까지, 쉼표로 나눠 씁니다. 비우면 서브넷의 빈 주소를 받습니다.",
     "nicIpsRunning": "이 인터페이스의 주소를 바꾸려면 VM을 멈추세요.",
     "nicIpsAuto": "자동",
-    "sdnNoGroups": "SDN 네트워크에는 아직 보안 그룹을 걸 수 없습니다. 포트 보안이 이 인터페이스의 MAC과 주소로만 보내게 합니다. 서브넷이 있는 네트워크에서 주소가 없는 인터페이스는 주소를 받을 때까지 아무것도 보내지 못합니다.",
     "ciSdn": "NIC {{n}}은 SDN 네트워크에 있어 주소를 IPAM(서브넷)이 정합니다.",
     "nicIpsKeepHint": "IPv4와 IPv6 주소를 하나씩까지, 쉼표로 나눠 씁니다. 비우면 지금 주소를 그대로 둡니다.",
-    "nicIpsGiveRunning": "이 인터페이스는 주소가 없어 포트가 꺼져 있습니다. 지금 주소를 줄 수 있고, 게스트는 다음 DHCP 갱신에서 받습니다."
+    "nicIpsGiveRunning": "이 인터페이스는 주소가 없어 포트가 꺼져 있습니다. 지금 주소를 줄 수 있고, 게스트는 다음 DHCP 갱신에서 받습니다.",
+    "sdnPortSecurity": "포트 보안이 이 인터페이스의 MAC과 주소로만 보내게 합니다. 서브넷이 있는 네트워크에서 주소가 없는 인터페이스는 주소를 받을 때까지 아무것도 보내지 못합니다."
   },
   "console": {
     "connecting": "연결 중…",
@@ -3342,14 +3355,17 @@
       "memory_mib": "메모리",
       "disk_bytes": "디스크",
       "vms": "VM 수",
-      "dedicated_vcpus": "전용 vCPU"
+      "dedicated_vcpus": "전용 vCPU",
+      "routers": "라우터",
+      "floating_ips": "유동 IP"
     },
     "usedOf": "{{limit}} 중 {{used}}",
     "noLimit": "상한 없음",
     "over": "상한 넘음",
     "boundBy": "{{path}}이(가) 묶음",
     "badCount": "0 이상의 정수를 넣으세요.",
-    "hiddenLimits": "볼 수 없는 위 폴더에도 할당량이 있을 수 있습니다. 그 할당량에 막히면 오류가 알려 줍니다."
+    "hiddenLimits": "볼 수 없는 위 폴더에도 할당량이 있을 수 있습니다. 그 할당량에 막히면 오류가 알려 줍니다.",
+    "networkQuotaDescription": "이 폴더와 그 아래 전체의 상한입니다. 유동 IP는 보통 모자란 공인 주소입니다."
   },
   "permissions": {
     "title": "{{name}}의 권한",
@@ -3806,7 +3822,9 @@
       "gateway": "서브넷과 같은 체계의 주소를 쓰세요.",
       "dns": "IP 주소를 4개까지 쉼표로 나눠 쓰세요.",
       "pools": "10.10.0.100-10.10.0.199 같은 범위를 서브넷과 같은 체계로 16개까지 쓰세요.",
-      "description": "200자까지 쓰세요."
+      "description": "200자까지 쓰세요.",
+      "floating": "IPv4 주소의 시작-끝 범위를 16개까지 쓰세요.",
+      "slaac64": "SLAAC 계열 모드는 /64 서브넷이어야 합니다."
     },
     "subnets": {
       "title": "서브넷",
@@ -3821,7 +3839,7 @@
       "poolsHint": "선택. 비우면 서브넷 전체입니다.",
       "description": "설명",
       "dhcp": "DHCP",
-      "noDhcp6": "IPv6: 주소는 cloud-init으로 들어갑니다(DHCPv6는 아직 없음).",
+      "noDhcp6": "IPv6: 여기에는 DHCP 스위치가 없습니다. RA나 DHCPv6는 IPv6 모드로 고르세요.",
       "remove": "서브넷 {{n}} 빼기",
       "add": "서브넷 더하기",
       "saved": "{{name}}의 서브넷을 저장했습니다.",
@@ -3832,7 +3850,12 @@
       "fillNotice_one": "이 네트워크에 주소가 없는 인터페이스 {{count}}개가 있습니다. 저장하면 새 서브넷의 주소를 받습니다. 그때까지 포트는 꺼져 있습니다.",
       "fillNotice_other": "이 네트워크에 주소가 없는 인터페이스 {{count}}개가 있습니다. 저장하면 저마다 새 서브넷의 주소를 받습니다. 그때까지 포트는 꺼져 있습니다.",
       "conflict": "그새 누가 서브넷을 바꿨습니다(지금: {{subnets}}). 입력한 행은 그대로 두었으니 확인하고 다시 저장하세요.",
-      "noneShort": "없음"
+      "noneShort": "없음",
+      "floating": "유동 IP 범위",
+      "floatingHint": "선택. 라우터 바깥 주소와 유동 IP를 여기서 고릅니다. 없으면 자동 할당 범위를 함께 씁니다.",
+      "floatingFromPools": "자동 할당 범위에서",
+      "ipv6Mode": "IPv6 모드",
+      "ipv6ModeHint": "라우터 알림(RA)은 이 네트워크가 라우터 인터페이스일 때만 나갑니다. SLAAC 계열은 /64만 되고 EUI-64 주소를 줍니다."
     },
     "sheet": {
       "title": "네트워크 {{name}}",
@@ -3857,7 +3880,11 @@
       "hidden_one": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다.",
       "hidden_other": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다.",
       "off": "꺼짐: 주소 없음",
-      "offHint": "주소를 받을 때까지 이 포트로는 아무것도 오가지 않습니다. 편집에서 주소를 넣거나(VM이 켜져 있어도 됩니다) orbivisorctl network ips NAME --fill을 실행하세요."
+      "offHint": "주소를 받을 때까지 이 포트로는 아무것도 오가지 않습니다. 편집에서 주소를 넣거나(VM이 켜져 있어도 됩니다) orbivisorctl network ips NAME --fill을 실행하세요.",
+      "router": "라우터 {{name}}",
+      "fip": "유동 IP {{name}}",
+      "fipTo": "유동 IP {{name}} → {{vm}}",
+      "floating": "유동 IP: {{size}} 가운데 {{used}} 사용, {{free}} 남음"
     },
     "noChassis": "준비된 OVN chassis 노드가 없음",
     "kindNotReady": "SDN(OVN) — 설정 안 됨",
@@ -3974,6 +4001,183 @@
       "removeNamed": "{{name}}의 남은 중앙 데이터베이스 빼기",
       "removeTitle": "{{name}}의 남은 OVN 중앙 데이터베이스를 뺄까요?",
       "removeDescription": "온라인 노드는 데이터베이스를 떠나고 멈춥니다(파일은 지우지 않고 이름만 바꿈). 오프라인이거나 지운 노드는 살아 있는 중앙이 내쫓습니다."
+    },
+    "providerNotReady": "외부(공급자) — SDN 설정 전",
+    "ipv6Mode": {
+      "none": "없음(cloud-init 고정 주소)",
+      "slaac": "SLAAC",
+      "dhcpv6-stateful": "DHCPv6(상태 있음)",
+      "dhcpv6-stateless": "SLAAC + DHCPv6(상태 없음)"
+    },
+    "physnet": {
+      "title": "SDN 물리 네트워크",
+      "edit": "고치기",
+      "editTitle": "{{name}}의 SDN 설정",
+      "editDescription": "물리 네트워크(physnet)를 이 노드에 만들어 둔 Linux 브리지에 잇고, 이 노드를 라우터의 게이트웨이 후보로 정합니다.",
+      "rows": "물리 네트워크",
+      "name": "물리 네트워크",
+      "nameN": "물리 네트워크 {{n}}",
+      "bridge": "브리지",
+      "bridgeN": "브리지 {{n}}",
+      "bridgeHint": "브리지는 노드에 있어야 합니다. SDN 에이전트가 veth 짝으로 OVS에 잇고 브리지는 고치지 않습니다.",
+      "add": "물리 네트워크 더하기",
+      "remove": "물리 네트워크 {{n}} 빼기",
+      "none": "물리 네트워크가 없습니다.",
+      "gateway": "라우터의 게이트웨이 후보",
+      "priority": "게이트웨이 우선순위",
+      "priorityHint": "1–1000. 클수록 먼저이고, 같은 우선순위의 후보에는 라우터가 고르게 나뉩니다.",
+      "gatewayOn": "게이트웨이 후보, 우선순위 {{priority}}.",
+      "gatewayOff": "게이트웨이 후보가 아닙니다.",
+      "gatewayPending": "(SDN 에이전트가 아직 적용하지 않았습니다)",
+      "ready": "준비됨",
+      "notReady": "준비 안 됨",
+      "pending": "적용 중",
+      "removing": "빼는 중",
+      "saved": "{{name}}의 SDN 설정을 저장했습니다.",
+      "noNode": "physnet {{physnet}}이 준비된 노드가 없습니다",
+      "pickHint": "노드 › 노드 › SDN 물리 네트워크에서 브리지에 이은 이름입니다.",
+      "noneHint": "물리 네트워크를 둔 노드가 아직 없습니다. 먼저 노드 화면(노드 › 노드 › SDN 물리 네트워크)에서 더하세요.",
+      "vlanHint": "선택, 1–4094. 없으면 flat(태그 없음)입니다.",
+      "mtuHint": "1280–9000. 기본은 1500(물리 네트워크)입니다.",
+      "errors": {
+        "name": "영문 소문자 하나로 시작하고 소문자·숫자·-를 30자까지 쓰세요.",
+        "duplicate": "같은 물리 네트워크가 두 번 있습니다.",
+        "bridge": "Linux 브리지 이름을 쓰세요(1–15자, br-int 아님).",
+        "priority": "1부터 1000 사이의 수를 쓰세요.",
+        "tooMany": "물리 네트워크는 8개까지입니다."
+      }
+    }
+  },
+  "router": {
+    "pageHint": "라우터는 SDN 네트워크끼리 잇고, 외부(공급자) 네트워크를 거쳐 SNAT와 유동 IP로 밖과 잇습니다.",
+    "sdnNotReady": "라우터와 유동 IP는 먼저 네트워크 › SDN에서 SDN(OVN)을 설정해야 합니다.",
+    "empty": {
+      "title": "라우터가 없습니다",
+      "description": "SDN 네트워크를 잇고 밖으로 나가려면 라우터를 만드세요."
+    },
+    "create": "라우터 만들기",
+    "createTitle": "라우터 만들기",
+    "createDescription": "이을 SDN 네트워크와, 밖으로 나갈 외부 네트워크(선택)를 고르세요.",
+    "created": "라우터 {{name}}을(를) 만들었습니다.",
+    "saved": "라우터 {{name}}을(를) 저장했습니다.",
+    "deleted": "라우터 {{name}}을(를) 삭제했습니다.",
+    "deleteTitle": "라우터 {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "라우터에 인터페이스가 남지 않았습니다. 바깥 주소는 외부 네트워크로 돌아갑니다.",
+    "removeFirst": "먼저 인터페이스를 빼세요.",
+    "open": "라우터 {{name}} 열기",
+    "sheetTitle": "라우터 {{name}}",
+    "descriptionOptional": "설명(선택)",
+    "external": "외부 네트워크",
+    "externalHint": "공급자 네트워크입니다. 없으면 라우터는 SDN 네트워크끼리만 잇습니다.",
+    "externalIps": "바깥 주소",
+    "externalChangeHint": "같은 네트워크를 두면 바깥 주소도 그대로입니다. 이 라우터로 라우팅되는 유동 IP는 바꾸거나 지우기 전에 떼야 합니다.",
+    "editExternal": "바꾸기",
+    "noExternal": "없음",
+    "noExternalHint": "외부 네트워크가 없습니다: 라우터는 SDN 네트워크끼리만 잇습니다.",
+    "snat": "SNAT",
+    "snatLabel": "안쪽 IPv4 주소를 바깥 주소로 바꾸기(SNAT)",
+    "snatOffHint": "SNAT가 없으면 물리 라우터에 안쪽 서브넷을 라우터 바깥 주소로 보내는 경로가 있어야 합니다.",
+    "on": "켬",
+    "off": "끔",
+    "interfaces": "인터페이스",
+    "interfacesHint": "SDN 네트워크 하나는 라우터 하나의 인터페이스가 됩니다. 서브넷 게이트웨이가 라우터 주소이고, 게스트는 다음 DHCP 갱신 때 기본 경로를 받습니다.",
+    "portAddresses": "라우터 주소",
+    "noInterfaces": "인터페이스가 없습니다.",
+    "noAttachable": "이을 수 있는 서브넷 있는 SDN 네트워크가 없습니다.",
+    "addInterface": "인터페이스 더하기",
+    "add": "더하기",
+    "removeInterface": "인터페이스 {{network}} 빼기",
+    "routes": "정적 경로",
+    "destination": "목적지",
+    "nexthop": "다음 홉",
+    "noRoutes": "정적 경로가 없습니다.",
+    "noRoutesDefault": "정적 경로가 없습니다. 기본 경로는 외부 네트워크의 게이트웨이로 갑니다.",
+    "addRoute": "경로 더하기",
+    "removeRoute": "{{destination}} 경로 빼기",
+    "gateway": "게이트웨이",
+    "gateways": "게이트웨이 노드",
+    "gatewaysHint": "지금 노드가 죽으면 OVN이 라우터의 바깥 포트를 다음 노드로 넘깁니다(BFD). 그때 맺은 SNAT 연결은 끊깁니다.",
+    "node": "노드",
+    "nodePriority": "노드 우선순위",
+    "haPriority": "순위",
+    "active": "지금",
+    "activeNow": "주인",
+    "standby": "대기",
+    "noGateway": "게이트웨이 노드 없음",
+    "gatewayError": "{{error}}. 게이트웨이 노드에 물리 네트워크가 준비될 때까지 라우터의 바깥 포트는 꺼져 있습니다(SNAT·유동 IP 없음). 노드 › 노드 › SDN 물리 네트워크에서 정하세요.",
+    "liveError": "OVN에서 지금 게이트웨이를 읽지 못했습니다: {{error}}",
+    "hostingOutside": "지금 주인: {{node}}.",
+    "upstreamHint": "이 경로들은 주소를 바꾸지 않습니다. 물리 라우터에 있어야 합니다:",
+    "errors": {
+      "description": "200자까지 쓰세요.",
+      "tooMany": "인터페이스는 16개까지입니다.",
+      "destination": "10.20.0.0/16 같은 CIDR을 쓰세요.",
+      "nexthop": "목적지와 같은 체계의 주소를 쓰세요.",
+      "defaultRoute": "외부 네트워크가 있으면 기본 경로는 저절로 생깁니다."
+    }
+  },
+  "fip": {
+    "pageHint": "외부 네트워크의 공인 주소를 VM 인터페이스 하나에 1:1로 잇습니다. VM의 노드에 물리 네트워크가 있으면 분산(그 노드에서 바로 나감), 아니면 게이트웨이 노드가 맡습니다.",
+    "empty": {
+      "title": "유동 IP가 없습니다",
+      "description": "외부 네트워크에서 유동 IP를 만들고 라우팅되는 VM 인터페이스에 붙이세요."
+    },
+    "create": "유동 IP 만들기",
+    "createTitle": "유동 IP 만들기",
+    "createDescription": "외부 네트워크의 유동 IP 범위에서 빈 주소를 받습니다.",
+    "created": "유동 IP {{address}}을(를) 만들었습니다.",
+    "deleted": "유동 IP {{name}}을(를) 삭제했습니다.",
+    "deleteTitle": "유동 IP {{name}}을(를) 삭제할까요?",
+    "deleteDescription": "주소는 외부 네트워크로 돌아갑니다.",
+    "deleteAttached": "붙어 있습니다: NAT가 사라지고 주소는 외부 네트워크로 돌아갑니다.",
+    "attach": "붙이기",
+    "attachNamed": "{{name}} 붙이기",
+    "attachTitle": "{{name}} 붙이기",
+    "attachDescription": "{{network}}로 라우팅되는 SDN 네트워크의 인터페이스에 붙일 수 있습니다.",
+    "attached": "{{name}}을(를) {{vm}}에 붙였습니다.",
+    "detach": "떼기",
+    "detachNamed": "{{name}} 떼기",
+    "detachTitle": "{{name}}을(를) 뗄까요?",
+    "detachDescription": "VM은 사설 주소를 그대로 둡니다. 유동 IP로 오가던 연결은 멈춥니다.",
+    "detached": "{{name}}을(를) 뗐습니다.",
+    "address": "주소",
+    "addressOptional": "주소(선택)",
+    "addressHint": "비우면 다음 빈 주소를 받습니다.",
+    "nameOptional": "이름(선택)",
+    "nameHint": "기본은 주소의 점을 -로 바꾼 것(203-0-113-120)입니다.",
+    "network": "외부 네트워크",
+    "noProvider": "쓸 수 있는 외부 네트워크가 없습니다",
+    "target": "붙은 곳",
+    "unattached": "붙지 않음",
+    "hiddenVm": "볼 수 없는 VM",
+    "nic": "인터페이스",
+    "attachOptional": "붙일 곳(선택)",
+    "nicHint": "이 외부 네트워크를 가진 라우터의 인터페이스인 네트워크에 있고 IPv4 주소가 있는 인터페이스만 됩니다.",
+    "noAttach": "붙이지 않음",
+    "pickNic": "인터페이스 고르기",
+    "nicLabel": "{{vm}} #{{n}} ({{network}})",
+    "blockedNic": "{{nic}} — {{reason}}",
+    "noRoutableNic": "이 외부 네트워크로 라우팅되는 인터페이스가 아직 없습니다: 그 네트워크를 외부가 이 네트워크인 라우터에 붙이세요.",
+    "column": "유동 IP",
+    "onNic": "유동 IP {{address}}",
+    "state": {
+      "unattached": "붙지 않음",
+      "distributed": "분산",
+      "distributedOn": "분산 · {{node}}",
+      "centralized": "중앙",
+      "unrouted": "라우팅 안 됨"
+    },
+    "why": {
+      "template": "템플릿",
+      "noRouter": "{{network}}이(가) {{external}}로 가는 라우터에 없음",
+      "noIpv4": "{{network}}에 IPv4 주소 없음",
+      "taken": "{{fip}}이(가) 붙어 있음",
+      "denied": "권한 없음"
+    },
+    "errors": {
+      "network": "외부 네트워크를 고르세요.",
+      "address": "IPv4 주소를 쓰세요.",
+      "nic": "인터페이스를 고르세요."
     }
   }
 }

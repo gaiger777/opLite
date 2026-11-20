@@ -3,11 +3,31 @@ import { cn } from "cn";
 import { useTranslation } from "react-i18next";
 
 import { api, call } from "@/api/client";
-import type { FolderUsageView } from "@/api/types";
+import type { FolderKind, FolderUsageView } from "@/api/types";
 import { formatBytes, formatMib } from "@/lib/format";
 
-export const DIMENSIONS = ["vcpus", "memory_mib", "disk_bytes", "vms", "dedicated_vcpus"] as const;
+export const DIMENSIONS = [
+  "vcpus",
+  "memory_mib",
+  "disk_bytes",
+  "vms",
+  "dedicated_vcpus",
+  "routers",
+  "floating_ips",
+] as const;
 export type Dimension = (typeof DIMENSIONS)[number];
+
+/** 폴더 종류마다 받는 할당량 차원(서버 `FolderKind::quota_dimensions` — 네트워크 폴더는 계획 66) */
+export function dimensionsOf(kind: FolderKind): readonly Dimension[] {
+  switch (kind) {
+    case "vm":
+      return ["vcpus", "memory_mib", "disk_bytes", "vms", "dedicated_vcpus"];
+    case "network":
+      return ["routers", "floating_ips"];
+    case "storage":
+      return [];
+  }
+}
 
 export function formatDimension(dim: Dimension, value: number): string {
   switch (dim) {
@@ -33,9 +53,9 @@ export interface Bar {
  * 차원마다 막대 하나: 묶는 폴더(`binding`)의 사용량/상한. 이 폴더의 상한이 부모보다 커도 부모가 묶으면 부모의 값과
  * 경로를 보인다(설계 §9 "부모가 묶음"). 상한이 없는 차원은 이 폴더의 사용량만이다.
  */
-export function usageBars(view: FolderUsageView): Bar[] {
+export function usageBars(view: FolderUsageView, kind: FolderKind = "vm"): Bar[] {
   // 전용 vCPU(계획 64)는 쓰거나 상한이 있을 때만 막대가 있다(지금 화면 그대로).
-  const dims = DIMENSIONS.filter(
+  const dims = dimensionsOf(kind).filter(
     (dim) =>
       dim !== "dedicated_vcpus" ||
       (view.usage.dedicated_vcpus ?? 0) > 0 ||
@@ -67,12 +87,12 @@ export function useFolderUsage(id: string, enabled = true) {
   });
 }
 
-/** 사용량/상한 막대 넷(VM 폴더 요약 카드·할당량 탭) */
-export function UsageBars({ view }: { view: FolderUsageView }) {
+/** 사용량/상한 막대(VM 폴더 넷, 네트워크 폴더 둘 — 요약 카드·할당량 탭) */
+export function UsageBars({ view, kind = "vm" }: { view: FolderUsageView; kind?: FolderKind }) {
   const { t } = useTranslation();
   return (
     <ul className="grid gap-(--gap) sm:grid-cols-2 lg:grid-cols-4">
-      {usageBars(view).map((bar) => {
+      {usageBars(view, kind).map((bar) => {
         const pct = bar.limit ? Math.min(100, (bar.used / bar.limit) * 100) : 0;
         const over = bar.limit !== undefined && bar.used > bar.limit;
         const label = t(`folders.dim.${bar.dim}`);

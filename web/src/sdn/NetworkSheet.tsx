@@ -21,6 +21,7 @@ import {
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { PortOffChip } from "@/sdn/chips";
+import { isProvider } from "@/routing/routing";
 import { formatIps } from "@/sdn/ips";
 import type { NetworkIps } from "@/sdn/sdn";
 import { SubnetsEditor } from "@/sdn/SubnetsEditor";
@@ -126,7 +127,9 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [failure, setFailure] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const saved = (network.spec.subnets ?? []).map(subnetRow);
+  // 공급자 네트워크(계획 66): DHCP 기본 끔, IPv4 서브넷의 유동 IP 풀
+  const provider = isProvider(network);
+  const saved = (network.spec.subnets ?? []).map((s) => subnetRow(s, provider));
   // 서브넷을 더하면 서버가 주소 없는 인터페이스에 새 서브넷의 주소를 준다(리뷰 2 웹 C-1). 고치는 동안만 센다(OVN은 읽지
   // 않는 목록용 질의).
   const usage = useNetworkIps(network, editing !== null, false);
@@ -137,7 +140,7 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
     if (!editing) {
       return;
     }
-    const found = subnetErrors(editing.rows);
+    const found = subnetErrors(editing.rows, provider);
     setErrors(found);
     setFailure(null);
     if (Object.keys(found).length > 0) {
@@ -148,7 +151,7 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
       const updated = await call(
         api.PATCH("/networks/{key}", {
           params: { path: { key: network.id }, header: { "If-Match": editing.revision } },
-          body: { subnets: editing.rows.map(toSubnet) },
+          body: { subnets: editing.rows.map((row) => toSubnet(row, provider)) },
         }),
       );
       putResource(queryClient, "network", updated);
@@ -214,6 +217,7 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
             rows={editing.rows}
             errors={errors}
             disabled={busy}
+            provider={provider}
             onChange={(rows) => setEditing({ ...editing, rows })}
           />
           {failure && (
@@ -249,6 +253,8 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
               <TableHead>{t("sdn.subnets.dhcp")}</TableHead>
               <TableHead>{t("sdn.subnets.dns")}</TableHead>
               <TableHead>{t("sdn.subnets.pools")}</TableHead>
+              {provider && <TableHead>{t("sdn.subnets.floating")}</TableHead>}
+              <TableHead>{t("sdn.subnets.ipv6Mode")}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -258,7 +264,7 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
                 <TableCell className="font-mono text-xs">
                   {s.gateway ?? t("sdn.subnets.firstHost")}
                 </TableCell>
-                <TableCell>{t(subnetRow(s).dhcp ? "nodes.yes" : "nodes.no")}</TableCell>
+                <TableCell>{t(subnetRow(s, provider).dhcp ? "nodes.yes" : "nodes.no")}</TableCell>
                 <TableCell className="font-mono text-xs">
                   {(s.dns_servers ?? []).join(", ") || "—"}
                 </TableCell>
@@ -266,6 +272,13 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
                   {(s.pools ?? []).map((p) => `${p.start}-${p.end}`).join(", ") ||
                     t("sdn.subnets.wholeRange")}
                 </TableCell>
+                {provider && (
+                  <TableCell className="font-mono text-xs">
+                    {(s.floating_pools ?? []).map((p) => `${p.start}-${p.end}`).join(", ") ||
+                      (s.cidr.includes(":") ? "—" : t("sdn.subnets.floatingFromPools"))}
+                  </TableCell>
+                )}
+                <TableCell>{s.ipv6_mode ? t(`sdn.ipv6Mode.${s.ipv6_mode}`) : "—"}</TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -303,6 +316,15 @@ function IpsSection({ network }: { network: Network }) {
                       free: addressCount(s.free),
                     })}
                   </span>
+                  {s.floating && (
+                    <span className="text-muted-foreground">
+                      {t("sdn.ips.floating", {
+                        used: s.floating.used,
+                        size: addressCount(s.floating.size),
+                        free: addressCount(s.floating.free),
+                      })}
+                    </span>
+                  )}
                 </li>
               ))}
             </ul>
@@ -334,11 +356,28 @@ function IpsSection({ network }: { network: Network }) {
               {data.allocations.map((a) => (
                 <TableRow key={`${a.vm}-${a.nic}`}>
                   <TableCell>
-                    <Link to={`/vms/${encodeURIComponent(a.vm_name)}`} className="underline">
-                      {a.vm_name}
-                    </Link>
+                    {/* 라우터 외부 주소·유동 IP 행(계획 66)은 `vm`·`vm_name`이 그 리소스의 것이다. */}
+                    {a.kind === "router" ? (
+                      <Link to="/routers" className="underline">
+                        {t("sdn.ips.router", { name: a.vm_name })}
+                      </Link>
+                    ) : a.kind === "floating-ip" ? (
+                      <Link to="/floating-ips" className="underline">
+                        {a.target
+                          ? t("sdn.ips.fipTo", { name: a.vm_name, vm: a.target })
+                          : t("sdn.ips.fip", { name: a.vm_name })}
+                      </Link>
+                    ) : (
+                      <Link to={`/vms/${encodeURIComponent(a.vm_name)}`} className="underline">
+                        {a.vm_name}
+                      </Link>
+                    )}
                   </TableCell>
-                  <TableCell>{t("sdn.ips.nicN", { n: a.nic + 1 })}</TableCell>
+                  <TableCell>
+                    {a.kind === "router" || a.kind === "floating-ip"
+                      ? "—"
+                      : t("sdn.ips.nicN", { n: a.nic + 1 })}
+                  </TableCell>
                   <TableCell className="font-mono text-xs">{a.mac ?? "—"}</TableCell>
                   <TableCell className="font-mono text-xs">
                     {formatIps(a.ips) || t("sdn.ips.noAddress")}

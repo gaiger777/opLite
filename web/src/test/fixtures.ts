@@ -866,3 +866,67 @@ export function sdnTask(
     status: { state: "pending", error: null, ...status },
   } as Task;
 }
+
+/**
+ * 공급자(외부) 네트워크(계획 66, 서버 모양: `sdn.provider`의 `vlan`은 flat이면 빠지고, 빈 `mtu`·`subnets`·`labels`도 빠진다)
+ */
+export function providerNetwork(
+  name: string,
+  physnet: string,
+  subnets: Record<string, unknown>[] = [],
+  vlan?: number,
+) {
+  return {
+    id: `019a0f3c-0000-7000-8003-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 5,
+    spec: {
+      sdn: { provider: { physnet, ...(vlan !== undefined && { vlan }) } },
+      ...(subnets.length > 0 && { subnets }),
+    },
+    status: {},
+  } as unknown as import("@/api/types").Network;
+}
+
+/**
+ * `GET /routers`의 항목(서버 `RouterView`): 리소스를 평평하게 펼치고(빈 `labels`·`interfaces`·`routes`·`external.ips`는
+ * 빠진다) `gateways`·`gateway_error`·`hosting`·`live_error`·`upstream_routes`는 있을 때만이다. `status`는 늘 `{}`.
+ */
+export function routerView(
+  name: string,
+  spec: Record<string, unknown> = {},
+  view: Record<string, unknown> = {},
+) {
+  return {
+    id: `019a0f3c-0000-7000-800a-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 7,
+    spec,
+    status: {},
+    ...view,
+  } as unknown as import("@/routing/routing").Router;
+}
+
+/** `GET /floating-ips`의 항목(서버 `FloatingIpView`): 리소스 + `state`(늘) + `vm_name`(읽을 수 있을 때만) */
+export function floatingIpView(
+  address: string,
+  network: string,
+  state: Record<string, unknown> = { kind: "unattached" },
+  extra: { target?: { vm: string; mac: string }; vm_name?: string; folder?: string } = {},
+) {
+  const name = address.replaceAll(".", "-");
+  return {
+    id: `019a0f3c-0000-7000-800b-${name.replaceAll("-", "").padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 8,
+    spec: {
+      network,
+      address,
+      ...(extra.target && { target: extra.target }),
+      ...(extra.folder && { folder: extra.folder }),
+    },
+    status: {},
+    state,
+    ...(extra.vm_name && { vm_name: extra.vm_name }),
+  } as unknown as import("@/routing/routing").FloatingIp;
+}

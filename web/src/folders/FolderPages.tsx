@@ -18,6 +18,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   CreateFolderDialog,
   DeleteFolderDialog,
+  NetworkQuotaDialog,
   QuotaDialog,
   RenameFolderDialog,
 } from "@/folders/FolderDialogs";
@@ -355,7 +356,9 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
   const [dialog, setDialog] = useState<"create" | "rename" | "quota" | null>(null);
   const [deleting, setDeleting] = useState(false);
   const kebab = useRef<HTMLButtonElement>(null);
-  const usage = useFolderUsage(id, kind === "vm" && folder !== undefined);
+  // 할당량은 VM 폴더와(계획 62) 네트워크 폴더(라우터·유동 IP, 계획 66)
+  const quotas = kind === "vm" || kind === "network";
+  const usage = useFolderUsage(id, quotas && folder !== undefined);
   // 읽을 수 없는 조상의 할당량은 서버가 빼고 보낸다(리뷰 1). 그런 조상이 있으면 안내한다.
   const hiddenAbove = useMemo(() => {
     let at = folder?.spec.parent;
@@ -367,7 +370,7 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
     }
     return false;
   }, [folder, perms, tree]);
-  const tabs = DETAIL_TABS.filter((tab) => tab !== "quota" || kind === "vm");
+  const tabs = DETAIL_TABS.filter((tab) => tab !== "quota" || quotas);
   const tab = tabs.find((x) => x === params.get("tab")) ?? "contents";
 
   if (!folders.data) {
@@ -387,7 +390,7 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
   const parent: Target = folder.spec.parent ? folderTarget(folder.spec.parent) : { type: "root" };
   const here = folderTarget(folder.id);
   const canFolder = perms.has("inventory.folder", here);
-  const canQuota = kind === "vm" && perms.has("inventory.quota", parent);
+  const canQuota = quotas && perms.has("inventory.quota", parent);
   const members = membersOf(tree, (list.data ?? []) as Member[], folder.id, true);
   const children = tree.children.get(folder.id) ?? [];
   const menu = (canFolder || canQuota) && (
@@ -428,7 +431,7 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
           { label: t("folders.subfolders"), value: children.length },
         ]}
       />
-      {kind === "vm" && usage.data && <UsageBars view={usage.data} />}
+      {quotas && usage.data && <UsageBars view={usage.data} kind={kind} />}
       <Tabs
         value={tab}
         onValueChange={(value) =>
@@ -481,7 +484,12 @@ export function FolderDetailPage({ kind }: { kind: FolderKind }) {
       {dialog === "rename" && (
         <RenameFolderDialog folder={folder} onClose={() => setDialog(null)} />
       )}
-      {dialog === "quota" && <QuotaDialog folder={folder} onClose={() => setDialog(null)} />}
+      {dialog === "quota" &&
+        (kind === "network" ? (
+          <NetworkQuotaDialog folder={folder} onClose={() => setDialog(null)} />
+        ) : (
+          <QuotaDialog folder={folder} onClose={() => setDialog(null)} />
+        ))}
       <DeleteFolderDialog
         folder={folder}
         path={path}

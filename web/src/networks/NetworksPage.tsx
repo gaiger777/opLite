@@ -35,8 +35,16 @@ import {
   UsageBar,
   useNetworkIps,
 } from "@/sdn/NetworkSheet";
+import {
+  DEFAULT_PROVIDER_MTU,
+  isProvider,
+  knownPhysnets,
+  physnetNodes,
+  providerLabel,
+  validPhysnet,
+} from "@/routing/routing";
 import { isSdnNetwork } from "@/sdn/ips";
-import { DEFAULT_SDN_MTU, sdnReady, useSdn } from "@/sdn/sdn";
+import { callWarned, DEFAULT_SDN_MTU, sdnReady, useSdn } from "@/sdn/sdn";
 import { SubnetsEditor } from "@/sdn/SubnetsEditor";
 import { subnetErrors, type SubnetRow, toSubnet } from "@/sdn/subnets";
 import { validName } from "@/vms/form";
@@ -71,17 +79,34 @@ export function bridgeName(spec: Network["spec"]): string {
   return spec.sdn ? OVN_BRIDGE : spec.vxlan ? `oplv${spec.vxlan.vni}` : (spec.bridge ?? "");
 }
 
-type Kind = "bridge" | "vxlan" | "sdn";
+/** `provider`는 공급자(외부) SDN 네트워크(계획 66) */
+type Kind = "bridge" | "vxlan" | "sdn" | "provider";
 
 function kindOf(spec: Network["spec"]): Kind {
-  return spec.sdn ? "sdn" : spec.vxlan ? "vxlan" : "bridge";
+  return spec.sdn?.provider ? "provider" : spec.sdn ? "sdn" : spec.vxlan ? "vxlan" : "bridge";
+}
+
+/** 목록의 MTU 칸: 정하지 않았으면 종류마다 서버의 기본 */
+function mtuOf(spec: Network["spec"]): number | string {
+  if (spec.sdn) {
+    return spec.mtu ?? (spec.sdn.provider ? DEFAULT_PROVIDER_MTU : DEFAULT_SDN_MTU);
+  }
+  return spec.vxlan ? (spec.mtu ?? DEFAULT_VXLAN_MTU) : "—";
 }
 
 /**
  * 그 브리지가 있는 노드와, VLAN을 쓰는데 VLAN 필터링이 꺼진 노드. SDN 네트워크는 준비된 OVN chassis다(`br-int`는 OVS
- * 브리지라 노드의 브리지 목록에 없다 — 서버 스케줄러의 `has_sdn`).
+ * 브리지라 노드의 브리지 목록에 없다 — 서버 스케줄러의 `has_sdn`). 공급자 네트워크는 그 physnet이 준비된 chassis다
+ * (스케줄러 `missing_physnet`).
  */
 export function bridgeNodes(network: Network, nodes: Node[]) {
+  const physnet = network.spec.sdn?.provider?.physnet;
+  if (physnet !== undefined) {
+    return {
+      having: physnetNodes(nodes, physnet).filter((n) => n.status.sdn?.chassis === "ready"),
+      noVlan: [],
+    };
+  }
   if (isSdnNetwork(network)) {
     return { having: nodes.filter((n) => n.status.sdn?.chassis === "ready"), noVlan: [] };
   }
@@ -182,14 +207,12 @@ export function NetworksPage() {
                 </TableCell>
                 <TableCell>{t(`networks.kinds.${kindOf(network.spec)}`)}</TableCell>
                 <TableCell className="font-mono text-xs">{bridgeName(network.spec)}</TableCell>
-                <TableCell>{network.spec.vxlan?.vni ?? network.spec.vlan ?? "—"}</TableCell>
                 <TableCell>
-                  {network.spec.sdn
-                    ? (network.spec.mtu ?? DEFAULT_SDN_MTU)
-                    : network.spec.vxlan
-                      ? (network.spec.mtu ?? DEFAULT_VXLAN_MTU)
-                      : "—"}
+                  {isProvider(network)
+                    ? providerLabel(network)
+                    : (network.spec.vxlan?.vni ?? network.spec.vlan ?? "—")}
                 </TableCell>
+                <TableCell>{mtuOf(network.spec)}</TableCell>
                 <TableCell>
                   {isSdnNetwork(network) ? <SubnetsCell network={network} /> : "—"}
                 </TableCell>
@@ -198,7 +221,11 @@ export function NetworksPage() {
                     "—"
                   ) : having.length === 0 ? (
                     <span className="text-destructive">
-                      {t(isSdnNetwork(network) ? "sdn.noChassis" : "networks.noNode")}
+                      {isProvider(network)
+                        ? t("sdn.physnet.noNode", {
+                            physnet: network.spec.sdn?.provider?.physnet,
+                          })
+                        : t(isSdnNetwork(network) ? "sdn.noChassis" : "networks.noNode")}
                     </span>
                   ) : (
                     having.map((n) => n.name).join(", ")
@@ -309,8 +336,9 @@ function SubnetsCell({ network }: { network: Network }) {
 }
 
 /**
- * `bridges`가 거짓이면(폴더 위임자) VXLAN·SDN만 만든다. SDN은 OVN이 세워졌을 때만 고를 수 있다(서버 409
- * `sdn_not_ready`). SDN 상태를 읽을 수 없는 사용자(루트 `cluster.read`가 없는 폴더 위임자)에게는 막지 않고 서버에 맡긴다.
+ * `bridges`가 거짓이면(폴더 위임자) VXLAN·SDN만 만든다. 브리지와 공급자(외부, 계획 66 — 노드의 물리 망) 네트워크는 루트
+ * `cluster.admin`이다. SDN·공급자는 OVN이 세워졌을 때만 고를 수 있다(서버 409 `sdn_not_ready`). SDN 상태를 읽을 수 없는
+ * 사용자(루트 `cluster.read`가 없는 폴더 위임자)에게는 막지 않고 서버에 맡긴다.
  */
 function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose(): void }) {
   const { t } = useTranslation();
@@ -326,6 +354,10 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
   const [bridge, setBridge] = useState("");
   const [vlan, setVlan] = useState("");
   const [vni, setVni] = useState("");
+  const [physnet, setPhysnet] = useState("");
+  const physnetsId = useId();
+  const physnets = knownPhysnets(nodes.data ?? []);
+  const sdnKind = kind === "sdn" || kind === "provider";
   const [mtu, setMtu] = useState("");
   const [subnets, setSubnets] = useState<SubnetRow[]>([]);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -361,11 +393,19 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
       if (mtu !== "" && !inRange(mtu, 1280, 9000)) {
         found.mtu = "networks.errors.mtu";
       }
-      if (kind === "sdn") {
+      if (kind === "provider") {
+        if (!validPhysnet(physnet)) {
+          found.physnet = "sdn.physnet.errors.name";
+        }
+        if (vlan !== "" && !inRange(vlan, 1, 4094)) {
+          found.vlan = "networks.errors.vlan";
+        }
+      }
+      if (sdnKind) {
         if (sdnBlocked) {
           found.kind = "sdn.notReadyHint";
         }
-        Object.assign(found, subnetErrors(subnets));
+        Object.assign(found, subnetErrors(subnets, kind === "provider"));
       }
     }
     setErrors(found);
@@ -373,22 +413,31 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
       return false;
     }
     const withMtu = mtu !== "" ? { mtu: Number(mtu) } : {};
+    const provider = kind === "provider";
     const spec =
       kind === "bridge"
         ? { bridge, vlan: vlan === "" ? null : Number(vlan) }
         : kind === "vxlan"
           ? { vxlan: { vni: Number(vni) }, ...withMtu }
           : {
-              sdn: {},
+              sdn: provider
+                ? { provider: { physnet, ...(vlan !== "" && { vlan: Number(vlan) }) } }
+                : {},
               ...withMtu,
-              ...(subnets.length > 0 && { subnets: subnets.map(toSubnet) }),
+              ...(subnets.length > 0 && {
+                subnets: subnets.map((row) => toSubnet(row, provider)),
+              }),
             };
-    await call(
+    // 공급자 네트워크: physnet이 준비된 노드가 없어도 만들고 `orbivisor-warning`으로 알린다.
+    const { warning } = await callWarned(
       api.POST("/networks", {
         body: { name, spec: { ...spec, ...(folder.value && { folder: folder.value }) } },
       }),
     );
     toast.success(t("networks.created", { name }));
+    if (warning) {
+      toast.warning(warning);
+    }
   }
 
   return (
@@ -421,7 +470,14 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             id="network-kind"
             className="w-full"
             value={kind}
-            onChange={(e) => setKind(e.target.value as Kind)}
+            onChange={(e) => {
+              const next = e.target.value as Kind;
+              // 공급자와 오버레이의 DHCP 기본이 달라 서브넷 행을 새로 쓴다.
+              if ((next === "provider") !== (kind === "provider")) {
+                setSubnets([]);
+              }
+              setKind(next);
+            }}
             {...a11y}
           >
             {bridges && (
@@ -432,14 +488,19 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             <NativeSelectOption value="sdn" disabled={sdnBlocked}>
               {t(sdnBlocked ? "sdn.kindNotReady" : "networks.kinds.sdn")}
             </NativeSelectOption>
+            {bridges && (
+              <NativeSelectOption value="provider" disabled={sdnBlocked}>
+                {t(sdnBlocked ? "sdn.providerNotReady" : "networks.kinds.provider")}
+              </NativeSelectOption>
+            )}
           </NativeSelect>
         )}
       </Field>
       {sdnBlocked && <p className="text-xs text-muted-foreground">{t("sdn.notReadyHint")}</p>}
-      {!readsSdn && kind === "sdn" && (
+      {!readsSdn && sdnKind && (
         <p className="text-xs text-muted-foreground">{t("sdn.serverChecks")}</p>
       )}
-      {sdn.isError && kind === "sdn" && (
+      {sdn.isError && sdnKind && (
         <p className="text-xs text-muted-foreground">
           {t("sdn.statusUnknown", { error: errorMessage(t, sdn.error) })}
         </p>
@@ -482,6 +543,48 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
         </>
       ) : (
         <>
+          {kind === "provider" && (
+            <>
+              <Field
+                id="network-physnet"
+                label={t("sdn.physnet.name")}
+                error={errors.physnet}
+                hint={t(physnets.length > 0 ? "sdn.physnet.pickHint" : "sdn.physnet.noneHint")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="network-physnet"
+                    list={physnetsId}
+                    placeholder="ext"
+                    value={physnet}
+                    onChange={(e) => setPhysnet(e.target.value)}
+                    {...a11y}
+                  />
+                )}
+              </Field>
+              <datalist id={physnetsId}>
+                {physnets.map((p) => (
+                  <option key={p} value={p} />
+                ))}
+              </datalist>
+              <Field
+                id="network-vlan"
+                label={t("networks.vlanOptional")}
+                error={errors.vlan}
+                hint={t("sdn.physnet.vlanHint")}
+              >
+                {(a11y) => (
+                  <Input
+                    id="network-vlan"
+                    inputMode="numeric"
+                    value={vlan}
+                    onChange={(e) => setVlan(e.target.value)}
+                    {...a11y}
+                  />
+                )}
+              </Field>
+            </>
+          )}
           {kind === "vxlan" && (
             <Field
               id="network-vni"
@@ -504,24 +607,37 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
             id="network-mtu"
             label={t("networks.mtuOptional")}
             error={errors.mtu}
-            hint={t(kind === "sdn" ? "sdn.mtuHint" : "networks.mtuHint")}
+            hint={t(
+              kind === "provider"
+                ? "sdn.physnet.mtuHint"
+                : kind === "sdn"
+                  ? "sdn.mtuHint"
+                  : "networks.mtuHint",
+            )}
           >
             {(a11y) => (
               <Input
                 id="network-mtu"
                 inputMode="numeric"
-                placeholder={String(kind === "sdn" ? DEFAULT_SDN_MTU : DEFAULT_VXLAN_MTU)}
+                placeholder={String(
+                  kind === "provider"
+                    ? DEFAULT_PROVIDER_MTU
+                    : kind === "sdn"
+                      ? DEFAULT_SDN_MTU
+                      : DEFAULT_VXLAN_MTU,
+                )}
                 value={mtu}
                 onChange={(e) => setMtu(e.target.value)}
                 {...a11y}
               />
             )}
           </Field>
-          {kind === "sdn" && (
+          {sdnKind && (
             <SubnetsEditor
               id="network-subnet"
               rows={subnets}
               errors={errors}
+              provider={kind === "provider"}
               onChange={setSubnets}
             />
           )}

@@ -386,3 +386,21 @@ test("SDN is not set up: the empty state and the blocked SDN type", async ({ pag
   const dialog = page.getByRole("dialog", { name: "Create a network" });
   await expect(dialog.getByRole("option", { name: "SDN (OVN) — not set up" })).toBeDisabled();
 });
+
+// 라우터·유동 IP(계획 66): 네트워크 탭의 보기이고, SDN 설정 전에는 빈 상태와 막힌 만들기다.
+test("routers and floating IPs before SDN is set up", async ({ page }) => {
+  await signIn(page);
+  await openTab(page, "Infrastructure", "Networks");
+  const views = page.getByRole("navigation", { name: "Networks views" });
+  await views.getByRole("link", { name: "Routers", exact: true }).click();
+  await expect(page).toHaveURL(/\/routers$/);
+  await expect(page.getByText("No routers")).toBeVisible();
+  await expect(
+    page.getByText("Routers and floating IPs need SDN (OVN) set up first, under Networks › SDN."),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Create a router" })).toBeDisabled();
+  await views.getByRole("link", { name: "Floating IPs", exact: true }).click();
+  await expect(page).toHaveURL(/\/floating-ips$/);
+  await expect(page.getByText("No floating IPs")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Create a floating IP" })).toBeDisabled();
+});

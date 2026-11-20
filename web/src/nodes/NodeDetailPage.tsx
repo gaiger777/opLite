@@ -21,10 +21,14 @@ import {
 } from "@/components/ui/table";
 import { formatMib } from "@/lib/format";
 import { NodeHeader } from "@/nodes/NodeHeader";
+import { NodeSdnSection } from "@/nodes/NodeSdnSection";
 import { vcpus } from "@/vms/VmListPage";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
-/** 노드 상세(`/nodes/:name`): 머리, 지표 차트 넷(범위 고르기), CPU(계획 63), NUMA 토폴로지(계획 64), 그 노드의 VM */
+/**
+ * 노드 상세(`/nodes/:name`): 머리, 지표 차트 넷(범위 고르기), CPU(계획 63), NUMA 토폴로지(계획 64), SDN physnet·게이트웨이
+ * (계획 66), 그 노드의 VM
+ */
 export function NodeDetailPage() {
   const { t } = useTranslation();
   const { name = "" } = useParams();
@@ -50,6 +54,7 @@ export function NodeDetailPage() {
       <NodeMetrics node={node} />
       <NodeCpuSection node={node} />
       <NodeTopologySection node={node} />
+      <NodeSdnSection node={node} />
       <NodeVms node={node} />
     </div>
   );

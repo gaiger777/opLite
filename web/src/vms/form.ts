@@ -643,9 +643,9 @@ export function toSpec(
       network: n.network,
       model: n.model,
       mac: n.mac === "" ? null : n.mac.toLowerCase(),
-      // SDN NIC는 보안 그룹을 받지 않는다(서버 400 `sdn_security_groups`) — 폼은 그 칸을 감추므로 옛 VM에 남은 그룹도
-      // 보내지 않는다(리뷰 1 #2).
-      ...(sdn[i] !== true && n.securityGroups.length > 0 && { security_groups: n.securityGroups }),
+      // SDN NIC도 보안 그룹을 받는다(계획 66 — OVN ACL). 모든 노드가 `sdn-routing`을 알리기 전이면 서버가 409
+      // `cluster_upgrading`이다.
+      ...(n.securityGroups.length > 0 && { security_groups: n.securityGroups }),
       ...(sdn[i] !== false && nicIps(n).length > 0 && { ips: nicIps(n) }),
     })),
     ...(v.cloudInit.enabled && { cloud_init: toCloudInit(v.cloudInit, v.nics.length, sdn) }),

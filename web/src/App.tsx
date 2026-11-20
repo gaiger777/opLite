@@ -108,6 +108,14 @@ export const appRoutes: RouteObject[] = [
               },
               { path: "sdn", lazy: page(() => import("@/sdn/SdnPage"), "SdnPage") },
               {
+                path: "routers",
+                lazy: page(() => import("@/routing/RoutersPage"), "RoutersPage"),
+              },
+              {
+                path: "floating-ips",
+                lazy: page(() => import("@/routing/FloatingIpsPage"), "FloatingIpsPage"),
+              },
+              {
                 path: "security-groups",
                 lazy: page(
                   () => import("@/security-groups/SecurityGroupsPage"),
