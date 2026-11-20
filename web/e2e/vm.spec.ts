@@ -136,13 +136,14 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   await dialog.getByRole("button", { name: "Take snapshot" }).click();
   await expect(dialog).toBeHidden();
   const before = page.getByRole("row").filter({ has: page.getByRole("cell", { name: /^before/ }) });
-  await expect(before.getByText("Current", { exact: true })).toBeVisible({ timeout: 60_000 });
+  // 메모리 스냅샷은 느린 CI 디스크에서 2분 넘게 걸린 적이 있다(그동안 VM은 "작업 중"으로 남는다).
+  await expect(before.getByText("Current", { exact: true })).toBeVisible({ timeout: 180_000 });
   await expect(before.getByRole("cell", { name: "Included", exact: true })).toBeVisible();
 
   // 되돌리면 VM을 껐다가 저장한 메모리에서 다시 실행한다. Task가 끝날 때는 다시 실행 중이다.
   await page.getByRole("button", { name: "Revert to before" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Revert" }).click();
-  await expect(page.getByText("Revert web to before: done")).toBeVisible({ timeout: 60_000 });
+  await expect(page.getByText("Revert web to before: done")).toBeVisible({ timeout: 180_000 });
   await expect(page.getByTestId("vm-phase")).toHaveText("Running");
   await expect(before.getByText("Current", { exact: true })).toBeVisible();
 
