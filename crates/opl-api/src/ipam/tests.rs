@@ -291,3 +291,45 @@ fn sdn_nics_of_new_vms_lose_groups_and_static_cloud_init() {
     assign(&mut s, None, &[], &nets, &|_| true).unwrap();
     assert!(strip_sdn_nic_config(&mut s, &nets).is_empty());
 }
+
+/// 리뷰 2 N-4: 서브넷을 더하면 주소가 하나도 없는 NIC만 새 서브넷의 주소를 받고(템플릿 빼고), 모두 줄 수 없으면 모자란
+/// 서브넷과 남은 수를 댄다.
+#[test]
+fn added_subnets_fill_only_nics_without_addresses() {
+    let added: Vec<Subnet> = vec![
+        serde_json::from_value(json!({ "cidr": "10.9.0.0/29" })).unwrap(),
+        serde_json::from_value(json!({ "cidr": "fd09::/64", "dhcp": false })).unwrap(),
+    ];
+    let mut tmpl = vm("tmpl", vec![nic("t", 9, &[])]);
+    tmpl.spec.template = true;
+    let vms = vec![
+        vm("a", vec![nic("t", 1, &[]), nic("other", 2, &[])]),
+        vm("b", vec![nic("t", 3, &["10.9.0.2"])]),
+        tmpl,
+    ];
+    assert_eq!(fill_shortages(&vms, "t", &added), (1, Vec::<String>::new()));
+    let mut used = network_used(&vms, "t");
+    let mut a = vms[0].spec.clone();
+    assert_eq!(fill_empty(&mut a, "t", &added, &mut used).unwrap(), 1);
+    assert_eq!(a.nics[0].ips, [ip("10.9.0.3"), ip("fd09::2")]);
+    assert!(a.nics[1].ips.is_empty());
+    let mut b = vms[1].spec.clone();
+    assert_eq!(fill_empty(&mut b, "t", &added, &mut used).unwrap(), 0);
+    let mut t = vms[2].spec.clone();
+    assert_eq!(fill_empty(&mut t, "t", &added, &mut used).unwrap(), 0);
+
+    let tight: Vec<Subnet> = vec![
+        serde_json::from_value(json!({ "cidr": "10.9.0.0/29",
+            "pools": [{ "start": "10.9.0.2", "end": "10.9.0.3" }] }))
+        .unwrap(),
+    ];
+    let more = vec![
+        vm("c", vec![nic("t", 4, &[])]),
+        vm("d", vec![nic("t", 5, &[]), nic("t", 6, &[])]),
+    ];
+    assert_eq!(
+        fill_shortages(&more, "t", &tight),
+        (3, vec!["10.9.0.0/29 (2 free)".to_string()])
+    );
+    assert_eq!(fill_shortages(&more, "t", &[]), (3, Vec::<String>::new()));
+}

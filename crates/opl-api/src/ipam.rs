@@ -10,7 +10,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::cloud_init::CloudInitNet;
 use opl_types::ipam::{self, IpamError};
-use opl_types::network::{Network, NetworkSpec};
+use opl_types::network::{Network, NetworkSpec, Subnet};
 use opl_types::vm::{Vm, VmSpec};
 
 use opl_types::authz::Privilege;
@@ -83,7 +83,7 @@ fn exhausted(network: &str, e: IpamError) -> ApiError {
 ///   클라이언트의 PUT이 주소를 지우지 않게). 그 주소는 다시 보지 않는다(풀을 줄여도 남는다).
 /// - 새로 준 주소는 그 네트워크의 서브넷 안(400)이고 예약이 아니며(400) 다른 NIC가 쓰지 않아야 한다(409 `ip_in_use`).
 /// - **새 NIC**(새 VM, 새 MAC, 바꾼 네트워크, 템플릿에서 되돌림)만 비어 있는 주소 체계마다 서브넷에서 가장 낮은 빈 주소를
-///   받는다(다 쓰였으면 409 `ip_exhausted`). 이미 있던 NIC에는 서브넷을 더해도 저절로 주지 않는다(설계 §9).
+///   받는다(다 쓰였으면 409 `ip_exhausted`). 이미 있던 NIC는 여기서 채우지 않는다(설계 §9 — 주소가 하나도 없는 NIC는 서브넷을 더하는 `PATCH`가 채운다, 리뷰 2 N-4).
 ///
 /// `sees`는 부른 사용자가 읽을 수 있는 VM인지다: 409 `ip_in_use`는 그런 VM만 이름으로 알린다(리뷰 1 I-2 — 다른
 /// 폴더의 VM 이름을 드러내지 않게).
@@ -359,6 +359,76 @@ pub(crate) fn assign_new(
         spec.nics[i].ips = ips;
     }
     Ok(warnings)
+}
+
+/// 네트워크 `network`의 NIC 가운데 주소가 하나도 없는 것에 새로 더한 서브넷 `added`(체계마다 하나)의 가장 낮은 빈 주소를
+/// 넣는다(리뷰 2 N-4 — 서브넷을 더하는 `PATCH`가 채운다). 고른 주소는 `used`에 넣고, 채운 NIC 수를 돌려준다. 이미 주소가
+/// 있는 NIC는 건드리지 않는다(켜진 VM에서 바꾸면 게스트가 쓰는 주소가 막힌다). 빈 주소가 없으면 오류다.
+pub(crate) fn fill_empty(
+    spec: &mut VmSpec,
+    network: &str,
+    added: &[Subnet],
+    used: &mut BTreeSet<IpAddr>,
+) -> Result<usize, IpamError> {
+    if spec.template {
+        return Ok(0);
+    }
+    let mut filled = 0;
+    for nic in spec
+        .nics
+        .iter_mut()
+        .filter(|n| n.network == network && n.ips.is_empty())
+    {
+        let mut ips = Vec::new();
+        for subnet in added {
+            let ip = ipam::allocate(subnet, used, None)?;
+            used.insert(ip);
+            ips.push(ip);
+        }
+        if !ips.is_empty() {
+            ips.sort_by_key(|ip| !ip.is_ipv4());
+            nic.ips = ips;
+            filled += 1;
+        }
+    }
+    Ok(filled)
+}
+
+/// 네트워크 `network`에서 VM들 `vms`가 쓰는 주소([`fill_empty`]의 `used`)
+pub(crate) fn network_used(vms: &[Vm], network: &str) -> BTreeSet<IpAddr> {
+    used_ips(vms, network)
+}
+
+/// 주소가 하나도 없는 NIC(템플릿 아닌 VM) 수와, 더한 서브넷 `added` 가운데 그만큼 줄 수 없는 것마다 "CIDR (n free)".
+/// 비어 있으면 모두 채울 수 있다.
+pub(crate) fn fill_shortages(vms: &[Vm], network: &str, added: &[Subnet]) -> (usize, Vec<String>) {
+    let needed = vms
+        .iter()
+        .filter(|v| !v.spec.template)
+        .flat_map(|v| v.spec.nics.iter())
+        .filter(|n| n.network == network && n.ips.is_empty())
+        .count();
+    let mut short = Vec::new();
+    if needed == 0 {
+        return (0, short);
+    }
+    for subnet in added {
+        let mut used = used_ips(vms, network);
+        let mut free = 0;
+        while free < needed {
+            match ipam::allocate(subnet, &used, None) {
+                Ok(ip) => {
+                    used.insert(ip);
+                    free += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        if free < needed {
+            short.push(format!("{} ({free} free)", subnet.cidr));
+        }
+    }
+    (needed, short)
 }
 
 #[cfg(test)]

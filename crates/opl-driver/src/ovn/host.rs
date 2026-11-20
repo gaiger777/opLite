@@ -840,8 +840,10 @@ impl OvnHost {
     }
 
     /// DB `db`의 이 서버가 클러스터를 떠난다(`cluster/leave`) — 떠난 뒤 서버는 그 DB를 내려 `cluster/status`가
-    /// `unknown cluster`다. 이미 떠났거나 서버가 돌지 않으면 그대로다(DB 파일이 있으면 떠나지 않은 것일 수 있으므로
-    /// 서버가 도는지 먼저 본다).
+    /// `unknown cluster`다. 이미 떠났으면 그대로다. Raft 구성에 들지 않은 서버는 떠날 것이 없어 그대로 둔다(리뷰 2 N-3 —
+    /// 부르는 쪽이 단위를 멈추고 DB를 치운다): 돌지 않는데 DB의 클러스터 id를 아직 모르는 서버(합류를 시작만 함)와 아직
+    /// 합류 중인 서버(OVS가 `can't leave while join in progress`로 거절한다). 그 밖에 서버가 돌지 않으면 실패다(멤버일 수
+    /// 있다).
     pub async fn leave_cluster(&self, db: Db) -> Result<(), OvnError> {
         let ctl = path_str(&self.paths.db_ctl(db));
         let status = |out: &CmdOutput| {
@@ -868,11 +870,28 @@ impl OvnHost {
             if left(&status(&out)) {
                 return Ok(());
             }
+            let path = self.paths.db_file(db);
+            if path.exists() && matches!(self.db_cid(&path).await, Ok(None)) {
+                tracing::info!(
+                    db = db.name(),
+                    "the server never joined the cluster; nothing to leave"
+                );
+                return Ok(());
+            }
             return Err(OvnError::Command(format!(
                 "cannot leave the {} cluster: its server is not running ({})",
                 db.name(),
                 tail(&status(&out), ERROR_LINES).unwrap_or_default()
             )));
+        }
+        if parse_cluster_status(&String::from_utf8_lossy(&out.stdout))
+            .is_ok_and(|s| s.raft_role() == RaftRole::Joining)
+        {
+            tracing::info!(
+                db = db.name(),
+                "the server is still joining the cluster; nothing to leave"
+            );
+            return Ok(());
         }
         self.run_ok(&Cmd::new(
             "ovs-appctl",
@@ -901,6 +920,43 @@ impl OvnHost {
             }
             tokio::time::sleep(self.options.wait_step).await;
         }
+    }
+
+    /// 이 서버(살아 있는 중앙)가 DB `db`의 클러스터에서 Raft 주소가 `address`인 다른 서버를 내쫓는다(`cluster/kick` —
+    /// 꺼졌거나 지운 노드, 리뷰 2 N-1·N-2). 그 주소가 `cluster/status`의 서버 목록에서 빠질 때까지 기다린다. 목록에
+    /// 없으면(멤버가 아니었거나 이미 빠짐) 아무것도 하지 않고 거짓이다. 이 서버의 주소면 거절한다.
+    pub async fn kick(&self, db: Db, address: IpAddr) -> Result<bool, OvnError> {
+        let target = ssl_addr(address, db.raft_port());
+        let listed = |s: &ClusterStatus| s.servers.iter().any(|x| x.address == target);
+        let status = self.cluster_status(db).await?;
+        if status.address == target {
+            return Err(OvnError::Command(format!(
+                "{target} is this server; it cannot kick itself out of the {} cluster",
+                db.name()
+            )));
+        }
+        if !listed(&status) {
+            return Ok(false);
+        }
+        self.run_ok(&Cmd::new(
+            "ovs-appctl",
+            &[
+                "--timeout",
+                CTL_TIMEOUT,
+                "-t",
+                &path_str(&self.paths.db_ctl(db)),
+                "cluster/kick",
+                db.name(),
+                &target,
+            ],
+        ))
+        .await?;
+        let what = match db {
+            Db::Nb => "the OVN northbound cluster to drop the kicked server",
+            Db::Sb => "the OVN southbound cluster to drop the kicked server",
+        };
+        self.wait_status(db, what, |s| !listed(s)).await?;
+        Ok(true)
     }
 
     /// 떠난 DB 파일을 지우지 않고 `{nb,sb}.db.left-<유닉스 초>`로 이름만 바꾼다. 바꾼 파일을 돌려준다.

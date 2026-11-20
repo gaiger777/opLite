@@ -1554,8 +1554,9 @@ fn power_task_running(state: &AppState, vm: &Vm) -> Result<bool, ApiError> {
 }
 
 /// 켜져 있는 VM의 있던 NIC(같은 MAC·네트워크) 주소는 바꾸지 않는다(409 `vm_running`, 계획 65): OVN 포트 보안이 곧바로
-/// 새 주소만 받으므로 게스트가 아직 쓰는 옛 주소가 막힌다. 주소는 핫플러그 장치 변경이 아니다(`hotplug::plan`은 견주지
-/// 않는다) — 그래서 핫플러그 길에서도 여기서 막는다.
+/// 새 주소만 받으므로 게스트가 아직 쓰는 옛 주소가 막힌다. 주소가 하나도 없던 NIC에 주는 것은 된다(리뷰 2 N-4 — 서브넷이
+/// 있는 네트워크에서 그 포트는 꺼져 있어 잃을 것이 없고, 게스트는 DHCP 갱신에서 받는다). 주소는 핫플러그 장치 변경이
+/// 아니다(`hotplug::plan`은 견주지 않는다) — 그래서 핫플러그 길에서도 여기서 막는다.
 fn check_running_ips(current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
     for (i, nic) in spec.nics.iter().enumerate() {
         let old = current
@@ -1563,7 +1564,7 @@ fn check_running_ips(current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
             .nics
             .iter()
             .find(|n| n.mac.is_some() && n.mac == nic.mac && n.network == nic.network);
-        if old.is_some_and(|old| old.ips != nic.ips) {
+        if old.is_some_and(|old| !old.ips.is_empty() && old.ips != nic.ips) {
             return Err(ApiError::conflict(
                 "vm_running",
                 format!(
@@ -1584,9 +1585,13 @@ fn check_running_devices(current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
     // 방화벽 규칙은 spec의 NIC 순번·MAC으로 tap을 정한다. 실행 중에 NIC 구성이 바뀌면 도는 tap과
     // 어긋나 막히지 않은 채가 되므로, 방화벽 NIC가 있으면(전이나 뒤) 그룹만 바꿀 수 있다.
     let firewalled = |s: &VmSpec| s.nics.iter().any(|n| !n.security_groups.is_empty());
+    // SDN 주소(`ips`)는 장치가 아니다 — [`check_running_ips`]가 따로 본다(리뷰 2 N-4: 주소 없던 NIC에 주기는 된다).
     let without_groups = |s: &VmSpec| {
         let mut nics = s.nics.clone();
-        nics.iter_mut().for_each(|n| n.security_groups.clear());
+        nics.iter_mut().for_each(|n| {
+            n.security_groups.clear();
+            n.ips.clear();
+        });
         nics
     };
     let only_groups = || {
@@ -2672,6 +2677,14 @@ mod tests {
         spec.nics[0].ips = vec!["10.0.0.7".parse().unwrap()];
         let e = check_running_ips(&vm, &spec).unwrap_err();
         assert_eq!((e.status, e.code), (StatusCode::CONFLICT, "vm_running"));
+        // 주소가 없던 NIC에 주기는 된다(리뷰 2 N-4 — 그 포트는 꺼져 있었다). 있던 주소를 지우기는 안 된다.
+        let mut bare = vm.clone();
+        bare.spec.nics[0].ips.clear();
+        let mut given = bare.spec.clone();
+        given.nics[0].ips = vec!["10.0.0.7".parse().unwrap()];
+        check_running_ips(&bare, &given).unwrap();
+        let e = check_running_ips(&vm, &bare.spec).unwrap_err();
+        assert_eq!(e.code, "vm_running");
         // 핫플러그 계획은 주소를 장치 변경으로 보지 않는다(그래서 위 검사가 막는다).
         assert!(!hotplug::hardware_changed(&vm.spec, &{
             let mut s = vm.spec.clone();

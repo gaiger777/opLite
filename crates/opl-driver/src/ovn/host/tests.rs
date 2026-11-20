@@ -782,6 +782,76 @@ async fn leaving_the_cluster() {
     assert_eq!(std::fs::read_to_string(&moved[1]).unwrap(), "sb");
 }
 
+/// 리뷰 2 N-3: Raft 구성에 들지 않은 서버는 떠날 것이 없다 — 돌지 않고 DB의 클러스터 id를 아직 모르면(합류를 시작만
+/// 함), 또는 아직 합류 중이면(OVS가 떠나기를 거절한다) `cluster/leave` 없이 끝난다. 클러스터 id를 아는 DB의 서버가 돌지
+/// 않으면 그대로 실패다.
+#[tokio::test]
+async fn servers_outside_the_raft_configuration_have_nothing_to_leave() {
+    let env = Env::new();
+    let nb = env.p("var/lib/opl/ovn/nb.db");
+    env.write("var/lib/opl/ovn/nb.db", "nb");
+    env.fake().reply(
+        "ovs-appctl",
+        CmdOutput::fail(1, "ovs-appctl: cannot connect to \"/run/opl/ovn/nb.ctl\""),
+    );
+    env.fake().reply(
+        &format!("ovsdb-tool db-cid {nb}"),
+        CmdOutput::ok(format!("{nb}: cluster ID not yet known\n")),
+    );
+    env.host.leave_cluster(Db::Nb).await.unwrap();
+    env.fake().reply(
+        &format!("ovsdb-tool db-cid {nb}"),
+        CmdOutput::ok(format!("{CID_NB}\n")),
+    );
+    let err = env.host.leave_cluster(Db::Nb).await.unwrap_err();
+    assert!(err.to_string().contains("server is not running"), "{err}");
+
+    let env = Env::new();
+    env.fake().reply("ovs-appctl", CmdOutput::ok(JOINING));
+    env.host.leave_cluster(Db::Nb).await.unwrap();
+    assert!(
+        env.calls_of("ovs-appctl")
+            .iter()
+            .all(|c| !c.contains("cluster/leave"))
+    );
+}
+
+/// 리뷰 2 N-1·N-2: 살아 있는 중앙이 다른 서버를 Raft 주소로 내쫓고 목록에서 빠질 때까지 기다린다. 목록에 없으면 하지
+/// 않고, 자기 주소는 거절한다.
+#[tokio::test]
+async fn kicking_a_dead_server_out() {
+    let env = Env::new();
+    let ctl = env.p("run/opl/ovn/nb.ctl");
+    let status = format!("ovs-appctl --timeout 5 -t {ctl} cluster/status OVN_Northbound");
+    let after = NB_LEADER
+        .lines()
+        .filter(|l| !l.contains("ssl:127.0.0.2:6643"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let two = include_str!("../fixtures/cluster-status-leader-two.txt");
+    env.fake().reply_seq(
+        &status,
+        vec![CmdOutput::ok(two), CmdOutput::ok(two), CmdOutput::ok(after)],
+    );
+    assert!(env.host.kick(Db::Nb, ip("127.0.0.2")).await.unwrap());
+    assert_eq!(
+        env.calls_of(&format!("ovs-appctl --timeout 5 -t {ctl} cluster/kick")),
+        [format!(
+            "ovs-appctl --timeout 5 -t {ctl} cluster/kick OVN_Northbound ssl:127.0.0.2:6643"
+        )]
+    );
+    // 이미 빠졌다.
+    assert!(!env.host.kick(Db::Nb, ip("127.0.0.2")).await.unwrap());
+    // 자기 자신은 내쫓지 않는다.
+    let err = env.host.kick(Db::Nb, ip("127.0.0.1")).await.unwrap_err();
+    assert!(err.to_string().contains("this server"), "{err}");
+    // 빠지지 않으면 시간 초과
+    let env = Env::new();
+    env.fake().reply("ovs-appctl", CmdOutput::ok(two));
+    let err = env.host.kick(Db::Nb, ip("127.0.0.2")).await.unwrap_err();
+    assert!(matches!(err, OvnError::Timeout(_)), "{err}");
+}
+
 /// chassis 구성: 다른 칸만 `ovs-vsctl set`(쉼표가 든 값은 따옴표), SSL, system-id.conf, 단위. 같으면 단위만 켠다.
 #[tokio::test]
 async fn chassis_configuration() {

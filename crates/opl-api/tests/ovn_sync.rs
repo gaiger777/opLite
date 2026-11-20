@@ -444,3 +444,93 @@ async fn the_ip_list_shows_live_port_state() {
     assert!(ips["allocations"][0]["live"].is_null(), "{ips}");
     assert!(ips["live_error"].is_string(), "{ips}");
 }
+
+/// 리뷰 2 m-2: 한 차례가 네트워크마다 트랜잭션을 나눠도 `nb_cfg`는 한 번만 오른다(올릴 때마다 모든 chassis가 SB에 쓴다).
+#[tokio::test]
+async fn nb_cfg_rises_once_per_round() {
+    let ovn = Ovn::start().await;
+    ovn.sdn(SdnPhase::Ready).await;
+    ovn.network("a").await;
+    ovn.network("b").await;
+    ovn.network("c").await;
+    let mut s = ovn.syncer();
+    let outcome = s.sync().await;
+    assert!(
+        matches!(
+            outcome,
+            SyncOutcome::Synced {
+                transactions: 3,
+                failed: 0,
+                ..
+            }
+        ),
+        "{outcome:?}"
+    );
+    let g = &ovn.nb.rows("NB_Global")[0];
+    assert_eq!(g["nb_cfg"], 1);
+    assert_eq!(ovn.sdn_status().1.unwrap().nb_cfg, 1);
+}
+
+/// 리뷰 2 m-2: 논리 포트에 쓰이지 않는 VM 쓰기(상태의 오류 문구 같은 것)로는 루프가 NB를 다시 읽지 않는다. 주소가 바뀌면
+/// 읽고 맞춘다.
+#[tokio::test]
+async fn the_loop_ignores_vm_writes_that_do_not_touch_ports() {
+    let ovn = Ovn::start().await;
+    ovn.sdn(SdnPhase::Ready).await;
+    let net = ovn.network("a").await;
+    let mut vm: opl_types::vm::Vm = Resource::new(
+        "v",
+        serde_json::from_value(json!({
+            "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt",
+            "nics": [{ "network": "a", "model": "virtio", "mac": "52:54:00:00:00:01", "ips": [] }]
+        }))
+        .unwrap(),
+    );
+    ovn.env.cluster.create(&vm).await.unwrap();
+    let mut config = ovn.config();
+    config.resync = Duration::from_secs(600);
+    let sync = OvnSync::spawn(ovn.env.cluster.clone(), config);
+    let ports = || ovn.nb.rows("Logical_Switch_Port").len();
+    for _ in 0..100 {
+        if ports() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(ports(), 1, "{:?}", ovn.switches());
+    assert_eq!(ovn.switches(), vec![format!("opl-{}", net.id)]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reads = || ovn.nb.with(|n| n.transacts.len());
+    let before = reads();
+    for i in 0..3 {
+        vm.status.last_error = Some(format!("noise {i}"));
+        ovn.env
+            .cluster
+            .update_status::<opl_types::vm::VmSpec>(vm.id, &vm.status)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(reads(), before);
+    let current = ovn
+        .env
+        .cluster
+        .get::<opl_types::vm::VmSpec>(vm.id)
+        .unwrap()
+        .unwrap();
+    let mut spec = current.spec.clone();
+    spec.power = opl_types::vm::PowerState::Running;
+    ovn.env
+        .cluster
+        .update_spec(vm.id, None, current.labels.clone(), &spec)
+        .await
+        .unwrap();
+    for _ in 0..100 {
+        if reads() > before {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(reads() > before);
+    sync.shutdown().await;
+}

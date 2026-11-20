@@ -653,8 +653,20 @@ pub fn fence_ops(
     tag: &str,
     token: &str,
 ) -> (Vec<Value>, BTreeMap<String, String>) {
+    fence(global, tag, token, true)
+}
+
+/// [`fence_ops`]와 같되 `bump`가 거짓이면 `nb_cfg`를 올리지 않는다(한 차례의 마지막 트랜잭션만 올린다 — 리뷰 2 m-2:
+/// 올릴 때마다 모든 ovn-controller가 SB `Chassis_Private.nb_cfg`를 쓴다). 펜싱 연산의 수는 같다.
+pub fn fence(
+    global: Option<&Global>,
+    tag: &str,
+    token: &str,
+    bump: bool,
+) -> (Vec<Value>, BTreeMap<String, String>) {
     let mut ids = global.map(|g| g.external_ids.clone()).unwrap_or_default();
     ids.insert(fence_key(tag), token.into());
+    let step = i64::from(bump);
     let ops = match global {
         Some(g) => vec![
             json!({"op": "wait", "table": "NB_Global", "where": by_uuid(&g.uuid), "columns": ["external_ids"],
@@ -662,14 +674,52 @@ pub fn fence_ops(
             json!({"op": "update", "table": "NB_Global", "where": by_uuid(&g.uuid),
                    "row": {"external_ids": map_value(&ids)}}),
             json!({"op": "mutate", "table": "NB_Global", "where": by_uuid(&g.uuid),
-                   "mutations": [["nb_cfg", "+=", 1]]}),
+                   "mutations": [["nb_cfg", "+=", step]]}),
         ],
         None => vec![
             json!({"op": "wait", "table": "NB_Global", "where": [], "columns": ["external_ids"],
                    "until": "==", "rows": [], "timeout": 0}),
             json!({"op": "insert", "table": "NB_Global",
-                   "row": {"external_ids": map_value(&ids), "nb_cfg": 1}}),
+                   "row": {"external_ids": map_value(&ids), "nb_cfg": step}}),
         ],
     };
     (ops, ids)
+}
+
+/// 논리 포트([`desired`])에 쓰이는 VM의 칸: 템플릿인지, NIC(네트워크·MAC·주소), 전원·배정 노드, 실행 단계·노드·
+/// 마이그레이션 대상. 이것이 그대로인 VM 쓰기(복제 기록·통계 같은 상태 쓰기)로는 OvnSync가 NB를 다시 읽지 않는다(리뷰 2
+/// m-2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmInputs {
+    template: bool,
+    nics: Vec<(String, Option<String>, Vec<std::net::IpAddr>)>,
+    power: PowerState,
+    node: Option<Uuid>,
+    phase: VmPhase,
+    at: Option<Uuid>,
+    migration: Option<Uuid>,
+}
+
+impl VmInputs {
+    pub fn of(spec: &opl_types::vm::VmSpec, status: &opl_types::vm::VmStatus) -> Self {
+        Self {
+            template: spec.template,
+            nics: spec
+                .nics
+                .iter()
+                .map(|n| {
+                    (
+                        n.network.clone(),
+                        n.mac.map(|m| m.to_string()),
+                        n.ips.clone(),
+                    )
+                })
+                .collect(),
+            power: spec.power,
+            node: spec.node,
+            phase: status.phase,
+            at: status.node,
+            migration: status.migration.as_ref().map(|m| m.node),
+        }
+    }
 }

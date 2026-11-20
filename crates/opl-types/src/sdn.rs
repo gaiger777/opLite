@@ -83,6 +83,22 @@ pub struct SdnStatus {
     /// OVN SB Raft 클러스터 id
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sb_cid: Option<Uuid>,
+    /// 클러스터에서 지웠지만 OVN Raft에 멤버로 남았을 수 있는 노드(중앙 목록 밖의 DB를 가진 채 꺼진 노드 — 리뷰 2 N-2).
+    /// 살아 있는 중앙의 `sdn-central-kick` Task가 내쫓은 뒤 지운다.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub departed: Vec<SdnDeparted>,
+}
+
+/// 클러스터에서 지운 노드 가운데 OVN Raft에서 아직 내쫓지 않은 것
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SdnDeparted {
+    pub node: Uuid,
+    /// 지울 때의 노드 이름(`sdn central remove NAME`으로 부른다)
+    pub name: String,
+    /// 그 노드의 Raft 주소(NB·SB가 이 IP의 6643·6644)
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = "ip"))]
+    pub address: IpAddr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -288,6 +304,23 @@ pub struct SdnView {
     pub chassis: Vec<SdnChassisView>,
     /// 끝나지 않은 SDN Task
     pub tasks: Vec<Uuid>,
+    /// 중앙 목록에 없지만 OVN Raft에 남았을 수 있는 노드(이 SDN의 DB를 가진 노드와 클러스터에서 지운 노드 — 리뷰 2
+    /// N-2·웹 I-3). `DELETE /sdn/centrals/{node}`로 뺀다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub strays: Vec<SdnStrayView>,
+}
+
+/// 중앙 목록 밖의 OVN Raft 멤버(일 수 있는 노드)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SdnStrayView {
+    pub node: Uuid,
+    pub name: String,
+    /// 클러스터에서 이미 지운 노드다(살아 있는 중앙이 Raft에서 내쫓는다).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub gone: bool,
 }
 
 /// 중앙 하나와 그 노드가 알린 Raft 역할
@@ -349,6 +382,27 @@ impl SdnView {
             .collect();
         chassis.sort_by(|a, b| a.name.cmp(&b.name));
         let status = sdn.map(|s| &s.status);
+        let mut strays: Vec<SdnStrayView> = Vec::new();
+        if let Some(s) = status.filter(|s| s.phase == SdnPhase::Ready) {
+            let busy = s.pending.as_ref().map(|p| p.node);
+            strays.extend(
+                nodes
+                    .iter()
+                    .filter(|n| !s.centrals.iter().any(|c| c.node == n.id) && busy != Some(n.id))
+                    .filter(|n| n.status.sdn.as_ref().is_some_and(|x| x.central.is_some()))
+                    .map(|n| SdnStrayView {
+                        node: n.id,
+                        name: n.name.clone(),
+                        gone: false,
+                    }),
+            );
+            strays.extend(s.departed.iter().map(|d| SdnStrayView {
+                node: d.node,
+                name: d.name.clone(),
+                gone: true,
+            }));
+            strays.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         Self {
             phase: status.map(|s| s.phase),
             centrals,
@@ -358,6 +412,7 @@ impl SdnView {
             sync: status.and_then(|s| s.sync.clone()),
             chassis,
             tasks,
+            strays,
         }
     }
 }
@@ -415,8 +470,20 @@ mod tests {
             }),
             nb_cid: Some(Uuid::now_v7()),
             sb_cid: None,
+            departed: vec![SdnDeparted {
+                node: n,
+                name: "n9".into(),
+                address: ip("10.0.0.9"),
+            }],
         };
         let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["departed"][0]["name"], "n9");
+        assert!(
+            serde_json::to_value(SdnStatus::default())
+                .unwrap()
+                .get("departed")
+                .is_none()
+        );
         assert_eq!(json["centrals"][0]["address"], "10.0.0.1");
         assert!(json.get("sb_cid").is_none(), "{json}");
         assert_eq!(json["init_address"], "10.0.0.1");
@@ -551,6 +618,64 @@ mod tests {
         assert_eq!(after.centrals[0].health, central.central);
         assert_eq!(after.centrals[1].name, gone.to_string());
         assert_eq!(after.centrals[1].health, None);
-        assert_eq!(after.chassis[0].sdn, Some(central));
+        assert_eq!(after.chassis[0].sdn, Some(central.clone()));
+        assert!(after.strays.is_empty());
+        assert!(
+            serde_json::to_value(&after)
+                .unwrap()
+                .get("strays")
+                .is_none()
+        );
+    }
+
+    /// 리뷰 2 N-2·웹 I-3: 중앙 목록 밖에서 DB를 알린 노드와 지운 노드는 `strays`다. 준비 전과 그 노드에서 중앙 Task가
+    /// 도는 동안(합류 중)은 아니다.
+    #[test]
+    fn view_lists_stray_central_databases() {
+        let health = NodeSdn {
+            central: Some(CentralHealth {
+                nb: RaftRole::Follower,
+                sb: RaftRole::Joining,
+                northd_active: false,
+            }),
+            ..NodeSdn::default()
+        };
+        let nodes = vec![
+            node("n1", false, Some(health.clone())),
+            node("n2", false, Some(health)),
+        ];
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+        sdn.status.centrals = vec![SdnCentral {
+            node: nodes[0].id,
+            address: ip("10.0.0.1"),
+        }];
+        assert!(
+            SdnView::new(Some(&sdn), &nodes, Vec::new())
+                .strays
+                .is_empty()
+        );
+        sdn.status.phase = SdnPhase::Ready;
+        let gone = Uuid::now_v7();
+        sdn.status.departed = vec![SdnDeparted {
+            node: gone,
+            name: "n0".into(),
+            address: ip("10.0.0.9"),
+        }];
+        let view = SdnView::new(Some(&sdn), &nodes, Vec::new());
+        let strays: Vec<_> = view
+            .strays
+            .iter()
+            .map(|s| (s.name.as_str(), s.gone))
+            .collect();
+        assert_eq!(strays, [("n0", true), ("n2", false)]);
+        let json = serde_json::to_value(&view).unwrap();
+        assert!(json["strays"][1].get("gone").is_none(), "{json}");
+        sdn.status.pending = Some(SdnPending {
+            op: crate::task::TaskOp::SdnCentralAdd,
+            node: nodes[1].id,
+            task: Uuid::now_v7(),
+        });
+        let view = SdnView::new(Some(&sdn), &nodes, Vec::new());
+        assert_eq!(view.strays.len(), 1);
     }
 }

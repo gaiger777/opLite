@@ -187,9 +187,10 @@ ML2/OVN이 하는 자리(OVN에 원하는 상태를 쓰는 관리 시스템)를 
   쓰는 VM의 기본 경로를 빼앗지 않게.
 - **포트 보안.** NIC마다 논리 포트 `opl-<VM id>-<MAC 12자리>`가 생기고 `port_security`가 늘 켜져 있다. NIC는 자기 MAC과
   받은 주소로만 보낼 수 있다(MAC·IP 위조와 ARP 위조를 OVN이 막는다). 꺼진 VM의 포트도 NB에 남아 주소를 잡아 둔다.
-  서브넷이 있는 네트워크에서 주소가 하나도 없는 NIC(서브넷을 나중에 더함, 빈 주소가 없어 템플릿 되돌리기가 주소 없이 둠)의
+  서브넷이 있는 네트워크에서 주소가 하나도 없는 NIC(빈 주소가 없어 템플릿 되돌리기가 주소 없이 둠, 복원 실패)의
   포트는 **꺼 둔다**(`enabled=false` — 아무것도 오가지 않음). MAC만인 포트 보안은 어느 IP든 보내게 두기 때문이다. 주소를
-  받으면(`network ips --fill`, VM 편집) 다음 동기화에 켜진다. 서브넷이 없는 SDN 네트워크는 L2만이라 MAC만으로 켠다.
+  받으면(VM 편집 — 켜진 VM도 된다, `network ips --fill`) 다음 동기화에 켜진다. 웹의 VM 상세·IP 표는 이 NIC를 "꺼짐: 주소
+  없음"으로 보인다. 서브넷이 없는 SDN 네트워크는 L2만이라 MAC만으로 켠다.
 
 ### 설정하기
 
@@ -228,7 +229,7 @@ orbivisorctl sdn status
 # NODE  CHASSIS  ENCAP-IP   OVN      ERROR
 # n1    ready    10.1.0.11  24.03.8  -
 # …
-orbivisorctl sdn central remove n3        # 노드가 온라인이어야 한다. 마지막 중앙은 뺄 수 없다(409 sdn_last_central)
+orbivisorctl sdn central remove n3        # 마지막 중앙은 뺄 수 없다(409 sdn_last_central). 꺼진 노드는 다른 중앙이 내쫓는다
 ```
 
 웹은 **인프라 › 네트워크 › SDN** 보기의 "SDN 설정 시작" 마법사다(① 중앙 노드 — 투표 멤버 셋을 미리 고름 ② 설치 진행과
@@ -251,8 +252,10 @@ orbivisorctl sdn central remove n3        # 노드가 온라인이어야 한다.
   실패한다(다른 중앙과 갈라진 NB·SB가 서지 않게 — 파일을 되살리거나, 중앙이 더 있으면 빼고 다시 더한다). 중앙 Task는
   클러스터에서 한 번에 하나다(바쁘면 409 `sdn_busy`). apt 때문에 시간 제한이 없다.
 - **중앙 더하기가 실패하면** 합류한 Raft를 다시 떠나고(`cluster/leave`) 단위를 멈추고 DB는 이름만 바꾼다 — 목록에 없는
-  멤버가 남아 정족수를 깎지 않게. 떠나지 못하면(opld 재시작 등) 그대로 둔다: 노드 상태가 중앙 칸을 알리고, 노드 지우기는
-  409 `sdn_central_on_node`이며, `sdn central add`로 다시 하거나 `sdn central remove`로 떠나게 한다.
+  멤버가 남아 정족수를 깎지 않게. 아직 합류 중이거나(OVS는 합류 중 떠나기를 거절한다) 서버가 한 번도 돌지 않은(클러스터
+  id를 아직 모르는) DB는 Raft 구성에 없으므로 떠나기 없이 멈추고 치운다. 떠나지 못하면(멤버인데 서버가 돌지 않음 등) 그대로
+  둔다: 노드 상태가 중앙 칸을 알리고(`sdn status`·웹의 "남은 중앙 DB"), `sdn central add`로 다시 하거나 `sdn central remove`로
+  떠나게 한다.
 - **아무것도 몰래 지우지 않는다.** 다른 OVN·OpenStack이 쓰는 노드(`ovn-remote`가 이미 있고 이 클러스터 표시가 아님),
   Raft가 모르는 클러스터 id의 DB, 논리 스위치가 든 배포판 NB DB가 있으면 거절한다(400, 까닭과 함께). 중앙에서 빠진 노드의
   DB는 `*.left-<시각>`으로 이름만 바꾼다.
@@ -261,10 +264,16 @@ orbivisorctl sdn central remove n3        # 노드가 온라인이어야 한다.
   `ovn-remote`·`encap-ip`·TLS 사본을 맞추고, 중앙이면 멈춘 단위를 다시 켜고 OVN 꾸러미를 올린 뒤의 DB 스키마 변환을 한다.
   재부팅 뒤 장치가 없는 이 클러스터의 OVS 포트를 지운다(남의 포트는 둔다). 노드 상태 `status.sdn`(chassis 상태
   `missing`·`configuring`·`ready`·`down`, OVN·OVS 판, encap 주소, 중앙이면 NB·SB Raft 역할과 northd 활성)을 알린다.
-  `cluster leave`면 chassis 구성의 이 클러스터 칸만 지우고 ovn-controller를 멈춘다(꾸러미·DB는 남김).
-- **노드 지우기.** 중앙인 노드(또는 끝나지 않은 중앙 더하기의 DB가 남은 노드)는 먼저 `sdn central remove`(409
-  `sdn_central_on_node`). chassis만인 노드의 SB `Chassis` 행은
-  리더가 지운다.
+  `cluster leave`면 chassis 구성의 이 클러스터 칸만 지우고 ovn-controller를 멈춘다(꾸러미·DB는 남김). 중앙이거나 남은 중앙
+  DB를 알린 노드의 `cluster leave`는 409 `sdn_central_on_node`다 — 먼저 `sdn central remove`.
+- **꺼진 중앙 빼기.** `sdn central remove`는 노드가 온라인이면 그 노드가 떠나고(`cluster/leave`), 꺼졌으면 살아 있는 다른
+  중앙이 그 노드의 Raft 주소(`ssl:IP:6643`·`:6644`)를 `cluster/kick`으로 내쫓고 목록에서 뺀다(Task `sdn-central-kick`).
+  꺼진 노드의 단위와 DB는 손대지 못하므로 그 노드를 되살리면 "남은 중앙 DB"로 보이고 다시 `sdn central remove`로 치운다.
+  내쫓기도 Raft 정족수(중앙 셋이면 둘)가 있어야 한다.
+- **노드 지우기.** 목록의 중앙인 노드는 먼저 `sdn central remove`(409 `sdn_central_on_node` — 꺼졌으면 위처럼 내쫓는다).
+  끝나지 않은 중앙 더하기의 DB를 알린 채 꺼진 노드는 막지 않는다: 지운 뒤 `SdnStatus.departed`에 적고 살아 있는 중앙이
+  내쫓는 Task를 만든다(응답 경고에 그 Task, 다른 중앙 Task가 돌면 나중에 `sdn central remove 이름`). chassis만인 노드의 SB
+  `Chassis` 행은 리더가 지운다.
 
 ```toml
 # /etc/opl/opld.toml (노드마다, 선택 — 기본값)
@@ -292,7 +301,7 @@ orbivisorctl network ips tenant-a                                    # VM을 붙
 # VM    NIC  MAC                ADDRESSES  UP   NODE
 # web1  0    52:54:00:12:34:56  10.10.0.2  yes  n1
 # db1   0    52:54:00:ab:cd:ef  10.10.0.3  no   -
-orbivisorctl network subnet add tenant-a fd00:10::/64                # 체계마다 하나(있던 NIC는 --fill로)
+orbivisorctl network subnet add tenant-a fd00:10::/64                # 체계마다 하나(주소 없는 NIC는 이때 받는다)
 orbivisorctl network subnet set tenant-a 10.10.0.0/24,dns=1.1.1.1+8.8.8.8,pool=10.10.0.100-10.10.0.199
 orbivisorctl network subnet remove tenant-b fd00:20::/64             # 그 주소를 쓰는 NIC가 없어야 한다
 ```
@@ -309,13 +318,17 @@ OVN 포트 상태를 읽지 않음)다.
   번호), 단순 네트워크 바꾸기는 409 `network_immutable`. 브리지 이름 `br-int`는 브리지 네트워크에 쓸 수 없다.
 - **서브넷 바꾸기.** DHCP·DNS·할당 범위·설명은 바꿀 수 있고 CIDR·게이트웨이는 바꿀 수 없다(빼고 다시 더한다). 할당 범위를
   줄여도 이미 준 범위 밖 주소는 남는다. 서브넷을 빼려면 그 주소를 쓰는 NIC가 없어야 한다(409 `subnet_in_use`와 VM 이름들).
-- **서브넷을 더해도 있던 NIC에는 주소를 주지 않는다.** VM 스펙을 몰래 바꾸지 않으려는 것이다. 꺼진 VM의 빠진 주소는
-  `orbivisorctl network ips tenant-a --fill`로 채운다(CLI만 — 켜진 VM은 건너뛰고 알린다). 새로 붙는 NIC는 곧바로 받는다.
-  서브넷이 없던 네트워크에 첫 서브넷을 더하면 주소 없는 NIC의 포트가 꺼지므로(포트 보안) 먼저 채울 VM을 끈다.
+- **서브넷을 더하면 주소가 하나도 없는 NIC가 그 서브넷의 주소를 받는다**(켜진 VM 포함). 주소 없는 NIC의 포트는 꺼지므로
+  (포트 보안) L2만이던 네트워크에 첫 서브넷을 더하는 순간 그 NIC들이 끊기지 않게 같은 `PATCH`가 채운다. 켜진 게스트는 다음
+  DHCP 갱신(또는 재부팅)에서 새 주소를 받는다 — 그동안 정적 주소를 쓰던 게스트는 그 주소가 포트 보안에 막히므로 서브넷을
+  더하기 전에 맞춘다. 모두 줄 빈 주소가 없으면 409 `ip_exhausted`(주소 없는 NIC 수와 서브넷마다 남은 수)이고 아무것도 바뀌지
+  않는다. 이미 주소가 있는 NIC의 빠진 체계(IPv4만 있는데 IPv6 서브넷을 더함)는 채우지 않는다 — `orbivisorctl network ips
+  tenant-a --fill`(켜진 VM은 주소 없는 NIC만 채우고 나머지는 알린다). 새로 붙는 NIC는 곧바로 받는다. 웹 서랍의 서브넷 편집도
+  저장 전에 몇 개의 NIC가 주소를 받을지 알린다.
 - **`network ips`의 UP·NODE**는 API 노드가 OVN에서 읽은 논리 포트의 `up`과 바인딩한 chassis다. OVN을 읽지 못하면 `-`이고
   까닭이 경고로 나온다(주소 표는 Raft에서 오므로 그대로 나온다). 목록에는 부른 사용자가 읽을 수 있는 VM의 NIC만 나온다 —
-  네트워크를 함께 쓰는 다른 폴더의 VM은 `USED`에만 들고 수로만 알린다(API `hidden`). 409 `ip_in_use`도 읽을 수 있는
-  VM만 이름으로 댄다.
+  네트워크를 함께 쓰는 다른 폴더의 VM은 `USED`에만 들고 수로만 알린다(API `hidden`). 409 `ip_in_use`와 409
+  `subnet_in_use`도 읽을 수 있는 VM만 이름으로 대고 나머지는 수로 댄다.
 - **권한.** SDN 네트워크는 VXLAN처럼 노드 자원이 아니라서 네트워크 폴더의 `network.config`로 만들고 바꾸고 지운다. NIC
   붙이기와 `ip=` 고르기는 그 네트워크의 `network.assign`, `ips` 보기는 네트워크 읽기다. 네트워크 폴더가 곧 테넌트다
   ([폴더와 권한](folders.md)).
@@ -342,7 +355,9 @@ orbivisorctl import run esx-db --ip 10.10.0.40                # 가져오기도 
   빼고 Task 경고에 적는다. 복제·가져오기의 `--ip`는 권한(새 VM의 폴더·네트워크)을 본 뒤에 본다. 백업 복원은 원래 주소가 비어 있으면 그대로, 아니면 새로 받고 Task 경고에 적는다. 스냅샷 되돌리기는 주소도
   되돌리고, 그 사이 다른 VM이 그 주소를 잡았으면 409 `ip_in_use`(몰래 바꾸지 않는다). 라이브 마이그레이션·HA는 그대로.
 - **켜진 VM의 주소는 바꿀 수 없다**(409 `vm_running`). 포트 보안이 새 주소만 받아 게스트의 옛 주소가 곧바로 막히기 때문이다.
-  켜진 VM에 새로 붙이는 NIC는 주소를 받는다(핫플러그).
+  켜진 VM에 새로 붙이는 NIC는 주소를 받는다(핫플러그). 주소가 하나도 없던 NIC에 주기는 켜진 채로 된다 — 그 포트는 꺼져
+  있어 잃을 것이 없고 게스트는 DHCP 갱신에서 받는다.
+- **템플릿 되돌리기**가 서브넷에 빈 주소가 없어 주소 없이 끝나면 Task 경고에 적는다(그 NIC의 포트는 꺼져 있다).
 - **게스트 쪽.** IPv4 서브넷의 DHCP가 켜져 있으면 게스트가 DHCP로 받는다(cloud-init이 없는 이미지도). cloud-init이 있는 VM은
   network-config에 SDN NIC를 IPv4 `dhcp`(DHCP를 끈 서브넷이면 `static` 주소/접두사·DNS), IPv6 `static`으로 적는다 — 게이트웨이는
   적지 않는다(라우터가 없음). SDN NIC 자리의 `cloud_init.networks[i]`는 빈 `{}`만 받는다(400 `cloud_init_sdn_nic` — 주소는
@@ -434,13 +449,14 @@ journalctl -u opl-ovn-nb -u opl-ovn-sb -u opl-ovn-northd; less /var/log/opl/ovn-
 
 ### 한계
 
-- **죽은 중앙 노드는 뺄 수 없다.** 빼기 Task가 그 노드에서 돌아야 하므로 오프라인 중앙은 409다. 노드를 되살리거나, 손으로
-  `ovs-appctl … cluster/kick`을 한 뒤의 정리는 아직 길이 없다(계획 66 이후).
+- **꺼진 중앙을 내쫓아도 그 노드는 모른다.** 내쫓은 노드의 단위·DB는 그대로라, 되살리면 옛 OVN 서버가 다시 켜진다(클러스터는
+  받지 않는다). "남은 중앙 DB"로 보이므로 `sdn central remove`로 치운다. 내쫓기는 GitHub `ovn` 작업(중앙 하나)으로는 실제로
+  보지 못했고 가짜 실행기 시험만 있다.
 - **여러 노드에서 실제로 보지 못한 것.** chassis 둘 사이의 Geneve, 라이브 마이그레이션의 두 chassis 바인딩, 중앙 셋의 실제 노드
   장애는 시험 장비가 노드 하나라 단위·가짜 OVSDB 시험으로만 보았다(`ovn` CI 작업은 노드 하나에 중앙·chassis와 127.0.0.2의
   두 번째 ovsdb 서버).
 - "10초 안에 포트가 바인딩되지 않음" 경고는 orbivisord 로그에만 있고 API·웹에는 없다.
-- 있던 NIC 채우기(`--fill`)는 CLI만이다. 웹·API에는 없다.
+- 주소가 있는 NIC의 빠진 체계 채우기(`--fill`)는 CLI만이다. 주소 없는 NIC는 서브넷을 더할 때 서버가 채운다.
 - 서브넷은 체계마다 하나, DHCP 릴레이·여러 서브넷·DNS 이름은 없다. 템플릿 배포 `--count` 2 이상에는 주소를 고를 수 없다.
 - 원격 복제(계획 55)를 받는 클러스터에는 같은 이름의 SDN 네트워크가 있어야 하고, 주소가 겹치면 받기가 실패한다.
 - 중앙 판은 첫 중앙의 OVN 판과 주·부 판이 같아야 한다(꾸러미를 올릴 때는 모든 중앙을 함께).

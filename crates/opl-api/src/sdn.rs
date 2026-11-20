@@ -19,8 +19,8 @@ use opl_types::network::{Network, NetworkSpec, NetworkStatus, Subnet};
 use opl_types::node::{Node, NodeSpec, SDN};
 use opl_types::resource::{Kind, Resource};
 use opl_types::sdn::{
-    MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnInitRequest, SdnNodeRequest, SdnPending,
-    SdnPhase, SdnSpec, SdnStatus, SdnView, central_address,
+    MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest, SdnNodeRequest,
+    SdnPending, SdnPhase, SdnSpec, SdnStatus, SdnView, central_address,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
@@ -569,13 +569,16 @@ pub async fn add_central(
     ))
 }
 
-/// 노드 `node`를 OVN 중앙에서 빼는 `sdn-central-remove` Task(202): NB·SB Raft 클러스터를 떠나고 단위를 멈추고 DB 파일은
-/// 이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙
-/// 더하기가 남긴 멤버)도 같이 떠나게 한다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이 아니면
-/// 400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`, 다른
-/// 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
+/// 노드 `node`를 OVN 중앙에서 빼는 Task(202). 노드가 온라인이면 그 노드의 `sdn-central-remove`: NB·SB Raft 클러스터를
+/// 떠나고 단위를 멈추고 DB 파일은 이름만 바꾼다(지우지 않음 — chassis 구성은 그대로). 꺼졌거나 클러스터에서 지운
+/// 노드면 살아 있는 다른 중앙의 `sdn-central-kick`: 그 노드의 Raft 주소를 NB·SB 클러스터에서 내쫓고 목록에서 뺀다(리뷰 2
+/// N-1 — 그 노드의 단위와 DB는 손대지 못한다). 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙 더하기가 남긴
+/// 멤버)와 지운 노드 기록(`strays`)도 같이 받는다(마지막 중앙 검사·짝수 경고 없음). 마지막 중앙은 뺄 수 없다(409
+/// `sdn_last_central`). 노드가 중앙이 아니면 400(없으면 404), 내쫓을 살아 있는 중앙이 없으면 409 `node_offline`, SDN이
+/// 준비되지 않았으면 409 `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 목록의 중앙을 빼서 짝수가 되면
+/// 응답 헤더 `orbivisor-warning`.
 #[utoipa::path(delete, path = "/sdn/centrals/{node}", tag = "sdn",
-    params(("node" = String, Path, description = "node id or name")),
+    params(("node" = String, Path, description = "node id or name (a deleted node: the name or id `strays` shows)")),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>,
         headers(("orbivisor-warning" = String, description = "the central count becomes even (only then)"))),
         (status = "4XX", body = crate::error::ErrorBody)))]
@@ -587,17 +590,20 @@ pub async fn remove_central(
 ) -> Result<(StatusCode, HeaderMap, Json<Task>), ApiError> {
     state.authorize(&principal, Action::Write, Kind::Sdn)?;
     require_feature(&state.cluster, SDN)?;
-    require_ready(&state.cluster)?;
-    let node = lookup::<NodeSpec>(&state.cluster, &key)?;
+    let sdn = require_ready(&state.cluster)?;
+    let target = removal_target(&state.cluster, &sdn, &key)?;
+    let id = target.id;
+    let alive = target.node.as_ref().is_some_and(|n| n.status.online);
     let check = |sdn: Option<&Sdn>| -> Result<(), ApiError> {
         let Some(sdn) = sdn.filter(|s| s.status.phase == SdnPhase::Ready) else {
             return Err(not_ready("SDN (OVN) is not set up"));
         };
-        let listed = sdn.status.centrals.iter().any(|c| c.node == node.id);
-        if !listed && !half_member(&node) {
+        let listed = sdn.status.centrals.iter().any(|c| c.node == id);
+        let departed = sdn.status.departed.iter().any(|d| d.node == id);
+        if !listed && !departed && !target.node.as_ref().is_some_and(half_member) {
             return Err(ApiError::bad_request(format!(
                 "node {:?} is not an OVN central",
-                node.name
+                target.name
             )));
         }
         if listed && sdn.status.centrals.len() <= 1 {
@@ -608,17 +614,115 @@ pub async fn remove_central(
         }
         check_busy(&state.cluster, sdn, None)
     };
-    check(find_sdn(&state.cluster)?.as_ref())?;
-    check_online(&state, node.id)?;
-    let centrals = require_ready(&state.cluster)?.status.centrals;
-    let count = centrals.len() - usize::from(centrals.iter().any(|c| c.node == node.id));
-    audit.detail(format!("sdn central remove {}", node.name));
-    let task = create_exclusive(&state, TaskOp::SdnCentralRemove, node.id, check, |_| {}).await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        warning_header(even_warning(count)),
-        Json(task),
-    ))
+    check(Some(&sdn))?;
+    let centrals = &sdn.status.centrals;
+    let listed = centrals.iter().any(|c| c.node == id);
+    // 목록의 중앙을 뺄 때만 수가 바뀐다(리뷰 2 m-4 — 목록 밖의 멤버를 치울 때는 경고하지 않는다).
+    let warning = listed.then(|| even_warning(centrals.len() - 1)).flatten();
+    let task = if alive {
+        audit.detail(format!("sdn central remove {}", target.name));
+        create_exclusive(&state, TaskOp::SdnCentralRemove, id, check, |_| {}).await?
+    } else {
+        let address = target.address.ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "cannot tell the OVN central address of node {:?}; kick it out by hand on a central with \
+                 `ovs-appctl -t /run/opl/ovn/nb.ctl cluster/kick OVN_Northbound SERVER` (and sb.ctl OVN_Southbound)",
+                target.name
+            ))
+        })?;
+        let by = live_central(&state.cluster, &sdn, id)?.ok_or_else(|| {
+            ApiError::conflict(
+                "node_offline",
+                format!(
+                    "node {:?} is offline and no other OVN central is online to kick it out of the OVN cluster",
+                    target.name
+                ),
+            )
+        })?;
+        audit.detail(format!(
+            "sdn central remove {} (offline; kicked out by {})",
+            target.name, by.name
+        ));
+        create_exclusive(
+            &state,
+            TaskOp::SdnCentralKick { node: id, address },
+            by.id,
+            check,
+            |_| {},
+        )
+        .await?
+    };
+    Ok((StatusCode::ACCEPTED, warning_header(warning), Json(task)))
+}
+
+/// 중앙 빼기의 대상: 노드(있으면)와 그 Raft 주소(목록의 주소, 지운 노드 기록의 주소, 아니면 노드의 기본 중앙 주소)
+struct RemovalTarget {
+    id: Uuid,
+    name: String,
+    node: Option<Node>,
+    address: Option<IpAddr>,
+}
+
+/// `DELETE /sdn/centrals/{key}`의 `key`: 노드 이름·id, 없으면 지운 노드 기록(`departed`)의 이름·id나 목록에 남은 중앙의
+/// id(옛 `cluster leave`가 남긴 것 — 리뷰 2 N-1). 어느 것도 아니면 404.
+fn removal_target(cluster: &Cluster, sdn: &Sdn, key: &str) -> Result<RemovalTarget, ApiError> {
+    let listed = |id: Uuid| {
+        sdn.status
+            .centrals
+            .iter()
+            .find(|c| c.node == id)
+            .map(|c| c.address)
+    };
+    match lookup::<NodeSpec>(cluster, key) {
+        Ok(node) => Ok(RemovalTarget {
+            id: node.id,
+            name: node.name.clone(),
+            address: listed(node.id).or_else(|| central_address(&node)),
+            node: Some(node),
+        }),
+        Err(e) if e.status == StatusCode::NOT_FOUND => {
+            if let Some(d) = sdn
+                .status
+                .departed
+                .iter()
+                .find(|d| d.name == key || d.node.to_string() == key)
+            {
+                return Ok(RemovalTarget {
+                    id: d.node,
+                    name: d.name.clone(),
+                    node: None,
+                    address: Some(d.address),
+                });
+            }
+            match sdn
+                .status
+                .centrals
+                .iter()
+                .find(|c| c.node.to_string() == key)
+            {
+                Some(c) => Ok(RemovalTarget {
+                    id: c.node,
+                    name: c.node.to_string(),
+                    node: None,
+                    address: Some(c.address),
+                }),
+                None => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 노드 `except` 말고 온라인인 중앙(Raft에서 다른 서버를 내쫓을 노드). 없으면 None
+fn live_central(cluster: &Cluster, sdn: &Sdn, except: Uuid) -> Result<Option<Node>, ApiError> {
+    for c in sdn.status.centrals.iter().filter(|c| c.node != except) {
+        if let Some(n) = cluster.get::<NodeSpec>(c.node)?
+            && n.status.online
+        {
+            return Ok(Some(n));
+        }
+    }
+    Ok(None)
 }
 
 /// 노드들(`nodes`, 또는 `all`이면 아직 준비된 chassis가 아닌 모든 온라인 Linux 노드)에 OVN chassis 꾸러미를 깔고 구성하는
@@ -692,7 +796,7 @@ pub async fn install_chassis(
 }
 
 /// 중앙 목록에 없지만 이 SDN의 NB·SB DB를 가진 노드(실패한 `sdn-central-add`가 합류만 하고 남긴 멤버 — 리뷰 1 I-7).
-/// 노드의 `SdnAgent`가 알린다(`NodeSdn.central`). OVN Raft의 멤버일 수 있으므로 지우기 전에 중앙 빼기로 떠나야 한다.
+/// 노드의 `SdnAgent`가 알린다(`NodeSdn.central`, 준비된 SDN에서만).
 fn half_member(node: &Node) -> bool {
     node.status
         .sdn
@@ -700,33 +804,103 @@ fn half_member(node: &Node) -> bool {
         .is_some_and(|s| s.central.is_some())
 }
 
-/// 노드 `node`가 OVN 중앙이면(또는 중앙 목록 밖이지만 이 SDN의 NB·SB DB를 가졌으면) 지우기 전에 409
-/// `sdn_central_on_node`(설계 §7.1 — 중앙에서 먼저 뺀다)
-pub(crate) fn check_node_removal(cluster: &Cluster, node: &Node) -> Result<(), ApiError> {
+/// 꺼진 노드 `node`를 지우기 전에 본다(설계 §7.1): 목록의 OVN 중앙이면 409 `sdn_central_on_node`(먼저 `sdn central
+/// remove` — 꺼진 노드는 다른 중앙이 내쫓는다). 목록 밖에서 이 SDN의 DB를 알린 노드(반쯤 합류한 멤버)는 막지 않고 지운 뒤
+/// 내쫓을 기록을 돌려준다(리뷰 2 N-2 — 죽은 노드를 영영 지우지 못하게 되지 않게). 부르는 쪽이 노드를 지운 뒤
+/// [`kick_departed`]로 넘긴다.
+pub(crate) fn check_node_removal(
+    cluster: &Cluster,
+    node: &Node,
+) -> Result<Option<SdnDeparted>, ApiError> {
     let Some(sdn) = find_sdn(cluster)? else {
-        return Ok(());
+        return Ok(None);
     };
-    if !sdn.status.centrals.iter().any(|c| c.node == node.id) && half_member(node) {
-        return Err(ApiError::conflict(
-            "sdn_central_on_node",
-            format!(
-                "node {:?} holds databases of the OVN central cluster (a central add that did not finish); \
-                 remove it with `orbivisorctl sdn central remove {}` first (the node must be online)",
-                node.name, node.name
-            ),
-        ));
-    }
     if let Some(c) = sdn.status.centrals.iter().find(|c| c.node == node.id) {
         return Err(ApiError::conflict(
             "sdn_central_on_node",
             format!(
                 "node {:?} is an OVN central ({}); remove it with `orbivisorctl sdn central remove {}` first \
-                 (the node must be online to leave the OVN cluster)",
+                 (another central kicks an offline node out of the OVN cluster)",
                 node.name, c.address, node.name
             ),
         ));
     }
-    Ok(())
+    if sdn.status.phase != SdnPhase::Ready || !half_member(node) {
+        return Ok(None);
+    }
+    Ok(Some(SdnDeparted {
+        node: node.id,
+        name: node.name.clone(),
+        address: central_address(node).unwrap_or(IpAddr::from([0, 0, 0, 0])),
+    }))
+}
+
+/// 지운 노드 `departed`가 OVN Raft에 남았을 수 있다: 기록(`SdnStatus.departed`)에 적고 살아 있는 중앙의
+/// `sdn-central-kick` Task로 내쫓는다(리뷰 2 N-2). 할 수 없으면(살아 있는 중앙이 없음, 다른 중앙 Task가 돎) 기록만 두고
+/// 나중에 `sdn central remove NAME`을 하라고 알린다. 노드 지우기 응답의 경고 줄을 돌려준다.
+pub(crate) async fn kick_departed(state: &AppState, departed: SdnDeparted) -> Vec<String> {
+    let name = departed.name.clone();
+    if departed.address.is_unspecified() {
+        return vec![format!(
+            "node {name:?} held OVN central databases but its address is unknown; on a central run \
+             `ovs-appctl -t /run/opl/ovn/nb.ctl cluster/status OVN_Northbound` and kick its server with \
+             `cluster/kick` (and the same for sb.ctl OVN_Southbound)"
+        )];
+    }
+    let record = departed.clone();
+    if let Err(e) = crate::tasks::sdn::update_sdn(&state.cluster, |s| {
+        if s.departed.iter().any(|d| d.node == record.node) {
+            return false;
+        }
+        s.departed.push(record.clone());
+        true
+    })
+    .await
+    {
+        return vec![format!(
+            "node {name:?} held OVN central databases and could not be recorded ({e}); kick its server \
+             ssl:{}:6643 and :6644 out of the OVN clusters by hand with `ovs-appctl … cluster/kick`",
+            departed.address
+        )];
+    }
+    let later =
+        format!("run `orbivisorctl sdn central remove {name}` to kick it out of the OVN cluster");
+    let sdn = match find_sdn(&state.cluster) {
+        Ok(Some(s)) => s,
+        _ => return vec![format!("node {name:?} held OVN central databases; {later}")],
+    };
+    let by = match live_central(&state.cluster, &sdn, departed.node) {
+        Ok(Some(n)) => n,
+        _ => {
+            return vec![format!(
+                "node {name:?} held OVN central databases and no OVN central is online; {later}"
+            )];
+        }
+    };
+    let id = departed.node;
+    let check = |sdn: Option<&Sdn>| -> Result<(), ApiError> {
+        let Some(sdn) = sdn.filter(|s| s.status.phase == SdnPhase::Ready) else {
+            return Err(not_ready("SDN (OVN) is not set up"));
+        };
+        if !sdn.status.departed.iter().any(|d| d.node == id) {
+            return Err(ApiError::bad_request("already kicked out"));
+        }
+        check_busy(&state.cluster, sdn, None)
+    };
+    let op = TaskOp::SdnCentralKick {
+        node: id,
+        address: departed.address,
+    };
+    match create_exclusive(state, op, by.id, check, |_| {}).await {
+        Ok(task) => vec![format!(
+            "node {name:?} held OVN central databases; node {:?} kicks it out of the OVN cluster (task {})",
+            by.name, task.id
+        )],
+        Err(e) => vec![format!(
+            "node {name:?} held OVN central databases; {later} ({})",
+            e.message
+        )],
+    }
 }
 
 /// `PATCH /networks/{key}`: SDN 네트워크의 서브넷 목록 전체(계획 65 §9)
@@ -739,22 +913,27 @@ pub struct NetworkPatch {
 }
 
 /// SDN 네트워크의 서브넷을 바꾼다(`If-Match`로 리비전 확인): 서브넷 더하기, `dns_servers`·`pools`·`dhcp` 바꾸기, 쓰는
-/// NIC가 없는 서브넷 빼기. 이미 있는 NIC에는 새 서브넷의 주소를 저절로 주지 않는다(`orbivisorctl network ips NAME
-/// --fill`). 풀을 줄여도 이미 준 풀 밖 주소는 남는다. 단순 네트워크면 409 `network_immutable`, 서브넷 검증·`gateway`
-/// 바꾸기는 400 `invalid_subnet`, 빼는 서브넷의 주소를 쓰는 VM이 있으면 409 `subnet_in_use`, 옛 노드가 남았으면 409
-/// `cluster_upgrading`.
+/// NIC가 없는 서브넷 빼기. 서브넷을 더하면 그 네트워크에서 주소가 하나도 없는 NIC(켜진 VM 포함)가 새 서브넷의 주소를
+/// 받는다(리뷰 2 N-4 — 서브넷이 있는 네트워크의 주소 없는 NIC는 OVN 포트가 꺼진다. 켜진 게스트는 다음 DHCP 갱신에서 받는다).
+/// 그만큼 빈 주소가 없으면 409 `ip_exhausted`(아무것도 바꾸지 않음). 이미 주소가 있는 NIC에 빠진 체계는 채우지 않는다
+/// (`orbivisorctl network ips NAME --fill`). 풀을 줄여도 이미 준 풀 밖 주소는 남는다. 단순 네트워크면 409
+/// `network_immutable`, 서브넷 검증·`gateway` 바꾸기는 400 `invalid_subnet`, 빼는 서브넷의 주소를 쓰는 VM이 있으면 409
+/// `subnet_in_use`(부른 사용자가 읽을 수 없는 VM은 수로만), 옛 노드가 남았으면 409 `cluster_upgrading`. 네트워크를 쓴 뒤
+/// 채우지 못한 VM(그새 바뀜)은 응답 헤더 `orbivisor-warning`으로 알린다.
 #[utoipa::path(patch, path = "/networks/{key}", tag = "networks",
     request_body = NetworkPatch,
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
-    responses((status = 200, body = Resource<NetworkSpec, NetworkStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 200, body = Resource<NetworkSpec, NetworkStatus>,
+        headers(("orbivisor-warning" = String, description = "interfaces that could not get an address (only then)"))),
+        (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn patch_network(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     audit: AuditNote,
     Path(key): Path<String>,
     headers: HeaderMap,
     Json(req): Json<NetworkPatch>,
-) -> Result<Json<Network>, ApiError> {
+) -> Result<(HeaderMap, Json<Network>), ApiError> {
     require_feature(&state.cluster, SDN)?;
     let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
     if !network.spec.is_sdn() {
@@ -788,47 +967,167 @@ pub async fn patch_network(
         .iter()
         .filter(|o| !spec.subnets.iter().any(|n| n.cidr == o.cidr))
         .collect();
-    if !removed.is_empty() {
-        let (_, vms) = state.cluster.list::<VmSpec>()?;
-        for subnet in &removed {
-            let users: Vec<&str> = vms
-                .iter()
-                .filter(|vm| {
-                    vm.spec.nics.iter().any(|n| {
-                        n.network == network.name
-                            && n.ips.iter().any(|ip| subnet.cidr.contains(*ip))
-                    })
+    let added: Vec<Subnet> = spec
+        .subnets
+        .iter()
+        .filter(|n| !network.spec.subnets.iter().any(|o| o.cidr == n.cidr))
+        .cloned()
+        .collect();
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
+    let sees = crate::ipam::readable(&state, Some(&principal));
+    for subnet in &removed {
+        let users: Vec<&opl_types::vm::Vm> = vms
+            .iter()
+            .filter(|vm| {
+                vm.spec.nics.iter().any(|n| {
+                    n.network == network.name && n.ips.iter().any(|ip| subnet.cidr.contains(*ip))
                 })
-                .map(|vm| vm.name.as_str())
-                .collect();
-            if !users.is_empty() {
-                return Err(ApiError::conflict(
-                    "subnet_in_use",
-                    format!(
-                        "subnet {} of network {:?} has addresses of VMs {}; remove those NICs or change their addresses first",
-                        subnet.cidr,
-                        network.name,
-                        users.join(", ")
-                    ),
-                ));
-            }
+            })
+            .collect();
+        if users.is_empty() {
+            continue;
         }
+        // 부른 사용자가 읽을 수 없는 VM(다른 폴더)은 이름을 대지 않는다(리뷰 2 m-1).
+        let mut named: Vec<&str> = users
+            .iter()
+            .filter(|vm| sees(vm))
+            .map(|vm| vm.name.as_str())
+            .collect();
+        let hidden = users.len() - named.len();
+        let other = format!("{hidden} VM(s) you cannot see");
+        if hidden > 0 {
+            named.push(&other);
+        }
+        return Err(ApiError::conflict(
+            "subnet_in_use",
+            format!(
+                "subnet {} of network {:?} has addresses of VMs {}; remove those NICs or change their addresses first",
+                subnet.cidr,
+                network.name,
+                named.join(", ")
+            ),
+        ));
+    }
+    let (empty, short) = crate::ipam::fill_shortages(&vms, &network.name, &added);
+    if !short.is_empty() {
+        return Err(ApiError::conflict(
+            "ip_exhausted",
+            format!(
+                "network {:?}: {empty} interface(s) have no address and would get one from the new subnets, \
+                 but {} cannot give that many; use a larger subnet or pool, or give those interfaces addresses first",
+                network.name,
+                short.join(", ")
+            ),
+        ));
     }
     let cidrs: Vec<String> = spec.subnets.iter().map(|s| s.cidr.to_string()).collect();
-    audit.detail(format!(
-        "network subnets {} [{}]",
-        network.name,
-        cidrs.join(", ")
-    ));
     let revision = if_match(&headers)?.unwrap_or(network.revision);
     let written = state
         .cluster
         .update_spec(network.id, Some(revision), network.labels.clone(), &spec)
         .await?;
+    let (filled, failed) = if empty > 0 && !added.is_empty() {
+        Box::pin(fill_empty_nics(&state, &network.name, &added)).await
+    } else {
+        (0, Vec::new())
+    };
+    let mut detail = format!("network subnets {} [{}]", network.name, cidrs.join(", "));
+    if filled > 0 {
+        detail.push_str(&format!(", gave addresses to {filled} interface(s)"));
+    }
+    audit.detail(detail);
+    let warning = (!failed.is_empty()).then(|| {
+        format!(
+            "could not give addresses to the interfaces of VMs {}; run `orbivisorctl network ips {} --fill`",
+            failed.join(", "),
+            network.name
+        )
+    });
     let mut out = network;
     out.spec = spec;
     out.revision = written;
-    Ok(Json(out))
+    Ok((warning_header(warning), Json(out)))
+}
+
+/// 서브넷을 더한 뒤 네트워크 `network`의 주소 없는 NIC에 새 서브넷 `added`의 주소를 준다(VM마다 리비전 확인 쓰기 — 그새
+/// 바뀌었거나 다른 노드가 같은 주소를 잡았으면 다시 고른다). 채운 NIC 수와 채우지 못한 VM 이름(까닭)을 돌려준다.
+async fn fill_empty_nics(
+    state: &AppState,
+    network: &str,
+    added: &[Subnet],
+) -> (usize, Vec<String>) {
+    let mut filled = 0;
+    let mut failed = Vec::new();
+    let ids: Vec<Uuid> = match state.cluster.list::<VmSpec>() {
+        Ok((_, vms)) => vms
+            .iter()
+            .filter(|v| {
+                !v.spec.template
+                    && v.spec
+                        .nics
+                        .iter()
+                        .any(|n| n.network == network && n.ips.is_empty())
+            })
+            .map(|v| v.id)
+            .collect(),
+        Err(e) => return (0, vec![format!("(cannot list VMs: {e})")]),
+    };
+    for id in ids {
+        let mut done = false;
+        let mut name = id.to_string();
+        for _ in 0..crate::ipam::RETRIES * 2 {
+            let _lock = state.vm_lock.lock().await;
+            let vms = match state.cluster.list::<VmSpec>() {
+                Ok((_, vms)) => vms,
+                Err(e) => {
+                    failed.push(format!("{name} ({e})"));
+                    done = true;
+                    break;
+                }
+            };
+            let Some(vm) = vms.iter().find(|v| v.id == id) else {
+                done = true;
+                break;
+            };
+            name = vm.name.clone();
+            let mut used = crate::ipam::network_used(&vms, network);
+            let mut spec = vm.spec.clone();
+            let count = match crate::ipam::fill_empty(&mut spec, network, added, &mut used) {
+                Ok(0) => {
+                    done = true;
+                    break;
+                }
+                Ok(n) => n,
+                Err(e) => {
+                    failed.push(format!("{name} ({e})"));
+                    done = true;
+                    break;
+                }
+            };
+            match state
+                .cluster
+                .update_spec(vm.id, Some(vm.revision), vm.labels.clone(), &spec)
+                .await
+            {
+                Ok(_) => {
+                    filled += count;
+                    done = true;
+                    break;
+                }
+                Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+                Err(e) if crate::ipam::is_ip_taken(&e) => {}
+                Err(e) => {
+                    failed.push(format!("{name} ({e})"));
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if !done {
+            failed.push(format!("{name} (it kept changing)"));
+        }
+    }
+    (filled, failed)
 }
 
 /// 서브넷 하나의 크기와 사용

@@ -18,6 +18,7 @@
 
 pub mod nb;
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -115,6 +116,8 @@ pub struct OvnSyncer {
     config: OvnSyncConfig,
     nb: Option<OvsdbClient>,
     sb: Option<OvsdbClient>,
+    /// 지난 차례가 읽은 VM마다 논리 포트에 쓰이는 칸(리뷰 2 m-2 — 이것이 그대로인 VM 쓰기로는 깨지 않는다)
+    seen: HashMap<Uuid, nb::VmInputs>,
 }
 
 impl OvnSyncer {
@@ -124,7 +127,13 @@ impl OvnSyncer {
             config,
             nb: None,
             sb: None,
+            seen: HashMap::new(),
         }
+    }
+
+    /// VM 쓰기 `spec`·`status`(VM `id`)가 지난 차례가 본 것과 논리 포트에 쓰이는 칸이 같은지(같으면 다시 맞출 일이 없다)
+    pub fn unchanged_vm(&self, id: Uuid, inputs: &nb::VmInputs) -> bool {
+        self.seen.get(&id) == Some(inputs)
     }
 
     /// 연결을 놓는다(리더가 아니게 되었거나 SDN이 쉴 때).
@@ -167,6 +176,10 @@ impl OvnSyncer {
                 return SyncOutcome::Skipped(e.to_string());
             }
         };
+        self.seen = vms
+            .iter()
+            .map(|v| (v.id, nb::VmInputs::of(&v.spec, &v.status)))
+            .collect();
         let want = nb::desired(&networks, &vms, &nodes, &self.config.tag);
         let centrals = central_hosts(&sdn, &nodes);
         let old = sdn.status.sync.clone();
@@ -331,8 +344,11 @@ impl OvnSyncer {
         let token = format!("{term}:{index}");
         let mut global = have.global.clone();
         let mut errors = Vec::new();
+        // `nb_cfg`는 한 차례에 한 번(마지막 묶음)만 올린다(리뷰 2 m-2). 마지막 묶음이 실패했으면 끝에 따로 올린다.
+        let mut bumped = false;
         for (i, batch) in plan.iter().enumerate() {
-            let (fence_ops, ids) = nb::fence_ops(global.as_ref(), &tag, &token);
+            let bump = i + 1 == plan.len();
+            let (fence_ops, ids) = nb::fence(global.as_ref(), &tag, &token, bump);
             let n_fence = fence_ops.len();
             let mut ops = fence_ops;
             ops.extend(batch.ops.iter().cloned());
@@ -342,24 +358,8 @@ impl OvnSyncer {
                     done.transactions += 1;
                     done.operations += count;
                     done.token = (term, index);
-                    done.nb_cfg += 1;
-                    global = Some(match global {
-                        Some(mut g) => {
-                            g.external_ids = ids;
-                            g.nb_cfg += 1;
-                            g
-                        }
-                        // 넣은 NB_Global(두 번째 결과)의 uuid
-                        None => nb::Global {
-                            uuid: parse_uuids(&results[1]["uuid"])
-                                .into_iter()
-                                .next()
-                                .unwrap_or_default(),
-                            external_ids: ids,
-                            nb_cfg: 1,
-                            hv_cfg: 0,
-                        },
-                    });
+                    bumped |= bump;
+                    global = Some(bumped_global(global, ids, &results, bump));
                 }
                 Err(e)
                     if e.is_wait_failed()
@@ -384,6 +384,20 @@ impl OvnSyncer {
                     break;
                 }
             }
+        }
+        if done.transactions > 0 && !bumped && !client.is_closed() {
+            let (ops, ids) = nb::fence(global.as_ref(), &tag, &token, true);
+            match client.transact(NB_DB, ops).await {
+                Ok(results) => {
+                    done.transactions += 1;
+                    bumped = true;
+                    global = Some(bumped_global(global, ids, &results, true));
+                }
+                Err(e) => errors.push(format!("NB_Global: {e}")),
+            }
+        }
+        if bumped {
+            done.nb_cfg = global.as_ref().map_or(done.nb_cfg, |g| g.nb_cfg);
         }
         if !errors.is_empty() {
             let more = errors.len().saturating_sub(3);
@@ -454,6 +468,35 @@ impl OvnSyncer {
             self.sb = Some(client);
         }
         Ok(n)
+    }
+}
+
+/// 펜싱 연산을 붙인 트랜잭션 뒤의 `NB_Global`(`bump`면 `nb_cfg` 1 더함). 없던 행이면 넣은 행(두 번째 결과)의 uuid다.
+fn bumped_global(
+    global: Option<nb::Global>,
+    ids: std::collections::BTreeMap<String, String>,
+    results: &[Value],
+    bump: bool,
+) -> nb::Global {
+    let step = i64::from(bump);
+    match global {
+        Some(mut g) => {
+            g.external_ids = ids;
+            g.nb_cfg += step;
+            g
+        }
+        None => nb::Global {
+            uuid: results
+                .get(1)
+                .map(|r| parse_uuids(&r["uuid"]))
+                .unwrap_or_default()
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+            external_ids: ids,
+            nb_cfg: step,
+            hv_cfg: 0,
+        },
     }
 }
 
@@ -544,7 +587,7 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
             tokio::select! {
                 _ = &mut shutdown => return,
                 () = &mut deadline => break,
-                () = changed(&mut watch) => {
+                () = changed(&mut watch, &syncer) => {
                     // 모아서 한 번
                     tokio::select! {
                         _ = &mut shutdown => return,
@@ -565,16 +608,33 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
     }
 }
 
-/// 맞출 일이 생길 때까지 기다린다: Network·Vm·Sdn 변경, 노드 지우기(SB chassis 청소). 구독이 끊기면 버리고 돌아가
-/// 다시 맞추게 한다.
-async fn changed(watch: &mut Option<Watch>) {
+/// 맞출 일이 생길 때까지 기다린다: Network·Sdn 변경, 논리 포트에 쓰이는 칸이 바뀐 VM 쓰기(지난 차례가 본 것과 견줌 —
+/// 리뷰 2 m-2), VM·노드 지우기(SB chassis 청소). 구독이 끊기면 버리고 돌아가 다시 맞추게 한다.
+async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
     let Some(w) = watch else {
         return tokio::time::sleep(RESUBSCRIBE).await;
     };
     loop {
         match w.next().await {
             Ok(WatchEvent::Put {
-                kind: Kind::Network | Kind::Vm | Kind::Sdn,
+                kind: Kind::Vm,
+                resource,
+            }) => {
+                let same = match (
+                    serde_json::from_value::<VmSpec>(resource.spec),
+                    serde_json::from_value::<opl_types::vm::VmStatus>(resource.status),
+                ) {
+                    (Ok(spec), Ok(status)) => {
+                        syncer.unchanged_vm(resource.id, &nb::VmInputs::of(&spec, &status))
+                    }
+                    _ => false,
+                };
+                if !same {
+                    return;
+                }
+            }
+            Ok(WatchEvent::Put {
+                kind: Kind::Network | Kind::Sdn,
                 ..
             })
             | Ok(WatchEvent::Deleted {

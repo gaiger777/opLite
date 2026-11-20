@@ -770,7 +770,9 @@ pub struct NodeRemoved {
 
 /// 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
 /// 그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다. Ceph 데몬(mon·mgr·OSD)
-/// 노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200).
+/// 노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200). OVN 중앙
+/// 목록의 노드는 먼저 `sdn central remove`로 빼야 하고(409 `sdn_central_on_node`), 목록 밖의 OVN DB를 가졌던 노드는 지운
+/// 뒤 살아 있는 중앙이 OVN Raft에서 내쫓는다(경고에 그 Task).
 #[utoipa::path(delete, path = "/nodes/{key}", tag = "nodes",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 204, description = "Removed"),
@@ -792,10 +794,10 @@ pub async fn delete_node(
             ),
         ));
     }
-    // OVN 중앙은 먼저 중앙에서 빼야 한다(계획 65 §7.1).
-    crate::sdn::check_node_removal(&state.cluster, &node)?;
+    // OVN 중앙은 먼저 중앙에서 빼야 한다(계획 65 §7.1). 목록 밖의 반쯤 합류한 멤버는 지운 뒤 다른 중앙이 내쫓는다.
+    let stray = crate::sdn::check_node_removal(&state.cluster, &node)?;
     // Ceph 기록에서 먼저 뺀다(노드를 지운 뒤 실패하면 다시 부를 노드가 없다).
-    let warnings = crate::ceph::forget_node(&state, &node).await?;
+    let mut warnings = crate::ceph::forget_node(&state, &node).await?;
     state
         .cluster
         .request(LeaderRequest::Remove {
@@ -809,6 +811,9 @@ pub async fn delete_node(
     // 노드의 전원 끄기 펜싱 설정(BMC 비밀번호)도 남기지 않는다.
     crate::node_fence::delete_with_node(&state, &node).await?;
     drop_replication_target(&state, node.id).await?;
+    if let Some(departed) = stray {
+        warnings.extend(crate::sdn::kick_departed(&state, departed).await);
+    }
     tracing::info!(node = %node.name, "node removed from the cluster");
     if warnings.is_empty() {
         return Ok(StatusCode::NO_CONTENT.into_response());

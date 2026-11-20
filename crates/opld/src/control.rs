@@ -30,6 +30,8 @@ pub enum Request {
 pub struct ControlError {
     pub status: StatusCode,
     pub message: String,
+    /// 기계가 읽는 까닭(API 오류의 `code`와 같은 이름). 있을 때만 본문에 쓴다.
+    pub code: Option<&'static str>,
 }
 
 impl ControlError {
@@ -38,13 +40,23 @@ impl ControlError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            code: None,
         }
     }
 
+    /// 실패한 요청. 떠나기가 지금 상태로 거절됐으면([`LeaveConflict`](crate::member::LeaveConflict)) 409와 그 `code`다.
     pub fn failed(e: anyhow::Error) -> Self {
+        if let Some(c) = e.downcast_ref::<crate::member::LeaveConflict>() {
+            return Self {
+                status: StatusCode::CONFLICT,
+                message: c.message.clone(),
+                code: Some(c.code),
+            };
+        }
         Self {
             status: StatusCode::BAD_REQUEST,
             message: format!("{e:#}"),
+            code: None,
         }
     }
 }
@@ -88,7 +100,13 @@ async fn ask(ctx: &Ctx, make: impl FnOnce(Reply) -> Request) -> Answer {
     ctx.requests.send(make(reply)).await.map_err(|_| gone())?;
     match rx.await.map_err(|_| gone())? {
         Ok(v) => Ok(Json(v)),
-        Err(e) => Err((e.status, Json(json!({ "message": e.message })))),
+        Err(e) => {
+            let mut body = json!({ "message": e.message });
+            if let Some(code) = e.code {
+                body["code"] = json!(code);
+            }
+            Err((e.status, Json(body)))
+        }
     }
 }
 
@@ -177,4 +195,24 @@ pub async fn serve(
             tracing::error!(error = %e, "control socket stopped");
         }
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 리뷰 2 N-1: 지금 상태로 거절한 떠나기는 409와 `code`, 그 밖의 실패는 400이다.
+    #[test]
+    fn leave_conflicts_carry_their_code() {
+        let e = ControlError::failed(anyhow::Error::new(crate::member::LeaveConflict {
+            code: "sdn_central_on_node",
+            message: "this node is an OVN central".into(),
+        }));
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(e.code, Some("sdn_central_on_node"));
+        assert_eq!(e.message, "this node is an OVN central");
+        let e = ControlError::failed(anyhow::anyhow!("VM \"a\" is still assigned"));
+        assert_eq!(e.status, StatusCode::BAD_REQUEST);
+        assert_eq!(e.code, None);
+    }
 }

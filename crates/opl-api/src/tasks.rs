@@ -1035,6 +1035,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::SdnInit { .. }
         | TaskOp::SdnCentralAdd
         | TaskOp::SdnCentralRemove
+        | TaskOp::SdnCentralKick { .. }
         | TaskOp::SdnChassisInstall => return sdn::perform(ctx, task).await,
         TaskOp::VolumeDownload {
             url,
@@ -1060,7 +1061,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             .await
         }
         TaskOp::VolumeFlatten => template::flatten(ctx, id).await,
-        TaskOp::VmUntemplate => template::untemplate(ctx, task).await,
+        // SDN 주소를 다시 받지 못한 NIC는 Task 경고로 알린다(리뷰 2 N-4).
+        TaskOp::VmUntemplate => return template::untemplate(ctx, task).await,
         TaskOp::VmFirmwareReset {
             uefi_vars,
             tpm,

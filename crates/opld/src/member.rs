@@ -1210,13 +1210,17 @@ impl Member {
         }
     }
 
-    /// 클러스터에서 빠진다. 이 노드에 배정된 VM이 있거나, 남는 투표 멤버가 없거나 모두 위트니스면
-    /// 거부한다.
+    /// 클러스터에서 빠진다. 이 노드에 배정된 VM이 있거나, 남는 투표 멤버가 없거나 모두 위트니스거나, OVN 중앙이거나
+    /// 이 SDN의 OVN DB를 가졌으면([`check_sdn_leave`], 409 `sdn_central_on_node`) 거부한다.
     /// 성공하면 `close(true)`로 닫는다.
     pub async fn leave(&self) -> anyhow::Result<()> {
         let me = self.cluster.id();
         let (_, nodes) = self.cluster.list::<NodeSpec>()?;
         check_leave(me, &self.cluster.members().voters, &nodes)?;
+        let sdn = self
+            .cluster
+            .get_by_name::<opl_types::sdn::SdnSpec>(opl_types::sdn::SDN_NAME)?;
+        check_sdn_leave(me, sdn.as_ref(), &nodes)?;
         let (_, vms) = self.cluster.list::<VmSpec>()?;
         if let Some(vm) = vms
             .iter()
@@ -1477,6 +1481,53 @@ fn check_leave(
             "the remaining voting members are all witnesses, which cannot lead; add another \
              non-witness node first"
         );
+    }
+    Ok(())
+}
+
+/// 지금 상태에서 받을 수 없는 떠나기(제어 API가 409와 `code`로 돌려준다)
+#[derive(Debug)]
+pub struct LeaveConflict {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl std::fmt::Display for LeaveConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for LeaveConflict {}
+
+/// OVN 중앙(목록)이거나 목록 밖에서 이 SDN의 OVN DB를 가졌다고 알린 노드는 떠나지 않는다(리뷰 2 N-1): 떠나면 Node
+/// 리소스가 사라져 `sdn central remove`로 부를 수 없고, 그 노드의 NB·SB 서버는 클러스터 밖에서 Raft 멤버로 남는다.
+fn check_sdn_leave(
+    me: NodeId,
+    sdn: Option<&opl_types::sdn::Sdn>,
+    nodes: &[Typed<NodeSpec>],
+) -> Result<(), LeaveConflict> {
+    let Some(sdn) = sdn else {
+        return Ok(());
+    };
+    let node = nodes.iter().find(|n| n.id == me.0);
+    let name = node.map_or_else(|| me.0.to_string(), |n| n.name.clone());
+    let refuse = |what: &str| LeaveConflict {
+        code: "sdn_central_on_node",
+        message: format!(
+            "this node {what}; remove it first with `orbivisorctl sdn central remove {name}`, then leave"
+        ),
+    };
+    if sdn.status.centrals.iter().any(|c| c.node == me.0) {
+        return Err(refuse("is an OVN central"));
+    }
+    if node
+        .and_then(|n| n.status.sdn.as_ref())
+        .is_some_and(|s| s.central.is_some())
+    {
+        return Err(refuse(
+            "holds databases of the OVN central cluster (a central add that did not finish)",
+        ));
     }
     Ok(())
 }
@@ -2043,6 +2094,44 @@ mod tests {
         check_leave(id(&w), &voters(&[&a, &w]), &nodes).unwrap();
         // Node 리소스가 없는 투표 멤버는 일반 노드로 본다(get_cluster처럼).
         check_leave(id(&a), &voters(&[&a, &b, &w]), &[a.clone(), w.clone()]).unwrap();
+    }
+
+    /// 리뷰 2 N-1: OVN 중앙이거나 이 SDN의 DB를 알린 노드는 `cluster leave`로 빠지지 않는다(409 `sdn_central_on_node`).
+    #[test]
+    fn ovn_centrals_do_not_leave() {
+        let mut node: Typed<NodeSpec> = Resource::new(
+            "n1",
+            NodeSpec {
+                host_resources: None,
+                address: "h:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        let me = NodeId(node.id);
+        let mut sdn: opl_types::sdn::Sdn =
+            Resource::new(opl_types::sdn::SDN_NAME, opl_types::sdn::SdnSpec {});
+        check_sdn_leave(me, None, std::slice::from_ref(&node)).unwrap();
+        check_sdn_leave(me, Some(&sdn), std::slice::from_ref(&node)).unwrap();
+        sdn.status.centrals = vec![opl_types::sdn::SdnCentral {
+            node: node.id,
+            address: "10.0.0.1".parse().unwrap(),
+        }];
+        let e = check_sdn_leave(me, Some(&sdn), std::slice::from_ref(&node)).unwrap_err();
+        assert_eq!(e.code, "sdn_central_on_node");
+        assert!(e.message.contains("sdn central remove n1"), "{e}");
+        sdn.status.centrals.clear();
+        node.status.sdn = Some(opl_types::sdn::NodeSdn {
+            central: Some(opl_types::sdn::CentralHealth {
+                nb: opl_types::sdn::RaftRole::Follower,
+                sb: opl_types::sdn::RaftRole::Follower,
+                northd_active: false,
+            }),
+            ..Default::default()
+        });
+        let e = check_sdn_leave(me, Some(&sdn), std::slice::from_ref(&node)).unwrap_err();
+        assert!(e.message.contains("did not finish"), "{e}");
     }
 
     /// 경보 장부를 열지 못해도 opld는 메모리 장부로 시작한다(리뷰 1 #12).

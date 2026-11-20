@@ -23,7 +23,7 @@ use opl_driver::ovn::{Chassis, ChassisProbe, Db, OvnHost};
 use opl_types::network::tap_name;
 use opl_types::node::{NodeSpec, SDN};
 use opl_types::resource::Kind;
-use opl_types::sdn::{ChassisState, NodeSdn, SDN_NAME, SdnCentral, SdnPending, SdnSpec};
+use opl_types::sdn::{ChassisState, NodeSdn, SDN_NAME, SdnCentral, SdnPending, SdnPhase, SdnSpec};
 use opl_types::vm::VmSpec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -183,9 +183,10 @@ impl Agent {
                 Some(host.central_health().await)
             }
             Some(_) => Some(host.central_health().await),
-            // 중앙 목록에 없지만 이 SDN의 DB가 있다: 끝나지 않은 중앙 더하기가 남긴 멤버일 수 있다. 알려서 API가 노드
-            // 지우기를 막고 중앙 빼기로 떠나게 한다(리뷰 1 I-7). 단위는 맞추지 않는다.
-            None => {
+            // 중앙 목록에 없지만 이 SDN의 DB가 있다: 끝나지 않은 중앙 더하기가 남긴 멤버일 수 있다. 알려서 중앙 빼기로
+            // 떠나게 한다(리뷰 1 I-7 — 꺼진 채 지우면 다른 중앙이 내쫓는다, 리뷰 2 N-2). 단위는 맞추지 않는다. 세우는 중
+            // (첫 세우기 노드의 DB는 아직 목록에 없다)과 이 노드에서 중앙 Task가 도는 동안(합류 중)은 알리지 않는다.
+            None if sdn.status.phase == SdnPhase::Ready && !busy => {
                 let known = opl_driver::ovn::KnownCids {
                     nb: sdn.status.nb_cid,
                     sb: sdn.status.sb_cid,
@@ -196,6 +197,7 @@ impl Agent {
                     None
                 }
             }
+            None => None,
         };
 
         if configured {
@@ -693,6 +695,33 @@ mod tests {
         s.agent.tick().await;
         assert!(s.agent.report.get().unwrap().central.is_some());
         assert!(f.calls().iter().all(|c| !c.starts_with("systemctl")));
+        // 세우는 중이거나 이 노드에서 중앙 Task가 돌면(합류 중) 알리지 않는다(리뷰 2 N-2).
+        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        for status in [
+            SdnStatus {
+                phase: SdnPhase::Bootstrapping,
+                ..sdn.status.clone()
+            },
+            SdnStatus {
+                pending: Some(SdnPending {
+                    op: opl_types::task::TaskOp::SdnCentralAdd,
+                    node: s.agent.node,
+                    task: Uuid::now_v7(),
+                }),
+                ..sdn.status.clone()
+            },
+        ] {
+            s.cluster
+                .update_status::<SdnSpec>(sdn.id, &status)
+                .await
+                .unwrap();
+            s.agent.tick().await;
+            assert_eq!(s.agent.report.get().unwrap().central, None);
+        }
+        s.cluster
+            .update_status::<SdnSpec>(sdn.id, &sdn.status)
+            .await
+            .unwrap();
         // 다른 클러스터의 DB면 아니다.
         f.reply(
             "ovsdb-tool db-cid",

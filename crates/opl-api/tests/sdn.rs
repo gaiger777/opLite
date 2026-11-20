@@ -764,8 +764,8 @@ async fn init_retries_keep_the_address() {
     assert_eq!(sdn.status.init_address, Some("10.1.0.5".parse().unwrap()));
 }
 
-/// 리뷰 1 I-7: 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙 더하기)는 중앙 빼기로 떠나게 하고, 그 전에는
-/// 클러스터에서 지울 수 없다.
+/// 리뷰 1 I-7: 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙 더하기)는 중앙 빼기로 떠나게 한다. 꺼진 채
+/// 지우면 기록해 두고 다른 중앙이 내쫓는다(리뷰 2 N-2).
 #[tokio::test]
 async fn half_joined_centrals_can_be_removed() {
     let mut env = Env::start().await;
@@ -802,7 +802,294 @@ async fn half_joined_centrals_can_be_removed() {
         .update_status::<NodeSpec>(n2, &node2.status)
         .await
         .unwrap();
+    // 꺼진 채 지우기는 막지 않는다(리뷰 2 N-2 — 지운 뒤 기록하고, 다른 중앙 Task가 돌면 나중에 빼라고 알린다).
+    let (status, body) = admin.delete("/nodes/node2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["warnings"]
+            .to_string()
+            .contains("sdn central remove node2"),
+        "{body}"
+    );
+}
+
+/// 리뷰 2 N-4: 서브넷을 더하면 주소가 하나도 없는 NIC(켜진 VM 포함)가 새 서브넷의 주소를 받는다. 모두 줄 수 없으면 409
+/// `ip_exhausted`(수와 함께)이고 아무것도 바뀌지 않는다. 주소가 있는 NIC는 그대로다.
+#[tokio::test]
+async fn adding_subnets_fills_interfaces_without_addresses() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env, &[env.node]).await;
+    let (status, net) = admin
+        .post("/networks", json!({ "name": "l2", "spec": { "sdn": {} } }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{net}");
+    for name in ["a", "b"] {
+        let mut req = vm_request(name);
+        req["spec"]["nics"] = json!([{ "network": "l2", "model": "virtio" }]);
+        let (status, vm) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{vm}");
+        assert!(vm["spec"]["nics"][0].get("ips").is_none(), "{vm}");
+    }
+    // 풀이 주소 하나뿐: 둘에게 줄 수 없다.
+    let rev = net["revision"].as_u64().unwrap();
+    let (status, body) = admin
+        .patch(
+            "/networks/l2",
+            json!({ "subnets": [{ "cidr": "10.20.0.0/29",
+                                  "pools": [{ "start": "10.20.0.2", "end": "10.20.0.2" }] }] }),
+            Some(rev),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ip_exhausted", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("2 interface(s)"), "{message}");
+    assert!(message.contains("10.20.0.0/29 (1 free)"), "{message}");
+    let (_, now) = admin.get("/networks/l2").await;
+    assert_eq!(now["revision"], net["revision"], "{now}");
+
+    let (status, body) = admin
+        .patch(
+            "/networks/l2",
+            json!({ "subnets": [{ "cidr": "10.20.0.0/29" }, { "cidr": "fd20::/64", "dhcp": false }] }),
+            Some(rev),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, a) = admin.get("/vms/a").await;
+    let (_, b) = admin.get("/vms/b").await;
+    assert_eq!(a["spec"]["nics"][0]["ips"], json!(["10.20.0.2", "fd20::2"]));
+    assert_eq!(b["spec"]["nics"][0]["ips"], json!(["10.20.0.3", "fd20::3"]));
+
+    // 주소가 있는 NIC는 새 체계를 저절로 받지 않는다(`--fill`). 주소가 없는 NIC만 받는다.
+    let mut req = vm_request("c");
+    req["spec"]["nics"] = json!([{ "network": "l2", "model": "virtio" }]);
+    let (status, c) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{c}");
+    assert_eq!(c["spec"]["nics"][0]["ips"], json!(["10.20.0.4", "fd20::4"]));
+}
+
+/// 리뷰 2 N-4: 켜진 VM에서도 주소가 없던 NIC에는 주소를 줄 수 있다(있던 주소 바꾸기는 여전히 409 `vm_running`).
+#[tokio::test]
+async fn running_vms_may_give_an_address_to_an_interface_without_one() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env, &[env.node]).await;
+    let (status, net) = admin
+        .post("/networks", json!({ "name": "l2", "spec": { "sdn": {} } }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{net}");
+    let mut req = vm_request("a");
+    req["spec"]["nics"] = json!([{ "network": "l2", "model": "virtio" }]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    // 서브넷만 저장소에 바로 더한다(PATCH는 저절로 채운다).
+    let mut network = env
+        .cluster
+        .get_by_name::<opl_types::network::NetworkSpec>("l2")
+        .unwrap()
+        .unwrap();
+    network.spec.subnets = vec![serde_json::from_value(json!({ "cidr": "10.30.0.0/24" })).unwrap()];
+    env.cluster
+        .update_spec(network.id, None, network.labels.clone(), &network.spec)
+        .await
+        .unwrap();
+    let mut me = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    me.status.sdn = Some(opl_types::sdn::NodeSdn {
+        chassis: opl_types::sdn::ChassisState::Ready,
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &me.status)
+        .await
+        .unwrap();
+    let started = admin.act("a", "start").await;
+    assert_eq!(started["status"]["state"], "succeeded", "{started}");
+    let (_, vm) = admin.get("/vms/a").await;
+    let rev = vm["revision"].as_u64().unwrap();
+    let mut spec = vm["spec"].clone();
+    spec["nics"][0]["ips"] = json!(["10.30.0.7"]);
+    let (status, body) = admin
+        .put("/vms/a", json!({ "spec": spec }), Some(rev))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rev = body["revision"].as_u64().unwrap();
+    spec["nics"][0]["ips"] = json!(["10.30.0.8"]);
+    let (status, body) = admin
+        .put("/vms/a", json!({ "spec": spec }), Some(rev))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "vm_running", "{body}");
+}
+
+/// 리뷰 2 N-4: 다 쓰인 서브넷의 템플릿 되돌리기는 주소 없이 끝나고 Task 경고로 알린다.
+#[tokio::test]
+async fn untemplating_onto_a_full_subnet_warns() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env, &[env.node]).await;
+    let (status, b) = admin
+        .post(
+            "/networks",
+            json!({ "name": "tiny", "spec": { "sdn": {}, "subnets": [{ "cidr": "10.40.0.0/29",
+                "pools": [{ "start": "10.40.0.2", "end": "10.40.0.2" }] }] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let mut req = vm_request("tmpl");
+    req["spec"]["nics"] = json!([{ "network": "tiny", "model": "virtio" }]);
+    let (status, b) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let (status, b) = admin.post("/vms/tmpl/template", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    // 템플릿이 놓은 하나뿐인 주소를 다른 VM이 잡는다.
+    let mut req = vm_request("other");
+    req["spec"]["nics"] = json!([{ "network": "tiny", "model": "virtio" }]);
+    let (status, b) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let (status, task) = admin.delete("/vms/tmpl/template").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "succeeded", "{done}");
+    let warning = done["status"]["error"].as_str().unwrap_or_default();
+    assert!(warning.contains("no free addresses"), "{done}");
+    assert!(warning.contains("--fill"), "{done}");
+    let (_, vm) = admin.get("/vms/tmpl").await;
+    assert!(vm["spec"]["nics"][0].get("ips").is_none(), "{vm}");
+}
+
+/// 리뷰 2 m-1: 쓰는 서브넷을 빼려 할 때 읽을 수 없는 VM은 이름 없이 수로만 댄다.
+#[tokio::test]
+async fn subnet_in_use_hides_other_folders() {
+    let env = Env::start().await;
+    let (admin, alice, _, _) = shared_world(&env).await;
+    // alice가 네트워크 폴더의 admin(network.config)이다.
+    let (_, users) = admin.get("/users").await;
+    let list = if users.is_array() {
+        users.clone()
+    } else {
+        users["items"].clone()
+    };
+    let alice_id = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == "alice")
+        .map(|u| u["id"].clone())
+        .unwrap();
+    let (_, net) = admin.get("/networks/shared").await;
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": alice_id },
+                "role": { "type": "builtin", "role": "admin" },
+                "target": { "type": "folder", "id": net["spec"]["folder"] },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = alice
+        .patch("/networks/shared", json!({ "subnets": [] }), None)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "subnet_in_use", "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("a1"), "{message}");
+    assert!(!message.contains("b1"), "{message}");
+    assert!(message.contains("1 VM(s) you cannot see"), "{message}");
+    let (_, body) = admin
+        .patch("/networks/shared", json!({ "subnets": [] }), None)
+        .await;
+    assert!(body["message"].as_str().unwrap().contains("b1"), "{body}");
+}
+
+/// 리뷰 2 N-1·N-2·m-4: 꺼진 중앙은 다른 중앙의 `sdn-central-kick`으로 빼고, 꺼진 반쯤 합류한 노드는 지울 수 있다(지운
+/// 뒤 기록하고 내쫓는다). 목록 밖 노드를 뺄 때는 짝수 경고가 없다.
+#[tokio::test]
+async fn dead_centrals_are_kicked_out_by_a_live_one() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let n2 = other_node(&env, "node2", false).await;
+    let n3 = other_node(&env, "node3", true).await;
+    ready_sdn(&env, &[env.node, n2, n3]).await;
+    // 꺼진 목록의 중앙: 지우기는 409, 빼기는 살아 있는 중앙(이 노드)이 내쫓는 Task
     let (status, body) = admin.delete("/nodes/node2").await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "sdn_central_on_node", "{body}");
+    let (status, headers, task) = admin
+        .send_headers(Method::DELETE, "/sdn/centrals/node2", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["op"]["kind"], "sdn-central-kick", "{task}");
+    assert_eq!(task["spec"]["op"]["node"], n2.to_string());
+    assert_eq!(task["spec"]["op"]["address"], "127.0.0.1");
+    assert_eq!(task["spec"]["node"], env.node.to_string());
+    // 셋에서 하나를 빼면 짝수가 된다.
+    assert!(headers.get("orbivisor-warning").is_some(), "{headers:?}");
+    finish(&env, &task).await;
+
+    // 꺼진 반쯤 합류한 노드(목록 밖, DB를 알림): 지우기는 막지 않고, 지운 뒤 기록하고 내쫓는 Task를 만든다.
+    ready_sdn(&env, &[env.node, n3]).await;
+    let n4 = other_node(&env, "node4", false).await;
+    let mut node4 = env.cluster.get::<NodeSpec>(n4).unwrap().unwrap();
+    node4.status.sdn = Some(opl_types::sdn::NodeSdn {
+        central: Some(opl_types::sdn::CentralHealth {
+            nb: opl_types::sdn::RaftRole::Follower,
+            sb: opl_types::sdn::RaftRole::Follower,
+            northd_active: false,
+        }),
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<NodeSpec>(n4, &node4.status)
+        .await
+        .unwrap();
+    let (_, view) = admin.get("/sdn").await;
+    assert_eq!(
+        view["strays"],
+        json!([{ "node": n4, "name": "node4" }]),
+        "{view}"
+    );
+    let (status, body) = admin.delete("/nodes/node4").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let warning = body["warnings"].to_string();
+    assert!(warning.contains("kicks it out"), "{body}");
+    let sdn = env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(sdn.status.departed.len(), 1);
+    assert_eq!(sdn.status.departed[0].address.to_string(), "10.0.0.9");
+    let task_id = sdn.status.pending.as_ref().unwrap().task;
+    let task = env
+        .cluster
+        .get::<opl_types::task::TaskSpec>(task_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.spec.op,
+        opl_types::task::TaskOp::SdnCentralKick {
+            node: n4,
+            address: "10.0.0.9".parse().unwrap()
+        }
+    );
+    let (_, view) = admin.get("/sdn").await;
+    assert_eq!(
+        view["strays"],
+        json!([{ "node": n4, "name": "node4", "gone": true }]),
+        "{view}"
+    );
+    finish(&env, &json!({ "id": task_id })).await;
+    // 지운 노드는 그 이름으로 다시 뺄 수 있다(목록 밖이라 짝수 경고 없음).
+    let (status, headers, task) = admin
+        .send_headers(Method::DELETE, "/sdn/centrals/node4", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["op"]["kind"], "sdn-central-kick", "{task}");
+    assert!(headers.get("orbivisor-warning").is_none(), "{headers:?}");
+    let _ = n3;
 }

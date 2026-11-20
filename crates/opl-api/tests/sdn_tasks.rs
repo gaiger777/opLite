@@ -905,6 +905,8 @@ async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
     let done = s.run_op(TaskOp::SdnInit { address: None }, id).await;
     assert_eq!(state(&done), "failed", "{done}");
     assert_eq!(h.calls_of("ovsdb-tool create-cluster").len(), 2);
+    let stops = || h.calls_of("systemctl disable --now opl-ovn").len();
+    assert_eq!(stops(), 0);
 
     h.status(NB_LEADER, SB_LEADER);
     let done = s
@@ -926,6 +928,18 @@ async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
         .collect();
     assert_eq!(kept.len(), 2, "{kept:?}");
     assert_eq!(s.sdn().centrals[0].address, ip("10.2.0.7"));
+    // 치우기 전에 지난 시도의 서버를 멈춘다(리뷰 2 m-3 — 옛 서버의 압축이 새 DB를 덮지 않게). 한 번만.
+    assert_eq!(stops(), 1);
+    let calls = h.fake().calls();
+    let stop = calls
+        .iter()
+        .position(|c| c.starts_with("systemctl disable --now opl-ovn"))
+        .unwrap();
+    let create = calls
+        .iter()
+        .rposition(|c| c.starts_with("ovsdb-tool create-cluster"))
+        .unwrap();
+    assert!(stop < create, "{calls:?}");
 }
 
 /// 중앙 더하기가 합류한 뒤 실패하면 클러스터를 다시 떠나고 단위를 멈추고 DB는 이름만 바꾼다(리뷰 1 I-7 — 목록에 없는
@@ -980,4 +994,146 @@ async fn a_half_joined_member_can_be_removed() {
     assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
     assert_eq!(s.sdn().centrals.len(), 1);
     assert_eq!(s.sdn().pending, None);
+}
+
+/// 리뷰 2 N-3: 합류 중인 서버(또는 돌지 않고 클러스터 id를 아직 모르는 DB)는 Raft 구성에 없다 — 떠나기 없이 단위를 멈추고
+/// DB를 치운다(OVS는 합류 중 떠나기를 거절해 빼기가 영영 실패했다).
+#[tokio::test]
+async fn a_joining_member_is_retired_without_leaving() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    let id = s.create(s.ready()).await;
+    std::fs::create_dir_all(h.root.join("var/lib/opl/ovn")).unwrap();
+    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    let joining = include_str!("../../opl-driver/src/ovn/fixtures/cluster-status-joining.txt");
+    h.fake().reply(
+        &format!(
+            "ovs-appctl --timeout 5 -t {} cluster/status",
+            h.p("run/opl/ovn/nb.ctl")
+        ),
+        CmdOutput::ok(joining),
+    );
+    // SB 서버는 돌지 않고 DB의 클러스터 id를 아직 모른다.
+    h.fake().reply(
+        &format!(
+            "ovs-appctl --timeout 5 -t {} cluster/status",
+            h.p("run/opl/ovn/sb.ctl")
+        ),
+        CmdOutput::fail(1, "ovs-appctl: cannot connect"),
+    );
+    let sb = h.p("var/lib/opl/ovn/sb.db");
+    h.fake().reply(
+        &format!("ovsdb-tool db-cid {sb}"),
+        CmdOutput::ok(format!("{sb}: cluster ID not yet known\n")),
+    );
+    let task = s.task(TaskOp::SdnCentralRemove, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    assert!(
+        h.fake()
+            .calls()
+            .iter()
+            .all(|c| !c.contains("cluster/leave")),
+        "{:?}",
+        h.fake().calls()
+    );
+    assert_eq!(h.calls_of("systemctl disable --now opl-ovn").len(), 1);
+    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
+    assert!(!h.root.join("var/lib/opl/ovn/sb.db").exists());
+}
+
+/// 리뷰 2 N-1·N-2: 살아 있는 중앙이 꺼진(지운) 노드의 Raft 주소를 NB·SB에서 내쫓고 중앙 목록과 지운 노드 기록에서 뺀다.
+/// 마지막 중앙은 내쫓지 않고, 목록에 없는 주소면 내쫓을 것 없이 기록만 지운다.
+#[tokio::test]
+async fn a_live_central_kicks_a_dead_one_out() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    let gone = Uuid::now_v7();
+    let mut ready = s.ready();
+    ready.centrals = vec![
+        SdnCentral {
+            node: s.env.node,
+            address: ip("127.0.0.1"),
+        },
+        SdnCentral {
+            node: gone,
+            address: ip("127.0.0.2"),
+        },
+    ];
+    ready.departed = vec![opl_types::sdn::SdnDeparted {
+        node: gone,
+        name: "dead".into(),
+        address: ip("127.0.0.2"),
+    }];
+    let id = s.create(ready).await;
+    let two = include_str!("../../opl-driver/src/ovn/fixtures/cluster-status-leader-two.txt");
+    let one = |text: &str| {
+        text.lines()
+            .filter(|l| !l.contains("ssl:127.0.0.2"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    for (db, port) in [("nb", "6643"), ("sb", "6644")] {
+        let text = two.replace("6643", port).replace(
+            "OVN_Northbound",
+            if db == "nb" {
+                "OVN_Northbound"
+            } else {
+                "OVN_Southbound"
+            },
+        );
+        h.fake().reply_seq(
+            &format!(
+                "ovs-appctl --timeout 5 -t {} cluster/status",
+                h.p(&format!("run/opl/ovn/{db}.ctl"))
+            ),
+            vec![CmdOutput::ok(text.clone()), CmdOutput::ok(one(&text))],
+        );
+    }
+    let op = TaskOp::SdnCentralKick {
+        node: gone,
+        address: ip("127.0.0.2"),
+    };
+    let task = s.task(op.clone(), id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    let kicks = h.calls_of("ovs-appctl --timeout 5 -t");
+    let kicks: Vec<&String> = kicks
+        .iter()
+        .filter(|c| c.contains("cluster/kick"))
+        .collect();
+    assert_eq!(kicks.len(), 2, "{kicks:?}");
+    assert!(
+        kicks[0].ends_with("cluster/kick OVN_Northbound ssl:127.0.0.2:6643"),
+        "{kicks:?}"
+    );
+    assert!(
+        kicks[1].ends_with("cluster/kick OVN_Southbound ssl:127.0.0.2:6644"),
+        "{kicks:?}"
+    );
+    let status = s.sdn();
+    assert_eq!(status.centrals.len(), 1);
+    assert!(status.departed.is_empty());
+    assert_eq!(status.pending, None);
+
+    // 다시 하면 내쫓을 것이 없다(경고).
+    let task = s.task(op, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    assert!(error(&done).contains("nothing to kick out"), "{done}");
+    // 마지막 중앙(이 노드)은 내쫓지 않는다.
+    let task = s.task(
+        TaskOp::SdnCentralKick {
+            node: s.env.node,
+            address: ip("127.0.0.1"),
+        },
+        id,
+    );
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert!(error(&done).contains("last OVN central"), "{done}");
 }

@@ -360,8 +360,8 @@ pub(crate) fn parse_subnet(s: &str) -> Result<Subnet, String> {
 
 #[derive(Subcommand)]
 pub(crate) enum SubnetCmd {
-    /// SDN 네트워크에 서브넷을 더한다(주소 체계마다 하나). 이미 있는 NIC에는 주소를 저절로 주지 않는다(`network ips
-    /// NAME --fill`).
+    /// SDN 네트워크에 서브넷을 더한다(주소 체계마다 하나). 주소가 하나도 없는 NIC(켜진 VM 포함)는 서버가 새 서브넷의
+    /// 주소를 준다(모두 줄 수 없으면 409 `ip_exhausted`). 주소가 있는 NIC에 빠진 체계는 `network ips NAME --fill`로 채운다.
     Add {
         network: String,
         #[arg(value_name = "CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B]", value_parser = parse_subnet)]
@@ -520,9 +520,9 @@ fn ip_rows(view: &Value) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// 네트워크 `network`의 SDN NIC 가운데 서브넷 주소 체계의 주소가 없는 것에 빈 주소를 골라 VM 스펙에 적는다(API는 있던
-/// NIC에 저절로 주지 않는다 — 설계 §9). 다른 요청이 그새 같은 주소를 잡으면(409 `ip_in_use`) 다시 고른다. 켜진 VM은
-/// 건너뛰고 알린다.
+/// 네트워크 `network`의 SDN NIC 가운데 서브넷 주소 체계의 주소가 없는 것에 빈 주소를 골라 VM 스펙에 적는다(API는 주소가
+/// 있던 NIC의 빠진 체계를 저절로 채우지 않는다 — 설계 §9). 다른 요청이 그새 같은 주소를 잡으면(409 `ip_in_use`) 다시 고른다. 켜진 VM은
+/// 주소가 하나도 없는 NIC만 채우고(리뷰 2 N-4 — 그 포트는 꺼져 있었다), 주소가 있는 NIC에 빠진 체계는 건너뛰고 알린다.
 async fn fill(
     client: &Client,
     network: &str,
@@ -534,7 +534,7 @@ async fn fill(
         .context("unexpected network subnets")?;
     let name = cell(&net["name"]);
     let mut filled = 0;
-    for _round in 0..5 {
+    for round in 0..5 {
         let vms = crate::cli::items(&client.get("/vms").await?);
         let mut used: BTreeSet<IpAddr> = vms
             .iter()
@@ -546,20 +546,20 @@ async fn fill(
             .collect();
         let mut retry = false;
         for vm in vms.iter().filter(|v| v["spec"]["template"] != true) {
-            let Some(spec) = fill_spec(vm, &name, &subnets, &mut used)? else {
-                continue;
-            };
             let vm_name = cell(&vm["name"]);
-            if vm["status"]["phase"]
+            let running = vm["status"]["phase"]
                 .as_str()
-                .is_some_and(|p| p != "stopped")
-            {
+                .is_some_and(|p| p != "stopped");
+            let (spec, skipped) = fill_spec(vm, &name, &subnets, &mut used, running)?;
+            if skipped && round == 0 {
                 writeln!(
                     err,
-                    "warning: VM {vm_name} is not stopped; stop it and run --fill again to give it addresses"
+                    "warning: VM {vm_name} is not stopped; stop it and run --fill again to add the missing address family"
                 )?;
-                continue;
             }
+            let Some(spec) = spec else {
+                continue;
+            };
             let r = client
                 .request(Method::PUT, &format!("/vms/{}", seg(&vm_name)))
                 .header("if-match", cell(&vm["revision"]))
@@ -591,23 +591,32 @@ async fn fill(
 }
 
 /// VM `vm`의 네트워크 `network` NIC에 빠진 주소 체계마다 서브넷의 빈 주소를 넣은 새 스펙(바꿀 것이 없으면 None).
-/// 고른 주소는 `used`에 넣는다.
+/// 고른 주소는 `used`에 넣는다. `running`이면 주소가 하나도 없는 NIC만 채우고(켜진 VM의 있던 주소는 바꾸지 않는다), 빠진
+/// 체계가 있어 건너뛴 NIC가 있으면 둘째 값이 참이다.
 fn fill_spec(
     vm: &Value,
     network: &str,
     subnets: &[Subnet],
     used: &mut BTreeSet<IpAddr>,
-) -> anyhow::Result<Option<Value>> {
+    running: bool,
+) -> anyhow::Result<(Option<Value>, bool)> {
     let mut spec = vm["spec"].clone();
     let mut changed = false;
+    let mut skipped = false;
     let Some(nics) = spec["nics"].as_array_mut() else {
-        return Ok(None);
+        return Ok((None, false));
     };
     for nic in nics.iter_mut().filter(|n| n["network"] == network) {
         let mut ips: Vec<IpAddr> = arr(&nic["ips"])
             .iter()
             .filter_map(|ip| ip.as_str()?.parse().ok())
             .collect();
+        if running && !ips.is_empty() {
+            skipped |= subnets
+                .iter()
+                .any(|s| !ips.iter().any(|ip| ip.is_ipv4() == s.is_ipv4()));
+            continue;
+        }
         for subnet in subnets {
             if ips.iter().any(|ip| ip.is_ipv4() == subnet.is_ipv4()) {
                 continue;
@@ -621,7 +630,7 @@ fn fill_spec(
         ips.sort_by_key(|ip| !ip.is_ipv4());
         nic["ips"] = json!(ips);
     }
-    Ok(changed.then_some(spec))
+    Ok((changed.then_some(spec), skipped))
 }
 
 /// `--ip [nicN=]A[+B]`: NIC 순번(없으면 준 순서)과 주소(체계마다 하나까지)
@@ -739,15 +748,28 @@ mod tests {
             { "network": "other", "model": "virtio" }
         ] } });
         let mut used: BTreeSet<IpAddr> = ["10.0.0.2".parse().unwrap()].into();
-        let spec = fill_spec(&vm, "t", &subnets, &mut used).unwrap().unwrap();
+        // 켜진 VM이면 주소가 있는 NIC는 건너뛰고 알린다(리뷰 2 N-4).
+        let (none, skipped) = fill_spec(&vm, "t", &subnets, &mut used, true).unwrap();
+        assert!(none.is_none() && skipped);
+        let (spec, _) = fill_spec(&vm, "t", &subnets, &mut used, false).unwrap();
+        let spec = spec.unwrap();
         assert_eq!(spec["nics"][0]["ips"], json!(["10.0.0.2", "fd00::2"]));
         assert!(spec["nics"][1].get("ips").is_none());
         // 다 있으면 바꾸지 않는다.
         let done = json!({ "spec": spec });
         assert!(
-            fill_spec(&done, "t", &subnets, &mut used)
+            fill_spec(&done, "t", &subnets, &mut used, false)
                 .unwrap()
+                .0
                 .is_none()
+        );
+        // 켜진 VM의 주소 없는 NIC는 채운다.
+        let bare = json!({ "spec": { "nics": [{ "network": "t", "model": "virtio" }] } });
+        let (spec, skipped) = fill_spec(&bare, "t", &subnets, &mut used, true).unwrap();
+        assert!(!skipped);
+        assert_eq!(
+            spec.unwrap()["nics"][0]["ips"],
+            json!(["10.0.0.3", "fd00::3"])
         );
     }
 

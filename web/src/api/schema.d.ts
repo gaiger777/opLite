@@ -1375,10 +1375,13 @@ export interface paths {
         head?: never;
         /**
          * SDN 네트워크의 서브넷을 바꾼다(`If-Match`로 리비전 확인): 서브넷 더하기, `dns_servers`·`pools`·`dhcp` 바꾸기, 쓰는
-         *     NIC가 없는 서브넷 빼기. 이미 있는 NIC에는 새 서브넷의 주소를 저절로 주지 않는다(`orbivisorctl network ips NAME
-         *     --fill`). 풀을 줄여도 이미 준 풀 밖 주소는 남는다. 단순 네트워크면 409 `network_immutable`, 서브넷 검증·`gateway`
-         *     바꾸기는 400 `invalid_subnet`, 빼는 서브넷의 주소를 쓰는 VM이 있으면 409 `subnet_in_use`, 옛 노드가 남았으면 409
-         *     `cluster_upgrading`.
+         *     NIC가 없는 서브넷 빼기. 서브넷을 더하면 그 네트워크에서 주소가 하나도 없는 NIC(켜진 VM 포함)가 새 서브넷의 주소를
+         *     받는다(리뷰 2 N-4 — 서브넷이 있는 네트워크의 주소 없는 NIC는 OVN 포트가 꺼진다. 켜진 게스트는 다음 DHCP 갱신에서 받는다).
+         *     그만큼 빈 주소가 없으면 409 `ip_exhausted`(아무것도 바꾸지 않음). 이미 주소가 있는 NIC에 빠진 체계는 채우지 않는다
+         *     (`orbivisorctl network ips NAME --fill`). 풀을 줄여도 이미 준 풀 밖 주소는 남는다. 단순 네트워크면 409
+         *     `network_immutable`, 서브넷 검증·`gateway` 바꾸기는 400 `invalid_subnet`, 빼는 서브넷의 주소를 쓰는 VM이 있으면 409
+         *     `subnet_in_use`(부른 사용자가 읽을 수 없는 VM은 수로만), 옛 노드가 남았으면 409 `cluster_upgrading`. 네트워크를 쓴 뒤
+         *     채우지 못한 VM(그새 바뀜)은 응답 헤더 `orbivisor-warning`으로 알린다.
          */
         patch: operations["patch_network"];
         trace?: never;
@@ -1446,7 +1449,9 @@ export interface paths {
         /**
          * 죽은 노드를 클러스터에서 뺀다. 살아 있는 노드는 그 노드에서 `orbivisorctl cluster leave`로 뺀다.
          *     그 노드에 배정된 VM은 그대로 남는다. VM들의 복제 대상(계획 55)에서는 그 노드를 뺀다. Ceph 데몬(mon·mgr·OSD)
-         *     노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200).
+         *     노드였으면 Orbivisor의 Ceph 기록에서도 빼고(Ceph는 바꾸지 않는다) 손으로 치울 명령을 경고로 돌려준다(200). OVN 중앙
+         *     목록의 노드는 먼저 `sdn central remove`로 빼야 하고(409 `sdn_central_on_node`), 목록 밖의 OVN DB를 가졌던 노드는 지운
+         *     뒤 살아 있는 중앙이 OVN Raft에서 내쫓는다(경고에 그 Task).
          */
         delete: operations["delete_node"];
         options?: never;
@@ -2124,11 +2129,14 @@ export interface paths {
         put?: never;
         post?: never;
         /**
-         * 노드 `node`를 OVN 중앙에서 빼는 `sdn-central-remove` Task(202): NB·SB Raft 클러스터를 떠나고 단위를 멈추고 DB 파일은
-         *     이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙
-         *     더하기가 남긴 멤버)도 같이 떠나게 한다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이 아니면
-         *     400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`, 다른
-         *     중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
+         * 노드 `node`를 OVN 중앙에서 빼는 Task(202). 노드가 온라인이면 그 노드의 `sdn-central-remove`: NB·SB Raft 클러스터를
+         *     떠나고 단위를 멈추고 DB 파일은 이름만 바꾼다(지우지 않음 — chassis 구성은 그대로). 꺼졌거나 클러스터에서 지운
+         *     노드면 살아 있는 다른 중앙의 `sdn-central-kick`: 그 노드의 Raft 주소를 NB·SB 클러스터에서 내쫓고 목록에서 뺀다(리뷰 2
+         *     N-1 — 그 노드의 단위와 DB는 손대지 못한다). 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙 더하기가 남긴
+         *     멤버)와 지운 노드 기록(`strays`)도 같이 받는다(마지막 중앙 검사·짝수 경고 없음). 마지막 중앙은 뺄 수 없다(409
+         *     `sdn_last_central`). 노드가 중앙이 아니면 400(없으면 404), 내쫓을 살아 있는 중앙이 없으면 409 `node_offline`, SDN이
+         *     준비되지 않았으면 409 `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 목록의 중앙을 빼서 짝수가 되면
+         *     응답 헤더 `orbivisor-warning`.
          */
         delete: operations["remove_central"];
         options?: never;
@@ -10355,6 +10363,14 @@ export interface components {
         };
         /** @enum {string} */
         SdnPhase: "bootstrapping" | "ready";
+        /** @description 중앙 목록 밖의 OVN Raft 멤버(일 수 있는 노드) */
+        SdnStrayView: {
+            /** @description 클러스터에서 이미 지운 노드다(살아 있는 중앙이 Raft에서 내쫓는다). */
+            gone?: boolean;
+            name: string;
+            /** Format: uuid */
+            node: string;
+        };
         /** @description 리더 `OvnSync`가 NB에 쓴 마지막 기록 */
         SdnSync: {
             /**
@@ -10401,6 +10417,11 @@ export interface components {
             /** @description 없으면 SDN을 아직 설정하지 않았다(`sdn init` 전). */
             phase?: components["schemas"]["SdnPhase"];
             release?: string;
+            /**
+             * @description 중앙 목록에 없지만 OVN Raft에 남았을 수 있는 노드(이 SDN의 DB를 가진 노드와 클러스터에서 지운 노드 — 리뷰 2
+             *     N-2·웹 I-3). `DELETE /sdn/centrals/{node}`로 뺀다.
+             */
+            strays?: components["schemas"]["SdnStrayView"][];
             sync?: components["schemas"]["SdnSync"];
             /** @description 끝나지 않은 SDN Task */
             tasks: string[];
@@ -11080,6 +11101,13 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "sdn-central-remove";
+        } | {
+            /** Format: ip */
+            address: string;
+            /** @enum {string} */
+            kind: "sdn-central-kick";
+            /** Format: uuid */
+            node: string;
         } | {
             /** @enum {string} */
             kind: "sdn-chassis-install";
@@ -15165,6 +15193,8 @@ export interface operations {
         responses: {
             200: {
                 headers: {
+                    /** @description interfaces that could not get an address (only then) */
+                    "orbivisor-warning"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16878,7 +16908,7 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description node id or name */
+                /** @description node id or name (a deleted node: the name or id `strays` shows) */
                 node: string;
             };
             cookie?: never;

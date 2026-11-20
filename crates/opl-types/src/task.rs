@@ -274,6 +274,13 @@ pub enum TaskOp {
     SdnCentralAdd,
     /// 이 노드를 OVN 중앙에서 뺀다(Raft에서 나가고 단위를 멈춤, DB 파일은 이름만 바꿈). 대상은 `Sdn` 리소스다.
     SdnCentralRemove,
+    /// 꺼졌거나 클러스터에서 지운 노드 `node`(Raft 주소 `address`)를 이 노드(살아 있는 중앙)가 NB·SB Raft 클러스터에서
+    /// 내쫓고(`cluster/kick`) 중앙 목록에서 뺀다(리뷰 2 N-1·N-2). 대상은 `Sdn` 리소스다.
+    SdnCentralKick {
+        node: Uuid,
+        #[cfg_attr(feature = "openapi", schema(value_type = String, format = "ip"))]
+        address: std::net::IpAddr,
+    },
     /// 대상 노드에 OVS·ovn-controller를 설치하고 chassis로 구성한다. 대상은 그 노드다(노드마다 함께 돈다).
     SdnChassisInstall,
 }
@@ -299,6 +306,7 @@ impl TaskOp {
             TaskOp::SdnInit { .. }
                 | TaskOp::SdnCentralAdd
                 | TaskOp::SdnCentralRemove
+                | TaskOp::SdnCentralKick { .. }
                 | TaskOp::SdnChassisInstall
         )
     }
@@ -887,6 +895,17 @@ mod tests {
             (
                 TaskOp::SdnChassisInstall,
                 serde_json::json!({ "kind": "sdn-chassis-install" }),
+            ),
+            (
+                TaskOp::SdnCentralKick {
+                    node: Uuid::nil(),
+                    address: "10.0.0.9".parse().unwrap(),
+                },
+                serde_json::json!({
+                    "kind": "sdn-central-kick",
+                    "node": "00000000-0000-0000-0000-000000000000",
+                    "address": "10.0.0.9"
+                }),
             ),
         ] {
             assert_eq!(serde_json::to_value(&op).unwrap(), json);

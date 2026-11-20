@@ -61,6 +61,7 @@ pub(super) async fn perform(ctx: &Ctx, task: &Task) -> Result<Option<String>, St
         TaskOp::SdnInit { address } => run.init(*address).await,
         TaskOp::SdnCentralAdd => run.add_central().await,
         TaskOp::SdnCentralRemove => run.remove_central().await,
+        TaskOp::SdnCentralKick { node, address } => run.kick(*node, *address).await,
         TaskOp::SdnChassisInstall => run.install_chassis().await,
         op => Err(format!("{op:?} is not an SDN task")),
     }
@@ -369,6 +370,7 @@ impl Run<'_> {
         // 다시 함) 이름만 바꿔 치우고 새로 만든다.
         let established =
             self.status().phase == SdnPhase::Ready || !self.status().centrals.is_empty();
+        let mut stopped = false;
         for db in Db::ALL {
             if established && !self.host.paths().db_file(db).exists() {
                 return Err(format!(
@@ -390,6 +392,12 @@ impl Run<'_> {
                         db.name(),
                         self.name()
                     ));
+                }
+                // 지난 시도가 켠 서버가 아직 그 파일을 쥐었으면 압축(임시 파일을 제자리로 이름 바꾸기)이 새 DB를 덮을 수
+                // 있다(리뷰 2 m-3). 치우기 전에 멈춘다 — 아래 `start`가 새 주소로 다시 켠다.
+                if !stopped {
+                    self.host.stop_central().await.map_err(|e| e.to_string())?;
+                    stopped = true;
                 }
                 let kept = self
                     .host
@@ -607,6 +615,50 @@ impl Run<'_> {
             s.centrals.len() != before
         })
         .await?;
+        Ok(None)
+    }
+
+    /// `sdn-central-kick`: 이 노드(살아 있는 중앙)가 꺼졌거나 지운 노드 `node`(Raft 주소 `address`)를 NB·SB 클러스터에서
+    /// 내쫓고(`cluster/kick`, 목록에서 빠질 때까지 기다림) 중앙 목록과 지운 노드 기록(`departed`)에서 뺀다(리뷰 2 N-1·N-2).
+    /// 마지막 중앙은 내쫓지 않는다. 멤버가 아니었으면(합류를 마치지 못함) 내쫓을 것 없이 기록만 지우고 알린다.
+    async fn kick(&self, node: Uuid, address: IpAddr) -> Result<Option<String>, String> {
+        self.require_slot()?;
+        let centrals = &self.status().centrals;
+        let listed = centrals.iter().any(|c| c.node == node);
+        if listed && centrals.len() <= 1 {
+            return Err("the last OVN central node cannot be removed".into());
+        }
+        if !centrals.iter().any(|c| c.node == self.me.id) {
+            return Err(format!(
+                "node {:?} is not an OVN central and cannot kick another server",
+                self.name()
+            ));
+        }
+        self.stage("kicking-server").await;
+        let mut kicked = Vec::new();
+        for db in Db::ALL {
+            if self
+                .host
+                .kick(db, address)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                kicked.push(db.name());
+            }
+        }
+        update_sdn(&self.ctx.cluster, |s| {
+            let before = (s.centrals.len(), s.departed.len());
+            s.centrals.retain(|c| c.node != node);
+            s.departed.retain(|d| d.node != node);
+            (s.centrals.len(), s.departed.len()) != before
+        })
+        .await?;
+        if kicked.is_empty() {
+            return Ok(Some(format!(
+                "{address} was not a member of the OVN clusters; nothing to kick out"
+            )));
+        }
+        tracing::info!(%node, %address, dbs = ?kicked, "kicked a dead server out of the OVN clusters");
         Ok(None)
     }
 

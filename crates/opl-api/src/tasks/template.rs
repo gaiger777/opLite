@@ -74,11 +74,11 @@ pub(super) async fn flatten(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 /// 되돌리기는 스펙이 이 Task가 쓴 그대로일 때만 한다(다른 쓰기를 덮지 않는다 — 그새 바뀌었으면 크게 실패한다). 쓰기가
 /// 오류를 냈어도(적용됐는지 모름) VM을 다시 읽어 표시가 지워졌으면 다시 본다. 이미 보통 VM이면(끊긴 Task를 다시 하거나
 /// 같은 VM의 다른 되돌리기가 먼저 마쳤다) 다시 보기만 한다.
-pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<(), String> {
+pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<Option<String>, String> {
     let id = task.spec.target;
     let vm = get_vm(ctx, id)?;
     if !vm.spec.template {
-        return recheck_clones(ctx, id, None).await;
+        return recheck_clones(ctx, id, None).await.map(|()| None);
     }
     let (_, volumes) = ctx
         .cluster
@@ -116,33 +116,40 @@ pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<(), String> {
             .map_err(|e| format!("cannot release the base of volume {:?}: {e}", disk.name))?;
     }
     // 다른 쓰기(메모리, 상태)를 덮지 않게 읽은 revision으로 쓴다.
-    let written = loop {
+    let (written, warnings) = loop {
         let vm = get_vm(ctx, id)?;
         if !vm.spec.template {
-            return recheck_clones(ctx, id, None).await;
+            return recheck_clones(ctx, id, None).await.map(|()| None);
         }
         let mut spec = VmSpec {
             template: false,
             ..vm.spec.clone()
         };
-        // 보통 VM이 된 NIC는 SDN 주소를 새로 받는다(계획 65 §9). 빈 주소가 없으면 주소 없이 두고 알린다(`network ips
-        // --fill`로 나중에 채운다).
+        // 보통 VM이 된 NIC는 SDN 주소를 새로 받는다(계획 65 §9). 빈 주소가 없으면 주소 없이 두고 Task 경고로 알린다
+        // (리뷰 2 N-4 — 그 NIC의 OVN 포트는 꺼진다. `network ips --fill`이나 VM 편집으로 나중에 채운다).
         let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
         let (_, networks) = ctx
             .cluster
             .list::<opl_types::network::NetworkSpec>()
             .map_err(|e| e.to_string())?;
         let others: Vec<&opl_types::vm::Vm> = vms.iter().filter(|v| v.id != id).collect();
-        if let Err(e) = crate::ipam::assign_new(&mut spec, &others, &networks) {
-            tracing::warn!(vm = %id, error = %e, "cannot give the untemplated VM SDN addresses; leaving them empty");
-            spec.nics.iter_mut().for_each(|n| n.ips.clear());
-        }
+        let warnings = match crate::ipam::assign_new(&mut spec, &others, &networks) {
+            Ok(notes) => notes,
+            Err(e) => {
+                tracing::warn!(vm = %id, error = %e, "cannot give the untemplated VM SDN addresses; leaving them empty");
+                spec.nics.iter_mut().for_each(|n| n.ips.clear());
+                vec![format!(
+                    "{e}; its SDN interfaces have no address and their OVN ports stay off until they get one \
+                     (`orbivisorctl network ips NETWORK --fill`, or edit the VM)"
+                )]
+            }
+        };
         match ctx
             .cluster
             .update_spec(id, Some(vm.revision), vm.labels.clone(), &spec)
             .await
         {
-            Ok(_) => break spec,
+            Ok(_) => break (spec, warnings),
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
             // 다른 노드가 그새 같은 주소를 잡았다: 다시 고른다.
             Err(e) if crate::ipam::is_ip_taken(&e) => {}
@@ -151,11 +158,12 @@ pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<(), String> {
                 if get_vm(ctx, id)?.spec.template {
                     return Err(format!("cannot record the VM: {e}"));
                 }
-                break spec;
+                break (spec, warnings);
             }
         }
     };
-    recheck_clones(ctx, id, Some(&written)).await
+    recheck_clones(ctx, id, Some(&written)).await?;
+    Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 
 /// 끊긴 되돌리기 Task(`unfinished`)의 다시 보기: 템플릿 표시가 이미 지워졌는데 연결 복제가 남았으면 그 오류다(표시는
