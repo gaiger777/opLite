@@ -73,6 +73,33 @@ async fn physnet_ready(env: &Env) {
         .unwrap();
 }
 
+/// VM을 API로 켜거나 끄고, 조정기가 Mock 하이퍼바이저에서 그렇게 만들 때까지 기다린다(켜면 이 노드에서 돈다).
+async fn power(env: &Env, admin: &common::Client, name: &str, id: uuid::Uuid, on: bool) {
+    let action = if on { "start" } else { "stop" };
+    let (status, body) = admin
+        .post(&format!("/vms/{name}/actions/{action}"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let deadline = std::time::Instant::now() + common::WAIT;
+    loop {
+        let vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+        let done = if on {
+            vm.status.phase == VmPhase::Running && vm.status.node == Some(env.node)
+        } else {
+            vm.status.phase == VmPhase::Stopped
+        };
+        if done {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{name} {action}: {:?}",
+            vm.status
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// 노드 `sdn`을 쓴다(`PUT /nodes/{key}`, 다른 칸은 그대로).
 async fn put_node_sdn(
     env: &Env,
@@ -225,27 +252,9 @@ async fn node_sdn_settings() {
         "{body}"
     );
     let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
-    // 이 노드에서 도는 것으로 적는다. 시험의 조정기가 느린 노드(svc01)에서 상태를 고쳐 쓸 수 있으므로, 409가
-    // 나올 때까지 적고 다시 묻는다(한도 안에서).
-    let mut tries = 0;
-    let (status, body) = loop {
-        let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
-        vm.status.node = Some(env.node);
-        vm.status.phase = VmPhase::Running;
-        env.cluster
-            .update_status::<VmSpec>(id, &vm.status)
-            .await
-            .unwrap();
-        let (status, body) = put_node_sdn(&env, &admin, Some(json!({ "gateway": 100 }))).await;
-        tries += 1;
-        if status == StatusCode::CONFLICT || tries >= 20 {
-            break (status, body);
-        }
-        // 상태가 덮여 PUT이 받아들여졌다 — physnet을 되돌리고 다시 해 본다.
-        let (status, body) = put_node_sdn(&env, &admin, Some(set.clone())).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    };
+    // 정말 켠다: 상태를 직접 적으면 조정기가 스펙(꺼짐)대로 고쳐 쓴다.
+    power(&env, &admin, "web", id, true).await;
+    let (status, body) = put_node_sdn(&env, &admin, Some(json!({ "gateway": 100 }))).await;
     code(status, &body, StatusCode::CONFLICT, "physnet_in_use");
     assert_eq!(body["details"]["vms"], json!(["web"]), "{body}");
     // 리뷰 1 #3: 같은 physnet의 브리지를 바꾸는 것도 도는 VM을 다른 L2로 옮기므로 막는다.
@@ -265,12 +274,7 @@ async fn node_sdn_settings() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
-    vm.status.phase = VmPhase::Stopped;
-    env.cluster
-        .update_status::<VmSpec>(id, &vm.status)
-        .await
-        .unwrap();
+    power(&env, &admin, "web", id, false).await;
     let (status, body) = put_node_sdn(&env, &admin, Some(json!({}))).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["spec"].get("sdn").is_none(), "{body}");
@@ -1314,13 +1318,7 @@ async fn review2_provider_nics_router_owners_and_gateway_bridges() {
     );
 
     // I-3: 게이트웨이 후보이고 분산 유동 IP의 VM이 도는 노드는 physnet 브리지를 바꾸지 못한다(빼기는 된다).
-    let mut vm = env.cluster.get::<VmSpec>(q_id).unwrap().unwrap();
-    vm.status.node = Some(env.node);
-    vm.status.phase = VmPhase::Running;
-    env.cluster
-        .update_status::<VmSpec>(q_id, &vm.status)
-        .await
-        .unwrap();
+    power(&env, &admin, "q", q_id, true).await;
     let (status, body) = put_node_sdn(
         &env,
         &admin,
