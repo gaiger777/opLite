@@ -47,6 +47,10 @@ pub enum RuntimeStatus {
     Running,
     /// 기동 직후 `cont` 전이거나 일시정지된 상태
     Paused,
+    /// QMP를 오래 붙잡는 작업(메모리 스냅샷 저장·불러오기, 스냅샷 지우기)이 도는 중이다. QEMU는 그
+    /// 작업이 끝날 때까지 QMP에 답하지 않으므로 상태를 묻지 않고 이것을 알린다. 값은 작업 이름이다.
+    /// 응답 없음(`Other("unresponsive")`)과 달리 다시 붙거나 끄지 않고, 다른 QMP 요청도 보내지 않는다.
+    Busy(&'static str),
     Other(String),
 }
 

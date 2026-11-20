@@ -189,6 +189,20 @@ pub struct QemuHypervisor {
     incoming_ports: tokio::sync::Mutex<()>,
     /// QMP로 붙은 복제 받는 QEMU(회차별)
     receivers: Mutex<HashMap<Uuid, Arc<Receiver>>>,
+    /// QMP를 오래 붙잡는 작업이 도는 VM과 그 작업 이름([`RuntimeStatus::Busy`], [`Self::busy`]).
+    busy: Mutex<HashMap<Uuid, &'static str>>,
+}
+
+/// [`QemuHypervisor::busy`]가 돌려주는 표시. 버리면(작업이 끝나거나 실패하거나 취소되면) 지운다.
+struct BusyGuard<'a> {
+    map: &'a Mutex<HashMap<Uuid, &'static str>>,
+    id: Uuid,
+}
+
+impl Drop for BusyGuard<'_> {
+    fn drop(&mut self) {
+        self.map.lock().unwrap().remove(&self.id);
+    }
 }
 
 /// 복제 회차 하나를 받는 QEMU(`-machine none`)
@@ -246,6 +260,7 @@ impl QemuHypervisor {
             pausing: Mutex::default(),
             incoming_ports: tokio::sync::Mutex::new(()),
             receivers: Mutex::default(),
+            busy: Mutex::default(),
         };
         hv.remove_dead_receiver_dirs();
         for entry in std::fs::read_dir(&vm_run_dir)? {
@@ -511,6 +526,7 @@ impl QemuHypervisor {
         if let Some(tag) = restore {
             // -S로 멈춘 채 불러온 뒤 cont로 이어서 실행한다. 메모리 상태는 첫 디스크(disk0)에 있다.
             let devices: Vec<String> = (0..vm.disks.len()).map(|i| format!("disk{i}")).collect();
+            let busy = self.busy(vm.id, "snapshot-load");
             let load = job(
                 handle
                     .qmp
@@ -518,6 +534,7 @@ impl QemuHypervisor {
                 "QMP snapshot-load",
             )
             .await;
+            drop(busy);
             if let Err(e) = load {
                 drop(handle);
                 // 작업이 끝나지 않았으면 QMP가 답하지 않을 수 있으므로 끝날 때까지 기다리고 필요하면 죽인다.
@@ -909,6 +926,23 @@ impl QemuHypervisor {
         serve_replicas(&receiver.qmp, &tls, exports, host, ports).await
     }
 
+    /// VM `id`에서 QMP를 오래 붙잡는 작업 `op`을 시작한다. QEMU는 메모리 스냅샷 저장·불러오기와 스냅샷
+    /// 지우기 작업을 BQL을 쥔 채 주 루프에서 하므로 끝날 때까지 QMP에 아무것도 답하지 않는다. 표시가 있는
+    /// 동안 상태 조회는 QMP를 묻지 않고 [`RuntimeStatus::Busy`]를 알린다(응답 없음으로 보이지 않게,
+    /// 답하지 않을 요청이 쌓이지 않게). 작업의 제한 시간(`SNAPSHOT_TIMEOUT`)을 넘겨 돌아오면 표시가
+    /// 사라지므로 그 뒤로 QEMU가 여전히 답하지 않으면 다시 응답 없음이다.
+    fn busy(&self, id: Uuid, op: &'static str) -> BusyGuard<'_> {
+        self.busy.lock().unwrap().insert(id, op);
+        BusyGuard {
+            map: &self.busy,
+            id,
+        }
+    }
+
+    fn busy_with(&self, id: Uuid) -> Option<&'static str> {
+        self.busy.lock().unwrap().get(&id).copied()
+    }
+
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
         let Some(handle) = self.handle(id) else {
             // 살아 있지만 QMP에 붙지 못한 VM도 드러내야 reconciler가 놓치지 않는다.
@@ -924,6 +958,14 @@ impl QemuHypervisor {
                 )))),
             };
         };
+        // QMP를 붙잡는 작업 중이다. 물어도 작업이 끝날 때까지 답이 없다. QEMU가 죽으면 모니터가 등록을 푼다.
+        if let Some(op) = self.busy_with(id) {
+            return Ok(Some(ActualState {
+                id,
+                pid: handle.pid,
+                status: RuntimeStatus::Busy(op),
+            }));
+        }
         let status = match tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await {
             Err(_) => return Err(DriverError::Timeout("QMP query-status")),
             Ok(Ok(RunState::Running)) => RuntimeStatus::Running,
@@ -1130,6 +1172,7 @@ impl Hypervisor for QemuHypervisor {
             let save = handle
                 .qmp
                 .snapshot_save(tag, vmstate, &devices, SNAPSHOT_TIMEOUT);
+            let _busy = self.busy(id, "snapshot-save");
             job(save, "QMP snapshot-save").await?;
             Ok(Quiesced::No)
         } else {
@@ -1443,6 +1486,7 @@ impl Hypervisor for QemuHypervisor {
             return Ok(());
         }
         let delete = handle.qmp.snapshot_delete(tag, &devices, SNAPSHOT_TIMEOUT);
+        let _busy = self.busy(id, "snapshot-delete");
         job(delete, "QMP snapshot-delete").await
     }
 
@@ -2496,6 +2540,10 @@ impl Hypervisor for QemuHypervisor {
 
     async fn repin(&self, id: Uuid, pin: &RuntimePinning) -> Result<usize, DriverError> {
         let handle = self.running_handle(id)?;
+        // QMP를 붙잡는 작업 중에는 vCPU 스레드를 물을 수 없다. 다음 차례(30초 뒤)에 본다.
+        if self.busy_with(id).is_some() {
+            return Ok(0);
+        }
         let mut changed = 0;
         // 스코프를 먼저: cpuset이 좁아지면 커널이 스레드 친화를 그 안으로 자른다.
         if self.config.systemd_scope
@@ -7867,6 +7915,35 @@ time.sleep(60)
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, ["uefi-vars.fd"]);
+    }
+
+    /// 메모리 스냅샷 저장 중의 QEMU는 작업이 끝날 때까지 QMP에 답하지 않는다(BQL). 그동안 상태 조회는
+    /// QMP를 묻지 않고 곧바로 `Busy`를 알린다(묻는다면 `QMP_TIMEOUT` 뒤 응답 없음이다). 작업을 그만두면
+    /// (제한 시간, 취소) 표시가 사라진다.
+    #[tokio::test]
+    async fn memory_snapshot_reports_busy_without_asking_qmp() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let hv = Arc::new(hv);
+        *fake.delay.lock().unwrap() = Some(("snapshot-save", Duration::from_secs(30)));
+        let save = tokio::spawn({
+            let hv = hv.clone();
+            async move { hv.snapshot_save(id, "s", true, false).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while hv.busy_with(id).is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "save did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let busy = RuntimeStatus::Busy("snapshot-save");
+        let asked = tokio::time::Instant::now();
+        assert_eq!(hv.inspect(id).await.unwrap().unwrap().status, busy);
+        assert_eq!(hv.list().await.unwrap()[0].status, busy);
+        assert!(asked.elapsed() < Duration::from_secs(1));
+
+        save.abort();
+        let _ = save.await;
+        assert_eq!(hv.busy_with(id), None);
     }
 
     /// 플리싱 필터를 끼우려고 게스트를 멈춘 동안은 지금 멈춰 둔 VM으로 둔다(그 사이 다시 붙기·`resume_left_stopped`가

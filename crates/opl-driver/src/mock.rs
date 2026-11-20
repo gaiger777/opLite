@@ -232,8 +232,12 @@ struct MockState {
     hold_next_start: bool,
     /// 다음 `snapshot_save`·`snapshot_delete` 한 번을 실패시킬 오류
     fail_next_snapshot: Option<DriverError>,
-    /// 다음 `snapshot_save` 한 번을 VM이 꺼질 때까지 멈춘다.
+    /// 다음 `snapshot_save` 한 번을 VM이 꺼지거나 `release_snapshot_save`까지 멈춘다.
     hang_next_save: bool,
+    /// 멈춘 `snapshot_save`를 놓아준다.
+    release_save: bool,
+    /// QMP를 붙잡는 작업(멈춘 `snapshot_save`)이 도는 VM과 그 작업 이름
+    busy: HashMap<Uuid, &'static str>,
     /// 살아 있지만 QMP로 다룰 수 없는 VM
     unresponsive: HashSet<Uuid>,
     /// SIGKILL에도 끝나지 않는(D 상태) VM. `stop(Kill)`이 시간 초과로 실패한다.
@@ -446,10 +450,16 @@ impl MockHypervisor {
         self.state.lock().unwrap().fail_next_snapshot = Some(err);
     }
 
-    /// 다음 `snapshot_save` 한 번이 VM이 꺼질 때까지 끝나지 않게 한다. 실제 QEMU의 메모리 저장처럼
+    /// 다음 `snapshot_save` 한 번이 VM이 꺼지거나 [`Self::release_snapshot_save`]까지 끝나지 않게 한다.
+    /// 실제 QEMU의 메모리 저장처럼 그동안 조회는 `Busy("snapshot-save")`이고 ACPI 요청은 시간 초과다.
     /// 그동안 VM을 강제로 끄면 QMP가 끊긴 오류로 실패하고 태그를 남기지 않는다.
     pub fn hang_next_snapshot_save(&self) {
         self.state.lock().unwrap().hang_next_save = true;
+    }
+
+    /// 멈춘 `snapshot_save`를 끝낸다(스냅샷을 만든다).
+    pub fn release_snapshot_save(&self) {
+        self.state.lock().unwrap().release_save = true;
     }
 
     /// 멈춘 `snapshot_save`가 들어올 때까지 기다린다.
@@ -1258,6 +1268,8 @@ impl MockHypervisor {
     fn state_of(st: &MockState, id: Uuid, pid: u32) -> ActualState {
         let status = if st.unresponsive.contains(&id) {
             RuntimeStatus::Other("unresponsive".into())
+        } else if let Some(op) = st.busy.get(&id) {
+            RuntimeStatus::Busy(op)
         } else if let Some(status) = st.statuses.get(&id) {
             status.clone()
         } else if let Some(status) = st.migration_status.get(&id) {
@@ -1348,6 +1360,10 @@ impl Hypervisor for MockHypervisor {
             // 테스트가 `guest_shutdown`으로 일으킨다. 에이전트가 답하지 않으면 ACPI로 넘어간다.
             StopMode::Acpi | StopMode::Agent => {
                 let mut st = self.state.lock().unwrap();
+                // QMP를 붙잡는 작업 중인 QEMU는 ACPI 요청에 답하지 않는다.
+                if st.vms.contains_key(&id) && st.busy.contains_key(&id) {
+                    return Err(DriverError::Timeout("QMP system_powerdown"));
+                }
                 if st.vms.contains_key(&id) {
                     let sent = match mode {
                         StopMode::Agent if Self::agent_session(&st, id).is_ok() => StopMode::Agent,
@@ -1411,11 +1427,26 @@ impl Hypervisor for MockHypervisor {
             std::mem::take(&mut st.hang_next_save)
         };
         if hang {
+            self.state.lock().unwrap().busy.insert(id, "snapshot-save");
             self.save_reached.notify_one();
-            while self.state.lock().unwrap().vms.contains_key(&id) {
+            loop {
+                let released = {
+                    let mut st = self.state.lock().unwrap();
+                    if !st.vms.contains_key(&id) {
+                        st.busy.remove(&id);
+                        return Err(DriverError::Qmp(QmpError::Disconnected));
+                    }
+                    let released = std::mem::take(&mut st.release_save);
+                    if released {
+                        st.busy.remove(&id);
+                    }
+                    released
+                };
+                if released {
+                    break;
+                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            return Err(DriverError::Qmp(QmpError::Disconnected));
         }
         let mut st = self.state.lock().unwrap();
         st.snapshots

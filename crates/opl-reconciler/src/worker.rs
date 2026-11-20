@@ -876,7 +876,13 @@ impl Worker {
                 {
                     hw.host_placement = Some(mine);
                 }
-                if state.status != RuntimeStatus::Running
+                let busy = matches!(state.status, RuntimeStatus::Busy(_));
+                if let RuntimeStatus::Busy(op) = &state.status {
+                    // QMP를 붙잡는 작업(메모리 스냅샷 등) 중이다. 응답 없음이 아니므로 다시 붙거나 이어서
+                    // 실행하지 않고 오류도 남기지 않는다. 작업이 끝나면 다시 본다.
+                    tracing::debug!(vm = %self.id, op, "VM is busy; checking again later");
+                    self.wake(now + self.config.retry_interval);
+                } else if state.status != RuntimeStatus::Running
                     && let Some(reason) = self.ha_blocked(vm)
                 {
                     // 멈춘 HA VM(넘겨받은 마이그레이션 등)은 리스가 있어야 이어서 실행한다.
@@ -944,7 +950,7 @@ impl Worker {
                         }
                     }
                 }
-                if self.disks_shared && status.last_error.is_none() {
+                if self.disks_shared && status.last_error.is_none() && !busy {
                     self.exclusive_disks(vm).await;
                 }
                 if vm.spec.ha_active() && status.last_error.is_none() {
@@ -1045,6 +1051,14 @@ impl Worker {
                         status.pid = None;
                         status.hardware = None;
                         return Ok(status);
+                    }
+                    // QMP를 붙잡는 작업(메모리 스냅샷 등) 중이면 ACPI 요청도 닿지 않는다. 요청을 보내지도
+                    // acpi_timeout을 세지도 않고(끝나면 ACPI부터 다시) 강제 종료로 넘어가지 않는다. 사용자가
+                    // 요청한 강제 정지(위)와 HA 리스를 잃은 강제 종료(`fence`)는 그대로 한다.
+                    _ if matches!(state.status, RuntimeStatus::Busy(_)) => {
+                        tracing::info!(vm = %self.id, status = ?state.status, "VM is busy; stopping it after the operation");
+                        self.stop_requested = None;
+                        self.wake(now + self.config.retry_interval);
                     }
                     None => {
                         // 요청이 실패해도(QMP로 다룰 수 없는 VM) acpi_timeout 뒤 강제 종료한다. 에이전트로 끄기로 했고

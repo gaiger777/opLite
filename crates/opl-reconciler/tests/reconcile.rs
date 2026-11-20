@@ -253,6 +253,54 @@ async fn unresponsive_vm_is_reattached_and_reported() {
     assert_eq!(env.pid(vm.id).await, pid);
 }
 
+/// 메모리 스냅샷처럼 QMP를 붙잡는 작업 중인 VM은 응답 없는 VM이 아니다(CI에서 느린 디스크의 메모리 저장).
+/// 재동기화가 여러 번 지나도 응답 없음으로 알리지 않고, 끄라고 해도 acpi_timeout을 몇 번 넘기도록 ACPI도
+/// 강제 종료도 하지 않는다(응답 없는 VM은 acpi_timeout 뒤 강제 종료 — 위 시험). 작업이 끝나면 ACPI부터 끈다.
+#[tokio::test]
+async fn busy_vm_is_neither_unresponsive_nor_forced_off() {
+    let env = Env::start_with(|c| c.resync_interval = Duration::from_millis(100)).await;
+    let vm = vm("web", env.node);
+    env.create(&vm).await;
+    let pid = env.wait(vm.id, "running", running).await.status.pid;
+
+    env.hv.hang_next_snapshot_save();
+    let hv = env.hv.clone();
+    let id = vm.id;
+    let save = tokio::spawn(async move { hv.snapshot_save(id, "s", true, false).await });
+    env.hv.snapshot_save_reached().await;
+    assert_eq!(
+        env.hv.inspect(vm.id).await.unwrap().map(|s| s.status),
+        Some(opl_driver::RuntimeStatus::Busy("snapshot-save"))
+    );
+
+    // 재동기화(0.1초)가 여러 번 지나도 실행 중 그대로이고 오류가 없다.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let got = env.wait(vm.id, "running", running).await;
+    assert_eq!(got.status.last_error, None);
+    assert_eq!(got.status.pid, pid);
+
+    // 끄라고 해도 작업 중에는 ACPI를 보내지 않고 acpi_timeout(0.3초)을 넘겨도 강제로 끄지 않는다.
+    env.set_power(vm.id, PowerState::Stopped).await;
+    env.wait(vm.id, "stopping", |v| v.status.phase == VmPhase::Stopping)
+        .await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(env.pid(vm.id).await, pid, "VM was stopped while busy");
+    assert!(env.hv.stop_requests(vm.id).is_empty());
+    let got = env
+        .wait(vm.id, "stopping", |v| v.status.phase == VmPhase::Stopping)
+        .await;
+    assert_eq!(got.status.last_error, None);
+
+    // 작업이 끝나면 스냅샷은 만들어지고 보통 종료(ACPI, 게스트가 무시하면 acpi_timeout 뒤 강제)로 끈다.
+    env.hv.release_snapshot_save();
+    save.await.unwrap().unwrap();
+    assert_eq!(env.hv.snapshots(vm.id), vec![("s".to_string(), true)]);
+    env.wait(vm.id, "stopped", |v| v.status.phase == VmPhase::Stopped)
+        .await;
+    assert_eq!(env.hv.stop_requests(vm.id), vec![StopMode::Acpi]);
+    assert_eq!(env.pid(vm.id).await, None);
+}
+
 /// 멈춘 채 남은 VM(표시가 있는 `pause`)은 디스크를 다시 해석하지 않고 이어서 실행한다(LVM이
 /// 응답하지 않아도 된다). 지금 `pause`해 둔 VM은 그대로 두고 응답하지 않는다고 알리지 않는다.
 #[tokio::test]

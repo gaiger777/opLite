@@ -454,6 +454,13 @@ impl Frozen {
         Self(Some(pid))
     }
 
+    /// 이어서 실행한다. 그 뒤로는 지키지 않는다.
+    fn thaw(&mut self) {
+        if let Some(pid) = self.0.take() {
+            kill_process(pid, Signal::CONT).unwrap();
+        }
+    }
+
     /// opld가 끝낸 프로세스는 더 지키지 않는다.
     async fn wait_gone(&mut self) {
         let pid = self.0.unwrap();
@@ -525,6 +532,69 @@ async fn force_stop_during_memory_snapshot_fails_it() {
     assert!(tags(&file).is_empty());
 
     d.ctl(&["vm", "delete", "web"]).await.unwrap();
+    d.ctl(&["volume", "delete", "root"]).await.unwrap();
+    d.stop();
+}
+
+/// 메모리 저장 중의 QEMU는 저장이 끝날 때까지 QMP에 답하지 않는다(느린 디스크에서는 몇 분). 작업자의
+/// 재동기화(30초)와 QMP 제한 시간을 넘겨도 응답 없는 VM으로 알리지 않고 끄지 않는다. 저장이 끝나면
+/// 스냅샷이 만들어지고 VM은 같은 QEMU로 계속 돈다(CI의 브라우저 e2e에서 저장이 느렸던 일).
+#[tokio::test]
+async fn slow_memory_snapshot_is_not_reported_unresponsive() {
+    let mut d = Daemon::new("node1", "");
+    let file = setup(&mut d).await;
+    let c = client(&d);
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "4096", "--disk", "root", "--start",
+    ])
+    .await
+    .unwrap();
+    let pid = vm(&c).await["status"]["pid"].as_u64().unwrap();
+    let size = std::fs::metadata(&file).unwrap().len();
+    let create = c
+        .post("/vms/web/snapshots", &json!({ "name": "mem" }))
+        .await
+        .unwrap();
+
+    // 메모리 상태를 쓰기 시작하면 QEMU를 멈춰 저장을 붙잡는다(아주 느린 디스크처럼).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while std::fs::metadata(&file).unwrap().len() == size {
+        assert!(
+            Instant::now() < deadline,
+            "memory state was not written:\n{}",
+            d.log()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut frozen = Frozen::new(pid);
+    assert!(
+        tags(&file).is_empty(),
+        "snapshot finished before QEMU was frozen"
+    );
+
+    // 재동기화 한 번(30초)과 QMP 제한 시간(5초)을 넘게 지켜본다.
+    let watch = Instant::now() + Duration::from_secs(40);
+    while Instant::now() < watch {
+        let v = vm(&c).await;
+        assert_eq!(v["status"]["phase"], "running", "{v}");
+        assert_eq!(v["status"]["pid"], pid, "{v}");
+        assert_eq!(v["status"]["last_error"], Value::Null, "{v}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(!d.log().contains("VM is unresponsive"), "{}", d.log());
+
+    frozen.thaw();
+    c.wait_task(&create).await.unwrap();
+    assert_eq!(snapshot(&c, "mem").await["status"]["phase"], "ready");
+    assert_eq!(tags(&file).len(), 1);
+    let v = vm(&c).await;
+    assert_eq!(v["status"]["phase"], "running", "{v}");
+    assert_eq!(v["status"]["pid"], pid, "{v}");
+
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&["vm", "delete", "web", "--with-snapshots"])
+        .await
+        .unwrap();
     d.ctl(&["volume", "delete", "root"]).await.unwrap();
     d.stop();
 }

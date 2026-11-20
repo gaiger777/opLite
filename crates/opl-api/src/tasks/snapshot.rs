@@ -343,6 +343,9 @@ async fn needs_pause(ctx: &Ctx, vm: Uuid) -> Result<bool, String> {
             RuntimeStatus::Other(s) if s == "unresponsive" => {
                 Err("VM is not responding; it cannot be paused for block snapshots".into())
             }
+            RuntimeStatus::Busy(op) => Err(format!(
+                "VM is busy ({op}); it cannot be paused for block snapshots"
+            )),
             _ => Ok(false),
         },
         Ok(None) => Err("VM is no longer running".into()),
