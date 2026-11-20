@@ -9,7 +9,9 @@
 //! 네트워크는 `/sdn`·`/networks` API와 orbivisorctl로 만든다(스테이지 6). 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM tap이 br-int에 붙어 이 chassis에 바인딩되는지, 클라우드
 //! 이미지(`OPL_TEST_CLOUD_IMAGE`, 있으면)의 게스트가 OVN DHCP로 IPAM 주소를 받는지 본다. 러너 하나는 OVS 하나라 두 chassis
 //! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험). 계획 66 스테이지 2: 노드 physnet(관리자 Linux 브리지
-//! `oplext0`에 veth·OVS 브리지·`ovn-bridge-mappings`, 게이트웨이 표시)과 그 localnet 데이터 길, 빼기 청소를 본다.
+//! `oplext0`에 veth·OVS 브리지·`ovn-bridge-mappings`, 게이트웨이 표시)과 그 localnet 데이터 길, 빼기 청소를 본다. 계획 66
+//! 스테이지 3: OvnSync가 쓴 공급자 네트워크의 localnet 포트, 라우터(동서 라우팅·DHCP 기본 경로), 게이트웨이 chassis의 SNAT·
+//! 유동 IP, 외부에서 들어오는 큰 패킷(MTU 탐침), RA(SLAAC)·상태 있는 DHCPv6를 물리 망 이름공간 `ext`와 견준다.
 //! `sudo -E env "PATH=$PATH" cargo test -p opld --features sdn-it --test sdn -- --nocapture`
 //! Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하다. OVN이 설치되지 않은 호스트여야 하고 시험은
 //! 호스트에 OVN 꾸러미와 데몬을 남긴다(CI 러너용).
@@ -107,6 +109,7 @@ impl Drop for Diagnostics {
             ],
         );
         show("ovn-sbctl", &["--db=unix:/run/opl/ovn/sb.sock", "show"]);
+        show("ovn-nbctl", &["--db=unix:/run/opl/ovn/nb.sock", "show"]);
         show(
             "systemctl",
             &[
@@ -854,10 +857,10 @@ async fn orbivisord_sets_up_ovn() {
     Box::pin(binding_section(&d, &tag, &node)).await;
 
     // 9. physnet 연결(계획 66 스테이지 2): 관리자 Linux 브리지 `oplext0`에 veth로 Orbivisor OVS 브리지를 잇고
-    // `ovn-bridge-mappings`·`ovn-cms-options`를 쓴다(남의 항목은 둔다). 손으로 만든 NB 스위치(주인 표시 없음 — OvnSync가 보지
-    // 않음)의 localnet 포트로 이름공간 "VM"이 물리 망 이름공간 `ext`에 ping한다. veth가 사라지면(재부팅) 다시 만들고, 빼면
-    // 내 것만 다 치운다.
-    Box::pin(physnet_section(&d, &tag)).await;
+    // `ovn-bridge-mappings`·`ovn-cms-options`를 쓴다(남의 항목은 둔다). Orbivisor 공급자 네트워크(스테이지 3 — OvnSync의
+    // localnet 포트)로 이름공간 "VM"이 물리 망 이름공간 `ext`에 ping한다. veth가 사라지면(재부팅) 다시 만든다. 라우터·SNAT·
+    // 유동 IP·IPv6(스테이지 3)를 본 뒤, 빼면 내 것만 다 치운다.
+    Box::pin(physnet_section(&d, &tag, &node)).await;
 }
 
 /// 제어 소켓의 시험 고리(`POST /v1/test/…`)
@@ -907,7 +910,98 @@ fn set_ovs_id(key: &str, value: &str) {
     );
 }
 
-async fn physnet_section(d: &Daemon, tag: &str) {
+/// 시험 고리로 리소스를 만들거나 바꾸고(`spec`이 null이면 지움) id를 돌려준다(스테이지 5 전 — API가 아직 막는다).
+async fn put(d: &Daemon, kind: &str, name: &str, spec: Value) -> String {
+    let http = reqwest::Client::builder()
+        .unix_socket(d.path("opld.sock"))
+        .build()
+        .unwrap();
+    let resp = http
+        .post("http://opld/v1/test/put")
+        .json(&json!({ "kind": kind, "name": name, "spec": spec }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "put {kind} {name}: {status} {text}");
+    serde_json::from_str::<Value>(&text)
+        .unwrap()
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// `ovn-nbctl --bare get …`(없거나 실패하면 빈 글). 식별자가 아닌 글(숫자로 시작하는 UUID 따위)의 따옴표는 뗀다.
+fn nb_get(args: &[&str]) -> String {
+    let mut all = vec!["--db=unix:/run/opl/ovn/nb.sock", "--bare", "get"];
+    all.extend_from_slice(args);
+    let (ok, out, _) = try_run("ovn-nbctl", &all);
+    if ok {
+        out.trim().trim_matches('"').to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 이름공간 `ns`에서 ping(`extra`는 앞에 붙는 인자)
+fn ping_from(ns: &str, extra: &[&str], to: &str) -> bool {
+    let mut all = vec!["netns", "exec", ns, "ping"];
+    all.extend_from_slice(extra);
+    all.extend_from_slice(&["-c", "2", "-W", "2", to]);
+    try_run("ip", &all).0
+}
+
+/// 이름공간 `ns`의 장치 `dev`에서 `filter`에 맞는 패킷 하나를 기다리며 `action`을 한다. tcpdump가 없으면 None.
+fn captured(ns: &str, dev: &str, filter: &str, action: impl FnOnce()) -> Option<bool> {
+    if !try_run("which", &["tcpdump"]).0 {
+        eprintln!("tcpdump is not installed; not capturing {filter}");
+        return None;
+    }
+    let mut args = vec![
+        "netns", "exec", ns, "timeout", "15", "tcpdump", "-n", "-l", "-c", "1", "-i", dev,
+    ];
+    args.extend(filter.split(' '));
+    let child = Command::new("ip")
+        .args(&args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    action();
+    let out = child.wait_with_output().unwrap();
+    eprintln!(
+        "tcpdump {filter}: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(out.status.success() && !out.stdout.is_empty())
+}
+
+/// API로 꺼진 VM(NIC 하나, `network`)을 만들고 (id, MAC, IPAM 주소, 논리 포트)
+async fn api_vm(d: &Daemon, name: &str, network: &str) -> (String, String, String, String) {
+    let vm = client(d)
+        .post(
+            "/vms",
+            &json!({ "name": name, "spec": {
+                "cpu": { "cores": 1 }, "memory_mib": 256,
+                "nics": [{ "network": network, "model": "virtio" }]
+            } }),
+        )
+        .await
+        .unwrap();
+    let id = vm["id"].as_str().unwrap().to_string();
+    let mac = vm["spec"]["nics"][0]["mac"].as_str().unwrap().to_string();
+    let ip = vm["spec"]["nics"][0]["ips"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let port = format!("opl-{id}-{}", mac.replace(':', ""));
+    (id, mac, ip, port)
+}
+
+async fn physnet_section(d: &Daemon, tag: &str, node: &str) {
     let (o, b, x) = opl_types::sdn::physnet_ifnames(tag, "ext");
     // 관리자 망: Linux 브리지와 "물리 라우터" 이름공간
     let _ = try_run("ip", &["netns", "del", "ext"]);
@@ -961,8 +1055,10 @@ async fn physnet_section(d: &Daemon, tag: &str) {
             "ovs-vsctl",
             &["get", "Bridge", &x, &format!("external_ids:{TAG_KEY}")]
         )
-        .trim(),
-        quote(tag)
+        .trim()
+        // ovs-vsctl는 식별자 같은 글을 따옴표 없이 찍는다(모두 숫자인 태그는 따옴표).
+        .trim_matches('"'),
+        tag
     );
     assert_eq!(
         run(
@@ -996,30 +1092,43 @@ async fn physnet_section(d: &Daemon, tag: &str) {
     let ovs_ports = run("ovs-vsctl", &["list-ports", &x]);
     assert!(ovs_ports.lines().any(|p| p == o), "{ovs_ports}");
 
-    // 데이터 길: 손으로 만든 스위치(주인 표시 없음)의 localnet 포트로 물리 망에 닿는다.
+    // 데이터 길: Orbivisor 공급자 네트워크 `ext`(스테이지 3 — OvnSync가 쓴 localnet 포트)로 물리 망에 닿는다. 이름공간
+    // "VM"은 그 스위치에 손으로 넣은 포트(주인 표시 없음 — OvnSync가 두는 남의 포트)다.
+    let ext = put(
+        d,
+        "network",
+        "ext",
+        json!({ "sdn": { "provider": { "physnet": "ext" } }, "subnets": [{
+            "cidr": "203.0.113.0/24", "gateway": "203.0.113.1",
+            "floating_pools": [{ "start": "203.0.113.100", "end": "203.0.113.199" }]
+        }] }),
+    )
+    .await;
+    let ln = format!("opl-ln-{ext}");
+    wait_for("the localnet port of ext", AGENT_WAIT, || async {
+        nb_rows(d, tag).await.ports.iter().any(|p| p.name == ln)
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    let port = rows.ports.iter().find(|p| p.name == ln).unwrap();
+    assert_eq!(port.kind, "localnet", "{port:?}");
+    assert_eq!(port.addresses, ["unknown"]);
+    assert_eq!(port.options["network_name"], "ext");
+    assert_eq!(port.tag, None);
+    // 공급자 서브넷의 DHCP는 기본 꺼짐
+    assert!(
+        !rows
+            .dhcp
+            .iter()
+            .any(|r| r.external_ids.get("orbivisor:id") == Some(&ext)),
+        "{:?}",
+        rows.dhcp
+    );
     let nb = |args: &[&str]| ovn_bare("ovn-nbctl", "nb", args);
+    let ext_switch = format!("opl-{ext}");
     nb(&[
-        "ls-add",
-        "probe-ext",
-        "--",
         "lsp-add",
-        "probe-ext",
-        "probe-ln",
-        "--",
-        "lsp-set-type",
-        "probe-ln",
-        "localnet",
-        "--",
-        "lsp-set-addresses",
-        "probe-ln",
-        "unknown",
-        "--",
-        "lsp-set-options",
-        "probe-ln",
-        "network_name=ext",
-        "--",
-        "lsp-add",
-        "probe-ext",
+        &ext_switch,
         "probe-vm",
         "--",
         "lsp-set-addresses",
@@ -1067,14 +1176,27 @@ async fn physnet_section(d: &Daemon, tag: &str) {
     })
     .await;
     assert_eq!(ovs_id("ovn-bridge-mappings"), format!("lab:br-lab,ext:{x}"));
-
-    // 빼기: 내 매핑 항목·veth·OVS 브리지·게이트웨이 낱말만 사라지고 남의 것은 남는다.
+    // OvnSync는 남의 포트를 두었다.
+    assert!(
+        nb(&["lsp-list", &ext_switch]).contains("probe-vm"),
+        "the foreign port is gone"
+    );
     let _ = try_run(
         "ovs-vsctl",
         &["--if-exists", "del-port", "br-int", "oplphys0"],
     );
     let _ = try_run("ip", &["netns", "del", "oplphys"]);
-    nb(&["ls-del", "probe-ext"]);
+    nb(&["lsp-del", "probe-vm"]);
+
+    // 10. 라우터·SNAT·유동 IP·IPv6(스테이지 3)
+    Box::pin(routing_section(d, tag, node)).await;
+
+    // 빼기: 내 매핑 항목·veth·OVS 브리지·게이트웨이 낱말만 사라지고 남의 것은 남는다.
+    put(d, "network", "ext", Value::Null).await;
+    wait_for("ext's switch to go", AGENT_WAIT, || async {
+        !has_switch(&nb_rows(d, tag).await, &ext_switch)
+    })
+    .await;
     hook(d, "node-sdn", json!({ "sdn": null })).await;
     wait_for("physnet ext to go", AGENT_WAIT, || async {
         let me = d.ctl_json(&["node", "get", "node1"]).await;
@@ -1565,5 +1687,411 @@ async fn binding_section(d: &Daemon, tag: &str, node: &str) {
     d.ctl(&["vm", "delete", "sdn-guest"]).await.unwrap();
     if image.is_some() {
         d.ctl(&["volume", "delete", "noble"]).await.unwrap();
+    }
+}
+
+/// 계획 66 스테이지 3: 오버레이 둘을 잇는 라우터(외부 = 공급자 네트워크 `ext`, 게이트웨이 = 이 노드)와 이름공간 "VM"들.
+/// 동서 ping, DHCP 기본 경로, SNAT(`ext`는 10.x로 가는 경로가 없으므로 답이 오는 것이 곧 주소 바꾸기다), 중앙 유동 IP(꺼진
+/// VM이라 chassis가 없다 — 분산은 OvnSync 시험과 여러 노드 작업), 큰 패킷 탐침, RA·DHCPv6.
+async fn routing_section(d: &Daemon, tag: &str, node: &str) {
+    let nb = |args: &[&str]| ovn_bare("ovn-nbctl", "nb", args);
+    let t1 = sdn_network(d, "rt-t1", &["--subnet", "10.10.0.0/24"]).await;
+    let t2 = sdn_network(d, "rt-t2", &["--subnet", "10.20.0.0/24"]).await;
+    let a = api_vm(d, "rt-a", "rt-t1").await;
+    let b = api_vm(d, "rt-b", "rt-t2").await;
+    assert_eq!(a.2, "10.10.0.2");
+    assert_eq!(b.2, "10.20.0.2");
+    let router = |interfaces: &[&str], external: Value| {
+        let interfaces: Vec<Value> = interfaces.iter().map(|n| json!({ "network": n })).collect();
+        let mut spec = json!({ "interfaces": interfaces });
+        if !external.is_null() {
+            spec["external"] = external;
+        }
+        spec
+    };
+    let external = json!({ "network": "ext", "ips": ["203.0.113.50"] });
+    let r1 = put(
+        d,
+        "router",
+        "r1",
+        router(&["rt-t1", "rt-t2"], external.clone()),
+    )
+    .await;
+    let gw = format!("opl-gw-{r1}");
+    wait_for("the gateway port to be hosted here", AGENT_WAIT, || async {
+        let hosting = nb_get(&["Logical_Router_Port", &gw, "status:hosting-chassis"]);
+        eprintln!("hosting-chassis of {gw}: {hosting:?}");
+        hosting == node
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    eprintln!("routers: {:?}\nnat: {:?}", rows.routers, rows.nat);
+    assert_eq!(rows.ha_chassis.len(), 1);
+    assert_eq!(rows.ha_chassis[0].chassis_name, node);
+    assert_eq!(rows.ha_chassis[0].priority, 32767);
+    let mut snat: Vec<(&str, &str, &str)> = rows
+        .nat
+        .iter()
+        .map(|n| {
+            (
+                n.kind.as_str(),
+                n.external_ip.as_str(),
+                n.logical_ip.as_str(),
+            )
+        })
+        .collect();
+    snat.sort();
+    assert_eq!(
+        snat,
+        [
+            ("snat", "203.0.113.50", "10.10.0.0/24"),
+            ("snat", "203.0.113.50", "10.20.0.0/24")
+        ]
+    );
+    for (net, gw_ip) in [(&t1, "10.10.0.1"), (&t2, "10.20.0.1")] {
+        let dhcp = rows
+            .dhcp
+            .iter()
+            .find(|r| r.external_ids.get("orbivisor:id") == Some(net))
+            .unwrap();
+        assert_eq!(dhcp.options["router"], gw_ip, "{dhcp:?}");
+    }
+
+    // 이름공간 "VM" 둘: DHCP로 주소·기본 경로
+    let script = d.path("udhcpc-route.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in\nbound|renew)\n  ip addr flush dev \"$interface\"\n  ip addr add \"$ip/$mask\" dev \"$interface\"\n  [ -n \"$mtu\" ] && ip link set \"$interface\" mtu \"$mtu\"\n  [ -n \"$router\" ] && ip route replace default via \"$router\"\n  echo \"$ip $mask $mtu $router\" > \"{}.$interface\"\n  ;;\nesac\n",
+            d.path("rlease").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    run("chmod", &["755", &script.to_string_lossy()]);
+    for (i, (vm, gw_ip)) in [(&a, "10.10.0.1"), (&b, "10.20.0.1")].iter().enumerate() {
+        let (ns, dev) = (format!("oplrt{i}"), format!("oplrt{i}d"));
+        namespace_port(&ns, &dev, &vm.3, &vm.1);
+        let out = d.path(&format!("rlease.{dev}"));
+        wait_for(&format!("a DHCP lease in {ns}"), AGENT_WAIT, || async {
+            udhcpc(&ns, &dev, &script, &out)
+        })
+        .await;
+        let lease = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(lease.trim(), format!("{} 24 1442 {gw_ip}", vm.2));
+    }
+    // 동서(분산 라우팅): 서로 다른 오버레이 사이
+    wait_for("a ping across the router", AGENT_WAIT, || async {
+        ping_from("oplrt0", &[], &b.2)
+    })
+    .await;
+    assert!(ping_from("oplrt1", &[], &a.2), "ping {} -> {}", b.2, a.2);
+    // SNAT: `ext`에는 10.x로 가는 경로가 없다.
+    assert!(
+        !ping_from("ext", &[], &a.2),
+        "ext reached a private address"
+    );
+    wait_for(
+        "a ping to the physical router through SNAT",
+        AGENT_WAIT,
+        || async { ping_from("oplrt0", &[], "203.0.113.1") },
+    )
+    .await;
+    let seen = captured("ext", "oplexti", "icmp and src host 203.0.113.50", || {
+        assert!(ping_from("oplrt1", &[], "203.0.113.1"));
+    });
+    assert_ne!(seen, Some(false), "ext did not see the router's address");
+
+    // 유동 IP(중앙): 밖에서 들어오고, 나가는 패킷의 보낸 주소가 유동 IP다.
+    put(
+        d,
+        "floating-ip",
+        "fip1",
+        json!({ "network": "ext", "address": "203.0.113.120",
+                "target": { "vm": a.0, "mac": a.1 } }),
+    )
+    .await;
+    wait_for("the floating IP NAT row", AGENT_WAIT, || async {
+        nb_rows(d, tag)
+            .await
+            .nat
+            .iter()
+            .any(|n| n.kind == "dnat_and_snat" && n.external_ip == "203.0.113.120")
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    let fip = rows.nat.iter().find(|n| n.kind == "dnat_and_snat").unwrap();
+    assert_eq!(fip.logical_ip, a.2);
+    // 꺼진 VM이라 chassis가 없어 중앙이다.
+    assert_eq!(fip.external_mac, None, "{fip:?}");
+    wait_for("a ping to the floating IP", AGENT_WAIT, || async {
+        ping_from("ext", &[], "203.0.113.120")
+    })
+    .await;
+    let seen = captured("ext", "oplexti", "icmp and src host 203.0.113.120", || {
+        assert!(ping_from("oplrt0", &[], "203.0.113.1"));
+    });
+    assert_ne!(seen, Some(false), "ext did not see the floating IP");
+    // 큰 패킷 탐침(설계 §9.1): 밖(1500)에서 DF로 안(1442)으로
+    let (ok, out, err) = try_run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            "ext",
+            "ping",
+            "-M",
+            "do",
+            "-s",
+            "1472",
+            "-c",
+            "3",
+            "-W",
+            "2",
+            "203.0.113.120",
+        ],
+    );
+    eprintln!("PROBE large DF ping ext -> floating IP: ok={ok}\n{out}{err}");
+    show(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            "ext",
+            "ip",
+            "route",
+            "get",
+            "203.0.113.120",
+        ],
+    );
+    // 떼면 SNAT로 돌아간다.
+    put(
+        d,
+        "floating-ip",
+        "fip1",
+        json!({ "network": "ext", "address": "203.0.113.120" }),
+    )
+    .await;
+    wait_for("the floating IP NAT row to go", AGENT_WAIT, || async {
+        !nb_rows(d, tag)
+            .await
+            .nat
+            .iter()
+            .any(|n| n.kind == "dnat_and_snat")
+    })
+    .await;
+    assert!(ping_from("oplrt0", &[], "203.0.113.1"));
+    let seen = captured("ext", "oplexti", "icmp and src host 203.0.113.50", || {
+        assert!(ping_from("oplrt0", &[], "203.0.113.1"));
+    });
+    assert_ne!(
+        seen,
+        Some(false),
+        "ext did not see the router's address again"
+    );
+
+    // IPv6: SLAAC(RA)와 상태 있는 DHCPv6. 이름공간 포트는 손으로 넣는다(EUI-64 IPAM은 스테이지 5).
+    let t6 = put(
+        d,
+        "network",
+        "rt-t6",
+        json!({ "sdn": {}, "subnets": [
+            { "cidr": "10.60.0.0/24" },
+            { "cidr": "fd00:60::/64", "ipv6_mode": "slaac", "dns_servers": ["fd00:60::53"] }
+        ] }),
+    )
+    .await;
+    let t7 = put(
+        d,
+        "network",
+        "rt-t7",
+        json!({ "sdn": {}, "subnets": [
+            { "cidr": "10.70.0.0/24" },
+            { "cidr": "fd00:70::/64", "ipv6_mode": "dhcpv6-stateful" }
+        ] }),
+    )
+    .await;
+    put(
+        d,
+        "router",
+        "r1",
+        router(&["rt-t1", "rt-t2", "rt-t6", "rt-t7"], external.clone()),
+    )
+    .await;
+    let lrp6 = format!("opl-lrp-{t6}");
+    wait_for("the RA config of rt-t6", AGENT_WAIT, || async {
+        nb_get(&["Logical_Router_Port", &lrp6, "ipv6_ra_configs:address_mode"]) == "slaac"
+    })
+    .await;
+    let mac6: opl_types::vm::MacAddr = "02:00:00:00:66:06".parse().unwrap();
+    let eui = opl_types::ipam::eui64("fd00:60::".parse().unwrap(), mac6);
+    nb(&[
+        "lsp-add",
+        &format!("opl-{t6}"),
+        "probe-v6",
+        "--",
+        "lsp-set-addresses",
+        "probe-v6",
+        &format!("{mac6} 10.60.0.50 {eui}"),
+    ]);
+    let sysctl = |ns: &str, key: &str| {
+        run("ip", &["netns", "exec", ns, "sysctl", "-qw", key]);
+    };
+    let ns6 = "oplrt6";
+    let _ = try_run("ip", &["netns", "del", ns6]);
+    run("ip", &["netns", "add", ns6]);
+    for key in [
+        "net.ipv6.conf.default.accept_ra=2",
+        "net.ipv6.conf.default.autoconf=1",
+        "net.ipv6.conf.default.use_tempaddr=0",
+        "net.ipv6.conf.default.addr_gen_mode=0",
+    ] {
+        sysctl(ns6, key);
+    }
+    run(
+        "ovs-vsctl",
+        &[
+            "--may-exist",
+            "add-port",
+            "br-int",
+            "oplrt6d",
+            "--",
+            "set",
+            "Interface",
+            "oplrt6d",
+            "type=internal",
+            "external_ids:iface-id=probe-v6",
+        ],
+    );
+    run("ip", &["link", "set", "oplrt6d", "netns", ns6]);
+    let in6 = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", ns6, "ip"];
+        all.extend_from_slice(args);
+        run("ip", &all)
+    };
+    in6(&["link", "set", "oplrt6d", "address", &mac6.to_string()]);
+    in6(&["link", "set", "lo", "up"]);
+    in6(&["link", "set", "oplrt6d", "up"]);
+    wait_for(
+        "a SLAAC address and default route from RA",
+        AGENT_WAIT,
+        || async {
+            let addr = in6(&["-6", "addr", "show", "dev", "oplrt6d"]);
+            let route = in6(&["-6", "route", "show", "default"]);
+            addr.contains(&eui.to_string()) && route.contains("via fe80::")
+        },
+    )
+    .await;
+    eprintln!(
+        "RA: {}{}",
+        in6(&["-6", "addr", "show", "dev", "oplrt6d"]),
+        in6(&["-6", "route"])
+    );
+    wait_for("a ping6 to the router port", AGENT_WAIT, || async {
+        ping_from(ns6, &["-6"], "fd00:60::1")
+    })
+    .await;
+
+    // 상태 있는 DHCPv6: 손으로 넣은 포트에 우리 DHCPv6 행을 단다.
+    let rows = nb_rows(d, tag).await;
+    let d6 = rows
+        .dhcp
+        .iter()
+        .find(|r| r.external_ids.get("orbivisor:id") == Some(&t7) && r.cidr == "fd00:70::/64")
+        .unwrap_or_else(|| panic!("no DHCPv6 row: {:?}", rows.dhcp));
+    eprintln!("DHCPv6 row: {d6:?}");
+    nb(&[
+        "lsp-add",
+        &format!("opl-{t7}"),
+        "probe-d6",
+        "--",
+        "lsp-set-addresses",
+        "probe-d6",
+        "02:00:00:00:66:07 10.70.0.50 fd00:70::50",
+        "--",
+        "lsp-set-dhcpv6-options",
+        "probe-d6",
+        &d6.uuid,
+    ]);
+    namespace_port("oplrt7", "oplrt7d", "probe-d6", "02:00:00:00:66:07");
+    let (has_udhcpc6, _, _) = try_run("busybox", &["udhcpc6", "--help"]);
+    if has_udhcpc6 {
+        let s6 = d.path("udhcpc6.sh");
+        std::fs::write(
+            &s6,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\nbound|renew)\n  echo \"$ipv6\" > \"{}\"\n  ;;\nesac\n",
+                d.path("lease6").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        run("chmod", &["755", &s6.to_string_lossy()]);
+        let out6 = d.path("lease6");
+        wait_for("a DHCPv6 lease", AGENT_WAIT, || async {
+            let (ok, o, e) = try_run(
+                "ip",
+                &[
+                    "netns",
+                    "exec",
+                    "oplrt7",
+                    "busybox",
+                    "udhcpc6",
+                    "-i",
+                    "oplrt7d",
+                    "-f",
+                    "-q",
+                    "-n",
+                    "-t",
+                    "5",
+                    "-T",
+                    "1",
+                    "-s",
+                    &s6.to_string_lossy(),
+                ],
+            );
+            eprintln!("udhcpc6: ok={ok}\n{o}{e}");
+            ok && out6.exists()
+        })
+        .await;
+        let lease = std::fs::read_to_string(&out6).unwrap();
+        // udhcpc6는 주소를 줄이지 않고 찍는다.
+        let got: std::net::Ipv6Addr = lease.trim().parse().unwrap();
+        assert_eq!(got, "fd00:70::50".parse::<std::net::Ipv6Addr>().unwrap());
+    } else {
+        eprintln!("PROBE busybox has no udhcpc6; the stateful DHCPv6 lease was not checked");
+    }
+
+    // 치우기: 이름공간, 손으로 넣은 포트, 유동 IP·라우터·네트워크·VM. OvnSync가 우리 라우터 행을 모두 지운다.
+    for (ns, dev) in [
+        ("oplrt0", "oplrt0d"),
+        ("oplrt1", "oplrt1d"),
+        (ns6, "oplrt6d"),
+        ("oplrt7", "oplrt7d"),
+    ] {
+        let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
+        let _ = try_run("ip", &["netns", "del", ns]);
+    }
+    nb(&["lsp-del", "probe-v6", "--", "lsp-del", "probe-d6"]);
+    put(d, "floating-ip", "fip1", Value::Null).await;
+    put(d, "router", "r1", Value::Null).await;
+    wait_for("the router rows to go", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        rows.routers.is_empty()
+            && rows.router_ports.is_empty()
+            && rows.ha_groups.is_empty()
+            && rows.ha_chassis.is_empty()
+            && rows.nat.is_empty()
+            && rows.routes.is_empty()
+            && !rows.ports.iter().any(|p| p.kind == "router")
+    })
+    .await;
+    let c = client(d);
+    for vm in [&a, &b] {
+        c.delete(&format!("/vms/{}", vm.0)).await.unwrap();
+    }
+    for name in ["rt-t6", "rt-t7"] {
+        put(d, "network", name, Value::Null).await;
+    }
+    for name in ["rt-t1", "rt-t2"] {
+        d.ctl(&["network", "delete", name]).await.unwrap();
     }
 }

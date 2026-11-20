@@ -1276,6 +1276,25 @@ async fn cloud_init_of_sdn_nics_uses_the_subnets() {
         seed.instance_id,
         render(vm.id, "web", &ci, &vm.spec.nics).instance_id
     );
+    // 라우터 인터페이스가 되면(계획 66) 고정 주소에 게이트웨이가 붙고 instance-id는 그대로다.
+    let router: opl_types::router::Router = Resource::new(
+        "r1",
+        serde_json::from_value(serde_json::json!({ "interfaces": [{ "network": "tenant" }] }))
+            .unwrap(),
+    );
+    cluster.create(&router).await.unwrap();
+    let routed = resolve(&cluster, &vm, node, Path::new(MNT))
+        .await
+        .unwrap()
+        .cloud_init
+        .unwrap();
+    let net: serde_json::Value =
+        serde_json::from_str(routed.network_config.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        net["config"][1]["subnets"],
+        serde_json::json!([{ "type": "static", "address": "10.0.0.5/24", "gateway": "10.0.0.1" }])
+    );
+    assert_eq!(routed.instance_id, seed.instance_id);
     // SDN NIC는 br-int의 tap이고 논리 포트 이름(OVS iface-id)을 단다. user NIC는 그대로다.
     let mac = vm.spec.nics[1].mac.unwrap();
     assert_eq!(spec.nics[0].backend, NicBackend::User);

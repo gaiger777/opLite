@@ -5,16 +5,24 @@
 //! 이름(`opl-<네트워크 id>`), 포트는 이름(`Logical_Switch_Port.name`은 표에서 하나), DHCP_Options는 (네트워크 id,
 //! CIDR)로 짝짓는다. 포트는 스위치의 강한 참조로만 살아 있으므로(뿌리 표가 아님) 포트를 넣는 연산과 스위치의 `ports`를
 //! 바꾸는 연산은 한 트랜잭션에 둔다 — 그래서 나누는 단위가 네트워크다.
+//!
+//! 계획 66: 라우터마다 한 묶음(`Logical_Router`·라우터 포트·정적 경로·NAT·`HA_Chassis_Group`). 라우터 포트·경로·NAT·
+//! `HA_Chassis`도 뿌리가 아니라 라우터·그룹의 강한 참조로만 산다. 묶음 차례는 네트워크 → 라우터 → 지울 스위치 → 지울
+//! 라우터(그 그룹과 함께) → 지울 DHCP 행이다.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::IpAddr;
 
 use opl_driver::ovn::ovsdb::{
     cond, map_value, named_uuid, parse_bool, parse_int, parse_map, parse_strings, parse_uuids,
     set_value, string_set, uuid_value,
 };
+use opl_types::floating_ip::FloatingIp;
 use opl_types::ipam;
-use opl_types::network::{Network, Subnet};
+use opl_types::network::{Ipv6Mode, Network, Subnet};
 use opl_types::node::Node;
+use opl_types::router::{Router, RouterExternal};
+use opl_types::sdn::{gateway_ranking, router_mac};
 use opl_types::vm::{PowerState, Vm, VmPhase};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
@@ -29,6 +37,10 @@ pub const NAME_KEY: &str = "orbivisor:name";
 pub const FOLDER_KEY: &str = "orbivisor:folder";
 /// DHCP_Options의 서브넷 CIDR
 pub const SUBNET_KEY: &str = "orbivisor:subnet";
+/// 라우터 id(라우터 포트·경로·스위치의 라우터 포트 짝)
+pub const ROUTER_KEY: &str = "orbivisor:router";
+/// 유동 IP id(`dnat_and_snat` NAT)
+pub const FIP_KEY: &str = "orbivisor:fip";
 
 /// `NB_Global.external_ids`의 펜싱 토큰 키(`"<term>:<index>"`)
 pub fn fence_key(tag: &str) -> String {
@@ -46,10 +58,104 @@ pub fn switch_name(id: Uuid) -> String {
     format!("opl-{id}")
 }
 
-/// 바라는 NB 행(스위치마다 그 포트와 DHCP 행). 같은 입력이면 같은 값이다(스위치는 네트워크 id 순).
+/// 라우터 `id`의 논리 라우터 이름
+pub fn router_name(id: Uuid) -> String {
+    format!("opl-r-{id}")
+}
+
+/// 라우터 인터페이스(네트워크 `network`)의 라우터 포트 이름
+pub fn router_port_name(network: Uuid) -> String {
+    format!("opl-lrp-{network}")
+}
+
+/// 라우터 인터페이스의 스위치 쪽 짝(`type=router`)
+pub fn router_switch_port_name(network: Uuid) -> String {
+    format!("opl-rsp-{network}")
+}
+
+/// 라우터 `router`의 분산 게이트웨이 포트(DGP) 이름
+pub fn gateway_port_name(router: Uuid) -> String {
+    format!("opl-gw-{router}")
+}
+
+/// DGP의 공급자 스위치 쪽 짝
+pub fn gateway_switch_port_name(router: Uuid) -> String {
+    format!("opl-rgw-{router}")
+}
+
+/// 라우터 `router`의 `HA_Chassis_Group` 이름
+pub fn ha_group_name(router: Uuid) -> String {
+    format!("opl-ha-{router}")
+}
+
+/// 공급자 네트워크 `network`의 localnet 포트 이름
+pub fn localnet_port_name(network: Uuid) -> String {
+    format!("opl-ln-{network}")
+}
+
+/// 바라는 NB 행(스위치마다 그 포트와 DHCP 행, 라우터마다 그 포트·경로·NAT·HA 그룹). 같은 입력이면 같은 값이다(스위치는
+/// 네트워크 id 순, 라우터는 라우터 id 순).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NbState {
     pub switches: Vec<SwitchRow>,
+    pub routers: Vec<RouterRow>,
+}
+
+/// 논리 라우터 하나(Router 하나, 계획 66 §9.1)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterRow {
+    pub router: Uuid,
+    pub name: String,
+    pub options: BTreeMap<String, String>,
+    pub external_ids: BTreeMap<String, String>,
+    pub ports: Vec<RouterPortRow>,
+    pub routes: Vec<RouteRow>,
+    pub nat: Vec<NatRow>,
+    /// 게이트웨이 후보가 있을 때만
+    pub ha: Option<HaGroupRow>,
+}
+
+/// 라우터 포트 하나(인터페이스 또는 DGP)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterPortRow {
+    pub name: String,
+    pub mac: String,
+    pub networks: Vec<String>,
+    pub enabled: Option<bool>,
+    /// 라우터의 `HA_Chassis_Group`을 가리킨다(DGP).
+    pub gateway: bool,
+    pub options: BTreeMap<String, String>,
+    pub ipv6_ra_configs: BTreeMap<String, String>,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+/// 정적 경로 하나
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteRow {
+    pub ip_prefix: String,
+    pub nexthop: String,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+/// NAT 하나(`snat`·`dnat_and_snat`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NatRow {
+    pub kind: String,
+    pub external_ip: String,
+    pub logical_ip: String,
+    /// 분산 유동 IP의 NIC 논리 포트
+    pub logical_port: Option<String>,
+    /// 분산 유동 IP의 NIC MAC
+    pub external_mac: Option<String>,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+/// `HA_Chassis_Group` 하나와 그 chassis(이름 = 노드 UUID, 우선순위)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HaGroupRow {
+    pub name: String,
+    pub chassis: Vec<(String, u16)>,
+    pub external_ids: BTreeMap<String, String>,
 }
 
 /// 논리 스위치 하나(SDN 네트워크 하나)
@@ -62,15 +168,21 @@ pub struct SwitchRow {
     pub dhcp: Vec<DhcpRow>,
 }
 
-/// 논리 스위치 포트 하나(VM NIC 하나, 스테이지 4)
+/// 논리 스위치 포트 하나(VM NIC 하나, 스테이지 4 — 계획 66부터 localnet·router 포트도)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortRow {
     pub name: String,
+    /// `type`(VM NIC는 빈 글, `localnet`, `router`)
+    pub kind: String,
     pub addresses: Vec<String>,
     pub port_security: Vec<String>,
     /// 이 스위치의 DHCP 행(CIDR)
     pub dhcpv4: Option<String>,
+    /// 이 스위치의 DHCPv6 행(CIDR)
+    pub dhcpv6: Option<String>,
     pub enabled: Option<bool>,
+    /// localnet 포트의 VLAN
+    pub tag: Option<u16>,
     pub options: BTreeMap<String, String>,
     pub external_ids: BTreeMap<String, String>,
 }
@@ -98,9 +210,9 @@ pub const LEASE_TIME: u32 = 86400;
 pub use opl_types::sdn::port_name;
 
 /// IPv4 서브넷 `subnet`(네트워크 `network`)의 DHCP_Options 칸(§8.3): 서버 주소 = 게이트웨이, 서버 MAC, 임대 시간, 망 MTU,
-/// DNS 서버(IPv4만, 있을 때). `router`는 넣지 않는다 — 65에는 라우터가 없고, 단순 네트워크 NIC를 함께 쓰는 VM의 기본
-/// 경로를 빼앗지 않게(66이 라우터에 붙은 서브넷에만 넣는다).
-fn dhcp_options(network: &Network, subnet: &Subnet) -> BTreeMap<String, String> {
+/// DNS 서버(IPv4만, 있을 때). `routed`(라우터 인터페이스이거나 공급자 네트워크 — 계획 66 §9.2)일 때만 `router`(= 게이트웨이)를
+/// 넣는다. 라우터가 없는 오버레이 네트워크는 단순 네트워크 NIC를 함께 쓰는 VM의 기본 경로를 빼앗지 않게 넣지 않는다.
+fn dhcp_options(network: &Network, subnet: &Subnet, routed: bool) -> BTreeMap<String, String> {
     let mut options = BTreeMap::from([
         ("server_id".to_string(), subnet.gateway().to_string()),
         (
@@ -109,6 +221,9 @@ fn dhcp_options(network: &Network, subnet: &Subnet) -> BTreeMap<String, String> 
         ),
         ("lease_time".to_string(), LEASE_TIME.to_string()),
     ]);
+    if routed {
+        options.insert("router".into(), subnet.gateway().to_string());
+    }
     if let Some(mtu) = network.spec.mtu() {
         options.insert("mtu".into(), mtu.to_string());
     }
@@ -124,10 +239,60 @@ fn dhcp_options(network: &Network, subnet: &Subnet) -> BTreeMap<String, String> 
     options
 }
 
-/// VM의 포트를 바인딩할 chassis(노드 UUID)와 추가 chassis가 열릴 때를 기다릴 패킷. 노드에서 돌거나 켜지는 중이면 그
-/// 노드, 라이브 마이그레이션 중이면 `"원본,대상"`과 `rarp`(QEMU가 끝에 보내는 RARP가 대상을 연다), 꺼져 있으면 없다.
-/// 클러스터에 없는 노드는 적지 않는다.
-fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static str>) {
+/// IPv6 서브넷 `subnet`의 DHCPv6 칸(계획 66 §10, `ipv6_mode`가 `dhcpv6-*`일 때): 서버 id(DUID-LL) = 서버 MAC, DNS 서버(IPv6만),
+/// 상태 없음이면 `dhcpv6_stateless`(주소는 주지 않음)
+fn dhcpv6_options(network: &Network, subnet: &Subnet, mode: Ipv6Mode) -> BTreeMap<String, String> {
+    let mut options = BTreeMap::from([(
+        "server_id".to_string(),
+        ipam::server_mac(network.id).to_string(),
+    )]);
+    let dns: Vec<String> = subnet
+        .dns_servers
+        .iter()
+        .filter(|ip| !ip.is_ipv4())
+        .map(ToString::to_string)
+        .collect();
+    if !dns.is_empty() {
+        options.insert("dns_server".into(), format!("{{{}}}", dns.join(", ")));
+    }
+    if mode == Ipv6Mode::Dhcpv6Stateless {
+        options.insert("dhcpv6_stateless".into(), "true".into());
+    }
+    options
+}
+
+/// DHCPv6 행을 두는 서브넷의 모드(`dhcpv6-stateful`·`dhcpv6-stateless`)
+fn dhcpv6_mode(subnet: &Subnet) -> Option<Ipv6Mode> {
+    subnet
+        .ipv6_mode
+        .filter(|m| matches!(m, Ipv6Mode::Dhcpv6Stateful | Ipv6Mode::Dhcpv6Stateless))
+        .filter(|_| !subnet.is_ipv4())
+}
+
+/// 라우터 포트의 RA 칸(계획 66 §10): 주소 모드, 주기적으로 보냄, MTU(1280 이상만 — OVN이 그보다 작은 값을 넣지 않는다),
+/// `rdnss`(서브넷 IPv6 DNS 서버의 첫 하나 — OVN은 하나만 받는다)
+fn ra_configs(network: &Network, subnet: &Subnet, mode: Ipv6Mode) -> BTreeMap<String, String> {
+    let address_mode = match mode {
+        Ipv6Mode::Slaac => "slaac",
+        Ipv6Mode::Dhcpv6Stateful => "dhcpv6_stateful",
+        Ipv6Mode::Dhcpv6Stateless => "dhcpv6_stateless",
+    };
+    let mut ra = BTreeMap::from([
+        ("address_mode".to_string(), address_mode.to_string()),
+        ("send_periodic".to_string(), "true".to_string()),
+    ]);
+    if let Some(mtu) = network.spec.mtu().filter(|m| *m >= 1280) {
+        ra.insert("mtu".into(), mtu.to_string());
+    }
+    if let Some(dns) = subnet.dns_servers.iter().find(|ip| !ip.is_ipv4()) {
+        ra.insert("rdnss".into(), dns.to_string());
+    }
+    ra
+}
+
+/// VM의 포트를 바인딩할 chassis(노드)들: 노드에서 돌거나 켜지는 중이면 그 노드, 라이브 마이그레이션 중이면 원본과 대상,
+/// 꺼져 있으면 없다. 클러스터에 없는 노드는 적지 않는다.
+fn chassis_nodes(vm: &Vm, nodes: &BTreeSet<Uuid>) -> Vec<Uuid> {
     let active = matches!(
         vm.status.phase,
         VmPhase::Starting | VmPhase::Running | VmPhase::Stopping | VmPhase::Migrating
@@ -141,7 +306,7 @@ fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static 
         None
     };
     let Some(here) = here.filter(|n| nodes.contains(n)) else {
-        return (None, None);
+        return Vec::new();
     };
     match vm
         .status
@@ -149,20 +314,144 @@ fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static 
         .as_ref()
         .filter(|m| active && nodes.contains(&m.node))
     {
-        Some(m) if m.node != here => (Some(format!("{here},{}", m.node)), Some("rarp")),
-        _ => (Some(here.to_string()), None),
+        Some(m) if m.node != here => vec![here, m.node],
+        _ => vec![here],
     }
 }
 
-/// 클러스터 `tag`의 바라는 NB 상태(§8.3): SDN 네트워크마다 논리 스위치, 그 네트워크의 DHCP를 켠 IPv4 서브넷마다
-/// DHCP_Options, 템플릿이 아닌 VM의 그 네트워크 NIC마다(전원과 상관없이) 논리 포트(주소·포트 보안 = `"MAC IP4 IP6"`,
-/// 주소가 없으면 `"MAC"` — 그때 네트워크에 서브넷이 있으면 `enabled = false`, IPv4 주소의 서브넷이 DHCP면 그 DHCP 행,
-/// `requested-chassis`). `nodes`는 클러스터의 노드다.
+/// VM의 포트를 바인딩할 chassis(노드 UUID)와 추가 chassis가 열릴 때를 기다릴 패킷. 노드에서 돌거나 켜지는 중이면 그
+/// 노드, 라이브 마이그레이션 중이면 `"원본,대상"`과 `rarp`(QEMU가 끝에 보내는 RARP가 대상을 연다), 꺼져 있으면 없다.
+fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static str>) {
+    match chassis_nodes(vm, nodes).as_slice() {
+        [] => (None, None),
+        [here] => (Some(here.to_string()), None),
+        [here, to, ..] => (Some(format!("{here},{to}")), Some("rarp")),
+    }
+}
+
+/// 공급자 네트워크(physnet `physnet`)로 나가는 라우터의 게이트웨이 후보(계획 66 §9.3): 게이트웨이 우선순위가 있고, 유지보수가
+/// 아니며, 그 physnet이 `ready`인 노드와 그 우선순위. chassis 살아 있음은 보지 않는다(OVN이 BFD로 고른다).
+fn gateway_candidates(nodes: &[Node], physnet: &str) -> Vec<(Uuid, u16)> {
+    nodes
+        .iter()
+        .filter(|n| !n.spec.maintenance)
+        .filter_map(|n| {
+            let priority = n.spec.sdn.as_ref()?.gateway?;
+            n.status.sdn.as_ref().filter(|s| s.physnet_ready(physnet))?;
+            Some((n.id, priority))
+        })
+        .collect()
+}
+
+/// 쓸 수 있는 라우터 하나: 인터페이스(오버레이 SDN, 서브넷 있음, 다른 라우터가 먼저 갖지 않음), 외부(공급자 네트워크와
+/// 그 서브넷 안의 외부 주소 `"주소/접두사"`), 게이트웨이 순위
+struct RouterPlan<'a> {
+    router: &'a Router,
+    interfaces: Vec<&'a Network>,
+    external: Option<External<'a>>,
+}
+
+struct External<'a> {
+    network: &'a Network,
+    spec: &'a RouterExternal,
+    /// `"주소/접두사"`(DGP의 `networks`)
+    addresses: Vec<String>,
+    /// `(노드, HA_Chassis.priority)`. 비면 DGP를 닫고 NAT를 쓰지 않는다.
+    gateways: Vec<(Uuid, u16)>,
+}
+
+impl External<'_> {
+    fn enabled(&self) -> bool {
+        !self.gateways.is_empty()
+    }
+
+    /// 체계가 IPv4인 외부 주소
+    fn ipv4(&self) -> Option<IpAddr> {
+        self.spec
+            .ips
+            .iter()
+            .copied()
+            .find(|ip| ip.is_ipv4() && ipam::nic_subnet(&self.network.spec, *ip).is_some())
+    }
+}
+
+/// 클러스터 `tag`의 바라는 NB 상태(§8.3): 라우터·유동 IP가 없는 [`desired_routing`]이다(계획 65의 행 그대로).
 pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> NbState {
+    desired_routing(networks, vms, nodes, &[], &[], tag)
+}
+
+/// 클러스터 `tag`의 바라는 NB 상태(계획 65 §8.3, 계획 66 §8~10): SDN 네트워크마다 논리 스위치, 그 네트워크의 DHCP를 켠 IPv4
+/// 서브넷([`NetworkSpec::subnet_dhcp`])과 `dhcpv6-*` IPv6 서브넷마다 DHCP_Options, 템플릿이 아닌 VM의 그 네트워크 NIC마다
+/// (전원과 상관없이) 논리 포트(주소·포트 보안 = `"MAC IP4 IP6"`, 주소가 없으면 `"MAC"` — 그때 네트워크에 서브넷이 있으면
+/// `enabled = false`, 주소의 서브넷이 DHCP면 그 DHCP 행, `requested-chassis`), 공급자 네트워크면 `localnet` 포트, 라우터
+/// 인터페이스면 `router` 포트. 라우터마다 `Logical_Router`(인터페이스 포트, 외부가 있으면 분산 게이트웨이 포트와
+/// `HA_Chassis_Group`, 정적 경로와 기본 경로, SNAT·유동 IP NAT). `nodes`는 클러스터의 노드다. 라우터·유동 IP·공급자
+/// 네트워크·`ipv6_mode`가 없으면 계획 65와 같은 행이다.
+pub fn desired_routing(
+    networks: &[Network],
+    vms: &[Vm],
+    nodes: &[Node],
+    routers: &[Router],
+    floating_ips: &[FloatingIp],
+    tag: &str,
+) -> NbState {
     let node_ids: BTreeSet<Uuid> = nodes.iter().map(|n| n.id).collect();
-    let mut switches: Vec<SwitchRow> = networks
+    let sdn: BTreeMap<&str, &Network> = networks
         .iter()
         .filter(|n| n.spec.is_sdn())
+        .map(|n| (n.name.as_str(), n))
+        .collect();
+
+    // 라우터(id 순). 한 네트워크는 라우터 하나에만 붙는다(Raft 겹침 키가 지키고, 여기서는 먼저 온 라우터가 갖는다).
+    let mut sorted: Vec<&Router> = routers.iter().collect();
+    sorted.sort_by_key(|r| r.id);
+    let mut owner: BTreeMap<&str, Uuid> = BTreeMap::new();
+    let plans: Vec<RouterPlan> = sorted
+        .into_iter()
+        .map(|r| {
+            let mut interfaces = Vec::new();
+            for i in &r.spec.interfaces {
+                let Some(n) = sdn.get(i.network.as_str()).copied() else {
+                    continue;
+                };
+                if n.spec.is_provider()
+                    || n.spec.subnets.is_empty()
+                    || owner.contains_key(n.name.as_str())
+                {
+                    continue;
+                }
+                owner.insert(n.name.as_str(), r.id);
+                interfaces.push(n);
+            }
+            interfaces.sort_by_key(|n| n.id);
+            let external = r.spec.external.as_ref().and_then(|e| {
+                let network = sdn.get(e.network.as_str()).copied()?;
+                let physnet = network.spec.physnet()?;
+                let addresses: Vec<String> = e
+                    .ips
+                    .iter()
+                    .filter_map(|ip| {
+                        let s = ipam::nic_subnet(&network.spec, *ip)?;
+                        Some(format!("{ip}/{}", s.cidr.prefix))
+                    })
+                    .collect();
+                (!addresses.is_empty()).then(|| External {
+                    network,
+                    spec: e,
+                    addresses,
+                    gateways: gateway_ranking(r.id, &gateway_candidates(nodes, physnet)),
+                })
+            });
+            RouterPlan {
+                router: r,
+                interfaces,
+                external,
+            }
+        })
+        .collect();
+
+    let mut switches: Vec<SwitchRow> = sdn
+        .values()
         .map(|n| {
             let mut external_ids = BTreeMap::from([
                 (CLUSTER_KEY.to_string(), tag.to_string()),
@@ -172,21 +461,32 @@ pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> N
             if let Some(folder) = n.spec.folder {
                 external_ids.insert(FOLDER_KEY.into(), folder.to_string());
             }
-            let dhcp = n
+            let dhcp_ids = |s: &Subnet| {
+                BTreeMap::from([
+                    (CLUSTER_KEY.to_string(), tag.to_string()),
+                    (ID_KEY.to_string(), n.id.to_string()),
+                    (SUBNET_KEY.to_string(), s.cidr.to_string()),
+                ])
+            };
+            let routed = owner.contains_key(n.name.as_str()) || n.spec.is_provider();
+            let mut dhcp: Vec<DhcpRow> = n
                 .spec
                 .subnets
                 .iter()
-                .filter(|s| s.is_ipv4() && s.dhcp())
+                .filter(|s| s.is_ipv4() && n.spec.subnet_dhcp(s))
                 .map(|s| DhcpRow {
                     cidr: s.cidr.to_string(),
-                    options: dhcp_options(n, s),
-                    external_ids: BTreeMap::from([
-                        (CLUSTER_KEY.to_string(), tag.to_string()),
-                        (ID_KEY.to_string(), n.id.to_string()),
-                        (SUBNET_KEY.to_string(), s.cidr.to_string()),
-                    ]),
+                    options: dhcp_options(n, s, routed),
+                    external_ids: dhcp_ids(s),
                 })
                 .collect();
+            dhcp.extend(n.spec.subnets.iter().filter_map(|s| {
+                Some(DhcpRow {
+                    cidr: s.cidr.to_string(),
+                    options: dhcpv6_options(n, s, dhcpv6_mode(s)?),
+                    external_ids: dhcp_ids(s),
+                })
+            }));
             let mut ports: Vec<PortRow> = vms
                 .iter()
                 .filter(|v| !v.spec.template)
@@ -209,7 +509,13 @@ pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> N
                         .iter()
                         .filter(|ip| ip.is_ipv4())
                         .find_map(|ip| ipam::nic_subnet(&n.spec, *ip))
-                        .filter(|s| s.dhcp())
+                        .filter(|s| n.spec.subnet_dhcp(s))
+                        .map(|s| s.cidr.to_string());
+                    let dhcpv6 = ips
+                        .iter()
+                        .filter(|ip| !ip.is_ipv4())
+                        .find_map(|ip| ipam::nic_subnet(&n.spec, *ip))
+                        .filter(|s| dhcpv6_mode(s).is_some())
                         .map(|s| s.cidr.to_string());
                     let mut options = BTreeMap::new();
                     let (requested, activation) = chassis(v, &node_ids);
@@ -225,10 +531,13 @@ pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> N
                     let enabled = !ips.is_empty() || n.spec.subnets.is_empty();
                     PortRow {
                         name: port_name(v.id, mac),
+                        kind: String::new(),
                         addresses: vec![address.clone()],
                         port_security: vec![address],
                         dhcpv4,
+                        dhcpv6,
                         enabled: Some(enabled),
+                        tag: None,
                         options,
                         external_ids: BTreeMap::from([
                             (CLUSTER_KEY.to_string(), tag.to_string()),
@@ -238,6 +547,52 @@ pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> N
                     }
                 })
                 .collect();
+            // 공급자 네트워크: 노드 physnet(OVS 브리지 매핑)으로 나가는 localnet 포트(계획 66 §8)
+            if let Some(p) = n.spec.provider() {
+                ports.push(PortRow {
+                    name: localnet_port_name(n.id),
+                    kind: "localnet".into(),
+                    addresses: vec!["unknown".into()],
+                    port_security: Vec::new(),
+                    dhcpv4: None,
+                    dhcpv6: None,
+                    enabled: None,
+                    tag: p.vlan,
+                    options: BTreeMap::from([("network_name".to_string(), p.physnet.clone())]),
+                    external_ids: BTreeMap::from([
+                        (CLUSTER_KEY.to_string(), tag.to_string()),
+                        (ID_KEY.to_string(), n.id.to_string()),
+                    ]),
+                });
+            }
+            // 라우터 인터페이스: 라우터 포트의 짝
+            if let Some(r) = owner.get(n.name.as_str()) {
+                ports.push(router_switch_port(
+                    router_switch_port_name(n.id),
+                    router_port_name(n.id),
+                    *r,
+                    false,
+                    tag,
+                ));
+            }
+            // 이 공급자 네트워크로 나가는 라우터의 게이트웨이 포트 짝(게이트웨이가 있을 때만 — 없으면 물리 망에 라우터를 보이지
+            // 않는다). `nat-addresses=router`: 게이트웨이 chassis와 분산 유동 IP의 chassis가 GARP를 보낸다.
+            for plan in &plans {
+                if plan
+                    .external
+                    .as_ref()
+                    .is_some_and(|e| e.network.id == n.id && e.enabled())
+                {
+                    let r = plan.router.id;
+                    ports.push(router_switch_port(
+                        gateway_switch_port_name(r),
+                        gateway_port_name(r),
+                        r,
+                        true,
+                        tag,
+                    ));
+                }
+            }
             ports.sort_by(|a, b| a.name.cmp(&b.name));
             SwitchRow {
                 network: n.id,
@@ -249,7 +604,252 @@ pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> N
         })
         .collect();
     switches.sort_by_key(|s| s.network);
-    NbState { switches }
+
+    let by_id: BTreeMap<Uuid, &Node> = nodes.iter().map(|n| (n.id, n)).collect();
+    let mut fips: Vec<&FloatingIp> = floating_ips.iter().collect();
+    fips.sort_by_key(|f| f.id);
+    let routers = plans
+        .iter()
+        .map(|plan| router_row(plan, vms, &fips, &by_id, &node_ids, tag))
+        .collect();
+    NbState { switches, routers }
+}
+
+/// 라우터 포트와 짝인 스위치 포트(`type=router`)
+fn router_switch_port(
+    name: String,
+    peer: String,
+    router: Uuid,
+    gateway: bool,
+    tag: &str,
+) -> PortRow {
+    let mut options = BTreeMap::from([("router-port".to_string(), peer)]);
+    if gateway {
+        options.insert("nat-addresses".into(), "router".into());
+    }
+    PortRow {
+        name,
+        kind: "router".into(),
+        addresses: vec!["router".into()],
+        port_security: Vec::new(),
+        dhcpv4: None,
+        dhcpv6: None,
+        enabled: None,
+        tag: None,
+        options,
+        external_ids: BTreeMap::from([
+            (CLUSTER_KEY.to_string(), tag.to_string()),
+            (ROUTER_KEY.to_string(), router.to_string()),
+        ]),
+    }
+}
+
+/// 라우터 하나의 NB 행(§9.1~9.5)
+fn router_row(
+    plan: &RouterPlan,
+    vms: &[Vm],
+    fips: &[&FloatingIp],
+    nodes: &BTreeMap<Uuid, &Node>,
+    node_ids: &BTreeSet<Uuid>,
+    tag: &str,
+) -> RouterRow {
+    let r = plan.router;
+    let ours = || {
+        BTreeMap::from([
+            (CLUSTER_KEY.to_string(), tag.to_string()),
+            (ROUTER_KEY.to_string(), r.id.to_string()),
+        ])
+    };
+    let mut external_ids = BTreeMap::from([
+        (CLUSTER_KEY.to_string(), tag.to_string()),
+        (ID_KEY.to_string(), r.id.to_string()),
+        (NAME_KEY.to_string(), r.name.clone()),
+    ]);
+    if let Some(folder) = r.spec.folder {
+        external_ids.insert(FOLDER_KEY.into(), folder.to_string());
+    }
+    let mut ports: Vec<RouterPortRow> = plan
+        .interfaces
+        .iter()
+        .map(|n| {
+            let mut options = BTreeMap::new();
+            if let Some(mtu) = n.spec.mtu() {
+                options.insert("gateway_mtu".to_string(), mtu.to_string());
+            }
+            let ipv6_ra_configs = n
+                .spec
+                .subnets
+                .iter()
+                .filter(|s| !s.is_ipv4())
+                .find_map(|s| Some(ra_configs(n, s, s.ipv6_mode?)))
+                .unwrap_or_default();
+            RouterPortRow {
+                name: router_port_name(n.id),
+                mac: router_mac(r.id, n.id).to_string(),
+                networks: n
+                    .spec
+                    .subnets
+                    .iter()
+                    .map(|s| format!("{}/{}", s.gateway(), s.cidr.prefix))
+                    .collect(),
+                enabled: None,
+                gateway: false,
+                options,
+                ipv6_ra_configs,
+                external_ids: ours(),
+            }
+        })
+        .collect();
+    let mut routes: Vec<RouteRow> = r
+        .spec
+        .routes
+        .iter()
+        .map(|s| RouteRow {
+            ip_prefix: s.destination.to_string(),
+            nexthop: s.nexthop.to_string(),
+            external_ids: ours(),
+        })
+        .collect();
+    let mut nat = Vec::new();
+    let mut ha = None;
+    if let Some(e) = &plan.external {
+        // 게이트웨이 후보가 없으면 포트를 닫는다: 그룹 없는 포트는 모든 chassis가 같은 라우터 MAC으로 물리 망에 답한다.
+        ports.push(RouterPortRow {
+            name: gateway_port_name(r.id),
+            mac: router_mac(r.id, e.network.id).to_string(),
+            networks: e.addresses.clone(),
+            enabled: (!e.enabled()).then_some(false),
+            gateway: e.enabled(),
+            options: BTreeMap::new(),
+            ipv6_ra_configs: BTreeMap::new(),
+            external_ids: ours(),
+        });
+        // 외부 주소의 체계마다 기본 경로 → 외부 서브넷의 게이트웨이(물리 라우터)
+        for ip in &e.spec.ips {
+            if let Some(s) = ipam::nic_subnet(&e.network.spec, *ip) {
+                routes.push(RouteRow {
+                    ip_prefix: if ip.is_ipv4() { "0.0.0.0/0" } else { "::/0" }.into(),
+                    nexthop: s.gateway().to_string(),
+                    external_ids: ours(),
+                });
+            }
+        }
+        if e.enabled() {
+            ha = Some(HaGroupRow {
+                name: ha_group_name(r.id),
+                chassis: e
+                    .gateways
+                    .iter()
+                    .map(|(node, priority)| (node.to_string(), *priority))
+                    .collect(),
+                external_ids: BTreeMap::from([
+                    (CLUSTER_KEY.to_string(), tag.to_string()),
+                    (ID_KEY.to_string(), r.id.to_string()),
+                ]),
+            });
+            nat = router_nat(plan, e, vms, fips, nodes, node_ids, tag);
+        }
+    }
+    ports.sort_by(|a, b| a.name.cmp(&b.name));
+    routes.sort_by(|a, b| (&a.ip_prefix, &a.nexthop).cmp(&(&b.ip_prefix, &b.nexthop)));
+    routes.dedup();
+    RouterRow {
+        router: r.id,
+        name: router_name(r.id),
+        options: BTreeMap::from([
+            ("dynamic_neigh_routers".to_string(), "true".to_string()),
+            (
+                "always_learn_from_arp_request".to_string(),
+                "false".to_string(),
+            ),
+        ]),
+        external_ids,
+        ports,
+        routes,
+        nat,
+        ha,
+    }
+}
+
+/// 라우터의 NAT(§9.4·9.5): SNAT(인터페이스의 IPv4 서브넷마다, `snat`이 켜져 있고 IPv4 외부 주소가 있을 때), 이 라우터로
+/// 라우팅되는 NIC에 붙은 유동 IP의 `dnat_and_snat`. VM이 켜진 노드(마이그레이션이면 둘 다)가 모두 외부 physnet을 `ready`로
+/// 알리면 분산(`logical_port`·`external_mac` = NIC MAC), 아니면 중앙(게이트웨이 chassis)이다.
+fn router_nat(
+    plan: &RouterPlan,
+    e: &External,
+    vms: &[Vm],
+    fips: &[&FloatingIp],
+    nodes: &BTreeMap<Uuid, &Node>,
+    node_ids: &BTreeSet<Uuid>,
+    tag: &str,
+) -> Vec<NatRow> {
+    let mut nat = Vec::new();
+    if let Some(ext) = e.ipv4().filter(|_| e.spec.snat()) {
+        for n in &plan.interfaces {
+            for s in n.spec.subnets.iter().filter(|s| s.is_ipv4()) {
+                nat.push(NatRow {
+                    kind: "snat".into(),
+                    external_ip: ext.to_string(),
+                    logical_ip: s.cidr.to_string(),
+                    logical_port: None,
+                    external_mac: None,
+                    external_ids: BTreeMap::from([(CLUSTER_KEY.to_string(), tag.to_string())]),
+                });
+            }
+        }
+    }
+    let physnet = e.network.spec.physnet().unwrap_or_default();
+    let mut taken = BTreeSet::new();
+    for f in fips.iter().filter(|f| f.spec.network == e.network.name) {
+        let (Some(address), Some(target)) = (f.spec.address.filter(IpAddr::is_ipv4), f.spec.target)
+        else {
+            continue;
+        };
+        let Some(vm) = vms.iter().find(|v| v.id == target.vm && !v.spec.template) else {
+            continue;
+        };
+        let Some(nic) = vm.spec.nics.iter().find(|n| n.mac == Some(target.mac)) else {
+            continue;
+        };
+        let Some(n) = plan.interfaces.iter().find(|n| n.name == nic.network) else {
+            continue;
+        };
+        let Some(logical) = nic
+            .ips
+            .iter()
+            .copied()
+            .find(|ip| ip.is_ipv4() && ipam::nic_subnet(&n.spec, *ip).is_some())
+        else {
+            continue;
+        };
+        // 같은 NIC 주소에 유동 IP 둘(Raft가 막는다)이면 먼저 온 것만
+        if !taken.insert(logical) {
+            continue;
+        }
+        let on = chassis_nodes(vm, node_ids);
+        let distributed = !on.is_empty()
+            && on.iter().all(|id| {
+                nodes
+                    .get(id)
+                    .and_then(|n| n.status.sdn.as_ref())
+                    .is_some_and(|s| s.physnet_ready(physnet))
+            });
+        nat.push(NatRow {
+            kind: "dnat_and_snat".into(),
+            external_ip: address.to_string(),
+            logical_ip: logical.to_string(),
+            logical_port: distributed.then(|| port_name(vm.id, target.mac)),
+            external_mac: distributed.then(|| target.mac.to_string()),
+            external_ids: BTreeMap::from([
+                (CLUSTER_KEY.to_string(), tag.to_string()),
+                (FIP_KEY.to_string(), f.id.to_string()),
+            ]),
+        });
+    }
+    nat.sort_by(|a, b| {
+        (&a.kind, &a.external_ip, &a.logical_ip).cmp(&(&b.kind, &b.external_ip, &b.logical_ip))
+    });
+    nat
 }
 
 // ---- NB에서 읽은 것 ----
@@ -266,10 +866,13 @@ pub struct ActualSwitch {
 pub struct ActualPort {
     pub uuid: String,
     pub name: String,
+    pub kind: String,
     pub addresses: Vec<String>,
     pub port_security: Vec<String>,
     pub dhcpv4: Option<String>,
+    pub dhcpv6: Option<String>,
     pub enabled: Option<bool>,
+    pub tag: Option<i64>,
     pub options: BTreeMap<String, String>,
     pub external_ids: BTreeMap<String, String>,
 }
@@ -291,6 +894,67 @@ pub struct Global {
     pub hv_cfg: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActualRouter {
+    pub uuid: String,
+    pub name: String,
+    pub options: BTreeMap<String, String>,
+    pub external_ids: BTreeMap<String, String>,
+    pub ports: Vec<String>,
+    pub static_routes: Vec<String>,
+    pub nat: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActualRouterPort {
+    pub uuid: String,
+    pub name: String,
+    pub mac: String,
+    pub networks: Vec<String>,
+    pub enabled: Option<bool>,
+    pub ha_chassis_group: Option<String>,
+    pub options: BTreeMap<String, String>,
+    pub ipv6_ra_configs: BTreeMap<String, String>,
+    /// northd가 쓰는 칸(`hosting-chassis` — 보기용)
+    pub status: BTreeMap<String, String>,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActualRoute {
+    pub uuid: String,
+    pub ip_prefix: String,
+    pub nexthop: String,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActualNat {
+    pub uuid: String,
+    pub kind: String,
+    pub external_ip: String,
+    pub logical_ip: String,
+    pub logical_port: Option<String>,
+    pub external_mac: Option<String>,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActualHaGroup {
+    pub uuid: String,
+    pub name: String,
+    pub ha_chassis: Vec<String>,
+    pub external_ids: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActualHaChassis {
+    pub uuid: String,
+    pub chassis_name: String,
+    pub priority: i64,
+    pub external_ids: BTreeMap<String, String>,
+}
+
 /// NB에서 읽은 우리 행과 `NB_Global`
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NbActual {
@@ -298,9 +962,16 @@ pub struct NbActual {
     pub ports: Vec<ActualPort>,
     pub dhcp: Vec<ActualDhcp>,
     pub global: Option<Global>,
+    pub routers: Vec<ActualRouter>,
+    pub router_ports: Vec<ActualRouterPort>,
+    pub routes: Vec<ActualRoute>,
+    pub nat: Vec<ActualNat>,
+    pub ha_groups: Vec<ActualHaGroup>,
+    pub ha_chassis: Vec<ActualHaChassis>,
 }
 
-/// 우리 행을 읽는 연산들(한 트랜잭션): 스위치·포트·DHCP(태그 조건)와 `NB_Global`
+/// 우리 행을 읽는 연산들(한 트랜잭션): 스위치·포트·DHCP(태그 조건)와 `NB_Global`, 라우터·라우터 포트·경로·NAT·HA 그룹·
+/// HA chassis(태그 조건)
 pub fn read_ops(tag: &str) -> Vec<Value> {
     let ours = || {
         vec![cond(
@@ -316,17 +987,32 @@ pub fn read_ops(tag: &str) -> Vec<Value> {
         json!({"op": "select", "table": "Logical_Switch", "where": ours(),
                "columns": ["_uuid", "name", "external_ids", "ports"]}),
         json!({"op": "select", "table": "Logical_Switch_Port", "where": ours(),
-               "columns": ["_uuid", "name", "addresses", "port_security", "dhcpv4_options",
-                           "enabled", "options", "external_ids"]}),
+               "columns": ["_uuid", "name", "type", "addresses", "port_security", "dhcpv4_options",
+                           "dhcpv6_options", "enabled", "tag", "options", "external_ids"]}),
         json!({"op": "select", "table": "DHCP_Options", "where": ours(),
                "columns": ["_uuid", "cidr", "options", "external_ids"]}),
         json!({"op": "select", "table": "NB_Global", "where": [],
                "columns": ["_uuid", "external_ids", "nb_cfg", "hv_cfg"]}),
+        json!({"op": "select", "table": "Logical_Router", "where": ours(),
+               "columns": ["_uuid", "name", "options", "external_ids", "ports", "static_routes", "nat"]}),
+        json!({"op": "select", "table": "Logical_Router_Port", "where": ours(),
+               "columns": ["_uuid", "name", "mac", "networks", "enabled", "ha_chassis_group", "options",
+                           "ipv6_ra_configs", "status", "external_ids"]}),
+        json!({"op": "select", "table": "Logical_Router_Static_Route", "where": ours(),
+               "columns": ["_uuid", "ip_prefix", "nexthop", "external_ids"]}),
+        json!({"op": "select", "table": "NAT", "where": ours(),
+               "columns": ["_uuid", "type", "external_ip", "logical_ip", "logical_port", "external_mac",
+                           "external_ids"]}),
+        json!({"op": "select", "table": "HA_Chassis_Group", "where": ours(),
+               "columns": ["_uuid", "name", "ha_chassis", "external_ids"]}),
+        json!({"op": "select", "table": "HA_Chassis", "where": ours(),
+               "columns": ["_uuid", "chassis_name", "priority", "external_ids"]}),
     ]
 }
 
 fn rows(v: &Value) -> Vec<Map<String, Value>> {
-    v["rows"]
+    v.get("rows")
+        .unwrap_or(&Value::Null)
         .as_array()
         .into_iter()
         .flatten()
@@ -366,10 +1052,15 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
         .map(|r| ActualPort {
             uuid: uuid_of(r),
             name: text(r, "name"),
+            kind: text(r, "type"),
             addresses: sorted(parse_strings(&r["addresses"])),
             port_security: sorted(parse_strings(&r["port_security"])),
             dhcpv4: parse_uuids(&r["dhcpv4_options"]).into_iter().next(),
+            dhcpv6: r
+                .get("dhcpv6_options")
+                .and_then(|v| parse_uuids(v).into_iter().next()),
             enabled: parse_bool(&r["enabled"]),
+            tag: r.get("tag").and_then(parse_int),
             options: parse_map(&r["options"]),
             external_ids: parse_map(&r["external_ids"]),
         })
@@ -390,11 +1081,90 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
         nb_cfg: parse_int(&r["nb_cfg"]).unwrap_or(0),
         hv_cfg: parse_int(&r["hv_cfg"]).unwrap_or(0),
     });
+    let none = Value::Null;
+    let at = |i: usize| rows(results.get(i).unwrap_or(&none));
+    let opt_text = |r: &Map<String, Value>, c: &str| {
+        r.get(c)
+            .map(parse_strings)
+            .and_then(|v| v.into_iter().next())
+    };
+    let routers = at(4)
+        .iter()
+        .map(|r| ActualRouter {
+            uuid: uuid_of(r),
+            name: text(r, "name"),
+            options: parse_map(&r["options"]),
+            external_ids: parse_map(&r["external_ids"]),
+            ports: sorted(parse_uuids(&r["ports"])),
+            static_routes: sorted(parse_uuids(&r["static_routes"])),
+            nat: sorted(parse_uuids(&r["nat"])),
+        })
+        .collect();
+    let router_ports = at(5)
+        .iter()
+        .map(|r| ActualRouterPort {
+            uuid: uuid_of(r),
+            name: text(r, "name"),
+            mac: text(r, "mac"),
+            networks: sorted(parse_strings(&r["networks"])),
+            enabled: parse_bool(&r["enabled"]),
+            ha_chassis_group: parse_uuids(&r["ha_chassis_group"]).into_iter().next(),
+            options: parse_map(&r["options"]),
+            ipv6_ra_configs: parse_map(&r["ipv6_ra_configs"]),
+            status: parse_map(&r["status"]),
+            external_ids: parse_map(&r["external_ids"]),
+        })
+        .collect();
+    let routes = at(6)
+        .iter()
+        .map(|r| ActualRoute {
+            uuid: uuid_of(r),
+            ip_prefix: text(r, "ip_prefix"),
+            nexthop: text(r, "nexthop"),
+            external_ids: parse_map(&r["external_ids"]),
+        })
+        .collect();
+    let nat = at(7)
+        .iter()
+        .map(|r| ActualNat {
+            uuid: uuid_of(r),
+            kind: text(r, "type"),
+            external_ip: text(r, "external_ip"),
+            logical_ip: text(r, "logical_ip"),
+            logical_port: opt_text(r, "logical_port"),
+            external_mac: opt_text(r, "external_mac"),
+            external_ids: parse_map(&r["external_ids"]),
+        })
+        .collect();
+    let ha_groups = at(8)
+        .iter()
+        .map(|r| ActualHaGroup {
+            uuid: uuid_of(r),
+            name: text(r, "name"),
+            ha_chassis: sorted(parse_uuids(&r["ha_chassis"])),
+            external_ids: parse_map(&r["external_ids"]),
+        })
+        .collect();
+    let ha_chassis = at(9)
+        .iter()
+        .map(|r| ActualHaChassis {
+            uuid: uuid_of(r),
+            chassis_name: text(r, "chassis_name"),
+            priority: parse_int(&r["priority"]).unwrap_or(0),
+            external_ids: parse_map(&r["external_ids"]),
+        })
+        .collect();
     NbActual {
         switches,
         ports,
         dhcp,
         global,
+        routers,
+        router_ports,
+        routes,
+        nat,
+        ha_groups,
+        ha_chassis,
     }
 }
 
@@ -417,20 +1187,52 @@ fn opt_bool(b: Option<bool>) -> Value {
     set_value(b.map(|b| json!(b)).into_iter().collect())
 }
 
-/// 포트 행의 칸(넣기·바꾸기). `dhcp`는 DHCP 행의 참조(있는 행의 uuid나 넣는 행의 named-uuid)다.
-fn port_columns(p: &PortRow, dhcp: Option<Value>) -> Map<String, Value> {
+/// 포트 행의 칸(넣기·바꾸기). `dhcp`·`dhcp6`는 DHCP 행의 참조(있는 행의 uuid나 넣는 행의 named-uuid)다. 계획 66의 칸
+/// (`type`·`tag`·`dhcpv6_options`)은 넣을 때 빈 값이면 쓰지 않는다(계획 65 포트의 연산 그대로), 바꿀 때는 늘 쓴다.
+fn port_columns(
+    p: &PortRow,
+    dhcp: Option<Value>,
+    dhcp6: Option<Value>,
+    update: bool,
+) -> Map<String, Value> {
     let mut row = Map::new();
     row.insert("name".into(), json!(p.name));
+    if update || !p.kind.is_empty() {
+        row.insert("type".into(), json!(p.kind));
+    }
     row.insert("addresses".into(), string_set(&p.addresses));
     row.insert("port_security".into(), string_set(&p.port_security));
     row.insert(
         "dhcpv4_options".into(),
         set_value(dhcp.into_iter().collect()),
     );
+    if update || dhcp6.is_some() {
+        row.insert(
+            "dhcpv6_options".into(),
+            set_value(dhcp6.into_iter().collect()),
+        );
+    }
     row.insert("enabled".into(), opt_bool(p.enabled));
+    if update || p.tag.is_some() {
+        row.insert(
+            "tag".into(),
+            set_value(p.tag.map(|t| json!(t)).into_iter().collect()),
+        );
+    }
     row.insert("options".into(), map_value(&p.options));
     row.insert("external_ids".into(), map_value(&p.external_ids));
     row
+}
+
+/// 참조 `want`(있는 행 uuid나 named-uuid, 없음)가 읽은 참조 `have`와 같은지. 넣는 행(named-uuid)은 늘 다르다.
+fn same_ref(want: Option<&Value>, have: Option<&str>) -> bool {
+    match want {
+        None => have.is_none(),
+        Some(v) => match v.as_array().map(Vec::as_slice) {
+            Some([tag, Value::String(u)]) if tag == "uuid" => have == Some(u.as_str()),
+            _ => false,
+        },
+    }
 }
 
 /// 바라는 것과 읽은 것을 견준 묶음들. 같으면 빈 목록이다.
@@ -520,29 +1322,21 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
         let mut kept_ports = BTreeSet::new();
         for (i, p) in sw.ports.iter().enumerate() {
             let dhcp = p.dhcpv4.as_deref().and_then(|c| dhcp_ref.get(c).cloned());
+            let dhcp6 = p.dhcpv6.as_deref().and_then(|c| dhcp_ref.get(c).cloned());
             match ports_by_name.get(p.name.as_str()) {
                 Some(a) => {
-                    let wanted_dhcp =
-                        dhcp.as_ref()
-                            .map(|d| match d.as_array().map(Vec::as_slice) {
-                                Some([_, Value::String(u)]) if d[0] == "uuid" => Some(u.clone()),
-                                _ => None,
-                            });
-                    let same_dhcp = match wanted_dhcp {
-                        None => a.dhcpv4.is_none(),
-                        Some(Some(u)) => a.dhcpv4.as_deref() == Some(u.as_str()),
-                        // 새로 넣는 DHCP 행을 가리켜야 한다.
-                        Some(None) => false,
-                    };
-                    let same = a.addresses == sorted(p.addresses.clone())
+                    let same = a.kind == p.kind
+                        && a.addresses == sorted(p.addresses.clone())
                         && a.port_security == sorted(p.port_security.clone())
-                        && same_dhcp
+                        && same_ref(dhcp.as_ref(), a.dhcpv4.as_deref())
+                        && same_ref(dhcp6.as_ref(), a.dhcpv6.as_deref())
                         && a.enabled == p.enabled
+                        && a.tag == p.tag.map(i64::from)
                         && a.options == p.options
                         && a.external_ids == p.external_ids;
                     if !same {
                         ops.push(json!({"op": "update", "table": "Logical_Switch_Port",
-                            "where": by_uuid(&a.uuid), "row": port_columns(p, dhcp)}));
+                            "where": by_uuid(&a.uuid), "row": port_columns(p, dhcp, dhcp6, true)}));
                     }
                     let in_this = current.is_some_and(|c| c.ports.contains(&a.uuid));
                     if !in_this {
@@ -559,7 +1353,7 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
                     let name = format!("p{n}_{i}");
                     ops.push(
                         json!({"op": "insert", "table": "Logical_Switch_Port", "uuid-name": name,
-                        "row": port_columns(p, dhcp)}),
+                        "row": port_columns(p, dhcp, dhcp6, false)}),
                     );
                     add.push(named_uuid(&name));
                 }
@@ -614,6 +1408,17 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
         }
     }
 
+    // 라우터마다 한 묶음(스위치 묶음 뒤 — 라우터 포트의 짝인 스위치 포트는 이름으로만 잇는다)
+    for (n, r) in want.routers.iter().enumerate() {
+        let ops = plan_router(n, r, have);
+        if !ops.is_empty() {
+            out.push(Batch {
+                key: r.name.clone(),
+                ops,
+            });
+        }
+    }
+
     // 바라지 않는 우리 스위치(포트는 따라 사라진다)와 그 네트워크의 DHCP 행
     for s in have
         .switches
@@ -626,6 +1431,29 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
                 json!({"op": "delete", "table": "Logical_Switch", "where": by_uuid(&s.uuid)}),
             ],
         });
+    }
+    // 바라지 않는 라우터(행이 남은 라우터 id마다 한 묶음 — 라우터와 그 HA 그룹)
+    let wanted_routers: BTreeSet<String> =
+        want.routers.iter().map(|r| r.router.to_string()).collect();
+    let stale_routers: BTreeSet<&str> = have
+        .routers
+        .iter()
+        .filter_map(|r| r.external_ids.get(ID_KEY).map(String::as_str))
+        .chain(
+            have.ha_groups
+                .iter()
+                .filter_map(|g| g.external_ids.get(ID_KEY).map(String::as_str)),
+        )
+        .filter(|id| !wanted_routers.contains(*id))
+        .collect();
+    for id in stale_routers {
+        let ops = delete_router(id, have);
+        if !ops.is_empty() {
+            out.push(Batch {
+                key: format!("opl-r-{id}"),
+                ops,
+            });
+        }
     }
     let stale_dhcp: Vec<Value> = have
         .dhcp
@@ -644,6 +1472,344 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
         });
     }
     out
+}
+
+/// 라우터 행 하나와 그 자식 행을 견주는 연산(한 트랜잭션, 계획 66 §9). 자식(포트·경로·NAT·HA chassis)은 우리 표시가 있는
+/// 것만 본다(관리자가 우리 라우터에 넣은 행은 둔다). 경로·NAT·HA chassis는 내용이 같은 행을 그대로 두고 다른 것만 넣고
+/// 뺀다(빠진 행은 참조를 잃고 OVSDB가 지운다). 다른 라우터에 있던 같은 이름의 포트(인터페이스를 옮김)는 이 묶음이 옛 라우터에서
+/// 빼고 지운 뒤 새로 넣는다 — 옛 라우터의 묶음과 차례가 어떻든 uuid로만 지우므로 서로 막지 않는다.
+fn plan_router(n: usize, r: &RouterRow, have: &NbActual) -> Vec<Value> {
+    let mut ops = Vec::new();
+    let mut same = have.routers.iter().filter(|a| a.name == r.name);
+    let current = same.next();
+    let our_ports: BTreeMap<&str, &ActualRouterPort> = have
+        .router_ports
+        .iter()
+        .map(|p| (p.uuid.as_str(), p))
+        .collect();
+    for extra in same {
+        ops.push(json!({"op": "delete", "table": "Logical_Router", "where": by_uuid(&extra.uuid)}));
+        for u in extra
+            .ports
+            .iter()
+            .filter(|u| our_ports.contains_key(u.as_str()))
+        {
+            ops.push(json!({"op": "delete", "table": "Logical_Router_Port", "where": by_uuid(u)}));
+        }
+    }
+
+    // HA 그룹(뿌리, 이름으로 짝짓기)
+    let mut groups = have.ha_groups.iter().filter(|g| {
+        r.ha.as_ref().is_some_and(|h| h.name == g.name) || g.name == ha_group_name(r.router)
+    });
+    let group = groups.next();
+    let mut stale_groups: Vec<&ActualHaGroup> = groups.collect();
+    let group_ref = match (&r.ha, group) {
+        (Some(want), Some(g)) => {
+            let chassis: Vec<&ActualHaChassis> = have
+                .ha_chassis
+                .iter()
+                .filter(|c| g.ha_chassis.contains(&c.uuid))
+                .collect();
+            let (mut kept, mut add) = (BTreeSet::new(), Vec::new());
+            for (i, (name, priority)) in want.chassis.iter().enumerate() {
+                let ids = ha_chassis_ids(want);
+                match chassis
+                    .iter()
+                    .find(|c| &c.chassis_name == name && !kept.contains(c.uuid.as_str()))
+                {
+                    Some(c) => {
+                        kept.insert(c.uuid.as_str());
+                        if c.priority != i64::from(*priority) || c.external_ids != ids {
+                            ops.push(json!({"op": "update", "table": "HA_Chassis", "where": by_uuid(&c.uuid),
+                                "row": {"priority": priority, "external_ids": map_value(&ids)}}));
+                        }
+                    }
+                    None => {
+                        let name_u = format!("h{n}_{i}");
+                        ops.push(json!({"op": "insert", "table": "HA_Chassis", "uuid-name": name_u,
+                            "row": {"chassis_name": name, "priority": priority, "external_ids": map_value(&ids)}}));
+                        add.push(named_uuid(&name_u));
+                    }
+                }
+            }
+            let remove: Vec<Value> = chassis
+                .iter()
+                .filter(|c| !kept.contains(c.uuid.as_str()))
+                .map(|c| uuid_value(&c.uuid))
+                .collect();
+            if g.external_ids != want.external_ids {
+                ops.push(
+                    json!({"op": "update", "table": "HA_Chassis_Group", "where": by_uuid(&g.uuid),
+                    "row": {"external_ids": map_value(&want.external_ids)}}),
+                );
+            }
+            mutate_set(
+                &mut ops,
+                "HA_Chassis_Group",
+                &g.uuid,
+                "ha_chassis",
+                remove,
+                add,
+            );
+            Some(uuid_value(&g.uuid))
+        }
+        (Some(want), None) => {
+            let mut members = Vec::new();
+            for (i, (name, priority)) in want.chassis.iter().enumerate() {
+                let name_u = format!("h{n}_{i}");
+                ops.push(
+                    json!({"op": "insert", "table": "HA_Chassis", "uuid-name": name_u,
+                    "row": {"chassis_name": name, "priority": priority,
+                            "external_ids": map_value(&ha_chassis_ids(want))}}),
+                );
+                members.push(named_uuid(&name_u));
+            }
+            let name_g = format!("g{n}");
+            ops.push(
+                json!({"op": "insert", "table": "HA_Chassis_Group", "uuid-name": name_g,
+                "row": {"name": want.name, "ha_chassis": set_value(members),
+                        "external_ids": map_value(&want.external_ids)}}),
+            );
+            Some(named_uuid(&name_g))
+        }
+        (None, g) => {
+            stale_groups.extend(g);
+            None
+        }
+    };
+
+    // 라우터 포트(이름으로 짝짓기)
+    let ports_by_name: BTreeMap<&str, &ActualRouterPort> = have
+        .router_ports
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+    let (mut kept, mut add) = (BTreeSet::new(), Vec::new());
+    for (i, p) in r.ports.iter().enumerate() {
+        let ha = if p.gateway { group_ref.clone() } else { None };
+        let found = ports_by_name.get(p.name.as_str()).copied();
+        match found.filter(|a| current.is_some_and(|c| c.ports.contains(&a.uuid))) {
+            Some(a) => {
+                kept.insert(a.uuid.as_str());
+                let same = a.mac == p.mac
+                    && a.networks == sorted(p.networks.clone())
+                    && a.enabled == p.enabled
+                    && same_ref(ha.as_ref(), a.ha_chassis_group.as_deref())
+                    && a.options == p.options
+                    && a.ipv6_ra_configs == p.ipv6_ra_configs
+                    && a.external_ids == p.external_ids;
+                if !same {
+                    ops.push(json!({"op": "update", "table": "Logical_Router_Port", "where": by_uuid(&a.uuid),
+                        "row": router_port_columns(p, ha)}));
+                }
+            }
+            None => {
+                if let Some(a) = found {
+                    // 다른 라우터에서 옮겨 온다.
+                    for old in have.routers.iter().filter(|o| o.ports.contains(&a.uuid)) {
+                        ops.push(json!({"op": "mutate", "table": "Logical_Router", "where": by_uuid(&old.uuid),
+                            "mutations": [["ports", "delete", set_value(vec![uuid_value(&a.uuid)])]]}));
+                    }
+                    ops.push(json!({"op": "delete", "table": "Logical_Router_Port", "where": by_uuid(&a.uuid)}));
+                }
+                let name_p = format!("lp{n}_{i}");
+                ops.push(
+                    json!({"op": "insert", "table": "Logical_Router_Port", "uuid-name": name_p,
+                    "row": router_port_columns(p, ha)}),
+                );
+                add.push(named_uuid(&name_p));
+            }
+        }
+    }
+    let mut remove = Vec::new();
+    for u in current.iter().flat_map(|c| &c.ports) {
+        if our_ports.contains_key(u.as_str()) && !kept.contains(u.as_str()) {
+            remove.push(uuid_value(u));
+            // 참조를 잃은 포트는 커밋 때 사라지지만, 그 포트가 지울 HA 그룹을 가리키면 참조 검사가 먼저 막으므로 곧바로 지운다.
+            ops.push(json!({"op": "delete", "table": "Logical_Router_Port", "where": by_uuid(u)}));
+        }
+    }
+    for g in stale_groups {
+        ops.push(json!({"op": "delete", "table": "HA_Chassis_Group", "where": by_uuid(&g.uuid)}));
+    }
+
+    // 정적 경로·NAT(내용으로 짝짓기)
+    let routes: Vec<&ActualRoute> = have
+        .routes
+        .iter()
+        .filter(|a| current.is_some_and(|c| c.static_routes.contains(&a.uuid)))
+        .collect();
+    let (mut kept_routes, mut add_routes) = (BTreeSet::new(), Vec::new());
+    for (i, w) in r.routes.iter().enumerate() {
+        match routes.iter().find(|a| {
+            a.ip_prefix == w.ip_prefix
+                && a.nexthop == w.nexthop
+                && a.external_ids == w.external_ids
+                && !kept_routes.contains(a.uuid.as_str())
+        }) {
+            Some(a) => {
+                kept_routes.insert(a.uuid.as_str());
+            }
+            None => {
+                let name_r = format!("r{n}_{i}");
+                ops.push(json!({"op": "insert", "table": "Logical_Router_Static_Route", "uuid-name": name_r,
+                    "row": {"ip_prefix": w.ip_prefix, "nexthop": w.nexthop,
+                            "external_ids": map_value(&w.external_ids)}}));
+                add_routes.push(named_uuid(&name_r));
+            }
+        }
+    }
+    let remove_routes: Vec<Value> = routes
+        .iter()
+        .filter(|a| !kept_routes.contains(a.uuid.as_str()))
+        .map(|a| uuid_value(&a.uuid))
+        .collect();
+    let nats: Vec<&ActualNat> = have
+        .nat
+        .iter()
+        .filter(|a| current.is_some_and(|c| c.nat.contains(&a.uuid)))
+        .collect();
+    let (mut kept_nat, mut add_nat) = (BTreeSet::new(), Vec::new());
+    for (i, w) in r.nat.iter().enumerate() {
+        match nats.iter().find(|a| {
+            a.kind == w.kind
+                && a.external_ip == w.external_ip
+                && a.logical_ip == w.logical_ip
+                && a.logical_port == w.logical_port
+                && a.external_mac == w.external_mac
+                && a.external_ids == w.external_ids
+                && !kept_nat.contains(a.uuid.as_str())
+        }) {
+            Some(a) => {
+                kept_nat.insert(a.uuid.as_str());
+            }
+            None => {
+                let name_n = format!("n{n}_{i}");
+                let opt = |v: &Option<String>| string_set(&v.iter().cloned().collect::<Vec<_>>());
+                ops.push(json!({"op": "insert", "table": "NAT", "uuid-name": name_n,
+                    "row": {"type": w.kind, "external_ip": w.external_ip, "logical_ip": w.logical_ip,
+                            "logical_port": opt(&w.logical_port), "external_mac": opt(&w.external_mac),
+                            "external_ids": map_value(&w.external_ids)}}));
+                add_nat.push(named_uuid(&name_n));
+            }
+        }
+    }
+    let remove_nat: Vec<Value> = nats
+        .iter()
+        .filter(|a| !kept_nat.contains(a.uuid.as_str()))
+        .map(|a| uuid_value(&a.uuid))
+        .collect();
+
+    match current {
+        None => {
+            ops.push(
+                json!({"op": "insert", "table": "Logical_Router", "uuid-name": format!("lr{n}"),
+                "row": {"name": r.name, "options": map_value(&r.options),
+                        "external_ids": map_value(&r.external_ids), "ports": set_value(add),
+                        "static_routes": set_value(add_routes), "nat": set_value(add_nat)}}),
+            );
+        }
+        Some(c) => {
+            if c.options != r.options || c.external_ids != r.external_ids {
+                ops.push(json!({"op": "update", "table": "Logical_Router", "where": by_uuid(&c.uuid),
+                    "row": {"options": map_value(&r.options), "external_ids": map_value(&r.external_ids)}}));
+            }
+            mutate_set(&mut ops, "Logical_Router", &c.uuid, "ports", remove, add);
+            mutate_set(
+                &mut ops,
+                "Logical_Router",
+                &c.uuid,
+                "static_routes",
+                remove_routes,
+                add_routes,
+            );
+            mutate_set(
+                &mut ops,
+                "Logical_Router",
+                &c.uuid,
+                "nat",
+                remove_nat,
+                add_nat,
+            );
+        }
+    }
+    ops
+}
+
+/// 그룹의 HA chassis 표시(그룹과 같은 주인 표시)
+fn ha_chassis_ids(group: &HaGroupRow) -> BTreeMap<String, String> {
+    group
+        .external_ids
+        .iter()
+        .filter(|(k, _)| k.as_str() == CLUSTER_KEY)
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// 집합 칸 `column`에서 `remove`를 빼고 `add`를 넣는 연산(빈 것은 쓰지 않는다)
+fn mutate_set(
+    ops: &mut Vec<Value>,
+    table: &str,
+    uuid: &str,
+    column: &str,
+    remove: Vec<Value>,
+    add: Vec<Value>,
+) {
+    if !remove.is_empty() {
+        ops.push(
+            json!({"op": "mutate", "table": table, "where": by_uuid(uuid),
+            "mutations": [[column, "delete", set_value(remove)]]}),
+        );
+    }
+    if !add.is_empty() {
+        ops.push(
+            json!({"op": "mutate", "table": table, "where": by_uuid(uuid),
+            "mutations": [[column, "insert", set_value(add)]]}),
+        );
+    }
+}
+
+/// 라우터 포트 행의 칸(넣기·바꾸기). `ha`는 HA 그룹의 참조다.
+fn router_port_columns(p: &RouterPortRow, ha: Option<Value>) -> Map<String, Value> {
+    let mut row = Map::new();
+    row.insert("name".into(), json!(p.name));
+    row.insert("mac".into(), json!(p.mac));
+    row.insert("networks".into(), string_set(&p.networks));
+    row.insert("enabled".into(), opt_bool(p.enabled));
+    row.insert(
+        "ha_chassis_group".into(),
+        set_value(ha.into_iter().collect()),
+    );
+    row.insert("options".into(), map_value(&p.options));
+    row.insert("ipv6_ra_configs".into(), map_value(&p.ipv6_ra_configs));
+    row.insert("external_ids".into(), map_value(&p.external_ids));
+    row
+}
+
+/// 바라지 않는 라우터 `id`(라우터 행이나 HA 그룹의 `orbivisor:id`)의 행을 지우는 연산: 라우터, 그 우리 포트(HA 그룹을
+/// 가리키는 DGP가 그룹 지우기를 막지 않게 곧바로), HA 그룹
+fn delete_router(id: &str, have: &NbActual) -> Vec<Value> {
+    let mut ops = Vec::new();
+    let ours: BTreeSet<&str> = have.router_ports.iter().map(|p| p.uuid.as_str()).collect();
+    for lr in have
+        .routers
+        .iter()
+        .filter(|r| r.external_ids.get(ID_KEY).map(String::as_str) == Some(id))
+    {
+        ops.push(json!({"op": "delete", "table": "Logical_Router", "where": by_uuid(&lr.uuid)}));
+        for u in lr.ports.iter().filter(|u| ours.contains(u.as_str())) {
+            ops.push(json!({"op": "delete", "table": "Logical_Router_Port", "where": by_uuid(u)}));
+        }
+    }
+    for g in have
+        .ha_groups
+        .iter()
+        .filter(|g| g.external_ids.get(ID_KEY).map(String::as_str) == Some(id))
+    {
+        ops.push(json!({"op": "delete", "table": "HA_Chassis_Group", "where": by_uuid(&g.uuid)}));
+    }
+    ops
 }
 
 /// 트랜잭션 앞의 펜싱 연산: `NB_Global.external_ids`가 읽은 값 그대로인지 `wait`하고, 토큰 `token`을 쓰고 `nb_cfg`를
@@ -720,6 +1886,31 @@ impl VmInputs {
             phase: status.phase,
             at: status.node,
             migration: status.migration.as_ref().map(|m| m.node),
+        }
+    }
+}
+
+/// 라우터 행([`desired_routing`])에 쓰이는 노드의 칸(계획 66 §12): 게이트웨이 우선순위, 유지보수, `ready`인 physnet. 이것이
+/// 그대로인 노드 쓰기(5초 검사 루프의 상태 쓰기)로는 OvnSync가 NB를 다시 읽지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeInputs {
+    gateway: Option<u16>,
+    maintenance: bool,
+    physnets: Vec<String>,
+}
+
+impl NodeInputs {
+    pub fn of(spec: &opl_types::node::NodeSpec, status: &opl_types::node::NodeStatus) -> Self {
+        Self {
+            gateway: spec.sdn.as_ref().and_then(|s| s.gateway),
+            maintenance: spec.maintenance,
+            physnets: status
+                .sdn
+                .iter()
+                .flat_map(|s| &s.physnets)
+                .filter(|p| p.ready)
+                .map(|p| p.name.clone())
+                .collect(),
         }
     }
 }

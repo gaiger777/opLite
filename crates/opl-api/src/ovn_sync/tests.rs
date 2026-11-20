@@ -13,16 +13,16 @@ use uuid::Uuid;
 
 use super::nb::*;
 
-const TAG: &str = "abcdef012345";
+pub(super) const TAG: &str = "abcdef012345";
 
-fn ids(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(super) fn ids(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
 }
 
-fn spec() -> NetworkSpec {
+pub(super) fn spec() -> NetworkSpec {
     NetworkSpec {
         bridge: None,
         vlan: None,
@@ -34,7 +34,7 @@ fn spec() -> NetworkSpec {
     }
 }
 
-fn sdn_net(name: &str) -> opl_types::network::Network {
+pub(super) fn sdn_net(name: &str) -> opl_types::network::Network {
     Resource::new(
         name,
         NetworkSpec {
@@ -47,10 +47,13 @@ fn sdn_net(name: &str) -> opl_types::network::Network {
 fn port(name: &str, ip: &str, dhcp: Option<&str>) -> PortRow {
     PortRow {
         name: name.into(),
+        kind: String::new(),
         addresses: vec![format!("02:00:00:00:00:01 {ip}")],
         port_security: vec![format!("02:00:00:00:00:01 {ip}")],
         dhcpv4: dhcp.map(String::from),
+        dhcpv6: None,
         enabled: Some(true),
+        tag: None,
         options: BTreeMap::new(),
         external_ids: ids(&[(CLUSTER_KEY, TAG)]),
     }
@@ -78,13 +81,13 @@ fn dhcp(network: Uuid, cidr: &str, lease: &str) -> DhcpRow {
     }
 }
 
-struct Nb {
-    fake: FakeOvsdb,
-    client: OvsdbClient,
+pub(super) struct Nb {
+    pub(super) fake: FakeOvsdb,
+    pub(super) client: OvsdbClient,
 }
 
 impl Nb {
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let fake = FakeOvsdb::start(NB_DB).await;
         let client =
             OvsdbClient::connect(&Transport::Tcp, &Endpoint::ip(fake.addr()), DEFAULT_TIMEOUT)
@@ -93,12 +96,12 @@ impl Nb {
         Self { fake, client }
     }
 
-    async fn read(&self) -> NbActual {
+    pub(super) async fn read(&self) -> NbActual {
         parse_actual(&self.client.transact(NB_DB, read_ops(TAG)).await.unwrap())
     }
 
     /// 견주어 쓰고(펜싱 포함) 쓴 트랜잭션 수를 돌려준다.
-    async fn sync(&self, want: &NbState, token: &str) -> usize {
+    pub(super) async fn sync(&self, want: &NbState, token: &str) -> usize {
         let have = self.read().await;
         let mut global = have.global.clone();
         let txs = plan(want, &have);
@@ -119,7 +122,7 @@ impl Nb {
         n
     }
 
-    fn rows(&self, table: &str) -> Vec<serde_json::Map<String, Value>> {
+    pub(super) fn rows(&self, table: &str) -> Vec<serde_json::Map<String, Value>> {
         self.fake.rows(table)
     }
 }
@@ -171,7 +174,7 @@ fn desired_has_a_switch_per_sdn_network_in_id_order() {
     assert_eq!(want, desired(&[a, b, foldered], &[], &[], TAG));
 }
 
-fn vm_on(name: &str, nics: serde_json::Value) -> opl_types::vm::Vm {
+pub(super) fn vm_on(name: &str, nics: serde_json::Value) -> opl_types::vm::Vm {
     Resource::new(
         name,
         serde_json::from_value(json!({
@@ -181,7 +184,7 @@ fn vm_on(name: &str, nics: serde_json::Value) -> opl_types::vm::Vm {
     )
 }
 
-fn node_res(name: &str) -> opl_types::node::Node {
+pub(super) fn node_res(name: &str) -> opl_types::node::Node {
     Resource::new(
         name,
         serde_json::from_value(json!({ "address": "127.0.0.1:7443" })).unwrap(),
@@ -399,6 +402,7 @@ async fn creates_updates_and_removes_switches_ports_and_dhcp() {
     let nb = Nb::new().await;
     let (n1, n2) = (Uuid::now_v7(), Uuid::now_v7());
     let mut want = NbState {
+        routers: Vec::new(),
         switches: vec![
             switch(
                 n1,
@@ -521,6 +525,7 @@ async fn duplicate_switches_of_ours_are_collapsed() {
     let nb = Nb::new().await;
     let n = Uuid::now_v7();
     let want = NbState {
+        routers: Vec::new(),
         switches: vec![switch(n, vec![], vec![])],
     };
     nb.fake.with(|s| {
@@ -541,6 +546,7 @@ async fn fencing_refuses_a_writer_that_read_an_older_token() {
     let nb = Nb::new().await;
     let n = Uuid::now_v7();
     let want = NbState {
+        routers: Vec::new(),
         switches: vec![switch(n, vec![], vec![])],
     };
     nb.sync(&want, "1:5").await;
@@ -584,6 +590,7 @@ async fn one_failing_network_does_not_block_the_others() {
     let nb = Nb::new().await;
     let (n1, n2) = (Uuid::now_v7(), Uuid::now_v7());
     let want = NbState {
+        routers: Vec::new(),
         switches: vec![
             switch(n1, vec![port("opl-taken", "10.0.0.5", None)], vec![]),
             switch(n2, vec![port("opl-free", "10.0.1.5", None)], vec![]),
@@ -662,6 +669,7 @@ async fn five_thousand_ports_resync_quickly() {
     let nb = Nb::new().await;
     let networks: Vec<Uuid> = (0..50).map(|_| Uuid::now_v7()).collect();
     let want = NbState {
+        routers: Vec::new(),
         switches: networks
             .iter()
             .enumerate()

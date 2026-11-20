@@ -420,7 +420,7 @@ jobs:
       - name: QEMU (OVN itself is installed by orbivisord)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils busybox
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils busybox tcpdump
           test ! -e /etc/ovn
           test ! -e /etc/openvswitch
           if dpkg -s ovn-central >/dev/null 2>&1 || dpkg -s openvswitch-switch >/dev/null 2>&1; then exit 1; fi

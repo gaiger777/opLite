@@ -62,6 +62,78 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
             ("external_ids", Map),
         ],
         "DHCP_Options" => &[("cidr", Str), ("options", Map), ("external_ids", Map)],
+        // 계획 66: 라우터·게이트웨이 HA·NAT·보안 그룹(뿌리 여부·참조는 OVN 24.03 스키마 7.3.0대로)
+        "Logical_Router" => &[
+            ("name", Str),
+            ("ports", Ref("Logical_Router_Port", true)),
+            ("static_routes", Ref("Logical_Router_Static_Route", true)),
+            ("nat", Ref("NAT", true)),
+            ("enabled", Set),
+            ("options", Map),
+            ("external_ids", Map),
+        ],
+        "Logical_Router_Port" => &[
+            ("name", Str),
+            ("networks", Set),
+            ("mac", Str),
+            ("peer", Set),
+            ("enabled", Set),
+            ("ha_chassis_group", Ref("HA_Chassis_Group", true)),
+            ("gateway_chassis", Set),
+            ("options", Map),
+            ("ipv6_ra_configs", Map),
+            ("status", Map),
+            ("external_ids", Map),
+        ],
+        "Logical_Router_Static_Route" => &[
+            ("ip_prefix", Str),
+            ("nexthop", Str),
+            ("policy", Set),
+            ("output_port", Set),
+            ("route_table", Str),
+            ("options", Map),
+            ("external_ids", Map),
+        ],
+        "NAT" => &[
+            ("type", Str),
+            ("external_ip", Str),
+            ("logical_ip", Str),
+            ("logical_port", Set),
+            ("external_mac", Set),
+            ("gateway_port", Ref("Logical_Router_Port", false)),
+            ("options", Map),
+            ("external_ids", Map),
+        ],
+        "HA_Chassis_Group" => &[
+            ("name", Str),
+            ("ha_chassis", Ref("HA_Chassis", true)),
+            ("external_ids", Map),
+        ],
+        "HA_Chassis" => &[
+            ("chassis_name", Str),
+            ("priority", Int),
+            ("external_ids", Map),
+        ],
+        "Port_Group" => &[
+            ("name", Str),
+            ("ports", Ref("Logical_Switch_Port", false)),
+            ("acls", Ref("ACL", true)),
+            ("external_ids", Map),
+        ],
+        "ACL" => &[
+            ("name", Set),
+            ("priority", Int),
+            ("direction", Str),
+            ("match", Str),
+            ("action", Str),
+            ("log", Set),
+            ("severity", Set),
+            ("meter", Set),
+            ("label", Int),
+            ("tier", Int),
+            ("options", Map),
+            ("external_ids", Map),
+        ],
         "SB_Global" => &[("nb_cfg", Int), ("external_ids", Map), ("options", Map)],
         "Chassis" => &[
             ("name", Str),
@@ -90,13 +162,27 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
 
 /// 참조가 없으면 커밋 때 사라지는 표
 fn is_root(table: &str) -> bool {
-    !matches!(table, "Logical_Switch_Port" | "Encap")
+    !matches!(
+        table,
+        "Logical_Switch_Port"
+            | "Encap"
+            | "Logical_Router_Port"
+            | "Logical_Router_Static_Route"
+            | "NAT"
+            | "HA_Chassis"
+            | "ACL"
+    )
 }
 
 /// 이름 색인(표에서 하나)
 fn index(table: &str) -> Option<&'static str> {
     match table {
-        "Logical_Switch_Port" | "Chassis" | "Chassis_Private" => Some("name"),
+        "Logical_Switch_Port"
+        | "Chassis"
+        | "Chassis_Private"
+        | "Logical_Router_Port"
+        | "HA_Chassis_Group"
+        | "Port_Group" => Some("name"),
         _ => None,
     }
 }

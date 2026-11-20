@@ -9,13 +9,21 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::host::valid_host;
-use crate::network::Subnet as NetSubnet;
+use crate::network::{Ipv6Mode, NetworkSpec};
 use crate::resource::Kind;
 use crate::vm::NicSpec;
 
-/// SDN 네트워크(이름)마다 그 서브넷(계획 65). network-config가 SDN NIC의 주소 설정을 IPAM 주소(`NicSpec.ips`)와 서브넷으로
-/// 만든다. 단순 네트워크는 넣지 않는다.
-pub type SdnSubnets = BTreeMap<String, Vec<NetSubnet>>;
+/// SDN 네트워크(이름)마다 그 스펙과 라우터 인터페이스인지(계획 65·66). network-config가 SDN NIC의 주소 설정을 IPAM
+/// 주소(`NicSpec.ips`)와 서브넷으로 만든다. 단순 네트워크는 넣지 않는다.
+pub type SdnSubnets = BTreeMap<String, SdnNicNetwork>;
+
+/// SDN NIC 하나가 붙은 네트워크(계획 66): 스펙(서브넷·공급자)과 라우터 인터페이스인지(게이트웨이·RA가 있음)
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct SdnNicNetwork {
+    pub spec: NetworkSpec,
+    #[serde(default)]
+    pub routed: bool,
+}
 
 /// 응답에서 비밀번호(해시) 대신 보이는 값. PUT 본문의 이 값은 "저장된 해시를 그대로 둠"이다.
 pub const PASSWORD_MASK: &str = "********";
@@ -435,10 +443,16 @@ enum Subnet<'a> {
     Dhcp6,
     #[serde(rename = "ipv6_slaac")]
     Ipv6Slaac,
+    /// 계획 66: 주소는 RA(SLAAC), 나머지는 DHCPv6
+    #[serde(rename = "ipv6_dhcpv6-stateless")]
+    Ipv6Dhcpv6Stateless,
+    /// 계획 66: 주소도 DHCPv6
+    #[serde(rename = "ipv6_dhcpv6-stateful")]
+    Ipv6Dhcpv6Stateful,
     Static {
         address: std::borrow::Cow<'a, str>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        gateway: Option<&'a str>,
+        gateway: Option<std::borrow::Cow<'a, str>>,
         /// SDN 서브넷의 DNS 서버(계획 65, DHCP가 없는 서브넷). 비면 쓰지 않는다.
         #[serde(skip_serializing_if = "Vec::is_empty")]
         dns_nameservers: Vec<String>,
@@ -446,7 +460,7 @@ enum Subnet<'a> {
     Static6 {
         address: std::borrow::Cow<'a, str>,
         #[serde(skip_serializing_if = "Option::is_none")]
-        gateway: Option<&'a str>,
+        gateway: Option<std::borrow::Cow<'a, str>>,
         #[serde(skip_serializing_if = "Vec::is_empty")]
         dns_nameservers: Vec<String>,
     },
@@ -560,30 +574,39 @@ fn seed_network_key(ci: &CloudInit, nics: &[NicSpec]) -> Option<String> {
     Some(key)
 }
 
-/// SDN NIC 하나의 주소 설정(계획 65 §9): IPv4 주소의 서브넷이 DHCP면 `dhcp`, 아니면 `static`(주소/접두사, 서브넷 DNS),
-/// IPv6는 `static6`이다(게이트웨이는 라우터가 오는 66부터). 주소가 없으면 IPv4 DHCP다. 서브넷에 들지 않는 주소(서브넷을
-/// 뺀 뒤)는 적지 않는다.
-fn sdn_subnets<'a>(nic: &NicSpec, subnets: &[NetSubnet]) -> Vec<Subnet<'a>> {
+/// SDN NIC 하나의 주소 설정(계획 65 §9, 계획 66 §10): IPv4 주소의 서브넷이 DHCP([`NetworkSpec::subnet_dhcp`])면 `dhcp`,
+/// 아니면 `static`(주소/접두사, 서브넷 DNS), IPv6는 `static6`이다. 라우터 인터페이스인 네트워크(RA가 있음)의 `ipv6_mode`
+/// 서브넷은 `ipv6_slaac`·`ipv6_dhcpv6-*`다. 고정 주소의 `gateway`는 라우터 인터페이스이거나 공급자 네트워크(물리 라우터)일
+/// 때만 적는다(라우터가 없는 오버레이는 계획 65 그대로 바이트까지 같다). 주소가 없으면 IPv4 DHCP다. 서브넷에 들지 않는
+/// 주소(서브넷을 뺀 뒤)는 적지 않는다.
+fn sdn_subnets<'a>(nic: &NicSpec, net: &SdnNicNetwork) -> Vec<Subnet<'a>> {
     let mut ips = nic.ips.clone();
     ips.sort_by_key(|ip| !ip.is_ipv4());
     if ips.is_empty() {
         return vec![Subnet::Dhcp];
     }
+    let spec = &net.spec;
+    let with_gateway = net.routed || spec.is_provider();
     ips.iter()
         .filter_map(|ip| {
-            let subnet = subnets.iter().find(|s| s.cidr.contains(*ip))?;
+            let subnet = spec.subnets.iter().find(|s| s.cidr.contains(*ip))?;
             let address = format!("{ip}/{}", subnet.cidr.prefix).into();
             let dns = || subnet.dns_servers.iter().map(ToString::to_string).collect();
-            Some(match (ip.is_ipv4(), subnet.dhcp()) {
-                (true, true) => Subnet::Dhcp,
-                (true, false) => Subnet::Static {
+            let gateway = with_gateway.then(|| subnet.gateway().to_string().into());
+            let mode = subnet.ipv6_mode.filter(|_| net.routed);
+            Some(match (ip.is_ipv4(), spec.subnet_dhcp(subnet), mode) {
+                (true, true, _) => Subnet::Dhcp,
+                (true, false, _) => Subnet::Static {
                     address,
-                    gateway: None,
+                    gateway,
                     dns_nameservers: dns(),
                 },
-                (false, _) => Subnet::Static6 {
+                (false, _, Some(Ipv6Mode::Slaac)) => Subnet::Ipv6Slaac,
+                (false, _, Some(Ipv6Mode::Dhcpv6Stateless)) => Subnet::Ipv6Dhcpv6Stateless,
+                (false, _, Some(Ipv6Mode::Dhcpv6Stateful)) => Subnet::Ipv6Dhcpv6Stateful,
+                (false, _, None) => Subnet::Static6 {
                     address,
-                    gateway: None,
+                    gateway,
                     dns_nameservers: dns(),
                 },
             })
@@ -608,11 +631,11 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec], sdn: &SdnSubnets) -> Option<
         .iter()
         .enumerate()
         .map(|(i, nic)| {
-            if let Some(subnets) = sdn.get(&nic.network) {
+            if let Some(net) = sdn.get(&nic.network) {
                 return NetEntry::Physical {
                     name: format!("eth{i}"),
                     mac_address: nic.mac.map(|m| m.to_string()),
-                    subnets: sdn_subnets(nic, subnets),
+                    subnets: sdn_subnets(nic, net),
                 };
             }
             let net = ci.networks.get(i);
@@ -623,7 +646,7 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec], sdn: &SdnSubnets) -> Option<
                     None | Some(IpConfig::Dhcp) | Some(IpConfig::Slaac) => Subnet::Dhcp,
                     Some(IpConfig::Static { address, gateway }) => Subnet::Static {
                         address: address.as_str().into(),
-                        gateway: gateway.as_deref(),
+                        gateway: gateway.as_deref().map(Into::into),
                         dns_nameservers: Vec::new(),
                     },
                 });
@@ -634,7 +657,7 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec], sdn: &SdnSubnets) -> Option<
                 Some(IpConfig::Slaac) => subnets.push(Subnet::Ipv6Slaac),
                 Some(IpConfig::Static { address, gateway }) => subnets.push(Subnet::Static6 {
                     address: address.as_str().into(),
-                    gateway: gateway.as_deref(),
+                    gateway: gateway.as_deref().map(Into::into),
                     dns_nameservers: Vec::new(),
                 }),
             }
@@ -1262,9 +1285,13 @@ mod tests {
         ]))
         .unwrap();
         let sdn: SdnSubnets = serde_json::from_value(serde_json::json!({
-            "tenant": [{ "cidr": "10.0.0.0/24" }, { "cidr": "2001:db8::/64", "dns_servers": ["2001:db8::53"] }],
-            "static": [{ "cidr": "10.9.0.0/16", "dhcp": false, "dns_servers": ["10.9.0.53"] }],
-            "bare": []
+            "tenant": { "spec": { "sdn": {}, "subnets": [
+                { "cidr": "10.0.0.0/24" }, { "cidr": "2001:db8::/64", "dns_servers": ["2001:db8::53"] }
+            ] } },
+            "static": { "spec": { "sdn": {}, "subnets": [
+                { "cidr": "10.9.0.0/16", "dhcp": false, "dns_servers": ["10.9.0.53"] }
+            ] } },
+            "bare": { "spec": { "sdn": {} } }
         }))
         .unwrap();
         // 주소 설정이 없어도 SDN NIC가 있으면 파일이 있다. 단순 NIC는 지금처럼 DHCP다.
@@ -1305,6 +1332,82 @@ mod tests {
         assert_eq!(
             plain,
             render_sdn(Uuid::nil(), "web", &hashed(), &super::tests::nics(), &sdn)
+        );
+    }
+
+    /// 계획 66 §10: 라우터 인터페이스인 네트워크의 고정 주소에는 게이트웨이, `ipv6_mode`는 RA·DHCPv6 항목. 라우터가 없으면
+    /// `ipv6_mode`가 있어도 고정 주소(RA가 없다), 공급자 네트워크는 물리 라우터를 게이트웨이로 적고 DHCP는 기본 꺼짐이다.
+    #[test]
+    fn routed_and_provider_nics_get_gateways_and_ipv6_modes() {
+        let nics: Vec<NicSpec> = serde_json::from_value(serde_json::json!([
+            { "network": "routed", "model": "virtio", "mac": "52:54:00:00:00:01",
+              "ips": ["10.9.0.7", "2001:db8::5054:ff:fe00:1"] },
+            { "network": "stateful", "model": "virtio", "mac": "52:54:00:00:00:02",
+              "ips": ["2001:db8:1::10"] },
+            { "network": "stateless", "model": "virtio", "mac": "52:54:00:00:00:03",
+              "ips": ["2001:db8:2::5054:ff:fe00:3"] },
+            { "network": "unrouted", "model": "virtio", "mac": "52:54:00:00:00:04",
+              "ips": ["10.8.0.7", "2001:db8:3::5054:ff:fe00:4"] },
+            { "network": "ext", "model": "virtio", "mac": "52:54:00:00:00:05",
+              "ips": ["203.0.113.10"] }
+        ]))
+        .unwrap();
+        let sdn: SdnSubnets = serde_json::from_value(serde_json::json!({
+            "routed": { "routed": true, "spec": { "sdn": {}, "subnets": [
+                { "cidr": "10.9.0.0/24", "dhcp": false },
+                { "cidr": "2001:db8::/64", "ipv6_mode": "slaac" }
+            ] } },
+            "stateful": { "routed": true, "spec": { "sdn": {}, "subnets": [
+                { "cidr": "2001:db8:1::/64", "ipv6_mode": "dhcpv6-stateful" }
+            ] } },
+            "stateless": { "routed": true, "spec": { "sdn": {}, "subnets": [
+                { "cidr": "2001:db8:2::/64", "ipv6_mode": "dhcpv6-stateless" }
+            ] } },
+            "unrouted": { "spec": { "sdn": {}, "subnets": [
+                { "cidr": "10.8.0.0/24", "dhcp": false },
+                { "cidr": "2001:db8:3::/64", "ipv6_mode": "slaac" }
+            ] } },
+            "ext": { "spec": { "sdn": { "provider": { "physnet": "ext" } }, "subnets": [
+                { "cidr": "203.0.113.0/24" }
+            ] } }
+        }))
+        .unwrap();
+        let seed = render_sdn(Uuid::nil(), "web", &CloudInit::default(), &nics, &sdn);
+        let net: serde_json::Value =
+            serde_json::from_str(seed.network_config.as_deref().unwrap()).unwrap();
+        let subnets: Vec<_> = (0..5)
+            .map(|i| net["config"][i]["subnets"].clone())
+            .collect();
+        assert_eq!(
+            subnets,
+            [
+                serde_json::json!([
+                    { "type": "static", "address": "10.9.0.7/24", "gateway": "10.9.0.1" },
+                    { "type": "ipv6_slaac" }
+                ]),
+                serde_json::json!([{ "type": "ipv6_dhcpv6-stateful" }]),
+                serde_json::json!([{ "type": "ipv6_dhcpv6-stateless" }]),
+                serde_json::json!([
+                    { "type": "static", "address": "10.8.0.7/24" },
+                    { "type": "static6", "address": "2001:db8:3:0:5054:ff:fe00:4/64" }
+                ]),
+                serde_json::json!([
+                    { "type": "static", "address": "203.0.113.10/24", "gateway": "203.0.113.1" }
+                ]),
+            ]
+        );
+        // instance-id는 NIC 주소로만 센다(라우터를 붙여도 그대로).
+        let mut unrouted = sdn.clone();
+        for n in unrouted.values_mut() {
+            n.routed = false;
+        }
+        assert_eq!(
+            seed.instance_id,
+            render_sdn(Uuid::nil(), "web", &CloudInit::default(), &nics, &unrouted).instance_id
+        );
+        assert_ne!(
+            seed.network_config,
+            render_sdn(Uuid::nil(), "web", &CloudInit::default(), &nics, &unrouted).network_config
         );
     }
 

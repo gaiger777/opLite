@@ -487,12 +487,14 @@ pub async fn runtime_medium(
     result.map(Some)
 }
 
-/// NIC들 `nics`가 쓰는 SDN 네트워크마다 그 서브넷(cloud-init network-config용, 계획 65). 단순 네트워크는 넣지 않는다.
+/// NIC들 `nics`가 쓰는 SDN 네트워크마다 그 스펙과 라우터 인터페이스인지(cloud-init network-config용, 계획 65·66). 단순
+/// 네트워크는 넣지 않는다.
 fn sdn_subnets(
     cluster: &Cluster,
     nics: &[opl_types::vm::NicSpec],
 ) -> Result<cloud_init::SdnSubnets, ResolveError> {
     let mut out = cloud_init::SdnSubnets::new();
+    let mut routers: Option<Vec<opl_types::router::Router>> = None;
     for nic in nics.iter().filter(|n| n.network != USER_NETWORK) {
         if out.contains_key(&nic.network) {
             continue;
@@ -500,7 +502,22 @@ fn sdn_subnets(
         if let Some(net) = cluster.get_by_name::<NetworkSpec>(&nic.network)?
             && net.spec.is_sdn()
         {
-            out.insert(nic.network.clone(), net.spec.subnets);
+            // 라우터 인터페이스인 오버레이 네트워크(계획 66): 고정 주소에 게이트웨이, IPv6 모드에 RA가 있다.
+            let routers = match &mut routers {
+                Some(r) => r,
+                None => routers.insert(cluster.list::<opl_types::router::RouterSpec>()?.1),
+            };
+            let routed = !net.spec.is_provider()
+                && routers
+                    .iter()
+                    .any(|r| r.spec.interfaces.iter().any(|i| i.network == nic.network));
+            out.insert(
+                nic.network.clone(),
+                cloud_init::SdnNicNetwork {
+                    spec: net.spec,
+                    routed,
+                },
+            );
         }
     }
     Ok(out)
