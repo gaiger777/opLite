@@ -385,6 +385,11 @@ async fn subnets_change_and_addresses_are_listed() {
     assert_eq!(ips["allocations"][0]["ips"], json!(["10.10.0.2"]));
     assert!(ips["allocations"][0]["live"].is_null(), "{ips}");
     assert!(ips["live_error"].is_string(), "{ips}");
+    // `live=false`면 OVN을 읽지 않는다(까닭도 없다).
+    let (status, quick) = admin.get("/networks/tenant/ips?live=false").await;
+    assert_eq!(status, StatusCode::OK, "{quick}");
+    assert!(quick.get("live_error").is_none(), "{quick}");
+    assert_eq!(quick["subnets"], ips["subnets"]);
 
     // 서브넷 더하기·바꾸기(리비전 확인). 있던 NIC에는 주소를 저절로 주지 않는다.
     let rev = net["revision"].as_u64().unwrap();
@@ -508,4 +513,296 @@ async fn clones_take_requested_addresses() {
         "{copy}"
     );
     let _: Value = copy;
+}
+
+async fn folder(admin: &common::Client, name: &str, kind: &str) -> String {
+    let (status, body) = admin
+        .post("/folders", json!({ "name": name, "kind": kind }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+/// 폴더 둘(teamA·teamB)이 함께 쓰는 SDN 네트워크 `shared`(네트워크 폴더 netA)와 각 폴더의 VM a1·b1. alice는 teamA·netA의
+/// operator다.
+async fn shared_world(env: &Env) -> (common::Client, common::Client, String, String) {
+    let admin = env.admin().await;
+    ready_sdn(env, &[env.node]).await;
+    let a = folder(&admin, "teamA", "vm").await;
+    let b = folder(&admin, "teamB", "vm").await;
+    let net = folder(&admin, "netA", "network").await;
+    let (status, body) = admin
+        .post(
+            "/networks",
+            json!({ "name": "shared", "spec": { "sdn": {}, "folder": net,
+                    "subnets": [{ "cidr": "10.10.0.0/24" }] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    for (name, f) in [("a1", &a), ("b1", &b)] {
+        let mut req = vm_request(name);
+        req["spec"]["folder"] = json!(f);
+        req["spec"]["nics"] = json!([{ "network": "shared", "model": "virtio" }]);
+        let (status, body) = admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let (status, body) = admin
+        .post(
+            "/users",
+            json!({ "name": "alice", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let alice_id = body["id"].as_str().unwrap().to_string();
+    for target in [&a, &net] {
+        let (status, body) = admin
+            .post(
+                "/grants",
+                json!({
+                    "principal": { "type": "user", "id": alice_id },
+                    "role": { "type": "builtin", "role": "operator" },
+                    "target": { "type": "folder", "id": target },
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let alice = env.login("alice", "password-1").await;
+    (admin, alice, a, b)
+}
+
+/// 리뷰 1 I-1·I-2: 네트워크를 함께 쓰는 다른 폴더의 VM은 주소 목록에도 `ip_in_use` 문구에도 드러나지 않고, 복제는 권한을
+/// 본 뒤에야 주소를 본다.
+#[tokio::test]
+async fn folder_users_see_only_their_own_addresses() {
+    let env = Env::start().await;
+    let (admin, alice, team_a, team_b) = shared_world(&env).await;
+    let (_, b1) = admin.get("/vms/b1").await;
+    let taken = b1["spec"]["nics"][0]["ips"][0]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 주소 목록: alice는 a1만 보고, b1은 수로만 센다. 사용 수는 모두다.
+    let (status, ips) = alice.get("/networks/shared/ips").await;
+    assert_eq!(status, StatusCode::OK, "{ips}");
+    let names: Vec<&str> = ips["allocations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["vm_name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["a1"], "{ips}");
+    assert_eq!(ips["hidden"], 1, "{ips}");
+    assert_eq!(ips["subnets"][0]["used"], 2, "{ips}");
+    assert!(!ips.to_string().contains(&taken), "{ips}");
+    let (_, all) = admin.get("/networks/shared/ips").await;
+    assert_eq!(all["allocations"].as_array().unwrap().len(), 2, "{all}");
+    assert!(all.get("hidden").is_none(), "{all}");
+
+    // 쓰는 주소: 409지만 읽을 수 없는 VM의 이름은 대지 않는다(관리자에게는 댄다).
+    let mut req = vm_request("a2");
+    req["spec"]["folder"] = json!(team_a);
+    req["spec"]["nics"] = json!([{ "network": "shared", "model": "virtio", "ips": [taken] }]);
+    let (status, body) = alice.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "ip_in_use", "{body}");
+    assert!(!body["message"].as_str().unwrap().contains("b1"), "{body}");
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("b1"), "{body}");
+
+    // 복제: 새 폴더에 만들 권한이 없으면 주소를 보기 전에 거절한다(쓰는 주소인지 캐 볼 수 없다).
+    let (status, body) = alice
+        .post(
+            "/vms/a1/clone",
+            json!({ "name": "probe", "folder": team_b, "ips": [[taken]] }),
+        )
+        .await;
+    assert!(
+        status == StatusCode::FORBIDDEN || status == StatusCode::NOT_FOUND,
+        "{status}: {body}"
+    );
+    let (status, body) = alice
+        .post(
+            "/vms/a1/clone",
+            json!({ "name": "probe", "ips": [[taken]] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(!body["message"].as_str().unwrap().contains("b1"), "{body}");
+}
+
+/// 리뷰 1 I-3: IPv4 대응 IPv6는 IPv4로 저장되고, IPv4와 함께 주면 한 NIC에 IPv4 둘이라 400이다.
+#[tokio::test]
+async fn mapped_ipv6_addresses_count_as_ipv4() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env, &[env.node]).await;
+    admin
+        .post(
+            "/networks",
+            json!({ "name": "tenant", "spec": { "sdn": {}, "subnets": [{ "cidr": "10.10.0.0/24" }] } }),
+        )
+        .await;
+    let mut req = vm_request("two");
+    req["spec"]["nics"] = json!([{ "network": "tenant", "model": "virtio",
+                                   "ips": ["::ffff:10.10.0.5", "10.10.0.6"] }]);
+    let (status, body) = admin.post("/vms", req.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    req["spec"]["nics"][0]["ips"] = json!(["::ffff:10.10.0.5"]);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    assert_eq!(vm["spec"]["nics"][0]["ips"], json!(["10.10.0.5"]), "{vm}");
+    let (status, body) = admin
+        .post(
+            "/vms/two/clone",
+            json!({ "name": "copy", "ips": [["::ffff:10.10.0.7", "10.10.0.8"]] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// 리뷰 1 웹 #2: 복제가 NIC를 SDN 네트워크로 옮기면 그 NIC의 보안 그룹과 cloud-init 고정 주소가 빠진다(경고). 새 VM은
+/// 그대로 다시 저장할 수 있다.
+#[tokio::test]
+async fn clones_onto_sdn_drop_groups_and_static_cloud_init() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env, &[env.node]).await;
+    for body in [
+        json!({ "name": "lan", "spec": { "bridge": "vmbr0" } }),
+        json!({ "name": "tenant", "spec": { "sdn": {}, "subnets": [{ "cidr": "10.10.0.0/24" }] } }),
+    ] {
+        let (status, b) = admin.post("/networks", body).await;
+        assert_eq!(status, StatusCode::CREATED, "{b}");
+    }
+    let (status, b) = admin
+        .post("/security-groups", json!({ "name": "ssh", "spec": {} }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    let mut req = vm_request("src");
+    req["spec"]["nics"] =
+        json!([{ "network": "lan", "model": "virtio", "security_groups": ["ssh"] }]);
+    req["spec"]["cloud_init"] = json!({ "user": "orbi",
+        "networks": [{ "ipv4": { "mode": "static", "address": "192.168.0.5/24" } }] });
+    let (status, b) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{b}");
+    // 주소를 주어도 미리 보기가 그룹 때문에 거절하지 않는다.
+    let (status, task) = admin
+        .post(
+            "/vms/src/clone",
+            json!({ "name": "copy", "nics": ["tenant"], "ips": [["10.10.0.9"]] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let done = admin.wait_task(&task).await;
+    assert_eq!(done["status"]["state"], "succeeded", "{done}");
+    let warning = done["status"]["error"].as_str().unwrap_or_default();
+    assert!(warning.contains("dropped security groups ssh"), "{done}");
+    assert!(warning.contains("cloud-init"), "{done}");
+    let (_, copy) = admin.get("/vms/copy").await;
+    let nic = &copy["spec"]["nics"][0];
+    assert_eq!(nic["network"], "tenant", "{copy}");
+    assert!(nic.get("security_groups").is_none(), "{copy}");
+    assert_eq!(nic["ips"], json!(["10.10.0.9"]), "{copy}");
+    assert_eq!(
+        copy["spec"]["cloud_init"]["networks"],
+        json!([{}]),
+        "{copy}"
+    );
+    let rev = copy["revision"].as_u64().unwrap();
+    let mut spec = copy["spec"].clone();
+    spec["memory_mib"] = json!(512);
+    let (status, body) = admin
+        .put("/vms/copy", json!({ "spec": spec }), Some(rev))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// 리뷰 1 I-5·I-7: 루프백이 노드 주소가 아니면 중앙 주소가 될 수 없고, 끝나지 않은 첫 세우기를 주소 없이 다시 하면
+/// 지난번 주소로 한다.
+#[tokio::test]
+async fn init_retries_keep_the_address() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    give_underlay(&env).await;
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.cluster_addresses = vec!["10.1.0.5:7444".into()];
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let admin = env.admin().await;
+    for bad in ["::1", "0.0.0.0", "169.254.1.1"] {
+        let (status, body) = admin
+            .post("/sdn", json!({ "node": "node1", "address": bad }))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    let (status, task) = admin
+        .post("/sdn", json!({ "node": "node1", "address": "10.1.0.5" }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    finish(&env, &task).await;
+    let (status, again) = admin.post("/sdn", json!({ "node": "node1" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{again}");
+    assert_eq!(
+        again["spec"]["op"],
+        json!({ "kind": "sdn-init", "address": "10.1.0.5" })
+    );
+    let sdn = env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(sdn.status.init_address, Some("10.1.0.5".parse().unwrap()));
+}
+
+/// 리뷰 1 I-7: 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙 더하기)는 중앙 빼기로 떠나게 하고, 그 전에는
+/// 클러스터에서 지울 수 없다.
+#[tokio::test]
+async fn half_joined_centrals_can_be_removed() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    let admin = env.admin().await;
+    let n2 = other_node(&env, "node2", true).await;
+    ready_sdn(&env, &[env.node]).await;
+    let (status, body) = admin.delete("/sdn/centrals/node2").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let mut node2 = env.cluster.get::<NodeSpec>(n2).unwrap().unwrap();
+    node2.status.sdn = Some(opl_types::sdn::NodeSdn {
+        central: Some(opl_types::sdn::CentralHealth {
+            nb: opl_types::sdn::RaftRole::Follower,
+            sb: opl_types::sdn::RaftRole::Follower,
+            northd_active: false,
+        }),
+        ..Default::default()
+    });
+    env.cluster
+        .update_status::<NodeSpec>(n2, &node2.status)
+        .await
+        .unwrap();
+    // 마지막(하나뿐인) 중앙이 있어도 반쯤 합류한 노드는 뺄 수 있고, 중앙 수가 그대로라 경고가 없다.
+    let (status, headers, task) = admin
+        .send_headers(Method::DELETE, "/sdn/centrals/node2", Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["op"]["kind"], "sdn-central-remove");
+    assert!(headers.get("orbivisor-warning").is_none(), "{headers:?}");
+    // 떠나기 전에는 클러스터에서 지울 수 없다.
+    let mut node2 = env.cluster.get::<NodeSpec>(n2).unwrap().unwrap();
+    node2.status.online = false;
+    env.cluster
+        .update_status::<NodeSpec>(n2, &node2.status)
+        .await
+        .unwrap();
+    let (status, body) = admin.delete("/nodes/node2").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "sdn_central_on_node", "{body}");
 }

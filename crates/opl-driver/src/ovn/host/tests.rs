@@ -1059,3 +1059,81 @@ fn linux_only_unless_tests_allow_any_os() {
     );
     assert_eq!(host.check_platform().is_ok(), cfg!(target_os = "linux"));
 }
+
+/// 제자리 DB의 Raft 주소(`db-local-address`)와 이 SDN의 DB가 남았는지(리뷰 1 I-7)
+#[tokio::test]
+async fn database_address_and_membership() {
+    let env = Env::new();
+    // 파일이 없으면 모른다(명령도 부르지 않는다).
+    assert_eq!(env.host.db_local_address(Db::Nb).await.unwrap(), None);
+    assert!(env.calls().is_empty());
+    let known = KnownCids {
+        nb: Some(CID_NB.parse().unwrap()),
+        sb: Some(CID_SB.parse().unwrap()),
+    };
+    assert!(!env.host.has_cluster_db(known).await);
+
+    env.write("var/lib/opl/ovn/nb.db", "nb");
+    let nb = env.p("var/lib/opl/ovn/nb.db");
+    env.fake().reply(
+        &format!("ovsdb-tool db-local-address {nb}"),
+        CmdOutput::ok("ssl:10.0.0.1:6643\n"),
+    );
+    assert_eq!(
+        env.host.db_local_address(Db::Nb).await.unwrap().as_deref(),
+        Some("ssl:10.0.0.1:6643")
+    );
+    assert_eq!(
+        env.host
+            .db_address_differs(Db::Nb, ip("10.0.0.1"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        env.host
+            .db_address_differs(Db::Nb, ip("10.0.0.2"))
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("ssl:10.0.0.1:6643")
+    );
+    // 주소 꼴이 아닌 답은 모르는 것이다.
+    env.fake().reply(
+        &format!("ovsdb-tool db-local-address {nb}"),
+        CmdOutput::ok("something else\n"),
+    );
+    assert_eq!(
+        env.host
+            .db_address_differs(Db::Nb, ip("10.0.0.2"))
+            .await
+            .unwrap(),
+        None
+    );
+
+    // 이 SDN의 id면(또는 합류 중이라 아직 모르면) 남은 멤버다. 다른 클러스터의 DB나 Raft가 id를 모르면 아니다.
+    env.fake().reply(
+        &format!("ovsdb-tool db-cid {nb}"),
+        CmdOutput::ok(format!("{CID_NB}\n")),
+    );
+    assert!(env.host.has_cluster_db(known).await);
+    assert!(!env.host.has_cluster_db(KnownCids::default()).await);
+    env.fake().reply(
+        &format!("ovsdb-tool db-cid {nb}"),
+        CmdOutput::ok(format!("{CID_SB}\n")),
+    );
+    assert!(!env.host.has_cluster_db(known).await);
+    env.fake().reply(
+        &format!("ovsdb-tool db-cid {nb}"),
+        CmdOutput::fail(1, "ovsdb-tool: database: cluster ID not yet known"),
+    );
+    assert!(env.host.has_cluster_db(known).await);
+
+    // 하나만 이름을 바꾼다.
+    let moved = env.host.retire_db(Db::Nb, 1_700_000_000).unwrap();
+    assert_eq!(
+        moved,
+        Some(env.path("var/lib/opl/ovn/nb.db.left-1700000000"))
+    );
+    assert_eq!(env.host.retire_db(Db::Nb, 1).unwrap(), None);
+}

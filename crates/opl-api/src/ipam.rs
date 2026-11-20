@@ -13,8 +13,27 @@ use opl_types::ipam::{self, IpamError};
 use opl_types::network::{Network, NetworkSpec};
 use opl_types::vm::{Vm, VmSpec};
 
+use opl_types::authz::Privilege;
+
+use crate::auth::Principal;
+use crate::authz::AuthzObject;
 use crate::cluster::require_feature;
 use crate::error::ApiError;
+use crate::state::AppState;
+
+/// 주체 `principal`이 읽을 수 있는 VM인지(오류 문구에 이름을 댈지). 주체가 없으면(요청 밖) 대지 않는다.
+pub(crate) fn readable<'a>(
+    state: &'a AppState,
+    principal: Option<&'a Principal>,
+) -> impl Fn(&Vm) -> bool + 'a {
+    move |vm: &Vm| {
+        principal.is_some_and(|p| {
+            state
+                .authz
+                .allows(p, Privilege::SystemRead, vm.authz_target())
+        })
+    }
+}
 
 /// Raft가 주소 겹침으로 거절했을 때 다시 고르는 횟수
 pub(crate) const RETRIES: usize = 5;
@@ -65,11 +84,15 @@ fn exhausted(network: &str, e: IpamError) -> ApiError {
 /// - 새로 준 주소는 그 네트워크의 서브넷 안(400)이고 예약이 아니며(400) 다른 NIC가 쓰지 않아야 한다(409 `ip_in_use`).
 /// - **새 NIC**(새 VM, 새 MAC, 바꾼 네트워크, 템플릿에서 되돌림)만 비어 있는 주소 체계마다 서브넷에서 가장 낮은 빈 주소를
 ///   받는다(다 쓰였으면 409 `ip_exhausted`). 이미 있던 NIC에는 서브넷을 더해도 저절로 주지 않는다(설계 §9).
+///
+/// `sees`는 부른 사용자가 읽을 수 있는 VM인지다: 409 `ip_in_use`는 그런 VM만 이름으로 알린다(리뷰 1 I-2 — 다른
+/// 폴더의 VM 이름을 드러내지 않게).
 pub(crate) fn assign(
     spec: &mut VmSpec,
     current: Option<&VmSpec>,
     others: &[&Vm],
     networks: &[Network],
+    sees: &dyn Fn(&Vm) -> bool,
 ) -> Result<(), ApiError> {
     for (i, nic) in spec.nics.iter().enumerate() {
         let Some(net) = sdn_network(networks, &nic.network) else {
@@ -144,6 +167,7 @@ pub(crate) fn assign(
                 Ok(_) => {}
                 Err(IpamError::InUse(ip)) => {
                     let by = holder(others, &net.name, ip)
+                        .filter(|v| sees(v))
                         .map(|v| format!(" by VM {:?}", v.name))
                         .unwrap_or_default();
                     return Err(ApiError::conflict(
@@ -179,10 +203,12 @@ pub(crate) fn assign(
 /// 있으면 409 `cluster_upgrading`, NIC보다 많으면·SDN이 아닌 네트워크·서브넷 밖·예약 주소는 400, 다른 NIC가 쓰면 409
 /// `ip_in_use`, 서브넷이 다 쓰였으면 409 `ip_exhausted`. 새 VM의 다른 NIC는 Task가 새로 받으므로 주소 없이 본다.
 /// Task가 VM을 만들 때 다시 보고, 그새 쓰였으면 실패한다.
+/// 권한 검사 뒤에 부른다(리뷰 1 I-2 — 권한 없는 요청이 주소의 쓰임을 캐 보지 못하게). `sees`는 [`assign`]과 같다.
 pub(crate) fn check_requested(
     cluster: &Cluster,
     spec: &VmSpec,
     requested: &[Vec<IpAddr>],
+    sees: &dyn Fn(&Vm) -> bool,
 ) -> Result<(), ApiError> {
     if requested.iter().all(Vec::is_empty) {
         return Ok(());
@@ -199,12 +225,61 @@ pub(crate) fn check_requested(
     new.template = false;
     for (i, nic) in new.nics.iter_mut().enumerate() {
         nic.mac = None;
-        nic.ips = requested.get(i).cloned().unwrap_or_default();
+        nic.ips = requested
+            .get(i)
+            .map(|ips| ips.iter().map(|ip| ip.to_canonical()).collect())
+            .unwrap_or_default();
+    }
+    // 주소 체계마다 하나(대응 IPv6를 IPv4로 바꾼 뒤 — 리뷰 1 I-3)
+    for (i, nic) in new.nics.iter().enumerate() {
+        if nic.ips.len() > 2 || (nic.ips.len() == 2 && nic.ips[0].is_ipv4() == nic.ips[1].is_ipv4())
+        {
+            return Err(ApiError::bad_request(format!(
+                "ips: {}",
+                opl_types::vm::ValidationError::NicIps(i)
+            )));
+        }
     }
     let (_, vms) = cluster.list::<VmSpec>()?;
     let (_, networks) = cluster.list::<NetworkSpec>()?;
+    // Task가 SDN NIC의 보안 그룹·cloud-init 주소 항목을 뺀다(아래 [`strip_sdn_nic_config`]) — 미리 보기도 같게.
+    strip_sdn_nic_config(&mut new, &networks);
     let others: Vec<&Vm> = vms.iter().collect();
-    assign(&mut new, None, &others, &networks)
+    assign(&mut new, None, &others, &networks, sees)
+}
+
+/// 복제·배포·가져오기·복원이 만드는 새 VM `spec`에서 SDN 네트워크 NIC의 보안 그룹과 cloud-init 주소 항목을 뺀다(리뷰 1
+/// 웹 #2 — 배포의 네트워크 바꾸기가 그룹이나 고정 주소를 가진 템플릿 NIC를 SDN으로 옮기면 그 VM은 저장할 수 없는 스펙이
+/// 된다: API는 SDN NIC의 둘을 400으로 받지 않는다). 뺀 것마다 경고 한 줄을 돌려준다.
+pub(crate) fn strip_sdn_nic_config(spec: &mut VmSpec, networks: &[Network]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for i in 0..spec.nics.len() {
+        let Some(net) = sdn_network(networks, &spec.nics[i].network) else {
+            continue;
+        };
+        let nic = &mut spec.nics[i];
+        if !nic.security_groups.is_empty() {
+            warnings.push(format!(
+                "NIC {i}: dropped security groups {} — SDN network {:?} protects NICs with port security only",
+                nic.security_groups.join(", "),
+                net.name
+            ));
+            nic.security_groups.clear();
+        }
+        if let Some(entry) = spec
+            .cloud_init
+            .as_mut()
+            .and_then(|ci| ci.networks.get_mut(i))
+            .filter(|n| **n != CloudInitNet::default())
+        {
+            *entry = CloudInitNet::default();
+            warnings.push(format!(
+                "NIC {i}: dropped its cloud-init address settings — SDN network {:?} gives addresses from IPAM",
+                net.name
+            ));
+        }
+    }
+    warnings
 }
 
 /// Task가 만드는 새 VM(복제·템플릿 배포·가져오기·복원·템플릿 되돌리기)의 스펙 `spec`에 주소를 채운다. `vms`는 이미 있는

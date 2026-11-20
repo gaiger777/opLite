@@ -42,8 +42,9 @@ fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
 
-/// 가짜 실행기에 넘기되 `ovsdb-tool create-cluster`·`join-cluster`가 DB 파일을 만든 것처럼 한다.
-struct Runner(FakeRunner);
+/// 가짜 실행기에 넘기되 `ovsdb-tool create-cluster`·`join-cluster`가 DB 파일을 만든 것처럼 하고, `cluster/leave`한
+/// 서버의 `cluster/status`는 떠난 것(`unknown cluster`)으로 답한다.
+struct Runner(FakeRunner, std::sync::Mutex<Vec<String>>);
 
 #[async_trait]
 impl CommandRunner for Runner {
@@ -52,6 +53,22 @@ impl CommandRunner for Runner {
             && matches!(cmd.args[0].as_str(), "create-cluster" | "join-cluster")
         {
             std::fs::write(&cmd.args[1], "db").unwrap();
+        }
+        if cmd.program == "ovs-appctl" {
+            let ctl = cmd.args.get(3).cloned().unwrap_or_default();
+            if cmd.args.iter().any(|a| a == "cluster/status")
+                && self.1.lock().unwrap().contains(&ctl)
+            {
+                self.0.run(cmd).await?;
+                return Ok(CmdOutput {
+                    status: 2,
+                    stdout: b"unknown cluster\n".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            if cmd.args.iter().any(|a| a == "cluster/leave") {
+                self.1.lock().unwrap().push(ctl);
+            }
         }
         self.0.run(cmd).await
     }
@@ -90,7 +107,7 @@ impl Host {
             any_os: true,
             ..OvnOptions::default()
         };
-        let runner = Arc::new(Runner(FakeRunner::new()));
+        let runner = Arc::new(Runner(FakeRunner::new(), Default::default()));
         let host = Arc::new(OvnHost::new(runner.clone(), paths, options, TAG.into()));
         Self {
             _dir: dir,
@@ -830,4 +847,137 @@ async fn sdn_tasks_have_no_timeout() {
         error(&done).contains("cannot run SDN (OVN) tasks"),
         "{done}"
     );
+}
+
+/// 준비된 SDN에서 첫 세우기를 다시 할 때 DB가 없으면 새 클러스터를 만들지 않고 실패한다(리뷰 1 I-7 — 다른 중앙과 갈라진
+/// 새 NB·SB가 서지 않게).
+#[tokio::test]
+async fn init_on_a_ready_sdn_never_creates_a_second_cluster() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    h.installed();
+    h.new_cluster();
+    let mut ready = s.ready();
+    ready.centrals = vec![SdnCentral {
+        node: s.env.node,
+        address: ip("127.0.0.1"),
+    }];
+    ready.init_node = Some(s.env.node);
+    let id = s.create(ready).await;
+    let done = s.run_op(TaskOp::SdnInit { address: None }, id).await;
+    assert_eq!(state(&done), "failed", "{done}");
+    assert!(error(&done).contains("database of node"), "{done}");
+    assert!(error(&done).contains("is missing"), "{done}");
+    assert!(h.calls_of("ovsdb-tool create-cluster").is_empty());
+    assert_eq!(s.sdn().nb_cid, Some(CID_NB.parse().unwrap()));
+}
+
+/// 끝나지 않은 첫 세우기를 다른 주소로 다시 하면 아직 아무도 쓰지 않은 DB(옛 Raft 주소)를 이름만 바꿔 치우고 새로
+/// 만든다(리뷰 1 I-7).
+#[tokio::test]
+async fn an_unfinished_init_with_a_new_address_recreates_the_databases() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    h.installed();
+    h.new_cluster();
+    h.status(NB_LEADER, FOLLOWER);
+    let id = s
+        .create(SdnStatus {
+            init_node: Some(s.env.node),
+            ..SdnStatus::default()
+        })
+        .await;
+    let done = s.run_op(TaskOp::SdnInit { address: None }, id).await;
+    assert_eq!(state(&done), "failed", "{done}");
+    assert_eq!(h.calls_of("ovsdb-tool create-cluster").len(), 2);
+
+    for db in ["nb", "sb"] {
+        let port = if db == "nb" { 6643 } else { 6644 };
+        h.fake().reply(
+            &format!(
+                "ovsdb-tool db-local-address {}",
+                h.p(&format!("var/lib/opl/ovn/{db}.db"))
+            ),
+            CmdOutput::ok(format!("ssl:127.0.0.1:{port}\n")),
+        );
+    }
+    // 같은 주소로 다시 하면 DB는 그대로다.
+    let done = s.run_op(TaskOp::SdnInit { address: None }, id).await;
+    assert_eq!(state(&done), "failed", "{done}");
+    assert_eq!(h.calls_of("ovsdb-tool create-cluster").len(), 2);
+
+    h.status(NB_LEADER, SB_LEADER);
+    let done = s
+        .run_op(
+            TaskOp::SdnInit {
+                address: Some(ip("10.2.0.7")),
+            },
+            id,
+        )
+        .await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    let creates = h.calls_of("ovsdb-tool create-cluster");
+    assert_eq!(creates.len(), 4, "{creates:?}");
+    assert!(creates[2].ends_with("ssl:10.2.0.7:6643"), "{creates:?}");
+    let kept: Vec<String> = std::fs::read_dir(h.root.join("var/lib/opl/ovn"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".left-"))
+        .collect();
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert_eq!(s.sdn().centrals[0].address, ip("10.2.0.7"));
+}
+
+/// 중앙 더하기가 합류한 뒤 실패하면 클러스터를 다시 떠나고 단위를 멈추고 DB는 이름만 바꾼다(리뷰 1 I-7 — 목록에 없는
+/// 멤버가 남지 않게).
+#[tokio::test]
+async fn a_failed_central_add_leaves_the_cluster_again() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    h.installed();
+    h.status(FOLLOWER, FOLLOWER);
+    let mut ready = s.ready();
+    ready.nb_cid = Some(Uuid::nil());
+    let id = s.create(ready).await;
+    let task = s.task(TaskOp::SdnCentralAdd, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "failed", "{done}");
+    assert!(
+        error(&done).contains("left the OVN cluster again"),
+        "{done}"
+    );
+    assert_eq!(
+        h.calls_of("ovs-appctl --timeout 5 -t")
+            .iter()
+            .filter(|c| c.contains("cluster/leave"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        h.calls_of("systemctl disable --now opl-ovn"),
+        ["systemctl disable --now opl-ovn-nb.service opl-ovn-sb.service opl-ovn-northd.service"]
+    );
+    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
+    assert_eq!(s.sdn().centrals.len(), 1);
+}
+
+/// 중앙 목록에 없는데 이 SDN의 DB가 남은 노드(반쯤 합류한 멤버)는 중앙 빼기로 떠난다. 중앙 목록은 그대로다.
+#[tokio::test]
+async fn a_half_joined_member_can_be_removed() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    let id = s.create(s.ready()).await;
+    std::fs::create_dir_all(h.root.join("var/lib/opl/ovn")).unwrap();
+    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    h.status(FOLLOWER, FOLLOWER);
+    let task = s.task(TaskOp::SdnCentralRemove, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    assert!(error(&done).contains("half joined"), "{done}");
+    assert!(!h.root.join("var/lib/opl/ovn/nb.db").exists());
+    assert_eq!(s.sdn().centrals.len(), 1);
+    assert_eq!(s.sdn().pending, None);
 }

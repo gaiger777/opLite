@@ -64,6 +64,10 @@ pub struct SdnStatus {
     /// 처음 세우는(세운) 노드
     #[serde(skip_serializing_if = "Option::is_none")]
     pub init_node: Option<Uuid>,
+    /// 처음 세우기의 중앙 주소(API가 정한 것). 주소 없이 다시 하면 이 주소로 이어서 한다(리뷰 1 I-7 — 이미 만든 DB의
+    /// Raft 주소와 단위가 어긋나지 않게).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_address: Option<IpAddr>,
     /// 처음 세우기가 실패한 이유
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -394,6 +398,7 @@ mod tests {
             }],
             release: Some("24.03.4".into()),
             init_node: Some(n),
+            init_address: Some(ip("10.0.0.1")),
             last_error: None,
             pending: Some(SdnPending {
                 op: crate::task::TaskOp::SdnCentralAdd,
@@ -414,6 +419,7 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["centrals"][0]["address"], "10.0.0.1");
         assert!(json.get("sb_cid").is_none(), "{json}");
+        assert_eq!(json["init_address"], "10.0.0.1");
         assert_eq!(json["pending"]["op"], json!({ "kind": "sdn-central-add" }));
         assert!(json["sync"].get("error").is_none(), "{json}");
         assert_eq!(serde_json::from_value::<SdnStatus>(json).unwrap(), status);

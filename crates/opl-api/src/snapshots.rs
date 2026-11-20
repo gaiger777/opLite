@@ -1019,8 +1019,6 @@ pub async fn clone_vm(
         }
     }
     check_security_groups(&state, &spec)?;
-    // 준 SDN 주소(계획 65 §12)는 미리 본다(Task가 만들 때 다시 본다).
-    crate::ipam::check_requested(&state.cluster, &spec, &req.ips)?;
     state
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, spec.folder)?;
@@ -1034,6 +1032,13 @@ pub async fn clone_vm(
     state
         .authz
         .require_networks(&principal, spec.nics.iter().map(|n| n.network.as_str()))?;
+    // 준 SDN 주소(계획 65 §12)는 권한을 본 뒤에 미리 본다(리뷰 1 I-2, Task가 만들 때 다시 본다).
+    crate::ipam::check_requested(
+        &state.cluster,
+        &spec,
+        &req.ips,
+        &crate::ipam::readable(&state, Some(&principal)),
+    )?;
     match &target {
         Some(pool) => state.authz.require_pool(&principal, &pool.name)?,
         None => {

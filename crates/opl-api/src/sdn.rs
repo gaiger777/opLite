@@ -25,7 +25,7 @@ use opl_types::sdn::{
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::audit::AuditNote;
@@ -33,7 +33,7 @@ use crate::auth::{Action, Principal};
 use crate::backups::check_online;
 use crate::ceph::{PENDING_GRACE, made_within};
 use crate::cluster::{host_of, require_feature};
-use crate::error::{ApiError, Json};
+use crate::error::{ApiError, Json, Query};
 use crate::resources::{if_match, lookup};
 use crate::revision::WARNING;
 use crate::state::AppState;
@@ -134,24 +134,67 @@ fn cert_names(node: &Node) -> Vec<String> {
     names
 }
 
-/// 중앙 주소 `address`(주지 않았으면 노드 주소의 IP나 underlay)를 정한다. 준 주소는 노드 인증서의 이름 안이어야 한다
-/// (400 — OvnSync가 그 이름으로 NB·SB 인증서를 확인한다). 정할 수 없으면 400.
+/// 노드의 주소(노드 주소와 클러스터 링크의 호스트 가운데 IP인 것): 중앙 주소가 될 수 있는 것
+fn node_ips(node: &Node) -> Vec<IpAddr> {
+    let mut ips: Vec<IpAddr> = Vec::new();
+    let hosts = host_of(&node.spec.address).into_iter().chain(
+        node.status
+            .cluster_addresses
+            .iter()
+            .filter_map(|a| host_of(a)),
+    );
+    for ip in hosts.filter_map(|h| h.parse::<IpAddr>().ok()) {
+        let ip = ip.to_canonical();
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    ips
+}
+
+/// 중앙 주소 `address`(주지 않았으면 노드 주소의 IP나 underlay)를 정한다(리뷰 1 I-5). 준 주소는 노드의 주소(노드 주소와
+/// 클러스터 링크의 호스트 — 노드 인증서의 이름 안이라 OvnSync가 그 이름으로 NB·SB 인증서를 확인한다)여야 하고, 지정 안 함
+/// (`0.0.0.0`·`::`)·링크 로컬·멀티캐스트는 늘, 루프백은 노드 자신의 주소가 루프백일 때(한 기계의 클러스터)가 아니면
+/// 거절한다(400) — 다른 중앙과 chassis가 닿을 수 없다. 정할 수 없으면 400.
 fn central_ip(node: &Node, address: Option<IpAddr>) -> Result<IpAddr, ApiError> {
-    let Some(ip) = address else {
-        return central_address(node).ok_or_else(|| {
+    let ip = match address {
+        Some(ip) => ip.to_canonical(),
+        None => central_address(node).ok_or_else(|| {
             ApiError::bad_request(format!(
                 "cannot tell the OVN central address of node {:?} from its address {:?}; give address",
                 node.name, node.spec.address
             ))
-        });
+        })?,
     };
-    let names = cert_names(node);
-    let ip = ip.to_canonical();
-    if !names.iter().any(|n| n.parse::<IpAddr>().ok() == Some(ip)) {
+    let link_local = match ip {
+        IpAddr::V4(v) => v.is_link_local(),
+        IpAddr::V6(v) => v.is_unicast_link_local(),
+    };
+    if ip.is_unspecified() || ip.is_multicast() || link_local {
+        return Err(ApiError::bad_request(format!(
+            "address {ip} cannot be an OVN central address (other centrals and chassis must reach it); \
+             use a unicast address of node {:?}",
+            node.name
+        )));
+    }
+    let own = node_ips(node);
+    if address.is_some() && !own.contains(&ip) {
+        let names = cert_names(node);
         return Err(ApiError::bad_request(format!(
             "address {ip} is not in the certificate of node {:?} ({}); use one of its addresses",
             node.name,
-            names.join(", ")
+            names
+                .iter()
+                .filter(|n| n.parse::<IpAddr>().is_ok_and(|a| own.contains(&a)))
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    if ip.is_loopback() && (own.is_empty() || !own.iter().all(IpAddr::is_loopback)) {
+        return Err(ApiError::bad_request(format!(
+            "address {ip} is a loopback address; other centrals and chassis cannot reach it — use an address of node {:?}",
+            node.name
         )));
     }
     Ok(ip)
@@ -325,8 +368,8 @@ pub async fn get_sdn(
 
 /// SDN(OVN)을 세운다: 노드 `node`에 OVN 꾸러미를 apt로 설치하고 NB·SB ovsdb Raft 클러스터와 northd를 Orbivisor 단위로
 /// 세우고 chassis로 구성하는 `sdn-init` Task(202). `address`는 NB·SB가 들을 주소(없으면 노드 주소의 IP, 노드 인증서의
-/// 이름 안이어야 한다). 실패했으면 같은 노드로 다시 부르면 이어서 하고, 첫 세우기 노드가 꺼졌거나 지워졌고 아직 중앙이
-/// 없으면 다른 노드로 옮겨 다시 한다. 노드가 없거나 위트니스·macOS·유지보수·underlay 없음·인증서 밖 주소면 400,
+/// 이름 안의 노드 주소여야 하고 루프백·링크 로컬은 안 된다). 실패했으면 같은 노드로 다시 부르면 이어서 하고(주소를
+/// 주지 않으면 지난번 주소로), 첫 세우기 노드가 꺼졌거나 지워졌고 아직 중앙이 없으면 다른 노드로 옮겨 다시 한다. 노드가 없거나 위트니스·macOS·유지보수·underlay 없음·인증서 밖 주소면 400,
 /// 오프라인이면 409 `node_offline`, 옛 노드가 남았으면 409 `cluster_upgrading`, 이미 세웠거나 다른 노드에서 세우는 중이면
 /// 409 `sdn_exists`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
 #[utoipa::path(post, path = "/sdn", tag = "sdn",
@@ -341,8 +384,16 @@ pub async fn init_sdn(
     state.authorize(&principal, Action::Write, Kind::Sdn)?;
     require_feature(&state.cluster, SDN)?;
     let node = central_node(&state, &req.node)?;
-    let address = central_ip(&node, req.address)?;
     let existing = find_sdn(&state.cluster)?;
+    // 같은 노드에서 끝나지 않은 첫 세우기를 주소 없이 다시 하면 지난번 주소로 이어서 한다(리뷰 1 I-7 — 기본 주소로
+    // 바뀌면 이미 만든 DB의 Raft 주소와 단위가 어긋난다).
+    let given = req.address.or_else(|| {
+        existing
+            .as_ref()
+            .filter(|s| s.status.phase != SdnPhase::Ready && s.status.init_node == Some(node.id))
+            .and_then(|s| s.status.init_address)
+    });
+    let address = central_ip(&node, given)?;
     let moved = match &existing {
         Some(sdn) => moved_init(&state, sdn, &node)?,
         None => None,
@@ -385,10 +436,15 @@ pub async fn init_sdn(
     }
     audit.detail(detail);
     let op = TaskOp::SdnInit {
-        address: req.address.map(|a| a.to_canonical()),
+        address: given.map(|a| a.to_canonical()),
     };
-    let task =
-        create_exclusive(&state, op, node.id, check, |s| s.init_node = Some(node.id)).await?;
+    let task = create_exclusive(&state, op, node.id, check, |s| {
+        s.init_node = Some(node.id);
+        if s.phase != SdnPhase::Ready {
+            s.init_address = Some(address);
+        }
+    })
+    .await?;
     if let Some(old) = moved {
         abandon_tasks(&state.cluster, old, &node.name).await?;
     }
@@ -514,9 +570,10 @@ pub async fn add_central(
 }
 
 /// 노드 `node`를 OVN 중앙에서 빼는 `sdn-central-remove` Task(202): NB·SB Raft 클러스터를 떠나고 단위를 멈추고 DB 파일은
-/// 이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이
-/// 아니면 400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`,
-/// 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
+/// 이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙
+/// 더하기가 남긴 멤버)도 같이 떠나게 한다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이 아니면
+/// 400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`, 다른
+/// 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
 #[utoipa::path(delete, path = "/sdn/centrals/{node}", tag = "sdn",
     params(("node" = String, Path, description = "node id or name")),
     responses((status = 202, body = Resource<TaskSpec, TaskStatus>,
@@ -536,13 +593,14 @@ pub async fn remove_central(
         let Some(sdn) = sdn.filter(|s| s.status.phase == SdnPhase::Ready) else {
             return Err(not_ready("SDN (OVN) is not set up"));
         };
-        if !sdn.status.centrals.iter().any(|c| c.node == node.id) {
+        let listed = sdn.status.centrals.iter().any(|c| c.node == node.id);
+        if !listed && !half_member(&node) {
             return Err(ApiError::bad_request(format!(
                 "node {:?} is not an OVN central",
                 node.name
             )));
         }
-        if sdn.status.centrals.len() <= 1 {
+        if listed && sdn.status.centrals.len() <= 1 {
             return Err(ApiError::conflict(
                 "sdn_last_central",
                 "the last OVN central node cannot be removed",
@@ -552,7 +610,8 @@ pub async fn remove_central(
     };
     check(find_sdn(&state.cluster)?.as_ref())?;
     check_online(&state, node.id)?;
-    let count = require_ready(&state.cluster)?.status.centrals.len() - 1;
+    let centrals = require_ready(&state.cluster)?.status.centrals;
+    let count = centrals.len() - usize::from(centrals.iter().any(|c| c.node == node.id));
     audit.detail(format!("sdn central remove {}", node.name));
     let task = create_exclusive(&state, TaskOp::SdnCentralRemove, node.id, check, |_| {}).await?;
     Ok((
@@ -632,11 +691,31 @@ pub async fn install_chassis(
     Ok((StatusCode::ACCEPTED, warning_header(warning), Json(tasks)))
 }
 
-/// 노드 `node`가 OVN 중앙이면 지우기 전에 409 `sdn_central_on_node`(설계 §7.1 — 중앙에서 먼저 뺀다)
+/// 중앙 목록에 없지만 이 SDN의 NB·SB DB를 가진 노드(실패한 `sdn-central-add`가 합류만 하고 남긴 멤버 — 리뷰 1 I-7).
+/// 노드의 `SdnAgent`가 알린다(`NodeSdn.central`). OVN Raft의 멤버일 수 있으므로 지우기 전에 중앙 빼기로 떠나야 한다.
+fn half_member(node: &Node) -> bool {
+    node.status
+        .sdn
+        .as_ref()
+        .is_some_and(|s| s.central.is_some())
+}
+
+/// 노드 `node`가 OVN 중앙이면(또는 중앙 목록 밖이지만 이 SDN의 NB·SB DB를 가졌으면) 지우기 전에 409
+/// `sdn_central_on_node`(설계 §7.1 — 중앙에서 먼저 뺀다)
 pub(crate) fn check_node_removal(cluster: &Cluster, node: &Node) -> Result<(), ApiError> {
     let Some(sdn) = find_sdn(cluster)? else {
         return Ok(());
     };
+    if !sdn.status.centrals.iter().any(|c| c.node == node.id) && half_member(node) {
+        return Err(ApiError::conflict(
+            "sdn_central_on_node",
+            format!(
+                "node {:?} holds databases of the OVN central cluster (a central add that did not finish); \
+                 remove it with `orbivisorctl sdn central remove {}` first (the node must be online)",
+                node.name, node.name
+            ),
+        ));
+    }
     if let Some(c) = sdn.status.centrals.iter().find(|c| c.node == node.id) {
         return Err(ApiError::conflict(
             "sdn_central_on_node",
@@ -792,17 +871,40 @@ pub struct PortLive {
     pub node: Option<String>,
 }
 
+/// `GET /networks/{key}/ips`의 질의
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct IpsQuery {
+    /// 거짓이면 OVN 포트 상태(`live`)를 읽지 않는다(목록의 사용률처럼 주소만 볼 때 — 그때 `live`는 모두 null이고
+    /// `live_error`도 없다). 기본 참
+    #[serde(default = "yes")]
+    pub live: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
 /// `GET /networks/{key}/ips`
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct NetworkIps {
     pub network: String,
     pub subnets: Vec<SubnetUsage>,
-    /// 템플릿이 아닌 VM의 이 네트워크 NIC마다(VM 이름, NIC 순)
+    /// 템플릿이 아닌 VM의 이 네트워크 NIC마다(VM 이름, NIC 순). 부른 사용자가 읽을 수 있는 VM의 것만 있다.
     pub allocations: Vec<IpAllocation>,
+    /// 부른 사용자가 읽을 수 없는 VM(다른 폴더)의 NIC 수: 목록에서 빠졌지만 `subnets`의 사용 수에는 들었다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schema(default)]
+    pub hidden: usize,
     /// OVN을 읽지 못한 까닭(그때 `live`는 모두 null)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, default)]
     pub live_error: Option<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// 주소의 비트(IPv4는 아래 32비트)
@@ -850,16 +952,19 @@ fn pool_size(subnet: &Subnet) -> u128 {
     total.saturating_sub(reserved)
 }
 
-/// SDN 네트워크의 주소: 서브넷마다 크기·사용·남음, NIC마다 VM·MAC·주소와 OVN 논리 포트의 `up`·바인딩 노드(API 노드가
-/// NB·SB 팔로어에서도 읽는다 — 못 읽으면 `live` null과 `live_error`). 네트워크 읽기 권한. 단순 네트워크면 409
+/// SDN 네트워크의 주소: 서브넷마다 크기·사용·남음(모든 VM), NIC마다 VM·MAC·주소와 OVN 논리 포트의 `up`·바인딩
+/// 노드(API 노드가 NB·SB 팔로어에서도 읽는다 — 못 읽으면 `live` null과 `live_error`). 네트워크 읽기 권한. NIC 목록은
+/// 부른 사용자가 읽을 수 있는 VM의 것뿐이고 나머지는 `hidden` 수로만 알린다(리뷰 1 I-1 — 네트워크를 함께 쓰는 다른
+/// 폴더의 VM 이름·주소를 드러내지 않게). `live=false`면 OVN을 읽지 않는다(목록의 사용률). 단순 네트워크면 409
 /// `network_immutable`.
 #[utoipa::path(get, path = "/networks/{key}/ips", tag = "networks",
-    params(("key" = String, Path, description = "id or name")),
+    params(("key" = String, Path, description = "id or name"), IpsQuery),
     responses((status = 200, body = NetworkIps), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn network_ips(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(key): Path<String>,
+    Query(query): Query<IpsQuery>,
 ) -> Result<Json<NetworkIps>, ApiError> {
     let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
     if !network.spec.is_sdn() {
@@ -910,11 +1015,25 @@ pub async fn network_ips(
             }
         })
         .collect();
-    let live_error = Box::pin(read_live(&state, &mut allocations)).await.err();
+    let readable: Vec<Uuid> = state
+        .authz
+        .filter(&principal, vms.iter())?
+        .into_iter()
+        .map(|v| v.id)
+        .collect();
+    let all = allocations.len();
+    allocations.retain(|a| readable.contains(&a.vm));
+    let hidden = all - allocations.len();
+    let live_error = if allocations.is_empty() || !query.live {
+        None
+    } else {
+        Box::pin(read_live(&state, &mut allocations)).await.err()
+    };
     Ok(Json(NetworkIps {
         network: network.name,
         subnets,
         allocations,
+        hidden,
         live_error,
     }))
 }
@@ -1004,6 +1123,32 @@ mod tests {
         assert_eq!(
             cert_names(&node),
             ["10.0.0.5", "10.1.0.5", "localhost", "127.0.0.1", "::1"]
+        );
+        // 루프백·지정 안 함·링크 로컬·멀티캐스트는 400(리뷰 1 I-5)
+        for bad in [
+            "127.0.0.1",
+            "::1",
+            "0.0.0.0",
+            "169.254.0.5",
+            "fe80::1",
+            "224.0.0.1",
+        ] {
+            let err = central_ip(&node, Some(bad.parse().unwrap())).unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{bad}");
+        }
+        // 노드 자신의 주소가 루프백이면(한 기계의 클러스터) 루프백이 그 노드의 주소다.
+        let mut local = node.clone();
+        local.spec.address = "127.0.0.1:8006".into();
+        local.status.cluster_addresses.clear();
+        assert_eq!(
+            central_ip(&local, Some("127.0.0.1".parse().unwrap())).unwrap(),
+            "127.0.0.1".parse::<IpAddr>().unwrap()
+        );
+        assert!(central_ip(&local, Some("::1".parse().unwrap())).is_err());
+        // IPv4 대응 IPv6는 IPv4로 본다.
+        assert_eq!(
+            central_ip(&node, Some("::ffff:10.1.0.5".parse().unwrap())).unwrap(),
+            "10.1.0.5".parse::<IpAddr>().unwrap()
         );
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
         assert_eq!(central_ip(&node, None).unwrap(), ip("10.0.0.5"));

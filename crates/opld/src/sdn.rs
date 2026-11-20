@@ -183,7 +183,19 @@ impl Agent {
                 Some(host.central_health().await)
             }
             Some(_) => Some(host.central_health().await),
-            None => None,
+            // 중앙 목록에 없지만 이 SDN의 DB가 있다: 끝나지 않은 중앙 더하기가 남긴 멤버일 수 있다. 알려서 API가 노드
+            // 지우기를 막고 중앙 빼기로 떠나게 한다(리뷰 1 I-7). 단위는 맞추지 않는다.
+            None => {
+                let known = opl_driver::ovn::KnownCids {
+                    nb: sdn.status.nb_cid,
+                    sb: sdn.status.sb_cid,
+                };
+                if host.has_cluster_db(known).await {
+                    Some(host.central_health().await)
+                } else {
+                    None
+                }
+            }
         };
 
         if configured {
@@ -643,6 +655,51 @@ mod tests {
             && !c.starts_with("systemctl")
             && !c.starts_with("ovs-vsctl --if-exists")));
         assert!(!s.root.join("etc/node.key").exists());
+    }
+
+    /// 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙 더하기)는 중앙 상태를 알린다(리뷰 1 I-7 — API가
+    /// 노드 지우기를 막고 중앙 빼기를 받는다). 단위는 맞추지 않는다.
+    #[tokio::test]
+    async fn a_half_joined_member_reports_its_databases() {
+        let s = setup(false).await;
+        let cid = Uuid::now_v7();
+        create_sdn(
+            &s.cluster,
+            SdnStatus {
+                phase: SdnPhase::Ready,
+                centrals: vec![SdnCentral {
+                    node: Uuid::nil(),
+                    address: "10.0.0.2".parse().unwrap(),
+                }],
+                nb_cid: Some(cid),
+                ..SdnStatus::default()
+            },
+        )
+        .await;
+        let f = &s.runner.fake;
+        f.reply("ovn-controller --version", CmdOutput::ok(OVN_VERSION));
+        f.reply("ovs-vsctl --version", CmdOutput::ok(OVS_VERSION));
+        f.reply(
+            "ovs-vsctl --format=json --columns=external_ids",
+            ids(&[("system-id", "x")]),
+        );
+        s.agent.tick().await;
+        assert_eq!(s.agent.report.get().unwrap().central, None);
+
+        std::fs::create_dir_all(s.root.join("var")).unwrap();
+        std::fs::write(s.root.join("var/nb.db"), "nb").unwrap();
+        f.reply("ovsdb-tool db-cid", CmdOutput::ok(format!("{cid}\n")));
+        f.reply("ovs-appctl", CmdOutput::ok(NB_LEADER));
+        s.agent.tick().await;
+        assert!(s.agent.report.get().unwrap().central.is_some());
+        assert!(f.calls().iter().all(|c| !c.starts_with("systemctl")));
+        // 다른 클러스터의 DB면 아니다.
+        f.reply(
+            "ovsdb-tool db-cid",
+            CmdOutput::ok(format!("{}\n", Uuid::now_v7())),
+        );
+        s.agent.tick().await;
+        assert_eq!(s.agent.report.get().unwrap().central, None);
     }
 
     /// 기능 `sdn`을 모르는 노드가 있으면 쓰지 않는다.

@@ -327,6 +327,11 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     if spec.nics.iter().any(|n| !n.ips.is_empty() || sdn_nic(n)) {
         require_feature(&state.cluster, opl_types::node::SDN)?;
     }
+    // NIC 주소는 표준 꼴로 저장한다(IPv4 대응 IPv6 → IPv4, 리뷰 1 I-3).
+    spec.nics
+        .iter_mut()
+        .flat_map(|n| n.ips.iter_mut())
+        .for_each(|ip| *ip = ip.to_canonical());
     // 핫플러그 상한은 준 그대로 둔다(지금 값과 같아도): 상한까지 늘린 VM이 상한을 잃으면 나중에 줄일 때 상한이
     // 바뀐 것이 되어 다시 켜야 한다.
     spec.validate().map_err(crate::cpu::validation_error)?;
@@ -373,11 +378,13 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     }
     // SDN NIC 주소(계획 65 §9): 검사하고 새 NIC에 채운다. 보안 그룹 검사보다 먼저(SDN NIC의 그룹은 400).
     let others_list: Vec<&Vm> = others.clone().collect();
+    let principal = crate::audit::principal();
     crate::ipam::assign(
         spec,
         inv.vms.iter().find(|v| v.id == id).map(|v| &v.spec),
         &others_list,
         &inv.networks,
+        &crate::ipam::readable(state, principal.as_ref()),
     )?;
     check_security_groups(state, spec)?;
     if spec.template {

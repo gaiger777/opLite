@@ -10,9 +10,10 @@
 //! 2. NB 리더에 붙어(팔로어는 낡은 행을 줄 수 있다) 주인 표시가 있는 우리 행과 `NB_Global`의 펜싱 토큰을 읽는다.
 //!    토큰의 임기가 내 임기보다 크면 쓰지 않는다(나는 물러난 리더다).
 //! 3. 다른 것만([`nb::plan`]) 펜싱 연산(`wait` + 토큰 `"<임기>:<Raft 인덱스>"` + `nb_cfg` 1 올림)을 앞에 붙여 쓴다.
-//!    연산이 2000개를 넘으면 네트워크 단위로 나눈다. 실패한 묶음만 다음 차례에 다시 한다.
+//!    네트워크마다(지울 스위치·DHCP 행도 따로) 한 트랜잭션이다 — 한 네트워크의 실패가 다른 네트워크를 막지 않는다(리뷰 1
+//!    I-6). 실패한 묶음만 다음 차례에 다시 한다.
 //! 4. SB에서 Raft에 없는 노드(노드 UUID 이름)의 `Chassis`·`Chassis_Private` 행을 지운다(`ovn-sbctl chassis-del`과
-//!    같다 — 65에서 SB에 쓰는 유일한 일).
+//!    같다 — 65에서 SB에 쓰는 유일한 일). 쓰기 바로 앞에서 아직 같은 임기의 리더인지 다시 본다(리뷰 1 m-1).
 //! 5. `SdnStatus.sync`를 바뀔 때만(성공이 이어지면 60초에 한 번) 쓴다.
 
 pub mod nb;
@@ -175,7 +176,18 @@ impl OvnSyncer {
         sync.at = now();
         let result = match outcome {
             Ok(NbResult::Fenced(seen)) => {
-                // 물러난 리더는 기록도 쓰지 않는다(새 리더의 몫이다).
+                // 물러난 리더는 기록도 쓰지 않는다(새 리더의 몫이다). 아직 리더인데 NB의 토큰이 더 크면(Raft를 새로
+                // 세우고 OVN DB는 둔 경우) 차례마다 오류로 남긴다 — 저절로 풀리지 않는다(리뷰 1 m-2).
+                if cluster.leader_term() == Some(term) {
+                    tracing::error!(
+                        term,
+                        newer = seen,
+                        key = %nb::fence_key(&self.config.tag),
+                        "the OVN northbound DB carries a fence token from a newer Raft term than this leader's; \
+                         OvnSync stops writing. If the Orbivisor cluster was rebuilt, remove the key with \
+                         `ovn-nbctl remove NB_Global . external_ids <key>` on the NB leader"
+                    );
+                }
                 return SyncOutcome::Fenced { term: seen };
             }
             Ok(NbResult::Done(done)) => {
@@ -191,14 +203,17 @@ impl OvnSyncer {
                 Err(e)
             }
         };
-        // SB 청소는 NB와 따로다(NB가 안 되어도 한다).
-        let chassis_deleted = match Box::pin(self.clean_chassis(&centrals, &nodes)).await {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::warn!(error = %e, "cannot remove the OVN chassis of removed nodes");
-                0
-            }
-        };
+        // SB 청소는 NB와 따로다(NB가 안 되어도 한다). 그새 물러났으면 하지 않는다(낡은 노드 목록으로 막 합류한 노드의
+        // chassis를 지우지 않게 — 리뷰 1 m-1).
+        let still_leader = cluster.leader_term() == Some(term);
+        let chassis_deleted =
+            match Box::pin(self.clean_chassis(&centrals, &nodes, still_leader)).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(error = %e, "cannot remove the OVN chassis of removed nodes");
+                    0
+                }
+            };
         if let Err(e) = report(&cluster, old.as_ref(), sync).await {
             tracing::warn!(error = %e, "cannot record the OVN sync");
         }
@@ -306,7 +321,7 @@ impl OvnSyncer {
             self.nb = Some(client);
             return Ok(NbResult::Fenced(seen_term));
         }
-        let plan = nb::batches(nb::plan(want, &have));
+        let plan = nb::plan(want, &have);
         let mut done = Done {
             token: seen.unwrap_or((0, 0)),
             nb_cfg: have.global.as_ref().map_or(0, |g| g.nb_cfg),
@@ -390,7 +405,11 @@ impl OvnSyncer {
         &mut self,
         centrals: &[(std::net::IpAddr, Option<String>)],
         nodes: &[Node],
+        leader: bool,
     ) -> Result<usize, OvsdbError> {
+        if !leader {
+            return Ok(0);
+        }
         let current = self.sb.take();
         let client = self
             .leader(current, centrals, SB_DB, self.config.sb_port)

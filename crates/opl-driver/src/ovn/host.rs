@@ -583,6 +583,54 @@ impl OvnHost {
         )))
     }
 
+    /// 제자리 DB `db`의 Raft 주소(`ovsdb-tool db-local-address`, 예: `ssl:10.0.0.5:6643`). 파일이 없거나 주소 꼴이
+    /// 아닌 답이면 None(모른다 — 부르는 쪽은 그대로 둔다)
+    pub async fn db_local_address(&self, db: Db) -> Result<Option<String>, OvnError> {
+        let path = self.paths.db_file(db);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let out = self
+            .run_ok(&Cmd::new(
+                "ovsdb-tool",
+                &["db-local-address", &path_str(&path)],
+            ))
+            .await?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let known = ["ssl:", "tcp:", "unix:"]
+            .iter()
+            .any(|p| text.starts_with(p));
+        Ok((known && !text.contains(char::is_whitespace)).then_some(text))
+    }
+
+    /// 제자리 DB `db`의 Raft 주소가 `address`가 아니면 그 주소(바꿔 다시 하는 첫 세우기가 볼 것). 모르면 None
+    pub async fn db_address_differs(
+        &self,
+        db: Db,
+        address: IpAddr,
+    ) -> Result<Option<String>, OvnError> {
+        let want = ssl_addr(address, db.raft_port());
+        Ok(self.db_local_address(db).await?.filter(|a| *a != want))
+    }
+
+    /// 이 노드에 `known` 클러스터의 NB·SB DB 파일이 있는지(합류 중이라 id를 아직 모르는 DB 포함). 중앙 목록에 없는
+    /// 노드면 끝나지 않은 중앙 더하기가 남긴 멤버다(리뷰 1 I-7). Raft가 id를 모르면 거짓이다.
+    pub async fn has_cluster_db(&self, known: KnownCids) -> bool {
+        for db in Db::ALL {
+            let path = self.paths.db_file(db);
+            let Some(cid) = known.get(db) else { continue };
+            if !path.exists() {
+                continue;
+            }
+            match self.db_cid(&path).await {
+                Ok(Some(found)) if found == cid => return true,
+                Ok(None) => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// 새 클러스터 DB `db`를 임시 파일(`.{nb,sb}.db.opl-new`)에 만들고(`ovsdb-tool create-cluster`, Raft 주소
     /// `ssl:ADDR:6643·6644`) 그 클러스터 id를 돌려준다. 부르는 쪽이 id를 Raft에 적은 뒤 [`commit_db`](Self::commit_db)로
     /// 제자리에 옮긴다 — 그래서 제자리의 DB는 늘 Raft가 아는 id다(§7.4 검사). DB가 이미 제자리에 있으면 None
@@ -859,19 +907,24 @@ impl OvnHost {
     pub fn retire_dbs(&self, now: u64) -> Result<Vec<PathBuf>, OvnError> {
         let mut moved = Vec::new();
         for db in Db::ALL {
-            let path = self.paths.db_file(db);
-            if !path.exists() {
-                continue;
-            }
-            let to = self
-                .paths
-                .var_lib
-                .join(format!("{}.db.left-{now}", db.short()));
-            std::fs::rename(&path, &to).map_err(|e| io_at(&path, e))?;
-            moved.push(to);
+            moved.extend(self.retire_db(db, now)?);
         }
-        sync_dir(&self.paths.var_lib);
         Ok(moved)
+    }
+
+    /// DB `db` 하나를 [`retire_dbs`](Self::retire_dbs)처럼 이름만 바꾼다. 없으면 None
+    pub fn retire_db(&self, db: Db, now: u64) -> Result<Option<PathBuf>, OvnError> {
+        let path = self.paths.db_file(db);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let to = self
+            .paths
+            .var_lib
+            .join(format!("{}.db.left-{now}", db.short()));
+        std::fs::rename(&path, &to).map_err(|e| io_at(&path, e))?;
+        sync_dir(&self.paths.var_lib);
+        Ok(Some(to))
     }
 
     /// 업그레이드한 꾸러미의 스키마가 DB보다 새로우면 이 서버가 리더일 때 변환한다(`ovsdb-client convert` — 배포판

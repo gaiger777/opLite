@@ -364,6 +364,40 @@ impl Run<'_> {
         self.write_tls(true).await?;
 
         self.stage("creating-cluster").await;
+        // 준비된 SDN(또는 중앙이 이미 있음)에서는 새 클러스터를 만들지 않는다(리뷰 1 I-7 — DB를 치운 뒤 다시 하면 다른
+        // 중앙과 갈라진 새 NB·SB가 선다). 세우는 중이면 DB는 아직 아무도 쓰지 않았으므로 Raft 주소가 다르면(주소를 바꿔
+        // 다시 함) 이름만 바꿔 치우고 새로 만든다.
+        let established =
+            self.status().phase == SdnPhase::Ready || !self.status().centrals.is_empty();
+        for db in Db::ALL {
+            if established && !self.host.paths().db_file(db).exists() {
+                return Err(format!(
+                    "the OVN {} database of node {:?} is missing; a ready SDN cannot get a second OVN cluster here — \
+                     restore the file, or remove this central with `sdn central remove` and add it again",
+                    db.name(),
+                    self.name()
+                ));
+            }
+            if let Some(old) = self
+                .host
+                .db_address_differs(db, address)
+                .await
+                .map_err(|e| e.to_string())?
+            {
+                if established {
+                    return Err(format!(
+                        "the OVN {} database of node {:?} uses Raft address {old}, not {address}; retry without address",
+                        db.name(),
+                        self.name()
+                    ));
+                }
+                let kept = self
+                    .host
+                    .retire_db(db, unix_now())
+                    .map_err(|e| e.to_string())?;
+                tracing::info!(db = db.name(), old = %old, kept = ?kept, "the setup address changed; recreating the unused OVN database");
+            }
+        }
         for db in Db::ALL {
             // 새 DB는 임시 파일에 만들고, 그 클러스터 id를 Raft에 적은 뒤에야 제자리에 둔다(§7.4 검사가 늘 맞게).
             if let Some(cid) = self
@@ -452,8 +486,38 @@ impl Run<'_> {
         self.install(true).await?;
         self.write_tls(true).await?;
 
+        let all = self.centrals_with(address);
+        if let Err(e) = self.join(address).await {
+            // 합류가 Raft에 적혔을 수 있다(멤버인데 중앙 목록에 없음 — 그 노드를 잃으면 정족수가 깨진다). 떠날 수 있으면
+            // 떠나 치우고, 아니면 그대로 두어 다시 하거나 중앙 빼기로 떠나게 한다(리뷰 1 I-7).
+            if already {
+                return Err(e);
+            }
+            return Err(match self.leave_and_retire().await {
+                Ok(()) => format!("{e}; left the OVN cluster again — retry the central add"),
+                Err(why) => format!(
+                    "{e}; cannot leave the OVN cluster again ({why}) — retry the central add, or remove the node with \
+                     `sdn central remove`"
+                ),
+            });
+        }
+        self.chassis(&all).await?;
+        if all.len().is_multiple_of(2) {
+            warnings.push(format!(
+                "SDN (OVN) now has {} central nodes; an even number tolerates no more failures than one \
+                 fewer — add or remove one",
+                all.len()
+            ));
+        }
+        Ok(join_warnings(warnings))
+    }
+
+    /// `joining-cluster`·`starting`·`waiting-for-leader`: 기존 중앙에 합류하고 단위를 켜 멤버가 되면 중앙 목록에 더한다.
+    async fn join(&self, address: IpAddr) -> Result<(), String> {
         self.stage("joining-cluster").await;
-        let others: Vec<IpAddr> = centrals
+        let others: Vec<IpAddr> = self
+            .status()
+            .centrals
             .iter()
             .filter(|c| c.node != self.me.id)
             .map(|c| c.address)
@@ -483,32 +547,12 @@ impl Run<'_> {
             s.centrals.push(SdnCentral { node: me, address });
             true
         })
-        .await?;
-        self.chassis(&all).await?;
-        if all.len().is_multiple_of(2) {
-            warnings.push(format!(
-                "SDN (OVN) now has {} central nodes; an even number tolerates no more failures than one \
-                 fewer — add or remove one",
-                all.len()
-            ));
-        }
-        Ok(join_warnings(warnings))
+        .await
     }
 
-    /// `sdn-central-remove`: 이 노드가 NB·SB 클러스터를 떠나고, 단위를 멈추고, DB 파일은 이름만 바꾼 뒤 중앙 목록에서
-    /// 뺀다. chassis 구성은 그대로다(SB 주소는 에이전트가 맞춘다).
-    async fn remove_central(&self) -> Result<Option<String>, String> {
-        self.require_slot()?;
-        let centrals = &self.status().centrals;
-        if !centrals.iter().any(|c| c.node == self.me.id) {
-            // 앞 Task가 이미 뺐다.
-            return Ok(None);
-        }
-        if centrals.len() <= 1 {
-            return Err("the last OVN central node cannot be removed".into());
-        }
-        self.stage("checking").await;
-        self.host.check_platform().map_err(|e| e.to_string())?;
+    /// `leaving-cluster`·`stopping`: 이 노드의 NB·SB가 클러스터를 떠나고(떠나지 못하면 단위를 멈추지 않고 실패 —
+    /// 멈춘 멤버는 정족수를 깎는다), 단위를 멈추고, DB 파일은 이름만 바꾼다.
+    async fn leave_and_retire(&self) -> Result<(), String> {
         self.stage("leaving-cluster").await;
         for db in Db::ALL {
             if self.host.paths().db_file(db).exists() {
@@ -526,6 +570,35 @@ impl Run<'_> {
             .map_err(|e| e.to_string())?;
         if !moved.is_empty() {
             tracing::info!(files = ?moved, "kept the OVN databases this node left");
+        }
+        Ok(())
+    }
+
+    /// `sdn-central-remove`: 이 노드가 NB·SB 클러스터를 떠나고, 단위를 멈추고, DB 파일은 이름만 바꾼 뒤 중앙 목록에서
+    /// 뺀다. chassis 구성은 그대로다(SB 주소는 에이전트가 맞춘다). 중앙 목록에 없는데 DB가 남은 노드(끝나지 않은 중앙
+    /// 더하기가 남긴 멤버)도 같이 떠난다.
+    async fn remove_central(&self) -> Result<Option<String>, String> {
+        self.require_slot()?;
+        let centrals = &self.status().centrals;
+        let listed = centrals.iter().any(|c| c.node == self.me.id);
+        let has_db = Db::ALL
+            .iter()
+            .any(|db| self.host.paths().db_file(*db).exists());
+        if !listed && !has_db {
+            // 앞 Task가 이미 뺐다.
+            return Ok(None);
+        }
+        if listed && centrals.len() <= 1 {
+            return Err("the last OVN central node cannot be removed".into());
+        }
+        self.stage("checking").await;
+        self.host.check_platform().map_err(|e| e.to_string())?;
+        self.leave_and_retire().await?;
+        if !listed {
+            return Ok(Some(format!(
+                "node {:?} was not a listed OVN central; it left the OVN cluster it had half joined",
+                self.name()
+            )));
         }
         let me = self.me.id;
         update_sdn(&self.ctx.cluster, |s| {

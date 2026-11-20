@@ -1,5 +1,5 @@
 //! OvnSync의 순수 부분(계획 65 §8.2~8.3): 바라는 NB 행([`NbState`]), NB에서 읽은 우리 행([`NbActual`]), 둘을 견준
-//! 트랜잭션 연산([`plan`]), 펜싱 연산([`fence_ops`]), 네트워크 단위로 나누기([`batches`]).
+//! 트랜잭션 연산([`plan`] — 네트워크마다 한 묶음, 한 트랜잭션), 펜싱 연산([`fence_ops`]).
 //!
 //! 우리 행은 `external_ids:orbivisor:cluster=<태그>`가 있는 행뿐이다. 그런 행만 읽고 바꾸고 지운다. 논리 스위치는
 //! 이름(`opl-<네트워크 id>`), 포트는 이름(`Logical_Switch_Port.name`은 표에서 하나), DHCP_Options는 (네트워크 id,
@@ -29,8 +29,6 @@ pub const NAME_KEY: &str = "orbivisor:name";
 pub const FOLDER_KEY: &str = "orbivisor:folder";
 /// DHCP_Options의 서브넷 CIDR
 pub const SUBNET_KEY: &str = "orbivisor:subnet";
-/// 한 트랜잭션의 연산 수가 이보다 많으면 네트워크 단위로 나눈다.
-pub const MAX_OPS: usize = 2000;
 
 /// `NB_Global.external_ids`의 펜싱 토큰 키(`"<term>:<index>"`)
 pub fn fence_key(tag: &str) -> String {
@@ -158,7 +156,8 @@ fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static 
 
 /// 클러스터 `tag`의 바라는 NB 상태(§8.3): SDN 네트워크마다 논리 스위치, 그 네트워크의 DHCP를 켠 IPv4 서브넷마다
 /// DHCP_Options, 템플릿이 아닌 VM의 그 네트워크 NIC마다(전원과 상관없이) 논리 포트(주소·포트 보안 = `"MAC IP4 IP6"`,
-/// 주소가 없으면 `"MAC"`, IPv4 주소의 서브넷이 DHCP면 그 DHCP 행, `requested-chassis`). `nodes`는 클러스터의 노드다.
+/// 주소가 없으면 `"MAC"` — 그때 네트워크에 서브넷이 있으면 `enabled = false`, IPv4 주소의 서브넷이 DHCP면 그 DHCP 행,
+/// `requested-chassis`). `nodes`는 클러스터의 노드다.
 pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> NbState {
     let node_ids: BTreeSet<Uuid> = nodes.iter().map(|n| n.id).collect();
     let mut switches: Vec<SwitchRow> = networks
@@ -220,12 +219,16 @@ pub fn desired(networks: &[Network], vms: &[Vm], nodes: &[Node], tag: &str) -> N
                     if let Some(a) = activation {
                         options.insert(ACTIVATION_STRATEGY.to_string(), a.to_string());
                     }
+                    // 서브넷이 있는 네트워크에서 주소가 없는 NIC(서브넷을 나중에 더함, 다 쓰인 서브넷의 템플릿 되돌리기,
+                    // 복원 실패)는 끈다: MAC만인 포트 보안은 어느 IP든 보내게 둔다(리뷰 1 I-4). `network ips --fill`이나
+                    // VM 편집으로 주소를 받으면 켠다. 서브넷이 없는 네트워크는 L2만이라 MAC만이 뜻한 것이다.
+                    let enabled = !ips.is_empty() || n.spec.subnets.is_empty();
                     PortRow {
                         name: port_name(v.id, mac),
                         addresses: vec![address.clone()],
                         port_security: vec![address],
                         dhcpv4,
-                        enabled: Some(true),
+                        enabled: Some(enabled),
                         options,
                         external_ids: BTreeMap::from([
                             (CLUSTER_KEY.to_string(), tag.to_string()),
@@ -397,7 +400,8 @@ pub fn parse_actual(results: &[Value]) -> NbActual {
 
 // ---- 견주기 ----
 
-/// 네트워크 하나(또는 지울 스위치·DHCP 행 하나)의 연산 묶음. 묶음끼리는 named-uuid가 겹치지 않는다.
+/// 네트워크 하나(또는 지울 스위치·DHCP 행 하나)의 연산 묶음. 묶음 하나가 트랜잭션 하나다(리뷰 1 I-6 — 한 네트워크의
+/// 실패가 다른 네트워크를 막지 않게). 묶음끼리는 named-uuid가 겹치지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Batch {
     /// 보기용 이름(스위치 이름)
@@ -443,6 +447,18 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
         }
     }
     let wanted: BTreeSet<&str> = want.switches.iter().map(|s| s.name.as_str()).collect();
+    // 바라는 포트(이름). 다른 스위치로 옮기는 포트는 새 스위치의 묶음만 옮긴다 — 옛 스위치의 묶음이 먼저 빼면 강한
+    // 참조를 잃은 포트가 지워져 새 묶음이 실패한다(리뷰 1 m-3).
+    let wanted_ports: BTreeSet<&str> = want
+        .switches
+        .iter()
+        .flat_map(|s| s.ports.iter().map(|p| p.name.as_str()))
+        .collect();
+    let port_names: BTreeMap<&str, &str> = have
+        .ports
+        .iter()
+        .map(|p| (p.uuid.as_str(), p.name.as_str()))
+        .collect();
     let wanted_networks: BTreeSet<String> = want
         .switches
         .iter()
@@ -552,7 +568,10 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
         if let Some(c) = current {
             for u in &c.ports {
                 // 우리 포트가 아닌 것(관리자가 넣은 포트)은 둔다.
-                if our_ports.contains(u.as_str()) && !kept_ports.contains(u.as_str()) {
+                let moved = port_names
+                    .get(u.as_str())
+                    .is_some_and(|name| wanted_ports.contains(name));
+                if our_ports.contains(u.as_str()) && !kept_ports.contains(u.as_str()) && !moved {
                     remove.push(uuid_value(u));
                 }
             }
@@ -625,27 +644,6 @@ pub fn plan(want: &NbState, have: &NbActual) -> Vec<Batch> {
         });
     }
     out
-}
-
-/// 묶음들을 트랜잭션으로: 모두 합쳐 [`MAX_OPS`] 이하면 하나, 넘으면 묶음마다 하나(한 묶음이 넘어도 나누지 않는다 —
-/// 강한 참조가 한 번에 맞아야 한다).
-pub fn batches(plan: Vec<Batch>) -> Vec<Batch> {
-    let total: usize = plan.iter().map(|b| b.ops.len()).sum();
-    if total <= MAX_OPS || plan.len() <= 1 {
-        if plan.is_empty() {
-            return plan;
-        }
-        let key = if plan.len() == 1 {
-            plan[0].key.clone()
-        } else {
-            format!("{} networks", plan.len())
-        };
-        return vec![Batch {
-            key,
-            ops: plan.into_iter().flat_map(|b| b.ops).collect(),
-        }];
-    }
-    plan
 }
 
 /// 트랜잭션 앞의 펜싱 연산: `NB_Global.external_ids`가 읽은 값 그대로인지 `wait`하고, 토큰 `token`을 쓰고 `nb_cfg`를

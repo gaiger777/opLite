@@ -454,8 +454,10 @@ impl VmSpec {
                     return Err(ValidationError::DuplicateSecurityGroup(i, group.clone()));
                 }
             }
+            // IPv4 대응 IPv6(`::ffff:a.b.c.d`)는 IPv4로 센다(리뷰 1 I-3 — 한 NIC에 IPv4 둘이 되지 않게).
             if nic.ips.len() > 2
-                || (nic.ips.len() == 2 && nic.ips[0].is_ipv4() == nic.ips[1].is_ipv4())
+                || (nic.ips.len() == 2
+                    && nic.ips[0].to_canonical().is_ipv4() == nic.ips[1].to_canonical().is_ipv4())
             {
                 return Err(ValidationError::NicIps(i));
             }
@@ -2639,6 +2641,11 @@ mod tests {
         );
         assert_eq!(
             with(&["10.0.0.5", "2001:db8::5", "2001:db8::6"]),
+            Err(ValidationError::NicIps(0))
+        );
+        // IPv4 대응 IPv6는 IPv4다.
+        assert_eq!(
+            with(&["::ffff:10.0.0.5", "10.0.0.6"]),
             Err(ValidationError::NicIps(0))
         );
     }

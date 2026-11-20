@@ -1391,8 +1391,10 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * SDN 네트워크의 주소: 서브넷마다 크기·사용·남음, NIC마다 VM·MAC·주소와 OVN 논리 포트의 `up`·바인딩 노드(API 노드가
-         *     NB·SB 팔로어에서도 읽는다 — 못 읽으면 `live` null과 `live_error`). 네트워크 읽기 권한. 단순 네트워크면 409
+         * SDN 네트워크의 주소: 서브넷마다 크기·사용·남음(모든 VM), NIC마다 VM·MAC·주소와 OVN 논리 포트의 `up`·바인딩
+         *     노드(API 노드가 NB·SB 팔로어에서도 읽는다 — 못 읽으면 `live` null과 `live_error`). 네트워크 읽기 권한. NIC 목록은
+         *     부른 사용자가 읽을 수 있는 VM의 것뿐이고 나머지는 `hidden` 수로만 알린다(리뷰 1 I-1 — 네트워크를 함께 쓰는 다른
+         *     폴더의 VM 이름·주소를 드러내지 않게). `live=false`면 OVN을 읽지 않는다(목록의 사용률). 단순 네트워크면 409
          *     `network_immutable`.
          */
         get: operations["network_ips"];
@@ -2077,8 +2079,8 @@ export interface paths {
         /**
          * SDN(OVN)을 세운다: 노드 `node`에 OVN 꾸러미를 apt로 설치하고 NB·SB ovsdb Raft 클러스터와 northd를 Orbivisor 단위로
          *     세우고 chassis로 구성하는 `sdn-init` Task(202). `address`는 NB·SB가 들을 주소(없으면 노드 주소의 IP, 노드 인증서의
-         *     이름 안이어야 한다). 실패했으면 같은 노드로 다시 부르면 이어서 하고, 첫 세우기 노드가 꺼졌거나 지워졌고 아직 중앙이
-         *     없으면 다른 노드로 옮겨 다시 한다. 노드가 없거나 위트니스·macOS·유지보수·underlay 없음·인증서 밖 주소면 400,
+         *     이름 안의 노드 주소여야 하고 루프백·링크 로컬은 안 된다). 실패했으면 같은 노드로 다시 부르면 이어서 하고(주소를
+         *     주지 않으면 지난번 주소로), 첫 세우기 노드가 꺼졌거나 지워졌고 아직 중앙이 없으면 다른 노드로 옮겨 다시 한다. 노드가 없거나 위트니스·macOS·유지보수·underlay 없음·인증서 밖 주소면 400,
          *     오프라인이면 409 `node_offline`, 옛 노드가 남았으면 409 `cluster_upgrading`, 이미 세웠거나 다른 노드에서 세우는 중이면
          *     409 `sdn_exists`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
          */
@@ -2123,9 +2125,10 @@ export interface paths {
         post?: never;
         /**
          * 노드 `node`를 OVN 중앙에서 빼는 `sdn-central-remove` Task(202): NB·SB Raft 클러스터를 떠나고 단위를 멈추고 DB 파일은
-         *     이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이
-         *     아니면 400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`,
-         *     다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
+         *     이름만 바꾼다(지우지 않음). chassis 구성은 그대로다. 중앙 목록에 없지만 이 SDN의 DB를 가진 노드(끝나지 않은 중앙
+         *     더하기가 남긴 멤버)도 같이 떠나게 한다. 마지막 중앙은 뺄 수 없다(409 `sdn_last_central`). 노드가 중앙이 아니면
+         *     400, 오프라인이면 409 `node_offline`(그 노드가 스스로 떠나야 한다), SDN이 준비되지 않았으면 409 `sdn_not_ready`, 다른
+         *     중앙 Task가 끝나지 않았으면 409 `sdn_busy`. 짝수가 되면 응답 헤더 `orbivisor-warning`.
          */
         delete: operations["remove_central"];
         options?: never;
@@ -7519,8 +7522,10 @@ export interface components {
         };
         /** @description `GET /networks/{key}/ips` */
         NetworkIps: {
-            /** @description 템플릿이 아닌 VM의 이 네트워크 NIC마다(VM 이름, NIC 순) */
+            /** @description 템플릿이 아닌 VM의 이 네트워크 NIC마다(VM 이름, NIC 순). 부른 사용자가 읽을 수 있는 VM의 것만 있다. */
             allocations: components["schemas"]["IpAllocation"][];
+            /** @description 부른 사용자가 읽을 수 없는 VM(다른 폴더)의 NIC 수: 목록에서 빠졌지만 `subnets`의 사용 수에는 들었다. */
+            hidden?: number;
             /** @description OVN을 읽지 못한 까닭(그때 `live`는 모두 null) */
             live_error?: string;
             network: string;
@@ -15178,7 +15183,13 @@ export interface operations {
     };
     network_ips: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description 거짓이면 OVN 포트 상태(`live`)를 읽지 않는다(목록의 사용률처럼 주소만 볼 때 — 그때 `live`는 모두 null이고
+                 *     `live_error`도 없다). 기본 참
+                 */
+                live?: boolean;
+            };
             header?: never;
             path: {
                 /** @description id or name */

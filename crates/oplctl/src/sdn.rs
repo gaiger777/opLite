@@ -472,6 +472,12 @@ pub(crate) async fn network_ips(
     if let Some(e) = view["live_error"].as_str() {
         writeln!(err, "warning: cannot read OVN port state: {e}")?;
     }
+    if let Some(n) = view["hidden"].as_u64().filter(|n| *n > 0) {
+        writeln!(
+            err,
+            "note: {n} NIC(s) of VMs you cannot read are counted in USED but not listed"
+        )?;
+    }
     let subnets: Vec<Vec<String>> = arr(&view["subnets"])
         .iter()
         .map(|s| {

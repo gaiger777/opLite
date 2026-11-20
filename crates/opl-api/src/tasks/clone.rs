@@ -479,8 +479,9 @@ pub(super) fn identity_warning(what: &str, spec: &VmSpec) -> Option<String> {
     })
 }
 
-/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, SDN NIC 주소를 채우며(스펙에 있던
-/// 주소는 비어 있으면 그대로, 아니면 새로 받고 `warnings`에 적는다 — 계획 65 §9), 예약 없는 VM이다. 노드는 `node`이고
+/// 복제·복원·가져오기가 만든 새 VM `new`를 저장소에 만든다: 빠진 MAC을 새로 받고, SDN NIC의 보안 그룹·cloud-init 주소
+/// 항목을 빼고, SDN NIC 주소를 채우며(스펙에 있던 주소는 비어 있으면 그대로, 아니면 새로 받고 `warnings`에 적는다 —
+/// 계획 65 §9), 예약 없는 VM이다. 노드는 `node`이고
 /// (복원·가져오기는 없음), `start`면 켠 채로(그 노드의 reconciler가 켠다), 아니면 꺼진 채로 만든다. `placement`를 모르는
 /// 노드가 있으면 VM 고정을, `templates`를 모르는 노드가 있으면 템플릿 표시(복원)를 버린다. 성공하면 Task가 만든 것을 더는
 /// 정리하지 않는다.
@@ -545,6 +546,12 @@ pub(super) async fn create_vm(
     {
         crate::backup_receive::drop_templates(&mut new.spec);
     }
+    // SDN NIC는 보안 그룹·cloud-init 주소 항목을 갖지 않는다(배포가 NIC를 SDN으로 옮겼을 때 — 리뷰 1 웹 #2).
+    let (_, networks) = ctx
+        .cluster
+        .list::<NetworkSpec>()
+        .map_err(|e| e.to_string())?;
+    warnings.extend(crate::ipam::strip_sdn_nic_config(&mut new.spec, &networks));
     // SDN 주소(계획 65): 다른 노드가 그새 같은 주소를 잡았으면 저장소가 거부하고 다시 고른다.
     let wanted = new.spec.nics.clone();
     let mut retries = 0;

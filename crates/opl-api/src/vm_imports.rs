@@ -1057,8 +1057,6 @@ pub async fn run_import(
     }
     let spec = import_spec(src, proposal, &run, &volumes).map_err(ApiError::bad_request)?;
     spec.validate().map_err(crate::cpu::validation_error)?;
-    // 준 SDN 주소(계획 65)는 미리 본다(Task가 만들 때 다시 본다).
-    crate::ipam::check_requested(&state.cluster, &spec, &run.ips)?;
     // 별칭은 버전 모델로 고정해 Task에 넣는다(계획 63 §8).
     if run.cpu_model.is_some() || !run.cpu_flags.is_empty() {
         let inv = crate::scheduler::Inventory::load(&state.cluster)?;
@@ -1106,6 +1104,13 @@ pub async fn run_import(
             )));
         }
     }
+    // 준 SDN 주소(계획 65)는 권한을 본 뒤에 미리 본다(리뷰 1 I-2, Task가 만들 때 다시 본다).
+    crate::ipam::check_requested(
+        &state.cluster,
+        &spec,
+        &run.ips,
+        &crate::ipam::readable(&state, Some(&principal)),
+    )?;
     let pool = state
         .cluster
         .get_by_name::<StoragePoolSpec>(&run.pool)?

@@ -387,6 +387,14 @@ pub(crate) fn requester() -> Option<Uuid> {
         .flatten()
 }
 
+/// 지금 요청을 보낸 주체(바꾸는 API 요청 안에서만, 인증 뒤). 요청 밖이면 None
+pub(crate) fn principal() -> Option<Principal> {
+    REQUEST
+        .try_with(|slot| slot.0.lock().unwrap().principal.clone())
+        .ok()
+        .flatten()
+}
+
 #[derive(Default)]
 struct SlotData {
     principal: Option<Principal>,
