@@ -15,6 +15,7 @@
 - [단축키](#단축키)
 - [CPU 모델 화면](#cpu-모델-화면)
 - [NUMA 화면](#numa-화면)
+- [SDN 화면](#sdn-화면)
 - [접근성과 모양](#접근성과-모양)
 - [한계](#한계)
 
@@ -28,7 +29,7 @@
 |---|---|
 | 홈 `/` | 없음(한 화면) |
 | 가상 머신 `/vms` | VM(목록 `/vms` \| 폴더 `/vm-folders`) · 템플릿 `/templates` · 이미지·ISO(이미지 라이브러리 `/images` \| ISO 이미지 `/isos`) · 가져오기 `/imports` |
-| 인프라 `/infra` | 노드(노드 `/nodes` \| 클러스터 `/cluster`) · 스토리지 풀(목록 `/storage-pools` \| 폴더 `/storage-folders`) · 볼륨 `/volumes` · Ceph `/ceph` · 네트워크(목록 `/networks` \| 폴더 `/network-folders`) · 보안 그룹 `/security-groups` |
+| 인프라 `/infra` | 노드(노드 `/nodes` \| 클러스터 `/cluster`) · 스토리지 풀(목록 `/storage-pools` \| 폴더 `/storage-folders`) · 볼륨 `/volumes` · Ceph `/ceph` · 네트워크(목록 `/networks` \| 폴더 `/network-folders` \| SDN `/sdn`) · 보안 그룹 `/security-groups` |
 | 보호 `/protect` | 백업 `/backups` · 백업 작업 `/backup-jobs` · 원격 복제 `/remotes`(원격 읽기 권한) · HA 그룹 `/ha-groups` · HA 검사 `/ha-checks` · 배치(배치 규칙 `/placement-rules` \| 최적 배치 `/placement`) |
 | 활동 `/activity` | 작업 `/tasks` · 경보 `/alerts` · 감사 로그 `/audit`(admin) |
 | 설정 `/settings` (아래 고정) | 일반 `/settings` · 사용자 `/settings/users`(사용자 읽기 권한) · 인증 영역 `/settings/realms`(영역 읽기 권한) · 권한 `/settings/permissions`(admin) · 역할 `/settings/roles`(admin) · 그룹 `/settings/groups`(그룹 읽기 권한) · 보안 `/settings/security`(admin, 2단계 인증 정책) · API 토큰 `/settings/tokens`(모두, 자기 토큰) · 2단계 인증 `/settings/account`(모두, 자기 요소) · 원격 클러스터 `/settings/remotes`(admin) · 알림 대상 `/settings/notifications`(admin) · 구독 `/settings/subscription` |
@@ -261,6 +262,29 @@ CPU·hugepages](vms.md#numa전용-cpuhugepages)·[호스트 준비](cluster.md#�
 | 폴더 상세(`/vm-folders/:id`) › 할당량, 할당량 대화상자 | "전용 vCPU"(입력 칸, 요약 막대는 쓰거나 상한이 있을 때만) |
 | 설정 › 역할 | 권한 목록의 `vm.dedicated` |
 
+## SDN 화면
+
+SDN(OVN, 계획 65)도 사이드바 항목을 더하지 않는다. **인프라 › 네트워크** 탭의 셋째 보기 **SDN**(`/sdn`)이고, 이 보기는 루트
+`cluster.read`가 있을 때만 보인다(폴더 사용자에게는 감춤). 쓰는 법은 [SDN (OVN)](network.md#sdn-ovn).
+
+| 화면 | 있는 것 |
+|---|---|
+| 인프라 › 네트워크 › SDN, 설정 전 | 빈 상태 "SDN이 설정되지 않음"과 admin의 "SDN 설정 시작"(시작하기 전에는 아무것도 설치하지 않음) |
+| "SDN(OVN) 설정" 마법사 | ① **중앙 노드**: 체크 목록(막히지 않은 투표 멤버 셋을 미리 고름, 5개까지, 짝수면 경고). 위트니스는 빠지고 macOS·underlay 주소 없음·유지보수 중·오프라인 노드는 까닭과 함께 막힘. "먼저 세움" 노드와 그 중앙 주소(선택 — 노드 인증서 안의 주소). ② **설치**: 첫 노드의 Task 단계(노드 확인 → 꾸러미 설치 → TLS 파일 쓰기 → NB·SB 데이터베이스 만들기 → ovsdb-server·northd 시작 → 데이터베이스 리더 기다리기 → chassis 구성), 끝나면 나머지 중앙을 화면이 **하나씩** 더함(중앙 Task는 클러스터에서 한 번에 하나), 노드마다 기다리는 중·합류 중·중앙·실패. 실패하면 까닭과 "다시 하기"(첫 세우기는 같은 노드로, 중앙 더하기는 그 노드로). ③ **chassis**: 노드 표와 노드마다 "설치", "모든 노드에 설치"(나중에 합류한 노드에는 저절로 깔지 않음) |
+| SDN 상태(설정 후) | 상태(설정 중·준비됨), OVN 판, 마지막 동기화 시각과 chassis 반영("모든 chassis가 반영했습니다" 또는 `hv_cfg` / `nb_cfg`), 동기화 오류, 진행 중인 SDN 작업 수, 마지막 설정 실패. 경고 띠: 중앙 수가 짝수, 투표 멤버가 아닌 중앙, 오프라인 중앙. 설정이 멈췄으면(설정 중이고 도는 작업 없음) "{노드}에서 설정 다시 하기" |
+| SDN 상태 › 중앙 노드 표 | 노드, 주소, NB·SB Raft 역할(리더·팔로어·후보·합류 중·꺼짐), northd 활성·대기. admin에게 "중앙 더하기"(대화상자 — apt 설치와 합류)와 행마다 빼기(확인 대화상자 — DB 파일은 이름만 바꿈, chassis로는 남음, 노드가 온라인이어야 함) |
+| SDN 상태 › chassis 표 | 노드, 상태 칩(설치 안 됨·구성 중·준비됨·끊김), Geneve 주소, OVN·OVS 판, 오류. admin에게 노드마다 "설치"와 "모든 노드에 설치" |
+| 서버 경고 | 응답 헤더 `orbivisor-warning`(영어 문장 — 중앙 짝수, `all`이 건너뛴 오프라인 노드)은 번역하지 않고 그대로 경고 토스트 |
+| 인프라 › 네트워크 › 목록 | SDN 행: 종류 "SDN(OVN)", 브리지 `br-int`, MTU(기본 1442), "서브넷" 칸(CIDR과 사용률 막대 — 행마다 IP 목록을 읽음, 10초 캐시), "브리지가 있는 노드" 칸은 준비된 chassis(없으면 "준비된 OVN chassis 노드가 없음"). **이름을 누르면 서랍**이 열린다 |
+| 네트워크 서랍 | **서브넷**: 보기와 "서브넷 편집"(저장된 서브넷의 CIDR·게이트웨이는 잠김, 저장은 목록 전체를 편집을 시작한 리비전으로 — 그새 바뀌었으면 412 `revision_mismatch`, 쓰는 서브넷을 빼면 서버 문장(VM 이름들)을 그대로). **IP 주소**: 서브넷 사용률("253개 중 2개 사용, 251개 남음"), 표(VM 링크, 인터페이스 #, MAC, 주소, 포트 켜짐·꺼짐, 바인딩 노드). OVN을 읽지 못하면 포트·노드가 "—"이고 까닭 한 줄 |
+| 네트워크 만들기 대화상자 | 종류 "SDN(OVN)"(SDN이 준비되지 않았으면 "SDN(OVN) — 설정 안 됨"으로 막고 까닭; `GET /sdn`을 읽지 못하는 폴더 위임자는 고를 수 있고 서버가 409 `sdn_not_ready`로 답함), MTU(1280~9000, 기본 1442), 서브넷 표(체계마다 하나 — CIDR, 게이트웨이(비우면 첫 호스트), DHCP(IPv4만), DNS 서버 4개, 할당 범위, 설명) |
+| VM 만들기·편집 › 네트워크 | SDN NIC에 "IP 주소"(IPv4·IPv6 하나씩 쉼표로, 비우면 "자동" — 있던 NIC는 서버가 지금 주소를 둠), 켜진 VM의 저장된 NIC는 잠김("이 인터페이스의 주소를 바꾸려면 VM을 멈추세요"). 보안 그룹 고르기 대신 "SDN 네트워크에는 아직 보안 그룹을 걸 수 없습니다…"(SDN 네트워크로 바꾸면 고른 그룹이 빠짐). 네트워크를 바꾸면 주소 입력을 비움 |
+| VM 만들기·편집 › cloud-init | SDN NIC 자리는 "NIC n은 SDN 네트워크에 있어 주소를 IPAM(서브넷)이 정합니다"(그 자리는 `{}`로 보냄) |
+| 복제·템플릿 배포 대화상자, 가져오기 실행 | SDN NIC마다 "인터페이스 n(네트워크) IP 주소"(비우면 자동). 배포 수가 2 이상이면 주소를 막음 |
+| VM 상세 › 하드웨어 | NIC 표의 "주소" 칸 |
+| 인프라 › 노드 목록·노드 상세 | "SDN" 칸: chassis 상태 칩, 중앙이면 "중앙(NB 역할)". 노드 상세 머리 요약에는 SDN이 있을 때만 |
+| 활동 › 작업, 알림 센터 | `sdn-*` 작업 문장("n1에 SDN(OVN) 설정", "n2에 OVN 중앙 더하기", "…의 OVN 중앙 빼기", "…에 OVN chassis 설치")과 진행 단계, 대상 링크는 SDN 보기 |
+
 ## 접근성과 모양
 
 - **테마**: 시스템(기본)·밝게·어둡게. **밀도**: 편안하게(기본)·촘촘하게. 둘 다 사용자 메뉴에 있고 브라우저에 남는다.
@@ -290,3 +314,5 @@ CPU·hugepages](vms.md#numa전용-cpuhugepages)·[호스트 준비](cluster.md#�
 - 노드 "NUMA 토폴로지" 격자에는 소켓 층이 없다(토폴로지가 CPU마다 소켓 번호를 갖지 않아 호스트 노드 › L3 › 코어 › 스레드로
   그린다). VM 폼의 "들어갈 노드"는 노드마다 남은 전용 CPU·hugepages 수만 보는 어림이고(`isolate`의 형제는 빼지 않는다), 노드마다
   직접 나누는 표는 VM 폼에만 있다(복제·배포·가져오기는 노드 수까지).
+- SDN 화면에 서브넷을 더한 뒤 있던 NIC에 주소를 채우는 단추는 없다(CLI `orbivisorctl network ips NAME --fill`). "10초 안에 포트가
+  바인딩되지 않음"은 orbivisord 로그에만 있고 VM 화면에 없다. 오프라인 중앙 노드는 화면에서도 뺄 수 없다. 토폴로지 그림은 계획 67이다.

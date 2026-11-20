@@ -406,3 +406,9 @@ graph LR
 - **노드 목록·상세**: "SDN" 칸(chassis 상태 칩, 중앙이면 NB 역할). 상세 머리 요약에는 SDN이 있을 때만.
 - **Task 목록**: `sdn-*` Task의 문장(실행 노드)과 진행 단계(`tasks.sdnStage.*`), 대상 링크 `/sdn`.
 - **하지 않은 것**: 스테이지 5의 "10초 안에 `ovn-installed`가 안 옴" 경고는 opld 로그뿐이라 화면에 없다. `network ips --fill`(있던 NIC 채우기)은 CLI만이다.
+
+### 스테이지 8 (문서)
+
+- **자리**: 쓰는 법은 `docs/guide/network.md`의 새 절 "SDN (OVN)"(개념·설정·네트워크와 서브넷·VM NIC 주소·켜기와 마이그레이션·OvnSync·버전 섞임·보안·문제 풀기·계획 65가 하지 않는 것·한계, Proxmox SDN·Neutron ML2/OVN과 짧은 비교), 화면은 `web-ui.md` "SDN 화면", 시험은 `development.md`(단위 시험 명령, `sdn-it`과 CI `ovn` 작업), 구조는 `docs/architecture.md` §1.1·§1.2·§2.3·§4(리더 루프 표의 `OvnSync`)·§11.3·§11.4(새로 씀: 리소스·설치 Task·`SdnAgent`·OVSDB 클라이언트·OvnSync·펜싱·SB·IPAM·포트 바인딩)·§13·§14·§17·§18·§19, README·`docs/index.md`, 계획 문서 `docs/superpowers/plans/2026-11-20-plan65-sdn.md`. 설계 §13의 "`docs/architecture.md` §11.4·§19 고치기"는 §11.4를 지우지 않고 SDN 절로 바꿔 썼다.
+- **문제 풀기 명령**은 스테이지 2·3 보고대로 팔로어 소켓에 `--no-leader-only`를 붙였다(`ovn-nbctl`의 기본은 리더만).
+- 문서를 쓰며 본 것(코드는 고치지 않음): 웹 `NetworkSheet.tsx`의 주석은 리비전 충돌을 409라 적지만 서버는 412 `revision_mismatch`다(화면 동작은 서버 오류 문장을 보이므로 같다). 가이드는 412로 적었다.

@@ -56,7 +56,7 @@ CLI `orbivisorctl`이나 그 데몬이 내장한 웹 UI로 한다.
 | 하이퍼바이저 제어 | QEMU/QMP 직접 | QEMU(qm, Perl) | ESXi |
 | 노드 수 | 투표 멤버 3/5/7 + learner·관찰 노드, 300노드 시험 | corosync 한계(수십 노드) | 클러스터당 96호스트 |
 | HA | 리스 + watchdog·IPMI/Redfish 펜싱, 기본 복구 약 22초 | watchdog 펜싱, 보통 2분 안팎 | HA 에이전트·하트비트 데이터스토어 |
-| SDN | 브리지·VLAN·정적 VXLAN, nftables 보안 그룹 | SDN(EVPN 포함) | NSX(따로) |
+| SDN | 브리지·VLAN·정적 VXLAN, nftables 보안 그룹, OVN SDN(논리 스위치·IPAM·DHCP, 계획 65 — 라우터·NAT는 계획 66) | SDN(EVPN 포함) | NSX(따로) |
 
 Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
 
@@ -66,7 +66,7 @@ Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에
 |---|---|---|
 | `opl-types` | 30k | 리소스 모델(32종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
 | `opl-qemu` | 7k | QEMU 명령줄 만들기, QMP·QGA 클라이언트, 펌웨어 찾기, cloud-init ISO 만들기 |
-| `opl-driver` | 47k | `Hypervisor` 트레이트와 `QemuHypervisor`·`MockHypervisor`, 스토리지 백엔드, 브리지·VXLAN·nftables, VIP, Ceph 구성 |
+| `opl-driver` | 47k | `Hypervisor` 트레이트와 `QemuHypervisor`·`MockHypervisor`, 스토리지 백엔드, 브리지·VXLAN·nftables, VIP, Ceph 구성, OVN 설치·OVSDB 클라이언트 |
 | `opl-cluster` | 16k | Raft(openraft + redb), 상태 머신, watch, 리스, 투표 멤버 관리(`VoterKeeper`), 관찰 노드 |
 | `opl-peer` | 9k | 노드 간 gRPC(tonic, mTLS), Raft 전송, 클러스터 CA·인증서, 노드 감시(`NodeMonitor`) |
 | `opl-reconciler` | 14k | 노드마다 VM을 원하는 상태로 맞추는 루프, HA watchdog(`HaGuard`), 펌웨어 사본 따라가기 |
@@ -214,7 +214,7 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 | `[migration] ports` | `60000-60099` | QEMU 마이그레이션·NBD(`config.rs:1812`) |
 
 설정 절: `[hypervisor] [reconciler] [schedule] [janitor] [backup] [replication] [pools] [migration] [ha] [network]
-[updates] [telemetry] [audit] [remotes] [runtime] [api] [vip] [web] [node] [ceph] [download] [metrics]`
+[updates] [telemetry] [audit] [remotes] [runtime] [api] [vip] [web] [node] [ceph] [download] [metrics] [sdn]`
 (`config.rs:63-106`). 예시는 `packaging/deb/opld.toml.example`.
 
 `data_dir` 아래:
@@ -492,6 +492,7 @@ sequenceDiagram
 | 배치 현황 | 리스로 받은 노드 부하를 다른 노드에 RPC(`ReadPlacement`)로 알려 줌 | 캐시 1초 | `placement_board.rs:154`, `score.rs:299-342` |
 | `TelemetryReporter` | 텔레메트리 보고 | 틱 60초, 24시간마다 | `telemetry.rs:221-229,292` |
 | `RemotePoller` | 원격 클러스터 상태 모으기 | 30초 | `remotes.rs:558-559,608` |
+| `OvnSync` | Raft의 SDN 네트워크·서브넷·VM NIC를 OVN NB에 맞추기(다른 것만, 펜싱 토큰), 지운 노드의 SB chassis 지우기, `SdnStatus.sync`(§11.4). `Sdn`이 `ready`가 아니면 쉼 | 바뀌면 0.5초 모아, 60초마다, 리더 확인 1초 | `ovn_sync/mod.rs:44-48,82-83,136,486` |
 | 리스 표 | 노드의 `RenewLease`를 받아 메모리에 기록(§5.1) | 요청마다 | `crates/opl-cluster/src/lease.rs` |
 
 리더 일이 **아닌** 것(오해하기 쉬운 것):
@@ -504,7 +505,9 @@ sequenceDiagram
 - **CPU 카탈로그 읽기.** 노드마다 자기 QEMU에 묻고 자기가 올린다(§9.6). 리더는 그 결과로 **클러스터 CPU 기준만** 셈해
   `ClusterStatus.cpu_baselines`에 쓴다(위 `ClusterJanitor` 틱, 계획 63). 노드가 VM을 켤 때는 이 기록만 읽으므로 리더가
   바뀌어도 모든 노드가 같은 기준을 쓰고, 새 리더는 다음 틱에 같은 값을 셈한다(같으면 쓰지 않는다).
-- **OvnSync, 구독 보고 루프는 없다.** OVN은 범위 밖이고(§11.4), 구독은 API(`subscription.rs`)만 있다.
+- **구독 보고 루프는 없다.** 구독은 API(`subscription.rs`)만 있다.
+- **OVN 설치와 chassis 맞추기.** 설치는 `sdn-*` Task(그 노드에서), chassis·중앙 단위 맞추기는 노드마다의 `SdnAgent`다(§11.4).
+  리더는 NB만 쓴다.
 
 **리더 장애 때.** 새 리더가 3~4초 안에 선다(§3.5). 진행 중이던 쓰기는 §3.7처럼 다시 시도된다. 리스 표는 임기가 바뀌면
 비워지고 새 리더는 자기가 그 임기를 본 때를 기준(base)으로 나이를 센다(`lease.rs:58-65`,
@@ -1157,13 +1160,70 @@ flowchart LR
 보안 그룹을 nftables **bridge 계열** 테이블 `opl_<tag>` 하나에 tap마다 체인으로 그려 `nft -f -`로 한 번에 적용한다.
 conntrack을 쓰고 원본 MAC을 확인한다(`crates/opl-driver/src/firewall.rs:1-110`). 에이전트가 60초마다 다시 맞추고
 (`crates/opld/src/firewall.rs:1-24`), 보안 그룹이 걸린 NIC가 있는 VM은 방화벽 동기화가 성공해야 켠다
-(`crates/opl-reconciler/src/firewall.rs`).
+(`crates/opl-reconciler/src/firewall.rs`). SDN NIC는 OVS 포트라 이 훅을 타지 않으므로 건너뛴다(`crates/opld/src/firewall.rs:38`,
+SDN NIC에 보안 그룹은 400 — 계획 66이 OVN ACL로 옮긴다).
 
-### 11.4 SDN 현황
+### 11.4 SDN: OVN과 OvnSync (계획 65)
 
-**OVN, OvnSync, EVPN/BGP/FRR은 없다.** 네트워크 설계가 일부러 뺐다(`docs/superpowers/specs/2026-11-03-network-sdn-design.md`).
-VXLAN의 정적 head-end 복제는 노드 수에 비례해 BUM 트래픽이 늘므로 노드가 아주 많을 때는 한계다. 로드맵의 SDN 계획은
-아직 코드에 없다.
+설계는 `docs/superpowers/specs/2026-11-20-sdn-ovn-design.md`, 쓰는 법은 [네트워크 가이드](guide/network.md#sdn-ovn)다. OVN을
+뒷단으로 쓰고 Orbivisor가 Neutron ML2/OVN의 자리(NB에 원하는 상태를 쓰는 관리 시스템)를 맡는다. 단순 네트워크(§11.1~11.3)는
+그대로이고, 관리자가 `sdn init`을 하기 전에는 아무 루프도 일하지 않는다.
+
+```mermaid
+graph LR
+  R["Raft: Network(sdn, subnets), Vm(nics[].ips), Sdn"] --> L["리더 OvnSync<br/>(OVSDB JSON-RPC, mTLS)"] --> NB[("NB")]
+  NB --> N["ovn-northd"] --> SB[("SB")] --> C["노드마다 ovn-controller → br-int"]
+  A["노드 SdnAgent"] -. "NodeStatus.sdn" .-> R
+```
+
+- **리소스.** `Sdn`(이름 `sdn` 하나, `CephCluster`와 같은 모양): `status.phase`(bootstrapping·ready), 중앙 목록과 주소, OVN 판,
+  NB·SB 클러스터 id, 한 번에 하나만 도는 중앙 Task 자리 `pending`(리비전 확인 쓰기), 동기화 `sync`. 네트워크 `spec.sdn`·
+  `subnets`, NIC `ips`, 노드 `status.sdn`(chassis 상태, 판, encap 주소, 중앙이면 NB·SB Raft 역할·northd 활성)
+  (`crates/opl-types/src/sdn.rs`, `network.rs`). 모두 기능 `sdn` 뒤에 있다(§14).
+- **설치(Task).** `sdn-init`·`sdn-central-add`·`sdn-central-remove`(대상 `Sdn`)와 `sdn-chassis-install`(대상 노드)이 그 노드의
+  `OvnHost`(`crates/opl-driver/src/ovn/host.rs`, Ceph의 `CommandRunner`를 같이 씀) 단계를 돈다: 빠진 꾸러미만 apt, TLS 사본
+  `/etc/opl/ovn/`, 배포판 중앙 단위 끄고 가리기, `ovsdb-tool create-cluster`/`join-cluster`(DB `/var/lib/opl/ovn/`), Orbivisor
+  단위 `opl-ovn-nb`·`-sb`·`-northd`(`units.rs` — 노드 주소의 `pssl`만), 리더·멤버 기다리기, chassis 구성(OVS `external_ids`,
+  `set-ssl`). 단계마다 지금 상태를 먼저 봐서 다시 하면 잇고, 남의 OVN·모르는 클러스터 id의 DB는 거절한다. `sdn-init`은 DB를
+  임시 파일에 만들어 클러스터 id를 Raft에 **먼저** 적고 제자리로 옮긴다 — 그래서 제자리의 DB는 늘 Raft가 아는 id다
+  (`crates/opl-api/src/tasks/sdn.rs`).
+- **노드 `SdnAgent`**(`crates/opld/src/sdn.rs:61`): `Sdn`이 있을 때만, 중앙 목록·자리·underlay가 바뀌거나 60초마다 chassis의
+  `ovn-remote`·`encap-ip`·TLS를 맞추고, 중앙이면 멈춘 단위를 켜고 스키마 변환(`ovsdb-client needs-conversion`/`convert`)을
+  하며, 장치 없는 이 클러스터의 OVS 포트를 지운다. 상태는 검사 루프가 `NodeStatus.sdn`에 바뀔 때만 쓴다.
+- **OVSDB 클라이언트**(`crates/opl-driver/src/ovn/ovsdb.rs`): RFC 7047 JSON-RPC를 `tokio-rustls` 위에서 직접 말한다(`ovn-nbctl`을
+  부르지 않음 — 리더가 macOS일 수도 있고, "다른 것만 한 트랜잭션에 + 펜싱 `wait`"을 명령줄로 만들기 어렵다). 노드 인증서로
+  붙고 서버 인증서를 클러스터 CA와 이름(중앙 IP 또는 그 노드 주소의 호스트)으로 확인한다. 붙자마자 `_Server`의 `Database`
+  행을 읽어 쓰는 쪽은 클러스터 리더에만(`connect_any(.., leader_only)`, `:363`), 읽는 쪽(`GET /networks/{key}/ips`)은 팔로어도
+  쓴다. 서버의 `echo` 탐침에 답한다. 시험은 가짜 서버(`fake_ovsdb.rs`)와 실제 24.03.8의 요청·답 고정물이다.
+- **`OvnSync`**(`crates/opl-api/src/ovn_sync/`): 리더 루프(§4). 차례마다 임기(`Cluster::leader_term()`)를 잡고 `read_barrier()`
+  뒤 임기가 그대로인지 다시 본 다음, 순수 함수 `nb::desired(networks, vms, nodes, tag)`(`nb.rs:162`)로 바라는 행
+  (`Logical_Switch` `opl-<네트워크 id>`, IPv4 DHCP 서브넷마다 `DHCP_Options`, 템플릿이 아닌 VM의 SDN NIC마다
+  `Logical_Switch_Port` `opl-<VM id>-<MAC>` — 주소·포트 보안·`requested-chassis`(마이그레이션 중이면 "원본,대상"과
+  `activation-strategy=rarp`))을 만들고, 주인 표시(`external_ids:orbivisor:cluster`)가 있는 NB 행만 읽어 견주어(`plan`, `:433`)
+  다른 것만 쓴다. Raft 읽기가 실패한 차례는 아무것도 지우지 않는다.
+- **펜싱.** 트랜잭션마다 첫 연산이 `NB_Global.external_ids`에 대한 `wait`(읽은 값 그대로) + 토큰 `"<임기>:<인덱스>"`를 넣은
+  `update` + `nb_cfg += 1`이다(`fence_ops`, `nb.rs:653`). NB의 토큰 임기가 내 임기보다 크면 쓰지 않고 `sync`·SB 청소도 하지
+  않는다(물러난 리더). 그래서 리더가 바뀌는 순간 옛 리더가 낡은 상태로 쓰더라도 새 리더의 `wait`이 깨져 다시 읽는다. 연산이
+  2000개를 넘으면 네트워크마다 나눈 트랜잭션이고 각각 펜싱 연산을 갖는다(`batches`, `:632`). 투표 멤버 하나인 Raft는 다시
+  떠도 임기가 그대로였다(같은 임기는 같은 리더이므로 막지 않는다 — 시험이 `(임기, 인덱스)`로 견준다).
+- **SB.** OvnSync가 SB에 쓰는 것은 Raft에 없는 노드 UUID 이름의 `Chassis`·`Chassis_Private` 지우기뿐이다.
+  `SdnStatus.sync`는 바뀔 때만(시각만 바뀌면 60초에 한 번) Raft에 쓴다. 규모: 네트워크 50·포트 5천을 빈 가짜 NB에 넣으면
+  트랜잭션 50개, 다 맞은 NB를 다시 읽고 견주기까지 Mac 디버그 빌드에서 약 1.7초.
+- **IPAM.** 주소의 출처는 VM 스펙 `nics[].ips`다. API의 `prepare`(`crates/opl-api/src/ipam.rs:68` `assign`)와 Task의 새 VM
+  (`:214` `assign_new` — 복제·배포·가져오기·복원)이 서브넷의 가장 낮은 빈 주소를 고르거나 준 주소를 검사하고(`opl_types::ipam::
+  allocate`, 정렬된 사용 목록의 틈을 찾음), Raft 상태 머신이 `("ip", "<네트워크 이름>/<주소>")` 배타 값으로 겹침을 막는다
+  (`crates/opl-cluster/src/exclusive.rs:46`, 템플릿 제외). 거절되면 5번까지 다시 고르고, 그 뒤 409 `ip_in_use`. 있던 NIC는
+  저절로 채우지 않는다(CLI `network ips --fill`이 스펙에 적음). DHCP는 OVN 내장(`server_mac` = `02:` + 네트워크 id 해시)이고
+  `router` 옵션이 없다.
+- **포트 바인딩.** `resolve`가 SDN NIC의 `NicBackend::Tap`을 `br-int`·망 MTU·`ovn_port`로 채우고, 드라이버가 tap을
+  `ovs-vsctl --may-exist add-port br-int …`(`iface-id`=논리 포트, `crates/opl-driver/src/net.rs:800`)로 붙인다. 켤 때는
+  기다리지 않고(10초 안에 `ovn-installed`가 없으면 로그 경고), 마이그레이션 받는 쪽은 받을 QEMU를 띄우기 전에 30초까지
+  기다려 안 되면 받기를 거절한다(`crates/opl-driver/src/qemu.rs:576`). 스케줄러 `has_sdn`은 chassis가 `ready`인 노드만
+  (`crates/opl-api/src/scheduler.rs:245`).
+- **TLS.** NB·SB·Raft 포트는 모두 클러스터 CA mTLS(`/etc/opl/ovn/`의 노드 인증서 사본)이고 평문 리스너가 없다(§13).
+- **없는 것.** 라우터·게이트웨이·NAT·플로팅 IP, SDN NIC의 보안 그룹(OVN ACL), DHCPv6·RA는 계획 66, 부하 분산·QoS·
+  단순 → SDN 옮기기·SB RBAC은 계획 67이다. EVPN/BGP/FRR은 없다. VXLAN의 정적 head-end 복제는 노드 수에 비례해 BUM
+  트래픽이 늘므로 노드가 아주 많으면 SDN 네트워크가 낫다.
 
 ---
 
@@ -1278,6 +1338,7 @@ graph LR
 | 할당량 | 폴더마다 vCPU·메모리·디스크·VM 수, Raft 적용에서 최종 판정 | §3.2 |
 | 감사 로그 | 노드마다 `{data_dir}/audit/audit.log`(JSON 줄, 1초마다 fsync, 16 MiB × 8). 쓰기 요청·콘솔 열기·OIDC 콜백. `GET /audit`이 fan-out으로 모음. **Raft에 없다** | `crates/opl-api/src/audit.rs:1-470` |
 | 제어 소켓 | 0600 유닉스 소켓, 인증 없음(루트 전용) | §7.1 |
+| OVN(계획 65) | NB·SB·Raft는 `pssl`만, 클러스터 CA mTLS(노드 인증서 사본), OvnSync는 서버 이름도 확인. OVS 서버는 CA만 보고 SB RBAC은 아직 없음(계획 67) | §11.4 |
 | swtpm | AppArmor 추가 규칙 | §9.2 |
 
 **저장된 비밀은 암호화하지 않는다.** LDAP `bind_password`, OIDC `client_secret`, IPMI/Redfish 비밀번호, SMTP 비밀번호,
@@ -1295,7 +1356,7 @@ webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평
 
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
-  `metrics-history`, `vip`, `cpu-models`, `numa` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.
@@ -1416,6 +1477,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 | `web-it`(= `qemu-it` + `web-ui`) | opld | 웹 내장과 실제 VM |
 | `starve-it` | opld | 실행기를 일부러 막고 Raft·리스가 견디는지(§2.2) |
 | `metrics-it` | opld | 지표 수집·기록 |
+| `sdn-it` | opld | 깨끗한 Ubuntu 24.04에 OVN 설치·mTLS·OvnSync·DHCP·포트 바인딩(root, OVN을 남김) |
 | `scale-it` | opl-cluster | 수백 노드 규모(§15) |
 | `ldap-it` | opl-api | 실제 LDAP 서버 |
 | `catalog-it` | oplctl | 이미지 목록의 링크 |
@@ -1433,7 +1495,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 | `ci.yml` `web` | pnpm typecheck·lint·test·gen:api 차이·audit·build |
 | `ci.yml` `shell`, `package` | 패키지 스크립트, deb 빌드와 설치 |
 | `ci.yml` `linux-kvm`(root, 80분) | qemu·net·web·nfs·lvm·zfs·rbd·lvm-shared·migration·ha·vtpm 실제 시험, `OPL_TEST_SYSTEMD=1` |
-| `ci.yml` `ceph`, `install-media`, `ldap`, `deny` | Ceph, 설치 매체·템플릿·vTPM 실제 게스트, LDAP, cargo-deny |
+| `ci.yml` `ceph`, `ovn`, `install-media`, `ldap`, `deny` | Ceph, OVN(설치·mTLS·OvnSync·DHCP·바인딩·클라우드 이미지 게스트 DHCP), 설치 매체·템플릿·vTPM 실제 게스트, LDAP, cargo-deny |
 | `iso.yml` `iso-e2e` | BIOS·UEFI 설치 ISO 끝까지(주 1회, 태그, `ci-probe/**` 가지) |
 | `catalog.yml` `catalog-links` | 이미지 목록 링크(주 1회) |
 
@@ -1476,7 +1538,8 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
   [로컬 디스크 마이그레이션](superpowers/specs/2026-11-10-storage-migration-design.md),
   [공유 스토리지 NFS](superpowers/specs/2026-10-28-shared-storage-nfs-design.md)와 이후 LVM-thin·ZFS·Ceph·iSCSI 설계,
   [백업](superpowers/specs/2026-11-04-backup-design.md), [증분 백업](superpowers/specs/2026-11-09-incremental-backup-design.md)
-- 네트워크: [네트워크·SDN](superpowers/specs/2026-11-03-network-sdn-design.md)
+- 네트워크: [네트워크·SDN](superpowers/specs/2026-11-03-network-sdn-design.md),
+  [SDN(OVN) 계획 65~67](superpowers/specs/2026-11-20-sdn-ovn-design.md)
 - 지표: [실시간 지표(계획 44)](superpowers/specs/2026-11-11-monitoring-ui-design.md),
   [지표 기록·대시보드·알림·Prometheus(계획 60)](superpowers/specs/2026-11-18-dashboard-metrics-notifications-design.md)
 - 화면·권한: [웹 UI](superpowers/specs/2026-10-23-web-ui-design.md),
@@ -1515,6 +1578,8 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 - **확인하지 않은 세부**: `ha_reserve`(HA 예약 용량) 적용 코드, `guest_watch`의 실행 상수, 균형기의 동시 이동 한도(설계는
   2), 리더가 받은 `LoadSummary`를 어디에 얼마나 두는지, API 요청 본문 크기 제한(`DefaultBodyLimit`를 찾지 못함 — axum
   기본값을 쓰는 것으로 보인다).
-- **없는 것으로 확인한 것**(찾았지만 없음): `.proto` 파일, OVN/OvnSync/EVPN, 구독 보고 루프,
+- **SDN을 여러 노드에서 실제로 보지 못한 것.** chassis 둘 사이 Geneve, 라이브 마이그레이션의 두 chassis 바인딩, 중앙 셋의
+  실제 노드 장애는 GitHub `ovn` 작업(노드 하나)이 보지 못하고 단위·가짜 OVSDB 시험으로만 본다(설계 §14).
+- **없는 것으로 확인한 것**(찾았지만 없음): `.proto` 파일, EVPN/BGP, OVN 라우터·NAT, 구독 보고 루프,
   SSE, 평문 HTTP 리스너, 시리얼 콘솔, Task 취소, 데몬 재시작 뒤 Task 이어가기(업그레이드 제외), 클러스터 전체 VM 잠금,
   인증서 자동 갱신과 CA 교체, 저장 비밀 암호화, keepalived, 대량 전송용 망, 꺼진 VM의 저장소 옮기기.

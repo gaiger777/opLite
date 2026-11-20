@@ -79,6 +79,20 @@ sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 OPL_TEST_NUMA_SYS=1 CARGO_TARGET_DIR
 # cpulist·MemTotal을 보고(노드 둘, 소켓마다 CPU 하나, 메모리 반씩), 기록 numa의 모양(CI install-media 작업)
 OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
   cargo test -p opld --features install-media-it,qemu-it --test install_media a_guest_sees_its_numa_nodes -- --nocapture
+# SDN(OVN, 계획 65)
+cargo test -p opl-types -- sdn ipam network                         # 순수: serde 하위 호환(옛 NetworkSpec·NicSpec·NodeStatus·RuntimeNic 바이트 그대로), 서브넷 검증 표, IPAM allocate(/16에 1만 개)
+cargo test -p opl-driver ovn                                        # OvnHost 단계(가짜 CommandRunner, 실제 출력 고정물 src/ovn/fixtures/), 단위 파일 기대 글, OVSDB 클라이언트(가짜 서버·실제 RPC 고정물)
+cargo test -p opl-cluster --test single_node an_sdn_address_belongs_to_one_nic_per_network   # Raft 주소 겹침 검사
+cargo test -p opl-api --test ovn_sync --test ipam --test sdn --test sdn_tasks   # OvnSync(가짜 NB: 다른 것만·펜싱·나누기·5천 포트), IPAM 경합·복제·복원, /sdn·PATCH·ips·권한, Task
+cargo test -p oplctl sdn                                            # sdn·network subnet·network ips·--ip 명령
+pnpm -C web test src/sdn src/networks                               # 마법사·상태·서브넷 편집·IP 서랍·NIC 주소(msw)
+# Linux(Ubuntu 24.04), root, OVN이 없는 버려도 되는 기계: orbivisord가 apt로 OVN을 설치하고 노드 하나에 NB·SB·northd와 chassis,
+# mTLS(다른 CA·인증서 없음·평문 거절), 127.0.0.2의 두 번째 ovsdb 합류·떠나기, OvnSync·펜싱, 이름공간 포트의 busybox udhcpc와 ping·위조
+# 막기, SDN NIC VM의 br-int 바인딩(OPL_TEST_CLOUD_IMAGE가 있으면 게스트가 OVN DHCP로 IPAM 주소를 받음). OVN 꾸러미와 데몬이 남는다
+# (CI `ovn` 작업). busybox와 QEMU가 필요하다.
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target \
+  OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
+  cargo test -p opld --features sdn-it --test sdn -- --nocapture
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -211,6 +225,18 @@ sudo vgcreate --shared oplshared "/dev/disk/by-path/ip-127.0.0.1:3260-iscsi-$IQN
 #         && sudo targetcli /iscsi delete "$IQN" && sudo targetcli /backstores/fileio delete oplshared
 #         (lvm.conf의 use_lvmlockd를 0으로 되돌린다)
 ```
+
+`sdn-it` 시험(`crates/opld/tests/sdn.rs`, 계획 65)은 **OVN이 깔린 적 없는 기계**에서 root로 돈다. orbivisord가 `sdn init`·
+`sdn chassis install`(API와 orbivisorctl)로 `ovn-central`·`ovn-host`·`openvswitch-switch`를 apt로 깔고, 배포판 중앙 단위를 끄고
+가린 뒤 Orbivisor 단위(`opl-ovn-nb`·`-sb`·`-northd`)를 띄운다. 시험은 NB·SB가 노드 주소의 `pssl`에만 듣는지(`ss -ltn`),
+클러스터 CA 인증서로만 붙는지, SB `Chassis`가 노드 UUID·Geneve·underlay인지, 127.0.0.2의 `ovsdb-server` 한 쌍의 합류·떠나기,
+리더 OvnSync의 NB 행·펜싱·다시 맞추기·지운 노드의 SB chassis 청소, IPAM 주소와 OVN DHCP(이름공간 둘의 OVS 내부 포트에서
+busybox `udhcpc`, 서로 ping, 위조 주소는 막힘), SDN NIC VM의 `br-int` tap·`ovn-installed`·SB 바인딩, `network ips`의 포트 상태,
+opld 다시 띄우기를 본다. 시험은 **호스트에 OVN 꾸러미·데몬·`/var/lib/opl/ovn`을 남긴다** — 그래서 GitHub의 깨끗한 Ubuntu
+24.04 러너에서만 돌린다. CI `ovn` 작업은 QEMU·OVMF·busybox만 미리 깔고 `/etc/ovn`·`/etc/openvswitch`와 OVN 꾸러미가 없는지
+확인한 뒤(OVN은 orbivisord가 설치), Ubuntu 24.04 클라우드 이미지를 받아 `OPL_TEST_CLOUD_IMAGE`로 넘기고
+`cargo test --features opld/sdn-it -p opld --test sdn`을 root로 돌린다(빌드 2분쯤, 시험 2~3분). 러너 하나는 OVS 하나라 chassis
+둘 사이의 Geneve와 라이브 마이그레이션의 두 chassis 바인딩은 여기서 보지 않는다(드라이버·OvnSync 단위 시험이 본다).
 
 웹 UI (`web/`):
 
