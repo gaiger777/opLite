@@ -93,6 +93,18 @@ pnpm -C web test src/sdn src/networks                               # 마법사�
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target \
   OPL_TEST_CLOUD_IMAGE=/tmp/ubuntu-24.04-server-cloudimg-amd64.img \
   cargo test -p opld --features sdn-it --test sdn -- --nocapture
+# SDN 라우팅(계획 66)
+cargo test -p opl-types -- router floating_ip sdn security_group     # 순수: 공급자·유동 IP 풀·ipv6_mode·라우터·노드 sdn 검증, eui64, gateway_ranking(HRW), nic_policy
+cargo test -p opld firewall::tests::the_ruleset_text_is_unchanged    # nic_policy로 옮긴 뒤에도 nftables 규칙 글이 바이트 그대로
+cargo test -p opl-driver physnet                                    # physnet 명령·매핑 합치기(남의 항목 보존·충돌)·빼는 차례
+cargo test -p opl-api ovn_sync                                      # 라우터·NAT·HA 그룹·RA·DHCPv6 행, 그룹 목록 Port_Group·ACL 띠, 실패하면 닫힘, 5천 포트 × ACL 2650
+cargo test -p opl-api --test sdn_routing                            # 라우터·유동 IP·공급자·노드 sdn API, 권한, 할당량, IPAM(EUI-64·풀), 409들
+cargo test -p oplctl routing                                        # router·fip·node sdn 명령
+pnpm -C web test src/routing src/nodes src/security-groups          # 라우터 서랍·유동 IP 붙이기·노드 physnet 카드·NIC 수(msw)
+# 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve
+sudo modprobe -a openvswitch geneve && docker build -t opl-sdn-node ci/sdn-node
+sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
+  cargo test -p opld --features sdn-multinode-it --test sdn_multinode -- --nocapture
 # Linux, root: 실제 tap과 브리지
 # root가 만든 빌드 결과가 ./target에 섞이지 않게 따로 둔다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p opl-driver --features qemu-it,net-it   # tap·브리지·VLAN, 이름공간 사이 VXLAN, nft 방화벽(nftables·python3 필요)
@@ -236,7 +248,33 @@ opld 다시 띄우기를 본다. 시험은 **호스트에 OVN 꾸러미·데몬�
 24.04 러너에서만 돌린다. CI `ovn` 작업은 QEMU·OVMF·busybox만 미리 깔고 `/etc/ovn`·`/etc/openvswitch`와 OVN 꾸러미가 없는지
 확인한 뒤(OVN은 orbivisord가 설치), Ubuntu 24.04 클라우드 이미지를 받아 `OPL_TEST_CLOUD_IMAGE`로 넘기고
 `cargo test --features opld/sdn-it -p opld --test sdn`을 root로 돌린다(빌드 2분쯤, 시험 2~3분). 러너 하나는 OVS 하나라 chassis
-둘 사이의 Geneve와 라이브 마이그레이션의 두 chassis 바인딩은 여기서 보지 않는다(드라이버·OvnSync 단위 시험이 본다).
+둘 사이의 Geneve와 라이브 마이그레이션의 두 chassis 바인딩은 여기서 보지 않는다(아래 `sdn-multinode`가 본다).
+계획 66부터 같은 시험이 러너 호스트에 Linux 브리지 `oplext0`와 "물리 라우터" 이름공간 `ext`(203.0.113.1)를 만들고 노드 physnet
+`ext=oplext0`·공급자 네트워크(localnet ping), 라우터의 DHCP 기본 경로·동서 ping·SNAT(`tcpdump`의 보낸 주소)·중앙 유동 IP,
+바깥에서 들어오는 DF 1500 패킷(조용히 버려짐), RA SLAAC(EUI-64)·상태 있는 DHCPv6(busybox `udhcpc6`)·클라우드 이미지 게스트의
+`ipv6_slaac`, 그리고 **보안 그룹의 같은 뜻**(같은 그룹을 건 nftables 이름공간과 OVN 이름공간의 탐침 표, 처음 맞는 규칙, 목록을
+바꾸는 동안의 연속 탐침, 허용을 빼면 OVN만 맺은 연결이 끊김)을 본다. 작업이 `tcpdump`·`nftables`·`python3`를 깐다.
+
+**여러 노드 SDN 시험**(`crates/opld/tests/sdn_multinode.rs`, 기능 `sdn-multinode-it`, 계획 66)은 한 Linux 호스트에 **privileged
+systemd 컨테이너 셋**(`opl-c1`~`c3`)을 Orbivisor 노드로 띄운다. 이미지 `ci/sdn-node/Dockerfile`은 `ubuntu:24.04`에 systemd·
+iproute2·nftables·qemu-system-x86·ovmf·qemu-utils·tcpdump·busybox·python3만 넣고 **OVN·OVS는 넣지 않는다** — orbivisord가
+`sdn init`·`sdn central add`·`sdn chassis install`로 apt에서 깐다(시험만을 위한 코드 길이 없다). 컨테이너마다 자기 netns·systemd·
+OVS·ovn-controller가 돌아 진짜 chassis 셋이 되고, 커널 모듈(`openvswitch`·`geneve`)만 호스트와 함께 쓴다 — 그래서 호스트가 미리
+`modprobe`한다(컨테이너 안 `ovs-ctl`은 올라온 모듈을 보고 넘어간다). 컨테이너는 `--privileged --cgroupns=private --tmpfs /run`,
+`/lib/modules` 읽기 전용, 호스트에서 빌드한 orbivisord 바이너리와 노드 디렉터리(`/var/tmp/oplmn/<노드>` — 설정·데이터·제어 소켓·
+로그)를 같은 경로로 바인드 마운트하고 `systemd-run --unit=orbivisord`로 띄운다(설정: `[sdn] refresh_secs = 30`, 마이그레이션
+`bandwidth_mib = 1`, `systemd_scope = false`). 망은 도커 망 `oplmgmt`(172.30.66.0/24, 노드 .11~.13 — Raft·OVN·Geneve), 호스트
+브리지 `oplext0` + 노드마다 veth(호스트 쪽 `oplv<i>`, 컨테이너 안 Linux 브리지 `vmbr1`) + 호스트 이름공간 `ext`(203.0.113.1)다.
+호스트의 orbivisorctl이 바인드 마운트된 제어 소켓(`cluster init`·`join`)과 노드 API로 모든 것을 만든다. 차례: 클러스터 셋 →
+OVN(NB·SB Raft 서버 셋, SB chassis 셋, Geneve) → 라우팅(physnet, 게이트웨이 c2=200·c3=100, `ext`·`t1`·`t2`·`r1`, chassis 사이 동서가
+c2의 Geneve에 없음, SNAT가 c2 veth로만, 게스트 없는 QEMU VM의 분산 유동 IP와 physnet을 빼면 중앙) → 두 chassis 마이그레이션
+(c1 → c3, NB `requested-chassis="c1,c3"`·`rarp`, SB 바인딩 c3, 유동 IP가 c3 veth로) → 게이트웨이 넘김(`systemctl stop
+ovn-controller`, `Restart=no` 덧붙이기를 얹은 `kill -9`, 되돌아감 — 시간을 찍음) → 노드 통째 죽음(`docker kill c2`, 남은 둘로 새
+유동 IP, `sdn central remove c2` → 실제 `cluster/kick`, 서버 둘). 실패하면 진단(노드마다 `ovs-vsctl`·`ovn-sbctl`·`ovn-nbctl show`, 단위 상태, journal, orbivisord 로그 끝)을 찍고,
+끝나거나 실패해도 컨테이너·도커 망·브리지·이름공간을 지운다. 필요한 것: Linux(Ubuntu 24.04) root, docker, tcpdump, 컨테이너가 apt에
+닿는 망. `/dev/kvm`이 있으면 컨테이너의 QEMU가 쓴다(없으면 TCG). CI `sdn-multinode` 작업(Ubuntu 24.04 러너, `timeout-minutes: 60`)은
+`modprobe -a openvswitch geneve`, `docker build -t opl-sdn-node ci/sdn-node`, 위 `cargo test`를 root로(캐시 없이 `$RUNNER_TEMP/target`)
+돌린다. 시험은 약 170초, 작업 전체는 약 6분이다(OVN 24.03).
 
 웹 UI (`web/`):
 
