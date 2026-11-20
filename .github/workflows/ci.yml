@@ -442,6 +442,33 @@ jobs:
             OPL_TEST_CLOUD_IMAGE="$RUNNER_TEMP/ubuntu-24.04-server-cloudimg-amd64.img" \
             cargo test --features opld/sdn-it -p opld --test sdn -- --nocapture
 
+  # 여러 노드 SDN(계획 66 스테이지 6): 러너 하나에 privileged systemd 컨테이너 셋(ci/sdn-node/Dockerfile — OVN·OVS는 넣지 않음)을
+  # Orbivisor 노드 셋으로 띄우고, 노드마다 orbivisord가 apt로 OVN을 깔아 실제 NB·SB Raft 셋과 chassis 셋이 된다(커널 모듈만
+  # 호스트가 올린다). orbivisorctl로 컨테이너 사이 Geneve 동서 라우팅, SNAT, 분산·중앙 유동 IP, 게이트웨이 넘김(ovn-controller
+  # 멈춤·kill -9·docker kill 노드 통째)과 되돌아감, 죽은 중앙의 실제 cluster/kick, 두 chassis 라이브 마이그레이션(게스트 없는
+  # QEMU VM)을 본다. 넘김 시간은 로그의 "PROBE" 줄.
+  sdn-multinode:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Kernel modules, tcpdump, node image
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config tcpdump
+          sudo modprobe -a openvswitch geneve
+          sudo modprobe vport_geneve || echo "no vport_geneve module"
+          lsmod | grep -E 'openvswitch|geneve'
+          ls -l /dev/kvm || true
+          docker version --format '{{.Server.Version}}'
+          docker build -t opl-sdn-node ci/sdn-node
+      # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다.
+      - name: Multinode SDN E2E as root
+        run: |
+          sudo -E env "PATH=$PATH" CARGO_TARGET_DIR="$RUNNER_TEMP/target" OPL_MULTINODE_IMAGE=opl-sdn-node \
+            cargo test --features opld/sdn-multinode-it -p opld --test sdn_multinode -- --nocapture
+
   # 설치 매체와 cloud-init(계획 57)의 실제 게스트: 받아 둔 Alpine virt ISO로 BIOS·UEFI VM이 CD에서 부팅하는지, Ubuntu
   # 24.04 클라우드 이미지에 cloud-init이 호스트 이름·사용자·비밀번호 해시·키·고정 IP를 적용하는지 본다. 게스트 OS가 있어야
   # 보이는 것만 여기서 보고, 나머지 CD·씨앗 시험은 linux-kvm의 qemu-it·migration-it가 돌린다.
