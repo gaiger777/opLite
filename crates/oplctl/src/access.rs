@@ -254,6 +254,12 @@ pub(crate) struct QuotaArgs {
     /// 전용 CPU VM의 vCPU 수 상한(핫플러그 상한까지, 에뮬레이터 `isolate`는 하나 더, `none`은 지우기)
     #[arg(long, value_name = "N|none")]
     dedicated_vcpus: Option<String>,
+    /// 라우터 수 상한(네트워크 폴더, `none`은 지우기)
+    #[arg(long, value_name = "N|none")]
+    routers: Option<String>,
+    /// 유동 IP 수 상한(네트워크 폴더, `none`은 지우기)
+    #[arg(long, value_name = "N|none")]
+    floating_ips: Option<String>,
 }
 
 impl QuotaArgs {
@@ -263,17 +269,21 @@ impl QuotaArgs {
             && self.disk.is_none()
             && self.vms.is_none()
             && self.dedicated_vcpus.is_none()
+            && self.routers.is_none()
+            && self.floating_ips.is_none()
     }
 
     /// 지금 할당량(`null`이면 없음)에 준 차원을 덮은 새 할당량
     fn apply(&self, current: &Value) -> anyhow::Result<Value> {
         let mut q: Map<String, Value> = current.as_object().cloned().unwrap_or_default();
-        let dims: [(&str, &Option<String>, ParseFn); 5] = [
+        let dims: [(&str, &Option<String>, ParseFn); 7] = [
             ("vcpus", &self.vcpus, parse_count),
             ("memory_mib", &self.memory, parse_mib),
             ("disk_bytes", &self.disk, parse_size),
             ("vms", &self.vms, parse_count),
             ("dedicated_vcpus", &self.dedicated_vcpus, parse_count),
+            ("routers", &self.routers, parse_count),
+            ("floating_ips", &self.floating_ips, parse_count),
         ];
         for (key, value, parse) in dims {
             match value.as_deref() {
@@ -329,6 +339,12 @@ fn quota_text(q: &Value) -> String {
     }
     if let Some(n) = q["dedicated_vcpus"].as_u64() {
         parts.push(format!("{n} dedicated vCPUs"));
+    }
+    if let Some(n) = q["routers"].as_u64() {
+        parts.push(format!("{n} routers"));
+    }
+    if let Some(n) = q["floating_ips"].as_u64() {
+        parts.push(format!("{n} floating IPs"));
     }
     if parts.is_empty() {
         "-".into()
@@ -393,14 +409,15 @@ pub(crate) enum FolderCmd {
         #[command(subcommand)]
         cmd: QuotaCmd,
     },
-    /// 하위 트리 사용량과 이 폴더를 묶는 할당량
+    /// 하위 트리 사용량과 이 폴더를 묶는 할당량(네트워크 폴더는 `network:/tenant`)
     Usage { folder: String },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum MembersCmd {
-    /// 리소스를 폴더 `DEST`로 옮긴다(`/`는 트리의 맨 위). 항목은 `vm/NAME`·`network/NAME`·`storage-pool/NAME`
-    /// (`pool/NAME`)이고 모두 같은 트리여야 한다. 항목마다 결과를 보인다.
+    /// 리소스를 폴더 `DEST`로 옮긴다(`/`는 트리의 맨 위). 항목은 `vm/NAME`·`network/NAME`·`router/NAME`·
+    /// `floating-ip/NAME`(`fip/NAME`)·`storage-pool/NAME`(`pool/NAME`)이고 모두 같은 트리여야 한다(네트워크·라우터·유동
+    /// IP는 네트워크 트리). 항목마다 결과를 보인다.
     Move {
         dest: String,
         #[arg(required = true, value_name = "KIND/NAME")]
@@ -423,13 +440,17 @@ pub(crate) enum QuotaCmd {
 /// 리소스 항목 `vm/web`의 (API 종류, 트리, 이름)
 fn member_item(s: &str) -> anyhow::Result<(&'static str, &'static str, &str)> {
     let (kind, key) = s.split_once('/').with_context(|| {
-        format!("expected KIND/NAME (vm/web, network/lan, storage-pool/fast), got {s:?}")
+        format!("expected KIND/NAME (vm/web, network/lan, router/r1, fip/f1, storage-pool/fast), got {s:?}")
     })?;
     let (api, tree) = match kind {
         "vm" => ("vm", "vm"),
         "network" => ("network", "network"),
+        "router" => ("router", "network"),
+        "floating-ip" | "fip" => ("floating-ip", "network"),
         "storage-pool" | "pool" => ("storage-pool", "storage"),
-        _ => bail!("unknown kind {kind:?} in {s:?}; use vm, network or storage-pool"),
+        _ => bail!(
+            "unknown kind {kind:?} in {s:?}; use vm, network, router, floating-ip or storage-pool"
+        ),
     };
     if key.is_empty() {
         bail!("no name in {s:?}");
@@ -479,6 +500,8 @@ fn usage_lines(view: &Value) -> Vec<String> {
         ("disk_bytes", "disk"),
         ("vms", "VMs"),
         ("dedicated_vcpus", "dedicated vCPUs"),
+        ("routers", "routers"),
+        ("floating_ips", "floating IPs"),
     ];
     let paths: BTreeMap<String, String> = view["limits"]
         .as_array()
@@ -494,8 +517,11 @@ fn usage_lines(view: &Value) -> Vec<String> {
                 cell(v)
             }
         };
-        // 전용 vCPU(계획 64)는 쓰거나 할당량이 있을 때만(지금 출력 그대로)
-        if key == "dedicated_vcpus" && usage[key].is_null() && view["binding"][key].is_null() {
+        // 전용 vCPU(계획 64)·라우터·유동 IP(계획 66)는 쓰거나 할당량이 있을 때만(지금 출력 그대로)
+        if matches!(key, "dedicated_vcpus" | "routers" | "floating_ips")
+            && usage[key].is_null()
+            && view["binding"][key].is_null()
+        {
             continue;
         }
         let mut line = format!("{label}: {}", shown(&usage[key]));
@@ -620,13 +646,16 @@ pub(crate) async fn folder(
             let (folder, quota) = match &cmd {
                 QuotaCmd::Set { folder, quota } => {
                     if quota.is_empty() {
-                        bail!("give --vcpus, --memory, --disk or --vms");
+                        bail!(
+                            "give --vcpus, --memory, --disk or --vms (VM folder), or --routers or \
+                             --floating-ips (network folder)"
+                        );
                     }
                     (folder, Some(quota))
                 }
                 QuotaCmd::Clear { folder } => (folder, None),
             };
-            let id = folder_id(client, Tree::Vm, folder).await?;
+            let id = quota_folder_id(client, folder).await?;
             let quota = match quota {
                 Some(q) => {
                     let current = client.get(&format!("/folders/{id}")).await?;
@@ -650,7 +679,7 @@ pub(crate) async fn folder(
             )?;
         }
         FolderCmd::Usage { folder } => {
-            let id = folder_id(client, Tree::Vm, &folder).await?;
+            let id = quota_folder_id(client, &folder).await?;
             let view = client.get(&format!("/folders/{id}/usage")).await?;
             if json_out {
                 print_json(out, &view)?;
@@ -671,6 +700,15 @@ async fn folder_id(client: &Client, kind: Tree, s: &str) -> anyhow::Result<Strin
         .with_context(|| format!("{s} is the root of the tree, not a folder"))
 }
 
+/// 할당량·사용량의 폴더: 경로는 접두사가 없으면 VM 트리, 네트워크 폴더는 `network:/tenant`(또는 id)
+async fn quota_folder_id(client: &Client, s: &str) -> anyhow::Result<String> {
+    Folders::load(client)
+        .await?
+        .resolve_target(s)?
+        .1
+        .with_context(|| format!("{s} is the root of the tree, not a folder"))
+}
+
 async fn members_move(
     client: &Client,
     dest: &str,
@@ -684,7 +722,10 @@ async fn members_move(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let tree = parsed[0].1;
     if parsed.iter().any(|(_, t, _)| *t != tree) {
-        bail!("move VMs, networks and storage pools separately (each has its own folder tree)");
+        bail!(
+            "move VMs, network-tree resources (networks, routers, floating IPs) and storage pools \
+             separately (each has its own folder tree)"
+        );
     }
     let (_, id) = Folders::load(client).await?.resolve(Some(tree), dest)?;
     let body = json!({
@@ -739,6 +780,8 @@ pub(crate) async fn grant_target(client: &Client, s: &str) -> anyhow::Result<Val
     let path = match kind {
         "vm" => "vms",
         "network" => "networks",
+        "router" => "routers",
+        "floating-ip" => "floating-ips",
         _ => "storage-pools",
     };
     let obj = client.get(&format!("/{path}/{}", seg(key))).await?;
@@ -757,13 +800,17 @@ fn folder_arg(s: &str) -> Option<&str> {
 /// 객체 인자 `vm/web`의 (API 종류, 이름)
 fn object_arg(s: &str) -> anyhow::Result<(&'static str, &str)> {
     let (kind, key) = s.split_once('/').with_context(|| {
-        format!("expected root, a folder (/teamA), vm/NAME, network/NAME or storage-pool/NAME, got {s:?}")
+        format!("expected root, a folder (/teamA), vm/NAME, network/NAME, router/NAME, floating-ip/NAME or storage-pool/NAME, got {s:?}")
     })?;
     let kind = match kind {
         "vm" => "vm",
         "network" => "network",
+        "router" => "router",
+        "floating-ip" | "fip" => "floating-ip",
         "storage-pool" | "pool" => "storage-pool",
-        _ => bail!("unknown kind {kind:?} in {s:?}; use folder, vm, network or storage-pool"),
+        _ => bail!(
+            "unknown kind {kind:?} in {s:?}; use folder, vm, network, router, floating-ip or storage-pool"
+        ),
     };
     if key.is_empty() {
         bail!("no name in {s:?}");
@@ -852,6 +899,8 @@ impl Names {
             ("vm", "/vms"),
             ("network", "/networks"),
             ("storage-pool", "/storage-pools"),
+            ("router", "/routers?live=false"),
+            ("floating-ip", "/floating-ips"),
         ] {
             if grants.iter().any(|g| g["spec"]["target"]["kind"] == kind) {
                 objects.push((kind, list(path).await));
@@ -1588,6 +1637,8 @@ mod tests {
             disk: Some("2T".into()),
             vms: None,
             dedicated_vcpus: Some("8".into()),
+            routers: None,
+            floating_ips: None,
         };
         let merged = q.apply(&json!({ "vcpus": 32, "vms": 2 })).unwrap();
         assert_eq!(
@@ -1615,6 +1666,39 @@ mod tests {
             ("storage-pool", "storage", "fast")
         );
         assert!(member_item("volume/x").is_err());
+        // 리뷰 1 웹 M4: 라우터·유동 IP는 네트워크 트리에서 옮긴다.
+        assert_eq!(
+            member_item("router/r1").unwrap(),
+            ("router", "network", "r1")
+        );
+        assert_eq!(
+            member_item("fip/203-0-113-5").unwrap(),
+            ("floating-ip", "network", "203-0-113-5")
+        );
+        assert_eq!(object_arg("floating-ip/f1").unwrap(), ("floating-ip", "f1"));
+        assert_eq!(object_arg("router/r1").unwrap(), ("router", "r1"));
+        let q = QuotaArgs {
+            routers: Some("2".into()),
+            floating_ips: Some("5".into()),
+            ..Default::default()
+        };
+        let merged = q.apply(&Value::Null).unwrap();
+        assert_eq!(merged, json!({ "routers": 2, "floating_ips": 5 }));
+        assert_eq!(quota_text(&merged), "2 routers, 5 floating IPs");
+        let lines = usage_lines(&json!({
+            "path": "network:/tenant",
+            "usage": { "vcpus": 0, "memory_mib": 0, "disk_bytes": 0, "vms": 0, "routers": 1 },
+            "binding": { "routers": "f1" },
+            "limits": [{ "folder": "f1", "path": "network:/tenant", "quota": { "routers": 2 } }]
+        }));
+        assert!(
+            lines.contains(&"routers: 1 of 2 (bound by network:/tenant)".to_string()),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.starts_with("floating IPs")),
+            "{lines:?}"
+        );
         assert!(member_item("vm/").is_err());
         assert_eq!(folder_arg("/teamA"), Some("/teamA"));
         assert_eq!(folder_arg("folder/vm:/teamA"), Some("vm:/teamA"));

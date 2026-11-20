@@ -2,9 +2,11 @@
 //! 옮긴다. 라우터 외부 주소와 유동 IP는 공급자 네트워크의 주소를 API가 고른다(`floating_pools`가 있으면 거기서만, 없으면
 //! 풀 — §8). 두 API 노드가 같은 주소를 고르면 Raft의 겹침 키 `("ip", "<네트워크>/<주소>")`가 하나를 거절하고 다시 고른다.
 //!
-//! 권한(§12): 라우터·유동 IP는 네트워크 폴더에 산다. 쓰기는 그 객체(만들기는 폴더)의 `network.config`, 인터페이스·외부로
-//! 잇는 네트워크와 유동 IP의 네트워크는 그 네트워크의 `network.assign`, 유동 IP를 붙이는 VM은 그 VM의 `vm.config`다.
-//! 보기는 `system.read`이고, 읽을 수 없는 VM(다른 폴더)의 이름은 보이지 않는다.
+//! 권한(§12): 라우터·유동 IP는 네트워크 폴더에 산다. 쓰기는 그 객체(만들기는 폴더)의 `network.config`, 인터페이스로 잇는
+//! 네트워크는 그 네트워크의 `network.config`(그 네트워크 VM 모두의 기본 경로가 바뀐다 — 리뷰 1 #1), 외부 네트워크와 유동
+//! IP의 네트워크는 `network.assign`, 유동 IP를 붙이는 VM은 그 VM의 `vm.config`다. 유동 IP 풀(없으면 풀) 밖의 주소를
+//! 고르는 것은 루트 `cluster.admin`만이다. 보기는 `system.read`이고, 읽을 수 없는 VM(다른 폴더)의 이름과 루트
+//! `cluster.read`가 없는 사용자에게 노드 이름은 보이지 않는다.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -15,6 +17,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
 use opl_types::authz::Privilege;
+use opl_types::authz_eval::AuthzTarget;
 use opl_types::floating_ip::{FipTarget, FloatingIp, FloatingIpSpec, FloatingIpStatus};
 use opl_types::ipam;
 use opl_types::network::{Network, NetworkSpec};
@@ -68,6 +71,29 @@ impl World {
             fips: state.cluster.list::<FloatingIpSpec>()?.1,
             networks: state.cluster.list::<NetworkSpec>()?.1,
             vms: state.cluster.list::<VmSpec>()?.1,
+            nodes: state.cluster.list::<NodeSpec>()?.1,
+        })
+    }
+
+    /// 유동 IP 보기용: VM은 `fips`가 붙은 것만 읽는다(모든 VM을 풀지 않는다 — 리뷰 1 웹 I1). 주소 고르기(`used`)에는 쓰지
+    /// 않는다.
+    fn load_for_fips(state: &AppState, fips: &[FloatingIp]) -> Result<Self, ApiError> {
+        let targets: BTreeSet<Uuid> = fips
+            .iter()
+            .filter_map(|f| f.spec.target)
+            .map(|t| t.vm)
+            .collect();
+        let mut vms = Vec::new();
+        for id in targets {
+            if let Some(vm) = state.cluster.get::<VmSpec>(id)? {
+                vms.push(vm);
+            }
+        }
+        Ok(World {
+            routers: state.cluster.list::<RouterSpec>()?.1,
+            fips: Vec::new(),
+            networks: state.cluster.list::<NetworkSpec>()?.1,
+            vms,
             nodes: state.cluster.list::<NodeSpec>()?.1,
         })
     }
@@ -138,8 +164,10 @@ fn ipam_error(network: &str, e: ipam::IpamError) -> ApiError {
     }
 }
 
-/// 공급자 네트워크의 IPv4 서브넷에서 유동 IP·라우터 외부 IPv4를 고른다(`want`가 있으면 그것을 본다). `keep`은 이미 가진
-/// 주소(다시 보지 않는다).
+/// 공급자 네트워크에서 유동 IP·라우터 외부 주소를 고른다(`v4`면 IPv4, 아니면 IPv6). `want`가 있으면 그것을 본다:
+/// 서브넷 안의 예약이 아닌 빈 주소이고, 루트 `cluster.admin`이 아니면(`admin` 거짓) 유동 IP 풀(없으면 풀) 안이어야 한다
+/// (§9.5, 리뷰 1 #2 — 물리 망의 다른 장비 주소를 테넌트가 가로채지 못하게. Neutron도 고른 주소는 관리자만). 없으면 그
+/// 체계의 서브넷에서 고른다. `keep`은 이미 가진 주소(다시 보지 않는다).
 fn pick_address(
     world: &World,
     network: &Network,
@@ -147,6 +175,7 @@ fn pick_address(
     want: Option<IpAddr>,
     keep: Option<IpAddr>,
     except: Option<Uuid>,
+    admin: bool,
 ) -> Result<Option<IpAddr>, ApiError> {
     if let Some(w) = want.map(|w| w.to_canonical())
         && keep == Some(w)
@@ -160,11 +189,25 @@ fn pick_address(
                 network.name
             )));
         };
+        if !admin && !ipam::in_floating_range(subnet, w) {
+            return Err(ApiError::bad_request(format!(
+                "address {w} is outside the {} of subnet {} of network {:?}; only a cluster administrator \
+                 can choose an address outside them",
+                if subnet.floating_pools.is_empty() {
+                    "address pools"
+                } else {
+                    "floating IP ranges"
+                },
+                subnet.cidr,
+                network.name
+            )));
+        }
         let used = world.used(&network.name, except);
         return ipam::allocate_from(subnet, &used, Some(w))
             .map(Some)
             .map_err(|e| ipam_error(&network.name, e));
     }
+    // 네트워크는 체계마다 서브넷이 하나다(`NetworkSpec` 검증).
     let Some(subnet) = network.spec.subnets.iter().find(|s| s.is_ipv4() == v4) else {
         return Ok(None);
     };
@@ -172,6 +215,22 @@ fn pick_address(
     ipam::allocate_from(subnet, &used, None)
         .map(Some)
         .map_err(|e| ipam_error(&network.name, e))
+}
+
+/// 부른 사용자가 루트 `cluster.admin`인지(유동 IP 풀 밖의 주소를 고를 수 있다)
+fn is_admin(state: &AppState, principal: &Principal) -> bool {
+    state
+        .authz
+        .allows(principal, Privilege::ClusterAdmin, AuthzTarget::Root)
+}
+
+/// 채운 외부 주소 중 API가 고른 것이 있는지(준 주소도 지금 주소도 아닌 것). 그때만 Raft의 주소 겹침 거절을 다시
+/// 고르기로 받는다(리뷰 1 M-6 — 준 주소의 겹침은 곧바로 409).
+fn auto_picked(filled: &RouterExternal, given: &[IpAddr], old: Option<&RouterExternal>) -> bool {
+    filled.ips.iter().any(|ip| {
+        !given.iter().any(|g| g.to_canonical() == *ip)
+            && !old.is_some_and(|o| o.network == filled.network && o.ips.contains(ip))
+    })
 }
 
 // ---- 라우터 ----
@@ -246,14 +305,15 @@ fn check_router(world: &World, spec: &RouterSpec, me: Option<Uuid>) -> Result<()
     Ok(())
 }
 
-/// 라우터 외부 주소를 채운다(체계마다 하나, 외부 네트워크의 서브넷마다): 준 주소는 서브넷 안의 예약이 아닌 빈 주소여야
-/// 하고, 없으면 유동 IP 풀(없으면 풀)에서 고른다. `old`는 지금 저장된 외부(같은 네트워크면 주소를 주지 않은 체계는 그
+/// 라우터 외부 주소를 채운다(체계마다 하나): 준 주소는 서브넷 안의 예약이 아닌 빈 주소이고 루트 `cluster.admin`이
+/// 아니면 유동 IP 풀(없으면 풀) 안이어야 하며, 없으면 유동 IP 풀(없으면 풀)에서 고른다. `old`는 지금 저장된 외부(같은 네트워크면 주소를 주지 않은 체계는 그
 /// 주소를 그대로 쓴다).
 fn fill_external(
     world: &World,
     external: &mut RouterExternal,
     old: Option<&RouterExternal>,
     me: Option<Uuid>,
+    admin: bool,
 ) -> Result<(), ApiError> {
     let network = world
         .network(&external.network)
@@ -278,7 +338,7 @@ fn fill_external(
             .copied()
             .find(|ip| ip.to_canonical().is_ipv4() == v4)
             .or(keep);
-        if let Some(ip) = pick_address(world, network, v4, want, keep, me)? {
+        if let Some(ip) = pick_address(world, network, v4, want, keep, me, admin)? {
             ips.push(ip);
         }
     }
@@ -324,7 +384,7 @@ fn names(fips: &[&FloatingIp]) -> String {
 /// 게이트웨이 노드 하나(Raft의 순위 — `HA_Chassis`)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct RouterGateway {
-    /// 노드 이름
+    /// 노드 이름(루트 `cluster.read`가 없으면 빈 글)
     pub node: String,
     /// `HA_Chassis.priority`(32767부터 내림 — 가장 높은 살아 있는 chassis가 주인)
     pub priority: u16,
@@ -347,7 +407,8 @@ pub struct RouterView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, default)]
     pub gateway_error: Option<String>,
-    /// 분산 게이트웨이 포트를 지금 가진 노드(NB `status:hosting-chassis`). 없거나 NB를 읽지 않았으면 없다.
+    /// 분산 게이트웨이 포트를 지금 가진 노드(NB `status:hosting-chassis`). 없거나 NB를 읽지 않았으면 없다. 루트
+    /// `cluster.read`가 없으면 빈 글이다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false, default)]
     pub hosting: Option<String>,
@@ -386,25 +447,36 @@ pub struct RouterList {
 /// NB에서 읽은 라우터 id → 게이트웨이 포트를 가진 chassis 이름(노드 UUID)
 type Hosting = BTreeMap<Uuid, String>;
 
-async fn read_hosting(state: &AppState) -> Result<Hosting, String> {
+/// 게이트웨이 포트의 지금 주인(`router`가 있으면 그 라우터 하나). `Logical_Router_Port`의 세 칸만 읽는다(리뷰 1 웹 I1).
+async fn read_hosting(state: &AppState, router: Option<Uuid>) -> Result<Hosting, String> {
     let (config, centrals, _) = crate::sdn::ovn_reader(state)?;
-    let actual = Box::pin(crate::ovn_sync::read_nb(config, &centrals))
+    Box::pin(crate::ovn_sync::read_hosting(config, &centrals, router))
         .await
-        .map_err(|e| e.to_string())?;
-    Ok(actual
-        .router_ports
-        .iter()
-        .filter_map(|p| {
-            let id = p.external_ids.get(nb::ROUTER_KEY)?.parse().ok()?;
-            (p.name == nb::gateway_port_name(id))
-                .then(|| p.status.get("hosting-chassis").cloned())
-                .flatten()
-                .map(|c| (id, c))
-        })
-        .collect())
+        .map_err(|e| e.to_string())
 }
 
-fn router_view(world: &World, router: Router, hosting: Option<&Hosting>) -> RouterView {
+/// 노드 이름을 볼 수 있는지(루트 `cluster.read` — `/nodes`와 같다). 아니면 보기의 노드 이름을 비운다(리뷰 1 M-4).
+fn sees_nodes(state: &AppState, principal: &Principal) -> bool {
+    state
+        .authz
+        .allows(principal, Privilege::ClusterRead, AuthzTarget::Root)
+}
+
+/// 보기의 노드 이름: 볼 수 없으면 빈 글
+fn node_label(world: &World, id: Uuid, sees_nodes: bool) -> String {
+    if sees_nodes {
+        world.node_name(id)
+    } else {
+        String::new()
+    }
+}
+
+fn router_view(
+    world: &World,
+    router: Router,
+    hosting: Option<&Hosting>,
+    sees_nodes: bool,
+) -> RouterView {
     let mut view = RouterView {
         gateways: Vec::new(),
         gateway_error: None,
@@ -415,8 +487,9 @@ fn router_view(world: &World, router: Router, hosting: Option<&Hosting>) -> Rout
     };
     let host = hosting.and_then(|h| h.get(&view.router.id));
     view.hosting = host.map(|c| match c.parse::<Uuid>() {
-        Ok(id) => world.node_name(id),
-        Err(_) => c.clone(),
+        Ok(id) => node_label(world, id, sees_nodes),
+        Err(_) if sees_nodes => c.clone(),
+        Err(_) => String::new(),
     });
     let Some(e) = &view.router.spec.external else {
         return view;
@@ -430,7 +503,7 @@ fn router_view(world: &World, router: Router, hosting: Option<&Hosting>) -> Rout
     view.gateways = gateway_ranking(view.router.id, &candidates)
         .into_iter()
         .map(|(node, priority)| RouterGateway {
-            node: world.node_name(node),
+            node: node_label(world, node, sees_nodes),
             priority,
             node_priority: candidates
                 .iter()
@@ -468,17 +541,18 @@ pub async fn list_routers(
     routers.sort_by(|a, b| a.name.cmp(&b.name));
     let world = World::load(&state)?;
     let (hosting, error) = if query.live && !routers.is_empty() {
-        match Box::pin(read_hosting(&state)).await {
+        match Box::pin(read_hosting(&state, None)).await {
             Ok(h) => (Some(h), None),
             Err(e) => (None, Some(e)),
         }
     } else {
         (None, None)
     };
+    let nodes = sees_nodes(&state, &principal);
     let items = routers
         .into_iter()
         .map(|r| {
-            let mut v = router_view(&world, r, hosting.as_ref());
+            let mut v = router_view(&world, r, hosting.as_ref(), nodes);
             v.live_error.clone_from(&error);
             v
         })
@@ -492,6 +566,7 @@ pub async fn list_routers(
     responses((status = 200, body = RouterView), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_router(
     State(state): State<Arc<AppState>>,
+    principal: Principal,
     Path(key): Path<String>,
     Query(query): Query<LiveQuery>,
 ) -> Result<Json<RouterView>, ApiError> {
@@ -499,14 +574,19 @@ pub async fn get_router(
     let router = lookup::<RouterSpec>(&state.cluster, &key)?;
     let world = World::load(&state)?;
     let (hosting, error) = if query.live {
-        match Box::pin(read_hosting(&state)).await {
+        match Box::pin(read_hosting(&state, Some(router.id))).await {
             Ok(h) => (Some(h), None),
             Err(e) => (None, Some(e)),
         }
     } else {
         (None, None)
     };
-    let mut view = router_view(&world, router, hosting.as_ref());
+    let mut view = router_view(
+        &world,
+        router,
+        hosting.as_ref(),
+        sees_nodes(&state, &principal),
+    );
     view.live_error = error;
     Ok(Json(view))
 }
@@ -521,8 +601,9 @@ pub struct CreateRouter {
     pub spec: RouterSpec,
 }
 
-/// 라우터를 만든다(계획 66 §9): 폴더의 `network.config`, 인터페이스·외부 네트워크마다 `network.assign`. 외부 주소는 API가
-/// 외부 네트워크의 체계마다 고른다(유동 IP 풀이 있으면 거기서만, 없으면 풀 — 준 주소는 서브넷 안의 빈 주소). 옛 노드가
+/// 라우터를 만든다(계획 66 §9): 폴더의 `network.config`, 인터페이스 네트워크마다 `network.config`, 외부 네트워크의
+/// `network.assign`. 외부 주소는 API가 외부 네트워크의 체계마다 고른다(유동 IP 풀이 있으면 거기서만, 없으면 풀 — 준
+/// 주소는 서브넷 안의 빈 주소이고 루트 `cluster.admin`이 아니면 그 범위 안). 옛 노드가
 /// 남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙·네트워크 검사는 400 `invalid_router`, 이미 다른
 /// 라우터의 인터페이스인 네트워크는 409 `network_in_use`, 주소는 409 `ip_in_use`·`ip_exhausted`, 폴더 할당량
 /// `routers`는 409 `quota_exceeded`. 게이트웨이 후보가 없으면 만들고 `orbivisor-warning`으로 알린다.
@@ -545,31 +626,34 @@ pub async fn create_router(
         Kind::Router,
         req.spec.folder,
     )?;
+    // 인터페이스는 그 네트워크의 모든 VM 기본 경로(DHCP `router`)를 바꾸므로 NIC 붙이기(`network.assign`)가 아니라
+    // `network.config`다(리뷰 1 #1). 외부(공급자) 네트워크는 `network.assign`.
+    state.authz.require_networks_with(
+        &principal,
+        Privilege::NetworkConfig,
+        req.spec.interfaces.iter().map(|i| i.network.as_str()),
+    )?;
     state.authz.require_networks(
         &principal,
-        req.spec
-            .interfaces
-            .iter()
-            .map(|i| i.network.as_str())
-            .chain(req.spec.external.iter().map(|e| e.network.as_str())),
+        req.spec.external.iter().map(|e| e.network.as_str()),
     )?;
+    let admin = is_admin(&state, &principal);
     for _ in 0..RETRIES {
         let world = World::load(&state)?;
         let mut spec = req.spec.clone();
         check_router(&world, &spec, None)?;
         if let Some(e) = &mut spec.external {
-            fill_external(&world, e, None, None)?;
+            fill_external(&world, e, None, None, admin)?;
         }
+        let retry = match (&spec.external, &req.spec.external) {
+            (Some(filled), Some(given)) => auto_picked(filled, &given.ips, None),
+            _ => false,
+        };
         let mut router = Resource::new(req.name.clone(), spec);
         router.labels = req.labels.clone();
         match state.cluster.create(&router).await {
             Ok(revision) => router.revision = revision,
-            Err(e)
-                if is_ip_taken(&e)
-                    && req.spec.external.as_ref().is_some_and(|e| e.ips.is_empty()) =>
-            {
-                continue;
-            }
+            Err(e) if is_ip_taken(&e) && retry => continue,
             Err(e) => return Err(e.into()),
         }
         let mut detail = format!("router create {}", router.name);
@@ -627,7 +711,8 @@ pub struct RouterPatch {
 }
 
 /// 라우터의 설명·외부·인터페이스·경로를 바꾼다(`If-Match`로 리비전 확인, 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시
-/// 읽는다). 라우터의 `network.config`(경로표)와 새로 잇는 인터페이스·외부 네트워크의 `network.assign`. 유동 IP가 이
+/// 읽는다). 라우터의 `network.config`(경로표), 새로 잇는 인터페이스 네트워크의 `network.config`, 새 외부 네트워크의
+/// `network.assign`. 유동 IP가 이
 /// 라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라). 검사는 만들기와 같다.
 #[utoipa::path(patch, path = "/routers/{key}", tag = "routers",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
@@ -662,19 +747,22 @@ pub async fn patch_router(
         if let Some(r) = &req.routes {
             spec.routes.clone_from(r);
         }
-        let added: Vec<&str> = spec
-            .interfaces
-            .iter()
-            .filter(|i| !old.interfaces.contains(i))
-            .map(|i| i.network.as_str())
-            .chain(
-                spec.external
-                    .iter()
-                    .filter(|e| old.external.as_ref().map(|o| &o.network) != Some(&e.network))
-                    .map(|e| e.network.as_str()),
-            )
-            .collect();
-        state.authz.require_networks(&principal, added)?;
+        // 새 인터페이스 네트워크는 `network.config`(리뷰 1 #1), 새 외부 네트워크는 `network.assign`.
+        state.authz.require_networks_with(
+            &principal,
+            Privilege::NetworkConfig,
+            spec.interfaces
+                .iter()
+                .filter(|i| !old.interfaces.contains(i))
+                .map(|i| i.network.as_str()),
+        )?;
+        state.authz.require_networks(
+            &principal,
+            spec.external
+                .iter()
+                .filter(|e| old.external.as_ref().map(|o| &o.network) != Some(&e.network))
+                .map(|e| e.network.as_str()),
+        )?;
         // 유동 IP가 지금 이 라우터로 라우팅되는데 그 길이 사라지면 막는다(§9.5 — 먼저 떼라).
         let lost: Vec<&FloatingIp> = routed_fips(&world, old)
             .into_iter()
@@ -692,8 +780,22 @@ pub async fn patch_router(
         }
         check_router(&world, &spec, Some(router.id))?;
         if let Some(e) = &mut spec.external {
-            fill_external(&world, e, old.external.as_ref(), Some(router.id))?;
+            fill_external(
+                &world,
+                e,
+                old.external.as_ref(),
+                Some(router.id),
+                is_admin(&state, &principal),
+            )?;
         }
+        let given: Vec<IpAddr> = match &req.external {
+            Some(Some(e)) => e.ips.clone(),
+            _ => Vec::new(),
+        };
+        let retry = spec
+            .external
+            .as_ref()
+            .is_some_and(|e| auto_picked(e, &given, old.external.as_ref()));
         let revision = expected.unwrap_or(router.revision);
         match state
             .cluster
@@ -717,7 +819,7 @@ pub async fn patch_router(
             }
             Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. }))
                 if expected.is_none() => {}
-            Err(e) if is_ip_taken(&e) => {}
+            Err(e) if is_ip_taken(&e) && retry => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -786,9 +888,11 @@ pub async fn delete_router(
             ),
         ));
     }
+    // `If-Match`가 없어도 읽은 리비전으로 지운다: 그새 인터페이스가 더해졌으면 함께 지우지 않고 409(리뷰 1 M-5).
+    let revision = if_match(&headers)?.unwrap_or(router.revision);
     state
         .cluster
-        .delete::<RouterSpec>(router.id, if_match(&headers)?)
+        .delete::<RouterSpec>(router.id, Some(revision))
         .await?;
     crate::permissions::drop_orphans(&state.cluster).await;
     audit.detail(format!("router delete {}", router.name));
@@ -805,7 +909,7 @@ pub enum FipState {
     Unattached,
     /// VM이 도는 노드에서 바로 나간다(그 노드들이 외부 physnet을 가졌다).
     Distributed {
-        /// VM이 도는 노드(마이그레이션 중이면 둘, 쉼표로)
+        /// VM이 도는 노드(마이그레이션 중이면 둘, 쉼표로). 루트 `cluster.read`가 없으면 빈 글
         node: String,
     },
     /// 게이트웨이 노드가 NAT를 한다.
@@ -835,17 +939,19 @@ pub struct FloatingIpList {
 
 /// 유동 IP를 붙일 수 있는 NIC인지(§9.5): 그 NIC의 네트워크가 라우터 인터페이스이고 그 라우터의 외부가 유동 IP의
 /// 네트워크이며 NIC에 그 네트워크의 IPv4 주소가 있다. 아니면 까닭.
+/// `label`은 문구에 쓰는 VM 이름(읽을 수 없는 사용자에게는 "the target VM" — 리뷰 1 M-4).
 fn routable<'a>(
     world: &'a World,
     network: &str,
     vm: &Vm,
     mac: opl_types::vm::MacAddr,
+    label: &str,
 ) -> Result<(&'a Router, IpAddr), String> {
     if vm.spec.template {
-        return Err(format!("VM {:?} is a template", vm.name));
+        return Err(format!("{label} is a template"));
     }
     let Some(nic) = vm.spec.nics.iter().find(|n| n.mac == Some(mac)) else {
-        return Err(format!("VM {:?} has no NIC with MAC {mac}", vm.name));
+        return Err(format!("{label} has no NIC with MAC {mac}"));
     };
     let Some(router) = world.routers.iter().find(|r| {
         r.spec.interfaces.iter().any(|i| i.network == nic.network)
@@ -873,7 +979,9 @@ fn routable<'a>(
     Ok((router, ip))
 }
 
-fn fip_state(world: &World, f: &FloatingIp) -> FipState {
+/// VM을 읽을 수 없으면(`sees_vm` 거짓) 까닭에 VM 이름을, 루트 `cluster.read`가 없으면(`sees_nodes` 거짓) 노드 이름을
+/// 넣지 않는다(리뷰 1 M-4).
+fn fip_state(world: &World, f: &FloatingIp, sees_vm: bool, sees_nodes: bool) -> FipState {
     let Some(t) = f.spec.target else {
         return FipState::Unattached;
     };
@@ -881,7 +989,12 @@ fn fip_state(world: &World, f: &FloatingIp) -> FipState {
     let Some(vm) = world.vms.iter().find(|v| v.id == t.vm) else {
         return unrouted("the VM no longer exists".into());
     };
-    if let Err(reason) = routable(world, &f.spec.network, vm, t.mac) {
+    let label = if sees_vm {
+        format!("VM {:?}", vm.name)
+    } else {
+        "the target VM".to_string()
+    };
+    if let Err(reason) = routable(world, &f.spec.network, vm, t.mac, &label) {
         return unrouted(reason);
     }
     let Some(ext) = world.network(&f.spec.network) else {
@@ -912,18 +1025,25 @@ fn fip_state(world: &World, f: &FloatingIp) -> FipState {
         .collect();
     if missing.is_empty() {
         FipState::Distributed {
-            node: on
-                .iter()
-                .map(|id| world.node_name(*id))
-                .collect::<Vec<_>>()
-                .join(","),
+            node: if sees_nodes {
+                on.iter()
+                    .map(|id| world.node_name(*id))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            } else {
+                String::new()
+            },
         }
-    } else {
+    } else if sees_nodes {
         FipState::Centralized {
             reason: format!(
                 "node {} does not have physnet {physnet} ready",
                 missing.join(", ")
             ),
+        }
+    } else {
+        FipState::Centralized {
+            reason: format!("a node of the VM does not have physnet {physnet} ready"),
         }
     }
 }
@@ -932,6 +1052,7 @@ fn fip_view(
     state: &AppState,
     principal: &Principal,
     world: &World,
+    sees_nodes: bool,
     f: FloatingIp,
 ) -> FloatingIpView {
     let vm_name = f
@@ -945,7 +1066,7 @@ fn fip_view(
         })
         .map(|vm| vm.name.clone());
     FloatingIpView {
-        state: fip_state(world, &f),
+        state: fip_state(world, &f, vm_name.is_some(), sees_nodes),
         vm_name,
         fip: f,
     }
@@ -960,11 +1081,19 @@ pub async fn list_floating_ips(
 ) -> Result<Json<FloatingIpList>, ApiError> {
     let (revision, fips) = state.cluster.list::<FloatingIpSpec>()?;
     let mut fips = state.authz.filter(&principal, fips)?;
+    if fips.is_empty() {
+        // 유동 IP가 없는 클러스터의 VM 화면 읽기(리뷰 1 웹 I1)는 다른 목록을 읽지 않는다.
+        return Ok(Json(FloatingIpList {
+            revision,
+            items: Vec::new(),
+        }));
+    }
     fips.sort_by(|a, b| a.name.cmp(&b.name));
-    let world = World::load(&state)?;
+    let world = World::load_for_fips(&state, &fips)?;
+    let nodes = sees_nodes(&state, &principal);
     let items = fips
         .into_iter()
-        .map(|f| fip_view(&state, &principal, &world, f))
+        .map(|f| fip_view(&state, &principal, &world, nodes, f))
         .collect();
     Ok(Json(FloatingIpList { revision, items }))
 }
@@ -978,8 +1107,9 @@ pub async fn get_floating_ip(
     Path(key): Path<String>,
 ) -> Result<Json<FloatingIpView>, ApiError> {
     let f = lookup::<FloatingIpSpec>(&state.cluster, &key)?;
-    let world = World::load(&state)?;
-    Ok(Json(fip_view(&state, &principal, &world, f)))
+    let world = World::load_for_fips(&state, std::slice::from_ref(&f))?;
+    let nodes = sees_nodes(&state, &principal);
+    Ok(Json(fip_view(&state, &principal, &world, nodes, f)))
 }
 
 /// `POST /floating-ips`
@@ -1009,7 +1139,7 @@ fn check_target(
         return Err(ApiError::bad_request(format!("VM {} not found", target.vm)));
     };
     state.authz.require(principal, Privilege::VmConfig, vm)?;
-    routable(world, network, vm, target.mac)
+    routable(world, network, vm, target.mac, &format!("VM {:?}", vm.name))
         .map_err(|reason| ApiError::conflict("fip_not_routable", reason))?;
     if let Some(other) = world.fips.iter().find(|f| {
         Some(f.id) != me
@@ -1029,7 +1159,8 @@ fn check_target(
 }
 
 /// 유동 IP를 만든다(계획 66 §9.5): 폴더의 `network.config`와 공급자 네트워크의 `network.assign`, 붙이면 그 VM의
-/// `vm.config`. 주소는 API가 유동 IP 풀(없으면 풀)의 IPv4에서 고른다(준 주소는 서브넷 안의 빈 IPv4). 공급자 네트워크가
+/// `vm.config`. 주소는 API가 유동 IP 풀(없으면 풀)의 IPv4에서 고른다(준 주소는 서브넷 안의 빈 IPv4이고, 루트
+/// `cluster.admin`이 아니면 그 범위 안 — 아니면 400). 공급자 네트워크가
 /// 아니면 400, 주소는 409 `ip_in_use`·`ip_exhausted`, 붙일 NIC가 라우팅되지 않으면 409 `fip_not_routable`, 이미 유동 IP가
 /// 붙은 NIC는 409 `fip_in_use`, 폴더 할당량 `floating_ips`는 409 `quota_exceeded`.
 #[utoipa::path(post, path = "/floating-ips", tag = "floating-ips",
@@ -1072,7 +1203,15 @@ pub async fn create_floating_ip(
             )));
         }
         let mut spec = req.spec.clone();
-        spec.address = pick_address(&world, network, true, spec.address, None, None)?;
+        spec.address = pick_address(
+            &world,
+            network,
+            true,
+            spec.address,
+            None,
+            None,
+            is_admin(&state, &principal),
+        )?;
         let Some(address) = spec.address else {
             return Err(ApiError::bad_request(format!(
                 "provider network {:?} has no IPv4 subnet",
@@ -1338,5 +1477,68 @@ mod tests {
             "router interface add r1 b, router interface remove r1 a, router external set r1 ext"
         );
         assert_eq!(router_change("r1", &old, &old), "router update r1");
+    }
+
+    fn world(vms: Vec<Vm>, routers: Vec<Router>) -> World {
+        World {
+            routers,
+            fips: Vec::new(),
+            networks: Vec::new(),
+            vms,
+            nodes: Vec::new(),
+        }
+    }
+
+    /// 리뷰 1 M-4: VM을 읽을 수 없는 사용자에게는 유동 IP 상태의 까닭에 VM 이름이 없다.
+    #[test]
+    fn fip_reasons_hide_unreadable_vm_names() {
+        let vm: Vm = Resource::new(
+            "secret-db",
+            serde_json::from_value(serde_json::json!({
+                "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt", "nics": []
+            }))
+            .unwrap(),
+        );
+        let f: FloatingIp = Resource::new(
+            "f1",
+            serde_json::from_value(serde_json::json!({
+                "network": "ext", "address": "203.0.113.100",
+                "target": { "vm": vm.id, "mac": "52:54:00:00:00:01" }
+            }))
+            .unwrap(),
+        );
+        let w = world(vec![vm], Vec::new());
+        let FipState::Unrouted { reason } = fip_state(&w, &f, false, false) else {
+            panic!("not unrouted");
+        };
+        assert!(!reason.contains("secret-db"), "{reason}");
+        assert!(reason.starts_with("the target VM"), "{reason}");
+        let FipState::Unrouted { reason } = fip_state(&w, &f, true, true) else {
+            panic!("not unrouted");
+        };
+        assert!(reason.contains("\"secret-db\""), "{reason}");
+    }
+
+    /// 리뷰 1 M-6: 준 주소나 지금 주소만 쓴 외부는 Raft의 주소 겹침을 다시 고르기로 받지 않는다(곧바로 409).
+    #[test]
+    fn only_auto_picked_external_addresses_retry() {
+        let ext = |ips: &[&str]| RouterExternal {
+            network: "ext".into(),
+            ips: ips.iter().map(|i| i.parse().unwrap()).collect(),
+            snat: None,
+        };
+        let given: Vec<IpAddr> = vec!["203.0.113.5".parse().unwrap()];
+        assert!(!auto_picked(&ext(&["203.0.113.5"]), &given, None));
+        assert!(auto_picked(
+            &ext(&["203.0.113.5", "2001:db8::2"]),
+            &given,
+            None
+        ));
+        let old = ext(&["2001:db8::2"]);
+        assert!(!auto_picked(
+            &ext(&["203.0.113.5", "2001:db8::2"]),
+            &given,
+            Some(&old)
+        ));
     }
 }

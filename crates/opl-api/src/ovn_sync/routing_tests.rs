@@ -829,3 +829,56 @@ async fn a_plan65_nb_needs_no_operations() {
     assert_eq!(old, new);
     assert!(plan(&new, &nb.read().await).is_empty());
 }
+
+/// 리뷰 1 웹 I1: 라우터 보기는 `Logical_Router_Port` 한 표의 세 칸만 읽고 우리 게이트웨이 포트의 `hosting-chassis`만 낸다
+/// (관리자의 포트·인터페이스 포트·주인 없는 상태는 빠짐). 라우터 하나를 주면 그 포트 하나만 고른다.
+#[tokio::test]
+async fn the_hosting_read_selects_only_gateway_ports() {
+    use opl_driver::ovn::ovsdb::NB_DB;
+    let nb = Nb::new().await;
+    let w = world();
+    let r = r1();
+    let want = desired_routing(
+        &w.networks,
+        &[],
+        &w.nodes,
+        std::slice::from_ref(&r),
+        &[],
+        TAG,
+    );
+    nb.sync(&want, "1:1").await;
+    nb.fake.with(|s| {
+        s.insert(
+            "Logical_Router_Port",
+            json!({"name": "admin-gw", "mac": "02:00:00:00:00:01",
+                   "status": ["map", [["hosting-chassis", "admin"]]]}),
+        );
+    });
+    let read = |router: Option<Uuid>| {
+        let (conditions, columns) = hosting_select(TAG, router);
+        let client = &nb.client;
+        async move {
+            let rows = client
+                .select(NB_DB, "Logical_Router_Port", conditions, &columns)
+                .await
+                .unwrap();
+            assert!(rows.iter().all(|r| r.len() <= 4), "{rows:?}");
+            parse_hosting(&rows)
+        }
+    };
+    // 아직 northd가 주인을 적지 않았다.
+    assert!(read(None).await.is_empty());
+    nb.client
+        .transact(
+            NB_DB,
+            vec![json!({"op": "update", "table": "Logical_Router_Port",
+                "where": [["name", "==", gateway_port_name(r.id)]],
+                "row": {"status": ["map", [["hosting-chassis", "chassis-2"]]]}})],
+        )
+        .await
+        .unwrap();
+    let all = read(None).await;
+    assert_eq!(all, BTreeMap::from([(r.id, "chassis-2".to_string())]));
+    assert_eq!(read(Some(r.id)).await, all);
+    assert!(read(Some(Uuid::new_v4())).await.is_empty());
+}

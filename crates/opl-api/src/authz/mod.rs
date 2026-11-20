@@ -448,6 +448,17 @@ impl Authz {
         principal: &Principal,
         names: impl IntoIterator<Item = &'a str>,
     ) -> Result<(), ApiError> {
+        self.require_networks_with(principal, Privilege::NetworkAssign, names)
+    }
+
+    /// 네트워크마다 `privilege`(라우터 인터페이스로 잇는 네트워크는 `network.config` — 그 네트워크의 모든 VM 기본 경로를
+    /// 바꾸므로 NIC 붙이기보다 크다). 없는 네트워크는 보지 않는다(검증이 400을 낸다).
+    pub fn require_networks_with<'a>(
+        &self,
+        principal: &Principal,
+        privilege: Privilege,
+        names: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), ApiError> {
         let mut seen = std::collections::BTreeSet::new();
         for name in names {
             if name == opl_types::network::USER_NETWORK || !seen.insert(name) {
@@ -457,7 +468,7 @@ impl Authz {
             if target != AuthzTarget::Root {
                 self.require(
                     principal,
-                    Privilege::NetworkAssign,
+                    privilege,
                     &Found {
                         owned: Owned::object(target),
                         missing: format!("network {name:?} not found"),

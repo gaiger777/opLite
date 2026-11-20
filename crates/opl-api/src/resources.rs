@@ -799,7 +799,8 @@ pub async fn create_network(
                 .is_some_and(|s| s.physnet_ready(&provider.physnet))
         }) {
             warnings.push(format!(
-                "no node has physnet {} ready yet; VMs on this network cannot start until one has                  (`orbivisorctl node sdn NODE --physnet {}=BRIDGE`)",
+                "no node has physnet {} ready yet; VMs on this network cannot start until one has \
+                 (`orbivisorctl node sdn NODE --physnet {}=BRIDGE`)",
                 provider.physnet, provider.physnet
             ));
         }

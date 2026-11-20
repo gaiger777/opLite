@@ -235,6 +235,15 @@ async fn node_sdn_settings() {
     let (status, body) = put_node_sdn(&env, &admin, Some(json!({ "gateway": 100 }))).await;
     code(status, &body, StatusCode::CONFLICT, "physnet_in_use");
     assert_eq!(body["details"]["vms"], json!(["web"]), "{body}");
+    // 리뷰 1 #3: 같은 physnet의 브리지를 바꾸는 것도 도는 VM을 다른 L2로 옮기므로 막는다.
+    let (status, body) = put_node_sdn(
+        &env,
+        &admin,
+        Some(json!({ "physnets": { "ext": "vmbr2" }, "gateway": 100 })),
+    )
+    .await;
+    code(status, &body, StatusCode::CONFLICT, "physnet_in_use");
+    assert_eq!(body["details"]["vms"], json!(["web"]), "{body}");
     // 게이트웨이만 바꾸는 것은 된다. `{}`는 지운다(VM을 멈춘 뒤).
     let (status, body) = put_node_sdn(
         &env,
@@ -267,6 +276,11 @@ async fn provider_networks_routers_and_floating_ips() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let warning = headers["orbivisor-warning"].to_str().unwrap().to_string();
     assert!(warning.contains("physnet ext"), "{warning}");
+    // 리뷰 1 웹 M6: 줄바꿈에서 남은 빈칸이 없다.
+    assert!(
+        warning.contains("until one has (`orbivisorctl node sdn"),
+        "{warning}"
+    );
     // 공급자 서브넷의 DHCP는 기본 꺼짐(저장은 그대로), MTU 기본 1500(저장하지 않음)
     assert_eq!(body["spec"]["subnets"][0].get("dhcp"), None, "{body}");
     // 같은 physnet·VLAN은 하나
@@ -839,4 +853,175 @@ async fn sdn_nics_take_security_groups() {
     // 그룹이 없는 SDN NIC는 그대로 된다.
     let (status, body) = admin.post("/vms", vm("c", json!([]))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// 계획 66 리뷰 1: 라우터 인터페이스는 그 네트워크의 `network.config`(#1 — `network.assign`만으로는 남의 네트워크 기본
+/// 경로를 가져가지 못함), 고른 유동 IP·라우터 외부 주소는 유동 IP 풀 안(#2 — 루트 `cluster.admin`만 밖), 루트
+/// `cluster.read`가 없으면 게이트웨이 노드 이름을 비움(M-4).
+#[tokio::test]
+async fn review1_router_interfaces_and_chosen_addresses() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env).await;
+    physnet_ready(&env).await;
+    let (status, body) = put_node_sdn(
+        &env,
+        &admin,
+        Some(json!({ "physnets": { "ext": "vmbr1" }, "gateway": 100 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = admin.post("/networks", ext_network()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut folders = Vec::new();
+    for name in ["tenant-a", "tenant-b"] {
+        let (status, f) = admin
+            .post("/folders", json!({ "name": name, "kind": "network" }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{f}");
+        folders.push(f["id"].as_str().unwrap().to_string());
+    }
+    for (name, folder, cidr) in [
+        ("a-net", &folders[0], "10.10.0.0/24"),
+        ("shared", &folders[1], "10.30.0.0/24"),
+    ] {
+        let (status, body) = admin
+            .post(
+                "/networks",
+                json!({ "name": name, "spec": { "folder": folder, "sdn": {}, "subnets": [{ "cidr": cidr }] } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let mut roles = Vec::new();
+    for (name, privileges) in [
+        ("netops", json!(["network.config", "network.assign"])),
+        ("assigner", json!(["network.assign"])),
+    ] {
+        let (status, role) = admin
+            .post(
+                "/access-roles",
+                json!({ "name": name, "privileges": privileges }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{role}");
+        roles.push(role["id"].clone());
+    }
+    let (status, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "alice", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    let shared_id = id_of(&admin, "/networks/shared").await;
+    let ext_id = id_of(&admin, "/networks/ext").await;
+    for (role, target) in [
+        (&roles[0], json!({ "type": "folder", "id": folders[0] })),
+        (
+            &roles[1],
+            json!({ "type": "object", "kind": "network", "id": shared_id }),
+        ),
+        (
+            &roles[1],
+            json!({ "type": "object", "kind": "network", "id": ext_id }),
+        ),
+    ] {
+        let (status, body) = admin
+            .post(
+                "/grants",
+                json!({
+                    "principal": { "type": "user", "id": user["id"] },
+                    "role": { "type": "custom", "id": role },
+                    "target": target,
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let alice = env.login("alice", "password-1").await;
+
+    // #1: `shared`에는 NIC만 붙일 수 있다(network.assign) — 라우터 인터페이스는 403.
+    let (status, body) = alice
+        .post(
+            "/routers",
+            json!({ "name": "r-a", "spec": { "folder": folders[0],
+                "interfaces": [{ "network": "a-net" }, { "network": "shared" }] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = alice
+        .post(
+            "/routers",
+            json!({ "name": "r-a", "spec": { "folder": folders[0], "interfaces": [{ "network": "a-net" }] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = alice
+        .patch(
+            "/routers/r-a",
+            json!({ "interfaces": [{ "network": "a-net" }, { "network": "shared" }] }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // #2: 고른 주소는 유동 IP 풀 안이어야 한다(물리 망의 .53을 가로채지 못함).
+    let (status, body) = alice
+        .post(
+            "/floating-ips",
+            json!({ "name": "f-x", "spec": { "network": "ext", "folder": folders[0], "address": "203.0.113.53" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("only a cluster administrator"),
+        "{body}"
+    );
+    let (status, body) = alice
+        .patch(
+            "/routers/r-a",
+            json!({ "external": { "network": "ext", "ips": ["203.0.113.53"] } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = alice
+        .post(
+            "/floating-ips",
+            json!({ "name": "f-a", "spec": { "network": "ext", "folder": folders[0], "address": "203.0.113.101" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin
+        .post(
+            "/floating-ips",
+            json!({ "name": "f-admin", "spec": { "network": "ext", "address": "203.0.113.53" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body) = alice
+        .patch(
+            "/routers/r-a",
+            json!({ "external": { "network": "ext" } }),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["spec"]["external"]["ips"],
+        json!(["203.0.113.100"]),
+        "{body}"
+    );
+
+    // M-4: 게이트웨이 순위는 보이지만 노드 이름은 루트 cluster.read가 있을 때만.
+    let (_, view) = alice.get("/routers/r-a?live=false").await;
+    assert_eq!(view["gateways"][0]["node"], "", "{view}");
+    assert_eq!(view["gateways"][0]["node_priority"], 100, "{view}");
+    let (_, view) = admin.get("/routers/r-a?live=false").await;
+    assert_ne!(view["gateways"][0]["node"], "", "{view}");
 }

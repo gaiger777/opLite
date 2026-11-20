@@ -1057,6 +1057,38 @@ pub fn read_ops(tag: &str) -> Vec<Value> {
     ]
 }
 
+/// 라우터 보기의 가벼운 NB 읽기(계획 66 리뷰 1 웹 I1): 우리 `Logical_Router_Port`의 이름·`status`·주인 표시만 고르는
+/// 조건과 칸(`router`가 있으면 그 라우터의 게이트웨이 포트 하나). [`read_ops`]처럼 12개 표를 다 읽지 않는다.
+pub fn hosting_select(tag: &str, router: Option<Uuid>) -> (Vec<Value>, [&'static str; 3]) {
+    let mut conditions = vec![cond(
+        "external_ids",
+        "includes",
+        map_value(&BTreeMap::from([(
+            CLUSTER_KEY.to_string(),
+            tag.to_string(),
+        )])),
+    )];
+    if let Some(id) = router {
+        conditions.push(cond("name", "==", json!(gateway_port_name(id))));
+    }
+    (conditions, ["name", "status", "external_ids"])
+}
+
+/// [`hosting_select`]의 행 → 라우터 id → 게이트웨이 포트를 가진 chassis 이름(`status:hosting-chassis`가 있는 것만)
+pub fn parse_hosting(rows: &[Map<String, Value>]) -> BTreeMap<Uuid, String> {
+    rows.iter()
+        .filter_map(|r| {
+            let ids = parse_map(r.get("external_ids")?);
+            let id: Uuid = ids.get(ROUTER_KEY)?.parse().ok()?;
+            if text(r, "name") != gateway_port_name(id) {
+                return None;
+            }
+            let host = parse_map(r.get("status")?).get("hosting-chassis")?.clone();
+            Some((id, host))
+        })
+        .collect()
+}
+
 fn rows(v: &Value) -> Vec<Map<String, Value>> {
     v.get("rows")
         .unwrap_or(&Value::Null)

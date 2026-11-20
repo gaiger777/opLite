@@ -74,7 +74,8 @@ pub(crate) fn subnet_uses_routing(subnet: &Subnet) -> bool {
 /// 노드 `node`의 SDN 설정(`NodeSpec.sdn`, 계획 66 §7)을 `new`(None은 지우기)로 바꿔도 되는지 보고 감사 설명을 돌려준다.
 /// 모든 노드가 `sdn-routing`을 알아야 하고(409 `cluster_upgrading`, 검증보다 먼저), 위트니스·macOS 노드는 chassis가 될 수
 /// 없고(400), 검증(physnet 이름·브리지·게이트웨이)은 400 `invalid_node_sdn`, SDN이 세워지지 않았으면 409 `sdn_not_ready`
-/// (지우기는 빼고), 빠지는 physnet을 쓰는 공급자 네트워크 NIC의 VM이 이 노드에서 돌면 409 `physnet_in_use`(`details.vms`).
+/// (지우기는 빼고), 빠지거나 브리지가 바뀌는 physnet을 쓰는 공급자 네트워크 NIC의 VM이 이 노드에서 돌면 409
+/// `physnet_in_use`(`details.vms`).
 pub(crate) fn check_node_sdn(
     state: &AppState,
     node: &Node,
@@ -98,12 +99,14 @@ pub(crate) fn check_node_sdn(
             .map_err(|e| ApiError::bad_request(e.to_string()).with_code("invalid_node_sdn"))?;
         require_ready(&state.cluster)?;
     }
+    // 빠지는 physnet과 브리지가 바뀌는 physnet(에이전트가 veth를 다른 브리지로 옮겨 돌던 VM이 다른 L2로 간다 — 리뷰 1 #3)
     let removed: Vec<&String> = node
         .spec
         .sdn
         .iter()
-        .flat_map(|s| s.physnets.keys())
-        .filter(|p| !new.is_some_and(|n| n.physnets.contains_key(*p)))
+        .flat_map(|s| s.physnets.iter())
+        .filter(|(p, bridge)| new.is_none_or(|n| n.physnets.get(*p) != Some(*bridge)))
+        .map(|(p, _)| p)
         .collect();
     if !removed.is_empty() {
         let (_, networks) = state.cluster.list::<NetworkSpec>()?;
@@ -136,7 +139,7 @@ pub(crate) fn check_node_sdn(
             let mut e = ApiError::conflict(
                 "physnet_in_use",
                 format!(
-                    "VMs {} on node {:?} use physnet(s) {}; stop or move them first",
+                    "VMs {} on node {:?} use physnet(s) {} being removed or moved to another bridge; stop or move them first",
                     users.join(", "),
                     node.name,
                     removed

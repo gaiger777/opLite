@@ -794,12 +794,14 @@ pub(crate) async fn read_ports(
     Ok(out)
 }
 
-/// API 노드가 우리 NB 행을 읽는다(계획 66 §9.3 라우터 보기 — DGP의 `status:hosting-chassis`). 읽기만 하므로 팔로어도
-/// 쓴다(`leader_only = false`).
-pub(crate) async fn read_nb(
+/// API 노드가 라우터 게이트웨이 포트의 지금 주인을 읽는다(계획 66 §9.3 라우터 보기 — DGP의 `status:hosting-chassis`,
+/// `router`가 있으면 그 하나). `Logical_Router_Port` 한 표의 세 칸만 고른다(리뷰 1 웹 I1 — 전체 NB를 읽지 않음). 읽기만
+/// 하므로 팔로어도 쓴다(`leader_only = false`).
+pub(crate) async fn read_hosting(
     config: &OvnSyncConfig,
     centrals: &[(std::net::IpAddr, Option<String>)],
-) -> Result<nb::NbActual, OvsdbError> {
+    router: Option<uuid::Uuid>,
+) -> Result<std::collections::BTreeMap<uuid::Uuid, String>, OvsdbError> {
     let transport = match &config.transport {
         OvnTransport::Tcp => Transport::Tcp,
         OvnTransport::Tls { pki } => Transport::Tls(OvsdbTls::from_dir(pki)?),
@@ -812,8 +814,11 @@ pub(crate) async fn read_nb(
         config.timeout,
     )
     .await?;
-    let results = client.transact(NB_DB, nb::read_ops(&config.tag)).await?;
-    Ok(nb::parse_actual(&results))
+    let (conditions, columns) = nb::hosting_select(&config.tag, router);
+    let rows = client
+        .select(NB_DB, "Logical_Router_Port", conditions, &columns)
+        .await?;
+    Ok(nb::parse_hosting(&rows))
 }
 
 /// SB의 논리 포트 → 바인딩한 chassis 이름

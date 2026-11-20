@@ -182,6 +182,24 @@ pub fn allocate_from(
     pick(subnet, pools, &[], used)
 }
 
+/// 라우터 외부 주소·유동 IP로 **골라 줄** 수 있는 주소인지(계획 66 §9.5, 리뷰 1 #2): 유동 IP 풀이 있으면 그 안, 없으면 풀
+/// (없으면 CIDR). 물리 망의 다른 장비(관리자만 아는 주소)를 테넌트가 가로채지 못하게 API가 루트 `cluster.admin`이
+/// 아닌 사용자의 주소를 이것으로 막는다.
+pub fn in_floating_range(subnet: &Subnet, ip: IpAddr) -> bool {
+    let b = bits(ip.to_canonical());
+    if !subnet.cidr.contains(ip.to_canonical()) {
+        return false;
+    }
+    if subnet.floating_pools.is_empty() {
+        ranges(subnet).iter().any(|(s, e)| (*s..=*e).contains(&b))
+    } else {
+        subnet
+            .floating_pools
+            .iter()
+            .any(|p| (bits(p.start)..=bits(p.end)).contains(&b))
+    }
+}
+
 /// NIC(MAC `mac`)의 주소를 서브넷에서 고른다(계획 66 §10): 주소를 게스트가 MAC에서 만드는 IPv6 서브넷(`ipv6_mode`가
 /// `slaac`·`dhcpv6-stateless`)이면 늘 [`eui64`] 주소이고 다른 주소를 원하면 [`IpamError::NotEui64`]다. 아니면
 /// [`allocate`]다.
@@ -429,6 +447,29 @@ mod tests {
     }
 
     /// 계획 66 §10: SLAAC 서브넷의 NIC 주소는 MAC의 EUI-64다.
+    #[test]
+    fn floating_range_is_the_floating_pools_else_the_pools() {
+        let mut s = subnet("203.0.113.0/24");
+        // 풀도 유동 IP 풀도 없으면 CIDR(망 주소·브로드캐스트 빼고)
+        assert!(in_floating_range(&s, ip("203.0.113.53")));
+        assert!(!in_floating_range(&s, ip("203.0.113.255")));
+        assert!(!in_floating_range(&s, ip("198.51.100.5")));
+        s.pools = vec![IpRange {
+            start: ip("203.0.113.10"),
+            end: ip("203.0.113.20"),
+        }];
+        assert!(in_floating_range(&s, ip("203.0.113.15")));
+        assert!(!in_floating_range(&s, ip("203.0.113.53")));
+        s.floating_pools = vec![IpRange {
+            start: ip("203.0.113.100"),
+            end: ip("203.0.113.150"),
+        }];
+        assert!(in_floating_range(&s, ip("203.0.113.100")));
+        assert!(in_floating_range(&s, ip("203.0.113.150")));
+        assert!(!in_floating_range(&s, ip("203.0.113.15")));
+        assert!(!in_floating_range(&s, ip("203.0.113.53")));
+    }
+
     #[test]
     fn slaac_subnets_give_eui64_addresses() {
         let mac: MacAddr = "52:54:00:12:34:56".parse().unwrap();

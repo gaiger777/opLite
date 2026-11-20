@@ -44,8 +44,13 @@ const EXT_IP: &str = "203.0.113.1";
 const ROUTER_IP: &str = "203.0.113.50";
 /// 에이전트·OvnSync가 맞추기를 기다리는 시간
 const AGENT_WAIT: Duration = Duration::from_secs(90);
-/// 게이트웨이 넘김의 상한(설계 §14 — BFD 기본값의 넘김)
-const FAILOVER_LIMIT: Duration = Duration::from_secs(15);
+/// 게이트웨이 넘김의 상한(설계 §14 — BFD 기본값의 넘김). 탐침에서 잰 값은 3초 안팎이지만 바쁜 러너에서 노드를 통째로
+/// 죽이면(Raft 투표 멤버·OVN 중앙도 함께) 더 걸릴 수 있어 넉넉히 둔다(리뷰 1 #5). 잰 값은 `PROBE` 줄로 남는다.
+const FAILOVER_LIMIT: Duration = Duration::from_secs(60);
+/// tcpdump 캡처 하나의 길이(초). tcpdump가 붙기를 기다린 뒤 `action`을 하므로 붙는 시간은 빼지 않는다.
+const CAPTURE_SECS: &str = "12";
+/// 캡처 확인을 다시 하는 횟수(바쁜 러너에서 tcpdump가 늦게 붙거나 첫 패킷을 놓쳐도 거짓 실패가 없게 — 리뷰 1 #5)
+const CAPTURE_ATTEMPTS: usize = 3;
 
 /// 명령을 실행해 (성공, stdout, stderr)
 fn try_run(program: &str, args: &[&str]) -> (bool, String, String) {
@@ -341,13 +346,16 @@ impl Node {
 struct Fleet {
     nodes: Vec<Node>,
     root: PathBuf,
+    /// 바꾼 sysctl의 옛 값(끝나면 되돌린다 — 개발 호스트에서 돌려도 남지 않게, 리뷰 1 M-10)
+    sysctls: Vec<(String, String)>,
 }
 
 impl Fleet {
     /// 지난 시험이 남긴 것을 지우고 도커 망·호스트 브리지·`ext` 이름공간을 만들고 컨테이너 셋을 띄운다.
     async fn up(image: &str) -> Self {
         let root = PathBuf::from("/var/tmp/oplmn");
-        let fleet = Fleet {
+        let mut fleet = Fleet {
+            sysctls: Vec::new(),
             nodes: NODES
                 .iter()
                 .map(|(name, ip)| Node {
@@ -373,7 +381,8 @@ impl Fleet {
         // 않게 한다(br_netfilter가 있으면).
         for key in ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"] {
             let path = format!("/proc/sys/net/bridge/{key}");
-            if std::path::Path::new(&path).exists() {
+            if let Ok(old) = std::fs::read_to_string(&path) {
+                fleet.sysctls.push((path.clone(), old.trim().to_string()));
                 std::fs::write(&path, "0").unwrap();
             }
         }
@@ -438,6 +447,8 @@ impl Fleet {
         }
         let _ = try_run("docker", &["network", "rm", MGMT_NET]);
         let _ = try_run("ip", &["netns", "del", EXT_NS]);
+        // 이름공간이 아직 붙들려 있어도 호스트 쪽 veth는 지운다(다음 `ip link add`가 실패하지 않게 — 리뷰 1 M-10).
+        let _ = try_run("ip", &["link", "del", "oplextr"]);
         let _ = try_run("ip", &["link", "del", EXT_BRIDGE]);
         for i in 1..=NODES.len() {
             let _ = try_run("ip", &["link", "del", &format!("oplv{i}")]);
@@ -510,6 +521,9 @@ impl Drop for Fleet {
             self.diagnose();
         }
         self.clean();
+        for (path, old) in &self.sysctls {
+            let _ = std::fs::write(path, old);
+        }
     }
 }
 
@@ -539,7 +553,7 @@ fn ext_neigh(ip: &str) -> String {
 }
 
 /// 패킷 캡처 하나: `prefix`(빈 것이면 호스트, 아니면 `docker exec <컨테이너>`)의 장치 `dev`에서 `filter`에 맞는 패킷을
-/// 8초 동안 센다.
+/// [`CAPTURE_SECS`] 동안 센다.
 struct Capture {
     what: String,
     child: Child,
@@ -549,9 +563,18 @@ impl Capture {
     fn start(prefix: &[String], dev: &str, filter: &str) -> Self {
         let mut argv: Vec<String> = prefix.to_vec();
         argv.extend(
-            ["timeout", "8", "tcpdump", "-n", "-l", "-i", dev, filter]
-                .iter()
-                .map(|s| s.to_string()),
+            [
+                "timeout",
+                CAPTURE_SECS,
+                "tcpdump",
+                "-n",
+                "-l",
+                "-i",
+                dev,
+                filter,
+            ]
+            .iter()
+            .map(|s| s.to_string()),
         );
         let child = Command::new(&argv[0])
             .args(&argv[1..])
@@ -565,6 +588,26 @@ impl Capture {
         }
     }
 
+    /// tcpdump가 장치에 붙었다고 알릴 때까지(stderr의 `listening on`, 15초까지) 기다린다. stderr의 나머지는 버린다.
+    fn wait_listening(&mut self) {
+        use std::io::BufRead;
+        let stderr = self.child.stderr.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stderr)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if line.contains("listening on") {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        if rx.recv_timeout(Duration::from_secs(15)).is_err() {
+            eprintln!("capture {}: tcpdump did not report listening", self.what);
+        }
+    }
+
     /// 끝나기를 기다려 잡은 패킷 수
     fn count(self) -> usize {
         let out = self.child.wait_with_output().unwrap();
@@ -575,15 +618,36 @@ impl Capture {
     }
 }
 
-/// 캡처들을 띄우고(tcpdump가 붙을 때까지 2초), `action`을 하고, 장치마다 잡은 수를 돌려준다.
+/// 캡처들을 띄우고(tcpdump가 모두 붙을 때까지 기다림), `action`을 하고, 장치마다 잡은 수를 돌려준다.
 fn captured(points: &[(Vec<String>, &str)], filter: &str, action: impl FnOnce()) -> Vec<usize> {
-    let caps: Vec<Capture> = points
+    let mut caps: Vec<Capture> = points
         .iter()
         .map(|(prefix, dev)| Capture::start(prefix, dev, filter))
         .collect();
-    std::thread::sleep(Duration::from_secs(2));
+    for c in &mut caps {
+        c.wait_listening();
+    }
     action();
     caps.into_iter().map(Capture::count).collect()
+}
+
+/// [`captured`]를 `ok`가 맞을 때까지 [`CAPTURE_ATTEMPTS`]번까지 다시 하고 마지막 수를 돌려준다(호출자가 그 수로
+/// 단언한다 — 정말 틀리면 모든 시도가 틀린다).
+fn captured_until(
+    points: &[(Vec<String>, &str)],
+    filter: &str,
+    action: impl Fn(),
+    ok: impl Fn(&[usize]) -> bool,
+) -> Vec<usize> {
+    let mut counts = Vec::new();
+    for attempt in 1..=CAPTURE_ATTEMPTS {
+        counts = captured(points, filter, &action);
+        if ok(&counts) {
+            break;
+        }
+        eprintln!("capture attempt {attempt}/{CAPTURE_ATTEMPTS} [{filter}]: {counts:?}; again");
+    }
+    counts
 }
 
 /// 호스트 쪽 veth(노드 `i` = 1..3)
@@ -954,7 +1018,7 @@ async fn routing_section(fleet: &Fleet) {
     )
     .await;
     // 분산 라우팅: c1 → c3 패킷은 Geneve로 c3에 곧바로 가고 게이트웨이 c2를 지나지 않는다.
-    let counts = captured(
+    let counts = captured_until(
         &[(c2.prefix(), "eth0"), (c3.prefix(), "eth0")],
         "geneve and icmp",
         || {
@@ -962,6 +1026,7 @@ async fn routing_section(fleet: &Fleet) {
                 "ip", "netns", "exec", "vma", "ping", "-c", "5", "-i", "0.3", &b.2,
             ]);
         },
+        |c| c[0] == 0 && c[1] > 0,
     );
     assert_eq!(
         counts[0], 0,
@@ -977,11 +1042,16 @@ async fn routing_section(fleet: &Fleet) {
     )
     .await;
     let src = format!("icmp and src host {ROUTER_IP}");
-    let counts = captured(&[host_veth(1), host_veth(2), host_veth(3)], &src, || {
-        c1.try_exec(&[
-            "ip", "netns", "exec", "vma", "ping", "-c", "5", "-i", "0.3", EXT_IP,
-        ]);
-    });
+    let counts = captured_until(
+        &[host_veth(1), host_veth(2), host_veth(3)],
+        &src,
+        || {
+            c1.try_exec(&[
+                "ip", "netns", "exec", "vma", "ping", "-c", "5", "-i", "0.3", EXT_IP,
+            ]);
+        },
+        |c| c[0] == 0 && c[1] > 0 && c[2] == 0,
+    );
     assert_eq!(
         counts,
         [0, counts[1], 0],
@@ -1038,12 +1108,13 @@ async fn routing_section(fleet: &Fleet) {
         counts[0] > 0 && counts[1] == 0 && ext_neigh("203.0.113.120") == q_mac
     })
     .await;
-    let tap = captured(
+    let tap = captured_until(
         &[(c1.prefix(), q_tap.as_str())],
         &format!("icmp and dst host {q_ip}"),
         || {
             ext_ping("203.0.113.120");
         },
+        |c| c[0] > 0,
     );
     assert!(tap[0] > 0, "the DNAT-ed packets did not reach the VM tap");
 

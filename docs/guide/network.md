@@ -448,18 +448,23 @@ orbivisorctl network list
 - **설정 규칙.** `PUT /api/v1/nodes/{name}`의 `spec.sdn`(`{"physnets": {"ext": "vmbr1"}, "gateway": 200}` — 칸이 없으면 그대로,
   `{}`는 지우기). 루트 `cluster.admin`. physnet 이름은 `[a-z][a-z0-9-]{0,30}`, 노드마다 8개, 브리지는 `br-int`·Orbivisor 장치가
   아닌 이름, 게이트웨이 우선순위 1~1000(400 `invalid_node_sdn`). 위트니스·macOS 노드는 400, SDN 전은 409 `sdn_not_ready`.
-  빠지는 physnet을 쓰는 공급자 네트워크 NIC의 VM이 그 노드에서 돌거나 그리로 마이그레이션 중이면 409 `physnet_in_use`
-  (`details.vms`). 브리지 이름만 바꾸는 것은 막지 않는다(에이전트가 다시 잇는다). `cluster leave`는 매핑·veth·OVS 브리지도 뺀다.
+  빠지거나 **브리지가 바뀌는** physnet을 쓰는 공급자 네트워크 NIC의 VM이 그 노드에서 돌거나 그리로 마이그레이션 중이면 409
+  `physnet_in_use`(`details.vms`) — 브리지를 바꾸면 에이전트가 veth를 새 브리지로 옮겨 도는 VM이 다른 L2로 가므로 먼저 멈추거나
+  옮긴다. `cluster leave`는 매핑·veth·OVS 브리지도 뺀다.
 - **공급자 네트워크 만들기·바꾸기·지우기는 루트 `cluster.admin`**(물리 망은 노드 자원 — 브리지 네트워크와 같다). 폴더는
   `network.assign`을 나눠 주는 자리일 뿐이다(Neutron의 공유 외부 네트워크). 같은 `(physnet, VLAN)`은 클러스터에 하나(409
   `physnet_conflict`). physnet이 준비된 노드가 없어도 만들 수 있고 경고(`orbivisor-warning`)가 나온다.
 - **서브넷의 뜻.** `gateway`는 **물리 라우터의 주소**, `pool`은 VM NIC 주소, **`floating`은 라우터 바깥 주소와 유동 IP**다.
-  라우터·유동 IP는 `floating`이 있으면 거기서만, 없으면 `pool`에서 고른다. NIC의 자동 할당은 `floating`을 건너뛴다. 셋은 한
-  주소 공간이라 한 주소는 NIC·라우터·유동 IP 가운데 하나만 갖는다(409 `ip_in_use` "… by a router or floating IP").
+  라우터·유동 IP는 `floating`이 있으면 거기서만, 없으면 `pool`에서 고른다. 주소를 직접 줄 때(`fip create --ip`, 라우터
+  `external ips`)도 그 범위 안이어야 한다 — 루트 `cluster.admin`만 범위 밖(서브넷 안)의 주소를 고른다(400 "only a cluster
+  administrator …"). 물리 망의 다른 장비(DNS·NTP 따위) 주소를 테넌트가 유동 IP로 가로채지 못하게 하려는 것이다(Neutron도 고른
+  유동 IP 주소는 관리자만). NIC의 자동 할당은 `floating`을 건너뛴다. 셋은 한 주소 공간이라 한 주소는 NIC·라우터·유동 IP 가운데
+  하나만 갖는다(409 `ip_in_use` "… by a router or floating IP").
 - **DHCP는 기본 끔**(`dhcp=on`으로 켬). 물리 망에 DHCP 서버가 있으면 그것도 VM에 답하고, VM이 다른 주소를 받으면 포트 보안이
   막는다 — 그 VLAN에 다른 DHCP가 없을 때만 켠다. 켜면 기본 경로(`router` = 서브넷 게이트웨이)도 준다. MTU 기본은 **1500**
   (1280~9000, 물리 망에 맞춘다).
-- **VM을 곧바로 붙이기.** `--nic ext`처럼 붙이면 VM이 물리 망에 그대로 선다(주소는 `pool`에서, `network.assign` 권한). VM은
+- **VM을 곧바로 붙이기.** `--nic ext`처럼 붙이면 VM이 물리 망에 그대로 선다(주소는 `pool`에서, `network.assign` 권한 — 이때
+  `ip=`로 서브넷 안의 어느 빈 주소든 고를 수 있으므로, 공급자 네트워크의 `network.assign`은 믿는 테넌트에게만 준다). VM은
   physnet이 준비된 노드에서만 돈다. 라이브 마이그레이션 동안(두 chassis 바인딩) OVN이 터널을 쓰므로 그 몇 초 동안 1442바이트보다
   큰 패킷은 버려진다.
 - **지우기.** 라우터의 바깥이거나 유동 IP가 있으면 409 `network_in_use`(이름들). 라우터·유동 IP가 쓰는 서브넷 빼기는 409
@@ -524,7 +529,9 @@ orbivisorctl router delete r1                                     # 인터페이
   {"external": {"network": "ext", "snat": true}, "interfaces": [{"network": "t1"}], "routes": [{"destination": "192.168.50.0/24",
   "nexthop": "10.10.0.254"}], "folder": "<id>"}}`, `PATCH`는 보낸 칸만(`description`·`external`(null은 지우기)·`interfaces`·
   `routes` — 목록은 통째로, `If-Match`). 읽기는 보기(`gateways`·`gateway_error`·`hosting`·`live_error`·`upstream_routes`)이고
-  `?live=false`면 OVN을 읽지 않는다.
+  `?live=false`면 OVN을 읽지 않는다. 지금 주인(`hosting`·`active`)은 OVN NB의 게이트웨이 포트 칸 셋만 읽는다(라우터 하나면 그
+  포트 하나). 루트 `cluster.read`가 없는 사용자(폴더 테넌트)에게는 게이트웨이 노드 이름(`gateways[].node`·`hosting`)이 빈 글이다
+  — 순위·우선순위·주인 표시는 보인다. `If-Match` 없이 지워도 읽은 리비전으로 지워, 그사이 인터페이스가 더해졌으면 지우지 않는다.
 
 ### 게이트웨이 HA
 
@@ -550,7 +557,8 @@ orbivisorctl router delete r1                                     # 인터페이
 | 되돌아감(높은 노드가 돌아옴) | 1.1~1.9초 | 2.4~3.1초 |
 
   실제 하드웨어 장애(전원·링크)는 BFD 감지 시간이 비슷하리라 보지만 재지 않았다. 점잖은 멈춤은 ovn-controller가 바인딩을 놓아
-  BFD를 기다리지 않는다.
+  BFD를 기다리지 않는다. CI(`sdn-multinode`)는 바쁜 러너에서 거짓 실패가 없게 넘김 상한을 60초로 넉넉히 두고 잰 값을 로그
+  (`PROBE`)에 남긴다.
 - **맺은 SNAT 연결은 끊긴다.** conntrack은 노드마다라 새 게이트웨이로 옮겨지지 않는다 — 넘김 뒤 새로 맺는다(Neutron L3 HA·NSX
   액티브·스탠바이와 같다). 넘긴 노드가 GARP로 물리 망에 알린다.
 - **되돌아감은 늘 일어난다.** 우선순위가 높은 노드가 돌아오면 OVN이 곧바로 다시 그쪽으로 넘긴다(두 번째 짧은 끊김). OVN에
@@ -595,7 +603,8 @@ orbivisorctl fip delete web                                     # 붙어 있어�
   한다(아니면 409 `fip_not_routable`과 까닭). NIC 하나에 유동 IP 하나(409 `fip_in_use`), 템플릿에는 못 붙인다. 붙인 유동 IP가
   있는 네트워크를 라우터에서 빼거나 라우터 바깥을 바꾸면 409 `fip_in_use`(먼저 뗀다).
 - **상태**(`fip list`의 STATE, 웹의 칩): `unattached`(붙지 않음), `distributed n1`(분산 — 그 노드에서 바로 나감), `centralized`(중앙
-  — 게이트웨이 노드가 맡음, 까닭과 함께), `unrouted`(라우팅 안 됨 — 게이트웨이 후보가 없거나 경로가 끊김, 까닭과 함께).
+  — 게이트웨이 노드가 맡음, 까닭과 함께), `unrouted`(라우팅 안 됨 — 게이트웨이 후보가 없거나 경로가 끊김, 까닭과 함께). 붙은 VM을
+  읽을 수 없는 사용자에게는 까닭에 VM 이름 대신 "the target VM"이, 루트 `cluster.read`가 없으면 노드 이름이 빈다.
 - **분산과 중앙은 저절로 고른다.** VM이 도는 노드(마이그레이션 중이면 두 노드 모두)가 **바깥 네트워크의 physnet을 준비됨으로
   알리면 분산**이다: NAT를 VM의 노드가 하고 물리 망에 유동 IP의 MAC으로 NIC MAC을 알리므로, 트래픽이 게이트웨이 노드를 지나지
   않는다(게이트웨이 대역폭이 병목이 되지 않고 게이트웨이 넘김에 끊기지 않는다). 아니면(꺼진 VM, physnet이 없는 노드) **중앙**:
@@ -610,7 +619,7 @@ orbivisorctl fip delete web                                     # 붙어 있어�
   IP를 물려받지 않는다. 원격 복제의 받는 클러스터로도 가지 않는다.
 - **API.** `GET|POST /api/v1/floating-ips`(`{"name"?: …, "spec": {"network": "ext", "address"?: …, "target"?: {"vm": "<id>",
   "mac": "52:54:…"}, "folder"?: …}}`), `GET|PATCH|DELETE /api/v1/floating-ips/{name}`(`PATCH {"target": {…} | null,
-  "description": …}`). 읽기 보기에 `state`와 `vm_name`.
+  "description": …}`). 읽기 보기에 `state`와 `vm_name`. 목록은 붙은 VM만 읽는다(유동 IP가 없으면 다른 것을 읽지 않음).
 - 포트 포워딩(주소 하나의 포트를 여러 VM에)·IPv6 유동 IP는 없다.
 
 ### IPv6: SLAAC·DHCPv6·RA
@@ -662,6 +671,7 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
 | 보낸 IP 위조 | 막지 않는다(보낸 MAC만) | **막는다**(포트 보안이 MAC·IP 모두) |
 | 규칙에서 허용을 빼면 | 맺은 연결은 conntrack 항목이 끝날 때까지 간다 | **맺은 연결도 끊긴다**(OVN은 요청 방향을 늘 ACL에 다시 비추고, 막히면 그 연결의 응답도 막음) |
 | IPv6 이웃 찾기·RA(NS·NA·RS·RA·MLD) | 들어오기는 늘 허용, 나가기는 규칙을 따름 | **양 방향 늘 허용** |
+| IP가 아니고 ARP도 아닌 프레임(LLDP, 다른 이더타입) | 들어오기는 막음(기본 막기가 ARP 말고 모두) | **들어오기도 지나감**(OVN 기본 막기는 `ip`만) |
 | 노드 요구 | `status.firewall`(nftables), 409 `firewall_unsupported` | chassis면 된다 |
 | 적용 | 노드 에이전트(0.5초 모아, 60초마다) | 리더 OvnSync(0.5초 모아, 60초마다) |
 
@@ -687,19 +697,21 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
 |---|---|
 | 공급자 네트워크 만들기·바꾸기·지우기, 노드 `sdn`(physnet·게이트웨이) | 루트 `cluster.admin` |
 | 라우터 만들기·바꾸기·지우기 | 라우터(만들기는 넣을 폴더)의 `network.config` |
-| 라우터 인터페이스 더하기 | + 그 네트워크의 `network.assign`(NIC 붙이기와 같은 권한) |
+| 라우터 인터페이스 더하기 | + 그 네트워크의 `network.config` — 그 네트워크의 모든 VM 기본 경로(DHCP `router`)가 라우터로 가므로 NIC 붙이기(`network.assign`)보다 크다 |
 | 라우터 바깥 정하기 | + 바깥 네트워크의 `network.assign` |
-| 유동 IP 만들기·지우기 | 유동 IP 폴더의 `network.config` + 바깥 네트워크의 `network.assign` |
+| 유동 IP 만들기·지우기 | 유동 IP 폴더의 `network.config` + 바깥 네트워크의 `network.assign`(주소를 직접 주면 유동 IP 범위 안 — 밖은 루트 `cluster.admin`) |
 | 유동 IP 붙이기·떼기 | 유동 IP의 `network.config` + 대상 VM의 `vm.config`(떼기는 앞의 것만) |
-| 보기 | `system.read`(라우터·유동 IP·네트워크). 다른 폴더의 VM은 이름을 감춘다 |
+| 보기 | `system.read`(라우터·유동 IP·네트워크). 다른 폴더의 VM은 이름을 감추고, 루트 `cluster.read`가 없으면 노드 이름도 감춘다 |
 | 보안 그룹 | 지금 그대로(만들고 바꾸기는 admin) |
 
 - 라우터·유동 IP에도 객체 grant를 준다(`/api/v1/grants`의 대상 `router/<id>`·`floating-ip/<id>`, 웹의 행마다 권한 서랍).
 - **할당량.** 네트워크 폴더에 `routers`·`floating_ips`(하위 트리의 수)를 둔다 — 공인 주소가 테넌트에게 가장 귀한 것이라서다.
   VM 폴더에 주면 400("quota routers cannot be set on a vm folder"), 넘으면 409 `quota_exceeded`(Raft 상태 머신이 커밋 순서대로
-  센다). API `PATCH /api/v1/folders/{id}`의 `quota: {"routers": 2, "floating_ips": 8}`, 웹 네트워크 폴더 상세의 할당량 탭.
+  센다). `orbivisorctl folder quota set network:/tenant --routers 2 --floating-ips 8`(`folder usage network:/tenant`), API `PATCH
+  /api/v1/folders/{id}`의 `quota: {"routers": 2, "floating_ips": 8}`, 웹 네트워크 폴더 상세의 할당량 탭.
   `GET /api/v1/folders/{id}/usage`가 둘을 센다.
-- **옮기기.** `POST /api/v1/folders/{id}/members {"items": [{"kind": "router", "key": "r1"}, {"kind": "floating-ip", "key": "web"}]}`.
+- **옮기기.** `orbivisorctl folder members move network:/tenant router/r1 fip/web`, API `POST /api/v1/folders/{id}/members {"items": [{"kind": "router", "key":
+  "r1"}, {"kind": "floating-ip", "key": "web"}]}`. 객체 grant도 CLI가 받는다(`orbivisorctl grant add --user bob --role operator --on router/r1`).
   네트워크·유동 IP의 할당량 차원 `networks`·`ips`는 계획 67이다.
 
 ### MTU: 바깥에서 들어오는 큰 패킷
@@ -830,10 +842,11 @@ ip -br link show master vmbr1                                                # �
   하드웨어 장애의 넘김 시간, 실제 물리 VLAN 스위치, 게스트 OS의 응답(게스트 없는 VM), **여러 chassis에 걸친 보안 그룹**은 보지
   않았다(보안 그룹의 같은 뜻은 노드 하나의 `ovn` 작업이 nftables와 견줘 본다).
 - **라우터·유동 IP 화면은 10초마다 다시 읽는다**(watch가 아님). 다른 사람이 바꾼 것은 그만큼 늦게 보인다.
-- **CLI에 없는 것.** `folder quota set`에 `routers`·`floating_ips` 칸이 없고, `folder members move`·`grant`가 `router/…`·
-  `floating-ip/…`를 받지 않는다 — API나 웹(할당량 탭, 행마다 권한 서랍)으로 한다. 웹의 폴더 내용 탭·끌어 놓기도 아직
-  네트워크만이라 라우터·유동 IP 옮기기는 API(`POST /folders/{id}/members`)다. `vm get`은 NIC의 유동 IP를 따로 보이지 않는다
-  (웹 하드웨어 표·`fip list`).
+- 웹의 폴더 내용 탭·끌어 놓기는 아직 네트워크만이라 라우터·유동 IP 옮기기는 CLI·API다. `vm get`은 NIC의 유동 IP를 따로 보이지
+  않는다(웹 하드웨어 표·`fip list`).
+- **보안 그룹 쓰기가 실패하면.** 한 그룹 목록의 Port_Group 쓰기가 계속 실패하면(같은 이름의 남의 Port_Group 따위) 그 목록을 쓰는
+  네트워크의 포트 쓰기가 모두 실패한다(그 네트워크의 새 VM은 포트가 없어 켜지지 않음 — 닫힌 쪽으로 실패). 이미 있는 목록의 규칙을
+  더 좁히는 쓰기가 실패하면 그 목록의 포트는 옛(더 넓은) 규칙에 남는다. 둘 다 `sdn status`의 동기화 오류로 보인다.
 - **게이트웨이 표에 chassis 상태가 없다**(`sdn status`가 보인다). 넘김 알림은 계획 67이다.
 - "10초 안에 포트가 바인딩되지 않음" 경고는 orbivisord 로그에만 있고 API·웹에는 없다.
 - 주소가 있는 NIC의 빠진 체계 채우기(`--fill`)는 CLI만이다. 주소 없는 NIC는 서브넷을 더할 때 서버가 채운다.

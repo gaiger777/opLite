@@ -80,6 +80,16 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
 /// 지운다. opld가 멈춘 채 죽었으면 다시 붙을 때 이 표시를 보고 이어서 실행한다.
 const PAUSED_MARK: &str = "paused-by-opl";
 
+/// QMP를 오래 붙잡는 작업(메모리 스냅샷 등 — [`QemuHypervisor::busy`])이 돈다는 표시 파일(내용은 작업 이름). VM 실행
+/// 디렉터리에 작업 전에 쓰고 끝나면 지운다. 그 작업 중 orbivisord가 다시 켜지면 메모리의 표시는 없지만 QEMU는 여전히
+/// 답하지 않으므로, 다시 붙지 못한 VM에 이 표시가 있고(`SNAPSHOT_TIMEOUT` 안) QMP가 답하지 않으면 응답 없음이 아니라
+/// 바쁨이다(계획 66 리뷰 1 #4 — 그렇지 않으면 멈추라는 요청이 `acpi_timeout` 뒤 저장 중인 VM을 강제로 끈다).
+const BUSY_MARK: &str = "busy-op";
+/// [`BUSY_MARK`]에 쓰는 작업 이름(표시 파일의 글을 `&'static str`로 되돌린다)
+const BUSY_OPS: [&str; 3] = ["snapshot-save", "snapshot-load", "snapshot-delete"];
+/// 다시 붙지 못한 VM에 [`BUSY_MARK`]가 있을 때 QMP가 답하는지 보는 한도(답하면 작업이 끝났고 표시는 남은 것이다)
+const BUSY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// 라이브 마이그레이션을 받는 QEMU라는 표시 파일(내용은 마이그레이션 Task id). `start_incoming`이
 /// QEMU를 띄우기 전에 실행 디렉터리에 쓰고 `finish_incoming`이 지운다. QEMU가 끝나면 실행 디렉터리와
 /// 함께 사라진다.
@@ -193,16 +203,43 @@ pub struct QemuHypervisor {
     busy: Mutex<HashMap<Uuid, &'static str>>,
 }
 
-/// [`QemuHypervisor::busy`]가 돌려주는 표시. 버리면(작업이 끝나거나 실패하거나 취소되면) 지운다.
+/// [`QemuHypervisor::busy`]가 돌려주는 표시. 버리면(작업이 끝나거나 실패하거나 취소되면) 메모리의 표시와 표시 파일
+/// ([`BUSY_MARK`])을 지운다.
 struct BusyGuard<'a> {
     map: &'a Mutex<HashMap<Uuid, &'static str>>,
     id: Uuid,
+    mark: Option<PathBuf>,
 }
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
         self.map.lock().unwrap().remove(&self.id);
+        if let Some(mark) = &self.mark
+            && let Err(e) = remove_if_exists(mark)
+        {
+            tracing::warn!(id = %self.id, error = %e, "cannot remove busy mark");
+        }
     }
+}
+
+/// 실행 디렉터리 `dir`의 [`BUSY_MARK`]가 `SNAPSHOT_TIMEOUT` 안에 쓰였으면 그 작업 이름
+fn busy_mark(dir: &Path) -> Option<&'static str> {
+    let path = dir.join(BUSY_MARK);
+    let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
+    // 시계가 뒤로 갔으면(mtime이 미래) 새 표시로 본다.
+    if modified.elapsed().is_ok_and(|age| age >= SNAPSHOT_TIMEOUT) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    BUSY_OPS.into_iter().find(|op| *op == text.trim())
+}
+
+/// QMP 소켓이 곧 답하는지(인사와 `qmp_capabilities`). 메모리 스냅샷 작업 중의 QEMU는 BQL을 쥐어 답하지 않는다.
+async fn qmp_answers(socket: &Path) -> bool {
+    matches!(
+        tokio::time::timeout(BUSY_PROBE_TIMEOUT, QmpClient::connect(socket)).await,
+        Ok(Ok(_))
+    )
 }
 
 /// 복제 회차 하나를 받는 QEMU(`-machine none`)
@@ -931,11 +968,21 @@ impl QemuHypervisor {
     /// 동안 상태 조회는 QMP를 묻지 않고 [`RuntimeStatus::Busy`]를 알린다(응답 없음으로 보이지 않게,
     /// 답하지 않을 요청이 쌓이지 않게). 작업의 제한 시간(`SNAPSHOT_TIMEOUT`)을 넘겨 돌아오면 표시가
     /// 사라지므로 그 뒤로 QEMU가 여전히 답하지 않으면 다시 응답 없음이다.
+    ///
+    /// 표시는 실행 디렉터리의 [`BUSY_MARK`]에도 남겨 orbivisord가 작업 중 다시 켜져도 바쁨을 안다.
     fn busy(&self, id: Uuid, op: &'static str) -> BusyGuard<'_> {
+        debug_assert!(BUSY_OPS.contains(&op), "{op}");
         self.busy.lock().unwrap().insert(id, op);
+        let mark = self.paths(id).ok().map(|p| p.dir.join(BUSY_MARK));
+        if let Some(path) = &mark
+            && let Err(e) = std::fs::write(path, op)
+        {
+            tracing::warn!(%id, error = %e, "cannot write busy mark");
+        }
         BusyGuard {
             map: &self.busy,
             id,
+            mark,
         }
     }
 
@@ -946,13 +993,27 @@ impl QemuHypervisor {
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
         let Some(handle) = self.handle(id) else {
             // 살아 있지만 QMP에 붙지 못한 VM도 드러내야 reconciler가 놓치지 않는다.
-            return match liveness(&self.paths(id)?.pidfile) {
+            let paths = self.paths(id)?;
+            return match liveness(&paths.pidfile) {
                 Liveness::Dead => Ok(None),
-                Liveness::Alive(pid) => Ok(Some(ActualState {
-                    id,
-                    pid,
-                    status: RuntimeStatus::Other("unresponsive".into()),
-                })),
+                Liveness::Alive(pid) => {
+                    // orbivisord가 메모리 스냅샷 작업 중 다시 켜졌다: QEMU가 아직 답하지 않으면 바쁨이다. 답하면 작업은
+                    // 끝났고 표시는 옛 프로세스가 남긴 것이다(지우고 보통처럼 다시 붙게 둔다).
+                    let status = match busy_mark(&paths.dir) {
+                        Some(op) if !qmp_answers(&paths.qmp_socket).await => {
+                            RuntimeStatus::Busy(op)
+                        }
+                        mark => {
+                            if mark.is_some()
+                                && let Err(e) = remove_if_exists(&paths.dir.join(BUSY_MARK))
+                            {
+                                tracing::warn!(%id, error = %e, "cannot remove busy mark");
+                            }
+                            RuntimeStatus::Other("unresponsive".into())
+                        }
+                    };
+                    Ok(Some(ActualState { id, pid, status }))
+                }
                 Liveness::Unknown => Err(DriverError::Io(std::io::Error::other(format!(
                     "cannot tell whether QEMU of VM {id} is running"
                 )))),
@@ -967,7 +1028,17 @@ impl QemuHypervisor {
             }));
         }
         let status = match tokio::time::timeout(QMP_TIMEOUT, handle.qmp.query_status()).await {
-            Err(_) => return Err(DriverError::Timeout("QMP query-status")),
+            // 묻는 사이에 작업이 시작됐거나(리뷰 1 M-7) 옛 프로세스의 작업이 아직 돈다(#4).
+            Err(_) => {
+                return match self.busy_with(id).or_else(|| busy_mark(&handle.paths.dir)) {
+                    Some(op) => Ok(Some(ActualState {
+                        id,
+                        pid: handle.pid,
+                        status: RuntimeStatus::Busy(op),
+                    })),
+                    None => Err(DriverError::Timeout("QMP query-status")),
+                };
+            }
             Ok(Ok(RunState::Running)) => RuntimeStatus::Running,
             Ok(Ok(RunState::Prelaunch | RunState::Paused)) => RuntimeStatus::Paused,
             Ok(Ok(RunState::Shutdown)) => RuntimeStatus::Other("shutdown".into()),
@@ -978,6 +1049,12 @@ impl QemuHypervisor {
             Ok(Err(QmpError::Disconnected)) => return Ok(None),
             Ok(Err(e)) => return Err(e.into()),
         };
+        // QEMU가 답했으니 메모리에 표시가 없는 바쁨 표시 파일은 옛 프로세스가 남긴 것이다.
+        if self.busy_with(id).is_none()
+            && let Err(e) = remove_if_exists(&handle.paths.dir.join(BUSY_MARK))
+        {
+            tracing::warn!(%id, error = %e, "cannot remove busy mark");
+        }
         // 실행 중인데 지금 멈춰 두지 않았으면 표시는 남은 것이다(이어서 실행했지만 지우지 못했거나
         // 누가 `cont`함). 그대로 두면 나중에 다른 까닭으로 멈춘 VM을 다시 붙을 때 이어서 실행한다.
         if status == RuntimeStatus::Running && !self.pausing.lock().unwrap().contains(&id) {
@@ -7941,9 +8018,67 @@ time.sleep(60)
         assert_eq!(hv.list().await.unwrap()[0].status, busy);
         assert!(asked.elapsed() < Duration::from_secs(1));
 
+        // 표시 파일도 남는다(리뷰 1 #4 — orbivisord가 다시 켜져도 안다).
+        let mark = hv.paths(id).unwrap().dir.join(BUSY_MARK);
+        assert_eq!(std::fs::read_to_string(&mark).unwrap(), "snapshot-save");
+
         save.abort();
         let _ = save.await;
         assert_eq!(hv.busy_with(id), None);
+        assert!(!mark.exists());
+    }
+
+    /// 리뷰 1 #4: 메모리 스냅샷 작업 중 orbivisord가 다시 켜져 다시 붙지 못한 VM은 표시 파일이 있고 QMP가 답하지 않으면
+    /// 바쁨이다(응답 없음이면 멈추라는 요청이 `acpi_timeout` 뒤 저장 중인 VM을 강제로 끈다). 오래된 표시는 보지 않는다.
+    #[tokio::test]
+    async fn a_restarted_driver_reports_a_marked_vm_busy() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
+        let vm = spec();
+        let dir = cfg.run_dir.join("vm").join(vm.id.to_string());
+        let qemu = unresponsive_vm(&dir).await;
+        std::fs::write(dir.join(BUSY_MARK), "snapshot-save").unwrap();
+        let busy = ActualState {
+            id: vm.id,
+            pid: qemu.id().unwrap(),
+            status: RuntimeStatus::Busy("snapshot-save"),
+        };
+        assert_eq!(hv.inspect(vm.id).await.unwrap(), Some(busy.clone()));
+        assert_eq!(hv.list().await.unwrap(), vec![busy]);
+        // SNAPSHOT_TIMEOUT보다 오래된 표시는 남은 것이다: 예전처럼 응답 없음
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(BUSY_MARK))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - SNAPSHOT_TIMEOUT - Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            hv.inspect(vm.id).await.unwrap().unwrap().status,
+            RuntimeStatus::Other("unresponsive".into())
+        );
+    }
+
+    /// 리뷰 1 M-7·#4: 붙은 VM의 `query-status`가 시간을 넘겼을 때 그 사이 작업이 시작됐거나 표시 파일이 있으면 바쁨이다.
+    /// QMP가 다시 답하면 메모리 표시가 없는 표시 파일은 지운다.
+    #[tokio::test]
+    async fn a_query_timeout_with_a_busy_mark_is_busy() {
+        let tmp = short_tempdir();
+        let (hv, id, fake, _qemu) = running_vm(tmp.path()).await;
+        let mark = hv.paths(id).unwrap().dir.join(BUSY_MARK);
+        std::fs::write(&mark, "snapshot-delete").unwrap();
+        *fake.delay.lock().unwrap() = Some(("query-status", QMP_TIMEOUT + Duration::from_secs(2)));
+        assert_eq!(
+            hv.inspect(id).await.unwrap().unwrap().status,
+            RuntimeStatus::Busy("snapshot-delete")
+        );
+        *fake.delay.lock().unwrap() = None;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(
+            hv.inspect(id).await.unwrap().unwrap().status,
+            RuntimeStatus::Running
+        );
+        assert!(!mark.exists());
     }
 
     /// 플리싱 필터를 끼우려고 게스트를 멈춘 동안은 지금 멈춰 둔 VM으로 둔다(그 사이 다시 붙기·`resume_left_stopped`가

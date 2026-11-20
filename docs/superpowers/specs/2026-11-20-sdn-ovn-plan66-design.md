@@ -261,6 +261,7 @@ nftables 쪽은 "방화벽 없이 도는 순간이 없다"(켜기 직전 `Firewa
 | 보낸 IP 위조 | 막지 않음(MAC만) | 막음(포트 보안 — 계획 65) |
 | 규칙에서 허용을 빼면 | 맺은 연결은 conntrack 항목이 끝날 때까지 감 | **맺은 연결도 끊김**(요청 방향이 ACL을 다시 보고 `ct_mark.blocked` — §4) |
 | IPv6 NS·NA·RS·RA·MLD | 들어오기는 늘 허용, 나가기는 규칙을 따름 | 양 방향 늘 허용(OVN 65532) |
+| IP도 ARP도 아닌 프레임(LLDP, 다른 이더타입) | 들어오기 막음(체인 끝 `drop`은 ARP 말고 모두) | 들어오기도 지나감(기본 막기 ACL이 `outport == @PG && ip`) — 리뷰 1 M-1, 바꾸지 않고 적어 둠 |
 | 노드 요구 | `status.firewall`(nftables) — 스케줄러·409 `firewall_unsupported` | chassis면 됨(위 둘은 단순 NIC에만) |
 | 적용 시각 | 노드 에이전트 0.5초 모아, 60초 다시 | OvnSync 0.5초 모아, 60초 다시 |
 | 없는 그룹 | 찾은 그룹의 규칙 뒤 들어오기·나가기 모두 막기 | 같음(우선순위 1001 `drop`) |
@@ -277,7 +278,7 @@ nftables 쪽은 "방화벽 없이 도는 순간이 없다"(켜기 직전 `Firewa
 |---|---|
 | 공급자 네트워크 만들기·바꾸기·지우기, 노드 `sdn`(physnet·게이트웨이) | 루트 `cluster.admin` |
 | 라우터 만들기·바꾸기·지우기 | 라우터 폴더의 `network.config` |
-| 라우터 인터페이스 더하기 | + 그 네트워크의 `network.assign`(NIC 붙이기와 같은 권한) |
+| 라우터 인터페이스 더하기 | + 그 네트워크의 `network.config`(리뷰 1 #1 — 처음 설계의 `network.assign`은 그 네트워크 모든 VM의 기본 경로를 남이 가져가게 했다) |
 | 라우터 외부 정하기 | + 외부 네트워크의 `network.assign` |
 | 유동 IP 만들기·지우기 | 유동 IP 폴더의 `network.config` + 외부 네트워크의 `network.assign` |
 | 유동 IP 붙이기·떼기 | 유동 IP의 `network.config` + 대상 VM의 `vm.config`(떼기는 앞의 것만) |
@@ -517,3 +518,19 @@ nftables 쪽은 "방화벽 없이 도는 순간이 없다"(켜기 직전 `Firewa
 ### 단계 밖 수정
 
 - **메모리 스냅샷 중 "응답 없음"(계획 64 §18의 브라우저 e2e 실패, 스테이지 7 탐침에서 다시 남).** QEMU는 `snapshot-save`·`snapshot-load`·`snapshot-delete` 작업을 BQL을 쥔 채 하므로 끝날 때까지 QMP가 답하지 않는다. 작업자는 그것을 `query-status` 시간 초과 → `Other("unresponsive")`로 보고 "VM is unresponsive"를 남겼고, 끄라는 요청이 있으면 ACPI 실패 → `acpi_timeout` 뒤 강제 종료로 넘어갔다. CI 로그에서 VM을 실제로 죽인 것은 작업자가 스스로가 아니라 Playwright가 60초 기다림을 넘긴 뒤 시험 정리의 `vm stop web --force`였다(저장 자체가 2분 넘게 끝나지 않음 — QEMU 쪽 느림의 까닭은 로그로 못 박지 못함). 고침: 드라이버가 그 작업 동안 VM을 바쁨으로 표시하고 조회는 QMP를 묻지 않고 `RuntimeStatus::Busy(작업 이름)`을 알린다. 작업자는 바쁜 VM을 실행 중으로 두고 오류를 남기지 않으며 다시 붙기·이어서 실행·디스크 배타 바꾸기를 하지 않고, 끄라는 요청은 ACPI도 `acpi_timeout`도 세지 않고 미룬다(사용자의 강제 정지와 HA 리스를 잃은 강제 종료는 그대로). `repin`은 건너뛰고, 측정기는 `Running`·`Paused`만 재므로 건너뛰며, 블록 스냅샷의 멈춤 판정은 바쁨을 오류로 본다. 작업이 제한 시간(`SNAPSHOT_TIMEOUT`)을 넘겨 돌아오면 표시가 사라지고 보통 처리로 돌아간다. 시험: 드라이버 `memory_snapshot_reports_busy_without_asking_qmp`(가짜 QMP), 작업자 `busy_vm_is_neither_unresponsive_nor_forced_off`(mock), 실제 QEMU `slow_memory_snapshot_is_not_reported_unresponsive`(저장 중 QEMU를 SIGSTOP으로 40초 붙잡음 — 고치기 전에는 "VM is unresponsive"로 실패).
+
+### 리뷰 1에서 고친 것 (서버)
+
+- **#1 라우터 인터페이스는 그 네트워크의 `network.config`**(§12 표의 `network.assign`을 바꿈): 인터페이스가 되면 OvnSync가 그 네트워크 DHCP의 `router`를 라우터로 두므로 NIC 붙이기 권한(`network.assign`)만 받은 테넌트가 남의 네트워크 기본 경로를 자기 VM으로 돌리고(정적 경로 `0.0.0.0/0`) Raft 키 `router-net`으로 주인의 라우터도 막을 수 있었다. 만들기·`PATCH`의 새 인터페이스 네트워크에 `Authz::require_networks_with(NetworkConfig)`, 외부 네트워크는 그대로 `network.assign`. 시험 `review1_router_interfaces_and_chosen_addresses`.
+- **#2 고른 주소는 유동 IP 범위 안**(§9.5의 "`floating_pools`(없으면 `pools`)에서"를 지킴): `fip create --ip`·라우터 `external.ips`가 서브넷 안 어디든 되어 테넌트가 물리 망의 다른 장비 주소(GARP로 가로채기)를 잡을 수 있었다. 순수 `ipam::in_floating_range`(유동 IP 풀, 없으면 풀, 없으면 CIDR)로 보고 밖이면 400, 루트 `cluster.admin`만 밖을 고른다(Neutron의 `floating_ip_address`가 관리자만인 것과 같다). 공급자 네트워크에 VM NIC를 곧바로 붙이는 `ip=`는 `network.assign`이면 서브넷 안 어디든 되는 그대로 두고 가이드에 "공급자 네트워크의 `network.assign`은 믿는 테넌트에게만"을 적었다(브리지 네트워크 NIC와 같은 힘 — 막으면 계획 65 NIC 주소 규칙이 둘로 갈린다).
+- **#3 physnet 브리지 바꾸기도 409 `physnet_in_use`**: 같은 physnet의 브리지만 바꾸면 `removed`에 들지 않아 에이전트가 도는 VM의 veth를 다른 브리지(다른 L2)로 옮겼다. "빠지거나 브리지가 바뀌는 physnet"을 본다(스테이지 5 보고의 "브리지만 바꾸는 것은 막지 않는다"를 뒤집음). 시험 `node_sdn_settings`에 한 줄.
+- **#4 바쁨 표시를 파일로도**: `QemuHypervisor::busy`가 VM 실행 디렉터리에 `busy-op`(작업 이름)을 쓰고 표시를 버릴 때 지운다. 다시 붙지 못한 살아 있는 VM(orbivisord가 저장 중 다시 켜짐)에 표시가 있고 `SNAPSHOT_TIMEOUT` 안이며 QMP가 1초 안에 답하지 않으면(`qmp_capabilities`가 BQL에 막힘) `Busy`다 — 답하면 작업이 끝난 것이므로 표시를 지우고 예전처럼 다시 붙는다. 붙은 VM의 `query-status`가 시간을 넘기면 메모리 표시·파일 표시를 다시 보고 `Busy`(M-7도 함께), 답하면 메모리에 없는 파일 표시를 지운다. `query-jobs`로 묻는 길은 고르지 않았다: 작업 중의 QEMU는 `query-jobs`에도 답하지 않는다(같은 BQL). 남는 것: 옛 프로세스가 맡던 작업은 끝나도 누가 `job-dismiss`하지 않는다(QEMU에 끝난 작업 하나가 남음 — 다음 `snapshot-save`의 job-id가 달라 해가 없다). 시험 `a_restarted_driver_reports_a_marked_vm_busy`·`a_query_timeout_with_a_busy_mark_is_busy`·`memory_snapshot_reports_busy_without_asking_qmp`(표시 파일).
+- **#5 여러 노드 시험**: 캡처는 tcpdump의 `listening on`을 기다린 뒤 동작하고(고정 2초 잠 대신), 한 번 보던 확인(동서 Geneve, SNAT veth, tap)은 `captured_until`로 세 번까지 다시 본다. 넘김 상한 15초 → 60초(잰 값은 `PROBE` 줄 그대로). M-10도: 청소에 `ip link del oplextr`, 바꾼 `bridge-nf-call-*` sysctl을 `Drop`에서 되돌림.
+- **웹 I1 서버 쪽**: 라우터 보기의 NB 읽기를 `read_ops`(12개 표) 대신 `Logical_Router_Port` 한 표의 `name·status·external_ids`로(`nb::hosting_select`·`parse_hosting`, `GET /routers/{key}`는 그 라우터 포트 하나). `GET /floating-ips`는 유동 IP가 없으면 다른 목록을 읽지 않고, 있으면 붙은 VM만 id로 읽는다(`World::load_for_fips`). 시험 `the_hosting_read_selects_only_gateway_ports`.
+- **M-4 이름 감추기**: 유동 IP 상태의 까닭은 VM을 읽을 수 없으면 "the target VM", 루트 `cluster.read`가 없으면 `distributed.node`·`centralized` 까닭·`gateways[].node`·`hosting`의 노드 이름이 빈다(순위·주인 표시는 그대로). 시험 `fip_reasons_hide_unreadable_vm_names`와 통합 시험.
+- **M-5 라우터 지우기**: `If-Match`가 없어도 읽은 리비전으로 지운다(그새 인터페이스가 더해졌으면 함께 지우지 않음). 나머지 경합(라우터 `PATCH`의 유동 IP 검사, `check_subnet_unused`·`check_network_unused`)은 계획 65 m-4와 같은 꼴로 남긴다.
+- **M-6 다시 고르기**: Raft 주소 겹침을 다시 고르기로 받는 것은 API가 고른 체계가 있을 때만(`auto_picked`) — 준 주소의 겹침은 곧바로 409 `ip_in_use`(전에는 `PATCH`가 6번 돌고 `busy`). 시험 `only_auto_picked_external_addresses_retry`. "둘째 IPv4 서브넷"은 고치지 않음(아래).
+- **웹 M6**: `resources.rs` 공급자 네트워크 경고의 줄바꿈 빈칸 18개를 `\` 이음으로(시험 한 줄).
+- **웹 M4 서버·CLI**: 서버의 라우터·유동 IP 폴더 옮기기는 스테이지 5에 이미 있었다. CLI `folder members move … router/NAME fip/NAME`, `grant … --on router/NAME|floating-ip/NAME`(`perm check`도), `folder quota set network:/T --routers N --floating-ips N`, `folder usage network:/T`(라우터·유동 IP 줄)를 더했다(스테이지 8 보고의 CLI 빈자리를 메움).
+- **적어만 둔 것**: M-1(OVN 기본 막기가 `ip`만 — §11.4 표·가이드 표에 줄을 더함; `!arp && !rarp`로 바꾸면 단순 NIC와 같아지지만 NB의 모든 목록 ACL이 바뀌고 GitHub 탐침의 같은 뜻 비교를 다시 해야 해서 이번에는 바꾸지 않음), M-2(한 목록 Port_Group의 실패가 그 네트워크 포트 쓰기를 모두 막음 — 닫힌 쪽 실패, 가이드 한계에), M-3(있는 목록의 규칙을 좁히는 쓰기가 실패하면 옛 규칙에 남음 — 가이드 한계에, `sdn status` 동기화 오류로 보임), M-8(디스크만의 `transaction`·`snapshot_save_with_bitmap`·`blockdev_del`은 바쁨 표시를 하지 않음 — 보통 짧고, 표시하면 끄기 요청이 그만큼 미뤄진다; 느린 qcow2에서 한 번 "응답 없음"이 보일 수 있다), M-9(돌던 VM의 `snapshot-delete` 중 보통 끄기는 끝날 때까지 말없이 미뤄짐 — 작업자 로그 "VM is busy; stopping it after the operation"만).
+- **틀린 지적**: M-6의 "`pick_address`가 첫 IPv4 서브넷만 봄"은 고칠 것이 없다 — 네트워크는 체계마다 서브넷이 하나다(`NetworkSpec` 검증 "a network can have at most one IPv4 and one IPv6 subnet").

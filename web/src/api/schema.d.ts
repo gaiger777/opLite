@@ -961,7 +961,8 @@ export interface paths {
         put?: never;
         /**
          * 유동 IP를 만든다(계획 66 §9.5): 폴더의 `network.config`와 공급자 네트워크의 `network.assign`, 붙이면 그 VM의
-         *     `vm.config`. 주소는 API가 유동 IP 풀(없으면 풀)의 IPv4에서 고른다(준 주소는 서브넷 안의 빈 IPv4). 공급자 네트워크가
+         *     `vm.config`. 주소는 API가 유동 IP 풀(없으면 풀)의 IPv4에서 고른다(준 주소는 서브넷 안의 빈 IPv4이고, 루트
+         *     `cluster.admin`이 아니면 그 범위 안 — 아니면 400). 공급자 네트워크가
          *     아니면 400, 주소는 409 `ip_in_use`·`ip_exhausted`, 붙일 NIC가 라우팅되지 않으면 409 `fip_not_routable`, 이미 유동 IP가
          *     붙은 NIC는 409 `fip_in_use`, 폴더 할당량 `floating_ips`는 409 `quota_exceeded`.
          */
@@ -2135,8 +2136,9 @@ export interface paths {
         get: operations["list_routers"];
         put?: never;
         /**
-         * 라우터를 만든다(계획 66 §9): 폴더의 `network.config`, 인터페이스·외부 네트워크마다 `network.assign`. 외부 주소는 API가
-         *     외부 네트워크의 체계마다 고른다(유동 IP 풀이 있으면 거기서만, 없으면 풀 — 준 주소는 서브넷 안의 빈 주소). 옛 노드가
+         * 라우터를 만든다(계획 66 §9): 폴더의 `network.config`, 인터페이스 네트워크마다 `network.config`, 외부 네트워크의
+         *     `network.assign`. 외부 주소는 API가 외부 네트워크의 체계마다 고른다(유동 IP 풀이 있으면 거기서만, 없으면 풀 — 준
+         *     주소는 서브넷 안의 빈 주소이고 루트 `cluster.admin`이 아니면 그 범위 안). 옛 노드가
          *     남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙·네트워크 검사는 400 `invalid_router`, 이미 다른
          *     라우터의 인터페이스인 네트워크는 409 `network_in_use`, 주소는 409 `ip_in_use`·`ip_exhausted`, 폴더 할당량
          *     `routers`는 409 `quota_exceeded`. 게이트웨이 후보가 없으면 만들고 `orbivisor-warning`으로 알린다.
@@ -2165,7 +2167,8 @@ export interface paths {
         head?: never;
         /**
          * 라우터의 설명·외부·인터페이스·경로를 바꾼다(`If-Match`로 리비전 확인, 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시
-         *     읽는다). 라우터의 `network.config`(경로표)와 새로 잇는 인터페이스·외부 네트워크의 `network.assign`. 유동 IP가 이
+         *     읽는다). 라우터의 `network.config`(경로표), 새로 잇는 인터페이스 네트워크의 `network.config`, 새 외부 네트워크의
+         *     `network.assign`. 유동 IP가 이
          *     라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라). 검사는 만들기와 같다.
          */
         patch: operations["patch_router"];
@@ -5443,7 +5446,7 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "distributed";
-            /** @description VM이 도는 노드(마이그레이션 중이면 둘, 쉼표로) */
+            /** @description VM이 도는 노드(마이그레이션 중이면 둘, 쉼표로). 루트 `cluster.read`가 없으면 빈 글 */
             node: string;
         } | {
             /** @enum {string} */
@@ -10581,7 +10584,7 @@ export interface components {
         RouterGateway: {
             /** @description NB의 분산 게이트웨이 포트를 지금 이 노드가 가졌다(`status:hosting-chassis`). NB를 읽지 않았으면 거짓 */
             active: boolean;
-            /** @description 노드 이름 */
+            /** @description 노드 이름(루트 `cluster.read`가 없으면 빈 글) */
             node: string;
             /**
              * Format: int32
@@ -10638,7 +10641,10 @@ export interface components {
             gateway_error?: string;
             /** @description 게이트웨이 후보의 순위(외부가 있을 때 — 우선순위가 있고 유지보수가 아니며 외부 physnet이 준비된 노드, 앞 5개) */
             gateways?: components["schemas"]["RouterGateway"][];
-            /** @description 분산 게이트웨이 포트를 지금 가진 노드(NB `status:hosting-chassis`). 없거나 NB를 읽지 않았으면 없다. */
+            /**
+             * @description 분산 게이트웨이 포트를 지금 가진 노드(NB `status:hosting-chassis`). 없거나 NB를 읽지 않았으면 없다. 루트
+             *     `cluster.read`가 없으면 빈 글이다.
+             */
             hosting?: string;
             /** @description NB를 읽지 못한 까닭 */
             live_error?: string;
