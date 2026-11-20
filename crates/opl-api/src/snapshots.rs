@@ -1038,6 +1038,7 @@ pub async fn clone_vm(
         &spec,
         &req.ips,
         &crate::ipam::readable(&state, Some(&principal)),
+        crate::ipam::chooses_any_ip(&state, Some(&principal)),
     )?;
     match &target {
         Some(pool) => state.authz.require_pool(&principal, &pool.name)?,

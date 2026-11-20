@@ -772,6 +772,7 @@ pub async fn create_network(
             ));
         }
     }
+    crate::routing::check_name_unreferenced(&state, &principal, &req.name)?;
     let mut warnings = Vec::new();
     if let Some(provider) = req.spec.provider() {
         let (_, networks) = state.cluster.list::<NetworkSpec>()?;
@@ -833,7 +834,7 @@ pub async fn delete_network(
     if network.spec.is_provider() {
         require_host_admin(&state, &principal, "deleting a provider network")?;
     }
-    crate::routing::check_network_unused(&state, &network)?;
+    crate::routing::check_network_unused(&state, &principal, &network)?;
     let (_, vms) = state.cluster.list::<VmSpec>()?;
     if let Some(vm) = vms
         .iter()

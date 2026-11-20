@@ -450,7 +450,10 @@ orbivisorctl network list
   아닌 이름, 게이트웨이 우선순위 1~1000(400 `invalid_node_sdn`). 위트니스·macOS 노드는 400, SDN 전은 409 `sdn_not_ready`.
   빠지거나 **브리지가 바뀌는** physnet을 쓰는 공급자 네트워크 NIC의 VM이 그 노드에서 돌거나 그리로 마이그레이션 중이면 409
   `physnet_in_use`(`details.vms`) — 브리지를 바꾸면 에이전트가 veth를 새 브리지로 옮겨 도는 VM이 다른 L2로 가므로 먼저 멈추거나
-  옮긴다. `cluster leave`는 매핑·veth·OVS 브리지도 뺀다.
+  옮긴다. **브리지만 바꾸는** physnet은 그 노드가 그 physnet으로 나가는 라우터의 게이트웨이 후보이거나(`details.routers`) 그
+  노드의 VM에 그 physnet의 유동 IP가 붙었을 때도(`details.floating_ips`) 409다 — physnet이 준비된 채라 OVN이 아무것도 옮기지
+  않고(BFD도 Geneve로 살아 있다) SNAT·유동 IP가 말없이 다른 L2로 가기 때문이다. 그럴 때는 physnet을 먼저 빼고(`--no-physnet` —
+  게이트웨이는 다음 후보로, 유동 IP는 중앙으로 넘어간다) 새 브리지로 다시 넣는다. `cluster leave`는 매핑·veth·OVS 브리지도 뺀다.
 - **공급자 네트워크 만들기·바꾸기·지우기는 루트 `cluster.admin`**(물리 망은 노드 자원 — 브리지 네트워크와 같다). 폴더는
   `network.assign`을 나눠 주는 자리일 뿐이다(Neutron의 공유 외부 네트워크). 같은 `(physnet, VLAN)`은 클러스터에 하나(409
   `physnet_conflict`). physnet이 준비된 노드가 없어도 만들 수 있고 경고(`orbivisor-warning`)가 나온다.
@@ -463,12 +466,21 @@ orbivisorctl network list
 - **DHCP는 기본 끔**(`dhcp=on`으로 켬). 물리 망에 DHCP 서버가 있으면 그것도 VM에 답하고, VM이 다른 주소를 받으면 포트 보안이
   막는다 — 그 VLAN에 다른 DHCP가 없을 때만 켠다. 켜면 기본 경로(`router` = 서브넷 게이트웨이)도 준다. MTU 기본은 **1500**
   (1280~9000, 물리 망에 맞춘다).
-- **VM을 곧바로 붙이기.** `--nic ext`처럼 붙이면 VM이 물리 망에 그대로 선다(주소는 `pool`에서, `network.assign` 권한 — 이때
-  `ip=`로 서브넷 안의 어느 빈 주소든 고를 수 있으므로, 공급자 네트워크의 `network.assign`은 믿는 테넌트에게만 준다). VM은
-  physnet이 준비된 노드에서만 돈다. 라이브 마이그레이션 동안(두 chassis 바인딩) OVN이 터널을 쓰므로 그 몇 초 동안 1442바이트보다
+- **VM을 곧바로 붙이기.** `--nic ext`처럼 붙이면 VM이 물리 망에 그대로 선다(주소는 `pool`에서, `network.assign` 권한). `ip=`로
+  고르는 주소도 **`pool` 안**(유동 IP 범위 밖)이어야 한다 — 루트 `cluster.admin`만 그 밖(서브넷 안)을 고른다(400 "only a cluster
+  administrator …"). 공급자 네트워크에서는 IPAM 주소가 포트 보안의 주소라, 아니면 유동 IP를 만들라고 `network.assign`을 받은
+  테넌트가 물리 망의 다른 장비(DNS·게이트웨이) 주소를 NIC 주소로 잡아 가로챌 수 있다(Neutron도 고정 IP 고르기는 관리자만).
+  이미 가진 주소와 오버레이 SDN 네트워크(계획 65)는 그대로다. VM은 physnet이 준비된 노드에서만 돈다. 라이브 마이그레이션 동안(두 chassis 바인딩) OVN이 터널을 쓰므로 그 몇 초 동안 1442바이트보다
   큰 패킷은 버려진다.
-- **지우기.** 라우터의 바깥이거나 유동 IP가 있으면 409 `network_in_use`(이름들). 라우터·유동 IP가 쓰는 서브넷 빼기는 409
-  `subnet_in_use`.
+- **IPv6와 물리 라우터의 RA.** 공급자 IPv6 서브넷의 NIC는 cloud-init에 고정 주소(`static6`, 물리 라우터 게이트웨이)와 함께
+  **`accept-ra: false`**를 받는다. 물리 라우터가 A 플래그 RA를 보내면 게스트가 SLAAC 주소를 하나 더 만들고, 그 주소로 나가는
+  패킷은 포트 보안(IPAM 주소만)이 막아 IPv6가 가끔 끊기기 때문이다(오버레이는 Orbivisor 라우터만 RA를 보내 이런 일이 없다).
+  cloud-init을 쓰지 않는 게스트는 그 NIC의 SLAAC를 끄거나, 물리 라우터가 SLAAC를 광고하는 망이면 서브넷에 `ipv6-mode=slaac`를
+  줘 IPAM 주소를 게스트가 만드는 EUI-64와 같게 한다.
+- **지우기.** 라우터의 바깥이거나 유동 IP가 있으면 409 `network_in_use`(읽을 수 있는 것은 이름, 나머지는 "N router(s) you
+  cannot see"처럼 수만). 라우터·유동 IP가 쓰는 서브넷 빼기는 409 `subnet_in_use`. 지운 네트워크 이름을 라우터·유동 IP가 아직
+  가리키면(지우기와 라우터 만들기가 겹침) 그 이름으로 새 네트워크를 만들 수 없다(409 `network_in_use` — 남의 라우터가 새
+  네트워크의 기본 경로가 되지 않게). 그 가리킴을 먼저 지운다.
 
 ### 라우터와 경로
 
@@ -484,6 +496,7 @@ orbivisorctl router create r1 --external ext --interface t1 --interface t2 --fol
 orbivisorctl router route add r1 192.168.50.0/24 10.10.0.254      # 정적 경로(다음 홉은 붙은 서브넷 안)
 orbivisorctl router route remove r1 192.168.50.0/24
 orbivisorctl router interface remove r1 t2
+orbivisorctl router detach t2                                     # 내 네트워크를 남의 라우터에서 떼기(네트워크의 network.config)
 orbivisorctl router external set r1 ext,snat=off                  # 같은 네트워크면 바깥 주소는 그대로
 orbivisorctl router external set r1 ext,ip=203.0.113.150          # 바깥 주소를 직접
 orbivisorctl router external clear r1
@@ -509,7 +522,10 @@ orbivisorctl router delete r1                                     # 인터페이
 (노드·노드 우선순위·순위·주인), "게이트웨이 노드 없음" 경고 띠, 물리 라우터에 둘 IPv6 경로.
 
 - **인터페이스.** 서브넷이 있는 오버레이 SDN 네트워크(공급자 아님)만 붙는다. 그 네트워크 서브넷의 **게이트웨이 주소가 라우터
-  포트의 주소**가 되므로 한 네트워크는 라우터 하나에만 붙는다(409 `network_in_use`). 한 라우터의 인터페이스·바깥 서브넷끼리
+  포트의 주소**가 되므로 한 네트워크는 라우터 하나에만 붙는다(409 `network_in_use` — 읽을 수 없는 라우터면 "a router you cannot
+  see"). 네트워크 주인(그 네트워크의 `network.config`)은 라우터를 읽을 수 없어도 `orbivisorctl router detach NET`(`DELETE
+  /api/v1/networks/{name}/router`)으로 뗀다 — 다른 폴더의 라우터에 이어 준 뒤 권한을 거뒀을 때 되찾는 길이다(그 길로 라우팅되는
+  유동 IP가 있으면 409 `fip_in_use`). 한 라우터의 인터페이스·바깥 서브넷끼리
   CIDR이 겹치면 400이다(폴더가 다른 네트워크는 같은 CIDR을 써도 되지만 같은 라우터에는 못 붙는다). 인터페이스 16개까지.
   인터페이스인 네트워크에 다른 인터페이스와 겹치는 서브넷을 더하면 400 `invalid_subnet`.
 - **바깥(external).** 공급자 네트워크 하나. 바깥 주소는 체계마다 하나이고 주지 않으면 서버가 `floating`(없으면 `pool`)에서
@@ -528,7 +544,10 @@ orbivisorctl router delete r1                                     # 인터페이
 - **API.** `GET|POST /api/v1/routers`, `GET|PATCH|DELETE /api/v1/routers/{name}`. 만들기는 `{"name": "r1", "spec":
   {"external": {"network": "ext", "snat": true}, "interfaces": [{"network": "t1"}], "routes": [{"destination": "192.168.50.0/24",
   "nexthop": "10.10.0.254"}], "folder": "<id>"}}`, `PATCH`는 보낸 칸만(`description`·`external`(null은 지우기)·`interfaces`·
-  `routes` — 목록은 통째로, `If-Match`). 읽기는 보기(`gateways`·`gateway_error`·`hosting`·`live_error`·`upstream_routes`)이고
+  `routes` — 목록은 통째로, `If-Match`). 경로나 바깥을 바꾸는 `PATCH`는 **모든 인터페이스 네트워크의 `network.config`**가
+  있어야 한다(경로·바깥은 그 네트워크들 모두의 길이다). 바깥 주소는 `external`을 보낸 `PATCH`만 채운다(설명만 바꾸는 `PATCH`가
+  바깥 네트워크에 새로 생긴 체계의 주소를 받지 않는다). 읽기는 보기(`gateways` — 후보마다 `online`(노드가 살아 있음) —
+  `gateway_error`·`hosting`·`live_error`·`upstream_routes`)이고
   `?live=false`면 OVN을 읽지 않는다. 지금 주인(`hosting`·`active`)은 OVN NB의 게이트웨이 포트 칸 셋만 읽는다(라우터 하나면 그
   포트 하나). 루트 `cluster.read`가 없는 사용자(폴더 테넌트)에게는 게이트웨이 노드 이름(`gateways[].node`·`hosting`)이 빈 글이다
   — 순위·우선순위·주인 표시는 보인다. `If-Match` 없이 지워도 읽은 리비전으로 지워, 그사이 인터페이스가 더해졌으면 지우지 않는다.
@@ -700,10 +719,12 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
 | 공급자 네트워크 만들기·바꾸기·지우기, 노드 `sdn`(physnet·게이트웨이) | 루트 `cluster.admin` |
 | 라우터 만들기·바꾸기·지우기 | 라우터(만들기는 넣을 폴더)의 `network.config` |
 | 라우터 인터페이스 더하기 | + 그 네트워크의 `network.config` — 그 네트워크의 모든 VM 기본 경로(DHCP `router`)가 라우터로 가므로 NIC 붙이기(`network.assign`)보다 크다 |
+| 라우터 경로·바깥 바꾸기 | + 모든 인터페이스 네트워크의 `network.config` |
+| 내 네트워크를 라우터에서 떼기 | 그 네트워크의 `network.config`(라우터 권한 없이 — `router detach`) |
 | 라우터 바깥 정하기 | + 바깥 네트워크의 `network.assign` |
 | 유동 IP 만들기·지우기 | 유동 IP 폴더의 `network.config` + 바깥 네트워크의 `network.assign`(주소를 직접 주면 유동 IP 범위 안 — 밖은 루트 `cluster.admin`) |
 | 유동 IP 붙이기·떼기 | 유동 IP의 `network.config` + 대상 VM의 `vm.config`(떼기는 앞의 것만) |
-| 보기 | `system.read`(라우터·유동 IP·네트워크). 다른 폴더의 VM은 이름을 감추고, 루트 `cluster.read`가 없으면 노드 이름도 감춘다 |
+| 보기 | `system.read`(라우터·유동 IP·네트워크). 다른 폴더의 VM은 이름을 감추고, 루트 `cluster.read`가 없으면 노드 이름도 감춘다. 오류 문구도 읽을 수 없는 라우터·유동 IP는 이름 없이 센다. `GET /routers`의 `routed`는 읽을 수 있는 네트워크 가운데 라우터 인터페이스인 것과 그 바깥(라우터 이름 없이)이다 — 웹이 읽을 수 없는 라우터 뒤의 NIC에도 유동 IP를 붙이게 한다 |
 | 보안 그룹 | 지금 그대로(만들고 바꾸기는 admin) |
 
 - 라우터·유동 IP에도 객체 grant를 준다(`/api/v1/grants`의 대상 `router/<id>`·`floating-ip/<id>`, 웹의 행마다 권한 서랍).

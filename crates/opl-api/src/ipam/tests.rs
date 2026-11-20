@@ -457,3 +457,48 @@ fn slaac_subnets_use_the_mac() {
     assert_eq!(fill_empty(&mut a, "t6", &added, &mut used).unwrap(), 1);
     assert_eq!(a.nics[0].ips, [ip("fd00:6::5054:ff:fe00:7")]);
 }
+
+/// 계획 66 리뷰 2 I-1: 공급자 NIC에 준 주소는 풀 안·유동 IP 범위 밖이어야 한다. 이미 가진 주소와 오버레이 NIC는 보지 않는다.
+#[test]
+fn provider_nic_addresses_stay_in_the_pools() {
+    let nets: Vec<Network> = vec![
+        Resource::new(
+            "ext",
+            serde_json::from_value(serde_json::json!({
+                "sdn": { "provider": { "physnet": "ext" } },
+                "subnets": [{ "cidr": "203.0.113.0/24",
+                    "pools": [{ "start": "203.0.113.10", "end": "203.0.113.99" }],
+                    "floating_pools": [{ "start": "203.0.113.100", "end": "203.0.113.150" }] }]
+            }))
+            .unwrap(),
+        ),
+        Resource::new(
+            "t1",
+            serde_json::from_value(serde_json::json!({
+                "sdn": {}, "subnets": [{ "cidr": "10.0.0.0/24",
+                    "pools": [{ "start": "10.0.0.10", "end": "10.0.0.20" }] }]
+            }))
+            .unwrap(),
+        ),
+    ];
+    let spec = |network: &str, ip: &str| -> VmSpec {
+        serde_json::from_value(serde_json::json!({
+            "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt",
+            "nics": [{ "network": network, "model": "virtio", "mac": "52:54:00:00:00:01", "ips": [ip] }]
+        }))
+        .unwrap()
+    };
+    assert!(check_provider_ips(&spec("ext", "203.0.113.20"), None, &nets).is_ok());
+    for bad in ["203.0.113.5", "203.0.113.120", "203.0.113.250"] {
+        let e = check_provider_ips(&spec("ext", bad), None, &nets).unwrap_err();
+        assert!(
+            e.message.contains("only a cluster administrator"),
+            "{bad}: {}",
+            e.message
+        );
+    }
+    // 이미 가진 주소(같은 MAC·네트워크)는 다시 보지 않는다. 오버레이는 풀 밖도 된다(계획 65 그대로).
+    let current = spec("ext", "203.0.113.5");
+    assert!(check_provider_ips(&spec("ext", "203.0.113.5"), Some(&current), &nets).is_ok());
+    assert!(check_provider_ips(&spec("t1", "10.0.0.50"), None, &nets).is_ok());
+}

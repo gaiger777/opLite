@@ -213,7 +213,10 @@ struct BusyGuard<'a> {
 
 impl Drop for BusyGuard<'_> {
     fn drop(&mut self) {
-        self.map.lock().unwrap().remove(&self.id);
+        // 잠금을 쥔 채 표시를 버리고 파일을 지운다: 그 사이 다음 작업의 [`QemuHypervisor::busy`]가 쓴 새 파일을 지우지
+        // 않게(리뷰 2 m-1).
+        let mut map = self.map.lock().unwrap();
+        map.remove(&self.id);
         if let Some(mark) = &self.mark
             && let Err(e) = remove_if_exists(mark)
         {
@@ -226,9 +229,12 @@ impl Drop for BusyGuard<'_> {
 fn busy_mark(dir: &Path) -> Option<&'static str> {
     let path = dir.join(BUSY_MARK);
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-    // 시계가 뒤로 갔으면(mtime이 미래) 새 표시로 본다.
-    if modified.elapsed().is_ok_and(|age| age >= SNAPSHOT_TIMEOUT) {
-        return None;
+    // 시계가 뒤로 갔으면(mtime이 미래) 오래된 표시로 본다: 새 표시로 보면 시계가 따라잡을 때까지(몇 시간일 수 있다)
+    // 정말 멈춘 VM이 바쁨으로 남는다(리뷰 2 m-2). 저장 중 시계가 뒤로 가고 그때 orbivisord가 다시 켜진 경우만 예전
+    // "응답 없음"으로 돌아간다.
+    match modified.elapsed() {
+        Ok(age) if age < SNAPSHOT_TIMEOUT => {}
+        _ => return None,
     }
     let text = std::fs::read_to_string(&path).ok()?;
     BUSY_OPS.into_iter().find(|op| *op == text.trim())
@@ -972,13 +978,16 @@ impl QemuHypervisor {
     /// 표시는 실행 디렉터리의 [`BUSY_MARK`]에도 남겨 orbivisord가 작업 중 다시 켜져도 바쁨을 안다.
     fn busy(&self, id: Uuid, op: &'static str) -> BusyGuard<'_> {
         debug_assert!(BUSY_OPS.contains(&op), "{op}");
-        self.busy.lock().unwrap().insert(id, op);
         let mark = self.paths(id).ok().map(|p| p.dir.join(BUSY_MARK));
+        // 메모리 표시와 파일을 한 잠금 안에서 쓴다([`Self::clear_stale_mark`]가 그 사이에 파일을 지우지 않게 — 리뷰 2 m-1).
+        let mut map = self.busy.lock().unwrap();
+        map.insert(id, op);
         if let Some(path) = &mark
             && let Err(e) = std::fs::write(path, op)
         {
             tracing::warn!(%id, error = %e, "cannot write busy mark");
         }
+        drop(map);
         BusyGuard {
             map: &self.busy,
             id,
@@ -988,6 +997,17 @@ impl QemuHypervisor {
 
     fn busy_with(&self, id: Uuid) -> Option<&'static str> {
         self.busy.lock().unwrap().get(&id).copied()
+    }
+
+    /// 메모리 표시가 없으면 실행 디렉터리 `dir`의 [`BUSY_MARK`](옛 프로세스가 남긴 것)를 지운다. 보기와 지우기를 한
+    /// 잠금 안에서 해 그 사이 시작한 작업의 새 표시를 지우지 않는다(리뷰 2 m-1).
+    fn clear_stale_mark(&self, id: Uuid, dir: &Path) {
+        let map = self.busy.lock().unwrap();
+        if !map.contains_key(&id)
+            && let Err(e) = remove_if_exists(&dir.join(BUSY_MARK))
+        {
+            tracing::warn!(%id, error = %e, "cannot remove busy mark");
+        }
     }
 
     async fn query_state(&self, id: Uuid) -> Result<Option<ActualState>, DriverError> {
@@ -1004,10 +1024,8 @@ impl QemuHypervisor {
                             RuntimeStatus::Busy(op)
                         }
                         mark => {
-                            if mark.is_some()
-                                && let Err(e) = remove_if_exists(&paths.dir.join(BUSY_MARK))
-                            {
-                                tracing::warn!(%id, error = %e, "cannot remove busy mark");
+                            if mark.is_some() {
+                                self.clear_stale_mark(id, &paths.dir);
                             }
                             RuntimeStatus::Other("unresponsive".into())
                         }
@@ -1050,11 +1068,7 @@ impl QemuHypervisor {
             Ok(Err(e)) => return Err(e.into()),
         };
         // QEMU가 답했으니 메모리에 표시가 없는 바쁨 표시 파일은 옛 프로세스가 남긴 것이다.
-        if self.busy_with(id).is_none()
-            && let Err(e) = remove_if_exists(&handle.paths.dir.join(BUSY_MARK))
-        {
-            tracing::warn!(%id, error = %e, "cannot remove busy mark");
-        }
+        self.clear_stale_mark(id, &handle.paths.dir);
         // 실행 중인데 지금 멈춰 두지 않았으면 표시는 남은 것이다(이어서 실행했지만 지우지 못했거나
         // 누가 `cont`함). 그대로 두면 나중에 다른 까닭으로 멈춘 VM을 다시 붙을 때 이어서 실행한다.
         if status == RuntimeStatus::Running && !self.pausing.lock().unwrap().contains(&id) {
@@ -8057,6 +8071,39 @@ time.sleep(60)
             hv.inspect(vm.id).await.unwrap().unwrap().status,
             RuntimeStatus::Other("unresponsive".into())
         );
+        // 리뷰 2 m-2: 시계가 뒤로 가 mtime이 미래인 표시도 오래된 것이다(시계가 따라잡을 때까지 바쁨으로 남지 않는다).
+        std::fs::write(dir.join(BUSY_MARK), "snapshot-save").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join(BUSY_MARK))
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600))
+            .unwrap();
+        assert_eq!(busy_mark(&dir), None);
+        assert_eq!(
+            hv.inspect(vm.id).await.unwrap().unwrap().status,
+            RuntimeStatus::Other("unresponsive".into())
+        );
+    }
+
+    /// 리뷰 2 m-1: 남은 표시 지우기는 그 사이 시작한 작업의 표시(메모리에 있음)를 지우지 않고, 작업이 끝나면 지운다.
+    #[tokio::test]
+    async fn clearing_a_stale_mark_keeps_a_fresh_one() {
+        let tmp = short_tempdir();
+        let cfg = config(tmp.path(), PathBuf::from("/nonexistent/qemu"));
+        let hv = QemuHypervisor::new(cfg.clone()).await.unwrap();
+        let id = Uuid::new_v4();
+        let dir = hv.paths(id).unwrap().dir;
+        std::fs::create_dir_all(&dir).unwrap();
+        let mark = dir.join(BUSY_MARK);
+        let guard = hv.busy(id, "snapshot-save");
+        hv.clear_stale_mark(id, &dir);
+        assert_eq!(std::fs::read_to_string(&mark).unwrap(), "snapshot-save");
+        drop(guard);
+        assert!(!mark.exists());
+        std::fs::write(&mark, "snapshot-save").unwrap();
+        hv.clear_stale_mark(id, &dir);
+        assert!(!mark.exists());
     }
 
     /// 리뷰 1 M-7·#4: 붙은 VM의 `query-status`가 시간을 넘겼을 때 그 사이 작업이 시작됐거나 표시 파일이 있으면 바쁨이다.

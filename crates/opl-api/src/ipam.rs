@@ -270,6 +270,72 @@ pub(crate) fn assign(
     Ok(())
 }
 
+/// 부른 사용자가 공급자 네트워크 NIC 주소를 마음대로 고를 수 있는지(루트 `cluster.admin` — 리뷰 2 I-1). 요청 밖(주체 없음)은
+/// 고를 수 있다.
+pub(crate) fn chooses_any_ip(state: &AppState, principal: Option<&Principal>) -> bool {
+    principal.is_none_or(|p| {
+        state.authz.allows(
+            p,
+            Privilege::ClusterAdmin,
+            opl_types::authz_eval::AuthzTarget::Root,
+        )
+    })
+}
+
+/// 공급자 네트워크(계획 66 §8)의 NIC에 준 주소는 풀(없으면 CIDR) 안이고 유동 IP 풀 밖이어야 한다(400 — 리뷰 2 I-1). 공급자
+/// 네트워크에서는 IPAM 주소가 포트 보안의 주소라, 아니면 `network.assign`만 받은 테넌트가 물리 망의 다른 장비(DNS·게이트웨이)
+/// 주소를 NIC 주소로 잡아 가로챌 수 있다. 루트 `cluster.admin`은 부르지 않는다. 그 NIC가 이미 가진 주소(같은 MAC·같은
+/// 네트워크, 템플릿이 아니던 스펙)와 템플릿(주소를 갖지 않음), SLAAC 계열 IPv6 서브넷(EUI-64만 받음)은 보지 않는다.
+pub(crate) fn check_provider_ips(
+    spec: &VmSpec,
+    current: Option<&VmSpec>,
+    networks: &[Network],
+) -> Result<(), ApiError> {
+    if spec.template {
+        return Ok(());
+    }
+    let current = current.filter(|c| !c.template);
+    for (i, nic) in spec.nics.iter().enumerate() {
+        let Some(net) = networks
+            .iter()
+            .find(|n| n.name == nic.network && n.spec.is_provider())
+        else {
+            continue;
+        };
+        let kept: Vec<IpAddr> = current
+            .and_then(|c| {
+                c.nics
+                    .iter()
+                    .find(|n| n.mac.is_some() && n.mac == nic.mac && n.network == nic.network)
+            })
+            .map(|n| n.ips.clone())
+            .unwrap_or_default();
+        for ip in nic.ips.iter().map(|ip| ip.to_canonical()) {
+            if kept.contains(&ip) {
+                continue;
+            }
+            let Some(subnet) = ipam::nic_subnet(&net.spec, ip) else {
+                // 서브넷 밖은 [`assign`]이 400으로 알린다.
+                continue;
+            };
+            if ipam::slaac_prefix(subnet).is_none() && !ipam::in_nic_range(subnet, ip) {
+                return Err(ApiError::bad_request(format!(
+                    "NIC {i}: address {ip} is outside the address pools of subnet {} of provider network {:?}{}; \
+                     only a cluster administrator can give a NIC an address outside them",
+                    subnet.cidr,
+                    net.name,
+                    if subnet.floating_pools.is_empty() {
+                        ""
+                    } else {
+                        " (or inside its floating IP ranges)"
+                    }
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// SDN NIC에 보안 그룹을 걸 수 있는지(모든 노드가 `sdn-routing`을 앎 — 계획 66 §11.4)
 pub(crate) fn sdn_groups_allowed(cluster: &Cluster) -> Result<bool, ApiError> {
     Ok(crate::cluster::missing_feature(cluster, opl_types::node::SDN_ROUTING)?.is_empty())
@@ -280,11 +346,13 @@ pub(crate) fn sdn_groups_allowed(cluster: &Cluster) -> Result<bool, ApiError> {
 /// `ip_in_use`, 서브넷이 다 쓰였으면 409 `ip_exhausted`. 새 VM의 다른 NIC는 Task가 새로 받으므로 주소 없이 본다.
 /// Task가 VM을 만들 때 다시 보고, 그새 쓰였으면 실패한다.
 /// 권한 검사 뒤에 부른다(리뷰 1 I-2 — 권한 없는 요청이 주소의 쓰임을 캐 보지 못하게). `sees`는 [`assign`]과 같다.
+/// `any_ip`가 거짓이면 공급자 네트워크 NIC 주소는 풀 안이어야 한다([`check_provider_ips`]).
 pub(crate) fn check_requested(
     cluster: &Cluster,
     spec: &VmSpec,
     requested: &[Vec<IpAddr>],
     sees: &dyn Fn(&Vm) -> bool,
+    any_ip: bool,
 ) -> Result<(), ApiError> {
     if requested.iter().all(Vec::is_empty) {
         return Ok(());
@@ -322,6 +390,9 @@ pub(crate) fn check_requested(
     // 보기도 같게.
     let groups = sdn_groups_allowed(cluster)?;
     strip_sdn_nic_config(&mut new, &networks, groups);
+    if !any_ip {
+        check_provider_ips(&new, None, &networks)?;
+    }
     let others: Vec<&Vm> = vms.iter().collect();
     assign(
         &mut new,

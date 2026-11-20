@@ -379,9 +379,13 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
     // SDN NIC 주소(계획 65 §9): 검사하고 새 NIC에 채운다.
     let others_list: Vec<&Vm> = others.clone().collect();
     let principal = crate::audit::principal();
+    let current = inv.vms.iter().find(|v| v.id == id).map(|v| &v.spec);
+    if !crate::ipam::chooses_any_ip(state, principal.as_ref()) {
+        crate::ipam::check_provider_ips(spec, current, &inv.networks)?;
+    }
     crate::ipam::assign(
         spec,
-        inv.vms.iter().find(|v| v.id == id).map(|v| &v.spec),
+        current,
         &others_list,
         &inv.networks,
         &crate::ipam::load_held(&state.cluster)?,

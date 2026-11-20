@@ -1461,6 +1461,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/networks/{key}/router": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * 네트워크를 그 네트워크가 인터페이스인 라우터에서 뗀다(리뷰 2 I-2): 그 네트워크의 `network.config`(경로표)면 라우터를
+         *     읽을 수 없어도 된다 — 다른 폴더의 라우터가 권한을 거둔 뒤에도 내 네트워크의 기본 경로를 쥐고 있을 때 주인이 되찾는
+         *     길이다. 라우터가 없으면 404, 이 길로 라우팅되는 유동 IP가 있으면 409 `fip_in_use`.
+         */
+        delete: operations["detach_network_router"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/nodes": {
         parameters: {
             query?: never;
@@ -10571,6 +10592,13 @@ export interface components {
             /** @enum {string} */
             type: "custom";
         };
+        /** @description 라우터 인터페이스인 네트워크 하나(`RouterList.routed`) */
+        RoutedNetwork: {
+            /** @description 그 라우터의 외부(공급자) 네트워크. 외부가 없으면 없고, 부른 사용자가 그 네트워크를 읽을 수 없으면 빈 글이다. */
+            external?: string;
+            /** @description 오버레이 네트워크 이름 */
+            network: string;
+        };
         /** @description 라우터의 외부 게이트웨이 */
         RouterExternal: {
             /** @description 라우터의 외부 주소(체계마다 하나). API가 그 네트워크의 유동 IP 풀(없으면 풀)에서 채운다. */
@@ -10591,6 +10619,8 @@ export interface components {
              * @description 노드의 게이트웨이 우선순위(`NodeSpec.sdn.gateway`)
              */
             node_priority: number;
+            /** @description 노드가 살아 있다(`NodeStatus.online` — 리뷰 2 웹 I2). 거짓이면 OVN이 다음 살아 있는 후보로 넘긴다. */
+            online: boolean;
             /**
              * Format: int32
              * @description `HA_Chassis.priority`(32767부터 내림 — 가장 높은 살아 있는 chassis가 주인)
@@ -10607,6 +10637,11 @@ export interface components {
             items: components["schemas"]["RouterView"][];
             /** Format: int64 */
             revision: number;
+            /**
+             * @description 라우터 인터페이스인 네트워크 가운데 부른 사용자가 읽을 수 있는 것(그 라우터를 읽을 수 없어도 — 리뷰 2 웹 I1).
+             *     유동 IP를 붙일 수 있는 NIC와 라우터를 이을 수 있는 네트워크를 웹이 서버와 같게 고르게 한다. 라우터 이름은 없다.
+             */
+            routed?: components["schemas"]["RoutedNetwork"][];
         };
         /** @description `PATCH /routers/{key}`: 준 칸만 바꾼다(목록은 통째로). */
         RouterPatch: {
@@ -15847,6 +15882,35 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["NetworkIps"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    detach_network_router: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description network id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

@@ -200,6 +200,23 @@ pub fn in_floating_range(subnet: &Subnet, ip: IpAddr) -> bool {
     }
 }
 
+/// 공급자 네트워크 NIC가 **고를** 수 있는 주소인지(리뷰 2 I-1): 풀(없으면 CIDR) 안이고 유동 IP 풀 밖. 공급자 네트워크에서는
+/// IPAM 주소가 포트 보안의 주소라 물리 망의 다른 장비(게이트웨이·DNS) 주소를 테넌트가 NIC 주소로 가로채지 못하게 API가
+/// 루트 `cluster.admin`이 아닌 사용자의 고른 주소를 이것으로 막는다(Neutron의 `create_port:fixed_ips:ip_address`가
+/// 관리자만인 것과 같다).
+pub fn in_nic_range(subnet: &Subnet, ip: IpAddr) -> bool {
+    let ip = ip.to_canonical();
+    if !subnet.cidr.contains(ip) {
+        return false;
+    }
+    let b = bits(ip);
+    ranges(subnet).iter().any(|(s, e)| (*s..=*e).contains(&b))
+        && !subnet
+            .floating_pools
+            .iter()
+            .any(|p| (bits(p.start)..=bits(p.end)).contains(&b))
+}
+
 /// NIC(MAC `mac`)의 주소를 서브넷에서 고른다(계획 66 §10): 주소를 게스트가 MAC에서 만드는 IPv6 서브넷(`ipv6_mode`가
 /// `slaac`·`dhcpv6-stateless`)이면 늘 [`eui64`] 주소이고 다른 주소를 원하면 [`IpamError::NotEui64`]다. 아니면
 /// [`allocate`]다.
@@ -468,6 +485,29 @@ mod tests {
         assert!(in_floating_range(&s, ip("203.0.113.150")));
         assert!(!in_floating_range(&s, ip("203.0.113.15")));
         assert!(!in_floating_range(&s, ip("203.0.113.53")));
+    }
+
+    /// 리뷰 2 I-1: 공급자 NIC가 고를 수 있는 주소는 풀(없으면 CIDR) 안이고 유동 IP 풀 밖이다.
+    #[test]
+    fn nic_ranges_are_the_pools_without_the_floating_ranges() {
+        let mut s = subnet("203.0.113.0/24");
+        assert!(in_nic_range(&s, ip("203.0.113.53")));
+        assert!(!in_nic_range(&s, ip("198.51.100.5")));
+        s.pools = vec![IpRange {
+            start: ip("203.0.113.10"),
+            end: ip("203.0.113.200"),
+        }];
+        assert!(in_nic_range(&s, ip("203.0.113.10")));
+        assert!(!in_nic_range(&s, ip("203.0.113.5")));
+        s.floating_pools = vec![IpRange {
+            start: ip("203.0.113.100"),
+            end: ip("203.0.113.150"),
+        }];
+        assert!(in_nic_range(&s, ip("203.0.113.53")));
+        assert!(!in_nic_range(&s, ip("203.0.113.120")));
+        assert!(in_nic_range(&s, ip("203.0.113.151")));
+        assert!(!in_nic_range(&s, ip("203.0.113.201")));
+        assert!(in_nic_range(&s, ip("::ffff:203.0.113.53")));
     }
 
     #[test]

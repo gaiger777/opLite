@@ -75,7 +75,8 @@ pub(crate) fn subnet_uses_routing(subnet: &Subnet) -> bool {
 /// 모든 노드가 `sdn-routing`을 알아야 하고(409 `cluster_upgrading`, 검증보다 먼저), 위트니스·macOS 노드는 chassis가 될 수
 /// 없고(400), 검증(physnet 이름·브리지·게이트웨이)은 400 `invalid_node_sdn`, SDN이 세워지지 않았으면 409 `sdn_not_ready`
 /// (지우기는 빼고), 빠지거나 브리지가 바뀌는 physnet을 쓰는 공급자 네트워크 NIC의 VM이 이 노드에서 돌면 409
-/// `physnet_in_use`(`details.vms`).
+/// `physnet_in_use`(`details.vms`). 브리지만 바뀌는 physnet은 이 노드가 그 physnet으로 나가는 라우터의 게이트웨이
+/// 후보이거나(`details.routers`) 이 노드의 VM에 그 physnet의 유동 IP가 붙었을 때도(`details.floating_ips`) 409다.
 pub(crate) fn check_node_sdn(
     state: &AppState,
     node: &Node,
@@ -111,6 +112,13 @@ pub(crate) fn check_node_sdn(
     if !removed.is_empty() {
         let (_, networks) = state.cluster.list::<NetworkSpec>()?;
         let (_, vms) = state.cluster.list::<VmSpec>()?;
+        let physnet_of = |name: &str| {
+            networks
+                .iter()
+                .find(|n| n.name == name)
+                .and_then(|n| n.spec.physnet())
+        };
+        let hit = |name: &str| physnet_of(name).is_some_and(|p| removed.iter().any(|r| *r == p));
         let on_node = |vm: &opl_types::vm::Vm| {
             vm.status.node == Some(node.id)
                 && !matches!(vm.status.phase, opl_types::vm::VmPhase::Stopped)
@@ -123,24 +131,68 @@ pub(crate) fn check_node_sdn(
         let users: Vec<String> = vms
             .iter()
             .filter(|vm| on_node(vm))
-            .filter(|vm| {
-                vm.spec.nics.iter().any(|nic| {
-                    networks.iter().any(|n| {
-                        n.name == nic.network
-                            && n.spec
-                                .physnet()
-                                .is_some_and(|p| removed.iter().any(|r| *r == p))
+            .filter(|vm| vm.spec.nics.iter().any(|nic| hit(&nic.network)))
+            .map(|vm| vm.name.clone())
+            .collect();
+        // 브리지만 바뀌는 physnet은 준비 상태가 그대로라 OvnSync가 아무것도 옮기지 않는다(BFD도 Geneve로 살아 있다): 이
+        // 노드가 그 physnet으로 나가는 라우터의 게이트웨이 후보이거나 이 노드의 VM에 그 physnet의 유동 IP가 분산으로
+        // 붙었으면 SNAT·유동 IP가 말없이 다른 L2로 간다(리뷰 2 I-3). physnet을 빼는 것은 준비가 떨어져 게이트웨이·유동 IP가
+        // 다른 노드·중앙으로 넘어가므로 막지 않는다 — 먼저 빼고 새 브리지로 다시 넣으면 된다.
+        let moved = |name: &str| {
+            physnet_of(name).is_some_and(|p| {
+                new.is_some_and(|n| n.physnets.contains_key(p)) && removed.iter().any(|r| *r == p)
+            })
+        };
+        let (_, nodes) = state.cluster.list::<NodeSpec>()?;
+        let ids: std::collections::BTreeSet<uuid::Uuid> = nodes.iter().map(|n| n.id).collect();
+        let (_, routers) = state.cluster.list::<opl_types::router::RouterSpec>()?;
+        let gateways: Vec<String> = routers
+            .iter()
+            .filter(|r| {
+                r.spec.external.as_ref().is_some_and(|e| {
+                    moved(&e.network)
+                        && physnet_of(&e.network).is_some_and(|p| {
+                            crate::ovn_sync::nb::gateway_candidates(&nodes, p)
+                                .iter()
+                                .any(|(n, _)| *n == node.id)
+                        })
+                })
+            })
+            .map(|r| r.name.clone())
+            .collect();
+        let (_, fips) = state
+            .cluster
+            .list::<opl_types::floating_ip::FloatingIpSpec>()?;
+        let distributed: Vec<String> = fips
+            .iter()
+            .filter(|f| moved(&f.spec.network))
+            .filter(|f| {
+                f.spec.target.is_some_and(|t| {
+                    vms.iter().find(|v| v.id == t.vm).is_some_and(|vm| {
+                        crate::ovn_sync::nb::chassis_nodes(vm, &ids).contains(&node.id)
                     })
                 })
             })
-            .map(|vm| vm.name.clone())
+            .map(|f| f.name.clone())
             .collect();
-        if !users.is_empty() {
+        if !users.is_empty() || !gateways.is_empty() || !distributed.is_empty() {
+            let mut what = Vec::new();
+            if !users.is_empty() {
+                what.push(format!("VMs {}", users.join(", ")));
+            }
+            if !gateways.is_empty() {
+                what.push(format!("the gateway of routers {}", gateways.join(", ")));
+            }
+            if !distributed.is_empty() {
+                what.push(format!("floating IPs {}", distributed.join(", ")));
+            }
             let mut e = ApiError::conflict(
                 "physnet_in_use",
                 format!(
-                    "VMs {} on node {:?} use physnet(s) {} being removed or moved to another bridge; stop or move them first",
-                    users.join(", "),
+                    "{} on node {:?} use physnet(s) {} being removed or moved to another bridge; stop or move \
+                     the VMs first, and to move a physnet that routers or floating IPs use here, remove it first \
+                     (they move to other nodes) and then add it with the new bridge",
+                    what.join("; "),
                     node.name,
                     removed
                         .iter()
@@ -149,7 +201,14 @@ pub(crate) fn check_node_sdn(
                         .join(", ")
                 ),
             );
-            e.details = Some(serde_json::json!({ "vms": users }));
+            let mut details = serde_json::json!({ "vms": users });
+            if !gateways.is_empty() {
+                details["routers"] = serde_json::json!(gateways);
+            }
+            if !distributed.is_empty() {
+                details["floating_ips"] = serde_json::json!(distributed);
+            }
+            e.details = Some(details);
             return Err(e);
         }
     }

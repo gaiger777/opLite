@@ -631,23 +631,49 @@ fn captured(points: &[(Vec<String>, &str)], filter: &str, action: impl FnOnce())
     caps.into_iter().map(Capture::count).collect()
 }
 
-/// [`captured`]를 `ok`가 맞을 때까지 [`CAPTURE_ATTEMPTS`]번까지 다시 하고 마지막 수를 돌려준다(호출자가 그 수로
-/// 단언한다 — 정말 틀리면 모든 시도가 틀린다).
+/// [`captured`]를 `ok`(보여야 하는 곳)가 맞을 때까지 [`CAPTURE_ATTEMPTS`]번까지 다시 하고 마지막 수를 돌려준다(호출자가
+/// 그 수로 단언한다). `zero`의 자리(보이면 안 되는 곳)는 시도마다 본다([`capture_verdict`]).
 fn captured_until(
     points: &[(Vec<String>, &str)],
     filter: &str,
     action: impl Fn(),
+    zero: &[usize],
     ok: impl Fn(&[usize]) -> bool,
 ) -> Vec<usize> {
     let mut counts = Vec::new();
     for attempt in 1..=CAPTURE_ATTEMPTS {
         counts = captured(points, filter, &action);
-        if ok(&counts) {
-            break;
+        match capture_verdict(&counts, zero, &ok) {
+            Ok(true) => break,
+            Ok(false) => eprintln!(
+                "capture attempt {attempt}/{CAPTURE_ATTEMPTS} [{filter}]: {counts:?}; again"
+            ),
+            Err(e) => panic!("capture attempt {attempt}/{CAPTURE_ATTEMPTS} [{filter}]: {e}"),
         }
-        eprintln!("capture attempt {attempt}/{CAPTURE_ATTEMPTS} [{filter}]: {counts:?}; again");
     }
     counts
+}
+
+/// 캡처 한 번의 판정: `zero`의 자리(보이면 안 되는 곳)가 하나라도 0이 아니면 곧바로 오류 — 다시 보지 않는다(리뷰 2 m-3:
+/// 세 번 가운데 한 번 새는 진짜 버그를 다시 보기가 가리지 않게). 아니면 `ok`(보여야 하는 곳이 보였는지 — 거짓이면
+/// tcpdump가 놓친 것일 수 있어 다시 본다).
+fn capture_verdict(
+    counts: &[usize],
+    zero: &[usize],
+    ok: impl Fn(&[usize]) -> bool,
+) -> Result<bool, String> {
+    if let Some(i) = zero.iter().find(|i| counts[**i] != 0) {
+        return Err(format!("point {i} must see nothing but saw {counts:?}"));
+    }
+    Ok(ok(counts))
+}
+
+#[test]
+fn a_leak_in_any_capture_attempt_fails() {
+    assert_eq!(capture_verdict(&[0, 3], &[0], |c| c[1] > 0), Ok(true));
+    assert_eq!(capture_verdict(&[0, 0], &[0], |c| c[1] > 0), Ok(false));
+    assert!(capture_verdict(&[1, 0], &[0], |c| c[1] > 0).is_err());
+    assert!(capture_verdict(&[0, 5, 2], &[0, 2], |c| c[1] > 0).is_err());
 }
 
 /// 호스트 쪽 veth(노드 `i` = 1..3)
@@ -1026,7 +1052,8 @@ async fn routing_section(fleet: &Fleet) {
                 "ip", "netns", "exec", "vma", "ping", "-c", "5", "-i", "0.3", &b.2,
             ]);
         },
-        |c| c[0] == 0 && c[1] > 0,
+        &[0],
+        |c| c[1] > 0,
     );
     assert_eq!(
         counts[0], 0,
@@ -1050,7 +1077,8 @@ async fn routing_section(fleet: &Fleet) {
                 "ip", "netns", "exec", "vma", "ping", "-c", "5", "-i", "0.3", EXT_IP,
             ]);
         },
-        |c| c[0] == 0 && c[1] > 0 && c[2] == 0,
+        &[0, 2],
+        |c| c[1] > 0,
     );
     assert_eq!(
         counts,
@@ -1114,6 +1142,7 @@ async fn routing_section(fleet: &Fleet) {
         || {
             ext_ping("203.0.113.120");
         },
+        &[],
         |c| c[0] > 0,
     );
     assert!(tap[0] > 0, "the DNAT-ed packets did not reach the VM tap");

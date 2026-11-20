@@ -37,6 +37,10 @@ pub(crate) enum RouterCmd {
     Delete {
         router: String,
     },
+    /// 내 네트워크를 그 네트워크가 인터페이스인 라우터에서 뗀다(네트워크의 network.config — 라우터를 읽을 수 없어도)
+    Detach {
+        network: String,
+    },
     /// 인터페이스(오버레이 SDN 네트워크 — 그 서브넷 게이트웨이가 라우터 주소)
     Interface {
         #[command(subcommand)]
@@ -343,6 +347,12 @@ pub(crate) async fn router(
         RouterCmd::Delete { router } => {
             client.delete(&format!("/routers/{}", seg(&router))).await?;
             writeln!(out, "router {router} deleted")?;
+        }
+        RouterCmd::Detach { network } => {
+            client
+                .delete(&format!("/networks/{}/router", seg(&network)))
+                .await?;
+            writeln!(out, "network {network} detached from its router")?;
         }
         RouterCmd::Interface { cmd } => {
             let (router, network, add) = match cmd {

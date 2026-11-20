@@ -1110,6 +1110,7 @@ pub async fn run_import(
         &spec,
         &run.ips,
         &crate::ipam::readable(&state, Some(&principal)),
+        crate::ipam::chooses_any_ip(&state, Some(&principal)),
     )?;
     let pool = state
         .cluster

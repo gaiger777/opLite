@@ -213,6 +213,12 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     // SDN 네트워크의 서브넷 바꾸기와 주소 목록(계획 65): 그 네트워크의 `network.config`·읽기
     ("PATCH", "/networks/{key}", Object(Network, NetworkConfig)),
     ("GET", "/networks/{key}/ips", Read(Network)),
+    // 내 네트워크를 남의 라우터에서 떼기(계획 66 리뷰 2 I-2): 그 네트워크의 `network.config`
+    (
+        "DELETE",
+        "/networks/{key}/router",
+        Object(Network, NetworkConfig),
+    ),
     // 라우터·유동 IP(계획 66): 네트워크 폴더의 객체. 만들기는 폴더의 `network.config`와 잇는 네트워크의
     // `network.assign`(핸들러), 바꾸기는 그 객체의 `network.config`(새로 잇는 네트워크·붙일 VM은 핸들러)
     ("GET", "/routers", List),

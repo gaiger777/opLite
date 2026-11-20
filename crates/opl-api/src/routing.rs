@@ -217,6 +217,18 @@ fn pick_address(
         .map_err(|e| ipam_error(&network.name, e))
 }
 
+/// 부른 사용자가 읽을 수 있는 객체인지(오류 문구에 이름을 댈지 — 리뷰 2 m-5)
+fn reads<'a, T: AuthzObject>(
+    state: &'a AppState,
+    principal: &'a Principal,
+) -> impl Fn(&T) -> bool + 'a {
+    move |o: &T| {
+        state
+            .authz
+            .allows(principal, Privilege::SystemRead, o.authz_target())
+    }
+}
+
 /// 부른 사용자가 루트 `cluster.admin`인지(유동 IP 풀 밖의 주소를 고를 수 있다)
 fn is_admin(state: &AppState, principal: &Principal) -> bool {
     state
@@ -238,7 +250,12 @@ fn auto_picked(filled: &RouterExternal, given: &[IpAddr], old: Option<&RouterExt
 /// 라우터 스펙을 네트워크와 함께 본다(§6·§9.1): 스펙 검증(400 `invalid_router`), 인터페이스는 서브넷이 있는 오버레이 SDN
 /// 네트워크(400)이고 다른 라우터가 갖지 않음(409 `network_in_use`), 외부는 공급자 네트워크(400), 인터페이스·외부 서브넷
 /// CIDR이 서로 겹치지 않음(400), 경로의 다음 홉은 붙은 서브넷 안(400).
-fn check_router(world: &World, spec: &RouterSpec, me: Option<Uuid>) -> Result<(), ApiError> {
+fn check_router(
+    world: &World,
+    spec: &RouterSpec,
+    me: Option<Uuid>,
+    sees: &dyn Fn(&Router) -> bool,
+) -> Result<(), ApiError> {
     spec.validate().map_err(|e| invalid_router(e.to_string()))?;
     let mut cidrs: Vec<(opl_types::security_group::Cidr, &str)> = Vec::new();
     for i in &spec.interfaces {
@@ -258,12 +275,15 @@ fn check_router(world: &World, spec: &RouterSpec, me: Option<Uuid>) -> Result<()
             )));
         }
         if let Some(other) = world.router_of(&n.name, me) {
+            // 읽을 수 없는 라우터의 이름은 대지 않는다(리뷰 2 m-5).
+            let which = if sees(other) {
+                format!("router {:?}", other.name)
+            } else {
+                "a router you cannot see".to_string()
+            };
             return Err(ApiError::conflict(
                 "network_in_use",
-                format!(
-                    "network {:?} is already an interface of router {:?}",
-                    n.name, other.name
-                ),
+                format!("network {:?} is already an interface of {which}", n.name),
             ));
         }
         cidrs.extend(n.spec.subnets.iter().map(|s| (s.cidr, n.name.as_str())));
@@ -373,12 +393,56 @@ fn target_nic<'a>(
     Some((vm, nic))
 }
 
-/// 유동 IP 이름들(오류 문구)
-fn names(fips: &[&FloatingIp]) -> String {
-    fips.iter()
-        .map(|f| f.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// 오류 문구의 이름들: 부른 사용자가 읽을 수 있는(`system.read`) 것만 이름으로, 나머지는 "N you cannot see"로 센다
+/// (리뷰 2 m-5 — 다른 폴더의 라우터·유동 IP 이름을 드러내지 않게, 계획 65 m-1의 VM 이름과 같다).
+pub(crate) fn visible_names<'a, S: 'a, T: 'a>(
+    state: &AppState,
+    principal: &Principal,
+    what: &str,
+    items: impl IntoIterator<Item = &'a Resource<S, T>>,
+) -> String
+where
+    Resource<S, T>: AuthzObject,
+{
+    let mut shown = Vec::new();
+    let mut hidden = 0;
+    for item in items {
+        if state
+            .authz
+            .allows(principal, Privilege::SystemRead, item.authz_target())
+        {
+            shown.push(format!("{what} {:?}", item.name));
+        } else {
+            hidden += 1;
+        }
+    }
+    if hidden > 0 {
+        shown.push(format!("{hidden} {what}(s) you cannot see"));
+    }
+    shown.join(", ")
+}
+
+/// 유동 IP가 유동 IP 범위(없으면 풀) 밖의 주소를 쓰는지(감사의 "admin override" — 리뷰 2 m-8)
+fn outside_floating(world: &World, network: &str, ips: &[IpAddr]) -> bool {
+    world.network(network).is_some_and(|n| {
+        ips.iter().any(|ip| {
+            ipam::nic_subnet(&n.spec, ip.to_canonical())
+                .is_some_and(|s| !ipam::in_floating_range(s, *ip))
+        })
+    })
+}
+
+/// 감사의 외부 설명: `ext (203.0.113.5, 2001:db8::5)`, 범위 밖이면 ` admin override`
+fn external_note(world: &World, e: &RouterExternal) -> String {
+    let ips: Vec<String> = e.ips.iter().map(ToString::to_string).collect();
+    let mut out = format!("{} ({})", e.network, ips.join(", "));
+    if e.snat == Some(false) {
+        out.push_str(" no-snat");
+    }
+    if outside_floating(world, &e.network, &e.ips) {
+        out.push_str(" admin override");
+    }
+    out
 }
 
 /// 게이트웨이 노드 하나(Raft의 순위 — `HA_Chassis`)
@@ -392,6 +456,8 @@ pub struct RouterGateway {
     pub node_priority: u16,
     /// NB의 분산 게이트웨이 포트를 지금 이 노드가 가졌다(`status:hosting-chassis`). NB를 읽지 않았으면 거짓
     pub active: bool,
+    /// 노드가 살아 있다(`NodeStatus.online` — 리뷰 2 웹 I2). 거짓이면 OVN이 다음 살아 있는 후보로 넘긴다.
+    pub online: bool,
 }
 
 /// `GET /routers/{key}`: 라우터와 게이트웨이(Raft의 순위와 NB의 지금 주인)
@@ -442,6 +508,56 @@ fn yes() -> bool {
 pub struct RouterList {
     pub revision: u64,
     pub items: Vec<RouterView>,
+    /// 라우터 인터페이스인 네트워크 가운데 부른 사용자가 읽을 수 있는 것(그 라우터를 읽을 수 없어도 — 리뷰 2 웹 I1).
+    /// 유동 IP를 붙일 수 있는 NIC와 라우터를 이을 수 있는 네트워크를 웹이 서버와 같게 고르게 한다. 라우터 이름은 없다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(default)]
+    pub routed: Vec<RoutedNetwork>,
+}
+
+/// 라우터 인터페이스인 네트워크 하나(`RouterList.routed`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct RoutedNetwork {
+    /// 오버레이 네트워크 이름
+    pub network: String,
+    /// 그 라우터의 외부(공급자) 네트워크. 외부가 없으면 없고, 부른 사용자가 그 네트워크를 읽을 수 없으면 빈 글이다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, default)]
+    pub external: Option<String>,
+}
+
+/// 모든 라우터의 인터페이스 가운데 부른 사용자가 읽을 수 있는 네트워크(`RouterList.routed`)
+fn routed_networks(state: &AppState, principal: &Principal, world: &World) -> Vec<RoutedNetwork> {
+    let reads = |name: &str| {
+        world.network(name).is_some_and(|n| {
+            state
+                .authz
+                .allows(principal, Privilege::SystemRead, n.authz_target())
+        })
+    };
+    let mut out: Vec<RoutedNetwork> = world
+        .routers
+        .iter()
+        .flat_map(|r| {
+            r.spec
+                .interfaces
+                .iter()
+                .map(move |i| (i, r.spec.external.as_ref()))
+        })
+        .filter(|(i, _)| reads(&i.network))
+        .map(|(i, e)| RoutedNetwork {
+            network: i.network.clone(),
+            external: e.map(|e| {
+                if reads(&e.network) {
+                    e.network.clone()
+                } else {
+                    String::new()
+                }
+            }),
+        })
+        .collect();
+    out.sort_by(|a, b| a.network.cmp(&b.network));
+    out
 }
 
 /// NB에서 읽은 라우터 id → 게이트웨이 포트를 가진 chassis 이름(노드 UUID)
@@ -510,6 +626,11 @@ fn router_view(
                 .find(|(n, _)| *n == node)
                 .map_or(0, |(_, p)| *p),
             active: host.is_some_and(|c| *c == node.to_string()),
+            online: world
+                .nodes
+                .iter()
+                .find(|n| n.id == node)
+                .is_some_and(|n| n.status.online),
         })
         .collect();
     for i in &view.router.spec.interfaces {
@@ -549,6 +670,7 @@ pub async fn list_routers(
         (None, None)
     };
     let nodes = sees_nodes(&state, &principal);
+    let routed = routed_networks(&state, &principal, &world);
     let items = routers
         .into_iter()
         .map(|r| {
@@ -557,7 +679,11 @@ pub async fn list_routers(
             v
         })
         .collect();
-    Ok(Json(RouterList { revision, items }))
+    Ok(Json(RouterList {
+        revision,
+        items,
+        routed,
+    }))
 }
 
 /// 라우터 하나와 게이트웨이 순위·지금 주인. `live=false`면 NB를 읽지 않는다.
@@ -641,7 +767,7 @@ pub async fn create_router(
     for _ in 0..RETRIES {
         let world = World::load(&state)?;
         let mut spec = req.spec.clone();
-        check_router(&world, &spec, None)?;
+        check_router(&world, &spec, None, &reads(&state, &principal))?;
         if let Some(e) = &mut spec.external {
             fill_external(&world, e, None, None, admin)?;
         }
@@ -656,10 +782,14 @@ pub async fn create_router(
             Err(e) if is_ip_taken(&e) && retry => continue,
             Err(e) => return Err(e.into()),
         }
+        // 감사: 인터페이스(그 네트워크들의 기본 경로가 바뀐다)와 외부 주소(범위 밖이면 admin override — 리뷰 2 m-8)
         let mut detail = format!("router create {}", router.name);
+        for i in &router.spec.interfaces {
+            detail.push_str(&format!(" --interface {}", i.network));
+        }
         let mut warnings = Vec::new();
         if let Some(e) = &router.spec.external {
-            detail.push_str(&format!(" --external {}", e.network));
+            detail.push_str(&format!(" --external {}", external_note(&world, e)));
             if let Some(w) = world
                 .network(&e.network)
                 .and_then(|n| no_gateway(&world, n))
@@ -763,23 +893,25 @@ pub async fn patch_router(
                 .filter(|e| old.external.as_ref().map(|o| &o.network) != Some(&e.network))
                 .map(|e| e.network.as_str()),
         )?;
-        // 유동 IP가 지금 이 라우터로 라우팅되는데 그 길이 사라지면 막는다(§9.5 — 먼저 떼라).
-        let lost: Vec<&FloatingIp> = routed_fips(&world, old)
-            .into_iter()
-            .filter(|f| !routed_fips(&world, &spec).iter().any(|g| g.id == f.id))
-            .collect();
-        if !lost.is_empty() {
-            return Err(ApiError::conflict(
-                "fip_in_use",
-                format!(
-                    "floating IPs {} are routed through router {:?} this way; detach them first",
-                    names(&lost),
-                    router.name
-                ),
-            ));
+        // 라우터의 경로와 외부는 그 라우터의 모든 인터페이스 네트워크의 길을 바꾼다: 바꾸면 그 네트워크들 모두의
+        // `network.config`(리뷰 2 I-2 — 권한을 거둔 뒤나 네트워크를 다른 폴더로 옮긴 뒤에도 남의 네트워크 기본 경로를
+        // 돌리지 못하게).
+        if spec.routes != old.routes
+            || external_changes(req.external.as_ref(), old.external.as_ref())
+        {
+            state.authz.require_networks_with(
+                &principal,
+                Privilege::NetworkConfig,
+                spec.interfaces.iter().map(|i| i.network.as_str()),
+            )?;
         }
-        check_router(&world, &spec, Some(router.id))?;
-        if let Some(e) = &mut spec.external {
+        check_lost_fips(&state, &principal, &world, &router, &spec)?;
+        check_router(&world, &spec, Some(router.id), &reads(&state, &principal))?;
+        // 외부 주소는 `external`을 준 요청만 채운다: 다른 칸만 바꾸는 `PATCH`가 외부 네트워크에 새로 생긴 체계의 주소를
+        // 몰래 받거나 그 풀이 다 쓰여 실패하지 않게(리뷰 2 m-6).
+        if req.external.is_some()
+            && let Some(e) = &mut spec.external
+        {
             fill_external(
                 &world,
                 e,
@@ -811,7 +943,7 @@ pub async fn patch_router(
                 {
                     warnings.push(w);
                 }
-                audit.detail(router_change(&router.name, old, &spec));
+                audit.detail(router_change(&world, &router.name, old, &spec));
                 let mut out = router;
                 out.spec = spec;
                 out.revision = written;
@@ -829,8 +961,103 @@ pub async fn patch_router(
     ))
 }
 
+/// `PATCH`의 `external`(`req`)이 지금 외부 `old`를 바꾸는지: 지우기·다른 네트워크·SNAT·준 주소가 다르면. 같은 네트워크에
+/// 주소를 주지 않으면 지금 주소를 그대로 쓰므로 바꾸지 않는다.
+fn external_changes(req: Option<&Option<RouterExternal>>, old: Option<&RouterExternal>) -> bool {
+    match (req, old) {
+        (None, _) | (Some(None), None) => false,
+        (Some(Some(e)), Some(o)) => {
+            e.network != o.network
+                || e.snat() != o.snat()
+                || (!e.ips.is_empty()
+                    && e.ips
+                        .iter()
+                        .map(|ip| ip.to_canonical())
+                        .collect::<BTreeSet<_>>()
+                        != o.ips.iter().copied().collect())
+        }
+        _ => true,
+    }
+}
+
+/// 유동 IP가 지금 이 라우터로 라우팅되는데 `new`에서 그 길이 사라지면 409 `fip_in_use`(§9.5 — 먼저 떼라).
+fn check_lost_fips(
+    state: &AppState,
+    principal: &Principal,
+    world: &World,
+    router: &Router,
+    new: &RouterSpec,
+) -> Result<(), ApiError> {
+    let lost: Vec<&FloatingIp> = routed_fips(world, &router.spec)
+        .into_iter()
+        .filter(|f| !routed_fips(world, new).iter().any(|g| g.id == f.id))
+        .collect();
+    if lost.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(
+        "fip_in_use",
+        format!(
+            "{} routed through this router this way; detach them first",
+            visible_names(state, principal, "floating IP", lost)
+        ),
+    ))
+}
+
+/// 네트워크를 그 네트워크가 인터페이스인 라우터에서 뗀다(리뷰 2 I-2): 그 네트워크의 `network.config`(경로표)면 라우터를
+/// 읽을 수 없어도 된다 — 다른 폴더의 라우터가 권한을 거둔 뒤에도 내 네트워크의 기본 경로를 쥐고 있을 때 주인이 되찾는
+/// 길이다. 라우터가 없으면 404, 이 길로 라우팅되는 유동 IP가 있으면 409 `fip_in_use`.
+#[utoipa::path(delete, path = "/networks/{key}/router", tag = "routers",
+    params(("key" = String, Path, description = "network id or name")),
+    responses((status = 204, description = "Detached"), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn detach_network_router(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    // 경로표가 이 네트워크의 `network.config`를 봤다.
+    let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
+    for _ in 0..RETRIES * 2 {
+        let world = World::load(&state)?;
+        let Some(router) = world.router_of(&network.name, None).cloned() else {
+            return Err(ApiError::not_found(format!(
+                "network {:?} is not an interface of a router",
+                network.name
+            )));
+        };
+        let mut spec = router.spec.clone();
+        spec.interfaces.retain(|i| i.network != network.name);
+        check_lost_fips(&state, &principal, &world, &router, &spec)?;
+        match state
+            .cluster
+            .update_spec(
+                router.id,
+                Some(router.revision),
+                router.labels.clone(),
+                &spec,
+            )
+            .await
+        {
+            Ok(_) => {
+                audit.detail(format!(
+                    "router interface remove {} {} (by the network)",
+                    router.name, network.name
+                ));
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the router kept changing while being updated; try again",
+    ))
+}
+
 /// 감사 설명: 바뀐 것(인터페이스 더하기·빼기, 외부, 경로)
-fn router_change(name: &str, old: &RouterSpec, new: &RouterSpec) -> String {
+fn router_change(world: &World, name: &str, old: &RouterSpec, new: &RouterSpec) -> String {
     let mut parts = Vec::new();
     for i in new
         .interfaces
@@ -848,7 +1075,7 @@ fn router_change(name: &str, old: &RouterSpec, new: &RouterSpec) -> String {
     }
     if old.external != new.external {
         parts.push(match &new.external {
-            Some(e) => format!("router external set {name} {}", e.network),
+            Some(e) => format!("router external set {name} {}", external_note(world, e)),
             None => format!("router external clear {name}"),
         });
     }
@@ -1150,8 +1377,10 @@ fn check_target(
         return Err(ApiError::conflict(
             "fip_in_use",
             format!(
-                "the NIC {} of VM {:?} already has floating IP {:?}",
-                target.mac, vm.name, other.name
+                "the NIC {} of VM {:?} already has {}",
+                target.mac,
+                vm.name,
+                visible_names(state, principal, "floating IP", [other])
             ),
         ));
     }
@@ -1232,7 +1461,23 @@ pub async fn create_floating_ip(
             Err(e) if is_ip_taken(&e) && req.spec.address.is_none() => continue,
             Err(e) => return Err(e.into()),
         }
-        audit.detail(format!("fip create {} -> {address}", fip.spec.network));
+        // 감사: 이름·주소(범위 밖이면 admin override)와 붙인 VM NIC(밖에 내놓는 일 — 리뷰 2 m-8)
+        let mut detail = format!(
+            "fip create {} --network {} --ip {address}",
+            fip.name, fip.spec.network
+        );
+        if outside_floating(&world, &fip.spec.network, &[address]) {
+            detail.push_str(" admin override");
+        }
+        if let Some(t) = fip.spec.target {
+            let vm = world
+                .vms
+                .iter()
+                .find(|v| v.id == t.vm)
+                .map_or_else(|| t.vm.to_string(), |v| v.name.clone());
+            detail.push_str(&format!(" --attach {vm}/{}", t.mac));
+        }
+        audit.detail(detail);
         return Ok((StatusCode::CREATED, Json(fip)));
     }
     Err(ApiError::conflict(
@@ -1348,33 +1593,68 @@ pub async fn delete_floating_ip(
 
 // ---- 다른 자리에서 쓰는 검사 ----
 
-/// 네트워크를 지우기 전에(§8): 라우터의 인터페이스·외부이거나 유동 IP가 있으면 409 `network_in_use`(이름들).
-pub(crate) fn check_network_unused(state: &AppState, network: &Network) -> Result<(), ApiError> {
+/// 이름이 `network`인 네트워크를 쓰는 라우터(인터페이스·외부)와 유동 IP의 문구. 읽을 수 없는 것은 센다(리뷰 2 m-5).
+fn network_users(
+    state: &AppState,
+    principal: &Principal,
+    network: &str,
+) -> Result<Option<String>, ApiError> {
     let (_, routers) = state.cluster.list::<RouterSpec>()?;
     let (_, fips) = state.cluster.list::<FloatingIpSpec>()?;
-    let mut users: Vec<String> = routers
+    let routers: Vec<&Router> = routers
         .iter()
         .filter(|r| {
-            r.spec.interfaces.iter().any(|i| i.network == network.name)
+            r.spec.interfaces.iter().any(|i| i.network == network)
                 || r.spec
                     .external
                     .as_ref()
-                    .is_some_and(|e| e.network == network.name)
+                    .is_some_and(|e| e.network == network)
         })
-        .map(|r| format!("router {:?}", r.name))
         .collect();
-    users.extend(
-        fips.iter()
-            .filter(|f| f.spec.network == network.name)
-            .map(|f| format!("floating IP {:?}", f.name)),
-    );
-    if users.is_empty() {
-        return Ok(());
+    let fips: Vec<&FloatingIp> = fips.iter().filter(|f| f.spec.network == network).collect();
+    let mut users = Vec::new();
+    if !routers.is_empty() {
+        users.push(visible_names(state, principal, "router", routers));
     }
-    Err(ApiError::conflict(
-        "network_in_use",
-        format!("network {:?} is used by {}", network.name, users.join(", ")),
-    ))
+    if !fips.is_empty() {
+        users.push(visible_names(state, principal, "floating IP", fips));
+    }
+    Ok((!users.is_empty()).then(|| users.join(", ")))
+}
+
+/// 네트워크를 지우기 전에(§8): 라우터의 인터페이스·외부이거나 유동 IP가 있으면 409 `network_in_use`(읽을 수 있는 이름들).
+pub(crate) fn check_network_unused(
+    state: &AppState,
+    principal: &Principal,
+    network: &Network,
+) -> Result<(), ApiError> {
+    match network_users(state, principal, &network.name)? {
+        None => Ok(()),
+        Some(users) => Err(ApiError::conflict(
+            "network_in_use",
+            format!("network {:?} is used by {users}", network.name),
+        )),
+    }
+}
+
+/// 네트워크를 만들기 전에: 지운 같은 이름의 네트워크를 라우터·유동 IP가 아직 가리키면 409 `network_in_use`(리뷰 2 m-4 —
+/// 라우터 만들기와 네트워크 지우기가 겹쳐 남은 이름을 새 네트워크가 물려받으면, 남의 라우터가 그 네트워크의 기본 경로가
+/// 된다). 라우터·유동 IP는 네트워크를 이름으로 가리키므로(옛 JSON 그대로) 물려받기를 막는다.
+pub(crate) fn check_name_unreferenced(
+    state: &AppState,
+    principal: &Principal,
+    name: &str,
+) -> Result<(), ApiError> {
+    match network_users(state, principal, name)? {
+        None => Ok(()),
+        Some(users) => Err(ApiError::conflict(
+            "network_in_use",
+            format!(
+                "{users} still refer to a deleted network named {name:?}; remove those references \
+                 (or use another name) first"
+            ),
+        )),
+    }
 }
 
 /// 서브넷을 빼기 전에(§8): 라우터 외부 주소·유동 IP가 그 서브넷 주소를 쓰면 409 `subnet_in_use`
@@ -1472,11 +1752,19 @@ mod tests {
             "external": { "network": "ext" }
         }))
         .unwrap();
+        let w = world(Vec::new(), Vec::new());
         assert_eq!(
-            router_change("r1", &old, &new),
-            "router interface add r1 b, router interface remove r1 a, router external set r1 ext"
+            router_change(&w, "r1", &old, &new),
+            "router interface add r1 b, router interface remove r1 a, router external set r1 ext ()"
         );
-        assert_eq!(router_change("r1", &old, &old), "router update r1");
+        assert_eq!(router_change(&w, "r1", &old, &old), "router update r1");
+        // 리뷰 2 m-8: 같은 외부 네트워크에서 주소만 바꿔도 새 주소가 남는다.
+        let mut moved = new.clone();
+        moved.external.as_mut().unwrap().ips = vec!["203.0.113.7".parse().unwrap()];
+        assert_eq!(
+            router_change(&w, "r1", &new, &moved),
+            "router external set r1 ext (203.0.113.7)"
+        );
     }
 
     fn world(vms: Vec<Vm>, routers: Vec<Router>) -> World {
@@ -1517,6 +1805,41 @@ mod tests {
             panic!("not unrouted");
         };
         assert!(reason.contains("\"secret-db\""), "{reason}");
+    }
+
+    /// 리뷰 2 I-2: 외부를 바꾸는 `PATCH`(지우기·네트워크·SNAT·다른 주소)만 모든 인터페이스 네트워크의 권한을 본다.
+    #[test]
+    fn only_real_external_changes_count() {
+        let ext = |network: &str, ips: &[&str], snat: Option<bool>| RouterExternal {
+            network: network.into(),
+            ips: ips.iter().map(|i| i.parse().unwrap()).collect(),
+            snat,
+        };
+        let old = ext("ext", &["203.0.113.5"], None);
+        assert!(!external_changes(None, Some(&old)));
+        assert!(!external_changes(Some(&None), None));
+        assert!(!external_changes(
+            Some(&Some(ext("ext", &[], None))),
+            Some(&old)
+        ));
+        assert!(!external_changes(
+            Some(&Some(ext("ext", &["203.0.113.5"], Some(true)))),
+            Some(&old)
+        ));
+        assert!(external_changes(Some(&None), Some(&old)));
+        assert!(external_changes(
+            Some(&Some(ext("ext2", &[], None))),
+            Some(&old)
+        ));
+        assert!(external_changes(
+            Some(&Some(ext("ext", &[], Some(false)))),
+            Some(&old)
+        ));
+        assert!(external_changes(
+            Some(&Some(ext("ext", &["203.0.113.6"], None))),
+            Some(&old)
+        ));
+        assert!(external_changes(Some(&Some(ext("ext", &[], None))), None));
     }
 
     /// 리뷰 1 M-6: 준 주소나 지금 주소만 쓴 외부는 Raft의 주소 겹침을 다시 고르기로 받지 않는다(곧바로 409).

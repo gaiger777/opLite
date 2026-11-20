@@ -426,6 +426,10 @@ enum NetEntry<'a> {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         mac_address: Option<String>,
+        /// 계획 66 리뷰 2 m-7: 공급자 네트워크 NIC의 고정 IPv6는 `false` — 물리 라우터의 RA(A 플래그)로 게스트가 만드는
+        /// SLAAC 주소는 포트 보안(IPAM 주소만)이 막으므로 그 주소를 만들지 않게 한다. 없으면 쓰지 않는다.
+        #[serde(rename = "accept-ra", skip_serializing_if = "Option::is_none")]
+        accept_ra: Option<bool>,
         subnets: Vec<Subnet<'a>>,
     },
     Nameserver {
@@ -632,10 +636,13 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec], sdn: &SdnSubnets) -> Option<
         .enumerate()
         .map(|(i, nic)| {
             if let Some(net) = sdn.get(&nic.network) {
+                let subnets = sdn_subnets(nic, net);
+                let static6 = subnets.iter().any(|s| matches!(s, Subnet::Static6 { .. }));
                 return NetEntry::Physical {
                     name: format!("eth{i}"),
                     mac_address: nic.mac.map(|m| m.to_string()),
-                    subnets: sdn_subnets(nic, net),
+                    accept_ra: (net.spec.is_provider() && static6).then_some(false),
+                    subnets,
                 };
             }
             let net = ci.networks.get(i);
@@ -664,6 +671,7 @@ fn network_config(ci: &CloudInit, nics: &[NicSpec], sdn: &SdnSubnets) -> Option<
             NetEntry::Physical {
                 name: format!("eth{i}"),
                 mac_address: nic.mac.map(|m| m.to_string()),
+                accept_ra: None,
                 subnets,
             }
         })
@@ -1349,7 +1357,9 @@ mod tests {
             { "network": "unrouted", "model": "virtio", "mac": "52:54:00:00:00:04",
               "ips": ["10.8.0.7", "2001:db8:3::5054:ff:fe00:4"] },
             { "network": "ext", "model": "virtio", "mac": "52:54:00:00:00:05",
-              "ips": ["203.0.113.10"] }
+              "ips": ["203.0.113.10"] },
+            { "network": "ext6", "model": "virtio", "mac": "52:54:00:00:00:06",
+              "ips": ["2001:db8:9::10"] }
         ]))
         .unwrap();
         let sdn: SdnSubnets = serde_json::from_value(serde_json::json!({
@@ -1369,6 +1379,9 @@ mod tests {
             ] } },
             "ext": { "spec": { "sdn": { "provider": { "physnet": "ext" } }, "subnets": [
                 { "cidr": "203.0.113.0/24" }
+            ] } },
+            "ext6": { "spec": { "sdn": { "provider": { "physnet": "ext6" } }, "subnets": [
+                { "cidr": "2001:db8:9::/64" }
             ] } }
         }))
         .unwrap();
@@ -1396,6 +1409,18 @@ mod tests {
                 ]),
             ]
         );
+        // 리뷰 2 m-7: 공급자 네트워크 NIC의 고정 IPv6는 RA를 받지 않는다(물리 라우터의 RA로 만든 SLAAC 주소는 포트
+        // 보안이 막는다). IPv4만인 공급자 NIC와 오버레이 NIC는 쓰지 않는다.
+        assert_eq!(net["config"][5]["accept-ra"], false, "{net}");
+        assert_eq!(
+            net["config"][5]["subnets"],
+            serde_json::json!([
+                { "type": "static6", "address": "2001:db8:9::10/64", "gateway": "2001:db8:9::1" }
+            ])
+        );
+        for i in 0..5 {
+            assert!(net["config"][i].get("accept-ra").is_none(), "{net}");
+        }
         // instance-id는 NIC 주소로만 센다(라우터를 붙여도 그대로).
         let mut unrouted = sdn.clone();
         for n in unrouted.values_mut() {

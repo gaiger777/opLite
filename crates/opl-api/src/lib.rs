@@ -272,6 +272,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             sdn::patch_network
         ))
         .routes(routes!(sdn::network_ips))
+        .routes(routes!(routing::detach_network_router))
         .routes(routes!(routing::list_routers, routing::create_router))
         .routes(routes!(
             routing::get_router,
