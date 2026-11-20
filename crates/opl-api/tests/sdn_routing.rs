@@ -225,14 +225,27 @@ async fn node_sdn_settings() {
         "{body}"
     );
     let id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
-    let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
-    vm.status.node = Some(env.node);
-    vm.status.phase = VmPhase::Running;
-    env.cluster
-        .update_status::<VmSpec>(id, &vm.status)
-        .await
-        .unwrap();
-    let (status, body) = put_node_sdn(&env, &admin, Some(json!({ "gateway": 100 }))).await;
+    // 이 노드에서 도는 것으로 적는다. 시험의 조정기가 느린 노드(svc01)에서 상태를 고쳐 쓸 수 있으므로, 409가
+    // 나올 때까지 적고 다시 묻는다(한도 안에서).
+    let mut tries = 0;
+    let (status, body) = loop {
+        let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
+        vm.status.node = Some(env.node);
+        vm.status.phase = VmPhase::Running;
+        env.cluster
+            .update_status::<VmSpec>(id, &vm.status)
+            .await
+            .unwrap();
+        let (status, body) = put_node_sdn(&env, &admin, Some(json!({ "gateway": 100 }))).await;
+        tries += 1;
+        if status == StatusCode::CONFLICT || tries >= 20 {
+            break (status, body);
+        }
+        // 상태가 덮여 PUT이 받아들여졌다 — physnet을 되돌리고 다시 해 본다.
+        let (status, body) = put_node_sdn(&env, &admin, Some(set.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     code(status, &body, StatusCode::CONFLICT, "physnet_in_use");
     assert_eq!(body["details"]["vms"], json!(["web"]), "{body}");
     // 리뷰 1 #3: 같은 physnet의 브리지를 바꾸는 것도 도는 VM을 다른 L2로 옮기므로 막는다.
@@ -252,6 +265,7 @@ async fn node_sdn_settings() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    let mut vm = env.cluster.get::<VmSpec>(id).unwrap().unwrap();
     vm.status.phase = VmPhase::Stopped;
     env.cluster
         .update_status::<VmSpec>(id, &vm.status)
