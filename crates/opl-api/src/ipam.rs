@@ -2,16 +2,21 @@
 //! ([`assign`])와 Task가 새 VM을 만들 때(복제·배포·가져오기·복원, [`assign_new`]) 채운다. 쓰고 있는 주소는 그
 //! 네트워크를 쓰는 템플릿 아닌 VM 스펙의 `ips`와 예약이다. 두 API 노드가 같은 주소를 동시에 고르면 Raft 상태 머신이
 //! 하나를 `InUse { field: "ip" }`로 거절하고([`is_ip_taken`]) 부른 쪽이 다시 고른다([`RETRIES`]번까지).
+//!
+//! 공급자 네트워크(계획 66 §8)에서는 라우터 외부 주소와 유동 IP도 같은 주소 공간을 쓴다([`HeldIps`] — Raft의 겹침 키도
+//! 셋이 하나다). NIC는 유동 IP 풀에서 저절로 받지 않고, SLAAC 계열 IPv6 서브넷의 NIC 주소는 MAC의 EUI-64다.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::cloud_init::CloudInitNet;
+use opl_types::floating_ip::{FloatingIp, FloatingIpSpec};
 use opl_types::ipam::{self, IpamError};
 use opl_types::network::{Network, NetworkSpec, Subnet};
-use opl_types::vm::{Vm, VmSpec};
+use opl_types::router::{Router, RouterSpec};
+use opl_types::vm::{MacAddr, Vm, VmSpec};
 
 use opl_types::authz::Privilege;
 
@@ -43,19 +48,81 @@ pub(crate) fn is_ip_taken(e: &ClusterError) -> bool {
     matches!(e, ClusterError::Rejected(Rejection::InUse { field, .. }) if field == "ip")
 }
 
+/// 네트워크 이름 → 라우터 외부 주소·유동 IP가 쓰는 주소(계획 66 §8). NIC 주소와 같은 주소 공간이다.
+pub(crate) type HeldIps = BTreeMap<String, BTreeSet<IpAddr>>;
+
+/// 라우터들 `routers`의 외부 주소와 유동 IP들 `fips`의 주소(`except`의 것은 뺀다 — 자기 자신을 고쳐 쓸 때)
+pub(crate) fn held_ips(
+    routers: &[Router],
+    fips: &[FloatingIp],
+    except: Option<uuid::Uuid>,
+) -> HeldIps {
+    let mut out = HeldIps::new();
+    for r in routers.iter().filter(|r| Some(r.id) != except) {
+        if let Some(e) = &r.spec.external {
+            out.entry(e.network.clone())
+                .or_default()
+                .extend(e.ips.iter().map(|ip| ip.to_canonical()));
+        }
+    }
+    for f in fips.iter().filter(|f| Some(f.id) != except) {
+        if let Some(a) = f.spec.address {
+            out.entry(f.spec.network.clone())
+                .or_default()
+                .insert(a.to_canonical());
+        }
+    }
+    out
+}
+
+/// 저장소의 라우터·유동 IP가 쓰는 주소
+pub(crate) fn load_held(cluster: &Cluster) -> Result<HeldIps, ApiError> {
+    let (_, routers) = cluster.list::<RouterSpec>()?;
+    let (_, fips) = cluster.list::<FloatingIpSpec>()?;
+    Ok(held_ips(&routers, &fips, None))
+}
+
+/// NIC(MAC `mac`)의 주소를 서브넷에서 고른다: SLAAC 계열 IPv6 서브넷은 EUI-64(MAC이 아직 없으면 — 복제 미리 보기 —
+/// 원하는 주소는 400, 아니면 고르지 않는다), 아니면 유동 IP 풀을 건너뛰는 [`ipam::allocate`]
+fn allocate_nic(
+    subnet: &Subnet,
+    mac: Option<MacAddr>,
+    used: &BTreeSet<IpAddr>,
+    want: Option<IpAddr>,
+) -> Result<Option<IpAddr>, IpamError> {
+    match (ipam::slaac_prefix(subnet), mac) {
+        (Some(_), Some(mac)) => ipam::allocate_v6_mode(subnet, mac, used, want).map(Some),
+        (Some(_), None) => match want {
+            Some(w) => Err(IpamError::NotEui64(
+                w,
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+            )),
+            None => Ok(None),
+        },
+        (None, _) => ipam::allocate(subnet, used, want).map(Some),
+    }
+}
+
 /// 이름이 `name`인 SDN 네트워크
 fn sdn_network<'a>(networks: &'a [Network], name: &str) -> Option<&'a Network> {
     networks.iter().find(|n| n.name == name && n.spec.is_sdn())
 }
 
-/// 네트워크 `network`(이름)에서 VM들 `vms`가 쓰는 주소(템플릿은 주소를 갖지 않는다)
-fn used_ips<'a>(vms: impl IntoIterator<Item = &'a Vm>, network: &str) -> BTreeSet<IpAddr> {
-    vms.into_iter()
+/// 네트워크 `network`(이름)에서 VM들 `vms`(템플릿은 주소를 갖지 않는다)와 라우터·유동 IP(`held`)가 쓰는 주소
+fn used_ips<'a>(
+    vms: impl IntoIterator<Item = &'a Vm>,
+    held: &HeldIps,
+    network: &str,
+) -> BTreeSet<IpAddr> {
+    let mut used: BTreeSet<IpAddr> = vms
+        .into_iter()
         .filter(|v| !v.spec.template)
         .flat_map(|v| v.spec.nics.iter())
         .filter(|n| n.network == network)
         .flat_map(|n| n.ips.iter().map(|ip| ip.to_canonical()))
-        .collect()
+        .collect();
+    used.extend(held.get(network).into_iter().flatten().copied());
+    used
 }
 
 /// 주소 `ip`를 가진 VM(오류 문구용)
@@ -84,7 +151,8 @@ fn exhausted(network: &str, e: IpamError) -> ApiError {
 ///   클라이언트의 PUT이 주소를 지우지 않게). 그 주소는 다시 보지 않는다(풀을 줄여도 남는다).
 /// - 새로 준 주소는 그 네트워크의 서브넷 안(400)이고 예약이 아니며(400) 다른 NIC가 쓰지 않아야 한다(409 `ip_in_use`).
 /// - **새 NIC**(새 VM, 새 MAC, 바꾼 네트워크, 템플릿에서 되돌림)만 비어 있는 주소 체계마다 서브넷에서 가장 낮은 빈 주소를
-///   받는다(다 쓰였으면 409 `ip_exhausted`). 이미 있던 NIC는 여기서 채우지 않는다(설계 §9 — 주소가 하나도 없는 NIC는 서브넷을 더하는 `PATCH`가 채운다, 리뷰 2 N-4).
+///   받는다(다 쓰였으면 409 `ip_exhausted`, 유동 IP 풀은 건너뜀). SLAAC 계열 IPv6 서브넷(계획 66 §10)은 MAC의 EUI-64이고
+///   다른 주소를 주면 400이다. 라우터 외부 주소·유동 IP(`held`)도 쓴 주소다. 이미 있던 NIC는 여기서 채우지 않는다(설계 §9 — 주소가 하나도 없는 NIC는 서브넷을 더하는 `PATCH`가 채운다, 리뷰 2 N-4).
 ///
 /// `sees`는 부른 사용자가 읽을 수 있는 VM인지다: 409 `ip_in_use`는 그런 VM만 이름으로 알린다(리뷰 1 I-2 — 다른
 /// 폴더의 VM 이름을 드러내지 않게).
@@ -93,6 +161,7 @@ pub(crate) fn assign(
     current: Option<&VmSpec>,
     others: &[&Vm],
     networks: &[Network],
+    held: &HeldIps,
     sees: &dyn Fn(&Vm) -> bool,
 ) -> Result<(), ApiError> {
     for (i, nic) in spec.nics.iter().enumerate() {
@@ -136,13 +205,14 @@ pub(crate) fn assign(
                 .map(|n| n.ips.clone())
         });
         // 이 스펙의 앞 NIC가 같은 네트워크에서 쓰는 주소도 쓴 것이다.
-        let mut used = used_ips(others.iter().copied(), &net.name);
+        let mut used = used_ips(others.iter().copied(), held, &net.name);
         used.extend(
             spec.nics[..i]
                 .iter()
                 .filter(|n| n.network == net.name)
                 .flat_map(|n| n.ips.iter().copied()),
         );
+        let mac = nic.mac;
         let mut ips: Vec<IpAddr> = if nic.ips.is_empty() {
             kept.clone().unwrap_or_default()
         } else {
@@ -158,13 +228,16 @@ pub(crate) fn assign(
                     net.name
                 )));
             };
-            match ipam::allocate(subnet, &used, Some(*ip)) {
+            match allocate_nic(subnet, mac, &used, Some(*ip)) {
                 Ok(_) => {}
                 Err(IpamError::InUse(ip)) => {
-                    let by = holder(others, &net.name, ip)
-                        .filter(|v| sees(v))
-                        .map(|v| format!(" by VM {:?}", v.name))
-                        .unwrap_or_default();
+                    let by = match holder(others, &net.name, ip) {
+                        Some(v) if sees(v) => format!(" by VM {:?}", v.name),
+                        None if held.get(&net.name).is_some_and(|h| h.contains(&ip)) => {
+                            " by a router or floating IP".to_string()
+                        }
+                        _ => String::new(),
+                    };
                     return Err(ApiError::conflict(
                         "ip_in_use",
                         format!(
@@ -182,8 +255,11 @@ pub(crate) fn assign(
                 if ips.iter().any(|ip| ip.is_ipv4() == subnet.is_ipv4()) {
                     continue;
                 }
-                let ip =
-                    ipam::allocate(subnet, &used, None).map_err(|e| exhausted(&net.name, e))?;
+                let Some(ip) =
+                    allocate_nic(subnet, mac, &used, None).map_err(|e| exhausted(&net.name, e))?
+                else {
+                    continue;
+                };
                 used.insert(ip);
                 ips.push(ip);
             }
@@ -247,7 +323,14 @@ pub(crate) fn check_requested(
     let groups = sdn_groups_allowed(cluster)?;
     strip_sdn_nic_config(&mut new, &networks, groups);
     let others: Vec<&Vm> = vms.iter().collect();
-    assign(&mut new, None, &others, &networks, sees)
+    assign(
+        &mut new,
+        None,
+        &others,
+        &networks,
+        &load_held(cluster)?,
+        sees,
+    )
 }
 
 /// 복제·배포·가져오기·복원이 만드는 새 VM `spec`에서 SDN 네트워크 NIC의 cloud-init 주소 항목을 뺀다(리뷰 1 웹 #2 —
@@ -297,6 +380,7 @@ pub(crate) fn assign_new(
     spec: &mut VmSpec,
     vms: &[&Vm],
     networks: &[Network],
+    held: &HeldIps,
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     if spec.template {
@@ -315,18 +399,19 @@ pub(crate) fn assign_new(
             }
             continue;
         };
-        let mut used = used_ips(vms.iter().copied(), &net.name);
+        let mut used = used_ips(vms.iter().copied(), held, &net.name);
         used.extend(
             spec.nics[..i]
                 .iter()
                 .filter(|n| n.network == net.name)
                 .flat_map(|n| n.ips.iter().copied()),
         );
+        let mac = nic.mac;
         let mut ips = Vec::new();
         let mut dropped = Vec::new();
         for ip in nic.ips.iter().map(|ip| ip.to_canonical()) {
             let fits = ipam::nic_subnet(&net.spec, ip)
-                .is_some_and(|s| ipam::allocate(s, &used, Some(ip)).is_ok())
+                .is_some_and(|s| allocate_nic(s, mac, &used, Some(ip)).is_ok())
                 && !ips.iter().any(|a: &IpAddr| a.is_ipv4() == ip.is_ipv4());
             if fits {
                 used.insert(ip);
@@ -339,8 +424,11 @@ pub(crate) fn assign_new(
             if ips.iter().any(|ip| ip.is_ipv4() == subnet.is_ipv4()) {
                 continue;
             }
-            let ip = ipam::allocate(subnet, &used, None)
-                .map_err(|e| format!("network {:?}: {e}", net.name))?;
+            let Some(ip) = allocate_nic(subnet, mac, &used, None)
+                .map_err(|e| format!("network {:?}: {e}", net.name))?
+            else {
+                continue;
+            };
             used.insert(ip);
             ips.push(ip);
         }
@@ -388,7 +476,9 @@ pub(crate) fn fill_empty(
     {
         let mut ips = Vec::new();
         for subnet in added {
-            let ip = ipam::allocate(subnet, used, None)?;
+            let Some(ip) = allocate_nic(subnet, nic.mac, used, None)? else {
+                continue;
+            };
             used.insert(ip);
             ips.push(ip);
         }
@@ -401,14 +491,19 @@ pub(crate) fn fill_empty(
     Ok(filled)
 }
 
-/// 네트워크 `network`에서 VM들 `vms`가 쓰는 주소([`fill_empty`]의 `used`)
-pub(crate) fn network_used(vms: &[Vm], network: &str) -> BTreeSet<IpAddr> {
-    used_ips(vms, network)
+/// 네트워크 `network`에서 VM들 `vms`와 라우터·유동 IP(`held`)가 쓰는 주소([`fill_empty`]의 `used`)
+pub(crate) fn network_used(vms: &[Vm], held: &HeldIps, network: &str) -> BTreeSet<IpAddr> {
+    used_ips(vms, held, network)
 }
 
 /// 주소가 하나도 없는 NIC(템플릿 아닌 VM) 수와, 더한 서브넷 `added` 가운데 그만큼 줄 수 없는 것마다 "CIDR (n free)".
 /// 비어 있으면 모두 채울 수 있다.
-pub(crate) fn fill_shortages(vms: &[Vm], network: &str, added: &[Subnet]) -> (usize, Vec<String>) {
+pub(crate) fn fill_shortages(
+    vms: &[Vm],
+    held: &HeldIps,
+    network: &str,
+    added: &[Subnet],
+) -> (usize, Vec<String>) {
     let needed = vms
         .iter()
         .filter(|v| !v.spec.template)
@@ -419,8 +514,9 @@ pub(crate) fn fill_shortages(vms: &[Vm], network: &str, added: &[Subnet]) -> (us
     if needed == 0 {
         return (0, short);
     }
-    for subnet in added {
-        let mut used = used_ips(vms, network);
+    // EUI-64 서브넷(MAC에서 정함)은 모자라지 않는다.
+    for subnet in added.iter().filter(|s| ipam::slaac_prefix(s).is_none()) {
+        let mut used = used_ips(vms, held, network);
         let mut free = 0;
         while free < needed {
             match ipam::allocate(subnet, &used, None) {

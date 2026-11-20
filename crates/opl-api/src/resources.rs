@@ -339,7 +339,8 @@ list_and_get!(
     SecurityGroupStatus,
     "/security-groups",
     "/security-groups/{key}",
-    "security-groups"
+    "security-groups",
+    |state, _, _, group| crate::security_groups::count_nics(state, group)
 );
 list_and_get!(
     list_backup_jobs,
@@ -443,7 +444,11 @@ pub async fn create_pool(
 }
 
 /// 노드의 자원(경로·장치·브리지)을 가리키는 쓰기: 루트 `cluster.admin`이 없으면 403.
-fn require_host_admin(state: &AppState, principal: &Principal, what: &str) -> Result<(), ApiError> {
+pub(crate) fn require_host_admin(
+    state: &AppState,
+    principal: &Principal,
+    what: &str,
+) -> Result<(), ApiError> {
     if state.authz.allows(
         principal,
         Privilege::ClusterAdmin,
@@ -700,14 +705,21 @@ fn check_pool_local(state: &AppState, pool: &StoragePool) -> Result<(), ApiError
 /// 네트워크(`sdn`, 서브넷 `subnets` — 계획 65). 이름 `user`와 브리지 `br-int`는 예약되어 있다. SDN 네트워크는 폴더의
 /// `network.config`로 만들고, SDN(OVN)이 세워지지 않았으면 409 `sdn_not_ready`, 서브넷 검증은 400 `invalid_subnet`.
 /// VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
+///
+/// 공급자(외부) 네트워크(`sdn.provider {physnet, vlan}` — 계획 66 §8)는 노드의 물리 망에 붙으므로 루트 `cluster.admin`이고,
+/// 같은 physnet·VLAN의 공급자 네트워크가 있으면 409 `physnet_conflict`다. 공급자 네트워크와 서브넷의 `floating_pools`·
+/// `ipv6_mode`는 모든 노드가 `sdn-routing`을 알아야 한다(409 `cluster_upgrading`, 검증보다 먼저). physnet이 준비된 노드가
+/// 없어도 만들고 `orbivisor-warning`으로 알린다.
 #[utoipa::path(post, path = "/networks", tag = "networks",
     request_body = CreateRequest<NetworkSpec>,
-    responses((status = 201, body = Resource<NetworkSpec, NetworkStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 201, body = Resource<NetworkSpec, NetworkStatus>,
+        headers(("orbivisor-warning" = String, description = "no node has the provider network's physnet ready (only then)"))),
+        (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn create_network(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     Json(req): Json<CreateRequest<NetworkSpec>>,
-) -> Result<(StatusCode, Json<Network>), ApiError> {
+) -> Result<(StatusCode, HeaderMap, Json<Network>), ApiError> {
     check_name(&req.name)?;
     if req.spec.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
@@ -716,18 +728,9 @@ pub async fn create_network(
     if req.spec.sdn.is_some() || !req.spec.subnets.is_empty() {
         require_feature(&state.cluster, opl_types::node::SDN)?;
     }
-    // 공급자 네트워크와 서브넷의 유동 IP 풀·IPv6 모드(계획 66)는 API 스테이지 전까지 막는다.
-    if req.spec.is_provider() {
-        return Err(crate::sdn::routing_not_yet(
-            &state.cluster,
-            "provider networks (sdn.provider)",
-        ));
-    }
-    if req.spec.subnets.iter().any(crate::sdn::subnet_uses_routing) {
-        return Err(crate::sdn::routing_not_yet(
-            &state.cluster,
-            "floating_pools and ipv6_mode",
-        ));
+    // 공급자 네트워크와 서브넷의 유동 IP 풀·IPv6 모드(계획 66)도 옛 노드가 풀지 못한다.
+    if req.spec.is_provider() || req.spec.subnets.iter().any(crate::sdn::subnet_uses_routing) {
+        require_feature(&state.cluster, opl_types::node::SDN_ROUTING)?;
     }
     state.authz.require_new(
         &principal,
@@ -736,9 +739,12 @@ pub async fn create_network(
         req.spec.folder,
     )?;
     // 브리지 네트워크는 노드의 브리지·NIC·VLAN에 VM을 붙인다: 루트 `cluster.admin`이다. 폴더의 `network.config`로는
-    // orbivisord가 만드는 VXLAN 네트워크만 만든다(리뷰 1).
+    // orbivisord가 만드는 VXLAN 네트워크만 만든다(리뷰 1). 공급자 네트워크도 노드의 물리 망이다(계획 66 §8).
     if req.spec.bridge.is_some() {
         require_host_admin(&state, &principal, "creating a bridge network")?;
+    }
+    if req.spec.is_provider() {
+        require_host_admin(&state, &principal, "creating a provider network")?;
     }
     if req.name == USER_NETWORK {
         return Err(ApiError::bad_request(format!(
@@ -766,23 +772,67 @@ pub async fn create_network(
             ));
         }
     }
+    let mut warnings = Vec::new();
+    if let Some(provider) = req.spec.provider() {
+        let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+        if let Some(other) = networks
+            .iter()
+            .find(|n| n.spec.provider().is_some_and(|p| p.key() == provider.key()))
+        {
+            return Err(ApiError::conflict(
+                "physnet_conflict",
+                format!(
+                    "provider network {:?} already uses physnet {} ({})",
+                    other.name,
+                    provider.physnet,
+                    provider
+                        .vlan
+                        .map_or_else(|| "flat".to_string(), |v| format!("VLAN {v}"))
+                ),
+            ));
+        }
+        let (_, nodes) = state.cluster.list::<NodeSpec>()?;
+        if !nodes.iter().any(|n| {
+            n.status
+                .sdn
+                .as_ref()
+                .is_some_and(|s| s.physnet_ready(&provider.physnet))
+        }) {
+            warnings.push(format!(
+                "no node has physnet {} ready yet; VMs on this network cannot start until one has                  (`orbivisorctl node sdn NODE --physnet {}=BRIDGE`)",
+                provider.physnet, provider.physnet
+            ));
+        }
+    }
     let mut network = Resource::new(req.name, req.spec);
     network.labels = req.labels;
     network.revision = state.cluster.create(&network).await?;
-    Ok((StatusCode::CREATED, Json(network)))
+    let mut headers = HeaderMap::new();
+    if let Some(v) = warnings
+        .first()
+        .and_then(|w| axum::http::HeaderValue::from_str(w).ok())
+    {
+        headers.insert(crate::revision::WARNING, v);
+    }
+    Ok((StatusCode::CREATED, headers, Json(network)))
 }
 
-/// VM이 쓰고 있으면 409
+/// VM이 쓰거나, 라우터의 인터페이스·외부이거나, 유동 IP가 있으면 409 `network_in_use`. 공급자 네트워크는 루트
+/// `cluster.admin`이다.
 #[utoipa::path(delete, path = "/networks/{key}", tag = "networks",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     responses((status = 204, description = "Deleted"), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn delete_network(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
+    if network.spec.is_provider() {
+        require_host_admin(&state, &principal, "deleting a provider network")?;
+    }
+    crate::routing::check_network_unused(&state, &network)?;
     let (_, vms) = state.cluster.list::<VmSpec>()?;
     if let Some(vm) = vms
         .iter()
@@ -814,6 +864,11 @@ pub struct UpdateNodeQuery {
 /// 노드의 주소, 유지보수 모드, 역할(`roles`), 호스트 자원 설정(`host_resources`)을 바꾼다. 노드 리소스는 orbivisord가
 /// 시작할 때 스스로 만든다. 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는
 /// API가 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
+///
+/// `sdn`(계획 66 §7: physnet → Linux 브리지, 게이트웨이 우선순위)도 칸이 없으면 저장된 값을 그대로 두고 `{}`면 지운다.
+/// 바꾸려면 모든 노드가 `sdn-routing`을 알고(409 `cluster_upgrading`) SDN이 세워졌어야 하며(409 `sdn_not_ready`, 지우기는
+/// 빼고) 위트니스·macOS 노드는 400, 검증은 400 `invalid_node_sdn`, 빠지는 physnet을 쓰는 VM이 이 노드에서 돌면 409
+/// `physnet_in_use`(`details.vms`)다.
 ///
 /// `host_resources`(계획 64: 예약·전용 CPU, 실행 중 hugepages 예약)는 칸이 없으면 저장된 값을 그대로 두고(이 칸을
 /// 모르는 클라이언트의 PUT이 지우지 않게) `{}`면 지운다. 바꾸려면 모든 노드가 `numa`를 알아야 하고(409
@@ -853,17 +908,24 @@ pub async fn update_node(
         // 옛 노드는 `roles`가 든 Node를 풀지 못한다.
         require_feature(&state.cluster, "node-roles")?;
     }
-    // 노드 SDN 설정(계획 66 physnet·게이트웨이): 칸이 없으면 저장된 값 그대로다. 바꾸기는 API 스테이지 전까지 막는다.
-    match spec.sdn.take() {
-        Some(asked) if Some(&asked) != node.spec.sdn.as_ref() => {
-            return Err(crate::sdn::routing_not_yet(
-                &state.cluster,
-                "node SDN settings (physnets, gateway)",
-            ));
+    // 노드 SDN 설정(계획 66 physnet·게이트웨이): 칸이 없으면 저장된 값 그대로, `{}`면 지움, 바꾸면 검사
+    let sdn_note = match spec.sdn.take() {
+        None => {
+            spec.sdn = node.spec.sdn.clone();
+            None
         }
-        _ => {}
-    }
-    spec.sdn = node.spec.sdn.clone();
+        Some(asked) => {
+            let asked = (asked != opl_types::sdn::NodeSdnConfig::default()).then_some(asked);
+            if asked == node.spec.sdn {
+                spec.sdn = asked;
+                None
+            } else {
+                let note = crate::sdn::check_node_sdn(&state, &node, asked.as_ref())?;
+                spec.sdn = asked;
+                Some(note)
+            }
+        }
+    };
     // 호스트 자원 설정(계획 64): 없으면 그대로, `{}`면 지움, 바꾸면 검증과 쓰기 전 확인
     let change =
         crate::numa::host_resources_change(&state, &node, spec.host_resources.take(), query.force)?;
@@ -872,8 +934,9 @@ pub async fn update_node(
         .cluster
         .update_spec(node.id, if_match(&headers)?, req.labels, &spec)
         .await?;
-    if let Some(note) = change.audit {
-        audit.detail(note);
+    let notes: Vec<String> = change.audit.into_iter().chain(sdn_note).collect();
+    if !notes.is_empty() {
+        audit.detail(notes.join(", "));
     }
     let mut out = HeaderMap::new();
     if !change.warnings.is_empty()

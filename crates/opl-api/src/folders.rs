@@ -129,12 +129,9 @@ fn require_quota_feature(state: &AppState, quota: Option<&FolderQuota>) -> Resul
     if quota.is_some_and(|q| q.dedicated_vcpus.is_some()) {
         require_feature(&state.cluster, NUMA)?;
     }
-    // 네트워크 폴더의 라우터·유동 IP 수(계획 66)는 API 스테이지 전까지 막는다.
+    // 네트워크 폴더의 라우터·유동 IP 수(계획 66)도 옛 노드가 풀지 못한다.
     if quota.is_some_and(|q| q.routers.is_some() || q.floating_ips.is_some()) {
-        return Err(crate::sdn::routing_not_yet(
-            &state.cluster,
-            "routers and floating_ips quotas",
-        ));
+        require_feature(&state.cluster, opl_types::node::SDN_ROUTING)?;
     }
     Ok(())
 }
@@ -489,10 +486,23 @@ async fn move_one(
                 ()
             ))
         }
-        Kind::Router | Kind::FloatingIp => Err(crate::sdn::routing_not_yet(
-            &state.cluster,
-            "routers and floating IPs",
-        )),
+        // 할당량 있는 폴더로 옮기면 Raft가 그 폴더의 라우터·유동 IP 수를 센다(409 `quota_exceeded`).
+        Kind::Router => {
+            move_resource!(opl_types::router::RouterSpec, |_: &_, _: &_| Ok::<
+                _,
+                ApiError,
+            >(
+                ()
+            ))
+        }
+        Kind::FloatingIp => {
+            move_resource!(opl_types::floating_ip::FloatingIpSpec, |_: &_, _: &_| Ok::<
+                _,
+                ApiError,
+            >(
+                ()
+            ))
+        }
         _ => unreachable!("FolderKind::of"),
     }
 }

@@ -15,9 +15,11 @@ use opl_cluster::Cluster;
 use opl_types::authz::Privilege;
 use opl_types::authz_eval::AuthzTarget;
 use opl_types::backup::BackupSpec;
+use opl_types::floating_ip::FloatingIpSpec;
 use opl_types::folder::FolderSpec;
 use opl_types::network::NetworkSpec;
 use opl_types::resource::ResourceSpec;
+use opl_types::router::RouterSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::task::TaskSpec;
 use opl_types::vm::VmSpec;
@@ -40,6 +42,8 @@ pub(crate) enum Obj {
     StoragePool,
     Task,
     Folder,
+    Router,
+    FloatingIp,
 }
 
 /// 경로가 요구하는 것
@@ -209,6 +213,26 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     // SDN 네트워크의 서브넷 바꾸기와 주소 목록(계획 65): 그 네트워크의 `network.config`·읽기
     ("PATCH", "/networks/{key}", Object(Network, NetworkConfig)),
     ("GET", "/networks/{key}/ips", Read(Network)),
+    // 라우터·유동 IP(계획 66): 네트워크 폴더의 객체. 만들기는 폴더의 `network.config`와 잇는 네트워크의
+    // `network.assign`(핸들러), 바꾸기는 그 객체의 `network.config`(새로 잇는 네트워크·붙일 VM은 핸들러)
+    ("GET", "/routers", List),
+    ("POST", "/routers", Handler),
+    ("GET", "/routers/{key}", Read(Router)),
+    ("PATCH", "/routers/{key}", Object(Router, NetworkConfig)),
+    ("DELETE", "/routers/{key}", Object(Router, NetworkConfig)),
+    ("GET", "/floating-ips", List),
+    ("POST", "/floating-ips", Handler),
+    ("GET", "/floating-ips/{key}", Read(FloatingIp)),
+    (
+        "PATCH",
+        "/floating-ips/{key}",
+        Object(FloatingIp, NetworkConfig),
+    ),
+    (
+        "DELETE",
+        "/floating-ips/{key}",
+        Object(FloatingIp, NetworkConfig),
+    ),
     // SDN(OVN) 설치·구성(계획 65): 루트 객체
     ("GET", "/sdn", Root(ClusterRead)),
     ("POST", "/sdn", Root(ClusterAdmin)),
@@ -420,6 +444,14 @@ pub(crate) fn resolve(cluster: &Cluster, obj: Obj, key: &str) -> Result<Option<F
         Network => get::<NetworkSpec>(cluster, key)?.map(|n| Found {
             owned: object(crate::authz::AuthzObject::authz_target(&n)),
             missing: missing::<NetworkSpec>(key),
+        }),
+        Router => get::<RouterSpec>(cluster, key)?.map(|r| Found {
+            owned: object(crate::authz::AuthzObject::authz_target(&r)),
+            missing: missing::<RouterSpec>(key),
+        }),
+        FloatingIp => get::<FloatingIpSpec>(cluster, key)?.map(|f| Found {
+            owned: object(crate::authz::AuthzObject::authz_target(&f)),
+            missing: missing::<FloatingIpSpec>(key),
         }),
         StoragePool => get::<StoragePoolSpec>(cluster, key)?.map(|p| Found {
             owned: object(crate::authz::AuthzObject::authz_target(&p)),

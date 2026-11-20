@@ -155,7 +155,13 @@ impl<S: ResourceSpec> HasSpec for opl_types::resource::Resource<S, S::Status> {
     type Spec = S;
 }
 
-object_in_folder!(Vm, Network, StoragePool);
+object_in_folder!(
+    Vm,
+    Network,
+    StoragePool,
+    opl_types::router::Router,
+    opl_types::floating_ip::FloatingIp
+);
 
 impl AuthzObject for Folder {
     fn authz_target(&self) -> AuthzTarget {

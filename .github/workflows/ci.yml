@@ -410,10 +410,12 @@ jobs:
   # 리더 OvnSync의 NB 쓰기·펜싱과, 이름공간 둘의 OVS 내부 포트(게스트 없는 "VM")로 OVN DHCP(busybox udhcpc)·ping·포트 보안을 본다.
   # QEMU VM의 SDN NIC가 br-int에 바인딩되고(SB Port_Binding·NB up·ovn-installed) 클라우드 이미지 게스트가 OVN DHCP로 주소를 받는지 본다.
   # 계획 66: 노드 physnet(Linux 브리지 oplext0에 veth·OVS 브리지·ovn-bridge-mappings, 게이트웨이 표시)과 localnet으로 이름공간 ext에
-  # 닿는지, veth를 다시 만드는지, 빼면 내 것만 치우는지 본다.
+  # 닿는지, veth를 다시 만드는지, 빼면 내 것만 치우는지 본다. 라우터·SNAT·유동 IP·RA·DHCPv6·보안 그룹(OVN ACL과 nftables의
+  # 같은 뜻)을 orbivisorctl(node sdn·network create --provider·router·fip)로 만들어 보고, 클라우드 이미지 게스트가 cloud-init
+  # ipv6_slaac로 EUI-64 주소를 쓰는지 본다.
   ovn:
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -424,7 +426,8 @@ jobs:
           test ! -e /etc/ovn
           test ! -e /etc/openvswitch
           if dpkg -s ovn-central >/dev/null 2>&1 || dpkg -s openvswitch-switch >/dev/null 2>&1; then exit 1; fi
-      # 포트 바인딩 시험(스테이지 5)의 게스트: SDN NIC의 VM이 OVN DHCP로 IPAM 주소를 받는지 본다.
+      # 포트 바인딩 시험(스테이지 5)의 게스트: SDN NIC의 VM이 OVN DHCP로 IPAM 주소를 받는지, SLAAC 서브넷에서 EUI-64를 쓰는지
+      # (계획 66) 본다.
       - name: Cloud image
         working-directory: ${{ runner.temp }}
         run: |

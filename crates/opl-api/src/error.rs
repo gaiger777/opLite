@@ -116,12 +116,16 @@ impl From<ClusterError> for ApiError {
                         "revision_mismatch",
                         message,
                     ),
-                    // 배타 값: VM의 MAC·볼륨·SDN NIC 주소, 스냅샷의 VM 안 이름
+                    // 배타 값: VM의 MAC·볼륨·SDN NIC 주소, 스냅샷의 VM 안 이름, 계획 66 라우팅 키
                     Rejection::InUse { field, .. } => ApiError::conflict(
                         match field.as_str() {
                             "mac" => "mac_in_use",
                             "ip" => "ip_in_use",
                             "name" => "name_taken",
+                            // 계획 66: 같은 physnet·VLAN, 다른 라우터의 인터페이스인 네트워크, 유동 IP가 붙은 NIC
+                            "physnet" => "physnet_conflict",
+                            "router-net" => "network_in_use",
+                            "fip-nic" => "fip_in_use",
                             _ => "volume_in_use",
                         },
                         message,

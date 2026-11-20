@@ -121,7 +121,7 @@ pub(crate) fn precheck_vm(
     )
 }
 
-/// 폴더마다 바로 든 VM의 사용량
+/// 폴더마다 바로 든 VM의 사용량과(네트워크 폴더 — 계획 66) 라우터·유동 IP 수
 fn direct_usage(cluster: &Cluster) -> Result<DirectUsage, ApiError> {
     let sizes = volume_sizes(cluster)?;
     let (_, vms) = cluster.list::<VmSpec>()?;
@@ -130,6 +130,23 @@ fn direct_usage(cluster: &Cluster) -> Result<DirectUsage, ApiError> {
         if let Some(f) = vm.spec.folder {
             let usage = FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, &sizes));
             direct.entry(f).or_default().add(&usage);
+        }
+    }
+    let routers = cluster.list::<opl_types::router::RouterSpec>()?.1;
+    let fips = cluster.list::<opl_types::floating_ip::FloatingIpSpec>()?.1;
+    let members = routers
+        .iter()
+        .map(|r| (r.spec.folder, opl_types::resource::Kind::Router))
+        .chain(
+            fips.iter()
+                .map(|f| (f.spec.folder, opl_types::resource::Kind::FloatingIp)),
+        );
+    for (folder, kind) in members {
+        if let Some(f) = folder {
+            direct
+                .entry(f)
+                .or_default()
+                .add(&FolderUsage::of_network_member(kind));
         }
     }
     Ok(direct)

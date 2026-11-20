@@ -37,7 +37,20 @@ impl ResourceSpec for SecurityGroupSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(default)]
-pub struct SecurityGroupStatus {}
+pub struct SecurityGroupStatus {
+    /// 이 그룹을 건 VM NIC 수(계획 66 §11.4). API가 응답에서만 채운다(Raft에 쓰지 않는다).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub nics: Option<SecurityGroupNics>,
+}
+
+/// 보안 그룹을 건 NIC 수: 단순 NIC(노드 nftables)와 SDN NIC(OVN ACL)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct SecurityGroupNics {
+    pub simple: usize,
+    pub sdn: usize,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -297,6 +310,11 @@ impl Cidr {
         let ip = ip.to_canonical();
         ip.is_ipv4() == self.addr.is_ipv4()
             && Self::bits(ip) & !self.host_mask() == Self::bits(self.addr)
+    }
+
+    /// 두 범위가 겹친다(같은 체계이고 한쪽이 다른 쪽의 망 주소를 품음).
+    pub fn overlaps(&self, other: &Cidr) -> bool {
+        self.contains(other.addr) || other.contains(self.addr)
     }
 }
 

@@ -166,7 +166,11 @@ async fn patch_changes_rules_and_description() {
     assert_eq!(body["spec"]["description"], "web servers");
     let changed = body["revision"].as_u64().unwrap();
     assert!(changed > revision);
-    assert_eq!(admin.get("/security-groups/web").await.1, body);
+    // 조회는 그룹을 건 NIC 수(`status.nics`, 계획 66)를 더 싣는다.
+    let mut got = admin.get("/security-groups/web").await.1;
+    assert_eq!(got["status"]["nics"], json!({ "simple": 0, "sdn": 0 }));
+    got["status"] = json!({});
+    assert_eq!(got, body);
 
     // 옛 revision이면 412
     let (status, body) = admin

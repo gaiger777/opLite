@@ -300,7 +300,7 @@ fn ra_configs(network: &Network, subnet: &Subnet, mode: Ipv6Mode) -> BTreeMap<St
 
 /// VM의 포트를 바인딩할 chassis(노드)들: 노드에서 돌거나 켜지는 중이면 그 노드, 라이브 마이그레이션 중이면 원본과 대상,
 /// 꺼져 있으면 없다. 클러스터에 없는 노드는 적지 않는다.
-fn chassis_nodes(vm: &Vm, nodes: &BTreeSet<Uuid>) -> Vec<Uuid> {
+pub(crate) fn chassis_nodes(vm: &Vm, nodes: &BTreeSet<Uuid>) -> Vec<Uuid> {
     let active = matches!(
         vm.status.phase,
         VmPhase::Starting | VmPhase::Running | VmPhase::Stopping | VmPhase::Migrating
@@ -339,7 +339,7 @@ fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static 
 
 /// 공급자 네트워크(physnet `physnet`)로 나가는 라우터의 게이트웨이 후보(계획 66 §9.3): 게이트웨이 우선순위가 있고, 유지보수가
 /// 아니며, 그 physnet이 `ready`인 노드와 그 우선순위. chassis 살아 있음은 보지 않는다(OVN이 BFD로 고른다).
-fn gateway_candidates(nodes: &[Node], physnet: &str) -> Vec<(Uuid, u16)> {
+pub(crate) fn gateway_candidates(nodes: &[Node], physnet: &str) -> Vec<(Uuid, u16)> {
     nodes
         .iter()
         .filter(|n| !n.spec.maintenance)

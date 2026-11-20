@@ -150,3 +150,30 @@ pub async fn delete_security_group(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+/// 보기의 `status.nics`(계획 66 §11.4): 이 그룹을 건 NIC 수를 단순 NIC(nftables)와 SDN NIC(OVN ACL)로 센다(템플릿
+/// 포함 — 그룹을 지울 수 없게 하는 것과 같은 셈). 읽지 못하면 비운다.
+pub(crate) fn count_nics(state: &AppState, group: &mut SecurityGroup) {
+    let (Ok((_, vms)), Ok((_, networks))) = (
+        state.cluster.list::<VmSpec>(),
+        state.cluster.list::<opl_types::network::NetworkSpec>(),
+    ) else {
+        return;
+    };
+    let mut nics = opl_types::security_group::SecurityGroupNics::default();
+    for nic in vms
+        .iter()
+        .flat_map(|v| v.spec.nics.iter())
+        .filter(|n| n.security_groups.contains(&group.name))
+    {
+        let sdn = networks
+            .iter()
+            .any(|n| n.name == nic.network && n.spec.is_sdn());
+        if sdn {
+            nics.sdn += 1;
+        } else {
+            nics.simple += 1;
+        }
+    }
+    group.status.nics = Some(nics);
+}

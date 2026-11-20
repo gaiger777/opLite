@@ -570,8 +570,9 @@ pub(super) async fn create_vm(
             .list::<NetworkSpec>()
             .map_err(|e| e.to_string())?;
         let others: Vec<&Vm> = vms.iter().filter(|v| v.id != new.id).collect();
+        let held = crate::ipam::load_held(&ctx.cluster).map_err(|e| e.message)?;
         new.spec.nics.clone_from(&wanted);
-        let notes = crate::ipam::assign_new(&mut new.spec, &others, &networks)
+        let notes = crate::ipam::assign_new(&mut new.spec, &others, &networks, &held)
             .map_err(|e| format!("cannot give the VM addresses: {e}"))?;
         // 요청이 준 주소(복제·배포·가져오기의 `ips`)는 바꿔 주지 않는다: 그새 쓰였으면 실패다.
         if strict_ips && !notes.is_empty() {

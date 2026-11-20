@@ -15,6 +15,7 @@ mod media;
 mod metrics;
 mod numa;
 mod output;
+mod routing;
 mod sdn;
 mod template;
 mod two_factor;

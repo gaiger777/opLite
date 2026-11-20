@@ -384,6 +384,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         inv.vms.iter().find(|v| v.id == id).map(|v| &v.spec),
         &others_list,
         &inv.networks,
+        &crate::ipam::load_held(&state.cluster)?,
         &crate::ipam::readable(state, principal.as_ref()),
     )?;
     check_security_groups(state, spec)?;
@@ -1846,6 +1847,8 @@ pub async fn delete_vm(
         .delete::<VmSpec>(vm.id, if_match(&headers)?)
         .await?;
     crate::permissions::drop_orphans(&state.cluster).await;
+    // 이 VM에 붙은 유동 IP를 뗀다(계획 66 §9.5).
+    crate::routing::detach_vm(&state, vm.id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

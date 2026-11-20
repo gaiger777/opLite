@@ -133,7 +133,8 @@ pub(super) async fn untemplate(ctx: &Ctx, task: &Task) -> Result<Option<String>,
             .list::<opl_types::network::NetworkSpec>()
             .map_err(|e| e.to_string())?;
         let others: Vec<&opl_types::vm::Vm> = vms.iter().filter(|v| v.id != id).collect();
-        let warnings = match crate::ipam::assign_new(&mut spec, &others, &networks) {
+        let held = crate::ipam::load_held(&ctx.cluster).map_err(|e| e.message)?;
+        let warnings = match crate::ipam::assign_new(&mut spec, &others, &networks, &held) {
             Ok(notes) => notes,
             Err(e) => {
                 tracing::warn!(vm = %id, error = %e, "cannot give the untemplated VM SDN addresses; leaving them empty");

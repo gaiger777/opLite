@@ -319,12 +319,26 @@ fn chassis_rows(view: &Value) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// `--subnet CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D][,description=TEXT]`의 서브넷(검증은 서버가 한다)
+/// `--subnet CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D][,floating=A-B+C-D][,ipv6-mode=MODE]
+/// [,description=TEXT]`의 서브넷(검증은 서버가 한다). `floating`은 공급자 네트워크의 유동 IP 풀, `ipv6-mode`는 `slaac`·
+/// `dhcpv6-stateful`·`dhcpv6-stateless`(계획 66)다.
 pub(crate) fn parse_subnet(s: &str) -> Result<Subnet, String> {
     let bad = |why: &str| {
         format!(
-            "invalid subnet {s:?}: {why}; use CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D]"
+            "invalid subnet {s:?}: {why}; use CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D]\
+             [,floating=A-B+C-D][,ipv6-mode=slaac|dhcpv6-stateful|dhcpv6-stateless]"
         )
+    };
+    let ranges = |value: &str, what: &str| -> Result<Vec<Value>, String> {
+        value
+            .split('+')
+            .map(|p| {
+                let (a, b) = p
+                    .split_once('-')
+                    .ok_or_else(|| bad(&format!("{what} is START-END")))?;
+                Ok(json!({ "start": a, "end": b }))
+            })
+            .collect()
     };
     let mut parts = s.split(',');
     let cidr = parts.next().unwrap_or_default();
@@ -341,15 +355,16 @@ pub(crate) fn parse_subnet(s: &str) -> Result<Subnet, String> {
                 })
             }
             "dns" => v["dns_servers"] = json!(value.split('+').collect::<Vec<_>>()),
-            "pool" => {
-                let pools: Result<Vec<Value>, String> = value
-                    .split('+')
-                    .map(|p| {
-                        let (a, b) = p.split_once('-').ok_or_else(|| bad("pool is START-END"))?;
-                        Ok(json!({ "start": a, "end": b }))
-                    })
-                    .collect();
-                v["pools"] = Value::Array(pools?);
+            "pool" => v["pools"] = Value::Array(ranges(value, "pool")?),
+            "floating" => v["floating_pools"] = Value::Array(ranges(value, "floating")?),
+            "ipv6-mode" => {
+                v["ipv6_mode"] = json!(match value {
+                    "slaac" | "dhcpv6-stateful" | "dhcpv6-stateless" => value,
+                    _ =>
+                        return Err(bad(
+                            "ipv6-mode is slaac, dhcpv6-stateful or dhcpv6-stateless"
+                        )),
+                })
             }
             "description" => v["description"] = json!(value),
             _ => return Err(bad(&format!("unknown option {key:?}"))),

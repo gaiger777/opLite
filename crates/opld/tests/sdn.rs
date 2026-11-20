@@ -11,7 +11,10 @@
 //! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험). 계획 66 스테이지 2: 노드 physnet(관리자 Linux 브리지
 //! `oplext0`에 veth·OVS 브리지·`ovn-bridge-mappings`, 게이트웨이 표시)과 그 localnet 데이터 길, 빼기 청소를 본다. 계획 66
 //! 스테이지 3: OvnSync가 쓴 공급자 네트워크의 localnet 포트, 라우터(동서 라우팅·DHCP 기본 경로), 게이트웨이 chassis의 SNAT·
-//! 유동 IP, 외부에서 들어오는 큰 패킷(MTU 탐침), RA(SLAAC)·상태 있는 DHCPv6를 물리 망 이름공간 `ext`와 견준다.
+//! 유동 IP, 외부에서 들어오는 큰 패킷(MTU 탐침), RA(SLAAC)·상태 있는 DHCPv6를 물리 망 이름공간 `ext`와 견준다. 계획 66
+//! 스테이지 5: 노드 physnet·공급자 네트워크·라우터·유동 IP는 API와 orbivisorctl(`node sdn`·`network create --provider`·
+//! `router`·`fip`)로 만들고, IPv6 이름공간 "VM"은 API VM의 포트(EUI-64·DHCPv6 IPAM)이며, 클라우드 이미지가 있으면 게스트가
+//! cloud-init `ipv6_slaac`로 EUI-64 주소를 쓰는지 본다.
 //! `sudo -E env "PATH=$PATH" cargo test -p opld --features sdn-it --test sdn -- --nocapture`
 //! Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하다. OVN이 설치되지 않은 호스트여야 하고 시험은
 //! 호스트에 OVN 꾸러미와 데몬을 남긴다(CI 러너용).
@@ -868,23 +871,6 @@ async fn orbivisord_sets_up_ovn() {
     Box::pin(security_section(&d, &tag)).await;
 }
 
-/// 제어 소켓의 시험 고리(`POST /v1/test/…`)
-async fn hook(d: &Daemon, path: &str, body: Value) {
-    let http = reqwest::Client::builder()
-        .unix_socket(d.path("opld.sock"))
-        .build()
-        .unwrap();
-    let resp = http
-        .post(format!("http://opld/v1/test/{path}"))
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(status.is_success(), "{path}: {status} {text}");
-}
-
 /// 로컬 OVS DB `Open_vSwitch`의 `external_ids` 칸 하나(없으면 빈 글)
 fn ovs_id(key: &str) -> String {
     let ids = parse_external_ids(
@@ -913,28 +899,6 @@ fn set_ovs_id(key: &str, value: &str) {
             &format!("external_ids:{key}={}", quote(value)),
         ],
     );
-}
-
-/// 시험 고리로 리소스를 만들거나 바꾸고(`spec`이 null이면 지움) id를 돌려준다(스테이지 5 전 — API가 아직 막는다).
-async fn put(d: &Daemon, kind: &str, name: &str, spec: Value) -> String {
-    let http = reqwest::Client::builder()
-        .unix_socket(d.path("opld.sock"))
-        .build()
-        .unwrap();
-    let resp = http
-        .post("http://opld/v1/test/put")
-        .json(&json!({ "kind": kind, "name": name, "spec": spec }))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(status.is_success(), "put {kind} {name}: {status} {text}");
-    serde_json::from_str::<Value>(&text)
-        .unwrap()
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// `ovn-nbctl --bare get …`(없거나 실패하면 빈 글). 식별자가 아닌 글(숫자로 시작하는 UUID 따위)의 따옴표는 뗀다.
@@ -1034,12 +998,20 @@ async fn physnet_section(d: &Daemon, tag: &str, node: &str) {
     set_ovs_id("ovn-bridge-mappings", "lab:br-lab");
     set_ovs_id("ovn-cms-options", "foo=bar");
 
-    hook(
-        d,
-        "node-sdn",
-        json!({ "sdn": { "physnets": { "ext": "oplext0" }, "gateway": 100 } }),
-    )
-    .await;
+    // 노드 SDN 설정은 API(`PUT /nodes`의 `spec.sdn`)로 — orbivisorctl `node sdn`
+    let said = d
+        .ctl(&[
+            "node",
+            "sdn",
+            "node1",
+            "--physnet",
+            "ext=oplext0",
+            "--gateway",
+            "100",
+        ])
+        .await
+        .unwrap();
+    assert!(said.contains("ext=oplext0"), "{said}");
     wait_for("physnet ext to be ready", AGENT_WAIT, || async {
         let me = d.ctl_json(&["node", "get", "node1"]).await;
         let sdn = &me["status"]["sdn"];
@@ -1097,18 +1069,25 @@ async fn physnet_section(d: &Daemon, tag: &str, node: &str) {
     let ovs_ports = run("ovs-vsctl", &["list-ports", &x]);
     assert!(ovs_ports.lines().any(|p| p == o), "{ovs_ports}");
 
-    // 데이터 길: Orbivisor 공급자 네트워크 `ext`(스테이지 3 — OvnSync가 쓴 localnet 포트)로 물리 망에 닿는다. 이름공간
-    // "VM"은 그 스위치에 손으로 넣은 포트(주인 표시 없음 — OvnSync가 두는 남의 포트)다.
-    let ext = put(
+    // 데이터 길: Orbivisor 공급자 네트워크 `ext`(OvnSync가 쓴 localnet 포트)로 물리 망에 닿는다. 이름공간 "VM"은 그
+    // 스위치에 손으로 넣은 포트(주인 표시 없음 — OvnSync가 두는 남의 포트)다.
+    let ext = sdn_network(
         d,
-        "network",
         "ext",
-        json!({ "sdn": { "provider": { "physnet": "ext" } }, "subnets": [{
-            "cidr": "203.0.113.0/24", "gateway": "203.0.113.1",
-            "floating_pools": [{ "start": "203.0.113.100", "end": "203.0.113.199" }]
-        }] }),
+        &[
+            "--provider",
+            "ext",
+            "--subnet",
+            "203.0.113.0/24,gateway=203.0.113.1,floating=203.0.113.100-203.0.113.199",
+        ],
     )
     .await;
+    let list = d.ctl(&["network", "list"]).await.unwrap();
+    assert!(
+        list.lines()
+            .any(|l| l.starts_with("ext ") && l.contains("provider") && l.contains("1500")),
+        "{list}"
+    );
     let ln = format!("opl-ln-{ext}");
     wait_for("the localnet port of ext", AGENT_WAIT, || async {
         nb_rows(d, tag).await.ports.iter().any(|p| p.name == ln)
@@ -1197,12 +1176,21 @@ async fn physnet_section(d: &Daemon, tag: &str, node: &str) {
     Box::pin(routing_section(d, tag, node)).await;
 
     // 빼기: 내 매핑 항목·veth·OVS 브리지·게이트웨이 낱말만 사라지고 남의 것은 남는다.
-    put(d, "network", "ext", Value::Null).await;
+    d.ctl(&["network", "delete", "ext"]).await.unwrap();
     wait_for("ext's switch to go", AGENT_WAIT, || async {
         !has_switch(&nb_rows(d, tag).await, &ext_switch)
     })
     .await;
-    hook(d, "node-sdn", json!({ "sdn": null })).await;
+    d.ctl(&[
+        "node",
+        "sdn",
+        "node1",
+        "--no-physnet",
+        "ext",
+        "--no-gateway",
+    ])
+    .await
+    .unwrap();
     wait_for("physnet ext to go", AGENT_WAIT, || async {
         let me = d.ctl_json(&["node", "get", "node1"]).await;
         let sdn = &me["status"]["sdn"];
@@ -1699,29 +1687,32 @@ async fn binding_section(d: &Daemon, tag: &str, node: &str) {
 /// 동서 ping, DHCP 기본 경로, SNAT(`ext`는 10.x로 가는 경로가 없으므로 답이 오는 것이 곧 주소 바꾸기다), 중앙 유동 IP(꺼진
 /// VM이라 chassis가 없다 — 분산은 OvnSync 시험과 여러 노드 작업), 큰 패킷 탐침, RA·DHCPv6.
 async fn routing_section(d: &Daemon, tag: &str, node: &str) {
-    let nb = |args: &[&str]| ovn_bare("ovn-nbctl", "nb", args);
     let t1 = sdn_network(d, "rt-t1", &["--subnet", "10.10.0.0/24"]).await;
     let t2 = sdn_network(d, "rt-t2", &["--subnet", "10.20.0.0/24"]).await;
     let a = api_vm(d, "rt-a", "rt-t1").await;
     let b = api_vm(d, "rt-b", "rt-t2").await;
     assert_eq!(a.2, "10.10.0.2");
     assert_eq!(b.2, "10.20.0.2");
-    let router = |interfaces: &[&str], external: Value| {
-        let interfaces: Vec<Value> = interfaces.iter().map(|n| json!({ "network": n })).collect();
-        let mut spec = json!({ "interfaces": interfaces });
-        if !external.is_null() {
-            spec["external"] = external;
-        }
-        spec
-    };
-    let external = json!({ "network": "ext", "ips": ["203.0.113.50"] });
-    let r1 = put(
-        d,
-        "router",
-        "r1",
-        router(&["rt-t1", "rt-t2"], external.clone()),
-    )
-    .await;
+    let said = d
+        .ctl(&[
+            "router",
+            "create",
+            "r1",
+            "--external",
+            "ext,ip=203.0.113.50",
+            "--interface",
+            "rt-t1",
+            "--interface",
+            "rt-t2",
+        ])
+        .await
+        .unwrap();
+    assert!(said.contains("203.0.113.50"), "{said}");
+    let c = client(d);
+    let r1 = c.get("/routers/r1?live=false").await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
     let gw = format!("opl-gw-{r1}");
     wait_for("the gateway port to be hosted here", AGENT_WAIT, || async {
         let hosting = nb_get(&["Logical_Router_Port", &gw, "status:hosting-chassis"]);
@@ -1729,6 +1720,12 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
         hosting == node
     })
     .await;
+    // 보기(계획 66 스테이지 5): NB의 `hosting-chassis`가 노드 이름으로, 게이트웨이 순위 하나
+    let view = d.ctl_json(&["router", "get", "r1"]).await;
+    assert_eq!(view["hosting"], "node1", "{view}");
+    assert_eq!(view["gateways"][0]["node"], "node1", "{view}");
+    assert_eq!(view["gateways"][0]["active"], true, "{view}");
+    assert_eq!(view["gateways"][0]["priority"], 32767, "{view}");
     let rows = nb_rows(d, tag).await;
     eprintln!("routers: {:?}\nnat: {:?}", rows.routers, rows.nat);
     assert_eq!(rows.ha_chassis.len(), 1);
@@ -1807,14 +1804,26 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
     assert_ne!(seen, Some(false), "ext did not see the router's address");
 
     // 유동 IP(중앙): 밖에서 들어오고, 나가는 패킷의 보낸 주소가 유동 IP다.
-    put(
-        d,
-        "floating-ip",
+    d.ctl(&[
+        "fip",
+        "create",
+        "--network",
+        "ext",
+        "--ip",
+        "203.0.113.120",
+        "--name",
         "fip1",
-        json!({ "network": "ext", "address": "203.0.113.120",
-                "target": { "vm": a.0, "mac": a.1 } }),
-    )
-    .await;
+        "--attach",
+        &format!("rt-a:{}", a.1),
+    ])
+    .await
+    .unwrap();
+    let view = d.ctl_json(&["fip", "get", "fip1"]).await;
+    assert_eq!(view["state"]["kind"], "centralized", "{view}");
+    // 유동 IP 풀에서 고른 주소(이름 없이 만들면 주소에서 이름)
+    let said = d.ctl(&["fip", "create", "--network", "ext"]).await.unwrap();
+    assert!(said.contains("203-0-113-100"), "{said}");
+    d.ctl(&["fip", "delete", "203-0-113-100"]).await.unwrap();
     wait_for("the floating IP NAT row", AGENT_WAIT, || async {
         nb_rows(d, tag)
             .await
@@ -1869,13 +1878,7 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
         ],
     );
     // 떼면 SNAT로 돌아간다.
-    put(
-        d,
-        "floating-ip",
-        "fip1",
-        json!({ "network": "ext", "address": "203.0.113.120" }),
-    )
-    .await;
+    d.ctl(&["fip", "detach", "fip1"]).await.unwrap();
     wait_for("the floating IP NAT row to go", AGENT_WAIT, || async {
         !nb_rows(d, tag)
             .await
@@ -1894,50 +1897,59 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
         "ext did not see the router's address again"
     );
 
-    // IPv6: SLAAC(RA)와 상태 있는 DHCPv6. 이름공간 포트는 손으로 넣는다(EUI-64 IPAM은 스테이지 5).
-    let t6 = put(
+    // IPv6: SLAAC(RA)와 상태 있는 DHCPv6. 이름공간 "VM"은 API VM의 포트다 — SLAAC 서브넷의 IPAM 주소는 MAC의 EUI-64,
+    // 상태 있는 DHCPv6 서브넷은 풀에서(계획 66 스테이지 5).
+    let t6 = sdn_network(
         d,
-        "network",
         "rt-t6",
-        json!({ "sdn": {}, "subnets": [
-            { "cidr": "10.60.0.0/24" },
-            { "cidr": "fd00:60::/64", "ipv6_mode": "slaac", "dns_servers": ["fd00:60::53"] }
-        ] }),
+        &[
+            "--subnet",
+            "10.60.0.0/24",
+            "--subnet",
+            "fd00:60::/64,ipv6-mode=slaac,dns=fd00:60::53",
+        ],
     )
     .await;
-    let t7 = put(
+    let t7 = sdn_network(
         d,
-        "network",
         "rt-t7",
-        json!({ "sdn": {}, "subnets": [
-            { "cidr": "10.70.0.0/24" },
-            { "cidr": "fd00:70::/64", "ipv6_mode": "dhcpv6-stateful" }
-        ] }),
+        &[
+            "--subnet",
+            "10.70.0.0/24",
+            "--subnet",
+            "fd00:70::/64,ipv6-mode=dhcpv6-stateful",
+        ],
     )
     .await;
-    put(
-        d,
-        "router",
-        "r1",
-        router(&["rt-t1", "rt-t2", "rt-t6", "rt-t7"], external.clone()),
-    )
-    .await;
+    for net in ["rt-t6", "rt-t7"] {
+        d.ctl(&["router", "interface", "add", "r1", net])
+            .await
+            .unwrap();
+    }
     let lrp6 = format!("opl-lrp-{t6}");
     wait_for("the RA config of rt-t6", AGENT_WAIT, || async {
         nb_get(&["Logical_Router_Port", &lrp6, "ipv6_ra_configs:address_mode"]) == "slaac"
     })
     .await;
-    let mac6: opl_types::vm::MacAddr = "02:00:00:00:66:06".parse().unwrap();
+    let v6vm = c
+        .post(
+            "/vms",
+            &json!({ "name": "rt-v6", "spec": {
+                "cpu": { "cores": 1 }, "memory_mib": 256,
+                "nics": [{ "network": "rt-t6", "model": "virtio" }]
+            } }),
+        )
+        .await
+        .unwrap();
+    let v6id = v6vm["id"].as_str().unwrap().to_string();
+    let mac6: opl_types::vm::MacAddr = v6vm["spec"]["nics"][0]["mac"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     let eui = opl_types::ipam::eui64("fd00:60::".parse().unwrap(), mac6);
-    nb(&[
-        "lsp-add",
-        &format!("opl-{t6}"),
-        "probe-v6",
-        "--",
-        "lsp-set-addresses",
-        "probe-v6",
-        &format!("{mac6} 10.60.0.50 {eui}"),
-    ]);
+    assert_eq!(v6vm["spec"]["nics"][0]["ips"][1], eui.to_string(), "{v6vm}");
+    let port6 = opl_types::sdn::port_name(v6id.parse().unwrap(), mac6);
     let sysctl = |ns: &str, key: &str| {
         run("ip", &["netns", "exec", ns, "sysctl", "-qw", key]);
     };
@@ -1964,7 +1976,7 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
             "Interface",
             "oplrt6d",
             "type=internal",
-            "external_ids:iface-id=probe-v6",
+            &format!("external_ids:iface-id={port6}"),
         ],
     );
     run("ip", &["link", "set", "oplrt6d", "netns", ns6]);
@@ -1995,29 +2007,35 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
         ping_from(ns6, &["-6"], "fd00:60::1")
     })
     .await;
+    // 클라우드 이미지 게스트의 SLAAC(설계 §10 탐침): cloud-init v1 `ipv6_slaac`로 켠 Ubuntu 24.04 게스트가 RA에서 MAC의
+    // EUI-64 주소를 만드는지. 포트 보안이 IPAM 주소(EUI-64)만 보내므로 그 주소로 ping6이 닿으면 게스트가 EUI-64를 쓴다.
+    if let Some(image) = std::env::var_os("OPL_TEST_CLOUD_IMAGE").map(PathBuf::from) {
+        Box::pin(guest_slaac(d, &image, ns6)).await;
+    }
 
-    // 상태 있는 DHCPv6: 손으로 넣은 포트에 우리 DHCPv6 행을 단다.
-    let rows = nb_rows(d, tag).await;
-    let d6 = rows
-        .dhcp
-        .iter()
-        .find(|r| r.external_ids.get("orbivisor:id") == Some(&t7) && r.cidr == "fd00:70::/64")
-        .unwrap_or_else(|| panic!("no DHCPv6 row: {:?}", rows.dhcp));
-    eprintln!("DHCPv6 row: {d6:?}");
-    nb(&[
-        "lsp-add",
-        &format!("opl-{t7}"),
-        "probe-d6",
-        "--",
-        "lsp-set-addresses",
-        "probe-d6",
-        "02:00:00:00:66:07 10.70.0.50 fd00:70::50",
-        "--",
-        "lsp-set-dhcpv6-options",
-        "probe-d6",
-        &d6.uuid,
-    ]);
-    namespace_port("oplrt7", "oplrt7d", "probe-d6", "02:00:00:00:66:07");
+    // 상태 있는 DHCPv6: API VM의 포트에 OvnSync가 우리 DHCPv6 행을 단다.
+    let d6 = api_vm(d, "rt-d6", "rt-t7").await;
+    let d6vm = c.get("/vms/rt-d6").await.unwrap();
+    let d6addr = d6vm["spec"]["nics"][0]["ips"][1]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(d6addr, "fd00:70::2", "{d6vm}");
+    wait_for("the DHCPv6 options on rt-d6's port", AGENT_WAIT, || async {
+        let rows = nb_rows(d, tag).await;
+        let Some(row) = rows
+            .dhcp
+            .iter()
+            .find(|r| r.external_ids.get("orbivisor:id") == Some(&t7) && r.cidr == "fd00:70::/64")
+        else {
+            return false;
+        };
+        rows.ports
+            .iter()
+            .any(|p| p.name == d6.3 && p.dhcpv6.as_deref() == Some(row.uuid.as_str()))
+    })
+    .await;
+    namespace_port("oplrt7", "oplrt7d", &d6.3, &d6.1);
     let (has_udhcpc6, _, _) = try_run("busybox", &["udhcpc6", "--help"]);
     if has_udhcpc6 {
         let s6 = d.path("udhcpc6.sh");
@@ -2060,7 +2078,7 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
         let lease = std::fs::read_to_string(&out6).unwrap();
         // udhcpc6는 주소를 줄이지 않고 찍는다.
         let got: std::net::Ipv6Addr = lease.trim().parse().unwrap();
-        assert_eq!(got, "fd00:70::50".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(got, d6addr.parse::<std::net::Ipv6Addr>().unwrap());
     } else {
         eprintln!("PROBE busybox has no udhcpc6; the stateful DHCPv6 lease was not checked");
     }
@@ -2075,9 +2093,16 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
         let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "br-int", dev]);
         let _ = try_run("ip", &["netns", "del", ns]);
     }
-    nb(&["lsp-del", "probe-v6", "--", "lsp-del", "probe-d6"]);
-    put(d, "floating-ip", "fip1", Value::Null).await;
-    put(d, "router", "r1", Value::Null).await;
+    d.ctl(&["fip", "delete", "fip1"]).await.unwrap();
+    // 인터페이스가 남은 라우터는 지울 수 없다(409 `router_in_use`).
+    let refused = d.ctl(&["router", "delete", "r1"]).await.unwrap_err();
+    assert!(refused.to_string().contains("interfaces"), "{refused}");
+    for net in ["rt-t1", "rt-t2", "rt-t6", "rt-t7"] {
+        d.ctl(&["router", "interface", "remove", "r1", net])
+            .await
+            .unwrap();
+    }
+    d.ctl(&["router", "delete", "r1"]).await.unwrap();
     wait_for("the router rows to go", AGENT_WAIT, || async {
         let rows = nb_rows(d, tag).await;
         rows.routers.is_empty()
@@ -2089,16 +2114,84 @@ async fn routing_section(d: &Daemon, tag: &str, node: &str) {
             && !rows.ports.iter().any(|p| p.kind == "router")
     })
     .await;
-    let c = client(d);
-    for vm in [&a, &b] {
-        c.delete(&format!("/vms/{}", vm.0)).await.unwrap();
+    for vm in [&a.0, &b.0, &v6id, &d6.0] {
+        c.delete(&format!("/vms/{vm}")).await.unwrap();
     }
-    for name in ["rt-t6", "rt-t7"] {
-        put(d, "network", name, Value::Null).await;
-    }
-    for name in ["rt-t1", "rt-t2"] {
+    for name in ["rt-t1", "rt-t2", "rt-t6", "rt-t7"] {
         d.ctl(&["network", "delete", name]).await.unwrap();
     }
+}
+
+/// 클라우드 이미지 게스트(`rt-guest6`, SLAAC 서브넷 `rt-t6`)가 EUI-64 주소로 답하는지 이름공간 `ns6`에서 ping6으로 본다.
+/// 풀 `local`은 바인딩 절이 만들어 두었다.
+async fn guest_slaac(d: &Daemon, image: &std::path::Path, ns6: &str) {
+    d.ctl(&[
+        "volume",
+        "import",
+        "noble6",
+        "--pool",
+        "local",
+        "--file",
+        image.to_str().unwrap(),
+        "--source-format",
+        "qcow2",
+    ])
+    .await
+    .unwrap();
+    let started = d
+        .ctl(&[
+            "vm",
+            "create",
+            "rt-guest6",
+            "--nic",
+            "rt-t6",
+            "--memory",
+            "1024",
+            "--machine",
+            "q35",
+            "--disk",
+            "noble6",
+            "--ci-hostname",
+            "rt-guest6",
+            "--start",
+        ])
+        .await;
+    if let Err(e) = started {
+        panic!("vm rt-guest6 did not start: {e}\n{}", d.log());
+    }
+    let vm = d.ctl_json(&["vm", "get", "rt-guest6"]).await;
+    let mac: opl_types::vm::MacAddr = vm["spec"]["nics"][0]["mac"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let eui = opl_types::ipam::eui64("fd00:60::".parse().unwrap(), mac);
+    assert_eq!(vm["spec"]["nics"][0]["ips"][1], eui.to_string(), "{vm}");
+    let answered = {
+        let start = std::time::Instant::now();
+        loop {
+            if ping_from(ns6, &["-6"], &eui.to_string()) {
+                break true;
+            }
+            if start.elapsed() > GUEST_WAIT {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    };
+    eprintln!("PROBE cloud image guest answers on its EUI-64 SLAAC address {eui}: {answered}");
+    if !answered {
+        show("ip", &["netns", "exec", ns6, "ip", "-6", "neigh", "show"]);
+    }
+    d.ctl(&["vm", "stop", "rt-guest6", "--force"])
+        .await
+        .unwrap();
+    d.ctl(&["vm", "delete", "rt-guest6"]).await.unwrap();
+    d.ctl(&["volume", "delete", "noble6"]).await.unwrap();
+    assert!(
+        answered,
+        "the cloud image guest did not answer on its EUI-64 address {eui} (cloud-init ipv6_slaac)"
+    );
 }
 
 /// 이름공간의 파이썬 메아리 서버(tcp 22·8080, 받은 바이트를 돌려줌)

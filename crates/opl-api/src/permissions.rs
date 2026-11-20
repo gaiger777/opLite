@@ -298,6 +298,20 @@ pub(crate) async fn drop_orphans(cluster: &Cluster) -> usize {
                 .iter()
                 .map(|p| (Kind::StoragePool, p.id)),
         );
+        objects.extend(
+            cluster
+                .list::<opl_types::router::RouterSpec>()?
+                .1
+                .iter()
+                .map(|r| (Kind::Router, r.id)),
+        );
+        objects.extend(
+            cluster
+                .list::<opl_types::floating_ip::FloatingIpSpec>()?
+                .1
+                .iter()
+                .map(|f| (Kind::FloatingIp, f.id)),
+        );
         Ok::<_, opl_cluster::ClusterError>((users, groups, objects, grants))
     })();
     let Ok((users, groups, objects, grants)) = found else {
@@ -355,8 +369,7 @@ fn orphan_grant(
         GrantTarget::Root => true,
         GrantTarget::Folder { id } => objects.contains(&(Kind::Folder, id)),
         GrantTarget::Object { kind, id } => {
-            !matches!(kind, Kind::Vm | Kind::Network | Kind::StoragePool)
-                || objects.contains(&(kind, id))
+            opl_types::folder::FolderKind::of(kind).is_none() || objects.contains(&(kind, id))
         }
     };
     !(principal && target)
@@ -499,6 +512,14 @@ fn grant_target(state: &AppState, target: &GrantTarget) -> Result<Option<AuthzTa
                     .cluster
                     .get::<StoragePoolSpec>(id)?
                     .map(|p| p.spec.folder),
+                Kind::Router => state
+                    .cluster
+                    .get::<opl_types::router::RouterSpec>(id)?
+                    .map(|r| r.spec.folder),
+                Kind::FloatingIp => state
+                    .cluster
+                    .get::<opl_types::floating_ip::FloatingIpSpec>(id)?
+                    .map(|f| f.spec.folder),
                 _ => None,
             };
             folder.map(|folder| AuthzTarget::Object { kind, id, folder })
@@ -560,7 +581,7 @@ pub(crate) fn grant_visible_raw(
 #[into_params(parameter_in = Query)]
 #[serde(deny_unknown_fields)]
 pub struct GrantQuery {
-    /// 대상: `root`, `folder/<id>`, `vm/<id>`, `network/<id>`, `storage-pool/<id>`
+    /// 대상: `root`, `folder/<id>`, `vm/<id>`, `network/<id>`, `storage-pool/<id>`, `router/<id>`, `floating-ip/<id>`
     pub target: Option<String>,
     /// 주체: `user/<id>`, `group/<id>`
     pub principal: Option<String>,
@@ -583,6 +604,14 @@ fn parse_grant_target(s: &str) -> Result<GrantTarget, ApiError> {
         },
         "storage-pool" => GrantTarget::Object {
             kind: Kind::StoragePool,
+            id,
+        },
+        "router" => GrantTarget::Object {
+            kind: Kind::Router,
+            id,
+        },
+        "floating-ip" => GrantTarget::Object {
+            kind: Kind::FloatingIp,
             id,
         },
         _ => return Err(ApiError::bad_request(format!("bad target {s:?}"))),
@@ -1022,6 +1051,8 @@ fn object_target(
         "vm" => crate::authz_routes::Obj::Vm,
         "network" => crate::authz_routes::Obj::Network,
         "storage-pool" => crate::authz_routes::Obj::StoragePool,
+        "router" => crate::authz_routes::Obj::Router,
+        "floating-ip" => crate::authz_routes::Obj::FloatingIp,
         _ => return Err(ApiError::bad_request(format!("bad object {object:?}"))),
     };
     let found = crate::authz_routes::resolve(&state.cluster, obj, key)?

@@ -105,7 +105,17 @@ enum Cmd {
         #[command(subcommand)]
         cmd: NetworkCmd,
     },
-    /// VM NIC에 거는 방화벽 규칙 묶음. nftables가 있는 노드가 적용한다.
+    /// SDN 라우터(계획 66): 오버레이 SDN 네트워크를 잇고 공급자 네트워크로 나가는 OVN 분산 라우터, 게이트웨이 HA, SNAT
+    Router {
+        #[command(subcommand)]
+        cmd: crate::routing::RouterCmd,
+    },
+    /// 유동 IP(계획 66): 공급자 네트워크의 IPv4 주소를 VM NIC에 1:1로(OVN dnat_and_snat)
+    Fip {
+        #[command(subcommand)]
+        cmd: crate::routing::FipCmd,
+    },
+    /// VM NIC에 거는 방화벽 규칙 묶음. 단순 NIC는 nftables가 있는 노드가, SDN NIC는 OVN ACL이 적용한다.
     SecurityGroup {
         #[command(subcommand)]
         cmd: SecurityGroupCmd,
@@ -361,6 +371,9 @@ enum NodeCmd {
         #[arg(long)]
         live: bool,
     },
+    /// 노드의 SDN 설정(계획 66): 공급자 네트워크가 쓰는 physnet(Linux 브리지)과 게이트웨이 우선순위를 보이거나 바꾼다.
+    /// 준 칸만 바꾼다(admin).
+    Sdn(crate::routing::NodeSdnArgs),
     /// 노드의 호스트 자원 설정(예약·전용 CPU, 실행 중 hugepages 예약)을 보이거나 바꾼다. 준 칸만 바꾼다.
     Resources {
         node: String,
@@ -1231,17 +1244,35 @@ struct NetworkCreate {
     /// SDN(OVN) 네트워크: OVN 논리 스위치(Geneve). `sdn init`으로 OVN을 세운 뒤 만든다.
     #[arg(long, conflicts_with = "vlan")]
     sdn: bool,
-    /// SDN 네트워크의 서브넷 `CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D]`(IPv4·IPv6 하나씩까지).
-    /// NIC는 서브넷에서 주소를 받는다(IPv4는 OVN DHCP).
+    /// SDN 네트워크의 서브넷 `CIDR[,gateway=IP][,dhcp=on|off][,dns=IP+IP][,pool=A-B+C-D][,floating=A-B+C-D]
+    /// [,ipv6-mode=slaac|dhcpv6-stateful|dhcpv6-stateless]`(IPv4·IPv6 하나씩까지). NIC는 서브넷에서 주소를 받는다(IPv4는
+    /// OVN DHCP, `ipv6-mode`가 있으면 라우터의 RA·DHCPv6). `floating`은 공급자 네트워크의 라우터 외부 주소·유동 IP 풀이다.
     #[arg(long = "subnet", value_name = "CIDR[,OPTION=VALUE...]", requires = "sdn",
         value_parser = crate::sdn::parse_subnet)]
     subnets: Vec<opl_types::network::Subnet>,
-    /// VXLAN·SDN 네트워크의 MTU(1280-9000, 기본 VXLAN 1450·SDN 1442)
+    /// 공급자(외부) SDN 네트워크: 노드의 물리 망 PHYSNET(`node sdn --physnet`)에 붙는다. `:VLAN`이 없으면 태그 없음(flat).
+    /// admin만 만든다. 서브넷의 DHCP는 기본 꺼짐, MTU는 기본 1500.
+    #[arg(long, value_name = "PHYSNET[:VLAN]", requires = "sdn", value_parser = parse_provider)]
+    provider: Option<Value>,
+    /// VXLAN·SDN 네트워크의 MTU(1280-9000, 기본 VXLAN 1450·SDN 1442·공급자 1500)
     #[arg(long, conflicts_with = "bridge")]
     mtu: Option<u16>,
     /// 넣을 폴더(경로 `/teamA/prod`나 id). 없으면 트리의 맨 위다(루트에 만들 권한이 없으면 400 `folder_required`).
     #[arg(long)]
     folder: Option<String>,
+}
+
+/// `--provider PHYSNET[:VLAN]`의 `SdnNet.provider`(검증은 서버가 한다)
+fn parse_provider(s: &str) -> Result<Value, String> {
+    match s.split_once(':') {
+        None => Ok(json!({ "physnet": s })),
+        Some((physnet, vlan)) => {
+            let vlan: u16 = vlan
+                .parse()
+                .map_err(|_| format!("invalid VLAN {vlan:?} in {s:?}; use PHYSNET[:VLAN]"))?;
+            Ok(json!({ "physnet": physnet, "vlan": vlan }))
+        }
+    }
 }
 
 /// `network create`의 요청 본문(`POST /networks`). 주지 않은 값은 보내지 않는다.
@@ -1257,7 +1288,11 @@ fn network_create_body(c: &NetworkCreate) -> Value {
         spec.insert("vxlan".into(), json!({ "vni": vni }));
     }
     if c.sdn {
-        spec.insert("sdn".into(), json!({}));
+        let mut sdn = json!({});
+        if let Some(p) = &c.provider {
+            sdn["provider"] = p.clone();
+        }
+        spec.insert("sdn".into(), sdn);
     }
     if !c.subnets.is_empty() {
         spec.insert("subnets".into(), json!(c.subnets));
@@ -5953,6 +5988,19 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
                 if !json_out && let Some(line) = node_firmware_line(&node) {
                     eprintln!("{line}");
                 }
+                if !json_out && let Some(line) = crate::routing::node_sdn_line(&node) {
+                    eprintln!("{line}");
+                }
+            }
+            NodeCmd::Sdn(args) => {
+                Box::pin(crate::routing::node_sdn(
+                    &client,
+                    &args,
+                    json_out,
+                    out,
+                    &mut std::io::stderr(),
+                ))
+                .await?
             }
             NodeCmd::Cpu { node, refresh } => {
                 node_cpu(&client, &node, refresh, json_out, out).await?
@@ -6102,6 +6150,17 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
                 network_ips(&client, &args, json_out, out, &mut std::io::stderr()).await?
             }
         },
+        Cmd::Router { cmd } => {
+            Box::pin(crate::routing::router(
+                &client,
+                cmd,
+                json_out,
+                out,
+                &mut std::io::stderr(),
+            ))
+            .await?
+        }
+        Cmd::Fip { cmd } => Box::pin(crate::routing::fip(&client, cmd, json_out, out)).await?,
         Cmd::SecurityGroup { cmd } => security_group(&client, cmd, json_out, out).await?,
         Cmd::Volume { cmd } => match cmd {
             VolumeCmd::List => {
@@ -8916,12 +8975,23 @@ fn network_row(n: &Value) -> Vec<String> {
             .flatten()
             .map(|s| cell(&s["cidr"]))
             .collect();
+        // 공급자 네트워크(계획 66): VLAN/VNI 칸에 `physnet[:vlan]`
+        let provider = &spec["sdn"]["provider"];
+        let (kind, vlan, mtu) = if provider.is_object() {
+            let at = match provider["vlan"].as_u64() {
+                Some(v) => format!("{}:{v}", cell(&provider["physnet"])),
+                None => cell(&provider["physnet"]),
+            };
+            ("provider", at, 1500)
+        } else {
+            ("sdn", "-".to_string(), 1442)
+        };
         return vec![
             cell(&n["name"]),
-            "sdn".into(),
+            kind.into(),
             "br-int".into(),
-            "-".into(),
-            spec["mtu"].as_u64().unwrap_or(1442).to_string(),
+            vlan,
+            spec["mtu"].as_u64().unwrap_or(mtu).to_string(),
             if subnets.is_empty() {
                 "-".into()
             } else {

@@ -949,6 +949,50 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/floating-ips": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 볼 수 있는 유동 IP와 지금 모양(분산·중앙·라우팅 안 됨) */
+        get: operations["list_floating_ips"];
+        put?: never;
+        /**
+         * 유동 IP를 만든다(계획 66 §9.5): 폴더의 `network.config`와 공급자 네트워크의 `network.assign`, 붙이면 그 VM의
+         *     `vm.config`. 주소는 API가 유동 IP 풀(없으면 풀)의 IPv4에서 고른다(준 주소는 서브넷 안의 빈 IPv4). 공급자 네트워크가
+         *     아니면 400, 주소는 409 `ip_in_use`·`ip_exhausted`, 붙일 NIC가 라우팅되지 않으면 409 `fip_not_routable`, 이미 유동 IP가
+         *     붙은 NIC는 409 `fip_in_use`, 폴더 할당량 `floating_ips`는 409 `quota_exceeded`.
+         */
+        post: operations["create_floating_ip"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/floating-ips/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_floating_ip"];
+        put?: never;
+        post?: never;
+        /** 유동 IP를 지운다(붙어 있어도 — NAT가 사라진다). */
+        delete: operations["delete_floating_ip"];
+        options?: never;
+        head?: never;
+        /**
+         * 유동 IP를 붙이거나 뗀다(유동 IP의 `network.config` — 경로표, 붙이면 대상 VM의 `vm.config`). 붙일 NIC의 검사는
+         *     만들기와 같다. `If-Match`가 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시 읽는다.
+         */
+        patch: operations["patch_floating_ip"];
+        trace?: never;
+    };
     "/folders": {
         parameters: {
             query?: never;
@@ -1351,6 +1395,10 @@ export interface paths {
          *     네트워크(`sdn`, 서브넷 `subnets` — 계획 65). 이름 `user`와 브리지 `br-int`는 예약되어 있다. SDN 네트워크는 폴더의
          *     `network.config`로 만들고, SDN(OVN)이 세워지지 않았으면 409 `sdn_not_ready`, 서브넷 검증은 400 `invalid_subnet`.
          *     VNI가 다른 네트워크와 겹치면 409 `vni_in_use`(동시에 만드는 두 요청의 경쟁은 막지 않는다).
+         * @description 공급자(외부) 네트워크(`sdn.provider {physnet, vlan}` — 계획 66 §8)는 노드의 물리 망에 붙으므로 루트 `cluster.admin`이고,
+         *     같은 physnet·VLAN의 공급자 네트워크가 있으면 409 `physnet_conflict`다. 공급자 네트워크와 서브넷의 `floating_pools`·
+         *     `ipv6_mode`는 모든 노드가 `sdn-routing`을 알아야 한다(409 `cluster_upgrading`, 검증보다 먼저). physnet이 준비된 노드가
+         *     없어도 만들고 `orbivisor-warning`으로 알린다.
          */
         post: operations["create_network"];
         delete?: never;
@@ -1369,7 +1417,10 @@ export interface paths {
         get: operations["get_network"];
         put?: never;
         post?: never;
-        /** VM이 쓰고 있으면 409 */
+        /**
+         * VM이 쓰거나, 라우터의 인터페이스·외부이거나, 유동 IP가 있으면 409 `network_in_use`. 공급자 네트워크는 루트
+         *     `cluster.admin`이다.
+         */
         delete: operations["delete_network"];
         options?: never;
         head?: never;
@@ -1437,7 +1488,12 @@ export interface paths {
          * 노드의 주소, 유지보수 모드, 역할(`roles`), 호스트 자원 설정(`host_resources`)을 바꾼다. 노드 리소스는 orbivisord가
          *     시작할 때 스스로 만든다. 위트니스 여부(`witness`)는 합류할 때 정해지므로 요청의 값을 무시하고 그대로 둔다. 위트니스는
          *     API가 없으므로 `api` 역할을 줄 수 없다. `roles`를 적으려면 모든 노드가 그 필드를 알아야 한다(`node-roles`).
-         * @description `host_resources`(계획 64: 예약·전용 CPU, 실행 중 hugepages 예약)는 칸이 없으면 저장된 값을 그대로 두고(이 칸을
+         * @description `sdn`(계획 66 §7: physnet → Linux 브리지, 게이트웨이 우선순위)도 칸이 없으면 저장된 값을 그대로 두고 `{}`면 지운다.
+         *     바꾸려면 모든 노드가 `sdn-routing`을 알고(409 `cluster_upgrading`) SDN이 세워졌어야 하며(409 `sdn_not_ready`, 지우기는
+         *     빼고) 위트니스·macOS 노드는 400, 검증은 400 `invalid_node_sdn`, 빠지는 physnet을 쓰는 VM이 이 노드에서 돌면 409
+         *     `physnet_in_use`(`details.vms`)다.
+         *
+         *     `host_resources`(계획 64: 예약·전용 CPU, 실행 중 hugepages 예약)는 칸이 없으면 저장된 값을 그대로 두고(이 칸을
          *     모르는 클라이언트의 PUT이 지우지 않게) `{}`면 지운다. 바꾸려면 모든 노드가 `numa`를 알아야 하고(409
          *     `cluster_upgrading`), 노드가 알린 토폴로지에 맞아야 한다(온라인 CPU, 예약·전용이 겹치지 않음, 공유 CPU가 남음, 있는
          *     호스트 NUMA 노드 — 400 `invalid_host_resources`). 도는 VM이 고정된 pCPU가 새 전용 CPU 밖이면 409
@@ -2066,6 +2122,53 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/routers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 볼 수 있는 라우터(`network.config`가 아닌 읽기)와 게이트웨이. `live=false`면 NB를 읽지 않는다. */
+        get: operations["list_routers"];
+        put?: never;
+        /**
+         * 라우터를 만든다(계획 66 §9): 폴더의 `network.config`, 인터페이스·외부 네트워크마다 `network.assign`. 외부 주소는 API가
+         *     외부 네트워크의 체계마다 고른다(유동 IP 풀이 있으면 거기서만, 없으면 풀 — 준 주소는 서브넷 안의 빈 주소). 옛 노드가
+         *     남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙·네트워크 검사는 400 `invalid_router`, 이미 다른
+         *     라우터의 인터페이스인 네트워크는 409 `network_in_use`, 주소는 409 `ip_in_use`·`ip_exhausted`, 폴더 할당량
+         *     `routers`는 409 `quota_exceeded`. 게이트웨이 후보가 없으면 만들고 `orbivisor-warning`으로 알린다.
+         */
+        post: operations["create_router"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/routers/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 라우터 하나와 게이트웨이 순위·지금 주인. `live=false`면 NB를 읽지 않는다. */
+        get: operations["get_router"];
+        put?: never;
+        post?: never;
+        /** 라우터를 지운다. 인터페이스가 남았으면 409 `router_in_use`(먼저 빼라). */
+        delete: operations["delete_router"];
+        options?: never;
+        head?: never;
+        /**
+         * 라우터의 설명·외부·인터페이스·경로를 바꾼다(`If-Match`로 리비전 확인, 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시
+         *     읽는다). 라우터의 `network.config`(경로표)와 새로 잇는 인터페이스·외부 네트워크의 `network.assign`. 유동 IP가 이
+         *     라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라). 검사는 만들기와 같다.
+         */
+        patch: operations["patch_router"];
         trace?: never;
     };
     "/sdn": {
@@ -3534,6 +3637,11 @@ export interface components {
             /** @description 경보를 모르는 옛 노드 이름 */
             unsupported: string[];
         };
+        /**
+         * @description 할당 행의 종류(계획 66 §8)
+         * @enum {string}
+         */
+        AllocationKind: "nic" | "router" | "floating-ip";
         /** @description 앞단(로드 밸런서)이 부를 API 노드 하나 */
         ApiEndpoint: {
             /** @description API 주소(`host:port`) */
@@ -4692,6 +4800,15 @@ export interface components {
             /** @description 백업 풀(`backups`를 켠 풀) */
             pool: string;
         };
+        /** @description `POST /floating-ips` */
+        CreateFloatingIp: {
+            labels?: {
+                [key: string]: string;
+            };
+            /** @description 없으면 주소의 점을 `-`로 바꾼 것(`203-0-113-120`) */
+            name?: string;
+            spec: components["schemas"]["FloatingIpSpec"];
+        };
         CreateFolderRequest: {
             kind: components["schemas"]["FolderKind"];
             /** @description 화면 이름(1~64자, `/` 없음). 형제 사이에서 대소문자 무시로 겹치면 409 `name_taken` */
@@ -5046,6 +5163,14 @@ export interface components {
                 size_bytes: number;
             };
         };
+        /** @description `POST /routers` */
+        CreateRouter: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            spec: components["schemas"]["RouterSpec"];
+        };
         CreateSnapshotRequest: {
             /** @description 최대 1024자 */
             description?: string;
@@ -5311,6 +5436,30 @@ export interface components {
             /** @description 등록 시작이 준 토큰 */
             token: string;
         };
+        /** @description 유동 IP의 지금 모양(Raft에서 셈 — OvnSync가 쓰는 NAT 행과 같은 규칙, §9.5) */
+        FipState: {
+            /** @enum {string} */
+            kind: "unattached";
+        } | {
+            /** @enum {string} */
+            kind: "distributed";
+            /** @description VM이 도는 노드(마이그레이션 중이면 둘, 쉼표로) */
+            node: string;
+        } | {
+            /** @enum {string} */
+            kind: "centralized";
+            reason: string;
+        } | {
+            /** @enum {string} */
+            kind: "unrouted";
+            reason: string;
+        };
+        /** @description 유동 IP가 붙은 NIC. NIC는 MAC으로 가리킨다(순서가 바뀌어도 같은 NIC — OVN 포트 이름과 같다). */
+        FipTarget: {
+            mac: components["schemas"]["MacAddr"];
+            /** Format: uuid */
+            vm: string;
+        };
         /** @enum {string} */
         Firmware: "bios" | "uefi";
         /** @description 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다. */
@@ -5331,6 +5480,52 @@ export interface components {
             tpm?: boolean;
             /** @description UEFI 변수(부팅 항목, Secure Boot 키)를 펌웨어 원본으로 되돌린다. */
             uefi_vars?: boolean;
+        };
+        /** @description `GET /floating-ips` */
+        FloatingIpList: {
+            items: components["schemas"]["FloatingIpView"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description `PATCH /floating-ips/{key}` */
+        FloatingIpPatch: {
+            /** @description 빈 글이면 설명을 지운다. */
+            description?: string;
+            target?: components["schemas"]["FipTarget"] | null;
+        };
+        FloatingIpSpec: {
+            /**
+             * Format: ip
+             * @description 유동 IP(IPv4). API가 그 네트워크의 유동 IP 풀(없으면 풀)에서 채운다.
+             */
+            address?: string;
+            /** @description 200자 이하 */
+            description?: string;
+            /**
+             * Format: uuid
+             * @description 든 네트워크 폴더(`Folder` id). 없으면 네트워크 트리의 루트다.
+             */
+            folder?: string;
+            /** @description 공급자 네트워크 이름 */
+            network: string;
+            /** @description 붙은 VM NIC. 없으면 떼어 둔 것이다. */
+            target?: components["schemas"]["FipTarget"];
+        };
+        FloatingIpStatus: Record<string, never>;
+        /** @description `GET /floating-ips/{key}` */
+        FloatingIpView: components["schemas"]["Resource_FloatingIpSpec_FloatingIpStatus"] & {
+            state: components["schemas"]["FipState"];
+            /** @description 붙은 VM의 이름(부른 사용자가 읽을 수 있을 때만) */
+            vm_name?: string;
+        };
+        /** @description 유동 IP 풀의 크기와 사용 */
+        FloatingUsage: {
+            /** Format: int64 */
+            free: number;
+            /** Format: int64 */
+            size: number;
+            /** Format: int64 */
+            used: number;
         };
         /**
          * @description 폴더 트리의 종류
@@ -5986,13 +6181,17 @@ export interface components {
          * @enum {string}
          */
         InterfaceKind: "ethernet" | "bond" | "bridge" | "vlan" | "dummy" | "veth" | "other";
-        /** @description NIC 하나의 주소 */
+        /** @description NIC(또는 라우터 외부·유동 IP) 하나의 주소 */
         IpAllocation: {
             ips: string[];
+            /** @description 없으면 `nic` */
+            kind?: components["schemas"]["AllocationKind"];
             live?: components["schemas"]["PortLive"] | null;
             mac?: string;
             /** @description NIC 순번(0부터) */
             nic: number;
+            /** @description 유동 IP가 붙은 VM의 이름(부른 사용자가 읽을 수 있을 때만) */
+            target?: string;
             /** Format: uuid */
             vm: string;
             vm_name: string;
@@ -6934,7 +7133,10 @@ export interface components {
                     /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
                     rules?: components["schemas"]["Rule"][];
                 };
-                status: Record<string, never>;
+                status: {
+                    /** @description 이 그룹을 건 VM NIC 수(계획 66 §11.4). API가 응답에서만 채운다(Raft에 쓰지 않는다). */
+                    nics?: components["schemas"]["SecurityGroupNics"];
+                };
             }[];
             /** Format: int64 */
             revision: number;
@@ -9403,6 +9605,39 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_FloatingIpSpec_FloatingIpStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /**
+                 * Format: ip
+                 * @description 유동 IP(IPv4). API가 그 네트워크의 유동 IP 풀(없으면 풀)에서 채운다.
+                 */
+                address?: string;
+                /** @description 200자 이하 */
+                description?: string;
+                /**
+                 * Format: uuid
+                 * @description 든 네트워크 폴더(`Folder` id). 없으면 네트워크 트리의 루트다.
+                 */
+                folder?: string;
+                /** @description 공급자 네트워크 이름 */
+                network: string;
+                /** @description 붙은 VM NIC. 없으면 떼어 둔 것이다. */
+                target?: components["schemas"]["FipTarget"];
+            };
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_FolderSpec_FolderStatus: {
             /** Format: uuid */
             id: string;
@@ -9770,6 +10005,37 @@ export interface components {
             status: Record<string, never>;
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_RouterSpec_RouterStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description 200자 이하 */
+                description?: string;
+                /** @description 외부 게이트웨이(공급자 네트워크). 없으면 라우터는 안쪽 네트워크끼리만 잇는다. */
+                external?: components["schemas"]["RouterExternal"];
+                /**
+                 * Format: uuid
+                 * @description 든 네트워크 폴더(`Folder` id). 없으면 네트워크 트리의 루트다.
+                 */
+                folder?: string;
+                /** @description 잇는 오버레이 SDN 네트워크(16개까지). 그 네트워크의 서브넷 게이트웨이가 라우터 포트 주소다. */
+                interfaces?: components["schemas"]["RouterInterface"][];
+                /** @description 정적 경로(64개까지). 외부가 있으면 기본 경로는 외부 서브넷 게이트웨이로 저절로 생긴다. */
+                routes?: components["schemas"]["StaticRoute"][];
+            };
+            /** @description 지금은 칸이 없다(게이트웨이 주인·순위는 보기가 NB에서 읽는다). */
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_SecurityGroupSpec_SecurityGroupStatus: {
             /** Format: uuid */
             id: string;
@@ -9788,7 +10054,10 @@ export interface components {
                 /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
                 rules?: components["schemas"]["Rule"][];
             };
-            status: Record<string, never>;
+            status: {
+                /** @description 이 그룹을 건 VM NIC 수(계획 66 §11.4). API가 응답에서만 채운다(Raft에 쓰지 않는다). */
+                nics?: components["schemas"]["SecurityGroupNics"];
+            };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_SettingsSpec_SettingsStatus: {
@@ -10299,6 +10568,86 @@ export interface components {
             /** @enum {string} */
             type: "custom";
         };
+        /** @description 라우터의 외부 게이트웨이 */
+        RouterExternal: {
+            /** @description 라우터의 외부 주소(체계마다 하나). API가 그 네트워크의 유동 IP 풀(없으면 풀)에서 채운다. */
+            ips?: string[];
+            /** @description 공급자 네트워크 이름 */
+            network: string;
+            /** @description 안쪽 IPv4 서브넷의 보낸 주소를 외부 주소로 바꾼다(SNAT). 없으면 참이다. */
+            snat?: boolean;
+        };
+        /** @description 게이트웨이 노드 하나(Raft의 순위 — `HA_Chassis`) */
+        RouterGateway: {
+            /** @description NB의 분산 게이트웨이 포트를 지금 이 노드가 가졌다(`status:hosting-chassis`). NB를 읽지 않았으면 거짓 */
+            active: boolean;
+            /** @description 노드 이름 */
+            node: string;
+            /**
+             * Format: int32
+             * @description 노드의 게이트웨이 우선순위(`NodeSpec.sdn.gateway`)
+             */
+            node_priority: number;
+            /**
+             * Format: int32
+             * @description `HA_Chassis.priority`(32767부터 내림 — 가장 높은 살아 있는 chassis가 주인)
+             */
+            priority: number;
+        };
+        /** @description 라우터 인터페이스 하나(오버레이 SDN 네트워크) */
+        RouterInterface: {
+            /** @description 네트워크 이름 */
+            network: string;
+        };
+        /** @description `GET /routers` */
+        RouterList: {
+            items: components["schemas"]["RouterView"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description `PATCH /routers/{key}`: 준 칸만 바꾼다(목록은 통째로). */
+        RouterPatch: {
+            /** @description 빈 글이면 설명을 지운다. */
+            description?: string;
+            external?: components["schemas"]["RouterExternal"] | null;
+            /** @description 인터페이스 전체 */
+            interfaces?: components["schemas"]["RouterInterface"][];
+            /** @description 정적 경로 전체 */
+            routes?: components["schemas"]["StaticRoute"][];
+        };
+        RouterSpec: {
+            /** @description 200자 이하 */
+            description?: string;
+            /** @description 외부 게이트웨이(공급자 네트워크). 없으면 라우터는 안쪽 네트워크끼리만 잇는다. */
+            external?: components["schemas"]["RouterExternal"];
+            /**
+             * Format: uuid
+             * @description 든 네트워크 폴더(`Folder` id). 없으면 네트워크 트리의 루트다.
+             */
+            folder?: string;
+            /** @description 잇는 오버레이 SDN 네트워크(16개까지). 그 네트워크의 서브넷 게이트웨이가 라우터 포트 주소다. */
+            interfaces?: components["schemas"]["RouterInterface"][];
+            /** @description 정적 경로(64개까지). 외부가 있으면 기본 경로는 외부 서브넷 게이트웨이로 저절로 생긴다. */
+            routes?: components["schemas"]["StaticRoute"][];
+        };
+        /** @description 지금은 칸이 없다(게이트웨이 주인·순위는 보기가 NB에서 읽는다). */
+        RouterStatus: Record<string, never>;
+        /** @description `GET /routers/{key}`: 라우터와 게이트웨이(Raft의 순위와 NB의 지금 주인) */
+        RouterView: components["schemas"]["Resource_RouterSpec_RouterStatus"] & {
+            /** @description 외부가 있는데 게이트웨이 후보가 없다(그동안 외부 게이트웨이 포트는 꺼져 있고 SNAT·유동 IP가 없다). */
+            gateway_error?: string;
+            /** @description 게이트웨이 후보의 순위(외부가 있을 때 — 우선순위가 있고 유지보수가 아니며 외부 physnet이 준비된 노드, 앞 5개) */
+            gateways?: components["schemas"]["RouterGateway"][];
+            /** @description 분산 게이트웨이 포트를 지금 가진 노드(NB `status:hosting-chassis`). 없거나 NB를 읽지 않았으면 없다. */
+            hosting?: string;
+            /** @description NB를 읽지 못한 까닭 */
+            live_error?: string;
+            /**
+             * @description 물리 라우터에 있어야 할 경로(NAT 없이 라우팅되는 안쪽 접두사 → 라우터 외부 주소): IPv6 서브넷은 늘(NAT66 없음),
+             *     SNAT를 끈 라우터는 IPv4 서브넷도. 예 `fd00:20::/64 via 2001:db8::5`
+             */
+            upstream_routes?: string[];
+        };
         Rule: {
             action: components["schemas"]["Action"];
             direction: components["schemas"]["Direction"];
@@ -10524,6 +10873,11 @@ export interface components {
             /** @description 패스키 응답(`navigator.credentials.get`) */
             webauthn?: components["schemas"]["AssertionCredential"];
         };
+        /** @description 보안 그룹을 건 NIC 수: 단순 NIC(노드 nftables)와 SDN NIC(OVN ACL) */
+        SecurityGroupNics: {
+            sdn: number;
+            simple: number;
+        };
         /** @description 보안 그룹에서 바꿀 값. 주어진 필드만 바꾼다. */
         SecurityGroupPatch: {
             /** @description 빈 글이면 설명을 지운다. */
@@ -10537,7 +10891,10 @@ export interface components {
             /** @description 적힌 순서대로 보고 처음 맞는 규칙을 따른다(200개 이하). */
             rules?: components["schemas"]["Rule"][];
         };
-        SecurityGroupStatus: Record<string, never>;
+        SecurityGroupStatus: {
+            /** @description 이 그룹을 건 VM NIC 수(계획 66 §11.4). API가 응답에서만 채운다(Raft에 쓰지 않는다). */
+            nics?: components["schemas"]["SecurityGroupNics"];
+        };
         /** @description 요청을 받은 노드. */
         ServingNode: {
             /** Format: uuid */
@@ -10832,6 +11189,16 @@ export interface components {
              */
             min?: number | null;
         };
+        /** @description 정적 경로 */
+        StaticRoute: {
+            /** @example 10.20.0.0/16 */
+            destination: string;
+            /**
+             * Format: ip
+             * @description 다음 홉(붙은 서브넷 안의 주소, 같은 체계)
+             */
+            nexthop: string;
+        };
         StoragePoolSpec: {
             backend: components["schemas"]["PoolBackend"];
             /** @description 백업 파일(`{루트}/backups/`)을 둘 수 있는 백업 풀인지. dir·NFS 풀만 된다. 켜도 VM 디스크는 그대로 둔다. */
@@ -10893,6 +11260,8 @@ export interface components {
         /** @description 서브넷 하나의 크기와 사용 */
         SubnetUsage: {
             cidr: string;
+            /** @description 유동 IP 풀(계획 66 — 라우터 외부 주소와 유동 IP의 자리)의 크기·사용·남음. 풀이 없으면 없다. */
+            floating?: components["schemas"]["FloatingUsage"];
             /**
              * Format: int64
              * @description 자동 할당 범위에서 남은 주소 수
@@ -10905,7 +11274,7 @@ export interface components {
             size: number;
             /**
              * Format: int64
-             * @description 이 서브넷에서 NIC가 쓰는 주소 수(풀 밖 주소 포함)
+             * @description 이 서브넷에서 NIC·라우터 외부·유동 IP가 쓰는 주소 수(풀 밖 주소 포함)
              */
             used: number;
         };
@@ -14071,6 +14440,161 @@ export interface operations {
             };
         };
     };
+    list_floating_ips: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FloatingIpList"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_floating_ip: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateFloatingIp"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_FloatingIpSpec_FloatingIpStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_floating_ip: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FloatingIpView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_floating_ip: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_floating_ip: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["FloatingIpPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_FloatingIpSpec_FloatingIpStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_folders: {
         parameters: {
             query?: {
@@ -14296,7 +14820,7 @@ export interface operations {
     list_grants: {
         parameters: {
             query?: {
-                /** @description 대상: `root`, `folder/<id>`, `vm/<id>`, `network/<id>`, `storage-pool/<id>` */
+                /** @description 대상: `root`, `folder/<id>`, `vm/<id>`, `network/<id>`, `storage-pool/<id>`, `router/<id>`, `floating-ip/<id>` */
                 target?: string;
                 /** @description 주체: `user/<id>`, `group/<id>` */
                 principal?: string;
@@ -15175,6 +15699,8 @@ export interface operations {
         responses: {
             201: {
                 headers: {
+                    /** @description no node has the provider network's physnet ready (only then) */
+                    "orbivisor-warning"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -16879,6 +17405,171 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RemoteView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_routers: {
+        parameters: {
+            query?: {
+                /** @description 거짓이면 OVN NB를 읽지 않는다(`hosting`·`active`가 비고 `live_error`도 없다). 기본 참 */
+                live?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RouterList"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_router: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRouter"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    /** @description no gateway node for the external network (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_RouterSpec_RouterStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_router: {
+        parameters: {
+            query?: {
+                /** @description 거짓이면 OVN NB를 읽지 않는다(`hosting`·`active`가 비고 `live_error`도 없다). 기본 참 */
+                live?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RouterView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_router: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_router: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RouterPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    /** @description no gateway node for the external network (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_RouterSpec_RouterStatus"];
                 };
             };
             "4XX": {

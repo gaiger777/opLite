@@ -360,7 +360,9 @@ pub enum AuthzError {
     BadName(#[from] NameError),
     #[error("role \"none\" grants nothing")]
     GrantNone,
-    #[error("permissions can be set on a vm, network or storage-pool object, not {0:?}")]
+    #[error(
+        "permissions can be set on a vm, network, storage-pool, router or floating-ip object, not {0:?}"
+    )]
     BadObjectKind(Kind),
     #[error("external group needs a realm and a group name of 1-{MAX_EXTERNAL_GROUP} characters")]
     BadExternalGroup,
@@ -471,16 +473,15 @@ pub enum GrantTarget {
     Root,
     /// 폴더(`Folder` id)
     Folder { id: Uuid },
-    /// 단일 객체(VM·네트워크·스토리지 풀)
+    /// 단일 객체(VM·네트워크·스토리지 풀·라우터·유동 IP)
     Object { kind: Kind, id: Uuid },
 }
 
 impl GrantTarget {
     pub fn validate(&self) -> Result<(), AuthzError> {
         match self {
-            GrantTarget::Object { kind, .. }
-                if !matches!(kind, Kind::Vm | Kind::Network | Kind::StoragePool) =>
-            {
+            // 폴더에 드는 종류(VM·네트워크·스토리지 풀, 계획 66 라우터·유동 IP)
+            GrantTarget::Object { kind, .. } if crate::folder::FolderKind::of(*kind).is_none() => {
                 Err(AuthzError::BadObjectKind(*kind))
             }
             _ => Ok(()),
@@ -858,7 +859,13 @@ mod tests {
         g.role = RoleRef::Builtin { role: Role::None };
         assert_eq!(g.validate(), Err(AuthzError::GrantNone));
         g.role = RoleRef::Builtin { role: Role::Admin };
-        for kind in [Kind::Vm, Kind::Network, Kind::StoragePool] {
+        for kind in [
+            Kind::Vm,
+            Kind::Network,
+            Kind::StoragePool,
+            Kind::Router,
+            Kind::FloatingIp,
+        ] {
             g.target = GrantTarget::Object {
                 kind,
                 id: Uuid::from_u128(2),

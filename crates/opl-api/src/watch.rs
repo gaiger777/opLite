@@ -189,7 +189,7 @@ impl Filter {
         let owned_before = if scoped && kind != Kind::Grant && kind != Kind::AccessRole {
             match self.owners.stored(kind, resource.id) {
                 Some(target) => Some(Owned::object(target)),
-                None if matches!(kind, Kind::Vm | Kind::Network | Kind::StoragePool) => None,
+                None if opl_types::folder::FolderKind::of(kind).is_some() => None,
                 None => self.owners.of_event(kind, resource),
             }
         } else {

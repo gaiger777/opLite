@@ -93,6 +93,10 @@ pub enum IpamError {
     Reserved(IpAddr),
     #[error("address {0} is already in use")]
     InUse(IpAddr),
+    #[error(
+        "address {0} is not the EUI-64 address {1} of the NIC's MAC; addresses in a SLAAC subnet come from the MAC"
+    )]
+    NotEui64(IpAddr, IpAddr),
 }
 
 /// 서브넷에서 주소 하나를 고른다. `want`가 있으면 그것이 서브넷 안이고 예약·사용 중이 아닌지만 본다(풀 밖이어도
@@ -103,8 +107,8 @@ pub fn allocate(
     used: &BTreeSet<IpAddr>,
     want: Option<IpAddr>,
 ) -> Result<IpAddr, IpamError> {
-    let reserved = reserved(subnet);
     if let Some(want) = want {
+        let reserved = reserved(subnet);
         let want = want.to_canonical();
         if !subnet.cidr.contains(want) {
             return Err(IpamError::OutsideSubnet(want, subnet.cidr));
@@ -117,10 +121,34 @@ pub fn allocate(
         }
         return Ok(want);
     }
+    // NIC는 유동 IP 풀(계획 66 §8 — 라우터 외부 주소·유동 IP의 자리)에서 저절로 받지 않는다.
+    let skip: Vec<(u128, u128)> = subnet
+        .floating_pools
+        .iter()
+        .map(|p| (bits(p.start), bits(p.end)))
+        .collect();
+    pick(subnet, ranges(subnet), &skip, used)
+}
+
+/// 범위들 `ranges`에서 `skip` 범위·예약·사용 중을 빼고 가장 낮은 주소
+fn pick(
+    subnet: &Subnet,
+    ranges: Vec<(u128, u128)>,
+    skip: &[(u128, u128)],
+    used: &BTreeSet<IpAddr>,
+) -> Result<IpAddr, IpamError> {
+    let reserved = reserved(subnet);
     let v4 = subnet.is_ipv4();
-    for (start, end) in ranges(subnet) {
+    for (start, end) in ranges {
         let mut cur = start;
         while cur <= end {
+            if let Some((_, e)) = skip.iter().find(|(s, e)| (*s..=*e).contains(&cur)) {
+                match e.checked_add(1) {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+                continue;
+            }
             let ip = addr(v4, cur);
             if !reserved.contains(&ip) && !used.contains(&ip) {
                 return Ok(ip);
@@ -132,6 +160,58 @@ pub fn allocate(
         }
     }
     Err(IpamError::Exhausted(subnet.cidr))
+}
+
+/// 라우터 외부 주소와 유동 IP를 고른다(계획 66 §8): 서브넷의 유동 IP 풀 `floating_pools`가 있으면 거기서만, 없으면 NIC와
+/// 같은 할당 범위(풀, 없으면 CIDR)에서 가장 낮은 빈 주소. `want`는 [`allocate`]와 같다(서브넷 안의 예약이 아닌 어디든).
+pub fn allocate_from(
+    subnet: &Subnet,
+    used: &BTreeSet<IpAddr>,
+    want: Option<IpAddr>,
+) -> Result<IpAddr, IpamError> {
+    if want.is_some() || subnet.floating_pools.is_empty() {
+        // 유동 IP 풀이 없으면 건너뛸 것도 없다.
+        return allocate(subnet, used, want);
+    }
+    let mut pools: Vec<(u128, u128)> = subnet
+        .floating_pools
+        .iter()
+        .map(|p| (bits(p.start), bits(p.end)))
+        .collect();
+    pools.sort();
+    pick(subnet, pools, &[], used)
+}
+
+/// NIC(MAC `mac`)의 주소를 서브넷에서 고른다(계획 66 §10): 주소를 게스트가 MAC에서 만드는 IPv6 서브넷(`ipv6_mode`가
+/// `slaac`·`dhcpv6-stateless`)이면 늘 [`eui64`] 주소이고 다른 주소를 원하면 [`IpamError::NotEui64`]다. 아니면
+/// [`allocate`]다.
+pub fn allocate_v6_mode(
+    subnet: &Subnet,
+    mac: MacAddr,
+    used: &BTreeSet<IpAddr>,
+    want: Option<IpAddr>,
+) -> Result<IpAddr, IpamError> {
+    let Some(prefix) = slaac_prefix(subnet) else {
+        return allocate(subnet, used, want);
+    };
+    let eui = IpAddr::V6(eui64(prefix, mac));
+    if let Some(want) = want.map(|w| w.to_canonical())
+        && want != eui
+    {
+        return Err(IpamError::NotEui64(want, eui));
+    }
+    if used.contains(&eui) {
+        return Err(IpamError::InUse(eui));
+    }
+    Ok(eui)
+}
+
+/// 주소를 게스트가 MAC에서 만드는 IPv6 서브넷이면 그 접두사
+pub fn slaac_prefix(subnet: &Subnet) -> Option<std::net::Ipv6Addr> {
+    match (subnet.cidr.addr, subnet.ipv6_mode) {
+        (IpAddr::V6(prefix), Some(mode)) if mode.is_slaac() => Some(prefix),
+        _ => None,
+    }
 }
 
 /// OVN DHCP 서버의 MAC: `02:` + 네트워크 id(16바이트) SHA-256의 앞 5바이트. 로컬 관리 유니캐스트 주소이고 같은
@@ -315,6 +395,69 @@ mod tests {
             end: ip("10.0.0.20"),
         }];
         assert_eq!(allocate(&p, &u, Some(ip("10.0.0.50"))), Ok(ip("10.0.0.50")));
+    }
+
+    /// 계획 66 §8: NIC는 유동 IP 풀을 건너뛰고, 라우터 외부 주소·유동 IP는 유동 IP 풀(없으면 풀)에서 고른다.
+    #[test]
+    fn floating_pools_are_kept_for_routers_and_floating_ips() {
+        let mut s = subnet("203.0.113.0/24");
+        s.floating_pools = vec![IpRange {
+            start: ip("203.0.113.2"),
+            end: ip("203.0.113.3"),
+        }];
+        assert_eq!(allocate(&s, &used(&[]), None), Ok(ip("203.0.113.4")));
+        assert_eq!(allocate_from(&s, &used(&[]), None), Ok(ip("203.0.113.2")));
+        assert_eq!(
+            allocate_from(&s, &used(&["203.0.113.2", "203.0.113.3"]), None),
+            Err(IpamError::Exhausted(s.cidr))
+        );
+        // 준 주소는 서브넷 안 어디든(NIC도 유동 IP 풀의 주소를 직접 줄 수는 있다)
+        assert_eq!(
+            allocate_from(&s, &used(&[]), Some(ip("203.0.113.90"))),
+            Ok(ip("203.0.113.90"))
+        );
+        assert_eq!(
+            allocate(&s, &used(&[]), Some(ip("203.0.113.2"))),
+            Ok(ip("203.0.113.2"))
+        );
+        // 유동 IP 풀이 없으면 NIC와 같은 범위
+        let plain = subnet("203.0.113.0/24");
+        assert_eq!(
+            allocate_from(&plain, &used(&["203.0.113.2"]), None),
+            Ok(ip("203.0.113.3"))
+        );
+    }
+
+    /// 계획 66 §10: SLAAC 서브넷의 NIC 주소는 MAC의 EUI-64다.
+    #[test]
+    fn slaac_subnets_give_eui64_addresses() {
+        let mac: MacAddr = "52:54:00:12:34:56".parse().unwrap();
+        let mut s = subnet("2001:db8:1::/64");
+        s.ipv6_mode = Some(crate::network::Ipv6Mode::Slaac);
+        let eui = ip("2001:db8:1::5054:ff:fe12:3456");
+        assert_eq!(allocate_v6_mode(&s, mac, &used(&[]), None), Ok(eui));
+        assert_eq!(allocate_v6_mode(&s, mac, &used(&[]), Some(eui)), Ok(eui));
+        assert_eq!(
+            allocate_v6_mode(&s, mac, &used(&[]), Some(ip("2001:db8:1::5"))),
+            Err(IpamError::NotEui64(ip("2001:db8:1::5"), eui))
+        );
+        assert_eq!(
+            allocate_v6_mode(&s, mac, &[eui].into(), None),
+            Err(IpamError::InUse(eui))
+        );
+        s.ipv6_mode = Some(crate::network::Ipv6Mode::Dhcpv6Stateless);
+        assert_eq!(allocate_v6_mode(&s, mac, &used(&[]), None), Ok(eui));
+        // 상태 있는 DHCPv6와 모드 없는 서브넷은 풀에서
+        s.ipv6_mode = Some(crate::network::Ipv6Mode::Dhcpv6Stateful);
+        assert_eq!(
+            allocate_v6_mode(&s, mac, &used(&[]), None),
+            Ok(ip("2001:db8:1::2"))
+        );
+        let v4 = subnet("10.0.0.0/24");
+        assert_eq!(
+            allocate_v6_mode(&v4, mac, &used(&[]), None),
+            Ok(ip("10.0.0.2"))
+        );
     }
 
     /// `/16`에 앞에서부터 1만 개를 썼어도 다음 빈 주소를 곧 찾는다.

@@ -66,19 +66,105 @@ pub(crate) fn require_ready(cluster: &Cluster) -> Result<Sdn, ApiError> {
     }
 }
 
-/// 계획 66 SDN 라우팅의 새 칸·종류(공급자 네트워크, 서브넷 `floating_pools`·`ipv6_mode`, 노드 `sdn`, 할당량
-/// `routers`·`floating_ips`, 라우터·유동 IP 옮기기)는 API 스테이지(계획 66 스테이지 5) 전까지 쓰지 않는다: 옛 노드가 남았으면
-/// 409 `cluster_upgrading`(검증보다 먼저 — 옛 노드는 이 칸을 풀지 못한다), 아니면 400. 스테이지 5가 지운다.
-pub(crate) fn routing_not_yet(cluster: &Cluster, what: &str) -> ApiError {
-    match require_feature(cluster, SDN_ROUTING) {
-        Err(e) => e,
-        Ok(()) => ApiError::bad_request(format!("{what} are not available yet (SDN routing)")),
-    }
-}
-
-/// 서브넷이 계획 66의 칸(`floating_pools`·`ipv6_mode`)을 쓴다.
+/// 서브넷이 계획 66의 칸(`floating_pools`·`ipv6_mode`)을 쓴다(옛 노드가 풀지 못한다).
 pub(crate) fn subnet_uses_routing(subnet: &Subnet) -> bool {
     !subnet.floating_pools.is_empty() || subnet.ipv6_mode.is_some()
+}
+
+/// 노드 `node`의 SDN 설정(`NodeSpec.sdn`, 계획 66 §7)을 `new`(None은 지우기)로 바꿔도 되는지 보고 감사 설명을 돌려준다.
+/// 모든 노드가 `sdn-routing`을 알아야 하고(409 `cluster_upgrading`, 검증보다 먼저), 위트니스·macOS 노드는 chassis가 될 수
+/// 없고(400), 검증(physnet 이름·브리지·게이트웨이)은 400 `invalid_node_sdn`, SDN이 세워지지 않았으면 409 `sdn_not_ready`
+/// (지우기는 빼고), 빠지는 physnet을 쓰는 공급자 네트워크 NIC의 VM이 이 노드에서 돌면 409 `physnet_in_use`(`details.vms`).
+pub(crate) fn check_node_sdn(
+    state: &AppState,
+    node: &Node,
+    new: Option<&opl_types::sdn::NodeSdnConfig>,
+) -> Result<String, ApiError> {
+    require_feature(&state.cluster, SDN_ROUTING)?;
+    if let Some(new) = new {
+        if node.spec.witness {
+            return Err(ApiError::bad_request(format!(
+                "node {:?} is a witness and cannot be an SDN (OVN) chassis",
+                node.name
+            )));
+        }
+        if node.status.hypervisor == HVF {
+            return Err(ApiError::bad_request(format!(
+                "node {:?} runs macOS; physnets and gateways need Linux SDN (OVN) chassis",
+                node.name
+            )));
+        }
+        new.validate()
+            .map_err(|e| ApiError::bad_request(e.to_string()).with_code("invalid_node_sdn"))?;
+        require_ready(&state.cluster)?;
+    }
+    let removed: Vec<&String> = node
+        .spec
+        .sdn
+        .iter()
+        .flat_map(|s| s.physnets.keys())
+        .filter(|p| !new.is_some_and(|n| n.physnets.contains_key(*p)))
+        .collect();
+    if !removed.is_empty() {
+        let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+        let (_, vms) = state.cluster.list::<VmSpec>()?;
+        let on_node = |vm: &opl_types::vm::Vm| {
+            vm.status.node == Some(node.id)
+                && !matches!(vm.status.phase, opl_types::vm::VmPhase::Stopped)
+                || vm
+                    .status
+                    .migration
+                    .as_ref()
+                    .is_some_and(|m| m.node == node.id)
+        };
+        let users: Vec<String> = vms
+            .iter()
+            .filter(|vm| on_node(vm))
+            .filter(|vm| {
+                vm.spec.nics.iter().any(|nic| {
+                    networks.iter().any(|n| {
+                        n.name == nic.network
+                            && n.spec
+                                .physnet()
+                                .is_some_and(|p| removed.iter().any(|r| *r == p))
+                    })
+                })
+            })
+            .map(|vm| vm.name.clone())
+            .collect();
+        if !users.is_empty() {
+            let mut e = ApiError::conflict(
+                "physnet_in_use",
+                format!(
+                    "VMs {} on node {:?} use physnet(s) {}; stop or move them first",
+                    users.join(", "),
+                    node.name,
+                    removed
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+            e.details = Some(serde_json::json!({ "vms": users }));
+            return Err(e);
+        }
+    }
+    Ok(match new {
+        None => format!("node sdn {} cleared", node.name),
+        Some(n) => {
+            let mut parts: Vec<String> = n
+                .physnets
+                .iter()
+                .map(|(p, b)| format!("--physnet {p}={b}"))
+                .collect();
+            parts.push(match n.gateway {
+                Some(g) => format!("--gateway {g}"),
+                None => "--no-gateway".into(),
+            });
+            format!("node sdn {} {}", node.name, parts.join(" "))
+        }
+    })
 }
 
 /// 요청 본문의 노드(이름이나 id). 없으면 400이다.
@@ -950,13 +1036,14 @@ pub async fn patch_network(
     Json(req): Json<NetworkPatch>,
 ) -> Result<(HeaderMap, Json<Network>), ApiError> {
     require_feature(&state.cluster, SDN)?;
+    // 서브넷의 유동 IP 풀·IPv6 모드(계획 66)는 옛 노드가 풀지 못한다(검증보다 먼저).
     if req.subnets.iter().any(subnet_uses_routing) {
-        return Err(routing_not_yet(
-            &state.cluster,
-            "floating_pools and ipv6_mode",
-        ));
+        require_feature(&state.cluster, SDN_ROUTING)?;
     }
     let network = lookup::<NetworkSpec>(&state.cluster, &key)?;
+    if network.spec.is_provider() {
+        crate::resources::require_host_admin(&state, &principal, "changing a provider network")?;
+    }
     if !network.spec.is_sdn() {
         return Err(ApiError::conflict(
             "network_immutable",
@@ -988,15 +1075,36 @@ pub async fn patch_network(
         .iter()
         .filter(|o| !spec.subnets.iter().any(|n| n.cidr == o.cidr))
         .collect();
+    // 라우터 외부 주소·유동 IP가 쓰는 서브넷은 뺄 수 없다(계획 66 §8).
+    for subnet in &removed {
+        crate::routing::check_subnet_unused(&state, &network.name, &subnet.cidr)?;
+    }
+    // IPv6 모드를 바꾸면 EUI-64와 풀 주소가 서로 달라진다: 그 서브넷 주소를 쓰는 NIC가 있으면 막는다(§10 — 몰래 주소를
+    // 바꾸지 않는다). 그런 서브넷은 빠지는 서브넷처럼 쓰는 VM을 찾는다.
+    let mode_changed: Vec<&Subnet> = network
+        .spec
+        .subnets
+        .iter()
+        .filter(|o| {
+            spec.subnets
+                .iter()
+                .any(|n| n.cidr == o.cidr && n.ipv6_mode != o.ipv6_mode)
+        })
+        .collect();
     let added: Vec<Subnet> = spec
         .subnets
         .iter()
         .filter(|n| !network.spec.subnets.iter().any(|o| o.cidr == n.cidr))
         .cloned()
         .collect();
+    crate::routing::check_router_overlap(&state, &network, &added)?;
     let (_, vms) = state.cluster.list::<VmSpec>()?;
     let sees = crate::ipam::readable(&state, Some(&principal));
-    for subnet in &removed {
+    for (subnet, why) in removed.iter().map(|s| (s, "has addresses of VMs")).chain(
+        mode_changed
+            .iter()
+            .map(|s| (s, "changes its IPv6 mode but has addresses of VMs")),
+    ) {
         let users: Vec<&opl_types::vm::Vm> = vms
             .iter()
             .filter(|vm| {
@@ -1022,14 +1130,15 @@ pub async fn patch_network(
         return Err(ApiError::conflict(
             "subnet_in_use",
             format!(
-                "subnet {} of network {:?} has addresses of VMs {}; remove those NICs or change their addresses first",
+                "subnet {} of network {:?} {why} {}; remove those NICs or change their addresses first",
                 subnet.cidr,
                 network.name,
                 named.join(", ")
             ),
         ));
     }
-    let (empty, short) = crate::ipam::fill_shortages(&vms, &network.name, &added);
+    let held = crate::ipam::load_held(&state.cluster)?;
+    let (empty, short) = crate::ipam::fill_shortages(&vms, &held, &network.name, &added);
     if !short.is_empty() {
         return Err(ApiError::conflict(
             "ip_exhausted",
@@ -1111,7 +1220,15 @@ async fn fill_empty_nics(
                 break;
             };
             name = vm.name.clone();
-            let mut used = crate::ipam::network_used(&vms, network);
+            let held = match crate::ipam::load_held(&state.cluster) {
+                Ok(h) => h,
+                Err(e) => {
+                    failed.push(format!("{name} ({})", e.message));
+                    done = true;
+                    break;
+                }
+            };
+            let mut used = crate::ipam::network_used(&vms, &held, network);
             let mut spec = vm.spec.clone();
             let count = match crate::ipam::fill_empty(&mut spec, network, added, &mut used) {
                 Ok(0) => {
@@ -1158,17 +1275,56 @@ pub struct SubnetUsage {
     pub cidr: String,
     /// 자동 할당 범위의 주소 수(예약 빼고, 아주 크면 u64 끝에서 멈춤)
     pub size: u64,
-    /// 이 서브넷에서 NIC가 쓰는 주소 수(풀 밖 주소 포함)
+    /// 이 서브넷에서 NIC·라우터 외부·유동 IP가 쓰는 주소 수(풀 밖 주소 포함)
     pub used: u64,
     /// 자동 할당 범위에서 남은 주소 수
     pub free: u64,
+    /// 유동 IP 풀(계획 66 — 라우터 외부 주소와 유동 IP의 자리)의 크기·사용·남음. 풀이 없으면 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, default)]
+    pub floating: Option<FloatingUsage>,
 }
 
-/// NIC 하나의 주소
+/// 유동 IP 풀의 크기와 사용
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct FloatingUsage {
+    pub size: u64,
+    pub used: u64,
+    pub free: u64,
+}
+
+/// 할당 행의 종류(계획 66 §8)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum AllocationKind {
+    /// VM NIC
+    #[default]
+    Nic,
+    /// 라우터 외부 주소(`vm`·`vm_name`은 라우터의 id·이름)
+    Router,
+    /// 유동 IP(`vm`·`vm_name`은 유동 IP의 id·이름, 붙은 VM은 `target`)
+    FloatingIp,
+}
+
+impl AllocationKind {
+    fn is_nic(&self) -> bool {
+        *self == AllocationKind::Nic
+    }
+}
+
+/// NIC(또는 라우터 외부·유동 IP) 하나의 주소
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct IpAllocation {
+    /// 없으면 `nic`
+    #[serde(default, skip_serializing_if = "AllocationKind::is_nic")]
+    #[schema(default)]
+    pub kind: AllocationKind,
     pub vm: Uuid,
     pub vm_name: String,
+    /// 유동 IP가 붙은 VM의 이름(부른 사용자가 읽을 수 있을 때만)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false, default)]
+    pub target: Option<String>,
     /// NIC 순번(0부터)
     pub nic: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1259,9 +1415,17 @@ fn in_pool(subnet: &Subnet, ip: IpAddr) -> bool {
         && !ipam::reserved(subnet).contains(&ip.to_canonical())
 }
 
-/// 자동 할당 범위의 크기(예약 빼고)
-fn pool_size(subnet: &Subnet) -> u128 {
-    let ranges = ranges(subnet);
+/// 유동 IP 풀의 범위(비트)
+fn floating_ranges(subnet: &Subnet) -> Vec<(u128, u128)> {
+    subnet
+        .floating_pools
+        .iter()
+        .map(|p| (bits(p.start), bits(p.end)))
+        .collect()
+}
+
+/// 범위들의 크기(예약 빼고)
+fn ranges_size(subnet: &Subnet, ranges: &[(u128, u128)]) -> u128 {
     let total = ranges
         .iter()
         .fold(0u128, |sum, (a, b)| sum.saturating_add(b - a + 1));
@@ -1270,6 +1434,11 @@ fn pool_size(subnet: &Subnet) -> u128 {
         .filter(|ip| ranges.iter().any(|(s, e)| (*s..=*e).contains(&bits(*ip))))
         .count() as u128;
     total.saturating_sub(reserved)
+}
+
+/// 자동 할당 범위의 크기(예약 빼고)
+fn pool_size(subnet: &Subnet) -> u128 {
+    ranges_size(subnet, &ranges(subnet))
 }
 
 /// SDN 네트워크의 주소: 서브넷마다 크기·사용·남음(모든 VM), NIC마다 VM·MAC·주소와 OVN 논리 포트의 `up`·바인딩
@@ -1306,6 +1475,8 @@ pub async fn network_ips(
                 continue;
             }
             allocations.push(IpAllocation {
+                kind: AllocationKind::Nic,
+                target: None,
                 vm: vm.id,
                 vm_name: vm.name.clone(),
                 nic: i,
@@ -1315,6 +1486,71 @@ pub async fn network_ips(
             });
         }
     }
+    // 라우터 외부 주소와 유동 IP(계획 66 §8 — 공급자 네트워크)
+    let (_, routers) = state.cluster.list::<opl_types::router::RouterSpec>()?;
+    let (_, fips) = state
+        .cluster
+        .list::<opl_types::floating_ip::FloatingIpSpec>()?;
+    let mut routing: Vec<(IpAllocation, bool)> = Vec::new();
+    for r in &routers {
+        if let Some(e) = r
+            .spec
+            .external
+            .as_ref()
+            .filter(|e| e.network == network.name)
+        {
+            let sees = state.authz.allows(
+                &principal,
+                opl_types::authz::Privilege::SystemRead,
+                crate::authz::AuthzObject::authz_target(r),
+            );
+            routing.push((
+                IpAllocation {
+                    kind: AllocationKind::Router,
+                    vm: r.id,
+                    vm_name: r.name.clone(),
+                    target: None,
+                    nic: 0,
+                    mac: None,
+                    ips: e.ips.clone(),
+                    live: None,
+                },
+                sees,
+            ));
+        }
+    }
+    for f in fips.iter().filter(|f| f.spec.network == network.name) {
+        let sees = state.authz.allows(
+            &principal,
+            opl_types::authz::Privilege::SystemRead,
+            crate::authz::AuthzObject::authz_target(f),
+        );
+        let target = f
+            .spec
+            .target
+            .and_then(|t| vms.iter().find(|v| v.id == t.vm))
+            .filter(|vm| {
+                state.authz.allows(
+                    &principal,
+                    opl_types::authz::Privilege::SystemRead,
+                    crate::authz::AuthzObject::authz_target(*vm),
+                )
+            })
+            .map(|vm| vm.name.clone());
+        routing.push((
+            IpAllocation {
+                kind: AllocationKind::FloatingIp,
+                vm: f.id,
+                vm_name: f.name.clone(),
+                target,
+                nic: 0,
+                mac: None,
+                ips: f.spec.address.into_iter().collect(),
+                live: None,
+            },
+            sees,
+        ));
+    }
     let subnets = network
         .spec
         .subnets
@@ -1323,15 +1559,30 @@ pub async fn network_ips(
             let size = pool_size(s);
             let used: Vec<IpAddr> = allocations
                 .iter()
+                .chain(routing.iter().map(|(a, _)| a))
                 .flat_map(|a| a.ips.iter().copied())
                 .filter(|ip| s.cidr.contains(*ip))
                 .collect();
             let in_pool = used.iter().filter(|ip| in_pool(s, **ip)).count() as u128;
+            let floating = (!s.floating_pools.is_empty()).then(|| {
+                let ranges = floating_ranges(s);
+                let size = ranges_size(s, &ranges);
+                let taken = used
+                    .iter()
+                    .filter(|ip| ranges.iter().any(|(a, b)| (*a..=*b).contains(&bits(**ip))))
+                    .count() as u128;
+                FloatingUsage {
+                    size: u64::try_from(size).unwrap_or(u64::MAX),
+                    used: u64::try_from(taken).unwrap_or(u64::MAX),
+                    free: u64::try_from(size.saturating_sub(taken)).unwrap_or(u64::MAX),
+                }
+            });
             SubnetUsage {
                 cidr: s.cidr.to_string(),
                 size: u64::try_from(size).unwrap_or(u64::MAX),
                 used: used.len() as u64,
                 free: u64::try_from(size.saturating_sub(in_pool)).unwrap_or(u64::MAX),
+                floating,
             }
         })
         .collect();
@@ -1341,8 +1592,14 @@ pub async fn network_ips(
         .into_iter()
         .map(|v| v.id)
         .collect();
-    let all = allocations.len();
+    let all = allocations.len() + routing.len();
     allocations.retain(|a| readable.contains(&a.vm));
+    allocations.extend(
+        routing
+            .into_iter()
+            .filter(|(_, sees)| *sees)
+            .map(|(a, _)| a),
+    );
     let hidden = all - allocations.len();
     let live_error = if allocations.is_empty() || !query.live {
         None
@@ -1358,8 +1615,14 @@ pub async fn network_ips(
     }))
 }
 
-/// 할당마다 OVN 논리 포트의 지금 상태를 채운다.
-async fn read_live(state: &AppState, allocations: &mut [IpAllocation]) -> Result<(), String> {
+/// OVN을 읽을 설정과 중앙들(보기의 `live` — 이 노드가 OVN을 읽지 않거나 SDN이 준비되지 않았으면 까닭)
+pub(crate) type OvnReader<'a> = (
+    &'a crate::ovn_sync::OvnSyncConfig,
+    Vec<(IpAddr, Option<String>)>,
+    Vec<Node>,
+);
+
+pub(crate) fn ovn_reader(state: &AppState) -> Result<OvnReader<'_>, String> {
     let Some(config) = &state.ovn else {
         return Err("this node does not read OVN".into());
     };
@@ -1372,6 +1635,12 @@ async fn read_live(state: &AppState, allocations: &mut [IpAllocation]) -> Result
         .list::<NodeSpec>()
         .map_err(|e| e.to_string())?;
     let centrals = crate::ovn_sync::central_hosts(&sdn, &nodes);
+    Ok((config, centrals, nodes))
+}
+
+/// 할당마다 OVN 논리 포트의 지금 상태를 채운다.
+async fn read_live(state: &AppState, allocations: &mut [IpAllocation]) -> Result<(), String> {
+    let (config, centrals, nodes) = ovn_reader(state)?;
     let ports = crate::ovn_sync::read_ports(config, &centrals)
         .await
         .map_err(|e| e.to_string())?;
@@ -1379,7 +1648,7 @@ async fn read_live(state: &AppState, allocations: &mut [IpAllocation]) -> Result
         .iter()
         .map(|n| (n.id.to_string(), n.name.as_str()))
         .collect();
-    for a in allocations.iter_mut() {
+    for a in allocations.iter_mut().filter(|a| a.kind.is_nic()) {
         let Ok(mac) = a.mac.as_deref().unwrap_or_default().parse() else {
             continue;
         };

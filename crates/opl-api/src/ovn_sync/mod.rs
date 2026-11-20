@@ -794,6 +794,28 @@ pub(crate) async fn read_ports(
     Ok(out)
 }
 
+/// API 노드가 우리 NB 행을 읽는다(계획 66 §9.3 라우터 보기 — DGP의 `status:hosting-chassis`). 읽기만 하므로 팔로어도
+/// 쓴다(`leader_only = false`).
+pub(crate) async fn read_nb(
+    config: &OvnSyncConfig,
+    centrals: &[(std::net::IpAddr, Option<String>)],
+) -> Result<nb::NbActual, OvsdbError> {
+    let transport = match &config.transport {
+        OvnTransport::Tcp => Transport::Tcp,
+        OvnTransport::Tls { pki } => Transport::Tls(OvsdbTls::from_dir(pki)?),
+    };
+    let client = OvsdbClient::connect_any(
+        &transport,
+        &OvnSyncer::endpoints(centrals, config.nb_port, None),
+        NB_DB,
+        false,
+        config.timeout,
+    )
+    .await?;
+    let results = client.transact(NB_DB, nb::read_ops(&config.tag)).await?;
+    Ok(nb::parse_actual(&results))
+}
+
 /// SB의 논리 포트 → 바인딩한 chassis 이름
 async fn read_bindings(
     config: &OvnSyncConfig,

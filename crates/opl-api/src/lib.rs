@@ -62,6 +62,7 @@ mod replica_receive;
 mod replication;
 pub mod resources;
 pub mod revision;
+mod routing;
 mod schedule;
 pub mod scheduler;
 pub mod score;
@@ -271,6 +272,21 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             sdn::patch_network
         ))
         .routes(routes!(sdn::network_ips))
+        .routes(routes!(routing::list_routers, routing::create_router))
+        .routes(routes!(
+            routing::get_router,
+            routing::patch_router,
+            routing::delete_router
+        ))
+        .routes(routes!(
+            routing::list_floating_ips,
+            routing::create_floating_ip
+        ))
+        .routes(routes!(
+            routing::get_floating_ip,
+            routing::patch_floating_ip,
+            routing::delete_floating_ip
+        ))
         .routes(routes!(sdn::get_sdn, sdn::init_sdn))
         .routes(routes!(sdn::add_central))
         .routes(routes!(sdn::remove_central))
