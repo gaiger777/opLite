@@ -354,6 +354,7 @@ impl TemplateDraft {
             }],
             nics: vec![NicSpec {
                 ips: Vec::new(),
+                qos: None,
                 network: self.network.clone(),
                 model: NicModel::Virtio,
                 mac: None,

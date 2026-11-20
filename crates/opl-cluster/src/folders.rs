@@ -281,7 +281,8 @@ pub(crate) struct QuotaCheck {
     after: QuotaTree,
     /// 할당량 있는 조상이 있는 폴더(쓰기 전이나 뒤). 그 밖의 리소스는 세지 않는다.
     relevant: HashSet<Uuid>,
-    /// 셀 종류: VM 쓰기·볼륨 늘리기는 VM, 라우터·유동 IP 쓰기는 그 둘, 폴더 옮기기는 셋 모두
+    /// 셀 종류: VM 쓰기·볼륨 늘리기는 VM, 네트워크 폴더 리소스(네트워크·라우터·유동 IP·부하 분산기) 쓰기는 그 넷, 폴더
+    /// 옮기기는 모두
     members: &'static [Kind],
     /// 쓰는 리소스(훑기에서 빼고 전·후 몫을 따로 더한다)
     this: Option<Uuid>,
@@ -295,8 +296,22 @@ pub(crate) struct QuotaCheck {
     pub(crate) scanned: bool,
 }
 
-/// 네트워크 폴더에 드는 할당량 대상(계획 66)
-const NETWORK_MEMBERS: &[Kind] = &[Kind::Router, Kind::FloatingIp];
+/// 네트워크 폴더에 드는 할당량 대상(계획 66 라우터·유동 IP, 계획 67 네트워크·부하 분산기)
+const NETWORK_MEMBERS: &[Kind] = &[
+    Kind::Network,
+    Kind::Router,
+    Kind::FloatingIp,
+    Kind::LoadBalancer,
+];
+
+/// 폴더 옮기기가 세는 모든 대상
+const ALL_MEMBERS: &[Kind] = &[
+    Kind::Vm,
+    Kind::Network,
+    Kind::Router,
+    Kind::FloatingIp,
+    Kind::LoadBalancer,
+];
 
 /// 이 쓰기가 할당량을 넘길 수 있으면 검사를 준비한다. 할당량이 걸린 조상이 없거나 아무것도 늘리지 않는 쓰기(HA·
 /// 마이그레이션·끄기 같은 노드·전원 바꾸기, 이름 바꾸기, 줄이기)는 None이라 VM을 훑지 않는다. `name`은 쓰는 리소스의
@@ -310,10 +325,7 @@ pub(crate) fn quota_check(
     spec: &Value,
     old: Option<&Value>,
 ) -> Result<Option<QuotaCheck>, StoreError> {
-    if !matches!(
-        kind,
-        Kind::Vm | Kind::Volume | Kind::Folder | Kind::Router | Kind::FloatingIp
-    ) {
+    if !matches!(kind, Kind::Vm | Kind::Volume | Kind::Folder) && !NETWORK_MEMBERS.contains(&kind) {
         return Ok(None);
     }
     // 볼륨은 늘릴 때만 본다(붙지 않은 볼륨은 세지 않는다). 늘리기 Task가 이미 늘린 디스크의 실제 크기
@@ -374,18 +386,21 @@ pub(crate) fn quota_check(
             check.this = Some(id);
             check.new_this = Some((to, new));
         }
-        Kind::Router | Kind::FloatingIp => {
-            // 몫은 늘 하나라 만들기와 할당량 있는 조상이 늘어나는 옮기기만 본다(계획 66).
+        Kind::Network | Kind::Router | Kind::FloatingIp | Kind::LoadBalancer => {
+            // 몫은 거의 늘 같아(부하 분산기는 바깥 VIP를 붙일 때만 유동 IP가 는다 — 계획 67) 만들기, 몫이 느는 바꾸기와
+            // 할당량 있는 조상이 늘어나는 옮기기만 본다(계획 66).
             let (to, from) = (folder_of(spec), old.and_then(folder_of));
             let bound = quota_ancestors(&check.before, to);
-            if bound.is_empty()
-                || (old.is_some() && subset(&bound, &quota_ancestors(&check.before, from)))
-            {
+            if bound.is_empty() {
                 return Ok(None);
             }
-            let usage = FolderUsage::of_network_member(kind);
-            if old.is_some() {
-                check.old_this = Some((from, usage));
+            let usage = FolderUsage::of_network_member_value(kind, spec);
+            if let Some(old) = old {
+                let was = FolderUsage::of_network_member_value(kind, old);
+                if usage.within(&was) && subset(&bound, &quota_ancestors(&check.before, from)) {
+                    return Ok(None);
+                }
+                check.old_this = Some((from, was));
             }
             check.members = NETWORK_MEMBERS;
             check.this = Some(id);
@@ -414,7 +429,7 @@ pub(crate) fn quota_check(
             if subset(&bound, &quota_ancestors(&check.before, from)) {
                 return Ok(None);
             }
-            check.members = &[Kind::Vm, Kind::Router, Kind::FloatingIp];
+            check.members = ALL_MEMBERS;
         }
         _ => unreachable!(),
     }
@@ -448,7 +463,7 @@ impl QuotaCheck {
             return Ok(());
         };
         if kind != Kind::Vm {
-            let usage = FolderUsage::of_network_member(kind);
+            let usage = FolderUsage::of_network_member_value(kind, spec);
             self.before_direct.entry(folder).or_default().add(&usage);
             self.after_direct.entry(folder).or_default().add(&usage);
             return Ok(());
@@ -1379,5 +1394,197 @@ mod tests {
             .unwrap();
         sm.create(Kind::Network, id(34), json!({"sdn": {}}))
             .unwrap();
+    }
+
+    /// 계획 67: 네트워크 폴더의 네트워크·부하 분산기 수, 바깥 VIP는 유동 IP로도 센다. 바깥 VIP를 붙이는 바꾸기도 막는다.
+    #[test]
+    fn network_and_load_balancer_quotas_count_network_folder_members() {
+        let mut sm = Sm::new();
+        sm.create(
+            Kind::Folder,
+            id(1),
+            net_quota_folder(
+                None,
+                json!({"networks": 1, "load_balancers": 2, "floating_ips": 1}),
+            ),
+        )
+        .unwrap();
+        let net = |folder: Option<Uuid>| {
+            let mut v = json!({"sdn": {}});
+            if let Some(f) = folder {
+                v["folder"] = json!(f);
+            }
+            v
+        };
+        assert_eq!(sm.create(Kind::Network, id(10), net(Some(id(1)))), Ok(()));
+        assert_eq!(
+            exceeded(sm.create(Kind::Network, id(11), net(Some(id(1))))),
+            Some((id(1), QuotaDimension::Networks, 1, 2))
+        );
+        // 루트에서 옮겨 넣으면 넘는다. 같은 폴더 안 바꾸기는 된다.
+        assert_eq!(sm.create(Kind::Network, id(11), net(None)), Ok(()));
+        assert!(exceeded(sm.update(Kind::Network, id(11), net(Some(id(1))))).is_some());
+        let mut mtu = net(Some(id(1)));
+        mtu["mtu"] = json!(1400);
+        assert_eq!(sm.update(Kind::Network, id(10), mtu), Ok(()));
+        let lb = |n: u8, external: bool| {
+            let mut v = json!({
+                "folder": id(1),
+                "network": "t1",
+                "vip": format!("10.10.0.{n}"),
+                "listeners": [{"protocol": "tcp", "port": 80}]
+            });
+            if external {
+                v["external"] = json!({"network": "ext", "ip": format!("203.0.113.{n}")});
+            }
+            v
+        };
+        assert_eq!(sm.create(Kind::LoadBalancer, id(20), lb(20, true)), Ok(()));
+        // 바깥 VIP가 유동 IP 하나를 썼으므로 유동 IP는 넘는다.
+        assert_eq!(
+            exceeded(sm.create(Kind::FloatingIp, id(30), fip(Some(id(1)), "203.0.113.30"))),
+            Some((id(1), QuotaDimension::FloatingIps, 1, 2))
+        );
+        assert_eq!(sm.create(Kind::LoadBalancer, id(21), lb(21, false)), Ok(()));
+        // 바깥 VIP를 붙이는 바꾸기는 유동 IP를 늘린다.
+        assert_eq!(
+            exceeded(sm.update(Kind::LoadBalancer, id(21), lb(21, true))),
+            Some((id(1), QuotaDimension::FloatingIps, 1, 2))
+        );
+        assert_eq!(
+            exceeded(sm.create(Kind::LoadBalancer, id(22), lb(22, false))),
+            Some((id(1), QuotaDimension::LoadBalancers, 2, 3))
+        );
+        // 떼는 바꾸기는 줄이므로 된다.
+        assert_eq!(sm.update(Kind::LoadBalancer, id(20), lb(20, false)), Ok(()));
+        assert_eq!(sm.update(Kind::LoadBalancer, id(21), lb(21, true)), Ok(()));
+        // 부하 분산기·옮기기가 든 폴더는 지우지 않는다.
+        assert_eq!(
+            sm.delete(Kind::Folder, id(1)),
+            Err(Rejection::FolderNotEmpty { id: id(1) })
+        );
+        // 옮기기는 할당량이 없고 네트워크 폴더에만 든다.
+        sm.create(Kind::Folder, id(4), folder("vms", "vm", None))
+            .unwrap();
+        assert_eq!(
+            sm.create(
+                Kind::NetworkMigration,
+                id(40),
+                json!({"folder": id(4), "source": "lan", "target": "t-lan"})
+            ),
+            not_found(id(4))
+        );
+        assert_eq!(
+            sm.create(
+                Kind::NetworkMigration,
+                id(40),
+                json!({"folder": id(1), "source": "lan", "target": "t-lan"})
+            ),
+            Ok(())
+        );
+    }
+
+    /// 계획 67: 부하 분산기 주소는 VM·라우터·유동 IP와 한 `ip` 공간이고, 끝나지 않은 옮기기는 원본·VM을 하나만 잡는다.
+    #[test]
+    fn sdn_service_values_are_exclusive() {
+        let mut sm = Sm::new();
+        let mut v = vm(None);
+        v["nics"] = json!([{"network": "t1", "mac": "52:54:00:00:00:01", "ips": ["10.10.0.5"]}]);
+        sm.create(Kind::Vm, id(1), v).unwrap();
+        let lb = |vip: &str, monitor: &str| {
+            json!({
+                "network": "t1",
+                "vip": vip,
+                "listeners": [{"protocol": "tcp", "port": 80}],
+                "monitors": [{"network": "t1", "ip": monitor}]
+            })
+        };
+        assert_eq!(
+            in_use(sm.create(Kind::LoadBalancer, id(10), lb("10.10.0.5", "10.10.0.60"))),
+            Some((
+                Kind::LoadBalancer,
+                "ip".into(),
+                "t1/10.10.0.5".into(),
+                id(1)
+            ))
+        );
+        assert_eq!(
+            in_use(sm.create(Kind::LoadBalancer, id(10), lb("10.10.0.50", "10.10.0.5"))),
+            Some((
+                Kind::LoadBalancer,
+                "ip".into(),
+                "t1/10.10.0.5".into(),
+                id(1)
+            ))
+        );
+        sm.create(Kind::LoadBalancer, id(10), lb("10.10.0.50", "10.10.0.60"))
+            .unwrap();
+        // 라우터·유동 IP·VM 쪽에서 본 겹침도 같다.
+        assert_eq!(
+            in_use(sm.create(
+                Kind::FloatingIp,
+                id(20),
+                json!({"network": "t1", "address": "10.10.0.60"})
+            )),
+            Some((
+                Kind::FloatingIp,
+                "ip".into(),
+                "t1/10.10.0.60".into(),
+                id(10)
+            ))
+        );
+        let mut v2 = vm(None);
+        v2["nics"] = json!([{"network": "t1", "mac": "52:54:00:00:00:02", "ips": ["10.10.0.50"]}]);
+        assert_eq!(
+            in_use(sm.create(Kind::Vm, id(2), v2)),
+            Some((Kind::Vm, "ip".into(), "t1/10.10.0.50".into(), id(10)))
+        );
+        // 한 네트워크에 끝나지 않은 옮기기 하나, 한 VM은 한 옮기기에만
+        let vm1 = id(1).to_string();
+        let mig =
+            |source: &str, vms: &[&str]| json!({"source": source, "target": "t-lan", "vms": vms});
+        sm.create(Kind::NetworkMigration, id(30), mig("lan", &[&vm1]))
+            .unwrap();
+        assert_eq!(
+            in_use(sm.create(Kind::NetworkMigration, id(31), mig("lan", &[]))),
+            Some((
+                Kind::NetworkMigration,
+                "migration-source".into(),
+                "lan".into(),
+                id(30)
+            ))
+        );
+        assert_eq!(
+            in_use(sm.create(Kind::NetworkMigration, id(31), mig("lan2", &[&vm1]))),
+            Some((
+                Kind::NetworkMigration,
+                "migration-vm".into(),
+                vm1.clone(),
+                id(30)
+            ))
+        );
+        // 상태에만 있는 VM(비운 `vms` — 만들 때 계획을 적음)도 잡는다.
+        let mut resource: RawResource = Resource::new(id(32).to_string(), mig("lan3", &[]));
+        resource.id = id(32);
+        resource.status = json!({"phase": "planned", "vms": [{"vm": vm1, "nic": 0}]});
+        assert_eq!(
+            in_use(sm.apply(Command::Create {
+                kind: Kind::NetworkMigration,
+                resource
+            }))
+            .map(|r| r.1),
+            Some("migration-vm".into())
+        );
+        // 끝난 옮기기는 더 잡지 않는다.
+        sm.apply(Command::UpdateStatus {
+            kind: Kind::NetworkMigration,
+            id: id(30),
+            status: json!({"phase": "finished"}),
+        })
+        .unwrap();
+        assert_eq!(
+            sm.create(Kind::NetworkMigration, id(31), mig("lan", &[&vm1])),
+            Ok(())
+        );
     }
 }

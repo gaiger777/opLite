@@ -245,7 +245,7 @@ impl Sdn {
 
     /// `Sdn` 리소스를 만든다.
     async fn create(&self, status: SdnStatus) -> Uuid {
-        let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec {});
+        let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec::default());
         sdn.status = status;
         self.env.cluster.create(&sdn).await.unwrap();
         sdn.id
@@ -839,7 +839,7 @@ async fn sdn_tasks_have_no_timeout() {
     env.stop_runner().await;
     Box::pin(env.start_runner_config(Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)), |_| {}))
         .await;
-    let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec {});
+    let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec::default());
     sdn.status.init_node = Some(env.node);
     env.cluster.create(&sdn).await.unwrap();
     let mut task: Task = Resource::new(

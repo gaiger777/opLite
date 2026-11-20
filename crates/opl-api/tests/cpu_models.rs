@@ -516,6 +516,7 @@ async fn add_x86_node(env: &Env, name: &str, catalog: &str) -> Uuid {
     );
     node.status = NodeStatus {
         sdn: None,
+        qos: false,
         topology: None,
         cpu: Some(NodeCpu {
             catalog: catalog.into(),

@@ -780,6 +780,7 @@ pub(crate) fn import_spec(
                 .ok_or_else(|| format!("no network mapping for {:?}", nic.network))?;
             Ok(NicSpec {
                 ips: run.ips.get(i).cloned().unwrap_or_default(),
+                qos: None,
                 network: network.clone(),
                 model,
                 mac: nic.mac.filter(|_| run.keep_macs),

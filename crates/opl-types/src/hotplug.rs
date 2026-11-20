@@ -867,6 +867,7 @@ mod tests {
     fn nic(last: u8) -> NicSpec {
         NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: "lan".into(),
             model: NicModel::Virtio,
             mac: Some(MacAddr([0x52, 0x54, 0, 0, 0, last])),

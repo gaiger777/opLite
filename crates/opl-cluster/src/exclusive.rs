@@ -6,15 +6,24 @@ use opl_types::resource::Kind;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// 종류가 달라도 한 키 공간을 쓰는 필드(계획 66): 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP가 함께 쓴다.
-pub(crate) const SHARED_IP_KINDS: [Kind; 3] = [Kind::Vm, Kind::Router, Kind::FloatingIp];
+/// 종류가 달라도 한 키 공간을 쓰는 필드(계획 66): 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP·부하 분산기 주소(계획
+/// 67)가 함께 쓴다.
+pub(crate) const SHARED_IP_KINDS: [Kind; 4] =
+    [Kind::Vm, Kind::Router, Kind::FloatingIp, Kind::LoadBalancer];
 
 /// spec에서 다른 리소스와 겹치면 안 되는 값을 `(필드, 값)`으로 꺼낸다. 지금은 VM이 붙인
 /// 볼륨 이름과 NIC의 MAC 주소, SDN NIC 주소의 `{네트워크 이름}/{주소}`(계획 65 — 템플릿은 보지 않는다), 스냅샷의
 /// `{vm id}/{이름}`, 폴더의 형제 이름 키(`FolderSpec::sibling_key`)다. 계획 66: 라우터 외부 주소와 유동 IP도 같은
 /// `ip` 키(종류 사이에서 겹치지 않음 — [`SHARED_IP_KINDS`]), 라우터 인터페이스 네트워크 `router-net`(한 네트워크는
 /// 라우터 하나에만), 유동 IP가 붙은 NIC `fip-nic`(`{vm id}/{MAC}`), 공급자 네트워크의 `physnet`(`{physnet}/{vlan|flat}`).
-pub(crate) fn exclusive_values(kind: Kind, spec: &Value) -> Vec<(&'static str, String)> {
+/// 계획 67: 부하 분산기의 VIP·바깥 VIP·건강 검사 주소도 `ip`, 리스너 `lb-listener`(`{VIP 네트워크}/{VIP}/{프로토콜}/{포트}`),
+/// 끝나지 않은 네트워크 옮기기의 원본 `migration-source`(한 네트워크에 하나)와 VM `migration-vm`(한 VM은 한 옮기기에만 —
+/// VM 목록은 스펙 `vms`와 상태 `vms[].vm`이라 `status`도 본다. `Finished`·`RolledBack`이면 값이 없다).
+pub(crate) fn exclusive_values(
+    kind: Kind,
+    spec: &Value,
+    status: &Value,
+) -> Vec<(&'static str, String)> {
     if kind == Kind::Folder {
         // 풀 수 없는 폴더 스펙은 API가 쓰지 않는다. 겹침 검사에서는 없는 것으로 본다.
         return FolderSpec::deserialize(spec)
@@ -55,6 +64,49 @@ pub(crate) fn exclusive_values(kind: Kind, spec: &Value) -> Vec<(&'static str, S
             }
             return values;
         }
+        Kind::LoadBalancer => {
+            let mut values: Vec<_> = ip(&spec["network"], &spec["vip"]).into_iter().collect();
+            let external = &spec["external"];
+            values.extend(ip(&external["network"], &external["ip"]));
+            for m in spec["monitors"].as_array().into_iter().flatten() {
+                values.extend(ip(&m["network"], &m["ip"]));
+            }
+            if let (Some(network), Some(vip)) = (spec["network"].as_str(), spec["vip"].as_str()) {
+                for l in spec["listeners"].as_array().into_iter().flatten() {
+                    if let (Some(proto), Some(port)) = (l["protocol"].as_str(), l["port"].as_u64())
+                    {
+                        values.push(("lb-listener", format!("{network}/{vip}/{proto}/{port}")));
+                    }
+                }
+            }
+            return values;
+        }
+        Kind::NetworkMigration => {
+            if matches!(status["phase"].as_str(), Some("finished" | "rolled-back")) {
+                return Vec::new();
+            }
+            let mut values: Vec<_> = spec["source"]
+                .as_str()
+                .map(|s| ("migration-source", s.to_string()))
+                .into_iter()
+                .collect();
+            // 한 VM이 NIC 여럿을 옮기면 상태에 여러 번 나오므로 한 번만 낸다.
+            let vms: std::collections::BTreeSet<&str> = spec["vms"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .chain(
+                    status["vms"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|m| m["vm"].as_str()),
+                )
+                .collect();
+            values.extend(vms.into_iter().map(|v| ("migration-vm", v.to_string())));
+            return values;
+        }
         Kind::Network => {
             let provider = &spec["sdn"]["provider"];
             return match (provider["physnet"].as_str(), provider["vlan"].as_u64()) {
@@ -92,6 +144,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn values(kind: Kind, spec: &Value) -> Vec<(&'static str, String)> {
+        exclusive_values(kind, spec, &Value::Null)
+    }
+
     #[test]
     fn extracts_vm_volumes_and_macs() {
         let spec = json!({
@@ -99,14 +155,14 @@ mod tests {
             "nics": [{"network": "user", "mac": "52:54:00:00:00:01"}, {"network": "user", "mac": null}]
         });
         assert_eq!(
-            exclusive_values(Kind::Vm, &spec),
+            values(Kind::Vm, &spec),
             vec![
                 ("volume", "root".to_string()),
                 ("volume", "data".to_string()),
                 ("mac", "52:54:00:00:00:01".to_string()),
             ]
         );
-        assert!(exclusive_values(Kind::Volume, &spec).is_empty());
+        assert!(values(Kind::Volume, &spec).is_empty());
     }
 
     #[test]
@@ -119,7 +175,7 @@ mod tests {
             ]
         });
         assert_eq!(
-            exclusive_values(Kind::Vm, &spec),
+            values(Kind::Vm, &spec),
             vec![
                 ("mac", "52:54:00:00:00:01".to_string()),
                 ("mac", "52:54:00:00:00:02".to_string()),
@@ -132,11 +188,7 @@ mod tests {
         );
         let mut template = spec.clone();
         template["template"] = json!(true);
-        assert!(
-            exclusive_values(Kind::Vm, &template)
-                .iter()
-                .all(|(f, _)| *f == "mac")
-        );
+        assert!(values(Kind::Vm, &template).iter().all(|(f, _)| *f == "mac"));
     }
 
     #[test]
@@ -149,7 +201,7 @@ mod tests {
         });
         // 같은 VM 안에서만 이름이 겹치면 안 된다. vm_spec의 볼륨은 배타 값이 아니다.
         assert_eq!(
-            exclusive_values(Kind::Snapshot, &spec),
+            values(Kind::Snapshot, &spec),
             vec![("name", format!("{vm}/before-upgrade"))]
         );
     }
@@ -158,7 +210,7 @@ mod tests {
     fn extracts_folder_sibling_key() {
         let parent = "0195f7a0-0000-7000-8000-000000000001";
         assert_eq!(
-            exclusive_values(
+            values(
                 Kind::Folder,
                 &json!({"name": "Prod", "kind": "vm", "parent": parent})
             ),
@@ -166,10 +218,10 @@ mod tests {
         );
         // 루트 바로 아래는 종류마다 따로 센다.
         assert_eq!(
-            exclusive_values(Kind::Folder, &json!({"name": "A", "kind": "network"})),
+            values(Kind::Folder, &json!({"name": "A", "kind": "network"})),
             vec![("name", "root-network/a".to_string())]
         );
-        assert!(exclusive_values(Kind::Folder, &json!({"name": 1})).is_empty());
+        assert!(values(Kind::Folder, &json!({"name": 1})).is_empty());
     }
 
     /// 계획 66: 라우터·유동 IP·공급자 네트워크의 독점 값
@@ -180,7 +232,7 @@ mod tests {
             "external": {"network": "ext", "ips": ["203.0.113.10", "2001:db8::10"]}
         });
         assert_eq!(
-            exclusive_values(Kind::Router, &router),
+            values(Kind::Router, &router),
             vec![
                 ("router-net", "t1".to_string()),
                 ("router-net", "t2".to_string()),
@@ -188,7 +240,7 @@ mod tests {
                 ("ip", "ext/2001:db8::10".to_string()),
             ]
         );
-        assert!(exclusive_values(Kind::Router, &json!({})).is_empty());
+        assert!(values(Kind::Router, &json!({})).is_empty());
         let vm = "0195f7a0-0000-7000-8000-000000000001";
         let fip = json!({
             "network": "ext",
@@ -196,30 +248,82 @@ mod tests {
             "target": {"vm": vm, "mac": "52:54:00:AA:00:01"}
         });
         assert_eq!(
-            exclusive_values(Kind::FloatingIp, &fip),
+            values(Kind::FloatingIp, &fip),
             vec![
                 ("ip", "ext/203.0.113.120".to_string()),
                 ("fip-nic", format!("{vm}/52:54:00:aa:00:01")),
             ]
         );
         // 주소를 아직 고르지 않은 유동 IP는 값이 없다.
-        assert!(exclusive_values(Kind::FloatingIp, &json!({"network": "ext"})).is_empty());
+        assert!(values(Kind::FloatingIp, &json!({"network": "ext"})).is_empty());
         assert_eq!(
-            exclusive_values(
+            values(
                 Kind::Network,
                 &json!({"sdn": {"provider": {"physnet": "ext", "vlan": 100}}})
             ),
             vec![("physnet", "ext/100".to_string())]
         );
         assert_eq!(
-            exclusive_values(
+            values(
                 Kind::Network,
                 &json!({"sdn": {"provider": {"physnet": "ext"}}})
             ),
             vec![("physnet", "ext/flat".to_string())]
         );
         // 오버레이·브리지 네트워크는 값이 없다(지금 그대로).
-        assert!(exclusive_values(Kind::Network, &json!({"sdn": {}})).is_empty());
-        assert!(exclusive_values(Kind::Network, &json!({"bridge": "vmbr0"})).is_empty());
+        assert!(values(Kind::Network, &json!({"sdn": {}})).is_empty());
+        assert!(values(Kind::Network, &json!({"bridge": "vmbr0"})).is_empty());
+    }
+
+    /// 계획 67: 부하 분산기의 주소·리스너, 끝나지 않은 네트워크 옮기기의 원본·VM
+    #[test]
+    fn extracts_sdn_service_values() {
+        let lb = json!({
+            "network": "t1",
+            "vip": "10.10.0.50",
+            "external": {"network": "ext", "ip": "203.0.113.130"},
+            "listeners": [{"protocol": "tcp", "port": 80}, {"protocol": "udp", "port": 53}],
+            "monitors": [{"network": "t1", "ip": "10.10.0.60"}, {"network": "t2", "ip": "10.20.0.60"}]
+        });
+        assert_eq!(
+            values(Kind::LoadBalancer, &lb),
+            vec![
+                ("ip", "t1/10.10.0.50".to_string()),
+                ("ip", "ext/203.0.113.130".to_string()),
+                ("ip", "t1/10.10.0.60".to_string()),
+                ("ip", "t2/10.20.0.60".to_string()),
+                ("lb-listener", "t1/10.10.0.50/tcp/80".to_string()),
+                ("lb-listener", "t1/10.10.0.50/udp/53".to_string()),
+            ]
+        );
+        // VIP를 아직 고르지 않았으면 값이 없다.
+        assert!(
+            values(
+                Kind::LoadBalancer,
+                &json!({"network": "t1", "listeners": [{"protocol": "tcp", "port": 80}]})
+            )
+            .is_empty()
+        );
+        let (a, b) = (
+            "0195f7a0-0000-7000-8000-000000000001",
+            "0195f7a0-0000-7000-8000-000000000002",
+        );
+        let mig = json!({"source": "lan", "target": "t-lan", "vms": [a]});
+        // 상태의 VM(NIC마다 한 줄)은 한 번만
+        let status = json!({"phase": "running", "vms": [{"vm": b, "nic": 0}, {"vm": b, "nic": 1}, {"vm": a, "nic": 0}]});
+        assert_eq!(
+            exclusive_values(Kind::NetworkMigration, &mig, &status),
+            vec![
+                ("migration-source", "lan".to_string()),
+                ("migration-vm", a.to_string()),
+                ("migration-vm", b.to_string()),
+            ]
+        );
+        for done in ["finished", "rolled-back"] {
+            assert!(
+                exclusive_values(Kind::NetworkMigration, &mig, &json!({"phase": done})).is_empty()
+            );
+        }
+        assert_eq!(values(Kind::NetworkMigration, &mig).len(), 2);
     }
 }

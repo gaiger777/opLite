@@ -362,6 +362,7 @@ pub(crate) fn apply_command(
                 kind,
                 resource.id,
                 &resource.spec,
+                &resource.status,
                 quota.as_mut(),
                 host.as_mut(),
             )? {
@@ -417,6 +418,7 @@ pub(crate) fn apply_command(
                 kind,
                 id,
                 &spec,
+                &resource.status,
                 quota.as_mut(),
                 host.as_mut(),
             )? {
@@ -503,10 +505,11 @@ fn check_exclusive(
     kind: Kind,
     id: Uuid,
     spec: &serde_json::Value,
+    status: &serde_json::Value,
     mut quota: Option<&mut folders::QuotaCheck>,
     mut host: Option<&mut hosts::HostCheck>,
 ) -> Result<Result<(), Rejection>, StoreError> {
-    let wanted = exclusive_values(kind, spec);
+    let wanted = exclusive_values(kind, spec, status);
     if kind != Kind::Vm {
         quota = None;
         host = None;
@@ -538,20 +541,23 @@ fn check_exclusive(
         if let Some(h) = host.as_deref_mut() {
             h.add(other, &other_spec);
         }
-        for (field, value) in exclusive_values(kind, &other_spec.spec) {
+        for (field, value) in exclusive_values(kind, &other_spec.spec, &other_spec.status) {
             if wanted.iter().any(|(f, v)| *f == field && *v == value) {
                 return Ok(Err(in_use(field, &value, other)));
             }
         }
     }
-    // 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP가 한 키 공간을 쓴다(계획 66). 다른 두 종류는 주소가 있을 때만 훑는다.
+    // 주소 `ip`는 VM NIC·라우터 외부 주소·유동 IP·부하 분산기 주소가 한 키 공간을 쓴다(계획 66·67). 다른 종류는 주소가
+    // 있을 때만 훑는다.
     if SHARED_IP_KINDS.contains(&kind) && wanted.iter().any(|(f, _)| *f == "ip") {
         for other_kind in SHARED_IP_KINDS.into_iter().filter(|k| *k != kind) {
             let name = other_kind.as_str();
             for item in objects.range((name, 0u128)..=(name, u128::MAX))? {
                 let (key, v) = item?;
                 let other_spec: RawResource = serde_json::from_slice(v.value())?;
-                for (field, value) in exclusive_values(other_kind, &other_spec.spec) {
+                for (field, value) in
+                    exclusive_values(other_kind, &other_spec.spec, &other_spec.status)
+                {
                     if field == "ip" && wanted.iter().any(|(f, v)| *f == field && *v == value) {
                         return Ok(Err(in_use(field, &value, Uuid::from_u128(key.value().1))));
                     }

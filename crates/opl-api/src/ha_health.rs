@@ -1287,6 +1287,7 @@ mod tests {
                     .iter()
                     .map(|n| NicSpec {
                         ips: Vec::new(),
+                        qos: None,
                         network: n.to_string(),
                         model: NicModel::Virtio,
                         mac: None,

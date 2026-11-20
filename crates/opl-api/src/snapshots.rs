@@ -35,8 +35,8 @@ use crate::score::Scorer;
 use crate::state::AppState;
 use crate::tasks::{LINKED_ONLY_FROM_TEMPLATES, create_task, unlinkable};
 use crate::vms::{
-    check_node_arch, check_not_template, check_not_witness, check_security_groups, crypt_password,
-    is_stopped, prepare,
+    check_nic_qos, check_node_arch, check_not_template, check_not_witness, check_security_groups,
+    crypt_password, is_stopped, prepare,
 };
 use crate::volumes::{check_pool_on, usable_node};
 
@@ -1018,6 +1018,7 @@ pub async fn clone_vm(
             )));
         }
     }
+    check_nic_qos(&state, &spec)?;
     check_security_groups(&state, &spec)?;
     state
         .authz

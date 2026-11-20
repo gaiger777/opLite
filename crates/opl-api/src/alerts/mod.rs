@@ -57,6 +57,13 @@ const DEFAULT_HISTORY_RANGE_MS: i64 = 24 * 3600 * 1000;
 /// 기능(409, 검증보다 먼저), 형식(400), 대상이 있는지(400)
 fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     require_feature(&state.cluster, NOTIFICATIONS)?;
+    // SDN 조건(계획 67)은 API 스테이지 전까지 받지 않는다.
+    if spec.condition.is_sdn() {
+        return Err(crate::sdn::services_not_yet(
+            &state.cluster,
+            "SDN alert conditions",
+        ));
+    }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for t in &spec.targets {
@@ -632,7 +639,7 @@ pub async fn list_alerts(
     }))
 }
 
-/// 경보 대상(종류와 id 또는 이름)의 주인. 볼 권한은 그 대상의 `alert.read`다. 노드·백업 작업·모르는 대상은 루트다.
+/// 경보 대상(종류와 id 또는 이름)의 주인. 볼 권한은 그 대상의 `alert.read`다. 노드·백업 작업·SDN·모르는 대상은 루트다.
 fn subject_owner(
     state: &AppState,
     owners: &crate::authz::Owners,
@@ -670,7 +677,34 @@ fn subject_owner(
         SubjectKind::Task => id
             .and_then(|id| state.cluster.get::<TaskSpec>(id).ok().flatten())
             .map(|t| owners.task(&t.spec).target),
-        SubjectKind::Node | SubjectKind::BackupJob => None,
+        // 라우터·부하 분산기 경보(계획 67)는 그 객체(네트워크 폴더)의 `alert.read`다.
+        SubjectKind::Router => id
+            .and_then(|id| {
+                state
+                    .cluster
+                    .get::<opl_types::router::RouterSpec>(id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|r| AuthzTarget::Object {
+                kind: opl_types::resource::Kind::Router,
+                id: r.id,
+                folder: r.spec.folder,
+            }),
+        SubjectKind::LoadBalancer => id
+            .and_then(|id| {
+                state
+                    .cluster
+                    .get::<opl_types::load_balancer::LoadBalancerSpec>(id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|l| AuthzTarget::Object {
+                kind: opl_types::resource::Kind::LoadBalancer,
+                id: l.id,
+                folder: l.spec.folder,
+            }),
+        SubjectKind::Node | SubjectKind::BackupJob | SubjectKind::Sdn => None,
     };
     crate::authz::Owned {
         target: target.unwrap_or(AuthzTarget::Root),

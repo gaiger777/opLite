@@ -39,6 +39,7 @@ fn nic(network: &str, mac: u8, ips: &[&str]) -> NicSpec {
         mac: Some(MacAddr([0x52, 0x54, 0, 0, 0, mac])),
         security_groups: Vec::new(),
         ips: ips.iter().map(|s| ip(s)).collect(),
+        qos: None,
     }
 }
 

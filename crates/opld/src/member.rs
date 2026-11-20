@@ -2114,7 +2114,7 @@ mod tests {
         );
         let me = NodeId(node.id);
         let mut sdn: opl_types::sdn::Sdn =
-            Resource::new(opl_types::sdn::SDN_NAME, opl_types::sdn::SdnSpec {});
+            Resource::new(opl_types::sdn::SDN_NAME, opl_types::sdn::SdnSpec::default());
         check_sdn_leave(me, None, std::slice::from_ref(&node)).unwrap();
         check_sdn_leave(me, Some(&sdn), std::slice::from_ref(&node)).unwrap();
         sdn.status.centrals = vec![opl_types::sdn::SdnCentral {

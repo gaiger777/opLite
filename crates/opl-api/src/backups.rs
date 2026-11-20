@@ -31,7 +31,7 @@ use crate::resources::{List, check_name, lookup};
 use crate::snapshots::{check_disks, check_not_busy};
 use crate::state::AppState;
 use crate::tasks::create_task;
-use crate::vms::{check_security_groups, is_stopped};
+use crate::vms::{check_nic_qos, check_security_groups, is_stopped};
 use crate::volumes::{check_pool_on, pool_node};
 use opl_types::authz::Privilege;
 use opl_types::node::FOLDERS;
@@ -657,6 +657,7 @@ pub async fn restore_backup(
             )));
         }
     }
+    check_nic_qos(&state, spec)?;
     check_security_groups(&state, spec)?;
     let source = find_pool(&state, &backup.spec.pool)?;
     let target = find_pool(&state, &req.pool)?;

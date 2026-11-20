@@ -62,4 +62,7 @@ it("links alert subjects", () => {
   expect(alertHref({ ...s, kind: "pool" })).toBe("/storage-pools?q=a%20b");
   expect(alertHref({ ...s, kind: "backup_job" })).toBe("/backup-jobs");
   expect(alertHref({ ...s, kind: "task" })).toBe("/tasks");
+  expect(alertHref({ ...s, kind: "sdn" })).toBe("/sdn");
+  expect(alertHref({ ...s, kind: "router" })).toBe("/routers");
+  expect(alertHref({ ...s, kind: "load_balancer" })).toBe("/networks");
 });

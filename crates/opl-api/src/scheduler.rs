@@ -1086,6 +1086,7 @@ mod tests {
         );
         n.status = NodeStatus {
             sdn: None,
+            qos: false,
             topology: None,
             cpu: None,
             online: true,
@@ -1764,6 +1765,7 @@ mod tests {
         let mut me = spec(512, None, PowerState::Running);
         me.nics = vec![NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: "lan".into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2154,6 +2156,7 @@ mod tests {
         };
         let nic = |network: &str| NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: network.into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2200,6 +2203,7 @@ mod tests {
         let mut me = spec(512, None, PowerState::Running);
         me.nics = vec![NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: "overlay".into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2240,6 +2244,7 @@ mod tests {
         assert_eq!(sched(&me, &inv), Ok(none.id));
         me.nics = vec![NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: "tenant".into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2303,6 +2308,7 @@ mod tests {
         };
         let nic = |network: &str| NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: network.into(),
             model: NicModel::Virtio,
             mac: None,
@@ -2430,6 +2436,7 @@ mod tests {
         );
         me.nics.push(NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: "lan".into(),
             model: NicModel::Virtio,
             mac: None,

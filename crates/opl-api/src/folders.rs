@@ -133,6 +133,13 @@ fn require_quota_feature(state: &AppState, quota: Option<&FolderQuota>) -> Resul
     if quota.is_some_and(|q| q.routers.is_some() || q.floating_ips.is_some()) {
         require_feature(&state.cluster, opl_types::node::SDN_ROUTING)?;
     }
+    // 네트워크·부하 분산기 수(계획 67)는 API 스테이지 전까지 받지 않는다.
+    if quota.is_some_and(|q| q.networks.is_some() || q.load_balancers.is_some()) {
+        return Err(crate::sdn::services_not_yet(
+            &state.cluster,
+            "networks and load_balancers quotas",
+        ));
+    }
     Ok(())
 }
 
@@ -503,6 +510,11 @@ async fn move_one(
                 ()
             ))
         }
+        // 부하 분산기·네트워크 옮기기(계획 67)는 API 스테이지 전까지 옮기지 않는다.
+        Kind::LoadBalancer | Kind::NetworkMigration => Err(crate::sdn::services_not_yet(
+            &state.cluster,
+            "load balancers and network migrations",
+        )),
         _ => unreachable!("FolderKind::of"),
     }
 }

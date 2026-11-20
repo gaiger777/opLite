@@ -62,6 +62,7 @@ async fn node(env: &Env, name: &str) -> Uuid {
     );
     node.status = NodeStatus {
         sdn: None,
+        qos: false,
         topology: None,
         cpu: None,
         online: true,

@@ -307,6 +307,7 @@ mod tests {
     fn nic(mac: Option<MacAddr>, groups: &[&str]) -> NicSpec {
         NicSpec {
             ips: Vec::new(),
+            qos: None,
             network: "lan".into(),
             model: NicModel::Virtio,
             mac,

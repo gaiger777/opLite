@@ -266,6 +266,7 @@ fn disk(volume: &str) -> DiskSpec {
 fn nic(network: &str, mac: Option<MacAddr>) -> NicSpec {
     NicSpec {
         ips: Vec::new(),
+        qos: None,
         network: network.into(),
         model: NicModel::Virtio,
         mac,

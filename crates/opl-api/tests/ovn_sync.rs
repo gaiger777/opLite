@@ -46,7 +46,7 @@ impl Ovn {
 
     /// 이 노드가 유일한 중앙인 `Sdn`(phase)
     async fn sdn(&self, phase: SdnPhase) {
-        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
         sdn.status.phase = phase;
         sdn.status.centrals = vec![SdnCentral {
             node: self.env.node,
@@ -381,7 +381,7 @@ async fn the_ip_list_shows_live_port_state() {
     config.timeout = Duration::from_secs(5);
     let for_state = config.clone();
     let env = Box::pin(Env::start_with_state(move |s| s.ovn = Some(for_state))).await;
-    let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+    let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
     sdn.status.phase = SdnPhase::Ready;
     sdn.status.centrals = vec![SdnCentral {
         node: env.node,

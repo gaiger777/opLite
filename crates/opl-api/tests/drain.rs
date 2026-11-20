@@ -42,6 +42,7 @@ async fn add_node(env: &Env, name: &str, edit: impl FnOnce(&mut Node)) -> Uuid {
     );
     node.status = NodeStatus {
         sdn: None,
+        qos: false,
         topology: None,
         cpu: None,
         online: true,

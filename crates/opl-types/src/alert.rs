@@ -283,6 +283,22 @@ pub enum AlertCondition {
     HaRecovery,
     /// 백업 작업 실행이 실패함(이벤트, 리더가 평가)
     BackupJobFailed,
+    /// SDN 중앙(OVN NB·SB) 정족수를 잃음(계획 67, 리더가 평가, 대상 SDN)
+    SdnQuorumLost,
+    /// 중앙 노드의 NB·SB가 꺼짐·후보이거나 노드가 오프라인(계획 67, 리더, 대상 노드)
+    SdnCentralDown,
+    /// chassis로 구성된 온라인 노드의 ovn-controller가 꺼짐·구성 중(계획 67, 리더, 대상 노드)
+    SdnChassisDown,
+    /// 바깥이 있는 라우터에 게이트웨이 후보가 없거나 모두 오프라인(계획 67, 리더, 대상 라우터)
+    SdnGatewayUnavailable,
+    /// 라우터의 활성 게이트웨이 chassis가 바뀜(이벤트, 계획 67, 리더, 대상 라우터)
+    SdnGatewayFailover,
+    /// OVN NB 동기화가 실패하거나 멈춤, 또는 잠금 표가 맞지 않는 노드가 있음(계획 67, 리더, 대상 SDN)
+    SdnSyncFailed,
+    /// 설정한 physnet(옮기기 다리 포함)이 준비되지 않음(계획 67, 리더, 대상 노드)
+    SdnPhysnetNotReady,
+    /// 부하 분산기의 건강 검사 멤버가 죽음(계획 67, 리더, 대상 부하 분산기)
+    SdnLbMemberDown,
 }
 
 /// 누가 평가하나
@@ -306,6 +322,14 @@ impl AlertCondition {
             Self::TaskFailed { .. } => "task_failed",
             Self::HaRecovery => "ha_recovery",
             Self::BackupJobFailed => "backup_job_failed",
+            Self::SdnQuorumLost => "sdn_quorum_lost",
+            Self::SdnCentralDown => "sdn_central_down",
+            Self::SdnChassisDown => "sdn_chassis_down",
+            Self::SdnGatewayUnavailable => "sdn_gateway_unavailable",
+            Self::SdnGatewayFailover => "sdn_gateway_failover",
+            Self::SdnSyncFailed => "sdn_sync_failed",
+            Self::SdnPhysnetNotReady => "sdn_physnet_not_ready",
+            Self::SdnLbMemberDown => "sdn_lb_member_down",
         }
     }
 
@@ -313,13 +337,32 @@ impl AlertCondition {
     pub fn is_event(&self) -> bool {
         matches!(
             self,
-            Self::TaskFailed { .. } | Self::HaRecovery | Self::BackupJobFailed
+            Self::TaskFailed { .. }
+                | Self::HaRecovery
+                | Self::BackupJobFailed
+                | Self::SdnGatewayFailover
+        )
+    }
+
+    /// SDN 조건(계획 67 — 기능 `sdn-services`)인지
+    pub fn is_sdn(&self) -> bool {
+        matches!(
+            self,
+            Self::SdnQuorumLost
+                | Self::SdnCentralDown
+                | Self::SdnChassisDown
+                | Self::SdnGatewayUnavailable
+                | Self::SdnGatewayFailover
+                | Self::SdnSyncFailed
+                | Self::SdnPhysnetNotReady
+                | Self::SdnLbMemberDown
         )
     }
 
     pub fn evaluator(&self) -> Evaluator {
         match self {
             Self::NodeOffline | Self::BackupJobFailed => Evaluator::Leader,
+            c if c.is_sdn() => Evaluator::Leader,
             _ => Evaluator::Node,
         }
     }
@@ -327,7 +370,14 @@ impl AlertCondition {
     /// 경보 대상의 종류
     pub fn subject_kind(&self) -> SubjectKind {
         match self {
-            Self::NodeMetric { .. } | Self::NodeOffline => SubjectKind::Node,
+            Self::NodeMetric { .. }
+            | Self::NodeOffline
+            | Self::SdnCentralDown
+            | Self::SdnChassisDown
+            | Self::SdnPhysnetNotReady => SubjectKind::Node,
+            Self::SdnQuorumLost | Self::SdnSyncFailed => SubjectKind::Sdn,
+            Self::SdnGatewayUnavailable | Self::SdnGatewayFailover => SubjectKind::Router,
+            Self::SdnLbMemberDown => SubjectKind::LoadBalancer,
             Self::VmMetric { .. } | Self::VmFailed => SubjectKind::Vm,
             Self::PoolUsage { .. } => SubjectKind::Pool,
             Self::TaskFailed { .. } | Self::HaRecovery => SubjectKind::Task,
@@ -463,7 +513,11 @@ impl AlertRuleSpec {
         if !self.vms.is_empty() && !c.about_vms() {
             return Err(AlertRuleError::VmsFilter(c.kind()));
         }
-        if !self.nodes.is_empty() && matches!(c, AlertCondition::BackupJobFailed) {
+        // 노드 거르기는 노드에서 일어나는 일에만 뜻이 있다(SDN 조건은 노드가 대상인 것만 — 계획 67 §11).
+        if !self.nodes.is_empty()
+            && (matches!(c, AlertCondition::BackupJobFailed)
+                || (c.is_sdn() && c.subject_kind() != SubjectKind::Node))
+        {
             return Err(AlertRuleError::NodesFilter(c.kind()));
         }
         if self.nodes.len() > MAX_RULE_SUBJECTS || self.vms.len() > MAX_RULE_SUBJECTS {
@@ -506,6 +560,12 @@ pub enum SubjectKind {
     Pool,
     Task,
     BackupJob,
+    /// 클러스터 SDN(`Sdn` 리소스, 계획 67)
+    Sdn,
+    /// SDN 라우터(계획 67)
+    Router,
+    /// 부하 분산기(계획 67)
+    LoadBalancer,
 }
 
 impl SubjectKind {
@@ -516,6 +576,9 @@ impl SubjectKind {
             Self::Pool => "pool",
             Self::Task => "task",
             Self::BackupJob => "backup_job",
+            Self::Sdn => "sdn",
+            Self::Router => "router",
+            Self::LoadBalancer => "load_balancer",
         }
     }
 }
@@ -1399,6 +1462,89 @@ mod tests {
             assert_eq!(want["kind"], c.kind());
             assert_eq!(serde_json::from_value::<AlertCondition>(want).unwrap(), c);
         }
+    }
+
+    /// 계획 67: SDN 조건 여덟은 리더가 평가하고, 대상 종류와 노드 거르기가 맞고, 옛 규칙 JSON은 그대로다.
+    #[test]
+    fn sdn_conditions() {
+        let all = [
+            (
+                AlertCondition::SdnQuorumLost,
+                "sdn_quorum_lost",
+                SubjectKind::Sdn,
+            ),
+            (
+                AlertCondition::SdnCentralDown,
+                "sdn_central_down",
+                SubjectKind::Node,
+            ),
+            (
+                AlertCondition::SdnChassisDown,
+                "sdn_chassis_down",
+                SubjectKind::Node,
+            ),
+            (
+                AlertCondition::SdnGatewayUnavailable,
+                "sdn_gateway_unavailable",
+                SubjectKind::Router,
+            ),
+            (
+                AlertCondition::SdnGatewayFailover,
+                "sdn_gateway_failover",
+                SubjectKind::Router,
+            ),
+            (
+                AlertCondition::SdnSyncFailed,
+                "sdn_sync_failed",
+                SubjectKind::Sdn,
+            ),
+            (
+                AlertCondition::SdnPhysnetNotReady,
+                "sdn_physnet_not_ready",
+                SubjectKind::Node,
+            ),
+            (
+                AlertCondition::SdnLbMemberDown,
+                "sdn_lb_member_down",
+                SubjectKind::LoadBalancer,
+            ),
+        ];
+        for (c, kind, subject) in all {
+            let json = json!({ "kind": kind });
+            assert_eq!(serde_json::to_value(&c).unwrap(), json);
+            assert_eq!(serde_json::from_value::<AlertCondition>(json).unwrap(), c);
+            assert_eq!(c.kind(), kind);
+            assert!(c.is_sdn());
+            assert_eq!(c.evaluator(), Evaluator::Leader);
+            assert_eq!(c.subject_kind(), subject);
+            assert_eq!(c.is_event(), c == AlertCondition::SdnGatewayFailover);
+            let mut r = rule(c.clone());
+            assert_eq!(r.validate(), Ok(()));
+            r.nodes = vec!["n1".into()];
+            if subject == SubjectKind::Node {
+                assert_eq!(r.validate(), Ok(()));
+            } else {
+                assert_eq!(r.validate(), Err(AlertRuleError::NodesFilter(kind)));
+            }
+            r.nodes.clear();
+            r.vms = vec!["web".into()];
+            assert_eq!(r.validate(), Err(AlertRuleError::VmsFilter(kind)));
+        }
+        assert!(!AlertCondition::NodeOffline.is_sdn());
+        assert!(!cpu_rule().condition.is_sdn());
+        for (k, s) in [
+            (SubjectKind::Sdn, "sdn"),
+            (SubjectKind::Router, "router"),
+            (SubjectKind::LoadBalancer, "load_balancer"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(serde_json::to_value(k).unwrap(), s);
+            assert_eq!(serde_json::from_value::<SubjectKind>(json!(s)).unwrap(), k);
+        }
+        // 옛 규칙 JSON은 바이트까지 같다.
+        let old = r#"{"condition":{"kind":"node_offline"},"for_secs":60,"severity":"critical","targets":["ops"],"nodes":["n1"]}"#;
+        let r: AlertRuleSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&r).unwrap(), old);
     }
 
     #[test]

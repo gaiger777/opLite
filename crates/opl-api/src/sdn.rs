@@ -16,7 +16,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::ipam;
 use opl_types::network::{Network, NetworkSpec, NetworkStatus, Subnet};
-use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING};
+use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::{Kind, Resource};
 use opl_types::sdn::{
     MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest, SdnNodeRequest,
@@ -227,6 +227,16 @@ pub(crate) fn check_node_sdn(
             format!("node sdn {} {}", node.name, parts.join(" "))
         }
     })
+}
+
+/// 계획 67 SDN 서비스의 새 칸·종류(NIC `qos`, SDN 경보 조건, 할당량 `networks`·`load_balancers`, 부하 분산기·네트워크
+/// 옮기기의 폴더 옮기기)는 API 스테이지(계획 67 스테이지 5) 전까지 쓰지 않는다: 옛 노드가 남았으면 409 `cluster_upgrading`(검증보다
+/// 먼저 — 옛 노드는 이 칸을 풀지 못한다), 아니면 400. 스테이지 5가 지운다.
+pub(crate) fn services_not_yet(cluster: &Cluster, what: &str) -> ApiError {
+    match require_feature(cluster, SDN_SERVICES) {
+        Err(e) => e,
+        Ok(()) => ApiError::bad_request(format!("{what} are not available yet (SDN services)")),
+    }
 }
 
 /// 요청 본문의 노드(이름이나 id). 없으면 400이다.
@@ -455,7 +465,7 @@ async fn create_exclusive(
         let found = find_sdn(&state.cluster)?;
         check(found.as_ref())?;
         let Some(sdn) = found else {
-            let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+            let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
             change(&mut sdn.status);
             sdn.status.pending = Some(pending.clone());
             match state.cluster.create(&sdn).await {

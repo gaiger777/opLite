@@ -28,7 +28,7 @@ async fn drop_routing(env: &Env) {
 
 /// 세워진 SDN을 저장소에 바로 둔다.
 async fn ready_sdn(env: &Env) {
-    let mut sdn = Resource::new(SDN_NAME, SdnSpec {});
+    let mut sdn = Resource::new(SDN_NAME, SdnSpec::default());
     sdn.status = SdnStatus {
         phase: SdnPhase::Ready,
         centrals: vec![SdnCentral {

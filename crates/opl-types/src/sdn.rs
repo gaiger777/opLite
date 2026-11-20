@@ -81,6 +81,70 @@ pub fn physnet_ifnames(tag: &str, physnet: &str) -> (String, String, String) {
     )
 }
 
+/// 네트워크 옮기기(계획 67 §9.5) 다리의 임시 physnet 이름 `mig<h8>`(h8 = SHA-256(`<태그>/migration/<옮기기 id>`) 앞
+/// 8자 16진). [`valid_physnet`]에 맞고, 관리자 physnet과 겹치지 않게 이 모양은 노드 설정이 받지 않는다
+/// ([`NodeSdnConfig::validate`]). 다리 장치 이름은 이 physnet의 [`physnet_ifnames`]다.
+pub fn migration_physnet(tag: &str, migration: Uuid) -> String {
+    let d = sha256(&[
+        tag.as_bytes(),
+        b"/migration/",
+        migration.to_string().as_bytes(),
+    ]);
+    let h8: String = d.as_ref()[..4].iter().map(|b| format!("{b:02x}")).collect();
+    format!("mig{h8}")
+}
+
+/// [`migration_physnet`]의 이름 모양(`^mig[0-9a-f]{8}$`)인지
+pub fn is_migration_physnet(name: &str) -> bool {
+    name.strip_prefix("mig").is_some_and(|rest| {
+        rest.len() == 8
+            && rest
+                .bytes()
+                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+    })
+}
+
+/// OVN 접근 잠금의 주소 허용 집합(계획 67 §10.3, 이름 순·겹치지 않게)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AllowSets {
+    /// 멤버 집합(NB 6641·SB 역할 6642): 위트니스·macOS가 아닌 노드의 클러스터 주소와 underlay 주소
+    pub members: Vec<IpAddr>,
+    /// 중앙 집합(Raft 6643·6644·SB 특권 6645): 중앙 주소와 그 노드들의 underlay
+    pub centrals: Vec<IpAddr>,
+    /// Geneve(UDP 6081)를 받는 출발 주소: 멤버 노드의 `encap_ip`
+    pub encaps: Vec<IpAddr>,
+}
+
+/// 노드 목록과 SDN 리소스에서 잠금의 허용 집합을 셈한다. 지운 노드는 목록에 없으므로 빠진다. macOS 노드(`qemu-hvf`)는
+/// chassis가 될 수 없어 멤버가 아니다.
+pub fn allow_sets(nodes: &[Node], sdn: &Sdn) -> AllowSets {
+    let mut sets = AllowSets::default();
+    for n in nodes {
+        if n.spec.witness || n.status.hypervisor == "qemu-hvf" {
+            continue;
+        }
+        sets.members
+            .extend(crate::ceph::address_ip(&n.spec.address));
+        sets.members.extend(n.status.underlay);
+        sets.encaps
+            .extend(n.status.sdn.as_ref().and_then(|s| s.encap_ip));
+    }
+    for c in &sdn.status.centrals {
+        sets.centrals.push(c.address);
+        if let Some(n) = nodes.iter().find(|n| n.id == c.node) {
+            sets.centrals.extend(n.status.underlay);
+        }
+    }
+    for set in [&mut sets.members, &mut sets.centrals, &mut sets.encaps] {
+        for ip in set.iter_mut() {
+            *ip = ip.to_canonical();
+        }
+        set.sort();
+        set.dedup();
+    }
+    sets
+}
+
 /// [`physnet_ifnames`]의 이름 모양(`^oplp[0-9a-f]{8}[obx]$`)인지
 pub fn is_physnet_ifname(name: &str) -> bool {
     let Some(rest) = name.strip_prefix("oplp") else {
@@ -148,6 +212,9 @@ impl NodeSdnConfig {
             if !valid_physnet(physnet) {
                 return Err(NodeSdnError::BadPhysnet(physnet.clone()));
             }
+            if is_migration_physnet(physnet) {
+                return Err(NodeSdnError::ReservedPhysnet(physnet.clone()));
+            }
             if !crate::network::valid_ifname(bridge)
                 || bridge == crate::network::OVN_BRIDGE
                 || crate::network::is_managed_ifname(bridge)
@@ -178,6 +245,10 @@ pub enum NodeSdnError {
     BadBridge(String, String),
     #[error("invalid gateway priority {0}: use 1-1000")]
     BadGateway(u16),
+    #[error(
+        "physnet {0:?} is reserved for network migration bridges (mig followed by 8 hex digits)"
+    )]
+    ReservedPhysnet(String),
 }
 
 /// 노드의 physnet 연결 상태(`NodeSdn.physnets`, 계획 66 §7)
@@ -196,10 +267,14 @@ pub struct PhysnetState {
     pub error: Option<String>,
 }
 
-/// 지금은 칸이 없다(게이트웨이 노드는 `NodeSpec.sdn`에 둔다 — 계획 66).
+/// 클러스터 SDN의 원하는 상태(게이트웨이 노드는 `NodeSpec.sdn`에 둔다 — 계획 66).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SdnSpec {}
+pub struct SdnSpec {
+    /// OVN 접근 잠금(계획 67 §10): SB RBAC 역할 포트·northd 전용 포트·주소 허용 목록. 거짓이면 쓰지 않아 옛 노드도 푼다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub lockdown: bool,
+}
 
 impl ResourceSpec for SdnSpec {
     const KIND: Kind = Kind::Sdn;
@@ -243,6 +318,27 @@ pub struct SdnStatus {
     /// 살아 있는 중앙의 `sdn-central-kick` Task가 내쫓은 뒤 지운다.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub departed: Vec<SdnDeparted>,
+    /// OVN 접근 잠금을 맞춘 기록(계획 67, `sdn-lockdown` Task가 쓴다). 잠금을 켠 적이 없으면 없다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lockdown: Option<LockdownState>,
+}
+
+/// 중앙의 OVN 접근 잠금 상태(`SdnStatus.lockdown`, 계획 67 §10.4)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(default)]
+pub struct LockdownState {
+    /// SB 설정 파일·단위를 `SdnSpec.lockdown`대로 바꾼 중앙
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub applied: Vec<Uuid>,
+    /// 중앙을 바꾸는 중이다.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub pending: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
 }
 
 /// 클러스터에서 지운 노드 가운데 OVN Raft에서 아직 내쫓지 않은 것
@@ -307,6 +403,10 @@ pub struct SdnSync {
     pub nb_cfg: i64,
     /// NB `NB_Global.hv_cfg`: 모든 chassis가 반영한 `nb_cfg`
     pub hv_cfg: i64,
+    /// 마지막 차례에서 실패한 묶음(`network tenant-a`, `port-group web,ssh` 따위, 계획 67). 비면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub failed: Vec<String>,
 }
 
 /// 노드의 SDN 상태(`NodeStatus.sdn`). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만 쓴다.
@@ -345,6 +445,24 @@ pub struct NodeSdn {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub gateway: bool,
+    /// 이 노드의 OVN 주소 허용 목록(nftables `inet opl_ovn_<태그>`, 계획 67 §10.3). 잠금이 꺼져 있으면 없다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub lockdown: Option<LockdownNodeState>,
+}
+
+/// 노드의 OVN 주소 허용 목록 상태(`NodeSdn.lockdown`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(default)]
+pub struct LockdownNodeState {
+    /// 표가 원하는 집합과 맞다.
+    pub firewall: bool,
+    /// 허용 집합의 주소 수
+    pub allowed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
 }
 
 impl NodeSdn {
@@ -603,7 +721,7 @@ mod tests {
         assert_eq!(SdnSpec::KIND, Kind::Sdn);
         assert_eq!(Kind::Sdn.as_str(), "sdn");
         assert_eq!(serde_json::to_value(Kind::Sdn).unwrap(), "sdn");
-        assert_eq!(serde_json::to_value(SdnSpec {}).unwrap(), json!({}));
+        assert_eq!(serde_json::to_value(SdnSpec::default()).unwrap(), json!({}));
         assert!(serde_json::from_value::<SdnSpec>(json!({ "gateways": [] })).is_err());
         let json = serde_json::to_value(SdnStatus::default()).unwrap();
         assert_eq!(json, json!({ "phase": "bootstrapping" }));
@@ -638,6 +756,7 @@ mod tests {
                 error: None,
                 nb_cfg: 7,
                 hv_cfg: 6,
+                failed: Vec::new(),
             }),
             nb_cid: Some(Uuid::now_v7()),
             sb_cid: None,
@@ -646,6 +765,7 @@ mod tests {
                 name: "n9".into(),
                 address: ip("10.0.0.9"),
             }],
+            lockdown: None,
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["departed"][0]["name"], "n9");
@@ -672,6 +792,7 @@ mod tests {
         let full = NodeSdn {
             physnets: Vec::new(),
             gateway: false,
+            lockdown: None,
             chassis: ChassisState::Ready,
             ovn_version: Some("24.03.4".into()),
             ovs_version: Some("3.3.0".into()),
@@ -774,7 +895,7 @@ mod tests {
         assert!(json.get("phase").is_none(), "{json}");
 
         let gone = Uuid::now_v7();
-        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
         sdn.status.phase = SdnPhase::Ready;
         sdn.status.centrals = vec![
             SdnCentral {
@@ -818,7 +939,7 @@ mod tests {
             node("n1", false, Some(health.clone())),
             node("n2", false, Some(health)),
         ];
-        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec {});
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
         sdn.status.centrals = vec![SdnCentral {
             node: nodes[0].id,
             address: ip("10.0.0.1"),
@@ -1046,5 +1167,164 @@ mod tests {
             }
         }
         assert!((100..=300).contains(&moved), "{moved}");
+    }
+
+    /// 계획 67: 잠금·실패 묶음 칸이 없으면 옛 SDN·노드 SDN JSON이 바이트까지 같고, 있으면 왕복한다.
+    #[test]
+    fn sdn_services_fields_are_written_only_when_set() {
+        let old = r#"{"phase":"ready","centrals":[{"node":"00000000-0000-0000-0000-000000000001","address":"10.0.0.1"}],"sync":{"term":3,"index":9,"at":100,"nb_cfg":2,"hv_cfg":2}}"#;
+        let st: SdnStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(st.lockdown, None);
+        assert!(st.sync.as_ref().unwrap().failed.is_empty());
+        assert_eq!(serde_json::to_string(&st).unwrap(), old);
+        let old = r#"{}"#;
+        let spec: SdnSpec = serde_json::from_str(old).unwrap();
+        assert!(!spec.lockdown);
+        assert_eq!(serde_json::to_string(&spec).unwrap(), old);
+        let spec = SdnSpec { lockdown: true };
+        assert_eq!(
+            serde_json::to_string(&spec).unwrap(),
+            r#"{"lockdown":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SdnSpec>(r#"{"lockdown":true}"#).unwrap(),
+            spec
+        );
+        let mut st = st;
+        st.lockdown = Some(LockdownState {
+            applied: vec![Uuid::from_u128(1)],
+            pending: true,
+            error: None,
+        });
+        st.sync.as_mut().unwrap().failed = vec!["network tenant-a".into()];
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(
+            json["lockdown"],
+            json!({ "applied": ["00000000-0000-0000-0000-000000000001"], "pending": true })
+        );
+        assert_eq!(json["sync"]["failed"], json!(["network tenant-a"]));
+        assert_eq!(serde_json::from_value::<SdnStatus>(json).unwrap(), st);
+        let old = r#"{"chassis":"ready","encap_ip":"10.0.0.2","physnets":[{"name":"ext","bridge":"vmbr1","ready":true}],"gateway":true}"#;
+        let ns: NodeSdn = serde_json::from_str(old).unwrap();
+        assert_eq!(ns.lockdown, None);
+        assert_eq!(serde_json::to_string(&ns).unwrap(), old);
+        let ns = NodeSdn {
+            lockdown: Some(LockdownNodeState {
+                firewall: true,
+                allowed: 5,
+                error: None,
+            }),
+            ..ns
+        };
+        let json = serde_json::to_value(&ns).unwrap();
+        assert_eq!(json["lockdown"], json!({ "firewall": true, "allowed": 5 }));
+        assert_eq!(serde_json::from_value::<NodeSdn>(json).unwrap(), ns);
+    }
+
+    #[test]
+    fn migration_physnets_are_valid_and_reserved() {
+        let a = migration_physnet("t1", Uuid::from_u128(1));
+        assert_eq!(a.len(), 11);
+        assert!(a.starts_with("mig"));
+        assert!(valid_physnet(&a));
+        assert!(is_migration_physnet(&a));
+        assert_eq!(a, migration_physnet("t1", Uuid::from_u128(1)));
+        assert_ne!(a, migration_physnet("t2", Uuid::from_u128(1)));
+        assert_ne!(a, migration_physnet("t1", Uuid::from_u128(2)));
+        for other in [
+            "migration",
+            "mig1234567",
+            "mig123456789",
+            "migABCDEF12",
+            "ext",
+        ] {
+            assert!(!is_migration_physnet(other), "{other}");
+        }
+        // 관리자 physnet으로 쓸 수 없다(같은 모양만 — `migration` 같은 이름은 된다).
+        let cfg = NodeSdnConfig {
+            physnets: [(a.clone(), "vmbr1".to_string())].into(),
+            gateway: None,
+        };
+        assert_eq!(cfg.validate(), Err(NodeSdnError::ReservedPhysnet(a)));
+        let cfg = NodeSdnConfig {
+            physnets: [("migration".to_string(), "vmbr1".to_string())].into(),
+            gateway: None,
+        };
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn allow_sets_follow_members_and_centrals() {
+        let mk = |n: u128,
+                  addr: &str,
+                  underlay: Option<&str>,
+                  witness: bool,
+                  hv: &str,
+                  encap: Option<&str>| {
+            let mut node: Node = Resource::new(
+                format!("n{n}"),
+                serde_json::from_value(json!({ "address": addr, "witness": witness })).unwrap(),
+            );
+            node.id = Uuid::from_u128(n);
+            node.status.underlay = underlay.map(ip);
+            node.status.hypervisor = hv.into();
+            node.status.sdn = encap.map(|e| NodeSdn {
+                encap_ip: Some(ip(e)),
+                ..Default::default()
+            });
+            node
+        };
+        let nodes = vec![
+            mk(
+                1,
+                "10.0.0.1:8006",
+                Some("192.168.0.1"),
+                false,
+                "qemu-kvm",
+                Some("192.168.0.1"),
+            ),
+            mk(
+                2,
+                "10.0.0.2:8006",
+                None,
+                false,
+                "qemu-kvm",
+                Some("10.0.0.2"),
+            ),
+            // 이름 주소(IP 아님)는 underlay만
+            mk(
+                3,
+                "n3.lab:8006",
+                Some("192.168.0.3"),
+                false,
+                "qemu-kvm",
+                None,
+            ),
+            mk(4, "10.0.0.4:8006", None, true, "", None),
+            mk(5, "10.0.0.5:8006", None, false, "qemu-hvf", None),
+        ];
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
+        sdn.status.centrals = vec![
+            SdnCentral {
+                node: Uuid::from_u128(1),
+                address: ip("10.0.0.1"),
+            },
+            SdnCentral {
+                node: Uuid::from_u128(2),
+                address: ip("10.0.0.2"),
+            },
+        ];
+        let sets = allow_sets(&nodes, &sdn);
+        let ips = |v: &[&str]| v.iter().map(|s| ip(s)).collect::<Vec<_>>();
+        assert_eq!(
+            sets.members,
+            ips(&["10.0.0.1", "10.0.0.2", "192.168.0.1", "192.168.0.3"])
+        );
+        assert_eq!(sets.centrals, ips(&["10.0.0.1", "10.0.0.2", "192.168.0.1"]));
+        assert_eq!(sets.encaps, ips(&["10.0.0.2", "192.168.0.1"]));
+        // 지운 노드는 목록에 없으므로 빠진다.
+        let sets = allow_sets(&nodes[1..], &sdn);
+        assert!(!sets.members.contains(&ip("10.0.0.1")));
+        assert_eq!(sets.centrals, ips(&["10.0.0.1", "10.0.0.2"]));
     }
 }

@@ -3558,6 +3558,30 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "backup_job_failed";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_quorum_lost";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_central_down";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_chassis_down";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_gateway_unavailable";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_gateway_failover";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_sync_failed";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_physnet_not_ready";
+        } | {
+            /** @enum {string} */
+            kind: "sdn_lb_member_down";
         };
         /**
          * @description 비교
@@ -5580,11 +5604,21 @@ export interface components {
             disk_bytes?: number;
             /**
              * Format: int64
-             * @description 유동 IP 수(계획 66, 네트워크 폴더만)
+             * @description 유동 IP 수(계획 66, 네트워크 폴더만). 부하 분산기의 바깥 VIP도 하나씩 센다(계획 67).
              */
             floating_ips?: number;
+            /**
+             * Format: int64
+             * @description 부하 분산기 수(계획 67, 네트워크 폴더만)
+             */
+            load_balancers?: number;
             /** Format: int64 */
             memory_mib?: number;
+            /**
+             * Format: int64
+             * @description 네트워크 수(계획 67, 네트워크 폴더만)
+             */
+            networks?: number;
             /**
              * Format: int64
              * @description 라우터 수(계획 66, 네트워크 폴더만)
@@ -5623,11 +5657,21 @@ export interface components {
             disk_bytes: number;
             /**
              * Format: int64
-             * @description 유동 IP 수(계획 66). 0이면 쓰지 않는다.
+             * @description 유동 IP 수(계획 66, 부하 분산기의 바깥 VIP 포함). 0이면 쓰지 않는다.
              */
             floating_ips?: number;
+            /**
+             * Format: int64
+             * @description 부하 분산기 수(계획 67). 0이면 쓰지 않는다.
+             */
+            load_balancers?: number;
             /** Format: int64 */
             memory_mib: number;
+            /**
+             * Format: int64
+             * @description 네트워크 수(계획 67). 0이면 쓰지 않는다.
+             */
+            networks?: number;
             /**
              * Format: int64
              * @description 라우터 수(계획 66). 0이면 쓰지 않는다.
@@ -6398,7 +6442,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration";
         /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
         LdapRealm: {
             /** @description 사용자를 찾을 기준 DN(subtree) */
@@ -7053,6 +7097,11 @@ export interface components {
                         [key: string]: components["schemas"]["PoolState"];
                     };
                     /**
+                     * @description 이 노드가 단순 NIC의 tap에 tc 속도 제한(`clsact`·police, 계획 67 §8.2)을 걸 수 있다. 검사 루프가 쓴다. 거짓이면
+                     *     쓰지 않는다(옛 노드·macOS·위트니스). 옛 노드는 무시한다.
+                     */
+                    qos?: boolean;
+                    /**
                      * @description 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
                      *     쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
                      */
@@ -7646,6 +7695,20 @@ export interface components {
              */
             surplus: number;
         };
+        /** @description 노드의 OVN 주소 허용 목록 상태(`NodeSdn.lockdown`) */
+        LockdownNodeState: {
+            /**
+             * @description 허용 집합의 주소 수
+             * @default 0
+             */
+            allowed: number;
+            error?: string;
+            /**
+             * @description 표가 원하는 집합과 맞다.
+             * @default false
+             */
+            firewall: boolean;
+        };
         LoginRequest: {
             password: string;
             /** @description 없거나 `local`이면 로컬 사용자 */
@@ -7829,6 +7892,29 @@ export interface components {
         NetworkStatus: Record<string, never>;
         /** @enum {string} */
         NicModel: "virtio" | "e1000e";
+        /** @description NIC 하나의 QoS(`NicSpec.qos`). 보내기·받기는 VM 쪽에서 본 방향이다. */
+        NicQos: {
+            /**
+             * Format: int32
+             * @description 버스트(kbit, 1~10000000). 없으면 속도(kbit/s)의 80%(Neutron 기본과 같다).
+             */
+            burst_kbit?: number;
+            /**
+             * Format: int32
+             * @description VM이 보내는 IP 패킷에 적는 DSCP(0~63). SDN NIC만 된다.
+             */
+            dscp?: number;
+            /**
+             * Format: int32
+             * @description VM이 받는 속도 상한(Mbit/s, 1~100000)
+             */
+            in_mbps?: number;
+            /**
+             * Format: int32
+             * @description VM이 보내는 속도 상한(Mbit/s, 1~100000)
+             */
+            out_mbps?: number;
+        };
         NicSpec: {
             /**
              * @description SDN 네트워크 NIC의 주소(주소 체계마다 하나까지, 계획 65). 네트워크에 서브넷이 있으면 API가 IPAM으로 채운다(MAC
@@ -7839,6 +7925,11 @@ export interface components {
             model: components["schemas"]["NicModel"];
             /** @description Network 리소스 이름 */
             network: string;
+            /**
+             * @description 보내기·받기 속도 제한과 DSCP(계획 67). SDN NIC는 OVN `QoS` 행, 단순 NIC는 tap의 tc(속도만). 없으면 쓰지 않아 옛
+             *     노드도 VM을 푼다.
+             */
+            qos?: components["schemas"]["NicQos"];
             /** @description 이 NIC에 거는 보안 그룹 이름(8개 이하, 겹치지 않게). 비어 있지 않으면 방화벽이 켜진다. */
             security_groups?: string[];
         };
@@ -8110,6 +8201,8 @@ export interface components {
             error?: string;
             /** @description `ovn-cms-options`에 `enable-chassis-as-gw`를 적었다(계획 66). 거짓이면 쓰지 않는다. */
             gateway?: boolean;
+            /** @description 이 노드의 OVN 주소 허용 목록(nftables `inet opl_ovn_<태그>`, 계획 67 §10.3). 잠금이 꺼져 있으면 없다. */
+            lockdown?: components["schemas"]["LockdownNodeState"];
             /** @description `ovn-controller --version`의 판 */
             ovn_version?: string;
             /** @description `ovs-vsctl --version`의 판 */
@@ -8237,6 +8330,11 @@ export interface components {
             pools: {
                 [key: string]: components["schemas"]["PoolState"];
             };
+            /**
+             * @description 이 노드가 단순 NIC의 tap에 tc 속도 제한(`clsact`·police, 계획 67 §8.2)을 걸 수 있다. 검사 루프가 쓴다. 거짓이면
+             *     쓰지 않는다(옛 노드·macOS·위트니스). 옛 노드는 무시한다.
+             */
+            qos?: boolean;
             /**
              * @description 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
              *     쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
@@ -9951,6 +10049,11 @@ export interface components {
                     [key: string]: components["schemas"]["PoolState"];
                 };
                 /**
+                 * @description 이 노드가 단순 NIC의 tap에 tc 속도 제한(`clsact`·police, 계획 67 §8.2)을 걸 수 있다. 검사 루프가 쓴다. 거짓이면
+                 *     쓰지 않는다(옛 노드·macOS·위트니스). 옛 노드는 무시한다.
+                 */
+                qos?: boolean;
+                /**
                  * @description 이 노드의 SDN(OVN) chassis·중앙 상태(계획 65). 노드의 SDN 에이전트가 바뀔 때만, 모든 노드가 `sdn`을 알릴 때만
                  *     쓴다. 없으면(SDN 설정 전·옛 노드·macOS·위트니스) chassis가 아니다. 옛 노드는 무시한다.
                  */
@@ -10841,6 +10944,8 @@ export interface components {
             at: number;
             /** @description 마지막 차례가 실패한 이유 */
             error?: string;
+            /** @description 마지막 차례에서 실패한 묶음(`network tenant-a`, `port-group web,ssh` 따위, 계획 67). 비면 쓰지 않는다. */
+            failed?: string[];
             /**
              * Format: int64
              * @description NB `NB_Global.hv_cfg`: 모든 chassis가 반영한 `nb_cfg`
@@ -11270,7 +11375,7 @@ export interface components {
          * @description 경보 대상의 종류
          * @enum {string}
          */
-        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job";
+        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer";
         /** @description SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다. */
         Subnet: {
             /**

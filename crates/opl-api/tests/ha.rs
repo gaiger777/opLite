@@ -118,6 +118,7 @@ async fn node_with(
     );
     node.status = NodeStatus {
         sdn: None,
+        qos: false,
         topology: None,
         cpu: None,
         online: true,

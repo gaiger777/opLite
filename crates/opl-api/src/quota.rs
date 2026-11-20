@@ -121,8 +121,9 @@ pub(crate) fn precheck_vm(
     )
 }
 
-/// 폴더마다 바로 든 VM의 사용량과(네트워크 폴더 — 계획 66) 라우터·유동 IP 수
+/// 폴더마다 바로 든 VM의 사용량과(네트워크 폴더) 라우터·유동 IP 수(계획 66), 네트워크·부하 분산기 수와 바깥 VIP(계획 67)
 fn direct_usage(cluster: &Cluster) -> Result<DirectUsage, ApiError> {
+    use opl_types::resource::Kind;
     let sizes = volume_sizes(cluster)?;
     let (_, vms) = cluster.list::<VmSpec>()?;
     let mut direct = DirectUsage::new();
@@ -132,21 +133,30 @@ fn direct_usage(cluster: &Cluster) -> Result<DirectUsage, ApiError> {
             direct.entry(f).or_default().add(&usage);
         }
     }
+    let networks = cluster.list::<opl_types::network::NetworkSpec>()?.1;
     let routers = cluster.list::<opl_types::router::RouterSpec>()?.1;
     let fips = cluster.list::<opl_types::floating_ip::FloatingIpSpec>()?.1;
-    let members = routers
+    let lbs = cluster
+        .list::<opl_types::load_balancer::LoadBalancerSpec>()?
+        .1;
+    let members = networks
         .iter()
-        .map(|r| (r.spec.folder, opl_types::resource::Kind::Router))
+        .map(|n| (n.spec.folder, Kind::Network, false))
+        .chain(routers.iter().map(|r| (r.spec.folder, Kind::Router, false)))
         .chain(
             fips.iter()
-                .map(|f| (f.spec.folder, opl_types::resource::Kind::FloatingIp)),
+                .map(|f| (f.spec.folder, Kind::FloatingIp, false)),
+        )
+        .chain(
+            lbs.iter()
+                .map(|l| (l.spec.folder, Kind::LoadBalancer, l.spec.external.is_some())),
         );
-    for (folder, kind) in members {
+    for (folder, kind, external) in members {
         if let Some(f) = folder {
             direct
                 .entry(f)
                 .or_default()
-                .add(&FolderUsage::of_network_member(kind));
+                .add(&FolderUsage::of_network_member(kind, external));
         }
     }
     Ok(direct)

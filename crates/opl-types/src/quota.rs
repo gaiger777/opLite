@@ -25,12 +25,16 @@ pub enum QuotaDimension {
     DedicatedVcpus,
     /// 라우터 수(계획 66, 네트워크 폴더)
     Routers,
-    /// 유동 IP 수(계획 66, 네트워크 폴더)
+    /// 유동 IP 수(계획 66, 네트워크 폴더 — 부하 분산기의 바깥 VIP 포함)
     FloatingIps,
+    /// 네트워크 수(계획 67, 네트워크 폴더)
+    Networks,
+    /// 부하 분산기 수(계획 67, 네트워크 폴더)
+    LoadBalancers,
 }
 
 impl QuotaDimension {
-    pub const ALL: [QuotaDimension; 7] = [
+    pub const ALL: [QuotaDimension; 9] = [
         QuotaDimension::Vcpus,
         QuotaDimension::MemoryMib,
         QuotaDimension::DiskBytes,
@@ -38,6 +42,8 @@ impl QuotaDimension {
         QuotaDimension::DedicatedVcpus,
         QuotaDimension::Routers,
         QuotaDimension::FloatingIps,
+        QuotaDimension::Networks,
+        QuotaDimension::LoadBalancers,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -49,6 +55,8 @@ impl QuotaDimension {
             QuotaDimension::DedicatedVcpus => "dedicated_vcpus",
             QuotaDimension::Routers => "routers",
             QuotaDimension::FloatingIps => "floating_ips",
+            QuotaDimension::Networks => "networks",
+            QuotaDimension::LoadBalancers => "load_balancers",
         }
     }
 
@@ -62,6 +70,8 @@ impl QuotaDimension {
             QuotaDimension::DedicatedVcpus => "dedicated vCPUs",
             QuotaDimension::Routers => "routers",
             QuotaDimension::FloatingIps => "floating IPs",
+            QuotaDimension::Networks => "networks",
+            QuotaDimension::LoadBalancers => "load balancers",
         }
     }
 
@@ -74,6 +84,8 @@ impl QuotaDimension {
             QuotaDimension::DedicatedVcpus => quota.dedicated_vcpus,
             QuotaDimension::Routers => quota.routers,
             QuotaDimension::FloatingIps => quota.floating_ips,
+            QuotaDimension::Networks => quota.networks,
+            QuotaDimension::LoadBalancers => quota.load_balancers,
         }
     }
 
@@ -86,6 +98,8 @@ impl QuotaDimension {
             QuotaDimension::DedicatedVcpus => usage.dedicated_vcpus,
             QuotaDimension::Routers => usage.routers,
             QuotaDimension::FloatingIps => usage.floating_ips,
+            QuotaDimension::Networks => usage.networks,
+            QuotaDimension::LoadBalancers => usage.load_balancers,
         }
     }
 }
@@ -106,6 +120,8 @@ impl FolderUsage {
         self.dedicated_vcpus = self.dedicated_vcpus.saturating_add(other.dedicated_vcpus);
         self.routers = self.routers.saturating_add(other.routers);
         self.floating_ips = self.floating_ips.saturating_add(other.floating_ips);
+        self.networks = self.networks.saturating_add(other.networks);
+        self.load_balancers = self.load_balancers.saturating_add(other.load_balancers);
     }
 
     /// 어느 차원도 `other`보다 크지 않다.
@@ -125,17 +141,29 @@ impl FolderUsage {
             dedicated_vcpus: self.dedicated_vcpus.saturating_mul(n),
             routers: self.routers.saturating_mul(n),
             floating_ips: self.floating_ips.saturating_mul(n),
+            networks: self.networks.saturating_mul(n),
+            load_balancers: self.load_balancers.saturating_mul(n),
         }
     }
 
-    /// 네트워크 폴더에 드는 리소스 하나의 몫(계획 66): 라우터 하나, 유동 IP 하나. 다른 종류는 0이다.
-    pub fn of_network_member(kind: crate::resource::Kind) -> FolderUsage {
+    /// 네트워크 폴더에 드는 리소스 하나의 몫: 라우터 하나, 유동 IP 하나(계획 66), 네트워크 하나, 부하 분산기 하나와
+    /// 바깥 VIP가 있으면(`external_vip`) 유동 IP 하나(계획 67 — 공인 주소는 어떤 리소스가 잡든 같은 몫). 다른 종류는
+    /// 0이다.
+    pub fn of_network_member(kind: crate::resource::Kind, external_vip: bool) -> FolderUsage {
         use crate::resource::Kind;
+        let lb = kind == Kind::LoadBalancer;
         FolderUsage {
             routers: u64::from(kind == Kind::Router),
-            floating_ips: u64::from(kind == Kind::FloatingIp),
+            floating_ips: u64::from(kind == Kind::FloatingIp || (lb && external_vip)),
+            networks: u64::from(kind == Kind::Network),
+            load_balancers: u64::from(lb),
             ..FolderUsage::default()
         }
+    }
+
+    /// [`FolderUsage::of_network_member`]의 JSON 판(상태 머신): 부하 분산기의 바깥 VIP는 스펙의 `external`이 있는지로 본다.
+    pub fn of_network_member_value(kind: crate::resource::Kind, spec: &Value) -> FolderUsage {
+        FolderUsage::of_network_member(kind, spec.get("external").is_some_and(|e| !e.is_null()))
     }
 
     /// VM 하나의 몫: vCPU(`sockets × cores`)·메모리·VM 하나, 그리고 붙은 볼륨의 크기 합 `disk_bytes`. 전용 VM은
@@ -357,6 +385,8 @@ mod tests {
         let want = FolderUsage {
             routers: 0,
             floating_ips: 0,
+            networks: 0,
+            load_balancers: 0,
             dedicated_vcpus: 0,
             vcpus: 6,
             memory_mib: 1024,
@@ -487,6 +517,8 @@ mod tests {
             vms: 4,
             routers: 5,
             floating_ips: 6,
+            networks: 0,
+            load_balancers: 0,
         };
         assert!(u.within(&u.times(2)));
         assert!(!u.times(2).within(&u));
@@ -495,29 +527,70 @@ mod tests {
         assert!(!more.within(&u));
     }
 
-    /// 계획 66: 네트워크 폴더의 라우터·유동 IP 수
+    /// 계획 66: 네트워크 폴더의 라우터·유동 IP 수, 계획 67: 네트워크·부하 분산기 수와 바깥 VIP의 유동 IP
     #[test]
     fn network_members_count_routers_and_floating_ips() {
         use crate::resource::Kind;
-        assert_eq!(FolderUsage::of_network_member(Kind::Router).routers, 1);
         assert_eq!(
-            FolderUsage::of_network_member(Kind::FloatingIp).floating_ips,
+            FolderUsage::of_network_member(Kind::Router, false).routers,
             1
         );
         assert_eq!(
-            FolderUsage::of_network_member(Kind::Network),
+            FolderUsage::of_network_member(Kind::FloatingIp, false).floating_ips,
+            1
+        );
+        assert_eq!(
+            FolderUsage::of_network_member(Kind::Network, false),
+            FolderUsage {
+                networks: 1,
+                ..FolderUsage::default()
+            }
+        );
+        assert_eq!(
+            FolderUsage::of_network_member(Kind::LoadBalancer, false),
+            FolderUsage {
+                load_balancers: 1,
+                ..FolderUsage::default()
+            }
+        );
+        // 바깥 VIP는 유동 IP 하나를 쓴다(부하 분산기에만 뜻이 있다).
+        assert_eq!(
+            FolderUsage::of_network_member_value(
+                Kind::LoadBalancer,
+                &json!({ "network": "t1", "external": { "network": "ext" } })
+            ),
+            FolderUsage {
+                load_balancers: 1,
+                floating_ips: 1,
+                ..FolderUsage::default()
+            }
+        );
+        assert_eq!(
+            FolderUsage::of_network_member_value(Kind::LoadBalancer, &json!({ "network": "t1" })),
+            FolderUsage::of_network_member(Kind::LoadBalancer, false)
+        );
+        assert_eq!(
+            FolderUsage::of_network_member(Kind::NetworkMigration, true),
             FolderUsage::default()
+        );
+        assert_eq!(
+            FolderUsage::of_network_member(Kind::Router, true),
+            FolderUsage::of_network_member(Kind::Router, false)
         );
         let quota = FolderQuota {
             floating_ips: Some(1),
             ..FolderQuota::default()
         };
         let tree: QuotaTree = [(id(1), node(None, Some(quota)))].into();
-        let one: DirectUsage = [(id(1), FolderUsage::of_network_member(Kind::FloatingIp))].into();
+        let one: DirectUsage = [(
+            id(1),
+            FolderUsage::of_network_member(Kind::FloatingIp, false),
+        )]
+        .into();
         let mut two = one.clone();
         two.get_mut(&id(1))
             .unwrap()
-            .add(&FolderUsage::of_network_member(Kind::FloatingIp));
+            .add(&FolderUsage::of_network_member(Kind::LoadBalancer, true));
         assert_eq!(
             quota_exceeded((&tree, &DirectUsage::new()), (&tree, &one)),
             None
@@ -526,6 +599,20 @@ mod tests {
             quota_exceeded((&tree, &one), (&tree, &two)).map(|e| (e.dimension, e.limit, e.used)),
             Some((QuotaDimension::FloatingIps, 1, 2))
         );
+        let quota = FolderQuota {
+            networks: Some(1),
+            ..FolderQuota::default()
+        };
+        let tree: QuotaTree = [(id(1), node(None, Some(quota)))].into();
+        let net = FolderUsage::of_network_member(Kind::Network, false);
+        let one: DirectUsage = [(id(1), net)].into();
+        let two: DirectUsage = [(id(1), net.times(2))].into();
+        assert_eq!(
+            quota_exceeded((&tree, &one), (&tree, &two)).map(|e| (e.dimension, e.limit, e.used)),
+            Some((QuotaDimension::Networks, 1, 2))
+        );
+        assert_eq!(QuotaDimension::LoadBalancers.as_str(), "load_balancers");
+        assert_eq!(QuotaDimension::LoadBalancers.unit(), "load balancers");
     }
 
     #[test]

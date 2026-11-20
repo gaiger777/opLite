@@ -295,6 +295,7 @@ impl Agent {
         self.report.set(Some(NodeSdn {
             physnets,
             gateway,
+            lockdown: None,
             chassis,
             ovn_version: Some(versions.ovn),
             ovs_version: Some(versions.ovs),
@@ -541,7 +542,7 @@ mod tests {
     }
 
     async fn create_sdn(cluster: &Cluster, status: SdnStatus) {
-        let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec {});
+        let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec::default());
         sdn.status = status;
         cluster.create(&sdn).await.unwrap();
     }

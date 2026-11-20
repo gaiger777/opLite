@@ -77,7 +77,7 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
       : { name };
 }
 
-/** 경보 대상의 화면: 노드·VM은 상세, 풀은 목록 검색, 백업 작업·Task는 그 목록 */
+/** 경보 대상의 화면: 노드·VM은 상세, 풀은 목록 검색, 백업 작업·Task·라우터는 그 목록, SDN은 SDN 보기(계획 67) */
 export function alertHref(subject: AlertSubject): string {
   switch (subject.kind) {
     case "node":
@@ -90,5 +90,12 @@ export function alertHref(subject: AlertSubject): string {
       return "/backup-jobs";
     case "task":
       return "/tasks";
+    case "sdn":
+      return "/sdn";
+    case "router":
+      return "/routers";
+    case "load_balancer":
+      // 부하 분산 보기는 웹 스테이지(계획 67 스테이지 7)가 더한다.
+      return "/networks";
   }
 }

@@ -461,6 +461,10 @@ impl VmSpec {
             {
                 return Err(ValidationError::NicIps(i));
             }
+            if let Some(qos) = &nic.qos {
+                qos.validate()
+                    .map_err(|e| ValidationError::NicQos(i, e.to_string()))?;
+            }
         }
         if let Some(schedule) = &self.snapshot_schedule
             && !(1..=MAX_SCHEDULE_KEEP).contains(&schedule.keep)
@@ -603,6 +607,8 @@ pub enum ValidationError {
     DuplicateSecurityGroup(usize, String),
     #[error("nics[{0}]: a NIC can have at most one IPv4 and one IPv6 address")]
     NicIps(usize),
+    #[error("nics[{0}]: {1}")]
+    NicQos(usize, String),
     #[error("ha.max_restart and ha.max_relocate must be between 0 and {MAX_HA_COUNT}")]
     HaCount,
     #[error("ha.priority must be between 0 and {MAX_HA_PRIORITY}")]
@@ -870,6 +876,11 @@ pub struct NicSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, default))]
     pub ips: Vec<std::net::IpAddr>,
+    /// 보내기·받기 속도 제한과 DSCP(계획 67). SDN NIC는 OVN `QoS` 행, 단순 NIC는 tap의 tc(속도만). 없으면 쓰지 않아 옛
+    /// 노드도 VM을 푼다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub qos: Option<crate::qos::NicQos>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2622,6 +2633,36 @@ mod tests {
         assert_eq!(json["guest_agent"], true);
         assert!(json.get("secure_boot").is_none(), "{json}");
         assert_eq!(serde_json::from_value::<RunningHardware>(json).unwrap(), hw);
+    }
+
+    /// 계획 67: QoS가 없는 NIC는 옛 JSON 그대로, QoS는 왕복하고 VM 검증이 본다.
+    #[test]
+    fn nic_qos_is_omitted_when_absent_and_validated() {
+        for old in [
+            r#"{"network":"lan","model":"virtio","mac":null}"#,
+            r#"{"network":"t","model":"virtio","mac":"52:54:00:12:34:56","security_groups":["web"],"ips":["10.0.0.5"]}"#,
+        ] {
+            let nic: NicSpec = serde_json::from_str(old).unwrap();
+            assert_eq!(nic.qos, None);
+            assert_eq!(serde_json::to_string(&nic).unwrap(), old);
+        }
+        let json = serde_json::json!({
+            "network": "lan",
+            "model": "virtio",
+            "mac": null,
+            "qos": { "out_mbps": 100, "dscp": 46 }
+        });
+        let nic: NicSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(nic.qos.unwrap().out_mbps, Some(100));
+        assert_eq!(serde_json::to_value(&nic).unwrap(), json);
+        let mut s = sample();
+        s.nics[0].qos = nic.qos;
+        assert_eq!(s.validate(), Ok(()));
+        s.nics[0].qos = Some(crate::qos::NicQos::default());
+        assert_eq!(
+            s.validate().unwrap_err().to_string(),
+            "nics[0]: qos needs out_mbps, in_mbps or dscp (leave qos out for none)"
+        );
     }
 
     /// 계획 65: 주소가 없는 NIC는 옛 JSON 그대로, 주소는 왕복하고 체계마다 하나까지다.

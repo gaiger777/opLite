@@ -156,6 +156,7 @@ fn disk(volume: &str) -> DiskSpec {
 fn user_nic(last: u8) -> NicSpec {
     NicSpec {
         ips: Vec::new(),
+        qos: None,
         network: "user".into(),
         model: NicModel::Virtio,
         mac: Some(MacAddr([0x52, 0x54, 0, 0, 0, last])),

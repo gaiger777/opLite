@@ -179,6 +179,7 @@ impl Env {
         me.id = node;
         me.status = NodeStatus {
             sdn: None,
+            qos: false,
             topology: None,
             cpu: None,
             online: true,

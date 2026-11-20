@@ -84,7 +84,7 @@ async fn ready_sdn(env: &Env, centrals: &[Uuid]) {
                 .unwrap();
         }
         None => {
-            let mut sdn = Resource::new(SDN_NAME, SdnSpec {});
+            let mut sdn = Resource::new(SDN_NAME, SdnSpec::default());
             sdn.status = status;
             env.cluster.create(&sdn).await.unwrap();
         }
@@ -249,7 +249,7 @@ async fn init_moves_off_a_dead_node_before_any_central() {
     let admin = env.admin().await;
     let dead = other_node(&env, "node2", false).await;
     // node2에서 세우다 멈춘 SDN(중앙 없음)
-    let mut sdn = Resource::new(SDN_NAME, SdnSpec {});
+    let mut sdn = Resource::new(SDN_NAME, SdnSpec::default());
     sdn.status = SdnStatus {
         init_node: Some(dead),
         ..SdnStatus::default()

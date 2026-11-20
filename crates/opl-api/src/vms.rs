@@ -391,6 +391,7 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
         &crate::ipam::load_held(&state.cluster)?,
         &crate::ipam::readable(state, principal.as_ref()),
     )?;
+    check_nic_qos(state, spec)?;
     check_security_groups(state, spec)?;
     if spec.template {
         check_template_spec(&vm.name, spec, &inv)?;
@@ -885,6 +886,17 @@ pub(crate) fn local_cdrom(vm: &Vm, inv: &Inventory) -> Option<String> {
             )
         })
     })
+}
+
+/// NIC `qos`(계획 67)는 API 스테이지 전까지 받지 않는다(`sdn::services_not_yet`).
+pub(crate) fn check_nic_qos(state: &AppState, spec: &VmSpec) -> Result<(), ApiError> {
+    if spec.nics.iter().any(|n| n.qos.is_some()) {
+        return Err(crate::sdn::services_not_yet(
+            &state.cluster,
+            "NIC qos settings",
+        ));
+    }
+    Ok(())
 }
 
 /// NIC의 보안 그룹이 모두 있고, 그룹을 건 NIC가 `user` 네트워크가 아닌지(아니면 400). SDN NIC에 그룹을 걸면 모든 노드가

@@ -167,6 +167,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub sdn: Option<NodeSdn>,
+    /// 이 노드가 단순 NIC의 tap에 tc 속도 제한(`clsact`·police, 계획 67 §8.2)을 걸 수 있다. 검사 루프가 쓴다. 거짓이면
+    /// 쓰지 않는다(옛 노드·macOS·위트니스). 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub qos: bool,
 }
 
 /// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
@@ -402,6 +407,7 @@ pub const FEATURES: &[&str] = &[
     NUMA,
     SDN,
     SDN_ROUTING,
+    SDN_SERVICES,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -478,6 +484,11 @@ pub const SDN: &str = "sdn";
 /// `physnets`·`gateway` 쓰기, 종류 `Router`·`FloatingIp`, 할당량 `routers`·`floating_ips`, SDN NIC의 `security_groups`.
 /// 옛 노드는 이 칸·종류를 풀지 못하므로 모든 노드가 알릴 때만 쓴다.
 pub const SDN_ROUTING: &str = "sdn-routing";
+
+/// SDN 서비스(계획 67): 종류 `LoadBalancer`·`NetworkMigration`, NIC `qos`, `SdnSpec.lockdown`, 경보 조건 `sdn_*`, 할당량
+/// `networks`·`load_balancers`, `NodeStatus.qos`·`NodeSdn.lockdown` 쓰기. 옛 노드는 이 칸·종류를 풀지 못하고(잠금은 중앙
+/// 에이전트가 단위 파일을 다시 쓰는 일이라 옛 에이전트가 되돌린다) 모든 노드가 알릴 때만 쓴다.
+pub const SDN_SERVICES: &str = "sdn-services";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -965,7 +976,8 @@ mod tests {
                 "cpu-models",
                 "numa",
                 "sdn",
-                "sdn-routing"
+                "sdn-routing",
+                "sdn-services"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1184,7 +1196,23 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&SDN_ROUTING));
+        assert_eq!(FEATURES.last(), Some(&SDN_SERVICES));
+    }
+
+    /// 계획 67: tc를 쓸 수 없으면(옛 노드) `qos`를 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.
+    #[test]
+    fn status_qos_is_written_only_when_true() {
+        let old = r#"{"online":true,"cpus":8,"memory_mib":16384,"hypervisor":"qemu-kvm","bridges":[],"arch":"x86_64","pools":{},"firewall":true,"features":["sdn"]}"#;
+        let status: NodeStatus = serde_json::from_str(old).unwrap();
+        assert!(!status.qos);
+        assert_eq!(serde_json::to_string(&status).unwrap(), old);
+        let status = NodeStatus {
+            qos: true,
+            ..status
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["qos"], true);
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 
     /// 계획 66: 노드 SDN 설정이 없으면 옛 노드 스펙 JSON이 바이트까지 같고, 있으면 그대로 오간다.

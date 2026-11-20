@@ -73,17 +73,28 @@ impl FolderKind {
     pub fn of(kind: Kind) -> Option<FolderKind> {
         match kind {
             Kind::Vm => Some(FolderKind::Vm),
-            Kind::Network | Kind::Router | Kind::FloatingIp => Some(FolderKind::Network),
+            Kind::Network
+            | Kind::Router
+            | Kind::FloatingIp
+            | Kind::LoadBalancer
+            | Kind::NetworkMigration => Some(FolderKind::Network),
             Kind::StoragePool => Some(FolderKind::Storage),
             _ => None,
         }
     }
 
-    /// 이 트리에 드는 리소스 종류(앞이 트리의 주 종류). 네트워크 폴더에는 라우터·유동 IP도 든다(계획 66).
+    /// 이 트리에 드는 리소스 종류(앞이 트리의 주 종류). 네트워크 폴더에는 라우터·유동 IP(계획 66)와 부하 분산기·네트워크
+    /// 옮기기(계획 67)도 든다.
     pub fn member_kinds(self) -> &'static [Kind] {
         match self {
             FolderKind::Vm => &[Kind::Vm],
-            FolderKind::Network => &[Kind::Network, Kind::Router, Kind::FloatingIp],
+            FolderKind::Network => &[
+                Kind::Network,
+                Kind::Router,
+                Kind::FloatingIp,
+                Kind::LoadBalancer,
+                Kind::NetworkMigration,
+            ],
             FolderKind::Storage => &[Kind::StoragePool],
         }
     }
@@ -98,7 +109,12 @@ impl FolderKind {
                 QuotaDimension::Vms,
                 QuotaDimension::DedicatedVcpus,
             ],
-            FolderKind::Network => &[QuotaDimension::Routers, QuotaDimension::FloatingIps],
+            FolderKind::Network => &[
+                QuotaDimension::Routers,
+                QuotaDimension::FloatingIps,
+                QuotaDimension::Networks,
+                QuotaDimension::LoadBalancers,
+            ],
             FolderKind::Storage => &[],
         }
     }
@@ -131,10 +147,18 @@ pub struct FolderQuota {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub routers: Option<u64>,
-    /// 유동 IP 수(계획 66, 네트워크 폴더만)
+    /// 유동 IP 수(계획 66, 네트워크 폴더만). 부하 분산기의 바깥 VIP도 하나씩 센다(계획 67).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub floating_ips: Option<u64>,
+    /// 네트워크 수(계획 67, 네트워크 폴더만)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub networks: Option<u64>,
+    /// 부하 분산기 수(계획 67, 네트워크 폴더만)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub load_balancers: Option<u64>,
 }
 
 impl FolderQuota {
@@ -160,10 +184,18 @@ pub struct FolderUsage {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub routers: u64,
-    /// 유동 IP 수(계획 66). 0이면 쓰지 않는다.
+    /// 유동 IP 수(계획 66, 부하 분산기의 바깥 VIP 포함). 0이면 쓰지 않는다.
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub floating_ips: u64,
+    /// 네트워크 수(계획 67). 0이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub networks: u64,
+    /// 부하 분산기 수(계획 67). 0이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub load_balancers: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -418,6 +450,60 @@ mod tests {
         assert!(q.is_empty());
         assert_eq!(serde_json::to_string(&q).unwrap(), "{}");
         assert!(serde_json::from_str::<FolderQuota>(r#"{"cpus":1}"#).is_err());
+    }
+
+    /// 계획 67: 네트워크·부하 분산기 수가 없으면 옛 할당량·사용량 JSON이 바이트까지 같고, 있으면 왕복한다. 네트워크
+    /// 폴더에만 걸린다.
+    #[test]
+    fn network_and_load_balancer_quotas_are_written_only_when_set() {
+        let old = r#"{"routers":1,"floating_ips":4}"#;
+        let q: FolderQuota = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&q).unwrap(), old);
+        let old =
+            r#"{"vcpus":0,"memory_mib":0,"disk_bytes":0,"vms":0,"routers":1,"floating_ips":2}"#;
+        let u: FolderUsage = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&u).unwrap(), old);
+        let q = FolderQuota {
+            networks: Some(10),
+            load_balancers: Some(2),
+            ..FolderQuota::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(json, r#"{"networks":10,"load_balancers":2}"#);
+        assert_eq!(serde_json::from_str::<FolderQuota>(&json).unwrap(), q);
+        let u = FolderUsage {
+            networks: 3,
+            load_balancers: 1,
+            ..FolderUsage::default()
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(
+            json,
+            r#"{"vcpus":0,"memory_mib":0,"disk_bytes":0,"vms":0,"networks":3,"load_balancers":1}"#
+        );
+        assert_eq!(serde_json::from_str::<FolderUsage>(&json).unwrap(), u);
+        let id = Uuid::from_u128(1);
+        let f = FolderSpec {
+            quota: Some(q),
+            ..spec("a", FolderKind::Network)
+        };
+        assert_eq!(f.validate(id), Ok(()));
+        let f = FolderSpec {
+            quota: Some(q),
+            ..spec("a", FolderKind::Vm)
+        };
+        assert_eq!(
+            f.validate(id),
+            Err(FolderError::QuotaDimension(QuotaDimension::Networks, "vm"))
+        );
+        assert_eq!(
+            FolderKind::of(Kind::LoadBalancer),
+            Some(FolderKind::Network)
+        );
+        assert_eq!(
+            FolderKind::of(Kind::NetworkMigration),
+            Some(FolderKind::Network)
+        );
     }
 
     /// 계획 66: 새 차원이 없으면 옛 할당량·사용량 JSON이 바이트까지 같고, 있으면 왕복한다.
