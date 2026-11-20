@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
 import { toast } from "sonner";
 
-import { api, call } from "@/api/client";
+import { api, ApiError, call } from "@/api/client";
 import { putResource } from "@/api/optimistic";
 import type { Network } from "@/api/types";
 import { ListPending } from "@/components/ListPending";
@@ -20,6 +20,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
+import { PortOffChip } from "@/sdn/chips";
 import { formatIps } from "@/sdn/ips";
 import type { NetworkIps } from "@/sdn/sdn";
 import { SubnetsEditor } from "@/sdn/SubnetsEditor";
@@ -111,15 +112,26 @@ export function NetworkSheet({
   );
 }
 
+/** 고치는 서브넷 목록에 새로 더한 CIDR이 있는지(저장된 것과 견줌, 앞뒤 공백 무시) */
+export function addsSubnets(saved: readonly SubnetRow[], rows: readonly SubnetRow[]): boolean {
+  const known = new Set(saved.map((r) => r.cidr.trim()));
+  return rows.some((r) => r.cidr.trim() !== "" && !known.has(r.cidr.trim()));
+}
+
 function SubnetsSection({ network, writes }: { network: Network; writes: boolean }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  // 고치기 시작한 리비전(If-Match). 그 사이 다른 사람이 바꿨으면 409 revision_mismatch다.
+  // 고치기 시작한 리비전(If-Match). 그 사이 다른 사람이 바꿨으면 412 revision_mismatch다.
   const [editing, setEditing] = useState<{ revision: number; rows: SubnetRow[] } | null>(null);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [failure, setFailure] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const saved = (network.spec.subnets ?? []).map(subnetRow);
+  // 서브넷을 더하면 서버가 주소 없는 인터페이스에 새 서브넷의 주소를 준다(리뷰 2 웹 C-1). 고치는 동안만 센다(OVN은 읽지
+  // 않는 목록용 질의).
+  const usage = useNetworkIps(network, editing !== null, false);
+  const adding = editing !== null && addsSubnets(saved, editing.rows);
+  const bare = usage.data?.allocations.filter((a) => a.ips.length === 0).length ?? 0;
 
   async function save() {
     if (!editing) {
@@ -144,7 +156,29 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
       toast.success(t("sdn.subnets.saved", { name: network.name }));
       setEditing(null);
     } catch (err) {
-      // 409 subnet_in_use: 서버가 그 서브넷의 주소를 쓰는 VM 이름을 말한다.
+      if (err instanceof ApiError && err.code === "revision_mismatch") {
+        // 그새 누가 서브넷을 바꿨다(412): 지금 리비전을 다시 읽어 입력한 행은 두고 다시 저장하게 한다(리뷰 2 웹 M-1 —
+        // 옛 리비전으로는 저장이 늘 412였다).
+        try {
+          const fresh = await call(
+            api.GET("/networks/{key}", { params: { path: { key: network.id } } }),
+          );
+          putResource(queryClient, "network", fresh);
+          setEditing({ revision: fresh.revision, rows: editing.rows });
+          setFailure(
+            t("sdn.subnets.conflict", {
+              subnets:
+                (fresh.spec.subnets ?? []).map((s) => s.cidr).join(", ") ||
+                t("sdn.subnets.noneShort"),
+            }),
+          );
+        } catch (again) {
+          setFailure(errorMessage(t, again));
+        }
+        return;
+      }
+      // 409 subnet_in_use: 서버가 그 서브넷의 주소를 쓰는 VM 이름을 말한다. 409 ip_exhausted: 주소 없는 인터페이스 수와
+      // 서브넷마다 남은 수.
       setFailure(errorMessage(t, err));
     } finally {
       setBusy(false);
@@ -170,6 +204,11 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
       {editing ? (
         <>
           <p className="text-xs text-muted-foreground">{t("sdn.subnets.editHint")}</p>
+          {adding && bare > 0 && (
+            <p role="status" className="text-sm text-warning-fg">
+              {t("sdn.subnets.fillNotice", { count: bare })}
+            </p>
+          )}
           <SubnetsEditor
             id="sheet-subnet"
             rows={editing.rows}
@@ -237,6 +276,8 @@ function SubnetsSection({ network, writes }: { network: Network; writes: boolean
 }
 
 function IpsSection({ network }: { network: Network }) {
+  // 서브넷이 있는 네트워크의 주소 없는 NIC는 포트가 꺼져 있다(리뷰 2 웹 I-1).
+  const subnets = (network.spec.subnets ?? []).length > 0;
   const { t } = useTranslation();
   const ips = useNetworkIps(network);
   const data: NetworkIps | undefined = ips.data;
@@ -297,14 +338,16 @@ function IpsSection({ network }: { network: Network }) {
                       {a.vm_name}
                     </Link>
                   </TableCell>
-                  <TableCell>{t("sdn.ips.nicN", { n: a.nic })}</TableCell>
+                  <TableCell>{t("sdn.ips.nicN", { n: a.nic + 1 })}</TableCell>
                   <TableCell className="font-mono text-xs">{a.mac ?? "—"}</TableCell>
                   <TableCell className="font-mono text-xs">
                     {formatIps(a.ips) || t("sdn.ips.noAddress")}
                   </TableCell>
                   <TableCell>
                     {/* OVN을 읽지 못했으면(live null) 모른다. */}
-                    {a.live == null ? (
+                    {subnets && a.ips.length === 0 ? (
+                      <PortOffChip />
+                    ) : a.live == null ? (
                       "—"
                     ) : (
                       <StatusChip tone={a.live.up ? "success" : "neutral"}>

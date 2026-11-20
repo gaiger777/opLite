@@ -6,6 +6,7 @@ import type { Node } from "@/api/types";
 
 type Schemas = components["schemas"];
 export type SdnView = Schemas["SdnView"];
+export type SdnStray = Schemas["SdnStrayView"];
 export type NodeSdn = Schemas["NodeSdn"];
 export type Subnet = Schemas["Subnet"];
 export type NetworkIps = Schemas["NetworkIps"];
@@ -132,6 +133,11 @@ export async function callWarned<T>(
     }),
   );
   return { data, warning: warningOf(response) };
+}
+
+/** 남은 중앙 DB를 알린 노드 id(`GET /sdn`의 `strays` 가운데 아직 클러스터에 있는 것 — 노드 칸의 표시) */
+export function strayNodes(view: SdnView | undefined): ReadonlySet<string> {
+  return new Set((view?.strays ?? []).filter((s) => !s.gone).map((s) => s.node));
 }
 
 /** 노드 목록의 이름(모르면 id) */

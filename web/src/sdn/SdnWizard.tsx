@@ -57,6 +57,16 @@ export function SdnWizard({
   const { t } = useTranslation();
   const [step, setStep] = useState<Step>("centrals");
   const [plan, setPlan] = useState<Plan | null>(null);
+  // 단계가 바뀌면 누른 단추가 사라지므로 새 단계로 초점을 옮긴다(리뷰 2 웹 M-3 — 초점이 <body>로 떨어지지 않게).
+  const body = useRef<HTMLDivElement>(null);
+  const first = useRef(true);
+  useEffect(() => {
+    if (first.current) {
+      first.current = false;
+      return;
+    }
+    body.current?.focus();
+  }, [step]);
 
   return (
     <Card className="max-w-3xl">
@@ -74,7 +84,12 @@ export function SdnWizard({
           ))}
         </ol>
       </CardHeader>
-      <CardContent>
+      <CardContent
+        ref={body}
+        tabIndex={-1}
+        aria-label={t(`sdn.wizard.steps.${step}`)}
+        className="outline-none"
+      >
         {step === "centrals" ? (
           <CentralsStep
             onCreated={(next) => {
@@ -89,6 +104,7 @@ export function SdnWizard({
             plan={plan}
             onRetried={(task) => setPlan({ ...plan, task })}
             onNext={() => setStep("chassis")}
+            onStranded={onDone}
           />
         ) : (
           <div className="flex flex-col gap-4">
@@ -230,11 +246,14 @@ function ProgressStep({
   plan,
   onRetried,
   onNext,
+  onStranded,
 }: {
   sdn: SdnView;
   plan: Plan;
   onRetried(task: string): void;
   onNext(): void;
+  /** 첫 세우기 노드가 꺼졌거나 지워져 여기서 다시 할 수 없다: 상태 화면(설정 옮기기)으로 넘긴다. */
+  onStranded(): void;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
@@ -257,6 +276,15 @@ function ProgressStep({
     (node) => !isCentral(node) && addTask(node)?.status.state === "failed",
   );
   const allDone = done && plan.rest.every(isCentral);
+  // 첫 세우기 노드가 꺼졌거나 지워졌고 아직 중앙이 없다: "다시 하기"는 늘 409라 상태 화면의 설정 옮기기로 넘긴다(리뷰 2 웹
+  // M-2). 도는 채로 남은 Task(전원이 나감)도 같다.
+  const initGone = nodes.isSuccess && !nodes.data.find((n) => n.id === plan.init)?.status.online;
+  const stranded = initGone && !done && sdn.centrals.length === 0;
+  useEffect(() => {
+    if (stranded) {
+      onStranded();
+    }
+  }, [stranded, onStranded]);
 
   async function addCentral(node: string) {
     posting.current = true;
@@ -314,6 +342,14 @@ function ProgressStep({
 
   return (
     <div className="flex flex-col gap-4">
+      {/* 단계 목록은 주기적으로 바뀐다: 지금 단계를 한 줄로 읽어 준다(리뷰 2 웹 M-3). */}
+      <p role="status" aria-live="polite" className="sr-only">
+        {failed
+          ? ""
+          : done
+            ? t("sdn.wizard.installed")
+            : t(`tasks.sdnStage.${INIT_STAGES[current]}`)}
+      </p>
       <ol aria-label={t("sdn.wizard.stages")} className="flex flex-col gap-1 text-sm">
         {INIT_STAGES.map((s, i) => (
           <li
@@ -332,7 +368,11 @@ function ProgressStep({
         ))}
       </ol>
       {plan.rest.length > 0 && (
-        <ul aria-label={t("sdn.wizard.moreCentrals")} className="flex flex-col gap-1 text-sm">
+        <ul
+          aria-label={t("sdn.wizard.moreCentrals")}
+          aria-live="polite"
+          className="flex flex-col gap-1 text-sm"
+        >
           {plan.rest.map((node) => {
             const state = isCentral(node)
               ? "done"

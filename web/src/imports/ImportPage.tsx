@@ -532,7 +532,7 @@ function RunSection({
                     <Field
                       key={`ips-${i}`}
                       id={`run-ips-${i}`}
-                      label={t("imports.nicIps", { n: i, network: nic.network })}
+                      label={t("imports.nicIps", { n: i + 1, network: nic.network })}
                       error={errors[`ips${i}`]}
                       hint={t("vmForm.nicIpsHint")}
                     >

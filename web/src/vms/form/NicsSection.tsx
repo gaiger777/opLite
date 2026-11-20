@@ -76,11 +76,14 @@ export function NicsSection({
           // 도는 장치: 네트워크·모델·MAC은 바꾸지 못한다(보안 그룹은 된다).
           const fixed = mode === "restart" || (live && i < savedRows);
           const sdn = sdnNetworkNamed(networks, nic.network);
-          // 켜진 VM의 저장된 NIC(같은 MAC·네트워크)는 주소를 바꿀 수 없다.
-          const stored = saved.some(
+          // 켜진 VM의 저장된 NIC(같은 MAC·네트워크)는 주소를 바꿀 수 없다. 주소가 하나도 없던 NIC에는 줄 수 있다(그 포트는
+          // 꺼져 있었다 — 서버 `check_running_ips`, 리뷰 2 N-4).
+          const savedNic = saved.find(
             (s) => s.network === nic.network && (s.mac ?? "") === nic.mac.toLowerCase(),
           );
-          const ipsFixed = mode !== "free" && stored;
+          const stored = savedNic !== undefined;
+          const bare = stored && !savedNic.ips?.length;
+          const ipsFixed = mode !== "free" && stored && !bare;
           const removable = live ? liveRemovable(i, savedRows, boot) : !locked;
           return (
             <fieldset
@@ -157,9 +160,11 @@ export function NicsSection({
                       hint={t(
                         ipsFixed
                           ? "vmForm.nicIpsRunning"
-                          : stored
-                            ? "vmForm.nicIpsKeepHint"
-                            : "vmForm.nicIpsHint",
+                          : bare && mode !== "free"
+                            ? "vmForm.nicIpsGiveRunning"
+                            : stored
+                              ? "vmForm.nicIpsKeepHint"
+                              : "vmForm.nicIpsHint",
                       )}
                     >
                       {(a11y) => (

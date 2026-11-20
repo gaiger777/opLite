@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
+import { listKey } from "@/api/live";
 import type { Node, Principal } from "@/api/types";
 import { SdnPage } from "@/sdn/SdnPage";
 import { expectNoAxeViolations } from "@/test/axe";
@@ -372,4 +373,154 @@ it("shows the state read-only to viewers", async () => {
   expect(await screen.findByRole("table", { name: "Central nodes" })).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Add a central" })).not.toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "Install on all nodes" })).not.toBeInTheDocument();
+});
+
+it("moves a setup whose task still runs on a node that lost power", async () => {
+  // 리뷰 2 웹 I-2: 전원이 나간 노드의 Task는 `running`으로 남는다. 서버처럼 그 노드의 Task는 버려진 것으로 본다.
+  const dead = sdnNode(1, undefined, { online: false });
+  const b = sdnNode(2);
+  const nodes = [dead, b];
+  cluster(nodes, ["n1", "n2"]);
+  const posts: unknown[] = [];
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        sdnView([], nodes, {
+          phase: "bootstrapping",
+          init_node: "n1",
+          sync: undefined,
+          tasks: ["t-init"],
+        }),
+      ),
+    ),
+    http.post(apiUrl("/sdn"), async ({ request }) => {
+      posts.push(await request.json());
+      return HttpResponse.json(sdnTask("t-init-2", "sdn-init", "n2"), { status: 202 });
+    }),
+  );
+  mockLists({
+    node: nodes,
+    task: [
+      sdnTask("t-init", "sdn-init", "n1", {
+        state: "running",
+        progress: { stage: "installing-packages", done_bytes: 0, total_bytes: 0 },
+      }),
+    ],
+  });
+  renderPage(<SdnPage />);
+  const user = userEvent.setup();
+  await screen.findByLabelText("Node to set up on");
+  await user.click(screen.getByRole("button", { name: "Move the setup here" }));
+  await waitFor(() => expect(posts).toEqual([{ node: "n2" }]));
+});
+
+it("does not offer a move while a task runs on another node", async () => {
+  const dead = sdnNode(1, undefined, { online: false });
+  const b = sdnNode(2);
+  const nodes = [dead, b];
+  cluster(nodes, ["n1", "n2"]);
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        sdnView([], nodes, {
+          phase: "bootstrapping",
+          init_node: "n1",
+          sync: undefined,
+          tasks: ["t-other"],
+        }),
+      ),
+    ),
+  );
+  mockLists({ node: nodes, task: [sdnTask("t-other", "sdn-init", "n2", { state: "running" })] });
+  renderPage(<SdnPage />);
+  expect(await screen.findByText("1 SDN task running")).toBeInTheDocument();
+  expect(screen.queryByLabelText("Node to set up on")).not.toBeInTheDocument();
+});
+
+it("hands a wizard whose first node died over to the move", async () => {
+  // 리뷰 2 웹 M-2: 마법사의 "다시 하기"는 꺼진 노드로는 늘 409라 상태 화면(설정 옮기기)으로 넘긴다.
+  const a = sdnNode(1);
+  const b = sdnNode(2);
+  let nodes = [a, b];
+  cluster(nodes, ["n1"]);
+  let started = false;
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        started
+          ? sdnView([], nodes, { phase: "bootstrapping", init_node: "n1", sync: undefined })
+          : { centrals: [], chassis: [], tasks: [] },
+      ),
+    ),
+    http.post(apiUrl("/sdn"), () => {
+      started = true;
+      return HttpResponse.json(sdnTask("t-init", "sdn-init", "n1"), { status: 202 });
+    }),
+  );
+  mockLists({
+    node: nodes,
+    task: [sdnTask("t-init", "sdn-init", "n1", { state: "failed", error: "lost" })],
+  });
+  const { queryClient } = renderPage(<SdnPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Start the SDN setup" }));
+  const pick = await screen.findByRole("group", { name: "Central nodes" });
+  await waitFor(() => expect(within(pick).getByLabelText("node-a")).toBeChecked());
+  await user.click(screen.getByRole("button", { name: "Install" }));
+  expect(await screen.findByText(/The setup failed: lost/)).toBeInTheDocument();
+  // 단계가 바뀌면 초점이 새 단계로 간다(리뷰 2 웹 M-3).
+  expect(screen.getByLabelText("Installation")).toHaveFocus();
+  nodes = [sdnNode(1, undefined, { online: false }), b];
+  mockLists({
+    node: nodes,
+    task: [sdnTask("t-init", "sdn-init", "n1", { state: "failed", error: "lost" })],
+  });
+  await queryClient.invalidateQueries({ queryKey: listKey("node") });
+  expect(await screen.findByLabelText("Node to set up on")).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Retry" })).not.toBeInTheDocument();
+});
+
+it("shows leftover central databases and removes them", async () => {
+  // 리뷰 2 웹 I-3: 중앙 목록 밖에서 OVN DB를 가진 노드와 지운 노드
+  const a = sdnNode(1, readyChassis(1, "leader"));
+  const c = sdnNode(3, readyChassis(3, "follower"));
+  const nodes = [a, c];
+  cluster(nodes, ["n1", "n3"]);
+  const removed: string[] = [];
+  server.use(
+    http.get(apiUrl("/sdn"), () =>
+      HttpResponse.json(
+        sdnView([a], nodes, {
+          strays: [
+            { node: "n0", name: "node-z", gone: true },
+            { node: "n3", name: "node-c" },
+          ],
+        }),
+      ),
+    ),
+    http.delete(apiUrl("/sdn/centrals/:node"), ({ params }) => {
+      removed.push(String(params.node));
+      return HttpResponse.json(sdnTask("t-rm", "sdn-central-remove", String(params.node)), {
+        status: 202,
+      });
+    }),
+  );
+  mockLists({ node: nodes });
+  renderPage(<SdnPage />);
+  const band = await screen.findByRole("region", { name: "Leftover central databases" });
+  expect(band).toHaveTextContent("node-c holds OVN central databases but is not a central.");
+  expect(band).toHaveTextContent(
+    "node-z was removed from the cluster but may still be an OVN database member.",
+  );
+  const user = userEvent.setup();
+  // 중앙 더하기는 남은 DB의 노드를 고르지 않는다.
+  await user.click(screen.getByRole("button", { name: "Add a central" }));
+  const dialog = await screen.findByRole("dialog", { name: "Add an OVN central" });
+  expect(within(dialog).queryByRole("option", { name: "node-c" })).not.toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  await user.click(
+    within(band).getByRole("button", { name: "Remove the leftover central databases of node-z" }),
+  );
+  await user.click(await screen.findByRole("button", { name: "Remove" }));
+  await waitFor(() => expect(removed).toEqual(["n0"]));
 });

@@ -462,7 +462,7 @@ export function DeployDialog({
                   <Field
                     key={`ips-${i}`}
                     id={`deploy-ips-${i}`}
-                    label={t("templates.nicIps", { n: i })}
+                    label={t("templates.nicIps", { n: i + 1 })}
                     error={errors[`ips${i}`]}
                     hint={t("vmForm.nicIpsHint")}
                   >

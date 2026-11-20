@@ -65,7 +65,8 @@ import {
   type ReplicaRow,
 } from "@/vms/replication";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
-import { formatIps } from "@/sdn/ips";
+import { PortOffChip } from "@/sdn/chips";
+import { formatIps, portOff } from "@/sdn/ips";
 import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -730,6 +731,8 @@ function Replication({ vm }: { vm: Vm }) {
 }
 
 function Hardware({ vm }: { vm: Vm }) {
+  // SDN NIC의 포트가 꺼졌는지 보려고(서브넷이 있는데 주소 없음 — 리뷰 2 웹 I-1)
+  const networks = useList("network");
   const { t } = useTranslation();
   return (
     <div className="flex flex-col gap-6 pt-2">
@@ -798,7 +801,16 @@ function Hardware({ vm }: { vm: Vm }) {
                 <TableCell>{nic.model}</TableCell>
                 <TableCell className="font-mono text-xs">{nic.mac ?? "—"}</TableCell>
                 {/* SDN NIC의 IPAM 주소(계획 65). 단순 네트워크 NIC는 Orbivisor가 주소를 모른다. */}
-                <TableCell className="font-mono text-xs">{formatIps(nic.ips) || "—"}</TableCell>
+                <TableCell className="font-mono text-xs">
+                  {portOff(
+                    networks.data?.find((n) => n.name === nic.network),
+                    nic.ips,
+                  ) ? (
+                    <PortOffChip />
+                  ) : (
+                    formatIps(nic.ips) || "—"
+                  )}
+                </TableCell>
                 <TableCell>
                   {nic.security_groups?.length ? nic.security_groups.join(", ") : "—"}
                 </TableCell>

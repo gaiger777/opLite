@@ -331,6 +331,7 @@
       "sdn-init": "{{node}}에 SDN(OVN) 설정",
       "sdn-central-add": "{{node}}에 OVN 중앙 더하기",
       "sdn-central-remove": "{{node}}의 OVN 중앙 빼기",
+      "sdn-central-kick": "{{node}}에서 {{kicked}}을(를) OVN 중앙 데이터베이스에서 내쫓기",
       "sdn-chassis-install": "{{node}}에 OVN chassis 설치"
     },
     "progress": {
@@ -372,7 +373,8 @@
       "waiting-for-leader": "데이터베이스 리더 기다리기",
       "configuring-chassis": "chassis 구성",
       "leaving-cluster": "데이터베이스에서 나가기",
-      "stopping": "서비스 멈추기"
+      "stopping": "서비스 멈추기",
+      "kicking-server": "죽은 서버 내쫓기"
     }
   },
   "pager": {
@@ -1587,7 +1589,9 @@
     "notFound": "노드 {{name}}을(를) 찾을 수 없습니다",
     "backToList": "노드 목록으로",
     "noVms": "이 노드에 VM이 없습니다.",
-    "sdn": "SDN"
+    "sdn": "SDN",
+    "sdnCentral": "{{name}}은(는) OVN 중앙입니다. 먼저 SDN에서 빼세요. 오프라인이면 다른 중앙이 OVN 데이터베이스에서 내쫓습니다.",
+    "sdnCentralRemove": "SDN에서 빼기"
   },
   "accounts": {
     "currentPassword": "현재 비밀번호",
@@ -2098,9 +2102,10 @@
     "nicIpsHint": "IPv4와 IPv6 주소를 하나씩까지, 쉼표로 나눠 씁니다. 비우면 서브넷의 빈 주소를 받습니다.",
     "nicIpsRunning": "이 인터페이스의 주소를 바꾸려면 VM을 멈추세요.",
     "nicIpsAuto": "자동",
-    "sdnNoGroups": "SDN 네트워크에는 아직 보안 그룹을 걸 수 없습니다. 포트 보안이 이 인터페이스의 MAC과 주소만 통과시킵니다.",
+    "sdnNoGroups": "SDN 네트워크에는 아직 보안 그룹을 걸 수 없습니다. 포트 보안이 이 인터페이스의 MAC과 주소로만 보내게 합니다. 서브넷이 있는 네트워크에서 주소가 없는 인터페이스는 주소를 받을 때까지 아무것도 보내지 못합니다.",
     "ciSdn": "NIC {{n}}은 SDN 네트워크에 있어 주소를 IPAM(서브넷)이 정합니다.",
-    "nicIpsKeepHint": "IPv4와 IPv6 주소를 하나씩까지, 쉼표로 나눠 씁니다. 비우면 지금 주소를 그대로 둡니다."
+    "nicIpsKeepHint": "IPv4와 IPv6 주소를 하나씩까지, 쉼표로 나눠 씁니다. 비우면 지금 주소를 그대로 둡니다.",
+    "nicIpsGiveRunning": "이 인터페이스는 주소가 없어 포트가 꺼져 있습니다. 지금 주소를 줄 수 있고, 게스트는 다음 DHCP 갱신에서 받습니다."
   },
   "console": {
     "connecting": "연결 중…",
@@ -3821,9 +3826,13 @@
       "add": "서브넷 더하기",
       "saved": "{{name}}의 서브넷을 저장했습니다.",
       "edit": "서브넷 편집",
-      "editHint": "저장된 서브넷의 CIDR·게이트웨이는 바꿀 수 없습니다(빼고 다시 더하세요). 서브넷은 그 주소를 쓰는 인터페이스가 없을 때만 뺄 수 있습니다. 새 서브넷을 더해도 있던 인터페이스에 주소를 저절로 주지 않습니다(orbivisorctl network ips NAME --fill).",
+      "editHint": "저장된 서브넷의 CIDR·게이트웨이는 바꿀 수 없습니다(빼고 다시 더하세요). 서브넷은 그 주소를 쓰는 인터페이스가 없을 때만 뺄 수 있습니다. 서브넷을 더하면 주소가 없는 인터페이스가 그 서브넷의 주소를 받습니다(켜진 게스트는 다음 DHCP 갱신에서 받음). 주소가 있는 인터페이스는 그대로입니다(빠진 체계는 orbivisorctl network ips NAME --fill).",
       "firstHost": "첫 호스트",
-      "wholeRange": "서브넷 전체"
+      "wholeRange": "서브넷 전체",
+      "fillNotice_one": "이 네트워크에 주소가 없는 인터페이스 {{count}}개가 있습니다. 저장하면 새 서브넷의 주소를 받습니다. 그때까지 포트는 꺼져 있습니다.",
+      "fillNotice_other": "이 네트워크에 주소가 없는 인터페이스 {{count}}개가 있습니다. 저장하면 저마다 새 서브넷의 주소를 받습니다. 그때까지 포트는 꺼져 있습니다.",
+      "conflict": "그새 누가 서브넷을 바꿨습니다(지금: {{subnets}}). 입력한 행은 그대로 두었으니 확인하고 다시 저장하세요.",
+      "noneShort": "없음"
     },
     "sheet": {
       "title": "네트워크 {{name}}",
@@ -3844,9 +3853,11 @@
       "empty": "이 네트워크에 인터페이스가 없습니다.",
       "noAddress": "주소 없음",
       "up": "켜짐",
-      "down": "꺼짐",
+      "down": "끊김",
       "hidden_one": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다.",
-      "hidden_other": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다."
+      "hidden_other": "볼 수 없는 VM의 인터페이스 {{count}}개가 더 있습니다. 위 사용량에는 들어 있습니다.",
+      "off": "꺼짐: 주소 없음",
+      "offHint": "주소를 받을 때까지 이 포트로는 아무것도 오가지 않습니다. 편집에서 주소를 넣거나(VM이 켜져 있어도 됩니다) orbivisorctl network ips NAME --fill을 실행하세요."
     },
     "noChassis": "준비된 OVN chassis 노드가 없음",
     "kindNotReady": "SDN(OVN) — 설정 안 됨",
@@ -3865,7 +3876,7 @@
       "voter": "투표 멤버",
       "initNode": "먼저 세움",
       "address": "첫 노드의 중앙 주소(선택)",
-      "addressHint": "데이터베이스가 들을 주소입니다. 비우면 노드 주소이고, 노드 인증서 안의 주소여야 합니다.",
+      "addressHint": "데이터베이스가 들을 주소입니다. 비우면 노드 주소이고, 노드 주소나 클러스터 링크 주소 가운데 하나여야 합니다(루프백·링크 로컬은 안 됨).",
       "start": "설치",
       "stages": "설정 단계",
       "moreCentrals": "다른 중앙 노드",
@@ -3883,7 +3894,8 @@
       "addFailed": "{{node}}을(를) 더하지 못했습니다: {{error}}",
       "next": "다음",
       "chassisHint": "SDN 네트워크의 VM을 돌릴 노드는 모두 준비된 chassis여야 합니다. 중앙 노드는 이미 chassis입니다. 나중에 합류하는 노드에는 저절로 설치하지 않습니다.",
-      "finish": "마치기"
+      "finish": "마치기",
+      "installed": "첫 중앙을 설치했습니다."
     },
     "retry": "다시 하기",
     "retryOn": "{{node}}에서 설정 다시 하기",
@@ -3918,7 +3930,7 @@
       "standby": "대기",
       "removeNamed": "중앙 {{name}} 빼기",
       "removeTitle": "{{name}}의 OVN 중앙을 뺄까요?",
-      "removeDescription": "노드가 NB·SB 데이터베이스를 떠나고 멈춥니다. 데이터베이스 파일은 지우지 않고 이름만 바꿉니다. chassis로는 남습니다. 노드가 온라인이어야 합니다.",
+      "removeDescription": "온라인 노드는 NB·SB 데이터베이스를 떠나고 멈춥니다. 데이터베이스 파일은 지우지 않고 이름만 바꾸며 chassis로는 남습니다. 오프라인 노드는 다른 중앙이 데이터베이스에서 내쫓습니다(그 노드의 파일은 그대로 남음).",
       "remove": "빼기",
       "addTitle": "OVN 중앙 더하기",
       "addDescription": "노드에 OVN 중앙 꾸러미를 apt로 설치하고 NB·SB 데이터베이스에 합류시킵니다."
@@ -3951,6 +3963,17 @@
       "node": "설정할 노드",
       "start": "이 노드로 설정 옮기기"
     },
-    "serverChecks": "네트워크를 만들 때 서버가 SDN(OVN)이 설정되었는지 확인합니다."
+    "serverChecks": "네트워크를 만들 때 서버가 SDN(OVN)이 설정되었는지 확인합니다.",
+    "strays": {
+      "title": "남은 중앙 데이터베이스",
+      "hint": "이 노드들은 중앙 노드가 아니지만 OVN 데이터베이스 클러스터의 멤버로 남아 있을 수 있어 장애 여유를 줄입니다. 빼세요.",
+      "held": "{{name}}은(는) 중앙이 아니지만 OVN 중앙 데이터베이스를 가지고 있습니다.",
+      "gone": "{{name}}은(는) 클러스터에서 지웠지만 OVN 데이터베이스 멤버로 남아 있을 수 있습니다.",
+      "chip": "남은 중앙 DB",
+      "remove": "빼기",
+      "removeNamed": "{{name}}의 남은 중앙 데이터베이스 빼기",
+      "removeTitle": "{{name}}의 남은 OVN 중앙 데이터베이스를 뺄까요?",
+      "removeDescription": "온라인 노드는 데이터베이스를 떠나고 멈춥니다(파일은 지우지 않고 이름만 바꿈). 오프라인이거나 지운 노드는 살아 있는 중앙이 내쫓습니다."
+    }
   }
 }

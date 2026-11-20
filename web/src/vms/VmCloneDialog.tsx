@@ -228,7 +228,7 @@ export function VmCloneDialog({
             <Field
               key={i}
               id={`clone-ips-${i}`}
-              label={t("clone.nicIps", { n: i, network: nic.network })}
+              label={t("clone.nicIps", { n: i + 1, network: nic.network })}
               error={errors[`ips${i}`]}
               hint={t("vmForm.nicIpsHint")}
             >

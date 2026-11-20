@@ -27,6 +27,7 @@ import {
   MAX_CENTRALS,
   nodeBlocker,
   SDN_KEY,
+  type SdnStray,
   type SdnView,
   sdnWarnings,
   useVoters,
@@ -39,17 +40,26 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
   const nodes = useList("node");
+  const tasks = useList("task");
   const voters = useVoters();
   const warnings = sdnWarnings(sdn, nodes.data, voters);
   const [error, setError] = useState<string | null>(null);
   const sync = sdn.sync;
   const initNode = nodes.data?.find((n) => n.id === sdn.init_node);
   const initName = initNode?.name ?? sdn.init_node;
-  // 세우다 멈췄고(도는 Task 없음) 아직 중앙이 없다. 첫 세우기 노드가 꺼졌거나 지워졌으면 다른 노드로 옮길 수 있다(서버
-  // `moved_init` — 리뷰 1 #4). 켜져 있으면 그 노드에서 다시 한다.
-  const stalled = admin && sdn.phase !== "ready" && sdn.tasks.length === 0 && !!sdn.init_node;
-  const movable =
-    stalled && sdn.centrals.length === 0 && nodes.isSuccess && !initNode?.status.online;
+  const initGone = nodes.isSuccess && !initNode?.status.online;
+  // 세우다 멈췄다: 도는 Task가 없거나, 첫 세우기 노드가 꺼졌거나 지워졌고 남은 Task가 모두 그 노드의 것이다(전원이 나간
+  // 노드의 Task는 `running`으로 남는다 — 서버 `moved_init`·`check_busy`도 그 노드의 Task를 버려진 것으로 본다, 리뷰 2 웹
+  // I-2). 아직 중앙이 없고 그 노드가 꺼졌으면 다른 노드로 옮길 수 있다. 켜져 있으면 그 노드에서 다시 한다.
+  const onInitOnly =
+    tasks.isSuccess &&
+    sdn.tasks.every((id) => tasks.data.find((x) => x.id === id)?.spec.node === sdn.init_node);
+  const stalled =
+    admin &&
+    sdn.phase !== "ready" &&
+    !!sdn.init_node &&
+    (sdn.tasks.length === 0 || (initGone && onInitOnly));
+  const movable = stalled && sdn.centrals.length === 0 && initGone;
   const targets = [...(nodes.data ?? [])]
     .filter((n) => n.id !== sdn.init_node && nodeBlocker(n, true) === null)
     .sort((a, b) => a.name.localeCompare(b.name));
@@ -178,6 +188,7 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
           )}
         </div>
       )}
+      <StraysBand sdn={sdn} admin={admin} />
       <CentralsTable sdn={sdn} admin={admin} />
       <section aria-labelledby="sdn-chassis" className="flex flex-col gap-2">
         <h2 id="sdn-chassis" className="font-medium">
@@ -296,13 +307,79 @@ function CentralsTable({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
   );
 }
 
-/** 중앙 하나를 더한다(`sdn-central-add`). 이미 중앙인 노드와 막힌 노드는 고를 수 없다. */
+/**
+ * 중앙 목록 밖에서 OVN 중앙 DB를 가진 노드(끝나지 않은 중앙 더하기가 남긴 멤버)와 클러스터에서 지웠지만 OVN Raft에서 아직
+ * 내쫓지 않은 노드(`GET /sdn`의 `strays` — 리뷰 2 웹 I-3). 정족수 여유를 깎으므로 경고하고 `admin`이면 빼기를 보인다
+ * (`DELETE /sdn/centrals/{node}` — 마지막 중앙 규칙과 짝수 경고는 없다. 꺼졌거나 지운 노드는 다른 중앙이 내쫓는다).
+ */
+function StraysBand({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [removing, setRemoving] = useState<SdnStray | null>(null);
+  const strays = sdn.strays ?? [];
+  if (strays.length === 0) {
+    return null;
+  }
+  const busy = sdn.tasks.length > 0;
+  return (
+    <section
+      aria-labelledby="sdn-strays"
+      className="flex flex-col gap-2 rounded-md border border-warning p-3 text-sm"
+    >
+      <h2 id="sdn-strays" className="font-medium">
+        {t("sdn.strays.title")}
+      </h2>
+      <p className="text-muted-foreground">{t("sdn.strays.hint")}</p>
+      <ul className="flex flex-col gap-2">
+        {strays.map((s) => (
+          <li key={s.node} className="flex flex-wrap items-center gap-2">
+            <span>{t(s.gone ? "sdn.strays.gone" : "sdn.strays.held", { name: s.name })}</span>
+            {admin && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy}
+                aria-label={t("sdn.strays.removeNamed", { name: s.name })}
+                onClick={() => setRemoving(s)}
+              >
+                {t("sdn.strays.remove")}
+              </Button>
+            )}
+          </li>
+        ))}
+      </ul>
+      <ConfirmDialog
+        open={removing !== null}
+        onOpenChange={(open) => !open && setRemoving(null)}
+        title={t("sdn.strays.removeTitle", { name: removing?.name })}
+        description={t("sdn.strays.removeDescription")}
+        confirmLabel={t("sdn.strays.remove")}
+        onConfirm={async () => {
+          const s = removing!;
+          const { data } = await callWarned(
+            api.DELETE("/sdn/centrals/{node}", { params: { path: { node: s.node } } }),
+          );
+          trackTask(data, t("tasks.op.sdn-central-remove", { node: s.name }));
+          await queryClient.invalidateQueries({ queryKey: SDN_KEY });
+        }}
+      />
+    </section>
+  );
+}
+
+/** 중앙 하나를 더한다(`sdn-central-add`). 이미 중앙인 노드, 남은 중앙 DB를 가진 노드와 막힌 노드는 고를 수 없다. */
 function AddCentralDialog({ sdn, onClose }: { sdn: SdnView; onClose(): void }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const nodes = useList("node");
   const choices = [...(nodes.data ?? [])]
-    .filter((n) => !n.spec.witness && !sdn.centrals.some((c) => c.node === n.id))
+    .filter(
+      (n) =>
+        !n.spec.witness &&
+        !sdn.centrals.some((c) => c.node === n.id) &&
+        // 남은 중앙 DB가 있는 노드는 먼저 그 DB를 뺀다(리뷰 2 웹 I-3).
+        !(sdn.strays ?? []).some((s) => s.node === n.id),
+    )
     .sort((a, b) => a.name.localeCompare(b.name));
   const [node, setNode] = useState("");
   const chosen = node || (choices.find((n) => nodeBlocker(n, true) === null)?.id ?? "");

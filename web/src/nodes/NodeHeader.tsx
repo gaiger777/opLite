@@ -10,7 +10,9 @@ import { StatusChip } from "@/components/StatusChip";
 import { Button } from "@/components/ui/button";
 import { formatCapacity } from "@/lib/format";
 import { isFrozen, useNodeActions } from "@/nodes/NodeActions";
+import { usePermissions } from "@/auth/usePermissions";
 import { NodeSdnCell } from "@/sdn/chips";
+import { strayNodes, useSdn } from "@/sdn/sdn";
 
 /**
  * 노드 상세의 머리(`ResourceHeader`): 이름·상태·★, 주 동작(유지보수·비우기), 케밥(업데이트·인터페이스·디스크·
@@ -21,6 +23,10 @@ export function NodeHeader({ node, vms }: { node: Node; vms?: number }) {
   const navigate = useNavigate();
   const hint = useId();
   const actions = useNodeActions({ onRemoved: () => void navigate("/nodes") });
+  // 중앙 역할을 알린 노드만 `GET /sdn`으로 목록의 중앙인지(아니면 남은 중앙 DB) 본다(리뷰 2 웹 I-3).
+  const readsSdn = usePermissions().reads("sdn");
+  const sdn = useSdn(false, readsSdn && !!node.status.sdn?.central);
+  const stray = strayNodes(sdn.data).has(node.id);
   useVisit({ kind: "node", id: node.id, name: node.name });
   const witness = node.spec.witness;
   const drain = actions.write && !witness ? actions.drainReason(node) : null;
@@ -85,7 +91,12 @@ export function NodeHeader({ node, vms }: { node: Node; vms?: number }) {
           { label: t("nodes.vms"), value: vms ?? "—" },
           // SDN(OVN) chassis·중앙 역할(계획 65). SDN을 세우지 않았으면 없다.
           ...(node.status.sdn
-            ? [{ label: t("nodes.sdn"), value: <NodeSdnCell sdn={node.status.sdn} /> }]
+            ? [
+                {
+                  label: t("nodes.sdn"),
+                  value: <NodeSdnCell sdn={node.status.sdn} stray={stray} />,
+                },
+              ]
             : []),
         ]}
       >

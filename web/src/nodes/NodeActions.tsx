@@ -14,6 +14,7 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ReasonMenuItem } from "@/components/Reason";
+import { Button } from "@/components/ui/button";
 import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { codeMessage, errorMessage } from "@/i18n/errors";
@@ -22,6 +23,7 @@ import { NodeDisksDialog } from "@/nodes/NodeDisksDialog";
 import { NodeFenceDialog } from "@/nodes/NodeFenceDialog";
 import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
+import { callWarned } from "@/sdn/sdn";
 import { trackTask } from "@/tasks/tasks";
 
 /** 그 노드에 고정했거나 그 노드에서 마지막으로 돈 VM의 수 */
@@ -64,6 +66,9 @@ export function useNodeActions({ onRemoved }: { onRemoved?(node: Node): void } =
   const cluster = useQuery({ queryKey: ["cluster"], queryFn: () => call(api.GET("/cluster")) });
   const tasks = useTaskIndex();
   const [open, setOpen] = useState<{ dialog: NodeDialog; node: Node } | null>(null);
+  // 지우기가 409 `sdn_central_on_node`(OVN 중앙)로 거절된 노드: 대화상자에 SDN에서 빼기를 보인다(리뷰 2 웹 I-3).
+  const [central, setCentral] = useState<string | null>(null);
+  const [leaving, setLeaving] = useState(false);
   const trigger = useRef<HTMLButtonElement | null>(null);
   const write = perms.can("write", "node");
   const close = () => setOpen(null);
@@ -273,7 +278,12 @@ export function useNodeActions({ onRemoved }: { onRemoved?(node: Node): void } =
       />
       <ConfirmDialog
         open={removing !== null}
-        onOpenChange={(o) => !o && close()}
+        onOpenChange={(o) => {
+          if (!o) {
+            setCentral(null);
+            close();
+          }
+        }}
         title={t("nodes.removeTitle", { name: removing?.name ?? node?.name })}
         description={t("nodes.removeDescription")}
         confirmLabel={t("nodes.remove")}
@@ -286,9 +296,18 @@ export function useNodeActions({ onRemoved }: { onRemoved?(node: Node): void } =
         returnFocus={trigger}
         onConfirm={async () => {
           const node = removing!;
-          const removed = await call(
-            api.DELETE("/nodes/{key}", { params: { path: { key: node.id } } }),
-          );
+          let removed;
+          try {
+            removed = await call(
+              api.DELETE("/nodes/{key}", { params: { path: { key: node.id } } }),
+            );
+          } catch (err) {
+            if (err instanceof ApiError && err.code === "sdn_central_on_node") {
+              setCentral(node.id);
+              throw new Error(t("nodes.sdnCentral", { name: node.name }), { cause: err });
+            }
+            throw err;
+          }
           toast.success(t("nodes.removed", { name: node.name }));
           // 손으로 할 일(예: Ceph 데몬 노드였으면 Ceph에서 치우기)
           for (const warning of removed?.warnings ?? []) {
@@ -296,7 +315,36 @@ export function useNodeActions({ onRemoved }: { onRemoved?(node: Node): void } =
           }
           onRemoved?.(node);
         }}
-      />
+      >
+        {removing && central === removing.id && perms.can("write", "sdn") && (
+          <div>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={leaving}
+              onClick={() => {
+                const node = removing;
+                setLeaving(true);
+                void callWarned(
+                  api.DELETE("/sdn/centrals/{node}", { params: { path: { node: node.id } } }),
+                )
+                  .then(({ data, warning }) => {
+                    trackTask(data, t("tasks.op.sdn-central-remove", { node: node.name }));
+                    if (warning) {
+                      toast.warning(warning);
+                    }
+                    setCentral(null);
+                    close();
+                  })
+                  .catch((err: unknown) => toast.error(errorMessage(t, err)))
+                  .finally(() => setLeaving(false));
+              }}
+            >
+              {t("nodes.sdnCentralRemove")}
+            </Button>
+          </div>
+        )}
+      </ConfirmDialog>
     </>
   );
 

@@ -9,6 +9,14 @@ export function isSdnNetwork(network: Network | undefined): boolean {
   return network?.spec?.sdn != null;
 }
 
+/**
+ * 서브넷이 있는 SDN 네트워크에서 주소가 하나도 없는 NIC: OVN 포트가 꺼져 아무것도 오가지 않는다(서버 리뷰 1 I-4 — MAC만인
+ * 포트 보안은 어느 IP든 보내게 두므로). 서브넷이 없는 SDN 네트워크(L2만)는 MAC만으로 켠다.
+ */
+export function portOff(network: Network | undefined, ips: readonly string[] | undefined): boolean {
+  return isSdnNetwork(network) && (network?.spec.subnets ?? []).length > 0 && !ips?.length;
+}
+
 /** 이름이 SDN 네트워크인지(목록에서 찾음) */
 export function sdnNetworkNamed(networks: readonly Network[] | undefined, name: string): boolean {
   return isSdnNetwork(networks?.find((n) => n.name === name));

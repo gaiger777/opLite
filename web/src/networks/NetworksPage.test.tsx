@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
@@ -544,7 +544,7 @@ it("shows the addresses of an SDN network and the OVN port state", async () => {
   const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
   const table = await within(sheet).findByRole("table", { name: "IP addresses" });
   const web = within(table).getByRole("link", { name: "web" }).closest("tr")!;
-  expect(web).toHaveTextContent("#0");
+  expect(web).toHaveTextContent("#1");
   expect(web).toHaveTextContent("52:54:00:aa:bb:01");
   expect(web).toHaveTextContent("10.10.0.2");
   expect(web).toHaveTextContent("Up");
@@ -624,4 +624,115 @@ it("lets only network writers edit the subnets", async () => {
     "10.0.0.53",
   );
   expect(within(sheet).queryByRole("button", { name: "Edit subnets" })).not.toBeInTheDocument();
+});
+
+it("marks interfaces without an address as a port that is off", async () => {
+  // 리뷰 2 웹 I-1: 서브넷이 있는 네트워크의 주소 없는 NIC는 포트가 꺼져 있다(VM이 꺼진 "Down"과 다르다).
+  mockLists({ network: [TENANT], node: [] });
+  const data = ips(true);
+  data.allocations[0]!.ips = [];
+  server.use(http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(data)));
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Open tenant" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
+  const table = await within(sheet).findByRole("table", { name: "IP addresses" });
+  const db = within(table).getByText("db").closest("tr")!;
+  expect(db).toHaveTextContent("Off: no address");
+  expect(db).not.toHaveTextContent("Down");
+  expect(within(table).getByText("web").closest("tr")).toHaveTextContent("Up");
+});
+
+it("tells how many interfaces get an address from an added subnet and shows ip_exhausted", async () => {
+  // 리뷰 2 웹 C-1: 서브넷을 더하면 서버가 주소 없는 인터페이스를 채운다. 빈 주소가 모자라면 409 ip_exhausted다.
+  const l2 = sdnNetwork("l2");
+  mockLists({ network: [l2], node: [] });
+  const bare = {
+    network: "l2",
+    subnets: [],
+    allocations: ["a", "b"].map((name, i) => ({
+      vm: vm(name, "running").id,
+      vm_name: name,
+      nic: 0,
+      mac: `52:54:00:aa:bb:0${i}`,
+      ips: [],
+      live: null,
+    })),
+  };
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(bare)),
+    http.patch(apiUrl("/networks/:key"), () =>
+      HttpResponse.json(
+        {
+          code: "ip_exhausted",
+          message:
+            'network "l2": 2 interface(s) have no address and would get one from the new subnets, but 10.20.0.0/29 (1 free) cannot give that many',
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Open l2" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network l2" });
+  await user.click(within(sheet).getByRole("button", { name: "Edit subnets" }));
+  expect(within(sheet).getByText(/interfaces that have no address get one/)).toBeInTheDocument();
+  expect(within(sheet).queryByRole("status")).not.toBeInTheDocument();
+  await user.click(within(sheet).getByRole("button", { name: "Add a subnet" }));
+  await user.type(
+    within(within(sheet).getByRole("group", { name: "Subnet 1" })).getByLabelText("CIDR"),
+    "10.20.0.0/29",
+  );
+  expect(await within(sheet).findByRole("status")).toHaveTextContent(
+    "2 interfaces on this network have no address; saving gives each one from the new subnet.",
+  );
+  await user.click(within(sheet).getByRole("button", { name: "Save" }));
+  expect(await within(sheet).findByRole("alert")).toHaveTextContent(
+    'The subnet has no free addresses left: network "l2": 2 interface(s) have no address',
+  );
+});
+
+it("reloads the revision after a conflict and keeps the typed rows", async () => {
+  // 리뷰 2 웹 M-1: 412 revision_mismatch 뒤 옛 리비전으로 다시 보내면 늘 412였다.
+  mockLists({ network: [TENANT], node: [] });
+  const sent: (string | null)[] = [];
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), () => HttpResponse.json(ips(true))),
+    http.get(apiUrl("/networks/:key"), () =>
+      HttpResponse.json({
+        ...TENANT,
+        revision: 7,
+        spec: { ...TENANT.spec, subnets: [{ cidr: "10.10.0.0/24" }, { cidr: "fd00::/64" }] },
+      }),
+    ),
+    http.patch(apiUrl("/networks/:key"), ({ request }) => {
+      sent.push(request.headers.get("If-Match"));
+      if (sent.length === 1) {
+        return HttpResponse.json(
+          { code: "revision_mismatch", message: "revision mismatch: expected 4, actual 7" },
+          { status: 412 },
+        );
+      }
+      return HttpResponse.json({ ...TENANT, revision: 8 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Open tenant" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
+  await user.click(within(sheet).getByRole("button", { name: "Edit subnets" }));
+  await user.click(within(sheet).getByRole("button", { name: "Add a subnet" }));
+  const added = within(sheet).getByRole("group", { name: "Subnet 2" });
+  await user.type(within(added).getByLabelText("CIDR"), "fd10::/64");
+  await user.click(within(sheet).getByRole("button", { name: "Save" }));
+  expect(await within(sheet).findByRole("alert")).toHaveTextContent(
+    "Someone changed the subnets meanwhile (now: 10.10.0.0/24, fd00::/64). Your rows are kept",
+  );
+  expect(
+    within(within(sheet).getByRole("group", { name: "Subnet 2" })).getByLabelText("CIDR"),
+  ).toHaveValue("fd10::/64");
+  await user.click(within(sheet).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(sent).toEqual(["4", "7"]));
+  expect((await screen.findAllByText("Saved the subnets of tenant.")).length).toBeGreaterThan(0);
 });

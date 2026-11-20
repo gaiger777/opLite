@@ -55,7 +55,7 @@ it("gives an SDN interface addresses instead of security groups", async () => {
   // cloud-init의 그 NIC 주소는 IPAM이 정한다.
   await user.click(screen.getByLabelText("Configure the guest with cloud-init"));
   expect(
-    screen.getByText("NIC 0 is on an SDN network: its addresses come from the subnet (IPAM)."),
+    screen.getByText("NIC 1 is on an SDN network: its addresses come from the subnet (IPAM)."),
   ).toBeVisible();
   expect(screen.queryByLabelText("nic0 IPv4")).not.toBeInTheDocument();
   await user.click(screen.getByRole("button", { name: "Create" }));
@@ -108,6 +108,47 @@ it("shows each interface's addresses on the VM page", async () => {
   expect(within(table).getByText("lan").closest("tr")).toHaveTextContent("52:54:00:00:00:02—");
 });
 
+it("lets a running VM give an address to an interface that has none", async () => {
+  // 리뷰 2 N-4·웹 I-1: 주소가 없던 NIC(포트 꺼짐)는 켜진 채로 주소를 받는다(서버 `check_running_ips`).
+  const web = withNics(vm("web", "running"), [
+    { network: "tenant", model: "virtio", mac: "52:54:00:00:00:01" },
+  ]);
+  mockLists({ vm: [web], node: [NODE], network: [TENANT] });
+  let body: { spec: Vm["spec"] } | undefined;
+  server.use(
+    http.put(apiUrl(`/vms/${web.id}`), async ({ request }) => {
+      body = (await request.json()) as typeof body;
+      return HttpResponse.json(web);
+    }),
+  );
+  renderPage(<VmEditPage />, { path: "/vms/:name/edit", url: "/vms/web/edit" });
+  const ips = await screen.findByLabelText("IP addresses");
+  expect(ips).toBeEnabled();
+  expect(ips).toHaveAccessibleDescription(
+    "This interface has no address, so its port is off. You can give it one now; the guest picks it up at its next DHCP renewal.",
+  );
+  const user = userEvent.setup();
+  await user.type(ips, "10.10.0.9");
+  await user.click(screen.getByRole("button", { name: "Save" }));
+  await vi.waitFor(() => expect(body).toBeDefined());
+  expect(body!.spec.nics![0]!.ips).toEqual(["10.10.0.9"]);
+});
+
+it("marks an SDN interface without an address as off on the VM page", async () => {
+  const web = withNics(vm("web", "running"), [
+    { network: "tenant", model: "virtio", mac: "52:54:00:00:00:01" },
+    { network: "l2", model: "virtio", mac: "52:54:00:00:00:02" },
+  ]);
+  mockLists({ vm: [web], node: [NODE], network: [TENANT, sdnNetwork("l2")] });
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  await userEvent.click(await screen.findByRole("tab", { name: "Hardware" }));
+  const table = screen.getByRole("table", { name: "Network interfaces" });
+  expect(await within(table).findByText("Off: no address")).toBeInTheDocument();
+  expect(within(table).getByText("tenant").closest("tr")).toHaveTextContent("Off: no address");
+  // 서브넷이 없는 SDN 네트워크(L2만)는 MAC만으로 켜진다.
+  expect(within(table).getByText("l2").closest("tr")).not.toHaveTextContent("Off");
+});
+
 it("clones a VM with an address for its SDN interface", async () => {
   const db = withNics(
     vm("db", "stopped"),
@@ -138,8 +179,8 @@ it("clones a VM with an address for its SDN interface", async () => {
   const dialog = await screen.findByRole("dialog", { name: /Clone db/ });
   await user.type(within(dialog).getByLabelText("New VM name"), "db2");
   // 단순 네트워크 NIC에는 주소 칸이 없다.
-  const ips = await within(dialog).findByLabelText("Interface 1 (tenant) IP addresses");
-  expect(within(dialog).queryByLabelText(/Interface 0/)).not.toBeInTheDocument();
+  const ips = await within(dialog).findByLabelText("Interface 2 (tenant) IP addresses");
+  expect(within(dialog).queryByLabelText(/Interface 1/)).not.toBeInTheDocument();
   await user.type(ips, "10.10.0.9");
   await user.click(within(dialog).getByRole("button", { name: "Clone" }));
   await waitFor(() => expect(bodies).toHaveLength(1));
@@ -170,7 +211,7 @@ it("deploys a template with an address only for one VM", async () => {
   const user = userEvent.setup();
   await user.click(await screen.findByRole("button", { name: "Deploy from tmpl" }));
   const dialog = await screen.findByRole("dialog", { name: "Deploy from tmpl" });
-  const ips = await within(dialog).findByLabelText("Interface 0 IP addresses");
+  const ips = await within(dialog).findByLabelText("Interface 1 IP addresses");
   await user.type(ips, "10.10.0.9");
   await user.clear(within(dialog).getByLabelText("Count"));
   await user.type(within(dialog).getByLabelText("Count"), "2");
@@ -184,9 +225,9 @@ it("deploys a template with an address only for one VM", async () => {
   await user.type(within(dialog).getByLabelText("Count"), "1");
   // 다른 네트워크로 바꾸면 주소 칸이 사라진다.
   await user.selectOptions(within(dialog).getByLabelText("nic0 network"), "lan");
-  expect(within(dialog).queryByLabelText("Interface 0 IP addresses")).not.toBeInTheDocument();
+  expect(within(dialog).queryByLabelText("Interface 1 IP addresses")).not.toBeInTheDocument();
   await user.selectOptions(within(dialog).getByLabelText("nic0 network"), "");
-  await user.type(within(dialog).getByLabelText("Interface 0 IP addresses"), "10.10.0.9");
+  await user.type(within(dialog).getByLabelText("Interface 1 IP addresses"), "10.10.0.9");
   await user.click(within(dialog).getByRole("button", { name: /^Deploy/ }));
   await waitFor(() => expect(bodies).toHaveLength(1));
   expect(bodies[0]).toMatchObject({ ips: [["10.10.0.9"]] });
@@ -264,9 +305,9 @@ it("clears typed clone addresses when the source changes", async () => {
   await user.click(await screen.findByRole("button", { name: /^Actions for / }));
   await user.click(screen.getByRole("menuitem", { name: "Clone" }));
   const dialog = await screen.findByRole("dialog", { name: /Clone db/ });
-  const ips = await within(dialog).findByLabelText("Interface 0 (tenant) IP addresses");
+  const ips = await within(dialog).findByLabelText("Interface 1 (tenant) IP addresses");
   await user.type(ips, "10.10.0.9");
   await within(dialog).findByRole("option", { name: "Snapshot before" });
   await user.selectOptions(within(dialog).getByLabelText("Source"), old.id);
-  expect(within(dialog).getByLabelText("Interface 0 (tenant) IP addresses")).toHaveValue("");
+  expect(within(dialog).getByLabelText("Interface 1 (tenant) IP addresses")).toHaveValue("");
 });

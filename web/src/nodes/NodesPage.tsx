@@ -26,6 +26,7 @@ import { NodeInterfacesDialog } from "@/nodes/NodeInterfacesDialog";
 import { NodePeek } from "@/nodes/NodePeek";
 import { NodeUpdatesDialog } from "@/nodes/NodeUpdatesDialog";
 import { NodeSdnCell } from "@/sdn/chips";
+import { strayNodes, useSdn } from "@/sdn/sdn";
 import { PoolStatus } from "@/storage/PoolStatus";
 import { useTopologyUsage } from "@/numa/numa";
 import { replicasOn } from "@/vms/replication";
@@ -146,6 +147,9 @@ export function NodesPage() {
   // 전용 CPU·hugepages 열(계획 64)은 한 번 읽는다(루트 `cluster.read`).
   const usage = useTopologyUsage(perms.has("cluster.read"));
   const usageOf = (node: Node) => usage.data?.nodes.find((n) => n.node === node.name);
+  // 중앙 역할을 알린 노드가 있을 때만 `GET /sdn`으로 남은 중앙 DB인지 본다(리뷰 2 웹 I-3).
+  const sdn = useSdn(false, perms.reads("sdn") && !!nodes.data?.some((n) => n.status.sdn?.central));
+  const strays = strayNodes(sdn.data);
   const actions = useNodeActions();
   const [showingUpdates, setShowingUpdates] = useState<Node | null>(null);
   const [showingInterfaces, setShowingInterfaces] = useState<Node | null>(null);
@@ -383,7 +387,7 @@ export function NodesPage() {
       header: t("nodes.sdn"),
       priority: 3,
       // OVN chassis 상태와 중앙이면 NB Raft 역할(계획 65). SDN을 세우지 않은 노드는 없다.
-      cell: (node) => <NodeSdnCell sdn={node.status.sdn} />,
+      cell: (node) => <NodeSdnCell sdn={node.status.sdn} stray={strays.has(node.id)} />,
     },
     {
       id: "bridges",

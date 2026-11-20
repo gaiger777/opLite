@@ -38,8 +38,11 @@ export function RoleChip({ role }: { role: Schemas["RaftRole"] | undefined }) {
   return <StatusChip tone={ROLE_TONE[role]}>{t(`sdn.role.${role}`)}</StatusChip>;
 }
 
-/** 노드 목록·상세의 SDN 칸: chassis 상태와 중앙이면 NB 역할 */
-export function NodeSdnCell({ sdn }: { sdn: NodeSdn | undefined }) {
+/**
+ * 노드 목록·상세의 SDN 칸: chassis 상태와 중앙이면 NB 역할. `stray`면(중앙 목록 밖에서 OVN DB를 알린 노드 — `GET /sdn`의
+ * `strays`) 중앙 역할 대신 "남은 중앙 DB"다(리뷰 2 웹 I-3).
+ */
+export function NodeSdnCell({ sdn, stray = false }: { sdn: NodeSdn | undefined; stray?: boolean }) {
   const { t } = useTranslation();
   if (!sdn) {
     return "—";
@@ -47,11 +50,28 @@ export function NodeSdnCell({ sdn }: { sdn: NodeSdn | undefined }) {
   return (
     <span className="flex flex-wrap items-center gap-1">
       <ChassisChip sdn={sdn} />
-      {sdn.central && (
-        <span className="text-xs text-muted-foreground">
-          {t("sdn.centralRole", { role: t(`sdn.role.${sdn.central.nb}`) })}
-        </span>
-      )}
+      {sdn.central &&
+        (stray ? (
+          <StatusChip tone="warning">{t("sdn.strays.chip")}</StatusChip>
+        ) : (
+          <span className="text-xs text-muted-foreground">
+            {t("sdn.centralRole", { role: t(`sdn.role.${sdn.central.nb}`) })}
+          </span>
+        ))}
+    </span>
+  );
+}
+
+/**
+ * 서브넷이 있는 SDN 네트워크에서 주소가 없는 NIC의 포트(꺼짐 — 리뷰 2 웹 I-1). VM이 꺼져 포트가 내려간 것과 다르게
+ * 경고로 보이고 고치는 길을 적는다.
+ */
+export function PortOffChip({ hint = true }: { hint?: boolean }) {
+  const { t } = useTranslation();
+  return (
+    <span className="flex flex-col items-start gap-0.5">
+      <StatusChip tone="warning">{t("sdn.ips.off")}</StatusChip>
+      {hint && <span className="text-xs text-muted-foreground">{t("sdn.ips.offHint")}</span>}
     </span>
   );
 }

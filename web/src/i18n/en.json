@@ -331,6 +331,7 @@
       "sdn-init": "Set up SDN (OVN) on {{node}}",
       "sdn-central-add": "Add an OVN central on {{node}}",
       "sdn-central-remove": "Remove the OVN central on {{node}}",
+      "sdn-central-kick": "Kick {{kicked}} out of the OVN central databases (on {{node}})",
       "sdn-chassis-install": "Install the OVN chassis on {{node}}"
     },
     "progress": {
@@ -372,7 +373,8 @@
       "waiting-for-leader": "Waiting for the database leader",
       "configuring-chassis": "Configuring the chassis",
       "leaving-cluster": "Leaving the databases",
-      "stopping": "Stopping the services"
+      "stopping": "Stopping the services",
+      "kicking-server": "Kicking the dead server out"
     }
   },
   "pager": {
@@ -1587,7 +1589,9 @@
     "notFound": "Node {{name}} not found",
     "backToList": "Back to nodes",
     "noVms": "No VMs on this node.",
-    "sdn": "SDN"
+    "sdn": "SDN",
+    "sdnCentral": "{{name}} is an OVN central. Remove it from the SDN first; if it is offline, another central kicks it out of the OVN databases.",
+    "sdnCentralRemove": "Remove it from the SDN"
   },
   "accounts": {
     "currentPassword": "Current password",
@@ -2098,9 +2102,10 @@
     "nicIpsHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to get free addresses from the subnets.",
     "nicIpsRunning": "Stop the VM to change the addresses of this interface.",
     "nicIpsAuto": "Automatic",
-    "sdnNoGroups": "Security groups do not apply on SDN networks yet; port security allows only this interface's MAC and addresses.",
+    "sdnNoGroups": "Security groups do not apply on SDN networks yet; port security lets this interface send only from its MAC and addresses. On a network with subnets, an interface without an address sends nothing until it gets one.",
     "ciSdn": "NIC {{n}} is on an SDN network: its addresses come from the subnet (IPAM).",
-    "nicIpsKeepHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to keep the current addresses."
+    "nicIpsKeepHint": "One IPv4 and one IPv6 address at most, separated by commas. Leave empty to keep the current addresses.",
+    "nicIpsGiveRunning": "This interface has no address, so its port is off. You can give it one now; the guest picks it up at its next DHCP renewal."
   },
   "console": {
     "connecting": "Connecting…",
@@ -3821,9 +3826,13 @@
       "add": "Add a subnet",
       "saved": "Saved the subnets of {{name}}.",
       "edit": "Edit subnets",
-      "editHint": "The CIDR and gateway of a saved subnet cannot change (remove it and add it again). A subnet can be removed only when no interface uses its addresses. Existing interfaces do not get addresses from a new subnet by themselves (orbivisorctl network ips NAME --fill).",
+      "editHint": "The CIDR and gateway of a saved subnet cannot change (remove it and add it again). A subnet can be removed only when no interface uses its addresses. When you add a subnet, interfaces that have no address get one from it (running guests pick it up at their next DHCP renewal); interfaces that already have an address keep it (fill a missing family with orbivisorctl network ips NAME --fill).",
       "firstHost": "first host",
-      "wholeRange": "whole subnet"
+      "wholeRange": "whole subnet",
+      "fillNotice_one": "1 interface on this network has no address; saving gives it one from the new subnet. Its port is off until then.",
+      "fillNotice_other": "{{count}} interfaces on this network have no address; saving gives each one from the new subnet. Their ports are off until then.",
+      "conflict": "Someone changed the subnets meanwhile (now: {{subnets}}). Your rows are kept; check them and save again.",
+      "noneShort": "none"
     },
     "sheet": {
       "title": "Network {{name}}",
@@ -3846,7 +3855,9 @@
       "up": "Up",
       "down": "Down",
       "hidden_one": "1 more interface belongs to a VM you cannot see; it counts in the usage above.",
-      "hidden_other": "{{count}} more interfaces belong to VMs you cannot see; they count in the usage above."
+      "hidden_other": "{{count}} more interfaces belong to VMs you cannot see; they count in the usage above.",
+      "off": "Off: no address",
+      "offHint": "Its port passes nothing until it gets an address: type one in Edit (the VM may keep running), or run orbivisorctl network ips NAME --fill."
     },
     "noChassis": "No node is a ready OVN chassis",
     "kindNotReady": "SDN (OVN) — not set up",
@@ -3865,7 +3876,7 @@
       "voter": "voting member",
       "initNode": "set up first",
       "address": "Central address of the first node (optional)",
-      "addressHint": "The address the databases listen on. Defaults to the node's address; must be in the node's certificate.",
+      "addressHint": "The address the databases listen on. Defaults to the node's address; it must be the node's address or one of its cluster link addresses (not loopback or link-local).",
       "start": "Install",
       "stages": "Setup steps",
       "moreCentrals": "More central nodes",
@@ -3883,7 +3894,8 @@
       "addFailed": "Adding {{node}} failed: {{error}}",
       "next": "Next",
       "chassisHint": "Every node that runs VMs on SDN networks must be a ready chassis. Central nodes already are. New nodes that join later are not installed by themselves.",
-      "finish": "Finish"
+      "finish": "Finish",
+      "installed": "The first central is installed."
     },
     "retry": "Retry",
     "retryOn": "Retry the setup on {{node}}",
@@ -3918,7 +3930,7 @@
       "standby": "standby",
       "removeNamed": "Remove central {{name}}",
       "removeTitle": "Remove the OVN central on {{name}}?",
-      "removeDescription": "The node leaves the NB and SB databases and stops them; its database files are renamed, not deleted. It stays a chassis. The node must be online.",
+      "removeDescription": "An online node leaves the NB and SB databases and stops them; its database files are renamed, not deleted, and it stays a chassis. An offline node is kicked out of the databases by another central instead (its own files are left as they are).",
       "remove": "Remove",
       "addTitle": "Add an OVN central",
       "addDescription": "Installs the OVN central packages on the node with apt and joins it to the NB and SB databases."
@@ -3951,6 +3963,17 @@
       "node": "Node to set up on",
       "start": "Move the setup here"
     },
-    "serverChecks": "The server checks that SDN (OVN) is set up when you create the network."
+    "serverChecks": "The server checks that SDN (OVN) is set up when you create the network.",
+    "strays": {
+      "title": "Leftover central databases",
+      "hint": "These nodes may still be members of the OVN database cluster although they are not central nodes, which narrows its failure margin. Remove them.",
+      "held": "{{name}} holds OVN central databases but is not a central.",
+      "gone": "{{name}} was removed from the cluster but may still be an OVN database member.",
+      "chip": "leftover central DB",
+      "remove": "Remove",
+      "removeNamed": "Remove the leftover central databases of {{name}}",
+      "removeTitle": "Remove the leftover OVN central databases of {{name}}?",
+      "removeDescription": "An online node leaves the databases and stops them (its files are renamed, not deleted). An offline or removed node is kicked out by a live central."
+    }
   }
 }

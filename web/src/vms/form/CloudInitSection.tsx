@@ -158,17 +158,17 @@ export function CloudInitSection({
                 return (
                   <fieldset
                     key={i}
-                    aria-label={t("vmForm.ciNic", { n: i })}
+                    aria-label={t("vmForm.ciNic", { n: i + 1 })}
                     className="rounded-md border p-3 text-sm text-muted-foreground"
                   >
-                    {t("vmForm.ciSdn", { n: i })}
+                    {t("vmForm.ciSdn", { n: i + 1 })}
                   </fieldset>
                 );
               }
               return (
                 <fieldset
                   key={i}
-                  aria-label={t("vmForm.ciNic", { n: i })}
+                  aria-label={t("vmForm.ciNic", { n: i + 1 })}
                   className="grid grid-cols-1 items-end gap-2 rounded-md border p-3 sm:grid-cols-3"
                 >
                   <Field

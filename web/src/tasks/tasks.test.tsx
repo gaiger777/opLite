@@ -371,3 +371,22 @@ it("describes the progress of downloads", () => {
   expect(describeProgress(at("checksum", 0, 0), t)).toBe("Fetching the checksum file");
   expect(describeProgress(at("template", 1, 1), t)).toBe("Creating the template VM");
 });
+
+it("names the node a central kick removes and the central that does it", () => {
+  // 리뷰 2 N-1·N-2: 지운 노드는 이름이 없어 Raft 주소로 댄다.
+  const kick = {
+    ...task("5", "pending"),
+    spec: {
+      op: { kind: "sdn-central-kick", node: "n9", address: "10.0.0.9" },
+      target: "sdn-0001",
+      node: "n1",
+    },
+  } as unknown as Task;
+  const names: Record<string, string> = { n1: "node-a", n9: "node-z" };
+  expect(describeTask(kick, i18n.t, "x", (id) => names[id])).toBe(
+    "Kick node-z out of the OVN central databases (on node-a)",
+  );
+  expect(describeTask(kick, i18n.t, "x", (id) => (id === "n1" ? "node-a" : undefined))).toBe(
+    "Kick 10.0.0.9 out of the OVN central databases (on node-a)",
+  );
+});
