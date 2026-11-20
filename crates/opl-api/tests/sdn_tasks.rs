@@ -84,6 +84,12 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
+        Self::with_wait_limit(Duration::from_millis(300))
+    }
+
+    /// Raft 기다리기 한도를 `wait_limit`으로 둔다. 시간 제한이 없음을 보는 시험은 느린 노드(svc01)에서도
+    /// 기다리기가 먼저 끝나지 않게 넉넉히 둔다.
+    fn with_wait_limit(wait_limit: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
         let paths = OvnPaths {
@@ -103,7 +109,7 @@ impl Host {
         }
         let options = OvnOptions {
             wait_step: Duration::from_millis(5),
-            wait_limit: Duration::from_millis(300),
+            wait_limit,
             any_os: true,
             ..OvnOptions::default()
         };
@@ -201,7 +207,11 @@ impl Sdn {
     /// Task 시간 제한을 `timeout`으로 둔다(SDN Task는 받지 않는다).
     async fn start_with(timeout: Duration) -> Self {
         let mut env = Env::start().await;
-        let host = Host::new();
+        let host = if timeout < Duration::from_secs(1) {
+            Host::with_wait_limit(Duration::from_secs(30))
+        } else {
+            Host::new()
+        };
         env.stop_runner().await;
         let ovn = host.host.clone();
         Box::pin(
