@@ -4,12 +4,14 @@
 //! - 이 노드가 이 클러스터의 chassis면(OVS DB `external_ids:orbivisor-cluster`가 내 태그) 노드 TLS 사본을 다시 쓰고(인증서를
 //!   다시 서명했으면), `ovn-remote`를 중앙 목록에, `ovn-encap-ip`를 underlay에 맞추고, 장치가 없는 이 클러스터의 OVS
 //!   포트(재부팅 뒤 남은 것)를 지운다.
+//! - 이 노드가 이 클러스터의 chassis면 physnet 연결(veth·OVS 브리지·`ovn-bridge-mappings`)과 게이트웨이 표시
+//!   (`ovn-cms-options`)를 `NodeSpec.sdn`에 맞춘다(계획 66 §7 — 관리자 Linux 브리지에 veth만 매단다).
 //! - 이 노드가 중앙이면 Orbivisor 단위를 맞추고(northd의 중앙 목록) 멈췄으면 켜며, 꾸러미를 올려 스키마가 새로워졌으면
 //!   리더에서 변환한다. 이 노드에서 중앙 Task가 도는 동안(`SdnStatus.pending`)은 단위를 건드리지 않는다.
 //! - 읽은 상태(`NodeSdn`)는 [`SdnReport`]에 두고 검사 루프(`checks.rs`)가 저장된 값과 다를 때만, 모든 노드가 `sdn`을 알릴
 //!   때만 노드 상태에 쓴다(계획 63·64와 같은 까닭).
 //!
-//! 언제: 시작, `Sdn` 리소스나 이 노드의 underlay가 바뀔 때(1초 모아 한 번), 그리고 `refresh`마다(기본 60초).
+//! 언제: 시작, `Sdn` 리소스나 이 노드의 underlay·`NodeSpec.sdn`이 바뀔 때(1초 모아 한 번), 그리고 `refresh`마다(기본 60초).
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -21,9 +23,12 @@ use opl_cluster::types::NodeId;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::ovn::{Chassis, ChassisProbe, Db, OvnHost};
 use opl_types::network::tap_name;
-use opl_types::node::{NodeSpec, SDN};
+use opl_types::node::{NodeSpec, SDN, SDN_ROUTING};
 use opl_types::resource::Kind;
-use opl_types::sdn::{ChassisState, NodeSdn, SDN_NAME, SdnCentral, SdnPending, SdnPhase, SdnSpec};
+use opl_types::sdn::{
+    ChassisState, NodeSdn, NodeSdnConfig, PhysnetState, SDN_NAME, SdnCentral, SdnPending, SdnPhase,
+    SdnSpec,
+};
 use opl_types::vm::VmSpec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -49,6 +54,18 @@ impl SdnReport {
 /// 모든 노드가 `sdn`을 알 때만 `NodeStatus.sdn`을 쓴다(옛 리더가 모르는 칸을 지우고 다시 쓰기를 되풀이하지 않게).
 pub fn sdn_ready(cluster: &Cluster, me: &str) -> bool {
     match opl_api::cluster::missing_feature(cluster, SDN) {
+        Ok(old) => old.iter().all(|n| n == me),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot read the node features");
+            false
+        }
+    }
+}
+
+/// 모든 노드가 `sdn-routing`을 알 때만 `NodeSdn.physnets`·`gateway`를 쓴다(계획 66 §7 — 옛 리더가 모르는 칸을 지우고
+/// 다시 쓰기를 되풀이하지 않게).
+pub fn routing_ready(cluster: &Cluster, me: &str) -> bool {
+    match opl_api::cluster::missing_feature(cluster, SDN_ROUTING) {
         Ok(old) => old.iter().all(|n| n == me),
         Err(e) => {
             tracing::warn!(error = %e, "cannot read the node features");
@@ -104,9 +121,14 @@ impl SdnAgent {
     }
 }
 
-/// 맞추기를 다시 할지 정하는 입력: 중앙 목록, 자리, 이 노드의 underlay. 이것이 바뀌지 않은 `Node` 변경(검사 결과 등)으로는
-/// 다시 맞추지 않는다.
-type Inputs = Option<(Vec<SdnCentral>, Option<SdnPending>, Option<IpAddr>)>;
+/// 맞추기를 다시 할지 정하는 입력: 중앙 목록, 자리, 이 노드의 underlay와 SDN 설정(physnet·게이트웨이). 이것이 바뀌지 않은
+/// `Node` 변경(검사 결과 등)으로는 다시 맞추지 않는다.
+type Inputs = Option<(
+    Vec<SdnCentral>,
+    Option<SdnPending>,
+    Option<IpAddr>,
+    Option<NodeSdnConfig>,
+)>;
 
 struct Agent {
     cluster: Arc<Cluster>,
@@ -119,7 +141,12 @@ impl Agent {
     fn inputs(&self) -> Inputs {
         let sdn = self.cluster.get_by_name::<SdnSpec>(SDN_NAME).ok()??;
         let me = self.cluster.get::<NodeSpec>(self.node).ok()??;
-        Some((sdn.status.centrals, sdn.status.pending, me.status.underlay))
+        Some((
+            sdn.status.centrals,
+            sdn.status.pending,
+            me.status.underlay,
+            me.spec.sdn,
+        ))
     }
 
     /// 한 번 맞추고 읽는다. `Sdn` 리소스가 없거나 이 노드가 위트니스면 아무것도 하지 않는다.
@@ -200,6 +227,27 @@ impl Agent {
             None => None,
         };
 
+        // physnet 연결과 게이트웨이 표시(계획 66 §7): 이 클러스터의 chassis일 때만
+        let wanted = me.spec.sdn.as_ref();
+        let (physnets, gateway) = if configured {
+            match Box::pin(host.reconcile_physnets(wanted)).await {
+                Ok(report) => {
+                    errors.extend(report.errors);
+                    (report.physnets, report.gateway)
+                }
+                Err(e) => {
+                    let e = format!("cannot connect the physnets: {e}");
+                    errors.push(e.clone());
+                    (not_ready(wanted, &e), false)
+                }
+            }
+        } else {
+            (
+                not_ready(wanted, "this node is not an SDN (OVN) chassis"),
+                false,
+            )
+        };
+
         if configured {
             match me.status.underlay {
                 Some(encap_ip) if !centrals.is_empty() => {
@@ -245,8 +293,8 @@ impl Agent {
             tracing::warn!(errors = ?errors, "SDN agent");
         }
         self.report.set(Some(NodeSdn {
-            physnets: Vec::new(),
-            gateway: false,
+            physnets,
+            gateway,
             chassis,
             ovn_version: Some(versions.ovn),
             ovs_version: Some(versions.ovs),
@@ -298,6 +346,20 @@ impl Agent {
             .flat_map(|vm| (0..vm.spec.nics.len()).map(|i| tap_name(vm.id, i)))
             .collect()
     }
+}
+
+/// 원하는 physnet마다(이름 순) 준비되지 않음과 그 까닭
+fn not_ready(wanted: Option<&NodeSdnConfig>, error: &str) -> Vec<PhysnetState> {
+    wanted
+        .into_iter()
+        .flat_map(|c| &c.physnets)
+        .map(|(name, bridge)| PhysnetState {
+            name: name.clone(),
+            bridge: bridge.clone(),
+            ready: false,
+            error: Some(error.to_string()),
+        })
+        .collect()
 }
 
 async fn run(agent: Agent, refresh: Duration, mut shutdown: oneshot::Receiver<()>) {
@@ -574,10 +636,19 @@ mod tests {
             "ovn-sbctl",
             CmdOutput::ok(format!(r#"{{"data":[["{node}"]],"headings":["name"]}}"#)),
         );
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,external_ids find Bridge",
+            CmdOutput::ok(r#"{"data":[],"headings":["name","external_ids"]}"#),
+        );
         s.agent.tick().await;
 
         let report = s.agent.report.get().unwrap();
         assert_eq!(report.chassis, ChassisState::Ready);
+        // physnet이 없으면 매핑·옵션을 건드리지 않는다.
+        assert!(report.physnets.is_empty() && !report.gateway);
+        assert!(f.calls().iter().all(|c| !c.contains("ovn-bridge-mappings")
+            && !c.contains("ovn-cms-options")
+            && !c.starts_with("ip ")));
         assert_eq!(report.ovn_version.as_deref(), Some("24.03.8"));
         assert_eq!(report.ovs_version.as_deref(), Some("3.3.9"));
         assert_eq!(report.encap_ip, Some("10.1.0.5".parse().unwrap()));
@@ -732,6 +803,117 @@ mod tests {
         );
         s.agent.tick().await;
         assert_eq!(s.agent.report.get().unwrap().central, None);
+    }
+
+    async fn set_node_sdn(cluster: &Cluster, node: Uuid, sdn: Option<NodeSdnConfig>) {
+        let me = cluster.get::<NodeSpec>(node).unwrap().unwrap();
+        let mut spec = me.spec;
+        spec.sdn = sdn;
+        cluster
+            .update_spec(node, None, me.labels, &spec)
+            .await
+            .unwrap();
+    }
+
+    /// 계획 66 §7: 이 클러스터의 chassis면 `NodeSpec.sdn`의 physnet을 잇고 게이트웨이를 표시해 알린다. chassis가 아니면
+    /// 아무것도 만들지 않고 준비되지 않음으로 알린다. `NodeSpec.sdn`이 바뀌면 맞추기 입력이 바뀐다.
+    #[tokio::test]
+    async fn connects_physnets_on_a_chassis() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.1.0.5").await;
+        create_sdn(
+            &s.cluster,
+            SdnStatus {
+                phase: SdnPhase::Ready,
+                centrals: vec![SdnCentral {
+                    node: Uuid::nil(),
+                    address: "10.0.0.2".parse().unwrap(),
+                }],
+                ..SdnStatus::default()
+            },
+        )
+        .await;
+        let before = s.agent.inputs();
+        let config = NodeSdnConfig {
+            physnets: [("ext".to_string(), "vmbr1".to_string())].into(),
+            gateway: Some(100),
+        };
+        set_node_sdn(&s.cluster, node, Some(config)).await;
+        assert_ne!(s.agent.inputs(), before);
+
+        let f = &s.runner.fake;
+        f.reply("ovn-controller --version", CmdOutput::ok(OVN_VERSION));
+        f.reply("ovs-vsctl --version", CmdOutput::ok(OVS_VERSION));
+        // chassis가 아님
+        f.reply(
+            "ovs-vsctl --format=json --columns=external_ids",
+            ids(&[("system-id", "x")]),
+        );
+        s.agent.tick().await;
+        let report = s.agent.report.get().unwrap();
+        assert_eq!(
+            report.physnets,
+            [PhysnetState {
+                name: "ext".into(),
+                bridge: "vmbr1".into(),
+                ready: false,
+                error: Some("this node is not an SDN (OVN) chassis".into()),
+            }]
+        );
+        assert!(!report.gateway);
+        assert!(f.calls().iter().all(|c| !c.starts_with("ip link")));
+
+        f.reply(
+            "ovs-vsctl --format=json --columns=external_ids",
+            ids(&[(opl_driver::ovn::TAG_KEY, TAG)]),
+        );
+        let empty = |headings: serde_json::Value| {
+            CmdOutput::ok(serde_json::json!({ "data": [], "headings": headings }).to_string())
+        };
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,external_ids find Bridge",
+            empty(serde_json::json!(["name", "external_ids"])),
+        );
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,ofport,external_ids",
+            empty(serde_json::json!(["name", "ofport", "external_ids"])),
+        );
+        f.reply(
+            "ip -j link show",
+            CmdOutput::ok(r#"[{"ifname":"vmbr1","mtu":1500,"flags":["UP"]}]"#),
+        );
+        f.reply(
+            "ip -j -d link show type bridge",
+            CmdOutput::ok(
+                r#"[{"ifname":"vmbr1","mtu":1500,"linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":0}}}]"#,
+            ),
+        );
+        s.agent.tick().await;
+        let report = s.agent.report.get().unwrap();
+        assert_eq!(report.physnets.len(), 1);
+        assert!(report.physnets[0].ready, "{report:?}");
+        assert!(report.gateway);
+        let calls = f.calls();
+        let (_, veth, bridge) = opl_types::sdn::physnet_ifnames(TAG, "ext");
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("ip link add") && c.contains(&veth)),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains(&format!(
+                "external_ids:ovn-bridge-mappings=\"ext:{bridge}\""
+            ))),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("external_ids:ovn-cms-options=\"enable-chassis-as-gw\"")),
+            "{calls:?}"
+        );
     }
 
     /// 기능 `sdn`을 모르는 노드가 있으면 쓰지 않는다.

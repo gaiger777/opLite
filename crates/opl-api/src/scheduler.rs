@@ -34,7 +34,7 @@ use crate::volumes::block_pool_kind;
 pub enum ScheduleError {
     /// 노드 조건([`node_fits`])에 맞는 노드가 없다.
     #[error(
-        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, is an SDN (OVN) chassis for VMs on SDN networks, has a firewall (nftables) for VMs with security groups, can run its CPU model, has room for its dedicated CPUs, hugepages and NUMA layout and, for an HA VM, has HA fencing)"
+        "no node can run this VM (needs an online node that is not a witness or in maintenance, has the architecture of its machine type, can reach its storage pools, has the bridges of its networks, is an SDN (OVN) chassis for VMs on SDN networks, has the physical networks (physnets) of its provider networks, has a firewall (nftables) for VMs with security groups, can run its CPU model, has room for its dedicated CPUs, hugepages and NUMA layout and, for an HA VM, has HA fencing)"
     )]
     NoNode,
     /// 노드 조건에 맞는 노드는 있지만 모두 이 hard 규칙(이름 순)을 어긴다.
@@ -253,6 +253,25 @@ impl Inventory {
             .sdn
             .as_ref()
             .is_some_and(|s| s.chassis == ChassisState::Ready)
+    }
+
+    /// 공급자 네트워크 NIC가 있는 VM이면 그 physnet이 모두 이 노드에서 준비됐는지(`NodeStatus.sdn.physnets`의 `ready`,
+    /// 계획 66 §7). 없으면 그 physnet 이름(처음 하나). 공급자 NIC가 없는 VM은 보지 않는다.
+    fn missing_physnet<'a>(&'a self, spec: &VmSpec, node: &Node) -> Option<&'a str> {
+        spec.nics.iter().find_map(|nic| {
+            let physnet = self
+                .networks
+                .iter()
+                .find(|n| n.name == nic.network)?
+                .spec
+                .physnet()?;
+            let ready = node
+                .status
+                .sdn
+                .as_ref()
+                .is_some_and(|s| s.physnet_ready(physnet));
+            (!ready).then_some(physnet)
+        })
     }
 
     /// 이 VM의 디스크가 있는 풀을 모두 쓸 수 있는 노드인지. 공유가 아닌 풀의 볼륨은 그 파일이 있는
@@ -914,6 +933,11 @@ fn fits(
     if !inv.has_sdn(spec, node) {
         return Err(format!(
             "node {name:?} is not a ready SDN (OVN) chassis for the VM's SDN networks"
+        ));
+    }
+    if let Some(physnet) = inv.missing_physnet(spec, node) {
+        return Err(format!(
+            "node {name:?} does not have physnet {physnet:?} ready for the VM's provider network"
         ));
     }
     if spec.has_firewall() && !node.status.firewall {
@@ -2228,6 +2252,76 @@ mod tests {
         );
         let inv = Inventory {
             nodes: vec![none, configuring],
+            ..inv
+        };
+        assert_eq!(sched(&me, &inv), Err(NoNode));
+    }
+
+    /// 공급자 네트워크 NIC가 있는 VM은 그 physnet이 준비된 chassis에만 간다(계획 66 §7). 오버레이 SDN NIC만 있는 VM은
+    /// physnet을 보지 않는다.
+    #[test]
+    fn provider_vms_need_their_physnet() {
+        use opl_types::sdn::{NodeSdn, PhysnetState};
+        let with = |memory: u64, physnets: &[(&str, bool)]| {
+            let mut n = node(memory);
+            n.status.sdn = Some(NodeSdn {
+                chassis: ChassisState::Ready,
+                physnets: physnets
+                    .iter()
+                    .map(|(name, ready)| PhysnetState {
+                        name: name.to_string(),
+                        bridge: "vmbr1".into(),
+                        ready: *ready,
+                        error: None,
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+            n
+        };
+        // 가장 넉넉한 노드부터: physnet 없음, 준비 안 됨, 다른 physnet, 준비됨(가장 작다)
+        let bare = with(64000, &[]);
+        let broken = with(32000, &[("ext", false)]);
+        let other = with(16000, &[("dmz", true)]);
+        let ready = with(1024, &[("ext", true), ("dmz", true)]);
+        let net = |name: &str, sdn: serde_json::Value| -> Network {
+            Resource::new(
+                name,
+                serde_json::from_value(serde_json::json!({ "sdn": sdn })).unwrap(),
+            )
+        };
+        let inv = Inventory {
+            nodes: vec![bare.clone(), broken.clone(), other, ready.clone()],
+            networks: vec![
+                net("tenant", serde_json::json!({})),
+                net(
+                    "ext",
+                    serde_json::json!({ "provider": { "physnet": "ext", "vlan": 100 } }),
+                ),
+            ],
+            ..Default::default()
+        };
+        let nic = |network: &str| NicSpec {
+            ips: Vec::new(),
+            network: network.into(),
+            model: NicModel::Virtio,
+            mac: None,
+            security_groups: Vec::new(),
+        };
+        let mut me = spec(512, None, PowerState::Running);
+        me.nics = vec![nic("tenant")];
+        assert_eq!(sched(&me, &inv), Ok(bare.id));
+        me.nics.push(nic("ext"));
+        assert_eq!(sched(&me, &inv), Ok(ready.id));
+        assert_eq!(
+            node_fits(&me, &inv, &broken),
+            Err(
+                "node \"n\" does not have physnet \"ext\" ready for the VM's provider network"
+                    .into()
+            )
+        );
+        let inv = Inventory {
+            nodes: vec![bare, broken],
             ..inv
         };
         assert_eq!(sched(&me, &inv), Err(NoNode));

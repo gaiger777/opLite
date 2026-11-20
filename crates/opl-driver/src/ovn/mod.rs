@@ -4,6 +4,7 @@
 pub mod fake_ovsdb;
 pub mod host;
 pub mod ovsdb;
+pub mod physnet;
 pub mod status;
 pub mod units;
 
@@ -15,6 +16,10 @@ pub use host::{
     central_units, chassis_ids, quote, stale_ports,
 };
 pub use ovsdb::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB, ServerDb, Transport};
+pub use physnet::{
+    CMS_OPTIONS_KEY, GATEWAY_OPTION, MAPPINGS_KEY, PHYSNET_KEY, PhysnetReport, merge_cms_options,
+    merge_mappings, physnet_commands,
+};
 pub use status::{
     ClusterServer, ClusterStatus, OvsInterface, SslConfig, major_minor, parse_cluster_status,
     parse_external_ids, parse_interfaces, parse_ssl, parse_table, parse_version,

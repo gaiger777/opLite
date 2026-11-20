@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use opl_types::sdn::{CentralHealth, MIN_OVN, RaftRole};
+use opl_types::sdn::{CentralHealth, MIN_OVN, RaftRole, is_physnet_ifname};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -1187,12 +1187,20 @@ impl OvnHost {
         }
     }
 
-    /// 클러스터에서 빠질 때: 이 클러스터의 chassis면 `orbivisor-cluster`·`ovn-remote`만 지우고 ovn-controller를
+    /// 클러스터에서 빠질 때: 이 클러스터의 chassis면 physnet 연결(내 매핑 항목·veth·OVS 브리지)과 `ovn-cms-options`의
+    /// 게이트웨이 표시를 빼고(계획 66 §7, 실패는 경고만), `orbivisor-cluster`·`ovn-remote`만 지우고 ovn-controller를
     /// 멈춘다(꾸러미·다른 칸은 남김). 지웠으면 참
     pub async fn unconfigure_chassis(&self) -> Result<bool, OvnError> {
         match self.external_ids().await? {
             Some(ids) if ids.get(TAG_KEY) == Some(&self.tag) => {}
             _ => return Ok(false),
+        }
+        match Box::pin(self.reconcile_physnets(None)).await {
+            Ok(report) if !report.errors.is_empty() => {
+                tracing::warn!(errors = ?report.errors, "cannot remove the physnet connections")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(error = %e, "cannot remove the physnet connections"),
         }
         self.run_ok(&Cmd::new(
             "ovs-vsctl",
@@ -1265,7 +1273,7 @@ impl OvnHost {
     }
 
     /// 명령을 돌려 종료 0이 아니면 `{명령 줄} failed: {stderr 끝 줄}`로 실패한다.
-    async fn run_ok(&self, cmd: &Cmd) -> Result<CmdOutput, OvnError> {
+    pub(crate) async fn run_ok(&self, cmd: &Cmd) -> Result<CmdOutput, OvnError> {
         let out = self.exec(cmd).await?;
         if out.success() {
             return Ok(out);
@@ -1279,7 +1287,7 @@ impl OvnHost {
     }
 
     /// [`run_ok`](Self::run_ok)와 같되 프로그램이 없으면 None이다.
-    async fn run_optional(&self, cmd: &Cmd) -> Result<Option<CmdOutput>, OvnError> {
+    pub(crate) async fn run_optional(&self, cmd: &Cmd) -> Result<Option<CmdOutput>, OvnError> {
         match self.run_ok(cmd).await {
             Err(OvnError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             other => other.map(Some),
@@ -1305,11 +1313,16 @@ pub fn chassis_ids(chassis: &Chassis<'_>, tag: &str) -> BTreeMap<&'static str, S
     ])
 }
 
-/// 지울 오래된 포트: 장치가 없고(`ofport` < 0) `keep`에 없는 것(이름 순)
+/// 지울 오래된 포트: 장치가 없고(`ofport` < 0) `keep`에 없으며 physnet veth가 아닌 것(이름 순)
 pub fn stale_ports(interfaces: &[OvsInterface], keep: &BTreeSet<String>) -> Vec<String> {
     let mut stale: Vec<String> = interfaces
         .iter()
-        .filter(|i| i.ofport.is_some_and(|p| p < 0) && !keep.contains(&i.name))
+        .filter(|i| {
+            i.ofport.is_some_and(|p| p < 0)
+                && !keep.contains(&i.name)
+                // physnet veth(`oplp<h8>o`)는 br-int가 아닌 Orbivisor OVS 브리지의 포트이고 physnet 맞추기가 다룬다.
+                && !is_physnet_ifname(&i.name)
+        })
         .map(|i| i.name.clone())
         .collect();
     stale.sort();

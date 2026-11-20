@@ -8,7 +8,8 @@
 //! (스테이지 4 — 이름공간의 OVS 내부 포트가 busybox udhcpc로 IPAM 주소를 받고, 포트 보안이 위조 주소를 막는지)도 본다. Task와 SDN
 //! 네트워크는 `/sdn`·`/networks` API와 orbivisorctl로 만든다(스테이지 6). 포트 바인딩(스테이지 5): SDN NIC의 QEMU VM tap이 br-int에 붙어 이 chassis에 바인딩되는지, 클라우드
 //! 이미지(`OPL_TEST_CLOUD_IMAGE`, 있으면)의 게스트가 OVN DHCP로 IPAM 주소를 받는지 본다. 러너 하나는 OVS 하나라 두 chassis
-//! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험).
+//! 사이 라이브 마이그레이션은 여기서 보지 않는다(드라이버·OvnSync 시험). 계획 66 스테이지 2: 노드 physnet(관리자 Linux 브리지
+//! `oplext0`에 veth·OVS 브리지·`ovn-bridge-mappings`, 게이트웨이 표시)과 그 localnet 데이터 길, 빼기 청소를 본다.
 //! `sudo -E env "PATH=$PATH" cargo test -p opld --features sdn-it --test sdn -- --nocapture`
 //! Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하다. OVN이 설치되지 않은 호스트여야 하고 시험은
 //! 호스트에 OVN 꾸러미와 데몬을 남긴다(CI 러너용).
@@ -851,6 +852,266 @@ async fn orbivisord_sets_up_ovn() {
     // 이 chassis에 바인딩한다(SB Port_Binding.chassis·up, NB up, ovn-installed). 클라우드 이미지가 있으면 게스트가 OVN DHCP로
     // IPAM 주소를 받았는지 같은 스위치의 이름공간 포트에서 ping으로 본다. 끄면 OVS 포트와 chassis 요청이 사라진다.
     Box::pin(binding_section(&d, &tag, &node)).await;
+
+    // 9. physnet 연결(계획 66 스테이지 2): 관리자 Linux 브리지 `oplext0`에 veth로 Orbivisor OVS 브리지를 잇고
+    // `ovn-bridge-mappings`·`ovn-cms-options`를 쓴다(남의 항목은 둔다). 손으로 만든 NB 스위치(주인 표시 없음 — OvnSync가 보지
+    // 않음)의 localnet 포트로 이름공간 "VM"이 물리 망 이름공간 `ext`에 ping한다. veth가 사라지면(재부팅) 다시 만들고, 빼면
+    // 내 것만 다 치운다.
+    Box::pin(physnet_section(&d, &tag)).await;
+}
+
+/// 제어 소켓의 시험 고리(`POST /v1/test/…`)
+async fn hook(d: &Daemon, path: &str, body: Value) {
+    let http = reqwest::Client::builder()
+        .unix_socket(d.path("opld.sock"))
+        .build()
+        .unwrap();
+    let resp = http
+        .post(format!("http://opld/v1/test/{path}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "{path}: {status} {text}");
+}
+
+/// 로컬 OVS DB `Open_vSwitch`의 `external_ids` 칸 하나(없으면 빈 글)
+fn ovs_id(key: &str) -> String {
+    let ids = parse_external_ids(
+        run(
+            "ovs-vsctl",
+            &[
+                "--format=json",
+                "--columns=external_ids",
+                "list",
+                "Open_vSwitch",
+            ],
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    ids.get(key).cloned().unwrap_or_default()
+}
+
+fn set_ovs_id(key: &str, value: &str) {
+    run(
+        "ovs-vsctl",
+        &[
+            "set",
+            "Open_vSwitch",
+            ".",
+            &format!("external_ids:{key}={}", quote(value)),
+        ],
+    );
+}
+
+async fn physnet_section(d: &Daemon, tag: &str) {
+    let (o, b, x) = opl_types::sdn::physnet_ifnames(tag, "ext");
+    // 관리자 망: Linux 브리지와 "물리 라우터" 이름공간
+    let _ = try_run("ip", &["netns", "del", "ext"]);
+    let _ = try_run("ip", &["link", "del", "oplext0"]);
+    run("ip", &["link", "add", "oplext0", "type", "bridge"]);
+    run("ip", &["link", "set", "oplext0", "up"]);
+    run("ip", &["netns", "add", "ext"]);
+    run(
+        "ip",
+        &[
+            "link", "add", "oplextr", "type", "veth", "peer", "name", "oplexti",
+        ],
+    );
+    run("ip", &["link", "set", "oplextr", "master", "oplext0", "up"]);
+    run("ip", &["link", "set", "oplexti", "netns", "ext"]);
+    let in_ext = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", "ext", "ip"];
+        all.extend_from_slice(args);
+        run("ip", &all);
+    };
+    in_ext(&["link", "set", "lo", "up"]);
+    in_ext(&["addr", "add", "203.0.113.1/24", "dev", "oplexti"]);
+    in_ext(&["link", "set", "oplexti", "up"]);
+    // 남의 매핑·옵션
+    set_ovs_id("ovn-bridge-mappings", "lab:br-lab");
+    set_ovs_id("ovn-cms-options", "foo=bar");
+
+    hook(
+        d,
+        "node-sdn",
+        json!({ "sdn": { "physnets": { "ext": "oplext0" }, "gateway": 100 } }),
+    )
+    .await;
+    wait_for("physnet ext to be ready", AGENT_WAIT, || async {
+        let me = d.ctl_json(&["node", "get", "node1"]).await;
+        let sdn = &me["status"]["sdn"];
+        sdn["physnets"][0]["ready"] == true && sdn["gateway"] == true
+    })
+    .await;
+    let me = d.ctl_json(&["node", "get", "node1"]).await;
+    assert_eq!(
+        me["status"]["sdn"]["physnets"],
+        json!([{ "name": "ext", "bridge": "oplext0", "ready": true }]),
+        "{me}"
+    );
+    show("ovs-vsctl", &["show"]);
+    assert_eq!(ovs_id("ovn-bridge-mappings"), format!("lab:br-lab,ext:{x}"));
+    assert_eq!(ovs_id("ovn-cms-options"), "foo=bar,enable-chassis-as-gw");
+    assert_eq!(
+        run(
+            "ovs-vsctl",
+            &["get", "Bridge", &x, &format!("external_ids:{TAG_KEY}")]
+        )
+        .trim(),
+        quote(tag)
+    );
+    assert_eq!(
+        run(
+            "ovs-vsctl",
+            &["get", "Bridge", &x, "external_ids:orbivisor-physnet"]
+        )
+        .trim(),
+        "ext"
+    );
+    let link = |name: &str| -> Value {
+        serde_json::from_str::<Value>(&run("ip", &["-j", "link", "show", "dev", name])).unwrap()[0]
+            .clone()
+    };
+    let veth = link(&b);
+    assert_eq!(veth["master"], "oplext0", "{veth}");
+    assert!(
+        veth["flags"].as_array().unwrap().contains(&json!("UP")),
+        "{veth}"
+    );
+    // 관리자 브리지에는 veth 한쪽만 더해진다(다른 포트는 그대로).
+    let ports: Vec<String> =
+        serde_json::from_str::<Value>(&run("ip", &["-j", "link", "show", "master", "oplext0"]))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["ifname"].as_str().unwrap().to_string())
+            .collect();
+    assert_eq!(ports, ["oplextr".to_string(), b.clone()], "{ports:?}");
+    // OVS 브리지에는 veth와 ovn-controller의 patch 포트(localnet이 생기면)
+    let ovs_ports = run("ovs-vsctl", &["list-ports", &x]);
+    assert!(ovs_ports.lines().any(|p| p == o), "{ovs_ports}");
+
+    // 데이터 길: 손으로 만든 스위치(주인 표시 없음)의 localnet 포트로 물리 망에 닿는다.
+    let nb = |args: &[&str]| ovn_bare("ovn-nbctl", "nb", args);
+    nb(&[
+        "ls-add",
+        "probe-ext",
+        "--",
+        "lsp-add",
+        "probe-ext",
+        "probe-ln",
+        "--",
+        "lsp-set-type",
+        "probe-ln",
+        "localnet",
+        "--",
+        "lsp-set-addresses",
+        "probe-ln",
+        "unknown",
+        "--",
+        "lsp-set-options",
+        "probe-ln",
+        "network_name=ext",
+        "--",
+        "lsp-add",
+        "probe-ext",
+        "probe-vm",
+        "--",
+        "lsp-set-addresses",
+        "probe-vm",
+        "02:00:00:00:66:02 203.0.113.10",
+    ]);
+    namespace_port("oplphys", "oplphys0", "probe-vm", "02:00:00:00:66:02");
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            "oplphys",
+            "ip",
+            "addr",
+            "add",
+            "203.0.113.10/24",
+            "dev",
+            "oplphys0",
+        ],
+    );
+    wait_for("the localnet patch port", AGENT_WAIT, || async {
+        run("ovs-vsctl", &["list-ports", &x])
+            .lines()
+            .any(|p| p.starts_with("patch-"))
+    })
+    .await;
+    let ping = |ns: &str, to: &str| {
+        try_run(
+            "ip",
+            &["netns", "exec", ns, "ping", "-c", "2", "-W", "2", to],
+        )
+        .0
+    };
+    wait_for("a ping over the physnet", AGENT_WAIT, || async {
+        ping("oplphys", "203.0.113.1")
+    })
+    .await;
+    assert!(ping("ext", "203.0.113.10"), "ping from the physical side");
+
+    // 재부팅처럼 veth가 사라지면 에이전트가 다시 만든다(OVS 브리지는 OVS DB에 남는다).
+    run("ip", &["link", "del", "dev", &b]);
+    wait_for("the veth to come back", AGENT_WAIT, || async {
+        try_run("ip", &["link", "show", "dev", &b]).0 && ping("oplphys", "203.0.113.1")
+    })
+    .await;
+    assert_eq!(ovs_id("ovn-bridge-mappings"), format!("lab:br-lab,ext:{x}"));
+
+    // 빼기: 내 매핑 항목·veth·OVS 브리지·게이트웨이 낱말만 사라지고 남의 것은 남는다.
+    let _ = try_run(
+        "ovs-vsctl",
+        &["--if-exists", "del-port", "br-int", "oplphys0"],
+    );
+    let _ = try_run("ip", &["netns", "del", "oplphys"]);
+    nb(&["ls-del", "probe-ext"]);
+    hook(d, "node-sdn", json!({ "sdn": null })).await;
+    wait_for("physnet ext to go", AGENT_WAIT, || async {
+        let me = d.ctl_json(&["node", "get", "node1"]).await;
+        let sdn = &me["status"]["sdn"];
+        sdn.get("physnets").is_none() && sdn.get("gateway").is_none()
+    })
+    .await;
+    assert_eq!(ovs_id("ovn-bridge-mappings"), "lab:br-lab");
+    assert_eq!(ovs_id("ovn-cms-options"), "foo=bar");
+    assert!(
+        !try_run("ovs-vsctl", &["br-exists", &x]).0,
+        "{x} is still there"
+    );
+    assert!(
+        !try_run("ip", &["link", "show", "dev", &b]).0,
+        "{b} is still there"
+    );
+    assert!(
+        !try_run("ip", &["link", "show", "dev", &o]).0,
+        "{o} is still there"
+    );
+    assert!(try_run("ip", &["link", "show", "dev", "oplext0"]).0);
+    assert!(try_run("ip", &["link", "show", "dev", "oplextr"]).0);
+
+    run(
+        "ovs-vsctl",
+        &[
+            "remove",
+            "Open_vSwitch",
+            ".",
+            "external_ids",
+            "ovn-bridge-mappings",
+            "ovn-cms-options",
+        ],
+    );
+    let _ = try_run("ip", &["netns", "del", "ext"]);
+    let _ = try_run("ip", &["link", "del", "oplext0"]);
 }
 
 /// 이름공간 `ns`의 OVS 내부 포트 `dev`(논리 포트 `port`, MAC `mac`)

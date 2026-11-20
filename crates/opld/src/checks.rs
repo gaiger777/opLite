@@ -629,7 +629,15 @@ impl State {
             .sdn
             .as_ref()
             .and_then(SdnReport::get)
-            .filter(|_| sdn::sdn_ready(&self.cluster, &self.name));
+            .filter(|_| sdn::sdn_ready(&self.cluster, &self.name))
+            .map(|mut s| {
+                // physnet·게이트웨이는 모든 노드가 `sdn-routing`을 알 때만 쓴다(계획 66 §7).
+                if !sdn::routing_ready(&self.cluster, &self.name) {
+                    s.physnets.clear();
+                    s.gateway = false;
+                }
+                s
+            });
         let interfaces = self
             .interfaces
             .as_deref()
@@ -1463,6 +1471,58 @@ mod tests {
         run_once(&mut state).await;
         assert_eq!(s.node().revision, revision);
         report.set(None);
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.sdn, Some(value));
+    }
+
+    /// physnet·게이트웨이(계획 66 §7): 기능 `sdn-routing`을 모르는 노드가 있으면 그 두 칸만 빼고 쓴다.
+    #[tokio::test]
+    async fn physnets_wait_for_sdn_routing() {
+        use opl_types::sdn::{ChassisState, NodeSdn, PhysnetState};
+        let s = setup().await;
+        let mut old: opl_types::node::Node = Resource::new(
+            "n2",
+            NodeSpec {
+                sdn: None,
+                host_resources: None,
+                address: "h2:8006".into(),
+                maintenance: false,
+                witness: false,
+                roles: None,
+            },
+        );
+        old.status.features = vec![HA_CHECKS.into(), opl_types::node::SDN.into()];
+        s.cluster.create(&old).await.unwrap();
+        let report = SdnReport::default();
+        let value = NodeSdn {
+            chassis: ChassisState::Ready,
+            physnets: vec![PhysnetState {
+                name: "ext".into(),
+                bridge: "vmbr1".into(),
+                ready: true,
+                error: None,
+            }],
+            gateway: true,
+            ..NodeSdn::default()
+        };
+        report.set(Some(value.clone()));
+        let mut state = s.state(&[]);
+        state.config.sdn = Some(report.clone());
+        run_once(&mut state).await;
+        assert_eq!(
+            s.node().status.sdn,
+            Some(NodeSdn {
+                chassis: ChassisState::Ready,
+                ..NodeSdn::default()
+            })
+        );
+
+        let mut n2 = s.cluster.get_by_name::<NodeSpec>("n2").unwrap().unwrap();
+        n2.status.features.push(opl_types::node::SDN_ROUTING.into());
+        s.cluster
+            .update_status::<NodeSpec>(n2.id, &n2.status)
+            .await
+            .unwrap();
         run_once(&mut state).await;
         assert_eq!(s.node().status.sdn, Some(value));
     }

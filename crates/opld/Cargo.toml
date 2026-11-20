@@ -94,7 +94,8 @@ numa-it = []
 # Orbivisor가 OVN을 설치·구성하는 E2E(계획 65): OVN이 없는 깨끗한 호스트에서 orbivisord가 apt로 `ovn-central`·`ovn-host`·
 # `openvswitch-switch`를 받아 노드 하나에 NB·SB Raft 클러스터와 northd(Orbivisor 단위, 노드 주소의 `pssl`만, 클러스터 CA mTLS)를
 # 세우고 chassis로 구성한다(`sdn-init`). 같은 호스트에 `ovsdb-server` 한 쌍을 127.0.0.2로 띄워 두 번째 중앙의 합류·떠나기를
-# 실제 ovsdb로 본다. Task와 SDN 네트워크는 `/sdn`·`/networks` API와 orbivisorctl로 만든다. Linux(Ubuntu 24.04 =
+# 실제 ovsdb로 본다. Task와 SDN 네트워크는 `/sdn`·`/networks` API와 orbivisorctl로 만든다. 노드 physnet(계획 66)은 API가
+# 생기기 전이라 제어 소켓의 시험 고리(`/v1/test/node-sdn`)로 쓴다(스테이지 5가 지운다). Linux(Ubuntu 24.04 =
 # OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하고, 호스트에 OVN 꾸러미와 데몬을 남기므로 CI 러너(`ovn` 작업)에서만 돌린다.
 sdn-it = []
 
