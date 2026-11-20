@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 
 import { Permissions } from "@/auth/permissions";
 import { grantable } from "@/permissions/grants";
-import { PermissionsPanel, useObjectNames } from "@/permissions/PermissionsPanel";
+import { PermissionsPanel, routingGrants, useObjectNames } from "@/permissions/PermissionsPanel";
 import { GroupsPage, RolesPage } from "@/permissions/SettingsPermissionsPage";
 import { floatingIpView, folder, folderId, routerView } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
@@ -362,7 +362,7 @@ it("names router and floating IP grants by their names", async () => {
   );
   mockLists({});
   function Names() {
-    const name = useObjectNames();
+    const name = useObjectNames({ routers: true, fips: true });
     return (
       <p>
         {name("router", r1.id) ?? "?"} {name("floating-ip", fip.id) ?? "?"}
@@ -371,4 +371,36 @@ it("names router and floating IP grants by their names", async () => {
   }
   renderPage(<Names />);
   expect(await screen.findByText("r1 203-0-113-120")).toBeInTheDocument();
+});
+
+it("reads routers and floating IPs only for panels that name them", async () => {
+  // 리뷰 2 웹 m6: VM·풀 권한 패널마다 라우터 목록(서버의 World 읽기)을 30초마다 읽지 않는다.
+  const asked: string[] = [];
+  server.use(
+    http.get(apiUrl("/routers"), () => {
+      asked.push("routers");
+      return HttpResponse.json({ revision: 1, items: [] });
+    }),
+    http.get(apiUrl("/floating-ips"), () => {
+      asked.push("floating-ips");
+      return HttpResponse.json({ revision: 1, items: [] });
+    }),
+  );
+  mockLists({});
+  function Names() {
+    const name = useObjectNames();
+    return <p>{name("vm", "x") ?? "none"}</p>;
+  }
+  renderPage(<Names />);
+  expect(await screen.findByText("none")).toBeInTheDocument();
+  await new Promise((r) => setTimeout(r, 50));
+  expect(asked).toEqual([]);
+  const grant = (kind: string) =>
+    ({ spec: { target: { type: "object", kind, id: "x" } } }) as never;
+  expect(routingGrants([grant("vm")])).toEqual({ routers: false, fips: false });
+  expect(routingGrants([grant("router"), grant("floating-ip")])).toEqual({
+    routers: true,
+    fips: true,
+  });
+  expect(routingGrants(undefined)).toEqual({ routers: false, fips: false });
 });

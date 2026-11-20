@@ -41,6 +41,11 @@ import {
   knownPhysnets,
   physnetNodes,
   providerLabel,
+  routingUsers,
+  serverText,
+  useFloatingIps,
+  useRouted,
+  useRouters,
   validPhysnet,
 } from "@/routing/routing";
 import { isSdnNetwork } from "@/sdn/ips";
@@ -154,6 +159,30 @@ export function NetworksPage() {
     vms.isSuccess
       ? vms.data.filter((vm) => vm.spec.nics?.some((nic) => nic.network === network.name)).length
       : undefined;
+  // 라우터(인터페이스·외부)와 유동 IP가 쓰는 네트워크도 서버가 지우지 않는다(409 `network_in_use` — 리뷰 2 웹 m2). SDN
+  // 네트워크가 있을 때만 읽는다.
+  const sdnAny = (networks.data ?? []).some(isSdnNetwork);
+  const routers = useRouters(sdnAny);
+  const routed = useRouted(sdnAny);
+  const fips = useFloatingIps(sdnAny, true);
+  const routing = (network: Network) =>
+    routingUsers(network.name, routers.data, routed.data, fips.data);
+
+  const deleteImpact = (network: Network) => {
+    const lines: string[] = [];
+    const vmCount = users(network);
+    if (vmCount !== undefined) {
+      lines.push(t("impact.vmsUsing", { count: vmCount }));
+    }
+    const r = routing(network);
+    if (r.routers > 0) {
+      lines.push(t("impact.routersUsing", { count: r.routers }));
+    }
+    if (r.fips > 0) {
+      lines.push(t("impact.fipsUsing", { count: r.fips }));
+    }
+    return lines.length > 0 ? lines : undefined;
+  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -195,6 +224,7 @@ export function NetworksPage() {
           {(networks.data ?? []).map((network) => {
             const { having, noVlan } = bridgeNodes(network, nodes.data ?? []);
             const used = users(network);
+            const routingUse = routing(network);
             return (
               <TableRow key={network.id}>
                 <TableCell className="font-medium">
@@ -263,8 +293,8 @@ export function NetworksPage() {
                         variant="ghost"
                         size="icon-sm"
                         aria-label={t("common.deleteNamed", { name: network.name })}
-                        // VM이 쓰는 네트워크는 서버가 지우지 않는다.
-                        disabled={used !== 0}
+                        // VM·라우터·유동 IP가 쓰는 네트워크는 서버가 지우지 않는다.
+                        disabled={used !== 0 || routingUse.routers + routingUse.fips > 0}
                         onClick={() => setDeleting(network)}
                       >
                         <Trash2 />
@@ -298,11 +328,7 @@ export function NetworksPage() {
         title={t("networks.deleteTitle", { name: deleting?.name })}
         description={t("networks.deleteDescription")}
         confirmLabel={t("common.delete")}
-        impact={
-          deleting && users(deleting) !== undefined
-            ? [t("impact.vmsUsing", { count: users(deleting) })]
-            : undefined
-        }
+        impact={deleting ? deleteImpact(deleting) : undefined}
         onConfirm={async () => {
           const network = deleting!;
           await call(api.DELETE("/networks/{key}", { params: { path: { key: network.id } } }));
@@ -442,7 +468,7 @@ function CreateNetworkDialog({ bridges, onClose }: { bridges: boolean; onClose()
     );
     toast.success(t("networks.created", { name }));
     if (warning) {
-      toast.warning(warning);
+      toast.warning(serverText(t, warning));
     }
   }
 

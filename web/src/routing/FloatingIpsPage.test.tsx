@@ -36,7 +36,9 @@ const T2 = sdnNetwork("t2", [{ cidr: "10.20.0.0/24" }]);
 const R1 = routerView(
   "r1",
   { external: { network: "ext", ips: ["203.0.113.100"] }, interfaces: [{ network: "t1" }] },
-  { gateways: [{ node: "node-a", priority: 32767, node_priority: 100, active: true }] },
+  {
+    gateways: [{ node: "node-a", priority: 32767, node_priority: 100, active: true, online: true }],
+  },
 );
 
 function withNics(v: Vm, nics: Vm["spec"]["nics"]): Vm {
@@ -51,10 +53,17 @@ const DB = withNics(vm("db", "stopped"), [
   { network: "t1", model: "virtio", mac: "52:54:00:00:00:03", ips: ["10.10.0.3"] },
 ]);
 
-function lists(fips: unknown[]) {
+/** 서버처럼: `routed`는 모든 라우터의 인터페이스다(`visible`이 거짓이면 R1을 읽을 수 없어 `items`에 없다). */
+function lists(fips: unknown[], visible = true) {
   server.use(
     http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([N1], [N1]))),
-    http.get(apiUrl("/routers"), () => HttpResponse.json({ revision: 9, items: [R1] })),
+    http.get(apiUrl("/routers"), () =>
+      HttpResponse.json({
+        revision: 9,
+        items: visible ? [R1] : [],
+        routed: [{ network: "t1", external: "ext" }],
+      }),
+    ),
     http.get(apiUrl("/floating-ips"), () => HttpResponse.json({ revision: 9, items: fips })),
   );
 }
@@ -98,7 +107,8 @@ it("lists floating IPs with their target and state", async () => {
   expect(within(first).getByRole("button", { name: "Detach 203-0-113-120" })).toBeVisible();
   const second = screen.getByText("203.0.113.121").closest("tr")!;
   expect(within(second).getByText("centralized")).toBeVisible();
-  expect(within(second).getByText("the VM is not running")).toBeVisible();
+  // 서버의 영어 까닭은 아는 꼴이면 번역한다(리뷰 2 웹 m7).
+  expect(within(second).getByText("The VM is not running")).toBeVisible();
   const free = screen.getByText("203.0.113.123").closest("tr")!;
   expect(within(free).getAllByText("not attached")).toHaveLength(2);
   expect(within(free).getByRole("button", { name: "Attach 203-0-113-123" })).toBeVisible();
@@ -199,4 +209,22 @@ it("says distributed without a node when the server hides node names", async () 
   // 루트 cluster.read가 없으면 서버가 `distributed.node`를 비운다(리뷰 1 M-4).
   renderPage(<FipStateChip state={{ kind: "distributed", node: "" }} />);
   expect(await screen.findByText("distributed")).toBeVisible();
+});
+
+it("offers interfaces behind a router the user cannot see and leaves out provider NICs", async () => {
+  // 리뷰 2 웹 I1: 라우터는 다른 폴더(목록에 없음)지만 서버의 `routed`가 t1 → ext를 알린다 — 서버는 붙이기를 받는다.
+  // 리뷰 2 웹 m3: 공급자 네트워크에 곧바로 붙은 NIC는 후보가 아니다.
+  const onExt = withNics(vm("edge", "running"), [
+    { network: "ext", model: "virtio", mac: "52:54:00:00:00:07", ips: ["203.0.113.20"] },
+  ]);
+  mockLists({ node: [N1], network: [EXT, T1, T2], vm: [WEB, onExt] });
+  const free = floatingIpView("203.0.113.121", "ext");
+  lists([free], false);
+  renderPage(<FloatingIpsPage />);
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Attach 203-0-113-121" }));
+  const dialog = await screen.findByRole("dialog", { name: "Attach 203.0.113.121" });
+  const nic = within(dialog).getByLabelText("Interface");
+  expect(await within(nic).findByRole("option", { name: "web #1 (t1)" })).toBeEnabled();
+  expect(within(nic).queryByRole("option", { name: /edge/ })).not.toBeInTheDocument();
 });

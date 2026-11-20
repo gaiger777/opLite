@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { Plus, Route, Trash2, X } from "lucide-react";
-import { useState } from "react";
+import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -40,9 +40,11 @@ import {
   MAX_INTERFACES,
   MAX_ROUTES,
   refreshRouting,
+  routedOf,
   type Router,
-  routerOf,
   type RouterPatch,
+  serverText,
+  useRouted,
   useRouter,
   useRouters,
 } from "@/routing/routing";
@@ -83,6 +85,15 @@ export function RoutersPage() {
   // 지금 게이트웨이(NB)는 연 서랍의 라우터 하나만 읽는다(리뷰 1 웹 I1). 읽기 전에는 목록의 것을 보인다.
   const live = useRouter(opened);
   const openedRouter = live.data ?? items.find((r) => r.id === opened);
+  // 리뷰 2 웹 m1: NB를 읽었을 때만 주인·대기를 가린다. NB를 읽지 못했으면(`live_error`) 모름, 요청이 실패했으면 그 까닭.
+  const liveState: LiveState =
+    live.data === undefined
+      ? live.error
+        ? "failed"
+        : "pending"
+      : live.data.live_error
+        ? "unknown"
+        : "read";
 
   return (
     <div className="flex flex-col gap-4">
@@ -130,7 +141,7 @@ export function RoutersPage() {
               <TableHead>{t("router.external")}</TableHead>
               <TableHead>{t("router.interfaces")}</TableHead>
               <TableHead>{t("router.snat")}</TableHead>
-              <TableHead>{t("router.gateway")}</TableHead>
+              <TableHead>{t("router.preferredGateway")}</TableHead>
               <TableHead>
                 <span className="sr-only">{t("vms.actions")}</span>
               </TableHead>
@@ -177,21 +188,7 @@ export function RoutersPage() {
                   {delegates(r) && (
                     <PermissionsButton name={r.name} onClick={() => setSharing(r)} />
                   )}
-                  {writes(r) && (
-                    <Button
-                      variant="ghost"
-                      size="icon-sm"
-                      aria-label={t("common.deleteNamed", { name: r.name })}
-                      // 인터페이스가 남은 라우터는 서버가 지우지 않는다(409 router_in_use).
-                      disabled={(r.spec.interfaces?.length ?? 0) > 0}
-                      title={
-                        (r.spec.interfaces?.length ?? 0) > 0 ? t("router.removeFirst") : undefined
-                      }
-                      onClick={() => setDeleting(r)}
-                    >
-                      <Trash2 />
-                    </Button>
-                  )}
+                  {writes(r) && <DeleteRouterButton router={r} onDelete={() => setDeleting(r)} />}
                 </TableCell>
               </TableRow>
             ))}
@@ -202,8 +199,8 @@ export function RoutersPage() {
       {openedRouter && (
         <RouterSheet
           router={openedRouter}
-          routers={items}
-          live={live.data !== undefined}
+          live={liveState}
+          liveFailure={live.error ? errorMessage(t, live.error) : null}
           writes={writes(openedRouter)}
           onClose={() => setOpened(null)}
         />
@@ -236,9 +233,13 @@ export function RoutersPage() {
   );
 }
 
+/** 서랍의 지금 게이트웨이(NB) 읽기: 읽는 중, 읽음, NB를 읽지 못함(`live_error`), 요청 실패 */
+type LiveState = "pending" | "read" | "unknown" | "failed";
+
 /**
- * 목록의 게이트웨이 칸: 후보 없음 경고, 아니면 순위가 가장 높은 후보(Raft). 목록은 NB를 읽지 않으므로(리뷰 1 웹 I1) 지금
- * 주인은 서랍에서 본다.
+ * 목록의 "1순위 게이트웨이" 칸: 후보 없음 경고, 아니면 순위가 가장 높은 후보(Raft)와 보이는 안내 줄. 목록은 NB를 읽지
+ * 않으므로(리뷰 1 웹 I1) 지금 주인은 서랍에서 본다. 그 노드가 꺼져 있으면(`online` 거짓) OVN이 다음 후보로 넘겼으므로
+ * 경고 칩을 단다(리뷰 2 웹 I2 — 넘긴 뒤에도 죽은 노드를 가리키지 않게).
  */
 export function GatewayCell({ router }: { router: Router }) {
   const { t } = useTranslation();
@@ -250,10 +251,50 @@ export function GatewayCell({ router }: { router: Router }) {
   }
   const first = router.gateways?.[0];
   if (first) {
-    // 루트 `cluster.read`가 없으면 서버가 노드 이름을 비운다(리뷰 1 M-4).
-    return <span title={t("router.firstGatewayHint")}>{first.node || t("router.nodeHidden")}</span>;
+    return (
+      <span className="flex flex-col items-start gap-0.5">
+        <span className="flex flex-wrap items-center gap-1.5">
+          {/* 루트 `cluster.read`가 없으면 서버가 노드 이름을 비운다(리뷰 1 M-4). */}
+          {first.node || t("router.nodeHidden")}
+          {!first.online && <StatusChip tone="warning">{t("router.gatewayDown")}</StatusChip>}
+        </span>
+        <span className="text-xs text-muted-foreground">{t("router.firstGatewayHint")}</span>
+      </span>
+    );
   }
   return <span className="text-muted-foreground">—</span>;
+}
+
+/**
+ * 라우터 지우기 단추. 인터페이스가 남은 라우터는 서버가 지우지 않으므로(409 `router_in_use`) 막지만, 키보드·터치에서도
+ * 까닭을 알 수 있게 단추는 초점을 받고(`aria-disabled`) 누르면 까닭을 알리며 화면 읽기 프로그램에는 설명으로 잇는다
+ * (리뷰 2 웹 m5).
+ */
+function DeleteRouterButton({ router, onDelete }: { router: Router; onDelete(): void }) {
+  const { t } = useTranslation();
+  const reasonId = useId();
+  const blocked = (router.spec.interfaces?.length ?? 0) > 0;
+  return (
+    <>
+      <Button
+        variant="ghost"
+        size="icon-sm"
+        aria-label={t("common.deleteNamed", { name: router.name })}
+        aria-disabled={blocked || undefined}
+        aria-describedby={blocked ? reasonId : undefined}
+        title={blocked ? t("router.removeFirst") : undefined}
+        className={blocked ? "opacity-50" : undefined}
+        onClick={() => (blocked ? toast.info(t("router.removeFirst")) : onDelete())}
+      >
+        <Trash2 />
+      </Button>
+      {blocked && (
+        <span id={reasonId} className="sr-only">
+          {t("router.removeFirst")}
+        </span>
+      )}
+    </>
+  );
 }
 
 /**
@@ -261,21 +302,23 @@ export function GatewayCell({ router }: { router: Router }) {
  * 인터페이스가 아님, 그 네트워크의 `network.config`(라우터는 그 네트워크 모든 VM의 기본 경로를 바꾼다 — 리뷰 1 #1).
  * 외부는 서브넷이 있는 공급자 네트워크와 `network.assign`(리뷰 1 웹 M3).
  */
-function useAttachable(routers: readonly Router[], self?: Router) {
+function useAttachable(self?: Router) {
   const perms = usePermissions();
   const networks = useList("network");
+  // 다른 라우터의 인터페이스인지는 서버의 `routed`로 본다 — 읽을 수 없는 라우터도(리뷰 2 웹 I1).
+  const routed = useRouted();
   const all = networks.data ?? [];
   const assigns = (n: Network) => perms.has("network.assign", objectTarget("network", n));
   const configures = (n: Network) => perms.has("network.config", objectTarget("network", n));
   const hasSubnet = (n: Network) => (n.spec.subnets ?? []).length > 0;
   return {
     interfaces: all.filter((n) => {
-      const owner = routerOf(routers, n.name);
+      const mine = self?.spec.interfaces?.some((i) => i.network === n.name) ?? false;
       return (
         isOverlay(n) &&
         hasSubnet(n) &&
         configures(n) &&
-        (owner === undefined || owner.id === self?.id)
+        (mine || routedOf(routed.data, n.name) === undefined)
       );
     }),
     externals: all.filter((n) => isProvider(n) && hasSubnet(n) && assigns(n)),
@@ -286,8 +329,7 @@ function CreateRouterDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const folder = useNewFolder("network", "network.config");
-  const routers = useRouters();
-  const { interfaces, externals } = useAttachable(routers.data ?? []);
+  const { interfaces, externals } = useAttachable();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [external, setExternal] = useState("");
@@ -320,7 +362,7 @@ function CreateRouterDialog({ onClose }: { onClose(): void }) {
     await refreshRouting(queryClient);
     toast.success(t("router.created", { name }));
     if (warning) {
-      toast.warning(warning);
+      toast.warning(serverText(t, warning));
     }
   }
 
@@ -468,19 +510,21 @@ function ExternalFields({
  */
 function RouterSheet({
   router,
-  routers,
   live,
+  liveFailure,
   writes,
   onClose,
 }: {
   router: Router;
-  routers: Router[];
-  /** `router`가 NB까지 읽은 보기다(아니면 지금 주인 칸을 비운다). */
-  live: boolean;
+  /** 지금 주인(NB) 읽기의 상태 */
+  live: LiveState;
+  /** `GET /routers/{key}` 요청이 실패한 까닭 */
+  liveFailure: string | null;
   writes: boolean;
   onClose(): void;
 }) {
   const { t } = useTranslation();
+  const perms = usePermissions();
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
@@ -499,7 +543,7 @@ function RouterSheet({
       await refreshRouting(queryClient);
       toast.success(t("router.saved", { name: router.name }));
       if (warning) {
-        toast.warning(warning);
+        toast.warning(serverText(t, warning));
       }
       return true;
     } catch (err) {
@@ -527,7 +571,11 @@ function RouterSheet({
               role="alert"
               className="rounded-md bg-warning-soft px-3 py-2 text-sm text-warning-fg"
             >
-              {t("router.gatewayError", { error: router.gateway_error })}
+              {/* 까닭은 웹이 안다(외부 네트워크의 physnet) — 서버의 영어 문장 대신(리뷰 2 웹 m7). 노드 SDN은 루트
+                  `cluster.admin`만 바꾸므로 다른 사용자에게는 관리자에게 부탁하라고 한다(리뷰 2 웹 m4). */}
+              {t(perms.has("cluster.admin") ? "router.gatewayError" : "router.gatewayErrorAsk", {
+                network: router.spec.external?.network ?? "",
+              })}
             </p>
           )}
           {router.live_error && (
@@ -535,25 +583,18 @@ function RouterSheet({
               {t("router.liveError", { error: router.live_error })}
             </p>
           )}
+          {liveFailure && (
+            <p role="status" className="text-sm text-warning-fg">
+              {t("router.liveError", { error: liveFailure })}
+            </p>
+          )}
           {failure && (
             <p role="alert" className="text-sm text-destructive">
               {failure}
             </p>
           )}
-          <InterfacesSection
-            router={router}
-            routers={routers}
-            writes={writes}
-            busy={busy}
-            patch={patch}
-          />
-          <ExternalSection
-            router={router}
-            routers={routers}
-            writes={writes}
-            busy={busy}
-            patch={patch}
-          />
+          <InterfacesSection router={router} writes={writes} busy={busy} patch={patch} />
+          <ExternalSection router={router} writes={writes} busy={busy} patch={patch} />
           <RoutesSection router={router} writes={writes} busy={busy} patch={patch} />
           <GatewaysSection router={router} live={live} />
         </div>
@@ -571,16 +612,10 @@ interface SectionProps {
   patch: Patch;
 }
 
-function InterfacesSection({
-  router,
-  routers,
-  writes,
-  busy,
-  patch,
-}: SectionProps & { routers: Router[] }) {
+function InterfacesSection({ router, writes, busy, patch }: SectionProps) {
   const { t } = useTranslation();
   const networks = useList("network");
-  const { interfaces } = useAttachable(routers, router);
+  const { interfaces } = useAttachable(router);
   const current = router.spec.interfaces ?? [];
   const addable = interfaces.filter((n) => !current.some((i) => i.network === n.name));
   const [adding, setAdding] = useState("");
@@ -681,15 +716,9 @@ function InterfacesSection({
   );
 }
 
-function ExternalSection({
-  router,
-  routers,
-  writes,
-  busy,
-  patch,
-}: SectionProps & { routers: Router[] }) {
+function ExternalSection({ router, writes, busy, patch }: SectionProps) {
   const { t } = useTranslation();
-  const { externals } = useAttachable(routers, router);
+  const { externals } = useAttachable(router);
   const external = router.spec.external;
   const [editing, setEditing] = useState<{ network: string; snat: boolean } | null>(null);
 
@@ -905,7 +934,7 @@ function RoutesSection({ router, writes, busy, patch }: SectionProps) {
 }
 
 /** 게이트웨이 순위(Raft의 HRW 순위)와 지금 주인(NB `hosting-chassis`) */
-function GatewaysSection({ router, live }: { router: Router; live: boolean }) {
+function GatewaysSection({ router, live }: { router: Router; live: LiveState }) {
   const { t } = useTranslation();
   if (!router.spec.external) {
     return null;
@@ -936,16 +965,27 @@ function GatewaysSection({ router, live }: { router: Router; live: boolean }) {
           )}
           {gateways.map((g) => (
             <TableRow key={g.priority}>
-              <TableCell>{g.node || t("router.nodeHidden")}</TableCell>
+              <TableCell>
+                <span className="flex flex-wrap items-center gap-1.5">
+                  {g.node || t("router.nodeHidden")}
+                  {!g.online && <StatusChip tone="warning">{t("router.gatewayDown")}</StatusChip>}
+                </span>
+              </TableCell>
               <TableCell>{g.node_priority}</TableCell>
               <TableCell>{g.priority}</TableCell>
               <TableCell>
                 {g.active ? (
                   <StatusChip tone="success">{t("router.activeNow")}</StatusChip>
-                ) : !live ? (
+                ) : live === "read" ? (
+                  <span className="text-muted-foreground">{t("router.standby")}</span>
+                ) : live === "pending" ? (
                   <span className="text-muted-foreground">…</span>
                 ) : (
-                  <span className="text-muted-foreground">{t("router.standby")}</span>
+                  // NB를 읽지 못했다: 누가 주인인지 모른다(모두 대기로 보이지 않게 — 리뷰 2 웹 m1).
+                  <span className="text-muted-foreground" title={t("router.activeUnknown")}>
+                    <span aria-hidden>?</span>
+                    <span className="sr-only">{t("router.activeUnknown")}</span>
+                  </span>
                 )}
               </TableCell>
             </TableRow>

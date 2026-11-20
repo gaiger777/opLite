@@ -9,6 +9,8 @@ import {
   nicChoices,
   physnetNodes,
   providerLabel,
+  routingUsers,
+  serverText,
   slowFipRefresh,
   validPhysnet,
 } from "@/routing/routing";
@@ -31,6 +33,8 @@ const R1 = routerView("r1", {
   external: { network: "ext", ips: ["203.0.113.100"] },
   interfaces: [{ network: "t1" }],
 });
+/** 서버의 `routed`: R1이 t1을 ext로 내보낸다(읽을 수 있든 없든) */
+const ROUTED = [{ network: "t1", external: "ext" }];
 
 function withNics(v: Vm, nics: Vm["spec"]["nics"], extra: Partial<Vm["spec"]> = {}): Vm {
   return { ...v, spec: { ...v.spec, nics, ...extra } };
@@ -72,6 +76,8 @@ it("says why an interface cannot take a floating IP", () => {
     { network: "t1", model: "virtio", mac: "52:54:00:00:00:01", ips: ["10.10.0.2"] },
     { network: "t2", model: "virtio", mac: "52:54:00:00:00:02", ips: ["10.20.0.2"] },
     { network: "lan", model: "virtio", mac: "52:54:00:00:00:03" },
+    // 공급자 네트워크에 곧바로 붙은 NIC는 후보가 아니다(리뷰 2 웹 m3).
+    { network: "ext", model: "virtio", mac: "52:54:00:00:00:06", ips: ["203.0.113.20"] },
   ]);
   const bare = withNics(vm("bare", "stopped"), [
     { network: "t1", model: "virtio", mac: "52:54:00:00:00:04", ips: ["fd00::4"] },
@@ -88,8 +94,9 @@ it("says why an interface cannot take a floating IP", () => {
     { target: { vm: web.id, mac: "52:54:00:00:00:01" }, vm_name: "web" },
   );
   const networks = [EXT, T1, T2, LAN] as never[];
-  const choices = nicChoices("ext", [web, bare, tmpl], networks, [R1], [taken]);
-  // 단순 NIC(lan)는 후보가 아니다. 이름 순.
+  const choices = nicChoices("ext", [web, bare, tmpl], networks, ROUTED, [taken]);
+  // 단순 NIC(lan)와 공급자 NIC(ext)는 후보가 아니다. 이름 순. 라우팅은 라우터 목록이 아니라 서버의 `routed`로 본다 —
+  // 읽을 수 없는 라우터 뒤의 NIC도 막지 않는다(리뷰 2 웹 I1).
   expect(choices.map((c) => [c.vm.name, c.index, c.reason?.key])).toEqual([
     ["bare", 0, "fip.why.noIpv4"],
     ["tmpl", 0, "fip.why.template"],
@@ -97,7 +104,17 @@ it("says why an interface cannot take a floating IP", () => {
     ["web", 1, "fip.why.noRouter"],
   ]);
   // 붙어 있는 그 유동 IP 자신은 막지 않는다.
-  expect(nicChoices("ext", [web], networks, [R1], [taken], taken.id)[0]!.reason).toBeUndefined();
+  expect(nicChoices("ext", [web], networks, ROUTED, [taken], taken.id)[0]!.reason).toBeUndefined();
+  // 외부를 읽을 수 없는 라우터(빈 글)나 다른 외부로 가는 라우터는 이 유동 IP 네트워크로 가지 않는다.
+  for (const routed of [
+    [{ network: "t1", external: "" }],
+    [{ network: "t1", external: "ext2" }],
+    [],
+  ]) {
+    expect(nicChoices("ext", [web], networks, routed, [], taken.id)[0]!.reason?.key).toBe(
+      "fip.why.noRouter",
+    );
+  }
   expect(fipOn([taken], web.id, "52:54:00:00:00:01")).toBe(taken);
   expect(fipOn([taken], web.id, "52:54:00:00:00:02")).toBeUndefined();
   expect(fipOn([taken], web.id, null)).toBeUndefined();
@@ -215,4 +232,40 @@ it("polls floating IPs on the VM page only when some exist, every 30 s", () => {
   expect(slowFipRefresh(undefined)).toBe(false);
   expect(slowFipRefresh(0)).toBe(false);
   expect(slowFipRefresh(2)).toBe(30_000);
+});
+
+it("counts the routers and floating IPs that keep a network from being deleted", () => {
+  const r2 = routerView("r2", { external: { network: "ext" } });
+  const fip = floatingIpView("203.0.113.120", "ext");
+  // t1은 (읽을 수 없을 수도 있는) 라우터의 인터페이스, ext는 R1·r2의 외부이고 유동 IP 하나(리뷰 2 웹 m2)
+  expect(routingUsers("t1", [], ROUTED, [])).toEqual({ routers: 1, fips: 0 });
+  expect(routingUsers("ext", [R1, r2], ROUTED, [fip])).toEqual({ routers: 2, fips: 1 });
+  expect(routingUsers("t2", [R1, r2], ROUTED, [fip])).toEqual({ routers: 0, fips: 0 });
+});
+
+it("translates the server reasons it knows and keeps the rest", () => {
+  const t = (key: string, values?: Record<string, unknown>) => `${key} ${JSON.stringify(values)}`;
+  expect(serverText(t, "no gateway node has physnet ext ready")).toBe(
+    'routing.server.noGateway {"physnet":"ext"}',
+  );
+  expect(
+    serverText(
+      t,
+      "no gateway node has physnet ext ready; the router's external gateway stays off until one has it (`orbivisorctl node sdn NODE --physnet NAME=BRIDGE --gateway`)",
+    ),
+  ).toBe('routing.server.noGatewayYet {"physnet":"ext"}');
+  expect(serverText(t, "node n1, n2 does not have physnet ext ready")).toBe(
+    'routing.server.nodeNoPhysnet {"node":"n1, n2","physnet":"ext"}',
+  );
+  expect(serverText(t, 'VM "web" is a template')).toBe('routing.server.template {"vm":"web"}');
+  expect(serverText(t, "the target VM is a template")).toBe(
+    'routing.server.templateHidden {"vm":""}',
+  );
+  expect(
+    serverText(
+      t,
+      'network "t1" of the NIC is not an interface of a router whose external network is "ext"',
+    ),
+  ).toBe('routing.server.noRouter {"network":"t1","external":"ext"}');
+  expect(serverText(t, "something new")).toBe("something new");
 });

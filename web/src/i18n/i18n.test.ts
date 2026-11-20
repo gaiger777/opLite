@@ -155,3 +155,12 @@ it("keeps <html lang> in sync with the language", async () => {
   await i18n.changeLanguage("en");
   expect(document.documentElement.lang).toBe("en");
 });
+
+it("words routing in Korean like the English and with a particle that fits any name", () => {
+  // 리뷰 2 웹 m7: "주인"은 en "active"와 맞지 않고, "{{physnet}}이"는 `ext`에서 "ext이"가 된다.
+  expect(ko.router.activeNow).toBe("활성");
+  expect(ko.router.standby).toBe("대기");
+  expect(ko.sdn.physnet.noNode).not.toMatch(/\}\}이 /);
+  // 서버의 까닭을 옮긴 글은 두 말 모두에 있다.
+  expect(Object.keys(ko.routing.server)).toEqual(Object.keys(en.routing.server));
+});

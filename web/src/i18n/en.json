@@ -3241,7 +3241,9 @@
     "backupsKept": "Backups (kept): {{count}}",
     "vmsUsing": "VMs using it: {{count}}",
     "volumes": "Volumes in it: {{count}}",
-    "backups": "Backups in it: {{count}}"
+    "backups": "Backups in it: {{count}}",
+    "routersUsing": "Routers using it: {{count}}",
+    "fipsUsing": "Floating IPs on it: {{count}}"
   },
   "center": {
     "title": "Tasks and alerts",
@@ -4100,9 +4102,8 @@
     "noRoutesDefault": "No static routes. The default route goes to the external network's gateway.",
     "addRoute": "Add a route",
     "removeRoute": "Remove the route to {{destination}}",
-    "gateway": "Gateway",
     "gateways": "Gateway nodes",
-    "firstGatewayHint": "Highest-ranked gateway node. Open the router to see which node holds the gateway now.",
+    "firstGatewayHint": "Top-ranked. The active one is in the router.",
     "nodeHidden": "(node name hidden)",
     "gatewaysHint": "OVN moves the router's outside port to the next node when the active one fails (BFD). Open SNAT connections are cut then.",
     "node": "Node",
@@ -4112,7 +4113,7 @@
     "activeNow": "active",
     "standby": "standby",
     "noGateway": "No gateway node",
-    "gatewayError": "{{error}}. The router's outside port stays off (no SNAT or floating IPs) until a gateway node has the physical network ready: set it under Nodes › node › SDN physical networks.",
+    "gatewayError": "No gateway node has the physical network of {{network}} ready. The router's outside port stays off (no SNAT or floating IPs) until one has: set it under Nodes › node › SDN physical networks.",
     "liveError": "Could not read the active gateway from OVN: {{error}}",
     "hostingOutside": "Active now: {{node}}.",
     "upstreamHint": "These routes are not translated. The physical router needs them:",
@@ -4122,7 +4123,11 @@
       "destination": "Use a CIDR like 10.20.0.0/16.",
       "nexthop": "Use an address of the same family as the destination.",
       "defaultRoute": "With an external network the default route is set automatically."
-    }
+    },
+    "preferredGateway": "Preferred gateway",
+    "gatewayDown": "down — a standby takes over",
+    "activeUnknown": "Unknown: OVN could not be read",
+    "gatewayErrorAsk": "No gateway node has the physical network of {{network}} ready, so the router's outside port stays off (no SNAT or floating IPs). Ask an administrator to give a gateway node that physical network."
   },
   "fip": {
     "pageHint": "Public addresses from an external network, mapped one to one to a VM interface. They are distributed (leave from the VM's node) when that node has the physical network, otherwise the gateway node handles them.",
@@ -4186,6 +4191,24 @@
       "network": "Choose an external network.",
       "address": "Use an IPv4 address.",
       "nic": "Choose an interface."
+    }
+  },
+  "routing": {
+    "server": {
+      "noGateway": "No gateway node has physical network {{physnet}} ready",
+      "noGatewayYet": "No gateway node has physical network {{physnet}} ready; the router's outside port stays off until one has it.",
+      "noPhysnetYet": "No node has physical network {{physnet}} ready yet; VMs on this network cannot start until one has it.",
+      "vmStopped": "The VM is not running",
+      "vmGone": "The VM no longer exists",
+      "nodeNoPhysnet": "Node {{node}} does not have physical network {{physnet}} ready",
+      "someNodeNoPhysnet": "A node of the VM does not have physical network {{physnet}} ready",
+      "template": "VM {{vm}} is a template",
+      "templateHidden": "The target VM is a template",
+      "noNic": "VM {{vm}} has no NIC with MAC {{mac}}",
+      "noNicHidden": "The target VM has no NIC with MAC {{mac}}",
+      "noRouter": "Network {{network}} of the NIC is not on a router to {{external}}",
+      "noIpv4": "The NIC has no IPv4 address on {{network}}",
+      "networkGone": "Network {{network}} no longer exists"
     }
   }
 }

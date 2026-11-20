@@ -64,14 +64,30 @@ export function usePrincipalNames(): ReadonlyMap<string, string> {
   );
 }
 
-/** 객체 id → 이름(VM·네트워크·풀·라우터·유동 IP — 계획 66 리뷰 1 웹 M5) */
-export function useObjectNames(): (kind: string, id: string) => string | undefined {
+/** 라우터·유동 IP의 이름이 필요한 grant 목록인지(그 종류의 객체 grant가 있음 — 리뷰 2 웹 m6) */
+export function routingGrants(grants: readonly Grant[] | undefined): {
+  routers: boolean;
+  fips: boolean;
+} {
+  const kinds = new Set(
+    (grants ?? []).map((g) => (g.spec.target.type === "object" ? g.spec.target.kind : "")),
+  );
+  return { routers: kinds.has("router"), fips: kinds.has("floating-ip") };
+}
+
+/**
+ * 객체 id → 이름(VM·네트워크·풀·라우터·유동 IP — 계획 66 리뷰 1 웹 M5). 라우터·유동 IP는 watch가 아니어서 따로 읽고
+ * 다시 읽으므로 `routing`이 그 종류를 원할 때만 읽는다(리뷰 2 웹 m6 — VM·풀 권한 패널마다 30초마다 읽지 않게).
+ */
+export function useObjectNames(
+  routing: { routers: boolean; fips: boolean } = { routers: false, fips: false },
+): (kind: string, id: string) => string | undefined {
   const vms = useList("vm");
   const networks = useList("network");
   const pools = useList("storage-pool");
-  // 라우터·유동 IP는 watch가 아니다: NB를 읽지 않는 목록, 유동 IP는 있을 때만 천천히 다시 읽는다.
-  const routers = useRouters();
-  const fips = useFloatingIps(true, true);
+  // 라우터는 NB를 읽지 않는 목록, 유동 IP는 있을 때만 천천히 다시 읽는다.
+  const routers = useRouters(routing.routers);
+  const fips = useFloatingIps(routing.fips, true);
   return useMemo(() => {
     const names = new Map<string, string>();
     for (const [kind, list] of [
@@ -123,12 +139,12 @@ export function PermissionsPanel({ target, label }: { target: Target; label: str
   const roles = useAccessRoles();
   const names = usePrincipalNames();
   const folderPath = useFolderPaths();
-  const objectName = useObjectNames();
+  const grants = (who.data?.grants ?? []) as Grant[];
+  const objectName = useObjectNames(routingGrants(grants));
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<Grant | null>(null);
   const headingId = useId();
   const changed = () => queryClient.invalidateQueries({ queryKey: ["permissions"] });
-  const grants = (who.data?.grants ?? []) as Grant[];
   const me = usePrincipal();
   // 내 접근의 근거를 빼면 이 탭과 grant 더하기를 잃을 수 있다. 이름을 넣어 확인한다.
   const self = removing !== null && revokesSelf(removing, me.user, { mine: mine.data?.grants });

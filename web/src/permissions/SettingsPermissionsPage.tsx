@@ -42,7 +42,12 @@ import {
   useAccessRoles,
   useGroups,
 } from "@/permissions/grants";
-import { AddGrantDialog, useObjectNames, usePrincipalNames } from "@/permissions/PermissionsPanel";
+import {
+  AddGrantDialog,
+  routingGrants,
+  useObjectNames,
+  usePrincipalNames,
+} from "@/permissions/PermissionsPanel";
 import { validName } from "@/vms/form";
 
 /** 디렉터리 그룹 이름의 최대 길이(서버 `MAX_EXTERNAL_GROUP`) */
@@ -74,7 +79,7 @@ export function GrantsPage() {
   const roles = useAccessRoles();
   const names = usePrincipalNames();
   const paths = useFolderPaths();
-  const objectName = useObjectNames();
+  const objectName = useObjectNames(routingGrants(grants.data));
   const folders = useList("folder");
   const [adding, setAdding] = useState(false);
   const [removing, setRemoving] = useState<Grant | null>(null);

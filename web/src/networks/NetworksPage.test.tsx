@@ -815,7 +815,12 @@ it("creates a provider network with a physnet, VLAN and floating IP ranges", asy
   await user.type(within(dialog).getByLabelText("Physical network"), "ext");
   await user.click(within(dialog).getByRole("button", { name: "Create" }));
   expect(await screen.findByText("Created network ext.")).toBeInTheDocument();
-  expect(await screen.findByText("no node has physnet ext ready yet")).toBeInTheDocument();
+  // 서버 경고는 아는 꼴이면 번역한다(리뷰 2 웹 m7).
+  expect(
+    await screen.findByText(
+      "No node has physical network ext ready yet; VMs on this network cannot start until one has it.",
+    ),
+  ).toBeInTheDocument();
   expect(body).toEqual({
     name: "ext",
     spec: {
@@ -862,4 +867,55 @@ it("offers editing and deleting a provider network only to the root cluster admi
   const sheet = await screen.findByRole("dialog", { name: "Network ext" });
   await within(sheet).findByRole("table", { name: "Subnets" });
   expect(within(sheet).queryByRole("button", { name: "Edit subnets" })).not.toBeInTheDocument();
+});
+
+it("does not offer deleting a network that routers or floating IPs use", async () => {
+  // 리뷰 2 웹 m2: 서버는 라우터 인터페이스·외부·유동 IP가 쓰는 네트워크를 409 network_in_use로 거절한다.
+  const ext = providerNetwork("ext", "ext", [{ cidr: "203.0.113.0/24" }]);
+  const t1 = sdnNetwork("t1", [{ cidr: "10.10.0.0/24" }]);
+  const t2 = sdnNetwork("t2", [{ cidr: "10.20.0.0/24" }]);
+  mockLists({ node: [NODE], network: [ext, t1, t2], vm: [] });
+  server.use(
+    http.get(apiUrl("/networks/:key/ips"), ({ params }) =>
+      HttpResponse.json({ network: params.key, subnets: [], allocations: [] }),
+    ),
+    // t1은 읽을 수 없는 라우터의 인터페이스(`routed`만), ext는 보이는 라우터의 외부이고 유동 IP가 둘이다.
+    http.get(apiUrl("/routers"), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: [
+          {
+            id: "019a0f3c-0000-7000-800a-0000000000r1",
+            name: "r1",
+            revision: 1,
+            spec: { external: { network: "ext" } },
+            status: {},
+          },
+        ],
+        routed: [{ network: "t1", external: "" }],
+      }),
+    ),
+    http.get(apiUrl("/floating-ips"), () =>
+      HttpResponse.json({
+        revision: 1,
+        items: ["203.0.113.120", "203.0.113.121"].map((address) => ({
+          id: `fip-${address}`,
+          name: address,
+          revision: 1,
+          spec: { network: "ext", address },
+          status: {},
+          state: { kind: "unattached" },
+        })),
+      }),
+    ),
+  );
+  renderPage(<NetworksPage />);
+  const table = await screen.findByRole("table", { name: "Networks" });
+  await waitFor(() =>
+    expect(within(table).getByRole("button", { name: "Delete t1" })).toBeDisabled(),
+  );
+  await waitFor(() =>
+    expect(within(table).getByRole("button", { name: "Delete ext" })).toBeDisabled(),
+  );
+  expect(within(table).getByRole("button", { name: "Delete t2" })).toBeEnabled();
 });

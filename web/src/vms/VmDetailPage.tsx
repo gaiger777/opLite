@@ -66,8 +66,8 @@ import {
 } from "@/vms/replication";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
 import { PortOffChip } from "@/sdn/chips";
-import { fipOn, useFloatingIps } from "@/routing/routing";
-import { formatIps, isSdnNetwork, portOff } from "@/sdn/ips";
+import { fipOn, isOverlay, useFloatingIps } from "@/routing/routing";
+import { formatIps, portOff } from "@/sdn/ips";
 import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -735,10 +735,12 @@ function Hardware({ vm }: { vm: Vm }) {
   // SDN NIC의 포트가 꺼졌는지 보려고(서브넷이 있는데 주소 없음 — 리뷰 2 웹 I-1)
   const networks = useList("network");
   const { t } = useTranslation();
-  // 유동 IP(계획 66)는 SDN NIC에만 붙는다. SDN NIC가 있을 때만 목록을 읽는다.
-  const sdnNics = (vm.spec.nics ?? []).some((nic) =>
-    isSdnNetwork(networks.data?.find((n) => n.name === nic.network)),
-  );
+  // 유동 IP(계획 66)는 오버레이 SDN NIC에만 붙는다(공급자 네트워크에 곧바로 붙은 NIC는 아니다 — 리뷰 2 웹 m3). 그런
+  // NIC가 있을 때만 목록을 읽고 칸을 보인다.
+  const sdnNics = (vm.spec.nics ?? []).some((nic) => {
+    const network = networks.data?.find((n) => n.name === nic.network);
+    return network !== undefined && isOverlay(network);
+  });
   const fips = useFloatingIps(sdnNics, true);
   return (
     <div className="flex flex-col gap-6 pt-2">

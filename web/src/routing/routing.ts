@@ -10,6 +10,7 @@ import { ipFamily, isSdnNetwork } from "@/sdn/ips";
 type Schemas = components["schemas"];
 export type Router = Schemas["RouterView"];
 export type RouterGateway = Schemas["RouterGateway"];
+export type RoutedNetwork = Schemas["RoutedNetwork"];
 export type RouterPatch = Schemas["RouterPatch"];
 export type FloatingIp = Schemas["FloatingIpView"];
 export type FipState = Schemas["FipState"];
@@ -35,8 +36,26 @@ export const MAX_PHYSNETS = 8;
 export function useRouters(enabled = true) {
   return useQuery({
     queryKey: [...ROUTERS_KEY, "spec"],
-    queryFn: () => call(api.GET("/routers", { params: { query: { live: false } } })),
+    queryFn: fetchRouters,
     select: (list) => list.items,
+    refetchInterval: ROUTING_SLOW_REFRESH_MS,
+    enabled,
+  });
+}
+
+function fetchRouters() {
+  return call(api.GET("/routers", { params: { query: { live: false } } }));
+}
+
+/**
+ * 라우터 인터페이스인 네트워크(`GET /routers`의 `routed` — 읽을 수 없는 라우터의 것도, 라우터 이름 없이). 유동 IP를
+ * 붙일 NIC와 라우터에 이을 수 있는 네트워크를 서버와 같게 고른다(리뷰 2 웹 I1). 라우터 목록과 같은 질의(캐시)다.
+ */
+export function useRouted(enabled = true) {
+  return useQuery({
+    queryKey: [...ROUTERS_KEY, "spec"],
+    queryFn: fetchRouters,
+    select: (list) => list.routed ?? [],
     refetchInterval: ROUTING_SLOW_REFRESH_MS,
     enabled,
   });
@@ -120,9 +139,32 @@ export function validPhysnet(name: string): boolean {
   return /^[a-z][a-z0-9-]{0,30}$/.test(name);
 }
 
-/** 그 네트워크를 인터페이스로 가진 라우터(한 네트워크는 라우터 하나에만) */
+/** 그 네트워크를 인터페이스로 가진 라우터(한 네트워크는 라우터 하나에만, 읽을 수 있는 것 가운데) */
 export function routerOf(routers: readonly Router[] | undefined, network: string) {
   return routers?.find((r) => r.spec.interfaces?.some((i) => i.network === network));
+}
+
+/** 그 네트워크가 어떤 라우터(읽을 수 없는 것도)의 인터페이스인지와 그 외부(`routed` — 리뷰 2 웹 I1) */
+export function routedOf(routed: readonly RoutedNetwork[] | undefined, network: string) {
+  return routed?.find((r) => r.network === network);
+}
+
+/**
+ * 네트워크 `network`를 쓰는 라우터(인터페이스 — 읽을 수 없는 라우터도 `routed`로, 외부)와 유동 IP 수(서버
+ * `check_network_unused`와 같은 셈 — 리뷰 2 웹 m2). 지우기 단추를 막고 영향 줄에 쓴다.
+ */
+export function routingUsers(
+  network: string,
+  routers: readonly Router[] | undefined,
+  routed: readonly RoutedNetwork[] | undefined,
+  fips: readonly FloatingIp[] | undefined,
+): { routers: number; fips: number } {
+  const interfaceOf = routedOf(routed, network) ? 1 : 0;
+  const externalOf = (routers ?? []).filter((r) => r.spec.external?.network === network).length;
+  return {
+    routers: interfaceOf + externalOf,
+    fips: (fips ?? []).filter((f) => f.spec.network === network).length,
+  };
 }
 
 /** VM NIC(MAC)에 붙은 유동 IP */
@@ -149,30 +191,27 @@ export interface NicChoice {
 
 /**
  * 유동 IP(공급자 네트워크 `fipNetwork`)를 붙일 수 있는 NIC: 서버 `routable`·`check_target`과 같은 차례로 막힌 까닭을
- * 붙인다 — 템플릿, MAC 없음, NIC의 네트워크가 외부가 `fipNetwork`인 라우터의 인터페이스가 아님, NIC에 IPv4 주소가 없음,
- * 다른 유동 IP가 붙음(`self`는 빼고). SDN NIC만 든다(단순 NIC는 라우터에 닿지 않는다).
+ * 붙인다 — 템플릿, MAC 없음, NIC의 네트워크가 외부가 `fipNetwork`인 라우터의 인터페이스가 아님(`routed` — 읽을 수 없는
+ * 라우터도 서버가 알린다, 리뷰 2 웹 I1), NIC에 IPv4 주소가 없음, 다른 유동 IP가 붙음(`self`는 빼고). 오버레이 SDN NIC만
+ * 든다(단순 NIC와 공급자 네트워크에 곧바로 붙은 NIC는 라우터 인터페이스가 될 수 없다 — 리뷰 2 웹 m3).
  */
 export function nicChoices(
   fipNetwork: string,
   vms: readonly Vm[],
   networks: readonly Network[],
-  routers: readonly Router[],
+  routed: readonly RoutedNetwork[],
   fips: readonly FloatingIp[],
   self?: string,
 ): NicChoice[] {
   const out: NicChoice[] = [];
-  const sdn = new Set(networks.filter(isSdnNetwork).map((n) => n.name));
+  const sdn = new Set(networks.filter(isOverlay).map((n) => n.name));
   for (const vm of [...vms].sort((a, b) => a.name.localeCompare(b.name))) {
     (vm.spec.nics ?? []).forEach((nic, index) => {
       if (!sdn.has(nic.network) || !nic.mac) {
         return;
       }
       const choice: NicChoice = { vm, index, mac: nic.mac.toLowerCase(), network: nic.network };
-      const router = routers.find(
-        (r) =>
-          r.spec.interfaces?.some((i) => i.network === nic.network) &&
-          r.spec.external?.network === fipNetwork,
-      );
+      const router = routedOf(routed, nic.network)?.external === fipNetwork;
       const taken = fipOn(fips, vm.id, nic.mac);
       if (vm.spec.template) {
         choice.reason = { key: "fip.why.template" };
@@ -213,4 +252,64 @@ export function groupNics(
     }
   }
   return out;
+}
+
+type Translate = (key: string, values?: Record<string, unknown>) => string;
+
+/** 서버가 보내는 영어 까닭·경고 가운데 웹이 아는 꼴(정규식 → 번역 키, 잡은 묶음의 이름) */
+const SERVER_TEXTS: readonly [RegExp, string, readonly string[]][] = [
+  [/^no gateway node has physnet (\S+) ready$/, "routing.server.noGateway", ["physnet"]],
+  [
+    /^no gateway node has physnet (\S+) ready; the router's external gateway stays off until one has it/,
+    "routing.server.noGatewayYet",
+    ["physnet"],
+  ],
+  [/^no node has physnet (\S+) ready yet\b/, "routing.server.noPhysnetYet", ["physnet"]],
+  [/^the VM is not running$/, "routing.server.vmStopped", []],
+  [/^the VM no longer exists$/, "routing.server.vmGone", []],
+  [
+    /^node (.+) does not have physnet (\S+) ready$/,
+    "routing.server.nodeNoPhysnet",
+    ["node", "physnet"],
+  ],
+  [
+    /^a node of the VM does not have physnet (\S+) ready$/,
+    "routing.server.someNodeNoPhysnet",
+    ["physnet"],
+  ],
+  [/^(?:VM "(.+)"|the target VM) is a template$/, "routing.server.template", ["vm"]],
+  [
+    /^(?:VM "(.+)"|the target VM) has no NIC with MAC (\S+)$/,
+    "routing.server.noNic",
+    ["vm", "mac"],
+  ],
+  [
+    /^network "(.+)" of the NIC is not an interface of a router whose external network is "(.+)"$/,
+    "routing.server.noRouter",
+    ["network", "external"],
+  ],
+  [/^the NIC has no IPv4 address on network "(.+)"$/, "routing.server.noIpv4", ["network"]],
+  [/^network "(.+)" not found$/, "routing.server.networkGone", ["network"]],
+];
+
+/**
+ * 서버의 영어 까닭(유동 IP 상태의 `reason`, 라우터의 `gateway_error`)과 경고(`orbivisor-warning`)를 아는 꼴이면 번역한다
+ * (리뷰 2 웹 m7 — 한국어 화면에 영어 문장이 섞이지 않게). 모르는 꼴은 그대로다. `the target VM`(읽을 수 없는 VM)은
+ * VM 이름 없이 옮긴다.
+ */
+export function serverText(t: Translate, text: string): string {
+  for (const [pattern, key, names] of SERVER_TEXTS) {
+    const m = pattern.exec(text);
+    if (m) {
+      const values: Record<string, string> = {};
+      names.forEach((name, i) => {
+        values[name] = m[i + 1] ?? "";
+      });
+      if ("vm" in values && values.vm === "") {
+        return t(`${key}Hidden`, values);
+      }
+      return t(key, values);
+    }
+  }
+  return text;
 }

@@ -38,8 +38,9 @@ import {
   type NicChoice,
   nicChoices,
   refreshRouting,
+  serverText,
   useFloatingIps,
-  useRouters,
+  useRouted,
 } from "@/routing/routing";
 import { ipFamily } from "@/sdn/ips";
 import { sdnReady, useSdn } from "@/sdn/sdn";
@@ -62,7 +63,9 @@ export function FipStateChip({ state }: { state: FipState }) {
           ? t("fip.state.distributedOn", { node: state.node })
           : t(`fip.state.${state.kind}`)}
       </StatusChip>
-      {"reason" in state && <span className="text-xs text-muted-foreground">{state.reason}</span>}
+      {"reason" in state && (
+        <span className="text-xs text-muted-foreground">{serverText(t, state.reason)}</span>
+      )}
     </span>
   );
 }
@@ -278,11 +281,12 @@ function useNicChoices(network: string, self?: string) {
   const perms = usePermissions();
   const vms = useList("vm");
   const networks = useList("network");
-  const routers = useRouters();
+  // 읽을 수 없는 라우터 뒤의 NIC도 서버가 알리는 `routed`로 고른다(리뷰 2 웹 I1).
+  const routed = useRouted();
   const fips = useFloatingIps();
-  const ready = vms.data && networks.data && routers.data && fips.data;
+  const ready = vms.data && networks.data && routed.data && fips.data;
   const choices = ready
-    ? nicChoices(network, vms.data!, networks.data!, routers.data!, fips.data!, self).map((c) =>
+    ? nicChoices(network, vms.data!, networks.data!, routed.data!, fips.data!, self).map((c) =>
         c.reason || perms.has("vm.config", objectTarget("vm", c.vm))
           ? c
           : { ...c, reason: { key: "fip.why.denied" } },
