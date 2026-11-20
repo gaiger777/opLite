@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -15,10 +16,11 @@ import {
   folderPath,
   folderTree,
   type FolderTree,
-  MEMBER_KIND,
-  moveMembers,
+  memberKindOf,
+  moveItems,
   ROOT_ID,
 } from "@/folders/folders";
+import { refreshRouting } from "@/routing/routing";
 
 /** 옮길 수 있는 곳: 루트(루트의 `inventory.move`)와 `inventory.move`가 있는 폴더 */
 export function moveTargets(tree: FolderTree, perms: Pick<Permissions, "has">): string[] {
@@ -40,7 +42,7 @@ export function moveReason(
   if ((item.spec.folder ?? ROOT_ID) === dest) {
     return "folders.reason.already";
   }
-  return perms.has("inventory.move", objectTarget(MEMBER_KIND[kind], item))
+  return perms.has("inventory.move", objectTarget(memberKindOf(item, kind), item))
     ? null
     : "folders.reason.denied";
 }
@@ -113,6 +115,7 @@ export function MoveDialog({
 }) {
   const { t } = useTranslation();
   const perms = usePermissions();
+  const queryClient = useQueryClient();
   const folders = useList("folder");
   const tree = useMemo(() => folderTree(folders.data, kind), [folders.data, kind]);
   const targets = moveTargets(tree, perms);
@@ -125,11 +128,14 @@ export function MoveDialog({
   const label = (id: string) => (id === ROOT_ID ? t("folders.root") : folderPath(tree, id));
 
   async function submit() {
-    const results = await moveMembers(
+    const results = await moveItems(
       dest === ROOT_ID ? null : dest,
-      MEMBER_KIND[kind],
-      able.map((item) => item.name),
+      able.map((item) => ({ kind: memberKindOf(item, kind), key: item.name })),
     );
+    // 라우터·유동 IP는 watch가 아니어서 다시 읽는다.
+    if (kind === "network") {
+      await refreshRouting(queryClient);
+    }
     announceMove(t, label(dest), results);
     onDone?.();
   }

@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import type { Vm } from "@/api/types";
-import { FloatingIpsPage } from "@/routing/FloatingIpsPage";
+import { FipStateChip, FloatingIpsPage } from "@/routing/FloatingIpsPage";
 import { expectNoAxeViolations } from "@/test/axe";
 import {
   floatingIpView,
@@ -174,4 +174,29 @@ it("creates a floating IP from an external network", async () => {
     spec: { network: "ext", target: { vm: WEB.id, mac: "52:54:00:00:00:01" } },
   });
   expect(await screen.findByText("Created floating IP 203.0.113.101.")).toBeVisible();
+});
+
+it("deletes a floating IP with If-Match", async () => {
+  // 리뷰 1 웹 M7: 확인을 연 사이 다른 사람이 붙였으면 서버가 412로 막는다(붙은 NAT를 몰래 지우지 않는다).
+  const free = floatingIpView("203.0.113.121", "ext");
+  mockLists({ node: [N1], network: [EXT, T1] });
+  lists([free]);
+  const sent: (string | null)[] = [];
+  server.use(
+    http.delete(apiUrl(`/floating-ips/${free.id}`), ({ request }) => {
+      sent.push(request.headers.get("If-Match"));
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<FloatingIpsPage />);
+  await user.click(await screen.findByRole("button", { name: `Delete ${free.name}` }));
+  await user.click(await screen.findByRole("button", { name: "Delete" }));
+  await waitFor(() => expect(sent).toEqual([String(free.revision)]));
+});
+
+it("says distributed without a node when the server hides node names", async () => {
+  // 루트 cluster.read가 없으면 서버가 `distributed.node`를 비운다(리뷰 1 M-4).
+  renderPage(<FipStateChip state={{ kind: "distributed", node: "" }} />);
+  expect(await screen.findByText("distributed")).toBeVisible();
 });

@@ -17,8 +17,10 @@ export type NodeSdnConfig = Schemas["NodeSdnConfig"];
 
 export const ROUTERS_KEY = ["routers"] as const;
 export const FIPS_KEY = ["floating-ips"] as const;
-/** 라우터의 지금 게이트웨이(NB)와 유동 IP 상태를 다시 읽는 주기 */
+/** 라우터의 지금 게이트웨이(NB — 연 서랍 하나만)와 유동 IP 상태를 다시 읽는 주기 */
 export const ROUTING_REFRESH_MS = 10_000;
+/** NB를 읽지 않는 라우터 목록과 VM 상세의 유동 IP를 다시 읽는 주기(리뷰 1 웹 I1 — 열어 둔 탭이 서버를 덜 부른다) */
+export const ROUTING_SLOW_REFRESH_MS = 30_000;
 /** 서버의 `DEFAULT_PROVIDER_MTU`: 물리 망 */
 export const DEFAULT_PROVIDER_MTU = 1500;
 /** 서버의 `MAX_INTERFACES`·`MAX_ROUTES`·`MAX_PHYSNETS` */
@@ -26,24 +28,47 @@ export const MAX_INTERFACES = 16;
 export const MAX_ROUTES = 64;
 export const MAX_PHYSNETS = 8;
 
-/** 라우터 목록(`GET /routers`). `live`가 거짓이면 NB를 읽지 않는다(지금 게이트웨이가 빈다). */
-export function useRouters(enabled = true, live = true) {
+/**
+ * 라우터 목록(`GET /routers?live=false`). NB를 읽지 않으므로 지금 게이트웨이(`hosting`·`active`)가 빈다 — 그것은
+ * 연 라우터 하나만 `useRouter`로 읽는다(리뷰 1 웹 I1: 목록마다 NB 전체를 읽지 않게).
+ */
+export function useRouters(enabled = true) {
   return useQuery({
-    queryKey: [...ROUTERS_KEY, live ? "live" : "spec"],
-    queryFn: () => call(api.GET("/routers", live ? {} : { params: { query: { live: false } } })),
+    queryKey: [...ROUTERS_KEY, "spec"],
+    queryFn: () => call(api.GET("/routers", { params: { query: { live: false } } })),
     select: (list) => list.items,
-    refetchInterval: live ? ROUTING_REFRESH_MS : false,
+    refetchInterval: ROUTING_SLOW_REFRESH_MS,
     enabled,
   });
 }
 
-/** 유동 IP 목록(`GET /floating-ips`, 상태는 서버가 Raft에서 셈) */
-export function useFloatingIps(enabled = true) {
+/** 라우터 하나와 NB의 지금 게이트웨이(`GET /routers/{key}`) — 연 서랍만 읽는다. */
+export function useRouter(id: string | null) {
+  return useQuery({
+    queryKey: [...ROUTERS_KEY, "live", id],
+    queryFn: () => call(api.GET("/routers/{key}", { params: { path: { key: id! } } })),
+    refetchInterval: ROUTING_REFRESH_MS,
+    enabled: id !== null,
+  });
+}
+
+/** VM 상세의 유동 IP 다시 읽기: 하나라도 있을 때만 30초, 없거나 아직 모르면 다시 읽지 않는다. */
+export function slowFipRefresh(count: number | undefined): number | false {
+  return (count ?? 0) > 0 ? ROUTING_SLOW_REFRESH_MS : false;
+}
+
+/**
+ * 유동 IP 목록(`GET /floating-ips`, 상태는 서버가 Raft에서 셈). `slow`면(VM 상세) 유동 IP가 하나라도 있을 때만 30초마다
+ * 다시 읽는다 — 유동 IP가 없는 클러스터에서 VM 상세가 서버를 부르지 않는다.
+ */
+export function useFloatingIps(enabled = true, slow = false) {
   return useQuery({
     queryKey: FIPS_KEY,
     queryFn: () => call(api.GET("/floating-ips")),
     select: (list) => list.items,
-    refetchInterval: ROUTING_REFRESH_MS,
+    refetchInterval: slow
+      ? (query) => slowFipRefresh(query.state.data?.items.length)
+      : ROUTING_REFRESH_MS,
     enabled,
   });
 }

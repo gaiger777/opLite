@@ -3312,6 +3312,12 @@
     "notFound": "폴더가 없습니다",
     "backToTree": "폴더로 돌아가기",
     "includeSubfolders": "하위 포함",
+    "type": "종류",
+    "memberKind": {
+      "network": "네트워크",
+      "router": "라우터",
+      "floating-ip": "유동 IP"
+    },
     "emptyFolder": "이 폴더에 든 것이 없습니다.",
     "createVmHere": "여기에 VM 만들기",
     "subfolders": "하위 폴더",
@@ -4096,6 +4102,8 @@
     "removeRoute": "{{destination}} 경로 빼기",
     "gateway": "게이트웨이",
     "gateways": "게이트웨이 노드",
+    "firstGatewayHint": "순위가 가장 높은 게이트웨이 노드입니다. 지금 게이트웨이를 가진 노드는 라우터를 열어 봅니다.",
+    "nodeHidden": "(노드 이름 감춤)",
     "gatewaysHint": "지금 노드가 죽으면 OVN이 라우터의 바깥 포트를 다음 노드로 넘깁니다(BFD). 그때 맺은 SNAT 연결은 끊깁니다.",
     "node": "노드",
     "nodePriority": "노드 우선순위",

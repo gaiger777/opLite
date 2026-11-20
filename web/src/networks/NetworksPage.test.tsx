@@ -830,3 +830,36 @@ it("creates a provider network with a physnet, VLAN and floating IP ranges", asy
     },
   });
 });
+
+it("offers editing and deleting a provider network only to the root cluster admin", async () => {
+  // 리뷰 1 웹 M1: 서버는 공급자 네트워크의 PATCH·지우기에 루트 cluster.admin을 본다. 폴더의 network.config 위임자에게
+  // 403으로 끝나는 단추를 보이지 않는다(같은 폴더의 오버레이 SDN 네트워크는 그대로 바꾼다).
+  const A = folderId("teamA");
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: [],
+        folders: {},
+        contents: { [A]: ["system.read", "network.config", "network.assign"] },
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/networks/:key/ips"), () =>
+      HttpResponse.json({ network: "ext", subnets: [], allocations: [] }),
+    ),
+  );
+  const inA = <T extends { spec: object }>(n: T) => ({ ...n, spec: { ...n.spec, folder: A } });
+  const ext = inA(providerNetwork("ext", "ext", [{ cidr: "203.0.113.0/24" }]));
+  const tenant = inA(TENANT);
+  mockLists({ folder: [folder("teamA", "network")], network: [ext, tenant] });
+  renderPage(<NetworksPage />, { as: { ...ADMIN, role: "none" } });
+  const table = await screen.findByRole("table", { name: "Networks" });
+  await within(table).findByRole("button", { name: "Delete tenant" });
+  expect(within(table).queryByRole("button", { name: "Delete ext" })).not.toBeInTheDocument();
+  await userEvent.click(within(table).getByRole("button", { name: "Open ext" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network ext" });
+  await within(sheet).findByRole("table", { name: "Subnets" });
+  expect(within(sheet).queryByRole("button", { name: "Edit subnets" })).not.toBeInTheDocument();
+});

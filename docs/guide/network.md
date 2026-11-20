@@ -543,7 +543,8 @@ orbivisorctl router delete r1                                     # 인터페이
 - **순위.** 관리자 우선순위가 높은 순, 같은 우선순위 안에서는 라우터·노드의 해시(HRW) 순으로 앞 **5개**를 라우터마다 고른다
   (`HA_Chassis.priority` 32767, 32766, …). 같은 우선순위의 게이트웨이 노드에 라우터들이 고르게 나뉘고, 노드를 더하거나 빼도
   그 노드가 이기거나 지던 라우터만 움직인다. 관리자 우선순위는 "이 노드를 먼저"의 손잡이다(바깥 회선이 좋은 노드 200, 나머지
-  100 따위). `router get`·웹 라우터 서랍의 게이트웨이 표가 순위와 지금 주인(`ACTIVE`, OVN의 `hosting-chassis`)을 보인다.
+  100 따위). `router get`·웹 라우터 서랍의 게이트웨이 표가 순위와 지금 주인(`ACTIVE`, OVN의 `hosting-chassis`)을 보인다. 웹
+  라우터 목록의 게이트웨이 칸은 OVN을 읽지 않고 순위가 가장 높은 후보(또는 "게이트웨이 노드 없음")를 보인다 — 지금 주인은 서랍에서.
 - **후보가 없으면** 바깥 포트를 꺼 둔다(물리 망에 라우터가 보이지 않음, SNAT·유동 IP 없음). 동서 라우팅은 그대로 된다.
   `router get`이 "warning: no gateway node has physnet ext ready; the external gateway is off", 웹이 "게이트웨이 노드 없음" 띠를
   보이고 유동 IP는 `unrouted`다.
@@ -619,7 +620,8 @@ orbivisorctl fip delete web                                     # 붙어 있어�
   IP를 물려받지 않는다. 원격 복제의 받는 클러스터로도 가지 않는다.
 - **API.** `GET|POST /api/v1/floating-ips`(`{"name"?: …, "spec": {"network": "ext", "address"?: …, "target"?: {"vm": "<id>",
   "mac": "52:54:…"}, "folder"?: …}}`), `GET|PATCH|DELETE /api/v1/floating-ips/{name}`(`PATCH {"target": {…} | null,
-  "description": …}`). 읽기 보기에 `state`와 `vm_name`. 목록은 붙은 VM만 읽는다(유동 IP가 없으면 다른 것을 읽지 않음).
+  "description": …}`). 읽기 보기에 `state`와 `vm_name`. 목록은 붙은 VM만 읽는다(유동 IP가 없으면 다른 것을 읽지 않음). 웹 VM
+  상세는 유동 IP가 있을 때만 30초마다 다시 읽는다.
 - 포트 포워딩(주소 하나의 포트를 여러 VM에)·IPv6 유동 IP는 없다.
 
 ### IPv6: SLAAC·DHCPv6·RA
@@ -710,7 +712,8 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
   센다). `orbivisorctl folder quota set network:/tenant --routers 2 --floating-ips 8`(`folder usage network:/tenant`), API `PATCH
   /api/v1/folders/{id}`의 `quota: {"routers": 2, "floating_ips": 8}`, 웹 네트워크 폴더 상세의 할당량 탭.
   `GET /api/v1/folders/{id}/usage`가 둘을 센다.
-- **옮기기.** `orbivisorctl folder members move network:/tenant router/r1 fip/web`, API `POST /api/v1/folders/{id}/members {"items": [{"kind": "router", "key":
+- **옮기기.** `orbivisorctl folder members move network:/tenant router/r1 fip/web`, 웹 네트워크 폴더의 내용 탭(라우터·유동 IP도
+  종류 칸과 함께 나오고 끌어 놓기·"폴더로 옮기기"), API `POST /api/v1/folders/{id}/members {"items": [{"kind": "router", "key":
   "r1"}, {"kind": "floating-ip", "key": "web"}]}`. 객체 grant도 CLI가 받는다(`orbivisorctl grant add --user bob --role operator --on router/r1`).
   네트워크·유동 IP의 할당량 차원 `networks`·`ips`는 계획 67이다.
 
@@ -841,9 +844,9 @@ ip -br link show master vmbr1                                                # �
   노드 통째 죽음과 죽은 중앙의 실제 `cluster/kick`은 GitHub `sdn-multinode` 작업(한 러너의 systemd 컨테이너 셋)이 본다. 실제
   하드웨어 장애의 넘김 시간, 실제 물리 VLAN 스위치, 게스트 OS의 응답(게스트 없는 VM), **여러 chassis에 걸친 보안 그룹**은 보지
   않았다(보안 그룹의 같은 뜻은 노드 하나의 `ovn` 작업이 nftables와 견줘 본다).
-- **라우터·유동 IP 화면은 10초마다 다시 읽는다**(watch가 아님). 다른 사람이 바꾼 것은 그만큼 늦게 보인다.
-- 웹의 폴더 내용 탭·끌어 놓기는 아직 네트워크만이라 라우터·유동 IP 옮기기는 CLI·API다. `vm get`은 NIC의 유동 IP를 따로 보이지
-  않는다(웹 하드웨어 표·`fip list`).
+- **라우터·유동 IP 화면은 30초마다 다시 읽는다**(watch가 아님 — 연 라우터 서랍의 지금 게이트웨이는 10초마다). 다른 사람이 바꾼
+  것은 그만큼 늦게 보인다.
+- `vm get`은 NIC의 유동 IP를 따로 보이지 않는다(웹 하드웨어 표·`fip list`).
 - **보안 그룹 쓰기가 실패하면.** 한 그룹 목록의 Port_Group 쓰기가 계속 실패하면(같은 이름의 남의 Port_Group 따위) 그 목록을 쓰는
   네트워크의 포트 쓰기가 모두 실패한다(그 네트워크의 새 VM은 포트가 없어 켜지지 않음 — 닫힌 쪽으로 실패). 이미 있는 목록의 규칙을
   더 좁히는 쓰기가 실패하면 그 목록의 포트는 옛(더 넓은) 규칙에 남는다. 둘 다 `sdn status`의 동기화 오류로 보인다.

@@ -1,3 +1,4 @@
+import { useQueryClient } from "@tanstack/react-query";
 import { FolderPlus, Plus } from "lucide-react";
 import { Suspense, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -30,6 +31,8 @@ import {
   folderTree,
   type FolderTree as Tree,
   MEMBER_KIND,
+  MEMBER_KINDS,
+  memberKindOf,
   membersOf,
   moveMembers,
   ROOT_ID,
@@ -38,9 +41,10 @@ import { endDrag, FolderTree, startDrag } from "@/folders/FolderTree";
 import { announceMove, MoveButton, MoveDialog } from "@/folders/MoveDialog";
 import { DIMENSIONS, formatDimension, UsageBars, useFolderUsage } from "@/folders/UsageBars";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
+import { refreshRouting, useFloatingIps, useRouters } from "@/routing/routing";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
 
-type Member = Vm | Network | StoragePool;
+type Member = (Vm | Network | StoragePool) & Pick<Foldered, "memberKind">;
 
 /** 이 트리의 객체 목록 */
 function useMembers(kind: FolderKind) {
@@ -48,6 +52,23 @@ function useMembers(kind: FolderKind) {
   const networks = useList("network");
   const pools = useList("storage-pool");
   return kind === "vm" ? vms : kind === "network" ? networks : pools;
+}
+
+/**
+ * 네트워크 폴더에 함께 드는 라우터·유동 IP(계획 66 — 리뷰 1 웹 M4). watch가 아니어서 따로 읽는다(라우터는 NB를 읽지
+ * 않는 목록). 행 모양은 다른 객체와 같고 `memberKind`로 가른다.
+ */
+function useNetworkExtras(enabled: boolean): Member[] {
+  const routers = useRouters(enabled);
+  const fips = useFloatingIps(enabled);
+  return useMemo(
+    () =>
+      [
+        ...(routers.data ?? []).map((r) => ({ ...r, memberKind: "router" as const })),
+        ...(fips.data ?? []).map((f) => ({ ...f, memberKind: "floating-ip" as const })),
+      ] as unknown as Member[],
+    [routers.data, fips.data],
+  );
 }
 
 function folderTarget(id: string): Target {
@@ -58,10 +79,11 @@ function folderTarget(id: string): Target {
 function useDrop(kind: FolderKind, tree: Tree) {
   const { t } = useTranslation();
   const perms = usePermissions();
+  const queryClient = useQueryClient();
   const label = (id: string) => (id === ROOT_ID ? t("folders.root") : folderPath(tree, id));
   return {
     canDrop(id: string, payload: DragPayload) {
-      if (payload.kind !== MEMBER_KIND[kind]) {
+      if (!MEMBER_KINDS[kind].includes(payload.kind)) {
         return "folders.reason.kind";
       }
       if (!perms.has("inventory.move", folderTarget(id))) {
@@ -71,7 +93,13 @@ function useDrop(kind: FolderKind, tree: Tree) {
     },
     onDrop(id: string, payload: DragPayload) {
       void moveMembers(id === ROOT_ID ? null : id, payload.kind, payload.names).then(
-        (results) => announceMove(t, label(id), results),
+        (results) => {
+          // 라우터·유동 IP는 watch가 아니어서 다시 읽는다.
+          if (payload.kind !== MEMBER_KIND[kind]) {
+            void refreshRouting(queryClient);
+          }
+          announceMove(t, label(id), results);
+        },
         (error: unknown) =>
           announceMove(
             t,
@@ -109,12 +137,13 @@ export function FolderMembers({
   const { t } = useTranslation();
   const perms = usePermissions();
   const list = useMembers(kind);
+  const extras = useNetworkExtras(kind === "network");
   const state = useTableState(`folder-${kind}`);
   const [moving, setMoving] = useState<{ items: Foldered[]; clear(): void } | null>(null);
-  const memberKind = MEMBER_KIND[kind];
+  const kindOf = (item: Member) => memberKindOf(item, kind);
   const rows = useMemo(
-    () => membersOf(tree, (list.data ?? []) as Member[], folder, deep),
-    [tree, list.data, folder, deep],
+    () => membersOf(tree, [...((list.data ?? []) as Member[]), ...extras], folder, deep),
+    [tree, list.data, extras, folder, deep],
   );
   const mover = perms.anywhere("inventory.move");
   const where = (item: Member) => item.spec.folder ?? ROOT_ID;
@@ -136,6 +165,16 @@ export function FolderMembers({
           <span className="font-medium">{item.name}</span>
         ),
     },
+    ...(kind === "network"
+      ? [
+          {
+            id: "type",
+            header: t("folders.type"),
+            value: (item: Member) => t(`folders.memberKind.${kindOf(item)}`),
+            cell: (item: Member) => t(`folders.memberKind.${kindOf(item)}`),
+          },
+        ]
+      : []),
     ...(kind === "vm"
       ? [
           {
@@ -174,18 +213,21 @@ export function FolderMembers({
             ? (chosen, clear) => (
                 <MoveButton
                   items={chosen}
-                  allowed={(item) => perms.has("inventory.move", objectTarget(memberKind, item))}
+                  allowed={(item) => perms.has("inventory.move", objectTarget(kindOf(item), item))}
                   onClick={() => setMoving({ items: chosen, clear })}
                 />
               )
             : undefined
         }
         rowProps={(item, selected) => {
+          const memberKind = kindOf(item);
           if (!perms.has("inventory.move", objectTarget(memberKind, item))) {
             return {};
           }
-          // 고른 행을 끌면 고른 것 모두, 아니면 그 행 하나
-          const dragged = selected.some((s) => s.id === item.id) ? selected : [item];
+          // 고른 행을 끌면 고른 것 중 같은 종류 모두(옮기기 끌기는 한 종류), 아니면 그 행 하나
+          const dragged = selected.some((s) => s.id === item.id)
+            ? selected.filter((s) => kindOf(s) === memberKind)
+            : [item];
           return {
             draggable: true,
             "aria-roledescription": t("folders.draggable"),

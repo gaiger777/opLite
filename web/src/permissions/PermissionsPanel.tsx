@@ -44,6 +44,7 @@ import {
   useAccessRoles,
   useGroups,
 } from "@/permissions/grants";
+import { useFloatingIps, useRouters } from "@/routing/routing";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -63,24 +64,29 @@ export function usePrincipalNames(): ReadonlyMap<string, string> {
   );
 }
 
-/** 객체 id → 이름(VM·네트워크·풀) */
+/** 객체 id → 이름(VM·네트워크·풀·라우터·유동 IP — 계획 66 리뷰 1 웹 M5) */
 export function useObjectNames(): (kind: string, id: string) => string | undefined {
   const vms = useList("vm");
   const networks = useList("network");
   const pools = useList("storage-pool");
+  // 라우터·유동 IP는 watch가 아니다: NB를 읽지 않는 목록, 유동 IP는 있을 때만 천천히 다시 읽는다.
+  const routers = useRouters();
+  const fips = useFloatingIps(true, true);
   return useMemo(() => {
     const names = new Map<string, string>();
     for (const [kind, list] of [
       ["vm", vms.data],
       ["network", networks.data],
       ["storage-pool", pools.data],
+      ["router", routers.data],
+      ["floating-ip", fips.data],
     ] as const) {
       for (const item of list ?? []) {
         names.set(`${kind}/${item.id}`, item.name);
       }
     }
     return (kind: string, id: string) => names.get(`${kind}/${id}`);
-  }, [vms.data, networks.data, pools.data]);
+  }, [vms.data, networks.data, pools.data, routers.data, fips.data]);
 }
 
 /** grant 대상을 화면의 대상으로(지우기 권한을 볼 때). 객체 grant는 이 패널의 객체다. */

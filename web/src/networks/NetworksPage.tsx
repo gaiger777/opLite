@@ -55,9 +55,12 @@ const USER_NETWORK = "user";
 /** 서버의 `DEFAULT_VXLAN_MTU`: underlay 1500에서 VXLAN 머리 50바이트를 뺀 값 */
 const DEFAULT_VXLAN_MTU = 1450;
 
-/** 서버의 `is_managed_ifname`: opld가 VXLAN 네트워크에 쓰는 이름 모양이라 브리지로 쓸 수 없다. */
-function managedName(name: string): boolean {
-  return /^opl[vx][0-9]+$/.test(name);
+/**
+ * 서버의 `is_managed_ifname`: opld가 VXLAN 네트워크(`oplv<vni>`·`oplx<vni>`)와 physnet 연결(`oplp<h8>[obx]`)에 쓰는
+ * 이름 모양이라 브리지로 쓸 수 없다.
+ */
+export function managedName(name: string): boolean {
+  return /^opl[vx][0-9]+$/.test(name) || /^oplp[0-9a-f]{8}[obx]$/.test(name);
 }
 
 /** 서버의 `valid_ifname`(1–15바이트의 보이는 ASCII, `/`·`:` 없음, `.`·`..`가 아님)이고 관리 이름이 아님 */
@@ -133,8 +136,11 @@ export function NetworksPage() {
   // 브리지 네트워크(노드의 브리지 이름)는 루트 `cluster.admin`만 만든다. VXLAN 네트워크는 폴더의 `network.config`로
   // 만든다(설계 §18 리뷰 1).
   const bridges = perms.has("cluster.admin");
+  // 공급자 네트워크의 바꾸기·지우기는 서버가 루트 `cluster.admin`도 본다(리뷰 1 웹 M1 — 폴더의 위임자에게 403 단추를
+  // 보이지 않는다).
   const writes = (network: Network) =>
-    perms.has("network.config", objectTarget("network", network));
+    perms.has("network.config", objectTarget("network", network)) &&
+    (!isProvider(network) || bridges);
   const delegates = (network: Network) =>
     perms.has("permission.modify", objectTarget("network", network));
   const actions = write || perms.anywhere("permission.modify");

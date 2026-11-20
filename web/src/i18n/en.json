@@ -3312,6 +3312,12 @@
     "notFound": "Folder not found",
     "backToTree": "Back to folders",
     "includeSubfolders": "Include subfolders",
+    "type": "Type",
+    "memberKind": {
+      "network": "Network",
+      "router": "Router",
+      "floating-ip": "Floating IP"
+    },
     "emptyFolder": "Nothing in this folder.",
     "createVmHere": "Create a VM here",
     "subfolders": "Subfolders",
@@ -4096,6 +4102,8 @@
     "removeRoute": "Remove the route to {{destination}}",
     "gateway": "Gateway",
     "gateways": "Gateway nodes",
+    "firstGatewayHint": "Highest-ranked gateway node. Open the router to see which node holds the gateway now.",
+    "nodeHidden": "(node name hidden)",
     "gatewaysHint": "OVN moves the router's outside port to the next node when the active one fails (BFD). Open SNAT connections are cut then.",
     "node": "Node",
     "nodePriority": "Node priority",

@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import type { Principal } from "@/api/types";
 import { RoutersPage } from "@/routing/RoutersPage";
+import type { Router } from "@/routing/routing";
 import { expectNoAxeViolations } from "@/test/axe";
 import {
   providerNetwork,
@@ -33,9 +34,29 @@ function sdnIsReady() {
   server.use(http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([N1], [N1]))));
 }
 
-function routers(items: unknown[]) {
-  server.use(http.get(apiUrl("/routers"), () => HttpResponse.json({ revision: 9, items })));
+/** 서버처럼: 목록(`live=false`)은 NB의 지금 주인을 비우고, `GET /routers/{key}`가 그것을 채운다. 부른 질의를 적는다. */
+const asked: string[] = [];
+function routers(items: Router[]) {
+  server.use(
+    http.get(apiUrl("/routers"), ({ request }) => {
+      asked.push(`list ${new URL(request.url).search}`);
+      const spec = items.map((r) => ({
+        ...r,
+        hosting: undefined,
+        gateways: r.gateways?.map((g) => ({ ...g, active: false })),
+      }));
+      return HttpResponse.json({ revision: 9, items: spec });
+    }),
+    http.get(apiUrl("/routers/:key"), ({ params, request }) => {
+      asked.push(`get ${String(params.key)} ${new URL(request.url).search}`);
+      return HttpResponse.json(items.find((r) => r.id === params.key));
+    }),
+  );
 }
+
+beforeEach(() => {
+  asked.length = 0;
+});
 
 /** 서버 `router_view`의 모양: 외부·게이트웨이 순위·지금 주인·IPv6 윗단 경로 */
 const R1 = routerView(
@@ -80,7 +101,9 @@ it("lists routers with the active gateway and opens the drawer", async () => {
   );
   renderPage(<RoutersPage />);
   const row = (await screen.findByRole("button", { name: "Open router r1" })).closest("tr")!;
+  // 목록은 NB를 읽지 않는다(리뷰 1 웹 I1): 게이트웨이 칸은 순위가 가장 높은 후보다.
   expect(within(row).getByText("node-a")).toBeVisible();
+  expect(asked).toEqual(["list ?live=false"]);
   expect(within(row).getByText("203.0.113.100, 2001:db8::5")).toBeVisible();
   // 인터페이스가 남은 라우터는 지울 수 없다.
   expect(within(row).getByRole("button", { name: "Delete r1" })).toBeDisabled();
@@ -92,7 +115,10 @@ it("lists routers with the active gateway and opens the drawer", async () => {
   const sheet = await screen.findByRole("dialog", { name: "Router r1" });
   const gateways = within(sheet).getByRole("table", { name: "Gateway nodes" });
   expect(within(gateways).getAllByRole("row")).toHaveLength(3);
-  expect(within(gateways).getByText("active")).toBeVisible();
+  // 지금 주인은 연 서랍의 라우터 하나만 NB까지 읽어 보인다.
+  expect(await within(gateways).findByText("active")).toBeVisible();
+  expect(asked).toContain(`get ${R1.id} `);
+  expect(asked.filter((a) => a.startsWith("get"))).toHaveLength(1);
   expect(within(sheet).getByText("fd00:20::/64 via 2001:db8::5")).toBeVisible();
   // 붙일 수 있는 것: 서브넷 있는 오버레이이고 다른 라우터에 없는 것(t2). 공급자·서브넷 없는 것은 빠진다.
   const add = within(sheet).getByLabelText("Add an interface");
@@ -216,4 +242,59 @@ it("hides changes from viewers", async () => {
   const sheet = await screen.findByRole("dialog", { name: "Router r1" });
   expect(within(sheet).queryByLabelText("Add an interface")).not.toBeInTheDocument();
   expect(within(sheet).queryByRole("button", { name: "Change" })).not.toBeInTheDocument();
+});
+
+it("offers only provider networks with a subnet as externals and only networks the user configures as interfaces", async () => {
+  // 리뷰 1 웹 M3: 서브넷 없는 공급자는 서버가 400 invalid_router로 거절한다.
+  // 리뷰 1 #1: 인터페이스는 그 네트워크의 network.config가 있어야 한다(network.assign만으로는 안 된다).
+  sdnIsReady();
+  const EMPTY_EXT = providerNetwork("ext2", "ext");
+  const SHARED = { ...sdnNetwork("shared", [{ cidr: "10.40.0.0/24" }]), id: "net-shared" };
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read"],
+        root_contents: ["system.read", "network.config", "network.assign"],
+        folders: {},
+        // 다른 폴더의 네트워크는 붙이기(network.assign)만 받았다.
+        contents: { "f-other": ["system.read", "network.assign"] },
+        objects: [],
+      }),
+    ),
+  );
+  const NOT_MINE = { ...SHARED, spec: { ...SHARED.spec, folder: "f-other" } };
+  mockLists({ node: [N1], network: [EXT, EMPTY_EXT, T1, NOT_MINE] });
+  routers([]);
+  renderPage(<RoutersPage />, { as: { ...ADMIN, role: "none" } });
+  const user = userEvent.setup();
+  await user.click(await screen.findByRole("button", { name: "Create a router" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a router" });
+  expect(
+    within(within(dialog).getByLabelText("External network"))
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["None", "ext"]);
+  expect(within(dialog).getByRole("checkbox", { name: "t1" })).toBeVisible();
+  expect(within(dialog).queryByRole("checkbox", { name: "shared" })).not.toBeInTheDocument();
+});
+
+it("shows a placeholder when the server hides gateway node names", async () => {
+  sdnIsReady();
+  mockLists({ node: [N1], network: [EXT, T1, T2, BARE] });
+  // 루트 cluster.read가 없는 사용자에게 서버는 노드 이름을 비운다(리뷰 1 M-4).
+  const hidden = {
+    ...R1,
+    hosting: "",
+    gateways: R1.gateways?.map((g) => ({ ...g, node: "" })),
+  };
+  routers([hidden]);
+  renderPage(<RoutersPage />);
+  const row = (await screen.findByRole("button", { name: "Open router r1" })).closest("tr")!;
+  expect(within(row).getByText("(node name hidden)")).toBeVisible();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "Open router r1" }));
+  const sheet = await screen.findByRole("dialog", { name: "Router r1" });
+  const gateways = within(sheet).getByRole("table", { name: "Gateway nodes" });
+  expect(within(gateways).getAllByText("(node name hidden)")).toHaveLength(2);
 });

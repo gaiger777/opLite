@@ -5,7 +5,7 @@ import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import type { Node, Principal } from "@/api/types";
-import { NodeSdnSection } from "@/nodes/NodeSdnSection";
+import { NodeSdnSection, sdnConfigOf } from "@/nodes/NodeSdnSection";
 import { readyChassis, sdnNode } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
@@ -129,4 +129,32 @@ it("checks the rows and hides editing from viewers", async () => {
   renderPage(<NodeSdnSection node={GW} />, { as: VIEWER });
   await screen.findByRole("table", { name: "SDN physical networks" });
   expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+});
+
+it("does not suggest or accept bridges Orbivisor manages", async () => {
+  // 리뷰 1 웹 M2: VXLAN `oplv<vni>`·physnet `oplp<h8>x`·`br-int`은 서버가 400 `invalid_node_sdn`으로 거절한다.
+  const node = {
+    ...GW,
+    status: {
+      ...GW.status,
+      bridges: ["vmbr1", "oplv100", "oplp1234abcdx", "br-int"].map((name) => ({
+        name,
+        vlan_filtering: false,
+      })),
+    },
+  } as Node;
+  mockLists({ node: [node] });
+  const user = userEvent.setup();
+  renderPage(<NodeSdnSection node={node} />);
+  await user.click(await screen.findByRole("button", { name: "Edit" }));
+  await screen.findByRole("dialog", { name: "SDN settings of node-a" });
+  const options = [...document.querySelectorAll("datalist option")].map((o) =>
+    o.getAttribute("value"),
+  );
+  expect(options).toEqual(["vmbr1"]);
+  for (const bridge of ["oplv100", "oplp1234abcdx", "oplp1234abcdb"]) {
+    expect(
+      sdnConfigOf({ rows: [{ name: "ext", bridge }], gateway: false, priority: "100" }).errors,
+    ).toEqual({ "physnets.0.bridge": "sdn.physnet.errors.bridge" });
+  }
 });

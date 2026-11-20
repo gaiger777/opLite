@@ -23,7 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { validBridge } from "@/networks/NetworksPage";
+import { managedName, validBridge } from "@/networks/NetworksPage";
 import { MAX_PHYSNETS, type NodeSdnConfig, validPhysnet } from "@/routing/routing";
 import { callWarned } from "@/sdn/sdn";
 
@@ -189,7 +189,11 @@ function NodeSdnDialog({ node, onClose }: { node: Node; onClose(): void }) {
   const [values, setValues] = useState<SdnValues>(() => valuesOf(opened.spec.sdn));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const bridgesId = useId();
-  const bridges = opened.status.bridges.map((b) => b.name).sort();
+  // Orbivisor가 만든 브리지(VXLAN `oplv<vni>`, physnet `oplp…`)와 OVN 통합 브리지는 physnet에 쓸 수 없어 제안하지 않는다.
+  const bridges = opened.status.bridges
+    .map((b) => b.name)
+    .filter((b) => !managedName(b) && b !== "br-int")
+    .sort();
   const setRow = (i: number, patch: Partial<PhysnetRow>) =>
     setValues({ ...values, rows: values.rows.map((r, j) => (j === i ? { ...r, ...patch } : r)) });
 

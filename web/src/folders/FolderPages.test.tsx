@@ -4,7 +4,7 @@ import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import { FolderDetailPage, FolderViewPage } from "@/folders/FolderPages";
-import { folder, folderId, vm } from "@/test/fixtures";
+import { floatingIpView, folder, folderId, routerView, sdnNetwork, vm } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -277,4 +277,67 @@ it("sets the router and floating IP quota of a network folder", async () => {
   await waitFor(() =>
     expect(requests).toEqual([{ ifMatch: "1", body: { quota: { routers: 2, floating_ips: 4 } } }]),
   );
+});
+
+it("lists routers and floating IPs in a network folder and moves them with their kind", async () => {
+  // 리뷰 1 웹 M4: 라우터만 든 네트워크 폴더가 비어 보이고 "폴더 지우기"가 409 folder_not_empty로 끝났다.
+  const T = folderId("tenant");
+  const inT = <X extends { spec: object }>(x: X) => ({ ...x, spec: { ...x.spec, folder: T } });
+  mockLists({
+    folder: [folder("tenant", "network"), folder("other", "network")],
+    network: [inT(sdnNetwork("t1", [{ cidr: "10.10.0.0/24" }]))],
+  });
+  const r1 = inT(routerView("r1"));
+  const fip = inT(floatingIpView("203.0.113.120", "ext"));
+  const moved: unknown[] = [];
+  const reads: string[] = [];
+  server.use(
+    http.get(apiUrl("/routers"), ({ request }) => {
+      reads.push(new URL(request.url).search);
+      return HttpResponse.json({ revision: 1, items: [r1] });
+    }),
+    http.get(apiUrl("/floating-ips"), () => HttpResponse.json({ revision: 1, items: [fip] })),
+    http.post(apiUrl("/folders/:id/members"), async ({ request, params }) => {
+      moved.push({ to: params.id, body: await request.json() });
+      return HttpResponse.json({
+        items: [
+          { kind: "router", key: "r1", ok: true },
+          { kind: "floating-ip", key: fip.name, ok: true },
+        ],
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<FolderDetailPage kind="network" />, {
+    path: "/network-folders/:id",
+    url: `/network-folders/${T}`,
+  });
+  const r1Row = (await screen.findByText("r1")).closest("tr")!;
+  expect(within(r1Row).getByText("Router")).toBeInTheDocument();
+  const fipRow = screen.getByText(fip.name).closest("tr")!;
+  expect(within(fipRow).getByText("Floating IP")).toBeInTheDocument();
+  expect(within(screen.getByText("t1").closest("tr")!).getByText("Network")).toBeInTheDocument();
+  // 라우터 목록은 NB를 읽지 않는 것이다.
+  expect(reads.every((q) => q === "?live=false")).toBe(true);
+
+  await user.click(screen.getByRole("checkbox", { name: "Select r1" }));
+  await user.click(screen.getByRole("checkbox", { name: `Select ${fip.name}` }));
+  await user.click(
+    within(screen.getByRole("region", { name: "Bulk actions" })).getByRole("button", {
+      name: "Move to folder (2 possible, 0 not possible)",
+    }),
+  );
+  const dialog = screen.getByRole("dialog", { name: "Move 2 items to a folder" });
+  await user.selectOptions(within(dialog).getByLabelText("Destination folder"), "/other");
+  await user.click(within(dialog).getByRole("button", { name: "Move" }));
+  await waitFor(() => expect(moved).toHaveLength(1));
+  expect(moved[0]).toEqual({
+    to: folderId("other"),
+    body: {
+      items: [
+        { kind: "router", key: "r1" },
+        { kind: "floating-ip", key: fip.name },
+      ],
+    },
+  });
 });

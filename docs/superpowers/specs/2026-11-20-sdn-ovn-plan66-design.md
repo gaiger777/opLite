@@ -534,3 +534,18 @@ nftables 쪽은 "방화벽 없이 도는 순간이 없다"(켜기 직전 `Firewa
 - **웹 M4 서버·CLI**: 서버의 라우터·유동 IP 폴더 옮기기는 스테이지 5에 이미 있었다. CLI `folder members move … router/NAME fip/NAME`, `grant … --on router/NAME|floating-ip/NAME`(`perm check`도), `folder quota set network:/T --routers N --floating-ips N`, `folder usage network:/T`(라우터·유동 IP 줄)를 더했다(스테이지 8 보고의 CLI 빈자리를 메움).
 - **적어만 둔 것**: M-1(OVN 기본 막기가 `ip`만 — §11.4 표·가이드 표에 줄을 더함; `!arp && !rarp`로 바꾸면 단순 NIC와 같아지지만 NB의 모든 목록 ACL이 바뀌고 GitHub 탐침의 같은 뜻 비교를 다시 해야 해서 이번에는 바꾸지 않음), M-2(한 목록 Port_Group의 실패가 그 네트워크 포트 쓰기를 모두 막음 — 닫힌 쪽 실패, 가이드 한계에), M-3(있는 목록의 규칙을 좁히는 쓰기가 실패하면 옛 규칙에 남음 — 가이드 한계에, `sdn status` 동기화 오류로 보임), M-8(디스크만의 `transaction`·`snapshot_save_with_bitmap`·`blockdev_del`은 바쁨 표시를 하지 않음 — 보통 짧고, 표시하면 끄기 요청이 그만큼 미뤄진다; 느린 qcow2에서 한 번 "응답 없음"이 보일 수 있다), M-9(돌던 VM의 `snapshot-delete` 중 보통 끄기는 끝날 때까지 말없이 미뤄짐 — 작업자 로그 "VM is busy; stopping it after the operation"만).
 - **틀린 지적**: M-6의 "`pick_address`가 첫 IPv4 서브넷만 봄"은 고칠 것이 없다 — 네트워크는 체계마다 서브넷이 하나다(`NetworkSpec` 검증 "a network can have at most one IPv4 and one IPv6 subnet").
+
+### 리뷰 1에서 고친 것 (웹)
+
+- **I1 라우터 목록 가볍게**: 목록은 `GET /routers?live=false`를 30초마다(NB를 읽지 않음) 읽고, 지금 게이트웨이(`hosting`·`active`)는 연 서랍의 라우터 하나만 `GET /routers/{key}`로 10초마다 읽는다(읽기 전 주인 칸은 "…"). 목록의 게이트웨이 칸은 후보 없음 경고 또는 순위가 가장 높은 후보다(스테이지 7의 "지금 게이트웨이 노드"를 바꿈). VM 상세의 유동 IP는 하나라도 있을 때만 30초마다 다시 읽는다(`slowFipRefresh`).
+- **M1** 공급자 네트워크의 편집·지우기 단추는 루트 `cluster.admin`에게만(폴더의 `network.config`로는 서버가 403). **M2** 노드 SDN 대화상자는 Orbivisor 관리 브리지(`oplv`·`oplx`·`oplp…`·`br-int`)를 제안하지 않고 `oplp…`도 거절한다(`managedName`이 서버 `is_managed_ifname`과 같게; `oplv100` 거절은 이미 있었다 — 지적의 절반). **M3** 라우터 외부 고르기는 서브넷이 있는 공급자만. 인터페이스 고르기는 서버 #1에 맞춰 그 네트워크의 `network.config`가 있을 때만.
+- **M4** 네트워크 폴더의 내용 탭에 라우터·유동 IP가 종류 칸과 함께 나오고 끌어 놓기·"폴더로 옮기기"로 옮긴다(`POST /folders/{id}/members`에 항목마다 종류). 폴더 머리의 개수는 아직 네트워크만 센다. **M5** 권한 화면이 라우터·유동 IP grant를 이름으로 보인다(라우터는 NB를 읽지 않는 목록에서). **M7** 유동 IP 지우기가 `If-Match`를 보낸다.
+- **M-4(서버)에 맞춤**: 서버가 노드 이름을 비우면 게이트웨이 칸·표는 "(노드 이름 감춤)", 분산 칩은 노드 없이 "분산"이다(표의 행 키는 순위).
+- **M6**은 서버 문구라 서버 커밋에서 고쳤다. **M8**은 아래에 적었다.
+- 시험: vitest 1446 → 1455(고친 것마다 하나 이상).
+
+### 스테이지 7 보고에 더함 (리뷰 1 M8 — §13과 다른 것)
+
+- **기능 판정 없음**: SDN NIC 보안 그룹 고르기는 기능(`sdn-routing`)을 묻지 않고 늘 열린다(§13 "기능이 켜졌을 때만"). 섞인 클러스터는 저장할 때 서버의 409 `cluster_upgrading`을 보인다 — 웹에 기능 판정 API가 없고, 섞인 클러스터는 업그레이드 동안만이다.
+- **VM 화면에 붙이기·떼기 없음**: VM 하드웨어 표에는 "유동 IP" 칸(유동 IP 보기로 가는 링크)만 있고 붙이기·떼기는 유동 IP 보기에서 한다(§13 "붙이기·떼기"). 같은 대화상자(막힌 까닭 포함)를 두 곳에 두지 않으려고 모았다.
+- **chassis 상태 칸 없음**: 라우터 게이트웨이 표에 chassis 상태가 없다(§13 "chassis 상태"). 스테이지 5가 `chassis_state`를 넣지 않았다(라우터마다 SB를 읽지 않음) — chassis 상태는 SDN 보기의 chassis 표가 보인다.

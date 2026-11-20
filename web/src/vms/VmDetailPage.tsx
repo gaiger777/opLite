@@ -739,7 +739,7 @@ function Hardware({ vm }: { vm: Vm }) {
   const sdnNics = (vm.spec.nics ?? []).some((nic) =>
     isSdnNetwork(networks.data?.find((n) => n.name === nic.network)),
   );
-  const fips = useFloatingIps(sdnNics);
+  const fips = useFloatingIps(sdnNics, true);
   return (
     <div className="flex flex-col gap-6 pt-2">
       <section className="flex flex-col gap-2">

@@ -58,7 +58,7 @@ export function FipStateChip({ state }: { state: FipState }) {
   return (
     <span className="flex flex-col items-start gap-0.5">
       <StatusChip tone={STATE_TONE[state.kind]}>
-        {state.kind === "distributed"
+        {state.kind === "distributed" && state.node
           ? t("fip.state.distributedOn", { node: state.node })
           : t(`fip.state.${state.kind}`)}
       </StatusChip>
@@ -235,7 +235,12 @@ export function FloatingIpsPage() {
         confirmLabel={t("common.delete")}
         onConfirm={async () => {
           const fip = deleting!;
-          await call(api.DELETE("/floating-ips/{key}", { params: { path: { key: fip.id } } }));
+          // 확인을 연 사이 누가 붙였으면(412) 붙은 NAT를 몰래 지우지 않는다(리뷰 1 웹 M7).
+          await call(
+            api.DELETE("/floating-ips/{key}", {
+              params: { path: { key: fip.id }, header: { "If-Match": fip.revision } },
+            }),
+          );
           await refreshRouting(queryClient);
           toast.success(t("fip.deleted", { name: fip.name }));
         }}
@@ -273,7 +278,7 @@ function useNicChoices(network: string, self?: string) {
   const perms = usePermissions();
   const vms = useList("vm");
   const networks = useList("network");
-  const routers = useRouters(true, false);
+  const routers = useRouters();
   const fips = useFloatingIps();
   const ready = vms.data && networks.data && routers.data && fips.data;
   const choices = ready

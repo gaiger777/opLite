@@ -9,6 +9,7 @@ import {
   nicChoices,
   physnetNodes,
   providerLabel,
+  slowFipRefresh,
   validPhysnet,
 } from "@/routing/routing";
 import { emptySubnetRow, subnetErrors, subnetRow, toSubnet } from "@/sdn/subnets";
@@ -207,4 +208,11 @@ it("draws router and floating IP bars for a network folder", () => {
     { dim: "routers", used: 1 },
     { dim: "floating_ips", used: 0, limit: 4, boundBy: undefined },
   ]);
+});
+
+it("polls floating IPs on the VM page only when some exist, every 30 s", () => {
+  // 리뷰 1 웹 I1: 유동 IP가 없는 클러스터에서 VM 상세가 10초마다 서버의 World 읽기를 부르지 않는다.
+  expect(slowFipRefresh(undefined)).toBe(false);
+  expect(slowFipRefresh(0)).toBe(false);
+  expect(slowFipRefresh(2)).toBe(30_000);
 });

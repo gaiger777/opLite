@@ -43,6 +43,7 @@ import {
   type Router,
   routerOf,
   type RouterPatch,
+  useRouter,
   useRouters,
 } from "@/routing/routing";
 import { cidrFamily } from "@/security-groups/rules";
@@ -79,7 +80,9 @@ export function RoutersPage() {
   const writes = (r: Router) => perms.has("network.config", objectTarget("router", r));
   const delegates = (r: Router) => perms.has("permission.modify", objectTarget("router", r));
   const items = routers.data ?? [];
-  const openedRouter = items.find((r) => r.id === opened);
+  // 지금 게이트웨이(NB)는 연 서랍의 라우터 하나만 읽는다(리뷰 1 웹 I1). 읽기 전에는 목록의 것을 보인다.
+  const live = useRouter(opened);
+  const openedRouter = live.data ?? items.find((r) => r.id === opened);
 
   return (
     <div className="flex flex-col gap-4">
@@ -200,6 +203,7 @@ export function RoutersPage() {
         <RouterSheet
           router={openedRouter}
           routers={items}
+          live={live.data !== undefined}
           writes={writes(openedRouter)}
           onClose={() => setOpened(null)}
         />
@@ -232,8 +236,11 @@ export function RoutersPage() {
   );
 }
 
-/** 목록의 게이트웨이 칸: 지금 주인(NB), 후보 없음 경고, NB를 읽지 못함 */
-function GatewayCell({ router }: { router: Router }) {
+/**
+ * 목록의 게이트웨이 칸: 후보 없음 경고, 아니면 순위가 가장 높은 후보(Raft). 목록은 NB를 읽지 않으므로(리뷰 1 웹 I1) 지금
+ * 주인은 서랍에서 본다.
+ */
+export function GatewayCell({ router }: { router: Router }) {
   const { t } = useTranslation();
   if (!router.spec.external) {
     return <span className="text-muted-foreground">{t("router.noExternal")}</span>;
@@ -241,29 +248,37 @@ function GatewayCell({ router }: { router: Router }) {
   if (router.gateway_error) {
     return <StatusChip tone="warning">{t("router.noGateway")}</StatusChip>;
   }
-  if (router.hosting) {
-    return <StatusChip tone="success">{router.hosting}</StatusChip>;
+  const first = router.gateways?.[0];
+  if (first) {
+    // 루트 `cluster.read`가 없으면 서버가 노드 이름을 비운다(리뷰 1 M-4).
+    return <span title={t("router.firstGatewayHint")}>{first.node || t("router.nodeHidden")}</span>;
   }
-  return <span className="text-muted-foreground">{router.live_error ? "?" : "—"}</span>;
+  return <span className="text-muted-foreground">—</span>;
 }
 
-/** 라우터에 붙일 수 있는 네트워크: 오버레이 SDN, 서브넷이 있음, 다른 라우터의 인터페이스가 아님, `network.assign` */
+/**
+ * 라우터에 붙일 수 있는 네트워크(서버 `check_router`와 권한): 인터페이스는 오버레이 SDN, 서브넷이 있음, 다른 라우터의
+ * 인터페이스가 아님, 그 네트워크의 `network.config`(라우터는 그 네트워크 모든 VM의 기본 경로를 바꾼다 — 리뷰 1 #1).
+ * 외부는 서브넷이 있는 공급자 네트워크와 `network.assign`(리뷰 1 웹 M3).
+ */
 function useAttachable(routers: readonly Router[], self?: Router) {
   const perms = usePermissions();
   const networks = useList("network");
   const all = networks.data ?? [];
   const assigns = (n: Network) => perms.has("network.assign", objectTarget("network", n));
+  const configures = (n: Network) => perms.has("network.config", objectTarget("network", n));
+  const hasSubnet = (n: Network) => (n.spec.subnets ?? []).length > 0;
   return {
     interfaces: all.filter((n) => {
       const owner = routerOf(routers, n.name);
       return (
         isOverlay(n) &&
-        (n.spec.subnets ?? []).length > 0 &&
-        assigns(n) &&
+        hasSubnet(n) &&
+        configures(n) &&
         (owner === undefined || owner.id === self?.id)
       );
     }),
-    externals: all.filter((n) => isProvider(n) && assigns(n)),
+    externals: all.filter((n) => isProvider(n) && hasSubnet(n) && assigns(n)),
   };
 }
 
@@ -271,7 +286,7 @@ function CreateRouterDialog({ onClose }: { onClose(): void }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const folder = useNewFolder("network", "network.config");
-  const routers = useRouters(true, false);
+  const routers = useRouters();
   const { interfaces, externals } = useAttachable(routers.data ?? []);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -454,11 +469,14 @@ function ExternalFields({
 function RouterSheet({
   router,
   routers,
+  live,
   writes,
   onClose,
 }: {
   router: Router;
   routers: Router[];
+  /** `router`가 NB까지 읽은 보기다(아니면 지금 주인 칸을 비운다). */
+  live: boolean;
   writes: boolean;
   onClose(): void;
 }) {
@@ -537,7 +555,7 @@ function RouterSheet({
             patch={patch}
           />
           <RoutesSection router={router} writes={writes} busy={busy} patch={patch} />
-          <GatewaysSection router={router} />
+          <GatewaysSection router={router} live={live} />
         </div>
       </SheetContent>
     </Sheet>
@@ -887,7 +905,7 @@ function RoutesSection({ router, writes, busy, patch }: SectionProps) {
 }
 
 /** 게이트웨이 순위(Raft의 HRW 순위)와 지금 주인(NB `hosting-chassis`) */
-function GatewaysSection({ router }: { router: Router }) {
+function GatewaysSection({ router, live }: { router: Router; live: boolean }) {
   const { t } = useTranslation();
   if (!router.spec.external) {
     return null;
@@ -917,13 +935,15 @@ function GatewaysSection({ router }: { router: Router }) {
             </TableRow>
           )}
           {gateways.map((g) => (
-            <TableRow key={g.node}>
-              <TableCell>{g.node}</TableCell>
+            <TableRow key={g.priority}>
+              <TableCell>{g.node || t("router.nodeHidden")}</TableCell>
               <TableCell>{g.node_priority}</TableCell>
               <TableCell>{g.priority}</TableCell>
               <TableCell>
                 {g.active ? (
                   <StatusChip tone="success">{t("router.activeNow")}</StatusChip>
+                ) : !live ? (
+                  <span className="text-muted-foreground">…</span>
                 ) : (
                   <span className="text-muted-foreground">{t("router.standby")}</span>
                 )}

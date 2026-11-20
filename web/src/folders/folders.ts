@@ -17,6 +17,13 @@ export const MEMBER_KIND: Record<FolderKind, MemberKind> = {
   storage: "storage-pool",
 };
 
+/** 트리에 들 수 있는 객체 종류(서버 `FolderKind::member_kinds` — 네트워크 폴더에는 라우터·유동 IP도, 계획 66) */
+export const MEMBER_KINDS: Record<FolderKind, readonly MemberKind[]> = {
+  vm: ["vm"],
+  network: ["network", "router", "floating-ip"],
+  storage: ["storage-pool"],
+};
+
 /** 루트(폴더 없음)를 가리키는 트리 노드 id. 주소 `?folder=`에도 쓴다. */
 export const ROOT_ID = "root";
 
@@ -25,6 +32,13 @@ export interface Foldered {
   id: string;
   name: string;
   spec: { folder?: string | null };
+  /** 트리의 기본 종류(`MEMBER_KIND`)가 아니면 그 종류(네트워크 폴더의 라우터·유동 IP) */
+  memberKind?: MemberKind;
+}
+
+/** 객체의 종류(옮기기 API·권한 대상) */
+export function memberKindOf(item: Foldered, kind: FolderKind): MemberKind {
+  return item.memberKind ?? MEMBER_KIND[kind];
 }
 
 export interface FolderTree {
@@ -104,10 +118,21 @@ export async function moveMembers(
   kind: MemberKind,
   keys: readonly string[],
 ) {
+  return moveItems(
+    folder,
+    keys.map((key) => ({ kind, key })),
+  );
+}
+
+/** 종류가 섞인 객체들을 옮긴다(네트워크 폴더의 네트워크·라우터·유동 IP). */
+export async function moveItems(
+  folder: string | null,
+  items: readonly { kind: MemberKind; key: string }[],
+) {
   const result = await call(
     api.POST("/folders/{id}/members", {
       params: { path: { id: folder ?? ROOT_ID } },
-      body: { items: keys.map((key) => ({ kind, key })) },
+      body: { items: [...items] },
     }),
   );
   return result.items;

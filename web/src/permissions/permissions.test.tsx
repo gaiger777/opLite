@@ -4,9 +4,9 @@ import { http, HttpResponse } from "msw";
 
 import { Permissions } from "@/auth/permissions";
 import { grantable } from "@/permissions/grants";
-import { PermissionsPanel } from "@/permissions/PermissionsPanel";
+import { PermissionsPanel, useObjectNames } from "@/permissions/PermissionsPanel";
 import { GroupsPage, RolesPage } from "@/permissions/SettingsPermissionsPage";
-import { folder, folderId } from "@/test/fixtures";
+import { floatingIpView, folder, folderId, routerView } from "@/test/fixtures";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -350,4 +350,25 @@ it("shows the server's reason when a grant is refused and confirms removing your
   await user.type(within(confirm).getByRole("textbox"), "teamA");
   await user.click(remove);
   await waitFor(() => expect(deleted).toEqual([MINE.id]));
+});
+
+it("names router and floating IP grants by their names", async () => {
+  // 리뷰 1 웹 M5: 라우터·유동 IP grant가 `router/1a2b3c4d`처럼 id 끝으로 보이지 않는다.
+  const r1 = routerView("r1");
+  const fip = floatingIpView("203.0.113.120", "ext");
+  server.use(
+    http.get(apiUrl("/routers"), () => HttpResponse.json({ revision: 1, items: [r1] })),
+    http.get(apiUrl("/floating-ips"), () => HttpResponse.json({ revision: 1, items: [fip] })),
+  );
+  mockLists({});
+  function Names() {
+    const name = useObjectNames();
+    return (
+      <p>
+        {name("router", r1.id) ?? "?"} {name("floating-ip", fip.id) ?? "?"}
+      </p>
+    );
+  }
+  renderPage(<Names />);
+  expect(await screen.findByText("r1 203-0-113-120")).toBeInTheDocument();
 });
