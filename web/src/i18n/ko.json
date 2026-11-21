@@ -4160,8 +4160,8 @@
       "exists": "있음",
       "create_one": "규칙 {{count}}개 만들기",
       "create_other": "규칙 {{count}}개 만들기",
-      "created_one": "SDN 경보 규칙 {{count}}개를 만들었습니다({{skipped}}개 건너뜀).",
-      "created_other": "SDN 경보 규칙 {{count}}개를 만들었습니다({{skipped}}개 건너뜀)."
+      "created_one": "SDN 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개).",
+      "created_other": "SDN 경보 규칙 {{count}}개를 만들었습니다(이미 있던 것 {{existing}}개)."
     }
   },
   "router": {

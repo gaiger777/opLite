@@ -4160,8 +4160,8 @@
       "exists": "exists",
       "create_one": "Create {{count}} rule",
       "create_other": "Create {{count}} rules",
-      "created_one": "Created {{count}} SDN alert rule ({{skipped}} skipped).",
-      "created_other": "Created {{count}} SDN alert rules ({{skipped}} skipped)."
+      "created_one": "Created {{count}} SDN alert rule; {{existing}} already existed.",
+      "created_other": "Created {{count}} SDN alert rules; {{existing}} already existed."
     }
   },
   "router": {

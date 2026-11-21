@@ -111,9 +111,9 @@ it("checks first and turns on only with force when peers are outside the allow l
   ]);
 });
 
-it("turns on the recommended SDN alert rules, skipping existing ones", async () => {
+it("turns on the recommended SDN alert rules with the server's sdn-defaults", async () => {
   sdn();
-  const sent: { name: string; spec: Record<string, unknown> }[] = [];
+  const sent: unknown[] = [];
   server.use(
     http.get(apiUrl("/alert-rules"), () =>
       HttpResponse.json({
@@ -157,10 +157,36 @@ it("turns on the recommended SDN alert rules, skipping existing ones", async () 
         ],
       }),
     ),
-    http.post(apiUrl("/alert-rules"), async ({ request }) => {
-      const body = (await request.json()) as { name: string; spec: Record<string, unknown> };
-      sent.push(body);
-      return HttpResponse.json({ ...body, id: "x", revision: 4, status: {} }, { status: 201 });
+    // 서버가 이미 있는 이름은 건너뛰고 만든 것과 있던 것을 알려 준다(여기서는 그새 하나가 더 생겼다).
+    http.post(apiUrl("/alert-rules/sdn-defaults"), async ({ request }) => {
+      sent.push(await request.json());
+      const rule = (name: string) => ({
+        id: `id-${name}`,
+        name,
+        revision: 4,
+        labels: {},
+        spec: {
+          condition: { kind: name.replaceAll("-", "_") },
+          enabled: true,
+          for_secs: 0,
+          severity: "warning",
+          targets: ["ops"],
+          repeat_secs: 14400,
+          send_resolved: true,
+        },
+        status: {},
+      });
+      return HttpResponse.json({
+        created: [
+          "sdn-central-down",
+          "sdn-chassis-down",
+          "sdn-gateway-unavailable",
+          "sdn-gateway-failover",
+          "sdn-sync-failed",
+          "sdn-physnet-not-ready",
+        ].map(rule),
+        existing: ["sdn-quorum-lost", "sdn-lb-member-down"],
+      });
     }),
   );
   const user = userEvent.setup();
@@ -172,23 +198,7 @@ it("turns on the recommended SDN alert rules, skipping existing ones", async () 
   expect(await within(dialog).findByText("Choose 1 to 16 notification targets.")).toBeVisible();
   await user.click(within(dialog).getByLabelText("ops"));
   await user.click(within(dialog).getByRole("button", { name: "Create 7 rules" }));
-  await waitFor(() => expect(sent).toHaveLength(7));
-  expect(sent.map((r) => r.name)).not.toContain("sdn-quorum-lost");
-  expect(sent.find((r) => r.name === "sdn-gateway-failover")).toEqual({
-    name: "sdn-gateway-failover",
-    spec: {
-      enabled: true,
-      condition: { kind: "sdn_gateway_failover" },
-      for_secs: 0,
-      severity: "info",
-      targets: ["ops"],
-      repeat_secs: 14400,
-      send_resolved: false,
-    },
-  });
-  expect(sent.find((r) => r.name === "sdn-sync-failed")?.spec).toMatchObject({
-    for_secs: 120,
-    severity: "warning",
-    send_resolved: true,
-  });
+  await waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent[0]).toEqual({ targets: ["ops"] });
+  expect(await screen.findByText("Created 6 SDN alert rules; 2 already existed.")).toBeVisible();
 });

@@ -105,22 +105,6 @@ export const SDN_DEFAULTS: readonly {
   { name: "sdn-lb-member-down", kind: "sdn_lb_member_down", severity: "warning", forSecs: 30 },
 ];
 
-/** 권하는 SDN 규칙 하나의 스펙(대상 `targets`, 나머지는 서버 기본값과 같다) */
-export function sdnDefaultSpec(
-  rule: (typeof SDN_DEFAULTS)[number],
-  targets: string[],
-): AlertRuleSpec {
-  return {
-    enabled: true,
-    condition: { kind: rule.kind } as AlertCondition,
-    for_secs: rule.forSecs,
-    severity: rule.severity,
-    targets,
-    repeat_secs: 14_400,
-    send_resolved: !isEvent(rule.kind),
-  };
-}
-
 /** `vms`로 거를 수 있는 조건(서버의 `about_vms`) */
 export function aboutVms(kind: ConditionKind): boolean {
   return kind === "vm_metric" || kind === "vm_failed" || kind === "ha_recovery";

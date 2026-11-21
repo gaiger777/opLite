@@ -6,8 +6,8 @@ import { Link } from "react-router";
 import { toast } from "sonner";
 
 import { useAlertRules, useNotificationTargets } from "@/alerts/alerts";
-import { isSdn, SDN_DEFAULTS, sdnDefaultSpec } from "@/alerts/rules";
-import { api, ApiError, call } from "@/api/client";
+import { isSdn, SDN_DEFAULTS } from "@/alerts/rules";
+import { api, call } from "@/api/client";
 import { usePermissions } from "@/auth/usePermissions";
 import { FormDialog } from "@/components/FormDialog";
 import { Button } from "@/components/ui/button";
@@ -15,8 +15,8 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 
 /**
- * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 고른 알림 대상으로 한 번에 만든다. 이미 있는 이름은 건너뛴다(만든
- * 뒤는 보통 규칙이라 경보 화면에서 고친다). 경보 규칙을 바꿀 수 있는(`alert.manage`) 사용자에게만 보인다.
+ * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 고른 알림 대상으로 한 번에 만든다(서버의
+ * `POST /alert-rules/sdn-defaults` — 이미 있는 이름은 서버가 건너뛴다). 만든 뒤는 보통 규칙이라 경보 화면에서 고친다. 경보 규칙을 바꿀 수 있는(`alert.manage`) 사용자에게만 보인다.
  */
 export function SdnAlertsCard() {
   const { t } = useTranslation();
@@ -74,28 +74,12 @@ function SdnDefaultsDialog({ taken, onClose }: { taken: string[]; onClose(): voi
       return false;
     }
     setError(null);
-    let made = 0;
-    let skipped = SDN_DEFAULTS.length - todo.length;
-    for (const rule of todo) {
-      try {
-        await call(
-          api.POST("/alert-rules", {
-            body: { name: rule.name, spec: sdnDefaultSpec(rule, chosen) },
-          }),
-        );
-        made += 1;
-      } catch (err) {
-        // 그새 누가 같은 이름을 만들었으면 건너뛴다. 다른 오류는 대화상자에 보인다.
-        if (err instanceof ApiError && err.status === 409) {
-          skipped += 1;
-          continue;
-        }
-        await queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
-        throw err;
-      }
-    }
+    // 오류는 대화상자에 보인다.
+    const out = await call(api.POST("/alert-rules/sdn-defaults", { body: { targets: chosen } }));
     await queryClient.invalidateQueries({ queryKey: ["alert-rules"] });
-    toast.success(t("sdn.alerts.created", { count: made, skipped }));
+    toast.success(
+      t("sdn.alerts.created", { count: out.created.length, existing: out.existing.length }),
+    );
   }
 
   return (

@@ -8,7 +8,6 @@ import {
   ruleFormOf,
   ruleSpecOf,
   SDN_DEFAULTS,
-  sdnDefaultSpec,
   takesNodes,
 } from "@/alerts/rules";
 
@@ -117,13 +116,4 @@ it("offers SDN conditions and filters nodes only on node subjects (plan 67)", ()
   expect(ruleSpecOf({ ...form, kind: "sdn_gateway_failover", forSecs: "60" }).for_secs).toBe(0);
   expect(CONDITION_KINDS.filter(isSdn)).toHaveLength(8);
   expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(CONDITION_KINDS.filter(isSdn).sort());
-  expect(sdnDefaultSpec(SDN_DEFAULTS[0]!, ["ops"])).toEqual({
-    enabled: true,
-    condition: { kind: "sdn_quorum_lost" },
-    for_secs: 0,
-    severity: "critical",
-    targets: ["ops"],
-    repeat_secs: 14400,
-    send_resolved: true,
-  });
 });

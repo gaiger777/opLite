@@ -58,6 +58,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/alert-rules/sdn-defaults": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 한 번에 만든다 — `sdn-quorum-lost` critical 0초,
+         *     `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info,
+         *     `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 같은 이름의
+         *     규칙이 있으면 건드리지 않는다. 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`sdn-services`를 알아야
+         *     한다.
+         */
+        post: operations["create_sdn_default_rules"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/alert-rules/{key}": {
         parameters: {
             query?: never;
@@ -11643,6 +11666,18 @@ export interface components {
             node: string;
             sdn?: components["schemas"]["NodeSdn"];
         };
+        /** @description `POST /alert-rules/sdn-defaults` 본문 */
+        SdnDefaultsRequest: {
+            /** @description 알릴 `NotificationTarget` 이름(1~16개) */
+            targets: string[];
+        };
+        /** @description `POST /alert-rules/sdn-defaults` 응답 */
+        SdnDefaultsResponse: {
+            /** @description 만든 규칙 */
+            created: components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"][];
+            /** @description 같은 이름의 규칙이 이미 있어 그대로 둔 것 */
+            existing: string[];
+        };
         /** @description `POST /sdn`: 노드 `node`에 첫 중앙을 세운다. */
         SdnInitRequest: {
             /**
@@ -13890,6 +13925,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_AlertRuleSpec_AlertRuleStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_sdn_default_rules: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnDefaultsRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SdnDefaultsResponse"];
                 };
             };
             "4XX": {
