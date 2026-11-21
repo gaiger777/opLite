@@ -21,6 +21,7 @@
 
 pub mod acl;
 pub mod lb;
+pub mod migration;
 pub mod nb;
 pub mod qos;
 
@@ -37,6 +38,7 @@ use opl_driver::ovn::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB,
 use opl_types::floating_ip::FloatingIpSpec;
 use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::network::NetworkSpec;
+use opl_types::network_migration::NetworkMigrationSpec;
 use opl_types::node::{Node, NodeSpec, SDN_SERVICES};
 use opl_types::resource::Kind;
 use opl_types::router::RouterSpec;
@@ -208,6 +210,10 @@ impl OvnSyncer {
             Ok((_, l)) => l,
             Err(e) => return SyncOutcome::Skipped(e.to_string()),
         };
+        let migrations = match cluster.list::<NetworkMigrationSpec>() {
+            Ok((_, m)) => m,
+            Err(e) => return SyncOutcome::Skipped(e.to_string()),
+        };
         self.seen = vms
             .iter()
             .map(|v| (v.id, nb::VmInputs::of(&v.spec, &v.status)))
@@ -216,7 +222,7 @@ impl OvnSyncer {
             .iter()
             .map(|n| (n.id, nb::NodeInputs::of(&n.spec, &n.status)))
             .collect();
-        let want = nb::desired_services(
+        let mut want = nb::desired_services(
             &networks,
             &vms,
             &nodes,
@@ -226,6 +232,8 @@ impl OvnSyncer {
             &lbs,
             &self.config.tag,
         );
+        // 옮기기 다리(계획 67 §9.5)
+        migration::add_bridges(&mut want, &migrations, &networks, &self.config.tag);
         let centrals = central_hosts(&sdn, &nodes);
         let old = sdn.status.sync.clone();
 
@@ -723,7 +731,8 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
                     | Kind::Router
                     | Kind::FloatingIp
                     | Kind::SecurityGroup
-                    | Kind::LoadBalancer,
+                    | Kind::LoadBalancer
+                    | Kind::NetworkMigration,
                 ..
             })
             | Ok(WatchEvent::Deleted {
@@ -735,7 +744,8 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
                     | Kind::Router
                     | Kind::FloatingIp
                     | Kind::SecurityGroup
-                    | Kind::LoadBalancer,
+                    | Kind::LoadBalancer
+                    | Kind::NetworkMigration,
                 ..
             }) => return,
             Ok(WatchEvent::Reset { .. }) | Err(_) => {
@@ -749,6 +759,8 @@ async fn changed(watch: &mut Option<Watch>, syncer: &OvnSyncer) {
 
 #[cfg(test)]
 mod acl_tests;
+#[cfg(test)]
+mod migration_tests;
 #[cfg(test)]
 mod routing_tests;
 #[cfg(test)]

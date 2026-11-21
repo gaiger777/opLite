@@ -1167,8 +1167,16 @@ async fn removed_node_section(fleet: &Fleet) {
         }
     }
     wait_for("c2's chassis to leave the SB", AGENT_WAIT, || async {
-        let names = c1.ovn_bare("ovn-sbctl", "sb", &["--columns=name", "list", "Chassis"]);
-        !names.is_empty() && !names.contains(&c2.id)
+        // 내쫓은 뒤 c1의 SB는 팔로어이거나 로컬 소켓이 답하지 않을 수 있다(탐침에서 본 "database connection failed",
+        // §4의 leader-only) — 남은 중앙 어느 쪽에서든 leader-only 없이 읽는다.
+        [c1, c3].iter().any(|n| {
+            let names = n.ovn_bare(
+                "ovn-sbctl",
+                "sb",
+                &["--no-leader-only", "--columns=name", "list", "Chassis"],
+            );
+            !names.is_empty() && !names.contains(&c2.id)
+        })
     })
     .await;
     // 남은 둘은 그대로다.

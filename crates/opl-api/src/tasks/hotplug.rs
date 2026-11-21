@@ -13,6 +13,7 @@ use opl_driver::AddOutcome;
 use opl_reconciler::cpu::CpuContext;
 use opl_reconciler::resolve::{runtime_disk, runtime_medium, runtime_nic};
 use opl_types::hotplug::{self, Step};
+use opl_types::network::NetworkSpec;
 use opl_types::node::{NodeHotplug, NodeSpec};
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::task::Task;
@@ -29,6 +30,9 @@ const SKIPPED: &str = "not tried because an earlier change failed";
 const VCPU_REFUSED: &str = "the guest does not support vCPU removal yet; restart the VM to apply";
 /// 스펙의 장치 목록을 되돌렸을 때 오류 끝에 붙인다.
 const UNDONE: &str = "; the change was undone";
+/// 단순 NIC를 SDN으로 옮긴 뒤 ovn-controller가 포트를 켜기(`ovn-installed`)를 기다리는 한도(계획 67 §9.4). 스펙을 쓴 뒤 리더
+/// OvnSync가 논리 포트를 만들고 이 노드가 바인딩하기까지다 — 마이그레이션 받기(30초)와 같다.
+const RELINK_WAIT: Duration = Duration::from_secs(30);
 /// Task 도중 QEMU가 바뀐 오류
 const MOVED: &str =
     "the VM was restarted or moved while its hardware was being changed; nothing was undone";
@@ -88,7 +92,8 @@ async fn run(
     caps: NodeHotplug,
 ) -> Result<Option<String>, Stop> {
     let id = vm.id;
-    let plan = match hotplug::plan(vm.id, &vm.name, &vm.spec, &hw, caps) {
+    let relink = relinkable(ctx, &vm.spec, &hw)?;
+    let plan = match hotplug::plan_relink(vm.id, &vm.name, &vm.spec, &hw, caps, &relink) {
         Ok(plan) => plan,
         Err(e) => {
             // 스펙이 도는 장치와 실행 중에 맞출 수 없게 어긋났다. 장치 목록을 되돌리고 보류를 다시 셈한다. 함께 바뀐
@@ -128,6 +133,25 @@ async fn run(
         None if hw.pending.is_empty() => Ok(None),
         None => Ok(Some(pending_warning(&hw.pending))),
     }
+}
+
+/// 실행 중에 네트워크를 단순 ↔ SDN으로 옮길 NIC(계획 67 §9.4 — 옮기기 도구만 그런 스펙을 쓴다, 일반 `PUT`은 409
+/// `nic_network_live`)
+fn relinkable(
+    ctx: &Ctx,
+    spec: &VmSpec,
+    hw: &RunningHardware,
+) -> Result<std::collections::BTreeSet<usize>, String> {
+    let (_, networks) = ctx
+        .cluster
+        .list::<NetworkSpec>()
+        .map_err(|e| format!("cannot read the networks: {e}"))?;
+    Ok(hotplug::relinkable(spec, hw, |name| {
+        networks
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.spec.is_sdn())
+    }))
 }
 
 /// 하지 않은 vCPU·메모리 단계의 `failed` 보류("not tried …")
@@ -465,6 +489,48 @@ async fn apply(
             *hw = update_hardware(ctx, id, qemu, |hw, _| {
                 if let Some(n) = hw.nics.get_mut(index) {
                     n.qos = wanted;
+                }
+            })
+            .await?;
+            Ok(())
+        }
+        Step::RelinkNic(index) => {
+            let nic = vm.spec.nics[index].clone();
+            let from = hw.nics[index].network.clone();
+            let not_moved = |e: &dyn std::fmt::Display| {
+                format!(
+                    "NIC {index} of VM {:?} was not moved from network {from:?} to {:?}: {e}",
+                    vm.name, nic.network
+                )
+            };
+            // 지금 도는 NIC의 런타임 정의(기록의 NIC로 푼 것)와 옮겨 갈 것
+            let mut running = vm.clone();
+            running.spec.nics[index] = hw.nics[index].clone();
+            let old = runtime_nic(&ctx.cluster, &running, index).map_err(|e| not_moved(&e))?;
+            let new = runtime_nic(&ctx.cluster, vm, index).map_err(|e| not_moved(&e))?;
+            // 보안 그룹을 건 NIC를 Linux 브리지로 되돌리면 그 tap의 nftables 규칙을 먼저 넣는다(AddNic과 같다).
+            let to_plain = matches!(
+                &new.backend,
+                opl_types::runtime::NicBackend::Tap { ovn_port: None, .. }
+            );
+            if to_plain && !nic.security_groups.is_empty() {
+                let Some(gate) = &ctx.config.firewall else {
+                    return Err(Stop::Failed(not_moved(
+                        &"this node has no firewall (nftables)",
+                    )));
+                };
+                gate.sync()
+                    .await
+                    .map_err(|e| not_moved(&format!("firewall: {e}")))?;
+                same_qemu(ctx, id, qemu)?;
+            }
+            ctx.hv
+                .relink_nic(id, index, &old, &new, RELINK_WAIT)
+                .await
+                .map_err(|e| not_moved(&e))?;
+            *hw = update_hardware(ctx, id, qemu, |hw, _| {
+                if let Some(n) = hw.nics.get_mut(index) {
+                    *n = nic.clone();
                 }
             })
             .await?;

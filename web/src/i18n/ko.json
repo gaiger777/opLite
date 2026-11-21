@@ -341,7 +341,8 @@
       "sdn-central-remove": "{{node}}의 OVN 중앙 빼기",
       "sdn-central-kick": "{{node}}에서 {{kicked}}을(를) OVN 중앙 데이터베이스에서 내쫓기",
       "sdn-chassis-install": "{{node}}에 OVN chassis 설치",
-      "sdn-lockdown": "OVN 접근 잠금 바꾸기({{node}}에서)"
+      "sdn-lockdown": "OVN 접근 잠금 바꾸기({{node}}에서)",
+      "network-migrate": "네트워크 옮기기 {{target}}: {{step}}"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",

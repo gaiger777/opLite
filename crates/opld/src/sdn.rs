@@ -15,13 +15,15 @@
 //! - 이 노드가 중앙이고 자기 SB가 Raft 리더면 클러스터에 없는 노드의 SB `Chassis`·`Chassis_Private`를 로컬 소켓으로
 //!   지운다(계획 67 §10.2 — 리더 OvnSync에서 옮겨 옴, 모든 노드가 `sdn-services`를 알 때만). NB·SB에 붙은 상대 주소를
 //!   읽어 알린다(잠금 미리 확인).
+//! - 이 노드가 단순 → SDN 옮기기의 다리 노드면(끝나지 않은 `NetworkMigration`의 `status.bridge.node`, 계획 67 §9.5) 그 임시
+//!   physnet `mig<h8>`을 원본 네트워크의 Linux 브리지에 같은 physnet 길로 잇고 알린다(관리자 설정 `NodeSpec.sdn`은 그대로).
 //! - 읽은 상태(`NodeSdn`)는 [`SdnReport`]에 두고 검사 루프(`checks.rs`)가 저장된 값과 다를 때만, 모든 노드가 `sdn`을 알릴
 //!   때만 노드 상태에 쓴다(계획 63·64와 같은 까닭).
 //!
 //! 언제: 시작, `Sdn` 리소스나 노드(이 노드의 underlay·`NodeSpec.sdn`, 허용 집합, 중앙의 상태)가 바뀔 때(1초 모아 한 번),
 //! 그리고 `refresh`마다(기본 60초).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,7 +33,8 @@ use opl_cluster::types::NodeId;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::ovn::lockdown::{LockdownRole, ruleset};
 use opl_driver::ovn::{Chassis, ChassisProbe, Db, OvnHost};
-use opl_types::network::tap_name;
+use opl_types::network::{NetworkSpec, tap_name};
+use opl_types::network_migration::NetworkMigrationSpec;
 use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::Kind;
 use opl_types::sdn::{
@@ -158,6 +161,46 @@ struct Inputs {
     sets: AllowSets,
     nodes: Vec<Uuid>,
     health: Vec<(Uuid, bool, Option<CentralHealth>)>,
+    /// 이 노드가 놓을 옮기기 다리(physnet → 원본 Linux 브리지)
+    bridges: BTreeMap<String, String>,
+}
+
+/// 이 노드 `node`가 다리 노드인 끝나지 않은 옮기기의 physnet → 원본 네트워크의 Linux 브리지(계획 67 §9.5)
+fn migration_physnets(cluster: &Cluster, node: Uuid) -> BTreeMap<String, String> {
+    let (Ok((_, migrations)), Ok((_, networks))) = (
+        cluster.list::<NetworkMigrationSpec>(),
+        cluster.list::<NetworkSpec>(),
+    ) else {
+        return BTreeMap::new();
+    };
+    migrations
+        .iter()
+        .filter(|m| !m.status.is_done())
+        .filter_map(|m| {
+            let b = m.status.bridge.as_ref().filter(|b| b.node == node)?;
+            let source = networks
+                .iter()
+                .find(|n| n.name == m.spec.source && !n.spec.is_sdn())?;
+            Some((b.physnet.clone(), source.spec.bridge_name()))
+        })
+        .collect()
+}
+
+/// 관리자 physnet 설정 `config`에 옮기기 다리 `bridges`를 더한 것(다리가 없으면 `config` 그대로)
+fn with_bridges(
+    config: Option<&NodeSdnConfig>,
+    bridges: &BTreeMap<String, String>,
+) -> Option<NodeSdnConfig> {
+    if bridges.is_empty() {
+        return config.cloned();
+    }
+    let mut c = config.cloned().unwrap_or_default();
+    for (physnet, bridge) in bridges {
+        c.physnets
+            .entry(physnet.clone())
+            .or_insert_with(|| bridge.clone());
+    }
+    Some(c)
 }
 
 /// 마지막으로 넣은 허용 목록(빠른 길이 쓴다): 글과 이 노드의 몫
@@ -289,6 +332,7 @@ impl Agent {
             pending: sdn.status.pending,
             underlay: me.status.underlay,
             config: me.spec.sdn,
+            bridges: migration_physnets(&self.cluster, self.node),
         })
     }
 
@@ -380,7 +424,11 @@ impl Agent {
         };
 
         // physnet 연결과 게이트웨이 표시(계획 66 §7): 이 클러스터의 chassis일 때만
-        let wanted = me.spec.sdn.as_ref();
+        let wanted = with_bridges(
+            me.spec.sdn.as_ref(),
+            &migration_physnets(&self.cluster, self.node),
+        );
+        let wanted = wanted.as_ref();
         let (physnets, gateway) = if configured {
             match Box::pin(host.reconcile_physnets(wanted)).await {
                 Ok(report) => {
@@ -802,11 +850,11 @@ async fn changed(watch: &mut Option<Watch>) {
         match w.next().await {
             Ok(
                 WatchEvent::Put {
-                    kind: Kind::Sdn | Kind::Node,
+                    kind: Kind::Sdn | Kind::Node | Kind::NetworkMigration,
                     ..
                 }
                 | WatchEvent::Deleted {
-                    kind: Kind::Sdn | Kind::Node,
+                    kind: Kind::Sdn | Kind::Node | Kind::NetworkMigration,
                     ..
                 },
             ) => return,
@@ -1209,6 +1257,114 @@ mod tests {
             .update_spec(node, None, me.labels, &spec)
             .await
             .unwrap();
+    }
+
+    /// 계획 67 §9.5: 다리 노드는 옮기기의 physnet을 원본 Linux 브리지에 같은 physnet 길로 잇고 알린다(관리자 설정에 더함).
+    /// 다른 노드의 다리는 놓지 않는다.
+    #[tokio::test]
+    async fn lays_the_migration_bridge_on_its_node() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.1.0.5").await;
+        create_sdn(
+            &s.cluster,
+            SdnStatus {
+                phase: SdnPhase::Ready,
+                centrals: vec![SdnCentral {
+                    node: Uuid::nil(),
+                    address: "10.0.0.2".parse().unwrap(),
+                }],
+                ..SdnStatus::default()
+            },
+        )
+        .await;
+        let lan = Resource::new(
+            "lan",
+            serde_json::from_value::<NetworkSpec>(serde_json::json!({ "bridge": "oplmig0" }))
+                .unwrap(),
+        );
+        s.cluster.create(&lan).await.unwrap();
+        let mut m: opl_types::network_migration::NetworkMigration = Resource::new(
+            "m",
+            serde_json::from_value(serde_json::json!({ "source": "lan", "target": "t-lan" }))
+                .unwrap(),
+        );
+        let physnet = opl_types::sdn::migration_physnet(TAG, m.id);
+        // 다른 노드의 다리는 이 노드가 놓지 않는다.
+        m.status.bridge = Some(opl_types::network_migration::MigrationBridge {
+            node: Uuid::now_v7(),
+            physnet: physnet.clone(),
+        });
+        s.cluster.create(&m).await.unwrap();
+        assert!(s.agent.inputs().unwrap().bridges.is_empty());
+        let mut status = m.status.clone();
+        status.bridge.as_mut().unwrap().node = node;
+        s.cluster
+            .update_status::<NetworkMigrationSpec>(m.id, &status)
+            .await
+            .unwrap();
+        assert_eq!(
+            s.agent.inputs().unwrap().bridges,
+            [(physnet.clone(), "oplmig0".to_string())].into()
+        );
+        // 관리자 설정에 다리를 더한다(게이트웨이는 그대로, 다리가 없으면 설정 그대로).
+        let admin = NodeSdnConfig {
+            physnets: [("ext".to_string(), "vmbr1".to_string())].into(),
+            gateway: Some(10),
+        };
+        let both = with_bridges(Some(&admin), &s.agent.inputs().unwrap().bridges).unwrap();
+        assert_eq!(both.physnets.len(), 2);
+        assert_eq!(both.gateway, Some(10));
+        assert_eq!(with_bridges(Some(&admin), &BTreeMap::new()), Some(admin));
+        assert_eq!(with_bridges(None, &BTreeMap::new()), None);
+
+        let f = &s.runner.fake;
+        f.reply("ovn-controller --version", CmdOutput::ok(OVN_VERSION));
+        f.reply("ovs-vsctl --version", CmdOutput::ok(OVS_VERSION));
+        f.reply(
+            "ovs-vsctl --format=json --columns=external_ids",
+            ids(&[(opl_driver::ovn::TAG_KEY, TAG)]),
+        );
+        let empty = |headings: serde_json::Value| {
+            CmdOutput::ok(serde_json::json!({ "data": [], "headings": headings }).to_string())
+        };
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,external_ids find Bridge",
+            empty(serde_json::json!(["name", "external_ids"])),
+        );
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,ofport,external_ids",
+            empty(serde_json::json!(["name", "ofport", "external_ids"])),
+        );
+        f.reply(
+            "ip -j link show",
+            CmdOutput::ok(r#"[{"ifname":"oplmig0","mtu":1500,"flags":["UP"]}]"#),
+        );
+        f.reply(
+            "ip -j -d link show type bridge",
+            CmdOutput::ok(
+                r#"[{"ifname":"oplmig0","mtu":1500,"linkinfo":{"info_kind":"bridge","info_data":{"vlan_filtering":0}}}]"#,
+            ),
+        );
+        s.agent.tick().await;
+        let report = s.agent.report.get().unwrap();
+        assert_eq!(report.physnets.len(), 1, "{report:?}");
+        assert_eq!(report.physnets[0].name, physnet);
+        assert!(report.physnets[0].ready, "{report:?}");
+        let (_, veth, bridge) = opl_types::sdn::physnet_ifnames(TAG, &physnet);
+        let calls = f.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.starts_with("ip link add") && c.contains(&veth)),
+            "{calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.contains(&format!(
+                "external_ids:ovn-bridge-mappings=\"{physnet}:{bridge}\""
+            ))),
+            "{calls:?}"
+        );
     }
 
     /// 계획 66 §7: 이 클러스터의 chassis면 `NodeSpec.sdn`의 physnet을 잇고 게이트웨이를 표시해 알린다. chassis가 아니면

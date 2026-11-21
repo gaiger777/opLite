@@ -42,6 +42,9 @@ pub enum Step {
     /// 그대로 남는 NIC `index`의 QoS(계획 67 §8)를 스펙의 것으로 맞춘다. 장치 변경이 아니다(QEMU는 그대로) — 단순 NIC는
     /// tap의 tc를 바꾸고, SDN NIC는 OVN `QoS` 행(리더 OvnSync)이 하므로 기록만 고친다.
     SetNicQos(usize),
+    /// 그대로 남는 NIC `index`의 네트워크를 단순 ↔ SDN으로 바꾼다(계획 67 §9.4 — 옮기기 도구의 `live`): QEMU 장치는 그대로
+    /// 두고 tap을 Linux 브리지에서 `br-int`로(또는 거꾸로) 옮긴다. [`relinkable`]이 고른 NIC에만 낸다.
+    RelinkNic(usize),
 }
 
 /// 스펙에 맞추는 계획: 바로 할 단계와 다음 재시작 때 적용할 변경
@@ -212,6 +215,70 @@ impl RunningHardware {
 /// VM `id`(이름 `name`)를 스펙 `spec`에 맞추는 계획. 이 노드의 능력은 `caps`다. 디스크·NIC를 실행 중에 바꿀 수
 /// 없으면 오류다.
 pub fn plan(
+    id: Uuid,
+    name: &str,
+    spec: &VmSpec,
+    hw: &RunningHardware,
+    caps: NodeHotplug,
+) -> Result<Plan, DeviceError> {
+    plan_relink(id, name, spec, hw, caps, &BTreeSet::new())
+}
+
+/// 실행 중에 네트워크를 바꿀 수 있는 NIC(계획 67 §9.4 `RelinkNic`)의 순번: 스펙과 기록의 같은 순번 NIC가 MAC·모델이 같고
+/// 네트워크만 단순 ↔ SDN으로 바뀌었다(`is_sdn`이 둘 다 아는 네트워크 — 모르는 네트워크·user NIC는 None). 게스트가 아직 내려
+/// 주지 않은 NIC는 빠진다. 그 밖의 네트워크 바꾸기는 여전히 [`DeviceError::Changed`]다(§16).
+pub fn relinkable(
+    spec: &VmSpec,
+    hw: &RunningHardware,
+    is_sdn: impl Fn(&str) -> Option<bool>,
+) -> BTreeSet<usize> {
+    spec.nics
+        .iter()
+        .zip(&hw.nics)
+        .enumerate()
+        .filter(|(i, (want, now))| {
+            want.mac.is_some()
+                && want.mac == now.mac
+                && want.model == now.model
+                && want.network != now.network
+                && !hw.unplugging.contains(&format!("nic{i}"))
+                && matches!((is_sdn(&want.network), is_sdn(&now.network)), (Some(a), Some(b)) if a != b)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// [`plan`]에 실행 중 네트워크를 바꿀 NIC `relink`([`relinkable`])를 더한 것: 그 NIC는 떼고 붙이지 않고 `RelinkNic` 단계다
+/// (장치 변경 검사에서는 바뀐 것으로 보지 않는다).
+pub fn plan_relink(
+    id: Uuid,
+    name: &str,
+    spec: &VmSpec,
+    hw: &RunningHardware,
+    caps: NodeHotplug,
+    relink: &BTreeSet<usize>,
+) -> Result<Plan, DeviceError> {
+    if relink.is_empty() {
+        return plan_devices(id, name, spec, hw, caps);
+    }
+    let mut view = hw.clone();
+    for &i in relink {
+        if let (Some(now), Some(want)) = (view.nics.get_mut(i), spec.nics.get(i)) {
+            *now = want.clone();
+        }
+    }
+    let mut plan = plan_devices(id, name, spec, &view, caps)?;
+    let at = plan
+        .steps
+        .iter()
+        .position(|s| !matches!(s, Step::RemoveNic(_) | Step::RemoveDisk(_)))
+        .unwrap_or(plan.steps.len());
+    plan.steps
+        .splice(at..at, relink.iter().map(|&i| Step::RelinkNic(i)));
+    Ok(plan)
+}
+
+fn plan_devices(
     id: Uuid,
     name: &str,
     spec: &VmSpec,
@@ -2385,5 +2452,56 @@ mod tests {
         assert_eq!(memory.reason, PendingReason::Unsupported);
         assert_eq!(memory.detail.as_deref(), Some(NO_PREALLOC));
         assert!(!pending.iter().any(|p| p.field == "max_memory_mib"));
+    }
+
+    /// 계획 67 §9.4: 같은 NIC의 네트워크만 단순 ↔ SDN으로 바뀌면 `RelinkNic`(QoS 단계 없이), 단순 ↔ 단순·모델이 다르면
+    /// 여전히 장치 변경 거절이다. 켤 때 단 NIC도 된다(QEMU 장치는 그대로).
+    #[test]
+    fn relinking_a_nic_between_simple_and_sdn_is_a_step() {
+        let mut s = spec();
+        s.nics.push(nic(2));
+        let caps = NodeHotplug::default();
+        let mut hw = started(&s, caps);
+        hw.nics = s.nics.clone();
+        let is_sdn = |n: &str| match n {
+            "lan" | "lan2" => Some(false),
+            "t-lan" => Some(true),
+            _ => None,
+        };
+        let mut moved = s.clone();
+        moved.nics[0].network = "t-lan".into();
+        moved.nics[0].ips = vec!["10.0.0.5".parse().unwrap()];
+        moved.nics[0].qos = Some(crate::qos::NicQos {
+            out_mbps: Some(10),
+            in_mbps: None,
+            burst_kbit: None,
+            dscp: None,
+        });
+        let relink = relinkable(&moved, &hw, is_sdn);
+        assert_eq!(relink, BTreeSet::from([0]));
+        let p = plan_relink(Uuid::nil(), "vm", &moved, &hw, caps, &relink).unwrap();
+        assert_eq!(p.steps, [Step::RelinkNic(0)]);
+        // 그냥 계획은 여전히 거절한다(일반 PUT의 길).
+        assert!(matches!(
+            plan(Uuid::nil(), "vm", &moved, &hw, caps),
+            Err(DeviceError::Changed(_))
+        ));
+        // 되돌리기(SDN → 단순)도 같다.
+        let mut back_hw = hw.clone();
+        back_hw.nics = moved.nics.clone();
+        assert_eq!(relinkable(&s, &back_hw, is_sdn), BTreeSet::from([0]));
+        // 단순 ↔ 단순, 모델이 바뀜, 모르는 네트워크, 떼는 중은 아니다.
+        let mut other = s.clone();
+        other.nics[0].network = "lan2".into();
+        assert!(relinkable(&other, &hw, is_sdn).is_empty());
+        let mut model = moved.clone();
+        model.nics[0].model = NicModel::E1000e;
+        assert!(relinkable(&model, &hw, is_sdn).is_empty());
+        let mut unknown = s.clone();
+        unknown.nics[0].network = "gone".into();
+        assert!(relinkable(&unknown, &hw, is_sdn).is_empty());
+        let mut held = hw.clone();
+        held.unplugging = vec!["nic0".into()];
+        assert!(relinkable(&moved, &held, is_sdn).is_empty());
     }
 }

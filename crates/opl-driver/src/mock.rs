@@ -166,6 +166,12 @@ pub enum HotplugCall {
         index: usize,
         qos: Option<opl_types::qos::NicQos>,
     },
+    /// NIC `index`의 tap을 다른 브리지로(계획 67 §9.4 — `to_ovn`이면 OVS `br-int`)
+    RelinkNic {
+        id: Uuid,
+        index: usize,
+        to_ovn: bool,
+    },
 }
 
 /// 실행 중인 VM의 핫플러그 상태(켤 때 런타임 스펙에서 정하고 핫플러그 호출이 바꾼다)
@@ -1078,7 +1084,8 @@ impl MockHypervisor {
             | HotplugCall::AddNic { id, .. }
             | HotplugCall::RemoveNic { id, .. }
             | HotplugCall::ChangeMedium { id, .. }
-            | HotplugCall::SetNicQos { id, .. } => id,
+            | HotplugCall::SetNicQos { id, .. }
+            | HotplugCall::RelinkNic { id, .. } => id,
         };
         st.hotplug_calls.push(call);
         Self::controllable(st, id)?;
@@ -2461,6 +2468,26 @@ impl Hypervisor for MockHypervisor {
         };
         let mut st = self.state.lock().unwrap();
         Self::hotplug_call(&mut st, HotplugCall::SetNicQos { id, index, qos })
+    }
+
+    async fn relink_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        from: &RuntimeNic,
+        to: &RuntimeNic,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        let _ = (from, timeout);
+        let to_ovn = matches!(
+            &to.backend,
+            opl_types::runtime::NicBackend::Tap {
+                ovn_port: Some(_),
+                ..
+            }
+        );
+        let mut st = self.state.lock().unwrap();
+        Self::hotplug_call(&mut st, HotplugCall::RelinkNic { id, index, to_ovn })
     }
 
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {

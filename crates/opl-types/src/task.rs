@@ -289,6 +289,18 @@ pub enum TaskOp {
     SdnLockdown {
         enabled: bool,
     },
+    /// 단순 → SDN 옮기기(계획 67 §9)의 한 걸음: `start`(VM을 하나씩 옮김 — 멈춘 옮기기를 이어서 함), `rollback`(옮긴 VM을
+    /// 원본으로 — `vms`가 비면 모두), `finish`(다리를 걷고 `router`가 있으면 대상 네트워크를 그 라우터에 붙임). 대상은
+    /// `NetworkMigration` 리소스이고 실행 노드는 요청을 받은 노드다. VM마다 상태를 리소스에 적어 opld가 다시 떠도 이어서 한다.
+    NetworkMigrate {
+        step: crate::network_migration::MigrationStep,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        vms: Vec<Uuid>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        router: Option<String>,
+    },
 }
 
 impl TaskOp {
@@ -339,6 +351,14 @@ impl TaskOp {
     /// vTPM 기능(계획 59, `node::VTPM`)을 모르는 노드가 풀지 못하는 Task인지
     pub fn needs_vtpm(&self) -> bool {
         matches!(self, TaskOp::VmFirmwareReset { .. })
+    }
+
+    /// SDN 서비스 기능(계획 67, `node::SDN_SERVICES`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_sdn_services(&self) -> bool {
+        matches!(
+            self,
+            TaskOp::SdnLockdown { .. } | TaskOp::NetworkMigrate { .. }
+        )
     }
 }
 
@@ -926,6 +946,43 @@ mod tests {
         }
         assert!(!TaskOp::CephInit.is_sdn());
         assert!(!TaskOp::VmHotplug.is_sdn());
+    }
+
+    /// 옮기기 Task(계획 67 §9): 빈 VM 목록·라우터는 쓰지 않는다.
+    #[test]
+    fn network_migrate_op_round_trips() {
+        use crate::network_migration::MigrationStep;
+        let vm = Uuid::from_u128(7);
+        for (op, json) in [
+            (
+                TaskOp::NetworkMigrate {
+                    step: MigrationStep::Start,
+                    vms: vec![],
+                    router: None,
+                },
+                serde_json::json!({ "kind": "network-migrate", "step": "start" }),
+            ),
+            (
+                TaskOp::NetworkMigrate {
+                    step: MigrationStep::Rollback,
+                    vms: vec![vm],
+                    router: None,
+                },
+                serde_json::json!({ "kind": "network-migrate", "step": "rollback", "vms": [vm] }),
+            ),
+            (
+                TaskOp::NetworkMigrate {
+                    step: MigrationStep::Finish,
+                    vms: vec![],
+                    router: Some("r1".into()),
+                },
+                serde_json::json!({ "kind": "network-migrate", "step": "finish", "router": "r1" }),
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+            assert!(op.needs_sdn_services() && !op.is_sdn(), "{op:?}");
+        }
     }
 
     #[test]

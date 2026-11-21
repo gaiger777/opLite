@@ -527,6 +527,19 @@ pub trait Hypervisor: Send + Sync {
         nic: &RuntimeNic,
     ) -> Result<(), DriverError>;
 
+    /// 실행 중인 VM의 `index`번째 NIC를 런타임 정의 `from`(지금 도는 것)에서 `to`로 옮긴다(계획 67 §9.4 `RelinkNic`): QEMU
+    /// 장치는 그대로 두고 tap을 Linux 브리지에서 OVS `br-int`로(또는 거꾸로) 옮긴다. SDN 쪽으로 옮기면 ovn-controller가 포트를
+    /// 켤 때까지(`ovn-installed`) `timeout`까지 기다리고, 오지 않으면 tap을 원래 브리지로 되돌리고 실패한다. 옮긴 뒤 QMP
+    /// `set_link`로 링크를 내렸다 올려 게스트가 DHCP를 다시 묻게 한다. 둘 다 이 VM의 같은 순번 tap이어야 한다.
+    async fn relink_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        from: &RuntimeNic,
+        to: &RuntimeNic,
+        timeout: Duration,
+    ) -> Result<(), DriverError>;
+
     /// 이 노드가 켠 VM의 하드웨어 기록(`status.hardware`, 핫플러그 배치 포함)을 VM 실행 디렉터리에 남긴다(QMP
     /// 소켓 옆 `hardware.json`). QEMU가 끝나면 실행 디렉터리와 함께 지워진다. VM이 없으면 `NotRunning`.
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError>;

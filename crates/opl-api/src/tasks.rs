@@ -12,6 +12,7 @@ mod firmware;
 mod hotplug;
 mod import;
 mod migrate;
+pub(crate) mod network_migrate;
 mod replicate;
 pub(crate) mod sdn;
 mod snapshot;
@@ -73,6 +74,10 @@ pub(crate) async fn create_task(
     // 펌웨어 초기화 Task는 옛 노드가 풀지 못한다(계획 59).
     if op.needs_vtpm() {
         crate::cluster::require_feature(cluster, opl_types::node::VTPM)?;
+    }
+    // 잠금·옮기기 Task도 옛 노드가 풀지 못한다(계획 67).
+    if op.needs_sdn_services() {
+        crate::cluster::require_feature(cluster, opl_types::node::SDN_SERVICES)?;
     }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
@@ -626,6 +631,8 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     match task.spec.op {
         TaskOp::BackupRestore { backup, .. } => return Some(backup),
         TaskOp::VmImport { import, .. } => return Some(import),
+        // 옮기기의 걸음은 그 옮기기의 줄에서 차례로(계획 67)
+        TaskOp::NetworkMigrate { .. } => return Some(target),
         _ => {}
     }
     if !matches!(
@@ -692,7 +699,12 @@ fn start(
         if let Some(previous) = previous {
             let _ = previous.await;
         }
-        if interrupted && task.spec.op != TaskOp::NodeUpgrade {
+        // 옮기기 Task(계획 67 §9.4)는 VM마다 상태를 리소스에 적으므로 다시 뜬 opld가 이어서 한다.
+        let resumes = matches!(
+            task.spec.op,
+            TaskOp::NodeUpgrade | TaskOp::NetworkMigrate { .. }
+        );
+        if interrupted && !resumes {
             let error = "interrupted: orbivisord restarted while the task was running".to_string();
             fail(&ctx, &task, error, true).await;
         } else {
@@ -732,7 +744,8 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::VolumeDownload { .. }
             | TaskOp::VolumeFlatten
     ) || task.spec.op.is_ceph()
-        || task.spec.op.is_sdn();
+        || task.spec.op.is_sdn()
+        || matches!(task.spec.op, TaskOp::NetworkMigrate { .. });
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -1038,6 +1051,10 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::SdnCentralKick { .. }
         | TaskOp::SdnChassisInstall
         | TaskOp::SdnLockdown { .. } => return sdn::perform(ctx, task).await,
+        // 단순 → SDN 옮기기(계획 67 §9). 원본에 남은 NIC·걷지 못한 다리는 경고로 남긴다.
+        TaskOp::NetworkMigrate { .. } => {
+            return Box::pin(network_migrate::perform(ctx, task)).await;
+        }
         TaskOp::VolumeDownload {
             url,
             sha256,

@@ -7817,6 +7817,11 @@ export interface components {
             /** Format: uuid */
             task: string;
         };
+        /**
+         * @description `network-migrate` Task의 걸음(계획 67 §9.4·§9.6·§9.7)
+         * @enum {string}
+         */
+        MigrationStep: "start" | "rollback" | "finish";
         MonReport: {
             /**
              * @description v2 주소(`10.0.0.1:3300`)
@@ -11740,6 +11745,12 @@ export interface components {
             enabled: boolean;
             /** @enum {string} */
             kind: "sdn-lockdown";
+        } | {
+            /** @enum {string} */
+            kind: "network-migrate";
+            router?: string;
+            step: components["schemas"]["MigrationStep"];
+            vms?: string[];
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

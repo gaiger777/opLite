@@ -917,6 +917,13 @@ impl QmpClient {
         self.execute("netdev_add", Some(args)).await.map(drop)
     }
 
+    /// NIC 장치 `name`(qdev id, 예: `nic0`)의 링크를 올리거나 내린다(`set_link` — 게스트가 링크 변화를 본다, 계획 67 §9.4).
+    pub async fn set_link(&self, name: &str, up: bool) -> Result<(), QmpError> {
+        self.execute("set_link", Some(json!({ "name": name, "up": up })))
+            .await
+            .map(drop)
+    }
+
     /// 네트워크 백엔드 `id`를 지운다.
     pub async fn netdev_del(&self, id: &str) -> Result<(), QmpError> {
         self.execute("netdev_del", Some(json!({ "id": id })))

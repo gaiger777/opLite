@@ -1326,6 +1326,7 @@ async fn write_spec(
         }
         if !is_stopped(&current) {
             check_running_ips(&current, &spec)?;
+            check_running_network(state, &current, &spec)?;
         }
         // Secure Boot는 꺼진 VM에서, UEFI 변수가 없을 때만 바꾼다(변수 초기화와 함께 바꾸기는
         // `POST /vms/{key}/firmware/reset`).
@@ -1612,6 +1613,42 @@ fn check_running_ips(current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
                 "vm_running",
                 format!(
                     "cannot change the addresses of NIC {i} of VM {:?} while it is running; stop it first",
+                    current.name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 실행 중인 VM NIC의 네트워크를 단순 ↔ SDN으로 바꾸기(같은 순번·MAC·모델)는 옮기기 도구만 한다(계획 67 §9.4 — tap만
+/// 옮기는 `RelinkNic`은 주소·다리·되돌리기를 함께 다루는 `network-migrate` Task의 몫): 409 `nic_network_live`.
+fn check_running_network(state: &AppState, current: &Vm, spec: &VmSpec) -> Result<(), ApiError> {
+    let changed: Vec<usize> = spec
+        .nics
+        .iter()
+        .zip(&current.spec.nics)
+        .enumerate()
+        .filter(|(_, (a, b))| a.mac.is_some() && a.mac == b.mac && a.network != b.network)
+        .map(|(i, _)| i)
+        .collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+    let sdn = |name: &str| {
+        networks
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.spec.is_sdn())
+    };
+    for i in changed {
+        let (to, from) = (&spec.nics[i].network, &current.spec.nics[i].network);
+        if matches!((sdn(to), sdn(from)), (Some(a), Some(b)) if a != b) {
+            return Err(ApiError::conflict(
+                "nic_network_live",
+                format!(
+                    "cannot move NIC {i} of running VM {:?} from network {from:?} to {to:?} by editing it; use `network migrate {from} --to {to}` (it carries the address over and moves the NIC live)",
                     current.name
                 ),
             ));

@@ -15,7 +15,7 @@ use crate::network::NetworkSpec;
 use crate::node::Node;
 use crate::resource::{Kind, Resource, ResourceSpec};
 use crate::sdn::ChassisState;
-use crate::vm::{MacAddr, Vm};
+use crate::vm::{MacAddr, Vm, VmSpec};
 
 pub type NetworkMigration = Resource<NetworkMigrationSpec, NetworkMigrationStatus>;
 
@@ -255,6 +255,19 @@ pub enum MoveState {
 pub struct MigrationBridge {
     pub node: Uuid,
     pub physnet: String,
+}
+
+/// `network-migrate` Task의 걸음(계획 67 §9.4·§9.6·§9.7)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum MigrationStep {
+    /// VM을 하나씩 옮긴다(멈춘·실패한 옮기기를 이어서 한다).
+    Start,
+    /// 옮긴(또는 실패한) VM을 원본으로 되돌린다.
+    Rollback,
+    /// 다리를 걷고 끝낸다(라우터 붙이기 포함).
+    Finish,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -540,6 +553,14 @@ pub fn plan(input: &PlanInput) -> MigrationPlan {
             } else {
                 None
             };
+            // 켜진 VM을 다시 켜거나 tap을 옮기는 일은 그 노드에서 한다 — chassis가 아니면 SDN NIC가 설 곳이 없다(먼저 chassis로
+            // 라이브 마이그레이션하거나 끈다). 꺼진 VM은 다음 켜기에서 스케줄러가 chassis를 고른다.
+            if pv.running && !chassis(vm.status.node) {
+                blockers.push(
+                    "the VM runs on a node that is not an SDN (OVN) chassis: migrate it to a chassis or stop it first"
+                        .to_string(),
+                );
+            }
             let mode = if !pv.running {
                 PlannedMode::Offline
             } else {
@@ -575,6 +596,14 @@ pub fn plan(input: &PlanInput) -> MigrationPlan {
                 warnings.push(format!(
                     "the MTU shrinks from {from_mtu} to {to_mtu} (DHCP guests get the new MTU)"
                 ));
+            }
+            // cloud-init 씨앗의 instance-id는 NIC 주소로도 셈한다(계획 65) — SDN 주소가 생기면 바뀌어 게스트가 다음 켜기에
+            // 인스턴스마다 하는 일(SSH 호스트 키 따위)을 다시 한다.
+            if vm.spec.cloud_init.is_some() {
+                warnings.push(
+                    "the cloud-init instance-id changes: on its next boot the guest runs its per-instance setup again (for example new SSH host keys)"
+                        .to_string(),
+                );
             }
             if nic.security_groups.is_empty() {
                 warnings.push(
@@ -701,6 +730,112 @@ fn plan_bridge(
             .to_string(),
     );
     b
+}
+
+// ---- 스펙 바꾸기(Task와 시험이 같은 함수) ----
+
+/// VM 스펙 `spec`의 NIC `nic`이 지금 옮기기 전 모습(되돌리기가 되살릴 것): 네트워크·보안 그룹·cloud-init 주소 항목(빈 항목은
+/// 없음으로)
+pub fn origin_of(spec: &VmSpec, nic: usize) -> Option<NicOrigin> {
+    let n = spec.nics.get(nic)?;
+    let cloud_init = spec
+        .cloud_init
+        .as_ref()
+        .and_then(|c| c.networks.get(nic))
+        .filter(|c| **c != CloudInitNet::default())
+        .cloned();
+    Some(NicOrigin {
+        network: n.network.clone(),
+        security_groups: n.security_groups.clone(),
+        cloud_init,
+    })
+}
+
+/// NIC `nic`을 대상 네트워크 `target`의 주소 `ips`로 옮긴다(§9.3): 네트워크·주소를 바꾸고 cloud-init 주소 항목을 비운다(SDN
+/// NIC의 주소는 IPAM이 정함 — 빈 `{}`로 두어 다른 NIC의 순번이 그대로다). MAC·모델·보안 그룹·`qos`는 그대로다.
+pub fn move_nic(spec: &mut VmSpec, nic: usize, target: &str, ips: &[IpAddr]) {
+    let Some(n) = spec.nics.get_mut(nic) else {
+        return;
+    };
+    n.network = target.to_string();
+    n.ips = ips.iter().map(|ip| ip.to_canonical()).collect();
+    if let Some(entry) = spec
+        .cloud_init
+        .as_mut()
+        .and_then(|c| c.networks.get_mut(nic))
+    {
+        *entry = CloudInitNet::default();
+    }
+}
+
+/// NIC `nic`을 옮기기 전 모습 `origin`으로 되돌린다(§9.6): 네트워크·보안 그룹·cloud-init 주소 항목을 되살리고 주소(IPAM)를
+/// 놓는다.
+pub fn restore_nic(spec: &mut VmSpec, nic: usize, origin: &NicOrigin) {
+    let Some(n) = spec.nics.get_mut(nic) else {
+        return;
+    };
+    n.network.clone_from(&origin.network);
+    n.ips.clear();
+    n.security_groups.clone_from(&origin.security_groups);
+    if let Some(entry) = &origin.cloud_init
+        && let Some(ci) = spec.cloud_init.as_mut()
+    {
+        if ci.networks.len() <= nic {
+            ci.networks.resize(nic + 1, CloudInitNet::default());
+        }
+        ci.networks[nic] = entry.clone();
+    }
+}
+
+/// VM 스펙에서 옮기기 NIC `m`(순번과 MAC이 같음)이 네트워크 `network`에 있는지
+pub fn nic_on(spec: &VmSpec, m: &VmMove, network: &str) -> bool {
+    spec.nics
+        .get(m.nic)
+        .is_some_and(|n| n.mac == Some(m.mac) && n.network == network)
+}
+
+impl VmMove {
+    /// 계획의 NIC 하나를 기록으로(MAC이 없는 NIC는 옮길 수 없어 빠진다). 상태는 `pending`이다.
+    pub fn planned(p: &PlannedNic, spec: &VmSpec) -> Option<VmMove> {
+        Some(VmMove {
+            vm: p.vm,
+            nic: p.nic,
+            mac: p.mac?,
+            mode: p.mode,
+            ips: p.ips.clone(),
+            address_source: p.address_source,
+            from: origin_of(spec, p.nic)?,
+            state: MoveState::Pending,
+            error: (!p.blockers.is_empty()).then(|| p.blockers.join("; ")),
+            at: None,
+        })
+    }
+}
+
+/// 만들 때 적은 기록 `recorded`와 그때 다시 한 계획 `now`가 다른 까닭(§9.2 — Task가 VM마다 옮기기 직전에 본다). 주소의
+/// 출처는 견주지 않는다(Task는 게스트 에이전트를 묻지 않고 적은 주소를 준 주소로 다시 계획한다). 같으면 None.
+pub fn plan_changed(recorded: &VmMove, now: &PlannedNic) -> Option<String> {
+    if now.mode == PlannedMode::Blocked {
+        return Some(format!("blocked: {}", now.blockers.join("; ")));
+    }
+    if now.mode != recorded.mode {
+        return Some(format!(
+            "the plan changed since the migration was created (mode {} is now {}): the VM's power or node changed",
+            kebab(recorded.mode),
+            kebab(now.mode)
+        ));
+    }
+    if recorded.address_source != AddressSource::Ipam && now.ips != recorded.ips {
+        return Some("the planned address changed since the migration was created".into());
+    }
+    None
+}
+
+fn kebab(v: impl Serialize) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1022,8 +1157,14 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("security groups"))
         );
-        // chassis가 아닌 노드 → restart
-        assert_eq!(by(12).mode, PlannedMode::Restart);
+        // 켜진 채 chassis가 아닌 노드 → 막힘(그 노드에서 SDN NIC를 켤 수 없다)
+        assert_eq!(by(12).mode, PlannedMode::Blocked);
+        assert!(
+            by(12)
+                .blockers
+                .iter()
+                .any(|b| b.contains("not an SDN (OVN) chassis"))
+        );
         assert_eq!(by(12).address_source, AddressSource::GuestAgent);
         // 템플릿은 막힌다.
         assert_eq!(by(13).mode, PlannedMode::Blocked);
@@ -1148,5 +1289,114 @@ mod tests {
         assert!(b.warnings[0].contains("provider network"));
         f.spec.bridge = Some(true);
         assert!(run(&f, &[], &[], &[], &[]).bridge.error.is_some());
+    }
+
+    /// 스펙 바꾸기(§9.3·§9.6): 옮기면 cloud-init 항목이 비고 되돌리면 되살아나며 주소를 놓는다. 다른 칸은 그대로다.
+    #[test]
+    fn move_and_restore_round_trip_the_nic() {
+        let v = vm(
+            1,
+            None,
+            json!([
+                { "network": "user", "model": "virtio", "mac": "52:54:00:00:00:09" },
+                { "network": "lan", "model": "e1000e", "mac": "52:54:00:00:00:01", "security_groups": ["web"] }
+            ]),
+            json!({ "cloud_init": { "networks": [{}, { "ipv4": { "mode": "static", "address": "10.0.0.5/24", "gateway": "10.0.0.1" } }] } }),
+        );
+        let before = v.spec.clone();
+        let origin = origin_of(&before, 1).unwrap();
+        assert_eq!(origin.network, "lan");
+        assert_eq!(origin.security_groups, ["web"]);
+        assert!(origin.cloud_init.is_some());
+        assert_eq!(origin_of(&before, 0).unwrap().cloud_init, None);
+        assert_eq!(origin_of(&before, 5), None);
+        let mut s = before.clone();
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        move_nic(&mut s, 1, "t-lan", &[ip]);
+        assert_eq!(s.nics[1].network, "t-lan");
+        assert_eq!(s.nics[1].ips, [ip]);
+        assert_eq!(s.nics[1].security_groups, ["web"]);
+        assert_eq!(s.nics[1].model, before.nics[1].model);
+        assert_eq!(
+            s.cloud_init.as_ref().unwrap().networks[1],
+            CloudInitNet::default()
+        );
+        assert_eq!(s.nics[0], before.nics[0]);
+        let m = VmMove {
+            vm: v.id,
+            nic: 1,
+            mac: "52:54:00:00:00:01".parse().unwrap(),
+            mode: PlannedMode::Offline,
+            ips: vec![ip],
+            address_source: AddressSource::CloudInit,
+            from: origin.clone(),
+            state: MoveState::Moving,
+            error: None,
+            at: None,
+        };
+        assert!(nic_on(&s, &m, "t-lan") && !nic_on(&s, &m, "lan"));
+        restore_nic(&mut s, 1, &origin);
+        assert_eq!(s, before);
+        // 되살릴 항목이 목록 밖이면 늘린다.
+        let mut short = before.clone();
+        short.cloud_init.as_mut().unwrap().networks.truncate(1);
+        restore_nic(&mut short, 1, &origin);
+        assert_eq!(short, before);
+    }
+
+    /// 다시 계획(§9.2): 막힘·방식·주소가 바뀌면 까닭, 주소 출처만 다르면(게스트 에이전트 → 준 주소) 같다.
+    #[test]
+    fn plan_changes_are_reported() {
+        let ip: IpAddr = "10.0.0.5".parse().unwrap();
+        let p = PlannedNic {
+            vm: id(1),
+            name: "vm1".into(),
+            nic: 0,
+            mac: Some("52:54:00:00:00:01".parse().unwrap()),
+            mode: PlannedMode::Live,
+            ips: vec![ip],
+            address_source: AddressSource::GuestAgent,
+            blockers: vec![],
+            warnings: vec![],
+        };
+        let v = vm(
+            1,
+            None,
+            json!([{ "network": "lan", "model": "virtio", "mac": "52:54:00:00:00:01" }]),
+            json!({}),
+        );
+        let m = VmMove::planned(&p, &v.spec).unwrap();
+        assert_eq!((m.state, m.error.clone()), (MoveState::Pending, None));
+        let same = PlannedNic {
+            address_source: AddressSource::Given,
+            ..p.clone()
+        };
+        assert_eq!(plan_changed(&m, &same), None);
+        let restart = PlannedNic {
+            mode: PlannedMode::Restart,
+            ..p.clone()
+        };
+        assert!(
+            plan_changed(&m, &restart)
+                .unwrap()
+                .contains("live is now restart")
+        );
+        let blocked = PlannedNic {
+            mode: PlannedMode::Blocked,
+            blockers: vec!["no permission".into()],
+            ..p.clone()
+        };
+        assert_eq!(
+            plan_changed(&m, &blocked).as_deref(),
+            Some("blocked: no permission")
+        );
+        let other = PlannedNic {
+            ips: vec!["10.0.0.6".parse().unwrap()],
+            ..p.clone()
+        };
+        assert!(plan_changed(&m, &other).is_some());
+        // MAC 없는 NIC는 기록하지 않는다.
+        let no_mac = PlannedNic { mac: None, ..p };
+        assert_eq!(VmMove::planned(&no_mac, &v.spec), None);
     }
 }

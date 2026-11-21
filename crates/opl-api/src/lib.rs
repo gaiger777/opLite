@@ -117,6 +117,10 @@ pub use replica_receive::{IncomingReplicas, REPLICA_SWEEP_INTERVAL, ReplicaConfi
 pub use replication::{ReplicationScheduler, ReplicationSchedulerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
+/// 단순 → SDN 옮기기 엔진(계획 67 §9 — API는 스테이지 5, 그 전에는 시험 고리가 부른다)
+pub use tasks::network_migrate::{
+    create_migration, pause_migration, plan_migration, start_step as start_migration_step,
+};
 pub use tasks::sdn::update_sdn as update_sdn_status;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
 pub use telemetry::{TelemetryConfig, TelemetryReporter};

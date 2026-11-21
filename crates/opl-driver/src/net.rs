@@ -127,6 +127,16 @@ pub trait HostNet: Send + Sync + std::fmt::Debug {
         }
         Ok(())
     }
+    /// 있는 tap(QEMU가 연 채)을 `from`의 브리지에서 `to`의 브리지로 옮긴다(계획 67 §9.4 — 옮기기 도구의 `live`): Linux 브리지
+    /// → OVS `br-int`(OVN 칸·망 MTU)나 거꾸로(브리지 MTU·VLAN·tc 속도 제한). 장치를 지우지 않는다. OVS가 없는 호스트
+    /// 네트워크(시험의 가짜)는 기본으로 거절한다.
+    async fn relink_tap(&self, from: &Tap, to: &Tap) -> Result<(), DriverError> {
+        let _ = from;
+        Err(DriverError::InvalidSpec(format!(
+            "{}: moving a tap between bridges is not supported on this node",
+            to.ifname
+        )))
+    }
     /// 이 노드가 tap에 tc 속도 제한을 걸 수 있는지(`NodeStatus.qos`): `tc`가 있고 `clsact`를 만들 수 있다.
     async fn probe_qos(&self) -> bool {
         false
@@ -186,6 +196,34 @@ impl IpRoute {
             .await?;
         }
         self.delete_link(ifname).await
+    }
+
+    /// tap `tap`을 붙일 Linux 브리지의 기본 VLAN(pvid)과 MTU. 브리지가 없거나 이 클러스터 것이 아니거나 VLAN NIC인데 VLAN
+    /// 인식이 아니면 오류다.
+    async fn linux_bridge(&self, tap: &Tap) -> Result<(u16, Option<u32>), DriverError> {
+        let out = self
+            .run("ip", &["-j", "-d", "link", "show", "type", "bridge"])
+            .await?;
+        let bridges = parse_bridges(&out)?;
+        let Some(bridge) = bridges.iter().find(|b| b.info.name == tap.bridge) else {
+            return Err(DriverError::InvalidSpec(format!(
+                "bridge {:?} not found on this node",
+                tap.bridge
+            )));
+        };
+        if foreign_bridges(&out, self.tag.as_deref())?.contains(&tap.bridge) {
+            return Err(DriverError::InvalidSpec(format!(
+                "bridge {:?} is not managed by this Orbivisor cluster",
+                tap.bridge
+            )));
+        }
+        if tap.vlan.is_some() && !bridge.info.vlan_filtering {
+            return Err(DriverError::InvalidSpec(format!(
+                "bridge {:?} is not VLAN-aware (vlan_filtering 1)",
+                tap.bridge
+            )));
+        }
+        Ok((bridge.default_pvid, bridge.mtu))
     }
 
     /// SDN tap(`ovn`)을 만들어 OVS 통합 브리지에 붙인다. 실패하면 OVS 포트와 장치를 지운다.
@@ -301,31 +339,10 @@ impl HostNet for IpRoute {
         if let Some(ovn) = &tap.ovn {
             return self.create_ovs_tap(tap, ovn).await;
         }
-        let out = self
-            .run("ip", &["-j", "-d", "link", "show", "type", "bridge"])
-            .await?;
-        let bridges = parse_bridges(&out)?;
-        let Some(bridge) = bridges.iter().find(|b| b.info.name == tap.bridge) else {
-            return Err(DriverError::InvalidSpec(format!(
-                "bridge {:?} not found on this node",
-                tap.bridge
-            )));
-        };
-        if foreign_bridges(&out, self.tag.as_deref())?.contains(&tap.bridge) {
-            return Err(DriverError::InvalidSpec(format!(
-                "bridge {:?} is not managed by this Orbivisor cluster",
-                tap.bridge
-            )));
-        }
-        if tap.vlan.is_some() && !bridge.info.vlan_filtering {
-            return Err(DriverError::InvalidSpec(format!(
-                "bridge {:?} is not VLAN-aware (vlan_filtering 1)",
-                tap.bridge
-            )));
-        }
+        let (pvid, mtu) = self.linux_bridge(tap).await?;
         // 이전 VM 인스턴스가 남긴 같은 이름의 tap
         self.delete_link(&tap.ifname).await?;
-        for (program, args) in tap_commands(tap, bridge.default_pvid, bridge.mtu) {
+        for (program, args) in tap_commands(tap, pvid, mtu) {
             if let Err(e) = self.run(program, &args).await {
                 let _ = self.delete_link(&tap.ifname).await;
                 return Err(e);
@@ -348,6 +365,31 @@ impl HostNet for IpRoute {
         let actual = snap_burst(actual, qos);
         for cmd in tc_commands(ifname, qos, &actual) {
             self.run("tc", &cmd[1..]).await?;
+        }
+        Ok(())
+    }
+
+    async fn relink_tap(&self, from: &Tap, to: &Tap) -> Result<(), DriverError> {
+        if from.ifname != to.ifname {
+            return Err(DriverError::InvalidSpec(format!(
+                "cannot move tap {:?} as {:?}",
+                from.ifname, to.ifname
+            )));
+        }
+        // Linux 브리지 쪽 속도 제한은 OVS 포트로 가기 전에 뗀다(SDN NIC는 OVN `QoS` 행).
+        if to.ovn.is_some() && from.qos.is_some_and(|q| q.has_rate()) {
+            self.set_tap_qos(&from.ifname, None).await?;
+        }
+        let bridge = match to.ovn {
+            Some(_) => None,
+            None => Some(self.linux_bridge(to).await?),
+        };
+        self.run_all(relink_commands(from, to, self.tag.as_deref(), bridge))
+            .await?;
+        if to.ovn.is_none()
+            && let Some(qos) = to.qos.filter(NicQos::has_rate)
+        {
+            self.set_tap_qos(&to.ifname, Some(&qos)).await?;
         }
         Ok(())
     }
@@ -916,6 +958,39 @@ fn ovs_tap_commands(tap: &Tap, ovn: &OvnPort, tag: Option<&str>) -> Vec<Command>
     cmds
 }
 
+/// 있는 tap을 `from`의 브리지에서 `to`의 브리지로 옮기는 명령(계획 67 §9.4). OVS로: Linux 브리지에서 떼고(`nomaster`) 망
+/// MTU → `ovs-vsctl add-port`와 OVN 칸 → 올리기([`ovs_tap_commands`]에서 장치 만들기를 뺀 것). Linux 브리지로: OVS 포트를
+/// 지우고 브리지 MTU → `master` → VLAN → 올리기([`tap_commands`]에서 장치 만들기를 뺀 것 — `bridge`는 그 브리지의 pvid·MTU).
+/// tc 속도 제한은 부르는 쪽이 따로 맞춘다.
+fn relink_commands(
+    from: &Tap,
+    to: &Tap,
+    tag: Option<&str>,
+    bridge: Option<(u16, Option<u32>)>,
+) -> Vec<Command> {
+    let dev = to.ifname.as_str();
+    let mut cmds = Vec::new();
+    match (&to.ovn, bridge) {
+        (Some(ovn), _) => {
+            if from.ovn.is_none() {
+                cmds.push(("ip", args(&["link", "set", "dev", dev, "nomaster"])));
+            }
+            cmds.extend(ovs_tap_commands(to, ovn, tag).into_iter().skip(1));
+        }
+        (None, bridge) => {
+            if from.ovn.is_some() {
+                cmds.push((
+                    "ovs-vsctl",
+                    args(&[OVS_TIMEOUT, "--if-exists", "del-port", dev]),
+                ));
+            }
+            let (pvid, mtu) = bridge.unwrap_or((0, None));
+            cmds.extend(tap_commands(to, pvid, mtu).into_iter().skip(1));
+        }
+    }
+    cmds
+}
+
 /// `ovs-vsctl --if-exists get Interface X external_ids:ovn-installed`의 출력이 참인지(값은 따옴표 친 문자열이다)
 fn ovn_installed(out: &str) -> bool {
     out.trim().trim_matches('"') == "true"
@@ -1244,6 +1319,66 @@ filter protocol all pref 49152 matchall chain 0 handle 0x1 \n\
         // 태그가 없으면(클러스터 전) 표시를 달지 않는다.
         let untagged = joined(ovs_tap_commands(&tap, &ovn, None));
         assert!(!untagged[2].contains("orbivisor-cluster"), "{untagged:?}");
+    }
+
+    /// 계획 67 §9.4: 있는 tap을 Linux 브리지 → `br-int`(떼고, 망 MTU, OVN 칸, 올림)와 거꾸로(OVS 포트를 지우고 브리지 MTU·
+    /// master·VLAN·올림). 장치를 새로 만들지 않는다.
+    #[test]
+    fn relinking_moves_the_tap_without_recreating_it() {
+        let vm: Uuid = "01234567-89ab-cdef-0123-456789abcdef".parse().unwrap();
+        let mac: MacAddr = "52:54:00:12:34:56".parse().unwrap();
+        let plain = Tap {
+            ifname: "op6789abcdefn1".into(),
+            bridge: "oplmig0".into(),
+            vlan: Some(10),
+            ovn: None,
+            qos: None,
+        };
+        let sdn = Tap {
+            bridge: "br-int".into(),
+            vlan: None,
+            ovn: Some(OvnPort {
+                iface_id: opl_types::sdn::port_name(vm, mac),
+                mac,
+                vm,
+                mtu: Some(1442),
+            }),
+            ..plain.clone()
+        };
+        assert_eq!(
+            joined(relink_commands(&plain, &sdn, Some("0123456789ab"), None)),
+            [
+                "ip link set dev op6789abcdefn1 nomaster",
+                "ip link set dev op6789abcdefn1 mtu 1442",
+                "ovs-vsctl --timeout=10 --may-exist add-port br-int op6789abcdefn1 -- set Interface op6789abcdefn1 \
+                 external_ids:iface-id=opl-01234567-89ab-cdef-0123-456789abcdef-525400123456 \
+                 external_ids:attached-mac=\"52:54:00:12:34:56\" external_ids:iface-status=active \
+                 external_ids:vm-uuid=01234567-89ab-cdef-0123-456789abcdef external_ids:orbivisor-cluster=0123456789ab",
+                "ip link set dev op6789abcdefn1 up",
+            ]
+        );
+        assert_eq!(
+            joined(relink_commands(&sdn, &plain, None, Some((1, Some(1500))))),
+            [
+                "ovs-vsctl --timeout=10 --if-exists del-port op6789abcdefn1",
+                "ip link set dev op6789abcdefn1 mtu 1500",
+                "ip link set dev op6789abcdefn1 master oplmig0",
+                "bridge vlan del dev op6789abcdefn1 vid 1",
+                "bridge vlan add dev op6789abcdefn1 vid 10 pvid untagged",
+                "ip link set dev op6789abcdefn1 up",
+            ]
+        );
+        assert!(
+            !joined(relink_commands(&plain, &sdn, None, None))
+                .iter()
+                .chain(&joined(relink_commands(
+                    &sdn,
+                    &plain,
+                    None,
+                    Some((0, None))
+                )))
+                .any(|c| c.contains("tuntap") || c.contains("link del"))
+        );
     }
 
     #[test]

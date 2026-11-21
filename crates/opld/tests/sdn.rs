@@ -882,7 +882,12 @@ async fn orbivisord_sets_up_ovn() {
     // `ruleset`)에도 걸어 같은 탐침 표가 같은지 본다(다른 것은 맺은 연결뿐 — 설계 §11.4).
     Box::pin(security_section(&d, &tag)).await;
 
-    // 12. OVN 접근 잠금(계획 67 §10): 다시 켜고 SB RBAC(역할 포트에서 남의 행·다른 표 쓰기 거절, 자기 행은 됨, northd는
+    // 12. 단순 → SDN 옮기기(계획 67 §9, 스테이지 4): Linux 브리지 네트워크 `lan`의 QEMU VM은 tap만 `br-int`로(라이브),
+    // 꺼진 이름공간 "VM"은 스펙만(cloud-init 주소를 그대로), 그동안 `l2gateway` 다리로 옮긴 쪽과 남은 쪽이 같은 L2다. 하나를
+    // 되돌리고 끝내면 다리(NB 행·매핑·veth)가 사라진다.
+    Box::pin(migration_section(&d, &tag, &node)).await;
+
+    // 13. OVN 접근 잠금(계획 67 §10): 다시 켜고 SB RBAC(역할 포트에서 남의 행·다른 표 쓰기 거절, 자기 행은 됨, northd는
     // 6645로 일함)·허용 목록 밖 출발 주소의 시간 초과를 본 뒤 끄면 계획 66 글 그대로다.
     Box::pin(lockdown_section(&d, &tag, &node)).await;
 }
@@ -3370,4 +3375,297 @@ async fn plain_tc_section() {
         let _ = try_run("ip", &["netns", "del", ns]);
     }
     let _ = try_run("ip", &["link", "del", "oplqbr"]);
+}
+
+/// 시험 고리 `POST /v1/test/migration`(스테이지 5 전 옮기기 엔진)
+async fn test_migration(d: &Daemon, body: Value) -> Value {
+    let http = reqwest::Client::builder()
+        .unix_socket(d.path("opld.sock"))
+        .build()
+        .unwrap();
+    let resp = http
+        .post("http://opld/v1/test/migration")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap();
+    assert!(status.is_success(), "migration {body}: {status} {text}");
+    serde_json::from_str(&text).unwrap()
+}
+
+/// 옮기기 걸음 하나를 Task로 하고 끝난 Task
+async fn migration_step(d: &Daemon, node: &str, action: &str, extra: Value) -> Value {
+    let mut body = json!({ "action": action, "name": "mig", "node": node });
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().cloned().unwrap_or_default());
+    let id = test_migration(d, body).await;
+    let started = Instant::now();
+    let task = wait_task(d, &json!({ "id": id }), Duration::from_secs(300)).await;
+    eprintln!(
+        "migration {action}: {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    task
+}
+
+/// 이름공간 `ns`에 Linux 브리지 `bridge`의 veth 한쪽(MAC `mac`, 주소 `ip`/24)
+fn bridge_namespace(ns: &str, bridge: &str, mac: &str, ip: &str) {
+    let _ = try_run("ip", &["netns", "del", ns]);
+    run("ip", &["netns", "add", ns]);
+    let (host, inner) = (format!("{ns}h"), format!("{ns}n"));
+    let _ = try_run("ip", &["link", "del", &host]);
+    run(
+        "ip",
+        &["link", "add", &host, "type", "veth", "peer", "name", &inner],
+    );
+    run("ip", &["link", "set", &host, "master", bridge, "up"]);
+    run("ip", &["link", "set", &inner, "netns", ns]);
+    let in_ns = |args: &[&str]| {
+        let mut all = vec!["netns", "exec", ns, "ip"];
+        all.extend_from_slice(args);
+        run("ip", &all)
+    };
+    in_ns(&["link", "set", &inner, "address", mac]);
+    in_ns(&["addr", "add", &format!("{ip}/24"), "dev", &inner]);
+    in_ns(&["link", "set", "lo", "up"]);
+    in_ns(&["link", "set", &inner, "up"]);
+}
+
+/// 계획 67 스테이지 4: Linux 브리지 `oplmig0`의 단순 네트워크 `lan`(이름공간 둘과 디스크 없는 QEMU VM 하나)을 같은 CIDR의
+/// SDN 오버레이 `t-lan`으로 옮긴다. 미리 보기 계획 → 시작(다리: NB `l2gateway` 행, 노드 매핑 `mig…`, veth) → QEMU VM은
+/// `live`(tap이 `br-int`로, `ovn-installed`, QEMU pid 그대로), 이름공간 VM `mig-a`는 `offline`(스펙만 — cloud-init 주소를
+/// 그대로 가져가고, 시험이 그 이름공간을 OVS 포트로 다시 붙여 "다시 켬"을 흉내) → 다리 너머 ping(옮긴 쪽 ↔ 남은 `mig-b`) →
+/// QEMU VM 되돌리기(tap이 `oplmig0`로) → 끝내기(다리가 모두 걷힘).
+async fn migration_section(d: &Daemon, tag: &str, node: &str) {
+    let c = client(d);
+    let _ = try_run("ip", &["link", "del", "oplmig0"]);
+    run("ip", &["link", "add", "oplmig0", "type", "bridge"]);
+    run("ip", &["link", "set", "oplmig0", "up"]);
+    c.post(
+        "/networks",
+        &json!({ "name": "lan", "spec": { "bridge": "oplmig0" } }),
+    )
+    .await
+    .unwrap();
+    sdn_network(d, "t-lan", &["--subnet", "10.66.0.0/24"]).await;
+    wait_for(
+        "the node to report bridge oplmig0",
+        Duration::from_secs(120),
+        || async {
+            let me = d.ctl_json(&["node", "get", "node1"]).await;
+            me["status"]["bridges"]
+                .as_array()
+                .is_some_and(|b| b.iter().any(|b| b["name"] == "oplmig0"))
+        },
+    )
+    .await;
+    // 꺼진 "VM" 둘(이름공간이 대신 돈다): a는 cloud-init 고정 주소, b는 옮기지 않고 남는다.
+    let mut made = Vec::new();
+    for (name, ip) in [("mig-a", "10.66.0.11"), ("mig-b", "10.66.0.12")] {
+        let vm = c
+            .post(
+                "/vms",
+                &json!({ "name": name, "spec": {
+                    "cpu": { "cores": 1 }, "memory_mib": 256,
+                    "nics": [{ "network": "lan", "model": "virtio" }],
+                    "cloud_init": { "networks": [{ "ipv4": { "mode": "static", "address": format!("{ip}/24"), "gateway": "10.66.0.1" } }] }
+                } }),
+            )
+            .await
+            .unwrap();
+        let mac = vm["spec"]["nics"][0]["mac"].as_str().unwrap().to_string();
+        let id = vm["id"].as_str().unwrap().to_string();
+        made.push((id, mac, ip));
+    }
+    let (a_id, a_mac, _) = made[0].clone();
+    let (_, b_mac, _) = made[1].clone();
+    bridge_namespace("oplmiga", "oplmig0", &a_mac, "10.66.0.11");
+    bridge_namespace("oplmigb", "oplmig0", &b_mac, "10.66.0.12");
+    assert!(
+        ping_from("oplmiga", &[], "10.66.0.12"),
+        "the source L2 works"
+    );
+    // 켠 QEMU VM(게스트 없음)
+    d.ctl(&[
+        "vm", "create", "mig-q", "--nic", "lan", "--memory", "256", "--start",
+    ])
+    .await
+    .unwrap();
+    let q = d.ctl_json(&["vm", "get", "mig-q"]).await;
+    let q_id: uuid::Uuid = q["id"].as_str().unwrap().parse().unwrap();
+    let q_mac: opl_types::vm::MacAddr = q["spec"]["nics"][0]["mac"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let pid = q["status"]["pid"].as_u64().unwrap();
+    let tap = opl_types::network::tap_name(q_id, 0);
+    let master = |dev: &str| -> String {
+        serde_json::from_str::<Value>(&run("ip", &["-j", "link", "show", "dev", dev])).unwrap()[0]
+            ["master"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(master(&tap), "oplmig0");
+
+    // 미리 보기
+    let spec = json!({
+        "source": "lan", "target": "t-lan", "vms": [q_id, a_id], "allow_mtu_shrink": true,
+        "addresses": [{ "vm": q_id, "mac": q_mac.to_string(), "ip": ["10.66.0.10"] }]
+    });
+    let plan = test_migration(d, json!({ "action": "plan", "name": "mig", "spec": spec })).await;
+    eprintln!("migration plan: {plan}");
+    let planned = |vm: &str| {
+        plan["nics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["vm"] == vm)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(planned(&q_id.to_string())["mode"], "live", "{plan}");
+    assert_eq!(
+        planned(&q_id.to_string())["address_source"],
+        "given",
+        "{plan}"
+    );
+    assert_eq!(planned(&a_id)["mode"], "offline", "{plan}");
+    assert_eq!(planned(&a_id)["address_source"], "cloud-init", "{plan}");
+    assert_eq!(planned(&a_id)["ips"], json!(["10.66.0.11"]), "{plan}");
+    assert_eq!(plan["bridge"]["needed"], true, "{plan}");
+    assert_eq!(plan["bridge"]["node"], node, "{plan}");
+    let mig = test_migration(
+        d,
+        json!({ "action": "create", "name": "mig", "spec": spec }),
+    )
+    .await;
+    let mig_id: uuid::Uuid = serde_json::from_value(mig).unwrap();
+    migration_step(d, node, "start", json!({})).await;
+
+    // 다리: NB l2gateway 행, 노드 매핑과 veth
+    let physnet = opl_types::sdn::migration_physnet(tag, mig_id);
+    let (_, veth, ovs_bridge) = opl_types::sdn::physnet_ifnames(tag, &physnet);
+    let l2gw = format!("opl-l2gw-{mig_id}");
+    wait_for("the l2gateway port", AGENT_WAIT, || async {
+        nb_rows(d, tag).await.ports.iter().any(|p| p.name == l2gw)
+    })
+    .await;
+    let rows = nb_rows(d, tag).await;
+    let port = rows.ports.iter().find(|p| p.name == l2gw).unwrap();
+    assert_eq!(port.kind, "l2gateway");
+    assert_eq!(port.options["network_name"], physnet);
+    assert_eq!(port.options["l2gateway-chassis"], node);
+    assert!(
+        ovs_id("ovn-bridge-mappings").contains(&format!("{physnet}:{ovs_bridge}")),
+        "{}",
+        ovs_id("ovn-bridge-mappings")
+    );
+    assert_eq!(master(&veth), "oplmig0");
+    // 주소 옮기기: 준 주소·cloud-init 주소가 논리 포트 주소다.
+    let q_port = opl_types::sdn::port_name(q_id, q_mac);
+    let a_port = format!("opl-{a_id}-{}", a_mac.replace(':', ""));
+    for (p, ip) in [(&q_port, "10.66.0.10"), (&a_port, "10.66.0.11")] {
+        let row = rows.ports.iter().find(|x| &x.name == p).unwrap();
+        assert!(row.addresses.iter().any(|a| a.ends_with(ip)), "{row:?}");
+    }
+    let va = c.get(&format!("/vms/{a_id}")).await.unwrap();
+    assert_eq!(va["spec"]["nics"][0]["network"], "t-lan", "{va}");
+    assert_eq!(va["spec"]["nics"][0]["ips"], json!(["10.66.0.11"]), "{va}");
+    assert_eq!(va["spec"]["cloud_init"]["networks"], json!([{}]), "{va}");
+    // QEMU VM: tap만 br-int로(같은 QEMU), 포트가 켜짐
+    assert_eq!(run("ovs-vsctl", &["port-to-br", &tap]).trim(), "br-int");
+    assert_eq!(iface_id_field(&tap, "iface-id"), q_port);
+    assert_eq!(iface_id_field(&tap, "ovn-installed"), "true");
+    let q = d.ctl_json(&["vm", "get", "mig-q"]).await;
+    assert_eq!(q["status"]["pid"].as_u64(), Some(pid), "{q}");
+    assert_eq!(
+        q["status"]["hardware"]["nics"][0]["network"], "t-lan",
+        "{q}"
+    );
+
+    // "다시 켠" a: 이름공간을 OVS 포트로 다시 붙인다. 다리 너머 남은 b에 닿는다(같은 L2).
+    namespace_port("oplmiga", "oplmiga0", &a_port, &a_mac);
+    run(
+        "ip",
+        &[
+            "netns",
+            "exec",
+            "oplmiga",
+            "ip",
+            "addr",
+            "add",
+            "10.66.0.11/24",
+            "dev",
+            "oplmiga0",
+        ],
+    );
+    wait_for(
+        "the moved namespace port to be installed",
+        AGENT_WAIT,
+        || async { iface_id_field("oplmiga0", "ovn-installed") == "true" },
+    )
+    .await;
+    let started = Instant::now();
+    wait_for("a ping across the migration bridge", AGENT_WAIT, || async {
+        ping_from("oplmiga", &[], "10.66.0.12")
+    })
+    .await;
+    eprintln!(
+        "migration bridge: moved -> remaining ping after {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    assert!(
+        ping_from("oplmigb", &[], "10.66.0.11"),
+        "remaining -> moved"
+    );
+
+    // QEMU VM 하나를 되돌린다: tap이 원래 브리지로(같은 QEMU), 주소를 놓는다.
+    migration_step(d, node, "rollback", json!({ "vms": [q_id] })).await;
+    assert_eq!(master(&tap), "oplmig0");
+    assert!(
+        !run("ovs-vsctl", &["list-ports", "br-int"])
+            .lines()
+            .any(|p| p == tap)
+    );
+    let q = d.ctl_json(&["vm", "get", "mig-q"]).await;
+    assert_eq!(q["status"]["pid"].as_u64(), Some(pid), "{q}");
+    assert_eq!(q["spec"]["nics"][0]["network"], "lan", "{q}");
+    assert!(q["spec"]["nics"][0]["ips"].is_null(), "{q}");
+    // 다리는 아직 있다(a가 옮겨져 있음).
+    assert!(ping_from("oplmiga", &[], "10.66.0.12"));
+
+    // 끝내기: 다리(NB 행·매핑·veth·OVS 브리지)가 걷힌다.
+    let task = migration_step(d, node, "finish", json!({})).await;
+    eprintln!("finish: {task}");
+    wait_for("the migration bridge to go", AGENT_WAIT, || async {
+        !nb_rows(d, tag).await.ports.iter().any(|p| p.name == l2gw)
+            && !ovs_id("ovn-bridge-mappings").contains(&physnet)
+            && !try_run("ip", &["link", "show", "dev", &veth]).0
+            && !run("ovs-vsctl", &["list-br"])
+                .lines()
+                .any(|b| b == ovs_bridge)
+    })
+    .await;
+    assert!(
+        !ping_from("oplmiga", &[], "10.66.0.12"),
+        "the bridge is gone"
+    );
+
+    // 치우기
+    d.ctl(&["vm", "stop", "mig-q", "--force"]).await.unwrap();
+    for vm in ["mig-q", "mig-a", "mig-b"] {
+        d.ctl(&["vm", "delete", vm]).await.unwrap();
+    }
+    for ns in ["oplmiga", "oplmigb"] {
+        let _ = try_run("ip", &["netns", "del", ns]);
+    }
+    let _ = try_run("ovs-vsctl", &["--if-exists", "del-port", "oplmiga0"]);
+    let _ = try_run("ip", &["link", "del", "oplmigbh"]);
+    let _ = try_run("ip", &["link", "del", "oplmig0"]);
 }

@@ -2633,6 +2633,61 @@ impl Hypervisor for QemuHypervisor {
         net.set_tap_qos(&tap.ifname, tap.qos.as_ref()).await
     }
 
+    async fn relink_nic(
+        &self,
+        id: Uuid,
+        index: usize,
+        from: &RuntimeNic,
+        to: &RuntimeNic,
+        timeout: Duration,
+    ) -> Result<(), DriverError> {
+        let handle = self.running_handle(id)?;
+        let (Some(from_tap), Some(to_tap)) = (Tap::from_nic(id, from), Tap::from_nic(id, to))
+        else {
+            return Err(DriverError::InvalidSpec(format!(
+                "NIC {index}: only tap NICs move between bridges"
+            )));
+        };
+        let own = opl_types::network::tap_name(id, index);
+        if from_tap.ifname != own || to_tap.ifname != own {
+            return Err(DriverError::InvalidSpec(format!(
+                "tap name {:?} is not NIC {index} of this VM",
+                to_tap.ifname
+            )));
+        }
+        let Some(net) = &self.config.net else {
+            return Err(DriverError::InvalidSpec(
+                "bridge networks are not supported on this node".into(),
+            ));
+        };
+        if let Err(e) = net.relink_tap(&from_tap, &to_tap).await {
+            // 반쯤 옮긴 tap을 원래 브리지로(게스트가 NIC를 잃지 않게)
+            if let Err(back) = net.relink_tap(&to_tap, &from_tap).await {
+                tracing::error!(%id, tap = %own, error = %back, "cannot move the tap back to its bridge");
+            }
+            return Err(e);
+        }
+        if to_tap.ovn.is_some()
+            && let Err(e) = net.wait_ovn_installed(&own, timeout).await
+        {
+            if let Err(back) = net.relink_tap(&to_tap, &from_tap).await {
+                tracing::error!(%id, tap = %own, error = %back, "cannot move the tap back to its bridge");
+            }
+            return Err(DriverError::InvalidSpec(format!(
+                "OVN did not activate the SDN port {own} in {}s; the NIC was moved back: {e}",
+                timeout.as_secs()
+            )));
+        }
+        // 게스트가 링크를 다시 보고 DHCP를 다시 묻게 한다. 실패해도 망은 이미 옮겨졌다(경고만).
+        let dev = format!("nic{index}");
+        for up in [false, true] {
+            if let Err(e) = qmp_call(handle.qmp.set_link(&dev, up), "QMP set_link").await {
+                tracing::warn!(%id, %dev, up, error = %e, "cannot toggle the NIC link after moving its tap");
+            }
+        }
+        Ok(())
+    }
+
     fn save_hardware(&self, id: Uuid, hw: &RunningHardware) -> Result<(), DriverError> {
         let dir = self.paths(id)?.dir;
         if !dir.is_dir() {
@@ -8814,6 +8869,11 @@ time.sleep(60)
             }
             Ok(())
         }
+        async fn relink_tap(&self, from: &Tap, to: &Tap) -> Result<(), DriverError> {
+            let call = format!("relink {} {} -> {}", to.ifname, from.bridge, to.bridge);
+            self.calls.lock().unwrap().push(call);
+            Ok(())
+        }
         async fn delete_vm_taps(&self, vm: Uuid) -> Result<(), DriverError> {
             self.calls.lock().unwrap().push(format!("delete-vm {vm}"));
             Ok(())
@@ -9267,6 +9327,58 @@ time.sleep(60)
                 qos: None,
             },
         }
+    }
+
+    /// 계획 67 §9.4: 단순 NIC의 tap을 `br-int`로 옮기고 OVN 포트를 기다린 뒤 링크를 내렸다 올린다(QEMU 장치는 그대로). 포트가
+    /// 켜지지 않으면 tap을 원래 브리지로 되돌리고 실패한다. 거꾸로(SDN → 단순)는 기다리지 않는다.
+    #[tokio::test]
+    async fn relinking_a_nic_moves_its_tap_and_toggles_the_link() {
+        let tmp = short_tempdir();
+        let net = Arc::new(RecordingNet::default());
+        let (hv, id, fake, _qemu) = running_vm_with_net(tmp.path(), net.clone()).await;
+        let (plain, sdn) = (tap_nic(id, 0), sdn_nic(id, 0));
+        let wait = Duration::from_secs(7);
+        hv.relink_nic(id, 0, &plain, &sdn, wait).await.unwrap();
+        let tap = tap_name(id, 0);
+        assert_eq!(
+            *net.calls.lock().unwrap(),
+            [
+                format!("relink {tap} br0 -> br-int"),
+                format!("wait {tap} 7s")
+            ]
+        );
+        let links: Vec<_> = sent(&fake, &["set_link"])
+            .into_iter()
+            .map(|(_, a)| a)
+            .collect();
+        assert_eq!(
+            links,
+            [
+                serde_json::json!({ "name": "nic0", "up": false }),
+                serde_json::json!({ "name": "nic0", "up": true })
+            ]
+        );
+        assert!(sent(&fake, &["device_del", "device_add", "netdev_del"]).is_empty());
+        net.calls.lock().unwrap().clear();
+        hv.relink_nic(id, 0, &sdn, &plain, wait).await.unwrap();
+        assert_eq!(
+            *net.calls.lock().unwrap(),
+            [format!("relink {tap} br-int -> br0")]
+        );
+        net.calls.lock().unwrap().clear();
+        *net.ovn_down.lock().unwrap() = true;
+        let err = hv.relink_nic(id, 0, &plain, &sdn, wait).await.unwrap_err();
+        assert!(err.to_string().contains("moved back"), "{err}");
+        assert_eq!(
+            *net.calls.lock().unwrap(),
+            [
+                format!("relink {tap} br0 -> br-int"),
+                format!("wait {tap} 7s"),
+                format!("relink {tap} br-int -> br0")
+            ]
+        );
+        // 다른 순번의 tap은 거절한다.
+        assert!(hv.relink_nic(id, 1, &plain, &sdn, wait).await.is_err());
     }
 
     /// 마이그레이션을 받는 쪽은 받는 QEMU를 띄우기 전에 SDN tap을 붙이고 OVN 포트가 켜지기를 30초까지 기다린다. 켜지지

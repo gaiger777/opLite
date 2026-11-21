@@ -62,16 +62,23 @@ struct World {
     networks: Vec<Network>,
     vms: Vec<Vm>,
     nodes: Vec<Node>,
+    /// 옮기기 다리가 놓인 대상 네트워크(계획 67 §9.5 — 라우터 인터페이스로 붙이지 못한다)
+    bridged: BTreeSet<String>,
 }
 
 impl World {
     fn load(state: &AppState) -> Result<Self, ApiError> {
+        Self::load_from(&state.cluster)
+    }
+
+    fn load_from(cluster: &opl_cluster::Cluster) -> Result<Self, ApiError> {
         Ok(World {
-            routers: state.cluster.list::<RouterSpec>()?.1,
-            fips: state.cluster.list::<FloatingIpSpec>()?.1,
-            networks: state.cluster.list::<NetworkSpec>()?.1,
-            vms: state.cluster.list::<VmSpec>()?.1,
-            nodes: state.cluster.list::<NodeSpec>()?.1,
+            routers: cluster.list::<RouterSpec>()?.1,
+            fips: cluster.list::<FloatingIpSpec>()?.1,
+            networks: cluster.list::<NetworkSpec>()?.1,
+            vms: cluster.list::<VmSpec>()?.1,
+            nodes: cluster.list::<NodeSpec>()?.1,
+            bridged: crate::tasks::network_migrate::bridged_networks(cluster)?,
         })
     }
 
@@ -95,6 +102,7 @@ impl World {
             networks: state.cluster.list::<NetworkSpec>()?.1,
             vms,
             nodes: state.cluster.list::<NodeSpec>()?.1,
+            bridged: BTreeSet::new(),
         })
     }
 
@@ -274,6 +282,15 @@ fn check_router(
                 n.name
             )));
         }
+        if world.bridged.contains(&n.name) {
+            return Err(ApiError::conflict(
+                "network_migrating",
+                format!(
+                    "network {:?} has a network migration bridge; finish the migration with this router instead (`network migration finish --router`)",
+                    n.name
+                ),
+            ));
+        }
         if let Some(other) = world.router_of(&n.name, me) {
             // 읽을 수 없는 라우터의 이름은 대지 않는다(리뷰 2 m-5).
             let which = if sees(other) {
@@ -323,6 +340,44 @@ fn check_router(
         }
     }
     Ok(())
+}
+
+/// 라우터 `key`(이름이나 id)에 네트워크 `network`를 인터페이스로 붙인다(계획 67 §9.7 — 옮기기 끝내기가 다리를 걷은 뒤).
+/// 검사는 라우터 `PATCH`와 같다(권한은 부른 쪽이 본다). 이미 붙었으면 아무것도 하지 않는다.
+pub(crate) async fn attach_interface(
+    cluster: &opl_cluster::Cluster,
+    key: &str,
+    network: &str,
+) -> Result<(), ApiError> {
+    for _ in 0..RETRIES * 2 {
+        let router = lookup::<RouterSpec>(cluster, key)?;
+        if router.spec.interfaces.iter().any(|i| i.network == network) {
+            return Ok(());
+        }
+        let world = World::load_from(cluster)?;
+        let mut spec = router.spec.clone();
+        spec.interfaces.push(RouterInterface {
+            network: network.to_string(),
+        });
+        check_router(&world, &spec, Some(router.id), &|_| true)?;
+        match cluster
+            .update_spec(
+                router.id,
+                Some(router.revision),
+                router.labels.clone(),
+                &spec,
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::conflict(
+        "busy",
+        "the router kept changing while being updated; try again",
+    ))
 }
 
 /// 라우터 외부 주소를 채운다(체계마다 하나): 준 주소는 서브넷 안의 예약이 아닌 빈 주소이고 루트 `cluster.admin`이
@@ -1769,6 +1824,7 @@ mod tests {
 
     fn world(vms: Vec<Vm>, routers: Vec<Router>) -> World {
         World {
+            bridged: BTreeSet::new(),
             routers,
             fips: Vec::new(),
             networks: Vec::new(),

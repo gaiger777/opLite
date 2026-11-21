@@ -126,6 +126,8 @@ export function describeTask(
         : undefined;
   // 꺼졌거나 지운 OVN 중앙을 내쫓는 Task(리뷰 2 N-1·N-2): 실행 노드는 살아 있는 중앙, 내쫓는 노드는 이름(지웠으면 주소)
   const kicked = op.kind === "sdn-central-kick" ? (nodeName(op.node) ?? op.address) : undefined;
+  // 단순 → SDN 옮기기(계획 67)의 걸음(start·rollback·finish)
+  const step = op.kind === "network-migrate" ? op.step : undefined;
   const device = op.kind === "ceph-osd-add" ? op.device : undefined;
   const pool = op.kind === "ceph-pool-create" ? op.pool : undefined;
   const name = op.kind === "ceph-pool-create" ? op.name : undefined;
@@ -144,6 +146,7 @@ export function describeTask(
     bond,
     node,
     kicked,
+    step,
     device,
     pool,
     name,
