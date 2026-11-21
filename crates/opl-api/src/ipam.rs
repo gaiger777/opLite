@@ -16,6 +16,7 @@ use opl_types::floating_ip::{FloatingIp, FloatingIpSpec};
 use opl_types::ipam::{self, IpamError};
 use opl_types::load_balancer::{LoadBalancer, LoadBalancerSpec};
 use opl_types::network::{Network, NetworkSpec, Subnet};
+use opl_types::network_migration::{NetworkMigration, NetworkMigrationSpec};
 use opl_types::router::{Router, RouterSpec};
 use opl_types::vm::{MacAddr, Vm, VmSpec};
 
@@ -86,12 +87,90 @@ pub(crate) fn held_ips(
     out
 }
 
-/// 저장소의 라우터·유동 IP·부하 분산기가 쓰는 주소
+/// 끝나지 않은 네트워크 옮기기들 `migrations`가 대상 네트워크에 잡아 둔 주소(리뷰 1 I2): 계획에 적은 NIC 주소(`status.vms[].ips`
+/// — 원본에 남은 VM은 아직 그 주소를 쓴다)와, 원본 네트워크에 NIC가 있는 VM들 `vms`의 cloud-init 고정 주소 가운데 대상
+/// 서브넷 안의 것. 다리가 두 L2를 잇는 동안 IPAM이 이 주소를 다른 NIC·부하 분산기·유동 IP에 주면 ARP가 겹친다. `except_vm`의
+/// 것은 뺀다(옮기는 VM 자신 — 그 주소로 옮겨 간다).
+pub(crate) fn migration_held(
+    migrations: &[NetworkMigration],
+    vms: &[Vm],
+    networks: &[Network],
+    except_vm: Option<uuid::Uuid>,
+) -> HeldIps {
+    let mut out = HeldIps::new();
+    for m in migrations.iter().filter(|m| !m.status.is_done()) {
+        let held = out.entry(m.spec.target.clone()).or_default();
+        held.extend(
+            m.status
+                .vms
+                .iter()
+                .filter(|v| Some(v.vm) != except_vm)
+                .flat_map(|v| v.ips.iter().map(|ip| ip.to_canonical())),
+        );
+        let Some(target) = networks.iter().find(|n| n.name == m.spec.target) else {
+            continue;
+        };
+        for v in vms
+            .iter()
+            .filter(|v| !v.spec.template && Some(v.id) != except_vm)
+        {
+            for (i, _) in v
+                .spec
+                .nics
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.network == m.spec.source)
+            {
+                let ci = v.spec.cloud_init.as_ref().and_then(|c| c.networks.get(i));
+                let (ips, source) =
+                    opl_types::network_migration::address_for(None, &target.spec, None, None, ci);
+                if source == opl_types::network_migration::AddressSource::CloudInit {
+                    held.extend(ips);
+                }
+            }
+        }
+    }
+    out.retain(|_, ips| !ips.is_empty());
+    out
+}
+
+/// `held`에 `more`를 더한다.
+pub(crate) fn merge_held(held: &mut HeldIps, more: HeldIps) {
+    for (network, ips) in more {
+        held.entry(network).or_default().extend(ips);
+    }
+}
+
+/// 저장소의 끝나지 않은 옮기기가 잡아 둔 주소([`migration_held`]). 옮기기가 없으면 VM을 읽지 않는다.
+pub(crate) fn load_migration_held(
+    cluster: &Cluster,
+    except_vm: Option<uuid::Uuid>,
+) -> Result<HeldIps, ApiError> {
+    let (_, migrations) = cluster.list::<NetworkMigrationSpec>()?;
+    if migrations.iter().all(|m| m.status.is_done()) {
+        return Ok(HeldIps::new());
+    }
+    let (_, vms) = cluster.list::<VmSpec>()?;
+    let (_, networks) = cluster.list::<NetworkSpec>()?;
+    Ok(migration_held(&migrations, &vms, &networks, except_vm))
+}
+
+/// 저장소의 라우터·유동 IP·부하 분산기가 쓰는 주소와 끝나지 않은 옮기기가 잡아 둔 주소
 pub(crate) fn load_held(cluster: &Cluster) -> Result<HeldIps, ApiError> {
+    load_held_except(cluster, None)
+}
+
+/// [`load_held`]에서 VM `except_vm`이 옮기기로 잡아 둔 주소는 뺀 것(그 VM을 옮길 때)
+pub(crate) fn load_held_except(
+    cluster: &Cluster,
+    except_vm: Option<uuid::Uuid>,
+) -> Result<HeldIps, ApiError> {
     let (_, routers) = cluster.list::<RouterSpec>()?;
     let (_, fips) = cluster.list::<FloatingIpSpec>()?;
     let (_, lbs) = cluster.list::<LoadBalancerSpec>()?;
-    Ok(held_ips(&routers, &fips, &lbs, None))
+    let mut held = held_ips(&routers, &fips, &lbs, None);
+    merge_held(&mut held, load_migration_held(cluster, except_vm)?);
+    Ok(held)
 }
 
 /// NIC(MAC `mac`)의 주소를 서브넷에서 고른다: SLAAC 계열 IPv6 서브넷은 EUI-64(MAC이 아직 없으면 — 복제 미리 보기 —
@@ -246,7 +325,8 @@ pub(crate) fn assign(
                     let by = match holder(others, &net.name, ip) {
                         Some(v) if sees(v) => format!(" by VM {:?}", v.name),
                         None if held.get(&net.name).is_some_and(|h| h.contains(&ip)) => {
-                            " by a router or floating IP".to_string()
+                            " by a router, floating IP, load balancer or network migration"
+                                .to_string()
                         }
                         _ => String::new(),
                     };

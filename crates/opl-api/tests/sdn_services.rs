@@ -608,3 +608,129 @@ async fn lockdown_dry_run_and_view() {
         "{audit}"
     );
 }
+
+/// 리뷰 1 M6: 토폴로지는 읽을 수 없는 VM 멤버의 주소를 내지 않고, 읽을 수 없는 폴더로 거르면 404다. 잠금 미리 확인은 Raft
+/// 상대도 보고(리뷰 1 I5), `127.0.0.1`이 아닌 루프백도 집합 밖이다.
+#[tokio::test]
+async fn review1_topology_redaction_and_raft_peers() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    ready_sdn(&env, false).await;
+    node_sdn(&env, &["127.0.0.2"]).await;
+    net(
+        &admin,
+        "ext",
+        json!({ "sdn": { "provider": { "physnet": "ext" } }, "subnets": [{ "cidr": "203.0.113.0/24" }] }),
+    )
+    .await;
+    net(
+        &admin,
+        "t1",
+        json!({ "sdn": {}, "subnets": [{ "cidr": "10.10.0.0/24" }] }),
+    )
+    .await;
+    let web = vm_on(&admin, "web1", "t1").await;
+    let (status, body) = admin
+        .post(
+            "/routers",
+            json!({ "name": "r1", "spec": { "external": { "network": "ext" }, "interfaces": [{ "network": "t1" }] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut folders = Vec::new();
+    for name in ["tenant", "other"] {
+        let (status, f) = admin
+            .post("/folders", json!({ "name": name, "kind": "network" }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{f}");
+        folders.push(f["id"].as_str().unwrap().to_string());
+    }
+    let (status, body) = admin
+        .post(
+            "/load-balancers",
+            json!({ "name": "lb", "spec": { "folder": folders[0], "network": "t1",
+                "listeners": [{ "protocol": "tcp", "port": 80,
+                    "members": [{ "vm": web["id"], "mac": web["spec"]["nics"][0]["mac"], "port": 80 }] }] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, role) = admin
+        .post(
+            "/access-roles",
+            json!({ "name": "reader", "privileges": ["system.read"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let (status, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "carol", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({ "principal": { "type": "user", "id": user["id"] },
+                "role": { "type": "custom", "id": role["id"] },
+                "target": { "type": "folder", "id": folders[0] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let carol = env.login("carol", "password-1").await;
+    let (status, topo) = carol
+        .get(&format!("/network-topology?folder={}", folders[0]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{topo}");
+    let member = &topo["load_balancers"][0]["members"][0];
+    assert!(member["vm"].is_null() && member["ip"].is_null(), "{topo}");
+    // 관리자는 주소를 본다.
+    let (_, topo) = admin.get("/network-topology").await;
+    assert!(
+        topo["load_balancers"][0]["members"][0]["ip"].is_string(),
+        "{topo}"
+    );
+    let (status, body) = carol
+        .get(&format!("/network-topology?folder={}", folders[1]))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+    // 잠금 미리 확인: 127.0.0.2(NB)와 Raft 상대 172.16.0.9가 밖이다.
+    let mut status_ = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status_.sdn.as_mut().unwrap().raft_peers = vec!["172.16.0.9".parse().unwrap()];
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status_)
+        .await
+        .unwrap();
+    let (status, check) = admin
+        .post("/sdn/lockdown?dry_run=true", json!({ "enabled": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{check}");
+    assert_eq!(
+        check["outside"],
+        json!([{ "central": "node1", "peer": "127.0.0.2" },
+               { "central": "node1", "peer": "172.16.0.9", "raft": true }]),
+        "{check}"
+    );
+    let (status, body) = admin
+        .post("/sdn/lockdown", json!({ "enabled": true }))
+        .await;
+    code(
+        status,
+        &body,
+        StatusCode::CONFLICT,
+        "lockdown_peers_outside",
+    );
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("172.16.0.9 on node1 (Raft)"),
+        "{body}"
+    );
+}

@@ -80,6 +80,25 @@ fn a_laid_bridge_is_an_l2gateway_port_and_a_dhcp_router() {
     );
 }
 
+/// 한 대상 스위치에 다리 둘이면 물리 L2와 고리가 생긴다(리뷰 1 I1): id가 가장 낮은 옮기기만 놓는다.
+#[test]
+fn one_target_switch_gets_one_bridge() {
+    let nets = networks();
+    let (a, b) = (
+        migration(Some(Uuid::now_v7())),
+        migration(Some(Uuid::now_v7())),
+    );
+    let first = a.id.min(b.id);
+    let both = state(&nets, &[b.clone(), a.clone()]);
+    let gateways: Vec<&str> = both.switches[0]
+        .ports
+        .iter()
+        .filter(|p| p.kind == "l2gateway")
+        .map(|p| p.name.as_str())
+        .collect();
+    assert_eq!(gateways, [l2gateway_port_name(first).as_str()]);
+}
+
 #[tokio::test]
 async fn the_bridge_is_written_once_and_taken_away() {
     let nb = Nb::new().await;

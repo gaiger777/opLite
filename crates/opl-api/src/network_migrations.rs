@@ -79,15 +79,87 @@ fn configures<'a>(
     }
 }
 
+/// 부른 사용자가 VM을 읽을 수 있는지(`system.read` — 계획에 이름·MAC·주소를 낼지, 리뷰 1 I3)
+fn reads<'a>(state: &'a AppState, principal: &'a Principal) -> impl Fn(&Vm) -> bool + Sync + 'a {
+    move |vm: &Vm| {
+        state
+            .authz
+            .allows(principal, Privilege::SystemRead, vm.authz_target())
+    }
+}
+
+/// 부른 사용자가 VM `id`를 읽을 수 있는지. 지운 VM은 감출 것이 없어 참이다.
+pub(crate) fn sees_vm(state: &AppState, principal: &Principal, id: Uuid) -> bool {
+    match state.cluster.get::<VmSpec>(id) {
+        Ok(Some(vm)) => reads(state, principal)(&vm),
+        Ok(None) => true,
+        Err(_) => false,
+    }
+}
+
+/// 옮기기 보기에서 부른 사용자가 읽을 수 없는 VM의 기록(MAC·주소·까닭)과 준 주소를 뺀다(리뷰 1 I3 — `GET`·목록·watch).
+pub(crate) fn redact(state: &AppState, principal: &Principal, m: &mut NetworkMigration) {
+    m.status.vms.retain(|v| sees_vm(state, principal, v.vm));
+    m.spec.addresses.retain(|a| sees_vm(state, principal, a.vm));
+}
+
+/// [`redact`]의 JSON 판(watch 이벤트의 스펙·상태)
+pub(crate) fn redact_json(
+    state: &AppState,
+    principal: &Principal,
+    spec: &mut serde_json::Value,
+    status: &mut serde_json::Value,
+) {
+    let keep = |item: &serde_json::Value| {
+        item["vm"]
+            .as_str()
+            .and_then(|s| s.parse::<Uuid>().ok())
+            .is_none_or(|id| sees_vm(state, principal, id))
+    };
+    if let Some(vms) = status.get_mut("vms").and_then(|v| v.as_array_mut()) {
+        vms.retain(keep);
+    }
+    if let Some(addresses) = spec.get_mut("addresses").and_then(|v| v.as_array_mut()) {
+        addresses.retain(keep);
+    }
+}
+
+/// 이름을 주지 않은 옮기기의 이름: `<원본>-to-<대상>`, 쓰였으면 `-2`, `-3` …(63자 안 — 끝난 옮기기의 기록이 이름을 쥐고 있어도
+/// 같은 원본·대상을 다시 옮길 수 있게, 리뷰 1 웹 I2)
+pub(crate) fn pick_name(source: &str, target: &str, taken: impl Fn(&str) -> bool) -> String {
+    let base = format!("{source}-to-{target}");
+    let fit = |suffix: &str| {
+        let mut b = base.clone();
+        b.truncate(63 - suffix.len());
+        let b = b.trim_end_matches('-');
+        format!("{b}{suffix}")
+    };
+    (1..)
+        .map(|n| {
+            fit(&if n == 1 {
+                String::new()
+            } else {
+                format!("-{n}")
+            })
+        })
+        .find(|name| !taken(name))
+        .unwrap_or(base)
+}
+
 /// 계획할 VM(스펙의 `vms`, 없으면 원본에 NIC가 있는 VM) 가운데 켜진 것의 게스트 에이전트 정보(캐시 — §9.2 주소 출처
-/// `guest-agent`). 답하지 않는 VM은 빠진다(주소를 모름).
-async fn guests(state: &AppState, spec: &NetworkMigrationSpec) -> BTreeMap<Uuid, GuestInfo> {
+/// `guest-agent`). 답하지 않는 VM은 빠진다(주소를 모름). 부른 사용자가 읽을 수 없는 VM은 묻지 않는다(리뷰 1 I3).
+async fn guests(
+    state: &AppState,
+    principal: &Principal,
+    spec: &NetworkMigrationSpec,
+) -> BTreeMap<Uuid, GuestInfo> {
     let Ok((_, vms)) = state.cluster.list::<VmSpec>() else {
         return BTreeMap::new();
     };
+    let sees = reads(state, principal);
     let wanted: Vec<Vm> = vms
         .into_iter()
-        .filter(|v| !v.spec.template)
+        .filter(|v| !v.spec.template && sees(v))
         .filter(|v| {
             if spec.vms.is_empty() {
                 v.spec.nics.iter().any(|n| n.network == spec.source)
@@ -145,6 +217,9 @@ pub async fn list_network_migrations(
     let (revision, items) = state.cluster.list::<NetworkMigrationSpec>()?;
     let mut items = state.authz.filter(&principal, items)?;
     items.sort_by(|a, b| a.name.cmp(&b.name));
+    for m in &mut items {
+        redact(&state, &principal, m);
+    }
     Ok(Json(NetworkMigrationList { revision, items }))
 }
 
@@ -154,15 +229,21 @@ pub async fn list_network_migrations(
     responses((status = 200, body = Resource<NetworkMigrationSpec, NetworkMigrationStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn get_network_migration(
     State(state): State<Arc<AppState>>,
+    principal: Principal,
     Path(key): Path<String>,
 ) -> Result<Json<NetworkMigration>, ApiError> {
-    Ok(Json(lookup::<NetworkMigrationSpec>(&state.cluster, &key)?))
+    let mut m = lookup::<NetworkMigrationSpec>(&state.cluster, &key)?;
+    redact(&state, &principal, &mut m);
+    Ok(Json(m))
 }
 
 /// `POST /network-migrations`
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateNetworkMigration {
+    /// 비면 `<원본>-to-<대상>`(쓰였으면 `-2`, `-3` …)
+    #[serde(default)]
+    #[schema(default)]
     pub name: String,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
@@ -188,10 +269,12 @@ pub struct NetworkMigrationCreated {
 }
 
 /// 옮기기를 계획하고 만든다(계획 67 §9.2): `dry_run`이면 리소스 없이 계획만(200), 아니면 계획을 `status.vms`에 적은
-/// `planned` 리소스(201 — 시작은 `POST …/start`). 켜진 VM의 주소는 게스트 에이전트가 알린 것을 쓴다. 원본의
+/// `planned` 리소스(201 — 시작은 `POST …/start`). 이름을 주지 않으면 `<원본>-to-<대상>`(쓰였으면 `-2` …)이다. 켜진 VM의
+/// 주소는 게스트 에이전트가 알린 것을 쓴다. 부른 사용자가 읽을 수 없는 VM은 계획에 없고 수(`hidden`)만 있다. 원본의
 /// `network.config`·대상의 `network.assign`, 폴더(없으면 원본 네트워크의 폴더)의 `network.config`. 권한이 없는 VM은
 /// 계획에서 막힌다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙·네트워크는 400
-/// `invalid_migration`, 같은 원본의 끝나지 않은 옮기기·다른 옮기기의 VM은 409. 계획에 경고가 있으면
+/// `invalid_migration`, 같은 원본·같은 다리 대상의 끝나지 않은 옮기기·다른 옮기기의 VM은 409 `migration_overlap`. 계획에
+/// 경고가 있으면
 /// `orbivisor-warning`에 그 수.
 #[utoipa::path(post, path = "/network-migrations", tag = "network-migrations",
     params(DryRunQuery),
@@ -208,8 +291,21 @@ pub async fn create_network_migration(
     Json(req): Json<CreateNetworkMigration>,
 ) -> Result<Response, ApiError> {
     require_services(&state)?;
-    check_name(&req.name)?;
+    if !req.name.is_empty() {
+        check_name(&req.name)?;
+    }
     require_networks(&state, &principal, &req.spec)?;
+    // 읽을 수 없는 VM은 없는 VM과 같다(리뷰 1 I3 — 있는지도 캐 보지 못하게).
+    for id in req
+        .spec
+        .vms
+        .iter()
+        .chain(req.spec.addresses.iter().map(|a| &a.vm))
+    {
+        if !sees_vm(&state, &principal, *id) {
+            return Err(invalid(format!("VM {id} not found")));
+        }
+    }
     let folder = match req.spec.folder {
         Some(f) => Some(f),
         None => state
@@ -223,20 +319,47 @@ pub async fn create_network_migration(
         Kind::NetworkMigration,
         folder,
     )?;
-    let guests = Box::pin(guests(&state, &req.spec)).await;
+    let guests = Box::pin(guests(&state, &principal, &req.spec)).await;
     let allowed = configures(&state, &principal);
+    let sees = reads(&state, &principal);
     if query.dry_run {
-        let plan = engine::plan_migration(&state.cluster, &req.spec, &guests, &allowed)?;
+        let plan = engine::plan_migration(&state.cluster, &req.spec, &guests, &allowed, &sees)?;
         return Ok((StatusCode::OK, Json(plan)).into_response());
     }
-    let (mut migration, plan) = engine::create_migration(
-        &state.cluster,
-        &req.name,
-        req.spec.clone(),
-        &guests,
-        &allowed,
-    )
-    .await?;
+    // 이름을 주지 않았으면 고른다. 두 요청이 같은 이름을 골랐으면 다시 고른다.
+    let mut tries = 0;
+    let (mut migration, plan) = loop {
+        tries += 1;
+        let name = if req.name.is_empty() {
+            pick_name(&req.spec.source, &req.spec.target, |n| {
+                state
+                    .cluster
+                    .get_by_name::<NetworkMigrationSpec>(n)
+                    .is_ok_and(|m| m.is_some())
+            })
+        } else {
+            req.name.clone()
+        };
+        match engine::create_migration(
+            &state.cluster,
+            &name,
+            req.spec.clone(),
+            &guests,
+            &allowed,
+            &sees,
+        )
+        .await
+        {
+            Err(e)
+                if req.name.is_empty()
+                    && tries < 5
+                    && matches!(e.code, "already_exists" | "name_taken") =>
+            {
+                continue;
+            }
+            other => break other?,
+        }
+    };
     if !req.labels.is_empty() {
         // 라벨은 만든 뒤 붙인다(엔진은 이름·스펙만 받는다).
         migration.revision = state
@@ -300,14 +423,15 @@ fn require_step(
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MigrationStartRequest {
-    /// 다리 노드(이름이나 id)를 바꾼다(§13 — 다리 노드를 클러스터에서 지워 멈춘 옮기기를 다른 노드로 이어 간다). 놓인
-    /// 다리가 살아 있는 노드에 있으면 바꿀 수 없다(409 `migration_bridge_laid`).
+    /// 다리 노드(이름이나 id)를 바꾼다(§13 — 다리 노드를 클러스터에서 지웠거나 그 노드가 꺼져 멈춘 옮기기를 다른 노드로
+    /// 이어 간다). 놓인 다리가 온라인 노드에 있으면 바꿀 수 없다(409 `migration_bridge_laid`).
     #[serde(default)]
     #[schema(nullable = false, default)]
     pub bridge_node: Option<String>,
 }
 
-/// 다리 노드를 바꾼다(스펙 `bridge_node`). 놓인 다리가 지운 노드에 있으면 그 기록을 지운다.
+/// 다리 노드를 바꾼다(스펙 `bridge_node`). 놓인 다리가 오프라인 노드에 있으면 그 기록을 지운다(지운 노드의 기록은
+/// 엔진이 없는 것으로 본다).
 async fn set_bridge_node(
     state: &AppState,
     m: &NetworkMigration,
@@ -315,14 +439,20 @@ async fn set_bridge_node(
 ) -> Result<Option<String>, ApiError> {
     let node = lookup::<NodeSpec>(&state.cluster, key)
         .map_err(|_| invalid(format!("node {key:?} not found")))?;
-    if let Some(b) = &m.status.bridge
-        && b.node != node.id
-        && state.cluster.get::<NodeSpec>(b.node)?.is_some()
-    {
+    // 놓인 다리가 살아 있는 다른 노드에 있으면 바꾸지 않는다. 지운 노드·오프라인 노드면 바꾼다(리뷰 1 M5 — 꺼진 노드의
+    // 다리는 이미 끊겼다. 그 노드가 돌아오면 에이전트가 기록에 없는 다리를 걷는다).
+    let laid_elsewhere = match &m.status.bridge {
+        Some(b) if b.node != node.id => state
+            .cluster
+            .get::<NodeSpec>(b.node)?
+            .map(|n| n.status.online),
+        _ => None,
+    };
+    if laid_elsewhere == Some(true) {
         return Err(ApiError::conflict(
             "migration_bridge_laid",
             format!(
-                "network migration {:?} has its bridge on another node; finish or roll back the migration first",
+                "network migration {:?} has its bridge on another node that is online; finish or roll back the migration first",
                 m.name
             ),
         ));
@@ -347,6 +477,11 @@ async fn set_bridge_node(
                 ),
                 e => e.into(),
             })?;
+    }
+    if laid_elsewhere == Some(false) {
+        engine::forget_bridge(&state.cluster, m.id)
+            .await
+            .map_err(|e| ApiError::conflict("busy", e))?;
     }
     Ok(Some(node.name))
 }
@@ -602,7 +737,28 @@ mod tests {
                 error: None,
                 warnings: Vec::new(),
             },
+            hidden: 0,
         };
         assert_eq!(plan_summary(&plan), "3 VMs, live 2, restart 1");
+    }
+
+    /// 리뷰 1 웹 I2: 이름을 주지 않은 옮기기는 쓰이지 않은 첫 이름(63자 안, `-`로 끝나지 않음)
+    #[test]
+    fn free_names_count_up_and_fit() {
+        assert_eq!(pick_name("lan", "t-lan", |_| false), "lan-to-t-lan");
+        let taken = ["lan-to-t-lan", "lan-to-t-lan-2"];
+        assert_eq!(
+            pick_name("lan", "t-lan", |n| taken.contains(&n)),
+            "lan-to-t-lan-3"
+        );
+        let long = "a".repeat(60);
+        let first = pick_name(&long, "bc", |_| false);
+        assert_eq!(first.len(), 63, "{first}");
+        let second = pick_name(&long, "bc", |n| n == first);
+        assert!(second.len() <= 63 && second.ends_with("-2"), "{second}");
+        // 잘린 끝의 `-`는 뺀다.
+        let name = pick_name(&"x".repeat(58), "yy", |_| false);
+        assert!(!name.ends_with('-'), "{name}");
+        opl_types::resource::validate_name(&name).unwrap();
     }
 }

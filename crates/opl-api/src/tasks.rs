@@ -159,6 +159,8 @@ pub struct TaskRunnerConfig {
     pub state_dir_min_age: Duration,
     /// 이 노드의 CPU 다시 읽기(계획 63). 없으면 `node-cpu-probe` Task는 실패한다.
     pub cpu: Option<Arc<dyn crate::cpu::CpuRefresher>>,
+    /// 네트워크 옮기기(계획 67)가 VM 하나의 끄기·켜기·핫플러그를 기다리는 한도(기본 15분 — 시험은 줄인다)
+    pub migration_vm_wait: Duration,
 }
 
 impl TaskRunnerConfig {
@@ -191,6 +193,7 @@ impl TaskRunnerConfig {
             download_allow_private: false,
             state_dir_min_age: firmware::STATE_DIR_MIN_AGE,
             cpu: None,
+            migration_vm_wait: network_migrate::VM_WAIT,
         }
     }
 }

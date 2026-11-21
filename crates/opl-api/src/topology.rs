@@ -276,7 +276,14 @@ pub async fn network_topology(
             .allows(&principal, Privilege::SystemRead, o.target())
     };
     let within: Option<BTreeSet<Uuid>> = match query.folder {
-        Some(root) => Some(subtree(&c.list::<FolderSpec>()?.1, root)),
+        Some(root) => {
+            let folders = c.list::<FolderSpec>()?.1;
+            // 읽을 수 없는 폴더는 없는 폴더와 같다(리뷰 1 M6 — 남의 폴더의 감춘 수를 캐 보지 못하게).
+            if !folders.iter().any(|f| f.id == root && reads(f)) {
+                return Err(ApiError::not_found(format!("folder {root} not found")));
+            }
+            Some(subtree(&folders, root))
+        }
         None => None,
     };
     let in_scope = |folder: Option<Uuid>| {
@@ -437,6 +444,7 @@ pub async fn network_topology(
 
     // VM(읽을 수 있는 것, 그림의 네트워크에 NIC가 있는 것)
     let vms = c.list::<VmSpec>()?.1;
+    let unreadable_vms: BTreeSet<Uuid> = vms.iter().filter(|v| !reads(*v)).map(|v| v.id).collect();
     let mut readable_vms = BTreeSet::new();
     for vm in vms.iter().filter(|v| !v.spec.template) {
         let nics: Vec<TopoNic> = vm
@@ -500,7 +508,10 @@ pub async fn network_topology(
                 .iter()
                 .map(|m| TopoLbMember {
                     vm: m.vm.filter(|id| readable_vms.contains(id)),
-                    ip: m.ip,
+                    // 읽을 수 없는 VM 멤버의 주소는 내지 않는다(리뷰 1 M6).
+                    ip: m
+                        .ip
+                        .filter(|_| !m.vm.is_some_and(|id| unreadable_vms.contains(&id))),
                     health: m.health,
                 })
                 .collect(),

@@ -848,6 +848,15 @@ async fn lockdown_firewall_and_peers() {
         env.calls_of("ss")
             .contains(&"ss -tnH state established ( sport = :6641 or sport = :6642 )".to_string())
     );
+    // Raft 상대(리뷰 1 I5)
+    assert_eq!(
+        env.host.central_raft_peers().await.unwrap(),
+        [ip("10.0.0.2")]
+    );
+    assert!(
+        env.calls_of("ss")
+            .contains(&"ss -tnH state established ( sport = :6643 or sport = :6644 )".to_string())
+    );
 }
 
 /// 리더·멤버 기다리기와 그 시간 초과

@@ -103,7 +103,7 @@ cargo test -p oplctl routing                                        # router·fi
 pnpm -C web test src/routing src/nodes src/security-groups          # 라우터 서랍·유동 IP 붙이기·노드 physnet 카드·NIC 수(msw)
 # SDN 서비스(계획 67)
 cargo test -p opl-types -- load_balancer qos network_migration alert::sdn sdn   # 순수: LB·QoS·옮기기 검증 표, lb vips·ip_port_mappings, qos nic_rows·tc_commands(남의 필터 보존), migration plan(방식·주소 출처·막힘), allow_sets, SDN 경보 평가 표
-cargo test -p opl-cluster                                           # ip 겹침(LB 셋)·lb-listener·migration-source·migration-vm, 할당량 networks·load_balancers와 바깥 VIP의 floating_ips
+cargo test -p opl-cluster                                           # ip 겹침(LB 셋)·lb-listener·migration-source·migration-vm·migration-target, 할당량 networks·load_balancers와 바깥 VIP의 floating_ips
 cargo test -p opl-api ovn_sync                                      # LB·건강 검사·QoS·l2gateway 행(가짜 NB), 같은 차례 붙이기, 계획 66 고정물에 연산 0개
 cargo test -p opl-api --test sdn_services --test network_migrate    # 기능 게이트, 권한, LB·QoS·할당량·유동 IP 떼기·잠금 미리 확인·토폴로지 감추기, 옮기기 상태 머신(라이브 실패·재시작·이어 하기·다리 노드 지움)
 cargo test -p opl-driver -- relink tc ovn::lockdown units           # tap 옮기기 명령, tc 명령, nftables 잠금 글·ss 파싱, sb.json·northd 단위(끔은 계획 66 글 그대로)

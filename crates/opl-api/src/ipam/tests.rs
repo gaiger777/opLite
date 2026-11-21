@@ -397,7 +397,7 @@ fn routers_and_floating_ips_hold_addresses() {
     let mut taken = spec(vec![nic("ext", 2, &["203.0.113.4"])]);
     let e = assign(&mut taken, None, &[], &nets, &held, &|_| true).unwrap_err();
     assert_eq!(e.code, "ip_in_use");
-    assert!(e.message.contains("router or floating IP"), "{}", e.message);
+    assert!(e.message.contains("router, floating IP"), "{}", e.message);
     let mut s = spec(vec![nic("ext", 3, &[])]);
     let warnings = assign_new(&mut s, &[], &nets, &held).unwrap();
     assert!(warnings.is_empty());
@@ -502,4 +502,65 @@ fn provider_nic_addresses_stay_in_the_pools() {
     let current = spec("ext", "203.0.113.5");
     assert!(check_provider_ips(&spec("ext", "203.0.113.5"), Some(&current), &nets).is_ok());
     assert!(check_provider_ips(&spec("t1", "10.0.0.50"), None, &nets).is_ok());
+}
+
+/// 리뷰 1 I2: 끝나지 않은 옮기기의 계획 주소와 원본 VM의 cloud-init 고정 주소(대상 서브넷 안)는 대상에서 쓴 주소다. 옮기는
+/// VM 자신(`except_vm`)과 끝난 옮기기의 것은 빼고, 대상 서브넷 밖의 고정 주소도 뺀다.
+#[test]
+fn unfinished_migrations_hold_their_addresses() {
+    use opl_types::network_migration::{MigrationPhase, NetworkMigration, VmMove};
+    let nets = networks();
+    let mut a = vm("a", vec![nic("lan", 1, &[])]);
+    a.spec.cloud_init = Some(CloudInit {
+        networks: vec![CloudInitNet {
+            ipv4: Some(IpConfig::Static {
+                address: "10.0.0.4/29".into(),
+                gateway: None,
+            }),
+            ..CloudInitNet::default()
+        }],
+        ..CloudInit::default()
+    });
+    let mut far = vm("far", vec![nic("lan", 2, &[])]);
+    far.spec.cloud_init = Some(CloudInit {
+        networks: vec![CloudInitNet {
+            ipv4: Some(IpConfig::Static {
+                address: "192.168.9.9/24".into(),
+                gateway: None,
+            }),
+            ..CloudInitNet::default()
+        }],
+        ..CloudInit::default()
+    });
+    let b = vm("b", vec![nic("lan", 3, &[])]);
+    let mut m: NetworkMigration = Resource::new(
+        "m",
+        serde_json::from_value(json!({ "source": "lan", "target": "tenant" })).unwrap(),
+    );
+    let rec: VmMove = serde_json::from_value(json!({
+        "vm": b.id, "nic": 0, "mac": "52:54:00:00:00:03", "mode": "live", "ips": ["10.0.0.5"],
+        "address_source": "guest-agent", "from": { "network": "lan" }, "state": "pending"
+    }))
+    .unwrap();
+    m.status.vms = vec![rec];
+    let vms = vec![a.clone(), far, b.clone()];
+    let held = migration_held(std::slice::from_ref(&m), &vms, &nets, None);
+    assert_eq!(held["tenant"], [ip("10.0.0.4"), ip("10.0.0.5")].into());
+    let held = migration_held(std::slice::from_ref(&m), &vms, &nets, Some(b.id));
+    assert_eq!(held["tenant"], [ip("10.0.0.4")].into());
+    // 새 NIC는 잡힌 주소를 받지 않는다.
+    let mut s = spec(vec![nic("tenant", 9, &[])]);
+    let all = migration_held(std::slice::from_ref(&m), &vms, &nets, None);
+    assign_new(&mut s, &[], &nets, &all).unwrap();
+    assert!(
+        !all["tenant"].contains(&s.nics[0].ips[0]),
+        "{:?}",
+        s.nics[0]
+    );
+    let mut s = spec(vec![nic("tenant", 9, &["10.0.0.5"])]);
+    let warnings = assign_new(&mut s, &[], &nets, &all).unwrap();
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    // 끝난 옮기기는 잡지 않는다.
+    m.status.phase = MigrationPhase::Finished;
+    assert!(migration_held(&[m], &vms, &nets, None).is_empty());
 }

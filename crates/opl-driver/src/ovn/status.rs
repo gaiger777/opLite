@@ -27,6 +27,8 @@ pub struct ClusterStatus {
     pub leader: Option<String>,
     /// 클러스터의 서버들(이 서버 포함)
     pub servers: Vec<ClusterServer>,
+    /// 선거 시간(`Election timer:`, ms)
+    pub election_timer_ms: Option<u64>,
 }
 
 /// `cluster/status`의 `Servers:` 줄 하나
@@ -37,6 +39,8 @@ pub struct ClusterServer {
     /// Raft 주소
     pub address: String,
     pub is_self: bool,
+    /// 그 서버에게서 마지막으로 받은 지(`last msg N ms ago` — 리더는 모든 팔로어, 팔로어는 리더만 적는다)
+    pub last_msg_ms: Option<u64>,
 }
 
 impl ClusterStatus {
@@ -48,6 +52,40 @@ impl ClusterStatus {
     /// 이 서버가 리더다.
     pub fn is_leader(&self) -> bool {
         self.is_member() && self.role == "leader"
+    }
+
+    /// Raft가 온전한지(리뷰 1 I5 — 잠금 방화벽을 건 뒤): 멤버이고 리더나 팔로어이며 리더를 알고, 리더면 다른 모든 서버에게서,
+    /// 팔로어면 리더에게서 `max_age_ms` 안에 받았다. 아니면 그 까닭
+    pub fn raft_intact(&self, max_age_ms: u64) -> Result<(), String> {
+        let db = &self.name;
+        if !self.is_member() || !matches!(self.role.as_str(), "leader" | "follower") {
+            return Err(format!("{db} is {} ({})", self.status, self.role));
+        }
+        let Some(leader) = self.leader.as_deref() else {
+            return Err(format!("{db} has no leader"));
+        };
+        let fresh = |s: &ClusterServer| s.last_msg_ms.is_some_and(|ms| ms <= max_age_ms);
+        let stale: Vec<&str> = if leader == "self" {
+            self.servers
+                .iter()
+                .filter(|s| !s.is_self && !fresh(s))
+                .map(|s| s.address.as_str())
+                .collect()
+        } else {
+            self.servers
+                .iter()
+                .filter(|s| s.sid == leader && !fresh(s))
+                .map(|s| s.address.as_str())
+                .collect()
+        };
+        if stale.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{db} has not heard from {} in {max_age_ms} ms",
+                stale.join(", ")
+            ))
+        }
     }
 
     /// 노드 상태(`CentralHealth`)에 쓰는 역할: 멤버면 리더·팔로어·후보, 합류 중이면 `Joining`, 그 밖은 `Unknown`
@@ -126,6 +164,7 @@ pub fn parse_cluster_status(text: &str) -> Result<ClusterStatus, String> {
             .unwrap_or_default(),
         leader,
         servers,
+        election_timer_ms: fields.get("Election timer").and_then(|t| t.parse().ok()),
     })
 }
 
@@ -138,10 +177,15 @@ fn parse_server(line: &str) -> Option<ClusterServer> {
     let (sid, rest) = line.split_once(' ')?;
     let inner = rest.strip_prefix('(')?.split_once(')')?.0;
     let (_, address) = inner.split_once(" at ")?;
+    let last_msg_ms = rest
+        .split_once("last msg ")
+        .and_then(|(_, t)| t.split_whitespace().next())
+        .and_then(|n| n.parse().ok());
     Some(ClusterServer {
         sid: sid.to_string(),
         address: address.to_string(),
         is_self: rest.contains("(self)"),
+        last_msg_ms,
     })
 }
 
@@ -298,8 +342,12 @@ mod tests {
                 sid: "4f28".into(),
                 address: "ssl:127.0.0.1:6643".into(),
                 is_self: true,
+                last_msg_ms: None,
             }]
         );
+        assert_eq!(s.election_timer_ms, Some(1000));
+        // 혼자인 리더는 늘 온전하다.
+        assert_eq!(s.raft_intact(2000), Ok(()));
         let sb = parse_cluster_status(SB_LEADER).unwrap();
         assert_eq!(sb.name, "OVN_Southbound");
         assert_eq!(sb.address, "ssl:127.0.0.1:6644");
@@ -334,6 +382,34 @@ mod tests {
         let l = parse_cluster_status(LEADER_TWO).unwrap();
         assert_eq!(l.servers.len(), 2);
         assert!(l.is_leader());
+    }
+
+    /// 잠금 방화벽 뒤 Raft 확인(리뷰 1 I5): 리더는 팔로어에게서, 팔로어는 리더에게서 최근에 받아야 한다.
+    #[test]
+    fn raft_is_intact_only_with_fresh_messages() {
+        let l = parse_cluster_status(LEADER_TWO).unwrap();
+        assert_eq!(l.servers[0].last_msg_ms, Some(331));
+        assert_eq!(l.raft_intact(2000), Ok(()));
+        let err = l.raft_intact(300).unwrap_err();
+        assert!(err.contains("ssl:127.0.0.2:6643"), "{err}");
+        let f = parse_cluster_status(FOLLOWER).unwrap();
+        assert_eq!(f.raft_intact(2000), Ok(()));
+        let cut = FOLLOWER.replace("last msg 331 ms ago", "last msg 9000 ms ago");
+        assert!(
+            parse_cluster_status(&cut)
+                .unwrap()
+                .raft_intact(2000)
+                .is_err()
+        );
+        let lost = FOLLOWER
+            .replace("Role: follower", "Role: candidate")
+            .replace("Leader: 4f28", "Leader: unknown");
+        assert!(
+            parse_cluster_status(&lost)
+                .unwrap()
+                .raft_intact(2000)
+                .is_err()
+        );
     }
 
     /// 떠난 서버(`unknown cluster`)나 다른 출력은 오류다.

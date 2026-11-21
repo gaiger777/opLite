@@ -38,7 +38,7 @@ use crate::auth::Principal;
 use crate::authz::AuthzObject;
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json, Query};
-use crate::ipam::{RETRIES, held_ips, is_ip_taken};
+use crate::ipam::{HeldIps, RETRIES, held_ips, is_ip_taken};
 use crate::ovn_sync::{MonitorState, nb};
 use crate::resources::{check_name, if_match, lookup};
 use crate::routing::{ipam_error, is_admin, present, warning_header};
@@ -73,12 +73,15 @@ struct World {
     vms: Vec<Vm>,
     nodes: Vec<Node>,
     groups: Vec<SecurityGroup>,
+    /// 끝나지 않은 옮기기가 대상 네트워크에 잡아 둔 주소(리뷰 1 I2 — VIP·건강 검사 주소로 고르지 않는다)
+    migrating: HeldIps,
 }
 
 impl World {
     fn load(state: &AppState) -> Result<Self, ApiError> {
         let c = &state.cluster;
         Ok(World {
+            migrating: crate::ipam::load_migration_held(c, None)?,
             lbs: c.list::<LoadBalancerSpec>()?.1,
             routers: c.list::<RouterSpec>()?.1,
             fips: c.list::<FloatingIpSpec>()?.1,
@@ -111,7 +114,8 @@ impl World {
 
     /// 네트워크 `network`에서 VM NIC·라우터 바깥·유동 IP·부하 분산기(`except` 말고)가 쓰는 주소
     fn used(&self, network: &str, except: Option<Uuid>) -> BTreeSet<IpAddr> {
-        let held = held_ips(&self.routers, &self.fips, &self.lbs, except);
+        let mut held = held_ips(&self.routers, &self.fips, &self.lbs, except);
+        crate::ipam::merge_held(&mut held, self.migrating.clone());
         crate::ipam::network_used(&self.vms, &held, network)
     }
 }

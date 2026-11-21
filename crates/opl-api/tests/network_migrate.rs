@@ -58,6 +58,11 @@ struct T {
 impl T {
     /// 이 노드가 chassis(핫플러그 기록 있음)이고 단순 네트워크 `lan`(브리지 br0)과 같은 CIDR의 SDN 오버레이 `t-lan`이 있다.
     async fn start() -> Self {
+        Self::start_with(|_| {}).await
+    }
+
+    /// [`T::start`]에 Task 실행기 설정 `tweak`을 더한다.
+    async fn start_with(tweak: impl FnOnce(&mut opl_api::TaskRunnerConfig)) -> Self {
         let mut env = Env::start().await;
         let tmp = env.dir.path().join("ovn");
         env.stop_runner().await;
@@ -65,6 +70,7 @@ impl T {
         Box::pin(
             env.start_runner_config(Arc::new(FakeStorage::default()), move |c| {
                 c.sdn = Some(host);
+                tweak(c);
             }),
         )
         .await;
@@ -582,6 +588,15 @@ async fn add_dead_node(env: &Env, name: &str) -> Uuid {
     r.id
 }
 
+async fn set_online(env: &Env, node: Uuid, online: bool) {
+    let mut n = env.cluster.get::<NodeSpec>(node).unwrap().unwrap();
+    n.status.online = online;
+    env.cluster
+        .update_status::<NodeSpec>(node, &n.status)
+        .await
+        .unwrap();
+}
+
 /// 계획 67 §13: 다리 노드를 클러스터에서 지우면 옮기기는 `paused`(까닭)가 되고 다리 기록이 지워진다. `resume`에
 /// `bridge_node`를 주면 그 노드로 다리를 다시 놓고 이어 간다. 살아 있는 다른 노드에 다리가 놓였으면 바꾸지 못한다.
 #[tokio::test]
@@ -599,6 +614,7 @@ async fn a_removed_bridge_node_pauses_the_migration() {
 
     // 살아 있는 다른 노드에 다리가 있으면 다리 노드를 바꾸지 못한다.
     let other = add_dead_node(&t.env, "other").await;
+    set_online(&t.env, other, true).await;
     let mut status = t.migration(m.id).status;
     status.bridge.as_mut().unwrap().node = other;
     t.env
@@ -612,6 +628,7 @@ async fn a_removed_bridge_node_pauses_the_migration() {
         .await;
     assert_eq!(status, StatusCode::CONFLICT, "{err}");
     assert_eq!(err["code"], "migration_bridge_laid", "{err}");
+    set_online(&t.env, other, false).await;
 
     // 그 노드를 지우면 옮기기가 멈추고 다리 기록이 지워진다.
     let (status, body) = t.admin.delete("/nodes/other").await;
@@ -649,4 +666,387 @@ async fn a_removed_bridge_node_pauses_the_migration() {
         "{audit}"
     );
     agent.abort();
+}
+
+/// 리뷰 1 M5: 다리 노드가 오프라인이면(지우지 않았어도) `resume --bridge-node`로 다른 노드에 다리를 다시 놓는다.
+#[tokio::test]
+async fn an_offline_bridge_node_can_be_replaced() {
+    let t = T::start().await;
+    t.vm("a", Some("10.66.0.11"), false).await;
+    t.vm("b", Some("10.66.0.12"), false).await;
+    let m = t
+        .create(json!({ "source": "lan", "target": "t-lan", "vms": [] }))
+        .await;
+    let agent = t.bridge_agent(m.id);
+    // 다리가 오프라인 노드에 놓였고 옮기기가 멈춘 모습
+    let other = add_dead_node(&t.env, "other").await;
+    let mut status = t.migration(m.id).status;
+    status.bridge = Some(opl_types::network_migration::MigrationBridge {
+        node: other,
+        physnet: "mig00000000".into(),
+    });
+    status.phase = MigrationPhase::Paused;
+    t.env
+        .cluster
+        .update_status::<NetworkMigrationSpec>(m.id, &status)
+        .await
+        .unwrap();
+    let node = t.env.node.to_string();
+    let (status, task) = t
+        .post_step(m.id, "resume", json!({ "bridge_node": node }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let (state, error) = t
+        .wait_task(task["id"].as_str().unwrap().parse().unwrap())
+        .await;
+    assert_eq!(state, TaskState::Succeeded, "{error:?}");
+    let resumed = t.migration(m.id);
+    assert_eq!(resumed.status.bridge.unwrap().node, t.env.node);
+    assert_eq!(resumed.status.phase, MigrationPhase::Moved);
+    agent.abort();
+}
+
+/// 리뷰 1 I1·웹 I2: 한 대상 네트워크에 다리를 놓을 수 있는 옮기기는 하나(다리 없이는 여럿), 이름을 주지 않으면
+/// `<원본>-to-<대상>`이고 쓰였으면 `-2`다.
+#[tokio::test]
+async fn one_bridge_per_target_and_free_names() {
+    let t = T::start().await;
+    let n = Resource::new(
+        "lan2",
+        serde_json::from_value::<NetworkSpec>(json!({ "bridge": "br0", "vlan": 20 })).unwrap(),
+    );
+    t.env.cluster.create(&n).await.unwrap();
+    t.vm("a", Some("10.66.0.11"), false).await;
+    let mut req = vm_request("b");
+    req["spec"]["nics"] = json!([{ "network": "lan2", "model": "virtio" }]);
+    let (status, body) = t.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 이름 `lan-to-t-lan`을 다른 원본(다리 없음)이 먼저 쥔다.
+    let (status, first) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "name": "lan-to-t-lan", "spec": { "source": "lan2", "target": "t-lan", "bridge": false } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{first}");
+    let (status, second) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "spec": { "source": "lan", "target": "t-lan" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{second}");
+    assert_eq!(second["name"], "lan-to-t-lan-2", "{second}");
+    // 다리를 놓는 옮기기가 같은 대상에 또 있으면 409(첫째를 지우고 다리를 놓는 것으로 다시)
+    let (status, _) = t.admin.delete("/network-migrations/lan-to-t-lan").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, err) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "spec": { "source": "lan2", "target": "t-lan" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["code"], "migration_overlap", "{err}");
+}
+
+/// 리뷰 1 I2: 끝나지 않은 옮기기가 계획한 주소(원본의 VM이 아직 쓴다)와 원본 VM의 cloud-init 고정 주소는 대상에서 쓴
+/// 주소다 — 새 VM이 고를 수 없다. 옮기는 VM 자신은 그 주소로 옮겨 간다.
+#[tokio::test]
+async fn planned_addresses_are_held_on_the_target() {
+    let t = T::start().await;
+    t.vm("a", Some("10.66.0.2"), false).await;
+    let m = t
+        .create(json!({ "source": "lan", "target": "t-lan", "bridge": false }))
+        .await;
+    // 준 주소로 새 VM을 만들 수 없고, 주소 없이 만들면 다른 주소를 받는다.
+    let mut req = vm_request("x");
+    req["spec"]["nics"] = json!([{ "network": "t-lan", "model": "virtio", "ips": ["10.66.0.2"] }]);
+    let (status, err) = t.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["code"], "ip_in_use", "{err}");
+    let mut req = vm_request("y");
+    req["spec"]["nics"] = json!([{ "network": "t-lan", "model": "virtio" }]);
+    let (status, y) = t.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{y}");
+    assert_ne!(y["spec"]["nics"][0]["ips"][0], "10.66.0.2", "{y}");
+    // 옮기는 VM은 그 주소로 간다.
+    let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
+    assert_eq!(state, TaskState::Succeeded, "{error:?}");
+    let moved = t.migration(m.id);
+    assert_eq!(moved.status.vms[0].ips, [ip("10.66.0.2")]);
+}
+
+/// 리뷰 1 M1: 원본에 NIC 둘인 VM은 둘 다 옮긴다(첫 NIC를 옮긴 뒤 다시 계획이 "다른 NIC가 대상에 있음"으로 막지 않는다).
+#[tokio::test]
+async fn a_vm_with_two_source_nics_moves_both() {
+    let t = T::start().await;
+    let mut req = vm_request("two");
+    req["spec"]["nics"] = json!([
+        { "network": "lan", "model": "virtio" },
+        { "network": "lan", "model": "virtio" }
+    ]);
+    req["spec"]["cloud_init"] = json!({ "networks": [
+        { "ipv4": { "mode": "static", "address": "10.66.0.21/24" } },
+        { "ipv4": { "mode": "static", "address": "10.66.0.22/24" } }
+    ] });
+    let (status, vm) = t.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let id: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let m = t
+        .create(json!({ "source": "lan", "target": "t-lan", "bridge": false }))
+        .await;
+    assert_eq!(m.status.vms.len(), 2);
+    let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
+    assert_eq!(state, TaskState::Succeeded, "{error:?}");
+    let m = t.migration(m.id);
+    assert!(
+        m.status.vms.iter().all(|v| v.state == MoveState::Moved),
+        "{:?}",
+        m.status.vms
+    );
+    let v = t.vm_of(id);
+    assert!(v.spec.nics.iter().all(|n| n.network == "t-lan"));
+}
+
+/// 리뷰 1 I3: 읽을 수 없는 VM은 계획에 없고(수만), 만든 옮기기의 상태에도 적히지 않으며, 다른 사람이 만든 옮기기를 읽어도
+/// 그 VM의 기록은 빠진다. 스펙에 그 VM을 주면 없는 VM과 같다.
+#[tokio::test]
+async fn unreadable_vms_are_left_out_of_plans_and_records() {
+    let t = T::start().await;
+    let (status, f) = t
+        .admin
+        .post("/folders", json!({ "name": "nf", "kind": "network" }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{f}");
+    let folder: Uuid = f["id"].as_str().unwrap().parse().unwrap();
+    for (name, spec) in [
+        ("lan3", json!({ "bridge": "br0", "folder": folder })),
+        (
+            "t3",
+            json!({ "sdn": {}, "folder": folder, "subnets": [{ "cidr": "10.67.0.0/24" }] }),
+        ),
+    ] {
+        let n = Resource::new(name, serde_json::from_value::<NetworkSpec>(spec).unwrap());
+        t.env.cluster.create(&n).await.unwrap();
+    }
+    let mut ids = Vec::new();
+    for name in ["mine", "theirs"] {
+        let mut req = vm_request(name);
+        req["spec"]["nics"] = json!([{ "network": "lan3", "model": "virtio" }]);
+        let (status, vm) = t.admin.post("/vms", req).await;
+        assert_eq!(status, StatusCode::CREATED, "{vm}");
+        ids.push(vm["id"].as_str().unwrap().to_string());
+    }
+    let (_, user) = t
+        .admin
+        .post(
+            "/users",
+            json!({ "name": "dave", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    for (role, privileges, target) in [
+        (
+            "netop",
+            json!(["network.config", "network.assign", "system.read"]),
+            json!({ "type": "folder", "id": folder }),
+        ),
+        (
+            "vmop",
+            json!(["vm.config", "system.read"]),
+            json!({ "type": "object", "kind": "vm", "id": ids[0] }),
+        ),
+    ] {
+        let (status, r) = t
+            .admin
+            .post(
+                "/access-roles",
+                json!({ "name": role, "privileges": privileges }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{r}");
+        let (status, body) = t
+            .admin
+            .post(
+                "/grants",
+                json!({ "principal": { "type": "user", "id": user["id"] },
+                    "role": { "type": "custom", "id": r["id"] }, "target": target }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    let dave = t.env.login("dave", "password-1").await;
+    let spec = json!({ "source": "lan3", "target": "t3", "bridge": false });
+    let (status, plan) = dave
+        .post("/network-migrations?dry_run=true", json!({ "spec": spec }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{plan}");
+    assert_eq!(plan["nics"].as_array().unwrap().len(), 1, "{plan}");
+    assert_eq!(plan["nics"][0]["name"], "mine");
+    assert_eq!(plan["hidden"], 1, "{plan}");
+    assert!(!plan.to_string().contains(&ids[1]), "{plan}");
+    // 읽을 수 없는 VM을 주면 없는 VM과 같다.
+    let (status, err) = dave
+        .post(
+            "/network-migrations?dry_run=true",
+            json!({ "spec": { "source": "lan3", "target": "t3", "vms": [ids[1]] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    let (status, created) = dave
+        .post("/network-migrations", json!({ "spec": spec }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["status"]["vms"].as_array().unwrap().len(), 1);
+    let (status, _) = t.admin.delete("/network-migrations/lan3-to-t3").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // 관리자가 만든 옮기기를 읽으면 그 VM의 기록이 빠진다(watch 이벤트도).
+    let since = dave.get("/network-migrations").await.1["revision"]
+        .as_u64()
+        .unwrap();
+    let mut ws = watch(
+        &dave,
+        &format!("/watch?kinds=network-migration&since={since}"),
+    )
+    .await;
+    let (status, created) = t
+        .admin
+        .post("/network-migrations", json!({ "spec": spec }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["status"]["vms"].as_array().unwrap().len(), 2);
+    let (status, seen) = dave.get("/network-migrations/lan3-to-t3").await;
+    assert_eq!(status, StatusCode::OK, "{seen}");
+    assert_eq!(seen["status"]["vms"].as_array().unwrap().len(), 1, "{seen}");
+    assert!(!seen.to_string().contains(&ids[1]), "{seen}");
+    let (_, list) = dave.get("/network-migrations").await;
+    assert!(!list.to_string().contains(&ids[1]), "{list}");
+    let ev = loop {
+        let ev = next_event(&mut ws).await;
+        if ev["kind"] == "network-migration" && ev["resource"]["name"] == "lan3-to-t3" {
+            break ev;
+        }
+    };
+    assert_eq!(
+        ev["resource"]["status"]["vms"].as_array().unwrap().len(),
+        1,
+        "{ev}"
+    );
+    assert!(!ev.to_string().contains(&ids[1]), "{ev}");
+}
+
+type Socket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn watch(client: &common::Client, path: &str) -> Socket {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let url = format!("{}/api/v1{path}", client.base.replace("http://", "ws://"));
+    let mut req = url.into_client_request().unwrap();
+    let token = client.token.as_ref().unwrap();
+    req.headers_mut()
+        .insert("authorization", format!("Bearer {token}").parse().unwrap());
+    tokio_tungstenite::connect_async(req).await.unwrap().0
+}
+
+async fn next_event(ws: &mut Socket) -> Value {
+    use futures_util::StreamExt;
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .expect("no message")
+            .unwrap()
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(text) = msg {
+            return serde_json::from_str(&text).unwrap();
+        }
+    }
+}
+
+/// 리뷰 1 M2: 우리 스펙 쓰기 전에 만든 핫플러그 Task가 tap을 옮기지 않고 끝나면 새 Task로 한 번 더 한다(스펙만 대상에 남은 채
+/// 원본에서 돌지 않게).
+#[tokio::test]
+async fn a_stale_hotplug_task_does_not_leave_the_spec_moved() {
+    let t = T::start().await;
+    let b = t.vm("b", Some("10.66.0.12"), true).await;
+    let m = t
+        .create(json!({ "source": "lan", "target": "t-lan", "allow_mtu_shrink": true, "bridge": false }))
+        .await;
+    assert_eq!(m.status.vms[0].mode, PlannedMode::Live);
+    // 다른 노드(없는 노드)에 걸린, 옮기기 전에 만든 핫플러그 Task
+    let mut stale: Resource<TaskSpec, opl_types::task::TaskStatus> = Resource::new(
+        "",
+        TaskSpec {
+            op: opl_types::task::TaskOp::VmHotplug,
+            target: b,
+            node: Uuid::now_v7(),
+        },
+    );
+    stale.name = stale.id.to_string();
+    t.env.cluster.create(&stale).await.unwrap();
+    let cluster = t.env.cluster.clone();
+    let stale_id = stale.id;
+    let finisher = tokio::spawn(async move {
+        // 옮기기가 스펙을 쓰면 옛 Task가 (tap을 옮기지 않고) 끝난다.
+        loop {
+            let vm = cluster.get::<VmSpec>(b).unwrap().unwrap();
+            if vm.spec.nics[0].network == "t-lan" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut task = cluster.get::<TaskSpec>(stale_id).unwrap().unwrap();
+        task.status.state = TaskState::Succeeded;
+        cluster
+            .update_status::<TaskSpec>(stale_id, &task.status)
+            .await
+            .unwrap();
+    });
+    let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
+    finisher.await.unwrap();
+    assert_eq!(state, TaskState::Succeeded, "{error:?}");
+    let vb = t.vm_of(b);
+    assert_eq!(vb.spec.nics[0].network, "t-lan");
+    assert_eq!(
+        vb.status.hardware.as_ref().unwrap().nics[0].network,
+        "t-lan"
+    );
+    assert_eq!(relinks(&t.env), [(0, true)]);
+}
+
+/// 리뷰 1 M3: 다시 켜기에서 새 네트워크로 켜지지 못한 채 시간이 다 되면 끄고 원래 네트워크로 되돌려 켠다.
+#[tokio::test]
+async fn a_restart_that_times_out_goes_back() {
+    let t = T::start_with(|c| c.migration_vm_wait = Duration::from_secs(3)).await;
+    let c = t.vm("c", Some("10.66.0.13"), true).await;
+    let m = t
+        .create(json!({ "source": "lan", "target": "t-lan", "bridge": false }))
+        .await;
+    assert_eq!(m.status.vms[0].mode, PlannedMode::Restart);
+    t.env.hv.hold_next_start();
+    let (status, task) = t.post_step(m.id, "start", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    // 새 네트워크로 켜기가 멈춰 있다. 옮기기가 시간이 다 되어 끄라고 하면 놓아준다.
+    t.env.hv.start_held().await;
+    let deadline = tokio::time::Instant::now() + LIMIT;
+    loop {
+        let vm = t.vm_of(c);
+        if vm.spec.power == opl_types::vm::PowerState::Stopped {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "not stopped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    t.env.hv.release_start();
+    let (state, error) = t
+        .wait_task(task["id"].as_str().unwrap().parse().unwrap())
+        .await;
+    assert_eq!(state, TaskState::Failed);
+    let error = error.unwrap();
+    assert!(error.contains("in time and was started on"), "{error}");
+    let vc = t.vm_of(c);
+    assert_eq!(vc.spec.nics[0].network, "lan");
+    assert_eq!(vc.spec.power, opl_types::vm::PowerState::Running);
 }

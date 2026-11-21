@@ -352,6 +352,9 @@ pub struct PlanInput<'a> {
     pub taken: &'a BTreeMap<IpAddr, Uuid>,
     /// 끝나지 않은 다른 옮기기에 든 VM
     pub busy: &'a BTreeSet<Uuid>,
+    /// 이 옮기기가 옮기는 NIC의 MAC(다시 계획할 때 — 이미 대상에 옮긴 같은 VM의 다른 NIC는 "다른 NIC가 대상에 있음"이 아니다,
+    /// 리뷰 1 M1). 만들 때는 비었다.
+    pub own: &'a BTreeSet<MacAddr>,
 }
 
 /// NIC 하나의 계획
@@ -391,6 +394,14 @@ pub struct PlannedBridge {
 pub struct MigrationPlan {
     pub nics: Vec<PlannedNic>,
     pub bridge: PlannedBridge,
+    /// 원본에 NIC가 있지만 부른 사람이 읽을 수 없는 VM 수(리뷰 1 I3 — `nics`에 없고 옮기지 않는다)
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub hidden: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// 게스트가 원본에서 보는 MTU: VXLAN은 그 네트워크 MTU, 브리지·VLAN은 1500(브리지 MTU는 노드마다라 Raft에 없다)
@@ -477,6 +488,7 @@ pub fn plan(input: &PlanInput) -> MigrationPlan {
         nodes,
         taken,
         busy,
+        own,
     } = *input;
     let chassis = |node: Option<Uuid>| {
         node.and_then(|id| nodes.iter().find(|n| n.id == id))
@@ -491,7 +503,11 @@ pub fn plan(input: &PlanInput) -> MigrationPlan {
     let mut nics: Vec<PlannedNic> = Vec::new();
     for pv in vms {
         let vm = pv.vm;
-        let on_target = vm.spec.nics.iter().any(|n| n.network == spec.target);
+        let on_target = vm
+            .spec
+            .nics
+            .iter()
+            .any(|n| n.network == spec.target && !n.mac.is_some_and(|m| own.contains(&m)));
         for (i, nic) in vm
             .spec
             .nics
@@ -539,8 +555,12 @@ pub fn plan(input: &PlanInput) -> MigrationPlan {
                     )),
                     Some(_) => {}
                 }
-                if let Some(holder) = taken.get(ip).filter(|h| **h != vm.id) {
-                    blockers.push(format!("address {ip} is already in use by {holder}"));
+                // 주인 id는 대지 않는다(리뷰 1 I3 — 부른 사람이 읽을 수 없는 VM일 수 있다).
+                if taken.get(ip).is_some_and(|h| *h != vm.id) {
+                    blockers.push(format!(
+                        "address {ip} is already in use on {:?}",
+                        spec.target
+                    ));
                 }
             }
             // 방식(§9.4)
@@ -654,7 +674,11 @@ pub fn plan(input: &PlanInput) -> MigrationPlan {
     let vm_nodes: BTreeMap<Uuid, Option<Uuid>> =
         vms.iter().map(|v| (v.vm.id, v.vm.status.node)).collect();
     let bridge = plan_bridge(spec, source, target, nodes, &nics, &vm_nodes);
-    MigrationPlan { nics, bridge }
+    MigrationPlan {
+        nics,
+        bridge,
+        hidden: 0,
+    }
 }
 
 /// 다리 계획(§9.5)
@@ -729,6 +753,11 @@ fn plan_bridge(
         "a DHCP server on the source network also answers moved VMs over the bridge: reserve the same addresses there or turn it off while migrating"
             .to_string(),
     );
+    // IPAM은 원본 L2의 다른 장비(물리 라우터·서버, 게스트 에이전트 없는 VM)의 주소를 모른다(리뷰 1 I2).
+    b.warnings.push(
+        "IPAM does not know the addresses other hosts use on the source network: keep them out of the target's pools while the bridge is up"
+            .to_string(),
+    );
     b
 }
 
@@ -769,7 +798,7 @@ pub fn move_nic(spec: &mut VmSpec, nic: usize, target: &str, ips: &[IpAddr]) {
 }
 
 /// NIC `nic`을 옮기기 전 모습 `origin`으로 되돌린다(§9.6): 네트워크·보안 그룹·cloud-init 주소 항목을 되살리고 주소(IPAM)를
-/// 놓는다.
+/// 놓는다. 원본(단순 네트워크)은 DSCP를 받지 않으므로 `qos.dscp`를 뺀다(속도 제한은 그대로 — 리뷰 1 M6).
 pub fn restore_nic(spec: &mut VmSpec, nic: usize, origin: &NicOrigin) {
     let Some(n) = spec.nics.get_mut(nic) else {
         return;
@@ -777,6 +806,12 @@ pub fn restore_nic(spec: &mut VmSpec, nic: usize, origin: &NicOrigin) {
     n.network.clone_from(&origin.network);
     n.ips.clear();
     n.security_groups.clone_from(&origin.security_groups);
+    if let Some(q) = n.qos.as_mut() {
+        q.dscp = None;
+        if q.out_mbps.is_none() && q.in_mbps.is_none() {
+            n.qos = None;
+        }
+    }
     if let Some(entry) = &origin.cloud_init
         && let Some(ci) = spec.cloud_init.as_mut()
     {
@@ -1122,6 +1157,7 @@ mod tests {
             nodes: &f.nodes,
             taken: &taken,
             busy: &busy,
+            own: &BTreeSet::new(),
         })
     }
 
@@ -1342,6 +1378,23 @@ mod tests {
         short.cloud_init.as_mut().unwrap().networks.truncate(1);
         restore_nic(&mut short, 1, &origin);
         assert_eq!(short, before);
+        // 되돌리면 단순 네트워크가 받지 않는 DSCP를 뺀다(속도 제한은 그대로 — 리뷰 1 M6).
+        let mut s = before.clone();
+        move_nic(&mut s, 1, "t-lan", &[ip]);
+        s.nics[1].qos = Some(crate::qos::NicQos {
+            out_mbps: Some(100),
+            dscp: Some(46),
+            ..Default::default()
+        });
+        restore_nic(&mut s, 1, &origin);
+        let q = s.nics[1].qos.unwrap();
+        assert_eq!((q.out_mbps, q.dscp), (Some(100), None));
+        s.nics[1].qos = Some(crate::qos::NicQos {
+            dscp: Some(46),
+            ..Default::default()
+        });
+        restore_nic(&mut s, 1, &origin);
+        assert_eq!(s.nics[1].qos, None);
     }
 
     /// 다시 계획(§9.2): 막힘·방식·주소가 바뀌면 까닭, 주소 출처만 다르면(게스트 에이전트 → 준 주소) 같다.

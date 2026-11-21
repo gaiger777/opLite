@@ -479,6 +479,11 @@ pub struct NodeSdn {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, default))]
     pub peers: Vec<IpAddr>,
+    /// 중앙이면 NB·SB Raft(6643·6644)에 지금 붙어 있는 상대 주소(다른 중앙의 출발 주소 — 잠금 미리 확인이 중앙 집합과
+    /// 견준다, 리뷰 1 I5). 비면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, default))]
+    pub raft_peers: Vec<IpAddr>,
 }
 
 /// 노드의 OVN 주소 허용 목록 상태(`NodeSdn.lockdown`)
@@ -585,6 +590,10 @@ pub struct LockdownPeer {
     pub central: String,
     #[cfg_attr(feature = "openapi", schema(value_type = String, format = "ip"))]
     pub peer: IpAddr,
+    /// Raft(6643·6644) 상대이고 중앙 집합 밖이다(거짓이면 NB·SB 6641·6642 상대이고 멤버 집합 밖 — 리뷰 1 I5).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub raft: bool,
 }
 
 /// `POST /sdn/lockdown?dry_run=true`(§10.4 미리 확인): 허용 집합과 그 밖에서 붙어 있는 상대
@@ -602,10 +611,25 @@ pub struct LockdownCheck {
     pub outside: Vec<LockdownPeer>,
     /// 켜기가 막힌다(`outside`가 있고 `force`가 아님)
     pub blocked: bool,
+    /// 막지는 않지만 알릴 것(중앙이 둘이면 차례마다 SB가 정족수를 잃음 따위 — 리뷰 1 M4)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub warnings: Vec<String>,
 }
 
-/// 잠금을 켜면 끊길 상대: 중앙이 알린 6641·6642 상대(`NodeSdn.peers`) 가운데 멤버 집합 밖(루프백 `127.0.0.1`·`::1`은
-/// 늘 받으므로 뺀다). 중앙 이름 순.
+/// 중앙이 잠금 방화벽을 건 뒤 자기 NB·SB Raft가 끊겨 표를 다시 걷었을 때 알리는 오류의 머리(리뷰 1 I5 — `sdn-lockdown`
+/// Task가 이것을 보면 성공으로 끝내지 않는다)
+pub const LOCKDOWN_RAFT_CUT: &str = "the address allow-list cut the OVN Raft connections";
+
+/// 잠금 방화벽이 늘 받는 루프백 출발 주소: `127.0.0.1`·`::1`만(드라이버 `lockdown::ruleset`과 같다 — `127.0.0.2` 따위의 다른
+/// 루프백은 막힌다, 리뷰 1 M6)
+pub fn is_lockdown_loopback(ip: IpAddr) -> bool {
+    ip == IpAddr::from([127, 0, 0, 1]) || ip == IpAddr::from(std::net::Ipv6Addr::LOCALHOST)
+}
+
+/// 잠금을 켜면 끊길 상대: 중앙이 알린 6641·6642 상대(`NodeSdn.peers`) 가운데 멤버 집합 밖과, Raft 6643·6644 상대
+/// (`NodeSdn.raft_peers`) 가운데 중앙 집합 밖(리뷰 1 I5 — 방화벽은 Raft를 중앙 집합에서만 받는다). 루프백 `127.0.0.1`·`::1`은
+/// 늘 받으므로 뺀다. 중앙 이름 순.
 pub fn lockdown_outside(nodes: &[Node], sdn: &Sdn) -> Vec<LockdownPeer> {
     let sets = allow_sets(nodes, sdn);
     let mut out = Vec::new();
@@ -613,19 +637,36 @@ pub fn lockdown_outside(nodes: &[Node], sdn: &Sdn) -> Vec<LockdownPeer> {
         let Some(n) = nodes.iter().find(|n| n.id == c.node) else {
             continue;
         };
-        for p in n.status.sdn.iter().flat_map(|s| s.peers.iter()) {
-            let p = p.to_canonical();
-            if p.is_loopback() || sets.members.contains(&p) {
-                continue;
+        for s in n.status.sdn.iter() {
+            let clients = s.peers.iter().map(|p| (p, false, &sets.members));
+            let raft = s.raft_peers.iter().map(|p| (p, true, &sets.centrals));
+            for (p, raft, allowed) in clients.chain(raft) {
+                let p = p.to_canonical();
+                if is_lockdown_loopback(p) || allowed.contains(&p) {
+                    continue;
+                }
+                out.push(LockdownPeer {
+                    central: n.name.clone(),
+                    peer: p,
+                    raft,
+                });
             }
-            out.push(LockdownPeer {
-                central: n.name.clone(),
-                peer: p,
-            });
         }
     }
-    out.sort_by(|a, b| (&a.central, a.peer).cmp(&(&b.central, b.peer)));
+    out.sort_by(|a, b| (&a.central, a.peer, a.raft).cmp(&(&b.central, b.peer, b.raft)));
     out.dedup();
+    out
+}
+
+/// 잠금 켜기 미리 확인의 경고: 중앙이 정확히 둘이면 차례마다 SB를 다시 띄우는 동안 남은 하나로는 정족수가 안 된다(리뷰 1 M4).
+pub fn lockdown_warnings(sdn: &Sdn) -> Vec<String> {
+    let mut out = Vec::new();
+    if sdn.status.centrals.len() == 2 {
+        out.push(
+            "the cluster has two OVN centrals: while each one restarts its southbound database the other alone is not a majority, so the SB is unavailable for a few seconds per central (the data path keeps working); add a third central to avoid it"
+                .to_string(),
+        );
+    }
     out
 }
 
@@ -974,6 +1015,7 @@ mod tests {
             gateway: false,
             lockdown: None,
             peers: Vec::new(),
+            raft_peers: vec![ip("10.0.0.3")],
             chassis: ChassisState::Ready,
             ovn_version: Some("24.03.4".into()),
             ovs_version: Some("3.3.0".into()),
@@ -1529,5 +1571,62 @@ mod tests {
         sdn.status.pending.as_mut().unwrap().op = crate::task::TaskOp::SdnCentralRemove;
         let sets = allow_sets(&nodes, &sdn);
         assert_eq!(sets.centrals, ips(&["10.0.0.1", "10.0.0.2", "192.168.0.1"]));
+    }
+
+    /// 리뷰 1 I5·M4·M6: Raft 상대는 중앙 집합과 견주고, 루프백은 `127.0.0.1`·`::1`만 받고, 중앙 둘이면 경고한다.
+    #[test]
+    fn lockdown_outside_checks_raft_peers_and_loopback() {
+        let mut nodes: Vec<Node> = (1..=3u128)
+            .map(|n| {
+                let mut node: Node = Resource::new(
+                    format!("n{n}"),
+                    serde_json::from_value(json!({ "address": format!("10.0.0.{n}:8006") }))
+                        .unwrap(),
+                );
+                node.id = Uuid::from_u128(n);
+                node.status.hypervisor = "qemu-kvm".into();
+                node
+            })
+            .collect();
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
+        sdn.status.centrals = (1..=2u128)
+            .map(|n| SdnCentral {
+                node: Uuid::from_u128(n),
+                address: ip(&format!("10.0.0.{n}")),
+            })
+            .collect();
+        // n1: 멤버 n3(중앙 아님)이 NB에(괜찮음), Raft에(밖), 다른 출발 주소 172.16.0.2가 Raft에(밖), 루프백 셋
+        nodes[0].status.sdn = Some(NodeSdn {
+            peers: vec![ip("10.0.0.3"), ip("127.0.0.1"), ip("127.0.0.2")],
+            raft_peers: vec![ip("10.0.0.2"), ip("10.0.0.3"), ip("172.16.0.2"), ip("::1")],
+            ..Default::default()
+        });
+        let out = lockdown_outside(&nodes, &sdn);
+        let got: Vec<(String, bool)> = out.iter().map(|p| (p.peer.to_string(), p.raft)).collect();
+        assert_eq!(
+            got,
+            [
+                ("10.0.0.3".to_string(), true),
+                ("127.0.0.2".to_string(), false),
+                ("172.16.0.2".to_string(), true),
+            ]
+        );
+        assert!(is_lockdown_loopback(ip("::1")) && !is_lockdown_loopback(ip("127.0.0.2")));
+        assert_eq!(lockdown_warnings(&sdn).len(), 1);
+        sdn.status.centrals.push(SdnCentral {
+            node: Uuid::from_u128(3),
+            address: ip("10.0.0.3"),
+        });
+        assert!(lockdown_warnings(&sdn).is_empty());
+        // 옛 JSON(raft 없음)은 그대로다.
+        let p = LockdownPeer {
+            central: "n1".into(),
+            peer: ip("10.9.9.9"),
+            raft: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&p).unwrap(),
+            json!({ "central": "n1", "peer": "10.9.9.9" })
+        );
     }
 }

@@ -625,3 +625,74 @@ async fn a_new_load_balancer_is_attached_in_the_same_round_and_wakes_the_loop() 
     assert!(seen);
     sync.shutdown().await;
 }
+
+/// 리뷰 1 I4: SDN 경보의 관찰 읽기는 OvnSync 루프 밖에서 돈다 — SB가 답하지 않아도(꺼진 중앙에 막힌 연결) NB 쓰기는 곧바로
+/// 이어진다. 관찰은 NB가 답하는 대로 읽어 두고, SB가 다시 답하면 이어 쓴다.
+#[tokio::test]
+async fn a_silent_sb_does_not_delay_nb_writes() {
+    let ovn = Ovn::start().await;
+    ovn.sdn(SdnPhase::Ready).await;
+    // 붙기는 받지만 아무 답도 하지 않는 SB
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let silent_port = silent.local_addr().unwrap().port();
+    let held = tokio::spawn(async move {
+        let mut conns = Vec::new();
+        while let Ok((c, _)) = silent.accept().await {
+            conns.push(c);
+        }
+    });
+    let mut config = ovn.config();
+    config.sb_port = silent_port;
+    config.timeout = Duration::from_secs(30);
+    config.observe_every = Duration::from_millis(50);
+    let observations = config.observations.clone();
+    let sync = OvnSync::spawn(ovn.env.cluster.clone(), config);
+    let started = std::time::Instant::now();
+    let a = ovn.network("a").await;
+    let want = format!("opl-{}", a.id);
+    while ovn.switches() != vec![want.clone()] {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            ovn.switches()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 관찰 하나가 막혀도(SB 2초 제한) NB 쓰기는 그것을 기다리지 않는다.
+    let b = ovn.network("b").await;
+    let again = std::time::Instant::now();
+    while !ovn.switches().contains(&format!("opl-{}", b.id)) {
+        assert!(
+            again.elapsed() < Duration::from_secs(2),
+            "the NB write waited for the observation"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(observations.get().is_none(), "SB never answered");
+    sync.shutdown().await;
+    held.abort();
+}
+
+/// 관찰 Task는 이어 쓰는 연결로 `observe_every`마다 읽어 둔다(리뷰 1 I4 — 차례마다 새로 붙지 않는다).
+#[tokio::test]
+async fn observations_are_read_over_kept_connections() {
+    let ovn = Ovn::start().await;
+    ovn.sdn(SdnPhase::Ready).await;
+    let mut config = ovn.config();
+    config.observe_every = Duration::from_millis(30);
+    let observations = config.observations.clone();
+    let sync = OvnSync::spawn(ovn.env.cluster.clone(), config);
+    let started = std::time::Instant::now();
+    let mut seen = std::collections::BTreeSet::new();
+    while seen.len() < 4 {
+        if let Some(o) = observations.get() {
+            assert_eq!(o.term, term(&ovn.env));
+            seen.insert(o.at);
+        }
+        assert!(started.elapsed() < Duration::from_secs(10), "{seen:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sync.shutdown().await;
+    // SB에는 관찰 연결 하나만 붙었다(읽을 때마다 새로 붙지 않음).
+    assert_eq!(ovn.sb.with(|s| s.accepted), 1);
+}

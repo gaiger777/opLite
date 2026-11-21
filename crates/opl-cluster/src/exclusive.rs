@@ -18,7 +18,8 @@ pub(crate) const SHARED_IP_KINDS: [Kind; 4] =
 /// 라우터 하나에만), 유동 IP가 붙은 NIC `fip-nic`(`{vm id}/{MAC}`), 공급자 네트워크의 `physnet`(`{physnet}/{vlan|flat}`).
 /// 계획 67: 부하 분산기의 VIP·바깥 VIP·건강 검사 주소도 `ip`, 리스너 `lb-listener`(`{VIP 네트워크}/{VIP}/{프로토콜}/{포트}`),
 /// 끝나지 않은 네트워크 옮기기의 원본 `migration-source`(한 네트워크에 하나)와 VM `migration-vm`(한 VM은 한 옮기기에만 —
-/// VM 목록은 스펙 `vms`와 상태 `vms[].vm`이라 `status`도 본다. `Finished`·`RolledBack`이면 값이 없다).
+/// VM 목록은 스펙 `vms`와 상태 `vms[].vm`이라 `status`도 본다. `Finished`·`RolledBack`이면 값이 없다), 다리를 놓을 수 있는
+/// (`bridge`가 `false`가 아닌) 옮기기의 대상 `migration-target`(한 대상 네트워크에 다리 하나 — 리뷰 1 I1).
 pub(crate) fn exclusive_values(
     kind: Kind,
     spec: &Value,
@@ -105,6 +106,13 @@ pub(crate) fn exclusive_values(
                 )
                 .collect();
             values.extend(vms.into_iter().map(|v| ("migration-vm", v.to_string())));
+            // 다리를 놓을 수 있는 옮기기는 대상 하나에 하나(리뷰 1 I1 — 한 논리 스위치에 l2gateway 둘이면 물리 L2와 고리가
+            // 생기거나 두 LAN이 하나로 이어진다). 다리 없이(`bridge: false`) 옮기는 것은 여럿이어도 된다.
+            if spec["bridge"].as_bool() != Some(false)
+                && let Some(t) = spec["target"].as_str()
+            {
+                values.push(("migration-target", t.to_string()));
+            }
             return values;
         }
         Kind::Network => {
@@ -317,13 +325,20 @@ mod tests {
                 ("migration-source", "lan".to_string()),
                 ("migration-vm", a.to_string()),
                 ("migration-vm", b.to_string()),
+                ("migration-target", "t-lan".to_string()),
             ]
+        );
+        // 다리 없이 옮기면 대상을 잡지 않는다.
+        let no_bridge = json!({"source": "lan", "target": "t-lan", "bridge": false});
+        assert_eq!(
+            values(Kind::NetworkMigration, &no_bridge),
+            vec![("migration-source", "lan".to_string())]
         );
         for done in ["finished", "rolled-back"] {
             assert!(
                 exclusive_values(Kind::NetworkMigration, &mig, &json!({"phase": done})).is_empty()
             );
         }
-        assert_eq!(values(Kind::NetworkMigration, &mig).len(), 2);
+        assert_eq!(values(Kind::NetworkMigration, &mig).len(), 3);
     }
 }

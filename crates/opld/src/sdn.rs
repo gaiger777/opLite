@@ -38,8 +38,9 @@ use opl_types::network_migration::NetworkMigrationSpec;
 use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::Kind;
 use opl_types::sdn::{
-    AllowSets, CentralHealth, ChassisState, LockdownNodeState, NodeSdn, NodeSdnConfig,
-    PhysnetState, RaftRole, SDN_NAME, Sdn, SdnCentral, SdnPending, SdnPhase, SdnSpec, allow_sets,
+    AllowSets, CentralHealth, ChassisState, LOCKDOWN_RAFT_CUT, LockdownNodeState, NodeSdn,
+    NodeSdnConfig, PhysnetState, RaftRole, SDN_NAME, Sdn, SdnCentral, SdnPending, SdnPhase,
+    SdnSpec, allow_sets,
 };
 use opl_types::task::TaskOp;
 use opl_types::vm::VmSpec;
@@ -122,6 +123,7 @@ impl SdnAgent {
             node,
             report,
             firewall: Mutex::new(None),
+            refused: Mutex::new(None),
         };
         let (shutdown, rx) = oneshot::channel();
         Some(Self {
@@ -217,6 +219,9 @@ struct Agent {
     report: SdnReport,
     /// 마지막으로 넣은 허용 목록(없으면 넣지 않았거나 지웠다)
     firewall: Mutex<Option<Firewall>>,
+    /// Raft를 끊어 걷은 허용 목록(리뷰 1 I5): 그 글, 그때의 잠금 Task, 까닭. 같은 글은 새 잠금 Task가 오기 전에 다시 넣지
+    /// 않는다(넣고 걷기를 되풀이하지 않게).
+    refused: Mutex<Option<(String, Option<Uuid>, String)>>,
 }
 
 /// 잠금을 바꾸지 않는 Task가 자리를 잡았는지(중앙 더하기·빼기 따위 — 그동안 중앙의 잠금은 그대로 둔다)
@@ -238,6 +243,21 @@ fn all_locked(sdn: &Sdn) -> bool {
             .centrals
             .iter()
             .all(|c| applied.contains(&c.node))
+}
+
+/// 목록에서 나(`me`)보다 앞선 중앙 가운데 아직 허용 목록을 걸었다고 알리지 않은 것의 이름(중앙은 하나씩 건다 — 리뷰 1 I5)
+fn earlier_central_without_firewall(sdn: &Sdn, nodes: &[Node], me: Uuid) -> Option<String> {
+    for c in sdn.status.centrals.iter().take_while(|c| c.node != me) {
+        let node = nodes.iter().find(|n| n.id == c.node);
+        let on = node
+            .and_then(|n| n.status.sdn.as_ref())
+            .and_then(|s| s.lockdown.as_ref())
+            .is_some_and(|l| l.firewall);
+        if !on {
+            return Some(node.map_or_else(|| c.node.to_string(), |n| n.name.clone()));
+        }
+    }
+    None
 }
 
 /// 잠긴 중앙(`SdnStatus.lockdown.applied`)의 주소
@@ -503,13 +523,19 @@ impl Agent {
                 )),
             }
         }
-        let peers = if mine.is_some() {
-            host.central_peers().await.unwrap_or_else(|e| {
+        let (peers, raft_peers) = if mine.is_some() {
+            let peers = host.central_peers().await.unwrap_or_else(|e| {
                 tracing::debug!(error = %e, "cannot read the OVN clients");
                 Vec::new()
-            })
+            });
+            // Raft 상대(리뷰 1 I5 — 잠금 미리 확인이 중앙 집합과 견준다)
+            let raft = host.central_raft_peers().await.unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "cannot read the OVN Raft peers");
+                Vec::new()
+            });
+            (peers, raft)
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         let (chassis, encap_ip) = match host.chassis_probe(self.node, &centrals).await {
@@ -535,6 +561,7 @@ impl Agent {
             gateway,
             lockdown,
             peers,
+            raft_peers,
             chassis,
             ovn_version: Some(versions.ovn),
             ovs_version: Some(versions.ovs),
@@ -716,6 +743,27 @@ impl Agent {
             .is_some_and(|f| f.text == text);
         // 같은 글을 넣었어도 표가 사라졌으면(누가 `nft flush ruleset`) 다시 넣는다.
         let present = same && host.lockdown_present().await.unwrap_or(false);
+        if !present && role.central {
+            let waiting = |error: Option<String>| LockdownNodeState {
+                firewall: false,
+                allowed: sets.members.len(),
+                error,
+            };
+            // 중앙은 하나씩(리뷰 1 I5): 목록에서 앞선 중앙이 모두 표를 걸었다고 알린 뒤에 건다.
+            if let Some(name) = earlier_central_without_firewall(sdn, nodes, self.node) {
+                tracing::debug!(central = %name, "waiting for an earlier central to apply the OVN allow-list");
+                return Some(waiting(None));
+            }
+            // Raft를 끊어 걷은 글은 새 잠금 Task가 올 때까지 다시 넣지 않는다.
+            let task = sdn.status.pending.as_ref().map(|p| p.task);
+            let refused = self.refused.lock().unwrap().clone();
+            if let Some((t, at, why)) = refused {
+                if t == text && at == task {
+                    return Some(waiting(Some(why)));
+                }
+                *self.refused.lock().unwrap() = None;
+            }
+        }
         let error = if present {
             None
         } else {
@@ -726,8 +774,34 @@ impl Agent {
                         centrals = sets.centrals.len(),
                         "applied the OVN address allow-list"
                     );
-                    *self.firewall.lock().unwrap() = Some(Firewall { text, role });
-                    None
+                    // 중앙은 건 뒤 자기 NB·SB Raft가 그대로인지 본다. 끊겼으면 표를 걷는다(정족수를 잃은 채 성공으로
+                    // 알리지 않게 — 리뷰 1 I5).
+                    let cut = if role.central {
+                        host.raft_still_intact().await.err()
+                    } else {
+                        None
+                    };
+                    match cut {
+                        None => {
+                            *self.firewall.lock().unwrap() = Some(Firewall { text, role });
+                            None
+                        }
+                        Some(why) => {
+                            let removed = host.remove_lockdown().await;
+                            *self.firewall.lock().unwrap() = None;
+                            let msg = format!(
+                                "{LOCKDOWN_RAFT_CUT} ({why}); removed it again{} — check `sdn lockdown on --dry-run` for Raft peers outside the central set",
+                                match &removed {
+                                    Err(e) => format!(" but the removal failed: {e}"),
+                                    Ok(_) => String::new(),
+                                }
+                            );
+                            tracing::warn!(error = %msg, "OVN lockdown");
+                            let task = sdn.status.pending.as_ref().map(|p| p.task);
+                            *self.refused.lock().unwrap() = Some((text, task, msg.clone()));
+                            Some(msg)
+                        }
+                    }
                 }
                 Err(e) => {
                     *self.firewall.lock().unwrap() = None;
@@ -960,6 +1034,7 @@ mod tests {
         });
         let options = OvnOptions {
             any_os: true,
+            wait_step: Duration::from_millis(20),
             ..OvnOptions::default()
         };
         let host = Arc::new(OvnHost::new(runner.clone(), paths, options, TAG.into()));
@@ -970,6 +1045,7 @@ mod tests {
             node,
             report: SdnReport::default(),
             firewall: Mutex::new(None),
+            refused: Mutex::new(None),
         };
         Setup {
             _dir: dir,
@@ -1642,6 +1718,65 @@ mod tests {
         assert_eq!(lockdown_turn(&sdn, &nodes(), a), Ok(()));
     }
 
+    /// 리뷰 1 I5: 중앙이 표를 건 뒤 자기 Raft가 끊겼으면(리더가 팔로어에게서 오래 듣지 못함) 표를 걷고 오류를 알린다.
+    /// 같은 잠금 차례에는 같은 표를 다시 넣지 않는다.
+    #[tokio::test]
+    async fn a_firewall_that_cuts_raft_is_removed() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.0.0.1").await;
+        set_features(&s.cluster, node, &[SDN, SDN_SERVICES]).await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![central(node, "10.0.0.1")];
+        s.cluster.create(&sdn).await.unwrap();
+        let f = &s.runner.fake;
+        let cut = include_str!("../../opl-driver/src/ovn/fixtures/cluster-status-leader-two.txt")
+            .replace("last msg 331 ms ago", "last msg 9000 ms ago");
+        for db in [opl_driver::ovn::Db::Nb, opl_driver::ovn::Db::Sb] {
+            f.reply(
+                &format!(
+                    "ovs-appctl --timeout 5 -t {} cluster/status",
+                    s.agent.host.paths().db_ctl(db).display()
+                ),
+                CmdOutput::ok(cut.as_str()),
+            );
+        }
+        central_setup(&s, vec![listing(false), listing(true)]);
+        s.agent.tick().await;
+        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        assert_eq!(sdn.status.lockdown.as_ref().unwrap().applied, [node]);
+
+        let nft = |f: &FakeRunner| {
+            f.commands()
+                .into_iter()
+                .filter(|c| c.program == "nft" && c.args == ["-f", "-"])
+                .count()
+        };
+        s.agent.tick().await;
+        // 넣고 곧바로 걷었다.
+        assert_eq!(nft(f), 2, "{:?}", f.calls());
+        let report = s.agent.report.get().unwrap();
+        let lockdown = report.lockdown.unwrap();
+        assert!(!lockdown.firewall, "{lockdown:?}");
+        let error = lockdown.error.unwrap();
+        assert!(error.starts_with(LOCKDOWN_RAFT_CUT), "{error}");
+        assert!(error.contains("ssl:127.0.0.2:6643"), "{error}");
+        // 같은 차례에는 다시 넣지 않는다.
+        s.agent.tick().await;
+        assert_eq!(nft(f), 2, "{:?}", f.calls());
+        assert!(
+            s.agent
+                .report
+                .get()
+                .unwrap()
+                .lockdown
+                .unwrap()
+                .error
+                .is_some()
+        );
+    }
+
     /// 중앙 하나: 잠금을 원하면 설정 파일·단위를 쓰고 SB를 다시 띄워 따라잡은 뒤 `applied`에 적는다. 다음 차례에 모든
     /// 중앙이 잠겼으므로 허용 목록을 넣는다. 잠근 뒤 다시 와도 SB를 다시 띄우지 않는다. 끄면 표를 지우고 되돌린다.
     #[tokio::test]
@@ -1672,6 +1807,7 @@ mod tests {
         let report = s.agent.report.get().unwrap();
         assert!(!report.lockdown.as_ref().unwrap().firewall, "{report:?}");
         assert_eq!(report.peers, ["10.0.0.2".parse::<IpAddr>().unwrap()]);
+        assert_eq!(report.raft_peers, ["10.0.0.2".parse::<IpAddr>().unwrap()]);
 
         let before = f.calls().len();
         s.agent.tick().await;

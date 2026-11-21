@@ -18,8 +18,8 @@ use opl_driver::MirrorProgress;
 use opl_driver::ovn::{Chassis, Db, KnownCids, OvnHost, OvnVersions, major_minor};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::sdn::{
-    ChassisState, MAX_CENTRALS, SDN_NAME, Sdn, SdnCentral, SdnPhase, SdnSpec, SdnStatus,
-    central_address,
+    ChassisState, LOCKDOWN_RAFT_CUT, MAX_CENTRALS, SDN_NAME, Sdn, SdnCentral, SdnPhase, SdnSpec,
+    SdnStatus, central_address,
 };
 use opl_types::task::{Task, TaskOp};
 use uuid::Uuid;
@@ -283,7 +283,7 @@ async fn lockdown(
                 .map(|e| format!(": {e}"))
                 .unwrap_or_default();
             return Err(format!(
-                "the OVN central {name:?} did not switch its lockdown in {}s (is it online, with the other                  centrals in quorum?){why}",
+                "the OVN central {name:?} did not switch its lockdown in {}s (is it online, with the other centrals in quorum?){why}",
                 limits.stall.as_secs()
             ));
         }
@@ -315,6 +315,18 @@ async fn lockdown(
             .collect();
         if pending.is_empty() {
             return Ok(None);
+        }
+        // 중앙이 표를 건 뒤 Raft가 끊겨 다시 걷었으면 성공으로 끝내지 않는다(리뷰 1 I5).
+        if enabled
+            && let Some((name, e)) = pending.iter().filter(|n| central(n.id)).find_map(|n| {
+                let e = n.status.sdn.as_ref()?.lockdown.as_ref()?.error.clone()?;
+                e.starts_with(LOCKDOWN_RAFT_CUT)
+                    .then(|| (n.name.clone(), e))
+            })
+        {
+            return Err(format!(
+                "the OVN central {name:?} could not keep its address allow-list: {e}"
+            ));
         }
         if tokio::time::Instant::now() >= deadline {
             let names: Vec<String> = pending

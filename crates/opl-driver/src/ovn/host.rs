@@ -14,7 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use opl_types::sdn::{
-    CentralHealth, MIN_OVN, NB_PORT, RaftRole, SB_ADMIN_PORT, SB_PORT, is_physnet_ifname,
+    CentralHealth, MIN_OVN, NB_PORT, NB_RAFT_PORT, RaftRole, SB_ADMIN_PORT, SB_PORT, SB_RAFT_PORT,
+    is_physnet_ifname,
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -867,6 +868,16 @@ impl OvnHost {
     /// 중앙의 NB(6641)·SB(6642)에 지금 붙어 있는 상대 주소(`ss -tnH state established`, 이름 순·겹치지 않게 — 계획 67
     /// §10.4 잠금 미리 확인)
     pub async fn central_peers(&self) -> Result<Vec<IpAddr>, OvnError> {
+        self.peers_on(NB_PORT, SB_PORT).await
+    }
+
+    /// 중앙의 NB·SB Raft(6643·6644)에 지금 붙어 있는 상대 주소(다른 중앙이 Raft를 보내는 출발 주소 — 잠금 미리 확인이
+    /// 중앙 집합과 견준다, 리뷰 1 I5)
+    pub async fn central_raft_peers(&self) -> Result<Vec<IpAddr>, OvnError> {
+        self.peers_on(NB_RAFT_PORT, SB_RAFT_PORT).await
+    }
+
+    async fn peers_on(&self, a: u16, b: u16) -> Result<Vec<IpAddr>, OvnError> {
         let out = self
             .run_ok(&Cmd::new(
                 "ss",
@@ -874,7 +885,7 @@ impl OvnHost {
                     "-tnH",
                     "state",
                     "established",
-                    &format!("( sport = :{} or sport = :{} )", NB_PORT, SB_PORT),
+                    &format!("( sport = :{a} or sport = :{b} )"),
                 ],
             ))
             .await?;
@@ -940,6 +951,33 @@ impl OvnHost {
             ))
             .await?;
         parse_cluster_status(&String::from_utf8_lossy(&out.stdout)).map_err(OvnError::Command)
+    }
+
+    /// 잠금 방화벽을 건 뒤 이 중앙의 NB·SB Raft가 온전한지(리뷰 1 I5): `wait_step`의 세 배를 기다린 뒤(선거 시간의 두 배보다
+    /// 오래 전 소식은 방화벽 앞의 것이다) 두 DB가 [`ClusterStatus::raft_intact`]인지 `wait_step`마다 다섯 번까지 본다. 아니면
+    /// 마지막 까닭
+    pub async fn raft_still_intact(&self) -> Result<(), String> {
+        tokio::time::sleep(self.options.wait_step * 3).await;
+        let mut why = String::new();
+        for _ in 0..5 {
+            let mut ok = true;
+            for db in [Db::Nb, Db::Sb] {
+                let checked = match self.cluster_status(db).await {
+                    Ok(s) => s.raft_intact(2 * s.election_timer_ms.unwrap_or(1000)),
+                    Err(e) => Err(e.to_string()),
+                };
+                if let Err(e) = checked {
+                    ok = false;
+                    why = e;
+                    break;
+                }
+            }
+            if ok {
+                return Ok(());
+            }
+            tokio::time::sleep(self.options.wait_step).await;
+        }
+        Err(why)
     }
 
     /// DB `db`의 이 서버가 리더가 될 때까지 기다린다(새 클러스터).

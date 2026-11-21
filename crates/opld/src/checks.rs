@@ -643,6 +643,7 @@ impl State {
                 if !sdn::services_ready(&self.cluster, &self.name) {
                     s.lockdown = None;
                     s.peers.clear();
+                    s.raft_peers.clear();
                 }
                 s
             });

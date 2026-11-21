@@ -68,6 +68,8 @@ struct World {
     nodes: Vec<Node>,
     /// 옮기기 다리가 놓인 대상 네트워크(계획 67 §9.5 — 라우터 인터페이스로 붙이지 못한다)
     bridged: BTreeSet<String>,
+    /// 끝나지 않은 옮기기가 대상 네트워크에 잡아 둔 주소(리뷰 1 I2 — 주소 고르기에서 쓴 것)
+    migrating: HeldIps,
 }
 
 impl World {
@@ -84,6 +86,7 @@ impl World {
             vms: cluster.list::<VmSpec>()?.1,
             nodes: cluster.list::<NodeSpec>()?.1,
             bridged: crate::tasks::network_migrate::bridged_networks(cluster)?,
+            migrating: crate::ipam::load_migration_held(cluster, None)?,
         })
     }
 
@@ -109,6 +112,7 @@ impl World {
             vms,
             nodes: state.cluster.list::<NodeSpec>()?.1,
             bridged: BTreeSet::new(),
+            migrating: HeldIps::new(),
         })
     }
 
@@ -127,6 +131,7 @@ impl World {
     fn used(&self, network: &str, except: Option<Uuid>) -> BTreeSet<IpAddr> {
         let held: HeldIps = held_ips(&self.routers, &self.fips, &self.lbs, except);
         let mut used: BTreeSet<IpAddr> = held.get(network).cloned().unwrap_or_default();
+        used.extend(self.migrating.get(network).into_iter().flatten().copied());
         used.extend(
             self.vms
                 .iter()
@@ -1985,6 +1990,7 @@ mod tests {
     fn world(vms: Vec<Vm>, routers: Vec<Router>) -> World {
         World {
             bridged: BTreeSet::new(),
+            migrating: HeldIps::new(),
             routers,
             fips: Vec::new(),
             lbs: Vec::new(),

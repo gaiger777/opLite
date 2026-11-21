@@ -21,7 +21,7 @@ use opl_types::resource::{Kind, Resource};
 use opl_types::sdn::{
     LockdownCheck, MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest,
     SdnLockdownRequest, SdnNodeRequest, SdnPending, SdnPhase, SdnSpec, SdnStatus, SdnView,
-    allow_sets, central_address, lockdown_outside,
+    allow_sets, central_address, lockdown_outside, lockdown_warnings,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
@@ -934,13 +934,21 @@ pub async fn set_lockdown(
             centrals: sets.centrals,
             blocked: !outside.is_empty() && !req.force,
             outside,
+            warnings: if req.enabled {
+                lockdown_warnings(&sdn)
+            } else {
+                Vec::new()
+            },
         })
         .into_response());
     }
     if !outside.is_empty() && !req.force {
         let list: Vec<String> = outside
             .iter()
-            .map(|p| format!("{} on {}", p.peer, p.central))
+            .map(|p| {
+                let raft = if p.raft { " (Raft)" } else { "" };
+                format!("{} on {}{raft}", p.peer, p.central)
+            })
             .collect();
         return Err(ApiError::conflict(
             "lockdown_peers_outside",

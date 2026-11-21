@@ -174,6 +174,28 @@ impl Filter {
         }
     }
 
+    /// 옮기기 이벤트에서 구독자가 읽을 수 없는 VM의 기록을 뺀다(리뷰 1 I3 — `GET`과 같다).
+    fn redact(&self, mut event: WatchEvent) -> WatchEvent {
+        if let WatchEvent::Put {
+            kind: Kind::NetworkMigration,
+            resource,
+        }
+        | WatchEvent::Deleted {
+            kind: Kind::NetworkMigration,
+            resource,
+            ..
+        } = &mut event
+        {
+            crate::network_migrations::redact_json(
+                &self.state,
+                &self.principal,
+                &mut resource.spec,
+                &mut resource.status,
+            );
+        }
+        event
+    }
+
     fn judge(&mut self, event: WatchEvent, kinds: &BTreeSet<Kind>) -> Verdict {
         if !self.still_valid() {
             return Verdict::Close;
@@ -240,7 +262,7 @@ impl Filter {
         }
         let writer = self.writer(owned_after);
         match event {
-            WatchEvent::Put { .. } if after => Verdict::Send(event, writer),
+            WatchEvent::Put { .. } if after => Verdict::Send(self.redact(event), writer),
             // 옮겨져 안 보이게 됐다: 이름과 id만 담은 지우기
             WatchEvent::Put { kind, resource } if before => {
                 let mut gone = RawResource::new(resource.name.clone(), serde_json::Value::Null);
@@ -256,7 +278,9 @@ impl Filter {
                     false,
                 )
             }
-            WatchEvent::Deleted { .. } if before || after => Verdict::Send(event, writer),
+            WatchEvent::Deleted { .. } if before || after => {
+                Verdict::Send(self.redact(event), writer)
+            }
             _ => Verdict::Skip,
         }
     }

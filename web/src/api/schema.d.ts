@@ -1468,10 +1468,12 @@ export interface paths {
         put?: never;
         /**
          * 옮기기를 계획하고 만든다(계획 67 §9.2): `dry_run`이면 리소스 없이 계획만(200), 아니면 계획을 `status.vms`에 적은
-         *     `planned` 리소스(201 — 시작은 `POST …/start`). 켜진 VM의 주소는 게스트 에이전트가 알린 것을 쓴다. 원본의
+         *     `planned` 리소스(201 — 시작은 `POST …/start`). 이름을 주지 않으면 `<원본>-to-<대상>`(쓰였으면 `-2` …)이다. 켜진 VM의
+         *     주소는 게스트 에이전트가 알린 것을 쓴다. 부른 사용자가 읽을 수 없는 VM은 계획에 없고 수(`hidden`)만 있다. 원본의
          *     `network.config`·대상의 `network.assign`, 폴더(없으면 원본 네트워크의 폴더)의 `network.config`. 권한이 없는 VM은
          *     계획에서 막힌다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙·네트워크는 400
-         *     `invalid_migration`, 같은 원본의 끝나지 않은 옮기기·다른 옮기기의 VM은 409. 계획에 경고가 있으면
+         *     `invalid_migration`, 같은 원본·같은 다리 대상의 끝나지 않은 옮기기·다른 옮기기의 VM은 409 `migration_overlap`. 계획에
+         *     경고가 있으면
          *     `orbivisor-warning`에 그 수.
          */
         post: operations["create_network_migration"];
@@ -5163,7 +5165,8 @@ export interface components {
             labels?: {
                 [key: string]: string;
             };
-            name: string;
+            /** @description 비면 `<원본>-to-<대상>`(쓰였으면 `-2`, `-3` …) */
+            name?: string;
             spec: components["schemas"]["NetworkMigrationSpec"];
         };
         CreateRequest_AlertRuleSpec: {
@@ -8161,6 +8164,8 @@ export interface components {
             members: string[];
             /** @description 지금 중앙 6641·6642에 붙은 상대 가운데 멤버 집합 밖인 것(중앙이 알린 `NodeSdn.peers`) */
             outside: components["schemas"]["LockdownPeer"][];
+            /** @description 막지는 않지만 알릴 것(중앙이 둘이면 차례마다 SB가 정족수를 잃음 따위 — 리뷰 1 M4) */
+            warnings?: string[];
         };
         /** @description 노드의 OVN 주소 허용 목록 상태(`NodeSdn.lockdown`) */
         LockdownNodeState: {
@@ -8193,6 +8198,8 @@ export interface components {
             central: string;
             /** Format: ip */
             peer: string;
+            /** @description Raft(6643·6644) 상대이고 중앙 집합 밖이다(거짓이면 NB·SB 6641·6642 상대이고 멤버 집합 밖 — 리뷰 1 I5). */
+            raft?: boolean;
         };
         /** @description `GET /sdn`의 잠금(§10.5): 켜졌는지, 바꾼 중앙, 허용 집합, 표를 거는 노드마다의 상태 */
         LockdownView: {
@@ -8312,6 +8319,8 @@ export interface components {
         /** @description 계획 전체 */
         MigrationPlan: {
             bridge: components["schemas"]["PlannedBridge"];
+            /** @description 원본에 NIC가 있지만 부른 사람이 읽을 수 없는 VM 수(리뷰 1 I3 — `nics`에 없고 옮기지 않는다) */
+            hidden?: number;
             nics: components["schemas"]["PlannedNic"][];
         };
         /** @description `POST /network-migrations/{key}/rollback` */
@@ -8322,8 +8331,8 @@ export interface components {
         /** @description `POST /network-migrations/{key}/start`·`resume` */
         MigrationStartRequest: {
             /**
-             * @description 다리 노드(이름이나 id)를 바꾼다(§13 — 다리 노드를 클러스터에서 지워 멈춘 옮기기를 다른 노드로 이어 간다). 놓인
-             *     다리가 살아 있는 노드에 있으면 바꿀 수 없다(409 `migration_bridge_laid`).
+             * @description 다리 노드(이름이나 id)를 바꾼다(§13 — 다리 노드를 클러스터에서 지웠거나 그 노드가 꺼져 멈춘 옮기기를 다른 노드로
+             *     이어 간다). 놓인 다리가 온라인 노드에 있으면 바꿀 수 없다(409 `migration_bridge_laid`).
              */
             bridge_node?: string;
         };
@@ -8837,6 +8846,11 @@ export interface components {
             peers?: string[];
             /** @description physnet 연결(계획 66, `NodeSpec.sdn.physnets`마다 이름 순). 비면 쓰지 않는다. */
             physnets?: components["schemas"]["PhysnetState"][];
+            /**
+             * @description 중앙이면 NB·SB Raft(6643·6644)에 지금 붙어 있는 상대 주소(다른 중앙의 출발 주소 — 잠금 미리 확인이 중앙 집합과
+             *     견준다, 리뷰 1 I5). 비면 쓰지 않는다.
+             */
+            raft_peers?: string[];
         };
         /** @description 노드의 SDN 설정(`NodeSpec.sdn`, 계획 66 §7). 관리자가 노드 쓰기(`cluster.admin`)로 바꾼다. */
         NodeSdnConfig: {

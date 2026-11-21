@@ -400,9 +400,11 @@ fn print_lockdown_check(out: &mut (dyn Write + Send), check: &Value) -> anyhow::
     } else {
         writeln!(out, "connected peers outside the allowed sets:")?;
         for o in &outside {
+            // Raft 상대는 중앙 집합과 견준다(리뷰 1 I5).
+            let raft = if o["raft"] == true { " (Raft)" } else { "" };
             writeln!(
                 out,
-                "  {} on central {}",
+                "  {} on central {}{raft}",
                 cell(&o["peer"]),
                 cell(&o["central"])
             )?;
@@ -413,6 +415,9 @@ fn print_lockdown_check(out: &mut (dyn Write + Send), check: &Value) -> anyhow::
             out,
             "would be blocked: a member node is connected from outside the sets; use --force to turn it on anyway"
         )?;
+    }
+    for w in arr(&check["warnings"]) {
+        writeln!(out, "warning: {}", cell(&w))?;
     }
     Ok(())
 }
@@ -976,11 +981,18 @@ mod tests {
         print_lockdown_check(
             &mut out,
             &json!({ "enabled": true, "members": ["10.0.0.1"], "centrals": ["10.0.0.1"],
-                     "outside": [{ "central": "n1", "peer": "10.9.9.9" }], "blocked": true }),
+                     "outside": [{ "central": "n1", "peer": "10.9.9.9" },
+                                 { "central": "n1", "peer": "172.16.0.2", "raft": true }],
+                     "blocked": true, "warnings": ["the cluster has two OVN centrals"] }),
         )
         .unwrap();
         let text = String::from_utf8(out).unwrap();
-        assert!(text.contains("10.9.9.9 on central n1"), "{text}");
+        assert!(text.contains("10.9.9.9 on central n1\n"), "{text}");
+        assert!(text.contains("172.16.0.2 on central n1 (Raft)"), "{text}");
+        assert!(
+            text.contains("warning: the cluster has two OVN centrals"),
+            "{text}"
+        );
         assert!(text.contains("--force"), "{text}");
     }
 }

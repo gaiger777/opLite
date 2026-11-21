@@ -483,7 +483,7 @@ async fn provider_networks_routers_and_floating_ips() {
         body["message"]
             .as_str()
             .unwrap()
-            .contains("router or floating IP"),
+            .contains("router, floating IP"),
         "{body}"
     );
 

@@ -174,6 +174,14 @@ fn columns(table: &str) -> Option<&'static [(&'static str, Ty)]> {
         ],
         // 주소 목록(`GET /networks/{key}/ips`)이 읽는 칸만
         "Port_Binding" => &[("logical_port", Str), ("chassis", Ref("Chassis", false))],
+        // 부하 분산 건강 검사(SDN 경보의 관찰·LB 보기가 읽는 칸만)
+        "Service_Monitor" => &[
+            ("ip", Str),
+            ("port", Int),
+            ("protocol", Set),
+            ("logical_port", Str),
+            ("status", Set),
+        ],
         "Encap" => &[
             ("type", Str),
             ("ip", Str),
@@ -286,6 +294,8 @@ pub struct FakeState {
     pub probe: Option<Duration>,
     /// 받은 `echo` 답의 수
     pub echo_replies: usize,
+    /// 받은 연결 수
+    pub accepted: usize,
 }
 
 impl FakeState {
@@ -300,6 +310,7 @@ impl FakeState {
             commits: 0,
             probe: None,
             echo_replies: 0,
+            accepted: 0,
         }
     }
 
@@ -392,6 +403,7 @@ impl FakeOvsdb {
         let (s, c) = (state.clone(), conns.clone());
         let task = tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
+                s.lock().unwrap().accepted += 1;
                 let s = s.clone();
                 let tls = tls.clone();
                 let handle = tokio::spawn(async move {

@@ -20,7 +20,7 @@ pub(crate) struct MigrateArgs {
     /// 옮겨 갈 SDN 네트워크(서브넷이 있음)
     #[arg(long = "to", value_name = "TARGET")]
     target: String,
-    /// 옮기기 이름(없으면 `SOURCE-to-TARGET`)
+    /// 옮기기 이름(없으면 서버가 `SOURCE-to-TARGET`, 쓰였으면 `-2` …을 고른다)
     #[arg(long)]
     name: Option<String>,
     /// 옮길 VM(여러 번, 없으면 원본에 NIC가 있는 모든 VM)
@@ -184,6 +184,12 @@ fn bridge_line(plan: &Value, nodes: &[Value]) -> String {
 fn print_plan(out: &mut (dyn Write + Send), plan: &Value, nodes: &[Value]) -> anyhow::Result<()> {
     table(out, PLAN_HEADERS, &plan_rows(plan))?;
     writeln!(out, "{}", bridge_line(plan, nodes))?;
+    if let Some(n) = plan["hidden"].as_u64().filter(|n| *n > 0) {
+        writeln!(
+            out,
+            "{n} VM(s) you cannot read are on the source network; they are not moved"
+        )?;
+    }
     Ok(())
 }
 
@@ -333,12 +339,12 @@ pub(crate) async fn migrate(
     out: &mut (dyn Write + Send),
     err: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let name = a
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("{}-to-{}", a.source, a.target));
     let spec = migration_spec(client, &a).await?;
-    let body = json!({ "name": name, "spec": spec });
+    // 이름을 주지 않으면 서버가 `SOURCE-to-TARGET`(쓰였으면 `-2` …)을 고른다(끝난 기록이 이름을 쥐어도 다시 옮길 수 있게).
+    let body = match &a.name {
+        Some(name) => json!({ "name": name, "spec": spec }),
+        None => json!({ "spec": spec }),
+    };
     if a.dry_run {
         let plan = client
             .post("/network-migrations?dry_run=true", &body)
@@ -354,6 +360,11 @@ pub(crate) async fn migrate(
         return print_plan(out, &plan, &nodes);
     }
     let created = client.post("/network-migrations", &body).await?;
+    let name = created["name"]
+        .as_str()
+        .map(str::to_string)
+        .or(a.name.clone())
+        .unwrap_or_default();
     if json_out {
         print_json(out, &created)?;
     } else {
@@ -545,6 +556,16 @@ mod tests {
         assert_eq!(rows[1][5], "blocked: a template VM");
         let nodes = vec![json!({ "id": "n1id", "name": "n1" })];
         assert_eq!(bridge_line(&plan, &nodes), "bridge: on node n1");
+        // 읽을 수 없는 VM은 수만(리뷰 1 I3)
+        let mut text = Vec::new();
+        let mut hidden = plan.clone();
+        hidden["hidden"] = json!(2);
+        print_plan(&mut text, &hidden, &nodes).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(
+            text.contains("2 VM(s) you cannot read are on the source network"),
+            "{text}"
+        );
         let row = list_row(
             &json!({ "name": "m", "spec": { "source": "lan", "target": "t" },
             "status": { "phase": "running", "vms": [{ "state": "moved" }, { "state": "pending" }] } }),
@@ -597,7 +618,7 @@ mod tests {
         let post = seen.iter().find(|s| s.line.starts_with("POST")).unwrap();
         assert_eq!(
             post.body,
-            json!({ "name": "lan-to-t-lan", "spec": {
+            json!({ "spec": {
                 "source": "lan", "target": "t-lan", "mode": "live", "allow_mtu_shrink": false,
                 "vms": ["v1"],
                 "addresses": [{ "vm": "v1", "mac": "52:54:00:00:00:01", "ip": ["10.0.0.5"] }],

@@ -45,6 +45,17 @@ pub fn add_bridges(
         if switch.ports.iter().any(|p| p.name == name) {
             continue;
         }
+        // 한 스위치에 다리 하나(리뷰 1 I1 — Raft `migration-target`이 막지만, 막기 전에 만든 옮기기가 남았을 때도 고리를
+        // 만들지 않게): id가 가장 낮은 옮기기만 놓는다.
+        if let Some(other) = switch.ports.iter().find(|p| p.kind == "l2gateway") {
+            tracing::warn!(
+                migration = %m.id,
+                network = %target.name,
+                laid = %other.name,
+                "another network migration already bridges this network; not laying a second bridge"
+            );
+            continue;
+        }
         switch.ports.push(PortRow {
             name,
             kind: "l2gateway".into(),

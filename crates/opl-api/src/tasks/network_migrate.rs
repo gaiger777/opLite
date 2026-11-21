@@ -33,7 +33,7 @@ use opl_types::node::{Node, NodeSpec, SDN_SERVICES};
 use opl_types::resource::Resource;
 use opl_types::router::RouterSpec;
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
-use opl_types::vm::{PowerState, Vm, VmPhase, VmSpec};
+use opl_types::vm::{MacAddr, PowerState, Vm, VmPhase, VmSpec};
 use uuid::Uuid;
 
 use super::{Ctx, create_task};
@@ -43,8 +43,8 @@ use crate::vms::is_stopped;
 
 /// 다리 노드가 physnet을 알리기(또는 걷기)를 기다리는 한도
 const BRIDGE_WAIT: Duration = Duration::from_secs(120);
-/// VM 하나의 끄기·켜기·핫플러그를 기다리는 한도
-const VM_WAIT: Duration = Duration::from_secs(15 * 60);
+/// VM 하나의 끄기·켜기·핫플러그를 기다리는 한도(기본 — `TaskRunnerConfig::migration_vm_wait`)
+pub(super) const VM_WAIT: Duration = Duration::from_secs(15 * 60);
 /// 다시 읽는 간격(시험은 `poll_interval`이 더 짧다)
 const POLL: Duration = Duration::from_millis(500);
 
@@ -69,6 +69,8 @@ struct World {
     nodes: Vec<Node>,
     taken: BTreeMap<IpAddr, Uuid>,
     busy: BTreeSet<Uuid>,
+    /// 다시 계획하는 옮기기 자신이 옮기는 NIC의 MAC(리뷰 1 M1)
+    own: BTreeSet<MacAddr>,
 }
 
 /// 끝나지 않은 옮기기 `m`이 잡은 VM(`spec.vms ∪ status.vms[].vm`)
@@ -176,12 +178,28 @@ fn load_world(
         .cloned()
         .collect();
     let (_, nodes) = cluster.list::<NodeSpec>()?;
-    let taken = taken_on(cluster, &spec.target, &all)?;
+    let mut taken = taken_on(cluster, &spec.target, &all)?;
     let (_, migrations) = cluster.list::<NetworkMigrationSpec>()?;
+    // 다른 끝나지 않은 옮기기가 이 대상에 잡아 둔 주소(리뷰 1 I2 — 원본에 남은 VM이 아직 쓴다)
+    for m in migrations
+        .iter()
+        .filter(|m| Some(m.id) != except && !m.status.is_done() && m.spec.target == spec.target)
+    {
+        for v in &m.status.vms {
+            for ip in &v.ips {
+                taken.entry(ip.to_canonical()).or_insert(v.vm);
+            }
+        }
+    }
     let busy = migrations
         .iter()
         .filter(|m| Some(m.id) != except)
         .flat_map(held_vms)
+        .collect();
+    let own = migrations
+        .iter()
+        .filter(|m| Some(m.id) == except)
+        .flat_map(|m| m.status.vms.iter().map(|v| v.mac))
         .collect();
     Ok(World {
         source,
@@ -190,6 +208,7 @@ fn load_world(
         nodes,
         taken,
         busy,
+        own,
     })
 }
 
@@ -210,18 +229,22 @@ pub fn plan_migration(
     spec: &NetworkMigrationSpec,
     guests: &BTreeMap<Uuid, GuestInfo>,
     allowed: &(dyn Fn(&Vm) -> bool + Sync),
+    sees: &(dyn Fn(&Vm) -> bool + Sync),
 ) -> Result<MigrationPlan, ApiError> {
     require_feature(cluster, SDN_SERVICES)?;
     spec.validate().map_err(|e| invalid(e.to_string()))?;
     let world = load_world(cluster, spec, None)?;
-    Ok(plan_world(&world, spec, guests, allowed))
+    Ok(plan_world(&world, spec, guests, allowed, sees))
 }
 
+/// 계획. `sees`가 거짓인 VM(부른 사람이 읽을 수 없음)은 계획에서 빼고 수만 센다(리뷰 1 I3 — 이름·MAC·주소를 내지 않고,
+/// 만들 때 상태에 적지도 않는다). 그런 VM은 `vm.config`도 없어 어차피 막힌다.
 fn plan_world(
     world: &World,
     spec: &NetworkMigrationSpec,
     guests: &BTreeMap<Uuid, GuestInfo>,
     allowed: &(dyn Fn(&Vm) -> bool + Sync),
+    sees: &(dyn Fn(&Vm) -> bool + Sync),
 ) -> MigrationPlan {
     let pvs: Vec<PlanVm> = world
         .vms
@@ -233,7 +256,7 @@ fn plan_world(
             allowed: allowed(vm),
         })
         .collect();
-    nm::plan(&PlanInput {
+    let mut plan = nm::plan(&PlanInput {
         spec,
         source: &world.source.spec,
         target: &world.target.spec,
@@ -241,7 +264,17 @@ fn plan_world(
         nodes: &world.nodes,
         taken: &world.taken,
         busy: &world.busy,
-    })
+        own: &world.own,
+    });
+    let hidden: BTreeSet<Uuid> = world
+        .vms
+        .iter()
+        .filter(|v| !sees(v))
+        .map(|v| v.id)
+        .collect();
+    plan.nics.retain(|n| !hidden.contains(&n.vm));
+    plan.hidden = hidden.len();
+    plan
 }
 
 /// 옮기기 `name`을 만든다: 계획을 `status.vms`에 적은 `planned` 리소스(원본 네트워크의 폴더 — 스펙에 없으면). 한 원본에
@@ -252,11 +285,12 @@ pub async fn create_migration(
     mut spec: NetworkMigrationSpec,
     guests: &BTreeMap<Uuid, GuestInfo>,
     allowed: &(dyn Fn(&Vm) -> bool + Sync),
+    sees: &(dyn Fn(&Vm) -> bool + Sync),
 ) -> Result<(NetworkMigration, MigrationPlan), ApiError> {
     require_feature(cluster, SDN_SERVICES)?;
     spec.validate().map_err(|e| invalid(e.to_string()))?;
     let world = load_world(cluster, &spec, None)?;
-    let plan = plan_world(&world, &spec, guests, allowed);
+    let plan = plan_world(&world, &spec, guests, allowed, sees);
     if spec.folder.is_none() {
         spec.folder = world.source.spec.folder;
     }
@@ -398,6 +432,21 @@ pub(crate) async fn drop_bridge_node(cluster: &Cluster, node: Uuid, name: &str) 
         }
     }
     out
+}
+
+/// 놓인 다리 기록을 지운다(다리 노드가 오프라인이라 다른 노드로 바꿀 때 — 리뷰 1 M5). 도는 Task가 있으면 거절한다.
+pub(crate) async fn forget_bridge(cluster: &Cluster, id: Uuid) -> Result<(), String> {
+    let m = cluster
+        .get::<NetworkMigrationSpec>(id)
+        .map_err(|e| e.to_string())?
+        .ok_or("the network migration was deleted")?;
+    if live_task(cluster, &m).map_err(|e| e.message)?.is_some() {
+        return Err(format!(
+            "network migration {:?} is running a task; pause it first",
+            m.name
+        ));
+    }
+    update(cluster, id, |s| s.bridge = None).await.map(|_| ())
 }
 
 // ---- 상태 쓰기 ----
@@ -558,7 +607,7 @@ async fn lay_bridge(ctx: &Ctx, id: Uuid) -> Result<(), String> {
         Some(b) => b,
         None => {
             let world = load_world(&ctx.cluster, &m.spec, Some(id)).map_err(|e| e.message)?;
-            let plan = plan_world(&world, &m.spec, &BTreeMap::new(), &|_| true);
+            let plan = plan_world(&world, &m.spec, &BTreeMap::new(), &|_| true, &|_| true);
             if let Some(e) = plan.bridge.error {
                 return Err(format!("cannot lay the migration bridge: {e}"));
             }
@@ -629,6 +678,17 @@ async fn take_bridge(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String> {
     update(&ctx.cluster, id, |s| s.bridge = None).await?;
     let deadline = tokio::time::Instant::now() + BRIDGE_WAIT;
     while physnet_state(ctx, bridge.node, &bridge.physnet).is_some() {
+        // 꺼진 노드는 알리지 못한다: 기다리지 않는다(돌아오면 에이전트가 기록에 없는 다리를 걷는다 — 리뷰 1 M5).
+        if !ctx
+            .cluster
+            .get::<NodeSpec>(bridge.node)
+            .is_ok_and(|n| n.is_some_and(|n| n.status.online))
+        {
+            return Ok(Some(format!(
+                "node {} is offline; it takes the migration bridge {} away when it comes back",
+                bridge.node, bridge.physnet
+            )));
+        }
         if tokio::time::Instant::now() >= deadline {
             return Ok(Some(format!(
                 "node {} still reports the migration bridge {}",
@@ -822,7 +882,7 @@ fn replan(
         });
     }
     let world = load_world(&ctx.cluster, &spec, Some(mig.id)).map_err(|e| e.message)?;
-    let plan = plan_world(&world, &spec, &BTreeMap::new(), &|_| true);
+    let plan = plan_world(&world, &spec, &BTreeMap::new(), &|_| true, &|_| true);
     let Some(now) = plan
         .nics
         .iter()
@@ -894,7 +954,9 @@ async fn write_leg(
             .list::<NetworkSpec>()
             .map_err(|e| e.to_string())?;
         let others: Vec<&Vm> = all.iter().filter(|v| v.id != vm.id).collect();
-        let held = crate::ipam::load_held(&ctx.cluster).map_err(|e| e.message)?;
+        // 옮기기들이 잡아 둔 주소(원본에 남은 VM의 주소 — 리뷰 1 I2)도 쓴 주소다. 이 VM 자신의 것은 뺀다.
+        let held =
+            crate::ipam::load_held_except(&ctx.cluster, Some(vm.id)).map_err(|e| e.message)?;
         let _ = crate::ipam::assign_new(&mut spec, &others, &networks, &held)?;
         let got = &spec.nics[leg.rec.nic].ips;
         if let Some(ip) = leg.rec.ips.iter().find(|ip| !got.contains(ip)) {
@@ -957,7 +1019,7 @@ fn hotplug_task(ctx: &Ctx, vm: Uuid) -> Result<Option<Task>, String> {
 
 /// Task `id`가 끝날 때까지 기다린다(실패면 그 오류).
 async fn wait_task(ctx: &Ctx, id: Uuid) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + VM_WAIT;
+    let deadline = tokio::time::Instant::now() + ctx.config.migration_vm_wait;
     loop {
         let t = ctx
             .cluster
@@ -985,7 +1047,7 @@ async fn wait_task(ctx: &Ctx, id: Uuid) -> Result<(), String> {
 /// 스펙의 NIC를 도는 것으로 되돌린다.
 async fn live(ctx: &Ctx, leg: &Leg) -> Result<Vec<IpAddr>, String> {
     let mut tries = 0;
-    let vm = loop {
+    loop {
         tries += 1;
         if tries > 20 {
             return Err("the VM kept changing".into());
@@ -1001,26 +1063,46 @@ async fn live(ctx: &Ctx, leg: &Leg) -> Result<Vec<IpAddr>, String> {
             return Err("the VM is no longer running; plan the migration again".into());
         }
         if leg.on_to(&vm.spec) {
-            break vm;
+            break;
         }
         if !leg.on_from(&vm.spec) {
             return Err("the NIC was changed outside the migration".into());
         }
         write_leg(ctx, &vm, leg, None).await?;
-    };
-    let task = match hotplug_task(ctx, vm.id)? {
-        Some(t) => t,
-        None => {
-            let node = vm.status.node.ok_or("the VM has no node")?;
-            create_task(&ctx.cluster, TaskOp::VmHotplug, vm.id, node)
-                .await
-                .map_err(|e| e.message)?
+    }
+    // 이미 도는 핫플러그 Task는 우리 스펙 쓰기 전에 계획했을 수 있다(그러면 tap을 옮기지 않고 끝난다 — 리뷰 1 M2). 그렇게
+    // 끝났으면 새 Task로 한 번 더 한다.
+    let mut waited = Ok(());
+    for _ in 0..2 {
+        let vm = get_vm(ctx, leg.rec.vm)?;
+        if leg.on_to(&vm.spec) && running_on(&vm, &leg.rec, &leg.to) {
+            return Ok(nic_ips(&vm, &leg.rec));
         }
-    };
-    let waited = wait_task(ctx, task.id).await;
+        let running = vm.spec.power == PowerState::Running && vm.status.phase == VmPhase::Running;
+        if !leg.on_to(&vm.spec) || !running {
+            break;
+        }
+        let task = match hotplug_task(ctx, vm.id)? {
+            Some(t) => t,
+            None => {
+                let node = vm.status.node.ok_or("the VM has no node")?;
+                create_task(&ctx.cluster, TaskOp::VmHotplug, vm.id, node)
+                    .await
+                    .map_err(|e| e.message)?
+            }
+        };
+        waited = wait_task(ctx, task.id).await;
+        if waited.is_err() {
+            break;
+        }
+    }
     let vm = get_vm(ctx, leg.rec.vm)?;
     if leg.on_to(&vm.spec) && running_on(&vm, &leg.rec, &leg.to) {
         return Ok(nic_ips(&vm, &leg.rec));
+    }
+    // 스펙은 옮겼는데 도는 NIC는 그대로면 스펙을 되돌린다(다음 켜기가 말없이 옮기지 않게 — 리뷰 1 M2).
+    if leg.on_to(&vm.spec) && !running_on(&vm, &leg.rec, &leg.to) {
+        write_back(ctx, leg).await;
     }
     Err(match waited {
         Err(e) => format!("the NIC was not moved live: {e}"),
@@ -1028,9 +1110,31 @@ async fn live(ctx: &Ctx, leg: &Leg) -> Result<Vec<IpAddr>, String> {
     })
 }
 
+/// 이 방향으로 쓴 스펙을 되돌린다(실패는 기록만).
+async fn write_back(ctx: &Ctx, leg: &Leg) {
+    let back = Leg {
+        to: leg.from.clone(),
+        from: leg.to.clone(),
+        rec: leg.rec.clone(),
+        forward: !leg.forward,
+    };
+    for _ in 0..10 {
+        let Ok(vm) = get_vm(ctx, leg.rec.vm) else {
+            return;
+        };
+        if back.on_to(&vm.spec) || !back.on_from(&vm.spec) {
+            return;
+        }
+        if let Err(e) = write_leg(ctx, &vm, &back, None).await {
+            tracing::warn!(vm = %vm.id, error = %e, "cannot write the NIC back after a failed live move");
+            return;
+        }
+    }
+}
+
 /// VM `id`가 켜질(Ok)·켜지지 못할(Err) 때까지
 async fn wait_started(ctx: &Ctx, id: Uuid) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + VM_WAIT;
+    let deadline = tokio::time::Instant::now() + ctx.config.migration_vm_wait;
     loop {
         let vm = get_vm(ctx, id)?;
         match (vm.spec.power, vm.status.phase) {
@@ -1066,9 +1170,18 @@ async fn set_power(ctx: &Ctx, vm: &Vm, power: PowerState) -> Result<(), String> 
 
 /// `restart`: 끄고(ACPI — reconciler가 VM의 시간 한도로) 스펙을 바꿔 켠다. 켜지 못하면 원래 네트워크로 되돌려 다시 켠다.
 async fn restart(ctx: &Ctx, leg: &Leg) -> Result<Vec<IpAddr>, String> {
-    let deadline = tokio::time::Instant::now() + VM_WAIT;
+    let deadline = tokio::time::Instant::now() + ctx.config.migration_vm_wait;
     loop {
         if tokio::time::Instant::now() >= deadline {
+            // 새 네트워크에서 켜지지 못한 채 시간이 다 됐으면 끄고 원래 네트워크로 되돌려 켠다(리뷰 1 M3).
+            if get_vm(ctx, leg.rec.vm).is_ok_and(|vm| leg.on_to(&vm.spec)) {
+                stop_and_wait(ctx, leg.rec.vm).await;
+                back_and_start(ctx, leg).await;
+                return Err(format!(
+                    "the VM did not start on network {:?} in time and was started on {:?} again",
+                    leg.to, leg.from
+                ));
+            }
             return Err("the VM did not stop or start in time".into());
         }
         let vm = get_vm(ctx, leg.rec.vm)?;
@@ -1108,6 +1221,27 @@ async fn restart(ctx: &Ctx, leg: &Leg) -> Result<Vec<IpAddr>, String> {
         }
         tokio::time::sleep(POLL.min(ctx.config.poll_interval)).await;
     }
+}
+
+/// VM `id`를 끄고 꺼질 때까지 기다린다(한도 안 — 실패는 기록만).
+async fn stop_and_wait(ctx: &Ctx, id: Uuid) {
+    let deadline = tokio::time::Instant::now() + ctx.config.migration_vm_wait;
+    while tokio::time::Instant::now() < deadline {
+        let Ok(vm) = get_vm(ctx, id) else {
+            return;
+        };
+        if is_stopped(&vm) {
+            return;
+        }
+        if vm.spec.power != PowerState::Stopped
+            && let Err(e) = set_power(ctx, &vm, PowerState::Stopped).await
+        {
+            tracing::warn!(vm = %id, error = %e, "cannot stop the VM that did not start on its new network");
+            return;
+        }
+        tokio::time::sleep(POLL.min(ctx.config.poll_interval)).await;
+    }
+    tracing::warn!(vm = %id, "the VM that did not start on its new network did not stop in time");
 }
 
 /// 켜지 못한 VM을 원래 네트워크로 되돌려 다시 켠다(기다리되 실패는 기록만 — VM이 망 없이 꺼진 채 남지 않게 최선을 다한다).

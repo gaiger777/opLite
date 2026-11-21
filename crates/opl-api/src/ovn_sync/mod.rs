@@ -20,12 +20,14 @@
 //! 5. `SdnStatus.sync`를 바뀔 때만(성공이 이어지면 60초에 한 번) 쓴다.
 //!
 //! 차례 뒤와 10초마다 SDN 경보의 관찰(계획 67 §11 — 게이트웨이 주인, SB `Service_Monitor`)을 읽어 메모리
-//! ([`Observations`])에 둔다. 리더 경보 엔진이 같은 프로세스에서 읽는다.
+//! ([`Observations`])에 둔다. 리더 경보 엔진이 같은 프로세스에서 읽는다. 관찰은 따로 도는 Task가 이어 쓰는 연결과 짧은 시간
+//! 제한으로 읽는다(`observe` — 리뷰 1 I4, 맞추기 차례를 막지 않는다).
 
 pub mod acl;
 pub mod lb;
 pub mod migration;
 pub mod nb;
+mod observe;
 pub mod qos;
 
 use std::collections::HashMap;
@@ -38,7 +40,7 @@ use opl_cluster::Cluster;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::ovn::ovsdb::{cond, parse_uuids};
 use opl_driver::ovn::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB, Transport};
-use opl_types::alert::sdn::{MonitorObservation, SdnObservations};
+use opl_types::alert::sdn::SdnObservations;
 use opl_types::floating_ip::FloatingIpSpec;
 use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::network::NetworkSpec;
@@ -342,48 +344,6 @@ impl OvnSyncer {
                 tracing::warn!(error = %e, "cannot sync the OVN northbound DB");
                 SyncOutcome::Failed(e.to_string())
             }
-        }
-    }
-
-    /// SDN 경보의 관찰(계획 67 §11): 리더이고 SDN이 준비됐으면 NB의 게이트웨이 주인(DGP `hosting-chassis`)과 SB
-    /// `Service_Monitor`를 읽어 [`OvnSyncConfig::observations`]에 둔다. 읽지 못하면 앞 관찰을 그대로 둔다(낡으면 경보
-    /// 엔진이 모르는 것으로 본다). 읽기만 하므로 팔로어도 쓴다.
-    pub async fn observe(&mut self) {
-        let Some(term) = self.cluster.leader_term() else {
-            return;
-        };
-        let sdn = match self.cluster.get_by_name::<SdnSpec>(SDN_NAME) {
-            Ok(Some(s)) if s.status.phase == SdnPhase::Ready && !s.status.centrals.is_empty() => s,
-            _ => return,
-        };
-        let Ok((_, nodes)) = self.cluster.list::<NodeSpec>() else {
-            return;
-        };
-        let centrals = central_hosts(&sdn, &nodes);
-        let read = async {
-            let hosting = Box::pin(read_hosting(&self.config, &centrals, None)).await?;
-            let monitors = Box::pin(read_monitors(&self.config, &centrals)).await?;
-            Ok::<_, OvsdbError>((hosting, monitors))
-        };
-        match read.await {
-            Ok((hosting, monitors)) if self.cluster.leader_term() == Some(term) => {
-                self.config.observations.set(SdnObservations {
-                    term,
-                    at: now_ms(),
-                    hosting,
-                    monitors: monitors
-                        .into_iter()
-                        .map(|m| MonitorObservation {
-                            logical_port: m.logical_port,
-                            port: m.port,
-                            protocol: m.protocol,
-                            status: m.status,
-                        })
-                        .collect(),
-                });
-            }
-            Ok(_) => {}
-            Err(e) => tracing::debug!(error = %e, "cannot read the OVN state for SDN alerts"),
         }
     }
 
@@ -705,7 +665,15 @@ impl OvnSync {
 }
 
 async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot::Receiver<()>) {
-    let (resync, debounce, observe_every) = (config.resync, config.debounce, config.observe_every);
+    let (resync, debounce) = (config.resync, config.debounce);
+    // SDN 경보의 관찰은 따로 도는 Task가 읽는다(리뷰 1 I4 — 죽은 중앙을 기다리느라 NB 쓰기가 늦지 않게). 한 차례를 마치면
+    // 깨운다.
+    let kick = Arc::new(tokio::sync::Notify::new());
+    let _observer = AbortOnDrop(tokio::spawn(observe::run(
+        cluster.clone(),
+        config.clone(),
+        kick.clone(),
+    )));
     let mut syncer = OvnSyncer::new(cluster.clone(), config);
     let mut watch: Option<Watch> = None;
     loop {
@@ -721,32 +689,17 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
             // 선거 중에는 오래 걸릴 수 있으므로 종료 요청과 겨룬다.
             tokio::select! {
                 _ = &mut shutdown => return,
-                _ = Box::pin(async {
-                    syncer.sync().await;
-                    syncer.observe().await;
-                }) => {}
+                _ = Box::pin(syncer.sync()) => kick.notify_one(),
             }
         } else {
             syncer.disconnect();
         }
         let deadline = tokio::time::sleep(resync);
         tokio::pin!(deadline);
-        let mut observe =
-            tokio::time::interval_at(tokio::time::Instant::now() + observe_every, observe_every);
-        observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
                 () = &mut deadline => break,
-                _ = observe.tick() => {
-                    // 게이트웨이 넘김·건강 검사는 Raft 변경 없이 OVN에서 일어나므로 따로 읽는다.
-                    if cluster.leader_term().is_some() {
-                        tokio::select! {
-                            _ = &mut shutdown => return,
-                            () = Box::pin(syncer.observe()) => {}
-                        }
-                    }
-                }
                 () = changed(&mut watch, &syncer) => {
                     // 모아서 한 번
                     tokio::select! {
@@ -765,6 +718,15 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
                 }
             }
         }
+    }
+}
+
+/// 놓으면 Task를 멈춘다.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -1026,7 +988,7 @@ pub(crate) async fn read_monitors(
 }
 
 /// `Service_Monitor` 행 하나(빈 선택 칸은 OVSDB의 `["set", []]`)
-fn parse_monitor(row: &serde_json::Map<String, Value>) -> Option<MonitorState> {
+pub(crate) fn parse_monitor(row: &serde_json::Map<String, Value>) -> Option<MonitorState> {
     let text = |k: &str| match row.get(k) {
         Some(Value::String(s)) => s.clone(),
         _ => String::new(),
@@ -1076,7 +1038,7 @@ async fn read_bindings(
 }
 
 /// 지금(유닉스 ms)
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

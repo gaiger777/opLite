@@ -126,6 +126,10 @@ impl From<ClusterError> for ApiError {
                             "physnet" => "physnet_conflict",
                             "router-net" => "network_in_use",
                             "fip-nic" => "fip_in_use",
+                            // 계획 67: 같은 원본·VM·다리 대상의 끝나지 않은 옮기기(리뷰 1 I1)
+                            "migration-source" | "migration-vm" | "migration-target" => {
+                                "migration_overlap"
+                            }
                             _ => "volume_in_use",
                         },
                         message,
@@ -263,6 +267,19 @@ mod tests {
             holder: uuid::Uuid::nil(),
         }));
         assert_eq!((e.status, e.code), (StatusCode::CONFLICT, "ip_in_use"));
+        // 끝나지 않은 옮기기의 원본·VM·다리 대상 겹침(리뷰 1 I1)
+        for field in ["migration-source", "migration-vm", "migration-target"] {
+            let e = ApiError::from(ClusterError::Rejected(Rejection::InUse {
+                kind: opl_types::resource::Kind::NetworkMigration,
+                field: field.into(),
+                value: "t-lan".into(),
+                holder: uuid::Uuid::nil(),
+            }));
+            assert_eq!(
+                (e.status, e.code),
+                (StatusCode::CONFLICT, "migration_overlap")
+            );
+        }
     }
 
     #[test]
