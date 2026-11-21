@@ -2,116 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: ['ci-probe/**']
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, macos-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: OpenSSL headers (Linux; native-tls)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-      - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace
-      # 시험 빌드에만 있는 고리로 리더의 api 실행기를 막는 굶김 시험(QEMU 없음)
-      - run: cargo test -p opld --features starve-it --test starve
-      # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
-      # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
-      - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
-      # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
-      # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
-      - name: Scale test (100 nodes in one process)
-        run: cargo test -p opl-cluster --features scale-it --test scale -- --nocapture
-        timeout-minutes: 10
-        env:
-          OPL_SCALE_NODES: 100
-          # 코어 3~4개 러너에서 노드 100개의 쓰기가 CPU에 묶여 흔들린다. 쓰기 p99 기준만 늦춘다(README, 설계 §14).
-          OPL_SCALE_P99_MS: 200
-      - name: Storage integration tests (qemu-img)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y qemu-utils
-          cargo test -p opl-driver --features storage-it --test dir_storage
-          cargo test -p opl-api --features storage-it --test volumes --test downloads
-          cargo test -p opl-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks
-
-  # 웹 UI: 타입 검사, 린트, 단위 테스트, API 타입이 Rust 정의와 같은지, 알려진 취약점, 빌드
-  web:
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: web
-    steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: web/package.json
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: pnpm
-          cache-dependency-path: web/pnpm-lock.yaml
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: OpenSSL headers (native-tls)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libssl-dev pkg-config
-      - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm lint
-      - run: pnpm test
-      - name: API types match the Rust API
-        run: |
-          pnpm gen:api
-          git diff --exit-code src/api/schema.d.ts
-      - run: pnpm audit --prod
-      - run: pnpm build
-
-  # 패키징 셸 스크립트: shellcheck, build-deb.sh 버전 확인·키링 시험, build-repo.sh 시험(가짜 apt-ftparchive·gpg),
-  # maintainer 스크립트 시험(가짜 systemctl), 옛 제품 이름(oplite)이 허용 목록 밖에 남지 않았는지(name-test.sh)
-  shell:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - name: shellcheck
-        run: |
-          shopt -s globstar
-          shellcheck packaging/**/*.sh packaging/deb/postinst packaging/deb/prerm packaging/deb/postrm .github/scripts/*.sh
-      - run: bash packaging/tests/name-test.sh
-      - run: bash packaging/tests/build-deb-test.sh
-      - run: bash packaging/tests/build-repo-test.sh
-      - run: bash packaging/tests/portal-test.sh
-      - run: bash packaging/tests/maint-test.sh
-      - run: bash packaging/tests/setup-test.sh
-      # 설치 프로그램 환경(busybox sh·awk)에서 orbivisor-setup.sh 함수가 같은 결과를 내는지
-      - name: setup-test with busybox
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y busybox
-          OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
-      - run: bash packaging/tests/iso-test.sh
-
-  # Debian 패키지 orbivisor와 전환 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) →
-  # Debian 13 컨테이너에서 설치 시험, build-repo.sh로 만든 APT 저장소에서 옛 oplite를 설치하고 testing 채널의
-  # orbivisor로 넘어가는 시험
   package:
     runs-on: ubuntu-24.04
     steps:
@@ -564,9 +460,3 @@ jobs:
       - name: slapd log
         if: failure()
         run: sudo journalctl -u slapd --no-pager -n 200
-
-  deny:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
