@@ -71,6 +71,28 @@ async fn ready(d: &Daemon) -> bool {
         .is_ok_and(|r| r.status() == reqwest::StatusCode::OK)
 }
 
+/// 이 노드가 적용한 리비전(Raft 로그 인덱스). 목록 응답의 `revision`이다. `token`은 `init`한 노드에 로그인한 토큰이다.
+async fn applied(d: &Daemon, token: &str) -> Option<u64> {
+    let resp = reqwest::Client::builder()
+        .tls_danger_accept_invalid_certs(true)
+        .build()
+        .unwrap()
+        .get(format!("{}/api/v1/alert-rules", d.server()))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    let body: serde_json::Value = resp.error_for_status().ok()?.json().await.ok()?;
+    body["revision"].as_u64()
+}
+
+/// 로그의 끝 몇 줄(실패했을 때 무엇이 걸렸는지 보려고)
+fn tail(d: &Daemon) -> String {
+    let log = d.log();
+    let lines: Vec<&str> = log.lines().collect();
+    lines[lines.len().saturating_sub(60)..].join("\n")
+}
+
 #[tokio::test]
 async fn one_node_holds_the_vip_and_it_moves_when_that_node_stops() {
     let ip = format!("192.0.2.{}", 10 + Uuid::new_v4().as_u128() % 240);
@@ -121,14 +143,32 @@ async fn one_node_holds_the_vip_and_it_moves_when_that_node_stops() {
     // kill -9로 죽은 주인의 VIP는 인터페이스에 남는다. 다시 시작하면 리스를 받기 전에 뗀다.
     // 다시 시작한 노드가 멈춰 있던 동안의 로그를 받기 전에 다른 노드를 죽이면, 그 로그를 가진 위트니스가
     // 투표하지 않아(Raft 선거 규칙) 리더가 생기지 않는다. 그래서 준비될(리더에게서 로그를 받을) 때까지 둔다.
+    // 헬스가 200이 되는 것(리더를 앎)은 리더의 하트비트를 받자마자다. 멈춘 동안의 로그를 아직 받는 중일 수 있으므로,
+    // 리더(`other`)가 적용한 리비전까지 이 노드도 적용하기를 기다린다.
     nodes[first].start().await;
     eventually("the first node ready", || ready(&nodes[first])).await;
-    nodes[other].kill();
-    assert!(ifaces[other].has(&ip));
-    eventually("the VIP back on the first node", || async {
-        ifaces[first].has(&ip)
+    let login: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(nodes[0].path("oplctl.json")).unwrap()).unwrap();
+    let token = login["token"].as_str().unwrap().to_string();
+    let target = applied(&nodes[other], &token).await.unwrap();
+    eventually("the first node caught up", || async {
+        applied(&nodes[first], &token).await >= Some(target)
     })
     .await;
+    nodes[other].kill();
+    assert!(ifaces[other].has(&ip));
+    // 새 리더 선거, 리스 정리(새 리더의 첫 리스 길이)와 HA 리스 회복을 기다린다. 바쁜 CI에서도 넉넉하게 60초를 두고,
+    // 실패하면 노드 로그를 보인다.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !ifaces[first].has(&ip) {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the VIP back on the first node\n--- first node\n{}\n--- witness\n{}",
+            tail(&nodes[first]),
+            tail(&w)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     nodes[other].start().await;
     eventually("the leftover VIP removed", || async {
         !ifaces[other].has(&ip)
