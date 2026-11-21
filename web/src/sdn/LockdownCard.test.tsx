@@ -202,3 +202,54 @@ it("turns on the recommended SDN alert rules with the server's sdn-defaults", as
   expect(sent[0]).toEqual({ targets: ["ops"] });
   expect(await screen.findByText("Created 6 SDN alert rules; 2 already existed.")).toBeVisible();
 });
+
+it("offers to finish a turn-on that stopped halfway, with Raft peers and warnings from the check (review 1 M6)", async () => {
+  // Task가 실패해 중앙 하나만 잠갔다(켜짐·바꾸는 중·오류, 도는 Task 없음).
+  sdn({
+    lockdown: {
+      ...LOCKED,
+      applied: [],
+      pending: true,
+      error: "central node-a did not come back",
+    },
+    tasks: [],
+  });
+  const sent: { search: string; body: unknown }[] = [];
+  server.use(
+    http.post(apiUrl("/sdn/lockdown"), async ({ request }) => {
+      const url = new URL(request.url);
+      sent.push({ search: url.search, body: await request.json() });
+      return url.searchParams.get("dry_run") === "true"
+        ? HttpResponse.json({
+            enabled: true,
+            members: ["10.0.0.1", "10.0.0.2"],
+            centrals: ["10.0.0.1"],
+            outside: [{ central: "node-a", peer: "192.0.2.8", raft: true }],
+            blocked: true,
+            warnings: ["with two centrals the southbound database loses quorum during each turn"],
+          })
+        : HttpResponse.json(sdnTask("t1", "sdn-init", N1.id), { status: 202 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<SdnPage />);
+  const card = (await screen.findByRole("heading", { name: "OVN access lockdown" })).closest(
+    "section",
+  )!;
+  expect(await within(card).findByText("Stopped halfway")).toBeVisible();
+  expect(within(card).getByRole("button", { name: "Turn off" })).toBeVisible();
+  await user.click(within(card).getByRole("button", { name: "Check first" }));
+  const peer = await within(card).findByText("192.0.2.8 → node-a");
+  expect(within(peer).getByText("Raft")).toBeVisible();
+  expect(
+    within(card).getByText(
+      "with two centrals the southbound database loses quorum during each turn",
+    ),
+  ).toBeVisible();
+  const finish = within(card).getByRole("button", { name: "Finish turning on" });
+  expect(finish).toBeDisabled();
+  await user.click(within(card).getByLabelText("Turn on anyway (these connections are cut off)"));
+  await user.click(finish);
+  await waitFor(() => expect(sent).toHaveLength(2));
+  expect(sent[1]).toEqual({ search: "", body: { enabled: true, force: true } });
+});

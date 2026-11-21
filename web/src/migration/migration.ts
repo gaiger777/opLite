@@ -77,10 +77,92 @@ export const MODE_TONE: Record<PlannedMode, StatusTone> = {
   blocked: "danger",
 };
 
-/** 옮기기 이름: `<원본>-to-<대상>`(서버 이름 규칙 63자 안) */
-export function migrationName(source: string, target: string): string {
-  const name = `${source}-to-${target}`.toLowerCase().replace(/[^a-z0-9-]/g, "-");
-  return name.slice(0, 63).replace(/-+$/, "");
+/**
+ * 계획을 정하는 칸만 남긴 스펙의 열쇠(VM 빼기는 화면에서만 하므로 `vms`는 뺀다 — 리뷰 1 I6). 화면의 계획을 만든 스펙과
+ * 지금 고른 것이 다르면 시작하기 전에 다시 계획해야 한다(리뷰 1 C1).
+ */
+export function planKey(spec: MigrationSpec): string {
+  const addresses = [...(spec.addresses ?? [])]
+    .filter((a) => a.ip.length > 0)
+    .map((a) => `${a.vm}/${a.mac.toLowerCase()}=${[...a.ip].sort().join(",")}`)
+    .sort();
+  return JSON.stringify([
+    spec.source,
+    spec.target,
+    spec.mode ?? "auto",
+    spec.bridge ?? null,
+    spec.bridge_node ?? null,
+    spec.allow_mtu_shrink ?? false,
+    spec.parallel ?? 1,
+    addresses,
+  ]);
+}
+
+/** 계획의 경고 수(NIC마다 + 다리) */
+export function planWarnings(plan: MigrationPlan): number {
+  return plan.nics.reduce((sum, n) => sum + n.warnings.length, 0) + plan.bridge.warnings.length;
+}
+
+/** 화면의 계획과 만들 때 서버가 다시 한 계획이 다른 것 하나 */
+export interface PlanChange {
+  vm: string;
+  name: string;
+  nic: number;
+  /** 새로 들어옴·방식·주소·막힘이 바뀜 */
+  what: "new" | "mode" | "ips" | "blockers";
+  before?: string;
+  after: string;
+  /** 켜진 VM이 이제 꺼졌다 켜지거나 라이브로 옮겨진다(눈에 띄게) */
+  disrupts: boolean;
+}
+
+/**
+ * 화면에 보인 계획 `shown`(빼지 않은 VM만)과 만들기가 돌려준 계획 `created`의 다른 점(리뷰 1 C1 — 그새 켜진 VM은 `auto`에서
+ * `offline` → `live`·`restart`가 된다). 다리 노드·오류는 Task가 다시 보므로 NIC만 견준다.
+ */
+export function planChanges(
+  shown: MigrationPlan,
+  created: MigrationPlan,
+  excluded: ReadonlySet<string> = new Set(),
+): PlanChange[] {
+  const out: PlanChange[] = [];
+  const before = new Map(shown.nics.map((n) => [`${n.vm}/${n.nic}`, n]));
+  const sameList = (a: readonly string[], b: readonly string[]) =>
+    [...a].sort().join("\n") === [...b].sort().join("\n");
+  for (const n of created.nics) {
+    if (excluded.has(n.vm)) {
+      continue;
+    }
+    const was = before.get(`${n.vm}/${n.nic}`);
+    const base = { vm: n.vm, name: n.name, nic: n.nic };
+    const disrupts = n.mode === "live" || n.mode === "restart";
+    if (!was) {
+      out.push({ ...base, what: "new", after: n.mode, disrupts });
+      continue;
+    }
+    if (was.mode !== n.mode) {
+      out.push({ ...base, what: "mode", before: was.mode, after: n.mode, disrupts });
+    }
+    if (!sameList(was.ips, n.ips)) {
+      out.push({
+        ...base,
+        what: "ips",
+        before: was.ips.join(", "),
+        after: n.ips.join(", "),
+        disrupts: false,
+      });
+    }
+    if (!sameList(was.blockers, n.blockers)) {
+      out.push({
+        ...base,
+        what: "blockers",
+        before: was.blockers.join("; "),
+        after: n.blockers.join("; "),
+        disrupts: false,
+      });
+    }
+  }
+  return out;
 }
 
 /** cloud-init instance-id가 바뀐다는 경고(스테이지 4 — 다음 켜기에 인스턴스마다 하는 일을 다시 함) */
@@ -99,7 +181,7 @@ const PLAN_TEXTS: readonly [RegExp, string, readonly string[]][] = [
   [/^the NIC has no MAC address yet$/, "migration.text.noMac", []],
   [/^address (\S+) is outside the subnets of "(.+)"$/, "migration.text.outside", ["ip", "network"]],
   [/^address (\S+) is reserved in "(.+)"/, "migration.text.reserved", ["ip", "network"]],
-  [/^address (\S+) is already in use by (\S+)$/, "migration.text.inUse", ["ip", "holder"]],
+  [/^address (\S+) is already in use on "(.+)"$/, "migration.text.inUse", ["ip", "network"]],
   [/^address (\S+) is also planned for another NIC$/, "migration.text.duplicate", ["ip"]],
   [/^the VM runs on a node that is not an SDN \(OVN\) chassis/, "migration.text.notChassis", []],
   [/^the VM is running \(mode offline\)$/, "migration.text.runningOffline", []],
@@ -120,6 +202,11 @@ const PLAN_TEXTS: readonly [RegExp, string, readonly string[]][] = [
   [/^the target is a provider network: no bridge/, "migration.text.providerNoBridge", []],
   [/^no bridge: moved VMs cannot reach/, "migration.text.noBridge", []],
   [/^a DHCP server on the source network also answers/, "migration.text.dhcp", []],
+  [
+    /^IPAM does not know the addresses other hosts use on the source network/,
+    "migration.text.ipamOthers",
+    [],
+  ],
   [/^a bridge is only laid to an overlay target$/, "migration.text.bridgeOverlay", []],
   [/^node (\S+) cannot be the bridge node/, "migration.text.badBridgeNode", ["node"]],
   [/^no SDN chassis has the source bridge "(.+)"/, "migration.text.noBridgeNode", ["bridge"]],

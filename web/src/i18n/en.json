@@ -148,7 +148,8 @@
     "fip_not_routable": "That interface cannot take a floating IP: {{message}}",
     "physnet_in_use": "VMs on this node use that physical network: {{message}}",
     "physnet_conflict": "Another network already uses that physical network and VLAN: {{message}}",
-    "invalid_node_sdn": "The SDN settings are not valid: {{message}}"
+    "invalid_node_sdn": "The SDN settings are not valid: {{message}}",
+    "migration_overlap": "Another unfinished network migration already uses this source network, VM or target network: {{message}}"
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -4145,7 +4146,10 @@
       "turnOn": "Turn on",
       "turnOff": "Turn off",
       "offTitle": "Turn off the OVN access lockdown?",
-      "offDescription": "The allow lists come down first, then each central goes back to the plain ports. Any node with the cluster certificate can then write to the southbound database again."
+      "offDescription": "The allow lists come down first, then each central goes back to the plain ports. Any node with the cluster certificate can then write to the southbound database again.",
+      "stalled": "Stopped halfway",
+      "finishOn": "Finish turning on",
+      "raft": "Raft"
     },
     "alerts": {
       "title": "SDN alerts",
@@ -4635,7 +4639,8 @@
     "taskStep": {
       "start": "start",
       "rollback": "roll back",
-      "finish": "finish"
+      "finish": "finish",
+      "resume": "resume"
     },
     "text": {
       "template": "a template is not migrated",
@@ -4645,7 +4650,7 @@
       "noMac": "the interface has no MAC address yet",
       "outside": "{{ip}} is outside the subnets of {{network}}",
       "reserved": "{{ip}} is reserved in {{network}} (network, broadcast or gateway)",
-      "inUse": "{{ip}} is already in use",
+      "inUse": "{{ip}} is already in use on {{network}}",
       "duplicate": "{{ip}} is also planned for another interface",
       "notChassis": "the VM runs on a node without OVN: move it to an SDN node or stop it first",
       "runningOffline": "the VM is running (mode: stopped VMs only)",
@@ -4665,7 +4670,31 @@
       "bridgeOverlay": "a bridge only goes to an SDN overlay network",
       "badBridgeNode": "node {{node}} can't be the bridge node (no OVN or no source bridge)",
       "noBridgeNode": "no OVN node has the source bridge {{bridge}}",
-      "bridgeRemoved": "the bridge node {{node}} was removed from the cluster: resume with another bridge node"
+      "bridgeRemoved": "the bridge node {{node}} was removed from the cluster: resume with another bridge node",
+      "ipamOthers": "IPAM does not know the addresses other hosts use on the source network: keep them out of the target's pools while the bridge is up"
+    },
+    "gone": "This migration record is gone.",
+    "close": "Close",
+    "oneMode": "One mode for the whole migration — leave VMs out and migrate them in a second migration for a different mode.",
+    "hiddenVms_one": "{{count}} VM you cannot see is on the source network; it is not moved.",
+    "hiddenVms_other": "{{count}} VMs you cannot see are on the source network; they are not moved.",
+    "replanFirst": "You changed the mode or an address: plan again before starting.",
+    "changedTitle": "The plan for {{name}} changed",
+    "changedDescription": "The server planned again when it created the migration, and some interfaces now differ from the plan on screen. Check them before starting. If you don't start, the migration stays planned: you can start or delete it in the next step.",
+    "changedStart": "Start with the new plan",
+    "changedDisrupts_one": "{{count}} running VM would now lose its network briefly or be restarted.",
+    "changedDisrupts_other": "{{count}} running VMs would now lose their network briefly or be restarted.",
+    "change": {
+      "who": "{{name}} interface {{n}}",
+      "new": "{{who}}: new in the plan ({{mode}})",
+      "mode": "{{who}}: {{before}} → {{after}}",
+      "ips": "{{who}}: address {{before}} → {{after}}",
+      "blockers": "{{who}}: now blocked by {{after}}",
+      "none": "nothing (no longer blocked)",
+      "disrupt": {
+        "live": "about a second without network",
+        "restart": "the VM is shut down and started again"
+      }
     }
   }
 }

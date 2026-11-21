@@ -31,7 +31,6 @@ import {
   isInstanceIdWarning,
   MAX_PARALLEL,
   type Migration,
-  migrationName,
   MIGRATIONS_KEY,
   type MigrationMode,
   type MigrationPlan,
@@ -39,7 +38,11 @@ import {
   MODE_TONE,
   MODES,
   PHASE_TONE,
+  type PlanChange,
+  planChanges,
+  planKey,
   planText,
+  planWarnings,
   progress,
   STATE_TONE,
   unfinished,
@@ -48,7 +51,6 @@ import {
 import { bridgeName } from "@/networks/NetworksPage";
 import { isOverlay, isProvider, useRouters } from "@/routing/routing";
 import { isSdnNetwork, splitList } from "@/sdn/ips";
-import { callWarned } from "@/sdn/sdn";
 import { emptySubnetRow, subnetErrors, toSubnet } from "@/sdn/subnets";
 import { trackTask } from "@/tasks/tasks";
 import { validName } from "@/vms/form";
@@ -64,8 +66,12 @@ export function MigrationWizard({ source, onClose }: { source: Network; onClose(
   const { t } = useTranslation();
   const migrations = useMigrations();
   const current = migrations.data?.find((m) => m.spec.source === source.name && unfinished(m));
-  const [created, setCreated] = useState<string | null>(null);
-  const shown = current ?? (created ? migrations.data?.find((m) => m.id === created) : undefined);
+  // 연 옮기기를 id로 붙잡는다(리뷰 1 I1 — 끝내거나 모두 되돌려도 그 기록을 계속 보인다).
+  const [pinned, setPinned] = useState<string | null>(null);
+  if (pinned === null && current) {
+    setPinned(current.id);
+  }
+  const shown = pinned ? migrations.data?.find((m) => m.id === pinned) : undefined;
   const [step, setStep] = useState<Step | null>(null);
   const at: Step = step ?? (shown ? "progress" : "target");
   const [spec, setSpec] = useState<MigrationSpec>({ source: source.name, target: "" });
@@ -115,17 +121,25 @@ export function MigrationWizard({ source, onClose }: { source: Network; onClose(
                 setSpec(next);
                 setPlan(p);
               }}
+              onCreated={setPinned}
               onStarted={(id) => {
-                setCreated(id);
+                setPinned(id);
                 setStep("progress");
               }}
             />
           )}
           {at === "progress" && shown && (
-            <ProgressStep migration={shown} onFinish={() => setStep("finish")} onClose={onClose} />
+            <ProgressStep
+              source={source}
+              migration={shown}
+              onFinish={() => setStep("finish")}
+              onClose={onClose}
+            />
           )}
           {at === "progress" && !shown && (
-            <p className="text-muted-foreground">{t("common.loading")}</p>
+            <p className="text-muted-foreground">
+              {migrations.data && pinned ? t("migration.gone") : t("common.loading")}
+            </p>
           )}
           {at === "finish" && shown && (
             <FinishStep
@@ -140,12 +154,17 @@ export function MigrationWizard({ source, onClose }: { source: Network; onClose(
   );
 }
 
-/** 계획만 받는다(`?dry_run=true`, 200 `MigrationPlan`) */
+/**
+ * 계획만 받는다(`?dry_run=true`, 200 `MigrationPlan`). 원본의 모든 VM을 계획한다(`vms` 없이 — 뺀 VM은 화면에서만 흐리게 두어
+ * 다시 넣을 수 있다, 리뷰 1 I6). 이름은 보내지 않는다(서버가 `<원본>-to-<대상>`, 쓰였으면 `-2`… — 리뷰 1 I2).
+ */
 async function dryRun(spec: MigrationSpec): Promise<MigrationPlan> {
+  const all: MigrationSpec = { ...spec };
+  delete all.vms;
   const plan = await call(
     api.POST("/network-migrations", {
       params: { query: { dry_run: true } },
-      body: { name: migrationName(spec.source, spec.target), spec },
+      body: { spec: all },
     }),
   );
   return plan as MigrationPlan;
@@ -242,6 +261,10 @@ function TargetStep({
         );
         targetName = newName;
         toast.success(t("networks.created", { name: newName }));
+        // 만든 네트워크를 고른 것으로 둔다(리뷰 1 M2 — 계획이 실패해도 다시 누르면 같은 이름을 또 만들지 않는다).
+        await queryClient.invalidateQueries({ queryKey: ["list", "network"] });
+        setCreate(false);
+        setTarget(newName);
       }
       const nextSpec: MigrationSpec = {
         source: source.name,
@@ -255,7 +278,6 @@ function TargetStep({
         ...(spec.addresses && { addresses: spec.addresses }),
       };
       const plan = await dryRun(nextSpec);
-      await queryClient.invalidateQueries({ queryKey: ["list", "network"] });
       onPlanned(nextSpec, plan);
     } catch (err) {
       setFailure(errorMessage(t, err));
@@ -446,19 +468,22 @@ function PlanStep({
   plan,
   onBack,
   onReplan,
+  onCreated,
   onStarted,
 }: {
   spec: MigrationSpec;
   plan: MigrationPlan;
   onBack(): void;
   onReplan(spec: MigrationSpec, plan: MigrationPlan): void;
+  /** 리소스를 만들었다(`planned` — 시작 전) */
+  onCreated(id: string): void;
   onStarted(id: string): void;
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const nodes = useList("node");
   const [mode, setMode] = useState<MigrationMode>(spec.mode ?? "auto");
-  // VM마다 넣기(빼면 `vms`에서 뺀다) — 처음은 계획의 모든 VM
+  // VM마다 넣기(빼면 만들 때 `vms`에서 뺀다) — 계획은 늘 원본의 모든 VM이다(리뷰 1 I6).
   const allVms = [...new Set(plan.nics.map((n) => n.vm))];
   const [excluded, setExcluded] = useState<Set<string>>(
     () => new Set(spec.vms ? allVms.filter((v) => !spec.vms!.includes(v)) : []),
@@ -469,11 +494,18 @@ function PlanStep({
   );
   const [failure, setFailure] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // 만들 때 서버가 다시 한 계획이 화면과 다르면 시작하기 전에 묻는다(리뷰 1 C1).
+  const [changed, setChanged] = useState<{ migration: Migration; changes: PlanChange[] } | null>(
+    null,
+  );
   const instanceId = plan.nics.some((n) => n.warnings.some(isInstanceIdWarning));
   const movable = plan.nics.filter((n) => n.mode !== "blocked" && !excluded.has(n.vm)).length;
   const blockedBridge = plan.bridge.error != null;
 
-  const edited = (): MigrationSpec => {
+  // 화면의 계획을 만든 스펙과 지금 고른 방식·주소가 다르면 다시 계획해야 시작한다(리뷰 1 C1).
+  const stale = planKey(edited()) !== planKey(spec);
+
+  function edited(): MigrationSpec {
     // 계획 표가 정하는 칸(VM·주소·방식)은 새로 쓴다.
     const rest: MigrationSpec = { ...spec };
     delete rest.vms;
@@ -491,7 +523,7 @@ function PlanStep({
       ...(excluded.size > 0 && { vms: allVms.filter((v) => !excluded.has(v)) }),
       ...(given.length > 0 && { addresses: given }),
     };
-  };
+  }
 
   async function replan() {
     setBusy(true);
@@ -506,41 +538,82 @@ function PlanStep({
     }
   }
 
-  async function start() {
-    setBusy(true);
-    setFailure(null);
+  /** 만든 옮기기의 `start` Task를 시작한다. 실패해도 리소스는 `planned`로 남으니 진행 단계로 간다(리뷰 1 M3). */
+  async function startTask(m: Migration) {
     try {
-      const next = edited();
-      const { data, warning } = await callWarned(
-        api.POST("/network-migrations", {
-          body: { name: migrationName(next.source, next.target), spec: next },
-        }),
-      );
-      const created = data as Migration & { plan: MigrationPlan };
       const task = await call(
         api.POST("/network-migrations/{key}/start", {
-          params: { path: { key: created.id } },
+          params: { path: { key: m.id } },
           body: {},
         }),
       );
       trackTask(
         task,
         t("tasks.op.network-migrate", {
-          target: created.name,
+          target: m.name,
           step: t("migration.taskStep.start"),
         }),
       );
-      if (warning) {
-        toast.warning(t("migration.planWarnings", { count: Number(warning) || 0, warning }));
+    } catch (err) {
+      toast.error(errorMessage(t, err));
+    }
+    await queryClient.invalidateQueries({ queryKey: MIGRATIONS_KEY });
+    onStarted(m.id);
+  }
+
+  async function start() {
+    setBusy(true);
+    setFailure(null);
+    try {
+      const next = edited();
+      const created = (await call(
+        api.POST("/network-migrations", { body: { spec: next } }),
+      )) as Migration & { plan: MigrationPlan };
+      onCreated(created.id);
+      // 경고 수는 서버 계획에서 센다(머리의 글은 문장이다 — 리뷰 1 M1).
+      const warnings = planWarnings(created.plan);
+      if (warnings > 0) {
+        toast.warning(t("migration.planWarnings", { count: warnings }));
       }
-      await queryClient.invalidateQueries({ queryKey: MIGRATIONS_KEY });
-      onStarted(created.id);
+      const changes = planChanges(plan, created.plan, excluded);
+      if (changes.length > 0) {
+        await queryClient.invalidateQueries({ queryKey: MIGRATIONS_KEY });
+        setChanged({ migration: created, changes });
+        return;
+      }
+      await startTask(created);
     } catch (err) {
       setFailure(errorMessage(t, err));
     } finally {
       setBusy(false);
     }
   }
+
+  const changeText = (c: PlanChange) => {
+    const who = t("migration.change.who", { name: c.name, n: c.nic + 1 });
+    const mode = (m: string | undefined) => t(`migration.planned.${m ?? "blocked"}`);
+    const text =
+      c.what === "new"
+        ? t("migration.change.new", { who, mode: mode(c.after) })
+        : c.what === "mode"
+          ? t("migration.change.mode", { who, before: mode(c.before), after: mode(c.after) })
+          : c.what === "ips"
+            ? t("migration.change.ips", {
+                who,
+                before: c.before || t("migration.newAddress"),
+                after: c.after || t("migration.newAddress"),
+              })
+            : t("migration.change.blockers", {
+                who,
+                after: c.after
+                  ? c.after
+                      .split("; ")
+                      .map((b) => planText(t, b))
+                      .join("; ")
+                  : t("migration.change.none"),
+              });
+    return c.disrupts ? `${text} — ${t(`migration.change.disrupt.${c.after}`)}` : text;
+  };
 
   return (
     <div className="flex flex-col gap-4">
@@ -575,6 +648,12 @@ function PlanStep({
         </Button>
       </div>
       <p className="text-xs text-muted-foreground">{t("migration.planHint")}</p>
+      <p className="text-xs text-muted-foreground">{t("migration.oneMode")}</p>
+      {(plan.hidden ?? 0) > 0 && (
+        <p role="status" className="text-sm text-muted-foreground">
+          {t("migration.hiddenVms", { count: plan.hidden })}
+        </p>
+      )}
       <div className="overflow-x-auto">
         <Table aria-label={t("migration.planTable")}>
           <TableHeader>
@@ -706,24 +785,63 @@ function PlanStep({
           {failure}
         </p>
       )}
+      {stale && (
+        <p role="status" className="text-sm text-warning-fg">
+          {t("migration.replanFirst")}
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
         <Button variant="outline" disabled={busy} onClick={onBack}>
           {t("common.back")}
         </Button>
-        <Button disabled={busy || movable === 0 || blockedBridge} onClick={() => void start()}>
+        <Button
+          disabled={busy || stale || movable === 0 || blockedBridge}
+          onClick={() => void start()}
+        >
           {t("migration.start", { count: movable })}
         </Button>
       </div>
+      {changed && (
+        <ConfirmDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) {
+              // 시작하지 않으면 `planned`로 남은 옮기기를 진행 단계에서 보인다(시작·지우기).
+              const id = changed.migration.id;
+              setChanged(null);
+              onStarted(id);
+            }
+          }}
+          title={t("migration.changedTitle", { name: changed.migration.name })}
+          description={t("migration.changedDescription")}
+          confirmLabel={t("migration.changedStart")}
+          impact={[
+            ...changed.changes.filter((c) => c.disrupts),
+            ...changed.changes.filter((c) => !c.disrupts),
+          ].map(changeText)}
+          onConfirm={() => startTask(changed.migration)}
+        >
+          {changed.changes.some((c) => c.disrupts) && (
+            <p role="alert" className="text-sm font-medium text-warning-fg">
+              {t("migration.changedDisrupts", {
+                count: new Set(changed.changes.filter((c) => c.disrupts).map((c) => c.vm)).size,
+              })}
+            </p>
+          )}
+        </ConfirmDialog>
+      )}
     </div>
   );
 }
 
 /** ③ 진행: NIC마다 상태, 멈춤·이어 하기(다리 노드 바꾸기)·되돌리기 */
 function ProgressStep({
+  source,
   migration: m,
   onFinish,
   onClose,
 }: {
+  source: Network;
   migration: Migration;
   onFinish(): void;
   onClose(): void;
@@ -749,7 +867,12 @@ function ProgressStep({
   // 다리 노드를 클러스터에서 지워 멈췄다(서버 `drop_bridge_node`): 이어 할 때 다른 노드를 고른다.
   const bridgeGone =
     m.status.bridge === undefined && (m.status.error ?? "").startsWith("the bridge node");
-  const bridgeCandidates = (nodes.data ?? []).filter((n) => n.status.sdn?.chassis === "ready");
+  // 서버 `plan_bridge`와 같게: chassis가 준비되고 원본 브리지가 있는 노드(리뷰 1 M5)
+  const bridgeCandidates = (nodes.data ?? []).filter(
+    (n) =>
+      n.status.sdn?.chassis === "ready" &&
+      n.status.bridges.some((b) => b.name === bridgeName(source.spec)),
+  );
 
   async function act(
     label: string,
@@ -970,6 +1093,11 @@ function ProgressStep({
         {!running && (
           <Button variant="ghost" disabled={busy} onClick={() => setDeleting(true)}>
             {t(done ? "migration.deleteRecord" : "migration.delete")}
+          </Button>
+        )}
+        {done && (
+          <Button variant="outline" onClick={onClose}>
+            {t("migration.close")}
           </Button>
         )}
       </div>

@@ -420,7 +420,11 @@ function LbSheet({
                           )}
                           {m.warning && (
                             <p className="mt-1 text-xs text-warning-fg">
-                              {serverText(t, m.warning)}
+                              {/* 서버는 한 멤버의 경고 여럿을 "; "로 잇는다(리뷰 1 M7) */}
+                              {m.warning
+                                .split("; ")
+                                .map((w) => serverText(t, w))
+                                .join("; ")}
                             </p>
                           )}
                         </TableCell>

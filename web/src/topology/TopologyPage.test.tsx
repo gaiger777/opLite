@@ -5,7 +5,8 @@ import { http, HttpResponse } from "msw";
 import { expectNoAxeViolations } from "@/test/axe";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
-import { sampleGraph } from "@/test/topology";
+import { REFRESH_ON } from "@/api/live";
+import { sampleGraph, topoId } from "@/test/topology";
 import { TopologyPage } from "@/topology/TopologyPage";
 
 // 보기(그림·목록)는 브라우저에 기억한다.
@@ -46,8 +47,10 @@ it("draws a cluster with only simple networks and switches to the list view", as
   expect(lan).toHaveAttribute("tabindex", "0");
   const web = within(picture).getByRole("button", { name: "VM web, Running, —" });
   expect(web).toHaveAttribute("tabindex", "-1");
-  // 살아 있는 상태도 읽는다(`live=true`)
-  expect(seen[0]?.searchParams.get("live")).toBe("true");
+  // 그림은 OVN을 읽지 않는 `live=false`, 살아 있는 상태는 따로 `live=true`(리뷰 1 I3)
+  const lives = seen.map((u) => u.searchParams.get("live"));
+  expect(lives).toContain("false");
+  expect(lives).toContain("true");
   expect(screen.getByText("2 items you can't see are left out.")).toBeVisible();
   await expectNoAxeViolations(container, { disable: ["region"] });
 
@@ -104,4 +107,66 @@ it("filters by network folder and hides VMs", async () => {
   await waitFor(() =>
     expect(seen.at(-1)?.searchParams.get("folder")).toBe("019a0f3c-0000-7000-8009-000000000001"),
   );
+});
+
+it("re-reads the picture without live state on watch events and overlays the live gateway (review 1 I3)", async () => {
+  mockLists({});
+  const seen: URL[] = [];
+  server.use(
+    http.get(apiUrl("/network-topology"), ({ request }) => {
+      const url = new URL(request.url);
+      seen.push(url);
+      const graph = sampleGraph();
+      if (url.searchParams.get("live") !== "true") {
+        // OVN을 읽지 않은 응답에는 게이트웨이 주인·멤버 건강이 없다.
+        graph.routers[0]!.gateway = { state: "unknown" };
+        graph.load_balancers[0]!.members[0]!.health = "unchecked";
+      }
+      return HttpResponse.json(graph);
+    }),
+  );
+  const { queryClient } = renderPage(<TopologyPage />, { path: "/networks/topology" });
+  const picture = await screen.findByRole("group", { name: "Network topology" });
+  // 살아 있는 읽기의 게이트웨이와 멤버 건강이 그림에 얹힌다.
+  expect(
+    await within(picture).findByRole("button", {
+      name: "Router r1, 2 interfaces, active gateway node-a",
+    }),
+  ).toBeVisible();
+  expect(
+    within(picture).getByRole("button", { name: /^Load balancer web-lb.*1 of 1/ }),
+  ).toBeVisible();
+  const live = () => seen.filter((u) => u.searchParams.get("live") === "true").length;
+  const plain = () => seen.filter((u) => u.searchParams.get("live") === "false").length;
+  const before = { live: live(), plain: plain() };
+  // watch 사건(`LiveProvider`가 `network-topology`를 버림)은 그림만 다시 읽는다.
+  await queryClient.invalidateQueries({ queryKey: ["network-topology"] });
+  await waitFor(() => expect(plain()).toBe(before.plain + 1));
+  expect(live()).toBe(before.live);
+  expect(REFRESH_ON.vm).not.toContainEqual(["network-topology-live"]);
+});
+
+it("shows VMs that only have NICs on provider networks (review 1 I4)", async () => {
+  mockLists({});
+  const graph = sampleGraph();
+  graph.vms.push({
+    id: topoId("002", 9),
+    name: "edge",
+    power: "running",
+    nics: [{ network: topoId("001", 1), ips: ["203.0.113.9"] }],
+  });
+  topology(graph);
+  const user = userEvent.setup();
+  renderPage(<TopologyPage />, { path: "/networks/topology" });
+  const picture = await screen.findByRole("group", { name: "Network topology" });
+  expect(
+    within(picture).getByRole("button", { name: "VM edge, Running, 203.0.113.9" }),
+  ).toBeVisible();
+  expect(
+    within(picture).getByRole("button", { name: /^Physical network ext, .*, 1 VM$/ }),
+  ).toBeVisible();
+  await user.click(screen.getByRole("radio", { name: "List" }));
+  const list = screen.getByRole("region", { name: "Network topology as a list" });
+  const providers = within(list).getByRole("heading", { name: "Physical networks" }).parentElement!;
+  expect(within(providers).getByRole("button", { name: "edge" })).toBeVisible();
 });

@@ -1,6 +1,7 @@
 // 부하 분산기(계획 67 §7)의 질의와 순수 도움 함수. 목록·보기는 watch(`load-balancer`)가 오면 다시 읽고(`LiveProvider`),
-// 멤버 건강(SB `Service_Monitor`)만 30초마다 다시 읽는다.
+// 멤버 건강(SB `Service_Monitor`)만 따로 30초마다 다시 읽어 얹는다.
 import { type QueryClient, useQuery } from "@tanstack/react-query";
+import { useMemo } from "react";
 
 import { api, call } from "@/api/client";
 import type { components } from "@/api/schema";
@@ -28,24 +29,72 @@ export const DEFAULT_HEALTH: LbHealth = { interval_secs: 5, timeout_secs: 3, ris
 export const MAX_LISTENERS = 16;
 export const MAX_MEMBERS = 64;
 
+/** 멤버 건강(SB)을 함께 읽은 목록의 키 — watch 사건이 버리지 않는다(`REFRESH_ON`의 `load-balancers`와 다른 앞부분) */
+export const LBS_LIVE_KEY = ["load-balancers-live"] as const;
+
+/** 멤버 하나를 가리키는 열쇠(리스너·주소 또는 MAC·포트) */
+function memberKey(m: Pick<LbMemberView, "listener" | "ip" | "mac" | "vm" | "port">): string {
+  return `${m.listener}|${m.vm ?? ""}|${m.ip ?? m.mac ?? ""}|${m.port}`;
+}
+
 /**
- * 부하 분산기 목록. `live`면 멤버 건강(SB)도 읽고 30초마다 다시 읽는다. 아니면(폴더 보기의 객체 목록) OVN을 읽지 않고
- * watch 사건으로만 다시 읽는다.
+ * 스펙 목록(`live=false`)에 살아 있는 목록의 멤버 건강을 얹는다(같은 LB·같은 멤버만). 살아 있는 목록이 아직 없거나 그
+ * 뒤에 생긴 멤버는 스펙 목록의 값(검사 안 함) 그대로다.
+ */
+export function withHealth(
+  spec: readonly LoadBalancer[],
+  live: readonly LoadBalancer[] | undefined,
+): LoadBalancer[] {
+  if (!live) {
+    return [...spec];
+  }
+  const byId = new Map(live.map((l) => [l.id, l]));
+  return spec.map((lb) => {
+    const fresh = byId.get(lb.id);
+    if (!fresh) {
+      return lb;
+    }
+    const health = new Map(fresh.members.map((m) => [memberKey(m), m]));
+    return {
+      ...lb,
+      ...(fresh.live_error !== undefined && { live_error: fresh.live_error }),
+      members: lb.members.map((m) => {
+        const h = health.get(memberKey(m));
+        return h ? { ...m, health: h.health, reason: h.reason } : m;
+      }),
+    };
+  });
+}
+
+/**
+ * 부하 분산기 목록. 목록 자체는 OVN을 읽지 않고(`live=false`) watch 사건으로만 다시 읽는다(리뷰 1 I3 — 사건마다 SB를 읽지
+ * 않게). `live`면 멤버 건강(SB)을 따로 30초마다 읽어 얹는다. 폴더 보기의 객체 목록은 `live` 없이 부른다.
  */
 export function useLoadBalancers(enabled = true, live = true) {
-  return useQuery({
-    queryKey: [...LBS_KEY, live ? "live" : "spec"],
-    queryFn: () =>
-      call(api.GET("/load-balancers", live ? {} : { params: { query: { live: false } } })),
+  const spec = useQuery({
+    queryKey: [...LBS_KEY, "spec"],
+    queryFn: () => call(api.GET("/load-balancers", { params: { query: { live: false } } })),
     select: (list) => [...list.items].sort((a, b) => a.name.localeCompare(b.name)),
-    refetchInterval: live ? LB_LIVE_MS : false,
     enabled,
   });
+  const health = useQuery({
+    queryKey: LBS_LIVE_KEY,
+    queryFn: () => call(api.GET("/load-balancers")),
+    select: (list) => list.items,
+    refetchInterval: LB_LIVE_MS,
+    enabled: enabled && live,
+  });
+  const data = useMemo(
+    () => (spec.data ? withHealth(spec.data, live ? health.data : undefined) : undefined),
+    [spec.data, health.data, live],
+  );
+  return { data, error: spec.error };
 }
 
 export async function refreshLbs(queryClient: QueryClient) {
   await Promise.all([
     queryClient.invalidateQueries({ queryKey: LBS_KEY }),
+    queryClient.invalidateQueries({ queryKey: LBS_LIVE_KEY }),
     queryClient.invalidateQueries({ queryKey: ["network-ips"] }),
   ]);
 }

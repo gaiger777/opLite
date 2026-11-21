@@ -42,6 +42,10 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
   const applied = lockdown?.applied.length ?? 0;
   const firewalls = lockdown?.nodes.filter((n) => n.firewall).length ?? 0;
   const nodes = lockdown?.nodes.length ?? 0;
+  // 켜기가 중간에 멈췄다(Task 실패 — 켜짐인데 아직 바꾸는 중이거나 오류, 도는 Task 없음). 같은 값을 다시 보내면 남은 일을
+  // 마저 한다(리뷰 1 M6).
+  const running = sdn.tasks.length > 0;
+  const stalled = enabled && (lockdown?.pending === true || lockdown?.error != null) && !running;
 
   async function dryRun() {
     setBusy(true);
@@ -78,15 +82,20 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
         <h2 id="sdn-lockdown" className="font-medium">
           {t("sdn.lockdown.title")}
         </h2>
-        <StatusChip tone={enabled ? "success" : "neutral"} busy={lockdown?.pending}>
+        <StatusChip
+          tone={stalled ? "warning" : enabled ? "success" : "neutral"}
+          busy={lockdown?.pending && !stalled}
+        >
           {t(
-            lockdown?.pending
-              ? enabled
-                ? "sdn.lockdown.turningOnShort"
-                : "sdn.lockdown.turningOffShort"
-              : enabled
-                ? "sdn.lockdown.on"
-                : "sdn.lockdown.off",
+            stalled
+              ? "sdn.lockdown.stalled"
+              : lockdown?.pending
+                ? enabled
+                  ? "sdn.lockdown.turningOnShort"
+                  : "sdn.lockdown.turningOffShort"
+                : enabled
+                  ? "sdn.lockdown.on"
+                  : "sdn.lockdown.off",
           )}
         </StatusChip>
       </div>
@@ -161,6 +170,11 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
               centrals: check.centrals.length,
             })}
           </p>
+          {(check.warnings ?? []).map((w) => (
+            <p key={w} className="text-warning-fg">
+              {w}
+            </p>
+          ))}
           {check.outside.length === 0 ? (
             <p className="text-success-fg">{t("sdn.lockdown.noOutside")}</p>
           ) : (
@@ -170,8 +184,13 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
               </p>
               <ul className="ml-5 list-disc font-mono text-xs">
                 {check.outside.map((o) => (
-                  <li key={`${o.central}-${o.peer}`}>
+                  <li key={`${o.central}-${o.peer}-${o.raft ? "raft" : "db"}`}>
                     {t("sdn.lockdown.peer", { peer: o.peer, central: o.central })}
+                    {o.raft && (
+                      <span className="ml-2 rounded bg-warning-soft px-1 font-sans text-warning-fg">
+                        {t("sdn.lockdown.raft")}
+                      </span>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -194,12 +213,12 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
       )}
       {admin && sdn.phase === "ready" && (
         <div className="flex flex-wrap gap-2">
-          {!enabled && (
+          {(!enabled || stalled) && (
             <Button variant="outline" disabled={busy} onClick={() => void dryRun()}>
               {t("sdn.lockdown.check")}
             </Button>
           )}
-          {!enabled && check && (
+          {(!enabled || stalled) && check && (
             <Button
               disabled={busy || (check.outside.length > 0 && !force)}
               onClick={() => {
@@ -209,7 +228,7 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
                   .finally(() => setBusy(false));
               }}
             >
-              {t("sdn.lockdown.turnOn")}
+              {t(stalled ? "sdn.lockdown.finishOn" : "sdn.lockdown.turnOn")}
             </Button>
           )}
           {enabled && (

@@ -11,7 +11,7 @@ export type OpenTarget =
 const byName = <T extends { name: string }>(a: T, b: T) => a.name.localeCompare(b.name);
 
 /**
- * "목록으로 보기"(계획 67 §12.2): 그림과 같은 정보를 트리 목록으로 — 공급자 네트워크(유동 IP), 라우터(인터페이스 네트워크 →
+ * "목록으로 보기"(계획 67 §12.2): 그림과 같은 정보를 트리 목록으로 — 공급자 네트워크(유동 IP·곧바로 붙은 VM), 라우터(인터페이스 네트워크 →
  * VM·부하 분산기), 라우터 없는 오버레이, 단순 네트워크. 화면 읽기 프로그램과 인쇄용이다.
  */
 export function TopologyList({
@@ -35,6 +35,25 @@ export function TopologyList({
 
   const vmsOn = (id: string): TopoVm[] =>
     hideVms ? [] : graph.vms.filter((vm) => vm.nics.some((n) => n.network === id)).sort(byName);
+
+  const vmItem = (vm: TopoVm, netId: string) => (
+    <li key={vm.id}>
+      <button
+        type="button"
+        className="underline-offset-4 hover:underline"
+        onClick={() => onOpen({ kind: "vm", name: vm.name })}
+      >
+        {vm.name}
+      </button>{" "}
+      <span className="text-muted-foreground">
+        {t(`vms.phase.${vm.power}`)}
+        {vm.nics.find((x) => x.network === netId)?.ips.length
+          ? ` · ${vm.nics.find((x) => x.network === netId)!.ips.join(", ")}`
+          : ""}
+        {vm.node && ` · ${vm.node}`}
+      </span>
+    </li>
+  );
 
   const network = (n: TopoNetwork) => (
     <li key={n.id}>
@@ -80,24 +99,7 @@ export function TopologyList({
               </span>
             </li>
           ))}
-        {vmsOn(n.id).map((vm) => (
-          <li key={vm.id}>
-            <button
-              type="button"
-              className="underline-offset-4 hover:underline"
-              onClick={() => onOpen({ kind: "vm", name: vm.name })}
-            >
-              {vm.name}
-            </button>{" "}
-            <span className="text-muted-foreground">
-              {t(`vms.phase.${vm.power}`)}
-              {vm.nics.find((x) => x.network === n.id)?.ips.length
-                ? ` · ${vm.nics.find((x) => x.network === n.id)!.ips.join(", ")}`
-                : ""}
-              {vm.node && ` · ${vm.node}`}
-            </span>
-          </li>
-        ))}
+        {vmsOn(n.id).map((vm) => vmItem(vm, n.id))}
       </ul>
     </li>
   );
@@ -138,6 +140,8 @@ export function TopologyList({
                         </span>
                       </li>
                     ))}
+                  {/* 공급자 네트워크에 곧바로 붙은 VM(리뷰 1 I4) */}
+                  {vmsOn(p.id).map((vm) => vmItem(vm, p.id))}
                 </ul>
               </li>
             ))}

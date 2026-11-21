@@ -783,6 +783,8 @@ orbivisorctl lb list                                      # NAME NETWORK VIP EXT
 - **API.** `GET|POST /api/v1/load-balancers`, `GET|PATCH|DELETE /api/v1/load-balancers/{key}`(`PATCH`는 보낸 칸만, `listeners`는 통째로,
   `If-Match`). 보기 `LoadBalancerView`는 리소스에 `vip_state`·`external_state`(`ready | unrouted {reason}`)와 멤버마다 `address`·`health`
   (`online|offline|error|unchecked|missing`)·`warning`, `live_error`를 더한다(`?live=false`면 OVN을 읽지 않음). 감사 `lb create web-lb …`.
+  웹 목록은 `?live=false`(OVN을 읽지 않음)를 watch 사건마다 다시 읽고, 멤버 건강만 `live`로 30초마다 따로 읽어 얹는다. 한 멤버의 경고가
+  여럿이면(`; `로 이음) 하나씩 번역해 보인다.
 
 ### QoS
 
@@ -830,8 +832,13 @@ orbivisorctl network topology --folder /tenant-a     # 같은 자료를 글 나�
 ```
 
 API는 `GET /api/v1/network-topology?folder=&live=`(`system.read`)다. 읽을 수 없는 것은 빼고 `hidden`에 세며, 루트 `cluster.read`가
-없으면 노드 이름을 비운다. `live=true`면 OVN의 게이트웨이 주인과 LB 멤버 건강을 한 번씩 읽는다(기본 `false` — 화면은 watch 사건으로
-다시 읽고 살아 있는 상태만 30초마다).
+없으면 노드 이름을 비운다. 읽을 수 없는 VM인 LB 멤버는 주소도 비우고, 읽을 수 없는 폴더로 거르면 404다(남의 폴더의 감춘 수를 캐 보지
+못하게). `live=true`면 OVN의 게이트웨이 주인과 LB 멤버 건강을 한 번씩 읽는다(기본 `false`). 화면은 그림을 `live=false`로 읽어 watch
+사건(1초 모음)마다 다시 읽고, 살아 있는 상태는 `live=true`를 30초마다 **따로** 읽어 그림에 얹는다. 그래서 바쁜 클러스터에서도 사건마다
+NB·SB를 읽지 않는다. 가리키기·초점·끌기는 원소를 다시 그리지 않는다(VM 2000대에서도 가리킨 원소 하나만).
+
+**공급자 네트워크에만 NIC가 있는 VM**은 그 공급자 판(유동 IP·바깥 VIP 꼬리표 뒤)에 블록으로 놓이고, 목록 보기에서는 공급자 아래 유동 IP
+다음에 나온다.
 
 ### 단순 네트워크를 SDN으로 옮기기
 
@@ -848,7 +855,7 @@ orbivisorctl network migrate lan --to t-lan --dry-run     # 계획만(리소스�
 # db1   0    offline  10.66.0.11  cloud-init   the cloud-init instance-id changes: …
 # app1  0    blocked  -           -            the VM runs on n4, which is not an OVN chassis
 # bridge: on node n1
-orbivisorctl network migrate lan --to t-lan --ip app2=10.66.0.40    # 만들고 시작(이름 lan-to-t-lan), 막힌 VM은 건너뜀
+orbivisorctl network migrate lan --to t-lan --ip app2=10.66.0.40    # 만들고 시작(이름 lan-to-t-lan, 쓰였으면 -2 …), 막힌 VM은 건너뜀
 orbivisorctl network migration get lan-to-t-lan            # VM NIC마다 MODE·ADDRESS·STATE·ERROR
 orbivisorctl network migration pause lan-to-t-lan          # 지금 VM이 끝난 뒤 멈춤 — resume으로 이어 감
 orbivisorctl network migration rollback lan-to-t-lan web1  # 이 VM만 원본으로(없으면 모두)
@@ -858,15 +865,30 @@ orbivisorctl network migration finish lan-to-t-lan --router r1   # 다리를 걷
 - **미리 보기.** `--dry-run`(API `POST /network-migrations?dry_run=true`)이 VM NIC마다 방식·옮겨 갈 주소와 출처·막는 까닭·경고, 다리 노드를
   보인다. 만들 때 이 계획을 적고, Task가 VM마다 **그때 다시** 계획해 달라졌으면(전원·주소가 바뀜) 그 VM만 `failed`(까닭)로 둔다.
   막는 까닭: 템플릿 VM, T 서브넷 밖·예약 주소, 다른 VM과 같은 주소(단순 네트워크에는 IPAM이 없어 겹칠 수 있다), 이미 쓰는 주소, 같은
-  VM의 다른 NIC가 이미 T에, 다른 옮기기 중, 켜진 VM이 chassis가 아닌 노드에 있음, 권한 없음. 경고: 주소가 바뀜(`ipam`), MTU가 줄어듦,
-  게스트 에이전트 없음, 원본에 보안 그룹 없음, DHCP 다툼, cloud-init instance-id 바뀜.
+  VM의 다른 NIC가 이미 T에(같은 옮기기가 옮긴 NIC는 빼고 — 원본에 NIC가 둘인 VM은 둘 다 옮긴다), 다른 옮기기 중, 켜진 VM이 chassis가
+  아닌 노드에 있음, 권한 없음. 경고: 주소가 바뀜(`ipam`), MTU가 줄어듦, 게스트 에이전트 없음, 원본에 보안 그룹 없음, DHCP 다툼, IPAM이
+  원본 L2의 다른 장비 주소를 모름(다리), cloud-init instance-id 바뀜. **읽을 수 없는 VM**(`system.read` 없음)은 계획에 이름·MAC·주소 없이
+  수(`hidden`)만 나오고 옮기지 않으며 리소스에도 적히지 않는다(게스트 에이전트도 묻지 않음). 스펙의 `vms`·`addresses`에 그런 VM을 주면
+  없는 VM과 같다(400).
+- **웹 마법사.** 네트워크 목록의 단순 네트워크 줄 "SDN으로 옮기기"(진행 중이면 진행 칩)가 연다. 순서는 ① 대상(또는 같은 CIDR의 새 SDN
+  네트워크)과 방식·다리 노드, ② 계획 표, ③ 진행, ④ 끝내기다. 마법사가 지키는 것:
+  - **미리 보기는 늘 원본의 모든 VM이다.** VM을 빼면 그 줄이 흐려지고 다시 넣을 수 있다. `vms`는 만들 때만 보낸다.
+  - **화면의 계획대로만 시작한다.** 방식이나 주소를 고치면 시작 단추가 막히고 "다시 계획"을 하라고 알린다.
+  - **만들 때 서버가 다시 계획한다.** 그새 VM이 켜져 `auto`가 꺼진 채 → 라이브·다시 켬이 되는 따위로 달라졌으면, 시작하기 전에 다른 점을
+    보이고 묻는다. 꺼졌다 켜지거나 라이브로 옮겨질 VM이 맨 앞이다. 시작하지 않으면 옮기기는 `planned`로 남아 진행 단계에서 시작하거나
+    지운다. 시작이 실패해도 그렇다.
+  - **이름은 서버가 고른다.** `<원본>-to-<대상>`이고, 끝난 기록이 그 이름을 쓰면 `-2`, `-3`…이다(API `name`을 비우면 — CLI `--name`이
+    없을 때도). 그래서 같은 원본을 다른 방식으로 다시 옮길 때 옛 기록을 먼저 지우지 않아도 된다. 이름을 주면 그 이름이다(쓰였으면 409).
+  - **연 옮기기는 끝내거나 모두 되돌린 뒤에도 기록으로 보인다.** "기록 지우기"와 "닫기"가 있다.
+  - **이어 가기의 새 다리 노드 후보는 원본 브리지가 있는 chassis뿐이다.**
+  - **볼 수 없는 VM은 수로만 나온다.** 원본에 그런 VM이 있으면 "볼 수 없는 VM N대 — 옮기지 않음"이다.
 - **방식**(`--mode`, 옮기기 하나에 하나 — 기본 `auto`):
 
 | 방식 | 언제(`auto`) | 하는 일 | 끊김 |
 |---|---|---|---|
 | `offline` | VM이 꺼짐 | 스펙만 바꾼다(다음 켜기에 스케줄러가 chassis를 고름) | 없음 |
 | `live` | 켜짐, VM 노드가 chassis, 게스트가 볼 MTU가 줄지 않음(또는 `--allow-mtu-shrink`), 주소를 앎 | tap을 Linux 브리지에서 떼어 `br-int`에 붙이고 `ovn-installed`를 30초까지 기다린 뒤 QMP `set_link` 끔·켬(게스트가 링크를 다시 보고 DHCP를 다시 묻게). QEMU 장치·PID는 그대로, 게스트에 NIC가 빠졌다 꽂히지 않는다. 오지 않으면 tap을 되돌리고 그 VM은 `failed` | 보통 1초 안 |
-| `restart` | 켜짐, `live`가 안 됨 | ACPI 끄기 → 스펙 바꾸기와 켜기를 한 번에(켜지 못하면 원래 네트워크로 되돌려 다시 켬) | 끄기 + 켜기 |
+| `restart` | 켜짐, `live`가 안 됨 | ACPI 끄기 → 스펙 바꾸기와 켜기를 한 번에(켜지 못하거나 15분 안에 켜지지 않으면 끄고 원래 네트워크로 되돌려 다시 켬) | 끄기 + 켜기 |
 | `blocked` | 막는 까닭이 있음 | 건너뜀 | — |
 
   `--mode live`인데 안 되는 VM은 `blocked`다(몰래 다시 켜지 않는다). VM마다 다른 방식이 필요하면 그 VM을 빼고(`--vm`) 끝낸 뒤 새 옮기기로
@@ -874,7 +896,11 @@ orbivisorctl network migration finish lan-to-t-lan --router r1   # 다리를 걷
 - **주소.** 출처 차례는 `given`(`--ip VM[:NIC]=A[+B]`) → `guest-agent`(게스트 에이전트가 이 MAC에 보고한, T 서브넷 안의 주소) →
   `cloud-init`(그 NIC의 고정 주소) → `ipam`(T 풀의 새 주소 — 주소가 바뀜). 주소를 모르고(`ipam`) 게스트가 고정 주소면 옮긴 뒤 포트 보안이
   그 주소를 막으므로 `--ip`로 주거나 게스트 에이전트를 켠 뒤 한다. cloud-init 고정 주소 항목은 지우고(SDN NIC의 주소는 IPAM이 정함)
-  되돌리기가 되살린다.
+  되돌리기가 되살린다. 되돌리면 단순 네트워크가 받지 않는 `qos.dscp`는 빠진다(속도 제한은 그대로).
+- **주소 잡아 두기.** 끝나지 않은 옮기기가 계획한 주소(원본에 남은 VM이 아직 쓴다)와 원본에 NIC가 있는 VM의 cloud-init 고정 주소(T 서브넷
+  안)는 T에서 **쓴 주소**다: 새 VM·다른 옮기기의 `ipam` 주소·LB VIP·건강 검사 주소·유동 IP·라우터 바깥이 받지 않고, 준 주소면 409
+  `ip_in_use`다(다리가 두 L2를 잇는 동안 ARP가 겹치지 않게). 옮기는 VM은 그 주소로 간다. 끝내거나 모두 되돌리면 풀린다. IPAM은 원본 L2의
+  다른 장비(물리 라우터·서버, 게스트 에이전트 없는 VM)의 주소를 모르므로, 다리를 놓는 동안 T의 풀에서 그 주소를 빼 둔다(계획 경고).
 - **cloud-init instance-id가 바뀐다.** 씨앗 키가 cloud-init 주소 항목과 NIC 주소를 함께 세므로 옮긴 VM의 instance-id가 달라지고, 그
   게스트는 **다음 부팅에 인스턴스마다 하는 일(SSH 호스트 키 새로 만들기 따위)을 다시 한다.** 계획과 웹 마법사가 cloud-init이 있는 VM에
   이 경고를 단다. 피할 수 없다면 옮긴 뒤 SSH 호스트 키가 바뀐다고 알린다.
@@ -883,7 +909,10 @@ orbivisorctl network migration finish lan-to-t-lan --router r1   # 다리를 걷
   `ovn-bridge-mappings`의 `mig<h8>`)로 원본 브리지에 잇는다. 옮긴 VM과 남은 VM이 같은 서브넷으로 서로 닿는다(잰 값: 노드 하나 ping 1.0초
   안, 여러 노드 VXLAN 원본 0.04초 — 다리 노드의 veth를 지남). 다리 동안 T의 DHCP는 `router` = 서브넷 게이트웨이(원본 망의 물리
   라우터)를 주고, T를 라우터 인터페이스로 붙이는 것은 409 `network_migrating`이다(라우터 포트가 같은 게이트웨이 주소를 가지므로).
-  `--no-bridge`면 놓지 않는다. 대상이 원본과 같은 L2의 공급자 네트워크면 다리가 필요 없다(놓으면 고리).
+  `--no-bridge`면 놓지 않는다. 대상이 원본과 같은 L2의 공급자 네트워크면 다리가 필요 없다(놓으면 고리). **한 대상 네트워크에 다리를 놓을 수
+  있는 끝나지 않은 옮기기는 하나다**(Raft `migration-target` — 둘째는 409 `migration_overlap`; 한 스위치에 다리 둘이면 물리 L2와 고리가
+  생기거나 두 VLAN이 하나로 이어진다). 다른 원본을 같은 T로 함께 옮기려면 `--no-bridge`로 하거나 앞의 옮기기를 끝낸 뒤 한다. 같은
+  원본·같은 VM의 겹침도 409 `migration_overlap`이다.
 - **DHCP 다툼.** 원본 망에 DHCP 서버가 있으면 그 응답도 다리를 건너 옮긴 VM에 온다. 보통 같은 chassis의 OVN DHCP가 먼저 답하지만, 다른
   주소를 받으면 포트 보안이 막는다 — 원본 DHCP 서버에 같은 주소로 예약하거나 옮기는 동안 끈다.
 - **되돌리기.** `rollback [VM…]`이 옮긴(또는 실패한) NIC를 거꾸로 옮긴다 — 켜진 VM은 `live`(tap만 옮긴 VM이거나 MTU가 줄지 않으면,
@@ -894,15 +923,20 @@ orbivisorctl network migration finish lan-to-t-lan --router r1   # 다리를 걷
   바로). 원본에 NIC가 남은 VM이 있으면 경고만. 끝난 옮기기는 기록으로 남는다(`network migration list`, 지우기는 언제든 — 도는 Task가
   있으면 409 `migration_in_progress`).
 - **다리 노드 바꾸기.** 다리 노드를 클러스터에서 지우면(`node remove`) 그 옮기기는 `paused`가 되고 다리 기록이 지워진다 — `network
-  migration resume M --bridge-node n2`로 새 다리 노드에서 이어 간다. **살아 있는 노드에 다리가 놓인 동안 바꾸기는 409
-  `migration_bridge_laid`**다: 모두 되돌린 뒤 `network migrate … --bridge-node n2`로 다시 한다.
+  migration resume M --bridge-node n2`로 새 다리 노드에서 이어 간다. 다리 노드가 **오프라인**이면(지우지 않았어도) 같은 `resume
+  --bridge-node`로 바꾼다 — 다리 기록을 지우고 새 노드에 놓으며, 그 노드가 돌아오면 에이전트가 기록에 없는 다리를 걷는다(끝내기도 오프라인
+  다리 노드를 기다리지 않고 경고만). **온라인 노드에 다리가 놓인 동안 바꾸기는 409 `migration_bridge_laid`**다: 모두 되돌린 뒤 `network
+  migrate … --bridge-node n2`로 다시 한다.
 - **견디기.** Task는 VM마다 상태를 리소스에 적고 VM 스펙·전원·도는 NIC를 보고 다음 한 걸음을 하므로 opld가 다시 떠도 이어 간다(시간 제한
   없음). 다리는 노드 하나를 지나는 길이다(넘김 없음 — 다리 노드가 죽으면 다리가 끊기고 경보 `sdn_physnet_not_ready`가 `mig…`로 뜬다).
+  라이브 옮기기가 옮기기 전에 만든 핫플러그 Task를 기다렸는데 tap이 그대로면 새 Task로 한 번 더 하고, 그래도 안 되면 스펙을 원본으로
+  되돌린다(스펙만 T에 남아 다음 켜기가 말없이 옮기지 않게).
 - **잰 값(GitHub `ovn`, 노드 하나).** `start` 4.1초(다리 준비 + 꺼진 VM 스펙 + QEMU VM 라이브 tap 옮기기 — QEMU PID 그대로), QEMU VM
   되돌리기 1.1초, 끝내기 5.1초 뒤 `l2gateway` 행·매핑·veth·OVS 브리지가 모두 사라짐.
 - **권한.** 원본 네트워크의 `network.config` + 대상의 `network.assign` + 옮길 VM마다 `vm.config`(막힌 VM은 "권한 없음"). 멈춤·지우기는
   네트워크 권한만, 끝내며 붙일 라우터는 그 라우터와 대상의 `network.config`. 리소스는 원본 네트워크의 폴더에 산다. 실행 중 VM의 NIC
   네트워크를 일반 `PUT`으로 바꾸면 409 `nic_network_live`("use network migrate"). 감사 `network migrate lan → t-lan (3 VMs, live 2, restart 1)`.
+  옮기기를 읽는 사람(`GET`·목록·watch)에게는 읽을 수 없는 VM의 기록(MAC·주소·까닭)과 준 주소가 빠진다.
 
 ### OVN 접근 잠금
 
@@ -943,14 +977,27 @@ orbivisorctl sdn lockdown off
   한 번에 하나라 OVN 정족수가 남고, northd는 잠긴 중앙엔 6645·아직 아닌 중앙엔 6642로 붙는다. 모든 중앙이 끝난 **뒤에** 허용 목록을 건다.
   끄기는 거꾸로(표를 먼저 걷고 중앙을 하나씩). 잰 값: 노드 하나 켜기 3.1초·끄기 5.1초, 중앙 셋 켜기 10.5초(그동안 VM ping 61/61)·끄기
   6.2초(40/40) — **잃은 패킷 0**. 중앙 Task(더하기·빼기)와 동시에 돌지 않는다(409 `sdn_busy`).
+  허용 목록도 **중앙은 하나씩** 건다(목록에서 앞선 중앙이 표를 걸었다고 알린 뒤). 중앙은 표를 건 뒤 자기 NB·SB Raft가 그대로인지 본다 —
+  멤버이고 리더를 알며, 리더면 모든 팔로어에게서·팔로어면 리더에게서 선거 시간 두 배 안에 소식을 받았다(3초 기다린 뒤 다섯 번까지).
+  끊겼으면 **표를 곧바로 걷고** 오류(`the address allow-list cut the OVN Raft connections …`)를 알리며, `sdn-lockdown` Task는 성공으로
+  끝나지 않고 그 중앙과 까닭으로 실패한다. 같은 표는 새 잠금 Task가 올 때까지 다시 넣지 않는다(뒤 중앙은 기다린다). **중앙이 둘이면** 차례마다
+  SB를 다시 띄우는 동안 남은 하나로는 과반이 아니어서 SB가 몇 초 멈춘다(데이터 길은 그대로) — 미리 확인이 경고하고, 셋째 중앙을 더하면
+  없다.
 - **미리 확인과 `--force`.** `--dry-run`(`?dry_run=true`)은 허용 집합과, 지금 중앙의 6641·6642에 붙은 상대 주소(중앙 에이전트가 `ss`로 읽어
-  알림) 가운데 집합 밖인 것을 보인다 — NAT·다른 출발 주소로 붙은 노드를 미리 찾는다. 집합 밖 상대가 **하나라도** 있으면 켜기를 막는다(409
-  `lockdown_peers_outside`, `--force`로만 — 주소만으로는 NAT 뒤 멤버인지 지운 노드인지 가릴 수 없다).
+  알림) 가운데 집합 밖인 것을 보인다 — NAT·다른 출발 주소로 붙은 노드를 미리 찾는다. **Raft 6643·6644에 붙은 상대도 중앙 집합과 견준다**
+  (여러 망에 걸친 중앙이 중앙 주소가 아닌 출발 주소로 Raft를 보내면 표가 그것을 끊어 NB·SB가 정족수를 잃는다 — 그런 상대는 `(Raft)`로
+  나온다). 루프백은 표와 같게 `127.0.0.1`·`::1`만 뺀다(`127.0.0.2` 따위는 밖). 집합 밖 상대가 **하나라도** 있으면 켜기를 막는다(409
+  `lockdown_peers_outside`, `--force`로만 — 주소만으로는 NAT 뒤 멤버인지 지운 노드인지 가릴 수 없다). 막지 않는 경고(`warnings` — 중앙
+  둘)도 함께 나온다.
 - **새 클러스터는 켜진 채로.** `sdn init`은 모든 노드가 `sdn-services`를 알면 잠금을 켠 채로 세운다(첫 중앙부터 잠근 모양). 계획 65·66으로
   세운 클러스터는 관리자가 켤 때까지 그대로다(업그레이드가 OVN 단위를 바꾸지 않는다). 잠금이 꺼져 있으면 OVN 단위는 계획 66과 바이트까지
   같다. 중앙 더하기는 잠금 상태를 따르고, 더할 노드는 합류 전에 중앙 집합에 든다.
 - **보기.** `GET /api/v1/sdn`의 `lockdown { enabled, applied, pending, error, allowed, nodes[{node, firewall, error}] }`(켠 적이 있을 때만),
-  `sdn status`의 잠금 줄, 웹 SDN 보기의 잠금 카드. 켜졌는데 표가 맞지 않는 노드는 경보 `sdn_sync_failed`의 까닭으로 보인다.
+  `sdn status`의 잠금 줄, 웹 SDN 보기의 잠금 카드. 켜졌는데 표가 맞지 않는 노드는 경보 `sdn_sync_failed`의 까닭으로 보인다. 웹 잠금 카드의
+  "먼저 확인"은 집합 밖 상대마다 그 중앙을 보이고, Raft 포트(6643·6644)에서 본 상대에는 "Raft" 꼬리표를 단다. 서버 경고(예: 중앙이 둘이면
+  차례마다 정족수를 잃음)도 보인다. 켜기 Task가 중간에 실패하면(켜짐인데 아직 바꾸는 중이거나 오류, 도는 Task 없음) 칩이 "중간에 멈춤"이
+  되고 "마저 켜기"가 나온다. 같은 `POST {enabled: true}`가 남은 일을 마저 하고, 새 미리 확인에서 집합 밖 상대가 있으면 "그래도 켬"을 골라야
+  한다.
 - **남는 것.** OVN 24.03 RBAC는 `Port_Binding`·`MAC_Binding`·`FDB` 쓰기에 id를 보지 않는다 — 망가진 chassis가 남의 포트를 자기에게
   바인딩할 수 있다(OVN이 막지 않음, `network ips`의 NODE가 VM 노드와 다르게 보인다). NB는 여전히 모든 멤버 노드가 쓴다. 인증서 폐기·CA
   바꾸기, Geneve 암호화는 없다.
@@ -958,8 +1005,9 @@ orbivisorctl sdn lockdown off
 ### SDN 경보
 
 [알림](cluster.md#알림)의 경보 규칙에 SDN 조건 여덟이 있다(계획 67). 모두 **리더가 평가**하고(`for_secs`·`repeat_secs`·`severity`·대상은 다른
-규칙과 같다), 입력은 Raft의 노드·SDN 상태와 리더 OvnSync가 10초마다 읽는 관찰(게이트웨이 주인, LB 멤버 건강)이다. SDN을 세우기 전에는
-모두 거짓이다.
+규칙과 같다), 입력은 Raft의 노드·SDN 상태와 리더 OvnSync가 10초마다 읽는 관찰(게이트웨이 주인, LB 멤버 건강)이다. 관찰은 맞추기 루프와
+따로 도는 Task가 이어 쓰는 연결과 2초 시간 제한으로 읽으므로, 꺼진 중앙이 NB 쓰기(새 포트·라이브 마이그레이션 relink)를 늦추지 않는다.
+SDN을 세우기 전에는 모두 거짓이다.
 
 | 조건 | 대상 | 참일 때 |
 |---|---|---|
@@ -1180,7 +1228,12 @@ ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lsp-list opl-<대상 �
 - **옮긴 VM이 주소를 잃음.** 원본 DHCP 서버가 다른 주소를 줬는지(다리를 건너 옴), 게스트가 고정 주소인데 계획이 `ipam`이었는지 본다.
   되돌리기(`network migration rollback`)는 언제든 된다.
 - **잠금 켜기가 409 `lockdown_peers_outside`.** `--dry-run`의 밖 상대가 NAT 뒤 멤버면 그 출발 주소를 노드 underlay로 알리게 고치거나
-  `--force`, 지운 노드면 그대로 켠다. 켠 뒤 노드가 붙지 못하면 `sdn status`의 잠금 줄과 그 노드의 `firewall`·오류를 본다.
+  `--force`, 지운 노드면 그대로 켠다. 켠 뒤 노드가 붙지 못하면 `sdn status`의 잠금 줄과 그 노드의 `firewall`·오류를 본다. 밖 상대가
+  `(Raft)`면 그 중앙이 Raft를 중앙 주소로 보내게(라우팅·출발 주소) 고친다 — 억지로 켜면 그 중앙이 표를 건 뒤 Raft가 끊긴 것을 보고 걷는다.
+- **잠금 켜기 Task가 `could not keep its address allow-list`로 실패.** 그 중앙이 표를 건 뒤 NB·SB Raft가 끊겨 표를 걷었다. `--dry-run`의
+  `(Raft)` 상대를 보고 고친 뒤 `sdn lockdown on`을 다시 한다(남은 일을 마저 함).
+- **옮기기 만들기가 409 `migration_overlap`.** 같은 원본·같은 VM, 또는 다리를 놓는 같은 대상의 끝나지 않은 옮기기가 있다 — 끝내거나 되돌린 뒤,
+  또는 `--no-bridge`로.
 
 ### 계획 67이 아직 하지 않는 것
 

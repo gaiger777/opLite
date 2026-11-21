@@ -326,3 +326,53 @@ it("edits only the changed fields with If-Match and deletes", async () => {
   await waitFor(() => expect(sent).toHaveLength(2));
   expect(sent[1]).toEqual({ method: "DELETE", ifMatch: "9" });
 });
+
+it("reads health apart from the list and translates each of a member's warnings (review 1 I3, M7)", async () => {
+  mockLists({ node: [N1], network: [EXT, T1, T2], vm: [WEB, API] });
+  ready([]);
+  const seen: string[] = [];
+  const clients =
+    "the security groups of the member NIC 52:54:00:00:00:02 do not admit tcp/8080 from clients";
+  const health =
+    "the security groups of the member NIC 52:54:00:00:00:02 block health checks from 10.20.0.60 to tcp/8080";
+  server.use(
+    http.get(apiUrl("/load-balancers"), ({ request }) => {
+      const live = new URL(request.url).searchParams.get("live") ?? "true";
+      seen.push(live);
+      // OVN을 읽지 않은 목록에는 건강이 없다(`unchecked`).
+      const members = WEB_LB.members.map((m, i) => ({
+        ...m,
+        ...(live === "false" && { health: "unchecked" }),
+        ...(i === 1 && { warning: `${clients}; ${health}` }),
+      }));
+      return HttpResponse.json({ revision: 9, items: [{ ...WEB_LB, members }] });
+    }),
+  );
+  const user = userEvent.setup();
+  const { queryClient } = renderPage(<LoadBalancersPage />);
+  const row = (await screen.findByRole("button", { name: "Open load balancer web-lb" })).closest(
+    "tr",
+  )!;
+  // 살아 있는 읽기의 건강이 목록에 얹힌다.
+  expect(
+    await within(row).findByRole("img", {
+      name: "1 up · 1 down · 0 unchecked · 1 missing (of 3)",
+    }),
+  ).toBeVisible();
+  expect(seen).toContain("false");
+  expect(seen).toContain("true");
+  const lives = seen.filter((s) => s === "true").length;
+  const plain = seen.filter((s) => s === "false").length;
+  // watch 사건은 목록만 다시 읽는다(SB를 읽지 않음).
+  await queryClient.invalidateQueries({ queryKey: ["load-balancers"] });
+  await waitFor(() => expect(seen.filter((s) => s === "false").length).toBe(plain + 1));
+  expect(seen.filter((s) => s === "true").length).toBe(lives);
+
+  await user.click(within(row).getByRole("button", { name: "Open load balancer web-lb" }));
+  const sheet = await screen.findByRole("dialog", { name: "Load balancer web-lb" });
+  expect(
+    within(sheet).getByText(
+      /^the security groups of member NIC 52:54:00:00:00:02 do not let clients reach tcp\/8080; the security groups of member NIC 52:54:00:00:00:02 block health checks/,
+    ),
+  ).toBeVisible();
+});

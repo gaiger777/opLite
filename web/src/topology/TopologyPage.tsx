@@ -57,6 +57,10 @@ export function TopologyPage() {
     () => (graph ? layoutTopology(graph, { hideSimple, hideVms }) : null),
     [graph, hideSimple, hideVms],
   );
+  const labels = useMemo(
+    () => (graph && scene ? itemLabels(t, graph, scene) : new Map<string, string>()),
+    [t, graph, scene],
+  );
   const tree = folderTree(folders.data, "network");
   const big = graph && (graph.networks.length > BIG_NETWORKS || graph.vms.length > BIG_VMS);
   const hidden = graph ? Object.values(graph.hidden).reduce((sum, n) => sum + n, 0) : 0;
@@ -197,7 +201,7 @@ export function TopologyPage() {
         <>
           <TopologyScene
             scene={scene}
-            labelOf={(item) => itemLabel(t, graph, item)}
+            labels={labels}
             onOpen={openItem}
             showVmNames={graph.vms.length <= NAMED_VMS}
           />
@@ -275,61 +279,71 @@ function Legend() {
 
 type Translate = (key: string, values?: Record<string, unknown>) => string;
 
-/** 원소의 화면 읽기 이름(§12.2 "라우터 r1, 인터페이스 2개, 활성 게이트웨이 n2") */
-export function itemLabel(t: Translate, graph: Topology, item: SceneItem): string {
-  switch (item.kind) {
-    case "network":
-    case "simple":
-    case "provider": {
-      const n = graph.networks.find((x) => x.id === item.id);
-      const count = graph.vms.filter((vm) => vm.nics.some((nic) => nic.network === item.id)).length;
-      return t(`topology.aria.${item.kind}`, {
-        name: item.label,
-        detail: item.detail ?? t(`topology.kind.${n?.kind ?? "sdn"}`),
-        count,
-      });
-    }
-    case "router": {
-      const r = graph.routers.find((x) => x.id === item.id);
-      return t("topology.aria.router", {
-        name: item.label,
-        count: r?.interfaces.length ?? 0,
-        gateway: r ? gatewayText(t, r.gateway) : "",
-      });
-    }
-    case "vm": {
-      const vm = graph.vms.find((x) => x.id === item.id);
-      return t("topology.aria.vm", {
-        name: item.label,
-        power: vm ? t(`vms.phase.${vm.power}`) : "",
-        ips: item.detail ?? "—",
-      });
-    }
-    case "more":
-      return t("topology.aria.more", {
-        count: item.count ?? 0,
-        network: graph.networks.find((n) => n.id === item.id)?.name ?? "",
-      });
-    case "lb": {
-      const lb = graph.load_balancers.find((x) => x.id === item.id);
-      return t("topology.aria.lb", {
-        name: item.label,
-        vip: lb?.vip ?? "—",
-        online: lb?.members.filter((m) => m.health === "online").length ?? 0,
-        total: lb?.members.length ?? 0,
-      });
-    }
-    case "fip": {
-      const f = graph.floating_ips.find((x) => x.id === item.id);
-      return t("topology.aria.fip", {
-        address: item.label,
-        state: f ? t(`fip.state.${f.state}`, { defaultValue: f.state }) : "",
-        vm: (f?.vm && graph.vms.find((v) => v.id === f.vm)?.name) || "—",
-      });
-    }
-    case "vip": {
-      const lb = graph.load_balancers.find((x) => x.id === item.id);
-      return t("topology.aria.vip", { address: item.label, name: lb?.name ?? "" });
+/** 원소 열쇠 → 화면 읽기 이름(§12.2 "라우터 r1, 인터페이스 2개, 활성 게이트웨이 n2"). 장면마다 한 번 센다 — 이름마다 VM을
+ * 훑지 않게 id → 원소·네트워크마다 VM 수를 먼저 만든다(리뷰 1 I5). */
+export function itemLabels(t: Translate, graph: Topology, scene: Scene): Map<string, string> {
+  const vms = new Map(graph.vms.map((v) => [v.id, v]));
+  const nets = new Map(graph.networks.map((n) => [n.id, n]));
+  const routers = new Map(graph.routers.map((r) => [r.id, r]));
+  const lbs = new Map(graph.load_balancers.map((l) => [l.id, l]));
+  const fips = new Map(graph.floating_ips.map((f) => [f.id, f]));
+  const perNet = new Map<string, number>();
+  for (const vm of graph.vms) {
+    for (const id of new Set(vm.nics.map((nic) => nic.network))) {
+      perNet.set(id, (perNet.get(id) ?? 0) + 1);
     }
   }
+  const label = (item: SceneItem): string => {
+    switch (item.kind) {
+      case "network":
+      case "simple":
+      case "provider":
+        return t(`topology.aria.${item.kind}`, {
+          name: item.label,
+          detail: item.detail ?? t(`topology.kind.${nets.get(item.id)?.kind ?? "sdn"}`),
+          count: perNet.get(item.id) ?? 0,
+        });
+      case "router": {
+        const r = routers.get(item.id);
+        return t("topology.aria.router", {
+          name: item.label,
+          count: r?.interfaces.length ?? 0,
+          gateway: r ? gatewayText(t, r.gateway) : "",
+        });
+      }
+      case "vm": {
+        const vm = vms.get(item.id);
+        return t("topology.aria.vm", {
+          name: item.label,
+          power: vm ? t(`vms.phase.${vm.power}`) : "",
+          ips: item.detail ?? "—",
+        });
+      }
+      case "more":
+        return t("topology.aria.more", {
+          count: item.count ?? 0,
+          network: nets.get(item.id)?.name ?? "",
+        });
+      case "lb": {
+        const lb = lbs.get(item.id);
+        return t("topology.aria.lb", {
+          name: item.label,
+          vip: lb?.vip ?? "—",
+          online: lb?.members.filter((m) => m.health === "online").length ?? 0,
+          total: lb?.members.length ?? 0,
+        });
+      }
+      case "fip": {
+        const f = fips.get(item.id);
+        return t("topology.aria.fip", {
+          address: item.label,
+          state: f ? t(`fip.state.${f.state}`, { defaultValue: f.state }) : "",
+          vm: (f?.vm && vms.get(f.vm)?.name) || "—",
+        });
+      }
+      case "vip":
+        return t("topology.aria.vip", { address: item.label, name: lbs.get(item.id)?.name ?? "" });
+    }
+  };
+  return new Map(scene.items.map((it) => [it.key, label(it)]));
 }

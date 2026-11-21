@@ -148,7 +148,8 @@
     "fip_not_routable": "그 인터페이스에는 유동 IP를 붙일 수 없습니다: {{message}}",
     "physnet_in_use": "이 노드의 VM이 그 물리 네트워크를 씁니다: {{message}}",
     "physnet_conflict": "다른 네트워크가 이미 그 물리 네트워크와 VLAN을 씁니다: {{message}}",
-    "invalid_node_sdn": "SDN 설정이 올바르지 않습니다: {{message}}"
+    "invalid_node_sdn": "SDN 설정이 올바르지 않습니다: {{message}}",
+    "migration_overlap": "끝나지 않은 다른 네트워크 옮기기가 이 원본 네트워크·VM·대상 네트워크를 이미 씁니다: {{message}}"
   },
   "nav": {
     "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",
@@ -4145,7 +4146,10 @@
       "turnOn": "켜기",
       "turnOff": "끄기",
       "offTitle": "OVN 접근 잠금을 끌까요?",
-      "offDescription": "허용 목록을 먼저 걷고 중앙마다 보통 포트로 되돌립니다. 그 뒤로는 클러스터 인증서가 있는 노드는 누구나 남쪽 DB에 쓸 수 있습니다."
+      "offDescription": "허용 목록을 먼저 걷고 중앙마다 보통 포트로 되돌립니다. 그 뒤로는 클러스터 인증서가 있는 노드는 누구나 남쪽 DB에 쓸 수 있습니다.",
+      "stalled": "중간에 멈춤",
+      "finishOn": "마저 켜기",
+      "raft": "Raft"
     },
     "alerts": {
       "title": "SDN 경보",
@@ -4635,7 +4639,8 @@
     "taskStep": {
       "start": "시작",
       "rollback": "되돌리기",
-      "finish": "끝내기"
+      "finish": "끝내기",
+      "resume": "이어 가기"
     },
     "text": {
       "template": "템플릿은 옮기지 않음",
@@ -4645,7 +4650,7 @@
       "noMac": "인터페이스에 아직 MAC 주소가 없음",
       "outside": "{{ip}}이(가) {{network}}의 서브넷 밖임",
       "reserved": "{{ip}}은(는) {{network}}에서 예약된 주소(망·브로드캐스트·게이트웨이)",
-      "inUse": "{{ip}}을(를) 이미 씀",
+      "inUse": "{{ip}}은(는) {{network}}에서 이미 쓰는 주소",
       "duplicate": "{{ip}}이(가) 다른 인터페이스에도 계획됨",
       "notChassis": "VM이 OVN이 없는 노드에서 돔: 먼저 SDN 노드로 옮기거나 끄세요",
       "runningOffline": "VM이 켜져 있음(방식: 꺼진 VM만)",
@@ -4665,7 +4670,31 @@
       "bridgeOverlay": "다리는 SDN 오버레이 네트워크로만 놓음",
       "badBridgeNode": "{{node}} 노드는 다리 노드가 될 수 없음(OVN이나 원본 브리지가 없음)",
       "noBridgeNode": "원본 브리지 {{bridge}}가 있는 OVN 노드가 없음",
-      "bridgeRemoved": "다리 노드 {{node}}을(를) 클러스터에서 지움: 다른 다리 노드로 이어 하세요"
+      "bridgeRemoved": "다리 노드 {{node}}을(를) 클러스터에서 지움: 다른 다리 노드로 이어 하세요",
+      "ipamOthers": "IPAM은 원본 네트워크의 다른 장비가 쓰는 주소를 모름: 다리가 있는 동안 그 주소를 대상 풀에서 빼세요"
+    },
+    "gone": "이 옮기기 기록이 없어졌습니다.",
+    "close": "닫기",
+    "oneMode": "옮기기 하나에 방식 하나입니다. 다른 방식으로 옮길 VM은 빼고 두 번째 옮기기로 옮기세요.",
+    "hiddenVms_one": "볼 수 없는 VM {{count}}대가 원본 네트워크에 있습니다. 옮기지 않습니다.",
+    "hiddenVms_other": "볼 수 없는 VM {{count}}대가 원본 네트워크에 있습니다. 옮기지 않습니다.",
+    "replanFirst": "방식이나 주소를 바꿨습니다. 시작하기 전에 다시 계획하세요.",
+    "changedTitle": "{{name}}의 계획이 바뀌었습니다",
+    "changedDescription": "서버가 옮기기를 만들며 다시 계획했고, 몇 인터페이스가 화면의 계획과 다릅니다. 시작하기 전에 확인하세요. 시작하지 않으면 옮기기는 계획된 채로 남고, 다음 단계에서 시작하거나 지울 수 있습니다.",
+    "changedStart": "새 계획으로 시작",
+    "changedDisrupts_one": "켜진 VM {{count}}대가 이제 잠깐 망이 끊기거나 다시 켜집니다.",
+    "changedDisrupts_other": "켜진 VM {{count}}대가 이제 잠깐 망이 끊기거나 다시 켜집니다.",
+    "change": {
+      "who": "{{name}} 인터페이스 {{n}}",
+      "new": "{{who}}: 계획에 새로 듦({{mode}})",
+      "mode": "{{who}}: {{before}} → {{after}}",
+      "ips": "{{who}}: 주소 {{before}} → {{after}}",
+      "blockers": "{{who}}: 막는 까닭 {{after}}",
+      "none": "없음(이제 막히지 않음)",
+      "disrupt": {
+        "live": "1초 안팎 망이 끊김",
+        "restart": "VM을 끄고 다시 켬"
+      }
     }
   }
 }

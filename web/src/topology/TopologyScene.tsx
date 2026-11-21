@@ -1,5 +1,5 @@
 import { Maximize2, Minus, Plus } from "lucide-react";
-import { useId, useMemo, useState } from "react";
+import { memo, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -59,25 +59,42 @@ const KEYS: Record<string, Direction> = {
   ArrowDown: "down",
 };
 
+/** 밝힌 원소·선만 진하게, 나머지는 옅게 — 원소를 다시 그리지 않고 `<style>` 한 줄만 바꾼다(리뷰 1 I5). */
+function glowStyle(svg: string, glow: ReadonlySet<string> | null): string {
+  if (!glow) {
+    return "";
+  }
+  const keys = [...glow];
+  const items = keys.map((k) => `#${svg} g[data-key="${k}"]`).join(",");
+  const links = keys.map((k) => `#${svg} g[data-link="${k}"]`).join(",");
+  return (
+    `#${svg} g[data-key]{opacity:.22}#${svg} g[data-link]{opacity:.12}` +
+    (items ? `${items}{opacity:1}` : "") +
+    (links ? `${links}{opacity:1}` : "")
+  );
+}
+
 /**
  * 2.5D 토폴로지 그림(SVG 하나): 깊이 순으로 판·블록·기둥·꼬리표를 그리고, 가리키거나 초점이 간 원소와 이어진 길을 밝힌다.
  * 원소마다 `role="button"`이고 초점은 하나만 탭으로 들어오며(나머지는 `tabindex=-1`) 화살표가 이웃으로 옮긴다.
+ * 가리키기·초점·끌기는 원소를 다시 그리지 않는다(원소는 `memo`, 밝히기는 `<style>`, 이름은 미리 센 `labels`).
  */
 export function TopologyScene({
   scene,
-  labelOf,
+  labels,
   onOpen,
   showVmNames,
 }: {
   scene: Scene;
-  /** 원소의 화면 읽기 이름 */
-  labelOf(item: SceneItem): string;
+  /** 원소 열쇠 → 화면 읽기 이름 */
+  labels: ReadonlyMap<string, string>;
   onOpen(item: SceneItem): void;
   /** VM 블록 아래 이름을 적는다(작은 그림만) */
   showVmNames: boolean;
 }) {
   const { t } = useTranslation();
   const defs = useId().replace(/:/g, "");
+  const svgId = `${defs}-scene`;
   const fit = useMemo(() => fitBox(scene.bounds), [scene.bounds]);
   const { view, attach, handlers, zoomIn, zoomOut, reset, reveal } = useIsoViewport(fit);
   const [active, setActive] = useState<string | null>(null);
@@ -85,32 +102,127 @@ export function TopologyScene({
   const current =
     active && scene.items.some((it) => it.key === active) ? active : scene.items[0]?.key;
   const glow = useMemo(() => (lit ? related(scene, lit) : null), [scene, lit]);
-  const dim = (key: string) => (glow && !glow.has(key) ? 0.22 : 1);
-
-  function move(from: SceneItem, dir: Direction, el: SVGGElement) {
-    const next = neighbor(scene.items, from.key, dir);
-    if (!next) {
-      return;
-    }
-    setActive(next);
-    setLit(next);
-    const item = scene.items.find((it) => it.key === next);
-    if (item) {
-      reveal(item.center.x, item.center.y);
-    }
-    el.ownerSVGElement?.querySelector<SVGGElement>(`[data-key="${next}"]`)?.focus();
-  }
+  // 원소의 손잡이는 열쇠만 받는 한 벌(바뀌지 않음) — 지금 장면·`reveal`·`onOpen`은 참조로 읽는다.
+  const latest = useRef({ scene, reveal, onOpen });
+  useLayoutEffect(() => {
+    latest.current = { scene, reveal, onOpen };
+  });
+  const handlersFor = useMemo(
+    () => ({
+      open(key: string) {
+        const item = latest.current.scene.items.find((it) => it.key === key);
+        if (item) {
+          latest.current.onOpen(item);
+        }
+      },
+      light(key: string, on: boolean) {
+        setLit((was) => (on ? key : was === key ? null : was));
+      },
+      focus(key: string) {
+        setActive(key);
+      },
+      move(key: string, dir: Direction, el: SVGGElement) {
+        const { scene, reveal } = latest.current;
+        const next = neighbor(scene.items, key, dir);
+        if (!next) {
+          return;
+        }
+        setActive(next);
+        setLit(next);
+        const item = scene.items.find((it) => it.key === next);
+        if (item) {
+          reveal(item.center.x, item.center.y);
+        }
+        el.ownerSVGElement?.querySelector<SVGGElement>(`[data-key="${next}"]`)?.focus();
+      },
+    }),
+    [],
+  );
+  // 그림자·선은 장면이 바뀔 때만 다시 만든다(끌기·가리키기에는 그대로).
+  const shadows = useMemo(
+    () => (
+      <g aria-hidden>
+        {scene.items
+          .filter(
+            (it) =>
+              it.kind === "router" ||
+              it.kind === "network" ||
+              it.kind === "provider" ||
+              it.kind === "simple",
+          )
+          .map((it) => (
+            <IsoShadow
+              key={it.key}
+              box={it.box}
+              defs={defs}
+              offset={it.kind === "router" ? 30 : 10}
+            />
+          ))}
+      </g>
+    ),
+    [scene.items, defs],
+  );
+  const links = useMemo(
+    () => (
+      <g aria-hidden>
+        {scene.links.map((l) => (
+          <g
+            key={l.key}
+            data-link={l.key}
+            opacity={0.75}
+            className="motion-safe:transition-opacity"
+          >
+            <IsoLink
+              from={l.from}
+              to={l.to}
+              color={LINK_COLOR[l.tone] ?? TONE_COLOR[l.tone]}
+              dashed={l.dashed}
+              lift={l.lift}
+              width={l.kind === "interface" || l.kind === "external" ? 2.2 : 1.4}
+              arrow={l.kind === "migration" ? `${defs}-arrow` : undefined}
+            />
+            {l.label && (
+              <Label
+                x={(l.from.x + l.to.x) / 2}
+                y={(l.from.y + l.to.y) / 2 - l.lift / 2 - 6}
+                text={l.label}
+                strong
+              />
+            )}
+          </g>
+        ))}
+      </g>
+    ),
+    [scene.links, defs],
+  );
+  const layer = (n: number) =>
+    scene.items
+      .filter((it) => it.layer === n)
+      .map((it) => (
+        <Item
+          key={it.key}
+          item={it}
+          defs={defs}
+          active={current === it.key}
+          strong={lit === it.key}
+          label={labels.get(it.key) ?? it.label}
+          showName={showVmNames}
+          handlers={handlersFor}
+        />
+      ));
 
   return (
     <div className="relative">
       <svg
         ref={attach}
+        id={svgId}
         role="group"
         aria-label={t("topology.pictureLabel")}
         viewBox={viewBoxAttr(view)}
         className="block h-[min(70svh,720px)] min-h-72 w-full touch-none rounded-lg border bg-gradient-to-b from-surface-1 to-background select-none"
         {...handlers}
       >
+        <style>{glowStyle(svgId, glow)}</style>
         <IsoDefs id={defs} />
         <defs>
           <marker
@@ -126,90 +238,13 @@ export function TopologyScene({
           </marker>
         </defs>
         {/* 그림자는 모든 것 아래 */}
-        <g aria-hidden>
-          {scene.items
-            .filter(
-              (it) =>
-                it.kind === "router" ||
-                it.kind === "network" ||
-                it.kind === "provider" ||
-                it.kind === "simple",
-            )
-            .map((it) => (
-              <IsoShadow
-                key={it.key}
-                box={it.box}
-                defs={defs}
-                offset={it.kind === "router" ? 30 : 10}
-              />
-            ))}
-        </g>
+        {shadows}
         {/* 바닥 판 */}
-        {scene.items
-          .filter((it) => it.layer === 0)
-          .map((it) => (
-            <Item
-              key={it.key}
-              item={it}
-              defs={defs}
-              opacity={dim(it.key)}
-              active={current === it.key}
-              strong={lit === it.key}
-              label={labelOf(it)}
-              showName={showVmNames}
-              onOpen={() => onOpen(it)}
-              onLight={(on) => setLit(on ? it.key : null)}
-              onFocus={() => setActive(it.key)}
-              onMove={(dir, el) => move(it, dir, el)}
-            />
-          ))}
+        {layer(0)}
         {/* 이음선(판 위, 블록 아래) */}
-        <g aria-hidden>
-          {scene.links.map((l) => (
-            <g
-              key={l.key}
-              opacity={glow ? (glow.has(l.key) ? 1 : 0.12) : 0.75}
-              className="motion-safe:transition-opacity"
-            >
-              <IsoLink
-                from={l.from}
-                to={l.to}
-                color={LINK_COLOR[l.tone] ?? TONE_COLOR[l.tone]}
-                dashed={l.dashed}
-                lift={l.lift}
-                width={l.kind === "interface" || l.kind === "external" ? 2.2 : 1.4}
-                arrow={l.kind === "migration" ? `${defs}-arrow` : undefined}
-              />
-              {l.label && (
-                <Label
-                  x={(l.from.x + l.to.x) / 2}
-                  y={(l.from.y + l.to.y) / 2 - l.lift / 2 - 6}
-                  text={l.label}
-                  strong
-                />
-              )}
-            </g>
-          ))}
-        </g>
+        {links}
         {/* 판 위의 것(깊이 순) */}
-        {scene.items
-          .filter((it) => it.layer === 1)
-          .map((it) => (
-            <Item
-              key={it.key}
-              item={it}
-              defs={defs}
-              opacity={dim(it.key)}
-              active={current === it.key}
-              strong={lit === it.key}
-              label={labelOf(it)}
-              showName={showVmNames}
-              onOpen={() => onOpen(it)}
-              onLight={(on) => setLit(on ? it.key : null)}
-              onFocus={() => setActive(it.key)}
-              onMove={(dir, el) => move(it, dir, el)}
-            />
-          ))}
+        {layer(1)}
       </svg>
       <div className="absolute top-2 right-2 flex flex-col gap-1">
         <Button variant="outline" size="icon-sm" aria-label={t("topology.zoomIn")} onClick={zoomIn}>
@@ -229,6 +264,14 @@ export function TopologyScene({
       </div>
     </div>
   );
+}
+
+/** 원소의 손잡이(열쇠를 받는 한 벌 — 원소마다 새 함수를 만들지 않는다) */
+interface ItemHandlers {
+  open(key: string): void;
+  light(key: string, on: boolean): void;
+  focus(key: string): void;
+  move(key: string, dir: Direction, el: SVGGElement): void;
 }
 
 /** 글 하나(배경색 테두리로 선 위에서도 읽힘) */
@@ -269,30 +312,22 @@ function Label({
   );
 }
 
-function Item({
+const Item = memo(function Item({
   item,
   defs,
-  opacity,
   active,
   strong,
   label,
   showName,
-  onOpen,
-  onLight,
-  onFocus,
-  onMove,
+  handlers: h,
 }: {
   item: SceneItem;
   defs: string;
-  opacity: number;
   active: boolean;
   strong: boolean;
   label: string;
   showName: boolean;
-  onOpen(): void;
-  onLight(on: boolean): void;
-  onFocus(): void;
-  onMove(dir: Direction, el: SVGGElement): void;
+  handlers: ItemHandlers;
 }) {
   const color = TONE_COLOR[item.tone];
   const b = item.box;
@@ -302,25 +337,24 @@ function Item({
       role="button"
       tabIndex={active ? 0 : -1}
       aria-label={label}
-      opacity={opacity}
       className="cursor-pointer outline-none motion-safe:transition-opacity"
-      onClick={onOpen}
+      onClick={() => h.open(item.key)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          onOpen();
+          h.open(item.key);
         } else if (KEYS[e.key]) {
           e.preventDefault();
-          onMove(KEYS[e.key]!, e.currentTarget);
+          h.move(item.key, KEYS[e.key]!, e.currentTarget);
         }
       }}
       onFocus={() => {
-        onFocus();
-        onLight(true);
+        h.focus(item.key);
+        h.light(item.key, true);
       }}
-      onBlur={() => onLight(false)}
-      onPointerEnter={() => onLight(true)}
-      onPointerLeave={() => onLight(false)}
+      onBlur={() => h.light(item.key, false)}
+      onPointerEnter={() => h.light(item.key, true)}
+      onPointerLeave={() => h.light(item.key, false)}
     >
       <title>{label}</title>
       {item.kind === "network" || item.kind === "provider" || item.kind === "simple" ? (
@@ -412,4 +446,4 @@ function Item({
       )}
     </g>
   );
-}
+});

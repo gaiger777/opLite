@@ -165,14 +165,14 @@ export function layoutTopology(graph: Topology, opts: LayoutOptions = {}): Scene
   const shownNet = (n: TopoNetwork | undefined) =>
     n !== undefined && !(opts.hideSimple && isSimple(n));
 
-  // VM은 그림에 있는 첫 NIC의 네트워크 판에 한 번 놓고, 다른 NIC의 네트워크로는 선을 긋는다.
+  // VM은 그림에 있는 첫 NIC의 네트워크 판에 한 번 놓고, 다른 NIC의 네트워크로는 선을 긋는다. 공급자 네트워크에만 NIC가
+  // 있는 VM은 그 공급자 판(꼬리표 뒤)에 놓는다(리뷰 1 I4).
   const homeOf = new Map<string, string>();
   const onSlab = new Map<string, TopoVm[]>();
   for (const vm of vms) {
-    const home = vm.nics.find((nic) => {
-      const n = netById.get(nic.network);
-      return shownNet(n) && n!.kind !== "provider";
-    })?.network;
+    const shown = vm.nics.filter((nic) => shownNet(netById.get(nic.network)));
+    const home = (shown.find((nic) => netById.get(nic.network)!.kind !== "provider") ?? shown[0])
+      ?.network;
     if (home) {
       homeOf.set(vm.id, home);
       onSlab.set(home, [...(onSlab.get(home) ?? []), vm]);
@@ -297,7 +297,11 @@ export function layoutTopology(graph: Topology, opts: LayoutOptions = {}): Scene
     const px = Number.isFinite(want) ? Math.max(want, free) : free;
     const tags =
       (fipsOn.get(n.id)?.length ?? 0) + lbs.filter((l) => externalOf(graph, l.id) === n.id).length;
-    const width = Math.max(SLAB_W, PAD * 2 + Math.ceil(tags / 2) * TAG_CELL);
+    const vmCells = Math.min(onSlab.get(n.id)?.length ?? 0, MAX_VMS_PER_SLAB);
+    const width = Math.max(
+      SLAB_W,
+      PAD * 2 + Math.ceil(tags / 2) * TAG_CELL + Math.ceil(vmCells / 2) * CELL,
+    );
     const slab = addSlab(n, px, 0);
     slab.box = { ...slab.box, w: width, d: PROVIDER_D };
     slab.center = topCenter(slab.box);
@@ -331,12 +335,28 @@ export function layoutTopology(graph: Topology, opts: LayoutOptions = {}): Scene
     });
   }
 
-  // 5) 판 위: LB(육각 기둥) 먼저, VM(블록), 넘친 것은 "+N"
+  // 5) 판 위: LB(육각 기둥) 먼저, VM(블록), 넘친 것은 "+N". 공급자 판은 꼬리표 열 뒤에 두 줄로.
   const vmKey = new Map<string, string>();
   for (const [netId, slab] of slabOf) {
-    if (slab.kind === "provider") {
-      continue;
-    }
+    const provider = slab.kind === "provider";
+    const tagCols = provider
+      ? Math.ceil(
+          ((fipsOn.get(netId)?.length ?? 0) +
+            lbs.filter((l) => externalOf(graph, l.id) === netId).length) /
+            2,
+        )
+      : 0;
+    const cellBoxOn = (i: number, size: number, h: number): Box =>
+      provider
+        ? {
+            x: slab.box.x + PAD + tagCols * TAG_CELL + Math.floor(i / 2) * CELL + (CELL - size) / 2,
+            y: slab.box.y + PAD + (i % 2) * CELL + (CELL - size) / 2,
+            z: slab.box.z + slab.box.h,
+            w: size,
+            d: size,
+            h,
+          }
+        : cellBox(slab.box, i, size, h);
     let cell = 0;
     for (const lb of lbsOn.get(netId) ?? []) {
       const box = cellBox(slab.box, cell++, 24, 28);
@@ -358,7 +378,7 @@ export function layoutTopology(graph: Topology, opts: LayoutOptions = {}): Scene
     const overflow = here.length > MAX_VMS_PER_SLAB;
     const shown = overflow ? here.slice(0, MAX_VMS_PER_SLAB - 1) : here;
     for (const vm of shown) {
-      const box = cellBox(slab.box, cell++, VM_SIZE, VM_H);
+      const box = cellBoxOn(cell++, VM_SIZE, VM_H);
       const key = `vm:${netId}:${vm.id}`;
       vmKey.set(vm.id, key);
       put({
@@ -377,7 +397,7 @@ export function layoutTopology(graph: Topology, opts: LayoutOptions = {}): Scene
     }
     if (overflow) {
       const rest = here.slice(MAX_VMS_PER_SLAB - 1);
-      const box = cellBox(slab.box, cell, VM_SIZE, VM_H);
+      const box = cellBoxOn(cell, VM_SIZE, VM_H);
       put({
         key: `more:${netId}`,
         kind: "more",

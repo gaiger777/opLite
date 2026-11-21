@@ -101,6 +101,7 @@ function cluster(migrations: unknown[] = []) {
 
 it("plans, shows blockers and the cloud-init warning, then creates and starts", async () => {
   cluster();
+  const warned = vi.spyOn(toast, "warning");
   const sent: { url: string; body: unknown }[] = [];
   let created = false;
   const RES = migrationRes(
@@ -132,7 +133,8 @@ it("plans, shows blockers and the cloud-init warning, then creates and starts", 
       created = true;
       return HttpResponse.json(
         { ...RES, plan: PLAN },
-        { status: 201, headers: { "orbivisor-warning": "3" } },
+        // 서버의 머리는 문장이다(리뷰 1 M1 — 수는 계획에서 센다).
+        { status: 201, headers: { "orbivisor-warning": "the plan has 4 warning(s); see plan" } },
       );
     }),
     http.post(apiUrl(`/network-migrations/${RES.id}/start`), async ({ request }) => {
@@ -166,27 +168,23 @@ it("plans, shows blockers and the cloud-init warning, then creates and starts", 
   expect(within(db).getByText("blocked")).toBeVisible();
   expect(within(db).getByText("192.168.10.5 is also planned for another interface")).toBeVisible();
   expect(within(sheet).getByText("Bridge on node-a")).toBeVisible();
-  // 막힌 VM은 빼고 다시 계획한다(`vms`)
+  expect(within(sheet).getByText(/^One mode for the whole migration/)).toBeVisible();
+  // 막힌 VM은 뺀다. 다시 계획해도 그 줄은 남아 다시 넣을 수 있다(리뷰 1 I6 — 미리 보기는 늘 모든 VM).
   await user.click(within(db).getByRole("checkbox", { name: "Move db" }));
   await user.click(within(sheet).getByRole("button", { name: "Plan again" }));
   await waitFor(() => expect(sent).toHaveLength(2));
+  const again = within(sheet).getByRole("table", { name: "Migration plan" });
+  expect(within(again).getByRole("checkbox", { name: "Move db" })).not.toBeChecked();
+  // 이름은 보내지 않는다(서버가 고른다 — 리뷰 1 I2). VM 빼기는 만들 때만 `vms`.
   await user.click(within(sheet).getByRole("button", { name: "Create and start (1 interface)" }));
   await waitFor(() => expect(sent).toHaveLength(4));
   expect(sent).toEqual([
-    {
-      url: "?dry_run=true",
-      body: { name: "lan-to-t-lan", spec: { source: "lan", target: "t-lan" } },
-    },
-    {
-      url: "?dry_run=true",
-      body: { name: "lan-to-t-lan", spec: { source: "lan", target: "t-lan", vms: [WEB.id] } },
-    },
-    {
-      url: "",
-      body: { name: "lan-to-t-lan", spec: { source: "lan", target: "t-lan", vms: [WEB.id] } },
-    },
+    { url: "?dry_run=true", body: { spec: { source: "lan", target: "t-lan" } } },
+    { url: "?dry_run=true", body: { spec: { source: "lan", target: "t-lan" } } },
+    { url: "", body: { spec: { source: "lan", target: "t-lan", vms: [WEB.id] } } },
     { url: "start", body: {} },
   ]);
+  expect(warned).toHaveBeenCalledWith("The plan has 4 warnings.");
   // ③ 진행
   expect(await within(sheet).findByText("running")).toBeVisible();
   expect(within(sheet).getByText("0 of 1 moved")).toBeVisible();
@@ -225,10 +223,7 @@ it("creates a new SDN network with the same subnet before planning", async () =>
     name: "lan-sdn",
     spec: { sdn: {}, subnets: [{ cidr: "192.168.10.0/24", gateway: "192.168.10.1" }] },
   });
-  expect(sent[1]).toEqual({
-    name: "lan-to-lan-sdn",
-    spec: { source: "lan", target: "lan-sdn", mode: "live" },
-  });
+  expect(sent[1]).toEqual({ spec: { source: "lan", target: "lan-sdn", mode: "live" } });
   // 다리를 놓을 수 없으면 시작할 수 없다.
   expect(await screen.findByText("no OVN node has the source bridge br0")).toBeVisible();
   expect(screen.getByRole("button", { name: "Create and start (0 interfaces)" })).toBeDisabled();
@@ -337,4 +332,288 @@ it("translates the server's plan sentences it knows", () => {
     ),
   ).toBe("the bridge node node-b was removed from the cluster: resume with another bridge node");
   expect(planText(t, "something new")).toBe("something new");
+});
+
+/** 목록이 온 뒤(대상 t-lan이 골라진 뒤) 계획을 만든다. */
+async function planOnTLan(user: ReturnType<typeof userEvent.setup>) {
+  const existing = await screen.findByLabelText("An existing SDN network");
+  await waitFor(() => expect(existing).toBeEnabled());
+  await user.click(existing);
+  expect(screen.getByLabelText("SDN network")).toHaveValue("t-lan");
+  await user.click(screen.getByRole("button", { name: "Make the plan" }));
+}
+
+/** 두 VM 모두 옮길 수 있는 계획(`web` 켜짐 라이브, `db` 꺼짐) */
+const MOVABLE = {
+  nics: [
+    { ...PLAN.nics[0]!, warnings: [] },
+    {
+      ...PLAN.nics[1]!,
+      mode: "offline",
+      ips: ["192.168.10.6"],
+      blockers: [],
+      warnings: [],
+    },
+  ],
+  bridge: { ...PLAN.bridge, warnings: [] },
+};
+
+function created(id: string, plan: unknown) {
+  return {
+    ...migrationRes(id, { source: "lan", target: "t-lan" }, { phase: "planned", vms: [] }),
+    plan,
+  };
+}
+
+it("starts only the plan on screen: a changed choice needs a new plan (review 1 C1)", async () => {
+  cluster();
+  const sent: string[] = [];
+  server.use(
+    http.post(apiUrl("/network-migrations"), ({ request }) => {
+      sent.push(new URL(request.url).search);
+      return HttpResponse.json(MOVABLE);
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await planOnTLan(user);
+  const start = await screen.findByRole("button", { name: "Create and start (2 interfaces)" });
+  expect(start).toBeEnabled();
+  // 방식을 바꾸면 화면의 계획과 달라 시작하지 못한다.
+  await user.selectOptions(screen.getByLabelText("Mode"), "Restart");
+  expect(start).toBeDisabled();
+  expect(screen.getByText(/plan again before starting/)).toBeVisible();
+  // 되돌리면 다시 된다. 주소를 고쳐도 다시 계획해야 한다.
+  await user.selectOptions(screen.getByLabelText("Mode"), "Automatic");
+  expect(start).toBeEnabled();
+  await user.type(screen.getByLabelText("Address for db interface 1"), "192.168.10.9");
+  expect(start).toBeDisabled();
+  await user.click(screen.getByRole("button", { name: "Plan again" }));
+  await waitFor(() => expect(sent).toHaveLength(2));
+  await waitFor(() => expect(start).toBeEnabled());
+});
+
+it("asks again when the server's plan at create differs, especially a VM that would restart (review 1 C1)", async () => {
+  cluster();
+  const sent: string[] = [];
+  // 그새 db가 켜져 `auto`가 다시 켬으로 계획한다.
+  const later = {
+    ...MOVABLE,
+    nics: [MOVABLE.nics[0], { ...MOVABLE.nics[1]!, mode: "restart" }],
+  };
+  const RES = created("lan-to-t-lan", later);
+  server.use(
+    http.post(apiUrl("/network-migrations"), ({ request }) => {
+      const dry = new URL(request.url).searchParams.get("dry_run") === "true";
+      sent.push(dry ? "dry" : "create");
+      return dry ? HttpResponse.json(MOVABLE) : HttpResponse.json(RES, { status: 201 });
+    }),
+    http.post(apiUrl(`/network-migrations/${RES.id}/start`), () => {
+      sent.push("start");
+      return HttpResponse.json(sdnTask("t1", "sdn-init", N1.id), { status: 202 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await planOnTLan(user);
+  await user.click(await screen.findByRole("button", { name: "Create and start (2 interfaces)" }));
+  const dialog = await screen.findByRole("alertdialog", {
+    name: "The plan for lan-to-t-lan changed",
+  });
+  expect(
+    within(dialog).getByText(
+      "db interface 1: stopped → restart — the VM is shut down and started again",
+    ),
+  ).toBeVisible();
+  expect(within(dialog).getByRole("alert")).toHaveTextContent(
+    "1 running VM would now lose its network briefly or be restarted.",
+  );
+  expect(sent).toEqual(["dry", "create"]);
+  await user.click(within(dialog).getByRole("button", { name: "Start with the new plan" }));
+  await waitFor(() => expect(sent).toEqual(["dry", "create", "start"]));
+});
+
+it("keeps a created migration planned when the plan changed and the user cancels", async () => {
+  cluster();
+  const later = {
+    ...MOVABLE,
+    nics: [{ ...MOVABLE.nics[0]!, ips: ["192.168.10.77"] }, MOVABLE.nics[1]],
+  };
+  const RES = created("lan-to-t-lan", later);
+  let made = false;
+  const started: string[] = [];
+  server.use(
+    http.post(apiUrl("/network-migrations"), ({ request }) => {
+      if (new URL(request.url).searchParams.get("dry_run") === "true") {
+        return HttpResponse.json(MOVABLE);
+      }
+      made = true;
+      return HttpResponse.json(RES, { status: 201 });
+    }),
+    http.get(apiUrl("/network-migrations"), () =>
+      HttpResponse.json({ revision: 13, items: made ? [RES] : [] }),
+    ),
+    http.post(apiUrl(`/network-migrations/${RES.id}/start`), () => {
+      started.push("start");
+      return HttpResponse.json(sdnTask("t1", "sdn-init", N1.id), { status: 202 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await planOnTLan(user);
+  await user.click(await screen.findByRole("button", { name: "Create and start (2 interfaces)" }));
+  const dialog = await screen.findByRole("alertdialog");
+  expect(
+    within(dialog).getByText("web interface 1: address 192.168.10.5 → 192.168.10.77"),
+  ).toBeVisible();
+  await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  // 진행 단계에 계획된 옮기기(시작·지우기)
+  expect(await screen.findByText("planned")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Start" })).toBeVisible();
+  expect(started).toEqual([]);
+});
+
+it("shows the progress step with Start when starting fails after the create (review 1 M3)", async () => {
+  cluster();
+  const RES = created("lan-to-t-lan", MOVABLE);
+  let made = false;
+  server.use(
+    http.post(apiUrl("/network-migrations"), ({ request }) => {
+      if (new URL(request.url).searchParams.get("dry_run") === "true") {
+        return HttpResponse.json(MOVABLE);
+      }
+      made = true;
+      return HttpResponse.json(RES, { status: 201 });
+    }),
+    http.get(apiUrl("/network-migrations"), () =>
+      HttpResponse.json({ revision: 13, items: made ? [RES] : [] }),
+    ),
+    http.post(apiUrl(`/network-migrations/${RES.id}/start`), () =>
+      HttpResponse.json(
+        { code: "sdn_busy", message: "another SDN task is running" },
+        { status: 409 },
+      ),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await planOnTLan(user);
+  await user.click(await screen.findByRole("button", { name: "Create and start (2 interfaces)" }));
+  expect(await screen.findByText("planned")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Start" })).toBeVisible();
+});
+
+it("keeps showing a migration it opened after it finishes (review 1 I1)", async () => {
+  const running = migrationRes(
+    "lan-to-t-lan",
+    { source: "lan", target: "t-lan" },
+    { phase: "moved", vms: [] },
+  );
+  cluster([running]);
+  const user = userEvent.setup();
+  const onClose = vi.fn();
+  const { queryClient } = renderPage(<MigrationWizard source={LAN} onClose={onClose} />);
+  expect(await screen.findByText("moved")).toBeVisible();
+  server.use(
+    http.get(apiUrl("/network-migrations"), () =>
+      HttpResponse.json({
+        revision: 14,
+        items: [{ ...running, status: { phase: "finished", vms: [] } }],
+      }),
+    ),
+  );
+  await queryClient.invalidateQueries({ queryKey: ["network-migrations"] });
+  expect(await screen.findByText("finished")).toBeVisible();
+  expect(screen.getByRole("button", { name: "Delete the record" })).toBeVisible();
+  const buttons = screen.getAllByRole("button", { name: "Close" });
+  await user.click(buttons.find((b) => b.textContent === "Close")!);
+  expect(onClose).toHaveBeenCalled();
+});
+
+it("offers only bridge nodes that have the source bridge when resuming (review 1 M5)", async () => {
+  const N2 = sdnNode(2, readyChassis(2), { bridges: [{ name: "br9", vlan_filtering: false }] });
+  const paused = migrationRes(
+    "lan-to-t-lan",
+    { source: "lan", target: "t-lan" },
+    {
+      phase: "paused",
+      vms: [],
+      error:
+        'the bridge node "node-c" was removed from the cluster; resume with another bridge node',
+    },
+  );
+  cluster([paused]);
+  mockLists({ node: [N1, N2], network: [LAN, TLAN], vm: [WEB, DB] });
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  const picker = await screen.findByLabelText("New bridge node");
+  const options = within(picker)
+    .getAllByRole("option")
+    .map((o) => o.textContent);
+  expect(options).toEqual(["Automatic (the node with the most VMs)", "node-a"]);
+});
+
+it("says how many VMs it cannot show and translates the new server sentences", async () => {
+  cluster();
+  server.use(
+    http.post(apiUrl("/network-migrations"), () =>
+      HttpResponse.json({
+        ...MOVABLE,
+        hidden: 2,
+        bridge: {
+          ...MOVABLE.bridge,
+          warnings: [
+            "IPAM does not know the addresses other hosts use on the source network: keep them out of the target's pools while the bridge is up",
+          ],
+        },
+      }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await planOnTLan(user);
+  expect(
+    await screen.findByText("2 VMs you cannot see are on the source network; they are not moved."),
+  ).toBeVisible();
+  expect(
+    screen.getByText(
+      "IPAM does not know the addresses other hosts use on the source network: keep them out of the target's pools while the bridge is up",
+    ),
+  ).toBeVisible();
+  const t = i18n.t;
+  expect(planText(t, 'address 10.0.0.5 is already in use on "t-lan"')).toBe(
+    "10.0.0.5 is already in use on t-lan",
+  );
+  // 이어 가기 Task 이름(리뷰 1 M4)
+  expect(t("migration.taskStep.resume")).toBe("resume");
+  expect(i18n.getResourceBundle("ko", "translation").migration.taskStep.resume).toBe("이어 가기");
+});
+
+it("doesn't create the new SDN network twice when planning fails (review 1 M2)", async () => {
+  cluster();
+  const sent: string[] = [];
+  let plans = 0;
+  server.use(
+    http.post(apiUrl("/networks"), () => {
+      sent.push("network");
+      return HttpResponse.json({ ...TLAN, name: "lan-sdn" }, { status: 201 });
+    }),
+    http.post(apiUrl("/network-migrations"), async ({ request }) => {
+      sent.push(JSON.stringify(await request.json()));
+      plans += 1;
+      return plans === 1
+        ? HttpResponse.json({ code: "sdn_busy", message: "busy" }, { status: 409 })
+        : HttpResponse.json(MOVABLE);
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await user.click(await screen.findByLabelText("A new SDN network with the same subnet"));
+  await user.type(screen.getByLabelText("Subnet (CIDR)"), "192.168.10.0/24");
+  await user.click(screen.getByRole("button", { name: "Make the plan" }));
+  expect(await screen.findByRole("alert")).toBeVisible();
+  expect(screen.getByLabelText("An existing SDN network")).toBeChecked();
+  await user.click(screen.getByRole("button", { name: "Make the plan" }));
+  await waitFor(() => expect(plans).toBe(2));
+  expect(sent.filter((x) => x === "network")).toHaveLength(1);
+  expect(JSON.parse(sent.at(-1)!)).toEqual({ spec: { source: "lan", target: "lan-sdn" } });
 });
