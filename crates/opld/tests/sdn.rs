@@ -2835,23 +2835,6 @@ async fn security_section(d: &Daemon, tag: &str) {
 // 계획 67 스테이지 2: 부하 분산·건강 검사 넘김·바깥 VIP·QoS(OVN `QoS` 행과 단순 NIC tc)
 // ---------------------------------------------------------------------------------------------------------------
 
-/// 제어 소켓의 시험 고리 `POST /v1/test/put`(스테이지 5가 지운다)
-async fn test_put(d: &Daemon, kind: &str, name: &str, spec: Value) {
-    let http = reqwest::Client::builder()
-        .unix_socket(d.path("opld.sock"))
-        .build()
-        .unwrap();
-    let resp = http
-        .post("http://opld/v1/test/put")
-        .json(&json!({ "kind": kind, "name": name, "spec": spec }))
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(status.is_success(), "put {kind} {name}: {status} {text}");
-}
-
 /// 붙으면 제 이름과 상대 주소 한 줄을 보내고 끊는 TCP 서버(`NAME PORT`)
 const NAME_SERVER: &str = r#"
 import socket, sys
@@ -2948,9 +2931,10 @@ fn near(measured: f64, want: f64) -> bool {
     (measured - want).abs() <= want * 0.15
 }
 
-/// 계획 67 스테이지 2: 오버레이 `lb-t1`(멤버 b1·b2, 같은 서브넷 클라이언트 c0)·`lb-t2`(클라이언트 c)를 잇는 라우터 `lr1`
-/// (바깥 `ext`)에 LB `web`(VIP 10.40.0.50, 바깥 VIP 203.0.113.130, tcp/80 → 8080, 건강 검사)을 시험 고리로 만들고 실제
-/// 트래픽을 본다. 이어서 SDN NIC QoS(OVN `QoS` 행 — iperf3·DSCP)와 단순 NIC tc(드라이버 `set_tap_qos`)를 잰다.
+/// 계획 67 스테이지 2·5: 오버레이 `lb-t1`(멤버 b1·b2, 같은 서브넷 클라이언트 c0)·`lb-t2`(클라이언트 c)를 잇는 라우터 `lr1`
+/// (바깥 `ext`)에 LB `web`(VIP 10.40.0.50, 바깥 VIP 203.0.113.130, tcp/80 → 8080, 건강 검사)을 orbivisorctl `lb`로 만들고
+/// 실제 트래픽과 API 보기의 멤버 건강(SB `Service_Monitor`)을 본다. 이어서 SDN NIC QoS(`vm nic-qos` → OVN `QoS` 행 —
+/// iperf3·DSCP)와 단순 NIC tc(드라이버 `set_tap_qos`)를 잰다.
 async fn services_section(d: &Daemon, tag: &str) {
     sdn_network(d, "lb-t1", &["--subnet", "10.40.0.0/24"]).await;
     sdn_network(d, "lb-t2", &["--subnet", "10.41.0.0/24"]).await;
@@ -2988,19 +2972,47 @@ async fn services_section(d: &Daemon, tag: &str) {
     let mut s1 = Some(name_server("oplb1", "lb-b1", 8080));
     let mut s2 = Some(name_server("oplb2", "lb-b2", 8080));
 
-    // LB(시험 고리 — 스테이지 5까지 API가 없다)
-    let spec = |affinity: Option<u32>| {
-        json!({
-            "network": "lb-t1", "vip": "10.40.0.50",
-            "external": {"network": "ext", "ip": "203.0.113.130"},
-            "affinity_secs": affinity,
-            "listeners": [{"protocol": "tcp", "port": 80,
-                "health": {"interval_secs": 2, "timeout_secs": 1, "rise": 1, "fall": 2},
-                "members": [{"vm": b1.0, "mac": b1.1, "port": 8080}, {"vm": b2.0, "mac": b2.1, "port": 8080}]}],
-            "monitors": [{"network": "lb-t1", "ip": "10.40.0.250"}]
-        })
-    };
-    test_put(d, "load-balancer", "web", spec(None)).await;
+    // LB(orbivisorctl — 스테이지 5 API): VIP·바깥 VIP를 주고, 멤버와 건강 검사를 더한다(검사 주소는 API가 고른다).
+    d.ctl(&[
+        "lb",
+        "create",
+        "web",
+        "--network",
+        "lb-t1",
+        "--vip",
+        "10.40.0.50",
+        "--external",
+        "ext,ip=203.0.113.130",
+        "--listener",
+        "tcp/80",
+    ])
+    .await
+    .unwrap();
+    for m in ["lb-b1@8080", "lb-b2@8080"] {
+        d.ctl(&["lb", "member", "add", "web", "tcp/80", m])
+            .await
+            .unwrap();
+    }
+    d.ctl(&[
+        "lb",
+        "health",
+        "set",
+        "web",
+        "tcp/80",
+        "--interval",
+        "2",
+        "--timeout",
+        "1",
+        "--rise",
+        "1",
+        "--fall",
+        "2",
+    ])
+    .await
+    .unwrap();
+    let lb = d.ctl_json(&["lb", "get", "web"]).await;
+    eprintln!("lb web: {lb}");
+    assert_eq!(lb["spec"]["monitors"][0]["network"], "lb-t1", "{lb}");
     wait_for("the load balancer rows", AGENT_WAIT, || async {
         let rows = nb_rows(d, tag).await;
         !rows.load_balancers.is_empty() && rows.routers.iter().any(|r| !r.load_balancers.is_empty())
@@ -3054,6 +3066,19 @@ async fn services_section(d: &Daemon, tag: &str) {
             && m.get(&b2.2).map(String::as_str) == Some("online")
     })
     .await;
+    // API 보기의 멤버 건강(SB `Service_Monitor`를 역할 포트로 읽음)
+    wait_for(
+        "the view to show both members online",
+        AGENT_WAIT,
+        || async {
+            let lb = d.ctl_json(&["lb", "get", "web"]).await;
+            lb["members"]
+                .as_array()
+                .is_some_and(|m| m.len() == 2 && m.iter().all(|m| m["health"] == "online"))
+        },
+    )
+    .await;
+    println!("{}", d.ctl(&["lb", "get", "web"]).await.unwrap());
     s1.take();
     let t0 = Instant::now();
     let (mut tries, mut ok) = (0, 0);
@@ -3074,6 +3099,16 @@ async fn services_section(d: &Daemon, tag: &str) {
     );
     let only = seen("oplc", "10.40.0.50", 10);
     assert_eq!(only.keys().collect::<Vec<_>>(), ["lb-b2"], "{only:?}");
+    let lb = d.ctl_json(&["lb", "get", "web"]).await;
+    let health = |vm: &str| {
+        lb["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["vm"] == vm)
+            .map(|m| m["health"].clone())
+    };
+    assert_eq!(health(&b1.0), Some(json!("offline")), "{lb}");
     s1 = Some(name_server("oplb1", "lb-b1", 8080));
     let t0 = Instant::now();
     wait_for("b1 back online", AGENT_WAIT, || async {
@@ -3118,8 +3153,11 @@ async fn services_section(d: &Daemon, tag: &str) {
     eprintln!("PROBE external VIP: {outside:?}");
     assert!(outside.ends_with(" 203.0.113.1"), "{outside}");
 
-    // 출발지 고정: 같은 클라이언트는 같은 멤버
-    test_put(d, "load-balancer", "web", spec(Some(60))).await;
+    // 출발지 고정: 같은 클라이언트는 같은 멤버(API `PATCH`)
+    client(d)
+        .patch("/load-balancers/web", &json!({ "affinity_secs": 60 }))
+        .await
+        .unwrap();
     wait_for("affinity in the NB", AGENT_WAIT, || async {
         nb_rows(d, tag)
             .await
@@ -3132,6 +3170,13 @@ async fn services_section(d: &Daemon, tag: &str) {
     eprintln!("PROBE affinity: {sticky:?}");
     assert_eq!(sticky.len(), 1, "{sticky:?}");
 
+    // 바깥 VIP가 쓰는 라우터 바깥은 떼지 못한다(409 `lb_in_use`) — 바깥 VIP를 먼저 뗀다.
+    let err = d
+        .ctl(&["router", "external", "clear", "lr1"])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("load balancer"), "{err}");
+    d.ctl(&["lb", "external", "clear", "web"]).await.unwrap();
     // DGP 없는 라우터(§7.2 탐침): 바깥을 떼어도 안쪽 VIP가 닿는지
     d.ctl(&["router", "external", "clear", "lr1"])
         .await
@@ -3151,8 +3196,14 @@ async fn services_section(d: &Daemon, tag: &str) {
         hit("oplc0", "10.40.0.50", 80)
     );
 
+    // VIP 네트워크는 라우터에서 떼지 못한다(409 `lb_in_use`).
+    let err = d
+        .ctl(&["router", "interface", "remove", "lr1", "lb-t1"])
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("load balancer"), "{err}");
     // LB를 지우면 행이 사라진다.
-    test_put(d, "load-balancer", "web", Value::Null).await;
+    d.ctl(&["lb", "delete", "web"]).await.unwrap();
     wait_for("the load balancer rows to go", AGENT_WAIT, || async {
         let rows = nb_rows(d, tag).await;
         rows.load_balancers.is_empty() && rows.health_checks.is_empty()
@@ -3171,16 +3222,14 @@ async fn services_section(d: &Daemon, tag: &str) {
     tokio::time::sleep(Duration::from_secs(1)).await;
     let free = iperf("oplb1", &c.2, false);
     eprintln!("PROBE iperf3 without QoS: {free:.1} Mbit/s");
-    let set_qos = |qos: Value| {
-        let c = client(d);
-        async move {
-            let mut vm = c.get("/vms/lb-b1").await.unwrap();
-            vm["spec"]["nics"][0]["qos"] = qos;
-            test_put(d, "vm", "lb-b1", vm["spec"].clone()).await;
-        }
+    // `vm nic-qos`(지금 값에 합친다 — `--clear`로 비운 뒤 다시 줄 수 있다)
+    let set_qos = |args: &'static [&'static str]| async move {
+        let mut argv = vec!["vm", "nic-qos", "lb-b1", "0"];
+        argv.extend_from_slice(args);
+        d.ctl(&argv).await.unwrap();
     };
     let qos_rows = || async { nb_rows(d, tag).await.qos };
-    set_qos(json!({"out_mbps": 50})).await;
+    set_qos(&["out=50"]).await;
     wait_for("the QoS row", AGENT_WAIT, || async {
         !qos_rows().await.is_empty()
     })
@@ -3194,7 +3243,7 @@ async fn services_section(d: &Daemon, tag: &str) {
     let out50 = iperf("oplb1", &c.2, false);
     eprintln!("PROBE SDN QoS out_mbps=50: {out50:.1} Mbit/s");
     assert!(near(out50, 50.0), "out_mbps=50 measured {out50:.1}");
-    set_qos(json!({"out_mbps": 50, "in_mbps": 30})).await;
+    set_qos(&["in=30"]).await;
     wait_for("two QoS rows", AGENT_WAIT, || async {
         qos_rows().await.len() == 2
     })
@@ -3202,7 +3251,7 @@ async fn services_section(d: &Daemon, tag: &str) {
     let in30 = iperf("oplb1", &c.2, true);
     eprintln!("PROBE SDN QoS in_mbps=30: {in30:.1} Mbit/s");
     assert!(near(in30, 30.0), "in_mbps=30 measured {in30:.1}");
-    set_qos(json!({"out_mbps": 20, "in_mbps": 30})).await;
+    set_qos(&["out=20"]).await;
     wait_for("the changed QoS row", AGENT_WAIT, || async {
         qos_rows()
             .await
@@ -3213,7 +3262,8 @@ async fn services_section(d: &Daemon, tag: &str) {
     let out20 = iperf("oplb1", &c.2, false);
     eprintln!("PROBE SDN QoS changed to out_mbps=20: {out20:.1} Mbit/s");
     assert!(near(out20, 20.0), "out_mbps=20 measured {out20:.1}");
-    set_qos(json!({"dscp": 46})).await;
+    set_qos(&["--clear"]).await;
+    set_qos(&["dscp=46"]).await;
     wait_for("the DSCP row", AGENT_WAIT, || async {
         qos_rows()
             .await
@@ -3231,7 +3281,7 @@ async fn services_section(d: &Daemon, tag: &str) {
     );
     eprintln!("PROBE DSCP 46 seen by the receiver: {marked:?}");
     assert_ne!(marked, Some(false), "the receiver did not see DSCP 46");
-    set_qos(Value::Null).await;
+    set_qos(&["--clear"]).await;
     wait_for("the QoS rows to go", AGENT_WAIT, || async {
         qos_rows().await.is_empty()
     })
@@ -3377,39 +3427,16 @@ async fn plain_tc_section() {
     let _ = try_run("ip", &["link", "del", "oplqbr"]);
 }
 
-/// 시험 고리 `POST /v1/test/migration`(스테이지 5 전 옮기기 엔진)
-async fn test_migration(d: &Daemon, body: Value) -> Value {
-    let http = reqwest::Client::builder()
-        .unix_socket(d.path("opld.sock"))
-        .build()
-        .unwrap();
-    let resp = http
-        .post("http://opld/v1/test/migration")
-        .json(&body)
-        .send()
-        .await
-        .unwrap();
-    let status = resp.status();
-    let text = resp.text().await.unwrap();
-    assert!(status.is_success(), "migration {body}: {status} {text}");
-    serde_json::from_str(&text).unwrap()
-}
-
-/// 옮기기 걸음 하나를 Task로 하고 끝난 Task
-async fn migration_step(d: &Daemon, node: &str, action: &str, extra: Value) -> Value {
-    let mut body = json!({ "action": action, "name": "mig", "node": node });
-    body.as_object_mut()
-        .unwrap()
-        .extend(extra.as_object().cloned().unwrap_or_default());
-    let id = test_migration(d, body).await;
+/// orbivisorctl 옮기기 명령 하나(Task를 기다린다)와 걸린 시간
+async fn migration_ctl(d: &Daemon, args: &[&str]) -> String {
     let started = Instant::now();
-    let task = wait_task(d, &json!({ "id": id }), Duration::from_secs(300)).await;
+    let out = d.ctl(args).await.unwrap();
     eprintln!(
-        "migration {action}: {:.1}s",
+        "{}: {:.1}s\n{out}",
+        args.join(" "),
         started.elapsed().as_secs_f64()
     );
-    assert_eq!(task["status"]["state"], "succeeded", "{task}");
-    task
+    out
 }
 
 /// 이름공간 `ns`에 Linux 브리지 `bridge`의 veth 한쪽(MAC `mac`, 주소 `ip`/24)
@@ -3513,12 +3540,30 @@ async fn migration_section(d: &Daemon, tag: &str, node: &str) {
     };
     assert_eq!(master(&tap), "oplmig0");
 
-    // 미리 보기
-    let spec = json!({
-        "source": "lan", "target": "t-lan", "vms": [q_id, a_id], "allow_mtu_shrink": true,
-        "addresses": [{ "vm": q_id, "mac": q_mac.to_string(), "ip": ["10.66.0.10"] }]
-    });
-    let plan = test_migration(d, json!({ "action": "plan", "name": "mig", "spec": spec })).await;
+    // 미리 보기(`network migrate … --dry-run`)
+    let migrate = [
+        "network",
+        "migrate",
+        "lan",
+        "--to",
+        "t-lan",
+        "--name",
+        "mig",
+        "--vm",
+        "mig-q",
+        "--vm",
+        "mig-a",
+        "--allow-mtu-shrink",
+        "--ip",
+        "mig-q=10.66.0.10",
+    ];
+    let mut dry = vec!["-o", "json"];
+    dry.extend_from_slice(&migrate);
+    dry.push("--dry-run");
+    let plan: Value = serde_json::from_str(&d.ctl(&dry).await.unwrap()).unwrap();
+    let mut table = migrate.to_vec();
+    table.push("--dry-run");
+    println!("{}", d.ctl(&table).await.unwrap());
     eprintln!("migration plan: {plan}");
     let planned = |vm: &str| {
         plan["nics"]
@@ -3540,13 +3585,11 @@ async fn migration_section(d: &Daemon, tag: &str, node: &str) {
     assert_eq!(planned(&a_id)["ips"], json!(["10.66.0.11"]), "{plan}");
     assert_eq!(plan["bridge"]["needed"], true, "{plan}");
     assert_eq!(plan["bridge"]["node"], node, "{plan}");
-    let mig = test_migration(
-        d,
-        json!({ "action": "create", "name": "mig", "spec": spec }),
-    )
-    .await;
-    let mig_id: uuid::Uuid = serde_json::from_value(mig).unwrap();
-    migration_step(d, node, "start", json!({})).await;
+    // 만들고 시작(Task를 기다린다)
+    migration_ctl(d, &migrate).await;
+    let mig = d.ctl_json(&["network", "migration", "get", "mig"]).await;
+    let mig_id: uuid::Uuid = mig["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(mig["status"]["phase"], "moved", "{mig}");
 
     // 다리: NB l2gateway 행, 노드 매핑과 veth
     let physnet = opl_types::sdn::migration_physnet(tag, mig_id);
@@ -3626,7 +3669,7 @@ async fn migration_section(d: &Daemon, tag: &str, node: &str) {
     );
 
     // QEMU VM 하나를 되돌린다: tap이 원래 브리지로(같은 QEMU), 주소를 놓는다.
-    migration_step(d, node, "rollback", json!({ "vms": [q_id] })).await;
+    migration_ctl(d, &["network", "migration", "rollback", "mig", "mig-q"]).await;
     assert_eq!(master(&tap), "oplmig0");
     assert!(
         !run("ovs-vsctl", &["list-ports", "br-int"])
@@ -3641,8 +3684,9 @@ async fn migration_section(d: &Daemon, tag: &str, node: &str) {
     assert!(ping_from("oplmiga", &[], "10.66.0.12"));
 
     // 끝내기: 다리(NB 행·매핑·veth·OVS 브리지)가 걷힌다.
-    let task = migration_step(d, node, "finish", json!({})).await;
-    eprintln!("finish: {task}");
+    migration_ctl(d, &["network", "migration", "finish", "mig"]).await;
+    let mig = d.ctl_json(&["network", "migration", "get", "mig"]).await;
+    assert_eq!(mig["status"]["phase"], "finished", "{mig}");
     wait_for("the migration bridge to go", AGENT_WAIT, || async {
         !nb_rows(d, tag).await.ports.iter().any(|p| p.name == l2gw)
             && !ovs_id("ovn-bridge-mappings").contains(&physnet)

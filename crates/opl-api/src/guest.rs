@@ -135,6 +135,20 @@ async fn ask(
     }
 }
 
+/// 켜진 VM의 게스트 정보(캐시 — 지금 묻지 않음). 꺼졌거나 채널이 없거나 답하지 않으면 None(계획 67 §9.2 옮기기 계획의
+/// 주소 출처 `guest-agent`).
+pub(crate) async fn cached_info(state: &AppState, vm: &Vm) -> Option<opl_types::guest::GuestInfo> {
+    let node = running_node(vm)?;
+    if !has_channel(vm) {
+        return None;
+    }
+    let op = GuestAgentOp::Info { refresh: false };
+    match Box::pin(ask(state, vm, node, op, GUEST_READ_TIMEOUT)).await {
+        Ok(Some(response)) => response.info,
+        _ => None,
+    }
+}
+
 /// 답하지 못한 이유를 게스트 정보 상태로 바꾼다.
 fn info_state(e: &GuestAgentError) -> GuestInfoState {
     match e {

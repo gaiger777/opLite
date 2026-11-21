@@ -743,6 +743,154 @@ pub(crate) async fn node_sdn(
     Ok(())
 }
 
+/// `network topology`의 글: 라우터마다 바깥·인터페이스 네트워크와 그 VM·부하 분산기, 라우터 없는 네트워크는 뒤에
+fn topology_lines(t: &Value) -> Vec<String> {
+    let networks = arr(&t["networks"]);
+    let vms = arr(&t["vms"]);
+    let lbs = arr(&t["load_balancers"]);
+    let fips = arr(&t["floating_ips"]);
+    let net_name = |id: &Value| {
+        networks
+            .iter()
+            .find(|n| n["id"] == *id || n["name"] == *id)
+            .map_or_else(|| cell(id), |n| cell(&n["name"]))
+    };
+    let vm_name = |id: &Value| {
+        vms.iter()
+            .find(|v| v["id"] == *id)
+            .map_or_else(|| cell(id), |v| cell(&v["name"]))
+    };
+    let network_lines = |n: &Value, indent: &str, out: &mut Vec<String>| {
+        let cidrs: Vec<String> = arr(&n["cidrs"]).iter().map(cell).collect();
+        let mut line = format!("{indent}network {} ({}", cell(&n["name"]), cell(&n["kind"]));
+        if !cidrs.is_empty() {
+            line.push_str(&format!(", {}", cidrs.join(" ")));
+        }
+        line.push(')');
+        if let Some(m) = n["migration"].as_str() {
+            line.push_str(&format!(" migrating: {m}"));
+        }
+        out.push(line);
+        for l in lbs
+            .iter()
+            .filter(|l| net_name(&l["network"]) == cell(&n["name"]))
+        {
+            let members: Vec<String> = arr(&l["members"])
+                .iter()
+                .map(|m| {
+                    let who = if m["vm"].is_null() {
+                        cell(&m["ip"])
+                    } else {
+                        vm_name(&m["vm"])
+                    };
+                    format!("{who} {}", cell(&m["health"]))
+                })
+                .collect();
+            let mut line = format!("{indent}  lb {} vip {}", cell(&l["name"]), cell(&l["vip"]));
+            if let Some(e) = l["external_ip"].as_str() {
+                line.push_str(&format!(" external {e}"));
+            }
+            if !members.is_empty() {
+                line.push_str(&format!(" → {}", members.join(", ")));
+            }
+            out.push(line);
+        }
+        for v in &vms {
+            for nic in arr(&v["nics"]) {
+                if net_name(&nic["network"]) != cell(&n["name"]) {
+                    continue;
+                }
+                let mut line = format!(
+                    "{indent}  vm {} ({}) {}",
+                    cell(&v["name"]),
+                    cell(&v["power"]),
+                    arr(&nic["ips"])
+                        .iter()
+                        .map(cell)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                for f in fips.iter().filter(|f| f["vm"] == v["id"]) {
+                    line.push_str(&format!(" fip {}", cell(&f["address"])));
+                }
+                out.push(line.trim_end().to_string());
+            }
+        }
+    };
+    let mut out = Vec::new();
+    let mut routed = std::collections::BTreeSet::new();
+    for r in arr(&t["routers"]) {
+        let g = &r["gateway"];
+        let mut line = format!("router {} (gateway {}", cell(&r["name"]), cell(&g["state"]));
+        if let Some(node) = g["node"].as_str().filter(|n| !n.is_empty()) {
+            line.push_str(&format!(" on {node}"));
+        }
+        line.push(')');
+        if r["external"].is_object() {
+            let ips: Vec<String> = arr(&r["external"]["ips"]).iter().map(cell).collect();
+            line.push_str(&format!(
+                " → {} {}",
+                net_name(&r["external"]["network"]),
+                ips.join(",")
+            ));
+        }
+        out.push(line);
+        for i in arr(&r["interfaces"]) {
+            if let Some(n) = networks.iter().find(|n| n["id"] == i || n["name"] == i) {
+                routed.insert(cell(&n["name"]));
+                network_lines(n, "  ", &mut out);
+            }
+        }
+    }
+    for n in networks
+        .iter()
+        .filter(|n| !routed.contains(&cell(&n["name"])))
+    {
+        network_lines(n, "", &mut out);
+    }
+    let hidden = &t["hidden"];
+    let parts: Vec<String> = [
+        "networks",
+        "routers",
+        "load_balancers",
+        "floating_ips",
+        "vms",
+    ]
+    .iter()
+    .filter_map(|k| {
+        let n = hidden[*k].as_u64().unwrap_or(0);
+        (n > 0).then(|| format!("{n} {}", k.replace('_', " ")))
+    })
+    .collect();
+    if !parts.is_empty() {
+        out.push(format!("not shown (no permission): {}", parts.join(", ")));
+    }
+    out
+}
+
+/// `network topology [--folder F]`
+pub(crate) async fn topology(
+    client: &Client,
+    folder: Option<&str>,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let mut path = "/network-topology".to_string();
+    if let Some(f) = folder
+        && let Some(id) = crate::access::resolve_folder(client, "network", f).await?
+    {
+        path.push_str(&format!("?folder={id}"));
+    }
+    let t = client.get(&path).await?;
+    if json_out {
+        return Ok(print_json(out, &t)?);
+    }
+    for line in topology_lines(&t) {
+        writeln!(out, "{line}")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -846,5 +994,35 @@ mod tests {
             "sdn: physnets ext=vmbr1 (ready); gateway priority 100"
         );
         assert_eq!(node_sdn_line(&json!({ "spec": {}, "status": {} })), None);
+    }
+
+    #[test]
+    fn topology_groups_networks_under_routers() {
+        let t = json!({
+            "networks": [
+                { "id": "n1", "name": "t1", "kind": "sdn", "cidrs": ["10.10.0.0/24"] },
+                { "id": "n2", "name": "lan", "kind": "bridge", "cidrs": [], "migration": "lan-to-t1" }
+            ],
+            "routers": [{ "id": "r1", "name": "r1", "interfaces": ["n1"],
+                "external": { "network": "ext", "ips": ["203.0.113.5"] },
+                "gateway": { "node": "n2", "state": "active" } }],
+            "load_balancers": [{ "id": "l1", "name": "web", "network": "n1", "vip": "10.10.0.50",
+                "members": [{ "vm": "v1", "ip": "10.10.0.11", "health": "online" }] }],
+            "floating_ips": [{ "id": "f1", "address": "203.0.113.9", "network": "ext", "vm": "v1", "state": "distributed" }],
+            "vms": [{ "id": "v1", "name": "web1", "power": "running",
+                "nics": [{ "network": "n1", "ips": ["10.10.0.11"] }] }],
+            "hidden": { "vms": 2 }
+        });
+        assert_eq!(
+            topology_lines(&t),
+            [
+                "router r1 (gateway active on n2) → ext 203.0.113.5",
+                "  network t1 (sdn, 10.10.0.0/24)",
+                "    lb web vip 10.10.0.50 → web1 online",
+                "    vm web1 (running) 10.10.0.11 fip 203.0.113.9",
+                "network lan (bridge) migrating: lan-to-t1",
+                "not shown (no permission): 2 vms",
+            ]
+        );
     }
 }

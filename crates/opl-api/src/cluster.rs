@@ -815,6 +815,10 @@ pub async fn delete_node(
     if let Some(departed) = stray {
         warnings.extend(crate::sdn::kick_departed(&state, departed).await);
     }
+    // 옮기기 다리 노드였으면 그 옮기기를 멈춘다(계획 67 §13 — 다른 다리 노드로 이어 간다).
+    warnings.extend(
+        crate::tasks::network_migrate::drop_bridge_node(&state.cluster, node.id, &node.name).await,
+    );
     tracing::info!(node = %node.name, "node removed from the cluster");
     if warnings.is_empty() {
         return Ok(StatusCode::NO_CONTENT.into_response());

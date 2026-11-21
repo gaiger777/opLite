@@ -127,6 +127,23 @@ impl NicPolicy {
     }
 }
 
+impl NicPolicy {
+    /// 이 NIC로 **들어오는** `protocol`·목적지 포트 `port`·출발 주소 `src`의 패킷을 받는지(처음 맞는 `in` 규칙, 맞는
+    /// 것이 없으면 막음). 그룹이 없는 NIC는 거르지 않으므로 부르는 쪽이 먼저 본다. 부하 분산기의 보안 그룹 경고(계획 67
+    /// §7.3)가 쓴다.
+    pub fn admits_in(&self, protocol: Protocol, port: u16, src: IpAddr) -> bool {
+        self.rules
+            .iter()
+            .filter(|r| r.direction == Direction::In)
+            .find(|r| {
+                r.protocol.is_none_or(|p| p == protocol)
+                    && r.ports.is_none_or(|p| (p.start..=p.end).contains(&port))
+                    && r.remote.is_none_or(|c| c.contains(src))
+            })
+            .is_some_and(|r| r.action == Action::Accept)
+    }
+}
+
 /// NIC의 그룹 이름 목록 `nic_groups`를 클러스터의 그룹 `groups`로 펼친다([`NicPolicy`]).
 pub fn nic_policy(nic_groups: &[String], groups: &[SecurityGroup]) -> NicPolicy {
     let mut policy = NicPolicy {
@@ -723,6 +740,31 @@ mod tests {
     }
 
     /// 계획 66: NIC의 그룹 순서 → 그룹 안 순서로 펼치고, 없는 그룹이 있으면 끝에 나가기 막기. 열쇠는 같은 뜻끼리 같다.
+    #[test]
+    fn admits_in_follows_the_first_matching_in_rule() {
+        let rule = |s: serde_json::Value| -> Rule { serde_json::from_value(s).unwrap() };
+        let policy = NicPolicy {
+            groups: Vec::new(),
+            missing: Vec::new(),
+            rules: vec![
+                rule(serde_json::json!({ "direction": "out", "action": "accept" })),
+                rule(serde_json::json!({
+                    "direction": "in", "action": "drop", "protocol": "tcp", "ports": "80",
+                    "remote": "10.0.0.9/32"
+                })),
+                rule(serde_json::json!({
+                    "direction": "in", "action": "accept", "protocol": "tcp", "ports": "80-90"
+                })),
+            ],
+        };
+        let ip = |s: &str| s.parse().unwrap();
+        assert!(policy.admits_in(Protocol::Tcp, 80, ip("10.0.0.5")));
+        assert!(!policy.admits_in(Protocol::Tcp, 80, ip("10.0.0.9")));
+        assert!(policy.admits_in(Protocol::Tcp, 85, ip("10.0.0.9")));
+        assert!(!policy.admits_in(Protocol::Udp, 80, ip("10.0.0.5")));
+        assert!(!policy.admits_in(Protocol::Tcp, 22, ip("10.0.0.5")));
+    }
+
     #[test]
     fn nic_policy_expands_groups_in_nic_order() {
         let ssh = rule(

@@ -257,9 +257,15 @@ pub(crate) struct QuotaArgs {
     /// 라우터 수 상한(네트워크 폴더, `none`은 지우기)
     #[arg(long, value_name = "N|none")]
     routers: Option<String>,
-    /// 유동 IP 수 상한(네트워크 폴더, `none`은 지우기)
+    /// 유동 IP 수 상한(네트워크 폴더, 부하 분산기의 바깥 VIP도 센다, `none`은 지우기)
     #[arg(long, value_name = "N|none")]
     floating_ips: Option<String>,
+    /// 네트워크 수 상한(네트워크 폴더 — 하위 트리, `none`은 지우기)
+    #[arg(long, value_name = "N|none")]
+    networks: Option<String>,
+    /// 부하 분산기 수 상한(네트워크 폴더, `none`은 지우기)
+    #[arg(long, value_name = "N|none")]
+    load_balancers: Option<String>,
 }
 
 impl QuotaArgs {
@@ -271,12 +277,14 @@ impl QuotaArgs {
             && self.dedicated_vcpus.is_none()
             && self.routers.is_none()
             && self.floating_ips.is_none()
+            && self.networks.is_none()
+            && self.load_balancers.is_none()
     }
 
     /// 지금 할당량(`null`이면 없음)에 준 차원을 덮은 새 할당량
     fn apply(&self, current: &Value) -> anyhow::Result<Value> {
         let mut q: Map<String, Value> = current.as_object().cloned().unwrap_or_default();
-        let dims: [(&str, &Option<String>, ParseFn); 7] = [
+        let dims: [(&str, &Option<String>, ParseFn); 9] = [
             ("vcpus", &self.vcpus, parse_count),
             ("memory_mib", &self.memory, parse_mib),
             ("disk_bytes", &self.disk, parse_size),
@@ -284,6 +292,8 @@ impl QuotaArgs {
             ("dedicated_vcpus", &self.dedicated_vcpus, parse_count),
             ("routers", &self.routers, parse_count),
             ("floating_ips", &self.floating_ips, parse_count),
+            ("networks", &self.networks, parse_count),
+            ("load_balancers", &self.load_balancers, parse_count),
         ];
         for (key, value, parse) in dims {
             match value.as_deref() {
@@ -345,6 +355,12 @@ fn quota_text(q: &Value) -> String {
     }
     if let Some(n) = q["floating_ips"].as_u64() {
         parts.push(format!("{n} floating IPs"));
+    }
+    if let Some(n) = q["networks"].as_u64() {
+        parts.push(format!("{n} networks"));
+    }
+    if let Some(n) = q["load_balancers"].as_u64() {
+        parts.push(format!("{n} load balancers"));
     }
     if parts.is_empty() {
         "-".into()
@@ -431,7 +447,7 @@ pub(crate) enum QuotaCmd {
     Set {
         folder: String,
         #[command(flatten)]
-        quota: QuotaArgs,
+        quota: Box<QuotaArgs>,
     },
     /// 할당량을 지운다.
     Clear { folder: String },
@@ -440,16 +456,19 @@ pub(crate) enum QuotaCmd {
 /// 리소스 항목 `vm/web`의 (API 종류, 트리, 이름)
 fn member_item(s: &str) -> anyhow::Result<(&'static str, &'static str, &str)> {
     let (kind, key) = s.split_once('/').with_context(|| {
-        format!("expected KIND/NAME (vm/web, network/lan, router/r1, fip/f1, storage-pool/fast), got {s:?}")
+        format!("expected KIND/NAME (vm/web, network/lan, router/r1, fip/f1, lb/web, network-migration/m1, storage-pool/fast), got {s:?}")
     })?;
     let (api, tree) = match kind {
         "vm" => ("vm", "vm"),
         "network" => ("network", "network"),
         "router" => ("router", "network"),
         "floating-ip" | "fip" => ("floating-ip", "network"),
+        "load-balancer" | "lb" => ("load-balancer", "network"),
+        "network-migration" => ("network-migration", "network"),
         "storage-pool" | "pool" => ("storage-pool", "storage"),
         _ => bail!(
-            "unknown kind {kind:?} in {s:?}; use vm, network, router, floating-ip or storage-pool"
+            "unknown kind {kind:?} in {s:?}; use vm, network, router, floating-ip, load-balancer, \
+             network-migration or storage-pool"
         ),
     };
     if key.is_empty() {
@@ -502,6 +521,8 @@ fn usage_lines(view: &Value) -> Vec<String> {
         ("dedicated_vcpus", "dedicated vCPUs"),
         ("routers", "routers"),
         ("floating_ips", "floating IPs"),
+        ("networks", "networks"),
+        ("load_balancers", "load balancers"),
     ];
     let paths: BTreeMap<String, String> = view["limits"]
         .as_array()
@@ -518,8 +539,10 @@ fn usage_lines(view: &Value) -> Vec<String> {
             }
         };
         // 전용 vCPU(계획 64)·라우터·유동 IP(계획 66)는 쓰거나 할당량이 있을 때만(지금 출력 그대로)
-        if matches!(key, "dedicated_vcpus" | "routers" | "floating_ips")
-            && usage[key].is_null()
+        if matches!(
+            key,
+            "dedicated_vcpus" | "routers" | "floating_ips" | "networks" | "load_balancers"
+        ) && usage[key].is_null()
             && view["binding"][key].is_null()
         {
             continue;
@@ -647,8 +670,8 @@ pub(crate) async fn folder(
                 QuotaCmd::Set { folder, quota } => {
                     if quota.is_empty() {
                         bail!(
-                            "give --vcpus, --memory, --disk or --vms (VM folder), or --routers or \
-                             --floating-ips (network folder)"
+                            "give --vcpus, --memory, --disk or --vms (VM folder), or --routers, \
+                             --floating-ips, --networks or --load-balancers (network folder)"
                         );
                     }
                     (folder, Some(quota))
@@ -782,6 +805,7 @@ pub(crate) async fn grant_target(client: &Client, s: &str) -> anyhow::Result<Val
         "network" => "networks",
         "router" => "routers",
         "floating-ip" => "floating-ips",
+        "load-balancer" => "load-balancers",
         _ => "storage-pools",
     };
     let obj = client.get(&format!("/{path}/{}", seg(key))).await?;
@@ -800,16 +824,18 @@ fn folder_arg(s: &str) -> Option<&str> {
 /// 객체 인자 `vm/web`의 (API 종류, 이름)
 fn object_arg(s: &str) -> anyhow::Result<(&'static str, &str)> {
     let (kind, key) = s.split_once('/').with_context(|| {
-        format!("expected root, a folder (/teamA), vm/NAME, network/NAME, router/NAME, floating-ip/NAME or storage-pool/NAME, got {s:?}")
+        format!("expected root, a folder (/teamA), vm/NAME, network/NAME, router/NAME, floating-ip/NAME, load-balancer/NAME or storage-pool/NAME, got {s:?}")
     })?;
     let kind = match kind {
         "vm" => "vm",
         "network" => "network",
         "router" => "router",
         "floating-ip" | "fip" => "floating-ip",
+        "load-balancer" | "lb" => "load-balancer",
         "storage-pool" | "pool" => "storage-pool",
         _ => bail!(
-            "unknown kind {kind:?} in {s:?}; use folder, vm, network, router, floating-ip or storage-pool"
+            "unknown kind {kind:?} in {s:?}; use folder, vm, network, router, floating-ip, load-balancer \
+             or storage-pool"
         ),
     };
     if key.is_empty() {
@@ -901,6 +927,7 @@ impl Names {
             ("storage-pool", "/storage-pools"),
             ("router", "/routers?live=false"),
             ("floating-ip", "/floating-ips"),
+            ("load-balancer", "/load-balancers?live=false"),
         ] {
             if grants.iter().any(|g| g["spec"]["target"]["kind"] == kind) {
                 objects.push((kind, list(path).await));
@@ -1639,6 +1666,8 @@ mod tests {
             dedicated_vcpus: Some("8".into()),
             routers: None,
             floating_ips: None,
+            networks: None,
+            load_balancers: None,
         };
         let merged = q.apply(&json!({ "vcpus": 32, "vms": 2 })).unwrap();
         assert_eq!(

@@ -556,6 +556,142 @@ pub struct SdnInitRequest {
 pub struct SdnLockdownRequest {
     /// 켜기(참)·끄기(거짓)
     pub enabled: bool,
+    /// 허용 집합 밖에서 중앙에 붙어 있는 상대가 있어도 켠다(§10.4 — 그 상대는 끊긴다).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub force: bool,
+}
+
+/// 중앙에 붙어 있지만 허용 집합 밖인 상대(잠그면 끊긴다 — NAT·다른 출발 주소로 붙은 멤버 노드일 수 있다)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LockdownPeer {
+    /// 그 상대가 붙은 중앙 노드 이름
+    pub central: String,
+    #[cfg_attr(feature = "openapi", schema(value_type = String, format = "ip"))]
+    pub peer: IpAddr,
+}
+
+/// `POST /sdn/lockdown?dry_run=true`(§10.4 미리 확인): 허용 집합과 그 밖에서 붙어 있는 상대
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LockdownCheck {
+    pub enabled: bool,
+    /// 멤버 집합(NB 6641·SB 역할 6642를 받는 출발 주소)
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub members: Vec<IpAddr>,
+    /// 중앙 집합(Raft·SB 특권 포트)
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub centrals: Vec<IpAddr>,
+    /// 지금 중앙 6641·6642에 붙은 상대 가운데 멤버 집합 밖인 것(중앙이 알린 `NodeSdn.peers`)
+    pub outside: Vec<LockdownPeer>,
+    /// 켜기가 막힌다(`outside`가 있고 `force`가 아님)
+    pub blocked: bool,
+}
+
+/// 잠금을 켜면 끊길 상대: 중앙이 알린 6641·6642 상대(`NodeSdn.peers`) 가운데 멤버 집합 밖(루프백 `127.0.0.1`·`::1`은
+/// 늘 받으므로 뺀다). 중앙 이름 순.
+pub fn lockdown_outside(nodes: &[Node], sdn: &Sdn) -> Vec<LockdownPeer> {
+    let sets = allow_sets(nodes, sdn);
+    let mut out = Vec::new();
+    for c in &sdn.status.centrals {
+        let Some(n) = nodes.iter().find(|n| n.id == c.node) else {
+            continue;
+        };
+        for p in n.status.sdn.iter().flat_map(|s| s.peers.iter()) {
+            let p = p.to_canonical();
+            if p.is_loopback() || sets.members.contains(&p) {
+                continue;
+            }
+            out.push(LockdownPeer {
+                central: n.name.clone(),
+                peer: p,
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.central, a.peer).cmp(&(&b.central, b.peer)));
+    out.dedup();
+    out
+}
+
+/// `GET /sdn`의 잠금(§10.5): 켜졌는지, 바꾼 중앙, 허용 집합, 표를 거는 노드마다의 상태
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LockdownView {
+    /// 원하는 상태(`SdnSpec.lockdown`)
+    pub enabled: bool,
+    /// SB를 원하는 모양으로 바꾼 중앙
+    pub applied: Vec<Uuid>,
+    /// 중앙을 바꾸는 중이다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub pending: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub members: Vec<IpAddr>,
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>))]
+    pub centrals: Vec<IpAddr>,
+    /// 허용 목록 표를 거는 노드(중앙과 구성된 chassis, 이름 순)
+    pub nodes: Vec<LockdownNodeView>,
+}
+
+/// 노드 하나의 허용 목록 표
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct LockdownNodeView {
+    pub node: Uuid,
+    pub name: String,
+    /// 표가 원하는 집합과 맞다(알리지 않았으면 거짓).
+    pub firewall: bool,
+    /// 표의 허용 주소 수
+    pub allowed: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
+}
+
+impl LockdownView {
+    /// 잠금을 켠 적이 없으면(`spec.lockdown` 거짓이고 상태 없음) None
+    pub fn new(sdn: &Sdn, nodes: &[Node]) -> Option<Self> {
+        if !sdn.spec.lockdown && sdn.status.lockdown.is_none() {
+            return None;
+        }
+        let state = sdn.status.lockdown.clone().unwrap_or_default();
+        let sets = allow_sets(nodes, sdn);
+        let mut views: Vec<LockdownNodeView> = nodes
+            .iter()
+            .filter(|n| !n.spec.witness && n.status.hypervisor != "qemu-hvf")
+            .filter(|n| {
+                sdn.status.centrals.iter().any(|c| c.node == n.id)
+                    || n.status
+                        .sdn
+                        .as_ref()
+                        .is_some_and(|s| s.lockdown.is_some() || s.chassis != ChassisState::Missing)
+            })
+            .map(|n| {
+                let l = n.status.sdn.as_ref().and_then(|s| s.lockdown.clone());
+                LockdownNodeView {
+                    node: n.id,
+                    name: n.name.clone(),
+                    firewall: l.as_ref().is_some_and(|l| l.firewall),
+                    allowed: l.as_ref().map_or(0, |l| l.allowed),
+                    error: l.and_then(|l| l.error),
+                }
+            })
+            .collect();
+        views.sort_by(|a, b| a.name.cmp(&b.name));
+        Some(LockdownView {
+            enabled: sdn.spec.lockdown,
+            applied: state.applied,
+            pending: state.pending,
+            error: state.error,
+            members: sets.members,
+            centrals: sets.centrals,
+            nodes: views,
+        })
+    }
 }
 
 /// `POST /sdn/centrals`
@@ -622,6 +758,10 @@ pub struct SdnView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub strays: Vec<SdnStrayView>,
+    /// OVN 접근 잠금(계획 67 §10.5). 켠 적이 없으면 없다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub lockdown: Option<LockdownView>,
 }
 
 /// 중앙 목록 밖의 OVN Raft 멤버(일 수 있는 노드)
@@ -726,6 +866,7 @@ impl SdnView {
             chassis,
             tasks,
             strays,
+            lockdown: sdn.and_then(|s| LockdownView::new(s, nodes)),
         }
     }
 }

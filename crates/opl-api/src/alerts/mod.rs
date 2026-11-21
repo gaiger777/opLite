@@ -57,12 +57,9 @@ const DEFAULT_HISTORY_RANGE_MS: i64 = 24 * 3600 * 1000;
 /// 기능(409, 검증보다 먼저), 형식(400), 대상이 있는지(400)
 fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     require_feature(&state.cluster, NOTIFICATIONS)?;
-    // SDN 조건(계획 67)은 API 스테이지 전까지 받지 않는다.
+    // SDN 조건(계획 67 §11)은 옛 노드가 풀지 못한다.
     if spec.condition.is_sdn() {
-        return Err(crate::sdn::services_not_yet(
-            &state.cluster,
-            "SDN alert conditions",
-        ));
+        require_feature(&state.cluster, opl_types::node::SDN_SERVICES)?;
     }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;

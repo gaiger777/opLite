@@ -312,6 +312,20 @@ pub(crate) async fn drop_orphans(cluster: &Cluster) -> usize {
                 .iter()
                 .map(|f| (Kind::FloatingIp, f.id)),
         );
+        objects.extend(
+            cluster
+                .list::<opl_types::load_balancer::LoadBalancerSpec>()?
+                .1
+                .iter()
+                .map(|l| (Kind::LoadBalancer, l.id)),
+        );
+        objects.extend(
+            cluster
+                .list::<opl_types::network_migration::NetworkMigrationSpec>()?
+                .1
+                .iter()
+                .map(|m| (Kind::NetworkMigration, m.id)),
+        );
         Ok::<_, opl_cluster::ClusterError>((users, groups, objects, grants))
     })();
     let Ok((users, groups, objects, grants)) = found else {
@@ -520,6 +534,14 @@ fn grant_target(state: &AppState, target: &GrantTarget) -> Result<Option<AuthzTa
                     .cluster
                     .get::<opl_types::floating_ip::FloatingIpSpec>(id)?
                     .map(|f| f.spec.folder),
+                Kind::LoadBalancer => state
+                    .cluster
+                    .get::<opl_types::load_balancer::LoadBalancerSpec>(id)?
+                    .map(|l| l.spec.folder),
+                Kind::NetworkMigration => state
+                    .cluster
+                    .get::<opl_types::network_migration::NetworkMigrationSpec>(id)?
+                    .map(|m| m.spec.folder),
                 _ => None,
             };
             folder.map(|folder| AuthzTarget::Object { kind, id, folder })
@@ -612,6 +634,14 @@ fn parse_grant_target(s: &str) -> Result<GrantTarget, ApiError> {
         },
         "floating-ip" => GrantTarget::Object {
             kind: Kind::FloatingIp,
+            id,
+        },
+        "load-balancer" => GrantTarget::Object {
+            kind: Kind::LoadBalancer,
+            id,
+        },
+        "network-migration" => GrantTarget::Object {
+            kind: Kind::NetworkMigration,
             id,
         },
         _ => return Err(ApiError::bad_request(format!("bad target {s:?}"))),
@@ -1053,6 +1083,8 @@ fn object_target(
         "storage-pool" => crate::authz_routes::Obj::StoragePool,
         "router" => crate::authz_routes::Obj::Router,
         "floating-ip" => crate::authz_routes::Obj::FloatingIp,
+        "load-balancer" => crate::authz_routes::Obj::LoadBalancer,
+        "network-migration" => crate::authz_routes::Obj::NetworkMigration,
         _ => return Err(ApiError::bad_request(format!("bad object {object:?}"))),
     };
     let found = crate::authz_routes::resolve(&state.cluster, obj, key)?

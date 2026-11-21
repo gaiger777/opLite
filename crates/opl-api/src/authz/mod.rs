@@ -160,7 +160,9 @@ object_in_folder!(
     Network,
     StoragePool,
     opl_types::router::Router,
-    opl_types::floating_ip::FloatingIp
+    opl_types::floating_ip::FloatingIp,
+    opl_types::load_balancer::LoadBalancer,
+    opl_types::network_migration::NetworkMigration
 );
 
 impl AuthzObject for Folder {

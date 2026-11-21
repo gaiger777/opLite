@@ -21,7 +21,7 @@ use opl_cluster::types::RawResource;
 use opl_types::authz::Privilege;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 19] = [
+const WATCHABLE: [Kind; 23] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
@@ -43,6 +43,12 @@ const WATCHABLE: [Kind; 19] = [
     Kind::AccessRole,
     Kind::Grant,
     Kind::Group,
+    // 계획 67: 네트워크 폴더의 라우터·유동 IP·부하 분산기·네트워크 옮기기(볼 수 있는 것만 — 폴더를 따른다). 라우터·부하
+    // 분산기 보기의 OVN 상태(게이트웨이 주인·멤버 건강)는 사건이 아니라 보기를 다시 읽어 얻는다.
+    Kind::Router,
+    Kind::FloatingIp,
+    Kind::LoadBalancer,
+    Kind::NetworkMigration,
 ];
 
 /// 이벤트마다 거르는 종류(폴더를 따르는 것과 grant). 나머지는 구독할 때 종류 단위로 루트에서 본다.
@@ -391,6 +397,14 @@ async fn stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 계획 67: 라우터·유동 IP·부하 분산기·네트워크 옮기기의 실시간 갱신(폴더를 따라 사건마다 거른다)
+    #[test]
+    fn sdn_objects_are_watchable_per_folder() {
+        let kinds = parse_kinds("router,floating-ip,load-balancer,network-migration").unwrap();
+        assert_eq!(kinds.len(), 4);
+        assert!(kinds.iter().all(|k| per_event(*k)));
+    }
 
     #[test]
     fn snapshots_are_watchable() {

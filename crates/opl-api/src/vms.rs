@@ -889,13 +889,64 @@ pub(crate) fn local_cdrom(vm: &Vm, inv: &Inventory) -> Option<String> {
     })
 }
 
-/// NIC `qos`(계획 67)는 API 스테이지 전까지 받지 않는다(`sdn::services_not_yet`).
+/// 감사의 NIC QoS 설명(계획 67 §8.3): 바뀐 NIC마다 `nic-qos 0 out=100 in=200 dscp=46`, 뺐으면 `nic-qos 0 clear`
+pub(crate) fn qos_notes(spec: &VmSpec, before: Option<&VmSpec>) -> Vec<String> {
+    let old = |i: usize| before.and_then(|b| b.nics.get(i)).and_then(|n| n.qos);
+    let mut out = Vec::new();
+    for (i, nic) in spec.nics.iter().enumerate() {
+        if nic.qos == old(i) {
+            continue;
+        }
+        let Some(q) = nic.qos else {
+            out.push(format!("nic-qos {i} clear"));
+            continue;
+        };
+        let mut parts = vec![format!("nic-qos {i}")];
+        for (k, v) in [
+            ("out", q.out_mbps),
+            ("in", q.in_mbps),
+            ("burst", q.burst_kbit),
+            ("dscp", q.dscp.map(u32::from)),
+        ] {
+            if let Some(v) = v {
+                parts.push(format!("{k}={v}"));
+            }
+        }
+        out.push(parts.join(" "));
+    }
+    out
+}
+
+/// NIC `qos`(계획 67 §8): 모든 노드가 `sdn-services`를 알아야 하고(409 `cluster_upgrading` — 옛 노드는 이 칸을 풀지
+/// 못한다), `user` 네트워크 NIC에는 tap이 없어 걸 수 없으며(400 `invalid_qos`), DSCP는 SDN NIC만(400 `qos_dscp_needs_sdn`
+/// — 단순 NIC는 tc 속도 제한뿐).
 pub(crate) fn check_nic_qos(state: &AppState, spec: &VmSpec) -> Result<(), ApiError> {
-    if spec.nics.iter().any(|n| n.qos.is_some()) {
-        return Err(crate::sdn::services_not_yet(
-            &state.cluster,
-            "NIC qos settings",
-        ));
+    if !spec.nics.iter().any(|n| n.qos.is_some()) {
+        return Ok(());
+    }
+    require_feature(&state.cluster, opl_types::node::SDN_SERVICES)?;
+    let (_, networks) = state.cluster.list::<NetworkSpec>()?;
+    for (i, nic) in spec.nics.iter().enumerate() {
+        let Some(qos) = &nic.qos else {
+            continue;
+        };
+        if nic.network == USER_NETWORK {
+            return Err(ApiError::bad_request(format!(
+                "nics[{i}]: the user network has no tap device; qos needs a bridge, VXLAN or SDN network"
+            ))
+            .with_code("invalid_qos"));
+        }
+        let sdn = networks
+            .iter()
+            .any(|n| n.name == nic.network && n.spec.is_sdn());
+        if qos.dscp.is_some() && !sdn {
+            return Err(ApiError::bad_request(format!(
+                "nics[{i}]: DSCP marking needs an SDN network; network {:?} only takes rate limits \
+                 (qos out_mbps/in_mbps)",
+                nic.network
+            ))
+            .with_code("qos_dscp_needs_sdn"));
+        }
     }
     Ok(())
 }
@@ -1104,6 +1155,7 @@ pub async fn create_vm(
     let notes: Vec<String> = crate::cpu::audit_cpu(&vm.spec.cpu, None, from.as_deref())
         .into_iter()
         .chain(opl_types::numa::audit(&vm.spec, None))
+        .chain(qos_notes(&vm.spec, None))
         .collect();
     if !notes.is_empty() {
         audit.detail(format!("vm create {} {}", vm.name, notes.join(" ")));
@@ -1268,6 +1320,7 @@ pub async fn update_vm(
     )
     .into_iter()
     .chain(opl_types::numa::audit(&vm.spec, before.as_ref()))
+    .chain(qos_notes(&vm.spec, before.as_ref()))
     .collect();
     if !notes.is_empty() {
         audit.detail(format!("vm set {} {}", vm.name, notes.join(" ")));

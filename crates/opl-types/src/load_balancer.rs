@@ -320,6 +320,21 @@ impl LoadBalancerSpec {
             .collect()
     }
 
+    /// 이 부하 분산기가 잡은 주소와 그 네트워크: 안 VIP, 바깥 VIP, 건강 검사 출발 주소(Raft `ip` 겹침 키와 같은 셋)
+    pub fn addresses(&self) -> Vec<(&str, Ipv4Addr)> {
+        let mut out = Vec::new();
+        if let Some(vip) = self.vip {
+            out.push((self.network.as_str(), vip));
+        }
+        if let Some(e) = &self.external
+            && let Some(ip) = e.ip
+        {
+            out.push((e.network.as_str(), ip));
+        }
+        out.extend(self.monitors.iter().map(|m| (m.network.as_str(), m.ip)));
+        out
+    }
+
     /// 멤버 네트워크 `network`의 건강 검사 출발 주소
     pub fn monitor_for(&self, network: &str) -> Option<Ipv4Addr> {
         self.monitors

@@ -765,6 +765,30 @@ mod migration_tests;
 mod routing_tests;
 #[cfg(test)]
 mod services_tests;
+
+#[cfg(test)]
+mod monitor_tests {
+    #[test]
+    fn service_monitor_rows_parse_with_empty_optionals() {
+        let row = serde_json::json!({
+            "ip": "10.10.0.11", "port": 80, "protocol": ["set", []],
+            "logical_port": "opl-x", "status": "offline"
+        });
+        let m = super::parse_monitor(row.as_object().unwrap()).unwrap();
+        assert_eq!(
+            (m.ip.as_str(), m.port, m.protocol.as_str()),
+            ("10.10.0.11", 80, "")
+        );
+        assert_eq!(m.status, "offline");
+        let row = serde_json::json!({ "ip": "10.10.0.11", "port": 80, "status": ["set", []] });
+        assert_eq!(
+            super::parse_monitor(row.as_object().unwrap())
+                .unwrap()
+                .status,
+            ""
+        );
+    }
+}
 #[cfg(test)]
 mod tests;
 
@@ -872,6 +896,62 @@ pub(crate) async fn read_hosting(
         .select(NB_DB, "Logical_Router_Port", conditions, &columns)
         .await?;
     Ok(nb::parse_hosting(&rows))
+}
+
+/// SB `Service_Monitor` 행 하나(부하 분산기 건강 검사 — 계획 67 §7.3)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MonitorState {
+    pub ip: String,
+    pub port: u16,
+    /// `tcp`·`udp`(비면 tcp)
+    pub protocol: String,
+    pub logical_port: String,
+    /// `online`·`offline`·`error`, 아직 없으면 빈 글
+    pub status: String,
+}
+
+/// API 노드가 SB `Service_Monitor`를 읽는다(부하 분산기 보기의 멤버 건강 — 계획 67 §7.3). 역할 포트로 읽기만 하므로
+/// 잠금 뒤에도 되고 팔로어도 쓴다(`leader_only = false`).
+pub(crate) async fn read_monitors(
+    config: &OvnSyncConfig,
+    centrals: &[(std::net::IpAddr, Option<String>)],
+) -> Result<Vec<MonitorState>, OvsdbError> {
+    let transport = match &config.transport {
+        OvnTransport::Tcp => Transport::Tcp,
+        OvnTransport::Tls { pki } => Transport::Tls(OvsdbTls::from_dir(pki)?),
+    };
+    let sb = OvsdbClient::connect_any(
+        &transport,
+        &OvnSyncer::endpoints(centrals, config.sb_port, None),
+        SB_DB,
+        false,
+        config.timeout,
+    )
+    .await?;
+    let rows = sb
+        .select(
+            SB_DB,
+            "Service_Monitor",
+            vec![],
+            &["ip", "port", "protocol", "logical_port", "status"],
+        )
+        .await?;
+    Ok(rows.iter().filter_map(parse_monitor).collect())
+}
+
+/// `Service_Monitor` 행 하나(빈 선택 칸은 OVSDB의 `["set", []]`)
+fn parse_monitor(row: &serde_json::Map<String, Value>) -> Option<MonitorState> {
+    let text = |k: &str| match row.get(k) {
+        Some(Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    Some(MonitorState {
+        ip: text("ip"),
+        port: u16::try_from(row.get("port")?.as_i64()?).ok()?,
+        protocol: text("protocol"),
+        logical_port: text("logical_port"),
+        status: text("status"),
+    })
 }
 
 /// SB의 논리 포트 → 바인딩한 chassis 이름

@@ -133,12 +133,9 @@ fn require_quota_feature(state: &AppState, quota: Option<&FolderQuota>) -> Resul
     if quota.is_some_and(|q| q.routers.is_some() || q.floating_ips.is_some()) {
         require_feature(&state.cluster, opl_types::node::SDN_ROUTING)?;
     }
-    // 네트워크·부하 분산기 수(계획 67)는 API 스테이지 전까지 받지 않는다.
+    // 네트워크·부하 분산기 수(계획 67)도 옛 노드가 풀지 못한다.
     if quota.is_some_and(|q| q.networks.is_some() || q.load_balancers.is_some()) {
-        return Err(crate::sdn::services_not_yet(
-            &state.cluster,
-            "networks and load_balancers quotas",
-        ));
+        require_feature(&state.cluster, opl_types::node::SDN_SERVICES)?;
     }
     Ok(())
 }
@@ -510,11 +507,19 @@ async fn move_one(
                 ()
             ))
         }
-        // 부하 분산기·네트워크 옮기기(계획 67)는 API 스테이지 전까지 옮기지 않는다.
-        Kind::LoadBalancer | Kind::NetworkMigration => Err(crate::sdn::services_not_yet(
-            &state.cluster,
-            "load balancers and network migrations",
-        )),
+        // 할당량 있는 폴더로 옮기면 Raft가 그 폴더의 부하 분산기 수(바깥 VIP는 유동 IP 수도)를 센다(계획 67).
+        Kind::LoadBalancer => {
+            move_resource!(
+                opl_types::load_balancer::LoadBalancerSpec,
+                |_: &_, _: &_| { Ok::<_, ApiError>(()) }
+            )
+        }
+        Kind::NetworkMigration => {
+            move_resource!(
+                opl_types::network_migration::NetworkMigrationSpec,
+                |_: &_, _: &_| Ok::<_, ApiError>(())
+            )
+        }
         _ => unreachable!("FolderKind::of"),
     }
 }

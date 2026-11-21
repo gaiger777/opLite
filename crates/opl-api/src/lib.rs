@@ -37,9 +37,11 @@ mod ipam;
 mod janitor;
 pub mod ldap;
 pub mod limit;
+mod load_balancers;
 mod metrics;
 mod metrics_history;
 mod migration_disks;
+mod network_migrations;
 mod node_fence;
 mod numa;
 pub mod oidc;
@@ -74,6 +76,7 @@ mod state;
 mod subscription;
 mod tasks;
 mod telemetry;
+mod topology;
 pub mod two_factor;
 mod updates;
 pub mod users;
@@ -117,10 +120,6 @@ pub use replica_receive::{IncomingReplicas, REPLICA_SWEEP_INTERVAL, ReplicaConfi
 pub use replication::{ReplicationScheduler, ReplicationSchedulerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
-/// 단순 → SDN 옮기기 엔진(계획 67 §9 — API는 스테이지 5, 그 전에는 시험 고리가 부른다)
-pub use tasks::network_migrate::{
-    create_migration, pause_migration, plan_migration, start_step as start_migration_step,
-};
 pub use tasks::sdn::update_sdn as update_sdn_status;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
 pub use telemetry::{TelemetryConfig, TelemetryReporter};
@@ -277,6 +276,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             sdn::patch_network
         ))
         .routes(routes!(sdn::network_ips))
+        .routes(routes!(topology::network_topology))
         .routes(routes!(routing::detach_network_router))
         .routes(routes!(routing::list_routers, routing::create_router))
         .routes(routes!(
@@ -293,6 +293,28 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
             routing::patch_floating_ip,
             routing::delete_floating_ip
         ))
+        .routes(routes!(
+            load_balancers::list_load_balancers,
+            load_balancers::create_load_balancer
+        ))
+        .routes(routes!(
+            load_balancers::get_load_balancer,
+            load_balancers::patch_load_balancer,
+            load_balancers::delete_load_balancer
+        ))
+        .routes(routes!(
+            network_migrations::list_network_migrations,
+            network_migrations::create_network_migration
+        ))
+        .routes(routes!(
+            network_migrations::get_network_migration,
+            network_migrations::delete_network_migration
+        ))
+        .routes(routes!(network_migrations::start_network_migration))
+        .routes(routes!(network_migrations::resume_network_migration))
+        .routes(routes!(network_migrations::pause_network_migration))
+        .routes(routes!(network_migrations::finish_network_migration))
+        .routes(routes!(network_migrations::rollback_network_migration))
         .routes(routes!(sdn::get_sdn, sdn::init_sdn))
         .routes(routes!(sdn::add_central))
         .routes(routes!(sdn::remove_central))

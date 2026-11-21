@@ -413,10 +413,10 @@ fn routers_and_floating_ips_hold_addresses() {
         serde_json::from_value(json!({ "network": "ext", "address": "203.0.113.3" })).unwrap(),
     );
     let (routers, fips) = (vec![r], vec![f]);
-    let all = held_ips(&routers, &fips, None);
+    let all = held_ips(&routers, &fips, &[], None);
     assert_eq!(all["ext"], [ip("203.0.113.2"), ip("203.0.113.3")].into());
     assert_eq!(
-        held_ips(&routers, &fips, Some(routers[0].id))["ext"],
+        held_ips(&routers, &fips, &[], Some(routers[0].id))["ext"],
         [ip("203.0.113.3")].into()
     );
 }

@@ -19,9 +19,9 @@ use opl_types::network::{Network, NetworkSpec, NetworkStatus, Subnet};
 use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::{Kind, Resource};
 use opl_types::sdn::{
-    MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest,
+    LockdownCheck, MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest,
     SdnLockdownRequest, SdnNodeRequest, SdnPending, SdnPhase, SdnSpec, SdnStatus, SdnView,
-    central_address,
+    allow_sets, central_address, lockdown_outside,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
@@ -228,16 +228,6 @@ pub(crate) fn check_node_sdn(
             format!("node sdn {} {}", node.name, parts.join(" "))
         }
     })
-}
-
-/// 계획 67 SDN 서비스의 새 칸·종류(NIC `qos`, SDN 경보 조건, 할당량 `networks`·`load_balancers`, 부하 분산기·네트워크
-/// 옮기기의 폴더 옮기기)는 API 스테이지(계획 67 스테이지 5) 전까지 쓰지 않는다: 옛 노드가 남았으면 409 `cluster_upgrading`(검증보다
-/// 먼저 — 옛 노드는 이 칸을 풀지 못한다), 아니면 400. 스테이지 5가 지운다.
-pub(crate) fn services_not_yet(cluster: &Cluster, what: &str) -> ApiError {
-    match require_feature(cluster, SDN_SERVICES) {
-        Err(e) => e,
-        Ok(()) => ApiError::bad_request(format!("{what} are not available yet (SDN services)")),
-    }
 }
 
 /// 요청 본문의 노드(이름이나 id). 없으면 400이다.
@@ -909,20 +899,59 @@ fn live_central(cluster: &Cluster, sdn: &Sdn, except: Uuid) -> Result<Option<Nod
 /// OVN 접근 잠금(계획 67 §10)을 켜거나 끄는 `sdn-lockdown` Task(202): `SdnSpec.lockdown`을 쓰고, 중앙마다의 SDN 에이전트가
 /// 하나씩(다른 중앙의 NB·SB가 정족수를 가졌을 때) SB를 역할 포트(6642 `ovn-controller`)·northd 전용 포트(6645)로 다시
 /// 띄운 뒤, 모든 중앙이 잠기면 chassis·중앙이 nftables 주소 허용 목록을 맞출 때까지 기다린다(끄기는 거꾸로). 같은 값을
-/// 다시 보내면 남은 일을 마저 기다린다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 준비되지 않았으면 409
-/// `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
+/// 다시 보내면 남은 일을 마저 기다린다. `dry_run`이면 바꾸지 않고 허용 집합과 그 밖에서 지금 중앙 6641·6642에 붙어 있는
+/// 상대(중앙이 알린 `ss` — NAT·다른 출발 주소로 붙은 노드를 미리 찾음)를 돌려준다(200). 켜기는 그런 상대가 있으면 409
+/// `lockdown_peers_outside`(`force`면 켠다 — 그 상대는 끊긴다). 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 준비되지
+/// 않았으면 409 `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
 #[utoipa::path(post, path = "/sdn/lockdown", tag = "sdn",
+    params(LockdownQuery),
     request_body = SdnLockdownRequest,
-    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>),
+        (status = 200, description = "The check only (dry_run)", body = LockdownCheck),
+        (status = "4XX", body = crate::error::ErrorBody)))]
 pub async fn set_lockdown(
     State(state): State<Arc<AppState>>,
     principal: Principal,
     audit: AuditNote,
+    Query(query): Query<LockdownQuery>,
     Json(req): Json<SdnLockdownRequest>,
-) -> Result<(StatusCode, Json<Task>), ApiError> {
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
     state.authorize(&principal, Action::Write, Kind::Sdn)?;
     require_feature(&state.cluster, SDN_SERVICES)?;
-    require_ready(&state.cluster)?;
+    let sdn = require_ready(&state.cluster)?;
+    let (_, nodes) = state.cluster.list::<NodeSpec>()?;
+    let outside = if req.enabled {
+        lockdown_outside(&nodes, &sdn)
+    } else {
+        Vec::new()
+    };
+    if query.dry_run {
+        let sets = allow_sets(&nodes, &sdn);
+        return Ok(Json(LockdownCheck {
+            enabled: req.enabled,
+            members: sets.members,
+            centrals: sets.centrals,
+            blocked: !outside.is_empty() && !req.force,
+            outside,
+        })
+        .into_response());
+    }
+    if !outside.is_empty() && !req.force {
+        let list: Vec<String> = outside
+            .iter()
+            .map(|p| format!("{} on {}", p.peer, p.central))
+            .collect();
+        return Err(ApiError::conflict(
+            "lockdown_peers_outside",
+            format!(
+                "these peers are connected to OVN centrals from addresses outside the allowed set and would be cut \
+                 off: {}; they may be member nodes behind NAT or using another source address \
+                 (see `sdn lockdown on --dry-run`); use --force to lock down anyway",
+                list.join(", ")
+            ),
+        ));
+    }
     let check = |sdn: Option<&Sdn>| -> Result<(), ApiError> {
         match sdn {
             Some(sdn) if sdn.status.phase == SdnPhase::Ready => {
@@ -932,14 +961,29 @@ pub async fn set_lockdown(
         }
     };
     audit.detail(format!(
-        "sdn lockdown {}",
-        if req.enabled { "on" } else { "off" }
+        "sdn lockdown {}{}",
+        if req.enabled { "on" } else { "off" },
+        if req.force && !outside.is_empty() {
+            " --force"
+        } else {
+            ""
+        }
     ));
     let op = TaskOp::SdnLockdown {
         enabled: req.enabled,
     };
     let task = create_exclusive(&state, op, state.node, check, |_| {}).await?;
-    Ok((StatusCode::ACCEPTED, Json(task)))
+    Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+/// `POST /sdn/lockdown`의 질의
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+#[serde(deny_unknown_fields)]
+pub struct LockdownQuery {
+    /// 참이면 바꾸지 않고 허용 집합과 그 밖의 상대만 돌려준다(200).
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// 노드들(`nodes`, 또는 `all`이면 아직 준비된 chassis가 아닌 모든 온라인 Linux 노드)에 OVN chassis 꾸러미를 깔고 구성하는
@@ -1420,6 +1464,10 @@ pub enum AllocationKind {
     Router,
     /// 유동 IP(`vm`·`vm_name`은 유동 IP의 id·이름, 붙은 VM은 `target`)
     FloatingIp,
+    /// 부하 분산기의 VIP나 바깥 VIP(`vm`·`vm_name`은 부하 분산기의 id·이름 — 계획 67)
+    LbVip,
+    /// 부하 분산기의 건강 검사 출발 주소(`vm`·`vm_name`은 부하 분산기의 id·이름 — 계획 67 §7.3)
+    LbMonitor,
 }
 
 impl AllocationKind {
@@ -1666,6 +1714,53 @@ pub async fn network_ips(
             },
             sees,
         ));
+    }
+    // 부하 분산기의 VIP·바깥 VIP·건강 검사 주소(계획 67)
+    let (_, lbs) = state
+        .cluster
+        .list::<opl_types::load_balancer::LoadBalancerSpec>()?;
+    for l in &lbs {
+        let sees = state.authz.allows(
+            &principal,
+            opl_types::authz::Privilege::SystemRead,
+            crate::authz::AuthzObject::authz_target(l),
+        );
+        let vips: Vec<IpAddr> = l
+            .spec
+            .vip
+            .filter(|_| l.spec.network == network.name)
+            .into_iter()
+            .chain(
+                l.spec
+                    .external
+                    .as_ref()
+                    .filter(|e| e.network == network.name)
+                    .and_then(|e| e.ip),
+            )
+            .map(IpAddr::V4)
+            .collect();
+        let monitor = l.spec.monitor_for(&network.name).map(IpAddr::V4);
+        for (kind, ips) in [
+            (AllocationKind::LbVip, vips),
+            (AllocationKind::LbMonitor, monitor.into_iter().collect()),
+        ] {
+            if ips.is_empty() {
+                continue;
+            }
+            routing.push((
+                IpAllocation {
+                    kind,
+                    vm: l.id,
+                    vm_name: l.name.clone(),
+                    target: None,
+                    nic: 0,
+                    mac: None,
+                    ips,
+                    live: None,
+                },
+                sees,
+            ));
+        }
     }
     let subnets = network
         .spec

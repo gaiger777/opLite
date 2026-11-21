@@ -762,6 +762,8 @@ pub(crate) fn folder_kind(kind: Kind) -> bool {
             | Kind::Network
             | Kind::Router
             | Kind::FloatingIp
+            | Kind::LoadBalancer
+            | Kind::NetworkMigration
             | Kind::StoragePool
             | Kind::Task
             | Kind::Folder

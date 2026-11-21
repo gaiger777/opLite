@@ -17,7 +17,9 @@ use opl_types::authz_eval::AuthzTarget;
 use opl_types::backup::BackupSpec;
 use opl_types::floating_ip::FloatingIpSpec;
 use opl_types::folder::FolderSpec;
+use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::network::NetworkSpec;
+use opl_types::network_migration::NetworkMigrationSpec;
 use opl_types::resource::ResourceSpec;
 use opl_types::router::RouterSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
@@ -44,6 +46,8 @@ pub(crate) enum Obj {
     Folder,
     Router,
     FloatingIp,
+    LoadBalancer,
+    NetworkMigration,
 }
 
 /// 경로가 요구하는 것
@@ -213,6 +217,8 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     // SDN 네트워크의 서브넷 바꾸기와 주소 목록(계획 65): 그 네트워크의 `network.config`·읽기
     ("PATCH", "/networks/{key}", Object(Network, NetworkConfig)),
     ("GET", "/networks/{key}/ips", Read(Network)),
+    // 토폴로지(계획 67 §12): 읽을 수 있는 것만 그린다(핸들러)
+    ("GET", "/network-topology", List),
     // 내 네트워크를 남의 라우터에서 떼기(계획 66 리뷰 2 I-2): 그 네트워크의 `network.config`
     (
         "DELETE",
@@ -229,15 +235,62 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/floating-ips", List),
     ("POST", "/floating-ips", Handler),
     ("GET", "/floating-ips/{key}", Read(FloatingIp)),
-    (
-        "PATCH",
-        "/floating-ips/{key}",
-        Object(FloatingIp, NetworkConfig),
-    ),
+    // 바꾸기는 유동 IP의 `network.config`, 떼기만은 붙은 VM의 `vm.config`로도(계획 67 §13 — 핸들러)
+    ("PATCH", "/floating-ips/{key}", Handler),
     (
         "DELETE",
         "/floating-ips/{key}",
         Object(FloatingIp, NetworkConfig),
+    ),
+    // 부하 분산기(계획 67): 네트워크 폴더의 객체. 만들기는 폴더의 `network.config`와 VIP 네트워크의 `network.assign`,
+    // 멤버 VM의 `vm.config`(핸들러), 바꾸기·지우기는 그 객체의 `network.config`(새 멤버·네트워크는 핸들러)
+    ("GET", "/load-balancers", List),
+    ("POST", "/load-balancers", Handler),
+    ("GET", "/load-balancers/{key}", Read(LoadBalancer)),
+    (
+        "PATCH",
+        "/load-balancers/{key}",
+        Object(LoadBalancer, NetworkConfig),
+    ),
+    (
+        "DELETE",
+        "/load-balancers/{key}",
+        Object(LoadBalancer, NetworkConfig),
+    ),
+    // 단순 → SDN 옮기기(계획 67): 원본 네트워크 폴더의 객체. 만들기와 걸음은 원본의 `network.config`·대상의
+    // `network.assign`·VM마다 `vm.config`(핸들러), 걸음·지우기는 그 객체의 `network.config`도
+    ("GET", "/network-migrations", List),
+    ("POST", "/network-migrations", Handler),
+    ("GET", "/network-migrations/{key}", Read(NetworkMigration)),
+    (
+        "DELETE",
+        "/network-migrations/{key}",
+        Object(NetworkMigration, NetworkConfig),
+    ),
+    (
+        "POST",
+        "/network-migrations/{key}/start",
+        Object(NetworkMigration, NetworkConfig),
+    ),
+    (
+        "POST",
+        "/network-migrations/{key}/resume",
+        Object(NetworkMigration, NetworkConfig),
+    ),
+    (
+        "POST",
+        "/network-migrations/{key}/pause",
+        Object(NetworkMigration, NetworkConfig),
+    ),
+    (
+        "POST",
+        "/network-migrations/{key}/finish",
+        Object(NetworkMigration, NetworkConfig),
+    ),
+    (
+        "POST",
+        "/network-migrations/{key}/rollback",
+        Object(NetworkMigration, NetworkConfig),
     ),
     // SDN(OVN) 설치·구성(계획 65): 루트 객체
     ("GET", "/sdn", Root(ClusterRead)),
@@ -459,6 +512,14 @@ pub(crate) fn resolve(cluster: &Cluster, obj: Obj, key: &str) -> Result<Option<F
         FloatingIp => get::<FloatingIpSpec>(cluster, key)?.map(|f| Found {
             owned: object(crate::authz::AuthzObject::authz_target(&f)),
             missing: missing::<FloatingIpSpec>(key),
+        }),
+        LoadBalancer => get::<LoadBalancerSpec>(cluster, key)?.map(|l| Found {
+            owned: object(crate::authz::AuthzObject::authz_target(&l)),
+            missing: missing::<LoadBalancerSpec>(key),
+        }),
+        NetworkMigration => get::<NetworkMigrationSpec>(cluster, key)?.map(|m| Found {
+            owned: object(crate::authz::AuthzObject::authz_target(&m)),
+            missing: missing::<NetworkMigrationSpec>(key),
         }),
         StoragePool => get::<StoragePoolSpec>(cluster, key)?.map(|p| Found {
             owned: object(crate::authz::AuthzObject::authz_target(&p)),

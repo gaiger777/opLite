@@ -61,7 +61,7 @@ pub struct Owners {
     imports: std::collections::HashSet<Uuid>,
     /// 네트워크 id → 폴더
     networks: HashMap<Uuid, Option<Uuid>>,
-    /// 라우터·유동 IP id → (종류, 폴더) (계획 66 — 네트워크 폴더의 객체)
+    /// 라우터·유동 IP·부하 분산기·네트워크 옮기기 id → (종류, 폴더) (계획 66·67 — 네트워크 폴더의 객체)
     routing: HashMap<Uuid, (Kind, Option<Uuid>)>,
 }
 
@@ -83,6 +83,19 @@ impl Owners {
         }
         for f in cluster.list::<opl_types::floating_ip::FloatingIpSpec>()?.1 {
             o.routing.insert(f.id, (Kind::FloatingIp, f.spec.folder));
+        }
+        for l in cluster
+            .list::<opl_types::load_balancer::LoadBalancerSpec>()?
+            .1
+        {
+            o.routing.insert(l.id, (Kind::LoadBalancer, l.spec.folder));
+        }
+        for m in cluster
+            .list::<opl_types::network_migration::NetworkMigrationSpec>()?
+            .1
+        {
+            o.routing
+                .insert(m.id, (Kind::NetworkMigration, m.spec.folder));
         }
         for v in cluster.list::<VolumeSpec>()?.1 {
             o.volumes.insert(v.id, (v.name, v.spec.pool));
@@ -290,7 +303,9 @@ impl Owners {
             Kind::Vm => *self.vms.get(&id)?,
             Kind::Network => *self.networks.get(&id)?,
             Kind::StoragePool => self.pools.values().find(|(p, _)| *p == id)?.1,
-            Kind::Router | Kind::FloatingIp => self.routing.get(&id).filter(|(k, _)| *k == kind)?.1,
+            Kind::Router | Kind::FloatingIp | Kind::LoadBalancer | Kind::NetworkMigration => {
+                self.routing.get(&id).filter(|(k, _)| *k == kind)?.1
+            }
             _ => return None,
         };
         Some(AuthzTarget::Object { kind, id, folder })
@@ -316,7 +331,10 @@ impl Owners {
                     Kind::Network => {
                         self.networks.insert(id, folder_of(&resource.spec));
                     }
-                    Kind::Router | Kind::FloatingIp => {
+                    Kind::Router
+                    | Kind::FloatingIp
+                    | Kind::LoadBalancer
+                    | Kind::NetworkMigration => {
                         self.routing.insert(id, (*kind, folder_of(&resource.spec)));
                     }
                     Kind::StoragePool => {
@@ -357,7 +375,10 @@ impl Owners {
                     Kind::Network => {
                         self.networks.remove(&id);
                     }
-                    Kind::Router | Kind::FloatingIp => {
+                    Kind::Router
+                    | Kind::FloatingIp
+                    | Kind::LoadBalancer
+                    | Kind::NetworkMigration => {
                         self.routing.remove(&id);
                     }
                     Kind::StoragePool => {
@@ -389,13 +410,17 @@ impl Owners {
     ) -> Option<Owned> {
         let spec = &resource.spec;
         let target = match kind {
-            Kind::Vm | Kind::Network | Kind::StoragePool | Kind::Router | Kind::FloatingIp => {
-                AuthzTarget::Object {
-                    kind,
-                    id: resource.id,
-                    folder: folder_of(spec),
-                }
-            }
+            Kind::Vm
+            | Kind::Network
+            | Kind::StoragePool
+            | Kind::Router
+            | Kind::FloatingIp
+            | Kind::LoadBalancer
+            | Kind::NetworkMigration => AuthzTarget::Object {
+                kind,
+                id: resource.id,
+                folder: folder_of(spec),
+            },
             Kind::Volume => {
                 let pool = spec
                     .get("pool")

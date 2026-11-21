@@ -65,6 +65,9 @@ pub(crate) fn validation_error(e: ValidationError) -> ApiError {
     match e {
         ValidationError::Cpu(e) => cpu_error(e),
         ValidationError::Numa(e) => crate::numa::numa_error(e),
+        e @ ValidationError::NicQos(..) => {
+            ApiError::bad_request(e.to_string()).with_code("invalid_qos")
+        }
         e => ApiError::bad_request(e.to_string()),
     }
 }

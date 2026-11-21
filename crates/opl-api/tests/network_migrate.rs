@@ -5,7 +5,6 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,13 +134,22 @@ impl T {
             .unwrap()
     }
 
+    /// `POST /network-migrations`(스테이지 5 API)
     async fn create(&self, spec: Value) -> NetworkMigration {
-        let spec: NetworkMigrationSpec = serde_json::from_value(spec).unwrap();
-        let (m, _) =
-            opl_api::create_migration(&self.env.cluster, "m", spec, &BTreeMap::new(), &|_| true)
-                .await
-                .unwrap();
-        m
+        let (status, m) = self
+            .admin
+            .post("/network-migrations", json!({ "name": "m", "spec": spec }))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{m}");
+        assert!(m["plan"]["nics"].is_array(), "{m}");
+        self.migration(m["id"].as_str().unwrap().parse().unwrap())
+    }
+
+    /// `POST /network-migrations/{id}/{step}`
+    async fn post_step(&self, id: Uuid, step: &str, body: Value) -> (StatusCode, Value) {
+        self.admin
+            .post(&format!("/network-migrations/{id}/{step}"), body)
+            .await
     }
 
     /// 걸음 하나를 Task로 하고 끝난 Task(상태, 오류·경고)
@@ -152,17 +160,15 @@ impl T {
         vms: Vec<Uuid>,
         router: Option<&str>,
     ) -> (TaskState, Option<String>) {
-        let task = opl_api::start_migration_step(
-            &self.env.cluster,
-            id,
-            step,
-            vms,
-            router.map(str::to_string),
-            self.env.node,
-        )
-        .await
-        .unwrap();
-        self.wait_task(task.id).await
+        let (path, body) = match step {
+            MigrationStep::Start => ("start", json!({})),
+            MigrationStep::Rollback => ("rollback", json!({ "vms": vms })),
+            MigrationStep::Finish => ("finish", json!({ "router": router })),
+        };
+        let (status, task) = self.post_step(id, path, body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        self.wait_task(task["id"].as_str().unwrap().parse().unwrap())
+            .await
     }
 
     async fn wait_task(&self, id: Uuid) -> (TaskState, Option<String>) {
@@ -251,12 +257,14 @@ async fn offline_and_live_moves_rollback_and_finish() {
     assert_eq!(by(&m, b).mode, PlannedMode::Live);
     assert_eq!(by(&m, b).address_source, AddressSource::Given);
     // 같은 원본에 두 번째 옮기기는 Raft가 막는다.
-    let again: NetworkMigrationSpec =
-        serde_json::from_value(json!({ "source": "lan", "target": "t-lan" })).unwrap();
-    let err = opl_api::create_migration(&t.env.cluster, "m2", again, &BTreeMap::new(), &|_| true)
-        .await
-        .unwrap_err();
-    assert_eq!(err.status, StatusCode::CONFLICT, "{}", err.message);
+    let (status, err) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "name": "m2", "spec": { "source": "lan", "target": "t-lan" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
 
     let agent = t.bridge_agent(m.id);
     let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
@@ -334,23 +342,27 @@ async fn offline_and_live_moves_rollback_and_finish() {
         "{r1}"
     );
     // 끝낸 옮기기는 원본을 더 잡지 않는다(새 옮기기가 된다).
-    let again: NetworkMigrationSpec =
-        serde_json::from_value(json!({ "source": "lan", "target": "t-lan" })).unwrap();
-    opl_api::create_migration(&t.env.cluster, "m2", again, &BTreeMap::new(), &|_| true)
-        .await
-        .unwrap();
+    let (status, m2) = t
+        .admin
+        .post(
+            "/network-migrations?dry_run=true",
+            json!({ "name": "m2", "spec": { "source": "lan", "target": "t-lan" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{m2}");
+    assert!(m2["nics"].is_array(), "the dry run returns the plan: {m2}");
+    let (status, m2) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "name": "m2", "spec": { "source": "lan", "target": "t-lan" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{m2}");
     // 끝난 옮기기에 걸음은 409
-    let err = opl_api::start_migration_step(
-        &t.env.cluster,
-        m.id,
-        MigrationStep::Start,
-        vec![],
-        None,
-        t.env.node,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.code, "migration_finished");
+    let (status, err) = t.post_step(m.id, "start", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "migration_finished", "{err}");
     agent.abort();
 }
 
@@ -477,16 +489,14 @@ async fn an_interrupted_migration_task_resumes() {
         .await
         .unwrap();
     t.env.stop_runner().await;
-    let task = opl_api::start_migration_step(
-        &t.env.cluster,
-        m.id,
-        MigrationStep::Start,
-        vec![],
-        None,
-        t.env.node,
-    )
-    .await
-    .unwrap();
+    let (status, task) = t.post_step(m.id, "start", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = t
+        .env
+        .cluster
+        .get::<TaskSpec>(task["id"].as_str().unwrap().parse().unwrap())
+        .unwrap()
+        .unwrap();
     // 앞선 opld가 시작한 Task(실행 중으로 남음)
     let mut ts = task.status.clone();
     ts.state = TaskState::Running;
@@ -525,41 +535,118 @@ async fn steps_do_not_overlap() {
     let m = t
         .create(json!({ "source": "lan", "target": "t-lan", "bridge": false }))
         .await;
-    let err = opl_api::pause_migration(&t.env.cluster, m.id)
-        .await
-        .unwrap_err();
-    assert_eq!(err.code, "migration_not_running");
+    let (status, err) = t.post_step(m.id, "pause", json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(err["code"], "migration_not_running", "{err}");
     t.env.stop_runner().await;
-    opl_api::start_migration_step(
-        &t.env.cluster,
-        m.id,
-        MigrationStep::Start,
-        vec![],
-        None,
-        t.env.node,
-    )
-    .await
-    .unwrap();
-    let err = opl_api::start_migration_step(
-        &t.env.cluster,
-        m.id,
-        MigrationStep::Finish,
-        vec![],
-        None,
-        t.env.node,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.code, "migration_in_progress");
-    let err = opl_api::start_migration_step(
-        &t.env.cluster,
-        m.id,
-        MigrationStep::Rollback,
-        vec![Uuid::now_v7()],
-        None,
-        t.env.node,
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(err.code, "migration_in_progress");
+    let (status, task) = t.post_step(m.id, "start", json!({})).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    for (step, body) in [
+        ("finish", json!({})),
+        ("rollback", json!({})),
+        ("resume", json!({})),
+    ] {
+        let (status, err) = t.post_step(m.id, step, body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{step}");
+        assert_eq!(err["code"], "migration_in_progress", "{step}: {err}");
+    }
+    // 도는 옮기기는 지우지 못한다(먼저 멈춤).
+    let (status, err) = t.admin.delete("/network-migrations/m").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    // 옮기기에 없는 VM의 되돌리기는 400
+    let (status, err) = t
+        .post_step(m.id, "rollback", json!({ "vms": ["nope"] }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}
+
+/// 클러스터에서 지운 노드에 넣은 노드(오프라인) — 다리 노드 지우기 시험용
+async fn add_dead_node(env: &Env, name: &str) -> Uuid {
+    let mut r: Resource<NodeSpec, opl_types::node::NodeStatus> = Resource::new(
+        name,
+        NodeSpec {
+            sdn: None,
+            host_resources: None,
+            address: "127.0.0.9:1".into(),
+            maintenance: false,
+            witness: false,
+            roles: None,
+        },
+    );
+    r.status.version = Some(opl_types::version::BUILD.into());
+    r.status.features = opl_types::node::FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    env.cluster.create(&r).await.unwrap();
+    r.id
+}
+
+/// 계획 67 §13: 다리 노드를 클러스터에서 지우면 옮기기는 `paused`(까닭)가 되고 다리 기록이 지워진다. `resume`에
+/// `bridge_node`를 주면 그 노드로 다리를 다시 놓고 이어 간다. 살아 있는 다른 노드에 다리가 놓였으면 바꾸지 못한다.
+#[tokio::test]
+async fn a_removed_bridge_node_pauses_the_migration() {
+    let t = T::start().await;
+    t.vm("a", Some("10.66.0.11"), false).await;
+    let m = t
+        .create(json!({ "source": "lan", "target": "t-lan" }))
+        .await;
+    let agent = t.bridge_agent(m.id);
+    let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
+    assert_eq!(state, TaskState::Succeeded, "{error:?}");
+    let laid = t.migration(m.id).status.bridge.unwrap();
+    assert_eq!(laid.node, t.env.node);
+
+    // 살아 있는 다른 노드에 다리가 있으면 다리 노드를 바꾸지 못한다.
+    let other = add_dead_node(&t.env, "other").await;
+    let mut status = t.migration(m.id).status;
+    status.bridge.as_mut().unwrap().node = other;
+    t.env
+        .cluster
+        .update_status::<NetworkMigrationSpec>(m.id, &status)
+        .await
+        .unwrap();
+    let node = t.env.node.to_string();
+    let (status, err) = t
+        .post_step(m.id, "resume", json!({ "bridge_node": node }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["code"], "migration_bridge_laid", "{err}");
+
+    // 그 노드를 지우면 옮기기가 멈추고 다리 기록이 지워진다.
+    let (status, body) = t.admin.delete("/nodes/other").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["warnings"][0]
+            .as_str()
+            .unwrap()
+            .contains("network migration \"m\" paused"),
+        "{body}"
+    );
+    let paused = t.migration(m.id);
+    assert_eq!(paused.status.phase, MigrationPhase::Paused);
+    assert!(paused.status.bridge.is_none());
+    assert!(paused.status.error.unwrap().contains("bridge node"));
+
+    // 다른 다리 노드로 이어 간다.
+    let (status, task) = t
+        .post_step(m.id, "resume", json!({ "bridge_node": node }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let (state, error) = t
+        .wait_task(task["id"].as_str().unwrap().parse().unwrap())
+        .await;
+    assert_eq!(state, TaskState::Succeeded, "{error:?}");
+    let resumed = t.migration(m.id);
+    assert_eq!(resumed.spec.bridge_node, Some(t.env.node));
+    assert_eq!(resumed.status.bridge.unwrap().node, t.env.node);
+    assert_eq!(resumed.status.phase, MigrationPhase::Moved);
+    let (_, audit) = t.admin.get("/audit?limit=5").await;
+    assert!(
+        audit
+            .to_string()
+            .contains("network migrate lan resume --bridge-node node1"),
+        "{audit}"
+    );
+    agent.abort();
 }

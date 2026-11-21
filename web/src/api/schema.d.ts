@@ -988,8 +988,9 @@ export interface paths {
         options?: never;
         head?: never;
         /**
-         * 유동 IP를 붙이거나 뗀다(유동 IP의 `network.config` — 경로표, 붙이면 대상 VM의 `vm.config`). 붙일 NIC의 검사는
-         *     만들기와 같다. `If-Match`가 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시 읽는다.
+         * 유동 IP를 붙이거나 뗀다(유동 IP의 `network.config`, 붙이면 대상 VM의 `vm.config`). **떼기만**(`{"target": null}`)은
+         *     지금 붙은 VM의 `vm.config`로도 된다(계획 67 §13 — 권한을 거둔 뒤 남은 유동 IP를 VM 주인이 떼는 길, 유동 IP를 읽을 수
+         *     없어도). 붙일 NIC의 검사는 만들기와 같다. `If-Match`가 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시 읽는다.
          */
         patch: operations["patch_floating_ip"];
         trace?: never;
@@ -1319,6 +1320,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/load-balancers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 볼 수 있는 부하 분산기와 VIP·멤버의 지금 모양. `live=false`면 OVN을 읽지 않는다. */
+        get: operations["list_load_balancers"];
+        put?: never;
+        /**
+         * 부하 분산기를 만든다(계획 67 §7): 폴더의 `network.config`, VIP 네트워크의 `network.assign`, NIC 멤버의 VM마다
+         *     `vm.config`, 주소 멤버의 네트워크와 바깥 VIP 네트워크의 `network.assign`. VIP·건강 검사 주소·바깥 VIP는 API가
+         *     고른다(§6). 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙은 400
+         *     `invalid_load_balancer`, VIP 네트워크·바깥이 라우터와 맞지 않으면 400 `lb_network_not_routed`, 닿지 않는 멤버는 400
+         *     `lb_member_unreachable`, 주소는 409 `ip_in_use`·`ip_exhausted`, 같은 VIP·포트는 409, 폴더 할당량 `load_balancers`(바깥
+         *     VIP는 `floating_ips`도)는 409 `quota_exceeded`. 멤버 보안 그룹이 클라이언트·건강 검사를 막거나 바깥 VIP의 게이트웨이
+         *     후보가 없으면 만들고 `orbivisor-warning`으로 알린다.
+         */
+        post: operations["create_load_balancer"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/load-balancers/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 부하 분산기 하나와 VIP·멤버의 지금 모양(멤버 건강은 SB `Service_Monitor`). `live=false`면 OVN을 읽지 않는다. */
+        get: operations["get_load_balancer"];
+        put?: never;
+        post?: never;
+        /** 부하 분산기를 지운다(언제든 — VIP·바깥 VIP·건강 검사 주소가 풀린다). */
+        delete: operations["delete_load_balancer"];
+        options?: never;
+        head?: never;
+        /**
+         * 부하 분산기의 설명·바깥 VIP·리스너·출발지 고정을 바꾼다(`If-Match`로 리비전 확인, 없으면 읽은 리비전에 쓰고 그새
+         *     바뀌었으면 다시 읽는다). 그 객체의 `network.config`(경로표), VIP 네트워크의 `network.assign`, 새 NIC 멤버의 VM마다
+         *     `vm.config`, 새 주소 멤버·새 바깥 네트워크의 `network.assign`. 검사·주소·경고는 만들기와 같다. 건강 검사 주소는
+         *     필요한 멤버 네트워크만 남긴다.
+         */
+        patch: operations["patch_load_balancer"];
+        trace?: never;
+    };
     "/metrics": {
         parameters: {
             query?: never;
@@ -1374,6 +1425,170 @@ export interface paths {
          *     `unsupported`에 이름이 들어간다.
          */
         get: operations["list_node_metrics"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 볼 수 있는 네트워크 옮기기(끝난 것도 기록으로 남는다) */
+        get: operations["list_network_migrations"];
+        put?: never;
+        /**
+         * 옮기기를 계획하고 만든다(계획 67 §9.2): `dry_run`이면 리소스 없이 계획만(200), 아니면 계획을 `status.vms`에 적은
+         *     `planned` 리소스(201 — 시작은 `POST …/start`). 켜진 VM의 주소는 게스트 에이전트가 알린 것을 쓴다. 원본의
+         *     `network.config`·대상의 `network.assign`, 폴더(없으면 원본 네트워크의 폴더)의 `network.config`. 권한이 없는 VM은
+         *     계획에서 막힌다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 없으면 409 `sdn_not_ready`, 스펙·네트워크는 400
+         *     `invalid_migration`, 같은 원본의 끝나지 않은 옮기기·다른 옮기기의 VM은 409. 계획에 경고가 있으면
+         *     `orbivisor-warning`에 그 수.
+         */
+        post: operations["create_network_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 네트워크 옮기기 하나(VM NIC마다 방식·주소·상태, 다리) */
+        get: operations["get_network_migration"];
+        put?: never;
+        post?: never;
+        /**
+         * 옮기기 리소스를 지운다(끝난 기록도). 도는 중이면 409 `migration_in_progress`(먼저 `pause`). 놓인 다리는 함께 걷힌다
+         *     (OvnSync·다리 노드가 리소스를 따른다). 옮긴 VM은 그대로다.
+         */
+        delete: operations["delete_network_migration"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations/{key}/finish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 옮기기를 끝낸다(Task, 202 — §9.7): 다리를 걷고 `router`가 있으면 대상 네트워크를 그 라우터 인터페이스로 붙인다(라우터와
+         *     대상 네트워크의 `network.config` — 라우터 `PATCH`와 같다). 원본에 남은 NIC는 Task 경고다.
+         */
+        post: operations["finish_network_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations/{key}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 도는 옮기기를 멈춘다(지금 옮기는 VM이 끝난 뒤 Task가 멈춘다). `running`이 아니면 409 `migration_not_running`. */
+        post: operations["pause_network_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations/{key}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 멈췄거나 실패한 옮기기를 이어 간다(시작과 같은 Task — 옮긴 VM은 건너뛰고 `failed`는 다시 해 본다). 다리 노드를
+         *     지워 멈췄으면 `bridge_node`로 다른 노드를 고른다.
+         */
+        post: operations["resume_network_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations/{key}/rollback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * VM을 원본 네트워크로 되돌린다(Task, 202 — §9.6): 켜진 VM은 라이브(MTU가 줄면 다시 켬), 꺼진 VM은 스펙만. 원본의
+         *     보안 그룹·cloud-init 항목을 되살리고 주소를 놓는다. 모두 되돌리면 다리를 걷고 `rolled-back`. 옮기기에 없는 VM은 400.
+         */
+        post: operations["rollback_network_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-migrations/{key}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 옮기기를 시작한다(`network-migrate` Task, 202): 다리를 놓고 VM NIC를 계획대로 옮긴다(VM마다 그때 다시 계획 — 달라진
+         *     VM은 `failed`). 원본 `network.config`·대상 `network.assign`·남은 VM마다 `vm.config`. 끝난 옮기기는 409
+         *     `migration_finished`, 이미 Task가 돌면 409 `migration_in_progress`.
+         */
+        post: operations["start_network_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/network-topology": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 네트워크·라우터·게이트웨이·부하 분산기·유동 IP·VM을 한 그림으로(계획 67 §12.3). 읽을 수 있는 것만 담고 나머지는
+         *     `hidden`에 센다. `folder`면 그 네트워크 폴더(하위 포함)의 것과 그 네트워크에 NIC가 있는 VM만.
+         */
+        get: operations["network_topology"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1474,7 +1689,8 @@ export interface paths {
         /**
          * 네트워크를 그 네트워크가 인터페이스인 라우터에서 뗀다(리뷰 2 I-2): 그 네트워크의 `network.config`(경로표)면 라우터를
          *     읽을 수 없어도 된다 — 다른 폴더의 라우터가 권한을 거둔 뒤에도 내 네트워크의 기본 경로를 쥐고 있을 때 주인이 되찾는
-         *     길이다. 라우터가 없으면 404, 이 길로 라우팅되는 유동 IP가 있으면 409 `fip_in_use`.
+         *     길이다. 라우터가 없으면 404, 이 길로 라우팅되는 유동 IP가 있으면 409 `fip_in_use`, 이 네트워크에 VIP가 있는 부하
+         *     분산기가 있으면 409 `lb_in_use`(계획 67 §7.1).
          */
         delete: operations["detach_network_router"];
         options?: never;
@@ -2190,7 +2406,8 @@ export interface paths {
          * 라우터의 설명·외부·인터페이스·경로를 바꾼다(`If-Match`로 리비전 확인, 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시
          *     읽는다). 라우터의 `network.config`(경로표), 새로 잇는 인터페이스 네트워크의 `network.config`, 새 외부 네트워크의
          *     `network.assign`. 유동 IP가 이
-         *     라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라). 검사는 만들기와 같다.
+         *     라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라), 부하 분산기의 VIP 네트워크
+         *     인터페이스를 빼거나 바깥 VIP가 쓰는 외부를 바꾸면 409 `lb_in_use`(계획 67). 검사는 만들기와 같다.
          */
         patch: operations["patch_router"];
         trace?: never;
@@ -2306,8 +2523,10 @@ export interface paths {
          * OVN 접근 잠금(계획 67 §10)을 켜거나 끄는 `sdn-lockdown` Task(202): `SdnSpec.lockdown`을 쓰고, 중앙마다의 SDN 에이전트가
          *     하나씩(다른 중앙의 NB·SB가 정족수를 가졌을 때) SB를 역할 포트(6642 `ovn-controller`)·northd 전용 포트(6645)로 다시
          *     띄운 뒤, 모든 중앙이 잠기면 chassis·중앙이 nftables 주소 허용 목록을 맞출 때까지 기다린다(끄기는 거꾸로). 같은 값을
-         *     다시 보내면 남은 일을 마저 기다린다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 준비되지 않았으면 409
-         *     `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
+         *     다시 보내면 남은 일을 마저 기다린다. `dry_run`이면 바꾸지 않고 허용 집합과 그 밖에서 지금 중앙 6641·6642에 붙어 있는
+         *     상대(중앙이 알린 `ss` — NAT·다른 출발 주소로 붙은 노드를 미리 찾음)를 돌려준다(200). 켜기는 그런 상대가 있으면 409
+         *     `lockdown_peers_outside`(`force`면 켠다 — 그 상대는 끊긴다). 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 준비되지
+         *     않았으면 409 `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
          */
         post: operations["set_lockdown"];
         delete?: never;
@@ -3541,6 +3760,11 @@ export interface components {
             value?: number;
         };
         /**
+         * @description 옮겨 갈 주소의 출처(앞이 먼저)
+         * @enum {string}
+         */
+        AddressSource: "given" | "guest-agent" | "cloud-init" | "ipam";
+        /**
          * @description 게스트 에이전트가 있는 VM을 끄는 방법
          * @enum {string}
          */
@@ -3712,7 +3936,7 @@ export interface components {
          * @description 할당 행의 종류(계획 66 §8)
          * @enum {string}
          */
-        AllocationKind: "nic" | "router" | "floating-ip";
+        AllocationKind: "nic" | "router" | "floating-ip" | "lb-vip" | "lb-monitor";
         /** @description 앞단(로드 밸런서)이 부를 API 노드 하나 */
         ApiEndpoint: {
             /** @description API 주소(`host:port`) */
@@ -4902,6 +5126,23 @@ export interface components {
             role: components["schemas"]["RoleRef"];
             target: components["schemas"]["GrantTarget"];
         };
+        /** @description `POST /load-balancers` */
+        CreateLoadBalancer: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description `monitors`는 API가 채운다(주면 400). */
+            spec: components["schemas"]["LoadBalancerSpec"];
+        };
+        /** @description `POST /network-migrations` */
+        CreateNetworkMigration: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            spec: components["schemas"]["NetworkMigrationSpec"];
+        };
         CreateRequest_AlertRuleSpec: {
             labels?: {
                 [key: string]: string;
@@ -5719,6 +5960,11 @@ export interface components {
             /** @description 하위 트리 사용량(할당 기준, 전원과 무관). 템플릿은 디스크만 센다. */
             usage: components["schemas"]["FolderUsage"];
         };
+        /**
+         * @description 라우터 게이트웨이의 지금 모양
+         * @enum {string}
+         */
+        GatewayState: "active" | "no-candidate" | "unknown";
         /** @description 권한 하나(`Kind::Grant`): 주체에게 대상에서 역할을 준다. */
         GrantSpec: {
             principal: components["schemas"]["PrincipalRef"];
@@ -6466,6 +6712,109 @@ export interface components {
          * @enum {string}
          */
         Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration";
+        /** @description 바깥 VIP */
+        LbExternal: {
+            /**
+             * Format: ipv4
+             * @description 바깥 VIP(IPv4). API가 그 네트워크의 유동 IP 풀(없으면 풀)에서 채운다.
+             */
+            ip?: string;
+            /** @description 공급자 네트워크 이름(VIP 네트워크 라우터의 바깥) */
+            network: string;
+        };
+        /** @description 건강 검사(OVN 서비스 모니터 — TCP SYN·UDP) */
+        LbHealth: {
+            /**
+             * Format: int32
+             * @description 이만큼 이어 실패하면 뺀다(1~10).
+             * @default 3
+             */
+            fall: number;
+            /**
+             * Format: int32
+             * @description 검사 간격(초, 1~300)
+             * @default 5
+             */
+            interval_secs: number;
+            /**
+             * Format: int32
+             * @description 이만큼 이어 성공하면 다시 넣는다(1~10).
+             * @default 2
+             */
+            rise: number;
+            /**
+             * Format: int32
+             * @description 답을 기다리는 시간(초, 1~간격)
+             * @default 3
+             */
+            timeout_secs: number;
+        };
+        /** @description 리스너 하나: 프로토콜·포트와 멤버 */
+        LbListener: {
+            /** @description 건강 검사. 없으면 멤버를 늘 쓴다. */
+            health?: components["schemas"]["LbHealth"];
+            /** @description 멤버(0~64개). 없으면 연결을 거절한다(TCP RST·ICMP). */
+            members?: components["schemas"]["LbMember"][];
+            /**
+             * Format: int32
+             * @description VIP 포트(1~65535)
+             */
+            port: number;
+            protocol: components["schemas"]["LbProtocol"];
+        };
+        /** @description 멤버 하나: VM NIC(`vm`·`mac` — 주소는 그 NIC의 IPv4) 또는 주소(`ip` — 건강 검사 없음) */
+        LbMember: {
+            /** Format: ipv4 */
+            ip?: string;
+            mac?: string;
+            /**
+             * Format: int32
+             * @description 멤버 포트(1~65535)
+             */
+            port: number;
+            /** Format: uuid */
+            vm?: string;
+        };
+        /** @description 멤버 하나의 보기 */
+        LbMemberView: {
+            health: components["schemas"]["MemberHealth"];
+            /**
+             * Format: ipv4
+             * @description 멤버 주소(NIC 멤버는 그 NIC의 IPv4, 찾지 못하면 없음)
+             */
+            ip?: string;
+            /** @description 리스너 `tcp/80` */
+            listener: string;
+            mac?: string;
+            /** Format: int32 */
+            port: number;
+            /** @description `missing`의 까닭 */
+            reason?: string;
+            /** Format: uuid */
+            vm?: string;
+            /** @description VM 이름(부른 사용자가 읽을 수 있을 때만) */
+            vm_name?: string;
+            /** @description 보안 그룹이 클라이언트·건강 검사를 막는다는 경고 */
+            warning?: string;
+        };
+        /** @description 건강 검사 출발 주소 하나(그 네트워크 서브넷 안 — Raft `ip`로 다른 NIC·라우터·유동 IP와 겹치지 않음) */
+        LbMonitor: {
+            /** Format: ipv4 */
+            ip: string;
+            /** @description 멤버 네트워크 이름 */
+            network: string;
+        };
+        /** @enum {string} */
+        LbProtocol: "tcp" | "udp";
+        /** @description VIP·바깥 VIP의 지금 모양(Raft에서 셈) */
+        LbState: {
+            /** @enum {string} */
+            state: "ready";
+        } | {
+            reason: string;
+            /** @enum {string} */
+            state: "unrouted";
+        };
         /** @description LDAP 디렉터리. `ldap://`는 StartTLS를 반드시 쓰고, `ldaps://`는 처음부터 TLS다. */
         LdapRealm: {
             /** @description 사용자를 찾을 기준 DN(subtree) */
@@ -7718,6 +8067,78 @@ export interface components {
              */
             surplus: number;
         };
+        /** @description `GET /load-balancers` */
+        LoadBalancerList: {
+            items: components["schemas"]["LoadBalancerView"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description `PATCH /load-balancers/{key}`: 준 칸만 바꾼다(리스너는 통째로). VIP 네트워크는 바꿀 수 없다(새로 만든다). */
+        LoadBalancerPatch: {
+            /**
+             * Format: int32
+             * @description 출발지 고정(초), `null`은 끄기
+             */
+            affinity_secs?: number | null;
+            /** @description 빈 글이면 설명을 지운다. */
+            description?: string;
+            external?: components["schemas"]["LbExternal"] | null;
+            /** @description 리스너 전체 */
+            listeners?: components["schemas"]["LbListener"][];
+        };
+        LoadBalancerSpec: {
+            /**
+             * Format: int32
+             * @description 같은 클라이언트를 이 시간(초, 1~65535) 동안 같은 멤버로 보낸다. 없으면 연결마다 해시다.
+             */
+            affinity_secs?: number;
+            /** @description 200자 이하 */
+            description?: string;
+            /** @description 바깥 VIP(VIP 네트워크 라우터의 바깥 공급자 네트워크). 없으면 안쪽에서만 닿는다. */
+            external?: components["schemas"]["LbExternal"];
+            /**
+             * Format: uuid
+             * @description 든 네트워크 폴더(`Folder` id). 없으면 네트워크 트리의 루트다.
+             */
+            folder?: string;
+            /** @description 리스너(1~16개, 같은 프로토콜·포트는 한 번) */
+            listeners: components["schemas"]["LbListener"][];
+            /**
+             * @description 건강 검사 출발 주소(건강 검사가 있는 NIC 멤버의 네트워크마다 하나). API가 그 서브넷 풀에서 채운다(사용자가 주지
+             *     않는다).
+             */
+            monitors?: components["schemas"]["LbMonitor"][];
+            /** @description VIP 네트워크(IPv4 서브넷이 있고 라우터 인터페이스인 오버레이 SDN 네트워크) 이름 */
+            network: string;
+            /**
+             * Format: ipv4
+             * @description VIP(IPv4). API가 그 서브넷 풀에서 채운다(직접 주면 풀 안).
+             */
+            vip?: string;
+        };
+        /** @description 지금은 칸이 없다(멤버 건강·VIP 상태는 보기가 SB·NB에서 읽는다). */
+        LoadBalancerStatus: Record<string, never>;
+        /** @description `GET /load-balancers/{key}`: 부하 분산기와 VIP·바깥 VIP·멤버의 지금 모양 */
+        LoadBalancerView: components["schemas"]["Resource_LoadBalancerSpec_LoadBalancerStatus"] & {
+            external_state?: components["schemas"]["LbState"];
+            /** @description SB를 읽지 못한 까닭(멤버 건강이 `unchecked`로 남는다) */
+            live_error?: string;
+            /** @description 리스너 차례의 멤버 */
+            members: components["schemas"]["LbMemberView"][];
+            vip_state: components["schemas"]["LbState"];
+        };
+        /** @description `POST /sdn/lockdown?dry_run=true`(§10.4 미리 확인): 허용 집합과 그 밖에서 붙어 있는 상대 */
+        LockdownCheck: {
+            /** @description 켜기가 막힌다(`outside`가 있고 `force`가 아님) */
+            blocked: boolean;
+            /** @description 중앙 집합(Raft·SB 특권 포트) */
+            centrals: string[];
+            enabled: boolean;
+            /** @description 멤버 집합(NB 6641·SB 역할 6642를 받는 출발 주소) */
+            members: string[];
+            /** @description 지금 중앙 6641·6642에 붙은 상대 가운데 멤버 집합 밖인 것(중앙이 알린 `NodeSdn.peers`) */
+            outside: components["schemas"]["LockdownPeer"][];
+        };
         /** @description 노드의 OVN 주소 허용 목록 상태(`NodeSdn.lockdown`) */
         LockdownNodeState: {
             /**
@@ -7731,6 +8152,38 @@ export interface components {
              * @default false
              */
             firewall: boolean;
+        };
+        /** @description 노드 하나의 허용 목록 표 */
+        LockdownNodeView: {
+            /** @description 표의 허용 주소 수 */
+            allowed: number;
+            error?: string;
+            /** @description 표가 원하는 집합과 맞다(알리지 않았으면 거짓). */
+            firewall: boolean;
+            name: string;
+            /** Format: uuid */
+            node: string;
+        };
+        /** @description 중앙에 붙어 있지만 허용 집합 밖인 상대(잠그면 끊긴다 — NAT·다른 출발 주소로 붙은 멤버 노드일 수 있다) */
+        LockdownPeer: {
+            /** @description 그 상대가 붙은 중앙 노드 이름 */
+            central: string;
+            /** Format: ip */
+            peer: string;
+        };
+        /** @description `GET /sdn`의 잠금(§10.5): 켜졌는지, 바꾼 중앙, 허용 집합, 표를 거는 노드마다의 상태 */
+        LockdownView: {
+            /** @description SB를 원하는 모양으로 바꾼 중앙 */
+            applied: string[];
+            centrals: string[];
+            /** @description 원하는 상태(`SdnSpec.lockdown`) */
+            enabled: boolean;
+            error?: string;
+            members: string[];
+            /** @description 허용 목록 표를 거는 노드(중앙과 구성된 chassis, 이름 순) */
+            nodes: components["schemas"]["LockdownNodeView"][];
+            /** @description 중앙을 바꾸는 중이다. */
+            pending?: boolean;
         };
         LoginRequest: {
             password: string;
@@ -7748,6 +8201,11 @@ export interface components {
         MacAddr: string;
         /** @enum {string} */
         MachineType: "q35" | "virt";
+        /**
+         * @description 멤버의 건강(SB `Service_Monitor`)
+         * @enum {string}
+         */
+        MemberHealth: "online" | "offline" | "error" | "unchecked" | "missing";
         /** @description 옮길 리소스 하나 */
         MemberRef: {
             /** @description 이름이나 id */
@@ -7805,6 +8263,47 @@ export interface components {
             /** @description 노드 로컬 풀의 디스크를 복사해 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다. */
             pool?: string | null;
         };
+        /** @description 사용자가 주는 NIC 하나의 주소 */
+        MigrationAddress: {
+            /** @description 주소 체계마다 하나까지 */
+            ip: string[];
+            mac: string;
+            /** Format: uuid */
+            vm: string;
+        };
+        /** @description 놓은 다리(노드와 그 노드의 임시 physnet `mig<h8>`) */
+        MigrationBridge: {
+            /** Format: uuid */
+            node: string;
+            physnet: string;
+        };
+        /** @description `POST /network-migrations/{key}/finish` */
+        MigrationFinishRequest: {
+            /** @description 다리를 걷은 뒤 대상 네트워크를 이 라우터(이름이나 id)의 인터페이스로 붙인다. */
+            router?: string;
+        };
+        /** @enum {string} */
+        MigrationMode: "auto" | "offline" | "restart" | "live";
+        /** @enum {string} */
+        MigrationPhase: "planned" | "running" | "paused" | "moved" | "finished" | "rolling-back" | "rolled-back" | "failed";
+        /** @description 계획 전체 */
+        MigrationPlan: {
+            bridge: components["schemas"]["PlannedBridge"];
+            nics: components["schemas"]["PlannedNic"][];
+        };
+        /** @description `POST /network-migrations/{key}/rollback` */
+        MigrationRollbackRequest: {
+            /** @description 되돌릴 VM(이름이나 id). 비면 옮긴(또는 실패한) 모든 VM */
+            vms?: string[];
+        };
+        /** @description `POST /network-migrations/{key}/start`·`resume` */
+        MigrationStartRequest: {
+            /**
+             * @description 다리 노드(이름이나 id)를 바꾼다(§13 — 다리 노드를 클러스터에서 지워 멈춘 옮기기를 다른 노드로 이어 간다). 놓인
+             *     다리가 살아 있는 노드에 있으면 바꿀 수 없다(409 `migration_bridge_laid`).
+             */
+            bridge_node?: string;
+        };
         /** @description 진행 중인 라이브 마이그레이션: 대상 노드와 그 마이그레이션 Task */
         MigrationStatus: {
             /**
@@ -7853,6 +8352,8 @@ export interface components {
             /** @description 옮겼거나 이미 그 폴더에 있었다. */
             ok: boolean;
         };
+        /** @enum {string} */
+        MoveState: "pending" | "moving" | "moved" | "failed" | "rolling-back" | "rolled-back";
         /** @description 내 권한(색인 그대로). 객체의 유효 권한 = 그 객체 폴더의 `contents`(없으면 `root_contents`) ∪ `objects`의 그 객체 */
         MyPermissions: {
             /** @description 루트에 모든 권한(전역 admin): 아래 표 없이 전부 참 */
@@ -7882,6 +8383,61 @@ export interface components {
             live_error?: string;
             network: string;
             subnets: components["schemas"]["SubnetUsage"][];
+        };
+        /** @description 만든 옮기기와 그 계획(VM NIC마다 막는 까닭·경고) */
+        NetworkMigrationCreated: components["schemas"]["Resource_NetworkMigrationSpec_NetworkMigrationStatus"] & {
+            plan: components["schemas"]["MigrationPlan"];
+        };
+        /** @description `GET /network-migrations` */
+        NetworkMigrationList: {
+            items: components["schemas"]["Resource_NetworkMigrationSpec_NetworkMigrationStatus"][];
+            /** Format: int64 */
+            revision: number;
+        };
+        NetworkMigrationSpec: {
+            /** @description 사용자가 주는 NIC 주소(게스트 에이전트·cloud-init보다 앞선다) */
+            addresses?: components["schemas"]["MigrationAddress"][];
+            /** @description 게스트가 볼 MTU가 줄어도 `live`로 옮긴다(아니면 `restart`). */
+            allow_mtu_shrink?: boolean;
+            /** @description 옮기는 동안 L2 다리를 놓는지. 없으면 대상이 오버레이면 참이다. */
+            bridge?: boolean;
+            /**
+             * Format: uuid
+             * @description 다리 노드. 없으면 원본 브리지가 있는 chassis 가운데 옮길 VM이 가장 많은 노드다.
+             */
+            bridge_node?: string;
+            /**
+             * Format: uuid
+             * @description 든 네트워크 폴더(`Folder` id — 원본 네트워크의 폴더). 없으면 네트워크 트리의 루트다.
+             */
+            folder?: string;
+            /** @description VM마다 방식. 없으면 `auto`(전원·MTU·주소로 고름) */
+            mode?: components["schemas"]["MigrationMode"];
+            /**
+             * Format: int32
+             * @description 한 번에 옮기는 VM 수(1~8). 없으면 1이다.
+             */
+            parallel?: number;
+            /** @description 원본 단순 네트워크(브리지·VLAN·VXLAN) 이름 */
+            source: string;
+            /** @description 대상 SDN 네트워크(서브넷이 있는 오버레이 또는 공급자) 이름 */
+            target: string;
+            /** @description 옮길 VM. 비면 계획할 때 원본에 NIC가 있는 모든 VM이다. */
+            vms?: string[];
+        };
+        NetworkMigrationStatus: {
+            /** @description 놓은 다리 */
+            bridge?: components["schemas"]["MigrationBridge"];
+            error?: string;
+            /** @default planned */
+            phase: components["schemas"]["MigrationPhase"];
+            /**
+             * Format: uuid
+             * @description 도는(돈) `network-migrate` Task
+             */
+            task?: string;
+            /** @description VM NIC마다의 계획과 상태(만들 때 계획을 적고 Task가 고친다) */
+            vms?: components["schemas"]["VmMove"][];
         };
         /** @description `PATCH /networks/{key}`: SDN 네트워크의 서브넷 목록 전체(계획 65 §9) */
         NetworkPatch: {
@@ -7918,8 +8474,24 @@ export interface components {
             vxlan?: components["schemas"]["Vxlan"];
         };
         NetworkStatus: Record<string, never>;
+        /** @description `GET /network-topology` */
+        NetworkTopology: {
+            floating_ips: components["schemas"]["TopoFip"][];
+            hidden: components["schemas"]["TopoHidden"];
+            load_balancers: components["schemas"]["TopoLb"][];
+            networks: components["schemas"]["TopoNetwork"][];
+            routers: components["schemas"]["TopoRouter"][];
+            vms: components["schemas"]["TopoVm"][];
+        };
         /** @enum {string} */
         NicModel: "virtio" | "e1000e";
+        /** @description 옮기기 전 NIC(되돌리기가 되살린다) */
+        NicOrigin: {
+            /** @description 지운 cloud-init NIC 항목 */
+            cloud_init?: components["schemas"]["CloudInitNet"];
+            network: string;
+            security_groups?: string[];
+        };
         /** @description NIC 하나의 QoS(`NicSpec.qos`). 보내기·받기는 VM 쪽에서 본 방향이다. */
         NicQos: {
             /**
@@ -8939,6 +9511,35 @@ export interface components {
             recommendations: components["schemas"]["PlacementMove"][];
             settings: components["schemas"]["PlacementSettings"];
         };
+        /** @description 다리 계획 */
+        PlannedBridge: {
+            /** @description 다리를 놓을 수 없는 까닭(그러면 옮기기를 시작하지 못한다) */
+            error?: string | null;
+            /** @description 다리를 놓는다. */
+            needed: boolean;
+            /**
+             * Format: uuid
+             * @description 고른 다리 노드
+             */
+            node?: string | null;
+            warnings: string[];
+        };
+        /** @enum {string} */
+        PlannedMode: "offline" | "live" | "restart" | "blocked";
+        /** @description NIC 하나의 계획 */
+        PlannedNic: {
+            address_source: components["schemas"]["AddressSource"];
+            blockers: string[];
+            ips: string[];
+            mac: string;
+            mode: components["schemas"]["PlannedMode"];
+            /** @description VM 이름 */
+            name: string;
+            nic: number;
+            /** Format: uuid */
+            vm: string;
+            warnings: string[];
+        };
         PoolBackend: {
             /** @enum {string} */
             kind: "dir";
@@ -9935,6 +10536,111 @@ export interface components {
                 restricted?: boolean;
             };
             status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_LoadBalancerSpec_LoadBalancerStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /**
+                 * Format: int32
+                 * @description 같은 클라이언트를 이 시간(초, 1~65535) 동안 같은 멤버로 보낸다. 없으면 연결마다 해시다.
+                 */
+                affinity_secs?: number;
+                /** @description 200자 이하 */
+                description?: string;
+                /** @description 바깥 VIP(VIP 네트워크 라우터의 바깥 공급자 네트워크). 없으면 안쪽에서만 닿는다. */
+                external?: components["schemas"]["LbExternal"];
+                /**
+                 * Format: uuid
+                 * @description 든 네트워크 폴더(`Folder` id). 없으면 네트워크 트리의 루트다.
+                 */
+                folder?: string;
+                /** @description 리스너(1~16개, 같은 프로토콜·포트는 한 번) */
+                listeners: components["schemas"]["LbListener"][];
+                /**
+                 * @description 건강 검사 출발 주소(건강 검사가 있는 NIC 멤버의 네트워크마다 하나). API가 그 서브넷 풀에서 채운다(사용자가 주지
+                 *     않는다).
+                 */
+                monitors?: components["schemas"]["LbMonitor"][];
+                /** @description VIP 네트워크(IPv4 서브넷이 있고 라우터 인터페이스인 오버레이 SDN 네트워크) 이름 */
+                network: string;
+                /**
+                 * Format: ipv4
+                 * @description VIP(IPv4). API가 그 서브넷 풀에서 채운다(직접 주면 풀 안).
+                 */
+                vip?: string;
+            };
+            /** @description 지금은 칸이 없다(멤버 건강·VIP 상태는 보기가 SB·NB에서 읽는다). */
+            status: Record<string, never>;
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_NetworkMigrationSpec_NetworkMigrationStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description 사용자가 주는 NIC 주소(게스트 에이전트·cloud-init보다 앞선다) */
+                addresses?: components["schemas"]["MigrationAddress"][];
+                /** @description 게스트가 볼 MTU가 줄어도 `live`로 옮긴다(아니면 `restart`). */
+                allow_mtu_shrink?: boolean;
+                /** @description 옮기는 동안 L2 다리를 놓는지. 없으면 대상이 오버레이면 참이다. */
+                bridge?: boolean;
+                /**
+                 * Format: uuid
+                 * @description 다리 노드. 없으면 원본 브리지가 있는 chassis 가운데 옮길 VM이 가장 많은 노드다.
+                 */
+                bridge_node?: string;
+                /**
+                 * Format: uuid
+                 * @description 든 네트워크 폴더(`Folder` id — 원본 네트워크의 폴더). 없으면 네트워크 트리의 루트다.
+                 */
+                folder?: string;
+                /** @description VM마다 방식. 없으면 `auto`(전원·MTU·주소로 고름) */
+                mode?: components["schemas"]["MigrationMode"];
+                /**
+                 * Format: int32
+                 * @description 한 번에 옮기는 VM 수(1~8). 없으면 1이다.
+                 */
+                parallel?: number;
+                /** @description 원본 단순 네트워크(브리지·VLAN·VXLAN) 이름 */
+                source: string;
+                /** @description 대상 SDN 네트워크(서브넷이 있는 오버레이 또는 공급자) 이름 */
+                target: string;
+                /** @description 옮길 VM. 비면 계획할 때 원본에 NIC가 있는 모든 VM이다. */
+                vms?: string[];
+            };
+            status: {
+                /** @description 놓은 다리 */
+                bridge?: components["schemas"]["MigrationBridge"];
+                error?: string;
+                /** @default planned */
+                phase: components["schemas"]["MigrationPhase"];
+                /**
+                 * Format: uuid
+                 * @description 도는(돈) `network-migrate` Task
+                 */
+                task?: string;
+                /** @description VM NIC마다의 계획과 상태(만들 때 계획을 적고 Task가 고친다) */
+                vms?: components["schemas"]["VmMove"][];
+            };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_NetworkSpec_NetworkStatus: {
@@ -10951,6 +11657,8 @@ export interface components {
         SdnLockdownRequest: {
             /** @description 켜기(참)·끄기(거짓) */
             enabled: boolean;
+            /** @description 허용 집합 밖에서 중앙에 붙어 있는 상대가 있어도 켠다(§10.4 — 그 상대는 끊긴다). */
+            force?: boolean;
         };
         /** @description SDN(OVN) 네트워크. 칸이 없으면 오버레이(Geneve) 네트워크다. */
         SdnNet: {
@@ -11017,6 +11725,8 @@ export interface components {
             /** Format: uuid */
             init_node?: string;
             last_error?: string;
+            /** @description OVN 접근 잠금(계획 67 §10.5). 켠 적이 없으면 없다. */
+            lockdown?: components["schemas"]["LockdownView"];
             /** @description 없으면 SDN을 아직 설정하지 않았다(`sdn init` 전). */
             phase?: components["schemas"]["SdnPhase"];
             release?: string;
@@ -11955,6 +12665,136 @@ export interface components {
             /** Format: uuid */
             vm: string;
         };
+        TopoExternal: {
+            ips: string[];
+            /**
+             * Format: uuid
+             * @description 공급자 네트워크 id
+             */
+            network: string;
+        };
+        TopoFip: {
+            /** Format: ipv4 */
+            address?: string;
+            /** Format: uuid */
+            id: string;
+            /**
+             * Format: uuid
+             * @description 공급자 네트워크 id
+             */
+            network: string;
+            /** @description `unattached`·`distributed`·`centralized`·`unrouted` */
+            state: string;
+            /**
+             * Format: uuid
+             * @description 붙은 VM(읽을 수 있을 때만)
+             */
+            vm?: string;
+        };
+        TopoGateway: {
+            /** @description 게이트웨이 포트를 가진 노드 이름(루트 `cluster.read`가 없으면 빈 글) */
+            node?: string;
+            state: components["schemas"]["GatewayState"];
+        };
+        /** @description 읽을 수 없어 뺀 수 */
+        TopoHidden: {
+            floating_ips: number;
+            load_balancers: number;
+            networks: number;
+            routers: number;
+            vms: number;
+        };
+        TopoLb: {
+            /** Format: ipv4 */
+            external_ip?: string;
+            /** Format: uuid */
+            id: string;
+            members: components["schemas"]["TopoLbMember"][];
+            name: string;
+            /**
+             * Format: uuid
+             * @description VIP 네트워크 id
+             */
+            network: string;
+            /** Format: ipv4 */
+            vip?: string;
+        };
+        TopoLbMember: {
+            health: components["schemas"]["MemberHealth"];
+            /** Format: ipv4 */
+            ip?: string;
+            /**
+             * Format: uuid
+             * @description 멤버 VM(읽을 수 있을 때만)
+             */
+            vm?: string;
+        };
+        /** @description 진행 중인 옮기기(원본 네트워크에) */
+        TopoMigration: {
+            /** Format: uuid */
+            id: string;
+            /** @description 옮긴 NIC 수 */
+            moved: number;
+            name: string;
+            phase: components["schemas"]["MigrationPhase"];
+            /**
+             * Format: uuid
+             * @description 대상 네트워크 id(읽을 수 없거나 없으면 없음)
+             */
+            target?: string;
+            /** @description 옮길 NIC 수(막힌 것 빼고) */
+            total: number;
+        };
+        TopoNetwork: {
+            /** @description 서브넷 CIDR */
+            cidrs: string[];
+            /** Format: uuid */
+            folder?: string;
+            /** Format: uuid */
+            id: string;
+            kind: components["schemas"]["TopoNetworkKind"];
+            migration?: components["schemas"]["TopoMigration"];
+            /** Format: int32 */
+            mtu?: number;
+            name: string;
+            physnet?: string;
+            /**
+             * Format: int32
+             * @description VLAN 태그(VLAN·공급자)
+             */
+            vlan?: number;
+        };
+        /**
+         * @description 네트워크의 모양
+         * @enum {string}
+         */
+        TopoNetworkKind: "bridge" | "vlan" | "vxlan" | "sdn" | "provider";
+        TopoNic: {
+            ips: string[];
+            /** Format: uuid */
+            network: string;
+        };
+        TopoRouter: {
+            external?: components["schemas"]["TopoExternal"];
+            /** Format: uuid */
+            folder?: string;
+            gateway: components["schemas"]["TopoGateway"];
+            /** Format: uuid */
+            id: string;
+            /** @description 인터페이스 네트워크 id(읽을 수 있는 것만) */
+            interfaces: string[];
+            name: string;
+        };
+        TopoVm: {
+            /** Format: uuid */
+            id: string;
+            name: string;
+            /** @description 그림에 있는 네트워크의 NIC */
+            nics: components["schemas"]["TopoNic"][];
+            /** @description 도는 노드 이름(루트 `cluster.read`가 없으면 없음) */
+            node?: string;
+            power: components["schemas"]["VmPhase"];
+        };
         /** @description 노드에 직접 물은 지금 값(노드 사이 RPC `ReadTopology`, 설계 §5·§13). 바뀔 때마다 쓰지 않도록 Raft에는 두지 않는다. */
         TopologyLive: {
             /** @description orbivisord의 CPU 친화가 노드 설정(예약 CPU)과 맞다. */
@@ -12439,6 +13279,28 @@ export interface components {
             unreachable: string[];
             /** @description 지표를 모르는 옛 노드의 이름(정렬) */
             unsupported: string[];
+            /** Format: uuid */
+            vm: string;
+        };
+        /** @description VM NIC 하나의 옮기기 */
+        VmMove: {
+            address_source: components["schemas"]["AddressSource"];
+            /**
+             * Format: int64
+             * @description 마지막으로 상태를 바꾼 시각(유닉스 초)
+             */
+            at?: number;
+            error?: string;
+            /** @description 되돌리기가 되살리는 원본 NIC */
+            from: components["schemas"]["NicOrigin"];
+            /** @description 옮겨 갈 주소(`ipam`이면 Task가 고른 주소) */
+            ips?: string[];
+            mac: string;
+            /** @description 정한 방식 */
+            mode: components["schemas"]["PlannedMode"];
+            /** @description NIC 순번 */
+            nic: number;
+            state?: components["schemas"]["MoveState"];
             /** Format: uuid */
             vm: string;
         };
@@ -15757,6 +16619,171 @@ export interface operations {
             };
         };
     };
+    list_load_balancers: {
+        parameters: {
+            query?: {
+                /** @description 거짓이면 OVN SB를 읽지 않는다(건강 검사 멤버가 `unchecked`). 기본 참 */
+                live?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadBalancerList"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_load_balancer: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateLoadBalancer"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    /** @description security groups block clients or health checks, or no gateway for the external VIP (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_LoadBalancerSpec_LoadBalancerStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_load_balancer: {
+        parameters: {
+            query?: {
+                /** @description 거짓이면 OVN SB를 읽지 않는다(건강 검사 멤버가 `unchecked`). 기본 참 */
+                live?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoadBalancerView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_load_balancer: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_load_balancer: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LoadBalancerPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    /** @description security groups block clients or health checks, or no gateway for the external VIP (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_LoadBalancerSpec_LoadBalancerStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_prometheus: {
         parameters: {
             query?: never;
@@ -15839,6 +16866,335 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NodeMetricsResponse"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_network_migrations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NetworkMigrationList"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_network_migration: {
+        parameters: {
+            query?: {
+                /** @description 참이면 리소스를 만들지 않고 계획만 돌려준다(200). */
+                dry_run?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateNetworkMigration"];
+            };
+        };
+        responses: {
+            /** @description The plan only (dry_run) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationPlan"];
+                };
+            };
+            201: {
+                headers: {
+                    /** @description the plan has warnings (only then) */
+                    "orbivisor-warning"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NetworkMigrationCreated"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_NetworkMigrationSpec_NetworkMigrationStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    finish_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrationFinishRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pause_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_NetworkMigrationSpec_NetworkMigrationStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resume_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrationStartRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rollback_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrationRollbackRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    start_network_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrationStartRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    network_topology: {
+        parameters: {
+            query?: {
+                /** @description 이 네트워크 폴더(하위 포함)의 네트워크·라우터·부하 분산기·유동 IP만 */
+                folder?: string;
+                /** @description 참이면 NB 게이트웨이 주인과 SB 건강 검사를 읽는다(기본 거짓 — 화면은 watch로 다시 읽고 살아 있는 상태는 가끔). */
+                live?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NetworkTopology"];
                 };
             };
             "4XX": {
@@ -17963,7 +19319,10 @@ export interface operations {
     };
     set_lockdown: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description 참이면 바꾸지 않고 허용 집합과 그 밖의 상대만 돌려준다(200). */
+                dry_run?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -17974,6 +19333,15 @@ export interface operations {
             };
         };
         responses: {
+            /** @description The check only (dry_run) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LockdownCheck"];
+                };
+            };
             202: {
                 headers: {
                     [name: string]: unknown;

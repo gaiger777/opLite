@@ -115,6 +115,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: crate::routing::FipCmd,
     },
+    /// 부하 분산기(계획 67): OVN Load_Balancer로 VIP 하나를 VM NIC·주소 여럿에 L4(TCP·UDP)로, 건강 검사·바깥 VIP
+    Lb {
+        #[command(subcommand)]
+        cmd: crate::lb::LbCmd,
+    },
     /// VM NIC에 거는 방화벽 규칙 묶음. 단순 NIC는 nftables가 있는 노드가, SDN NIC는 OVN ACL이 적용한다.
     SecurityGroup {
         #[command(subcommand)]
@@ -1226,6 +1231,19 @@ enum NetworkCmd {
     },
     /// SDN 네트워크의 주소(서브넷 사용, NIC마다 주소와 OVN 포트 상태)
     Ips(NetworkIps),
+    /// 단순 네트워크(브리지·VLAN·VXLAN)의 VM NIC를 SDN 네트워크로 옮긴다(계획 67): 계획을 보이고 시작한다.
+    Migrate(crate::migration::MigrateArgs),
+    /// 단순 → SDN 옮기기(목록·상태·시작·멈춤·이어 하기·끝내기·되돌리기·지우기)
+    Migration {
+        #[command(subcommand)]
+        cmd: crate::migration::MigrationCmd,
+    },
+    /// 네트워크·라우터·부하 분산기·유동 IP·VM의 연결을 나무로 보인다(읽을 수 있는 것만).
+    Topology {
+        /// 이 네트워크 폴더(경로나 id)와 그 아래만
+        #[arg(long)]
+        folder: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -1678,6 +1696,21 @@ enum VmCmd {
         index: usize,
         groups: Vec<String>,
     },
+    /// NIC의 QoS(계획 67 — 속도 제한·DSCP)를 바꾼다. 실행 중이어도 곧바로 적용된다. 준 값만 바꾸고 `--clear`는 모두 뺀다.
+    /// DSCP는 SDN NIC만이다.
+    NicQos {
+        vm: String,
+        /// NIC 번호(0부터, `vm get`의 nics 순서)
+        index: usize,
+        /// `out=MBPS`(VM이 보냄), `in=MBPS`(VM이 받음), `burst=KBIT`, `dscp=0-63`
+        #[arg(value_name = "KEY=N", value_parser = parse_qos_setting)]
+        settings: Vec<(String, String)>,
+        #[arg(long, conflicts_with = "settings")]
+        clear: bool,
+        /// 실행 중인 VM의 핫플러그 Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
     /// VM 디스크를 붙이거나 뗀다. 실행 중이면 바로 적용한다(끝에 붙이기, 실행 중 붙인 디스크 떼기).
     Disk {
         #[command(subcommand)]
@@ -1846,7 +1879,8 @@ struct VmCreate {
     boot: Option<String>,
     /// 연결할 네트워크 이름(`user`는 QEMU NAT). 여러 번 줄 수 있다. `,sg=A+B`를 붙이면 그 NIC에
     /// 보안 그룹을 건다(예: `lan,sg=web+db`). SDN 네트워크면 `,ip=A[+B]`로 주소를 고른다(없으면 서브넷에서 받는다).
-    #[arg(long = "nic", value_name = "NETWORK[,sg=GROUP+...][,ip=ADDRESS+...]", value_parser = parse_nic)]
+    /// `,qos-out=MBPS,qos-in=MBPS,qos-burst=KBIT,dscp=N`은 속도 제한(VM이 보냄·받음)과 DSCP 표시(SDN NIC만)다.
+    #[arg(long = "nic", value_name = "NETWORK[,sg=GROUP+...][,ip=ADDRESS+...][,qos-out=N][,qos-in=N][,qos-burst=N][,dscp=N]", value_parser = parse_nic)]
     nics: Vec<NicArg>,
     #[arg(long, value_enum, default_value = "never")]
     restart: Restart,
@@ -1881,15 +1915,101 @@ struct NicArg {
     network: String,
     security_groups: Vec<String>,
     ips: Vec<std::net::IpAddr>,
+    qos: NicQosArg,
+}
+
+/// NIC `qos`(계획 67 §8): 보내기·받기 속도(Mbit/s), 버스트(kbit), DSCP. 모두 없으면 `qos`를 보내지 않는다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct NicQosArg {
+    pub(crate) out_mbps: Option<u32>,
+    pub(crate) in_mbps: Option<u32>,
+    pub(crate) burst_kbit: Option<u32>,
+    pub(crate) dscp: Option<u8>,
+}
+
+impl NicQosArg {
+    /// 스펙의 `qos` 값(아무것도 없으면 None). 범위 검사는 서버가 한다.
+    pub(crate) fn value(&self) -> Option<Value> {
+        if *self == NicQosArg::default() {
+            return None;
+        }
+        let mut q = json!({});
+        for (k, v) in [
+            ("out_mbps", self.out_mbps),
+            ("in_mbps", self.in_mbps),
+            ("burst_kbit", self.burst_kbit),
+        ] {
+            if let Some(v) = v {
+                q[k] = json!(v);
+            }
+        }
+        if let Some(d) = self.dscp {
+            q["dscp"] = json!(d);
+        }
+        Some(q)
+    }
+
+    /// `KEY=N` 하나를 읽는다(`out`·`qos-out`, `in`·`qos-in`, `burst`·`qos-burst`, `dscp`). 모르는 키면 거짓
+    pub(crate) fn set(&mut self, key: &str, value: &str) -> Result<bool, String> {
+        let num = || {
+            value
+                .parse::<u32>()
+                .map_err(|_| format!("{key}={value:?} is not a number"))
+        };
+        match key {
+            "out" | "qos-out" => self.out_mbps = Some(num()?),
+            "in" | "qos-in" => self.in_mbps = Some(num()?),
+            "burst" | "qos-burst" => self.burst_kbit = Some(num()?),
+            "dscp" => {
+                self.dscp = Some(
+                    value
+                        .parse::<u8>()
+                        .map_err(|_| format!("dscp={value:?} is not 0-63"))?,
+                )
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// `vm nic-qos`의 알림 글(`out=100 in=200 dscp=46`)
+    pub(crate) fn text(&self) -> String {
+        let mut parts = Vec::new();
+        for (k, v) in [
+            ("out", self.out_mbps),
+            ("in", self.in_mbps),
+            ("burst", self.burst_kbit),
+            ("dscp", self.dscp.map(u32::from)),
+        ] {
+            if let Some(v) = v {
+                parts.push(format!("{k}={v}"));
+            }
+        }
+        parts.join(" ")
+    }
 }
 
 /// `lan`, `lan,sg=web+db`, `tenant,ip=10.0.0.5+fd00::5`처럼 쓴다. 그룹이 있는지와 주소가 서브넷 안인지는 API가 본다.
 fn parse_nic(s: &str) -> Result<NicArg, String> {
-    let bad = || format!("invalid nic {s:?}: use NETWORK[,sg=GROUP+GROUP][,ip=ADDRESS+ADDRESS]");
+    let bad = || {
+        format!(
+            "invalid nic {s:?}: use NETWORK[,sg=GROUP+GROUP][,ip=ADDRESS+ADDRESS][,qos-out=MBPS]\
+             [,qos-in=MBPS][,qos-burst=KBIT][,dscp=N]"
+        )
+    };
     let mut parts = s.split(',');
     let network = parts.next().unwrap_or_default();
     let (mut groups, mut ips) = (None, None);
+    let mut qos = NicQosArg::default();
     for part in parts {
+        if let Some((k, v)) = part.split_once('=')
+            && (k.starts_with("qos-") || k == "dscp")
+        {
+            if !qos.set(k, v)? {
+                return Err(bad());
+            }
+            continue;
+        }
         if let Some(list) = part.strip_prefix("sg=")
             && groups.is_none()
         {
@@ -1917,6 +2037,7 @@ fn parse_nic(s: &str) -> Result<NicArg, String> {
         network: network.into(),
         security_groups: groups.unwrap_or_default(),
         ips: ips.unwrap_or_default(),
+        qos,
     })
 }
 
@@ -1984,6 +2105,9 @@ fn nic_body(nic: &NicArg) -> Value {
     }
     if !nic.ips.is_empty() {
         body["ips"] = json!(nic.ips);
+    }
+    if let Some(q) = nic.qos.value() {
+        body["qos"] = q;
     }
     body
 }
@@ -6149,6 +6273,35 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             NetworkCmd::Ips(args) => {
                 network_ips(&client, &args, json_out, out, &mut std::io::stderr()).await?
             }
+            NetworkCmd::Migrate(args) => {
+                Box::pin(crate::migration::migrate(
+                    &client,
+                    args,
+                    json_out,
+                    out,
+                    &mut std::io::stderr(),
+                ))
+                .await?
+            }
+            NetworkCmd::Migration { cmd } => {
+                Box::pin(crate::migration::migration(
+                    &client,
+                    cmd,
+                    json_out,
+                    out,
+                    &mut std::io::stderr(),
+                ))
+                .await?
+            }
+            NetworkCmd::Topology { folder } => {
+                Box::pin(crate::routing::topology(
+                    &client,
+                    folder.as_deref(),
+                    json_out,
+                    out,
+                ))
+                .await?
+            }
         },
         Cmd::Router { cmd } => {
             Box::pin(crate::routing::router(
@@ -6161,6 +6314,16 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             .await?
         }
         Cmd::Fip { cmd } => Box::pin(crate::routing::fip(&client, cmd, json_out, out)).await?,
+        Cmd::Lb { cmd } => {
+            Box::pin(crate::lb::lb(
+                &client,
+                cmd,
+                json_out,
+                out,
+                &mut std::io::stderr(),
+            ))
+            .await?
+        }
         Cmd::SecurityGroup { cmd } => security_group(&client, cmd, json_out, out).await?,
         Cmd::Volume { cmd } => match cmd {
             VolumeCmd::List => {
@@ -7947,6 +8110,31 @@ async fn warn_ha_without_replica(
 
 /// `vm get`: 표준 출력에는 VM JSON만 쓰고(스크립트가 그대로 읽는다), 실행 중 하드웨어(`hardware:`)와 다음 재시작 때
 /// 적용할 변경(`pending:`) 요약은 `err`(stderr)에 쓴다. `-o json`이면 요약을 쓰지 않는다.
+/// NIC `index`의 QoS 글(`qos out=100 in=200 dscp=46`), 없으면 None
+fn nic_qos_line(vm: &Value, index: usize) -> Option<String> {
+    let q = &vm["spec"]["nics"].get(index)?["qos"];
+    if !q.is_object() {
+        return None;
+    }
+    let qos = NicQosArg {
+        out_mbps: q["out_mbps"].as_u64().map(|v| v as u32),
+        in_mbps: q["in_mbps"].as_u64().map(|v| v as u32),
+        burst_kbit: q["burst_kbit"].as_u64().map(|v| v as u32),
+        dscp: q["dscp"].as_u64().map(|v| v as u8),
+    };
+    Some(format!("qos {}", qos.text()))
+}
+
+/// `vm get`의 NIC QoS 줄(계획 67, QoS가 있는 NIC만): `nic 0 (lan): qos out=100 in=200`
+fn nic_qos_lines(vm: &Value) -> Vec<String> {
+    let nics = vm["spec"]["nics"].as_array().cloned().unwrap_or_default();
+    (0..nics.len())
+        .filter_map(|i| {
+            nic_qos_line(vm, i).map(|q| format!("nic {i} ({}): {q}", cell(&nics[i]["network"])))
+        })
+        .collect()
+}
+
 /// `vm get`의 SDN NIC 주소 줄(계획 65, 주소가 있는 NIC만): `nic 0 (tenant): 10.0.0.5, fd00::5`
 fn nic_ip_lines(vm: &Value) -> Vec<String> {
     vm["spec"]["nics"]
@@ -7984,6 +8172,7 @@ async fn vm_get(
             .chain(boot_line(&vm))
             .chain(cloud_init_lines(&vm))
             .chain(nic_ip_lines(&vm))
+            .chain(nic_qos_lines(&vm))
         {
             writeln!(err, "{line}")?;
         }
@@ -8315,6 +8504,25 @@ async fn vm(
             vm_replicate(client, &vm, node.as_deref(), no_wait, out).await?
         }
         VmCmd::Replication { vm } => vm_replication(client, &vm, json_out, out).await?,
+        VmCmd::NicQos {
+            vm,
+            index,
+            settings,
+            clear,
+            no_wait,
+        } => {
+            if settings.is_empty() && !clear {
+                bail!("give out=MBPS, in=MBPS, burst=KBIT or dscp=N, or --clear");
+            }
+            let task = put_spec(client, &vm, |current| {
+                nic_qos_update(current, index, &settings, clear).map(|(body, _)| body)
+            })
+            .await?;
+            let current = client.get(&format!("/vms/{}", seg(&vm))).await?;
+            let now = nic_qos_line(&current, index).unwrap_or_else(|| "no QoS".into());
+            let done = format!("vm {vm}: NIC {index} {now}");
+            hotplug_result(client, &vm, task, no_wait, &done, out).await?;
+        }
         VmCmd::NicSg { vm, index, groups } => {
             put_spec(client, &vm, |current| {
                 nic_groups_update(current, index, &groups)
@@ -8709,6 +8917,59 @@ pub(crate) fn spec_update(vm: &Value, field: &str, value: Value) -> Value {
     // 라벨이 없으면 응답에 `labels`가 없다.
     let labels = vm.get("labels").cloned().unwrap_or_else(|| json!({}));
     json!({ "labels": labels, "spec": spec })
+}
+
+/// `vm nic-qos`의 `KEY=N` 하나(`out`·`in`·`burst`·`dscp`)
+fn parse_qos_setting(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| format!("invalid {s:?}: use out=MBPS, in=MBPS, burst=KBIT or dscp=N"))?;
+    if !NicQosArg::default().set(k, v)? || k.starts_with("qos-") {
+        return Err(format!(
+            "unknown setting {k:?}: use out=MBPS, in=MBPS, burst=KBIT or dscp=N"
+        ));
+    }
+    Ok((k.to_string(), v.to_string()))
+}
+
+/// VM 수정 본문: NIC `index`의 `qos`를 지금 값에 `settings`를 덮어 바꾼다(`clear`면 뺀다). 새 값도 돌려준다.
+fn nic_qos_update(
+    vm: &Value,
+    index: usize,
+    settings: &[(String, String)],
+    clear: bool,
+) -> anyhow::Result<(Value, NicQosArg)> {
+    let mut nics = vm["spec"]["nics"].as_array().cloned().unwrap_or_default();
+    let count = nics.len();
+    let Some(nic) = nics.get_mut(index) else {
+        bail!(
+            "VM {} has no NIC {index} ({count} NICs, numbered from 0)",
+            cell(&vm["name"])
+        );
+    };
+    let mut qos = NicQosArg::default();
+    if !clear {
+        let now = &nic["qos"];
+        qos = NicQosArg {
+            out_mbps: now["out_mbps"].as_u64().map(|v| v as u32),
+            in_mbps: now["in_mbps"].as_u64().map(|v| v as u32),
+            burst_kbit: now["burst_kbit"].as_u64().map(|v| v as u32),
+            dscp: now["dscp"].as_u64().map(|v| v as u8),
+        };
+        for (k, v) in settings {
+            qos.set(k, v).map_err(anyhow::Error::msg)?;
+        }
+    }
+    let obj = nic.as_object_mut().context("NIC is not an object")?;
+    match qos.value() {
+        Some(q) => {
+            obj.insert("qos".into(), q);
+        }
+        None => {
+            obj.remove("qos");
+        }
+    }
+    Ok((spec_update(vm, "nics", Value::Array(nics)), qos))
 }
 
 /// VM 수정 본문: NIC `index`(0부터)의 보안 그룹만 `groups`로 바꾼다.
@@ -13626,6 +13887,51 @@ mod tests {
                 json!({ "network": "t", "model": "virtio", "security_groups": ["web"],
                 "ips": ["10.0.0.5", "fd00::5"] })
             ]
+        );
+    }
+
+    #[test]
+    fn nic_qos_parses_and_updates_one_nic() {
+        let nic = parse_nic("lan,qos-out=100,qos-in=200,dscp=46").unwrap();
+        assert_eq!(
+            nic_body(&nic),
+            json!({ "network": "lan", "model": "virtio",
+                "qos": { "out_mbps": 100, "in_mbps": 200, "dscp": 46 } })
+        );
+        assert!(parse_nic("lan,qos-up=1").is_err());
+        assert!(parse_nic("lan,dscp=300").is_err());
+        assert!(nic_body(&parse_nic("lan").unwrap()).get("qos").is_none());
+        let cli =
+            Cli::try_parse_from(["oplctl", "vm", "nic-qos", "web", "1", "out=50", "burst=400"])
+                .unwrap();
+        let Cmd::Vm {
+            cmd: VmCmd::NicQos { settings, .. },
+        } = cli.cmd
+        else {
+            panic!("not nic-qos");
+        };
+        assert!(Cli::try_parse_from(["oplctl", "vm", "nic-qos", "web", "0", "up=1"]).is_err());
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "nic-qos", "web", "0", "out=1", "--clear"])
+                .is_err()
+        );
+        let vm = json!({ "name": "web", "spec": { "nics": [
+            { "network": "a" },
+            { "network": "b", "qos": { "in_mbps": 10, "dscp": 8 } }
+        ] } });
+        let (body, qos) = nic_qos_update(&vm, 1, &settings, false).unwrap();
+        assert_eq!(
+            body["spec"]["nics"][1]["qos"],
+            json!({ "out_mbps": 50, "in_mbps": 10, "burst_kbit": 400, "dscp": 8 })
+        );
+        assert_eq!(qos.text(), "out=50 in=10 burst=400 dscp=8");
+        assert!(body["spec"]["nics"][0].get("qos").is_none());
+        let (cleared, _) = nic_qos_update(&vm, 1, &[], true).unwrap();
+        assert!(cleared["spec"]["nics"][1].get("qos").is_none());
+        assert!(nic_qos_update(&vm, 2, &settings, false).is_err());
+        assert_eq!(
+            nic_qos_lines(&vm),
+            ["nic 1 (b): qos in=10 dscp=8".to_string()]
         );
     }
 

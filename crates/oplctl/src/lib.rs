@@ -11,8 +11,10 @@ mod cpu;
 #[cfg(test)]
 mod fake_api;
 mod firmware;
+mod lb;
 mod media;
 mod metrics;
+mod migration;
 mod numa;
 mod output;
 mod routing;

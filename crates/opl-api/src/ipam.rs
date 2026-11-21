@@ -14,6 +14,7 @@ use opl_cluster::{Cluster, ClusterError};
 use opl_types::cloud_init::CloudInitNet;
 use opl_types::floating_ip::{FloatingIp, FloatingIpSpec};
 use opl_types::ipam::{self, IpamError};
+use opl_types::load_balancer::{LoadBalancer, LoadBalancerSpec};
 use opl_types::network::{Network, NetworkSpec, Subnet};
 use opl_types::router::{Router, RouterSpec};
 use opl_types::vm::{MacAddr, Vm, VmSpec};
@@ -48,13 +49,16 @@ pub(crate) fn is_ip_taken(e: &ClusterError) -> bool {
     matches!(e, ClusterError::Rejected(Rejection::InUse { field, .. }) if field == "ip")
 }
 
-/// 네트워크 이름 → 라우터 외부 주소·유동 IP가 쓰는 주소(계획 66 §8). NIC 주소와 같은 주소 공간이다.
+/// 네트워크 이름 → 라우터 외부 주소·유동 IP·부하 분산기(VIP·바깥 VIP·건강 검사 주소 — 계획 67 §6)가 쓰는 주소(계획 66
+/// §8). NIC 주소와 같은 주소 공간이다.
 pub(crate) type HeldIps = BTreeMap<String, BTreeSet<IpAddr>>;
 
-/// 라우터들 `routers`의 외부 주소와 유동 IP들 `fips`의 주소(`except`의 것은 뺀다 — 자기 자신을 고쳐 쓸 때)
+/// 라우터들 `routers`의 외부 주소, 유동 IP들 `fips`의 주소, 부하 분산기들 `lbs`의 주소(`except`의 것은 뺀다 — 자기
+/// 자신을 고쳐 쓸 때)
 pub(crate) fn held_ips(
     routers: &[Router],
     fips: &[FloatingIp],
+    lbs: &[LoadBalancer],
     except: Option<uuid::Uuid>,
 ) -> HeldIps {
     let mut out = HeldIps::new();
@@ -72,14 +76,22 @@ pub(crate) fn held_ips(
                 .insert(a.to_canonical());
         }
     }
+    for l in lbs.iter().filter(|l| Some(l.id) != except) {
+        for (network, ip) in l.spec.addresses() {
+            out.entry(network.to_string())
+                .or_default()
+                .insert(IpAddr::V4(ip));
+        }
+    }
     out
 }
 
-/// 저장소의 라우터·유동 IP가 쓰는 주소
+/// 저장소의 라우터·유동 IP·부하 분산기가 쓰는 주소
 pub(crate) fn load_held(cluster: &Cluster) -> Result<HeldIps, ApiError> {
     let (_, routers) = cluster.list::<RouterSpec>()?;
     let (_, fips) = cluster.list::<FloatingIpSpec>()?;
-    Ok(held_ips(&routers, &fips, None))
+    let (_, lbs) = cluster.list::<LoadBalancerSpec>()?;
+    Ok(held_ips(&routers, &fips, &lbs, None))
 }
 
 /// NIC(MAC `mac`)의 주소를 서브넷에서 고른다: SLAAC 계열 IPv6 서브넷은 EUI-64(MAC이 아직 없으면 — 복제 미리 보기 —

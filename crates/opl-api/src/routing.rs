@@ -20,7 +20,9 @@ use opl_types::authz::Privilege;
 use opl_types::authz_eval::AuthzTarget;
 use opl_types::floating_ip::{FipTarget, FloatingIp, FloatingIpSpec, FloatingIpStatus};
 use opl_types::ipam;
+use opl_types::load_balancer::{LoadBalancer, LoadBalancerSpec};
 use opl_types::network::{Network, NetworkSpec};
+use opl_types::network_migration::{NetworkMigration, NetworkMigrationSpec};
 use opl_types::node::{Node, NodeSpec, SDN_ROUTING};
 use opl_types::resource::{Kind, Resource};
 use opl_types::router::{Router, RouterExternal, RouterInterface, RouterSpec, StaticRoute};
@@ -59,6 +61,8 @@ fn require_routing(state: &AppState) -> Result<(), ApiError> {
 struct World {
     routers: Vec<Router>,
     fips: Vec<FloatingIp>,
+    /// 부하 분산기(계획 67 — 주소 고르기와 `lb_in_use`)
+    lbs: Vec<LoadBalancer>,
     networks: Vec<Network>,
     vms: Vec<Vm>,
     nodes: Vec<Node>,
@@ -75,6 +79,7 @@ impl World {
         Ok(World {
             routers: cluster.list::<RouterSpec>()?.1,
             fips: cluster.list::<FloatingIpSpec>()?.1,
+            lbs: cluster.list::<LoadBalancerSpec>()?.1,
             networks: cluster.list::<NetworkSpec>()?.1,
             vms: cluster.list::<VmSpec>()?.1,
             nodes: cluster.list::<NodeSpec>()?.1,
@@ -99,6 +104,7 @@ impl World {
         Ok(World {
             routers: state.cluster.list::<RouterSpec>()?.1,
             fips: Vec::new(),
+            lbs: Vec::new(),
             networks: state.cluster.list::<NetworkSpec>()?.1,
             vms,
             nodes: state.cluster.list::<NodeSpec>()?.1,
@@ -119,7 +125,7 @@ impl World {
 
     /// 공급자 네트워크 `network`에서 VM NIC·라우터 외부·유동 IP가 쓰는 주소(`except`의 것은 뺀다)
     fn used(&self, network: &str, except: Option<Uuid>) -> BTreeSet<IpAddr> {
-        let held: HeldIps = held_ips(&self.routers, &self.fips, except);
+        let held: HeldIps = held_ips(&self.routers, &self.fips, &self.lbs, except);
         let mut used: BTreeSet<IpAddr> = held.get(network).cloned().unwrap_or_default();
         used.extend(
             self.vms
@@ -141,7 +147,7 @@ impl World {
 }
 
 /// 응답 헤더 `orbivisor-warning`(있을 때만)
-fn warning_header(warnings: &[String]) -> HeaderMap {
+pub(crate) fn warning_header(warnings: &[String]) -> HeaderMap {
     let mut out = HeaderMap::new();
     if !warnings.is_empty()
         && let Ok(v) = HeaderValue::from_str(&warnings.join("; "))
@@ -160,7 +166,7 @@ fn no_gateway(world: &World, external: &Network) -> Option<String> {
 }
 
 /// 주소 고르기의 오류: 다 쓰였으면 409 `ip_exhausted`, 쓰이면 409 `ip_in_use`, 나머지(서브넷 밖·예약)는 400
-fn ipam_error(network: &str, e: ipam::IpamError) -> ApiError {
+pub(crate) fn ipam_error(network: &str, e: ipam::IpamError) -> ApiError {
     match e {
         ipam::IpamError::Exhausted(_) => {
             ApiError::conflict("ip_exhausted", format!("network {network:?}: {e}"))
@@ -238,7 +244,7 @@ fn reads<'a, T: AuthzObject>(
 }
 
 /// 부른 사용자가 루트 `cluster.admin`인지(유동 IP 풀 밖의 주소를 고를 수 있다)
-fn is_admin(state: &AppState, principal: &Principal) -> bool {
+pub(crate) fn is_admin(state: &AppState, principal: &Principal) -> bool {
     state
         .authz
         .allows(principal, Privilege::ClusterAdmin, AuthzTarget::Root)
@@ -627,7 +633,7 @@ async fn read_hosting(state: &AppState, router: Option<Uuid>) -> Result<Hosting,
 }
 
 /// 노드 이름을 볼 수 있는지(루트 `cluster.read` — `/nodes`와 같다). 아니면 보기의 노드 이름을 비운다(리뷰 1 M-4).
-fn sees_nodes(state: &AppState, principal: &Principal) -> bool {
+pub(crate) fn sees_nodes(state: &AppState, principal: &Principal) -> bool {
     state
         .authz
         .allows(principal, Privilege::ClusterRead, AuthzTarget::Root)
@@ -865,7 +871,7 @@ pub async fn create_router(
 }
 
 /// 적은 값은 `null`이어도 `Some`이다(적지 않으면 `serde(default)`의 `None`).
-fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn present<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
@@ -898,7 +904,8 @@ pub struct RouterPatch {
 /// 라우터의 설명·외부·인터페이스·경로를 바꾼다(`If-Match`로 리비전 확인, 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시
 /// 읽는다). 라우터의 `network.config`(경로표), 새로 잇는 인터페이스 네트워크의 `network.config`, 새 외부 네트워크의
 /// `network.assign`. 유동 IP가 이
-/// 라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라). 검사는 만들기와 같다.
+/// 라우터로 라우팅되는 인터페이스를 빼거나 외부를 바꾸면 409 `fip_in_use`(먼저 떼라), 부하 분산기의 VIP 네트워크
+/// 인터페이스를 빼거나 바깥 VIP가 쓰는 외부를 바꾸면 409 `lb_in_use`(계획 67). 검사는 만들기와 같다.
 #[utoipa::path(patch, path = "/routers/{key}", tag = "routers",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = RouterPatch,
@@ -961,6 +968,7 @@ pub async fn patch_router(
             )?;
         }
         check_lost_fips(&state, &principal, &world, &router, &spec)?;
+        check_lost_lbs(&state, &principal, &world, &router, &spec)?;
         check_router(&world, &spec, Some(router.id), &reads(&state, &principal))?;
         // 외부 주소는 `external`을 준 요청만 채운다: 다른 칸만 바꾸는 `PATCH`가 외부 네트워크에 새로 생긴 체계의 주소를
         // 몰래 받거나 그 풀이 다 쓰여 실패하지 않게(리뷰 2 m-6).
@@ -1059,9 +1067,57 @@ fn check_lost_fips(
     ))
 }
 
+/// 라우터 `spec`에 기대는 부하 분산기(계획 67 §7.1): VIP 네트워크가 인터페이스이거나, 바깥 VIP가 그 라우터의 바깥을 쓴다
+fn routed_lbs<'a>(world: &'a World, spec: &RouterSpec) -> Vec<(&'a LoadBalancer, bool)> {
+    world
+        .lbs
+        .iter()
+        .filter(|l| spec.interfaces.iter().any(|i| i.network == l.spec.network))
+        .map(|l| {
+            let external = l.spec.external.as_ref().is_some_and(|e| {
+                spec.external
+                    .as_ref()
+                    .is_some_and(|x| x.network == e.network)
+            });
+            (l, external)
+        })
+        .collect()
+}
+
+/// 부하 분산기가 지금 이 라우터에 기대는데 `new`에서 그 길(VIP 네트워크 인터페이스, 바깥 VIP의 바깥)이 사라지면 409
+/// `lb_in_use`(계획 67 §7.1 — 유동 IP의 `fip_in_use`와 같은 꼴, 먼저 부하 분산기를 지우거나 바깥 VIP를 떼라).
+fn check_lost_lbs(
+    state: &AppState,
+    principal: &Principal,
+    world: &World,
+    router: &Router,
+    new: &RouterSpec,
+) -> Result<(), ApiError> {
+    let after = routed_lbs(world, new);
+    let lost: Vec<&LoadBalancer> = routed_lbs(world, &router.spec)
+        .into_iter()
+        .filter(|(l, ext)| match after.iter().find(|(m, _)| m.id == l.id) {
+            None => true,
+            Some((_, still)) => *ext && !*still,
+        })
+        .map(|(l, _)| l)
+        .collect();
+    if lost.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(
+        "lb_in_use",
+        format!(
+            "{} use this router this way (VIP network or external VIP); delete them or remove their external VIP first",
+            visible_names(state, principal, "load balancer", lost)
+        ),
+    ))
+}
+
 /// 네트워크를 그 네트워크가 인터페이스인 라우터에서 뗀다(리뷰 2 I-2): 그 네트워크의 `network.config`(경로표)면 라우터를
 /// 읽을 수 없어도 된다 — 다른 폴더의 라우터가 권한을 거둔 뒤에도 내 네트워크의 기본 경로를 쥐고 있을 때 주인이 되찾는
-/// 길이다. 라우터가 없으면 404, 이 길로 라우팅되는 유동 IP가 있으면 409 `fip_in_use`.
+/// 길이다. 라우터가 없으면 404, 이 길로 라우팅되는 유동 IP가 있으면 409 `fip_in_use`, 이 네트워크에 VIP가 있는 부하
+/// 분산기가 있으면 409 `lb_in_use`(계획 67 §7.1).
 #[utoipa::path(delete, path = "/networks/{key}/router", tag = "routers",
     params(("key" = String, Path, description = "network id or name")),
     responses((status = 204, description = "Detached"), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1084,6 +1140,7 @@ pub async fn detach_network_router(
         let mut spec = router.spec.clone();
         spec.interfaces.retain(|i| i.network != network.name);
         check_lost_fips(&state, &principal, &world, &router, &spec)?;
+        check_lost_lbs(&state, &principal, &world, &router, &spec)?;
         match state
             .cluster
             .update_spec(
@@ -1354,6 +1411,52 @@ fn fip_view(
     }
 }
 
+/// 유동 IP마다 지금 모양의 이름(`unattached`·`distributed`·`centralized`·`unrouted` — 토폴로지 보기, 계획 67 §12.3)
+pub(crate) fn fip_state_names(
+    state: &AppState,
+    principal: &Principal,
+    fips: &[FloatingIp],
+) -> Result<BTreeMap<Uuid, &'static str>, ApiError> {
+    let world = World::load_for_fips(state, fips)?;
+    let nodes = sees_nodes(state, principal);
+    Ok(fips
+        .iter()
+        .map(|f| {
+            let name = match fip_state(&world, f, false, nodes) {
+                FipState::Unattached => "unattached",
+                FipState::Distributed { .. } => "distributed",
+                FipState::Centralized { .. } => "centralized",
+                FipState::Unrouted { .. } => "unrouted",
+            };
+            (f.id, name)
+        })
+        .collect())
+}
+
+/// 라우터마다 게이트웨이 후보가 있는지(외부가 있는 라우터만 — 토폴로지 보기의 `no-candidate`)
+pub(crate) fn routers_without_gateway(
+    state: &AppState,
+    routers: &[Router],
+) -> Result<BTreeSet<Uuid>, ApiError> {
+    let world = World::load(state)?;
+    Ok(routers
+        .iter()
+        .filter(|r| {
+            r.spec
+                .external
+                .as_ref()
+                .and_then(|e| world.network(&e.network))
+                .is_some_and(|n| no_gateway(&world, n).is_some())
+        })
+        .map(|r| r.id)
+        .collect())
+}
+
+/// 게이트웨이 포트의 지금 주인(라우터 id → chassis 이름 — 토폴로지 보기)
+pub(crate) async fn hosting_all(state: &AppState) -> Result<BTreeMap<Uuid, String>, String> {
+    Box::pin(read_hosting(state, None)).await
+}
+
 /// 볼 수 있는 유동 IP와 지금 모양(분산·중앙·라우팅 안 됨)
 #[utoipa::path(get, path = "/floating-ips", tag = "floating-ips",
     responses((status = 200, body = FloatingIpList), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1555,8 +1658,9 @@ pub struct FloatingIpPatch {
     pub description: Option<String>,
 }
 
-/// 유동 IP를 붙이거나 뗀다(유동 IP의 `network.config` — 경로표, 붙이면 대상 VM의 `vm.config`). 붙일 NIC의 검사는
-/// 만들기와 같다. `If-Match`가 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시 읽는다.
+/// 유동 IP를 붙이거나 뗀다(유동 IP의 `network.config`, 붙이면 대상 VM의 `vm.config`). **떼기만**(`{"target": null}`)은
+/// 지금 붙은 VM의 `vm.config`로도 된다(계획 67 §13 — 권한을 거둔 뒤 남은 유동 IP를 VM 주인이 떼는 길, 유동 IP를 읽을 수
+/// 없어도). 붙일 NIC의 검사는 만들기와 같다. `If-Match`가 없으면 읽은 리비전에 쓰고 그새 바뀌었으면 다시 읽는다.
 #[utoipa::path(patch, path = "/floating-ips/{key}", tag = "floating-ips",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
     request_body = FloatingIpPatch,
@@ -1573,6 +1677,7 @@ pub async fn patch_floating_ip(
     let expected = if_match(&headers)?;
     for _ in 0..RETRIES * 2 {
         let f = lookup::<FloatingIpSpec>(&state.cluster, &key)?;
+        check_fip_patch(&state, &principal, &f, &req)?;
         let world = World::load(&state)?;
         let mut spec = f.spec.clone();
         if let Some(d) = &req.description {
@@ -1622,6 +1727,36 @@ pub async fn patch_floating_ip(
     ))
 }
 
+/// `PATCH /floating-ips/{key}`의 권한(경로표는 핸들러에 맡긴다): 유동 IP의 `network.config`, 또는 떼기만이고 지금 붙은
+/// VM의 `vm.config`. 아니면 유동 IP의 권한 오류(읽을 수 없으면 404, 아니면 403)다.
+fn check_fip_patch(
+    state: &AppState,
+    principal: &Principal,
+    f: &FloatingIp,
+    req: &FloatingIpPatch,
+) -> Result<(), ApiError> {
+    if state
+        .authz
+        .allows(principal, Privilege::NetworkConfig, f.authz_target())
+    {
+        return Ok(());
+    }
+    let detach_only = matches!(req.target, Some(None)) && req.description.is_none();
+    let vm_owner = f
+        .spec
+        .target
+        .and_then(|t| state.cluster.get::<VmSpec>(t.vm).ok().flatten())
+        .is_some_and(|vm| {
+            state
+                .authz
+                .allows(principal, Privilege::VmConfig, vm.authz_target())
+        });
+    if detach_only && vm_owner {
+        return Ok(());
+    }
+    state.authz.require(principal, Privilege::NetworkConfig, f)
+}
+
 /// 유동 IP를 지운다(붙어 있어도 — NAT가 사라진다).
 #[utoipa::path(delete, path = "/floating-ips/{key}", tag = "floating-ips",
     params(("key" = String, Path, description = "id or name"), ("If-Match" = Option<u64>, Header)),
@@ -1648,7 +1783,7 @@ pub async fn delete_floating_ip(
 
 // ---- 다른 자리에서 쓰는 검사 ----
 
-/// 이름이 `network`인 네트워크를 쓰는 라우터(인터페이스·외부)와 유동 IP의 문구. 읽을 수 없는 것은 센다(리뷰 2 m-5).
+/// 이름이 `network`인 네트워크를 쓰는 라우터(인터페이스·외부)·유동 IP·부하 분산기·끝나지 않은 네트워크 옮기기의 문구. 읽을 수 없는 것은 센다(리뷰 2 m-5).
 fn network_users(
     state: &AppState,
     principal: &Principal,
@@ -1667,12 +1802,36 @@ fn network_users(
         })
         .collect();
     let fips: Vec<&FloatingIp> = fips.iter().filter(|f| f.spec.network == network).collect();
+    // 부하 분산기(VIP·바깥 VIP·건강 검사 주소의 네트워크)와 끝나지 않은 옮기기(원본·대상 — 계획 67)
+    let (_, lbs) = state.cluster.list::<LoadBalancerSpec>()?;
+    let lbs: Vec<&LoadBalancer> = lbs
+        .iter()
+        .filter(|l| {
+            l.spec.addresses().iter().any(|(n, _)| *n == network) || l.spec.network == network
+        })
+        .collect();
+    let (_, migrations) = state.cluster.list::<NetworkMigrationSpec>()?;
+    let migrations: Vec<&NetworkMigration> = migrations
+        .iter()
+        .filter(|m| !m.status.is_done() && (m.spec.source == network || m.spec.target == network))
+        .collect();
     let mut users = Vec::new();
     if !routers.is_empty() {
         users.push(visible_names(state, principal, "router", routers));
     }
     if !fips.is_empty() {
         users.push(visible_names(state, principal, "floating IP", fips));
+    }
+    if !lbs.is_empty() {
+        users.push(visible_names(state, principal, "load balancer", lbs));
+    }
+    if !migrations.is_empty() {
+        users.push(visible_names(
+            state,
+            principal,
+            "network migration",
+            migrations,
+        ));
     }
     Ok((!users.is_empty()).then(|| users.join(", ")))
 }
@@ -1720,7 +1879,8 @@ pub(crate) fn check_subnet_unused(
 ) -> Result<(), ApiError> {
     let (_, routers) = state.cluster.list::<RouterSpec>()?;
     let (_, fips) = state.cluster.list::<FloatingIpSpec>()?;
-    let held = held_ips(&routers, &fips, None);
+    let (_, lbs) = state.cluster.list::<LoadBalancerSpec>()?;
+    let held = held_ips(&routers, &fips, &lbs, None);
     if !held
         .get(network)
         .is_some_and(|h| h.iter().any(|ip| cidr.contains(*ip)))
@@ -1730,7 +1890,7 @@ pub(crate) fn check_subnet_unused(
     Err(ApiError::conflict(
         "subnet_in_use",
         format!(
-            "subnet {cidr} of network {network:?} has addresses of routers or floating IPs; remove those first"
+            "subnet {cidr} of network {network:?} has addresses of routers, floating IPs or load balancers; remove those first"
         ),
     ))
 }
@@ -1827,6 +1987,7 @@ mod tests {
             bridged: BTreeSet::new(),
             routers,
             fips: Vec::new(),
+            lbs: Vec::new(),
             networks: Vec::new(),
             vms,
             nodes: Vec::new(),

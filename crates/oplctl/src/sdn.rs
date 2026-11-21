@@ -43,6 +43,12 @@ pub(crate) enum SdnCmd {
     Lockdown {
         #[arg(value_enum)]
         state: OnOff,
+        /// 바꾸지 않고 허용 집합과 지금 중앙에 붙은 집합 밖 상대 주소만 보인다.
+        #[arg(long)]
+        dry_run: bool,
+        /// 집합 밖에 멤버 노드가 붙어 있어도 켠다.
+        #[arg(long)]
+        force: bool,
         /// Task를 기다리지 않는다.
         #[arg(long)]
         no_wait: bool,
@@ -189,11 +195,25 @@ pub(crate) async fn sdn(
                 writeln!(out, "sdn: chassis installed on {node}")?;
             }
         }
-        SdnCmd::Lockdown { state, no_wait } => {
+        SdnCmd::Lockdown {
+            state,
+            dry_run,
+            force,
+            no_wait,
+        } => {
             let enabled = state == OnOff::On;
-            let task = client
-                .post("/sdn/lockdown", &json!({ "enabled": enabled }))
-                .await?;
+            let mut body = json!({ "enabled": enabled });
+            if force {
+                body["force"] = json!(true);
+            }
+            if dry_run {
+                let check = client.post("/sdn/lockdown?dry_run=true", &body).await?;
+                if json_out {
+                    return Ok(print_json(out, &check)?);
+                }
+                return print_lockdown_check(out, &check);
+            }
+            let task = client.post("/sdn/lockdown", &body).await?;
             if no_wait {
                 return started(out, &task);
             }
@@ -302,6 +322,9 @@ fn print_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::Result<()
                 .unwrap_or_default()
         )?;
     }
+    if let Some(line) = lockdown_line(view) {
+        writeln!(out, "{line}")?;
+    }
     let tasks = view["tasks"].as_array().map_or(0, Vec::len);
     if tasks > 0 {
         writeln!(out, "running SDN tasks: {tasks}")?;
@@ -310,6 +333,87 @@ fn print_status(out: &mut (dyn Write + Send), view: &Value) -> anyhow::Result<()
     table(out, CENTRAL_HEADERS, &central_rows(view))?;
     writeln!(out)?;
     table(out, CHASSIS_HEADERS, &chassis_rows(view))?;
+    Ok(())
+}
+
+/// `sdn status`의 잠금 줄: `lockdown: on (3/3 centrals, firewall on 5/5 nodes)`. 보기에 칸이 없으면 None
+fn lockdown_line(view: &Value) -> Option<String> {
+    let l = &view["lockdown"];
+    if !l.is_object() {
+        return None;
+    }
+    let centrals = arr(&view["centrals"]).len();
+    let applied = arr(&l["applied"]).len();
+    let nodes = arr(&l["nodes"]);
+    let firewall = nodes.iter().filter(|n| n["firewall"] == true).count();
+    let mut line = if l["enabled"] == true {
+        format!(
+            "lockdown: on ({applied}/{centrals} centrals, firewall on {firewall}/{} nodes)",
+            nodes.len()
+        )
+    } else if applied > 0 || firewall > 0 {
+        format!(
+            "lockdown: off (still locked: {applied}/{centrals} centrals, firewall on {firewall}/{} nodes)",
+            nodes.len()
+        )
+    } else {
+        "lockdown: off".to_string()
+    };
+    if l["pending"] == true {
+        line.push_str(", switching");
+    }
+    if let Some(e) = l["error"].as_str() {
+        line.push_str(&format!(" — error: {e}"));
+    }
+    for n in &nodes {
+        if let Some(e) = n["error"].as_str() {
+            line.push_str(&format!("\n  {}: {e}", cell(&n["name"])));
+        }
+    }
+    Some(line)
+}
+
+/// `sdn lockdown --dry-run`의 글: 허용 집합과 집합 밖에서 중앙에 붙은 상대
+fn print_lockdown_check(out: &mut (dyn Write + Send), check: &Value) -> anyhow::Result<()> {
+    let list = |v: &Value| {
+        let all: Vec<String> = arr(v).iter().map(cell).collect();
+        if all.is_empty() {
+            "-".to_string()
+        } else {
+            all.join(", ")
+        }
+    };
+    writeln!(
+        out,
+        "lockdown {}: members {}",
+        if check["enabled"] == true {
+            "on"
+        } else {
+            "off"
+        },
+        list(&check["members"])
+    )?;
+    writeln!(out, "centrals: {}", list(&check["centrals"]))?;
+    let outside = arr(&check["outside"]);
+    if outside.is_empty() {
+        writeln!(out, "no connected peer is outside the allowed sets")?;
+    } else {
+        writeln!(out, "connected peers outside the allowed sets:")?;
+        for o in &outside {
+            writeln!(
+                out,
+                "  {} on central {}",
+                cell(&o["peer"]),
+                cell(&o["central"])
+            )?;
+        }
+    }
+    if check["blocked"] == true {
+        writeln!(
+            out,
+            "would be blocked: a member node is connected from outside the sets; use --force to turn it on anyway"
+        )?;
+    }
     Ok(())
 }
 
@@ -851,5 +955,32 @@ mod tests {
         )
         .unwrap();
         assert!(String::from_utf8(out).unwrap().contains("not set up"));
+    }
+
+    #[test]
+    fn lockdown_line_counts_centrals_and_nodes() {
+        let view = json!({ "centrals": [{}, {}, {}], "lockdown": {
+            "enabled": true, "applied": ["a", "b", "c"], "pending": false,
+            "nodes": [{ "name": "n1", "firewall": true }, { "name": "n2", "firewall": false, "error": "nft" }]
+        } });
+        assert_eq!(
+            lockdown_line(&view).unwrap(),
+            "lockdown: on (3/3 centrals, firewall on 1/2 nodes)\n  n2: nft"
+        );
+        assert_eq!(
+            lockdown_line(&json!({ "lockdown": { "enabled": false } })).unwrap(),
+            "lockdown: off"
+        );
+        assert_eq!(lockdown_line(&json!({})), None);
+        let mut out = Vec::new();
+        print_lockdown_check(
+            &mut out,
+            &json!({ "enabled": true, "members": ["10.0.0.1"], "centrals": ["10.0.0.1"],
+                     "outside": [{ "central": "n1", "peer": "10.9.9.9" }], "blocked": true }),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("10.9.9.9 on central n1"), "{text}");
+        assert!(text.contains("--force"), "{text}");
     }
 }

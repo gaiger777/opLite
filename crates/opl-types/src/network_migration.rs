@@ -355,7 +355,7 @@ pub struct PlanInput<'a> {
 }
 
 /// NIC 하나의 계획
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlannedNic {
     pub vm: Uuid,
@@ -373,7 +373,7 @@ pub struct PlannedNic {
 }
 
 /// 다리 계획
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct PlannedBridge {
     /// 다리를 놓는다.
@@ -386,7 +386,7 @@ pub struct PlannedBridge {
 }
 
 /// 계획 전체
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct MigrationPlan {
     pub nics: Vec<PlannedNic>,

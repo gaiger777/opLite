@@ -324,7 +324,7 @@ pub async fn start_step(
 }
 
 /// 옮기기 `m`의 끝나지 않은 Task(노드가 오프라인이면 끝난 것으로 본다 — 다른 노드에서 이어 갈 수 있게)
-fn live_task(cluster: &Cluster, m: &NetworkMigration) -> Result<Option<Uuid>, ApiError> {
+pub(crate) fn live_task(cluster: &Cluster, m: &NetworkMigration) -> Result<Option<Uuid>, ApiError> {
     let Some(t) = m.status.task else {
         return Ok(None);
     };
@@ -362,6 +362,42 @@ pub async fn pause_migration(cluster: &Cluster, id: Uuid) -> Result<NetworkMigra
     })
     .await
     .map_err(|e| ApiError::conflict("migration_not_running", e))
+}
+
+/// 클러스터에서 지운 노드 `node`가 다리 노드인 끝나지 않은 옮기기를 멈춘다(§13 — `paused`, 다리 기록을 지우고 까닭을
+/// 적는다). 다시 이어 갈 때 다른 다리 노드를 고르거나(`bridge_node`) 계획이 고른다. 노드 지우기 응답의 경고 줄을 돌려준다.
+pub(crate) async fn drop_bridge_node(cluster: &Cluster, node: Uuid, name: &str) -> Vec<String> {
+    let Ok((_, migrations)) = cluster.list::<NetworkMigrationSpec>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in migrations
+        .iter()
+        .filter(|m| !m.status.is_done() && m.status.bridge.as_ref().is_some_and(|b| b.node == node))
+    {
+        let why = format!(
+            "the bridge node {name:?} was removed from the cluster; resume with another bridge node \
+             (`orbivisorctl network migration resume {} --bridge-node NODE`)",
+            m.name
+        );
+        let reason = why.clone();
+        match update(cluster, m.id, move |s| {
+            if s.bridge.as_ref().is_some_and(|b| b.node == node) {
+                s.bridge = None;
+                s.phase = MigrationPhase::Paused;
+                s.error = Some(reason.clone());
+            }
+        })
+        .await
+        {
+            Ok(_) => out.push(format!("network migration {:?} paused: {why}", m.name)),
+            Err(e) => out.push(format!(
+                "network migration {:?} uses the removed node as its bridge and could not be paused ({e})",
+                m.name
+            )),
+        }
+    }
+    out
 }
 
 // ---- 상태 쓰기 ----
@@ -512,8 +548,14 @@ fn physnet_state(ctx: &Ctx, node: Uuid, physnet: &str) -> Option<Result<(), Stri
 /// 다리를 놓는다(§9.5): 계획이 다리를 원하면 `status.bridge`를 적고 그 노드가 physnet을 알릴 때까지 기다린다.
 async fn lay_bridge(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     let m = read(ctx, id)?;
-    let bridge = match &m.status.bridge {
-        Some(b) => b.clone(),
+    // 지운 노드의 다리 기록은 없는 것으로 본다(다시 계획해 다른 노드를 고른다 — §13).
+    let laid = m.status.bridge.clone().filter(|b| {
+        ctx.cluster
+            .get::<NodeSpec>(b.node)
+            .is_ok_and(|n| n.is_some())
+    });
+    let bridge = match laid {
+        Some(b) => b,
         None => {
             let world = load_world(&ctx.cluster, &m.spec, Some(id)).map_err(|e| e.message)?;
             let plan = plan_world(&world, &m.spec, &BTreeMap::new(), &|_| true);
@@ -546,9 +588,7 @@ async fn lay_bridge(ctx: &Ctx, id: Uuid) -> Result<(), String> {
             };
             let laid = b.clone();
             update(&ctx.cluster, id, move |s| {
-                if s.bridge.is_none() {
-                    s.bridge = Some(laid.clone());
-                }
+                s.bridge = Some(laid.clone());
             })
             .await?;
             b
@@ -558,6 +598,10 @@ async fn lay_bridge(ctx: &Ctx, id: Uuid) -> Result<(), String> {
     loop {
         let state = physnet_state(ctx, bridge.node, &bridge.physnet);
         if let Some(Ok(())) = state {
+            return Ok(());
+        }
+        // 그새 다리 노드를 지워 멈췄으면(`drop_bridge_node`) 기다리지 않는다 — `start`가 멈춘 것을 보고 끝낸다.
+        if read(ctx, id)?.status.bridge.as_ref() != Some(&bridge) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
