@@ -4,7 +4,7 @@
 
 ## 진행 내역
 
-처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료, 설치 매체와 cloud-init(계획 57) 완료, 템플릿·링크드 클론·이미지 라이브러리(계획 58) 완료, vTPM·Secure Boot·게스트 에이전트(계획 59) 완료, 지표 기록·대시보드·알림·Prometheus(계획 60) 완료, 웹 화면 구성·UX 개편(계획 61) 완료, 폴더·객체 권한·폴더 할당량·2단계 인증(계획 62) 완료, 게스트 CPU 모델·플래그 숨기기·클러스터 CPU 기준(계획 63) 완료, NUMA 토폴로지·vNUMA·전용 CPU 고정·hugepages(계획 64) 완료, SDN(OVN) 1: OVN 설치·논리 스위치·서브넷·IPAM·DHCP(계획 65) 완료, SDN(OVN) 2: 외부(공급자) 네트워크·분산 라우터·게이트웨이 HA·SNAT·유동 IP·DHCPv6·RA·OVN 보안 그룹(계획 66) 완료
+처음 분해한 하위 프로젝트 1~10 완료 (노드 코어 M7, 웹 UI, VM 스냅샷·복제·예약 스냅샷, NFS 공유 스토리지, LVM-thin·ZFS·Ceph RBD·공유 LVM(iSCSI) 풀, 라이브 마이그레이션, 위트니스 노드, Debian 패키지·설치 ISO, 버전과 업데이트, 구독과 텔레메트리, 백업·백업 작업, VMware 가져오기, 감사 로그, LDAP·OIDC, 원격 클러스터·원격 복제), 하위 프로젝트 11 노드 유지보수 모드(노드 비우기) 완료, 하위 프로젝트 12 증분 백업·증분 복제(계획 40·41) 완료, 하위 프로젝트 13 로컬 디스크 라이브 마이그레이션(계획 42) 완료, 제품 이름 Orbivisor로 바꾸기(계획 43) 완료, 하위 프로젝트 14 실시간 지표 수집(계획 44) 완료, 하위 프로젝트 15 제어부 가용성: 실행기 격리와 systemd watchdog(계획 45) 완료, 헬스 체크·세션 공유·API 이름·내장 VIP·앞단 프록시(계획 46) 완료, 리스 확인 묶기·리스 기반 노드 감시·투표 멤버 상한·규모 시험(계획 47) 완료, 관찰 노드(계획 48) 완료, 클러스터 통신 다중 링크(계획 49) 완료, 배치 규칙과 HA 정책(계획 50) 완료, 빠른 HA와 노드 전원 끄기(계획 51) 완료, HA 상태 검사(계획 52) 완료, 최적 배치(계획 53) 완료, VM 무중단 유형 변경(계획 54) 완료, 로컬 디스크 HA(계획 55) 완료, Ceph 자동 구성(계획 56) 완료, 설치 매체와 cloud-init(계획 57) 완료, 템플릿·링크드 클론·이미지 라이브러리(계획 58) 완료, vTPM·Secure Boot·게스트 에이전트(계획 59) 완료, 지표 기록·대시보드·알림·Prometheus(계획 60) 완료, 웹 화면 구성·UX 개편(계획 61) 완료, 폴더·객체 권한·폴더 할당량·2단계 인증(계획 62) 완료, 게스트 CPU 모델·플래그 숨기기·클러스터 CPU 기준(계획 63) 완료, NUMA 토폴로지·vNUMA·전용 CPU 고정·hugepages(계획 64) 완료, SDN(OVN) 1: OVN 설치·논리 스위치·서브넷·IPAM·DHCP(계획 65) 완료, SDN(OVN) 2: 외부(공급자) 네트워크·분산 라우터·게이트웨이 HA·SNAT·유동 IP·DHCPv6·RA·OVN 보안 그룹(계획 66) 완료, SDN(OVN) 3: 부하 분산·QoS·2.5D 네트워크 토폴로지·단순 → SDN 옮기기 도구·OVN 접근 잠금·SDN 경보(계획 67) 완료
 
 ## 설계와 계획
 
@@ -42,6 +42,7 @@
 - [NUMA 구조 수집·vNUMA·전용 CPU 고정·hugepages 설계 (계획 64)](superpowers/specs/2026-11-19-numa-pinning-design.md)
 - [SDN(OVN) 설계 — 논리 스위치·IPAM·DHCP, 라우터·NAT, 보안 그룹·부하 분산 (계획 65~67)](superpowers/specs/2026-11-20-sdn-ovn-design.md)
 - [SDN(OVN) 2 설계 — 외부 네트워크·라우터·게이트웨이 HA·SNAT·유동 IP·DHCPv6·RA·OVN 보안 그룹 (계획 66)](superpowers/specs/2026-11-20-sdn-ovn-plan66-design.md)
+- [SDN(OVN) 3 설계 — 부하 분산·QoS·2.5D 네트워크 토폴로지·단순 → SDN 옮기기 도구·OVN 접근 잠금·SDN 경보 (계획 67)](superpowers/specs/2026-11-21-sdn-ovn-plan67-design.md)
 - [계획 1: 워크스페이스, 리소스 모델, QEMU 제어](superpowers/plans/2026-10-20-plan1-workspace-types-qemu.md)
 - [계획 2: 하이퍼바이저·스토리지 드라이버](superpowers/plans/2026-10-20-plan2-opl-driver.md)
 - [계획 3: 클러스터 저장소](superpowers/plans/2026-10-21-plan3-opl-cluster.md)
@@ -108,3 +109,4 @@
 - [계획 64: NUMA 토폴로지·vNUMA·전용 CPU 고정·hugepages](superpowers/plans/2026-11-19-plan64-numa.md)
 - [계획 65: SDN(OVN) 1 — OVN 설치·논리 스위치·서브넷·IPAM·DHCP](superpowers/plans/2026-11-20-plan65-sdn.md)
 - [계획 66: SDN(OVN) 2 — 외부 네트워크·라우터·게이트웨이 HA·SNAT·유동 IP·IPv6·OVN 보안 그룹](superpowers/plans/2026-11-21-plan66-sdn2.md)
+- [계획 67: SDN(OVN) 3 — 부하 분산·QoS·토폴로지·단순 → SDN 옮기기·OVN 접근 잠금·SDN 경보](superpowers/plans/2026-11-21-plan67-sdn3.md)

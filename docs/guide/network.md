@@ -166,7 +166,13 @@ ML2/OVN이 하는 자리(OVN에 원하는 상태를 쓰는 관리 시스템)를 
 **IPv6 SLAAC·DHCPv6·RA**, 그리고 SDN NIC의 **보안 그룹**(OVN ACL). 자세한 비교는 [Neutron·Proxmox SDN·NSX와
 견주기](#neutronproxmox-sdnnsx와-견주기).
 
-| | Proxmox VE SDN | OpenStack Neutron ML2/OVN | Orbivisor 계획 65·66 |
+계획 67은 **서비스와 운영**이다: OVN 내장 **부하 분산**(VIP·건강 검사·바깥 VIP), NIC마다 **QoS**(속도 제한·DSCP — 단순 NIC도 tc로
+속도 제한), 네트워크·라우터·VM·LB를 한 그림으로 보는 **2.5D 토폴로지**, 단순 네트워크의 VM NIC를 SDN으로 옮기는 **옮기기 도구**
+(미리 보기·라이브·되돌리기), 지운 노드를 끊는 **OVN 접근 잠금**(SB RBAC·주소 허용 목록), **SDN 경보** 여덟, 네트워크 폴더 할당량
+`networks`·`load_balancers`. 기능 하나 **`sdn-services`**가 이것을 가린다. 견주기는 [부하 분산·QoS·옮기기: Octavia·Proxmox·NSX와
+견주기](#부하-분산qos옮기기-octaviaproxmoxnsx와-견주기).
+
+| | Proxmox VE SDN | OpenStack Neutron ML2/OVN | Orbivisor 계획 65~67 |
 |---|---|---|---|
 | 데이터 평면 | Linux 브리지 + VLAN·QinQ·VXLAN·EVPN(FRR) | OVS + OVN(Geneve) | OVS + OVN(Geneve) |
 | 제어 | `/etc/pve/sdn` 설정을 노드마다 ifupdown2로 적용 | API가 NB에 쓰고 주기적으로 고침 | Raft의 원하는 상태를 리더 `OvnSync`가 NB에 맞춤 |
@@ -174,6 +180,8 @@ ML2/OVN이 하는 자리(OVN에 원하는 상태를 쓰는 관리 시스템)를 
 | 서브넷·IPAM | VNet › 서브넷, pve·NetBox·phpIPAM | 서브넷, Neutron DB | 네트워크 안 서브넷, Raft(NIC 스펙의 `ips`) |
 | DHCP | dnsmasq(simple 영역) | OVN 내장 | OVN 내장 DHCPv4·DHCPv6, RA |
 | 라우터·NAT·플로팅 IP | EVPN 출구·SNAT | 분산 라우터, 게이트웨이 HA | 분산 라우터, 게이트웨이 HA, SNAT, 유동 IP(계획 66) |
+| 부하 분산 | 없음 | Octavia(Amphora VM 또는 OVN 공급자) | OVN 내장 `Load_Balancer`, 건강 검사, 바깥 VIP(계획 67) |
+| QoS | NIC `rate`(tc) | QoS 정책(OVN `QoS` 행) | NIC `qos` — SDN은 OVN `QoS` 행, 단순 NIC는 tc(계획 67) |
 | 테넌트 | 없음(권한 경로) | 프로젝트 | [네트워크 폴더](folders.md) |
 
 ### 개념
@@ -216,6 +224,10 @@ ML2/OVN이 하는 자리(OVN에 원하는 상태를 쓰는 관리 시스템)를 
 | UDP 6081 | 모든 chassis 사이(underlay) | Geneve |
 | TCP 6641·6642 | 모든 노드 → 중앙 | NB·SB(클러스터 CA mTLS) |
 | TCP 6643·6644 | 중앙끼리 | NB·SB의 Raft |
+| TCP 6645 | 중앙끼리 | SB 특권 포트 — northd만([OVN 접근 잠금](#ovn-접근-잠금)을 켰을 때) |
+
+잠금을 켜면(새 클러스터는 기본으로 켜짐) 6641·6642는 클러스터 멤버 노드의 주소에서만, 6643~6645는 중앙 주소에서만, Geneve는
+멤버 노드에서만 받는다.
 
 **중앙은 셋을 고른다.** 하나면 그 노드가 죽을 때 OVN 제어 평면이 멈추고(도는 VM의 흐름은 남는다), 셋이면 하나를, 다섯이면
 둘을 견딘다. 짝수는 하나 적은 홀수보다 더 견디지 못하므로 경고가 나온다. 장애 영역이 다른 투표 멤버 셋이 좋다.
@@ -285,7 +297,8 @@ orbivisorctl sdn central remove n3        # 마지막 중앙은 뺄 수 없다(4
 - **노드 지우기.** 목록의 중앙인 노드는 먼저 `sdn central remove`(409 `sdn_central_on_node` — 꺼졌으면 위처럼 내쫓는다).
   끝나지 않은 중앙 더하기의 DB를 알린 채 꺼진 노드는 막지 않는다: 지운 뒤 `SdnStatus.departed`에 적고 살아 있는 중앙이
   내쫓는 Task를 만든다(응답 경고에 그 Task, 다른 중앙 Task가 돌면 나중에 `sdn central remove 이름`). chassis만인 노드의 SB
-  `Chassis` 행은 리더가 지운다.
+  `Chassis` 행은 **SB Raft 리더인 중앙의 에이전트**가 로컬 소켓으로 지운다(계획 67 — 모든 노드가 `sdn-services`를 알기 전에는
+  리더 OvnSync가). 그 노드가 옮기기 다리 노드였으면 그 옮기기는 멈춘다([옮기기](#단순-네트워크를-sdn으로-옮기기)).
 
 ```toml
 # /etc/opl/opld.toml (노드마다, 선택 — 기본값)
@@ -713,9 +726,273 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
 - **업그레이드 먼저.** 모든 노드가 기능 `sdn-routing`을 알려야 SDN NIC에 그룹을 건다(아니면 409 `cluster_upgrading`). 섞인
   클러스터의 복제는 계획 65처럼 SDN NIC의 그룹을 뺀다.
 
+### 부하 분산
+
+부하 분산기(LB, 계획 67)는 VIP 하나로 오는 TCP·UDP 연결을 VM NIC(또는 주소) 여럿에 L4로 나눈다. OVN 내장 `Load_Balancer`라
+서비스 VM·에이전트가 없고(Octavia의 OVN 공급자와 같은 자리), 안쪽 트래픽은 **클라이언트 chassis에서 분산**으로 DNAT된다(게이트웨이를
+지나지 않음). 건강 검사가 죽은 멤버를 빼고, 라우터 바깥의 유동 IP 범위에서 받은 **바깥 VIP**로 물리 망에도 연다.
+
+```bash
+orbivisorctl lb create web-lb --network t1 --listener tcp/80 --listener tcp/443 --folder /tenant-a   # VIP는 t1 풀에서
+orbivisorctl lb member add web-lb tcp/80 web1             # VM NIC 멤버(NIC 0, 리스너 포트)
+orbivisorctl lb member add web-lb tcp/80 web2:1@8080      # NIC 1의 8080으로(VM 멤버의 포트는 @ — MAC에 :가 있다)
+orbivisorctl lb member add web-lb tcp/80 10.20.0.30:80    # 주소 멤버(라우터 인터페이스 서브넷 안)
+orbivisorctl lb health set web-lb tcp/80 --interval 5 --timeout 3 --rise 2 --fall 3   # 주지 않은 값은 기본 5초·3초·2·3
+orbivisorctl lb external set web-lb ext                   # 바깥 VIP(ext의 유동 IP 범위에서, ip=A로 고름)
+orbivisorctl lb get web-lb
+# load balancer web-lb
+# vip: 10.10.0.50 on t1
+# external: 203.0.113.130 on ext
+#
+# LISTENER  MEMBER     ADDRESS     PORT  HEALTH   WARNING
+# tcp/80    web1       10.10.0.11  80    online   -
+# tcp/80    web2:1     10.20.0.12  8080  offline  -
+# tcp/80    10.20.0.30 10.20.0.30  80    unchecked -
+orbivisorctl lb list                                      # NAME NETWORK VIP EXTERNAL LISTENERS MEMBERS
+```
+
+- **VIP 네트워크.** 서브넷(IPv4)이 있는 오버레이 SDN 네트워크이고 **어떤 라우터의 인터페이스**여야 한다(아니면 400
+  `lb_network_not_routed`). LB는 그 라우터와 라우터의 모든 인터페이스 스위치에 붙는다 — 라우터가 VIP의 ARP에 답해 **같은 서브넷
+  클라이언트도 VIP에 닿고**(GitHub `ovn` 작업: 같은 서브넷·다른 서브넷 클라이언트 모두 두 멤버가 16·14로 나눔, 바깥을 뗀 라우터도
+  같음), 다른 인터페이스 네트워크의 클라이언트는 자기 스위치에서 DNAT한다. VIP는 직접 주면 그 서브넷의 NIC 범위(풀) 안이어야 하고,
+  없으면 풀에서 받는다. VIP 네트워크는 바꿀 수 없다(새로 만든다). LB가 VIP를 둔 네트워크를 라우터에서 떼거나, 바깥 VIP가 쓰는
+  라우터 바깥을 바꾸면 409 `lb_in_use`.
+- **리스너와 멤버.** 리스너는 `tcp|udp/포트` 1~16개, 리스너마다 멤버 64개까지. NIC 멤버는 그 NIC의 네트워크가 VIP 네트워크이거나
+  **같은 라우터의 다른 인터페이스**이고 IPv4가 있어야 한다(아니면 400 `lb_member_unreachable`과 까닭). 붙은 뒤 깨지면(NIC를 빼거나
+  VM을 지움) 멤버는 스펙에 남고 흐름에서만 빠져 `missing`(까닭)으로 보인다 — 몰래 스펙을 바꾸지 않는다(Octavia의 `ERROR`와 같다).
+  멤버가 하나도 남지 않은 리스너는 연결을 바로 거절한다(RST·ICMP — 조용히 버리지 않음).
+- **나누기와 출발지 고정.** OVN 기본(`dp_hash`, 5튜플 해시)이다. `--affinity SECS`(1~65535)면 같은 클라이언트 주소를 그 시간 동안
+  같은 멤버로 보낸다(시험: 60초면 10번 모두 같은 멤버).
+- **건강 검사.** 리스너마다 켠다(NIC 멤버만 — 주소 멤버는 `unchecked`). OVN 서비스 모니터가 멤버의 chassis에서 검사하고, `fall`번
+  실패하면 그 멤버를 **새 연결**에서 뺀다(맺은 연결은 conntrack에 남아 그 멤버로 가다 끊긴다), `rise`번 되면 다시 넣는다. 기본값이면
+  죽은 멤버를 약 15초 안에 뺀다. 잰 값: 간격 2초·`fall` 2로 노드 하나에서 3.6~3.7초, 여러 chassis(멤버 c1·c3, 클라이언트 c2)에서
+  4.4초 뒤 남은 멤버만 답했고, 되살리면 2초에 `online`, 둘 다 죽으면 곧바로 `refused`. **UDP 검사는 약하다** — "ICMP 포트 닿지 않음이
+  오지 않으면 online"이라 듣지 않는 서비스도 살아 보일 수 있다. 검사는 **IPv4만**이다(VIP도 IPv4만).
+- **검사 출발 주소와 보안 그룹.** 검사는 LB와 멤버 네트워크마다 IPAM에서 잡은 주소(`monitors` — `network ips`의 `lb-monitor` 행)에서
+  온다. 멤버 NIC에 보안 그룹이 있으면 그 주소에서 멤버 포트로 오는 것과 클라이언트를 받아야 한다(Octavia와 같다). API는 만들기·바꾸기
+  때 멤버 NIC의 그룹이 검사·클라이언트를 막는지 셈해 경고 헤더와 `lb get`의 WARNING을 단다(막지는 않음 — 일부러 닫아 둘 수 있다).
+  클라이언트 NIC의 `out` 규칙은 DNAT **앞**(목적지 = VIP), 멤버 NIC의 `in` 규칙은 DNAT **뒤**(목적지 = 멤버, 출발지 = 클라이언트)를 본다.
+- **바깥 VIP.** VIP 네트워크 라우터의 바깥이 그 공급자 네트워크여야 하고, 주소는 유동 IP 범위에서 온다(범위 밖은 루트
+  `cluster.admin`). 물리 망 → 게이트웨이 chassis에서 DNAT → 분산 라우팅으로 멤버. **SNAT가 없어 멤버는 바깥 클라이언트 주소를 그대로
+  본다.** 게이트웨이가 넘어가면 새 게이트웨이가 바깥 VIP도 GARP로 알린다 — 여러 노드 시험에서 게이트웨이 주인이 0.25초에 바뀌고 물리 쪽
+  ARP 캐시를 그대로 둔 채 1.3초에 다시 닿았다. 게이트웨이 후보가 없으면 `external_state: unrouted`(까닭)이고 경보
+  `sdn_gateway_unavailable`이 뜬다. 바깥 VIP는 폴더 할당량 `floating_ips`를 하나 쓴다.
+- **다른 기능과.** 같은 멤버 NIC에 유동 IP를 붙여도 된다. 멤버 VM이 라이브 마이그레이션하면 검사 chassis가 따라간다. LB는 VM 복제·
+  템플릿·원격 복제를 따라가지 않는다(멤버는 MAC으로 가리키고 복제본은 새 MAC). L7(HTTP 규칙·TLS 종료)이 필요하면 LB 뒤에 HAProxy VM을
+  둔다.
+- **API.** `GET|POST /api/v1/load-balancers`, `GET|PATCH|DELETE /api/v1/load-balancers/{key}`(`PATCH`는 보낸 칸만, `listeners`는 통째로,
+  `If-Match`). 보기 `LoadBalancerView`는 리소스에 `vip_state`·`external_state`(`ready | unrouted {reason}`)와 멤버마다 `address`·`health`
+  (`online|offline|error|unchecked|missing`)·`warning`, `live_error`를 더한다(`?live=false`면 OVN을 읽지 않음). 감사 `lb create web-lb …`.
+
+### QoS
+
+NIC마다 보내기·받기 속도 상한과 DSCP 표시를 둔다(계획 67). **SDN NIC는 OVN `QoS` 행**, **단순 NIC(브리지·VLAN·VXLAN)는 tap의 tc**가
+집행하고 둘 다 **폴리싱**(넘으면 버림)이라 같은 칸이 같은 뜻이다 — [옮기기](#단순-네트워크를-sdn으로-옮기기) 앞뒤에서도 그대로다.
+
+```bash
+orbivisorctl vm create web1 --memory 1024 --disk root --nic t1,qos-out=100,qos-in=200,dscp=46 --start
+orbivisorctl vm nic-qos web1 0 out=50                     # 실행 중에도 곧바로(준 값만 바꿈)
+orbivisorctl vm nic-qos web1 0 burst=4000                 # 버스트(kbit) — 없으면 속도의 80%
+orbivisorctl vm nic-qos web1 0 --clear                    # 모두 뺌
+```
+
+| 칸 | 뜻 | SDN NIC | 단순 NIC |
+|---|---|---|---|
+| `out_mbps`(`out=`) | VM이 보내는 속도 상한, 1~100000 Mbit/s | `from-lport` `QoS` 행(우선순위 2000) | tap ingress의 matchall `police`(우선순위 49152) |
+| `in_mbps`(`in=`) | VM이 받는 속도 상한 | `to-lport` `QoS` 행 | tap egress의 `police` |
+| `burst_kbit`(`burst=`) | 버스트, 1~10000000 kbit, 기본 속도의 80% | 행의 `bandwidth.burst` | `police burst`(바이트로 적음) |
+| `dscp` | VM이 보내는 IP 패킷의 DSCP, 0~63 | 행의 `action.dscp` | **없음** — 400 `qos_dscp_needs_sdn` |
+
+- **정확도(잰 값, GitHub).** SDN NIC: `out_mbps=50` → 50.0, `in_mbps=30` → 30.1, 실행 중 20으로 → 20.1 Mbit/s, 여러 chassis
+  (Geneve 너머 c1 → c3) 50 → 50.3, DSCP 46이 받는 쪽에 `tos 0xb8`로 보였다. 단순 NIC(tc): 40 → 38.8, 25 → 24.1, 바꾼 15 → 14.5.
+- **버스트.** 폴리싱은 처음에 버스트만큼 더 보낸다 — 기본 버스트(속도의 0.8초분)가 짧은 측정을 부풀린다(5초 iperf3에서 50 Mbit/s 제한이
+  57.7). 잴 때는 앞 몇 초를 빼고(`iperf3 -O 3`) 길게 잰다. TCP는 버림을 보고 줄여 대개 제한 근처로 모이고, **UDP는 넘는 만큼 잃는다**.
+- **실행 중 바꾸기**는 장치 변경이 아니다(SDN은 OvnSync 한 차례, 단순 NIC는 핫플러그 Task의 `SetNicQos` 한 단계 — 바뀐 훅만 다시 넣고 같은
+  값이면 건드리지 않음). 단순 NIC의 tc가 실패하면 스펙은 그대로 두고 보류(`failed`)로 남아 `vm hotplug`가 다시 한다.
+- **노드.** 단순 NIC QoS는 tc `clsact`를 쓸 수 있는 노드(`NodeStatus.qos` — 시작할 때 시험 장치로 확인, macOS는 거짓)에만 놓이고
+  (스케줄러, 아니면 409 `qos_unsupported`), 그 노드의 tap을 만들 때(켜기·마이그레이션 받기·핫플러그) 건다. 우선순위 49152만 우리 것으로
+  보고 남의 tc 필터는 건드리지 않는다. QoS 없는 VM의 tap 명령은 바이트 그대로다.
+- **따라가는 것.** 라이브 마이그레이션(SDN은 포트를 따라, 단순은 받는 노드가 tap에 다시 건다), 템플릿·복제·가져오기·원격 복제(NIC 칸).
+  SDN NIC의 행은 유동 IP·LB 트래픽도 함께 제한한다(같은 포트를 지나므로).
+- `user` 네트워크 NIC의 `qos`는 400 `invalid_qos`(tap이 없어 아무것도 하지 않게 되므로). 권한은 VM의 `vm.config`(보안 그룹과 같다).
+  감사는 VM 줄에 `nic-qos 0 out=100 in=200 dscp=46`(뺐으면 `nic-qos 0 clear`).
+
+### 토폴로지
+
+웹 **인프라 › 네트워크 › 토폴로지**(`/networks/topology`)는 네트워크·라우터·게이트웨이·유동 IP·VM·LB를 **2.5D 그림**(아이소메트릭
+SVG — WebGL이 아님) 하나로 보인다. 바닥에 오버레이 네트워크 판과 그 위의 VM 블록·LB 기둥, 가운데 높이에 라우터 블록과 게이트웨이
+칩(활성 노드, 후보 없으면 경고 색), 뒤에 공급자 네트워크 판과 유동 IP·바깥 VIP 꼬리표, 옆에 회색 단순 네트워크 판(옮기는 중이면 대상
+판으로 화살표와 진행 수)이다. 누르면 그 서랍(라우터·LB는 그 보기로 가서 서랍), 가리키면 이어진 길(VM → 네트워크 → 라우터 → 공급자,
+LB → 멤버)이 밝아진다. 자세한 다루기는 [웹 화면 둘러보기](web-ui.md#sdn-화면).
+
+```bash
+orbivisorctl network topology --folder /tenant-a     # 같은 자료를 글 나무로(읽을 수 있는 것만)
+```
+
+API는 `GET /api/v1/network-topology?folder=&live=`(`system.read`)다. 읽을 수 없는 것은 빼고 `hidden`에 세며, 루트 `cluster.read`가
+없으면 노드 이름을 비운다. `live=true`면 OVN의 게이트웨이 주인과 LB 멤버 건강을 한 번씩 읽는다(기본 `false` — 화면은 watch 사건으로
+다시 읽고 살아 있는 상태만 30초마다).
+
+### 단순 네트워크를 SDN으로 옮기기
+
+옮기기 도구(계획 67)는 단순 네트워크(브리지·VLAN·VXLAN) **S**의 VM NIC를 서브넷이 있는 SDN 네트워크 **T**로 옮긴다. **주소를 그대로
+가져가고**, VM마다 꺼진 채·다시 켜며·**라이브**(tap만 옮김)로 하나씩 옮기며, 그동안 두 쪽 L2를 OVN `l2gateway` 다리로 잇고, 언제든
+되돌린다. 옮기는 것은 NIC 스펙(`network`, 주소, cloud-init NIC 항목)뿐이고 MAC·모델·보안 그룹·QoS는 그대로다(보안 그룹은 같은 뜻의 OVN
+ACL이 된다). 원본 네트워크는 지우지 않는다.
+
+```bash
+orbivisorctl network create t-lan --sdn --subnet 10.66.0.0/24,gateway=10.66.0.1   # 보통 원본 L2와 같은 CIDR, 게이트웨이 = 물리 라우터
+orbivisorctl network migrate lan --to t-lan --dry-run     # 계획만(리소스를 만들지 않음)
+# VM    NIC  MODE     ADDRESS     SOURCE       BLOCKER/WARNING
+# web1  0    live     10.66.0.21  guest-agent  -
+# db1   0    offline  10.66.0.11  cloud-init   the cloud-init instance-id changes: …
+# app1  0    blocked  -           -            the VM runs on n4, which is not an OVN chassis
+# bridge: on node n1
+orbivisorctl network migrate lan --to t-lan --ip app2=10.66.0.40    # 만들고 시작(이름 lan-to-t-lan), 막힌 VM은 건너뜀
+orbivisorctl network migration get lan-to-t-lan            # VM NIC마다 MODE·ADDRESS·STATE·ERROR
+orbivisorctl network migration pause lan-to-t-lan          # 지금 VM이 끝난 뒤 멈춤 — resume으로 이어 감
+orbivisorctl network migration rollback lan-to-t-lan web1  # 이 VM만 원본으로(없으면 모두)
+orbivisorctl network migration finish lan-to-t-lan --router r1   # 다리를 걷고 T를 r1 인터페이스로
+```
+
+- **미리 보기.** `--dry-run`(API `POST /network-migrations?dry_run=true`)이 VM NIC마다 방식·옮겨 갈 주소와 출처·막는 까닭·경고, 다리 노드를
+  보인다. 만들 때 이 계획을 적고, Task가 VM마다 **그때 다시** 계획해 달라졌으면(전원·주소가 바뀜) 그 VM만 `failed`(까닭)로 둔다.
+  막는 까닭: 템플릿 VM, T 서브넷 밖·예약 주소, 다른 VM과 같은 주소(단순 네트워크에는 IPAM이 없어 겹칠 수 있다), 이미 쓰는 주소, 같은
+  VM의 다른 NIC가 이미 T에, 다른 옮기기 중, 켜진 VM이 chassis가 아닌 노드에 있음, 권한 없음. 경고: 주소가 바뀜(`ipam`), MTU가 줄어듦,
+  게스트 에이전트 없음, 원본에 보안 그룹 없음, DHCP 다툼, cloud-init instance-id 바뀜.
+- **방식**(`--mode`, 옮기기 하나에 하나 — 기본 `auto`):
+
+| 방식 | 언제(`auto`) | 하는 일 | 끊김 |
+|---|---|---|---|
+| `offline` | VM이 꺼짐 | 스펙만 바꾼다(다음 켜기에 스케줄러가 chassis를 고름) | 없음 |
+| `live` | 켜짐, VM 노드가 chassis, 게스트가 볼 MTU가 줄지 않음(또는 `--allow-mtu-shrink`), 주소를 앎 | tap을 Linux 브리지에서 떼어 `br-int`에 붙이고 `ovn-installed`를 30초까지 기다린 뒤 QMP `set_link` 끔·켬(게스트가 링크를 다시 보고 DHCP를 다시 묻게). QEMU 장치·PID는 그대로, 게스트에 NIC가 빠졌다 꽂히지 않는다. 오지 않으면 tap을 되돌리고 그 VM은 `failed` | 보통 1초 안 |
+| `restart` | 켜짐, `live`가 안 됨 | ACPI 끄기 → 스펙 바꾸기와 켜기를 한 번에(켜지 못하면 원래 네트워크로 되돌려 다시 켬) | 끄기 + 켜기 |
+| `blocked` | 막는 까닭이 있음 | 건너뜀 | — |
+
+  `--mode live`인데 안 되는 VM은 `blocked`다(몰래 다시 켜지 않는다). VM마다 다른 방식이 필요하면 그 VM을 빼고(`--vm`) 끝낸 뒤 새 옮기기로
+  한다. 원본 MTU는 VXLAN이면 그 MTU, 브리지·VLAN은 1500으로 본다(오버레이 T는 1442라 그대로면 `restart`). `--parallel N`(1~8, 기본 1).
+- **주소.** 출처 차례는 `given`(`--ip VM[:NIC]=A[+B]`) → `guest-agent`(게스트 에이전트가 이 MAC에 보고한, T 서브넷 안의 주소) →
+  `cloud-init`(그 NIC의 고정 주소) → `ipam`(T 풀의 새 주소 — 주소가 바뀜). 주소를 모르고(`ipam`) 게스트가 고정 주소면 옮긴 뒤 포트 보안이
+  그 주소를 막으므로 `--ip`로 주거나 게스트 에이전트를 켠 뒤 한다. cloud-init 고정 주소 항목은 지우고(SDN NIC의 주소는 IPAM이 정함)
+  되돌리기가 되살린다.
+- **cloud-init instance-id가 바뀐다.** 씨앗 키가 cloud-init 주소 항목과 NIC 주소를 함께 세므로 옮긴 VM의 instance-id가 달라지고, 그
+  게스트는 **다음 부팅에 인스턴스마다 하는 일(SSH 호스트 키 새로 만들기 따위)을 다시 한다.** 계획과 웹 마법사가 cloud-init이 있는 VM에
+  이 경고를 단다. 피할 수 없다면 옮긴 뒤 SSH 호스트 키가 바뀐다고 알린다.
+- **다리**(`l2gateway`). 대상이 오버레이면 첫 VM 앞에서 T 스위치에 `l2gateway` 포트 `opl-l2gw-<옮기기 id>`를 두고, **다리 노드**(원본
+  브리지가 있는 chassis 가운데 옮길 VM이 가장 많은 노드, 또는 `--bridge-node`)가 계획 66 physnet 길(veth `oplp<h8>{o,b}`·OVS 브리지·
+  `ovn-bridge-mappings`의 `mig<h8>`)로 원본 브리지에 잇는다. 옮긴 VM과 남은 VM이 같은 서브넷으로 서로 닿는다(잰 값: 노드 하나 ping 1.0초
+  안, 여러 노드 VXLAN 원본 0.04초 — 다리 노드의 veth를 지남). 다리 동안 T의 DHCP는 `router` = 서브넷 게이트웨이(원본 망의 물리
+  라우터)를 주고, T를 라우터 인터페이스로 붙이는 것은 409 `network_migrating`이다(라우터 포트가 같은 게이트웨이 주소를 가지므로).
+  `--no-bridge`면 놓지 않는다. 대상이 원본과 같은 L2의 공급자 네트워크면 다리가 필요 없다(놓으면 고리).
+- **DHCP 다툼.** 원본 망에 DHCP 서버가 있으면 그 응답도 다리를 건너 옮긴 VM에 온다. 보통 같은 chassis의 OVN DHCP가 먼저 답하지만, 다른
+  주소를 받으면 포트 보안이 막는다 — 원본 DHCP 서버에 같은 주소로 예약하거나 옮기는 동안 끈다.
+- **되돌리기.** `rollback [VM…]`이 옮긴(또는 실패한) NIC를 거꾸로 옮긴다 — 켜진 VM은 `live`(tap만 옮긴 VM이거나 MTU가 줄지 않으면,
+  아니면 `restart`), 꺼진 VM은 `offline`. 원본 네트워크·보안 그룹·cloud-init 항목을 되살리고 IPAM 주소를 놓는다. 마지막 VM이 돌아가면 다리를
+  걷고 `rolled-back`. `finished` 뒤에는 되돌리기가 없다(그 뒤는 VM 편집이나 새 옮기기).
+- **끝내기.** `finish [--router R]`이 다리를 걷고(노드가 physnet을 걷기까지 120초 기다림), `--router`면 같은 Task가 T를 그 라우터
+  인터페이스로 붙인다(물리 라우터에서 OVN 라우터로 기본 경로 넘김 — DHCP 게스트는 다음 갱신, 고정 주소 게스트는 게이트웨이가 같은 주소라
+  바로). 원본에 NIC가 남은 VM이 있으면 경고만. 끝난 옮기기는 기록으로 남는다(`network migration list`, 지우기는 언제든 — 도는 Task가
+  있으면 409 `migration_in_progress`).
+- **다리 노드 바꾸기.** 다리 노드를 클러스터에서 지우면(`node remove`) 그 옮기기는 `paused`가 되고 다리 기록이 지워진다 — `network
+  migration resume M --bridge-node n2`로 새 다리 노드에서 이어 간다. **살아 있는 노드에 다리가 놓인 동안 바꾸기는 409
+  `migration_bridge_laid`**다: 모두 되돌린 뒤 `network migrate … --bridge-node n2`로 다시 한다.
+- **견디기.** Task는 VM마다 상태를 리소스에 적고 VM 스펙·전원·도는 NIC를 보고 다음 한 걸음을 하므로 opld가 다시 떠도 이어 간다(시간 제한
+  없음). 다리는 노드 하나를 지나는 길이다(넘김 없음 — 다리 노드가 죽으면 다리가 끊기고 경보 `sdn_physnet_not_ready`가 `mig…`로 뜬다).
+- **잰 값(GitHub `ovn`, 노드 하나).** `start` 4.1초(다리 준비 + 꺼진 VM 스펙 + QEMU VM 라이브 tap 옮기기 — QEMU PID 그대로), QEMU VM
+  되돌리기 1.1초, 끝내기 5.1초 뒤 `l2gateway` 행·매핑·veth·OVS 브리지가 모두 사라짐.
+- **권한.** 원본 네트워크의 `network.config` + 대상의 `network.assign` + 옮길 VM마다 `vm.config`(막힌 VM은 "권한 없음"). 멈춤·지우기는
+  네트워크 권한만, 끝내며 붙일 라우터는 그 라우터와 대상의 `network.config`. 리소스는 원본 네트워크의 폴더에 산다. 실행 중 VM의 NIC
+  네트워크를 일반 `PUT`으로 바꾸면 409 `nic_network_live`("use network migrate"). 감사 `network migrate lan → t-lan (3 VMs, live 2, restart 1)`.
+
+### OVN 접근 잠금
+
+계획 65의 OVN은 "클러스터 CA mTLS"라 이 클러스터의 노드 인증서만 있으면 NB·SB·Raft에 붙어 무엇이든 쓸 수 있었다. 잠금(계획 67)은 셋을
+막는다: **망가진 chassis가 남의 SB 행을 쓰는 것**(SB RBAC), **클러스터에서 지운 노드가 살아 있는 인증서로 다시 붙는 것**(주소 허용 목록),
+NB·Raft 포트가 모든 곳에 열린 것.
+
+```bash
+orbivisorctl sdn lockdown on --dry-run      # 바꾸지 않고 허용 집합과 집합 밖에서 붙은 상대를 보임
+# lockdown on: members 10.1.0.11, 10.1.0.12, 10.1.0.13, 10.1.0.14
+# centrals: 10.1.0.11, 10.1.0.12, 10.1.0.13
+# no connected peer is outside the allowed sets
+orbivisorctl sdn lockdown on                # 중앙을 하나씩 바꾼 뒤 허용 목록을 건다
+orbivisorctl sdn lockdown on --force        # 집합 밖 상대가 있어도
+orbivisorctl sdn status | grep lockdown     # lockdown: on (3/3 centrals, firewall on 5/5 nodes)
+orbivisorctl sdn lockdown off
+```
+
+- **SB 역할 포트와 특권 포트.** SB `ovsdb-server`가 설정 파일 `/etc/opl/ovn/sb.json`(0600)로 뜬다: **6642**는 `role=ovn-controller`
+  (chassis는 인증서 CN = 노드 UUID = chassis 이름인 **자기 `Chassis`·`Encap`·`Chassis_Private` 행만** 쓴다 — 남의 행·`SB_Global` 쓰기는
+  `RBAC rules … prohibit …`으로 거절, GitHub에서 확인), **6645**는 northd만 쓰는 특권 포트(중앙 주소만 받음), `punix`는 중앙의 root.
+  OvnSync·API의 SB 읽기(바인딩·서비스 모니터)는 6642로 한다. 지운 노드의 `Chassis` 청소는 이제 SB 리더인 중앙의 에이전트가 로컬
+  소켓으로 한다. NB에는 RBAC가 없다(OVN).
+- **주소 허용 목록**(nftables 표 `inet opl_ovn_<태그>`, 입력 훅, 우리 포트만 거름):
+
+| 노드 | 포트 | 받는 출발 주소 |
+|---|---|---|
+| 중앙 | TCP 6641(NB)·6642(SB 역할) | **멤버 집합**: Raft 노드 가운데 위트니스·macOS가 아닌 노드의 클러스터 주소(IP일 때)와 underlay 주소 |
+| 중앙 | TCP 6643·6644(Raft)·6645(SB 특권) | **중앙 집합**: 중앙 주소와 그 노드들의 underlay |
+| chassis | UDP 6081(Geneve) | 멤버 집합과 알린 Geneve 주소 |
+
+  그 밖의 출발 주소는 버린다(맺은 연결도). 루프백은 `127.0.0.1`·`::1`만 받는다. SSH·Orbivisor API·gRPC는 건드리지 않고, 집합을 읽지 못하면
+  마지막 표를 둔다(비우지 않음). 노드를 지우면 1초 안에 모든 에이전트가 그 주소를 빼고 — **잰 값: `cluster remove-node` 뒤 1.1초에 지운 노드의
+  인증서가 남은 중앙의 6641·6642에 붙지 못했다** — 그 노드의 `Chassis`도 지워져 다른 chassis의 터널이 사라진다. 인증서는 여전히 CA로 맞지만
+  쓸 길이 없다.
+- **켜고 끄기.** `sdn lockdown on|off`(`POST /api/v1/sdn/lockdown {enabled, force?}`, 루트 `cluster.admin`)가 `sdn-lockdown` Task를 만든다.
+  중앙마다 에이전트가 **자기 차례**(다른 중앙이 모두 온라인이고 리더·팔로어)에 설정을 쓰고 SB를 다시 띄워 따라잡은 뒤 적용을 알린다 —
+  한 번에 하나라 OVN 정족수가 남고, northd는 잠긴 중앙엔 6645·아직 아닌 중앙엔 6642로 붙는다. 모든 중앙이 끝난 **뒤에** 허용 목록을 건다.
+  끄기는 거꾸로(표를 먼저 걷고 중앙을 하나씩). 잰 값: 노드 하나 켜기 3.1초·끄기 5.1초, 중앙 셋 켜기 10.5초(그동안 VM ping 61/61)·끄기
+  6.2초(40/40) — **잃은 패킷 0**. 중앙 Task(더하기·빼기)와 동시에 돌지 않는다(409 `sdn_busy`).
+- **미리 확인과 `--force`.** `--dry-run`(`?dry_run=true`)은 허용 집합과, 지금 중앙의 6641·6642에 붙은 상대 주소(중앙 에이전트가 `ss`로 읽어
+  알림) 가운데 집합 밖인 것을 보인다 — NAT·다른 출발 주소로 붙은 노드를 미리 찾는다. 집합 밖 상대가 **하나라도** 있으면 켜기를 막는다(409
+  `lockdown_peers_outside`, `--force`로만 — 주소만으로는 NAT 뒤 멤버인지 지운 노드인지 가릴 수 없다).
+- **새 클러스터는 켜진 채로.** `sdn init`은 모든 노드가 `sdn-services`를 알면 잠금을 켠 채로 세운다(첫 중앙부터 잠근 모양). 계획 65·66으로
+  세운 클러스터는 관리자가 켤 때까지 그대로다(업그레이드가 OVN 단위를 바꾸지 않는다). 잠금이 꺼져 있으면 OVN 단위는 계획 66과 바이트까지
+  같다. 중앙 더하기는 잠금 상태를 따르고, 더할 노드는 합류 전에 중앙 집합에 든다.
+- **보기.** `GET /api/v1/sdn`의 `lockdown { enabled, applied, pending, error, allowed, nodes[{node, firewall, error}] }`(켠 적이 있을 때만),
+  `sdn status`의 잠금 줄, 웹 SDN 보기의 잠금 카드. 켜졌는데 표가 맞지 않는 노드는 경보 `sdn_sync_failed`의 까닭으로 보인다.
+- **남는 것.** OVN 24.03 RBAC는 `Port_Binding`·`MAC_Binding`·`FDB` 쓰기에 id를 보지 않는다 — 망가진 chassis가 남의 포트를 자기에게
+  바인딩할 수 있다(OVN이 막지 않음, `network ips`의 NODE가 VM 노드와 다르게 보인다). NB는 여전히 모든 멤버 노드가 쓴다. 인증서 폐기·CA
+  바꾸기, Geneve 암호화는 없다.
+
+### SDN 경보
+
+[알림](cluster.md#알림)의 경보 규칙에 SDN 조건 여덟이 있다(계획 67). 모두 **리더가 평가**하고(`for_secs`·`repeat_secs`·`severity`·대상은 다른
+규칙과 같다), 입력은 Raft의 노드·SDN 상태와 리더 OvnSync가 10초마다 읽는 관찰(게이트웨이 주인, LB 멤버 건강)이다. SDN을 세우기 전에는
+모두 거짓이다.
+
+| 조건 | 대상 | 참일 때 |
+|---|---|---|
+| `sdn_quorum_lost` | SDN | NB 또는 SB에 리더를 알리는 중앙이 없거나, 리더·팔로어인 중앙이 과반 미만(오프라인 노드는 꺼짐으로 셈) |
+| `sdn_central_down` | 노드 | 중앙의 NB·SB 가운데 하나가 꺼짐·후보이거나 노드가 오프라인 |
+| `sdn_chassis_down` | 노드 | 온라인 chassis 노드의 ovn-controller가 꺼짐·구성 중 |
+| `sdn_gateway_unavailable` | 라우터 | 바깥이 있는데 게이트웨이 후보가 없음, 또는 모든 후보가 오프라인 |
+| `sdn_gateway_failover` | 라우터 | (이벤트) 게이트웨이 주인 노드가 바뀜 — 문구에 옛·새 노드 |
+| `sdn_sync_failed` | SDN | OvnSync 오류, 또는 300초 넘게 동기화 없음, 또는 잠금 표가 맞지 않는 노드 — 문구에 실패한 묶음 |
+| `sdn_physnet_not_ready` | 노드 | 설정한 physnet(옮기기 다리 `mig…` 포함)이 준비 안 됨 — 문구에 까닭 |
+| `sdn_lb_member_down` | LB | 건강 검사 멤버 가운데 `offline`·`error`가 있음(LB마다 하나 — 문구에 멤버 목록) |
+
+```bash
+orbivisorctl alert rule add-sdn-defaults --target ops-mail       # 권하는 여덟 규칙을 한 번에(같은 이름은 그대로 둠)
+orbivisorctl alert rule create gw --condition sdn_gateway_unavailable --for 30s --severity critical --target phone
+```
+
+- **권하는 묶음**(`add-sdn-defaults`, `POST /api/v1/alert-rules/sdn-defaults {targets}` → `{created, existing}`, 웹 SDN 보기의 "SDN 경보
+  켜기"): `sdn-quorum-lost` critical 0초, `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초,
+  `sdn-gateway-failover` info(이벤트), `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning
+  30초, 반복 4시간, 해제 알림. 만든 뒤는 보통 규칙이고 다시 불러도 안전하다(같은 이름이면 건드리지 않음 — 웹·CLI가 같은 서버 묶음을 부른다).
+- **노드 거르기**(`--node`)는 대상이 노드인 조건(`central_down`·`chassis_down`·`physnet_not_ready`)에만 쓴다(나머지는 400).
+- **리더가 바뀌면** 관찰 기반 조건(게이트웨이 넘김·LB 멤버)은 새 리더의 첫 관찰까지 평가하지 않고(거짓으로 풀지 않음), 넘김은 같은 임기의
+  관찰끼리만 견준다. 대상이 사라진 firing 경보(라우터·노드를 지움, 중앙이 아니게 됨)는 해제로 알린다. 오프라인 노드의 `chassis_down`·
+  `physnet_not_ready`는 모르는 것으로 둔다(`node-offline`이 알림).
+- **잰 값(여러 노드 시험, 지속 시간 5초로 줄임).** LB 멤버 듣기 멈춤 → `sdn_lb_member_down` 11.5초, 게이트웨이 후보를 모두 빼면
+  `sdn_gateway_unavailable` 9.5초(되돌리면 해제 62.6초 — 해제 대기 60초), 게이트웨이 노드의 ovn-controller 멈춤 → 넘김 확인 때
+  `sdn_gateway_failover`("moved from c2 to c3")와 `sdn_chassis_down`이 이미 와 있음, 중앙 컨테이너 죽이기 → `sdn_central_down` 17.0초.
+  `sdn_quorum_lost`는 순수 시험 표로만 보았다(컨테이너 셋에서 중앙 둘을 죽이면 Orbivisor Raft도 정족수를 잃어 평가할 리더가 없다).
+
 ### 폴더 권한과 할당량
 
-라우터와 유동 IP는 **네트워크 폴더**에 산다(네트워크 폴더가 테넌트, [폴더와 권한](folders.md)).
+라우터·유동 IP·부하 분산기·옮기기는 **네트워크 폴더**에 산다(네트워크 폴더가 테넌트, [폴더와 권한](folders.md)).
 
 | 일 | 필요한 것 |
 |---|---|
@@ -726,20 +1003,29 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
 | 내 네트워크를 라우터에서 떼기 | 그 네트워크의 `network.config`(라우터 권한 없이 — `router detach`) |
 | 라우터 바깥 정하기 | + 바깥 네트워크의 `network.assign` |
 | 유동 IP 만들기·지우기 | 유동 IP 폴더의 `network.config` + 바깥 네트워크의 `network.assign`(주소를 직접 주면 유동 IP 범위 안 — 밖은 루트 `cluster.admin`) |
-| 유동 IP 붙이기·떼기 | 유동 IP의 `network.config` + 대상 VM의 `vm.config`(떼기는 앞의 것만) |
-| 보기 | `system.read`(라우터·유동 IP·네트워크). 다른 폴더의 VM은 이름을 감추고, 루트 `cluster.read`가 없으면 노드 이름도 감춘다. 오류 문구도 읽을 수 없는 라우터·유동 IP는 이름 없이 센다. `GET /routers`의 `routed`는 읽을 수 있는 네트워크 가운데 라우터 인터페이스인 것과 그 바깥(라우터 이름 없이)이다 — 웹이 읽을 수 없는 라우터 뒤의 NIC에도 유동 IP를 붙이게 한다 |
+| 유동 IP 붙이기·떼기 | 유동 IP의 `network.config` + 대상 VM의 `vm.config`. 떼기는 유동 IP의 `network.config` **또는** 지금 붙은 VM의 `vm.config`(계획 67 — 유동 IP를 읽을 수 없어도 VM 주인이 뗄 수 있다) |
+| 부하 분산기 만들기·바꾸기·지우기 | LB(만들기는 폴더)의 `network.config` + VIP 네트워크의 `network.assign`(지우기는 LB의 `network.config`만) |
+| LB 멤버 | NIC 멤버는 + 그 VM의 `vm.config`(남의 VM으로 트래픽을 보내지 않게), 주소 멤버는 + 그 서브넷 네트워크의 `network.assign` |
+| LB 바깥 VIP | + 공급자 네트워크의 `network.assign`(유동 IP 범위 밖 주소는 루트 `cluster.admin`) |
+| NIC `qos` | VM의 `vm.config` |
+| 옮기기 만들기·시작·끝내기·되돌리기 | 원본 네트워크의 `network.config` + 대상의 `network.assign` + 옮길 VM마다 `vm.config`(멈춤·지우기는 네트워크 권한만) |
+| OVN 잠금 켜고 끄기, SDN 경보 규칙 | 루트 `cluster.admin` |
+| 보기 | `system.read`(라우터·유동 IP·네트워크·LB·옮기기·토폴로지). 다른 폴더의 VM은 이름을 감추고, 루트 `cluster.read`가 없으면 노드 이름도 감춘다. 오류 문구도 읽을 수 없는 라우터·유동 IP는 이름 없이 센다. `GET /routers`의 `routed`는 읽을 수 있는 네트워크 가운데 라우터 인터페이스인 것과 그 바깥(라우터 이름 없이)이다 — 웹이 읽을 수 없는 라우터 뒤의 NIC에도 유동 IP를 붙이게 한다 |
 | 보안 그룹 | 지금 그대로(만들고 바꾸기는 admin) |
 
-- 라우터·유동 IP에도 객체 grant를 준다(`/api/v1/grants`의 대상 `router/<id>`·`floating-ip/<id>`, 웹의 행마다 권한 서랍).
-- **할당량.** 네트워크 폴더에 `routers`·`floating_ips`(하위 트리의 수)를 둔다 — 공인 주소가 테넌트에게 가장 귀한 것이라서다.
+- 라우터·유동 IP·부하 분산기·옮기기에도 객체 grant를 준다(`/api/v1/grants`의 대상 `router/<id>`·`floating-ip/<id>`·`load-balancer/<id>`·
+  `network-migration/<id>`, 웹의 행마다 권한 서랍).
+- **할당량.** 네트워크 폴더에 `routers`·`floating_ips`와 계획 67의 `networks`·`load_balancers`(하위 트리의 수)를 둔다 — 공인 주소가
+  테넌트에게 가장 귀한 것이라서다. **LB의 바깥 VIP는 `floating_ips`도 하나 쓴다**(공인 주소는 어떤 리소스가 잡든 같은 것 — LB에 바깥
+  VIP를 붙이는 바꾸기도 센다). 옮기기는 세지 않는다. `ips` 차원은 두지 않는다: 오버레이 주소는 테넌트 자기 망의 것이고 공유 공급자 망의
+  주소는 `floating_ips`와 관리자가 준 `network.assign`으로 이미 묶인다.
   VM 폴더에 주면 400("quota routers cannot be set on a vm folder"), 넘으면 409 `quota_exceeded`(Raft 상태 머신이 커밋 순서대로
-  센다). `orbivisorctl folder quota set network:/tenant --routers 2 --floating-ips 8`(`folder usage network:/tenant`), API `PATCH
-  /api/v1/folders/{id}`의 `quota: {"routers": 2, "floating_ips": 8}`, 웹 네트워크 폴더 상세의 할당량 탭.
-  `GET /api/v1/folders/{id}/usage`가 둘을 센다.
-- **옮기기.** `orbivisorctl folder members move network:/tenant router/r1 fip/web`, 웹 네트워크 폴더의 내용 탭(라우터·유동 IP도
+  센다). `orbivisorctl folder quota set network:/tenant --routers 2 --floating-ips 8 --networks 10 --load-balancers 4`(`folder usage
+  network:/tenant`), API `PATCH /api/v1/folders/{id}`의 `quota: {"routers": 2, "floating_ips": 8, "networks": 10, "load_balancers": 4}`, 웹
+  네트워크 폴더 상세의 할당량 탭. `GET /api/v1/folders/{id}/usage`가 넷을 센다(0이면 칸이 없음). 계획 67 차원은 기능 `sdn-services` 뒤다.
+- **옮기기.** `orbivisorctl folder members move network:/tenant router/r1 fip/web lb/web-lb`, 웹 네트워크 폴더의 내용 탭(라우터·유동 IP·LB도
   종류 칸과 함께 나오고 끌어 놓기·"폴더로 옮기기"), API `POST /api/v1/folders/{id}/members {"items": [{"kind": "router", "key":
   "r1"}, {"kind": "floating-ip", "key": "web"}]}`. 객체 grant도 CLI가 받는다(`orbivisorctl grant add --user bob --role operator --on router/r1`).
-  네트워크·유동 IP의 할당량 차원 `networks`·`ips`는 계획 67이다.
 
 ### MTU: 바깥에서 들어오는 큰 패킷
 
@@ -770,15 +1056,34 @@ orbivisorctl vm nic-sg web1 0 web          # 실행 중에도 그룹만 바꾼�
 | 테넌트·할당량 | 프로젝트, 라우터·유동 IP 할당량 | 없음 | 프로젝트·VPC | 네트워크 폴더, 할당량 `routers`·`floating_ips` |
 | 설치·운영 | 배포 도구가 따로 | 내장(SDN은 FRR 따로) | NSX Manager·Edge VM | orbivisord가 OVN 설치, physnet·게이트웨이는 노드 설정 한 줄 |
 
+### 부하 분산·QoS·옮기기: Octavia·Proxmox·NSX와 견주기
+
+| | OpenStack Octavia(Amphora / OVN 공급자) | Proxmox VE 8 | VMware NSX 4(NSX ALB·NSX LB) | Orbivisor 계획 67 |
+|---|---|---|---|---|
+| LB 모양 | Amphora: 테넌트마다 HAProxy 서비스 VM(액티브·스탠바이), L7·TLS. OVN 공급자: NB `Load_Balancer`, L4만 | 없음(사용자가 HAProxy VM) | Edge의 서비스 라우터(L4·L7), NSX ALB는 서비스 엔진 VM | OVN 내장 `Load_Balancer`(OVN 공급자와 같은 자리), L4 TCP·UDP |
+| 데이터 길 | Amphora는 VM을 지남. OVN 공급자는 클라이언트 chassis에서 분산 DNAT | — | Edge 노드에 모임 | 클라이언트 chassis에서 분산 DNAT, 바깥 VIP만 게이트웨이 chassis |
+| 건강 검사 | Amphora: HTTP·TCP 따위. OVN 공급자: TCP·UDP(서비스 모니터, 네트워크마다 `ovn-lb-hm` 포트) | — | 능동·수동 모니터, L7 | TCP·UDP 서비스 모니터, LB·네트워크마다 출발 주소, 멤버 SG 경고 |
+| 넘김 | Amphora 짝 VRRP, OVN 공급자는 모니터 + 게이트웨이 HA | — | Edge 액티브·스탠바이 | 죽은 멤버 빼기 3.6~4.4초(간격 2초·fall 2 측정), 바깥 VIP는 게이트웨이 HA(GARP로 1.3초) |
+| 바깥 주소 | 유동 IP를 VIP 포트에 붙임 | — | VIP를 Tier-0/1에 광고 | LB의 `external` 칸(유동 IP 범위·`floating_ips` 할당량), SNAT 없음 |
+| 운영 부담 | Amphora 이미지·업그레이드·자원 셈 | — | Edge·서비스 엔진 VM | NB 행뿐(VM·에이전트 없음) |
+| QoS | Neutron QoS 정책(대역폭·DSCP·최소 대역폭) | NIC `rate`(tc, 속도만) | 세그먼트 프로필(셰이핑·DSCP) | NIC 칸: 속도·버스트·DSCP(SDN), 단순 NIC도 tc 속도 — 같은 폴리싱 뜻 |
+| 네트워크 옮기기 | 없음(사용자가 포트를 바꿈) | 실행 중 브리지 바꾸기(NIC마다 손으로) | Migration Coordinator(단계별·되돌리기, VLAN → 세그먼트 다리) | 미리 보기 계획, 주소 가져가기, VM마다 offline·live·restart, `l2gateway` 다리, 되돌리기, 끝내며 라우터 붙이기 |
+| 제어 평면 접근 | SB RBAC(`ovn-controller` 역할) | — | 관리자·전송 노드 인증서 | SB RBAC + northd 특권 포트 + Raft 멤버십을 따르는 주소 허용 목록(지운 노드 1.1초에 끊김) |
+
+**고르지 않은 것.** L7(HTTP 규칙·TLS 종료·쿠키 고정)·SCTP·IPv6 VIP는 넣지 않았다 — 서비스 VM이 필요하거나(L7) OVN 서비스 모니터가 IPv4만이라서다.
+L7이 필요하면 LB 뒤에 HAProxy VM을 둔다. 최소 대역폭 보장은 스케줄러의 대역폭 셈이 필요해 나중이다.
+
 ### OvnSync: Raft에서 OVN으로
 
 API는 Raft만 쓰고 OVN을 부르지 않는다. **리더의 `OvnSync`**가 Raft의 SDN 네트워크·서브넷·VM NIC·라우터·유동 IP·보안
-그룹을 NB의 행(`Logical_Switch`·`Logical_Switch_Port`·`DHCP_Options`, 계획 66부터 `Logical_Router`·라우터 포트·정적 경로·
-`NAT`·`HA_Chassis_Group`·`Port_Group`·`ACL`)으로 그려 지금 NB와 다른 것만 쓴다. 트랜잭션은 그룹 목록 Port_Group마다 →
-네트워크마다 → 라우터마다 → 지울 것 차례이고, 하나가 실패해도 다른 것은 쓰인다(`sync`의 오류가 그 이름을 댄다).
-Network·Vm·Sdn·Router·FloatingIp·SecurityGroup이 바뀌거나 노드의 게이트웨이 우선순위·유지보수·준비된 physnet이 바뀌면 0.5초
+그룹·부하 분산기·옮기기 다리를 NB의 행(`Logical_Switch`·`Logical_Switch_Port`·`DHCP_Options`, 계획 66부터 `Logical_Router`·라우터
+포트·정적 경로·`NAT`·`HA_Chassis_Group`·`Port_Group`·`ACL`, 계획 67부터 `Load_Balancer`·`Load_Balancer_Health_Check`·`QoS`·`l2gateway`
+포트)으로 그려 지금 NB와 다른 것만 쓴다. 트랜잭션은 그룹 목록 Port_Group마다 → LB마다 → 네트워크마다(QoS 행·다리·LB 붙이기 포함) →
+라우터마다 → 지울 것 차례이고, 하나가 실패해도 다른 것은 쓰인다(`sync`의 오류가 그 이름을 댄다 — 실패한 묶음은 경보
+`sdn_sync_failed`의 문구에도). Network·Vm·Sdn·Router·FloatingIp·SecurityGroup·LoadBalancer·NetworkMigration이 바뀌거나 노드의 게이트웨이 우선순위·유지보수·준비된 physnet이 바뀌면 0.5초
 모아 한 번, 리더가 된 직후, 그리고 60초마다(누가 NB를 고쳐도 되살린다) 돈다. NB는 다시 만들 수 있는
-파생물이다 — 지워도 다음 차례에 되살아난다.
+파생물이다 — 지워도 다음 차례에 되살아난다. 리더 OvnSync는 차례 뒤와 10초마다 게이트웨이 주인·LB 멤버 건강을 읽어 경보 엔진에 넘긴다
+(Raft에 쓰지 않음). LB·QoS·다리를 쓰지 않으면 NB 행은 계획 66과 같다.
 
 - **주인 표시.** Orbivisor가 만든 NB 행은 `external_ids:orbivisor:cluster=<클러스터 태그>`를 갖고, OvnSync는 그런 행만 바꾸고
   지운다. 관리자가 `ovn-nbctl`로 만든 행은 남는다.
@@ -799,6 +1104,11 @@ IP, 네트워크 폴더 할당량 `routers`·`floating_ips`, SDN NIC의 보안 �
 전에는 409 `cluster_upgrading`이다. 라우터·공급자 네트워크·`ipv6-mode`·SDN NIC 그룹을 쓰지 않으면 OvnSync가 계획 65와 같은
 NB 행을 쓰고(업그레이드가 NB를 건드리지 않는다) 단순 NIC의 nftables 규칙 글도 바이트 그대로다.
 
+계획 67의 칸(부하 분산기, 옮기기, NIC `qos`, OVN 잠금, SDN 경보 조건, 네트워크 폴더 할당량 `networks`·`load_balancers`)은 기능
+**`sdn-services`** 뒤에 있다 — 모든 노드가 알리기 전에는 409 `cluster_upgrading`이고, 노드는 `status.qos`·잠금 상태를 쓰지 않는다.
+LB·QoS·옮기기를 쓰지 않으면 NB 행, QoS 없는 VM의 tap 명령, nftables 글, cloud-init 씨앗이 바이트 그대로이고, 잠금을 켜지 않은 클러스터의
+OVN 단위도 그대로다.
+
 ### 보안
 
 - **OVN 연결은 모두 클러스터 CA mTLS다.** NB·SB·Raft 포트는 `pssl`만 열고(평문 `ptcp` 없음) 노드 인증서
@@ -809,7 +1119,9 @@ NB 행을 쓰고(업그레이드가 NB를 건드리지 않는다) 단순 NIC의 
   중앙 주소·노드 주소와 견준다.
 - 로컬 `punix` 소켓(`/run/opl/ovn/{nb,sb}.sock`)은 root만 쓴다.
 - Geneve(UDP 6081)는 VXLAN처럼 암호화하지 않는다. underlay는 믿을 수 있는 망이어야 한다.
-- 계획 65에서 chassis는 SB의 다른 chassis 행도 쓸 수 있다(SB RBAC는 계획 67).
+- **잠금을 켜면**(새 클러스터의 기본) chassis는 SB에서 자기 행만 쓰고, northd만 특권 포트를 쓰며, 지운 노드는 인증서가 살아 있어도 붙지
+  못한다([OVN 접근 잠금](#ovn-접근-잠금)). 계획 65·66으로 세운 클러스터는 `sdn lockdown on`을 할 때까지 chassis가 SB의 다른 chassis 행도
+  쓸 수 있다.
 
 ### 문제 풀기
 
@@ -830,6 +1142,16 @@ ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only --bare get Logical_Rou
 ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only acl-list opl_<태그>_<h16>    # 그룹 목록 Port_Group의 ACL
 ovs-vsctl get Open_vSwitch . external_ids:ovn-bridge-mappings                # 노드의 physnet 매핑
 ip -br link show master vmbr1                                                # 관리자 브리지에 매단 veth oplp…b
+# 부하 분산·QoS(계획 67). LB 행은 opl-lb-<LB id>-<tcp|udp>
+ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lb-list
+ovn-sbctl --db=unix:/run/opl/ovn/sb.sock --no-leader-only list Service_Monitor    # 멤버 건강(online·offline)
+ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only qos-list opl-<네트워크 id>
+tc filter show dev <tap> ingress; tc filter show dev <tap> egress            # 단순 NIC의 police(pref 49152)
+# 잠금(계획 67)
+ovs-appctl -t /run/opl/ovn/sb.ctl ovsdb-server/list-remotes                  # 잠겼으면 pssl:6642·pssl:6645·punix
+nft list table inet opl_ovn_<태그>                                            # 허용 집합 members·centrals·geneve
+# 옮기기 다리(계획 67). 포트 opl-l2gw-<옮기기 id>, 다리 노드의 매핑 mig<h8>
+ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lsp-list opl-<대상 네트워크 id> | grep l2gw
 ```
 
 - `sdn status`의 CHASSIS가 `down`이면 ovn-controller가 SB에 붙지 않은 것이다(중앙에 닿는지, TCP 6642). `configuring`은 붙었으나
@@ -849,13 +1171,26 @@ ip -br link show master vmbr1                                                # �
 - **보안 그룹을 바꾸자 SDN VM의 맺은 연결이 끊김.** 허용을 뺀 규칙에 걸린 연결은 OVN에서 끊기는 것이 뜻이다([SDN NIC의 보안
   그룹](#sdn-nic의-보안-그룹)).
 - **밖에서 들어오는 큰 UDP·DF 패킷이 사라짐.** [MTU](#mtu-바깥에서-들어오는-큰-패킷).
+- **LB 멤버가 `offline`인데 서비스는 산다.** 멤버 NIC의 보안 그룹이 검사 주소(`network ips`의 `lb-monitor` 행)에서 오는 것을 막는지
+  본다(`lb get`의 WARNING). UDP 검사는 ICMP 포트 닿지 않음으로만 죽음을 안다.
+- **VIP에 닿지 않음.** `lb get`의 `vip_state`·`external_state` 까닭(라우터 인터페이스가 아님, 게이트웨이 후보 없음)과 `lb-list`의 행을 본다.
+  멤버가 하나도 없거나 모두 죽었으면 연결이 곧바로 거절된다.
+- **QoS 측정이 제한보다 크다.** 처음 몇 초는 버스트다 — 앞을 빼고 길게 잰다. 단순 NIC 노드를 다시 띄운 뒤 tc가 어긋나 보이면 `vm hotplug`가
+  맞춘다.
+- **옮긴 VM이 주소를 잃음.** 원본 DHCP 서버가 다른 주소를 줬는지(다리를 건너 옴), 게스트가 고정 주소인데 계획이 `ipam`이었는지 본다.
+  되돌리기(`network migration rollback`)는 언제든 된다.
+- **잠금 켜기가 409 `lockdown_peers_outside`.** `--dry-run`의 밖 상대가 NAT 뒤 멤버면 그 출발 주소를 노드 underlay로 알리게 고치거나
+  `--force`, 지운 노드면 그대로 켠다. 켠 뒤 노드가 붙지 못하면 `sdn status`의 잠금 줄과 그 노드의 `firewall`·오류를 본다.
 
-### 계획 66이 아직 하지 않는 것
+### 계획 67이 아직 하지 않는 것
 
-- **부하 분산, QoS, 단순 → SDN 옮기기 도구**(VM NIC를 VXLAN·브리지 네트워크에서 SDN 네트워크로), 토폴로지 화면, 네트워크 폴더
-  할당량 `networks`·`ips`, SB RBAC, OVN 알림(`sdn_sync_failed`·`ovn_central_degraded`·`chassis_down`·`gateway_failover`)은 **계획
-  67**이다.
-- 라우터끼리 잇기, 공급자 네트워크를 인터페이스로, 바깥 게이트웨이 여럿·ECMP, 정책 경로, 포트 포워딩, 유동 IP QoS.
+- 부하 분산의 L7(HTTP 규칙·TLS 종료·쿠키 고정), SCTP, IPv6 VIP·건강 검사, 라우터 없는 네트워크·공급자 네트워크에 곧바로 둔 VIP, LB끼리
+  VIP 나누기, `Load_Balancer_Group`.
+- QoS 정책 리소스·네트워크 기본 QoS, 최소 대역폭 보장, 유동 IP QoS, 단순 NIC의 DSCP.
+- SDN → 단순 옮기기(되돌리기만), VXLAN 장치를 통째로 OVN으로 바꾸기, 실행 중 단순 ↔ 단순 NIC 네트워크 바꾸기.
+- OVN 잠금 다음: `Port_Binding` 주인 견주기 경보, 클러스터 CA 바꾸기·인증서 폐기, Geneve IPsec, NB 읽기 전용 원격.
+- 토폴로지에서 끌어 놓아 잇기(라우터 인터페이스 만들기 따위), 노드·랙 배치(계획 70의 2.5D 클러스터 보기).
+- 라우터끼리 잇기, 공급자 네트워크를 인터페이스로, 바깥 게이트웨이 여럿·ECMP, 정책 경로, 포트 포워딩.
 - 보안 그룹을 폴더에(테넌트가 자기 그룹을 만듦), 다른 그룹을 원격으로 가리키는 규칙, ACL 로그·카운터, 관리자 정책 층.
 - 서브넷 `default_route: false`(SDN NIC 여럿인 VM), DNS 이름, 접두사 위임, BGP·EVPN 광고, OVN 연동(IC), physnet에 물리 NIC를
   직접, 하드웨어 오프로드·DPDK, SDN 끄기와 OVN 지우기, 중앙 자동 교체.
@@ -865,18 +1200,31 @@ ip -br link show master vmbr1                                                # �
 - **꺼진 중앙을 내쫓아도 그 노드는 모른다.** 내쫓은 노드의 단위·DB는 그대로라, 되살리면 옛 OVN 서버가 다시 켜진다(클러스터는
   받지 않는다). "남은 중앙 DB"로 보이므로 `sdn central remove`로 치운다.
 - **여러 노드 시험은 컨테이너다.** chassis 셋 사이의 Geneve, 실제 OVN Raft 셋, 두 chassis 라이브 마이그레이션, 게이트웨이 넘김,
-  노드 통째 죽음과 죽은 중앙의 실제 `cluster/kick`은 GitHub `sdn-multinode` 작업(한 러너의 systemd 컨테이너 셋)이 본다. 실제
-  하드웨어 장애의 넘김 시간, 실제 물리 VLAN 스위치, 게스트 OS의 응답(게스트 없는 VM), **여러 chassis에 걸친 보안 그룹**은 보지
-  않았다(보안 그룹의 같은 뜻은 노드 하나의 `ovn` 작업이 nftables와 견줘 본다).
-- **라우터·유동 IP 화면은 30초마다 다시 읽는다**(watch가 아님 — 연 라우터 서랍의 지금 게이트웨이는 10초마다). 다른 사람이 바꾼
-  것은 그만큼 늦게 보인다.
-- `vm get`은 NIC의 유동 IP를 따로 보이지 않는다(웹 하드웨어 표·`fip list`).
+  노드 통째 죽음과 죽은 중앙의 실제 `cluster/kick`, 계획 67의 여러 chassis 보안 그룹(c1 → c3 ping이 그룹을 건 뒤 2.1초에 막힘, tcp 22는
+  됨)·LB 넘김·바깥 VIP의 게이트웨이 넘김·Geneve 너머 QoS·VXLAN 원본 옮기기와 다리 노드 바꾸기·잠금과 지운 노드·경보는 GitHub
+  `sdn-multinode` 작업(한 러너의 systemd 컨테이너 셋, 커널 하나)이 본다. 실제 하드웨어 장애의 넘김 시간, 실제 물리 VLAN 스위치와 그
+  DSCP 처리, 높은 속도의 QoS 정확도(veth), 게스트 OS의 응답(게스트 없는 VM)은 보지 않았다.
+- **연 라우터 서랍의 지금 게이트웨이, LB 목록의 멤버 건강, 토폴로지의 살아 있는 상태는 30초마다 읽는다**(OVN의 상태라 사건이 없다).
+  라우터·유동 IP·LB·옮기기 목록은 계획 67부터 watch다.
+- `vm get`은 NIC의 유동 IP를 따로 보이지 않는다(웹 하드웨어 표·`fip list`). 그래서 **유동 IP를 읽을 수 없는 VM 주인은 웹에서 그 유동 IP를
+  찾을 길이 없다**(떼기 권한은 있음 — 키를 알면 CLI·API로).
 - **보안 그룹 쓰기가 실패하면.** 한 그룹 목록의 Port_Group 쓰기가 계속 실패하면(같은 이름의 남의 Port_Group 따위) 그 목록을 쓰는
   네트워크의 포트 쓰기가 모두 실패한다(그 네트워크의 새 VM은 포트가 없어 켜지지 않음 — 닫힌 쪽으로 실패). 이미 있는 목록의 규칙을
   더 좁히는 쓰기가 실패하면 그 목록의 포트는 옛(더 넓은) 규칙에 남는다. 둘 다 `sdn status`의 동기화 오류로 보인다.
-- **게이트웨이 표에 chassis 상태가 없다**(`sdn status`가 보인다). 넘김 알림은 계획 67이다.
+- **게이트웨이 표에 chassis 상태가 없다**(`sdn status`가 보인다). 넘김·chassis 꺼짐은 [SDN 경보](#sdn-경보)로 안다.
 - "10초 안에 포트가 바인딩되지 않음" 경고는 orbivisord 로그에만 있고 API·웹에는 없다.
 - 주소가 있는 NIC의 빠진 체계 채우기(`--fill`)는 CLI만이다. 주소 없는 NIC는 서브넷을 더할 때 서버가 채운다.
 - 서브넷은 체계마다 하나, DHCP 릴레이·여러 서브넷·DNS 이름은 없다. 템플릿 배포 `--count` 2 이상에는 주소를 고를 수 없다.
 - 원격 복제(계획 55)를 받는 클러스터에는 같은 이름의 SDN 네트워크가 있어야 하고, 주소가 겹치면 받기가 실패한다.
 - 중앙 판은 첫 중앙의 OVN 판과 주·부 판이 같아야 한다(꾸러미를 올릴 때는 모든 중앙을 함께).
+- **부하 분산.** VIP·건강 검사는 IPv4만, UDP 검사는 약하다. 죽은 멤버는 새 연결에서만 빠진다(맺은 연결은 그 멤버로 가다 끊김). VIP 네트워크는
+  라우터 인터페이스여야 한다. LB는 복제·템플릿·원격 복제를 따라가지 않는다.
+- **QoS는 폴리싱이다.** 넘는 패킷을 버리므로 UDP는 넘는 만큼 잃고 처음 몇 초는 버스트만큼 더 간다. 단순 NIC의 tc는 opld를 다시 띄워도
+  다시 맞추지 않는다(커널이 tap과 함께 들고 있음 — 어긋나면 `vm hotplug`).
+- **옮기기.** cloud-init이 있는 VM은 instance-id가 바뀌어 다음 부팅에 인스턴스마다 하는 일(SSH 호스트 키 따위)을 다시 한다. 방식은 옮기기
+  하나에 하나다. 켜진 VM이 chassis가 아닌 노드에 있으면 막힌다. 다리는 노드 하나를 지나고 넘김이 없으며, 살아 있는 다리 노드는 바꿀 수 없다
+  (모두 되돌린 뒤 `--bridge-node`로 다시). 브리지·VLAN 원본의 MTU는 1500으로 본다.
+- **잠금.** `Port_Binding`·`MAC_Binding`·`FDB` 가로채기는 OVN이 막지 않는다. NB는 여전히 모든 멤버 노드가 쓴다. 미리 확인은 집합 밖 상대가
+  하나라도 있으면 막는다(`--force`). 계획 65·66으로 세운 클러스터는 켤 때까지 잠기지 않는다.
+- **경보.** `sdn_quorum_lost`는 순수 시험으로만 보았다. 넘김 이벤트는 리더가 바뀐 직후의 첫 관찰과 견주지 않는다.
+- **토폴로지.** 네트워크 200·VM 2000이면 SVG 원소가 약 11,400개다(배치는 13 ms) — 그 크기에서는 폴더로 거르거나 VM을 감추라는 띠가 뜬다.

@@ -101,8 +101,16 @@ cargo test -p opl-api ovn_sync                                      # 라우터�
 cargo test -p opl-api --test sdn_routing                            # 라우터·유동 IP·공급자·노드 sdn API, 권한, 할당량, IPAM(EUI-64·풀), 409들
 cargo test -p oplctl routing                                        # router·fip·node sdn 명령
 pnpm -C web test src/routing src/nodes src/security-groups          # 라우터 서랍·유동 IP 붙이기·노드 physnet 카드·NIC 수(msw)
-# 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve
-sudo modprobe -a openvswitch geneve && docker build -t opl-sdn-node ci/sdn-node
+# SDN 서비스(계획 67)
+cargo test -p opl-types -- load_balancer qos network_migration alert::sdn sdn   # 순수: LB·QoS·옮기기 검증 표, lb vips·ip_port_mappings, qos nic_rows·tc_commands(남의 필터 보존), migration plan(방식·주소 출처·막힘), allow_sets, SDN 경보 평가 표
+cargo test -p opl-cluster                                           # ip 겹침(LB 셋)·lb-listener·migration-source·migration-vm, 할당량 networks·load_balancers와 바깥 VIP의 floating_ips
+cargo test -p opl-api ovn_sync                                      # LB·건강 검사·QoS·l2gateway 행(가짜 NB), 같은 차례 붙이기, 계획 66 고정물에 연산 0개
+cargo test -p opl-api --test sdn_services --test network_migrate    # 기능 게이트, 권한, LB·QoS·할당량·유동 IP 떼기·잠금 미리 확인·토폴로지 감추기, 옮기기 상태 머신(라이브 실패·재시작·이어 하기·다리 노드 지움)
+cargo test -p opl-driver -- relink tc ovn::lockdown units           # tap 옮기기 명령, tc 명령, nftables 잠금 글·ss 파싱, sb.json·northd 단위(끔은 계획 66 글 그대로)
+cargo test -p oplctl -- lb migration sdn alerts                     # lb·vm nic-qos·network migrate·sdn lockdown·alert rule add-sdn-defaults 명령
+pnpm -C web test src/components/iso src/topology src/lb src/migration src/sdn src/alerts   # 투영·배치(200/50/2000 기록)·키보드·axe, LB 서랍, 마법사, 잠금 카드·SDN 경보(msw)
+# 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
+sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
   cargo test -p opld --features sdn-multinode-it --test sdn_multinode -- --nocapture
 # Linux, root: 실제 tap과 브리지
@@ -254,6 +262,15 @@ opld 다시 띄우기를 본다. 시험은 **호스트에 OVN 꾸러미·데몬�
 바깥에서 들어오는 DF 1500 패킷(조용히 버려짐), RA SLAAC(EUI-64)·상태 있는 DHCPv6(busybox `udhcpc6`)·클라우드 이미지 게스트의
 `ipv6_slaac`, 그리고 **보안 그룹의 같은 뜻**(같은 그룹을 건 nftables 이름공간과 OVN 이름공간의 탐침 표, 처음 맞는 규칙, 목록을
 바꾸는 동안의 연속 탐침, 허용을 빼면 OVN만 맺은 연결이 끊김)을 본다. 작업이 `tcpdump`·`nftables`·`python3`를 깐다.
+계획 67부터 `ovn` 작업은 세운 직후 잠금 모양(SB `sb.json`·6645)을 보고 `sdn lockdown off`로 이전 절을 돈 뒤(127.0.0.2의 두 번째 ovsdb는
+Orbivisor 중앙이 아니라 허용 목록에 막히므로), 새 절 넷을 CLI·API로 돈다: **부하 분산**(`services_section` — 이름공간 멤버 둘·같은 서브넷과
+다른 서브넷 클라이언트가 VIP로 두 멤버에 나뉨, 바깥을 뗀 라우터, 출발지 고정, 건강 검사 넘김 시간·되살림·둘 다 죽으면 거절, `lb get`의
+건강, 바깥 VIP와 멤버가 본 출발 주소, `lb_in_use`), **QoS**(같은 절 — iperf3 `-O 3`으로 `out`·`in`·실행 중 바꿈 ±15%, DSCP 46의 `tos 0xb8`;
+`plain_tc_section` — veth를 tap 자리로 드라이버 tc 명령의 속도·다시 맞추기·남의 필터), **옮기기**(`migration_section` — Linux 브리지 `oplmig0`의
+`lan` → `t-lan`, `--dry-run` 계획, QEMU VM 라이브 tap 옮기기(PID 그대로)·이름공간 VM `offline`, 다리 너머 ping 두 방향, 되돌리기, 끝내기로
+`l2gateway`·`mig…` 매핑·veth가 사라짐), **잠금**(`lockdown_section` — 노드 인증서로 역할 포트에서 남의 `Chassis`·`SB_Global` 쓰기가 RBAC 오류,
+자기 행·6645는 됨, `--wait=hv`, 127.0.0.3 출발은 6641·6642·6645 시간 초과, 끄면 단위 글이 계획 66 그대로). 작업이 `iperf3`도 깐다.
+`linux-kvm`의 `net-it`는 실제 tc로 `tap_rate_limits_use_tc_police`를 본다.
 
 **여러 노드 SDN 시험**(`crates/opld/tests/sdn_multinode.rs`, 기능 `sdn-multinode-it`, 계획 66)은 한 Linux 호스트에 **privileged
 systemd 컨테이너 셋**(`opl-c1`~`c3`)을 Orbivisor 노드로 띄운다. 이미지 `ci/sdn-node/Dockerfile`은 `ubuntu:24.04`에 systemd·
@@ -270,11 +287,17 @@ OVN(NB·SB Raft 서버 셋, SB chassis 셋, Geneve) → 라우팅(physnet, 게�
 c2의 Geneve에 없음, SNAT가 c2 veth로만, 게스트 없는 QEMU VM의 분산 유동 IP와 physnet을 빼면 중앙) → 두 chassis 마이그레이션
 (c1 → c3, NB `requested-chassis="c1,c3"`·`rarp`, SB 바인딩 c3, 유동 IP가 c3 veth로) → 게이트웨이 넘김(`systemctl stop
 ovn-controller`, `Restart=no` 덧붙이기를 얹은 `kill -9`, 되돌아감 — 시간을 찍음) → 노드 통째 죽음(`docker kill c2`, 남은 둘로 새
-유동 IP, `sdn central remove c2` → 실제 `cluster/kick`, 서버 둘). 실패하면 진단(노드마다 `ovs-vsctl`·`ovn-sbctl`·`ovn-nbctl show`, 단위 상태, journal, orbivisord 로그 끝)을 찍고,
+유동 IP, `sdn central remove c2` → 실제 `cluster/kick`, 서버 둘). 계획 67부터 세우기·중앙 더하기는 **잠금을 켠 채** 돌고, 새 절이 더해졌다:
+잠금 끄기·켜기 동안 VM ping(잃은 패킷 0), **여러 chassis 보안 그룹**(c1 VM → c3 VM이 그룹대로 막히고 허용 그룹이면 됨, `ext` → 유동 IP도 그룹대로),
+경보(호스트의 작은 webhook 서버 — 도커 망 게이트웨이 172.30.66.1 — 로 받고 지속 시간 5초), 게이트웨이 후보 모두 빼기(`sdn_gateway_unavailable`·
+해제), **여러 chassis LB**(멤버 c1·c3, 클라이언트 c2 — 나눔, 멤버 듣기 멈춤 넘김과 `sdn_lb_member_down`, 바깥 VIP의 게이트웨이 넘김과 GARP,
+`sdn_gateway_failover`·`sdn_chassis_down`, Geneve 너머 QoS 측정), **VXLAN 원본 옮기기**(다리 c1 → 남은 c3 이름공간 ping, 모두 되돌린 뒤
+`--bridge-node c2`로 다시, 끝내기), 중앙 죽이기의 `sdn_central_down`, 끝에 **지운 노드 끊기**(죽인 c2를 orbivisord 없이 다시 띄워 `cluster
+remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 시간). 이미지에 `iperf3`, 호스트가 `vxlan` 모듈도 올린다. 실패하면 진단(노드마다 `ovs-vsctl`·`ovn-sbctl`·`ovn-nbctl show`, 단위 상태, journal, orbivisord 로그 끝)을 찍고,
 끝나거나 실패해도 컨테이너·도커 망·브리지·이름공간을 지운다. 필요한 것: Linux(Ubuntu 24.04) root, docker, tcpdump, 컨테이너가 apt에
 닿는 망. `/dev/kvm`이 있으면 컨테이너의 QEMU가 쓴다(없으면 TCG). CI `sdn-multinode` 작업(Ubuntu 24.04 러너, `timeout-minutes: 60`)은
 `modprobe -a openvswitch geneve`, `docker build -t opl-sdn-node ci/sdn-node`, 위 `cargo test`를 root로(캐시 없이 `$RUNNER_TEMP/target`)
-돌린다. 시험은 약 170초, 작업 전체는 약 6분이다(OVN 24.03).
+돌린다. 시험은 계획 66 때 약 170초였고 계획 67의 절로 늘었다(설계 어림 약 6분 더 — `timeout-minutes: 60` 그대로, OVN 24.03).
 
 웹 UI (`web/`):
 

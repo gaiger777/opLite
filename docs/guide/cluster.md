@@ -1154,6 +1154,8 @@ orbivisorctl alert rule create vm-failed --vm-failed --target ops-slack
 orbivisorctl alert rule create start-failed --task-failed --op vm-start --op vm-migrate --target ops-slack
 orbivisorctl alert rule create ha --ha-recovery --severity critical --target phone
 orbivisorctl alert rule create backup --backup-job-failed --target ops-mail
+orbivisorctl alert rule create chassis --condition sdn_chassis_down --for 1m --node n2 --target ops-mail
+orbivisorctl alert rule add-sdn-defaults --target ops-mail   # 권하는 SDN 규칙 여덟을 한 번에(같은 이름은 그대로 둠)
 orbivisorctl alert rule list                     # NAME ENABLED SEVERITY CONDITION FOR TARGETS
 orbivisorctl alert rule set cpu-hot --gt 95      # 준 것만 바꾼다(--gt·--lt만 주면 문턱만)
 orbivisorctl alert rule set cpu-hot --disable    # --enable, --all-nodes, --all-vms
@@ -1170,12 +1172,21 @@ orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보�
 | `--task-failed [--op OP]…` | Task 실패(이벤트, `--op` 없으면 모든 종류) | Task를 돈 노드 | Task |
 | `--ha-recovery` | `vm-ha-recover` Task가 끝남(이벤트, 결과는 본문에) | Task를 돈 노드 | Task |
 | `--backup-job-failed` | 백업 작업 실행이 실패(이벤트) | **리더** | 백업 작업 |
+| `--condition sdn_quorum_lost` | OVN NB·SB의 리더가 없거나 리더·팔로어인 중앙이 과반 미만(계획 67) | **리더** | SDN |
+| `--condition sdn_central_down` | 중앙 노드의 NB·SB가 꺼짐·후보이거나 노드가 오프라인 | **리더** | 노드 |
+| `--condition sdn_chassis_down` | 온라인 chassis 노드의 ovn-controller가 꺼짐·구성 중 | **리더** | 노드 |
+| `--condition sdn_gateway_unavailable` | 바깥이 있는 라우터에 게이트웨이 후보가 없거나 모두 오프라인 | **리더** | 라우터 |
+| `--condition sdn_gateway_failover` | 라우터의 게이트웨이 주인 노드가 바뀜(이벤트, 옛·새 노드) | **리더** | 라우터 |
+| `--condition sdn_sync_failed` | OvnSync 오류, 300초 넘게 동기화 없음, 또는 OVN 잠금 표가 맞지 않는 노드 | **리더** | SDN |
+| `--condition sdn_physnet_not_ready` | 설정한 physnet(옮기기 다리 포함)이 준비 안 됨 | **리더** | 노드 |
+| `--condition sdn_lb_member_down` | 부하 분산기의 건강 검사 멤버 가운데 죽은 것이 있음(LB마다 하나) | **리더** | 부하 분산기 |
 
 - **칸.** `--for`(조건이 이만큼 이어지면 알림, `0`~`24h`, 기본 0), `--severity info|warning|critical`(기본 warning), `--target`
   (알림 대상 이름 1~16개, 있어야 함), `--repeat`(계속 firing이면 이 간격으로 다시, 기본 `4h`, `0`이면 다시 보내지 않음,
   `1m`~`7d`), `--send-resolved true|false`(기본 true), `--node`·`--vm`(이 노드·VM만, 이름 256개까지, 비면 모두), `--disabled`.
   `--vm`은 VM 조건(`vm-metric`·`vm-failed`·`ha-recovery`)에만, `--node`는 `backup-job-failed`에 쓰지 못한다. 이벤트 조건은
-  `--for 0`만 받고 해제 알림이 없다. API 본문은 `POST /alert-rules {"name","spec":{"condition":{"kind":"node_metric","metric":"cpu","op":"gt","value":90},"for_secs":300,"severity":"critical","targets":["ops-mail"]}}`다.
+  `--for 0`만 받고 해제 알림이 없다. SDN 조건의 `--node`는 대상이 노드인 셋(`sdn_central_down`·`sdn_chassis_down`·
+  `sdn_physnet_not_ready`)에만 쓴다. API 본문은 `POST /alert-rules {"name","spec":{"condition":{"kind":"node_metric","metric":"cpu","op":"gt","value":90},"for_secs":300,"severity":"critical","targets":["ops-mail"]}}`다.
 - **유지보수.** 유지보수 노드(`node maintenance NODE on`·`node drain`)의 노드 지표 규칙과 `node-offline`은 평가하지 않고, 들어갈 때 그 노드의
   활성 노드 경보는 알림 없이 풀린다. 그 노드에서 도는 VM의 규칙은 그대로 본다. 기록은 유지보수 중에도 계속한다.
 
@@ -1188,7 +1199,8 @@ orbivisorctl alert rule delete cpu-hot           # 그 규칙의 활성 경보�
   7일 동안 두 번 보내지 않음). 깨진 파일은 `state.json.corrupt`로 옮기고 빈 상태로 시작한다. 장부 디렉터리를 열지 못하면
   (권한 등) 경고하고 메모리에만 두고 시작한다(다시 시작하면 상태와 보낸 기록을 잊는다). 목록을 읽지 못한 tick, 잠깐 준비되지
   않은 로컬 풀, 마이그레이션 중인 VM의 지표 경보는 알림 없이 빼지 않고 그대로 둔다.
-- **리더 경보.** `node-offline`·`backup-job-failed`는 그 판단이 이미 리더의 것이므로 리더가 평가하고 리더가 보낸다. 상태는
+- **리더 경보.** `node-offline`·`backup-job-failed`와 SDN 조건 여덟은 그 판단이 이미 리더의 것이므로 리더가 평가하고 리더가 보낸다
+  (SDN 조건의 입력은 Raft의 SDN·노드 상태와 리더 OvnSync가 10초마다 읽는 게이트웨이 주인·LB 멤버 건강 — [SDN 경보](network.md#sdn-경보)). 상태는
   규칙의 `status.active`(Raft)에 두고, **상태를 쓴 뒤에만 보내므로** 리더가 바뀌어도 새 리더가 이어받아 다시 보내지 않는다.
   규칙을 만들기 전에 끝난 백업 실행은 알리지 않는다. 지운 노드의 `node-offline` 경보는 해제로 알린다.
 - **상태 기계.** 지표·상태 조건은 `pending`(조건이 참) → `firing`(참인 채 `--for`가 지남, 알림) → `--repeat`마다 다시 알림 →
@@ -1228,11 +1240,17 @@ orbivisorctl alert history --since 1h   # 보낸 알림(새 것부터, 기본 �
   기록을 시각 순으로 합친다(`truncated`면 CLI가 `note: more records match …`). 둘 다 노드 문제로 실패하지 않는다.
   `/watch?kinds=alert-rule`로 규칙(리더 경보 포함) 변경을 받는다. 알림 대상은 watch할 수 없다.
 
+- **SDN 경보 묶음.** `alert rule add-sdn-defaults --target T`(API `POST /api/v1/alert-rules/sdn-defaults {"targets": [...]}` → `{created,
+  existing}`, 웹 SDN 보기의 "SDN 경보 켜기")가 `sdn-quorum-lost` critical 0초, `sdn-central-down`·`sdn-chassis-down` warning 60초,
+  `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info, `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초,
+  `sdn-lb-member-down` warning 30초를 만든다. 같은 이름이 있으면 건드리지 않으므로 다시 불러도 된다. 모든 노드가 기능 `sdn-services`를
+  알아야 SDN 조건을 쓸 수 있다(409 `cluster_upgrading`).
+
 ### 웹
 
 - **경보**(활동 › 경보 탭 `/alerts`, 홈 경보 위젯이나 종 서랍의 "모든 경보 보기"): **활성** 탭(심각도·대상·단계
   울림/대기/해제 중·값과 문턱·시작 시각, 답하지 않은·옛 노드 안내), **규칙** 탭(누구나 읽음, admin만 만들기·고치기·지우기 —
-  조건 종류에 따라 칸이 바뀌는 폼), **보낸 알림** 탭(지난 24시간·7일, 500개까지). 경보는 화면 알림으로 띄우지 않고 머리줄 종의 숫자와 서랍에 보인다([웹 화면 둘러보기](web-ui.md#알림-센터)).
+  조건 종류에 따라 칸이 바뀌는 폼, 조건 고르기에 SDN 묶음 — 노드 거르기는 대상이 노드인 SDN 조건에만, 게이트웨이 넘김은 지속 시간 없는 이벤트), **보낸 알림** 탭(지난 24시간·7일, 500개까지). 경보는 화면 알림으로 띄우지 않고 머리줄 종의 숫자와 서랍에 보인다([웹 화면 둘러보기](web-ui.md#알림-센터)).
 - **알림 대상**(설정 › 알림 대상 탭 `/settings/notifications`, admin — 규칙 탭의 링크로도 간다): SMTP·webhook 폼, 시험 보내기.
   저장된 비밀은 비워 두면 지키고 "지우기"로 지운다. 서버·포트·사용자·TLS나 URL·CA를 바꾸면서 비밀을 다시 넣지 않으면
   폼이 먼저 막는다.
