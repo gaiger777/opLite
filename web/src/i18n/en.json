@@ -149,7 +149,22 @@
     "physnet_in_use": "VMs on this node use that physical network: {{message}}",
     "physnet_conflict": "Another network already uses that physical network and VLAN: {{message}}",
     "invalid_node_sdn": "The SDN settings are not valid: {{message}}",
-    "migration_overlap": "Another unfinished network migration already uses this source network, VM or target network: {{message}}"
+    "migration_overlap": "Another unfinished network migration already uses this source network, VM or target network: {{message}}",
+    "qos_unsupported": "The node can't rate-limit this VM's simple-network interfaces (no tc support). Remove the rate limit or run the VM on another node.",
+    "qos_dscp_needs_sdn": "DSCP marking works only on SDN networks: {{message}}",
+    "invalid_qos": "The QoS setting is not valid: {{message}}",
+    "invalid_load_balancer": "The load balancer is not valid: {{message}}",
+    "lb_network_not_routed": "The VIP network must be an interface of a router: {{message}}",
+    "lb_member_unreachable": "A member is not reachable from the VIP network's router: {{message}}",
+    "lb_in_use": "Load balancers use this router or network: {{message}}",
+    "invalid_migration": "The network migration is not valid: {{message}}",
+    "migration_in_progress": "A task is still running this network migration. Pause it and wait until the task stops.",
+    "migration_finished": "This network migration is already finished or rolled back.",
+    "migration_not_running": "This network migration is not running.",
+    "migration_bridge_laid": "The migration's bridge is on another node that is online. Finish or roll back the migration first.",
+    "network_migrating": "This network has a migration bridge. Finish the migration with this router instead.",
+    "nic_network_live": "A running VM's interface can't change network by editing it. Use the network migration wizard, or stop the VM first.",
+    "lockdown_peers_outside": "Some peers connect to OVN centrals from addresses outside the allowed set and would be cut off. Check first, then turn on anyway if that is intended."
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -2146,7 +2161,9 @@
       "column": "QoS",
       "outShort": "↑ {{mbps}} Mbit/s",
       "inShort": "↓ {{mbps}} Mbit/s",
-      "dscpShort": "DSCP {{dscp}}"
+      "dscpShort": "DSCP {{dscp}}",
+      "noTc": "Node {{node}} can't rate-limit simple-network interfaces (no tc). Saving or starting the VM there is refused; remove the rate limit or pick another node.",
+      "noTcAnywhere": "No node can rate-limit simple-network interfaces (no tc). Remove the rate limit or use an SDN network."
     }
   },
   "console": {
@@ -4149,7 +4166,18 @@
       "offDescription": "The allow lists come down first, then each central goes back to the plain ports. Any node with the cluster certificate can then write to the southbound database again.",
       "stalled": "Stopped halfway",
       "finishOn": "Finish turning on",
-      "raft": "Raft"
+      "raft": "Raft",
+      "finishOff": "Finish turning off",
+      "text": {
+        "twoCentrals": "The cluster has two OVN centrals: while each one restarts its southbound database, the other alone is not a majority, so the southbound database is unavailable for a few seconds per central (the data path keeps working). Add a third central to avoid it.",
+        "raftCut": "The address allow-list cut the OVN Raft connections and was removed again. Check first for Raft peers outside the central set.",
+        "notSwitched": "The OVN central {{name}} did not switch its lockdown in {{secs}} s. Is it online, with the other centrals in quorum?",
+        "notKept": "The OVN central {{name}} could not keep its address allow-list: it cut the OVN Raft connections.",
+        "notApplied": "The OVN address allow-list is not applied on {{nodes}} yet; the SDN agent there keeps trying.",
+        "notRemoved": "The OVN address allow-list is not removed on {{nodes}} yet; the SDN agent there keeps trying.",
+        "replaced": "Another request changed the OVN lockdown; this task stopped.",
+        "offAgain": "The lockdown was turned off again."
+      }
     },
     "alerts": {
       "title": "SDN alerts",
@@ -4431,7 +4459,8 @@
       "members": "Use at most 64 members.",
       "memberIp": "Use an IPv4 address.",
       "memberTaken": "This member is already in the listener."
-    }
+    },
+    "externalHidden": "External VIP (the router's external network isn't visible to you)"
   },
   "topology": {
     "hint": "Networks, routers, gateways, floating IPs, VMs and load balancers in one picture. Physical networks at the back, routers above their SDN networks, simple networks on the side.",
@@ -4504,7 +4533,9 @@
       "lb": "Load balancer {{name}}, VIP {{vip}}, {{online}} of {{total}} members up",
       "fip": "Floating IP {{address}}, {{state}}, to {{vm}}",
       "vip": "External VIP {{address}} of load balancer {{name}}"
-    }
+    },
+    "nicless_one": "{{count}} VM is only on networks you can't see and is not drawn.",
+    "nicless_other": "{{count}} VMs are only on networks you can't see and are not drawn."
   },
   "migration": {
     "title": "Migrate {{name}} to SDN",
@@ -4613,7 +4644,7 @@
     "paused": "Pausing {{name}} after the current VM.",
     "resume": "Resume",
     "startNow": "Start",
-    "resumed": "Started {{name}}.",
+    "resumed": "Resumed {{name}}.",
     "newBridgeNode": "New bridge node",
     "newBridgeNodeHint": "The bridge node was removed from the cluster. Pick another node to resume.",
     "rollback": "Roll back",
@@ -4671,7 +4702,26 @@
       "badBridgeNode": "node {{node}} can't be the bridge node (no OVN or no source bridge)",
       "noBridgeNode": "no OVN node has the source bridge {{bridge}}",
       "bridgeRemoved": "the bridge node {{node}} was removed from the cluster: resume with another bridge node",
-      "ipamOthers": "IPAM does not know the addresses other hosts use on the source network: keep them out of the target's pools while the bridge is up"
+      "ipamOthers": "IPAM does not know the addresses other hosts use on the source network: keep them out of the target's pools while the bridge is up",
+      "planChanged": "the plan changed since the migration was made (mode {{before}} is now {{after}}): the VM's power or node changed",
+      "addressChanged": "the planned address changed since the migration was made",
+      "nicGone": "the interface (MAC {{mac}}) is no longer on {{network}}",
+      "changedOutside": "the interface was changed outside the migration",
+      "notLive": "the interface was not moved live",
+      "startTimeout": "the VM did not start on {{to}} in time and was started on {{from}} again",
+      "startFailed": "the VM did not start on {{to}} and was started on {{from}} again",
+      "powerTimeout": "the VM did not stop or start in time",
+      "vmDeleted": "the VM was deleted; skipped",
+      "failedMove_one": "{{count}} interface failed to move",
+      "failedMove_other": "{{count}} interfaces failed to move",
+      "failedRollback_one": "{{count}} interface failed to roll back",
+      "failedRollback_other": "{{count}} interfaces failed to roll back",
+      "stillOnSource_one": "{{count}} interface is still on network {{network}}",
+      "stillOnSource_other": "{{count}} interfaces are still on network {{network}}",
+      "bridgeNotReady": "the bridge on node {{node}} is not ready after {{secs}} s: if the node is down, resume with another bridge node",
+      "sourceGone": "the source network {{network}} was deleted; there is nothing to roll back to",
+      "blocked": "blocked: {{why}}",
+      "rollbackFailed": "rollback: {{why}}"
     },
     "gone": "This migration record is gone.",
     "close": "Close",
@@ -4690,11 +4740,21 @@
       "mode": "{{who}}: {{before}} → {{after}}",
       "ips": "{{who}}: address {{before}} → {{after}}",
       "blockers": "{{who}}: now blocked by {{after}}",
-      "none": "nothing (no longer blocked)",
       "disrupt": {
         "live": "about a second without network",
         "restart": "the VM is shut down and started again"
-      }
+      },
+      "unblocked": "{{who}}: no longer blocked"
+    },
+    "startedNow": "Started {{name}}.",
+    "newBridgeNodeOffline": "The bridge node {{node}} is offline. Pick another node to resume; the bridge moves there.",
+    "summary": {
+      "restart_one": "{{count}} running VM is shut down and started again",
+      "restart_other": "{{count}} running VMs are shut down and started again",
+      "live_one": "{{count}} VM moves live (about a second without network)",
+      "live_other": "{{count}} VMs move live (about a second without network)",
+      "offline_one": "{{count}} stopped VM changes",
+      "offline_other": "{{count}} stopped VMs change"
     }
   }
 }

@@ -164,3 +164,34 @@ it("words routing in Korean like the English and with a particle that fits any n
   // 서버의 까닭을 옮긴 글은 두 말 모두에 있다.
   expect(Object.keys(ko.routing.server)).toEqual(Object.keys(en.routing.server));
 });
+
+it("translates the plan-67 error codes (review 2 m2)", () => {
+  const codes = [
+    "qos_unsupported",
+    "qos_dscp_needs_sdn",
+    "invalid_qos",
+    "invalid_load_balancer",
+    "lb_network_not_routed",
+    "lb_member_unreachable",
+    "lb_in_use",
+    "invalid_migration",
+    "migration_in_progress",
+    "migration_finished",
+    "migration_not_running",
+    "migration_bridge_laid",
+    "network_migrating",
+    "nic_network_live",
+    "lockdown_peers_outside",
+  ];
+  for (const code of codes) {
+    expect(en.errors).toHaveProperty(code);
+    expect(ko.errors).toHaveProperty(code);
+  }
+  const t = i18n.getFixedT("ko");
+  expect(
+    errorMessage(t, new ApiError(409, "qos_unsupported", 'node "mac" cannot rate-limit NICs')),
+  ).toBe(ko.errors.qos_unsupported);
+  expect(errorMessage(t, new ApiError(400, "invalid_load_balancer", "listener tcp/80 twice"))).toBe(
+    "부하 분산기 설정이 올바르지 않습니다: listener tcp/80 twice",
+  );
+});

@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
 
 import i18n from "@/i18n";
-import { topoId as id } from "@/test/topology";
+import { countReads, topoId as id } from "@/test/topology";
 import { layoutTopology } from "@/topology/layout";
 import type { Topology } from "@/topology/topology";
 import { itemLabels } from "@/topology/TopologyPage";
@@ -20,8 +20,8 @@ vi.mock("@/components/iso", async (importOriginal) => {
   };
 });
 
-/** §12.1의 큰 클러스터: 네트워크 200, 라우터 50, VM 2000 */
-function bigGraph(): Topology {
+/** §12.1의 큰 클러스터: 네트워크 200, 라우터 50, VM `vms`(기본 2000) */
+function bigGraph(vms = 2000): Topology {
   const graph: Topology = {
     networks: [],
     routers: [],
@@ -41,7 +41,7 @@ function bigGraph(): Topology {
       gateway: { state: "unknown" },
     });
   }
-  for (let v = 0; v < 2000; v++) {
+  for (let v = 0; v < vms; v++) {
     graph.vms.push({
       id: id("006", v),
       name: `vm${v}`,
@@ -52,34 +52,52 @@ function bigGraph(): Topology {
   return graph;
 }
 
-it("hovering and dragging a 2000-VM picture redraws only the items that change", () => {
-  const graph = bigGraph();
+/** 이름 셈이 VM 목록을 몇 번 읽는지(벽시계 대신 — 리뷰 2 웹 #4) */
+function labelReads(vms: number): number {
+  const graph = bigGraph(vms);
   const scene = layoutTopology(graph);
-  const started = performance.now();
-  const labels = itemLabels(i18n.t, graph, scene);
-  // 이름은 장면마다 한 번(원소마다 VM을 훑지 않음)
-  expect(performance.now() - started).toBeLessThan(500);
-  render(<TopologyScene scene={scene} labels={labels} onOpen={() => {}} showVmNames={false} />);
-  const picture = screen.getByRole("group", { name: "Network topology" });
-  const first = drawn.blocks;
-  expect(first).toBeGreaterThan(1000);
+  const counted = countReads(graph.vms);
+  itemLabels(i18n.t, { ...graph, vms: counted.items }, scene);
+  return counted.reads();
+}
 
-  const vm = within(picture).getByRole("button", { name: "VM vm0, Running, —" });
-  drawn.blocks = 0;
-  fireEvent.pointerEnter(vm);
-  // 밝힌 VM 하나만(굵게) 다시 그린다. 옅게 하기는 `<style>` 한 줄이다.
-  expect(drawn.blocks).toBeLessThanOrEqual(2);
-  const style = picture.querySelector("style")!.textContent!;
-  expect(style).toContain(`g[data-key="vm:${id("004", 0)}:${id("006", 0)}"]`);
-  drawn.blocks = 0;
-  fireEvent.pointerLeave(vm);
-  expect(drawn.blocks).toBeLessThanOrEqual(2);
-  expect(picture.querySelector("style")!.textContent).toBe("");
-
-  // 끌기(viewBox만 바뀜)도 원소를 다시 그리지 않는다.
-  drawn.blocks = 0;
-  fireEvent.pointerDown(picture, { pointerId: 1, clientX: 10, clientY: 10, button: 0 });
-  fireEvent.pointerMove(picture, { pointerId: 1, clientX: 60, clientY: 40 });
-  fireEvent.pointerUp(picture, { pointerId: 1, clientX: 60, clientY: 40 });
-  expect(drawn.blocks).toBe(0);
+it("names the items of a picture in one pass over the VMs", { timeout: 30_000 }, () => {
+  // 원소마다 VM을 훑던 셈(리뷰 1 I5 전)은 2000대에서 약 440만 번 읽었다. 이제 VM 수에 비례한다.
+  const big = labelReads(2000);
+  expect(big).toBeGreaterThanOrEqual(2000);
+  expect(big).toBeLessThanOrEqual(3 * 2000);
+  expect(big / labelReads(1000)).toBeLessThan(2.5);
 });
+
+it(
+  "hovering and dragging a 2000-VM picture redraws only the items that change",
+  { timeout: 30_000 },
+  () => {
+    const graph = bigGraph();
+    const scene = layoutTopology(graph);
+    const labels = itemLabels(i18n.t, graph, scene);
+    render(<TopologyScene scene={scene} labels={labels} onOpen={() => {}} showVmNames={false} />);
+    const picture = screen.getByRole("group", { name: "Network topology" });
+    const first = drawn.blocks;
+    expect(first).toBeGreaterThan(1000);
+
+    const vm = within(picture).getByRole("button", { name: "VM vm0, Running, —" });
+    drawn.blocks = 0;
+    fireEvent.pointerEnter(vm);
+    // 밝힌 VM 하나만(굵게) 다시 그린다. 옅게 하기는 `<style>` 한 줄이다.
+    expect(drawn.blocks).toBeLessThanOrEqual(2);
+    const style = picture.querySelector("style")!.textContent!;
+    expect(style).toContain(`g[data-key="vm:${id("004", 0)}:${id("006", 0)}"]`);
+    drawn.blocks = 0;
+    fireEvent.pointerLeave(vm);
+    expect(drawn.blocks).toBeLessThanOrEqual(2);
+    expect(picture.querySelector("style")!.textContent).toBe("");
+
+    // 끌기(viewBox만 바뀜)도 원소를 다시 그리지 않는다.
+    drawn.blocks = 0;
+    fireEvent.pointerDown(picture, { pointerId: 1, clientX: 10, clientY: 10, button: 0 });
+    fireEvent.pointerMove(picture, { pointerId: 1, clientX: 60, clientY: 40 });
+    fireEvent.pointerUp(picture, { pointerId: 1, clientX: 60, clientY: 40 });
+    expect(drawn.blocks).toBe(0);
+  },
+);

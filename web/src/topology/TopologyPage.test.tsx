@@ -170,3 +170,21 @@ it("shows VMs that only have NICs on provider networks (review 1 I4)", async () 
   const providers = within(list).getByRole("heading", { name: "Physical networks" }).parentElement!;
   expect(within(providers).getByRole("button", { name: "edge" })).toBeVisible();
 });
+
+it("leaves out VMs that are only on networks the user can't see and says so (review 2 m7)", async () => {
+  mockLists({});
+  const GHOST = "019a0f3c-0000-7000-8002-000000000010";
+  topology({
+    ...SIMPLE_ONLY,
+    vms: [...SIMPLE_ONLY.vms, { id: GHOST, name: "ghost", power: "running", nics: [] }],
+  });
+  const user = userEvent.setup();
+  renderPage(<TopologyPage />, { path: "/networks/topology" });
+  await screen.findByRole("group", { name: "Network topology" });
+  expect(
+    screen.getByText("1 VM is only on networks you can't see and is not drawn."),
+  ).toBeVisible();
+  await user.click(screen.getByRole("radio", { name: "List" }));
+  const list = screen.getByRole("region", { name: "Network topology as a list" });
+  expect(within(list).queryByRole("button", { name: "ghost" })).toBeNull();
+});

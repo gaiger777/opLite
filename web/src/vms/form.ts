@@ -830,3 +830,19 @@ export function firmwareUnavailable(
   }
   return nodes.some((n) => !n.spec.witness && has(n)) ? null : { key: `vmForm.${what}NoNode` };
 }
+
+/**
+ * 단순 NIC 속도 제한(tc)을 걸 수 없는 곳(서버 `check_qos_node` — `NodeStatus.qos`가 참이 아니면 409 `qos_unsupported`):
+ * 고른 노드가 못 하면 그 이름, 노드를 고르지 않았는데 할 수 있는 노드가 하나도 없으면 빈 글, 아니면 null. 노드 목록을
+ * 읽지 못했으면 null(모름).
+ */
+export function tcMissing(nodes: readonly Node[] | undefined, node: string): string | null {
+  if (!nodes) {
+    return null;
+  }
+  if (node !== "") {
+    const chosen = nodes.find((n) => n.id === node);
+    return chosen && chosen.status.qos !== true ? chosen.name : null;
+  }
+  return nodes.some((n) => !n.spec.witness && n.status.qos === true) ? null : "";
+}

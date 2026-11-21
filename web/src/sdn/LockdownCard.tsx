@@ -19,7 +19,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
-import { SDN_KEY, type SdnView } from "@/sdn/sdn";
+import { lockdownText, SDN_KEY, type SdnView } from "@/sdn/sdn";
 import { trackTask } from "@/tasks/tasks";
 
 type LockdownCheck = components["schemas"]["LockdownCheck"];
@@ -42,10 +42,12 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
   const applied = lockdown?.applied.length ?? 0;
   const firewalls = lockdown?.nodes.filter((n) => n.firewall).length ?? 0;
   const nodes = lockdown?.nodes.length ?? 0;
-  // 켜기가 중간에 멈췄다(Task 실패 — 켜짐인데 아직 바꾸는 중이거나 오류, 도는 Task 없음). 같은 값을 다시 보내면 남은 일을
-  // 마저 한다(리뷰 1 M6).
+  // 켜기·끄기가 중간에 멈췄다(Task 실패 — 아직 바꾸는 중이거나 오류, 도는 Task 없음). 같은 값을 다시 보내면 남은 일을
+  // 마저 한다(리뷰 1 M6, 끄기는 리뷰 2 웹 m3).
   const running = sdn.tasks.length > 0;
-  const stalled = enabled && (lockdown?.pending === true || lockdown?.error != null) && !running;
+  const stalled = (lockdown?.pending === true || lockdown?.error != null) && !running;
+  const stalledOn = enabled && stalled;
+  const stalledOff = !enabled && stalled;
 
   async function dryRun() {
     setBusy(true);
@@ -110,7 +112,7 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
       )}
       {lockdown?.error && (
         <p role="alert" className="text-sm text-destructive">
-          {lockdown.error}
+          {lockdownText(t, lockdown.error)}
         </p>
       )}
       {lockdown && lockdown.nodes.length > 0 && (
@@ -141,7 +143,9 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
                     <StatusChip tone={n.firewall ? "success" : enabled ? "warning" : "neutral"}>
                       {t(n.firewall ? "sdn.lockdown.fwOn" : "sdn.lockdown.fwOff")}
                     </StatusChip>
-                    {n.error && <span className="text-xs text-destructive">{n.error}</span>}
+                    {n.error && (
+                      <span className="text-xs text-destructive">{lockdownText(t, n.error)}</span>
+                    )}
                   </span>
                 </TableCell>
                 <TableCell>{n.allowed}</TableCell>
@@ -172,7 +176,7 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
           </p>
           {(check.warnings ?? []).map((w) => (
             <p key={w} className="text-warning-fg">
-              {w}
+              {lockdownText(t, w)}
             </p>
           ))}
           {check.outside.length === 0 ? (
@@ -213,12 +217,12 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
       )}
       {admin && sdn.phase === "ready" && (
         <div className="flex flex-wrap gap-2">
-          {(!enabled || stalled) && (
+          {(!enabled || stalledOn) && (
             <Button variant="outline" disabled={busy} onClick={() => void dryRun()}>
               {t("sdn.lockdown.check")}
             </Button>
           )}
-          {(!enabled || stalled) && check && (
+          {(!enabled || stalledOn) && check && (
             <Button
               disabled={busy || (check.outside.length > 0 && !force)}
               onClick={() => {
@@ -228,7 +232,21 @@ export function LockdownCard({ sdn, admin }: { sdn: SdnView; admin: boolean }) {
                   .finally(() => setBusy(false));
               }}
             >
-              {t(stalled ? "sdn.lockdown.finishOn" : "sdn.lockdown.turnOn")}
+              {t(stalledOn ? "sdn.lockdown.finishOn" : "sdn.lockdown.turnOn")}
+            </Button>
+          )}
+          {stalledOff && (
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => {
+                setBusy(true);
+                set(false)
+                  .catch((err: unknown) => setFailure(errorMessage(t, err)))
+                  .finally(() => setBusy(false));
+              }}
+            >
+              {t("sdn.lockdown.finishOff")}
             </Button>
           )}
           {enabled && (

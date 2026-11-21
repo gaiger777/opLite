@@ -156,3 +156,50 @@ export function useVoters(enabled = true): ReadonlySet<string> | undefined {
     ? new Set(cluster.data.members.filter((m) => m.voter).map((m) => m.id))
     : undefined;
 }
+
+/** 서버 잠금 문장 가운데 웹이 아는 꼴(정규식 → 번역 키, 잡은 묶음 이름 — 리뷰 2 웹 m2) */
+const OFF_AGAIN = "; turned the OVN lockdown off again";
+
+const LOCKDOWN_TEXTS: readonly [RegExp, string, readonly string[]][] = [
+  [/^the cluster has two OVN centrals/, "sdn.lockdown.text.twoCentrals", []],
+  [/^the address allow-list cut the OVN Raft connections/, "sdn.lockdown.text.raftCut", []],
+  [
+    /^the OVN central "(.+)" did not switch its lockdown in (\d+)s/,
+    "sdn.lockdown.text.notSwitched",
+    ["name", "secs"],
+  ],
+  [
+    /^the OVN central "(.+)" could not keep its address allow-list/,
+    "sdn.lockdown.text.notKept",
+    ["name"],
+  ],
+  [
+    /^the OVN address allow-list is not applied on (.+) yet/,
+    "sdn.lockdown.text.notApplied",
+    ["nodes"],
+  ],
+  [
+    /^the OVN address allow-list is not removed on (.+) yet/,
+    "sdn.lockdown.text.notRemoved",
+    ["nodes"],
+  ],
+  [/^another request changed the OVN lockdown/, "sdn.lockdown.text.replaced", []],
+];
+
+/** 서버의 잠금 경고·오류 문장을 아는 꼴이면 번역한다(모르는 꼴은 그대로). */
+export function lockdownText(
+  t: (key: string, values?: Record<string, unknown>) => string,
+  text: string,
+): string {
+  // 실패한 켜기는 서버가 잠금을 다시 끄고 그 말을 끝에 붙인다(리뷰 2 I2).
+  if (text.endsWith(OFF_AGAIN)) {
+    return `${lockdownText(t, text.slice(0, -OFF_AGAIN.length))} ${t("sdn.lockdown.text.offAgain")}`;
+  }
+  for (const [pattern, key, names] of LOCKDOWN_TEXTS) {
+    const m = pattern.exec(text);
+    if (m) {
+      return t(key, Object.fromEntries(names.map((name, i) => [name, m[i + 1] ?? ""])));
+    }
+  }
+  return text;
+}

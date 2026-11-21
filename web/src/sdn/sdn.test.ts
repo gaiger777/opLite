@@ -170,3 +170,19 @@ it("sends import addresses only for NICs mapped to SDN networks", () => {
   expect(toRun(form, [false, false]).ips).toBeUndefined();
   expect(toRun({ ...form, ips: undefined }).ips).toBeUndefined();
 });
+
+it("translates a failed turn-on that turned the lockdown off again and migration counts", async () => {
+  const { lockdownText } = await import("@/sdn/sdn");
+  const { planText } = await import("@/migration/migration");
+  const t = (key: string, values?: Record<string, unknown>) =>
+    values && Object.keys(values).length ? `${key} ${JSON.stringify(values)}` : key;
+  expect(
+    lockdownText(
+      t,
+      'the OVN central "n1" could not keep its address allow-list: x; turned the OVN lockdown off again',
+    ),
+  ).toBe('sdn.lockdown.text.notKept {"name":"n1"} sdn.lockdown.text.offAgain');
+  expect(planText(t, '2 NIC(s) are still on network "lan"')).toBe(
+    'migration.text.stillOnSource {"count":2,"network":"lan"}',
+  );
+});

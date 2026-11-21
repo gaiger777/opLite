@@ -399,22 +399,21 @@ function LbSheet({
                     {members.map((m, i) => (
                       <TableRow key={i}>
                         <TableCell>
-                          {m.vm ? (
-                            m.vm_name ? (
-                              <span className="flex flex-col">
-                                <Link
-                                  to={`/vms/${encodeURIComponent(m.vm_name)}`}
-                                  className="underline"
-                                >
-                                  {m.vm_name}
-                                </Link>
-                                <span className="font-mono text-xs text-muted-foreground">
-                                  {m.mac}
-                                </span>
+                          {m.vm_name ? (
+                            <span className="flex flex-col">
+                              <Link
+                                to={`/vms/${encodeURIComponent(m.vm_name)}`}
+                                className="underline"
+                              >
+                                {m.vm_name}
+                              </Link>
+                              <span className="font-mono text-xs text-muted-foreground">
+                                {m.mac}
                               </span>
-                            ) : (
-                              <span className="text-muted-foreground">{t("lb.hiddenVm")}</span>
-                            )
+                            </span>
+                          ) : m.vm || !m.ip ? (
+                            // 읽을 수 없는 VM의 NIC 멤버는 서버가 `vm`·`mac`·`ip`를 비워 보낸다(리뷰 2 서버 m1).
+                            <span className="text-muted-foreground">{t("lb.hiddenVm")}</span>
                           ) : (
                             t("lb.addressMember")
                           )}
@@ -485,15 +484,23 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
   const [network, setNetwork] = useState(lb?.spec.network ?? "");
   const vipNetwork = network || candidates[0]?.name || "";
   const [vip, setVip] = useState(lb?.spec.vip ?? "");
-  const externalOf = routedOf(routed.data, vipNetwork)?.external;
+  const routedExternal = routedOf(routed.data, vipNetwork)?.external;
+  // 라우터의 외부 네트워크를 읽을 수 없으면 서버가 빈 글을 준다. 고칠 때는 LB가 이미 가진 외부 네트워크 이름을 쓴다.
+  const externalOf = routedExternal || lb?.spec.external?.network;
   const [external, setExternal] = useState(lb?.spec.external !== undefined);
   const [externalIp, setExternalIp] = useState(lb?.spec.external?.ip ?? "");
+  // 고칠 때는 바깥 VIP 칸을 사용자가 바꿨을 때만 보낸다(리뷰 2 웹 #1 — 그대로 보내면 읽을 수 없거나 바뀐 외부 네트워크
+  // 때문에 저장이 막히거나 VIP가 말없이 옮겨진다).
+  const externalChanged =
+    lb === null ||
+    external !== (lb.spec.external !== undefined) ||
+    (external && externalIp.trim() !== (lb.spec.external?.ip ?? ""));
   const [affinity, setAffinity] = useState(lb?.spec.affinity_secs?.toString() ?? "");
   const [rows, setRows] = useState<ListenerRow[]>(() =>
     lb ? listenerRows(lb.spec.listeners) : [newListener()],
   );
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const reachable = memberNetworks(vipNetwork, routers.data);
+  const reachable = memberNetworks(vipNetwork, routers.data, routed.data);
   const choices = memberChoices(reachable, vms.data ?? []).map((c) =>
     c.reason || perms.has("vm.config", objectTarget("vm", c.vm))
       ? c
@@ -514,10 +521,15 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
     if (vip.trim() !== "" && ipFamily(vip.trim()) !== 4) {
       found.vip = "lb.errors.vip";
     }
-    if (external && !externalOf) {
+    if (externalChanged && external && !externalOf) {
       found.external = "lb.errors.noExternal";
     }
-    if (external && externalIp.trim() !== "" && ipFamily(externalIp.trim()) !== 4) {
+    if (
+      externalChanged &&
+      external &&
+      externalIp.trim() !== "" &&
+      ipFamily(externalIp.trim()) !== 4
+    ) {
       found.externalIp = "lb.errors.vip";
     }
     const aff = affinity.trim();
@@ -544,7 +556,7 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
           params: { path: { key: lb.id }, header: { "If-Match": lb.revision } },
           body: {
             description: description.trim(),
-            external: externalSpec ?? null,
+            ...(externalChanged && { external: externalSpec ?? null }),
             listeners: checked.listeners,
             affinity_secs: aff === "" ? null : Number(aff),
           },
@@ -668,7 +680,11 @@ function LbDialog({ lb, onClose }: { lb: LoadBalancer | null; onClose(): void })
               onCheckedChange={(on) => setExternal(on === true)}
             />
             <Label htmlFor="lb-external">
-              {externalOf ? t("lb.externalOn", { network: externalOf }) : t("lb.externalNone")}
+              {externalOf
+                ? t("lb.externalOn", { network: externalOf })
+                : routedExternal === ""
+                  ? t("lb.externalHidden")
+                  : t("lb.externalNone")}
             </Label>
           </div>
           {errors.external && <p className="text-xs text-destructive">{t(errors.external)}</p>}

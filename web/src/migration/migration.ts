@@ -103,6 +103,20 @@ export function planWarnings(plan: MigrationPlan): number {
   return plan.nics.reduce((sum, n) => sum + n.warnings.length, 0) + plan.bridge.warnings.length;
 }
 
+/** 시작하면 무엇이 일어나는지 VM 수로(뺀 VM·막힌 NIC 빼고 — 리뷰 2 웹 m6): 꺼졌다 켜짐·라이브·꺼진 채 바꿈 */
+export function planSummary(
+  plan: MigrationPlan,
+  excluded: ReadonlySet<string> = new Set(),
+): { restart: number; live: number; offline: number } {
+  const by = { restart: new Set<string>(), live: new Set<string>(), offline: new Set<string>() };
+  for (const n of plan.nics) {
+    if (n.mode !== "blocked" && !excluded.has(n.vm)) {
+      by[n.mode].add(n.vm);
+    }
+  }
+  return { restart: by.restart.size, live: by.live.size, offline: by.offline.size };
+}
+
 /** 화면의 계획과 만들 때 서버가 다시 한 계획이 다른 것 하나 */
 export interface PlanChange {
   vm: string;
@@ -215,16 +229,89 @@ const PLAN_TEXTS: readonly [RegExp, string, readonly string[]][] = [
     "migration.text.bridgeRemoved",
     ["node"],
   ],
+  // 옮기기 Task가 NIC·옮기기에 적는 오류(리뷰 2 웹 m2 — 진행 단계에 영어로 나오던 것)
+  [
+    /^the plan changed since the migration was created \(mode (\S+) is now (\S+)\)/,
+    "migration.text.planChanged",
+    ["before", "after"],
+  ],
+  [
+    /^the planned address changed since the migration was created$/,
+    "migration.text.addressChanged",
+    [],
+  ],
+  [
+    /^NIC \d+ \(MAC (\S+)\) is no longer on network "(.+)"$/,
+    "migration.text.nicGone",
+    ["mac", "network"],
+  ],
+  [/^the NIC was changed outside the migration$/, "migration.text.changedOutside", []],
+  [/^the NIC was not moved live/, "migration.text.notLive", []],
+  [
+    /^the VM did not start on network "(.+)" in time and was started on "(.+)" again$/,
+    "migration.text.startTimeout",
+    ["to", "from"],
+  ],
+  [
+    /^the VM did not start on network "(.+)" and was started on "(.+)" again/,
+    "migration.text.startFailed",
+    ["to", "from"],
+  ],
+  [/^the VM did not stop or start in time$/, "migration.text.powerTimeout", []],
+  [
+    /^address (\S+) on network "(.+)" is already in use$/,
+    "migration.text.inUse",
+    ["ip", "network"],
+  ],
+  [/^the VM was deleted; skipped$/, "migration.text.vmDeleted", []],
+  [/^(\d+) NIC\(s\) failed to move$/, "migration.text.failedMove", ["count"]],
+  [/^(\d+) NIC\(s\) failed to roll back$/, "migration.text.failedRollback", ["count"]],
+  [
+    /^(\d+) NIC\(s\) are still on network "(.+)"$/,
+    "migration.text.stillOnSource",
+    ["count", "network"],
+  ],
+  [
+    /^the migration bridge \S+ on node (\S+) is not ready after (\d+)s/,
+    "migration.text.bridgeNotReady",
+    ["node", "secs"],
+  ],
+  [
+    /^the source network "(.+)" was deleted; there is nothing to roll back to$/,
+    "migration.text.sourceGone",
+    ["network"],
+  ],
 ];
 
-/** 서버 계획의 문장을 아는 꼴이면 번역한다(모르는 꼴은 그대로). */
-export function planText(t: Translate, text: string): string {
+/**
+ * 서버 계획·옮기기의 문장을 아는 꼴이면 번역한다(모르는 꼴은 그대로). `blocked: …`·`rollback: …`은 앞말을 번역하고 나머지를
+ * 다시 본다. `nodeName`을 주면 잡은 `node`(노드 id)를 이름으로 바꾼다.
+ */
+export function planText(
+  t: Translate,
+  text: string,
+  nodeName: (id: string) => string = (id) => id,
+): string {
+  if (text.startsWith("blocked: ")) {
+    const why = text
+      .slice("blocked: ".length)
+      .split("; ")
+      .map((b) => planText(t, b, nodeName))
+      .join("; ");
+    return t("migration.text.blocked", { why });
+  }
+  if (text.startsWith("rollback: ")) {
+    return t("migration.text.rollbackFailed", {
+      why: planText(t, text.slice("rollback: ".length), nodeName),
+    });
+  }
   for (const [pattern, key, names] of PLAN_TEXTS) {
     const m = pattern.exec(text);
     if (m) {
-      const values: Record<string, string> = {};
+      const values: Record<string, string | number> = {};
       names.forEach((name, i) => {
-        values[name] = m[i + 1] ?? "";
+        const v = m[i + 1] ?? "";
+        values[name] = name === "node" ? nodeName(v) : name === "count" ? Number(v) : v;
       });
       return t(key, values);
     }

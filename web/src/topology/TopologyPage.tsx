@@ -214,6 +214,11 @@ export function TopologyPage() {
       {hidden > 0 && (
         <p className="text-sm text-muted-foreground">{t("topology.hidden", { count: hidden })}</p>
       )}
+      {topology.nicless > 0 && (
+        <p className="text-sm text-muted-foreground">
+          {t("topology.nicless", { count: topology.nicless })}
+        </p>
+      )}
       {opened && (
         <NetworkSheet
           network={opened}

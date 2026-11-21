@@ -1,6 +1,6 @@
 import { layoutTopology, MAX_VMS_PER_SLAB, neighbor, related } from "@/topology/layout";
-import { sampleGraph, topoId as id } from "@/test/topology";
-import type { Topology } from "@/topology/topology";
+import { countReads, sampleGraph, topoId as id } from "@/test/topology";
+import { type Topology, withoutNicless } from "@/topology/topology";
 
 it("lays out the same picture for the same input, whatever the order", () => {
   const a = layoutTopology(sampleGraph());
@@ -92,7 +92,8 @@ it("lights the path from a VM up to the physical network", () => {
   expect([...lit].some((k) => k.includes(id("002", 3)))).toBe(false);
 });
 
-it("lays out a large cluster quickly (§12.1: 200 networks, 50 routers, 2000 VMs)", () => {
+/** §12.1의 큰 클러스터: 네트워크 200, 라우터 50, VM `vms` */
+function bigGraph(vms: number): Topology {
   const graph: Topology = {
     networks: [],
     routers: [],
@@ -117,7 +118,7 @@ it("lays out a large cluster quickly (§12.1: 200 networks, 50 routers, 2000 VMs
       gateway: { state: "unknown" },
     });
   }
-  for (let v = 0; v < 2000; v++) {
+  for (let v = 0; v < vms; v++) {
     graph.vms.push({
       id: id("006", v),
       name: `vm${v}`,
@@ -125,12 +126,39 @@ it("lays out a large cluster quickly (§12.1: 200 networks, 50 routers, 2000 VMs
       nics: [{ network: id("004", v % 200), ips: [] }],
     });
   }
-  const started = performance.now();
-  const scene = layoutTopology(graph);
-  const took = performance.now() - started;
-  // 시험 기계마다 다르므로 넉넉히(설계 목표는 50 ms — M 계열 Mac에서 13 ms, §18)
-  expect(took).toBeLessThan(500);
-  // SVG 원소: 원소마다 <g> + 면(블록 3, 판 3~5, 기둥 4~5) + 글 — 대략 5개(2250개 → 약 11,400, §18)
-  const elements = scene.items.length * 5 + scene.links.length;
-  expect(elements).toBeLessThan(15_000);
+  return graph;
+}
+
+/** 배치가 VM 목록을 몇 번 읽는지(벽시계 대신 — 리뷰 2 웹 #4) */
+function layoutReads(vms: number): number {
+  const graph = bigGraph(vms);
+  const counted = countReads(graph.vms);
+  layoutTopology({ ...graph, vms: counted.items });
+  return counted.reads();
+}
+
+it(
+  "lays out a large cluster in work linear in the VMs (§12.1: 200 networks, 50 routers, 2000 VMs)",
+  { timeout: 30_000 },
+  () => {
+    // VM 목록을 VM마다 다시 훑지 않는다(설계 목표 50 ms — M 계열 Mac에서 13 ms, §18). 시간은 시험 기계마다 다르므로 읽기
+    // 수를 센다.
+    const big = layoutReads(2000);
+    expect(big).toBeGreaterThanOrEqual(2000);
+    expect(big).toBeLessThanOrEqual(4 * 2000);
+    expect(big / layoutReads(1000)).toBeLessThan(2.5);
+    const scene = layoutTopology(bigGraph(2000));
+    // SVG 원소: 원소마다 <g> + 면(블록 3, 판 3~5, 기둥 4~5) + 글 — 대략 5개(2250개 → 약 11,400, §18)
+    const elements = scene.items.length * 5 + scene.links.length;
+    expect(elements).toBeLessThan(15_000);
+  },
+);
+
+it("drops VMs without a shown NIC and counts them (review 2 m7)", () => {
+  const graph = sampleGraph();
+  expect(withoutNicless(graph)).toEqual({ graph, nicless: 0 });
+  const ghost = { id: id("006", 1), name: "ghost", power: "running" as const, nics: [] };
+  const out = withoutNicless({ ...graph, vms: [...graph.vms, ghost] });
+  expect(out.nicless).toBe(1);
+  expect(out.graph.vms).toEqual(graph.vms);
 });

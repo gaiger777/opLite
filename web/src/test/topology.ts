@@ -84,3 +84,20 @@ export function sampleGraph(): Topology {
     hidden: { networks: 0, routers: 0, load_balancers: 0, floating_ips: 0, vms: 0 },
   };
 }
+
+/**
+ * 배열을 감싸 원소 읽기(번호로 읽기 — `for…of`·`map`·`filter`도 이것으로 읽는다)를 센다. 성능 시험이 벽시계 대신 일의 양을
+ * 센다(리뷰 2 웹 #4 — 시험 기계의 부하에 흔들리지 않게).
+ */
+export function countReads<T>(items: T[]): { items: T[]; reads: () => number } {
+  let reads = 0;
+  const proxy = new Proxy(items, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) {
+        reads += 1;
+      }
+      return Reflect.get(target, key, receiver) as unknown;
+    },
+  });
+  return { items: proxy, reads: () => reads };
+}

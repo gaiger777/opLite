@@ -4,13 +4,14 @@ import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
 
 import type { Network, Vm } from "@/api/types";
-import { planText } from "@/migration/migration";
+import { planSummary, planText } from "@/migration/migration";
 import { MigrationWizard } from "@/migration/MigrationWizard";
 import { NetworksPage } from "@/networks/NetworksPage";
 import i18n from "@/i18n";
 import { expectNoAxeViolations } from "@/test/axe";
 import {
   migrationRes,
+  providerNetwork,
   readyChassis,
   routerView,
   sdnNetwork,
@@ -585,7 +586,8 @@ it("says how many VMs it cannot show and translates the new server sentences", a
   );
   // 이어 가기 Task 이름(리뷰 1 M4)
   expect(t("migration.taskStep.resume")).toBe("resume");
-  expect(i18n.getResourceBundle("ko", "translation").migration.taskStep.resume).toBe("이어 가기");
+  // ko는 단추와 같은 "이어 하기"(리뷰 2 m8)
+  expect(i18n.getResourceBundle("ko", "translation").migration.taskStep.resume).toBe("이어 하기");
 });
 
 it("doesn't create the new SDN network twice when planning fails (review 1 M2)", async () => {
@@ -616,4 +618,142 @@ it("doesn't create the new SDN network twice when planning fails (review 1 M2)",
   await waitFor(() => expect(plans).toBe(2));
   expect(sent.filter((x) => x === "network")).toHaveLength(1);
   expect(JSON.parse(sent.at(-1)!)).toEqual({ spec: { source: "lan", target: "lan-sdn" } });
+});
+
+it("sends no bridge for a provider target so a second migration into it is not refused (review 2 #2)", async () => {
+  const PROV = providerNetwork("prov", "phys", [{ cidr: "192.168.10.0/24" }]);
+  mockLists({ node: [N1], network: [LAN, PROV], vm: [WEB, DB] });
+  server.use(
+    http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([N1], [N1]))),
+    http.get(apiUrl("/network-migrations"), () => HttpResponse.json({ revision: 12, items: [] })),
+  );
+  const sent: unknown[] = [];
+  server.use(
+    http.post(apiUrl("/network-migrations"), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json({
+        ...MOVABLE,
+        bridge: { needed: false, node: null, error: null, warnings: [] },
+      });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  const existing = await screen.findByLabelText("An existing SDN network");
+  await waitFor(() => expect(existing).toBeChecked());
+  expect(screen.getByLabelText("SDN network")).toHaveValue("prov");
+  // 공급자 대상에는 다리 칸이 없다.
+  expect(screen.queryByLabelText(/bridge/i, { selector: "button[role=checkbox]" })).toBeNull();
+  await user.click(screen.getByRole("button", { name: "Make the plan" }));
+  await waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent[0]).toEqual({ spec: { source: "lan", target: "prov", bridge: false } });
+});
+
+it("picks the existing network once the list arrives when opened before it (review 2 m5)", async () => {
+  cluster();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => (release = r));
+  server.use(
+    http.get(apiUrl("/networks"), async () => {
+      await gate;
+      return HttpResponse.json({ revision: 1, items: [LAN, TLAN] });
+    }),
+  );
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  const plan = await screen.findByRole("button", { name: "Make the plan" });
+  // 목록이 오기 전에는 계획을 만들 수 없다.
+  expect(plan).toBeDisabled();
+  release();
+  await waitFor(() => expect(screen.getByLabelText("An existing SDN network")).toBeChecked());
+  expect(screen.getByLabelText("SDN network")).toHaveValue("t-lan");
+  expect(plan).toBeEnabled();
+});
+
+it("replaces an offline bridge node and translates per-interface errors (review 2 #3, m2, m8)", async () => {
+  const OFF = sdnNode(1, readyChassis(1, "leader"), {
+    bridges: [{ name: "br0", vlan_filtering: false }],
+    online: false,
+  });
+  const N2 = sdnNode(2, readyChassis(2), { bridges: [{ name: "br0", vlan_filtering: false }] });
+  const failed = migrationRes(
+    "lan-to-t-lan",
+    { source: "lan", target: "t-lan" },
+    {
+      phase: "failed",
+      bridge: { node: OFF.id, physnet: "opl-mig-1" },
+      error: `the migration bridge opl-mig-1 on node ${OFF.id} is not ready after 120s: the node did not report it`,
+      vms: [
+        {
+          vm: WEB.id,
+          nic: 0,
+          mac: "52:54:00:00:00:01",
+          mode: "live",
+          ips: ["192.168.10.5"],
+          address_source: "given",
+          from: { network: "lan" },
+          state: "failed",
+          error: "the NIC was changed outside the migration",
+        },
+      ],
+    },
+  );
+  cluster([failed]);
+  mockLists({ node: [OFF, N2], network: [LAN, TLAN], vm: [WEB, DB] });
+  const sent: unknown[] = [];
+  server.use(
+    http.post(apiUrl(`/network-migrations/${failed.id}/resume`), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json(sdnTask("t1", "sdn-init", N2.id), { status: 202 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  expect(
+    await screen.findByText(
+      "the bridge on node node-a is not ready after 120 s: if the node is down, resume with another bridge node",
+    ),
+  ).toBeVisible();
+  expect(screen.getByText("the interface was changed outside the migration")).toBeVisible();
+  const picker = screen.getByLabelText("New bridge node");
+  // 꺼진 다리 노드는 후보가 아니다.
+  expect(
+    within(picker)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["Automatic (the node with the most VMs)", "node-b"]);
+  expect(screen.getByText(/The bridge node node-a is offline/)).toBeVisible();
+  await user.selectOptions(picker, "node-b");
+  await user.click(screen.getByRole("button", { name: "Resume" }));
+  await waitFor(() => expect(sent).toEqual([{ bridge_node: N2.id }]));
+  expect(await screen.findByText("Resumed lan-to-t-lan.")).toBeInTheDocument();
+});
+
+it("sums up what starting does and says when a VM is no longer blocked (review 2 m6, m8, m1)", async () => {
+  cluster();
+  // 화면의 계획은 db가 막혔고, 만들 때 서버 계획은 막히지 않았다.
+  const RES = created("lan-to-t-lan", MOVABLE);
+  server.use(
+    http.post(apiUrl("/network-migrations"), ({ request }) =>
+      new URL(request.url).searchParams.get("dry_run") === "true"
+        ? HttpResponse.json(PLAN)
+        : HttpResponse.json(RES, { status: 201 }),
+    ),
+  );
+  const user = userEvent.setup();
+  renderPage(<MigrationWizard source={LAN} onClose={() => {}} />);
+  await planOnTLan(user);
+  expect(await screen.findByText("1 VM moves live (about a second without network)")).toBeVisible();
+  await user.click(screen.getByRole("button", { name: "Create and start (1 interface)" }));
+  const dialog = await screen.findByRole("alertdialog", {
+    name: "The plan for lan-to-t-lan changed",
+  });
+  expect(within(dialog).getByText("db interface 1: no longer blocked")).toBeVisible();
+  // 바뀐 것이 많아도 단추가 화면 밖으로 나가지 않게 대화상자 안에서 넘긴다.
+  expect(dialog).toHaveClass("max-h-[90svh]", "overflow-y-auto");
+});
+
+it("counts VMs per mode without the left-out ones", () => {
+  const plan = MOVABLE as unknown as Parameters<typeof planSummary>[0];
+  expect(planSummary(plan)).toEqual({ restart: 0, live: 1, offline: 1 });
+  expect(planSummary(plan, new Set([DB.id]))).toEqual({ restart: 0, live: 1, offline: 0 });
 });

@@ -61,6 +61,16 @@ export function withLive(graph: Topology, live: Topology | undefined): Topology 
   };
 }
 
+/**
+ * NIC가 모두 볼 수 없는 네트워크에 있는 VM(서버가 `nics: []`로 보냄)을 뺀다. 그림·목록 어디에도 집이 없는데 큰 그림 띠·이름
+ * 보이기 문턱을 부풀렸다(리뷰 2 웹 m7). 뺀 수는 따로 알린다. 없으면 같은 객체를 돌려준다.
+ */
+export function withoutNicless(graph: Topology): { graph: Topology; nicless: number } {
+  const vms = graph.vms.filter((v) => v.nics.length > 0);
+  const nicless = graph.vms.length - vms.length;
+  return { graph: nicless === 0 ? graph : { ...graph, vms }, nicless };
+}
+
 /** 토폴로지(폴더로 거를 수 있다): 그림은 watch로, 살아 있는 상태는 30초마다 */
 export function useTopology(folder: string | null) {
   const graph = useQuery({
@@ -72,9 +82,10 @@ export function useTopology(folder: string | null) {
     queryFn: () => read(folder, true),
     refetchInterval: TOPOLOGY_LIVE_MS,
   });
+  const shown = useMemo(() => (graph.data ? withoutNicless(graph.data) : undefined), [graph.data]);
   const data = useMemo(
-    () => (graph.data ? withLive(graph.data, live.data) : undefined),
-    [graph.data, live.data],
+    () => (shown ? withLive(shown.graph, live.data) : undefined),
+    [shown, live.data],
   );
-  return { data, error: graph.error };
+  return { data, nicless: shown?.nicless ?? 0, error: graph.error };
 }

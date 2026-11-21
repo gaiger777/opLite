@@ -1561,3 +1561,24 @@ it("moves focus to the first wrong input of the first step with errors", async (
   expect(mac).toHaveFocus();
   expect(mac).toHaveAccessibleDescription("Use the form 52:54:00:12:34:56.");
 });
+
+it("warns when a simple-network rate limit can't run on any node (review 2 m2)", async () => {
+  // NODE는 `qos`를 알리지 않는다(tc 없음 — 서버가 409 `qos_unsupported`로 막는다).
+  mockLists({
+    node: [NODE],
+    network: [{ id: "net", name: "lan", revision: 1, labels: {}, spec: { bridge: "br0" } }],
+  });
+  renderPage(<VmCreatePage />, { path: "/vms/-new" });
+  const user = userEvent.setup();
+  const nic = await screen.findByRole("group", { name: "Network interface 1" });
+  await within(nic).findByRole("option", { name: "lan" });
+  await user.selectOptions(within(nic).getByLabelText("Network"), "lan");
+  await user.click(within(nic).getByText("QoS (rate limit, DSCP)"));
+  expect(within(nic).queryByText(/can't rate-limit/)).not.toBeInTheDocument();
+  await user.type(within(nic).getByLabelText("Send limit (Mbit/s)"), "100");
+  expect(
+    within(nic).getByText(
+      "No node can rate-limit simple-network interfaces (no tc). Remove the rate limit or use an SDN network.",
+    ),
+  ).toBeVisible();
+});

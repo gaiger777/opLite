@@ -8,6 +8,7 @@ import {
   type CdromRow,
   gibToBytes,
   haUnavailable,
+  tcMissing,
   toSpec,
   validate,
   windows11,
@@ -559,4 +560,18 @@ it("checks, round-trips and sends NIC QoS (plan 67)", () => {
     "nics.1.qos.burst": "vmForm.errors.qos.burstWithoutRate",
     "nics.2.qos.out": "vmForm.errors.qos.user",
   });
+});
+
+it("says where simple-NIC rate limits can't run (review 2 m2, server qos_unsupported)", () => {
+  const withTc = { ...NODE, id: "n1", name: "node-a", status: { ...NODE.status, qos: true } };
+  const noTc = { ...NODE, id: "n2", name: "node-b", status: { ...NODE.status, qos: false } };
+  const old = { ...NODE, id: "n3", name: "node-c" };
+  expect(tcMissing(undefined, "n2")).toBeNull();
+  expect(tcMissing([withTc, noTc], "n1")).toBeNull();
+  expect(tcMissing([withTc, noTc], "n2")).toBe("node-b");
+  // `qos`를 알리지 않는 노드(옛 노드)도 서버가 막는다.
+  expect(tcMissing([withTc, old], "n3")).toBe("node-c");
+  // 노드를 고르지 않으면 할 수 있는 노드가 하나라도 있는지
+  expect(tcMissing([withTc, noTc], "")).toBeNull();
+  expect(tcMissing([noTc, old], "")).toBe("");
 });

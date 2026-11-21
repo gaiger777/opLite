@@ -139,13 +139,21 @@ export function vipNetworks(
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-/** 멤버가 닿을 수 있는 네트워크: VIP 네트워크와 같은 라우터의 다른 인터페이스(라우터를 읽을 수 있을 때) */
+/**
+ * 멤버가 닿을 수 있는 네트워크: VIP 네트워크와 같은 라우터의 다른 인터페이스. 라우터를 읽을 수 없으면 어느 것이 같은
+ * 라우터인지 모르므로 라우터에 붙은 오버레이 네트워크(`routed`) 모두를 VIP 네트워크 다음에 내놓고, 닿지 않는 NIC는 서버의
+ * 400 `lb_member_unreachable`이 가린다(리뷰 2 웹 m4).
+ */
 export function memberNetworks(
   vipNetwork: string,
   routers: readonly Router[] | undefined,
+  routed: readonly RoutedNetwork[] = [],
 ): string[] {
   const router = routers?.find((r) => r.spec.interfaces?.some((i) => i.network === vipNetwork));
-  return router ? (router.spec.interfaces ?? []).map((i) => i.network) : [vipNetwork];
+  if (router) {
+    return (router.spec.interfaces ?? []).map((i) => i.network);
+  }
+  return [vipNetwork, ...routed.map((r) => r.network).filter((n) => n !== vipNetwork)];
 }
 
 /** NIC 멤버 후보 하나. `reason`이 있으면 막힌 까닭(번역 키와 값). */

@@ -305,7 +305,6 @@ it("edits only the changed fields with If-Match and deletes", async () => {
     ifMatch: "9",
     body: {
       description: "front",
-      external: { network: "ext", ip: "203.0.113.130" },
       listeners: [
         {
           protocol: "tcp",
@@ -375,4 +374,90 @@ it("reads health apart from the list and translates each of a member's warnings 
       /^the security groups of member NIC 52:54:00:00:00:02 do not let clients reach tcp\/8080; the security groups of member NIC 52:54:00:00:00:02 block health checks/,
     ),
   ).toBeVisible();
+});
+
+it("keeps an external VIP on a network the user can't see and sends it only when changed (review 2 #1, m4)", async () => {
+  mockLists({ node: [N1], network: [T1, T2], vm: [WEB, API] });
+  // 테넌트는 라우터도 외부 네트워크도 읽을 수 없다: 라우터 목록은 비고, 외부 이름은 빈 글이다.
+  server.use(
+    http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([N1], [N1]))),
+    http.get(apiUrl("/routers"), () =>
+      HttpResponse.json({
+        revision: 9,
+        items: [],
+        routed: [
+          { network: "t1", external: "" },
+          { network: "t2", external: "" },
+        ],
+      }),
+    ),
+    http.get(apiUrl("/load-balancers"), () => HttpResponse.json({ revision: 9, items: [WEB_LB] })),
+  );
+  const sent: unknown[] = [];
+  server.use(
+    http.patch(apiUrl(`/load-balancers/${WEB_LB.id}`), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json({ ...WEB_LB, revision: 10, status: {} });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<LoadBalancersPage />);
+  await user.click(await screen.findByRole("button", { name: "Edit web-lb" }));
+  const dialog = await screen.findByRole("dialog", { name: "Edit load balancer web-lb" });
+  // LB가 가진 외부 네트워크 이름을 보인다.
+  expect(within(dialog).getByRole("checkbox", { name: /External VIP on ext/ })).toBeChecked();
+  // 라우터를 읽을 수 없어도 다른 인터페이스(t2)의 NIC를 고를 수 있다(서버가 판단).
+  const pick = within(dialog).getAllByLabelText("VM interface")[0]!;
+  expect(within(pick).getByRole("option", { name: "api #1 (t2, 10.20.0.2)" })).toBeEnabled();
+  await user.type(within(dialog).getByLabelText("Description (optional)"), "front");
+  await user.click(within(dialog).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(sent).toHaveLength(1));
+  expect(sent[0]).not.toHaveProperty("external");
+  expect(sent[0]).toMatchObject({ description: "front" });
+
+  // 바깥 VIP 주소를 바꾸면 LB의 외부 네트워크로 보낸다.
+  await user.click(await screen.findByRole("button", { name: "Edit web-lb" }));
+  const again = await screen.findByRole("dialog", { name: "Edit load balancer web-lb" });
+  const ip = within(again).getByLabelText("External VIP address (optional)");
+  await user.clear(ip);
+  await user.type(ip, "203.0.113.131");
+  await user.click(within(again).getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(sent).toHaveLength(2));
+  expect(sent[1]).toMatchObject({ external: { network: "ext", ip: "203.0.113.131" } });
+});
+
+it("says the router's external network is hidden when creating (review 2 #1)", async () => {
+  mockLists({ node: [N1], network: [T1], vm: [] });
+  server.use(
+    http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([N1], [N1]))),
+    http.get(apiUrl("/routers"), () =>
+      HttpResponse.json({ revision: 9, items: [], routed: [{ network: "t1", external: "" }] }),
+    ),
+    http.get(apiUrl("/load-balancers"), () => HttpResponse.json({ revision: 9, items: [] })),
+  );
+  const user = userEvent.setup();
+  renderPage(<LoadBalancersPage />);
+  await user.click(await screen.findByRole("button", { name: "Create a load balancer" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create a load balancer" });
+  expect(
+    await within(dialog).findByText(
+      "External VIP (the router's external network isn't visible to you)",
+    ),
+  ).toBeVisible();
+});
+
+it("shows NIC members of VMs the user can't read without their details (server review 2 m1)", async () => {
+  mockLists({ node: [N1], network: [EXT, T1, T2], vm: [WEB] });
+  const hidden = {
+    ...WEB_LB,
+    members: [WEB_LB.members[0]!, { listener: "tcp/80", port: 8080, health: "online" as const }],
+  };
+  ready([hidden]);
+  const user = userEvent.setup();
+  renderPage(<LoadBalancersPage />);
+  await user.click(await screen.findByRole("button", { name: "Open load balancer web-lb" }));
+  const sheet = await screen.findByRole("dialog", { name: "Load balancer web-lb" });
+  const table = within(sheet).getByRole("table", { name: "Listener tcp/80" });
+  expect(within(table).getByText("A VM you can't see")).toBeVisible();
+  expect(within(table).queryAllByRole("cell", { name: "Address" })).toHaveLength(0);
 });

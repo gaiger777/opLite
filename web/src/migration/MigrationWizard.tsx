@@ -41,6 +41,7 @@ import {
   type PlanChange,
   planChanges,
   planKey,
+  planSummary,
   planText,
   planWarnings,
   progress,
@@ -194,7 +195,9 @@ function TargetStep({
         perms.has("network.assign", objectTarget("network", n)),
     )
     .sort((a, b) => a.name.localeCompare(b.name));
-  const [create, setCreate] = useState(targets.length === 0);
+  // "있는/새 네트워크"는 고르기 전에는 목록을 읽은 뒤에 정한다(리뷰 2 웹 m5 — 목록이 오기 전에 정해 "새"에 머물지 않게).
+  const [choice, setCreate] = useState<boolean | null>(null);
+  const create = choice ?? (networks.data !== undefined && targets.length === 0);
   const [target, setTarget] = useState(spec.target);
   const chosen = target || targets[0]?.name || "";
   const [newName, setNewName] = useState(`${source.name}-sdn`.slice(0, 63));
@@ -210,6 +213,8 @@ function TargetStep({
   const [busy, setBusy] = useState(false);
   const targetNet = create ? undefined : networks.data?.find((n) => n.name === chosen);
   const overlay = create || (targetNet !== undefined && isOverlay(targetNet));
+  // 공급자 대상에는 다리가 없다: `bridge: false`를 보내 대상 네트워크의 겹침 키를 잡지 않는다(리뷰 2 웹 #2·서버 m3).
+  const provider = targetNet !== undefined && !isOverlay(targetNet);
   // 다리 노드 후보: 원본 브리지가 있고 chassis가 준비된 노드(서버 `plan_bridge`)
   const bridgeNodes = (nodes.data ?? [])
     .filter(
@@ -270,7 +275,7 @@ function TargetStep({
         source: source.name,
         target: targetName,
         ...(mode !== "auto" && { mode }),
-        ...(overlay && !bridge && { bridge: false }),
+        ...((provider || (overlay && !bridge)) && { bridge: false }),
         ...(overlay && bridge && bridgeNode && { bridge_node: bridgeNode }),
         ...(shrink && { allow_mtu_shrink: true }),
         ...(parallel !== "1" && { parallel: Number(parallel) }),
@@ -454,7 +459,7 @@ function TargetStep({
         </p>
       )}
       <div>
-        <Button disabled={busy} onClick={() => void next()}>
+        <Button disabled={busy || networks.data === undefined} onClick={() => void next()}>
           {t("migration.makePlan")}
         </Button>
       </div>
@@ -501,6 +506,10 @@ function PlanStep({
   const instanceId = plan.nics.some((n) => n.warnings.some(isInstanceIdWarning));
   const movable = plan.nics.filter((n) => n.mode !== "blocked" && !excluded.has(n.vm)).length;
   const blockedBridge = plan.bridge.error != null;
+  const summary = planSummary(plan, excluded);
+  const summaryText = (["restart", "live", "offline"] as const)
+    .filter((k) => summary[k] > 0)
+    .map((k) => t(`migration.summary.${k}`, { count: summary[k] }));
 
   // 화면의 계획을 만든 스펙과 지금 고른 방식·주소가 다르면 다시 계획해야 시작한다(리뷰 1 C1).
   const stale = planKey(edited()) !== planKey(spec);
@@ -603,15 +612,15 @@ function PlanStep({
                 before: c.before || t("migration.newAddress"),
                 after: c.after || t("migration.newAddress"),
               })
-            : t("migration.change.blockers", {
-                who,
-                after: c.after
-                  ? c.after
-                      .split("; ")
-                      .map((b) => planText(t, b))
-                      .join("; ")
-                  : t("migration.change.none"),
-              });
+            : c.after
+              ? t("migration.change.blockers", {
+                  who,
+                  after: c.after
+                    .split("; ")
+                    .map((b) => planText(t, b))
+                    .join("; "),
+                })
+              : t("migration.change.unblocked", { who });
     return c.disrupts ? `${text} — ${t(`migration.change.disrupt.${c.after}`)}` : text;
   };
 
@@ -790,6 +799,15 @@ function PlanStep({
           {t("migration.replanFirst")}
         </p>
       )}
+      {summaryText.length > 0 && (
+        <p
+          className={
+            summary.restart > 0 ? "text-sm font-medium text-warning-fg" : "text-sm text-foreground"
+          }
+        >
+          {summaryText.join(", ")}
+        </p>
+      )}
       <div className="flex flex-wrap gap-2">
         <Button variant="outline" disabled={busy} onClick={onBack}>
           {t("common.back")}
@@ -867,9 +885,16 @@ function ProgressStep({
   // 다리 노드를 클러스터에서 지워 멈췄다(서버 `drop_bridge_node`): 이어 할 때 다른 노드를 고른다.
   const bridgeGone =
     m.status.bridge === undefined && (m.status.error ?? "").startsWith("the bridge node");
-  // 서버 `plan_bridge`와 같게: chassis가 준비되고 원본 브리지가 있는 노드(리뷰 1 M5)
+  // 놓인 다리의 노드가 꺼졌다(지우지 않음): 서버는 `resume --bridge-node`로 바꾸게 한다(리뷰 1 서버 M5, 리뷰 2 웹 #3).
+  const bridgeHost = m.status.bridge
+    ? nodes.data?.find((n) => n.id === m.status.bridge?.node)
+    : undefined;
+  const bridgeOffline = bridgeHost !== undefined && !bridgeHost.status.online;
+  const nodeName = (id: string) => nodes.data?.find((n) => n.id === id)?.name ?? id;
+  // 서버 `plan_bridge`와 같게: chassis가 준비되고 원본 브리지가 있는 노드(리뷰 1 M5). 꺼진 다리 노드는 뺀다.
   const bridgeCandidates = (nodes.data ?? []).filter(
     (n) =>
+      n.id !== m.status.bridge?.node &&
       n.status.sdn?.chassis === "ready" &&
       n.status.bridges.some((b) => b.name === bridgeName(source.spec)),
   );
@@ -933,7 +958,7 @@ function ProgressStep({
       </div>
       {m.status.error && (
         <p role="alert" className="text-sm text-destructive">
-          {planText(t, m.status.error)}
+          {planText(t, m.status.error, nodeName)}
         </p>
       )}
       <div className="overflow-x-auto">
@@ -995,7 +1020,11 @@ function ProgressStep({
                       >
                         {t(`migration.state.${v.state ?? "pending"}`)}
                       </StatusChip>
-                      {v.error && <span className="text-xs text-destructive">{v.error}</span>}
+                      {v.error && (
+                        <span className="text-xs text-destructive">
+                          {planText(t, v.error, nodeName)}
+                        </span>
+                      )}
                       {v.at && (
                         <span className="text-xs text-muted-foreground">
                           {new Date(v.at * 1000).toLocaleTimeString(i18n.language)}
@@ -1009,11 +1038,15 @@ function ProgressStep({
           </TableBody>
         </Table>
       </div>
-      {canResume && bridgeGone && (
+      {canResume && (bridgeGone || bridgeOffline) && (
         <Field
           id="mig-resume-node"
           label={t("migration.newBridgeNode")}
-          hint={t("migration.newBridgeNodeHint")}
+          hint={
+            bridgeOffline
+              ? t("migration.newBridgeNodeOffline", { node: bridgeHost.name })
+              : t("migration.newBridgeNodeHint")
+          }
         >
           {(a11y) => (
             <NativeSelect
@@ -1058,7 +1091,7 @@ function ProgressStep({
             disabled={busy}
             onClick={() =>
               void act(
-                "migration.resumed",
+                phase === "planned" ? "migration.startedNow" : "migration.resumed",
                 () =>
                   call(
                     api.POST(

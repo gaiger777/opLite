@@ -29,6 +29,7 @@ export function NicsSection({
   saved,
   boot,
   template = false,
+  noTc = null,
 }: {
   values: VmFormValues;
   errors: Record<string, string>;
@@ -48,6 +49,11 @@ export function NicsSection({
   boot: number;
   /** 템플릿을 고친다: 서버가 템플릿의 주소를 늘 지우므로 주소 칸을 보이지 않는다(리뷰 1 #9). */
   template?: boolean;
+  /**
+   * 단순 NIC의 속도 제한(tap의 tc)을 걸 수 없는 곳: 고른 노드의 이름, 노드를 고르지 않았는데 tc가 되는 노드가 없으면 빈 글,
+   * 걸 수 있으면 null(리뷰 2 웹 m2 — 서버 409 `qos_unsupported`를 미리 알림).
+   */
+  noTc?: string | null;
 }) {
   const { t } = useTranslation();
   const locked = mode === "locked" || mode === "restart";
@@ -188,6 +194,7 @@ export function NicsSection({
                   index={i}
                   qos={nic.qos}
                   sdn={sdn}
+                  noTc={noTc}
                   errors={errors}
                   onChange={(qos) => setNic(i, { qos })}
                 />
@@ -235,12 +242,14 @@ function NicQos({
   index,
   qos,
   sdn,
+  noTc,
   errors,
   onChange,
 }: {
   index: number;
   qos: QosRow | undefined;
   sdn: boolean;
+  noTc: string | null;
   errors: Record<string, string>;
   onChange: (qos: QosRow) => void;
 }) {
@@ -281,6 +290,11 @@ function NicQos({
         )}
       </div>
       <p className="mt-1 text-xs text-muted-foreground">{t("vmForm.qos.hint")}</p>
+      {!sdn && noTc !== null && (value.out.trim() !== "" || value.in.trim() !== "") && (
+        <p role="status" className="mt-1 text-xs text-warning-fg">
+          {noTc === "" ? t("vmForm.qos.noTcAnywhere") : t("vmForm.qos.noTc", { node: noTc })}
+        </p>
+      )}
     </details>
   );
 }

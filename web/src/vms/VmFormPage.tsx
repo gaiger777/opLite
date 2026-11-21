@@ -24,6 +24,7 @@ import {
   fromVm,
   haActive,
   type NicRow,
+  tcMissing,
   validate,
   type VmFormValues,
 } from "@/vms/form";
@@ -130,6 +131,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   const [values, setValues] = useState(initial);
   // NIC마다 SDN 네트워크인지(계획 65 — 주소 칸과 cloud-init 주소). 목록을 읽기 전에는 모른다(빈 목록 → 단순으로 본다).
   const sdnNics = values.nics.map((n) => sdnNetworkNamed(networks.data, n.network));
+  const noTc = tcMissing(nodes.data, values.node || (vm?.status.node ?? ""));
   const [revision, setRevision] = useState(vm?.revision);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [failure, setFailure] = useState<{ message: string; conflict: boolean } | null>(null);
@@ -422,6 +424,7 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
                   saved={vm?.spec.nics ?? []}
                   boot={layout?.boot_nics ?? 0}
                   template={vm?.spec.template === true}
+                  noTc={noTc}
                 />
               </StepSection>
               <StepSection step="cdroms">

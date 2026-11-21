@@ -226,7 +226,10 @@ it("offers to finish a turn-on that stopped halfway, with Raft peers and warning
             centrals: ["10.0.0.1"],
             outside: [{ central: "node-a", peer: "192.0.2.8", raft: true }],
             blocked: true,
-            warnings: ["with two centrals the southbound database loses quorum during each turn"],
+            // 서버 `lockdown_warnings`의 문장 그대로
+            warnings: [
+              "the cluster has two OVN centrals: while each one restarts its southbound database the other alone is not a majority, so the SB is unavailable for a few seconds per central (the data path keeps working); add a third central to avoid it",
+            ],
           })
         : HttpResponse.json(sdnTask("t1", "sdn-init", N1.id), { status: 202 });
     }),
@@ -242,9 +245,7 @@ it("offers to finish a turn-on that stopped halfway, with Raft peers and warning
   const peer = await within(card).findByText("192.0.2.8 → node-a");
   expect(within(peer).getByText("Raft")).toBeVisible();
   expect(
-    within(card).getByText(
-      "with two centrals the southbound database loses quorum during each turn",
-    ),
+    within(card).getByText(/^The cluster has two OVN centrals: while each one restarts/),
   ).toBeVisible();
   const finish = within(card).getByRole("button", { name: "Finish turning on" });
   expect(finish).toBeDisabled();
@@ -252,4 +253,46 @@ it("offers to finish a turn-on that stopped halfway, with Raft peers and warning
   await user.click(finish);
   await waitFor(() => expect(sent).toHaveLength(2));
   expect(sent[1]).toEqual({ search: "", body: { enabled: true, force: true } });
+});
+
+it("offers to finish a turn-off that stopped halfway and translates lockdown errors (review 2 m3, m2)", async () => {
+  sdn({
+    lockdown: {
+      ...LOCKED,
+      enabled: false,
+      pending: true,
+      error:
+        "the OVN address allow-list is not removed on node-b: nft: permission denied yet; the SDN agent there keeps trying",
+      nodes: [
+        LOCKED.nodes[0],
+        {
+          ...LOCKED.nodes[1],
+          error:
+            "the address allow-list cut the OVN Raft connections (no fresh message from 10.0.0.1); removed it again",
+        },
+      ],
+    },
+    tasks: [],
+  });
+  const sent: unknown[] = [];
+  server.use(
+    http.post(apiUrl("/sdn/lockdown"), async ({ request }) => {
+      sent.push(await request.json());
+      return HttpResponse.json(sdnTask("t1", "sdn-init", N1.id), { status: 202 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<SdnPage />);
+  const card = (await screen.findByRole("heading", { name: "OVN access lockdown" })).closest(
+    "section",
+  )!;
+  expect(await within(card).findByText("Stopped halfway")).toBeVisible();
+  expect(
+    within(card).getByText(/^The OVN address allow-list is not removed on node-b/),
+  ).toBeVisible();
+  expect(
+    within(card).getByText(/^The address allow-list cut the OVN Raft connections and was removed/),
+  ).toBeVisible();
+  await user.click(within(card).getByRole("button", { name: "Finish turning off" }));
+  await waitFor(() => expect(sent).toEqual([{ enabled: false }]));
 });
