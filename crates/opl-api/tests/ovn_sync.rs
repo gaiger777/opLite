@@ -303,6 +303,31 @@ async fn removes_the_sb_chassis_of_nodes_that_left() {
         s.insert("Chassis", json!({"name": "admin-chassis"}));
     });
     let mut s = ovn.syncer();
+    // 모든 노드가 `sdn-services`를 알면 리더는 SB에 쓰지 않는다(계획 67 §10.2 — 중앙 에이전트가 한다).
+    assert!(matches!(
+        s.sync().await,
+        SyncOutcome::Synced {
+            chassis_deleted: 0,
+            ..
+        }
+    ));
+    assert_eq!(ovn.sb.rows("Chassis").len(), 3);
+    // 옛 노드가 섞인 동안은 리더가 계획 65처럼 지운다.
+    let node = ovn
+        .env
+        .cluster
+        .get::<opl_types::node::NodeSpec>(ovn.env.node)
+        .unwrap()
+        .unwrap();
+    let mut status = node.status;
+    status
+        .features
+        .retain(|f| f != opl_types::node::SDN_SERVICES);
+    ovn.env
+        .cluster
+        .update_status::<opl_types::node::NodeSpec>(ovn.env.node, &status)
+        .await
+        .unwrap();
     let outcome = s.sync().await;
     assert!(
         matches!(

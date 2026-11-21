@@ -521,6 +521,18 @@ async fn orbivisord_sets_up_ovn() {
         &["remove", "Open_vSwitch", ".", "external_ids", "opl-test"],
     );
 
+    // 1b. OVN 접근 잠금(계획 67 §10): 새 클러스터의 `sdn init`은 잠금을 켠 채 세운다(SB 설정 파일·6645·허용 목록).
+    // 뒤의 두 번째 중앙(127.0.0.2 — Orbivisor 중앙이 아님)과 이전 계획의 절은 잠금을 끄고 본다(끄면 계획 66 글 그대로).
+    // 잠금 자체(RBAC·허용 목록·다시 켜기)는 끝의 `lockdown_section`이 본다.
+    wait_for("the initial lockdown", AGENT_WAIT, || async {
+        lockdown_shape(&tag, true).is_ok()
+    })
+    .await;
+    lockdown_shape(&tag, true).unwrap();
+    let said = d.ctl(&["sdn", "lockdown", "off"]).await.unwrap();
+    eprintln!("{said}");
+    lockdown_shape(&tag, false).unwrap();
+
     // 2. 다시 하기: 이미 된 일은 건너뛴다(DB를 다시 만들지 않는다).
     let inode = || {
         use std::os::unix::fs::MetadataExt;
@@ -869,6 +881,190 @@ async fn orbivisord_sets_up_ovn() {
     // 그룹을 바꾸는 동안 열린 순간이 없음, 허용을 빼면 맺은 연결이 끊김 — 같은 그룹을 단순 브리지의 nftables(방화벽 에이전트의
     // `ruleset`)에도 걸어 같은 탐침 표가 같은지 본다(다른 것은 맺은 연결뿐 — 설계 §11.4).
     Box::pin(security_section(&d, &tag)).await;
+
+    // 12. OVN 접근 잠금(계획 67 §10): 다시 켜고 SB RBAC(역할 포트에서 남의 행·다른 표 쓰기 거절, 자기 행은 됨, northd는
+    // 6645로 일함)·허용 목록 밖 출발 주소의 시간 초과를 본 뒤 끄면 계획 66 글 그대로다.
+    Box::pin(lockdown_section(&d, &tag, &node)).await;
+}
+
+/// 잠금이 켜졌으면(`on`) SB 설정 파일(0600)·SB와 northd 단위가 잠근 모양이고 6645에 듣고 허용 목록 표가 있다. 꺼졌으면
+/// 설정 파일·6645·표가 없고 단위 글은 계획 66과 바이트까지 같다. 다르면 까닭
+fn lockdown_shape(tag: &str, on: bool) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let paths = OvnPaths::default();
+    let me: IpAddr = "127.0.0.1".parse().unwrap();
+    let mine = [me];
+    let locked: &[IpAddr] = if on { &mine } else { &[] };
+    let read = |p: &str| std::fs::read_to_string(p).unwrap_or_default();
+    let config = std::path::Path::new("/etc/opl/ovn/sb.json");
+    if on {
+        if read("/etc/opl/ovn/sb.json") != opl_driver::ovn::sb_config(me, &paths) {
+            return Err("sb.json".into());
+        }
+        let mode = std::fs::metadata(config).unwrap().permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(format!("sb.json mode {mode:o}"));
+        }
+    } else if config.exists() {
+        return Err("sb.json is still there".into());
+    }
+    if read("/etc/systemd/system/opl-ovn-sb.service")
+        != opl_driver::ovn::db_unit(Db::Sb, me, on, &paths)
+    {
+        return Err("the SB unit".into());
+    }
+    if read("/etc/systemd/system/opl-ovn-northd.service")
+        != opl_driver::ovn::northd_unit(&[me], locked, &paths)
+    {
+        return Err("the northd unit".into());
+    }
+    let ss = run("ss", &["-ltnH"]);
+    if ss.contains("127.0.0.1:6645") != on {
+        return Err(format!("listeners:\n{ss}"));
+    }
+    let table = format!("opl_ovn_{tag}");
+    let (present, _, _) = try_run("nft", &["list", "table", "inet", &table]);
+    if present != on {
+        return Err(format!("nft table present = {present}"));
+    }
+    Ok(())
+}
+
+/// 출발 주소 `from`에서 `127.0.0.1:port`로 TCP를 맺어 본다(5초 — 허용 목록 밖이면 SYN이 버려져 시간 초과).
+fn tcp_connects(from: &str, port: u16) -> bool {
+    let script = "import socket,sys\ns=socket.socket()\ns.settimeout(5)\ns.bind((sys.argv[1],0))\n\
+                  try:\n  s.connect(('127.0.0.1',int(sys.argv[2])))\n  print('connected')\n\
+                  except Exception as e:\n  print('failed',e)\n";
+    let out = run("python3", &["-c", script, from, &port.to_string()]);
+    eprintln!("tcp {from} -> 127.0.0.1:{port}: {}", out.trim());
+    out.starts_with("connected")
+}
+
+/// 노드 인증서로 `port`의 SB에 `ovn-sbctl`(성공, stderr)
+fn sb_as_node(port: u16, args: &[&str]) -> (bool, String) {
+    let db = format!("--db=ssl:127.0.0.1:{port}");
+    let mut all = vec![
+        db.as_str(),
+        "--private-key=/etc/opl/ovn/node.key",
+        "--certificate=/etc/opl/ovn/node.crt",
+        "--ca-cert=/etc/opl/ovn/ca.crt",
+        "--timeout=20",
+    ];
+    all.extend_from_slice(args);
+    let (ok, out, err) = try_run("ovn-sbctl", &all);
+    (ok, format!("{out}{err}"))
+}
+
+/// OVN 접근 잠금(12번, 노드 하나): `sdn lockdown on` → SB가 설정 파일로 6642(`ovn-controller` 역할)·6645(northd)에 듣고,
+/// 노드 인증서(CN = 이 chassis)로 역할 포트에서 남의 `Chassis` 행 바꾸기·남의 이름으로 chassis 넣기·`SB_Global` 쓰기가
+/// RBAC로 거절되고 자기 행은 바뀐다. 특권 포트는 같은 인증서로 된다. ovn-controller가 역할 포트로 `nb_cfg`를 따라잡고
+/// (`--wait=hv`), northd가 6645로 일한다. 허용 목록 밖 출발 주소(127.0.0.3)는 6641·6642·6645에서 시간 초과다. 끄면
+/// 계획 66 글로 돌아가고 다시 붙는다.
+async fn lockdown_section(d: &Daemon, tag: &str, node: &str) {
+    let started = Instant::now();
+    let said = d.ctl(&["sdn", "lockdown", "on"]).await.unwrap();
+    eprintln!(
+        "{said}\nPROBE lockdown on (one central) took {:?}",
+        started.elapsed()
+    );
+    lockdown_shape(tag, true).unwrap();
+    let remotes = run(
+        "ovs-appctl",
+        &["-t", "/run/opl/ovn/sb.ctl", "ovsdb-server/list-remotes"],
+    );
+    eprintln!("PROBE SB list-remotes under lockdown:\n{remotes}");
+    let nft = run("nft", &["list", "table", "inet", &format!("opl_ovn_{tag}")]);
+    eprintln!("nft table:\n{nft}");
+
+    // RBAC: 남의 chassis(이름이 UUID가 아니라 에이전트 청소가 두는 것)를 로컬 소켓으로 만든다.
+    let sbctl = |args: &[&str]| {
+        let mut all = vec!["--db=unix:/run/opl/ovn/sb.sock"];
+        all.extend_from_slice(args);
+        run("ovn-sbctl", &all)
+    };
+    sbctl(&["chassis-add", "opl-fake-chassis", "geneve", "127.0.0.9"]);
+    let (ok, said) = sb_as_node(
+        6642,
+        &[
+            "set",
+            "Chassis",
+            "opl-fake-chassis",
+            "external_ids:opl-test=x",
+        ],
+    );
+    eprintln!("PROBE RBAC another chassis via 6642: ok={ok} {said}");
+    assert!(!ok, "a chassis certificate changed another chassis: {said}");
+    let (ok, said) = sb_as_node(
+        6642,
+        &[
+            "chassis-add",
+            "8d6b5c4a-0000-4000-8000-000000000001",
+            "geneve",
+            "127.0.0.7",
+        ],
+    );
+    assert!(!ok, "a chassis certificate added another chassis: {said}");
+    let (ok, said) = sb_as_node(6642, &["set", "SB_Global", ".", "external_ids:opl-test=x"]);
+    eprintln!("PROBE RBAC SB_Global via 6642: ok={ok} {said}");
+    assert!(!ok, "a chassis certificate wrote SB_Global: {said}");
+    let (ok, said) = sb_as_node(6642, &["set", "Chassis", node, "external_ids:opl-test=1"]);
+    assert!(ok, "its own chassis row: {said}");
+    let (ok, said) = sb_as_node(
+        6642,
+        &["remove", "Chassis", node, "external_ids", "opl-test"],
+    );
+    assert!(ok, "{said}");
+    // 특권 포트(northd 몫)는 역할이 없다.
+    let (ok, said) = sb_as_node(
+        6645,
+        &[
+            "set",
+            "Chassis",
+            "opl-fake-chassis",
+            "external_ids:opl-test=x",
+        ],
+    );
+    assert!(ok, "the privileged port refused a write: {said}");
+    sbctl(&["chassis-del", "opl-fake-chassis"]);
+    // ovn-controller가 역할 포트로 자기 `Chassis_Private.nb_cfg`를 쓰고 northd가 6645로 일한다.
+    run(
+        "ovn-nbctl",
+        &[
+            "--db=unix:/run/opl/ovn/nb.sock",
+            "--timeout=60",
+            "--wait=hv",
+            "sync",
+        ],
+    );
+    assert_eq!(
+        run("ovn-appctl", &["-t", "/run/opl/ovn/northd.ctl", "status"]).trim(),
+        "Status: active"
+    );
+
+    // 허용 목록: 루프백 127.0.0.1(노드 주소)은 붙고 그 밖의 출발 주소는 시간 초과
+    for port in [6641, 6642, 6645] {
+        assert!(tcp_connects("127.0.0.1", port), "{port}");
+        assert!(!tcp_connects("127.0.0.3", port), "127.0.0.3 reached {port}");
+    }
+
+    // 끄기: 계획 66 글, 다시 붙는다.
+    let started = Instant::now();
+    d.ctl(&["sdn", "lockdown", "off"]).await.unwrap();
+    eprintln!(
+        "PROBE lockdown off (one central) took {:?}",
+        started.elapsed()
+    );
+    lockdown_shape(tag, false).unwrap();
+    assert!(tcp_connects("127.0.0.3", 6641));
+    run(
+        "ovn-nbctl",
+        &[
+            "--db=unix:/run/opl/ovn/nb.sock",
+            "--timeout=60",
+            "--wait=hv",
+            "sync",
+        ],
+    );
 }
 
 /// 로컬 OVS DB `Open_vSwitch`의 `external_ids` 칸 하나(없으면 빈 글)

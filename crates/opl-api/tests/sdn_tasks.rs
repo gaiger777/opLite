@@ -1147,3 +1147,248 @@ async fn a_live_central_kicks_a_dead_one_out() {
     let done = s.run(task).await;
     assert!(error(&done).contains("last OVN central"), "{done}");
 }
+
+/// 잠금을 켠 `Sdn` 리소스
+async fn create_locked(s: &Sdn, status: SdnStatus) -> Uuid {
+    let mut sdn: opl_types::sdn::Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+    sdn.status = status;
+    s.env.cluster.create(&sdn).await.unwrap();
+    sdn.id
+}
+
+/// 계획 67 §10.4: 잠금을 켠 SDN의 첫 세우기는 SB를 처음부터 설정 파일로 띄우고(northd는 6645) 그 중앙을 `applied`에
+/// 적는다. 중앙 더하기도 잠금을 따르고, 빼기는 `applied`에서도 뺀다.
+#[tokio::test]
+async fn locked_centrals_start_with_the_sb_config_file() {
+    let s = Sdn::start().await;
+    let h = &s.host;
+    h.installed();
+    h.new_cluster();
+    let task = s.task(TaskOp::SdnInit { address: None }, Uuid::nil());
+    let id = create_locked(
+        &s,
+        SdnStatus {
+            init_node: Some(s.env.node),
+            pending: Some(SdnPending {
+                op: task.spec.op.clone(),
+                node: s.env.node,
+                task: task.id,
+            }),
+            ..SdnStatus::default()
+        },
+    )
+    .await;
+    let task = Task {
+        spec: TaskSpec {
+            target: id,
+            ..task.spec
+        },
+        ..task
+    };
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    let status = s.sdn();
+    assert_eq!(status.lockdown.unwrap().applied, [s.env.node]);
+    let sb = std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+    assert!(sb.contains("--config-file="), "{sb}");
+    assert!(h.root.join("etc/opl/ovn/sb.json").exists());
+    let northd =
+        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    assert!(
+        northd.contains("--ovnsb-db=ssl:127.0.0.1:6645 "),
+        "{northd}"
+    );
+
+    // 중앙 더하기: 잠긴 다른 중앙(10.0.0.9)은 6645, 새 중앙도 잠근 채 뜬다.
+    let s = Sdn::start().await;
+    let h = &s.host;
+    h.installed();
+    h.status(
+        FOLLOWER,
+        &SB_LEADER.replace("Role: leader", "Role: follower"),
+    );
+    let mut ready = s.ready();
+    ready.lockdown = Some(opl_types::sdn::LockdownState {
+        applied: vec![Uuid::nil()],
+        ..Default::default()
+    });
+    let id = create_locked(&s, ready).await;
+    let task = s.task(TaskOp::SdnCentralAdd, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    let northd =
+        std::fs::read_to_string(h.root.join("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    assert!(
+        northd.contains("--ovnsb-db=ssl:10.0.0.9:6645,ssl:127.0.0.1:6645 "),
+        "{northd}"
+    );
+    let mut applied = s.sdn().lockdown.unwrap().applied;
+    applied.sort();
+    let mut want = vec![Uuid::nil(), s.env.node];
+    want.sort();
+    assert_eq!(applied, want);
+
+    // 중앙 빼기는 잠긴 중앙에서도 뺀다.
+    std::fs::write(h.root.join("var/lib/opl/ovn/nb.db"), "nb").unwrap();
+    std::fs::write(h.root.join("var/lib/opl/ovn/sb.db"), "sb").unwrap();
+    let left = CmdOutput {
+        status: 2,
+        stdout: b"unknown cluster\n".to_vec(),
+        stderr: Vec::new(),
+    };
+    for db in ["nb", "sb"] {
+        h.fake().reply_seq(
+            &format!(
+                "ovs-appctl --timeout 5 -t {} cluster/status",
+                h.p(&format!("run/opl/ovn/{db}.ctl"))
+            ),
+            vec![CmdOutput::ok(FOLLOWER), left.clone()],
+        );
+    }
+    let task = s.task(TaskOp::SdnCentralRemove, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    assert_eq!(s.sdn().lockdown.unwrap().applied, [Uuid::nil()]);
+}
+
+/// 이 노드가 알린 SDN 상태를 쓴다(에이전트 대신).
+async fn report_node_sdn(s: &Sdn, sdn: Option<opl_types::sdn::NodeSdn>) {
+    let me = s.env.cluster.get::<NodeSpec>(s.env.node).unwrap().unwrap();
+    let mut status = me.status;
+    status.sdn = sdn;
+    s.env
+        .cluster
+        .update_status::<NodeSpec>(me.id, &status)
+        .await
+        .unwrap();
+}
+
+/// `sdn-lockdown`(계획 67 §10.4): OVN을 부르지 않고 `SdnSpec.lockdown`을 쓴 뒤, 에이전트가 중앙을 잠가 `applied`에 적고
+/// chassis가 허용 목록을 맞출 때까지 단계(`writing-spec` → `switching-centrals` → `applying-firewall`)로 기다린다.
+/// 끝나면 `pending`을 놓는다. 그새 다른 요청이 반대로 바꾸면 실패한다.
+#[tokio::test]
+async fn the_lockdown_task_waits_for_the_agents() {
+    let s = Sdn::start().await;
+    let mut ready = s.ready();
+    ready.centrals = vec![SdnCentral {
+        node: s.env.node,
+        address: ip("127.0.0.1"),
+    }];
+    let id = s.create(ready).await;
+    report_node_sdn(
+        &s,
+        Some(opl_types::sdn::NodeSdn {
+            chassis: opl_types::sdn::ChassisState::Ready,
+            ..Default::default()
+        }),
+    )
+    .await;
+    // 에이전트 흉내: 잠금을 원하면 중앙을 잠그고, 다음에 허용 목록을 넣는다.
+    let cluster = s.env.cluster.clone();
+    let node = s.env.node;
+    let agent = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Some(sdn) = cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap() else {
+                continue;
+            };
+            let applied = sdn
+                .status
+                .lockdown
+                .as_ref()
+                .is_some_and(|l| l.applied.contains(&node));
+            if sdn.spec.lockdown && !applied {
+                let mut status = sdn.status.clone();
+                status
+                    .lockdown
+                    .get_or_insert_with(Default::default)
+                    .applied
+                    .push(node);
+                let _ = cluster
+                    .update_status_checked::<SdnSpec>(sdn.id, sdn.revision, &status)
+                    .await;
+                continue;
+            }
+            if sdn.spec.lockdown && applied {
+                let me = cluster.get::<NodeSpec>(node).unwrap().unwrap();
+                let mut st = me.status;
+                let s = st.sdn.get_or_insert_with(Default::default);
+                if s.lockdown.as_ref().is_some_and(|l| l.firewall) {
+                    continue;
+                }
+                s.lockdown = Some(opl_types::sdn::LockdownNodeState {
+                    firewall: true,
+                    allowed: 1,
+                    error: None,
+                });
+                let _ = cluster.update_status::<NodeSpec>(node, &st).await;
+            }
+        }
+    });
+    let task = s.task(TaskOp::SdnLockdown { enabled: true }, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    assert_eq!(state(&done), "succeeded", "{done}");
+    let sdn = s
+        .env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert!(sdn.spec.lockdown);
+    let lockdown = sdn.status.lockdown.unwrap();
+    assert_eq!(lockdown.applied, [s.env.node]);
+    assert!(
+        !lockdown.pending && lockdown.error.is_none(),
+        "{lockdown:?}"
+    );
+    assert_eq!(sdn.status.pending, None);
+    // OVN 명령을 하나도 부르지 않았다.
+    assert!(
+        s.host.fake().calls().is_empty(),
+        "{:?}",
+        s.host.fake().calls()
+    );
+    agent.abort();
+
+    // 다른 요청이 그새 끄면 실패하고 그 까닭을 남긴다.
+    let task = s.task(TaskOp::SdnLockdown { enabled: true }, id);
+    s.hold(&task).await;
+    let sdn = s
+        .env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    let mut status = sdn.status.clone();
+    status.lockdown.as_mut().unwrap().applied.clear();
+    s.env
+        .cluster
+        .update_status::<SdnSpec>(sdn.id, &status)
+        .await
+        .unwrap();
+    let cluster = s.env.cluster.clone();
+    let flip = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let sdn = cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        cluster
+            .update_spec(sdn.id, None, sdn.labels, &SdnSpec { lockdown: false })
+            .await
+            .unwrap();
+    });
+    let done = s.run(task).await;
+    flip.await.unwrap();
+    assert_eq!(state(&done), "failed", "{done}");
+    assert!(error(&done).contains("another request changed"), "{done}");
+    let lockdown = s.sdn().lockdown.unwrap();
+    assert!(!lockdown.pending, "{lockdown:?}");
+    assert!(
+        lockdown
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("another request")),
+        "{lockdown:?}"
+    );
+}

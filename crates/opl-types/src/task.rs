@@ -283,6 +283,12 @@ pub enum TaskOp {
     },
     /// 대상 노드에 OVS·ovn-controller를 설치하고 chassis로 구성한다. 대상은 그 노드다(노드마다 함께 돈다).
     SdnChassisInstall,
+    /// OVN 접근 잠금(계획 67 §10.4)을 켜거나 끈다: `SdnSpec.lockdown`을 `enabled`로 쓰고, 중앙마다의 SDN 에이전트가
+    /// 하나씩(정족수를 지키며) SB 설정을 바꾸고 모든 노드가 주소 허용 목록을 맞출 때까지 기다린다. 대상은 `Sdn`
+    /// 리소스이고, 실행 노드는 요청을 받은 노드다(OVN을 부르지 않는다).
+    SdnLockdown {
+        enabled: bool,
+    },
 }
 
 impl TaskOp {
@@ -308,6 +314,7 @@ impl TaskOp {
                 | TaskOp::SdnCentralRemove
                 | TaskOp::SdnCentralKick { .. }
                 | TaskOp::SdnChassisInstall
+                | TaskOp::SdnLockdown { .. }
         )
     }
 
@@ -906,6 +913,10 @@ mod tests {
                     "node": "00000000-0000-0000-0000-000000000000",
                     "address": "10.0.0.9"
                 }),
+            ),
+            (
+                TaskOp::SdnLockdown { enabled: true },
+                serde_json::json!({ "kind": "sdn-lockdown", "enabled": true }),
             ),
         ] {
             assert_eq!(serde_json::to_value(&op).unwrap(), json);

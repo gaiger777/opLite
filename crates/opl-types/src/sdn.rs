@@ -27,6 +27,8 @@ pub const SB_PORT: u16 = 6642;
 pub const NB_RAFT_PORT: u16 = 6643;
 /// SB ovsdb 클러스터의 Raft 포트
 pub const SB_RAFT_PORT: u16 = 6644;
+/// OVN 접근 잠금(계획 67 §10.2)의 SB 특권 포트: northd만 쓴다(잠금이 켜진 중앙에서만 듣는다). 역할 없는 6642 대신이다.
+pub const SB_ADMIN_PORT: u16 = 6645;
 /// Geneve UDP 포트(IANA)
 pub const GENEVE_PORT: u16 = 6081;
 /// SDN 네트워크의 기본 MTU: underlay 1500에서 OVN Geneve 머리(`max_header_size` 38 + 바깥 IPv4 20)를 뺀 값
@@ -116,7 +118,8 @@ pub struct AllowSets {
 }
 
 /// 노드 목록과 SDN 리소스에서 잠금의 허용 집합을 셈한다. 지운 노드는 목록에 없으므로 빠진다. macOS 노드(`qemu-hvf`)는
-/// chassis가 될 수 없어 멤버가 아니다.
+/// chassis가 될 수 없어 멤버가 아니다. 중앙 더하기 Task가 도는 노드(`pending`의 `sdn-central-add`)는 Raft에 합류하기
+/// 전에 중앙 집합에 든다(§10.4 — 합류가 다른 중앙의 6643·6644에 닿게).
 pub fn allow_sets(nodes: &[Node], sdn: &Sdn) -> AllowSets {
     let mut sets = AllowSets::default();
     for n in nodes {
@@ -134,6 +137,13 @@ pub fn allow_sets(nodes: &[Node], sdn: &Sdn) -> AllowSets {
         if let Some(n) = nodes.iter().find(|n| n.id == c.node) {
             sets.centrals.extend(n.status.underlay);
         }
+    }
+    if let Some(p) = &sdn.status.pending
+        && p.op == crate::task::TaskOp::SdnCentralAdd
+        && let Some(n) = nodes.iter().find(|n| n.id == p.node)
+    {
+        sets.centrals.extend(central_address(n));
+        sets.centrals.extend(n.status.underlay);
     }
     for set in [&mut sets.members, &mut sets.centrals, &mut sets.encaps] {
         for ip in set.iter_mut() {
@@ -449,6 +459,11 @@ pub struct NodeSdn {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub lockdown: Option<LockdownNodeState>,
+    /// 중앙이면 NB(6641)·SB(6642)에 지금 붙어 있는 상대 주소(`ss`, 이름 순 — 계획 67 §10.4 잠금 미리 확인). 비면 쓰지
+    /// 않는다.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<String>, default))]
+    pub peers: Vec<IpAddr>,
 }
 
 /// 노드의 OVN 주소 허용 목록 상태(`NodeSdn.lockdown`)
@@ -532,6 +547,15 @@ pub struct SdnInitRequest {
         schema(value_type = String, format = "ip", nullable = false, default)
     )]
     pub address: Option<IpAddr>,
+}
+
+/// `POST /sdn/lockdown`(계획 67 §10.4)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct SdnLockdownRequest {
+    /// 켜기(참)·끄기(거짓)
+    pub enabled: bool,
 }
 
 /// `POST /sdn/centrals`
@@ -793,6 +817,7 @@ mod tests {
             physnets: Vec::new(),
             gateway: false,
             lockdown: None,
+            peers: Vec::new(),
             chassis: ChassisState::Ready,
             ovn_version: Some("24.03.4".into()),
             ovs_version: Some("3.3.0".into()),
@@ -1218,6 +1243,14 @@ mod tests {
         };
         let json = serde_json::to_value(&ns).unwrap();
         assert_eq!(json["lockdown"], json!({ "firewall": true, "allowed": 5 }));
+        assert!(json.get("peers").is_none(), "{json}");
+        assert_eq!(serde_json::from_value::<NodeSdn>(json).unwrap(), ns);
+        let ns = NodeSdn {
+            peers: vec![ip("10.0.0.2"), ip("fd00::2")],
+            ..ns
+        };
+        let json = serde_json::to_value(&ns).unwrap();
+        assert_eq!(json["peers"], json!(["10.0.0.2", "fd00::2"]));
         assert_eq!(serde_json::from_value::<NodeSdn>(json).unwrap(), ns);
     }
 
@@ -1326,5 +1359,19 @@ mod tests {
         let sets = allow_sets(&nodes[1..], &sdn);
         assert!(!sets.members.contains(&ip("10.0.0.1")));
         assert_eq!(sets.centrals, ips(&["10.0.0.1", "10.0.0.2"]));
+        // 중앙 더하기가 도는 노드는 합류 전에 중앙 집합에 든다(다른 Task면 아니다).
+        sdn.status.pending = Some(SdnPending {
+            op: crate::task::TaskOp::SdnCentralAdd,
+            node: Uuid::from_u128(3),
+            task: Uuid::nil(),
+        });
+        let sets = allow_sets(&nodes, &sdn);
+        assert_eq!(
+            sets.centrals,
+            ips(&["10.0.0.1", "10.0.0.2", "192.168.0.1", "192.168.0.3"])
+        );
+        sdn.status.pending.as_mut().unwrap().op = crate::task::TaskOp::SdnCentralRemove;
+        let sets = allow_sets(&nodes, &sdn);
+        assert_eq!(sets.centrals, ips(&["10.0.0.1", "10.0.0.2", "192.168.0.1"]));
     }
 }

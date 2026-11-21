@@ -3,9 +3,14 @@
 //! 필요한 것을 읽어 단계를 차례로 부르고, NB·SB가 실제로 선 것(리더·멤버)을 확인한 뒤에만 `Sdn` 리소스의 상태에 그 노드를
 //! 더한다. 중앙 Task는 `SdnStatus.pending`(API가 리비전 확인 쓰기로 잡음)을 가진 것만 돈다 — 클러스터 전체에서 한 번에
 //! 하나다. 단계마다 진행률 stage를 단계 이름으로 쓴다(바이트 0/0). 실패한 Task는 같은 요청을 다시 하면 이어서 한다.
+//!
+//! OVN 접근 잠금(`sdn-lockdown`, 계획 67 §10.4)은 같은 자리를 잡지만 노드에서 OVN을 부르지 않는다: `SdnSpec.lockdown`을
+//! 쓰고, 중앙마다의 SDN 에이전트가 하나씩(정족수를 지키며) SB를 바꿔 `SdnStatus.lockdown.applied`에 적고 모든 노드가
+//! 허용 목록을 맞출 때까지 기다린다. 에이전트가 Raft 상태만 보고 이어서 하므로 Task가 죽어도(다시 해도) 잠금은 끝까지
+//! 간다. 중앙 세우기·더하기는 `SdnSpec.lockdown`을 따라 처음부터 잠근 단위로 뜨고 `applied`에 든다.
 
 use std::net::IpAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
@@ -13,7 +18,8 @@ use opl_driver::MirrorProgress;
 use opl_driver::ovn::{Chassis, Db, KnownCids, OvnHost, OvnVersions, major_minor};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::sdn::{
-    MAX_CENTRALS, SDN_NAME, Sdn, SdnCentral, SdnPhase, SdnSpec, SdnStatus, central_address,
+    ChassisState, MAX_CENTRALS, SDN_NAME, Sdn, SdnCentral, SdnPhase, SdnSpec, SdnStatus,
+    central_address,
 };
 use opl_types::task::{Task, TaskOp};
 use uuid::Uuid;
@@ -32,6 +38,9 @@ pub(super) fn queue(ctx: &Ctx, task: &Task) -> Uuid {
 
 /// SDN Task를 돌린다. 성공해도 알릴 것(`br-int`의 남의 포트, 짝수 중앙)은 경고로 남긴다.
 pub(super) async fn perform(ctx: &Ctx, task: &Task) -> Result<Option<String>, String> {
+    if let TaskOp::SdnLockdown { enabled } = task.spec.op {
+        return lockdown(ctx, task.id, enabled, LockdownLimits::default()).await;
+    }
     let host = ctx
         .config
         .sdn
@@ -76,6 +85,14 @@ pub(super) async fn finished(ctx: &Ctx, task: &Task, error: Option<&str>) {
             s.pending = None;
             changed = true;
         }
+        if matches!(task.spec.op, TaskOp::SdnLockdown { .. })
+            && let Some(state) = s.lockdown.as_mut()
+            && (state.pending || state.error.as_deref() != error)
+        {
+            state.pending = false;
+            state.error = error.map(str::to_string);
+            changed = true;
+        }
         if matches!(task.spec.op, TaskOp::SdnInit { .. })
             && s.init_node == Some(task.spec.node)
             && let Some(error) = error
@@ -94,7 +111,7 @@ pub(super) async fn finished(ctx: &Ctx, task: &Task, error: Option<&str>) {
 
 /// `Sdn` 리소스의 상태를 `change`로 바꾼다(읽은 revision 확인 — 다른 쓰기와 부딪치면 다시 읽어 바꾼다). `change`가
 /// 거짓이면 쓰지 않는다. 리소스가 없으면 아무것도 하지 않는다.
-pub(crate) async fn update_sdn(
+pub async fn update_sdn(
     cluster: &Cluster,
     mut change: impl FnMut(&mut SdnStatus) -> bool,
 ) -> Result<(), String> {
@@ -125,6 +142,202 @@ fn known_cids(s: &SdnStatus) -> KnownCids {
     KnownCids {
         nb: s.nb_cid,
         sb: s.sb_cid,
+    }
+}
+
+/// 잠긴 중앙(`SdnStatus.lockdown.applied`)의 주소
+fn locked_addresses(s: &SdnStatus) -> Vec<IpAddr> {
+    let applied = s
+        .lockdown
+        .as_ref()
+        .map(|l| l.applied.as_slice())
+        .unwrap_or_default();
+    s.centrals
+        .iter()
+        .filter(|c| applied.contains(&c.node))
+        .map(|c| c.address)
+        .collect()
+}
+
+/// 중앙 `node`를 잠긴 중앙(`applied`)에 더한다(이미 있으면 거짓).
+fn mark_locked(s: &mut SdnStatus, node: Uuid) -> bool {
+    let state = s.lockdown.get_or_insert_with(Default::default);
+    if state.applied.contains(&node) {
+        return false;
+    }
+    state.applied.push(node);
+    true
+}
+
+/// 떠난 중앙 `node`를 잠긴 중앙에서 뺀다(있었으면 참).
+fn unmark_locked(s: &mut SdnStatus, node: Uuid) -> bool {
+    let Some(state) = s.lockdown.as_mut() else {
+        return false;
+    };
+    let before = state.applied.len();
+    state.applied.retain(|n| *n != node);
+    state.applied.len() != before
+}
+
+/// `sdn-lockdown`이 기다리는 시간
+#[derive(Debug, Clone, Copy)]
+struct LockdownLimits {
+    /// 잠긴 중앙이 하나도 늘거나 줄지 않은 채 이만큼 지나면 실패다(중앙 하나가 SB를 다시 띄워 따라잡는 데 몇 초).
+    stall: Duration,
+    /// 모든 노드가 허용 목록을 맞추기까지(넘으면 경고 — 꺼진 노드는 다시 켜질 때 맞춘다)
+    firewall: Duration,
+    /// 다시 보는 간격
+    step: Duration,
+}
+
+impl Default for LockdownLimits {
+    fn default() -> Self {
+        Self {
+            stall: Duration::from_secs(300),
+            firewall: Duration::from_secs(120),
+            step: Duration::from_secs(1),
+        }
+    }
+}
+
+/// `sdn-lockdown`(계획 67 §10.4): `SdnSpec.lockdown`을 `enabled`로 쓰고, 중앙마다의 에이전트가 SB를 바꿔 `applied`가
+/// 원하는 대로 될 때까지(중앙 하나씩 — 에이전트가 정족수를 본다), 그 뒤 chassis·중앙 노드가 허용 목록을 맞출 때까지
+/// 기다린다. 다른 요청이 그새 반대로 바꾸면 실패한다. 진행이 멈추면 기다리는 중앙과 그 노드가 알린 오류로 실패한다.
+async fn lockdown(
+    ctx: &Ctx,
+    task: Uuid,
+    enabled: bool,
+    limits: LockdownLimits,
+) -> Result<Option<String>, String> {
+    let cluster = &ctx.cluster;
+    write_progress(ctx, task, "writing-spec", MirrorProgress::default()).await;
+    loop {
+        let sdn = cluster
+            .get_by_name::<SdnSpec>(SDN_NAME)
+            .map_err(|e| e.to_string())?
+            .ok_or("SDN (OVN) is not set up")?;
+        if sdn.status.phase != SdnPhase::Ready {
+            return Err("SDN (OVN) is not ready yet".into());
+        }
+        if sdn.spec.lockdown == enabled {
+            break;
+        }
+        let mut spec = sdn.spec.clone();
+        spec.lockdown = enabled;
+        match cluster
+            .update_spec(sdn.id, Some(sdn.revision), sdn.labels.clone(), &spec)
+            .await
+        {
+            Ok(_) => break,
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    update_sdn(cluster, |s| {
+        let state = s.lockdown.get_or_insert_with(Default::default);
+        if state.pending && state.error.is_none() {
+            return false;
+        }
+        state.pending = true;
+        state.error = None;
+        true
+    })
+    .await?;
+
+    write_progress(ctx, task, "switching-centrals", MirrorProgress::default()).await;
+    let mut seen: Option<Vec<Uuid>> = None;
+    let mut deadline = tokio::time::Instant::now() + limits.stall;
+    loop {
+        let sdn = cluster
+            .get_by_name::<SdnSpec>(SDN_NAME)
+            .map_err(|e| e.to_string())?
+            .ok_or("SDN (OVN) was removed")?;
+        if sdn.spec.lockdown != enabled {
+            return Err("another request changed the OVN lockdown; this task stops".into());
+        }
+        let applied = sdn
+            .status
+            .lockdown
+            .as_ref()
+            .map(|l| l.applied.clone())
+            .unwrap_or_default();
+        let waiting = sdn
+            .status
+            .centrals
+            .iter()
+            .find(|c| applied.contains(&c.node) != enabled);
+        let Some(waiting) = waiting else {
+            break;
+        };
+        if seen.as_ref() != Some(&applied) {
+            seen = Some(applied);
+            deadline = tokio::time::Instant::now() + limits.stall;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let node = cluster.get::<NodeSpec>(waiting.node).ok().flatten();
+            let name = node
+                .as_ref()
+                .map_or_else(|| waiting.node.to_string(), |n| n.name.clone());
+            let why = node
+                .and_then(|n| n.status.sdn?.error)
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "the OVN central {name:?} did not switch its lockdown in {}s (is it online, with the other                  centrals in quorum?){why}",
+                limits.stall.as_secs()
+            ));
+        }
+        tokio::time::sleep(limits.step).await;
+    }
+
+    write_progress(ctx, task, "applying-firewall", MirrorProgress::default()).await;
+    let deadline = tokio::time::Instant::now() + limits.firewall;
+    loop {
+        let (_, nodes) = cluster.list::<NodeSpec>().map_err(|e| e.to_string())?;
+        let sdn = cluster
+            .get_by_name::<SdnSpec>(SDN_NAME)
+            .map_err(|e| e.to_string())?
+            .ok_or("SDN (OVN) was removed")?;
+        let central = |id: Uuid| sdn.status.centrals.iter().any(|c| c.node == id);
+        let pending: Vec<&Node> = nodes
+            .iter()
+            .filter(|n| !n.spec.witness)
+            .filter(|n| {
+                let Some(s) = &n.status.sdn else {
+                    return false;
+                };
+                if s.chassis == ChassisState::Missing && !central(n.id) {
+                    return false;
+                }
+                let on = s.lockdown.as_ref().is_some_and(|l| l.firewall);
+                on != enabled
+            })
+            .collect();
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let names: Vec<String> = pending
+                .iter()
+                .map(|n| {
+                    let state = if n.status.online { "" } else { " (offline)" };
+                    let error = n
+                        .status
+                        .sdn
+                        .as_ref()
+                        .and_then(|s| s.lockdown.as_ref()?.error.clone())
+                        .map(|e| format!(": {e}"))
+                        .unwrap_or_default();
+                    format!("{}{state}{error}", n.name)
+                })
+                .collect();
+            return Ok(Some(format!(
+                "the OVN address allow-list is not {} on {} yet; the SDN agent there keeps trying",
+                if enabled { "applied" } else { "removed" },
+                names.join(", ")
+            )));
+        }
+        tokio::time::sleep(limits.step).await;
     }
 }
 
@@ -315,12 +528,18 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// `starting`: Orbivisor 단위를 쓰고 켠다.
+    /// `starting`: Orbivisor 단위를 쓰고 켠다. 잠금(`SdnSpec.lockdown`, 계획 67 §10.4)이면 이 노드의 SB도 처음부터
+    /// 잠근 모양으로 뜬다(다른 중앙은 `applied`대로).
     async fn start(&self, address: IpAddr, centrals: &[IpAddr]) -> Result<(), String> {
         self.stage("starting").await;
+        let mut locked = locked_addresses(self.status());
+        locked.retain(|a| *a != address);
+        if self.sdn.spec.lockdown {
+            locked.push(address);
+        }
         let changed = self
             .host
-            .write_units(address, centrals)
+            .write_units(address, centrals, &locked)
             .await
             .map_err(|e| e.to_string())?;
         self.host
@@ -460,11 +679,15 @@ impl Run<'_> {
             tracing::info!(db = db.name(), cid = ?status.cid, "the OVN database is up");
         }
         let me = self.me.id;
+        let lockdown = self.sdn.spec.lockdown;
         self.update_init(|s| {
             let mut changed = false;
             if !s.centrals.iter().any(|c| c.node == me) {
                 s.centrals.push(SdnCentral { node: me, address });
                 changed = true;
+            }
+            if lockdown {
+                changed |= mark_locked(s, me);
             }
             if s.phase != SdnPhase::Ready || s.last_error.is_some() {
                 s.phase = SdnPhase::Ready;
@@ -548,12 +771,17 @@ impl Run<'_> {
                 .map_err(|e| e.to_string())?;
         }
         let me = self.me.id;
+        let lockdown = self.sdn.spec.lockdown;
         update_sdn(&self.ctx.cluster, |s| {
-            if s.centrals.iter().any(|c| c.node == me) {
-                return false;
+            let mut changed = false;
+            if !s.centrals.iter().any(|c| c.node == me) {
+                s.centrals.push(SdnCentral { node: me, address });
+                changed = true;
             }
-            s.centrals.push(SdnCentral { node: me, address });
-            true
+            if lockdown {
+                changed |= mark_locked(s, me);
+            }
+            changed
         })
         .await
     }
@@ -612,7 +840,8 @@ impl Run<'_> {
         update_sdn(&self.ctx.cluster, |s| {
             let before = s.centrals.len();
             s.centrals.retain(|c| c.node != me);
-            s.centrals.len() != before
+            let unlocked = unmark_locked(s, me);
+            s.centrals.len() != before || unlocked
         })
         .await?;
         Ok(None)
@@ -650,7 +879,8 @@ impl Run<'_> {
             let before = (s.centrals.len(), s.departed.len());
             s.centrals.retain(|c| c.node != node);
             s.departed.retain(|d| d.node != node);
-            (s.centrals.len(), s.departed.len()) != before
+            let unlocked = unmark_locked(s, node);
+            (s.centrals.len(), s.departed.len()) != before || unlocked
         })
         .await?;
         if kicked.is_empty() {

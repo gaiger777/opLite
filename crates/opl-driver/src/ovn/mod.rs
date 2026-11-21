@@ -3,6 +3,7 @@
 
 pub mod fake_ovsdb;
 pub mod host;
+pub mod lockdown;
 pub mod ovsdb;
 pub mod physnet;
 pub mod status;
@@ -15,6 +16,7 @@ pub use host::{
     HOST_UNIT, KnownCids, OvnError, OvnHost, OvnOptions, OvnPaths, OvnVersions, TAG_KEY,
     central_units, chassis_ids, quote, stale_ports,
 };
+pub use lockdown::{LockdownRole, parse_ss_peers};
 pub use ovsdb::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB, ServerDb, Transport};
 pub use physnet::{
     CMS_OPTIONS_KEY, GATEWAY_OPTION, MAPPINGS_KEY, PHYSNET_KEY, PhysnetReport, merge_cms_options,
@@ -26,5 +28,5 @@ pub use status::{
 };
 pub use units::{
     Db, NORTHD_UNIT, UNIT_MARK, db_unit, listen_addr, northd_args, northd_unit, ovsdb_server_args,
-    remotes, ssl_addr,
+    remotes, sb_config, sb_locked_args, ssl_addr,
 };

@@ -810,8 +810,10 @@ async fn three_container_nodes_run_ovn() {
     Box::pin(ovn_section(&fleet)).await;
     Box::pin(routing_section(&fleet)).await;
     Box::pin(migration_section(&fleet)).await;
+    Box::pin(lockdown_section(&fleet)).await;
     Box::pin(failover_section(&fleet)).await;
     Box::pin(dead_node_section(&fleet)).await;
+    Box::pin(removed_node_section(&fleet)).await;
 }
 
 /// 1. Orbivisor 클러스터 셋(투표 멤버 셋)
@@ -936,6 +938,246 @@ async fn ovn_section(fleet: &Fleet) {
         .await;
     }
     n_show(fleet.node("c1"), &["ovs-vsctl", "show"]);
+
+    // OVN 접근 잠금(계획 67 §10.4): 새 클러스터는 잠금을 켠 채 서고, 잠금 중 더한 중앙도 잠근 모양으로 합류한다(합류 전에
+    // 다른 중앙의 허용 목록에 든다). 모든 중앙이 6645에 듣고 모든 노드에 허용 목록 표가 있다.
+    for n in &fleet.nodes {
+        wait_for(
+            &format!("the lockdown on {}", n.name),
+            AGENT_WAIT,
+            || async { locked_shape(n) },
+        )
+        .await;
+    }
+    n_show(fleet.node("c1"), &["nft", "list", "ruleset"]);
+}
+
+/// 이 중앙이 잠근 모양인지: SB가 6645에 듣고 허용 목록 표가 있다.
+fn locked_shape(n: &Node) -> bool {
+    let (_, ss, _) = n.try_exec(&["ss", "-ltnH"]);
+    let (_, tables, _) = n.try_exec(&["nft", "list", "tables"]);
+    ss.contains(&format!("{}:6645", n.ip)) && tables.contains("inet opl_ovn_")
+}
+
+/// 잠금이 풀린 모양인지: 6645·허용 목록 표가 없다.
+fn unlocked_shape(n: &Node) -> bool {
+    let (_, ss, _) = n.try_exec(&["ss", "-ltnH"]);
+    let (_, tables, _) = n.try_exec(&["nft", "list", "tables"]);
+    !ss.contains(":6645") && !tables.contains("inet opl_ovn_")
+}
+
+/// 노드 `n` 안 이름공간 `ns`에서 0.2초마다 `to`로 ping을 띄운다(`stop_ping`이 멈추고 (보냄, 받음)을 센다).
+fn start_ping(n: &Node, ns: &str, to: &str) -> Child {
+    Command::new("docker")
+        .args([
+            "exec",
+            &n.container,
+            "ip",
+            "netns",
+            "exec",
+            ns,
+            "ping",
+            "-i",
+            "0.2",
+            "-W",
+            "1",
+            to,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn stop_ping(n: &Node, to: &str, child: Child) -> (u64, u64) {
+    n.try_exec(&["pkill", "-INT", "-f", &format!("ping -i 0.2 -W 1 {to}")]);
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let line = text
+        .lines()
+        .find(|l| l.contains("packets transmitted"))
+        .unwrap_or_else(|| panic!("no ping summary: {text}"));
+    let nums: Vec<u64> = line
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .take(2)
+        .map(|s| s.parse().unwrap())
+        .collect();
+    eprintln!("ping {to}: {line}");
+    (nums[0], nums[1])
+}
+
+/// 이름공간 `ns`의 장치 `dev`의 IPv4 주소
+fn ns_ipv4(n: &Node, ns: &str, dev: &str) -> String {
+    let out = n.exec(&["ip", "-n", ns, "-4", "-br", "addr", "show", dev]);
+    out.split_whitespace()
+        .nth(2)
+        .and_then(|a| a.split('/').next())
+        .unwrap_or_else(|| panic!("no address on {dev}: {out}"))
+        .to_string()
+}
+
+/// 4b. 돌고 있는 중앙 셋의 잠금 끄기·켜기(계획 67 §10.4): 중앙을 하나씩 바꾸는 동안 c1 VM → c3 VM 트래픽(Geneve)이 하나도
+/// 버려지지 않고, 그동안 OvnSync 쓰기(새 네트워크)가 NB에 닿는다. 끄면 6645·표가 없고 켜면 다시 생긴다. 걸린 시간은 PROBE.
+async fn lockdown_section(fleet: &Fleet) {
+    let (c1, c3) = (fleet.node("c1"), fleet.node("c3"));
+    let to = ns_ipv4(c3, "vmb", "oplnsb");
+    assert!(c1.ping("vma", &to));
+    for (state, on) in [("off", false), ("on", true)] {
+        let ping = start_ping(c1, "vma", &to);
+        let started = Instant::now();
+        let name = format!("lk-{state}");
+        let said = c1.ctl_ok(&["sdn", "lockdown", state, "--no-wait"]).await;
+        eprintln!("{said}");
+        let id = said
+            .split_whitespace()
+            .find(|w| w.len() == 36 && w.contains('-'))
+            .unwrap()
+            .to_string();
+        // 바꾸는 동안의 OvnSync 쓰기
+        c1.ctl_ok(&[
+            "network",
+            "create",
+            &name,
+            "--sdn",
+            "--subnet",
+            "10.62.9.0/24",
+        ])
+        .await;
+        let task = loop {
+            let task = c1.ctl_json(&["task", "get", &id]).await;
+            let state = task["status"]["state"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if state == "succeeded" || state == "failed" {
+                break task;
+            }
+            assert!(started.elapsed() < Duration::from_secs(600), "{task}");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let took = started.elapsed();
+        assert_eq!(task["status"]["state"], "succeeded", "{task}");
+        wait_for(&format!("the switch of {name}"), AGENT_WAIT, || async {
+            c1.ovn_bare(
+                "ovn-nbctl",
+                "nb",
+                &["--columns=external_ids", "list", "Logical_Switch"],
+            )
+            .contains(&name)
+        })
+        .await;
+        // 여러 차례의 ping이 더 지나가게 잠깐 둔다.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let (sent, received) = stop_ping(c1, &to, ping);
+        eprintln!(
+            "PROBE lockdown {state} on three centrals took {took:?}; ping c1 -> c3 {received}/{sent}"
+        );
+        assert!(sent >= 10, "{sent}");
+        assert_eq!(
+            sent, received,
+            "VM traffic was lost while switching the lockdown {state}"
+        );
+        for n in &fleet.nodes {
+            let ok = if on {
+                locked_shape(n)
+            } else {
+                unlocked_shape(n)
+            };
+            assert!(ok, "{} after lockdown {state}", n.name);
+        }
+        c1.ctl_ok(&["network", "delete", &name]).await;
+    }
+    for db in ["nb", "sb"] {
+        for n in &fleet.nodes {
+            assert!(n.cluster_status(db).is_member(), "{} {db}", n.name);
+        }
+    }
+}
+
+/// 노드 `from` 안에서 그 노드 인증서로 `to`의 `port`에 `ovsdb-client list-dbs`(성공 여부)
+fn ovsdb_from(from: &Node, to: &str, port: u16) -> bool {
+    ovsdb_within(from, to, port, 3)
+}
+
+/// [`ovsdb_from`]의 시간 한도를 `secs`초로
+fn ovsdb_within(from: &Node, to: &str, port: u16, secs: u32) -> bool {
+    let timeout = format!("--timeout={secs}");
+    let (ok, out, err) = from.try_exec(&[
+        "ovsdb-client",
+        &timeout,
+        "--private-key=/etc/opl/ovn/node.key",
+        "--certificate=/etc/opl/ovn/node.crt",
+        "--ca-cert=/etc/opl/ovn/ca.crt",
+        "list-dbs",
+        &format!("ssl:{to}:{port}"),
+    ]);
+    if !ok {
+        eprintln!("{} -> {to}:{port}: {}", from.name, err.trim());
+    }
+    ok && out.contains("OVN_")
+}
+
+/// 7. 클러스터에서 지운 노드 끊기(계획 67 §10.3): 죽인 c2(이미 중앙에서 내쫓음)를 orbivisord 없이 다시 띄우면 노드
+///    인증서로 c1·c3의 NB·SB에 붙고(아직 멤버) 6643~6645는 막힌다(중앙이 아님). `cluster remove-node c2` 뒤 몇 초 안에
+///    c2의 인증서로는 c1·c3의 6641·6642에 붙지 못하고, 중앙 에이전트가 SB에서 c2의 chassis를 지운다. c1·c3는 그대로다.
+async fn removed_node_section(fleet: &Fleet) {
+    let (c1, c2, c3) = (fleet.node("c1"), fleet.node("c2"), fleet.node("c3"));
+    run("docker", &["start", &c2.container]);
+    wait_for("systemd in c2 again", AGENT_WAIT, || async {
+        let (_, out, _) = c2.try_exec(&["systemctl", "is-system-running"]);
+        matches!(out.trim(), "running" | "degraded")
+    })
+    .await;
+    wait_for(
+        "c2's certificate to reach the NB and SB",
+        AGENT_WAIT,
+        || async {
+            [c1, c3]
+                .iter()
+                .all(|n| ovsdb_from(c2, n.ip, 6641) && ovsdb_from(c2, n.ip, 6642))
+        },
+    )
+    .await;
+    for port in [6643, 6644, 6645] {
+        assert!(!ovsdb_from(c2, c1.ip, port), "c2 reached c1:{port}");
+    }
+    let started = Instant::now();
+    c1.ctl_ok(&["cluster", "remove-node", "c2", "--force"])
+        .await;
+    // 끊긴 때는 한 곳(c1 NB)을 1초 한도로 거듭 붙어 보며 잰다(붙으면 곧바로 성공, 막히면 1초 시간 초과).
+    let mut cut = None;
+    while started.elapsed() < Duration::from_secs(30) {
+        if !ovsdb_within(c2, c1.ip, 6641, 1) {
+            cut = Some(started.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let cut = cut.expect("the removed node still reaches the OVN databases");
+    eprintln!("PROBE removed node c2 cut off from NB/SB {cut:?} after the removal");
+    assert!(cut <= Duration::from_secs(5), "{cut:?}");
+    for n in [c1, c3] {
+        for port in [6641, 6642] {
+            assert!(
+                !ovsdb_from(c2, n.ip, port),
+                "c2 still reaches {}:{port}",
+                n.name
+            );
+        }
+    }
+    wait_for("c2's chassis to leave the SB", AGENT_WAIT, || async {
+        let names = c1.ovn_bare("ovn-sbctl", "sb", &["--columns=name", "list", "Chassis"]);
+        !names.is_empty() && !names.contains(&c2.id)
+    })
+    .await;
+    // 남은 둘은 그대로다.
+    let to = ns_ipv4(c3, "vmb", "oplnsb");
+    wait_for("c1 -> c3 after the removal", AGENT_WAIT, || async {
+        c1.ping("vma", &to)
+    })
+    .await;
+    assert!(ovsdb_from(c3, c1.ip, 6641) && ovsdb_from(c1, c3.ip, 6642));
 }
 
 /// 진단용 출력(컨테이너 안)

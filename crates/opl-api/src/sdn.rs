@@ -19,8 +19,9 @@ use opl_types::network::{Network, NetworkSpec, NetworkStatus, Subnet};
 use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::{Kind, Resource};
 use opl_types::sdn::{
-    MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest, SdnNodeRequest,
-    SdnPending, SdnPhase, SdnSpec, SdnStatus, SdnView, central_address,
+    MAX_CENTRALS, SDN_NAME, Sdn, SdnChassisRequest, SdnDeparted, SdnInitRequest,
+    SdnLockdownRequest, SdnNodeRequest, SdnPending, SdnPhase, SdnSpec, SdnStatus, SdnView,
+    central_address,
 };
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::VmSpec;
@@ -383,11 +384,14 @@ fn unfinished(cluster: &Cluster) -> Result<Vec<Task>, ApiError> {
         .collect())
 }
 
-/// 중앙 Task(첫 세우기·중앙 더하기·빼기)인지
+/// 중앙 Task(첫 세우기·중앙 더하기·빼기·잠금 바꾸기)인지
 fn is_central_op(op: &TaskOp) -> bool {
     matches!(
         op,
-        TaskOp::SdnInit { .. } | TaskOp::SdnCentralAdd | TaskOp::SdnCentralRemove
+        TaskOp::SdnInit { .. }
+            | TaskOp::SdnCentralAdd
+            | TaskOp::SdnCentralRemove
+            | TaskOp::SdnLockdown { .. }
     )
 }
 
@@ -465,7 +469,11 @@ async fn create_exclusive(
         let found = find_sdn(&state.cluster)?;
         check(found.as_ref())?;
         let Some(sdn) = found else {
-            let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
+            // 새 클러스터는 OVN 접근 잠금을 켠 채 세운다(계획 67 §10.4 — 첫 중앙부터 `sb.json`). 옛 노드가 있으면 그
+            // 칸을 풀지 못하므로 끈 채로 둔다(관리자가 업그레이드 뒤 `sdn lockdown on`).
+            let lockdown = matches!(op, TaskOp::SdnInit { .. })
+                && crate::cluster::missing_feature(&state.cluster, SDN_SERVICES)?.is_empty();
+            let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown });
             change(&mut sdn.status);
             sdn.status.pending = Some(pending.clone());
             match state.cluster.create(&sdn).await {
@@ -896,6 +904,42 @@ fn live_central(cluster: &Cluster, sdn: &Sdn, except: Uuid) -> Result<Option<Nod
         }
     }
     Ok(None)
+}
+
+/// OVN 접근 잠금(계획 67 §10)을 켜거나 끄는 `sdn-lockdown` Task(202): `SdnSpec.lockdown`을 쓰고, 중앙마다의 SDN 에이전트가
+/// 하나씩(다른 중앙의 NB·SB가 정족수를 가졌을 때) SB를 역할 포트(6642 `ovn-controller`)·northd 전용 포트(6645)로 다시
+/// 띄운 뒤, 모든 중앙이 잠기면 chassis·중앙이 nftables 주소 허용 목록을 맞출 때까지 기다린다(끄기는 거꾸로). 같은 값을
+/// 다시 보내면 남은 일을 마저 기다린다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 준비되지 않았으면 409
+/// `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
+#[utoipa::path(post, path = "/sdn/lockdown", tag = "sdn",
+    request_body = SdnLockdownRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn set_lockdown(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Json(req): Json<SdnLockdownRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    state.authorize(&principal, Action::Write, Kind::Sdn)?;
+    require_feature(&state.cluster, SDN_SERVICES)?;
+    require_ready(&state.cluster)?;
+    let check = |sdn: Option<&Sdn>| -> Result<(), ApiError> {
+        match sdn {
+            Some(sdn) if sdn.status.phase == SdnPhase::Ready => {
+                check_busy(&state.cluster, sdn, None)
+            }
+            _ => Err(not_ready("SDN (OVN) is not set up")),
+        }
+    };
+    audit.detail(format!(
+        "sdn lockdown {}",
+        if req.enabled { "on" } else { "off" }
+    ));
+    let op = TaskOp::SdnLockdown {
+        enabled: req.enabled,
+    };
+    let task = create_exclusive(&state, op, state.node, check, |_| {}).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
 /// 노드들(`nodes`, 또는 `all`이면 아직 준비된 chassis가 아닌 모든 온라인 Linux 노드)에 OVN chassis 꾸러미를 깔고 구성하는

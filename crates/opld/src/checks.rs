@@ -639,6 +639,11 @@ impl State {
                     s.physnets.clear();
                     s.gateway = false;
                 }
+                // 잠금 상태·중앙의 상대 주소는 모든 노드가 `sdn-services`를 알 때만(계획 67 §13).
+                if !sdn::services_ready(&self.cluster, &self.name) {
+                    s.lockdown = None;
+                    s.peers.clear();
+                }
                 s
             });
         // 모든 노드가 `sdn-services`를 알 때만 쓴다(계획 67 §13).
@@ -1539,7 +1544,30 @@ mod tests {
             .await
             .unwrap();
         run_once(&mut state).await;
+        assert_eq!(s.node().status.sdn, Some(value.clone()));
+
+        // 잠금 상태·중앙의 상대 주소(계획 67)는 모든 노드가 `sdn-services`를 알 때만 쓴다.
+        let locked = NodeSdn {
+            lockdown: Some(opl_types::sdn::LockdownNodeState {
+                firewall: true,
+                allowed: 2,
+                error: None,
+            }),
+            peers: vec!["10.0.0.2".parse().unwrap()],
+            ..value.clone()
+        };
+        report.set(Some(locked.clone()));
+        run_once(&mut state).await;
         assert_eq!(s.node().status.sdn, Some(value));
+        n2.status
+            .features
+            .push(opl_types::node::SDN_SERVICES.into());
+        s.cluster
+            .update_status::<NodeSpec>(n2.id, &n2.status)
+            .await
+            .unwrap();
+        run_once(&mut state).await;
+        assert_eq!(s.node().status.sdn, Some(locked));
     }
 
     /// tc 속도 제한 능력(계획 67 §8.2): 옛 노드(기능 `sdn-services`를 모름)가 있으면 쓰지 않고, 모두 알면 쓴다. 옛 리더가

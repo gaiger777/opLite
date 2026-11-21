@@ -8,10 +8,18 @@
 //!   (`ovn-cms-options`)를 `NodeSpec.sdn`에 맞춘다(계획 66 §7 — 관리자 Linux 브리지에 veth만 매단다).
 //! - 이 노드가 중앙이면 Orbivisor 단위를 맞추고(northd의 중앙 목록) 멈췄으면 켜며, 꾸러미를 올려 스키마가 새로워졌으면
 //!   리더에서 변환한다. 이 노드에서 중앙 Task가 도는 동안(`SdnStatus.pending`)은 단위를 건드리지 않는다.
+//! - OVN 접근 잠금(계획 67 §10): 중앙은 자기 차례(`SdnSpec.lockdown`과 다른 첫 중앙이고 다른 중앙의 NB·SB가 살아 있음)에
+//!   SB 설정 파일·단위를 바꾸고 SB를 다시 띄워 따라잡은 뒤 `SdnStatus.lockdown.applied`에 적는다(한 번에 중앙 하나 —
+//!   정족수 유지). 모든 중앙이 잠기면 chassis·중앙이 nftables 주소 허용 목록(`inet opl_ovn_<태그>`)을 맞춘다. 노드가
+//!   빠지거나 들면 1초 모으기를 기다리지 않고 곧바로 집합을 바꾼다.
+//! - 이 노드가 중앙이고 자기 SB가 Raft 리더면 클러스터에 없는 노드의 SB `Chassis`·`Chassis_Private`를 로컬 소켓으로
+//!   지운다(계획 67 §10.2 — 리더 OvnSync에서 옮겨 옴, 모든 노드가 `sdn-services`를 알 때만). NB·SB에 붙은 상대 주소를
+//!   읽어 알린다(잠금 미리 확인).
 //! - 읽은 상태(`NodeSdn`)는 [`SdnReport`]에 두고 검사 루프(`checks.rs`)가 저장된 값과 다를 때만, 모든 노드가 `sdn`을 알릴
 //!   때만 노드 상태에 쓴다(계획 63·64와 같은 까닭).
 //!
-//! 언제: 시작, `Sdn` 리소스나 이 노드의 underlay·`NodeSpec.sdn`이 바뀔 때(1초 모아 한 번), 그리고 `refresh`마다(기본 60초).
+//! 언제: 시작, `Sdn` 리소스나 노드(이 노드의 underlay·`NodeSpec.sdn`, 허용 집합, 중앙의 상태)가 바뀔 때(1초 모아 한 번),
+//! 그리고 `refresh`마다(기본 60초).
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
@@ -21,14 +29,16 @@ use std::time::Duration;
 use opl_cluster::Cluster;
 use opl_cluster::types::NodeId;
 use opl_cluster::watch::{Watch, WatchEvent};
+use opl_driver::ovn::lockdown::{LockdownRole, ruleset};
 use opl_driver::ovn::{Chassis, ChassisProbe, Db, OvnHost};
 use opl_types::network::tap_name;
-use opl_types::node::{NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
+use opl_types::node::{Node, NodeSpec, SDN, SDN_ROUTING, SDN_SERVICES};
 use opl_types::resource::Kind;
 use opl_types::sdn::{
-    ChassisState, NodeSdn, NodeSdnConfig, PhysnetState, SDN_NAME, SdnCentral, SdnPending, SdnPhase,
-    SdnSpec,
+    AllowSets, CentralHealth, ChassisState, LockdownNodeState, NodeSdn, NodeSdnConfig,
+    PhysnetState, RaftRole, SDN_NAME, Sdn, SdnCentral, SdnPending, SdnPhase, SdnSpec, allow_sets,
 };
+use opl_types::task::TaskOp;
 use opl_types::vm::VmSpec;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -108,6 +118,7 @@ impl SdnAgent {
             host: host.clone(),
             node,
             report,
+            firewall: Mutex::new(None),
         };
         let (shutdown, rx) = oneshot::channel();
         Some(Self {
@@ -133,32 +144,152 @@ impl SdnAgent {
     }
 }
 
-/// 맞추기를 다시 할지 정하는 입력: 중앙 목록, 자리, 이 노드의 underlay와 SDN 설정(physnet·게이트웨이). 이것이 바뀌지 않은
-/// `Node` 변경(검사 결과 등)으로는 다시 맞추지 않는다.
-type Inputs = Option<(
-    Vec<SdnCentral>,
-    Option<SdnPending>,
-    Option<IpAddr>,
-    Option<NodeSdnConfig>,
-)>;
+/// 맞추기를 다시 할지 정하는 입력: 중앙 목록, 자리, 이 노드의 underlay와 SDN 설정(physnet·게이트웨이), 잠금(원하는 것,
+/// 잠긴 중앙, 허용 집합, 노드 목록, 중앙들의 온라인·Raft 역할 — 계획 67). 이것이 바뀌지 않은 `Node` 변경(검사 결과
+/// 등)으로는 다시 맞추지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Inputs {
+    centrals: Vec<SdnCentral>,
+    pending: Option<SdnPending>,
+    underlay: Option<IpAddr>,
+    config: Option<NodeSdnConfig>,
+    lockdown: bool,
+    applied: Vec<Uuid>,
+    sets: AllowSets,
+    nodes: Vec<Uuid>,
+    health: Vec<(Uuid, bool, Option<CentralHealth>)>,
+}
+
+/// 마지막으로 넣은 허용 목록(빠른 길이 쓴다): 글과 이 노드의 몫
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Firewall {
+    text: String,
+    role: LockdownRole,
+}
 
 struct Agent {
     cluster: Arc<Cluster>,
     host: Arc<OvnHost>,
     node: Uuid,
     report: SdnReport,
+    /// 마지막으로 넣은 허용 목록(없으면 넣지 않았거나 지웠다)
+    firewall: Mutex<Option<Firewall>>,
+}
+
+/// 잠금을 바꾸지 않는 Task가 자리를 잡았는지(중앙 더하기·빼기 따위 — 그동안 중앙의 잠금은 그대로 둔다)
+fn other_task(pending: Option<&SdnPending>) -> bool {
+    pending.is_some_and(|p| !matches!(p.op, TaskOp::SdnLockdown { .. }))
+}
+
+/// 모든 중앙의 SB가 잠겼다(허용 목록을 걸 때 — 바뀌지 않은 northd가 6645에 막히는 순간이 없게, 계획 67 §10.4).
+fn all_locked(sdn: &Sdn) -> bool {
+    let applied = sdn
+        .status
+        .lockdown
+        .as_ref()
+        .map(|l| l.applied.as_slice())
+        .unwrap_or_default();
+    !sdn.status.centrals.is_empty()
+        && sdn
+            .status
+            .centrals
+            .iter()
+            .all(|c| applied.contains(&c.node))
+}
+
+/// 잠긴 중앙(`SdnStatus.lockdown.applied`)의 주소
+fn locked_addresses(sdn: &Sdn) -> Vec<IpAddr> {
+    let applied = sdn
+        .status
+        .lockdown
+        .as_ref()
+        .map(|l| l.applied.clone())
+        .unwrap_or_default();
+    sdn.status
+        .centrals
+        .iter()
+        .filter(|c| applied.contains(&c.node))
+        .map(|c| c.address)
+        .collect()
+}
+
+/// 이 노드 `me`(중앙)의 잠금을 바꿀 차례인지(계획 67 §10.4): 다른 중앙 Task가 없고, SDN이 준비됐고, 원하는 잠금과 다른
+/// 첫 중앙(목록 차례)이 나이고, 다른 중앙이 모두 온라인이며 NB·SB가 리더나 팔로어라고 알렸다(내 SB를 다시 띄워도
+/// 정족수가 남는다). 아니면 기다리는 까닭
+fn lockdown_turn(sdn: &Sdn, nodes: &[Node], me: Uuid) -> Result<(), String> {
+    if other_task(sdn.status.pending.as_ref()) {
+        return Err("another SDN central task is running".into());
+    }
+    if sdn.status.phase != SdnPhase::Ready {
+        return Err("SDN (OVN) is not ready".into());
+    }
+    let want = sdn.spec.lockdown;
+    let applied = sdn
+        .status
+        .lockdown
+        .as_ref()
+        .map(|l| l.applied.as_slice())
+        .unwrap_or_default();
+    let first = sdn
+        .status
+        .centrals
+        .iter()
+        .find(|c| applied.contains(&c.node) != want);
+    match first {
+        Some(c) if c.node == me => {}
+        Some(c) => return Err(format!("waiting for central {}", c.node)),
+        None => return Err("nothing to change".into()),
+    }
+    let live = |role: RaftRole| matches!(role, RaftRole::Leader | RaftRole::Follower);
+    for c in sdn.status.centrals.iter().filter(|c| c.node != me) {
+        let node = nodes.iter().find(|n| n.id == c.node);
+        let healthy = node.is_some_and(|n| {
+            n.status.online
+                && n.status
+                    .sdn
+                    .as_ref()
+                    .and_then(|s| s.central)
+                    .is_some_and(|h| live(h.nb) && live(h.sb))
+        });
+        if !healthy {
+            let name = node.map_or_else(|| c.node.to_string(), |n| n.name.clone());
+            return Err(format!(
+                "central {name:?} is offline or its OVN databases are not in the cluster"
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Agent {
-    fn inputs(&self) -> Inputs {
+    fn inputs(&self) -> Option<Inputs> {
         let sdn = self.cluster.get_by_name::<SdnSpec>(SDN_NAME).ok()??;
         let me = self.cluster.get::<NodeSpec>(self.node).ok()??;
-        Some((
-            sdn.status.centrals,
-            sdn.status.pending,
-            me.status.underlay,
-            me.spec.sdn,
-        ))
+        let (_, nodes) = self.cluster.list::<NodeSpec>().ok()?;
+        let health = sdn
+            .status
+            .centrals
+            .iter()
+            .map(|c| {
+                let n = nodes.iter().find(|n| n.id == c.node);
+                (
+                    c.node,
+                    n.is_some_and(|n| n.status.online),
+                    n.and_then(|n| n.status.sdn.as_ref()?.central),
+                )
+            })
+            .collect();
+        Some(Inputs {
+            sets: allow_sets(&nodes, &sdn),
+            nodes: nodes.iter().map(|n| n.id).collect(),
+            health,
+            lockdown: sdn.spec.lockdown,
+            applied: sdn.status.lockdown.map(|l| l.applied).unwrap_or_default(),
+            centrals: sdn.status.centrals,
+            pending: sdn.status.pending,
+            underlay: me.status.underlay,
+            config: me.spec.sdn,
+        })
     }
 
     /// 한 번 맞추고 읽는다. `Sdn` 리소스가 없거나 이 노드가 위트니스면 아무것도 하지 않는다.
@@ -179,6 +310,14 @@ impl Agent {
                 return;
             }
         };
+        // 노드 목록을 읽지 못하면 허용 목록·청소를 건너뛴다(빈 목록으로 막거나 지우지 않는다 — §10.3).
+        let nodes = match self.cluster.list::<NodeSpec>() {
+            Ok((_, nodes)) => Some(nodes),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the nodes");
+                None
+            }
+        };
         let host = &*self.host;
         let mut errors: Vec<String> = Vec::new();
         let versions = match host.versions().await {
@@ -197,12 +336,12 @@ impl Agent {
         };
         let centrals: Vec<IpAddr> = sdn.status.centrals.iter().map(|c| c.address).collect();
         let mine = sdn.status.centrals.iter().find(|c| c.node == self.node);
-        // 이 노드에서 중앙 Task가 돈다(그 Task가 단위·DB를 다룬다).
+        // 이 노드에서 중앙 Task가 돈다(그 Task가 단위·DB를 다룬다). 잠금 Task는 중앙을 만지지 않는다.
         let busy = sdn
             .status
             .pending
             .as_ref()
-            .is_some_and(|p| p.node == self.node);
+            .is_some_and(|p| p.node == self.node && other_task(Some(p)));
 
         let configured = matches!(
             host.external_ids().await,
@@ -218,7 +357,8 @@ impl Agent {
 
         let central = match mine {
             Some(c) if !busy => {
-                self.keep_central(c.address, &centrals, &mut errors).await;
+                self.keep_central(&sdn, nodes.as_deref(), c.address, &centrals, &mut errors)
+                    .await;
                 Some(host.central_health().await)
             }
             Some(_) => Some(host.central_health().await),
@@ -286,6 +426,44 @@ impl Agent {
             }
         }
 
+        // 주소 허용 목록(계획 67 §10.3)
+        let role = LockdownRole {
+            central: mine.is_some(),
+            chassis: configured,
+        };
+        let lockdown = match &nodes {
+            Some(nodes) => self.firewall(&sdn, nodes, role).await,
+            None => None,
+        };
+        // 지운 노드의 SB chassis 청소(계획 67 §10.2): 이 중앙의 SB가 리더일 때만
+        if mine.is_some()
+            && let Some(nodes) = &nodes
+            && services_ready(&self.cluster, &me.name)
+            && host
+                .cluster_status(Db::Sb)
+                .await
+                .is_ok_and(|s| s.is_leader())
+        {
+            let keep = nodes.iter().map(|n| n.id).collect();
+            match host.clean_chassis(&keep).await {
+                Ok(removed) if !removed.is_empty() => {
+                    tracing::info!(chassis = ?removed, "removed the OVN chassis of removed nodes")
+                }
+                Ok(_) => {}
+                Err(e) => errors.push(format!(
+                    "cannot remove the OVN chassis of removed nodes: {e}"
+                )),
+            }
+        }
+        let peers = if mine.is_some() {
+            host.central_peers().await.unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "cannot read the OVN clients");
+                Vec::new()
+            })
+        } else {
+            Vec::new()
+        };
+
         let (chassis, encap_ip) = match host.chassis_probe(self.node, &centrals).await {
             ChassisProbe::NotConfigured => (ChassisState::Missing, None),
             ChassisProbe::Configured {
@@ -307,7 +485,8 @@ impl Agent {
         self.report.set(Some(NodeSdn {
             physnets,
             gateway,
-            lockdown: None,
+            lockdown,
+            peers,
             chassis,
             ovn_version: Some(versions.ovn),
             ovs_version: Some(versions.ovs),
@@ -317,10 +496,39 @@ impl Agent {
         }));
     }
 
-    /// 중앙 노드의 단위를 맞춘다: 파일(northd의 중앙 목록), 바뀐 단위 다시 시작, 멈춘 단위 켜기, 스키마 변환
-    async fn keep_central(&self, address: IpAddr, centrals: &[IpAddr], errors: &mut Vec<String>) {
+    /// 중앙 노드의 단위를 맞춘다: 잠금 차례면 SB를 잠금대로 바꾸고(§10.4), 아니면 파일(northd의 중앙 목록, 잠긴 중앙),
+    /// 바뀐 단위 다시 시작, 멈춘 단위 켜기, 스키마 변환
+    async fn keep_central(
+        &self,
+        sdn: &Sdn,
+        nodes: Option<&[Node]>,
+        address: IpAddr,
+        centrals: &[IpAddr],
+        errors: &mut Vec<String>,
+    ) {
         let host = &*self.host;
-        match host.write_units(address, centrals).await {
+        let mut locked = locked_addresses(sdn);
+        let applied_me = locked.contains(&address);
+        let turn = match nodes {
+            Some(nodes) if sdn.spec.lockdown != applied_me => {
+                match lockdown_turn(sdn, nodes, self.node) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        tracing::info!(reason = %why, "the OVN lockdown of this central waits");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        };
+        if turn {
+            return self
+                .switch_lockdown(sdn, address, centrals, locked, errors)
+                .await;
+        }
+        // 잠금은 내 SB가 실제로 바뀐 뒤 적힌 `applied`를 따른다(차례가 아니면 바꾸지 않는다).
+        locked.dedup();
+        match host.write_units(address, centrals, &locked).await {
             Ok(changed) if !changed.is_empty() => {
                 tracing::info!(units = ?changed, "updated the OVN central units");
                 if let Err(e) = host.start_central(&changed).await {
@@ -346,6 +554,174 @@ impl Agent {
                     tracing::debug!(db = db.name(), error = %e, "cannot check the OVN schema")
                 }
             }
+        }
+    }
+
+    /// 이 중앙의 SB를 `SdnSpec.lockdown`대로 바꾼다(§10.4 (2)·(3)·(4)): 설정 파일·단위를 쓰고, 돌고 있는 SB가 아직 옛
+    /// 모양이면(파일을 쓴 뒤 멈췄다 다시 와도) 다시 띄우고, 클러스터에 다시 붙을 때까지 기다린 뒤 `applied`에 적는다.
+    async fn switch_lockdown(
+        &self,
+        sdn: &Sdn,
+        address: IpAddr,
+        centrals: &[IpAddr],
+        mut locked: Vec<IpAddr>,
+        errors: &mut Vec<String>,
+    ) {
+        let host = &*self.host;
+        let want = sdn.spec.lockdown;
+        locked.retain(|a| *a != address);
+        if want {
+            locked.push(address);
+        }
+        tracing::info!(
+            lockdown = want,
+            "switching the OVN lockdown of this central"
+        );
+        let mut restart = match host.write_units(address, centrals, &locked).await {
+            Ok(changed) => changed,
+            Err(e) => {
+                return errors.push(format!("cannot write the OVN central units: {e}"));
+            }
+        };
+        let sb = Db::Sb.unit();
+        if host.sb_running_locked().await != Some(want) && !restart.contains(&sb) {
+            restart.push(sb);
+        }
+        if let Err(e) = host.start_central(&restart).await {
+            return errors.push(format!("cannot restart the OVN central units: {e}"));
+        }
+        if let Err(e) = host.wait_member(Db::Sb, sdn.status.sb_cid).await {
+            return errors.push(format!(
+                "the OVN southbound database did not rejoin its cluster after the lockdown change: {e}"
+            ));
+        }
+        if host.sb_running_locked().await != Some(want) {
+            return errors.push(
+                "the OVN southbound database does not listen as the lockdown wants after a restart"
+                    .into(),
+            );
+        }
+        let me = self.node;
+        let result = opl_api::update_sdn_status(&self.cluster, |s| {
+            let state = s.lockdown.get_or_insert_with(Default::default);
+            let has = state.applied.contains(&me);
+            if has == want {
+                return false;
+            }
+            if want {
+                state.applied.push(me);
+            } else {
+                state.applied.retain(|n| *n != me);
+            }
+            true
+        })
+        .await;
+        match result {
+            Ok(()) => tracing::info!(lockdown = want, "switched the OVN lockdown of this central"),
+            Err(e) => errors.push(format!("cannot record the OVN lockdown: {e}")),
+        }
+    }
+
+    /// 주소 허용 목록을 맞추고 알릴 상태를 돌려준다(잠금이 꺼져 있으면 None). 잠금을 원하고 모든 중앙이 잠겼으면 이
+    /// 노드의 몫(중앙·chassis)대로 표를 넣고, 아니면 있던 표를 지운다(잠금을 켠 적이 없으면 nft를 부르지 않는다).
+    async fn firewall(
+        &self,
+        sdn: &Sdn,
+        nodes: &[Node],
+        role: LockdownRole,
+    ) -> Option<LockdownNodeState> {
+        let host = &*self.host;
+        let sets = allow_sets(nodes, sdn);
+        let wanted = sdn.spec.lockdown && all_locked(sdn) && (role.central || role.chassis);
+        if !wanted {
+            let had = self.firewall.lock().unwrap().take().is_some();
+            // chassis도 중앙도 아닌 노드는 표를 걸지 않으므로 알리지도 않는다(nft가 없을 수 있다).
+            if !had && !role.central && !role.chassis {
+                return None;
+            }
+            if had || sdn.status.lockdown.is_some() {
+                match host.remove_lockdown().await {
+                    Ok(true) => tracing::info!("removed the OVN address allow-list"),
+                    Ok(false) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot remove the OVN address allow-list");
+                        return sdn.spec.lockdown.then_some(LockdownNodeState {
+                            firewall: false,
+                            allowed: sets.members.len(),
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            }
+            return sdn.spec.lockdown.then_some(LockdownNodeState {
+                firewall: false,
+                allowed: sets.members.len(),
+                error: None,
+            });
+        }
+        let text = ruleset(host.tag(), &sets, role);
+        let same = self
+            .firewall
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|f| f.text == text);
+        // 같은 글을 넣었어도 표가 사라졌으면(누가 `nft flush ruleset`) 다시 넣는다.
+        let present = same && host.lockdown_present().await.unwrap_or(false);
+        let error = if present {
+            None
+        } else {
+            match host.apply_lockdown(&text).await {
+                Ok(()) => {
+                    tracing::info!(
+                        members = sets.members.len(),
+                        centrals = sets.centrals.len(),
+                        "applied the OVN address allow-list"
+                    );
+                    *self.firewall.lock().unwrap() = Some(Firewall { text, role });
+                    None
+                }
+                Err(e) => {
+                    *self.firewall.lock().unwrap() = None;
+                    Some(e.to_string())
+                }
+            }
+        };
+        Some(LockdownNodeState {
+            firewall: error.is_none(),
+            allowed: sets.members.len(),
+            error,
+        })
+    }
+
+    /// 빠른 길(§10.3 "1초 안"): 노드가 빠지거나 들어 허용 집합이 바뀌었으면 1초 모으기와 다른 맞추기를 기다리지 않고
+    /// 지금 넣은 표의 집합만 새로 넣는다. 표를 넣은 적이 없으면 아무것도 하지 않는다(다음 차례가 한다).
+    async fn quick_firewall(&self) {
+        let Some(last) = self.firewall.lock().unwrap().clone() else {
+            return;
+        };
+        let (Ok(Some(sdn)), Ok((_, nodes))) = (
+            self.cluster.get_by_name::<SdnSpec>(SDN_NAME),
+            self.cluster.list::<NodeSpec>(),
+        ) else {
+            return;
+        };
+        if !(sdn.spec.lockdown && all_locked(&sdn)) {
+            return;
+        }
+        let text = ruleset(self.host.tag(), &allow_sets(&nodes, &sdn), last.role);
+        if text == last.text {
+            return;
+        }
+        match self.host.apply_lockdown(&text).await {
+            Ok(()) => {
+                tracing::info!("updated the OVN address allow-list");
+                *self.firewall.lock().unwrap() = Some(Firewall {
+                    text,
+                    role: last.role,
+                });
+            }
+            Err(e) => tracing::warn!(error = %e, "cannot update the OVN address allow-list"),
         }
     }
 
@@ -379,12 +755,14 @@ async fn run(agent: Agent, refresh: Duration, mut shutdown: oneshot::Receiver<()
     let mut interval = tokio::time::interval(refresh);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut watch: Option<Watch> = None;
-    let mut last: Inputs = None;
+    let mut last: Option<Inputs> = None;
     loop {
         tokio::select! {
             _ = &mut shutdown => return,
             _ = interval.tick() => {}
             () = changed(&mut watch) => {
+                // 지운 노드를 곧바로 끊는다(§10.3).
+                agent.quick_firewall().await;
                 tokio::select! {
                     _ = &mut shutdown => return,
                     () = tokio::time::sleep(DEBOUNCE) => {}
@@ -543,6 +921,7 @@ mod tests {
             host,
             node,
             report: SdnReport::default(),
+            firewall: Mutex::new(None),
         };
         Setup {
             _dir: dir,
@@ -652,6 +1031,10 @@ mod tests {
         f.reply(
             "ovs-vsctl --format=json --columns=name,external_ids find Bridge",
             CmdOutput::ok(r#"{"data":[],"headings":["name","external_ids"]}"#),
+        );
+        f.reply(
+            "ovsdb-client --timeout=10 transact",
+            CmdOutput::ok(r#"[{"rows":[]},{"rows":[]}]"#),
         );
         s.agent.tick().await;
 
@@ -927,6 +1310,395 @@ mod tests {
                 .any(|c| c.contains("external_ids:ovn-cms-options=\"enable-chassis-as-gw\"")),
             "{calls:?}"
         );
+    }
+
+    /// 다른 노드 하나(중앙이면 NB·SB 역할을 알린다)
+    async fn add_node(
+        cluster: &Cluster,
+        name: &str,
+        address: &str,
+        online: bool,
+        central: Option<RaftRole>,
+    ) -> Uuid {
+        let mut n: opl_types::node::Node = Resource::new(
+            name,
+            NodeSpec {
+                sdn: None,
+                address: format!("{address}:8006"),
+                maintenance: false,
+                witness: false,
+                roles: None,
+                host_resources: None,
+            },
+        );
+        n.status.online = online;
+        n.status.features = vec![SDN.into(), SDN_SERVICES.into()];
+        n.status.sdn = central.map(|role| NodeSdn {
+            central: Some(CentralHealth {
+                nb: role,
+                sb: role,
+                northd_active: false,
+            }),
+            ..NodeSdn::default()
+        });
+        cluster.create(&n).await.unwrap();
+        n.id
+    }
+
+    async fn set_features(cluster: &Cluster, node: Uuid, features: &[&str]) {
+        let me = cluster.get::<NodeSpec>(node).unwrap().unwrap();
+        let mut status = me.status;
+        status.features = features.iter().map(|f| f.to_string()).collect();
+        status.online = true;
+        cluster
+            .update_status::<NodeSpec>(node, &status)
+            .await
+            .unwrap();
+    }
+
+    fn central(node: Uuid, ip: &str) -> SdnCentral {
+        SdnCentral {
+            node,
+            address: ip.parse().unwrap(),
+        }
+    }
+
+    /// 중앙이자 chassis인 노드의 가짜 답(`list-remotes`는 [`central_setup`]이 먼저 단다)
+    fn central_replies(f: &FakeRunner) {
+        f.reply("ovn-controller --version", CmdOutput::ok(OVN_VERSION));
+        f.reply("ovs-vsctl --version", CmdOutput::ok(OVS_VERSION));
+        f.reply(
+            "ovs-vsctl --format=json --columns=external_ids",
+            ids(&[(opl_driver::ovn::TAG_KEY, TAG)]),
+        );
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,external_ids find Bridge",
+            CmdOutput::ok(r#"{"data":[],"headings":["name","external_ids"]}"#),
+        );
+        f.reply(
+            "ovs-vsctl --format=json --columns=name,ofport",
+            CmdOutput::ok(r#"{"data":[],"headings":["name","ofport","external_ids"]}"#),
+        );
+        f.reply("ovs-appctl", CmdOutput::ok(NB_LEADER));
+        f.reply("ovsdb-client needs-conversion", CmdOutput::ok("no\n"));
+        f.reply(
+            "ovsdb-client --timeout=10 transact",
+            CmdOutput::ok(r#"[{"rows":[]},{"rows":[]}]"#),
+        );
+        f.reply(
+            "ss -tnH",
+            CmdOutput::ok("0 0 10.0.0.1:6642 10.0.0.2:4000\n"),
+        );
+    }
+
+    fn remotes_rule(s: &Setup) -> String {
+        format!(
+            "ovs-appctl --timeout 5 -t {} ovsdb-server/list-remotes",
+            s.root.join("run/sb.ctl").display()
+        )
+    }
+
+    fn listing(locked: bool) -> CmdOutput {
+        if locked {
+            CmdOutput::ok("pssl:6642:10.0.0.1\npssl:6645:10.0.0.1\npunix:/x/sb.sock\n")
+        } else {
+            CmdOutput::ok("pssl:6642:10.0.0.1\npunix:/x/sb.sock\n")
+        }
+    }
+
+    /// 중앙의 가짜 답. `list-remotes`(더 긴 앞부분)를 일반 `ovs-appctl`보다 먼저 단다(처음 맞는 규칙이 답한다).
+    fn central_setup(s: &Setup, remotes: Vec<CmdOutput>) {
+        let f = &s.runner.fake;
+        f.reply_seq(&remotes_rule(s), remotes);
+        central_replies(f);
+    }
+
+    /// 잠금 차례(계획 67 §10.4): 다른 중앙 Task가 없고, 바꿀 첫 중앙이 나이고, 다른 중앙이 온라인이며 NB·SB가 리더·팔로어
+    #[tokio::test]
+    async fn the_lockdown_turn_goes_one_central_at_a_time() {
+        let (_dir, cluster) = node_cluster().await;
+        let NodeId(me) = cluster.id();
+        let mut status = cluster.get::<NodeSpec>(me).unwrap().unwrap().status;
+        status.online = true;
+        status.sdn = Some(NodeSdn {
+            central: Some(CentralHealth {
+                nb: RaftRole::Follower,
+                sb: RaftRole::Follower,
+                northd_active: true,
+            }),
+            ..NodeSdn::default()
+        });
+        cluster
+            .update_status::<NodeSpec>(me, &status)
+            .await
+            .unwrap();
+        let a = add_node(&cluster, "a", "10.0.0.2", true, Some(RaftRole::Follower)).await;
+        let b = add_node(&cluster, "b", "10.0.0.3", true, Some(RaftRole::Leader)).await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![
+            central(a, "10.0.0.2"),
+            central(me, "10.0.0.1"),
+            central(b, "10.0.0.3"),
+        ];
+        let nodes = || cluster.list::<NodeSpec>().unwrap().1;
+        // 차례는 목록의 첫 중앙(a)부터
+        assert!(
+            lockdown_turn(&sdn, &nodes(), me)
+                .unwrap_err()
+                .contains("waiting for central")
+        );
+        assert_eq!(lockdown_turn(&sdn, &nodes(), a), Ok(()));
+        sdn.status.lockdown = Some(opl_types::sdn::LockdownState {
+            applied: vec![a],
+            ..Default::default()
+        });
+        assert_eq!(lockdown_turn(&sdn, &nodes(), me), Ok(()));
+        // 다른 중앙이 오프라인이거나 Raft 밖이면 기다린다.
+        let mut down = cluster.get::<NodeSpec>(b).unwrap().unwrap().status;
+        down.sdn.as_mut().unwrap().central.as_mut().unwrap().sb = RaftRole::Candidate;
+        cluster.update_status::<NodeSpec>(b, &down).await.unwrap();
+        assert!(
+            lockdown_turn(&sdn, &nodes(), me)
+                .unwrap_err()
+                .contains("\"b\"")
+        );
+        let mut status = cluster.get::<NodeSpec>(b).unwrap().unwrap().status;
+        status.sdn.as_mut().unwrap().central.as_mut().unwrap().sb = RaftRole::Follower;
+        status.online = false;
+        cluster.update_status::<NodeSpec>(b, &status).await.unwrap();
+        assert!(lockdown_turn(&sdn, &nodes(), me).is_err());
+        status.online = true;
+        cluster.update_status::<NodeSpec>(b, &status).await.unwrap();
+        assert_eq!(lockdown_turn(&sdn, &nodes(), me), Ok(()));
+        // 중앙 더하기 Task가 자리를 잡았으면 기다리고, 잠금 Task면 간다.
+        sdn.status.pending = Some(SdnPending {
+            op: TaskOp::SdnCentralAdd,
+            node: b,
+            task: Uuid::now_v7(),
+        });
+        assert!(lockdown_turn(&sdn, &nodes(), me).is_err());
+        sdn.status.pending.as_mut().unwrap().op = TaskOp::SdnLockdown { enabled: true };
+        assert_eq!(lockdown_turn(&sdn, &nodes(), me), Ok(()));
+        // 끄기는 거꾸로: 잠긴 첫 중앙부터
+        sdn.spec.lockdown = false;
+        assert!(lockdown_turn(&sdn, &nodes(), me).is_err());
+        assert_eq!(lockdown_turn(&sdn, &nodes(), a), Ok(()));
+    }
+
+    /// 중앙 하나: 잠금을 원하면 설정 파일·단위를 쓰고 SB를 다시 띄워 따라잡은 뒤 `applied`에 적는다. 다음 차례에 모든
+    /// 중앙이 잠겼으므로 허용 목록을 넣는다. 잠근 뒤 다시 와도 SB를 다시 띄우지 않는다. 끄면 표를 지우고 되돌린다.
+    #[tokio::test]
+    async fn a_single_central_locks_down_and_back() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.0.0.1").await;
+        set_features(&s.cluster, node, &[SDN, SDN_SERVICES]).await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![central(node, "10.0.0.1")];
+        s.cluster.create(&sdn).await.unwrap();
+        central_setup(&s, vec![listing(false), listing(true)]);
+        let f = &s.runner.fake;
+
+        s.agent.tick().await;
+        let calls = f.calls();
+        assert!(
+            calls.contains(&"systemctl restart opl-ovn-sb.service".to_string()),
+            "{calls:?}"
+        );
+        assert!(s.root.join("etc/sb.json").exists());
+        let unit = std::fs::read_to_string(s.root.join("systemd/opl-ovn-sb.service")).unwrap();
+        assert!(unit.contains("--config-file="), "{unit}");
+        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        assert_eq!(sdn.status.lockdown.as_ref().unwrap().applied, [node]);
+        // 이 차례에는 아직 표를 넣지 않았다(모든 중앙이 잠긴 것을 본 다음 차례).
+        let report = s.agent.report.get().unwrap();
+        assert!(!report.lockdown.as_ref().unwrap().firewall, "{report:?}");
+        assert_eq!(report.peers, ["10.0.0.2".parse::<IpAddr>().unwrap()]);
+
+        let before = f.calls().len();
+        s.agent.tick().await;
+        let after: Vec<String> = f.calls()[before..].to_vec();
+        assert!(!after.iter().any(|c| c.contains("restart")), "{after:?}");
+        assert!(after.contains(&"nft -f -".to_string()), "{after:?}");
+        let nft = f
+            .commands()
+            .into_iter()
+            .rev()
+            .find(|c| c.program == "nft" && c.args == ["-f", "-"])
+            .unwrap();
+        let text = String::from_utf8(nft.stdin.unwrap()).unwrap();
+        assert!(
+            text.contains(&format!("table inet opl_ovn_{TAG} {{\n")),
+            "{text}"
+        );
+        assert!(text.contains("elements = { 10.0.0.1 }"), "{text}");
+        assert!(text.contains("tcp dport { 6643, 6644, 6645 }"), "{text}");
+        let report = s.agent.report.get().unwrap();
+        let lockdown = report.lockdown.unwrap();
+        assert!(
+            lockdown.firewall && lockdown.error.is_none(),
+            "{lockdown:?}"
+        );
+        assert_eq!(lockdown.allowed, 1);
+
+        // 끄기: 표를 지우고 SB를 계획 66 모양으로 되돌린다.
+        let mut sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        sdn.spec.lockdown = false;
+        s.cluster
+            .update_spec(sdn.id, None, sdn.labels.clone(), &sdn.spec)
+            .await
+            .unwrap();
+        f.reply(
+            &format!("nft list table inet opl_ovn_{TAG}"),
+            CmdOutput::ok("table"),
+        );
+        f.reply_seq(&remotes_rule(&s), vec![listing(true), listing(false)]);
+        s.agent.tick().await;
+        assert!(!s.root.join("etc/sb.json").exists());
+        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        assert!(sdn.status.lockdown.unwrap().applied.is_empty());
+        let deleted = f
+            .commands()
+            .into_iter()
+            .rfind(|c| c.program == "nft" && c.args == ["-f", "-"])
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(deleted.stdin.unwrap()).unwrap(),
+            format!("table inet opl_ovn_{TAG} {{}}\ndelete table inet opl_ovn_{TAG}\n")
+        );
+        assert_eq!(s.agent.report.get().unwrap().lockdown, None);
+    }
+
+    /// 단위 파일을 쓴 뒤 SB를 다시 띄우기 전에 멈췄다가 다시 와도(파일은 같음) 돌고 있는 SB가 옛 모양이면 다시 띄운다.
+    /// 다른 중앙이 Raft 밖이면 차례가 오지 않아 아무것도 바꾸지 않는다.
+    #[tokio::test]
+    async fn a_lockdown_switch_resumes_after_a_crash() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.0.0.1").await;
+        let other = add_node(&s.cluster, "b", "10.0.0.2", true, Some(RaftRole::Candidate)).await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![central(node, "10.0.0.1"), central(other, "10.0.0.2")];
+        s.cluster.create(&sdn).await.unwrap();
+        central_setup(&s, vec![listing(false)]);
+        let f = &s.runner.fake;
+        s.agent.tick().await;
+        assert!(!s.root.join("etc/sb.json").exists());
+        assert!(
+            !f.calls().iter().any(|c| c.contains("list-remotes")),
+            "{:?}",
+            f.calls()
+        );
+
+        // 다른 중앙이 돌아왔다. 파일은 이미 잠근 모양(앞 차례가 쓰고 멈춤)이지만 SB는 옛 모양으로 돈다.
+        let host = &s.agent.host;
+        host.write_units(
+            "10.0.0.1".parse().unwrap(),
+            &["10.0.0.1".parse().unwrap(), "10.0.0.2".parse().unwrap()],
+            &["10.0.0.1".parse().unwrap()],
+        )
+        .await
+        .unwrap();
+        let mut status = s.cluster.get::<NodeSpec>(other).unwrap().unwrap().status;
+        status.sdn.as_mut().unwrap().central.as_mut().unwrap().sb = RaftRole::Follower;
+        status.sdn.as_mut().unwrap().central.as_mut().unwrap().nb = RaftRole::Follower;
+        s.cluster
+            .update_status::<NodeSpec>(other, &status)
+            .await
+            .unwrap();
+        f.reply_seq(&remotes_rule(&s), vec![listing(false), listing(true)]);
+        let before = f.calls().len();
+        s.agent.tick().await;
+        let after: Vec<String> = f.calls()[before..].to_vec();
+        assert!(
+            after.contains(&"systemctl restart opl-ovn-sb.service".to_string()),
+            "{after:?}"
+        );
+        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        assert_eq!(sdn.status.lockdown.unwrap().applied, [node]);
+        // 아직 다른 중앙이 잠기지 않아 표는 걸지 않는다.
+        assert!(!after.contains(&"nft -f -".to_string()), "{after:?}");
+    }
+
+    /// 빠른 길: 넣은 표가 있으면 노드가 빠질 때 모으기 없이 그 주소를 뺀 집합을 곧바로 넣는다.
+    #[tokio::test]
+    async fn a_removed_node_leaves_the_allow_list_at_once() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.0.0.1").await;
+        let gone = add_node(&s.cluster, "gone", "10.0.0.7", true, None).await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![central(node, "10.0.0.1")];
+        sdn.status.lockdown = Some(opl_types::sdn::LockdownState {
+            applied: vec![node],
+            ..Default::default()
+        });
+        s.cluster.create(&sdn).await.unwrap();
+        central_setup(&s, vec![listing(true)]);
+        s.agent.tick().await;
+        let last = || {
+            s.runner
+                .fake
+                .commands()
+                .into_iter()
+                .rfind(|c| c.program == "nft" && c.args == ["-f", "-"])
+                .map(|c| String::from_utf8(c.stdin.unwrap()).unwrap())
+                .unwrap()
+        };
+        assert!(last().contains("10.0.0.7"), "{}", last());
+        // 같으면 넣지 않는다.
+        let n = s.runner.fake.calls().len();
+        s.agent.quick_firewall().await;
+        assert_eq!(s.runner.fake.calls().len(), n);
+        s.cluster.delete::<NodeSpec>(gone, None).await.unwrap();
+        s.agent.quick_firewall().await;
+        assert!(!last().contains("10.0.0.7"), "{}", last());
+        assert_eq!(s.runner.fake.calls().len(), n + 1);
+    }
+
+    /// 지운 노드의 SB chassis 청소: 모든 노드가 `sdn-services`를 알고 내 SB가 리더일 때만(계획 67 §10.2)
+    #[tokio::test]
+    async fn the_central_agent_cleans_chassis_when_its_sb_leads() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.0.0.1").await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec::default());
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![central(node, "10.0.0.1")];
+        s.cluster.create(&sdn).await.unwrap();
+        central_setup(&s, vec![listing(false)]);
+        let f = &s.runner.fake;
+        let gone = Uuid::now_v7();
+        f.reply(
+            "ovsdb-client --timeout=10 transact",
+            CmdOutput::ok(format!(
+                r#"[{{"rows":[{{"name":"{gone}"}},{{"name":"{node}"}}]}},{{"rows":[]}}]"#
+            )),
+        );
+        // 옛 노드(`sdn-services`를 모름)가 있으면 리더 OvnSync가 한다.
+        let old = add_node(&s.cluster, "old", "10.0.0.9", true, None).await;
+        set_features(&s.cluster, old, &[SDN]).await;
+        s.agent.tick().await;
+        assert!(
+            f.calls()
+                .iter()
+                .all(|c| !c.starts_with("ovsdb-client --timeout=10"))
+        );
+        // 잠금을 켠 적이 없으면 nft를 부르지 않는다.
+        assert!(f.calls().iter().all(|c| !c.starts_with("nft")));
+        set_features(&s.cluster, old, &[SDN, SDN_SERVICES]).await;
+        s.agent.tick().await;
+        let deletes: Vec<String> = f
+            .calls()
+            .into_iter()
+            .filter(|c| c.starts_with("ovsdb-client --timeout=10") && c.contains("delete"))
+            .collect();
+        assert_eq!(deletes.len(), 1, "{deletes:?}");
+        assert!(deletes[0].contains(&gone.to_string()) && !deletes[0].contains(&node.to_string()));
     }
 
     /// 기능 `sdn`을 모르는 노드가 있으면 쓰지 않는다.

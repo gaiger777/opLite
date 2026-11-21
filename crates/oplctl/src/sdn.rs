@@ -39,6 +39,21 @@ pub(crate) enum SdnCmd {
     },
     /// 중앙과 Raft 역할·northd, 동기화, 노드마다의 chassis 상태
     Status,
+    /// OVN 접근 잠금(SB 역할 포트·northd 전용 포트·주소 허용 목록)을 켜거나 끈다. 중앙을 하나씩 바꾼다.
+    Lockdown {
+        #[arg(value_enum)]
+        state: OnOff,
+        /// Task를 기다리지 않는다.
+        #[arg(long)]
+        no_wait: bool,
+    },
+}
+
+/// `sdn lockdown`의 켜기·끄기
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum OnOff {
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +188,21 @@ pub(crate) async fn sdn(
                 wait(client, &task, &node, err).await?;
                 writeln!(out, "sdn: chassis installed on {node}")?;
             }
+        }
+        SdnCmd::Lockdown { state, no_wait } => {
+            let enabled = state == OnOff::On;
+            let task = client
+                .post("/sdn/lockdown", &json!({ "enabled": enabled }))
+                .await?;
+            if no_wait {
+                return started(out, &task);
+            }
+            wait(client, &task, "the OVN centrals", err).await?;
+            writeln!(
+                out,
+                "sdn: OVN access lockdown is {}",
+                if enabled { "on" } else { "off" }
+            )?;
         }
         SdnCmd::Status => {
             let view = client.get("/sdn").await?;

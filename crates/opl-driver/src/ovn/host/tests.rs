@@ -600,7 +600,7 @@ async fn units_are_written_and_started() {
     let env = Env::new();
     let changed = env
         .host
-        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")])
+        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")], &[])
         .await
         .unwrap();
     assert_eq!(
@@ -612,7 +612,7 @@ async fn units_are_written_and_started() {
         ]
     );
     let nb = std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-nb.service")).unwrap();
-    assert_eq!(nb, db_unit(Db::Nb, ip("10.0.0.1"), env.host.paths()));
+    assert_eq!(nb, db_unit(Db::Nb, ip("10.0.0.1"), false, env.host.paths()));
     assert_eq!(env.calls_of("systemctl daemon-reload").len(), 1);
     env.host.start_central(&changed).await.unwrap();
     assert_eq!(
@@ -631,14 +631,14 @@ async fn units_are_written_and_started() {
     // 같으면 아무것도 바꾸지 않는다. 중앙이 늘면 northd만 바뀐다.
     let changed = env
         .host
-        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")])
+        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")], &[])
         .await
         .unwrap();
     assert!(changed.is_empty());
     assert_eq!(env.calls_of("systemctl daemon-reload").len(), 1);
     let changed = env
         .host
-        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1"), ip("10.0.0.2")])
+        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1"), ip("10.0.0.2")], &[])
         .await
         .unwrap();
     assert_eq!(changed, ["opl-ovn-northd.service"]);
@@ -646,7 +646,7 @@ async fn units_are_written_and_started() {
     env.write("etc/systemd/system/opl-ovn-sb.service", "[Unit]\n");
     let err = env
         .host
-        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")])
+        .write_units(ip("10.0.0.1"), &[ip("10.0.0.1")], &[])
         .await
         .unwrap_err();
     assert!(
@@ -670,6 +670,183 @@ async fn units_are_written_and_started() {
     assert_eq!(
         env.calls_of("systemctl disable"),
         ["systemctl disable --now opl-ovn-nb.service opl-ovn-sb.service opl-ovn-northd.service"]
+    );
+}
+
+/// 잠금(계획 67 §10.2): 이 노드가 `locked`에 들면 `sb.json`(0600)을 쓰고 SB 단위가 그것으로 뜨며 northd는 잠긴 중앙의
+/// SB에 6645로 붙는다. 다시 풀면 설정 파일을 치우고 단위가 계획 66 글로 돌아간다.
+#[tokio::test]
+async fn locked_units_use_the_sb_config_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    let me = ip("10.0.0.1");
+    let centrals = [me, ip("10.0.0.2")];
+    env.host.write_units(me, &centrals, &[]).await.unwrap();
+    let plain_sb =
+        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+    let plain_northd =
+        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    assert!(!env.path("etc/opl/ovn/sb.json").exists());
+
+    let changed = env.host.write_units(me, &centrals, &[me]).await.unwrap();
+    assert_eq!(changed, ["opl-ovn-sb.service", "opl-ovn-northd.service"]);
+    let config = env.path("etc/opl/ovn/sb.json");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        sb_config(me, env.host.paths())
+    );
+    assert_eq!(
+        std::fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let sb = std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap();
+    assert!(
+        sb.contains(&format!("--config-file={}", config.display())),
+        "{sb}"
+    );
+    let northd =
+        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-northd.service")).unwrap();
+    assert!(
+        northd.contains("--ovnsb-db=ssl:10.0.0.1:6645,ssl:10.0.0.2:6642 "),
+        "{northd}"
+    );
+    // 다른 중앙만 잠기면 이 노드의 SB는 그대로고 northd만 바뀐다.
+    let changed = env
+        .host
+        .write_units(me, &centrals, &[me, ip("10.0.0.2")])
+        .await
+        .unwrap();
+    assert_eq!(changed, ["opl-ovn-northd.service"]);
+    // 설정 파일만 달라도(손으로 바꿈) SB 단위를 다시 띄울 것으로 알린다.
+    std::fs::write(&config, "{}").unwrap();
+    let changed = env
+        .host
+        .write_units(me, &centrals, &[me, ip("10.0.0.2")])
+        .await
+        .unwrap();
+    assert_eq!(changed, ["opl-ovn-sb.service"]);
+
+    // 풀기: 계획 66 글 그대로, 설정 파일은 치운다.
+    env.host.write_units(me, &centrals, &[]).await.unwrap();
+    assert!(!config.exists());
+    assert_eq!(
+        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-sb.service")).unwrap(),
+        plain_sb
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.path("etc/systemd/system/opl-ovn-northd.service")).unwrap(),
+        plain_northd
+    );
+}
+
+/// 돌고 있는 SB가 잠금으로 떴는지는 `list-remotes`의 6645로 본다(닿지 못하면 모름).
+#[tokio::test]
+async fn reads_the_running_sb_remotes() {
+    let env = Env::new();
+    let ctl = env.p("run/opl/ovn/sb.ctl");
+    let cmd = format!("ovs-appctl --timeout 5 -t {ctl} ovsdb-server/list-remotes");
+    env.fake().reply(
+        &cmd,
+        CmdOutput::ok("pssl:6642:10.0.0.1\npssl:6645:10.0.0.1\npunix:/run/opl/ovn/sb.sock\n"),
+    );
+    assert_eq!(env.host.sb_running_locked().await, Some(true));
+    env.fake().reply(
+        &cmd,
+        CmdOutput::ok("pssl:6642:10.0.0.1\npunix:/run/opl/ovn/sb.sock\n"),
+    );
+    assert_eq!(env.host.sb_running_locked().await, Some(false));
+    env.fake().reply(&cmd, CmdOutput::fail(1, "cannot connect"));
+    assert_eq!(env.host.sb_running_locked().await, None);
+    env.host.restart_sb().await.unwrap();
+    assert_eq!(
+        env.calls_of("systemctl"),
+        ["systemctl restart opl-ovn-sb.service"]
+    );
+}
+
+/// 중앙 에이전트의 SB chassis 청소(계획 67 §10.2): 로컬 소켓으로 읽고, `keep`에 없는 UUID 이름만 이름 조건으로 지운다.
+#[tokio::test]
+async fn cleans_chassis_of_removed_nodes_over_the_local_socket() {
+    let env = Env::new();
+    let gone = "22222222-2222-2222-2222-222222222222";
+    let sock = env.p("run/opl/ovn/sb.sock");
+    let read = format!(
+        "ovsdb-client --timeout=10 transact unix:{sock} [\"OVN_Southbound\",{{\"columns\":[\"name\"],\"op\":\"select\""
+    );
+    env.fake().reply(
+        &read,
+        CmdOutput::ok(format!(
+            r#"[{{"rows":[{{"name":"{NODE}"}},{{"name":"{gone}"}},{{"name":"hand-made"}}]}},{{"rows":[{{"name":"{gone}"}}]}}]"#
+        )),
+    );
+    let keep: BTreeSet<Uuid> = [NODE.parse().unwrap()].into();
+    let removed = env.host.clean_chassis(&keep).await.unwrap();
+    assert_eq!(removed, [gone]);
+    let calls = env.calls_of("ovsdb-client");
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    let delete: serde_json::Value =
+        serde_json::from_str(calls[1].rsplit_once(' ').unwrap().1).unwrap();
+    assert_eq!(
+        delete,
+        serde_json::json!(["OVN_Southbound",
+            {"op": "delete", "table": "Chassis", "where": [["name", "==", gone]]},
+            {"op": "delete", "table": "Chassis_Private", "where": [["name", "==", gone]]}])
+    );
+
+    // 지울 것이 없으면 읽기만, 연산 오류는 실패다.
+    let env = Env::new();
+    env.fake().reply(
+        "ovsdb-client",
+        CmdOutput::ok(r#"[{"rows":[]},{"rows":[]}]"#),
+    );
+    assert!(env.host.clean_chassis(&keep).await.unwrap().is_empty());
+    assert_eq!(env.calls_of("ovsdb-client").len(), 1);
+    let env = Env::new();
+    env.fake().reply_seq(
+        "ovsdb-client",
+        vec![
+            CmdOutput::ok(format!(
+                r#"[{{"rows":[{{"name":"{gone}"}}]}},{{"rows":[]}}]"#
+            )),
+            CmdOutput::ok(r#"[{"error":"permission error"}]"#),
+        ],
+    );
+    assert!(env.host.clean_chassis(&keep).await.is_err());
+}
+
+/// 허용 목록 표: 넣기는 `nft -f -`, 있는지는 `nft list table`, 끄기는 있을 때만 지운다. `ss`로 중앙의 상대 주소.
+#[tokio::test]
+async fn lockdown_firewall_and_peers() {
+    let env = Env::new();
+    env.host.apply_lockdown("table inet x {}\n").await.unwrap();
+    let cmds = env.runner.fake.commands();
+    assert_eq!(cmds[0].line(), "nft -f -");
+    assert_eq!(cmds[0].stdin.as_deref(), Some(&b"table inet x {}\n"[..]));
+    env.fake().reply(
+        &format!("nft list table inet opl_ovn_{TAG}"),
+        CmdOutput::fail(1, "No such file"),
+    );
+    assert!(!env.host.remove_lockdown().await.unwrap());
+    env.fake().reply(
+        &format!("nft list table inet opl_ovn_{TAG}"),
+        CmdOutput::ok("table inet …"),
+    );
+    assert!(env.host.remove_lockdown().await.unwrap());
+    let cmds = env.runner.fake.commands();
+    let last = cmds.last().unwrap();
+    assert_eq!(
+        last.stdin.as_deref(),
+        Some(super::super::lockdown::delete_ruleset(TAG).as_bytes())
+    );
+
+    env.fake().reply(
+        "ss -tnH state established",
+        CmdOutput::ok("0 0 10.0.0.1:6642 10.0.0.2:5000\n0 0 10.0.0.1:6641 10.0.0.2:5001\n"),
+    );
+    assert_eq!(env.host.central_peers().await.unwrap(), [ip("10.0.0.2")]);
+    assert!(
+        env.calls_of("ss")
+            .contains(&"ss -tnH state established ( sport = :6641 or sport = :6642 )".to_string())
     );
 }
 

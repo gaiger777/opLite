@@ -1036,7 +1036,8 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         | TaskOp::SdnCentralAdd
         | TaskOp::SdnCentralRemove
         | TaskOp::SdnCentralKick { .. }
-        | TaskOp::SdnChassisInstall => return sdn::perform(ctx, task).await,
+        | TaskOp::SdnChassisInstall
+        | TaskOp::SdnLockdown { .. } => return sdn::perform(ctx, task).await,
         TaskOp::VolumeDownload {
             url,
             sha256,

@@ -14,7 +14,9 @@
 //!    네트워크마다(지울 스위치·DHCP 행도 따로) 한 트랜잭션이다 — 한 네트워크의 실패가 다른 네트워크를 막지 않는다(리뷰 1
 //!    I-6). 실패한 묶음만 다음 차례에 다시 한다.
 //! 4. SB에서 Raft에 없는 노드(노드 UUID 이름)의 `Chassis`·`Chassis_Private` 행을 지운다(`ovn-sbctl chassis-del`과
-//!    같다 — 65에서 SB에 쓰는 유일한 일). 쓰기 바로 앞에서 아직 같은 임기의 리더인지 다시 본다(리뷰 1 m-1).
+//!    같다 — 65에서 SB에 쓰는 유일한 일). 쓰기 바로 앞에서 아직 같은 임기의 리더인지 다시 본다(리뷰 1 m-1). 모든 노드가
+//!    `sdn-services`를 알면 하지 않는다(계획 67 §10.2 — 잠금의 SB 역할 포트는 남의 chassis 행 지우기를 거절하므로 중앙
+//!    노드의 SDN 에이전트가 로컬 소켓으로 한다). 옛 노드가 섞인 동안은 둘 다 하지만 같은 이름 조건이라 겹쳐도 해가 없다.
 //! 5. `SdnStatus.sync`를 바뀔 때만(성공이 이어지면 60초에 한 번) 쓴다.
 
 pub mod acl;
@@ -35,7 +37,7 @@ use opl_driver::ovn::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB,
 use opl_types::floating_ip::FloatingIpSpec;
 use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::network::NetworkSpec;
-use opl_types::node::{Node, NodeSpec};
+use opl_types::node::{Node, NodeSpec, SDN_SERVICES};
 use opl_types::resource::Kind;
 use opl_types::router::RouterSpec;
 use opl_types::sdn::{NB_PORT, SB_PORT, SDN_NAME, SdnPhase, SdnSpec, SdnSync};
@@ -278,7 +280,9 @@ impl OvnSyncer {
         };
         // SB 청소는 NB와 따로다(NB가 안 되어도 한다). 그새 물러났으면 하지 않는다(낡은 노드 목록으로 막 합류한 노드의
         // chassis를 지우지 않게 — 리뷰 1 m-1).
-        let still_leader = cluster.leader_term() == Some(term);
+        let still_leader = cluster.leader_term() == Some(term)
+            && crate::cluster::missing_feature(&cluster, SDN_SERVICES)
+                .is_ok_and(|old| !old.is_empty());
         let chassis_deleted =
             match Box::pin(self.clean_chassis(&centrals, &nodes, still_leader)).await {
                 Ok(n) => n,

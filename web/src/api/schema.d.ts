@@ -2293,6 +2293,29 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sdn/lockdown": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * OVN 접근 잠금(계획 67 §10)을 켜거나 끄는 `sdn-lockdown` Task(202): `SdnSpec.lockdown`을 쓰고, 중앙마다의 SDN 에이전트가
+         *     하나씩(다른 중앙의 NB·SB가 정족수를 가졌을 때) SB를 역할 포트(6642 `ovn-controller`)·northd 전용 포트(6645)로 다시
+         *     띄운 뒤, 모든 중앙이 잠기면 chassis·중앙이 nftables 주소 허용 목록을 맞출 때까지 기다린다(끄기는 거꾸로). 같은 값을
+         *     다시 보내면 남은 일을 마저 기다린다. 옛 노드가 남았으면 409 `cluster_upgrading`, SDN이 준비되지 않았으면 409
+         *     `sdn_not_ready`, 다른 중앙 Task가 끝나지 않았으면 409 `sdn_busy`.
+         */
+        post: operations["set_lockdown"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/security-groups": {
         parameters: {
             query?: never;
@@ -8207,6 +8230,11 @@ export interface components {
             ovn_version?: string;
             /** @description `ovs-vsctl --version`의 판 */
             ovs_version?: string;
+            /**
+             * @description 중앙이면 NB(6641)·SB(6642)에 지금 붙어 있는 상대 주소(`ss`, 이름 순 — 계획 67 §10.4 잠금 미리 확인). 비면 쓰지
+             *     않는다.
+             */
+            peers?: string[];
             /** @description physnet 연결(계획 66, `NodeSpec.sdn.physnets`마다 이름 순). 비면 쓰지 않는다. */
             physnets?: components["schemas"]["PhysnetState"][];
         };
@@ -10914,6 +10942,11 @@ export interface components {
             /** @description 이름이나 id */
             node: string;
         };
+        /** @description `POST /sdn/lockdown`(계획 67 §10.4) */
+        SdnLockdownRequest: {
+            /** @description 켜기(참)·끄기(거짓) */
+            enabled: boolean;
+        };
         /** @description SDN(OVN) 네트워크. 칸이 없으면 오버레이(Geneve) 네트워크다. */
         SdnNet: {
             /** @description 공급자(외부) 네트워크(계획 66): 노드의 물리 망(physnet)에 붙는 OVN `localnet` 네트워크. 없으면 쓰지 않는다. */
@@ -11703,6 +11736,10 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "sdn-chassis-install";
+        } | {
+            enabled: boolean;
+            /** @enum {string} */
+            kind: "sdn-lockdown";
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -17901,6 +17938,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_lockdown: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SdnLockdownRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
             };
             "4XX": {

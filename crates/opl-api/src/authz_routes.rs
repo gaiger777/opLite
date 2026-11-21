@@ -245,6 +245,7 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/sdn/centrals", Root(ClusterAdmin)),
     ("DELETE", "/sdn/centrals/{node}", Root(ClusterAdmin)),
     ("POST", "/sdn/chassis", Root(ClusterAdmin)),
+    ("POST", "/sdn/lockdown", Root(ClusterAdmin)),
     ("GET", "/security-groups", Root(ClusterRead)),
     ("POST", "/security-groups", Root(NetworkConfig)),
     ("GET", "/security-groups/{key}", Root(ClusterRead)),

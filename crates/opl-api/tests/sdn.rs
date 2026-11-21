@@ -1094,3 +1094,88 @@ async fn dead_centrals_are_kicked_out_by_a_live_one() {
     assert!(headers.get("orbivisor-warning").is_none(), "{headers:?}");
     let _ = n3;
 }
+
+/// 계획 67 §10.4: 새 클러스터의 `sdn init`은 잠금을 켠 채 세운다(옛 노드가 있으면 끈 채). `POST /sdn/lockdown`은 admin,
+/// 기능 `sdn-services`, 준비된 SDN이 필요하고 중앙 Task와 같은 자리를 잡는다(요청 받은 노드에서 돈다).
+#[tokio::test]
+async fn lockdown_defaults_on_for_new_clusters_and_takes_the_slot() {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    give_underlay(&env).await;
+    let admin = env.admin().await;
+    let (status, body) = admin
+        .post("/sdn/lockdown", json!({ "enabled": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "sdn_not_ready", "{body}");
+    let (status, task) = admin.post("/sdn", json!({ "node": "node1" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let sdn = env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert!(sdn.spec.lockdown);
+    finish(&env, &task).await;
+
+    ready_sdn(&env, &[env.node]).await;
+    let viewer = env.user("viewer", "viewer").await;
+    let (status, _) = viewer
+        .post("/sdn/lockdown", json!({ "enabled": false }))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, body) = admin.post("/sdn/lockdown", json!({ "on": true })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, task) = admin
+        .post("/sdn/lockdown", json!({ "enabled": false }))
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(
+        task["spec"]["op"],
+        json!({ "kind": "sdn-lockdown", "enabled": false })
+    );
+    assert_eq!(task["spec"]["node"], env.node.to_string());
+    let sdn = env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sdn.status.pending.as_ref().unwrap().task.to_string(),
+        task["id"].as_str().unwrap()
+    );
+    // 도는 동안 다른 잠금·중앙 Task는 409 `sdn_busy`
+    let (status, body) = admin
+        .post("/sdn/lockdown", json!({ "enabled": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "sdn_busy", "{body}");
+    let node2 = other_node(&env, "node2", true).await;
+    let (status, body) = admin
+        .post("/sdn/centrals", json!({ "node": "node2" }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // node2는 `sdn-services`를 모른다: 잠금 요청은 409 `cluster_upgrading`
+    finish(&env, &task).await;
+    let (status, body) = admin
+        .post("/sdn/lockdown", json!({ "enabled": true }))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading", "{body}");
+    let _ = node2;
+
+    // 옛 노드가 있는 클러스터의 첫 세우기는 잠금을 끈 채다.
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    give_underlay(&env).await;
+    other_node(&env, "old", true).await;
+    let admin = env.admin().await;
+    let (status, task) = admin.post("/sdn", json!({ "node": "node1" })).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let sdn = env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert!(!sdn.spec.lockdown);
+}

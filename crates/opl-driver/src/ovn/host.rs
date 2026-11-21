@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use opl_types::sdn::{CentralHealth, MIN_OVN, RaftRole, is_physnet_ifname};
+use opl_types::sdn::{
+    CentralHealth, MIN_OVN, NB_PORT, RaftRole, SB_ADMIN_PORT, SB_PORT, is_physnet_ifname,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -21,7 +23,9 @@ use super::status::{
     ClusterStatus, OvsInterface, SslConfig, major_minor, parse_cluster_status, parse_external_ids,
     parse_interfaces, parse_ssl, parse_table, parse_version,
 };
-use super::units::{Db, NORTHD_UNIT, db_unit, is_managed, northd_unit, remotes, ssl_addr};
+use super::units::{
+    Db, NORTHD_UNIT, db_unit, is_managed, northd_unit, remotes, sb_config, ssl_addr,
+};
 use crate::ceph::runner::{Cmd, CmdOutput, CommandRunner};
 use crate::error::DriverError;
 
@@ -147,6 +151,11 @@ impl OvnPaths {
 
     pub fn tls_ca(&self) -> PathBuf {
         self.etc.join("ca.crt")
+    }
+
+    /// 잠금이 켜진 SB의 설정 파일(계획 67 §10.2, 0600)
+    pub fn sb_config(&self) -> PathBuf {
+        self.etc.join("sb.json")
     }
 
     pub fn schema(&self, db: Db) -> PathBuf {
@@ -705,21 +714,29 @@ impl OvnHost {
             .join(format!(".{}.db.opl-new", db.short()))
     }
 
-    /// Orbivisor 단위 셋을 쓴다(DB 둘은 이 노드 주소 `address`, northd는 중앙 모두 `centrals`). 관리 표시가 없는 같은
-    /// 이름의 파일은 덮지 않는다. 바뀐 단위 이름을 돌려주고, 바뀌었으면 `systemctl daemon-reload`를 한다.
+    /// Orbivisor 단위 셋을 쓴다(DB 둘은 이 노드 주소 `address`, northd는 중앙 모두 `centrals`). `locked`는 SB가 잠금
+    /// (계획 67 §10.2)으로 뜨는 중앙 주소다: 이 노드가 들면 SB 설정 파일(`sb.json`, 0600)을 쓰고 SB 단위가 그것으로 뜨며,
+    /// 들지 않으면 설정 파일을 치운다(Orbivisor가 만든 것뿐이다). northd는 잠금이 켜진 중앙의 SB에 6645로 붙는다. 관리
+    /// 표시가 없는 같은 이름의 파일은 덮지 않는다. 바뀐 단위 이름을 돌려주고(잠금 중 설정 파일만 바뀌어도 SB 단위),
+    /// 바뀌었으면 `systemctl daemon-reload`를 한다.
     pub async fn write_units(
         &self,
         address: IpAddr,
         centrals: &[IpAddr],
+        locked: &[IpAddr],
     ) -> Result<Vec<String>, OvnError> {
+        let me_locked = locked.contains(&address);
         let mut changed = Vec::new();
         let mut files: Vec<(String, String)> = Db::ALL
             .iter()
-            .map(|db| (db.unit(), db_unit(*db, address, &self.paths)))
+            .map(|db| (db.unit(), db_unit(*db, address, me_locked, &self.paths)))
             .collect();
-        files.push((NORTHD_UNIT.to_string(), northd_unit(centrals, &self.paths)));
-        for (unit, text) in files {
-            let path = self.paths.unit_file(&unit);
+        files.push((
+            NORTHD_UNIT.to_string(),
+            northd_unit(centrals, locked, &self.paths),
+        ));
+        for (unit, _) in &files {
+            let path = self.paths.unit_file(unit);
             if let Some(old) = read_optional(&path)?
                 && !is_managed(&old)
             {
@@ -728,15 +745,142 @@ impl OvnHost {
                     path.display()
                 )));
             }
-            if write_file(&path, text.as_bytes(), 0o644)? {
+        }
+        // 설정 파일을 단위보다 먼저 쓴다(바뀐 단위로 다시 뜨는 서버가 새 파일을 읽게).
+        let config = self.paths.sb_config();
+        let config_changed = if me_locked {
+            write_file(&config, sb_config(address, &self.paths).as_bytes(), 0o600)?
+        } else {
+            false
+        };
+        for (unit, text) in files {
+            let path = self.paths.unit_file(&unit);
+            if write_file(&path, text.as_bytes(), 0o644)?
+                || (config_changed && unit == Db::Sb.unit())
+            {
                 changed.push(unit);
             }
+        }
+        if !me_locked && config.exists() {
+            remove_file(&config)?;
         }
         if !changed.is_empty() {
             self.run_ok(&Cmd::new("systemctl", &["daemon-reload"]))
                 .await?;
         }
         Ok(changed)
+    }
+
+    /// 돌고 있는 SB 서버가 잠금으로 떴는지(`ovsdb-server/list-remotes`에 특권 포트 6645가 있음). 서버에 닿지 못하면
+    /// None(계획 67 §10.4 — 단위 파일을 쓴 뒤 다시 띄우기 전에 멈췄던 맞추기를 이어서 할 때 본다).
+    pub async fn sb_running_locked(&self) -> Option<bool> {
+        let out = self
+            .run_ok(&Cmd::new(
+                "ovs-appctl",
+                &[
+                    "--timeout",
+                    CTL_TIMEOUT,
+                    "-t",
+                    &path_str(&self.paths.db_ctl(Db::Sb)),
+                    "ovsdb-server/list-remotes",
+                ],
+            ))
+            .await
+            .ok()?;
+        let admin = format!(":{SB_ADMIN_PORT}:");
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|l| l.trim().starts_with("pssl:") && l.contains(&admin)),
+        )
+    }
+
+    /// SB 단위를 다시 띄운다(잠금 바꾸기 — 계획 67 §10.4).
+    pub async fn restart_sb(&self) -> Result<(), OvnError> {
+        self.run_ok(&Cmd::new("systemctl", &["restart", &Db::Sb.unit()]))
+            .await
+            .map(drop)
+    }
+
+    /// 로컬 SB 소켓(`punix`, 역할 없음)으로 이름이 노드 UUID이지만 `keep`에 없는 `Chassis`·`Chassis_Private` 행을 지운다
+    /// (계획 67 §10.2 — 지운 노드의 chassis 청소를 리더 OvnSync에서 중앙 에이전트로 옮김. `ovn-sbctl chassis-del`과
+    /// 같다). UUID가 아닌 이름(관리자가 붙인 chassis)은 건드리지 않는다. 지우는 쿼리는 이름 조건이라 두 중앙이 겹쳐도
+    /// 해가 없다. 지운 chassis 이름을 돌려준다.
+    pub async fn clean_chassis(&self, keep: &BTreeSet<Uuid>) -> Result<Vec<String>, OvnError> {
+        let server = format!("unix:{}", self.paths.db_socket(Db::Sb).display());
+        let select = |table: &str| serde_json::json!({"op": "select", "table": table, "where": [], "columns": ["name"]});
+        let read = serde_json::json!([
+            "OVN_Southbound",
+            select("Chassis"),
+            select("Chassis_Private")
+        ]);
+        let out = self
+            .run_ok(&Cmd::new(
+                "ovsdb-client",
+                &["--timeout=10", "transact", &server, &read.to_string()],
+            ))
+            .await?;
+        let results: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| OvnError::Command(format!("cannot read the SB chassis: {e}")))?;
+        let mut gone = BTreeSet::new();
+        for result in results.as_array().into_iter().flatten() {
+            for row in result["rows"].as_array().into_iter().flatten() {
+                if let Some(name) = row["name"].as_str()
+                    && Uuid::parse_str(name).is_ok_and(|id| !keep.contains(&id))
+                {
+                    gone.insert(name.to_string());
+                }
+            }
+        }
+        if gone.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut ops = vec![serde_json::json!("OVN_Southbound")];
+        for name in &gone {
+            for table in ["Chassis", "Chassis_Private"] {
+                ops.push(serde_json::json!({"op": "delete", "table": table,
+                    "where": [["name", "==", name]]}));
+            }
+        }
+        let out = self
+            .run_ok(&Cmd::new(
+                "ovsdb-client",
+                &[
+                    "--timeout=10",
+                    "transact",
+                    &server,
+                    &serde_json::Value::Array(ops).to_string(),
+                ],
+            ))
+            .await?;
+        // `transact`는 연산 오류도 결과 배열의 `error`로 돌려준다.
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.contains("\"error\"") {
+            return Err(OvnError::Command(format!(
+                "cannot delete the SB chassis: {}",
+                text.trim()
+            )));
+        }
+        Ok(gone.into_iter().collect())
+    }
+
+    /// 중앙의 NB(6641)·SB(6642)에 지금 붙어 있는 상대 주소(`ss -tnH state established`, 이름 순·겹치지 않게 — 계획 67
+    /// §10.4 잠금 미리 확인)
+    pub async fn central_peers(&self) -> Result<Vec<IpAddr>, OvnError> {
+        let out = self
+            .run_ok(&Cmd::new(
+                "ss",
+                &[
+                    "-tnH",
+                    "state",
+                    "established",
+                    &format!("( sport = :{} or sport = :{} )", NB_PORT, SB_PORT),
+                ],
+            ))
+            .await?;
+        Ok(super::lockdown::parse_ss_peers(&String::from_utf8_lossy(
+            &out.stdout,
+        )))
     }
 
     /// Orbivisor 단위 셋을 켜고 부팅 때도 켜지게 한다. `restart`에 든 단위(파일이 바뀐 것)는 다시 시작한다.
@@ -1261,7 +1405,7 @@ impl OvnHost {
     // -------------------------------------------------------------------------------------------------------
 
     /// 명령을 돌린다. 시간이 넘으면 그 명령 줄을 담아 실패한다.
-    async fn exec(&self, cmd: &Cmd) -> Result<CmdOutput, OvnError> {
+    pub(crate) async fn exec(&self, cmd: &Cmd) -> Result<CmdOutput, OvnError> {
         match self.runner.run(cmd).await {
             Err(DriverError::Timeout(_)) => Err(OvnError::Command(format!(
                 "{} timed out after {}s",

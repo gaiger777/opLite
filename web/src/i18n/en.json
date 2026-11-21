@@ -340,7 +340,8 @@
       "sdn-central-add": "Add an OVN central on {{node}}",
       "sdn-central-remove": "Remove the OVN central on {{node}}",
       "sdn-central-kick": "Kick {{kicked}} out of the OVN central databases (on {{node}})",
-      "sdn-chassis-install": "Install the OVN chassis on {{node}}"
+      "sdn-chassis-install": "Install the OVN chassis on {{node}}",
+      "sdn-lockdown": "Change the OVN access lockdown (from {{node}})"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",

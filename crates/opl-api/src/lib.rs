@@ -117,6 +117,7 @@ pub use replica_receive::{IncomingReplicas, REPLICA_SWEEP_INTERVAL, ReplicaConfi
 pub use replication::{ReplicationScheduler, ReplicationSchedulerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
+pub use tasks::sdn::update_sdn as update_sdn_status;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
 pub use telemetry::{TelemetryConfig, TelemetryReporter};
 pub use updates::{AUTH_FILE, KEYRING, UpdateAgent, Updates, UpdatesConfig};
@@ -292,6 +293,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(sdn::add_central))
         .routes(routes!(sdn::remove_central))
         .routes(routes!(sdn::install_chassis))
+        .routes(routes!(sdn::set_lockdown))
         .routes(routes!(
             r::list_security_groups,
             security_groups::create_security_group
