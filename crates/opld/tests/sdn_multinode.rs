@@ -322,10 +322,12 @@ impl Node {
         parse_cluster_status(&out).unwrap()
     }
 
-    /// 이 중앙의 `ovn-nbctl`·`ovn-sbctl --bare …`(실패하면 빈 글, 따옴표는 뗀다)
+    /// 이 중앙의 `ovn-nbctl`·`ovn-sbctl --no-leader-only --bare …`(실패하면 빈 글, 따옴표는 뗀다)
     fn ovn_bare(&self, program: &str, db: &str, args: &[&str]) -> String {
         let socket = format!("--db=unix:/run/opl/ovn/{db}.sock");
-        let mut all = vec![program, socket.as_str(), "--bare"];
+        // 팔로어의 로컬 소켓에는 leader-only(기본) 클라이언트가 붙지 못한다(계획 67 스테이지 6에서 확인) — 읽기만 하므로
+        // 어느 중앙에서든 읽는다.
+        let mut all = vec![program, socket.as_str(), "--no-leader-only", "--bare"];
         all.extend_from_slice(args);
         let (ok, out, _) = self.try_exec(&all);
         if ok {
@@ -472,8 +474,18 @@ impl Fleet {
             if running.trim() == "true" {
                 for args in [
                     &["ovs-vsctl", "show"][..],
-                    &["ovn-sbctl", "--db=unix:/run/opl/ovn/sb.sock", "show"],
-                    &["ovn-nbctl", "--db=unix:/run/opl/ovn/nb.sock", "show"],
+                    &[
+                        "ovn-sbctl",
+                        "--db=unix:/run/opl/ovn/sb.sock",
+                        "--no-leader-only",
+                        "show",
+                    ],
+                    &[
+                        "ovn-nbctl",
+                        "--db=unix:/run/opl/ovn/nb.sock",
+                        "--no-leader-only",
+                        "show",
+                    ],
                     &[
                         "systemctl",
                         "status",
@@ -561,20 +573,16 @@ struct Capture {
 
 impl Capture {
     fn start(prefix: &[String], dev: &str, filter: &str) -> Self {
+        Self::start_for(prefix, dev, filter, CAPTURE_SECS)
+    }
+
+    /// `secs`초 동안 잡는 캡처
+    fn start_for(prefix: &[String], dev: &str, filter: &str, secs: &str) -> Self {
         let mut argv: Vec<String> = prefix.to_vec();
         argv.extend(
-            [
-                "timeout",
-                CAPTURE_SECS,
-                "tcpdump",
-                "-n",
-                "-l",
-                "-i",
-                dev,
-                filter,
-            ]
-            .iter()
-            .map(|s| s.to_string()),
+            ["timeout", secs, "tcpdump", "-n", "-l", "-i", dev, filter]
+                .iter()
+                .map(|s| s.to_string()),
         );
         let child = Command::new(&argv[0])
             .args(&argv[1..])
@@ -799,7 +807,7 @@ fn fdb_port(mac: &str) -> String {
 #[tokio::test(flavor = "multi_thread")]
 async fn three_container_nodes_run_ovn() {
     let image = std::env::var("OPL_MULTINODE_IMAGE").unwrap_or_else(|_| "opl-sdn-node".into());
-    for m in ["openvswitch", "geneve"] {
+    for m in ["openvswitch", "geneve", "vxlan"] {
         assert!(
             std::path::Path::new(&format!("/sys/module/{m}")).exists(),
             "kernel module {m} is not loaded (modprobe {m})"
@@ -810,9 +818,16 @@ async fn three_container_nodes_run_ovn() {
     Box::pin(ovn_section(&fleet)).await;
     Box::pin(routing_section(&fleet)).await;
     Box::pin(migration_section(&fleet)).await;
+    // 계획 67 스테이지 6
+    let hook = Hook::start();
+    Box::pin(security_group_section(&fleet)).await;
+    Box::pin(alerts_setup(&fleet, &hook)).await;
+    Box::pin(gateway_candidates_section(&fleet, &hook)).await;
+    Box::pin(lb_section(&fleet, &hook)).await;
+    Box::pin(vxlan_migration_section(&fleet)).await;
     Box::pin(lockdown_section(&fleet)).await;
     Box::pin(failover_section(&fleet)).await;
-    Box::pin(dead_node_section(&fleet)).await;
+    Box::pin(dead_node_section(&fleet, &hook)).await;
     Box::pin(removed_node_section(&fleet)).await;
 }
 
@@ -1165,6 +1180,37 @@ async fn removed_node_section(fleet: &Fleet) {
                 n.name
             );
         }
+    }
+    // 스테이지 4가 본 "database connection failed ()"(c1의 로컬 SB 소켓): ovn-sbctl 기본(leader-only)은 팔로어의 소켓 하나로는
+    // 붙지 못한다. 역할과 두 읽기를 남긴다.
+    for n in [c1, c3] {
+        let role = n.cluster_status("sb").role;
+        let socket = "--db=unix:/run/opl/ovn/sb.sock";
+        let leader_only = n.try_exec(&[
+            "ovn-sbctl",
+            socket,
+            "--bare",
+            "--columns=name",
+            "list",
+            "Chassis",
+        ]);
+        let any = n.try_exec(&[
+            "ovn-sbctl",
+            socket,
+            "--no-leader-only",
+            "--bare",
+            "--columns=name",
+            "list",
+            "Chassis",
+        ]);
+        eprintln!(
+            "PROBE {} SB role {role:?}: leader-only read ok={} ({}), --no-leader-only read ok={}",
+            n.name,
+            leader_only.0,
+            leader_only.2.trim(),
+            any.0
+        );
+        assert!(any.0, "{} SB local socket: {}", n.name, any.2);
     }
     wait_for("c2's chassis to leave the SB", AGENT_WAIT, || async {
         // 내쫓은 뒤 c1의 SB는 팔로어이거나 로컬 소켓이 답하지 않을 수 있다(탐침에서 본 "database connection failed",
@@ -1641,7 +1687,7 @@ async fn failover_section(fleet: &Fleet) {
 /// 6. 노드 통째 죽이기(`docker kill c2` — Orbivisor 투표 멤버·OVN 중앙·게이트웨이 주인이 함께): c3로 넘기고, 남은 둘로
 ///    Orbivisor Raft·OVN NB/SB가 쓰기를 이어 새 유동 IP가 닿는다. 그 뒤 `sdn central remove c2`가 살아 있는 중앙의 실제
 ///    `cluster/kick`으로 c2를 NB·SB에서 내쫓는다.
-async fn dead_node_section(fleet: &Fleet) {
+async fn dead_node_section(fleet: &Fleet, hook: &Hook) {
     let (c1, c2, c3) = (fleet.node("c1"), fleet.node("c2"), fleet.node("c3"));
     assert_eq!(hosting(c1).await, "c2");
     let (moved, reached) = failover(fleet, "docker kill c2", "c3", || {
@@ -1684,6 +1730,10 @@ async fn dead_node_section(fleet: &Fleet) {
         assert_eq!(leaders, 1, "{db}: no leader among c1 and c3");
     }
 
+    // 중앙 하나를 잃으면 `sdn_central_down`(계획 67 §11, 남은 둘의 리더가 평가)
+    hook.wait_alert("sdn-central-down", "firing", "c2", Duration::from_secs(150))
+        .await;
+
     // 죽은 중앙 내쫓기
     wait_for("c2 offline", AGENT_WAIT, || async {
         let view = c1.ctl_json(&["cluster", "status"]).await;
@@ -1724,4 +1774,785 @@ async fn dead_node_section(fleet: &Fleet) {
         !ext_ping("203.0.113.121")
     })
     .await;
+}
+
+// ---- 계획 67 스테이지 6: 여러 chassis 보안 그룹·부하 분산·QoS·옮기기 다리·SDN 경보 ----
+
+/// 붙어 한 줄을 받는 탐침(받은 줄, 또는 `refused`·`timeout`·`error …`)
+const HIT: &str = r#"
+import socket, sys
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=2)
+    s.settimeout(2); print(s.recv(200).decode().strip())
+except ConnectionRefusedError: print("refused")
+except socket.timeout: print("timeout")
+except OSError as e: print("error", e)
+"#;
+
+/// 붙은 손님에게 `이름 손님주소`를 보내는 서버
+const NAME_SERVER: &str = r#"
+import socket, sys
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[2]))); s.listen(64)
+while True:
+    c, peer = s.accept()
+    try: c.sendall(("%s %s\n" % (sys.argv[1], peer[0])).encode())
+    except OSError: pass
+    c.close()
+"#;
+
+/// 노드 `n`의 이름공간 `ns`에 이름 서버(`name`, 포트 `port`)를 띄운다(`docker exec -d` — [`stop_server`]가 끈다).
+fn start_server(n: &Node, ns: &str, name: &str, port: u16) {
+    n.exec(&[
+        "sh",
+        "-c",
+        &format!(
+            "nohup ip netns exec {ns} python3 -c '{NAME_SERVER}' {name} {port} >/dev/null 2>&1 &"
+        ),
+    ]);
+}
+
+fn stop_server(n: &Node, name: &str, port: u16) {
+    let _ = n.try_exec(&["pkill", "-f", &format!("{name} {port}$")]);
+}
+
+/// 노드 `n`의 이름공간 `ns`에서 `to:port`에 붙어 받은 줄
+fn hit_from(n: &Node, ns: &str, to: &str, port: u16) -> String {
+    let p = port.to_string();
+    let (_, out, _) = n.try_exec(&["ip", "netns", "exec", ns, "python3", "-c", HIT, to, &p]);
+    out.trim().to_string()
+}
+
+/// 호스트 이름공간 `ext`(물리 망)에서 `to:port`에 붙어 받은 줄
+fn ext_hit(to: &str, port: u16) -> String {
+    let p = port.to_string();
+    let (_, out, _) = try_run(
+        "ip",
+        &["netns", "exec", EXT_NS, "python3", "-c", HIT, to, &p],
+    );
+    out.trim().to_string()
+}
+
+/// 경보를 받는 webhook(호스트의 작은 HTTP 서버, 도커 망 게이트웨이 172.30.66.1에서 컨테이너가 닿는다). 받은 JSON 본문을
+/// 모은다.
+struct Hook {
+    port: u16,
+    seen: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Hook {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let s = s.clone();
+                std::thread::spawn(move || hook_request(stream, &s));
+            }
+        });
+        Self { port, seen }
+    }
+
+    fn url(&self) -> String {
+        format!("http://172.30.66.1:{}/alerts", self.port)
+    }
+
+    /// `pred`에 맞는 알림이 올 때까지 기다린다(이미 온 것도 본다). 그 알림과 걸린 시간
+    async fn wait(
+        &self,
+        what: &str,
+        limit: Duration,
+        pred: impl Fn(&Value) -> bool,
+    ) -> (Value, Duration) {
+        let started = Instant::now();
+        loop {
+            if let Some(v) = self.seen.lock().unwrap().iter().find(|v| pred(v)) {
+                return (v.clone(), started.elapsed());
+            }
+            if started.elapsed() > limit {
+                let all = self.seen.lock().unwrap().clone();
+                panic!("no {what} notification in {limit:?}; got {all:#?}");
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// 규칙 `rule`의 `state`(firing·resolved·event) 알림 가운데 대상 이름이 `subject`인 것
+    async fn wait_alert(
+        &self,
+        rule: &str,
+        state: &str,
+        subject: &str,
+        limit: Duration,
+    ) -> (Value, Duration) {
+        let what = format!("{rule} {state} on {subject}");
+        let (v, took) = self
+            .wait(&what, limit, |v| {
+                v["rule"] == rule && v["state"] == state && v["subject"]["name"] == subject
+            })
+            .await;
+        eprintln!("PROBE alert {what} after {took:?}: {}", v["detail"]);
+        (v, took)
+    }
+}
+
+/// webhook 요청 하나: 머리와 `Content-Length`만큼의 본문을 읽고 200으로 답한다.
+fn hook_request(stream: std::net::TcpStream, seen: &Mutex<Vec<Value>>) {
+    use std::io::{BufRead, Read, Write};
+    let mut reader = std::io::BufReader::new(match stream.try_clone() {
+        Ok(s) => s,
+        Err(_) => return,
+    });
+    let mut length = 0usize;
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 {
+            return;
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((k, v)) = line.split_once(':')
+            && k.eq_ignore_ascii_case("content-length")
+        {
+            length = v.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0; length];
+    if reader.read_exact(&mut body).is_err() {
+        return;
+    }
+    if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+        seen.lock().unwrap().push(v);
+    }
+    let mut stream = stream;
+    let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
+
+/// 6a. 여러 chassis에 걸친 보안 그룹(계획 66 §14 10번): c1의 vma → c3의 vmb(ns-b)에 그룹을 걸면 c3 쪽 `to-lport` ACL이
+///     c1에서 온 Geneve 트래픽을 그룹대로 거른다(tcp 22만 허용 → ping 막힘, icmp 허용을 더하면 됨). 물리 망 `ext`에서
+///     유동 IP(중앙 — c2 게이트웨이)로 들어오는 것도 그룹대로다.
+async fn security_group_section(fleet: &Fleet) {
+    let (c1, c3) = (fleet.node("c1"), fleet.node("c3"));
+    let b_ip = ns_ipv4(c3, "vmb", "oplnsb");
+    start_server(c3, "vmb", "sg-b", 22);
+    assert!(c1.ping("vma", &b_ip));
+    c1.ctl_ok(&[
+        "security-group",
+        "create",
+        "sg-ssh",
+        "--rule",
+        "in accept tcp 22",
+    ])
+    .await;
+    c1.ctl_ok(&[
+        "security-group",
+        "create",
+        "sg-icmp",
+        "--rule",
+        "in accept icmp",
+    ])
+    .await;
+    let started = Instant::now();
+    c1.ctl_ok(&["vm", "nic-sg", "ns-b", "0", "sg-ssh"]).await;
+    wait_for("ping c1 -> c3 blocked by sg-ssh", AGENT_WAIT, || async {
+        !c1.ping("vma", &b_ip)
+    })
+    .await;
+    eprintln!(
+        "PROBE cross-chassis security group: ping blocked {:?} after nic-sg",
+        started.elapsed()
+    );
+    let ssh = hit_from(c1, "vma", &b_ip, 22);
+    assert!(ssh.starts_with("sg-b "), "tcp 22 across chassis: {ssh}");
+    c1.ctl_ok(&["vm", "nic-sg", "ns-b", "0", "sg-ssh", "sg-icmp"])
+        .await;
+    wait_for("ping c1 -> c3 allowed by sg-icmp", AGENT_WAIT, || async {
+        c1.ping("vma", &b_ip)
+    })
+    .await;
+    // 바깥에서 유동 IP로: icmp 허용이면 닿고, 빼면 막히고 tcp 22는 된다.
+    c1.ctl_ok(&[
+        "fip",
+        "create",
+        "--network",
+        "ext",
+        "--ip",
+        "203.0.113.122",
+        "--name",
+        "fb",
+        "--attach",
+        "ns-b",
+    ])
+    .await;
+    wait_for("ext -> fb ping", AGENT_WAIT, || async {
+        ext_ping("203.0.113.122")
+    })
+    .await;
+    c1.ctl_ok(&["vm", "nic-sg", "ns-b", "0", "sg-ssh"]).await;
+    wait_for("ext -> fb ping blocked", AGENT_WAIT, || async {
+        !ext_ping("203.0.113.122")
+    })
+    .await;
+    let ssh = ext_hit("203.0.113.122", 22);
+    assert!(
+        ssh.starts_with("sg-b 203.0.113.1"),
+        "ext -> fb tcp 22: {ssh}"
+    );
+    // 치우기(뒤 절이 vmb에 ping한다)
+    c1.ctl_ok(&["vm", "nic-sg", "ns-b", "0"]).await;
+    c1.ctl_ok(&["fip", "delete", "fb"]).await;
+    for g in ["sg-ssh", "sg-icmp"] {
+        c1.ctl_ok(&["security-group", "delete", g]).await;
+    }
+    stop_server(c3, "sg-b", 22);
+    wait_for("ping c1 -> c3 without groups", AGENT_WAIT, || async {
+        c1.ping("vma", &b_ip)
+    })
+    .await;
+}
+
+/// 6b. SDN 경보(계획 67 §11): 호스트 webhook을 알림 대상으로, "SDN 경보 켜기"(`alert rule add-sdn-defaults`)로 권하는 여덟
+///     규칙을 만들고 시험이 기다리지 않게 지속 시간을 5초로 줄인다.
+async fn alerts_setup(fleet: &Fleet, hook: &Hook) {
+    let c1 = fleet.node("c1");
+    c1.ctl_ok(&[
+        "notify",
+        "target",
+        "create",
+        "hook",
+        "webhook",
+        "--url",
+        &hook.url(),
+    ])
+    .await;
+    let said = c1
+        .ctl_ok(&["alert", "rule", "add-sdn-defaults", "--target", "hook"])
+        .await;
+    eprintln!("{said}");
+    assert_eq!(said.matches(" created").count(), 8, "{said}");
+    for rule in [
+        "sdn-central-down",
+        "sdn-chassis-down",
+        "sdn-gateway-unavailable",
+        "sdn-lb-member-down",
+    ] {
+        c1.ctl_ok(&["alert", "rule", "set", rule, "--for", "5"])
+            .await;
+    }
+    println!("{}", c1.ctl_ok(&["alert", "rule", "list"]).await);
+}
+
+/// 6c. 게이트웨이 후보를 모두 빼면(`node sdn --no-gateway`) 라우터 r1에 `sdn_gateway_unavailable`이 뜨고, 되돌리면 c2가 다시
+///     주인이 되고 해제가 온다.
+async fn gateway_candidates_section(fleet: &Fleet, hook: &Hook) {
+    let c1 = fleet.node("c1");
+    for n in ["c2", "c3"] {
+        c1.ctl_ok(&["node", "sdn", n, "--no-gateway"]).await;
+    }
+    let (v, _) = hook
+        .wait_alert("sdn-gateway-unavailable", "firing", "r1", AGENT_WAIT)
+        .await;
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no gateway node has physnet ext ready"),
+        "{v}"
+    );
+    c1.ctl_ok(&["node", "sdn", "c2", "--gateway", "200"]).await;
+    c1.ctl_ok(&["node", "sdn", "c3", "--gateway", "100"]).await;
+    wait_for("r1 hosted on c2 again", AGENT_WAIT, || async {
+        hosting(c1).await == "c2"
+    })
+    .await;
+    // 해제는 거짓인 채 60초 뒤
+    hook.wait_alert(
+        "sdn-gateway-unavailable",
+        "resolved",
+        "r1",
+        Duration::from_secs(180),
+    )
+    .await;
+    wait_for("SNAT after the gateways are back", AGENT_WAIT, || async {
+        c1.ping("vma", EXT_IP)
+    })
+    .await;
+}
+
+/// 6d. 여러 chassis 부하 분산(§14 2): 멤버 vma(c1)·vmb(c3), 손님 vmc(c2)와 물리 망 `ext`(바깥 VIP — 게이트웨이 c2). 멤버
+///     듣기를 멈추면 `sdn_lb_member_down`. 게이트웨이를 넘기면(c2의 ovn-controller 멈춤) 바깥 VIP가 다시 닿는 시간(§7.4 GARP
+///     탐침 — `ext`의 ARP 캐시를 비우지 않음)과 `sdn_gateway_failover`·`sdn_chassis_down`. 끝에 NIC QoS를 Geneve 너머에서
+///     잰다(§14 3).
+async fn lb_section(fleet: &Fleet, hook: &Hook) {
+    let (c1, c2, c3) = (fleet.node("c1"), fleet.node("c2"), fleet.node("c3"));
+    let client = api_vm(c1, "ns-c", "t2").await;
+    namespace_vm(c2, "vmc", "oplnsc", &client, "10.61.2.1");
+    start_server(c1, "vma", "lb-a", 8080);
+    start_server(c3, "vmb", "lb-b", 8080);
+    c1.ctl_ok(&[
+        "lb",
+        "create",
+        "web",
+        "--network",
+        "t1",
+        "--vip",
+        "10.61.1.50",
+        "--external",
+        "ext,ip=203.0.113.130",
+        "--listener",
+        "tcp/80",
+    ])
+    .await;
+    for m in ["ns-a@8080", "ns-b@8080"] {
+        c1.ctl_ok(&["lb", "member", "add", "web", "tcp/80", m])
+            .await;
+    }
+    c1.ctl_ok(&[
+        "lb",
+        "health",
+        "set",
+        "web",
+        "tcp/80",
+        "--interval",
+        "2",
+        "--timeout",
+        "1",
+        "--rise",
+        "1",
+        "--fall",
+        "2",
+    ])
+    .await;
+    wait_for("both members online", AGENT_WAIT, || async {
+        let lb = c1.ctl_json(&["lb", "get", "web"]).await;
+        lb["members"]
+            .as_array()
+            .is_some_and(|m| m.len() == 2 && m.iter().all(|m| m["health"] == "online"))
+    })
+    .await;
+    let spread = |n: &Node, ns: &str, to: &str, times: usize| {
+        let mut m = std::collections::BTreeMap::<String, usize>::new();
+        for _ in 0..times {
+            let got = hit_from(n, ns, to, 80);
+            *m.entry(got.split(' ').next().unwrap_or_default().to_string())
+                .or_default() += 1;
+        }
+        m
+    };
+    wait_for("the VIP from c2", AGENT_WAIT, || async {
+        hit_from(c2, "vmc", "10.61.1.50", 80).starts_with("lb-")
+    })
+    .await;
+    let seen = spread(c2, "vmc", "10.61.1.50", 20);
+    eprintln!("PROBE multi-chassis LB spread from c2: {seen:?}");
+    assert!(
+        seen.contains_key("lb-a") && seen.contains_key("lb-b"),
+        "{seen:?}"
+    );
+    wait_for("the external VIP", AGENT_WAIT, || async {
+        ext_hit("203.0.113.130", 80).starts_with("lb-")
+    })
+    .await;
+    let outside = ext_hit("203.0.113.130", 80);
+    assert!(outside.ends_with(" 203.0.113.1"), "{outside}");
+
+    // 멤버 죽음: c3의 듣기를 멈춤 → 새 연결은 c1만, 경보
+    stop_server(c3, "lb-b", 8080);
+    let t0 = Instant::now();
+    wait_for("only lb-a answers", AGENT_WAIT, || async {
+        spread(c2, "vmc", "10.61.1.50", 6)
+            .keys()
+            .collect::<Vec<_>>()
+            == ["lb-a"]
+    })
+    .await;
+    eprintln!("PROBE LB member on c3 taken out after {:?}", t0.elapsed());
+    let (v, _) = hook
+        .wait_alert("sdn-lb-member-down", "firing", "web", AGENT_WAIT)
+        .await;
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ns-b:8080"),
+        "{v}"
+    );
+    start_server(c3, "vmb", "lb-b", 8080);
+    wait_for("both members answer again", AGENT_WAIT, || async {
+        spread(c2, "vmc", "10.61.1.50", 10).len() == 2
+    })
+    .await;
+
+    // 게이트웨이 넘김 뒤 바깥 VIP(§7.4): `ext`의 이웃 표는 그대로 두고 다시 닿는 시간과 c3 veth의 VIP GARP를 잰다.
+    assert_eq!(hosting(c1).await, "c2");
+    assert!(ext_hit("203.0.113.130", 80).starts_with("lb-"));
+    eprintln!(
+        "ext neighbor of the VIP before: {}",
+        ext_neigh("203.0.113.130")
+    );
+    let mut cap = Capture::start_for(&[], "oplv3", "arp and host 203.0.113.130", "45");
+    cap.wait_listening();
+    let t0 = Instant::now();
+    c2.exec(&["systemctl", "stop", "ovn-controller"]);
+    // 옛 게이트웨이의 흐름이 잠깐 남아 답할 수 있으므로 주인이 c3로 바뀐 뒤부터 잰다.
+    wait_for("r1 hosted on c3", AGENT_WAIT, || async {
+        hosting(c1).await == "c3"
+    })
+    .await;
+    let moved = t0.elapsed();
+    let mut reached = None;
+    while t0.elapsed() < FAILOVER_LIMIT {
+        if ext_hit("203.0.113.130", 80).starts_with("lb-") {
+            reached = Some(t0.elapsed());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let garp = cap.count();
+    let reached = reached.expect("the external VIP did not come back after the gateway failover");
+    eprintln!(
+        "PROBE external VIP after the gateway failover: hosting c3 after {moved:?}, reachable again after \
+         {reached:?} (ext ARP cache kept); ARP packets for the VIP on c3's veth: {garp}; ext neighbor {}",
+        ext_neigh("203.0.113.130")
+    );
+    for _ in 0..5 {
+        assert!(ext_hit("203.0.113.130", 80).starts_with("lb-"));
+    }
+    let (v, _) = hook
+        .wait_alert("sdn-gateway-failover", "event", "r1", AGENT_WAIT)
+        .await;
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("from c2 to c3"),
+        "{v}"
+    );
+    hook.wait_alert("sdn-chassis-down", "firing", "c2", AGENT_WAIT)
+        .await;
+    c2.exec(&["systemctl", "start", "ovn-controller"]);
+    wait_for("r1 back on c2", AGENT_WAIT, || async {
+        hosting(c1).await == "c2"
+    })
+    .await;
+    wait_for(
+        "the external VIP after the failback",
+        AGENT_WAIT,
+        || async { ext_hit("203.0.113.130", 80).starts_with("lb-") },
+    )
+    .await;
+
+    // QoS(§14 3): c1의 vma가 보내는 속도를 50 Mbit/s로 — c3의 vmb가 받는 속도(Geneve 너머)
+    let b_ip = ns_ipv4(c3, "vmb", "oplnsb");
+    c3.exec(&["ip", "netns", "exec", "vmb", "iperf3", "-s", "-D"]);
+    c1.ctl_ok(&["vm", "nic-qos", "ns-a", "0", "out=50"]).await;
+    let mut measured = 0.0;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        measured = iperf_from(c1, "vma", &b_ip);
+        if (measured - 50.0).abs() <= 50.0 * 0.15 {
+            break;
+        }
+    }
+    eprintln!("PROBE QoS out_mbps=50 c1 -> c3 across Geneve: {measured:.1} Mbit/s");
+    assert!((measured - 50.0).abs() <= 50.0 * 0.15, "{measured}");
+    c1.ctl_ok(&["vm", "nic-qos", "ns-a", "0", "--clear"]).await;
+    let _ = c3.try_exec(&["pkill", "-x", "iperf3"]);
+
+    // 치우기
+    c1.ctl_ok(&["lb", "delete", "web"]).await;
+    stop_server(c1, "lb-a", 8080);
+    stop_server(c3, "lb-b", 8080);
+}
+
+/// iperf3 클라이언트(노드 `n`의 이름공간 `ns` → `to`) — 받은 쪽 Mbit/s. 폴리싱 버스트를 빼려고 앞 3초를 뺀다.
+fn iperf_from(n: &Node, ns: &str, to: &str) -> f64 {
+    let (ok, out, err) = n.try_exec(&[
+        "ip", "netns", "exec", ns, "iperf3", "-c", to, "-t", "6", "-O", "3", "-J",
+    ]);
+    if !ok {
+        eprintln!("iperf3 {ns} -> {to}: {err}{out}");
+        return 0.0;
+    }
+    serde_json::from_str::<Value>(&out).unwrap_or(Value::Null)["end"]["sum_received"]
+        ["bits_per_second"]
+        .as_f64()
+        .unwrap_or(0.0)
+        / 1e6
+}
+
+/// 노드 `n`의 이름공간 `ns`(없으면 만듦)를 Linux 브리지 `bridge`의 veth 한쪽(`dev`, MAC·주소)으로 둔다.
+fn bridge_ns(n: &Node, ns: &str, dev: &str, bridge: &str, mac: &str, ip: &str) {
+    let _ = n.try_exec(&["ip", "netns", "add", ns]);
+    let _ = n.try_exec(&["ip", "netns", "exec", ns, "ip", "link", "del", dev]);
+    let peer = format!("{dev}p");
+    n.exec(&[
+        "ip", "link", "add", dev, "type", "veth", "peer", "name", &peer,
+    ]);
+    n.exec(&["ip", "link", "set", &peer, "master", bridge, "up"]);
+    n.exec(&["ip", "link", "set", dev, "netns", ns]);
+    let in_ns = |args: &[&str]| {
+        let mut all = vec!["ip", "netns", "exec", ns, "ip"];
+        all.extend_from_slice(args);
+        n.exec(&all);
+    };
+    in_ns(&["link", "set", dev, "address", mac]);
+    in_ns(&["addr", "add", &format!("{ip}/24"), "dev", dev]);
+    in_ns(&["link", "set", "lo", "up"]);
+    in_ns(&["link", "set", dev, "up"]);
+}
+
+/// 노드 `n`의 이름공간 `ns`의 장치를 OVS 내부 포트(`dev`, 논리 포트 `port`)로 바꾼다 — "옮긴 뒤 다시 켠" VM.
+fn ovs_ns(n: &Node, ns: &str, dev: &str, port: &str, mac: &str, ip: &str) {
+    let _ = n.try_exec(&["ip", "netns", "exec", ns, "ip", "link", "del", dev]);
+    n.exec(&[
+        "ovs-vsctl",
+        "--may-exist",
+        "add-port",
+        "br-int",
+        dev,
+        "--",
+        "set",
+        "Interface",
+        dev,
+        "type=internal",
+        &format!("external_ids:iface-id={port}"),
+    ]);
+    n.exec(&["ip", "link", "set", dev, "netns", ns]);
+    let in_ns = |args: &[&str]| {
+        let mut all = vec!["ip", "netns", "exec", ns, "ip"];
+        all.extend_from_slice(args);
+        n.exec(&all);
+    };
+    in_ns(&["link", "set", dev, "address", mac]);
+    in_ns(&["link", "set", dev, "mtu", "1442"]);
+    in_ns(&["addr", "add", &format!("{ip}/24"), "dev", dev]);
+    in_ns(&["link", "set", dev, "up"]);
+}
+
+/// 노드 `n`에서 OVS 포트를 지우고 이름공간 장치를 다시 Linux 브리지 veth로(되돌린 VM)
+fn back_to_bridge(n: &Node, ns: &str, dev: &str, bridge: &str, mac: &str, ip: &str) {
+    let _ = n.try_exec(&["ovs-vsctl", "--if-exists", "del-port", dev]);
+    bridge_ns(n, ns, dev, bridge, mac, ip);
+}
+
+/// 노드 `n`의 Linux 브리지 `bridge`에 매달린 옮기기 다리 veth(`oplp…`) 이름(없으면 빈 글)
+fn bridge_veth(n: &Node, bridge: &str) -> String {
+    let (_, out, _) = n.try_exec(&["ip", "-j", "link", "show", "master", bridge]);
+    serde_json::from_str::<Value>(&out)
+        .unwrap_or(Value::Null)
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l["ifname"].as_str())
+        .find(|name| name.starts_with("oplp"))
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// tap이 붙은 곳(Linux 브리지 이름 또는 `br-int`)
+fn tap_home(n: &Node, tap: &str) -> String {
+    let (ok, out, _) = n.try_exec(&["ovs-vsctl", "port-to-br", tap]);
+    if ok {
+        return out.trim().to_string();
+    }
+    let (_, out, _) = n.try_exec(&["ip", "-j", "link", "show", "dev", tap]);
+    serde_json::from_str::<Value>(&out).unwrap_or(Value::Null)[0]["master"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 6e. VXLAN 원본의 옮기기(§14 4): VXLAN 단순 네트워크 `lanx`(c1·c2·c3의 `oplv4242`)의 c1 QEMU VM을 `live`로, c1 이름공간
+///     VM을 `offline`으로 SDN `t-lanx`에 옮기면 다리 노드가 c1(옮길 VM이 가장 많음)이고, 옮긴 이름공간이 c3의 남은
+///     이름공간에 닿는다(c1의 다리 veth를 지남). 모두 되돌린 뒤 `--bridge-node c2`로 다시 옮기면 다리가 c2에 놓이고 같은
+///     ping이 c2의 veth를 지난다. 끝내기로 다리가 걷힌다.
+async fn vxlan_migration_section(fleet: &Fleet) {
+    let (c1, c2, c3) = (fleet.node("c1"), fleet.node("c2"), fleet.node("c3"));
+    c1.ctl_ok(&["network", "create", "lanx", "--vxlan", "4242"])
+        .await;
+    c1.ctl_ok(&[
+        "network",
+        "create",
+        "t-lanx",
+        "--sdn",
+        "--subnet",
+        "10.66.5.0/24",
+    ])
+    .await;
+    for n in &fleet.nodes {
+        wait_for(&format!("oplv4242 on {}", n.name), AGENT_WAIT, || async {
+            let me = c1.ctl_json(&["node", "get", n.name]).await;
+            me["status"]["bridges"]
+                .as_array()
+                .is_some_and(|b| b.iter().any(|b| b["name"] == "oplv4242"))
+        })
+        .await;
+    }
+    let mut made = Vec::new();
+    for name in ["mig-a", "mig-b"] {
+        c1.ctl_ok(&["vm", "create", name, "--memory", "128", "--nic", "lanx"])
+            .await;
+        let vm = c1.ctl_json(&["vm", "get", name]).await;
+        let id: uuid::Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+        let mac = vm["spec"]["nics"][0]["mac"].as_str().unwrap().to_string();
+        made.push((id, mac));
+    }
+    let (a_id, a_mac) = made[0].clone();
+    let (_, b_mac) = made[1].clone();
+    let a_port = opl_types::sdn::port_name(a_id, a_mac.parse().unwrap());
+    bridge_ns(c1, "mxa", "mxa0", "oplv4242", &a_mac, "10.66.5.11");
+    bridge_ns(c3, "mxb", "mxb0", "oplv4242", &b_mac, "10.66.5.12");
+    wait_for("the VXLAN source L2 c1 -> c3", AGENT_WAIT, || async {
+        c1.ping("mxa", "10.66.5.12")
+    })
+    .await;
+    c1.ctl_ok(&[
+        "vm", "create", "mig-q", "--memory", "256", "--nic", "lanx", "--node", "c1", "--start",
+    ])
+    .await;
+    let q = c1.ctl_json(&["vm", "get", "mig-q"]).await;
+    let q_tap = opl_types::network::tap_name(q["id"].as_str().unwrap().parse().unwrap(), 0);
+    let pid = q["status"]["pid"].as_u64();
+    assert_eq!(tap_home(c1, &q_tap), "oplv4242");
+
+    let migrate = |name: &'static str, bridge: Option<&'static str>| {
+        let mut args = vec![
+            "network",
+            "migrate",
+            "lanx",
+            "--to",
+            "t-lanx",
+            "--name",
+            name,
+            "--vm",
+            "mig-q",
+            "--vm",
+            "mig-a",
+            "--allow-mtu-shrink",
+            "--ip",
+            "mig-q=10.66.5.10",
+            "--ip",
+            "mig-a=10.66.5.11",
+        ];
+        if let Some(b) = bridge {
+            args.extend(["--bridge-node", b]);
+        }
+        args
+    };
+    // 미리 보기: 다리 노드 c1, QEMU VM live
+    let mut dry = vec!["-o", "json"];
+    dry.extend(migrate("mx", None));
+    dry.push("--dry-run");
+    let plan: Value = serde_json::from_str(&c1.ctl_ok(&dry).await).unwrap();
+    eprintln!("VXLAN migration plan: {plan}");
+    assert_eq!(plan["bridge"]["needed"], true, "{plan}");
+    assert_eq!(plan["bridge"]["node"], c1.id.as_str(), "{plan}");
+
+    for (round, (name, bridge_node, via)) in [("mx", None, c1), ("mx2", Some("c2"), c2)]
+        .into_iter()
+        .enumerate()
+    {
+        let started = Instant::now();
+        let said = c1.ctl_ok(&migrate(name, bridge_node)).await;
+        eprintln!("network migrate {name} ({:?}): {said}", started.elapsed());
+        let mig = c1.ctl_json(&["network", "migration", "get", name]).await;
+        assert_eq!(mig["status"]["phase"], "moved", "{mig}");
+        assert_eq!(mig["status"]["bridge"]["node"], via.id.as_str(), "{mig}");
+        // QEMU VM: tap만 br-int로, 같은 QEMU
+        assert_eq!(tap_home(c1, &q_tap), "br-int");
+        let q = c1.ctl_json(&["vm", "get", "mig-q"]).await;
+        assert_eq!(q["status"]["pid"].as_u64(), pid, "{q}");
+        // 다리 veth가 다리 노드의 oplv4242에
+        wait_for(
+            &format!("the bridge veth on {}", via.name),
+            AGENT_WAIT,
+            || async { !bridge_veth(via, "oplv4242").is_empty() },
+        )
+        .await;
+        let veth = bridge_veth(via, "oplv4242");
+        // "다시 켠" mig-a: OVS 포트로. 다리 너머 c3의 남은 이름공간에 닿는다.
+        ovs_ns(c1, "mxa", "mxa0", &a_port, &a_mac, "10.66.5.11");
+        let t0 = Instant::now();
+        wait_for(
+            "moved (c1) -> remaining (c3) across the bridge",
+            AGENT_WAIT,
+            || async { c1.ping("mxa", "10.66.5.12") },
+        )
+        .await;
+        eprintln!(
+            "PROBE VXLAN migration bridge on {} (round {}): moved -> remaining ping after {:?}",
+            via.name,
+            round + 1,
+            t0.elapsed()
+        );
+        assert!(c3.ping("mxb", "10.66.5.11"), "remaining -> moved");
+        let counts = captured_until(
+            &[(via.prefix(), veth.as_str())],
+            "icmp and host 10.66.5.12",
+            || {
+                c1.try_exec(&[
+                    "ip",
+                    "netns",
+                    "exec",
+                    "mxa",
+                    "ping",
+                    "-c",
+                    "5",
+                    "-i",
+                    "0.3",
+                    "10.66.5.12",
+                ]);
+            },
+            &[],
+            |c| c[0] > 0,
+        );
+        assert!(
+            counts[0] > 0,
+            "the ping did not cross {}'s bridge veth",
+            via.name
+        );
+        if round == 0 {
+            // 모두 되돌린다(tap이 oplv4242로, mig-a 스펙도). 다리가 걷힌다.
+            let said = c1.ctl_ok(&["network", "migration", "rollback", name]).await;
+            eprintln!("rollback {name}: {said}");
+            let mig = c1.ctl_json(&["network", "migration", "get", name]).await;
+            assert_eq!(mig["status"]["phase"], "rolled-back", "{mig}");
+            assert_eq!(tap_home(c1, &q_tap), "oplv4242");
+            back_to_bridge(c1, "mxa", "mxa0", "oplv4242", &a_mac, "10.66.5.11");
+            wait_for("the c1 bridge veth to go", AGENT_WAIT, || async {
+                bridge_veth(c1, "oplv4242").is_empty()
+            })
+            .await;
+            wait_for("the VXLAN source L2 again", AGENT_WAIT, || async {
+                c1.ping("mxa", "10.66.5.12")
+            })
+            .await;
+        } else {
+            c1.ctl_ok(&["network", "migration", "finish", name]).await;
+            let mig = c1.ctl_json(&["network", "migration", "get", name]).await;
+            assert_eq!(mig["status"]["phase"], "finished", "{mig}");
+            wait_for("the c2 bridge veth to go", AGENT_WAIT, || async {
+                bridge_veth(c2, "oplv4242").is_empty()
+            })
+            .await;
+            wait_for("no path across the removed bridge", AGENT_WAIT, || async {
+                !c1.ping("mxa", "10.66.5.12")
+            })
+            .await;
+        }
+    }
+    // 치우기(뒤 절의 노드 죽이기와 상관없게)
+    c1.ctl_ok(&["vm", "stop", "mig-q", "--force"]).await;
+    for vm in ["mig-q", "mig-a", "mig-b"] {
+        c1.ctl_ok(&["vm", "delete", vm]).await;
+    }
+    let _ = c1.try_exec(&["ovs-vsctl", "--if-exists", "del-port", "mxa0"]);
+    let _ = c1.try_exec(&["ip", "netns", "del", "mxa"]);
+    let _ = c3.try_exec(&["ip", "netns", "del", "mxb"]);
+    let _ = c3.try_exec(&["ip", "link", "del", "mxb0p"]);
 }

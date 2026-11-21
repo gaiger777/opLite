@@ -18,6 +18,9 @@
 //!    `sdn-services`를 알면 하지 않는다(계획 67 §10.2 — 잠금의 SB 역할 포트는 남의 chassis 행 지우기를 거절하므로 중앙
 //!    노드의 SDN 에이전트가 로컬 소켓으로 한다). 옛 노드가 섞인 동안은 둘 다 하지만 같은 이름 조건이라 겹쳐도 해가 없다.
 //! 5. `SdnStatus.sync`를 바뀔 때만(성공이 이어지면 60초에 한 번) 쓴다.
+//!
+//! 차례 뒤와 10초마다 SDN 경보의 관찰(계획 67 §11 — 게이트웨이 주인, SB `Service_Monitor`)을 읽어 메모리
+//! ([`Observations`])에 둔다. 리더 경보 엔진이 같은 프로세스에서 읽는다.
 
 pub mod acl;
 pub mod lb;
@@ -35,6 +38,7 @@ use opl_cluster::Cluster;
 use opl_cluster::watch::{Watch, WatchEvent};
 use opl_driver::ovn::ovsdb::{cond, parse_uuids};
 use opl_driver::ovn::{Endpoint, NB_DB, OvsdbClient, OvsdbError, OvsdbTls, SB_DB, Transport};
+use opl_types::alert::sdn::{MonitorObservation, SdnObservations};
 use opl_types::floating_ip::FloatingIpSpec;
 use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::network::NetworkSpec;
@@ -60,6 +64,25 @@ const SYNC_AT_REFRESH: u64 = 60;
 const LEADER_POLL: Duration = Duration::from_secs(1);
 /// 구독이 끊겼을 때 다시 구독하기 전 기다림
 const RESUBSCRIBE: Duration = Duration::from_secs(1);
+/// SDN 경보의 관찰(게이트웨이 주인·건강 검사)을 다시 읽는 간격(계획 67 §11)
+const OBSERVE_EVERY: Duration = Duration::from_secs(10);
+
+/// 리더 OvnSync가 읽은 SDN 관찰(계획 67 §11 `SdnObservations`). 같은 프로세스의 경보 엔진이 읽는다(Raft에 쓰지 않음).
+/// OvnSync 설정을 복제한 모든 곳(API 상태·OvnSync)이 같은 칸을 나눈다.
+#[derive(Debug, Clone, Default)]
+pub struct Observations(Arc<std::sync::Mutex<Option<SdnObservations>>>);
+
+impl Observations {
+    /// 마지막 관찰
+    pub fn get(&self) -> Option<SdnObservations> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 관찰을 둔다(시험도 쓴다).
+    pub fn set(&self, o: SdnObservations) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(o);
+    }
+}
 
 /// OVN에 붙는 방법
 #[derive(Debug, Clone)]
@@ -84,6 +107,10 @@ pub struct OvnSyncConfig {
     pub debounce: Duration,
     /// OVSDB 연결·요청의 시간 제한
     pub timeout: Duration,
+    /// 리더가 읽은 SDN 관찰(경보 엔진과 나눔)
+    pub observations: Observations,
+    /// 관찰을 다시 읽는 간격
+    pub observe_every: Duration,
 }
 
 impl OvnSyncConfig {
@@ -96,6 +123,8 @@ impl OvnSyncConfig {
             resync: Duration::from_secs(60),
             debounce: Duration::from_millis(500),
             timeout: opl_driver::ovn::ovsdb::DEFAULT_TIMEOUT,
+            observations: Observations::default(),
+            observe_every: OBSERVE_EVERY,
         }
     }
 }
@@ -313,6 +342,48 @@ impl OvnSyncer {
                 tracing::warn!(error = %e, "cannot sync the OVN northbound DB");
                 SyncOutcome::Failed(e.to_string())
             }
+        }
+    }
+
+    /// SDN 경보의 관찰(계획 67 §11): 리더이고 SDN이 준비됐으면 NB의 게이트웨이 주인(DGP `hosting-chassis`)과 SB
+    /// `Service_Monitor`를 읽어 [`OvnSyncConfig::observations`]에 둔다. 읽지 못하면 앞 관찰을 그대로 둔다(낡으면 경보
+    /// 엔진이 모르는 것으로 본다). 읽기만 하므로 팔로어도 쓴다.
+    pub async fn observe(&mut self) {
+        let Some(term) = self.cluster.leader_term() else {
+            return;
+        };
+        let sdn = match self.cluster.get_by_name::<SdnSpec>(SDN_NAME) {
+            Ok(Some(s)) if s.status.phase == SdnPhase::Ready && !s.status.centrals.is_empty() => s,
+            _ => return,
+        };
+        let Ok((_, nodes)) = self.cluster.list::<NodeSpec>() else {
+            return;
+        };
+        let centrals = central_hosts(&sdn, &nodes);
+        let read = async {
+            let hosting = Box::pin(read_hosting(&self.config, &centrals, None)).await?;
+            let monitors = Box::pin(read_monitors(&self.config, &centrals)).await?;
+            Ok::<_, OvsdbError>((hosting, monitors))
+        };
+        match read.await {
+            Ok((hosting, monitors)) if self.cluster.leader_term() == Some(term) => {
+                self.config.observations.set(SdnObservations {
+                    term,
+                    at: now_ms(),
+                    hosting,
+                    monitors: monitors
+                        .into_iter()
+                        .map(|m| MonitorObservation {
+                            logical_port: m.logical_port,
+                            port: m.port,
+                            protocol: m.protocol,
+                            status: m.status,
+                        })
+                        .collect(),
+                });
+            }
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "cannot read the OVN state for SDN alerts"),
         }
     }
 
@@ -634,7 +705,7 @@ impl OvnSync {
 }
 
 async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot::Receiver<()>) {
-    let (resync, debounce) = (config.resync, config.debounce);
+    let (resync, debounce, observe_every) = (config.resync, config.debounce, config.observe_every);
     let mut syncer = OvnSyncer::new(cluster.clone(), config);
     let mut watch: Option<Watch> = None;
     loop {
@@ -650,17 +721,32 @@ async fn run(cluster: Arc<Cluster>, config: OvnSyncConfig, mut shutdown: oneshot
             // 선거 중에는 오래 걸릴 수 있으므로 종료 요청과 겨룬다.
             tokio::select! {
                 _ = &mut shutdown => return,
-                _ = Box::pin(syncer.sync()) => {}
+                _ = Box::pin(async {
+                    syncer.sync().await;
+                    syncer.observe().await;
+                }) => {}
             }
         } else {
             syncer.disconnect();
         }
         let deadline = tokio::time::sleep(resync);
         tokio::pin!(deadline);
+        let mut observe =
+            tokio::time::interval_at(tokio::time::Instant::now() + observe_every, observe_every);
+        observe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = &mut shutdown => return,
                 () = &mut deadline => break,
+                _ = observe.tick() => {
+                    // 게이트웨이 넘김·건강 검사는 Raft 변경 없이 OVN에서 일어나므로 따로 읽는다.
+                    if cluster.leader_term().is_some() {
+                        tokio::select! {
+                            _ = &mut shutdown => return,
+                            () = Box::pin(syncer.observe()) => {}
+                        }
+                    }
+                }
                 () = changed(&mut watch, &syncer) => {
                     // 모아서 한 번
                     tokio::select! {
@@ -987,4 +1073,11 @@ async fn read_bindings(
             Some((port, chassis.get(&uuid)?.clone()))
         })
         .collect())
+}
+
+/// 지금(유닉스 ms)
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
 }

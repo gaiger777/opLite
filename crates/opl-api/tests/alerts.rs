@@ -1190,3 +1190,179 @@ async fn pool_usage_and_maintenance() {
     assert_eq!(rig.hook.hits().len(), 2);
     engine.shutdown().await;
 }
+
+/// SDN 경보(계획 67 §11): "SDN 경보 켜기"가 권하는 여덟 규칙을 만들고(다시 부르면 그대로 둠), 리더 엔진이 chassis 꺼짐을
+/// `for_secs` 뒤 알리고(까닭 문구), OvnSync 관찰의 게이트웨이 주인이 바뀌면 넘김 이벤트를 한 번 보낸다(같은 임기의 앞
+/// 관찰과 견줌). 다른 임기의 관찰은 쓰지 않는다. chassis가 돌아오면 해제한다.
+#[tokio::test]
+async fn sdn_alerts_fire_from_node_state_and_observations() {
+    use opl_types::alert::sdn::SdnObservations;
+    use opl_types::node::FEATURES;
+    use opl_types::router::RouterSpec;
+    use opl_types::sdn::{
+        CentralHealth, ChassisState, NodeSdn, RaftRole, SDN_NAME, SdnCentral, SdnPhase, SdnSpec,
+        SdnStatus,
+    };
+
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    let admin = rig.env.admin().await;
+    let (status, body) = admin
+        .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"].as_array().unwrap().len(), 8, "{body}");
+    let (_, again) = admin
+        .post("/alert-rules/sdn-defaults", json!({"targets": ["ops"]}))
+        .await;
+    assert_eq!(again["created"], json!([]), "{again}");
+    assert_eq!(again["existing"].as_array().unwrap().len(), 8, "{again}");
+    let missing = admin
+        .post("/alert-rules/sdn-defaults", json!({"targets": ["nobody"]}))
+        .await;
+    assert_error(&missing, StatusCode::BAD_REQUEST, "invalid_request");
+
+    // SDN(중앙 = 이 노드)과 chassis가 꺼진 node2, 라우터 하나
+    let mut sdn = Resource::new(SDN_NAME, SdnSpec::default());
+    sdn.status = SdnStatus {
+        phase: SdnPhase::Ready,
+        centrals: vec![SdnCentral {
+            node: rig.env.node,
+            address: "127.0.0.1".parse().unwrap(),
+        }],
+        ..SdnStatus::default()
+    };
+    rig.env.cluster.create(&sdn).await.unwrap();
+    // 이 노드는 건강한 중앙(정족수 경보가 뜨지 않게)
+    let mut me = rig
+        .env
+        .cluster
+        .get::<NodeSpec>(rig.env.node)
+        .unwrap()
+        .unwrap();
+    me.status.sdn = Some(NodeSdn {
+        chassis: ChassisState::Ready,
+        central: Some(CentralHealth {
+            nb: RaftRole::Leader,
+            sb: RaftRole::Leader,
+            northd_active: true,
+        }),
+        ..NodeSdn::default()
+    });
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(rig.env.node, &me.status)
+        .await
+        .unwrap();
+    let node2 = add_node(
+        &rig.env,
+        "node2",
+        NodeStatus {
+            online: true,
+            features: FEATURES.iter().map(|f| f.to_string()).collect(),
+            sdn: Some(NodeSdn {
+                chassis: ChassisState::Down,
+                ..NodeSdn::default()
+            }),
+            ..NodeStatus::default()
+        },
+    )
+    .await;
+    let router: Resource<RouterSpec, opl_types::router::RouterStatus> =
+        Resource::new("r1", RouterSpec::default());
+    rig.env.cluster.create(&router).await.unwrap();
+
+    // 관찰을 나누는 OvnSync 설정을 단 엔진
+    let ovn = opl_api::OvnSyncConfig::new("t", opl_api::OvnTransport::Tcp);
+    let observations = ovn.observations.clone();
+    let hv: Arc<dyn Hypervisor> = rig.env.hv.clone();
+    let mut state = AppState::new(
+        rig.env.cluster.clone(),
+        rig.env.node,
+        hv,
+        rig.env.dir.path().join("uploads"),
+    );
+    state.alerts = Some(rig.book.clone());
+    state.ovn = Some(ovn);
+    let engine = AlertEngine::spawn(
+        Arc::new(state),
+        AlertEngineConfig {
+            tick: Duration::from_millis(20),
+            resolve_after_ms: RESOLVE_AFTER_MS,
+            clock: rig.clock.clone(),
+            sender: fast_sender(),
+        },
+    );
+    settle().await;
+    // 60초 전에는 pending
+    let (_, rule) = admin.get("/alert-rules/sdn-chassis-down").await;
+    assert_eq!(rule["status"]["active"][0]["state"], "pending", "{rule}");
+    assert_eq!(
+        rule["status"]["active"][0]["subject"]["id"],
+        node2.to_string()
+    );
+    assert!(rig.hook.hits().is_empty());
+    rig.step(61_000, 1.0);
+    let hits = rig.hook.wait(1).await;
+    let fired = hits[0].json();
+    assert_eq!(fired["rule"], "sdn-chassis-down", "{fired}");
+    assert_eq!(fired["state"], "firing", "{fired}");
+    assert_eq!(fired["subject"]["kind"], "node", "{fired}");
+    assert!(
+        fired["detail"]
+            .as_str()
+            .unwrap()
+            .contains("OVN chassis node2 is down: ovn-controller is not running"),
+        "{fired}"
+    );
+
+    // 게이트웨이 넘김: 다른 임기의 관찰은 쓰지 않고, 같은 임기의 두 관찰이 다르면 이벤트 하나
+    let term = rig.env.cluster.leader_term().unwrap();
+    let now = rig.clock.now_ms();
+    let obs = |term: u64, at: i64, host: Uuid| SdnObservations {
+        term,
+        at: now + at,
+        hosting: [(router.id, host.to_string())].into(),
+        monitors: vec![],
+    };
+    observations.set(obs(term + 1, 1, rig.env.node));
+    settle().await;
+    observations.set(obs(term + 1, 2, node2));
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 1);
+    observations.set(obs(term, 3, rig.env.node));
+    settle().await;
+    observations.set(obs(term, 4, node2));
+    let hits = rig.hook.wait(2).await;
+    let moved = hits[1].json();
+    assert_eq!(moved["rule"], "sdn-gateway-failover", "{moved}");
+    assert_eq!(moved["subject"]["kind"], "router", "{moved}");
+    assert_eq!(
+        moved["detail"], "The gateway of router r1 moved from node1 to node2",
+        "{moved}"
+    );
+    settle().await;
+    assert_eq!(rig.hook.hits().len(), 2, "the failover was sent once");
+
+    // chassis가 돌아오면 60초 뒤 해제
+    let mut n2 = rig.env.cluster.get::<NodeSpec>(node2).unwrap().unwrap();
+    n2.status.sdn.as_mut().unwrap().chassis = ChassisState::Ready;
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(node2, &n2.status)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        let (_, rule) = admin.get("/alert-rules/sdn-chassis-down").await;
+        if rule["status"]["active"][0]["clear_since"].is_i64() {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{rule}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
+    let hits = rig.hook.wait(3).await;
+    assert_eq!(hits[2].json()["state"], "resolved", "{:?}", hits[2].json());
+    engine.shutdown().await;
+}

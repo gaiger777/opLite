@@ -348,18 +348,10 @@ fn chassis(vm: &Vm, nodes: &BTreeSet<Uuid>) -> (Option<String>, Option<&'static 
     }
 }
 
-/// 공급자 네트워크(physnet `physnet`)로 나가는 라우터의 게이트웨이 후보(계획 66 §9.3): 게이트웨이 우선순위가 있고, 유지보수가
-/// 아니며, 그 physnet이 `ready`인 노드와 그 우선순위. chassis 살아 있음은 보지 않는다(OVN이 BFD로 고른다).
+/// 공급자 네트워크(physnet `physnet`)로 나가는 라우터의 게이트웨이 후보([`opl_types::sdn::gateway_candidates`] — SDN 경보와
+/// 같은 것)
 pub(crate) fn gateway_candidates(nodes: &[Node], physnet: &str) -> Vec<(Uuid, u16)> {
-    nodes
-        .iter()
-        .filter(|n| !n.spec.maintenance)
-        .filter_map(|n| {
-            let priority = n.spec.sdn.as_ref()?.gateway?;
-            n.status.sdn.as_ref().filter(|s| s.physnet_ready(physnet))?;
-            Some((n.id, priority))
-        })
-        .collect()
+    opl_types::sdn::gateway_candidates(nodes, physnet)
 }
 
 /// 쓸 수 있는 라우터 하나: 인터페이스(오버레이 SDN, 서브넷 있음, 다른 라우터가 먼저 갖지 않음), 외부(공급자 네트워크와

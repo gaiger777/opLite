@@ -4,8 +4,9 @@
 //! - **노드 경보**(지표·`VmFailed`·로컬 풀 `PoolUsage`·`TaskFailed`·`HaRecovery`)는 그 일이 일어난 노드가 평가하고 상태를
 //!   노드 장부(`alerts/state.json`)에 둔다. 공유 풀은 그 풀이 `ready`인 온라인 노드 가운데 id가 가장 작은 노드가 본다.
 //!   Raft에 쓰지 않는다.
-//! - **리더 경보**(`NodeOffline`·`BackupJobFailed`)는 리더가 평가하고 상태를 `AlertRule.status`(Raft)에 둔다. 상태를 먼저
-//!   쓰고 쓰기가 된 뒤에만 보내므로 리더가 바뀌어도 다시 보내지 않는다.
+//! - **리더 경보**(`NodeOffline`·`BackupJobFailed`, 계획 67의 SDN 조건 여덟)는 리더가 평가하고 상태를 `AlertRule.status`
+//!   (Raft)에 둔다. 상태를 먼저 쓰고 쓰기가 된 뒤에만 보내므로 리더가 바뀌어도 다시 보내지 않는다. SDN 조건은
+//!   [`opl_types::alert::sdn::evaluate`]가 Raft와 리더 OvnSync의 관찰(같은 프로세스의 메모리)로 본다.
 //!
 //! 단계는 [`opl_types::alert::advance`]다: pending → firing(알림) → `repeat_secs`마다 다시 → 거짓인 채 60초 → 해제(알림).
 //! 노드 장부도 파일에 먼저 쓰고 보내므로 opld를 다시 시작해도 같은 알림을 다시 보내지 않는다.
@@ -17,16 +18,22 @@ use std::time::Duration;
 use opl_cluster::types::NodeId;
 use opl_cluster::watch::{Watch, WatchError, WatchEvent};
 use opl_cluster::{Cluster, Typed};
+use opl_types::alert::sdn::{SdnFinding, SdnInputs, SdnObservations};
 use opl_types::alert::{
-    ActiveAlert, AlertCondition, AlertRule, AlertRuleSpec, AlertState, AlertSubject, Evaluator,
-    Notice, NotificationState, Observation, RESOLVE_AFTER_MS, SubjectKind, advance,
+    ActiveAlert, AlertCondition, AlertRule, AlertRuleSpec, AlertRuleStatus, AlertState,
+    AlertSubject, Evaluator, Notice, NotificationState, Observation, RESOLVE_AFTER_MS, SubjectKind,
+    advance,
 };
 use opl_types::backup_job::{BackupJob, BackupJobSpec};
 use opl_types::clock::{Clock, SystemClock};
 use opl_types::cluster::ClusterSpec;
+use opl_types::load_balancer::LoadBalancerSpec;
 use opl_types::metrics::{MetricsQuery, MetricsScope, NodeSample, VmSample};
+use opl_types::network::NetworkSpec;
 use opl_types::node::{Node, NodeSpec};
 use opl_types::resource::Kind;
+use opl_types::router::RouterSpec;
+use opl_types::sdn::{SDN_NAME, SdnSpec};
 use opl_types::storage::{StoragePoolSpec, is_shared};
 use opl_types::task::{Task, TaskOp, TaskState};
 use opl_types::vm::{Vm, VmPhase, VmSpec};
@@ -114,6 +121,7 @@ async fn run(state: Arc<AppState>, config: AlertEngineConfig, mut stop: oneshot:
         last_t: HashMap::new(),
         leader_ready: false,
         persisted_at: i64::MIN,
+        last_observed: None,
     };
     let mut watch = engine.subscribe(true);
     let mut interval = tokio::time::interval(config.tick);
@@ -159,6 +167,8 @@ struct Engine {
     leader_ready: bool,
     /// 상태 파일을 마지막으로 쓴 때
     persisted_at: i64,
+    /// 리더로서 마지막으로 평가에 쓴 SDN 관찰(`sdn_gateway_failover`가 다음 관찰과 견준다)
+    last_observed: Option<SdnObservations>,
 }
 
 /// 경보 하나와 보낼 알림
@@ -167,6 +177,37 @@ struct Pending {
     alert: ActiveAlert,
     state: NotificationState,
     detail: Option<String>,
+}
+
+/// SDN 조건의 Raft 입력(한 tick에 한 번 읽음)
+struct SdnWorld {
+    sdn: Option<opl_types::sdn::Sdn>,
+    networks: Vec<opl_types::network::Network>,
+    routers: Vec<opl_types::router::Router>,
+    load_balancers: Vec<opl_types::load_balancer::LoadBalancer>,
+    vms: Vec<Vm>,
+}
+
+impl SdnWorld {
+    fn inputs<'a>(
+        &'a self,
+        nodes: &'a [Node],
+        observed: Option<&'a SdnObservations>,
+        previous: Option<&'a SdnObservations>,
+        now: i64,
+    ) -> SdnInputs<'a> {
+        SdnInputs {
+            sdn: self.sdn.as_ref(),
+            nodes,
+            networks: &self.networks,
+            routers: &self.routers,
+            load_balancers: &self.load_balancers,
+            vms: &self.vms,
+            observed,
+            previous,
+            now_ms: now,
+        }
+    }
 }
 
 impl Engine {
@@ -548,6 +589,7 @@ impl Engine {
     async fn leader_rules(&mut self, now: i64, nodes: &[Node]) {
         if self.cluster().members().leader != Some(NodeId(self.state.node)) {
             self.leader_ready = false;
+            self.last_observed = None;
             return;
         }
         // 새 리더는 앞 리더가 쓴 상태를 아직 적용하지 않았을 수 있으므로 장벽 뒤에 다음 tick부터 본다.
@@ -561,6 +603,13 @@ impl Engine {
             .list::<AlertRuleSpec>()
             .map(|(_, r)| r)
             .unwrap_or_default();
+        // SDN 조건(계획 67 §11)의 입력은 그런 규칙이 있을 때만 한 번 읽는다.
+        let sdn = all
+            .iter()
+            .any(|r| r.spec.condition.is_sdn())
+            .then(|| self.sdn_world())
+            .flatten();
+        let observed = self.observed();
         for rule in all
             .into_iter()
             .filter(|r| r.spec.condition.evaluator() == Evaluator::Leader)
@@ -568,6 +617,15 @@ impl Engine {
             let (status, out) = match rule.spec.condition {
                 AlertCondition::NodeOffline => self.node_offline(now, &rule, nodes),
                 AlertCondition::BackupJobFailed => self.backup_failed(now, &rule),
+                ref c if c.is_sdn() => {
+                    // 입력을 읽지 못했으면 그대로 둔다(빈 입력으로 보면 경보를 알림 없이 뺀다).
+                    let Some(world) = &sdn else { continue };
+                    let findings = opl_types::alert::sdn::evaluate(
+                        &rule.spec,
+                        &world.inputs(nodes, observed.as_ref(), self.last_observed.as_ref(), now),
+                    );
+                    self.sdn_rule(now, &rule, findings)
+                }
                 _ => continue,
             };
             if status == rule.status {
@@ -586,6 +644,105 @@ impl Engine {
                 }
             }
         }
+        if observed.is_some() {
+            self.last_observed = observed;
+        }
+    }
+
+    /// 지금 임기의 SDN 관찰(리더 OvnSync가 이 프로세스에 둔 것). 다른 임기의 것은 쓰지 않는다(§11 — 새 리더의 첫
+    /// 관찰까지 관찰 조건을 평가하지 않음).
+    fn observed(&self) -> Option<SdnObservations> {
+        let term = self.cluster().leader_term()?;
+        self.state
+            .ovn
+            .as_ref()?
+            .observations
+            .get()
+            .filter(|o| o.term == term)
+    }
+
+    /// SDN 조건의 Raft 입력. 하나라도 읽지 못하면 None이다.
+    fn sdn_world(&self) -> Option<SdnWorld> {
+        let c = self.cluster();
+        Some(SdnWorld {
+            sdn: c.get_by_name::<SdnSpec>(SDN_NAME).ok()?,
+            networks: c.list::<NetworkSpec>().ok()?.1,
+            routers: c.list::<RouterSpec>().ok()?.1,
+            load_balancers: c.list::<LoadBalancerSpec>().ok()?.1,
+            vms: c.list::<VmSpec>().ok()?.1,
+        })
+    }
+
+    /// SDN 규칙 하나(계획 67 §11)를 본 결과로 진행한다. 상태 조건은 [`advance`](값을 모르면 단계를 그대로), 이벤트
+    /// (`sdn_gateway_failover`)는 참인 대상마다 한 번 보낸다. 대상이 사라진(라우터·노드를 지움, 중앙이 아니게 됨) `firing`
+    /// 경보는 해제로 알린다. 끈 규칙은 알림 없이 비운다.
+    fn sdn_rule(
+        &self,
+        now: i64,
+        rule: &AlertRule,
+        findings: Vec<SdnFinding>,
+    ) -> (AlertRuleStatus, Vec<Pending>) {
+        let mut status = rule.status.clone();
+        let mut out = Vec::new();
+        if rule.spec.condition.is_event() {
+            status.active.clear();
+            if rule.spec.enabled {
+                for f in findings.into_iter().filter(|f| f.holds == Some(true)) {
+                    out.push(Pending {
+                        alert: event_alert(rule, f.subject, now),
+                        rule: rule.clone(),
+                        state: NotificationState::Event,
+                        detail: f.detail,
+                    });
+                }
+            }
+            return (status, out);
+        }
+        let mut current: HashMap<String, ActiveAlert> =
+            status.active.iter().map(|a| (a.key(), a.clone())).collect();
+        let mut active = Vec::new();
+        if rule.spec.enabled {
+            for f in findings {
+                let before = current.remove(&f.subject.key(rule.id));
+                let seen = f.holds.map(|h| Observation::new(h, None));
+                let (after, notice) = advance(
+                    rule.id,
+                    &rule.spec,
+                    &f.subject,
+                    before.clone(),
+                    seen,
+                    now,
+                    self.resolve_after_ms,
+                );
+                if let Some(mut a) = after.clone() {
+                    a.subject = f.subject.clone();
+                    active.push(a);
+                }
+                if let Some(notice) = notice
+                    && let Some(alert) = after.or(before)
+                {
+                    out.push(Pending {
+                        rule: rule.clone(),
+                        alert,
+                        state: notice_state(notice),
+                        detail: (notice != Notice::Resolve).then_some(f.detail).flatten(),
+                    });
+                }
+            }
+            for (_, a) in current {
+                if rule.spec.send_resolved && a.state == AlertState::Firing {
+                    out.push(Pending {
+                        rule: rule.clone(),
+                        alert: a,
+                        state: NotificationState::Resolved,
+                        detail: Some("The subject no longer applies to this condition.".into()),
+                    });
+                }
+            }
+        }
+        active.sort_by_key(|a| a.key());
+        status.active = active;
+        (status, out)
     }
 
     fn node_offline(

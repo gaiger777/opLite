@@ -6,7 +6,7 @@ FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      systemd systemd-sysv dbus iproute2 nftables kmod procps iputils-ping tcpdump busybox python3 \
+      systemd systemd-sysv dbus iproute2 nftables kmod procps iputils-ping tcpdump busybox python3 iperf3 \
       qemu-system-x86 qemu-utils ovmf openssl ca-certificates \
  && rm -f /usr/sbin/policy-rc.d \
  # 컨테이너에 필요 없거나 호스트 장치를 건드리는 단위

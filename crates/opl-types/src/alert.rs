@@ -12,6 +12,8 @@ use uuid::Uuid;
 use crate::metrics::{NodeSample, VmSample};
 use crate::resource::{Kind, NameError, Resource, ResourceSpec, validate_name};
 
+pub mod sdn;
+
 pub type AlertRule = Resource<AlertRuleSpec, AlertRuleStatus>;
 pub type NotificationTarget = Resource<NotificationTargetSpec, NotificationTargetStatus>;
 

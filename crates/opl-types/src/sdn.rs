@@ -198,6 +198,21 @@ pub fn gateway_ranking(router: Uuid, candidates: &[(Uuid, u16)]) -> Vec<(Uuid, u
         .collect()
 }
 
+/// 공급자 네트워크(physnet `physnet`)로 나가는 라우터의 게이트웨이 후보(계획 66 §9.3): 게이트웨이 우선순위가 있고, 유지보수가
+/// 아니며, 그 physnet이 `ready`인 노드와 그 우선순위. chassis 살아 있음은 보지 않는다(OVN이 BFD로 고른다). OvnSync와 SDN
+/// 경보(계획 67 §11 `sdn_gateway_unavailable`)가 같은 것을 쓴다.
+pub fn gateway_candidates(nodes: &[Node], physnet: &str) -> Vec<(Uuid, u16)> {
+    nodes
+        .iter()
+        .filter(|n| !n.spec.maintenance)
+        .filter_map(|n| {
+            let priority = n.spec.sdn.as_ref()?.gateway?;
+            n.status.sdn.as_ref().filter(|s| s.physnet_ready(physnet))?;
+            Some((n.id, priority))
+        })
+        .collect()
+}
+
 /// 노드의 SDN 설정(`NodeSpec.sdn`, 계획 66 §7). 관리자가 노드 쓰기(`cluster.admin`)로 바꾼다.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]

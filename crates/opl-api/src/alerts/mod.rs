@@ -147,6 +147,72 @@ pub async fn delete_alert_rule(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /alert-rules/sdn-defaults` 본문
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SdnDefaultsRequest {
+    /// 알릴 `NotificationTarget` 이름(1~16개)
+    pub targets: Vec<String>,
+}
+
+/// `POST /alert-rules/sdn-defaults` 응답
+#[derive(Debug, serde::Serialize, ToSchema)]
+pub struct SdnDefaultsResponse {
+    /// 만든 규칙
+    pub created: Vec<Resource<AlertRuleSpec, AlertRuleStatus>>,
+    /// 같은 이름의 규칙이 이미 있어 그대로 둔 것
+    pub existing: Vec<String>,
+}
+
+/// "SDN 경보 켜기"(계획 67 §11): 권하는 SDN 규칙 여덟을 한 번에 만든다 — `sdn-quorum-lost` critical 0초,
+/// `sdn-central-down`·`sdn-chassis-down` warning 60초, `sdn-gateway-unavailable` critical 30초, `sdn-gateway-failover` info,
+/// `sdn-sync-failed` warning 120초, `sdn-physnet-not-ready` warning 60초, `sdn-lb-member-down` warning 30초. 같은 이름의
+/// 규칙이 있으면 건드리지 않는다. 만든 뒤는 보통 규칙이다. admin만 쓰고 모든 노드가 `notifications`·`sdn-services`를 알아야
+/// 한다.
+#[utoipa::path(post, path = "/alert-rules/sdn-defaults", tag = "alerts",
+    request_body = SdnDefaultsRequest,
+    responses((status = 200, body = SdnDefaultsResponse), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_sdn_default_rules(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Json(req): Json<SdnDefaultsRequest>,
+) -> Result<Json<SdnDefaultsResponse>, ApiError> {
+    state.authorize(&principal, Action::Write, AlertRuleSpec::KIND)?;
+    audit.detail(format!(
+        "alert-rule sdn-defaults -> {}",
+        req.targets.join(",")
+    ));
+    let rules = opl_types::alert::sdn::default_rules(&req.targets);
+    // 대상·기능은 한 번 본다(모든 규칙이 같은 대상이다).
+    if let Some((_, spec)) = rules.first() {
+        check_rule(&state, spec)?;
+    }
+    let mut out = SdnDefaultsResponse {
+        created: Vec::new(),
+        existing: Vec::new(),
+    };
+    for (name, spec) in rules {
+        if state.cluster.get_by_name::<AlertRuleSpec>(name)?.is_some() {
+            out.existing.push(name.to_string());
+            continue;
+        }
+        let mut rule = Resource::new(name, spec);
+        match state.cluster.create(&rule).await {
+            Ok(revision) => {
+                rule.revision = revision;
+                out.created.push(rule);
+            }
+            // 그사이 같은 이름을 누가 만들었다.
+            Err(ClusterError::Rejected(Rejection::NameTaken { .. })) => {
+                out.existing.push(name.to_string());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(Json(out))
+}
+
 // ---- 알림 대상 ----
 
 /// 알림 대상 만들기·바꾸기 본문. 바꾸기는 통째로 바꾸되 비밀은 다음처럼 지킨다(영역의 `bind_password`와 같은 규칙):

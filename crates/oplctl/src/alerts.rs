@@ -149,6 +149,12 @@ pub(crate) enum RuleCmd {
     Delete {
         rule: String,
     },
+    /// 권하는 SDN 경보 규칙 여덟(`sdn-quorum-lost` …)을 한 번에 만든다. 같은 이름의 규칙은 그대로 둔다.
+    AddSdnDefaults {
+        /// 알림 대상 이름(여러 번 줄 수 있다)
+        #[arg(long = "target", value_name = "NAME", required = true)]
+        targets: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -185,7 +191,7 @@ enum SeverityArg {
 #[derive(Args, Default)]
 #[command(group(ArgGroup::new("condition").args([
     "node_metric", "vm_metric", "pool_usage", "node_offline", "vm_failed", "task_failed", "ha_recovery",
-    "backup_job_failed",
+    "backup_job_failed", "sdn",
 ])))]
 struct ConditionArgs {
     /// 노드 지표 임계값
@@ -221,6 +227,30 @@ struct ConditionArgs {
     /// 백업 작업이 실패하면(이벤트, 리더가 본다)
     #[arg(long)]
     backup_job_failed: bool,
+    /// SDN 조건(계획 67, 리더가 본다): sdn_quorum_lost, sdn_central_down, sdn_chassis_down, sdn_gateway_unavailable,
+    /// sdn_gateway_failover(이벤트), sdn_sync_failed, sdn_physnet_not_ready, sdn_lb_member_down
+    #[arg(long = "condition", value_name = "KIND", value_parser = parse_sdn_condition)]
+    sdn: Option<String>,
+}
+
+/// SDN 경보 조건의 `kind`
+const SDN_CONDITIONS: &[&str] = &[
+    "sdn_quorum_lost",
+    "sdn_central_down",
+    "sdn_chassis_down",
+    "sdn_gateway_unavailable",
+    "sdn_gateway_failover",
+    "sdn_sync_failed",
+    "sdn_physnet_not_ready",
+    "sdn_lb_member_down",
+];
+
+fn parse_sdn_condition(s: &str) -> Result<String, String> {
+    if SDN_CONDITIONS.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!("use one of {}", SDN_CONDITIONS.join(", ")))
+    }
 }
 
 impl ConditionArgs {
@@ -261,6 +291,8 @@ impl ConditionArgs {
             json!({ "kind": "ha_recovery" })
         } else if self.backup_job_failed {
             json!({ "kind": "backup_job_failed" })
+        } else if let Some(kind) = &self.sdn {
+            json!({ "kind": kind })
         } else {
             return Ok(None);
         };
@@ -646,6 +678,21 @@ pub(crate) async fn alert(
                     .delete(&format!("/alert-rules/{}", seg(&rule)))
                     .await?;
                 writeln!(out, "alert rule {rule} deleted")?;
+            }
+            RuleCmd::AddSdnDefaults { targets } => {
+                let resp = client
+                    .post("/alert-rules/sdn-defaults", &json!({ "targets": targets }))
+                    .await?;
+                if json_out {
+                    print_json(out, &resp)?;
+                } else {
+                    for r in resp["created"].as_array().into_iter().flatten() {
+                        writeln!(out, "alert rule {} created", cell(&r["name"]))?;
+                    }
+                    for name in resp["existing"].as_array().into_iter().flatten() {
+                        writeln!(out, "alert rule {} already exists; kept", cell(name))?;
+                    }
+                }
             }
         },
     }
@@ -1246,6 +1293,37 @@ mod tests {
                 json!({ "kind": kind })
             );
         }
+        // SDN 조건(계획 67)
+        assert_eq!(
+            rule_create(&[
+                "r",
+                "--condition",
+                "sdn_chassis_down",
+                "--for",
+                "60",
+                "--node",
+                "n1",
+                "--target",
+                "a"
+            ])
+            .unwrap()["spec"],
+            json!({ "condition": { "kind": "sdn_chassis_down" }, "severity": "warning", "for_secs": 60,
+                "targets": ["a"], "nodes": ["n1"] })
+        );
+        assert!(
+            Cli::try_parse_from([
+                "t",
+                "alert",
+                "rule",
+                "create",
+                "r",
+                "--condition",
+                "sdn_nope",
+                "--target",
+                "a"
+            ])
+            .is_err()
+        );
         let err = |args: &[&str]| rule_create(args).unwrap_err().to_string();
         assert!(err(&["r", "--node-metric", "cpu", "--target", "a"]).contains("--gt or --lt"));
         assert!(err(&["r", "--target", "a"]).contains("give a condition"));
@@ -1346,6 +1424,43 @@ mod tests {
         };
         let err = rule_set_spec(&current, &s).unwrap_err().to_string();
         assert!(err.contains("node_offline"), "{err}");
+    }
+
+    /// `alert rule add-sdn-defaults`는 대상과 함께 한 번 보내고 만든 것·그대로 둔 것을 줄마다 알린다(계획 67 §11).
+    #[tokio::test]
+    async fn sdn_defaults_are_one_request() {
+        let (client, seen) = fake_api(|_, _| {
+            (
+                200,
+                json!({ "created": [{ "name": "sdn-quorum-lost" }, { "name": "sdn-chassis-down" }],
+                        "existing": ["sdn-sync-failed"] }),
+            )
+        })
+        .await;
+        assert!(Cli::try_parse_from(["t", "alert", "rule", "add-sdn-defaults"]).is_err());
+        let cmd = alert_cmd(&[
+            "rule",
+            "add-sdn-defaults",
+            "--target",
+            "ops",
+            "--target",
+            "pager",
+        ]);
+        let mut out = Vec::new();
+        alert(&client, cmd, false, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "alert rule sdn-quorum-lost created\nalert rule sdn-chassis-down created\n\
+             alert rule sdn-sync-failed already exists; kept\n"
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(
+            seen[0].line,
+            "POST /api/v1/alert-rules/sdn-defaults HTTP/1.1"
+        );
+        assert_eq!(seen[0].body, json!({ "targets": ["ops", "pager"] }));
     }
 
     /// 활성 경보와 보낸 기록은 표로 보이고 빠진 노드·잘림은 stderr에 알린다. `--since 1h`는 밀리초로 바꿔 보낸다.

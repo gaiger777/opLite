@@ -447,7 +447,9 @@ jobs:
   # Orbivisor 노드 셋으로 띄우고, 노드마다 orbivisord가 apt로 OVN을 깔아 실제 NB·SB Raft 셋과 chassis 셋이 된다(커널 모듈만
   # 호스트가 올린다). orbivisorctl로 컨테이너 사이 Geneve 동서 라우팅, SNAT, 분산·중앙 유동 IP, 게이트웨이 넘김(ovn-controller
   # 멈춤·kill -9·docker kill 노드 통째)과 되돌아감, 죽은 중앙의 실제 cluster/kick, 두 chassis 라이브 마이그레이션(게스트 없는
-  # QEMU VM)을 본다. 넘김 시간은 로그의 "PROBE" 줄.
+  # QEMU VM)을 본다. 계획 67: 여러 chassis 보안 그룹, 부하 분산(멤버 c1·c3, 손님 c2, 바깥 VIP의 게이트웨이 넘김), Geneve 너머
+  # QoS(iperf3), VXLAN 원본의 옮기기 다리(다리 노드 바꾸기), 잠금, 지운 노드 끊기, 호스트 webhook으로 받는 SDN 경보. 넘김 시간은
+  # 로그의 "PROBE" 줄.
   sdn-multinode:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -458,9 +460,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config tcpdump
-          sudo modprobe -a openvswitch geneve
+          sudo modprobe -a openvswitch geneve vxlan
           sudo modprobe vport_geneve || echo "no vport_geneve module"
-          lsmod | grep -E 'openvswitch|geneve'
+          lsmod | grep -E 'openvswitch|geneve|vxlan'
           ls -l /dev/kvm || true
           docker version --format '{{.Server.Version}}'
           docker build -t opl-sdn-node ci/sdn-node
