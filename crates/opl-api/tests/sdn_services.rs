@@ -382,6 +382,29 @@ async fn load_balancers() {
     assert_eq!(body["spec"]["vip"], vip.as_str(), "the VIP stays");
     assert_eq!(body["spec"]["affinity_secs"], 60);
 
+    // 리뷰 2 m4: 멤버 NIC가 다른 인터페이스 네트워크로 옮기면 건강 검사 출발 주소를 다시 고른다(t2의 것은 놓는다).
+    let (_, w2) = admin.get("/vms/web2").await;
+    let mut spec = w2["spec"].clone();
+    spec["nics"][0]["network"] = json!("t1");
+    spec["nics"][0]["ips"] = json!([]);
+    let (status, body) = admin.put("/vms/web2", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, lb) = admin.get("/load-balancers/web?live=false").await;
+    let monitors = lb["spec"]["monitors"].as_array().unwrap();
+    assert_eq!(monitors.len(), 1, "{lb}");
+    assert_eq!(monitors[0]["network"], "t1", "{lb}");
+    let (_, ips) = admin.get("/networks/t2/ips?live=false").await;
+    assert!(!ips.to_string().contains("lb-monitor"), "{ips}");
+    // 되돌린다(아래 시험이 t2 멤버를 쓴다).
+    let (_, w2) = admin.get("/vms/web2").await;
+    let mut spec = w2["spec"].clone();
+    spec["nics"][0]["network"] = json!("t2");
+    spec["nics"][0]["ips"] = json!([]);
+    let (status, body) = admin.put("/vms/web2", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, lb) = admin.get("/load-balancers/web?live=false").await;
+    assert_eq!(lb["spec"]["monitors"].as_array().unwrap().len(), 2, "{lb}");
+
     // `lb_in_use`: VIP 네트워크 인터페이스 빼기·네트워크 주인의 떼기·바깥 VIP가 쓰는 라우터 바깥 지우기
     let (status, body) = admin
         .patch(
@@ -694,6 +717,17 @@ async fn review1_topology_redaction_and_raft_peers() {
         .get(&format!("/network-topology?folder={}", folders[1]))
         .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    // 리뷰 2 m1: LB 보기도 읽을 수 없는 VM 멤버의 VM id·MAC·주소를 내지 않는다(건강은 남김).
+    let (status, view) = carol.get("/load-balancers/lb?live=false").await;
+    assert_eq!(status, StatusCode::OK, "{view}");
+    let m = &view["members"][0];
+    assert!(
+        m["vm"].is_null() && m["mac"].is_null() && m["ip"].is_null() && m["vm_name"].is_null(),
+        "{view}"
+    );
+    assert_eq!(m["health"], "unchecked", "{view}");
+    let (_, view) = admin.get("/load-balancers/lb?live=false").await;
+    assert!(view["members"][0]["ip"].is_string(), "{view}");
 
     // 잠금 미리 확인: 127.0.0.2(NB)와 Raft 상대 172.16.0.9가 밖이다.
     let mut status_ = env

@@ -63,7 +63,16 @@ impl T {
 
     /// [`T::start`]에 Task 실행기 설정 `tweak`을 더한다.
     async fn start_with(tweak: impl FnOnce(&mut opl_api::TaskRunnerConfig)) -> Self {
-        let mut env = Env::start().await;
+        Self::start_env(Env::start().await, tweak).await
+    }
+
+    /// [`T::start`]에 게스트 에이전트 정보 소스 `guest`를 단다.
+    async fn start_guest(guest: Arc<dyn opl_peer::GuestAgentSource>) -> Self {
+        let env = Box::pin(Env::start_with_state(|s| s.guest = Some(guest))).await;
+        Self::start_env(env, |_| {}).await
+    }
+
+    async fn start_env(mut env: Env, tweak: impl FnOnce(&mut opl_api::TaskRunnerConfig)) -> Self {
         let tmp = env.dir.path().join("ovn");
         env.stop_runner().await;
         let host = ovn_host(&tmp);
@@ -337,7 +346,10 @@ async fn offline_and_live_moves_rollback_and_finish() {
         .step(m.id, MigrationStep::Finish, vec![], Some("r1"))
         .await;
     assert_eq!(state, TaskState::Succeeded, "{warning:?}");
-    assert!(warning.unwrap().contains(&b.to_string()));
+    // 리뷰 2 m1: Task 글에는 VM id 없이 수만
+    let warning = warning.unwrap();
+    assert_eq!(warning, "1 NIC(s) are still on network \"lan\"");
+    assert!(!warning.contains(&b.to_string()));
     let m = t.migration(m.id);
     assert_eq!(m.status.phase, MigrationPhase::Finished);
     assert_eq!(m.status.bridge, None);
@@ -386,9 +398,22 @@ async fn a_failed_live_move_keeps_the_vm_on_its_network() {
     t.env.hv.fail_next_hotplug("ovn-installed did not come");
     let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
     assert_eq!(state, TaskState::Failed);
-    assert!(error.unwrap().contains("ovn-installed"), "task error");
+    assert_eq!(
+        error.as_deref(),
+        Some("1 NIC(s) failed to move"),
+        "task error"
+    );
     let m = t.migration(m.id);
     assert_eq!(m.status.phase, MigrationPhase::Failed);
+    assert!(
+        m.status.vms[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("ovn-installed"),
+        "{:?}",
+        m.status.vms[0]
+    );
     assert_eq!(m.status.vms[0].state, MoveState::Failed);
     assert_eq!(m.status.bridge, None);
     let vb = t.vm_of(b);
@@ -452,9 +477,10 @@ async fn a_changed_plan_fails_only_that_vm_and_put_cannot_relink() {
     assert_eq!(task["status"]["state"], "succeeded", "{task}");
     let (state, error) = t.step(m.id, MigrationStep::Start, vec![], None).await;
     assert_eq!(state, TaskState::Failed);
-    assert!(error.unwrap().contains("plan changed"));
+    assert!(!error.unwrap().contains(&d.to_string()));
     let m = t.migration(m.id);
     let rec = |vm: Uuid| m.status.vms.iter().find(|v| v.vm == vm).unwrap();
+    assert!(rec(d).error.as_deref().unwrap().contains("plan changed"));
     assert_eq!(rec(a).state, MoveState::Moved);
     assert_eq!(rec(d).state, MoveState::Failed);
     assert_eq!(t.vm_of(d).spec.nics[0].network, "lan");
@@ -938,6 +964,117 @@ async fn unreadable_vms_are_left_out_of_plans_and_records() {
     assert!(!ev.to_string().contains(&ids[1]), "{ev}");
 }
 
+/// 리뷰 2 m2·m3: 이름을 고르기 전에 네트워크를 본다(ASCII가 아닌 긴 원본 이름이 처리기를 멈추게 하지 않음 — 400).
+/// 공급자 대상에는 다리가 없으니 `bridge`를 거짓으로 적어, 같은 공급자 네트워크로 옮기는 둘째도 만들어진다.
+#[tokio::test]
+async fn provider_targets_take_no_bridge_key_and_odd_names_are_400() {
+    let t = T::start().await;
+    let (status, err) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "spec": { "source": "é".repeat(40), "target": "t-lan" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    assert_eq!(err["code"], "invalid_migration", "{err}");
+    for (name, spec) in [
+        ("lan2", json!({ "bridge": "br0", "vlan": 20 })),
+        (
+            "prov",
+            json!({ "sdn": { "provider": { "physnet": "ext" } }, "subnets": [{ "cidr": "10.66.0.0/24" }] }),
+        ),
+    ] {
+        let n = Resource::new(name, serde_json::from_value::<NetworkSpec>(spec).unwrap());
+        t.env.cluster.create(&n).await.unwrap();
+    }
+    for source in ["lan", "lan2"] {
+        let (status, created) = t
+            .admin
+            .post(
+                "/network-migrations",
+                json!({ "spec": { "source": source, "target": "prov" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["spec"]["bridge"], false, "{created}");
+    }
+}
+
+/// VM마다 정한 게스트 에이전트 정보
+#[derive(Default)]
+struct Guests(std::sync::Mutex<std::collections::BTreeMap<Uuid, opl_types::guest::GuestInfo>>);
+
+#[async_trait::async_trait]
+impl opl_peer::GuestAgentSource for Guests {
+    async fn info(&self, vm: Uuid, _refresh: bool) -> opl_types::guest::GuestInfoResponse {
+        let info = self.0.lock().unwrap().get(&vm).cloned();
+        opl_types::guest::GuestInfoResponse {
+            state: if info.is_some() {
+                opl_types::guest::GuestInfoState::Answered
+            } else {
+                opl_types::guest::GuestInfoState::NoAgent
+            },
+            info,
+        }
+    }
+
+    async fn set_password(
+        &self,
+        _vm: Uuid,
+        _user: &str,
+        _password: &str,
+    ) -> Result<(), opl_peer::GuestAgentError> {
+        Ok(())
+    }
+}
+
+/// 리뷰 2 I4: 계획에 없이 원본에 남는 켜진 VM(읽을 수 없거나 뺀 VM)이 게스트 에이전트로 알린 주소도 대상에 잡아 둔다 —
+/// 서버가 묻고 VM id 없이 `status.held_ips`에 적으며, API 보기(만들기 응답·GET)에는 내지 않는다.
+#[tokio::test]
+async fn addresses_of_vms_left_on_the_source_are_held() {
+    let guests = Arc::new(Guests::default());
+    let t = T::start_guest(guests.clone()).await;
+    let mine = t.vm("mine", None, false).await;
+    let mut req = vm_request("theirs");
+    req["spec"]["nics"] = json!([{ "network": "lan", "model": "virtio" }]);
+    req["spec"]["guest_agent"] = json!({});
+    let (status, vm) = t.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let theirs: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let task = t.admin.act("theirs", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let mac = t.vm_of(theirs).spec.nics[0].mac.unwrap().to_string();
+    guests.0.lock().unwrap().insert(
+        theirs,
+        serde_json::from_value(json!({
+            "collected_at": 1,
+            "interfaces": [{ "name": "eth0", "mac": mac,
+                "addresses": [{ "ip": "10.66.0.9", "prefix": 24 }] }]
+        }))
+        .unwrap(),
+    );
+    let (status, created) = t
+        .admin
+        .post(
+            "/network-migrations",
+            json!({ "spec": { "source": "lan", "target": "t-lan", "bridge": false, "vms": [mine] } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+    assert_eq!(t.migration(id).status.held_ips, [ip("10.66.0.9")]);
+    assert!(!created.to_string().contains("10.66.0.9"), "{created}");
+    let (_, seen) = t.admin.get(&format!("/network-migrations/{id}")).await;
+    assert!(!seen.to_string().contains("10.66.0.9"), "{seen}");
+    // 대상에서 그 주소를 고를 수 없다.
+    let mut req = vm_request("x");
+    req["spec"]["nics"] = json!([{ "network": "t-lan", "model": "virtio", "ips": ["10.66.0.9"] }]);
+    let (status, err) = t.admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{err}");
+    assert_eq!(err["code"], "ip_in_use", "{err}");
+}
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1043,8 +1180,8 @@ async fn a_restart_that_times_out_goes_back() {
     let (state, error) = t
         .wait_task(task["id"].as_str().unwrap().parse().unwrap())
         .await;
-    assert_eq!(state, TaskState::Failed);
-    let error = error.unwrap();
+    assert_eq!(state, TaskState::Failed, "{error:?}");
+    let error = t.migration(m.id).status.vms[0].error.clone().unwrap();
     assert!(error.contains("in time and was started on"), "{error}");
     let vc = t.vm_of(c);
     assert_eq!(vc.spec.nics[0].network, "lan");

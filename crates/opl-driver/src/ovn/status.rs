@@ -54,27 +54,55 @@ impl ClusterStatus {
         self.is_member() && self.role == "leader"
     }
 
-    /// Raft가 온전한지(리뷰 1 I5 — 잠금 방화벽을 건 뒤): 멤버이고 리더나 팔로어이며 리더를 알고, 리더면 다른 모든 서버에게서,
-    /// 팔로어면 리더에게서 `max_age_ms` 안에 받았다. 아니면 그 까닭
-    pub fn raft_intact(&self, max_age_ms: u64) -> Result<(), String> {
+    /// 잠금 방화벽을 건 뒤에도 Raft가 이어졌는지(리뷰 2 I1): `before`(표를 걸기 전의 이 DB)에 견준다. 건 뒤(`self`)
+    /// 멤버이고 리더나 팔로어이며 리더를 알아야 한다. 리더면 걸기 전에 선거 시간 두 배 안에 들었던 다른 서버 가운데
+    /// `judged`(지금의 중앙 주소)인 것마다, 팔로어면 리더에게서 `since_ms`(표를 건 뒤 지난 시간) 안에 받았어야 한다 — 표
+    /// 앞의 소식은 세지 않는다. 걸기 전부터 끊겼던 서버(꺼진 중앙, 내쫓지 못한 서버)는 보지 않는다. 걸기 전에도 온전하지
+    /// 않았으면(리더를 모름) 판단하지 않는다(Ok). 아니면 그 까닭
+    pub fn raft_kept(
+        &self,
+        before: &ClusterStatus,
+        judged: impl Fn(&str) -> bool,
+        since_ms: u64,
+    ) -> Result<(), String> {
         let db = &self.name;
-        if !self.is_member() || !matches!(self.role.as_str(), "leader" | "follower") {
-            return Err(format!("{db} is {} ({})", self.status, self.role));
-        }
-        let Some(leader) = self.leader.as_deref() else {
-            return Err(format!("{db} has no leader"));
+        let live = |s: &ClusterStatus| {
+            s.is_member() && matches!(s.role.as_str(), "leader" | "follower") && s.leader.is_some()
         };
-        let fresh = |s: &ClusterServer| s.last_msg_ms.is_some_and(|ms| ms <= max_age_ms);
-        let stale: Vec<&str> = if leader == "self" {
-            self.servers
+        if !live(before) {
+            return Ok(());
+        }
+        if !live(self) {
+            let leader = if self.leader.is_some() {
+                ""
+            } else {
+                ", no leader"
+            };
+            return Err(format!("{db} is {} ({}{leader})", self.status, self.role));
+        }
+        let after_apply = |s: &ClusterServer| s.last_msg_ms.is_some_and(|ms| ms <= since_ms);
+        let stale: Vec<&str> = if self.leader.as_deref() == Some("self") {
+            let max_age = 2 * before.election_timer_ms.unwrap_or(1000);
+            before
+                .servers
                 .iter()
-                .filter(|s| !s.is_self && !fresh(s))
+                .filter(|s| !s.is_self && s.last_msg_ms.is_some_and(|ms| ms <= max_age))
+                .filter(|s| judged(&s.address))
+                .filter(|b| {
+                    !self
+                        .servers
+                        .iter()
+                        .find(|s| s.sid == b.sid)
+                        .is_some_and(after_apply)
+                })
                 .map(|s| s.address.as_str())
                 .collect()
         } else {
+            let leader = self.leader.as_deref();
             self.servers
                 .iter()
-                .filter(|s| s.sid == leader && !fresh(s))
+                .filter(|s| Some(s.sid.as_str()) == leader && judged(&s.address))
+                .filter(|s| !after_apply(s))
                 .map(|s| s.address.as_str())
                 .collect()
         };
@@ -82,7 +110,7 @@ impl ClusterStatus {
             Ok(())
         } else {
             Err(format!(
-                "{db} has not heard from {} in {max_age_ms} ms",
+                "{db} has not heard from {} in the {since_ms} ms since the allow-list was applied",
                 stale.join(", ")
             ))
         }
@@ -103,6 +131,16 @@ impl ClusterStatus {
             _ => RaftRole::Unknown,
         }
     }
+}
+
+/// Raft 주소(`ssl:10.0.0.1:6643`, `tcp:[fd00::1]:6643`)의 IP
+pub fn raft_address_ip(address: &str) -> Option<std::net::IpAddr> {
+    let rest = address.split_once(':').map_or(address, |(_, r)| r);
+    let (host, _) = rest.rsplit_once(':')?;
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse()
+        .ok()
 }
 
 /// `cluster/status` 출력을 읽는다. `Name:`·`Status:`·`Role:`이 없으면 오류다.
@@ -347,7 +385,7 @@ mod tests {
         );
         assert_eq!(s.election_timer_ms, Some(1000));
         // 혼자인 리더는 늘 온전하다.
-        assert_eq!(s.raft_intact(2000), Ok(()));
+        assert_eq!(s.raft_kept(&s, |_| true, 0), Ok(()));
         let sb = parse_cluster_status(SB_LEADER).unwrap();
         assert_eq!(sb.name, "OVN_Southbound");
         assert_eq!(sb.address, "ssl:127.0.0.1:6644");
@@ -387,28 +425,49 @@ mod tests {
     /// 잠금 방화벽 뒤 Raft 확인(리뷰 1 I5): 리더는 팔로어에게서, 팔로어는 리더에게서 최근에 받아야 한다.
     #[test]
     fn raft_is_intact_only_with_fresh_messages() {
+        let all = |_: &str| true;
         let l = parse_cluster_status(LEADER_TWO).unwrap();
         assert_eq!(l.servers[0].last_msg_ms, Some(331));
-        assert_eq!(l.raft_intact(2000), Ok(()));
-        let err = l.raft_intact(300).unwrap_err();
+        assert_eq!(l.raft_kept(&l, all, 2000), Ok(()));
+        // 표 앞의 소식(331 ms 전 — 건 지 300 ms)은 세지 않는다.
+        let err = l.raft_kept(&l, all, 300).unwrap_err();
         assert!(err.contains("ssl:127.0.0.2:6643"), "{err}");
         let f = parse_cluster_status(FOLLOWER).unwrap();
-        assert_eq!(f.raft_intact(2000), Ok(()));
+        assert_eq!(f.raft_kept(&f, all, 2000), Ok(()));
         let cut = FOLLOWER.replace("last msg 331 ms ago", "last msg 9000 ms ago");
         assert!(
             parse_cluster_status(&cut)
                 .unwrap()
-                .raft_intact(2000)
+                .raft_kept(&f, all, 2000)
                 .is_err()
         );
         let lost = FOLLOWER
             .replace("Role: follower", "Role: candidate")
             .replace("Leader: 4f28", "Leader: unknown");
-        assert!(
-            parse_cluster_status(&lost)
-                .unwrap()
-                .raft_intact(2000)
-                .is_err()
+        let lost = parse_cluster_status(&lost).unwrap();
+        assert!(lost.raft_kept(&f, all, 2000).is_err());
+        // 걸기 전에도 리더를 몰랐으면 판단하지 않는다.
+        assert_eq!(lost.raft_kept(&lost, all, 2000), Ok(()));
+    }
+
+    /// 리뷰 2 I1: 걸기 전부터 끊겼던 서버(꺼진 중앙·내쫓지 못한 서버)나 중앙이 아닌 주소는 리더가 듣지 못해도 끊김이 아니다.
+    #[test]
+    fn raft_kept_judges_only_peers_that_were_fresh_before() {
+        let down = LEADER_TWO.replace("last msg 331 ms ago", "last msg 9000 ms ago");
+        let before = parse_cluster_status(&down).unwrap();
+        let after = parse_cluster_status(&down.replace("9000", "12000")).unwrap();
+        assert_eq!(after.raft_kept(&before, |_| true, 2500), Ok(()));
+        let fresh = parse_cluster_status(LEADER_TWO).unwrap();
+        assert!(after.raft_kept(&fresh, |_| true, 2500).is_err());
+        let central = |a: &str| raft_address_ip(a) == Some("127.0.0.1".parse().unwrap());
+        assert_eq!(after.raft_kept(&fresh, central, 2500), Ok(()));
+        assert_eq!(
+            raft_address_ip("ssl:127.0.0.2:6643"),
+            Some("127.0.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            raft_address_ip("ssl:[fd00::2]:6644"),
+            Some("fd00::2".parse().unwrap())
         );
     }
 

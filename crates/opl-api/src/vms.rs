@@ -1325,6 +1325,21 @@ pub async fn update_vm(
     if !notes.is_empty() {
         audit.detail(format!("vm set {} {}", vm.name, notes.join(" ")));
     }
+    // NIC가 네트워크를 바꿨으면 그 NIC를 멤버로 가진 부하 분산기의 건강 검사 출발 주소를 다시 고른다(리뷰 2 m4).
+    let moved = before.as_ref().is_some_and(|b| {
+        vm.spec.nics.iter().any(|n| {
+            b.nics
+                .iter()
+                .any(|o| o.mac.is_some() && o.mac == n.mac && o.network != n.network)
+        })
+    });
+    if moved {
+        Box::pin(crate::load_balancers::refresh_monitors(
+            &state.cluster,
+            vm.id,
+        ))
+        .await;
+    }
     Ok((headers, Json(vm)))
 }
 

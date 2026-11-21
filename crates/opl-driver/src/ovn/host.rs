@@ -953,17 +953,42 @@ impl OvnHost {
         parse_cluster_status(&String::from_utf8_lossy(&out.stdout)).map_err(OvnError::Command)
     }
 
-    /// 잠금 방화벽을 건 뒤 이 중앙의 NB·SB Raft가 온전한지(리뷰 1 I5): `wait_step`의 세 배를 기다린 뒤(선거 시간의 두 배보다
-    /// 오래 전 소식은 방화벽 앞의 것이다) 두 DB가 [`ClusterStatus::raft_intact`]인지 `wait_step`마다 다섯 번까지 본다. 아니면
-    /// 마지막 까닭
-    pub async fn raft_still_intact(&self) -> Result<(), String> {
-        tokio::time::sleep(self.options.wait_step * 3).await;
+    /// 잠금 방화벽을 걸기 전의 NB·SB `cluster/status`(리뷰 2 I1 — [`Self::raft_still_intact`]가 견준다). 읽지 못한 DB는 None
+    pub async fn raft_before(&self) -> [Option<ClusterStatus>; 2] {
+        [
+            self.cluster_status(Db::Nb).await.ok(),
+            self.cluster_status(Db::Sb).await.ok(),
+        ]
+    }
+
+    /// 잠금 방화벽을 건(`applied`) 뒤 이 중앙의 NB·SB Raft가 이어졌는지(리뷰 1 I5, 리뷰 2 I1): 선거 시간 두 배에 `wait_step`을
+    /// 더한 만큼(적어도 `wait_step` 세 배) 기다린 뒤 두 DB가 걸기 전(`before`)에 견주어 [`ClusterStatus::raft_kept`]인지
+    /// `wait_step`마다 다섯 번까지 본다. 보는 상대는 `centrals`(지금의 중앙 주소)뿐이다. 아니면 마지막 까닭
+    pub async fn raft_still_intact(
+        &self,
+        before: &[Option<ClusterStatus>; 2],
+        centrals: &[IpAddr],
+        applied: tokio::time::Instant,
+    ) -> Result<(), String> {
+        let timer = before
+            .iter()
+            .flatten()
+            .filter_map(|s| s.election_timer_ms)
+            .max()
+            .unwrap_or(1000);
+        let wait = (Duration::from_millis(2 * timer) + self.options.wait_step)
+            .max(self.options.wait_step * 3);
+        tokio::time::sleep_until(applied + wait).await;
+        let judged =
+            |a: &str| super::status::raft_address_ip(a).is_some_and(|ip| centrals.contains(&ip));
         let mut why = String::new();
         for _ in 0..5 {
             let mut ok = true;
-            for db in [Db::Nb, Db::Sb] {
+            for (db, before) in [Db::Nb, Db::Sb].into_iter().zip(before) {
+                let Some(before) = before else { continue };
+                let since = applied.elapsed().as_millis() as u64;
                 let checked = match self.cluster_status(db).await {
-                    Ok(s) => s.raft_intact(2 * s.election_timer_ms.unwrap_or(1000)),
+                    Ok(s) => s.raft_kept(before, judged, since),
                     Err(e) => Err(e.to_string()),
                 };
                 if let Err(e) = checked {

@@ -88,7 +88,7 @@ pub(crate) fn held_ips(
 }
 
 /// 끝나지 않은 네트워크 옮기기들 `migrations`가 대상 네트워크에 잡아 둔 주소(리뷰 1 I2): 계획에 적은 NIC 주소(`status.vms[].ips`
-/// — 원본에 남은 VM은 아직 그 주소를 쓴다)와, 원본 네트워크에 NIC가 있는 VM들 `vms`의 cloud-init 고정 주소 가운데 대상
+/// — 원본에 남은 VM은 아직 그 주소를 쓴다), 계획에 없는 VM이 쓰는 주소(`status.held_ips`, 리뷰 2 I4)와, 원본 네트워크에 NIC가 있는 VM들 `vms`의 cloud-init 고정 주소 가운데 대상
 /// 서브넷 안의 것. 다리가 두 L2를 잇는 동안 IPAM이 이 주소를 다른 NIC·부하 분산기·유동 IP에 주면 ARP가 겹친다. `except_vm`의
 /// 것은 뺀다(옮기는 VM 자신 — 그 주소로 옮겨 간다).
 pub(crate) fn migration_held(
@@ -107,6 +107,8 @@ pub(crate) fn migration_held(
                 .filter(|v| Some(v.vm) != except_vm)
                 .flat_map(|v| v.ips.iter().map(|ip| ip.to_canonical())),
         );
+        // 원본에 남는 VM(읽을 수 없는 VM 포함)이 게스트 에이전트로 알린 주소(리뷰 2 I4)
+        held.extend(m.status.held_ips.iter().map(|ip| ip.to_canonical()));
         let Some(target) = networks.iter().find(|n| n.name == m.spec.target) else {
             continue;
         };

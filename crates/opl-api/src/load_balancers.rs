@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use opl_cluster::ClusterError;
 use opl_cluster::types::Rejection;
+use opl_cluster::{Cluster, ClusterError};
 use opl_types::authz::Privilege;
 use opl_types::floating_ip::{FloatingIp, FloatingIpSpec};
 use opl_types::ipam;
@@ -79,7 +79,10 @@ struct World {
 
 impl World {
     fn load(state: &AppState) -> Result<Self, ApiError> {
-        let c = &state.cluster;
+        Self::load_from(&state.cluster)
+    }
+
+    fn load_from(c: &Cluster) -> Result<Self, ApiError> {
         Ok(World {
             migrating: crate::ipam::load_migration_held(c, None)?,
             lbs: c.list::<LoadBalancerSpec>()?.1,
@@ -376,6 +379,63 @@ fn fill_addresses(
     }
     spec.monitors = monitors;
     Ok(picked)
+}
+
+/// VM `vm`의 NIC가 네트워크를 바꾼 뒤(`PUT /vms`) 그 VM의 NIC를 멤버로 가진 부하 분산기의 건강 검사 출발 주소를 다시
+/// 고른다(리뷰 2 m4 — 멤버가 옮겨 간 인터페이스 네트워크에 출발 주소가 없으면 OVN이 그 멤버를 늘 건강하다고 보고, 비게 된
+/// 네트워크의 주소는 IPAM에 잡힌 채 남는다). 필요한 네트워크 집합이 같으면 쓰지 않는다. 고르지 못하면 경고 로그만 남긴다
+/// (VM 쓰기는 이미 됐다 — 다음 부하 분산기 쓰기가 다시 고른다).
+pub(crate) async fn refresh_monitors(cluster: &Cluster, vm: Uuid) {
+    for _ in 0..RETRIES {
+        let world = match World::load_from(cluster) {
+            Ok(w) => w,
+            Err(e) => {
+                tracing::warn!(error = %e.message, "cannot refresh load balancer health-check sources");
+                return;
+            }
+        };
+        let mut retry = false;
+        for lb in world.lbs.iter().filter(|l| {
+            l.spec
+                .listeners
+                .iter()
+                .flat_map(|l| l.members.iter())
+                .any(|m| m.nic().is_some_and(|(v, _)| v == vm))
+        }) {
+            let Ok(router) = vip_router(&world, &lb.spec) else {
+                continue;
+            };
+            let want = monitor_networks(&world, router, &lb.spec);
+            let have: BTreeSet<String> =
+                lb.spec.monitors.iter().map(|m| m.network.clone()).collect();
+            if want == have {
+                continue;
+            }
+            let mut spec = lb.spec.clone();
+            if let Err(e) =
+                fill_addresses(&world, router, &mut spec, Some(&lb.spec), Some(lb.id), true)
+            {
+                tracing::warn!(lb = %lb.name, error = %e.message, "cannot pick load balancer health-check sources");
+                continue;
+            }
+            match cluster
+                .update_spec(lb.id, Some(lb.revision), lb.labels.clone(), &spec)
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(lb = %lb.name, "moved load balancer health-check sources with a member NIC")
+                }
+                Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => retry = true,
+                Err(e) if is_ip_taken(&e) => retry = true,
+                Err(e) => {
+                    tracing::warn!(lb = %lb.name, error = %e, "cannot store load balancer health-check sources")
+                }
+            }
+        }
+        if !retry {
+            return;
+        }
+    }
 }
 
 fn to_v4(r: Result<IpAddr, ipam::IpamError>) -> Result<Ipv4Addr, ipam::IpamError> {
@@ -679,6 +739,12 @@ fn lb_view(
                         };
                     }
                 }
+            }
+            // 읽을 수 없는 VM의 멤버는 VM id·MAC·주소를 내지 않는다(리뷰 2 m1 — 토폴로지와 같게). 건강은 남긴다.
+            if vm.is_some_and(|v| !sees_vm(v)) {
+                view.vm = None;
+                view.mac = None;
+                view.ip = None;
             }
             members.push(view);
         }

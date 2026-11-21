@@ -1,7 +1,7 @@
 //! SDN 경보의 관찰 읽기(계획 67 §11): 리더가 NB의 게이트웨이 주인(DGP `hosting-chassis`)과 SB `Service_Monitor`를 읽어
 //! [`Observations`]에 둔다. OvnSync 루프와 따로 도는 Task다(리뷰 1 I4 — 죽은 중앙에 붙느라 NB 쓰기가 늦지 않게). 연결은
-//! 이어 쓰고(끊겼을 때만 다시 붙되 지난번에 붙은 중앙을 먼저), 붙기·요청의 시간 제한은 짧다([`OBSERVE_TIMEOUT`] — 연결의
-//! 요청 시간 제한은 붙을 때 준 것이다).
+//! 이어 쓰고(끊겼거나 그 중앙이 클러스터에서 떨어졌을 때만 다시 붙되 지난번에 붙은 중앙을 먼저 — 리뷰 2 I3), 붙기·요청의
+//! 시간 제한은 짧다([`OBSERVE_TIMEOUT`] — 연결의 요청 시간 제한은 붙을 때 준 것이다).
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -44,7 +44,8 @@ impl Observer {
         self.config.timeout.min(OBSERVE_TIMEOUT)
     }
 
-    /// 열린 연결이면 그것, 아니면 지난번 중앙을 먼저 해 보고 새로 붙는다.
+    /// 열린 연결이 아직 클러스터에 붙어 있으면(`_Server.Database.connected` — 리뷰 2 I3, 갈라진 중앙의 얼어붙은 사본을
+    /// 새 관찰로 적지 않게) 그것, 아니면 버리고 지난번 중앙을 먼저 해 보고 새로 붙는다(`connect_any`가 `connected`를 본다).
     async fn client(
         &self,
         current: Option<OvsdbClient>,
@@ -54,7 +55,14 @@ impl Observer {
         prefer: Option<SocketAddr>,
     ) -> Result<OvsdbClient, OvsdbError> {
         if let Some(c) = current.filter(|c| !c.is_closed()) {
-            return Ok(c);
+            match c.server_db(db).await {
+                Ok(Some(s)) if s.connected => return Ok(c),
+                Ok(_) => tracing::debug!(
+                    central = %c.endpoint(),
+                    "the OVN central left its cluster; reconnecting the SDN observer"
+                ),
+                Err(e) => tracing::debug!(error = %e, "reconnecting the SDN observer"),
+            }
         }
         let transport = match &self.config.transport {
             super::OvnTransport::Tcp => Transport::Tcp,

@@ -233,6 +233,53 @@ async fn lockdown(
             Err(e) => return Err(e.to_string()),
         }
     }
+    let result = lockdown_steps(ctx, task, enabled, limits).await;
+    // 켜기가 실패하면 반쯤 걸린 채 두지 않는다(리뷰 2 I2): `SdnSpec.lockdown`을 다시 끈다. 그러면 에이전트가 중앙의 SB를
+    // 하나씩 되돌리고 허용 목록을 걷는다(지우기가 실패하면 차례마다 다시 한다). Task가 끝난 뒤나 opld를 다시 띄운 뒤에도
+    // 다시 걸지 않는다 — 원하는 잠금이 꺼짐이다. 실패 까닭은 `SdnStatus.lockdown.error`에 남는다(`finished`).
+    match result {
+        Err(e) if enabled => match turn_off_again(cluster).await {
+            Ok(true) => Err(format!("{e}; turned the OVN lockdown off again")),
+            Ok(false) => Err(e),
+            Err(w) => Err(format!("{e}; cannot turn the OVN lockdown off again: {w}")),
+        },
+        other => other,
+    }
+}
+
+/// 실패한 잠금 켜기 뒤 `SdnSpec.lockdown`을 끈다(켜져 있었으면 참). 다른 쓰기와 부딪치면 다시 읽는다.
+async fn turn_off_again(cluster: &Cluster) -> Result<bool, String> {
+    loop {
+        let Some(sdn) = cluster
+            .get_by_name::<SdnSpec>(SDN_NAME)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(false);
+        };
+        if !sdn.spec.lockdown {
+            return Ok(false);
+        }
+        let mut spec = sdn.spec.clone();
+        spec.lockdown = false;
+        match cluster
+            .update_spec(sdn.id, Some(sdn.revision), sdn.labels.clone(), &spec)
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => continue,
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+}
+
+/// `sdn-lockdown`의 스펙을 쓴 뒤의 단계: 중앙 바꾸기 → 허용 목록 기다리기
+async fn lockdown_steps(
+    ctx: &Ctx,
+    task: Uuid,
+    enabled: bool,
+    limits: LockdownLimits,
+) -> Result<Option<String>, String> {
+    let cluster = &ctx.cluster;
     update_sdn(cluster, |s| {
         let state = s.lockdown.get_or_insert_with(Default::default);
         if state.pending && state.error.is_none() {

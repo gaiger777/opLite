@@ -66,6 +66,8 @@ struct World {
     target: Network,
     /// 원본에 NIC가 있는 VM(스펙 `vms`가 있으면 그것만)
     vms: Vec<Vm>,
+    /// 원본에 NIC가 있는 모든 VM(템플릿 빼고 — 계획에 없이 남는 VM의 주소를 잡아 두려고, 리뷰 2 I4)
+    on_source: Vec<Vm>,
     nodes: Vec<Node>,
     taken: BTreeMap<IpAddr, Uuid>,
     busy: BTreeSet<Uuid>,
@@ -171,6 +173,11 @@ fn load_world(
             )));
         }
     }
+    let on_source: Vec<Vm> = all
+        .iter()
+        .filter(|v| !v.spec.template && v.spec.nics.iter().any(|n| n.network == spec.source))
+        .cloned()
+        .collect();
     let vms: Vec<Vm> = all
         .iter()
         .filter(|v| v.spec.nics.iter().any(|n| n.network == spec.source))
@@ -190,6 +197,10 @@ fn load_world(
                 taken.entry(ip.to_canonical()).or_insert(v.vm);
             }
         }
+        // 주인 없이 잡아 둔 주소(리뷰 2 I4)
+        for ip in &m.status.held_ips {
+            taken.entry(ip.to_canonical()).or_insert(Uuid::nil());
+        }
     }
     let busy = migrations
         .iter()
@@ -205,6 +216,7 @@ fn load_world(
         source,
         target,
         vms,
+        on_source,
         nodes,
         taken,
         busy,
@@ -290,6 +302,11 @@ pub async fn create_migration(
     require_feature(cluster, SDN_SERVICES)?;
     spec.validate().map_err(|e| invalid(e.to_string()))?;
     let world = load_world(cluster, &spec, None)?;
+    // 공급자 대상에는 다리를 놓지 않는다: `bridge`를 거짓으로 적어 Raft `migration-target`을 잡지 않게 한다(리뷰 2 m3 —
+    // 같은 공급자 네트워크로 옮기는 둘째가 409를 받지 않게). 계획은 같다(`plan_bridge`).
+    if world.target.spec.is_provider() && spec.bridge.is_none() {
+        spec.bridge = Some(false);
+    }
     let plan = plan_world(&world, &spec, guests, allowed, sees);
     if spec.folder.is_none() {
         spec.folder = world.source.spec.folder;
@@ -303,8 +320,34 @@ pub async fn create_migration(
             VmMove::planned(p, &vm.spec)
         })
         .collect();
+    let planned: BTreeSet<Uuid> = m.status.vms.iter().map(|v| v.vm).collect();
+    m.status.held_ips = remaining_ips(&world, &m.spec.source, &planned, guests);
     m.revision = cluster.create(&m).await?;
     Ok((m, plan))
+}
+
+/// 계획에 없이 원본에 남는 VM(부른 사람이 읽을 수 없거나 뺀 VM)이 게스트 에이전트로 알린, 대상 서브넷 안의 주소(리뷰 2 I4 —
+/// 다리가 선 동안 IPAM이 대상에서 주지 않게 `status.held_ips`에 VM id 없이 적는다). cloud-init 고정 주소는
+/// `ipam::migration_held`가 따로 본다.
+fn remaining_ips(
+    world: &World,
+    source: &str,
+    planned: &BTreeSet<Uuid>,
+    guests: &BTreeMap<Uuid, GuestInfo>,
+) -> Vec<IpAddr> {
+    let mut out: BTreeSet<IpAddr> = BTreeSet::new();
+    for vm in world.on_source.iter().filter(|v| !planned.contains(&v.id)) {
+        let Some(guest) = guests.get(&vm.id) else {
+            continue;
+        };
+        for nic in vm.spec.nics.iter().filter(|n| n.network == source) {
+            let (ips, from) = nm::address_for(nic.mac, &world.target.spec, None, Some(guest), None);
+            if from == nm::AddressSource::GuestAgent {
+                out.extend(ips.into_iter().map(|ip| ip.to_canonical()));
+            }
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// 옮기기 `id`의 걸음 하나를 노드 `node`(요청을 받은 노드)의 `network-migrate` Task로 시작한다. 이미 Task가 돌면 409
@@ -752,7 +795,13 @@ async fn start(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String> {
     })
     .await?;
     match m.status.phase {
-        MigrationPhase::Failed => Err(failed.join("; ")),
+        // Task 글에는 VM id·까닭(주소가 들 수 있다)을 적지 않는다(리뷰 2 m1 — Task를 읽는 사람이 그 VM을 읽지 못할 수
+        // 있다). 까닭은 옮기기 기록의 VM마다 `error`에 있고, 보기가 읽을 수 없는 VM의 것은 뺀다.
+        MigrationPhase::Failed => Err(m
+            .status
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("{} NIC(s) failed to move", failed.len()))),
         MigrationPhase::Paused => Ok(Some("paused".into())),
         _ => Ok(warnings(&m)),
     }
@@ -776,16 +825,16 @@ fn settled(s: &NetworkMigrationStatus, ok: bool) -> MigrationPhase {
     }
 }
 
-/// 끝난 옮기기의 경고: 원본에 남은 NIC(막힘·실패)
+/// 끝난 옮기기의 경고: 원본에 남은 NIC(막힘·실패)의 수
 fn warnings(m: &NetworkMigration) -> Option<String> {
-    let left: Vec<String> = m
+    // VM id는 적지 않는다(리뷰 2 m1 — 어느 VM인지는 기록의 VM 목록에 있다).
+    let left = m
         .status
         .vms
         .iter()
         .filter(|v| !matches!(v.state, MoveState::Moved))
-        .map(|v| format!("VM {} NIC {}", v.vm, v.nic))
-        .collect();
-    (!left.is_empty()).then(|| format!("still on network {:?}: {}", m.spec.source, left.join(", ")))
+        .count();
+    (left > 0).then(|| format!("{left} NIC(s) are still on network {:?}", m.spec.source))
 }
 
 /// VM NIC 하나를 옮긴다(§9.4). 결과를 기록에 적는다.
@@ -1386,7 +1435,11 @@ async fn rollback(ctx: &Ctx, id: Uuid, vms: &[Uuid]) -> Result<Option<String>, S
     })
     .await?;
     if m.status.phase == MigrationPhase::Failed {
-        return Err(failed.join("; "));
+        return Err(m
+            .status
+            .error
+            .clone()
+            .unwrap_or_else(|| format!("{} NIC(s) failed to roll back", failed.len())));
     }
     Ok(warning)
 }

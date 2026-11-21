@@ -220,7 +220,8 @@ struct Agent {
     /// 마지막으로 넣은 허용 목록(없으면 넣지 않았거나 지웠다)
     firewall: Mutex<Option<Firewall>>,
     /// Raft를 끊어 걷은 허용 목록(리뷰 1 I5): 그 글, 그때의 잠금 Task, 까닭. 같은 글은 새 잠금 Task가 오기 전에 다시 넣지
-    /// 않는다(넣고 걷기를 되풀이하지 않게).
+    /// 않는다(넣고 걷기를 되풀이하지 않게 — Task가 끝나 자리가 비어도, 리뷰 2 I2). 실패한 Task가 `SdnSpec.lockdown`을 끄므로
+    /// opld를 다시 띄운 뒤에도(이 기록이 없어도) 다시 걸지 않는다.
     refused: Mutex<Option<(String, Option<Uuid>, String)>>,
 }
 
@@ -754,19 +755,45 @@ impl Agent {
                 tracing::debug!(central = %name, "waiting for an earlier central to apply the OVN allow-list");
                 return Some(waiting(None));
             }
-            // Raft를 끊어 걷은 글은 새 잠금 Task가 올 때까지 다시 넣지 않는다.
+            // Raft를 끊어 걷은 글은 새 잠금 Task가 올 때까지 다시 넣지 않는다(Task가 끝나 자리가 비어도 — 리뷰 2 I2,
+            // 실패한 Task는 잠금을 다시 끈다). 걷기가 실패했으면 표가 걷힐 때까지 차례마다 다시 걷는다.
             let task = sdn.status.pending.as_ref().map(|p| p.task);
             let refused = self.refused.lock().unwrap().clone();
             if let Some((t, at, why)) = refused {
-                if t == text && at == task {
+                if t == text && (at == task || task.is_none()) {
+                    let why = match host.lockdown_present().await {
+                        Ok(true) => match host.remove_lockdown().await {
+                            Ok(_) => why,
+                            Err(e) => format!("{why}; the removal failed again: {e}"),
+                        },
+                        _ => why,
+                    };
                     return Some(waiting(Some(why)));
                 }
                 *self.refused.lock().unwrap() = None;
             }
         }
+        // Raft 확인은 잠금 켜기 Task가 도는 동안 이 중앙이 처음 걸 때만 한다(리뷰 2 I1): opld를 다시 띄운 뒤나 받아들인 표를
+        // 다시 걸 때는 보지 않고, 그래서 걷지도 않는다(꺼진 중앙 하나 때문에 맞게 걸린 표를 걷지 않게).
+        let first = role.central
+            && matches!(
+                sdn.status.pending.as_ref().map(|p| &p.op),
+                Some(TaskOp::SdnLockdown { enabled: true })
+            )
+            && !nodes
+                .iter()
+                .find(|n| n.id == self.node)
+                .and_then(|n| n.status.sdn.as_ref()?.lockdown.as_ref())
+                .is_some_and(|l| l.firewall);
         let error = if present {
             None
         } else {
+            let before = if first {
+                Some(host.raft_before().await)
+            } else {
+                None
+            };
+            let applied_at = tokio::time::Instant::now();
             match host.apply_lockdown(&text).await {
                 Ok(()) => {
                     tracing::info!(
@@ -774,12 +801,17 @@ impl Agent {
                         centrals = sets.centrals.len(),
                         "applied the OVN address allow-list"
                     );
-                    // 중앙은 건 뒤 자기 NB·SB Raft가 그대로인지 본다. 끊겼으면 표를 걷는다(정족수를 잃은 채 성공으로
-                    // 알리지 않게 — 리뷰 1 I5).
-                    let cut = if role.central {
-                        host.raft_still_intact().await.err()
-                    } else {
-                        None
+                    // 처음 거는 중앙은 건 뒤 자기 NB·SB Raft가 걸기 전과 같이 이어졌는지 본다. 끊겼으면 표를 걷는다
+                    // (정족수를 잃은 채 성공으로 알리지 않게 — 리뷰 1 I5).
+                    let cut = match &before {
+                        Some(before) => {
+                            let centrals: Vec<IpAddr> =
+                                sdn.status.centrals.iter().map(|c| c.address).collect();
+                            host.raft_still_intact(before, &centrals, applied_at)
+                                .await
+                                .err()
+                        }
+                        None => None,
                     };
                     match cut {
                         None => {
@@ -1718,8 +1750,58 @@ mod tests {
         assert_eq!(lockdown_turn(&sdn, &nodes(), a), Ok(()));
     }
 
-    /// 리뷰 1 I5: 중앙이 표를 건 뒤 자기 Raft가 끊겼으면(리더가 팔로어에게서 오래 듣지 못함) 표를 걷고 오류를 알린다.
-    /// 같은 잠금 차례에는 같은 표를 다시 넣지 않는다.
+    /// 잠금 켜기 Task가 도는 중이라고 적는다(`task`가 None이면 자리를 비운다 — Task가 끝남).
+    async fn lockdown_pending(s: &Setup, task: Option<Uuid>) {
+        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
+        let mut status = sdn.status;
+        status.pending = task.map(|task| SdnPending {
+            op: TaskOp::SdnLockdown { enabled: true },
+            node: s.agent.node,
+            task,
+        });
+        s.cluster
+            .update_status::<SdnSpec>(sdn.id, &status)
+            .await
+            .unwrap();
+    }
+
+    /// 선거 시간 50 ms의 리더 `cluster/status`(팔로어 127.0.0.2에게서 `ago` ms 전에 받음)
+    fn leader_heard(ago: u64) -> CmdOutput {
+        CmdOutput::ok(
+            include_str!("../../opl-driver/src/ovn/fixtures/cluster-status-leader-two.txt")
+                .replace("Election timer: 1000", "Election timer: 50")
+                .replace("last msg 331 ms ago", &format!("last msg {ago} ms ago")),
+        )
+    }
+
+    fn status_rule(s: &Setup, db: opl_driver::ovn::Db) -> String {
+        format!(
+            "ovs-appctl --timeout 5 -t {} cluster/status",
+            s.agent.host.paths().db_ctl(db).display()
+        )
+    }
+
+    /// `nft -f -` 가운데 표를 넣은(`chain`이 있는) 것과 걷기만 한 것의 수
+    fn nft_writes(f: &FakeRunner) -> (usize, usize) {
+        let writes: Vec<bool> = f
+            .commands()
+            .into_iter()
+            .filter(|c| c.program == "nft" && c.args == ["-f", "-"])
+            .map(|c| {
+                String::from_utf8_lossy(c.stdin.as_deref().unwrap_or_default()).contains("chain")
+            })
+            .collect();
+        let applies = writes.iter().filter(|a| **a).count();
+        (applies, writes.len() - applies)
+    }
+
+    fn nft_applies(f: &FakeRunner) -> usize {
+        nft_writes(f).0
+    }
+
+    /// 리뷰 1 I5·리뷰 2 I1·I2: 잠금 켜기 Task가 도는 동안 처음 건 중앙은 걸기 전에 듣던 상대(지금의 중앙)에게서 건 뒤
+    /// 다시 듣지 못하면 표를 걷고 오류를 알린다. 같은 Task 동안에도, Task가 끝나 자리가 빈 뒤에도 같은 표를 다시 넣지
+    /// 않고, 남은 표는 걷는다.
     #[tokio::test]
     async fn a_firewall_that_cuts_raft_is_removed() {
         let s = setup(false).await;
@@ -1728,43 +1810,42 @@ mod tests {
         set_features(&s.cluster, node, &[SDN, SDN_SERVICES]).await;
         let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
         sdn.status.phase = SdnPhase::Ready;
-        sdn.status.centrals = vec![central(node, "10.0.0.1")];
+        sdn.status.centrals = vec![
+            central(node, "10.0.0.1"),
+            central(Uuid::now_v7(), "127.0.0.2"),
+        ];
+        sdn.status.lockdown = Some(opl_types::sdn::LockdownState {
+            applied: vec![node, sdn.status.centrals[1].node],
+            ..Default::default()
+        });
         s.cluster.create(&sdn).await.unwrap();
+        lockdown_pending(&s, Some(Uuid::now_v7())).await;
         let f = &s.runner.fake;
-        let cut = include_str!("../../opl-driver/src/ovn/fixtures/cluster-status-leader-two.txt")
-            .replace("last msg 331 ms ago", "last msg 9000 ms ago");
+        // 걸기 전(이번 차례의 처음 읽기들)에는 5 ms 전에 들었고, 건 뒤에는 듣지 못한다. `cluster/status` 규칙은 일반
+        // `ovs-appctl` 규칙보다 먼저 단다.
+        let calls_before_firewall = 3;
         for db in [opl_driver::ovn::Db::Nb, opl_driver::ovn::Db::Sb] {
-            f.reply(
-                &format!(
-                    "ovs-appctl --timeout 5 -t {} cluster/status",
-                    s.agent.host.paths().db_ctl(db).display()
-                ),
-                CmdOutput::ok(cut.as_str()),
-            );
+            let mut seq = vec![leader_heard(5); calls_before_firewall];
+            seq.push(leader_heard(9000));
+            f.reply_seq(&status_rule(&s, db), seq);
         }
-        central_setup(&s, vec![listing(false), listing(true)]);
-        s.agent.tick().await;
-        let sdn = s.cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap().unwrap();
-        assert_eq!(sdn.status.lockdown.as_ref().unwrap().applied, [node]);
-
-        let nft = |f: &FakeRunner| {
-            f.commands()
-                .into_iter()
-                .filter(|c| c.program == "nft" && c.args == ["-f", "-"])
-                .count()
-        };
+        central_setup(&s, vec![listing(true)]);
         s.agent.tick().await;
         // 넣고 곧바로 걷었다.
-        assert_eq!(nft(f), 2, "{:?}", f.calls());
+        assert_eq!(nft_writes(f), (1, 1), "{:?}", f.calls());
         let report = s.agent.report.get().unwrap();
         let lockdown = report.lockdown.unwrap();
         assert!(!lockdown.firewall, "{lockdown:?}");
         let error = lockdown.error.unwrap();
         assert!(error.starts_with(LOCKDOWN_RAFT_CUT), "{error}");
         assert!(error.contains("ssl:127.0.0.2:6643"), "{error}");
-        // 같은 차례에는 다시 넣지 않는다.
+        // 같은 차례에는 다시 넣지 않는다. 표가 아직 있으면(가짜 `nft list`는 늘 있다고 답한다) 다시 걷는다.
         s.agent.tick().await;
-        assert_eq!(nft(f), 2, "{:?}", f.calls());
+        assert_eq!(nft_writes(f), (1, 2), "{:?}", f.calls());
+        // Task가 끝나 자리가 비어도 다시 넣지 않는다(리뷰 2 I2 — 전에는 다시 넣고 다시 걷었다).
+        lockdown_pending(&s, None).await;
+        s.agent.tick().await;
+        assert_eq!(nft_applies(f), 1, "{:?}", f.calls());
         assert!(
             s.agent
                 .report
@@ -1774,6 +1855,65 @@ mod tests {
                 .unwrap()
                 .error
                 .is_some()
+        );
+    }
+
+    /// 리뷰 2 I1: 잠금 Task 없이(opld를 다시 띄운 뒤) 다시 거는 표는 Raft를 보지 않고, 상대가 꺼져 있어도 걷지 않는다.
+    /// 잠금 Task가 돌아도 이 중앙이 이미 표를 걸었다고 알렸으면 보지 않는다. 걸기 전부터 듣지 못하던 상대는 처음 걸 때도
+    /// 끊김이 아니다.
+    #[tokio::test]
+    async fn a_reapplied_firewall_is_never_removed_for_a_down_peer() {
+        let s = setup(false).await;
+        let node = s.agent.node;
+        set_underlay(&s.cluster, node, "10.0.0.1").await;
+        set_features(&s.cluster, node, &[SDN, SDN_SERVICES]).await;
+        let mut sdn: Sdn = Resource::new(SDN_NAME, SdnSpec { lockdown: true });
+        sdn.status.phase = SdnPhase::Ready;
+        sdn.status.centrals = vec![
+            central(node, "10.0.0.1"),
+            central(Uuid::now_v7(), "127.0.0.2"),
+        ];
+        sdn.status.lockdown = Some(opl_types::sdn::LockdownState {
+            applied: vec![node, sdn.status.centrals[1].node],
+            ..Default::default()
+        });
+        s.cluster.create(&sdn).await.unwrap();
+        let f = &s.runner.fake;
+        for db in [opl_driver::ovn::Db::Nb, opl_driver::ovn::Db::Sb] {
+            f.reply(&status_rule(&s, db), leader_heard(9000));
+        }
+        central_setup(&s, vec![listing(true)]);
+        let removals = |f: &FakeRunner| nft_writes(f).1;
+        // 다시 띄운 뒤(Task 없음): 걸고 그대로 둔다.
+        s.agent.tick().await;
+        assert_eq!(nft_applies(f), 1, "{:?}", f.calls());
+        assert_eq!(removals(f), 0, "{:?}", f.calls());
+        let lockdown = s.agent.report.get().unwrap().lockdown.unwrap();
+        assert!(
+            lockdown.firewall && lockdown.error.is_none(),
+            "{lockdown:?}"
+        );
+
+        // 잠금 Task가 돌고 처음 거는 중앙이라도, 걸기 전부터 듣지 못하던 상대(꺼진 중앙)는 보지 않는다.
+        let restarted = Agent {
+            cluster: s.cluster.clone(),
+            host: s.agent.host.clone(),
+            node,
+            report: SdnReport::default(),
+            firewall: Mutex::new(None),
+            refused: Mutex::new(None),
+        };
+        lockdown_pending(&s, Some(Uuid::now_v7())).await;
+        let started = std::time::Instant::now();
+        restarted.tick().await;
+        assert_eq!(nft_applies(f), 2, "{:?}", f.calls());
+        assert_eq!(removals(f), 0, "{:?}", f.calls());
+        // 건 뒤 선거 시간 두 배(100 ms)와 한 걸음 넘게 기다렸다.
+        assert!(started.elapsed() >= Duration::from_millis(120));
+        let lockdown = restarted.report.get().unwrap().lockdown.unwrap();
+        assert!(
+            lockdown.firewall && lockdown.error.is_none(),
+            "{lockdown:?}"
         );
     }
 

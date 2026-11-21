@@ -696,3 +696,37 @@ async fn observations_are_read_over_kept_connections() {
     // SB에는 관찰 연결 하나만 붙었다(읽을 때마다 새로 붙지 않음).
     assert_eq!(ovn.sb.with(|s| s.accepted), 1);
 }
+
+/// 리뷰 2 I3: 이어 쓰는 관찰 연결의 중앙이 클러스터에서 떨어지면(`_Server.connected`가 거짓 — 갈라진 중앙의 얼어붙은
+/// 사본) 새 관찰을 적지 않는다(낡아 경보 엔진이 모르는 것으로 본다). 다시 붙으면 관찰이 이어진다.
+#[tokio::test]
+async fn observations_stop_when_the_central_leaves_its_cluster() {
+    let ovn = Ovn::start().await;
+    ovn.sdn(SdnPhase::Ready).await;
+    let mut config = ovn.config();
+    config.observe_every = Duration::from_millis(30);
+    let observations = config.observations.clone();
+    let sync = OvnSync::spawn(ovn.env.cluster.clone(), config);
+    let at = || observations.get().map(|o| o.at);
+    let started = std::time::Instant::now();
+    while at().is_none() {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    ovn.sb.with(|s| s.connected = false);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let frozen = at();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        at(),
+        frozen,
+        "observations kept coming from a central outside its cluster"
+    );
+    ovn.sb.with(|s| s.connected = true);
+    let started = std::time::Instant::now();
+    while at() == frozen {
+        assert!(started.elapsed() < Duration::from_secs(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    sync.shutdown().await;
+}

@@ -122,6 +122,7 @@ async fn run(state: Arc<AppState>, config: AlertEngineConfig, mut stop: oneshot:
         leader_ready: false,
         persisted_at: i64::MIN,
         last_observed: None,
+        events_sent: HashMap::new(),
     };
     let mut watch = engine.subscribe(true);
     let mut interval = tokio::time::interval(config.tick);
@@ -167,8 +168,46 @@ struct Engine {
     leader_ready: bool,
     /// 상태 파일을 마지막으로 쓴 때
     persisted_at: i64,
-    /// 리더로서 마지막으로 평가에 쓴 SDN 관찰(`sdn_gateway_failover`가 다음 관찰과 견준다)
+    /// 리더로서 마지막으로 평가에 쓴 SDN 관찰(`sdn_gateway_failover`가 다음 관찰과 견준다). 게이트웨이 주인은 같은 임기에서
+    /// 마지막으로 안 것을 남긴다(리뷰 2 m5 — 주인이 없던 관찰을 지나 옮겨도 놓치지 않게, [`merge_hosting`]).
     last_observed: Option<SdnObservations>,
+    /// 이벤트 규칙이 대상·문구마다 마지막으로 보낸 때((규칙, 대상, 문구) → ms — 리뷰 2 m5, [`damp_events`])
+    events_sent: HashMap<(Uuid, Uuid, Option<String>), i64>,
+}
+
+/// 새 관찰 `now`에 같은 임기의 앞 관찰 `prev`가 알던 게이트웨이 주인 가운데 `now`에 없는 것을 더한다(리뷰 2 m5: A → 주인
+/// 없음 → B도 A → B로 본다).
+fn merge_hosting(prev: Option<&SdnObservations>, mut now: SdnObservations) -> SdnObservations {
+    if let Some(prev) = prev.filter(|p| p.term == now.term) {
+        for (router, host) in &prev.hosting {
+            now.hosting.entry(*router).or_insert_with(|| host.clone());
+        }
+    }
+    now
+}
+
+/// 이벤트 규칙(`sdn_gateway_failover`)의 참인 발견 가운데 같은 대상의 같은 일(문구 — "A에서 B로")을 `repeat_secs` 안에
+/// 이미 보낸 것은 뺀다(리뷰 2 m5 — BFD가 두 chassis 사이를 오가도 관찰마다 알리지 않게: A→B·B→A 한 번씩). 보낼 것은
+/// `sent`에 지금을 적는다.
+fn damp_events(
+    sent: &mut HashMap<(Uuid, Uuid, Option<String>), i64>,
+    rule: &AlertRule,
+    findings: Vec<SdnFinding>,
+    now: i64,
+) -> Vec<SdnFinding> {
+    let window = i64::from(rule.spec.repeat_secs) * 1000;
+    findings
+        .into_iter()
+        .filter(|f| f.holds == Some(true))
+        .filter(|f| {
+            let key = (rule.id, f.subject.id, f.detail.clone());
+            if sent.get(&key).is_some_and(|at| now - at < window) {
+                return false;
+            }
+            sent.insert(key, now);
+            true
+        })
+        .collect()
 }
 
 /// 경보 하나와 보낼 알림
@@ -590,6 +629,7 @@ impl Engine {
         if self.cluster().members().leader != Some(NodeId(self.state.node)) {
             self.leader_ready = false;
             self.last_observed = None;
+            self.events_sent.clear();
             return;
         }
         // 새 리더는 앞 리더가 쓴 상태를 아직 적용하지 않았을 수 있으므로 장벽 뒤에 다음 tick부터 본다.
@@ -644,8 +684,8 @@ impl Engine {
                 }
             }
         }
-        if observed.is_some() {
-            self.last_observed = observed;
+        if let Some(o) = observed {
+            self.last_observed = Some(merge_hosting(self.last_observed.as_ref(), o));
         }
     }
 
@@ -677,7 +717,7 @@ impl Engine {
     /// (`sdn_gateway_failover`)는 참인 대상마다 한 번 보낸다. 대상이 사라진(라우터·노드를 지움, 중앙이 아니게 됨) `firing`
     /// 경보는 해제로 알린다. 끈 규칙은 알림 없이 비운다.
     fn sdn_rule(
-        &self,
+        &mut self,
         now: i64,
         rule: &AlertRule,
         findings: Vec<SdnFinding>,
@@ -687,7 +727,7 @@ impl Engine {
         if rule.spec.condition.is_event() {
             status.active.clear();
             if rule.spec.enabled {
-                for f in findings.into_iter().filter(|f| f.holds == Some(true)) {
+                for f in damp_events(&mut self.events_sent, rule, findings, now) {
                     out.push(Pending {
                         alert: event_alert(rule, f.subject, now),
                         rule: rule.clone(),
@@ -1079,6 +1119,58 @@ mod tests {
     use super::*;
 
     const NOW: i64 = 1_700_000_000_000;
+
+    /// 리뷰 2 m5: 같은 임기의 관찰은 앞서 안 게이트웨이 주인을 이어 받는다(주인이 없던 관찰을 지나도 A → B를 본다).
+    /// 다른 임기의 것은 받지 않는다.
+    #[test]
+    fn hosting_is_remembered_across_observations_without_it() {
+        let r = Uuid::from_u128(7);
+        let obs = |term: u64, host: Option<&str>| SdnObservations {
+            term,
+            at: 1,
+            hosting: host.map(|h| (r, h.to_string())).into_iter().collect(),
+            monitors: vec![],
+        };
+        let a = merge_hosting(None, obs(3, Some("a")));
+        let none = merge_hosting(Some(&a), obs(3, None));
+        assert_eq!(none.hosting.get(&r).map(String::as_str), Some("a"));
+        let b = merge_hosting(Some(&none), obs(3, Some("b")));
+        assert_eq!(b.hosting.get(&r).map(String::as_str), Some("b"));
+        let other = merge_hosting(Some(&a), obs(4, None));
+        assert!(other.hosting.is_empty());
+    }
+
+    /// 리뷰 2 m5: 같은 대상의 같은 일은 `repeat_secs` 안에 한 번만 보낸다. 다른 대상·다른 일(되돌아감)·창이 지난 뒤에는
+    /// 보낸다.
+    #[test]
+    fn events_are_damped_per_subject() {
+        let mut r = rule();
+        r.spec.repeat_secs = 60;
+        let found = |n: u128, d: &str| SdnFinding {
+            subject: vm(n),
+            holds: Some(true),
+            detail: Some(d.to_string()),
+        };
+        let mut sent = HashMap::new();
+        assert_eq!(
+            damp_events(&mut sent, &r, vec![found(1, "a→b")], NOW).len(),
+            1
+        );
+        assert_eq!(
+            damp_events(&mut sent, &r, vec![found(1, "b→a")], NOW + 5_000).len(),
+            1
+        );
+        assert!(damp_events(&mut sent, &r, vec![found(1, "a→b")], NOW + 10_000).is_empty());
+        assert!(damp_events(&mut sent, &r, vec![found(1, "b→a")], NOW + 15_000).is_empty());
+        assert_eq!(
+            damp_events(&mut sent, &r, vec![found(2, "a→b")], NOW + 10_000).len(),
+            1
+        );
+        assert_eq!(
+            damp_events(&mut sent, &r, vec![found(1, "a→b")], NOW + 61_000).len(),
+            1
+        );
+    }
 
     fn rule() -> AlertRule {
         let spec: AlertRuleSpec = serde_json::from_value(json!({

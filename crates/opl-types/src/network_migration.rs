@@ -121,6 +121,12 @@ pub struct NetworkMigrationStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub error: Option<String>,
+    /// 원본에 남는(계획에 적지 않은) VM이 원본에서 쓰는, 대상 서브넷 안의 주소(리뷰 2 I4 — 만들 때 게스트 에이전트에게
+    /// 서버가 물어 적는다. 부른 사람이 읽을 수 없는 VM 것도). IPAM이 옮기기가 끝날 때까지 대상에 잡아 둔다. VM id 없이
+    /// 적고, API 보기에는 내지 않는다(`network_migrations::redact`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(ignore))]
+    pub held_ips: Vec<IpAddr>,
 }
 
 impl NetworkMigrationStatus {

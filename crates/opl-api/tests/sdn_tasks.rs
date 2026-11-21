@@ -1392,3 +1392,89 @@ async fn the_lockdown_task_waits_for_the_agents() {
         "{lockdown:?}"
     );
 }
+
+/// 리뷰 2 I2: 중앙이 허용 목록을 Raft를 끊어 걷었으면 `sdn-lockdown`(켜기)은 실패하고 `SdnSpec.lockdown`을 다시 끈다
+/// (반쯤 걸린 채 두지 않음 — 에이전트가 SB를 되돌리고 표를 걷는다). 까닭은 `lockdown.error`에 남는다.
+#[tokio::test]
+async fn a_failed_lockdown_turns_itself_off_again() {
+    let s = Sdn::start().await;
+    let mut ready = s.ready();
+    ready.centrals = vec![SdnCentral {
+        node: s.env.node,
+        address: ip("127.0.0.1"),
+    }];
+    let id = s.create(ready).await;
+    report_node_sdn(
+        &s,
+        Some(opl_types::sdn::NodeSdn {
+            chassis: opl_types::sdn::ChassisState::Ready,
+            lockdown: Some(opl_types::sdn::LockdownNodeState {
+                firewall: false,
+                allowed: 1,
+                error: Some(format!(
+                    "{} (OVN_Northbound has not heard from ssl:10.0.0.2:6643); removed it again",
+                    opl_types::sdn::LOCKDOWN_RAFT_CUT
+                )),
+            }),
+            ..Default::default()
+        }),
+    )
+    .await;
+    // 에이전트 흉내: 잠금을 원하면 중앙을 잠근다(표는 끊김으로 걷었다고 이미 알렸다).
+    let cluster = s.env.cluster.clone();
+    let node = s.env.node;
+    let agent = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Some(sdn) = cluster.get_by_name::<SdnSpec>(SDN_NAME).unwrap() else {
+                continue;
+            };
+            let applied = sdn
+                .status
+                .lockdown
+                .as_ref()
+                .is_some_and(|l| l.applied.contains(&node));
+            if sdn.spec.lockdown && !applied {
+                let mut status = sdn.status.clone();
+                status
+                    .lockdown
+                    .get_or_insert_with(Default::default)
+                    .applied
+                    .push(node);
+                let _ = cluster
+                    .update_status_checked::<SdnSpec>(sdn.id, sdn.revision, &status)
+                    .await;
+            }
+        }
+    });
+    let task = s.task(TaskOp::SdnLockdown { enabled: true }, id);
+    s.hold(&task).await;
+    let done = s.run(task).await;
+    agent.abort();
+    assert_eq!(state(&done), "failed", "{done}");
+    assert!(
+        error(&done).contains("could not keep its address allow-list"),
+        "{done}"
+    );
+    assert!(
+        error(&done).contains("turned the OVN lockdown off again"),
+        "{done}"
+    );
+    let sdn = s
+        .env
+        .cluster
+        .get_by_name::<SdnSpec>(SDN_NAME)
+        .unwrap()
+        .unwrap();
+    assert!(!sdn.spec.lockdown, "the failed turn-on must not stay on");
+    let lockdown = sdn.status.lockdown.unwrap();
+    assert!(!lockdown.pending, "{lockdown:?}");
+    assert!(
+        lockdown
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("turned the OVN lockdown off again")),
+        "{lockdown:?}"
+    );
+    assert_eq!(sdn.status.pending, None);
+}

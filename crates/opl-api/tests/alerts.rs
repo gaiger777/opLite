@@ -1343,6 +1343,27 @@ async fn sdn_alerts_fire_from_node_state_and_observations() {
     );
     settle().await;
     assert_eq!(rig.hook.hits().len(), 2, "the failover was sent once");
+    // 리뷰 2 m5: 주인이 없던 관찰을 지나 되돌아와도(node2 → 없음 → node1) 넘김으로 보고, 오가는 BFD(다시 node2 →
+    // node1)는 `repeat_secs` 안에 한 번만 보낸다.
+    let none = |at: i64| SdnObservations {
+        term,
+        at: now + at,
+        hosting: Default::default(),
+        monitors: vec![],
+    };
+    observations.set(none(5));
+    settle().await;
+    observations.set(obs(term, 6, rig.env.node));
+    let hits = rig.hook.wait(3).await;
+    assert_eq!(
+        hits[2].json()["detail"],
+        "The gateway of router r1 moved from node2 to node1"
+    );
+    for (at, host) in [(7, node2), (8, rig.env.node)] {
+        observations.set(obs(term, at, host));
+        settle().await;
+    }
+    assert_eq!(rig.hook.hits().len(), 3, "a flapping gateway is damped");
 
     // chassis가 돌아오면 60초 뒤 해제
     let mut n2 = rig.env.cluster.get::<NodeSpec>(node2).unwrap().unwrap();
@@ -1362,7 +1383,7 @@ async fn sdn_alerts_fire_from_node_state_and_observations() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     rig.step(RESOLVE_AFTER_MS + 1_000, 1.0);
-    let hits = rig.hook.wait(3).await;
-    assert_eq!(hits[2].json()["state"], "resolved", "{:?}", hits[2].json());
+    let hits = rig.hook.wait(4).await;
+    assert_eq!(hits[3].json()["state"], "resolved", "{:?}", hits[3].json());
     engine.shutdown().await;
 }

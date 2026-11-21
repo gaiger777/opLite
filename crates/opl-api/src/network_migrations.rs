@@ -101,6 +101,8 @@ pub(crate) fn sees_vm(state: &AppState, principal: &Principal, id: Uuid) -> bool
 pub(crate) fn redact(state: &AppState, principal: &Principal, m: &mut NetworkMigration) {
     m.status.vms.retain(|v| sees_vm(state, principal, v.vm));
     m.spec.addresses.retain(|a| sees_vm(state, principal, a.vm));
+    // 계획에 없는 VM이 쓰는 주소는 누구에게도 내지 않는다(리뷰 2 I4).
+    m.status.held_ips.clear();
 }
 
 /// [`redact`]의 JSON 판(watch 이벤트의 스펙·상태)
@@ -119,6 +121,9 @@ pub(crate) fn redact_json(
     if let Some(vms) = status.get_mut("vms").and_then(|v| v.as_array_mut()) {
         vms.retain(keep);
     }
+    if let Some(status) = status.as_object_mut() {
+        status.remove("held_ips");
+    }
     if let Some(addresses) = spec.get_mut("addresses").and_then(|v| v.as_array_mut()) {
         addresses.retain(keep);
     }
@@ -130,7 +135,12 @@ pub(crate) fn pick_name(source: &str, target: &str, taken: impl Fn(&str) -> bool
     let base = format!("{source}-to-{target}");
     let fit = |suffix: &str| {
         let mut b = base.clone();
-        b.truncate(63 - suffix.len());
+        // 글자 경계에서 자른다(리뷰 2 m2 — 바이트 자리에서 자르면 ASCII가 아닌 이름에서 멈춘다).
+        let mut end = (63 - suffix.len()).min(b.len());
+        while !b.is_char_boundary(end) {
+            end -= 1;
+        }
+        b.truncate(end);
         let b = b.trim_end_matches('-');
         format!("{b}{suffix}")
     };
@@ -146,27 +156,18 @@ pub(crate) fn pick_name(source: &str, target: &str, taken: impl Fn(&str) -> bool
         .unwrap_or(base)
 }
 
-/// 계획할 VM(스펙의 `vms`, 없으면 원본에 NIC가 있는 VM) 가운데 켜진 것의 게스트 에이전트 정보(캐시 — §9.2 주소 출처
-/// `guest-agent`). 답하지 않는 VM은 빠진다(주소를 모름). 부른 사용자가 읽을 수 없는 VM은 묻지 않는다(리뷰 1 I3).
-async fn guests(
-    state: &AppState,
-    principal: &Principal,
-    spec: &NetworkMigrationSpec,
-) -> BTreeMap<Uuid, GuestInfo> {
+/// 원본에 NIC가 있는 VM 가운데 켜진 것의 게스트 에이전트 정보(캐시 — §9.2 주소 출처 `guest-agent`). 답하지 않는 VM은
+/// 빠진다(주소를 모름). 부른 사용자가 읽을 수 없는 VM과 계획에서 뺀 VM도 서버 안에서 묻는다(리뷰 2 I4 — 원본에 남아 쓰는
+/// 주소를 잡아 두려고). 그 답은 계획·응답에 내지 않는다(`plan_world`가 읽을 수 없는 VM을 빼고, 남는 VM의 주소는 id 없이
+/// `status.held_ips`에만 적는다).
+async fn guests(state: &AppState, spec: &NetworkMigrationSpec) -> BTreeMap<Uuid, GuestInfo> {
     let Ok((_, vms)) = state.cluster.list::<VmSpec>() else {
         return BTreeMap::new();
     };
-    let sees = reads(state, principal);
     let wanted: Vec<Vm> = vms
         .into_iter()
-        .filter(|v| !v.spec.template && sees(v))
-        .filter(|v| {
-            if spec.vms.is_empty() {
-                v.spec.nics.iter().any(|n| n.network == spec.source)
-            } else {
-                spec.vms.contains(&v.id)
-            }
-        })
+        .filter(|v| !v.spec.template)
+        .filter(|v| v.spec.nics.iter().any(|n| n.network == spec.source))
         .collect();
     let answers = futures_util::future::join_all(
         wanted
@@ -295,6 +296,13 @@ pub async fn create_network_migration(
         check_name(&req.name)?;
     }
     require_networks(&state, &principal, &req.spec)?;
+    // 스펙과 두 네트워크를 이름 고르기(`pick_name`) 전에 본다(리뷰 2 m2).
+    req.spec.validate().map_err(|e| invalid(e.to_string()))?;
+    for name in [&req.spec.source, &req.spec.target] {
+        if state.cluster.get_by_name::<NetworkSpec>(name)?.is_none() {
+            return Err(invalid(format!("network {name:?} not found")));
+        }
+    }
     // 읽을 수 없는 VM은 없는 VM과 같다(리뷰 1 I3 — 있는지도 캐 보지 못하게).
     for id in req
         .spec
@@ -319,7 +327,7 @@ pub async fn create_network_migration(
         Kind::NetworkMigration,
         folder,
     )?;
-    let guests = Box::pin(guests(&state, &principal, &req.spec)).await;
+    let guests = Box::pin(guests(&state, &req.spec)).await;
     let allowed = configures(&state, &principal);
     let sees = reads(&state, &principal);
     if query.dry_run {
@@ -373,6 +381,7 @@ pub async fn create_network_migration(
             .await?;
         migration.labels = req.labels.clone();
     }
+    redact(&state, &principal, &mut migration);
     audit.detail(format!(
         "network migrate {} → {} ({})",
         migration.spec.source,
@@ -561,8 +570,9 @@ pub async fn pause_network_migration(
 ) -> Result<Json<NetworkMigration>, ApiError> {
     let m = lookup::<NetworkMigrationSpec>(&state.cluster, &key)?;
     require_networks(&state, &principal, &m.spec)?;
-    let m = engine::pause_migration(&state.cluster, m.id).await?;
+    let mut m = engine::pause_migration(&state.cluster, m.id).await?;
     audit.detail(format!("network migrate {} pause", m.spec.source));
+    redact(&state, &principal, &mut m);
     Ok(Json(m))
 }
 
@@ -760,5 +770,10 @@ mod tests {
         let name = pick_name(&"x".repeat(58), "yy", |_| false);
         assert!(!name.ends_with('-'), "{name}");
         opl_types::resource::validate_name(&name).unwrap();
+        // 리뷰 2 m2: ASCII가 아닌 긴 이름도 글자 경계에서 자른다(전에는 멈췄다).
+        let wide = pick_name(&"é".repeat(40), "x", |_| false);
+        assert!(wide.len() <= 63 && wide.starts_with('é'), "{wide}");
+        let wide2 = pick_name(&"é".repeat(40), "x", |n| n == wide);
+        assert!(wide2.len() <= 63 && wide2.ends_with("-2"), "{wide2}");
     }
 }
