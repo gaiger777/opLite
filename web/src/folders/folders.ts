@@ -17,10 +17,13 @@ export const MEMBER_KIND: Record<FolderKind, MemberKind> = {
   storage: "storage-pool",
 };
 
-/** 트리에 들 수 있는 객체 종류(서버 `FolderKind::member_kinds` — 네트워크 폴더에는 라우터·유동 IP도, 계획 66) */
+/**
+ * 트리에 들 수 있는 객체 종류(서버 `FolderKind::member_kinds` — 네트워크 폴더에는 라우터·유동 IP(계획 66)와 부하 분산기
+ * (계획 67)도. 네트워크 옮기기는 원본 네트워크의 폴더에 생기는 기록이라 화면에서 옮기지 않는다)
+ */
 export const MEMBER_KINDS: Record<FolderKind, readonly MemberKind[]> = {
   vm: ["vm"],
-  network: ["network", "router", "floating-ip"],
+  network: ["network", "router", "floating-ip", "load-balancer"],
   storage: ["storage-pool"],
 };
 

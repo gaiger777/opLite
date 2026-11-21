@@ -1,5 +1,16 @@
 import type { AlertRule } from "@/alerts/alerts";
-import { checkRuleForm, emptyRuleForm, ruleFormOf, ruleSpecOf } from "@/alerts/rules";
+import {
+  checkRuleForm,
+  CONDITION_KINDS,
+  emptyRuleForm,
+  isEvent,
+  isSdn,
+  ruleFormOf,
+  ruleSpecOf,
+  SDN_DEFAULTS,
+  sdnDefaultSpec,
+  takesNodes,
+} from "@/alerts/rules";
 
 const rule = (spec: Partial<AlertRule["spec"]>): AlertRule => ({
   id: "r1",
@@ -92,4 +103,27 @@ it("checks the form like the server", () => {
   expect(checkRuleForm({ ...ok, kind: "ha_recovery", forSecs: "x", repeatSecs: "x" }, [])).toEqual(
     {},
   );
+});
+
+it("offers SDN conditions and filters nodes only on node subjects (plan 67)", () => {
+  const form = { ...emptyRuleForm(), name: "q", targets: ["ops"], nodes: "node-a" };
+  // 정족수(대상 SDN)는 노드로 거르지 않고, chassis 꺼짐(대상 노드)은 거른다.
+  expect(ruleSpecOf({ ...form, kind: "sdn_quorum_lost" })).not.toHaveProperty("nodes");
+  expect(ruleSpecOf({ ...form, kind: "sdn_chassis_down" }).nodes).toEqual(["node-a"]);
+  expect(takesNodes("sdn_lb_member_down")).toBe(false);
+  expect(takesNodes("node_metric")).toBe(true);
+  // 게이트웨이 넘김은 이벤트(지속 시간 0)
+  expect(isEvent("sdn_gateway_failover")).toBe(true);
+  expect(ruleSpecOf({ ...form, kind: "sdn_gateway_failover", forSecs: "60" }).for_secs).toBe(0);
+  expect(CONDITION_KINDS.filter(isSdn)).toHaveLength(8);
+  expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(CONDITION_KINDS.filter(isSdn).sort());
+  expect(sdnDefaultSpec(SDN_DEFAULTS[0]!, ["ops"])).toEqual({
+    enabled: true,
+    condition: { kind: "sdn_quorum_lost" },
+    for_secs: 0,
+    severity: "critical",
+    targets: ["ops"],
+    repeat_secs: 14400,
+    send_resolved: true,
+  });
 });

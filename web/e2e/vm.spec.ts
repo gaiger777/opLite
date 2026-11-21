@@ -405,3 +405,42 @@ test("routers and floating IPs before SDN is set up", async ({ page }) => {
   await expect(page.getByText("No floating IPs")).toBeVisible();
   await expect(page.getByRole("button", { name: "Create a floating IP" })).toBeDisabled();
 });
+
+// 계획 67: 2.5D 토폴로지(네트워크 탭의 보기, 늦게 읽는 조각)는 단순 네트워크만 있는 클러스터에서도 그림을 그리고 목록 보기로
+// 바뀐다. 부하 분산은 SDN 설정 전에 빈 상태와 막힌 만들기다.
+test("network topology and load balancers before SDN is set up", async ({ page }) => {
+  await signIn(page);
+  await openTab(page, "Infrastructure", "Networks");
+  await page.getByRole("main").getByRole("button", { name: "Create", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Create a network" });
+  await dialog.getByLabel("Name").fill("e2e-lan");
+  await dialog.getByLabel("Bridge").fill("e2ebr0");
+  await dialog.getByRole("button", { name: "Create" }).click();
+  await expect(page.getByRole("cell", { name: "e2e-lan", exact: true })).toBeVisible();
+
+  const views = page.getByRole("navigation", { name: "Networks views" });
+  await views.getByRole("link", { name: "Topology", exact: true }).click();
+  await expect(page).toHaveURL(/\/networks\/topology$/);
+  const picture = page.getByRole("group", { name: "Network topology" });
+  await expect(
+    picture.getByRole("button", { name: /^Simple network e2e-lan, bridge/ }),
+  ).toBeVisible();
+  await page.getByRole("radio", { name: "List" }).click();
+  const list = page.getByRole("region", { name: "Network topology as a list" });
+  await expect(list.getByRole("button", { name: "e2e-lan" })).toBeVisible();
+  // 다음에 열 때를 위해 그림으로 되돌린다(브라우저에 기억한다).
+  await page.getByRole("radio", { name: "Picture" }).click();
+
+  await views.getByRole("link", { name: "Load balancers", exact: true }).click();
+  await expect(page).toHaveURL(/\/load-balancers$/);
+  await expect(page.getByText("No load balancers")).toBeVisible();
+  await expect(
+    page.getByText("Load balancers need SDN (OVN) set up first, under Networks › SDN."),
+  ).toBeVisible();
+  await expect(page.getByRole("button", { name: "Create a load balancer" })).toBeDisabled();
+
+  await views.getByRole("link", { name: "Networks", exact: true }).click();
+  await page.getByRole("button", { name: "Delete e2e-lan" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByRole("cell", { name: "e2e-lan", exact: true })).toHaveCount(0);
+});

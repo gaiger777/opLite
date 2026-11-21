@@ -32,6 +32,7 @@ import {
 } from "@/components/ui/table";
 import { FolderSelect, useNewFolder } from "@/folders/FolderSelect";
 import { useFolderPaths } from "@/folders/useFolderPaths";
+import { useOpenParam } from "@/lib/createParam";
 import { errorMessage } from "@/i18n/errors";
 import { PermissionsButton, PermissionsSheet } from "@/permissions/PermissionsSheet";
 import {
@@ -75,6 +76,8 @@ export function RoutersPage() {
   const blocked = useSdnBlocked();
   const [creating, setCreating] = useState(false);
   const [opened, setOpened] = useState<string | null>(null);
+  // 토폴로지 그림에서 누른 라우터(`?open=<id>`)
+  useOpenParam(setOpened);
   const [sharing, setSharing] = useState<Router | null>(null);
   const [deleting, setDeleting] = useState<Router | null>(null);
   const queryClient = useQueryClient();

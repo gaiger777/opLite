@@ -5,6 +5,7 @@ import { http, HttpResponse, ws } from "msw";
 import { listKey, SETTINGS_KEY, useList, useSettings, useSubscription } from "@/api/live";
 import { LiveProvider, useLiveStatus } from "@/api/LiveProvider";
 import { createQueryClient } from "@/api/queryClient";
+import { useRouters } from "@/routing/routing";
 import { apiUrl, server } from "@/test/server";
 
 const watch = ws.link(`ws://${window.location.host}/api/v1/watch`);
@@ -64,7 +65,7 @@ it("watches from the oldest list revision and applies changes", async () => {
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,settings&since=7",
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,router,floating-ip,load-balancer,network-migration,settings&since=7",
   );
 });
 
@@ -327,7 +328,7 @@ it("reads and watches only what a folder user can read at the root", async () =>
   );
   expect(await screen.findByText("live: web=stopped")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,task,network,snapshot,backup,vm-import,folder&since=7",
+    "kinds=vm,volume,storage-pool,task,network,snapshot,backup,vm-import,folder,router,floating-ip,load-balancer,network-migration&since=7",
   );
   expect(read).toEqual([]);
 });
@@ -361,4 +362,44 @@ it("drops the lists of kinds the user can no longer read", async () => {
   expect(queryClient.getQueryData(listKey("node"))).toBeUndefined();
   expect(queryClient.getQueryData(SETTINGS_KEY)).toBeUndefined();
   expect(queryClient.getQueryData(listKey("vm"))).toBeDefined();
+});
+
+it("reads view lists again (batched) when their watch events arrive (plan 67)", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  let reads = 0;
+  let send: ((data: string) => void) | undefined;
+  server.use(
+    ...lists([], 7),
+    // 라우터 목록은 보기(서버가 게이트웨이 순위를 덧붙임)라 사건으로 고치지 않고 다시 읽는다.
+    http.get(apiUrl("/routers"), () => {
+      reads += 1;
+      return HttpResponse.json({ revision: 7 + reads, items: [], routed: [] });
+    }),
+    watch.addEventListener("connection", ({ client }) => {
+      send = (data) => client.send(data);
+    }),
+  );
+  function Routers() {
+    const routers = useRouters();
+    return <p>routers read {routers.dataUpdatedAt > 0 ? "yes" : "no"}</p>;
+  }
+  render(
+    <QueryClientProvider client={createQueryClient()}>
+      <LiveProvider>
+        <Probe />
+        <Routers />
+      </LiveProvider>
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByText("live:")).toBeInTheDocument();
+  await vi.advanceTimersByTimeAsync(1100);
+  const before = reads;
+  const router = { id: "r1", name: "r1", revision: 9, spec: {}, status: {} };
+  send!(JSON.stringify({ type: "put", kind: "router", resource: router }));
+  send!(JSON.stringify({ type: "put", kind: "floating-ip", resource: { ...router, id: "f1" } }));
+  // 1초 모은 뒤 한 번만 다시 읽는다.
+  await vi.advanceTimersByTimeAsync(500);
+  expect(reads).toBe(before);
+  await vi.advanceTimersByTimeAsync(600);
+  await vi.waitFor(() => expect(reads).toBe(before + 1));
 });

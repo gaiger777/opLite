@@ -115,6 +115,15 @@ export const appRoutes: RouteObject[] = [
                 path: "floating-ips",
                 lazy: page(() => import("@/routing/FloatingIpsPage"), "FloatingIpsPage"),
               },
+              // 계획 67: 부하 분산기, 2.5D 네트워크 토폴로지(그림 코드는 이 조각에만 — 첫 화면 묶음에 없다)
+              {
+                path: "load-balancers",
+                lazy: page(() => import("@/lb/LoadBalancersPage"), "LoadBalancersPage"),
+              },
+              {
+                path: "networks/topology",
+                lazy: page(() => import("@/topology/TopologyPage"), "TopologyPage"),
+              },
               {
                 path: "security-groups",
                 lazy: page(

@@ -17,6 +17,15 @@ export const CONDITION_KINDS: readonly ConditionKind[] = [
   "task_failed",
   "ha_recovery",
   "backup_job_failed",
+  // SDN(OVN, 계획 67 §11) — 리더가 평가한다.
+  "sdn_quorum_lost",
+  "sdn_central_down",
+  "sdn_chassis_down",
+  "sdn_gateway_unavailable",
+  "sdn_gateway_failover",
+  "sdn_sync_failed",
+  "sdn_physnet_not_ready",
+  "sdn_lb_member_down",
 ];
 export const NODE_METRICS: readonly NodeMetric[] = [
   "cpu",
@@ -40,7 +49,76 @@ export const VM_METRICS: readonly VmMetric[] = [
 
 /** 한 번 일어나는 일(지속 시간이 없고 해제도 없다) */
 export function isEvent(kind: ConditionKind): boolean {
-  return kind === "task_failed" || kind === "ha_recovery" || kind === "backup_job_failed";
+  return (
+    kind === "task_failed" ||
+    kind === "ha_recovery" ||
+    kind === "backup_job_failed" ||
+    kind === "sdn_gateway_failover"
+  );
+}
+
+/** SDN 조건(서버 `AlertCondition::is_sdn`) */
+export function isSdn(kind: ConditionKind): boolean {
+  return kind.startsWith("sdn_");
+}
+
+/**
+ * `nodes`로 거를 수 있는 조건: 백업 작업 조건이 아니고, SDN 조건이면 대상이 노드인 것만(중앙 꺼짐·chassis 꺼짐·physnet
+ * 준비 안 됨 — 나머지는 서버가 400 `NodesFilter`)
+ */
+export function takesNodes(kind: ConditionKind): boolean {
+  if (kind === "backup_job_failed") {
+    return false;
+  }
+  return (
+    !isSdn(kind) ||
+    kind === "sdn_central_down" ||
+    kind === "sdn_chassis_down" ||
+    kind === "sdn_physnet_not_ready"
+  );
+}
+
+/** "SDN 경보 켜기"가 만드는 권하는 규칙(§11 — 이름·조건·심각도·지속 시간 초) */
+export const SDN_DEFAULTS: readonly {
+  name: string;
+  kind: ConditionKind;
+  severity: Severity;
+  forSecs: number;
+}[] = [
+  { name: "sdn-quorum-lost", kind: "sdn_quorum_lost", severity: "critical", forSecs: 0 },
+  { name: "sdn-central-down", kind: "sdn_central_down", severity: "warning", forSecs: 60 },
+  { name: "sdn-chassis-down", kind: "sdn_chassis_down", severity: "warning", forSecs: 60 },
+  {
+    name: "sdn-gateway-unavailable",
+    kind: "sdn_gateway_unavailable",
+    severity: "critical",
+    forSecs: 30,
+  },
+  { name: "sdn-gateway-failover", kind: "sdn_gateway_failover", severity: "info", forSecs: 0 },
+  { name: "sdn-sync-failed", kind: "sdn_sync_failed", severity: "warning", forSecs: 120 },
+  {
+    name: "sdn-physnet-not-ready",
+    kind: "sdn_physnet_not_ready",
+    severity: "warning",
+    forSecs: 60,
+  },
+  { name: "sdn-lb-member-down", kind: "sdn_lb_member_down", severity: "warning", forSecs: 30 },
+];
+
+/** 권하는 SDN 규칙 하나의 스펙(대상 `targets`, 나머지는 서버 기본값과 같다) */
+export function sdnDefaultSpec(
+  rule: (typeof SDN_DEFAULTS)[number],
+  targets: string[],
+): AlertRuleSpec {
+  return {
+    enabled: true,
+    condition: { kind: rule.kind } as AlertCondition,
+    for_secs: rule.forSecs,
+    severity: rule.severity,
+    targets,
+    repeat_secs: 14_400,
+    send_resolved: !isEvent(rule.kind),
+  };
 }
 
 /** `vms`로 거를 수 있는 조건(서버의 `about_vms`) */
@@ -190,11 +268,11 @@ function conditionOf(form: RuleForm): AlertCondition {
 
 /**
  * 보낼 규칙. 이벤트 조건은 지속 시간이 0이고 반복이 없다(서버 기본값). `vms`는 VM 조건에만,
- * `nodes`는 백업 작업 조건이 아닐 때만 보낸다(서버가 다른 조합을 거절한다).
+ * `nodes`는 노드로 거를 수 있는 조건에만(`takesNodes`) 보낸다(서버가 다른 조합을 거절한다).
  */
 export function ruleSpecOf(form: RuleForm): AlertRuleSpec {
   const event = isEvent(form.kind);
-  const nodes = form.kind === "backup_job_failed" ? [] : splitNames(form.nodes);
+  const nodes = takesNodes(form.kind) ? splitNames(form.nodes) : [];
   const vms = aboutVms(form.kind) ? splitNames(form.vms) : [];
   return {
     enabled: form.enabled,

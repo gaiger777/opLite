@@ -514,3 +514,49 @@ it("says why TPM or Secure Boot cannot be turned on for the chosen node", () => 
   });
   expect(firmwareUnavailable([tpmOnly, old], "n1", "tpm")).toBeNull();
 });
+
+it("checks, round-trips and sends NIC QoS (plan 67)", () => {
+  const web = vm("web", "running", {
+    spec: {
+      ...vm("web", "running").spec,
+      nics: [
+        {
+          network: "t1",
+          model: "virtio",
+          mac: "52:54:00:12:34:56",
+          qos: { out_mbps: 100, dscp: 46 },
+        },
+        { network: "lan", model: "virtio", mac: "52:54:00:12:34:57" },
+      ],
+    },
+  });
+  const v = fromVm(web);
+  expect(v.nics[0]!.qos).toEqual({ out: "100", in: "", burst: "", dscp: "46" });
+  // QoS가 없는 NIC는 칸이 없다(옛 폼 그대로)
+  expect(v.nics[1]).not.toHaveProperty("qos");
+  expect(toSpec(v, "running", [true, false]).nics).toEqual([
+    { network: "t1", model: "virtio", mac: "52:54:00:12:34:56", qos: { out_mbps: 100, dscp: 46 } },
+    { network: "lan", model: "virtio", mac: "52:54:00:12:34:57" },
+  ]);
+  // 모두 비우면 보내지 않는다
+  const cleared = {
+    ...v,
+    nics: [{ ...v.nics[0]!, qos: { out: "", in: "", burst: "", dscp: "" } }],
+  };
+  expect(toSpec(cleared, "running", [true]).nics?.[0]).not.toHaveProperty("qos");
+
+  const bad = {
+    ...v,
+    nics: [
+      { ...v.nics[1]!, qos: { out: "0", in: "", burst: "", dscp: "7" } },
+      { ...v.nics[1]!, mac: "", qos: { out: "", in: "", burst: "100", dscp: "" } },
+      { ...v.nics[1]!, mac: "", network: "user", qos: { out: "10", in: "", burst: "", dscp: "" } },
+    ],
+  };
+  expect(validate(bad, false, [], [false, false, false])).toEqual({
+    "nics.0.qos.out": "vmForm.errors.qos.out",
+    "nics.0.qos.dscp": "vmForm.errors.qos.dscpNeedsSdn",
+    "nics.1.qos.burst": "vmForm.errors.qos.burstWithoutRate",
+    "nics.2.qos.out": "vmForm.errors.qos.user",
+  });
+});

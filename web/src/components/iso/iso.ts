@@ -1,0 +1,149 @@
+// 아이소메트릭(2.5D) 그림의 순수 셈(계획 67 §12.1): 투영, 상자의 보이는 면, 깊이 차례, 면 밝기. 진짜 3D(WebGL)가
+// 아니라 SVG 한 장에 "3D처럼 보이는 2D"를 그린다. 계획 70의 클러스터 보기가 같은 조각을 쓴다.
+
+/** cos 30° — 아이소메트릭 축의 가로 비율 */
+export const COS30 = Math.cos(Math.PI / 6);
+/** sin 30° */
+export const SIN30 = 0.5;
+
+/** 화면(SVG) 좌표 */
+export interface Point {
+  x: number;
+  y: number;
+}
+
+/** 세계 좌표의 상자: (x, y, z)에서 x로 `w`, y로 `d`, 위로 `h` */
+export interface Box {
+  x: number;
+  y: number;
+  z: number;
+  w: number;
+  d: number;
+  h: number;
+}
+
+/**
+ * 세계 좌표 → 화면 좌표: `iso(x, y, z) = ((x − y)·cos 30°, (x + y)·sin 30° − z)`. x가 늘면 오른쪽 아래, y가 늘면 왼쪽
+ * 아래, z가 늘면 위로 간다(보는 사람은 +x·+y·+z 쪽에 있다).
+ */
+export function iso(x: number, y: number, z = 0): Point {
+  return { x: (x - y) * COS30, y: (x + y) * SIN30 - z };
+}
+
+/** SVG `points` 글 */
+export function pointsAttr(points: readonly Point[]): string {
+  return points.map((p) => `${round(p.x)},${round(p.y)}`).join(" ");
+}
+
+/** 소수 둘째 자리(그림 글을 짧게) */
+export function round(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+/** 상자의 보이는 세 면(위, +y 쪽 "왼쪽", +x 쪽 "오른쪽")의 화면 꼭짓점 */
+export function boxFaces(b: Box): { top: Point[]; left: Point[]; right: Point[] } {
+  const { x, y, z, w, d, h } = b;
+  const top = z + h;
+  return {
+    top: [iso(x, y, top), iso(x + w, y, top), iso(x + w, y + d, top), iso(x, y + d, top)],
+    left: [iso(x, y + d, top), iso(x + w, y + d, top), iso(x + w, y + d, z), iso(x, y + d, z)],
+    right: [iso(x + w, y, top), iso(x + w, y + d, top), iso(x + w, y + d, z), iso(x + w, y, z)],
+  };
+}
+
+/** 상자 윗면의 가운데(화면) — 글과 이음선의 끝 */
+export function topCenter(b: Box): Point {
+  return iso(b.x + b.w / 2, b.y + b.d / 2, b.z + b.h);
+}
+
+/** 상자 바닥의 가운데(화면) */
+export function bottomCenter(b: Box): Point {
+  return iso(b.x + b.w / 2, b.y + b.d / 2, b.z);
+}
+
+/** 화면에서 상자가 차지하는 사각형 */
+export function boxBounds(b: Box): { minX: number; minY: number; maxX: number; maxY: number } {
+  const f = boxFaces(b);
+  const all = [...f.top, ...f.left, ...f.right];
+  return {
+    minX: Math.min(...all.map((p) => p.x)),
+    minY: Math.min(...all.map((p) => p.y)),
+    maxX: Math.max(...all.map((p) => p.x)),
+    maxY: Math.max(...all.map((p) => p.y)),
+  };
+}
+
+/**
+ * 깊이 열쇠(먼 것부터 그린다): 바닥 가운데의 x + y, 같으면 z. SVG에는 z-index가 없으므로 원소 순서가 곧 깊이다.
+ */
+export function depthOf(b: Box): number {
+  return b.x + b.w / 2 + (b.y + b.d / 2) + b.z * 1e-3;
+}
+
+/** 깊이 순으로 정렬한 새 배열(같으면 원래 차례 — 안정 정렬) */
+export function byDepth<T extends { box: Box; layer?: number }>(items: readonly T[]): T[] {
+  return [...items].sort(
+    (a, b) => (a.layer ?? 0) - (b.layer ?? 0) || depthOf(a.box) - depthOf(b.box),
+  );
+}
+
+/** 면마다 밝기: 위는 밝게, 왼쪽은 그대로, 오른쪽은 어둡게(디자인 토큰 색에서 셈 — 밝음·어둠 테마 모두) */
+export type Face = "top" | "left" | "right";
+
+export function shade(color: string, face: Face): string {
+  switch (face) {
+    case "top":
+      return `color-mix(in oklab, ${color} 78%, white)`;
+    case "left":
+      return color;
+    case "right":
+      return `color-mix(in oklab, ${color} 72%, black)`;
+  }
+}
+
+/**
+ * 바닥 원 위의 정다각형 기둥(육각 기둥 따위)의 윗면 꼭짓점(세계 좌표 둘레, 화면으로)과 보이는 옆면. 옆면은 바깥 법선이
+ * 보는 쪽(+x·+y)을 향하는 것만 먼 것부터.
+ */
+export function prismFaces(
+  cx: number,
+  cy: number,
+  z: number,
+  r: number,
+  h: number,
+  sides = 6,
+): { top: Point[]; sides: Point[][] } {
+  const corners = Array.from({ length: sides }, (_, i) => {
+    const a = (Math.PI * 2 * i) / sides + Math.PI / sides;
+    return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+  });
+  const top = corners.map((c) => iso(c.x, c.y, z + h));
+  const faces: { depth: number; points: Point[] }[] = [];
+  corners.forEach((a, i) => {
+    const b = corners[(i + 1) % sides]!;
+    // 바깥 법선 = 가운데에서 두 꼭짓점의 가운데로
+    const nx = (a.x + b.x) / 2 - cx;
+    const ny = (a.y + b.y) / 2 - cy;
+    if (nx + ny <= 0) {
+      return;
+    }
+    faces.push({
+      depth: a.x + b.x + a.y + b.y,
+      points: [iso(a.x, a.y, z + h), iso(b.x, b.y, z + h), iso(b.x, b.y, z), iso(a.x, a.y, z)],
+    });
+  });
+  faces.sort((p, q) => p.depth - q.depth);
+  return { top, sides: faces.map((f) => f.points) };
+}
+
+/**
+ * 두 화면 점을 잇는 SVG 경로. `lift`가 있으면 가운데를 그만큼 위로 올린 2차 곡선(휜 선)이다.
+ */
+export function linkPath(from: Point, to: Point, lift = 0): string {
+  if (lift === 0) {
+    return `M${round(from.x)},${round(from.y)} L${round(to.x)},${round(to.y)}`;
+  }
+  const mx = (from.x + to.x) / 2;
+  const my = (from.y + to.y) / 2 - lift;
+  return `M${round(from.x)},${round(from.y)} Q${round(mx)},${round(my)} ${round(to.x)},${round(to.y)}`;
+}

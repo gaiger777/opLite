@@ -1,5 +1,5 @@
 import type { components } from "@/api/schema";
-import type { Node, Vm, VmSpec } from "@/api/types";
+import type { Node, NicSpec, Vm, VmSpec } from "@/api/types";
 import { emptyNuma, numaErrors, numaFrom, numaSpec, type NumaValues } from "@/numa/numa";
 import { MAX_NIC_SECURITY_GROUPS } from "@/security-groups/rules";
 import { formatIps, parseIps } from "@/sdn/ips";
@@ -80,6 +80,86 @@ export interface NicRow {
    * 서버가 지금 주소를 그대로 둔다.
    */
   ips: string;
+  /** 속도 제한·DSCP(계획 67, 글 입력 그대로). 없거나 모두 비면 보내지 않는다. */
+  qos?: QosRow;
+}
+
+/** NIC QoS 입력: 보내기·받기 Mbit/s, 버스트 kbit, DSCP(SDN NIC만) */
+export interface QosRow {
+  out: string;
+  in: string;
+  burst: string;
+  dscp: string;
+}
+
+/** 서버 `NicQos::validate`의 범위 */
+export const MAX_QOS_MBPS = 100_000;
+export const MAX_QOS_BURST_KBIT = 10_000_000;
+export const MAX_DSCP = 63;
+
+export function qosRow(q: NicSpec["qos"]): QosRow | undefined {
+  return q
+    ? {
+        out: q.out_mbps?.toString() ?? "",
+        in: q.in_mbps?.toString() ?? "",
+        burst: q.burst_kbit?.toString() ?? "",
+        dscp: q.dscp?.toString() ?? "",
+      }
+    : undefined;
+}
+
+/** 입력이 하나라도 있는지(모두 비면 QoS 없음) */
+export function hasQos(q: QosRow | undefined): q is QosRow {
+  return !!q && [q.out, q.in, q.burst, q.dscp].some((v) => v.trim() !== "");
+}
+
+/**
+ * QoS 입력의 오류(칸 → 번역 키): 범위, 속도 없이 버스트만(`BurstWithoutRate`), `user` 네트워크(tap이 없다 — 400
+ * `invalid_qos`), 단순 NIC의 DSCP(400 `qos_dscp_needs_sdn`).
+ */
+export function qosErrors(
+  q: QosRow | undefined,
+  network: string,
+  sdn: boolean,
+): Record<string, string> {
+  const errors: Record<string, string> = {};
+  if (!hasQos(q)) {
+    return errors;
+  }
+  const check = (key: keyof QosRow, min: number, max: number) => {
+    const v = q[key].trim();
+    if (v !== "" && !(/^\d+$/.test(v) && intIn(v, min, max))) {
+      errors[key] = `vmForm.errors.qos.${key}`;
+    }
+  };
+  check("out", 1, MAX_QOS_MBPS);
+  check("in", 1, MAX_QOS_MBPS);
+  check("burst", 1, MAX_QOS_BURST_KBIT);
+  check("dscp", 0, MAX_DSCP);
+  if (q.burst.trim() !== "" && q.out.trim() === "" && q.in.trim() === "") {
+    errors.burst = "vmForm.errors.qos.burstWithoutRate";
+  }
+  if (q.dscp.trim() !== "" && !sdn) {
+    errors.dscp = "vmForm.errors.qos.dscpNeedsSdn";
+  }
+  if (network === "user") {
+    errors.out = "vmForm.errors.qos.user";
+  }
+  return errors;
+}
+
+/** 보낼 `qos`(모두 비면 없음) */
+export function toQos(q: QosRow | undefined): NicSpec["qos"] {
+  if (!hasQos(q)) {
+    return undefined;
+  }
+  const n = (v: string) => (v.trim() === "" ? undefined : Number(v.trim()));
+  return {
+    ...(n(q.out) !== undefined && { out_mbps: n(q.out) }),
+    ...(n(q.in) !== undefined && { in_mbps: n(q.in) }),
+    ...(n(q.burst) !== undefined && { burst_kbit: n(q.burst) }),
+    ...(n(q.dscp) !== undefined && { dscp: n(q.dscp) }),
+  };
 }
 
 /** 예약 스냅샷 입력. 끄더라도 보관 개수와 메모리는 남겨 두어 다시 켤 때 쓴다. */
@@ -251,6 +331,7 @@ export function fromVm(vm: Vm): VmFormValues {
       mac: n.mac ?? "",
       securityGroups: n.security_groups ?? [],
       ips: formatIps(n.ips),
+      ...(n.qos && { qos: qosRow(n.qos) }),
     })),
     cloudInit: cloudInitFrom(s.cloud_init),
     node: s.node ?? "",
@@ -439,6 +520,9 @@ export function validate(
     const ips = parseIps(n.ips);
     if ("error" in ips) {
       errors[`nics.${i}.ips`] = ips.error;
+    }
+    for (const [key, error] of Object.entries(qosErrors(n.qos, n.network, sdn[i] !== false))) {
+      errors[`nics.${i}.qos.${key}`] = error;
     }
     if (n.mac === "") {
       return;
@@ -647,6 +731,7 @@ export function toSpec(
       // `cluster_upgrading`이다.
       ...(n.securityGroups.length > 0 && { security_groups: n.securityGroups }),
       ...(sdn[i] !== false && nicIps(n).length > 0 && { ips: nicIps(n) }),
+      ...(hasQos(n.qos) && { qos: toQos(n.qos) }),
     })),
     ...(v.cloudInit.enabled && { cloud_init: toCloudInit(v.cloudInit, v.nics.length, sdn) }),
     node: v.node === "" ? null : v.node,

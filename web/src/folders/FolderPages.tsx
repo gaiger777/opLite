@@ -40,6 +40,7 @@ import {
 import { endDrag, FolderTree, startDrag } from "@/folders/FolderTree";
 import { announceMove, MoveButton, MoveDialog } from "@/folders/MoveDialog";
 import { DIMENSIONS, formatDimension, UsageBars, useFolderUsage } from "@/folders/UsageBars";
+import { refreshLbs, useLoadBalancers } from "@/lb/lb";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
 import { refreshRouting, useFloatingIps, useRouters } from "@/routing/routing";
 import { VmPhaseBadge } from "@/vms/VmPhaseBadge";
@@ -61,13 +62,16 @@ function useMembers(kind: FolderKind) {
 function useNetworkExtras(enabled: boolean): Member[] {
   const routers = useRouters(enabled);
   const fips = useFloatingIps(enabled);
+  // 부하 분산기(계획 67)도 네트워크 폴더에 든다.
+  const lbs = useLoadBalancers(enabled, false);
   return useMemo(
     () =>
       [
         ...(routers.data ?? []).map((r) => ({ ...r, memberKind: "router" as const })),
         ...(fips.data ?? []).map((f) => ({ ...f, memberKind: "floating-ip" as const })),
+        ...(lbs.data ?? []).map((l) => ({ ...l, memberKind: "load-balancer" as const })),
       ] as unknown as Member[],
-    [routers.data, fips.data],
+    [routers.data, fips.data, lbs.data],
   );
 }
 
@@ -94,9 +98,10 @@ function useDrop(kind: FolderKind, tree: Tree) {
     onDrop(id: string, payload: DragPayload) {
       void moveMembers(id === ROOT_ID ? null : id, payload.kind, payload.names).then(
         (results) => {
-          // 라우터·유동 IP는 watch가 아니어서 다시 읽는다.
+          // 라우터·유동 IP·부하 분산기는 보기 목록이라 다시 읽는다.
           if (payload.kind !== MEMBER_KIND[kind]) {
             void refreshRouting(queryClient);
+            void refreshLbs(queryClient);
           }
           announceMove(t, label(id), results);
         },

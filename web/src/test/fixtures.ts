@@ -930,3 +930,44 @@ export function floatingIpView(
     ...(extra.vm_name && { vm_name: extra.vm_name }),
   } as unknown as import("@/routing/routing").FloatingIp;
 }
+
+/**
+ * `GET /load-balancers`의 항목(서버 `LoadBalancerView`, 계획 67): 리소스를 평평하게 펼치고(빈 `labels`·`monitors`·리스너
+ * `members`는 빠진다, `status`는 늘 `{}`) `vip_state`·`members`는 늘, `external_state`(바깥 VIP가 있을 때)·`live_error`는
+ * 있을 때만이다. 멤버 줄의 `vm`·`vm_name`·`mac`·`ip`·`reason`·`warning`도 있을 때만이다.
+ */
+export function lbView(
+  name: string,
+  spec: Record<string, unknown>,
+  view: Record<string, unknown> = {},
+) {
+  return {
+    id: `019a0f3c-0000-7000-800c-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 9,
+    spec,
+    status: {},
+    vip_state: { state: "ready" },
+    members: [],
+    ...view,
+  } as unknown as import("@/lb/lb").LoadBalancer;
+}
+
+/**
+ * 네트워크 옮기기 리소스(서버 `Resource<NetworkMigrationSpec, NetworkMigrationStatus>`): 스펙의 빈 칸(`vms`·`mode` auto·
+ * `addresses`·`bridge`·`bridge_node`·`allow_mtu_shrink` 거짓·`parallel`)은 빠지고, 상태의 `phase`는 늘, `vms`·`bridge`·
+ * `task`·`error`는 있을 때만이다. `VmMove`의 `state`는 늘(`ips`·`error`·`at`는 있을 때만, `from.security_groups`·`cloud_init`도).
+ */
+export function migrationRes(
+  name: string,
+  spec: Record<string, unknown>,
+  status: Record<string, unknown> = { phase: "planned" },
+) {
+  return {
+    id: `019a0f3c-0000-7000-800d-${name.padStart(12, "0").slice(-12)}`,
+    name,
+    revision: 11,
+    spec,
+    status,
+  } as unknown as import("@/migration/migration").Migration;
+}

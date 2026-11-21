@@ -19,9 +19,11 @@ import {
   CONDITION_KINDS,
   emptyRuleForm,
   isEvent,
+  isSdn,
   NODE_METRICS,
   ruleFormOf,
   ruleSpecOf,
+  takesNodes,
   VM_METRICS,
   type RuleForm,
 } from "@/alerts/rules";
@@ -304,11 +306,19 @@ function RuleDialog({
               setErrors({});
             }}
           >
-            {CONDITION_KINDS.map((kind) => (
+            {CONDITION_KINDS.filter((kind) => !isSdn(kind)).map((kind) => (
               <NativeSelectOption key={kind} value={kind}>
                 {t(`alerts.kind.${kind}`)}
               </NativeSelectOption>
             ))}
+            {/* SDN 묶음(계획 67 §11) */}
+            <optgroup label={t("alerts.sdnGroup")}>
+              {CONDITION_KINDS.filter(isSdn).map((kind) => (
+                <NativeSelectOption key={kind} value={kind}>
+                  {t(`alerts.kind.${kind}`)}
+                </NativeSelectOption>
+              ))}
+            </optgroup>
           </NativeSelect>
         </Field>
         {metric && (
@@ -419,7 +429,7 @@ function RuleDialog({
             <Label htmlFor="rule-send-resolved">{t("alerts.rules.sendResolved")}</Label>
           </div>
         )}
-        {form.kind !== "backup_job_failed" &&
+        {takesNodes(form.kind) &&
           input("rule-nodes", "nodes", t("alerts.rules.nodes"), t("alerts.rules.namesHint"))}
         {aboutVms(form.kind) &&
           input("rule-vms", "vms", t("alerts.rules.vms"), t("alerts.rules.namesHint"))}

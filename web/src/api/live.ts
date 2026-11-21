@@ -23,6 +23,35 @@ export const KINDS: WatchKind[] = [
 ];
 
 /**
+ * 서버가 상태를 덧붙인 보기 목록이라 watch로는 사건만 받고 그 화면의 질의를 다시 읽는 종류(계획 67): 라우터(게이트웨이
+ * 순위)·유동 IP(상태)·부하 분산기(멤버 건강)·네트워크 옮기기. 모두 폴더를 따라 서버가 사건마다 거른다.
+ */
+export const VIEW_KINDS = ["router", "floating-ip", "load-balancer", "network-migration"] as const;
+export type ViewKind = (typeof VIEW_KINDS)[number];
+
+/**
+ * 사건이 오면 다시 읽을 질의 키(앞부분). 라우터·유동 IP·부하 분산기는 서로의 상태와 네트워크 주소 표·토폴로지를 바꾼다.
+ * 네트워크·VM 사건은 토폴로지·유동 IP 상태·옮기기 진행을 바꾼다.
+ */
+export const REFRESH_ON: Partial<Record<ViewKind | WatchKind, readonly (readonly string[])[]>> = {
+  router: [
+    ["routers"],
+    ["floating-ips"],
+    ["load-balancers"],
+    ["network-ips"],
+    ["network-topology"],
+  ],
+  "floating-ip": [["floating-ips"], ["network-ips"], ["network-topology"]],
+  "load-balancer": [["load-balancers"], ["network-ips"], ["network-topology"]],
+  "network-migration": [["network-migrations"], ["network-topology"]],
+  network: [["network-topology"], ["load-balancers"]],
+  vm: [["network-topology"], ["floating-ips"]],
+};
+
+/** 다시 읽기를 모으는 시간(사건이 몰려도 한 번 — 설계 §12.3 "1초 모아") */
+export const REFRESH_BATCH_MS = 1000;
+
+/**
  * 목록 없이 watch로만 받는 클러스터 설정(`Settings`, 늘 하나). 캐시 키는 `SETTINGS_KEY`이고, 연결할 때마다
  * `LiveProvider`가 다시 읽는다.
  */
@@ -45,11 +74,11 @@ interface Versioned {
 }
 
 export type WatchEvent =
-  | { type: "put"; kind: WatchKind | typeof SETTINGS_KIND; resource: Versioned }
+  | { type: "put"; kind: WatchKind | ViewKind | typeof SETTINGS_KIND; resource: Versioned }
   | {
       type: "deleted";
       revision: number;
-      kind: WatchKind | typeof SETTINGS_KIND;
+      kind: WatchKind | ViewKind | typeof SETTINGS_KIND;
       resource: Versioned;
     }
   | { type: "reset"; revision: number }

@@ -1,4 +1,4 @@
-import { Plus, Trash2 } from "lucide-react";
+import { ArrowRightLeft, Plus, Trash2 } from "lucide-react";
 import { useId, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
@@ -28,6 +28,9 @@ import {
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
 import { useCreateParam } from "@/lib/createParam";
+import { migrationOf, progress, useMigrations } from "@/migration/migration";
+import { MigrationWizard } from "@/migration/MigrationWizard";
+import { StatusChip } from "@/components/StatusChip";
 import {
   addressCount,
   hasUsageBar,
@@ -164,9 +167,17 @@ export function NetworksPage() {
   const sdnAny = (networks.data ?? []).some(isSdnNetwork);
   const routers = useRouters(sdnAny);
   const routed = useRouted(sdnAny);
-  const fips = useFloatingIps(sdnAny, true);
+  const fips = useFloatingIps(sdnAny);
   const routing = (network: Network) =>
     routingUsers(network.name, routers.data, routed.data, fips.data);
+  // 단순 → SDN 옮기기(계획 67): 단순 네트워크가 있을 때만 읽는다. 옮기기는 SDN이 세워진 뒤에만 시작할 수 있다.
+  const simpleAny = (networks.data ?? []).some((n) => !isSdnNetwork(n));
+  const migrations = useMigrations(simpleAny);
+  const readsSdn = perms.reads("sdn");
+  const sdn = useSdn(false, readsSdn && simpleAny);
+  const canMigrate = sdnReady(sdn.data);
+  const [migrating, setMigrating] = useState<string | null>(null);
+  const migratingNetwork = networks.data?.find((n) => n.id === migrating);
 
   const deleteImpact = (network: Network) => {
     const lines: string[] = [];
@@ -240,6 +251,10 @@ export function NetworksPage() {
                   ) : (
                     network.name
                   )}
+                  <MigrationChip
+                    migration={migrationOf(migrations.data, network.name)}
+                    onOpen={() => setMigrating(network.id)}
+                  />
                 </TableCell>
                 <TableCell>{t(`networks.kinds.${kindOf(network.spec)}`)}</TableCell>
                 <TableCell className="font-mono text-xs">{bridgeName(network.spec)}</TableCell>
@@ -282,6 +297,19 @@ export function NetworksPage() {
                 </TableCell>
                 {actions && (
                   <TableCell className="text-right whitespace-nowrap">
+                    {writes(network) &&
+                      canMigrate &&
+                      !isSdnNetwork(network) &&
+                      !migrationOf(migrations.data, network.name) && (
+                        <Button
+                          variant="ghost"
+                          size="icon-sm"
+                          aria-label={t("migration.openNamed", { name: network.name })}
+                          onClick={() => setMigrating(network.id)}
+                        >
+                          <ArrowRightLeft />
+                        </Button>
+                      )}
                     {delegates(network) && (
                       <PermissionsButton
                         name={network.name}
@@ -308,6 +336,9 @@ export function NetworksPage() {
         </TableBody>
       </Table>
       {creating && <CreateNetworkDialog bridges={bridges} onClose={() => setCreating(false)} />}
+      {migratingNetwork && (
+        <MigrationWizard source={migratingNetwork} onClose={() => setMigrating(null)} />
+      )}
       {openedNetwork && (
         <NetworkSheet
           network={openedNetwork}
@@ -336,6 +367,33 @@ export function NetworksPage() {
         }}
       />
     </div>
+  );
+}
+
+/** 진행 중인 옮기기 칩(누르면 마법사의 진행 단계) */
+function MigrationChip({
+  migration,
+  onOpen,
+}: {
+  migration: ReturnType<typeof migrationOf>;
+  onOpen(): void;
+}) {
+  const { t } = useTranslation();
+  if (!migration) {
+    return null;
+  }
+  const { moved, total } = progress(migration);
+  return (
+    <button
+      type="button"
+      className="ml-2 align-middle"
+      aria-label={t("migration.chipLabel", { name: migration.name, moved, total })}
+      onClick={onOpen}
+    >
+      <StatusChip tone="info" busy={migration.status.phase === "running"}>
+        {t("migration.chip", { moved, total })}
+      </StatusChip>
+    </button>
   );
 }
 

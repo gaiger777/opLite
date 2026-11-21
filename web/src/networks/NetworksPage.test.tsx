@@ -919,3 +919,113 @@ it("does not offer deleting a network that routers or floating IPs use", async (
   );
   expect(within(table).getByRole("button", { name: "Delete t2" })).toBeEnabled();
 });
+
+it("lets the network owner detach it from a router it cannot see and shows load balancer addresses", async () => {
+  mockLists({ network: [TENANT], node: [sdnNode(1, readyChassis(1))] });
+  const LB = "019a0f3c-0000-7000-800c-0000000000aa";
+  const deleted: string[] = [];
+  server.use(
+    // 다른 폴더의 라우터: 목록에는 없고 `routed`만 알린다(서버 `RouterList`).
+    http.get(apiUrl("/routers"), () =>
+      HttpResponse.json({ revision: 9, items: [], routed: [{ network: "tenant" }] }),
+    ),
+    http.get(apiUrl("/networks/:key/ips"), () =>
+      HttpResponse.json({
+        ...ips(true),
+        // 서버 `IpAllocation`: 부하 분산기 행은 `kind`·`vm`(LB id)·`vm_name`(LB 이름), `nic` 0, `mac` 없음, `live` null
+        allocations: [
+          { kind: "lb-vip", vm: LB, vm_name: "web-lb", nic: 0, ips: ["10.10.0.50"], live: null },
+          {
+            kind: "lb-monitor",
+            vm: LB,
+            vm_name: "web-lb",
+            nic: 0,
+            ips: ["10.10.0.60"],
+            live: null,
+          },
+        ],
+      }),
+    ),
+    http.delete(apiUrl(`/networks/${TENANT.id}/router`), () => {
+      deleted.push(TENANT.id);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<NetworksPage />);
+  await user.click(await screen.findByRole("button", { name: "Open tenant" }));
+  const sheet = await screen.findByRole("dialog", { name: "Network tenant" });
+  const table = await within(sheet).findByRole("table", { name: "IP addresses" });
+  expect(within(table).getByRole("link", { name: "Load balancer web-lb (VIP)" })).toHaveAttribute(
+    "href",
+    `/load-balancers?open=${LB}`,
+  );
+  expect(
+    within(table).getByRole("link", { name: "Load balancer web-lb (health checks)" }),
+  ).toBeVisible();
+  expect(await within(sheet).findByText("A router you can't see")).toBeVisible();
+  await user.click(within(sheet).getByRole("button", { name: "Detach from the router" }));
+  await user.click(await screen.findByRole("button", { name: "Detach from the router" }));
+  await waitFor(() => expect(deleted).toEqual([TENANT.id]));
+});
+
+it("offers migrating a simple network to SDN and shows a running migration", async () => {
+  const lan = network("lan", "vmbr0");
+  const old = network("old", "vmbr1");
+  mockLists({ network: [lan, old], node: [sdnNode(1, readyChassis(1))] });
+  server.use(
+    http.get(apiUrl("/sdn"), () => HttpResponse.json(sdnView([sdnNode(1, readyChassis(1))], []))),
+    http.get(apiUrl("/network-migrations"), () =>
+      HttpResponse.json({
+        revision: 3,
+        items: [
+          {
+            id: "019a0f3c-0000-7000-800d-000000000001",
+            name: "old-to-t",
+            revision: 2,
+            spec: { source: "old", target: "t" },
+            status: {
+              phase: "running",
+              vms: [
+                {
+                  vm: "a",
+                  nic: 0,
+                  mac: "52:54:00:00:00:01",
+                  mode: "live",
+                  address_source: "given",
+                  from: { network: "old" },
+                  state: "moved",
+                },
+                {
+                  vm: "b",
+                  nic: 0,
+                  mac: "52:54:00:00:00:02",
+                  mode: "offline",
+                  address_source: "ipam",
+                  from: { network: "old" },
+                  state: "pending",
+                },
+                {
+                  vm: "c",
+                  nic: 0,
+                  mac: "52:54:00:00:00:03",
+                  mode: "blocked",
+                  address_source: "ipam",
+                  from: { network: "old" },
+                  state: "pending",
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    ),
+  );
+  renderPage(<NetworksPage />);
+  expect(await screen.findByRole("button", { name: "Migrate lan to SDN" })).toBeVisible();
+  // 진행 중인 옮기기는 칩(막힌 NIC는 세지 않음)이고 새로 시작할 수 없다.
+  expect(
+    await screen.findByRole("button", { name: "Migration old-to-t: 1 of 2 moved" }),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: "Migrate old to SDN" })).not.toBeInTheDocument();
+});

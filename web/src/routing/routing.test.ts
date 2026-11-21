@@ -11,7 +11,6 @@ import {
   providerLabel,
   routingUsers,
   serverText,
-  slowFipRefresh,
   validPhysnet,
 } from "@/routing/routing";
 import { emptySubnetRow, subnetErrors, subnetRow, toSubnet } from "@/sdn/subnets";
@@ -204,9 +203,9 @@ it("sends an empty object to clear a node's SDN settings", () => {
   });
 });
 
-it("draws router and floating IP bars for a network folder", () => {
+it("draws network, router, floating IP and load balancer bars for a network folder", () => {
   const F = "019a0f3c-0000-7000-8009-00000000000c";
-  // 서버 `FolderUsage`: VM 칸은 늘, 라우터·유동 IP는 0이면 빠진다.
+  // 서버 `FolderUsage`: VM 칸은 늘, 네트워크·라우터·유동 IP·부하 분산기(계획 67)는 0이면 빠진다.
   const view = {
     folder: F,
     path: "/tenant",
@@ -222,16 +221,11 @@ it("draws router and floating IP bars for a network folder", () => {
     binding: { floating_ips: F },
   };
   expect(usageBars(view, "network")).toEqual([
+    { dim: "networks", used: 0 },
     { dim: "routers", used: 1 },
     { dim: "floating_ips", used: 0, limit: 4, boundBy: undefined },
+    { dim: "load_balancers", used: 0 },
   ]);
-});
-
-it("polls floating IPs on the VM page only when some exist, every 30 s", () => {
-  // 리뷰 1 웹 I1: 유동 IP가 없는 클러스터에서 VM 상세가 10초마다 서버의 World 읽기를 부르지 않는다.
-  expect(slowFipRefresh(undefined)).toBe(false);
-  expect(slowFipRefresh(0)).toBe(false);
-  expect(slowFipRefresh(2)).toBe(30_000);
 });
 
 it("counts the routers and floating IPs that keep a network from being deleted", () => {

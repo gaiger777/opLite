@@ -33,6 +33,8 @@ import {
   useVoters,
 } from "@/sdn/sdn";
 import { ChassisChip, RoleChip } from "@/sdn/chips";
+import { LockdownCard } from "@/sdn/LockdownCard";
+import { SdnAlertsCard } from "@/sdn/SdnAlertsCard";
 import { trackTask } from "@/tasks/tasks";
 
 /** 설정된 SDN(OVN)의 상태: 경고 띠, 요약·동기화, 중앙 표, chassis 표. `admin`이면 고치는 단추를 보인다. */
@@ -196,6 +198,9 @@ export function SdnStatusView({ sdn, admin }: { sdn: SdnView; admin: boolean }) 
         </h2>
         <ChassisTable sdn={sdn} admin={admin} />
       </section>
+      {/* 계획 67: OVN 접근 잠금(§10.5)과 "SDN 경보 켜기"(§11) */}
+      {(sdn.phase === "ready" || sdn.lockdown) && <LockdownCard sdn={sdn} admin={admin} />}
+      <SdnAlertsCard />
     </div>
   );
 }

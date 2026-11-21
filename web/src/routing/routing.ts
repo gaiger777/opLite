@@ -1,5 +1,6 @@
-// 라우터·유동 IP·공급자 네트워크(계획 66)의 질의와 순수 도움 함수. 라우터·유동 IP는 watch로 나가지 않아(서버
-// `WATCHABLE`에 없다) 목록을 주기적으로 다시 읽고, 바꾼 뒤에는 캐시를 버린다.
+// 라우터·유동 IP·공급자 네트워크(계획 66)의 질의와 순수 도움 함수. 목록은 서버가 상태를 덧붙인 보기라 watch 사건이
+// 오면(계획 67 — `LiveProvider`의 `VIEW_KINDS`) 다시 읽고, 바꾼 뒤에도 캐시를 버린다. 주기적으로 다시 읽는 것은 연 라우터의
+// 지금 게이트웨이(NB — Raft 사건이 없는 살아 있는 상태)뿐이다.
 import { type QueryClient, useQuery } from "@tanstack/react-query";
 
 import { api, call } from "@/api/client";
@@ -18,10 +19,8 @@ export type NodeSdnConfig = Schemas["NodeSdnConfig"];
 
 export const ROUTERS_KEY = ["routers"] as const;
 export const FIPS_KEY = ["floating-ips"] as const;
-/** 라우터의 지금 게이트웨이(NB — 연 서랍 하나만)와 유동 IP 상태를 다시 읽는 주기 */
-export const ROUTING_REFRESH_MS = 10_000;
-/** NB를 읽지 않는 라우터 목록과 VM 상세의 유동 IP를 다시 읽는 주기(리뷰 1 웹 I1 — 열어 둔 탭이 서버를 덜 부른다) */
-export const ROUTING_SLOW_REFRESH_MS = 30_000;
+/** 연 라우터의 지금 게이트웨이(NB — 사건이 없는 살아 있는 상태)를 다시 읽는 주기 */
+export const ROUTING_LIVE_MS = 30_000;
 /** 서버의 `DEFAULT_PROVIDER_MTU`: 물리 망 */
 export const DEFAULT_PROVIDER_MTU = 1500;
 /** 서버의 `MAX_INTERFACES`·`MAX_ROUTES`·`MAX_PHYSNETS` */
@@ -38,7 +37,6 @@ export function useRouters(enabled = true) {
     queryKey: [...ROUTERS_KEY, "spec"],
     queryFn: fetchRouters,
     select: (list) => list.items,
-    refetchInterval: ROUTING_SLOW_REFRESH_MS,
     enabled,
   });
 }
@@ -56,7 +54,6 @@ export function useRouted(enabled = true) {
     queryKey: [...ROUTERS_KEY, "spec"],
     queryFn: fetchRouters,
     select: (list) => list.routed ?? [],
-    refetchInterval: ROUTING_SLOW_REFRESH_MS,
     enabled,
   });
 }
@@ -66,28 +63,20 @@ export function useRouter(id: string | null) {
   return useQuery({
     queryKey: [...ROUTERS_KEY, "live", id],
     queryFn: () => call(api.GET("/routers/{key}", { params: { path: { key: id! } } })),
-    refetchInterval: ROUTING_REFRESH_MS,
+    refetchInterval: ROUTING_LIVE_MS,
     enabled: id !== null,
   });
 }
 
-/** VM 상세의 유동 IP 다시 읽기: 하나라도 있을 때만 30초, 없거나 아직 모르면 다시 읽지 않는다. */
-export function slowFipRefresh(count: number | undefined): number | false {
-  return (count ?? 0) > 0 ? ROUTING_SLOW_REFRESH_MS : false;
-}
-
 /**
- * 유동 IP 목록(`GET /floating-ips`, 상태는 서버가 Raft에서 셈). `slow`면(VM 상세) 유동 IP가 하나라도 있을 때만 30초마다
- * 다시 읽는다 — 유동 IP가 없는 클러스터에서 VM 상세가 서버를 부르지 않는다.
+ * 유동 IP 목록(`GET /floating-ips`, 상태는 서버가 Raft에서 셈). 유동 IP·라우터·VM·네트워크 사건이 오면 다시 읽는다(상태가
+ * 그것들로 셈해진다 — `LiveProvider`).
  */
-export function useFloatingIps(enabled = true, slow = false) {
+export function useFloatingIps(enabled = true) {
   return useQuery({
     queryKey: FIPS_KEY,
     queryFn: () => call(api.GET("/floating-ips")),
     select: (list) => list.items,
-    refetchInterval: slow
-      ? (query) => slowFipRefresh(query.state.data?.items.length)
-      : ROUTING_REFRESH_MS,
     enabled,
   });
 }
@@ -290,6 +279,20 @@ const SERVER_TEXTS: readonly [RegExp, string, readonly string[]][] = [
   ],
   [/^the NIC has no IPv4 address on network "(.+)"$/, "routing.server.noIpv4", ["network"]],
   [/^network "(.+)" not found$/, "routing.server.networkGone", ["network"]],
+  // 부하 분산기(계획 67)의 경고·까닭
+  [
+    /^the security groups of the member NIC (\S+) do not admit (\S+) from clients$/,
+    "routing.server.lbClients",
+    ["mac", "listener"],
+  ],
+  [
+    /^the security groups of the member NIC (\S+) block health checks from (\S+) to (\S+)$/,
+    "routing.server.lbHealth",
+    ["mac", "source", "listener"],
+  ],
+  [/^the external VIP is not reachable yet: (.+)$/, "routing.server.lbExternal", ["reason"]],
+  [/^the VIP network is not routed$/, "routing.server.lbNotRouted", []],
+  [/^no VIP$/, "routing.server.lbNoVip", []],
 ];
 
 /**

@@ -21,9 +21,12 @@ export type Kind =
   | "grant"
   | "group"
   | "access-role"
-  // 라우터·유동 IP(계획 66): 네트워크 폴더에 들고 watch로 나가지 않는다.
+  // 라우터·유동 IP(계획 66), 부하 분산기·네트워크 옮기기(계획 67): 네트워크 폴더에 든다. watch로는 사건만 받아 보기를
+  // 다시 읽는다(`LiveProvider`의 `VIEW_KINDS`).
   | "router"
-  | "floating-ip";
+  | "floating-ip"
+  | "load-balancer"
+  | "network-migration";
 
 /** 권한(계획 62 설계 §6.2). 이름은 서버의 `Privilege`와 같다. */
 export const PRIVILEGES = [
@@ -78,6 +81,8 @@ const FOLDER_KINDS: ReadonlySet<Kind> = new Set([
   "network",
   "router",
   "floating-ip",
+  "load-balancer",
+  "network-migration",
   "storage-pool",
   "task",
   "folder",
@@ -117,6 +122,8 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
         case "network":
         case "router":
         case "floating-ip":
+        case "load-balancer":
+        case "network-migration":
         case "security-group":
           return "network.config";
         case "alert-rule":
@@ -185,8 +192,18 @@ export function can(role: Role, action: Action, kind: Kind): boolean {
   return builtinPrivileges(role).includes(kindPrivilege(action, kind));
 }
 
-/** 폴더를 둘 수 있는 객체 종류(서버 `FolderKind::member_kinds` — 네트워크 폴더에는 라우터·유동 IP도 든다, 계획 66) */
-export type MemberKind = "vm" | "network" | "router" | "floating-ip" | "storage-pool";
+/**
+ * 폴더를 둘 수 있는 객체 종류(서버 `FolderKind::member_kinds` — 네트워크 폴더에는 라우터·유동 IP(계획 66)와 부하 분산기·
+ * 네트워크 옮기기(계획 67)도 든다)
+ */
+export type MemberKind =
+  | "vm"
+  | "network"
+  | "router"
+  | "floating-ip"
+  | "load-balancer"
+  | "network-migration"
+  | "storage-pool";
 
 /** 권한을 따지는 대상: 루트(클러스터), 폴더 자체, 객체(폴더 안, `folder`가 없으면 루트) */
 export type Target =

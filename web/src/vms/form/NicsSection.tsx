@@ -10,7 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { sdnNetworkNamed } from "@/sdn/ips";
-import { MAX_NICS, type NicRow, type VmFormValues } from "@/vms/form";
+import { hasQos, MAX_NICS, type NicRow, type QosRow, type VmFormValues } from "@/vms/form";
 import { type DeviceMode, liveRemovable, savedCount } from "@/vms/hotplug";
 
 /**
@@ -103,7 +103,7 @@ export function NicsSection({
                     setNic(
                       i,
                       e.target.value === "user"
-                        ? { network: e.target.value, securityGroups: [], ips: "" }
+                        ? { network: e.target.value, securityGroups: [], ips: "", qos: undefined }
                         : { network: e.target.value, ips: "" },
                     )
                   }
@@ -184,6 +184,15 @@ export function NicsSection({
                 </div>
               )}
               {nic.network !== "user" && (
+                <NicQos
+                  index={i}
+                  qos={nic.qos}
+                  sdn={sdn}
+                  errors={errors}
+                  onChange={(qos) => setNic(i, { qos })}
+                />
+              )}
+              {nic.network !== "user" && (
                 <NicGroups
                   index={i}
                   chosen={nic.securityGroups}
@@ -215,6 +224,64 @@ export function NicsSection({
         )}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * NIC 하나의 QoS(계획 67 §8): 보내기·받기 속도(Mbit/s)·버스트(kbit)·DSCP. 속도 제한은 폴리싱(넘으면 버림)이고 실행 중에도
+ * 바뀐다. DSCP는 SDN NIC만(단순 NIC는 tap의 tc라 속도만 — 칸이 막히고 까닭을 보인다). 값이 있으면 펼쳐 보인다.
+ */
+function NicQos({
+  index,
+  qos,
+  sdn,
+  errors,
+  onChange,
+}: {
+  index: number;
+  qos: QosRow | undefined;
+  sdn: boolean;
+  errors: Record<string, string>;
+  onChange: (qos: QosRow) => void;
+}) {
+  const { t } = useTranslation();
+  const value = qos ?? { out: "", in: "", burst: "", dscp: "" };
+  const field = (key: keyof QosRow, label: string, disabled = false, hint?: string) => (
+    <Field
+      id={`nic-${index}-qos-${key}`}
+      label={label}
+      error={errors[`nics.${index}.qos.${key}`]}
+      hint={hint}
+    >
+      {(a11y) => (
+        <Input
+          id={`nic-${index}-qos-${key}`}
+          inputMode="numeric"
+          autoComplete="off"
+          disabled={disabled}
+          value={value[key]}
+          onChange={(e) => onChange({ ...value, [key]: e.target.value })}
+          {...a11y}
+        />
+      )}
+    </Field>
+  );
+  return (
+    <details className="col-span-full" open={hasQos(qos)}>
+      <summary className="cursor-pointer text-sm font-medium">{t("vmForm.qos.title")}</summary>
+      <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {field("out", t("vmForm.qos.out"))}
+        {field("in", t("vmForm.qos.in"))}
+        {field("burst", t("vmForm.qos.burst"), false, t("vmForm.qos.burstHint"))}
+        {field(
+          "dscp",
+          t("vmForm.qos.dscp"),
+          !sdn && value.dscp === "",
+          sdn ? undefined : t("vmForm.qos.dscpSdnOnly"),
+        )}
+      </div>
+      <p className="mt-1 text-xs text-muted-foreground">{t("vmForm.qos.hint")}</p>
+    </details>
   );
 }
 

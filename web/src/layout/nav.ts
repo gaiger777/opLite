@@ -96,6 +96,9 @@ export const AREAS: NavArea[] = [
           // 라우터·유동 IP(계획 66)도 사이드바 항목이 아니라 네트워크 탭의 보기다.
           { to: "/routers", key: "nav.routers" },
           { to: "/floating-ips", key: "nav.floatingIps" },
+          // 부하 분산기와 2.5D 토폴로지(계획 67)도 네트워크 탭의 보기다.
+          { to: "/load-balancers", key: "nav.loadBalancers" },
+          { to: "/networks/topology", key: "nav.topology" },
           // SDN(OVN) 설정·상태(계획 65). 사이드바 항목이 아니라 네트워크 탭의 보기다.
           { to: "/sdn", key: "nav.sdn", kind: "sdn" },
         ],

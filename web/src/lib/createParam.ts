@@ -28,3 +28,29 @@ export function useCreateParam(open: () => void, allowed: boolean, ready = true)
     }
   }, [wanted, allowed, ready, setParams]);
 }
+
+/**
+ * `?open=<id>`로 들어오면 그 화면의 서랍을 연다(토폴로지 그림에서 누른 라우터·부하 분산기). 쿼리는 지워서 뒤로 가기나
+ * 새로 고침이 다시 열지 않게 한다.
+ */
+export function useOpenParam(open: (id: string) => void) {
+  const [params, setParams] = useSearchParams();
+  const wanted = params.get("open");
+  const latest = useRef(open);
+  useEffect(() => {
+    latest.current = open;
+  });
+  useEffect(() => {
+    if (!wanted) {
+      return;
+    }
+    setParams(
+      (p) => {
+        p.delete("open");
+        return p;
+      },
+      { replace: true },
+    );
+    latest.current(wanted);
+  }, [wanted, setParams]);
+}

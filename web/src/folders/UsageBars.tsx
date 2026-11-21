@@ -12,18 +12,20 @@ export const DIMENSIONS = [
   "disk_bytes",
   "vms",
   "dedicated_vcpus",
+  "networks",
   "routers",
   "floating_ips",
+  "load_balancers",
 ] as const;
 export type Dimension = (typeof DIMENSIONS)[number];
 
-/** 폴더 종류마다 받는 할당량 차원(서버 `FolderKind::quota_dimensions` — 네트워크 폴더는 계획 66) */
+/** 폴더 종류마다 받는 할당량 차원(서버 `FolderKind::quota_dimensions` — 네트워크 폴더는 계획 66·67) */
 export function dimensionsOf(kind: FolderKind): readonly Dimension[] {
   switch (kind) {
     case "vm":
       return ["vcpus", "memory_mib", "disk_bytes", "vms", "dedicated_vcpus"];
     case "network":
-      return ["routers", "floating_ips"];
+      return ["networks", "routers", "floating_ips", "load_balancers"];
     case "storage":
       return [];
   }

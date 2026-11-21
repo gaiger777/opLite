@@ -14,7 +14,8 @@ export function apiUrl(path: string) {
  * 클러스터 지표 모으기와 활성 경보도 기본으로 비어 있다. 내 권한(`/permissions/mine`)은 기본으로 없어(404)
  * 화면이 전역 역할로 본다. 폴더 목록도 기본으로 비어 있다. CPU 질의(계획 63)는 VM 폼·상세·노드·클러스터·설정 화면이
  * 읽으므로 기본으로 `host`·`max`만 있고 기준·카탈로그가 없는 클러스터다. NUMA 질의(계획 64)도 노드 화면이 읽으므로 기본으로
- * 토폴로지를 알린 노드가 없다. 라우터·유동 IP(계획 66)도 기본으로 없다.
+ * 토폴로지를 알린 노드가 없다. 라우터·유동 IP(계획 66)도 기본으로 없다. 부하 분산기·네트워크 옮기기(계획 67)와 경보 규칙도
+ * 기본으로 없다(네트워크 목록·폴더·SDN 화면이 읽는다).
  */
 export const server = setupServer(
   http.get(apiUrl("/permissions/mine"), () =>
@@ -32,6 +33,10 @@ export const server = setupServer(
   // (SDN NIC의 유동 IP)와 보기들이 읽는다.
   http.get(apiUrl("/routers"), () => HttpResponse.json({ revision: 1, items: [] })),
   http.get(apiUrl("/floating-ips"), () => HttpResponse.json({ revision: 1, items: [] })),
+  // 계획 67: 서버 `LoadBalancerList`·`NetworkMigrationList`·`AlertRuleList`(`{revision, items}`)
+  http.get(apiUrl("/load-balancers"), () => HttpResponse.json({ revision: 1, items: [] })),
+  http.get(apiUrl("/network-migrations"), () => HttpResponse.json({ revision: 1, items: [] })),
+  http.get(apiUrl("/alert-rules"), () => HttpResponse.json({ revision: 1, items: [] })),
   http.get(apiUrl("/vms/:key/guest"), () => HttpResponse.json({ state: "no_agent" })),
   // CPU(계획 63): x86_64 노드 하나(카탈로그를 아직 알리지 않음), 기준 끔인 클러스터의 관리자 응답 모양이다. 기준이
   // 없으면 `cluster`에 `current`가 없다(리뷰 1 웹 #1 — 있으면 새 VM이 `cluster`로 시작한다). 다만 노드마다의 목록

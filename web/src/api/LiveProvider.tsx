@@ -7,9 +7,13 @@ import {
   KINDS,
   type List,
   listKey,
+  REFRESH_BATCH_MS,
+  REFRESH_ON,
   SETTINGS_KEY,
   SETTINGS_KIND,
   SUBSCRIPTION_KEY,
+  VIEW_KINDS,
+  type ViewKind,
   type WatchEvent,
 } from "@/api/live";
 import type { Settings, WatchKind } from "@/api/types";
@@ -47,6 +51,24 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     let delay = FIRST_RETRY_MS;
     let stopped = false;
+    // 보기 목록(계획 67)의 다시 읽기를 1초 모은다.
+    const stale = new Map<string, readonly string[]>();
+    let batch: ReturnType<typeof setTimeout> | undefined;
+    const refresh = (keys: readonly (readonly string[])[] | undefined) => {
+      for (const key of keys ?? []) {
+        stale.set(key.join("/"), key);
+      }
+      if (batch === undefined && stale.size > 0) {
+        batch = setTimeout(() => {
+          batch = undefined;
+          const keys = [...stale.values()];
+          stale.clear();
+          for (const queryKey of keys) {
+            void queryClient.invalidateQueries({ queryKey });
+          }
+        }, REFRESH_BATCH_MS);
+      }
+    };
 
     const retry = () => {
       if (stopped) {
@@ -60,6 +82,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     async function connect() {
       let since: number;
       let kinds: WatchKind[];
+      let views: ViewKind[];
       let settings: boolean;
       try {
         const perms = await queryClient
@@ -70,6 +93,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
             () => Permissions.fromRole(role),
           );
         kinds = KINDS.filter((kind) => perms.reads(kind));
+        views = VIEW_KINDS.filter((kind) => perms.reads(kind));
         settings = perms.reads("settings");
         // 더는 읽을 수 없는 종류(권한을 잃었다)의 옛 목록은 버린다. 남겨 두면 다시 바뀌지 않는 목록이 보인다.
         for (const kind of KINDS) {
@@ -92,9 +116,13 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
           ),
         );
         since = Math.min(...lists.map((list) => list.revision));
-        // 설정과 구독 상태는 목록이 없으므로 watch를 열기 전에 다시 읽는다(보는 화면이 있을 때만).
+        // 설정과 구독 상태는 목록이 없으므로 watch를 열기 전에 다시 읽는다(보는 화면이 있을 때만). 보기 목록도 끊긴 사이의
+        // 사건을 놓쳤을 수 있다.
         await queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
         await queryClient.invalidateQueries({ queryKey: SUBSCRIPTION_KEY });
+        for (const kind of views) {
+          refresh(REFRESH_ON[kind]);
+        }
       } catch {
         retry();
         return;
@@ -102,7 +130,9 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
       if (stopped) {
         return;
       }
-      const ws = new WebSocket(watchUrl(settings ? [...kinds, SETTINGS_KIND] : kinds, since));
+      const ws = new WebSocket(
+        watchUrl([...kinds, ...views, ...(settings ? [SETTINGS_KIND] : [])], since),
+      );
       socket = ws;
       let openedAt: number | undefined;
       ws.onopen = () => {
@@ -121,6 +151,11 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
         switch (event?.type) {
           case "put":
           case "deleted":
+            // 보기 목록(계획 67)은 사건으로 고치지 않고 그 질의를 다시 읽는다.
+            if ((VIEW_KINDS as readonly string[]).includes(event.kind)) {
+              refresh(REFRESH_ON[event.kind as ViewKind]);
+              break;
+            }
             // 설정은 지우지 않는다. 읽은 것보다 새것일 때만 바꾼다.
             if (event.kind === SETTINGS_KIND) {
               const resource = event.resource as Settings;
@@ -144,9 +179,10 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
               void queryClient.invalidateQueries({ queryKey: SUBSCRIPTION_KEY });
             }
             queryClient.setQueryData<List<{ id: string; revision: number }>>(
-              listKey(event.kind),
+              listKey(event.kind as WatchKind),
               (list) => list && applyEvent(list, event),
             );
+            refresh(REFRESH_ON[event.kind as WatchKind]);
             // 폴더가 생기거나 옮겨지면 폴더별 권한 표가 바뀐다(계획 62). 내 권한이 바뀌면 서버가 연결을
             // `permissions`로 닫지만, 새 폴더의 칸은 여기서 다시 읽는다.
             if (event.kind === "folder") {
@@ -178,6 +214,7 @@ export function LiveProvider({ children }: { children: React.ReactNode }) {
     return () => {
       stopped = true;
       clearTimeout(timer);
+      clearTimeout(batch);
       socket?.close();
       socket = null;
     };

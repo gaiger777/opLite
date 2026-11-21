@@ -1,3 +1,5 @@
+import { useQueryClient } from "@tanstack/react-query";
+import { Unlink } from "lucide-react";
 import { Suspense, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
@@ -7,10 +9,11 @@ import { api, call } from "@/api/client";
 
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
-import type { ReplicationState, Vm } from "@/api/types";
+import type { NicSpec, ReplicationState, Vm } from "@/api/types";
 import { objectTarget } from "@/auth/permissions";
 import { usePermissions, useVmCan } from "@/auth/usePermissions";
 import { VmBackups } from "@/backups/VmBackups";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
 import { useVisit } from "@/components/PinButton";
 import { Pager, usePage } from "@/components/Pager";
@@ -66,7 +69,7 @@ import {
 } from "@/vms/replication";
 import { PermissionsPanel } from "@/permissions/lazyPanel";
 import { PortOffChip } from "@/sdn/chips";
-import { fipOn, isOverlay, useFloatingIps } from "@/routing/routing";
+import { fipOn, isOverlay, refreshRouting, useFloatingIps } from "@/routing/routing";
 import { formatIps, portOff } from "@/sdn/ips";
 import { useVmActionHost } from "@/vms/actionHost";
 import { useTemplateReasons, type VmDialog } from "@/vms/VmMenu";
@@ -741,7 +744,9 @@ function Hardware({ vm }: { vm: Vm }) {
     const network = networks.data?.find((n) => n.name === nic.network);
     return network !== undefined && isOverlay(network);
   });
-  const fips = useFloatingIps(sdnNics, true);
+  const fips = useFloatingIps(sdnNics);
+  // NIC QoS(계획 67)가 하나라도 있으면 칸을 보인다.
+  const qos = (vm.spec.nics ?? []).some((nic) => nic.qos);
   return (
     <div className="flex flex-col gap-6 pt-2">
       <section className="flex flex-col gap-2">
@@ -790,6 +795,7 @@ function Hardware({ vm }: { vm: Vm }) {
               <TableHead>{t("vms.mac")}</TableHead>
               <TableHead>{t("vms.addresses")}</TableHead>
               <TableHead>{t("vmForm.securityGroups")}</TableHead>
+              {qos && <TableHead>{t("vmForm.qos.column")}</TableHead>}
               {sdnNics && <TableHead>{t("fip.column")}</TableHead>}
             </TableRow>
           </TableHeader>
@@ -823,9 +829,14 @@ function Hardware({ vm }: { vm: Vm }) {
                 <TableCell>
                   {nic.security_groups?.length ? nic.security_groups.join(", ") : "—"}
                 </TableCell>
+                {qos && (
+                  <TableCell>
+                    <QosChip qos={nic.qos} />
+                  </TableCell>
+                )}
                 {sdnNics && (
                   <TableCell className="font-mono text-xs">
-                    <NicFip fip={fipOn(fips.data, vm.id, nic.mac)} />
+                    <NicFip vm={vm} fip={fipOn(fips.data, vm.id, nic.mac)} />
                   </TableCell>
                 )}
               </TableRow>
@@ -837,20 +848,85 @@ function Hardware({ vm }: { vm: Vm }) {
   );
 }
 
-/** NIC에 붙은 유동 IP: 유동 IP 보기로 가는 링크(붙이기·떼기는 그 보기에서) */
-function NicFip({ fip }: { fip: ReturnType<typeof fipOn> }) {
+/** NIC QoS 칩: `↑100 ↓200 Mbit/s · DSCP 46`(계획 67) */
+function QosChip({ qos }: { qos: NicSpec["qos"] }) {
   const { t } = useTranslation();
+  if (!qos) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+  return <Badge variant="secondary">{qosText(t, qos)}</Badge>;
+}
+
+/** QoS 한 줄 */
+function qosText(
+  t: (key: string, values?: Record<string, unknown>) => string,
+  qos: NonNullable<NicSpec["qos"]>,
+): string {
+  const parts: string[] = [];
+  if (qos.out_mbps !== undefined) {
+    parts.push(t("vmForm.qos.outShort", { mbps: qos.out_mbps }));
+  }
+  if (qos.in_mbps !== undefined) {
+    parts.push(t("vmForm.qos.inShort", { mbps: qos.in_mbps }));
+  }
+  if (qos.dscp !== undefined) {
+    parts.push(t("vmForm.qos.dscpShort", { dscp: qos.dscp }));
+  }
+  return parts.join(" · ");
+}
+
+/**
+ * NIC에 붙은 유동 IP: 유동 IP 보기로 가는 링크와 떼기 단추(계획 67 — VM의 `vm.config`나 유동 IP의 `network.config`면 뗀다.
+ * 붙이기는 유동 IP 보기에서).
+ */
+function NicFip({ vm, fip }: { vm: Vm; fip: ReturnType<typeof fipOn> }) {
+  const { t } = useTranslation();
+  const perms = usePermissions();
+  const queryClient = useQueryClient();
+  const [detaching, setDetaching] = useState(false);
   if (!fip) {
     return <span className="text-muted-foreground">—</span>;
   }
+  const detachable =
+    perms.has("vm.config", objectTarget("vm", vm)) ||
+    perms.has("network.config", objectTarget("floating-ip", fip));
   return (
-    <Link
-      to="/floating-ips"
-      className="underline"
-      aria-label={t("fip.onNic", { address: fip.spec.address ?? fip.name })}
-    >
-      {fip.spec.address ?? fip.name}
-    </Link>
+    <span className="flex items-center gap-1">
+      <Link
+        to="/floating-ips"
+        className="underline"
+        aria-label={t("fip.onNic", { address: fip.spec.address ?? fip.name })}
+      >
+        {fip.spec.address ?? fip.name}
+      </Link>
+      {detachable && (
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          aria-label={t("fip.detachNamed", { name: fip.spec.address ?? fip.name })}
+          onClick={() => setDetaching(true)}
+        >
+          <Unlink />
+        </Button>
+      )}
+      <ConfirmDialog
+        open={detaching}
+        onOpenChange={setDetaching}
+        title={t("fip.detachTitle", { name: fip.spec.address ?? fip.name })}
+        description={t("fip.detachDescription")}
+        confirmLabel={t("fip.detach")}
+        onConfirm={async () => {
+          await call(
+            api.PATCH("/floating-ips/{key}", {
+              params: { path: { key: fip.id }, header: { "If-Match": fip.revision } },
+              body: { target: null },
+            }),
+          );
+          await refreshRouting(queryClient);
+          toast.success(t("fip.detached", { name: fip.spec.address ?? fip.name }));
+        }}
+      />
+    </span>
   );
 }
 

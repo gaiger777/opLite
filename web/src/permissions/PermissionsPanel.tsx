@@ -76,8 +76,8 @@ export function routingGrants(grants: readonly Grant[] | undefined): {
 }
 
 /**
- * 객체 id → 이름(VM·네트워크·풀·라우터·유동 IP — 계획 66 리뷰 1 웹 M5). 라우터·유동 IP는 watch가 아니어서 따로 읽고
- * 다시 읽으므로 `routing`이 그 종류를 원할 때만 읽는다(리뷰 2 웹 m6 — VM·풀 권한 패널마다 30초마다 읽지 않게).
+ * 객체 id → 이름(VM·네트워크·풀·라우터·유동 IP — 계획 66 리뷰 1 웹 M5). 라우터·유동 IP는 보기 목록이라 따로 읽으므로
+ * `routing`이 그 종류를 원할 때만 읽는다(리뷰 2 웹 m6 — VM·풀 권한 패널마다 읽지 않게).
  */
 export function useObjectNames(
   routing: { routers: boolean; fips: boolean } = { routers: false, fips: false },
@@ -85,9 +85,9 @@ export function useObjectNames(
   const vms = useList("vm");
   const networks = useList("network");
   const pools = useList("storage-pool");
-  // 라우터는 NB를 읽지 않는 목록, 유동 IP는 있을 때만 천천히 다시 읽는다.
+  // 라우터는 NB를 읽지 않는 목록이다. 둘 다 watch 사건이 오면 다시 읽는다.
   const routers = useRouters(routing.routers);
-  const fips = useFloatingIps(routing.fips, true);
+  const fips = useFloatingIps(routing.fips);
   return useMemo(() => {
     const names = new Map<string, string>();
     for (const [kind, list] of [

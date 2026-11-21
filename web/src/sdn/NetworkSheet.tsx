@@ -20,8 +20,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { errorMessage } from "@/i18n/errors";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { PortOffChip } from "@/sdn/chips";
-import { isProvider } from "@/routing/routing";
+import {
+  isProvider,
+  refreshRouting,
+  routedOf,
+  routerOf,
+  useRouted,
+  useRouters,
+} from "@/routing/routing";
 import { formatIps } from "@/sdn/ips";
 import type { NetworkIps } from "@/sdn/sdn";
 import { SubnetsEditor } from "@/sdn/SubnetsEditor";
@@ -105,11 +113,64 @@ export function NetworkSheet({
           {t("sdn.sheet.title", { name: network.name })}
         </SheetTitle>
         <div className="flex flex-col gap-6 px-4 pb-4">
+          {!isProvider(network) && <RouterSection network={network} writes={writes} />}
           <SubnetsSection network={network} writes={writes} />
           <IpsSection network={network} />
         </div>
       </SheetContent>
     </Sheet>
+  );
+}
+
+/**
+ * 이 네트워크가 인터페이스인 라우터와 "라우터에서 떼기"(계획 66 넘김 — `DELETE /networks/{key}/router`): 네트워크의
+ * `network.config`면 라우터를 읽을 수 없어도 뗀다(권한을 거둔 다른 폴더의 라우터가 기본 경로를 쥐고 있을 때). 유동 IP·부하
+ * 분산기 VIP가 그 길을 쓰면 서버가 409 `fip_in_use`·`lb_in_use`다.
+ */
+function RouterSection({ network, writes }: { network: Network; writes: boolean }) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const routed = useRouted();
+  const routers = useRouters();
+  const [detaching, setDetaching] = useState(false);
+  if (!routedOf(routed.data, network.name)) {
+    return null;
+  }
+  const router = routerOf(routers.data, network.name);
+  return (
+    <section aria-labelledby="sdn-router" className="flex flex-col gap-2">
+      <h2 id="sdn-router" className="font-medium">
+        {t("sdn.sheet.router")}
+      </h2>
+      <div className="flex flex-wrap items-center gap-3 text-sm">
+        {router ? (
+          <Link to={`/routers?open=${encodeURIComponent(router.id)}`} className="underline">
+            {router.name}
+          </Link>
+        ) : (
+          <span className="text-muted-foreground">{t("sdn.sheet.hiddenRouter")}</span>
+        )}
+        {writes && (
+          <Button variant="outline" size="sm" onClick={() => setDetaching(true)}>
+            {t("sdn.sheet.detach")}
+          </Button>
+        )}
+      </div>
+      <ConfirmDialog
+        open={detaching}
+        onOpenChange={setDetaching}
+        title={t("sdn.sheet.detachTitle", { name: network.name })}
+        description={t("sdn.sheet.detachDescription")}
+        confirmLabel={t("sdn.sheet.detach")}
+        onConfirm={async () => {
+          await call(
+            api.DELETE("/networks/{key}/router", { params: { path: { key: network.id } } }),
+          );
+          await refreshRouting(queryClient);
+          toast.success(t("sdn.sheet.detached", { name: network.name }));
+        }}
+      />
+    </section>
   );
 }
 
@@ -367,6 +428,16 @@ function IpsSection({ network }: { network: Network }) {
                           ? t("sdn.ips.fipTo", { name: a.vm_name, vm: a.target })
                           : t("sdn.ips.fip", { name: a.vm_name })}
                       </Link>
+                    ) : a.kind === "lb-vip" || a.kind === "lb-monitor" ? (
+                      // 부하 분산기의 VIP·바깥 VIP·건강 검사 주소(계획 67): `vm`·`vm_name`은 그 부하 분산기의 것이다.
+                      <Link
+                        to={`/load-balancers?open=${encodeURIComponent(a.vm)}`}
+                        className="underline"
+                      >
+                        {t(a.kind === "lb-vip" ? "sdn.ips.lbVip" : "sdn.ips.lbMonitor", {
+                          name: a.vm_name,
+                        })}
+                      </Link>
                     ) : (
                       <Link to={`/vms/${encodeURIComponent(a.vm_name)}`} className="underline">
                         {a.vm_name}
@@ -374,9 +445,7 @@ function IpsSection({ network }: { network: Network }) {
                     )}
                   </TableCell>
                   <TableCell>
-                    {a.kind === "router" || a.kind === "floating-ip"
-                      ? "—"
-                      : t("sdn.ips.nicN", { n: a.nic + 1 })}
+                    {a.kind && a.kind !== "nic" ? "—" : t("sdn.ips.nicN", { n: a.nic + 1 })}
                   </TableCell>
                   <TableCell className="font-mono text-xs">{a.mac ?? "—"}</TableCell>
                   <TableCell className="font-mono text-xs">

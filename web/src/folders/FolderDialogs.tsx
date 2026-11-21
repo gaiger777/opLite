@@ -158,26 +158,31 @@ export function parseLimit(text: string, scale: number): number | null | undefin
   return Math.round(n * scale);
 }
 
+/** 네트워크 폴더의 할당량 차원(서버 `FolderKind::quota_dimensions`) */
+const NETWORK_DIMS = ["networks", "routers", "floating_ips", "load_balancers"] as const;
+
 /**
- * 네트워크 폴더의 할당량(계획 66): 라우터 수·유동 IP 수. 빈 칸은 상한이 없고, 모두 비우면 할당량을 지운다. 옛 노드가 남은
- * 클러스터는 서버가 409 `cluster_upgrading`이다.
+ * 네트워크 폴더의 할당량(계획 66·67): 네트워크·라우터·유동 IP(부하 분산기의 바깥 VIP 포함)·부하 분산기 수. 빈 칸은 상한이
+ * 없고, 모두 비우면 할당량을 지운다. 옛 노드가 남은 클러스터는 서버가 409 `cluster_upgrading`이다.
  */
 export function NetworkQuotaDialog({ folder, onClose }: { folder: Folder; onClose(): void }) {
   const { t } = useTranslation();
   const q = folder.spec.quota ?? {};
-  const [values, setValues] = useState({
-    routers: q.routers?.toString() ?? "",
-    floating_ips: q.floating_ips?.toString() ?? "",
-  });
+  const [values, setValues] = useState(
+    () =>
+      Object.fromEntries(NETWORK_DIMS.map((d) => [d, q[d]?.toString() ?? ""])) as Record<
+        (typeof NETWORK_DIMS)[number],
+        string
+      >,
+  );
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   async function submit() {
-    const parsed = {
-      routers: parseLimit(values.routers, 1),
-      floating_ips: parseLimit(values.floating_ips, 1),
-    };
+    const parsed = Object.fromEntries(
+      NETWORK_DIMS.map((d) => [d, parseLimit(values[d], 1)]),
+    ) as Record<(typeof NETWORK_DIMS)[number], number | null | undefined>;
     const found: Record<string, string> = {};
-    for (const key of ["routers", "floating_ips"] as const) {
+    for (const key of NETWORK_DIMS) {
       if (parsed[key] === undefined) {
         found[key] = "folders.badCount";
       }
@@ -206,7 +211,7 @@ export function NetworkQuotaDialog({ folder, onClose }: { folder: Folder; onClos
       onClose={onClose}
       onSubmit={submit}
     >
-      {(["routers", "floating_ips"] as const).map((id) => (
+      {NETWORK_DIMS.map((id) => (
         <Field
           key={id}
           id={`quota-${id}`}

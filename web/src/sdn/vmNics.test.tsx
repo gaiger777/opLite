@@ -362,3 +362,49 @@ it("shows the floating IP of an SDN interface on the VM page", async () => {
   expect(link).toHaveAttribute("href", "/floating-ips");
   expect(within(table).getByText("10.10.0.3").closest("tr")).toHaveTextContent(/—$/);
 });
+
+it("lets the VM owner detach a floating IP and shows NIC QoS on the VM page (plan 67)", async () => {
+  // VM 주인은 `vm.config`만 있고 유동 IP의 `network.config`는 없다(서버는 `{target: null}`이면 VM 쪽 권한으로 뗀다).
+  const web = withNics(vm("web", "running"), [
+    {
+      network: "tenant",
+      model: "virtio",
+      mac: "52:54:00:00:00:01",
+      ips: ["10.10.0.2"],
+      qos: { out_mbps: 100, in_mbps: 200, dscp: 46 },
+    },
+  ]);
+  const fip = floatingIpView(
+    "203.0.113.120",
+    "ext",
+    { kind: "distributed", node: "node-a" },
+    { target: { vm: web.id, mac: "52:54:00:00:00:01" }, vm_name: "web" },
+  );
+  mockLists({ vm: [web], node: [NODE], network: [TENANT] });
+  const sent: { ifMatch: string | null; body: unknown }[] = [];
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: [],
+        root_contents: ["system.read", "vm.config", "vm.power"],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+    http.get(apiUrl("/floating-ips"), () => HttpResponse.json({ revision: 3, items: [fip] })),
+    http.patch(apiUrl(`/floating-ips/${fip.id}`), async ({ request }) => {
+      sent.push({ ifMatch: request.headers.get("If-Match"), body: await request.json() });
+      return HttpResponse.json({ ...fip, spec: { network: "ext", address: "203.0.113.120" } });
+    }),
+  );
+  const user = userEvent.setup();
+  renderPage(<VmDetailPage />, { path: "/vms/:name", url: "/vms/web" });
+  await user.click(await screen.findByRole("tab", { name: "Hardware" }));
+  const table = screen.getByRole("table", { name: "Network interfaces" });
+  expect(within(table).getByText("↑ 100 Mbit/s · ↓ 200 Mbit/s · DSCP 46")).toBeVisible();
+  await user.click(await within(table).findByRole("button", { name: "Detach 203.0.113.120" }));
+  await user.click(await screen.findByRole("button", { name: "Detach" }));
+  await waitFor(() => expect(sent).toEqual([{ ifMatch: "8", body: { target: null } }]));
+});
