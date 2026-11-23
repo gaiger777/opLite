@@ -82,6 +82,10 @@ pub(crate) async fn create_task(
     if op.needs_sdn_services() {
         crate::cluster::require_feature(cluster, opl_types::node::SDN_SERVICES)?;
     }
+    // 파일 복원 Task도 옛 노드가 풀지 못한다(계획 69).
+    if op.needs_file_restore() {
+        crate::cluster::require_feature(cluster, opl_types::node::FILE_RESTORE)?;
+    }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
     // 요청한 사용자(리뷰 2 N7). 레이블이라 옛 노드도 그대로 읽는다(`TaskSpec`은 모르는 칸을 거절한다).
@@ -1190,6 +1194,10 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         }
         TaskOp::BackupCopy { store } => {
             return Box::pin(backup_store::copy(ctx, task, store)).await;
+        }
+        // 파일 복원 Task(계획 69)는 스테이지 5·6이 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. } => {
+            Err("file restore tasks are not available yet".into())
         }
     };
     done.map(|()| None)

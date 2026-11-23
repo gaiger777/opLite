@@ -6087,6 +6087,11 @@ export interface components {
             /** @description 복구 키(`OPK1-…`) */
             recovery_key?: string;
         };
+        /** @description a path inside a volume: a list of names (empty = the volume root), or a string "/etc/nginx" (UTF-8 names only; written back as a list) */
+        EntryPath: (string | {
+            /** @description standard base64 of a name that is not UTF-8 */
+            b64: string;
+        })[] | string;
         /** @description 오류 응답 본문 */
         ErrorBody: {
             /** @description 기계가 읽는 오류 종류. 예: `not_found`, `revision_mismatch`, `cluster_no_quorum` */
@@ -6230,6 +6235,25 @@ export interface components {
          * @enum {string}
          */
         Fencing: "watchdog" | "process";
+        /** @description 노드의 파일 복원 능력(`NodeStatus.file_restore`): 도우미 이미지가 있고 검사를 지난 노드만 알린다. */
+        FileRestoreNode: {
+            /** @description 도우미 VM 가속기(`kvm`·`hvf`·`tcg` — 다른 저장 칸처럼 문자열이라 모르는 값이 와도 상태를 푼다) */
+            accel: string;
+            /** @description 이미지·도우미 VM 아키텍처 */
+            arch: components["schemas"]["Arch"];
+            /** @description 이미지 판(`manifest.json`) */
+            image_version: string;
+            /**
+             * Format: int32
+             * @description 노드당 세션 상한(`[file_restore] max_sessions`)
+             */
+            max_sessions: number;
+            /**
+             * Format: int32
+             * @description 지금 열린 세션 수
+             */
+            sessions: number;
+        };
         FinishRegistrationRequest: {
             credential: components["schemas"]["RegistrationCredential"];
             /** @description 패스키 이름(1~64자) */
@@ -6562,6 +6586,11 @@ export interface components {
             /** @description VM을 끌 때 쓰는 방법 */
             shutdown?: components["schemas"]["AgentShutdown"];
         };
+        /**
+         * @description 게스트에 같은 이름이 있을 때
+         * @enum {string}
+         */
+        GuestConflict: "keep" | "skip" | "overwrite";
         /** @description 게스트의 파일 시스템 하나. 크기는 에이전트가 알려 줄 때만 있다. */
         GuestFs: {
             fstype: string;
@@ -8083,6 +8112,11 @@ export interface components {
                      *     없으면 None). 옛 노드는 이 필드를 무시한다.
                      */
                     fence_check?: components["schemas"]["FenceCheck"];
+                    /**
+                     * @description 파일 복원 도우미(계획 69 §8.4): 이미지가 있고 검사를 지난 노드만 알린다(세션 수가 바뀔 때만 쓴다). 없으면 이
+                     *     노드에서 세션을 열지 않는다(옛 노드·이미지 없음·위트니스). 옛 노드는 무시한다.
+                     */
+                    file_restore?: components["schemas"]["FileRestoreNode"];
                     /**
                      * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
                      *     (위트니스는 늘 false).
@@ -9610,6 +9644,11 @@ export interface components {
              *     없으면 None). 옛 노드는 이 필드를 무시한다.
              */
             fence_check?: components["schemas"]["FenceCheck"];
+            /**
+             * @description 파일 복원 도우미(계획 69 §8.4): 이미지가 있고 검사를 지난 노드만 알린다(세션 수가 바뀔 때만 쓴다). 없으면 이
+             *     노드에서 세션을 열지 않는다(옛 노드·이미지 없음·위트니스). 옛 노드는 무시한다.
+             */
+            file_restore?: components["schemas"]["FileRestoreNode"];
             /**
              * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
              *     (위트니스는 늘 false).
@@ -11601,6 +11640,11 @@ export interface components {
                  */
                 fence_check?: components["schemas"]["FenceCheck"];
                 /**
+                 * @description 파일 복원 도우미(계획 69 §8.4): 이미지가 있고 검사를 지난 노드만 알린다(세션 수가 바뀔 때만 쓴다). 없으면 이
+                 *     노드에서 세션을 열지 않는다(옛 노드·이미지 없음·위트니스). 옛 노드는 무시한다.
+                 */
+                file_restore?: components["schemas"]["FileRestoreNode"];
+                /**
                  * @description 이 노드에 VM 방화벽(nftables)이 있다. 보안 그룹을 건 NIC가 있는 VM은 이런 노드에서만 돈다
                  *     (위트니스는 늘 false).
                  */
@@ -13569,6 +13613,22 @@ export interface components {
             kind: "backup-live-restore";
             name: string;
             pool: string;
+        } | {
+            /** Format: uuid */
+            backup: string;
+            /** @enum {string} */
+            kind: "file-restore-session";
+        } | {
+            /** Format: uuid */
+            backup: string;
+            conflict: components["schemas"]["GuestConflict"];
+            /** @enum {string} */
+            kind: "file-restore-to-guest";
+            paths: components["schemas"]["EntryPath"][];
+            /** Format: uuid */
+            session: string;
+            target_dir: string;
+            volume: string;
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

@@ -211,6 +211,7 @@ impl Env {
                 secure_boot: true,
             }),
             backup_stores: Vec::new(),
+            file_restore: None,
         };
         // 이 노드는 지금 빌드를 돌린다.
         me.status.version = Some(BUILD.into());

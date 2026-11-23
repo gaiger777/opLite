@@ -177,6 +177,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub backup_stores: Vec<crate::backup_store::NodeStoreState>,
+    /// 파일 복원 도우미(계획 69 §8.4): 이미지가 있고 검사를 지난 노드만 알린다(세션 수가 바뀔 때만 쓴다). 없으면 이
+    /// 노드에서 세션을 열지 않는다(옛 노드·이미지 없음·위트니스). 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub file_restore: Option<crate::file_restore::FileRestoreNode>,
 }
 
 /// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
@@ -414,6 +419,7 @@ pub const FEATURES: &[&str] = &[
     SDN_ROUTING,
     SDN_SERVICES,
     BACKUP_STORE,
+    FILE_RESTORE,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -502,6 +508,12 @@ pub const SDN_SERVICES: &str = "sdn-services";
 /// 종류를 풀지 못하고(`BackupSpec`·`BackupJobSpec`은 `deny_unknown_fields`) 저장소 백업을 읽는 코드(복원·GC·검증·지우기)가
 /// 모든 노드에 있어야 하므로 모든 노드가 알릴 때만 쓴다.
 pub const BACKUP_STORE: &str = "backup-store";
+
+/// 파일 단위 복원(계획 69): Task `file-restore-session`·`file-restore-to-guest`, 권한 `backup.file_restore`을 쓴 역할·토큰
+/// 범위, `NodeStatus.file_restore`, 파일 복원 경로, 노드 사이 RPC `FileRestore`. 옛 노드는 새 Task를 풀지 못하고 새 권한
+/// 이름을 버려(권한 판단이 노드마다 달라진다) 모든 노드가 알릴 때만 쓴다. 기능을 아는 것과 도우미 이미지가 있는 것은
+/// 다르다(이미지는 `NodeStatus.file_restore`).
+pub const FILE_RESTORE: &str = "file-restore";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -991,7 +1003,8 @@ mod tests {
                 "sdn",
                 "sdn-routing",
                 "sdn-services",
-                "backup-store"
+                "backup-store",
+                "file-restore"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1210,7 +1223,33 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&BACKUP_STORE));
+        assert_eq!(FEATURES.last(), Some(&FILE_RESTORE));
+    }
+
+    /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.
+    #[test]
+    fn status_file_restore_is_written_only_when_reported() {
+        let old = r#"{"online":true,"cpus":8,"memory_mib":16384,"hypervisor":"qemu-tcg","bridges":[],"arch":"aarch64","pools":{},"features":["backup-store"]}"#;
+        let status: NodeStatus = serde_json::from_str(old).unwrap();
+        assert!(status.file_restore.is_none());
+        assert_eq!(serde_json::to_string(&status).unwrap(), old);
+        let status = NodeStatus {
+            file_restore: Some(crate::file_restore::FileRestoreNode {
+                image_version: "0.69.0+3f2a".into(),
+                arch: Arch::Aarch64,
+                accel: "tcg".into(),
+                sessions: 1,
+                max_sessions: 4,
+            }),
+            ..status
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["file_restore"],
+            serde_json::json!({ "image_version": "0.69.0+3f2a", "arch": "aarch64", "accel": "tcg", "sessions": 1,
+                                "max_sessions": 4 })
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 
     /// 계획 68: 저장소 닿음 보고가 없으면(옛 노드) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

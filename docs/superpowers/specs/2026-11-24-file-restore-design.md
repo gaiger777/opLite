@@ -416,3 +416,15 @@ opld는 시작할 때와 `image_dir`의 `manifest.json`이 바뀔 때 파일 해
 8. **docs: 백업 가이드의 파일 단위 복원·도우미 이미지 설치·보안 모형·RHEL 에이전트 설정, 아키텍처, 설계 문서 스테이지 보고, 계획 69 실행 기록** — `docs/guide/backup.md`, `docs/architecture.md`, `web-ui.md`·`development.md`, `docs/index.md`, README 한 줄, `docs/superpowers/plans/2026-11-24-plan69-file-restore.md`.
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
+
+### 스테이지 1 (opl-types·opl-api·opld)
+
+- **`EntryPath`·`PathPart`**: 조각은 바이트열(`PathPart(Vec<u8>)`)로 들고, JSON은 UTF-8이면 문자열·아니면 `{ "b64": … }`(표준 base64, 다른 칸이 있으면 거절). `{b64}`가 UTF-8로 풀리면 문자열로 되쓴다(같은 이름의 두 꼴이 생기지 않게). 문자열 경로는 앞 `/` 하나만 받고 빈 조각(`//`·끝 `/`)·`.`·`..`·NUL은 거절, 조각 ≤ 1024바이트·깊이 ≤ 256(`MAX_NAME_BYTES`·`MAX_PATH_DEPTH`). 빈 목록·`"/"`는 볼륨 루트. OpenAPI 스키마는 손으로(조각 목록 또는 문자열).
+- **볼륨 id**: `disk_volume_id`·`partition_volume_id`·`lv_volume_id(vg, lv, vg_uuid, lv_uuid) -> Option`(이름도 UUID도 LVM 규칙에 어긋나면 그 LV는 보이지 않음 — 게스트 값이라), API 입력 검사 `valid_volume_id`(앞 0 없는 수만, LVM 이름 1~127바이트 `[A-Za-z0-9+_.-]`·`-`로 시작 안 함).
+- **`FileRestoreNode.accel`은 `Accel`이 아니라 문자열**: 다른 저장 칸(`NodeCpu.accel`)처럼 모르는 값이 와도 `NodeStatus`를 풀게. `accelerated()`가 `cpu::Accel::parse`로 읽는다. 다시 등록할 때(`bootstrap::record_node`) `file_restore`는 지운다(세션이 없어졌고 이미지를 다시 검사 — 스테이지 4가 쓴다).
+- **`choose_session_node(candidates, api_node) -> Result<Uuid, NoSessionNode>`**: 후보는 `SessionNodeCandidate { id, name, online, reads_backup, file_restore }`(백업 읽기 판단·위트니스 거르기는 부르는 쪽). 오류 갈래 `NoImage`·`NoReader`(이미지는 있으나 백업을 읽는 노드에 없음)·`Busy`, `code()`는 `file_restore_busy`/`file_restore_unavailable`.
+- **`guest_target_name(name, conflict, exists, now) -> Result<GuestTarget{Write(이름)|Skip|Overwrite}, NoFreeName>`**: `keep`은 `.restored-YYYYMMDD-HHMMSS`(UTC), 그다음 `-2`…`-99`까지(`MAX_KEEP_NAMES`) — 모두 있으면 오류(그 파일 실패로 적음, 조용히 건너뛰지 않음). 임시 이름은 `guest_temp_name(name, task)`. `guest_path_ok(os, part) -> Result<(), GuestPathError>`(Windows 예약 이름은 확장자가 붙어도·`COM1`~`9`·`LPT1`~`9`, `Other`는 Linux 규칙). 경로 260자 검사는 대상 경로를 잇는 스테이지 6에.
+- **`content_disposition`**: ASCII 대체에서 ASCII 아닌 글자·`"`·`\`·`/`·제어 문자를 `_`로, `filename*`은 RFC 5987 attr-char 밖을 `%XX`.
+- **권한 `backup.file_restore`**: 목록 끝(비트 27번째). 역할 만들기·바꾸기와 토큰 범위 만들기에 이 이름이 있으면 `permissions::check_privilege_features`가 검증보다 먼저 `file-restore` 기능을 보고(409 `cluster_upgrading`), **임시로 400 "backup.file_restore is not available yet (file restore)"** — 스테이지 5가 400을 뺀다. 내장 admin은 가지고 operator는 가지지 않는다. grant는 권한 이름을 담지 않으므로(역할을 가리킴) 따로 막지 않는다.
+- **Task 둘**: `TaskOp::needs_file_restore()`, `create_task`가 기능을 본다. 실행기는 "file restore tasks are not available yet"로 실패(스테이지 5·6이 채움). `FileRestoreToGuest.conflict`는 늘 쓴다(새 Task라 바이트 같음 문제 없음). 시험 `crates/opl-api/tests/file_restore_types.rs`.
+- 세션·볼륨·항목 보기 타입(`FileRestoreSessionView`·`VolumeView`·`EntryView`·`ListPage`·`GuestRestoreCaps`)은 경로가 없어 아직 OpenAPI에 나오지 않는다(스테이지 5). `EntryView.mtime`은 `i64`(1970 전), `EntryView::part()`가 `raw`/`name`에서 되보낼 조각을 만든다. `FileRestoreSessionView.opened_by`는 사용자 id(Uuid).

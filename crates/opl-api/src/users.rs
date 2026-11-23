@@ -730,6 +730,7 @@ pub async fn create_token(
     if let Some(scope) = &req.scope {
         // 옛 노드는 범위를 모르고 주인 권한 전부를 준다.
         require_feature(&state.cluster, FOLDERS)?;
+        crate::permissions::check_privilege_features(&state.cluster, &scope.privileges)?;
         scope
             .validate()
             .map_err(|e| ApiError::bad_request(e.to_string()))?;

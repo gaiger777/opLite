@@ -233,6 +233,8 @@ async fn record_node(
         let stores = std::mem::take(&mut status.backup_stores);
         *status = NodeStatus {
             backup_stores: stores,
+            // 파일 복원 도우미(계획 69)는 다시 시작하면 세션이 없고 이미지를 다시 검사하므로 지운다. 검사가 다시 쓴다.
+            file_restore: None,
             sdn: None,
             qos: if qos_ready { host.qos } else { status.qos },
             topology: match &host.topology {
@@ -933,7 +935,8 @@ pub(crate) mod tests {
                 "sdn",
                 "sdn-routing",
                 "sdn-services",
-                "backup-store"
+                "backup-store",
+                "file-restore"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -980,7 +983,8 @@ pub(crate) mod tests {
                 "sdn",
                 "sdn-routing",
                 "sdn-services",
-                "backup-store"
+                "backup-store",
+                "file-restore"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1046,7 +1050,8 @@ pub(crate) mod tests {
                 "sdn",
                 "sdn-routing",
                 "sdn-services",
-                "backup-store"
+                "backup-store",
+                "file-restore"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1287,6 +1292,7 @@ pub(crate) mod tests {
                     "sdn-routing".into(),
                     "sdn-services".into(),
                     "backup-store".into(),
+                    "file-restore".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

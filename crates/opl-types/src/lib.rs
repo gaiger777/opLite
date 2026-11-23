@@ -15,6 +15,7 @@ pub mod cluster;
 pub mod cpu;
 pub mod crypt;
 pub mod fence;
+pub mod file_restore;
 pub mod firmware;
 pub mod floating_ip;
 pub mod folder;

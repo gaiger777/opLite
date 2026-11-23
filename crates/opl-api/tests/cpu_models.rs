@@ -555,6 +555,7 @@ async fn add_x86_node(env: &Env, name: &str, catalog: &str) -> Uuid {
         hotplug: None,
         firmware_caps: None,
         backup_stores: Vec::new(),
+        file_restore: None,
     };
     env.cluster.create(&node).await.unwrap();
     node.id

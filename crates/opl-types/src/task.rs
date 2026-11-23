@@ -333,6 +333,21 @@ pub enum TaskOp {
         #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
         folder: Option<Uuid>,
     },
+    /// 파일 복원 세션(계획 69 §10): 백업 `backup`을 일회용 도우미 VM에 읽기 전용으로 붙여 열고, 유휴·최대 시간·닫기
+    /// 요청까지 기다린 뒤 치운다. 대상은 세션 id(새 UUID — 같은 백업의 세션 둘이 줄 서지 않게). 이어 가지 않는다.
+    FileRestoreSession {
+        backup: Uuid,
+    },
+    /// 세션 `session`(백업 `backup`)의 볼륨 `volume`에서 `paths`를 게스트 에이전트로 대상 VM의 `target_dir`에 되돌려
+    /// 쓴다(계획 69 §12). 대상은 VM이고 세션 노드에서 돈다.
+    FileRestoreToGuest {
+        session: Uuid,
+        backup: Uuid,
+        volume: String,
+        paths: Vec<crate::file_restore::EntryPath>,
+        target_dir: String,
+        conflict: crate::file_restore::GuestConflict,
+    },
 }
 
 impl TaskOp {
@@ -396,6 +411,14 @@ impl TaskOp {
                 | TaskOp::BackupConvert { .. }
                 | TaskOp::BackupCopy { .. }
                 | TaskOp::BackupLiveRestore { .. }
+        )
+    }
+
+    /// 파일 복원 기능(계획 69, `node::FILE_RESTORE`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_file_restore(&self) -> bool {
+        matches!(
+            self,
+            TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. }
         )
     }
 
@@ -556,6 +579,56 @@ mod tests {
         let old = serde_json::json!({ "kind": "backup-restore", "backup": backup, "name": "web-2", "pool": "local" });
         let op: TaskOp = serde_json::from_value(old.clone()).unwrap();
         assert!(!op.needs_backup_store());
+        assert_eq!(serde_json::to_value(&op).unwrap(), old);
+    }
+
+    /// 계획 69의 파일 복원 Task 둘: 태그와 칸 이름, 경로는 조각 목록(UTF-8이 아니면 b64), 옛 Task JSON은 그대로다.
+    #[test]
+    fn file_restore_ops_are_tagged() {
+        use crate::file_restore::{EntryPath, GuestConflict, PathPart};
+        let backup = Uuid::now_v7();
+        let session = Uuid::now_v7();
+        let raw = EntryPath::from_parts(vec![
+            PathPart::new("etc").unwrap(),
+            PathPart::new(vec![0xff]).unwrap(),
+        ])
+        .unwrap();
+        let cases = [
+            (
+                TaskOp::FileRestoreSession { backup },
+                serde_json::json!({ "kind": "file-restore-session", "backup": backup }),
+            ),
+            (
+                TaskOp::FileRestoreToGuest {
+                    session,
+                    backup,
+                    volume: "disk0p2".into(),
+                    paths: vec![EntryPath::parse("/etc/nginx.conf").unwrap(), raw],
+                    target_dir: "/etc".into(),
+                    conflict: GuestConflict::Keep,
+                },
+                serde_json::json!({ "kind": "file-restore-to-guest", "session": session, "backup": backup,
+                    "volume": "disk0p2", "paths": [["etc", "nginx.conf"], ["etc", { "b64": "/w==" }]],
+                    "target_dir": "/etc", "conflict": "keep" }),
+            ),
+        ];
+        for (op, json) in cases {
+            assert!(op.needs_file_restore(), "{json}");
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        }
+        // 문자열 경로도 받는다(조각 목록으로 되쓴다).
+        let op: TaskOp = serde_json::from_value(serde_json::json!({ "kind": "file-restore-to-guest",
+            "session": session, "backup": backup, "volume": "disk0", "paths": ["/a/b"], "target_dir": "/",
+            "conflict": "overwrite" }))
+        .unwrap();
+        assert!(
+            matches!(&op, TaskOp::FileRestoreToGuest { paths, .. } if paths[0] == EntryPath::parse("a/b").unwrap())
+        );
+        assert!(!TaskOp::BackupDelete.needs_file_restore());
+        let old = serde_json::json!({ "kind": "backup-restore", "backup": backup, "name": "web-2", "pool": "local" });
+        let op: TaskOp = serde_json::from_value(old.clone()).unwrap();
+        assert!(!op.needs_file_restore());
         assert_eq!(serde_json::to_value(&op).unwrap(), old);
     }
 

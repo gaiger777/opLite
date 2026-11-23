@@ -1116,6 +1116,7 @@ mod tests {
             hotplug: None,
             firmware_caps: None,
             backup_stores: Vec::new(),
+            file_restore: None,
         };
         n
     }

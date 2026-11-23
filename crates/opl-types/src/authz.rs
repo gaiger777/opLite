@@ -111,6 +111,9 @@ privileges! {
     ClusterRead = "cluster.read",
     /// 계정·영역·남의 토큰·알림 대상·감사 로그·설정·노드·HA·배치·Ceph·SDN·원격 쓰기, 역할·그룹·루트 grant
     ClusterAdmin = "cluster.admin",
+    /// 백업 안 파일 찾아보기·내려받기·게스트로 되돌려 쓰기(계획 69). VM 통째 복원과 다른 무게의 데이터 읽기라
+    /// operator에 넣지 않는다(관리자가 따로 준다).
+    BackupFileRestore = "backup.file_restore",
 }
 
 impl Privilege {
@@ -624,7 +627,10 @@ mod tests {
 
     #[test]
     fn privilege_names_round_trip() {
-        assert_eq!(Privilege::ALL.len(), 26);
+        assert_eq!(Privilege::ALL.len(), 27);
+        // 계획 69: 새 권한은 목록 끝(비트 순서 유지)
+        assert_eq!(Privilege::ALL.last(), Some(&Privilege::BackupFileRestore));
+        assert_eq!(Privilege::BackupFileRestore.as_str(), "backup.file_restore");
         assert!(Privilege::ALL.len() <= 64);
         for (i, p) in Privilege::ALL.iter().enumerate() {
             assert_eq!(*p as usize, i);
@@ -677,6 +683,17 @@ mod tests {
         let (set, unknown) = PrivSet::from_names(&["vm.power", "x.y"]);
         assert_eq!(set, Privilege::VmPower.into());
         assert_eq!(unknown, vec!["x.y".to_string()]);
+        // 계획 69의 권한은 이 빌드가 알고, 옛 operator 이름 목록은 바이트 그대로다.
+        let set: PrivSet =
+            serde_json::from_value(serde_json::json!(["backup.restore", "backup.file_restore"]))
+                .unwrap();
+        assert!(set.contains(Privilege::BackupFileRestore));
+        let op = serde_json::to_string(&builtin_privileges(Role::Operator)).unwrap();
+        assert!(!op.contains("file_restore"), "{op}");
+        assert_eq!(
+            serde_json::from_str::<PrivSet>(&op).unwrap(),
+            builtin_privileges(Role::Operator)
+        );
     }
 
     #[test]
@@ -698,6 +715,7 @@ mod tests {
             Privilege::AlertManage,
             Privilege::ClusterAdmin,
             Privilege::VmDedicated,
+            Privilege::BackupFileRestore,
         ] {
             assert!(!op.contains(p), "{p}");
         }
