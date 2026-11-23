@@ -226,3 +226,22 @@ it("follows the server's check_no_migration: every action waits for a migration"
   const done = { ...queued[0]!, status: { state: "failed", error: "boom" } } as Task;
   expect(availability(running, "migrate", [done])).toEqual({ ok: true });
 });
+
+it("blocks stop, delete and migrate during a live restore but allows force stop", () => {
+  const v = vm("lr", "running");
+  const live = {
+    ...v,
+    status: {
+      ...v.status,
+      live_restore: { backup: "b", task: "t", phase: "copying" as const, started_at: 1 },
+    },
+  };
+  for (const action of ["stop", "delete", "migrate"] as const) {
+    expect(availability(live, action, [])).toEqual({
+      ok: false,
+      reason: "vms.reason.restoring",
+    });
+  }
+  expect(availability(live, "force-stop", [])).toEqual({ ok: true });
+  expect(availability(live, "console", [])).toEqual({ ok: true });
+});

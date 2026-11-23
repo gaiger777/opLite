@@ -21,6 +21,7 @@ import {
   WEEKDAYS,
 } from "@/backups/jobs";
 import { RemoteTargetFields } from "@/backups/RemoteTargetFields";
+import { useBackupStores } from "@/backupStores/stores";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
@@ -98,7 +99,7 @@ export function BackupJobsPage() {
           <TableRow>
             <TableHead>{t("common.name")}</TableHead>
             <TableHead>{t("backupJobs.vms")}</TableHead>
-            <TableHead>{t("backups.pool")}</TableHead>
+            <TableHead>{t("backups.target")}</TableHead>
             <TableHead>{t("backupJobs.schedule")}</TableHead>
             <TableHead>{t("backupJobs.keep")}</TableHead>
             <TableHead>{t("backupJobs.replicate")}</TableHead>
@@ -137,7 +138,24 @@ export function BackupJobsPage() {
                     </span>
                   )}
                 </TableCell>
-                <TableCell>{job.spec.pool}</TableCell>
+                <TableCell>
+                  {job.spec.store ? (
+                    <span className="flex flex-col">
+                      <span>{job.spec.store}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {t("backups.storeTarget")}
+                      </span>
+                      {/* 다른 저장소로 보내는 복사본(계획 68 §12.5) */}
+                      {job.spec.copy_to && (
+                        <span className="text-xs text-muted-foreground">
+                          {t("backupJobs.copiesTo", { store: job.spec.copy_to.store })}
+                        </span>
+                      )}
+                    </span>
+                  ) : (
+                    job.spec.pool
+                  )}
+                </TableCell>
                 <TableCell>
                   {days.length === 0
                     ? t("backupJobs.everyDay")
@@ -275,14 +293,25 @@ function JobDialog({
   onClose(): void;
 }) {
   const { t } = useTranslation();
+  const perms = usePermissions();
   const pools = backupPools(useList("storage-pool").data ?? []).map((p) => p.name);
+  // 백업을 받을 수 있는 저장소(계획 68). 작업의 저장소는 이제 받을 수 없어도 고른 값으로 보인다.
+  const stores = (useBackupStores(perms.reads("backup-store")).data ?? [])
+    .filter((s) => s.status.phase === "ready" && !s.spec.read_only)
+    .map((s) => s.name);
+  const jobStore = job?.spec.store;
+  if (jobStore && !stores.includes(jobStore)) {
+    stores.unshift(jobStore);
+  }
   // 작업의 풀이 이제 백업 풀이 아니어도 고른 값으로 보인다(서버가 저장할 때 거절한다).
   // 저장소 작업(계획 68)은 풀이 없다.
   const jobPool = job?.spec.pool;
   if (jobPool && !pools.includes(jobPool)) {
     pools.unshift(jobPool);
   }
-  const [form, setForm] = useState<JobForm>(() => (job ? formOf(job) : emptyForm(pools[0] ?? "")));
+  const [form, setForm] = useState<JobForm>(() =>
+    job ? formOf(job) : emptyForm(pools[0] ?? "", stores[0] ?? ""),
+  );
   const [errors, setErrors] = useState<Record<string, string>>({});
   const change = (part: Partial<JobForm>) => setForm((f) => ({ ...f, ...part }));
   const unchanged = job !== null && Object.keys(patchOf(job, specOf(form))).length === 0;
@@ -312,7 +341,7 @@ function JobDialog({
       title={job ? t("backupJobs.editTitle", { name: job.name }) : t("backupJobs.createTitle")}
       description={t(job ? "backupJobs.editDescription" : "backupJobs.createDescription")}
       submitLabel={job ? t("common.save") : t("common.create")}
-      submitDisabled={pools.length === 0 || unchanged}
+      submitDisabled={(pools.length === 0 && stores.length === 0) || unchanged}
       returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
@@ -329,8 +358,50 @@ function JobDialog({
           )}
         </Field>
       )}
-      {pools.length === 0 ? (
+      {pools.length === 0 && stores.length === 0 ? (
         <p className="text-sm text-muted-foreground">{t("backups.noPools")}</p>
+      ) : stores.length > 0 ? (
+        // 백업 풀 | 저장소(계획 68 §14 웹)
+        <Field
+          id="job-target-store"
+          label={t("backups.target")}
+          error={errors.pool ?? errors.store}
+        >
+          {(a11y) => (
+            <NativeSelect
+              id="job-target-store"
+              className="w-full"
+              value={form.targetKind === "store" ? `store:${form.store}` : `pool:${form.pool}`}
+              onChange={(e) => {
+                const value = e.target.value;
+                const name = value.slice(value.indexOf(":") + 1);
+                change(
+                  value.startsWith("store:")
+                    ? { targetKind: "store", store: name }
+                    : { targetKind: "pool", pool: name, copyStore: "" },
+                );
+              }}
+              {...a11y}
+            >
+              {pools.length > 0 && (
+                <optgroup label={t("backups.poolsGroup")}>
+                  {pools.map((p) => (
+                    <NativeSelectOption key={p} value={`pool:${p}`}>
+                      {p}
+                    </NativeSelectOption>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label={t("backups.storesGroup")}>
+                {stores.map((s) => (
+                  <NativeSelectOption key={s} value={`store:${s}`}>
+                    {s}
+                  </NativeSelectOption>
+                ))}
+              </optgroup>
+            </NativeSelect>
+          )}
+        </Field>
       ) : (
         <Field id="job-pool" label={t("backups.pool")} error={errors.pool}>
           {(a11y) => (
@@ -471,6 +542,64 @@ function JobDialog({
           />
         )}
       </Field>
+      {form.targetKind === "store" && stores.some((s) => s !== form.store) && (
+        <fieldset className="flex flex-col gap-1.5">
+          <legend className="mb-1.5 text-sm font-medium">{t("backupJobs.copyTo")}</legend>
+          <Field
+            id="job-copy-store"
+            label={t("backupJobs.copyStore")}
+            error={errors.copyStore}
+            hint={t("backupJobs.copyHint")}
+          >
+            {(a11y) => (
+              <NativeSelect
+                id="job-copy-store"
+                className="w-full"
+                value={form.copyStore}
+                onChange={(e) => change({ copyStore: e.target.value })}
+                {...a11y}
+              >
+                <NativeSelectOption value="">{t("backupJobs.noCopy")}</NativeSelectOption>
+                {stores
+                  .filter((s) => s !== form.store)
+                  .map((s) => (
+                    <NativeSelectOption key={s} value={s}>
+                      {s}
+                    </NativeSelectOption>
+                  ))}
+              </NativeSelect>
+            )}
+          </Field>
+          {form.copyStore !== "" && (
+            <>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {KEEP_UNITS.map((unit) => (
+                  <div key={unit} className="flex flex-col gap-1.5">
+                    <Label htmlFor={`job-copy-keep-${unit}`}>
+                      {t("backupJobs.copyKeepLabel", { unit: t(`backupJobs.keepLabel.${unit}`) })}
+                    </Label>
+                    <Input
+                      id={`job-copy-keep-${unit}`}
+                      inputMode="numeric"
+                      placeholder={form.keep[unit] || "0"}
+                      value={form.copyKeep[unit]}
+                      aria-invalid={errors.copyKeep ? true : undefined}
+                      onChange={(e) =>
+                        change({ copyKeep: { ...form.copyKeep, [unit]: e.target.value } })
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+              {errors.copyKeep ? (
+                <p className="text-xs text-destructive">{t(errors.copyKeep)}</p>
+              ) : (
+                <p className="text-xs text-muted-foreground">{t("backupJobs.copyKeepHint")}</p>
+              )}
+            </>
+          )}
+        </fieldset>
+      )}
       <RemoteTargetFields
         id="job-replicate"
         label={t("backupJobs.replicateLabel")}

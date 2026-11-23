@@ -22,6 +22,7 @@ import type {
   VmImport,
   Volume,
 } from "@/api/types";
+import type { BackupStore } from "@/backupStores/stores";
 import type { RemoteView } from "@/remotes/remotes";
 import type { PoolState } from "@/storage/pools";
 
@@ -970,4 +971,61 @@ export function migrationRes(
     spec,
     status,
   } as unknown as import("@/migration/migration").Migration;
+}
+
+/**
+ * 테스트용 백업 저장소(계획 68, 서버 `BackupStoreView` — 비밀이 빠진 보기). 기본은 백업 풀 `bk` 안의 준비된 평문 저장소이고
+ * 매일 05:00 GC, 일요일 06:00 검증이다.
+ */
+export function backupStore(
+  name: string,
+  n: number,
+  extra: { spec?: Partial<BackupStore["spec"]>; status?: Partial<BackupStore["status"]> } = {},
+): BackupStore {
+  return {
+    id: `019a0f3c-0000-7000-8068-${String(n).padStart(12, "0")}`,
+    name,
+    revision: 1,
+    labels: {},
+    spec: {
+      backend: { pool: "bk" },
+      gc: { at: "05:00", days: [] },
+      verify: { schedule: { at: "06:00", days: ["sun"] }, reverify_days: 30, mode: "full" },
+      max_streams: 8,
+      ...extra.spec,
+    },
+    status: { phase: "ready", ...extra.status },
+  };
+}
+
+/** 저장소 `store`에 든 테스트용 백업(풀이 없고 청크 통계가 있다) */
+export function storeBackup(
+  name: string,
+  of: Vm,
+  n: number,
+  store: string,
+  extra: { spec?: Partial<Backup["spec"]>; status?: Partial<Backup["status"]> } = {},
+): Backup {
+  const b = backup(name, of, n, extra);
+  const spec = { ...b.spec, store, ...extra.spec };
+  delete spec.pool;
+  return {
+    ...b,
+    spec,
+    status: {
+      ...b.status,
+      disks: [
+        { name: "disk0", file: "disk0.fidx", virtual_bytes: 16 * 1024 ** 3, stored_bytes: 0 },
+      ],
+      store_stats: {
+        logical_bytes: 16 * 1024 ** 3,
+        read_bytes: 16 * 1024 ** 3,
+        new_bytes: 300 * 1024 ** 2,
+        new_chunks: 75,
+        reused_chunks: 10,
+        zero_chunks: 4011,
+      },
+      ...extra.status,
+    },
+  };
 }

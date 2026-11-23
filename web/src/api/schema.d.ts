@@ -5983,8 +5983,8 @@ export interface components {
             /** @description 새 키를 만들었으면 그 복구 키(이때 한 번 — 나중에는 `key/export`). 잃으면 백업을 되살릴 길이 없다. */
             recovery_key?: string;
             store: components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"];
-            /** @description 초기화 Task */
-            task: components["schemas"]["Resource"];
+            /** @description 초기화 Task(OpenAPI가 별칭 `Task`를 남의 `Resource`로 잇지 않게 전체 이름으로 쓴다) */
+            task: components["schemas"]["Resource_TaskSpec_TaskStatus"];
         };
         CreatedToken: {
             /** @description `Authorization: Bearer <secret>`로 쓴다. 다시 볼 수 없다. */

@@ -26,7 +26,9 @@ export type Kind =
   | "router"
   | "floating-ip"
   | "load-balancer"
-  | "network-migration";
+  | "network-migration"
+  // 백업 저장소(계획 68, 루트 — 읽기 `system.read`, 쓰기 `storage.config`). watch로는 사건만 받아 목록을 다시 읽는다.
+  | "backup-store";
 
 /** 권한(계획 62 설계 §6.2). 이름은 서버의 `Privilege`와 같다. */
 export const PRIVILEGES = [
@@ -102,7 +104,7 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
     case "read":
       return kind === "alert-rule"
         ? "alert.read"
-        : FOLDER_KINDS.has(kind)
+        : FOLDER_KINDS.has(kind) || kind === "backup-store"
           ? "system.read"
           : "cluster.read";
     case "write":
@@ -118,6 +120,7 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
         case "backup-job":
           return "backup.job";
         case "storage-pool":
+        case "backup-store":
           return "storage.config";
         case "network":
         case "router":
@@ -145,6 +148,8 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
           return "backup.restore";
         case "backup-job":
           return "backup.job";
+        case "backup-store":
+          return "storage.config";
         default:
           return "cluster.admin";
       }

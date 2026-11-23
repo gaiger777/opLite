@@ -53,7 +53,14 @@ export function keepParts(keep: Keep | undefined): [KeepUnit, number][] {
 /** 만들기·바꾸기 폼의 값. 숫자도 입력 그대로 문자열로 둔다. */
 export interface JobForm {
   name: string;
+  /** 백업이 가는 곳: 백업 풀 또는 백업 저장소(계획 68) */
+  targetKind: "pool" | "store";
   pool: string;
+  store: string;
+  /** 복사본을 보낼 다른 저장소(계획 68 §12.5). 비면 복사하지 않는다. 저장소 작업만이다. */
+  copyStore: string;
+  /** 복사본의 보존(모두 비면 작업의 보존을 쓴다) */
+  copyKeep: Record<KeepUnit, string>;
   target: "all" | "names" | "labels";
   /** 쉼표로 나눈 VM 이름 */
   names: string;
@@ -71,10 +78,14 @@ export interface JobForm {
   fullEvery: string;
 }
 
-export function emptyForm(pool: string): JobForm {
+export function emptyForm(pool: string, store = ""): JobForm {
   return {
     name: "",
+    targetKind: pool === "" && store !== "" ? "store" : "pool",
     pool,
+    store,
+    copyStore: "",
+    copyKeep: { last: "", daily: "", weekly: "", monthly: "" },
     target: "all",
     names: "",
     labels: "",
@@ -91,9 +102,19 @@ export function emptyForm(pool: string): JobForm {
 export function formOf(job: BackupJob): JobForm {
   const vms = job.spec.vms;
   const keep = job.spec.keep;
+  const copyKeep = job.spec.copy_to?.keep;
   return {
     name: job.name,
+    targetKind: job.spec.store ? "store" : "pool",
     pool: job.spec.pool ?? "",
+    store: job.spec.store ?? "",
+    copyStore: job.spec.copy_to?.store ?? "",
+    copyKeep: {
+      last: copyKeep ? String(copyKeep.last) : "",
+      daily: copyKeep ? String(copyKeep.daily) : "",
+      weekly: copyKeep ? String(copyKeep.weekly) : "",
+      monthly: copyKeep ? String(copyKeep.monthly) : "",
+    },
     target: "all" in vms ? "all" : "names" in vms ? "names" : "labels",
     names: "names" in vms ? vms.names.join(", ") : "",
     labels:
@@ -127,8 +148,25 @@ export function checkForm(form: JobForm, taken: string[] | null): Record<string,
       found.name = "backupJobs.errors.exists";
     }
   }
-  if (form.pool === "") {
+  if (form.targetKind === "pool" && form.pool === "") {
     found.pool = "backups.errors.pool";
+  }
+  if (form.targetKind === "store") {
+    if (form.store === "") {
+      found.store = "backupJobs.errors.store";
+    } else if (form.copyStore === form.store) {
+      found.copyStore = "backupJobs.errors.copySame";
+    }
+  }
+  if (
+    form.targetKind === "store" &&
+    form.copyStore !== "" &&
+    KEEP_UNITS.some((unit) => {
+      const n = form.copyKeep[unit].trim();
+      return n !== "" && !(/^\d+$/.test(n) && Number(n) <= U32_MAX);
+    })
+  ) {
+    found.copyKeep = "backupJobs.errors.keep";
   }
   if (form.replicateRemote !== "" && form.replicatePool === "") {
     found.replicatePool = "backups.errors.pool";
@@ -170,9 +208,23 @@ export function specOf(form: JobForm): Spec {
         : { labels: parseLabels(form.labels) ?? {} };
   const count = (unit: KeepUnit) => Number(form.keep[unit].trim() || "0");
   const fullEvery = Number(form.fullEvery.trim() || "0");
+  const store = form.targetKind === "store";
+  // 복사본의 보존은 칸을 하나라도 채웠을 때만 보낸다(없으면 작업의 보존).
+  const copyKeep = KEEP_UNITS.some((unit) => form.copyKeep[unit].trim() !== "")
+    ? {
+        last: Number(form.copyKeep.last.trim() || "0"),
+        daily: Number(form.copyKeep.daily.trim() || "0"),
+        weekly: Number(form.copyKeep.weekly.trim() || "0"),
+        monthly: Number(form.copyKeep.monthly.trim() || "0"),
+      }
+    : undefined;
   return {
     vms,
-    pool: form.pool,
+    ...(store ? { store: form.store } : { pool: form.pool }),
+    ...(store &&
+      form.copyStore !== "" && {
+        copy_to: { store: form.copyStore, ...(copyKeep && { keep: copyKeep }) },
+      }),
     schedule: { at: form.at, days: WEEKDAYS.filter((d) => form.days.includes(d)) },
     keep: {
       last: count("last"),
@@ -201,8 +253,17 @@ export function patchOf(job: BackupJob, spec: Spec): BackupJobPatch {
   if (!same(job.spec.vms, spec.vms)) {
     patch.vms = spec.vms;
   }
-  if (job.spec.pool !== spec.pool) {
+  // 저장소를 주면 풀이 비고, 풀을 주면 저장소가 빈다(서버 — 계획 68).
+  if (spec.store !== undefined) {
+    if (job.spec.store !== spec.store) {
+      patch.store = spec.store;
+    }
+  } else if (job.spec.pool !== spec.pool || job.spec.store !== undefined) {
     patch.pool = spec.pool;
+  }
+  const copy = (c: Spec["copy_to"]) => (c ? [c.store, c.keep ? keep(c.keep) : null] : null);
+  if (!same(copy(job.spec.copy_to), copy(spec.copy_to))) {
+    patch.copy_to = spec.copy_to ?? null;
   }
   const days = (d: Weekday[] | undefined) => WEEKDAYS.filter((w) => d?.includes(w));
   const schedule = { at: job.spec.schedule.at, days: days(job.spec.schedule.days) };

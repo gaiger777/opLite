@@ -117,3 +117,20 @@ it("offers SDN conditions and filters nodes only on node subjects (plan 67)", ()
   expect(CONDITION_KINDS.filter(isSdn)).toHaveLength(8);
   expect(SDN_DEFAULTS.map((r) => r.kind).sort()).toEqual(CONDITION_KINDS.filter(isSdn).sort());
 });
+
+it("does not filter the backup store conditions by node or VM", () => {
+  expect(CONDITION_KINDS).toContain("backup_verify_failed");
+  expect(CONDITION_KINDS).toContain("backup_store_unavailable");
+  expect(takesNodes("backup_verify_failed")).toBe(false);
+  expect(takesNodes("backup_store_unavailable")).toBe(false);
+  expect(isEvent("backup_verify_failed")).toBe(false);
+  const spec = ruleSpecOf({
+    ...emptyRuleForm(),
+    name: "verify",
+    kind: "backup_verify_failed",
+    nodes: "node-a",
+    targets: ["mail"],
+  });
+  expect(spec.condition).toEqual({ kind: "backup_verify_failed" });
+  expect(spec).not.toHaveProperty("nodes");
+});

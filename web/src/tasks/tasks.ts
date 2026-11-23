@@ -114,6 +114,8 @@ export function describeTask(
   const op = task.spec.op;
   const from = op.kind === "vm-ha-recover" ? (nodeName(op.from) ?? op.from) : undefined;
   const remote = op.kind === "backup-replicate" ? op.remote : undefined;
+  // 옮기기·복사(계획 68)의 대상 저장소
+  const store = op.kind === "backup-convert" || op.kind === "backup-copy" ? op.store : undefined;
   const check = op.kind === "ha-check" ? op.check : undefined;
   const action = op.kind === "ha-check" ? t(`haChecks.actions.${op.action}`) : undefined;
   const bond = op.kind === "bond-degraded" ? op.bond : undefined;
@@ -141,6 +143,7 @@ export function describeTask(
     target,
     from,
     remote,
+    store,
     check,
     action,
     bond,

@@ -27,7 +27,7 @@ use opl_types::backup_store::{
 use opl_types::node::BACKUP_STORE;
 use opl_types::resource::Resource;
 use opl_types::storage::StoragePoolSpec;
-use opl_types::task::{Task, TaskOp, TaskSpec};
+use opl_types::task::{Task, TaskOp, TaskSpec, TaskStatus};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use utoipa::ToSchema;
@@ -221,8 +221,8 @@ pub struct CreatedStore {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(nullable = false)]
     pub recovery_key: Option<String>,
-    /// 초기화 Task
-    pub task: Task,
+    /// 초기화 Task(OpenAPI가 별칭 `Task`를 남의 `Resource`로 잇지 않게 전체 이름으로 쓴다)
+    pub task: Resource<TaskSpec, TaskStatus>,
 }
 
 /// S3 자격 증명 바꾸기(둘 다)

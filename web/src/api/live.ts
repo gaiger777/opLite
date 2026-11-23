@@ -26,7 +26,14 @@ export const KINDS: WatchKind[] = [
  * 서버가 상태를 덧붙인 보기 목록이라 watch로는 사건만 받고 그 화면의 질의를 다시 읽는 종류(계획 67): 라우터(게이트웨이
  * 순위)·유동 IP(상태)·부하 분산기(멤버 건강)·네트워크 옮기기. 모두 폴더를 따라 서버가 사건마다 거른다.
  */
-export const VIEW_KINDS = ["router", "floating-ip", "load-balancer", "network-migration"] as const;
+export const VIEW_KINDS = [
+  "router",
+  "floating-ip",
+  "load-balancer",
+  "network-migration",
+  // 백업 저장소(계획 68): 비밀을 뺀 보기라 사건이 오면 목록을 다시 읽는다.
+  "backup-store",
+] as const;
 export type ViewKind = (typeof VIEW_KINDS)[number];
 
 /**
@@ -44,6 +51,7 @@ export const REFRESH_ON: Partial<Record<ViewKind | WatchKind, readonly (readonly
   "floating-ip": [["floating-ips"], ["network-ips"], ["network-topology"]],
   "load-balancer": [["load-balancers"], ["network-ips"], ["network-topology"]],
   "network-migration": [["network-migrations"], ["network-topology"]],
+  "backup-store": [["backup-stores"]],
   network: [["network-topology"], ["load-balancers"]],
   vm: [["network-topology"], ["floating-ips"]],
 };

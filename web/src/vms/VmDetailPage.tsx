@@ -12,6 +12,7 @@ import { useTaskIndex } from "@/api/taskIndex";
 import type { NicSpec, ReplicationState, Vm } from "@/api/types";
 import { objectTarget } from "@/auth/permissions";
 import { usePermissions, useVmCan } from "@/auth/usePermissions";
+import { LiveRestoreStrip } from "@/backups/LiveRestoreStrip";
 import { VmBackups } from "@/backups/VmBackups";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ListPending } from "@/components/ListPending";
@@ -131,6 +132,7 @@ export function VmDetailPage() {
   return (
     <div className="flex flex-col gap-4">
       <VmHeader vm={vm} />
+      {vm.status.live_restore && <LiveRestoreStrip vm={vm} />}
       <Tabs
         value={tab}
         onValueChange={(value) =>

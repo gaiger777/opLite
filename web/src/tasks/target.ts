@@ -25,7 +25,7 @@ function vmTab(task: Task): string | undefined {
   if (kind.startsWith("snapshot-")) {
     return "snapshots";
   }
-  if (kind === "vm-backup" || kind === "backup-replicate") {
+  if (kind === "vm-backup" || kind === "backup-replicate" || kind === "backup-live-restore") {
     return "backups";
   }
   if (kind === "vm-firmware-reset" || kind === "vm-hotplug") {
@@ -46,7 +46,7 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
     return { name: vm.name, href: `/vms/${enc(vm.name)}${tab ? `?tab=${tab}` : ""}` };
   }
   // 복원·가져오기의 대상은 Task가 끝날 때 만들어지는 새 VM이다. 그 전에는 요청한 이름을 보인다.
-  if (op.kind === "backup-restore") {
+  if (op.kind === "backup-restore" || op.kind === "backup-live-restore") {
     return { name: op.name };
   }
   if (op.kind === "vm-import") {
@@ -70,6 +70,10 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
     return { name: node.name, href: `/nodes/${enc(node.name)}` };
   }
   const name = task.spec.target.slice(-8);
+  // 저장소 Task(계획 68)의 대상은 저장소 리소스다.
+  if (op.kind.startsWith("backup-store-")) {
+    return { name, href: `/backup-stores?open=${enc(task.spec.target)}` };
+  }
   return op.kind.startsWith("ceph-")
     ? { name, href: "/ceph" }
     : op.kind.startsWith("sdn-")
@@ -79,7 +83,7 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
 
 /**
  * 경보 대상의 화면: 노드·VM은 상세, 풀은 목록 검색, 백업 작업·Task는 그 목록, 라우터·부하 분산기는 그 서랍을 연 목록,
- * SDN은 SDN 보기(계획 67), 백업은 목록 검색, 백업 저장소는 백업 목록(계획 68 — 저장소 화면은 웹 스테이지가 더한다)
+ * SDN은 SDN 보기(계획 67), 백업은 목록 검색, 백업 저장소는 그 서랍을 연 저장소 목록(계획 68)
  */
 export function alertHref(subject: AlertSubject): string {
   switch (subject.kind) {
@@ -102,6 +106,6 @@ export function alertHref(subject: AlertSubject): string {
     case "backup":
       return `/backups?q=${enc(subject.name)}`;
     case "backup_store":
-      return "/backups";
+      return `/backup-stores?open=${enc(subject.id)}`;
   }
 }

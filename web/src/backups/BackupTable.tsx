@@ -1,25 +1,36 @@
-import { CircleAlert, CircleCheck, LoaderCircle } from "lucide-react";
+import { CircleAlert, CircleCheck, CircleDashed, LoaderCircle } from "lucide-react";
 import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
+import { toast } from "sonner";
 
 import { api, ApiError, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Backup, Task } from "@/api/types";
 import { usePermissions } from "@/auth/usePermissions";
 import { chainBytes, chainReplicas, storedBytes } from "@/backups/backups";
+import { formatUtc } from "@/backups/jobs";
 import { type RemoteTarget, RemoteTargetFields } from "@/backups/RemoteTargetFields";
+import {
+  type BackupStore,
+  backupTarget,
+  useBackupStores,
+  verifyBadge,
+} from "@/backupStores/stores";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
+import { StatusChip } from "@/components/StatusChip";
 import { type Column, DataTable } from "@/components/data-table/DataTable";
 import { useTableState } from "@/components/data-table/state";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
-import { codeMessage } from "@/i18n/errors";
+import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
 import { validName } from "@/vms/form";
@@ -61,12 +72,46 @@ function ReplicaBadge({ replica }: { replica: Replica }) {
 }
 
 /**
+ * 검증 배지(계획 68 §14 웹): 확인됨·실패(깨진 청크 수)·안 함. 시각과 오류는 툴팁과 화면 읽기용 글에 둔다. 풀 백업은
+ * 검증하지 않으므로 "—"다.
+ */
+export function VerifyBadge({ backup }: { backup: Backup }) {
+  const { t } = useTranslation();
+  const state = verifyBadge(backup);
+  if (state === "none") {
+    return <>—</>;
+  }
+  const verify = backup.status.verify;
+  const title = verify
+    ? t("backups.verify.at", { at: formatUtc(verify.at) }) +
+      (verify.error ? `. ${verify.error}` : "")
+    : t("backups.verify.neverHint");
+  const label =
+    state === "failed"
+      ? t("backups.verify.failed", { count: verify?.bad_chunks ?? 0 })
+      : t(`backups.verify.${state}`);
+  return (
+    <span title={title}>
+      <StatusChip
+        tone={state === "ok" ? "success" : state === "failed" ? "danger" : "neutral"}
+        icon={state === "ok" ? CircleCheck : state === "failed" ? CircleAlert : CircleDashed}
+      >
+        {label}
+      </StatusChip>
+      <span className="sr-only">{title}</span>
+    </span>
+  );
+}
+
+/**
  * 백업 표와 복원·원격 복제·지우기. VM 상세의 백업 탭과 백업 화면이 쓴다. `showVm`이면 VM 열을 보인다(VM을
  * 지웠으면 만든 때의 이름만). 작업 열은 백업을 만든 백업 작업이다(손으로 만든 백업은 비어 있다). 받은 사본은
  * 이름 옆에 보낸 클러스터를, 원격 사본 열은 원격으로 보낸 사본의 상태를 보이고 증분이면 원격 사본마다 체인의
  * 몇 백업이 원격에 있는지도 보인다(복제 중이 아니어도 보이는 상태, 다 있으면 뺀다). 종류 열은 전체·증분과
  * 증분의 부모(같은 표의 그 행으로 가는 링크), 증분을 청했는데 전체로 한 이유를 보이고, 증분의 크기 열은 자기
- * 파일 크기 아래에 복원에 드는 체인 전체 크기를 보인다(부모는 같은 VM의 백업이라 표에 있다).
+ * 파일 크기 아래에 복원에 드는 체인 전체 크기를 보인다(부모는 같은 VM의 백업이라 표에 있다). 저장소 백업(계획 68)은 대상 열에 저장소, 검증 열에 배지,
+ * 크기 열에 "새 데이터 / 논리", 종류 열에 base 링크를 보이고, 동작에 "지금 검증"·"다른 저장소로 복사"가, 풀 백업에는
+ * "저장소로 옮기기"가 있다(받을 저장소가 있을 때).
  */
 export function BackupTable({
   backups,
@@ -88,6 +133,13 @@ export function BackupTable({
   const jobs = useList("backup-job");
   const [restoring, setRestoring] = useState<Backup | null>(null);
   const [replicating, setReplicating] = useState<Backup | null>(null);
+  // 저장소로 옮기기(convert)·다른 저장소로 복사(copy)
+  const [moving, setMoving] = useState<{ backup: Backup; kind: "convert" | "copy" } | null>(null);
+  const stores = useBackupStores(perms.reads("backup-store"));
+  // 백업을 받을 수 있는 저장소(준비됐고 읽기 전용이 아님)
+  const writable = (stores.data ?? []).filter(
+    (s) => s.status.phase === "ready" && !s.spec.read_only,
+  );
   // 닫히는 동안에도 대상을 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
   const [deleting, setDeleting] = useState<Backup | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -98,7 +150,9 @@ export function BackupTable({
   const remove = perms.anywhere("backup.delete");
   // 원격으로 보내기는 루트 `cluster.admin`이다(계획 62 리뷰 2, 서버도 같다). 원격 목록도 루트 권한이다.
   const replicate = perms.has("cluster.admin");
-  const actions = restore || remove || replicate;
+  // 검증·옮기기·복사는 백업의 `backup.create`다(서버가 VM마다 본다).
+  const create = perms.anywhere("backup.create");
+  const actions = restore || remove || replicate || create;
   const state = useTableState("backups", [], url);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));
   const originHint = (origin: NonNullable<Backup["spec"]["origin"]>) =>
@@ -119,8 +173,12 @@ export function BackupTable({
   /** 행 하나를 그릴 값 */
   const rowInfo = (backup: Backup) => {
     const { phase, created_at: created, error, replicas = [] } = backup.status;
-    const { parent: parentId, full_reason: fullReason } = backup.status;
+    const { parent: parentId, full_reason: fullReason, base: baseId } = backup.status;
     return {
+      target: backupTarget(backup),
+      stats: backup.status.store_stats,
+      baseId,
+      base: baseId ? backups.find((b) => b.id === baseId) : undefined,
       vm: vmById.get(backup.spec.vm),
       size: storedBytes(backup),
       phase,
@@ -185,11 +243,21 @@ export function BackupTable({
         ] satisfies Column<Backup>[])
       : []),
     {
-      id: "pool",
-      header: t("backups.pool"),
-      value: (backup) => backup.spec.pool ?? "",
+      id: "target",
+      header: t("backups.target"),
+      value: (backup) => `${backupTarget(backup).kind}:${backupTarget(backup).name}`,
       priority: 2,
-      cell: (backup) => backup.spec.pool ?? "",
+      cell: (backup) => {
+        const { target } = rowInfo(backup);
+        return target.kind === "store" ? (
+          <span className="flex flex-col">
+            <span>{target.name}</span>
+            <span className="text-xs text-muted-foreground">{t("backups.storeTarget")}</span>
+          </span>
+        ) : (
+          target.name
+        );
+      },
     },
     {
       id: "job",
@@ -216,6 +284,13 @@ export function BackupTable({
       },
     },
     {
+      id: "verified",
+      header: t("backups.verified"),
+      priority: 3,
+      value: (backup) => verifyBadge(backup),
+      cell: (backup) => <VerifyBadge backup={backup} />,
+    },
+    {
       id: "created",
       header: t("backups.created"),
       value: (backup) => backup.status.created_at ?? 0,
@@ -230,7 +305,18 @@ export function BackupTable({
       value: (backup) => storedBytes(backup) ?? -1,
       priority: 2,
       cell: (backup) => {
-        const { size, chain } = rowInfo(backup);
+        const { size, chain, stats } = rowInfo(backup);
+        // 저장소 백업은 이 백업이 저장소에 처음 쓴 것과 디스크의 논리 크기다(dedup — 계획 68 §6).
+        if (stats) {
+          return (
+            <span className="flex flex-col">
+              <span>{t("backups.newData", { size: formatBytes(stats.new_bytes) })}</span>
+              <span className="text-xs text-muted-foreground">
+                {t("backups.logical", { size: formatBytes(stats.logical_bytes) })}
+              </span>
+            </span>
+          );
+        }
         return (
           <>
             {size !== undefined ? formatBytes(size) : "—"}
@@ -248,7 +334,32 @@ export function BackupTable({
       header: t("backups.type"),
       priority: 3,
       cell: (backup) => {
-        const { parentId, fullReason, parent } = rowInfo(backup);
+        const { parentId, fullReason, parent, target, baseId, base } = rowInfo(backup);
+        // 저장소 백업은 체인이 없다: 바뀌지 않은 청크를 가져온 base만 보인다(복원은 따라가지 않는다).
+        if (target.kind === "store") {
+          return (
+            <>
+              <Badge variant="outline">{t("backups.kind.store")}</Badge>
+              {baseId && (
+                <div className="text-xs text-muted-foreground">
+                  {t("backups.base")}{" "}
+                  {base ? (
+                    <a href={`#backup-${base.id}`} className="underline-offset-4 hover:underline">
+                      {base.name}
+                    </a>
+                  ) : (
+                    baseId
+                  )}
+                </div>
+              )}
+              {fullReason && (
+                <div className="max-w-xs text-xs whitespace-normal break-words text-muted-foreground">
+                  {t("backups.fullRead", { reason: fullReason })}
+                </div>
+              )}
+            </>
+          );
+        }
         return (
           <>
             <Badge variant="outline">
@@ -335,7 +446,8 @@ export function BackupTable({
             header: t("vms.actions"),
             actions: true,
             cell: (backup) => {
-              const { phase } = rowInfo(backup);
+              const { phase, target } = rowInfo(backup);
+              const others = writable.filter((s) => s.name !== target.name);
               return (
                 <>
                   {restore && (
@@ -368,6 +480,36 @@ export function BackupTable({
                       {t("backups.replicate")}
                     </Button>
                   )}
+                  {create && target.kind === "store" && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="ml-2"
+                      aria-label={t("backups.verifyNamed", { name: backup.name })}
+                      disabled={phase !== "ready"}
+                      onClick={() => void verifyNow(backup)}
+                    >
+                      {t("backups.verifyNow")}
+                    </Button>
+                  )}
+                  {create && others.length > 0 && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="ml-2"
+                      aria-label={t(
+                        target.kind === "store" ? "backups.copyNamed" : "backups.convertNamed",
+                        { name: backup.name },
+                      )}
+                      disabled={phase !== "ready"}
+                      onClick={(e) => {
+                        opener.current = e.currentTarget;
+                        setMoving({ backup, kind: target.kind === "store" ? "copy" : "convert" });
+                      }}
+                    >
+                      {t(target.kind === "store" ? "backups.copy" : "backups.convert")}
+                    </Button>
+                  )}
                   {/* 실패했거나 Task 없이 남은 백업도 지운다. 진행 중인 Task가 있으면 서버가 거절한다. */}
                   {remove && (
                     <Button
@@ -392,6 +534,17 @@ export function BackupTable({
       : []),
   ];
 
+  async function verifyNow(backup: Backup) {
+    try {
+      const task = await call(
+        api.POST("/backups/{key}/actions/verify", { params: { path: { key: backup.id } } }),
+      );
+      trackTask(task, t("backups.op.verify", { name: backup.name }));
+    } catch (err) {
+      toast.error(errorMessage(t, err));
+    }
+  }
+
   return (
     <>
       <DataTable
@@ -410,6 +563,15 @@ export function BackupTable({
       />
       {restoring && (
         <RestoreDialog backup={restoring} returnFocus={opener} onClose={() => setRestoring(null)} />
+      )}
+      {moving && (
+        <StoreTargetDialog
+          backup={moving.backup}
+          kind={moving.kind}
+          stores={writable.filter((s) => s.name !== backupTarget(moving.backup).name)}
+          returnFocus={opener}
+          onClose={() => setMoving(null)}
+        />
       )}
       {replicating && (
         <ReplicateDialog
@@ -438,7 +600,10 @@ export function BackupTable({
   );
 }
 
-/** 백업에서 새 VM(꺼짐)을 만드는 대화상자. 열 때만 그린다. */
+/**
+ * 백업에서 새 VM을 만드는 대화상자. 열 때만 그린다. 보통은 꺼진 VM이고, "라이브 복원"(계획 68 §11)이면 디스크를 다 받기 전에
+ * VM을 켜고 뒤에서 옮긴다(새 폴더의 `vm.power`도 든다 — 없으면 스위치를 보이지 않는다).
+ */
 function RestoreDialog({
   backup,
   returnFocus,
@@ -449,10 +614,13 @@ function RestoreDialog({
   onClose(): void;
 }) {
   const { t } = useTranslation();
+  const perms = usePermissions();
   const vms = useList("vm");
   const pools = useList("storage-pool");
   const [name, setName] = useState("");
   const [pool, setPool] = useState("");
+  const [live, setLive] = useState(false);
+  const canLive = perms.anywhere("vm.power");
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   async function submit() {
@@ -472,16 +640,20 @@ function RestoreDialog({
     const task = await call(
       api.POST("/backups/{key}/restore", {
         params: { path: { key: backup.id } },
-        body: { name, pool },
+        // 라이브는 청할 때만 보낸다(옛 서버는 모르는 필드를 거절한다).
+        body: { name, pool, ...(live && { live: true }) },
       }),
     );
-    trackTask(task, t("backups.op.restore", { backup: backup.name, name }));
+    trackTask(
+      task,
+      t(live ? "backups.op.liveRestore" : "backups.op.restore", { backup: backup.name, name }),
+    );
   }
 
   return (
     <FormDialog
       title={t("backups.restoreTitle", { name: backup.name })}
-      description={t("backups.restoreDescription")}
+      description={t(live ? "liveRestore.dialogDescription" : "backups.restoreDescription")}
       submitLabel={t("backups.restore")}
       returnFocus={returnFocus}
       onClose={onClose}
@@ -515,6 +687,79 @@ function RestoreDialog({
             ))}
           </NativeSelect>
         )}
+      </Field>
+      {canLive && (
+        <div className="flex flex-col gap-1.5">
+          <div className="flex items-center gap-2">
+            <Switch
+              id="restore-live"
+              checked={live}
+              aria-describedby="restore-live-hint"
+              onCheckedChange={setLive}
+            />
+            <Label htmlFor="restore-live">{t("liveRestore.switch")}</Label>
+          </div>
+          <p id="restore-live-hint" className="text-xs text-muted-foreground">
+            {t(live ? "liveRestore.switchOnHint" : "liveRestore.switchHint")}
+          </p>
+        </div>
+      )}
+    </FormDialog>
+  );
+}
+
+/** 풀 백업을 저장소로 옮기기(convert)·저장소 백업을 다른 저장소로 복사(copy, 계획 68 §12.2·§12.5). 원본은 그대로 남는다. */
+function StoreTargetDialog({
+  backup,
+  kind,
+  stores,
+  returnFocus,
+  onClose,
+}: {
+  backup: Backup;
+  kind: "convert" | "copy";
+  stores: BackupStore[];
+  returnFocus: RefObject<HTMLElement | null>;
+  onClose(): void;
+}) {
+  const { t } = useTranslation();
+  const [store, setStore] = useState(stores[0]?.name ?? "");
+
+  async function submit() {
+    const params = { params: { path: { key: backup.id } }, body: { store } };
+    const task = await call(
+      kind === "convert"
+        ? api.POST("/backups/{key}/actions/convert", params)
+        : api.POST("/backups/{key}/actions/copy", params),
+    );
+    trackTask(task, t(`tasks.op.backup-${kind}`, { target: backup.name, store }));
+  }
+
+  return (
+    <FormDialog
+      title={t(kind === "convert" ? "backups.convertNamed" : "backups.copyNamed", {
+        name: backup.name,
+      })}
+      description={t(kind === "convert" ? "backups.convertDescription" : "backups.copyDescription")}
+      submitLabel={t(kind === "convert" ? "backups.convert" : "backups.copy")}
+      submitDisabled={store === ""}
+      returnFocus={returnFocus}
+      onClose={onClose}
+      onSubmit={submit}
+    >
+      <Field id="move-store" label={t("backups.store")}>
+        <NativeSelect
+          id="move-store"
+          className="w-full"
+          value={store}
+          onChange={(e) => setStore(e.target.value)}
+        >
+          {stores.map((s) => (
+            <NativeSelectOption key={s.id} value={s.name}>
+              {s.name}
+            </NativeSelectOption>
+          ))}
+        </NativeSelect>
       </Field>
     </FormDialog>
   );

@@ -113,6 +113,8 @@ export const AREAS: NavArea[] = [
     tabs: [
       { to: "/backups", key: "nav.backups" },
       { to: "/backup-jobs", key: "nav.backupJobs", kind: "backup-job" },
+      // 백업 저장소(계획 68 — 중복 제거·암호화·S3). 사이드바 항목이 아니라 보호 영역의 탭이다.
+      { to: "/backup-stores", key: "nav.backupStores", kind: "backup-store" },
       { to: "/remotes", key: "nav.replication", kind: "remote" },
       { to: "/ha-groups", key: "nav.haGroups", kind: "ha-group" },
       { to: "/ha-checks", key: "nav.haChecks", kind: "ha-check" },

@@ -12,6 +12,7 @@ export const DIMENSIONS = [
   "disk_bytes",
   "vms",
   "dedicated_vcpus",
+  "backup_bytes",
   "networks",
   "routers",
   "floating_ips",
@@ -23,7 +24,7 @@ export type Dimension = (typeof DIMENSIONS)[number];
 export function dimensionsOf(kind: FolderKind): readonly Dimension[] {
   switch (kind) {
     case "vm":
-      return ["vcpus", "memory_mib", "disk_bytes", "vms", "dedicated_vcpus"];
+      return ["vcpus", "memory_mib", "disk_bytes", "vms", "dedicated_vcpus", "backup_bytes"];
     case "network":
       return ["networks", "routers", "floating_ips", "load_balancers"];
     case "storage":
@@ -36,6 +37,7 @@ export function formatDimension(dim: Dimension, value: number): string {
     case "memory_mib":
       return formatMib(value);
     case "disk_bytes":
+    case "backup_bytes":
       return formatBytes(value);
     default:
       return String(value);
@@ -56,12 +58,12 @@ export interface Bar {
  * 경로를 보인다(설계 §9 "부모가 묶음"). 상한이 없는 차원은 이 폴더의 사용량만이다.
  */
 export function usageBars(view: FolderUsageView, kind: FolderKind = "vm"): Bar[] {
-  // 전용 vCPU(계획 64)는 쓰거나 상한이 있을 때만 막대가 있다(지금 화면 그대로).
+  // 전용 vCPU(계획 64)와 백업 바이트(계획 68)는 쓰거나 상한이 있을 때만 막대가 있다(지금 화면 그대로).
   const dims = dimensionsOf(kind).filter(
     (dim) =>
-      dim !== "dedicated_vcpus" ||
-      (view.usage.dedicated_vcpus ?? 0) > 0 ||
-      view.limits.some((l) => l.quota.dedicated_vcpus != null),
+      (dim !== "dedicated_vcpus" && dim !== "backup_bytes") ||
+      (view.usage[dim] ?? 0) > 0 ||
+      view.limits.some((l) => l.quota[dim] != null),
   );
   return dims.map((dim) => {
     const binder = view.binding[dim];

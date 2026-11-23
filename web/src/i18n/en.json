@@ -164,7 +164,21 @@
     "migration_bridge_laid": "The migration's bridge is on another node that is online. Finish or roll back the migration first.",
     "network_migrating": "This network has a migration bridge. Finish the migration with this router instead.",
     "nic_network_live": "A running VM's interface can't change network by editing it. Use the network migration wizard, or stop the VM first.",
-    "lockdown_peers_outside": "Some peers connect to OVN centrals from addresses outside the allowed set and would be cut off. Check first, then turn on anyway if that is intended."
+    "lockdown_peers_outside": "Some peers connect to OVN centrals from addresses outside the allowed set and would be cut off. Check first, then turn on anyway if that is intended.",
+    "store_target_in_use": "Another backup store already uses this pool or bucket and prefix.",
+    "store_in_use": "The store still has backups. Delete them first.",
+    "store_read_only": "The store is attached read-only: {{message}}",
+    "store_owned_elsewhere": "Another cluster owns this store: {{message}}",
+    "store_not_on_node": "This node cannot use the store: {{message}}",
+    "store_not_ready": "The backup store is not ready yet.",
+    "store_key_mismatch": "The key does not match the store: {{message}}",
+    "store_key_required": "The store is encrypted. Give its recovery key or escrow passphrase.",
+    "store_unavailable": "The backup store cannot be reached: {{message}}",
+    "store_busy": "A task on this store is in progress: {{message}}",
+    "invalid_backup_store": "{{message}}",
+    "vm_restoring": "The VM is being live-restored. Wait for the restore or cancel it.",
+    "vm_not_restoring": "The VM is not being live-restored.",
+    "backup_exists": "That store already has a copy of this backup."
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -231,7 +245,8 @@
     "routers": "Routers",
     "floatingIps": "Floating IPs",
     "loadBalancers": "Load balancers",
-    "topology": "Topology"
+    "topology": "Topology",
+    "backupStores": "Backup stores"
   },
   "header": {
     "language": "Language",
@@ -360,7 +375,14 @@
       "sdn-central-kick": "Kick {{kicked}} out of the OVN central databases (on {{node}})",
       "sdn-chassis-install": "Install the OVN chassis on {{node}}",
       "sdn-lockdown": "Change the OVN access lockdown (from {{node}})",
-      "network-migrate": "Network migration {{target}}: {{step}}"
+      "network-migrate": "Network migration {{target}}: {{step}}",
+      "backup-store-init": "Initialize backup store {{target}}",
+      "backup-store-gc": "Garbage-collect backup store {{target}}",
+      "backup-store-verify": "Verify backup store {{target}}",
+      "backup-store-scan": "Scan backup store {{target}}",
+      "backup-convert": "Move backup {{target}} to store {{store}}",
+      "backup-copy": "Copy backup {{target}} to store {{store}}",
+      "backup-live-restore": "Live restore a backup as {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -456,7 +478,8 @@
       "busy": "The VM is starting or stopping.",
       "migrating": "Not available while the VM is being migrated.",
       "snapshotPending": "Not available while a snapshot or clone task is in progress.",
-      "template": "A template cannot be started, migrated or deleted."
+      "template": "A template cannot be started, migrated or deleted.",
+      "restoring": "Not available during a live restore. Wait for it or cancel it."
     },
     "deleteTitle": "Delete {{name}}?",
     "deleteDescription": "The VM is deleted. Its volumes are kept.",
@@ -847,7 +870,8 @@
     "type": "Type",
     "kind": {
       "full": "Full",
-      "incremental": "Incremental"
+      "incremental": "Incremental",
+      "store": "Chunked"
     },
     "parent": "Parent:",
     "fullReason": "Why full: {{reason}}",
@@ -907,14 +931,45 @@
     "op": {
       "create": "Back up {{vm}}",
       "restore": "Restore {{backup}} as {{name}}",
-      "delete": "Delete backup {{name}}"
+      "delete": "Delete backup {{name}}",
+      "verify": "Verify backup {{name}}",
+      "liveRestore": "Live restore {{backup}} as {{name}}"
     },
     "errors": {
       "exists": "A backup with this name already exists.",
       "vmExists": "A VM with this name already exists.",
       "pool": "Choose a storage pool.",
       "remote": "Choose a remote cluster."
-    }
+    },
+    "target": "Target",
+    "targetHint": "A backup pool keeps a qcow2 file per disk. A store keeps each changed chunk once.",
+    "storeTarget": "backup store",
+    "poolsGroup": "Backup pools",
+    "storesGroup": "Backup stores",
+    "encryptedStore": "{{name}} (encrypted)",
+    "store": "Backup store",
+    "verified": "Verified",
+    "verify": {
+      "ok": "Verified",
+      "failed_one": "{{count}} bad chunk",
+      "failed_other": "{{count}} bad chunks",
+      "never": "Not verified",
+      "at": "Verified {{at}}",
+      "neverHint": "Not verified yet"
+    },
+    "newData": "New data {{size}}",
+    "logical": "Logical {{size}}",
+    "base": "Base:",
+    "fullRead": "Read in full: {{reason}}",
+    "verifyNamed": "Verify {{name}} now",
+    "verifyNow": "Verify",
+    "convert": "Move to store",
+    "convertNamed": "Move {{name}} to a backup store",
+    "convertDescription": "Copies this backup (with its chain) into a backup store as a new backup. The original stays in the backup pool until you delete it.",
+    "copy": "Copy to store",
+    "copyNamed": "Copy {{name}} to another backup store",
+    "copyDescription": "Copies the backup into another store, sending only the chunks that store does not have. The copy is a separate backup with its own retention.",
+    "incrementalStoreHint": "Reads only the blocks changed since the last backup of this VM in the store. Every backup still has a complete index, so any backup can be restored or deleted on its own."
   },
   "backupJobs": {
     "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
@@ -1000,8 +1055,17 @@
       "labels": "Enter at least one KEY=VALUE label.",
       "at": "Enter a time from 00:00 to 23:59.",
       "keep": "Enter whole numbers of 0 or more.",
-      "fullEvery": "Enter a whole number of 0 or more."
-    }
+      "fullEvery": "Enter a whole number of 0 or more.",
+      "store": "Choose a backup store.",
+      "copySame": "Choose another store than the job's store."
+    },
+    "copiesTo": "copies to {{store}}",
+    "copyTo": "Copy to another store",
+    "copyStore": "Copy store",
+    "copyHint": "Each backup of the job is copied there once it is ready, such as from a fast local store to S3.",
+    "noCopy": "Do not copy",
+    "copyKeepLabel": "{{unit}} (copies)",
+    "copyKeepHint": "Retention of the copies in the copy store. Leave all empty to use the job's retention."
   },
   "imports": {
     "pageHint": "Bring VMware VMs into Orbivisor from OVA files or straight from ESXi or vCenter. Review the settings proposed from the source VM, then run the import to create a stopped VM.",
@@ -3019,7 +3083,9 @@
       "sdn_gateway_failover": "SDN gateway failover",
       "sdn_sync_failed": "SDN sync failed",
       "sdn_physnet_not_ready": "Physical network not ready",
-      "sdn_lb_member_down": "Load balancer member down"
+      "sdn_lb_member_down": "Load balancer member down",
+      "backup_verify_failed": "Backup verification failed",
+      "backup_store_unavailable": "Backup store unreachable"
     },
     "metric": {
       "cpu": "CPU %",
@@ -3049,7 +3115,9 @@
       "sdn_gateway_failover": "SDN gateway failover",
       "sdn_sync_failed": "SDN sync failed",
       "sdn_physnet_not_ready": "Physical network not ready",
-      "sdn_lb_member_down": "Load balancer member down"
+      "sdn_lb_member_down": "Load balancer member down",
+      "backup_verify_failed": "Backup verification failed",
+      "backup_store_unavailable": "Backup store unreachable"
     },
     "rules": {
       "create": "Create rule",
@@ -3176,7 +3244,8 @@
       },
       "empty": "No notification targets."
     },
-    "sdnGroup": "SDN (OVN)"
+    "sdnGroup": "SDN (OVN)",
+    "backupGroup": "Backup stores"
   },
   "empty": {
     "docs": "Read the guide"
@@ -3431,7 +3500,8 @@
       "routers": "Routers",
       "floating_ips": "Floating IPs",
       "networks": "Networks",
-      "load_balancers": "Load balancers"
+      "load_balancers": "Load balancers",
+      "backup_bytes": "Backups"
     },
     "usedOf": "{{used}} of {{limit}}",
     "noLimit": "No limit",
@@ -3439,7 +3509,8 @@
     "boundBy": "Limited by {{path}}",
     "badCount": "Enter a whole number of 0 or more.",
     "hiddenLimits": "Folders above this one that you cannot see may also have quotas. If one of them blocks a change, the error says so.",
-    "networkQuotaDescription": "Limits for this folder and everything below it. Floating IPs are usually the scarce public addresses."
+    "networkQuotaDescription": "Limits for this folder and everything below it. Floating IPs are usually the scarce public addresses.",
+    "backupGib": "Backups (GiB)"
   },
   "permissions": {
     "title": "Permissions of {{name}}",
@@ -4756,5 +4827,225 @@
       "offline_one": "{{count}} stopped VM changes",
       "offline_other": "{{count}} stopped VMs change"
     }
+  },
+  "backupStores": {
+    "pageHint": "Deduplicated chunk stores for backups, in a backup pool or an S3-compatible bucket, optionally encrypted on the nodes. Back up to a store from the Backups tab of a VM or from a backup job.",
+    "create": "Create a backup store",
+    "empty": {
+      "title": "No backup stores",
+      "description": "A backup store keeps each changed 4 MiB chunk once, verifies it on a schedule and can encrypt it before it leaves the node. Old backups in backup pools keep working."
+    },
+    "backend": "Backend",
+    "backendKind": {
+      "pool": "Backup pool",
+      "s3": "S3-compatible"
+    },
+    "encryption": "Encryption",
+    "encrypted": "Encrypted",
+    "plain": "Not encrypted",
+    "snapshots": "Snapshots",
+    "stored": "Stored",
+    "dedup": "Dedup",
+    "lastGc": "Last GC",
+    "lastVerify": "Last verify",
+    "openNamed": "Open {{name}}",
+    "readOnlyBadge": "Read-only",
+    "access": "Access",
+    "phase": {
+      "initializing": "Initializing",
+      "ready": "Ready",
+      "failed": "Failed"
+    },
+    "never": "Never",
+    "verifyOk": "Verified",
+    "verifyFailed_one": "{{count}} bad chunk",
+    "verifyFailed_other": "{{count}} bad chunks",
+    "gcRunning": "GC: {{phase}}",
+    "gcPhase": {
+      "mark": "marking",
+      "wait": "waiting for backups",
+      "sweep": "sweeping"
+    },
+    "gcRemoved_one": "Removed {{count}} chunk ({{size}})",
+    "gcRemoved_other": "Removed {{count}} chunks ({{size}})",
+    "deleteTitle": "Delete backup store {{name}}?",
+    "deleteDescription": "Only the store resource is removed. The data in the bucket or directory stays; remove it by hand. A store that still has backups cannot be deleted.",
+    "deleted": "Backup store {{name}} deleted.",
+    "createTitle": "Create a backup store",
+    "createDescription": "Choose where the chunks go, whether they are encrypted, and when garbage collection and verification run.",
+    "steps": "Steps",
+    "step": {
+      "backend": "Backend",
+      "encryption": "Encryption",
+      "schedule": "Schedule",
+      "key": "Recovery key"
+    },
+    "created": "Backup store {{name}} created. It is being initialized.",
+    "done": "Done",
+    "back": "Back",
+    "next": "Next",
+    "poolHint": "A directory or NFS pool that stores backups. The store lives in store/<id> inside the pool.",
+    "endpoint": "Endpoint",
+    "endpointHint": "An https:// URL, such as https://s3.eu-central-1.amazonaws.com or your MinIO address.",
+    "region": "Region",
+    "bucket": "Bucket",
+    "prefix": "Prefix (optional)",
+    "prefixHint": "A folder inside the bucket, such as orbivisor/. Leave empty to use the whole bucket.",
+    "pathStyle": "Path-style addresses (MinIO, Ceph RGW)",
+    "accessKeyId": "Access key ID",
+    "secretKey": "Secret access key",
+    "secretHint": "Kept in the cluster database only. It is never shown again.",
+    "caPem": "CA certificate (optional)",
+    "caHint": "PEM of the CA that signed the endpoint certificate. Leave empty to trust the system roots.",
+    "readOnly": "Attach read-only",
+    "readOnlyHint": "Opens a store another cluster owns, to restore from it (disaster recovery). Backups, deletes and GC are blocked; Scan adds its backups here.",
+    "storeId": "Store ID",
+    "storeIdHint": "The directory name under store/ in the pool, written by the cluster that made the store.",
+    "encrypt": {
+      "none": "No encryption",
+      "generate": "Encrypt with a new key",
+      "recovery": "Use a recovery key",
+      "escrow": "Unlock with the escrow passphrase"
+    },
+    "encryptHint": {
+      "none": "Chunks are only compressed. Whoever can read the store can read the backups.",
+      "generate": "Chunks, VM settings and firmware state are encrypted with AES-256-GCM on the node. You get a recovery key once, right after creating the store.",
+      "recovery": "Opens or creates a store with an existing key, such as a copy of another store.",
+      "escrow": "Opens a store whose key was wrapped with a passphrase inside the store."
+    },
+    "recoveryKeyHint": "The OPK1-… key printed when the store was created.",
+    "unlockPassphrase": "Escrow passphrase",
+    "unlockHint": "The passphrase given when the key was escrowed.",
+    "escrowPassphrase": "Escrow passphrase (optional)",
+    "escrowHint": "Also wraps the key with this passphrase inside the store, so the store can be opened without this cluster. At least 8 characters. The passphrase is not saved.",
+    "scheduleHint": "Times are UTC. GC removes chunks no backup uses any more; verification re-reads chunks and checks them.",
+    "gcAt": "GC time (UTC)",
+    "gcDays": "GC days",
+    "verifyScheduled": "Verify on a schedule",
+    "verifyAt": "Verify time (UTC)",
+    "verifyDays": "Verify days",
+    "reverifyDays": "Verify again after (days)",
+    "reverifyHint": "Backups verified longer ago than this are verified again.",
+    "verifyMode": "Verify mode",
+    "mode": {
+      "full": "Full (read every chunk)",
+      "metadata": "Metadata (check chunks exist)"
+    },
+    "verifyNew": "Verify each new backup right after it is made",
+    "errors": {
+      "exists": "A backup store with this name already exists.",
+      "storeId": "Enter the store ID (a UUID).",
+      "endpoint": "Enter an https:// endpoint.",
+      "bucket": "Enter the bucket.",
+      "region": "Enter the region.",
+      "accessKeyId": "Enter the access key ID.",
+      "secretKey": "Enter the secret access key.",
+      "recoveryKey": "Enter a recovery key that starts with OPK1-.",
+      "passphrase": "Use at least 8 characters.",
+      "passphraseAgain": "The passphrases do not match.",
+      "reverifyDays": "Enter a number of days from 1 to 3650.",
+      "maxStreams": "Enter a number from 1 to 64.",
+      "credentials": "Give both the access key ID and the secret access key, or neither."
+    },
+    "key": {
+      "recoveryTitle": "Save the recovery key",
+      "recoveryWarning": "Store this key now, away from the cluster. Without it the backups cannot be recovered if the cluster is lost.",
+      "recoveryKey": "Recovery key",
+      "fingerprintLine": "Key fingerprint: {{fingerprint}}",
+      "qr": "Recovery key of {{name}} as a QR code",
+      "copy": "Copy the recovery key",
+      "print": "Print",
+      "printTitle": "Orbivisor backup store {{name}}",
+      "printBlocked": "The print window was blocked. Allow pop-ups, or copy the key.",
+      "saved": "I have stored the recovery key",
+      "confirmFirst": "Confirm that you have stored the recovery key before closing. It is shown only now.",
+      "title": "Key",
+      "aes": "AES-256-GCM on the nodes",
+      "fingerprint": "Fingerprint:",
+      "escrow": "Escrow in the store",
+      "export": "Show the recovery key",
+      "adminOnly": "Only cluster administrators can show the recovery key or escrow it.",
+      "plain": "This store is not encrypted.",
+      "exportTitle": "Recovery key of {{name}}",
+      "exportDescription": "The recovery key opens every backup in this store. Showing it is recorded in the audit log.",
+      "exportConfirm": "Show",
+      "exportShown": "Store it away from the cluster. Showing it was recorded in the audit log.",
+      "escrowed": "The key of {{name}} is escrowed in the store.",
+      "escrowTitle": "Escrow the key of {{name}}",
+      "escrowDescription": "Wraps the key with a passphrase (Argon2id) and writes it into the store, replacing an earlier escrow. With the store and the passphrase the backups can be opened without this cluster. The passphrase is not saved."
+    },
+    "sheetTitle": "Backup store {{name}}",
+    "owner": "Owner cluster",
+    "usage": "Usage",
+    "usageLine": "{{snapshots}} snapshots, {{stored}} stored for {{logical}} of disks ({{ratio}})",
+    "notCounted": "Not counted yet (GC counts it).",
+    "badChunks": "Bad chunks",
+    "gcNow": "Run GC now",
+    "verifyNow": "Verify now",
+    "check": "Check connection",
+    "editSettings": "Settings",
+    "scan": "Scan",
+    "takeOver": "Take over",
+    "schedules": "Schedules and results",
+    "gc": "GC",
+    "verify": "Verification",
+    "nextAt": "Next: {{at}}",
+    "verifyPolicy": "Verify again after {{days}} days, {{mode}}",
+    "verifyNewShort": "· new backups too",
+    "noVerify": "No scheduled verification",
+    "verifyCounts": "{{snapshots}} backups, {{chunks}} chunks",
+    "reach": "Reachable from nodes",
+    "checkOk": "This node read the store and the key matches.",
+    "checkFailed": "Check failed: {{error}}",
+    "checkNotHere": "This node cannot use the store (it is in another node's local pool). Below are the nodes' own reports.",
+    "noReports": "No node has reported on this store yet.",
+    "checkedAt": "Checked",
+    "reachable": "Reachable",
+    "unreachable": "Unreachable",
+    "takeOverTitle": "Take over {{name}}?",
+    "takeOverDescription": "This cluster becomes the owner of the store and may write to it. Cluster {{owner}} must not use it any more: two clusters writing one store can delete each other's backups.",
+    "tookOver": "This cluster now owns {{name}}.",
+    "takeOverForce": "Take over even if the owner was active in the last 24 hours",
+    "passphrase": "Passphrase",
+    "passphraseAgain": "Passphrase again",
+    "settingsTitle": "Settings of {{name}}",
+    "settingsDescription": "The backend and the encryption cannot be changed.",
+    "saved": "Settings of {{name}} saved.",
+    "maxStreams": "Parallel S3 requests",
+    "maxStreamsHint": "From 1 to 64.",
+    "newAccessKeyId": "New access key ID",
+    "credentialsHint": "Leave both empty to keep the current credentials.",
+    "newSecretKey": "New secret access key"
+  },
+  "liveRestore": {
+    "switch": "Live restore (start right away)",
+    "switchHint": "Starts the new VM before its disks are copied.",
+    "switchOnHint": "The VM starts in seconds and reads blocks it does not have yet from the backup while the disks are copied in the background; then it switches to the new disks. Until then it cannot be stopped normally, migrated, snapshotted or backed up, and HA protects it only afterwards. It runs on a node that reaches the backup.",
+    "dialogDescription": "Makes a new VM from the backup and starts it right away. Its disks are filled from the backup in the background.",
+    "title": "Live restore",
+    "phase": {
+      "starting": "Starting",
+      "copying": "Copying",
+      "pivoting": "Switching over",
+      "paused": "Paused",
+      "stopped": "Stopped",
+      "failed": "Failed"
+    },
+    "cancelling": "Cancelling",
+    "from": "from {{backup}}",
+    "cancel": "Cancel live restore",
+    "progress": "Live restore progress",
+    "waiting": "Waiting for the copy to start",
+    "copied": "{{percent}}% ({{done}} of {{total}})",
+    "failedBecause": "Failed: {{error}}",
+    "pausedBecause": "Paused: {{error}}",
+    "hint": "Stopping, migrating, snapshots, backups and disk changes wait until the restore finishes. Force stop keeps what was copied; starting the VM again continues.",
+    "cancelTitle": "Cancel the live restore of {{name}}?",
+    "cancelDescription": "The VM is stopped and deleted with its new disks. Everything the guest wrote since it started is discarded.",
+    "cancelConfirm": "Discard and delete",
+    "op": {
+      "cancel": "Cancel live restore of {{name}}"
+    },
+    "blockedBackup": "The VM is being live-restored. Back it up when the restore has finished."
   }
 }

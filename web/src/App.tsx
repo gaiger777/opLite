@@ -103,6 +103,10 @@ export const appRoutes: RouteObject[] = [
                 lazy: page(() => import("@/backups/BackupJobsPage"), "BackupJobsPage"),
               },
               {
+                path: "backup-stores",
+                lazy: page(() => import("@/backupStores/BackupStoresPage"), "BackupStoresPage"),
+              },
+              {
                 path: "networks",
                 lazy: page(() => import("@/networks/NetworksPage"), "NetworksPage"),
               },

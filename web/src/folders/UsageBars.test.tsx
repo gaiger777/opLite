@@ -41,3 +41,27 @@ it("shows the binding folder's usage and limit, and the parent that binds", () =
   expect(screen.getByText("Over the limit")).toBeInTheDocument();
   expect(screen.getAllByText("No limit")).toHaveLength(2);
 });
+
+it("shows a backup bytes bar only when backups count or have a limit", () => {
+  expect(usageBars(view).some((b) => b.dim === "backup_bytes")).toBe(false);
+  const withBackups = {
+    ...view,
+    usage: { ...view.usage, backup_bytes: 3 * 1024 ** 3 },
+    limits: [
+      {
+        ...view.limits[0]!,
+        quota: { backup_bytes: 10 * 1024 ** 3 },
+        usage: { ...view.limits[0]!.usage, backup_bytes: 3 * 1024 ** 3 },
+      },
+    ],
+    binding: { backup_bytes: A },
+  };
+  expect(usageBars(withBackups).find((b) => b.dim === "backup_bytes")).toEqual({
+    dim: "backup_bytes",
+    used: 3 * 1024 ** 3,
+    limit: 10 * 1024 ** 3,
+  });
+  render(<UsageBars view={withBackups} />);
+  expect(screen.getByRole("meter", { name: "Backups" })).toBeInTheDocument();
+  expect(screen.getByText("3 GiB of 10 GiB")).toBeInTheDocument();
+});

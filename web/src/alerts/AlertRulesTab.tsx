@@ -18,6 +18,7 @@ import {
   checkRuleForm,
   CONDITION_KINDS,
   emptyRuleForm,
+  isBackupStore,
   isEvent,
   isSdn,
   NODE_METRICS,
@@ -306,7 +307,7 @@ function RuleDialog({
               setErrors({});
             }}
           >
-            {CONDITION_KINDS.filter((kind) => !isSdn(kind)).map((kind) => (
+            {CONDITION_KINDS.filter((kind) => !isSdn(kind) && !isBackupStore(kind)).map((kind) => (
               <NativeSelectOption key={kind} value={kind}>
                 {t(`alerts.kind.${kind}`)}
               </NativeSelectOption>
@@ -314,6 +315,14 @@ function RuleDialog({
             {/* SDN 묶음(계획 67 §11) */}
             <optgroup label={t("alerts.sdnGroup")}>
               {CONDITION_KINDS.filter(isSdn).map((kind) => (
+                <NativeSelectOption key={kind} value={kind}>
+                  {t(`alerts.kind.${kind}`)}
+                </NativeSelectOption>
+              ))}
+            </optgroup>
+            {/* 백업 저장소 묶음(계획 68) */}
+            <optgroup label={t("alerts.backupGroup")}>
+              {CONDITION_KINDS.filter(isBackupStore).map((kind) => (
                 <NativeSelectOption key={kind} value={kind}>
                   {t(`alerts.kind.${kind}`)}
                 </NativeSelectOption>

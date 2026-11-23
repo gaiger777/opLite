@@ -195,3 +195,46 @@ it("asks for incremental backups only when full_every is above 0", () => {
     full_every: 3,
   });
 });
+
+// 계획 68: 저장소 작업과 다른 저장소로 보내는 복사본
+it("checks, builds and patches store jobs with a copy target", () => {
+  const form = {
+    ...emptyForm("", "st"),
+    name: "tiered",
+    at: "03:00",
+    copyStore: "s3",
+  };
+  expect(form.targetKind).toBe("store");
+  expect(checkForm(form, [])).toEqual({});
+  expect(checkForm({ ...form, store: "" }, [])).toEqual({ store: "backupJobs.errors.store" });
+  expect(checkForm({ ...form, copyStore: "st" }, [])).toEqual({
+    copyStore: "backupJobs.errors.copySame",
+  });
+  expect(checkForm({ ...form, copyKeep: { ...form.copyKeep, daily: "x" } }, [])).toEqual({
+    copyKeep: "backupJobs.errors.keep",
+  });
+  const spec = specOf(form);
+  expect(spec).toMatchObject({ store: "st", copy_to: { store: "s3" } });
+  expect(spec).not.toHaveProperty("pool");
+  expect(spec.copy_to).not.toHaveProperty("keep");
+  expect(specOf({ ...form, copyKeep: { ...form.copyKeep, daily: "90" } }).copy_to).toEqual({
+    store: "s3",
+    keep: { last: 0, daily: 90, weekly: 0, monthly: 0 },
+  });
+
+  const job = backupJob("tiered", 1, {
+    spec: { pool: undefined, store: "st", copy_to: { store: "s3" } },
+  });
+  expect(formOf(job)).toMatchObject({ targetKind: "store", store: "st", copyStore: "s3" });
+  expect(patchOf(job, specOf(formOf(job)))).toEqual({});
+  // 풀로 바꾸면 저장소가 비고 복사본도 끈다.
+  expect(patchOf(job, specOf({ ...formOf(job), targetKind: "pool", pool: "bk" }))).toEqual({
+    pool: "bk",
+    copy_to: null,
+  });
+  // 풀 작업을 저장소로
+  const old = backupJob("nightly", 2);
+  expect(patchOf(old, specOf({ ...formOf(old), targetKind: "store", store: "st" }))).toEqual({
+    store: "st",
+  });
+});

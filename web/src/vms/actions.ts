@@ -121,6 +121,14 @@ export function availability(vm: Vm, action: VmOperation, vmTasks: readonly Task
   if (action !== "console" && isMigrating(vm, vmTasks)) {
     return { ok: false, reason: "vms.reason.migrating" };
   }
+  // 라이브 복원 중(계획 68 §11.4): 정지·지우기·옮기기는 409 `vm_restoring`이다. 강제 정지는 받고(멈춤 — `vm start`가
+  // 이어 간다), 지우려면 복원을 취소한다.
+  if (
+    vm.status.live_restore &&
+    (action === "stop" || action === "delete" || action === "migrate")
+  ) {
+    return { ok: false, reason: "vms.reason.restoring" };
+  }
   // 템플릿은 켜거나 옮기거나 지울 수 없다(서버의 409 `vm_is_template` — 지우려면 먼저 VM으로 되돌린다).
   if (
     vm.spec.template === true &&

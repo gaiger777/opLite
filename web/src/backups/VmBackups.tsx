@@ -5,9 +5,10 @@ import { useTranslation } from "react-i18next";
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
-import { useVmCan } from "@/auth/usePermissions";
+import { usePermissions, useVmCan } from "@/auth/usePermissions";
 import { backupPools, newestFirst } from "@/backups/backups";
 import { BackupTable } from "@/backups/BackupTable";
+import { type BackupStore, useBackupStores } from "@/backupStores/stores";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { ListPending } from "@/components/ListPending";
@@ -29,8 +30,9 @@ export function VmBackups({ vm }: { vm: Vm }) {
   const [creating, setCreating] = useState(false);
   const opener = useRef<HTMLElement | null>(null);
   const mine = newestFirst((backups.data ?? []).filter((b) => b.spec.vm === vm.id));
-  // 서버는 시작·정지 중인 VM을 백업하지 않는다(vm_busy).
-  const busy = isBusy(vm);
+  // 서버는 시작·정지 중인 VM을 백업하지 않는다(vm_busy). 라이브 복원 중에도 받지 않는다(vm_restoring, 계획 68).
+  const restoring = !!vm.status.live_restore;
+  const busy = isBusy(vm) || restoring;
 
   return (
     <section className="flex flex-col gap-4 pt-2">
@@ -57,7 +59,9 @@ export function VmBackups({ vm }: { vm: Vm }) {
         )}
       </div>
       {can("backup.create") && busy && (
-        <p className="text-sm text-muted-foreground">{t("backups.busy")}</p>
+        <p className="text-sm text-muted-foreground">
+          {t(restoring ? "liveRestore.blockedBackup" : "backups.busy")}
+        </p>
       )}
       <BackupTable backups={mine} query={backups} labelledBy="vm-backups" />
       {creating && (
@@ -85,10 +89,19 @@ function CreateBackupDialog({
   onClose(): void;
 }) {
   const { t } = useTranslation();
+  const perms = usePermissions();
   const pools = backupPools(useList("storage-pool").data ?? []);
+  // 백업을 받을 수 있는 저장소(계획 68 — 준비됐고 읽기 전용이 아님). 없으면 대상 고르기는 지금처럼 백업 풀만이다.
+  const stores: BackupStore[] = (useBackupStores(perms.reads("backup-store")).data ?? []).filter(
+    (s) => s.status.phase === "ready" && !s.spec.read_only,
+  );
   const [chosen, setChosen] = useState<string | null>(null);
-  // 고르지 않았으면 첫 백업 풀이다.
-  const pool = chosen ?? pools[0]?.name ?? "";
+  // 고르지 않았으면 첫 백업 풀(없으면 첫 저장소)이다. 값은 `pool:<이름>`·`store:<이름>`이다.
+  const target =
+    chosen ?? (pools[0] ? `pool:${pools[0].name}` : stores[0] ? `store:${stores[0].name}` : "");
+  const colon = target.indexOf(":");
+  const kind = target.slice(0, colon);
+  const targetName = target.slice(colon + 1);
   const [name, setName] = useState("");
   const [incremental, setIncremental] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -109,7 +122,11 @@ function CreateBackupDialog({
       api.POST("/vms/{key}/backups", {
         params: { path: { key: vm.id } },
         // 증분은 청할 때만 보낸다(옛 서버는 모르는 필드를 거절한다).
-        body: { pool, ...(name !== "" && { name }), ...(incremental && { incremental }) },
+        body: {
+          ...(kind === "store" ? { store: targetName } : { pool: targetName }),
+          ...(name !== "" && { name }),
+          ...(incremental && { incremental }),
+        },
       }),
     );
     trackTask(task, t("backups.op.create", { vm: vm.name }));
@@ -120,27 +137,57 @@ function CreateBackupDialog({
       title={t("backups.createTitle", { name: vm.name })}
       description={t(isStopped(vm) ? "backups.createDescription" : "backups.runningDescription")}
       submitLabel={t("backups.create")}
-      submitDisabled={pools.length === 0}
+      submitDisabled={target === ""}
       returnFocus={returnFocus}
       onClose={onClose}
       onSubmit={submit}
     >
-      {pools.length === 0 ? (
+      {target === "" ? (
         <p className="text-sm text-muted-foreground">{t("backups.noPools")}</p>
-      ) : (
+      ) : stores.length === 0 ? (
         <Field id="backup-pool" label={t("backups.pool")}>
           <NativeSelect
             id="backup-pool"
             className="w-full"
-            value={pool}
+            value={target}
             onChange={(e) => setChosen(e.target.value)}
           >
             {pools.map((p) => (
-              <NativeSelectOption key={p.id} value={p.name}>
+              <NativeSelectOption key={p.id} value={`pool:${p.name}`}>
                 {p.name}
               </NativeSelectOption>
             ))}
           </NativeSelect>
+        </Field>
+      ) : (
+        // 백업 풀 | 저장소(계획 68 §14 웹)
+        <Field id="backup-target" label={t("backups.target")} hint={t("backups.targetHint")}>
+          {(a11y) => (
+            <NativeSelect
+              id="backup-target"
+              className="w-full"
+              value={target}
+              onChange={(e) => setChosen(e.target.value)}
+              {...a11y}
+            >
+              {pools.length > 0 && (
+                <optgroup label={t("backups.poolsGroup")}>
+                  {pools.map((p) => (
+                    <NativeSelectOption key={p.id} value={`pool:${p.name}`}>
+                      {p.name}
+                    </NativeSelectOption>
+                  ))}
+                </optgroup>
+              )}
+              <optgroup label={t("backups.storesGroup")}>
+                {stores.map((s) => (
+                  <NativeSelectOption key={s.id} value={`store:${s.name}`}>
+                    {s.spec.encryption ? t("backups.encryptedStore", { name: s.name }) : s.name}
+                  </NativeSelectOption>
+                ))}
+              </optgroup>
+            </NativeSelect>
+          )}
         </Field>
       )}
       <Field
@@ -170,7 +217,7 @@ function CreateBackupDialog({
           <Label htmlFor="backup-incremental">{t("backups.incremental")}</Label>
         </div>
         <p id="backup-incremental-hint" className="text-xs text-muted-foreground">
-          {t("backups.incrementalHint")}
+          {t(kind === "store" ? "backups.incrementalStoreHint" : "backups.incrementalHint")}
         </p>
       </div>
     </FormDialog>

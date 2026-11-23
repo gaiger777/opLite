@@ -5,6 +5,8 @@ const password = process.env.OPL_PASSWORD ?? "";
 /** 노드에 미리 만든 빈 디렉터리(풀)와 올릴 디스크 이미지. Rust 테스트가 준비한다. */
 const poolPath = process.env.OPL_POOL_PATH ?? "";
 const image = process.env.OPL_IMAGE ?? "";
+/** 백업 저장소 줄기(계획 68)의 백업 풀 디렉터리. 저장소를 지워도 데이터가 남으므로 위 풀과 따로 둔다. */
+const backupPoolPath = process.env.OPL_BACKUP_POOL_PATH ?? "";
 if (!password || !poolPath || !image) {
   throw new Error("Set OPL_PASSWORD, OPL_POOL_PATH and OPL_IMAGE (the Rust test sets them).");
 }
@@ -443,4 +445,49 @@ test("network topology and load balancers before SDN is set up", async ({ page }
   await page.getByRole("button", { name: "Delete e2e-lan" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Delete" }).click();
   await expect(page.getByRole("cell", { name: "e2e-lan", exact: true })).toHaveCount(0);
+});
+
+// 계획 68: 보호 영역의 백업 저장소 탭(늦게 읽는 조각). 백업 풀 안에 로컬 저장소를 만들면 목록에 보이고 초기화가 끝나면
+// 준비된다. 저장소 리소스를 지우고 풀도 지운다(저장소 데이터는 풀 디렉터리에 남는다 — Rust 테스트가 본다).
+test("create a local backup store and see it in the list", async ({ page }) => {
+  await signIn(page);
+  await openTab(page, "Infrastructure", "Storage pools");
+  await page.getByRole("button", { name: "Create", exact: true }).click();
+  const poolDialog = page.getByRole("dialog", { name: "Create a storage pool" });
+  await poolDialog.getByLabel("Name").fill("e2e-bk");
+  await poolDialog.getByLabel("Directory").fill(backupPoolPath);
+  await poolDialog.getByLabel("Store backups").check();
+  await poolDialog.getByRole("button", { name: "Create" }).click();
+  await expect(poolDialog).toBeHidden();
+
+  await openTab(page, "Protection", "Backup stores");
+  await expect(page).toHaveURL(/\/backup-stores$/);
+  await expect(page.getByText("No backup stores")).toBeVisible();
+  await page.getByRole("button", { name: "Create a backup store" }).click();
+  const wizard = page.getByRole("dialog", { name: "Create a backup store" });
+  await wizard.getByLabel("Name").fill("e2e-st");
+  await expect(wizard.getByLabel("Backup pool")).toHaveValue("e2e-bk");
+  await wizard.getByRole("button", { name: "Next" }).click();
+  await wizard.getByRole("button", { name: "Next" }).click();
+  await wizard.getByRole("button", { name: "Create" }).click();
+  await expect(wizard).toBeHidden();
+  const row = page
+    .getByRole("row")
+    .filter({ has: page.getByRole("button", { name: "Open e2e-st" }) });
+  await expect(row).toContainText("e2e-bk");
+  await expect(row).toContainText("Not encrypted");
+  // 로컬 저장소 준비(디렉터리 65,536개)는 macOS에서 십몇 초 걸린다.
+  await expect(row).toContainText("Ready", { timeout: 120_000 });
+
+  await page.getByRole("button", { name: "Delete e2e-st" }).click();
+  let confirm = page.getByRole("alertdialog");
+  await confirm.getByLabel("Type e2e-st to confirm").fill("e2e-st");
+  await confirm.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText("No backup stores")).toBeVisible();
+
+  await openTab(page, "Infrastructure", "Storage pools");
+  await page.getByRole("button", { name: "Delete e2e-bk" }).click();
+  confirm = page.getByRole("alertdialog");
+  await confirm.getByRole("button", { name: "Delete" }).click();
+  await expect(page.getByText("No storage pools.")).toBeVisible();
 });

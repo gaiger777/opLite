@@ -74,6 +74,9 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
     d.login().await;
     let pool = d.path("pool");
     std::fs::create_dir(&pool).unwrap();
+    // 백업 저장소 줄기(계획 68)의 백업 풀. 저장소 리소스를 지워도 저장소 데이터(`store/<id>`)는 남는다(설계 원칙).
+    let backup_pool = d.path("bkpool");
+    std::fs::create_dir(&backup_pool).unwrap();
     let image = d.path("image.raw");
     std::fs::File::create(&image)
         .unwrap()
@@ -87,6 +90,7 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
             ("OPL_USER", "admin".into()),
             ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
             ("OPL_POOL_PATH", pool.to_str().unwrap().into()),
+            ("OPL_BACKUP_POOL_PATH", backup_pool.to_str().unwrap().into()),
             ("OPL_IMAGE", image.to_str().unwrap().into()),
         ],
     )
@@ -151,6 +155,12 @@ async fn browser_uploads_image_runs_vm_and_cleans_up() {
         left.is_empty(),
         "pool directory {}: {left:?}",
         pool.display()
+    );
+    let stores = d.ctl_json(&["backup-store", "list"]).await;
+    assert_eq!(stores.as_array().map(Vec::len), Some(0), "stores: {stores}");
+    assert!(
+        backup_pool.join("store").is_dir(),
+        "the deleted store's data stays in the backup pool"
     );
     d.stop();
 }

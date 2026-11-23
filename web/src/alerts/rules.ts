@@ -26,6 +26,9 @@ export const CONDITION_KINDS: readonly ConditionKind[] = [
   "sdn_sync_failed",
   "sdn_physnet_not_ready",
   "sdn_lb_member_down",
+  // 백업 저장소(계획 68 §10.5·§6) — 리더가 평가한다.
+  "backup_verify_failed",
+  "backup_store_unavailable",
 ];
 export const NODE_METRICS: readonly NodeMetric[] = [
   "cpu",
@@ -57,6 +60,11 @@ export function isEvent(kind: ConditionKind): boolean {
   );
 }
 
+/** 백업 저장소 조건(서버 `AlertCondition::is_backup_store`) — 노드·VM으로 거르지 않는다. */
+export function isBackupStore(kind: ConditionKind): boolean {
+  return kind === "backup_verify_failed" || kind === "backup_store_unavailable";
+}
+
 /** SDN 조건(서버 `AlertCondition::is_sdn`) */
 export function isSdn(kind: ConditionKind): boolean {
   return kind.startsWith("sdn_");
@@ -67,7 +75,7 @@ export function isSdn(kind: ConditionKind): boolean {
  * 준비 안 됨 — 나머지는 서버가 400 `NodesFilter`)
  */
 export function takesNodes(kind: ConditionKind): boolean {
-  if (kind === "backup_job_failed") {
+  if (kind === "backup_job_failed" || isBackupStore(kind)) {
     return false;
   }
   return (

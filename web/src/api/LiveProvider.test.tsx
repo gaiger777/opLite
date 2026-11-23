@@ -65,7 +65,7 @@ it("watches from the oldest list revision and applies changes", async () => {
   );
   expect(await screen.findByText("live: web=running")).toBeInTheDocument();
   expect(urls[0]).toContain(
-    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,router,floating-ip,load-balancer,network-migration,settings&since=7",
+    "kinds=vm,volume,storage-pool,node,task,network,snapshot,security-group,backup,backup-job,vm-import,ha-group,placement-rule,folder,router,floating-ip,load-balancer,network-migration,backup-store,settings&since=7",
   );
 });
 
