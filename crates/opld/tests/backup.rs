@@ -456,12 +456,15 @@ async fn incremental_backup_of_a_running_vm_restores_the_same_disk() {
     assert_eq!(manifest["version"], 2, "{manifest}");
     assert_eq!(manifest["parent"], full["id"], "{manifest}");
     let list = d.ctl(&["backup", "list", "--vm", "web"]).await.unwrap();
+    // TYPE 열은 머리줄에서 끝부터 센다(CREATED는 칸이 여럿이고, 뒤에 열이 늘어도 — 계획 68의 VERIFIED).
+    let header: Vec<&str> = list.lines().next().unwrap().split_whitespace().collect();
+    let from_end = header.len() - header.iter().position(|c| *c == "TYPE").unwrap();
     let types: Vec<(&str, &str)> = list
         .lines()
         .skip(1)
         .map(|l| {
             let cols: Vec<&str> = l.split_whitespace().collect();
-            (cols[0], cols[cols.len() - 3])
+            (cols[0], cols[cols.len() - from_end])
         })
         .collect();
     assert!(types.contains(&("full", "full")), "{list}");

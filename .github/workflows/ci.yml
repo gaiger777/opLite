@@ -540,14 +540,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 75
     env:
-      MINIO_IMAGE: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+      # MinIO는 2025년 가을부터 이미지·바이너리를 내지 않아(quay 401, dl.min.io 410) SeaweedFS S3로 시험한다.
+      S3_IMAGE: chrislusf/seaweedfs:4.50
       OPL_S3_ENDPOINT: http://127.0.0.1:9000
       OPL_S3_TLS_ENDPOINT: https://127.0.0.1:9443
       OPL_S3_CA: /tmp/opl-s3-certs/ca.pem
       OPL_S3_ACCESS_KEY: opl-ci-access
       OPL_S3_SECRET_KEY: opl-ci-secret-key-1234
       OPL_S3_BUCKET: orbi
-      OPL_S3_CONTAINER: opl-minio
+      OPL_S3_CONTAINER: opl-s3
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -561,7 +562,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils
           ls -l /dev/kvm
-      # 시험 CA와 127.0.0.1 인증서(MinIO `--certs-dir`의 public.crt·private.key)
+      # 시험 CA와 127.0.0.1 인증서(SeaweedFS `-s3.cert.file`·`-s3.key.file`)
       - name: Test CA and a server certificate
         run: |
           d=/tmp/opl-s3-certs
@@ -575,28 +576,32 @@ jobs:
             -extfile "$d/ext" -out "$d/public.crt"
           chmod 0644 "$d/private.key"
           openssl verify -CAfile "$OPL_S3_CA" "$d/public.crt"
-      - name: MinIO over HTTP and HTTPS, and the bucket
+      - name: SeaweedFS S3 over HTTP and HTTPS, and the bucket
         run: |
-          docker run -d --name "$OPL_S3_CONTAINER" -p 127.0.0.1:9000:9000 \
-            -e MINIO_ROOT_USER="$OPL_S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$OPL_S3_SECRET_KEY" \
-            "$MINIO_IMAGE" server /data
-          docker run -d --name opl-minio-tls -p 127.0.0.1:9443:9000 -v /tmp/opl-s3-certs:/certs:ro \
-            -e MINIO_ROOT_USER="$OPL_S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$OPL_S3_SECRET_KEY" \
-            "$MINIO_IMAGE" server /data --certs-dir /certs
-          for _ in $(seq 60); do curl -fsS http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
-          for _ in $(seq 60); do curl -fsS --cacert "$OPL_S3_CA" https://127.0.0.1:9443/minio/health/live && break; sleep 1; done
+          d=/tmp/opl-s3-certs
+          printf '{"identities":[{"name":"opl","credentials":[{"accessKey":"%s","secretKey":"%s"}],"actions":["Admin","Read","Write","List","Tagging"]}]}' \
+            "$OPL_S3_ACCESS_KEY" "$OPL_S3_SECRET_KEY" > "$d/s3.json"
+          chmod 0644 "$d/s3.json"
+          docker run -d --name "$OPL_S3_CONTAINER" -p 127.0.0.1:9000:8333 -v "$d:/conf:ro" \
+            "$S3_IMAGE" server -dir=/data -s3 -s3.port=8333 -s3.config=/conf/s3.json
+          docker run -d --name opl-s3-tls -p 127.0.0.1:9443:8333 -v "$d:/conf:ro" \
+            "$S3_IMAGE" server -dir=/data -s3 -s3.port=8333 -s3.config=/conf/s3.json \
+            -s3.cert.file=/conf/public.crt -s3.key.file=/conf/private.key
+          for _ in $(seq 90); do curl -s -o /dev/null http://127.0.0.1:9000/ && break; sleep 1; done
+          for _ in $(seq 90); do curl -s -o /dev/null --cacert "$OPL_S3_CA" https://127.0.0.1:9443/ && break; sleep 1; done
           export AWS_ACCESS_KEY_ID="$OPL_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$OPL_S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
-          aws --endpoint-url "$OPL_S3_ENDPOINT" s3 mb "s3://$OPL_S3_BUCKET"
-          aws --endpoint-url "$OPL_S3_TLS_ENDPOINT" --ca-bundle "$OPL_S3_CA" s3 mb "s3://$OPL_S3_BUCKET"
-          docker exec "$OPL_S3_CONTAINER" minio --version
-      - name: Backup store E2E against MinIO
+          for _ in $(seq 30); do aws --endpoint-url "$OPL_S3_ENDPOINT" s3 mb "s3://$OPL_S3_BUCKET" && break; sleep 2; done
+          for _ in $(seq 30); do aws --endpoint-url "$OPL_S3_TLS_ENDPOINT" --ca-bundle "$OPL_S3_CA" s3 mb "s3://$OPL_S3_BUCKET" && break; sleep 2; done
+          aws --endpoint-url "$OPL_S3_ENDPOINT" s3 ls
+          docker exec "$OPL_S3_CONTAINER" weed version
+      - name: Backup store E2E against S3 (SeaweedFS)
         timeout-minutes: 60
         run: cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1
-      - name: MinIO logs
+      - name: S3 server logs
         if: failure()
         run: |
-          docker logs --tail 200 "$OPL_S3_CONTAINER"
-          docker logs --tail 200 opl-minio-tls
+          docker logs --tail 200 "$OPL_S3_CONTAINER" || true
+          docker logs --tail 200 opl-s3-tls || true
 
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는
