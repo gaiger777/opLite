@@ -1224,7 +1224,8 @@ async fn interrupted_flatten_can_be_redone() {
     let _ = tokio::time::timeout(std::time::Duration::from_millis(30), flatten).await;
     // 취소는 qemu-img에 SIGKILL을 보내고 거두기는 tokio가 뒤에서 한다. 죽은 프로세스가 이미지 잠금을 놓을 때까지 기다린다
     // (잠금이 남아 있으면 qemu-io가 열지 못한다).
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    // 느린 노드(TCG ARM 시험기)에서는 SIGKILL 거두기와 잠금 풀림이 5초를 넘기도 해서 넉넉히 둔다.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !qemu_io(&path, "read -P 0x42 0 192M") {
         assert!(
             std::time::Instant::now() < deadline,
