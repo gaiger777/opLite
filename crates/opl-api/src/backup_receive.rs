@@ -377,6 +377,8 @@ pub async fn receive_backup(
             origin: Some(req.origin),
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     backup.status = BackupStatus {
@@ -397,6 +399,9 @@ pub async fn receive_backup(
         parent: req.parent,
         full_reason: None,
         tpm_state: manifest.tpm_state,
+        base: None,
+        store_stats: None,
+        verify: None,
     };
     // 그사이 같은 이름이 생겼으면 저장소가 거부한다(409 name_taken).
     state.cluster.create(&backup).await?;

@@ -31,10 +31,12 @@ pub enum QuotaDimension {
     Networks,
     /// 부하 분산기 수(계획 67, 네트워크 폴더)
     LoadBalancers,
+    /// 백업 바이트(계획 68, VM 폴더)
+    BackupBytes,
 }
 
 impl QuotaDimension {
-    pub const ALL: [QuotaDimension; 9] = [
+    pub const ALL: [QuotaDimension; 10] = [
         QuotaDimension::Vcpus,
         QuotaDimension::MemoryMib,
         QuotaDimension::DiskBytes,
@@ -44,6 +46,7 @@ impl QuotaDimension {
         QuotaDimension::FloatingIps,
         QuotaDimension::Networks,
         QuotaDimension::LoadBalancers,
+        QuotaDimension::BackupBytes,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -57,6 +60,7 @@ impl QuotaDimension {
             QuotaDimension::FloatingIps => "floating_ips",
             QuotaDimension::Networks => "networks",
             QuotaDimension::LoadBalancers => "load_balancers",
+            QuotaDimension::BackupBytes => "backup_bytes",
         }
     }
 
@@ -72,6 +76,7 @@ impl QuotaDimension {
             QuotaDimension::FloatingIps => "floating IPs",
             QuotaDimension::Networks => "networks",
             QuotaDimension::LoadBalancers => "load balancers",
+            QuotaDimension::BackupBytes => "bytes of backups",
         }
     }
 
@@ -86,6 +91,7 @@ impl QuotaDimension {
             QuotaDimension::FloatingIps => quota.floating_ips,
             QuotaDimension::Networks => quota.networks,
             QuotaDimension::LoadBalancers => quota.load_balancers,
+            QuotaDimension::BackupBytes => quota.backup_bytes,
         }
     }
 
@@ -100,6 +106,7 @@ impl QuotaDimension {
             QuotaDimension::FloatingIps => usage.floating_ips,
             QuotaDimension::Networks => usage.networks,
             QuotaDimension::LoadBalancers => usage.load_balancers,
+            QuotaDimension::BackupBytes => usage.backup_bytes,
         }
     }
 }
@@ -122,6 +129,7 @@ impl FolderUsage {
         self.floating_ips = self.floating_ips.saturating_add(other.floating_ips);
         self.networks = self.networks.saturating_add(other.networks);
         self.load_balancers = self.load_balancers.saturating_add(other.load_balancers);
+        self.backup_bytes = self.backup_bytes.saturating_add(other.backup_bytes);
     }
 
     /// 어느 차원도 `other`보다 크지 않다.
@@ -143,6 +151,7 @@ impl FolderUsage {
             floating_ips: self.floating_ips.saturating_mul(n),
             networks: self.networks.saturating_mul(n),
             load_balancers: self.load_balancers.saturating_mul(n),
+            backup_bytes: self.backup_bytes.saturating_mul(n),
         }
     }
 
@@ -383,6 +392,7 @@ mod tests {
         .unwrap();
         let size = |n: &str| if n == "a" { 10 } else { 5 };
         let want = FolderUsage {
+            backup_bytes: 0,
             routers: 0,
             floating_ips: 0,
             networks: 0,
@@ -519,6 +529,7 @@ mod tests {
             floating_ips: 6,
             networks: 0,
             load_balancers: 0,
+            backup_bytes: 7,
         };
         assert!(u.within(&u.times(2)));
         assert!(!u.times(2).within(&u));
@@ -613,6 +624,41 @@ mod tests {
         );
         assert_eq!(QuotaDimension::LoadBalancers.as_str(), "load_balancers");
         assert_eq!(QuotaDimension::LoadBalancers.unit(), "load balancers");
+    }
+
+    /// 계획 68: 백업 바이트는 VM 폴더의 차원이고, 늘리는 쓰기만 넘을 때 막는다.
+    #[test]
+    fn backup_bytes_is_a_vm_folder_dimension() {
+        assert_eq!(QuotaDimension::BackupBytes.as_str(), "backup_bytes");
+        assert_eq!(QuotaDimension::BackupBytes.unit(), "bytes of backups");
+        assert!(
+            crate::folder::FolderKind::Vm
+                .quota_dimensions()
+                .contains(&QuotaDimension::BackupBytes)
+        );
+        assert!(
+            !crate::folder::FolderKind::Network
+                .quota_dimensions()
+                .contains(&QuotaDimension::BackupBytes)
+        );
+        let quota = FolderQuota {
+            backup_bytes: Some(100),
+            ..FolderQuota::default()
+        };
+        assert_eq!(QuotaDimension::BackupBytes.limit(&quota), Some(100));
+        let tree: QuotaTree = [(id(1), node(None, Some(quota)))].into();
+        let bytes = |n| FolderUsage {
+            backup_bytes: n,
+            ..FolderUsage::default()
+        };
+        let over: DirectUsage = [(id(1), bytes(150))].into();
+        let more: DirectUsage = [(id(1), bytes(160))].into();
+        // 이미 넘은 사용량(진행 중 백업이 넘김)은 늘리지 않는 쓰기를 막지 않는다.
+        assert_eq!(quota_exceeded((&tree, &over), (&tree, &over)), None);
+        assert_eq!(
+            quota_exceeded((&tree, &over), (&tree, &more)).map(|e| (e.dimension, e.limit, e.used)),
+            Some((QuotaDimension::BackupBytes, 100, 160))
+        );
     }
 
     #[test]

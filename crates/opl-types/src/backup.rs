@@ -1,5 +1,6 @@
 //! VM 백업. 백업 풀(`backups`를 켠 dir·NFS 풀)의 `{루트}/backups/{백업 id}/`에 디스크마다 압축
-//! qcow2(`disk{i}.qcow2`), UEFI 변수(`vars.fd`), 매니페스트(`manifest.json`)를 둔다.
+//! qcow2(`disk{i}.qcow2`), UEFI 변수(`vars.fd`), 매니페스트(`manifest.json`)를 둔다. 백업 저장소(계획 68,
+//! [`crate::backup_store`])의 백업은 `spec.store`를 쓰고 데이터는 저장소의 청크·인덱스·매니페스트 v3에 있다.
 
 use std::path::{Path, PathBuf};
 
@@ -45,8 +46,20 @@ pub struct BackupSpec {
     pub vm: Uuid,
     /// 만든 때의 VM 이름(표시용)
     pub vm_name: String,
-    /// 백업 풀 이름
+    /// 백업 풀 이름. 저장소 백업(`store`, 계획 68)이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로 바이트 그대로다).
+    /// `pool`과 `store` 중 정확히 하나다([`BackupSpec::target`]).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub pool: String,
+    /// 백업 저장소 이름(계획 68). 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub store: Option<String>,
+    /// 옛 백업을 옮기거나(`convert`) 다른 저장소에서 복사해(`copy`) 만든 저장소 백업의 원본(계획 68 §12.2·§12.5). 없으면
+    /// 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub source: Option<BackupSource>,
     /// 만든 때의 VM 스펙
     pub vm_spec: VmSpec,
     /// 이 백업을 만든 백업 작업 id. 손으로 만든 백업이면 없다.
@@ -70,6 +83,96 @@ pub struct BackupSpec {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// 백업이 사는 곳: 백업 풀(계획 27) 또는 백업 저장소(계획 68)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupTarget<'a> {
+    Pool(&'a str),
+    Store(&'a str),
+}
+
+/// `pool`과 `store`가 둘 다 있거나 둘 다 없다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a backup needs exactly one of pool and store")]
+pub struct BackupTargetError;
+
+impl BackupSpec {
+    /// 백업이 사는 곳. `pool`과 `store` 중 정확히 하나가 아니면 오류다.
+    pub fn target(&self) -> Result<BackupTarget<'_>, BackupTargetError> {
+        match (self.pool.is_empty(), &self.store) {
+            (false, None) => Ok(BackupTarget::Pool(&self.pool)),
+            (true, Some(store)) => Ok(BackupTarget::Store(store)),
+            _ => Err(BackupTargetError),
+        }
+    }
+}
+
+/// 저장소 백업의 원본(계획 68): 그 백업 id와 만든 방법
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct BackupSource {
+    /// 원본 백업 id
+    pub backup: Uuid,
+    pub kind: BackupSourceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum BackupSourceKind {
+    /// 옛 풀 백업(qcow2)을 저장소로 옮김(`backup convert`). 원본은 남는다.
+    Convert,
+    /// 같은 클러스터의 다른 저장소에서 복사함(계층)
+    Copy,
+}
+
+/// 저장소 백업 하나가 읽고 쓴 양(계획 68 §8.4)
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(default)]
+pub struct StoreBackupStats {
+    /// 디스크 가상 크기 합
+    pub logical_bytes: u64,
+    /// 이번에 읽은 바이트(증분이면 바뀐 청크만)
+    pub read_bytes: u64,
+    /// 저장소에 처음 올린 청크 수
+    pub new_chunks: u64,
+    /// 이 백업이 저장소에 처음 쓴 저장 바이트(압축·암호화 뒤). 할당량 `backup_bytes`가 센다.
+    pub new_bytes: u64,
+    /// 이미 저장소에 있어 다시 쓰지 않은 청크 수
+    pub reused_chunks: u64,
+    /// 내용이 모두 0이라 저장하지 않은 청크 수
+    pub zero_chunks: u64,
+}
+
+/// 백업 하나의 마지막 검증 결과(계획 68 §10.5)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct BackupVerify {
+    /// 검증한 시각(유닉스 초)
+    pub at: u64,
+    pub state: VerifyState,
+    /// 이 백업이 가리키는 깨진 청크 수
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub bad_chunks: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub enum VerifyState {
+    Ok,
+    Failed,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// 받은 사본의 원본: 보낸 클러스터와 그 클러스터의 백업
@@ -134,6 +237,47 @@ pub struct BackupStatus {
     #[serde(skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub tpm_state: bool,
+    /// 저장소 백업(계획 68)에서 바뀌지 않은 청크를 가져온 앞 백업. 계획 40의 `parent`와 달리 복원은 이것을 따라가지
+    /// 않는다(인덱스가 늘 완전하다). 없으면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub base: Option<Uuid>,
+    /// 저장소 백업이 읽고 쓴 양(계획 68). 없으면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub store_stats: Option<StoreBackupStats>,
+    /// 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub verify: Option<BackupVerify>,
+}
+
+impl BackupStatus {
+    /// 할당량 `backup_bytes`(계획 68 §13)에 드는 바이트: 저장소 백업은 처음 쓴 바이트(`store_stats.new_bytes`), 풀
+    /// 백업은 디스크 파일 크기 합
+    pub fn backup_bytes(&self) -> u64 {
+        match &self.store_stats {
+            Some(s) => s.new_bytes,
+            None => self
+                .disks
+                .iter()
+                .fold(0u64, |sum, d| sum.saturating_add(d.stored_bytes)),
+        }
+    }
+
+    /// [`BackupStatus::backup_bytes`]의 JSON 판(상태 머신 — 모르는 칸이 있어도 같은 답)
+    pub fn backup_bytes_value(status: &serde_json::Value) -> u64 {
+        match status["store_stats"]["new_bytes"].as_u64() {
+            Some(n) => n,
+            None => status["disks"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .fold(0u64, |sum, d| {
+                    sum.saturating_add(d["stored_bytes"].as_u64().unwrap_or(0))
+                }),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -329,6 +473,9 @@ mod tests {
             parent: None,
             full_reason: None,
             tpm_state: false,
+            base: None,
+            store_stats: None,
+            verify: None,
         };
         assert_eq!(
             serde_json::to_value(&ready).unwrap(),
@@ -646,6 +793,124 @@ mod tests {
             serde_json::from_value::<BackupManifest>(json).unwrap(),
             child
         );
+    }
+
+    /// 계획 68: 옛 풀 백업의 스펙·상태 JSON은 바이트 그대로이고, 저장소 백업은 `pool`을 쓰지 않는다.
+    #[test]
+    fn store_backups_leave_out_the_pool_and_old_json_stays_byte_identical() {
+        let vm = Uuid::now_v7();
+        // 이 빌드 전 노드가 쓴 모양(칸 차례 그대로)
+        let vm_spec_json = serde_json::to_string(&vm_spec()).unwrap();
+        let spec_json = format!(
+            r#"{{"vm":"{vm}","vm_name":"web","pool":"backups","vm_spec":{vm_spec_json},"incremental":true}}"#
+        );
+        let old: BackupSpec = serde_json::from_str(&spec_json).unwrap();
+        assert_eq!(old.store, None);
+        assert_eq!(old.source, None);
+        assert_eq!(old.target(), Ok(BackupTarget::Pool("backups")));
+        assert_eq!(serde_json::to_string(&old).unwrap(), spec_json);
+
+        let source = Uuid::now_v7();
+        let json = serde_json::json!({
+            "vm": vm, "vm_name": "web", "store": "local-st", "vm_spec": vm_spec(),
+            "source": { "backup": source, "kind": "convert" }
+        });
+        let st: BackupSpec = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(st.pool, "");
+        assert_eq!(st.target(), Ok(BackupTarget::Store("local-st")));
+        assert_eq!(
+            st.source,
+            Some(BackupSource {
+                backup: source,
+                kind: BackupSourceKind::Convert
+            })
+        );
+        assert_eq!(serde_json::to_value(&st).unwrap(), json);
+        assert_eq!(
+            serde_json::to_value(BackupSourceKind::Copy).unwrap(),
+            "copy"
+        );
+
+        let both = BackupSpec {
+            pool: "backups".into(),
+            ..st.clone()
+        };
+        assert_eq!(both.target(), Err(BackupTargetError));
+        let neither = BackupSpec {
+            store: None,
+            ..st.clone()
+        };
+        assert_eq!(neither.target(), Err(BackupTargetError));
+        let bad = serde_json::json!({ "backup": source, "kind": "move" });
+        assert!(serde_json::from_value::<BackupSource>(bad).is_err());
+
+        let status_json = r#"{"phase":"ready","created_at":1790000000,"disks":[{"name":"disk0","file":"disk0.qcow2","virtual_bytes":1073741824,"stored_bytes":1048576}],"uefi_vars":false,"error":null,"parent":"0190a2b3-c4d5-7e6f-8a9b-0c1d2e3f4a5b"}"#;
+        let status: BackupStatus = serde_json::from_str(status_json).unwrap();
+        assert_eq!(serde_json::to_string(&status).unwrap(), status_json);
+        assert_eq!(status.backup_bytes(), 1 << 20);
+        assert_eq!(
+            BackupStatus::backup_bytes_value(&serde_json::from_str(status_json).unwrap()),
+            1 << 20
+        );
+    }
+
+    #[test]
+    fn store_backup_status_round_trips() {
+        let base = Uuid::now_v7();
+        let status = BackupStatus {
+            phase: BackupPhase::Ready,
+            disks: vec![BackupDisk {
+                name: "disk0".into(),
+                file: "disk0.fidx".into(),
+                virtual_bytes: 20 << 30,
+                stored_bytes: 300 << 20,
+                sha256: None,
+            }],
+            base: Some(base),
+            store_stats: Some(StoreBackupStats {
+                logical_bytes: 20 << 30,
+                read_bytes: 1 << 30,
+                new_chunks: 90,
+                new_bytes: 300 << 20,
+                reused_chunks: 1000,
+                zero_chunks: 3901,
+            }),
+            verify: Some(BackupVerify {
+                at: 1_790_000_000,
+                state: VerifyState::Failed,
+                bad_chunks: 2,
+                error: Some("2 chunks are damaged".into()),
+            }),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["base"], serde_json::json!(base));
+        assert_eq!(json["store_stats"]["new_bytes"], 300u64 << 20);
+        assert_eq!(
+            json["verify"],
+            serde_json::json!({ "at": 1_790_000_000u64, "state": "failed", "bad_chunks": 2, "error": "2 chunks are damaged" })
+        );
+        assert_eq!(status.backup_bytes(), 300 << 20);
+        assert_eq!(BackupStatus::backup_bytes_value(&json), 300 << 20);
+        assert_eq!(
+            serde_json::from_value::<BackupStatus>(json).unwrap(),
+            status
+        );
+        let ok = BackupVerify {
+            at: 1,
+            state: VerifyState::Ok,
+            bad_chunks: 0,
+            error: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&ok).unwrap(),
+            serde_json::json!({ "at": 1, "state": "ok" })
+        );
+        // 새 칸이 없으면 쓰지 않는다.
+        let json = serde_json::to_value(BackupStatus::default()).unwrap();
+        for k in ["base", "store_stats", "verify"] {
+            assert!(json.get(k).is_none(), "{k}: {json}");
+        }
     }
 
     #[test]

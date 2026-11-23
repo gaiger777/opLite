@@ -1435,6 +1435,8 @@ async fn block_tags_of_pending_backups_are_kept_at_startup() {
                 origin: None,
                 incremental: false,
                 max_chain: None,
+                source: None,
+                store: None,
             },
         );
         env.cluster.create(&backup).await.unwrap();

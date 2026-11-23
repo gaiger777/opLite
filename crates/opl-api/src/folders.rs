@@ -137,6 +137,13 @@ fn require_quota_feature(state: &AppState, quota: Option<&FolderQuota>) -> Resul
     if quota.is_some_and(|q| q.networks.is_some() || q.load_balancers.is_some()) {
         require_feature(&state.cluster, opl_types::node::SDN_SERVICES)?;
     }
+    // 백업 바이트(계획 68)는 API 스테이지 전까지 받지 않는다.
+    if quota.is_some_and(|q| q.backup_bytes.is_some()) {
+        return Err(crate::backups::store_not_yet(
+            &state.cluster,
+            "backup_bytes quotas",
+        ));
+    }
     Ok(())
 }
 

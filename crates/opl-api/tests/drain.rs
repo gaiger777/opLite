@@ -65,6 +65,7 @@ async fn add_node(env: &Env, name: &str, edit: impl FnOnce(&mut Node)) -> Uuid {
         checks: vec![],
         hotplug: None,
         firmware_caps: None,
+        backup_stores: Vec::new(),
     };
     edit(&mut node);
     env.cluster.create(&node).await.unwrap();

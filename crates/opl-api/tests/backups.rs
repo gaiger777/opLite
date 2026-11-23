@@ -731,6 +731,8 @@ async fn restore_needs_the_networks_and_security_groups_of_the_backup() {
             origin: None,
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     backup.status.phase = BackupPhase::Ready;

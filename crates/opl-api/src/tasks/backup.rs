@@ -714,6 +714,9 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<Option<St
             parent,
             full_reason,
             tpm_state,
+            base: None,
+            store_stats: None,
+            verify: None,
         };
         // 다 만든 백업이다. 실패로 끝내면 정리하면서 지우게 되므로 기록될 때까지 다시 시도한다.
         loop {

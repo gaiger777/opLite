@@ -133,6 +133,8 @@ async fn passwords_are_stored_as_sha512_crypt_and_never_returned() {
             origin: None,
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     env.cluster.create(&backup).await.unwrap();

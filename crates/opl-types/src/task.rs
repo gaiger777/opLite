@@ -301,6 +301,38 @@ pub enum TaskOp {
         #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
         router: Option<String>,
     },
+    /// 백업 저장소(대상)를 만든다(계획 68): `store.json`·`owner.json`(쓰기 저장소)을 쓰거나, 붙이는 저장소면 읽어 키·주인을
+    /// 확인하고 `phase: ready`를 쓴다. 저장소를 쓸 수 있는 노드에서 돈다.
+    BackupStoreInit,
+    /// 대상 저장소의 가비지 수집(계획 68 §10.2: 표시·기다림·쓸기 잠금·쓸기). 같은 저장소의 GC·검증은 차례로 돈다.
+    BackupStoreGc,
+    /// 대상 저장소의 검증(계획 68 §10.5). `backups`가 비면 일정대로(`verify::due`) 고른다.
+    BackupStoreVerify {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        backups: Vec<Uuid>,
+    },
+    /// 대상 저장소(읽기 전용으로 붙인 저장소)의 매니페스트마다 `ready` Backup 리소스를 만든다(계획 68 §12.6).
+    BackupStoreScan,
+    /// 대상 백업(옛 풀 백업, 체인 포함)을 저장소 `store`로 옮긴다(계획 68 §12.2). 원본은 남는다.
+    BackupConvert {
+        store: String,
+    },
+    /// 대상 저장소 백업을 같은 클러스터의 다른 저장소 `store`로 복사한다(계획 68 §12.5 — 없는 청크만).
+    BackupCopy {
+        store: String,
+    },
+    /// 백업 `backup`을 대상 id(미리 정한 새 VM id)의 새 VM `name`으로 라이브 복원한다(계획 68 §11): 디스크를 다 받기 전에
+    /// VM을 켜고 뒤에서 `pool`의 대상 볼륨으로 옮긴 뒤 갈아탄다. opld가 다시 떠도 이어 가는 Task다.
+    BackupLiveRestore {
+        backup: Uuid,
+        name: String,
+        pool: String,
+        /// 새 VM의 폴더(지금 복원과 같다). 없으면 쓰지 않는다.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+        folder: Option<Uuid>,
+    },
 }
 
 impl TaskOp {
@@ -351,6 +383,20 @@ impl TaskOp {
     /// vTPM 기능(계획 59, `node::VTPM`)을 모르는 노드가 풀지 못하는 Task인지
     pub fn needs_vtpm(&self) -> bool {
         matches!(self, TaskOp::VmFirmwareReset { .. })
+    }
+
+    /// 백업 저장소 기능(계획 68, `node::BACKUP_STORE`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_backup_store(&self) -> bool {
+        matches!(
+            self,
+            TaskOp::BackupStoreInit
+                | TaskOp::BackupStoreGc
+                | TaskOp::BackupStoreVerify { .. }
+                | TaskOp::BackupStoreScan
+                | TaskOp::BackupConvert { .. }
+                | TaskOp::BackupCopy { .. }
+                | TaskOp::BackupLiveRestore { .. }
+        )
     }
 
     /// SDN 서비스 기능(계획 67, `node::SDN_SERVICES`)을 모르는 노드가 풀지 못하는 Task인지
@@ -444,6 +490,73 @@ mod tests {
             serde_json::to_value(&first).unwrap(),
             serde_json::json!({ "kind": "cpu-baseline", "arch": "aarch64", "running_vms": 0 })
         );
+    }
+
+    /// 계획 68의 저장소 Task 일곱: 태그와 빈 칸 빼기, 옛 Task JSON은 그대로 읽힌다.
+    #[test]
+    fn backup_store_ops_are_tagged_and_omit_empty_fields() {
+        let backup = Uuid::now_v7();
+        let folder = Uuid::now_v7();
+        let cases = [
+            (
+                TaskOp::BackupStoreInit,
+                serde_json::json!({ "kind": "backup-store-init" }),
+            ),
+            (
+                TaskOp::BackupStoreGc,
+                serde_json::json!({ "kind": "backup-store-gc" }),
+            ),
+            (
+                TaskOp::BackupStoreVerify { backups: vec![] },
+                serde_json::json!({ "kind": "backup-store-verify" }),
+            ),
+            (
+                TaskOp::BackupStoreVerify {
+                    backups: vec![backup],
+                },
+                serde_json::json!({ "kind": "backup-store-verify", "backups": [backup] }),
+            ),
+            (
+                TaskOp::BackupStoreScan,
+                serde_json::json!({ "kind": "backup-store-scan" }),
+            ),
+            (
+                TaskOp::BackupConvert { store: "st".into() },
+                serde_json::json!({ "kind": "backup-convert", "store": "st" }),
+            ),
+            (
+                TaskOp::BackupCopy { store: "s3".into() },
+                serde_json::json!({ "kind": "backup-copy", "store": "s3" }),
+            ),
+            (
+                TaskOp::BackupLiveRestore {
+                    backup,
+                    name: "web-2".into(),
+                    pool: "local".into(),
+                    folder: None,
+                },
+                serde_json::json!({ "kind": "backup-live-restore", "backup": backup, "name": "web-2", "pool": "local" }),
+            ),
+            (
+                TaskOp::BackupLiveRestore {
+                    backup,
+                    name: "web-2".into(),
+                    pool: "local".into(),
+                    folder: Some(folder),
+                },
+                serde_json::json!({ "kind": "backup-live-restore", "backup": backup, "name": "web-2", "pool": "local", "folder": folder }),
+            ),
+        ];
+        for (op, json) in cases {
+            assert!(op.needs_backup_store(), "{json}");
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        }
+        assert!(!TaskOp::BackupDelete.needs_backup_store());
+        let old = serde_json::json!({ "kind": "backup-restore", "backup": backup, "name": "web-2", "pool": "local" });
+        let op: TaskOp = serde_json::from_value(old.clone()).unwrap();
+        assert!(!op.needs_backup_store());
+        assert_eq!(serde_json::to_value(&op).unwrap(), old);
     }
 
     #[test]

@@ -79,7 +79,7 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
 
 /**
  * 경보 대상의 화면: 노드·VM은 상세, 풀은 목록 검색, 백업 작업·Task는 그 목록, 라우터·부하 분산기는 그 서랍을 연 목록,
- * SDN은 SDN 보기(계획 67)
+ * SDN은 SDN 보기(계획 67), 백업은 목록 검색, 백업 저장소는 백업 목록(계획 68 — 저장소 화면은 웹 스테이지가 더한다)
  */
 export function alertHref(subject: AlertSubject): string {
   switch (subject.kind) {
@@ -99,5 +99,9 @@ export function alertHref(subject: AlertSubject): string {
       return `/routers?open=${enc(subject.id)}`;
     case "load_balancer":
       return `/load-balancers?open=${enc(subject.id)}`;
+    case "backup":
+      return `/backups?q=${enc(subject.name)}`;
+    case "backup_store":
+      return "/backups";
   }
 }

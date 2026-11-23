@@ -989,6 +989,11 @@ pub struct VmStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub tpm_node: Option<Uuid>,
+    /// 진행 중인 라이브 복원(계획 68 §11). 라이브 복원 Task가 쓰고 갈아타기가 끝나면 지운다. 있는 동안 reconciler·HA가
+    /// 이 VM을 켜거나 옮기지 않는다. 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub live_restore: Option<crate::backup_store::LiveRestore>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -2626,6 +2631,30 @@ mod tests {
         assert!(!spec.agent_channel());
         spec.guest_agent = Some(GuestAgentSpec::default());
         assert!(spec.agent_channel());
+    }
+
+    /// 계획 68: 라이브 복원 상태가 없으면 옛 VM 상태 JSON이 바이트까지 같고, 있으면 왕복한다.
+    #[test]
+    fn status_live_restore_is_written_only_while_restoring() {
+        let old = r#"{"phase":"running","node":null,"pid":12,"last_error":null,"snapshot":null,"schedule_error":null,"firmware_epoch":1}"#;
+        let st: VmStatus = serde_json::from_str(old).unwrap();
+        assert_eq!(st.live_restore, None);
+        assert_eq!(serde_json::to_string(&st).unwrap(), old);
+        let st = VmStatus {
+            live_restore: Some(crate::backup_store::LiveRestore {
+                backup: Uuid::now_v7(),
+                task: Uuid::now_v7(),
+                phase: crate::backup_store::LiveRestorePhase::Copying,
+                done_bytes: 1,
+                total_bytes: 2,
+                started_at: 3,
+                error: None,
+            }),
+            ..st
+        };
+        let json = serde_json::to_value(&st).unwrap();
+        assert_eq!(json["live_restore"]["phase"], "copying");
+        assert_eq!(serde_json::from_value::<VmStatus>(json).unwrap(), st);
     }
 
     /// TPM 해시·사본·회차(계획 59)는 없으면 쓰지 않고 있으면 왕복한다. 하드웨어 기록의 세 칸도 같다.

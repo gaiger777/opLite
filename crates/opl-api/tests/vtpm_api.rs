@@ -452,6 +452,8 @@ async fn restore_refuses_tpm_backups_on_old_clusters() {
             origin: None,
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     backup.status.phase = BackupPhase::Ready;

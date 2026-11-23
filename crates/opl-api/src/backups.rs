@@ -96,6 +96,16 @@ pub struct BackupForgotten {
     pub message: String,
 }
 
+/// 계획 68 백업 저장소의 새 칸·조건(백업 작업 `store`·`copy_to`, 경보 조건 `backup_*`, 할당량 `backup_bytes`)은 API
+/// 스테이지(계획 68 스테이지 6) 전까지 쓰지 않는다: 옛 노드가 남았으면 409 `cluster_upgrading`(검증보다 먼저 — 옛 노드는
+/// 이 칸을 풀지 못한다), 아니면 400. 스테이지 6이 지운다.
+pub(crate) fn store_not_yet(cluster: &opl_cluster::Cluster, what: &str) -> ApiError {
+    match require_feature(cluster, opl_types::node::BACKUP_STORE) {
+        Err(e) => e,
+        Ok(()) => ApiError::bad_request(format!("{what} are not available yet (backup stores)")),
+    }
+}
+
 /// 지금 시각(유닉스 초)
 pub(crate) fn now() -> u64 {
     std::time::SystemTime::now()
@@ -408,6 +418,8 @@ pub(crate) async fn start_backup(
             origin: None,
             incremental,
             max_chain,
+            source: None,
+            store: None,
         },
     );
     // 같은 이름이 있으면 저장소가 거부한다(409 name_taken).

@@ -231,6 +231,8 @@ async fn clone_and_restore_are_checked_before_the_task() {
             origin: None,
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     env.cluster.create(&backup).await.unwrap();

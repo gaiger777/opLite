@@ -677,6 +677,8 @@ async fn deleting_a_job_keeps_its_backups() {
             origin: None,
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     env.cluster.create(&backup).await.unwrap();

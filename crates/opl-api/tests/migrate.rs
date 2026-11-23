@@ -57,6 +57,7 @@ async fn add_node(env: &Env, name: &str) -> Uuid {
         checks: vec![],
         hotplug: None,
         firmware_caps: None,
+        backup_stores: Vec::new(),
     };
     env.cluster.create(&node).await.unwrap();
     node.id

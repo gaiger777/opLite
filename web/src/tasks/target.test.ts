@@ -65,4 +65,6 @@ it("links alert subjects", () => {
   expect(alertHref({ ...s, kind: "sdn" })).toBe("/sdn");
   expect(alertHref({ ...s, kind: "router" })).toBe("/routers?open=x");
   expect(alertHref({ ...s, kind: "load_balancer" })).toBe("/load-balancers?open=x");
+  expect(alertHref({ ...s, kind: "backup" })).toBe("/backups?q=a%20b");
+  expect(alertHref({ ...s, kind: "backup_store" })).toBe("/backups");
 });

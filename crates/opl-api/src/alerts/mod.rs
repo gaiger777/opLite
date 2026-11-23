@@ -61,6 +61,13 @@ fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     if spec.condition.is_sdn() {
         require_feature(&state.cluster, opl_types::node::SDN_SERVICES)?;
     }
+    // 백업 저장소 조건(계획 68)은 API 스테이지 전까지 받지 않는다.
+    if spec.condition.is_backup_store() {
+        return Err(crate::backups::store_not_yet(
+            &state.cluster,
+            "backup store alert conditions",
+        ));
+    }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     for t in &spec.targets {
@@ -702,7 +709,8 @@ pub async fn list_alerts(
     }))
 }
 
-/// 경보 대상(종류와 id 또는 이름)의 주인. 볼 권한은 그 대상의 `alert.read`다. 노드·백업 작업·SDN·모르는 대상은 루트다.
+/// 경보 대상(종류와 id 또는 이름)의 주인. 볼 권한은 그 대상의 `alert.read`다. 노드·백업 작업·SDN·백업 저장소·모르는
+/// 대상은 루트다.
 fn subject_owner(
     state: &AppState,
     owners: &crate::authz::Owners,
@@ -767,7 +775,20 @@ fn subject_owner(
                 id: l.id,
                 folder: l.spec.folder,
             }),
-        SubjectKind::Node | SubjectKind::BackupJob | SubjectKind::Sdn => None,
+        // 백업 경보(계획 68)는 백업의 주인(VM, 지웠으면 백업한 때의 VM 폴더)의 `alert.read`다.
+        SubjectKind::Backup => id
+            .and_then(|id| {
+                state
+                    .cluster
+                    .get::<opl_types::backup::BackupSpec>(id)
+                    .ok()
+                    .flatten()
+            })
+            .map(|b| owners.backup(b.spec.vm, b.spec.vm_spec.folder)),
+        SubjectKind::Node
+        | SubjectKind::BackupJob
+        | SubjectKind::Sdn
+        | SubjectKind::BackupStore => None,
     };
     crate::authz::Owned {
         target: target.unwrap_or(AuthzTarget::Root),

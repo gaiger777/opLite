@@ -641,6 +641,8 @@ async fn takes_in_a_backup_of_this_run_left_out_of_the_status() {
             origin: None,
             incremental: false,
             max_chain: None,
+            source: None,
+            store: None,
         },
     );
     made.status = BackupStatus {

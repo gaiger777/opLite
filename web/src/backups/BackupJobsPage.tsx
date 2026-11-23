@@ -277,8 +277,10 @@ function JobDialog({
   const { t } = useTranslation();
   const pools = backupPools(useList("storage-pool").data ?? []).map((p) => p.name);
   // 작업의 풀이 이제 백업 풀이 아니어도 고른 값으로 보인다(서버가 저장할 때 거절한다).
-  if (job && !pools.includes(job.spec.pool)) {
-    pools.unshift(job.spec.pool);
+  // 저장소 작업(계획 68)은 풀이 없다.
+  const jobPool = job?.spec.pool;
+  if (jobPool && !pools.includes(jobPool)) {
+    pools.unshift(jobPool);
   }
   const [form, setForm] = useState<JobForm>(() => (job ? formOf(job) : emptyForm(pools[0] ?? "")));
   const [errors, setErrors] = useState<Record<string, string>>({});

@@ -544,3 +544,18 @@ Raft 상태 기계는 로그 차례로 적용되므로 L 뒤에 만들어진 백
 8. **docs: 백업 가이드의 저장소·암호화·S3·검증·GC·라이브 복원·옮기기·DR, 아키텍처, 설계 문서 스테이지 보고, 계획 68 실행 기록** — `docs/guide/backup.md`, `docs/architecture.md`, `web-ui.md`·`development.md`, `docs/index.md`, README 한 줄, `docs/superpowers/plans/2026-11-23-plan68-backup2.md`.
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
+
+### 스테이지 1 (opl-types·opl-cluster)
+
+- **`backup-store-target`은 풀 id가 아니라 풀 이름**(`pool:<이름>`): 스펙에는 풀 이름만 있고 상태 머신의 겹침 검사는 스펙 JSON만 본다. 리소스 이름은 클러스터에서 고유하고 바뀌지 않으므로 같은 뜻이다. S3는 `s3:<host[:port]>/<버킷>/<접두사>` — 호스트 소문자, 기본 포트(443·80)는 빼고, 접두사 끝 `/`도 뺀다(`store_target_key`·JSON 판 `store_target_key_value`).
+- **`merge_index(base, count, dirty, new)`**: 디스크의 청크 수 `count`를 받고 `new[j]`가 `dirty[j]` 청크의 id다. base 인덱스의 청크 수가 `count`와 다르면(디스크 크기가 바뀜) 오류 — 마지막 짧은 청크의 내용이 달라지므로 부모 고르기(디스크 같음)가 그런 base를 주지 않는다. `chunk_ranges(extents, chunk_bytes)`는 `(오프셋, 길이)` 목록 → 오름차순·겹침 없는 청크 번호, `chunk_count(virtual_bytes, chunk_bytes)`를 더했다. `ChunkId = [u8; 32]`, `ZERO_CHUNK`, `CHUNK_BYTES`.
+- **`verify::due(backups, store, policy, now)`**: `ready`이고 `spec.store == store`인 백업 가운데 검증한 적 없음 → 오래된 차례(같으면 id). `mode`는 고르기에 쓰지 않는다.
+- **검증 규칙**(`BackupStoreSpec::validate`): 끝점은 `https://host[:port]`만(경로·질의·사용자 정보 없음, `http`는 `insecure_http`일 때만), 지역 1~32자 `[a-z0-9-]`, 버킷 3~63자 소문자·숫자·`.`·`-`(앞뒤는 영숫자, `..` 없음), 접두사 1~512자(앞 `/`·빈·`.`·`..` 조각·제어 문자 없음, 끝 `/`는 됨), `ca_pem`은 64 KiB 안의 `BEGIN CERTIFICATE`, 자격 증명은 인쇄 가능한 ASCII(1~128·1~256), 지문은 소문자 16진 16쌍 `:`, 키는 base64 32바이트, `reverify_days` 1~3650, `max_streams` 1~64. 일정 검사는 `JobSchedule::validate`로 빼서 백업 작업과 같이 쓴다.
+- **비밀은 `Debug`에서 빠진다**: `BackupStoreSpec`·`S3Target`·`StoreEncryption`의 `Debug`를 손으로 짜 `secret_access_key`·`key`를 `<redacted>`로(`ca_pem`도 줄임). API 보기·watch·감사에서 빼기는 스테이지 6.
+- **백업 작업 검증**: `pool`과 `store` 중 정확히 하나(`BackupJobError::Target`), `copy_to`는 저장소 작업에만(`CopyFromPool`), 대상은 작업의 저장소와 달라야(`CopyToSelf`). 백업은 `BackupSpec::target() -> BackupTarget::{Pool, Store}`(둘 다·둘 다 없음은 `BackupTargetError`).
+- **할당량 `backup_bytes`**: `BackupStatus::backup_bytes()`(저장소 백업은 `store_stats.new_bytes`, 풀 백업은 `disks[].stored_bytes` 합)와 JSON 판. 상태 머신은 `backup_bytes` 할당량이 있는 폴더가 있을 때만 VM 쓰기·폴더 옮기기에서 백업을 훑는다: 있는 VM의 백업은 그 VM 몫(옮기면 따라감), 지운 VM의 백업은 `vm_spec.folder`. 바이트는 상태(Task가 씀)에만 있어 **백업 쓰기 자체는 막지 않는다** — "만들 때 이미 넘었으면 409"는 API(스테이지 4·6)가 한다. API `quota::direct_usage`(사용량 보기)와 `precheck`(VM 옮기기)도 같은 규칙으로 센다.
+- **권한 갈래**: `kind_privilege` — `BackupStore` 읽기 `system.read`, 쓰기·조작 `storage.config`. 경보 대상 주인: `SubjectKind::Backup`은 백업의 주인(VM, 지웠으면 백업한 때의 VM 폴더), `BackupStore`는 루트.
+- **경보 조건 둘**은 리더가 평가하고(이벤트가 아님 — `for_secs`를 받음) `nodes`·`vms` 거르기는 400. 리더 엔진은 모르는 리더 조건을 건너뛰므로 평가는 스테이지 4.
+- **`NodeStatus.backup_stores`**: 노드가 다시 등록할 때(`bootstrap::record_node`) 지우지 않고 남긴다(보고 루프가 고친다). **`VmStatus.live_restore`**: reconciler가 끈 VM의 상태를 다시 쓸 때도 남긴다.
+- **새 Task 일곱**: `TaskOp::needs_backup_store()`. 실행기(`tasks.rs perform`)는 아직 "backup store tasks are not available yet"로 실패한다 — 스테이지 4·5·6이 갈래를 채운다. `BackupLiveRestore`를 이어 가는 Task 목록에 넣는 것은 스테이지 5.
+- **임시 API 막기(스테이지 6 전, `backups::store_not_yet` — 옛 노드가 있으면 409 `cluster_upgrading`, 아니면 400 "… are not available yet (backup stores)")**: 백업 작업의 `store`·`copy_to`(`backup_jobs::check_spec`), 경보 규칙의 `backup_verify_failed`·`backup_store_unavailable`(`check_rule`), 폴더 할당량 `backup_bytes`(`require_quota_feature`). 백업 만들기·복원 요청 본문은 따로 정의된 구조라 새 칸이 들어올 길이 없다. 시험 `crates/opl-api/tests/backup_store_types.rs`. `Kind::BackupStore`의 경로·owners·watch는 스테이지 6.

@@ -1089,6 +1089,16 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             tpm,
             secure_boot,
         } => firmware::reset(ctx, task, (*uefi_vars, *tpm), *secure_boot).await,
+        // 백업 저장소 Task(계획 68)는 실행 스테이지(4·5·6)가 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::BackupStoreInit
+        | TaskOp::BackupStoreGc
+        | TaskOp::BackupStoreVerify { .. }
+        | TaskOp::BackupStoreScan
+        | TaskOp::BackupConvert { .. }
+        | TaskOp::BackupCopy { .. }
+        | TaskOp::BackupLiveRestore { .. } => {
+            Err("backup store tasks are not available yet".into())
+        }
     };
     done.map(|()| None)
 }

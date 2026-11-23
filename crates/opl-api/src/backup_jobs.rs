@@ -46,6 +46,13 @@ use crate::state::AppState;
 /// 등록돼 있어야 한다(400). 원격의 풀은 보낼 때 원격이 확인한다. `full_every`(증분 백업)는 모든 노드가
 /// 증분 백업을 알 때만 쓴다(409 `cluster_upgrading`).
 fn check_spec(state: &AppState, spec: &mut BackupJobSpec) -> Result<(), ApiError> {
+    // 저장소 작업·복사본(계획 68)은 API 스테이지 전까지 받지 않는다.
+    if spec.store.is_some() || spec.copy_to.is_some() {
+        return Err(crate::backups::store_not_yet(
+            &state.cluster,
+            "backup jobs to a backup store",
+        ));
+    }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     spec.schedule.days.sort();
@@ -1013,6 +1020,8 @@ mod tests {
                 origin: None,
                 incremental: false,
                 max_chain: None,
+                source: None,
+                store: None,
             },
         );
         b.status = BackupStatus {
@@ -1171,6 +1180,8 @@ mod tests {
                 enabled: true,
                 replicate: None,
                 full_every: 0,
+                copy_to: None,
+                store: None,
             },
         );
         job.status = running(vec![a, b], vec![], vec![]);
@@ -1204,6 +1215,8 @@ mod tests {
                 enabled: true,
                 replicate: None,
                 full_every: 0,
+                copy_to: None,
+                store: None,
             },
         );
         // 실행은 NOW - 60에 시작했다.
@@ -1261,6 +1274,8 @@ mod tests {
                 enabled: true,
                 replicate: None,
                 full_every: 0,
+                copy_to: None,
+                store: None,
             },
         );
         let target = ReplicateTarget {
@@ -1503,6 +1518,8 @@ mod tests {
                 enabled: true,
                 replicate: None,
                 full_every: 0,
+                copy_to: None,
+                store: None,
             },
         );
         job.status = running(vec![], vec![], vec![]);

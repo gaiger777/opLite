@@ -3854,6 +3854,12 @@ export interface components {
         } | {
             /** @enum {string} */
             kind: "sdn_lb_member_down";
+        } | {
+            /** @enum {string} */
+            kind: "backup_verify_failed";
+        } | {
+            /** @enum {string} */
+            kind: "backup_store_unavailable";
         };
         /**
          * @description 비교
@@ -4105,6 +4111,8 @@ export interface components {
             vms?: components["schemas"]["VmSelector"];
         };
         BackupJobSpec: {
+            /** @description 작업의 백업이 `ready`가 되면 다른 저장소로 복사본을 보낸다(계획 68 §12.5 — 계층). 없으면 쓰지 않는다. */
+            copy_to?: components["schemas"]["CopyTarget"];
             /**
              * @description 끄면 예약 실행을 하지 않는다.
              * @default true
@@ -4114,15 +4122,22 @@ export interface components {
              * Format: int32
              * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
              *     0이면 늘 전체다(뺀다).
+             *     저장소 작업(`store`)에서는 "n번 연속 비트맵으로 읽었으면 다음은 디스크 전체를 읽기"다(계획 68 §8.3 — 저장 공간은
+             *     늘지 않는다).
              */
             full_every?: number;
             /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
             keep?: components["schemas"]["Keep"];
-            /** @description 백업 풀 이름 */
-            pool: string;
+            /**
+             * @description 백업 풀 이름. 백업 저장소(`store`, 계획 68)로 백업하는 작업이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로
+             *     바이트 그대로다). `pool`과 `store` 중 정확히 하나다.
+             */
+            pool?: string;
             /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
             replicate?: components["schemas"]["ReplicateTarget"];
             schedule: components["schemas"]["JobSchedule"];
+            /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+            store?: string;
             /** @description 백업할 VM */
             vms: components["schemas"]["VmSelector"];
         };
@@ -4214,6 +4229,17 @@ export interface components {
             remote: string;
             state: components["schemas"]["ReplicaState"];
         };
+        /** @description 저장소 백업의 원본(계획 68): 그 백업 id와 만든 방법 */
+        BackupSource: {
+            /**
+             * Format: uuid
+             * @description 원본 백업 id
+             */
+            backup: string;
+            kind: components["schemas"]["BackupSourceKind"];
+        };
+        /** @enum {string} */
+        BackupSourceKind: "convert" | "copy";
         BackupSpec: {
             /**
              * @description 할 수 있으면 증분으로 백업한다(바로 앞 백업을 부모로 바뀐 블록만). 할 수 없으면 전체로 하고 그
@@ -4233,8 +4259,18 @@ export interface components {
             max_chain?: number;
             /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
             origin?: components["schemas"]["BackupOrigin"];
-            /** @description 백업 풀 이름 */
-            pool: string;
+            /**
+             * @description 백업 풀 이름. 저장소 백업(`store`, 계획 68)이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로 바이트 그대로다).
+             *     `pool`과 `store` 중 정확히 하나다([`BackupSpec::target`]).
+             */
+            pool?: string;
+            /**
+             * @description 옛 백업을 옮기거나(`convert`) 다른 저장소에서 복사해(`copy`) 만든 저장소 백업의 원본(계획 68 §12.2·§12.5). 없으면
+             *     쓰지 않는다.
+             */
+            source?: components["schemas"]["BackupSource"];
+            /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+            store?: string;
             /**
              * Format: uuid
              * @description VM id. VM을 지워도 백업은 남는다.
@@ -4246,6 +4282,12 @@ export interface components {
             vm_spec: components["schemas"]["VmSpec"];
         };
         BackupStatus: {
+            /**
+             * Format: uuid
+             * @description 저장소 백업(계획 68)에서 바뀌지 않은 청크를 가져온 앞 백업. 계획 40의 `parent`와 달리 복원은 이것을 따라가지
+             *     않는다(인덱스가 늘 완전하다). 없으면 쓰지 않는다.
+             */
+            base?: string;
             /**
              * Format: int64
              * @description 만든 시각(유닉스 초)
@@ -4281,6 +4323,8 @@ export interface components {
             received_at?: number;
             /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
             replicas?: components["schemas"]["BackupReplica"][];
+            /** @description 저장소 백업이 읽고 쓴 양(계획 68). 없으면 쓰지 않는다. */
+            store_stats?: components["schemas"]["StoreBackupStats"];
             /** @description TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다. */
             tpm_state?: boolean;
             /**
@@ -4288,6 +4332,23 @@ export interface components {
              * @default false
              */
             uefi_vars: boolean;
+            /** @description 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다. */
+            verify?: components["schemas"]["BackupVerify"];
+        };
+        /** @description 백업 하나의 마지막 검증 결과(계획 68 §10.5) */
+        BackupVerify: {
+            /**
+             * Format: int64
+             * @description 검증한 시각(유닉스 초)
+             */
+            at: number;
+            /**
+             * Format: int64
+             * @description 이 백업이 가리키는 깨진 청크 수
+             */
+            bad_chunks?: number;
+            error?: string;
+            state: components["schemas"]["VerifyState"];
         };
         /** @description 아키텍처 하나의 클러스터 기준(`ClusterStatus.cpu_baselines`, 리더가 쓴다). `cluster` 모델 VM이 켤 때 쓴다. */
         Baseline: {
@@ -4919,6 +4980,15 @@ export interface components {
             /** @description 첫 줄에 `off`나 `on`을 찍는다(그 밖은 모름). */
             status: string;
         };
+        /**
+         * @description 백업 작업의 복사본을 보낼 저장소(계획 68 §12.5). 복사본의 보존은 `keep`(없으면 작업의 `keep`)으로 대상 저장소
+         *     안에서 따로 고른다.
+         */
+        CopyTarget: {
+            keep?: components["schemas"]["Keep"];
+            /** @description 같은 클러스터의 다른 백업 저장소 이름 */
+            store: string;
+        };
         /** @description 아키텍처 하나의 클러스터 기준 */
         CpuBaselineInfo: {
             arch: components["schemas"]["Arch"];
@@ -5214,6 +5284,8 @@ export interface components {
             };
             name: string;
             spec: {
+                /** @description 작업의 백업이 `ready`가 되면 다른 저장소로 복사본을 보낸다(계획 68 §12.5 — 계층). 없으면 쓰지 않는다. */
+                copy_to?: components["schemas"]["CopyTarget"];
                 /**
                  * @description 끄면 예약 실행을 하지 않는다.
                  * @default true
@@ -5223,15 +5295,22 @@ export interface components {
                  * Format: int32
                  * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
                  *     0이면 늘 전체다(뺀다).
+                 *     저장소 작업(`store`)에서는 "n번 연속 비트맵으로 읽었으면 다음은 디스크 전체를 읽기"다(계획 68 §8.3 — 저장 공간은
+                 *     늘지 않는다).
                  */
                 full_every?: number;
                 /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
                 keep?: components["schemas"]["Keep"];
-                /** @description 백업 풀 이름 */
-                pool: string;
+                /**
+                 * @description 백업 풀 이름. 백업 저장소(`store`, 계획 68)로 백업하는 작업이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로
+                 *     바이트 그대로다). `pool`과 `store` 중 정확히 하나다.
+                 */
+                pool?: string;
                 /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
                 replicate?: components["schemas"]["ReplicateTarget"];
                 schedule: components["schemas"]["JobSchedule"];
+                /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+                store?: string;
                 /** @description 백업할 VM */
                 vms: components["schemas"]["VmSelector"];
             };
@@ -5884,6 +5963,12 @@ export interface components {
         FolderQuota: {
             /**
              * Format: int64
+             * @description 하위 트리 VM들의 백업이 차지한다고 보는 바이트(계획 68 §13, VM 폴더만): 저장소 백업은 처음 쓴 바이트, 풀 백업은
+             *     파일 크기 합. 지운 VM의 백업은 백업한 때의 VM 폴더에 든다.
+             */
+            backup_bytes?: number;
+            /**
+             * Format: int64
              * @description 전용 VM의 vCPU 자리(핫플러그 상한 + 에뮬레이터 `isolate` 1, 계획 64)
              */
             dedicated_vcpus?: number;
@@ -5938,6 +6023,11 @@ export interface components {
         FolderStatus: Record<string, never>;
         /** @description 폴더 하위 트리의 사용량(할당 기준, 전원과 무관). 할당량과 같은 칸이다. */
         FolderUsage: {
+            /**
+             * Format: int64
+             * @description 백업 바이트(계획 68). 0이면 쓰지 않는다.
+             */
+            backup_bytes?: number;
             /**
              * Format: int64
              * @description 전용 VM의 vCPU 자리(계획 64). 0이면 쓰지 않아 지금 응답 그대로다.
@@ -6737,7 +6827,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store";
         /** @description 바깥 VIP */
         LbExternal: {
             /**
@@ -7045,6 +7135,8 @@ export interface components {
                  */
                 revision: number;
                 spec: {
+                    /** @description 작업의 백업이 `ready`가 되면 다른 저장소로 복사본을 보낸다(계획 68 §12.5 — 계층). 없으면 쓰지 않는다. */
+                    copy_to?: components["schemas"]["CopyTarget"];
                     /**
                      * @description 끄면 예약 실행을 하지 않는다.
                      * @default true
@@ -7054,15 +7146,22 @@ export interface components {
                      * Format: int32
                      * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
                      *     0이면 늘 전체다(뺀다).
+                     *     저장소 작업(`store`)에서는 "n번 연속 비트맵으로 읽었으면 다음은 디스크 전체를 읽기"다(계획 68 §8.3 — 저장 공간은
+                     *     늘지 않는다).
                      */
                     full_every?: number;
                     /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
                     keep?: components["schemas"]["Keep"];
-                    /** @description 백업 풀 이름 */
-                    pool: string;
+                    /**
+                     * @description 백업 풀 이름. 백업 저장소(`store`, 계획 68)로 백업하는 작업이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로
+                     *     바이트 그대로다). `pool`과 `store` 중 정확히 하나다.
+                     */
+                    pool?: string;
                     /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
                     replicate?: components["schemas"]["ReplicateTarget"];
                     schedule: components["schemas"]["JobSchedule"];
+                    /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+                    store?: string;
                     /** @description 백업할 VM */
                     vms: components["schemas"]["VmSelector"];
                 };
@@ -7120,8 +7219,18 @@ export interface components {
                     max_chain?: number;
                     /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
                     origin?: components["schemas"]["BackupOrigin"];
-                    /** @description 백업 풀 이름 */
-                    pool: string;
+                    /**
+                     * @description 백업 풀 이름. 저장소 백업(`store`, 계획 68)이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로 바이트 그대로다).
+                     *     `pool`과 `store` 중 정확히 하나다([`BackupSpec::target`]).
+                     */
+                    pool?: string;
+                    /**
+                     * @description 옛 백업을 옮기거나(`convert`) 다른 저장소에서 복사해(`copy`) 만든 저장소 백업의 원본(계획 68 §12.2·§12.5). 없으면
+                     *     쓰지 않는다.
+                     */
+                    source?: components["schemas"]["BackupSource"];
+                    /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+                    store?: string;
                     /**
                      * Format: uuid
                      * @description VM id. VM을 지워도 백업은 남는다.
@@ -7133,6 +7242,12 @@ export interface components {
                     vm_spec: components["schemas"]["VmSpec"];
                 };
                 status: {
+                    /**
+                     * Format: uuid
+                     * @description 저장소 백업(계획 68)에서 바뀌지 않은 청크를 가져온 앞 백업. 계획 40의 `parent`와 달리 복원은 이것을 따라가지
+                     *     않는다(인덱스가 늘 완전하다). 없으면 쓰지 않는다.
+                     */
+                    base?: string;
                     /**
                      * Format: int64
                      * @description 만든 시각(유닉스 초)
@@ -7168,6 +7283,8 @@ export interface components {
                     received_at?: number;
                     /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
                     replicas?: components["schemas"]["BackupReplica"][];
+                    /** @description 저장소 백업이 읽고 쓴 양(계획 68). 없으면 쓰지 않는다. */
+                    store_stats?: components["schemas"]["StoreBackupStats"];
                     /** @description TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다. */
                     tpm_state?: boolean;
                     /**
@@ -7175,6 +7292,8 @@ export interface components {
                      * @default false
                      */
                     uefi_vars: boolean;
+                    /** @description 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다. */
+                    verify?: components["schemas"]["BackupVerify"];
                 };
             }[];
             /** Format: int64 */
@@ -7424,6 +7543,11 @@ export interface components {
                 status: {
                     /** @default null */
                     arch: components["schemas"]["Arch"] | null;
+                    /**
+                     * @description 이 노드가 쓸 수 있는 백업 저장소마다 닿는지(계획 68 §6 — 60초마다 `store.json` 읽기). 비면 쓰지 않는다(옛 노드·
+                     *     저장소 없음). 옛 노드는 무시한다.
+                     */
+                    backup_stores?: components["schemas"]["NodeStoreState"][];
                     /**
                      * @description 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
                      * @default []
@@ -7928,6 +8052,11 @@ export interface components {
                      *     필드를 무시한다.
                      */
                     last_recovery?: components["schemas"]["ReplicaRecovery"];
+                    /**
+                     * @description 진행 중인 라이브 복원(계획 68 §11). 라이브 복원 Task가 쓰고 갈아타기가 끝나면 지운다. 있는 동안 reconciler·HA가
+                     *     이 VM을 켜거나 옮기지 않는다. 없으면 쓰지 않는다.
+                     */
+                    live_restore?: components["schemas"]["LiveRestore"];
                     /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
                     migration?: components["schemas"]["MigrationStatus"];
                     /**
@@ -8093,6 +8222,36 @@ export interface components {
              */
             surplus: number;
         };
+        /** @description 라이브 복원 중인 VM의 상태(§11 — `VmStatus.live_restore`). 라이브 복원 Task가 쓰고, 갈아타기가 끝나면 지운다. */
+        LiveRestore: {
+            /**
+             * Format: uuid
+             * @description 되살리는 백업
+             */
+            backup: string;
+            /**
+             * Format: int64
+             * @description 대상 볼륨으로 옮긴 바이트(mirror 진행)
+             */
+            done_bytes?: number;
+            /** @description 멈춘 까닭이나 실패한 이유 */
+            error?: string;
+            phase: components["schemas"]["LiveRestorePhase"];
+            /**
+             * Format: int64
+             * @description 시작한 시각(유닉스 초)
+             */
+            started_at: number;
+            /**
+             * Format: uuid
+             * @description 라이브 복원 Task
+             */
+            task: string;
+            /** Format: int64 */
+            total_bytes?: number;
+        };
+        /** @enum {string} */
+        LiveRestorePhase: "starting" | "copying" | "pivoting" | "paused" | "stopped" | "failed";
         /** @description `GET /load-balancers` */
         LoadBalancerList: {
             items: components["schemas"]["LoadBalancerView"][];
@@ -8903,6 +9062,11 @@ export interface components {
             /** @default null */
             arch: components["schemas"]["Arch"] | null;
             /**
+             * @description 이 노드가 쓸 수 있는 백업 저장소마다 닿는지(계획 68 §6 — 60초마다 `store.json` 읽기). 비면 쓰지 않는다(옛 노드·
+             *     저장소 없음). 옛 노드는 무시한다.
+             */
+            backup_stores?: components["schemas"]["NodeStoreState"][];
+            /**
              * @description 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
              * @default []
              */
@@ -9005,6 +9169,24 @@ export interface components {
             updates?: components["schemas"]["NodeUpdates"];
             /** @description 이 노드에서 도는 orbivisord의 빌드 버전. 노드가 등록할 때 쓴다(옛 버전 노드는 None). */
             version?: string;
+        };
+        /**
+         * @description 노드 하나가 본 저장소(§6 — `NodeStatus.backup_stores`). 이 노드가 그 저장소를 쓸 수 있을 때만 60초마다
+         *     `store.json`을 읽어 적는다.
+         */
+        NodeStoreState: {
+            /**
+             * Format: int64
+             * @description 확인한 시각(유닉스 초)
+             */
+            checked_at: number;
+            error?: string;
+            ok: boolean;
+            /**
+             * Format: uuid
+             * @description 저장소 리소스 id
+             */
+            store: string;
         };
         /** @description 노드의 CPU·메모리 토폴로지(`NodeStatus.topology`, 설계 §6). 바뀔 때만 쓰므로 빈 자원은 넣지 않는다. */
         NodeTopology: {
@@ -10269,6 +10451,8 @@ export interface components {
              */
             revision: number;
             spec: {
+                /** @description 작업의 백업이 `ready`가 되면 다른 저장소로 복사본을 보낸다(계획 68 §12.5 — 계층). 없으면 쓰지 않는다. */
+                copy_to?: components["schemas"]["CopyTarget"];
                 /**
                  * @description 끄면 예약 실행을 하지 않는다.
                  * @default true
@@ -10278,15 +10462,22 @@ export interface components {
                  * Format: int32
                  * @description 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
                  *     0이면 늘 전체다(뺀다).
+                 *     저장소 작업(`store`)에서는 "n번 연속 비트맵으로 읽었으면 다음은 디스크 전체를 읽기"다(계획 68 §8.3 — 저장 공간은
+                 *     늘지 않는다).
                  */
                 full_every?: number;
                 /** @description 보존 규칙. 모두 0이면 지우지 않는다. */
                 keep?: components["schemas"]["Keep"];
-                /** @description 백업 풀 이름 */
-                pool: string;
+                /**
+                 * @description 백업 풀 이름. 백업 저장소(`store`, 계획 68)로 백업하는 작업이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로
+                 *     바이트 그대로다). `pool`과 `store` 중 정확히 하나다.
+                 */
+                pool?: string;
                 /** @description 만든 백업을 보낼 원격 클러스터의 백업 풀. 없으면 보내지 않는다. */
                 replicate?: components["schemas"]["ReplicateTarget"];
                 schedule: components["schemas"]["JobSchedule"];
+                /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+                store?: string;
                 /** @description 백업할 VM */
                 vms: components["schemas"]["VmSelector"];
             };
@@ -10340,8 +10531,18 @@ export interface components {
                 max_chain?: number;
                 /** @description 다른 클러스터에서 받은 사본이면 그 원본. 이 클러스터에서 만든 백업이면 없다. */
                 origin?: components["schemas"]["BackupOrigin"];
-                /** @description 백업 풀 이름 */
-                pool: string;
+                /**
+                 * @description 백업 풀 이름. 저장소 백업(`store`, 계획 68)이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로 바이트 그대로다).
+                 *     `pool`과 `store` 중 정확히 하나다([`BackupSpec::target`]).
+                 */
+                pool?: string;
+                /**
+                 * @description 옛 백업을 옮기거나(`convert`) 다른 저장소에서 복사해(`copy`) 만든 저장소 백업의 원본(계획 68 §12.2·§12.5). 없으면
+                 *     쓰지 않는다.
+                 */
+                source?: components["schemas"]["BackupSource"];
+                /** @description 백업 저장소 이름(계획 68). 없으면 쓰지 않는다. */
+                store?: string;
                 /**
                  * Format: uuid
                  * @description VM id. VM을 지워도 백업은 남는다.
@@ -10353,6 +10554,12 @@ export interface components {
                 vm_spec: components["schemas"]["VmSpec"];
             };
             status: {
+                /**
+                 * Format: uuid
+                 * @description 저장소 백업(계획 68)에서 바뀌지 않은 청크를 가져온 앞 백업. 계획 40의 `parent`와 달리 복원은 이것을 따라가지
+                 *     않는다(인덱스가 늘 완전하다). 없으면 쓰지 않는다.
+                 */
+                base?: string;
                 /**
                  * Format: int64
                  * @description 만든 시각(유닉스 초)
@@ -10388,6 +10595,8 @@ export interface components {
                 received_at?: number;
                 /** @description 원격 클러스터에 보낸 사본. 없으면 뺀다. */
                 replicas?: components["schemas"]["BackupReplica"][];
+                /** @description 저장소 백업이 읽고 쓴 양(계획 68). 없으면 쓰지 않는다. */
+                store_stats?: components["schemas"]["StoreBackupStats"];
                 /** @description TPM 상태 파일(`tpm2-00.permall`)을 담았는지(계획 59). 거짓이면 뺀다. */
                 tpm_state?: boolean;
                 /**
@@ -10395,6 +10604,8 @@ export interface components {
                  * @default false
                  */
                 uefi_vars: boolean;
+                /** @description 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다. */
+                verify?: components["schemas"]["BackupVerify"];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -10754,6 +10965,11 @@ export interface components {
             status: {
                 /** @default null */
                 arch: components["schemas"]["Arch"] | null;
+                /**
+                 * @description 이 노드가 쓸 수 있는 백업 저장소마다 닿는지(계획 68 §6 — 60초마다 `store.json` 읽기). 비면 쓰지 않는다(옛 노드·
+                 *     저장소 없음). 옛 노드는 무시한다.
+                 */
+                backup_stores?: components["schemas"]["NodeStoreState"][];
                 /**
                  * @description 이 노드에 있는 Linux 브리지. 스케줄러가 브리지 네트워크를 쓰는 VM을 배치할 때 본다.
                  * @default []
@@ -11331,6 +11547,11 @@ export interface components {
                  *     필드를 무시한다.
                  */
                 last_recovery?: components["schemas"]["ReplicaRecovery"];
+                /**
+                 * @description 진행 중인 라이브 복원(계획 68 §11). 라이브 복원 Task가 쓰고 갈아타기가 끝나면 지운다. 있는 동안 reconciler·HA가
+                 *     이 VM을 켜거나 옮기지 않는다. 없으면 쓰지 않는다.
+                 */
+                live_restore?: components["schemas"]["LiveRestore"];
                 /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
                 migration?: components["schemas"]["MigrationStatus"];
                 /**
@@ -12168,11 +12389,50 @@ export interface components {
              */
             total_bytes: number | null;
         };
+        /** @description 저장소 백업 하나가 읽고 쓴 양(계획 68 §8.4) */
+        StoreBackupStats: {
+            /**
+             * Format: int64
+             * @description 디스크 가상 크기 합
+             * @default 0
+             */
+            logical_bytes: number;
+            /**
+             * Format: int64
+             * @description 이 백업이 저장소에 처음 쓴 저장 바이트(압축·암호화 뒤). 할당량 `backup_bytes`가 센다.
+             * @default 0
+             */
+            new_bytes: number;
+            /**
+             * Format: int64
+             * @description 저장소에 처음 올린 청크 수
+             * @default 0
+             */
+            new_chunks: number;
+            /**
+             * Format: int64
+             * @description 이번에 읽은 바이트(증분이면 바뀐 청크만)
+             * @default 0
+             */
+            read_bytes: number;
+            /**
+             * Format: int64
+             * @description 이미 저장소에 있어 다시 쓰지 않은 청크 수
+             * @default 0
+             */
+            reused_chunks: number;
+            /**
+             * Format: int64
+             * @description 내용이 모두 0이라 저장하지 않은 청크 수
+             * @default 0
+             */
+            zero_chunks: number;
+        };
         /**
          * @description 경보 대상의 종류
          * @enum {string}
          */
-        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer";
+        SubjectKind: "node" | "vm" | "pool" | "task" | "backup_job" | "sdn" | "router" | "load_balancer" | "backup" | "backup_store";
         /** @description SDN 네트워크의 서브넷: 주소를 Orbivisor IPAM(`NicSpec.ips`)이 정하고 OVN 내장 DHCP가 준다. */
         Subnet: {
             /**
@@ -12510,6 +12770,39 @@ export interface components {
             router?: string;
             step: components["schemas"]["MigrationStep"];
             vms?: string[];
+        } | {
+            /** @enum {string} */
+            kind: "backup-store-init";
+        } | {
+            /** @enum {string} */
+            kind: "backup-store-gc";
+        } | {
+            backups?: string[];
+            /** @enum {string} */
+            kind: "backup-store-verify";
+        } | {
+            /** @enum {string} */
+            kind: "backup-store-scan";
+        } | {
+            /** @enum {string} */
+            kind: "backup-convert";
+            store: string;
+        } | {
+            /** @enum {string} */
+            kind: "backup-copy";
+            store: string;
+        } | {
+            /** Format: uuid */
+            backup: string;
+            /**
+             * Format: uuid
+             * @description 새 VM의 폴더(지금 복원과 같다). 없으면 쓰지 않는다.
+             */
+            folder?: string;
+            /** @enum {string} */
+            kind: "backup-live-restore";
+            name: string;
+            pool: string;
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {
@@ -13198,6 +13491,8 @@ export interface components {
             /** @description 2단계 인증 요소(확인된 TOTP 또는 패스키)가 있다(계획 62) */
             two_factor?: boolean;
         };
+        /** @enum {string} */
+        VerifyState: "ok" | "failed";
         VersionInfo: {
             /** @description 이 노드의 orbivisord 빌드 버전 */
             version: string;
@@ -13550,6 +13845,11 @@ export interface components {
              *     필드를 무시한다.
              */
             last_recovery?: components["schemas"]["ReplicaRecovery"];
+            /**
+             * @description 진행 중인 라이브 복원(계획 68 §11). 라이브 복원 Task가 쓰고 갈아타기가 끝나면 지운다. 있는 동안 reconciler·HA가
+             *     이 VM을 켜거나 옮기지 않는다. 없으면 쓰지 않는다.
+             */
+            live_restore?: components["schemas"]["LiveRestore"];
             /** @description 진행 중인 라이브 마이그레이션. 원본 노드의 마이그레이션 Task가 쓰고 지운다. */
             migration?: components["schemas"]["MigrationStatus"];
             /**

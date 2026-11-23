@@ -20,8 +20,15 @@ const DAY: u64 = 86_400;
 pub struct BackupJobSpec {
     /// 백업할 VM
     pub vms: VmSelector,
-    /// 백업 풀 이름
+    /// 백업 풀 이름. 백업 저장소(`store`, 계획 68)로 백업하는 작업이면 비우고 쓰지 않는다(옛 JSON에는 늘 있으므로
+    /// 바이트 그대로다). `pool`과 `store` 중 정확히 하나다.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
     pub pool: String,
+    /// 백업 저장소 이름(계획 68). 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub store: Option<String>,
     pub schedule: JobSchedule,
     /// 보존 규칙. 모두 0이면 지우지 않는다.
     #[serde(default)]
@@ -36,9 +43,28 @@ pub struct BackupJobSpec {
     pub replicate: Option<ReplicateTarget>,
     /// 0보다 크면 증분으로 백업하되(할 수 있으면) 체인의 증분이 이만큼 쌓이면 다음은 전체로 한다.
     /// 0이면 늘 전체다(뺀다).
+    /// 저장소 작업(`store`)에서는 "n번 연속 비트맵으로 읽었으면 다음은 디스크 전체를 읽기"다(계획 68 §8.3 — 저장 공간은
+    /// 늘지 않는다).
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub full_every: u32,
+    /// 작업의 백업이 `ready`가 되면 다른 저장소로 복사본을 보낸다(계획 68 §12.5 — 계층). 없으면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub copy_to: Option<CopyTarget>,
+}
+
+/// 백업 작업의 복사본을 보낼 저장소(계획 68 §12.5). 복사본의 보존은 `keep`(없으면 작업의 `keep`)으로 대상 저장소
+/// 안에서 따로 고른다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct CopyTarget {
+    /// 같은 클러스터의 다른 백업 저장소 이름
+    pub store: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub keep: Option<Keep>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -75,21 +101,31 @@ impl BackupJobSpec {
             }
             VmSelector::Names(_) | VmSelector::Labels(_) => {}
         }
-        if parse_at(&self.schedule.at).is_none() {
-            return Err(BackupJobError::At);
-        }
-        let mut days = BTreeSet::new();
-        for day in &self.schedule.days {
-            if !days.insert(day) {
-                return Err(BackupJobError::DuplicateDay(day.as_str()));
+        match (self.pool.is_empty(), &self.store) {
+            (false, None) => {}
+            (true, Some(store)) => {
+                validate_name(store).map_err(|_| BackupJobError::Store(store.clone()))?
             }
+            _ => return Err(BackupJobError::Target),
         }
+        self.schedule.validate()?;
         if let Some(target) = &self.replicate {
             if validate_name(&target.remote).is_err() {
                 return Err(BackupJobError::ReplicateRemote(target.remote.clone()));
             }
             if validate_name(&target.pool).is_err() {
                 return Err(BackupJobError::ReplicatePool(target.pool.clone()));
+            }
+        }
+        if let Some(copy) = &self.copy_to {
+            if validate_name(&copy.store).is_err() {
+                return Err(BackupJobError::CopyStore(copy.store.clone()));
+            }
+            if self.store.as_deref() == Some(copy.store.as_str()) {
+                return Err(BackupJobError::CopyToSelf);
+            }
+            if self.store.is_none() {
+                return Err(BackupJobError::CopyFromPool);
             }
         }
         Ok(())
@@ -110,6 +146,16 @@ pub enum BackupJobError {
     ReplicateRemote(String),
     #[error("replicate.pool {0:?} is not a valid storage pool name")]
     ReplicatePool(String),
+    #[error("give exactly one of pool and store")]
+    Target,
+    #[error("store {0:?} is not a valid backup store name")]
+    Store(String),
+    #[error("copy_to.store {0:?} is not a valid backup store name")]
+    CopyStore(String),
+    #[error("copy_to.store must be another store than the job's store")]
+    CopyToSelf,
+    #[error("copy_to needs a job that backs up to a store")]
+    CopyFromPool,
 }
 
 /// 백업할 VM 고르기. JSON은 `{"all": true}`, `{"names": [...]}`, `{"labels": {...}}` 중 하나다.
@@ -235,6 +281,22 @@ impl Weekday {
             Weekday::Sat => "sat",
             Weekday::Sun => "sun",
         }
+    }
+}
+
+impl JobSchedule {
+    /// `at`이 `HH:MM`이고 요일이 겹치지 않는다.
+    pub fn validate(&self) -> Result<(), BackupJobError> {
+        if parse_at(&self.at).is_none() {
+            return Err(BackupJobError::At);
+        }
+        let mut days = BTreeSet::new();
+        for day in &self.days {
+            if !days.insert(day) {
+                return Err(BackupJobError::DuplicateDay(day.as_str()));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -514,6 +576,94 @@ mod tests {
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["full_every"], 6);
         assert_eq!(spec(json).unwrap(), s);
+    }
+
+    /// 계획 68: 저장소 작업은 `pool`을 쓰지 않고 `store`·`copy_to`를 쓴다. 옛 풀 작업 JSON은 바이트 그대로다.
+    #[test]
+    fn store_jobs_leave_out_the_pool_and_old_jobs_stay_byte_identical() {
+        let old = r#"{"vms":{"all":true},"pool":"backups","schedule":{"at":"03:00","days":["mon"]},"keep":{"last":3,"daily":0,"weekly":0,"monthly":0},"enabled":true,"full_every":6}"#;
+        let s: BackupJobSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(s.store, None);
+        assert_eq!(s.copy_to, None);
+        assert_eq!(serde_json::to_string(&s).unwrap(), old);
+
+        let j = json!({
+            "vms": { "all": true },
+            "store": "local-st",
+            "schedule": { "at": "03:00", "days": [] },
+            "keep": { "last": 7, "daily": 0, "weekly": 0, "monthly": 0 },
+            "enabled": true,
+            "copy_to": { "store": "s3-dr", "keep": { "last": 0, "daily": 90, "weekly": 0, "monthly": 0 } }
+        });
+        let s = spec(j.clone()).unwrap();
+        assert_eq!(s.pool, "");
+        assert_eq!(s.store.as_deref(), Some("local-st"));
+        assert_eq!(
+            s.copy_to,
+            Some(CopyTarget {
+                store: "s3-dr".into(),
+                keep: Some(Keep {
+                    daily: 90,
+                    ..Keep::default()
+                }),
+            })
+        );
+        assert_eq!(s.validate(), Ok(()));
+        assert_eq!(serde_json::to_value(&s).unwrap(), j);
+        let mut bad = j.clone();
+        bad["copy_to"]["stor"] = json!("x");
+        assert!(spec(bad).is_err());
+    }
+
+    #[test]
+    fn validates_the_pool_or_store_target_and_copy_to() {
+        let mut both = spec(base()).unwrap();
+        both.store = Some("st".into());
+        assert_eq!(both.validate(), Err(BackupJobError::Target));
+        let neither = BackupJobSpec {
+            pool: String::new(),
+            store: None,
+            ..both.clone()
+        };
+        assert_eq!(neither.validate(), Err(BackupJobError::Target));
+        let store = BackupJobSpec {
+            pool: String::new(),
+            ..both.clone()
+        };
+        assert_eq!(store.validate(), Ok(()));
+        let bad = BackupJobSpec {
+            store: Some("St".into()),
+            ..store.clone()
+        };
+        assert_eq!(bad.validate(), Err(BackupJobError::Store("St".into())));
+        let copy = |to: &str| CopyTarget {
+            store: to.into(),
+            keep: None,
+        };
+        let with = |s: &BackupJobSpec, to: &str| BackupJobSpec {
+            copy_to: Some(copy(to)),
+            ..s.clone()
+        };
+        assert_eq!(with(&store, "s3").validate(), Ok(()));
+        assert_eq!(
+            with(&store, "st").validate(),
+            Err(BackupJobError::CopyToSelf)
+        );
+        assert_eq!(
+            with(&store, "S3").validate(),
+            Err(BackupJobError::CopyStore("S3".into()))
+        );
+        assert_eq!(
+            with(&spec(base()).unwrap(), "s3").validate(),
+            Err(BackupJobError::CopyFromPool)
+        );
+        // 일정 검사는 저장소의 GC·검증 일정도 쓴다.
+        assert_eq!(schedule("24:00", &[]).validate(), Err(BackupJobError::At));
+        assert_eq!(
+            schedule("01:00", &[Weekday::Sun, Weekday::Sun]).validate(),
+            Err(BackupJobError::DuplicateDay("sun"))
+        );
+        assert_eq!(schedule("01:00", &[Weekday::Sun]).validate(), Ok(()));
     }
 
     #[test]

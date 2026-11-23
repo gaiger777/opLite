@@ -121,18 +121,68 @@ pub(crate) fn precheck_vm(
     )
 }
 
+/// 할당량 `backup_bytes`(계획 68 §13)에 드는 백업 바이트: 있는 VM은 VM id → 그 VM 백업의 합(VM 몫이라 VM을 옮기면
+/// 따라감), 지운 VM의 백업은 백업한 때의 VM 폴더 → 합. 상태 머신(`opl-cluster` `folders.rs`)과 같은 규칙이다.
+#[derive(Default)]
+struct BackupBytes {
+    by_vm: HashMap<Uuid, u64>,
+    orphans: HashMap<Uuid, u64>,
+}
+
+fn backup_bytes(cluster: &Cluster, vms: &[opl_types::vm::Vm]) -> Result<BackupBytes, ApiError> {
+    let (_, backups) = cluster.list::<opl_types::backup::BackupSpec>()?;
+    let live: std::collections::HashSet<Uuid> = vms.iter().map(|v| v.id).collect();
+    let mut out = BackupBytes::default();
+    for b in backups {
+        let bytes = b.status.backup_bytes();
+        let slot = if live.contains(&b.spec.vm) {
+            Some(out.by_vm.entry(b.spec.vm).or_default())
+        } else {
+            b.spec
+                .vm_spec
+                .folder
+                .map(|f| out.orphans.entry(f).or_default())
+        };
+        if let Some(sum) = slot {
+            *sum = sum.saturating_add(bytes);
+        }
+    }
+    Ok(out)
+}
+
+impl BackupBytes {
+    fn of(&self, vm: Uuid) -> FolderUsage {
+        FolderUsage {
+            backup_bytes: self.by_vm.get(&vm).copied().unwrap_or(0),
+            ..FolderUsage::default()
+        }
+    }
+
+    fn add_orphans(&self, direct: &mut DirectUsage) {
+        for (f, bytes) in &self.orphans {
+            direct.entry(*f).or_default().add(&FolderUsage {
+                backup_bytes: *bytes,
+                ..FolderUsage::default()
+            });
+        }
+    }
+}
+
 /// 폴더마다 바로 든 VM의 사용량과(네트워크 폴더) 라우터·유동 IP 수(계획 66), 네트워크·부하 분산기 수와 바깥 VIP(계획 67)
 fn direct_usage(cluster: &Cluster) -> Result<DirectUsage, ApiError> {
     use opl_types::resource::Kind;
     let sizes = volume_sizes(cluster)?;
     let (_, vms) = cluster.list::<VmSpec>()?;
+    let backups = backup_bytes(cluster, &vms)?;
     let mut direct = DirectUsage::new();
     for vm in &vms {
         if let Some(f) = vm.spec.folder {
-            let usage = FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, &sizes));
+            let mut usage = FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, &sizes));
+            usage.add(&backups.of(vm.id));
             direct.entry(f).or_default().add(&usage);
         }
     }
+    backups.add_orphans(&mut direct);
     let networks = cluster.list::<opl_types::network::NetworkSpec>()?.1;
     let routers = cluster.list::<opl_types::router::RouterSpec>()?.1;
     let fips = cluster.list::<opl_types::floating_ip::FloatingIpSpec>()?.1;
@@ -184,9 +234,21 @@ pub(crate) fn precheck(cluster: &Cluster, change: Change) -> Result<(), ApiError
     }
     let mut after_tree = before_tree.clone();
     let (mut before, mut after) = (DirectUsage::new(), DirectUsage::new());
+    // 백업 바이트(계획 68)는 그 할당량이 있을 때만 센다.
+    let backups = if before_tree
+        .values()
+        .any(|n| n.quota.is_some_and(|q| q.backup_bytes.is_some()))
+    {
+        backup_bytes(cluster, &vms)?
+    } else {
+        BackupBytes::default()
+    };
+    backups.add_orphans(&mut before);
+    backups.add_orphans(&mut after);
     for vm in &vms {
         let Some(f) = vm.spec.folder else { continue };
-        let usage = FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, &sizes));
+        let mut usage = FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, &sizes));
+        usage.add(&backups.of(vm.id));
         before.entry(f).or_default().add(&usage);
         let next = match change {
             Change::Vm {
@@ -194,7 +256,9 @@ pub(crate) fn precheck(cluster: &Cluster, change: Change) -> Result<(), ApiError
             } if id == vm.id => continue,
             _ => match &grown {
                 Some((name, sizes)) if vm.spec.disks.iter().any(|d| d.volume == *name) => {
-                    FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, sizes))
+                    let mut grown = FolderUsage::of_vm(&vm.spec, disk_bytes(&vm.spec, sizes));
+                    grown.add(&backups.of(vm.id));
+                    grown
                 }
                 _ => usage,
             },
@@ -203,11 +267,18 @@ pub(crate) fn precheck(cluster: &Cluster, change: Change) -> Result<(), ApiError
     }
     match change {
         Change::Vm {
+            replaces,
             folder: Some(f),
             usage,
             count,
-            ..
-        } => after.entry(f).or_default().add(&usage.times(count)),
+        } => {
+            let mut usage = usage.times(count);
+            // 바꾸는 VM의 백업은 VM을 따라간다.
+            if let Some(id) = replaces {
+                usage.add(&backups.of(id));
+            }
+            after.entry(f).or_default().add(&usage)
+        }
         Change::Folder { id, parent } => {
             if let Some(node) = after_tree.get_mut(&id) {
                 node.parent = parent;

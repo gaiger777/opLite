@@ -301,6 +301,10 @@ pub enum AlertCondition {
     SdnPhysnetNotReady,
     /// 부하 분산기의 건강 검사 멤버가 죽음(계획 67, 리더, 대상 부하 분산기)
     SdnLbMemberDown,
+    /// 백업의 마지막 검증이 실패함(계획 68, 리더, 대상 백업 — 다시 검증해 통과하거나 백업을 지우면 풀림)
+    BackupVerifyFailed,
+    /// 백업 저장소에 닿지 않음(계획 68, 리더가 노드 보고 `backup_stores`로 평가, 대상 저장소)
+    BackupStoreUnavailable,
 }
 
 /// 누가 평가하나
@@ -332,6 +336,8 @@ impl AlertCondition {
             Self::SdnSyncFailed => "sdn_sync_failed",
             Self::SdnPhysnetNotReady => "sdn_physnet_not_ready",
             Self::SdnLbMemberDown => "sdn_lb_member_down",
+            Self::BackupVerifyFailed => "backup_verify_failed",
+            Self::BackupStoreUnavailable => "backup_store_unavailable",
         }
     }
 
@@ -361,10 +367,18 @@ impl AlertCondition {
         )
     }
 
+    /// 백업 저장소 조건(계획 68 — 기능 `backup-store`)인지
+    pub fn is_backup_store(&self) -> bool {
+        matches!(
+            self,
+            Self::BackupVerifyFailed | Self::BackupStoreUnavailable
+        )
+    }
+
     pub fn evaluator(&self) -> Evaluator {
         match self {
             Self::NodeOffline | Self::BackupJobFailed => Evaluator::Leader,
-            c if c.is_sdn() => Evaluator::Leader,
+            c if c.is_sdn() || c.is_backup_store() => Evaluator::Leader,
             _ => Evaluator::Node,
         }
     }
@@ -384,6 +398,8 @@ impl AlertCondition {
             Self::PoolUsage { .. } => SubjectKind::Pool,
             Self::TaskFailed { .. } | Self::HaRecovery => SubjectKind::Task,
             Self::BackupJobFailed => SubjectKind::BackupJob,
+            Self::BackupVerifyFailed => SubjectKind::Backup,
+            Self::BackupStoreUnavailable => SubjectKind::BackupStore,
         }
     }
 
@@ -518,6 +534,7 @@ impl AlertRuleSpec {
         // 노드 거르기는 노드에서 일어나는 일에만 뜻이 있다(SDN 조건은 노드가 대상인 것만 — 계획 67 §11).
         if !self.nodes.is_empty()
             && (matches!(c, AlertCondition::BackupJobFailed)
+                || c.is_backup_store()
                 || (c.is_sdn() && c.subject_kind() != SubjectKind::Node))
         {
             return Err(AlertRuleError::NodesFilter(c.kind()));
@@ -568,6 +585,10 @@ pub enum SubjectKind {
     Router,
     /// 부하 분산기(계획 67)
     LoadBalancer,
+    /// 백업(계획 68)
+    Backup,
+    /// 백업 저장소(계획 68)
+    BackupStore,
 }
 
 impl SubjectKind {
@@ -581,6 +602,8 @@ impl SubjectKind {
             Self::Sdn => "sdn",
             Self::Router => "router",
             Self::LoadBalancer => "load_balancer",
+            Self::Backup => "backup",
+            Self::BackupStore => "backup_store",
         }
     }
 }
@@ -1547,6 +1570,50 @@ mod tests {
         let old = r#"{"condition":{"kind":"node_offline"},"for_secs":60,"severity":"critical","targets":["ops"],"nodes":["n1"]}"#;
         let r: AlertRuleSpec = serde_json::from_str(old).unwrap();
         assert_eq!(serde_json::to_string(&r).unwrap(), old);
+    }
+
+    /// 계획 68: 백업 조건 둘은 리더가 평가하고(이벤트가 아님), 대상은 백업·저장소이며 노드·VM 거르기를 받지 않는다.
+    #[test]
+    fn backup_store_conditions() {
+        for (c, kind, subject) in [
+            (
+                AlertCondition::BackupVerifyFailed,
+                "backup_verify_failed",
+                SubjectKind::Backup,
+            ),
+            (
+                AlertCondition::BackupStoreUnavailable,
+                "backup_store_unavailable",
+                SubjectKind::BackupStore,
+            ),
+        ] {
+            let json = json!({ "kind": kind });
+            assert_eq!(serde_json::to_value(&c).unwrap(), json);
+            assert_eq!(serde_json::from_value::<AlertCondition>(json).unwrap(), c);
+            assert_eq!(c.kind(), kind);
+            assert!(c.is_backup_store());
+            assert!(!c.is_sdn());
+            assert!(!c.is_event());
+            assert_eq!(c.evaluator(), Evaluator::Leader);
+            assert_eq!(c.subject_kind(), subject);
+            let mut r = rule(c.clone());
+            r.for_secs = 600;
+            assert_eq!(r.validate(), Ok(()));
+            r.nodes = vec!["n1".into()];
+            assert_eq!(r.validate(), Err(AlertRuleError::NodesFilter(kind)));
+            r.nodes.clear();
+            r.vms = vec!["web".into()];
+            assert_eq!(r.validate(), Err(AlertRuleError::VmsFilter(kind)));
+        }
+        assert!(!AlertCondition::BackupJobFailed.is_backup_store());
+        for (k, s) in [
+            (SubjectKind::Backup, "backup"),
+            (SubjectKind::BackupStore, "backup_store"),
+        ] {
+            assert_eq!(k.as_str(), s);
+            assert_eq!(serde_json::to_value(k).unwrap(), s);
+            assert_eq!(serde_json::from_value::<SubjectKind>(json!(s)).unwrap(), k);
+        }
     }
 
     #[test]

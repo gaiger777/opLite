@@ -187,9 +187,9 @@ export function BackupTable({
     {
       id: "pool",
       header: t("backups.pool"),
-      value: (backup) => backup.spec.pool,
+      value: (backup) => backup.spec.pool ?? "",
       priority: 2,
-      cell: (backup) => backup.spec.pool,
+      cell: (backup) => backup.spec.pool ?? "",
     },
     {
       id: "job",

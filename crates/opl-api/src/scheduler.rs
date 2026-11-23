@@ -1115,6 +1115,7 @@ mod tests {
             checks: vec![],
             hotplug: None,
             firmware_caps: None,
+            backup_stores: Vec::new(),
         };
         n
     }

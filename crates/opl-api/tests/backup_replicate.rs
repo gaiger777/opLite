@@ -74,6 +74,8 @@ async fn ready_backup(env: &Env, name: &str, job: Option<Uuid>) -> Backup {
         origin: None,
         incremental: false,
         max_chain: None,
+        source: None,
+        store: None,
     };
     make_backup(env, name, spec, None).await
 }
@@ -117,6 +119,9 @@ async fn make_backup(env: &Env, name: &str, spec: BackupSpec, parent: Option<Uui
         parent,
         full_reason: None,
         tpm_state: false,
+        base: None,
+        store_stats: None,
+        verify: None,
     };
     let dir = source_dir(env, backup.id);
     std::fs::create_dir_all(&dir).unwrap();
@@ -457,6 +462,8 @@ async fn a_copy_of_a_vm_with_cloud_init_and_replication_is_checked() {
         origin: None,
         incremental: false,
         max_chain: None,
+        source: None,
+        store: None,
     };
     let source = make_backup(&local, "web-1", spec, None).await;
 

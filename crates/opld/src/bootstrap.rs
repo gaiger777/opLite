@@ -229,7 +229,10 @@ async fn record_node(
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
         let stored = status.topology.take();
+        // 저장소 닿음(계획 68)은 그 보고 루프가 고친다. 다시 등록할 때 지우지 않는다.
+        let stores = std::mem::take(&mut status.backup_stores);
         *status = NodeStatus {
+            backup_stores: stores,
             sdn: None,
             qos: if qos_ready { host.qos } else { status.qos },
             topology: match &host.topology {
@@ -929,7 +932,8 @@ pub(crate) mod tests {
                 "numa",
                 "sdn",
                 "sdn-routing",
-                "sdn-services"
+                "sdn-services",
+                "backup-store"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -975,7 +979,8 @@ pub(crate) mod tests {
                 "numa",
                 "sdn",
                 "sdn-routing",
-                "sdn-services"
+                "sdn-services",
+                "backup-store"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1040,7 +1045,8 @@ pub(crate) mod tests {
                 "numa",
                 "sdn",
                 "sdn-routing",
-                "sdn-services"
+                "sdn-services",
+                "backup-store"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1280,6 +1286,7 @@ pub(crate) mod tests {
                     "sdn".into(),
                     "sdn-routing".into(),
                     "sdn-services".into(),
+                    "backup-store".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

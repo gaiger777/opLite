@@ -76,11 +76,13 @@ pub enum Kind {
     LoadBalancer,
     /// 단순 → SDN 네트워크 옮기기(계획 67)
     NetworkMigration,
+    /// 백업 저장소(계획 68)
+    BackupStore,
 }
 
 impl Kind {
     /// 모든 종류(선언 순서). 종류마다 도는 시험과 권한 표가 쓴다.
-    pub const ALL: [Kind; 38] = [
+    pub const ALL: [Kind; 39] = [
         Kind::Vm,
         Kind::StoragePool,
         Kind::Volume,
@@ -119,6 +121,7 @@ impl Kind {
         Kind::FloatingIp,
         Kind::LoadBalancer,
         Kind::NetworkMigration,
+        Kind::BackupStore,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -161,6 +164,7 @@ impl Kind {
             Kind::FloatingIp => "floating-ip",
             Kind::LoadBalancer => "load-balancer",
             Kind::NetworkMigration => "network-migration",
+            Kind::BackupStore => "backup-store",
         }
     }
 }
@@ -233,7 +237,7 @@ mod tests {
         assert_eq!(set.len(), Kind::ALL.len());
         assert_eq!(
             Kind::ALL.last().map(|k| k.as_str()),
-            Some("network-migration"),
+            Some("backup-store"),
             "새 종류는 ALL 끝에도 더한다"
         );
     }

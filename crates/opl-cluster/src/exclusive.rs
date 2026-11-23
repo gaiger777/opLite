@@ -20,6 +20,8 @@ pub(crate) const SHARED_IP_KINDS: [Kind; 4] =
 /// 끝나지 않은 네트워크 옮기기의 원본 `migration-source`(한 네트워크에 하나)와 VM `migration-vm`(한 VM은 한 옮기기에만 —
 /// VM 목록은 스펙 `vms`와 상태 `vms[].vm`이라 `status`도 본다. `Finished`·`RolledBack`이면 값이 없다), 다리를 놓을 수 있는
 /// (`bridge`가 `false`가 아닌) 옮기기의 대상 `migration-target`(한 대상 네트워크에 다리 하나 — 리뷰 1 I1).
+/// 계획 68: 백업 저장소의 자리 `backup-store-target`(`pool:<풀 이름>` 또는 `s3:<host>/<버킷>/<접두사>` — 한 곳에 저장소
+/// 하나).
 pub(crate) fn exclusive_values(
     kind: Kind,
     spec: &Value,
@@ -123,6 +125,12 @@ pub(crate) fn exclusive_values(
                 _ => Vec::new(),
             };
         }
+        Kind::BackupStore => {
+            return opl_types::backup_store::store_target_key_value(spec)
+                .map(|k| ("backup-store-target", k))
+                .into_iter()
+                .collect();
+        }
         Kind::Vm => {}
         _ => return Vec::new(),
     }
@@ -171,6 +179,27 @@ mod tests {
             ]
         );
         assert!(values(Kind::Volume, &spec).is_empty());
+    }
+
+    /// 계획 68: 백업 저장소 하나는 한 곳(풀 또는 S3 버킷·접두사)에만 둔다.
+    #[test]
+    fn extracts_backup_store_targets() {
+        assert_eq!(
+            values(Kind::BackupStore, &json!({ "backend": { "pool": "bk" } })),
+            vec![("backup-store-target", "pool:bk".to_string())]
+        );
+        let s3 = json!({ "backend": { "s3": {
+            "endpoint": "https://S3.example.com:443", "bucket": "orbi-bk", "prefix": "a/",
+            "access_key_id": "k", "secret_access_key": "s"
+        } } });
+        assert_eq!(
+            values(Kind::BackupStore, &s3),
+            vec![(
+                "backup-store-target",
+                "s3:s3.example.com/orbi-bk/a".to_string()
+            )]
+        );
+        assert!(values(Kind::BackupStore, &json!({})).is_empty());
     }
 
     #[test]

@@ -4,6 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use opl_types::backup::BackupStatus;
 use opl_types::folder::{FolderKind, FolderSpec, FolderUsage, MAX_FOLDER_DEPTH};
 use opl_types::quota::{
     DirectUsage, QuotaNode, QuotaTree, disk_names, quota_ancestors, quota_exceeded,
@@ -294,6 +295,42 @@ pub(crate) struct QuotaCheck {
     after_direct: DirectUsage,
     /// VM을 이미 다 훑었다.
     pub(crate) scanned: bool,
+    /// 할당량 `backup_bytes`(계획 68)가 걸린 폴더가 있을 때 VM 쓰기·폴더 옮기기가 세는 백업
+    backups: Option<Backups>,
+}
+
+/// 할당량 `backup_bytes`(계획 68 §13)에 드는 백업. 있는 VM의 백업은 그 VM의 몫이라 VM을 옮기면 따라가고, 지운 VM의
+/// 백업은 백업한 때의 VM 폴더(`vm_spec.folder`)에 든다. 백업 바이트는 상태(Task가 씀)에만 있어 백업 쓰기는 막지 않는다
+/// — 넘었을 때 새 백업을 막는 것은 API다.
+#[derive(Default)]
+struct Backups {
+    /// (VM id, 백업한 때의 VM 폴더, 바이트)
+    list: Vec<(Uuid, Option<Uuid>, u64)>,
+    /// VM id → 그 VM 백업의 바이트 합
+    by_vm: HashMap<Uuid, u64>,
+    /// 훑기에서 만난 VM(그 VM의 백업은 VM 몫으로 셌다)
+    seen: HashSet<Uuid>,
+}
+
+/// 바이트가 있는 백업 전부(풀 수 없는 스펙은 뺀다)
+fn load_backups(objects: &Objects) -> Result<Backups, StoreError> {
+    let mut out = Backups::default();
+    let kind = Kind::Backup.as_str();
+    for item in objects.range((kind, 0u128)..=(kind, u128::MAX))? {
+        let (_, v) = item?;
+        let raw: RawResource = decode(v.value())?;
+        let bytes = BackupStatus::backup_bytes_value(&raw.status);
+        let Some(vm) = raw.spec["vm"].as_str().and_then(|s| s.parse().ok()) else {
+            continue;
+        };
+        if bytes == 0 {
+            continue;
+        }
+        out.list.push((vm, folder_of(&raw.spec["vm_spec"]), bytes));
+        let sum = out.by_vm.entry(vm).or_default();
+        *sum = sum.saturating_add(bytes);
+    }
+    Ok(out)
 }
 
 /// 네트워크 폴더에 드는 할당량 대상(계획 66 라우터·유동 IP, 계획 67 네트워크·부하 분산기)
@@ -366,6 +403,7 @@ pub(crate) fn quota_check(
         before_direct: DirectUsage::new(),
         after_direct: DirectUsage::new(),
         scanned: false,
+        backups: None,
     };
     let subset = |a: &[Uuid], b: &[Uuid]| a.iter().all(|x| b.contains(x));
     match kind {
@@ -433,6 +471,23 @@ pub(crate) fn quota_check(
         }
         _ => unreachable!(),
     }
+    if matches!(kind, Kind::Vm | Kind::Folder)
+        && check
+            .before
+            .values()
+            .chain(after.values())
+            .any(|n| n.quota.is_some_and(|q| q.backup_bytes.is_some()))
+    {
+        let backups = load_backups(objects)?;
+        let bytes = backups.by_vm.get(&id).copied().unwrap_or(0);
+        for this in [&mut check.old_this, &mut check.new_this]
+            .into_iter()
+            .flatten()
+        {
+            this.1.backup_bytes = this.1.backup_bytes.saturating_add(bytes);
+        }
+        check.backups = Some(backups);
+    }
     check.relevant = after
         .keys()
         .chain(check.before.keys())
@@ -456,6 +511,11 @@ impl QuotaCheck {
         id: Uuid,
         spec: &Value,
     ) -> Result<(), StoreError> {
+        if kind == Kind::Vm
+            && let Some(b) = self.backups.as_mut()
+        {
+            b.seen.insert(id);
+        }
         if self.this == Some(id) {
             return Ok(());
         }
@@ -468,7 +528,10 @@ impl QuotaCheck {
             self.after_direct.entry(folder).or_default().add(&usage);
             return Ok(());
         }
-        let before = vm_usage(objects, names, spec)?;
+        let mut before = vm_usage(objects, names, spec)?;
+        if let Some(b) = &self.backups {
+            before.backup_bytes = b.by_vm.get(&id).copied().unwrap_or(0);
+        }
         let mut after = before;
         if let Some((name, size)) = &self.resized {
             let grown = disk_names(spec).filter(|n| n == name).count() as u64;
@@ -505,6 +568,23 @@ impl QuotaCheck {
                     Uuid::from_u128(key.value().1),
                     &raw.spec,
                 )?;
+            }
+        }
+        // 지운 VM의 백업은 백업한 때의 VM 폴더에 든다(쓰기 앞뒤 같다).
+        if let Some(b) = &self.backups {
+            for (vm, folder, bytes) in &b.list {
+                let Some(f) = folder.filter(|f| self.relevant.contains(f)) else {
+                    continue;
+                };
+                if b.seen.contains(vm) || self.this == Some(*vm) {
+                    continue;
+                }
+                let usage = FolderUsage {
+                    backup_bytes: *bytes,
+                    ..FolderUsage::default()
+                };
+                self.before_direct.entry(f).or_default().add(&usage);
+                self.after_direct.entry(f).or_default().add(&usage);
             }
         }
         if let Some((Some(f), usage)) = self.old_this {
@@ -1083,6 +1163,110 @@ mod tests {
             sm.update(Kind::Folder, id(2), folder("a", "vm", Some(id(1)))),
             Ok(())
         );
+    }
+
+    /// 백업 `bid`(VM `vm`, 백업한 때의 VM 폴더 `folder`)를 만들고 상태에 바이트를 적는다(계획 68).
+    fn backup(sm: &mut Sm, bid: Uuid, vm: Uuid, folder: Option<Uuid>, status: Value) {
+        sm.create(
+            Kind::Backup,
+            bid,
+            json!({"vm": vm, "vm_name": "x", "pool": "bk", "vm_spec": {"folder": folder}}),
+        )
+        .unwrap();
+        sm.apply(Command::UpdateStatus {
+            kind: Kind::Backup,
+            id: bid,
+            status,
+        })
+        .unwrap();
+    }
+
+    fn pool_bytes(n: u64) -> Value {
+        json!({"phase": "ready", "disks": [{"name": "disk0", "file": "disk0.qcow2", "virtual_bytes": 1000, "stored_bytes": n}]})
+    }
+
+    /// 계획 68: 할당량 `backup_bytes`는 VM 폴더를 따라 백업을 센다 — VM을 옮기면 그 백업 몫도 옮겨지고, 지운 VM의 백업은
+    /// 백업한 때의 VM 폴더에 든다. 저장소 백업은 처음 쓴 바이트(`store_stats.new_bytes`)다.
+    #[test]
+    fn backup_bytes_follow_the_vm_folder() {
+        let mut sm = Sm::new();
+        sm.create(
+            Kind::Folder,
+            id(1),
+            quota_folder(None, json!({"backup_bytes": 100})),
+        )
+        .unwrap();
+        sm.folder(id(2), "plain", None).unwrap();
+        sm.create(Kind::Vm, id(10), vm(Some(id(1)))).unwrap();
+        sm.create(Kind::Vm, id(11), vm(Some(id(2)))).unwrap();
+        sm.create(Kind::Vm, id(12), vm(Some(id(2)))).unwrap();
+        sm.create(Kind::Vm, id(13), vm(Some(id(2)))).unwrap();
+        backup(&mut sm, id(30), id(10), Some(id(1)), pool_bytes(30));
+        // 지운 VM(99)의 백업은 백업한 때의 폴더(1)에 든다.
+        backup(&mut sm, id(31), id(99), Some(id(1)), pool_bytes(50));
+        // VM 11의 저장소 백업 — 백업한 때는 폴더 1이었어도 VM이 있으면 VM 폴더(2)를 따른다.
+        backup(
+            &mut sm,
+            id(32),
+            id(11),
+            Some(id(1)),
+            json!({"phase": "ready", "disks": [{"name": "disk0", "file": "disk0.fidx", "virtual_bytes": 1000, "stored_bytes": 999}], "store_stats": {"new_bytes": 30}}),
+        );
+        backup(&mut sm, id(33), id(12), None, pool_bytes(10));
+        // 30 + 50 + 30 = 110 > 100
+        assert_eq!(
+            exceeded(sm.update(Kind::Vm, id(11), vm(Some(id(1))))),
+            Some((id(1), QuotaDimension::BackupBytes, 100, 110))
+        );
+        // 30 + 50 + 10 = 90
+        assert_eq!(sm.update(Kind::Vm, id(12), vm(Some(id(1)))), Ok(()));
+        // 백업 없는 VM은 늘리지 않는다.
+        assert_eq!(sm.update(Kind::Vm, id(13), vm(Some(id(1)))), Ok(()));
+        // 폴더 옮기기도 하위 트리 VM의 백업을 가져온다.
+        sm.folder(id(3), "sub", None).unwrap();
+        assert_eq!(sm.update(Kind::Vm, id(11), vm(Some(id(3)))), Ok(()));
+        assert_eq!(
+            exceeded(sm.update(Kind::Folder, id(3), folder("sub", "vm", Some(id(1))))),
+            Some((id(1), QuotaDimension::BackupBytes, 100, 120))
+        );
+        // 백업을 지우면 자리가 난다.
+        sm.delete(Kind::Backup, id(31)).unwrap();
+        assert_eq!(
+            sm.update(Kind::Folder, id(3), folder("sub", "vm", Some(id(1)))),
+            Ok(())
+        );
+        // 넘었어도(백업 상태는 막지 않는다) 늘리지 않는 쓰기는 받는다.
+        sm.apply(Command::UpdateStatus {
+            kind: Kind::Backup,
+            id: id(30),
+            status: pool_bytes(500),
+        })
+        .unwrap();
+        assert_eq!(sm.create(Kind::Vm, id(14), vm(Some(id(1)))), Ok(()));
+    }
+
+    /// 계획 68: 백업 저장소 하나는 한 곳(풀이나 S3 버킷·접두사)에만 둔다.
+    #[test]
+    fn a_store_location_holds_one_store() {
+        let mut sm = Sm::new();
+        sm.create(Kind::BackupStore, id(1), json!({"backend": {"pool": "bk"}}))
+            .unwrap();
+        assert_eq!(
+            in_use(sm.create(Kind::BackupStore, id(2), json!({"backend": {"pool": "bk"}}))),
+            Some((
+                Kind::BackupStore,
+                "backup-store-target".into(),
+                "pool:bk".into(),
+                id(1)
+            ))
+        );
+        let s3 = |prefix: &str| {
+            json!({"backend": {"s3": {"endpoint": "https://s3.example.com", "bucket": "orbi-bk",
+                "prefix": prefix, "access_key_id": "k", "secret_access_key": "s"}}})
+        };
+        sm.create(Kind::BackupStore, id(2), s3("a")).unwrap();
+        assert!(in_use(sm.create(Kind::BackupStore, id(3), s3("a/"))).is_some());
+        assert_eq!(sm.create(Kind::BackupStore, id(3), s3("b")), Ok(()));
     }
 
     /// 상태를 apply 없이 바로 쓴다(규모 시험의 준비).

@@ -321,6 +321,7 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             | Kind::LoadBalancer
             | Kind::NetworkMigration
             | Kind::StoragePool
+            | Kind::BackupStore
             | Kind::Task
             | Kind::Folder => SystemRead,
             _ => ClusterRead,
@@ -331,7 +332,7 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             Kind::Volume => StorageAllocate,
             Kind::Backup => BackupCreate,
             Kind::BackupJob => BackupJob,
-            Kind::StoragePool => StorageConfig,
+            Kind::StoragePool | Kind::BackupStore => StorageConfig,
             Kind::Network
             | Kind::SecurityGroup
             | Kind::Router
@@ -348,6 +349,7 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             Kind::Volume => StorageAllocate,
             Kind::Backup => BackupRestore,
             Kind::BackupJob => BackupJob,
+            Kind::BackupStore => StorageConfig,
             _ => ClusterAdmin,
         },
     }

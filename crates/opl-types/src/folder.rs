@@ -108,6 +108,7 @@ impl FolderKind {
                 QuotaDimension::DiskBytes,
                 QuotaDimension::Vms,
                 QuotaDimension::DedicatedVcpus,
+                QuotaDimension::BackupBytes,
             ],
             FolderKind::Network => &[
                 QuotaDimension::Routers,
@@ -159,6 +160,11 @@ pub struct FolderQuota {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub load_balancers: Option<u64>,
+    /// 하위 트리 VM들의 백업이 차지한다고 보는 바이트(계획 68 §13, VM 폴더만): 저장소 백업은 처음 쓴 바이트, 풀 백업은
+    /// 파일 크기 합. 지운 VM의 백업은 백업한 때의 VM 폴더에 든다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub backup_bytes: Option<u64>,
 }
 
 impl FolderQuota {
@@ -196,6 +202,10 @@ pub struct FolderUsage {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub load_balancers: u64,
+    /// 백업 바이트(계획 68). 0이면 쓰지 않는다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub backup_bytes: u64,
 }
 
 fn is_zero(n: &u64) -> bool {
@@ -504,6 +514,53 @@ mod tests {
             FolderKind::of(Kind::NetworkMigration),
             Some(FolderKind::Network)
         );
+    }
+
+    /// 계획 68: 백업 바이트가 없으면 옛 할당량·사용량 JSON이 바이트까지 같고, 있으면 왕복한다. VM 폴더에만 걸리고, 백업
+    /// 저장소는 폴더에 들지 않는다(루트).
+    #[test]
+    fn backup_bytes_quota_is_written_only_when_set() {
+        let old = r#"{"vcpus":8,"dedicated_vcpus":4}"#;
+        let q: FolderQuota = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&q).unwrap(), old);
+        let old = r#"{"vcpus":2,"memory_mib":1024,"disk_bytes":10,"vms":1}"#;
+        let u: FolderUsage = serde_json::from_str(old).unwrap();
+        assert_eq!(serde_json::to_string(&u).unwrap(), old);
+        let q = FolderQuota {
+            backup_bytes: Some(2 << 40),
+            ..FolderQuota::default()
+        };
+        let json = serde_json::to_string(&q).unwrap();
+        assert_eq!(json, r#"{"backup_bytes":2199023255552}"#);
+        assert_eq!(serde_json::from_str::<FolderQuota>(&json).unwrap(), q);
+        let u = FolderUsage {
+            backup_bytes: 5,
+            ..FolderUsage::default()
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(
+            json,
+            r#"{"vcpus":0,"memory_mib":0,"disk_bytes":0,"vms":0,"backup_bytes":5}"#
+        );
+        assert_eq!(serde_json::from_str::<FolderUsage>(&json).unwrap(), u);
+        let id = Uuid::from_u128(1);
+        let f = FolderSpec {
+            quota: Some(q),
+            ..spec("a", FolderKind::Vm)
+        };
+        assert_eq!(f.validate(id), Ok(()));
+        let f = FolderSpec {
+            quota: Some(q),
+            ..spec("a", FolderKind::Network)
+        };
+        assert_eq!(
+            f.validate(id),
+            Err(FolderError::QuotaDimension(
+                QuotaDimension::BackupBytes,
+                "network"
+            ))
+        );
+        assert_eq!(FolderKind::of(Kind::BackupStore), None);
     }
 
     /// 계획 66: 새 차원이 없으면 옛 할당량·사용량 JSON이 바이트까지 같고, 있으면 왕복한다.

@@ -7,6 +7,7 @@ pub mod authz;
 pub mod authz_eval;
 pub mod backup;
 pub mod backup_job;
+pub mod backup_store;
 pub mod ceph;
 pub mod clock;
 pub mod cloud_init;

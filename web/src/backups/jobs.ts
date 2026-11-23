@@ -93,7 +93,7 @@ export function formOf(job: BackupJob): JobForm {
   const keep = job.spec.keep;
   return {
     name: job.name,
-    pool: job.spec.pool,
+    pool: job.spec.pool ?? "",
     target: "all" in vms ? "all" : "names" in vms ? "names" : "labels",
     names: "names" in vms ? vms.names.join(", ") : "",
     labels:

@@ -2239,6 +2239,7 @@ impl Worker {
             firmware_copies: vm.status.firmware_copies.clone(),
             firmware_epoch: vm.status.firmware_epoch,
             tpm_node: vm.status.tpm_node,
+            live_restore: vm.status.live_restore.clone(),
         };
         self.write_status(status, vm).await?;
         self.power_off = None;

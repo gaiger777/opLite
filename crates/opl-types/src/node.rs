@@ -172,6 +172,11 @@ pub struct NodeStatus {
     #[serde(default, skip_serializing_if = "is_false")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub qos: bool,
+    /// 이 노드가 쓸 수 있는 백업 저장소마다 닿는지(계획 68 §6 — 60초마다 `store.json` 읽기). 비면 쓰지 않는다(옛 노드·
+    /// 저장소 없음). 옛 노드는 무시한다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub backup_stores: Vec<crate::backup_store::NodeStoreState>,
 }
 
 /// 노드의 펌웨어 능력(계획 59). 스케줄러가 TPM·Secure Boot VM을 놓을 노드를 거른다.
@@ -408,6 +413,7 @@ pub const FEATURES: &[&str] = &[
     SDN,
     SDN_ROUTING,
     SDN_SERVICES,
+    BACKUP_STORE,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -489,6 +495,13 @@ pub const SDN_ROUTING: &str = "sdn-routing";
 /// `networks`·`load_balancers`, `NodeStatus.qos`·`NodeSdn.lockdown` 쓰기. 옛 노드는 이 칸·종류를 풀지 못하고(잠금은 중앙
 /// 에이전트가 단위 파일을 다시 쓰는 일이라 옛 에이전트가 되돌린다) 모든 노드가 알릴 때만 쓴다.
 pub const SDN_SERVICES: &str = "sdn-services";
+
+/// 백업 저장소 2(계획 68): 종류 `BackupStore`, `BackupSpec.store`·`source`, `BackupStatus`의 `base`·`store_stats`·`verify`,
+/// `BackupJobSpec.store`·`copy_to`, 복원의 `live`·`VmStatus.live_restore`, 저장소 Task 일곱, 경보 조건 `backup_verify_failed`·
+/// `backup_store_unavailable`, 할당량 `backup_bytes`, `NodeStatus.backup_stores`, 받는 쪽의 저장소 사본. 옛 노드는 이 칸·
+/// 종류를 풀지 못하고(`BackupSpec`·`BackupJobSpec`은 `deny_unknown_fields`) 저장소 백업을 읽는 코드(복원·GC·검증·지우기)가
+/// 모든 노드에 있어야 하므로 모든 노드가 알릴 때만 쓴다.
+pub const BACKUP_STORE: &str = "backup-store";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -977,7 +990,8 @@ mod tests {
                 "numa",
                 "sdn",
                 "sdn-routing",
-                "sdn-services"
+                "sdn-services",
+                "backup-store"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1196,7 +1210,32 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&SDN_SERVICES));
+        assert_eq!(FEATURES.last(), Some(&BACKUP_STORE));
+    }
+
+    /// 계획 68: 저장소 닿음 보고가 없으면(옛 노드) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.
+    #[test]
+    fn status_backup_stores_are_written_only_when_reported() {
+        let old = r#"{"online":true,"cpus":8,"memory_mib":16384,"hypervisor":"qemu-kvm","bridges":[],"arch":"x86_64","pools":{},"firewall":true,"features":["sdn"],"qos":true}"#;
+        let status: NodeStatus = serde_json::from_str(old).unwrap();
+        assert!(status.backup_stores.is_empty());
+        assert_eq!(serde_json::to_string(&status).unwrap(), old);
+        let store = uuid::Uuid::now_v7();
+        let status = NodeStatus {
+            backup_stores: vec![crate::backup_store::NodeStoreState {
+                store,
+                ok: false,
+                error: Some("connection refused".into()),
+                checked_at: 1_790_000_000,
+            }],
+            ..status
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(
+            json["backup_stores"],
+            serde_json::json!([{ "store": store, "ok": false, "error": "connection refused", "checked_at": 1_790_000_000u64 }])
+        );
+        assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
     }
 
     /// 계획 67: tc를 쓸 수 없으면(옛 노드) `qos`를 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

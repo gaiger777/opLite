@@ -145,6 +145,7 @@ async fn node_with(
         checks: vec![],
         hotplug: None,
         firmware_caps: None,
+        backup_stores: Vec::new(),
     };
     tweak(&mut node);
     env.cluster.create(&node).await.unwrap();
