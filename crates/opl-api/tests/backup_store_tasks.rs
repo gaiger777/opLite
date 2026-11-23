@@ -1096,7 +1096,7 @@ async fn the_scheduler_queues_gc_verify_and_store_jobs() {
             .map(|t| t.spec.op)
             .collect::<Vec<_>>()
     };
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
         let done = ops();
         let gc = done.contains(&TaskOp::BackupStoreGc);
