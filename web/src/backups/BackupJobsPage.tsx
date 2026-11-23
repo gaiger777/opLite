@@ -296,7 +296,8 @@ function JobDialog({
   const perms = usePermissions();
   const pools = backupPools(useList("storage-pool").data ?? []).map((p) => p.name);
   // 백업을 받을 수 있는 저장소(계획 68). 작업의 저장소는 이제 받을 수 없어도 고른 값으로 보인다.
-  const stores = (useBackupStores(perms.reads("backup-store")).data ?? [])
+  const storeList = useBackupStores(perms.reads("backup-store")).data ?? [];
+  const stores = storeList
     .filter((s) => s.status.phase === "ready" && !s.spec.read_only)
     .map((s) => s.name);
   const jobStore = job?.spec.store;
@@ -315,14 +316,29 @@ function JobDialog({
   const [picked, setForm] = useState<JobForm>(() =>
     job ? formOf(job) : emptyForm(pools[0] ?? "", stores[0] ?? ""),
   );
-  // 새 작업에서 아직 대상을 고르지 않았으면 지금 목록의 첫 대상(풀·저장소 목록이 대화상자를 연 뒤에 와도)
+  // 새 작업에서 아직 대상을 고르지 않았으면 지금 목록의 첫 대상(풀·저장소 목록이 대화상자를 연 뒤에 와도). 폼을 처음
+  // 바꿀 때 보이던 대상으로 굳힌다 — 그 뒤 바뀐 목록이 대상을 바꾸지 않는다(리뷰 2 N3).
   const fresh = emptyForm(pools[0] ?? "", stores[0] ?? "");
+  const withTarget = (f: JobForm): JobForm =>
+    !job && f.pool === "" && f.store === ""
+      ? { ...f, targetKind: fresh.targetKind, pool: fresh.pool, store: fresh.store }
+      : f;
+  // 원격 대상을 고를 때의 대상 종류. 그 뒤 대상 종류가 바뀌었으면(목록이 오기 전에 골랐다) 원격 풀을 원격 저장소로(또는
+  // 거꾸로) 보내지 않게 원격 대상을 다시 고른다(리뷰 2 N3).
+  const [replicateKind, setReplicateKind] = useState<JobForm["targetKind"]>();
+  const shown = withTarget(picked);
   const form =
-    !job && picked.pool === "" && picked.store === ""
-      ? { ...picked, targetKind: fresh.targetKind, pool: fresh.pool, store: fresh.store }
-      : picked;
+    replicateKind !== undefined && replicateKind !== shown.targetKind
+      ? { ...shown, replicatePool: "" }
+      : shown;
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const change = (part: Partial<JobForm>) => setForm((f) => ({ ...f, ...part }));
+  const change = (part: Partial<JobForm>) => setForm((f) => ({ ...withTarget(f), ...part }));
+  // 저장소 작업의 원격 대상은 그 저장소와 같은 키의 원격 저장소만(리뷰 2 N2)
+  const targetStore = storeList.find((s) => s.name === form.store);
+  const storeFingerprint =
+    form.targetKind === "store" && targetStore
+      ? (targetStore.spec.encryption?.fingerprint ?? null)
+      : undefined;
   const unchanged = job !== null && Object.keys(patchOf(job, specOf(form))).length === 0;
 
   async function submit() {
@@ -622,11 +638,13 @@ function JobDialog({
             : "backupJobs.replicateHint",
         )}
         kind={form.targetKind === "store" ? "store" : "pool"}
+        fingerprint={storeFingerprint}
         value={{ remote: form.replicateRemote, pool: form.replicatePool }}
         errors={{ pool: errors.replicatePool }}
-        onChange={(target) =>
-          change({ replicateRemote: target.remote, replicatePool: target.pool })
-        }
+        onChange={(target) => {
+          setReplicateKind(form.targetKind);
+          change({ replicateRemote: target.remote, replicatePool: target.pool });
+        }}
       />
       <div className="flex items-center gap-2">
         <Checkbox

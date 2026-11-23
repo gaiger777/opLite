@@ -468,6 +468,6 @@ it("explains why a parent backup cannot be deleted", async () => {
   const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-1?" });
   await userEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
   expect(await within(dialog).findByRole("alert")).toHaveTextContent(
-    "Incremental backups are based on this backup. Delete them first, starting from the newest.",
+    'This backup is still needed: backup "web-1" is the parent of 1 incremental backup(s); delete them first',
   );
 });

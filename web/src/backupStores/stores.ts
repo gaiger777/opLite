@@ -250,10 +250,10 @@ export function checkStoreStep(
       if (form.caPem.trim() !== "" && !validCaPem(form.caPem.trim())) {
         errors.caPem = "backupStores.errors.caPem";
       }
-      if (form.accessKeyId.trim() === "") {
+      if (!validAccessKeyId(form.accessKeyId.trim())) {
         errors.accessKeyId = "backupStores.errors.accessKeyId";
       }
-      if (form.secretKey === "") {
+      if (!validSecretKey(form.secretKey)) {
         errors.secretKey = "backupStores.errors.secretKey";
       }
     }
@@ -389,6 +389,16 @@ export function settingsFormOf(store: BackupStore): StoreSettingsForm {
   };
 }
 
+/** 서버 규칙(`printable`): 액세스 키 ID는 공백 없는 ASCII 1-128자(앞뒤 공백은 보낼 때 뺀다) */
+export function validAccessKeyId(id: string): boolean {
+  return /^[\x21-\x7e]{1,128}$/.test(id);
+}
+
+/** 비밀 키는 공백·줄바꿈 없는 ASCII 1-256자. 일부러 넣었을 수도 있는 끝 글자를 몰래 빼지 않고 오류로 보인다(리뷰 2 N4). */
+export function validSecretKey(secret: string): boolean {
+  return /^[\x21-\x7e]{1,256}$/.test(secret);
+}
+
 export function checkSettings(form: StoreSettingsForm, s3: boolean): Record<string, string> {
   const errors = checkStoreStep({ ...emptyStoreForm(), ...form }, "schedule", []);
   const streams = form.maxStreams.trim();
@@ -397,6 +407,13 @@ export function checkSettings(form: StoreSettingsForm, s3: boolean): Record<stri
   }
   if (s3 && (form.accessKeyId.trim() === "") !== (form.secretKey === "")) {
     errors.secretKey = "backupStores.errors.credentials";
+  } else if (s3 && form.secretKey !== "") {
+    if (!validAccessKeyId(form.accessKeyId.trim())) {
+      errors.accessKeyId = "backupStores.errors.accessKeyId";
+    }
+    if (!validSecretKey(form.secretKey)) {
+      errors.secretKey = "backupStores.errors.secretKey";
+    }
   }
   return errors;
 }

@@ -623,6 +623,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
             id="settings-access-key"
             label={t("backupStores.newAccessKeyId")}
             hint={t("backupStores.credentialsHint")}
+            error={errors.accessKeyId}
           >
             {(a11y) => (
               <Input

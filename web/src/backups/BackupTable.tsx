@@ -454,6 +454,10 @@ export function BackupTable({
             cell: (backup) => {
               const { phase, target } = rowInfo(backup);
               const others = targetsFor(backup);
+              // 라이브 복원(실패한 것도)이 바탕으로 쓰는 백업은 서버가 지우지 않는다(409 `backup_in_use`).
+              const liveInto = (vms.data ?? []).find(
+                (v) => v.status.live_restore?.backup === backup.id,
+              );
               return (
                 <>
                   {restore && (
@@ -523,6 +527,8 @@ export function BackupTable({
                       size="sm"
                       className="ml-2"
                       aria-label={t("backups.deleteNamed", { name: backup.name })}
+                      disabled={liveInto !== undefined}
+                      title={liveInto && t("backups.liveRestoreInUse", { vm: liveInto.name })}
                       onClick={(e) => {
                         opener.current = e.currentTarget;
                         setDeleting(backup);
@@ -788,6 +794,12 @@ function ReplicateDialog({
   const [target, setTarget] = useState<RemoteTarget>({ remote: "", pool: "" });
   const [errors, setErrors] = useState<{ remote?: string; pool?: string }>({});
   const toStore = backup.spec.store != null;
+  // 보내는 저장소의 키 지문(평문이면 null) — 키가 다른 원격 저장소는 받지 않는다(리뷰 2 N2). 모르면 가리지 않는다.
+  const perms = usePermissions();
+  const source = useBackupStores(toStore && perms.reads("backup-store")).data?.find(
+    (s) => s.name === backup.spec.store,
+  );
+  const fingerprint = source ? (source.spec.encryption?.fingerprint ?? null) : undefined;
 
   async function submit() {
     const found: { remote?: string; pool?: string } = {};
@@ -833,6 +845,7 @@ function ReplicateDialog({
         label={t("backups.remote")}
         none={t("backups.chooseRemote")}
         kind={toStore ? "store" : "pool"}
+        fingerprint={fingerprint}
         value={target}
         errors={errors}
         onChange={setTarget}

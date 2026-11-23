@@ -658,3 +658,105 @@ async fn store_backups_replicate_only_missing_chunks() {
         "{task}"
     );
 }
+
+/// 받는 저장소의 검증이 깨진 청크를 옮기는 동안(`quarantining`) 받기 완료는 커밋 구간에 들지 않고 기다린다(리뷰 2 N2 —
+/// 앞에는 쓸기만 보았다). 잠금이 풀리면 사본이 `ready`가 된다.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_received_copy_waits_while_verify_moves_bad_chunks() {
+    let s3 = FakeS3::start("bkt", "AKID", "secret-key-123").await;
+    let (tp, tr) = (s3.target(Some("prod")), s3.target(Some("dr")));
+    let remote = Env::start().await;
+    let server = remote.serve_tls().await;
+    let r = Remote {
+        env: remote,
+        server,
+    };
+    let local = Env::start().await;
+    let admin = local.admin().await;
+    create(
+        &admin,
+        json!({ "name": "prod", "spec": { "backend": s3_backend(&tp) } }),
+    )
+    .await;
+    let radmin = r.env.admin().await;
+    create(
+        &radmin,
+        json!({ "name": "dr", "spec": { "backend": s3_backend(&tr) } }),
+    )
+    .await;
+    let token = r.env.user("sender", "admin").await.token.unwrap();
+    let (status, body) = admin
+        .post(
+            "/remotes",
+            json!({ "name": "dr", "url": r.server.url, "ca_fingerprint": r.env.ca_fingerprint(), "token": token }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    store_backup(
+        &local,
+        "prod",
+        &tp,
+        None,
+        "web-1",
+        Uuid::now_v7(),
+        image(4, 2),
+    )
+    .await;
+    // 원격 저장소의 검증이 옮기기 잠금을 쥐고 있다.
+    let dr = r
+        .env
+        .cluster
+        .get_by_name::<BackupStoreSpec>("dr")
+        .unwrap()
+        .unwrap();
+    let mut held = dr.status.clone();
+    held.quarantining = Some(Uuid::now_v7());
+    r.env
+        .cluster
+        .update_status::<BackupStoreSpec>(dr.id, &held)
+        .await
+        .unwrap();
+    let (status, task) = admin
+        .post(
+            "/backups/web-1/actions/replicate",
+            json!({ "remote": "dr", "pool": "dr" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    // 받기는 끝까지 가지만 완료는 커밋 구간 밖에서 기다린다.
+    let copy = || {
+        r.env
+            .cluster
+            .list::<BackupSpec>()
+            .unwrap()
+            .1
+            .into_iter()
+            .next()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while copy().and_then(|c| c.status.received_at).is_none() {
+        assert!(std::time::Instant::now() < deadline, "nothing was received");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+    let waiting = copy().unwrap();
+    assert_eq!(waiting.status.phase, BackupPhase::Receiving, "{waiting:?}");
+    let s = r
+        .env
+        .cluster
+        .get::<BackupStoreSpec>(dr.id)
+        .unwrap()
+        .unwrap();
+    assert!(s.status.committing.is_empty(), "{:?}", s.status);
+    // 잠금이 풀리면 끝난다.
+    let mut free = s.status.clone();
+    free.quarantining = None;
+    r.env
+        .cluster
+        .update_status::<BackupStoreSpec>(dr.id, &free)
+        .await
+        .unwrap();
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    assert_eq!(copy().unwrap().status.phase, BackupPhase::Ready);
+}

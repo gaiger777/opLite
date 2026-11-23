@@ -531,6 +531,18 @@ async fn gc_removes_only_old_unreferenced_chunks_and_records_usage() {
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
         .unwrap();
 
+    // 이 클러스터가 주인인 오래된 하트비트
+    let (cluster, fp) = opl_api::stores::this_cluster(&env.cluster).unwrap();
+    store
+        .write_owner(&opl_store::format::OwnerFile {
+            cluster,
+            ca_fingerprint: fp,
+            store_resource: st.id,
+            heartbeat: 1,
+        })
+        .await
+        .unwrap();
+
     let st_id = get_store(&env, "st").id;
     succeeded(&task(&env, TaskOp::BackupStoreGc, st_id).await);
     assert!(!store.has_chunk(&old.id).await.unwrap());
@@ -558,8 +570,79 @@ async fn gc_removes_only_old_unreferenced_chunks_and_records_usage() {
     );
     // 남은 백업은 그대로 복원된다
     assert_eq!(restore(&env, "b2", "web2").await, image(&[5, 8]));
-    // 주인 하트비트
-    assert!(store.read_owner().await.unwrap().is_some());
+    // 주인 하트비트(아직 이 클러스터가 주인이므로 새로 쓴다)
+    assert!(store.read_owner().await.unwrap().unwrap().heartbeat > 1);
+}
+
+/// 쓸기 동안 다른 클러스터가 (`--force`로) 넘겨받으면 GC가 끝날 때 주인 표식을 되돌리지 않고 저장소를 `failed`로 멈춘다
+/// (리뷰 2 N1 — 앞에는 GC 끝의 하트비트가 넘겨받기를 덮어 두 클러스터가 같은 저장소에 썼다). 가짜 S3를 느리게 하고 한 쪽에
+/// 객체 하나씩 나열해 쓸기를 몇 초 걸리게 한다.
+#[tokio::test]
+async fn a_take_over_during_the_sweep_is_not_undone() {
+    let env = Env::start().await;
+    let s3 = opl_store::fake_s3::FakeS3::start("bk", "AKID", "secret-key").await;
+    let target = s3.target(Some("st"));
+    let spec: BackupStoreSpec = serde_json::from_value(json!({
+        "backend": {"s3": serde_json::to_value(&target).unwrap()}
+    }))
+    .unwrap();
+    let res: BackupStore = Resource::new("st", spec);
+    env.cluster.create(&res).await.unwrap();
+    succeeded(&task(&env, TaskOp::BackupStoreInit, res.id).await);
+    let backend = Arc::new(opl_store::backend::s3::S3Backend::new(&target, 4).unwrap());
+    let store = Store::open(backend, None).await.unwrap();
+    for i in 0..12u8 {
+        store
+            .put_chunk(&store.encode_chunk(&[i; 100]))
+            .await
+            .unwrap();
+    }
+    s3.set_page_size(1);
+    s3.set_delay(Duration::from_millis(250));
+    let mut t: opl_types::task::Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::BackupStoreGc,
+            target: res.id,
+            node: env.node,
+        },
+    );
+    t.name = t.id.to_string();
+    env.cluster.create(&t).await.unwrap();
+    let phase = || get_store(&env, "st").status.gc.map(|g| g.phase);
+    for _ in 0..1500 {
+        if phase() == Some(opl_types::backup_store::GcPhase::Sweep) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(phase(), Some(opl_types::backup_store::GcPhase::Sweep));
+    // 쓸기 잠금 뒤의 주인 확인은 지났고 쓸기는 아직이다.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(get_store(&env, "st").status.sweeping);
+    store
+        .write_owner(&opl_store::format::OwnerFile {
+            cluster: "dr".into(),
+            ca_fingerprint: "sha256:dd".into(),
+            store_resource: Uuid::now_v7(),
+            heartbeat: 1,
+        })
+        .await
+        .unwrap();
+    let done = env.admin().await.wait_task(&json!({"id": t.id})).await;
+    s3.set_delay(Duration::ZERO);
+    assert_eq!(done["status"]["state"], "failed", "{done}");
+    assert!(
+        done["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("taken over by cluster \"dr\""),
+        "{done}"
+    );
+    assert_eq!(store.read_owner().await.unwrap().unwrap().cluster, "dr");
+    let s = get_store(&env, "st").status;
+    assert_eq!(s.phase, StorePhase::Failed, "{s:?}");
+    assert!(!s.sweeping && s.gc.is_none(), "{s:?}");
 }
 
 #[tokio::test]
@@ -714,7 +797,7 @@ async fn an_incremental_reuploads_base_chunks_that_verify_moved_aside() {
     };
     succeeded(&task(&env, verify, get_store(&env, "st").id).await);
     assert!(!path.exists(), "the bad chunk was moved aside");
-    assert!(!get_store(&env, "st").status.quarantining);
+    assert_eq!(get_store(&env, "st").status.quarantining, None);
     // f2를 base로 한 증분: 청크 0만 바뀌었다 — 청크 1은 base 인덱스에서 옮기지만 `bad/`에 있으므로 다시 올린다.
     let mut next = img.clone();
     next[10..20].fill(9);
@@ -728,6 +811,53 @@ async fn an_incremental_reuploads_base_chunks_that_verify_moved_aside() {
         "the chunk taken from the base was uploaded again"
     );
     assert_eq!(restore(&env, "i1", "web2").await, next);
+}
+
+/// 검증이 앞서 놓지 못한 제 옮기기 잠금(`quarantining`)을 다시 쥐고 끝낸다(리뷰 2 N3 — 앞에는 쥔 Task를 적지 않아 제
+/// 잠금을 끝없이 기다렸고 그동안 모든 커밋이 막혔다).
+#[tokio::test]
+async fn verify_takes_back_its_own_quarantine_lock() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env, "local", false).await;
+    create_pool(&env, "bk", true).await;
+    let st = seed_store(&env, "st").await;
+    create_volume(&env, &admin, "root", 8 * MIB).await;
+    let vm = create_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "start").await);
+    let img = image(&[31, 32]);
+    env.hv.set_fleece_images(vm, vec![img.clone()]);
+    succeeded(&store_backup(&env, "web", "st", "b1", false).await);
+    let store = open(&env, &st).await;
+    let id = store.chunk_id(&img[CHUNK..]);
+    let path = store_dir(&env, &st).join(opl_store::format::chunk_key(&id));
+    let mut bytes = std::fs::read(&path).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    let mut t: opl_types::task::Task = Resource::new(
+        "",
+        TaskSpec {
+            op: TaskOp::BackupStoreVerify {
+                backups: vec![backup(&env, "b1").id],
+            },
+            target: st.id,
+            node: env.node,
+        },
+    );
+    t.name = t.id.to_string();
+    // 이 Task가 쥔 채 남은 잠금
+    let mut s = get_store(&env, "st");
+    s.status.quarantining = Some(t.id);
+    env.cluster
+        .update_status::<BackupStoreSpec>(s.id, &s.status)
+        .await
+        .unwrap();
+    env.cluster.create(&t).await.unwrap();
+    let done = admin.wait_task(&json!({"id": t.id})).await;
+    succeeded(&done);
+    assert!(!path.exists(), "the bad chunk was moved aside");
+    assert_eq!(get_store(&env, "st").status.quarantining, None);
 }
 
 #[tokio::test]

@@ -256,3 +256,33 @@ it("patches only the changed settings", () => {
     s3_credentials: { access_key_id: "AK", secret_access_key: "SK" },
   });
 });
+
+// 리뷰 2(N4): 서버 `printable`처럼 공백·줄바꿈이 든 자격 증명은 만들기 전에(설정에서도) 막는다. 비밀 키는 몰래 다듬지 않는다.
+it("refuses S3 credentials with spaces or line breaks before sending them", () => {
+  const s3 = {
+    ...emptyStoreForm("bk"),
+    name: "dr",
+    backend: "s3" as const,
+    endpoint: "https://s3.example.com",
+    bucket: "bkt",
+    accessKeyId: " AK ",
+    secretKey: "SK\n",
+  };
+  expect(checkStoreStep(s3, "backend", [])).toEqual({
+    secretKey: "backupStores.errors.secretKey",
+  });
+  expect(
+    checkStoreStep({ ...s3, accessKeyId: "A K", secretKey: "x".repeat(257) }, "backend", []),
+  ).toEqual({
+    accessKeyId: "backupStores.errors.accessKeyId",
+    secretKey: "backupStores.errors.secretKey",
+  });
+  expect(checkStoreStep({ ...s3, secretKey: "x".repeat(256) }, "backend", [])).toEqual({});
+  const form = settingsFormOf(backupStore("st", 1));
+  expect(checkSettings({ ...form, accessKeyId: "AK", secretKey: "SK " }, true)).toEqual({
+    secretKey: "backupStores.errors.secretKey",
+  });
+  expect(checkSettings({ ...form, accessKeyId: "A\tK", secretKey: "SK" }, true)).toEqual({
+    accessKeyId: "backupStores.errors.accessKeyId",
+  });
+});

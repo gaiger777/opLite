@@ -832,13 +832,19 @@ const MAX_CHUNK_OBJECT: u64 = (4 << 20) + 64;
 /// 받는 블롭(UEFI 변수·TPM 상태·config)의 최대 크기
 const MAX_BLOB_OBJECT: u64 = (64 << 20) + 64;
 /// 가상 크기 `virtual_bytes`인 디스크 인덱스(`disk{i}.fidx`)의 최대 크기: 청크마다 id 32바이트에 머리·꼬리 몫 4 KiB
+/// (블롭 한도보다 작지 않게). `virtual_bytes`는 보내는 쪽 매니페스트의 값이므로 S3 백엔드가 한 객체로 읽는 한도
+/// [`MAX_INDEX_OBJECT`]를 넘지 않는다(리뷰 2 N5 — 터무니없는 크기로 본문을 메모리에 끝없이 받지 않는다).
 fn index_limit(virtual_bytes: u64) -> u64 {
     let chunks =
         opl_types::backup_store::chunk_count(virtual_bytes, opl_types::backup_store::CHUNK_BYTES);
-    MAX_BLOB_OBJECT.max(4096 + 32 * chunks)
+    MAX_BLOB_OBJECT
+        .max(4096u64.saturating_add(chunks.saturating_mul(32)))
+        .min(MAX_INDEX_OBJECT)
 }
+/// 받는 인덱스의 최대 크기(1 GiB — S3 백엔드가 읽는 객체 한도, 4 MiB 청크로 128 TiB 디스크)
+const MAX_INDEX_OBJECT: u64 = 1 << 30;
 
-/// 커밋 구간에 들어가려고 GC 쓸기가 끝나기를 기다리는 시간
+/// 커밋 구간에 들어가려고 GC 쓸기(또는 검증의 옮기기)가 끝나기를 기다리는 시간
 const COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// 이 노드에서 저장소를 연다. 이 노드가 쓸 수 없으면 409 `store_not_on_node`, 닿지 않으면 503 `store_unavailable`.
@@ -1301,7 +1307,8 @@ async fn complete_store(state: &AppState, backup: &Backup) -> Result<(), ApiErro
         return Err(e);
     }
     record_received(state, id).await?;
-    // 커밋 구간: 쓸기 중이면 기다린다.
+    // 커밋 구간: 쓸기 중이거나 검증이 깨진 청크를 옮기는 중이면 기다린다(리뷰 2 N2 — 옮기는 사이에 "있음"으로 본 청크를
+    // 가리키는 매니페스트를 쓰지 않는다. 옮긴 뒤면 없는 청크로 보여 보내는 쪽이 다시 보낸다).
     let deadline = tokio::time::Instant::now() + COMMIT_WAIT;
     loop {
         let mut entered = false;
@@ -1310,7 +1317,7 @@ async fn complete_store(state: &AppState, backup: &Backup) -> Result<(), ApiErro
                 entered = true;
                 return None;
             }
-            if s.sweeping {
+            if s.sweeping || s.quarantining.is_some() {
                 return None;
             }
             s.committing.push(id);
@@ -1324,7 +1331,9 @@ async fn complete_store(state: &AppState, backup: &Backup) -> Result<(), ApiErro
         if tokio::time::Instant::now() >= deadline {
             return Err(ApiError::conflict(
                 "store_busy",
-                format!("backup store {name:?} is being garbage-collected; try again"),
+                format!(
+                    "backup store {name:?} is busy (garbage collection or verification); try again"
+                ),
             ));
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1415,6 +1424,9 @@ mod tests {
         let big = 16u64 << 40;
         let ix = 32 * (big / opl_types::backup_store::CHUNK_BYTES);
         assert!(index_limit(big) > ix && ix > MAX_BLOB_OBJECT);
+        // 보내는 쪽이 터무니없는 크기를 대도 1 GiB를 넘지 않는다(리뷰 2 N5)
+        assert_eq!(index_limit(u64::MAX), MAX_INDEX_OBJECT);
+        assert_eq!(index_limit(1 << 60), MAX_INDEX_OBJECT);
     }
 
     #[test]

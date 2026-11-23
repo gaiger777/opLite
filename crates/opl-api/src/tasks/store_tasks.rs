@@ -155,24 +155,29 @@ fn writing(b: &Backup, store: &str) -> bool {
     b.spec.target() == Ok(BackupTarget::Store(store)) && b.status.phase == BackupPhase::Pending
 }
 
+/// 다른 클러스터가 넘겨받은 저장소를 `failed`로 멈추고 그 오류 글을 돌려준다.
+async fn taken_over(ctx: &Ctx, store: Uuid, by: &str) -> String {
+    let error = format!("store was taken over by cluster {by:?}");
+    let _ = update_store(ctx, store, |s| {
+        s.phase = StorePhase::Failed;
+        s.error = Some(error.clone());
+        Ok(Step::Write)
+    })
+    .await;
+    error
+}
+
 /// 저장소 GC(§10.2): 표식과 T0 → Raft에 `gc`(L) → 기다림 집합 W → 모든 인덱스 표시 → W가 끝나기를 기다림(그새 생긴
 /// 인덱스도 표시) → `committing`이 빌 때 쓸기 잠금(`sweeping`, `sweep_epoch` + 1) → 늦은 표시 → 쓸기 → 결과·사용량·주인
-/// 하트비트. 주인이 이 클러스터가 아니면(넘겨받음) 저장소를 `failed`로 멈춘다.
+/// 하트비트(아직 주인일 때만). 시작·쓸기 잠금 뒤·쓸기 뒤에 주인이 이 클러스터가 아니면(넘겨받음) 저장소를 `failed`로 멈춘다.
 pub(super) async fn gc(ctx: &Ctx, task: &Task) -> Result<Option<String>, String> {
     let (res, store) = ready_store(ctx, task.spec.target, true).await?;
     let fail = |e: StoreError| stores::store_error(&res.name, e);
-    let (cluster, fp) = this_cluster(ctx)?;
+    let (_, fp) = this_cluster(ctx)?;
     if let Some(o) = store.read_owner().await.map_err(fail)?
         && (o.ca_fingerprint != fp || o.store_resource != res.id)
     {
-        let error = format!("store was taken over by cluster {:?}", o.cluster);
-        let _ = update_store(ctx, res.id, |s| {
-            s.phase = StorePhase::Failed;
-            s.error = Some(error.clone());
-            Ok(Step::Write)
-        })
-        .await;
-        return Err(error);
+        return Err(taken_over(ctx, res.id, &o.cluster).await);
     }
     let start = gc::start(&store, task.id).await.map_err(fail)?;
     let started_at = now_secs();
@@ -266,30 +271,31 @@ pub(super) async fn gc(ctx: &Ctx, task: &Task) -> Result<Option<String>, String>
     if let Some(o) = store.read_owner().await.map_err(fail)?
         && (o.ca_fingerprint != fp || o.store_resource != res.id)
     {
-        let error = format!("store was taken over by cluster {:?}", o.cluster);
-        let _ = update_store(ctx, res.id, |s| {
-            s.phase = StorePhase::Failed;
-            s.error = Some(error.clone());
-            Ok(Step::Write)
-        })
-        .await;
+        let error = taken_over(ctx, res.id, &o.cluster).await;
         return Err(format!("{error}; nothing was removed"));
     }
     // 늦은 표시: 표시 뒤에 생긴 인덱스
     marker.mark(&store).await.map_err(fail)?;
     let stats = gc::sweep(&store, &marker, &start).await.map_err(fail)?;
     let finished_at = now_secs();
-    let owner = OwnerFile {
-        cluster,
-        ca_fingerprint: fp,
-        store_resource: res.id,
-        heartbeat: finished_at,
-    };
-    if let Err(e) = store.write_owner(&owner).await {
-        tracing::warn!(store = %res.name, error = %e, "cannot write the owner heartbeat");
-    }
     if let Err(e) = gc::finish(&store, &start).await {
         tracing::warn!(store = %res.name, error = %e, "cannot remove the GC marker");
+    }
+    // 쓸기 뒤 주인을 다시 본다(리뷰 2 N1): 쓸기 동안(`--force`로) 넘겨받혔으면 표식을 덮지 않고(넘겨받기를 되돌리지
+    // 않는다) 저장소를 멈춰 알린다. 아직 이 클러스터면 하트비트만 새로 쓴다(`refresh_heartbeat` — 주인이 아니면 쓰지 않음).
+    match store.read_owner().await {
+        Ok(Some(o)) if o.ca_fingerprint != fp || o.store_resource != res.id => {
+            let error = taken_over(ctx, res.id, &o.cluster).await;
+            return Err(format!("{error} while this GC was sweeping"));
+        }
+        Ok(_) => {
+            if let Err(e) = store.refresh_heartbeat(&fp, res.id, finished_at, 0).await {
+                tracing::warn!(store = %res.name, error = %e, "cannot write the owner heartbeat");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(store = %res.name, error = %e, "cannot read the owner after the sweep")
+        }
     }
     let usage = StoreUsage {
         snapshots: marker.snapshots,
@@ -381,21 +387,30 @@ async fn record_verify(ctx: &Ctx, id: Uuid, verify: &BackupVerify) -> Result<(),
 /// 찾은 깨진 청크를 `bad/`로 옮긴다(리뷰 1 I5): 커밋 구간이 빌 때 `quarantining`을 쥐고(그동안 새 커밋은 기다린다) 옮긴 뒤
 /// 놓는다. 그 뒤의 커밋은 `bad/`의 id 가운데 건너뛰었거나 base에서 옮긴 것을 다시 올린다 — 옮기는 사이에 "있음"으로 본
 /// 청크를 가리키는 매니페스트가 생기지 않는다.
-async fn quarantine(ctx: &Ctx, store: Uuid, verifier: &mut Verifier<'_>) -> Result<u64, String> {
+async fn quarantine(
+    ctx: &Ctx,
+    task: Uuid,
+    store: Uuid,
+    verifier: &mut Verifier<'_>,
+) -> Result<u64, String> {
     update_store(ctx, store, |s| {
-        if s.quarantining || !s.committing.is_empty() {
+        // 이 Task가 앞서 놓지 못한 잠금이면 그대로 다시 쥔다(리뷰 2 N3 — 제 잠금을 끝없이 기다리지 않는다).
+        if s.quarantining == Some(task) {
+            return Ok(Step::Skip);
+        }
+        if s.quarantining.is_some() || !s.committing.is_empty() {
             return Ok(Step::Wait);
         }
-        s.quarantining = true;
+        s.quarantining = Some(task);
         Ok(Step::Write)
     })
     .await?;
     let moved = verifier.quarantine().await.map_err(|e| e.to_string());
     let released = update_store(ctx, store, |s| {
-        if !s.quarantining {
+        if s.quarantining != Some(task) {
             return Ok(Step::Skip);
         }
-        s.quarantining = false;
+        s.quarantining = None;
         Ok(Step::Write)
     })
     .await;
@@ -458,7 +473,7 @@ pub(super) async fn verify(
             .await
             .map_err(|e| stores::store_error(&res.name, e))?;
         if verifier.has_pending() {
-            quarantine(ctx, res.id, &mut verifier)
+            quarantine(ctx, task.id, res.id, &mut verifier)
                 .await
                 .map_err(|e| format!("cannot move bad chunks aside: {e}"))?;
         }

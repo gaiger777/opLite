@@ -354,3 +354,39 @@ it("keeps showing a job's copy target that can no longer take backups", async ()
   const dialog = await screen.findByRole("dialog", { name: "Edit tiered" });
   await waitFor(() => expect(within(dialog).getByLabelText("Copy store")).toHaveValue("ro"));
 });
+
+// 리뷰 2(N1): `backup_in_use`는 부모·만드는 중인 증분의 base·라이브 복원의 세 뜻이라 서버의 설명을 보인다. 라이브 복원이
+// 쓰는 백업은 지우기 단추부터 막는다.
+it("blocks deleting a backup that a live restore uses and shows why the server refused", async () => {
+  mockLists({ vm: [restoring], node: [NODE], backup: [base, inStore] });
+  stores([ST]);
+  renderPage(<BackupsPage />);
+  const del = await screen.findByRole("button", { name: "Delete backup web-s1" });
+  expect(del).toBeDisabled();
+  expect(del).toHaveAttribute(
+    "title",
+    "VM web is being live-restored from this backup. Finish or cancel the live restore first.",
+  );
+  expect(screen.getByRole("button", { name: "Delete backup web-s2" })).toBeEnabled();
+});
+
+it("shows the server's reason when a backup is still in use", async () => {
+  const user = userEvent.setup();
+  mockLists({ vm: [web], node: [NODE], backup: [base] });
+  stores([ST]);
+  const reason =
+    'backup "web-s1" is being live-restored into VM "web2"; finish or cancel that first';
+  server.use(
+    http.delete(apiUrl(`/backups/${base.id}`), () =>
+      HttpResponse.json({ code: "backup_in_use", message: reason }, { status: 409 }),
+    ),
+  );
+  renderPage(<BackupsPage />);
+  await user.click(await screen.findByRole("button", { name: "Delete backup web-s1" }));
+  const dialog = await screen.findByRole("alertdialog", { name: "Delete backup web-s1?" });
+  await user.click(within(dialog).getByRole("button", { name: "Delete" }));
+  expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+    `This backup is still needed: ${reason}`,
+  );
+  expect(within(dialog).getByRole("alert")).not.toHaveTextContent("Incremental backups");
+});

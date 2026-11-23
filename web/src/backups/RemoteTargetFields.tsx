@@ -22,6 +22,8 @@ export interface RemoteTarget {
  *
  * `kind`가 `store`면(저장소 백업의 사본 — 계획 68 §12.4) 풀 대신 원격의 쓸 수 있는 백업 저장소(`GET
  * /backup-stores`, 준비됐고 읽기 전용이 아닌 것)를 고른다. 서버는 같은 `pool` 칸을 원격 저장소 이름으로 읽는다.
+ * `fingerprint`(보내는 저장소의 키 지문, 평문이면 null)를 주면 키가 다른 원격 저장소는 고를 수 없게 보인다 — 받는 쪽은
+ * 같은 키이거나 둘 다 평문이어야 받는다(409 `store_key_mismatch`, 리뷰 2 N2). 모르면(undefined) 가리지 않는다.
  */
 export function RemoteTargetFields({
   id,
@@ -32,12 +34,14 @@ export function RemoteTargetFields({
   errors,
   onChange,
   kind = "pool",
+  fingerprint,
 }: {
   id: string;
   label: string;
   none: string;
   hint?: string;
   kind?: "pool" | "store";
+  fingerprint?: string | null;
   value: RemoteTarget;
   errors: { remote?: string; pool?: string };
   onChange(value: RemoteTarget): void;
@@ -63,16 +67,26 @@ export function RemoteTargetFields({
     select: (items) =>
       items
         .filter((s) => s.status.phase === "ready" && !s.spec.read_only)
-        .map((s) => s.name)
-        .sort((a, b) => a.localeCompare(b)),
+        .sort((a, b) => a.name.localeCompare(b.name)),
     enabled: value.remote !== "" && kind === "store",
   });
   const targets = kind === "store" ? stores : pools;
+  const targetNames = (kind === "store" ? stores.data?.map((s) => s.name) : pools.data) ?? [];
+  // 키가 다른 원격 저장소(보내는 저장소의 지문을 알 때만)
+  const otherKey = new Set(
+    kind === "store" && fingerprint !== undefined
+      ? (stores.data ?? [])
+          .filter((s) => (s.spec.encryption?.fingerprint ?? null) !== fingerprint)
+          .map((s) => s.name)
+      : [],
+  );
+  const noSameKey =
+    targets.isSuccess && targetNames.length > 0 && targetNames.every((n) => otherKey.has(n));
   const remoteNames = [...(remotes.data ?? [])];
   if (value.remote !== "" && !remoteNames.includes(value.remote)) {
     remoteNames.unshift(value.remote);
   }
-  const poolNames = [...(targets.data ?? [])];
+  const poolNames = [...targetNames];
   if (value.pool !== "" && !poolNames.includes(value.pool)) {
     poolNames.unshift(value.pool);
   }
@@ -124,17 +138,20 @@ export function RemoteTargetFields({
                   {t(kind === "store" ? "backups.chooseStore" : "backups.choosePool")}
                 </NativeSelectOption>
                 {poolNames.map((name) => (
-                  <NativeSelectOption key={name} value={name}>
-                    {name}
+                  <NativeSelectOption key={name} value={name} disabled={otherKey.has(name)}>
+                    {otherKey.has(name) ? t("backups.otherKeyStore", { name }) : name}
                   </NativeSelectOption>
                 ))}
               </NativeSelect>
             )}
           </Field>
-          {targets.isSuccess && targets.data.length === 0 && (
+          {targets.isSuccess && targetNames.length === 0 && (
             <p className="text-sm text-muted-foreground">
               {t(kind === "store" ? "backups.noRemoteStores" : "backups.noRemotePools")}
             </p>
+          )}
+          {noSameKey && (
+            <p className="text-sm text-muted-foreground">{t("backups.noSameKeyStores")}</p>
           )}
         </>
       )}

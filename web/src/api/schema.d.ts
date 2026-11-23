@@ -4654,10 +4654,11 @@ export interface components {
             /** @default initializing */
             phase: components["schemas"]["StorePhase"];
             /**
-             * @description 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
-             *     구간에 새로 들지 않는다)
+             * Format: uuid
+             * @description 검증이 깨진 청크를 `bad/`로 옮기는 중이면 그 검증 Task(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 쥐고
+             *     그동안 커밋 구간에 새로 들지 않는다. 쥔 Task를 적어 같은 Task는 다시 쥐고 janitor는 그 Task가 끝나면 푼다 — 리뷰 2 N3)
              */
-            quarantining?: boolean;
+            quarantining?: string;
             /**
              * Format: uuid
              * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
@@ -7777,10 +7778,11 @@ export interface components {
                     /** @default initializing */
                     phase: components["schemas"]["StorePhase"];
                     /**
-                     * @description 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
-                     *     구간에 새로 들지 않는다)
+                     * Format: uuid
+                     * @description 검증이 깨진 청크를 `bad/`로 옮기는 중이면 그 검증 Task(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 쥐고
+                     *     그동안 커밋 구간에 새로 들지 않는다. 쥔 Task를 적어 같은 Task는 다시 쥐고 janitor는 그 Task가 끝나면 푼다 — 리뷰 2 N3)
                      */
-                    quarantining?: boolean;
+                    quarantining?: string;
                     /**
                      * Format: uuid
                      * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
@@ -11183,10 +11185,11 @@ export interface components {
                 /** @default initializing */
                 phase: components["schemas"]["StorePhase"];
                 /**
-                 * @description 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
-                 *     구간에 새로 들지 않는다)
+                 * Format: uuid
+                 * @description 검증이 깨진 청크를 `bad/`로 옮기는 중이면 그 검증 Task(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 쥐고
+                 *     그동안 커밋 구간에 새로 들지 않는다. 쥔 Task를 적어 같은 Task는 다시 쥐고 janitor는 그 Task가 끝나면 푼다 — 리뷰 2 N3)
                  */
-                quarantining?: boolean;
+                quarantining?: string;
                 /**
                  * Format: uuid
                  * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.

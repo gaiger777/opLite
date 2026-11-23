@@ -136,7 +136,7 @@ async fn begin_commit(ctx: &Ctx, store: Uuid, backup: Uuid) -> Result<BackupStor
     update_store(ctx, store, |s| {
         if s.committing.contains(&backup) {
             Ok(Step::Skip)
-        } else if s.sweeping || s.quarantining {
+        } else if s.sweeping || s.quarantining.is_some() {
             Ok(Step::Wait)
         } else {
             s.committing.push(backup);
@@ -1674,8 +1674,8 @@ pub(crate) fn filling(tasks: &[Task], backups: &[Backup], backup: &Backup) -> bo
 pub(crate) const RECEIVE_COMMIT_STALE: u64 = 600;
 
 /// 쓰기 잠금을 쥔 채 남은 것(§10.3 끝): 커밋 구간의 백업 가운데 더는 `pending`이 아니거나 채우는 Task가 없는 것(받는
-/// 사본은 [`RECEIVE_COMMIT_STALE`] 동안 받은 것이 없는 것), 끝난(없는) GC Task의 `gc`·`sweeping`, 검증 Task가 모두 끝난
-/// 저장소의 `quarantining`. 바꿀 것이 있으면 고친 상태.
+/// 사본은 [`RECEIVE_COMMIT_STALE`] 동안 받은 것이 없는 것), 끝난(없는) GC Task의 `gc`·`sweeping`, 끝난(없는) 검증 Task가
+/// 쥔 `quarantining`. 바꿀 것이 있으면 고친 상태.
 pub(crate) fn stale_locks(
     store: &BackupStore,
     backups: &[Backup],
@@ -1701,15 +1701,13 @@ pub(crate) fn stale_locks(
     } else if status.sweeping {
         status.sweeping = false;
     }
-    // 검증이 깨진 청크를 옮기는 잠금(리뷰 1 I5): 이 저장소의 검증 Task가 모두 끝났으면 놓는다.
-    if status.quarantining
-        && !tasks.iter().any(|t| {
-            t.spec.target == store.id
-                && matches!(t.spec.op, TaskOp::BackupStoreVerify { .. })
-                && !t.status.state.is_finished()
-        })
+    // 검증이 깨진 청크를 옮기는 잠금(리뷰 1 I5): 쥔 검증 Task가 끝났거나 없으면 놓는다(리뷰 2 N3).
+    if let Some(holder) = status.quarantining
+        && !tasks
+            .iter()
+            .any(|t| t.id == holder && !t.status.state.is_finished())
     {
-        status.quarantining = false;
+        status.quarantining = None;
     }
     (status != store.status).then_some(status)
 }
@@ -1827,16 +1825,25 @@ mod tests {
         assert!(!fixed.sweeping && fixed.gc.is_none());
         store.status = fixed;
         assert_eq!(stale_locks(&store, &backups, &tasks, 0), None);
-        // 검증의 옮기기 잠금(리뷰 1 I5): 그 저장소의 검증 Task가 돌면 두고, 모두 끝났으면 놓는다
-        store.status.quarantining = true;
+        // 검증의 옮기기 잠금(리뷰 1 I5): 쥔 검증 Task가 돌면 두고, 끝났으면 놓는다
         let verify = TaskOp::BackupStoreVerify { backups: vec![] };
-        tasks.push(task(verify, store.id, TaskState::Running));
+        tasks.push(task(verify.clone(), store.id, TaskState::Running));
+        store.status.quarantining = Some(tasks[2].id);
         assert_eq!(stale_locks(&store, &backups, &tasks, 0), None);
         tasks[2].status.state = TaskState::Succeeded;
-        assert!(
-            !stale_locks(&store, &backups, &tasks, 0)
+        assert_eq!(
+            stale_locks(&store, &backups, &tasks, 0)
                 .unwrap()
-                .quarantining
+                .quarantining,
+            None
+        );
+        // 쥔 Task가 끝났으면 같은 저장소의 다른 검증이 돌아도 놓는다(리뷰 2 N3 — 앞에는 다른 검증이 잠금을 붙잡았다)
+        tasks.push(task(verify, store.id, TaskState::Running));
+        assert_eq!(
+            stale_locks(&store, &backups, &tasks, 0)
+                .unwrap()
+                .quarantining,
+            None
         );
     }
 }

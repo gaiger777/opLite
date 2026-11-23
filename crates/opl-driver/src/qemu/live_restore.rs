@@ -60,12 +60,23 @@ fn mark_pivoted(dir: &Path, disks: &[usize]) -> Result<(), DriverError> {
         }
     }
     if changed {
-        let tmp = dir.join(format!("{LIVE_RESTORE_FILE}.tmp"));
-        let json = serde_json::to_vec(&wiring).expect("wiring serializes");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(&tmp, dir.join(LIVE_RESTORE_FILE))?;
+        write_wiring(dir, &wiring)?;
     }
     Ok(())
+}
+
+/// 배선 파일을 바꾼다: 임시 파일에 쓰고 fsync한 뒤 rename, 디렉터리도 fsync(리뷰 2 N4 — 전원이 나간 뒤 빈 파일이나
+/// `pivoted`를 잃은 옛 배선이 남으면 갈아탄 디스크를 옛 오버레이로 덮는다).
+fn write_wiring(dir: &Path, disks: &[LiveRestoreDisk]) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = dir.join(format!("{LIVE_RESTORE_FILE}.tmp"));
+    let json = serde_json::to_vec(disks).expect("wiring serializes");
+    let mut file = std::fs::File::create(&tmp)?;
+    file.write_all(&json)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, dir.join(LIVE_RESTORE_FILE))?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// 이름 있는 블록 노드들
@@ -86,10 +97,7 @@ impl QemuHypervisor {
         match disks {
             Some(disks) => {
                 std::fs::create_dir_all(&dir)?;
-                let tmp = dir.join(format!("{LIVE_RESTORE_FILE}.tmp"));
-                let json = serde_json::to_vec(disks).expect("wiring serializes");
-                std::fs::write(&tmp, json)?;
-                std::fs::rename(&tmp, &file)?;
+                write_wiring(&dir, disks)?;
             }
             None => {
                 if let Some(old) = read_wiring(&dir)? {
@@ -203,8 +211,11 @@ impl QemuHypervisor {
                 Some(j) if j.is_ready() && in_sync(&synced, &job_id) => {
                     match qmp_call(qmp.job_complete(&job_id), "QMP job-complete").await {
                         Ok(()) => ids.push(job_id),
+                        // 갈아타기 실패(리뷰 2 N6): `LiveRestore`로 알려 Task가 `Copying`으로 돌아가 다시 옮기게 한다.
                         Err(e) => {
-                            refused = Some(e);
+                            refused = Some(DriverError::LiveRestore(format!(
+                                "disk {i}: job-complete failed: {e}"
+                            )));
                             break;
                         }
                     }

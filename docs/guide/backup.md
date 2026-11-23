@@ -341,7 +341,8 @@ orbivisorctl backup-job create nightly --store offsite --all --at 03:00 --keep-d
   할 수 없으면 전체를 읽고 `status.full_reason`에 까닭을 적는다(풀 백업의 까닭들에 더해 `a chunk of the base backup failed
   verification` — base의 청크가 검증에서 깨졌으면 다음은 전체 읽기). 백업 작업의 `full_every N`은 base를 따라 연속으로 비트맵으로
   읽은 수가 N이면 다음을 전체 읽기로 한다(Veeam의 active full처럼 비트맵을 씻을 뿐 공간은 늘지 않는다). 목록의 `TYPE`은 base가
-  있으면 `incr`이지만 혼자 복원된다.
+  있으면 `incr`이지만 혼자 복원된다. VM의 비트맵은 마지막 백업 것 하나만 남으므로 한 VM을 두 작업(다른 저장소나 풀)이 번갈아
+  백업하면 서로의 비트맵을 지워 둘 다 늘 전체 읽기다 — 한 VM의 증분 백업은 작업 하나로 하고 다른 곳에는 `copy_to`·복제로 보낸다.
 - **크기.** `status.store_stats`에 논리 크기(`logical_bytes`), 읽은 바이트(`read_bytes`), 새 청크 수(`new_chunks`)와 새로 쓴
   바이트(`new_bytes` — 목록의 `SIZE`), 이미 있던 청크(`reused_chunks`), 0 청크(`zero_chunks`)가 있다. 웹 백업 표는 "새 데이터 / 논리"를 보인다. 저장소 전체의 쓴
   공간·dedup 배율은 GC가 잰다(`backup-store list`의 `STORED`·`DEDUP`).
@@ -520,7 +521,8 @@ orbivisorctl backup-job set nightly --no-copy                      # 사본 보�
 저장소 백업도 [원격 복제(DR)](#원격-복제dr)로 원격 클러스터에 보낸다. 대상 자리에 원격의 **백업 저장소 이름**을 준다
 (`orbivisorctl backup replicate B --remote dr --pool <dr의 저장소>`, 작업 `--replicate dr/<dr의 저장소>`). 보내는 쪽은 인덱스의 청크
 id를 4096개씩 물어 **원격에 없는 청크만** 보낸다 — 체인이 없어도 증분 복제가 저절로 된다. 받는 쪽은 청크를 자기 키로 풀어 id를
-맞춰 본 뒤 쓰므로 **두 저장소가 같은 키(지문)이거나 둘 다 평문**이어야 한다(dr 저장소를 prod 저장소의 복구 키로 만든다). 원격의 모든
+맞춰 본 뒤 쓰므로 **두 저장소가 같은 키(지문)이거나 둘 다 평문**이어야 한다(dr 저장소를 prod 저장소의 복구 키로 만든다 — 웹의 복제
+대화상자·작업 폼은 키가 다른 원격 저장소를 "(다른 키)"로 보이고 고르지 못하게 한다). 원격의 모든
 노드에 `backup-store`가 있어야 한다. 지우기 전파·사본 상태(`REPLICAS`)는 풀 백업과 같다.
 
 ### S3로 DR — 읽기 전용 붙이기와 넘겨받기
@@ -548,9 +550,9 @@ orbivisorctl backup-store take-over prod-s3
   `{VM 이름}-{만든 시각}`, 루트 폴더, `spec.origin`은 `owner.json`의 클러스터·CA 지문. 저장소에서 사라진 백업은 `failed`("snapshot is
   gone from the store")로 표시만 한다.
 - **넘겨받기**(`cluster.admin`, API `POST …/actions/take-over`)는 Task 없이 곧바로 주인 표식을 이 클러스터로 바꾸고 `read_only`를 끈다.
-  옛 주인의 하트비트(리더가 한 시간마다, GC도 끝날 때 씀)가 24시간 안이면 `--force` 없이는 409 `store_owned_elsewhere`다. 옛 주인이 살아
-  있으면 다음 GC(시작할 때와 쓸기 잠금을 쥔 뒤)에서 표식이 바뀐 것을 보고 그 저장소를 `failed`("store was taken over by cluster X")로
-  멈춘다.
+  옛 주인의 하트비트(리더가 한 시간마다, GC도 끝날 때 — 아직 주인일 때만 씀)가 24시간 안이면 `--force` 없이는 409
+  `store_owned_elsewhere`다. 옛 주인이 살아 있으면 다음 GC(시작할 때, 쓸기 잠금을 쥔 뒤, 쓸기를 마친 뒤 — 돌고 있던 GC도)에서 표식이
+  바뀐 것을 보고 그 저장소를 `failed`("store was taken over by cluster X")로 멈춘다. GC는 넘겨받은 표식을 덮어쓰지 않는다.
 - **DR 시험.** 계획 68의 GitHub `backup-s3` 작업은 두 클러스터로 이 차례(prod 암호화 저장소·escrow → dr 읽기 전용 붙이기·scan·라이브
   복원이 원본과 같음 → 읽기 전용 백업 거절 → 넘겨받기 거절 뒤 `--force` → prod GC가 "taken over"로 멈춤)를 돈다.
 
@@ -566,6 +568,10 @@ orbivisorctl backup-store take-over prod-s3
 | 복원 / 라이브 복원 | 지금 복원 그대로 / + 새 VM 폴더 `vm.power` |
 | 라이브 복원 취소 | 새 VM `vm.delete` |
 | 백업 작업의 `store`·`copy_to` | 루트 `backup.job` |
+
+웹은 저장소 목록(루트 `system.read`)을 읽을 수 있을 때만 저장소를 대상으로 보인다. 그래서 폴더에서만 `backup.create`를 가진 운영자는
+웹의 "지금 백업"·옮기기·복사에서 백업 풀만 고르게 된다(서버는 저장소도 받는다) — 그런 운영자는 `orbivisorctl backup create --store`나
+저장소를 정한 백업 작업을 쓴다.
 
 - **할당량 `backup_bytes`**(`orbivisorctl folder quota set /teamA --backup-bytes 2T`, 웹 폴더 할당량 "백업(GiB)"): VM 폴더 하위 트리 VM들의
   백업이 차지한다고 보는 바이트 — 저장소 백업은 **그 백업이 처음 쓴 바이트**(`new_bytes`), 풀 백업은 파일 크기 합. 중복 제거된 고유
