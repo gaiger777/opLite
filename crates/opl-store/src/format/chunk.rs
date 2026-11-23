@@ -29,12 +29,8 @@ pub struct EncodedChunk {
 /// 내용이 모두 0인가(0 청크는 저장하지 않는다 — §7.1)
 pub fn is_zero(raw: &[u8]) -> bool {
     // 8바이트씩 보면 4 MiB에서도 충분히 빠르다
-    let words = raw.chunks_exact(8);
-    let rest = words.remainder();
-    words
-        .map(|c| u64::from_ne_bytes(c.try_into().expect("8 bytes")))
-        .all(|w| w == 0)
-        && rest.iter().all(|b| *b == 0)
+    let (words, rest) = raw.as_chunks::<8>();
+    words.iter().map(|c| u64::from_ne_bytes(*c)).all(|w| w == 0) && rest.iter().all(|b| *b == 0)
 }
 
 /// 청크 id: 평문 저장소는 SHA-256(raw), 암호화 저장소는 HMAC-SHA256(id_key, raw)

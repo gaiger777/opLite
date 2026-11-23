@@ -4,6 +4,7 @@
 //! 구독하므로, 어느 노드의 API가 만든 Task든 대상 노드에서 실행된다.
 
 pub(crate) mod backup;
+pub(crate) mod backup_store;
 mod ceph;
 mod clone;
 mod download;
@@ -16,6 +17,7 @@ pub(crate) mod network_migrate;
 mod replicate;
 pub(crate) mod sdn;
 mod snapshot;
+mod store_tasks;
 mod template;
 mod vm_replicate;
 
@@ -161,6 +163,20 @@ pub struct TaskRunnerConfig {
     pub cpu: Option<Arc<dyn crate::cpu::CpuRefresher>>,
     /// 네트워크 옮기기(계획 67)가 VM 하나의 끄기·켜기·핫플러그를 기다리는 한도(기본 15분 — 시험은 줄인다)
     pub migration_vm_wait: Duration,
+    /// 꺼진 VM·옛 백업을 저장소로 읽는 `qemu-nbd`(계획 68 §8.2)
+    pub qemu_nbd: PathBuf,
+    /// 저장소 백업·복원의 유닉스 소켓 디렉터리(경로 길이 한도 안 — opld는 `{data_dir}/run`)
+    pub backup_run_dir: PathBuf,
+    /// fleecing 시작 전 남아 있어야 할 공간의 최소(디스크 크기 합의 10%와 큰 쪽, `[backup] fleece_reserve_min_mib`)
+    pub fleece_reserve_min: u64,
+    /// fleecing 지킴이가 읽기를 끊는 남은 공간(`[backup] fleece_min_free_mib`)
+    pub fleece_min_free: u64,
+    /// 저장소 복원 NBD 서버의 풀린 청크 캐시(MiB, `[backup] serve_cache_mib`)
+    pub serve_cache_mib: u64,
+    /// 저장소 쓰기 잠금·GC 기다림을 다시 보는 간격(기본 5초)
+    pub store_poll: Duration,
+    /// GC가 시작 때 진행 중이던 백업을 기다리는 한도(기본 24시간 — 넘으면 아무것도 지우지 않고 실패)
+    pub gc_wait_max: Duration,
 }
 
 impl TaskRunnerConfig {
@@ -194,6 +210,13 @@ impl TaskRunnerConfig {
             state_dir_min_age: firmware::STATE_DIR_MIN_AGE,
             cpu: None,
             migration_vm_wait: network_migrate::VM_WAIT,
+            qemu_nbd: PathBuf::from("qemu-nbd"),
+            backup_run_dir: std::env::temp_dir(),
+            fleece_reserve_min: 2 << 30,
+            fleece_min_free: 1 << 30,
+            serve_cache_mib: opl_store::nbd::serve::DEFAULT_CACHE_MIB,
+            store_poll: Duration::from_secs(5),
+            gc_wait_max: Duration::from_secs(24 * 3600),
         }
     }
 }
@@ -633,6 +656,11 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
     }
     match task.spec.op {
         TaskOp::BackupRestore { backup, .. } => return Some(backup),
+        // 저장소 Task는 저장소의 줄(같은 저장소의 GC·검증은 차례로 — 계획 68 §10.2)
+        TaskOp::BackupStoreInit
+        | TaskOp::BackupStoreGc
+        | TaskOp::BackupStoreVerify { .. }
+        | TaskOp::BackupStoreScan => return Some(target),
         TaskOp::VmImport { import, .. } => return Some(import),
         // 옮기기의 걸음은 그 옮기기의 줄에서 차례로(계획 67)
         TaskOp::NetworkMigrate { .. } => return Some(target),
@@ -654,7 +682,10 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
         );
         let backup_queue = matches!(
             task.spec.op,
-            TaskOp::BackupDelete | TaskOp::BackupReplicate { .. } | TaskOp::VmImportDelete
+            TaskOp::BackupDelete
+                | TaskOp::BackupReplicate { .. }
+                | TaskOp::BackupConvert { .. }
+                | TaskOp::VmImportDelete
         );
         let node_queue = task.spec.op == TaskOp::NodeDrain;
         return (is_volume_op(&task.spec.op)
@@ -748,6 +779,15 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             | TaskOp::VolumeFlatten
     ) || task.spec.op.is_ceph()
         || task.spec.op.is_sdn()
+        // 저장소 Task(계획 68)는 저장소 크기만큼 읽고 쓴다(S3는 다시 하기 60초를 품는다).
+        || matches!(
+            task.spec.op,
+            TaskOp::BackupStoreInit
+                | TaskOp::BackupStoreGc
+                | TaskOp::BackupStoreVerify { .. }
+                | TaskOp::BackupStoreScan
+                | TaskOp::BackupConvert { .. }
+        )
         || matches!(task.spec.op, TaskOp::NetworkMigrate { .. });
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
@@ -854,6 +894,15 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if let TaskOp::BackupReplicate { remote, pool } = &task.spec.op {
         replicate::discard_chain(ctx, task.spec.target, remote, pool, error).await;
+    }
+    match &task.spec.op {
+        TaskOp::BackupConvert { store } => {
+            backup_store::discard_convert(ctx, task, store, error).await;
+        }
+        TaskOp::BackupStoreInit => store_tasks::init_failed(ctx, task, error).await,
+        TaskOp::BackupStoreGc => store_tasks::gc_failed(ctx, task, error).await,
+        TaskOp::BackupStoreVerify { .. } => store_tasks::verify_failed(ctx, task, error).await,
+        _ => {}
     }
     if let TaskOp::VmImport { import, .. } = task.spec.op {
         import::discard(ctx, task, import, error).await;
@@ -1089,14 +1138,18 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             tpm,
             secure_boot,
         } => firmware::reset(ctx, task, (*uefi_vars, *tpm), *secure_boot).await,
-        // 백업 저장소 Task(계획 68)는 실행 스테이지(4·5·6)가 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::BackupStoreInit
-        | TaskOp::BackupStoreGc
-        | TaskOp::BackupStoreVerify { .. }
-        | TaskOp::BackupStoreScan
-        | TaskOp::BackupConvert { .. }
-        | TaskOp::BackupCopy { .. }
-        | TaskOp::BackupLiveRestore { .. } => {
+        // 백업 저장소 Task(계획 68 §10·§12). 깨진 백업·읽지 못한 스냅샷은 경고로 남긴다.
+        TaskOp::BackupStoreInit => return store_tasks::init(ctx, task).await,
+        TaskOp::BackupStoreGc => return Box::pin(store_tasks::gc(ctx, task)).await,
+        TaskOp::BackupStoreVerify { backups } => {
+            return Box::pin(store_tasks::verify(ctx, task, backups)).await;
+        }
+        TaskOp::BackupStoreScan => return Box::pin(store_tasks::scan(ctx, task)).await,
+        TaskOp::BackupConvert { store } => {
+            return Box::pin(backup_store::convert(ctx, task, store)).await;
+        }
+        // 복사·라이브 복원은 스테이지 5·6이 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::BackupCopy { .. } | TaskOp::BackupLiveRestore { .. } => {
             Err("backup store tasks are not available yet".into())
         }
     };

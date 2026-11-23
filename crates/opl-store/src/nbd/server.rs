@@ -417,8 +417,10 @@ where
             let cookie = r.read_u64().await?;
             let offset = r.read_u64().await?;
             let len = r.read_u32().await?;
-            let in_range =
-                len <= MAX_REQUEST && offset.checked_add(len as u64).is_some_and(|e| e <= size);
+            // 읽기만 한 요청 길이 한도를 따른다(`BLOCK_STATUS`는 내보내기 끝까지 묻는다 — `qemu-img convert`가 큰 디스크에
+            // 32 MiB 넘게 묻는다).
+            let in_range = (len <= MAX_REQUEST || cmd == CMD_BLOCK_STATUS)
+                && offset.checked_add(len as u64).is_some_and(|e| e <= size);
             let send = |frame: Vec<u8>| {
                 let tx = tx.clone();
                 async move {

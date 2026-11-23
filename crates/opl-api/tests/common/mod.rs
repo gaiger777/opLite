@@ -104,6 +104,9 @@ pub fn runner_config(node: Uuid, dir: &Path) -> TaskRunnerConfig {
     config.hotplug_timeout = Duration::from_millis(200);
     // 받기 시험은 127.0.0.1의 시험 서버에서 받는다.
     config.download_allow_private = true;
+    // 저장소 백업(계획 68): 짧은 소켓 경로, 빠른 잠금 기다림
+    config.backup_run_dir = "/tmp".into();
+    config.store_poll = Duration::from_millis(20);
     config
 }
 

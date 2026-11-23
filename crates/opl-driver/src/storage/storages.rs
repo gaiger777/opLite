@@ -209,6 +209,19 @@ impl Storage for Storages {
             .await
     }
 
+    async fn import_nbd(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        socket: &Path,
+        export: &str,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.backend(pool)?
+            .import_nbd(pool, id, socket, export, format)
+            .await
+    }
+
     /// 올린 파일만 본다(풀과 상관없다).
     async fn check_import_source(
         &self,

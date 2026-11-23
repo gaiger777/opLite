@@ -1387,3 +1387,131 @@ async fn sdn_alerts_fire_from_node_state_and_observations() {
     assert_eq!(hits[3].json()["state"], "resolved", "{:?}", hits[3].json());
     engine.shutdown().await;
 }
+
+/// 백업 경보 둘(계획 68 §10.5·§6): 검증이 실패한 저장소 백업마다 `backup_verify_failed`, 노드가 닿지 않는다고 보고한
+/// 저장소마다 `backup_store_unavailable`. 다시 검증해 통과하거나 노드가 다시 닿으면 풀린다. 규칙은 API 스테이지 전이라
+/// 클러스터에 바로 쓴다.
+#[tokio::test]
+async fn backup_verify_and_store_alerts_follow_backup_and_node_state() {
+    use opl_types::alert::AlertRuleSpec;
+    use opl_types::backup::{Backup, BackupSpec, BackupVerify, VerifyState};
+    use opl_types::backup_store::{BackupStoreSpec, NodeStoreState, StorePhase};
+
+    let rig = Rig::start().await;
+    rig.target("ops", "json").await;
+    for (name, kind) in [
+        ("verify", "backup_verify_failed"),
+        ("store", "backup_store_unavailable"),
+    ] {
+        let spec: AlertRuleSpec = serde_json::from_value(
+            json!({"condition": {"kind": kind}, "severity": "critical", "targets": ["ops"]}),
+        )
+        .unwrap();
+        rig.env
+            .cluster
+            .create(&Resource::new(name, spec))
+            .await
+            .unwrap();
+    }
+    let mut store: opl_types::backup_store::BackupStore = Resource::new(
+        "st",
+        serde_json::from_value::<BackupStoreSpec>(json!({"backend": {"pool": "bk"}})).unwrap(),
+    );
+    store.status.phase = StorePhase::Ready;
+    rig.env.cluster.create(&store).await.unwrap();
+    let spec: BackupSpec = serde_json::from_value(json!({
+        "vm": Uuid::now_v7(), "vm_name": "web", "store": "st",
+        "vm_spec": {"cpu": {"cores": 1}, "memory_mib": 256, "machine": "virt"}
+    }))
+    .unwrap();
+    let mut backup: Backup = Resource::new("web-1", spec);
+    backup.status.phase = opl_types::backup::BackupPhase::Ready;
+    backup.status.verify = Some(BackupVerify {
+        at: 1,
+        state: VerifyState::Failed,
+        bad_chunks: 2,
+        error: None,
+    });
+    rig.env.cluster.create(&backup).await.unwrap();
+    let mut me = rig
+        .env
+        .cluster
+        .get::<NodeSpec>(rig.env.node)
+        .unwrap()
+        .unwrap();
+    me.status.backup_stores = vec![NodeStoreState {
+        store: store.id,
+        ok: false,
+        error: Some("connection refused".into()),
+        checked_at: 1,
+    }];
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(rig.env.node, &me.status)
+        .await
+        .unwrap();
+    let _engine = rig.engine();
+    let hits = rig.hook.wait(2).await;
+    let texts: Vec<String> = hits.iter().map(|h| h.json().to_string()).collect();
+    assert!(
+        texts
+            .iter()
+            .any(|t| t.contains("web-1") && t.contains("2 bad chunks")),
+        "{texts:?}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("connection refused")),
+        "{texts:?}"
+    );
+    let active = |name: &str| {
+        rig.env
+            .cluster
+            .get_by_name::<AlertRuleSpec>(name)
+            .unwrap()
+            .unwrap()
+            .status
+            .active
+            .len()
+    };
+    assert_eq!((active("verify"), active("store")), (1, 1));
+    // 다시 검증해 통과, 노드가 다시 닿음 → 풀림
+    let b = rig
+        .env
+        .cluster
+        .get::<BackupSpec>(backup.id)
+        .unwrap()
+        .unwrap();
+    let mut status = b.status.clone();
+    status.verify = Some(BackupVerify {
+        at: 2,
+        state: VerifyState::Ok,
+        bad_chunks: 0,
+        error: None,
+    });
+    rig.env
+        .cluster
+        .update_status::<BackupSpec>(backup.id, &status)
+        .await
+        .unwrap();
+    let mut me = rig
+        .env
+        .cluster
+        .get::<NodeSpec>(rig.env.node)
+        .unwrap()
+        .unwrap();
+    me.status.backup_stores[0].ok = true;
+    me.status.backup_stores[0].error = None;
+    rig.env
+        .cluster
+        .update_status::<NodeSpec>(rig.env.node, &me.status)
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        rig.clock.advance(RESOLVE_AFTER_MS + 1);
+        if active("verify") == 0 && active("store") == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("backup alerts did not resolve");
+}

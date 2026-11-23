@@ -38,6 +38,8 @@ opl-cluster.workspace = true
 opl-driver.workspace = true
 opl-peer.workspace = true
 opl-reconciler.workspace = true
+# 백업 저장소(계획 68): 형식·백엔드·GC·검증·NBD
+opl-store.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
 # OIDC 토큰 교환의 폼 본문
 reqwest = { workspace = true, features = ["form"] }
@@ -68,6 +70,7 @@ bytes.workspace = true
 lber.workspace = true
 openraft.workspace = true
 opl-qemu.workspace = true
+opl-store = { workspace = true, features = ["fake-s3", "test-util"] }
 rcgen.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }

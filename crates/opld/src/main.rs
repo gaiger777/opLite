@@ -38,6 +38,7 @@ mod sdn;
 mod shutdown;
 #[cfg(feature = "starve-it")]
 mod starve;
+mod store_watch;
 mod topology;
 mod web;
 

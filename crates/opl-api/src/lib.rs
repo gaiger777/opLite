@@ -73,6 +73,7 @@ mod security_groups;
 mod settings;
 mod snapshots;
 mod state;
+pub mod stores;
 mod subscription;
 mod tasks;
 mod telemetry;

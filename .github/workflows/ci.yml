@@ -53,7 +53,7 @@ jobs:
           cargo test -p opl-driver --features storage-it --test dir_storage
           cargo test -p opl-store --features storage-it --test nbd_qemu -- --nocapture
           cargo test -p opl-api --features storage-it --test volumes --test downloads
-          cargo test -p opl-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks
+          cargo test -p opl-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks --test backup_store_tasks
 
   # 웹 UI: 타입 검사, 린트, 단위 테스트, API 타입이 Rust 정의와 같은지, 알려진 취약점, 빌드
   web:
@@ -368,7 +368,7 @@ jobs:
           sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
             cargo test --features "$FEATURES" -p opl-qemu -p opl-driver -p opl-reconciler -p opld
         env:
-          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it,opld/numa-it
+          FEATURES: opl-qemu/qemu-it,opl-driver/qemu-it,opl-driver/net-it,opl-reconciler/qemu-it,opld/qemu-it,opld/net-it,opld/web-it,opld/nfs-it,opl-driver/lvm-it,opld/lvm-it,opl-driver/zfs-it,opld/zfs-it,opl-driver/rbd-it,opld/rbd-it,opl-driver/lvm-shared-it,opld/lvm-shared-it,opld/migration-it,opld/ha-it,opl-driver/vtpm-it,opld/vtpm-it,opld/cpu-it,opld/numa-it,opld/backup-it
           OPL_TEST_NFS_EXPORT: /srv/opl-nfs
           OPL_TEST_LVM: opltest/tp
           OPL_TEST_ZFS: opltestz/opl

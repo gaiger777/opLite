@@ -109,6 +109,22 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// 유닉스 소켓 `socket`의 읽기 전용 NBD 내보내기 `export`(저장소 백업을 내보내는 NBD 서버 — 계획 68 설계 §8.6)를
+    /// 읽어 형식 `format`의 새 볼륨으로 만든다. 0으로 알린 범위는 쓰지 않는다(`qemu-img convert`). 실패하면 만들다 만
+    /// 볼륨을 남기지 않는다. 기본은 지원하지 않는다.
+    async fn import_nbd(
+        &self,
+        _pool: &StoragePool,
+        _id: Uuid,
+        _socket: &Path,
+        _export: &str,
+        _format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot import from a backup store".into(),
+        ))
+    }
+
     /// `src`가 다른 파일을 참조하지 않는 이미지 하나인지 확인한다(VMDK extent, backing file).
     /// 사용자가 올린 파일을 `import_volume`에 넘기기 전에 부른다.
     async fn check_import_source(
@@ -856,6 +872,8 @@ enum ImportSource<'a> {
     File(&'a Path, SourceFormat),
     /// 증분 백업 체인: qcow2 백업 파일들(자식부터 전체 백업까지). 파일 헤더에는 backing이 없다.
     Chain(&'a [PathBuf]),
+    /// 유닉스 소켓 NBD 내보내기(소켓, 내보내기 이름) — 저장소 백업(계획 68)
+    Nbd(&'a Path, &'a str),
 }
 
 impl ImportSource<'_> {
@@ -874,6 +892,11 @@ impl ImportSource<'_> {
             ImportSource::Chain(files) => {
                 let mut args: Vec<String> = out.into_iter().flatten().collect();
                 args.push(chain_json(files)?);
+                Ok(args)
+            }
+            ImportSource::Nbd(socket, export) => {
+                let mut args: Vec<String> = out.into_iter().flatten().collect();
+                args.push(nbd_json(socket, export)?);
                 Ok(args)
             }
         }
@@ -896,6 +919,36 @@ fn chain_json(files: &[PathBuf]) -> Result<String, DriverError> {
         });
     }
     Ok(format!("json:{image}"))
+}
+
+/// 유닉스 소켓 NBD 내보내기를 여는 `json:` 원본(읽기 전용)
+fn nbd_json(socket: &Path, export: &str) -> Result<String, DriverError> {
+    require_absolute(socket)?;
+    let image = serde_json::json!({
+        "driver": "nbd",
+        "server": { "type": "unix", "path": path_str(socket)? },
+        "export": export,
+    });
+    Ok(format!("json:{image}"))
+}
+
+/// 백업 체인 `files`(자식부터, 하나면 전체 백업)를 `qemu-nbd`로 유닉스 소켓 `socket`에 읽기 전용으로 내보낸다(옛 백업
+/// 옮기기 — 계획 68 설계 §12.2). 부모는 [`chain_json`]처럼 순서로만 잇는다(파일 헤더의 backing은 따르지 않는다).
+/// `size_bytes`는 디스크 가상 크기다.
+pub async fn nbd_chain_source(
+    qemu_nbd: &Path,
+    files: &[PathBuf],
+    size_bytes: u64,
+    socket: &Path,
+) -> Result<NbdSource, DriverError> {
+    let mut args = vec![
+        "--read-only".to_string(),
+        "--persistent".into(),
+        "--shared=0".into(),
+        format!("--socket={}", path_str(socket)?),
+    ];
+    args.push(chain_json(files)?);
+    spawn_nbd(qemu_nbd, args, socket, size_bytes).await
 }
 
 /// `qemu-img`를 돌려 표준 출력을 돌려준다. 실패하면 stderr를 담은 `ToolFailed`.
@@ -1040,6 +1093,16 @@ pub async fn nbd_source(
         format!("--socket={}", path_str(socket)?),
     ];
     args.extend(nbd_source_args(src, block)?);
+    spawn_nbd(qemu_nbd, args, socket, src.size_bytes).await
+}
+
+/// `qemu-nbd args`를 띄우고(남은 소켓 `socket`은 지운다) 답할 때까지 기다린다(30초).
+async fn spawn_nbd(
+    qemu_nbd: &Path,
+    args: Vec<String>,
+    socket: &Path,
+    size_bytes: u64,
+) -> Result<NbdSource, DriverError> {
     match std::fs::remove_file(socket) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -1059,7 +1122,7 @@ pub async fn nbd_source(
         child,
         socket: socket.to_path_buf(),
         export: String::new(),
-        size_bytes: src.size_bytes,
+        size_bytes,
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -1348,6 +1411,18 @@ impl Storage for DirStorage {
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
         self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
+    }
+
+    async fn import_nbd(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        socket: &Path,
+        export: &str,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Nbd(socket, export), format)
             .await
     }
 

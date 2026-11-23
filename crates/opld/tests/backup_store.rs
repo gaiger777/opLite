@@ -1,6 +1,7 @@
 //! 백업 저장소(계획 68 스테이지 3): `orbivisord backup-serve` 헬퍼(표준 입력 설정, pid 파일, 죽이고 다시 띄우기,
 //! 멈추기)와 `backup-it` 빌드의 제어 소켓 고리. QEMU는 쓰지 않는다.
-//! `cargo test -p opld --test backup_store` (고리는 `--features backup-it`)
+//! `cargo test -p opld --test backup_store` (고리는 `--features backup-it`, 실제 QEMU로 저장소에 백업·복원하는 E2E는
+//! `--features backup-it,qemu-it` — qemu-img·qemu-io·qemu-nbd가 필요하다)
 
 mod common;
 
@@ -194,5 +195,169 @@ async fn backup_hook_writes_stores_and_jobs() {
     assert!(ok && gone == "null", "{gone}");
     let (ok, why) = put(&d, "nope", "x", Value::Null).await;
     assert!(!ok, "{why}");
+    d.stop();
+}
+
+/// 실제 QEMU(스테이지 4, 고리로): 백업 풀 안 저장소를 만들고(초기화 Task), 실행 중인 VM을 fleecing으로 전체 → 디스크에
+/// 표식 → 증분(바뀐 청크만 읽음) 백업하고, 증분 백업을 새 VM으로 복원해 원본과 같은지 본다. 앞 백업을 지우고 GC·검증을
+/// 돌려도 남은 백업은 그대로다.
+#[cfg(all(feature = "backup-it", feature = "qemu-it"))]
+#[tokio::test]
+async fn running_vm_store_backups_restore_and_survive_gc() {
+    use common::Daemon;
+    use serde_json::{Value, json};
+    use std::process::Command;
+
+    async fn hook(d: &Daemon, path: &str, body: Value) -> Value {
+        let http = reqwest::Client::builder()
+            .unix_socket(d.path("opld.sock"))
+            .build()
+            .unwrap();
+        let resp = http
+            .post(format!("http://opld/v1/test/{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let ok = resp.status().is_success();
+        let text = resp.text().await.unwrap();
+        assert!(ok, "{path}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
+    async fn wait_task(d: &Daemon, id: &Value) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        loop {
+            let t = d.ctl_json(&["task", "get", id.as_str().unwrap()]).await;
+            let state = t["status"]["state"].as_str().unwrap_or("").to_string();
+            if state == "succeeded" || state == "failed" {
+                assert_eq!(state, "succeeded", "{t}");
+                return t;
+            }
+            assert!(std::time::Instant::now() < deadline, "{t}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    fn qemu_io(file: &Path, cmd: &str) {
+        let ok = Command::new("qemu-io")
+            .args(["-f", "qcow2", "-c", cmd])
+            .arg(file)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "qemu-io {cmd}");
+    }
+
+    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
+    d.start().await;
+    d.init("st-e2e").await;
+    d.login().await;
+    for (name, extra) in [("local", None), ("bk", Some("--backups"))] {
+        let dir = d.path(name);
+        std::fs::create_dir(&dir).unwrap();
+        let mut args = vec!["pool", "create", name, "--path", dir.to_str().unwrap()];
+        args.extend(extra);
+        d.ctl(&args).await.unwrap();
+        d.wait_pool_ready(name).await;
+    }
+    d.ctl(&[
+        "volume", "create", "root", "--pool", "local", "--size", "64M", "--format", "qcow2",
+    ])
+    .await
+    .unwrap();
+    let vol = d.ctl_json(&["volume", "get", "root"]).await;
+    let root = d
+        .path("local")
+        .join(format!("{}.qcow2", vol["id"].as_str().unwrap()));
+    qemu_io(&root, "write -P 0x11 1M 4M");
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--start",
+    ])
+    .await
+    .unwrap();
+    let node = d.ctl_json(&["node", "get", "node1"]).await;
+    let node = node["id"].clone();
+
+    let store = hook(
+        &d,
+        "put",
+        json!({"kind": "backup-store", "name": "st", "spec": {"backend": {"pool": "bk"}}}),
+    )
+    .await;
+    let t = hook(
+        &d,
+        "task",
+        json!({"op": {"kind": "backup-store-init"}, "target": store, "node": node}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+
+    let t = hook(
+        &d,
+        "backup",
+        json!({"vm": "web", "store": "st", "name": "full", "incremental": true}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+    let full = d.ctl_json(&["backup", "get", "full"]).await;
+    assert_eq!(full["status"]["phase"], "ready", "{full}");
+    assert_eq!(full["spec"]["store"], "st", "{full}");
+    assert!(
+        full["status"]["store_stats"]["new_chunks"]
+            .as_u64()
+            .unwrap()
+            >= 2,
+        "{full}"
+    );
+
+    // 게스트가 없어 VM을 끄고 쓴다(qcow2의 persistent 비트맵이 그 쓰기를 담는다).
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    qemu_io(&root, "write -P 0xcd 0 64k");
+    d.ctl(&["vm", "start", "web"]).await.unwrap();
+    let t = hook(
+        &d,
+        "backup",
+        json!({"vm": "web", "store": "st", "name": "incr", "incremental": true}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+    let incr = d.ctl_json(&["backup", "get", "incr"]).await;
+    assert_eq!(incr["status"]["base"], full["id"], "{incr}");
+    let stats = &incr["status"]["store_stats"];
+    assert_eq!(stats["read_bytes"], 4u64 << 20, "{incr}");
+    assert_eq!(stats["new_chunks"], 1, "{incr}");
+
+    // 앞 백업을 지우고 GC·검증
+    d.ctl(&["backup", "delete", "full"]).await.unwrap();
+    let t = hook(
+        &d,
+        "task",
+        json!({"op": {"kind": "backup-store-gc"}, "target": store, "node": node}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+    let t = hook(&d, "task", json!({"op": {"kind": "backup-store-verify", "backups": [incr["id"]]}, "target": store, "node": node})).await;
+    wait_task(&d, &t).await;
+    let incr = d.ctl_json(&["backup", "get", "incr"]).await;
+    assert_eq!(incr["status"]["verify"]["state"], "ok", "{incr}");
+
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+    d.ctl(&[
+        "backup", "restore", "incr", "--name", "copy", "--pool", "local",
+    ])
+    .await
+    .unwrap();
+    let copy = d.ctl_json(&["volume", "get", "copy-disk0"]).await;
+    let copy = d
+        .path("local")
+        .join(format!("{}.qcow2", copy["id"].as_str().unwrap()));
+    let same = Command::new("qemu-img")
+        .args(["compare", "-q", "-f", "qcow2", "-F", "qcow2"])
+        .arg(&copy)
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success();
+    assert!(same, "restored disk differs from the original");
     d.stop();
 }

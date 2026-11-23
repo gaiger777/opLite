@@ -69,6 +69,7 @@ use crate::pools::PoolMounter;
 use crate::runtime::{Handles, on, run_on};
 use crate::sdn::{SdnAgent, SdnReport};
 use crate::shutdown;
+use crate::store_watch::StoreWatch;
 use crate::topology::TopologyWatch;
 
 /// 데이터 디렉터리 아래 클러스터 저장소(Raft 로그와 상태)를 두는 디렉터리
@@ -77,6 +78,8 @@ pub const CLUSTER_DIR: &str = "cluster";
 const MIGRATION_DISKS_DIR: &str = "migration-disks";
 /// 데이터 디렉터리 아래 복제본 기록 파일과 증분 겹층을 두는 디렉터리(로컬 디스크 복제, 계획 55)
 const REPLICAS_DIR: &str = "replicas";
+/// 저장소 백업·복원의 유닉스 소켓 디렉터리(계획 68 — `{data_dir}/backup-run`)
+const BACKUP_RUN_DIR: &str = "backup-run";
 /// 종료 신호를 받은 뒤 열린 연결(watch, 콘솔)이 끝나기를 기다리는 시간
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 쓰기가 커밋되기를 기다리는 시간. 리더를 잃으면 새 리더를 뽑는 데 보통 선거 제한 시간의 두 배쯤
@@ -219,6 +222,8 @@ struct Services {
     /// 이 노드의 VIP 리스를 갱신하고 VIP를 붙인다(`[vip]`이 없으면 없다).
     vip: Option<VipAgent>,
     pools: PoolMounter,
+    /// 이 노드가 백업 저장소에 닿는지 노드 상태에 쓴다(계획 68).
+    stores: StoreWatch,
     /// 이 노드와 그 VM의 사용량 지표를 잰다.
     metrics: MetricsSampler,
     /// 지표를 분마다 기록 파일에 쓰고 VM 기록을 주인 노드에 밀어 넘긴다(`[metrics] history = false`면 없다).
@@ -284,6 +289,7 @@ impl Services {
         self.fence_watch.shutdown().await;
         self.vip_manager.shutdown().await;
         self.pools.shutdown().await;
+        self.stores.shutdown().await;
         self.metrics.shutdown().await;
         // 측정기가 멈춘 뒤 마지막 점까지 쓴다.
         if let Some(history) = self.history {
@@ -859,6 +865,14 @@ impl Member {
                 pool_levels.clone(),
             )
         });
+        let stores = on(&rt.work, || {
+            StoreWatch::spawn(
+                cluster.clone(),
+                node,
+                mount_root.clone(),
+                crate::store_watch::CHECK_EVERY,
+            )
+        });
         // 지표는 메모리 1시간과 노드 로컬 기록 파일에 둔다(Raft에 쓰지 않는다).
         let metrics = on(&rt.work, || {
             MetricsSampler::spawn(
@@ -906,6 +920,12 @@ impl Member {
         runner_config.replica_dir = Some(config.data_dir.join(REPLICAS_DIR));
         runner_config.replication_bandwidth = config.replication.bandwidth();
         runner_config.download_allow_private = config.download.allow_private;
+        // 저장소 백업(계획 68): 꺼진 VM·옛 백업 읽기, NBD 소켓, fleecing 공간 지킴이, 복원 캐시
+        runner_config.qemu_nbd = config.qemu_nbd();
+        runner_config.backup_run_dir = config.data_dir.join(BACKUP_RUN_DIR);
+        runner_config.fleece_reserve_min = config.backup.fleece_reserve_min_mib << 20;
+        runner_config.fleece_min_free = config.backup.fleece_min_free_mib << 20;
+        runner_config.serve_cache_mib = config.backup.serve_cache_mib;
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         runner_config.ceph = Some(ceph.clone());
@@ -1082,6 +1102,7 @@ impl Member {
                 vip_manager,
                 vip,
                 pools,
+                stores,
                 metrics,
                 history,
                 overlay,

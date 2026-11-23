@@ -467,7 +467,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NbdClient<S> {
                                 return Err(proto("bad block status chunk"));
                             }
                             if be_u32(&data) == id {
-                                for d in data[4..].chunks_exact(8) {
+                                for d in data[4..].as_chunks::<8>().0 {
                                     out.push(Extent {
                                         length: be_u32(d) as u64,
                                         flags: be_u32(&d[4..]),

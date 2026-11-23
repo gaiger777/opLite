@@ -187,7 +187,7 @@ async fn has_manifest(dir: &Path, id: Uuid) -> bool {
 
 /// 부모 `parent`가 없어졌거나 `ready`가 아니거나 지우는 Task가 끝나지 않았으면 전체로 하는 이유. 부모
 /// 지우기는 자식이 적히기 전에 확인을 지났으면 그대로 돈다(백업의 줄에 서므로 VM의 줄과 따로 돈다).
-fn parent_going(ctx: &Ctx, parent: &Backup) -> Result<Option<String>, String> {
+pub(super) fn parent_going(ctx: &Ctx, parent: &Backup) -> Result<Option<String>, String> {
     use opl_types::task::{TaskOp, TaskSpec};
     let now = get_backup(ctx, parent.id)?;
     let (_, tasks) = ctx.cluster.list::<TaskSpec>().map_err(|e| e.to_string())?;
@@ -537,6 +537,10 @@ pub(super) async fn backup(ctx: &Ctx, task: &Task, id: Uuid) -> Result<Option<St
     if backup.status.phase != BackupPhase::Pending {
         return Err("backup is not pending".into());
     }
+    // 저장소 백업(계획 68)은 청크 저장소 길이다.
+    if backup.spec.store.is_some() {
+        return Box::pin(super::backup_store::backup(ctx, task, backup)).await;
+    }
     let vm = get_vm(ctx, task.spec.target)?;
     check_settled(&vm)?;
     let running = vm.status.phase == VmPhase::Running;
@@ -768,6 +772,9 @@ pub(super) async fn discard(ctx: &Ctx, task: &Task, id: Uuid, error: &str, unfin
             return;
         }
     };
+    if backup.spec.store.is_some() {
+        return super::backup_store::discard(ctx, backup, error, unfinished).await;
+    }
     if let Ok(Some(vm)) = ctx.cluster.get::<VmSpec>(task.spec.target)
         && matches!(ctx.hv.inspect(vm.id).await, Ok(Some(_)))
     {
@@ -820,6 +827,9 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String
             && matches!(t.spec.op, TaskOp::BackupRestore { backup, .. } if backup == id)
     }) {
         return Err("backup is being restored".into());
+    }
+    if backup.spec.store.is_some() {
+        return super::backup_store::delete(ctx, backup).await;
     }
     let (_, backups) = ctx
         .cluster
@@ -891,7 +901,7 @@ pub(super) async fn read_manifest(dir: &Path) -> Result<BackupManifest, String> 
 /// `root` 안의 디렉터리와 매니페스트. 조상은 모두 같은 풀에 `ready`로 있고 이 노드에서 읽을 수 있으며,
 /// 매니페스트가 그 기록과 맞고, 디스크 수와 가상 크기가 `backup`과 같아야 한다. 아니면 "backup chain is
 /// broken: …"이다. 전체 백업이면 비어 있다.
-async fn read_chain(
+pub(super) async fn read_chain(
     ctx: &Ctx,
     backup: &Backup,
     root: &Path,
@@ -950,7 +960,7 @@ async fn read_chain(
 
 /// 백업 디렉터리 `dir` 안의 일반 파일 `file`의 경로. 심볼릭 링크(디렉터리 밖을 가리킬 수 있다)나 다른
 /// 종류의 파일이면 오류다.
-async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
+pub(super) async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, String> {
     let path = dir.join(file);
     match tokio::fs::symlink_metadata(&path).await {
         Ok(m) if m.file_type().is_file() => Ok(path),
@@ -988,6 +998,12 @@ pub(super) async fn restore(
         .is_some()
     {
         return Err(format!("VM {name:?} already exists"));
+    }
+    if backup.spec.store.is_some() {
+        return Box::pin(super::backup_store::restore(
+            ctx, task, backup, name, pool, folder,
+        ))
+        .await;
     }
     if let Some(node) = backup.status.node.filter(|n| *n != ctx.config.node) {
         return Err(format!("backup is stored on node {node}"));
@@ -1138,7 +1154,7 @@ pub(super) async fn restore(
 /// 백업은 CD-ROM의 매체(ISO)를 담지 않는다. 스펙의 ISO가 이 클러스터에 없거나, ISO가 아니거나, 준비되지 않았거나,
 /// 이 노드(복원한 디스크가 있는 노드)에서 쓸 수 없으면 그 드라이브를 비우고(드라이브는 남김) 드라이브마다 경고를
 /// 돌려준다.
-fn available_media(ctx: &Ctx, spec: &mut VmSpec) -> Result<Vec<String>, String> {
+pub(super) fn available_media(ctx: &Ctx, spec: &mut VmSpec) -> Result<Vec<String>, String> {
     let me = ctx
         .cluster
         .get::<NodeSpec>(ctx.config.node)

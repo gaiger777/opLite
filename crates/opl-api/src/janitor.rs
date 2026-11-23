@@ -16,6 +16,7 @@ use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_types::auth::{Session, SessionSpec, User, UserSpec};
 use opl_types::backup::{Backup, BackupPhase, BackupSpec};
+use opl_types::backup_store::BackupStoreSpec;
 use opl_types::cpu::{CpuCatalog, CpuCatalogSpec};
 use opl_types::node::{Node, NodeSpec};
 use opl_types::snapshot::{Snapshot, SnapshotPhase, SnapshotSpec};
@@ -435,6 +436,8 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
     crate::cpu_baseline::record(state).await;
     // 지우기 Task가 파일이 있는 노드에서 파일과 리소스를 지운다. 만들지 못하면(노드가 오프라인 등) 다음
     // tick에 다시 한다.
+    // 죽은 백업·GC Task가 쥔 채 남은 저장소 쓰기 잠금(계획 68 §10.3)을 푼다. 읽은 revision에서만 쓴다.
+    release_store_locks(cluster, &backups, &tasks).await;
     for backup in stale_receiving(SystemTime::now(), config, &backups, &tasks) {
         match start_backup_delete(state, backup).await {
             Ok(task) => {
@@ -442,6 +445,30 @@ async fn tick(state: &AppState, config: &ClusterJanitorConfig, seen: &mut Seen) 
             }
             Err(e) => {
                 tracing::info!(backup = %backup.name, error = %e.message, "janitor: cannot delete a backup that stopped receiving")
+            }
+        }
+    }
+}
+
+/// 저장소마다 [`crate::tasks::backup_store::stale_locks`]가 고른 남은 잠금을 푼다. 그사이 바뀌었으면 다음 tick에 다시
+/// 본다.
+async fn release_store_locks(cluster: &Cluster, backups: &[Backup], tasks: &[Task]) {
+    let Ok((_, stores)) = cluster.list::<BackupStoreSpec>() else {
+        return;
+    };
+    for store in stores {
+        let Some(status) = crate::tasks::backup_store::stale_locks(&store, backups, tasks) else {
+            continue;
+        };
+        match cluster
+            .update_status_checked::<BackupStoreSpec>(store.id, store.revision, &status)
+            .await
+        {
+            Ok(_) => {
+                tracing::info!(store = %store.name, "janitor: released stale backup store locks")
+            }
+            Err(e) => {
+                tracing::info!(store = %store.name, error = %e, "janitor: cannot release backup store locks yet")
             }
         }
     }

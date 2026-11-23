@@ -9,6 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use opl_types::backup::{Backup, BackupPhase, BackupSpec, BackupStatus, default_backup_name};
+use opl_types::backup_store::{BackupStore, BackupStoreSpec, StoreBackend, StorePhase};
 use opl_types::network::{NetworkSpec, USER_NETWORK};
 use opl_types::node::{GUEST_AGENT, Node, NodeSpec, VTPM};
 use opl_types::remote::RemoteSpec;
@@ -114,6 +115,48 @@ pub(crate) fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 백업이 갈 곳: 백업 풀(계획 27) 또는 백업 저장소(계획 68)
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Dest {
+    Pool(StoragePool),
+    Store(BackupStore),
+}
+
+/// 저장소 `name`. 없으면 400.
+pub(crate) fn find_store(state: &AppState, name: &str) -> Result<BackupStore, ApiError> {
+    state
+        .cluster
+        .get_by_name::<BackupStoreSpec>(name)?
+        .ok_or_else(|| ApiError::bad_request(format!("backup store {name:?} not found")))
+}
+
+/// 저장소가 준비됐는지(409 `store_not_ready`), 쓰기면 읽기 전용이 아닌지(409 `store_read_only`)
+pub(crate) fn check_store(store: &BackupStore, write: bool) -> Result<(), ApiError> {
+    if store.status.phase != StorePhase::Ready {
+        return Err(ApiError::conflict(
+            "store_not_ready",
+            format!("backup store {:?} is not ready", store.name),
+        ));
+    }
+    if write && store.spec.read_only {
+        return Err(ApiError::conflict(
+            "store_read_only",
+            format!("backup store {:?} is attached read-only", store.name),
+        ));
+    }
+    Ok(())
+}
+
+/// 노드 `node`가 저장소를 쓸 수 있는지. 아니면 409 `store_not_on_node`.
+pub(crate) fn check_store_on(
+    state: &AppState,
+    store: &BackupStore,
+    node: Uuid,
+) -> Result<(), ApiError> {
+    crate::stores::usable_on_node(&state.cluster, store, node)
+        .map_err(|e| ApiError::conflict("store_not_on_node", e))
+}
+
 pub(crate) fn find_pool(state: &AppState, name: &str) -> Result<StoragePool, ApiError> {
     state
         .cluster
@@ -142,6 +185,12 @@ pub(crate) fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static st
             TaskOp::BackupRestore { backup, .. } if backup == id => Some("being restored"),
             TaskOp::BackupDelete if t.spec.target == id => Some("being deleted"),
             TaskOp::BackupReplicate { .. } if t.spec.target == id => Some("being replicated"),
+            TaskOp::BackupConvert { .. } if t.spec.target == id => {
+                Some("being moved to a backup store")
+            }
+            TaskOp::BackupStoreVerify { ref backups } if backups.contains(&id) => {
+                Some("being verified")
+            }
             _ => None,
         })
         .collect())
@@ -196,6 +245,17 @@ pub(crate) fn check_no_backups(state: &AppState, pool: &StoragePool) -> Result<(
             format!("pool {:?} holds backups", pool.name),
         ));
     }
+    // 풀 안 백업 저장소(계획 68 §7.6)
+    let (_, stores) = state.cluster.list::<BackupStoreSpec>()?;
+    if let Some(store) = stores
+        .iter()
+        .find(|s| matches!(&s.spec.backend, StoreBackend::Pool(p) if *p == pool.name))
+    {
+        return Err(ApiError::conflict(
+            "pool_in_use",
+            format!("pool {:?} holds backup store {:?}", pool.name, store.name),
+        ));
+    }
     Ok(())
 }
 
@@ -225,7 +285,7 @@ fn vm_disks(state: &AppState, vm: &Vm) -> Result<Vec<(Volume, StoragePool)>, Api
 fn backup_node(
     state: &AppState,
     vm: &Vm,
-    pool: &StoragePool,
+    dest: &Dest,
     disks: &[(Volume, StoragePool)],
 ) -> Result<Uuid, ApiError> {
     let placed = if is_stopped(vm) {
@@ -236,18 +296,32 @@ fn backup_node(
     if let Some(node) = placed {
         return Ok(node);
     }
+    let store_pool = match dest {
+        Dest::Store(store) => {
+            crate::stores::backend_pool(&state.cluster, store).map_err(ApiError::bad_request)?
+        }
+        Dest::Pool(_) => None,
+    };
     let reads = |node: &Node| {
-        pool_usable_on(pool, node)
+        let target = match dest {
+            Dest::Pool(pool) => pool_usable_on(pool, node),
+            Dest::Store(store) => crate::stores::usable_on(store, store_pool.as_ref(), node),
+        };
+        target
             && disks.iter().all(|(volume, p)| {
                 pool_usable_on(p, node) && (is_shared(p) || volume.status.node == Some(node.id))
             })
+    };
+    let what = match dest {
+        Dest::Pool(pool) => format!("storage pool {:?}", pool.name),
+        Dest::Store(store) => format!("backup store {:?}", store.name),
     };
     first_node(state, reads)?.ok_or_else(|| {
         ApiError::conflict(
             "no_node",
             format!(
-                "no online node can read the disks of VM {:?} and use storage pool {:?}",
-                vm.name, pool.name
+                "no online node can read the disks of VM {:?} and use {what}",
+                vm.name
             ),
         )
     })
@@ -340,22 +414,30 @@ pub async fn create_backup(
         require_feature(&state.cluster, "incremental-backup")?;
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    let pool = find_pool(&state, &req.pool)?;
-    let node = check_backup(&state, &vm, &pool)?;
+    let dest = Dest::Pool(find_pool(&state, &req.pool)?);
+    let node = check_backup(&state, &vm, &dest)?;
     let name = req
         .name
         .unwrap_or_else(|| default_backup_name(&vm.name, now()));
-    let task = start_backup(&state, &vm, &pool, node, name, None, req.incremental, None).await?;
+    let task = start_backup(&state, &vm, &dest, node, name, None, req.incremental, None).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
 }
 
 /// VM을 백업 풀 `pool`에 백업할 수 있는지 보고 백업 Task를 돌릴 노드를 돌려준다. 오류는
 /// [`create_backup`]과 같다. 백업 요청 API와 백업 작업 스케줄러가 쓴다(권한 검사는 부르는 쪽).
-pub(crate) fn check_backup(
-    state: &AppState,
-    vm: &Vm,
-    pool: &StoragePool,
-) -> Result<Uuid, ApiError> {
+pub(crate) fn check_backup(state: &AppState, vm: &Vm, dest: &Dest) -> Result<Uuid, ApiError> {
+    let pool = match dest {
+        Dest::Pool(pool) => pool,
+        // 저장소 백업(계획 68 §8.1)은 fleecing으로 읽으므로 스냅샷을 담지 못하는 디스크(공유 LVM)도 실행 중에 된다.
+        Dest::Store(store) => {
+            check_store(store, true)?;
+            check_not_busy(state, vm)?;
+            let disks = vm_disks(state, vm)?;
+            let node = backup_node(state, vm, dest, &disks)?;
+            check_store_on(state, store, node)?;
+            return Ok(node);
+        }
+    };
     if !pool.spec.backups {
         return Err(ApiError::bad_request(format!(
             "storage pool {:?} does not store backups; turn on its backups setting",
@@ -381,7 +463,7 @@ pub(crate) fn check_backup(
     if !is_stopped(vm) {
         check_disks(state, vm)?;
     }
-    let node = backup_node(state, vm, pool, &disks)?;
+    let node = backup_node(state, vm, dest, &disks)?;
     check_pool_on(state, pool, node, || {
         format!(
             "storage pool {:?} is not available on the node holding VM {:?}",
@@ -399,7 +481,7 @@ pub(crate) fn check_backup(
 pub(crate) async fn start_backup(
     state: &AppState,
     vm: &Vm,
-    pool: &StoragePool,
+    dest: &Dest,
     node: Uuid,
     name: String,
     job: Option<Uuid>,
@@ -407,34 +489,45 @@ pub(crate) async fn start_backup(
     max_chain: Option<u32>,
 ) -> Result<Task, ApiError> {
     check_name(&name)?;
+    // 폴더 할당량 `backup_bytes`(계획 68 §13)를 이미 다 썼으면 새 백업을 받지 않는다.
+    crate::quota::check_backup_room(&state.cluster, vm.spec.folder)?;
+    let (pool_name, store) = match dest {
+        Dest::Pool(pool) => (pool.name.clone(), None),
+        Dest::Store(store) => (String::new(), Some(store.name.clone())),
+    };
     let backup: Backup = Resource::new(
         name,
         BackupSpec {
             vm: vm.id,
             vm_name: vm.name.clone(),
-            pool: pool.name.clone(),
+            pool: pool_name,
             vm_spec: vm.spec.clone(),
             job,
             origin: None,
             incremental,
             max_chain,
             source: None,
-            store: None,
+            store,
         },
     );
     // 같은 이름이 있으면 저장소가 거부한다(409 name_taken).
     state.cluster.create(&backup).await?;
     // 풀 지우기·백업 표시 끄기는 백업이 없을 때만 된다. 그 확인과 엇갈렸으면 만든 백업을 거둔다.
-    if !find_pool(state, &pool.name).is_ok_and(|p| p.spec.backups) {
+    let gone = match dest {
+        Dest::Pool(pool) => !find_pool(state, &pool.name).is_ok_and(|p| p.spec.backups),
+        Dest::Store(store) => state.cluster.get::<BackupStoreSpec>(store.id)?.is_none(),
+    };
+    if gone {
+        let pool = match dest {
+            Dest::Pool(pool) => format!("storage pool {:?}", pool.name),
+            Dest::Store(store) => format!("backup store {:?}", store.name),
+        };
         if let Err(d) = state.cluster.delete::<BackupSpec>(backup.id, None).await {
             tracing::warn!(backup = %backup.id, error = %d, "cannot remove backup of a removed pool");
         }
         return Err(ApiError::conflict(
             "pool_unavailable",
-            format!(
-                "storage pool {:?} was deleted or stopped storing backups",
-                pool.name
-            ),
+            format!("{pool} was deleted or stopped storing backups"),
         ));
     }
     let op = TaskOp::VmBackup { backup: backup.id };
@@ -537,7 +630,9 @@ pub(crate) fn parent_in_use(backups: &[Backup], backup: &Backup) -> Option<Strin
 /// 백업이 증분 백업의 부모이면 409 `backup_in_use`
 fn check_not_parent(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
-    match parent_in_use(&backups, backup) {
+    let used = parent_in_use(&backups, backup)
+        .or_else(|| crate::tasks::backup_store::base_in_use(&backups, backup));
+    match used {
         Some(message) => Err(ApiError::conflict("backup_in_use", message)),
         None => Ok(()),
     }
@@ -545,6 +640,21 @@ fn check_not_parent(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
 
 /// 백업 지우기 Task를 돌릴 노드. 풀이 없어졌으면(파일도 함께 없어졌다) 이 노드다.
 fn delete_node(state: &AppState, backup: &Backup) -> Result<Uuid, ApiError> {
+    if let Some(name) = &backup.spec.store {
+        // 저장소가 없어졌으면 이 노드의 Task가 리소스만 지운다.
+        let Some(store) = state.cluster.get_by_name::<BackupStoreSpec>(name)? else {
+            return Ok(state.node);
+        };
+        check_store(&store, true)?;
+        return crate::stores::task_node(&state.cluster, &store, Some(state.node))
+            .map_err(ApiError::bad_request)?
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "store_unavailable",
+                    format!("no online node can use backup store {name:?}"),
+                )
+            });
+    }
     match state
         .cluster
         .get_by_name::<StoragePoolSpec>(&backup.spec.pool)?
@@ -671,59 +781,63 @@ pub async fn restore_backup(
     }
     check_nic_qos(&state, spec)?;
     check_security_groups(&state, spec)?;
-    let source = find_pool(&state, &backup.spec.pool)?;
     let target = find_pool(&state, &req.pool)?;
-    let node = match (&req.node, backup.status.node) {
-        (key, Some(stored)) => {
-            if let Some(key) = key
-                && lookup::<NodeSpec>(&state.cluster, key)?.id != stored
-            {
-                return Err(ApiError::conflict(
-                    "backup_on_other_node",
+    let node = if let Some(store) = &backup.spec.store {
+        restore_store_node(&state, &backup, store, &target, req.node.as_deref())?
+    } else {
+        let source = find_pool(&state, &backup.spec.pool)?;
+        match (&req.node, backup.status.node) {
+            (key, Some(stored)) => {
+                if let Some(key) = key
+                    && lookup::<NodeSpec>(&state.cluster, key)?.id != stored
+                {
+                    return Err(ApiError::conflict(
+                        "backup_on_other_node",
+                        format!(
+                            "backup {:?} is stored on node {:?}",
+                            backup.name,
+                            node_name(&state, stored)?
+                        ),
+                    ));
+                }
+                check_online(&state, stored)?;
+                let name = node_name(&state, stored)?;
+                for pool in [&source, &target] {
+                    check_pool_on(&state, pool, stored, || {
+                        format!(
+                            "storage pool {:?} is not available on node {:?}",
+                            pool.name, name
+                        )
+                    })?;
+                }
+                stored
+            }
+            (Some(key), None) => {
+                let node = lookup::<NodeSpec>(&state.cluster, key)?;
+                check_online(&state, node.id)?;
+                for pool in [&source, &target] {
+                    check_pool_on(&state, pool, node.id, || {
+                        format!(
+                            "storage pool {:?} is not available on node {:?}",
+                            pool.name, node.name
+                        )
+                    })?;
+                }
+                node.id
+            }
+            (None, None) => first_node(&state, |n| {
+                pool_usable_on(&source, n) && pool_usable_on(&target, n)
+            })?
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "no_node",
                     format!(
-                        "backup {:?} is stored on node {:?}",
-                        backup.name,
-                        node_name(&state, stored)?
+                        "no online node can use both storage pools {:?} and {:?}",
+                        source.name, target.name
                     ),
-                ));
-            }
-            check_online(&state, stored)?;
-            let name = node_name(&state, stored)?;
-            for pool in [&source, &target] {
-                check_pool_on(&state, pool, stored, || {
-                    format!(
-                        "storage pool {:?} is not available on node {:?}",
-                        pool.name, name
-                    )
-                })?;
-            }
-            stored
+                )
+            })?,
         }
-        (Some(key), None) => {
-            let node = lookup::<NodeSpec>(&state.cluster, key)?;
-            check_online(&state, node.id)?;
-            for pool in [&source, &target] {
-                check_pool_on(&state, pool, node.id, || {
-                    format!(
-                        "storage pool {:?} is not available on node {:?}",
-                        pool.name, node.name
-                    )
-                })?;
-            }
-            node.id
-        }
-        (None, None) => first_node(&state, |n| {
-            pool_usable_on(&source, n) && pool_usable_on(&target, n)
-        })?
-        .ok_or_else(|| {
-            ApiError::conflict(
-                "no_node",
-                format!(
-                    "no online node can use both storage pools {:?} and {:?}",
-                    source.name, target.name
-                ),
-            )
-        })?,
     };
     if backup.status.parent.is_some() {
         let n = state
@@ -748,6 +862,51 @@ pub async fn restore_backup(
     };
     let task = create_task(&state.cluster, op, Uuid::now_v7(), node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 저장소 백업(계획 68 §8.6)을 되살릴 노드: `node`(저장소와 대상 풀을 쓸 수 있어야 함, 아니면 409 `store_not_on_node`·
+/// `pool_not_on_node`·`pool_unavailable`) 또는 그런 온라인 노드 가운데 — 이 노드를 먼저 — 이름이 가장 앞선 노드(없으면 409
+/// `no_node`). 저장소가 없으면 400, 준비되지 않았으면 409 `store_not_ready`.
+fn restore_store_node(
+    state: &AppState,
+    backup: &Backup,
+    store: &str,
+    target: &StoragePool,
+    node: Option<&str>,
+) -> Result<Uuid, ApiError> {
+    let store = find_store(state, store)?;
+    check_store(&store, false)?;
+    if let Some(key) = node {
+        let node = lookup::<NodeSpec>(&state.cluster, key)?;
+        check_online(state, node.id)?;
+        check_store_on(state, &store, node.id)?;
+        check_pool_on(state, target, node.id, || {
+            format!(
+                "storage pool {:?} is not available on node {:?}",
+                target.name, node.name
+            )
+        })?;
+        return Ok(node.id);
+    }
+    let pool =
+        crate::stores::backend_pool(&state.cluster, &store).map_err(ApiError::bad_request)?;
+    let fits =
+        |n: &Node| crate::stores::usable_on(&store, pool.as_ref(), n) && pool_usable_on(target, n);
+    if let Some(me) = state.cluster.get::<NodeSpec>(state.node)?
+        && me.status.online
+        && fits(&me)
+    {
+        return Ok(me.id);
+    }
+    first_node(state, fits)?.ok_or_else(|| {
+        ApiError::conflict(
+            "no_node",
+            format!(
+                "no online node can use both backup store {:?} and storage pool {:?} to restore backup {:?}",
+                store.name, target.name, backup.name
+            ),
+        )
+    })
 }
 
 /// `ready` 백업을 원격 클러스터 `remote`의 백업 풀 `pool`에 사본으로 보낼 Task를 돌려준다(202). Task는
@@ -805,6 +964,13 @@ pub(crate) async fn start_backup_replicate(
     pool: String,
 ) -> Result<Task, ApiError> {
     require_current(&state.cluster)?;
+    // 저장소 백업의 복제(없는 청크만 — 계획 68 §12.4)는 API 스테이지가 연다.
+    if backup.spec.store.is_some() {
+        return Err(store_not_yet(
+            &state.cluster,
+            "replicating backups of a backup store",
+        ));
+    }
     let remote = lookup::<RemoteSpec>(&state.cluster, remote)?;
     if backup.status.phase != BackupPhase::Ready {
         return Err(ApiError::conflict(

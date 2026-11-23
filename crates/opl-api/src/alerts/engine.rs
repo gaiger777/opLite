@@ -24,7 +24,9 @@ use opl_types::alert::{
     AlertSubject, Evaluator, Notice, NotificationState, Observation, RESOLVE_AFTER_MS, SubjectKind,
     advance,
 };
+use opl_types::backup::{BackupSpec, VerifyState};
 use opl_types::backup_job::{BackupJob, BackupJobSpec};
+use opl_types::backup_store::BackupStoreSpec;
 use opl_types::clock::{Clock, SystemClock};
 use opl_types::cluster::ClusterSpec;
 use opl_types::load_balancer::LoadBalancerSpec;
@@ -657,6 +659,15 @@ impl Engine {
             let (status, out) = match rule.spec.condition {
                 AlertCondition::NodeOffline => self.node_offline(now, &rule, nodes),
                 AlertCondition::BackupJobFailed => self.backup_failed(now, &rule),
+                // 백업 저장소(계획 68 §10.5·§6): 목록을 읽지 못하면 그대로 둔다.
+                AlertCondition::BackupVerifyFailed => match self.verify_findings() {
+                    Some(f) => self.subject_rule(now, &rule, f, "The backup was deleted."),
+                    None => continue,
+                },
+                AlertCondition::BackupStoreUnavailable => match self.store_findings(nodes) {
+                    Some(f) => self.subject_rule(now, &rule, f, "The backup store was deleted."),
+                    None => continue,
+                },
                 ref c if c.is_sdn() => {
                     // 입력을 읽지 못했으면 그대로 둔다(빈 입력으로 보면 경보를 알림 없이 뺀다).
                     let Some(world) = &sdn else { continue };
@@ -847,6 +858,135 @@ impl Engine {
                     state: NotificationState::Resolved,
                     detail: Some("The node was removed from the cluster.".into()),
                 });
+            }
+        }
+        active.sort_by_key(|a| a.key());
+        status.active = active;
+        (status, out)
+    }
+
+    /// 검증이 실패한 백업(`status.verify.state == failed`)마다 참. 저장소 백업만 본다.
+    fn verify_findings(&self) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
+        let (_, backups) = self.cluster().list::<BackupSpec>().ok()?;
+        Some(
+            backups
+                .iter()
+                .filter(|b| b.status.verify.is_some())
+                .map(|b| {
+                    let v = b.status.verify.as_ref().expect("filtered");
+                    let failed = v.state == VerifyState::Failed;
+                    let detail = failed.then(|| {
+                        let mut d = format!(
+                            "Backup {} failed verification ({} bad chunks)",
+                            b.name, v.bad_chunks
+                        );
+                        if let Some(e) = &v.error {
+                            d.push_str(&format!(": {e}"));
+                        }
+                        d
+                    });
+                    let subject = AlertSubject {
+                        kind: SubjectKind::Backup,
+                        id: b.id,
+                        name: b.name.clone(),
+                        node: None,
+                    };
+                    (subject, failed, detail)
+                })
+                .collect(),
+        )
+    }
+
+    /// 저장소마다: 이 저장소를 쓰는 온라인 노드 가운데 닿지 않는다고 보고한 노드가 있으면 참(노드 보고
+    /// `NodeStatus.backup_stores`, 60초마다).
+    fn store_findings(&self, nodes: &[Node]) -> Option<Vec<(AlertSubject, bool, Option<String>)>> {
+        let (_, stores) = self.cluster().list::<BackupStoreSpec>().ok()?;
+        Some(
+            stores
+                .iter()
+                .map(|s| {
+                    let failing: Vec<String> = nodes
+                        .iter()
+                        .filter(|n| n.status.online)
+                        .filter_map(|n| {
+                            let r = n.status.backup_stores.iter().find(|r| r.store == s.id)?;
+                            (!r.ok).then(|| {
+                                format!(
+                                    "- {}: {}",
+                                    n.name,
+                                    r.error.as_deref().unwrap_or("unreachable")
+                                )
+                            })
+                        })
+                        .collect();
+                    let subject = AlertSubject {
+                        kind: SubjectKind::BackupStore,
+                        id: s.id,
+                        name: s.name.clone(),
+                        node: None,
+                    };
+                    let detail = (!failing.is_empty()).then(|| {
+                        format!(
+                            "Backup store {} is unreachable from:\n{}",
+                            s.name,
+                            failing.join("\n")
+                        )
+                    });
+                    (subject, !failing.is_empty(), detail)
+                })
+                .collect(),
+        )
+    }
+
+    /// 대상마다 참·거짓을 본 상태 조건(`for_secs`·해제 규칙은 [`advance`]). 목록에서 사라진 대상의 `firing` 경보는
+    /// `gone`과 함께 해제로 알린다. 끈 규칙은 알림 없이 비운다.
+    fn subject_rule(
+        &self,
+        now: i64,
+        rule: &AlertRule,
+        findings: Vec<(AlertSubject, bool, Option<String>)>,
+        gone: &str,
+    ) -> (opl_types::alert::AlertRuleStatus, Vec<Pending>) {
+        let mut status = rule.status.clone();
+        let mut current: HashMap<String, ActiveAlert> =
+            status.active.iter().map(|a| (a.key(), a.clone())).collect();
+        let mut active = Vec::new();
+        let mut out = Vec::new();
+        if rule.spec.enabled {
+            for (subject, holds, detail) in findings {
+                let before = current.remove(&subject.key(rule.id));
+                let (after, notice) = advance(
+                    rule.id,
+                    &rule.spec,
+                    &subject,
+                    before.clone(),
+                    Some(Observation::new(holds, None)),
+                    now,
+                    self.resolve_after_ms,
+                );
+                if let Some(a) = &after {
+                    active.push(a.clone());
+                }
+                if let Some(notice) = notice
+                    && let Some(alert) = after.or(before)
+                {
+                    out.push(Pending {
+                        rule: rule.clone(),
+                        alert,
+                        state: notice_state(notice),
+                        detail: (notice != Notice::Resolve).then_some(detail).flatten(),
+                    });
+                }
+            }
+            for (_, a) in current {
+                if rule.spec.send_resolved && a.state == AlertState::Firing {
+                    out.push(Pending {
+                        rule: rule.clone(),
+                        alert: a,
+                        state: NotificationState::Resolved,
+                        detail: Some(gone.into()),
+                    });
+                }
             }
         }
         active.sort_by_key(|a| a.key());

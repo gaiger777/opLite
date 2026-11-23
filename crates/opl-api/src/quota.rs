@@ -304,6 +304,37 @@ pub(crate) fn precheck(cluster: &Cluster, change: Change) -> Result<(), ApiError
     }
 }
 
+/// 새 백업(계획 68 §13): VM 폴더나 그 조상의 `backup_bytes` 할당량을 **이미** 다 썼으면 409 `quota_exceeded`. 백업 크기는
+/// 미리 알 수 없으므로 진행 중 백업 하나는 넘길 수 있다. 그 할당량이 없으면 바로 끝난다.
+pub(crate) fn check_backup_room(cluster: &Cluster, folder: Option<Uuid>) -> Result<(), ApiError> {
+    let tree = tree(cluster)?;
+    let limited: Vec<(Uuid, u64)> = ancestors(&tree, folder)
+        .into_iter()
+        .filter_map(|f| Some((f, tree.get(&f)?.quota?.backup_bytes?)))
+        .collect();
+    if limited.is_empty() {
+        return Ok(());
+    }
+    let direct = direct_usage(cluster)?;
+    for (f, limit) in limited {
+        let used = subtree_usage(&tree, &direct, f).backup_bytes;
+        if used >= limit {
+            return Err(exceeded(
+                f,
+                QuotaDimension::BackupBytes,
+                limit,
+                used,
+                format!(
+                    "folder {} already uses {used} of {limit} {}",
+                    folder_path(cluster, f),
+                    QuotaDimension::BackupBytes.unit()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// 할당량 있는 폴더 하나의 상한과 하위 트리 사용량
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuotaLimit {

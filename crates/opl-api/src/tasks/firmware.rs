@@ -53,8 +53,13 @@ pub(super) async fn file_hash(path: &Path) -> io::Result<Option<String>> {
 /// `from`을 `to`에 0600으로 둔다(임시 파일에 쓰고 rename). 디렉터리가 없으면 0700으로 만든다. 둔 내용의 SHA-256을
 /// 돌려준다. TPM 상태는 봉인한 비밀을 지키는 키라서 다른 사용자가 읽지 못하게 한다.
 pub(super) async fn place_private(from: &Path, to: &Path) -> io::Result<String> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let bytes = tokio::fs::read(from).await?;
+    place_private_bytes(bytes, to).await
+}
+
+/// [`place_private`]와 같되 내용 `bytes`를 둔다(저장소 백업의 TPM 블롭 — 계획 68).
+pub(super) async fn place_private_bytes(bytes: Vec<u8>, to: &Path) -> io::Result<String> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     let (to, sha256) = (to.to_path_buf(), sha256_hex(&bytes));
     tokio::task::spawn_blocking(move || -> io::Result<()> {
         use std::io::Write;

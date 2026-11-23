@@ -4,6 +4,9 @@
 //! - `POST /v1/test/put` `{kind, name, spec}`: `backup-store`·`backup-job`은 스펙 검증만 하고 이름으로 만들거나 바꾼다
 //!   (`spec`이 null이면 지움). 답은 리소스 id(지웠으면 null)다. API의 검사(기능·권한·풀·키·겹침)는 스테이지 4·6에서
 //!   생긴다 — Raft의 겹침 키(`backup-store-target`)는 상태 기계가 본다.
+//! - `POST /v1/test/task` `{op, target, node}`: Task를 곧바로 만든다(스테이지 4 — 저장소 초기화·GC·검증·옮기기). 답은 Task id.
+//! - `POST /v1/test/backup` `{vm, store, name, incremental}`: VM의 저장소 백업(`pending` Backup과 `vm-backup` Task)을 만든다.
+//!   Task는 `node`(없으면 VM이 도는 노드나 배치된 노드)에서 돈다. 답은 Task id.
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -39,7 +42,10 @@ fn bad(e: impl std::fmt::Display) -> Failure {
 }
 
 pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
-    Router::new().route("/v1/test/put", post(put))
+    Router::new()
+        .route("/v1/test/put", post(put))
+        .route("/v1/test/task", post(task))
+        .route("/v1/test/backup", post(backup))
 }
 
 #[derive(Deserialize)]
@@ -104,4 +110,73 @@ async fn put_one<S: ResourceSpec>(
         }
         (None, None) => Ok(None),
     }
+}
+
+#[derive(Deserialize)]
+struct NewTask {
+    op: opl_types::task::TaskOp,
+    target: uuid::Uuid,
+    node: uuid::Uuid,
+}
+
+async fn create_task(
+    cluster: &Cluster,
+    op: opl_types::task::TaskOp,
+    target: uuid::Uuid,
+    node: uuid::Uuid,
+) -> Result<uuid::Uuid, Failure> {
+    use opl_types::task::TaskSpec;
+    let mut t: opl_types::task::Task = Resource::new("", TaskSpec { op, target, node });
+    t.name = t.id.to_string();
+    cluster.create(&t).await.map_err(bad)?;
+    Ok(t.id)
+}
+
+async fn task(Json(b): Json<NewTask>) -> Result<Json<uuid::Uuid>, Failure> {
+    let cluster = member()?;
+    Ok(Json(create_task(&cluster, b.op, b.target, b.node).await?))
+}
+
+#[derive(Deserialize)]
+struct NewBackup {
+    vm: String,
+    store: String,
+    name: String,
+    #[serde(default)]
+    incremental: bool,
+    #[serde(default)]
+    node: Option<uuid::Uuid>,
+}
+
+async fn backup(Json(b): Json<NewBackup>) -> Result<Json<uuid::Uuid>, Failure> {
+    use opl_types::backup::BackupSpec;
+    use opl_types::vm::VmSpec;
+    let cluster = member()?;
+    let vm = cluster
+        .get_by_name::<VmSpec>(&b.vm)
+        .map_err(bad)?
+        .ok_or_else(|| bad("no such VM"))?;
+    let node = b
+        .node
+        .or(vm.status.node)
+        .or(vm.spec.node)
+        .ok_or_else(|| bad("the VM has no node; give one"))?;
+    let backup: opl_types::backup::Backup = Resource::new(
+        b.name,
+        BackupSpec {
+            vm: vm.id,
+            vm_name: vm.name.clone(),
+            pool: String::new(),
+            store: Some(b.store),
+            source: None,
+            vm_spec: vm.spec.clone(),
+            job: None,
+            origin: None,
+            incremental: b.incremental,
+            max_chain: None,
+        },
+    );
+    cluster.create(&backup).await.map_err(bad)?;
+    let op = opl_types::task::TaskOp::VmBackup { backup: backup.id };
+    Ok(Json(create_task(&cluster, op, vm.id, node).await?))
 }

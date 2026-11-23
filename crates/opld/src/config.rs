@@ -274,6 +274,16 @@ pub struct BackupSection {
     /// 노드마다 동시에 도는 백업 Task의 최대 수
     #[serde(default = "default_backup_max_concurrent")]
     pub max_concurrent: usize,
+    /// 저장소 백업(계획 68 §8.5): fleecing을 시작하려면 VM 상태 디렉터리에 남아 있어야 할 공간의 최소(MiB — 디스크 크기
+    /// 합의 10%와 큰 쪽)
+    #[serde(default = "default_fleece_reserve_min_mib")]
+    pub fleece_reserve_min_mib: u64,
+    /// 저장소 백업을 읽는 동안 남은 공간이 이보다 적어지면 읽기를 끊는다(MiB)
+    #[serde(default = "default_fleece_min_free_mib")]
+    pub fleece_min_free_mib: u64,
+    /// 저장소 복원·라이브 복원의 NBD 서버가 둘 풀린 청크 캐시(MiB)
+    #[serde(default = "default_serve_cache_mib")]
+    pub serve_cache_mib: u64,
 }
 
 impl Default for BackupSection {
@@ -281,6 +291,9 @@ impl Default for BackupSection {
         Self {
             tick_secs: default_tick_secs(),
             max_concurrent: default_backup_max_concurrent(),
+            fleece_reserve_min_mib: default_fleece_reserve_min_mib(),
+            fleece_min_free_mib: default_fleece_min_free_mib(),
+            serve_cache_mib: default_serve_cache_mib(),
         }
     }
 }
@@ -1412,11 +1425,30 @@ fn default_systemd_scope() -> bool {
 fn default_qemu_img() -> PathBuf {
     "qemu-img".into()
 }
+
+impl Config {
+    /// `qemu-nbd`(계획 68 — 꺼진 VM·옛 백업을 저장소로 읽기): `qemu_img`과 같은 디렉터리의 것, 경로 없는 이름이면 PATH
+    pub fn qemu_nbd(&self) -> PathBuf {
+        match self.qemu_img.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(dir) => dir.join("qemu-nbd"),
+            None => "qemu-nbd".into(),
+        }
+    }
+}
 fn default_acpi_timeout() -> u64 {
     60
 }
 fn default_tick_secs() -> u64 {
     60
+}
+fn default_fleece_reserve_min_mib() -> u64 {
+    2048
+}
+fn default_fleece_min_free_mib() -> u64 {
+    1024
+}
+fn default_serve_cache_mib() -> u64 {
+    opl_store::nbd::serve::DEFAULT_CACHE_MIB
 }
 fn default_hour_secs() -> u64 {
     3600
@@ -1540,6 +1572,9 @@ impl Config {
         }
         if self.backup.tick_secs == 0 || self.backup.max_concurrent == 0 {
             anyhow::bail!("backup.tick_secs and backup.max_concurrent must be at least 1");
+        }
+        if self.backup.serve_cache_mib < 8 || self.backup.serve_cache_mib > 1 << 20 {
+            anyhow::bail!("backup.serve_cache_mib must be between 8 and 1048576");
         }
         if self.replication.tick_secs == 0 || self.replication.max_concurrent == 0 {
             anyhow::bail!(
@@ -2131,6 +2166,25 @@ mod tests {
         assert!(
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[backup]\ntick = 1").is_err()
         );
+    }
+
+    #[test]
+    fn backup_section_sets_the_store_backup_limits() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.backup.fleece_reserve_min_mib, 2048);
+        assert_eq!(c.backup.fleece_min_free_mib, 1024);
+        assert_eq!(c.backup.serve_cache_mib, 256);
+        assert_eq!(c.qemu_nbd(), PathBuf::from("qemu-nbd"));
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\nqemu_img = \"/opt/q/bin/qemu-img\"\n[backup]\nfleece_reserve_min_mib = 512\nfleece_min_free_mib = 64\nserve_cache_mib = 32",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.backup.fleece_reserve_min_mib, 512);
+        assert_eq!(c.backup.fleece_min_free_mib, 64);
+        assert_eq!(c.backup.serve_cache_mib, 32);
+        assert_eq!(c.qemu_nbd(), PathBuf::from("/opt/q/bin/qemu-nbd"));
+        let c = parse("name = \"n\"\naddress = \"h\"\n[backup]\nserve_cache_mib = 4");
+        assert!(c.validate().is_err());
     }
 
     #[test]

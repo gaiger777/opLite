@@ -419,6 +419,10 @@ pub struct BackupStoreStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub store_id: Option<Uuid>,
+    /// 공유가 아닌 백업 풀 안 저장소를 만든 노드(그 노드에만 있다 — §7.6). 공유 풀·S3면 없다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub node: Option<Uuid>,
     /// 저장소 `owner.json`의 주인 클러스터(§12.6)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
@@ -1030,6 +1034,7 @@ mod tests {
         let status = BackupStoreStatus {
             phase: StorePhase::Ready,
             store_id: Some(Uuid::now_v7()),
+            node: Some(Uuid::now_v7()),
             owner: Some(StoreOwner {
                 cluster: "prod".into(),
                 ca_fingerprint: format!("sha256:{}", "ab".repeat(32)),

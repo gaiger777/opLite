@@ -53,7 +53,7 @@ pub use storage::{
     LvmThinStorage, NbdSource, RBD_DEFAULT_USER, RbdOps, RbdSnapshot, RbdSpace, RbdStorage,
     Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VgInfo, VolumeInfo, VolumeSource,
     ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root,
-    disk_location, is_iso_image, nbd_source, parse_ceph_df, parse_lvs, parse_vgs,
+    disk_location, is_iso_image, nbd_chain_source, nbd_source, parse_ceph_df, parse_lvs, parse_vgs,
     parse_zfs_dataset, pool_root,
 };
 pub use tpm::{

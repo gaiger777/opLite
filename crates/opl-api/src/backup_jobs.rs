@@ -20,6 +20,7 @@ use opl_types::backup_job::{
     BackupJob, BackupJobSpec, BackupJobStatus, JobError, JobRun, JobRunResult, JobSchedule, Keep,
     ReplicateTarget, VmSelector, next_run, prune,
 };
+use opl_types::backup_store::BackupStoreSpec;
 use opl_types::remote::RemoteSpec;
 use opl_types::resource::{Resource, ResourceSpec};
 use opl_types::storage::StoragePoolSpec;
@@ -33,7 +34,7 @@ use uuid::Uuid;
 
 use crate::auth::{Action, Principal};
 use crate::backups::{
-    check_backup, files_node, find_pool, now, start_backup, start_backup_delete,
+    Dest, check_backup, files_node, find_pool, now, start_backup, start_backup_delete,
     start_backup_replicate,
 };
 use crate::cluster::{require_current, require_feature};
@@ -423,6 +424,132 @@ async fn tick(state: &AppState, config: &BackupJobSchedulerConfig) {
             tracing::warn!(job = %job.name, error = %e.message, "cannot replicate backups of job");
         }
     }
+    store_tick(state, now).await;
+}
+
+/// 저장소마다 예약 GC·검증(계획 68 §10.5 — `next_gc`·`next_verify`, 놓친 실행은 한 번)과 새 백업 검증(`verify_new`)을
+/// 줄 세운다. 같은 종류의 Task가 끝나지 않았으면 만들지 않는다. 돌릴 노드가 없으면 다음 tick에 다시 본다.
+async fn store_tick(state: &AppState, now: u64) {
+    let cluster = &state.cluster;
+    let lists = (|| {
+        Ok::<_, opl_cluster::ClusterError>((
+            cluster.list::<BackupStoreSpec>()?.1,
+            cluster.list::<TaskSpec>()?.1,
+            cluster.list::<BackupSpec>()?.1,
+        ))
+    })();
+    let Ok((stores, tasks, backups)) = lists else {
+        return;
+    };
+    for store in stores
+        .iter()
+        .filter(|s| s.status.phase == opl_types::backup_store::StorePhase::Ready)
+    {
+        if let Err(e) = schedule_store(state, store, &tasks, &backups, now).await {
+            tracing::warn!(store = %store.name, error = %e.message, "cannot schedule backup store tasks");
+        }
+    }
+}
+
+/// 저장소 하나의 예약([`store_tick`])
+async fn schedule_store(
+    state: &AppState,
+    store: &opl_types::backup_store::BackupStore,
+    tasks: &[Task],
+    backups: &[Backup],
+    now: u64,
+) -> Result<(), ApiError> {
+    let cluster = &state.cluster;
+    let unfinished = |gc: bool| {
+        tasks.iter().any(|t| {
+            !t.status.state.is_finished()
+                && t.spec.target == store.id
+                && match t.spec.op {
+                    TaskOp::BackupStoreGc => gc,
+                    TaskOp::BackupStoreVerify { .. } => !gc,
+                    _ => false,
+                }
+        })
+    };
+    let mut status = store.status.clone();
+    // 다음 시각이 없으면 적고, 지났으면 Task를 만든 뒤 다음 시각으로 옮긴다.
+    let mut gc_due = false;
+    if store.spec.read_only {
+        status.next_gc = None;
+    } else {
+        match status.next_gc {
+            None => status.next_gc = Some(next_run(&store.spec.gc, now)),
+            Some(t) if t <= now => gc_due = true,
+            Some(_) => {}
+        }
+    }
+    let mut verify_due = false;
+    match &store.spec.verify {
+        None => status.next_verify = None,
+        Some(p) => match status.next_verify {
+            None => status.next_verify = Some(next_run(&p.schedule, now)),
+            Some(t) if t <= now => verify_due = true,
+            Some(_) => {}
+        },
+    }
+    // 새로 `ready`가 된 백업(검증한 적 없음)은 곧바로 검증한다.
+    let verifying: HashSet<Uuid> = tasks
+        .iter()
+        .filter(|t| !t.status.state.is_finished())
+        .filter_map(|t| match &t.spec.op {
+            TaskOp::BackupStoreVerify { backups } => Some(backups.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let fresh: Vec<Uuid> = if store.spec.verify.as_ref().is_some_and(|p| p.verify_new) {
+        backups
+            .iter()
+            .filter(|b| {
+                b.spec.store.as_deref() == Some(store.name.as_str())
+                    && b.status.phase == BackupPhase::Ready
+                    && b.status.verify.is_none()
+                    && !verifying.contains(&b.id)
+            })
+            .map(|b| b.id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let wants = gc_due || verify_due || !fresh.is_empty();
+    let node = if wants {
+        crate::stores::task_node(cluster, store, None).map_err(ApiError::internal)?
+    } else {
+        None
+    };
+    if let Some(node) = node {
+        if gc_due {
+            if !unfinished(true) {
+                let task =
+                    crate::tasks::create_task(cluster, TaskOp::BackupStoreGc, store.id, node)
+                        .await?;
+                tracing::info!(store = %store.name, task = %task.id, "scheduled backup store GC");
+            }
+            status.next_gc = Some(next_run(&store.spec.gc, now));
+        }
+        if let Some(p) = store.spec.verify.as_ref().filter(|_| verify_due) {
+            if !unfinished(false) {
+                let op = TaskOp::BackupStoreVerify { backups: vec![] };
+                let task = crate::tasks::create_task(cluster, op, store.id, node).await?;
+                tracing::info!(store = %store.name, task = %task.id, "scheduled backup store verification");
+            }
+            status.next_verify = Some(next_run(&p.schedule, now));
+        } else if !fresh.is_empty() {
+            let op = TaskOp::BackupStoreVerify { backups: fresh };
+            crate::tasks::create_task(cluster, op, store.id, node).await?;
+        }
+    }
+    if status != store.status {
+        cluster
+            .update_status_checked::<BackupStoreSpec>(store.id, store.revision, &status)
+            .await?;
+    }
+    Ok(())
 }
 
 /// 작업 하나를 한 걸음 나아가게 한다: 때가 되면 실행을 시작하고, 큐에서 VM을 꺼내 백업을 요청하고,
@@ -729,10 +856,17 @@ async fn dispatch(
     {
         return refused("a backup of this VM is already running".into());
     }
-    let Some(pool) = cluster.get_by_name::<StoragePoolSpec>(&job.spec.pool)? else {
-        return refused(format!("storage pool {:?} not found", job.spec.pool));
+    let dest = match &job.spec.store {
+        Some(store) => match cluster.get_by_name::<BackupStoreSpec>(store)? {
+            Some(s) => Dest::Store(s),
+            None => return refused(format!("backup store {store:?} not found")),
+        },
+        None => match cluster.get_by_name::<StoragePoolSpec>(&job.spec.pool)? {
+            Some(p) => Dest::Pool(p),
+            None => return refused(format!("storage pool {:?} not found", job.spec.pool)),
+        },
     };
-    let node = match check_backup(state, &vm, &pool) {
+    let node = match check_backup(state, &vm, &dest) {
         Ok(node) => node,
         Err(e) if e.status.is_client_error() => return refused(e.message),
         Err(e) => return Err(e),
@@ -751,7 +885,7 @@ async fn dispatch(
     let started = start_backup(
         state,
         &vm,
-        &pool,
+        &dest,
         node,
         name,
         Some(job.id),
@@ -896,9 +1030,13 @@ fn finish(
 /// 되살리는 데 필요하므로 남기고, 지울 증분 백업은 그 부모보다 먼저 둔다(자식이 있는 부모는 지울 수
 /// 없다, 증분 백업 설계 §3.7).
 fn retention(job: Uuid, keep: &Keep, backups: &[Backup]) -> Vec<Uuid> {
-    let mut by_vm: BTreeMap<Uuid, Vec<&Backup>> = BTreeMap::new();
+    // VM과 대상(풀·저장소)마다 따로 고른다(계획 68 §12.1 — 작업을 저장소로 바꾼 뒤에도 풀 쪽은 그 규칙대로 줄어든다).
+    let mut by_vm: BTreeMap<(Uuid, String, Option<String>), Vec<&Backup>> = BTreeMap::new();
     for b in backups.iter().filter(|b| b.spec.job == Some(job)) {
-        by_vm.entry(b.spec.vm).or_default().push(b);
+        by_vm
+            .entry((b.spec.vm, b.spec.pool.clone(), b.spec.store.clone()))
+            .or_default()
+            .push(b);
     }
     let mut out = Vec::new();
     for mine in by_vm.values() {

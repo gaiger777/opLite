@@ -104,10 +104,8 @@ impl FixedIndex {
         {
             return Err(bad("chunk count does not match the size"));
         }
-        let ids = body[HEADER_BYTES..]
-            .chunks_exact(32)
-            .map(|c| c.try_into().expect("32 bytes"))
-            .collect();
+        // 길이는 위에서 32의 배수로 확인했다(남는 바이트 없음).
+        let ids = body[HEADER_BYTES..].as_chunks::<32>().0.to_vec();
         Ok(FixedIndex {
             backup,
             virtual_bytes,

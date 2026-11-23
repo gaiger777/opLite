@@ -494,3 +494,25 @@ async fn extra_contexts_are_negotiated_and_answered_together() {
     let mut plain = connect(&server, "disk0", &[]).await.unwrap();
     assert!(plain.block_status(BASE_ALLOCATION, 0, 10).await.is_err());
 }
+
+/// `BLOCK_STATUS`는 읽기 한도(32 MiB)보다 긴 범위도 받는다(`qemu-img convert`가 64 MiB 디스크에 한 번에 묻는다).
+#[tokio::test]
+async fn block_status_accepts_ranges_longer_than_the_read_limit() {
+    let size = 40 * MIB;
+    let mut data = vec![0u8; size];
+    data[35 * MIB] = 1;
+    let server = server_with(data, None);
+    let mut c = connect(&server, "disk0", &[BASE_ALLOCATION]).await.unwrap();
+    let got = c
+        .block_status(BASE_ALLOCATION, 0, size as u32)
+        .await
+        .unwrap();
+    assert_eq!(got[0].flags, STATE_HOLE | STATE_ZERO);
+    assert!(got.iter().map(|e| e.length).sum::<u64>() <= size as u64);
+    // 읽기는 그대로 한도를 지킨다
+    assert!(
+        c.read(0, (MAX_REQUEST as usize + 4096) as u32)
+            .await
+            .is_err()
+    );
+}

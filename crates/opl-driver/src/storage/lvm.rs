@@ -744,6 +744,18 @@ impl Storage for LvmThinStorage {
             .await
     }
 
+    async fn import_nbd(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        socket: &Path,
+        export: &str,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Nbd(socket, export), format)
+            .await
+    }
+
     /// 올린 파일만 본다(풀과 상관없다).
     async fn check_import_source(
         &self,
@@ -1402,6 +1414,18 @@ impl Storage for LvmSharedStorage {
         format: ImageFormat,
     ) -> Result<PathBuf, DriverError> {
         self.import_from(pool, id, ImportSource::Chain(chain), format)
+            .await
+    }
+
+    async fn import_nbd(
+        &self,
+        pool: &StoragePool,
+        id: Uuid,
+        socket: &Path,
+        export: &str,
+        format: ImageFormat,
+    ) -> Result<PathBuf, DriverError> {
+        self.import_from(pool, id, ImportSource::Nbd(socket, export), format)
             .await
     }
 
