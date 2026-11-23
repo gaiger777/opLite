@@ -1,0 +1,3 @@
+DEVNAME=/dev/vdb
+PTUUID=a1b2c3d4
+PTTYPE=dos

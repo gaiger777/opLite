@@ -71,6 +71,9 @@ ring = "0.17.14"
 base64 = "0.22.1"
 # 백업 저장소 청크 압축(계획 68). 순수 Rust, unsafe 없는 길만 쓴다.
 lz4_flex = { version = "0.14.2", default-features = false, features = ["safe-encode", "safe-decode", "std"] }
+# 파일 단위 복원의 zip(deflate)·tar.gz(계획 69). 기본 백엔드 miniz_oxide·crc32fast — 순수 Rust(도우미 에이전트를
+# musl로 C 없이 빌드한다).
+flate2 = "1.1.11"
 # S3 백엔드의 시스템 루트 인증서(계획 68). lettre가 이미 끌어온다.
 rustls-native-certs = "0.8.5"
 # TOTP 비밀의 base32(계획 62). 이미 트리에 있다.

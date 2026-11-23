@@ -1,0 +1,16 @@
+  {
+      "report": [
+          {
+              "lv": [
+                  {"vg_name":"rl", "lv_name":"root", "vg_uuid":"Vg0001-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_uuid":"Lv0001-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_size":"8585740288", "lv_attr":"-wi-a-----", "lv_dm_path":"/dev/mapper/rl-root"},
+                  {"vg_name":"rl", "lv_name":"swap", "vg_uuid":"Vg0001-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_uuid":"Lv0002-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_size":"1073741824", "lv_attr":"-wi-a-----", "lv_dm_path":"/dev/mapper/rl-swap"},
+                  {"vg_name":"rl", "lv_name":"pool", "vg_uuid":"Vg0001-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_uuid":"Lv0003-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_size":"4294967296", "lv_attr":"twi-aotz--", "lv_dm_path":"/dev/mapper/rl-pool"},
+                  {"vg_name":"rl", "lv_name":"thin1", "vg_uuid":"Vg0001-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_uuid":"Lv0004-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_size":"2147483648", "lv_attr":"Vwi-aotz--", "lv_dm_path":"/dev/mapper/rl-thin1"},
+                  {"vg_name":"rl", "lv_name":"off", "vg_uuid":"Vg0001-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_uuid":"Lv0005-aaaa-bbbb-cccc-dddd-eeee-ffffff", "lv_size":"1048576", "lv_attr":"-wi-------", "lv_dm_path":""}
+              ]
+          }
+      ]
+      ,
+      "log": [
+      ]
+  }

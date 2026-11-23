@@ -1,0 +1,3 @@
+DEVNAME=/dev/vda
+PTUUID=0b8f6f3e-5d2a-4c39-9b0e-2f7d8a1c4e55
+PTTYPE=gpt

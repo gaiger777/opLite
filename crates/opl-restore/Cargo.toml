@@ -1,0 +1,33 @@
+[package]
+name = "opl-restore"
+description = "File-level restore for Orbivisor: helper VM agent and its protocol, zip and tar.gz streaming writers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# 에이전트 바이너리는 도우미 VM의 PID 1이다(정적 musl, `--target <arch>-unknown-linux-musl`, 링커 rust-lld). C를 쓰는
+# 의존성(ring·cc 빌드 스크립트)을 들이지 않는다 — 그래서 opl-types(ring)에 기대지 않고 통신 규약의 타입·한도를 여기
+# 따로 둔다(opl-types와 같은 값인지는 시험이 본다).
+[[bin]]
+name = "orbivisor-restore-agent"
+path = "src/bin/agent.rs"
+
+[features]
+# 만든 zip·tar.gz를 `unzip -t`·`bsdtar`·`tar`(있으면 Python zipfile)로 읽어 보는 시험(Debian/Ubuntu: apt install
+# unzip libarchive-tools, macOS는 기본).
+storage-it = []
+
+[dependencies]
+base64.workspace = true
+flate2.workspace = true
+rustix = { workspace = true, features = ["fs", "mount", "system"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+opl-types.workspace = true
+proptest.workspace = true
+tempfile.workspace = true
