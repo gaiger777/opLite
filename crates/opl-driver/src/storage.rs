@@ -1124,6 +1124,14 @@ async fn spawn_nbd(
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
     }
+    // 소켓 디렉터리(새 데이터 디렉터리면 아직 없다 — qemu-nbd는 만들지 않는다). 소켓만 두므로 opld만 들어간다.
+    if let Some(dir) = socket.parent() {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+    }
     let child = tokio::process::Command::new(qemu_nbd)
         .args(&args)
         .stdin(std::process::Stdio::null())

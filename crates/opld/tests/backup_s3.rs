@@ -83,9 +83,15 @@ async fn volume(d: &Daemon, name: &str, size: &str, format: &str) -> PathBuf {
         .join(format!("{}.{format}", v["id"].as_str().unwrap()))
 }
 
-fn volume_file(d: &Daemon, v: &Value, format: &str) -> PathBuf {
-    d.path("local")
-        .join(format!("{}.{format}", v["id"].as_str().unwrap()))
+/// 복원한 볼륨 `v`(`volume get`)가 `root`(형식 `root_format`)와 바이트가 같은가. 볼륨 형식은 spec에서 읽는다(dir 풀로의
+/// 복원은 원본이 raw여도 qcow2다).
+fn same_as(d: &Daemon, v: &Value, root: &Path, root_format: &str) -> bool {
+    let format = v["spec"]["format"].as_str().unwrap();
+    let file = d
+        .path("local")
+        .join(format!("{}.{format}", v["id"].as_str().unwrap()));
+    assert!(file.exists(), "{} is missing: {v}", file.display());
+    same(&file, format, root, root_format)
 }
 
 /// `backup-store create`의 S3 인자(http 끝점이면 `--insecure-http`)
@@ -262,7 +268,7 @@ async fn s3_store_backups_survive_concurrent_gc() {
     .unwrap();
     println!("PROBE restore of 256 MiB from S3: {:?}", started.elapsed());
     let copy = d.ctl_json(&["volume", "get", "copy-disk0"]).await;
-    assert!(same(&volume_file(&d, &copy, "raw"), "raw", &root, "raw"));
+    assert!(same_as(&d, &copy, &root, "raw"));
 }
 
 /// 사용자 CA로 서명한 HTTPS 끝점: CA 없이는 초기화가 실패하고(시스템 루트가 모름), `--ca-file`이면 백업·복원이 된다.
@@ -303,12 +309,7 @@ async fn s3_https_with_a_user_ca() {
     .await
     .unwrap();
     let copy = d.ctl_json(&["volume", "get", "web2-disk0"]).await;
-    assert!(same(
-        &volume_file(&d, &copy, "qcow2"),
-        "qcow2",
-        &root,
-        "qcow2"
-    ));
+    assert!(same_as(&d, &copy, &root, "qcow2"));
 }
 
 /// S3 호환 저장소(CI: SeaweedFS) 컨테이너를 멈춘다(`docker pause`). 놓으면 푼다.
@@ -428,12 +429,7 @@ async fn s3_pauses_and_kills_during_backup_and_live_restore() {
     );
     d.ctl(&["vm", "stop", "big2", "--force"]).await.unwrap();
     let copy = d.ctl_json(&["volume", "get", "big2-disk0"]).await;
-    assert!(same(
-        &volume_file(&d, &copy, "qcow2"),
-        "qcow2",
-        &root,
-        "qcow2"
-    ));
+    assert!(same_as(&d, &copy, &root, "qcow2"));
 
     // 90초 멈춤(헬퍼의 다시 하기 60초보다 길다)
     d.ctl(&[
@@ -470,12 +466,7 @@ async fn s3_pauses_and_kills_during_backup_and_live_restore() {
     .await;
     d.ctl(&["vm", "stop", "big3", "--force"]).await.unwrap();
     let copy = d.ctl_json(&["volume", "get", "big3-disk0"]).await;
-    assert!(same(
-        &volume_file(&d, &copy, "qcow2"),
-        "qcow2",
-        &root,
-        "qcow2"
-    ));
+    assert!(same_as(&d, &copy, &root, "qcow2"));
     d.stop();
 }
 
@@ -549,12 +540,7 @@ async fn s3_two_cluster_disaster_recovery() {
     println!("PROBE DR live restore of 64 MiB: {:?}", started.elapsed());
     dr.ctl(&["vm", "stop", "web-dr", "--force"]).await.unwrap();
     let copy = dr.ctl_json(&["volume", "get", "web-dr-disk0"]).await;
-    assert!(same(
-        &volume_file(&dr, &copy, "qcow2"),
-        "qcow2",
-        &root,
-        "qcow2"
-    ));
+    assert!(same_as(&dr, &copy, &root, "qcow2"));
 
     // 읽기 전용: 백업은 거절
     let e = dr

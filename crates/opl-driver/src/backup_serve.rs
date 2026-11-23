@@ -68,7 +68,11 @@ pub async fn start_backup_serve(
         tokio::process::Command::new(exe)
     };
     if let Some(dir) = log.parent() {
-        std::fs::create_dir_all(dir)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
     }
     let stderr = std::fs::OpenOptions::new()
         .create(true)

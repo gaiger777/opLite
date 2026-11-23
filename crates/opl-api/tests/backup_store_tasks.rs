@@ -240,7 +240,17 @@ fn image(fill: &[u8]) -> Vec<u8> {
 
 #[tokio::test]
 async fn stopped_vm_backup_restores_and_deletes() {
-    let env = Env::start().await;
+    let mut env = Env::start().await;
+    // 새 데이터 디렉터리처럼 소켓 디렉터리가 아직 없다(GitHub 탐침: qemu-nbd가 소켓을 못 만들었다).
+    let tmp = tempfile::tempdir_in("/tmp").unwrap();
+    let run = tmp.path().join("backup-run");
+    env.stop_runner().await;
+    let dir = run.clone();
+    env.start_runner_config(
+        Arc::new(opl_driver::DirStorage::new("qemu-img", common::MOUNT_ROOT)),
+        move |c| c.backup_run_dir = dir,
+    )
+    .await;
     let admin = env.admin().await;
     create_pool(&env, "local", false).await;
     create_pool(&env, "bk", true).await;
@@ -257,6 +267,11 @@ async fn stopped_vm_backup_restores_and_deletes() {
     let b = backup(&env, "b1");
     assert_eq!(b.status.phase, BackupPhase::Ready, "{b:?}");
     assert!(b.status.uefi_vars);
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&run).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
     let stats = b.status.store_stats.unwrap();
     // 청크 0(0xaa)·2(0x5b)만 내용이 있고 청크 1은 0(qcow2가 할당하지 않음 — 읽지도 않는다)
     assert_eq!((stats.new_chunks, stats.zero_chunks), (2, 1), "{stats:?}");

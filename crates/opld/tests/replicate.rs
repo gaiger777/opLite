@@ -176,8 +176,11 @@ async fn a_backup_is_replicated_restored_on_the_remote_and_deleted_with_the_orig
     assert_eq!(replica["pool"], "bk", "{original}");
     assert_eq!(replica["state"], "ready", "{original}");
     let list = prod.ctl(&["backup", "list"]).await.unwrap();
+    // REPLICAS 열은 머리줄에서 끝부터 센다(CREATED는 칸이 여럿이고, 뒤에 열이 늘어도 — 계획 68의 VERIFIED).
+    let header: Vec<&str> = list.lines().next().unwrap().split_whitespace().collect();
+    let from_end = header.len() - header.iter().position(|c| *c == "REPLICAS").unwrap();
     let row: Vec<&str> = list.lines().nth(1).unwrap().split_whitespace().collect();
-    assert_eq!(row.last(), Some(&"dr:ready"), "{list}");
+    assert_eq!(row[row.len() - from_end], "dr:ready", "{list}");
 
     // dr에는 같은 이름의 ready 사본이 있고 출처가 prod의 원본이다.
     let copies = dr.ctl_json(&["backup", "list"]).await;

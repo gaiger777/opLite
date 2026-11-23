@@ -128,7 +128,12 @@ pub fn bind(path: &Path) -> Result<UnixListener, ServeError> {
         _ => {}
     }
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| io("cannot create", dir, e))?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| io("cannot create", dir, e))?;
     }
     let listener = UnixListener::bind(path).map_err(|e| io("cannot listen on", path, e))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
