@@ -966,6 +966,124 @@ fn convert_from(
     Ok(args)
 }
 
+/// `qemu-nbd`가 읽기 전용으로 내보낸 볼륨(꺼진 VM의 저장소 백업 — 계획 68 설계 §8.2). drop되면 `qemu-nbd`를 끝내고
+/// 소켓을 지운다.
+#[derive(Debug)]
+pub struct NbdSource {
+    child: tokio::process::Child,
+    /// 유닉스 소켓
+    pub socket: PathBuf,
+    /// 내보내기 이름(`qemu-nbd`의 기본 — 빈 이름)
+    pub export: String,
+    /// 읽을 내용의 가상 크기
+    pub size_bytes: u64,
+}
+
+impl Drop for NbdSource {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+impl NbdSource {
+    /// `qemu-nbd`를 끝내고 기다린다.
+    pub async fn close(mut self) {
+        let _ = self.child.kill().await;
+    }
+}
+
+/// `qemu-nbd`가 볼륨 원본 `src`([`Storage::volume_source`])를 여는 인자: 파일·블록 장치는 `--image-opts`로 형식과
+/// 원본 드라이버(`file`·`host_device`)를 정하고 잠금을 끈다(`qemu-img -U`와 같은 뜻 — 백업은 VM 잠금 안에서 읽는다).
+/// qcow2 내부 스냅샷은 `-l`, RBD는 그 옵션 문자열이다.
+fn nbd_source_args(src: &VolumeSource, block: bool) -> Result<Vec<String>, DriverError> {
+    let mut args = vec![];
+    match &src.rbd {
+        Some(image) => {
+            args.push("--image-opts".into());
+            args.push(rbd::image_opts(image, src.snapshot.as_deref()));
+        }
+        None => {
+            require_absolute(&src.path)?;
+            if let Some(name) = &src.snapshot {
+                args.push(format!(
+                    "--load-snapshot=snapshot.name={}",
+                    name.replace(',', ",,")
+                ));
+            }
+            args.push("--image-opts".into());
+            args.push(format!(
+                "driver={},file.driver={},file.filename={},file.locking=off",
+                fmt_name(src.format),
+                if block { "host_device" } else { "file" },
+                path_str(&src.path)?.replace(',', ",,")
+            ));
+        }
+    }
+    Ok(args)
+}
+
+/// 볼륨 원본 `src`를 `qemu-nbd`(`qemu_nbd`)로 유닉스 소켓 `socket`(있으면 지움)에 읽기 전용으로 내보내고(여러 연결,
+/// 끊겨도 계속) 답할 때까지 기다린다(30초). 실패하면 `ToolFailed`(stderr).
+pub async fn nbd_source(
+    qemu_nbd: &Path,
+    src: &VolumeSource,
+    socket: &Path,
+) -> Result<NbdSource, DriverError> {
+    use std::os::unix::fs::FileTypeExt;
+    let block = src.rbd.is_none()
+        && std::fs::metadata(&src.path).is_ok_and(|m| m.file_type().is_block_device());
+    let mut args = vec![
+        "--read-only".to_string(),
+        "--persistent".into(),
+        "--shared=0".into(),
+        format!("--socket={}", path_str(socket)?),
+    ];
+    args.extend(nbd_source_args(src, block)?);
+    match std::fs::remove_file(socket) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
+    let child = tokio::process::Command::new(qemu_nbd)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| DriverError::ToolFailed {
+            tool: "qemu-nbd",
+            stderr: format!("{}: {e}", qemu_nbd.display()),
+        })?;
+    let mut source = NbdSource {
+        child,
+        socket: socket.to_path_buf(),
+        export: String::new(),
+        size_bytes: src.size_bytes,
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if opl_store::nbd::NbdClient::list(socket).await.is_ok() {
+            return Ok(source);
+        }
+        if let Some(status) = source.child.try_wait()? {
+            let mut stderr = String::new();
+            if let Some(mut e) = source.child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let _ = e.read_to_string(&mut stderr).await;
+            }
+            return Err(DriverError::ToolFailed {
+                tool: "qemu-nbd",
+                stderr: format!("{status}: {}", stderr.trim()),
+            });
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DriverError::Timeout("qemu-nbd to listen"));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// [`Storage::export_volume`]: `qemu-img convert -c -O qcow2`로 `{dest}.part`에 쓰고(`-t writeback`:
 /// 닫을 때 디스크에 내려 쓴다) `dest`로 이름을 바꾼다. 파일시스템 호출은 [`on_pool`]로 한다(백업 풀이
 /// 멈춘 NFS일 수 있다).

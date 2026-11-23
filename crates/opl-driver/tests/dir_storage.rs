@@ -1244,3 +1244,97 @@ async fn interrupted_flatten_can_be_redone() {
     assert!(qemu_io(&path, "read -P 0x24 200M 1M"));
     assert!(qemu_io(&path, "read -P 0 192M 8M"));
 }
+
+/// 꺼진 VM의 저장소 백업 원본(계획 68 설계 §8.2): `qemu-nbd`가 볼륨(지금 내용과 qcow2 내부 스냅샷)을 유닉스 소켓에
+/// 읽기 전용으로 내보내고, opl-store의 NBD 클라이언트가 읽고 구멍을 본다. 끝나면 `qemu-nbd`가 사라진다.
+#[tokio::test]
+async fn qemu_nbd_exports_a_volume_and_its_snapshot() {
+    use opl_store::nbd::{BASE_ALLOCATION, NbdClient, STATE_ZERO};
+    let tmp = tempfile::Builder::new()
+        .prefix("opl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let pool = pool(tmp.path());
+    let storage = DirStorage::new("qemu-img", MNT);
+    for format in [ImageFormat::Qcow2, ImageFormat::Raw] {
+        let id = Uuid::now_v7();
+        let path = storage
+            .create_volume(&pool, id, 16 * MIB, format)
+            .await
+            .unwrap();
+        let f = if format == ImageFormat::Qcow2 {
+            "qcow2"
+        } else {
+            "raw"
+        };
+        let io = |cmd: &str| {
+            let ok = std::process::Command::new("qemu-io")
+                .args(["-f", f, "-c", cmd, path.to_str().unwrap()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{cmd}");
+        };
+        io("write -P 0x5a 1M 64k");
+        let tag = (format == ImageFormat::Qcow2).then(|| {
+            let tag = Uuid::now_v7().to_string();
+            qemu_img(&["snapshot", "-c", &tag, path.to_str().unwrap()]);
+            io("write -P 0x6b 1M 64k");
+            tag
+        });
+        let sock = tmp.path().join(format!("{f}.sock"));
+        let src = storage
+            .volume_source(&pool, id, format, None)
+            .await
+            .unwrap();
+        let nbd = opl_driver::nbd_source(Path::new("qemu-nbd"), &src, &sock)
+            .await
+            .unwrap();
+        assert_eq!(nbd.size_bytes, 16 * MIB);
+        let mut c = NbdClient::connect(&nbd.socket, &nbd.export, &[BASE_ALLOCATION])
+            .await
+            .unwrap();
+        assert!(c.read_only());
+        assert_eq!(c.size(), 16 * MIB);
+        let now = if tag.is_some() { 0x6b } else { 0x5a };
+        assert_eq!(c.read(MIB, 4096).await.unwrap(), vec![now; 4096]);
+        let alloc = c.extents(BASE_ALLOCATION, 0, 16 * MIB).await.unwrap();
+        // raw 파일의 구멍은 플랫폼마다 다르다(macOS QEMU는 모두 데이터로 알린다). qcow2는 어디서나 안다.
+        if format == ImageFormat::Qcow2 {
+            assert!(alloc[0].flags & STATE_ZERO != 0, "{f}: {alloc:?}");
+        }
+        // 여러 연결(백업 파이프라인이 나란히 읽는다)
+        let mut c2 = NbdClient::connect(&nbd.socket, &nbd.export, &[])
+            .await
+            .unwrap();
+        assert_eq!(c2.read(MIB, 1).await.unwrap(), vec![now]);
+        nbd.close().await;
+        assert!(NbdClient::list(&sock).await.is_err());
+        if let Some(tag) = tag {
+            let src = storage
+                .volume_source(&pool, id, format, Some(&tag))
+                .await
+                .unwrap();
+            let nbd = opl_driver::nbd_source(Path::new("qemu-nbd"), &src, &sock)
+                .await
+                .unwrap();
+            let mut c = NbdClient::connect(&nbd.socket, &nbd.export, &[])
+                .await
+                .unwrap();
+            assert_eq!(c.read(MIB, 4096).await.unwrap(), vec![0x5a; 4096]);
+            drop(nbd);
+        }
+    }
+    // 없는 파일: qemu-nbd가 끝나며 그 까닭을 돌려준다.
+    let missing = VolumeSource {
+        path: tmp.path().join("nope.qcow2"),
+        format: ImageFormat::Qcow2,
+        snapshot: None,
+        size_bytes: 0,
+        rbd: None,
+    };
+    let e = opl_driver::nbd_source(Path::new("qemu-nbd"), &missing, &tmp.path().join("x.sock"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, DriverError::ToolFailed { .. }), "{e}");
+}

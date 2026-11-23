@@ -22,7 +22,8 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, CpuProbe, DiskBitmaps, DiskCounters,
-    EventKind, Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
+    EventKind, FleeceDisk, FleeceExport, FleeceRequest, Hypervisor, HypervisorEvent, Quiesced,
+    RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
@@ -300,6 +301,16 @@ struct MockState {
     fail_next_incremental: Option<DriverError>,
     /// `incremental_backup` 호출(실패 포함)
     incrementals: Vec<IncrementalCall>,
+    /// `fleece_begin`이 내보낼 VM별 디스크 이미지(없으면 디스크마다 1 MiB의 0)
+    fleece_images: HashMap<Uuid, Vec<Vec<u8>>>,
+    /// `fleece_begin`이 부모 비트맵 문맥으로 알릴 VM별 디스크마다의 바뀐 (시작, 길이) 범위
+    fleece_dirty: HashMap<Uuid, Vec<Vec<(u64, u64)>>>,
+    /// 열린 가짜 fleecing 내보내기(VM별 소켓과 NBD 서버)
+    fleece_servers: HashMap<Uuid, (PathBuf, tokio::task::JoinHandle<()>)>,
+    /// `fleece_begin`(`None`)·`fleece_end`(`Some(success)`) 호출(실패 포함)
+    fleece_calls: Vec<(Uuid, FleeceRequest, Option<bool>)>,
+    /// 다음 `fleece_begin` 한 번을 실패시킬 오류(비트맵은 그대로)
+    fail_next_fleece: Option<DriverError>,
     /// `clear_backup_leftovers`를 부른 VM(실패 포함)
     leftover_clears: Vec<Uuid>,
     /// 받는 QEMU가 NBD로 내보내는 디스크(`start_incoming`의 `exports`, `finish_incoming`까지)
@@ -810,6 +821,37 @@ impl MockHypervisor {
     /// 다음 `incremental_backup` 한 번을 이 오류로 실패시킨다. 비트맵은 그대로 남는다.
     pub fn fail_next_incremental(&self, err: DriverError) {
         self.state.lock().unwrap().fail_next_incremental = Some(err);
+    }
+
+    /// VM `id`의 `fleece_begin`이 내보낼 디스크 이미지(디스크 차례)
+    pub fn set_fleece_images(&self, id: Uuid, images: Vec<Vec<u8>>) {
+        self.state.lock().unwrap().fleece_images.insert(id, images);
+    }
+
+    /// VM `id`의 `fleece_begin`이 부모 비트맵 문맥으로 알릴 디스크마다의 바뀐 (시작, 길이) 범위
+    pub fn set_fleece_dirty(&self, id: Uuid, ranges: Vec<Vec<(u64, u64)>>) {
+        self.state.lock().unwrap().fleece_dirty.insert(id, ranges);
+    }
+
+    /// 다음 `fleece_begin` 한 번을 이 오류로 실패시킨다(비트맵은 그대로).
+    pub fn fail_next_fleece(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_fleece = Some(err);
+    }
+
+    /// `fleece_begin`(`None`)·`fleece_end`(`Some(success)`) 호출(실패 포함)
+    pub fn fleece_calls(&self) -> Vec<(Uuid, FleeceRequest, Option<bool>)> {
+        self.state.lock().unwrap().fleece_calls.clone()
+    }
+
+    /// 아직 열린 가짜 fleecing 내보내기가 있는 VM
+    pub fn open_fleeces(&self) -> Vec<Uuid> {
+        self.state
+            .lock()
+            .unwrap()
+            .fleece_servers
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// `incremental_backup` 호출(실패 포함)을 순서대로 돌려준다. 대상 파일에는 아무것도 쓰지 않는다.
@@ -1588,6 +1630,115 @@ impl Hypervisor for MockHypervisor {
     }
 
     /// 남은 증분 백업 작업은 없다. 호출을 기록하고 남은 미러와 따라잡기 비트맵(`opl-mig-*`)을 치운다.
+    /// 실제 드라이버처럼 부모 비트맵은 모든 디스크에 있고 inconsistent가 아니어야 하고, 새 비트맵을 만든다. 디스크
+    /// 이미지(`set_fleece_images`)를 메모리 NBD 서버로 `/tmp`의 소켓에 내보내고, 부모가 있으면
+    /// `qemu:dirty-bitmap:opl-fl-point` 문맥으로 `set_fleece_dirty`의 범위를 알린다.
+    async fn fleece_begin(
+        &self,
+        id: Uuid,
+        req: &FleeceRequest,
+    ) -> Result<FleeceExport, DriverError> {
+        const POINT: &str = "opl-fl-point";
+        let (images, dirty, quiesced, stale) = {
+            let mut st = self.state.lock().unwrap();
+            st.fleece_calls.push((id, req.clone(), None));
+            Self::controllable(&st, id)?;
+            if let Some(e) = st.fail_next_fleece.take() {
+                return Err(e);
+            }
+            let disks = st.disk_formats.get(&id).map_or(0, Vec::len);
+            if let Some(parent) = &req.parent {
+                let ok = (0..disks).all(|i| {
+                    st.bitmaps
+                        .get(&id)
+                        .and_then(|b| b.get(i))
+                        .is_some_and(|b| b.iter().any(|b| &b.name == parent && !b.inconsistent))
+                });
+                if !ok || disks == 0 {
+                    return Err(DriverError::Backup(format!(
+                        "a disk has no usable dirty bitmap {parent}"
+                    )));
+                }
+            }
+            Self::add_bitmaps_to(&mut st, id, &req.bitmap)?;
+            let quiesced = Self::quiesce(&mut st, id, req.quiesce);
+            let images = st
+                .fleece_images
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| vec![vec![0; 1 << 20]; disks]);
+            let dirty = st.fleece_dirty.get(&id).cloned().unwrap_or_default();
+            (images, dirty, quiesced, st.fleece_servers.remove(&id))
+        };
+        if let Some((sock, server)) = stale {
+            server.abort();
+            let _ = std::fs::remove_file(sock);
+        }
+        let mut server = opl_store::nbd::NbdServer::new();
+        let mut disks = Vec::new();
+        for (i, image) in images.into_iter().enumerate() {
+            let ctx = req
+                .parent
+                .as_ref()
+                .map(|_| opl_store::nbd::dirty_bitmap_context(POINT));
+            let mut bitmaps = BTreeMap::new();
+            if let Some(ctx) = &ctx {
+                bitmaps.insert(ctx.clone(), dirty.get(i).cloned().unwrap_or_default());
+            }
+            disks.push(FleeceDisk {
+                export: format!("disk{i}"),
+                size: image.len() as u64,
+                dirty_context: ctx,
+            });
+            server.add(
+                format!("disk{i}"),
+                std::sync::Arc::new(opl_store::nbd::export::MemoryExport::new(image, bitmaps)),
+            );
+        }
+        let socket = PathBuf::from(format!("/tmp/opl-mock-{}.sock", req.run.simple()));
+        let listener =
+            opl_store::nbd::serve::bind(&socket).map_err(|e| DriverError::Backup(e.to_string()))?;
+        let task =
+            tokio::spawn(std::sync::Arc::new(server).serve(listener, std::future::pending()));
+        self.state
+            .lock()
+            .unwrap()
+            .fleece_servers
+            .insert(id, (socket.clone(), task));
+        Ok(FleeceExport {
+            socket,
+            disks,
+            quiesced,
+        })
+    }
+
+    /// 내보내기를 닫고, 성공이면 부모 비트맵을, 아니면 새 비트맵을 지운다.
+    async fn fleece_end(
+        &self,
+        id: Uuid,
+        req: &FleeceRequest,
+        success: bool,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        st.fleece_calls.push((id, req.clone(), Some(success)));
+        if let Some((sock, server)) = st.fleece_servers.remove(&id) {
+            server.abort();
+            let _ = std::fs::remove_file(sock);
+        }
+        Self::controllable(&st, id)?;
+        let stale = match (&req.parent, success) {
+            (Some(parent), true) => Some(parent.clone()),
+            (None, true) => None,
+            (_, false) => Some(req.bitmap.clone()),
+        };
+        if let Some(stale) = stale {
+            for disk in st.bitmaps.get_mut(&id).into_iter().flatten() {
+                disk.retain(|b| b.name != stale);
+            }
+        }
+        Ok(())
+    }
+
     async fn clear_backup_leftovers(&self, id: Uuid) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         st.leftover_clears.push(id);
@@ -3020,6 +3171,73 @@ mod tests {
                 size: 1 << 30,
             })
             .collect()
+    }
+
+    /// 가짜 fleecing: 부모가 있으면 그 비트맵이 있어야 하고 새 비트맵을 만들며, 내보내기를 NBD로 읽고(부모 문맥 포함)
+    /// 끝나면 성공은 부모를, 실패는 새 비트맵을 지운다.
+    #[tokio::test]
+    async fn fleecing_serves_the_images_and_moves_the_bitmaps() {
+        use opl_store::nbd::{NbdClient, STATE_DIRTY};
+        let hv = MockHypervisor::default();
+        let vm = spec_with_disks();
+        let req = |parent: Option<&str>, bitmap: &str| FleeceRequest {
+            run: Uuid::now_v7(),
+            parent: parent.map(str::to_string),
+            bitmap: bitmap.into(),
+            quiesce: false,
+            reserve_min: 0,
+            min_free: 0,
+        };
+        assert!(matches!(
+            hv.fleece_begin(vm.id, &req(None, "opl-a")).await,
+            Err(DriverError::NotRunning(_))
+        ));
+        hv.start(&vm, None).await.unwrap();
+        hv.set_fleece_images(vm.id, vec![vec![7; 8192], vec![0; 4096]]);
+        hv.set_fleece_dirty(vm.id, vec![vec![(4096, 512)], vec![]]);
+        // 부모 비트맵이 없다.
+        assert!(matches!(
+            hv.fleece_begin(vm.id, &req(Some("opl-a"), "opl-b")).await,
+            Err(DriverError::Backup(_))
+        ));
+        let first = req(None, "opl-a");
+        let ex = hv.fleece_begin(vm.id, &first).await.unwrap();
+        assert_eq!(ex.disks.len(), 2);
+        assert_eq!(ex.disks[0].dirty_context, None);
+        let mut c = NbdClient::connect(&ex.socket, "disk0", &[]).await.unwrap();
+        assert_eq!(c.read(0, 8192).await.unwrap(), vec![7; 8192]);
+        hv.fleece_end(vm.id, &first, true).await.unwrap();
+        assert!(hv.open_fleeces().is_empty());
+        assert!(!ex.socket.exists());
+
+        let second = req(Some("opl-a"), "opl-b");
+        let ex = hv.fleece_begin(vm.id, &second).await.unwrap();
+        let ctx = ex.disks[0].dirty_context.clone().unwrap();
+        let mut c = NbdClient::connect(&ex.socket, "disk0", &[&ctx])
+            .await
+            .unwrap();
+        let dirty = c.extents(&ctx, 0, 8192).await.unwrap();
+        assert_eq!(dirty[1].flags, STATE_DIRTY);
+        assert_eq!(dirty[1].length, 512);
+        // 실패: 새 비트맵만 지운다.
+        hv.fleece_end(vm.id, &second, false).await.unwrap();
+        let names = |disks: Vec<DiskBitmaps>| {
+            disks[0]
+                .bitmaps
+                .iter()
+                .map(|b| b.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(hv.backup_bitmaps(vm.id).await.unwrap()), ["opl-a"]);
+        // 성공: 부모를 지운다.
+        let third = req(Some("opl-a"), "opl-c");
+        hv.fleece_begin(vm.id, &third).await.unwrap();
+        hv.fleece_end(vm.id, &third, true).await.unwrap();
+        assert_eq!(names(hv.backup_bitmaps(vm.id).await.unwrap()), ["opl-c"]);
+        let calls = hv.fleece_calls();
+        assert_eq!(calls.iter().filter(|c| c.2.is_none()).count(), 5);
+        hv.fail_next_fleece(DriverError::Backup("x".into()));
+        assert!(hv.fleece_begin(vm.id, &req(None, "opl-d")).await.is_err());
     }
 
     #[tokio::test]

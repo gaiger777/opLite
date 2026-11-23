@@ -99,6 +99,9 @@ numa-it = []
 # `sdn lockdown`)로 — 실제 LB 트래픽·건강 검사 넘김·바깥 VIP·QoS 속도 측정(iperf3)·단순 NIC tc·옮기기 다리를 본다.
 # Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하고, 호스트에 OVN 꾸러미와 데몬을 남기므로 CI 러너(`ovn` 작업)에서만 돌린다.
 sdn-it = []
+# 백업 저장소 E2E의 시험 고리(계획 68): 저장소 API(스테이지 6)가 생기기 전에 제어 소켓의 `POST /v1/test/put`으로
+# `backup-store`·`backup-job` 리소스를 클러스터에 바로 쓴다. 시험 빌드에만 넣고 스테이지 6이 지운다.
+backup-it = []
 # 여러 노드 SDN E2E(계획 66 스테이지 6): 한 호스트에 privileged systemd 컨테이너 셋(`ci/sdn-node/Dockerfile`)으로 Orbivisor
 # 노드 셋을 띄워 실제 OVN Raft 셋·Geneve·SNAT·분산·중앙 유동 IP·게이트웨이 넘김·죽은 중앙 내쫓기·두 chassis 마이그레이션을
 # orbivisorctl로 본다. Linux에서 root, docker와 이미지, 커널 모듈 openvswitch·geneve, tcpdump가 필요하고 호스트에 도커 망·
@@ -120,6 +123,8 @@ opl-driver.workspace = true
 opl-peer.workspace = true
 opl-qemu.workspace = true
 opl-reconciler.workspace = true
+# `orbivisord backup-serve` 헬퍼(계획 68)
+opl-store.workspace = true
 opl-types.workspace = true
 reqwest.workspace = true
 rust-embed.workspace = true
@@ -135,6 +140,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 oplctl.workspace = true
+opl-store = { workspace = true, features = ["test-util"] }
 rcgen.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

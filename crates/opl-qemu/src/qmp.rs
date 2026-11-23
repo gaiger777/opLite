@@ -253,6 +253,15 @@ pub enum TransactionAction {
         name: String,
         persistent: bool,
     },
+    /// 꺼진(바뀜을 따라가지 않는) 저장하지 않는 dirty bitmap(`block-dirty-bitmap-add`, `disabled: true`). 저장소
+    /// 백업이 부모 비트맵의 "그 시점까지"를 얼려 두는 데 쓴다(계획 68 — 뒤의 [`TransactionAction::BitmapMerge`]로 채움).
+    BitmapAddDisabled { node: String, name: String },
+    /// 노드 `node`의 비트맵 `target`에 비트맵들(`(노드, 이름)`)을 합친다(`block-dirty-bitmap-merge`).
+    BitmapMerge {
+        node: String,
+        target: String,
+        bitmaps: Vec<(String, String)>,
+    },
     /// `bitmap`이 가리키는 바뀐 블록만 `target` 노드에 압축해 쓰는 백업 작업(`blockdev-backup`,
     /// `sync: bitmap`). 비트맵은 그대로 두고(`bitmap-mode: never`. `sync: incremental`은 `on-success`만
     /// 받는다), 끝난 작업은 `job-dismiss`할 때까지 남는다.
@@ -298,6 +307,18 @@ impl TransactionAction {
             } => json!({
                 "type": "block-dirty-bitmap-add",
                 "data": { "node": node, "name": name, "persistent": persistent },
+            }),
+            TransactionAction::BitmapAddDisabled { node, name } => json!({
+                "type": "block-dirty-bitmap-add",
+                "data": { "node": node, "name": name, "persistent": false, "disabled": true },
+            }),
+            TransactionAction::BitmapMerge {
+                node,
+                target,
+                bitmaps,
+            } => json!({
+                "type": "block-dirty-bitmap-merge",
+                "data": { "node": node, "target": target, "bitmaps": bitmap_refs(bitmaps) },
             }),
             TransactionAction::IncrementalBackup {
                 job_id,
@@ -345,6 +366,14 @@ impl TransactionAction {
             }
         }
     }
+}
+
+/// 비트맵 참조 목록(`BlockDirtyBitmapOrStr`의 `{node, name}` 꼴)
+fn bitmap_refs(bitmaps: &[(String, String)]) -> Value {
+    bitmaps
+        .iter()
+        .map(|(node, name)| json!({ "node": node, "name": name }))
+        .collect()
 }
 
 /// `query-jobs`의 작업 하나
@@ -668,6 +697,19 @@ impl QmpClient {
             .map(drop)
     }
 
+    /// 노드 `node`의 비트맵 `target`에 비트맵들(`(노드, 이름)`)을 합친다.
+    pub async fn block_dirty_bitmap_merge(
+        &self,
+        node: &str,
+        target: &str,
+        bitmaps: &[(String, String)],
+    ) -> Result<(), QmpError> {
+        let args = json!({ "node": node, "target": target, "bitmaps": bitmap_refs(bitmaps) });
+        self.execute("block-dirty-bitmap-merge", Some(args))
+            .await
+            .map(drop)
+    }
+
     /// qcow2 파일 `path`를 backing 없이 블록 노드 `node_name`으로 연다(백업 대상).
     pub async fn blockdev_add_qcow2(&self, node_name: &str, path: &Path) -> Result<(), QmpError> {
         let args = json!({
@@ -730,6 +772,37 @@ impl QmpClient {
             "tls-creds": tls_creds,
         });
         self.execute("nbd-server-start", Some(args)).await.map(drop)
+    }
+
+    /// 유닉스 소켓 `path`에서 TLS 없이 받는 NBD 서버를 띄운다(저장소 백업의 fleecing 읽기 — 계획 68, 소켓은 VM 상태
+    /// 디렉터리 안이라 opld만 닿는다). QEMU 하나에 서버 하나라 마이그레이션의 inet 서버와 함께 쓰지 않는다.
+    pub async fn nbd_server_start_unix(&self, path: &Path) -> Result<(), QmpError> {
+        let args = json!({
+            "addr": { "type": "unix", "data": { "path": path.display().to_string() } },
+        });
+        self.execute("nbd-server-start", Some(args)).await.map(drop)
+    }
+
+    /// 블록 노드 `node`를 NBD 서버에 이름 `name`으로 읽기 전용으로 내보낸다(내보내기 id `id`). `bitmaps`(`(노드,
+    /// 이름)` — 다른 노드의 비트맵도 됨, 꺼져 있어야 함)는 클라이언트가 `qemu:dirty-bitmap:<이름>` 문맥으로 읽는다.
+    pub async fn block_export_add_nbd_ro(
+        &self,
+        id: &str,
+        node: &str,
+        name: &str,
+        bitmaps: &[(String, String)],
+    ) -> Result<(), QmpError> {
+        let mut args = json!({
+            "type": "nbd",
+            "id": id,
+            "node-name": node,
+            "name": name,
+            "writable": false,
+        });
+        if !bitmaps.is_empty() {
+            args["bitmaps"] = bitmap_refs(bitmaps);
+        }
+        self.execute("block-export-add", Some(args)).await.map(drop)
     }
 
     /// 블록 노드 `node`를 NBD 서버에 이름 `name`으로 쓰기 가능하게 내보낸다(내보내기 id `id`).
@@ -2189,6 +2262,74 @@ mod tests {
                     "speed": 1048576, "auto-dismiss": false
                 } }
             ])
+        );
+    }
+
+    /// 저장소 백업(계획 68): 부모 비트맵을 꺼진 임시 비트맵에 얼리는 transaction, 유닉스 NBD 서버, 다른 노드 비트맵을 단
+    /// 읽기 전용 내보내기, 비트맵 합치기.
+    #[tokio::test]
+    async fn store_backup_commands_send_their_arguments() {
+        let (client, mut fake, _dir) = setup().await;
+        let actions = [
+            TransactionAction::BitmapAddDisabled {
+                node: "disk0".into(),
+                name: "opl-fl-point".into(),
+            },
+            TransactionAction::BitmapMerge {
+                node: "disk0".into(),
+                target: "opl-fl-point".into(),
+                bitmaps: vec![("disk0".into(), "opl-base".into())],
+            },
+        ];
+        let (r, cmd) = tokio::join!(client.transaction(&actions), reply(&mut fake, json!({})));
+        r.unwrap();
+        assert_eq!(
+            cmd["arguments"]["actions"],
+            json!([
+                { "type": "block-dirty-bitmap-add", "data": {
+                    "node": "disk0", "name": "opl-fl-point", "persistent": false, "disabled": true } },
+                { "type": "block-dirty-bitmap-merge", "data": {
+                    "node": "disk0", "target": "opl-fl-point",
+                    "bitmaps": [{ "node": "disk0", "name": "opl-base" }] } }
+            ])
+        );
+        let (r, cmd) = tokio::join!(
+            client.nbd_server_start_unix(Path::new("/run/opl/vms/x/backup.sock")),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "nbd-server-start");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "addr": { "type": "unix", "data": { "path": "/run/opl/vms/x/backup.sock" } } })
+        );
+        let bitmaps = [("disk0".to_string(), "opl-fl-point".to_string())];
+        let (r, cmd) = tokio::join!(
+            client.block_export_add_nbd_ro("opl-bk-0", "opl-fl-acc-0", "disk0", &bitmaps),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "type": "nbd", "id": "opl-bk-0", "node-name": "opl-fl-acc-0", "name": "disk0",
+                    "writable": false, "bitmaps": [{ "node": "disk0", "name": "opl-fl-point" }] })
+        );
+        let (r, cmd) = tokio::join!(
+            client.block_export_add_nbd_ro("opl-bk-1", "opl-fl-acc-1", "disk1", &[]),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert!(cmd["arguments"].get("bitmaps").is_none());
+        let (r, cmd) = tokio::join!(
+            client.block_dirty_bitmap_merge("disk1", "opl-a", &bitmaps),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(cmd["execute"], "block-dirty-bitmap-merge");
+        assert_eq!(
+            cmd["arguments"],
+            json!({ "node": "disk1", "target": "opl-a",
+                    "bitmaps": [{ "node": "disk0", "name": "opl-fl-point" }] })
         );
     }
 

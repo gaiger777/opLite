@@ -34,6 +34,8 @@ jobs:
       # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
       # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
       - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
+      # 백업 저장소 시험 고리(`POST /v1/test/put`의 backup-store·backup-job, 계획 68 스테이지 6까지 — QEMU 없음)
+      - run: cargo test -p opld --features backup-it --test backup_store
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)
@@ -49,6 +51,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y qemu-utils
           cargo test -p opl-driver --features storage-it --test dir_storage
+          cargo test -p opl-store --features storage-it --test nbd_qemu -- --nocapture
           cargo test -p opl-api --features storage-it --test volumes --test downloads
           cargo test -p opl-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks
 

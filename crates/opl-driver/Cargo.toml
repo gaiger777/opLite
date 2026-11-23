@@ -37,6 +37,8 @@ async-trait.workspace = true
 fs4.workspace = true
 libc.workspace = true
 opl-qemu.workspace = true
+# 저장소 백업의 NBD 서버(가짜 하이퍼바이저의 fleecing 내보내기, 계획 68)
+opl-store.workspace = true
 opl-types.workspace = true
 rustix.workspace = true
 # OVN NB·SB OVSDB JSON-RPC의 클러스터 CA mTLS(계획 65)

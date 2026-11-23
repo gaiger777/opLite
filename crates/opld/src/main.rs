@@ -11,6 +11,9 @@
 //! QEMU는 `-daemonize`로 떠 있으므로 opld가 멈추거나 죽어도 VM은 계속 돈다. 다시 시작하면
 //! 하이퍼바이저 드라이버가 살아 있는 VM에 다시 붙고 reconciler가 이어서 맞춘다.
 
+#[cfg(feature = "backup-it")]
+mod backup_hook;
+mod backup_serve;
 mod bootstrap;
 mod checks;
 mod config;
@@ -75,6 +78,14 @@ struct Args {
     /// `ExecStopPost`). 오류가 있어도 0으로 끝난다(재시작을 막지 않게).
     #[arg(long)]
     release_vips: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// 저장소 백업의 디스크를 읽기 전용 NBD로 내보내는 헬퍼(opld가 띄운다). 설정은 표준 입력의 JSON이다.
+    BackupServe,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -87,6 +98,9 @@ fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::stdout().is_terminal())
         .init();
     let args = Args::parse();
+    if let Some(Command::BackupServe) = args.command {
+        return backup_serve::run();
+    }
     if args.release_vips {
         release_vips_and_exit(&args.config);
         return Ok(());

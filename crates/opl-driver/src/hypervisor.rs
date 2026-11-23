@@ -104,6 +104,46 @@ pub struct BackupTarget {
     pub size: u64,
 }
 
+/// 저장소 백업의 읽기([`Hypervisor::fleece_begin`]·[`Hypervisor::fleece_end`], 계획 68 설계 §8.1·§8.5)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleeceRequest {
+    /// 이 읽기(백업 id)
+    pub run: Uuid,
+    /// 부모 백업의 dirty bitmap(`opl-{base}`). 있으면 내보내기마다 "부모 시점 → 이 시점"에 바뀐 곳을 비트맵 문맥으로
+    /// 단다(모든 디스크에 있어야 한다).
+    pub parent: Option<String>,
+    /// 이 시점부터 바뀜을 따라갈 새 비트맵(`opl-{새 id}`, qcow2면 이미지에 저장)
+    pub bitmap: String,
+    /// 시점을 잡는 순간 게스트 파일 시스템을 얼린다.
+    pub quiesce: bool,
+    /// 시작 전 플리싱 이미지 자리(VM 상태 디렉터리)의 남은 공간이 이것과 디스크 가상 크기 합의 10%(복제 회차의 플리싱과
+    /// 같은 규칙) 가운데 큰 쪽보다 적으면 시작하지 않는다.
+    pub reserve_min: u64,
+    /// 읽는 동안 남은 공간이 이보다 적어지면 지킴이가 내보내기와 플리싱을 곧바로 뗀다(`fleece_min_free_mib`).
+    pub min_free: u64,
+}
+
+/// 열린 저장소 백업 읽기: 유닉스 소켓 NBD 서버 하나에 디스크마다 읽기 전용 내보내기
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleeceExport {
+    /// NBD 서버의 유닉스 소켓
+    pub socket: PathBuf,
+    /// 디스크 차례
+    pub disks: Vec<FleeceDisk>,
+    pub quiesced: Quiesced,
+}
+
+/// 시점이 고정된 디스크 하나의 내보내기
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleeceDisk {
+    /// 내보내기 이름(`disk{i}`)
+    pub export: String,
+    /// 가상 크기(바이트)
+    pub size: u64,
+    /// 부모 뒤 바뀐 곳을 읽는 메타 문맥(`qemu:dirty-bitmap:…`). 부모가 없으면 `None`.
+    pub dirty_context: Option<String>,
+}
+
 /// 실행 중인 VM의 모든 디스크(`disk{i}`)를 합한 I/O 누적 카운터(게스트가 본 것, QMP `query-blockstats`).
 /// QEMU를 다시 켜면 0부터 다시 센다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -281,6 +321,30 @@ pub trait Hypervisor: Send + Sync {
 
     /// 살아 있는 받는 QEMU의 회차들(실행 디렉터리의 pid 파일로). 끝난 회차의 받는 QEMU를 찾아 끄는 데 쓴다.
     async fn replica_receivers(&self) -> Result<Vec<Uuid>, DriverError>;
+
+    /// 실행 중인 VM의 모든 디스크를 한 시점으로 고정해 읽기 전용 NBD로 내보낸다(저장소 백업, 계획 68 설계 §8.1).
+    /// 앞선 읽기가 남긴 것을 먼저 치운다. 게스트를 잠시 멈춘 채(얼림은 `req.quiesce`) transaction 하나로 새 비트맵
+    /// `req.bitmap`을 만들고 — 부모가 있으면 부모 비트맵의 그 시점까지를 저장하지 않는 꺼진 임시 비트맵에 얼려 둔다(부모는
+    /// 켜진 채 그대로) — 디스크마다 copy-before-write 필터(`on-cbw-error: break-snapshot`)와 snapshot-access 노드를
+    /// 붙인다(플리싱, 복제 회차와 같은 길). 그 노드들을 VM 상태 디렉터리의 유닉스 소켓 NBD 서버에 `disk{i}`로 내보낸다.
+    /// 플리싱 이미지가 차도 게스트 쓰기는 실패하지 않고 읽기만 실패한다. 읽는 동안 지킴이가 1초마다 남은 공간을 보고
+    /// `req.min_free`보다 적으면 내보내기와 플리싱을 뗀다. 끝은 반드시 [`fleece_end`](Self::fleece_end).
+    async fn fleece_begin(
+        &self,
+        id: Uuid,
+        req: &FleeceRequest,
+    ) -> Result<FleeceExport, DriverError>;
+
+    /// [`fleece_begin`](Self::fleece_begin)으로 연 읽기를 닫는다: 내보내기·NBD 서버·플리싱·임시 비트맵을 떼고,
+    /// `success`면 부모 비트맵을 지워 새 비트맵만 남기고(다음 증분의 부모), 아니면 새 비트맵을 지운다(부모는 켜진 채라
+    /// 다음 시도도 같은 부모에서 증분). 지킴이가 뗐으면 그 까닭으로 실패한다(정리는 한다). 연 읽기가 없어도(opld가 다시
+    /// 떴다) VM에 남은 것을 치우고 비트맵을 같은 규칙으로 맞춘다.
+    async fn fleece_end(
+        &self,
+        id: Uuid,
+        req: &FleeceRequest,
+        success: bool,
+    ) -> Result<(), DriverError>;
 
     /// 실행 중인 VM의 모든 디스크에서 내부 스냅샷 `tag`를 지운다. 태그가 없어도 성공한다.
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError>;

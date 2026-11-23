@@ -338,7 +338,7 @@ pub(crate) fn alive(paths: &RuntimePaths) -> Option<u32> {
 }
 
 /// 프로세스의 명령줄(인자를 공백으로 이은 것). Linux는 `/proc`, 다른 곳은 `ps`로 읽는다.
-fn process_cmdline(pid: u32) -> Option<String> {
+pub(crate) fn process_cmdline(pid: u32) -> Option<String> {
     if cfg!(target_os = "linux") {
         let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
         Some(

@@ -35,7 +35,8 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, CpuProbe, DiskBitmaps, DiskCounters, EventKind,
-    Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode, VcpuChange,
+    FleeceExport, FleeceRequest, Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode,
+    VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
@@ -48,6 +49,7 @@ use crate::storage::{DiskLocation, fmt_name};
 use crate::tpm::{self, SwtpmConfig, vm_tpm_dir};
 
 mod agent;
+mod store_backup;
 
 use agent::Freezer;
 
@@ -201,6 +203,8 @@ pub struct QemuHypervisor {
     receivers: Mutex<HashMap<Uuid, Arc<Receiver>>>,
     /// QMP를 오래 붙잡는 작업이 도는 VM과 그 작업 이름([`RuntimeStatus::Busy`], [`Self::busy`]).
     busy: Mutex<HashMap<Uuid, &'static str>>,
+    /// 열린 저장소 백업 읽기(계획 68, VM별)
+    store_reads: Mutex<HashMap<Uuid, store_backup::StoreRead>>,
 }
 
 /// [`QemuHypervisor::busy`]가 돌려주는 표시. 버리면(작업이 끝나거나 실패하거나 취소되면) 메모리의 표시와 표시 파일
@@ -304,6 +308,7 @@ impl QemuHypervisor {
             incoming_ports: tokio::sync::Mutex::new(()),
             receivers: Mutex::default(),
             busy: Mutex::default(),
+            store_reads: Mutex::default(),
         };
         hv.remove_dead_receiver_dirs();
         for entry in std::fs::read_dir(&vm_run_dir)? {
@@ -1568,6 +1573,23 @@ impl Hypervisor for QemuHypervisor {
             .filter(|(_, live)| *live != Liveness::Dead)
             .map(|(run, _)| run)
             .collect())
+    }
+
+    async fn fleece_begin(
+        &self,
+        id: Uuid,
+        req: &FleeceRequest,
+    ) -> Result<FleeceExport, DriverError> {
+        self.begin_store_read(id, req).await
+    }
+
+    async fn fleece_end(
+        &self,
+        id: Uuid,
+        req: &FleeceRequest,
+        success: bool,
+    ) -> Result<(), DriverError> {
+        self.end_store_read(id, req, success).await
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
@@ -3507,6 +3529,8 @@ async fn unfleece(qmp: &QmpClient, f: &Fleece) -> Result<(), DriverError> {
 /// 앞선 회차가 남긴 플리싱(opld가 기다리다 죽었다)을 뗀다: 장치가 아직 필터를 쓰면 디스크 노드로 되돌리고 `opl-fl-*`
 /// 노드를 닫은 뒤 `dir`의 플리싱 이미지 파일을 지운다. 그 노드를 읽던 작업은 먼저 치웠어야 한다.
 async fn clear_fleecing(qmp: &QmpClient, dir: &Path) -> Result<(), DriverError> {
+    // 저장소 백업 읽기(계획 68)의 내보내기가 플리싱 노드를 쥔다.
+    store_backup::clear_store_exports(qmp, dir).await?;
     let nodes = qmp_call(qmp.query_block_nodes(), "QMP query-named-block-nodes").await?;
     let left: Vec<String> = nodes
         .into_iter()
