@@ -378,6 +378,36 @@ async fn running_vm_backups_are_incremental_from_the_dirty_bitmap() {
     assert_eq!(restored, second);
 }
 
+/// 전체 백업도 성공하면 다른 백업 비트맵을 지운다(리뷰 1 I1): 전체 → 전체 → 증분은 둘째 전체를 base로 쓰고, 디스크엔
+/// 비트맵이 하나만 남는다.
+#[tokio::test]
+async fn full_backups_drop_older_bitmaps_so_incrementals_continue() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env, "local", false).await;
+    create_pool(&env, "bk", true).await;
+    seed_store(&env, "st").await;
+    create_volume(&env, &admin, "root", 8 * MIB).await;
+    let vm = create_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "start").await);
+    env.hv.set_fleece_images(vm, vec![image(&[1, 2])]);
+    succeeded(&store_backup(&env, "web", "st", "f1", false).await);
+    succeeded(&store_backup(&env, "web", "st", "f2", false).await);
+    let f2 = backup(&env, "f2");
+    let names = |env: &Env| -> Vec<String> {
+        env.hv.bitmaps(vm)[0]
+            .iter()
+            .map(|b| b.name.clone())
+            .collect()
+    };
+    assert_eq!(names(&env), vec![opl_types::backup::bitmap_name(f2.id)]);
+    env.hv.set_fleece_dirty(vm, vec![vec![(10, 10)]]);
+    succeeded(&store_backup(&env, "web", "st", "i1", true).await);
+    let i1 = backup(&env, "i1");
+    assert_eq!(i1.status.base, Some(f2.id), "{i1:?}");
+    assert_eq!(names(&env), vec![opl_types::backup::bitmap_name(i1.id)]);
+}
+
 #[tokio::test]
 async fn base_of_a_pending_backup_cannot_be_deleted() {
     let env = Env::start().await;
@@ -655,6 +685,51 @@ async fn verify_quarantines_bad_chunks_and_the_next_backup_heals_them() {
     assert_eq!(restore(&env, "b2", "web2").await, img);
 }
 
+/// 검증이 한 백업의 깨진 청크를 `bad/`로 옮기면, 아직 검증하지 않은 다른 백업을 base로 쓰는 증분도 그 청크(base에서 옮긴
+/// id)를 원본에서 다시 올린다(리뷰 1 I5) — 망가짐이 새 증분으로 번지지 않는다.
+#[tokio::test]
+async fn an_incremental_reuploads_base_chunks_that_verify_moved_aside() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    create_pool(&env, "local", false).await;
+    create_pool(&env, "bk", true).await;
+    let st = seed_store(&env, "st").await;
+    create_volume(&env, &admin, "root", 8 * MIB).await;
+    let vm = create_vm(&admin, "web", &["root"]).await;
+    succeeded(&admin.act("web", "start").await);
+    let img = image(&[21, 22]);
+    env.hv.set_fleece_images(vm, vec![img.clone()]);
+    succeeded(&store_backup(&env, "web", "st", "f1", false).await);
+    succeeded(&store_backup(&env, "web", "st", "f2", false).await);
+    // f1만 검증한다: 두 백업이 함께 쓰는 청크 1이 깨져 `bad/`로 간다(f2는 아직 검증하지 않음).
+    let store = open(&env, &st).await;
+    let id = store.chunk_id(&img[CHUNK..]);
+    let path = store_dir(&env, &st).join(opl_store::format::chunk_key(&id));
+    let mut bytes = std::fs::read(&path).unwrap();
+    let n = bytes.len();
+    bytes[n - 1] ^= 1;
+    std::fs::write(&path, bytes).unwrap();
+    let verify = TaskOp::BackupStoreVerify {
+        backups: vec![backup(&env, "f1").id],
+    };
+    succeeded(&task(&env, verify, get_store(&env, "st").id).await);
+    assert!(!path.exists(), "the bad chunk was moved aside");
+    assert!(!get_store(&env, "st").status.quarantining);
+    // f2를 base로 한 증분: 청크 0만 바뀌었다 — 청크 1은 base 인덱스에서 옮기지만 `bad/`에 있으므로 다시 올린다.
+    let mut next = img.clone();
+    next[10..20].fill(9);
+    env.hv.set_fleece_images(vm, vec![next.clone()]);
+    env.hv.set_fleece_dirty(vm, vec![vec![(10, 10)]]);
+    succeeded(&store_backup(&env, "web", "st", "i1", true).await);
+    let i1 = backup(&env, "i1");
+    assert_eq!(i1.status.base, Some(backup(&env, "f2").id), "{i1:?}");
+    assert!(
+        path.exists(),
+        "the chunk taken from the base was uploaded again"
+    );
+    assert_eq!(restore(&env, "i1", "web2").await, next);
+}
+
 #[tokio::test]
 async fn an_old_pool_backup_moves_to_the_store() {
     let env = Env::start().await;
@@ -738,6 +813,57 @@ async fn a_read_only_s3_store_is_scanned_into_backups() {
     succeeded(&task(&env, TaskOp::BackupStoreScan, res.id).await);
     let b = env.cluster.get::<BackupSpec>(id).unwrap().unwrap();
     assert_eq!(b.status.phase, BackupPhase::Failed);
+}
+
+/// 폴더 안에 있고 복제 대상이 있던 VM의 백업도 scan한 뒤 복원된다(리뷰 1 C1): `config` 블롭은 만든 클러스터의 원래
+/// 스펙이고 리소스는 폴더·복제 대상을 버린 스펙이다 — 복원은 리소스의 스펙을 기준으로 한다.
+#[tokio::test]
+async fn a_scanned_backup_of_a_vm_in_a_folder_restores() {
+    let env = Env::start().await;
+    create_pool(&env, "local", false).await;
+    let s3 = opl_store::fake_s3::FakeS3::start("bk", "AKID", "secret-key").await;
+    let target = s3.target(Some("dr"));
+    let backend = Arc::new(opl_store::backend::s3::S3Backend::new(&target, 4).unwrap());
+    let other = Uuid::now_v7();
+    let store = Store::init(backend, other, None, 1).await.unwrap();
+    store
+        .write_owner(&opl_store::format::OwnerFile {
+            cluster: "prod".into(),
+            ca_fingerprint: "sha256:00".into(),
+            store_resource: other,
+            heartbeat: 1,
+        })
+        .await
+        .unwrap();
+    let (vm, id) = (Uuid::now_v7(), Uuid::now_v7());
+    let config = opl_store::format::manifest::ConfigBlob {
+        vm_name: "web".into(),
+        vm_spec: serde_json::from_value(json!({
+            "cpu": {"cores": 1}, "memory_mib": 256, "machine": "virt",
+            "disks": [{"volume": "root", "bus": "virtio-blk"}],
+            "folder": Uuid::now_v7(),
+            "replication": [{"node": Uuid::now_v7()}]
+        }))
+        .unwrap(),
+        uefi_vars: false,
+        tpm_state: false,
+    };
+    let img = image(&[5, 0, 6]);
+    opl_store::testing::write_backup_with(&store, vm, id, std::slice::from_ref(&img), &config, 7)
+        .await
+        .unwrap();
+    let spec: BackupStoreSpec = serde_json::from_value(json!({
+        "backend": {"s3": serde_json::to_value(&target).unwrap()}, "read_only": true
+    }))
+    .unwrap();
+    let res: BackupStore = Resource::new("dr", spec);
+    env.cluster.create(&res).await.unwrap();
+    succeeded(&task(&env, TaskOp::BackupStoreInit, res.id).await);
+    succeeded(&task(&env, TaskOp::BackupStoreScan, res.id).await);
+    let b = env.cluster.get::<BackupSpec>(id).unwrap().unwrap();
+    assert_eq!(b.spec.vm_spec.folder, None);
+    assert!(b.spec.vm_spec.replication.is_empty(), "{b:?}");
+    assert_eq!(restore(&env, &b.name, "web2").await, img);
 }
 
 /// 초기화 Task는 `store.json`·`owner.json`을 쓰고 `ready`·다음 GC 시각을 적는다(로컬은 `chunks/` 디렉터리 65,536개를

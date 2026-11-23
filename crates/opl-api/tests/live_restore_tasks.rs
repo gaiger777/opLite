@@ -290,6 +290,10 @@ async fn store_backup_live_restore_runs_survives_restarts_and_pivots() {
     assert!(env.hv.live_restore_polls(id) > polls);
     assert_eq!(read_source(socket).await, raw_of(&root));
 
+    // 첫 갈아타기는 실패한다(작업이 없어졌다): `Pivoting`에서 맴돌지 않고 `Copying`으로 돌아가 다시 옮긴 뒤 갈아탄다(리뷰 1 I3).
+    env.hv.fail_next_pivot(opl_driver::DriverError::LiveRestore(
+        "opl-lr-0: write error".into(),
+    ));
     // 다 옮기면 갈아타고 보통 VM이 된다.
     env.hv.finish_live_restore_copy(id);
     let t = admin.wait_task(&json!({"id": task})).await;

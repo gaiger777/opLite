@@ -153,7 +153,17 @@ async fn verify_full_quarantines_and_heals() {
         assert_eq!(r1.bad_chunks, vec![shared]);
         let r2 = v.verify_snapshot(vm, b2, None).await.unwrap();
         assert_eq!(r2.bad_chunks, vec![shared], "found earlier in the run");
+        // 옮기기는 부르는 쪽이 커밋 구간을 막은 뒤
+        assert!(v.has_pending());
+        assert!(s.has_chunk(&shared).await.unwrap());
+        assert!(s.quarantined_chunks().await.unwrap().is_empty());
+        assert_eq!(v.quarantine().await.unwrap(), 1);
+        assert!(!v.has_pending());
         assert_eq!(v.moved, 1);
+        assert_eq!(
+            s.quarantined_chunks().await.unwrap(),
+            std::collections::HashSet::from([shared])
+        );
         assert!(!s.has_chunk(&shared).await.unwrap());
         let bad = list_all(b.as_ref(), "bad/").await.unwrap();
         assert_eq!(bad.len(), 1);

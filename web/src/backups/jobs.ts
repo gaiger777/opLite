@@ -169,7 +169,8 @@ export function checkForm(form: JobForm, taken: string[] | null): Record<string,
     found.copyKeep = "backupJobs.errors.keep";
   }
   if (form.replicateRemote !== "" && form.replicatePool === "") {
-    found.replicatePool = "backups.errors.pool";
+    found.replicatePool =
+      form.targetKind === "store" ? "backups.errors.store" : "backups.errors.pool";
   }
   if (form.target === "names" && parseNames(form.names).length === 0) {
     found.names = "backupJobs.errors.names";

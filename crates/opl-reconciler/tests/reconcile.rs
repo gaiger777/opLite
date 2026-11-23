@@ -149,6 +149,7 @@ async fn live_restore_vms_start_only_with_their_wiring() {
             export: "disk0".into(),
         },
         overlay: "/tmp/o.qcow2".into(),
+        pivoted: false,
     }];
     env.hv.set_live_restore(v.id, Some(&wiring)).await.unwrap();
     set_lr(Some(LiveRestore {
@@ -168,13 +169,27 @@ async fn live_restore_vms_start_only_with_their_wiring() {
     assert_eq!(env.hv.live_launches(v.id), 2);
     assert_eq!(env.get(v.id).spec.power, PowerState::Running);
 
+    // 갈아타는 중(`Pivoting`)에 죽으면 배선으로 다시 켜지 않는다(리뷰 1 I3 — Task가 끝내면 보통 VM으로 켠다).
+    set_lr(Some(LiveRestore {
+        phase: LiveRestorePhase::Pivoting,
+        ..copying.clone()
+    }))
+    .await;
+    env.hv.crash(v.id);
+    env.wait(v.id, "held while pivoting", |v| {
+        v.status.last_error.as_deref() == Some(opl_reconciler::LIVE_RESTORE_NOT_STARTED)
+    })
+    .await;
+    assert_eq!(env.pid(v.id).await, None);
+    assert_eq!(env.hv.live_launches(v.id), 2);
+
     // 취소 요청이면 꺼진 뒤 다시 켜지 않는다.
     set_lr(Some(LiveRestore {
         cancel: true,
         ..copying.clone()
     }))
     .await;
-    env.hv.crash(v.id);
+    tokio::time::sleep(Duration::from_millis(300)).await;
     env.wait(v.id, "held after cancel", |v| {
         v.status.last_error.as_deref() == Some(opl_reconciler::LIVE_RESTORE_NOT_STARTED)
     })

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures_util::{StreamExt, TryStreamExt};
 use opl_types::backup_store::{ChunkId, ZERO_CHUNK};
@@ -29,6 +30,9 @@ pub struct SnapshotFiles {
     /// 모든 객체 이름
     pub keys: Vec<String>,
 }
+
+/// 주인 표식을 새로 쓴 뒤 다시 읽기까지 기다리는 시간(같은 때 쓴 다른 클러스터의 덮어쓰기를 본다)
+pub const CLAIM_SETTLE: Duration = Duration::from_secs(2);
 
 /// 주인 표식을 쓰려 한 결과(설계 §12.6)
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,6 +309,17 @@ impl Store {
     }
 
     /// 주어진 id 가운데 저장소에 없는 것(커밋 확인 — 설계 §10.3 (다))
+    /// 검증이 `bad/`로 옮긴 청크 id들(리뷰 1 I5 — 커밋이 base에서 옮긴 id·"있음"으로 건너뛴 id 가운데 이것을 다시 본다)
+    pub async fn quarantined_chunks(
+        &self,
+    ) -> Result<std::collections::HashSet<ChunkId>, StoreError> {
+        Ok(list_all(self.backend.as_ref(), "bad/")
+            .await?
+            .iter()
+            .filter_map(|o| crate::format::parse_bad_key(&o.key))
+            .collect())
+    }
+
     pub async fn missing_chunks(&self, ids: &[ChunkId]) -> Result<Vec<ChunkId>, StoreError> {
         let found: Vec<(ChunkId, bool)> = futures_util::stream::iter(ids.iter().copied())
             .map(|id| async move { Ok::<_, StoreError>((id, self.has_chunk(&id).await?)) })
@@ -520,20 +535,61 @@ impl Store {
         }
     }
 
-    /// 주인 표식을 없을 때만 쓰고 다시 읽어 견준다.
+    /// 주인 표식을 없을 때만 쓰고 다시 읽어 견준다. 새로 썼으면 [`CLAIM_SETTLE`] 뒤 한 번 더 읽는다(리뷰 1 M4): 조건부 쓰기를
+    /// 모르는(또는 무시하는) S3 백엔드에서 같은 때 쓴 다른 클러스터가 덮었으면 그쪽이 주인이다.
     pub async fn claim_owner(&self, owner: &OwnerFile) -> Result<OwnerClaim, StoreError> {
+        self.claim_owner_after(owner, CLAIM_SETTLE).await
+    }
+
+    async fn claim_owner_after(
+        &self,
+        owner: &OwnerFile,
+        settle: Duration,
+    ) -> Result<OwnerClaim, StoreError> {
         let bytes = serde_json::to_vec_pretty(owner).expect("owner.json serializes");
         let wrote = self.backend.put_if_absent(OWNER_FILE, bytes).await?;
-        let found = self.read_owner().await?.ok_or_else(|| {
-            StoreError::Invalid("owner.json vanished right after writing it".into())
-        })?;
-        let same = found.ca_fingerprint == owner.ca_fingerprint
-            && found.store_resource == owner.store_resource;
+        let read = async || {
+            let found = self.read_owner().await?.ok_or_else(|| {
+                StoreError::Invalid("owner.json vanished right after writing it".into())
+            })?;
+            let same = found.ca_fingerprint == owner.ca_fingerprint
+                && found.store_resource == owner.store_resource;
+            Ok::<_, StoreError>((found, same))
+        };
+        let (mut found, mut same) = read().await?;
+        if wrote && same {
+            tokio::time::sleep(settle).await;
+            (found, same) = read().await?;
+        }
         Ok(match (wrote, same) {
             (true, true) => OwnerClaim::Claimed,
             (_, true) => OwnerClaim::Ours,
             (_, false) => OwnerClaim::Other(found),
         })
+    }
+
+    /// 이 클러스터(CA 지문 `fp`, 저장소 리소스 `resource`)가 주인이고 하트비트가 `every`초보다 오래됐으면 `now`로 새로 쓴다
+    /// (리뷰 1 I4 — 넘겨받기의 24시간 기다림은 하트비트로 산 주인을 가린다. GC만 쓰면 주마다 도는 GC의 주인도 넘겨받힌다).
+    /// 다른 클러스터가 주인이거나 표식이 없으면 쓰지 않는다. 썼으면 true.
+    pub async fn refresh_heartbeat(
+        &self,
+        fp: &str,
+        resource: Uuid,
+        now: u64,
+        every: u64,
+    ) -> Result<bool, StoreError> {
+        let Some(mut owner) = self.read_owner().await? else {
+            return Ok(false);
+        };
+        if owner.ca_fingerprint != fp
+            || owner.store_resource != resource
+            || owner.heartbeat.saturating_add(every) > now
+        {
+            return Ok(false);
+        }
+        owner.heartbeat = now;
+        self.write_owner(&owner).await?;
+        Ok(true)
     }
 
     /// 주인 표식을 덮어쓴다(하트비트·넘겨받기).
@@ -769,6 +825,62 @@ mod tests {
         );
         s.write_owner(&other).await.unwrap();
         assert_eq!(s.read_owner().await.unwrap(), Some(other));
+    }
+
+    /// 새로 쓴 뒤 다른 클러스터가 덮으면(조건부 쓰기를 모르는 백엔드) 다시 읽어 그쪽을 주인으로 본다(리뷰 1 M4).
+    #[tokio::test]
+    async fn a_claim_overwritten_right_after_writing_is_not_ours() {
+        let s = Arc::new(
+            Store::init(mem(), Uuid::from_u128(1), None, 1)
+                .await
+                .unwrap(),
+        );
+        let me = OwnerFile {
+            cluster: "prod".into(),
+            ca_fingerprint: "sha256:aa".into(),
+            store_resource: Uuid::from_u128(1),
+            heartbeat: 10,
+        };
+        let other = OwnerFile {
+            cluster: "dr".into(),
+            ca_fingerprint: "sha256:bb".into(),
+            ..me.clone()
+        };
+        let (claim, ()) = tokio::join!(
+            s.claim_owner_after(&me, Duration::from_millis(300)),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                s.write_owner(&other).await.unwrap();
+            }
+        );
+        assert_eq!(claim.unwrap(), OwnerClaim::Other(other));
+    }
+
+    /// 하트비트는 이 클러스터가 주인이고 `every`보다 오래됐을 때만 새로 쓴다(리뷰 1 I4).
+    #[tokio::test]
+    async fn heartbeats_refresh_only_our_old_owner_file() {
+        let s = Store::init(mem(), Uuid::from_u128(1), None, 1)
+            .await
+            .unwrap();
+        let r = Uuid::from_u128(1);
+        assert!(!s.refresh_heartbeat("sha256:aa", r, 100, 10).await.unwrap());
+        let me = OwnerFile {
+            cluster: "prod".into(),
+            ca_fingerprint: "sha256:aa".into(),
+            store_resource: r,
+            heartbeat: 95,
+        };
+        s.write_owner(&me).await.unwrap();
+        assert!(!s.refresh_heartbeat("sha256:aa", r, 100, 10).await.unwrap());
+        assert!(!s.refresh_heartbeat("sha256:bb", r, 200, 10).await.unwrap());
+        assert!(
+            !s.refresh_heartbeat("sha256:aa", Uuid::from_u128(2), 200, 10)
+                .await
+                .unwrap()
+        );
+        assert_eq!(s.read_owner().await.unwrap().unwrap().heartbeat, 95);
+        assert!(s.refresh_heartbeat("sha256:aa", r, 200, 10).await.unwrap());
+        assert_eq!(s.read_owner().await.unwrap().unwrap().heartbeat, 200);
     }
 
     #[tokio::test]

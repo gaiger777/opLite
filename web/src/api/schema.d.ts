@@ -4654,6 +4654,11 @@ export interface components {
             /** @default initializing */
             phase: components["schemas"]["StorePhase"];
             /**
+             * @description 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
+             *     구간에 새로 들지 않는다)
+             */
+            quarantining?: boolean;
+            /**
              * Format: uuid
              * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
              */
@@ -7771,6 +7776,11 @@ export interface components {
                     owner?: components["schemas"]["StoreOwner"];
                     /** @default initializing */
                     phase: components["schemas"]["StorePhase"];
+                    /**
+                     * @description 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
+                     *     구간에 새로 들지 않는다)
+                     */
+                    quarantining?: boolean;
                     /**
                      * Format: uuid
                      * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
@@ -11172,6 +11182,11 @@ export interface components {
                 owner?: components["schemas"]["StoreOwner"];
                 /** @default initializing */
                 phase: components["schemas"]["StorePhase"];
+                /**
+                 * @description 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
+                 *     구간에 새로 들지 않는다)
+                 */
+                quarantining?: boolean;
                 /**
                  * Format: uuid
                  * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.

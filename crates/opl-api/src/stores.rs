@@ -20,6 +20,22 @@ use opl_types::storage::{StoragePool, StoragePoolSpec, is_shared, pool_error_on,
 use opl_types::task::{TaskOp, TaskSpec};
 use uuid::Uuid;
 
+/// 주인 하트비트(`owner.json`)를 새로 쓰는 간격(리뷰 1 I4 — 넘겨받기는 24시간 지난 하트비트를 기다린다)
+pub const HEARTBEAT_EVERY: u64 = 3600;
+
+/// 이 클러스터의 이름과 CA 지문(`owner.json`)
+pub fn this_cluster(cluster: &Cluster) -> Result<(String, String), String> {
+    let info = cluster
+        .list::<opl_types::cluster::ClusterSpec>()
+        .map_err(|e| e.to_string())?
+        .1
+        .into_iter()
+        .next()
+        .ok_or("the cluster has not been initialized")?;
+    let fp = opl_peer::pki::fingerprint(&info.spec.ca_cert_pem).map_err(|e| e.to_string())?;
+    Ok((info.name, fp))
+}
+
 /// 저장소 `store.json`의 id: 만든 저장소는 리소스 id, 붙인 저장소는 초기화가 읽은 남의 id
 pub fn store_id(store: &BackupStore) -> Uuid {
     store.status.store_id.unwrap_or(store.id)

@@ -19,7 +19,6 @@ use opl_types::backup_store::{
     BackupStore, BackupStoreSpec, GcPhase, GcResult, GcRun, StoreOwner, StorePhase, StoreUsage,
     VerifyMode, VerifyResult, verify::due,
 };
-use opl_types::cluster::ClusterSpec;
 use opl_types::resource::Resource;
 use opl_types::storage::is_shared;
 use opl_types::task::Task;
@@ -39,16 +38,7 @@ fn get_store(ctx: &Ctx, id: Uuid) -> Result<BackupStore, String> {
 
 /// 이 클러스터의 이름과 CA 지문(`owner.json`)
 fn this_cluster(ctx: &Ctx) -> Result<(String, String), String> {
-    let info = ctx
-        .cluster
-        .list::<ClusterSpec>()
-        .map_err(|e| e.to_string())?
-        .1
-        .into_iter()
-        .next()
-        .ok_or("the cluster has not been initialized")?;
-    let fp = opl_peer::pki::fingerprint(&info.spec.ca_cert_pem).map_err(|e| e.to_string())?;
-    Ok((info.name, fp))
+    stores::this_cluster(&ctx.cluster)
 }
 
 fn owner_file(ctx: &Ctx, store: &BackupStore, now: u64) -> Result<OwnerFile, String> {
@@ -272,6 +262,19 @@ pub(super) async fn gc(ctx: &Ctx, task: &Task) -> Result<Option<String>, String>
         Ok(Step::Write)
     })
     .await?;
+    // 쓸기 잠금을 쥔 뒤 주인을 다시 본다(리뷰 1 I4): 표시하는 동안 넘겨받혔으면 새 주인의 백업이 건너뛴 청크를 지우게 된다.
+    if let Some(o) = store.read_owner().await.map_err(fail)?
+        && (o.ca_fingerprint != fp || o.store_resource != res.id)
+    {
+        let error = format!("store was taken over by cluster {:?}", o.cluster);
+        let _ = update_store(ctx, res.id, |s| {
+            s.phase = StorePhase::Failed;
+            s.error = Some(error.clone());
+            Ok(Step::Write)
+        })
+        .await;
+        return Err(format!("{error}; nothing was removed"));
+    }
     // 늦은 표시: 표시 뒤에 생긴 인덱스
     marker.mark(&store).await.map_err(fail)?;
     let stats = gc::sweep(&store, &marker, &start).await.map_err(fail)?;
@@ -375,6 +378,33 @@ async fn record_verify(ctx: &Ctx, id: Uuid, verify: &BackupVerify) -> Result<(),
     }
 }
 
+/// 찾은 깨진 청크를 `bad/`로 옮긴다(리뷰 1 I5): 커밋 구간이 빌 때 `quarantining`을 쥐고(그동안 새 커밋은 기다린다) 옮긴 뒤
+/// 놓는다. 그 뒤의 커밋은 `bad/`의 id 가운데 건너뛰었거나 base에서 옮긴 것을 다시 올린다 — 옮기는 사이에 "있음"으로 본
+/// 청크를 가리키는 매니페스트가 생기지 않는다.
+async fn quarantine(ctx: &Ctx, store: Uuid, verifier: &mut Verifier<'_>) -> Result<u64, String> {
+    update_store(ctx, store, |s| {
+        if s.quarantining || !s.committing.is_empty() {
+            return Ok(Step::Wait);
+        }
+        s.quarantining = true;
+        Ok(Step::Write)
+    })
+    .await?;
+    let moved = verifier.quarantine().await.map_err(|e| e.to_string());
+    let released = update_store(ctx, store, |s| {
+        if !s.quarantining {
+            return Ok(Step::Skip);
+        }
+        s.quarantining = false;
+        Ok(Step::Write)
+    })
+    .await;
+    if let Err(e) = released {
+        tracing::warn!(store = %store, error = %e, "cannot release the quarantine lock; the janitor will");
+    }
+    moved
+}
+
 /// 저장소 검증(§10.5): `backups`(비면 일정대로 [`due`])의 매니페스트·블롭·인덱스·청크를 확인하고 백업마다
 /// `status.verify`, 저장소에 `last_verify`·`bad_chunks`를 적는다. 깨진 청크는 `bad/`로 옮긴다(읽기 전용이면 옮기지
 /// 않음). 실패한 백업이 있으면 경고로 돌려준다.
@@ -427,6 +457,11 @@ pub(super) async fn verify(
             .verify_snapshot(b.spec.vm, b.id, Some(&expected))
             .await
             .map_err(|e| stores::store_error(&res.name, e))?;
+        if verifier.has_pending() {
+            quarantine(ctx, res.id, &mut verifier)
+                .await
+                .map_err(|e| format!("cannot move bad chunks aside: {e}"))?;
+        }
         snapshots += 1;
         let verify = BackupVerify {
             at: now_secs(),
@@ -550,8 +585,9 @@ pub(super) async fn scan(ctx: &Ctx, task: &Task) -> Result<Option<String>, Strin
             .find(|n| !all.iter().any(|b| &b.name == n))
             .expect("a free name");
         let mut vm_spec = config.vm_spec.clone();
-        // 다른 클러스터의 폴더는 여기에 없다(받은 사본과 같다 — 루트).
+        // 다른 클러스터의 폴더는 여기에 없고 복제 대상은 그 클러스터의 노드다(받은 사본과 같다 — 루트, 복제 없음).
         vm_spec.folder = None;
+        vm_spec.replication.clear();
         let mut b: Backup = Resource::new(
             name,
             BackupSpec {

@@ -765,7 +765,10 @@ function StoreTargetDialog({
   );
 }
 
-/** 백업을 원격 클러스터의 백업 풀에 사본으로 보내는 대화상자. 열 때만 그린다. */
+/**
+ * 백업을 원격 클러스터의 백업 풀에 사본으로 보내는 대화상자. 저장소 백업은 원격의 백업 저장소로 보낸다(계획 68
+ * §12.4 — 서버는 `pool` 칸을 원격 저장소 이름으로 읽는다). 열 때만 그린다.
+ */
 function ReplicateDialog({
   backup,
   returnFocus,
@@ -778,13 +781,14 @@ function ReplicateDialog({
   const { t } = useTranslation();
   const [target, setTarget] = useState<RemoteTarget>({ remote: "", pool: "" });
   const [errors, setErrors] = useState<{ remote?: string; pool?: string }>({});
+  const toStore = backup.spec.store != null;
 
   async function submit() {
     const found: { remote?: string; pool?: string } = {};
     if (target.remote === "") {
       found.remote = "backups.errors.remote";
     } else if (target.pool === "") {
-      found.pool = "backups.errors.pool";
+      found.pool = toStore ? "backups.errors.store" : "backups.errors.pool";
     }
     setErrors(found);
     if (Object.keys(found).length > 0) {
@@ -810,7 +814,9 @@ function ReplicateDialog({
   return (
     <FormDialog
       title={t("backups.replicateNamed", { name: backup.name })}
-      description={t("backups.replicateDescription")}
+      description={t(
+        toStore ? "backups.replicateStoreDescription" : "backups.replicateDescription",
+      )}
       submitLabel={t("backups.replicateSubmit")}
       returnFocus={returnFocus}
       onClose={onClose}
@@ -820,6 +826,7 @@ function ReplicateDialog({
         id="replicate"
         label={t("backups.remote")}
         none={t("backups.chooseRemote")}
+        kind={toStore ? "store" : "pool"}
         value={target}
         errors={errors}
         onChange={setTarget}

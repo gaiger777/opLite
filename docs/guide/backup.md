@@ -448,8 +448,9 @@ orbivisorctl backup-store get offsite | jq '.status.last_gc, .status.usage'
 - **결과.** `last_gc`(시각, 지운 청크·바이트 `removed_chunks`·`removed_bytes`, 젊어서 남긴 청크 `kept_young`, 오류)와 `usage`(스냅샷 수,
   청크 수, 논리 바이트, 저장 바이트 — `DEDUP` = 논리 ÷ 저장). 표시 집합은 Bloom 필터라 1% 안팎의 쓰레기가 다음 GC까지 남을 수 있다(지우면 안 되는 것을 지우는 쪽으로는
   틀리지 않는다).
-- **기다림 한도.** 시작 때 돌던 백업을 24시간까지 기다리고, 넘으면 아무것도 지우지 않고 실패한다. 같은 저장소의 GC·검증은 차례로
-  돈다. 읽기 전용 저장소와 넘겨받힌 저장소(주인 표식이 이 클러스터가 아님 — 저장소를 `failed`, "store was taken over by cluster
+- **기다림 한도.** 시작 때 돌던 백업을 24시간까지 기다리고, 넘으면 아무것도 지우지 않고 실패한다. 같은 저장소의 GC·검증은 한
+  노드 안에서는 차례로 돌지만 다른 노드에서는 함께 돌 수 있다(GC는 가리키지 않는 청크만, 검증은 가리키는 청크만 건드려 서로 엇갈리지
+  않는다). 읽기 전용 저장소와 넘겨받힌 저장소(주인 표식이 이 클러스터가 아님 — 저장소를 `failed`, "store was taken over by cluster
   X")에서는 돌지 않는다.
 - **보존.** 백업 작업의 보존 규칙은 VM과 **대상(풀·저장소)마다** 따로 고른다. 저장소 백업은 체인이 없으므로 조상 보호 없이 규칙대로
   지운다(풀 백업은 지금처럼 조상 보호). 지운 백업의 공간은 다음 GC가 거둔다.
@@ -547,8 +548,9 @@ orbivisorctl backup-store take-over prod-s3
   `{VM 이름}-{만든 시각}`, 루트 폴더, `spec.origin`은 `owner.json`의 클러스터·CA 지문. 저장소에서 사라진 백업은 `failed`("snapshot is
   gone from the store")로 표시만 한다.
 - **넘겨받기**(`cluster.admin`, API `POST …/actions/take-over`)는 Task 없이 곧바로 주인 표식을 이 클러스터로 바꾸고 `read_only`를 끈다.
-  옛 주인의 하트비트(GC마다 씀)가 24시간 안이면 `--force` 없이는 409 `store_owned_elsewhere`다. 옛 주인이 살아 있으면 다음 GC에서 표식이
-  바뀐 것을 보고 그 저장소를 `failed`("store was taken over by cluster X")로 멈춘다.
+  옛 주인의 하트비트(리더가 한 시간마다, GC도 끝날 때 씀)가 24시간 안이면 `--force` 없이는 409 `store_owned_elsewhere`다. 옛 주인이 살아
+  있으면 다음 GC(시작할 때와 쓸기 잠금을 쥔 뒤)에서 표식이 바뀐 것을 보고 그 저장소를 `failed`("store was taken over by cluster X")로
+  멈춘다.
 - **DR 시험.** 계획 68의 GitHub `backup-s3` 작업은 두 클러스터로 이 차례(prod 암호화 저장소·escrow → dr 읽기 전용 붙이기·scan·라이브
   복원이 원본과 같음 → 읽기 전용 백업 거절 → 넘겨받기 거절 뒤 `--force` → prod GC가 "taken over"로 멈춤)를 돈다.
 
@@ -704,7 +706,7 @@ orbivisorctl remote remove dr
 
     | 경로(`{*path}`) | `GET`·`HEAD` | 그 밖의 메서드 |
     |---|---|---|
-    | 첫 조각이 `vms`·`volumes`·`storage-pools`·`networks`·`security-groups`·`snapshots`·`backups`·`backup-jobs`·`vm-imports`·`nodes`·`tasks`·`cluster`·`version`·`settings`·`subscription`, 또는 정확히 `auth/whoami` | viewer 이상 | admin |
+    | 첫 조각이 `vms`·`volumes`·`storage-pools`·`backup-stores`·`networks`·`security-groups`·`snapshots`·`backups`·`backup-jobs`·`vm-imports`·`nodes`·`tasks`·`cluster`·`version`·`settings`·`subscription`, 또는 정확히 `auth/whoami` | viewer 이상 | admin |
     | 그 밖(`users`·`tokens`·`realms`·`audit`·`telemetry`·`remotes`·다른 `auth/*`·모르는 조각) | admin | admin |
 
   - 보내는 헤더는 `Content-Type`·`Content-Length`·`If-Match`·`Accept`뿐이다(쿠키·`Origin`·원래 `Authorization` 등은 보내지

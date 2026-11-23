@@ -78,6 +78,21 @@ async fn reach(
     }
 }
 
+/// 이 클러스터가 주인이고 하트비트가 [`opl_api::stores::HEARTBEAT_EVERY`]보다 오래됐으면 새로 쓴다. 썼으면 true.
+async fn heartbeat(
+    cluster: &Cluster,
+    store: &BackupStore,
+    node: Uuid,
+    mount_root: &std::path::Path,
+) -> Result<bool, String> {
+    let (_, fp) = opl_api::stores::this_cluster(cluster)?;
+    let opened = opl_api::stores::open(cluster, store, node, mount_root).await?;
+    opened
+        .refresh_heartbeat(&fp, store.id, now(), opl_api::stores::HEARTBEAT_EVERY)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 한 번 확인하고 바뀌었으면 쓴다.
 pub async fn check_once(
     cluster: &Cluster,
@@ -106,6 +121,20 @@ pub async fn check_once(
             Ok(r) => r,
             Err(_) => Err(format!("no answer in {}s", CHECK_TIMEOUT.as_secs())),
         };
+        // 리더는 이 클러스터가 주인인 쓰기 저장소의 하트비트를 새로 쓴다(리뷰 1 I4 — GC가 드물거나 실패해도 산 주인이
+        // `force` 없이 넘겨받히지 않는다).
+        if r.is_ok() && !store.spec.read_only && cluster.leader_term().is_some() {
+            let beat = heartbeat(cluster, store, node, mount_root);
+            match tokio::time::timeout(CHECK_TIMEOUT, beat).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(store = %store.name, error = %e, "cannot write the owner heartbeat")
+                }
+                Err(_) => {
+                    tracing::warn!(store = %store.name, "writing the owner heartbeat timed out")
+                }
+            }
+        }
         found.push(NodeStoreState {
             store: store.id,
             ok: r.is_ok(),

@@ -447,6 +447,11 @@ pub struct BackupStoreStatus {
     #[serde(skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub sweep_epoch: u64,
+    /// 검증이 깨진 청크를 `bad/`로 옮기는 중(리뷰 1 I5 — 쓸기 잠금처럼 `committing`이 비었을 때만 참이 되고 그동안 커밋
+    /// 구간에 새로 들지 않는다)
+    #[serde(skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub quarantining: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub last_gc: Option<GcResult>,
@@ -1060,6 +1065,7 @@ mod tests {
             sweeping: true,
             committing: vec![backup],
             sweep_epoch: 4,
+            quarantining: true,
             last_gc: Some(GcResult {
                 started_at: 1,
                 finished_at: 2,

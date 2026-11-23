@@ -93,6 +93,17 @@ export async function remoteStoragePools(
   return list.items;
 }
 
+/** 원격의 백업 저장소 목록(저장소 백업의 사본을 보낼 저장소를 고른다 — 계획 68 §12.4) */
+export async function remoteBackupStores(
+  remote: string,
+  signal?: AbortSignal,
+): Promise<components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"][]> {
+  const list = await proxy<{
+    items: components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"][];
+  }>(remote, "GET", "/backup-stores", signal);
+  return list.items;
+}
+
 /** 원격 VM의 동작을 요청한다. 원격이 만든 Task를 돌려준다(이 클러스터의 Task가 아니라 지켜보지 않는다). */
 export function remoteVmAction(remote: string, vm: Vm, action: RemoteVmAction): Promise<Task> {
   const path =

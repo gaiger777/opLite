@@ -131,12 +131,12 @@ pub(super) async fn update_store(
     }
 }
 
-/// 커밋 구간에 들어간다(§10.3): 쓸기 중이면 끝날 때까지 기다리고 `committing`에 `backup`을 넣는다. 들어간 뒤의 상태.
+/// 커밋 구간에 들어간다(§10.3): 쓸기 중(또는 검증이 깨진 청크를 옮기는 중 — 리뷰 1 I5)이면 끝날 때까지 기다리고 `committing`에 `backup`을 넣는다. 들어간 뒤의 상태.
 async fn begin_commit(ctx: &Ctx, store: Uuid, backup: Uuid) -> Result<BackupStoreStatus, String> {
     update_store(ctx, store, |s| {
         if s.committing.contains(&backup) {
             Ok(Step::Skip)
-        } else if s.sweeping {
+        } else if s.sweeping || s.quarantining {
             Ok(Step::Wait)
         } else {
             s.committing.push(backup);
@@ -174,6 +174,8 @@ struct DiskResult {
     index: FixedIndex,
     /// "있음 확인"으로 건너뛴(base에 없던) 청크와 그 청크 번호 — 커밋 확인
     skipped: Vec<(u64, ChunkId)>,
+    /// base 인덱스에서 옮긴(있음을 보지 않은) 청크와 그 청크 번호 — 커밋이 `bad/`의 id와 견준다(리뷰 1 I5)
+    inherited: Vec<(u64, ChunkId)>,
     read_bytes: u64,
     new_chunks: u64,
     new_bytes: u64,
@@ -356,9 +358,19 @@ async fn write_disk(
     if processed.len() != to_read.len() {
         return Err("the disk was not read completely".into());
     }
+    // base에서 옮긴 자리(읽지 않은 것): 아래에서 읽은 자리는 덮인다.
+    let read: HashSet<u64> = processed.iter().map(|p| p.0).collect();
+    let inherited: Vec<(u64, ChunkId)> = index
+        .ids
+        .iter()
+        .enumerate()
+        .filter(|(n, id)| **id != ZERO_CHUNK && !read.contains(&(*n as u64)))
+        .map(|(n, id)| (n as u64, *id))
+        .collect();
     let mut out = DiskResult {
         index,
         skipped: Vec::new(),
+        inherited,
         read_bytes: 0,
         new_chunks: 0,
         new_bytes: 0,
@@ -368,11 +380,12 @@ async fn write_disk(
         out.read_bytes += read;
         match outcome {
             Outcome::Exists => out.skipped.push((n, id)),
+            Outcome::Unchanged => out.inherited.push((n, id)),
             Outcome::New(bytes) => {
                 out.new_chunks += 1;
                 out.new_bytes += bytes;
             }
-            Outcome::Zero | Outcome::Unchanged | Outcome::Seen => {}
+            Outcome::Zero | Outcome::Seen => {}
         }
     }
     Ok(out)
@@ -452,6 +465,7 @@ pub(super) async fn write_backup(
     let mut stats = StoreBackupStats::default();
     let mut indexes = Vec::with_capacity(sources.len());
     let mut skipped: Vec<(usize, u64, ChunkId)> = Vec::new();
+    let mut inherited: Vec<(usize, u64, ChunkId)> = Vec::new();
     let mut disks = Vec::with_capacity(sources.len());
     for (i, src) in sources.iter().enumerate() {
         let base = bases.and_then(|b| b.get(i));
@@ -466,6 +480,7 @@ pub(super) async fn write_backup(
         stats.zero_chunks += zero;
         stats.reused_chunks += r.index.ids.len() as u64 - zero - r.new_chunks;
         skipped.extend(r.skipped.iter().map(|(n, id)| (i, *n, *id)));
+        inherited.extend(r.inherited.iter().map(|(n, id)| (i, *n, *id)));
         disks.push(BackupDisk {
             name: format!("disk{i}"),
             file: format!("disk{i}.fidx"),
@@ -511,18 +526,28 @@ pub(super) async fn write_backup(
     }
     let status = begin_commit(ctx, c.store_res.id, c.backup).await?;
     let committed = async {
-        if status.sweep_epoch != c.epoch || c.sweeping {
-            let ids: Vec<ChunkId> = skipped.iter().map(|s| s.2).collect();
+        // 다시 볼 것: 쓸기가 있었으면 "있음"으로 건너뛴 id, 그리고 검증이 `bad/`로 옮긴 id 가운데 건너뛰었거나 base에서
+        // 옮긴 것(리뷰 1 I5 — 커밋 구간 안이라 그새 더 옮겨지지 않는다)
+        let swept = status.sweep_epoch != c.epoch || c.sweeping;
+        let bad = store.quarantined_chunks().await.map_err(fail)?;
+        let check: Vec<(usize, u64, ChunkId)> = skipped
+            .iter()
+            .filter(|s| swept || bad.contains(&s.2))
+            .chain(inherited.iter().filter(|s| bad.contains(&s.2)))
+            .copied()
+            .collect();
+        if !check.is_empty() {
+            let ids: Vec<ChunkId> = check.iter().map(|s| s.2).collect();
             let gone: HashSet<ChunkId> = store.missing_chunks(&ids).await.map_err(fail)?.into_iter().collect();
             if !gone.is_empty() {
                 let mut again: Vec<(usize, u64, ChunkId)> = Vec::new();
                 let mut done = HashSet::new();
-                for s in skipped.iter().filter(|s| gone.contains(&s.2)) {
+                for s in check.iter().filter(|s| gone.contains(&s.2)) {
                     if done.insert(s.2) {
                         again.push(*s);
                     }
                 }
-                tracing::info!(backup = %c.backup, chunks = again.len(), "re-uploading chunks removed by a GC sweep");
+                tracing::info!(backup = %c.backup, chunks = again.len(), "re-uploading chunks removed by a GC sweep or a verification");
                 let bytes = reupload(store, sources, &again).await?;
                 stats.new_chunks += again.len() as u64;
                 stats.reused_chunks -= again.len() as u64;
@@ -833,6 +858,14 @@ pub(super) async fn backup(
                 tracing::warn!(backup = %id, error = %e, "the backup is complete but closing its disk export failed");
                 Ok(w)
             }
+            (Ok(w), Ok(())) => {
+                // 남은 다른 백업 비트맵(전체 백업이 쌓은 것, 풀 백업의 것)은 다음 증분을 막을 뿐이다 — 풀 백업처럼
+                // 이 백업의 것만 남긴다(리뷰 1 I1).
+                if let Err(e) = ctx.hv.remove_bitmaps(vm.id, Some(&req.bitmap)).await {
+                    tracing::warn!(backup = %id, error = %e, "cannot remove older dirty bitmaps");
+                }
+                Ok(w)
+            }
             (r, _) => r,
         };
         (written, export.quiesced.warning())
@@ -1099,7 +1132,9 @@ pub(super) async fn serve(
     })
 }
 
-/// 저장소 백업의 매니페스트와 `config` 블롭을 읽고 리소스와 맞춰 본다.
+/// 저장소 백업의 매니페스트와 `config` 블롭을 읽고 리소스와 맞춰 본다. VM 스펙은 리소스의 것이 기준이다: 받은 사본·
+/// scan한 백업의 `config`는 보낸(만든) 클러스터의 원래 스펙(폴더·복제 대상·옛 노드가 버린 칸이 든)이라 같지 않을 수
+/// 있다 — 디스크 수만 맞춰 본다(리뷰 1 C1).
 pub(super) async fn read_snapshot(
     store: &Store,
     backup: &Backup,
@@ -1113,7 +1148,8 @@ pub(super) async fn read_snapshot(
     let raw = store.get_blob(&m, CONFIG_BLOB).await.map_err(fail)?;
     let config: ConfigBlob =
         serde_json::from_slice(&raw).map_err(|e| format!("invalid config blob: {e}"))?;
-    if config.vm_spec != backup.spec.vm_spec || m.disks.len() != backup.spec.vm_spec.disks.len() {
+    let disks = backup.spec.vm_spec.disks.len();
+    if config.vm_spec.disks.len() != disks || m.disks.len() != disks {
         return Err("backup manifest does not match the backup record".into());
     }
     Ok((m, config))
@@ -1638,8 +1674,8 @@ pub(crate) fn filling(tasks: &[Task], backups: &[Backup], backup: &Backup) -> bo
 pub(crate) const RECEIVE_COMMIT_STALE: u64 = 600;
 
 /// 쓰기 잠금을 쥔 채 남은 것(§10.3 끝): 커밋 구간의 백업 가운데 더는 `pending`이 아니거나 채우는 Task가 없는 것(받는
-/// 사본은 [`RECEIVE_COMMIT_STALE`] 동안 받은 것이 없는 것), 끝난(없는) GC Task의 `gc`·`sweeping`. 바꿀 것이 있으면 고친
-/// 상태.
+/// 사본은 [`RECEIVE_COMMIT_STALE`] 동안 받은 것이 없는 것), 끝난(없는) GC Task의 `gc`·`sweeping`, 검증 Task가 모두 끝난
+/// 저장소의 `quarantining`. 바꿀 것이 있으면 고친 상태.
 pub(crate) fn stale_locks(
     store: &BackupStore,
     backups: &[Backup],
@@ -1664,6 +1700,16 @@ pub(crate) fn stale_locks(
         }
     } else if status.sweeping {
         status.sweeping = false;
+    }
+    // 검증이 깨진 청크를 옮기는 잠금(리뷰 1 I5): 이 저장소의 검증 Task가 모두 끝났으면 놓는다.
+    if status.quarantining
+        && !tasks.iter().any(|t| {
+            t.spec.target == store.id
+                && matches!(t.spec.op, TaskOp::BackupStoreVerify { .. })
+                && !t.status.state.is_finished()
+        })
+    {
+        status.quarantining = false;
     }
     (status != store.status).then_some(status)
 }
@@ -1781,5 +1827,16 @@ mod tests {
         assert!(!fixed.sweeping && fixed.gc.is_none());
         store.status = fixed;
         assert_eq!(stale_locks(&store, &backups, &tasks, 0), None);
+        // 검증의 옮기기 잠금(리뷰 1 I5): 그 저장소의 검증 Task가 돌면 두고, 모두 끝났으면 놓는다
+        store.status.quarantining = true;
+        let verify = TaskOp::BackupStoreVerify { backups: vec![] };
+        tasks.push(task(verify, store.id, TaskState::Running));
+        assert_eq!(stale_locks(&store, &backups, &tasks, 0), None);
+        tasks[2].status.state = TaskState::Succeeded;
+        assert!(
+            !stale_locks(&store, &backups, &tasks, 0)
+                .unwrap()
+                .quarantining
+        );
     }
 }

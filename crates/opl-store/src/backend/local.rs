@@ -56,13 +56,17 @@ fn write_tmp(path: &Path, data: &[u8]) -> Result<PathBuf, StoreError> {
             .create_new(true)
             .open(&tmp)
     };
-    let mut f = match open() {
-        Err(e) if e.kind() == ErrorKind::NotFound => {
-            let parent = path.parent().expect("object has a parent");
-            fs::create_dir_all(parent).map_err(|e| io_err("cannot create", parent, e))?;
-            open()
+    // 디렉터리가 없으면 만든다. 같은 때 지우기가 빈 디렉터리를 치웠으면(만든 뒤 열기 전) 몇 번 다시 한다(리뷰 1 M6).
+    let mut tries = 0;
+    let mut f = loop {
+        match open() {
+            Err(e) if e.kind() == ErrorKind::NotFound && tries < 3 => {
+                tries += 1;
+                let parent = path.parent().expect("object has a parent");
+                fs::create_dir_all(parent).map_err(|e| io_err("cannot create", parent, e))?;
+            }
+            r => break r,
         }
-        r => r,
     }
     .map_err(|e| io_err("cannot create", &tmp, e))?;
     let res = f.write_all(data).and_then(|_| f.sync_all());

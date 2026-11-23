@@ -229,12 +229,14 @@ async fn live_restore_boots_copies_reconnects_and_pivots() {
                 export: "disk0".into(),
             },
             overlay: state.join("lr-disk0.qcow2"),
+            pivoted: false,
         },
         LiveRestoreDisk {
             source: LiveRestoreSource::Qcow2 {
                 chain: vec![child.clone(), base.clone()],
             },
             overlay: state.join("lr-disk1.qcow2"),
+            pivoted: false,
         },
     ];
     for d in &wiring {

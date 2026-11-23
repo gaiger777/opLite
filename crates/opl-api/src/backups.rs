@@ -664,11 +664,31 @@ pub(crate) fn parent_in_use(backups: &[Backup], backup: &Backup) -> Option<Strin
     })
 }
 
-/// 백업이 증분 백업의 부모이면 409 `backup_in_use`
+/// 백업 `backup`을 라이브 복원하는 VM이 있으면(실패한 라이브 복원도 — 오버레이가 그 백업을 바탕으로 둔다) 그 거절 문구
+/// (리뷰 1 I2). 그동안 지우면 GC가 청크를 거둬 그 VM은 다시 이어 갈 수 없다.
+pub(crate) fn live_restore_in_use(vms: &[Vm], backup: &Backup) -> Option<String> {
+    vms.iter()
+        .find(|v| {
+            v.status
+                .live_restore
+                .as_ref()
+                .is_some_and(|l| l.backup == backup.id)
+        })
+        .map(|v| {
+            format!(
+                "backup {:?} is being live-restored into VM {:?}; finish or cancel that first",
+                backup.name, v.name
+            )
+        })
+}
+
+/// 백업이 증분 백업의 부모이거나 라이브 복원 중인 VM의 바탕이면 409 `backup_in_use`
 fn check_not_parent(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
+    let (_, vms) = state.cluster.list::<VmSpec>()?;
     let used = parent_in_use(&backups, backup)
-        .or_else(|| crate::tasks::backup_store::base_in_use(&backups, backup));
+        .or_else(|| crate::tasks::backup_store::base_in_use(&backups, backup))
+        .or_else(|| live_restore_in_use(&vms, backup));
     match used {
         Some(message) => Err(ApiError::conflict("backup_in_use", message)),
         None => Ok(()),

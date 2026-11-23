@@ -831,6 +831,13 @@ pub const MISSING_BATCH: usize = 4096;
 const MAX_CHUNK_OBJECT: u64 = (4 << 20) + 64;
 /// 받는 블롭(UEFI 변수·TPM 상태·config)의 최대 크기
 const MAX_BLOB_OBJECT: u64 = (64 << 20) + 64;
+/// 가상 크기 `virtual_bytes`인 디스크 인덱스(`disk{i}.fidx`)의 최대 크기: 청크마다 id 32바이트에 머리·꼬리 몫 4 KiB
+fn index_limit(virtual_bytes: u64) -> u64 {
+    let chunks =
+        opl_types::backup_store::chunk_count(virtual_bytes, opl_types::backup_store::CHUNK_BYTES);
+    MAX_BLOB_OBJECT.max(4096 + 32 * chunks)
+}
+
 /// 커밋 구간에 들어가려고 GC 쓸기가 끝나기를 기다리는 시간
 const COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1066,7 +1073,17 @@ async fn put_store_file(
     }
     let store = receiving_store(state, backup).await?;
     let _receiving = ReceivingFile::take(state, backup, file)?;
-    let bytes = read_body(body, length, MAX_BLOB_OBJECT, state.receive_idle_timeout).await?;
+    // 인덱스는 청크마다 32바이트라 8 TiB 넘는 디스크면 블롭 한도를 넘는다: 디스크 크기에서 한도를 잡는다(리뷰 1 M1).
+    let limit = match file.strip_suffix(".fidx") {
+        Some(_) => backup
+            .status
+            .disks
+            .iter()
+            .find(|d| d.file == file)
+            .map_or(MAX_BLOB_OBJECT, |d| index_limit(d.virtual_bytes)),
+        None => MAX_BLOB_OBJECT,
+    };
+    let bytes = read_body(body, length, limit, state.receive_idle_timeout).await?;
     let sha256 = hex::encode(Sha256::digest(&bytes));
     if let Some(disk) = file.strip_suffix(".fidx") {
         let mut ix = opl_store::format::index::FixedIndex::from_bytes(&bytes)
@@ -1390,6 +1407,15 @@ async fn complete_store(state: &AppState, backup: &Backup) -> Result<(), ApiErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 인덱스 한도는 디스크 크기를 따른다(리뷰 1 M1): 16 TiB 디스크의 인덱스(128 MiB 남짓)도 받는다.
+    #[test]
+    fn index_limits_follow_the_disk_size() {
+        assert_eq!(index_limit(1 << 30), MAX_BLOB_OBJECT);
+        let big = 16u64 << 40;
+        let ix = 32 * (big / opl_types::backup_store::CHUNK_BYTES);
+        assert!(index_limit(big) > ix && ix > MAX_BLOB_OBJECT);
+    }
 
     #[test]
     fn free_names_get_a_number_and_stay_short() {

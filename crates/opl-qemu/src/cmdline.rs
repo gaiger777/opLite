@@ -269,7 +269,7 @@ fn build(
             }
         };
         // 라이브 복원: 백업 → 오버레이를 앞에 두고 장치는 오버레이에 붙인다(대상 `disk{i}`는 mirror가 채운다).
-        let drive = match live.get(i) {
+        let drive = match live.get(i).filter(|lr| !lr.pivoted) {
             Some(lr) => {
                 a.opt("-blockdev", live_restore_source(i, &lr.source));
                 a.opt(
@@ -707,6 +707,36 @@ mod tests {
     use super::*;
     use crate::host::Accel;
 
+    /// 이미 갈아탄 디스크(`pivoted`, 리뷰 1 I3)는 다시 켜도 대상(`disk{i}`)에 붙는다 — 다른 디스크는 그대로 오버레이에.
+    #[test]
+    fn pivoted_live_restore_disks_attach_their_target() {
+        let spec = x86_spec();
+        let disk = |i: usize, pivoted| LiveRestoreDisk {
+            source: LiveRestoreSource::Nbd {
+                socket: "/run/opl/bk.sock".into(),
+                export: format!("disk{i}"),
+            },
+            overlay: format!("/var/lib/opl/vm/x/lr-disk{i}.qcow2").into(),
+            pivoted,
+        };
+        let args = build_live_restore_cmdline(
+            &spec,
+            &x86_host(),
+            &paths(),
+            &[disk(0, false), disk(1, true)],
+        )
+        .unwrap();
+        assert!(args.iter().any(|a| a.ends_with("node-name=disk0-lr")));
+        assert!(!args.iter().any(|a| a.contains("disk1-lr")), "{args:?}");
+        let devices: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-device" && w[1].contains("id=disk"))
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(devices[0].contains("drive=disk0-lr,"), "{devices:?}");
+        assert!(devices[1].contains("drive=disk1,"), "{devices:?}");
+    }
+
     /// 계획 68 §11.2: 라이브 복원 VM은 디스크마다 백업 → 오버레이를 두고 장치를 오버레이에 붙인다(`rerror`·`werror`=stop).
     /// 대상 볼륨 노드(`disk{i}`)는 그대로 있되 장치에 붙지 않는다. 디스크 아닌 인자는 보통 명령줄과 같다.
     #[test]
@@ -719,12 +749,14 @@ mod tests {
                     export: "disk0".into(),
                 },
                 overlay: "/var/lib/opl/vm/x/lr-disk0.qcow2".into(),
+                pivoted: false,
             },
             LiveRestoreDisk {
                 source: LiveRestoreSource::Qcow2 {
                     chain: vec!["/bk/b2/disk1.qcow2".into(), "/bk/b1/disk1.qcow2".into()],
                 },
                 overlay: "/var/lib/opl/vm/x/lr-disk1.qcow2".into(),
+                pivoted: false,
             },
         ];
         let args = build_live_restore_cmdline(&spec, &x86_host(), &paths(), &live).unwrap();

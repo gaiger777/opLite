@@ -32,10 +32,12 @@ const REQUEST_HEADERS: [HeaderName; 4] = [CONTENT_TYPE, CONTENT_LENGTH, IF_MATCH
 const RESPONSE_HEADERS: [HeaderName; 4] = [CONTENT_LENGTH, ETAG, RETRY_AFTER, CONTENT_DISPOSITION];
 /// admin이 아니어도 GET·HEAD로 읽을 수 있는 첫 경로 조각(그 밖에는 `auth/whoami`만). 사용자·토큰·영역·
 /// 감사·텔레메트리와 원격의 원격(중계 사슬)은 원격 토큰이 읽을 수 있어도 이 클러스터의 admin만 읽는다.
-const READABLE: [&str; 19] = [
+const READABLE: [&str; 20] = [
     "vms",
     "volumes",
     "storage-pools",
+    // 백업 저장소(계획 68): 저장소 백업의 원격 복제 대상을 고른다(보기에 비밀이 없다 — 리뷰 1 웹 I1)
+    "backup-stores",
     "networks",
     "security-groups",
     "snapshots",
@@ -260,6 +262,7 @@ mod tests {
             "vms",
             "vms/web",
             "storage-pools/p/volumes",
+            "backup-stores",
             "tasks",
             "auth/whoami",
             "%76ms",

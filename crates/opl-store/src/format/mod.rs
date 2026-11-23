@@ -130,6 +130,16 @@ pub fn bad_key(id: &ChunkId, at: u64) -> String {
     format!("bad/{}.{at}", hex::encode(id))
 }
 
+/// `bad/<id hex>.<옮긴 시각>`의 청크 id
+pub fn parse_bad_key(key: &str) -> Option<ChunkId> {
+    let rest = key.strip_prefix("bad/")?;
+    let (name, _) = rest.split_once('.')?;
+    if name.len() != 64 || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    hex::decode(name).ok()?.try_into().ok()
+}
+
 /// GC 기준 표식 `gc/<run>.start`
 pub fn gc_marker_key(run: Uuid) -> String {
     format!("gc/{run}.start")
@@ -164,6 +174,9 @@ mod tests {
         assert_eq!(parse_snapshot_key(&format!("{p}a/b")), None);
         assert_eq!(parse_snapshot_key("snapshots/x/y/z"), None);
         assert_eq!(bad_key(&[1; 32], 5), format!("bad/{}.5", "01".repeat(32)));
+        assert_eq!(parse_bad_key(&bad_key(&[0xab; 32], 7)), Some([0xab; 32]));
+        assert_eq!(parse_bad_key("bad/xyz.1"), None);
+        assert_eq!(parse_bad_key(&chunk_key(&[1; 32])), None);
     }
 
     #[test]

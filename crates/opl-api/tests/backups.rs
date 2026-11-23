@@ -855,6 +855,52 @@ async fn parents_of_incremental_backups_cannot_be_deleted() {
     assert_eq!(status, StatusCode::ACCEPTED, "{task}");
 }
 
+/// 라이브 복원 중인(실패한 것도) VM의 바탕 백업은 지우지 못한다: 409 `backup_in_use`(`force`여도, 리뷰 1 I2). 그 VM의
+/// 라이브 복원이 끝나면 지운다.
+#[tokio::test]
+async fn backups_under_a_live_restore_cannot_be_deleted() {
+    let env = env().await;
+    let admin = env.admin().await;
+    let id = ready_backup(&env, &admin).await;
+    let (status, vm) = admin.post("/vms", vm_request("lr")).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let vm_id: Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    let set = async |lr: Option<opl_types::backup_store::LiveRestore>| {
+        let vm = env.cluster.get::<VmSpec>(vm_id).unwrap().unwrap();
+        let status = VmStatus {
+            live_restore: lr,
+            ..vm.status
+        };
+        env.cluster
+            .update_status::<VmSpec>(vm_id, &status)
+            .await
+            .unwrap();
+    };
+    set(Some(opl_types::backup_store::LiveRestore {
+        backup: id,
+        task: Uuid::now_v7(),
+        phase: opl_types::backup_store::LiveRestorePhase::Failed,
+        done_bytes: 0,
+        total_bytes: 0,
+        started_at: 1,
+        error: Some("lost".into()),
+        cancel: false,
+    }))
+    .await;
+    for path in ["/backups/b1", "/backups/b1?force=true"] {
+        let got = admin.delete(path).await;
+        assert_error(&got, StatusCode::CONFLICT, "backup_in_use");
+        assert!(
+            got.1["message"].as_str().unwrap().contains("live-restored"),
+            "{}",
+            got.1
+        );
+    }
+    set(None).await;
+    let (status, task) = admin.delete("/backups/b1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+}
+
 /// 증분 백업은 증분 백업을 아는 노드에서만 되살린다(버전 2 매니페스트). 전체 백업은 어느 노드든 된다.
 #[tokio::test]
 async fn incremental_backups_restore_on_nodes_that_know_them() {

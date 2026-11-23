@@ -375,10 +375,13 @@ function JobDialog({
               onChange={(e) => {
                 const value = e.target.value;
                 const name = value.slice(value.indexOf(":") + 1);
+                const kind = value.startsWith("store:") ? "store" : "pool";
+                // 복제 대상은 풀 작업이면 원격 풀, 저장소 작업이면 원격 저장소다: 바뀌면 다시 고른다.
+                const replicate = kind === form.targetKind ? {} : { replicatePool: "" };
                 change(
-                  value.startsWith("store:")
-                    ? { targetKind: "store", store: name }
-                    : { targetKind: "pool", pool: name, copyStore: "" },
+                  kind === "store"
+                    ? { targetKind: "store", store: name, ...replicate }
+                    : { targetKind: "pool", pool: name, copyStore: "", ...replicate },
                 );
               }}
               {...a11y}
@@ -604,7 +607,12 @@ function JobDialog({
         id="job-replicate"
         label={t("backupJobs.replicateLabel")}
         none={t("backupJobs.noReplicate")}
-        hint={t("backupJobs.replicateHint")}
+        hint={t(
+          form.targetKind === "store"
+            ? "backupJobs.replicateStoreHint"
+            : "backupJobs.replicateHint",
+        )}
+        kind={form.targetKind === "store" ? "store" : "pool"}
         value={{ remote: form.replicateRemote, pool: form.replicatePool }}
         errors={{ pool: errors.replicatePool }}
         onChange={(target) =>

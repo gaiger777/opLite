@@ -206,6 +206,10 @@ pub struct LiveRestoreDisk {
     pub source: LiveRestoreSource,
     /// 오버레이 qcow2(헤더에 backing 없음 — backing은 명령줄에서만)
     pub overlay: PathBuf,
+    /// 이 디스크는 이미 대상으로 갈아탔다(리뷰 1 I3): 다른 디스크의 갈아타기가 실패해 다시 옮기는 동안 QEMU가 다시 떠도 이
+    /// 디스크는 대상(`disk{i}`)에 붙는다 — 갈아탄 뒤 게스트가 대상에만 쓴 것이 있다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pivoted: bool,
 }
 
 /// 라이브 복원이 읽는 백업

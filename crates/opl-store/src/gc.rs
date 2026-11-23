@@ -287,6 +287,15 @@ mod tests {
             sweep_decision(&obj(&tmp, t0 - 100), |_| false, t0),
             SweepDecision::Ignore
         );
+        // 시각을 읽지 못한 S3 목록 항목(`u64::MAX`, 리뷰 1 I6)은 새것으로 남긴다
+        assert_eq!(
+            sweep_decision(&obj(&k, u64::MAX), |_| false, t0),
+            SweepDecision::KeepYoung
+        );
+        assert_eq!(
+            sweep_decision(&obj(&tmp, u64::MAX), |_| false, t0),
+            SweepDecision::Ignore
+        );
         assert_eq!(
             sweep_decision(&obj("chunks/x/readme", 0), |_| false, t0),
             SweepDecision::Ignore

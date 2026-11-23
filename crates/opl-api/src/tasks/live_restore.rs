@@ -8,7 +8,8 @@
 //! 3. VM이 돌면 디스크마다 mirror를 걸고 지켜본다: 헬퍼가 죽으면 다시 띄우고, 백업을 읽지 못해 VM이 멈추면(`rerror=stop`)
 //!    `Paused`로 적고 백업이 돌아오면 `cont`, 강제로 끄면 `Stopped`(`vm start`가 같은 배선으로 켠다), QEMU가 죽으면
 //!    reconciler가 같은 배선으로 다시 켜고 mirror는 처음부터 다시 건다.
-//! 4. 모두 `ready`면 `Pivoting`을 적고 갈아탄다 → 배선·오버레이·헬퍼를 치우고 `live_restore`를 지운다(보통 VM).
+//! 4. 모두 `ready`(대상과 맞춰짐)면 `Pivoting`을 적고 갈아탄다 → 배선·오버레이·헬퍼를 치우고 `live_restore`를 지운다(보통
+//!    VM). 갈아타기가 실패하면 `Copying`으로 돌아가 다시 옮긴다.
 //!
 //! 할 일은 모두 Raft의 VM 상태와 하이퍼바이저의 배선에서 다시 읽으므로 opld가 다시 떠도 같은 걸음에서 잇는다. 취소
 //! (`live_restore.cancel`)는 VM을 끄고 VM·대상 볼륨·오버레이를 지운다.
@@ -171,10 +172,12 @@ async fn step(ctx: &Ctx, vm: &Vm, lr: &LiveRestore, retry: bool) -> Result<Next,
     let hv = |e: opl_driver::DriverError| e.to_string();
     let state = ctx.hv.inspect(id).await.map_err(hv)?;
     if lr.phase == LiveRestorePhase::Pivoting {
-        // 모든 mirror가 `ready`였다(write-blocking이라 그때부터 대상은 게스트가 본 디스크와 늘 같다). QEMU가 죽었어도 대상이
-        // 완전하므로 배선 없이 끝낸다.
+        // 모든 mirror가 `ready`이고 대상과 맞춰져 있었다(`actively-synced` — write-blocking이라 그때부터 대상은 게스트가 본
+        // 디스크와 늘 같다). QEMU가 죽었어도 대상이 완전하므로 배선 없이 끝낸다(reconciler는 `Pivoting`인 VM을 켜지 않는다).
+        // 돌고 있으면 갈아탄다 — 실패하면(어느 디스크의 `job-complete`가 실패해 작업이 없어졌다) `Copying`으로 돌아가 다시
+        // 옮긴다(갈아탄 디스크는 드라이버가 배선에 적어 다시 옮기지 않는다, 리뷰 1 I3).
         if state.is_some() {
-            ctx.hv.pivot_live_restore(id).await.map_err(hv)?;
+            return Ok(pivot(ctx, id, lr).await);
         }
         return Ok(Next::Finish);
     }
@@ -224,8 +227,12 @@ async fn step(ctx: &Ctx, vm: &Vm, lr: &LiveRestore, retry: bool) -> Result<Next,
             l.total_bytes = total;
         })
         .await?;
-        ctx.hv.pivot_live_restore(id).await.map_err(hv)?;
-        return Ok(Next::Finish);
+        let lr = LiveRestore {
+            done_bytes: done,
+            total_bytes: total,
+            ..lr.clone()
+        };
+        return Ok(pivot(ctx, id, &lr).await);
     }
     Ok(Next::Report(Report {
         phase: LiveRestorePhase::Copying,
@@ -233,6 +240,30 @@ async fn step(ctx: &Ctx, vm: &Vm, lr: &LiveRestore, retry: bool) -> Result<Next,
         done,
         total,
     }))
+}
+
+/// 갈아탄다. 드라이버가 갈아타지 못한 디스크를 알린 실패(`LiveRestore` — 갈아탄 디스크는 배선에 적었다)면 `Copying`으로
+/// 돌아가 그 까닭을 적는다: 다음 걸음이 그 디스크를 다시 옮긴다(`Pivoting`에 머물며 같은 갈아타기를 끝없이 되풀이하지
+/// 않는다). 그 밖의 실패(QMP 시간 초과 등 — 어느 디스크가 갈아탔는지 아직 모른다)는 `Pivoting`에 머물러 다시 해 본다.
+async fn pivot(ctx: &Ctx, id: Uuid, lr: &LiveRestore) -> Next {
+    match ctx.hv.pivot_live_restore(id).await {
+        Ok(()) => Next::Finish,
+        Err(e) => {
+            let phase = if matches!(e, opl_driver::DriverError::LiveRestore(_)) {
+                tracing::warn!(vm = %id, error = %e, "switching to the restored disks failed; copying again");
+                LiveRestorePhase::Copying
+            } else {
+                tracing::warn!(vm = %id, error = %e, "switching to the restored disks failed; will retry");
+                LiveRestorePhase::Pivoting
+            };
+            Next::Report(Report {
+                phase,
+                error: Some(format!("switching to the restored disks failed: {e}")),
+                done: lr.done_bytes,
+                total: lr.total_bytes,
+            })
+        }
+    }
 }
 
 /// VM `id`의 라이브 복원 백업 소켓
@@ -359,7 +390,11 @@ async fn wire(ctx: &Ctx, backup: &Backup, id: Uuid) -> Result<(), String> {
         create_overlay(&ctx.config.qemu_img, &overlay, size)
             .await
             .map_err(|e| format!("cannot create the overlay of disk {i}: {e}"))?;
-        disks.push(LiveRestoreDisk { source, overlay });
+        disks.push(LiveRestoreDisk {
+            source,
+            overlay,
+            pivoted: false,
+        });
     }
     ctx.hv
         .set_live_restore(id, Some(&disks))

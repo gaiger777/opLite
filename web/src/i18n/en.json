@@ -891,6 +891,7 @@
     "replicate": "Copy to remote",
     "replicateNamed": "Copy {{name}} to a remote cluster",
     "replicateDescription": "Sends the backup files to a backup pool of a remote cluster. The copy there is an ordinary backup that can be restored on that cluster. An incremental backup is sent with the earlier backups of its chain that the remote cluster does not have yet, starting from the full backup. Deleting this backup deletes the copy too.",
+    "replicateStoreDescription": "Sends the store backup to a backup store of a remote cluster. Only the chunks that store does not have yet cross the network. The copy there is an ordinary store backup that can be restored on that cluster. Deleting this backup deletes the copy too.",
     "replicateSubmit": "Copy",
     "replicateErrors": {
       "backup_busy": "This backup is being deleted, or it or a backup of its chain is being copied to this remote: {{message}}"
@@ -898,8 +899,10 @@
     "remote": "Remote cluster",
     "chooseRemote": "Choose a remote cluster",
     "remotePool": "Backup pool on the remote cluster",
+    "remoteStore": "Backup store on the remote cluster",
     "noRemotes": "No remote clusters. Add one on the Remote clusters page.",
     "noRemotePools": "The remote cluster has no storage pool that stores backups.",
+    "noRemoteStores": "The remote cluster has no writable backup store.",
     "empty": "No backups.",
     "phase": {
       "pending": "Creating",
@@ -925,6 +928,7 @@
     "newName": "New VM name",
     "diskPool": "Storage pool for the disks",
     "choosePool": "Choose a pool",
+    "chooseStore": "Choose a store",
     "deleteNamed": "Delete backup {{name}}",
     "deleteTitle": "Delete backup {{name}}?",
     "deleteDescription": "The backup files are removed from the backup pool, and the copies sent to remote clusters are deleted too. This cannot be undone.",
@@ -939,7 +943,8 @@
       "exists": "A backup with this name already exists.",
       "vmExists": "A VM with this name already exists.",
       "pool": "Choose a storage pool.",
-      "remote": "Choose a remote cluster."
+      "remote": "Choose a remote cluster.",
+      "store": "Choose a backup store."
     },
     "target": "Target",
     "targetHint": "A backup pool keeps a qcow2 file per disk. A store keeps each changed chunk once.",
@@ -1044,6 +1049,7 @@
     "replicateLabel": "Copy to a remote cluster",
     "noReplicate": "Do not copy",
     "replicateHint": "Each backup the job makes is copied to this backup pool of the remote cluster. Failed copies are tried again at the next run.",
+    "replicateStoreHint": "Each backup the job makes is copied to this backup store of the remote cluster. Failed copies are tried again at the next run.",
     "created": "Backup job {{name}} created.",
     "saved": "Backup job {{name}} saved.",
     "deleted": "Backup job {{name}} deleted.",

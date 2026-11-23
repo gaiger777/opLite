@@ -982,12 +982,16 @@ impl Worker {
                 self.force_requested = false;
                 self.deactivate_disks(vm).await;
                 // 라이브 복원(계획 68 §11.3) 중인 VM은 Task가 배선(백업 → 오버레이)을 둔 뒤에만 켠다 — 드라이버가 그 배선으로
-                // 켠다. 준비 중·실패·취소 요청이거나 배선이 없으면 켜지 않는다(대상 볼륨은 아직 다 옮기지 않았다).
+                // 켠다. 준비 중·실패·취소 요청이거나 배선이 없으면 켜지 않는다(대상 볼륨은 아직 다 옮기지 않았다). 갈아타는
+                // 중(`Pivoting`)에 죽었으면 켜지 않는다: 대상이 완전하므로 Task가 배선을 치우고 끝내면 보통 VM으로 켠다 —
+                // 배선으로 켜면 게스트가 오버레이에만 쓰고 Task가 그것을 지운다(리뷰 1 I3).
                 if let Some(lr) = &vm.status.live_restore {
                     let ready = !lr.cancel
                         && !matches!(
                             lr.phase,
-                            LiveRestorePhase::Starting | LiveRestorePhase::Failed
+                            LiveRestorePhase::Starting
+                                | LiveRestorePhase::Pivoting
+                                | LiveRestorePhase::Failed
                         )
                         && self.hv.live_restore_wired(self.id);
                     if !ready {

@@ -673,7 +673,8 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
         TaskOp::BackupRestore { backup, .. } | TaskOp::BackupLiveRestore { backup, .. } => {
             return Some(backup);
         }
-        // 저장소 Task는 저장소의 줄(같은 저장소의 GC·검증은 차례로 — 계획 68 §10.2)
+        // 저장소 Task는 저장소의 줄(같은 저장소의 GC·검증은 이 노드 안에서 차례로 — 계획 68 §10.2. 다른 노드에서는 함께
+        // 돌 수 있다: GC는 가리키지 않는 청크만, 검증은 가리키는 청크만 건드리고 잠금은 Raft의 저장소 상태다 — 리뷰 1 M5)
         TaskOp::BackupStoreInit
         | TaskOp::BackupStoreGc
         | TaskOp::BackupStoreVerify { .. }

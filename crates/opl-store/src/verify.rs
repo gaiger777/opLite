@@ -56,6 +56,8 @@ pub struct Verifier<'a> {
     now: u64,
     checked: HashSet<ChunkId>,
     bad: HashSet<ChunkId>,
+    /// 옮길 깨진 청크([`Verifier::quarantine`]가 옮긴다 — 부르는 쪽이 커밋 구간을 막은 뒤, 리뷰 1 I5)
+    pending: Vec<ChunkId>,
     /// 옮긴 청크 수
     pub moved: u64,
 }
@@ -69,6 +71,7 @@ impl<'a> Verifier<'a> {
             now,
             checked: HashSet::new(),
             bad: HashSet::new(),
+            pending: Vec::new(),
             moved: 0,
         }
     }
@@ -81,6 +84,34 @@ impl<'a> Verifier<'a> {
     /// 이 실행이 찾은 깨진(또는 없는) 청크
     pub fn bad_chunks(&self) -> &HashSet<ChunkId> {
         &self.bad
+    }
+
+    /// 옮길 깨진 청크가 있는지([`Verifier::quarantine`])
+    pub fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// 찾은 깨진 청크를 `bad/`로 옮긴다(지우지 않음). 옮기는 동안 그 청크를 "있음"으로 건너뛴 백업이 커밋하지 않게 부르는
+    /// 쪽이 커밋 구간을 막는다(리뷰 1 I5 — 커밋은 `bad/`의 id를 다시 본다). 옮긴 수.
+    pub async fn quarantine(&mut self) -> Result<u64, StoreError> {
+        let mut moved = 0;
+        while let Some(id) = self.pending.pop() {
+            match self
+                .store
+                .backend()
+                .rename(&chunk_key(&id), &bad_key(&id, self.now))
+                .await
+            {
+                Ok(()) => moved += 1,
+                Err(StoreError::NotFound(_)) => {}
+                Err(e) => {
+                    self.pending.push(id);
+                    return Err(e);
+                }
+            }
+        }
+        self.moved += moved;
+        Ok(moved)
     }
 
     /// 스냅샷 하나를 검증한다. 내용 문제는 보고서에, 저장소에 닿지 못함 따위는 `Err`(실행을 멈춘다).
@@ -190,15 +221,7 @@ impl<'a> Verifier<'a> {
                 ChunkState::Corrupt => {
                     self.bad.insert(id);
                     if self.quarantine {
-                        match store
-                            .backend()
-                            .rename(&chunk_key(&id), &bad_key(&id, self.now))
-                            .await
-                        {
-                            Ok(()) => self.moved += 1,
-                            Err(StoreError::NotFound(_)) => {}
-                            Err(e) => return Err(e),
-                        }
+                        self.pending.push(id);
                     }
                 }
             }

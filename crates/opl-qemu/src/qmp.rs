@@ -1096,6 +1096,35 @@ impl QmpClient {
             .collect())
     }
 
+    /// 장치(BlockBackend)마다 붙은 맨 위 노드 이름(`query-block`의 `inserted.node-name`, 암묵 필터는 QEMU가 건너뛴다). 라이브
+    /// 복원이 장치가 아직 오버레이에 붙었는지(갈아타지 않았는지) 본다.
+    pub async fn query_block_roots(&self) -> Result<Vec<String>, QmpError> {
+        let ret = self.execute("query-block", None).await?;
+        let blocks = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-block: {ret}")))?;
+        Ok(blocks
+            .iter()
+            .filter_map(|b| b["inserted"]["node-name"].as_str().map(str::to_string))
+            .collect())
+    }
+
+    /// 블록 작업마다 `actively-synced`(`query-block-jobs`, QEMU 8.2부터): write-blocking 미러가 대상과 맞춰져 그 뒤 쓰기가
+    /// 모두 대상에도 바로 가는지. 옛 QEMU는 그 칸이 없어 None이다. 작업 id(`device`)와 함께 돌려준다.
+    pub async fn query_block_jobs_synced(&self) -> Result<Vec<(String, Option<bool>)>, QmpError> {
+        let ret = self.execute("query-block-jobs", None).await?;
+        let jobs = ret
+            .as_array()
+            .ok_or_else(|| QmpError::Protocol(format!("query-block-jobs: {ret}")))?;
+        Ok(jobs
+            .iter()
+            .filter_map(|j| {
+                let id = j["device"].as_str()?;
+                Some((id.to_string(), j["actively-synced"].as_bool()))
+            })
+            .collect())
+    }
+
     /// 이동식 장치 `id`(qdev id)의 트레이가 열려 있는지(`query-block`의 `tray_open`). 없는 장치는 false다.
     pub async fn query_tray_open(&self, id: &str) -> Result<bool, QmpError> {
         let ret = self.execute("query-block", None).await?;
@@ -3263,6 +3292,35 @@ mod tests {
             assert_eq!(cmd["execute"], "query-block");
             assert_eq!(r.unwrap(), want, "{dev}");
         }
+    }
+
+    /// `query-block`의 맨 위 노드, `query-block-jobs`의 `actively-synced`(없으면 None — QEMU 8.2 전)
+    #[tokio::test]
+    async fn query_block_roots_and_synced_jobs() {
+        let (client, mut fake, _dir) = setup().await;
+        let ret = json!([
+            { "device": "", "qdev": "disk0-dev", "inserted": { "node-name": "disk0-lr", "ro": false } },
+            { "device": "", "qdev": "disk1-dev", "inserted": { "node-name": "disk1", "ro": false } },
+            { "device": "", "qdev": "cd0-dev", "removable": true }
+        ]);
+        let (r, cmd) = tokio::join!(client.query_block_roots(), reply(&mut fake, ret));
+        assert_eq!(cmd["execute"], "query-block");
+        assert_eq!(r.unwrap(), ["disk0-lr", "disk1"]);
+        let ret = json!([
+            { "device": "opl-lr-0", "type": "mirror", "ready": true, "actively-synced": true },
+            { "device": "opl-lr-1", "type": "mirror", "ready": true, "actively-synced": false },
+            { "device": "opl-lr-2", "type": "mirror", "ready": true }
+        ]);
+        let (r, cmd) = tokio::join!(client.query_block_jobs_synced(), reply(&mut fake, ret));
+        assert_eq!(cmd["execute"], "query-block-jobs");
+        assert_eq!(
+            r.unwrap(),
+            [
+                ("opl-lr-0".to_string(), Some(true)),
+                ("opl-lr-1".to_string(), Some(false)),
+                ("opl-lr-2".to_string(), None),
+            ]
+        );
     }
 
     /// `query-block`: qdev id(경로면 장치 id만)와 매체 파일. 빈 드라이브는 None, 장치 없는 백엔드는 뺀다.

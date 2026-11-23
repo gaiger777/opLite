@@ -828,6 +828,10 @@ pub(super) async fn delete(ctx: &Ctx, id: Uuid) -> Result<Option<String>, String
     }) {
         return Err("backup is being restored".into());
     }
+    let (_, vms) = ctx.cluster.list::<VmSpec>().map_err(|e| e.to_string())?;
+    if let Some(e) = crate::backups::live_restore_in_use(&vms, &backup) {
+        return Err(e);
+    }
     if backup.spec.store.is_some() {
         return super::backup_store::delete(ctx, backup).await;
     }

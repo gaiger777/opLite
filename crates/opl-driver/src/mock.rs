@@ -322,6 +322,8 @@ struct MockState {
     pivots: Vec<Uuid>,
     /// 다음 `pivot_live_restore` 한 번을 실패시킬 오류
     fail_next_pivot: Option<DriverError>,
+    /// 갈아타기가 실패해 mirror 작업이 없어진 VM(실제 QEMU처럼 다음 `start_live_restore`가 다시 걸 때까지 갈아타지 못한다)
+    live_unmirrored: HashSet<Uuid>,
     /// 다음 `fleece_begin` 한 번을 실패시킬 오류(비트맵은 그대로)
     fail_next_fleece: Option<DriverError>,
     /// `clear_backup_leftovers`를 부른 VM(실패 포함)
@@ -883,7 +885,8 @@ impl MockHypervisor {
         self.state.lock().unwrap().pivots.clone()
     }
 
-    /// 다음 `pivot_live_restore` 한 번을 `err`로 실패시킨다.
+    /// 다음 `pivot_live_restore` 한 번을 `err`로 실패시킨다. 그 뒤로는 `start_live_restore`가 mirror를 다시 걸 때까지
+    /// 갈아타지 못한다(`job-complete`가 실패한 실제 QEMU와 같다).
     pub fn fail_next_pivot(&self, err: DriverError) {
         self.state.lock().unwrap().fail_next_pivot = Some(err);
     }
@@ -1999,7 +2002,9 @@ impl Hypervisor for MockHypervisor {
             st.statuses
                 .insert(id, RuntimeStatus::Other("io-error".into()));
         }
-        let ready = unreachable.is_none() && st.live_ready.contains(&id);
+        // 갈아타기가 실패해 작업이 없어졌으면 다시 건다(이번 부름은 아직 `ready`가 아니다).
+        let remirrored = st.live_unmirrored.remove(&id);
+        let ready = unreachable.is_none() && st.live_ready.contains(&id) && !remirrored;
         Ok((0..wiring.len())
             .map(|disk| LiveRestoreJob {
                 disk,
@@ -2021,7 +2026,13 @@ impl Hypervisor for MockHypervisor {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
         if let Some(e) = st.fail_next_pivot.take() {
+            st.live_unmirrored.insert(id);
             return Err(e);
+        }
+        if st.live_unmirrored.contains(&id) {
+            return Err(DriverError::LiveRestore(
+                "disk 0 has no copy running".into(),
+            ));
         }
         if !st.live_ready.contains(&id) {
             return Err(DriverError::LiveRestore(

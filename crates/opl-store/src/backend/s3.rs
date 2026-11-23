@@ -505,9 +505,10 @@ pub fn parse_list(xml: &str) -> Result<(Vec<ObjectInfo>, Option<String>), StoreE
         let size = child_text(c, "Size")
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        // 읽지 못한 시각은 "방금"으로 본다(리뷰 1 I6): 0으로 두면 GC가 아직 인덱스에 없는 새 청크를 오래된 것으로 지운다.
         let modified = child_text(c, "LastModified")
             .and_then(|s| parse_iso8601(&s))
-            .unwrap_or(0);
+            .unwrap_or(u64::MAX);
         out.push(ObjectInfo {
             key,
             size,
@@ -536,27 +537,58 @@ fn unix(y: i32, mo: u8, d: u8, h: u8, mi: u8, s: u8) -> Option<u64> {
     .ok()
 }
 
-/// `2009-10-12T17:50:30.000Z`
+/// `2009-10-12T17:50:30.000Z`. 소수 초는 버리고, 끝의 `Z`·`±hh:mm`·`±hhmm`(없으면 UTC)를 따른다(리뷰 1 I6). 그 밖의
+/// 꼴은 None.
 pub fn parse_iso8601(s: &str) -> Option<u64> {
     let b = s.as_bytes();
     if b.len() < 19
         || b[4] != b'-'
         || b[7] != b'-'
-        || b[10] != b'T'
+        || !matches!(b[10], b'T' | b't' | b' ')
         || b[13] != b':'
         || b[16] != b':'
     {
         return None;
     }
-    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<u32>().ok();
-    unix(
+    let n = |r: std::ops::Range<usize>| -> Option<u32> {
+        let t = s.get(r)?;
+        t.bytes()
+            .all(|c| c.is_ascii_digit())
+            .then(|| t.parse().ok())?
+    };
+    let at = unix(
         n(0..4)? as i32,
         n(5..7)? as u8,
         n(8..10)? as u8,
         n(11..13)? as u8,
         n(14..16)? as u8,
         n(17..19)? as u8,
-    )
+    )?;
+    let mut rest = &s[19..];
+    if let Some(frac) = rest.strip_prefix('.') {
+        let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        rest = &frac[digits..];
+    }
+    let offset: i64 = match rest.as_bytes() {
+        [] | [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), ..] => {
+            let hm = rest[1..].replace(':', "");
+            if hm.len() != 4 || !hm.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let (h, m): (i64, i64) = (hm[..2].parse().ok()?, hm[2..].parse().ok()?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            let secs = h * 3600 + m * 60;
+            if *sign == b'+' { secs } else { -secs }
+        }
+        _ => return None,
+    };
+    u64::try_from(at as i64 - offset).ok()
 }
 
 /// `Wed, 12 Oct 2009 17:50:30 GMT`
@@ -795,6 +827,13 @@ mod tests {
         assert_eq!(objs[0].key, "orbi/chunks/abcd/x");
         assert_eq!(objs[0].size, 434234);
         assert_eq!(objs[0].modified, 1_255_369_830);
+        // 읽지 못한 시각은 "방금"(GC가 지우지 않음, 리뷰 1 I6)
+        let odd = r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+  <Contents><Key>a</Key><LastModified>Mon, 12 Oct 2009 17:50:30 GMT</LastModified><Size>1</Size></Contents>
+  <Contents><Key>b</Key><Size>1</Size></Contents>
+</ListBucketResult>"#;
+        let (objs, _) = parse_list(odd).unwrap();
+        assert!(objs.iter().all(|o| o.modified == u64::MAX), "{objs:?}");
         assert_eq!(
             next.as_deref(),
             Some("1ueGcxLPRx1Tr/XYExHnhbYLgveDs2J/wm36Hy4vbOwM=")
@@ -841,6 +880,20 @@ mod tests {
         );
         assert_eq!(parse_iso8601("2009-10-12T17:50:30Z"), Some(1_255_369_830));
         assert_eq!(parse_iso8601("garbage"), None);
+        // 시간대(리뷰 1 I6): 같은 순간
+        assert_eq!(
+            parse_iso8601("2009-10-12T19:50:30+02:00"),
+            Some(1_255_369_830)
+        );
+        assert_eq!(
+            parse_iso8601("2009-10-12T12:50:30.5-0500"),
+            Some(1_255_369_830)
+        );
+        assert_eq!(parse_iso8601("2009-10-12T17:50:30"), Some(1_255_369_830));
+        assert_eq!(parse_iso8601("2009-10-12T17:50:30.Z"), None);
+        assert_eq!(parse_iso8601("2009-10-12T17:50:30 GMT"), None);
+        assert_eq!(parse_iso8601("2009-10-12T17:50:30+2"), None);
+        assert_eq!(parse_iso8601("Mon, 12 Oct 2009 17:50:30 GMT"), None);
         assert_eq!(
             parse_http_date("Mon, 12 Oct 2009 17:50:30 GMT"),
             Some(1_255_369_830)
