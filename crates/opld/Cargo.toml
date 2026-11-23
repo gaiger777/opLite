@@ -102,7 +102,7 @@ sdn-it = []
 # 실제 QEMU로 백업 저장소(계획 68)에 백업·복원·라이브 복원하는 E2E(`tests/backup_store.rs` — orbivisorctl로). qemu-it의 준비물과
 # qemu-img·qemu-io·qemu-nbd가 필요하다(CI `linux-kvm`).
 backup-it = ["qemu-it"]
-# MinIO(S3)로 백업 저장소 E2E(`tests/backup_s3.rs`): HTTP·사용자 CA HTTPS, GC와 백업 동시, MinIO 멈춤(docker pause) 도중의 백업·
+# S3 호환 저장소(CI: SeaweedFS)로 백업 저장소 E2E(`tests/backup_s3.rs`): HTTP·사용자 CA HTTPS, GC와 백업 동시, 저장소 멈춤(docker pause) 도중의 백업·
 # 라이브 복원, 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·넘겨받기). backup-it의 준비물에 더해 환경 변수 `OPL_S3_ENDPOINT`·
 # `OPL_S3_TLS_ENDPOINT`·`OPL_S3_CA`·`OPL_S3_ACCESS_KEY`·`OPL_S3_SECRET_KEY`·`OPL_S3_CONTAINER`(멈춤 시험의 docker 컨테이너
 # 이름)가 필요하다(CI `backup-s3` 작업).

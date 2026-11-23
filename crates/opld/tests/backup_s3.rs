@@ -1,11 +1,11 @@
-//! 백업 저장소를 실제 S3 호환 저장소(MinIO)로(계획 68 §14 GitHub `backup-s3` 작업): orbivisorctl로 S3 저장소를 만들고 실제
-//! QEMU VM을 백업·복원·라이브 복원한다. GC와 백업 동시, 사용자 CA의 HTTPS, MinIO 멈춤(`docker pause`) 도중의 백업과 라이브
+//! 백업 저장소를 실제 S3 호환 저장소(CI: SeaweedFS)로(계획 68 §14 GitHub `backup-s3` 작업): orbivisorctl로 S3 저장소를 만들고 실제
+//! QEMU VM을 백업·복원·라이브 복원한다. GC와 백업 동시, 사용자 CA의 HTTPS, S3 저장소 멈춤(`docker pause`) 도중의 백업과 라이브
 //! 복원(그사이 헬퍼 `kill -9`·opld 다시 시작), 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·라이브 복원·넘겨받기).
 //! `cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1`
 //!
-//! 환경 변수(CI가 MinIO 컨테이너 둘을 띄워 준다): `OPL_S3_ENDPOINT`(http), `OPL_S3_TLS_ENDPOINT`(https), `OPL_S3_CA`(https
+//! 환경 변수(CI가 S3 호환 저장소(SeaweedFS) 컨테이너 둘을 띄워 준다): `OPL_S3_ENDPOINT`(http), `OPL_S3_TLS_ENDPOINT`(https), `OPL_S3_CA`(https
 //! 끝점을 서명한 CA PEM 파일), `OPL_S3_ACCESS_KEY`, `OPL_S3_SECRET_KEY`, `OPL_S3_BUCKET`(두 끝점에 있는 버킷),
-//! `OPL_S3_CONTAINER`(http 끝점 MinIO의 docker 컨테이너 이름 — 멈춤 시험).
+//! `OPL_S3_CONTAINER`(http 끝점 S3 저장소의 docker 컨테이너 이름 — 멈춤 시험).
 #![cfg(feature = "s3-it")]
 
 mod common;
@@ -191,7 +191,7 @@ async fn s3_store_backups_survive_concurrent_gc() {
         .unwrap();
     let took = started.elapsed();
     println!(
-        "PROBE first full backup of 256 MiB to MinIO (encrypted): {:?} ({:.1} MB/s)",
+        "PROBE first full backup of 256 MiB to S3 (encrypted): {:?} ({:.1} MB/s)",
         took,
         256.0 / took.as_secs_f64()
     );
@@ -260,10 +260,7 @@ async fn s3_store_backups_survive_concurrent_gc() {
     ])
     .await
     .unwrap();
-    println!(
-        "PROBE restore of 256 MiB from MinIO: {:?}",
-        started.elapsed()
-    );
+    println!("PROBE restore of 256 MiB from S3: {:?}", started.elapsed());
     let copy = d.ctl_json(&["volume", "get", "copy-disk0"]).await;
     assert!(same(&volume_file(&d, &copy, "raw"), "raw", &root, "raw"));
 }
@@ -314,7 +311,7 @@ async fn s3_https_with_a_user_ca() {
     ));
 }
 
-/// MinIO를 멈춘다(`docker pause`). 놓으면 푼다.
+/// S3 호환 저장소(CI: SeaweedFS) 컨테이너를 멈춘다(`docker pause`). 놓으면 푼다.
 struct Paused(String);
 
 impl Paused {
@@ -331,7 +328,7 @@ impl Drop for Paused {
     }
 }
 
-/// MinIO가 멈춰도(다시 하기 60초 안) 백업은 이어 가고, 라이브 복원 VM은 켜진 채 남는다. 라이브 복원 도중(MinIO 멈춤으로
+/// S3 저장소가 멈춰도(다시 하기 60초 안) 백업은 이어 가고, 라이브 복원 VM은 켜진 채 남는다. 라이브 복원 도중(S3 저장소 멈춤으로
 /// 붙잡아 둔 채) 헬퍼를 `kill -9`하고 opld를 다시 시작해도 Task가 헬퍼를 다시 띄워 끝내고, 대상 디스크는 원본과 같다. 90초
 /// 멈춤(다시 하기보다 김)도 풀리면 끝난다(그사이 단계는 적어 둔다).
 #[tokio::test]
@@ -403,7 +400,7 @@ async fn s3_pauses_and_kills_during_backup_and_live_restore() {
                 rustix::process::Pid::from_raw(pid).unwrap(),
                 rustix::process::Signal::KILL,
             );
-            println!("PROBE killed the backup-serve helper {pid} while MinIO was paused");
+            println!("PROBE killed the backup-serve helper {pid} while S3 was paused");
         } else {
             println!("PROBE the live restore had finished before the pause (pid file gone)");
         }

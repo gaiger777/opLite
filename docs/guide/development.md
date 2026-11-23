@@ -109,6 +109,20 @@ cargo test -p opl-api --test sdn_services --test network_migrate    # 기능 게
 cargo test -p opl-driver -- relink tc ovn::lockdown units           # tap 옮기기 명령, tc 명령, nftables 잠금 글·ss 파싱, sb.json·northd 단위(끔은 계획 66 글 그대로)
 cargo test -p oplctl -- lb migration sdn alerts                     # lb·vm nic-qos·network migrate·sdn lockdown·alert rule add-sdn-defaults 명령
 pnpm -C web test src/components/iso src/topology src/lb src/migration src/sdn src/alerts   # 투영·배치(200/50/2000 기록)·키보드·axe, LB 서랍, 마법사, 잠금 카드·SDN 경보(msw)
+# 백업 저장소(계획 68) — 가짜 S3(opl-store `fake-s3`)와 MockHypervisor로 S3·QEMU 없이
+cargo test -p opl-store                                             # 형식(청크·인덱스·매니페스트 v3 고정물), 키 계층·복구 키·escrow, 로컬·메모리·가짜 S3 백엔드 공통 시험, SigV4 공개 벡터, GC 안전 모형 proptest, Bloom 오탐률, 검증, NBD 클라이언트·서버
+cargo test -p opl-types backup_store                                # 스펙 검증 표, chunk_ranges·merge_index, verify::due, serde 하위 호환
+cargo test -p opl-api --test backup_stores --test backup_store_types   # 저장소 API·권한·비밀 가리기·읽기 전용 붙이기·scan·넘겨받기, 복사, 두 Env 원격 복제(없는 청크만), 기능 게이트
+cargo test -p opl-api --features storage-it --test backup_store_tasks --test live_restore_tasks   # 백업·증분·GC·검증·옮기기 Task, 라이브 복원 상태 머신(qemu-img·qemu-nbd)
+cargo test -p opl-store --features storage-it --test nbd_qemu       # 우리 NBD ↔ qemu-nbd·qemu-img·qemu-io, 재연결
+cargo test -p opl-driver --features qemu-it --test qemu_fleece --test qemu_live_restore   # 실제 QEMU 플리싱·비트맵 문맥·ENOSPC, 라이브 복원 배선·갈아타기·재연결
+cargo test -p opld --features backup-it --test backup_store         # E2E(orbivisorctl): 로컬 저장소 실행 중 VM 전체 → 증분 → GC·검증 → 복원·라이브 복원이 원본과 같음
+cargo test -p oplctl -- backup_store backup                         # backup-store·backup verify/convert/copy·vm live-restore 인자와 표
+pnpm -C web test src/backupStores src/backups                       # 저장소 목록·마법사(복구 키 확인)·서랍·키 카드, 백업 표 대상·검증 배지, 라이브 복원 띠(msw, axe)
+# 실제 S3 호환 저장소(아래 "백업 저장소 S3 시험"): QEMU + qemu-nbd, S3 끝점 둘(HTTP·사설 CA HTTPS)과 docker 컨테이너 이름
+OPL_S3_ENDPOINT=http://127.0.0.1:9000 OPL_S3_TLS_ENDPOINT=https://127.0.0.1:9443 OPL_S3_CA=/tmp/opl-s3-certs/ca.pem \
+  OPL_S3_ACCESS_KEY=… OPL_S3_SECRET_KEY=… OPL_S3_BUCKET=orbi OPL_S3_CONTAINER=opl-s3 \
+  cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1
 # 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
 sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
@@ -298,6 +312,17 @@ remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 
 닿는 망. `/dev/kvm`이 있으면 컨테이너의 QEMU가 쓴다(없으면 TCG). CI `sdn-multinode` 작업(Ubuntu 24.04 러너, `timeout-minutes: 60`)은
 `modprobe -a openvswitch geneve`, `docker build -t opl-sdn-node ci/sdn-node`, 위 `cargo test`를 root로(캐시 없이 `$RUNNER_TEMP/target`)
 돌린다. 시험은 계획 66 때 약 170초였고 계획 67의 절로 늘었다(설계 어림 약 6분 더 — `timeout-minutes: 60` 그대로, OVN 24.03).
+
+**백업 저장소 S3 시험**(`crates/opld/tests/backup_s3.rs`, 기능 `s3-it`, 계획 68)은 실제 QEMU VM을 실제 S3 호환 저장소에 orbivisorctl로
+백업한다: (1) 암호화 S3 저장소에 실행 중 VM 백업 다섯 번과 GC 세 번을 함께 → 모든 백업 검증 통과, 저장소의 모든 객체에 디스크의
+평문 표식이 없음, 복원이 같음, 처리량 `PROBE`, (2) 사설 CA HTTPS — CA 없이는 초기화 실패, `--ca-file`이면 백업·복원, (3) 512 MiB
+디스크: 백업 도중 저장소 `docker pause` 20초 → 백업 성공, 라이브 복원 도중 멈춤 → 헬퍼 `kill -9` → orbivisord 다시 시작 → 풀면
+끝나고 대상이 원본과 같음, 90초 멈춤 뒤에도 끝남, (4) 두 클러스터 DR — prod 암호화 저장소(escrow) → dr 읽기 전용 붙이기·scan·라이브
+복원, 읽기 전용 백업 거절, 넘겨받기(하트비트 새로움 거절 → `--force`), prod GC가 "taken over"로 멈춤. 제품은 어떤 S3 호환 저장소와도
+쓰지만, CI `backup-s3` 작업(Ubuntu 24.04 러너, KVM, root 아님, `timeout-minutes: 75`)은 **SeaweedFS**(`chrislusf/seaweedfs:4.50`)
+컨테이너 둘(HTTP `:9000`, 시험 CA로 서명한 `127.0.0.1` 인증서의 HTTPS `:9443`)을 띄우고 버킷을 러너의 AWS CLI로 만든 뒤 위
+`cargo test`를 돌린다(MinIO는 2025년 가을부터 이미지·바이너리를 내지 않아 바꿨다). 로컬에서 돌리려면 같은 컨테이너를 띄우고
+`OPL_S3_CONTAINER`에 HTTP 쪽 컨테이너 이름을 준다(멈춤 시험이 `docker pause`한다). svc 배포 서버에는 S3가 없어 이 시험은 GitHub에서만 돈다.
 
 웹 UI (`web/`):
 

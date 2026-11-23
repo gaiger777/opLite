@@ -533,8 +533,8 @@ jobs:
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
 
-  # 백업 저장소를 실제 S3 호환 저장소(MinIO)로(계획 68 §14): HTTP 끝점과 사용자 CA로 서명한 HTTPS 끝점(MinIO 컨테이너 둘,
-  # 태그를 못 박음), GC와 백업 동시·평문 표식 없음, MinIO 멈춤(`docker pause`) 도중의 백업·라이브 복원(헬퍼 kill -9·opld 다시
+  # 백업 저장소를 실제 S3 호환 저장소(SeaweedFS)로(계획 68 §14): HTTP 끝점과 사용자 CA로 서명한 HTTPS 끝점(SeaweedFS 컨테이너 둘,
+  # 태그를 못 박음), GC와 백업 동시·평문 표식 없음, S3 저장소 멈춤(`docker pause`) 도중의 백업·라이브 복원(헬퍼 kill -9·opld 다시
   # 시작·90초 멈춤), 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·라이브 복원·넘겨받기). VM은 KVM으로, root가 아니다.
   backup-s3:
     runs-on: ubuntu-24.04

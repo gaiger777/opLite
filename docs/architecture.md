@@ -58,6 +58,7 @@ CLI `orbivisorctl`이나 그 데몬이 내장한 웹 UI로 한다.
 | 노드 수 | 투표 멤버 3/5/7 + learner·관찰 노드, 300노드 시험 | corosync 한계(수십 노드) | 클러스터당 96호스트 |
 | HA | 리스 + watchdog·IPMI/Redfish 펜싱, 기본 복구 약 22초 | watchdog 펜싱, 보통 2분 안팎 | HA 에이전트·하트비트 데이터스토어 |
 | SDN | 브리지·VLAN·정적 VXLAN, nftables 보안 그룹, OVN SDN(논리 스위치·IPAM·DHCP 계획 65, 공급자 네트워크·분산 라우터·게이트웨이 HA·SNAT·유동 IP·DHCPv6·RA·OVN ACL 보안 그룹 계획 66, OVN 부하 분산·NIC QoS·단순 → SDN 옮기기·OVN 접근 잠금·SDN 경보·2.5D 토폴로지 계획 67) | SDN(EVPN 포함) | NSX(따로) |
+| 백업 | 백업 풀(qcow2·증분 체인)과 백업 저장소(계획 68: 4 MiB 청크 중복 제거·노드 암호화·S3·검증·GC·라이브 복원·읽기 전용 붙이기), 따로 둘 서버 없음 | Proxmox Backup Server(따로) | VADP + 서드파티(Veeam 등) |
 
 Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
 
@@ -65,8 +66,9 @@ Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에
 
 | 크레이트 | 줄 수(대략) | 하는 일 |
 |---|---|---|
-| `opl-types` | 30k | 리소스 모델(32종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
+| `opl-types` | 30k | 리소스 모델(39종), spec·status 타입, 순수 함수(핫플러그 계획, 권한 평가 등). OpenAPI 스키마(`openapi` 기능) |
 | `opl-qemu` | 7k | QEMU 명령줄 만들기, QMP·QGA 클라이언트, 펌웨어 찾기, cloud-init ISO 만들기 |
+| `opl-store` | 9k | 백업 저장소(계획 68): 청크·고정 인덱스·매니페스트 v3 형식, 암호화 키 계층·복구 키·escrow, 로컬·S3 백엔드(직접 짠 SigV4), GC 표시·쓸기·Bloom 필터, 검증, NBD 클라이언트·서버(`backup-serve` 헬퍼), 가짜 S3(`fake-s3` 기능) |
 | `opl-driver` | 47k | `Hypervisor` 트레이트와 `QemuHypervisor`·`MockHypervisor`, 스토리지 백엔드, 브리지·VXLAN·nftables, VIP, Ceph 구성, OVN 설치·OVSDB 클라이언트 |
 | `opl-cluster` | 16k | Raft(openraft + redb), 상태 머신, watch, 리스, 투표 멤버 관리(`VoterKeeper`), 관찰 노드 |
 | `opl-peer` | 9k | 노드 간 gRPC(tonic, mTLS), Raft 전송, 클러스터 CA·인증서, 노드 감시(`NodeMonitor`) |
@@ -80,9 +82,11 @@ Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에
 graph TD
   types[opl-types]
   qemu[opl-qemu] --> types
+  store[opl-store] --> types
   cluster[opl-cluster] --> types
   driver[opl-driver] --> qemu
   driver --> types
+  driver --> store
   peer[opl-peer] --> cluster
   peer --> driver
   peer --> types
@@ -94,6 +98,7 @@ graph TD
   api --> peer
   api --> rec
   api --> types
+  api --> store
   opld["opld (orbivisord)"] --> api
   opld --> rec
   opld --> peer
@@ -101,6 +106,7 @@ graph TD
   opld --> driver
   opld --> qemu
   opld --> types
+  opld --> store
   ctl["oplctl (orbivisorctl)"] --> types
   web["web/ (React)"] -. "web-ui 기능으로 내장" .-> opld
   ctl -. HTTPS .-> api
@@ -227,7 +233,8 @@ HA watchdog(노드 재부팅)과 systemd watchdog(데몬 재시작)의 관계는
 | `pki/` | `ca.crt`, `node.crt`, `node.key`(0600) | `crates/opl-peer/src/pki.rs:31-35` |
 | `cluster/cluster.redb` | Raft 로그 + 상태 머신 + 스냅샷 | `crates/opl-cluster/src/cluster.rs:46` |
 | `migration-tls/` | QEMU 마이그레이션용 인증서 사본(시작마다 다시 씀) | `crates/opl-driver/src/migration.rs:144-185` |
-| `vm/<id>/` | VM의 영속 파일(UEFI 변수 `uefi-vars.fd`, `tpm/`) | `crates/opl-driver/src/qemu.rs:144-150` |
+| `vm/<id>/` | VM의 영속 파일(UEFI 변수 `uefi-vars.fd`, `tpm/`), 복제·저장소 백업의 플리싱 `fleece-{i}.img`와 `backup.sock`, 라이브 복원 배선 `live-restore.json`·오버레이 `lr-disk{i}.qcow2`(계획 68) | `crates/opl-driver/src/qemu.rs:144-150`, `qemu/live_restore.rs` |
+| `backup-run/` | 저장소 백업·복원·옮기기의 NBD 소켓, 라이브 복원 헬퍼의 소켓·pid·로그(`lr-<vm>.*`)(계획 68) | `crates/opld/src/member.rs:81` |
 | `pools/<id>` | 풀 마운트 지점 | `member.rs:457` |
 | `uploads/`, `migration-disks/`, `replicas/` | 업로드, 마이그레이션·복제 상태 | `member.rs:72-74,613` |
 | `audit/audit.log` | 감사 로그 | `crates/opl-api/src/audit.rs:53` |
@@ -291,10 +298,10 @@ sequenceDiagram
 | `names` | (kind, name) → id (이름 유일성 색인) |
 | `meta` | `vote`, `committed`, `last_applied`, `last_purged`, `last_membership`, `snapshot_meta`, `snapshot_data`, `node_mode`, `schema_version` … |
 
-- **리소스 32종** (`crates/opl-types/src/resource.rs:38-108`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
+- **리소스 39종** (`crates/opl-types/src/resource.rs`의 `Kind`): Vm, StoragePool, Volume, Node, Task, User, ApiToken,
   Cluster, JoinToken, Network, Snapshot, SecurityGroup, Backup, BackupJob, VmImport, Settings, Realm, Remote, Session,
   VipHolder, HaGroup, PlacementRule, NodeFence, HaCheck, Ceph, AlertRule, NotificationTarget, Folder, Grant,
-  AccessRole, Group, TwoFactor.
+  AccessRole, Group, TwoFactor, CpuCatalog, Sdn, Router, FloatingIp, LoadBalancer, NetworkMigration, BackupStore(계획 68).
 - 모든 리소스는 같은 봉투 `Resource<S,T> { id, name, revision, labels, spec, status }`다(`resource.rs:7-18`).
 - **revision은 클러스터 전체에 하나인 순서다.** 리소스의 `revision`은 마지막으로 바꾼 Raft 로그 index이고
   (`crates/opl-cluster/src/state_machine.rs:381,419,427,443`), 목록의 revision은 `last_applied`다
@@ -483,12 +490,12 @@ sequenceDiagram
 | `HaManager` | 리스가 끊긴 노드의 HA VM 복구, 전원 펜싱, HA 상태 검사 대응, 배치 규칙 위반 고치기, failback, 복구 대상 미리 계산 | 1초(failback 30초, 계획 10초) | `ha.rs:88-95,633` |
 | `NodeMonitor` | 리스 나이로 `NodeStatus.online` 쓰기(바뀔 때만) | 2초, 10초면 오프라인 | `crates/opl-peer/src/monitor.rs:34-41,131-136` |
 | `VoterKeeper` | 투표 멤버 승격·강등, 대기 learner·관찰 노드 목록 | 1초 | `crates/opl-cluster/src/voters.rs:73-83` |
-| `ClusterJanitor` | 오프라인(60초 넘게)·지워진 노드의 대기 Task 실패 처리, 고아 스냅샷, 끝난 Task 정리(7일·1000개), 만료 세션, `receiving`에 24시간 넘게 머문 백업, 고아 grant, 어느 노드도 가리키지 않고 1시간 넘은 CPU 카탈로그, 클러스터 CPU 기준 다시 셈·기록(§9.6) | 10초 | `janitor.rs:54-66,289,316,435`, `cpu_baseline.rs:148` |
+| `ClusterJanitor` | 오프라인(60초 넘게)·지워진 노드의 대기 Task 실패 처리, 고아 스냅샷, 끝난 Task 정리(7일·1000개), 만료 세션, `receiving`에 24시간 넘게 머문 백업, 백업 저장소의 남은 쓰기 잠금(끝난 Task의 `committing`·`gc`·`sweeping`, 받는 사본은 10분 멈춘 것), 고아 grant, 어느 노드도 가리키지 않고 1시간 넘은 CPU 카탈로그, 클러스터 CPU 기준 다시 셈·기록(§9.6) | 10초 | `janitor.rs:54-66,289,316,435`, `cpu_baseline.rs:148` |
 | `SnapshotScheduler` | 예약 스냅샷 만들기·정리 | 60초 | `schedule.rs:39,234` |
-| `BackupJobScheduler` | 백업 작업 실행(진행은 Raft에 있어 새 리더가 잇는다) | 60초 | `backup_jobs.rs:346,395` |
+| `BackupJobScheduler` | 백업 작업 실행(진행은 Raft에 있어 새 리더가 잇는다), 대상(풀·저장소)마다 보존, 저장소 작업의 `copy_to` 복사 줄 세우기, 백업 저장소의 GC·예약 검증·`verify_new` 검증 Task 만들기(계획 68) | 60초 | `backup_jobs.rs:346,395` |
 | `ReplicationScheduler` | 로컬 디스크 복제 Task 만들기(원본 노드당 2개까지) | 60초 | `replication.rs:175-183,320` |
 | `Balancer` | 부하 불균형 재기, 추천 게시 또는 자동 마이그레이션(계획 53) | 틱 10초, 실행 300초, 리더 된 뒤 첫 실행 60초 안 | `balancer.rs:34,50-57,121` |
-| `AlertEngine`(리더 몫) | `node_offline`, `backup_job_failed` 알림. 상태는 `AlertRule.status`(Raft) | 5초 | `alerts/engine.rs:548-588` |
+| `AlertEngine`(리더 몫) | `node_offline`, `backup_job_failed`, SDN 조건, `backup_verify_failed`·`backup_store_unavailable`(계획 68) 알림. 상태는 `AlertRule.status`(Raft) | 5초 | `alerts/engine.rs:548-588` |
 | `VipManager` | VIP마다 들 노드 정하기(`VipHolder`) | 1초 | `vip.rs:34-38,226` |
 | 배치 현황 | 리스로 받은 노드 부하를 다른 노드에 RPC(`ReadPlacement`)로 알려 줌 | 캐시 1초 | `placement_board.rs:154`, `score.rs:299-342` |
 | `TelemetryReporter` | 텔레메트리 보고 | 틱 60초, 24시간마다 | `telemetry.rs:221-229,292` |
@@ -896,8 +903,9 @@ graph TD
 - 노드마다 `TaskRunner` 하나가 자기 노드의 Pending Task를 watch해 CAS로 Running으로 바꾸고 tokio 태스크로 돌린다
   (`crates/opl-api/src/tasks.rs:247-325,863-898`). 크기를 정한 작업자 풀은 없다. **순서**는 대상마다의 줄
   (`by_target`)로 맞춘다: 같은 VM·볼륨·백업·노드·Ceph의 앞 Task가 끝나야 다음이 돈다(`tasks.rs:600-664`).
-- **다시 시작해도 이어지지 않는다.** 데몬이 다시 뜰 때 Running인 Task는 "interrupted: orbivisord restarted"로 실패
-  처리한다. 노드 업그레이드(`NodeUpgrade`)만 이어간다(`tasks.rs:282-288,664-686`).
+- **다시 시작해도 대개 이어지지 않는다.** 데몬이 다시 뜰 때 Running인 Task는 "interrupted: orbivisord restarted"로 실패
+  처리한다. 노드 업그레이드(`NodeUpgrade`), 단순 → SDN 옮기기(`NetworkMigrate`, 계획 67), 라이브 복원(`BackupLiveRestore`,
+  계획 68)만 이어간다(`tasks.rs`의 이어 가는 Task 목록) — 셋 다 진행을 Raft·노드 파일에 두고 다시 읽어 걸음을 정한다.
 - 제한 시간 기본 600초. 마이그레이션·백업·복원·복제·가져오기·업그레이드·비우기·내려받기·flatten·Ceph는 없음.
 - **잠금.** 클러스터 전체의 VM 잠금은 없다. 노드 로컬 `vm_lock`이 그 노드에서의 VM spec 검증·쓰기를 줄 세우고
   (`crates/opl-api/src/state.rs:46-48`), 노드 사이 경쟁은 revision 비교(412)로 막는다. 라이브 마이그레이션 동안은
@@ -1131,7 +1139,30 @@ flowchart LR
   (`crates/opl-types/src/backup.rs:1-2`). 전체 백업은 임시 스냅샷을 내보내고, **증분**은 영속 dirty bitmap(`opl-{id}`)을
   쓴다(`crates/opl-api/src/tasks/backup.rs:24-30,392-396`). 백업 작업은 리더가 돌린다(§4).
 - **원격 복제(DR)**는 다른 클러스터로 준비된 백업을 HTTPS로 밀고 SHA-256으로 확인한다
-  (`crates/opl-api/src/tasks/replicate.rs:1-9`).
+  (`crates/opl-api/src/tasks/replicate.rs:1-9`). 저장소 백업은 원격 저장소에 없는 청크만 보낸다(아래).
+- **백업 저장소(계획 68)**는 루트 리소스 `BackupStore`(백엔드: 백업 풀 안 `{루트}/store/{id}/` 또는 S3, 암호화 키는 Raft에만 —
+  API·watch·감사에서 뺌, GC·검증 일정, 읽기 전용)다. 데이터(청크·인덱스·매니페스트 v3·블롭)는 저장소 안에만 있고 Raft에는 리소스와
+  상태(주인·사용량·GC 진행·쓰기 잠금 `committing`/`sweeping`·`sweep_epoch`)만 있다. 형식·백엔드·GC·검증·NBD는 `opl-store`
+  크레이트이고 Raft·Task를 모른다 — `opl-api`의 `stores.rs`(저장소 열기·노드 고르기), `tasks/backup_store.rs`(파이프라인·커밋·
+  백업·복원·지우기·옮기기·복사), `tasks/store_tasks.rs`(초기화·GC·검증·scan), `tasks/live_restore.rs`가 걸음을 차례로 부른다.
+  - **읽기는 pull**: 실행 중 VM은 복제(§5.7)와 같은 copy-before-write 플리싱(VM 상태 디렉터리의 성긴 파일) 위 snapshot-access
+    노드를 QEMU가 유닉스 소켓 NBD로 내보내고(증분은 남의 노드 비트맵 문맥 `qemu:dirty-bitmap:opl-fl-point` — 부모 비트맵은 끄지
+    않고 같은 transaction에서 꺼진 임시 비트맵으로 시점을 얼림), 꺼진 VM은 `qemu-nbd`다. opld의 Task가 순수 Rust NBD 클라이언트로
+    4 MiB씩 읽어 0 검사 → 청크 id(SHA-256 또는 키 HMAC) → base 같은 자리·이번 실행·`HEAD` 있음 확인 → lz4·AES-256-GCM(결정적
+    nonce) → 올림을 겹쳐 돈다. 저장소 쪽 스냅샷이 필요 없어 모든 풀에서 같다.
+  - **GC는 표시·쓸기**: 저장소 시계의 T0 → 시작 때 진행 중이던 백업을 기다림 → Raft CAS 쓰기 잠금(`committing`이 비어야
+    `sweeping`, epoch + 1)과 늦은 표시 → T0 − 5분보다 오래된 표시 없는 청크를 지움. 표시 집합은 Bloom 필터. 백업은 매니페스트를
+    쓰기 전에 `committing`에 들어가고, 시작 뒤 epoch가 바뀌었으면 "있음"으로 건너뛴 청크를 다시 확인해 사라진 것을 열린 원본에서
+    다시 올린다. 안전은 `opl-store`의 모형 proptest가 지킨다.
+  - **복원은 NBD 서버**: 보통 복원·옮기기·복사는 opld 안의 NBD 서버(`StoreExport` — 풀린 청크 LRU, 미리 읽기, 0 청크는 구멍)를
+    `qemu-img convert`가 읽고, 라이브 복원은 같은 서버를 헬퍼 `orbivisord backup-serve`(표준 입력 설정, Linux systemd면
+    `opl-bkserve-<id>` scope)로 띄워 QEMU가 오버레이의 backing으로 읽는다(`reconnect-delay=300`). Task가 배선 파일
+    (`live-restore.json`)을 두면 reconciler의 보통 켜기가 드라이버를 거쳐 그 배선의 명령줄로 켜고, Task는 `blockdev-mirror`
+    (`write-blocking`, `on-source-error: stop`) → `job-complete`로 대상 볼륨에 갈아탄다. HA 관리자는 `live_restore`가 있는 VM을
+    건너뛰고, reconciler는 그 VM의 QEMU가 죽으면 재시작 정책과 관계없이 같은 배선으로 다시 켠다(`Pivoting` 뒤에는 대상으로 보통 켬).
+  - **노드 닿음**: 노드마다 60초에 한 번 쓸 수 있는 저장소의 `store.json`을 읽어 `NodeStatus.backup_stores`에 적는다(바뀔 때만).
+  - 자세한 것은 [백업 저장소 안내](guide/backup.md#백업-저장소중복-제거암호화s3)와
+    [설계](superpowers/specs/2026-11-23-backup-store2-design.md).
 - **로컬 디스크 복제(HA)**는 §5.7.
 - VMware 가져오기(OVA, ESXi)는 `VmImport` 리소스와 Task다([백업·복제·가져오기 안내](guide/backup.md)).
 
@@ -1509,9 +1540,10 @@ graph LR
 | 제어 소켓 | 0600 유닉스 소켓, 인증 없음(루트 전용) | §7.1 |
 | OVN(계획 65~67) | NB·SB·Raft는 `pssl`만, 클러스터 CA mTLS(노드 인증서 사본), OvnSync는 서버 이름도 확인. 잠금(계획 67, 새 클러스터 기본): SB 역할 포트 `role=ovn-controller`(chassis는 자기 행만), northd 전용 특권 포트 6645, Raft 멤버십을 따르는 nftables 주소 허용 목록(지운 노드는 인증서가 살아 있어도 끊김). `Port_Binding`·`MAC_Binding`·`FDB`는 OVN RBAC가 id를 보지 않음, NB에는 RBAC 없음. SDN NIC의 보안 그룹은 OVN ACL(포트 보안이 IP 위조도 막음), 포트는 Port_Group이 있어야 생김(실패하면 닫힘) | §11.4~§11.6 |
 | swtpm | AppArmor 추가 규칙 | §9.2 |
+| 백업 저장소(계획 68) | 노드에서 AES-256-GCM(HKDF로 나눈 키, HMAC 청크 id, 결정적 nonce, 매니페스트 HMAC 인증), 주 키는 Raft에(API·watch·감사·`Debug`에서 뺌), 복구 키·저장소 안 argon2id escrow, S3는 rustls + SigV4(인증서 검증 실패는 다시 하지 않음), `backup-serve` 소켓 0600·설정은 표준 입력 | §10.3 |
 
 **저장된 비밀은 암호화하지 않는다.** LDAP `bind_password`, OIDC `client_secret`, IPMI/Redfish 비밀번호, SMTP 비밀번호,
-webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평문으로 있다. API 응답·watch·`Debug` 출력에서만 숨긴다
+webhook 토큰, TOTP 비밀, 백업 저장소의 암호화 주 키와 S3 비밀 키(계획 68), **클러스터 CA 개인 키**가 Raft(redb)에 평문으로 있다. API 응답·watch·`Debug` 출력에서만 숨긴다
 (`crates/opl-types/src/` 아래 `realm.rs:59,111`, `fence.rs:92,123`, `alert.rs:764`, `two_factor.rs:133`, `cluster.rs:23`).
 보호는 0700 데이터 디렉터리뿐이다(계획 62 설계도 그렇게 적었다). 그래서 노드 하나의 `cluster.redb`나 백업을 얻으면
 클러스터 CA로 노드 인증서를 만들 수 있다. 복구 코드와 API 토큰·세션·합류 토큰은 해시, 패스키는 공개 키만, cloud-init
@@ -1525,7 +1557,7 @@ webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평
 
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
-  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.
@@ -1537,7 +1569,7 @@ webhook 토큰, TOTP 비밀, **클러스터 CA 개인 키**가 Raft(redb)에 평
   만들어 옛 노드가 아예 실패하게 한다(예: `UpdateStatusIf`, `types.rs:54-56`). 단일 링크 노드의 `OrbNode`는 openraft
   `BasicNode`와 바이트가 같다(`types.rs:169-237`). 모르는 명령은 역직렬화에 실패한다.
 - **업그레이드.** APT 채널(stable, testing, enterprise)에서 패키지를 받는 `NodeUpgrade` Task가 노드를 하나씩 올린다.
-  데몬을 다시 시작해도 이어지는 유일한 Task다(§8.3). 자세한 것은 [시작하기](guide/getting-started.md).
+  데몬을 다시 시작해도 이어지는 Task 셋 가운데 하나다(§8.3). 자세한 것은 [시작하기](guide/getting-started.md).
 
 ---
 
@@ -1634,7 +1666,8 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 
 - **단위 시험.** `cargo test --workspace`. 순수 함수(명령줄 만들기, 핫플러그 계획, 권한 평가, 스케줄러, RRD)를 따로 시험하고,
   `MockHypervisor`와 메모리 저장소로 여러 노드 클러스터를 한 프로세스에 띄운다. insta 스냅샷, proptest(권한 색인이 참조
-  구현과 같은지).
+  구현과 같은지, 백업 저장소 GC가 동시 백업의 청크를 지우지 않는지). 백업 저장소는 메모리 백엔드와 가짜 S3(`opl-store`의
+  `fake-s3` — SigV4 확인·실패 주입·시계 조종)로 S3 없이 시험한다.
 - **실제 시험(기능으로 켬).** 실제 QEMU·커널·저장소가 필요해 기본으로는 돌지 않는다.
 
 | 기능 | 크레이트 | 시험하는 것 |
@@ -1646,6 +1679,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 | `web-it`(= `qemu-it` + `web-ui`) | opld | 웹 내장과 실제 VM |
 | `starve-it` | opld | 실행기를 일부러 막고 Raft·리스가 견디는지(§2.2) |
 | `metrics-it` | opld | 지표 수집·기록 |
+| `backup-it`(= `qemu-it`), `s3-it`(= `backup-it`) | opld | 실제 QEMU로 백업 저장소 백업·증분·GC·검증·복원·라이브 복원(orbivisorctl로), S3 호환 저장소(HTTP·사설 CA HTTPS, GC와 백업 동시, 저장소 멈춤 도중 백업·라이브 복원, 두 클러스터 DR) |
 | `sdn-it` | opld | 깨끗한 Ubuntu 24.04에 OVN 설치·mTLS·OvnSync·DHCP·포트 바인딩, physnet·공급자 네트워크·라우터·SNAT·유동 IP·RA·DHCPv6·nftables와 OVN 보안 그룹 비교, 부하 분산·건강 검사 넘김·바깥 VIP·QoS 측정(iperf3)·단순 NIC tc·옮기기(라이브 tap·다리·되돌리기·끝내기)·잠금(RBAC·허용 목록)(root, OVN을 남김) |
 | `sdn-multinode-it` | opld | 한 호스트의 systemd 컨테이너 셋을 노드로: OVN Raft 셋, chassis 사이 Geneve·동서 라우팅, SNAT, 분산·중앙 유동 IP, 게이트웨이 넘김, 두 chassis 마이그레이션, 죽은 중앙 `cluster/kick`, 계획 67의 잠금 켜고 끄기·여러 chassis 보안 그룹·LB 넘김·바깥 VIP GARP·Geneve 너머 QoS·VXLAN 원본 옮기기와 다리 노드 바꾸기·SDN 경보(webhook)·지운 노드 끊기(root, docker) |
 | `scale-it` | opl-cluster | 수백 노드 규모(§15) |
@@ -1661,10 +1695,11 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 
 | 작업 | 도는 것 |
 |---|---|
-| `ci.yml` `check`(Ubuntu, macOS) | fmt, clippy `--all-features -D warnings`, `cargo test --workspace`, `starve-it`, `metrics-it`, `scale-it`(노드 100, p99 기준 200 ms), `storage-it`(Linux) |
+| `ci.yml` `check`(Ubuntu, macOS) | fmt, clippy `--all-features -D warnings`, `cargo test --workspace`, `starve-it`, `metrics-it`, `scale-it`(노드 100, p99 기준 200 ms), `storage-it`(Linux — NBD·`qemu-nbd`, 저장소 백업·라이브 복원 Task 포함) |
 | `ci.yml` `web` | pnpm typecheck·lint·test·gen:api 차이·audit·build |
 | `ci.yml` `shell`, `package` | 패키지 스크립트, deb 빌드와 설치 |
-| `ci.yml` `linux-kvm`(root, 80분) | qemu·net·web·nfs·lvm·zfs·rbd·lvm-shared·migration·ha·vtpm 실제 시험, `OPL_TEST_SYSTEMD=1` |
+| `ci.yml` `linux-kvm`(root, 80분) | qemu·net·web·nfs·lvm·zfs·rbd·lvm-shared·migration·ha·vtpm·cpu·numa·backup 실제 시험, `OPL_TEST_SYSTEMD=1` |
+| `ci.yml` `backup-s3` | SeaweedFS S3 컨테이너 둘(HTTP·사설 CA HTTPS)로 `s3-it`(계획 68) |
 | `ci.yml` `ceph`, `ovn`, `install-media`, `ldap`, `deny` | Ceph, OVN(설치·mTLS·OvnSync·DHCP·바인딩·클라우드 이미지 게스트 DHCP·라우팅·보안 그룹 비교·부하 분산·QoS·옮기기·잠금), 설치 매체·템플릿·vTPM 실제 게스트, LDAP, cargo-deny |
 | `ci.yml` `sdn-multinode` | 한 러너의 privileged systemd 컨테이너 셋(`ci/sdn-node/Dockerfile`)이 Orbivisor 노드 셋 — 여러 노드 OVN(약 6분) |
 | `iso.yml` `iso-e2e` | BIOS·UEFI 설치 ISO 끝까지(주 1회, 태그, `ci-probe/**` 가지) |
@@ -1708,7 +1743,8 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 - 마이그레이션·저장소: [라이브 마이그레이션](superpowers/specs/2026-10-30-live-migration-design.md),
   [로컬 디스크 마이그레이션](superpowers/specs/2026-11-10-storage-migration-design.md),
   [공유 스토리지 NFS](superpowers/specs/2026-10-28-shared-storage-nfs-design.md)와 이후 LVM-thin·ZFS·Ceph·iSCSI 설계,
-  [백업](superpowers/specs/2026-11-04-backup-design.md), [증분 백업](superpowers/specs/2026-11-09-incremental-backup-design.md)
+  [백업](superpowers/specs/2026-11-04-backup-design.md), [증분 백업](superpowers/specs/2026-11-09-incremental-backup-design.md),
+  [백업 저장소 2 — 중복 제거·검증·암호화·S3·라이브 복원(계획 68)](superpowers/specs/2026-11-23-backup-store2-design.md)
 - 네트워크: [네트워크·SDN](superpowers/specs/2026-11-03-network-sdn-design.md),
   [SDN(OVN) 계획 65~67](superpowers/specs/2026-11-20-sdn-ovn-design.md),
   [SDN(OVN) 2 — 라우터·게이트웨이 HA·유동 IP·OVN 보안 그룹(계획 66)](superpowers/specs/2026-11-20-sdn-ovn-plan66-design.md),
@@ -1761,6 +1797,10 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
   (링크 다시 보기·DHCP 다시 묻기)은 게스트 없는 QEMU VM으로만 봤다(tap이 `br-int`로, `ovn-installed`, PID 그대로). `sdn_quorum_lost`는 순수
   시험 표로만 보았다(컨테이너 셋에서 중앙 둘을 죽이면 Orbivisor Raft도 정족수를 잃음). 단순 NIC tc는 opld를 다시 띄워도 다시 맞추지 않는다
   (커널이 tap과 함께 들고 있다고 보고 재부팅 흉내로는 확인하지 않음). 토폴로지의 SVG 원소 수(2000 VM에 약 11,400)는 설계 목표 5000을 넘는다.
+- **계획 68(백업 저장소)에서 확인하지 못한 것.** S3는 CI의 SeaweedFS와 가짜 S3로만 시험했다(AWS·Wasabi·Ceph RGW는 손 확인).
+  아주 큰 저장소(청크 수억 개)의 GC 시간·메모리는 재지 않았다. 라이브 복원의 헬퍼·opld·QEMU 죽음은 실제 QEMU에서는 S3 큰 디스크
+  시험(`backup-s3`)과 드라이버 재연결 탐침으로, 나머지는 가짜 하이퍼바이저로 본다. fleece가 1초에 1 GiB보다 빨리 차는 경우는
+  QEMU 동작(게스트 쓰기는 성공, 내보내기 읽기만 실패)을 작은 APFS 이미지로만 확인했다.
 - **OVN 24.03 RBAC가 막지 않는 것.** 잠금은 SB `Chassis`·`Encap`·`Chassis_Private`의 주인만 보고, `Port_Binding`·`MAC_Binding`·`FDB` 쓰기는 id 검사
   없이 받는다(OVN이 그렇게 정의). 망가진 chassis의 포트 가로채기는 막지 못하고 탐지 경보도 아직 없다.
 - **OVN 판에 기대는 것.** 바깥 → 안의 큰 DF 패킷에 ICMP가 없는 것(`gateway_mtu`가 게이트웨이로 나가는 방향만 잼), ACL 우선순위

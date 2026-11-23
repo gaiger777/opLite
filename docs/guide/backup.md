@@ -1,8 +1,10 @@
 # 백업·복제·가져오기
 
-백업과 복원, 원격 클러스터, 원격 복제(DR), VMware에서 가져오기. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+백업과 복원, 백업 저장소(중복 제거·암호화·S3·검증·라이브 복원), 원격 클러스터, 원격 복제(DR), VMware에서 가져오기. 처음 보는
+사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [백업과 복원](#백업과-복원)
+- [백업 저장소(중복 제거·암호화·S3)](#백업-저장소중복-제거암호화s3)
 - [원격 클러스터](#원격-클러스터)
 - [원격 복제(DR)](#원격-복제dr)
 - [VMware에서 가져오기](#vmware에서-가져오기)
@@ -10,7 +12,8 @@
 ## 백업과 복원
 
 백업은 VM 전체(디스크, UEFI 변수, VM 스펙)를 다른 저장소에 떠 둔 것이다. 스냅샷과 달리 VM 디스크의 저장소를
-잃거나 VM을 지워도 남고, 언제든 **새 VM**으로 되살린다. 백업은 `backups`를 켠 **디렉터리·NFS 풀**(백업 풀)에 둔다.
+잃거나 VM을 지워도 남고, 언제든 **새 VM**으로 되살린다. 백업은 `backups`를 켠 **디렉터리·NFS 풀**(백업 풀)에 두거나,
+중복 제거·암호화·S3를 쓰는 **백업 저장소**(계획 68, 아래 [백업 저장소](#백업-저장소중복-제거암호화s3))에 둔다. 이 절은 백업 풀의 백업이다.
 노드 사이 로컬 디스크 복제(위 "로컬 디스크 복제와 HA")와 함께 쓸 수 있다 — 복제 비트맵과 증분 백업 비트맵은 따로다.
 CD-ROM 매체와 cloud-init 씨앗은 담지 않는다 — 복원은 없는 ISO의 드라이브를 비우고 경고한다("설치 매체와 cloud-init").
 
@@ -22,9 +25,9 @@ orbivisorctl backup create web --pool bk --name before-upgrade
 orbivisorctl backup create web --pool bk --incremental       # 할 수 있으면 증분(아래 "증분 백업")
 # backup web-20261105-030000 of vm web created (incremental)     할 수 없었으면 (full: <이유>)
 orbivisorctl backup list                                     # --vm web이면 지금 web인 VM과 web이라는 이름으로 남은(지운 VM) 백업
-# NAME                 VM   POOL  PHASE  CREATED               SIZE      TYPE  ORIGIN  REPLICAS
-# before-upgrade       web  bk    ready  2026-11-04 03:00 UTC  412.5MiB  full  -       -
-# web-20261105-030000  web  bk    ready  2026-11-05 03:00 UTC  18.2MiB   incr  -       -
+# NAME                 VM   TARGET  PHASE  CREATED               SIZE      TYPE  ORIGIN  REPLICAS  VERIFIED
+# before-upgrade       web  bk      ready  2026-11-04 03:00 UTC  412.5MiB  full  -       -         -
+# web-20261105-030000  web  bk      ready  2026-11-05 03:00 UTC  18.2MiB   incr  -       -         -
 orbivisorctl backup get before-upgrade                       # 디스크별 크기, UEFI 변수, 오류, 증분이면 부모와 체인(JSON)
 orbivisorctl backup restore before-upgrade --name web2 --pool local  # 새 VM web2(꺼진 채), --node로 노드를 정할 수 있다
 orbivisorctl backup delete before-upgrade                    # 파일과 리소스를 지운다(실패한 백업도)
@@ -213,7 +216,8 @@ orbivisorctl backup-job delete nightly         # 작업만 지운다. 만든 백
   `POST /api/v1/backup-jobs/{name}/run`이고, 읽기는 모든 사용자, 쓰기는 operator 이상이다. 스케줄러의 확인 간격은
   `[backup] tick_secs`(기본 60초)다.
 
-- **한계.** 중복 제거, 암호화(TPM 상태 `tpm2-00.permall`도 그대로 담긴다), 원격(S3) 저장소, 파일 단위 복원, 기존 VM 덮어쓰기는 없다.
+- **한계.** 백업 풀의 백업에는 중복 제거·암호화(TPM 상태 `tpm2-00.permall`도 그대로 담긴다)·검증·S3가 없다 — 그것은 아래
+  [백업 저장소](#백업-저장소중복-제거암호화s3)가 한다(옛 풀 백업은 `backup convert`로 옮긴다). 파일 단위 복원, 기존 VM 덮어쓰기는 없다.
   다른 Orbivisor 클러스터로 사본을 보내는 것은 아래 "원격 복제(DR)"다. 증분 백업은: 꺼진 VM은 늘 전체(매일 백업하는
   꺼진 VM은 매일 전체를 쓴다), 블록 풀 VM은 다시 켠 뒤 첫 백업이 전체, VM마다 비트맵이 하나라 두 풀에 번갈아 백업하면
   늘 전체, 체인 병합과 중간 백업 지우기 없음, 증분 파일만으로는 복원할 수 없음(Orbivisor 밖에서는 위처럼 체인을 적어
@@ -224,6 +228,388 @@ orbivisorctl backup-job delete nightly         # 작업만 지운다. 만든 백
   다 만든 뒤 VM을 만들기 전에 orbivisord가 죽으면 `{새 이름}-disk{i}` 볼륨이 남는다(복제도 같다) — `orbivisorctl volume delete`로
   지운다. 백업 디렉터리의 파일 작업에는 시간 제한이 없어, NFS 서버가 멈추면(hard 마운트) 백업·지우기·복원 작업이
   서버가 돌아올 때까지 멈춘다.
+
+## 백업 저장소(중복 제거·암호화·S3)
+
+**백업 저장소**(`BackupStore`, 계획 68)는 백업 풀의 디렉터리 하나나 S3 호환 객체 저장소의 버킷(접두사)에 둔 **중복 제거 청크
+저장소**다. 디스크를 고정 4 MiB 청크로 나눠 청크마다 한 번만 저장하고(같은 VM의 다음 백업, 같은 템플릿의 클론, 다른 VM의 같은
+블록이 모두 나눠 쓴다), 백업마다 **완전한 인덱스**(청크 id의 차례 — 1 TiB 디스크에 8 MiB)를 둔다. 그래서 증분 백업에도 체인이
+없다: 아무 백업이나 지우고, 아무 백업이나 혼자 복원한다. 그 위에 노드에서 하는 **AES-256-GCM 암호화**, 청크를 다시 읽어 보는
+**검증**, 쓰지 않는 청크를 거두는 **가비지 수집(GC)**, 디스크를 다 받기 전에 VM을 켜는 **라이브 복원**, 저장소 사이 **복사**(계층),
+다른 클러스터의 **읽기 전용 붙이기**(DR)가 있다.
+
+위의 백업 풀 백업(qcow2 파일, 증분 체인)은 그대로 남고 그대로 동작한다. 저장소를 만들지 않은 클러스터는 계획 67과 바이트까지
+같다. 저장소·저장소 백업·라이브 복원은 클러스터의 모든 노드(위트니스 포함)에 기능 `backup-store`가 있어야 하고, 아니면 **409**
+`cluster_upgrading`이다.
+
+- [저장소 만들기](#저장소-만들기)
+- [저장소로 백업과 복원](#저장소로-백업과-복원)
+- [암호화와 복구 키](#암호화와-복구-키)
+- [S3 호환 저장소](#s3-호환-저장소)
+- [검증](#검증)
+- [가비지 수집(GC)과 보존](#가비지-수집gc과-보존)
+- [라이브 복원](#라이브-복원)
+- [옛 백업 옮기기와 저장소 사이 복사](#옛-백업-옮기기와-저장소-사이-복사)
+- [저장소 백업의 원격 복제](#저장소-백업의-원격-복제)
+- [S3로 DR — 읽기 전용 붙이기와 넘겨받기](#s3로-dr--읽기-전용-붙이기와-넘겨받기)
+- [권한·할당량·경보](#권한할당량경보)
+- [PBS·Veeam과 견주기](#pbsveeam과-견주기)
+- [한계와 계획 68이 아직 하지 않는 것](#한계와-계획-68이-아직-하지-않는-것)
+
+### 저장소 만들기
+
+```bash
+# 백업 풀(--backups를 켠 dir·NFS 풀) 안 저장소: {풀 루트}/store/{저장소 id}/
+orbivisorctl backup-store create local --pool bk
+# S3 저장소, 새 키로 암호화하고 키를 암호 문구로 감싸 저장소 안에도 둔다(escrow — 아래 "암호화와 복구 키")
+orbivisorctl backup-store create offsite --s3-endpoint https://s3.eu-central-1.amazonaws.com --region eu-central-1 \
+  --bucket acme-backup --prefix orbivisor --access-key-id AKIA… --secret-key-file /root/s3-secret \
+  --encrypt --escrow-passphrase-file /root/escrow-pass --verify-at 06:00 --verify-days sun
+# recovery key: OPK1-ABCD-EFGH-…
+# store it now; backups in this store cannot be recovered without it
+# backup store offsite created
+orbivisorctl backup-store list
+# NAME     BACKEND                   ENCRYPTED    SNAPSHOTS  STORED   DEDUP  LAST-GC               LAST-VERIFY           PHASE
+# local    pool:bk                   no           42         61.3GiB  5.8x   2026-11-23 05:00 UTC  -                     ready
+# offsite  s3:acme-backup/orbivisor  3f:9a:1c:07  42         58.9GiB  6.0x   2026-11-23 05:01 UTC  2026-11-22 06:14 UTC  ready
+orbivisorctl backup-store get offsite          # 스펙·상태(JSON, 비밀 키·암호화 키는 빠진다)
+orbivisorctl backup-store check offsite        # 이 노드에서 지금 열어 보기 + 노드마다 보고한 닿음
+orbivisorctl backup-store set offsite --gc-at 04:30 --verify-new true   # 일정·동시 요청 수·S3 자격 증명·CA만 바꾼다
+orbivisorctl backup-store delete local         # 리소스만 지운다(백업이 남아 있으면 409 store_in_use)
+```
+
+- **만들기는 Task를 기다린다.** API(`POST /api/v1/backup-stores`)는 201 `{store, recovery_key?, task}`를 주고 초기화 Task
+  (`backup-store-init`)가 저장소에 `store.json`(형식·청크 크기·키 지문)과 주인 표식 `owner.json`을 쓴다. 그동안 저장소는
+  `initializing`, 끝나면 `ready`, 실패하면 `failed`와 까닭이다. 로컬 저장소는 초기화가 `chunks/0000`~`ffff` 디렉터리 65,536개를
+  미리 만든다(몇 초~수십 초). 만들기 전에 API 노드가 그 저장소에 닿으면 미리 읽어 보고 400 `store_key_required`(암호화 저장소인데
+  키 없음)·`store_key_mismatch`(키 지문이 다름)·409 `store_owned_elsewhere`(다른 클러스터가 쓰는 저장소)를 곧바로 준다. 같은 풀의
+  저장소·같은 버킷/접두사를 두 번 만들면 409 `store_target_in_use`다.
+- **풀 안 저장소.** 풀은 `backups`가 켜진 dir·NFS 풀이어야 한다. 저장소가 든 풀은 지우기·`backups` 끄기·`shared` 바꾸기가
+  409 `pool_in_use`다. **공유가 아닌 dir 풀의 저장소는 초기화한 노드에만 있다**(`status.node`) — 그 노드의 VM만 거기로 백업하고
+  (다른 노드면 409 `store_not_on_node`), 그 노드를 잃으면 저장소도 잃는다. 여러 노드가 쓰려면 NFS 풀이나 S3를 쓴다.
+- **일정.** GC는 기본 매일 05:00 UTC(`--gc-at`·`--gc-days`), 예약 검증은 `--verify-at`을 줄 때만 켜진다(`--verify-days`,
+  `--reverify-days N` 기본 30, `--verify-mode full|metadata`, `--verify-new`). 웹 마법사는 GC 매일 05:00, 검증 일요일 06:00을
+  기본으로 채운다. 리더의 백업 작업 스케줄러가 시각이 되면 Task를 만든다(놓친 실행은 한 번).
+- **지우기.** 저장소 리소스를 지워도 **저장소 안 데이터는 그대로다**(버킷·디렉터리를 지우는 API는 없다). 그 저장소의 백업을
+  먼저 모두 지워야 한다. 데이터까지 지우려면 리소스를 지운 뒤 손으로: 로컬은 `rm -rf {풀 루트}/store/{저장소 id}`(id는
+  `backup-store get`의 `status.store_id`), S3는 `aws s3 rm --recursive s3://<버킷>/<접두사>/`.
+- **노드마다 닿음.** 노드마다 60초에 한 번 쓸 수 있는 저장소의 `store.json`을 읽어 닿는지 `NodeStatus.backup_stores`에 적는다
+  (바뀔 때만). `backup-store check`(API `POST …/actions/check` — 늘 200 `{ok, checked_here, error?, nodes}`)와 웹 서랍의 "연결
+  확인"이 그것을 보인다. 온라인 노드 가운데 하나라도 닿지 않으면 경보 `backup_store_unavailable`이 참이다.
+- **웹.** 보호 › **백업 저장소** 탭(`/backup-stores`): 목록, 만들기 마법사(백엔드 → 암호화 → 일정 → 새 키면 복구 키), 서랍(설정,
+  키 카드, 노드별 닿음, GC·검증 지금, 읽기 전용이면 scan·넘겨받기). [웹 화면](web-ui.md#백업-저장소-화면).
+
+**저장소 안 모습.** 만들기 뒤 바뀌지 않는 `store.json`, 주인 표식 `owner.json`, 감싼 키 `keys/<지문>.json`(escrow를 쓸 때),
+청크 `chunks/<id 앞 4자>/<id>`, 백업마다 `snapshots/<VM id>/<백업 id>/`(매니페스트 `index.json`, 디스크 인덱스
+`disk{i}.fidx`, VM 설정 블롭 `config`, `vars.fd`·`tpm2-00.permall` 블롭), GC 기준 시각 표식 `gc/`, 검증이 옆으로 옮긴 깨진 청크
+`bad/`. 청크는 lz4로 압축하고(줄지 않으면 그대로) 암호화 저장소면 암호화한다. 이 형식은 Orbivisor 고유라 **Orbivisor 없이
+qcow2처럼 열 도구는 없다** — 꺼내려면 어느 Orbivisor 클러스터에서든 읽기 전용으로 붙여 복원한다(아래 "S3로 DR").
+
+### 저장소로 백업과 복원
+
+```bash
+orbivisorctl backup create web --store offsite                  # 이름은 풀 백업과 같은 규칙
+orbivisorctl backup create web --store offsite --incremental    # 할 수 있으면 바뀐 청크만 읽는다
+# backup web-20261123-030000 of vm web created (incremental): new 14.0MiB of 40.0GiB
+orbivisorctl backup list --vm web
+# NAME                 VM   TARGET         PHASE  CREATED               SIZE     TYPE  ORIGIN  REPLICAS  VERIFIED
+# web-20261122-030000  web  store:offsite  ready  2026-11-22 03:00 UTC  6.1GiB   full  -       -         ok
+# web-20261123-030000  web  store:offsite  ready  2026-11-23 03:00 UTC  14.0MiB  incr  -       -         never
+orbivisorctl backup restore web-20261122-030000 --name web2 --pool local   # 보통 복원(꺼진 새 VM)
+orbivisorctl backup delete web-20261122-030000                  # 순서 제약 없음 — 청크는 다음 GC가 거둔다
+orbivisorctl backup-job create nightly --store offsite --all --at 03:00 --keep-daily 14 --full-every 6
+```
+
+웹은 VM 상세 "백업" 탭과 보호 › 백업의 "지금 백업"에서 대상(백업 풀 | 저장소)을 고른다. API는 `POST /api/v1/vms/{key}/backups`에
+`{"store": …}`(`pool`과 둘 중 하나).
+
+- **실행 중인 VM은 fleecing으로 읽는다.** 디스크 스냅샷을 찍지 않는다: 게스트를 잠깐 멈춘 사이 디스크 위에 copy-before-write
+  필터를 끼워 그 시점의 내용을 VM 상태 디렉터리의 성긴 파일(`fleece-{i}.img`)에 붙잡고, QEMU가 유닉스 소켓 NBD로 시점 내용을
+  내보내면 orbivisord가 4 MiB씩 읽어 해시·압축·암호화해 올린다. 백업하는 동안 게스트가 덮어쓴 블록의 옛 내용만 fleece 파일에
+  쌓이고, 백업이 끝나면 지운다. 그래서 **모든 풀(dir·NFS qcow2, LVM-thin·ZFS·RBD, 공유 LVM)에서 실행 중 백업이 된다** — 풀
+  백업의 409 `vm_running`·`snapshot_unsupported`가 저장소 백업에는 없고, 블록 풀 VM도 멈추지 않으며 qcow2에 임시 스냅샷 태그가
+  남지 않는다.
+- **fleece 공간.** 시작 전 VM 상태 디렉터리의 파일시스템에 `max([backup] fleece_reserve_min_mib(기본 2048), 디스크 크기 합의
+  10%)`가 비어 있어야 하고(아니면 백업이 곧바로 실패), 백업하는 동안 1초마다 남은 공간이 `fleece_min_free_mib`(기본 1024)
+  아래로 내려가면 내보내기와 fleecing을 떼고 백업을 실패시킨다. fleece가 차도 **게스트 쓰기는 실패하지 않는다**(QEMU가 시점
+  내보내기를 깨뜨리고 그 뒤 읽기만 실패 — 계획 68 탐침). 쓰기가 아주 많은 VM은 상태 디렉터리(`{data_dir}`)를 넉넉한 곳에 둔다.
+- **꺼진 VM은 `qemu-nbd`로 디스크 전체를 읽는다**(`qemu-img` 옆의 `qemu-nbd` — Debian `qemu-utils`, macOS Homebrew `qemu`). 읽는
+  시간만 들고 공간·전송은 바뀐 청크만이다(나머지는 "있음 확인"으로 건너뜀). qcow2 디스크에는 끝에 비트맵을 둬 다음 실행 중
+  백업이 증분이 된다.
+- **증분(`incremental`).** 풀 백업과 같은 비트맵 규칙으로 같은 VM·같은 저장소의 마지막 백업을 **base**로 골라
+  (`status.base`), QEMU dirty bitmap이 바뀌었다고 알린 청크만 읽고 나머지는 base 인덱스의 id를 옮긴다. 결과 인덱스는 늘 완전하다.
+  할 수 없으면 전체를 읽고 `status.full_reason`에 까닭을 적는다(풀 백업의 까닭들에 더해 `a chunk of the base backup failed
+  verification` — base의 청크가 검증에서 깨졌으면 다음은 전체 읽기). 백업 작업의 `full_every N`은 base를 따라 연속으로 비트맵으로
+  읽은 수가 N이면 다음을 전체 읽기로 한다(Veeam의 active full처럼 비트맵을 씻을 뿐 공간은 늘지 않는다). 목록의 `TYPE`은 base가
+  있으면 `incr`이지만 혼자 복원된다.
+- **크기.** `status.store_stats`에 논리 크기(`logical_bytes`), 읽은 바이트(`read_bytes`), 새 청크 수(`new_chunks`)와 새로 쓴
+  바이트(`new_bytes` — 목록의 `SIZE`), 이미 있던 청크(`reused_chunks`), 0 청크(`zero_chunks`)가 있다. 웹 백업 표는 "새 데이터 / 논리"를 보인다. 저장소 전체의 쓴
+  공간·dedup 배율은 GC가 잰다(`backup-store list`의 `STORED`·`DEDUP`).
+- **커밋.** 청크 → 블롭 → 인덱스 → 매니페스트 차례로 쓰고 매니페스트가 있어야 백업이 완전하다(`ready`). 실패하면 그 백업의
+  객체를 지우고 `failed`다(올린 청크는 다음 GC가 거둔다).
+- **복원.** 풀 백업과 같다(늘 새 VM, 백업 때의 스펙·UEFI 변수·TPM 상태). orbivisord가 백업을 노드 안 NBD로 내보내고 `qemu-img
+  convert`가 대상 풀의 새 볼륨에 쓴다(0 청크는 쓰지 않는다). 복원 노드는 저장소와 대상 풀을 함께 쓸 수 있는 온라인 노드다(`--node`가
+  그렇지 않으면 409 `store_not_on_node`, 저장소가 `ready`가 아니면 409 `store_not_ready`). 백업 노드를 잃어도 S3·NFS 저장소의 백업은
+  다른 노드가 복원한다.
+- **지우기.** 체인이 없으므로 **아무 백업이나 지운다**. 만드는 중인 백업의 base만 409 `backup_in_use`다. 읽기 전용 저장소의
+  백업은 409 `store_read_only`(`--force`는 리소스만 지운다), 저장소 리소스가 없어졌으면 리소스만 지운다.
+- **백업 작업.** `--store S`로 만들고, `backup-job set J --store S`로 풀 작업을 저장소로 바꾼다(그 뒤의 백업만 — 그 작업의 풀
+  백업은 보존 규칙대로 줄어든다, 몰래 옮기거나 지우지 않는다). `backup-job list`의 `POOL` 칸은 저장소 작업이면 `-`다(`backup-job
+  get`의 `spec.store`).
+- **설정**(`[backup]`): `fleece_reserve_min_mib = 2048`, `fleece_min_free_mib = 1024`, `serve_cache_mib = 256`(복원·라이브 복원이
+  쓰는 풀린 청크 캐시, 8~1048576).
+
+### 암호화와 복구 키
+
+암호화는 만들 때만 고른다(나중에 켜거나 끄거나 키를 바꾸지 못한다). 노드가 청크를 올리기 전에 암호화하므로 저장소(S3 업체,
+NFS 관리자, 훔친 백업 디스크)는 내용을 보지 못한다.
+
+- **키.** 저장소마다 무작위 주 키(32바이트)에서 HKDF로 데이터 키(AES-256-GCM)·청크 id 키·nonce 키·매니페스트 인증 키를 나눈다.
+  청크 id는 평문 해시가 아니라 HMAC이라 "알려진 파일의 해시"로 내용을 맞혀 볼 수 없고, nonce는 청크 id에서 정해져(결정적) 같은
+  청크는 같은 바이트다 — 중복 제거가 그대로 되고 키 하나에 쓸 수 있는 청크 수에 실용 한계가 없다. 매니페스트는 HMAC으로 인증해
+  고친 매니페스트를 거절한다. 키 **지문**(`3f:9a:…`, 키를 알려 주지 않음)은 리소스·`store.json`에 평문으로 있다.
+- **키는 클러스터(Raft)에 있다**(원격 토큰·S3 비밀 키와 같은 자리). API 응답·watch·감사 로그·로그에서 뺀다. 노드는 어차피 VM의
+  평문을 가지므로 위협 모델은 저장소 쪽이다.
+- **복구 키(종이 키).** 새 키로 만들면 응답에 한 번 `OPK1-…`(73자, 네 자씩 묶음, 체크섬 포함)를 준다. CLI는 찍은 뒤 경고하고, 웹
+  마법사는 글·QR·복사·인쇄 창을 보이고 "보관했습니다"를 누르기 전에는 닫히지 않는다. 다시 보기는 루트 `cluster.admin`의
+  `orbivisorctl backup-store key export S`(API `POST …/key/export`, 감사에 남음).
+- **저장소 안 escrow(선택).** `--escrow-passphrase-file F`(만들 때) 또는 `backup-store key escrow S --passphrase-file F`(나중에,
+  `cluster.admin`, 8자 이상)는 주 키를 암호 문구로 감싸(argon2id) 저장소의 `keys/<지문>.json`에 둔다. 암호 문구는 어디에도
+  저장하지 않는다. 클러스터를 통째로 잃어도 **저장소와 암호 문구만으로** 다른 클러스터가 연다.
+- **가져오기.** 이미 있는 암호화 저장소를 붙일 때는 `--recovery-key-file F` 또는 `--escrow-unlock-file F`(escrow 암호 문구)로
+  키를 준다. 지문이 다르면 400 `store_key_mismatch`.
+
+> **키를 잃으면 백업을 되살릴 길이 없다.** 클러스터가 살아 있는 동안은 키가 Raft에 있지만, 클러스터를 잃는 날(DR)에는 복구 키나
+> escrow 암호 문구가 유일한 열쇠다. 복구 키를 인쇄해 클러스터 밖(금고, 비밀번호 관리자)에 두고, escrow를 쓰면 암호 문구도 따로 둔다.
+
+**암호화 저장소에서 평문으로 남는 것.**
+
+| 저장소를 가진 사람이 볼 수 있는 것 | 볼 수 없는 것 |
+|---|---|
+| `store.json`(형식·청크 크기·키 지문), `owner.json`(주인 클러스터 이름·CA 지문·하트비트) | 청크 내용(디스크 데이터) |
+| 스냅샷 경로(VM id·백업 id), 매니페스트의 시각·디스크 수·가상 크기·청크 수·0 청크 수 | VM 이름·스펙·cloud-init user-data(`config` 블롭) |
+| 인덱스(키가 든 청크 id의 차례 — 디스크 안 어느 청크끼리 같은지) | UEFI 변수(`vars.fd`), TPM 상태 |
+| 청크 객체 크기(압축률의 힌트), 객체를 쓴 시각, 같은 저장소 안 같은 청크라는 사실 | 다른 키 저장소의 청크와 같은지 |
+
+평문 저장소도 VM 이름이 경로에 들어가지 않는다(id만). TPM 상태가 평문 파일로 남는 풀 백업(`tpm2-00.permall`)보다 나아진 점이다.
+
+### S3 호환 저장소
+
+- **끝점.** `--s3-endpoint https://host[:port]`(경로·질의 없이), `--bucket`, `--prefix`(버킷 안 자리, 한 버킷에 여러 저장소),
+  `--region`(기본 `us-east-1`), `--path-style`(경로 방식 `https://host/버킷/…` — 대개 MinIO·SeaweedFS·Ceph RGW; 없으면 가상 호스트
+  `버킷.host`), `--ca-file`(사설 CA PEM — 없으면 시스템 루트), `--max-streams N`(동시 요청, 기본 8, 1~64).
+  `--insecure-http`는 시험용이다(자격 증명과 데이터가 평문으로 오간다 — 웹 마법사는 `https://`만 받는다).
+- **자격 증명.** `--access-key-id`와 비밀 키 파일(`--secret-key-file` — 명령줄·환경에 비밀을 두지 않는다). 바꾸기는
+  `backup-store set S --access-key-id … --secret-key-file …`, CA는 `--ca-file`·`--no-ca`. 버킷은 미리 만든다. 필요한 권한은
+  그 접두사에 대한 `s3:PutObject`·`GetObject`·`DeleteObject`와 버킷의 `s3:ListBucket`(`HeadObject`·`CopyObject`는 그 안에 든다).
+- **요구 사항.** 읽은-뒤-쓰기 강한 일관성(AWS S3, MinIO, SeaweedFS, Ceph RGW, Wasabi는 그렇다). 없을 때만 쓰기는
+  `If-None-Match: *`를 쓰고, 모르는 구현이면 쓴 뒤 다시 읽어 견준다. 서명은 SigV4(직접 구현 — AWS 공개 벡터로 시험).
+- **다시 하기.** 5xx·429·연결 끊김·시간 넘김(요청 120초)은 지수 대기로 60초 동안 다시 한다. 인증서 검증 실패와 4xx는 곧바로
+  실패한다(403은 자격 증명이나 버킷 정책). 그래서 짧은 S3 장애 동안 백업·복원은 멈췄다 이어 간다.
+- **비용 메모.** 새 청크마다 `HEAD` + `PUT`, GC는 청크 1000개마다 `LIST` 하나와 지울 청크마다 `DELETE`(하나씩, 병렬), 검증 `full`은
+  모든 청크를 `GET`(내보내기 요금) — `metadata`는 `HEAD`만이다.
+- **확인한 구현.** GitHub CI의 `backup-s3` 작업은 **SeaweedFS**(S3 게이트웨이)로 HTTP·사설 CA HTTPS를 시험한다(MinIO는 2025년
+  가을부터 이미지·바이너리를 내지 않는다). AWS·Wasabi·Ceph RGW는 CI가 아니다 — 쓰기 전에 손으로 확인한다: 저장소를 만들고
+  `backup-store check`가 모든 노드에서 ok인지, 작은 VM을 백업 → `backup verify --wait` → 복원 → `backup-store gc --wait`가 되는지.
+
+### 검증
+
+```bash
+orbivisorctl backup verify web-20261123-030000 --wait     # 백업 하나를 지금
+# backup web-20261123-030000 verified: ok
+orbivisorctl backup-store verify offsite --wait           # 일정의 규칙대로 고른 백업(오래 검증하지 않은 것부터)
+orbivisorctl backup-store verify offsite --backup a --backup b
+```
+
+- **무엇을 보나.** 매니페스트 인증(암호화 저장소)·`config` 블롭·인덱스 해시·디스크 수와 크기, 그리고 `full`이면 모든 청크를 읽어
+  AEAD 태그·압축 풀기·id 다시 계산(한 실행에서 같은 청크는 한 번), `metadata`면 청크가 있고 크기가 맞는지만(`HEAD`).
+- **깨진 청크.** 지우지 않고 `bad/<id>.<시각>`으로 옮긴다. 그 청크를 가리키는 모든 백업이 `status.verify.state = failed`이고 경보
+  `backup_verify_failed`가 참이다. 다음 백업이 같은 내용을 만나면 청크가 없다고 보고 다시 올려 **스스로 낫는다**(base의 청크가
+  깨졌으면 다음 백업은 전체 읽기). 나은 뒤 다시 검증하면 `ok`가 되고 경보가 풀린다. 읽기 전용 저장소는 옮기지 않고 결과만 적는다.
+- **기록.** 백업마다 `status.verify {at, state, bad_chunks, error}`(목록 `VERIFIED` — `ok`·`failed`·`never`, 웹 "검증" 배지), 저장소
+  `last_verify`·`bad_chunks`. 저장소에 닿지 못하면 Task가 실패하고 `last_verify.error`.
+- **일정.** 예약 검증은 `reverify_days`(기본 30)보다 오래전에 검증한 백업을 고른다. `verify_new`면 새 백업이 `ready`가 되자마자
+  하나의 Task로 검증한다.
+- **풀 백업은 검증하지 않는다**(`backup verify`가 400 — 저장소로 옮긴 뒤 검증한다).
+
+### 가비지 수집(GC)과 보존
+
+```bash
+orbivisorctl backup-store gc offsite --wait
+# GC of backup store offsite done
+orbivisorctl backup-store get offsite | jq '.status.last_gc, .status.usage'
+```
+
+- **표시·쓸기.** GC(`backup-store-gc` Task)는 저장소 시계로 기준 시각 T0를 잡고, 모든 인덱스가 가리키는 청크를 표시하고, 시작 때
+  돌던 백업이 끝나기를 기다린 뒤, 짧은 쓰기 잠금 안에서 늦게 끝난 백업까지 표시하고, 표시되지 않았고 T0 − 5분보다 오래된 청크를
+  지운다. 백업과 **동시에** 돈다 — 백업의 커밋 구간과 쓸기만 서로 기다리고, 쓸기 뒤에 커밋하는 백업은 건너뛴 청크가 아직 있는지 다시
+  보고 없으면 다시 올린다. (이 규칙은 백업·GC 걸음을 무작위로 섞는 모형 시험과, CI에서 백업 다섯과 GC 셋을 함께 돌린 뒤 모든 백업의
+  검증으로 확인했다.)
+- **결과.** `last_gc`(시각, 지운 청크·바이트 `removed_chunks`·`removed_bytes`, 젊어서 남긴 청크 `kept_young`, 오류)와 `usage`(스냅샷 수,
+  청크 수, 논리 바이트, 저장 바이트 — `DEDUP` = 논리 ÷ 저장). 표시 집합은 Bloom 필터라 1% 안팎의 쓰레기가 다음 GC까지 남을 수 있다(지우면 안 되는 것을 지우는 쪽으로는
+  틀리지 않는다).
+- **기다림 한도.** 시작 때 돌던 백업을 24시간까지 기다리고, 넘으면 아무것도 지우지 않고 실패한다. 같은 저장소의 GC·검증은 차례로
+  돈다. 읽기 전용 저장소와 넘겨받힌 저장소(주인 표식이 이 클러스터가 아님 — 저장소를 `failed`, "store was taken over by cluster
+  X")에서는 돌지 않는다.
+- **보존.** 백업 작업의 보존 규칙은 VM과 **대상(풀·저장소)마다** 따로 고른다. 저장소 백업은 체인이 없으므로 조상 보호 없이 규칙대로
+  지운다(풀 백업은 지금처럼 조상 보호). 지운 백업의 공간은 다음 GC가 거둔다.
+
+### 라이브 복원
+
+```bash
+orbivisorctl backup restore web-20261123-030000 --name web-dr --pool local --live   # 곧바로 켠다
+orbivisorctl vm live-restore status web-dr
+# vm web-dr: copying 37% (14.8GiB of 40.0GiB)
+orbivisorctl backup restore web-20261123-030000 --name web-dr --pool local --live --wait   # 갈아탈 때까지 기다림
+orbivisorctl vm live-restore cancel web-dr --discard     # VM·새 디스크·게스트가 쓴 것을 버린다
+```
+
+라이브 복원은 디스크를 다 옮기기 전에 새 VM을 켠다. 디스크마다 노드 로컬 오버레이(qcow2) 아래에 백업을 NBD로 두고(저장소 백업은
+`orbivisord backup-serve` 헬퍼, Linux systemd면 `opl-bkserve-<id>` scope라 orbivisord가 다시 떠도 산다), QEMU의 `blockdev-mirror`
+(`write-blocking`)가 뒤에서 대상 풀의 새 볼륨으로 옮긴다. 게스트가 아직 옮기지 않은 블록을 읽으면 그 청크를 저장소에서 곧바로
+읽는다. 다 옮기면 대상 볼륨으로 갈아타고(`job-complete`) 오버레이·헬퍼를 걷는다 — 그 뒤 VM은 보통 VM과 같다(스냅샷·마이그레이션·
+백업·HA).
+
+- **단계**(`status.live_restore.phase`, 웹 VM 머리의 띠): `starting`(볼륨·헬퍼·오버레이·켜기) → `copying`(진행
+  `done_bytes`/`total_bytes`, 30초마다) → `pivoting` → 끝. `paused`는 백업을 읽지 못해 VM이 멈춘 것(헬퍼·저장소가 돌아오면 Task가
+  `cont`), `stopped`는 강제 정지(`vm start`가 이어 감), `failed`는 Task가 실패한 것(취소하거나 새 Task로 이음).
+- **API.** `POST /api/v1/backups/{key}/restore`에 `"live": true`(202 Task `backup-live-restore`). 보통 복원의 권한에 더해 새 VM 폴더의
+  `vm.power`가 필요하다. 웹은 복원 대화상자의 "라이브 복원(바로 켬)" 스위치. 노드는 서버가 저장소와 대상 풀에 닿는 노드로 고른다.
+- **끝날 때까지 막히는 것.** 마이그레이션·스냅샷·백업·디스크 핫플러그·볼륨 크기 바꾸기·템플릿으로 바꾸기·노드 사이 복제·`vm stop`·
+  지우기·PATCH의 디스크·노드 바꾸기는 **409** `vm_restoring`("wait for the live restore or cancel it")이다. 강제 정지와 CPU·메모리·NIC
+  핫플러그는 된다. HA 관리자는 라이브 복원 VM을 되살리지·옮기지 않는다.
+- **죽거나 끊기면.** Task는 이어 가는 Task다(시간 제한 없음, orbivisord가 다시 떠도 이어 감):
+
+  | 무엇이 | 일어나는 일 |
+  |---|---|
+  | orbivisord가 다시 뜸 | 헬퍼·QEMU·mirror는 그대로 돌고 새 orbivisord가 Task를 잇는다 |
+  | 헬퍼가 죽음 | QEMU가 NBD 요청을 붙잡고(`reconnect-delay` 300초) Task가 같은 소켓으로 헬퍼를 다시 띄운다 — 게스트는 몇 초 멈칫할 뿐 |
+  | 저장소가 끊김 | 헬퍼가 60초 다시 한 뒤 읽기 오류 → VM `paused` → 돌아오면 Task가 `cont` |
+  | QEMU가 죽음 | 같은 오버레이·헬퍼로 다시 켜고 mirror를 처음부터(재시작 정책과 관계없이) |
+  | 노드가 죽음 | 오버레이가 그 노드에 있어 HA로 되살리지 않는다. 노드가 돌아오면 이어 간다. 노드를 영영 잃으면 취소하고 다시 복원한다(그사이 게스트가 쓴 것은 잃음) |
+
+- **취소.** `vm live-restore cancel VM --discard`(API `POST /vms/{key}/live-restore/cancel {"discard": true}`, 새 VM의 `vm.delete`)는
+  VM을 끄고 VM·대상 볼륨·오버레이·헬퍼를 남김없이 지운다. `discard` 없이는 400, 라이브 복원 중이 아니면 409 `vm_not_restoring`.
+- **옛 풀 백업도** 라이브 복원한다(헬퍼 없이 QEMU가 qcow2 체인을 곧바로 읽는다 — 공유가 아닌 풀은 그 노드에서만).
+- **자리.** 오버레이는 VM 상태 디렉터리의 `lr-disk{i}.qcow2`(게스트가 쓴 블록만 — 그만큼 공간이 든다), 헬퍼 소켓·로그는
+  `{data_dir}/backup-run/`.
+
+### 옛 백업 옮기기와 저장소 사이 복사
+
+```bash
+orbivisorctl backup convert web-20261105-030000 --store local     # 옛 풀 백업(증분이면 체인째 읽음) → 새 저장소 백업 web-20261105-030000-st
+orbivisorctl backup convert --all-in-pool bk --store local         # 풀의 ready 백업을 만든 차례로 하나씩(옮긴 것은 건너뜀)
+orbivisorctl backup copy web-20261123-030000 --store offsite --wait   # 다른 저장소로(대상에 없는 청크만) → web-20261123-030000-offsite
+orbivisorctl backup-job create nightly --store local --all --at 03:00 --keep-daily 7 \
+  --copy-to offsite --copy-keep-daily 30 --copy-keep-monthly 12  # 빠른 로컬 7일 + S3 사본 30일·12달
+orbivisorctl backup-job set nightly --no-copy                      # 사본 보내기 끔(만든 사본은 남는다)
+```
+
+- **옮기기**(`backup-convert` Task)는 원본을 지우지 않는다(확인한 뒤 손으로 지운다). 새 백업의 VM·스펙·작업·레이블·만든 시각은
+  원본 그대로이고 `spec.source = {backup, kind: convert}`다. 원본 파일이 있는 노드가 저장소를 써야 하고(409 `store_not_on_node`),
+  같은 원본을 같은 저장소로 두 번은 409 `backup_exists`. 웹은 백업 표 동작 "저장소로 옮기기".
+- **복사**(`backup-copy` Task)는 원본을 노드 안 NBD로 내보내 대상 저장소에 백업처럼 쓴다: 대상에 있는 청크는 올리지 않고, 키가
+  다르면 대상 키로 다시 암호화한다. 이름 `{원본}-{저장소}`, `spec.source = {backup, kind: copy}`. 작업의 `copy_to`는 작업
+  저장소의 `ready` 백업 가운데 사본이 없는 것을 스케줄러가 줄 세우고(`[backup] max_concurrent` 안, 실패한 복사는 실행마다 한 번
+  다시), 사본은 `copy_to.keep`(없으면 작업의 보존)으로 사본 저장소 안에서 따로 고른다. 웹은 백업 표 "저장소로 복사"와 작업 폼의
+  "다른 저장소로 복사".
+
+### 저장소 백업의 원격 복제
+
+저장소 백업도 [원격 복제(DR)](#원격-복제dr)로 원격 클러스터에 보낸다. 대상 자리에 원격의 **백업 저장소 이름**을 준다
+(`orbivisorctl backup replicate B --remote dr --pool <dr의 저장소>`, 작업 `--replicate dr/<dr의 저장소>`). 보내는 쪽은 인덱스의 청크
+id를 4096개씩 물어 **원격에 없는 청크만** 보낸다 — 체인이 없어도 증분 복제가 저절로 된다. 받는 쪽은 청크를 자기 키로 풀어 id를
+맞춰 본 뒤 쓰므로 **두 저장소가 같은 키(지문)이거나 둘 다 평문**이어야 한다(dr 저장소를 prod 저장소의 복구 키로 만든다). 원격의 모든
+노드에 `backup-store`가 있어야 한다. 지우기 전파·사본 상태(`REPLICAS`)는 풀 백업과 같다.
+
+### S3로 DR — 읽기 전용 붙이기와 넘겨받기
+
+원격 복제 없이도, 주 클러스터(prod)가 쓰는 S3 저장소를 DR 클러스터(dr)가 **읽기 전용으로 붙여** 복원할 수 있다. prod를 통째로
+잃어도 S3와 키(복구 키 또는 escrow 암호 문구)만 있으면 된다.
+
+```bash
+# dr에서: 같은 버킷·접두사를 읽기 전용으로, escrow 암호 문구로 키를 연다
+orbivisorctl backup-store create prod-s3 --read-only --s3-endpoint https://s3.eu-central-1.amazonaws.com \
+  --region eu-central-1 --bucket acme-backup --prefix orbivisor --access-key-id AKIA… --secret-key-file /root/s3-secret \
+  --escrow-unlock-file /root/escrow-pass
+orbivisorctl backup-store scan prod-s3 --wait        # 저장소의 백업을 dr의 백업 리소스로(다시 하면 새것만)
+orbivisorctl backup list                             # ORIGIN이 prod/…인 백업
+orbivisorctl backup restore <백업> --name web --pool local --live   # 곧바로 켠다
+# prod를 영영 잃었으면 저장소의 주인이 된다(옛 주인의 하트비트가 24시간보다 오래됐을 때, 아니면 --force)
+orbivisorctl backup-store take-over prod-s3
+```
+
+- **주인 표식.** 저장소를 만든 클러스터가 `owner.json`(클러스터 이름·CA 지문·하트비트)을 쓴다. 다른 클러스터가 같은 자리를 쓰기
+  모드로 만들면 409 `store_owned_elsewhere`다. 한 저장소에 두 클러스터가 쓰면 GC가 서로의 진행 중 백업을 보지 못하므로 막는다.
+- **읽기 전용 저장소**에서는 복원·라이브 복원·검증(옮기지 않음)·scan이 되고, 백업·지우기·GC는 409 `store_read_only`다. 풀 안 저장소를
+  읽기 전용으로 붙이려면 디렉터리 이름을 알아야 하므로 `--store-id <id>`를 준다.
+- **scan**(`backup-store-scan` Task)은 저장소의 매니페스트마다 `ready` 백업 리소스를 만든다: 리소스 id = 저장소의 백업 id, 이름
+  `{VM 이름}-{만든 시각}`, 루트 폴더, `spec.origin`은 `owner.json`의 클러스터·CA 지문. 저장소에서 사라진 백업은 `failed`("snapshot is
+  gone from the store")로 표시만 한다.
+- **넘겨받기**(`cluster.admin`, API `POST …/actions/take-over`)는 Task 없이 곧바로 주인 표식을 이 클러스터로 바꾸고 `read_only`를 끈다.
+  옛 주인의 하트비트(GC마다 씀)가 24시간 안이면 `--force` 없이는 409 `store_owned_elsewhere`다. 옛 주인이 살아 있으면 다음 GC에서 표식이
+  바뀐 것을 보고 그 저장소를 `failed`("store was taken over by cluster X")로 멈춘다.
+- **DR 시험.** 계획 68의 GitHub `backup-s3` 작업은 두 클러스터로 이 차례(prod 암호화 저장소·escrow → dr 읽기 전용 붙이기·scan·라이브
+  복원이 원본과 같음 → 읽기 전용 백업 거절 → 넘겨받기 거절 뒤 `--force` → prod GC가 "taken over"로 멈춤)를 돈다.
+
+### 권한·할당량·경보
+
+| 일 | 필요한 것 |
+|---|---|
+| 저장소 보기(비밀 뺀 보기) | 루트 `system.read` |
+| 저장소 만들기·바꾸기·지우기, GC·검증 지금, 연결 확인, scan | 루트 `storage.config` |
+| 키 내보내기·escrow 쓰기, 넘겨받기 | 루트 `cluster.admin` |
+| 저장소로 백업 | VM `backup.create`(+ 할당량 `backup_bytes`) — 풀처럼 저장소 자체 권한은 보지 않는다 |
+| 백업 검증·옮기기·복사 | 백업 `backup.create` |
+| 복원 / 라이브 복원 | 지금 복원 그대로 / + 새 VM 폴더 `vm.power` |
+| 라이브 복원 취소 | 새 VM `vm.delete` |
+| 백업 작업의 `store`·`copy_to` | 루트 `backup.job` |
+
+- **할당량 `backup_bytes`**(`orbivisorctl folder quota set /teamA --backup-bytes 2T`, 웹 폴더 할당량 "백업(GiB)"): VM 폴더 하위 트리 VM들의
+  백업이 차지한다고 보는 바이트 — 저장소 백업은 **그 백업이 처음 쓴 바이트**(`new_bytes`), 풀 백업은 파일 크기 합. 중복 제거된 고유
+  공간과 다르고(지우면 줄어듦), 미리 알 수 없어 **만들 때 이미 넘었으면** 409 `quota_exceeded`다(진행 중인 백업 하나는 넘길 수 있다).
+  VM을 옮기면 백업 몫도 따라가고, 지운 VM의 백업은 백업 때의 폴더 몫이다.
+- **경보**(리더가 평가, 노드·VM 거르기 없음): `backup_verify_failed`(백업마다 — 다시 검증해 ok이거나 지우면 풀림),
+  `backup_store_unavailable`(저장소마다 — 온라인 노드 하나라도 닿지 않으면, 상세에 노드와 까닭).
+  `orbivisorctl alert rule create bk-verify --condition backup_verify_failed --target ops-mail`, 웹 경보 규칙의 "백업 저장소" 묶음.
+- **감사.** `backup-store create offsite (s3 https://…/acme-backup/orbivisor, encrypted 3f:9a:…)`, `key export`, `take-over … (from prod)`,
+  `backup create web → store offsite`, `backup restore … (live)`, `vm live-restore cancel … (discard)` 따위 — 비밀은 남기지 않는다.
+
+### PBS·Veeam과 견주기
+
+| | Orbivisor 백업 저장소 | Proxmox Backup Server | Veeam |
+|---|---|---|---|
+| 중복 제거 | 고정 4 MiB 청크, 클러스터의 모든 VM 사이 | 같은 방식(VM 이미지 고정 4 MiB) | 작업·저장소 단위 블록 dedup |
+| 증분 | dirty bitmap, 백업마다 완전한 인덱스(체인 없음) | 같음 | 체인(forever forward·synthetic full) |
+| 암호화 | 노드에서 AES-256-GCM, 복구 키 + 저장소 안 escrow | 클라이언트 AES-256-GCM, 키 파일 + 종이 키 | 작업 암호(+ Enterprise Manager 복구) |
+| 저장 자리 | 백업 풀(dir·NFS)·S3 호환 직접 | 데이터스토어(로컬 디스크), S3는 근래 기술 미리보기 | 저장소·SOBR 용량 계층(S3) |
+| 검증 | 예약·새 백업 검증, 깨진 청크 격리·스스로 낫기 | 예약 검증 | SureBackup(부팅 검증), 상태 검사 |
+| 라이브 복원 | 모든 풀, 이어 가는 Task(헬퍼·데몬·QEMU 죽음) | 있음 | Instant Recovery |
+| 따로 둘 서버 | 없음(클러스터 노드가 함) | PBS 서버 | 백업 서버·프록시·저장소 |
+| 없는 것 | 불변 백업, 파일 단위 복원(계획 69), 부팅 검증, 테이프 | — | — |
+
+PBS·Veeam 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
+
+### 한계와 계획 68이 아직 하지 않는 것
+
+- **불변 백업 없음**(S3 Object Lock·`chattr +i`) — prod의 관리자 권한을 빼앗기면 백업을 지울 수 있다. 사본을 다른 자격 증명의 다른
+  저장소에 두고(`copy_to`, 원격 복제), 버킷 쪽 버전 관리·수명 주기를 쓴다.
+- **키를 바꾸지 못하고**(새 키 저장소로 `backup copy`), 외부 KMS·HSM·백업마다 다른 키·복구 키 여럿이 없다. 저장소의 암호화를
+  나중에 켜거나 끄지 못한다.
+- **꺼진 VM은 늘 디스크 전체를 읽는다**(공간·전송은 새 청크만). 같은 VM을 풀과 저장소에 번갈아 백업하면 비트맵이 하나라 늘 전체
+  읽기다(저장소 공간은 늘지 않는다).
+- **fleece**: 지킴이는 1초마다 보므로 1초에 1 GiB보다 빨리 쓰는 게스트는 앞지를 수 있다 — 그래도 게스트 쓰기는 실패하지 않고 그
+  백업만 실패한다(계획 68 탐침). 상태 디렉터리 공간을 넉넉히 둔다.
+- **라이브 복원**: 오버레이가 노드 로컬이라 끝날 때까지 HA가 없고, 노드를 영영 잃으면 라이브 복원 뒤 게스트가 쓴 것을 잃는다. 첫
+  읽기는 4 MiB 청크 단위라 S3 지연만큼 느리다. 끝나기 전 막히는 동작은 위 목록.
+- **풀 백업 검증 없음**(옮긴 뒤 검증). 깨진 청크를 다른 사본에서 자동으로 고치지 않는다(다음 백업이 같은 내용을 다시 올릴 때만 낫는다).
+- **한 저장소에 한 클러스터만 쓴다**(다른 클러스터는 읽기 전용). 테이프, PBS 형식 내보내기, Azure·GCS 네이티브 API 없음.
+- **S3**: 강한 일관성 구현만, 지우기는 하나씩(`DeleteObjects` 없음), multipart 없음(인덱스는 1 GiB 안 — 128 TiB 디스크까지), 대역폭
+  제한 없음. CI는 SeaweedFS만 — AWS·Wasabi·Ceph RGW는 위 손 확인.
+- **용량**: GC는 청크 수만큼 나열하고 Bloom 필터(청크마다 약 10비트)를 메모리에 둔다. 아주 큰 저장소(청크 수억 개)의 GC 시간은 재지
+  않았다.
+- **로컬 저장소**(공유 아닌 dir 풀)는 그 노드에 묶인다. 백업 데이터를 지키려면 NFS나 S3를 쓴다.
+- 파일 단위 복원(계획 69), 부팅 검증(SureBackup), 꺼진 VM의 증분 읽기, zstd 압축, 노드 백업 대역폭 제한은 다음 계획이다.
 
 ## 원격 클러스터
 
@@ -447,14 +833,14 @@ orbivisorctl backup-job create nightly --pool bk --all --at 03:00 --keep-daily 7
 orbivisorctl backup-job set db --replicate dr/dr-bk  # 있는 작업에 켜기(대상 바꾸기도 같다)
 orbivisorctl backup-job set db --no-replicate       # 끄기(이미 보낸 사본은 남는다)
 orbivisorctl backup list
-# NAME                 VM   POOL  PHASE  CREATED               SIZE      TYPE  ORIGIN  REPLICAS
-# web-20261107-030000  web  bk    ready  2026-11-07 03:00 UTC  412.5MiB  full  -       dr:ready
+# NAME                 VM   TARGET  PHASE  CREATED               SIZE      TYPE  ORIGIN  REPLICAS  VERIFIED
+# web-20261107-030000  web  bk      ready  2026-11-07 03:00 UTC  412.5MiB  full  -       dr:ready  -
 orbivisorctl backup delete web-20261107-030000      # dr의 사본도 지운다
 
 # dr에서
 orbivisorctl backup list
-# NAME                 VM   POOL   PHASE  CREATED               SIZE      TYPE  ORIGIN         REPLICAS
-# web-20261107-030000  web  dr-bk  ready  2026-11-07 03:00 UTC  412.5MiB  full  prod/019a5b1c  -
+# NAME                 VM   TARGET  PHASE  CREATED               SIZE      TYPE  ORIGIN         REPLICAS  VERIFIED
+# web-20261107-030000  web  dr-bk   ready  2026-11-07 03:00 UTC  412.5MiB  full  prod/019a5b1c  -         -
 ```
 
 - **수동 복제.** `orbivisorctl backup replicate <백업> --remote <원격> --pool <원격의 백업 풀> [--wait]`(API `POST
@@ -560,7 +946,8 @@ orbivisorctl backup list
    복원) 한다. prod를 새로 만들었으면 옛 원본이 없어 dr의 옛 사본은 보존 규칙으로 지워지지 않으므로 dr에서 지운다.
 
 - **한계.**
-  - 백업 파일을 그대로 보낸다(전체 백업은 디스크 전체, 증분 백업은 바뀐 블록만 — 중복 제거·압축 추가 없음). 증분
+  - 풀 백업은 백업 파일을 그대로 보낸다(전체 백업은 디스크 전체, 증분 백업은 바뀐 블록만 — 중복 제거·압축 추가 없음). 저장소
+    백업은 원격 저장소에 없는 청크만 보낸다(위 [저장소 백업의 원격 복제](#저장소-백업의-원격-복제)). 증분
     체인을 처음 보내면 전체 백업부터 모두 간다. 대역폭 제한이 없어 큰 백업은 링크를 채운다(스케줄러는 노드마다 복제
     하나). 진행률이 없다(증분 체인은 원격에 있는 백업 수만).
   - 증분 복제의 건너뛰기는 prod의 사본 기록만 믿는다: 앞 백업의 기록이 `ready`면 dr에 묻지 않으므로, dr에서 (자식
