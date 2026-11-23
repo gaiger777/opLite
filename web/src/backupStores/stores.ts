@@ -162,9 +162,55 @@ const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** 서버의 escrow 암호 문구 하한(스테이지 6) */
 export const MIN_PASSPHRASE = 8;
 
-/** 복구 키 꼴(`OPK1-` + base32 묶음). 체크섬은 서버가 본다. */
+/**
+ * 복구 키 꼴(`OPK1-` + base32 55자). 서버처럼 대소문자·공백·`-`는 가리지 않는다(인쇄본에서 묶음 사이를 띄어 붙여도).
+ * 체크섬은 서버가 본다.
+ */
 export function looksLikeRecoveryKey(text: string): boolean {
-  return /^OPK1-[A-Z2-7]{4}(-[A-Z2-7]{1,4})+$/.test(text.trim().toUpperCase());
+  const key = text.trim().toUpperCase();
+  return key.startsWith("OPK1-") && /^[A-Z2-7]{55}$/.test(key.slice(5).replace(/[\s-]+/g, ""));
+}
+
+/** S3 끝점: 호스트와 포트만 있는 https URL(경로·질의·사용자 정보 없음 — 서버 `endpoint_authority`와 같다) */
+function validEndpoint(text: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    return false;
+  }
+  return (
+    url.protocol === "https:" &&
+    url.hostname !== "" &&
+    url.username === "" &&
+    url.password === "" &&
+    url.pathname === "/" &&
+    url.search === "" &&
+    url.hash === "" &&
+    !/[?#]/.test(text)
+  );
+}
+
+/** 버킷: 3-63자 소문자·숫자·`.`·`-`, 처음과 끝은 글자나 숫자, `..` 없음(서버 `valid_bucket`) */
+function validBucket(bucket: string): boolean {
+  return /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(bucket) && !bucket.includes("..");
+}
+
+/** 접두사: 512자 이하, `/`로 시작하지 않고, 빈·`.`·`..` 조각이 없다(끝 `/` 하나는 된다 — 서버 `valid_prefix`). */
+function validPrefix(prefix: string): boolean {
+  if (prefix.length > 512 || prefix.startsWith("/") || /\p{Cc}/u.test(prefix)) {
+    return false;
+  }
+  return (prefix.endsWith("/") ? prefix.slice(0, -1) : prefix)
+    .split("/")
+    .every((part) => part !== "" && part !== "." && part !== "..");
+}
+
+/** CA: PEM 인증서가 든 64 KiB 이하 글 */
+function validCaPem(pem: string): boolean {
+  return (
+    pem.includes("-----BEGIN CERTIFICATE-----") && new TextEncoder().encode(pem).length <= 64 << 10
+  );
 }
 
 /** 한 단계의 오류(칸 → 번역 키). `taken`은 있는 저장소 이름이다. */
@@ -188,14 +234,21 @@ export function checkStoreStep(
         errors.storeId = "backupStores.errors.storeId";
       }
     } else {
-      if (!/^https:\/\/[^/\s]+/.test(form.endpoint.trim())) {
+      // 서버(`S3Target::validate`)와 같은 규칙 — 만들기에서 400이 마지막 단계에 뜨지 않게
+      if (!validEndpoint(form.endpoint.trim())) {
         errors.endpoint = "backupStores.errors.endpoint";
       }
-      if (form.bucket.trim() === "") {
+      if (!validBucket(form.bucket.trim())) {
         errors.bucket = "backupStores.errors.bucket";
       }
-      if (form.region.trim() === "") {
+      if (!/^[a-z0-9-]{1,32}$/.test(form.region.trim())) {
         errors.region = "backupStores.errors.region";
+      }
+      if (form.prefix.trim() !== "" && !validPrefix(form.prefix.trim())) {
+        errors.prefix = "backupStores.errors.prefix";
+      }
+      if (form.caPem.trim() !== "" && !validCaPem(form.caPem.trim())) {
+        errors.caPem = "backupStores.errors.caPem";
       }
       if (form.accessKeyId.trim() === "") {
         errors.accessKeyId = "backupStores.errors.accessKeyId";
@@ -212,8 +265,9 @@ export function checkStoreStep(
     if (form.encryption === "escrow" && form.unlockPassphrase.length < MIN_PASSPHRASE) {
       errors.unlockPassphrase = "backupStores.errors.passphrase";
     }
-    // 읽기 전용 저장소에는 escrow를 쓰지 않는다(서버 409 `store_read_only`).
+    // 읽기 전용 저장소에는 escrow를 쓰지 않는다(서버 409 `store_read_only`) — 칸도 숨으므로 보지 않는다.
     if (
+      !form.readOnly &&
       form.escrowPassphrase !== "" &&
       (form.encryption === "generate" || form.encryption === "recovery") &&
       form.escrowPassphrase.length < MIN_PASSPHRASE

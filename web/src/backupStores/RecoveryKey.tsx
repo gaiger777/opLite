@@ -3,8 +3,8 @@ import { useId, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
-import { QrCode } from "@/accounts/TwoFactorSetup";
 import { CopyButton } from "@/components/CopyButton";
+import { QrCode } from "@/components/QrCode";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
@@ -58,6 +58,7 @@ export function RecoveryKeyView({
   const { t } = useTranslation();
   const qr = useRef<HTMLDivElement>(null);
   const titleId = useId();
+  const keyId = useId();
   return (
     <section aria-labelledby={titleId} className="flex flex-col gap-3">
       <h3 id={titleId} className="font-medium">
@@ -66,12 +67,12 @@ export function RecoveryKeyView({
       <p role="note" className="rounded-md bg-warning-soft p-3 text-sm text-warning-fg">
         {t("backupStores.key.recoveryWarning")}
       </p>
-      <p
-        aria-label={t("backupStores.key.recoveryKey")}
-        className="rounded-md bg-muted p-3 font-mono text-sm break-all"
-      >
-        {recoveryKey}
-      </p>
+      <div role="group" aria-labelledby={keyId} className="flex flex-col gap-1">
+        <span id={keyId} className="text-xs text-muted-foreground">
+          {t("backupStores.key.recoveryKey")}
+        </span>
+        <p className="rounded-md bg-muted p-3 font-mono text-sm break-all">{recoveryKey}</p>
+      </div>
       {fingerprint && (
         <p className="text-xs text-muted-foreground">
           {t("backupStores.key.fingerprintLine", { fingerprint })}

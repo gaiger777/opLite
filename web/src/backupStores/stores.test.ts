@@ -15,7 +15,7 @@ import {
 } from "@/backupStores/stores";
 import { backup, backupStore, storeBackup, vm } from "@/test/fixtures";
 
-const KEY = "OPK1-ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ23-4567-ABCD-EFGH-IJKL-MNOP-QRST-UV";
+const KEY = "OPK1-ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ23-4567-ABCD-EFGH-IJKL-MNOP-QRST-UVW";
 
 it("describes the backend in one line", () => {
   expect(backendText(backupStore("local", 1))).toBe("bk");
@@ -93,6 +93,81 @@ it("checks each wizard step like the server", () => {
   });
   // 검증을 끄면 검증 칸은 보지 않는다.
   expect(checkStoreStep({ ...form, verify: false, verifyAt: "x" }, "schedule", [])).toEqual({});
+});
+
+// 리뷰 1(M3·M4·M5): 서버(`S3Target::validate`·`from_recovery_key`)와 같은 규칙, 숨은 escrow 칸은 보지 않는다.
+it("checks S3 fields and recovery keys like the server", () => {
+  const s3 = {
+    ...emptyStoreForm("bk"),
+    name: "dr",
+    backend: "s3" as const,
+    endpoint: "https://s3.example.com:9000/",
+    bucket: "my.bk-1",
+    accessKeyId: "AK",
+    secretKey: "SK",
+  };
+  expect(checkStoreStep(s3, "backend", [])).toEqual({});
+  expect(
+    checkStoreStep(
+      {
+        ...s3,
+        endpoint: "https://s3.example.com/x",
+        region: "US_EAST",
+        bucket: "a..b",
+        prefix: "/orbi",
+        caPem: "not a cert",
+      },
+      "backend",
+      [],
+    ),
+  ).toEqual({
+    endpoint: "backupStores.errors.endpoint",
+    region: "backupStores.errors.region",
+    bucket: "backupStores.errors.bucket",
+    prefix: "backupStores.errors.prefix",
+    caPem: "backupStores.errors.caPem",
+  });
+  for (const endpoint of ["https://u:p@h", "https://h?x=1", "https://h#", "ftp://h"]) {
+    expect(checkStoreStep({ ...s3, endpoint }, "backend", [])).toHaveProperty("endpoint");
+  }
+  for (const bucket of ["ab", "-ab", "ab-", "Ab1", "a".repeat(64)]) {
+    expect(checkStoreStep({ ...s3, bucket }, "backend", [])).toHaveProperty("bucket");
+  }
+  for (const prefix of ["a//b", "a/./b", "../a", "a/.."]) {
+    expect(checkStoreStep({ ...s3, prefix }, "backend", [])).toHaveProperty("prefix");
+  }
+  expect(checkStoreStep({ ...s3, prefix: "orbi/prod/" }, "backend", [])).toEqual({});
+  const pem = "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----";
+  expect(checkStoreStep({ ...s3, caPem: pem }, "backend", [])).toEqual({});
+  expect(
+    checkStoreStep({ ...s3, caPem: pem + "A".repeat(64 << 10) }, "backend", []),
+  ).toHaveProperty("caPem");
+  expect(checkStoreStep({ ...s3, region: "a".repeat(33) }, "backend", [])).toHaveProperty("region");
+
+  // 복구 키: 인쇄본에서 띄어 쓰거나 `-` 없이, 소문자로 붙여도 된다. 길이가 틀리면 안 된다.
+  const groups = KEY.slice(5);
+  expect(looksLikeRecoveryKey(`OPK1-${groups.replaceAll("-", " ")}`)).toBe(true);
+  expect(looksLikeRecoveryKey(`opk1-${groups.replaceAll("-", "")}`)).toBe(true);
+  expect(looksLikeRecoveryKey(`OPK1-${groups.replaceAll("-", "\n")}\n`)).toBe(true);
+  expect(looksLikeRecoveryKey(KEY.slice(0, -1))).toBe(false);
+  expect(looksLikeRecoveryKey(`${KEY}A`)).toBe(false);
+  expect(looksLikeRecoveryKey(KEY.replace("OPK1-", "OPK2-"))).toBe(false);
+  expect(looksLikeRecoveryKey(KEY.replace("ABCD", "AB1D"))).toBe(false);
+
+  // 읽기 전용이면 escrow 칸이 숨으므로 남은 짧은 암호 문구로 막지 않는다.
+  expect(
+    checkStoreStep(
+      {
+        ...s3,
+        readOnly: true,
+        encryption: "recovery",
+        recoveryKey: KEY,
+        escrowPassphrase: "short",
+      },
+      "encryption",
+      [],
+    ),
+  ).toEqual({});
 });
 
 it("builds the create body with only the fields in use", () => {

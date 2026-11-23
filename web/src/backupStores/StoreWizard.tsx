@@ -209,26 +209,29 @@ export function StoreWizard({ taken, onClose }: { taken: string[]; onClose(): vo
     }
     setBusy(true);
     setError(null);
+    let result;
     try {
-      const result = await call(api.POST("/backup-stores", { body: createBodyOf(chosen) }));
-      trackTask(result.task, t("tasks.op.backup-store-init", { target: chosen.name }));
-      await refreshStores(queryClient);
-      if (result.recovery_key) {
-        setCreated({
-          name: chosen.name,
-          fingerprint: result.store.spec.encryption?.fingerprint,
-          key: result.recovery_key,
-        });
-        setStep("key");
-      } else {
-        toast.success(t("backupStores.created", { name: chosen.name }));
-        onClose();
-      }
+      result = await call(api.POST("/backup-stores", { body: createBodyOf(chosen) }));
     } catch (err) {
       setError(errorMessage(t, err));
-    } finally {
       setBusy(false);
+      return;
     }
+    // 저장소는 이미 있다 — 한 번만 오는 복구 키를 먼저 보이고(설계 §9.4), Task 따라가기·목록 다시 읽기는 그 뒤에 한다.
+    setBusy(false);
+    if (result.recovery_key) {
+      setCreated({
+        name: chosen.name,
+        fingerprint: result.store.spec.encryption?.fingerprint,
+        key: result.recovery_key,
+      });
+      setStep("key");
+    } else {
+      toast.success(t("backupStores.created", { name: chosen.name }));
+      onClose();
+    }
+    trackTask(result.task, t("tasks.op.backup-store-init", { target: chosen.name }));
+    void refreshStores(queryClient);
   }
 
   function close() {
@@ -374,7 +377,9 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
         <Input
           id={id}
           type={extra.type}
-          autoComplete="off"
+          // 비밀번호 칸의 `off`는 Chromium이 무시하고 로그인 암호를 채운다 — 새 비밀로 두고, 나머지 칸은 암호 관리자가 보지 않게.
+          autoComplete={extra.type === "password" ? "new-password" : "off"}
+          {...(extra.type !== "password" && { "data-1p-ignore": "", "data-lpignore": "true" })}
           placeholder={extra.placeholder}
           value={form[key] as string}
           onChange={(e) => onChange({ [key]: e.target.value })}
@@ -399,7 +404,13 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
       </Field>
       {form.backend === "pool" ? (
         pools.length === 0 ? (
-          <p className="text-sm text-muted-foreground">{t("backups.noPools")}</p>
+          // 고를 풀이 없으면 "다음"이 막힌 까닭을 여기서 보인다.
+          <p
+            role={errors.pool ? "alert" : undefined}
+            className={`text-sm ${errors.pool ? "text-destructive" : "text-muted-foreground"}`}
+          >
+            {t("backups.noPools")}
+          </p>
         ) : (
           <Field
             id="store-pool"
@@ -448,7 +459,12 @@ function BackendStep({ form, pools, errors, onChange }: StepProps & { pools: str
             type: "password",
             hint: t("backupStores.secretHint"),
           })}
-          <Field id="store-ca" label={t("backupStores.caPem")} hint={t("backupStores.caHint")}>
+          <Field
+            id="store-ca"
+            label={t("backupStores.caPem")}
+            error={errors.caPem}
+            hint={t("backupStores.caHint")}
+          >
             {(a11y) => (
               <textarea
                 id="store-ca"
@@ -556,7 +572,7 @@ function EncryptionStep({ form, errors, onChange }: StepProps) {
             <Input
               id="store-unlock"
               type="password"
-              autoComplete="off"
+              autoComplete="new-password"
               value={form.unlockPassphrase}
               onChange={(e) => onChange({ unlockPassphrase: e.target.value })}
               {...a11y}

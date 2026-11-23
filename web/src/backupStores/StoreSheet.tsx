@@ -186,9 +186,9 @@ export function StoreSheet({ store, onClose }: { store: BackupStore; onClose(): 
             </Row>
           </dl>
 
-          {write && (
+          {(write || (readOnly && admin)) && (
             <div className="flex flex-wrap gap-2">
-              {!readOnly && (
+              {write && !readOnly && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -198,26 +198,30 @@ export function StoreSheet({ store, onClose }: { store: BackupStore; onClose(): 
                   {t("backupStores.gcNow")}
                 </Button>
               )}
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={!ready || busy !== null}
-                onClick={() => void act("verify")}
-              >
-                {t("backupStores.verifyNow")}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={busy !== null}
-                onClick={() => void runCheck()}
-              >
-                {t("backupStores.check")}
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
-                {t("backupStores.editSettings")}
-              </Button>
-              {readOnly && (
+              {write && (
+                <>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!ready || busy !== null}
+                    onClick={() => void act("verify")}
+                  >
+                    {t("backupStores.verifyNow")}
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={busy !== null}
+                    onClick={() => void runCheck()}
+                  >
+                    {t("backupStores.check")}
+                  </Button>
+                  <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+                    {t("backupStores.editSettings")}
+                  </Button>
+                </>
+              )}
+              {write && readOnly && (
                 <Button
                   variant="outline"
                   size="sm"
@@ -227,8 +231,14 @@ export function StoreSheet({ store, onClose }: { store: BackupStore; onClose(): 
                   {t("backupStores.scan")}
                 </Button>
               )}
+              {/* 넘겨받기는 `cluster.admin`만 든다(`storage.config` 없이도). 준비되지 않은 저장소는 서버가 409다. */}
               {readOnly && admin && (
-                <Button variant="outline" size="sm" onClick={() => setTakingOver(true)}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!ready}
+                  onClick={() => setTakingOver(true)}
+                >
                   {t("backupStores.takeOver")}
                 </Button>
               )}
@@ -411,7 +421,13 @@ function KeyCard({ store, admin }: { store: BackupStore; admin: boolean }) {
             {admin ? (
               <div className="flex flex-wrap gap-2">
                 {!store.spec.read_only && (
-                  <Button variant="outline" size="sm" onClick={() => setEscrowing(true)}>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    // 서버가 저장소를 열어 쓴다 — 준비되지 않았으면 409 `store_not_ready`
+                    disabled={store.status.phase !== "ready"}
+                    onClick={() => setEscrowing(true)}
+                  >
                     {t("backupStores.key.escrow")}
                   </Button>
                 )}
@@ -612,6 +628,8 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
               <Input
                 id="settings-access-key"
                 autoComplete="off"
+                data-1p-ignore=""
+                data-lpignore="true"
                 value={form.accessKeyId}
                 onChange={(e) => change({ accessKeyId: e.target.value })}
                 {...a11y}
@@ -627,7 +645,7 @@ function SettingsDialog({ store, onClose }: { store: BackupStore; onClose(): voi
               <Input
                 id="settings-secret-key"
                 type="password"
-                autoComplete="off"
+                autoComplete="new-password"
                 value={form.secretKey}
                 onChange={(e) => change({ secretKey: e.target.value })}
                 {...a11y}

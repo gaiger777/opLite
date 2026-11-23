@@ -10,7 +10,7 @@ import { BackupsPage } from "@/backups/BackupsPage";
 import type { BackupStore } from "@/backupStores/stores";
 import { resetTasks } from "@/tasks/tasks";
 import { expectNoAxeViolations } from "@/test/axe";
-import { backup, backupStore, NODE, pool, storeBackup, task, vm } from "@/test/fixtures";
+import { backup, backupJob, backupStore, NODE, pool, storeBackup, task, vm } from "@/test/fixtures";
 import { mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
@@ -276,4 +276,81 @@ it("makes a job that backs up to a store and copies to another store", async () 
     }),
   );
   expect((body as { spec: object }).spec).not.toHaveProperty("pool");
+});
+
+// 리뷰 1(M1·M10·M12): 풀과 같은 이름의 저장소도 옮길 곳이고, 크기 정렬은 저장소 백업의 새 데이터로, 행에는 링크가 가는 id가 있다.
+it("moves into a store named like the pool, sorts store backups by new data and anchors rows", async () => {
+  const user = userEvent.setup();
+  const big = storeBackup("web-s9", web, 9, "st", {
+    status: { store_stats: { ...inStore.status.store_stats!, new_bytes: 2 * 1024 ** 3 } },
+  });
+  mockLists({ vm: [web], backup: [big, inPool] });
+  // 풀 `bk`와 저장소 `bk`는 이름 공간이 다르다.
+  stores([backupStore("bk", 5)]);
+  renderPage(<BackupsPage />, { url: "/?sort=size" });
+  const table = await screen.findByRole("table", { name: "Backups" });
+  await within(table).findByText("web-s9");
+  // 풀 백업 1.5 GiB < 저장소 백업의 새 데이터 2 GiB(예전에는 저장소 백업이 0으로 맨 앞이었다)
+  expect(
+    within(table)
+      .getAllByRole("row")
+      .slice(1)
+      .map((r) => within(r).getAllByRole("cell")[0]!.textContent),
+  ).toEqual(["web-1", "web-s9"]);
+  expect(row("web-1")).toHaveAttribute("id", `backup-${inPool.id}`);
+  await user.click(screen.getByRole("button", { name: "Move web-1 to a backup store" }));
+  const dialog = await screen.findByRole("dialog", { name: "Move web-1 to a backup store" });
+  expect(
+    within(within(dialog).getByLabelText("Backup store"))
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["bk"]);
+});
+
+// 리뷰 1(M9): 백업 풀이 없고 저장소 목록이 대화상자를 연 뒤에 와도 새 작업은 첫 저장소로 간다.
+it("defaults a new job to the first store when the stores arrive after the dialog opens", async () => {
+  const user = userEvent.setup();
+  mockLists({ "storage-pool": [] });
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  server.use(
+    http.get(apiUrl("/backup-stores"), async () => {
+      await gate;
+      return HttpResponse.json({ revision: 1, items: [ST] });
+    }),
+  );
+  let body: unknown;
+  server.use(
+    http.post(apiUrl("/backup-jobs"), async ({ request }) => {
+      body = await request.json();
+      return HttpResponse.json({}, { status: 201 });
+    }),
+  );
+  renderPage(<BackupJobsPage />);
+  await user.click(await screen.findByRole("button", { name: "Create" }));
+  const dialog = await screen.findByRole("dialog", { name: "Create backup job" });
+  release();
+  expect(await within(dialog).findByLabelText("Target")).toHaveValue("store:st");
+  await user.type(within(dialog).getByLabelText("Name"), "late");
+  await user.type(within(dialog).getByLabelText("Time (UTC)"), "03:00");
+  await user.click(within(dialog).getByRole("button", { name: "Create" }));
+  await waitFor(() => expect(body).toMatchObject({ name: "late", spec: { store: "st" } }));
+});
+
+// 리뷰 1(M8): 복사 대상이 이제 받을 수 없는 저장소여도 "복사 안 함"이 아니라 그 저장소로 보인다.
+it("keeps showing a job's copy target that can no longer take backups", async () => {
+  const RO = backupStore("ro", 6, { spec: { read_only: true } });
+  const job = backupJob("tiered", 1, {
+    spec: {
+      pool: undefined,
+      store: "st",
+      copy_to: { store: "ro", keep: { last: 0, daily: 90, weekly: 0, monthly: 0 } },
+    },
+  });
+  mockLists({ "storage-pool": [pool("bk", { backups: true })], "backup-job": [job] });
+  stores([ST, RO]);
+  renderPage(<BackupJobsPage />);
+  await userEvent.click(await screen.findByRole("button", { name: "Edit tiered" }));
+  const dialog = await screen.findByRole("dialog", { name: "Edit tiered" });
+  await waitFor(() => expect(within(dialog).getByLabelText("Copy store")).toHaveValue("ro"));
 });

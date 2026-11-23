@@ -140,6 +140,11 @@ export function BackupTable({
   const writable = (stores.data ?? []).filter(
     (s) => s.status.phase === "ready" && !s.spec.read_only,
   );
+  // 옮기거나 복사할 곳: 저장소 백업이면 그 저장소를 뺀다(풀과 저장소는 이름 공간이 달라 풀 백업은 다 된다).
+  const targetsFor = (backup: Backup) => {
+    const target = backupTarget(backup);
+    return writable.filter((s) => target.kind !== "store" || s.name !== target.name);
+  };
   // 닫히는 동안에도 대상을 남겨 두어 대화상자의 글이 바뀌지 않게 한다.
   const [deleting, setDeleting] = useState<Backup | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
@@ -302,7 +307,8 @@ export function BackupTable({
     {
       id: "size",
       header: t("backups.size"),
-      value: (backup) => storedBytes(backup) ?? -1,
+      // 저장소 백업은 보이는 "새 데이터"로 정렬한다.
+      value: (backup) => backup.status.store_stats?.new_bytes ?? storedBytes(backup) ?? -1,
       priority: 2,
       cell: (backup) => {
         const { size, chain, stats } = rowInfo(backup);
@@ -447,7 +453,7 @@ export function BackupTable({
             actions: true,
             cell: (backup) => {
               const { phase, target } = rowInfo(backup);
-              const others = writable.filter((s) => s.name !== target.name);
+              const others = targetsFor(backup);
               return (
                 <>
                   {restore && (
@@ -568,7 +574,7 @@ export function BackupTable({
         <StoreTargetDialog
           backup={moving.backup}
           kind={moving.kind}
-          stores={writable.filter((s) => s.name !== backupTarget(moving.backup).name)}
+          stores={targetsFor(moving.backup)}
           returnFocus={opener}
           onClose={() => setMoving(null)}
         />

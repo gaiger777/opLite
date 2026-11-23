@@ -7,8 +7,10 @@ const poolPath = process.env.OPL_POOL_PATH ?? "";
 const image = process.env.OPL_IMAGE ?? "";
 /** 백업 저장소 줄기(계획 68)의 백업 풀 디렉터리. 저장소를 지워도 데이터가 남으므로 위 풀과 따로 둔다. */
 const backupPoolPath = process.env.OPL_BACKUP_POOL_PATH ?? "";
-if (!password || !poolPath || !image) {
-  throw new Error("Set OPL_PASSWORD, OPL_POOL_PATH and OPL_IMAGE (the Rust test sets them).");
+if (!password || !poolPath || !image || !backupPoolPath) {
+  throw new Error(
+    "Set OPL_PASSWORD, OPL_POOL_PATH, OPL_IMAGE and OPL_BACKUP_POOL_PATH (the Rust test sets them).",
+  );
 }
 
 async function signIn(page: Page) {

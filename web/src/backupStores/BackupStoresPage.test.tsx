@@ -18,7 +18,7 @@ afterEach(() => {
 });
 
 const FP = "ab:cd:ef:01:23:45:67:89:ab:cd:ef:01:23:45:67:89";
-const KEY = "OPK1-ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ23-4567-ABCD-EFGH-IJKL-MNOP-QRST-UV";
+const KEY = "OPK1-ABCD-EFGH-IJKL-MNOP-QRST-UVWX-YZ23-4567-ABCD-EFGH-IJKL-MNOP-QRST-UVW";
 
 const LOCAL = backupStore("local", 1, {
   status: {
@@ -151,6 +151,9 @@ it("creates an encrypted store and does not close until the recovery key is stor
   expect(
     within(wizard).getByRole("img", { name: "Recovery key of st as a QR code" }),
   ).toBeVisible();
+  // 리뷰 1(M11): 키 글은 이름 붙은 묶음이다(`<p aria-label>`은 axe `aria-prohibited-attr`).
+  expect(within(wizard).getByRole("group", { name: "Recovery key" })).toHaveTextContent(KEY);
+  await expectNoAxeViolations(container, { disable: ["region"] });
   expect(body).toEqual({
     name: "st",
     spec: {
@@ -194,10 +197,18 @@ it("asks for the S3 endpoint, bucket and credentials and imports a recovery key"
   await user.type(within(wizard).getByLabelText("Name"), "dr");
   await user.selectOptions(within(wizard).getByLabelText("Backend"), "s3");
   await user.click(within(wizard).getByRole("button", { name: "Next" }));
-  expect(within(wizard).getByText("Enter an https:// endpoint.")).toBeVisible();
-  expect(within(wizard).getByText("Enter the bucket.")).toBeVisible();
+  expect(
+    within(wizard).getByText("Enter an https:// URL with only a host and an optional port."),
+  ).toBeVisible();
+  expect(within(wizard).getByText(/^Enter a bucket of 3-63/)).toBeVisible();
   await user.type(within(wizard).getByLabelText("Endpoint"), "https://s3.example.com");
-  await user.type(within(wizard).getByLabelText("Bucket"), "bk");
+  await user.type(within(wizard).getByLabelText("Bucket"), "backups");
+  // 리뷰 1(M7): 암호 관리자가 로그인 암호를 S3 자격 증명 칸에 채우지 않게
+  expect(within(wizard).getByLabelText("Access key ID")).toHaveAttribute("data-lpignore", "true");
+  expect(within(wizard).getByLabelText("Secret access key")).toHaveAttribute(
+    "autocomplete",
+    "new-password",
+  );
   await user.type(within(wizard).getByLabelText("Access key ID"), "AK");
   await user.type(within(wizard).getByLabelText("Secret access key"), "SK");
   await user.click(within(wizard).getByLabelText("Attach read-only"));
@@ -224,7 +235,7 @@ it("asks for the S3 endpoint, bucket and credentials and imports a recovery key"
         s3: {
           endpoint: "https://s3.example.com",
           region: "us-east-1",
-          bucket: "bk",
+          bucket: "backups",
           access_key_id: "AK",
           secret_access_key: "SK",
         },
@@ -254,7 +265,7 @@ it("opens the drawer with schedules, node reachability and the key card", async 
       return HttpResponse.json({ recovery_key: KEY });
     }),
   );
-  renderPage(<BackupStoresPage />);
+  const { container } = renderPage(<BackupStoresPage />);
   await user.click(await screen.findByRole("button", { name: "Open s3-dr" }));
   const sheet = await screen.findByRole("dialog", { name: "Backup store s3-dr" });
   expect(sheet).toHaveTextContent("Owner clusterprod");
@@ -278,6 +289,7 @@ it("opens the drawer with schedules, node reachability and the key card", async 
   const shown = await screen.findByRole("dialog", { name: "Recovery key of s3-dr" });
   expect(within(shown).getByLabelText("Recovery key")).toHaveTextContent(KEY);
   expect(exported).toBe(true);
+  await expectNoAxeViolations(container, { disable: ["region"] });
 });
 
 it("runs GC and verification now and takes over a read-only store", async () => {
@@ -334,4 +346,54 @@ it("hides store changes and the key actions from operators", async () => {
   expect(sheet).toHaveTextContent("Only cluster administrators can show the recovery key");
   expect(screen.queryByRole("button", { name: "Create a backup store" })).toBeNull();
   expect(screen.queryByRole("button", { name: "Delete local" })).toBeNull();
+});
+
+// 리뷰 1(M3): 백업 풀이 없으면 "다음"이 막힌 까닭을 보인다.
+it("explains why Next does nothing when no pool stores backups", async () => {
+  const user = userEvent.setup();
+  mockLists({ node: [NODE], "storage-pool": [pool("vmdisks")] });
+  renderPage(<BackupStoresPage />);
+  await user.click(await screen.findByRole("button", { name: "Create a backup store" }));
+  const wizard = await screen.findByRole("dialog", { name: "Create a backup store" });
+  await user.type(within(wizard).getByLabelText("Name"), "st");
+  await user.click(within(wizard).getByRole("button", { name: "Next" }));
+  expect(within(wizard).getByRole("alert")).toHaveTextContent(/^No storage pool stores backups/);
+  expect(within(wizard).getByRole("listitem", { current: "step" })).toHaveTextContent("1. Backend");
+});
+
+// 리뷰 1(M2): 넘겨받기는 `cluster.admin`만으로 보이고, escrow·넘겨받기는 준비된 저장소에서만 된다.
+it("offers take-over to cluster admins without storage.config and only for a ready store", async () => {
+  const user = userEvent.setup();
+  mockLists({ node: [NODE], "storage-pool": [pool("bk", { backups: true })] });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read", "cluster.admin"],
+        root_contents: [],
+        folders: {},
+        contents: {},
+        objects: [],
+      }),
+    ),
+  );
+  const starting = backupStore("starting", 7, {
+    spec: { encryption: { fingerprint: FP } },
+    status: { phase: "initializing" },
+  });
+  stores([DR, starting]);
+  renderPage(<BackupStoresPage />);
+  await user.click(await screen.findByRole("button", { name: "Open s3-dr" }));
+  let sheet = await screen.findByRole("dialog", { name: "Backup store s3-dr" });
+  await waitFor(() =>
+    expect(within(sheet).queryByRole("button", { name: "Verify now" })).toBeNull(),
+  );
+  // DR은 실패한 저장소다(서버 409 `store_not_ready`).
+  expect(within(sheet).getByRole("button", { name: "Take over" })).toBeDisabled();
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  await user.click(screen.getByRole("button", { name: "Open starting" }));
+  sheet = await screen.findByRole("dialog", { name: "Backup store starting" });
+  expect(within(sheet).getByRole("button", { name: "Escrow in the store" })).toBeDisabled();
+  expect(within(sheet).getByRole("button", { name: "Show the recovery key" })).toBeEnabled();
 });

@@ -309,9 +309,18 @@ function JobDialog({
   if (jobPool && !pools.includes(jobPool)) {
     pools.unshift(jobPool);
   }
-  const [form, setForm] = useState<JobForm>(() =>
+  // 복사 대상은 이제 받을 수 없어도(읽기 전용·초기화 중) 고른 값으로 보인다 — "복사 안 함"으로 보이지 않게.
+  const jobCopy = job?.spec.copy_to?.store;
+  const copyStores = jobCopy && !stores.includes(jobCopy) ? [...stores, jobCopy] : stores;
+  const [picked, setForm] = useState<JobForm>(() =>
     job ? formOf(job) : emptyForm(pools[0] ?? "", stores[0] ?? ""),
   );
+  // 새 작업에서 아직 대상을 고르지 않았으면 지금 목록의 첫 대상(풀·저장소 목록이 대화상자를 연 뒤에 와도)
+  const fresh = emptyForm(pools[0] ?? "", stores[0] ?? "");
+  const form =
+    !job && picked.pool === "" && picked.store === ""
+      ? { ...picked, targetKind: fresh.targetKind, pool: fresh.pool, store: fresh.store }
+      : picked;
   const [errors, setErrors] = useState<Record<string, string>>({});
   const change = (part: Partial<JobForm>) => setForm((f) => ({ ...f, ...part }));
   const unchanged = job !== null && Object.keys(patchOf(job, specOf(form))).length === 0;
@@ -545,7 +554,7 @@ function JobDialog({
           />
         )}
       </Field>
-      {form.targetKind === "store" && stores.some((s) => s !== form.store) && (
+      {form.targetKind === "store" && copyStores.some((s) => s !== form.store) && (
         <fieldset className="flex flex-col gap-1.5">
           <legend className="mb-1.5 text-sm font-medium">{t("backupJobs.copyTo")}</legend>
           <Field
@@ -563,7 +572,7 @@ function JobDialog({
                 {...a11y}
               >
                 <NativeSelectOption value="">{t("backupJobs.noCopy")}</NativeSelectOption>
-                {stores
+                {copyStores
                   .filter((s) => s !== form.store)
                   .map((s) => (
                     <NativeSelectOption key={s} value={s}>
