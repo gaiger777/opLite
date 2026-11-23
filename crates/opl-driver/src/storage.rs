@@ -1806,8 +1806,21 @@ impl Storage for DirStorage {
                 "volume {id} has snapshots; delete them before flattening it"
             )));
         }
-        self.qemu_img(&["rebase", "-q", "-f", "qcow2", "-b", "", path_str(&path)?])
-            .await?;
+        // `-t writethrough`: 기본(writeback)은 백킹을 끊는 헤더가 복사한 클러스터의 L2 표보다 먼저 디스크에 닿아,
+        // 도중에 죽으면(취소의 SIGKILL, opld 강제 종료) 백킹도 데이터도 없는 이미지가 남는다(svc01 Rocky에서 재현).
+        // writethrough는 쓰기마다 내려 써서 헤더가 맨 끝에 닿는다 — 끊겨도 옛 사슬이 그대로다.
+        self.qemu_img(&[
+            "rebase",
+            "-q",
+            "-t",
+            "writethrough",
+            "-f",
+            "qcow2",
+            "-b",
+            "",
+            path_str(&path)?,
+        ])
+        .await?;
         Ok(())
     }
 }
