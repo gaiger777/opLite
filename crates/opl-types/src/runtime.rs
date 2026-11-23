@@ -199,6 +199,25 @@ pub struct RbdTarget {
     pub conf: Option<String>,
 }
 
+/// 라이브 복원(계획 68 §11.2) 중인 디스크 하나의 배선: 게스트는 오버레이(`disk{i}-lr`, 게스트가 쓴 블록만)를 보고, 오버레이의
+/// backing(`disk{i}-lrsrc`)은 백업이다. 대상 볼륨(`disk{i}`)은 장치에 붙지 않고 mirror가 채운 뒤 갈아탄다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LiveRestoreDisk {
+    pub source: LiveRestoreSource,
+    /// 오버레이 qcow2(헤더에 backing 없음 — backing은 명령줄에서만)
+    pub overlay: PathBuf,
+}
+
+/// 라이브 복원이 읽는 백업
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LiveRestoreSource {
+    /// 저장소 백업: `backup-serve` 헬퍼의 유닉스 소켓 NBD 내보내기(헬퍼가 죽으면 QEMU가 다시 붙는다)
+    Nbd { socket: PathBuf, export: String },
+    /// 옛 풀 백업(§11.5): qcow2 파일 체인(자식부터, 마지막이 전체 백업). backing은 헤더를 따르지 않고 명시한다.
+    Qcow2 { chain: Vec<PathBuf> },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]

@@ -54,6 +54,9 @@ pub enum DriverError {
     /// 저장소 백업의 읽기(플리싱·NBD 내보내기)를 열거나 지키지 못했다(계획 68).
     #[error("backup failed: {0}")]
     Backup(String),
+    /// 라이브 복원(계획 68 §11)의 배선·mirror·갈아타기를 하지 못했다.
+    #[error("live restore failed: {0}")]
+    LiveRestore(String),
     /// VXLAN 네트워크 몇 개를 맞추지 못했다. 내용은 네트워크(VNI)마다의 오류다. 나머지는 맞췄다.
     #[error("VXLAN overlay sync failed: {0}")]
     Overlay(String),
@@ -105,6 +108,7 @@ impl DriverError {
             | DriverError::Migration(_)
             | DriverError::Replication(_)
             | DriverError::Backup(_)
+            | DriverError::LiveRestore(_)
             | DriverError::CpuProbe(_)
             | DriverError::GuestAgent(_)
             | DriverError::Overlay(_) => false,

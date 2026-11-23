@@ -93,6 +93,101 @@ async fn never_starts_a_template() {
     assert!(env.pid(vm.id).await.is_some());
 }
 
+/// 라이브 복원(계획 68 §11.3) 중인 VM은 Task가 배선을 두고 단계를 넘길 때까지 켜지 않고, 그 뒤에는 배선으로 켠다.
+/// 취소 요청이면 다시 켜지 않는다. 라이브 복원이 끝났는데 배선이 남았으면 치우고 보통으로 켠다. reconciler는 라이브 복원
+/// 상태를 덮어쓰지 않는다.
+#[tokio::test]
+async fn live_restore_vms_start_only_with_their_wiring() {
+    use opl_types::backup_store::{LiveRestore, LiveRestorePhase};
+    use opl_types::runtime::{LiveRestoreDisk, LiveRestoreSource};
+    let env = Env::start().await;
+    let mut v = vm("lr", env.node);
+    let lr = LiveRestore {
+        backup: Uuid::now_v7(),
+        task: Uuid::now_v7(),
+        phase: LiveRestorePhase::Starting,
+        done_bytes: 0,
+        total_bytes: 0,
+        started_at: 1,
+        error: None,
+        cancel: false,
+    };
+    v.status.live_restore = Some(lr.clone());
+    env.create(&v).await;
+    let got = env
+        .wait(v.id, "held", |v| {
+            v.status.last_error.as_deref() == Some(opl_reconciler::LIVE_RESTORE_NOT_STARTED)
+        })
+        .await;
+    assert_eq!(got.status.phase, VmPhase::Starting);
+    assert_eq!(got.status.live_restore, Some(lr.clone()));
+    assert_eq!(env.pid(v.id).await, None);
+
+    // 단계를 넘겼어도 배선이 없으면 켜지 않는다.
+    let set_lr = |lr: Option<LiveRestore>| {
+        let cluster = env.cluster.clone();
+        async move {
+            let cur = cluster.get::<VmSpec>(v.id).unwrap().unwrap();
+            let mut st = cur.status.clone();
+            st.live_restore = lr;
+            cluster
+                .update_status_checked::<VmSpec>(v.id, cur.revision, &st)
+                .await
+                .unwrap();
+        }
+    };
+    let copying = LiveRestore {
+        phase: LiveRestorePhase::Copying,
+        ..lr.clone()
+    };
+    set_lr(Some(copying.clone())).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(env.pid(v.id).await, None);
+    let wiring = [LiveRestoreDisk {
+        source: LiveRestoreSource::Nbd {
+            socket: "/tmp/x.sock".into(),
+            export: "disk0".into(),
+        },
+        overlay: "/tmp/o.qcow2".into(),
+    }];
+    env.hv.set_live_restore(v.id, Some(&wiring)).await.unwrap();
+    set_lr(Some(LiveRestore {
+        error: Some("x".into()),
+        ..copying.clone()
+    }))
+    .await;
+    let got = env.wait(v.id, "running", running).await;
+    assert_eq!(env.hv.live_launches(v.id), 1);
+    assert_eq!(got.status.live_restore.unwrap().error.as_deref(), Some("x"));
+
+    // QEMU가 죽으면 재시작 정책(`never`)과 관계없이 같은 배선으로 다시 켠다.
+    let pid = env.pid(v.id).await;
+    env.hv.crash(v.id);
+    env.wait(v.id, "restarted", |v| running(v) && v.status.pid != pid)
+        .await;
+    assert_eq!(env.hv.live_launches(v.id), 2);
+    assert_eq!(env.get(v.id).spec.power, PowerState::Running);
+
+    // 취소 요청이면 꺼진 뒤 다시 켜지 않는다.
+    set_lr(Some(LiveRestore {
+        cancel: true,
+        ..copying.clone()
+    }))
+    .await;
+    env.hv.crash(v.id);
+    env.wait(v.id, "held after cancel", |v| {
+        v.status.last_error.as_deref() == Some(opl_reconciler::LIVE_RESTORE_NOT_STARTED)
+    })
+    .await;
+    assert_eq!(env.pid(v.id).await, None);
+
+    // 끝났는데(상태 없음) 배선이 남았으면 치우고 보통으로 켠다.
+    set_lr(None).await;
+    env.wait(v.id, "running normally", running).await;
+    assert!(!env.hv.live_restore_wired(v.id));
+    assert_eq!(env.hv.live_launches(v.id), 2);
+}
+
 #[tokio::test]
 async fn ignores_vms_not_assigned_to_this_node() {
     let env = Env::start().await;

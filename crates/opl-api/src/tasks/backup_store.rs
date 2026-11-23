@@ -75,7 +75,7 @@ fn check_writable(store: &BackupStore) -> Result<(), String> {
 }
 
 /// 이 노드의 유닉스 소켓 경로(`{backup_run_dir}/{tag}-{id}.sock` — 경로 길이 한도 안)
-fn socket_path(ctx: &Ctx, tag: &str, id: Uuid) -> PathBuf {
+pub(super) fn socket_path(ctx: &Ctx, tag: &str, id: Uuid) -> PathBuf {
     ctx.config
         .backup_run_dir
         .join(format!("{tag}-{}.sock", id.simple()))
@@ -1043,10 +1043,17 @@ pub(super) async fn delete(ctx: &Ctx, backup: Backup) -> Result<Option<String>, 
 // ---- 복원(§8.6) ----
 
 /// 이 노드 안에서 저장소 백업을 유닉스 소켓 NBD로 내보내는 서버(`backup-serve` 헬퍼와 같은 몸통). drop되면 멈춘다.
-struct Serving {
+pub(super) struct Serving {
     socket: PathBuf,
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     task: tokio::task::JoinHandle<()>,
+}
+
+impl Serving {
+    /// 서버가 아직 도는지
+    pub(super) fn alive(&self) -> bool {
+        !self.task.is_finished()
+    }
 }
 
 impl Drop for Serving {
@@ -1059,7 +1066,7 @@ impl Drop for Serving {
     }
 }
 
-async fn serve(
+pub(super) async fn serve(
     ctx: &Ctx,
     store: &Arc<Store>,
     m: &Manifest,
@@ -1093,7 +1100,10 @@ async fn serve(
 }
 
 /// 저장소 백업의 매니페스트와 `config` 블롭을 읽고 리소스와 맞춰 본다.
-async fn read_snapshot(store: &Store, backup: &Backup) -> Result<(Manifest, ConfigBlob), String> {
+pub(super) async fn read_snapshot(
+    store: &Store,
+    backup: &Backup,
+) -> Result<(Manifest, ConfigBlob), String> {
     let name = backup.spec.store.as_deref().unwrap_or_default();
     let fail = |e| stores::store_error(name, e);
     let m = store
@@ -1112,6 +1122,9 @@ async fn read_snapshot(store: &Store, backup: &Backup) -> Result<(Manifest, Conf
 /// 저장소 백업 `backup`을 새 VM `name`으로 되살린다(§8.6): 이 노드 안 NBD 서버로 디스크를 내보내 디스크마다 `pool`에 새
 /// 볼륨을 만들어 읽어 넣고(`qemu-img convert`, 0 청크는 쓰지 않음), UEFI 변수·TPM 상태는 블롭에서 받는다. 그 뒤는 풀
 /// 백업 복원과 같다.
+///
+/// `live`(계획 68 §11.3)면 디스크를 읽어 넣지 않고 빈 대상 볼륨만 만들고 새 VM을 라이브 복원 상태로 만든다(풀 백업
+/// 복원과 같다 — [`super::backup::restore`]).
 pub(super) async fn restore(
     ctx: &Ctx,
     task: &Task,
@@ -1119,6 +1132,7 @@ pub(super) async fn restore(
     name: &str,
     pool: &str,
     folder: Option<Uuid>,
+    live: bool,
 ) -> Result<Option<String>, String> {
     let store_name = backup.spec.store.clone().unwrap_or_default();
     let target = ready_pool(ctx, pool)?;
@@ -1135,7 +1149,11 @@ pub(super) async fn restore(
             ));
         }
     }
-    let serving = serve(ctx, &store, &m, socket_path(ctx, "rs", task.id)).await?;
+    let serving = if live {
+        None
+    } else {
+        Some(serve(ctx, &store, &m, socket_path(ctx, "rs", task.id)).await?)
+    };
     let (_, volumes) = ctx
         .cluster
         .list::<VolumeSpec>()
@@ -1166,10 +1184,20 @@ pub(super) async fn restore(
             .create(&copy)
             .await
             .map_err(|e| format!("cannot create volume {:?}: {e}", copy.name))?;
-        ctx.storage
-            .import_nbd(&target, copy.id, &serving.socket, &disk.name, format)
-            .await
-            .map_err(|e| format!("cannot restore disk {:?}: {e}", disk.name))?;
+        let imported = match &serving {
+            Some(serving) => {
+                ctx.storage
+                    .import_nbd(&target, copy.id, &serving.socket, &disk.name, format)
+                    .await
+            }
+            // 라이브 복원: 빈 대상 볼륨(mirror가 채운다)
+            None => ctx
+                .storage
+                .create_volume(&target, copy.id, disk.virtual_bytes, format)
+                .await
+                .map(|_| Default::default()),
+        };
+        imported.map_err(|e| format!("cannot restore disk {:?}: {e}", disk.name))?;
         copies.push(copy);
     }
     let mut new: Vm = Resource::new(name, backup.spec.vm_spec.clone());
@@ -1230,7 +1258,8 @@ pub(super) async fn restore(
     new.spec
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
-    create_vm(ctx, task, new, None, false, false, &mut warnings).await?;
+    let node = super::live_restore::begin(ctx, task, &mut new, backup.id, live);
+    create_vm(ctx, task, new, node, live, false, &mut warnings).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
 }
 

@@ -12,6 +12,7 @@ mod drain;
 mod firmware;
 mod hotplug;
 mod import;
+pub(crate) mod live_restore;
 mod migrate;
 pub(crate) mod network_migrate;
 mod replicate;
@@ -177,6 +178,13 @@ pub struct TaskRunnerConfig {
     pub store_poll: Duration,
     /// GC가 시작 때 진행 중이던 백업을 기다리는 한도(기본 24시간 — 넘으면 아무것도 지우지 않고 실패)
     pub gc_wait_max: Duration,
+    /// 라이브 복원 오버레이를 만드는 `qemu-img`(계획 68 §11.2)
+    pub qemu_img: PathBuf,
+    /// 라이브 복원이 저장소 백업을 내보내는 `backup-serve` 헬퍼의 실행 파일(opld 자신). 없으면 opld 안에서 내보낸다
+    /// (시험 — opld가 다시 뜨면 Task가 다시 띄운다).
+    pub backup_serve_exe: Option<PathBuf>,
+    /// 헬퍼를 systemd scope(`opl-bkserve-<id>`)로 감싸 opld가 다시 떠도 살게 한다(systemd가 있는 Linux).
+    pub backup_serve_scope: bool,
 }
 
 impl TaskRunnerConfig {
@@ -217,6 +225,9 @@ impl TaskRunnerConfig {
             serve_cache_mib: opl_store::nbd::serve::DEFAULT_CACHE_MIB,
             store_poll: Duration::from_secs(5),
             gc_wait_max: Duration::from_secs(24 * 3600),
+            qemu_img: PathBuf::from("qemu-img"),
+            backup_serve_exe: None,
+            backup_serve_scope: false,
         }
     }
 }
@@ -234,6 +245,8 @@ struct Ctx {
     config: TaskRunnerConfig,
     /// 실행 중인 복제 Task가 만든 것(Task id별). 실패하면 정리가 지운다.
     cloned: std::sync::Mutex<HashMap<Uuid, clone::Made>>,
+    /// 라이브 복원이 opld 안에서 내보내는 저장소 백업(VM별 — `backup-serve` 헬퍼를 쓰지 않을 때, 계획 68)
+    live_serving: std::sync::Mutex<HashMap<Uuid, backup_store::Serving>>,
     /// 실행기가 멈췄는지. 뒤에서 도는 일(남은 태그 지우기)이 보고 함께 멈춘다.
     stopped: watch::Sender<bool>,
 }
@@ -256,6 +269,7 @@ impl TaskRunner {
             reconciler,
             config,
             cloned: Default::default(),
+            live_serving: Default::default(),
             stopped: watch::channel(false).0,
         });
         let (revision, tasks) = loop {
@@ -655,7 +669,10 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
         return Some(sdn::queue(ctx, task));
     }
     match task.spec.op {
-        TaskOp::BackupRestore { backup, .. } => return Some(backup),
+        // 라이브 복원도 백업의 줄에 서서 끝날 때까지 그 백업을 지우지 않게 한다(헬퍼·QEMU가 읽는다).
+        TaskOp::BackupRestore { backup, .. } | TaskOp::BackupLiveRestore { backup, .. } => {
+            return Some(backup);
+        }
         // 저장소 Task는 저장소의 줄(같은 저장소의 GC·검증은 차례로 — 계획 68 §10.2)
         TaskOp::BackupStoreInit
         | TaskOp::BackupStoreGc
@@ -736,7 +753,7 @@ fn start(
         // 옮기기 Task(계획 67 §9.4)는 VM마다 상태를 리소스에 적으므로 다시 뜬 opld가 이어서 한다.
         let resumes = matches!(
             task.spec.op,
-            TaskOp::NodeUpgrade | TaskOp::NetworkMigrate { .. }
+            TaskOp::NodeUpgrade | TaskOp::NetworkMigrate { .. } | TaskOp::BackupLiveRestore { .. }
         );
         if interrupted && !resumes {
             let error = "interrupted: orbivisord restarted while the task was running".to_string();
@@ -787,6 +804,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
                 | TaskOp::BackupStoreVerify { .. }
                 | TaskOp::BackupStoreScan
                 | TaskOp::BackupConvert { .. }
+                | TaskOp::BackupLiveRestore { .. }
         )
         || matches!(task.spec.op, TaskOp::NetworkMigrate { .. });
     let (result, unfinished) = if unlimited {
@@ -888,6 +906,10 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if let TaskOp::VmClone { .. } | TaskOp::BackupRestore { .. } = task.spec.op {
         clone::discard(ctx, task.id).await;
+    }
+    if let TaskOp::BackupLiveRestore { .. } = task.spec.op {
+        clone::discard(ctx, task.id).await;
+        live_restore::failed(ctx, task, error).await;
     }
     if let TaskOp::VmBackup { backup } = task.spec.op {
         backup::discard(ctx, task, backup, error, unfinished).await;
@@ -1062,7 +1084,7 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             pool,
             folder,
         } => {
-            return backup::restore(ctx, task, *backup, name, pool, *folder).await;
+            return backup::restore(ctx, task, *backup, name, pool, *folder, false).await;
         }
         TaskOp::BackupReplicate { remote, pool } => {
             replicate::replicate(ctx, id, remote, pool).await
@@ -1149,9 +1171,19 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             return Box::pin(backup_store::convert(ctx, task, store)).await;
         }
         // 복사·라이브 복원은 스테이지 5·6이 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::BackupCopy { .. } | TaskOp::BackupLiveRestore { .. } => {
-            Err("backup store tasks are not available yet".into())
+        // 디스크를 다 받기 전에 켜고 뒤에서 옮긴다(계획 68 §11). opld가 다시 떠도 잇는다.
+        TaskOp::BackupLiveRestore {
+            backup,
+            name,
+            pool,
+            folder,
+        } => {
+            return Box::pin(live_restore::run(
+                ctx, task, *backup, name, pool, *folder, resume,
+            ))
+            .await;
         }
+        TaskOp::BackupCopy { .. } => Err("backup store tasks are not available yet".into()),
     };
     done.map(|()| None)
 }

@@ -926,6 +926,11 @@ impl Member {
         runner_config.fleece_reserve_min = config.backup.fleece_reserve_min_mib << 20;
         runner_config.fleece_min_free = config.backup.fleece_min_free_mib << 20;
         runner_config.serve_cache_mib = config.backup.serve_cache_mib;
+        // 라이브 복원(계획 68 §11): 오버레이는 qemu-img로, 저장소 백업은 이 실행 파일의 `backup-serve` 헬퍼가 내보낸다(Linux는
+        // systemd scope로 opld가 다시 떠도 산다).
+        runner_config.qemu_img = config.qemu_img.clone();
+        runner_config.backup_serve_exe = std::env::current_exe().ok();
+        runner_config.backup_serve_scope = config.hypervisor.systemd_scope;
         // ESXi 가져오기의 자격 증명은 API가 받아 두고 가져오기 Task가 쓴다.
         runner_config.import_credentials = state.import_credentials.clone();
         runner_config.ceph = Some(ceph.clone());

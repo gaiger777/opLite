@@ -5,6 +5,7 @@ use opl_types::numa::{self, HostPlacement, MemoryPolicy, PageKind, ResolvedNuma}
 use opl_types::runtime::{
     DiskKind, HOTPLUG_PORTS, HotplugLayout, ImageFormat, NicBackend, RbdTarget, VmRuntimeSpec,
 };
+pub use opl_types::runtime::{LiveRestoreDisk, LiveRestoreSource};
 use opl_types::vm::{Arch, DiskBus, Firmware, MAX_CDROMS, MachineType, NicModel, Q35_SATA_PORTS};
 use thiserror::Error;
 
@@ -48,9 +49,14 @@ pub enum CmdlineError {
         "this node has no Secure Boot firmware (a QEMU firmware descriptor with secure-boot and enrolled-keys)"
     )]
     NoSecureBootFirmware,
+    #[error("live restore wiring has {wired} disks but the VM has {disks}")]
+    LiveRestoreDisks { disks: usize, wired: usize },
     #[error(transparent)]
     Cpu(#[from] CpuError),
 }
+
+/// 라이브 복원 NBD 백업이 끊겼을 때 QEMU가 요청을 붙잡고 다시 붙는 시간(초, §11.4). 넘기면 읽기 오류 → VM 멈춤.
+pub const LIVE_RESTORE_RECONNECT_SECS: u32 = 300;
 
 /// QEMU 인자 목록(바이너리 제외)을 만든다. 부수 효과가 없는 순수 함수다.
 ///
@@ -59,6 +65,62 @@ pub fn build_cmdline(
     spec: &VmRuntimeSpec,
     host: &HostProfile,
     paths: &RuntimePaths,
+) -> Result<Vec<String>, CmdlineError> {
+    build(spec, host, paths, &[])
+}
+
+/// 라이브 복원(계획 68 §11.2) 중인 VM의 인자. [`build_cmdline`]의 디스크마다 백업(`disk{i}-lrsrc` — NBD는
+/// `reconnect-delay=300`, 옛 qcow2 백업은 체인을 명시한 json)과 그 위 오버레이(`disk{i}-lr`)를 더하고 장치를 오버레이에
+/// 붙인다(`rerror=stop,werror=stop` — 백업을 읽지 못하면 게스트가 오류를 보지 않고 VM이 멈춘다). 대상 볼륨(`disk{i}`)은
+/// 지금 모양 그대로 두되 장치에 붙이지 않는다(mirror의 대상). 나머지 인자는 [`build_cmdline`]과 같다. `disks`는 VM
+/// 디스크마다 하나다.
+pub fn build_live_restore_cmdline(
+    spec: &VmRuntimeSpec,
+    host: &HostProfile,
+    paths: &RuntimePaths,
+    disks: &[LiveRestoreDisk],
+) -> Result<Vec<String>, CmdlineError> {
+    if disks.len() != spec.disks.len() {
+        return Err(CmdlineError::LiveRestoreDisks {
+            disks: spec.disks.len(),
+            wired: disks.len(),
+        });
+    }
+    build(spec, host, paths, disks)
+}
+
+/// 라이브 복원 백업 노드(`disk{i}-lrsrc`)의 `-blockdev` 값
+fn live_restore_source(i: usize, source: &LiveRestoreSource) -> String {
+    let node = format!("disk{i}-lrsrc");
+    match source {
+        LiveRestoreSource::Nbd { socket, export } => format!(
+            "driver=nbd,server.type=unix,server.path={},export={},reconnect-delay={LIVE_RESTORE_RECONNECT_SECS},read-only=on,node-name={node}",
+            esc_path(socket),
+            esc(export)
+        ),
+        LiveRestoreSource::Qcow2 { chain } => {
+            // 자식부터 전체 백업까지 backing을 명시한다(헤더의 backing 이름은 따르지 않음 — 계획 40 `import_chain`과 같은 뜻).
+            let mut node_json = serde_json::Value::Null;
+            for file in chain.iter().rev() {
+                node_json = serde_json::json!({
+                    "driver": "qcow2",
+                    "read-only": true,
+                    "file": { "driver": "file", "filename": file, "read-only": true },
+                    "backing": node_json,
+                });
+            }
+            node_json["node-name"] = serde_json::json!(node);
+            node_json.to_string()
+        }
+    }
+}
+
+/// [`build_cmdline`]·[`build_live_restore_cmdline`]의 몸통. `live`가 비면 라이브 복원이 아니다.
+fn build(
+    spec: &VmRuntimeSpec,
+    host: &HostProfile,
+    paths: &RuntimePaths,
+    live: &[LiveRestoreDisk],
 ) -> Result<Vec<String>, CmdlineError> {
     check_compat(spec, host)?;
 
@@ -206,6 +268,21 @@ pub fn build_cmdline(
                 rbd_source(rbd)
             }
         };
+        // 라이브 복원: 백업 → 오버레이를 앞에 두고 장치는 오버레이에 붙인다(대상 `disk{i}`는 mirror가 채운다).
+        let drive = match live.get(i) {
+            Some(lr) => {
+                a.opt("-blockdev", live_restore_source(i, &lr.source));
+                a.opt(
+                    "-blockdev",
+                    format!(
+                        "driver=qcow2,file.driver=file,file.filename={},backing=disk{i}-lrsrc,node-name=disk{i}-lr",
+                        esc_path(&lr.overlay)
+                    ),
+                );
+                format!("disk{i}-lr")
+            }
+            None => format!("disk{i}"),
+        };
         a.opt("-blockdev", format!("{source},node-name=disk{i}-file"));
         a.opt(
             "-blockdev",
@@ -213,17 +290,20 @@ pub fn build_cmdline(
         );
         let mut dev = match disk.bus {
             DiskBus::VirtioBlk => format!(
-                "virtio-blk-pci,drive=disk{i},id=disk{i}-dev{}",
+                "virtio-blk-pci,drive={drive},id=disk{i}-dev{}",
                 hot_bus(layout.map(|l| (l.boot_disks, &l.disk_ports[..])), i)
             ),
             DiskBus::Sata => {
-                let d = format!("ide-hd,drive=disk{i},bus=ide.{sata_port},id=disk{i}-dev");
+                let d = format!("ide-hd,drive={drive},bus=ide.{sata_port},id=disk{i}-dev");
                 sata_port += 1;
                 d
             }
         };
         if let Some(order) = disk.boot_order {
             dev.push_str(&format!(",bootindex={order}"));
+        }
+        if !live.is_empty() {
+            dev.push_str(",rerror=stop,werror=stop");
         }
         a.opt("-device", dev);
     }
@@ -626,6 +706,91 @@ mod tests {
 
     use super::*;
     use crate::host::Accel;
+
+    /// 계획 68 §11.2: 라이브 복원 VM은 디스크마다 백업 → 오버레이를 두고 장치를 오버레이에 붙인다(`rerror`·`werror`=stop).
+    /// 대상 볼륨 노드(`disk{i}`)는 그대로 있되 장치에 붙지 않는다. 디스크 아닌 인자는 보통 명령줄과 같다.
+    #[test]
+    fn live_restore_wires_backup_overlay_and_target() {
+        let spec = x86_spec();
+        let live = [
+            LiveRestoreDisk {
+                source: LiveRestoreSource::Nbd {
+                    socket: "/run/opl/bk,1.sock".into(),
+                    export: "disk0".into(),
+                },
+                overlay: "/var/lib/opl/vm/x/lr-disk0.qcow2".into(),
+            },
+            LiveRestoreDisk {
+                source: LiveRestoreSource::Qcow2 {
+                    chain: vec!["/bk/b2/disk1.qcow2".into(), "/bk/b1/disk1.qcow2".into()],
+                },
+                overlay: "/var/lib/opl/vm/x/lr-disk1.qcow2".into(),
+            },
+        ];
+        let args = build_live_restore_cmdline(&spec, &x86_host(), &paths(), &live).unwrap();
+        let plain = build_cmdline(&spec, &x86_host(), &paths()).unwrap();
+        let blockdevs: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-blockdev")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            blockdevs[0],
+            "driver=nbd,server.type=unix,server.path=/run/opl/bk,,1.sock,export=disk0,reconnect-delay=300,read-only=on,node-name=disk0-lrsrc"
+        );
+        assert_eq!(
+            blockdevs[1],
+            "driver=qcow2,file.driver=file,file.filename=/var/lib/opl/vm/x/lr-disk0.qcow2,backing=disk0-lrsrc,node-name=disk0-lr"
+        );
+        assert_eq!(
+            blockdevs[2],
+            "driver=file,filename=/var/lib/opl/pools/local/web-01-root.qcow2,node-name=disk0-file"
+        );
+        assert_eq!(blockdevs[3], "driver=qcow2,file=disk0-file,node-name=disk0");
+        // 옛 백업 체인은 backing을 명시한 json(자식 → 부모 → 끝은 null)
+        let chain: serde_json::Value = serde_json::from_str(blockdevs[4]).unwrap();
+        assert_eq!(chain["node-name"], "disk1-lrsrc");
+        assert_eq!(chain["read-only"], true);
+        assert_eq!(chain["file"]["filename"], "/bk/b2/disk1.qcow2");
+        assert_eq!(chain["backing"]["file"]["filename"], "/bk/b1/disk1.qcow2");
+        assert_eq!(chain["backing"]["backing"], serde_json::Value::Null);
+        assert!(blockdevs[5].ends_with("backing=disk1-lrsrc,node-name=disk1-lr"));
+        let devices: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-device" && w[1].contains("id=disk"))
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(
+            devices,
+            [
+                "virtio-blk-pci,drive=disk0-lr,id=disk0-dev,bootindex=1,rerror=stop,werror=stop",
+                "ide-hd,drive=disk1-lr,bus=ide.0,id=disk1-dev,rerror=stop,werror=stop",
+            ]
+        );
+        // 디스크 인자를 빼면 보통 명령줄과 같다.
+        let others = |a: &[String]| -> Vec<String> {
+            let mut out = Vec::new();
+            let mut it = a.iter().peekable();
+            while let Some(x) = it.next() {
+                if (x == "-blockdev" || x == "-device")
+                    && it.peek().is_some_and(|v| v.contains("disk"))
+                {
+                    it.next();
+                    continue;
+                }
+                out.push(x.clone());
+            }
+            out
+        };
+        assert_eq!(others(&args), others(&plain));
+        // 보통 명령줄에는 오류 정책을 더하지 않는다(라이브 복원이 아닌 VM은 지금과 같음 — §13).
+        assert!(!plain.iter().any(|a| a.contains("rerror")));
+        // 디스크 수가 다르면 거절
+        assert_eq!(
+            build_live_restore_cmdline(&spec, &x86_host(), &paths(), &live[..1]),
+            Err(CmdlineError::LiveRestoreDisks { disks: 2, wired: 1 })
+        );
+    }
 
     #[test]
     fn replica_receiver_has_no_guest_devices() {

@@ -2649,6 +2649,7 @@ mod tests {
                 total_bytes: 2,
                 started_at: 3,
                 error: None,
+                cancel: false,
             }),
             ..st
         };

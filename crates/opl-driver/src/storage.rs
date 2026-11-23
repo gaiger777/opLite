@@ -952,6 +952,23 @@ pub async fn nbd_chain_source(
 }
 
 /// `qemu-img`를 돌려 표준 출력을 돌려준다. 실패하면 stderr를 담은 `ToolFailed`.
+/// 라이브 복원 오버레이(계획 68 §11.2): 가상 크기 `size`의 빈 qcow2를 `path`에 만든다(헤더에 backing 없음 — backing은
+/// QEMU 명령줄에서만). 이미 있으면 그대로 둔다(게스트가 쓴 블록이 들어 있다).
+pub async fn create_overlay(qemu_img: &Path, path: &Path, size: u64) -> Result<(), DriverError> {
+    if tokio::fs::try_exists(path).await? {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        tokio::fs::create_dir_all(dir).await?;
+    }
+    let tmp = path.with_extension("tmp");
+    let tmp_str = tmp.to_string_lossy().into_owned();
+    let size = size.to_string();
+    run_qemu_img(qemu_img, &["create", "-q", "-f", "qcow2", &tmp_str, &size]).await?;
+    tokio::fs::rename(&tmp, path).await?;
+    Ok(())
+}
+
 async fn run_qemu_img(qemu_img: &Path, args: &[&str]) -> Result<Vec<u8>, DriverError> {
     let out = tokio::process::Command::new(qemu_img)
         .args(args)

@@ -13,7 +13,8 @@ use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
 use opl_types::runtime::{
-    ImageFormat, RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning, VmRuntimeSpec,
+    ImageFormat, LiveRestoreDisk, RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning,
+    VmRuntimeSpec,
 };
 use opl_types::vm::{Arch, CpuSpec, DiskBus, MachineType, RunningHardware};
 use tokio::sync::{Notify, broadcast};
@@ -22,8 +23,8 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, BitmapInfo, CpuProbe, DiskBitmaps, DiskCounters,
-    EventKind, FleeceDisk, FleeceExport, FleeceRequest, Hypervisor, HypervisorEvent, Quiesced,
-    RuntimeStatus, StopMode, VcpuChange,
+    EventKind, FleeceDisk, FleeceExport, FleeceRequest, Hypervisor, HypervisorEvent,
+    LiveRestoreJob, Quiesced, RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
@@ -309,6 +310,18 @@ struct MockState {
     fleece_servers: HashMap<Uuid, (PathBuf, tokio::task::JoinHandle<()>)>,
     /// `fleece_begin`(`None`)·`fleece_end`(`Some(success)`) 호출(실패 포함)
     fleece_calls: Vec<(Uuid, FleeceRequest, Option<bool>)>,
+    /// 라이브 복원 배선(계획 68, `set_live_restore`)
+    live_restore: HashMap<Uuid, Vec<LiveRestoreDisk>>,
+    /// 배선으로 켠 VM(켤 때마다)
+    live_launches: Vec<Uuid>,
+    /// mirror가 `ready`인(다 옮긴) VM — 시험이 [`MockHypervisor::finish_live_restore_copy`]로 정한다
+    live_ready: HashSet<Uuid>,
+    /// `start_live_restore` 호출 수(VM별)
+    live_polls: HashMap<Uuid, usize>,
+    /// 갈아탄 VM(`pivot_live_restore` 성공)
+    pivots: Vec<Uuid>,
+    /// 다음 `pivot_live_restore` 한 번을 실패시킬 오류
+    fail_next_pivot: Option<DriverError>,
     /// 다음 `fleece_begin` 한 번을 실패시킬 오류(비트맵은 그대로)
     fail_next_fleece: Option<DriverError>,
     /// `clear_backup_leftovers`를 부른 VM(실패 포함)
@@ -843,6 +856,38 @@ impl MockHypervisor {
         self.state.lock().unwrap().fleece_calls.clone()
     }
 
+    /// VM의 라이브 복원 배선(없으면 `None`)
+    pub fn live_restore_wiring(&self, id: Uuid) -> Option<Vec<LiveRestoreDisk>> {
+        self.state.lock().unwrap().live_restore.get(&id).cloned()
+    }
+
+    /// 라이브 복원 배선으로 켠 횟수
+    pub fn live_launches(&self, id: Uuid) -> usize {
+        let st = self.state.lock().unwrap();
+        st.live_launches.iter().filter(|v| **v == id).count()
+    }
+
+    /// 라이브 복원 mirror가 다 옮긴 것으로 한다(다음 `start_live_restore`가 `ready`를 알린다).
+    pub fn finish_live_restore_copy(&self, id: Uuid) {
+        self.state.lock().unwrap().live_ready.insert(id);
+    }
+
+    /// `start_live_restore`를 부른 횟수
+    pub fn live_restore_polls(&self, id: Uuid) -> usize {
+        let st = self.state.lock().unwrap();
+        st.live_polls.get(&id).copied().unwrap_or(0)
+    }
+
+    /// 갈아탄 VM들(`pivot_live_restore` 성공)
+    pub fn pivots(&self) -> Vec<Uuid> {
+        self.state.lock().unwrap().pivots.clone()
+    }
+
+    /// 다음 `pivot_live_restore` 한 번을 `err`로 실패시킨다.
+    pub fn fail_next_pivot(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_pivot = Some(err);
+    }
+
     /// 아직 열린 가짜 fleecing 내보내기가 있는 VM
     pub fn open_fleeces(&self) -> Vec<Uuid> {
         self.state
@@ -1364,6 +1409,9 @@ impl Hypervisor for MockHypervisor {
             }
             st.launches.push((vm.id, restore.map(str::to_string)));
             st.launch_specs.push(vm.clone());
+            if st.live_restore.contains_key(&vm.id) {
+                st.live_launches.push(vm.id);
+            }
             if let Some(err) = st
                 .fail_next_start
                 .take()
@@ -1899,6 +1947,91 @@ impl Hypervisor for MockHypervisor {
             .collect())
     }
 
+    async fn set_live_restore(
+        &self,
+        id: Uuid,
+        disks: Option<&[LiveRestoreDisk]>,
+    ) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        match disks {
+            Some(d) => {
+                st.live_restore.insert(id, d.to_vec());
+            }
+            None => {
+                // 실제 드라이버처럼 오버레이 파일도 지운다.
+                for d in st.live_restore.remove(&id).into_iter().flatten() {
+                    let _ = std::fs::remove_file(&d.overlay);
+                }
+                st.live_ready.remove(&id);
+            }
+        }
+        Ok(())
+    }
+
+    fn live_restore_wired(&self, id: Uuid) -> bool {
+        self.state.lock().unwrap().live_restore.contains_key(&id)
+    }
+
+    /// 배선의 NBD 백업마다 연결해 본다(게스트 읽기 흉내). 닿지 않으면 VM이 `io-error`로 멈추고(`rerror=stop`) 작업은
+    /// 오류를 알린다. 다 옮긴 것으로 정했으면(`finish_live_restore_copy`) `ready`다.
+    async fn start_live_restore(&self, id: Uuid) -> Result<Vec<LiveRestoreJob>, DriverError> {
+        let wiring = {
+            let mut st = self.state.lock().unwrap();
+            Self::controllable(&st, id)?;
+            *st.live_polls.entry(id).or_default() += 1;
+            st.live_restore.get(&id).cloned().ok_or_else(|| {
+                DriverError::LiveRestore(format!("VM {id} has no live restore wiring"))
+            })?
+        };
+        let mut unreachable = None;
+        for d in &wiring {
+            if let opl_types::runtime::LiveRestoreSource::Nbd { socket, export } = &d.source {
+                match opl_store::nbd::NbdClient::connect(socket, export, &[]).await {
+                    Ok(c) => {
+                        let _ = c.disconnect().await;
+                    }
+                    Err(e) => unreachable = Some(e.to_string()),
+                }
+            }
+        }
+        let mut st = self.state.lock().unwrap();
+        if unreachable.is_some() {
+            st.statuses
+                .insert(id, RuntimeStatus::Other("io-error".into()));
+        }
+        let ready = unreachable.is_none() && st.live_ready.contains(&id);
+        Ok((0..wiring.len())
+            .map(|disk| LiveRestoreJob {
+                disk,
+                ready,
+                done_bytes: if ready {
+                    MOCK_MIRROR_BYTES
+                } else {
+                    MOCK_MIRROR_BYTES / 2
+                },
+                total_bytes: MOCK_MIRROR_BYTES,
+                error: unreachable
+                    .as_ref()
+                    .map(|e| format!("the copy of disk {disk} stopped: {e}")),
+            })
+            .collect())
+    }
+
+    async fn pivot_live_restore(&self, id: Uuid) -> Result<(), DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        if let Some(e) = st.fail_next_pivot.take() {
+            return Err(e);
+        }
+        if !st.live_ready.contains(&id) {
+            return Err(DriverError::LiveRestore(
+                "disk 0 is not copied yet (running)".into(),
+            ));
+        }
+        st.pivots.push(id);
+        Ok(())
+    }
+
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {
         let mut st = self.state.lock().unwrap();
         Self::controllable(&st, id)?;
@@ -1937,6 +2070,10 @@ impl Hypervisor for MockHypervisor {
         Self::controllable(&st, id)?;
         st.paused.remove(&id);
         st.marked.remove(&id);
+        // 읽기 오류로 멈춘 VM(`rerror=stop`)도 `cont`로 다시 돈다(아직 읽지 못하면 다음 읽기에서 다시 멈춘다).
+        if st.statuses.get(&id) == Some(&RuntimeStatus::Other("io-error".into())) {
+            st.statuses.remove(&id);
+        }
         // 마이그레이션을 보낸 원본도 `cont`로 다시 돈다.
         if st.migration_status.get(&id) == Some(&postmigrate()) {
             st.migration_status.remove(&id);

@@ -47,7 +47,8 @@ use crate::scheduler::{
 use crate::score::{self, Scorer};
 use crate::snapshots::{
     check_no_hotplug_task, check_no_migration, check_no_revert_task, check_no_snapshot_task,
-    check_no_untemplate_task, check_not_busy, check_not_migrating, count_snapshots,
+    check_no_untemplate_task, check_not_busy, check_not_migrating, check_not_restoring,
+    check_settled, count_snapshots,
 };
 use crate::state::AppState;
 use crate::tasks::create_task;
@@ -1371,6 +1372,10 @@ async fn write_spec(
             .into());
         }
         let (spec, labels) = edit(&current)?;
+        // 라이브 복원 중인 VM(계획 68)은 그 노드의 배선(디스크마다)으로만 켜진다: 디스크·노드를 바꾸지 않는다.
+        if spec.disks != current.spec.disks || spec.node != current.spec.node {
+            check_not_restoring(&current)?;
+        }
         // 템플릿의 디스크 목록(볼륨·버스·개수)은 배포한 연결 복제의 기반이라 바꿀 수 없다(계획 58 §3).
         if current.spec.template
             && spec.template
@@ -1791,7 +1796,11 @@ fn check_hot_change(state: &AppState, vm: &Vm, spec: &VmSpec) -> Result<(), ApiE
             ),
         ));
     };
-    check_not_busy(state, vm)?;
+    // 라이브 복원 중(계획 68)에도 CPU·메모리·NIC는 바꾼다. 디스크는 배선이 디스크마다라 바꾸지 않는다.
+    if spec.disks != vm.spec.disks {
+        check_not_restoring(vm)?;
+    }
+    check_settled(state, vm)?;
     check_no_hotplug_task(state, vm)?;
     // CD-ROM 드라이브(컨트롤러 포트)는 켤 때만 정해진다.
     if spec.cdroms.len() != hw.cdroms.len() {
@@ -1963,6 +1972,8 @@ pub async fn delete_vm(
             ),
         ));
     }
+    // 라이브 복원 중인 VM은 취소(`discard`)로만 지운다(계획 68 §11.4 — 오버레이·헬퍼를 함께 치움).
+    check_not_restoring(&vm)?;
     check_no_migration(&state, &vm)?;
     check_no_untemplate_task(&state, &vm)?;
     if !is_stopped(&vm) {
@@ -2058,6 +2069,15 @@ pub async fn vm_action(
     }
     let id = vm.id;
     let (op, vm) = match action.as_str() {
+        // 라이브 복원 중인 VM(계획 68 §11.4 — 강제로 끈 것)은 그 노드에서 같은 배선으로만 켠다(자리를 다시 고르지 않는다).
+        "start" if vm.status.live_restore.is_some() => {
+            let vm = modify_spec(&state, id, |spec| {
+                spec.power = PowerState::Running;
+                Ok(())
+            })
+            .await?;
+            (TaskOp::VmStart, vm)
+        }
         "start" => {
             let scoring = score::scorer(&state, start_picks(&state, &vm)?).await;
             let scorer = scoring.scorer();
@@ -2173,6 +2193,10 @@ pub async fn vm_action(
             (TaskOp::VmStart, vm)
         }
         "stop" => {
+            // 라이브 복원 중에는 강제 정지만 받는다(오버레이·대상은 남고 `vm start`가 잇는다).
+            if query.mode != StopMode::Force {
+                check_not_restoring(&vm)?;
+            }
             let vm = modify_spec(&state, id, |spec| {
                 spec.power = PowerState::Stopped;
                 Ok(())

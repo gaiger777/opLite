@@ -598,6 +598,11 @@ pub struct LiveRestore {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
     pub error: Option<String>,
+    /// 취소 요청(§11.4 `live-restore/cancel { discard: true }`): Task가 VM을 끄고 VM·대상 볼륨·오버레이를 지운다. 그동안
+    /// reconciler는 VM을 켜지 않는다.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[cfg_attr(feature = "openapi", schema(default))]
+    pub cancel: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1101,9 +1106,16 @@ mod tests {
             total_bytes: 20 << 30,
             started_at: 1_790_000_000,
             error: Some("backup store unreachable".into()),
+            cancel: false,
         };
         let j = serde_json::to_value(&lr).unwrap();
         assert_eq!(j["phase"], "paused");
+        // 취소 요청은 있을 때만 쓴다.
+        assert!(j.get("cancel").is_none(), "{j}");
+        assert_eq!(serde_json::from_value::<LiveRestore>(j).unwrap(), lr);
+        let lr = LiveRestore { cancel: true, ..lr };
+        let j = serde_json::to_value(&lr).unwrap();
+        assert_eq!(j["cancel"], true);
         assert_eq!(serde_json::from_value::<LiveRestore>(j).unwrap(), lr);
         for (p, s) in [
             (LiveRestorePhase::Starting, "starting"),

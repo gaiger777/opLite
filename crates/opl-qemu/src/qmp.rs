@@ -883,6 +883,42 @@ impl QmpClient {
         .map(drop)
     }
 
+    /// 라이브 복원(계획 68 §11.2)의 mirror `job_id`를 시작한다: 노드 `device`(오버레이)를 노드 `target`(대상 볼륨)으로
+    /// `sync: full`, `copy-mode: write-blocking`(게스트 쓰기를 대상에도 함께 써서 반드시 수렴), 원본 읽기 오류면 멈춤
+    /// (`on-source-error: stop` — 백업이 돌아오면 `job-resume`). `ready`가 되면 [`job_complete`](Self::job_complete)로
+    /// 장치를 대상으로 갈아탄다.
+    pub async fn blockdev_mirror_active(
+        &self,
+        job_id: &str,
+        device: &str,
+        target: &str,
+    ) -> Result<(), QmpError> {
+        let args = json!({
+            "job-id": job_id,
+            "device": device,
+            "target": target,
+            "sync": "full",
+            "copy-mode": "write-blocking",
+            "on-source-error": "stop",
+            "auto-dismiss": false,
+        });
+        self.execute("blockdev-mirror", Some(args)).await.map(drop)
+    }
+
+    /// `ready`인 작업을 끝낸다. mirror는 원본 노드의 부모(장치)를 대상 노드로 바꾸고 `concluded`가 된다. 곧바로 돌아온다.
+    pub async fn job_complete(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("job-complete", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
+    /// 멈춘(`paused` — 오류로 멈춘 것 포함) 작업을 잇는다.
+    pub async fn job_resume(&self, id: &str) -> Result<(), QmpError> {
+        self.execute("job-resume", Some(json!({ "id": id })))
+            .await
+            .map(drop)
+    }
+
     /// `concluded`인 작업을 지운다.
     pub async fn job_dismiss(&self, id: &str) -> Result<(), QmpError> {
         self.execute("job-dismiss", Some(json!({ "id": id })))
@@ -2557,6 +2593,28 @@ mod tests {
         );
         r.unwrap();
         assert!(cmd["arguments"].get("speed").is_none(), "{cmd}");
+
+        // 라이브 복원 mirror(계획 68): write-blocking, 원본 오류면 멈춤
+        let (r, cmd) = tokio::join!(
+            client.blockdev_mirror_active("opl-lr-0", "disk0-lr", "disk0"),
+            reply(&mut fake, json!({}))
+        );
+        r.unwrap();
+        assert_eq!(
+            cmd["arguments"],
+            json!({
+                "job-id": "opl-lr-0", "device": "disk0-lr", "target": "disk0",
+                "sync": "full", "copy-mode": "write-blocking", "on-source-error": "stop",
+                "auto-dismiss": false
+            })
+        );
+        for (r, cmd) in [
+            tokio::join!(client.job_complete("opl-lr-0"), reply(&mut fake, json!({}))),
+            tokio::join!(client.job_resume("opl-lr-0"), reply(&mut fake, json!({}))),
+        ] {
+            r.unwrap();
+            assert_eq!(cmd["arguments"], json!({ "id": "opl-lr-0" }));
+        }
 
         for force in [false, true] {
             let (r, cmd) = tokio::join!(

@@ -979,6 +979,9 @@ pub(super) async fn regular_file(dir: &Path, file: &str) -> Result<PathBuf, Stri
 /// 증분 백업은 부모를 거슬러 전체 백업까지의 체인([`read_chain`])을 디스크마다 한 이미지로 연다(증분
 /// 백업 설계 §3.6). 실패하면 실행기의 정리(복제와 같은 [`super::clone::discard`])가 만든 볼륨과 변수
 /// 사본을 지운다.
+///
+/// `live`(계획 68 §11.3)면 디스크를 읽어 넣지 않고 빈 대상 볼륨만 만들며, 새 VM은 이 노드에서 켜진 채(`running`)
+/// 라이브 복원 상태(`Starting`)로 만든다 — 라이브 복원 Task가 배선을 둔 뒤 reconciler가 켠다.
 pub(super) async fn restore(
     ctx: &Ctx,
     task: &Task,
@@ -986,6 +989,7 @@ pub(super) async fn restore(
     name: &str,
     pool: &str,
     folder: Option<Uuid>,
+    live: bool,
 ) -> Result<Option<String>, String> {
     let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
     if backup.status.phase != BackupPhase::Ready {
@@ -1001,7 +1005,7 @@ pub(super) async fn restore(
     }
     if backup.spec.store.is_some() {
         return Box::pin(super::backup_store::restore(
-            ctx, task, backup, name, pool, folder,
+            ctx, task, backup, name, pool, folder, live,
         ))
         .await;
     }
@@ -1032,8 +1036,7 @@ pub(super) async fn restore(
             ));
         }
     }
-    // 증분 백업의 조상 디렉터리(부모부터)
-    let ancestors = read_chain(ctx, &backup, &root, &manifest).await?;
+    let chains = disk_chains(ctx, &backup, &root, &dir, &manifest).await?;
 
     let (_, volumes) = ctx
         .cluster
@@ -1042,26 +1045,9 @@ pub(super) async fn restore(
     let mut taken: HashSet<String> = volumes.into_iter().map(|v| v.name).collect();
     let format = copy_format(&source, &target, ImageFormat::Qcow2);
     let mut copies: Vec<Volume> = Vec::with_capacity(manifest.disks.len());
-    for (i, disk) in manifest.disks.iter().enumerate() {
+    for (disk, chain) in manifest.disks.iter().zip(&chains) {
         let failed =
             |e: &dyn std::fmt::Display| format!("cannot restore disk {:?}: {e}", disk.name);
-        // 체인의 파일(자식부터). 전체 백업이면 하나다.
-        let mut chain = Vec::with_capacity(ancestors.len() + 1);
-        for (dir, m) in
-            std::iter::once((&dir, &manifest)).chain(ancestors.iter().map(|(d, m)| (d, m)))
-        {
-            let file = m.disks[i].file.as_str();
-            // 파일은 백업 디렉터리 바로 안에 있어야 한다. 다른 파일을 참조하는 이미지도 받지 않는다.
-            if Path::new(file).file_name() != Some(OsStr::new(file)) {
-                return Err(failed(&format!("invalid file name {file:?}")));
-            }
-            let file = regular_file(dir, file).await.map_err(|e| failed(&e))?;
-            ctx.storage
-                .check_import_source(&file, SourceFormat::Qcow2)
-                .await
-                .map_err(|e| failed(&e))?;
-            chain.push(file);
-        }
         let copy_name = volume_name(name, &disk.name, |n| taken.contains(n));
         taken.insert(copy_name.clone());
         let mut copy: Volume = Resource::new(
@@ -1082,6 +1068,12 @@ pub(super) async fn restore(
             .await
             .map_err(|e| format!("cannot create volume {:?}: {e}", copy.name))?;
         let imported = match &chain[..] {
+            // 라이브 복원: 빈 대상 볼륨(mirror가 채운다)
+            _ if live => ctx
+                .storage
+                .create_volume(&target, copy.id, disk.virtual_bytes, format)
+                .await
+                .map(|_| Default::default()),
             [file] => {
                 ctx.storage
                     .import_volume(&target, copy.id, file, SourceFormat::Qcow2, format)
@@ -1147,8 +1139,45 @@ pub(super) async fn restore(
         .validate()
         .map_err(|e| format!("invalid VM spec in backup: {e}"))?;
     // SDN 주소(계획 65 §9): 원래 주소가 비어 있으면 그대로, 아니면 새로 받고 경고에 적는다.
-    create_vm(ctx, task, new, None, false, false, &mut warnings).await?;
+    let node = super::live_restore::begin(ctx, task, &mut new, id, live);
+    create_vm(ctx, task, new, node, live, false, &mut warnings).await?;
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+}
+
+/// 풀 백업 `backup`(디렉터리 `dir`, 매니페스트 `manifest`)의 디스크마다 읽을 qcow2 파일 체인(자식부터 — 전체 백업이면 하나).
+/// 증분 백업은 조상([`read_chain`])을 붙인다. 파일은 백업 디렉터리 바로 안의 보통 파일이고 qcow2여야 한다.
+pub(super) async fn disk_chains(
+    ctx: &Ctx,
+    backup: &Backup,
+    root: &Path,
+    dir: &Path,
+    manifest: &BackupManifest,
+) -> Result<Vec<Vec<PathBuf>>, String> {
+    // 증분 백업의 조상 디렉터리(부모부터)
+    let ancestors = read_chain(ctx, backup, root, manifest).await?;
+    let mut chains = Vec::with_capacity(manifest.disks.len());
+    for (i, disk) in manifest.disks.iter().enumerate() {
+        let failed =
+            |e: &dyn std::fmt::Display| format!("cannot restore disk {:?}: {e}", disk.name);
+        let mut chain = Vec::with_capacity(ancestors.len() + 1);
+        for (dir, m) in
+            std::iter::once((dir, manifest)).chain(ancestors.iter().map(|(d, m)| (d.as_path(), m)))
+        {
+            let file = m.disks[i].file.as_str();
+            // 파일은 백업 디렉터리 바로 안에 있어야 한다. 다른 파일을 참조하는 이미지도 받지 않는다.
+            if Path::new(file).file_name() != Some(OsStr::new(file)) {
+                return Err(failed(&format!("invalid file name {file:?}")));
+            }
+            let file = regular_file(dir, file).await.map_err(|e| failed(&e))?;
+            ctx.storage
+                .check_import_source(&file, SourceFormat::Qcow2)
+                .await
+                .map_err(|e| failed(&e))?;
+            chain.push(file);
+        }
+        chains.push(chain);
+    }
+    Ok(chains)
 }
 
 /// 백업은 CD-ROM의 매체(ISO)를 담지 않는다. 스펙의 ISO가 이 클러스터에 없거나, ISO가 아니거나, 준비되지 않았거나,

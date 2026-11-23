@@ -10,7 +10,8 @@ pub mod qga;
 pub mod qmp;
 
 pub use cmdline::{
-    CmdlineError, build_cmdline, build_incoming_cmdline, build_replica_receiver_cmdline,
+    CmdlineError, LIVE_RESTORE_RECONNECT_SECS, LiveRestoreDisk, LiveRestoreSource, build_cmdline,
+    build_incoming_cmdline, build_live_restore_cmdline, build_replica_receiver_cmdline,
 };
 pub use cpu::{CpuProbe, CpuProbeError, CpuProbeReplies};
 pub use firmware::FirmwarePair;

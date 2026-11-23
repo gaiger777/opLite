@@ -12,7 +12,7 @@ use opl_qemu::{
     BackupSync, BlockNode, HostProfile, JobInfo, MigrationInfo, MigrationParameters,
     MigrationState, NbdBlockdev, QmpClient, QmpError, QmpEvent, RunState, RuntimePaths,
     TlsEndpoint, TransactionAction, build_cmdline, build_incoming_cmdline,
-    build_replica_receiver_cmdline,
+    build_live_restore_cmdline, build_replica_receiver_cmdline,
 };
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::guest::GuestInfo;
@@ -35,8 +35,8 @@ use uuid::Uuid;
 use crate::error::DriverError;
 use crate::hypervisor::{
     ActualState, AddOutcome, BackupTarget, CpuProbe, DiskBitmaps, DiskCounters, EventKind,
-    FleeceExport, FleeceRequest, Hypervisor, HypervisorEvent, Quiesced, RuntimeStatus, StopMode,
-    VcpuChange,
+    FleeceExport, FleeceRequest, Hypervisor, HypervisorEvent, LiveRestoreJob, Quiesced,
+    RuntimeStatus, StopMode, VcpuChange,
 };
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MIGRATION_TLS_ID, MigrateOptions, MigrateTarget,
@@ -49,6 +49,7 @@ use crate::storage::{DiskLocation, fmt_name};
 use crate::tpm::{self, SwtpmConfig, vm_tpm_dir};
 
 mod agent;
+mod live_restore;
 mod store_backup;
 
 use agent::Freezer;
@@ -477,7 +478,16 @@ impl QemuHypervisor {
         remove_if_exists(&paths.dir.join(agent::FSFROZEN_MARK))?;
 
         let args = match how {
-            Launch::Start { .. } => build_cmdline(vm, &self.config.host, paths),
+            // 라이브 복원 배선(계획 68 §11.2)이 있으면 그것으로 켠다. 메모리 스냅샷은 불러오지 않는다.
+            Launch::Start { restore } => match live_restore::read_wiring(&self.state_dir(vm.id))? {
+                Some(_) if restore.is_some() => {
+                    return Err(DriverError::InvalidSpec(
+                        "a VM in a live restore cannot load a snapshot".into(),
+                    ));
+                }
+                Some(disks) => build_live_restore_cmdline(vm, &self.config.host, paths, &disks),
+                None => build_cmdline(vm, &self.config.host, paths),
+            },
             Launch::Incoming { .. } => build_incoming_cmdline(vm, &self.config.host, paths),
         };
         let mut args = args.map_err(|e| DriverError::InvalidSpec(e.to_string()))?;
@@ -1590,6 +1600,28 @@ impl Hypervisor for QemuHypervisor {
         success: bool,
     ) -> Result<(), DriverError> {
         self.end_store_read(id, req, success).await
+    }
+
+    async fn set_live_restore(
+        &self,
+        id: Uuid,
+        disks: Option<&[opl_types::runtime::LiveRestoreDisk]>,
+    ) -> Result<(), DriverError> {
+        self.write_live_restore(id, disks)
+    }
+
+    fn live_restore_wired(&self, id: Uuid) -> bool {
+        self.state_dir(id)
+            .join(live_restore::LIVE_RESTORE_FILE)
+            .exists()
+    }
+
+    async fn start_live_restore(&self, id: Uuid) -> Result<Vec<LiveRestoreJob>, DriverError> {
+        self.live_restore_jobs(id).await
+    }
+
+    async fn pivot_live_restore(&self, id: Uuid) -> Result<(), DriverError> {
+        self.pivot(id).await
     }
 
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError> {

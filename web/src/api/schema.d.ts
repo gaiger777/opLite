@@ -8230,6 +8230,11 @@ export interface components {
              */
             backup: string;
             /**
+             * @description 취소 요청(§11.4 `live-restore/cancel { discard: true }`): Task가 VM을 끄고 VM·대상 볼륨·오버레이를 지운다. 그동안
+             *     reconciler는 VM을 켜지 않는다.
+             */
+            cancel?: boolean;
+            /**
              * Format: int64
              * @description 대상 볼륨으로 옮긴 바이트(mirror 진행)
              */

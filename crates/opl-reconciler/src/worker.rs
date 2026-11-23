@@ -4,6 +4,7 @@ use std::time::Duration;
 use opl_cluster::types::Rejection;
 use opl_cluster::{Cluster, ClusterError};
 use opl_driver::{ActualState, DriverError, EventKind, Hypervisor, RuntimeStatus, StopMode};
+use opl_types::backup_store::LiveRestorePhase;
 use opl_types::cpu::ResolvedCpu;
 use opl_types::firmware::{
     TpmSource, firmware_copy_nodes, move_firmware_node, tpm_is_current, tpm_source,
@@ -42,6 +43,9 @@ use crate::resolve::{
 /// QEMU 드라이버는 QMP 연결이 끊긴 뒤 프로세스가 끝나기를 최대 5초(`EXIT_GRACE`) 기다린 다음에
 /// 크래시를 알리므로 그보다 길게 잡는다. 짧으면 느리게 끝난 크래시를 두 번 세게 된다.
 const EVENT_GRACE: Duration = Duration::from_secs(6);
+
+/// 라이브 복원 Task가 VM을 켤 준비를 하는 동안(또는 실패·취소 중) reconciler가 남기는 까닭(계획 68)
+pub const LIVE_RESTORE_NOT_STARTED: &str = "waiting for the live restore task to prepare the VM";
 
 /// 켜라고 한 템플릿(계획 58)을 켜지 않았을 때의 status
 pub const TEMPLATE_NOT_STARTED: &str =
@@ -488,6 +492,11 @@ impl Worker {
                 self.keep_restart_cpu(vm);
                 match (self.ha_restarts(vm), vm.spec.restart) {
                     (Some(max), _) => self.record_crash(max, "VM crashed"),
+                    // 라이브 복원 중인 VM(계획 68 §11.4)은 정책과 관계없이 같은 배선으로 다시 켠다(오버레이에 게스트가 쓴
+                    // 것이 있다 — mirror는 처음부터 다시).
+                    (None, _) if vm.status.live_restore.is_some() => {
+                        self.record_failure("VM crashed".into())
+                    }
                     (None, RestartPolicy::Never) => {
                         self.power_off = Some(Some("VM crashed".into()))
                     }
@@ -972,6 +981,29 @@ impl Worker {
                 self.awaiting_event = None;
                 self.force_requested = false;
                 self.deactivate_disks(vm).await;
+                // 라이브 복원(계획 68 §11.3) 중인 VM은 Task가 배선(백업 → 오버레이)을 둔 뒤에만 켠다 — 드라이버가 그 배선으로
+                // 켠다. 준비 중·실패·취소 요청이거나 배선이 없으면 켜지 않는다(대상 볼륨은 아직 다 옮기지 않았다).
+                if let Some(lr) = &vm.status.live_restore {
+                    let ready = !lr.cancel
+                        && !matches!(
+                            lr.phase,
+                            LiveRestorePhase::Starting | LiveRestorePhase::Failed
+                        )
+                        && self.hv.live_restore_wired(self.id);
+                    if !ready {
+                        self.backoff = None;
+                        status.phase = VmPhase::Starting;
+                        status.pid = None;
+                        status.last_error = Some(LIVE_RESTORE_NOT_STARTED.into());
+                        return Ok(status);
+                    }
+                } else if self.hv.live_restore_wired(self.id) {
+                    // 끝난(또는 지운) 라이브 복원의 배선이 남았다. 보통 VM으로 켜도록 치운다.
+                    tracing::warn!(vm = %self.id, "removing a live restore wiring left behind");
+                    if let Err(e) = self.hv.set_live_restore(self.id, None).await {
+                        tracing::warn!(vm = %self.id, error = %e, "cannot remove the live restore wiring");
+                    }
+                }
                 // 템플릿(계획 58)은 스펙과 상관없이 켜지 않는다. API가 켜기를 막지만, 막기 전의 쓰기나 저장소를
                 // 직접 고친 경우를 막는다(켜면 연결 복제의 기반 디스크가 바뀐다).
                 if vm.spec.template {
@@ -2182,6 +2214,8 @@ impl Worker {
             }
             status.rule_violations = vm.status.rule_violations.clone();
             status.last_recovery = vm.status.last_recovery;
+            // 라이브 복원 상태는 그 Task만 쓴다(계획 68).
+            status.live_restore = vm.status.live_restore.clone();
             status.ha = merge_ha(&read_ha, &mine, vm.status.ha.clone());
             match self
                 .cluster

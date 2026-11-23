@@ -182,7 +182,11 @@ pub(crate) fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static st
         .filter(|t| !t.status.state.is_finished())
         .filter_map(|t| match t.spec.op {
             TaskOp::VmBackup { backup } if backup == id => Some("being created"),
-            TaskOp::BackupRestore { backup, .. } if backup == id => Some("being restored"),
+            TaskOp::BackupRestore { backup, .. } | TaskOp::BackupLiveRestore { backup, .. }
+                if backup == id =>
+            {
+                Some("being restored")
+            }
             TaskOp::BackupDelete if t.spec.target == id => Some("being deleted"),
             TaskOp::BackupReplicate { .. } if t.spec.target == id => Some("being replicated"),
             TaskOp::BackupConvert { .. } if t.spec.target == id => {

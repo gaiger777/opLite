@@ -217,6 +217,28 @@ pub(crate) fn template_node(state: &AppState, vm: &Vm) -> Uuid {
 /// [`check_no_snapshot_task`]의 반대쪽이다. 디스크 크기 늘리기도 같은 규칙이다. 마이그레이션 중인
 /// VM도 같다([`check_no_migration`]).
 pub(crate) fn check_not_busy(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_not_restoring(vm)?;
+    check_settled(state, vm)
+}
+
+/// 라이브 복원(계획 68 §11.4) 중인 VM이면 409 `vm_restoring`: 디스크를 다루는 동작(마이그레이션·스냅샷·백업·복제·디스크
+/// 핫플러그·크기 바꾸기·템플릿으로 바꾸기·지우기·정지)은 라이브 복원이 끝나거나 취소된 뒤에 한다. CPU·메모리·NIC 핫플러그,
+/// 강제 정지와 다시 켜기는 된다.
+pub(crate) fn check_not_restoring(vm: &Vm) -> Result<(), ApiError> {
+    if vm.status.live_restore.is_some() {
+        return Err(ApiError::conflict(
+            "vm_restoring",
+            format!(
+                "VM {:?} is being live-restored; wait for the live restore or cancel it",
+                vm.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_not_busy`]에서 라이브 복원 검사를 뺀 것(라이브 복원 중에도 되는 핫플러그가 쓴다)
+pub(crate) fn check_settled(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
     check_no_migration(state, vm)?;
     let settled = match vm.spec.power {
         PowerState::Running => vm.status.phase == VmPhase::Running,

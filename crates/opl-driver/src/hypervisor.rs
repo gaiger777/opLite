@@ -8,7 +8,9 @@ pub use opl_qemu::BitmapInfo;
 pub use opl_qemu::CpuProbe;
 use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
-use opl_types::runtime::{RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning, VmRuntimeSpec};
+use opl_types::runtime::{
+    LiveRestoreDisk, RuntimeDisk, RuntimeMedium, RuntimeNic, RuntimePinning, VmRuntimeSpec,
+};
 use opl_types::vm::{CpuSpec, RunningHardware};
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -19,6 +21,19 @@ use crate::migration::{
     MirrorTarget,
 };
 use crate::replication::{ReceiverExport, ReplicateRequest};
+
+/// 라이브 복원 mirror 하나의 상태(계획 68 §11.2, [`Hypervisor::start_live_restore`])
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveRestoreJob {
+    pub disk: usize,
+    /// 다 옮기고 게스트 쓰기를 대상에도 함께 쓰는 중(갈아탈 수 있음)
+    pub ready: bool,
+    /// 옮긴 바이트와 전체(늘 수 있다, QEMU `current-progress`·`total-progress`)
+    pub done_bytes: u64,
+    pub total_bytes: u64,
+    /// 백업을 읽지 못해 멈췄거나 오류로 끝났으면 그 까닭(다음 부름이 잇거나 다시 건다)
+    pub error: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopMode {
@@ -345,6 +360,28 @@ pub trait Hypervisor: Send + Sync {
         req: &FleeceRequest,
         success: bool,
     ) -> Result<(), DriverError>;
+
+    /// 라이브 복원 배선(계획 68 §11.2)을 VM 상태 디렉터리에 둔다(`Some`) — 다음 [`start`](Self::start)가 이 배선으로
+    /// 켠다(디스크마다 백업 → 오버레이, 장치는 오버레이, `rerror`·`werror`=stop) — 또는 배선과 그 오버레이 파일을
+    /// 지운다(`None`, 없으면 할 일이 없다). 오버레이 파일은 부르는 쪽이 만든다. 배선은 opld가 다시 떠도 남는다.
+    async fn set_live_restore(
+        &self,
+        id: Uuid,
+        disks: Option<&[LiveRestoreDisk]>,
+    ) -> Result<(), DriverError>;
+
+    /// 라이브 복원 배선이 있는지([`set_live_restore`](Self::set_live_restore)). reconciler가 켜기 전에 본다.
+    fn live_restore_wired(&self, id: Uuid) -> bool;
+
+    /// 라이브 복원 배선으로 켠 VM의 디스크마다 mirror(`opl-lr-{i}`: 오버레이 → 대상, `sync: full`,
+    /// `copy-mode: write-blocking`, 원본 오류면 멈춤)가 돌게 하고 그 상태를 돌려준다: 없으면 걸고, 오류로 멈췄으면 잇고,
+    /// 오류로 끝났으면 치운다(다음 부름이 처음부터 다시 건다). 여러 번 불러도 된다.
+    async fn start_live_restore(&self, id: Uuid) -> Result<Vec<LiveRestoreJob>, DriverError>;
+
+    /// 모든 mirror가 `ready`인 라이브 복원 VM을 대상 볼륨으로 갈아탄다: `job-complete`로 장치가 대상 노드(`disk{i}`)로
+    /// 바뀌고, 작업을 치우고 오버레이·백업 노드를 지운다. 이미 갈아탔으면(작업·노드가 없음) 할 일이 없다. 배선은
+    /// 그대로다(부르는 쪽이 [`set_live_restore`](Self::set_live_restore)`(None)`).
+    async fn pivot_live_restore(&self, id: Uuid) -> Result<(), DriverError>;
 
     /// 실행 중인 VM의 모든 디스크에서 내부 스냅샷 `tag`를 지운다. 태그가 없어도 성공한다.
     async fn snapshot_delete(&self, id: Uuid, tag: &str) -> Result<(), DriverError>;

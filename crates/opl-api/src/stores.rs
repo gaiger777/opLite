@@ -120,6 +120,33 @@ pub fn open_backend(
     }
 }
 
+/// `backup-serve` 헬퍼(라이브 복원 §11.1)에 줄 저장소 백엔드: 백업 풀 안 저장소는 이 노드의 디렉터리, S3는 그 대상.
+/// 쓸 수 없는 까닭은 [`open_backend`]와 같다.
+pub fn serve_backend(
+    cluster: &Cluster,
+    store: &BackupStore,
+    node: Uuid,
+    mount_root: &Path,
+) -> Result<opl_store::nbd::serve::ServeBackend, String> {
+    use opl_store::nbd::serve::ServeBackend;
+    match &store.spec.backend {
+        StoreBackend::Pool(name) => {
+            // 풀·노드 확인은 open_backend와 같다.
+            open_backend(cluster, store, node, mount_root)?;
+            let pool = backend_pool(cluster, store)?.expect("pool backend");
+            let root = check_pool_root(&pool, mount_root)
+                .map_err(|e| format!("storage pool {name:?}: {e}"))?;
+            Ok(ServeBackend::Local {
+                root: store_dir(&root, store),
+            })
+        }
+        StoreBackend::S3(target) => Ok(ServeBackend::S3 {
+            target: target.clone(),
+            max_streams: store.spec.max_streams,
+        }),
+    }
+}
+
 /// 이 노드에서 저장소를 연다(키 지문 확인).
 pub async fn open(
     cluster: &Cluster,

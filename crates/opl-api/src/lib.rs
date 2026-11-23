@@ -121,6 +121,7 @@ pub use replica_receive::{IncomingReplicas, REPLICA_SWEEP_INTERVAL, ReplicaConfi
 pub use replication::{ReplicationScheduler, ReplicationSchedulerConfig};
 pub use schedule::{SnapshotScheduler, SnapshotSchedulerConfig};
 pub use state::AppState;
+pub use tasks::live_restore::request_cancel as request_live_restore_cancel;
 pub use tasks::sdn::update_sdn as update_sdn_status;
 pub use tasks::{TaskRunner, TaskRunnerConfig};
 pub use telemetry::{TelemetryConfig, TelemetryReporter};

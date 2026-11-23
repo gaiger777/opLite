@@ -360,8 +360,8 @@ async fn chunk_cache_fetches_each_chunk_once_and_evicts_by_size() {
         cache.get(&store, &ix.ids[0], cb).await.unwrap()[..],
         image[..cb]
     );
-    for n in 1..3 {
-        cache.get(&store, &ix.ids[n], cb).await.unwrap();
+    for id in &ix.ids[1..3] {
+        cache.get(&store, id, cb).await.unwrap();
     }
     assert_eq!(cache.len(), 2);
     // 밀려난 청크는 다시 읽는다 — 망가뜨렸으니 오류이고 캐시에 남지 않는다.

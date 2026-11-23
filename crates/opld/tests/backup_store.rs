@@ -361,3 +361,146 @@ async fn running_vm_store_backups_restore_and_survive_gc() {
     assert!(same, "restored disk differs from the original");
     d.stop();
 }
+
+/// 실제 QEMU 라이브 복원(스테이지 5, 고리로): 실행 중 VM의 저장소 백업을 새 VM으로 라이브 복원한다 — `backup-serve` 헬퍼
+/// (이 orbivisord)가 백업을 내보내고 VM이 곧바로 켜진 뒤, mirror가 다 옮기면 갈아탄다. 끝나면 보통 VM이고 대상 볼륨은
+/// 원본과 같으며 헬퍼·오버레이는 없다.
+#[cfg(all(feature = "backup-it", feature = "qemu-it"))]
+#[tokio::test]
+async fn store_backup_live_restore_boots_and_pivots() {
+    use common::Daemon;
+    use serde_json::{Value, json};
+    use std::process::Command;
+
+    async fn hook(d: &Daemon, path: &str, body: Value) -> Value {
+        let http = reqwest::Client::builder()
+            .unix_socket(d.path("opld.sock"))
+            .build()
+            .unwrap();
+        let resp = http
+            .post(format!("http://opld/v1/test/{path}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        let ok = resp.status().is_success();
+        let text = resp.text().await.unwrap();
+        assert!(ok, "{path}: {text}");
+        serde_json::from_str(&text).unwrap()
+    }
+    async fn wait_task(d: &Daemon, id: &Value) -> Value {
+        let deadline = std::time::Instant::now() + Duration::from_secs(300);
+        loop {
+            let t = d.ctl_json(&["task", "get", id.as_str().unwrap()]).await;
+            let state = t["status"]["state"].as_str().unwrap_or("").to_string();
+            if state == "succeeded" || state == "failed" {
+                assert_eq!(state, "succeeded", "{t}");
+                return t;
+            }
+            assert!(std::time::Instant::now() < deadline, "{t}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
+    d.start().await;
+    d.init("lr-e2e").await;
+    d.login().await;
+    for (name, extra) in [("local", None), ("bk", Some("--backups"))] {
+        let dir = d.path(name);
+        std::fs::create_dir(&dir).unwrap();
+        let mut args = vec!["pool", "create", name, "--path", dir.to_str().unwrap()];
+        args.extend(extra);
+        d.ctl(&args).await.unwrap();
+        d.wait_pool_ready(name).await;
+    }
+    d.ctl(&[
+        "volume", "create", "root", "--pool", "local", "--size", "64M", "--format", "qcow2",
+    ])
+    .await
+    .unwrap();
+    let vol = d.ctl_json(&["volume", "get", "root"]).await;
+    let root = d
+        .path("local")
+        .join(format!("{}.qcow2", vol["id"].as_str().unwrap()));
+    let ok = Command::new("qemu-io")
+        .args(["-f", "qcow2", "-c", "write -P 0x5a 3M 9M"])
+        .arg(&root)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    d.ctl(&[
+        "vm", "create", "web", "--memory", "256", "--disk", "root", "--start",
+    ])
+    .await
+    .unwrap();
+    let node = d.ctl_json(&["node", "get", "node1"]).await["id"].clone();
+    let store = hook(
+        &d,
+        "put",
+        json!({"kind": "backup-store", "name": "st", "spec": {"backend": {"pool": "bk"}}}),
+    )
+    .await;
+    let t = hook(
+        &d,
+        "task",
+        json!({"op": {"kind": "backup-store-init"}, "target": store, "node": node}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+    let t = hook(
+        &d,
+        "backup",
+        json!({"vm": "web", "store": "st", "name": "b1"}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+    let b1 = d.ctl_json(&["backup", "get", "b1"]).await;
+    d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
+
+    let target = Uuid::now_v7();
+    let started = std::time::Instant::now();
+    let t = hook(
+        &d,
+        "task",
+        json!({"op": {"kind": "backup-live-restore", "backup": b1["id"], "name": "web2", "pool": "local"},
+               "target": target, "node": node}),
+    )
+    .await;
+    wait_task(&d, &t).await;
+    println!(
+        "PROBE live restore of a 64 MiB disk took {:?}",
+        started.elapsed()
+    );
+    let web2 = d.ctl_json(&["vm", "get", "web2"]).await;
+    assert_eq!(web2["status"]["phase"], "running", "{web2}");
+    assert!(web2["status"].get("live_restore").is_none(), "{web2}");
+    // 헬퍼·소켓이 치워졌다.
+    let run = d.data_dir().join("backup-run");
+    let left: Vec<_> = std::fs::read_dir(&run)
+        .map(|r| r.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(
+        !left.iter().any(|n| n
+            .to_string_lossy()
+            .starts_with(&format!("lr-{}", target.simple()))
+            && !n.to_string_lossy().ends_with(".log")),
+        "{left:?}"
+    );
+    d.ctl(&["vm", "stop", "web2", "--force"]).await.unwrap();
+    let copy = d.ctl_json(&["volume", "get", "web2-disk0"]).await;
+    let copy = d
+        .path("local")
+        .join(format!("{}.qcow2", copy["id"].as_str().unwrap()));
+    let same = Command::new("qemu-img")
+        .args(["compare", "-q", "-f", "qcow2", "-F", "qcow2"])
+        .arg(&copy)
+        .arg(&root)
+        .status()
+        .unwrap()
+        .success();
+    assert!(same, "live-restored disk differs from the original");
+    d.stop();
+}

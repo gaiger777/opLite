@@ -47,6 +47,8 @@ pub(crate) async fn start_replication(
         )));
     }
     check_not_migrating(&vm)?;
+    // 라이브 복원 중(계획 68)에는 디스크 노드가 아직 다 옮기지 않은 대상이다.
+    crate::snapshots::check_not_restoring(&vm)?;
     let running = vm.spec.power == PowerState::Running && vm.status.phase == VmPhase::Running;
     let Some(source) = vm.spec.node.filter(|_| running) else {
         return Err(ApiError::conflict(

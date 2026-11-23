@@ -1387,8 +1387,11 @@ async fn placed(ctx: Ctx<'_>, vm: &Vm, pick: Pick) -> Result<Option<Uuid>, Clust
 /// 옮겨 달라고 한 노드: 재시작 횟수를 넘긴 HA VM이 아직 그 노드에 배정되어 있고 켜져 있다.
 fn relocating(vm: &Vm) -> Option<Uuid> {
     let from = vm.status.ha.as_ref()?.relocate_from?;
-    (vm.spec.node == Some(from) && vm.spec.power == PowerState::Running && vm.spec.ha_active())
-        .then_some(from)
+    (vm.spec.node == Some(from)
+        && vm.spec.power == PowerState::Running
+        && vm.spec.ha_active()
+        && vm.status.live_restore.is_none())
+    .then_some(from)
 }
 
 /// 옮기기 창 안에서 다른 노드로 옮긴 기록이 있는 VM
@@ -1925,6 +1928,7 @@ async fn fail_back(
         .iter()
         .filter(|vm| vm.spec.ha_active() && vm.spec.power == PowerState::Running)
         .filter(|vm| vm.status.phase == VmPhase::Running && vm.status.migration.is_none())
+        .filter(|vm| vm.status.live_restore.is_none())
         .filter(|vm| !failback.failed.contains(&vm.id))
         .filter(|vm| !failback.waiting(vm.id, now))
         // 재시작 횟수를 넘겨 옮겨 온 VM은 옮기기 창 안에서 되돌리지 않는다(그 노드에서 다시 크래시하면 error다).
@@ -2052,9 +2056,11 @@ pub(crate) fn runs_ha(vm: &Vm, node: Uuid) -> bool {
 }
 
 /// 노드 `node`에 배정된 HA VM으로 실행하기로 된 것. `state: stopped`는 꺼져 있어도 노드를 옮긴다.
+/// 라이브 복원 중인 VM(계획 68 §11.4)은 오버레이가 그 노드에만 있어 다른 노드로 옮기지 않는다.
 fn recoverable(vm: &Vm, node: Uuid) -> bool {
     vm.spec.node == Some(node)
         && vm.spec.ha_active()
+        && vm.status.live_restore.is_none()
         && (vm.spec.power == PowerState::Running || stays_stopped(vm))
 }
 

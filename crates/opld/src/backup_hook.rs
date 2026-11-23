@@ -7,6 +7,9 @@
 //! - `POST /v1/test/task` `{op, target, node}`: Task를 곧바로 만든다(스테이지 4 — 저장소 초기화·GC·검증·옮기기). 답은 Task id.
 //! - `POST /v1/test/backup` `{vm, store, name, incremental}`: VM의 저장소 백업(`pending` Backup과 `vm-backup` Task)을 만든다.
 //!   Task는 `node`(없으면 VM이 도는 노드나 배치된 노드)에서 돈다. 답은 Task id.
+//! - `POST /v1/test/live-restore-cancel` `{vm}`(스테이지 5): VM의 라이브 복원을 취소하라고 적는다(스테이지 6의
+//!   `POST /vms/{key}/live-restore/cancel`과 같은 함수). 답은 취소를 하는 Task id. 라이브 복원은 `/v1/test/task`의
+//!   `backup-live-restore`(대상 = 새 VM id)로 시작한다.
 
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -46,6 +49,7 @@ pub fn routes<S: Clone + Send + Sync + 'static>() -> Router<S> {
         .route("/v1/test/put", post(put))
         .route("/v1/test/task", post(task))
         .route("/v1/test/backup", post(backup))
+        .route("/v1/test/live-restore-cancel", post(live_restore_cancel))
 }
 
 #[derive(Deserialize)]
@@ -179,4 +183,17 @@ async fn backup(Json(b): Json<NewBackup>) -> Result<Json<uuid::Uuid>, Failure> {
     cluster.create(&backup).await.map_err(bad)?;
     let op = opl_types::task::TaskOp::VmBackup { backup: backup.id };
     Ok(Json(create_task(&cluster, op, vm.id, node).await?))
+}
+
+#[derive(Deserialize)]
+struct Cancel {
+    vm: uuid::Uuid,
+}
+
+async fn live_restore_cancel(Json(b): Json<Cancel>) -> Result<Json<uuid::Uuid>, Failure> {
+    let cluster = member()?;
+    opl_api::request_live_restore_cancel(&cluster, b.vm)
+        .await
+        .map(Json)
+        .map_err(bad)
 }
