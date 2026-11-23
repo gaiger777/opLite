@@ -61,12 +61,9 @@ fn check_rule(state: &AppState, spec: &AlertRuleSpec) -> Result<(), ApiError> {
     if spec.condition.is_sdn() {
         require_feature(&state.cluster, opl_types::node::SDN_SERVICES)?;
     }
-    // 백업 저장소 조건(계획 68)은 API 스테이지 전까지 받지 않는다.
+    // 백업 저장소 조건(계획 68)도 옛 노드가 풀지 못한다.
     if spec.condition.is_backup_store() {
-        return Err(crate::backups::store_not_yet(
-            &state.cluster,
-            "backup store alert conditions",
-        ));
+        require_feature(&state.cluster, opl_types::node::BACKUP_STORE)?;
     }
     spec.validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;

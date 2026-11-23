@@ -11,8 +11,6 @@
 //! QEMU는 `-daemonize`로 떠 있으므로 opld가 멈추거나 죽어도 VM은 계속 돈다. 다시 시작하면
 //! 하이퍼바이저 드라이버가 살아 있는 VM에 다시 붙고 reconciler가 이어서 맞춘다.
 
-#[cfg(feature = "backup-it")]
-mod backup_hook;
 mod backup_serve;
 mod bootstrap;
 mod checks;

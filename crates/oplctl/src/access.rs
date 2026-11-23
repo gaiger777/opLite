@@ -266,6 +266,9 @@ pub(crate) struct QuotaArgs {
     /// 부하 분산기 수 상한(네트워크 폴더, `none`은 지우기)
     #[arg(long, value_name = "N|none")]
     load_balancers: Option<String>,
+    /// 백업이 차지하는 바이트 상한(VM 폴더 — 저장소 백업은 처음 쓴 바이트, `2T`, `none`은 지우기)
+    #[arg(long, value_name = "SIZE|none")]
+    backup_bytes: Option<String>,
 }
 
 impl QuotaArgs {
@@ -279,12 +282,13 @@ impl QuotaArgs {
             && self.floating_ips.is_none()
             && self.networks.is_none()
             && self.load_balancers.is_none()
+            && self.backup_bytes.is_none()
     }
 
     /// 지금 할당량(`null`이면 없음)에 준 차원을 덮은 새 할당량
     fn apply(&self, current: &Value) -> anyhow::Result<Value> {
         let mut q: Map<String, Value> = current.as_object().cloned().unwrap_or_default();
-        let dims: [(&str, &Option<String>, ParseFn); 9] = [
+        let dims: [(&str, &Option<String>, ParseFn); 10] = [
             ("vcpus", &self.vcpus, parse_count),
             ("memory_mib", &self.memory, parse_mib),
             ("disk_bytes", &self.disk, parse_size),
@@ -294,6 +298,7 @@ impl QuotaArgs {
             ("floating_ips", &self.floating_ips, parse_count),
             ("networks", &self.networks, parse_count),
             ("load_balancers", &self.load_balancers, parse_count),
+            ("backup_bytes", &self.backup_bytes, parse_size),
         ];
         for (key, value, parse) in dims {
             match value.as_deref() {
@@ -362,6 +367,9 @@ fn quota_text(q: &Value) -> String {
     if let Some(n) = q["load_balancers"].as_u64() {
         parts.push(format!("{n} load balancers"));
     }
+    if q["backup_bytes"].is_u64() {
+        parts.push(format!("{} backups", bytes(&q["backup_bytes"])));
+    }
     if parts.is_empty() {
         "-".into()
     } else {
@@ -392,7 +400,7 @@ pub(crate) enum FolderCmd {
         #[arg(long, value_enum, default_value = "vm")]
         kind: Tree,
         #[command(flatten)]
-        quota: QuotaArgs,
+        quota: Box<QuotaArgs>,
     },
     /// 폴더 이름을 바꾼다.
     Rename {
@@ -523,6 +531,7 @@ fn usage_lines(view: &Value) -> Vec<String> {
         ("floating_ips", "floating IPs"),
         ("networks", "networks"),
         ("load_balancers", "load balancers"),
+        ("backup_bytes", "backups"),
     ];
     let paths: BTreeMap<String, String> = view["limits"]
         .as_array()
@@ -532,7 +541,7 @@ fn usage_lines(view: &Value) -> Vec<String> {
         .collect();
     for (key, label) in dims {
         let shown = |v: &Value| {
-            if key == "disk_bytes" {
+            if key == "disk_bytes" || key == "backup_bytes" {
                 bytes(v)
             } else {
                 cell(v)
@@ -541,7 +550,12 @@ fn usage_lines(view: &Value) -> Vec<String> {
         // 전용 vCPU(계획 64)·라우터·유동 IP(계획 66)는 쓰거나 할당량이 있을 때만(지금 출력 그대로)
         if matches!(
             key,
-            "dedicated_vcpus" | "routers" | "floating_ips" | "networks" | "load_balancers"
+            "dedicated_vcpus"
+                | "routers"
+                | "floating_ips"
+                | "networks"
+                | "load_balancers"
+                | "backup_bytes"
         ) && usage[key].is_null()
             && view["binding"][key].is_null()
         {
@@ -670,8 +684,8 @@ pub(crate) async fn folder(
                 QuotaCmd::Set { folder, quota } => {
                     if quota.is_empty() {
                         bail!(
-                            "give --vcpus, --memory, --disk or --vms (VM folder), or --routers, \
-                             --floating-ips, --networks or --load-balancers (network folder)"
+                            "give --vcpus, --memory, --disk, --vms or --backup-bytes (VM folder), or \
+                             --routers, --floating-ips, --networks or --load-balancers (network folder)"
                         );
                     }
                     (folder, Some(quota))
@@ -1668,6 +1682,7 @@ mod tests {
             floating_ips: None,
             networks: None,
             load_balancers: None,
+            backup_bytes: None,
         };
         let merged = q.apply(&json!({ "vcpus": 32, "vms": 2 })).unwrap();
         assert_eq!(

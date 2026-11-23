@@ -52,14 +52,36 @@ const MAX_TPM_BYTES: u64 = opl_peer::firmware::MAX_TPM_BYTES;
 pub struct ReceiveRequest {
     /// 받는 쪽 백업 이름. 없으면 `{VM 이름}-{만든 시각}`이고, 겹치면 뒤에 `-2`, `-3`…을 붙인다.
     pub name: Option<String>,
-    /// 받을 백업 풀. 이 노드에서 쓸 수 있어야 한다.
+    /// 받을 백업 풀. 이 노드에서 쓸 수 있어야 한다. `store`와 둘 중 하나다.
+    #[serde(default)]
     pub pool: String,
-    /// 원본 백업의 매니페스트(`manifest.json`)
-    pub manifest: BackupManifest,
+    /// 받을 백업 저장소(계획 68 §12.4 — 저장소 백업의 사본). 이 노드에서 쓸 수 있어야 한다.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub store: Option<String>,
+    /// 원본 백업의 매니페스트: 풀이면 `manifest.json`(버전 1·2), 저장소면 `index.json`(버전 3)
+    #[schema(value_type = Object)]
+    pub manifest: serde_json::Value,
     pub origin: BackupOrigin,
     /// 증분 백업이면 받는 쪽(이 클러스터)에 있는 부모 사본의 id. 전체 백업이면 뺀다.
     #[serde(default)]
     pub parent: Option<Uuid>,
+    /// 저장소 사본의 VM 칸(매니페스트 v3에는 없고 암호화된 `config` 블롭에 있다). 저장소면 있어야 한다.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub config: Option<StoreCopyConfig>,
+}
+
+/// 저장소 사본의 VM 칸(`config` 블롭과 같은 내용)
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoreCopyConfig {
+    pub vm_name: String,
+    pub vm_spec: VmSpec,
+    #[serde(default)]
+    pub uefi_vars: bool,
+    #[serde(default)]
+    pub tpm_state: bool,
 }
 
 /// 받기 시작한 백업
@@ -230,6 +252,73 @@ pub(crate) fn drop_templates(spec: &mut VmSpec) {
     spec.template = false;
 }
 
+/// 받은 VM 스펙을 이 클러스터의 노드가 풀 수 있게 고친다(옛 노드가 모르는 칸은 버리고, 버리면 안 되는 TPM 상태·Secure
+/// Boot·게스트 에이전트는 모든 노드가 알 때만 받는다 — 409 `cluster_upgrading`). 폴더·복제 대상은 늘 버린다.
+fn adapt_spec(
+    state: &AppState,
+    spec: &mut VmSpec,
+    tpm_state: bool,
+    backup: Uuid,
+) -> Result<(), ApiError> {
+    // 계획 50 노드는 우선순위·게스트 감시를 풀지 못한다: 그 둘은 기본값으로 둔다.
+    if let Some(ha) = spec.ha.as_mut()
+        && ha.uses_fast_ha()
+        && !missing_feature(&state.cluster, FAST_HA)?.is_empty()
+    {
+        ha.priority = VmHa::default().priority;
+        ha.guest_watch = None;
+    }
+    // 옛 노드는 기본이 아닌 HA 정책 객체를 풀지 못한다: HA는 켠 채 정책 세부(그룹·횟수·상태)는 버린다.
+    if spec.ha.as_ref().is_some_and(|ha| *ha != VmHa::default())
+        && !missing_feature(&state.cluster, HA_PLACEMENT)?.is_empty()
+    {
+        spec.ha = Some(VmHa::default());
+    }
+    // 옛 노드는 VM 최적 배치 옵션을 풀지 못한다: 버린다(균형 조정기가 옮길 수 있다).
+    if spec.placement.is_some() && !missing_feature(&state.cluster, PLACEMENT)?.is_empty() {
+        spec.placement = None;
+    }
+    // 옛 노드는 핫플러그 상한을 풀지 못한다: 버린다(지금 크기 그대로 핫플러그만 꺼진다).
+    if (spec.cpu.max_vcpus.is_some() || spec.max_memory_mib.is_some())
+        && !missing_feature(&state.cluster, HOTPLUG)?.is_empty()
+    {
+        spec.cpu.max_vcpus = None;
+        spec.max_memory_mib = None;
+    }
+    // 옛 노드는 CD-ROM 드라이브·cloud-init이 든 VM 스펙을 풀지 못한다: 버리고, 디스크에 부팅 순서가 없으면 첫 디스크를
+    // 부팅 장치로 둔다(CD가 있을 때 디스크가 받던 순서).
+    if (!spec.cdroms.is_empty() || spec.cloud_init.is_some())
+        && !missing_feature(&state.cluster, INSTALL_MEDIA)?.is_empty()
+    {
+        tracing::warn!(
+            backup = %backup,
+            "a node does not know install media; dropping the CD-ROM drives and cloud-init of the received backup"
+        );
+        drop_install_media(spec);
+    }
+    // 옛 노드는 템플릿 표시가 든 VM 스펙을 풀지 못한다: 버린다(복원하면 보통 VM).
+    if spec.template && !missing_feature(&state.cluster, TEMPLATES)?.is_empty() {
+        tracing::warn!(
+            backup = %backup,
+            "a node does not know templates; the received backup restores as a plain VM"
+        );
+        drop_templates(spec);
+    }
+    // 보낸 클러스터의 폴더 id는 여기서 뜻이 없고 옛 노드는 그 칸을 풀지 못한다: 버린다(복원은 루트나 요청한 폴더, 리뷰 1).
+    spec.folder = None;
+    // TPM 상태·Secure Boot·게스트 에이전트(계획 59)는 버리지 않는다: TPM 상태를 버리면 봉인한 비밀을 잃는다. 옛 노드는
+    // 그 VM 스펙을 풀지 못하므로 모든 노드가 그 기능을 알 때만 받는다(409 `cluster_upgrading`).
+    if tpm_state || spec.tpm || spec.secure_boot {
+        require_feature(&state.cluster, VTPM)?;
+    }
+    if spec.guest_agent.is_some() {
+        require_feature(&state.cluster, GUEST_AGENT)?;
+    }
+    // 복제 대상은 원본 클러스터의 노드다: 늘 버린다.
+    spec.replication.clear();
+    Ok(())
+}
+
 /// 다른 클러스터의 백업 사본을 받기 시작한다(201): 매니페스트의 VM·스펙·디스크로 `receiving` 백업을
 /// 만들고 백업 풀에 그 디렉터리를 만든다. 풀이 없거나 백업 풀이 아니거나 매니페스트가 올바르지 않으면
 /// 400, 풀을 이 노드에서 쓸 수 없으면 409 `pool_not_on_node`·`pool_unavailable`, 같은 원본(CA 지문과
@@ -259,6 +348,9 @@ pub async fn receive_backup(
     if req.parent.is_some() {
         require_feature(&state.cluster, "incremental-replication")?;
     }
+    if let Some(store) = req.store.clone() {
+        return receive_store(&state, req, &store).await;
+    }
     let pool = find_pool(&state, &req.pool)?;
     if !pool.spec.backups {
         return Err(ApiError::bad_request(format!(
@@ -267,70 +359,15 @@ pub async fn receive_backup(
         )));
     }
     let root = pool_root(&state, &pool)?;
-    let mut manifest = req.manifest;
+    let mut manifest: BackupManifest = serde_json::from_value(req.manifest)
+        .map_err(|e| ApiError::bad_request(format!("invalid backup manifest: {e}")))?;
     check_manifest(&manifest, req.parent)?;
-    // 계획 50 노드는 우선순위·게스트 감시를 풀지 못한다: 그 둘은 기본값으로 둔다.
-    if let Some(ha) = manifest.vm_spec.ha.as_mut()
-        && ha.uses_fast_ha()
-        && !missing_feature(&state.cluster, FAST_HA)?.is_empty()
-    {
-        ha.priority = VmHa::default().priority;
-        ha.guest_watch = None;
-    }
-    // 옛 노드는 기본이 아닌 HA 정책 객체를 풀지 못한다: HA는 켠 채 정책 세부(그룹·횟수·상태)는 버린다.
-    if manifest
-        .vm_spec
-        .ha
-        .as_ref()
-        .is_some_and(|ha| *ha != VmHa::default())
-        && !missing_feature(&state.cluster, HA_PLACEMENT)?.is_empty()
-    {
-        manifest.vm_spec.ha = Some(VmHa::default());
-    }
-    // 옛 노드는 VM 최적 배치 옵션을 풀지 못한다: 버린다(균형 조정기가 옮길 수 있다).
-    if manifest.vm_spec.placement.is_some()
-        && !missing_feature(&state.cluster, PLACEMENT)?.is_empty()
-    {
-        manifest.vm_spec.placement = None;
-    }
-    // 옛 노드는 핫플러그 상한을 풀지 못한다: 버린다(지금 크기 그대로 핫플러그만 꺼진다).
-    if (manifest.vm_spec.cpu.max_vcpus.is_some() || manifest.vm_spec.max_memory_mib.is_some())
-        && !missing_feature(&state.cluster, HOTPLUG)?.is_empty()
-    {
-        manifest.vm_spec.cpu.max_vcpus = None;
-        manifest.vm_spec.max_memory_mib = None;
-    }
-    // 옛 노드는 CD-ROM 드라이브·cloud-init이 든 VM 스펙을 풀지 못한다: 버리고, 디스크에 부팅 순서가 없으면 첫 디스크를
-    // 부팅 장치로 둔다(CD가 있을 때 디스크가 받던 순서).
-    if (!manifest.vm_spec.cdroms.is_empty() || manifest.vm_spec.cloud_init.is_some())
-        && !missing_feature(&state.cluster, INSTALL_MEDIA)?.is_empty()
-    {
-        tracing::warn!(
-            backup = %manifest.backup,
-            "a node does not know install media; dropping the CD-ROM drives and cloud-init of the received backup"
-        );
-        drop_install_media(&mut manifest.vm_spec);
-    }
-    // 옛 노드는 템플릿 표시가 든 VM 스펙을 풀지 못한다: 버린다(복원하면 보통 VM).
-    if manifest.vm_spec.template && !missing_feature(&state.cluster, TEMPLATES)?.is_empty() {
-        tracing::warn!(
-            backup = %manifest.backup,
-            "a node does not know templates; the received backup restores as a plain VM"
-        );
-        drop_templates(&mut manifest.vm_spec);
-    }
-    // 보낸 클러스터의 폴더 id는 여기서 뜻이 없고 옛 노드는 그 칸을 풀지 못한다: 버린다(복원은 루트나 요청한 폴더, 리뷰 1).
-    manifest.vm_spec.folder = None;
-    // TPM 상태·Secure Boot·게스트 에이전트(계획 59)는 버리지 않는다: TPM 상태를 버리면 봉인한 비밀을 잃는다. 옛 노드는
-    // 그 VM 스펙을 풀지 못하므로 모든 노드가 그 기능을 알 때만 받는다(409 `cluster_upgrading`).
-    if manifest.tpm_state || manifest.vm_spec.tpm || manifest.vm_spec.secure_boot {
-        require_feature(&state.cluster, VTPM)?;
-    }
-    if manifest.vm_spec.guest_agent.is_some() {
-        require_feature(&state.cluster, GUEST_AGENT)?;
-    }
-    // 복제 대상은 원본 클러스터의 노드다: 늘 버린다.
-    manifest.vm_spec.replication.clear();
+    adapt_spec(
+        &state,
+        &mut manifest.vm_spec,
+        manifest.tpm_state,
+        manifest.backup,
+    )?;
     let (_, backups) = state.cluster.list::<BackupSpec>()?;
     if let Some(copy) = backups.iter().find(|b| {
         // 같은 원본이라도 다른 풀에 받은 것은 다른 사본이다.
@@ -552,6 +589,9 @@ pub async fn put_backup_file(
         .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
     let length = content_length(&headers)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    if backup.spec.store.is_some() {
+        return put_store_file(&state, &backup, &file, length, body).await;
+    }
     let dir = receiving_dir(&state, &backup)?;
     // 이름은 정해진 몇 개뿐이므로 경로 문자를 따로 볼 필요가 없다.
     let Some((_, size)) = expected_files(&backup)
@@ -696,6 +736,12 @@ pub async fn complete_backup(
         .authz
         .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    if backup.spec.store.is_some() {
+        complete_store(&state, &backup).await?;
+        let mut backup = lookup::<BackupSpec>(&state.cluster, &backup.id.to_string())?;
+        crate::backups::mask_backup(&state, &principal, &mut backup);
+        return Ok(Json(backup));
+    }
     let dir = receiving_dir(&state, &backup)?;
     check_not_deleting(&state, &backup)?;
     let mut missing = vec![];
@@ -775,6 +821,570 @@ pub async fn complete_backup(
     let mut backup = lookup::<BackupSpec>(&state.cluster, &current.id.to_string())?;
     crate::backups::mask_backup(&state, &principal, &mut backup);
     Ok(Json(backup))
+}
+
+// ---- 저장소 사본 받기(계획 68 §12.4) ----
+
+/// `chunks/missing` 한 번에 묻는 청크 수의 상한
+pub const MISSING_BATCH: usize = 4096;
+/// 받는 청크 객체의 최대 크기(4 MiB 청크 + 머리 12 + nonce 12 + 태그 16)
+const MAX_CHUNK_OBJECT: u64 = (4 << 20) + 64;
+/// 받는 블롭(UEFI 변수·TPM 상태·config)의 최대 크기
+const MAX_BLOB_OBJECT: u64 = (64 << 20) + 64;
+/// 커밋 구간에 들어가려고 GC 쓸기가 끝나기를 기다리는 시간
+const COMMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 이 노드에서 저장소를 연다. 이 노드가 쓸 수 없으면 409 `store_not_on_node`, 닿지 않으면 503 `store_unavailable`.
+async fn open_store_here(
+    state: &AppState,
+    store: &opl_types::backup_store::BackupStore,
+) -> Result<opl_store::Store, ApiError> {
+    crate::stores::usable_on_node(&state.cluster, store, state.node).map_err(|e| {
+        ApiError::conflict(
+            "store_not_on_node",
+            format!(
+                "{e}; register this cluster as a remote with the URL of a node using the store"
+            ),
+        )
+    })?;
+    crate::stores::open(&state.cluster, store, state.node, &state.mount_root)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "store_unavailable", e))
+}
+
+/// 받는 중인 저장소 사본과 그 저장소(이 노드에서 연 것). 받는 중이 아니면 409 `backup_not_receiving`.
+async fn receiving_store(state: &AppState, backup: &Backup) -> Result<opl_store::Store, ApiError> {
+    if backup.status.phase != BackupPhase::Receiving {
+        return Err(ApiError::conflict(
+            "backup_not_receiving",
+            format!("backup {:?} is not receiving files", backup.name),
+        ));
+    }
+    let name = backup.spec.store.as_deref().unwrap_or_default();
+    let store = crate::backups::find_store(state, name)?;
+    open_store_here(state, &store).await
+}
+
+fn store_err(name: &str, e: opl_store::StoreError) -> ApiError {
+    match e {
+        opl_store::StoreError::Unavailable(_) | opl_store::StoreError::Io(_) => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "store_unavailable",
+            crate::stores::store_error(name, e),
+        ),
+        _ => ApiError::bad_request(crate::stores::store_error(name, e)),
+    }
+}
+
+/// 저장소 사본 받기 시작(201): 받는 저장소가 준비돼 있고 쓰기 저장소이며 이 노드에서 쓸 수 있고, 같은 키(지문)이거나 둘 다
+/// 평문이어야 한다(409 `store_key_mismatch`). 같은 원본의 사본이 그 저장소에 있으면 409 `replica_exists`.
+async fn receive_store(
+    state: &AppState,
+    req: ReceiveRequest,
+    store_name: &str,
+) -> Result<(StatusCode, Json<ReceivingBackup>), ApiError> {
+    require_feature(&state.cluster, opl_types::node::BACKUP_STORE)?;
+    if !req.pool.is_empty() || req.parent.is_some() {
+        return Err(ApiError::bad_request(
+            "a copy for a backup store takes store without pool or parent",
+        ));
+    }
+    let mut config = req
+        .config
+        .ok_or_else(|| ApiError::bad_request("a copy for a backup store needs config"))?;
+    let m: opl_store::format::manifest::Manifest = serde_json::from_value(req.manifest)
+        .map_err(|e| ApiError::bad_request(format!("invalid backup store manifest: {e}")))?;
+    if m.version != opl_store::format::manifest::VERSION {
+        return Err(ApiError::bad_request(format!(
+            "backup store manifest version {} is not supported (this node reads version {})",
+            m.version,
+            opl_store::format::manifest::VERSION
+        )));
+    }
+    validate_name(&config.vm_name)
+        .map_err(|e| ApiError::bad_request(format!("invalid VM name: {e}")))?;
+    config
+        .vm_spec
+        .validate()
+        .map_err(|e| ApiError::bad_request(format!("invalid VM spec: {e}")))?;
+    if m.disks.len() != config.vm_spec.disks.len()
+        || m.disks
+            .iter()
+            .enumerate()
+            .any(|(i, d)| d.name != format!("disk{i}") || d.index != format!("disk{i}.fidx"))
+    {
+        return Err(ApiError::bad_request(
+            "the manifest disks must be disk0.. with indexes disk0.fidx.., one per disk of the VM spec",
+        ));
+    }
+    let store = crate::backups::find_store(state, store_name)?;
+    crate::backups::check_store(&store, true)?;
+    let theirs = m.encryption.as_ref().map(|e| e.fingerprint.as_str());
+    let ours = store
+        .spec
+        .encryption
+        .as_ref()
+        .map(|e| e.fingerprint.as_str());
+    if theirs != ours {
+        return Err(ApiError::conflict(
+            "store_key_mismatch",
+            format!(
+                "backup store {store_name:?} uses {} but the backup uses {}; import the same key into the receiving store",
+                ours.map_or("no encryption".to_string(), |f| format!("key {f}")),
+                theirs.map_or("no encryption".to_string(), |f| format!("key {f}")),
+            ),
+        ));
+    }
+    open_store_here(state, &store).await?;
+    adapt_spec(state, &mut config.vm_spec, config.tpm_state, m.backup)?;
+    let (_, backups) = state.cluster.list::<BackupSpec>()?;
+    if let Some(copy) = backups.iter().find(|b| {
+        b.spec.store.as_deref() == Some(store_name)
+            && b.spec.origin.as_ref().is_some_and(|o| {
+                o.ca_fingerprint == req.origin.ca_fingerprint && o.backup == req.origin.backup
+            })
+    }) {
+        let mut e = ApiError::conflict(
+            "replica_exists",
+            format!(
+                "backup {:?} is already a copy of backup {} of cluster {:?}",
+                copy.name, req.origin.backup, req.origin.cluster
+            ),
+        );
+        e.details = Some(serde_json::json!({ "backup": copy.id }));
+        return Err(e);
+    }
+    let taken: HashSet<&str> = backups.iter().map(|b| b.name.as_str()).collect();
+    let base = req
+        .name
+        .unwrap_or_else(|| default_backup_name(&config.vm_name, m.created_at));
+    let name = free_name(&base, |n| taken.contains(n));
+    let mut backup: Backup = Resource::new(
+        name,
+        BackupSpec {
+            vm: m.vm,
+            vm_name: config.vm_name,
+            pool: String::new(),
+            vm_spec: config.vm_spec,
+            job: None,
+            origin: Some(req.origin),
+            incremental: false,
+            max_chain: None,
+            source: None,
+            store: Some(store_name.to_string()),
+        },
+    );
+    backup.status = BackupStatus {
+        phase: BackupPhase::Receiving,
+        created_at: Some(m.created_at),
+        disks: m
+            .disks
+            .iter()
+            .map(|d| BackupDisk {
+                name: d.name.clone(),
+                file: d.index.clone(),
+                virtual_bytes: d.virtual_bytes,
+                stored_bytes: 0,
+                sha256: None,
+            })
+            .collect(),
+        uefi_vars: config.uefi_vars,
+        tpm_state: config.tpm_state,
+        received_at: Some(now()),
+        ..Default::default()
+    };
+    state.cluster.create(&backup).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(ReceivingBackup {
+            id: backup.id,
+            name: backup.name,
+        }),
+    ))
+}
+
+/// 저장소 사본이 받는 파일: 인덱스마다 `disk{i}.fidx`, `config`, UEFI 변수·TPM 상태 블롭
+fn expected_store_files(backup: &Backup) -> Vec<String> {
+    let mut files: Vec<String> = backup.status.disks.iter().map(|d| d.file.clone()).collect();
+    files.push(opl_store::format::manifest::CONFIG_BLOB.to_string());
+    if backup.status.uefi_vars {
+        files.push(opl_store::format::manifest::VARS_BLOB.to_string());
+    }
+    if backup.status.tpm_state {
+        files.push(opl_store::format::manifest::TPM_BLOB.to_string());
+    }
+    files
+}
+
+/// 본문을 `limit` 바이트까지 메모리로 받는다(`length`는 `Content-Length`).
+async fn read_body(
+    body: Body,
+    length: u64,
+    limit: u64,
+    idle: std::time::Duration,
+) -> Result<Vec<u8>, ApiError> {
+    if length > limit {
+        return Err(ApiError::bad_request(format!(
+            "the upload must not be larger than {limit} bytes"
+        )));
+    }
+    let mut out = Vec::with_capacity(length as usize);
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = tokio::time::timeout(idle, stream.next())
+        .await
+        .map_err(|_| ApiError::bad_request("the upload stalled"))?
+    {
+        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload failed: {e}")))?;
+        if out.len() as u64 + chunk.len() as u64 > length {
+            return Err(ApiError::bad_request(
+                "upload is longer than Content-Length",
+            ));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    if out.len() as u64 != length {
+        return Err(ApiError::bad_request("upload ended early"));
+    }
+    Ok(out)
+}
+
+/// 저장소 사본의 인덱스·블롭 하나를 받는다: 인덱스는 이 사본의 백업 id로 다시 써 넣고(청크 id는 그대로), 블롭은 풀어
+/// 맞춰 본 뒤 그대로 쓴다. 받은 내용의 SHA-256과 크기를 돌려준다.
+async fn put_store_file(
+    state: &AppState,
+    backup: &Backup,
+    file: &str,
+    length: u64,
+    body: Body,
+) -> Result<Json<ReceivedFile>, ApiError> {
+    let name = backup.spec.store.as_deref().unwrap_or_default();
+    if !expected_store_files(backup).iter().any(|f| f == file) {
+        return Err(ApiError::bad_request(format!(
+            "backup {:?} has no file {file:?}",
+            backup.name
+        )));
+    }
+    let store = receiving_store(state, backup).await?;
+    let _receiving = ReceivingFile::take(state, backup, file)?;
+    let bytes = read_body(body, length, MAX_BLOB_OBJECT, state.receive_idle_timeout).await?;
+    let sha256 = hex::encode(Sha256::digest(&bytes));
+    if let Some(disk) = file.strip_suffix(".fidx") {
+        let mut ix = opl_store::format::index::FixedIndex::from_bytes(&bytes)
+            .map_err(|e| ApiError::bad_request(format!("{file}: {e}")))?;
+        let expected = backup
+            .status
+            .disks
+            .iter()
+            .find(|d| d.file == file)
+            .map(|d| d.virtual_bytes);
+        if Some(ix.virtual_bytes) != expected || ix.keyed != store.encrypted() {
+            return Err(ApiError::bad_request(format!(
+                "{file} does not match the manifest of backup {:?}",
+                backup.name
+            )));
+        }
+        ix.backup = backup.id;
+        store
+            .put_index(backup.spec.vm, backup.id, disk, &ix)
+            .await
+            .map_err(|e| store_err(name, e))?;
+    } else {
+        store
+            .put_blob_object(backup.spec.vm, backup.id, file, bytes)
+            .await
+            .map_err(|e| store_err(name, e))?;
+    }
+    record_received(state, backup.id).await?;
+    Ok(Json(ReceivedFile {
+        sha256,
+        size: length,
+    }))
+}
+
+/// 받은 시각(`received_at`)을 적는다(janitor가 오래 멈춘 받기의 커밋 잠금을 풀 때 본다).
+async fn record_received(state: &AppState, id: Uuid) -> Result<(), ApiError> {
+    record_file(state, id, "", "").await
+}
+
+/// 받을 청크를 묻는 본문
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ChunkIds {
+    /// 청크 id(16진 64자), 4096개까지
+    pub ids: Vec<String>,
+}
+
+/// 받는 쪽 저장소에 없는 청크
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct MissingChunks {
+    pub missing: Vec<String>,
+}
+
+fn parse_chunk_id(s: &str) -> Result<opl_types::backup_store::ChunkId, ApiError> {
+    let mut id = [0u8; 32];
+    hex::decode_to_slice(s, &mut id)
+        .map_err(|_| ApiError::bad_request(format!("{s:?} is not a chunk id (64 hex digits)")))?;
+    Ok(id)
+}
+
+/// 받는 중인 저장소 사본에 보낼 청크 가운데 받는 쪽 저장소에 없는 것(200). 4096개까지 묻는다(400).
+#[utoipa::path(post, path = "/backups/{key}/chunks/missing", tag = "backups",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = ChunkIds,
+    responses((status = 200, body = MissingChunks), (status = "4XX", body = crate::error::ErrorBody),
+              (status = 503, body = crate::error::ErrorBody)))]
+pub async fn missing_chunks(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<ChunkIds>,
+) -> Result<Json<MissingChunks>, ApiError> {
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
+    if req.ids.len() > MISSING_BATCH {
+        return Err(ApiError::bad_request(format!(
+            "ask for at most {MISSING_BATCH} chunks at a time"
+        )));
+    }
+    let ids = req
+        .ids
+        .iter()
+        .map(|s| parse_chunk_id(s))
+        .collect::<Result<Vec<_>, _>>()?;
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    let store = receiving_store(&state, &backup).await?;
+    let missing = store
+        .missing_chunks(&ids)
+        .await
+        .map_err(|e| store_err(backup.spec.store.as_deref().unwrap_or_default(), e))?;
+    Ok(Json(MissingChunks {
+        missing: missing.iter().map(hex::encode).collect(),
+    }))
+}
+
+/// 저장소 사본의 청크 객체 하나를 받는다(204): 받는 쪽 키로 풀어 id·인증 태그를 맞춰 본 뒤 그대로 쓴다. 맞지 않으면 400.
+/// 크기 상한은 4 MiB 청크와 머리·태그다.
+#[utoipa::path(put, path = "/backups/{key}/chunks/{id}", tag = "backups",
+    params(
+        ("key" = String, Path, description = "id or name"),
+        ("id" = String, Path, description = "chunk id (64 hex digits)"),
+    ),
+    request_body(content = BackupFile, content_type = "application/octet-stream"),
+    responses((status = 204), (status = "4XX", body = crate::error::ErrorBody), (status = 503, body = crate::error::ErrorBody)))]
+pub async fn put_chunk(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Path((key, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Body,
+) -> Result<StatusCode, ApiError> {
+    state
+        .authz
+        .require_root(&principal, opl_types::authz::Privilege::BackupCreate)?;
+    let length = content_length(&headers)?;
+    let id = parse_chunk_id(&id)?;
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    if backup.spec.store.is_none() {
+        return Err(ApiError::bad_request(format!(
+            "backup {:?} is not a copy for a backup store",
+            backup.name
+        )));
+    }
+    let store = receiving_store(&state, &backup).await?;
+    let bytes = read_body(body, length, MAX_CHUNK_OBJECT, state.receive_idle_timeout).await?;
+    store
+        .put_chunk_object(&id, bytes)
+        .await
+        .map_err(|e| store_err(backup.spec.store.as_deref().unwrap_or_default(), e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 저장소 상태를 읽은 revision에서 바꾼다(`f`가 `None`이면 쓰지 않음).
+async fn update_store_status(
+    state: &AppState,
+    id: Uuid,
+    mut f: impl FnMut(&mut opl_types::backup_store::BackupStoreStatus) -> Option<()>,
+) -> Result<opl_types::backup_store::BackupStoreStatus, ApiError> {
+    loop {
+        let store = state
+            .cluster
+            .get::<opl_types::backup_store::BackupStoreSpec>(id)?
+            .ok_or_else(|| ApiError::conflict("store_not_ready", "the backup store was deleted"))?;
+        let mut status = store.status.clone();
+        if f(&mut status).is_none() {
+            return Ok(store.status);
+        }
+        match state
+            .cluster
+            .update_status_checked::<opl_types::backup_store::BackupStoreSpec>(
+                id,
+                store.revision,
+                &status,
+            )
+            .await
+        {
+            Ok(_) => return Ok(status),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// 저장소 사본 받기를 끝낸다: 모든 인덱스·블롭이 있고, 커밋 구간(GC 쓸기와 겹치지 않음 — §10.3) 안에서 인덱스가 가리키는
+/// 모든 청크가 저장소에 있으면 이 사본의 매니페스트를 써서 `ready`로. 빠진 파일은 409 `backup_incomplete`(`details.files`),
+/// 빠진 청크는 409 `backup_incomplete`(`details.chunks` — 보내는 쪽이 다시 보내고 완료를 다시 청한다).
+async fn complete_store(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
+    let name = backup.spec.store.clone().unwrap_or_default();
+    let store = receiving_store(state, backup).await?;
+    check_not_deleting(state, backup)?;
+    let res = crate::backups::find_store(state, &name)?;
+    let (vm, id) = (backup.spec.vm, backup.id);
+    let mut missing_files = Vec::new();
+    let mut disks = Vec::new();
+    let mut ids: HashSet<opl_types::backup_store::ChunkId> = HashSet::new();
+    let (mut logical, mut zero) = (0u64, 0u64);
+    for (i, _) in backup.status.disks.iter().enumerate() {
+        match store.index_entry(vm, id, &format!("disk{i}")).await {
+            Ok((entry, ix)) => {
+                logical += ix.virtual_bytes;
+                zero += entry.zero_chunks;
+                ids.extend(
+                    ix.ids
+                        .iter()
+                        .filter(|c| **c != opl_types::backup_store::ZERO_CHUNK),
+                );
+                disks.push(entry);
+            }
+            Err(opl_store::StoreError::NotFound(_)) => missing_files.push(format!("disk{i}.fidx")),
+            Err(e) => return Err(store_err(&name, e)),
+        }
+    }
+    let mut blobs = Vec::new();
+    for file in expected_store_files(backup)
+        .into_iter()
+        .filter(|f| !f.ends_with(".fidx"))
+    {
+        match store.blob_entry(vm, id, &file).await {
+            Ok(b) => blobs.push(b),
+            Err(opl_store::StoreError::NotFound(_)) => missing_files.push(file),
+            Err(e) => return Err(store_err(&name, e)),
+        }
+    }
+    if !missing_files.is_empty() {
+        let mut e = ApiError::conflict(
+            "backup_incomplete",
+            format!(
+                "backup {:?} is missing files: {}",
+                backup.name,
+                missing_files.join(", ")
+            ),
+        );
+        e.details = Some(serde_json::json!({ "files": missing_files }));
+        return Err(e);
+    }
+    record_received(state, id).await?;
+    // 커밋 구간: 쓸기 중이면 기다린다.
+    let deadline = tokio::time::Instant::now() + COMMIT_WAIT;
+    loop {
+        let mut entered = false;
+        update_store_status(state, res.id, |s| {
+            if s.committing.contains(&id) {
+                entered = true;
+                return None;
+            }
+            if s.sweeping {
+                return None;
+            }
+            s.committing.push(id);
+            entered = true;
+            Some(())
+        })
+        .await?;
+        if entered {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::conflict(
+                "store_busy",
+                format!("backup store {name:?} is being garbage-collected; try again"),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let committed = async {
+        let ids: Vec<_> = ids.into_iter().collect();
+        let missing = store
+            .missing_chunks(&ids)
+            .await
+            .map_err(|e| store_err(&name, e))?;
+        if !missing.is_empty() {
+            let mut e = ApiError::conflict(
+                "backup_incomplete",
+                format!(
+                    "backup {:?} is missing {} chunk(s) in the store",
+                    backup.name,
+                    missing.len()
+                ),
+            );
+            e.details = Some(serde_json::json!({
+                "chunks": missing.iter().map(hex::encode).collect::<Vec<_>>()
+            }));
+            return Err(e);
+        }
+        let mut m = store.new_manifest(
+            vm,
+            id,
+            backup.status.created_at.unwrap_or_default(),
+            disks,
+            blobs,
+        );
+        store
+            .put_manifest(&mut m)
+            .await
+            .map_err(|e| store_err(&name, e))
+    }
+    .await;
+    let left = update_store_status(state, res.id, |s| {
+        if !s.committing.contains(&id) {
+            return None;
+        }
+        s.committing.retain(|b| *b != id);
+        Some(())
+    })
+    .await;
+    if let Err(e) = left {
+        tracing::warn!(backup = %id, error = %e.message, "cannot leave the commit section; the janitor will");
+    }
+    committed?;
+    loop {
+        let current = lookup::<BackupSpec>(&state.cluster, &id.to_string())?;
+        if current.status.phase != BackupPhase::Receiving {
+            return Err(ApiError::conflict(
+                "backup_not_receiving",
+                format!("backup {:?} is not receiving files", backup.name),
+            ));
+        }
+        let status = BackupStatus {
+            phase: BackupPhase::Ready,
+            error: None,
+            store_stats: Some(opl_types::backup::StoreBackupStats {
+                logical_bytes: logical,
+                zero_chunks: zero,
+                ..Default::default()
+            }),
+            ..current.status.clone()
+        };
+        match state
+            .cluster
+            .update_status_checked::<BackupSpec>(id, current.revision, &status)
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClusterError::Rejected(Rejection::RevisionMismatch { .. })) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 #[cfg(test)]

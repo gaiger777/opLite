@@ -158,13 +158,11 @@ async fn ready_store(ctx: &Ctx, id: Uuid, write: bool) -> Result<(BackupStore, S
 
 // ---- GC(§10.2) ----
 
-/// 기다림 집합 W의 상태: 이 저장소에 아직 쓰는 중인 백업(만드는 중·받는 중)
+/// 기다림 집합 W의 상태: 이 저장소에 아직 쓰는 중인 백업(만드는 중). 원격에서 받는 사본(`receiving`)은 넣지 않는다 — 받기
+/// 완료가 커밋 구간 안에서 인덱스의 모든 청크가 있는지 보고 없으면 보내는 쪽이 다시 보내므로(계획 68 스테이지 6) 쓸기를
+/// 막을 까닭이 없고, 보내는 쪽이 멈춘 사본이 GC를 하루 동안 붙잡지 않는다.
 fn writing(b: &Backup, store: &str) -> bool {
-    b.spec.target() == Ok(BackupTarget::Store(store))
-        && matches!(
-            b.status.phase,
-            BackupPhase::Pending | BackupPhase::Receiving
-        )
+    b.spec.target() == Ok(BackupTarget::Store(store)) && b.status.phase == BackupPhase::Pending
 }
 
 /// 저장소 GC(§10.2): 표식과 T0 → Raft에 `gc`(L) → 기다림 집합 W → 모든 인덱스 표시 → W가 끝나기를 기다림(그새 생긴

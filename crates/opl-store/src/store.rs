@@ -199,6 +199,93 @@ impl Store {
         self.backend.get(&chunk_key(id)).await
     }
 
+    /// 다른 저장소(같은 키)에서 온 청크 객체를 그대로 쓴다(원격 복제 받기 — 설계 §12.4). 쓰기 전에 풀어 id·인증 태그를
+    /// 맞춰 보므로 깨지거나 다른 키의 객체는 받지 않는다.
+    pub async fn put_chunk_object(&self, id: &ChunkId, obj: Vec<u8>) -> Result<(), StoreError> {
+        if *id == ZERO_CHUNK {
+            return Err(StoreError::Invalid("the zero chunk is not stored".into()));
+        }
+        chunk::decode(&obj, id, self.keys())
+            .map_err(|e| StoreError::Corrupt(format!("chunk {}: {e}", hex::encode(id))))?;
+        self.backend.put(&chunk_key(id), obj).await
+    }
+
+    /// 스냅샷 객체(인덱스·블롭)를 그대로 읽는다(복제 보내기).
+    pub async fn get_snapshot_object(
+        &self,
+        vm: Uuid,
+        backup: Uuid,
+        name: &str,
+    ) -> Result<Vec<u8>, StoreError> {
+        self.backend.get(&Self::snap_key(vm, backup, name)).await
+    }
+
+    /// 다른 저장소(같은 키)에서 온 블롭 객체를 그대로 쓴다(풀어 맞춰 본 뒤). 매니페스트의 블롭 칸을 돌려준다.
+    pub async fn put_blob_object(
+        &self,
+        vm: Uuid,
+        backup: Uuid,
+        name: &str,
+        obj: Vec<u8>,
+    ) -> Result<ManifestBlob, StoreError> {
+        chunk::decode_blob(name, &obj, self.keys())
+            .map_err(|e| StoreError::Corrupt(format!("blob {name}: {e}")))?;
+        let sha = hex::encode(sha256(&obj));
+        self.backend
+            .put(&Self::snap_key(vm, backup, name), obj)
+            .await?;
+        Ok(ManifestBlob {
+            name: name.into(),
+            sha256: sha,
+        })
+    }
+
+    /// 쓴 블롭 객체의 매니페스트 칸(풀어 맞춰 본 뒤 — 복제 받기의 완료)
+    pub async fn blob_entry(
+        &self,
+        vm: Uuid,
+        backup: Uuid,
+        name: &str,
+    ) -> Result<ManifestBlob, StoreError> {
+        let obj = self.get_snapshot_object(vm, backup, name).await?;
+        chunk::decode_blob(name, &obj, self.keys())
+            .map_err(|e| StoreError::Corrupt(format!("blob {name}: {e}")))?;
+        Ok(ManifestBlob {
+            name: name.into(),
+            sha256: hex::encode(sha256(&obj)),
+        })
+    }
+
+    /// 쓴 인덱스의 매니페스트 칸과 인덱스(복제 받기의 완료). `name`은 `disk{i}`.
+    pub async fn index_entry(
+        &self,
+        vm: Uuid,
+        backup: Uuid,
+        name: &str,
+    ) -> Result<(ManifestDisk, FixedIndex), StoreError> {
+        let file = format!("{name}.fidx");
+        let bytes = self.get_snapshot_object(vm, backup, &file).await?;
+        let ix = FixedIndex::from_bytes(&bytes)?;
+        if ix.backup != backup
+            || ix.keyed != self.encrypted()
+            || ix.chunk_bytes != self.info.chunk_bytes
+        {
+            return Err(StoreError::Corrupt(format!(
+                "index {file}: does not belong to this backup and store"
+            )));
+        }
+        let zero = ix.ids.iter().filter(|id| **id == ZERO_CHUNK).count() as u64;
+        let entry = ManifestDisk {
+            name: name.into(),
+            virtual_bytes: ix.virtual_bytes,
+            index: file,
+            index_sha256: hex::encode(sha256(&bytes)),
+            chunks: ix.ids.len() as u64,
+            zero_chunks: zero,
+        };
+        Ok((entry, ix))
+    }
+
     /// 청크를 읽어 풀고 id를 맞춰 본다. 0 청크면 `len` 바이트의 0.
     pub async fn get_chunk(&self, id: &ChunkId, len: usize) -> Result<Vec<u8>, StoreError> {
         if *id == ZERO_CHUNK {
@@ -490,6 +577,67 @@ mod tests {
 
     fn mem() -> Arc<MemBackend> {
         Arc::new(MemBackend::new())
+    }
+
+    /// 복제 받기(§12.4): 같은 키의 다른 저장소가 쓴 청크·블롭 객체를 그대로 받고, 인덱스는 받는 쪽 백업 id로 다시 써서
+    /// 받는 쪽 매니페스트로 커밋하면 읽힌다. 깨진 객체·다른 키의 객체·0 청크는 받지 않는다.
+    #[tokio::test]
+    async fn raw_objects_copy_between_stores_with_the_same_key() {
+        let mk = MasterKey::generate();
+        let a = Store::init(mem(), Uuid::from_u128(1), Some(&mk), 1)
+            .await
+            .unwrap();
+        let b = Store::init(mem(), Uuid::from_u128(2), Some(&mk), 1)
+            .await
+            .unwrap();
+        let other = Store::init(mem(), Uuid::from_u128(3), Some(&MasterKey::generate()), 1)
+            .await
+            .unwrap();
+        let (vm, src, dst) = (Uuid::from_u128(9), Uuid::from_u128(10), Uuid::from_u128(11));
+        let image: Vec<u8> = (0..CHUNK_BYTES as usize + 1000)
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let m = crate::testing::write_backup(&a, vm, src, std::slice::from_ref(&image))
+            .await
+            .unwrap();
+        let ix = a.read_index(&m, &m.disks[0]).await.unwrap();
+        for id in &ix.ids {
+            let obj = a.get_chunk_object(id).await.unwrap();
+            assert!(other.put_chunk_object(id, obj.clone()).await.is_err());
+            let mut bad = obj.clone();
+            *bad.last_mut().unwrap() ^= 1;
+            assert!(b.put_chunk_object(id, bad).await.is_err());
+            b.put_chunk_object(id, obj).await.unwrap();
+        }
+        assert!(b.put_chunk_object(&ZERO_CHUNK, vec![]).await.is_err());
+        let config = a.get_snapshot_object(vm, src, CONFIG_BLOB).await.unwrap();
+        let blob = b
+            .put_blob_object(vm, dst, CONFIG_BLOB, config.clone())
+            .await
+            .unwrap();
+        assert!(
+            other
+                .put_blob_object(vm, dst, CONFIG_BLOB, config)
+                .await
+                .is_err()
+        );
+        let mut copy = ix.clone();
+        copy.backup = dst;
+        b.put_index(vm, dst, "disk0", &copy).await.unwrap();
+        let (entry, got) = b.index_entry(vm, dst, "disk0").await.unwrap();
+        assert_eq!(got.ids, ix.ids);
+        assert_eq!(b.blob_entry(vm, dst, CONFIG_BLOB).await.unwrap(), blob);
+        let mut m2 = b.new_manifest(vm, dst, 1, vec![entry], vec![blob]);
+        b.put_manifest(&mut m2).await.unwrap();
+        let m2 = b.read_manifest(vm, dst).await.unwrap();
+        let ix2 = b.read_index(&m2, &m2.disks[0]).await.unwrap();
+        let mut back = Vec::new();
+        for (i, id) in ix2.ids.iter().enumerate() {
+            back.extend(b.get_chunk(id, ix2.chunk_len(i) as usize).await.unwrap());
+        }
+        assert!(back == image);
+        // 다른 백업의 인덱스는 이 백업의 칸이 아니다.
+        assert!(b.index_entry(vm, src, "disk0").await.is_err());
     }
 
     #[tokio::test]

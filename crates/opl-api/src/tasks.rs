@@ -702,6 +702,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
             TaskOp::BackupDelete
                 | TaskOp::BackupReplicate { .. }
                 | TaskOp::BackupConvert { .. }
+                | TaskOp::BackupCopy { .. }
                 | TaskOp::VmImportDelete
         );
         let node_queue = task.spec.op == TaskOp::NodeDrain;
@@ -804,6 +805,7 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
                 | TaskOp::BackupStoreVerify { .. }
                 | TaskOp::BackupStoreScan
                 | TaskOp::BackupConvert { .. }
+                | TaskOp::BackupCopy { .. }
                 | TaskOp::BackupLiveRestore { .. }
         )
         || matches!(task.spec.op, TaskOp::NetworkMigrate { .. });
@@ -920,6 +922,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     match &task.spec.op {
         TaskOp::BackupConvert { store } => {
             backup_store::discard_convert(ctx, task, store, error).await;
+        }
+        TaskOp::BackupCopy { store } => {
+            backup_store::discard_copy(ctx, task, store, error).await;
         }
         TaskOp::BackupStoreInit => store_tasks::init_failed(ctx, task, error).await,
         TaskOp::BackupStoreGc => store_tasks::gc_failed(ctx, task, error).await,
@@ -1170,7 +1175,6 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::BackupConvert { store } => {
             return Box::pin(backup_store::convert(ctx, task, store)).await;
         }
-        // 복사·라이브 복원은 스테이지 5·6이 더한다. 그 전에는 API가 만들지 않는다.
         // 디스크를 다 받기 전에 켜고 뒤에서 옮긴다(계획 68 §11). opld가 다시 떠도 잇는다.
         TaskOp::BackupLiveRestore {
             backup,
@@ -1183,7 +1187,9 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             ))
             .await;
         }
-        TaskOp::BackupCopy { .. } => Err("backup store tasks are not available yet".into()),
+        TaskOp::BackupCopy { store } => {
+            return Box::pin(backup_store::copy(ctx, task, store)).await;
+        }
     };
     done.map(|()| None)
 }

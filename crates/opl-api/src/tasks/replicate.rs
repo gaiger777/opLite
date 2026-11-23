@@ -141,6 +141,10 @@ struct ParentMissing(String);
 /// 하므로 기록을 ready로 둔다(확인이 실패해도 이유만 적힌다). 원격에 없거나 다른 사본이면 그때 copying이나
 /// failed로 바꾼다.
 pub(super) async fn replicate(ctx: &Ctx, id: Uuid, remote: &str, pool: &str) -> Result<(), String> {
+    // 저장소 백업은 원격의 같은 이름 저장소로 없는 청크만 보낸다(계획 68 §12.4). 체인이 없다.
+    if get_backup(ctx, id)?.is_some_and(|b| b.spec.store.is_some()) {
+        return Box::pin(replicate_store(ctx, id, remote, pool)).await;
+    }
     let mut retried = false;
     loop {
         match replicate_chain(ctx, id, remote, pool, retried).await? {
@@ -237,6 +241,23 @@ fn read_chain(ctx: &Ctx, id: Uuid) -> Result<Vec<Backup>, String> {
 /// 원격의 모든 노드(위트니스 포함)가 증분 받기(`incremental-replication`)를 아는지 본다(`GET /nodes`의
 /// `status.features`). 노드 목록이 비었으면 모르는 것으로 본다.
 async fn check_remote_features(ctx: &Ctx, remote: &str) -> Result<(), String> {
+    check_remote_feature(
+        ctx,
+        remote,
+        "incremental-replication",
+        "incremental backups",
+    )
+    .await
+}
+
+/// 원격의 모든 노드(위트니스 포함)가 기능 `feature`를 아는지 본다(`GET /nodes`의 `status.features`). 노드 목록이 비었으면
+/// 모르는 것으로 본다. 모르면 "remote cluster … does not support {what}"이다.
+async fn check_remote_feature(
+    ctx: &Ctx,
+    remote: &str,
+    feature: &str,
+    what: &str,
+) -> Result<(), String> {
     let client = client(ctx, remote)?;
     let nodes: Value = client
         .get_json("/nodes")
@@ -246,13 +267,13 @@ async fn check_remote_features(ctx: &Ctx, remote: &str) -> Result<(), String> {
     let knows = |n: &Value| {
         n["status"]["features"]
             .as_array()
-            .is_some_and(|f| f.iter().any(|f| f == "incremental-replication"))
+            .is_some_and(|f| f.iter().any(|f| f == feature))
     };
     if !items.is_empty() && items.iter().all(knows) {
         Ok(())
     } else {
         Err(format!(
-            "remote cluster {remote:?} does not support incremental backups; upgrade it"
+            "remote cluster {remote:?} does not support {what}; upgrade it"
         ))
     }
 }
@@ -836,6 +857,285 @@ fn body_id(body: &Value, field: &str) -> Result<Uuid, RemoteError> {
         .as_str()
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| RemoteError::Invalid(format!("the remote answered without {field}")))
+}
+
+// ---- 저장소 백업 복제(계획 68 §12.4) ----
+
+/// 완료가 빠진 청크를 알리면(그사이 받는 쪽 GC가 거뒀다) 다시 보내고 완료를 다시 청하는 횟수
+const COMPLETE_TRIES: usize = 3;
+/// 청크를 동시에 보내는 수
+const CHUNK_STREAMS: usize = 4;
+
+/// 저장소 백업 `id`를 원격 `remote`의 백업 저장소 `target`으로 보낸다: 원격의 모든 노드가 `backup-store`를 알아야 하고,
+/// 받기를 시작하거나(앞의 사본이 원격에 있으면 이어 감) 인덱스의 청크 가운데 원격에 없는 것만 보내고, 인덱스·블롭을 보낸
+/// 뒤 완료를 청한다. 사본 기록은 풀 백업과 같다(`(원격, 저장소)`).
+async fn replicate_store(ctx: &Ctx, id: Uuid, remote: &str, target: &str) -> Result<(), String> {
+    let backup = get_backup(ctx, id)?.ok_or("backup was deleted")?;
+    if backup.status.phase != BackupPhase::Ready {
+        return Err("backup is not ready".into());
+    }
+    check_remote_feature(ctx, remote, opl_types::node::BACKUP_STORE, "backup stores").await?;
+    let checking = backup.status.replicas.iter().any(|r| {
+        r.remote == remote
+            && r.pool == target
+            && r.state == ReplicaState::Ready
+            && r.backup.is_some()
+    });
+    if !checking {
+        record(ctx, id, remote, target, copying).await;
+    }
+    let copy = Box::pin(send_store(ctx, &backup, remote, target, checking)).await?;
+    record(ctx, id, remote, target, |r| {
+        r.backup = Some(copy);
+        r.state = ReplicaState::Ready;
+        r.error = None;
+    })
+    .await;
+    Ok(())
+}
+
+/// 저장소 백업을 보내고 원격 사본 id를 돌려준다.
+async fn send_store(
+    ctx: &Ctx,
+    backup: &Backup,
+    remote: &str,
+    target: &str,
+    checking: bool,
+) -> Result<Uuid, String> {
+    let id = backup.id;
+    let client = client(ctx, remote)?;
+    let name = backup.spec.store.clone().unwrap_or_default();
+    let (_, store) = super::backup_store::open_store(ctx, &name).await?;
+    let (m, config) = super::backup_store::read_snapshot(&store, backup).await?;
+    let request = json!({
+        "name": backup.name,
+        "store": target,
+        "manifest": m,
+        "origin": origin(ctx, backup)?,
+        "config": {
+            "vm_name": config.vm_name,
+            "vm_spec": config.vm_spec,
+            "uefi_vars": config.uefi_vars,
+            "tpm_state": config.tpm_state,
+        },
+    });
+    let start = |e| remote_error(remote, "start the copy", e);
+    let recorded = backup
+        .status
+        .replicas
+        .iter()
+        .find(|r| r.remote == remote && r.pool == target)
+        .and_then(|r| r.backup);
+    let mut existing = match recorded {
+        Some(copy) => get_copy(&client, copy).await.map_err(start)?,
+        None => None,
+    };
+    if checking && existing.is_none() {
+        record(ctx, id, remote, target, copying).await;
+    }
+    if existing.is_none() {
+        let (status, body) = call(&client, Method::POST, "/backups/receive", Some(&request))
+            .await
+            .map_err(start)?;
+        match status {
+            201 => {}
+            409 if body["code"] == "replica_exists" => {
+                let copy = body_id(&body["details"], "backup").map_err(start)?;
+                existing = Some(get_copy(&client, copy).await.map_err(start)?.ok_or_else(
+                    || format!("the copy {copy} on remote {remote:?} was deleted; try again"),
+                )?);
+            }
+            _ => return Err(start(status_error(status, &body))),
+        }
+        if existing.is_none() {
+            let copy = body_id(&body, "id").map_err(start)?;
+            existing = get_copy(&client, copy).await.map_err(start)?;
+        }
+    }
+    let got =
+        existing.ok_or_else(|| format!("the copy on remote {remote:?} vanished; try again"))?;
+    let copy = got.id;
+    let same = got.spec.origin.as_ref().map(|o| o.backup) == Some(id)
+        && got.spec.store.as_deref() == Some(target)
+        && matches!(
+            got.status.phase,
+            BackupPhase::Receiving | BackupPhase::Ready
+        );
+    if !same {
+        let e = format!(
+            "a different backup claims to be the copy of {id} on remote {remote:?}; delete it there"
+        );
+        return Err(mismatch(ctx, id, remote, target, e).await);
+    }
+    // 받는 쪽 매니페스트가 있으면(ready) 완성된 사본이다 — 받는 쪽이 모든 청크를 확인하고 썼다.
+    if got.status.phase == BackupPhase::Ready {
+        return Ok(copy);
+    }
+    record(ctx, id, remote, target, |r| {
+        r.backup = Some(copy);
+        copying(r);
+    })
+    .await;
+    let fail = |e| crate::stores::store_error(&name, e);
+    // 청크: 원격에 없는 것만
+    let mut ids: Vec<opl_types::backup_store::ChunkId> = Vec::new();
+    let mut seen = HashSet::new();
+    for disk in &m.disks {
+        let ix = store.read_index(&m, disk).await.map_err(fail)?;
+        ids.extend(
+            ix.ids
+                .into_iter()
+                .filter(|c| *c != opl_types::backup_store::ZERO_CHUNK && seen.insert(*c)),
+        );
+    }
+    let mut sent = 0usize;
+    for batch in ids.chunks(crate::backup_receive::MISSING_BATCH) {
+        let ask = json!({ "ids": batch.iter().map(hex::encode).collect::<Vec<_>>() });
+        let asking = |e| remote_error(remote, "list missing chunks", e);
+        let (status, body) = call(
+            &client,
+            Method::POST,
+            &format!("/backups/{copy}/chunks/missing"),
+            Some(&ask),
+        )
+        .await
+        .map_err(asking)?;
+        let body = expect(200, status, body).map_err(asking)?;
+        let missing: Vec<String> = serde_json::from_value(body["missing"].clone())
+            .map_err(|e| format!("remote {remote:?} answered an unexpected chunk list: {e}"))?;
+        sent += missing.len();
+        send_chunks(&client, remote, &store, copy, &missing, &name).await?;
+    }
+    tracing::info!(backup = %backup.name, remote, chunks = ids.len(), sent, "sent the missing chunks of a store backup");
+    // 인덱스·블롭(받는 쪽이 인덱스를 자기 백업 id로 다시 쓴다)
+    let mut files: Vec<String> = m.disks.iter().map(|d| d.index.clone()).collect();
+    files.extend(m.blobs.iter().map(|b| b.name.clone()));
+    for file in files {
+        let bytes = store
+            .get_snapshot_object(backup.spec.vm, id, &file)
+            .await
+            .map_err(fail)?;
+        send_bytes(&client, remote, copy, &file, bytes).await?;
+    }
+    for _ in 0..COMPLETE_TRIES {
+        let (status, body) = call(
+            &client,
+            Method::POST,
+            &format!("/backups/{copy}/actions/complete"),
+            None,
+        )
+        .await
+        .map_err(|e| remote_error(remote, "complete the copy", e))?;
+        if status == 409
+            && body["code"] == "backup_incomplete"
+            && let Some(chunks) = body["details"]["chunks"].as_array()
+        {
+            let missing: Vec<String> = chunks
+                .iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect();
+            send_chunks(&client, remote, &store, copy, &missing, &name).await?;
+            continue;
+        }
+        expect(200, status, body).map_err(|e| remote_error(remote, "complete the copy", e))?;
+        return Ok(copy);
+    }
+    Err(format!(
+        "remote {remote:?} kept reporting missing chunks for the copy {copy}; try again"
+    ))
+}
+
+/// 청크 객체를 그대로 보낸다(받는 쪽이 같은 키로 풀어 맞춰 본다). `CHUNK_STREAMS`개씩 나란히.
+async fn send_chunks(
+    client: &RemoteClient,
+    remote: &str,
+    store: &opl_store::Store,
+    copy: Uuid,
+    missing: &[String],
+    name: &str,
+) -> Result<(), String> {
+    for group in missing.chunks(CHUNK_STREAMS) {
+        let sends = group
+            .iter()
+            .map(|hex_id| send_chunk(client, remote, store, copy, hex_id.clone(), name));
+        for r in futures_util::future::join_all(sends).await {
+            r?;
+        }
+    }
+    Ok(())
+}
+
+/// 청크 하나를 보낸다.
+async fn send_chunk(
+    client: &RemoteClient,
+    remote: &str,
+    store: &opl_store::Store,
+    copy: Uuid,
+    hex_id: String,
+    name: &str,
+) -> Result<(), String> {
+    let mut id = [0u8; 32];
+    hex::decode_to_slice(&hex_id, &mut id)
+        .map_err(|_| format!("remote {remote:?} named an invalid chunk {hex_id:?}"))?;
+    let obj = store
+        .get_chunk_object(&id)
+        .await
+        .map_err(|e| crate::stores::store_error(name, e))?;
+    let (status, body) = put_bytes(client, &format!("/backups/{copy}/chunks/{hex_id}"), obj)
+        .await
+        .map_err(|e| remote_error(remote, &format!("send chunk {hex_id}"), e))?;
+    expect(204, status, body)
+        .map_err(|e| remote_error(remote, &format!("send chunk {hex_id}"), e))?;
+    Ok(())
+}
+
+/// 바이트를 원격 사본 `copy`의 `file`로 보내고 원격이 받은 SHA-256·크기를 맞춰 본다.
+async fn send_bytes(
+    client: &RemoteClient,
+    remote: &str,
+    copy: Uuid,
+    file: &str,
+    bytes: Vec<u8>,
+) -> Result<(), String> {
+    let sent = hex::encode(Sha256::digest(&bytes));
+    let size = bytes.len() as u64;
+    let sending = |e| remote_error(remote, &format!("send {file}"), e);
+    let (status, body) = put_bytes(client, &format!("/backups/{copy}/files/{file}"), bytes)
+        .await
+        .map_err(sending)?;
+    let got = expect(200, status, body).map_err(sending)?;
+    if got["sha256"].as_str() != Some(sent.as_str()) || got["size"].as_u64() != Some(size) {
+        return Err(format!(
+            "remote {remote:?} received {file} with SHA-256 {} and {} bytes; sent SHA-256 {sent} and {size} bytes",
+            got["sha256"], got["size"]
+        ));
+    }
+    Ok(())
+}
+
+/// 바이트 본문의 `PUT`(상태와 JSON 본문)
+async fn put_bytes(
+    client: &RemoteClient,
+    path: &str,
+    bytes: Vec<u8>,
+) -> Result<(u16, Value), RemoteError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_LENGTH, HeaderValue::from(bytes.len() as u64));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    let response = client
+        .request_with_timeout(
+            Method::PUT,
+            path,
+            headers,
+            Full::new(Bytes::from(bytes)),
+            FILE_ANSWER_TIMEOUT,
+        )
+        .await?;
+    read_json(response).await
 }
 
 #[cfg(test)]

@@ -17,6 +17,27 @@ pub async fn write_backup(
     backup: Uuid,
     disks: &[Vec<u8>],
 ) -> Result<Manifest, StoreError> {
+    let config = ConfigBlob {
+        vm_name: "test".into(),
+        vm_spec: serde_json::from_value(serde_json::json!({
+            "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt"
+        }))
+        .expect("vm spec"),
+        uefi_vars: false,
+        tpm_state: false,
+    };
+    write_backup_with(store, vm, backup, disks, &config, 1).await
+}
+
+/// [`write_backup`]에 `config` 블롭과 만든 시각을 준다(API 시험이 백업 리소스와 맞춘다).
+pub async fn write_backup_with(
+    store: &Store,
+    vm: Uuid,
+    backup: Uuid,
+    disks: &[Vec<u8>],
+    config: &ConfigBlob,
+    created_at: u64,
+) -> Result<Manifest, StoreError> {
     let cb = CHUNK_BYTES as usize;
     let mut entries = Vec::new();
     for (i, image) in disks.iter().enumerate() {
@@ -37,24 +58,15 @@ pub async fn write_backup(
                 .await?,
         );
     }
-    let config = ConfigBlob {
-        vm_name: "test".into(),
-        vm_spec: serde_json::from_value(serde_json::json!({
-            "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt"
-        }))
-        .expect("vm spec"),
-        uefi_vars: false,
-        tpm_state: false,
-    };
     let blob = store
         .put_blob(
             vm,
             backup,
             CONFIG_BLOB,
-            &serde_json::to_vec(&config).expect("config"),
+            &serde_json::to_vec(config).expect("config"),
         )
         .await?;
-    let mut m = store.new_manifest(vm, backup, 1, entries, vec![blob]);
+    let mut m = store.new_manifest(vm, backup, created_at, entries, vec![blob]);
     store.put_manifest(&mut m).await?;
     Ok(m)
 }

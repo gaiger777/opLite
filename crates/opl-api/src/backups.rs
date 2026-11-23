@@ -35,14 +35,20 @@ use crate::tasks::create_task;
 use crate::vms::{check_nic_qos, check_security_groups, is_stopped};
 use crate::volumes::{check_pool_on, pool_node};
 use opl_types::authz::Privilege;
-use opl_types::node::FOLDERS;
+use opl_types::node::{BACKUP_STORE, FOLDERS};
 use opl_types::resource::Kind;
 
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CreateBackupRequest {
-    /// 백업 풀(`backups`를 켠 풀)
-    pub pool: String,
+    /// 백업 풀(`backups`를 켠 풀). `store`와 둘 중 하나다.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub pool: Option<String>,
+    /// 백업 저장소(계획 68). `pool`과 둘 중 하나다.
+    #[serde(default)]
+    #[schema(nullable = false)]
+    pub store: Option<String>,
     /// 백업 이름(클러스터에서 고유). 없으면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다.
     pub name: Option<String>,
     /// 할 수 있으면 증분으로(같은 풀의 바로 앞 백업을 부모로 바뀐 블록만) 백업한다. 할 수 없으면
@@ -63,6 +69,17 @@ pub struct RestoreRequest {
     /// 새 VM을 둘 폴더 id(계획 62). 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트다.
     #[serde(default)]
     pub folder: Option<Uuid>,
+    /// 라이브 복원(계획 68 §11): 디스크를 다 받기 전에 새 VM을 켜고 뒤에서 옮긴다. 새 폴더의 `vm.power`도 든다.
+    #[serde(default)]
+    pub live: bool,
+}
+
+/// 옮기기·복사의 대상 저장소
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoreTargetRequest {
+    /// 백업 저장소 이름
+    pub store: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -95,16 +112,6 @@ pub struct DeleteBackupQuery {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BackupForgotten {
     pub message: String,
-}
-
-/// 계획 68 백업 저장소의 새 칸·조건(백업 작업 `store`·`copy_to`, 경보 조건 `backup_*`, 할당량 `backup_bytes`)은 API
-/// 스테이지(계획 68 스테이지 6) 전까지 쓰지 않는다: 옛 노드가 남았으면 409 `cluster_upgrading`(검증보다 먼저 — 옛 노드는
-/// 이 칸을 풀지 못한다), 아니면 400. 스테이지 6이 지운다.
-pub(crate) fn store_not_yet(cluster: &opl_cluster::Cluster, what: &str) -> ApiError {
-    match require_feature(cluster, opl_types::node::BACKUP_STORE) {
-        Err(e) => e,
-        Ok(()) => ApiError::bad_request(format!("{what} are not available yet (backup stores)")),
-    }
 }
 
 /// 지금 시각(유닉스 초)
@@ -191,6 +198,9 @@ pub(crate) fn backup_tasks(state: &AppState, id: Uuid) -> Result<Vec<&'static st
             TaskOp::BackupReplicate { .. } if t.spec.target == id => Some("being replicated"),
             TaskOp::BackupConvert { .. } if t.spec.target == id => {
                 Some("being moved to a backup store")
+            }
+            TaskOp::BackupCopy { .. } if t.spec.target == id => {
+                Some("being copied to another backup store")
             }
             TaskOp::BackupStoreVerify { ref backups } if backups.contains(&id) => {
                 Some("being verified")
@@ -408,9 +418,13 @@ pub(crate) fn mask_backup(state: &AppState, principal: &Principal, backup: &mut 
 pub async fn create_backup(
     State(state): State<Arc<AppState>>,
     _principal: Principal,
+    audit: crate::audit::AuditNote,
     Path(key): Path<String>,
     Json(req): Json<CreateBackupRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    if req.store.is_some() {
+        require_feature(&state.cluster, BACKUP_STORE)?;
+    }
     if let Some(name) = &req.name {
         check_name(name)?;
     }
@@ -418,7 +432,26 @@ pub async fn create_backup(
         require_feature(&state.cluster, "incremental-backup")?;
     }
     let vm = lookup::<VmSpec>(&state.cluster, &key)?;
-    let dest = Dest::Pool(find_pool(&state, &req.pool)?);
+    let dest = match (&req.pool, &req.store) {
+        (Some(pool), None) => Dest::Pool(find_pool(&state, pool)?),
+        (None, Some(store)) => Dest::Store(find_store(&state, store)?),
+        _ => {
+            return Err(ApiError::bad_request("give exactly one of pool and store"));
+        }
+    };
+    audit.detail(match &dest {
+        Dest::Pool(p) => format!("backup create {} → pool {}", vm.name, p.name),
+        Dest::Store(s) => format!(
+            "backup create {} → store {}{}",
+            vm.name,
+            s.name,
+            if req.incremental {
+                " (incremental)"
+            } else {
+                ""
+            }
+        ),
+    });
     let node = check_backup(&state, &vm, &dest)?;
     let name = req
         .name
@@ -697,10 +730,14 @@ pub(crate) async fn start_backup_delete(
 pub async fn restore_backup(
     State(state): State<Arc<AppState>>,
     principal: Principal,
+    audit: crate::audit::AuditNote,
     Path(key): Path<String>,
     Json(req): Json<RestoreRequest>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
     // 백업의 `backup.restore`는 경로표가 봤다. 새 VM의 폴더·풀·네트워크는 아래에서 본다.
+    if req.live {
+        require_feature(&state.cluster, BACKUP_STORE)?;
+    }
     if req.folder.is_some() {
         require_feature(&state.cluster, FOLDERS)?;
     }
@@ -719,6 +756,12 @@ pub async fn restore_backup(
     state
         .authz
         .require_new(&principal, Privilege::VmCreate, Kind::Vm, folder)?;
+    // 라이브 복원은 새 VM을 곧바로 켠다.
+    if req.live {
+        state
+            .authz
+            .require_new(&principal, Privilege::VmPower, Kind::Vm, folder)?;
+    }
     // 전용 CPU·hugepages VM은 `vm.dedicated`, 계획 64 칸은 모든 노드가 `numa`를 알아야 한다.
     crate::numa::require_privilege(
         &state,
@@ -858,11 +901,26 @@ pub async fn restore_backup(
             ));
         }
     }
-    let op = TaskOp::BackupRestore {
-        backup: backup.id,
-        name: req.name,
-        pool: target.name,
-        folder,
+    audit.detail(format!(
+        "backup restore {} → {}{}",
+        backup.name,
+        req.name,
+        if req.live { " (live)" } else { "" }
+    ));
+    let op = if req.live {
+        TaskOp::BackupLiveRestore {
+            backup: backup.id,
+            name: req.name,
+            pool: target.name,
+            folder,
+        }
+    } else {
+        TaskOp::BackupRestore {
+            backup: backup.id,
+            name: req.name,
+            pool: target.name,
+            folder,
+        }
     };
     let task = create_task(&state.cluster, op, Uuid::now_v7(), node).await?;
     Ok((StatusCode::ACCEPTED, Json(task)))
@@ -968,12 +1026,9 @@ pub(crate) async fn start_backup_replicate(
     pool: String,
 ) -> Result<Task, ApiError> {
     require_current(&state.cluster)?;
-    // 저장소 백업의 복제(없는 청크만 — 계획 68 §12.4)는 API 스테이지가 연다.
+    // 저장소 백업의 복제(없는 청크만 — 계획 68 §12.4): 원격의 같은 이름 저장소로
     if backup.spec.store.is_some() {
-        return Err(store_not_yet(
-            &state.cluster,
-            "replicating backups of a backup store",
-        ));
+        require_feature(&state.cluster, BACKUP_STORE)?;
     }
     let remote = lookup::<RemoteSpec>(&state.cluster, remote)?;
     if backup.status.phase != BackupPhase::Ready {
@@ -1005,11 +1060,219 @@ pub(crate) async fn start_backup_replicate(
             &format!("being replicated to remote {:?}", remote.name),
         ));
     }
-    let backup_pool = find_pool(state, &backup.spec.pool)?;
-    let node = files_node(state, backup, &backup_pool)?;
+    let node = replicate_node(state, backup)?;
     let op = TaskOp::BackupReplicate {
         remote: remote.name,
         pool,
     };
+    create_task(&state.cluster, op, backup.id, node).await
+}
+
+/// 백업을 읽어 보낼 노드: 풀 백업은 파일이 있는 노드([`files_node`]), 저장소 백업은 저장소를 쓸 수 있는 노드(이 노드를
+/// 먼저). 없으면 409.
+pub(crate) fn replicate_node(state: &AppState, backup: &Backup) -> Result<Uuid, ApiError> {
+    let Some(name) = &backup.spec.store else {
+        let pool = find_pool(state, &backup.spec.pool)?;
+        return files_node(state, backup, &pool);
+    };
+    let store = find_store(state, name)?;
+    check_store(&store, false)?;
+    store_task_node(state, &store)
+}
+
+/// 저장소를 쓰는 Task를 돌릴 온라인 노드(이 노드를 먼저). 없으면 409 `no_node`.
+fn store_task_node(state: &AppState, store: &BackupStore) -> Result<Uuid, ApiError> {
+    crate::stores::task_node(&state.cluster, store, Some(state.node))
+        .map_err(ApiError::bad_request)?
+        .ok_or_else(|| {
+            ApiError::conflict(
+                "no_node",
+                format!("no online node can use backup store {:?}", store.name),
+            )
+        })
+}
+
+/// 저장소 백업을 지금 검증한다(202 — 저장소의 검증 Task, 계획 68 §10.5). 백업 풀의 백업은 400(저장소 백업만 검증한다),
+/// 준비되지 않았으면 409 `backup_not_ready`, 저장소가 준비되지 않았으면 409 `store_not_ready`.
+#[utoipa::path(post, path = "/backups/{key}/actions/verify", tag = "backups",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn verify_backup(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    Path(key): Path<String>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    require_feature(&state.cluster, BACKUP_STORE)?;
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    let Some(name) = &backup.spec.store else {
+        return Err(ApiError::bad_request(format!(
+            "backup {:?} is in a backup pool; only backups in a backup store are verified (move it with convert)",
+            backup.name
+        )));
+    };
+    check_ready(&backup)?;
+    let store = find_store(&state, name)?;
+    check_store(&store, false)?;
+    let task = crate::backup_stores::start_verify(&state, &store, vec![backup.id]).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+fn check_ready(backup: &Backup) -> Result<(), ApiError> {
+    if backup.status.phase != BackupPhase::Ready {
+        return Err(ApiError::conflict(
+            "backup_not_ready",
+            format!("backup {:?} is not ready", backup.name),
+        ));
+    }
+    Ok(())
+}
+
+/// 저장소 `store`에 원본 `backup`을 옮기거나(`kind`) 복사한 백업이 이미 있으면 409 `backup_exists`
+fn check_no_copy(
+    state: &AppState,
+    backup: &Backup,
+    store: &str,
+    kind: opl_types::backup::BackupSourceKind,
+) -> Result<(), ApiError> {
+    let (_, backups) = state.cluster.list::<BackupSpec>()?;
+    if let Some(b) = backups.iter().find(|b| {
+        b.spec.store.as_deref() == Some(store)
+            && b.status.phase != BackupPhase::Failed
+            && b.spec
+                .source
+                .as_ref()
+                .is_some_and(|s| s.backup == backup.id && s.kind == kind)
+    }) {
+        return Err(ApiError::conflict(
+            "backup_exists",
+            format!(
+                "backup {:?} is already in backup store {store:?} as {:?}",
+                backup.name, b.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// 옛 풀 백업을 저장소로 옮긴다(202 — `backup-convert` Task, 계획 68 §12.2). 원본은 남는다. 저장소 백업이면 400, 준비되지
+/// 않았으면 409 `backup_not_ready`, 같은 저장소로 이미 옮겼으면 409 `backup_exists`, 저장소가 읽기 전용이면 409
+/// `store_read_only`, 파일이 있는 노드가 저장소를 쓸 수 없으면 409 `store_not_on_node`.
+#[utoipa::path(post, path = "/backups/{key}/actions/convert", tag = "backups",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = StoreTargetRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn convert_backup(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    audit: crate::audit::AuditNote,
+    Path(key): Path<String>,
+    Json(req): Json<StoreTargetRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    require_feature(&state.cluster, BACKUP_STORE)?;
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    if backup.spec.store.is_some() {
+        return Err(ApiError::bad_request(format!(
+            "backup {:?} is already in a backup store; use copy",
+            backup.name
+        )));
+    }
+    check_ready(&backup)?;
+    check_backup_idle(&state, &backup)?;
+    let store = find_store(&state, &req.store)?;
+    check_store(&store, true)?;
+    check_no_copy(
+        &state,
+        &backup,
+        &store.name,
+        opl_types::backup::BackupSourceKind::Convert,
+    )?;
+    crate::quota::check_backup_room(&state.cluster, backup.spec.vm_spec.folder)?;
+    let pool = find_pool(&state, &backup.spec.pool)?;
+    let node = files_node(&state, &backup, &pool)?;
+    check_store_on(&state, &store, node)?;
+    audit.detail(format!(
+        "backup convert {} → store {}",
+        backup.name, store.name
+    ));
+    let op = TaskOp::BackupConvert { store: store.name };
+    let task = create_task(&state.cluster, op, backup.id, node).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 저장소 백업을 다른 저장소로 복사한다(202 — `backup-copy` Task, 계획 68 §12.5). 대상에 없는 청크만 쓴다(키가 다르면
+/// 다시 암호화). 풀 백업이면 400(convert), 같은 저장소면 400, 이미 복사했으면 409 `backup_exists`, 대상이 읽기 전용이면
+/// 409 `store_read_only`, 두 저장소를 함께 쓰는 온라인 노드가 없으면 409 `no_node`.
+#[utoipa::path(post, path = "/backups/{key}/actions/copy", tag = "backups",
+    params(("key" = String, Path, description = "id or name")),
+    request_body = StoreTargetRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn copy_backup(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    Path(key): Path<String>,
+    Json(req): Json<StoreTargetRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    require_feature(&state.cluster, BACKUP_STORE)?;
+    let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
+    let task = start_backup_copy(&state, &backup, &req.store).await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+/// 저장소 백업 `backup`을 저장소 `target`으로 복사할 Task를 만든다. 오류는 [`copy_backup`]과 같다. 복사 API와 백업 작업의
+/// `copy_to`가 쓴다(권한 검사는 부르는 쪽).
+pub(crate) async fn start_backup_copy(
+    state: &AppState,
+    backup: &Backup,
+    target: &str,
+) -> Result<Task, ApiError> {
+    let Some(source) = &backup.spec.store else {
+        return Err(ApiError::bad_request(format!(
+            "backup {:?} is in a backup pool; move it to a backup store with convert",
+            backup.name
+        )));
+    };
+    if source == target {
+        return Err(ApiError::bad_request(format!(
+            "backup {:?} is already in backup store {target:?}",
+            backup.name
+        )));
+    }
+    check_ready(backup)?;
+    if backup_tasks(state, backup.id)?.contains(&"being deleted") {
+        return Err(backup_busy(backup, "being deleted"));
+    }
+    let from = find_store(state, source)?;
+    check_store(&from, false)?;
+    let to = find_store(state, target)?;
+    check_store(&to, true)?;
+    check_no_copy(
+        state,
+        backup,
+        &to.name,
+        opl_types::backup::BackupSourceKind::Copy,
+    )?;
+    let fits = |n: &Node| {
+        let a = crate::stores::backend_pool(&state.cluster, &from)
+            .ok()
+            .flatten();
+        let b = crate::stores::backend_pool(&state.cluster, &to)
+            .ok()
+            .flatten();
+        crate::stores::usable_on(&from, a.as_ref(), n)
+            && crate::stores::usable_on(&to, b.as_ref(), n)
+    };
+    let node = match state.cluster.get::<NodeSpec>(state.node)? {
+        Some(me) if me.status.online && fits(&me) => me.id,
+        _ => first_node(state, fits)?.ok_or_else(|| {
+            ApiError::conflict(
+                "no_node",
+                format!(
+                    "no online node can use both backup stores {:?} and {:?}",
+                    from.name, to.name
+                ),
+            )
+        })?,
+    };
+    let op = TaskOp::BackupCopy { store: to.name };
     create_task(&state.cluster, op, backup.id, node).await
 }

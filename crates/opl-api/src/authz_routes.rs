@@ -389,6 +389,72 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
         "/backups/{key}/actions/complete",
         Root(BackupCreate),
     ),
+    // 저장소 백업의 사본 받기(계획 68 §12.4 — 없는 청크만)
+    ("POST", "/backups/{key}/chunks/missing", Root(BackupCreate)),
+    ("PUT", "/backups/{key}/chunks/{id}", Root(BackupCreate)),
+    // 백업 검증·옮기기·복사(계획 68): 백업 쓰기. 옮기기·복사는 백업을 새로 만든다.
+    (
+        "POST",
+        "/backups/{key}/actions/verify",
+        Object(Backup, BackupCreate),
+    ),
+    (
+        "POST",
+        "/backups/{key}/actions/convert",
+        Object(Backup, BackupCreate),
+    ),
+    (
+        "POST",
+        "/backups/{key}/actions/copy",
+        Object(Backup, BackupCreate),
+    ),
+    // 라이브 복원 취소: VM과 대상 볼륨을 지운다.
+    (
+        "POST",
+        "/vms/{key}/live-restore/cancel",
+        Object(Vm, VmDelete),
+    ),
+    // 백업 저장소(계획 68 §13): 루트 종류. 키·넘겨받기는 cluster.admin.
+    ("GET", "/backup-stores", Root(SystemRead)),
+    ("POST", "/backup-stores", Root(StorageConfig)),
+    ("GET", "/backup-stores/{key}", Root(SystemRead)),
+    ("PATCH", "/backup-stores/{key}", Root(StorageConfig)),
+    ("DELETE", "/backup-stores/{key}", Root(StorageConfig)),
+    (
+        "POST",
+        "/backup-stores/{key}/actions/gc",
+        Root(StorageConfig),
+    ),
+    (
+        "POST",
+        "/backup-stores/{key}/actions/verify",
+        Root(StorageConfig),
+    ),
+    (
+        "POST",
+        "/backup-stores/{key}/actions/check",
+        Root(StorageConfig),
+    ),
+    (
+        "POST",
+        "/backup-stores/{key}/actions/scan",
+        Root(StorageConfig),
+    ),
+    (
+        "POST",
+        "/backup-stores/{key}/actions/take-over",
+        Root(ClusterAdmin),
+    ),
+    (
+        "POST",
+        "/backup-stores/{key}/key/export",
+        Root(ClusterAdmin),
+    ),
+    (
+        "POST",
+        "/backup-stores/{key}/key/escrow",
+        Root(ClusterAdmin),
+    ),
     ("GET", "/backup-jobs", Root(ClusterRead)),
     ("POST", "/backup-jobs", Root(BackupJob)),
     ("GET", "/backup-jobs/{key}", Root(ClusterRead)),

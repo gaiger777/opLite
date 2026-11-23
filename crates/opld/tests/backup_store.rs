@@ -1,7 +1,6 @@
-//! 백업 저장소(계획 68 스테이지 3): `orbivisord backup-serve` 헬퍼(표준 입력 설정, pid 파일, 죽이고 다시 띄우기,
-//! 멈추기)와 `backup-it` 빌드의 제어 소켓 고리. QEMU는 쓰지 않는다.
-//! `cargo test -p opld --test backup_store` (고리는 `--features backup-it`, 실제 QEMU로 저장소에 백업·복원하는 E2E는
-//! `--features backup-it,qemu-it` — qemu-img·qemu-io·qemu-nbd가 필요하다)
+//! 백업 저장소(계획 68): `orbivisord backup-serve` 헬퍼(표준 입력 설정, pid 파일, 죽이고 다시 띄우기, 멈추기 — QEMU는 쓰지
+//! 않는다)와, 실제 QEMU로 orbivisorctl(`backup-store`·`backup … --store`·`backup restore --live`)을 쓰는 E2E.
+//! `cargo test -p opld --test backup_store` (E2E는 `--features backup-it` — qemu-img·qemu-io·qemu-nbd가 필요하다)
 
 mod common;
 
@@ -129,114 +128,14 @@ async fn backup_serve_helper_exports_a_store_backup_and_restarts() {
     assert!(e.contains("key") || e.contains("fingerprint"), "{e}");
 }
 
-/// `backup-it` 고리: 저장소·작업 리소스를 이름으로 만들고 바꾸고 지운다. 같은 백업 풀에 저장소 둘은 Raft의 겹침
-/// 키(`backup-store-target`)가 막는다.
+/// 실제 QEMU(orbivisorctl로): 백업 풀 안 저장소를 만들고(초기화 Task), 실행 중인 VM을 fleecing으로 전체 → 디스크에 표식 →
+/// 증분(바뀐 청크만 읽음) 백업하고, 앞 백업을 지우고 GC·검증을 돌린 뒤 증분 백업을 새 VM으로 복원해 원본과 같은지 본다.
 #[cfg(feature = "backup-it")]
-#[tokio::test]
-async fn backup_hook_writes_stores_and_jobs() {
-    use common::Daemon;
-    use serde_json::{Value, json};
-
-    async fn put(d: &Daemon, kind: &str, name: &str, spec: Value) -> (bool, String) {
-        let http = reqwest::Client::builder()
-            .unix_socket(d.path("opld.sock"))
-            .build()
-            .unwrap();
-        let resp = http
-            .post("http://opld/v1/test/put")
-            .json(&json!({ "kind": kind, "name": name, "spec": spec }))
-            .send()
-            .await
-            .unwrap();
-        (resp.status().is_success(), resp.text().await.unwrap())
-    }
-
-    let mut d = Daemon::new("node1", "");
-    d.start().await;
-    d.init("c1").await;
-    let (ok, id) = put(
-        &d,
-        "backup-store",
-        "st",
-        json!({ "backend": { "pool": "bk" } }),
-    )
-    .await;
-    assert!(ok, "{id}");
-    let id: Uuid = serde_json::from_str(&id).unwrap();
-    let (ok, again) = put(
-        &d,
-        "backup-store",
-        "st",
-        json!({ "backend": { "pool": "bk" }, "max_streams": 4 }),
-    )
-    .await;
-    assert!(ok, "{again}");
-    assert_eq!(serde_json::from_str::<Uuid>(&again).unwrap(), id);
-    let (ok, why) = put(
-        &d,
-        "backup-store",
-        "st2",
-        json!({ "backend": { "pool": "bk" } }),
-    )
-    .await;
-    assert!(!ok, "a second store on the same pool: {why}");
-    let (ok, why) = put(
-        &d,
-        "backup-store",
-        "st3",
-        json!({ "backend": { "pool": "bk" }, "max_streams": 0 }),
-    )
-    .await;
-    assert!(!ok && why.contains("max_streams"), "{why}");
-    let job = json!({ "vms": { "all": true }, "store": "st", "schedule": { "at": "03:00" } });
-    let (ok, why) = put(&d, "backup-job", "nightly", job).await;
-    assert!(ok, "{why}");
-    let (ok, gone) = put(&d, "backup-store", "st", Value::Null).await;
-    assert!(ok && gone == "null", "{gone}");
-    let (ok, why) = put(&d, "nope", "x", Value::Null).await;
-    assert!(!ok, "{why}");
-    d.stop();
-}
-
-/// 실제 QEMU(스테이지 4, 고리로): 백업 풀 안 저장소를 만들고(초기화 Task), 실행 중인 VM을 fleecing으로 전체 → 디스크에
-/// 표식 → 증분(바뀐 청크만 읽음) 백업하고, 증분 백업을 새 VM으로 복원해 원본과 같은지 본다. 앞 백업을 지우고 GC·검증을
-/// 돌려도 남은 백업은 그대로다.
-#[cfg(all(feature = "backup-it", feature = "qemu-it"))]
 #[tokio::test]
 async fn running_vm_store_backups_restore_and_survive_gc() {
     use common::Daemon;
-    use serde_json::{Value, json};
     use std::process::Command;
 
-    async fn hook(d: &Daemon, path: &str, body: Value) -> Value {
-        let http = reqwest::Client::builder()
-            .unix_socket(d.path("opld.sock"))
-            .build()
-            .unwrap();
-        let resp = http
-            .post(format!("http://opld/v1/test/{path}"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        let ok = resp.status().is_success();
-        let text = resp.text().await.unwrap();
-        assert!(ok, "{path}: {text}");
-        serde_json::from_str(&text).unwrap()
-    }
-    async fn wait_task(d: &Daemon, id: &Value) -> Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
-        loop {
-            let t = d.ctl_json(&["task", "get", id.as_str().unwrap()]).await;
-            let state = t["status"]["state"].as_str().unwrap_or("").to_string();
-            if state == "succeeded" || state == "failed" {
-                assert_eq!(state, "succeeded", "{t}");
-                return t;
-            }
-            assert!(std::time::Instant::now() < deadline, "{t}");
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
     fn qemu_io(file: &Path, cmd: &str) {
         let ok = Command::new("qemu-io")
             .args(["-f", "qcow2", "-c", cmd])
@@ -275,30 +174,26 @@ async fn running_vm_store_backups_restore_and_survive_gc() {
     ])
     .await
     .unwrap();
-    let node = d.ctl_json(&["node", "get", "node1"]).await;
-    let node = node["id"].clone();
 
-    let store = hook(
-        &d,
-        "put",
-        json!({"kind": "backup-store", "name": "st", "spec": {"backend": {"pool": "bk"}}}),
-    )
-    .await;
-    let t = hook(
-        &d,
-        "task",
-        json!({"op": {"kind": "backup-store-init"}, "target": store, "node": node}),
-    )
-    .await;
-    wait_task(&d, &t).await;
-
-    let t = hook(
-        &d,
-        "backup",
-        json!({"vm": "web", "store": "st", "name": "full", "incremental": true}),
-    )
-    .await;
-    wait_task(&d, &t).await;
+    let out = d
+        .ctl(&["backup-store", "create", "st", "--pool", "bk"])
+        .await
+        .unwrap();
+    assert!(out.contains("backup store st created"), "{out}");
+    let out = d
+        .ctl(&[
+            "backup",
+            "create",
+            "web",
+            "--store",
+            "st",
+            "--name",
+            "full",
+            "--incremental",
+        ])
+        .await
+        .unwrap();
+    assert!(out.contains("backup full of vm web created"), "{out}");
     let full = d.ctl_json(&["backup", "get", "full"]).await;
     assert_eq!(full["status"]["phase"], "ready", "{full}");
     assert_eq!(full["spec"]["store"], "st", "{full}");
@@ -314,32 +209,42 @@ async fn running_vm_store_backups_restore_and_survive_gc() {
     d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
     qemu_io(&root, "write -P 0xcd 0 64k");
     d.ctl(&["vm", "start", "web"]).await.unwrap();
-    let t = hook(
-        &d,
-        "backup",
-        json!({"vm": "web", "store": "st", "name": "incr", "incremental": true}),
-    )
-    .await;
-    wait_task(&d, &t).await;
+    let out = d
+        .ctl(&[
+            "backup",
+            "create",
+            "web",
+            "--store",
+            "st",
+            "--name",
+            "incr",
+            "--incremental",
+        ])
+        .await
+        .unwrap();
+    assert!(out.contains("(incremental)"), "{out}");
     let incr = d.ctl_json(&["backup", "get", "incr"]).await;
     assert_eq!(incr["status"]["base"], full["id"], "{incr}");
     let stats = &incr["status"]["store_stats"];
     assert_eq!(stats["read_bytes"], 4u64 << 20, "{incr}");
     assert_eq!(stats["new_chunks"], 1, "{incr}");
+    let list = d.ctl(&["backup", "list"]).await.unwrap();
+    assert!(list.contains("store:st"), "{list}");
 
     // 앞 백업을 지우고 GC·검증
     d.ctl(&["backup", "delete", "full"]).await.unwrap();
-    let t = hook(
-        &d,
-        "task",
-        json!({"op": {"kind": "backup-store-gc"}, "target": store, "node": node}),
-    )
-    .await;
-    wait_task(&d, &t).await;
-    let t = hook(&d, "task", json!({"op": {"kind": "backup-store-verify", "backups": [incr["id"]]}, "target": store, "node": node})).await;
-    wait_task(&d, &t).await;
-    let incr = d.ctl_json(&["backup", "get", "incr"]).await;
-    assert_eq!(incr["status"]["verify"]["state"], "ok", "{incr}");
+    let out = d
+        .ctl(&["backup-store", "gc", "st", "--wait"])
+        .await
+        .unwrap();
+    assert!(out.contains("GC of backup store st done"), "{out}");
+    let out = d
+        .ctl(&["backup", "verify", "incr", "--wait"])
+        .await
+        .unwrap();
+    assert!(out.contains("verified: ok"), "{out}");
+    let stores = d.ctl(&["backup-store", "list"]).await.unwrap();
+    assert!(stores.contains("pool:bk"), "{stores}");
 
     d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
     d.ctl(&[
@@ -362,45 +267,14 @@ async fn running_vm_store_backups_restore_and_survive_gc() {
     d.stop();
 }
 
-/// 실제 QEMU 라이브 복원(스테이지 5, 고리로): 실행 중 VM의 저장소 백업을 새 VM으로 라이브 복원한다 — `backup-serve` 헬퍼
-/// (이 orbivisord)가 백업을 내보내고 VM이 곧바로 켜진 뒤, mirror가 다 옮기면 갈아탄다. 끝나면 보통 VM이고 대상 볼륨은
-/// 원본과 같으며 헬퍼·오버레이는 없다.
-#[cfg(all(feature = "backup-it", feature = "qemu-it"))]
+/// 실제 QEMU 라이브 복원(orbivisorctl로): 실행 중 VM의 저장소 백업을 새 VM으로 라이브 복원한다 — `backup-serve` 헬퍼(이
+/// orbivisord)가 백업을 내보내고 VM이 곧바로 켜진 뒤, mirror가 다 옮기면 갈아탄다. 끝나면 보통 VM이고 대상 볼륨은 원본과
+/// 같으며 헬퍼·오버레이는 없다.
+#[cfg(feature = "backup-it")]
 #[tokio::test]
 async fn store_backup_live_restore_boots_and_pivots() {
     use common::Daemon;
-    use serde_json::{Value, json};
     use std::process::Command;
-
-    async fn hook(d: &Daemon, path: &str, body: Value) -> Value {
-        let http = reqwest::Client::builder()
-            .unix_socket(d.path("opld.sock"))
-            .build()
-            .unwrap();
-        let resp = http
-            .post(format!("http://opld/v1/test/{path}"))
-            .json(&body)
-            .send()
-            .await
-            .unwrap();
-        let ok = resp.status().is_success();
-        let text = resp.text().await.unwrap();
-        assert!(ok, "{path}: {text}");
-        serde_json::from_str(&text).unwrap()
-    }
-    async fn wait_task(d: &Daemon, id: &Value) -> Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(300);
-        loop {
-            let t = d.ctl_json(&["task", "get", id.as_str().unwrap()]).await;
-            let state = t["status"]["state"].as_str().unwrap_or("").to_string();
-            if state == "succeeded" || state == "failed" {
-                assert_eq!(state, "succeeded", "{t}");
-                return t;
-            }
-            assert!(std::time::Instant::now() < deadline, "{t}");
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    }
 
     let mut d = Daemon::new("node1", "[reconciler]\nacpi_timeout_secs = 5\n");
     d.start().await;
@@ -436,40 +310,27 @@ async fn store_backup_live_restore_boots_and_pivots() {
     ])
     .await
     .unwrap();
-    let node = d.ctl_json(&["node", "get", "node1"]).await["id"].clone();
-    let store = hook(
-        &d,
-        "put",
-        json!({"kind": "backup-store", "name": "st", "spec": {"backend": {"pool": "bk"}}}),
-    )
-    .await;
-    let t = hook(
-        &d,
-        "task",
-        json!({"op": {"kind": "backup-store-init"}, "target": store, "node": node}),
-    )
-    .await;
-    wait_task(&d, &t).await;
-    let t = hook(
-        &d,
-        "backup",
-        json!({"vm": "web", "store": "st", "name": "b1"}),
-    )
-    .await;
-    wait_task(&d, &t).await;
-    let b1 = d.ctl_json(&["backup", "get", "b1"]).await;
+    d.ctl(&["backup-store", "create", "st", "--pool", "bk"])
+        .await
+        .unwrap();
+    d.ctl(&["backup", "create", "web", "--store", "st", "--name", "b1"])
+        .await
+        .unwrap();
     d.ctl(&["vm", "stop", "web", "--force"]).await.unwrap();
 
-    let target = Uuid::now_v7();
     let started = std::time::Instant::now();
-    let t = hook(
-        &d,
-        "task",
-        json!({"op": {"kind": "backup-live-restore", "backup": b1["id"], "name": "web2", "pool": "local"},
-               "target": target, "node": node}),
-    )
-    .await;
-    wait_task(&d, &t).await;
+    let out = d
+        .ctl(&[
+            "backup", "restore", "b1", "--name", "web2", "--pool", "local", "--live", "--wait",
+        ])
+        .await
+        .unwrap();
+    assert!(out.contains("vm web2 restored from backup b1"), "{out}");
+    let target: Uuid = d.ctl_json(&["vm", "get", "web2"]).await["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     println!(
         "PROBE live restore of a 64 MiB disk took {:?}",
         started.elapsed()

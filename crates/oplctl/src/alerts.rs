@@ -227,14 +227,17 @@ struct ConditionArgs {
     /// 백업 작업이 실패하면(이벤트, 리더가 본다)
     #[arg(long)]
     backup_job_failed: bool,
-    /// SDN 조건(계획 67, 리더가 본다): sdn_quorum_lost, sdn_central_down, sdn_chassis_down, sdn_gateway_unavailable,
-    /// sdn_gateway_failover(이벤트), sdn_sync_failed, sdn_physnet_not_ready, sdn_lb_member_down
+    /// 리더가 보는 조건: 백업(계획 68) backup_verify_failed, backup_store_unavailable, SDN(계획 67) sdn_quorum_lost,
+    /// sdn_central_down, sdn_chassis_down, sdn_gateway_unavailable, sdn_gateway_failover(이벤트), sdn_sync_failed,
+    /// sdn_physnet_not_ready, sdn_lb_member_down
     #[arg(long = "condition", value_name = "KIND", value_parser = parse_sdn_condition)]
     sdn: Option<String>,
 }
 
-/// SDN 경보 조건의 `kind`
+/// SDN·백업 저장소 경보 조건의 `kind`(`--condition`)
 const SDN_CONDITIONS: &[&str] = &[
+    "backup_verify_failed",
+    "backup_store_unavailable",
     "sdn_quorum_lost",
     "sdn_central_down",
     "sdn_chassis_down",

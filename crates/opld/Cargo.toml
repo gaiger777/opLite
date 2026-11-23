@@ -99,9 +99,14 @@ numa-it = []
 # `sdn lockdown`)로 — 실제 LB 트래픽·건강 검사 넘김·바깥 VIP·QoS 속도 측정(iperf3)·단순 NIC tc·옮기기 다리를 본다.
 # Linux(Ubuntu 24.04 = OVN 24.03)에서 root와 apt가 닿는 네트워크가 필요하고, 호스트에 OVN 꾸러미와 데몬을 남기므로 CI 러너(`ovn` 작업)에서만 돌린다.
 sdn-it = []
-# 백업 저장소 E2E의 시험 고리(계획 68): 저장소 API(스테이지 6)가 생기기 전에 제어 소켓의 `POST /v1/test/put`으로
-# `backup-store`·`backup-job` 리소스를 클러스터에 바로 쓴다. 시험 빌드에만 넣고 스테이지 6이 지운다.
-backup-it = []
+# 실제 QEMU로 백업 저장소(계획 68)에 백업·복원·라이브 복원하는 E2E(`tests/backup_store.rs` — orbivisorctl로). qemu-it의 준비물과
+# qemu-img·qemu-io·qemu-nbd가 필요하다(CI `linux-kvm`).
+backup-it = ["qemu-it"]
+# MinIO(S3)로 백업 저장소 E2E(`tests/backup_s3.rs`): HTTP·사용자 CA HTTPS, GC와 백업 동시, MinIO 멈춤(docker pause) 도중의 백업·
+# 라이브 복원, 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·넘겨받기). backup-it의 준비물에 더해 환경 변수 `OPL_S3_ENDPOINT`·
+# `OPL_S3_TLS_ENDPOINT`·`OPL_S3_CA`·`OPL_S3_ACCESS_KEY`·`OPL_S3_SECRET_KEY`·`OPL_S3_CONTAINER`(멈춤 시험의 docker 컨테이너
+# 이름)가 필요하다(CI `backup-s3` 작업).
+s3-it = ["backup-it"]
 # 여러 노드 SDN E2E(계획 66 스테이지 6): 한 호스트에 privileged systemd 컨테이너 셋(`ci/sdn-node/Dockerfile`)으로 Orbivisor
 # 노드 셋을 띄워 실제 OVN Raft 셋·Geneve·SNAT·분산·중앙 유동 IP·게이트웨이 넘김·죽은 중앙 내쫓기·두 chassis 마이그레이션을
 # orbivisorctl로 본다. Linux에서 root, docker와 이미지, 커널 모듈 openvswitch·geneve, tcpdump가 필요하고 호스트에 도커 망·

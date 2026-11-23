@@ -21,7 +21,7 @@ use opl_cluster::types::RawResource;
 use opl_types::authz::Privilege;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 23] = [
+const WATCHABLE: [Kind; 24] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
@@ -49,6 +49,8 @@ const WATCHABLE: [Kind; 23] = [
     Kind::FloatingIp,
     Kind::LoadBalancer,
     Kind::NetworkMigration,
+    // 계획 68: 백업 저장소(루트 — system.read). S3 비밀 키·주 키는 이벤트에서 뺀다.
+    Kind::BackupStore,
 ];
 
 /// 이벤트마다 거르는 종류(폴더를 따르는 것과 grant). 나머지는 구독할 때 종류 단위로 루트에서 본다.
@@ -193,6 +195,18 @@ impl Filter {
                 &mut resource.status,
             );
         }
+        if let WatchEvent::Put {
+            kind: Kind::BackupStore,
+            resource,
+        }
+        | WatchEvent::Deleted {
+            kind: Kind::BackupStore,
+            resource,
+            ..
+        } = &mut event
+        {
+            crate::backup_stores::redact_json(&mut resource.spec);
+        }
         event
     }
 
@@ -258,7 +272,7 @@ impl Filter {
         }
         if !scoped {
             let writer = self.writer(self.owners.of_event(kind, resource));
-            return Verdict::Send(event, writer);
+            return Verdict::Send(self.redact(event), writer);
         }
         let writer = self.writer(owned_after);
         match event {

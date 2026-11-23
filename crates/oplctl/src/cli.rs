@@ -180,6 +180,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: BackupCmd,
     },
+    /// 백업 저장소(계획 68): 중복 제거 청크 저장소(백업 풀 안·S3), 암호화 키, GC·검증, DR(읽기 전용 붙이기·넘겨받기)
+    BackupStore {
+        #[command(subcommand)]
+        cmd: crate::backup_store::BackupStoreCmd,
+    },
     /// 백업 작업: 정한 시각(UTC)에 고른 VM들을 백업하고 보존 규칙대로 옛 백업을 지운다.
     BackupJob {
         #[command(subcommand)]
@@ -1689,6 +1694,11 @@ enum VmCmd {
     Numa {
         vm: String,
     },
+    /// 라이브 복원(계획 68) 진행 보기와 취소
+    LiveRestore {
+        #[command(subcommand)]
+        cmd: crate::backup_store::LiveRestoreCmd,
+    },
     /// NIC의 보안 그룹을 바꾼다. 실행 중이어도 곧바로 적용된다. 그룹을 주지 않으면 모두 뺀다.
     NicSg {
         vm: String,
@@ -2616,12 +2626,16 @@ fn schedule_value(args: &ScheduleArgs) -> Option<Value> {
 
 #[derive(Subcommand)]
 enum BackupCmd {
-    /// VM을 백업한다. 실행 중이면 디스크를 잠깐 스냅샷한 때의 상태(crash-consistent)를 담는다.
+    /// VM을 백업한다. 실행 중이면 디스크를 잠깐 스냅샷한 때의 상태(crash-consistent)를 담는다(저장소는 fleecing).
+    #[command(group(ArgGroup::new("target").required(true).args(["pool", "store"])))]
     Create {
         vm: String,
         /// 백업 풀(`pool set NAME --backups true`로 표시한 풀)
         #[arg(long)]
-        pool: String,
+        pool: Option<String>,
+        /// 백업 저장소(계획 68 — 중복 제거·암호화·S3)
+        #[arg(long)]
+        store: Option<String>,
         /// 생략하면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다.
         #[arg(long)]
         name: Option<String>,
@@ -2658,6 +2672,37 @@ enum BackupCmd {
         /// 복원을 실행할 노드(이름이나 id). 생략하면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다.
         #[arg(long)]
         node: Option<String>,
+        /// 라이브 복원: 새 VM을 곧바로 켜고 디스크는 뒤에서 옮긴다(`vm live-restore status`로 본다).
+        #[arg(long)]
+        live: bool,
+        /// 라이브 복원이 다 옮기고 갈아탈 때까지 기다린다(보통 복원은 늘 기다린다).
+        #[arg(long, requires = "live")]
+        wait: bool,
+    },
+    /// 저장소 백업을 지금 검증한다(청크를 읽어 맞춰 봄).
+    Verify {
+        backup: String,
+        /// 끝날 때까지 기다리고 결과를 보인다.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// 옛 풀 백업을 백업 저장소로 옮긴다(체인 포함). 원본은 남는다.
+    #[command(group(ArgGroup::new("what").required(true).args(["backup", "all_in_pool"])))]
+    Convert {
+        backup: Option<String>,
+        /// 이 백업 풀의 ready 백업을 만든 차례로 하나씩
+        #[arg(long, value_name = "POOL")]
+        all_in_pool: Option<String>,
+        #[arg(long)]
+        store: String,
+    },
+    /// 저장소 백업을 다른 저장소로 복사한다(대상에 없는 청크만).
+    Copy {
+        backup: String,
+        #[arg(long)]
+        store: String,
+        #[arg(long)]
+        wait: bool,
     },
     /// 백업을 원격 클러스터(`remote add`로 등록)의 백업 풀에 사본으로 보낸다. 원격 쪽 토큰 주인은
     /// operator 이상이어야 한다.
@@ -2749,11 +2794,20 @@ enum Day {
 
 #[derive(Args)]
 #[command(group(ArgGroup::new("selector").required(true).args(["all", "vms", "labels"])))]
+#[command(group(ArgGroup::new("target").required(true).args(["pool", "store"])))]
 struct BackupJobCreate {
     name: String,
     /// 백업 풀(`pool set NAME --backups true`로 표시한 풀)
     #[arg(long)]
-    pool: String,
+    pool: Option<String>,
+    /// 백업 저장소(계획 68)
+    #[arg(long)]
+    store: Option<String>,
+    /// 작업의 백업을 이 저장소에도 복사해 둔다(저장소 작업만, 보존은 `--copy-keep-*`, 없으면 작업의 보존)
+    #[arg(long, value_name = "STORE", requires = "store")]
+    copy_to: Option<String>,
+    #[command(flatten)]
+    copy_keep: CopyKeepArgs,
     #[command(flatten)]
     vms: VmsArgs,
     /// 실행 시각(UTC)
@@ -2780,7 +2834,7 @@ struct BackupJobCreate {
 #[command(group(ArgGroup::new("change").required(true).multiple(true).args([
     "all", "vms", "labels", "pool", "at", "days",
     "keep_last", "keep_daily", "keep_weekly", "keep_monthly", "enabled",
-    "replicate", "no_replicate", "full_every",
+    "replicate", "no_replicate", "full_every", "store", "copy_to", "no_copy",
 ])))]
 struct BackupJobSet {
     job: String,
@@ -2796,6 +2850,17 @@ struct BackupJobSet {
     days: Vec<Day>,
     #[command(flatten)]
     keep: KeepArgs,
+    /// 백업 저장소로 바꾼다(그 뒤의 백업만 — 풀의 백업은 보존 규칙대로 줄어든다).
+    #[arg(long, conflicts_with = "pool")]
+    store: Option<String>,
+    /// 복사본을 보낼 저장소(보존은 `--copy-keep-*`)
+    #[arg(long, value_name = "STORE", conflicts_with = "no_copy")]
+    copy_to: Option<String>,
+    #[command(flatten)]
+    copy_keep: CopyKeepArgs,
+    /// 복사본 보내기를 끈다(이미 만든 복사본은 남는다).
+    #[arg(long)]
+    no_copy: bool,
     /// 예약 실행을 켜거나(다음 실행 시각을 지금부터 다시 정한다) 끈다. 진행 중인 실행은 끝까지 간다.
     #[arg(long, value_name = "true|false")]
     enabled: Option<bool>,
@@ -2808,6 +2873,37 @@ struct BackupJobSet {
     /// 1 이상이면 할 수 있을 때 증분으로 백업하고, 체인의 증분이 N개가 되면 다음은 전체다. 0이면 늘 전체.
     #[arg(long, value_name = "N")]
     full_every: Option<u32>,
+}
+
+/// 복사본의 보존 규칙(없으면 작업의 보존)
+#[derive(Args)]
+struct CopyKeepArgs {
+    #[arg(long, value_name = "N")]
+    copy_keep_last: Option<u32>,
+    #[arg(long, value_name = "N")]
+    copy_keep_daily: Option<u32>,
+    #[arg(long, value_name = "N")]
+    copy_keep_weekly: Option<u32>,
+    #[arg(long, value_name = "N")]
+    copy_keep_monthly: Option<u32>,
+}
+
+/// `copy_to` 값(`{ store, keep? }`)
+fn copy_to_value(store: &str, k: &CopyKeepArgs) -> Value {
+    let mut v = json!({ "store": store });
+    if k.copy_keep_last.is_some()
+        || k.copy_keep_daily.is_some()
+        || k.copy_keep_weekly.is_some()
+        || k.copy_keep_monthly.is_some()
+    {
+        v["keep"] = json!({
+            "last": k.copy_keep_last.unwrap_or(0),
+            "daily": k.copy_keep_daily.unwrap_or(0),
+            "weekly": k.copy_keep_weekly.unwrap_or(0),
+            "monthly": k.copy_keep_monthly.unwrap_or(0),
+        });
+    }
+    v
 }
 
 /// `--replicate`의 `REMOTE/POOL`을 `replicate` 값(`{ remote, pool }`)으로
@@ -2869,12 +2965,20 @@ fn backup_job_create_body(args: &BackupJobCreate) -> Value {
         "name": args.name,
         "spec": {
             "vms": vms_value(&args.vms),
-            "pool": args.pool,
             "schedule": { "at": args.at, "days": days_value(&args.days) },
             "keep": keep_value(&args.keep, &Value::Null),
             "enabled": !args.disabled,
         }
     });
+    // 풀 작업은 지금과 같은 본문이다(옛 서버는 모르는 필드를 거절한다).
+    match (&args.pool, &args.store) {
+        (Some(pool), _) => body["spec"]["pool"] = json!(pool),
+        (None, Some(store)) => body["spec"]["store"] = json!(store),
+        (None, None) => {}
+    }
+    if let Some(copy) = &args.copy_to {
+        body["spec"]["copy_to"] = copy_to_value(copy, &args.copy_keep);
+    }
     // 복제하지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
     if let Some(replicate) = &args.replicate {
         body["spec"]["replicate"] = replicate.clone();
@@ -2921,6 +3025,14 @@ fn backup_job_set_body(args: &BackupJobSet, current: &Value) -> Value {
     }
     if let Some(full_every) = args.full_every {
         body["full_every"] = json!(full_every);
+    }
+    if let Some(store) = &args.store {
+        body["store"] = json!(store);
+    }
+    if let Some(copy) = &args.copy_to {
+        body["copy_to"] = copy_to_value(copy, &args.copy_keep);
+    } else if args.no_copy {
+        body["copy_to"] = Value::Null;
     }
     body
 }
@@ -6429,6 +6541,12 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
         Cmd::PlacementRule { cmd } => placement_rule(&client, cmd, json_out, out).await?,
         Cmd::Backup { cmd } => backup(&client, cmd, json_out, out).await?,
         Cmd::BackupJob { cmd } => backup_job(&client, cmd, json_out, out).await?,
+        Cmd::BackupStore { cmd } => {
+            Box::pin(crate::backup_store::backup_store(
+                &client, cmd, json_out, out,
+            ))
+            .await?
+        }
         Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
@@ -6611,9 +6729,39 @@ async fn backup(
         BackupCmd::Create {
             vm,
             pool,
+            store,
             name,
             incremental,
-        } => backup_create(client, &vm, &pool, name, incremental, out).await?,
+        } => {
+            let target = match (&pool, &store) {
+                (Some(p), _) => json!({ "pool": p }),
+                (None, Some(s)) => json!({ "store": s }),
+                (None, None) => bail!("give --pool or --store"),
+            };
+            backup_create(client, &vm, target, name, incremental, out).await?
+        }
+        BackupCmd::Verify { backup, wait } => {
+            crate::backup_store::backup_verify(client, &backup, wait, out).await?
+        }
+        BackupCmd::Convert {
+            backup,
+            all_in_pool,
+            store,
+        } => {
+            crate::backup_store::backup_convert(
+                client,
+                backup.as_deref(),
+                all_in_pool.as_deref(),
+                &store,
+                out,
+            )
+            .await?
+        }
+        BackupCmd::Copy {
+            backup,
+            store,
+            wait,
+        } => crate::backup_store::backup_copy(client, &backup, &store, wait, out).await?,
         BackupCmd::List { vm } => {
             let mut r = client.request(Method::GET, "/backups");
             if let Some(vm) = &vm {
@@ -6635,13 +6783,27 @@ async fn backup(
             name,
             pool,
             node,
+            live,
+            wait,
         } => {
-            let body = json!({ "name": name, "pool": pool, "node": node });
+            let mut body = json!({ "name": name, "pool": pool, "node": node });
+            // 청하지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
+            if live {
+                body["live"] = json!(true);
+            }
             let task = client
                 .post(&format!("/backups/{}/restore", seg(&backup)), &body)
                 .await?;
-            client.wait_task_for(&task, BACKUP_WAIT).await?;
-            writeln!(out, "vm {name} restored from backup {backup}")?;
+            if live && !wait {
+                let id = cell(&task["id"]);
+                writeln!(
+                    out,
+                    "live restore of backup {backup} to vm {name} started (task {id}); the VM runs as soon as it is wired, follow it with `orbivisorctl vm live-restore status {name}`"
+                )?;
+            } else {
+                client.wait_task_for(&task, BACKUP_WAIT).await?;
+                writeln!(out, "vm {name} restored from backup {backup}")?;
+            }
         }
         BackupCmd::Replicate {
             backup,
@@ -6657,12 +6819,14 @@ async fn backup(
 async fn backup_create(
     client: &Client,
     vm: &str,
-    pool: &str,
+    target: Value,
     name: Option<String>,
     incremental: bool,
     out: &mut (dyn Write + Send),
 ) -> anyhow::Result<()> {
-    let mut body = json!({ "pool": pool, "name": name });
+    let store = target["store"].is_string();
+    let mut body = target;
+    body["name"] = json!(name);
     // 청하지 않으면 보내지 않는다(옛 서버는 모르는 필드를 거절한다).
     if incremental {
         body["incremental"] = json!(true);
@@ -6672,7 +6836,7 @@ async fn backup_create(
         .await?;
     client.wait_task_for(&task, BACKUP_WAIT).await?;
     // 이름을 주지 않았거나 증분을 청했으면 만든 백업을 읽는다.
-    let backup = if name.is_none() || incremental {
+    let backup = if name.is_none() || incremental || store {
         let id = cell(&task["spec"]["op"]["backup"]);
         client.get(&format!("/backups/{}", seg(&id))).await?
     } else {
@@ -6681,10 +6845,19 @@ async fn backup_create(
     let name = name.unwrap_or_else(|| cell(&backup["name"]));
     let kind = if !incremental {
         String::new()
-    } else if backup["status"]["parent"].is_string() {
+    } else if backup["status"]["parent"].is_string() || backup["status"]["base"].is_string() {
         " (incremental)".into()
     } else {
         format!(" (full: {})", cell(&backup["status"]["full_reason"]))
+    };
+    // 저장소 백업은 새로 쓴 데이터와 논리 크기를 보인다.
+    let kind = match &backup["status"]["store_stats"] {
+        stats if store && stats.is_object() => format!(
+            "{kind}: new {} of {}",
+            bytes(&stats["new_bytes"]),
+            bytes(&stats["logical_bytes"])
+        ),
+        _ => kind,
     };
     writeln!(out, "backup {name} of vm {vm} created{kind}")?;
     Ok(())
@@ -6838,7 +7011,7 @@ async fn backup_delete(
 
 /// `backup list`의 열
 const BACKUP_HEADERS: &[&str] = &[
-    "NAME", "VM", "POOL", "PHASE", "CREATED", "SIZE", "TYPE", "ORIGIN", "REPLICAS",
+    "NAME", "VM", "TARGET", "PHASE", "CREATED", "SIZE", "TYPE", "ORIGIN", "REPLICAS", "VERIFIED",
 ];
 
 /// `backup list`의 한 행. VM은 만든 때의 이름이고(VM을 지웠어도 남는다), SIZE는 백업 파일 크기의 합이다
@@ -6872,14 +7045,24 @@ fn backup_row(b: &Value) -> Vec<String> {
             .join(","),
         _ => "-".into(),
     };
+    // 저장소 백업(계획 68): 대상은 `store:S`, 크기는 새로 쓴 바이트, 종류는 base가 있으면 incr, 검증 결과
+    let target = match b["spec"]["store"].as_str() {
+        Some(s) => format!("store:{s}"),
+        None => cell(&b["spec"]["pool"]),
+    };
+    let verified = match status["verify"]["state"].as_str() {
+        Some(state) => state.to_string(),
+        None if b["spec"]["store"].is_string() => "never".into(),
+        None => "-".into(),
+    };
     vec![
         cell(&b["name"]),
         cell(&b["spec"]["vm_name"]),
-        cell(&b["spec"]["pool"]),
+        target,
         cell(&status["phase"]),
         created,
         size,
-        if status["parent"].is_string() {
+        if status["parent"].is_string() || status["base"].is_string() {
             "incr"
         } else {
             "full"
@@ -6887,6 +7070,7 @@ fn backup_row(b: &Value) -> Vec<String> {
         .into(),
         origin,
         replicas,
+        verified,
     ]
 }
 
@@ -8222,6 +8406,12 @@ async fn vm(
         VmCmd::Get { vm } => vm_get(client, &vm, json_out, out, &mut std::io::stderr()).await?,
         VmCmd::Cpu { vm } => vm_cpu(client, &vm, json_out, out).await?,
         VmCmd::Numa { vm } => Box::pin(vm_numa(client, &vm, json_out, out)).await?,
+        VmCmd::LiveRestore { cmd } => {
+            Box::pin(crate::backup_store::live_restore(
+                client, cmd, json_out, out,
+            ))
+            .await?
+        }
         VmCmd::Create(args) => {
             let node = match &args.node {
                 Some(key) => Some(client.get(&format!("/nodes/{}", seg(key))).await?),
@@ -11545,7 +11735,7 @@ mod tests {
         };
         assert!(matches!(
             parse(&["create", "web", "--pool", "bk"]).unwrap(),
-            BackupCmd::Create { vm, pool, name: None, incremental: false } if vm == "web" && pool == "bk"
+            BackupCmd::Create { vm, pool: Some(pool), store: None, name: None, incremental: false } if vm == "web" && pool == "bk"
         ));
         assert!(matches!(
             parse(&["create", "web", "--pool", "bk", "--incremental"]).unwrap(),
@@ -11565,7 +11755,7 @@ mod tests {
         assert!(matches!(
             parse(&["restore", "web-1", "--name", "web2", "--pool", "local", "--node", "n1"])
                 .unwrap(),
-            BackupCmd::Restore { backup, name, pool, node: Some(node) }
+            BackupCmd::Restore { backup, name, pool, node: Some(node), live: false, wait: false }
                 if backup == "web-1" && name == "web2" && pool == "local" && node == "n1"
         ));
         assert!(matches!(
@@ -11621,6 +11811,7 @@ mod tests {
                 "2026-11-04 03:00 UTC",
                 "3.5GiB",
                 "full",
+                "-",
                 "-",
                 "-"
             ]
@@ -11798,7 +11989,7 @@ mod tests {
             backup_create(
                 &client,
                 "web",
-                "bk",
+                json!({ "pool": "bk" }),
                 name.map(str::to_string),
                 incremental,
                 &mut out,
@@ -11881,7 +12072,7 @@ mod tests {
             },
             "status": { "phase": "receiving", "created_at": 1_793_761_200, "disks": [] }
         });
-        assert_eq!(backup_row(&copy)[7..], ["prod/019a4f2c", "-"]);
+        assert_eq!(backup_row(&copy)[7..9], ["prod/019a4f2c", "-"]);
         // 원격 사본마다 원격:상태
         let original = json!({
             "name": "web-20261104-030000",
@@ -11894,7 +12085,18 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(backup_row(&original)[7..], ["-", "dr:ready,far:failed"]);
+        assert_eq!(backup_row(&original)[7..9], ["-", "dr:ready,far:failed"]);
+        // 저장소 백업(계획 68): 대상 `store:S`, base가 있으면 incr, 검증 결과
+        let stored = json!({
+            "name": "web-3", "spec": { "vm_name": "web", "store": "st" },
+            "status": { "phase": "ready", "created_at": 1_793_761_200, "base": "019a4f2c-1111-7000-8000-000000000000",
+                        "disks": [{ "name": "disk0", "stored_bytes": 4u64 << 20 }],
+                        "verify": { "at": 1, "state": "failed", "bad_chunks": 1 } }
+        });
+        let row = backup_row(&stored);
+        assert_eq!(row[2], "store:st");
+        assert_eq!(row[6], "incr");
+        assert_eq!(row[9], "failed");
     }
 
     /// `backup-job create`의 인자를 요청 본문으로

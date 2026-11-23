@@ -1,7 +1,7 @@
-//! 계획 68 스테이지 1: 백업 저장소의 새 칸(백업 작업 `store`·`copy_to`, 경보 조건 `backup_verify_failed`·
-//! `backup_store_unavailable`, 할당량 `backup_bytes`)은 API 스테이지(6) 전까지 임시로 막힌다: 옛 노드가 남았으면 409
-//! `cluster_upgrading`, 아니면 400. 이 칸을 쓰지 않는 요청과 저장 모양은 지금 그대로다. 저장소에 직접 쓴 `backup_bytes`
-//! 할당량은 사용량 보기와 VM 옮기기 사전 확인이 센다.
+//! 계획 68: 백업 저장소의 새 칸(백업 작업 `store`·`copy_to`, 경보 조건 `backup_verify_failed`·`backup_store_unavailable`,
+//! 할당량 `backup_bytes`)은 옛 노드가 남았으면 409 `cluster_upgrading`(검증보다 먼저)이고, 모든 노드가 `backup-store`를
+//! 알면 받는다(작업의 저장소는 있어야 한다). 이 칸을 쓰지 않는 요청과 저장 모양은 지금 그대로다. `backup_bytes` 할당량은
+//! 사용량 보기와 VM 옮기기 사전 확인이 센다.
 
 mod common;
 
@@ -29,24 +29,13 @@ async fn drop_feature(env: &Env) {
         .unwrap();
 }
 
-fn not_yet(status: StatusCode, body: &Value) {
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body["message"]
-            .as_str()
-            .unwrap()
-            .contains("not available yet (backup stores)"),
-        "{body}"
-    );
-}
-
 fn upgrading(status: StatusCode, body: &Value) {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "cluster_upgrading", "{body}");
 }
 
 #[tokio::test]
-async fn backup_store_fields_are_gated_until_the_api_stage() {
+async fn backup_store_fields_need_the_feature() {
     let env = Env::start().await;
     let admin = env.admin().await;
     let store_job = json!({
@@ -62,32 +51,37 @@ async fn backup_store_fields_are_gated_until_the_api_stage() {
         "name": "verify",
         "spec": { "condition": { "kind": "backup_verify_failed" }, "severity": "warning", "targets": ["ops"] }
     });
-    let unavailable = json!({
-        "name": "unavailable",
-        "spec": { "condition": { "kind": "backup_store_unavailable" }, "severity": "critical",
-                  "for_secs": 300, "targets": ["ops"] }
-    });
     let quota = json!({ "name": "team", "kind": "vm", "quota": { "backup_bytes": 1024 } });
 
-    for (path, req) in [
-        ("/backup-jobs", &store_job),
-        ("/backup-jobs", &copy_job),
-        ("/alert-rules", &rule),
-        ("/alert-rules", &unavailable),
-        ("/folders", &quota),
-    ] {
-        let (status, body) = admin.post(path, req.clone()).await;
-        not_yet(status, &body);
-    }
-    // 새 칸을 쓰지 않는 폴더는 지금 그대로이고, 할당량을 더하는 바꾸기는 막힌다.
-    let (status, body) = admin
-        .post(
-            "/folders",
-            json!({ "name": "team", "kind": "vm", "quota": { "vms": 2 } }),
-        )
-        .await;
+    // 기능이 있으면 받는다: 작업의 저장소는 있어야 하고(400), 복사본은 저장소 작업에만(400).
+    let (status, body) = admin.post("/backup-jobs", store_job.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("backup store \"local-st\" not found"),
+        "{body}"
+    );
+    let (status, body) = admin.post("/backup-jobs", copy_job.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // 경보 조건은 형식대로 본다(알림 대상이 없음).
+    let (status, body) = admin.post("/alert-rules", rule.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("notification target"),
+        "{body}"
+    );
+    let (status, body) = admin.post("/folders", quota.clone()).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    assert_eq!(body["spec"]["quota"], json!({ "vms": 2 }), "{body}");
+    assert_eq!(
+        body["spec"]["quota"],
+        json!({ "backup_bytes": 1024 }),
+        "{body}"
+    );
     let folder = body["id"].as_str().unwrap().to_string();
     let (status, body) = admin
         .patch(
@@ -96,7 +90,7 @@ async fn backup_store_fields_are_gated_until_the_api_stage() {
             None,
         )
         .await;
-    not_yet(status, &body);
+    assert_eq!(status, StatusCode::OK, "{body}");
     // 대상이 둘이거나 없는 작업은 400이다(형식).
     let (status, body) = admin
         .post(
@@ -115,18 +109,23 @@ async fn backup_store_fields_are_gated_until_the_api_stage() {
 
     // 옛 노드가 있으면 검증보다 먼저 409다.
     drop_feature(&env).await;
+    let quota2 = json!({ "name": "team2", "kind": "vm", "quota": { "backup_bytes": 1024 } });
     for (path, req) in [
         ("/backup-jobs", store_job),
         ("/backup-jobs", copy_job),
         ("/alert-rules", rule),
-        ("/folders", quota),
+        ("/folders", quota2),
+        (
+            "/backup-stores",
+            json!({ "name": "st", "spec": { "backend": { "pool": "bk" } } }),
+        ),
     ] {
         let (status, body) = admin.post(path, req).await;
         upgrading(status, &body);
     }
 }
 
-/// 저장소에 직접 쓴 `backup_bytes` 할당량(스테이지 6 전 — 상태 머신·시험만 씀): 사용량 보기가 백업 바이트를 세고(VM
+/// 저장소에 직접 쓴 `backup_bytes` 할당량: 사용량 보기가 백업 바이트를 세고(VM
 /// 몫, 지운 VM의 백업은 백업한 때의 폴더), VM을 할당량 폴더로 옮기기는 넘으면 `quota_exceeded`다.
 #[tokio::test]
 async fn backup_bytes_are_counted_by_the_usage_view_and_the_precheck() {

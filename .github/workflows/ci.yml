@@ -34,8 +34,6 @@ jobs:
       # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
       # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
       - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
-      # 백업 저장소 시험 고리(`POST /v1/test/put`의 backup-store·backup-job, 계획 68 스테이지 6까지 — QEMU 없음)
-      - run: cargo test -p opld --features backup-it --test backup_store
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)
@@ -534,6 +532,71 @@ jobs:
         run: cargo test --features opld/vtpm-it,opld/install-media-it,opld/qemu-it -p opld --test vtpm -- --nocapture
         env:
           OPL_TEST_CLOUD_IMAGE: ${{ runner.temp }}/ubuntu-24.04-server-cloudimg-amd64.img
+
+  # 백업 저장소를 실제 S3 호환 저장소(MinIO)로(계획 68 §14): HTTP 끝점과 사용자 CA로 서명한 HTTPS 끝점(MinIO 컨테이너 둘,
+  # 태그를 못 박음), GC와 백업 동시·평문 표식 없음, MinIO 멈춤(`docker pause`) 도중의 백업·라이브 복원(헬퍼 kill -9·opld 다시
+  # 시작·90초 멈춤), 두 클러스터 DR(읽기 전용 붙이기·escrow·scan·라이브 복원·넘겨받기). VM은 KVM으로, root가 아니다.
+  backup-s3:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    env:
+      MINIO_IMAGE: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+      OPL_S3_ENDPOINT: http://127.0.0.1:9000
+      OPL_S3_TLS_ENDPOINT: https://127.0.0.1:9443
+      OPL_S3_CA: /tmp/opl-s3-certs/ca.pem
+      OPL_S3_ACCESS_KEY: opl-ci-access
+      OPL_S3_SECRET_KEY: opl-ci-secret-key-1234
+      OPL_S3_BUCKET: orbi
+      OPL_S3_CONTAINER: opl-minio
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: KVM, QEMU, qemu-utils
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 ovmf qemu-utils
+          ls -l /dev/kvm
+      # 시험 CA와 127.0.0.1 인증서(MinIO `--certs-dir`의 public.crt·private.key)
+      - name: Test CA and a server certificate
+        run: |
+          d=/tmp/opl-s3-certs
+          mkdir -p "$d"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 2 \
+            -subj "/CN=opl s3 test ca" -keyout "$d/ca.key" -out "$OPL_S3_CA"
+          openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj "/CN=127.0.0.1" \
+            -keyout "$d/private.key" -out "$d/server.csr"
+          printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' > "$d/ext"
+          openssl x509 -req -in "$d/server.csr" -CA "$OPL_S3_CA" -CAkey "$d/ca.key" -CAcreateserial -days 2 \
+            -extfile "$d/ext" -out "$d/public.crt"
+          chmod 0644 "$d/private.key"
+          openssl verify -CAfile "$OPL_S3_CA" "$d/public.crt"
+      - name: MinIO over HTTP and HTTPS, and the bucket
+        run: |
+          docker run -d --name "$OPL_S3_CONTAINER" -p 127.0.0.1:9000:9000 \
+            -e MINIO_ROOT_USER="$OPL_S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$OPL_S3_SECRET_KEY" \
+            "$MINIO_IMAGE" server /data
+          docker run -d --name opl-minio-tls -p 127.0.0.1:9443:9000 -v /tmp/opl-s3-certs:/certs:ro \
+            -e MINIO_ROOT_USER="$OPL_S3_ACCESS_KEY" -e MINIO_ROOT_PASSWORD="$OPL_S3_SECRET_KEY" \
+            "$MINIO_IMAGE" server /data --certs-dir /certs
+          for _ in $(seq 60); do curl -fsS http://127.0.0.1:9000/minio/health/live && break; sleep 1; done
+          for _ in $(seq 60); do curl -fsS --cacert "$OPL_S3_CA" https://127.0.0.1:9443/minio/health/live && break; sleep 1; done
+          export AWS_ACCESS_KEY_ID="$OPL_S3_ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$OPL_S3_SECRET_KEY" AWS_DEFAULT_REGION=us-east-1
+          aws --endpoint-url "$OPL_S3_ENDPOINT" s3 mb "s3://$OPL_S3_BUCKET"
+          aws --endpoint-url "$OPL_S3_TLS_ENDPOINT" --ca-bundle "$OPL_S3_CA" s3 mb "s3://$OPL_S3_BUCKET"
+          docker exec "$OPL_S3_CONTAINER" minio --version
+      - name: Backup store E2E against MinIO
+        timeout-minutes: 60
+        run: cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1
+      - name: MinIO logs
+        if: failure()
+        run: |
+          docker logs --tail 200 "$OPL_S3_CONTAINER"
+          docker logs --tail 200 opl-minio-tls
 
   # LDAP 영역: 실제 OpenLDAP(slapd)에 LDAPS와 ldap://+StartTLS로 사용자 찾기·바인드, memberOf 그룹,
   # API의 영역 시험 동작과 외부 사용자 로그인. 디렉터리(시험 CA, 사용자 둘, 그룹 하나)는

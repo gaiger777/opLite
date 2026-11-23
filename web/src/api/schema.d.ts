@@ -502,6 +502,193 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backup-stores": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_stores"];
+        put?: never;
+        /**
+         * 저장소를 만들고 초기화 Task를 돌려준다(201 — 저장소는 `initializing`). 쓰기 저장소는 `store.json`·주인 표식을 쓰고,
+         *     읽기 전용은 있는 저장소를 키로 열어 본다. 암호화는 새 키(`generate` — 응답에 복구 키가 한 번 들어 있다), 복구 키,
+         *     저장소 안 escrow 가운데 하나다. API 노드가 저장소에 닿으면 미리 확인한다: 키 지문이 다르면 400 `store_key_mismatch`,
+         *     암호화 저장소인데 키가 없으면 400 `store_key_required`, 다른 클러스터가 주인인 곳에 쓰기 저장소면 409
+         *     `store_owned_elsewhere`. 같은 풀·버킷/접두사의 저장소가 있으면 409 `store_target_in_use`, 형식이 틀리면 400
+         *     `invalid_backup_store`, 옛 노드가 있으면 409 `cluster_upgrading`.
+         */
+        post: operations["create_store"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_store"];
+        put?: never;
+        post?: never;
+        /**
+         * 저장소 리소스를 지운다(200). 저장소 안 데이터는 그대로다(버킷·디렉터리는 손으로). 저장소의 백업이 남아 있으면 409
+         *     `store_in_use`, 저장소 Task나 저장소 백업을 쓰는 Task가 끝나지 않았으면 409 `store_busy`.
+         */
+        delete: operations["delete_store"];
+        options?: never;
+        head?: never;
+        /**
+         * 일정·검증·동시 요청 수·S3 자격 증명·CA를 바꾼다. 백엔드·암호화는 바꾸지 못한다(그 칸은 받지 않는다 — 400). 일정이
+         *     바뀌면 다음 실행 시각을 다시 고른다.
+         */
+        patch: operations["patch_store"];
+        trace?: never;
+    };
+    "/backup-stores/{key}/actions/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 연결 확인(200): API 노드가 그 저장소를 쓸 수 있으면 `store.json`을 읽어 키를 맞춰 보고, 노드마다 보고한 닿음을 함께
+         *     돌려준다.
+         */
+        post: operations["check_store"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}/actions/gc": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * GC를 지금 돌린다(202 Task). 준비되지 않았으면 409 `store_not_ready`, 읽기 전용이면 409 `store_read_only`, 이미 돌면
+         *     409 `store_busy`.
+         */
+        post: operations["gc_store"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}/actions/scan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 읽기 전용 저장소의 스냅샷마다 백업 리소스를 만든다(202 Task — §12.6). 다시 하면 새것만 더한다. 읽기 전용이 아니면
+         *     409 `store_read_only`의 반대 — 400.
+         */
+        post: operations["scan_store"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}/actions/take-over": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 읽기 전용으로 붙인 저장소를 넘겨받는다(200 — §12.6): 주인 표식(`owner.json`)의 하트비트가 24시간보다 오래됐거나
+         *     `force`면 주인을 이 클러스터로 바꾸고 `read_only`를 끈다. 옛 주인은 다음 GC 때 바뀐 표식을 보고 그 저장소를 멈춘다.
+         *     하트비트가 새로우면 409 `store_owned_elsewhere`, 읽기 전용이 아니면 400.
+         */
+        post: operations["take_over"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}/actions/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 검증을 지금 돌린다(202 Task). `backups`가 비면 일정의 규칙대로 고른다. 읽기 전용 저장소도 검증한다(깨진 청크를
+         *     옮기지 않고 결과만 적는다).
+         */
+        post: operations["verify_store"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}/key/escrow": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 주 키를 암호 문구로 감싸 저장소 안(`keys/<지문>.json`)에 쓴다(204 — 덮어씀). 암호 문구는 저장하지 않는다. 평문
+         *     저장소면 400, 읽기 전용이면 409 `store_read_only`, API 노드가 그 저장소를 쓸 수 없으면 409 `store_not_on_node`,
+         *     닿지 않으면 503 `store_unavailable`.
+         */
+        post: operations["escrow_key_handler"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backup-stores/{key}/key/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 주 키를 복구 키로 돌려준다(200, 감사에 남음). 평문 저장소면 400. */
+        post: operations["export_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/backups": {
         parameters: {
             query?: never;
@@ -592,6 +779,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/backups/{key}/actions/convert": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 옛 풀 백업을 저장소로 옮긴다(202 — `backup-convert` Task, 계획 68 §12.2). 원본은 남는다. 저장소 백업이면 400, 준비되지
+         *     않았으면 409 `backup_not_ready`, 같은 저장소로 이미 옮겼으면 409 `backup_exists`, 저장소가 읽기 전용이면 409
+         *     `store_read_only`, 파일이 있는 노드가 저장소를 쓸 수 없으면 409 `store_not_on_node`.
+         */
+        post: operations["convert_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/actions/copy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 저장소 백업을 다른 저장소로 복사한다(202 — `backup-copy` Task, 계획 68 §12.5). 대상에 없는 청크만 쓴다(키가 다르면
+         *     다시 암호화). 풀 백업이면 400(convert), 같은 저장소면 400, 이미 복사했으면 409 `backup_exists`, 대상이 읽기 전용이면
+         *     409 `store_read_only`, 두 저장소를 함께 쓰는 온라인 노드가 없으면 409 `no_node`.
+         */
+        post: operations["copy_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/backups/{key}/actions/replicate": {
         parameters: {
             query?: never;
@@ -612,6 +841,63 @@ export interface paths {
          *     노드가 있으면 409 `cluster_upgrading`.
          */
         post: operations["replicate_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/actions/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 저장소 백업을 지금 검증한다(202 — 저장소의 검증 Task, 계획 68 §10.5). 백업 풀의 백업은 400(저장소 백업만 검증한다),
+         *     준비되지 않았으면 409 `backup_not_ready`, 저장소가 준비되지 않았으면 409 `store_not_ready`.
+         */
+        post: operations["verify_backup"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/chunks/missing": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 받는 중인 저장소 사본에 보낼 청크 가운데 받는 쪽 저장소에 없는 것(200). 4096개까지 묻는다(400). */
+        post: operations["missing_chunks"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/chunks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * 저장소 사본의 청크 객체 하나를 받는다(204): 받는 쪽 키로 풀어 id·인증 태그를 맞춰 본 뒤 그대로 쓴다. 맞지 않으면 400.
+         *     크기 상한은 4 MiB 청크와 머리·태그다.
+         */
+        put: operations["put_chunk"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -3350,6 +3636,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vms/{key}/live-restore/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 라이브 복원을 취소한다(202, 계획 68 §11.4): VM을 끄고 VM·대상 볼륨·오버레이를 지운다 — 게스트가 쓴 것을 버리므로
+         *     `discard: true`가 없으면 400. 라이브 복원 중이 아니면 409 `vm_not_restoring`. 취소를 하는 Task(라이브 복원 Task)를
+         *     돌려준다.
+         */
+        post: operations["cancel_live_restore"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vms/{key}/metrics": {
         parameters: {
             query?: never;
@@ -4097,6 +4404,7 @@ export interface components {
         };
         /** @description 백업 작업에서 바꿀 값. 주어진 필드만 바꾼다. */
         BackupJobPatch: {
+            copy_to?: components["schemas"]["CopyTarget"] | null;
             enabled?: boolean;
             /**
              * Format: int32
@@ -4108,6 +4416,8 @@ export interface components {
             pool?: string;
             replicate?: components["schemas"]["ReplicateTarget"] | null;
             schedule?: components["schemas"]["JobSchedule"];
+            /** @description 백업 저장소(계획 68). 주면 그 뒤의 백업은 저장소로 간다(`pool`을 비운다). `pool`을 주면 저장소를 비운다. */
+            store?: string;
             vms?: components["schemas"]["VmSelector"];
         };
         BackupJobSpec: {
@@ -4157,41 +4467,6 @@ export interface components {
             next_run: number | null;
             /** @default null */
             run: components["schemas"]["JobRun"] | null;
-        };
-        /** @description 백업 디렉터리의 `manifest.json`. Orbivisor 없이도 백업을 알아볼 수 있게 VM 스펙과 디스크 목록을 담는다. */
-        BackupManifest: {
-            /**
-             * Format: uuid
-             * @description 백업 id
-             */
-            backup: string;
-            /**
-             * Format: int64
-             * @description 만든 시각(유닉스 초)
-             */
-            created_at: number;
-            disks: components["schemas"]["BackupDisk"][];
-            /**
-             * Format: uuid
-             * @description 증분 백업의 부모 백업 id. 디스크 파일은 바뀐 블록만 담고, 부모는 헤더가 아니라 여기로만 잇는다.
-             *     전체 백업이면 뺀다.
-             */
-            parent?: string;
-            /**
-             * @description TPM 상태 파일(`tpm2-00.permall`, 0600)을 담았는지(계획 59). 거짓이면 빼고 써서 형식 버전은 그대로다. 옛 노드는
-             *     이 필드를 무시한다.
-             */
-            tpm_state?: boolean;
-            uefi_vars: boolean;
-            /**
-             * Format: int32
-             * @description 형식 버전([`MANIFEST_VERSION`], 증분 백업은 [`MANIFEST_VERSION_INCREMENTAL`])
-             */
-            version: number;
-            /** Format: uuid */
-            vm: string;
-            vm_name: string;
-            vm_spec: components["schemas"]["VmSpec"];
         };
         /** @description 받은 사본의 원본: 보낸 클러스터와 그 클러스터의 백업 */
         BackupOrigin: {
@@ -4335,6 +4610,64 @@ export interface components {
             /** @description 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다. */
             verify?: components["schemas"]["BackupVerify"];
         };
+        /** @description 비밀(S3 비밀 키·주 키)을 뺀 저장소 스펙 */
+        BackupStoreSpecView: {
+            backend: components["schemas"]["StoreBackendView"];
+            encryption?: components["schemas"]["StoreEncryptionView"];
+            gc: components["schemas"]["JobSchedule"];
+            /** Format: int32 */
+            max_streams: number;
+            read_only?: boolean;
+            verify?: components["schemas"]["VerifyPolicy"];
+        };
+        /** @description 저장소의 실제 상태. 초기화·GC·검증 Task와 리더의 스케줄러가 쓴다. */
+        BackupStoreStatus: {
+            /**
+             * Format: int64
+             * @description 검증이 찾아 `bad/`로 옮긴 청크 수
+             */
+            bad_chunks?: number;
+            /** @description 매니페스트를 쓰는 중인 백업(쓰기 잠금 — `sweeping`이 거짓일 때만 더한다, §10.3) */
+            committing?: string[];
+            error?: string;
+            /** @description 진행 중인 GC(§10.2) */
+            gc?: components["schemas"]["GcRun"];
+            last_gc?: components["schemas"]["GcResult"];
+            last_verify?: components["schemas"]["VerifyResult"];
+            /**
+             * Format: int64
+             * @description 다음 예약 GC 시각(유닉스 초)
+             */
+            next_gc?: number;
+            /**
+             * Format: int64
+             * @description 다음 예약 검증 시각(유닉스 초)
+             */
+            next_verify?: number;
+            /**
+             * Format: uuid
+             * @description 공유가 아닌 백업 풀 안 저장소를 만든 노드(그 노드에만 있다 — §7.6). 공유 풀·S3면 없다.
+             */
+            node?: string;
+            /** @description 저장소 `owner.json`의 주인 클러스터(§12.6) */
+            owner?: components["schemas"]["StoreOwner"];
+            /** @default initializing */
+            phase: components["schemas"]["StorePhase"];
+            /**
+             * Format: uuid
+             * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
+             */
+            store_id?: string;
+            /**
+             * Format: int64
+             * @description 쓸기를 시작할 때마다 1씩 오른다. 백업이 시작과 커밋 때 견준다.
+             */
+            sweep_epoch?: number;
+            /** @description GC가 청크를 지우는 중(쓰기 잠금 — `committing`이 비었을 때만 참이 된다) */
+            sweeping?: boolean;
+            /** @description 마지막 GC가 센 사용량 */
+            usage?: components["schemas"]["StoreUsage"];
+        };
         /** @description 백업 하나의 마지막 검증 결과(계획 68 §10.5) */
         BackupVerify: {
             /**
@@ -4409,6 +4742,11 @@ export interface components {
             name: string;
             /** @description VLAN-aware 브리지(`vlan_filtering 1`)인지. VLAN 태그를 쓰는 네트워크에 필요하다. */
             vlan_filtering: boolean;
+        };
+        /** @description 라이브 복원 취소 본문 */
+        CancelLiveRestoreRequest: {
+            /** @description 게스트가 라이브 복원 뒤 쓴 것을 버린다는 확인(참이어야 한다) */
+            discard?: boolean;
         };
         /** @description `POST /image-catalog/{id}/download` */
         CatalogDownloadRequest: {
@@ -4734,6 +5072,11 @@ export interface components {
             /** @enum {string} */
             kind: "sums";
             url: string;
+        };
+        /** @description 받을 청크를 묻는 본문 */
+        ChunkIds: {
+            /** @description 청크 id(16진 64자), 4096개까지 */
+            ids: string[];
         };
         /** @description 배포(복제) 때 원본 스펙에서 바꾸는 값. 비어 있는 칸은 원본 그대로다. */
         CloneOverrides: {
@@ -5187,8 +5530,10 @@ export interface components {
             incremental?: boolean;
             /** @description 백업 이름(클러스터에서 고유). 없으면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다. */
             name?: string | null;
-            /** @description 백업 풀(`backups`를 켠 풀) */
-            pool: string;
+            /** @description 백업 풀(`backups`를 켠 풀). `store`와 둘 중 하나다. */
+            pool?: string;
+            /** @description 백업 저장소(계획 68). `pool`과 둘 중 하나다. */
+            store?: string;
         };
         /** @description `POST /floating-ips` */
         CreateFloatingIp: {
@@ -5596,6 +5941,21 @@ export interface components {
             /** @description VM 안에서 고유한 이름 */
             name: string;
         };
+        /** @description 저장소 만들기 본문 */
+        CreateStoreRequest: {
+            /** @description 없으면 평문 저장소 */
+            encryption?: components["schemas"]["EncryptionRequest"];
+            /**
+             * @description 만들 때 주 키를 이 암호 문구로 감싸 저장소 안에 둔다(escrow — 클러스터를 잃어도 연다). 암호 문구는 저장하지
+             *     않는다.
+             */
+            escrow_passphrase?: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            spec: components["schemas"]["StoreSpecRequest"];
+        };
         CreateTokenRequest: {
             name: string;
             /**
@@ -5617,6 +5977,14 @@ export interface components {
             expires_at: number;
             /** @description 새 노드에서 `orbivisorctl cluster join`에 넘길 URL. 다시 볼 수 없다. */
             url: string;
+        };
+        /** @description 만든 저장소 */
+        CreatedStore: {
+            /** @description 새 키를 만들었으면 그 복구 키(이때 한 번 — 나중에는 `key/export`). 잃으면 백업을 되살릴 길이 없다. */
+            recovery_key?: string;
+            store: components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"];
+            /** @description 초기화 Task */
+            task: components["schemas"]["Resource"];
         };
         CreatedToken: {
             /** @description `Authorization: Bearer <secret>`로 쓴다. 다시 볼 수 없다. */
@@ -5705,12 +6073,24 @@ export interface components {
          * @enum {string}
          */
         EmulatorPolicy: "shared" | "isolate";
+        /** @description 만들기의 암호화: 셋 가운데 하나 — 새 키(`generate`), 복구 키 가져오기, 저장소 안 escrow를 암호 문구로 풀기 */
+        EncryptionRequest: {
+            /** @description 저장소 `keys/<지문>.json`을 풀 암호 문구 */
+            escrow_passphrase?: string;
+            generate?: boolean;
+            /** @description 복구 키(`OPK1-…`) */
+            recovery_key?: string;
+        };
         /** @description 오류 응답 본문 */
         ErrorBody: {
             /** @description 기계가 읽는 오류 종류. 예: `not_found`, `revision_mismatch`, `cluster_no_quorum` */
             code: string;
             details?: unknown;
             message: string;
+        };
+        /** @description 감싸 둘 암호 문구 */
+        EscrowRequest: {
+            passphrase: string;
         };
         /** @description browse 응답 */
         EsxiBrowse: {
@@ -6081,6 +6461,41 @@ export interface components {
          * @enum {string}
          */
         GatewayState: "active" | "no-candidate" | "unknown";
+        /** @enum {string} */
+        GcPhase: "mark" | "wait" | "sweep";
+        /** @description 끝난 GC의 결과 */
+        GcResult: {
+            error?: string;
+            /** Format: int64 */
+            finished_at: number;
+            /**
+             * Format: int64
+             * @description 표시되지 않았지만 GC 시작 뒤에 올라와 남긴 청크 수
+             */
+            kept_young: number;
+            /** Format: int64 */
+            removed_bytes: number;
+            /** Format: int64 */
+            removed_chunks: number;
+            /** Format: int64 */
+            started_at: number;
+        };
+        /** @description 진행 중인 GC(§10.2) */
+        GcRun: {
+            /**
+             * Format: int64
+             * @description GC 표식의 저장소 시각 T0(유닉스 초, 저장소 시계)
+             */
+            marker_at: number;
+            phase: components["schemas"]["GcPhase"];
+            /**
+             * Format: int64
+             * @description 시작한 시각(유닉스 초, 노드 시계)
+             */
+            started_at: number;
+            /** Format: uuid */
+            task: string;
+        };
         /** @description 권한 하나(`Kind::Grant`): 주체에게 대상에서 역할을 준다. */
         GrantSpec: {
             principal: components["schemas"]["PrincipalRef"];
@@ -7294,6 +7709,82 @@ export interface components {
                     uefi_vars: boolean;
                     /** @description 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다. */
                     verify?: components["schemas"]["BackupVerify"];
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_BackupStoreSpecView_BackupStoreStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 비밀(S3 비밀 키·주 키)을 뺀 저장소 스펙 */
+                spec: {
+                    backend: components["schemas"]["StoreBackendView"];
+                    encryption?: components["schemas"]["StoreEncryptionView"];
+                    gc: components["schemas"]["JobSchedule"];
+                    /** Format: int32 */
+                    max_streams: number;
+                    read_only?: boolean;
+                    verify?: components["schemas"]["VerifyPolicy"];
+                };
+                /** @description 저장소의 실제 상태. 초기화·GC·검증 Task와 리더의 스케줄러가 쓴다. */
+                status: {
+                    /**
+                     * Format: int64
+                     * @description 검증이 찾아 `bad/`로 옮긴 청크 수
+                     */
+                    bad_chunks?: number;
+                    /** @description 매니페스트를 쓰는 중인 백업(쓰기 잠금 — `sweeping`이 거짓일 때만 더한다, §10.3) */
+                    committing?: string[];
+                    error?: string;
+                    /** @description 진행 중인 GC(§10.2) */
+                    gc?: components["schemas"]["GcRun"];
+                    last_gc?: components["schemas"]["GcResult"];
+                    last_verify?: components["schemas"]["VerifyResult"];
+                    /**
+                     * Format: int64
+                     * @description 다음 예약 GC 시각(유닉스 초)
+                     */
+                    next_gc?: number;
+                    /**
+                     * Format: int64
+                     * @description 다음 예약 검증 시각(유닉스 초)
+                     */
+                    next_verify?: number;
+                    /**
+                     * Format: uuid
+                     * @description 공유가 아닌 백업 풀 안 저장소를 만든 노드(그 노드에만 있다 — §7.6). 공유 풀·S3면 없다.
+                     */
+                    node?: string;
+                    /** @description 저장소 `owner.json`의 주인 클러스터(§12.6) */
+                    owner?: components["schemas"]["StoreOwner"];
+                    /** @default initializing */
+                    phase: components["schemas"]["StorePhase"];
+                    /**
+                     * Format: uuid
+                     * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
+                     */
+                    store_id?: string;
+                    /**
+                     * Format: int64
+                     * @description 쓸기를 시작할 때마다 1씩 오른다. 백업이 시작과 커밋 때 견준다.
+                     */
+                    sweep_epoch?: number;
+                    /** @description GC가 청크를 지우는 중(쓰기 잠금 — `committing`이 비었을 때만 참이 된다) */
+                    sweeping?: boolean;
+                    /** @description 마지막 GC가 센 사용량 */
+                    usage?: components["schemas"]["StoreUsage"];
                 };
             }[];
             /** Format: int64 */
@@ -8517,6 +9008,10 @@ export interface components {
          * @enum {string}
          */
         MigrationStep: "start" | "rollback" | "finish";
+        /** @description 받는 쪽 저장소에 없는 청크 */
+        MissingChunks: {
+            missing: string[];
+        };
         MonReport: {
             /**
              * @description v2 주소(`10.0.0.1:3300`)
@@ -10038,8 +10533,10 @@ export interface components {
             roles: components["schemas"]["RoleMapping"];
         };
         ReceiveRequest: {
-            /** @description 원본 백업의 매니페스트(`manifest.json`) */
-            manifest: components["schemas"]["BackupManifest"];
+            /** @description 저장소 사본의 VM 칸(매니페스트 v3에는 없고 암호화된 `config` 블롭에 있다). 저장소면 있어야 한다. */
+            config?: components["schemas"]["StoreCopyConfig"];
+            /** @description 원본 백업의 매니페스트: 풀이면 `manifest.json`(버전 1·2), 저장소면 `index.json`(버전 3) */
+            manifest: Record<string, never>;
             /** @description 받는 쪽 백업 이름. 없으면 `{VM 이름}-{만든 시각}`이고, 겹치면 뒤에 `-2`, `-3`…을 붙인다. */
             name?: string | null;
             origin: components["schemas"]["BackupOrigin"];
@@ -10048,8 +10545,10 @@ export interface components {
              * @description 증분 백업이면 받는 쪽(이 클러스터)에 있는 부모 사본의 id. 전체 백업이면 뺀다.
              */
             parent?: string | null;
-            /** @description 받을 백업 풀. 이 노드에서 쓸 수 있어야 한다. */
-            pool: string;
+            /** @description 받을 백업 풀. 이 노드에서 쓸 수 있어야 한다. `store`와 둘 중 하나다. */
+            pool?: string;
+            /** @description 받을 백업 저장소(계획 68 §12.4 — 저장소 백업의 사본). 이 노드에서 쓸 수 있어야 한다. */
+            store?: string;
         };
         /** @description 받은 파일 */
         ReceivedFile: {
@@ -10067,6 +10566,10 @@ export interface components {
         /** @description 새 복구 코드(한 번만 보인다). 이미 남은 코드가 있어 새로 만들지 않았으면 비어 있다. */
         RecoveryCodes: {
             codes: string[];
+        };
+        /** @description 복구 키 */
+        RecoveryKey: {
+            recovery_key: string;
         };
         /** @description Redfish BMC. Basic 인증으로 `ComputerSystem.Reset`(`ForceOff`)을 부르고 `PowerState`로 확인한다. */
         RedfishFence: {
@@ -10611,6 +11114,78 @@ export interface components {
                 uefi_vars: boolean;
                 /** @description 마지막 검증 결과(계획 68). 검증한 적이 없으면 쓰지 않는다. */
                 verify?: components["schemas"]["BackupVerify"];
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_BackupStoreSpecView_BackupStoreStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 비밀(S3 비밀 키·주 키)을 뺀 저장소 스펙 */
+            spec: {
+                backend: components["schemas"]["StoreBackendView"];
+                encryption?: components["schemas"]["StoreEncryptionView"];
+                gc: components["schemas"]["JobSchedule"];
+                /** Format: int32 */
+                max_streams: number;
+                read_only?: boolean;
+                verify?: components["schemas"]["VerifyPolicy"];
+            };
+            /** @description 저장소의 실제 상태. 초기화·GC·검증 Task와 리더의 스케줄러가 쓴다. */
+            status: {
+                /**
+                 * Format: int64
+                 * @description 검증이 찾아 `bad/`로 옮긴 청크 수
+                 */
+                bad_chunks?: number;
+                /** @description 매니페스트를 쓰는 중인 백업(쓰기 잠금 — `sweeping`이 거짓일 때만 더한다, §10.3) */
+                committing?: string[];
+                error?: string;
+                /** @description 진행 중인 GC(§10.2) */
+                gc?: components["schemas"]["GcRun"];
+                last_gc?: components["schemas"]["GcResult"];
+                last_verify?: components["schemas"]["VerifyResult"];
+                /**
+                 * Format: int64
+                 * @description 다음 예약 GC 시각(유닉스 초)
+                 */
+                next_gc?: number;
+                /**
+                 * Format: int64
+                 * @description 다음 예약 검증 시각(유닉스 초)
+                 */
+                next_verify?: number;
+                /**
+                 * Format: uuid
+                 * @description 공유가 아닌 백업 풀 안 저장소를 만든 노드(그 노드에만 있다 — §7.6). 공유 풀·S3면 없다.
+                 */
+                node?: string;
+                /** @description 저장소 `owner.json`의 주인 클러스터(§12.6) */
+                owner?: components["schemas"]["StoreOwner"];
+                /** @default initializing */
+                phase: components["schemas"]["StorePhase"];
+                /**
+                 * Format: uuid
+                 * @description 저장소 `store.json`의 id. 이 클러스터가 만든 저장소는 리소스 id, 붙인 저장소는 남의 것이다.
+                 */
+                store_id?: string;
+                /**
+                 * Format: int64
+                 * @description 쓸기를 시작할 때마다 1씩 오른다. 백업이 시작과 커밋 때 견준다.
+                 */
+                sweep_epoch?: number;
+                /** @description GC가 청크를 지우는 중(쓰기 잠금 — `committing`이 비었을 때만 참이 된다) */
+                sweeping?: boolean;
+                /** @description 마지막 GC가 센 사용량 */
+                usage?: components["schemas"]["StoreUsage"];
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
@@ -11664,6 +12239,8 @@ export interface components {
              * @description 새 VM을 둘 폴더 id(계획 62). 없으면 백업한 VM의 폴더(아직 있으면), 아니면 루트다.
              */
             folder?: string | null;
+            /** @description 라이브 복원(계획 68 §11): 디스크를 다 받기 전에 새 VM을 켜고 뒤에서 옮긴다. 새 폴더의 `vm.power`도 든다. */
+            live?: boolean;
             /** @description 새 VM의 이름 */
             name: string;
             /** @description 복원을 실행할 노드(이름이나 id). 없으면 백업 풀과 대상 풀을 함께 쓸 수 있는 노드다. */
@@ -11873,6 +12450,41 @@ export interface components {
          * @enum {string}
          */
         RuntimeHealth: "ok" | "slow";
+        /** @description S3 자격 증명 바꾸기(둘 다) */
+        S3Credentials: {
+            access_key_id: string;
+            secret_access_key: string;
+        };
+        /** @description S3 호환 객체 저장소의 버킷과 접두사(§7.7) */
+        S3Target: {
+            access_key_id: string;
+            bucket: string;
+            /** @description 끝점 인증서를 확인할 사용자 CA(PEM). 없으면 시스템 루트. */
+            ca_pem?: string;
+            /** @description 끝점 URL(`https://host[:port]`). 시험만 `http`(`insecure_http`). */
+            endpoint: string;
+            /** @description `http` 끝점을 허락한다(시험용 — 자격 증명과 데이터가 평문으로 오간다). */
+            insecure_http?: boolean;
+            /** @description 경로 방식 주소(`{끝점}/{버킷}/…` — MinIO·Ceph RGW). 거짓이면 가상 호스트 방식(`{버킷}.{호스트}`). */
+            path_style?: boolean;
+            /** @description 버킷 안 접두사. 끝에 `/`를 붙여 쓴다. 없으면 버킷 맨 위다. */
+            prefix?: string;
+            /** @default us-east-1 */
+            region: string;
+            /** @description 비밀 키. Raft에만 있고 API 보기·watch·감사·`Debug`에서 뺀다. */
+            secret_access_key: string;
+        };
+        /** @description 보기의 S3 대상: 비밀 키가 없다. */
+        S3TargetView: {
+            access_key_id: string;
+            bucket: string;
+            ca_pem?: string;
+            endpoint: string;
+            insecure_http?: boolean;
+            path_style?: boolean;
+            prefix?: string;
+            region: string;
+        };
         /**
          * @description 예약 스냅샷이 실패한 이유. `code`는 거절한 API 오류의 code(`vm_busy` 등)이고, Task가 실패했으면
          *     `task_failed`다. 옛 상태의 문자열은 `{ code: "unknown", message: <문자열> }`로 읽는다.
@@ -12394,6 +13006,19 @@ export interface components {
              */
             total_bytes: number | null;
         };
+        /** @description 저장소가 사는 곳. JSON은 `{"pool": "bk"}` 또는 `{"s3": {...}}`이다. */
+        StoreBackend: {
+            /** @description 백업 풀(`backups`를 켠 dir·NFS 풀)의 이름. 경로는 `{풀 루트}/store/{저장소 id}/`. */
+            pool: string;
+        } | {
+            s3: components["schemas"]["S3Target"];
+        };
+        /** @description 보기의 백엔드(`{"pool": "bk"}` 또는 `{"s3": {...}}`) */
+        StoreBackendView: {
+            pool: string;
+        } | {
+            s3: components["schemas"]["S3TargetView"];
+        };
         /** @description 저장소 백업 하나가 읽고 쓴 양(계획 68 §8.4) */
         StoreBackupStats: {
             /**
@@ -12432,6 +13057,119 @@ export interface components {
              * @default 0
              */
             zero_chunks: number;
+        };
+        /** @description 연결 확인 결과: 이 노드에서 곧바로 읽어 본 것과 노드마다 보고한 것 */
+        StoreCheck: {
+            /** @description API 노드가 그 저장소를 쓰지 못하면(다른 노드의 로컬 풀) 확인하지 않았다. */
+            checked_here: boolean;
+            error?: string;
+            nodes: components["schemas"]["StoreNodeCheck"][];
+            /** @description API 노드에서 `store.json`을 읽고 키가 맞았다. */
+            ok: boolean;
+        };
+        /** @description 저장소 사본의 VM 칸(`config` 블롭과 같은 내용) */
+        StoreCopyConfig: {
+            tpm_state?: boolean;
+            uefi_vars?: boolean;
+            vm_name: string;
+            vm_spec: components["schemas"]["VmSpec"];
+        };
+        /** @description 보기의 암호화: 키 지문만 */
+        StoreEncryptionView: {
+            fingerprint: string;
+        };
+        /** @description 노드 하나가 저장소에 닿는지(노드 보고 `NodeStatus.backup_stores`) */
+        StoreNodeCheck: {
+            /** Format: int64 */
+            checked_at: number;
+            error?: string;
+            name: string;
+            /** Format: uuid */
+            node: string;
+            ok: boolean;
+        };
+        /** @description 저장소의 주인 클러스터(`owner.json`) */
+        StoreOwner: {
+            /** @description 주인 클러스터 CA의 지문(`sha256:…`) */
+            ca_fingerprint: string;
+            cluster: string;
+        };
+        /** @description 저장소에서 바꿀 값. 주어진 것만 바꾼다. 백엔드·암호화·읽기 전용은 바꾸지 못한다(읽기 전용은 `take-over`). */
+        StorePatch: {
+            /** @description S3 저장소만. `null`이면 시스템 루트로 돌아간다. */
+            ca_pem?: string | null;
+            gc?: components["schemas"]["JobSchedule"];
+            /** Format: int32 */
+            max_streams?: number;
+            /** @description S3 저장소만 */
+            s3_credentials?: components["schemas"]["S3Credentials"];
+            verify?: components["schemas"]["VerifyPolicy"] | null;
+        };
+        /** @enum {string} */
+        StorePhase: "initializing" | "ready" | "failed";
+        /** @description 만들기의 스펙(암호화는 [`CreateStoreRequest::encryption`]으로 따로 — 키를 본문에 받지 않는다) */
+        StoreSpecRequest: {
+            backend: components["schemas"]["StoreBackend"];
+            /** @description GC 일정(UTC). 없으면 매일 05:00. */
+            gc?: components["schemas"]["JobSchedule"];
+            /**
+             * Format: int32
+             * @description S3 동시 요청 수(1~64, 기본 8)
+             */
+            max_streams?: number;
+            /** @description 다른 클러스터가 주인인 저장소를 복원용으로 붙인다(백업·지우기·GC 막힘). */
+            read_only?: boolean;
+            /**
+             * Format: uuid
+             * @description 읽기 전용으로 붙이는 백업 풀 안 저장소의 id(`{풀 루트}/store/<id>/` — 다른 클러스터가 만든 디렉터리). S3는 쓰지
+             *     않는다.
+             */
+            store_id?: string;
+            /** @description 예약 검증. 없으면 예약 검증을 하지 않는다. */
+            verify?: components["schemas"]["VerifyPolicy"];
+        };
+        /** @description 옮기기·복사의 대상 저장소 */
+        StoreTargetRequest: {
+            /** @description 백업 저장소 이름 */
+            store: string;
+        };
+        /** @description 저장소 사용량(GC가 셈) */
+        StoreUsage: {
+            /**
+             * Format: int64
+             * @description 참조되는 청크 수
+             * @default 0
+             */
+            chunks: number;
+            /**
+             * Format: int64
+             * @description 스냅샷 디스크 가상 크기 합(dedup 배율 = logical / stored)
+             * @default 0
+             */
+            logical_bytes: number;
+            /**
+             * Format: int64
+             * @description 센 시각(유닉스 초)
+             * @default 0
+             */
+            measured_at: number;
+            /**
+             * Format: int64
+             * @description 스냅샷(완성된 백업) 수
+             * @default 0
+             */
+            snapshots: number;
+            /**
+             * Format: int64
+             * @description 청크가 차지한 바이트(압축·암호화 뒤)
+             * @default 0
+             */
+            stored_bytes: number;
+        };
+        /** @description 저장소 동작 본문(검증만 쓴다) */
+        StoreVerifyRequest: {
+            /** @description 검증할 백업(이름이나 id). 비면 일정의 규칙대로 고른다(검증한 적 없거나 오래된 백업). */
+            backups?: string[];
         };
         /**
          * @description 경보 대상의 종류
@@ -12520,6 +13258,11 @@ export interface components {
          * @enum {string}
          */
         SubscriptionState: "none" | "active" | "expired" | "invalid" | "over_limit";
+        /** @description 넘겨받기 본문 */
+        TakeOverRequest: {
+            /** @description 주인의 하트비트가 24시간 안이어도 넘겨받는다(옛 주인이 아직 살아 있으면 두 클러스터가 서로의 백업을 지울 수 있다). */
+            force?: boolean;
+        };
         /** @description 보내는 방법 */
         TargetConfig: (components["schemas"]["SmtpTarget"] & {
             /** @enum {string} */
@@ -13495,6 +14238,44 @@ export interface components {
             role: components["schemas"]["Role"];
             /** @description 2단계 인증 요소(확인된 TOTP 또는 패스키)가 있다(계획 62) */
             two_factor?: boolean;
+        };
+        /** @enum {string} */
+        VerifyMode: "full" | "metadata";
+        /** @description 예약 검증(§10.5) */
+        VerifyPolicy: {
+            mode?: components["schemas"]["VerifyMode"];
+            /**
+             * Format: int32
+             * @description 이 날 수보다 오래전에 검증한 백업을 다시 검증한다(1~3650).
+             * @default 30
+             */
+            reverify_days: number;
+            schedule: components["schemas"]["JobSchedule"];
+            /** @description 백업이 `ready`가 되면 곧바로 그 백업을 검증한다. */
+            verify_new?: boolean;
+        };
+        /** @description 끝난 검증 실행의 결과 */
+        VerifyResult: {
+            /**
+             * Format: int64
+             * @description 깨진 청크 수
+             */
+            bad: number;
+            /**
+             * Format: int64
+             * @description 확인한 청크 수
+             */
+            chunks: number;
+            error?: string;
+            /** Format: int64 */
+            finished_at: number;
+            /**
+             * Format: int64
+             * @description 검증한 백업 수
+             */
+            snapshots: number;
+            /** Format: int64 */
+            started_at: number;
         };
         /** @enum {string} */
         VerifyState: "ok" | "failed";
@@ -15112,6 +15893,402 @@ export interface operations {
             };
         };
     };
+    list_stores: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_BackupStoreSpecView_BackupStoreStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateStoreRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CreatedStore"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StorePatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    check_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StoreCheck"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    gc_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    scan_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    take_over: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TakeOverRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_BackupStoreSpecView_BackupStoreStatus"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    verify_store: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreVerifyRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    escrow_key_handler: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EscrowRequest"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    export_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecoveryKey"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_backups: {
         parameters: {
             query?: {
@@ -15275,6 +16452,74 @@ export interface operations {
             };
         };
     };
+    convert_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreTargetRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    copy_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["StoreTargetRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     replicate_backup: {
         parameters: {
             query?: never;
@@ -15297,6 +16542,120 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    verify_backup: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    missing_chunks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChunkIds"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MissingChunks"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_chunk: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+                /** @description chunk id (64 hex digits) */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": components["schemas"]["BackupFile"];
+            };
+        };
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {
@@ -21401,6 +22760,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_live_restore: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CancelLiveRestoreRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
                 };
             };
             "4XX": {

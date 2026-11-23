@@ -130,6 +130,8 @@ impl From<ClusterError> for ApiError {
                             "migration-source" | "migration-vm" | "migration-target" => {
                                 "migration_overlap"
                             }
+                            // 계획 68: 같은 백업 풀·S3 버킷/접두사의 다른 저장소
+                            "backup-store-target" => "store_target_in_use",
                             _ => "volume_in_use",
                         },
                         message,

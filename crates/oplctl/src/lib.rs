@@ -2,6 +2,7 @@
 
 mod access;
 mod alerts;
+mod backup_store;
 mod ceph;
 mod cli;
 mod client;

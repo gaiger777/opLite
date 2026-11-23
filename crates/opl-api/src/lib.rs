@@ -11,6 +11,7 @@ pub mod authz;
 mod authz_routes;
 mod backup_jobs;
 mod backup_receive;
+mod backup_stores;
 mod backups;
 pub mod balance;
 mod balancer;
@@ -388,6 +389,28 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(backup_receive::receive_backup))
         .routes(routes!(backup_receive::put_backup_file))
         .routes(routes!(backup_receive::complete_backup))
+        .routes(routes!(backup_receive::missing_chunks))
+        .routes(routes!(backup_receive::put_chunk))
+        .routes(routes!(backups::verify_backup))
+        .routes(routes!(backups::convert_backup))
+        .routes(routes!(backups::copy_backup))
+        .routes(routes!(vms::cancel_live_restore))
+        .routes(routes!(
+            backup_stores::list_stores,
+            backup_stores::create_store
+        ))
+        .routes(routes!(
+            backup_stores::get_store,
+            backup_stores::patch_store,
+            backup_stores::delete_store
+        ))
+        .routes(routes!(backup_stores::gc_store))
+        .routes(routes!(backup_stores::verify_store))
+        .routes(routes!(backup_stores::check_store))
+        .routes(routes!(backup_stores::scan_store))
+        .routes(routes!(backup_stores::take_over))
+        .routes(routes!(backup_stores::export_key))
+        .routes(routes!(backup_stores::escrow_key_handler))
         .routes(routes!(r::list_backup_jobs, backup_jobs::create_backup_job))
         .routes(routes!(
             r::get_backup_job,

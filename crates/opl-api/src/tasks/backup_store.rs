@@ -1457,6 +1457,160 @@ pub(super) async fn discard_convert(ctx: &Ctx, task: &Task, store: &str, error: 
     }
 }
 
+// ---- 저장소 사이 복사(§12.5) ----
+
+/// 원본 `source`를 저장소 `store`로 복사한 백업(실패하지 않은 것)
+fn copied<'a>(backups: &'a [Backup], source: Uuid, store: &str) -> Option<&'a Backup> {
+    backups.iter().find(|b| {
+        b.spec.store.as_deref() == Some(store)
+            && b.spec
+                .source
+                .as_ref()
+                .is_some_and(|s| s.backup == source && s.kind == BackupSourceKind::Copy)
+            && b.status.phase != BackupPhase::Failed
+    })
+}
+
+/// 복사한 백업의 이름: 원본 이름에 `-{저장소}`(겹치면 번호), 63자 안
+fn copy_name(original: &str, store: &str, taken: impl Fn(&str) -> bool) -> String {
+    (1..)
+        .map(|n| {
+            let suffix = if n == 1 {
+                format!("-{store}")
+            } else {
+                format!("-{store}{n}")
+            };
+            let suffix = &suffix[..suffix.len().min(40)];
+            let keep = original.len().min(63 - suffix.len());
+            format!("{}{suffix}", original[..keep].trim_end_matches('-'))
+        })
+        .find(|name| !taken(name))
+        .expect("some suffix is free")
+}
+
+/// 저장소 백업 `source`(대상)를 다른 저장소 `store`로 복사한다(§12.5): 원본을 이 노드 안 NBD 서버로 내보내 파이프라인으로
+/// 대상 저장소에 쓴다 — 대상에 이미 있는 청크는 올리지 않고(있음 확인), 키가 다르면 대상 키로 다시 암호화한다(키가 같으면
+/// 결정적 nonce라 객체 바이트가 같다). 새 Backup(`spec.source = {source, copy}`, 같은 `vm`·`vm_spec`·`job`·`created_at`)을
+/// 만든다. 같은 원본을 같은 저장소로 이미 복사했으면 실패한다.
+pub(super) async fn copy(
+    ctx: &Ctx,
+    task: &Task,
+    store_name: &str,
+) -> Result<Option<String>, String> {
+    let source = get_backup(ctx, task.spec.target)?.ok_or("backup was deleted")?;
+    if source.status.phase != BackupPhase::Ready {
+        return Err("backup is not ready".into());
+    }
+    let from = source
+        .spec
+        .store
+        .clone()
+        .ok_or("only backups in a backup store can be copied to another store")?;
+    let (_, src) = open_store(ctx, &from).await?;
+    let (dst_res, dst) = open_store(ctx, store_name).await?;
+    check_writable(&dst_res)?;
+    let (_, backups) = ctx
+        .cluster
+        .list::<BackupSpec>()
+        .map_err(|e| e.to_string())?;
+    if let Some(b) = copied(&backups, source.id, store_name) {
+        return Err(format!(
+            "backup {:?} was already copied to store {store_name:?} as {:?}",
+            source.name, b.name
+        ));
+    }
+    let (m, config) = read_snapshot(&src, &source).await?;
+    let fail = |e| stores::store_error(&from, e);
+    let firmware = Firmware {
+        vars: match m.blob(VARS_BLOB) {
+            Some(_) => Some(src.get_blob(&m, VARS_BLOB).await.map_err(fail)?),
+            None => None,
+        },
+        tpm: match m.blob(TPM_BLOB) {
+            Some(_) => Some(src.get_blob(&m, TPM_BLOB).await.map_err(fail)?),
+            None => None,
+        },
+    };
+    let mut copy: Backup = Resource::new(
+        copy_name(&source.name, store_name, |n| {
+            backups.iter().any(|b| b.name == n)
+        }),
+        BackupSpec {
+            pool: String::new(),
+            store: Some(store_name.to_string()),
+            source: Some(BackupSource {
+                backup: source.id,
+                kind: BackupSourceKind::Copy,
+            }),
+            incremental: false,
+            max_chain: None,
+            origin: None,
+            ..source.spec.clone()
+        },
+    );
+    copy.labels = source.labels.clone();
+    ctx.cluster.create(&copy).await.map_err(|e| e.to_string())?;
+    let serving = serve(ctx, &src, &m, socket_path(ctx, "cp", copy.id)).await?;
+    let sources: Vec<DiskSource> = m
+        .disks
+        .iter()
+        .map(|d| DiskSource {
+            socket: socket_path(ctx, "cp", copy.id),
+            export: d.name.clone(),
+            dirty: None,
+        })
+        .collect();
+    let created_at = source.status.created_at.unwrap_or(m.created_at);
+    let commit = Commit {
+        store_res: &dst_res,
+        store: &dst,
+        vm: source.spec.vm,
+        backup: copy.id,
+        created_at,
+        config: ConfigBlob {
+            uefi_vars: firmware.vars.is_some(),
+            tpm_state: firmware.tpm.is_some(),
+            ..config
+        },
+        firmware,
+        epoch: dst_res.status.sweep_epoch,
+        sweeping: dst_res.status.sweeping,
+    };
+    let written = Box::pin(write_backup(ctx, &commit, &sources, None)).await;
+    drop(serving);
+    let (disks, stats) = written?;
+    let status = BackupStatus {
+        phase: BackupPhase::Ready,
+        created_at: Some(created_at),
+        disks,
+        uefi_vars: commit.config.uefi_vars,
+        tpm_state: commit.config.tpm_state,
+        store_stats: Some(stats),
+        ..Default::default()
+    };
+    mark_backup(ctx, copy.id, &status).await?;
+    Ok(None)
+}
+
+/// 실패한 복사가 만든 `pending` 백업을 [`discard`]로 치운다.
+pub(super) async fn discard_copy(ctx: &Ctx, task: &Task, store: &str, error: &str) {
+    let Ok((_, backups)) = ctx.cluster.list::<BackupSpec>() else {
+        return;
+    };
+    let made = backups
+        .into_iter()
+        .filter(|b| b.status.phase == BackupPhase::Pending)
+        .find(|b| {
+            b.spec.store.as_deref() == Some(store)
+                && b.spec.source.as_ref().is_some_and(|s| {
+                    s.backup == task.spec.target && s.kind == BackupSourceKind::Copy
+                })
+        });
+    if let Some(b) = made {
+        discard(ctx, b, error, false).await;
+    }
+}
+
 /// 끝나지 않은 옮기기 Task가 이 저장소 백업을 채우는지(janitor·GC가 pending 백업을 볼 때)
 pub(crate) fn filling(tasks: &[Task], backups: &[Backup], backup: &Backup) -> bool {
     tasks
@@ -1473,23 +1627,32 @@ pub(crate) fn filling(tasks: &[Task], backups: &[Backup], backup: &Backup) -> bo
                         .is_some_and(|s| s.backup == t.spec.target)
                     && converted(backups, t.spec.target, store).is_some_and(|c| c.id == backup.id)
             }
+            TaskOp::BackupCopy { store } => {
+                copied(backups, t.spec.target, store).is_some_and(|c| c.id == backup.id)
+            }
             _ => false,
         })
 }
 
-/// 쓰기 잠금을 쥔 채 남은 것(§10.3 끝): 커밋 구간의 백업 가운데 더는 `pending`이 아니거나 채우는 Task가 없는 것,
-/// 끝난(없는) GC Task의 `gc`·`sweeping`. 바꿀 것이 있으면 고친 상태.
+/// 받는 사본(원격 복제)의 커밋 구간을 쥔 채 이만큼 아무것도 받지 않았으면 남은 잠금으로 본다(완료 요청이 죽었다).
+pub(crate) const RECEIVE_COMMIT_STALE: u64 = 600;
+
+/// 쓰기 잠금을 쥔 채 남은 것(§10.3 끝): 커밋 구간의 백업 가운데 더는 `pending`이 아니거나 채우는 Task가 없는 것(받는
+/// 사본은 [`RECEIVE_COMMIT_STALE`] 동안 받은 것이 없는 것), 끝난(없는) GC Task의 `gc`·`sweeping`. 바꿀 것이 있으면 고친
+/// 상태.
 pub(crate) fn stale_locks(
     store: &BackupStore,
     backups: &[Backup],
     tasks: &[Task],
+    now: u64,
 ) -> Option<BackupStoreStatus> {
     let mut status = store.status.clone();
     status.committing.retain(|id| {
-        backups
-            .iter()
-            .find(|b| b.id == *id)
-            .is_some_and(|b| b.status.phase == BackupPhase::Pending && filling(tasks, backups, b))
+        backups.iter().find(|b| b.id == *id).is_some_and(|b| {
+            (b.status.phase == BackupPhase::Pending && filling(tasks, backups, b))
+                || (b.status.phase == BackupPhase::Receiving
+                    && b.status.received_at.unwrap_or(0) + RECEIVE_COMMIT_STALE >= now)
+        })
     });
     if let Some(gc) = &status.gc {
         let alive = tasks
@@ -1608,15 +1771,15 @@ mod tests {
             ),
             gc_task.clone(),
         ];
-        let fixed = stale_locks(&store, &backups, &tasks).unwrap();
+        let fixed = stale_locks(&store, &backups, &tasks, 0).unwrap();
         assert_eq!(fixed.committing, vec![live.id]);
         assert!(fixed.sweeping && fixed.gc.is_some());
         // GC Task가 끝났으면 잠금을 푼다
         tasks[1].status.state = TaskState::Failed;
         store.status = fixed;
-        let fixed = stale_locks(&store, &backups, &tasks).unwrap();
+        let fixed = stale_locks(&store, &backups, &tasks, 0).unwrap();
         assert!(!fixed.sweeping && fixed.gc.is_none());
         store.status = fixed;
-        assert_eq!(stale_locks(&store, &backups, &tasks), None);
+        assert_eq!(stale_locks(&store, &backups, &tasks, 0), None);
     }
 }

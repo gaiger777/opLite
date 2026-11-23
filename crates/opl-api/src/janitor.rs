@@ -457,7 +457,9 @@ async fn release_store_locks(cluster: &Cluster, backups: &[Backup], tasks: &[Tas
         return;
     };
     for store in stores {
-        let Some(status) = crate::tasks::backup_store::stale_locks(&store, backups, tasks) else {
+        let Some(status) =
+            crate::tasks::backup_store::stale_locks(&store, backups, tasks, crate::backups::now())
+        else {
             continue;
         };
         match cluster

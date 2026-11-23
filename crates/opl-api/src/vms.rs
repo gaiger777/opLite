@@ -2867,3 +2867,50 @@ mod tests {
         }));
     }
 }
+
+/// 라이브 복원 취소 본문
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CancelLiveRestoreRequest {
+    /// 게스트가 라이브 복원 뒤 쓴 것을 버린다는 확인(참이어야 한다)
+    #[serde(default)]
+    pub discard: bool,
+}
+
+/// 라이브 복원을 취소한다(202, 계획 68 §11.4): VM을 끄고 VM·대상 볼륨·오버레이를 지운다 — 게스트가 쓴 것을 버리므로
+/// `discard: true`가 없으면 400. 라이브 복원 중이 아니면 409 `vm_not_restoring`. 취소를 하는 Task(라이브 복원 Task)를
+/// 돌려준다.
+#[utoipa::path(post, path = "/vms/{key}/live-restore/cancel", tag = "vms",
+    params(("key" = String, Path, description = "VM id or name")),
+    request_body = CancelLiveRestoreRequest,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn cancel_live_restore(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+    Json(req): Json<CancelLiveRestoreRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    require_feature(&state.cluster, opl_types::node::BACKUP_STORE)?;
+    if !req.discard {
+        return Err(ApiError::bad_request(
+            "cancelling a live restore deletes the VM and what the guest wrote; confirm with discard: true",
+        ));
+    }
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    if vm.status.live_restore.is_none() {
+        return Err(ApiError::conflict(
+            "vm_not_restoring",
+            format!("VM {:?} is not being live-restored", vm.name),
+        ));
+    }
+    let id = crate::tasks::live_restore::request_cancel(&state.cluster, vm.id)
+        .await
+        .map_err(|e| ApiError::conflict("vm_not_restoring", e))?;
+    audit.detail(format!("vm live-restore cancel {} (discard)", vm.name));
+    let task = state
+        .cluster
+        .get::<TaskSpec>(id)?
+        .ok_or_else(|| ApiError::internal("the cancelling task vanished"))?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
