@@ -382,25 +382,47 @@ async fn applying_a_recommendation_starts_the_migration() {
     // 문턱 1%면 두 VM 모두 옮기라고 한다. 회차는 5초마다라 그사이 추천이 바뀌지 않는다.
     set_placement(&c.admin, json!({ "threshold": 1 })).await;
     let bal = balancer_every(&c.env, Duration::from_secs(5));
+    // 사용자를 먼저 만든다. 회차(5초)마다 추천 id가 새로 매겨지므로, 느린 CI에서 읽은 뒤 적용 사이에 회차가 지나면
+    // 404 `recommendation_not_found`다 — 그때는 다시 읽어 같은 VM의 새 추천으로 한다.
+    let viewer = c.env.user("v", "viewer").await;
+    let operator = c.env.user("o", "operator").await;
     let got = status_until(&c.admin, "two recommendations", |s| {
         recommendations(s).len() == 2
     })
     .await;
     let recs = recommendations(&got);
-    let (first, second) = (&recs[0], &recs[1]);
+    let (first, second) = (recs[0].clone(), recs[1].clone());
     let path = |r: &Value| {
         format!(
             "/placement/recommendations/{}/apply",
             r["id"].as_str().unwrap()
         )
     };
+    // `vm`의 지금 추천을 적용한다(사라졌으면 다시 읽어 몇 번).
+    let apply = |user: &'static str, vm: Value| {
+        let (admin, viewer, operator) = (&c.admin, &viewer, &operator);
+        async move {
+            let who = if user == "viewer" { viewer } else { operator };
+            for _ in 0..5 {
+                let recs = recommendations(&status(admin).await);
+                let Some(rec) = recs.iter().find(|r| r["vm"] == vm).cloned() else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                };
+                let (code, body) = who.post(&path(&rec), Value::Null).await;
+                if code == StatusCode::NOT_FOUND && body["code"] == "recommendation_not_found" {
+                    continue;
+                }
+                return (rec, code, body);
+            }
+            panic!("no stable recommendation for {vm}");
+        }
+    };
 
-    let viewer = c.env.user("v", "viewer").await;
-    let (code, _) = viewer.post(&path(first), Value::Null).await;
+    let (_, code, _) = apply("viewer", first["vm"].clone()).await;
     assert_eq!(code, StatusCode::FORBIDDEN);
 
-    let operator = c.env.user("o", "operator").await;
-    let (code, task) = operator.post(&path(first), Value::Null).await;
+    let (first, code, task) = apply("operator", first["vm"].clone()).await;
     assert_eq!(code, StatusCode::ACCEPTED, "{task}");
     assert_eq!(
         task["spec"]["op"],
@@ -412,7 +434,7 @@ async fn applying_a_recommendation_starts_the_migration() {
     let after = recommendations(&status(&c.admin).await);
     assert_eq!(after[0]["task"], task["id"], "{after:?}");
 
-    let (code, body) = operator.post(&path(first), Value::Null).await;
+    let (code, body) = operator.post(&path(&first), Value::Null).await;
     assert_eq!(code, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "recommendation_stale");
     assert!(
@@ -444,7 +466,7 @@ async fn applying_a_recommendation_starts_the_migration() {
         .update_spec(id, None, vm.labels.clone(), &vm.spec)
         .await
         .unwrap();
-    let (code, body) = operator.post(&path(second), Value::Null).await;
+    let (_, code, body) = apply("operator", second["vm"].clone()).await;
     assert_eq!(code, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "vm_pinned");
     assert_eq!(migrations(&c.env).len(), 1);
