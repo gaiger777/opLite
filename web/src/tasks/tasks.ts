@@ -193,6 +193,26 @@ function gib(bytes: number): string {
   return (bytes / 1024 ** 3).toFixed(1);
 }
 
+/** 바이트 진행률(%, 내림, 넘치면 100). 전체를 모르면 0. */
+export function bytePercent(done: number, total: number): number {
+  return total > 0 ? Math.floor((Math.min(done, total) * 100) / total) : 0;
+}
+
+/**
+ * 마이그레이션 Task의 진행률(클러스터 지도도 씀): 바이트 수가 뜻 있는 것은 디스크 복사 단계뿐이다 — 메모리 단계는 서버가
+ * 끝난 디스크 복사의 바이트(다 됨)를 그대로 두므로 퍼센트로 보이면 100%가 된다. 그 밖의 단계는 `null`.
+ */
+export function migrationPercent(progress: Task["status"]["progress"]): number | null {
+  return progress?.stage === "copying-disks"
+    ? bytePercent(progress.done_bytes, progress.total_bytes)
+    : null;
+}
+
+/** 마이그레이션 단계의 글(퍼센트가 없는 단계): "메모리 옮기는 중". 모르는 단계는 `null`(날 이름을 보이지 않음). */
+export function migrationStageText(stage: string, t: (key: string) => string): string | null {
+  return stage === "migrating-memory" ? t("tasks.progress.migratingMemory") : null;
+}
+
 /**
  * 실행 중인 Task의 진행률 문구(로컬 디스크를 복사하는 마이그레이션과 복제): "디스크 복사 37% (14.8/40.0 GiB)",
  * "메모리 옮기는 중", "복제 12% (0.1/1.0 GiB)", 받기(체크섬 파일, "받는 중 40% (0.4/1.0 GiB)", 확인, 가져오기, 템플릿 만들기), Ceph Task의 단계("패키지 설치 중", 모르는 단계는 그 이름). 진행률이
@@ -202,7 +222,7 @@ export function describeProgress(task: Task, t: TFunction): string | null {
   const progress = task.status.progress;
   if (progress?.stage === "copying-disks" || progress?.stage === "replicating") {
     const { done_bytes: done, total_bytes: total } = progress;
-    const percent = total > 0 ? Math.floor((Math.min(done, total) * 100) / total) : 0;
+    const percent = bytePercent(done, total);
     return t(
       progress.stage === "replicating"
         ? "tasks.progress.replicating"
@@ -231,7 +251,7 @@ export function describeProgress(task: Task, t: TFunction): string | null {
     return t(`tasks.progress.${progress.stage}`);
   }
   if (progress?.stage === "migrating-memory") {
-    return t("tasks.progress.migratingMemory");
+    return migrationStageText(progress.stage, t);
   }
   // Ceph Task는 단계 이름만 알린다(바이트 0/0).
   if (progress && task.spec.op.kind.startsWith("ceph-")) {

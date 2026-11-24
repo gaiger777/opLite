@@ -8,6 +8,7 @@ import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
 import { useTaskIndex } from "@/api/taskIndex";
 import { usePermissions } from "@/auth/usePermissions";
+import type { Task, Vm } from "@/api/types";
 import type { MapInput, TaskProgress } from "@/clusterMap/model";
 import { PLACEMENT_KEY } from "@/placement/balance";
 
@@ -38,6 +39,37 @@ export function useCoalesced<T>(value: T, ms: number, live: boolean): T {
   return live && state.value != null ? state.value : value;
 }
 
+/**
+ * 진행 중 마이그레이션 Task의 진행률만(VM의 `status.migration.task`). 값이 `prev`와 같으면 `prev`를 그대로 돌려준다 — 백업·
+ * 가져오기·복제처럼 상관없는 Task가 바뀔 때 지도를 다시 배치하지 않게.
+ */
+export function migrationProgress(
+  vms: readonly Vm[] | undefined,
+  tasks: ReadonlyMap<string, readonly Task[]>,
+  prev: ReadonlyMap<string, TaskProgress>,
+): ReadonlyMap<string, TaskProgress> {
+  const out = new Map<string, TaskProgress>();
+  for (const vm of vms ?? []) {
+    const id = vm.status.migration?.task;
+    const p = id ? tasks.get(vm.id)?.find((task) => task.id === id)?.status.progress : null;
+    if (id && p) {
+      out.set(id, p);
+    }
+  }
+  const same =
+    out.size === prev.size &&
+    [...out].every(([id, p]) => {
+      const q = prev.get(id);
+      return (
+        q !== undefined &&
+        q.stage === p.stage &&
+        q.done_bytes === p.done_bytes &&
+        q.total_bytes === p.total_bytes
+      );
+    });
+  return same ? prev : out;
+}
+
 /** 지도가 읽는 것 모두. `input`은 노드·VM 목록이 오기 전에는 `null`. */
 export function useClusterMapData() {
   const perms = usePermissions();
@@ -62,17 +94,13 @@ export function useClusterMapData() {
   const alerts = useAlerts();
   const tasks = useTaskIndex();
 
-  const progress = useMemo(() => {
-    const out = new Map<string, TaskProgress>();
-    for (const list of tasks.values()) {
-      for (const task of list) {
-        if (task.status.progress) {
-          out.set(task.id, task.status.progress);
-        }
-      }
-    }
-    return out;
-  }, [tasks]);
+  const [progress, setProgress] = useState<ReadonlyMap<string, TaskProgress>>(() => new Map());
+  const nextProgress = migrationProgress(vms.data, tasks, progress);
+  if (nextProgress !== progress) {
+    setProgress(nextProgress);
+  }
+  // VM 읽기가 루트 아래 모두면(관리자 따위) "볼 수 없는 VM"이 없다 — VM 읽기 권한은 `system.read`(폴더 종류)
+  const vmsLimited = !perms.has("system.read", { type: "object", kind: "vm" });
 
   const ready = nodes.data !== undefined && vms.data !== undefined;
   const raw = useMemo<MapInput | null>(
@@ -87,6 +115,7 @@ export function useClusterMapData() {
             cluster: cluster.isError || !cluster.data ? null : cluster.data,
             alerts: alerts.data?.alerts ?? [],
             progress,
+            vmsLimited,
           }
         : null,
     [
@@ -100,6 +129,7 @@ export function useClusterMapData() {
       cluster.data,
       alerts.data,
       progress,
+      vmsLimited,
     ],
   );
   const input = useCoalesced(raw, COALESCE_MS, ready);

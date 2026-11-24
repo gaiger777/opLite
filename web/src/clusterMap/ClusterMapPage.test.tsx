@@ -5,6 +5,8 @@ import { http, HttpResponse } from "msw";
 import type { AlertView } from "@/alerts/alerts";
 import type { Task } from "@/api/types";
 import { ClusterMapPage } from "@/clusterMap/ClusterMapPage";
+import { AppLayout } from "@/layout/AppLayout";
+import { PLACEMENT_KEY } from "@/placement/balance";
 import { expectNoAxeViolations } from "@/test/axe";
 import { layerStatus, load, mapNode, mapPool, mapVm, placement, vmId } from "@/test/clusterMap";
 import { ADMIN, mockLists, renderPage } from "@/test/render";
@@ -50,7 +52,7 @@ const MIGRATION: Task = {
   status: {
     state: "running",
     error: null,
-    progress: { stage: "memory", done_bytes: 62, total_bytes: 100 },
+    progress: { stage: "copying-disks", done_bytes: 62, total_bytes: 100 },
   },
 } as Task;
 
@@ -80,17 +82,45 @@ function placementBody(mode: "recommend" | "off" = "recommend") {
   );
 }
 
+/** 클러스터·노드를 읽고 VM은 한 폴더 안만 읽는 사용자(옮기기·노드 쓰기 없음) */
+const LIMITED = {
+  all: false,
+  root: ["cluster.read", "alert.read"],
+  root_contents: [],
+  folders: {},
+  contents: { "019a0f3c-0000-7000-8f00-000000000001": ["system.read"] },
+  objects: [],
+};
+
 function mockCluster({
   placementStatus = 200,
   clusterStatus = 200,
   mode = "recommend",
-}: { placementStatus?: number; clusterStatus?: number; mode?: "recommend" | "off" } = {}) {
+  stage = "copying-disks",
+  vms = VMS,
+  limited = false,
+}: {
+  placementStatus?: number;
+  clusterStatus?: number;
+  mode?: "recommend" | "off";
+  stage?: string;
+  vms?: typeof VMS;
+  limited?: boolean;
+} = {}) {
   mockLists({
     node: [A, B, C, W],
-    vm: VMS,
+    vm: vms,
     "storage-pool": [mapPool(1, "local"), mapPool(2, "nfs", true)],
-    task: [MIGRATION],
+    task: [
+      {
+        ...MIGRATION,
+        status: { ...MIGRATION.status, progress: { ...MIGRATION.status.progress!, stage } },
+      },
+    ],
   });
+  if (limited) {
+    server.use(http.get(apiUrl("/permissions/mine"), () => HttpResponse.json(LIMITED)));
+  }
   server.use(
     http.get(apiUrl("/placement"), () =>
       placementStatus === 200
@@ -386,3 +416,249 @@ it.each(["light", "dark"])(
     await expectNoAxeViolations(sheet);
   },
 );
+
+it("shows the memory stage, not 100%, once the disks are copied", async () => {
+  mockCluster({ stage: "migrating-memory" });
+  const user = userEvent.setup();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  // 서버는 메모리 단계에 끝난 디스크 복사의 바이트(62/100)를 그대로 둔다 — 퍼센트가 아니라 번역한 단계
+  const arrow = await within(map).findByText("mig → n2 · Migrating memory");
+  expect(within(map).queryByText(/mig → n2 · \d+%/)).toBeNull();
+  await user.click(arrow);
+  const sheet = await screen.findByRole("dialog", { name: "Migration of mig" });
+  expect(within(sheet).getByText("Migrating memory")).toBeVisible();
+});
+
+it("counts unreadable VMs only for users whose VM read is limited", async () => {
+  // 관리자: `/placement`가 n2에 켜 둔 VM 하나를 세지만(꺼진 `job`만 보임) 가짜 "볼 수 없음"이 없다
+  mockCluster();
+  const { unmount } = renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  let map = await picture();
+  const n2 = await within(map).findByRole("button", { name: /^Node n2, .*CPU 10%/ });
+  expect(n2.getAttribute("aria-label")).not.toMatch(/can't see/);
+  unmount();
+
+  mockCluster({ limited: true });
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  map = await picture();
+  expect(
+    await within(map).findByRole("button", { name: /^Node n2, .*, 1 you can't see$/ }),
+  ).toBeVisible();
+});
+
+it("hides Apply and node actions from a user who may not use them", async () => {
+  mockCluster({ limited: true });
+  localStorage.setItem(`opl.${ADMIN.user}.clusterMap.layers`, "load,recommendations");
+  const user = userEvent.setup();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  await user.click(await within(map).findByText("Recommended: job n2 → n1"));
+  const sheet = await screen.findByRole("dialog", { name: "Recommended move of job" });
+  expect(within(sheet).getByText("2 GiB")).toBeVisible();
+  // VM `job`을 옮길 수 없다(`vm.migrate` 없음) — 서버의 403을 보지 않게 숨긴다
+  expect(within(sheet).queryByRole("button", { name: "Apply" })).toBeNull();
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await user.click(within(map).getByRole("button", { name: /^Node n1,/ }));
+  const node = await screen.findByRole("dialog");
+  expect(within(node).getByRole("heading", { name: "n1" })).toBeVisible();
+  expect(within(node).queryByRole("button", { name: "Node actions" })).toBeNull();
+});
+
+it("leaves Ctrl/⌘ with + - 0 to the browser's page zoom", async () => {
+  mockCluster();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  n1.focus();
+  for (const key of ["-", "+", "=", "0"]) {
+    expect(fireEvent.keyDown(n1, { key, ctrlKey: true })).toBe(true);
+    expect(fireEvent.keyDown(n1, { key, metaKey: true })).toBe(true);
+  }
+  // 그냥 누르면 지도의 확대·축소·맞추기
+  expect(fireEvent.keyDown(n1, { key: "-" })).toBe(false);
+  expect(fireEvent.keyDown(n1, { key: "0" })).toBe(false);
+});
+
+it("reaches arrows without a mouse: the node drawer and the list view list them with Apply", async () => {
+  mockCluster();
+  localStorage.setItem(`opl.${ADMIN.user}.clusterMap.layers`, "load,recommendations");
+  const applied: string[] = [];
+  server.use(
+    http.post(apiUrl("/placement/recommendations/:id/apply"), ({ params }) => {
+      applied.push(String(params.id));
+      return HttpResponse.json({ ...MIGRATION, id: "t2", name: "t2" });
+    }),
+  );
+  const user = userEvent.setup();
+  const { container } = renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  // 그림: n2에 초점 → Enter → 노드 서랍의 "마이그레이션과 추천" → 추천 서랍 → 적용
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  n1.focus();
+  fireEvent.keyDown(n1, { key: "ArrowRight" });
+  await waitFor(() =>
+    expect(document.activeElement?.getAttribute("aria-label")).toMatch(/^Node n2,/),
+  );
+  const n2 = document.activeElement as HTMLElement;
+  fireEvent.keyDown(n2, { key: "Enter" });
+  const sheet = await screen.findByRole("dialog");
+  expect(
+    within(sheet).getByRole("heading", { name: "Migrations and recommendations" }),
+  ).toBeVisible();
+  expect(within(sheet).getByRole("button", { name: "mig → n2 · 62%" })).toBeVisible();
+  await user.click(within(sheet).getByRole("button", { name: "Recommended: job n2 → n1" }));
+  const rec = await screen.findByRole("dialog", { name: "Recommended move of job" });
+  await user.click(within(rec).getByRole("button", { name: "Apply" }));
+  const confirm = await screen.findByRole("alertdialog", { name: "Move job?" });
+  await user.click(within(confirm).getByRole("button", { name: "Apply" }));
+  await waitFor(() => expect(applied).toEqual([REC]));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(n2));
+
+  // 목록 보기: 같은 화살표가 단추, 누르면 같은 서랍
+  await user.click(screen.getByRole("radio", { name: "List" }));
+  const list = screen.getByRole("region", { name: "Cluster map as a list" });
+  expect(
+    within(list).getByRole("heading", { name: "Migrations and recommendations" }),
+  ).toBeVisible();
+  await expectNoAxeViolations(container, { disable: ["region"] });
+  const mig = within(list).getByRole("button", { name: "mig → n2 · 62%" });
+  await user.click(mig);
+  const task = await screen.findByRole("dialog", { name: "Migration of mig" });
+  expect(within(task).getByRole("link", { name: "Open tasks" })).toBeVisible();
+  await user.keyboard("{Escape}");
+  await waitFor(() => expect(document.activeElement).toBe(mig));
+});
+
+it("does not list recommendations in the list view while their layer is off", async () => {
+  mockCluster();
+  const user = userEvent.setup();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  await picture();
+  await user.click(screen.getByRole("radio", { name: "List" }));
+  const list = screen.getByRole("region", { name: "Cluster map as a list" });
+  expect(await within(list).findByRole("button", { name: "mig → n2 · 62%" })).toBeVisible();
+  expect(within(list).queryByRole("button", { name: /^Recommended:/ })).toBeNull();
+});
+
+it("returns focus to the right node after Shift+Enter on a +N hidden tile", async () => {
+  mockCluster({ limited: true });
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  // 먼저 n1의 서랍을 열고 닫는다(돌려줄 초점이 n1로 남음)
+  n1.focus();
+  fireEvent.keyDown(n1, { key: "Enter" });
+  fireEvent.keyDown(await screen.findByRole("dialog"), { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(n1));
+  fireEvent.keyDown(n1, { key: "ArrowRight" });
+  await waitFor(() =>
+    expect(document.activeElement?.getAttribute("aria-label")).toMatch(/^Node n2,/),
+  );
+  const n2 = document.activeElement as HTMLElement;
+  fireEvent.keyDown(n2, { key: "]" });
+  fireEvent.keyDown(n2, { key: "End" });
+  expect((await screen.findAllByText("1 VM on n2 you can't see")).length).toBeGreaterThan(0);
+  fireEvent.keyDown(n2, { key: "Enter", shiftKey: true });
+  const sheet = await screen.findByRole("dialog", { name: "VMs on n2" });
+  fireEvent.keyDown(sheet, { key: "Escape" });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(() => expect(document.activeElement).toBe(n2));
+});
+
+it("outlines the Not placed tray when it has focus", async () => {
+  mockCluster();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  n1.focus();
+  fireEvent.keyDown(n1, { key: "End" });
+  const tray = within(map).getByRole("button", { name: "Not placed, 1 VM" });
+  await waitFor(() => expect(document.activeElement).toBe(tray));
+  const outline = map.querySelector('path[pointer-events="none"]');
+  expect(outline?.getAttribute("d")).not.toBe("");
+});
+
+it("drops a remembered label grouping or group that no longer exists", async () => {
+  mockCluster();
+  localStorage.setItem(`opl.${ADMIN.user}.clusterMap.group`, "label:gone");
+  localStorage.setItem(
+    `opl.${ADMIN.user}.clusterMap.filter`,
+    JSON.stringify({ slab: "slab:gone", hideStopped: false, problems: false }),
+  );
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  await picture();
+  await waitFor(() => expect(screen.getByLabelText("Group by")).toHaveValue("zone"));
+  expect(screen.getByLabelText("Show")).toHaveValue("");
+  expect(pref("group")).toBe("zone");
+  expect(JSON.parse(pref("filter")!)).toMatchObject({ slab: "" });
+});
+
+it("lists a VM in the drawer of the node the picture draws it on", async () => {
+  // `status.node`가 지운 노드를 가리키면 그림은 `spec.node`(n2)에 그린다 — 서랍도 같게
+  const stray = mapVm(6, "stray", B.id, "stopped", { status: { node: "gone" } });
+  mockCluster({ vms: [...VMS, stray] });
+  const user = userEvent.setup();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  await user.click(await within(map).findByRole("button", { name: /^Node n2,/ }));
+  const sheet = await screen.findByRole("dialog");
+  expect(within(sheet).getByRole("button", { name: "stray" })).toBeVisible();
+  expect(within(sheet).getByRole("button", { name: "job" })).toBeVisible();
+});
+
+it("drops stale load when a later /placement read fails", async () => {
+  mockCluster();
+  const { queryClient } = renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  expect(
+    await within(map).findByRole("button", { name: /^Node n1, .*CPU 72%, memory 38%/ }),
+  ).toBeVisible();
+  server.use(
+    http.get(apiUrl("/placement"), () =>
+      HttpResponse.json(
+        { code: "placement_unavailable", message: "leader unreachable" },
+        { status: 503 },
+      ),
+    ),
+  );
+  await queryClient.refetchQueries({ queryKey: PLACEMENT_KEY });
+  expect(
+    await screen.findByText("Load unknown: the leader's placement summary can't be read."),
+  ).toBeVisible();
+  expect(
+    await within(map).findByRole(
+      "button",
+      { name: /^Node n1, group a, online, leader, load unknown/ },
+      { timeout: 3000 },
+    ),
+  ).toBeVisible();
+});
+
+it("keeps [ for the map while it has focus and for the sidebar elsewhere", async () => {
+  mockCluster();
+  renderPage(
+    <>
+      <AppLayout />
+      <ClusterMapPage />
+    </>,
+    { path: "*", url: "/cluster/map" },
+  );
+  const map = await picture();
+  // jsdom은 좁은 화면이라 레일(접힘)로 시작한다
+  expect(await screen.findByRole("button", { name: "Expand sidebar" })).toBeInTheDocument();
+  // 그림 밖: 전역 `[`가 사이드바를 펴고 접는다
+  fireEvent.keyDown(document.body, { key: "[" });
+  expect(await screen.findByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+  // 그림의 노드에 초점: `[`는 그림이 받는다(사이드바 그대로)
+  const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
+  n1.focus();
+  fireEvent.keyDown(n1, { key: "]" });
+  fireEvent.keyDown(n1, { key: "[" });
+  expect(await screen.findByText(/^Node n1, group a/, { selector: "p" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Collapse sidebar" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Expand sidebar" })).toBeNull();
+});

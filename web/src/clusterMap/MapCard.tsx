@@ -4,7 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import type { Vm } from "@/api/types";
 import type { NodeItem } from "@/clusterMap/layout";
-import type { MapNode } from "@/clusterMap/model";
+import { isHa, type MapNode } from "@/clusterMap/model";
 import { StatusChip } from "@/components/StatusChip";
 import { formatCapacity, formatMib } from "@/lib/format";
 
@@ -114,9 +114,7 @@ export function VmCard({
       <p className="text-sm font-semibold">{vm.name}</p>
       <div className="flex flex-wrap gap-1">
         <StatusChip tone={tone}>{t(`vms.phase.${phase}`)}</StatusChip>
-        {vm.spec.ha !== undefined && vm.spec.ha !== false && (
-          <StatusChip tone="neutral">{t("clusterMap.label.ha")}</StatusChip>
-        )}
+        {isHa(vm) && <StatusChip tone="neutral">{t("clusterMap.label.ha")}</StatusChip>}
       </div>
       <p>
         {t("clusterMap.card.vmSize", {

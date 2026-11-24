@@ -5,7 +5,7 @@ import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { layoutCluster } from "@/clusterMap/layout";
 import { mapLabels } from "@/clusterMap/labels";
 import type { Lod } from "@/clusterMap/lod";
-import { MapScene } from "@/clusterMap/MapScene";
+import { MapScene, pillWidth } from "@/clusterMap/MapScene";
 import { type ClusterModel, toModel } from "@/clusterMap/model";
 import { elementCount, type MapLayer, scenePaths } from "@/clusterMap/paths";
 import i18n from "@/i18n";
@@ -138,4 +138,12 @@ it("opens the node's VM list with ] in the summary view instead of entering tile
   act(() => first.focus());
   expect(fireEvent.keyDown(first, { key: "]" })).toBe(false);
   expect(entered).toEqual([first.getAttribute("data-key")]);
+});
+
+it("sizes tag pills for wide Hangul glyphs as well as Latin ones", () => {
+  expect(pillWidth("offline")).toBe(7 * 6 + 12);
+  // 한글은 글자마다 약 10px(10px 굵은 글) — 알약 밖으로 넘치지 않게
+  expect(pillWidth("오프라인")).toBe(4 * 10 + 12);
+  expect(pillWidth("펜스 확인 실패")).toBe(6 * 10 + 2 * 6 + 12);
+  expect(pillWidth("비우는 중 2/5")).toBeGreaterThanOrEqual(4 * 10 + 5 * 6 + 12);
 });

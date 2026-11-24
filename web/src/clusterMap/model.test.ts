@@ -1,4 +1,4 @@
-import { heatTone, labelKeys, permille, toModel } from "@/clusterMap/model";
+import { heatTone, isHa, labelKeys, permille, placeOf, toModel } from "@/clusterMap/model";
 import { load, mapNode, mapVm, nodeId, placement, vmId } from "@/test/clusterMap";
 import type { AlertView } from "@/alerts/alerts";
 
@@ -79,6 +79,7 @@ it("counts VMs on a node that the user cannot read", () => {
     vms: [mapVm(1, "mine", A.id), mapVm(2, "off", A.id, "stopped")],
     // /placement은 고정된 노드에 켜 둔 VM을 센다: A에 셋(보이는 것 하나), B에 없음
     placement: placement([load(A, { vms: 3 }), load(B, { vms: 0 })]),
+    vmsLimited: true,
   });
   expect(m.nodes.find((n) => n.id === A.id)!.hiddenVms).toBe(2);
   expect(m.nodes.find((n) => n.id === B.id)!.hiddenVms).toBe(0);
@@ -87,8 +88,16 @@ it("counts VMs on a node that the user cannot read", () => {
     nodes: [A],
     vms: [mapVm(1, "a", A.id), mapVm(2, "b", A.id)],
     placement: placement([load(A, { vms: 1 })]),
+    vmsLimited: true,
   });
   expect(all.nodes[0]!.hiddenVms).toBe(0);
+  // 모든 VM을 읽는 사용자(관리자)는 `/placement`(15초 주기)가 아직 세는 막 멈춘·지운 VM을 "볼 수 없음"으로 보지 않는다
+  const admin = toModel({
+    nodes: [A],
+    vms: [mapVm(1, "a", A.id, "stopped")],
+    placement: placement([load(A, { vms: 1 })]),
+  });
+  expect(admin.nodes[0]!.hiddenVms).toBe(0);
 });
 
 it("marks witnesses, maintenance, frozen nodes and the leader", () => {
@@ -123,7 +132,7 @@ it("turns migrations into moves with progress and keeps one arrow per VM", () =>
   const m = toModel({
     nodes: [A, B],
     vms: [moving, mapVm(2, "db", A.id), mapVm(3, "api", A.id)],
-    progress: new Map([[task, { stage: "memory", done_bytes: 620, total_bytes: 1000 }]]),
+    progress: new Map([[task, { stage: "copying-disks", done_bytes: 620, total_bytes: 1000 }]]),
     placement: placement([load(A), load(B)], {
       recommendations: [
         // 같은 VM의 추천은 진행 중 화살표에 밀린다
@@ -145,7 +154,7 @@ it("turns migrations into moves with progress and keeps one arrow per VM", () =>
       from: A.id,
       to: B.id,
       progress: 62,
-      stage: "memory",
+      stage: "copying-disks",
       task,
       recommendation: null,
     },
@@ -173,6 +182,20 @@ it("turns migrations into moves with progress and keeps one arrow per VM", () =>
     progress: new Map([[task, { stage: "disks", done_bytes: 0, total_bytes: 0 }]]),
   });
   expect(early.moves[0]).toMatchObject({ progress: null, stage: "disks" });
+  // 메모리 단계: 서버는 끝난 디스크 복사의 바이트(다 됨)를 그대로 둔다 — 100%가 아니라 단계만
+  const memory = toModel({
+    nodes: [A, B],
+    vms: [moving],
+    progress: new Map([[task, { stage: "migrating-memory", done_bytes: 1000, total_bytes: 1000 }]]),
+  });
+  expect(memory.moves[0]).toMatchObject({ progress: null, stage: "migrating-memory" });
+  // 디스크 복사: 전체를 아직 모르면 0%(작업 센터와 같음)
+  const copying = toModel({
+    nodes: [A, B],
+    vms: [moving],
+    progress: new Map([[task, { stage: "copying-disks", done_bytes: 0, total_bytes: 0 }]]),
+  });
+  expect(copying.moves[0]).toMatchObject({ progress: 0, stage: "copying-disks" });
   // 모르는 대상으로의 마이그레이션은 화살표 없이 원본에
   const lost = toModel({
     nodes: [A],
@@ -264,4 +287,22 @@ it("treats VMs with HA on and placement rule violations", () => {
     ["b", false, 2],
     ["c", true, 0],
   ]);
+});
+
+it("shares the placement rule and the HA rule with the drawer and the card", () => {
+  const known = new Set([A.id, B.id]);
+  // 지운 노드에서 돈다고 남은 `status.node`는 고정한 노드로(그림·노드 서랍·배치 안 됨 서랍이 같은 규칙)
+  const stray = mapVm(1, "stray", B.id, "running", { status: { node: "gone" } });
+  expect(placeOf(stray, known)).toBe(B.id);
+  expect(toModel({ nodes: [A, B], vms: [stray] }).vms[0]!.node).toBe(B.id);
+  expect(placeOf(mapVm(2, "lost", "gone", "stopped"), known)).toBeNull();
+  // `ignored`는 HA가 아니다(타일의 이름·HA 레이어와 카드가 같게)
+  expect(isHa(mapVm(3, "a", A.id, "running", { spec: { ha: true } }))).toBe(true);
+  expect(
+    isHa(mapVm(4, "b", A.id, "running", { spec: { ha: { state: "ignored" } as never } })),
+  ).toBe(false);
+  expect(
+    isHa(mapVm(5, "c", A.id, "running", { spec: { ha: { state: "started" } as never } })),
+  ).toBe(true);
+  expect(isHa(mapVm(6, "d", A.id))).toBe(false);
 });

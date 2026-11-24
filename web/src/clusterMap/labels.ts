@@ -2,6 +2,7 @@
 // 쓴다. 모델의 VM·노드를 한 번씩만 훑는다(원소마다 목록을 훑지 않음).
 import type { MapLink, MapScene, NodeItem, SlabItem } from "@/clusterMap/layout";
 import type { ClusterModel, MapNode, MapVm } from "@/clusterMap/model";
+import { migrationStageText } from "@/tasks/tasks";
 
 type Translate = (key: string, values?: Record<string, unknown>) => string;
 
@@ -105,7 +106,7 @@ function vmText(
   return parts.join(", ");
 }
 
-/** 화살표의 글: "web → n3 · 62%", 추천은 "추천: web n1 → n3" */
+/** 화살표의 글: "web → n3 · 62%"(디스크 복사)·"web → n3 · 메모리 옮기는 중", 추천은 "추천: web n1 → n3" */
 export function linkText(t: Translate, link: MapLink, nodeName: (key: string) => string): string {
   const from = nodeName(link.ends[0]);
   const to = nodeName(link.ends[1]);
@@ -115,8 +116,9 @@ export function linkText(t: Translate, link: MapLink, nodeName: (key: string) =>
   if (link.progress !== null) {
     return t(`${L}.migrationPct`, { vm: link.vmName, to, progress: link.progress });
   }
-  return link.stage
-    ? t(`${L}.migrationStage`, { vm: link.vmName, to, stage: link.stage })
+  const stage = link.stage ? migrationStageText(link.stage, t) : null;
+  return stage
+    ? t(`${L}.migrationStage`, { vm: link.vmName, to, stage })
     : t(`${L}.migration`, { vm: link.vmName, to });
 }
 

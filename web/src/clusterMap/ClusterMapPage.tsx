@@ -170,7 +170,19 @@ export function ClusterMapPage() {
   };
 
   const full = useMemo(() => (data.input ? toModel(data.input) : null), [data.input]);
+  // 기억한 묶기 레이블·판이 이제 없으면(레이블을 지움) 기본으로 되돌리고 기억도 고친다 — 고르기 상자가 없는 값을 갖지 않게
+  if (full && group.kind === "label" && !labelKeys(full.nodes).includes(group.key)) {
+    setGroupState({ kind: "zone" });
+    save("group", "zone");
+  }
   const fullScene = useMemo(() => (full ? layoutCluster(full, { group }) : null), [full, group]);
+  if (
+    fullScene &&
+    filter.slab &&
+    !fullScene.slabs.some((s) => s.key === filter.slab && s.kind !== "unplaced")
+  ) {
+    setFilter({ ...filter, slab: "" });
+  }
   const model = useMemo(
     () => (full && fullScene ? filterModel(full, fullScene, filter) : null),
     [full, fullScene, filter],
@@ -198,6 +210,9 @@ export function ClusterMapPage() {
         ? "clusterMap.recsOff"
         : null;
   const shown = layers.filter((l) => l !== "recommendations" || recsReason === null);
+  // 그림에 그리는 화살표 — 목록 보기와 노드 서랍의 "마이그레이션과 추천"도 같은 것(키보드·화면 읽기로 화살표 서랍에 닿는 길)
+  const showRecs = shown.includes("recommendations");
+  const links = (scene?.links ?? []).filter((l) => l.kind === "migration" || showRecs);
 
   const [sheet, setSheet] = useState<SheetTarget | null>(null);
   // 한 번 연 서랍은 닫아도 두어 닫힘·초점 돌려주기가 그대로 돈다
@@ -271,8 +286,8 @@ export function ClusterMapPage() {
     returnFocus.current = open.owner as HTMLElement | null;
     setSheet(targetOf(open.key));
   };
-  const onDetail = (key: string) => {
-    const target = targetOf(key);
+  const onDetail = (open: MapOpen) => {
+    const target = targetOf(open.key);
     if (target?.kind === "node") {
       const n = full?.nodes.find((x) => x.id === target.id);
       if (n) {
@@ -284,6 +299,8 @@ export function ClusterMapPage() {
         void navigate(`/vms/${encodeURIComponent(vm.name)}`);
       }
     } else if (target) {
+      // 상세 화면이 없는 것("+N"·화살표)은 서랍 — 닫으면 이 원소로 초점이 돌아오게
+      returnFocus.current = open.owner as HTMLElement | null;
       setSheet(target);
     }
   };
@@ -495,6 +512,8 @@ export function ClusterMapPage() {
             <MapList
               model={m}
               scene={s}
+              links={links}
+              labels={labels}
               slabName={slabName}
               onOpen={(key, owner) => onOpen({ key, owner })}
             />
@@ -508,7 +527,7 @@ export function ClusterMapPage() {
             phone={phone}
             nodes={data.nodes.data ?? []}
             vms={data.vms.data ?? []}
-            links={scene?.links ?? []}
+            links={links}
             moves={data.placement.data?.recommendations ?? []}
             actions={actions}
             returnFocus={returnFocus}

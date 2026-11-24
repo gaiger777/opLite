@@ -40,7 +40,8 @@ function input() {
     ]),
     cluster: { name: "prod", leader: n5.id },
     alerts: [alert("warning"), alert("critical")],
-    progress: new Map([[task, { stage: "memory", done_bytes: 62, total_bytes: 100 }]]),
+    progress: new Map([[task, { stage: "copying-disks", done_bytes: 62, total_bytes: 100 }]]),
+    vmsLimited: true,
   };
 }
 
@@ -107,7 +108,14 @@ it("writes arrow labels for progress, stage and recommendations", () => {
     recommendation: null,
   };
   expect(linkText(t, base, name)).toBe("web → b");
-  expect(linkText(t, { ...base, stage: "disks" }, name)).toBe("web → b · disks");
+  // 메모리 단계는 번역한 글, 모르는 단계의 날 id는 보이지 않는다
+  expect(linkText(t, { ...base, stage: "migrating-memory" }, name)).toBe(
+    "web → b · Migrating memory",
+  );
+  expect(linkText(i18n.getFixedT("ko"), { ...base, stage: "migrating-memory" }, name)).toBe(
+    "web → b · 메모리 옮기는 중",
+  );
+  expect(linkText(t, { ...base, stage: "disks" }, name)).toBe("web → b");
   expect(linkText(t, { ...base, kind: "recommendation" }, name)).toBe("Recommended: web a → b");
   expect(linkText(i18n.getFixedT("ko"), { ...base, kind: "recommendation" }, name)).toBe(
     "추천: web a → b",
@@ -119,7 +127,12 @@ it("names more and hidden tiles past 64 cells", () => {
   const vms = Array.from({ length: 70 }, (_, i) =>
     mapVm(i, `v${String(i).padStart(2, "0")}`, n.id),
   );
-  const model = toModel({ nodes: [n], vms, placement: placement([load(n, { vms: 72 })]) });
+  const model = toModel({
+    nodes: [n],
+    vms,
+    placement: placement([load(n, { vms: 72 })]),
+    vmsLimited: true,
+  });
   const labels = mapLabels(i18n.getFixedT("en"), model, layoutCluster(model));
   expect(labels.get(`more:node:${nodeId(1)}`)).toBe("8 more VMs on n1");
   expect(labels.get(`hidden:node:${nodeId(1)}`)).toBe("2 VMs on n1 you can't see");

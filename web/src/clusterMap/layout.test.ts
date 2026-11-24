@@ -148,7 +148,7 @@ it("folds VMs past 64 cells into +N and shows unreadable VMs as +N hidden", () =
   expect(cells.filter((c) => c.kind === "vm")).toHaveLength(63);
   // 읽을 수 없는 VM이 있으면 그 칸도
   const hidden = layoutCluster(
-    toModel({ nodes: [n], vms, placement: placement([load(n, { vms: 75 })]) }),
+    toModel({ nodes: [n], vms, placement: placement([load(n, { vms: 75 })]), vmsLimited: true }),
   );
   const hc = hidden.nodes[0]!.grid!.cells;
   expect(hc).toHaveLength(MAX_CELLS);
@@ -156,7 +156,12 @@ it("folds VMs past 64 cells into +N and shows unreadable VMs as +N hidden", () =
   expect(hc[63]).toMatchObject({ kind: "hidden", key: `hidden:node:${n.id}`, count: 5 });
   // 적으면 VM 뒤에 한 칸
   const few = layoutCluster(
-    toModel({ nodes: [n], vms: vms.slice(0, 3), placement: placement([load(n, { vms: 4 })]) }),
+    toModel({
+      nodes: [n],
+      vms: vms.slice(0, 3),
+      placement: placement([load(n, { vms: 4 })]),
+      vmsLimited: true,
+    }),
   );
   expect(few.nodes[0]!.grid!.cells.map((c) => c.kind)).toEqual(["vm", "vm", "vm", "hidden"]);
 });

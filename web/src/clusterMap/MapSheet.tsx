@@ -10,7 +10,7 @@ import { Link } from "react-router";
 import { api, call } from "@/api/client";
 import { useTaskIndex } from "@/api/taskIndex";
 import type { Node, PlacementMove, Vm } from "@/api/types";
-import { usePermissions, useVmCan } from "@/auth/usePermissions";
+import { useVmCan } from "@/auth/usePermissions";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { focusBack } from "@/components/focusBack";
 import { PeekFacts } from "@/components/data-table/PeekFacts";
@@ -24,13 +24,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { linkText } from "@/clusterMap/labels";
 import type { MapLink } from "@/clusterMap/layout";
-import { byName } from "@/clusterMap/model";
+import { byName, placeOf } from "@/clusterMap/model";
 import { formatMib } from "@/lib/format";
 import { NodePeek } from "@/nodes/NodePeek";
 import type { useNodeActions } from "@/nodes/NodeActions";
 import { moveReasonText, PLACEMENT_KEY } from "@/placement/balance";
-import { trackTask } from "@/tasks/tasks";
+import { migrationStageText, trackTask } from "@/tasks/tasks";
 import { availability } from "@/vms/actions";
 import { useVmActionHost } from "@/vms/actionHost";
 import { VmMenu } from "@/vms/VmMenu";
@@ -113,13 +114,20 @@ function VmSheet({ vm, nodeName }: { vm: Vm; nodeName(id?: string | null): strin
 function NodeSheet({
   node,
   vms,
+  moves,
+  nodeName,
   actions,
   onPick,
+  onMove,
 }: {
   node: Node;
   vms: readonly Vm[];
+  /** 이 노드에서 나가거나 들어오는 화살표(그림에 그린 것) — 키보드·화면 읽기로 화살표 서랍에 닿는 길 */
+  moves: readonly MapLink[];
+  nodeName(key: string): string;
   actions: ReturnType<typeof useNodeActions>;
   onPick(vm: Vm): void;
+  onMove(link: MapLink): void;
 }) {
   const { t } = useTranslation();
   return (
@@ -150,6 +158,25 @@ function NodeSheet({
         {t("clusterMap.sheet.nodeVms", { name: node.name })}
       </h3>
       <VmList vms={vms} onPick={onPick} />
+      {moves.length > 0 && (
+        <>
+          <h3 className="px-4 pt-2 text-sm font-medium">{t("clusterMap.moves")}</h3>
+          <ul className="flex flex-col gap-1 px-4 pb-4 text-sm">
+            {moves.map((link) => (
+              <li key={link.key}>
+                <Button
+                  variant="link"
+                  size="sm"
+                  className="h-auto p-0 text-left whitespace-normal"
+                  onClick={() => onMove(link)}
+                >
+                  {linkText(t, link, nodeName)}
+                </Button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
     </>
   );
 }
@@ -191,17 +218,20 @@ function VmsSheet({
 function MoveSheet({
   link,
   move,
+  vm,
   nodeName,
   onApplied,
 }: {
   link: MapLink;
   /** 추천이면 `/placement`의 그 추천 */
   move: PlacementMove | undefined;
+  /** 화살표의 VM(읽을 수 있으면) — "적용"은 이 VM을 옮길 수 있을 때만 */
+  vm: Vm | undefined;
   nodeName(key: string): string;
   onApplied(): void;
 }) {
   const { t } = useTranslation();
-  const perms = usePermissions();
+  const can = useVmCan(vm);
   const queryClient = useQueryClient();
   const [confirm, setConfirm] = useState(false);
   const from = nodeName(link.ends[0]);
@@ -220,7 +250,9 @@ function MoveSheet({
             [t("clusterMap.sheet.to"), to],
             [
               t("clusterMap.sheet.progress"),
-              link.progress !== null ? `${link.progress}%` : (link.stage ?? "—"),
+              link.progress !== null
+                ? `${link.progress}%`
+                : ((link.stage ? migrationStageText(link.stage, t) : null) ?? "—"),
             ],
           ]}
         />
@@ -232,7 +264,8 @@ function MoveSheet({
       </>
     );
   }
-  const operate = perms.anywhere("vm.migrate");
+  // 서버도 VM마다 본다(폴더 운영자가 "적용"을 눌러 403을 보지 않게)
+  const operate = can("vm.migrate");
   return (
     <>
       <SheetHeader>
@@ -310,25 +343,29 @@ export function MapSheet({
   const nodeName = (id?: string | null) => nodes.find((n) => n.id === id)?.name ?? "—";
   const pick = (vm: Vm) => onTarget({ kind: "vm", id: vm.id });
   const known = new Set(nodes.map((n) => n.id));
-  const onNode = (id: string) =>
-    vms.filter((vm) => !vm.spec.template && (vm.status.node ?? vm.spec.node) === id);
+  // 그림과 같은 자리 규칙(`placeOf` — 모르는 노드의 `status.node`는 `spec.node`로)
+  const onNode = (id: string | null) =>
+    vms.filter((vm) => !vm.spec.template && placeOf(vm, known) === id);
+  const linkName = (key: string) => nodeName(key.replace(/^node:/, ""));
   let body: React.ReactNode = null;
   if (target?.kind === "node") {
     const node = nodes.find((n) => n.id === target.id);
-    body = node && <NodeSheet node={node} vms={onNode(node.id)} actions={actions} onPick={pick} />;
+    body = node && (
+      <NodeSheet
+        node={node}
+        vms={onNode(node.id)}
+        moves={links.filter((l) => l.ends.includes(`node:${node.id}`))}
+        nodeName={linkName}
+        actions={actions}
+        onPick={pick}
+        onMove={(link) => onTarget({ kind: "move", key: link.key })}
+      />
+    );
   } else if (target?.kind === "vm") {
     const vm = vms.find((v) => v.id === target.id);
     body = vm && <VmSheet vm={vm} nodeName={nodeName} />;
   } else if (target?.kind === "vms") {
-    const list =
-      target.node === null
-        ? vms.filter(
-            (vm) =>
-              !vm.spec.template &&
-              !known.has(vm.status.node ?? "") &&
-              !known.has(vm.spec.node ?? ""),
-          )
-        : onNode(target.node);
+    const list = onNode(target.node);
     body = (
       <VmsSheet
         title={
@@ -346,7 +383,8 @@ export function MapSheet({
       <MoveSheet
         link={link}
         move={moves.find((m) => m.id === link.recommendation)}
-        nodeName={(key) => nodeName(key.replace(/^node:/, ""))}
+        vm={vms.find((v) => v.id === link.vm)}
+        nodeName={linkName}
         onApplied={onClose}
       />
     );

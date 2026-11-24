@@ -3,6 +3,7 @@
 import type { AlertView } from "@/alerts/alerts";
 import type { Node, PlacementMode, PlacementStatus, StoragePool, Vm } from "@/api/types";
 import type { components } from "@/api/schema";
+import { migrationPercent } from "@/tasks/tasks";
 
 export type TaskProgress = components["schemas"]["TaskProgress"];
 export type Severity = AlertView["severity"];
@@ -95,9 +96,9 @@ export interface MapMove {
   vmName: string;
   from: string;
   to: string;
-  /** 진행률(0~100 정수) — Task `progress`에 바이트 수가 있을 때 */
+  /** 진행률(0~100 정수) — 디스크 복사 단계일 때만(메모리 단계의 바이트 수는 끝난 디스크 복사라 늘 100%) */
   progress: number | null;
-  /** 진행 단계 이름(바이트 수를 모를 때 글로) */
+  /** 진행 단계 id(퍼센트가 없을 때 — 글은 `migrationStageText`로 옮긴다) */
   stage: string | null;
   /** 마이그레이션 Task id */
   task: string | null;
@@ -133,6 +134,11 @@ export interface MapInput {
   progress?: ReadonlyMap<string, TaskProgress>;
   /** 스토리지 풀 목록(공유인지 알려고). 없으면 노드의 풀을 모두 로컬로 본다. */
   pools?: readonly StoragePool[];
+  /**
+   * 사용자가 읽을 수 없는 VM이 있을 수 있다(VM 읽기가 루트 아래 모두가 아님). 거짓(기본)이면 "볼 수 없는 VM"을 세지 않는다 —
+   * 모두 보는 사용자에게 `/placement`(15초 주기)와 실시간 VM 목록의 시차가 가짜 "+N 볼 수 없음"이 되지 않게.
+   */
+  vmsLimited?: boolean;
 }
 
 /** 이름 차례: 숫자를 숫자로(`n2` < `n10`), 브라우저 언어와 상관없이 같은 차례 */
@@ -163,7 +169,8 @@ export function heatTone(load: NodeLoad | null): Heat {
 
 const SEVERITY: Record<Severity, number> = { info: 0, warning: 1, critical: 2 };
 
-function isHa(vm: Vm): boolean {
+/** HA로 지키는 VM(`ha: true`나 `ignored`가 아닌 설정) — 타일·카드가 같은 기준 */
+export function isHa(vm: Pick<Vm, "spec">): boolean {
   const ha = vm.spec.ha;
   return ha === true || (typeof ha === "object" && ha !== null && ha.state !== "ignored");
 }
@@ -256,6 +263,20 @@ export function labelKeys(nodes: readonly Pick<MapNode, "labels">[]): string[] {
   return [...keys].sort(naturalCompare);
 }
 
+/** VM을 그리는 노드: `status.node`(지금 도는 곳), 없거나 모르는 노드면 `spec.node`, 그것도 아니면 `null`(배치 안 됨) */
+export function placeOf(
+  vm: Pick<Vm, "spec" | "status">,
+  known: ReadonlySet<string>,
+): string | null {
+  if (vm.status.node && known.has(vm.status.node)) {
+    return vm.status.node;
+  }
+  if (vm.spec.node && known.has(vm.spec.node)) {
+    return vm.spec.node;
+  }
+  return null;
+}
+
 /**
  * 질의 결과 → 모델. VM 자리는 `status.node`(지금 도는 곳), 없거나 모르는 노드면 `spec.node`, 그것도 아니면 배치 안 됨.
  * 템플릿은 타일이 아니라 노드의 수로만 센다.
@@ -264,15 +285,7 @@ export function toModel(input: MapInput): ClusterModel {
   const placement = input.placement ?? null;
   const loads = new Map((placement?.nodes ?? []).map((l) => [l.node, l]));
   const known = new Set(input.nodes.map((n) => n.id));
-  const where = (vm: Vm): string | null => {
-    if (vm.status.node && known.has(vm.status.node)) {
-      return vm.status.node;
-    }
-    if (vm.spec.node && known.has(vm.spec.node)) {
-      return vm.spec.node;
-    }
-    return null;
-  };
+  const where = (vm: Vm) => placeOf(vm, known);
 
   const vms: MapVm[] = [];
   const templates = new Map<string, number>();
@@ -317,10 +330,7 @@ export function toModel(input: MapInput): ClusterModel {
         vmName: vm.name,
         from: node,
         to: migration.to,
-        progress:
-          p && p.total_bytes > 0
-            ? Math.min(100, Math.floor((p.done_bytes / p.total_bytes) * 100))
-            : null,
+        progress: migrationPercent(p),
         stage: p?.stage ?? null,
         task: migration.task,
         recommendation: null,
@@ -402,7 +412,7 @@ export function toModel(input: MapInput): ClusterModel {
         l && l.mem_total_mib > 0 ? Math.round((l.mem_allocated_mib / l.mem_total_mib) * 100) : null,
       alerts: alerts.get(n.id)?.count ?? 0,
       severity: alerts.get(n.id)?.severity ?? null,
-      hiddenVms: l ? Math.max(0, l.vms - (visiblePlaced.get(n.id) ?? 0)) : 0,
+      hiddenVms: l && input.vmsLimited ? Math.max(0, l.vms - (visiblePlaced.get(n.id) ?? 0)) : 0,
       templates: templates.get(n.id) ?? 0,
       pinnedRunning: pinnedRunning.get(n.id) ?? 0,
       outgoing: outgoing.get(n.id) ?? 0,

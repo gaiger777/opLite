@@ -50,6 +50,7 @@
     },
     "pictureLabel": "Cluster map",
     "listLabel": "Cluster map as a list",
+    "moves": "Migrations and recommendations",
     "hint": "Nodes are blocks on their zone, VMs are tiles on their node. A block's top shows load, its left side memory and its right side CPU.",
     "group": "Group by",
     "groupZone": "Zone (then rack)",

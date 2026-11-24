@@ -321,9 +321,21 @@ const Slab = memo(function Slab({
   );
 });
 
+/**
+ * 알약 너비(10px 굵은 글): 라틴 글자는 약 6px, 한글처럼 넓은 글자(라틴 확장 B `ɏ` 뒤)는 약 10px — 재지 않고 셈한다
+ * (원소 수·그리기 한 번 그대로).
+ */
+export function pillWidth(text: string): number {
+  let w = 0;
+  for (const ch of text) {
+    w += ch > "\u024f" ? 10 : 6;
+  }
+  return w + 12;
+}
+
 /** 노드 아래의 알약 꼬리표(알약 + 글) */
 function Tags({ at, tags }: { at: Point; tags: { key: string; text: string; tone: TagTone }[] }) {
-  const widths = tags.map((tag) => tag.text.length * 6 + 12);
+  const widths = tags.map((tag) => pillWidth(tag.text));
   const total = widths.reduce((a, b) => a + b, 0) + Math.max(0, tags.length - 1) * 4;
   const lefts = widths.map(
     (_, i) => at.x - total / 2 + widths.slice(0, i).reduce((a, b) => a + b + 4, 0),
@@ -787,8 +799,8 @@ export interface MapSceneProps {
    */
   focusRequest?: { focus: Focus; seq: number; dom: boolean } | null;
   onOpen(open: MapOpen): void;
-  /** Shift+Enter·더블클릭·Ctrl/⌘+클릭 — 상세 화면 */
-  onDetail(key: string): void;
+  /** Shift+Enter·더블클릭·Ctrl/⌘+클릭 — 상세 화면(없는 것은 서랍, 그래서 주인 원소도) */
+  onDetail(open: MapOpen): void;
   /** 요약 단계에서 `]`: 그 노드의 VM 목록 */
   onSummaryEnter(nodeKey: string, owner: Element | null): void;
   onFocusChange?(focus: Focus | null): void;
@@ -914,10 +926,11 @@ export function MapScene(props: MapSceneProps) {
 
   const open = (key: string, detail: boolean) => {
     const owner = ownerOf(scene, key);
+    const at = { key, owner: owner ? nodeEl(owner) : null };
     if (detail) {
-      latest.current.onDetail(key);
+      latest.current.onDetail(at);
     } else {
-      latest.current.onOpen({ key, owner: owner ? nodeEl(owner) : null });
+      latest.current.onOpen(at);
     }
   };
 
@@ -927,6 +940,10 @@ export function MapScene(props: MapSceneProps) {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       open(key, e.key === "Enter" && e.shiftKey);
+      return;
+    }
+    // Ctrl/⌘/Alt와 함께면 브라우저의 것(Ctrl+`-`·`+`·`0` 쪽 확대는 저시력 사용자가 쓴다 — WCAG 1.4.4)
+    if (e.altKey || e.ctrlKey || e.metaKey) {
       return;
     }
     if (e.key === "+" || e.key === "=") {
@@ -944,7 +961,7 @@ export function MapScene(props: MapSceneProps) {
       reset();
       return;
     }
-    if (!isNavKey(e.key) || e.altKey || e.ctrlKey || e.metaKey) {
+    if (!isNavKey(e.key)) {
       return;
     }
     // Esc는 타일 단계에서만 그림이 받는다(노드 단계면 쪽의 Esc 그대로)
@@ -973,8 +990,8 @@ export function MapScene(props: MapSceneProps) {
     if (tile) {
       return tile.cell.box;
     }
-    const node = scene.byKey.get(lit);
-    return node && node.kind !== "unplaced" ? { ...node.box, h: node.box.h } : null;
+    // 배치 안 됨 판(납작한 상자)도 — 초점이 보이게(WCAG 2.4.7)
+    return scene.byKey.get(lit)?.box ?? null;
   })();
 
   // 장면이 바뀔 때만(가리키기·끌기에는 그대로)
