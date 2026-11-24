@@ -755,6 +755,7 @@ reconciler나 Task 실행기가 한다. `remote_proxy.rs`는 다른 **클러스�
   (`lib.rs:150-381`).
 - 주요 묶음: `/auth/*`(로그인·2FA·OIDC), `/users`, `/tokens`, `/realms`, `/remotes`, `/nodes`, `/cluster`, `/health`,
   `/settings`, `/storage-pools`, `/volumes`, `/networks`, `/security-groups`, `/vms`(동작·마이그레이션·콘솔·복제),
+  `/vm-checks`(만들기 미리 확인 — 쓰지 않고 감사 로그에 적지 않음, 계획 71),
   `/snapshots`, `/backups`, `/backup-jobs`, `/vm-imports`, `/images`, `/tasks`, `/watch`, `/audit`, 지표·알림·알림 대상,
   HA 그룹·검사·배치, Ceph, `/folders`, `/access-roles`, `/groups`, `/grants`, `/permissions/*`.
 - `GET /api/v1/openapi.json`은 인증 없이 열려 있다(`lib.rs:394-400`). 보안 방식은 Bearer 토큰과 쿠키 `opl_session`.
@@ -1597,7 +1598,7 @@ webhook 토큰, TOTP 비밀, 백업 저장소의 암호화 주 키와 S3 비밀 
 
 - 클러스터 하나의 "기능 수준" 번호는 없다. 노드마다 자기 버전이 아는 **기능 문자열** 목록(`FEATURES`:
   `voter-limit`, `observer`, `multi-link`, `lease-liveness`, `shared-sessions`, `hotplug`, `folders`, `two-factor`,
-  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store`, `file-restore` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
+  `metrics-history`, `vip`, `cpu-models`, `numa`, `sdn`, `sdn-routing`, `sdn-services`, `backup-store`, `file-restore`, `vm-check` …)을 `Node` status에 알린다(`crates/opl-types/src/node.rs:341-369`).
 - 새 기능을 쓰는 API는 `require_feature`로 **모든 노드**가 그 기능을 알리는지 보고, 아니면 **409 `cluster_upgrading`**을
   준다. `require_current`는 이 빌드보다 옛 노드가 있는지, `require_upgraded`는 버전이 없는 노드가 있는지 본다
   (`crates/opl-api/src/cluster.rs:434-519`). 호출하는 곳은 약 100곳이다.

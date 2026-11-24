@@ -1,6 +1,6 @@
 # 가상 머신
 
-설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, NUMA·전용 CPU·hugepages, 라이브 마이그레이션. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+설치 매체·cloud-init, 템플릿·링크드 클론, 이미지, vTPM·Secure Boot, 게스트 에이전트, 무중단 유형 변경, CPU 모델과 플래그, NUMA·전용 CPU·hugepages, 라이브 마이그레이션, 만들기 전 미리 확인. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [설치 매체와 cloud-init](#설치-매체와-cloud-init)
 - [템플릿과 링크드 클론](#템플릿과-링크드-클론)
@@ -13,6 +13,7 @@
 - [취약점 때문에 CPU 기능 숨기기](#취약점-때문에-cpu-기능-숨기기)
 - [NUMA·전용 CPU·hugepages](#numa전용-cpuhugepages)
 - [라이브 마이그레이션](#라이브-마이그레이션)
+- [만들기 전 미리 확인](#만들기-전-미리-확인)
 
 ## 설치 매체와 cloud-init
 
@@ -1110,7 +1111,8 @@ orbivisorctl vm list                     # 옮기는 동안 PHASE migrating, NOD
 ```
 
 웹은 VM 상세의 "마이그레이션"(실행 중일 때)에서 대상 노드를 고른다(로컬 디스크가 있으면 복사할 디스크 목록과
-"대상 풀" — 고른 노드에 같은 이름의 풀이 없으면 대상 풀을 고르게 한다). API는 `POST /api/v1/vms/{key}/migrate`(`{"node": "이름 또는 id", "pool"?: "풀"}`, 운영자 권한, 202와
+"대상 풀" — 고른 노드에 같은 이름의 풀이 없으면 대상 풀을 고르게 한다). 클러스터 지도에서 켜진 VM 타일을 노드로 끌거나 `m`으로
+고르면 그 노드를 고른 같은 대화상자가 열린다([클러스터 지도 화면](web-ui.md#클러스터-지도-화면)). API는 `POST /api/v1/vms/{key}/migrate`(`{"node": "이름 또는 id", "pool"?: "풀"}`, 운영자 권한, 202와
 작업)다.
 
 ```toml
@@ -1199,3 +1201,71 @@ disk_timeout = "12h"      # 로컬 디스크 복사가 따라잡기(ready)까지
     아주 많은 VM은 스위치오버 때 멈추는 시간이 길어진다. 복사는 클러스터 주소(노드 사이 망)로 간다. 꺼진 VM의 디스크
     옮기기와 한 노드 안에서 디스크만 다른 풀로 옮기기는 없다. 확정 뒤 원본 볼륨 지우기에 실패하면 다음 정리(30분)까지
     원본 노드에 남는다.
+
+## 만들기 전 미리 확인
+
+VM을 만들지 않고 서버가 **만들기(`POST /vms`)와 같은 검사**를 돌려 문제를 모아 준다(계획 71). 웹의 [VM 빌더](web-ui.md#vm-빌더-화면)가 값을
+바꿀 때마다(0.6초 쉬면) 이것을 부르고, CLI는 `vm create … --dry-run`이다. 아무것도 쓰지 않고 잠그지 않으며 감사 로그에 적지 않는다.
+
+```bash
+orbivisorctl vm create web --memory 4096 --disk web-disk0 --nic lan --node node2 --dry-run
+# AT       CODE        MESSAGE
+# disks.0  pool_space  warning: storage pool "local" has … bytes free, less than the … bytes of volume "web-disk0"
+# ok: node node2, cpu host, machine q35
+orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응답 그대로
+```
+
+- **CLI.** `--dry-run`은 `vm create`의 다른 플래그로 짠 같은 본문을 `POST /api/v1/vm-checks`로만 보낸다. 문제가 있으면 `AT  CODE  MESSAGE` 표
+  (경고는 `MESSAGE` 앞에 `warning: `), 오류가 없으면 `ok: node …, cpu …, machine …`이다. 오류가 있으면 표 뒤
+  `error: the check found N problem(s); the VM would not be created`와 끝 코드 1, 경고만이면 0이다. `--start`와 함께 줄 수 없다(서로 막음).
+  CLI의 `vm create`는 있는 볼륨만 붙이므로 아래 `volumes`·`rules`는 늘 비어 있다.
+- **API.** `POST /api/v1/vm-checks`. 권한은 만들기와 같다 — 그 폴더(spec `folder`)의 `vm.create`.
+
+```json
+{
+  "name": "web",
+  "labels": {},
+  "spec": { "cpu": { "sockets": 1, "cores": 2 }, "memory_mib": 4096, "power": "running",
+            "disks": [{ "volume": "web-disk0" }], "nics": [{ "network": "lan" }] },
+  "volumes": [{ "name": "web-disk0", "spec": { "pool": "local", "size_bytes": 21474836480, "format": "qcow2" } }],
+  "rules": [{ "name": "web-zone", "spec": { "kind": "node-affinity", "vms": ["web"], "node_tag": "zone=rack-a" } }]
+}
+```
+
+  `spec`은 `POST /vms`의 spec 그대로다(`machine`을 빼면 서버가 채운다). `volumes`는 VM보다 먼저 만들 볼륨(`POST /volumes`의 본문 —
+  디스크가 이름으로 가리키면 준비된 볼륨으로 얹어 본다), `rules`는 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 빌더의 장애
+  영역 규칙)이다. 둘 다 생략할 수 있다. 모르는 칸은 400이다.
+- **응답은 문제가 있어도 200이다**:
+
+```json
+{
+  "ok": true,
+  "problems": [{ "at": "disks.0", "code": "pool_space", "message": "storage pool \"local\" has … bytes free, …", "level": "warn" }],
+  "node": "node2",
+  "machine": "q35",
+  "cpu_model": "x86-64-v3",
+  "ips": [[]]
+}
+```
+
+  `ok`는 `level: "error"`인 문제가 없다는 뜻이다(경고 `warn`은 있어도 된다 — 지금 경고는 만들 볼륨의 노드가 알린 풀 남은 용량이 새 디스크보다
+  적은 `pool_space` 하나). `code`는 만들기가 낼 오류 코드(`forbidden`·`quota_exceeded`·`no_node`·`placement_rule`·`name_taken` 등)이고
+  `message`는 그 글이다. `node`는 준 노드나 켜진 채 노드 없이 만들 때 스케줄러가 고를 노드의 이름이고(**예상** — 확인과 만들기 사이 부하가
+  바뀌면 다르게 고를 수 있고, 꺼진 채 만드는 VM에도 나올 수 있다 — 켤 때 다시 고른다), 준비 단계를 지나지 못했거나 노드가 정해지지 않았거나 루트
+  `cluster.read`가 없으면 `null`이다. `machine`(채운 머신)·`cpu_model`(별칭을
+  버전 모델로 고정한 것)·`ips`(NIC마다 받을 SDN 주소 — 예상이고 잡아 두지 않음)는 준비 단계를 지났을 때만 채우고, 아니면 `null`·빈 목록이다.
+- **`at` 자리**(웹 빌더의 칸이자 폼 오류 열쇠의 꼴): `name`, `compute`, `disks`·`disks.N`, `cdroms`·`cdroms.N`, `nics`·`nics.N`, `cloudInit`,
+  `placement`, `protection`, `replication`, `quota`, `spec`(그 밖). `N`은 요청 spec의 `disks`·`cdroms`·`nics` 차례다. 만들 볼륨의 문제는 그 볼륨을
+  가리키는 `disks.N`(없으면 `disks`), 만들 규칙의 문제는 `placement`에 붙는다. 같은 `at`·`code`는 하나로 모은다.
+- **검사 차례.** ① 이름(형식·같은 이름 VM `name_taken`)과 머신 채우기 ② 폴더의 `vm.create` — 없으면 **403**(폴더를 읽을 수도 없으면 404)으로
+  끝난다(만들 수 없는 곳의 규칙·노드를 알려 주지 않음). 폴더를 주지 않고 루트 `vm.create`도 없으면 400 `folder_required` ③ **모으는** 검사(하나가
+  실패해도 다음을 봄): 네트워크·볼륨·ISO·복제 풀의 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨마다 `POST /volumes`의 검사(이름·`name_taken`·풀·
+  `storage.allocate`·형식·풀 노드)와 풀 남은 용량 경고, 만들 규칙마다 배치 규칙 만들기의 검사(`placement-rule` 쓰기 권한·이름·모양·모순 —
+  맞는 노드가 없는 영역 규칙은 `rule_conflict`와 아래 `placement_rule`이 함께 나온다), 폴더 할당량(만들 볼륨 크기를 더해) ④ 만들 볼륨·규칙을
+  얹은 준비 단계(MAC·SDN 주소·CPU 모델·볼륨·ISO·노드 조건·hard 배치 규칙·스케줄러·HA 용량 — 만들기의 `prepare`와 같은 함수)는 **첫 오류
+  하나**만 준다.
+- **거절.** 401(로그인 없음), 400(본문을 풀 수 없음·`folder_required`), 403·404(위), **409 `cluster_upgrading`** — 노드 하나라도(위트니스 포함)
+  기능 `vm-check`를 알리지 않으면(롤링 업그레이드 중). 웹은 이때 "모든 노드를 올린 뒤에" 안내를 보이고 만들기는 그대로 된다. 질의 꼴
+  `POST /vms?dry_run=true`가 아니라 따로 된 경로인 까닭은 옛 노드가 질의를 모르고 진짜 VM을 만들기 때문이다.
+- **한계.** 그 순간의 답이다(잡아 두지 않음 — 확인과 만들기 사이 바뀌면 만들기가 알린다). 템플릿 배포(`POST /vms/{key}/clone`)의 미리 확인은
+  없다. 준비 단계 문제는 첫 하나다.

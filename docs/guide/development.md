@@ -140,6 +140,13 @@ OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
   cargo test -p opld --features restore-it --test file_restore -- --nocapture   # E2E (1)~(5)(orbivisorctl backup files — (5)는 OPL_RESTORE_TEST_GUEST가 있을 때)
 pnpm -C web build && OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
   cargo test -p opld --features web-it --test web browser_browses_backup_files   # 브라우저로 찾아보기·내려받기
+# VM 빌더·만들기 미리 확인(계획 71)
+cargo test -p opl-api --test vm_checks                              # POST /vm-checks: 통과(고를 노드·아무것도 안 씀)·문제 모음과 자리·이름·머신·만들 볼륨·영역 규칙·403/404·folder_required·409·감사 없음·OpenAPI
+cargo test -p opl-api vm_checks                                     # area_of 코드 → 자리 표, slot_of
+cargo test -p oplctl -- vm_create_dry_run web_cross                 # vm create --dry-run(표·-o json·끝 코드), 웹 CLI 미리 보기 교차 시험(아래)
+pnpm -C web test src/dnd src/vmBuilder src/placement/hard.test.ts   # 끌기 틀(상태 기계 사건열 성질 시험·자동 스크롤·제공자), 빌더 모델(부품·놓기 규칙 표·놓기·문제·요청·JSON·CLI·무작위 놓기)과 화면(msw, axe), hard 배치 규칙 예상
+pnpm -C web test src/clusterMap/drop.test.ts src/clusterMap/ClusterMapDrag.test.tsx   # 지도 끌어 옮기기: 놓을 자리 판정 표, 마우스·터치·m 키·권한·가장자리 보기 옮기기
+pnpm -C web build && cargo test -p opld --features web-it --test web browser_builds_vms_with_the_builder   # 브라우저로 빌더 만들기 셋(QEMU를 켜지 않음)
 # 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
 sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
@@ -386,14 +393,29 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 다시 읽기 단추)과 설정 › 일반의 CPU 기준 칸을 보고, 꺼진 VM을 소켓 2·게스트 NUMA 노드 2로 고쳐 요약을 보며, 노드 상세의 "NUMA
 토폴로지"(Linux는 탐침 요약, macOS는 "알리지 않았습니다")를 보고, VM이 켜진 뒤 인프라 › 노드의 보기 "지도"(계획 70 — 노드 블록·VM 타일,
 키보드 `]`·`Enter` 서랍·`Esc`·`[`, 실제 브라우저 가리키기 카드와 타일 누르기, 목록 보기, 동작 줄이기·어둠 테마, 390 × 844 폭의 "보기 설정"과
-가로 스크롤 없음, 기억한 보기)를 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
+가로 스크롤 없음, 기억한 보기)와 지도 `m`(계획 71 — 한 노드라 "Moving web: no node can take it. Escape cancels."와 `Esc` → "Cancelled.",
+초점은 노드)을 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
 시험이 잡지 못하는 경로 이동·렌더 문제가 있으므로 **웹을 바꾸면 커밋 전에 이 Mac에서 돌린다.** 실패하면
 `web/test-results/*/error-context.md`(화면 스냅숏)와 `trace.zip`이 남는다.
 
 둘째 브라우저 E2E(`web/e2e/permissions.spec.ts`)는 `web.rs`의 `browser_shows_a_folder_user_only_their_folder`가 돌린다. Rust 쪽이
 `/teamA`·`/teamB`와 VM, 그룹 grant로 `/teamA` operator를 받은 `none` 사용자를 준비하고, 브라우저는 그 사용자로 VM 목록·폴더
 트리·팔레트에 `/teamA`만 보이는지, + 만들기가 폴더를 골라 두고 노드 칸 없이 VM을 만드는지, 설정 › 2단계 인증에서 인증 앱을 켠
-뒤 둘째 단계로 다시 로그인하는지 본다. 두 시험은 spec 하나씩을 돌리고 하나씩 차례로 돈다.
+뒤 둘째 단계로 다시 로그인하는지 본다.
+
+셋째 브라우저 E2E(`web/e2e/builder.spec.ts`, 계획 71)는 `web.rs`의 `browser_builds_vms_with_the_builder`가 돌린다. Rust 쪽이 dir 풀
+`local`, 이름이 겹칠 볼륨 `b1-disk0`, vCPU 할당량 1인 폴더 `/q`를 준비하고, 브라우저는 VM 빌더로 꺼진 VM 셋을 만든다: (1) 1440 × 1000
+마우스 — 폼에서 넘어온 NIC 블록을 "빼기"로 끌고, 크기·풀·네트워크를 끌어 놓고, 이름이 겹치는 볼륨의 브라우저 오류, 4096 GiB 디스크의 서버
+경고 `pool_space`(디스크 줄), 폴더 `/q`의 서버 오류 `quota_exceeded`(VM 틀, 만들기 막힘), JSON·CLI 탭 글, 만들기 → `/vms/b1`, (2) 키보드만
+(`Space`·`Tab`·`Space`, 알림 줄, `Esc` 초점), (3) 390 × 844 "Add parts" 서랍 → 누르기 → "Drop here", 가로 스크롤 없음. 끝에 Rust가 CLI로
+만든 VM의 스펙·볼륨·폴더를 본다. 터치 길게 누르기는 vitest에만 있다(Playwright Desktop Chrome에 터치가 없음). 세 시험은 spec 하나씩을 돌리고
+하나씩 차례로 돈다.
+
+**웹 CLI 미리 보기 교차 시험.** 빌더 모델 시험(`web/src/vmBuilder/model/cli.test.ts`)이 대표 상태 열둘의 CLI 명령(셸을 거치지 않는 인자 배열)·
+user-data 파일·웹 요청 본문을 `web/src/vmBuilder/model/__fixtures__/cli.json`과 견주고(다르면 실패), `crates/oplctl/src/web_cross.rs`가 같은
+파일의 명령을 진짜 CLI(`run`)로 가짜 API에 보내 받은 `POST /vms`(템플릿은 `POST /vms/{key}/clone`) 본문이 웹 본문과 같은지 본다(CLI가 보내지
+않는 서버 기본값은 고르게 한 뒤). CLI 플래그나 웹 본문을 바꾸면 한쪽이 깨진다 — 의도한 바뀜이면 `UPDATE_FIXTURES=1 pnpm -C web test
+src/vmBuilder`로 고정 파일을 다시 쓰고 `cargo test -p oplctl web_cross`를 돌린다. 고정 파일은 prettier가 건드리지 않는다(`.prettierignore`).
 
 접근성 검사는 `src/test/axe.ts`의 `expectNoAxeViolations(container)`가 `axe-core`를 직접 부른다(jsdom에서 안 되는
 `color-contrast` 규칙은 끄고 `src/tokens.test.ts`가 대신한다). 머리줄·팔레트·서랍·목록·상세·설정·홈 시험에서 돈다. 새 색
@@ -403,7 +425,9 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 경로를 열 때 `clusterMap/strings.ts`가 `addResourceBundle`로 얕게 더한다(첫 화면에는 `nav.clusterMap`·팔레트 별칭·단축키 글만). 시험은
 `src/test/setup.ts`가 미리 더하고 `i18n.test`가 두 파일의 키를 맞춘다. 화면 안에서만 받는 키는 `lib/shortcuts.ts`의 `SHORTCUTS`에 따로
 묶음(`map`)으로 적어 `?` 도움말에만 보이고 전역 해석기는 받지 않는다. 첫 화면 묶음 크기는 `pnpm -C web build` 뒤 진입 조각 +
-modulepreload + index CSS의 gzip -9 합으로 잰다(계획 70 끝 478,317 B).
+modulepreload + index CSS의 gzip -9 합으로 잰다(계획 70 끝 478,317 B). 계획 71은 빌더 문구(`vmBuilder/i18n`)와 끌기 틀 문구(`dnd/i18n`)를 같은
+규약으로 늦게 받는다(`loadBuilderStrings`·`loadDndStrings`). 계획 71 끝은 이 도구로 479,457 B(시작 478,636 B에서 +821 B — 잰 도구에 따라 앞의 수와
+다르다).
 
 `cargo test --workspace --all-features`는 `web-it`도 켜므로 위 준비(빌드한 `web/dist`, pnpm, Chromium)가
 필요하다.
