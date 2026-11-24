@@ -198,6 +198,8 @@ struct Services {
     runner: TaskRunner,
     /// 이 노드의 복제본 기록을 청소한다(지운 VM·뺀 대상·뗀 디스크의 복제본, 끝난 회차의 겹층·받는 QEMU).
     replica_sweep: JoinHandle<()>,
+    /// 파일 복원 도우미 이미지를 검사하고 노드 상태(`NodeStatus.file_restore`)에 쓴다(계획 69).
+    file_restore: JoinHandle<()>,
     monitor: NodeMonitor,
     /// 리더가 투표 멤버를 상한(클러스터 설정 `voters`)에 맞춘다.
     voter_keeper: VoterKeeper,
@@ -306,6 +308,7 @@ impl Services {
             overlay.shutdown(left).await;
         }
         self.replica_sweep.abort();
+        self.file_restore.abort();
         self.runner.shutdown().await;
         self.reconciler.shutdown().await;
         // 작업자가 다시 켜지 않게 reconciler를 멈춘 뒤, 도는 HA VM 목록을 닫기(`ha.close()`) 전에 끈다.
@@ -498,6 +501,18 @@ impl Member {
                 .and_then(|n| n.spec.host_resources);
             host.topology = Some(watch.refresh(resources.as_ref(), unix_now()).await.clone());
         }
+        // 파일 복원 세션(계획 69)은 opld와 생애를 같이한다: 앞 프로세스의 도우미를 치우고, 이미지를 등록 전에 한 번
+        // 검사한다(등록이 `NodeStatus.file_restore`에 쓴다). 그 뒤로는 알림 루프가 manifest 바뀜과 세션 수를 본다.
+        let swept = hv.sweep_restore_helpers().await;
+        if swept > 0 {
+            tracing::info!(
+                sessions = swept,
+                "removed file restore helpers left by the previous process"
+            );
+        }
+        let file_restore = Arc::new(config.file_restore_state(&host.profile));
+        file_restore.refresh_image().await;
+        host.file_restore = Some(file_restore.clone());
         // QEMU가 마이그레이션 TLS에 쓰는 노드 인증서. 드라이버의 state_dir은 데이터 디렉터리다(host.rs).
         let tls_dir = migration_tls_dir(&config.data_dir);
         if let Err(e) = write_migration_tls(&tls_dir, &tls.ca_pem, &tls.cert_pem, &tls.key_pem) {
@@ -964,6 +979,14 @@ impl Member {
         )
         .await;
         let replica_sweep = rt.work.spawn(replicas.sweep_every());
+        let file_restore = on(&rt.work, || {
+            crate::file_restore::spawn(
+                cluster.clone(),
+                file_restore,
+                config.name.clone(),
+                crate::file_restore::CHECK_EVERY,
+            )
+        });
         let fence_watch = on(&rt.work, || {
             FenceWatch::spawn(cluster.clone(), peers.clone(), node)
         });
@@ -1087,6 +1110,7 @@ impl Member {
                 reconciler,
                 runner,
                 replica_sweep,
+                file_restore,
                 monitor,
                 voter_keeper,
                 schedule,

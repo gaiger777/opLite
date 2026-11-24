@@ -66,6 +66,9 @@ pub enum DriverError {
     /// 노드 CPU 탐침(계획 63)이 QEMU에서 모델·플래그를 읽지 못했다.
     #[error("CPU probe failed: {0}")]
     CpuProbe(String),
+    /// 파일 복원 도우미 VM(계획 69)을 띄우지 못했거나 도우미가 끝났다. 내용에 까닭(콘솔 로그의 마지막 줄)이 있다.
+    #[error("file restore helper: {0}")]
+    FileRestore(String),
     #[error(transparent)]
     Qmp(#[from] QmpError),
     #[error("i/o error: {0}")]
@@ -110,6 +113,7 @@ impl DriverError {
             | DriverError::Backup(_)
             | DriverError::LiveRestore(_)
             | DriverError::CpuProbe(_)
+            | DriverError::FileRestore(_)
             | DriverError::GuestAgent(_)
             | DriverError::Overlay(_) => false,
         }

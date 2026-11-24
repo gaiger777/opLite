@@ -2799,6 +2799,31 @@ impl Hypervisor for QemuHypervisor {
         read_pinning(&self.paths(id).ok()?.dir)
     }
 
+    async fn start_restore_helper(
+        &self,
+        cfg: &crate::file_restore::HelperConfig,
+        launch: &crate::file_restore::HelperLaunch,
+    ) -> Result<crate::file_restore::RestoreHelper, DriverError> {
+        crate::file_restore::start_helper(
+            &self.config.host,
+            self.config.systemd_scope,
+            &self.config.run_dir,
+            &self.config.state_dir,
+            cfg,
+            launch,
+        )
+        .await
+    }
+
+    async fn sweep_restore_helpers(&self) -> usize {
+        crate::file_restore::sweep_leftovers(
+            &self.config.run_dir,
+            &self.config.state_dir,
+            self.config.systemd_scope,
+        )
+        .await
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }

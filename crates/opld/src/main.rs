@@ -22,6 +22,7 @@ mod cpu_hook;
 #[cfg(feature = "ha-it")]
 mod fault;
 mod fence_watch;
+mod file_restore;
 mod firewall;
 mod guest;
 mod host;

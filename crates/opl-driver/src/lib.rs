@@ -4,6 +4,7 @@ pub mod affinity;
 pub mod backup_serve;
 pub mod ceph;
 pub mod error;
+pub mod file_restore;
 pub mod firewall;
 pub mod hostcheck;
 pub mod hypervisor;

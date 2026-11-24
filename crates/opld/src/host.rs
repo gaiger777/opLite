@@ -37,6 +37,8 @@ pub struct Host {
     pub topology: Option<opl_types::numa::NodeTopology>,
     /// swtpm 실행 파일(`[hypervisor] swtpm`·`swtpm_setup`)
     pub swtpm: opl_driver::SwtpmConfig,
+    /// 파일 복원 도우미(계획 69). 위트니스가 아닌 노드가 드라이버를 만든 뒤 둔다. 등록이 `NodeStatus.file_restore`에 쓴다.
+    pub file_restore: Option<Arc<opl_driver::file_restore::FileRestoreState>>,
 }
 
 impl Host {
@@ -66,6 +68,7 @@ impl Host {
             cpu: None,
             topology: None,
             swtpm: config.swtpm(),
+            file_restore: None,
         })
     }
 

@@ -107,6 +107,8 @@ pub struct Config {
     pub download: DownloadSection,
     #[serde(default)]
     pub metrics: MetricsSection,
+    #[serde(default)]
+    pub file_restore: FileRestoreSection,
     /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`·`metrics-it`)에만 있다. 배포 빌드는 `[test]`를 모르는
     /// 키로 거부한다.
     #[cfg(any(
@@ -943,6 +945,111 @@ pub struct DownloadSection {
     pub allow_private: bool,
 }
 
+/// 파일 단위 복원(계획 69 §6·§10.3). 도우미 이미지가 `image_dir`에 있고 검사를 지나야 이 노드가 세션을 받는다
+/// (`NodeStatus.file_restore`). 위트니스는 쓰지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileRestoreSection {
+    /// 도우미 이미지 디렉터리(`<arch>/manifest.json`·커널·initrd). 없으면 Linux `/usr/share/orbivisor/restore`(deb
+    /// `orbivisor-restore-image`), macOS `{data_dir}/restore-image`
+    #[serde(default)]
+    pub image_dir: Option<PathBuf>,
+    /// 노드당 세션 수(0이면 이 노드는 파일 복원을 받지 않는다, 64까지)
+    #[serde(default = "default_fr_max_sessions")]
+    pub max_sessions: u32,
+    /// 도우미 VM 메모리(MiB, 128~16384)와 vCPU(1~16)
+    #[serde(default = "default_fr_memory_mib")]
+    pub memory_mib: u32,
+    #[serde(default = "default_fr_vcpus")]
+    pub vcpus: u32,
+    /// 도우미가 에이전트 인사까지 걸려도 되는 시간(초, 10~3600 — TCG 노드를 생각해 넉넉히)
+    #[serde(default = "default_fr_boot_timeout_secs")]
+    pub boot_timeout_secs: u64,
+    /// 나열·내려받기·되돌려 쓰기가 없으면 세션을 닫는 시간(분, 1 이상)
+    #[serde(default = "default_fr_idle_minutes")]
+    pub idle_minutes: u64,
+    /// 세션 최대 시간(시간, 1~168)
+    #[serde(default = "default_fr_max_hours")]
+    pub max_hours: u64,
+    /// 디스크 덮개(저널 재생이 쓰는 곳) 합계 상한(MiB, 64 이상)
+    #[serde(default = "default_fr_overlay_max_mib")]
+    pub overlay_max_mib: u64,
+    /// 도우미 QEMU가 디스크·소켓을 연 뒤 내려갈 사용자(Linux에서 opld가 root일 때). 빈 값이면 내리지 않는다.
+    #[serde(default = "default_fr_run_as")]
+    pub run_as: String,
+    /// 게스트로 되돌려 쓰기 한 번의 바이트·파일 수 상한
+    #[serde(default = "default_fr_guest_max_bytes")]
+    pub guest_max_bytes: u64,
+    #[serde(default = "default_fr_guest_max_files")]
+    pub guest_max_files: u64,
+    /// 내려받기(zip·tar.gz) 한 번의 항목 수 상한
+    #[serde(default = "default_fr_download_max_entries")]
+    pub download_max_entries: u64,
+}
+
+impl Default for FileRestoreSection {
+    fn default() -> Self {
+        Self {
+            image_dir: None,
+            max_sessions: default_fr_max_sessions(),
+            memory_mib: default_fr_memory_mib(),
+            vcpus: default_fr_vcpus(),
+            boot_timeout_secs: default_fr_boot_timeout_secs(),
+            idle_minutes: default_fr_idle_minutes(),
+            max_hours: default_fr_max_hours(),
+            overlay_max_mib: default_fr_overlay_max_mib(),
+            run_as: default_fr_run_as(),
+            guest_max_bytes: default_fr_guest_max_bytes(),
+            guest_max_files: default_fr_guest_max_files(),
+            download_max_entries: default_fr_download_max_entries(),
+        }
+    }
+}
+
+impl FileRestoreSection {
+    fn validate(&self) -> anyhow::Result<()> {
+        let bad = |key: &str, range: &str| anyhow::anyhow!("file_restore.{key} must be {range}");
+        if self.max_sessions > 64 {
+            return Err(bad("max_sessions", "at most 64"));
+        }
+        if !(128..=16384).contains(&self.memory_mib) {
+            return Err(bad("memory_mib", "between 128 and 16384"));
+        }
+        if !(1..=16).contains(&self.vcpus) {
+            return Err(bad("vcpus", "between 1 and 16"));
+        }
+        if !(10..=3600).contains(&self.boot_timeout_secs) {
+            return Err(bad("boot_timeout_secs", "between 10 and 3600"));
+        }
+        if self.idle_minutes == 0 || self.idle_minutes > 7 * 24 * 60 {
+            return Err(bad("idle_minutes", "between 1 and 10080"));
+        }
+        if !(1..=168).contains(&self.max_hours) {
+            return Err(bad("max_hours", "between 1 and 168"));
+        }
+        if self.overlay_max_mib < 64 || self.overlay_max_mib > 1 << 30 {
+            return Err(bad("overlay_max_mib", "at least 64"));
+        }
+        if self.guest_max_bytes == 0 || self.guest_max_files == 0 || self.download_max_entries == 0
+        {
+            return Err(anyhow::anyhow!(
+                "file_restore.guest_max_bytes, guest_max_files and download_max_entries must be at least 1"
+            ));
+        }
+        let user_ok = self.run_as.is_empty()
+            || (self.run_as.len() <= 32
+                && !self.run_as.starts_with('-')
+                && self
+                    .run_as
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')));
+        if !user_ok {
+            return Err(bad("run_as", "a user name or empty"));
+        }
+        Ok(())
+    }
+}
+
 /// 지표 기록(계획 60 §6). 위트니스는 쓰지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1428,6 +1535,51 @@ fn default_qemu_img() -> PathBuf {
 
 impl Config {
     /// `qemu-nbd`(계획 68 — 꺼진 VM·옛 백업을 저장소로 읽기): `qemu_img`과 같은 디렉터리의 것, 경로 없는 이름이면 PATH
+    /// 도우미 이미지 디렉터리(`[file_restore] image_dir`, 없으면 Linux `/usr/share/orbivisor/restore`, macOS
+    /// `{data_dir}/restore-image`)
+    pub fn file_restore_image_dir(&self) -> PathBuf {
+        match &self.file_restore.image_dir {
+            Some(dir) => dir.clone(),
+            None if cfg!(target_os = "macos") => self.data_dir.join("restore-image"),
+            None => "/usr/share/orbivisor/restore".into(),
+        }
+    }
+
+    /// 이 노드의 파일 복원 상태(계획 69): 이미지 자리·도우미 설정·세션 한도. 이미지는 아직 검사하지 않았다.
+    pub fn file_restore_state(
+        &self,
+        host: &HostProfile,
+    ) -> opl_driver::file_restore::FileRestoreState {
+        use opl_driver::file_restore::{ClientOptions, HelperConfig, SessionLimits};
+        let f = &self.file_restore;
+        let helper = HelperConfig {
+            qemu_img: self.qemu_img.clone(),
+            memory_mib: f.memory_mib,
+            vcpus: f.vcpus,
+            boot_timeout: Duration::from_secs(f.boot_timeout_secs),
+            overlay_max: f.overlay_max_mib << 20,
+            run_as: (!f.run_as.is_empty()).then(|| f.run_as.clone()),
+            client: ClientOptions {
+                max_entries: f.download_max_entries,
+                ..ClientOptions::default()
+            },
+        };
+        let limits = SessionLimits {
+            max_sessions: f.max_sessions,
+            idle: Duration::from_secs(f.idle_minutes * 60),
+            max: Duration::from_secs(f.max_hours * 3600),
+            guest_max_bytes: f.guest_max_bytes,
+            guest_max_files: f.guest_max_files,
+        };
+        opl_driver::file_restore::FileRestoreState::new(
+            self.file_restore_image_dir(),
+            host,
+            opl_types::version::BUILD,
+            helper,
+            limits,
+        )
+    }
+
     pub fn qemu_nbd(&self) -> PathBuf {
         match self.qemu_img.parent().filter(|p| !p.as_os_str().is_empty()) {
             Some(dir) => dir.join("qemu-nbd"),
@@ -1437,6 +1589,39 @@ impl Config {
 }
 fn default_acpi_timeout() -> u64 {
     60
+}
+fn default_fr_max_sessions() -> u32 {
+    4
+}
+fn default_fr_memory_mib() -> u32 {
+    512
+}
+fn default_fr_vcpus() -> u32 {
+    2
+}
+fn default_fr_boot_timeout_secs() -> u64 {
+    300
+}
+fn default_fr_idle_minutes() -> u64 {
+    15
+}
+fn default_fr_max_hours() -> u64 {
+    8
+}
+fn default_fr_overlay_max_mib() -> u64 {
+    2048
+}
+fn default_fr_run_as() -> String {
+    "nobody".into()
+}
+fn default_fr_guest_max_bytes() -> u64 {
+    4 << 30
+}
+fn default_fr_guest_max_files() -> u64 {
+    10_000
+}
+fn default_fr_download_max_entries() -> u64 {
+    1_000_000
 }
 fn default_tick_secs() -> u64 {
     60
@@ -1647,6 +1832,7 @@ impl Config {
             anyhow::bail!("network.underlay must not be an unspecified address (got {ip})");
         }
         self.validate_vip(linux)?;
+        self.file_restore.validate()?;
         if self.node.zone.as_ref().is_some_and(|z| z.trim().is_empty()) {
             anyhow::bail!("node.zone must not be empty");
         }
@@ -3260,5 +3446,62 @@ mod tests {
         let hang = |_: String| std::future::pending::<std::io::Result<Vec<IpAddr>>>();
         assert_eq!(c.underlay_with(hang).await, None);
         assert_eq!(started.elapsed(), UNDERLAY_LOOKUP_TIMEOUT);
+    }
+
+    /// 계획 69 `[file_restore]`: 기본값, 도우미·세션 설정으로 옮기기, 범위 검사
+    #[test]
+    fn file_restore_section() {
+        let c = parse("name = \"n\"\naddress = \"h\"\ndata_dir = \"/d\"");
+        assert_eq!(c.file_restore, FileRestoreSection::default());
+        let expected: PathBuf = if cfg!(target_os = "macos") {
+            "/d/restore-image".into()
+        } else {
+            "/usr/share/orbivisor/restore".into()
+        };
+        assert_eq!(c.file_restore_image_dir(), expected);
+        let host = HostProfile::debian(opl_types::vm::Arch::Aarch64, Accel::Tcg);
+        let st = c.file_restore_state(&host);
+        assert_eq!(st.helper.memory_mib, 512);
+        assert_eq!(st.helper.vcpus, 2);
+        assert_eq!(st.helper.boot_timeout, Duration::from_secs(300));
+        assert_eq!(st.helper.overlay_max, 2048 << 20);
+        assert_eq!(st.helper.run_as.as_deref(), Some("nobody"));
+        assert_eq!(st.helper.client.max_entries, 1_000_000);
+        assert_eq!(st.limits.max_sessions, 4);
+        assert_eq!(st.limits.idle, Duration::from_secs(900));
+        assert_eq!(st.limits.max, Duration::from_secs(8 * 3600));
+        assert_eq!(st.limits.guest_max_bytes, 4 << 30);
+        assert_eq!(st.limits.guest_max_files, 10_000);
+        assert_eq!(st.accel, "tcg");
+
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[file_restore]\nimage_dir = \"/img\"\nrun_as = \"\"\nmax_sessions = 0",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.file_restore_image_dir(), PathBuf::from("/img"));
+        assert_eq!(c.file_restore_state(&host).helper.run_as, None);
+
+        for bad in [
+            "memory_mib = 64",
+            "vcpus = 0",
+            "boot_timeout_secs = 5",
+            "idle_minutes = 0",
+            "max_hours = 0",
+            "overlay_max_mib = 1",
+            "max_sessions = 65",
+            "download_max_entries = 0",
+            "run_as = \"-x\"",
+            "run_as = \"a b\"",
+        ] {
+            let c = parse(&format!(
+                "name = \"n\"\naddress = \"h\"\n[file_restore]\n{bad}"
+            ));
+            let err = c.validate().unwrap_err().to_string();
+            assert!(err.starts_with("file_restore."), "{bad}: {err}");
+        }
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[file_restore]\nnope = 1")
+                .is_err()
+        );
     }
 }

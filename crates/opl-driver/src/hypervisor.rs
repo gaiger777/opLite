@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::error::DriverError;
+use crate::file_restore::{HelperConfig, HelperLaunch, RestoreHelper};
 use crate::migration::{
     CatchUp, CatchUpState, IncomingPorts, MigrateOptions, MigrateTarget, MirrorOptions,
     MirrorTarget,
@@ -666,6 +667,19 @@ pub trait Hypervisor: Send + Sync {
     fn forget_pinning(&self, id: Uuid) {
         let _ = id;
     }
+
+    /// 파일 복원 도우미 VM(계획 69 §7)을 띄우고 에이전트 `Hello`까지 기다린다. 끝은
+    /// [`stop_helper`](crate::file_restore::stop_helper). 실제 드라이버는 이 노드의 QEMU·가속기로
+    /// [`start_helper`](crate::file_restore::start_helper), 가짜 하이퍼바이저는 에이전트 몸통 + 메모리 나무
+    /// ([`fake_helper`](crate::file_restore::fake_helper))다.
+    async fn start_restore_helper(
+        &self,
+        cfg: &HelperConfig,
+        launch: &HelperLaunch,
+    ) -> Result<RestoreHelper, DriverError>;
+
+    /// opld가 시작할 때 앞 프로세스가 남긴 도우미(QEMU·scope·덮개·소켓)를 치운다(§10.5). 치운 세션 수다.
+    async fn sweep_restore_helpers(&self) -> usize;
 
     /// 이 시점 이후의 VM 수명 이벤트를 받는다. `Lagged`를 받으면 `list()`로 전체 상태를 다시 맞춘다.
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent>;

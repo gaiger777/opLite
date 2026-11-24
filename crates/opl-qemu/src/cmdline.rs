@@ -51,6 +51,8 @@ pub enum CmdlineError {
     NoSecureBootFirmware,
     #[error("live restore wiring has {wired} disks but the VM has {disks}")]
     LiveRestoreDisks { disks: usize, wired: usize },
+    #[error("a file restore helper takes at most {MAX_HELPER_DISKS} disks (the backup has {0})")]
+    TooManyHelperDisks(usize),
     #[error(transparent)]
     Cpu(#[from] CpuError),
 }
@@ -668,6 +670,185 @@ fn check_layout(
         return Err(e);
     }
     Ok(())
+}
+
+/// 파일 복원 도우미 VM의 사용자 내리기(계획 69 §7.4). QEMU가 블록 장치·NBD 연결·소켓·로그를 다 연 뒤 바꾼다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperDrop {
+    /// `-run-with user=<이름>`(QEMU 9.1+)
+    RunWith(String),
+    /// `-runas <이름>`(QEMU 9.0까지 — 10.x는 받되 경고)
+    Runas(String),
+}
+
+/// 파일 복원 도우미 VM의 디스크 하나: 읽기 전용 백업 원본과 그 위 버리는 덮개(qcow2, backing은 명령줄에서만)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelperDisk<'a> {
+    pub source: &'a LiveRestoreSource,
+    pub overlay: &'a Path,
+}
+
+/// 파일 복원 도우미 VM(계획 69 §7.4)의 인자 재료
+#[derive(Debug, Clone)]
+pub struct RestoreHelperArgs<'a> {
+    /// 세션 id(`-name opl-fr-<id>` — 남은 것 치우기가 명령줄로 알아본다)
+    pub id: uuid::Uuid,
+    pub arch: Arch,
+    pub accel: crate::host::Accel,
+    pub kernel: &'a Path,
+    pub initrd: &'a Path,
+    pub memory_mib: u32,
+    pub vcpus: u32,
+    pub disks: &'a [HelperDisk<'a>],
+    /// 에이전트 채널(virtio-serial)의 호스트 쪽 유닉스 소켓(QEMU가 서버)
+    pub ctl_socket: &'a Path,
+    /// 직렬 콘솔 로그(덧붙여 씀 — opld 지킴이가 크기를 자른다)
+    pub console_log: &'a Path,
+    pub drop: Option<HelperDrop>,
+    /// seccomp `-sandbox`(seccomp로 빌드한 QEMU만)
+    pub sandbox: bool,
+}
+
+/// 도우미 VM 디스크 수 상한(virtio-blk-pci는 PCI 자리 하나씩 — q35·virt 모두 넉넉히 남는 수)
+pub const MAX_HELPER_DISKS: usize = 24;
+
+/// 도우미 이미지의 통신 규약 판(`opl.proto=` — 에이전트가 다르면 끈다)
+pub const HELPER_PROTO: u32 = 1;
+
+/// 파일 복원 도우미 VM의 QEMU 인자(바이너리 제외, 계획 69 §7.4). 펌웨어 없이 커널을 바로 올리고(`-kernel`·`-initrd`),
+/// 장치는 디스크마다 virtio-blk(읽기 전용 원본 → 덮개), virtio-serial 하나, virtio-rng, 직렬 콘솔(파일)뿐이다 —
+/// 네트워크·화면·USB가 없다. 원본은 `read-only=on`(NBD는 다시 붙지 않음 — 끊기면 세션이 실패한다), 옛 풀 백업은 체인을
+/// 명시한 json. 디스크마다 `serial=opl-disk{i}`로 에이전트가 번호를 맞춘다. 순수 함수다.
+pub fn build_restore_helper_cmdline(
+    a: &RestoreHelperArgs<'_>,
+) -> Result<Vec<String>, CmdlineError> {
+    use crate::host::Accel;
+    if a.disks.len() > MAX_HELPER_DISKS {
+        return Err(CmdlineError::TooManyHelperDisks(a.disks.len()));
+    }
+    let mut v = Args::default();
+    v.opt("-name", format!("opl-fr-{}", a.id));
+    v.flag("-nodefaults");
+    v.flag("-no-user-config");
+    v.opt("-display", "none".into());
+    v.opt("-net", "none".into());
+    let accel = a.accel.as_str();
+    let (machine, cpu, console) = match a.arch {
+        Arch::X86_64 => (
+            format!("q35,accel={accel}"),
+            match a.accel {
+                Accel::Tcg => "max",
+                Accel::Kvm | Accel::Hvf => "host",
+            },
+            "ttyS0",
+        ),
+        Arch::Aarch64 => (
+            match a.accel {
+                // HVF는 GICv3를 QEMU 판에 따라 받지 못한다 — 기본(GICv2)으로 둔다.
+                Accel::Hvf => format!("virt,accel={accel}"),
+                Accel::Kvm | Accel::Tcg => format!("virt,accel={accel},gic-version=max"),
+            },
+            match a.accel {
+                // TCG의 `max`는 포인터 인증(QARMA)을 흉내 내 느리다 — 구현 정의 알고리즘이 훨씬 빠르다(§4).
+                Accel::Tcg => "max,pauth-impdef=on",
+                Accel::Kvm | Accel::Hvf => "host",
+            },
+            "ttyAMA0",
+        ),
+    };
+    v.opt("-machine", machine);
+    v.opt("-cpu", cpu.into());
+    v.opt("-smp", a.vcpus.to_string());
+    v.opt("-m", format!("{}M", a.memory_mib));
+    v.opt("-kernel", a.kernel.display().to_string());
+    v.opt("-initrd", a.initrd.display().to_string());
+    v.opt(
+        "-append",
+        format!(
+            "console={console} panic=-1 quiet opl.session={} opl.proto={HELPER_PROTO}",
+            a.id
+        ),
+    );
+    for (i, d) in a.disks.iter().enumerate() {
+        v.opt("-blockdev", helper_source(i, d.source));
+        v.opt(
+            "-blockdev",
+            format!(
+                "driver=qcow2,file.driver=file,file.filename={},backing=src{i},node-name=ov{i}",
+                esc_path(d.overlay)
+            ),
+        );
+        v.opt(
+            "-device",
+            format!("virtio-blk-pci,drive=ov{i},serial=opl-disk{i}"),
+        );
+    }
+    v.opt("-device", "virtio-serial-pci".into());
+    v.opt(
+        "-chardev",
+        format!(
+            "socket,id=ctl,path={},server=on,wait=off",
+            esc_path(a.ctl_socket)
+        ),
+    );
+    v.opt(
+        "-device",
+        "virtserialport,chardev=ctl,name=org.orbivisor.restore.0".into(),
+    );
+    v.opt("-device", "virtio-rng-pci".into());
+    v.opt(
+        "-chardev",
+        format!("file,id=con,path={},append=on", esc_path(a.console_log)),
+    );
+    v.opt("-serial", "chardev:con".into());
+    v.flag("-no-reboot");
+    match &a.drop {
+        Some(HelperDrop::RunWith(user)) => v.opt("-run-with", format!("user={}", esc(user))),
+        Some(HelperDrop::Runas(user)) => v.opt("-runas", user.clone()),
+        None => {}
+    }
+    if a.sandbox {
+        // seccomp는 사용자를 바꾸기 전에 걸린다: `elevateprivileges=deny`면 QEMU 자신의 setuid가 SIGSYS로 죽는다(Rocky
+        // qemu-kvm 10.1에서 확인). 내린 뒤에는 root로 돌아갈 수 없으므로 그때만 뺀다.
+        let sandbox = if a.drop.is_some() {
+            HELPER_SANDBOX_DROPPED
+        } else {
+            HELPER_SANDBOX
+        };
+        v.opt("-sandbox", sandbox.into());
+    }
+    Ok(v.0)
+}
+
+/// 도우미 VM의 seccomp 설정(§7.2): 옛 시스템 호출·권한 올리기·새 프로세스·자원 바꾸기를 막는다.
+pub const HELPER_SANDBOX: &str =
+    "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny";
+/// 사용자를 내리는 도우미의 seccomp 설정([`HELPER_SANDBOX`]에서 `elevateprivileges=deny`를 뺌)
+pub const HELPER_SANDBOX_DROPPED: &str = "on,obsolete=deny,spawn=deny,resourcecontrol=deny";
+
+/// 도우미 디스크 원본(`src{i}`)의 `-blockdev` 값 — 늘 읽기 전용, NBD는 다시 붙지 않는다.
+fn helper_source(i: usize, source: &LiveRestoreSource) -> String {
+    let node = format!("src{i}");
+    match source {
+        LiveRestoreSource::Nbd { socket, export } => format!(
+            "driver=nbd,server.type=unix,server.path={},export={},read-only=on,node-name={node}",
+            esc_path(socket),
+            esc(export)
+        ),
+        LiveRestoreSource::Qcow2 { chain } => {
+            let mut node_json = serde_json::Value::Null;
+            for file in chain.iter().rev() {
+                node_json = serde_json::json!({
+                    "driver": "qcow2",
+                    "read-only": true,
+                    "file": { "driver": "file", "filename": file, "read-only": true },
+                    "backing": node_json,
+                });
+            }
+            node_json["node-name"] = serde_json::json!(node);
+            node_json.to_string()
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1931,5 +2112,145 @@ mod tests {
         let args = build_cmdline(&spec, &mac_host(), &paths()).unwrap();
         assert!(args.contains(&"cpu,node-id=1,socket-id=1".to_string()));
         assert!(args.contains(&"memory-backend-ram,id=ram-node1,size=4096M".to_string()));
+    }
+
+    fn helper_args<'a>(
+        arch: Arch,
+        accel: Accel,
+        disks: &'a [HelperDisk<'a>],
+        drop: Option<HelperDrop>,
+        sandbox: bool,
+    ) -> RestoreHelperArgs<'a> {
+        RestoreHelperArgs {
+            id: Uuid::nil(),
+            arch,
+            accel,
+            kernel: Path::new("/usr/share/orbivisor/restore/aarch64/Image"),
+            initrd: Path::new("/usr/share/orbivisor/restore/aarch64/initrd.img"),
+            memory_mib: 512,
+            vcpus: 2,
+            disks,
+            ctl_socket: Path::new("/run/opl/file-restore/x/ctl.sock"),
+            console_log: Path::new("/var/lib/opl/file-restore/x/console.log"),
+            drop,
+            sandbox,
+        }
+    }
+
+    /// 계획 69 §7.4: aarch64 TCG 도우미 — 펌웨어 없는 직접 부팅, 원본(NBD·qcow2 체인)은 읽기 전용, 덮개에 장치, 네트워크·화면
+    /// 없음, `pauth-impdef`, 권한 내림·sandbox는 맨 끝.
+    #[test]
+    fn restore_helper_cmdline_aarch64_tcg() {
+        let nbd = LiveRestoreSource::Nbd {
+            socket: "/run/opl/file-restore/x/nbd,1.sock".into(),
+            export: "disk0".into(),
+        };
+        let chain = LiveRestoreSource::Qcow2 {
+            chain: vec!["/bk/b2/disk1.qcow2".into(), "/bk/b1/disk1.qcow2".into()],
+        };
+        let disks = [
+            HelperDisk {
+                source: &nbd,
+                overlay: Path::new("/var/lib/opl/file-restore/x/ov0.qcow2"),
+            },
+            HelperDisk {
+                source: &chain,
+                overlay: Path::new("/var/lib/opl/file-restore/x/ov1.qcow2"),
+            },
+        ];
+        let args = build_restore_helper_cmdline(&helper_args(
+            Arch::Aarch64,
+            Accel::Tcg,
+            &disks,
+            Some(HelperDrop::RunWith("nobody".into())),
+            true,
+        ))
+        .unwrap();
+        let line = args.join(" ");
+        let expected = [
+            "-name opl-fr-00000000-0000-0000-0000-000000000000 -nodefaults -no-user-config -display none -net none",
+            " -machine virt,accel=tcg,gic-version=max -cpu max,pauth-impdef=on -smp 2 -m 512M",
+            " -kernel /usr/share/orbivisor/restore/aarch64/Image -initrd /usr/share/orbivisor/restore/aarch64/initrd.img",
+            " -append console=ttyAMA0 panic=-1 quiet opl.session=00000000-0000-0000-0000-000000000000 opl.proto=1",
+            " -blockdev driver=nbd,server.type=unix,server.path=/run/opl/file-restore/x/nbd,,1.sock,export=disk0,read-only=on,node-name=src0",
+            " -blockdev driver=qcow2,file.driver=file,file.filename=/var/lib/opl/file-restore/x/ov0.qcow2,backing=src0,node-name=ov0",
+            " -device virtio-blk-pci,drive=ov0,serial=opl-disk0",
+        ]
+        .concat();
+        assert!(line.starts_with(&expected), "{line}");
+        let src1: serde_json::Value = serde_json::from_str(&args[args.len() - 22]).unwrap();
+        assert_eq!(src1["node-name"], "src1");
+        assert_eq!(src1["read-only"], true);
+        assert_eq!(src1["file"]["filename"], "/bk/b2/disk1.qcow2");
+        assert_eq!(src1["backing"]["file"]["filename"], "/bk/b1/disk1.qcow2");
+        assert_eq!(src1["backing"]["backing"], serde_json::Value::Null);
+        assert!(line.ends_with(concat!(
+            " -device virtio-blk-pci,drive=ov1,serial=opl-disk1 -device virtio-serial-pci",
+            " -chardev socket,id=ctl,path=/run/opl/file-restore/x/ctl.sock,server=on,wait=off",
+            " -device virtserialport,chardev=ctl,name=org.orbivisor.restore.0 -device virtio-rng-pci",
+            " -chardev file,id=con,path=/var/lib/opl/file-restore/x/console.log,append=on -serial chardev:con",
+            " -no-reboot -run-with user=nobody",
+            " -sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny"
+        )), "{line}");
+        assert!(!line.contains("reconnect-delay"), "{line}");
+        for absent in ["-netdev", "-vnc", "usb", "virtio-net", "-drive", "pflash"] {
+            assert!(!line.contains(absent), "{absent}: {line}");
+        }
+    }
+
+    /// x86 KVM은 `q35`·`-cpu host`·`ttyS0`, HVF는 GIC 판을 정하지 않는다, 옛 QEMU는 `-runas`, 디스크 수 상한.
+    #[test]
+    fn restore_helper_cmdline_variants() {
+        let x86 = build_restore_helper_cmdline(&helper_args(
+            Arch::X86_64,
+            Accel::Kvm,
+            &[],
+            Some(HelperDrop::Runas("nobody".into())),
+            false,
+        ))
+        .unwrap()
+        .join(" ");
+        assert!(x86.contains("-machine q35,accel=kvm -cpu host "), "{x86}");
+        assert!(x86.contains("console=ttyS0 "), "{x86}");
+        assert!(x86.ends_with("-no-reboot -runas nobody"), "{x86}");
+        let x86_tcg =
+            build_restore_helper_cmdline(&helper_args(Arch::X86_64, Accel::Tcg, &[], None, true))
+                .unwrap()
+                .join(" ");
+        assert!(
+            x86_tcg.contains("-machine q35,accel=tcg -cpu max "),
+            "{x86_tcg}"
+        );
+        // 내리지 않으면 권한 올리기도 막는다.
+        assert!(
+            x86_tcg.ends_with(
+                "-no-reboot -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"
+            ),
+            "{x86_tcg}"
+        );
+        let hvf =
+            build_restore_helper_cmdline(&helper_args(Arch::Aarch64, Accel::Hvf, &[], None, false))
+                .unwrap()
+                .join(" ");
+        assert!(hvf.contains("-machine virt,accel=hvf -cpu host "), "{hvf}");
+        let src = LiveRestoreSource::Qcow2 {
+            chain: vec!["/bk/d.qcow2".into()],
+        };
+        let disks: Vec<HelperDisk> = (0..=MAX_HELPER_DISKS)
+            .map(|_| HelperDisk {
+                source: &src,
+                overlay: Path::new("/o.qcow2"),
+            })
+            .collect();
+        assert_eq!(
+            build_restore_helper_cmdline(&helper_args(
+                Arch::X86_64,
+                Accel::Kvm,
+                &disks,
+                None,
+                false
+            )),
+            Err(CmdlineError::TooManyHelperDisks(MAX_HELPER_DISKS + 1))
+        );
     }
 }

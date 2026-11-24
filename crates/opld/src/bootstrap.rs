@@ -226,6 +226,8 @@ async fn record_node(
     let numa_ready = host.topology.is_some() && crate::topology::numa_ready(cluster, &config.name);
     // tc 속도 제한(계획 67)은 모든 노드가 `sdn-services`를 알 때만 쓴다. 아니면 이미 적힌 것을 지우지 않는다.
     let qos_ready = crate::sdn::services_ready(cluster, &config.name);
+    let file_restore =
+        crate::file_restore::node_value(cluster, &config.name, host.file_restore.as_deref());
     update_node_status(cluster, |status| {
         let previous = status.cpu.take();
         let stored = status.topology.take();
@@ -233,8 +235,8 @@ async fn record_node(
         let stores = std::mem::take(&mut status.backup_stores);
         *status = NodeStatus {
             backup_stores: stores,
-            // 파일 복원 도우미(계획 69)는 다시 시작하면 세션이 없고 이미지를 다시 검사하므로 지운다. 검사가 다시 쓴다.
-            file_restore: None,
+            // 파일 복원 도우미(계획 69): 검사한 이미지와 지금 세션 수(검사 전이면 None — 알림 루프가 검사 뒤 쓴다).
+            file_restore: file_restore.clone(),
             sdn: None,
             qos: if qos_ready { host.qos } else { status.qos },
             topology: match &host.topology {
@@ -546,7 +548,7 @@ pub(crate) mod tests {
     }
 
     /// address는 IP 리터럴이다(등록이 이름을 풀지 않게).
-    fn test_config() -> Config {
+    pub(crate) fn test_config() -> Config {
         toml::from_str(
             "name = \"n\"\naddress = \"10.0.0.1\"\n[hypervisor]\naccel = \"tcg\"\nsystemd_scope = false",
         )

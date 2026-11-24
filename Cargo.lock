@@ -1704,9 +1704,12 @@ name = "opl-driver"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "fs4",
+ "hex",
  "libc",
  "opl-qemu",
+ "opl-restore",
  "opl-store",
  "opl-types",
  "rcgen",
@@ -1715,6 +1718,7 @@ dependencies = [
  "rustls-pki-types",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "time",

@@ -310,6 +310,14 @@ struct MockState {
     fleece_servers: HashMap<Uuid, (PathBuf, tokio::task::JoinHandle<()>)>,
     /// `fleece_begin`(`None`)·`fleece_end`(`Some(success)`) 호출(실패 포함)
     fleece_calls: Vec<(Uuid, FleeceRequest, Option<bool>)>,
+    /// 파일 복원 도우미 띄우기(계획 69, 실패 포함)
+    restore_launches: Vec<crate::file_restore::HelperLaunch>,
+    /// 다음 `start_restore_helper` 한 번을 실패시킬 오류
+    fail_next_restore_helper: Option<DriverError>,
+    /// 가짜 도우미가 보일 볼륨(없으면 [`mock_restore_volumes`])
+    restore_volumes: Option<crate::file_restore::FakeVolumes>,
+    /// `sweep_restore_helpers` 호출 수
+    restore_sweeps: usize,
     /// 라이브 복원 배선(계획 68, `set_live_restore`)
     live_restore: HashMap<Uuid, Vec<LiveRestoreDisk>>,
     /// 배선으로 켠 VM(켤 때마다)
@@ -856,6 +864,26 @@ impl MockHypervisor {
     /// `fleece_begin`(`None`)·`fleece_end`(`Some(success)`) 호출(실패 포함)
     pub fn fleece_calls(&self) -> Vec<(Uuid, FleeceRequest, Option<bool>)> {
         self.state.lock().unwrap().fleece_calls.clone()
+    }
+
+    /// 파일 복원 도우미 띄우기 호출(실패 포함, 계획 69)
+    pub fn restore_launches(&self) -> Vec<crate::file_restore::HelperLaunch> {
+        self.state.lock().unwrap().restore_launches.clone()
+    }
+
+    /// 다음 `start_restore_helper` 한 번을 실패시킨다
+    pub fn fail_next_restore_helper(&self, err: DriverError) {
+        self.state.lock().unwrap().fail_next_restore_helper = Some(err);
+    }
+
+    /// `sweep_restore_helpers` 호출 수
+    pub fn restore_sweeps(&self) -> usize {
+        self.state.lock().unwrap().restore_sweeps
+    }
+
+    /// 가짜 도우미가 보일 볼륨(에이전트 몸통이 그대로 답한다)
+    pub fn set_restore_volumes(&self, volumes: crate::file_restore::FakeVolumes) {
+        self.state.lock().unwrap().restore_volumes = Some(volumes);
     }
 
     /// VM의 라이브 복원 배선(없으면 `None`)
@@ -2820,9 +2848,121 @@ impl Hypervisor for MockHypervisor {
         self.state.lock().unwrap().pinned.remove(&id);
     }
 
+    async fn start_restore_helper(
+        &self,
+        cfg: &crate::file_restore::HelperConfig,
+        launch: &crate::file_restore::HelperLaunch,
+    ) -> Result<crate::file_restore::RestoreHelper, DriverError> {
+        let volumes = {
+            let mut st = self.state.lock().unwrap();
+            st.restore_launches.push(launch.clone());
+            if let Some(e) = st.fail_next_restore_helper.take() {
+                return Err(e);
+            }
+            st.restore_volumes.clone()
+        };
+        let volumes = volumes.unwrap_or_else(mock_restore_volumes);
+        crate::file_restore::fake_helper(launch, volumes, cfg.client).await
+    }
+
+    async fn sweep_restore_helpers(&self) -> usize {
+        self.state.lock().unwrap().restore_sweeps += 1;
+        0
+    }
+
     fn subscribe(&self) -> broadcast::Receiver<HypervisorEvent> {
         self.events.subscribe()
     }
+}
+
+/// 따로 정하지 않았을 때 가짜 도우미가 보이는 볼륨: `disk0p1`(ext4, `/etc/hostname`·`/etc/nginx/nginx.conf`·
+/// `/home/user/notes.txt`·`/var/log/app.log`(3 MiB)·링크 `/etc/localtime`), `disk0p2`(LVM PV — 마운트 못 함),
+/// `lvm/vg0/data`(xfs, 빈 디렉터리 `/srv`), `disk1`(LUKS — 마운트 못 함)
+pub fn mock_restore_volumes() -> crate::file_restore::FakeVolumes {
+    use opl_restore::agent::MemFs;
+    use opl_restore::agent::fs::path_of;
+    use opl_restore::proto::{Partition, PartitionTable, Volume, VolumeKind};
+    let root = MemFs::new();
+    root.file(&path_of("etc/hostname"), "web-01\n")
+        .file(&path_of("etc/nginx/nginx.conf"), "worker_processes auto;\n")
+        .file(&path_of("home/user/notes.txt"), "remember the milk\n")
+        .file(
+            &path_of("var/log/app.log"),
+            (0..3u32 << 20)
+                .map(|i| b"0123456789abcdef"[(i % 16) as usize])
+                .collect::<Vec<u8>>(),
+        )
+        .symlink(&path_of("etc/localtime"), "/usr/share/zoneinfo/UTC");
+    let data = MemFs::new();
+    data.dir(&path_of("srv"));
+    let part = |number: u32, type_name: &str| Partition {
+        table: PartitionTable::Gpt,
+        number,
+        type_name: type_name.into(),
+        uuid: None,
+    };
+    vec![
+        (
+            Volume {
+                id: "disk0p1".into(),
+                disk: 0,
+                kind: VolumeKind::Partition,
+                size: 8 << 30,
+                partition: Some(part(1, "Linux filesystem")),
+                fs: Some("ext4".into()),
+                label: Some("root".into()),
+                uuid: None,
+                mountable: true,
+                note: None,
+            },
+            Some(std::sync::Arc::new(root) as std::sync::Arc<dyn opl_restore::agent::Fs>),
+        ),
+        (
+            Volume {
+                id: "disk0p2".into(),
+                disk: 0,
+                kind: VolumeKind::Partition,
+                size: 2 << 30,
+                partition: Some(part(2, "Linux LVM")),
+                fs: Some("LVM2_member".into()),
+                label: None,
+                uuid: None,
+                mountable: false,
+                note: Some("LVM physical volume".into()),
+            },
+            None,
+        ),
+        (
+            Volume {
+                id: "lvm/vg0/data".into(),
+                disk: 0,
+                kind: VolumeKind::LogicalVolume,
+                size: 1 << 30,
+                partition: None,
+                fs: Some("xfs".into()),
+                label: None,
+                uuid: None,
+                mountable: true,
+                note: None,
+            },
+            Some(std::sync::Arc::new(data) as std::sync::Arc<dyn opl_restore::agent::Fs>),
+        ),
+        (
+            Volume {
+                id: "disk1".into(),
+                disk: 1,
+                kind: VolumeKind::Disk,
+                size: 4 << 30,
+                partition: None,
+                fs: Some("crypto_LUKS".into()),
+                label: None,
+                uuid: None,
+                mountable: false,
+                note: Some("encrypted (LUKS) — not supported".into()),
+            },
+            None,
+        ),
+    ]
 }
 
 /// QEMU가 명령에 오류로 답한 것
