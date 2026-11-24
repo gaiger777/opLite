@@ -414,3 +414,20 @@ VmCheckRequest {                     // deny_unknown_fields
 - **만들 규칙**: 권한(`placement-rule` 쓰기) → 이름 → 같은 이름 규칙(`name_taken`) → `placement_rules::check`(형식·노드·모순) 차례로 `placement`. 맞는 노드가 없는 영역 규칙은 규칙 만들기가 422 `rule_conflict`로 거절하므로 `rule_conflict`와 `prepare`의 `placement_rule`이 함께 `placement`에 나온다.
 - **만들 볼륨**: 같은 이름 볼륨(또는 만들 볼륨끼리 같은 이름) → `name_taken`. 검사를 지나지 못한 볼륨도 풀이 있으면 그 노드에 둔 준비된 볼륨으로 얹는다(스케줄러가 "풀에 닿는 노드 없음"을 덧붙이지 않게). 할당량에는 만들 볼륨 크기를 디스크로 더한다(`quota::precheck_new_vm`).
 - **CLI** `vm create --dry-run`: 경고는 `MESSAGE` 앞에 `warning: `, 오류가 있으면 표 뒤 `error: the check found N problem(s); the VM would not be created`(끝 코드 1), `--start`와 함께 쓸 수 없다. `-o json`은 답 그대로.
+
+### 스테이지 2
+
+(§18에 옮길 글)
+
+- **Rust 교차 시험은 이 스테이지에 없다**: 스테이지 1과 같은 때 다른 작업 트리에서 했고 `crates/`를 건드리지 않기로 해서, 웹 쪽 고정 파일 `web/src/vmBuilder/model/__fixtures__/cli.json`(대표 상태 열둘 — 명령은 셸을 거치지 않는 인자 배열, user-data 파일, 웹 본문, 노드 id → 이름)만 만들었다. `crates/oplctl` 시험은 스테이지 1이 합쳐진 뒤 더한다. 맞춰 볼 때 고르게 할 것: CLI는 `power`를 보내지 않고(꺼진 채 만들고 `--start`면 `vm start`), `--boot`가 없으면 첫 디스크에 `boot_order: 1`, `host` 모델은 보내지 않고, 게스트 에이전트는 `{}`(웹은 `{freeze_fs: true}`), 노드 이름·폴더 경로는 가짜 API로 id가 된다. 고정 파일은 prettier가 건드리지 않는다(`.prettierignore`), 갱신은 `UPDATE_FIXTURES=1`.
+- **`BuilderState`에 `preset`을 더함**: 폼의 `applyPreset(next, applied, values)`가 앞서 얹은 프리셋을 알아야 Windows를 떠날 때 SATA·e1000e를 돌린다. 폼은 이것을 화면 상태로 들고, 빌더는 상태에 둔다.
+- **템플릿 바탕의 cloud-init은 빈 값에서 시작**: §7.4는 "템플릿 것을 기본으로"였으나 템플릿의 cloud-init은 응답에서 비밀번호가 가려져 있어 그대로 다시 보내면 가린 값이 덮어쓰기가 된다. 배포 대화상자처럼 덮어쓰기만 받는다(비면 템플릿 것 그대로). 템플릿 디스크 줄의 크기 칸은 "늘릴 크기"(비면 그대로)이고 늘리기만 되는지를 문제로 본다. 보안 그룹은 배포 본문에 칸이 없어 템플릿 바탕에서는 막는다(`templateFixed`).
+- **HA 부품의 권한(`vm.ha`)은 없다**: 서버 권한 목록에 `vm.ha`가 없고 만들기는 `vm.create`만 본다. 영역 부품만 `placement-rule` 쓰기(`perms.can("write", "placement-rule")`)를 본다.
+- **서버 미리 확인 타입은 빌더 모델 안에 둠**(`requests.ts`의 `VmCheckRequest`·`VmCheck`·`VmCheckProblem`): 이 스테이지가 `schema.d.ts`를 건드리지 않아서다. 스테이지 1의 모양(`level: error|warn`, 통과하지 못하면 `machine`·`cpu_model`이 null)을 받도록 `level`은 선택(없으면 오류)이다. 스테이지 3이 `schema.d.ts` 타입으로 바꾼다.
+- **문제 겹침**: 서버 문제는 같은 `at`·`code`를 하나로(§9.2), 브라우저 문제는 값까지 같을 때만 하나로 — 같은 NIC에서 네트워크와 보안 그룹이 함께 사라지면 둘 다 보인다. 할당량 경고는 칸마다 열쇠(`quotaVcpus`·`quotaMemory`·`quotaDisk`)로 나눴다(값 `what`을 다시 옮기지 않게).
+- **CLI 글의 규칙**: 디스크가 둘 이상이거나 순서를 정했으면 `--boot`로 실제 부팅 순서를 적는다(CLI 기본은 첫 디스크만 부팅 — 웹의 "디스크 차례, CD는 뒤"와 다름). 모든 디스크가 SATA이거나 모든 NIC가 e1000e면 `--preset windows11`(CLI에 장치마다의 버스·모델 플래그가 없음)이고 프리셋과 다른 TPM·Secure Boot·게스트 에이전트만 `on|off`로 적는다. 플래그가 없는 칸(섞인 버스·모델, 고정 MAC, NUMA, 스냅샷 예약, 배포의 폴더·보안 그룹)은 주석 줄. 긴 명령은 플래그 앞에서 ` \` 줄 바꿈. `shq`는 안전한 글(`[A-Za-z0-9_@%+=:,./-]`)은 그대로 둔다.
+- **`useDropSlot`은 콜백 ref**(React 19 정리 함수)를 준다 — 쓰는 쪽이 자기 ref와 묶기 쉽고 id·이름이 바뀌면 다시 단다.
+- **문구는 늦게 받음**: `dnd/strings.ts`(`loadDndStrings`)와 `vmBuilder/strings.ts`(`loadBuilderStrings`) — 계획 70 지도 문구와 같은 규약, 시험은 `test/setup.ts`가 미리 더한다. 모델의 까닭은 번역 키라 폼의 열쇠(`vmForm.haNodeOff`·`vmForm.tpmNodeOff` 등)는 그대로 쓴다.
+- **함께 쓰게 꺼낸 것**: `vms/form.ts` `volumeRequest`(폼 `createVolume`도 씀), `templates.ts` `cloneBody`·`DeployOverrides`(배포 대화상자도 씀), `vms/migrate.ts`(옮기기 대화상자·일괄 옮기기·팔레트가 대화상자 파일 대신 이것을 읽음).
+- **크기**: 끌기 틀(제공자·훅 둘·상태 기계·자동 스크롤·알림 줄, 줄인 ES, React·i18next 밖) 8,454 B, gzip -9 **3,455 B**(목표 4 KB 밑). 첫 화면 묶음은 그대로(이 도구로 잰 앞뒤 모두 478,636 B — 화면이 없는 스테이지).
+- 시험: 웹 전체 177개 파일·2,128개 통과(끌기 틀 사건열 성질 시험 200 씨앗, 빌더 무작위 놓기 성질 시험 60 씨앗 포함), `typecheck`·`lint` 깨끗. 브라우저 E2E는 화면이 없어 돌리지 않았다(스테이지 5).
