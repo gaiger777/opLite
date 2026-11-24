@@ -5,9 +5,10 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{Client, Env, WAIT, set_pool_state};
+use common::{Client, Env, FakeStorage, WAIT, set_pool_state};
 use opl_types::audit::AuditQuery;
 use opl_types::node::{NodeSpec, PoolState, VM_CHECK};
 use opl_types::placement::PlacementRuleSpec;
@@ -42,6 +43,15 @@ fn with_new_disk(name: &str, pool: &str) -> Value {
     body["volumes"] = json!([{ "name": volume,
         "spec": { "pool": pool, "size_bytes": GIB, "format": "qcow2" } }]);
     body
+}
+
+/// 파일 없는 스토리지로 실행기를 띄운 시험 환경 — 볼륨 만들기가 `qemu-img`에 기대지 않게(CI `check`에는 없다).
+async fn start() -> Env {
+    let mut env = Env::start().await;
+    env.stop_runner().await;
+    env.start_runner_with(Arc::new(FakeStorage::default()))
+        .await;
+    env
 }
 
 async fn local_pool(env: &Env, admin: &Client, name: &str, folder: Option<&str>) {
@@ -137,7 +147,7 @@ fn counts(env: &Env) -> [usize; 4] {
 
 #[tokio::test]
 async fn a_passing_check_names_the_node_and_creates_nothing() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     local_pool(&env, &admin, "local", None).await;
     let before = counts(&env);
@@ -171,7 +181,7 @@ async fn a_passing_check_names_the_node_and_creates_nothing() {
 
 #[tokio::test]
 async fn independent_problems_are_collected_with_their_slots() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let team = folder(&admin, "team", "vm", json!({ "memory_mib": 128 })).await;
     let net = folder(&admin, "net", "network", json!(null)).await;
@@ -247,7 +257,7 @@ async fn hidden_payroll(env: &Env, admin: &Client) -> (Client, String) {
 
 #[tokio::test]
 async fn refused_attachments_do_not_run_the_deeper_checks() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let (alice, mine) = hidden_payroll(&env, &admin).await;
 
@@ -295,7 +305,7 @@ async fn refused_attachments_do_not_run_the_deeper_checks() {
 
 #[tokio::test]
 async fn rules_the_caller_may_not_create_do_not_steer_the_check() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let (alice, mine) = hidden_payroll(&env, &admin).await;
     let probe = |folder: Option<&str>| {
@@ -354,7 +364,7 @@ async fn grant(admin: &Client, user: &str, role: &str, folder: &str) {
 
 #[tokio::test]
 async fn creates_keep_the_first_refusal_by_volume_name() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let mine = folder(&admin, "mine", "vm", json!(null)).await;
     let seen = folder(&admin, "seen", "storage", json!(null)).await;
@@ -402,7 +412,7 @@ async fn creates_keep_the_first_refusal_by_volume_name() {
 
 #[tokio::test]
 async fn planned_lists_are_capped() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let volume = |i: usize| json!({ "name": format!("v{i}"), "spec": { "pool": "local", "size_bytes": GIB, "format": "qcow2" } });
     let rule = |i: usize| json!({ "name": format!("r{i}"), "spec": { "kind": "anti-affinity", "vms": ["web", "x"] } });
@@ -420,7 +430,7 @@ async fn planned_lists_are_capped() {
 
 #[tokio::test]
 async fn names_and_machines_are_checked_too() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let (status, body) = admin.post("/vms", check_body("web")).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
@@ -457,7 +467,7 @@ async fn names_and_machines_are_checked_too() {
 
 #[tokio::test]
 async fn planned_volumes_are_checked_like_volume_creates() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     local_pool(&env, &admin, "local", None).await;
     let team = folder(&admin, "team", "vm", json!(null)).await;
@@ -523,7 +533,7 @@ async fn planned_volumes_are_checked_like_volume_creates() {
 /// 거절만 돌려준다 — 준비 단계가 그 풀의 성질(노드 로컬인지·어느 노드인지)을 드러내지 않게. 없는 풀도 거기서 멈춘다.
 #[tokio::test]
 async fn planned_volumes_in_hidden_pools_are_refused_before_other_checks() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     local_pool(&env, &admin, "local", None).await;
     let team = folder(&admin, "team", "vm", json!(null)).await;
@@ -561,7 +571,7 @@ async fn planned_volumes_in_hidden_pools_are_refused_before_other_checks() {
 
 #[tokio::test]
 async fn planned_zone_rules_steer_the_node() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
     node.labels.insert("zone".into(), "a".into());
@@ -612,7 +622,7 @@ async fn planned_zone_rules_steer_the_node() {
 
 #[tokio::test]
 async fn a_folder_without_vm_create_is_refused() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let mine = folder(&admin, "mine", "vm", json!(null)).await;
     let theirs = folder(&admin, "theirs", "vm", json!(null)).await;
@@ -642,7 +652,7 @@ async fn a_folder_without_vm_create_is_refused() {
 
 #[tokio::test]
 async fn old_nodes_make_the_check_wait_for_the_upgrade() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     let mut status = env
         .cluster
@@ -665,7 +675,7 @@ async fn old_nodes_make_the_check_wait_for_the_upgrade() {
 
 #[tokio::test]
 async fn checks_are_not_audited() {
-    let env = Env::start().await;
+    let env = start().await;
     let admin = env.admin().await;
     check(&admin, check_body("web")).await;
     let (status, body) = admin.post("/vms", check_body("web")).await;
@@ -699,7 +709,7 @@ async fn checks_are_not_audited() {
 
 #[tokio::test]
 async fn the_check_is_in_the_api_document() {
-    let env = Env::start().await;
+    let env = start().await;
     let (status, doc) = env.anonymous().get("/openapi.json").await;
     assert_eq!(status, StatusCode::OK);
     let post = &doc["paths"]["/vm-checks"]["post"];
