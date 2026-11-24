@@ -11,6 +11,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
 import { useDnd } from "@/dnd/DndProvider";
 import { UsageBars } from "@/folders/UsageBars";
+import { serverErrorMessage } from "@/i18n/errors";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 import { cn } from "@/lib/utils";
 import { useBuilder } from "@/vmBuilder/context";
@@ -125,6 +126,12 @@ export function SidePanel({
                 </span>
               )}
             </p>
+            {server.status === "failed" && (
+              // 404는 서버의 설명 그대로(볼 수 없는 폴더 등 — 번역 "더는 없음"보다 정확함)
+              <p className="text-xs text-muted-foreground">
+                {serverErrorMessage(t, server.error, ["not_found"])}
+              </p>
+            )}
             {server.status === "failed" && (
               <Button
                 type="button"

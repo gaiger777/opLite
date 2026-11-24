@@ -27,11 +27,12 @@ export function useDraggable<I extends Item>(item: I, role?: string) {
       if (e.button !== 0 || !e.isPrimary) {
         return;
       }
-      // 든 채 놓을 수 있는 칸 안의 다른 블록을 누르면 그 칸에 놓기다(칸의 click이 받는다).
+      // 든 채 놓을 수 있는 칸 안의 다른 블록을 누르면 그 칸에 놓기다(칸의 click이 받는다). click은 가장 안쪽 칸만 받으니
+      // 그 칸을 본다 — 안쪽 칸이 받지 않으면(바깥 칸만 밝음) 누른 블록을 든다.
       if (
         s.phase === "picked" &&
         s.item.id !== item.id &&
-        e.currentTarget.closest("[data-drop=ok]")
+        e.currentTarget.closest("[data-drop]")?.getAttribute("data-drop") === "ok"
       ) {
         return;
       }

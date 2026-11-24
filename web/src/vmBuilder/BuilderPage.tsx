@@ -84,6 +84,13 @@ export function BuilderPage() {
 /** 규칙 요청의 비교 열쇠(이름과 내용) */
 const ruleKey = (r: RuleRequest) => JSON.stringify(r);
 
+/** 이 화면이 만든 규칙: 서버 id, 요청 열쇠, 걸린 VM 이름 */
+interface MadeRule {
+  id: string;
+  key: string;
+  vm: string;
+}
+
 /** 새로 만든 볼륨을 있는 볼륨으로(다시 보낼 때 또 만들지 않음 — 폼 규칙) */
 function markExisting(s: BuilderState, volume: string): BuilderState {
   return {
@@ -161,24 +168,31 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     ],
   );
 
-  // 이번 화면에서 만든 배치 규칙(이름 → id·열쇠). VM을 만들지 못한 채 남았다: 다시 만들 때 지금 영역 규칙과 같으면 다시
-  // 쓰고, 영역·hard/soft·VM 이름이 바뀌었거나 영역을 뺐으면 곧 지운다(이 화면이 방금 만든, 아직 VM 없는 규칙이다).
-  const madeRules = useRef(new Map<string, { id: string; key: string }>());
+  // 이번 화면에서 만든 배치 규칙(이름 → id·열쇠·VM 이름). VM을 만들지 못한 채 남았다: 다시 만들 때 지금 영역 규칙과
+  // 같으면 다시 쓰고, 영역·hard/soft·VM 이름이 바뀌었거나 영역을 뺐으면 곧 지운다(이 화면이 방금 만든, 아직 VM 없는 규칙).
+  const madeRules = useRef(new Map<string, MadeRule>());
   const dropping = useRef(new Map<string, Promise<void>>());
-  // 만든 규칙 이름(그리기용 — `madeRules`를 바꿀 때마다 맞춤)
-  const [madeNames, setMadeNames] = useState<ReadonlySet<string>>(new Set());
-  const syncMade = () => setMadeNames(new Set(madeRules.current.keys()));
+  // 만든 규칙(그리기용 — `madeRules`를 바꿀 때마다 맞춤)
+  const [made, setMade] = useState<ReadonlyMap<string, MadeRule>>(new Map());
+  const syncMade = () => setMade(new Map(madeRules.current));
   // 이번 화면에서 만든 볼륨(다시 실패해도 알림에 남김)
   const madeVolumes = useRef<string[]>([]);
+  const want = zoneRule(s);
+  const wantKey = want && ruleKey(want);
 
   const browser = useMemo(() => browserProblems(s, ctx), [s, ctx]);
-  // 만든 규칙은 이미 있다 — 확인 본문의 "만들 규칙"에서 뺀다(넣으면 서버가 name_taken).
-  const body = useMemo(() => checkBody(s, ctx, (name) => madeNames.has(name)), [s, ctx, madeNames]);
+  // 같은 것(이름·내용)을 만든 규칙은 이미 있다 — 확인 본문의 "만들 규칙"에서 뺀다(넣으면 서버가 name_taken).
+  const body = useMemo(
+    () => checkBody(s, ctx, (r) => made.get(r.name)?.key === ruleKey(r)),
+    [s, ctx, made],
+  );
+  // 지울 만든 규칙이 아직 이 VM에 걸려 있으면(지우는 중·지우지 못함) 서버는 지난 규칙으로 확인한다 — 지운 뒤에 묻는다.
+  const held = [...made.values()].some((r) => r.key !== wantKey && r.vm === s.values.name);
   // 기능 `vm-check`가 없는 노드(위트니스 제외)가 있으면 묻지 않는다. 노드를 읽지 못하면 묻고 409를 받는다.
   const supported = !(ctx.nodes ?? []).some(
     (n) => !n.spec.witness && !(n.status.features ?? []).includes(VM_CHECK),
   );
-  const server = useServerCheck(body, !blocking(browser), supported);
+  const server = useServerCheck(body, !blocking(browser), supported, held);
   const list = useMemo(
     () => problems(s, ctx, server.stale ? null : server.check),
     [s, ctx, server.stale, server.check],
@@ -186,7 +200,13 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
 
   const [selected, select] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [failure, setFailure] = useState<string | null>(null);
+  // 알림: 만들기가 실패했으면(`volumes`는 그때까지 만든 볼륨) "이미 만든 것"에 지금 남은 만든 규칙을 더해 그린다.
+  const [failure, setFailure] = useState<{ message: string; volumes?: string[] } | null>(null);
+  const leftAlert = useCallback(
+    (name: string, err: unknown) =>
+      setFailure({ message: t("vmBuilder.page.ruleLeft", { name, error: errorMessage(t, err) }) }),
+    [t],
+  );
   // 놓은 뒤 초점을 줄 곳(블록 `data-block` 또는 칸 제목 id — 그린 뒤에 준다)
   const focusTo = useRef<{ block: string } | { heading: string } | null>(null);
   const [said, setSaid] = useState("");
@@ -222,15 +242,13 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
         })
         .then(() => {
           madeRules.current.delete(name);
-          setMadeNames(new Set(madeRules.current.keys()));
+          setMade(new Map(madeRules.current));
         })
         .finally(() => dropping.current.delete(name));
       dropping.current.set(name, p);
     }
     return p;
   }, []);
-  const want = zoneRule(s);
-  const wantKey = want && ruleKey(want);
   useEffect(() => {
     // 만드는 중에는 두지 않는다(VM 요청이 날고 있는 동안 그 규칙을 지우지 않게).
     if (busy) {
@@ -238,12 +256,10 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     }
     for (const [name, r] of madeRules.current) {
       if (r.key !== wantKey) {
-        dropRule(name).catch((err: unknown) =>
-          setFailure(t("vmBuilder.page.ruleLeft", { name, error: errorMessage(t, err) })),
-        );
+        dropRule(name).catch((err: unknown) => leftAlert(name, err));
       }
     }
-  }, [wantKey, madeNames, busy, dropRule, t]);
+  }, [wantKey, made, busy, dropRule, leftAlert]);
 
   const apply = (next: BuilderState) => setHist((h) => record(h, next));
   const builder: BuilderApi = {
@@ -334,7 +350,18 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
     const { signal } = controller;
     try {
       // 지우는 중인 지난 규칙을 기다린다(같은 이름을 다시 만들 수 있게).
-      await Promise.all([...dropping.current.values()]);
+      await Promise.allSettled([...dropping.current.values()]);
+      // 지금 영역 규칙과 다른 만든 규칙(지우지 못했던 것 — 이름이 다른 것도)을 다시 지운다. 못 지우면 멈추고 알린다.
+      for (const [name, r] of [...madeRules.current]) {
+        if (r.key !== wantKey) {
+          try {
+            await dropRule(name);
+          } catch (err) {
+            leftAlert(name, err);
+            return;
+          }
+        }
+      }
       // 폼과 같은 차례: 새 볼륨(Task 기다림) → 영역 규칙 → VM(또는 템플릿 배포 Task)
       for (const r of requests(s, ctx)) {
         if (signal.aborted) {
@@ -349,7 +376,11 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
             signal,
           );
           madeVolumes.current.push(name);
-          setHist((h) => ({ ...h, present: markExisting(h.present, name) }));
+          // 되돌리기 쌓기에서도(되돌린 뒤 다시 만들 때 또 보내지 않게)
+          setHist((h) => ({
+            past: h.past.map((p) => markExisting(p, name)),
+            present: markExisting(h.present, name),
+          }));
         } else if (r.path === "/placement-rules") {
           const key = ruleKey(r.body);
           const had = madeRules.current.get(r.body.name);
@@ -357,7 +388,7 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
             // 지난 것과 다르면(지우기가 실패했었음) 먼저 지운다.
             await dropRule(r.body.name);
             const rule = await call(api.POST("/placement-rules", { body: r.body }));
-            madeRules.current.set(r.body.name, { id: rule.id, key });
+            madeRules.current.set(r.body.name, { id: rule.id, key, vm: s.values.name });
             syncMade();
           }
         } else if (r.path === "/vms") {
@@ -380,13 +411,7 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
       if (signal.aborted) {
         return;
       }
-      const message = errorMessage(t, err);
-      const made = [...madeVolumes.current, ...madeRules.current.keys()];
-      setFailure(
-        made.length > 0
-          ? t("vmBuilder.page.created", { names: made.join(", "), error: message })
-          : message,
-      );
+      setFailure({ message: errorMessage(t, err), volumes: [...madeVolumes.current] });
     } finally {
       if (!signal.aborted) {
         setBusy(false);
@@ -400,6 +425,13 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
       ? putDraft({ values: initialState(machine, folder).values, preset: "template" })
       : putDraft({ values: s.values });
 
+  // 자동으로 지운 규칙은 "이미 만든 것"에서 빠진다.
+  const createdNames = failure?.volumes && [...failure.volumes, ...made.keys()];
+  const alert =
+    failure &&
+    (createdNames && createdNames.length > 0
+      ? t("vmBuilder.page.created", { names: createdNames.join(", "), error: failure.message })
+      : failure.message);
   const narrow = useNarrow();
   return (
     <BuilderContext.Provider value={builder}>
@@ -420,7 +452,7 @@ function Builder({ machine, folder }: { machine: VmFormValues["machine"]; folder
           <div className="vb-grid">
             <PartsPanel narrow={narrow} />
             <Chassis />
-            <SidePanel server={server} failure={failure} onCreate={() => void create()} />
+            <SidePanel server={server} failure={alert} onCreate={() => void create()} />
           </div>
           <div>
             <Button variant="ghost" asChild>

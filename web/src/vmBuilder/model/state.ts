@@ -38,6 +38,8 @@ export interface BuilderState {
   autoNames: boolean[];
   /** 마지막으로 얹은 OS 프리셋(`applyPreset`이 Windows를 떠날 때 장치를 돌리는 데 쓴다) */
   preset: Preset;
+  /** 템플릿을 놓을 때 비운, 폼에서 고친 칸(배포가 싣지 못함 — 틀 위 칩이 알림) */
+  cleared?: CarriedKey[];
 }
 
 /** 부품·놓기 규칙·문제가 보는 세상(목록은 watch로 늘 최신). 노드를 읽지 못하면 `nodes`가 null이다. */
@@ -165,8 +167,13 @@ export const CARRIED_KEYS = [
   "agentShutdown",
 ] as const satisfies readonly (keyof VmFormValues)[];
 
+export type CarriedKey = (typeof CARRIED_KEYS)[number];
+
+/** 템플릿 배포 요청(`CloneRequest`)에 싣지 않는 들고 다니는 칸 — 템플릿을 놓으면 비운다(CPU 플래그만 싣는다). */
+export const NOT_DEPLOYED: readonly CarriedKey[] = CARRIED_KEYS.filter((k) => k !== "cpuFlags");
+
 /** 폼에서 고친(처음 값과 다른) 들고 다니는 칸 — 틀 위 "폼에서 고친 칸 n개" */
-export function formOnly(v: VmFormValues): (typeof CARRIED_KEYS)[number][] {
+export function formOnly(v: VmFormValues): CarriedKey[] {
   const empty = emptyForm(v.machine, v.folder);
   return CARRIED_KEYS.filter((k) => JSON.stringify(v[k]) !== JSON.stringify(empty[k]));
 }

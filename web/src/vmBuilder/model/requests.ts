@@ -130,13 +130,13 @@ function withoutPassword(v: VmFormValues): VmFormValues {
 }
 
 /**
- * 서버 미리 확인 본문. 템플릿 바탕은 확인하지 않는다(설계 §2 — 배포의 미리 확인은 나중). `made`가 참인 이름의 영역
- * 규칙은 이미 만들었다(지난 만들기 — 서버에 있으니 "만들 규칙"으로 보내지 않음).
+ * 서버 미리 확인 본문. 템플릿 바탕은 확인하지 않는다(설계 §2 — 배포의 미리 확인은 나중). `made`가 참인 영역 규칙은
+ * 이름과 내용이 같은 것을 이미 만들었다(지난 만들기 — 서버에 있으니 "만들 규칙"으로 보내지 않음).
  */
 export function checkBody(
   s: BuilderState,
   ctx: BuilderCtx,
-  made: (rule: string) => boolean = () => false,
+  made: (rule: RuleRequest) => boolean = () => false,
 ): VmCheckRequest | null {
   if (s.base.kind === "template") {
     return null;
@@ -148,7 +148,7 @@ export function checkBody(
     labels: {},
     spec: toSpec(v, v.start ? "running" : "stopped", sdnOf(s, ctx)),
     volumes: volumeRequests(s, ctx),
-    rules: rule && !made(rule.name) ? [rule] : [],
+    rules: rule && !made(rule) ? [rule] : [],
   };
 }
 

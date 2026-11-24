@@ -151,7 +151,7 @@ it("checks without the plain password and not for templates", () => {
   expect(body.spec.cloud_init).toBeDefined();
   expect(checkBody(build([[`template:${TEMPLATE.id}`, "vm"]]), ctx)).toBeNull();
   // 이 화면이 이미 만든 규칙은 "만들 규칙"이 아니다(보내면 서버가 name_taken).
-  expect(checkBody(s, ctx, (name) => name === "web-zone")!.rules).toEqual([]);
+  expect(checkBody(s, ctx, (r) => r.name === "web-zone")!.rules).toEqual([]);
 });
 
 it("masks the cloud-init password in the JSON preview", () => {

@@ -4,9 +4,15 @@ import type { Vm } from "@/api/types";
 import { accepts, type Thing } from "@/vmBuilder/model/accepts";
 import { NEW_DISK_GIB, SIZES } from "@/vmBuilder/model/parts";
 import { type ListKind, listOf, slotOf } from "@/vmBuilder/model/slots";
-import { type BuilderCtx, type BuilderState, renumber } from "@/vmBuilder/model/state";
+import {
+  type BuilderCtx,
+  type BuilderState,
+  formOnly,
+  NOT_DEPLOYED,
+  renumber,
+} from "@/vmBuilder/model/state";
 import { DEFAULT_NET, emptyCloudInit, type NetRow } from "@/vms/cloudInit";
-import { defaultMachine, emptyDisk, type NicRow, type VmFormValues } from "@/vms/form";
+import { defaultMachine, emptyDisk, emptyForm, type NicRow, type VmFormValues } from "@/vms/form";
 import { applyPreset } from "@/vms/form/steps";
 
 /** 패키지 조각이 비어 있는 user-data에 넣는 글(게스트 에이전트 꾸러미) */
@@ -66,11 +72,16 @@ export function removeBlock(s: BuilderState, list: ListKind, index: number): Bui
   return renumber({ ...s, values, autoNames });
 }
 
-/** 템플릿 바탕: 틀의 디스크·NIC를 템플릿 것으로(바꿀 수 없는 줄), 계산·CPU·머신은 템플릿 값에서 시작한다. */
+/**
+ * 템플릿 바탕: 틀의 디스크·NIC를 템플릿 것으로(바꿀 수 없는 줄), 계산·CPU·머신은 템플릿 값에서 시작한다. 배포 요청이
+ * 싣지 못하는 폼 칸(`NOT_DEPLOYED` — 복제·스냅샷 예약·NUMA 등)은 처음 값으로 비운다(보내지 않는 값을 들고 있지 않게).
+ */
 export function templateValues(v: VmFormValues, t: Vm): VmFormValues {
   const s = t.spec;
+  const empty = emptyForm(s.machine, v.folder);
   return {
     ...v,
+    ...(Object.fromEntries(NOT_DEPLOYED.map((k) => [k, empty[k]])) as Partial<VmFormValues>),
     sockets: s.cpu.sockets ?? 1,
     cores: String(s.cpu.cores),
     model: s.cpu.model ?? "host",
@@ -143,6 +154,13 @@ export function drop(s: BuilderState, t: Thing, at: string, ctx: BuilderCtx): Bu
         ...s,
         base: { kind: "template", id: vm.id, linked: null, pool: "" },
         values: templateValues(v, vm),
+        // 비운 칸(앞 템플릿이 비운 것도)을 틀 위 칩이 알린다.
+        cleared: [
+          ...new Set([
+            ...(s.cleared ?? []),
+            ...formOnly(v).filter((k) => NOT_DEPLOYED.includes(k)),
+          ]),
+        ],
         autoNames: [],
         preset: "blank",
       };

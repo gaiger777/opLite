@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import type { List } from "@/api/live";
-import type { Node, Task } from "@/api/types";
+import type { Node, Task, Volume } from "@/api/types";
 import i18n from "@/i18n";
 import { writeUserPref } from "@/lib/prefs";
 import { expectNoAxeViolations } from "@/test/axe";
@@ -12,10 +12,11 @@ import { haGroup, isoVolume, securityGroup, task, vm, volume } from "@/test/fixt
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { BuilderPage } from "@/vmBuilder/BuilderPage";
-import { readDraft } from "@/vmBuilder/draft";
+import { putDraft, readDraft } from "@/vmBuilder/draft";
 import builderEn from "@/vmBuilder/i18n/en.json";
 import builderKo from "@/vmBuilder/i18n/ko.json";
 import { CHECK_DELAY_MS } from "@/vmBuilder/useServerCheck";
+import { emptyForm } from "@/vms/form";
 import { VmCreatePage } from "@/vms/VmFormPage";
 
 /** 빌더의 세상: 영역 a·b의 두 노드, 공유 풀 ceph·로컬 풀, 네트워크 lan·SDN tenant, 보안 그룹, ISO, 템플릿 */
@@ -192,6 +193,26 @@ it("picks a block with a tap on its grip without moving it (the click after the 
   // 다른 블록 줄을 누르면 그 자리에 놓는다(가장 안쪽 칸만 받는다).
   fireEvent.click(block("Disk 2 (spare)"));
   expect(names()).toEqual(["Disk 1 (spare)", "Disk 2 (web-disk1)"]);
+});
+
+it("picks the tapped block when its row refuses what is held, even if the list takes it", async () => {
+  world();
+  open();
+  const user = userEvent.setup();
+  await twoDisks(user);
+  const tap = (el: HTMLElement) => {
+    fireEvent.pointerDown(el, { button: 0, isPrimary: true, clientX: 10, clientY: 10 });
+    fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
+    fireEvent.click(el);
+  };
+  tap(part(/^New disk in ceph/));
+  // 풀은 있는 볼륨 디스크에 놓지 못한다(줄은 "no") — 바깥 디스크 목록은 받는다("ok").
+  expect(slot(/^Disk 2 \(spare\)/)).toHaveAttribute("data-drop", "no");
+  expect(slot(/^Disks \(top boots first\)/)).toHaveAttribute("data-drop", "ok");
+  const grip = screen.getByRole("button", { name: "Pick up Disk 2 (spare)" });
+  tap(grip);
+  expect(grip).toHaveAttribute("data-held");
+  expect(live()).toHaveTextContent(/Picked up Disk 2 \(spare\)/);
 });
 
 it("does not undo while a block is held, and refuses a drop whose block is gone", async () => {
@@ -417,6 +438,91 @@ it("does not ask the server while the browser finds errors, or when a node lacks
   }
 });
 
+describe("server check answers", () => {
+  /** `/vm-checks`의 답을 바꿔 가며 이름을 짓는다. */
+  async function ask(reply: () => Response | Promise<Response>) {
+    world({ features: true });
+    let asked = 0;
+    server.use(
+      http.post(apiUrl("/vm-checks"), () => {
+        asked += 1;
+        return reply();
+      }),
+    );
+    open();
+    await user_type_name();
+    return () => asked;
+  }
+  const passed = () =>
+    HttpResponse.json({ ok: true, node: "n1", ips: [], problems: [] }) as Response;
+
+  it("says the folder refuses on 403, without blocking Create", async () => {
+    await ask(() => HttpResponse.json({ code: "forbidden", message: "no" }, { status: 403 }));
+    expect(
+      await screen.findByText("You may not create VMs in this folder.", {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(create()).toBeEnabled();
+  });
+
+  it("shows a failed check with the reason and checks again on Retry", async () => {
+    let reply: () => Response = () =>
+      HttpResponse.json({ code: "internal", message: "store is down" }, { status: 500 });
+    const asked = await ask(() => reply());
+    expect(
+      await screen.findByText(/Could not check with the server/, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/store is down/)).toBeInTheDocument();
+    expect(create()).toBeEnabled();
+    reply = passed;
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    expect(
+      await screen.findByText("Server check: passed.", { selector: "p" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(asked()).toBe(2);
+  });
+
+  it("tells an old server (no route) from another 404", async () => {
+    let reply = () =>
+      HttpResponse.json(
+        { code: "not_found", message: "no API at POST /api/v1/vm-checks" },
+        { status: 404 },
+      );
+    await ask(() => reply());
+    expect(
+      await screen.findByText(/works after all nodes are upgraded/, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    // 볼 수 없는 폴더의 404는 업그레이드가 아니다: 서버의 까닭을 보인다.
+    reply = () =>
+      HttpResponse.json({ code: "not_found", message: "folder /x not found" }, { status: 404 });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "web2" } });
+    expect(
+      await screen.findByText(/folder \/x not found/, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/Could not check with the server/)).toBeInTheDocument();
+    expect(screen.queryByText(/works after all nodes are upgraded/)).toBeNull();
+  });
+
+  it("does not show a failure for a request cut off by a newer one", async () => {
+    let first = true;
+    const asked = await ask(async () => {
+      if (first) {
+        first = false;
+        // 끊길 때까지 답하지 않는다.
+        await new Promise(() => {});
+      }
+      return passed();
+    });
+    await waitFor(() => expect(asked()).toBe(1), { timeout: 3000 });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "web2" } });
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    expect(screen.queryByText(/Could not check with the server/)).toBeNull();
+    expect(
+      await screen.findByText("Server check: passed.", { selector: "p" }, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Could not check with the server/)).toBeNull();
+  });
+});
+
 it("creates the new volumes, then the zone rule, then the VM", async () => {
   world();
   const order: string[] = [];
@@ -502,6 +608,54 @@ it("says what was already made when the VM cannot be created, and does not make 
   expect(volumes).toBe(1);
 });
 
+it("does not make a created volume again after Undo past the failed create", async () => {
+  world();
+  let volumes = 0;
+  let vms = 0;
+  server.use(
+    http.post(apiUrl("/volumes"), () => {
+      volumes += 1;
+      return HttpResponse.json(task("t-vol", "volume-create", "v1"), { status: 202 });
+    }),
+    http.post(apiUrl("/placement-rules"), async ({ request }) => {
+      const body = (await request.json()) as { name: string };
+      return HttpResponse.json({ ...body, id: "r1" }, { status: 201 });
+    }),
+    http.delete(apiUrl("/placement-rules/:key"), () => new HttpResponse(null, { status: 204 })),
+    http.post(apiUrl("/vms"), () => {
+      vms += 1;
+      return HttpResponse.json(
+        { code: "quota_exceeded", message: "over the quota" },
+        { status: 409 },
+      );
+    }),
+  );
+  const { queryClient } = open();
+  const user = userEvent.setup();
+  await quickVm(user);
+  await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
+  const done = {
+    ...task("t-vol", "volume-create", "v1"),
+    status: { state: "succeeded", error: null },
+  };
+  queryClient.setQueryData<List<Task>>(["list", "task"], { revision: 2, items: [done as Task] });
+  await user.click(create());
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-disk0/);
+  // 되돌리기로 영역을 뺀다 — 디스크는 그 앞의 상태에서도 "있는 볼륨"이다.
+  await user.click(screen.getByRole("button", { name: "Undo" }));
+  expect(within(slot("Placement")).queryByText("Zone b")).toBeNull();
+  // 목록이 새 볼륨을 받는다(watch).
+  const listed = queryClient.getQueryData<List<Volume>>(["list", "volume"])!;
+  queryClient.setQueryData<List<Volume>>(["list", "volume"], {
+    revision: listed.revision + 1,
+    items: [...listed.items, volume("web-disk0", "ceph")],
+  });
+  await user.click(create());
+  await waitFor(() => expect(vms).toBe(2));
+  expect(volumes).toBe(1);
+});
+
 it("reuses the zone rule of a failed create only while it is the same, and deletes a stale one", async () => {
   world({ features: true });
   const checks: { rules?: unknown[] }[] = [];
@@ -544,6 +698,14 @@ it("reuses the zone rule of a failed create only while it is the same, and delet
   await user.click(within(slot("Placement")).getByRole("button", { name: "Inspect" }));
   await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
   await waitFor(() => expect(deleted).toEqual(["r1"]));
+  // 지운 뒤의 확인은 새 규칙(soft)을 "만들 규칙"으로 보낸다.
+  await waitFor(
+    () =>
+      expect(checks.at(-1)?.rules).toEqual([
+        expect.objectContaining({ spec: expect.objectContaining({ kind: "soft-node-affinity" }) }),
+      ]),
+    { timeout: 3000 },
+  );
   vmReply = () => HttpResponse.json(vm("web", "stopped"), { status: 201 });
   await user.click(create());
   expect(await screen.findByText("moved")).toBeInTheDocument();
@@ -576,15 +738,138 @@ it("deletes the zone rule of a failed create when the zone is removed or the VM 
   await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
   await user.click(create());
   expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-zone\./);
-  // 이름을 바꾸면 old 이름의 규칙(web-zone)을 지운다.
+  // 이름을 바꾸면 old 이름의 규칙(web-zone)을 지운다. 지운 것은 "이미 만든 것"에서 빠진다.
   await user.type(screen.getByLabelText("Name"), "2");
   await waitFor(() => expect(deleted).toEqual(["r1"]));
+  expect(screen.getByRole("alert")).toHaveTextContent("over the quota");
+  expect(screen.getByRole("alert")).not.toHaveTextContent("web-zone");
   await user.click(create());
   expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web2-zone\./);
   // 영역을 빼면(자동) 그 규칙도 지운다.
   await user.click(screen.getByRole("button", { name: /^Ways to add Automatic/ }));
   await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
   await waitFor(() => expect(deleted).toEqual(["r1", "r2"]));
+});
+
+it("waits for the old zone rule to go before checking, and deletes it again on Create", async () => {
+  world({ features: true });
+  const checks: { rules?: unknown[] }[] = [];
+  const rules: { name: string }[] = [];
+  let deletes = 0;
+  let deleteOk = false;
+  let vmOk = false;
+  server.use(
+    http.post(apiUrl("/vm-checks"), async ({ request }) => {
+      checks.push((await request.json()) as { rules?: unknown[] });
+      return HttpResponse.json({ ok: true, node: null, ips: [], problems: [] });
+    }),
+    http.post(apiUrl("/placement-rules"), async ({ request }) => {
+      const body = (await request.json()) as { name: string };
+      rules.push(body);
+      return HttpResponse.json({ ...body, id: `r${rules.length}` }, { status: 201 });
+    }),
+    http.delete(apiUrl("/placement-rules/:key"), () => {
+      deletes += 1;
+      return deleteOk
+        ? new HttpResponse(null, { status: 204 })
+        : HttpResponse.json({ code: "internal", message: "store is down" }, { status: 500 });
+    }),
+    http.post(apiUrl("/vms"), () =>
+      vmOk
+        ? HttpResponse.json(vm("web", "stopped"), { status: 201 })
+        : HttpResponse.json({ code: "quota_exceeded", message: "over the quota" }, { status: 409 }),
+    ),
+  );
+  open();
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
+  await user.click(create());
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-zone\./);
+  await waitFor(() => expect(checks.at(-1)?.rules).toEqual([]), { timeout: 3000 });
+  const before = checks.length;
+  // hard → soft: 지난 hard 규칙을 지우지 못했다 — 서버는 아직 그것으로 확인하니 묻지 않고 기다린다.
+  await user.click(within(slot("Placement")).getByRole("button", { name: "Inspect" }));
+  await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "Could not delete the placement rule web-zone left by the last try: The server failed: store is down",
+  );
+  expect(
+    screen.getByText(
+      "The server check waits until the placement rule left by the last try is deleted.",
+    ),
+  ).toBeInTheDocument();
+  await act(() => new Promise((r) => setTimeout(r, CHECK_DELAY_MS * 2)));
+  expect(checks).toHaveLength(before);
+  // 만들기는 먼저 다시 지운다 — 또 못 지우면 멈추고 그 규칙을 알린다(새 규칙·VM을 보내지 않음).
+  await user.click(create());
+  await waitFor(() => expect(deletes).toBeGreaterThanOrEqual(2));
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "Could not delete the placement rule web-zone left by the last try",
+  );
+  expect(rules).toHaveLength(1);
+  // 지우면 새 규칙(soft)으로 만든다.
+  deleteOk = true;
+  vmOk = true;
+  await user.click(create());
+  expect(await screen.findByText("moved")).toBeInTheDocument();
+  expect(rules).toHaveLength(2);
+  expect(rules[1]).toMatchObject({ name: "web-zone", spec: { kind: "soft-node-affinity" } });
+});
+
+it("deletes the rule of a renamed VM again on Create and names it if that fails", async () => {
+  world();
+  const rules: { name: string }[] = [];
+  const deleted: string[] = [];
+  let deleteOk = false;
+  let vms = 0;
+  server.use(
+    http.post(apiUrl("/placement-rules"), async ({ request }) => {
+      const body = (await request.json()) as { name: string };
+      rules.push(body);
+      return HttpResponse.json({ ...body, id: `r${rules.length}` }, { status: 201 });
+    }),
+    http.delete(apiUrl("/placement-rules/:key"), ({ params }) => {
+      if (!deleteOk) {
+        return HttpResponse.json({ code: "internal", message: "store is down" }, { status: 500 });
+      }
+      deleted.push(String(params.key));
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.post(apiUrl("/vms"), () => {
+      vms += 1;
+      return vms === 1
+        ? HttpResponse.json({ code: "quota_exceeded", message: "over the quota" }, { status: 409 })
+        : HttpResponse.json(vm("web2", "stopped"), { status: 201 });
+    }),
+  );
+  open();
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
+  await user.click(create());
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-zone\./);
+  await user.type(screen.getByLabelText("Name"), "2");
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Could not delete the placement rule web-zone left by the last try",
+    ),
+  );
+  // 만들기: web-zone을 다시 지우지 못하면 멈춘다(web2를 만들고 떠나면 web-zone이 말없이 남음).
+  await user.click(create());
+  await waitFor(() => expect(screen.getByRole("button", { name: "Create" })).toBeEnabled());
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "Could not delete the placement rule web-zone left by the last try: The server failed: store is down",
+  );
+  expect(vms).toBe(1);
+  expect(rules).toHaveLength(1);
+  deleteOk = true;
+  await user.click(create());
+  expect(await screen.findByText("moved")).toBeInTheDocument();
+  expect(deleted).toEqual(["r1"]);
+  expect(rules.map((r) => r.name)).toEqual(["web-zone", "web2-zone"]);
 });
 
 it("does not navigate after the VM is created when the user already left", async () => {
@@ -665,6 +950,34 @@ it("deploys from a template with the clone request and keeps its devices fixed",
   await user.click(create());
   expect(await screen.findByText("moved")).toBeInTheDocument();
   expect(sent).toEqual([{ name: "from-tmpl", start: true }]);
+});
+
+it("shows the form-only fields on a chip, and clears them for a template deployment", async () => {
+  world();
+  putDraft({
+    values: { ...emptyForm("q35"), name: "carry", restart: "on-failure", disks: [], nics: [] },
+  });
+  open();
+  expect(
+    await screen.findByText(
+      "Changed in the form: 1 field (restart policy). It is sent as set there.",
+    ),
+  ).toBeInTheDocument();
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("tab", { name: "JSON" }));
+  expect(screen.getByRole("tabpanel")).toHaveTextContent('"restart": "on-failure"');
+  await user.click(screen.getByRole("button", { name: /^Ways to add tmpl/ }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to VM" }));
+  expect(
+    screen.getByText(
+      "Cleared 1 field changed in the form (restart policy): a template deployment cannot carry it. Set it after creating.",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.queryByText(/^Changed in the form/)).toBeNull();
+  expect(screen.getByRole("tabpanel")).not.toHaveTextContent("restart");
+  // 되돌리면 빈 VM과 폼의 값이 돌아온다.
+  await user.click(screen.getByRole("button", { name: "Undo" }));
+  expect(screen.getByText(/^Changed in the form: 1 field/)).toBeInTheDocument();
 });
 
 it("shows the JSON and CLI of the same requests, with the password masked", async () => {

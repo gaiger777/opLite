@@ -645,6 +645,28 @@ describe("drop", () => {
     expect(s.values.cloudInit.userData).toBe(PACKAGES_USER_DATA);
     expect(s.values.guestAgent).toBe(false);
   });
+
+  it("clears the form fields a template deployment cannot carry and remembers which", () => {
+    const v = emptyForm("q35");
+    let s = fromValues({
+      ...v,
+      restart: "on-failure",
+      snapshotSchedule: { every: "daily", keep: "3", memory: false },
+      cpuFlags: ["+aes"],
+    });
+    expect(formOnly(s.values)).toEqual(["cpuFlags", "restart", "snapshotSchedule"]);
+    s = build([[`template:${TEMPLATE.id}`, "vm"]], ctx, s);
+    // CPU 플래그는 배포가 싣는다(템플릿 값에서 시작). 나머지는 비우고 칩이 알린다.
+    expect(s.cleared).toEqual(["restart", "snapshotSchedule"]);
+    expect(s.values.restart).toBe(v.restart);
+    expect(s.values.snapshotSchedule).toEqual(v.snapshotSchedule);
+    expect(formOnly(s.values).filter((k) => k !== "cpuFlags")).toEqual([]);
+    // 다른 템플릿을 놓아도 비운 칸을 잊지 않는다.
+    expect(build([[`template:${TEMPLATE.id}`, "vm"]], ctx, s).cleared).toEqual([
+      "restart",
+      "snapshotSchedule",
+    ]);
+  });
 });
 
 describe("problems", () => {

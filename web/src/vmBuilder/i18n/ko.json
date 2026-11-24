@@ -86,6 +86,10 @@
       "undone": "되돌렸습니다.",
       "created": "이미 만든 것: {{names}}. {{error}}",
       "ruleLeft": "지난 시도가 남긴 배치 규칙 {{name}}을 지우지 못했습니다: {{error}}",
+      "formOnly_one": "폼에서 고친 칸 {{count}}개({{names}}) — 폼에서 정한 대로 보냅니다.",
+      "formOnly_other": "폼에서 고친 칸 {{count}}개({{names}}) — 폼에서 정한 대로 보냅니다.",
+      "formCleared_one": "폼에서 고친 칸 {{count}}개({{names}})를 비웠습니다 — 템플릿 배포가 싣지 못합니다. 만든 뒤 고치세요.",
+      "formCleared_other": "폼에서 고친 칸 {{count}}개({{names}})를 비웠습니다 — 템플릿 배포가 싣지 못합니다. 만든 뒤 고치세요.",
       "side": "확인과 미리 보기",
       "creating": "만드는 중…",
       "blocked": "아직 만들 수 없습니다: {{reason}}",
@@ -212,6 +216,18 @@
       "editInForm": "폼에서 더 고치기",
       "deployDialog": "배포 대화상자에서 더 고치기…"
     },
+    "carried": {
+      "cpuFlags": "CPU 플래그",
+      "maxVcpus": "최대 vCPU",
+      "maxMemory": "최대 메모리",
+      "numa": "NUMA",
+      "firmware": "펌웨어",
+      "restart": "재시작 정책",
+      "snapshotSchedule": "스냅샷 예약",
+      "replication": "원격 복제",
+      "agentFreeze": "게스트 에이전트 얼리기",
+      "agentShutdown": "게스트 에이전트 끄기"
+    },
     "check": {
       "tab": {
         "check": "확인",
@@ -219,6 +235,7 @@
         "cli": "CLI"
       },
       "off": "브라우저가 찾은 오류가 없으면 서버 확인을 합니다.",
+      "held": "지난 시도가 남긴 배치 규칙을 지운 뒤에 서버 확인을 합니다.",
       "checking": "서버에 확인하는 중…",
       "done": "서버 확인을 마쳤습니다.",
       "ok": "서버 확인: 통과.",

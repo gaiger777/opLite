@@ -27,7 +27,7 @@ import { drop } from "@/vmBuilder/model/drop";
 import { parts } from "@/vmBuilder/model/parts";
 import type { Problem } from "@/vmBuilder/model/problems";
 import type { Block, ListKind } from "@/vmBuilder/model/slots";
-import { setName } from "@/vmBuilder/model/state";
+import { formOnly, setName } from "@/vmBuilder/model/state";
 import { isShared } from "@/storage/pools";
 
 /** 칸 하나: 놓을 자리, 제목, 비었을 때 안내, 그 칸의 문제 */
@@ -142,9 +142,21 @@ export function Chassis() {
     b.record(s);
   }
 
+  // 틀 위 칩(설계 §8.6): 빈 VM이면 폼에서 고친 들고 다니는 칸(그대로 보냄), 템플릿 바탕이면 놓을 때 비운 칸
+  const template = b.s.base.kind === "template";
+  const carried = template ? (b.s.cleared ?? []) : formOnly(v);
+
   return (
     <div className="flex min-w-0 flex-col gap-4">
-      <SlotBox id="vm" inspect={b.s.base.kind === "template"}>
+      {carried.length > 0 && (
+        <p className="self-start rounded-full border bg-muted px-3 py-1 text-xs">
+          {t(template ? "vmBuilder.page.formCleared" : "vmBuilder.page.formOnly", {
+            count: carried.length,
+            names: carried.map((k) => t(`vmBuilder.carried.${k}`)).join(", "),
+          })}
+        </p>
+      )}
+      <SlotBox id="vm" inspect={template}>
         <div className="grid gap-3 sm:grid-cols-2">
           <Field
             id="vb-name"

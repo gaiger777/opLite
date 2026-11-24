@@ -86,6 +86,10 @@
       "undone": "Undone.",
       "created": "Already created: {{names}}. {{error}}",
       "ruleLeft": "Could not delete the placement rule {{name}} left by the last try: {{error}}",
+      "formOnly_one": "Changed in the form: {{count}} field ({{names}}). It is sent as set there.",
+      "formOnly_other": "Changed in the form: {{count}} fields ({{names}}). They are sent as set there.",
+      "formCleared_one": "Cleared {{count}} field changed in the form ({{names}}): a template deployment cannot carry it. Set it after creating.",
+      "formCleared_other": "Cleared {{count}} fields changed in the form ({{names}}): a template deployment cannot carry them. Set them after creating.",
       "side": "Check and preview",
       "creating": "Creating…",
       "blocked": "Cannot create yet: {{reason}}",
@@ -212,6 +216,18 @@
       "editInForm": "Edit more in the form",
       "deployDialog": "More deploy options…"
     },
+    "carried": {
+      "cpuFlags": "CPU flags",
+      "maxVcpus": "max vCPUs",
+      "maxMemory": "max memory",
+      "numa": "NUMA",
+      "firmware": "firmware",
+      "restart": "restart policy",
+      "snapshotSchedule": "snapshot schedule",
+      "replication": "remote replication",
+      "agentFreeze": "guest agent freeze",
+      "agentShutdown": "guest agent shutdown"
+    },
     "check": {
       "tab": {
         "check": "Check",
@@ -219,6 +235,7 @@
         "cli": "CLI"
       },
       "off": "The server check runs when the browser finds no errors.",
+      "held": "The server check waits until the placement rule left by the last try is deleted.",
       "checking": "Checking with the server…",
       "done": "Server check done.",
       "ok": "Server check: passed.",
