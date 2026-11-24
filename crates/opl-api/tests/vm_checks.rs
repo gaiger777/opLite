@@ -1,0 +1,469 @@
+//! 계획 71: VM 만들기 미리 확인 `POST /vm-checks` — 만들기와 같은 검사를 만들 볼륨·배치 규칙을 얹어 쓰지 않고 돌린다.
+//! 통과(고를 노드·채운 머신·CPU 모델), 아무것도 만들지 않음, 문제를 자리마다 모음(권한·없는 ISO·할당량), 만들 볼륨(없는
+//! 풀·권한 없는 풀·같은 이름·풀 용량 경고), 만들 규칙(영역 규칙 → 그 영역 노드, 맞는 노드 없음 → `placement`, 권한),
+//! 이름·머신 문제, 폴더 `vm.create` 없음 → 403, 노드 이름을 볼 수 없으면 `node: null`, 기능 `vm-check` → 409, 감사 없음.
+
+mod common;
+
+use std::time::{Duration, Instant};
+
+use common::{Client, Env, WAIT, set_pool_state};
+use opl_types::audit::AuditQuery;
+use opl_types::node::{NodeSpec, PoolState, VM_CHECK};
+use opl_types::placement::PlacementRuleSpec;
+use opl_types::resource::{Resource, ResourceSpec};
+use opl_types::storage::VolumeSpec;
+use opl_types::task::TaskSpec;
+use opl_types::vm::VmSpec;
+use reqwest::StatusCode;
+use serde_json::{Value, json};
+
+const GIB: u64 = 1 << 30;
+
+/// 디스크 없는 VM `name`(켜진 채, 노드 없이)의 확인 본문
+fn check_body(name: &str) -> Value {
+    json!({
+        "name": name,
+        "spec": {
+            "cpu": { "cores": 1 },
+            "memory_mib": 256,
+            "machine": "virt",
+            "power": "running",
+            "nics": [{ "network": "user", "model": "virtio" }],
+        },
+    })
+}
+
+/// 새 디스크 하나(`<name>-disk0`, 풀 `local`, 1 GiB)를 만들어 붙이는 확인 본문
+fn with_new_disk(name: &str, pool: &str) -> Value {
+    let mut body = check_body(name);
+    let volume = format!("{name}-disk0");
+    body["spec"]["disks"] = json!([{ "volume": volume, "bus": "virtio-blk" }]);
+    body["volumes"] = json!([{ "name": volume,
+        "spec": { "pool": pool, "size_bytes": GIB, "format": "qcow2" } }]);
+    body
+}
+
+async fn local_pool(env: &Env, admin: &Client, name: &str, folder: Option<&str>) {
+    let dir = env.dir.path().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (status, body) = admin
+        .post(
+            "/storage-pools",
+            json!({ "name": name, "spec": { "backend": { "kind": "dir", "path": dir }, "folder": folder } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    env.pool_ready(name).await;
+}
+
+async fn folder(admin: &Client, name: &str, kind: &str, quota: Value) -> String {
+    let (status, body) = admin
+        .post(
+            "/folders",
+            json!({ "name": name, "kind": kind, "quota": quota }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    body["id"].as_str().unwrap().to_string()
+}
+
+/// 전역 역할 `none`인 사용자 `name`에게 폴더마다 operator를 주고 로그인한다.
+async fn folder_user(env: &Env, admin: &Client, name: &str, folders: &[&str]) -> Client {
+    let (status, body) = admin
+        .post(
+            "/users",
+            json!({ "name": name, "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let user = body["id"].as_str().unwrap().to_string();
+    for f in folders {
+        let (status, body) = admin
+            .post(
+                "/grants",
+                json!({
+                    "principal": { "type": "user", "id": user },
+                    "role": { "type": "builtin", "role": "operator" },
+                    "target": { "type": "folder", "id": f },
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+    }
+    env.login(name, "password-1").await
+}
+
+/// 확인을 보내 200과 답을 받는다.
+async fn check(client: &Client, body: Value) -> Value {
+    let (status, answer) = client.post("/vm-checks", body).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    answer
+}
+
+/// 답의 문제를 (자리, 코드, 무게)로
+fn problems(answer: &Value) -> Vec<(String, String, String)> {
+    answer["problems"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{answer}"))
+        .iter()
+        .map(|p| {
+            (
+                p["at"].as_str().unwrap().to_string(),
+                p["code"].as_str().unwrap().to_string(),
+                p["level"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn problem(at: &str, code: &str, level: &str) -> (String, String, String) {
+    (at.into(), code.into(), level.into())
+}
+
+fn count<S: ResourceSpec>(env: &Env) -> usize {
+    env.cluster.list::<S>().unwrap().1.len()
+}
+
+/// VM·볼륨·배치 규칙·Task 수
+fn counts(env: &Env) -> [usize; 4] {
+    [
+        count::<VmSpec>(env),
+        count::<VolumeSpec>(env),
+        count::<PlacementRuleSpec>(env),
+        count::<TaskSpec>(env),
+    ]
+}
+
+#[tokio::test]
+async fn a_passing_check_names_the_node_and_creates_nothing() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    local_pool(&env, &admin, "local", None).await;
+    let before = counts(&env);
+    let mut body = with_new_disk("web", "local");
+    body["spec"].as_object_mut().unwrap().remove("machine");
+    let answer = check(&admin, body.clone()).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["problems"], json!([]));
+    assert_eq!(answer["node"], "node1");
+    assert_eq!(answer["machine"], "virt");
+    assert!(answer["cpu_model"].is_string(), "{answer}");
+    assert_eq!(answer["ips"], json!([[]]));
+    // 미리 확인은 아무것도 만들지 않는다(볼륨·VM·Task 그대로) — 그리고 같은 요청으로 정말 만들 수 있다.
+    assert_eq!(counts(&env), before);
+    let (status, task) = admin.post("/volumes", body["volumes"][0].clone()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+    let (status, created) = admin
+        .post("/vms", json!({ "name": "web", "spec": body["spec"] }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["spec"]["node"], env.node.to_string(), "{created}");
+
+    // 꺼진 채 노드 없이 만들면 고를 노드가 없다.
+    let mut off = check_body("off");
+    off["spec"]["power"] = json!("stopped");
+    let answer = check(&admin, off).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["node"], Value::Null);
+}
+
+#[tokio::test]
+async fn independent_problems_are_collected_with_their_slots() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let team = folder(&admin, "team", "vm", json!({ "memory_mib": 128 })).await;
+    let net = folder(&admin, "net", "network", json!(null)).await;
+    let (status, body) = admin
+        .post(
+            "/networks",
+            json!({ "name": "lan-net", "spec": { "bridge": "vmbr0", "folder": net } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let alice = folder_user(&env, &admin, "alice", &[&team]).await;
+    let mut body = check_body("web");
+    body["spec"]["folder"] = json!(team);
+    body["spec"]["nics"] = json!([
+        { "network": "user", "model": "virtio" },
+        { "network": "lan-net", "model": "virtio" }]);
+    body["spec"]["cdroms"] = json!([{ "iso": "nope.iso" }]);
+    let answer = check(&alice, body).await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    let found = problems(&answer);
+    // 권한 없는 네트워크(읽을 수도 없으면 404), 할당량 넘음, 없는 ISO(만들기 검사의 첫 오류)가 한 답에 셋
+    assert_eq!(found.len(), 3, "{answer}");
+    assert_eq!(found[0].0, "nics.1", "{answer}");
+    assert!(
+        ["forbidden", "not_found"].contains(&found[0].1.as_str()),
+        "{answer}"
+    );
+    assert_eq!(found[1], problem("quota", "quota_exceeded", "error"));
+    assert_eq!(found[2], problem("cdroms.0", "invalid_request", "error"));
+    assert_eq!(answer["node"], Value::Null);
+    assert_eq!(answer["machine"], Value::Null);
+}
+
+#[tokio::test]
+async fn names_and_machines_are_checked_too() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (status, body) = admin.post("/vms", check_body("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let answer = check(&admin, check_body("web")).await;
+    assert_eq!(problems(&answer), [problem("name", "name_taken", "error")]);
+    let answer = check(&admin, check_body("Bad_Name!")).await;
+    assert_eq!(problems(&answer)[0].0, "name", "{answer}");
+    assert_eq!(answer["ok"], false);
+
+    // 아키텍처가 섞인 클러스터에서 머신을 빼면 고를 수 없다(계산 칸).
+    let mut other: opl_types::node::Node = Resource::new(
+        "x86",
+        serde_json::from_value(json!({ "address": "127.0.0.2:0" })).unwrap(),
+    );
+    other.status.arch = Some(opl_types::vm::Arch::X86_64);
+    other.status.features = opl_types::node::FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .collect();
+    env.cluster.create(&other).await.unwrap();
+    env.cluster
+        .update_status::<NodeSpec>(other.id, &other.status)
+        .await
+        .unwrap();
+    let mut body = check_body("db");
+    body["spec"].as_object_mut().unwrap().remove("machine");
+    let answer = check(&admin, body).await;
+    assert_eq!(
+        problems(&answer),
+        [problem("compute", "invalid_request", "error")]
+    );
+    assert_eq!(answer["ok"], false);
+}
+
+#[tokio::test]
+async fn planned_volumes_are_checked_like_volume_creates() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    local_pool(&env, &admin, "local", None).await;
+    let team = folder(&admin, "team", "vm", json!(null)).await;
+    let alice = folder_user(&env, &admin, "alice", &[&team]).await;
+
+    // 없는 풀: 그 볼륨을 가리키는 디스크 칸. 디스크 자체는 만들 볼륨으로 보아 만들기 검사를 지난다.
+    let answer = check(&admin, with_new_disk("web", "nope")).await;
+    assert_eq!(
+        problems(&answer),
+        [problem("disks.0", "invalid_request", "error")]
+    );
+    assert_eq!(answer["node"], "node1", "{answer}");
+
+    // 이 풀에 할당할 권한이 없는 폴더 사용자(루트 풀)
+    let mut body = with_new_disk("web", "local");
+    body["spec"]["folder"] = json!(team);
+    let answer = check(&alice, body).await;
+    let found = problems(&answer);
+    assert_eq!(found.len(), 1, "{answer}");
+    assert_eq!(found[0].0, "disks.0");
+    assert!(
+        ["forbidden", "not_found"].contains(&found[0].1.as_str()),
+        "{answer}"
+    );
+
+    // 같은 이름 볼륨이 이미 있음
+    let (status, task) = admin
+        .post(
+            "/volumes",
+            json!({ "name": "web-disk0", "spec": { "pool": "local", "size_bytes": GIB, "format": "qcow2" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let answer = check(&admin, with_new_disk("web", "local")).await;
+    assert!(
+        problems(&answer).contains(&problem("disks.0", "name_taken", "error")),
+        "{answer}"
+    );
+
+    // 풀 남은 용량이 새 디스크보다 적으면 경고(만들기는 받는다)
+    set_pool_state(
+        &env.cluster,
+        env.node,
+        "local",
+        PoolState {
+            ready: true,
+            total_bytes: 10 * GIB,
+            available_bytes: GIB / 2,
+            ..Default::default()
+        },
+    )
+    .await;
+    let answer = check(&admin, with_new_disk("db", "local")).await;
+    assert_eq!(
+        problems(&answer),
+        [problem("disks.0", "pool_space", "warn")]
+    );
+    assert_eq!(answer["ok"], true, "{answer}");
+}
+
+#[tokio::test]
+async fn planned_zone_rules_steer_the_node() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut node = env.cluster.get::<NodeSpec>(env.node).unwrap().unwrap();
+    node.labels.insert("zone".into(), "a".into());
+    env.cluster
+        .update_spec(env.node, None, node.labels.clone(), &node.spec)
+        .await
+        .unwrap();
+    let zone = |value: &str| {
+        let mut body = check_body("web");
+        body["rules"] = json!([{ "name": "web-zone",
+            "spec": { "kind": "node-affinity", "vms": ["web"], "node_tag": format!("zone={value}") } }]);
+        body
+    };
+    let answer = check(&admin, zone("a")).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["node"], "node1");
+    // 영역에 노드가 없으면 만들 규칙 때문에 놓을 곳이 없다(배치 칸).
+    // 규칙 만들기가 422 `rule_conflict`(맞는 노드가 없는 규칙)로 거절하고, 만들기 검사도 놓을 노드가 없다.
+    let answer = check(&admin, zone("b")).await;
+    assert_eq!(answer["ok"], false, "{answer}");
+    assert_eq!(
+        problems(&answer),
+        [
+            problem("placement", "rule_conflict", "error"),
+            problem("placement", "placement_rule", "error")
+        ]
+    );
+    assert_eq!(count::<PlacementRuleSpec>(&env), 0);
+
+    // 규칙을 쓸 권한(admin)이 없으면 배치 칸
+    let team = folder(&admin, "team", "vm", json!(null)).await;
+    let alice = folder_user(&env, &admin, "alice", &[&team]).await;
+    let mut body = zone("a");
+    body["spec"]["folder"] = json!(team);
+    let answer = check(&alice, body).await;
+    assert_eq!(
+        problems(&answer)[0],
+        problem("placement", "forbidden", "error")
+    );
+    // 노드 이름을 볼 수 없는 폴더 사용자에게는 고를 노드를 알리지 않는다.
+    let mut body = check_body("web");
+    body["spec"]["folder"] = json!(team);
+    let answer = check(&alice, body).await;
+    assert_eq!(answer["ok"], true, "{answer}");
+    assert_eq!(answer["node"], Value::Null);
+    assert_eq!(answer["machine"], "virt");
+}
+
+#[tokio::test]
+async fn a_folder_without_vm_create_is_refused() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mine = folder(&admin, "mine", "vm", json!(null)).await;
+    let theirs = folder(&admin, "theirs", "vm", json!(null)).await;
+    let alice = folder_user(&env, &admin, "alice", &[&mine]).await;
+    let mut body = check_body("web");
+    body["spec"]["folder"] = json!(theirs);
+    let (status, answer) = alice.post("/vm-checks", body).await;
+    assert!(
+        [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND].contains(&status),
+        "{status} {answer}"
+    );
+    // 폴더를 주지 않으면 루트에 만들 권한이 없어 400 `folder_required`(만들기와 같다)
+    let (status, answer) = alice.post("/vm-checks", check_body("web")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["code"], "folder_required");
+    // 풀 수 없는 본문은 400
+    let (status, answer) = admin
+        .post(
+            "/vm-checks",
+            json!({ "name": "web", "spec": {}, "extra": 1 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    let (status, _) = env.anonymous().post("/vm-checks", check_body("web")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn old_nodes_make_the_check_wait_for_the_upgrade() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mut status = env
+        .cluster
+        .get::<NodeSpec>(env.node)
+        .unwrap()
+        .unwrap()
+        .status;
+    status.features.retain(|f| f != VM_CHECK);
+    env.cluster
+        .update_status::<NodeSpec>(env.node, &status)
+        .await
+        .unwrap();
+    let (code, body) = admin.post("/vm-checks", check_body("web")).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "cluster_upgrading");
+    // 만들기는 그대로 된다.
+    let (code, body) = admin.post("/vms", check_body("web")).await;
+    assert_eq!(code, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn checks_are_not_audited() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    check(&admin, check_body("web")).await;
+    let (status, body) = admin.post("/vms", check_body("web")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // 쓰기 스레드가 만들기를 적을 때까지 기다린 뒤 미리 확인이 없는지 본다(확인이 먼저 왔다).
+    let start = Instant::now();
+    let entries = loop {
+        let entries = env
+            .state
+            .audit
+            .read(AuditQuery {
+                since: 0,
+                until: u64::MAX,
+                user: None,
+                action: None,
+                limit: 1000,
+            })
+            .await
+            .unwrap();
+        if entries.iter().any(|e| e.action == "POST /vms") {
+            break entries;
+        }
+        assert!(start.elapsed() < WAIT, "{entries:#?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        entries.iter().all(|e| e.action != "POST /vm-checks"),
+        "{entries:#?}"
+    );
+}
+
+#[tokio::test]
+async fn the_check_is_in_the_api_document() {
+    let env = Env::start().await;
+    let (status, doc) = env.anonymous().get("/openapi.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let post = &doc["paths"]["/vm-checks"]["post"];
+    assert_eq!(
+        post["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/VmCheckRequest"
+    );
+    assert_eq!(
+        post["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/VmCheck"
+    );
+    let schemas = &doc["components"]["schemas"];
+    for name in [
+        "VmCheck",
+        "VmCheckProblem",
+        "VmCheckLevel",
+        "VmCheckRequest",
+    ] {
+        assert!(schemas[name].is_object(), "{name}");
+    }
+}

@@ -87,13 +87,41 @@ fn disk_bytes(spec: &VmSpec, sizes: &HashMap<String, u64>) -> u64 {
 
 /// VM 스펙 하나의 사용량(디스크는 지금 있는 볼륨의 크기)
 pub(crate) fn vm_usage(cluster: &Cluster, spec: &VmSpec) -> Result<FolderUsage, ApiError> {
+    vm_usage_with(cluster, spec, &BTreeMap::new())
+}
+
+/// [`vm_usage`]에 아직 없는 볼륨(이름 → 만들 크기 — 계획 71 미리 확인의 만들 볼륨)을 더한다.
+fn vm_usage_with(
+    cluster: &Cluster,
+    spec: &VmSpec,
+    planned: &BTreeMap<String, u64>,
+) -> Result<FolderUsage, ApiError> {
     let mut bytes = 0u64;
     for d in &spec.disks {
-        if let Some(v) = cluster.get_by_name::<VolumeSpec>(&d.volume)? {
-            bytes = bytes.saturating_add(v.spec.size_bytes);
-        }
+        let size = match cluster.get_by_name::<VolumeSpec>(&d.volume)? {
+            Some(v) => v.spec.size_bytes,
+            None => planned.get(&d.volume).copied().unwrap_or(0),
+        };
+        bytes = bytes.saturating_add(size);
     }
     Ok(FolderUsage::of_vm(spec, bytes))
+}
+
+/// 새 VM의 사전 확인([`precheck_vm`])에 만들 볼륨(이름 → 크기)의 크기를 디스크로 더한다(계획 71 미리 확인).
+pub(crate) fn precheck_new_vm(
+    cluster: &Cluster,
+    spec: &VmSpec,
+    planned: &BTreeMap<String, u64>,
+) -> Result<(), ApiError> {
+    precheck(
+        cluster,
+        Change::Vm {
+            replaces: None,
+            folder: spec.folder,
+            usage: vm_usage_with(cluster, spec, planned)?,
+            count: 1,
+        },
+    )
 }
 
 /// VM 쓰기(`current`는 바꾸기 전 VM의 id와 스펙, 만들기는 None)의 사전 확인. 늘리지 않고 폴더도 그대로인 바꾸기는

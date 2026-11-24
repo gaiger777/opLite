@@ -3373,6 +3373,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vm-checks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 만들기를 미리 확인한다: 만들기와 같은 검사(이름, 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨(`POST /volumes`의 검사와 풀
+         *     남은 용량 경고), 만들 배치 규칙(`POST /placement-rules`의 검사), 폴더 할당량, 그리고 만들 것을 얹은 `prepare`)를 쓰지
+         *     않고 돌려 문제를 자리마다 모은다. 문제가 있어도 200이다. 대상 폴더에 `vm.create`가 없으면 403(그 밖을 알려 주지
+         *     않음), 기능 `vm-check`를 모르는 노드가 있으면 409 `cluster_upgrading`, 본문을 풀 수 없으면 400.
+         */
+        post: operations["check_vm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vm-imports": {
         parameters: {
             query?: never;
@@ -14712,6 +14734,52 @@ export interface components {
          * @enum {string}
          */
         VmAlertMetric: "cpu" | "mem_rss" | "disk_read" | "disk_write" | "disk_read_iops" | "disk_write_iops" | "net_rx" | "net_tx";
+        /** @description 미리 확인의 답. 문제가 있어도 200이다(문제 목록이 답). */
+        VmCheck: {
+            /** @description 별칭을 버전 모델로 고정한 CPU 모델(통과했을 때만) */
+            cpu_model?: string | null;
+            /** @description NIC마다 받을 SDN 주소(예상 — 잡아 두지 않는다). 통과하지 못했으면 빈 목록 */
+            ips: string[][];
+            machine?: components["schemas"]["MachineType"] | null;
+            /**
+             * @description 켜진 채 노드 없이 만들면 스케줄러가 고를 노드(노드를 준 요청은 그 노드). 통과하지 못했거나 꺼진 채 노드 없이
+             *     만들거나 노드 이름을 볼 수 없으면(루트 `cluster.read` 없음) null
+             */
+            node?: string | null;
+            /** @description `problems`에 오류(`error`)가 없다 */
+            ok: boolean;
+            problems: components["schemas"]["VmCheckProblem"][];
+        };
+        /**
+         * @description 문제의 무게
+         * @enum {string}
+         */
+        VmCheckLevel: "error" | "warn";
+        /** @description 미리 확인이 찾은 문제 하나 */
+        VmCheckProblem: {
+            /**
+             * @description 자리: `name`, `compute`, `disks`·`disks.N`, `cdroms.N`, `nics`·`nics.N`, `cloudInit`, `placement`, `protection`,
+             *     `replication`, `quota`, `spec`(그 밖)
+             */
+            at: string;
+            /** @description 만들기가 낼 오류의 `code`(예: `forbidden`, `quota_exceeded`, `no_node`), 경고는 `pool_space` */
+            code: string;
+            level: components["schemas"]["VmCheckLevel"];
+            message: string;
+        };
+        /** @description 미리 확인할 VM 만들기와 그 앞에 만들 것 */
+        VmCheckRequest: {
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description VM보다 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 장애 영역 규칙) */
+            rules?: components["schemas"]["CreateRequest_PlacementRuleSpec"][];
+            /** @description `POST /vms`의 spec과 같다(`machine`을 빼면 채운다). */
+            spec: components["schemas"]["VmSpec"];
+            /** @description VM보다 먼저 만들 볼륨(`POST /volumes`의 본문). 디스크가 이름으로 가리키면 준비된 볼륨으로 본다. */
+            volumes?: components["schemas"]["CreateRequest_VolumeSpec"][];
+        };
         VmCounts: {
             /**
              * Format: int64
@@ -22813,6 +22881,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["VersionInfo"];
+                };
+            };
+        };
+    };
+    check_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VmCheckRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VmCheck"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
         };

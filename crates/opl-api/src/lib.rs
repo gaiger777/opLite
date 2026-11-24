@@ -84,6 +84,7 @@ pub mod two_factor;
 mod updates;
 pub mod users;
 pub mod vip;
+mod vm_checks;
 mod vm_firmware;
 pub mod vm_imports;
 mod vms;
@@ -362,6 +363,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(r::list_tasks))
         .routes(routes!(r::get_task))
         .routes(routes!(r::list_vms, vms::create_vm))
+        .routes(routes!(vm_checks::check_vm))
         .routes(routes!(r::get_vm, vms::update_vm, vms::delete_vm))
         .routes(routes!(vms::vm_action))
         .routes(routes!(vms::migrate_vm))

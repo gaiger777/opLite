@@ -205,15 +205,14 @@ fn check_iso(
     Ok(ImageFormat::Raw)
 }
 
-/// 볼륨 리소스를 만들고, 파일을 만들 Task를 돌려준다(202). Task가 실패하면 리소스도 지운다.
-#[utoipa::path(post, path = "/volumes", tag = "storage",
-    request_body = CreateRequest<VolumeSpec>,
-    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
-pub async fn create_volume(
-    State(state): State<Arc<AppState>>,
-    principal: Principal,
-    Json(req): Json<CreateRequest<VolumeSpec>>,
-) -> Result<(StatusCode, Json<Task>), ApiError> {
+/// 빈 디스크 볼륨 만들기(`POST /volumes`)의 검사: 이름, 디스크 내용, 크기, `base` 없음, 풀이 있음(400)·`storage.allocate`,
+/// 풀이 담는 형식, 파일을 만들 노드(409 `pool_unavailable`). 풀과 그 노드를 돌려준다. VM 미리 확인(계획 71)의 만들
+/// 볼륨도 이것으로 본다.
+pub(crate) fn check_new_volume(
+    state: &AppState,
+    principal: &Principal,
+    req: &CreateRequest<VolumeSpec>,
+) -> Result<(StoragePool, Uuid), ApiError> {
     check_volume_name(&req.name)?;
     if !req.spec.content.is_disk() {
         return Err(ApiError::bad_request(
@@ -230,12 +229,25 @@ pub async fn create_volume(
             "base is set only by deploying from a template",
         ));
     }
-    let pool = find_pool(&state, &req.spec.pool)?;
+    let pool = find_pool(state, &req.spec.pool)?;
     state
         .authz
-        .require(&principal, Privilege::StorageAllocate, &pool)?;
+        .require(principal, Privilege::StorageAllocate, &pool)?;
     check_pool_format(&pool, req.spec.format)?;
-    let node = pool_node(&state, &pool)?;
+    let node = pool_node(state, &pool)?;
+    Ok((pool, node))
+}
+
+/// 볼륨 리소스를 만들고, 파일을 만들 Task를 돌려준다(202). Task가 실패하면 리소스도 지운다.
+#[utoipa::path(post, path = "/volumes", tag = "storage",
+    request_body = CreateRequest<VolumeSpec>,
+    responses((status = 202, body = Resource<TaskSpec, TaskStatus>), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn create_volume(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    Json(req): Json<CreateRequest<VolumeSpec>>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    let (_, node) = check_new_volume(&state, &principal, &req)?;
     let mut volume: Volume = Resource::new(req.name, req.spec);
     volume.labels = req.labels;
     volume.status.node = Some(node);

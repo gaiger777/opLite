@@ -938,7 +938,8 @@ pub(crate) mod tests {
                 "sdn-routing",
                 "sdn-services",
                 "backup-store",
-                "file-restore"
+                "file-restore",
+                "vm-check"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -986,7 +987,8 @@ pub(crate) mod tests {
                 "sdn-routing",
                 "sdn-services",
                 "backup-store",
-                "file-restore"
+                "file-restore",
+                "vm-check"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1053,7 +1055,8 @@ pub(crate) mod tests {
                 "sdn-routing",
                 "sdn-services",
                 "backup-store",
-                "file-restore"
+                "file-restore",
+                "vm-check"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1295,6 +1298,7 @@ pub(crate) mod tests {
                     "sdn-services".into(),
                     "backup-store".into(),
                     "file-restore".into(),
+                    "vm-check".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

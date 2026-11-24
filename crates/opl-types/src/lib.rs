@@ -53,4 +53,5 @@ pub mod two_factor;
 pub mod version;
 pub mod vip;
 pub mod vm;
+pub mod vm_check;
 pub mod vm_import;

@@ -332,6 +332,8 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("GET", "/vms", List),
     // 대상 폴더 `vm.create`, NIC마다 `network.assign`, 디스크 볼륨마다 `storage.allocate`
     ("POST", "/vms", Handler),
+    // 만들기 미리 확인(계획 71): 대상 폴더 `vm.create`(403), 나머지는 문제 목록으로
+    ("POST", "/vm-checks", Handler),
     ("GET", "/vms/{key}", Read(Vm)),
     // 새로 붙이는 네트워크·볼륨은 핸들러가 더 본다.
     ("PUT", "/vms/{key}", Object(Vm, VmConfig)),

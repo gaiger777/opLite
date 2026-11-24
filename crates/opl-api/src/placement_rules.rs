@@ -18,7 +18,7 @@ use crate::state::AppState;
 
 /// 형식(400), 규칙의 노드가 모두 있는지(400), 모든 노드가 새 종류를 아는지(409 `cluster_upgrading`),
 /// 이 규칙이 다른 켜진 hard 규칙과 모순인지(422 `rule_conflict`, `details.rules`)
-fn check(state: &AppState, rule: &PlacementRule) -> Result<(), ApiError> {
+pub(crate) fn check(state: &AppState, rule: &PlacementRule) -> Result<(), ApiError> {
     rule.spec
         .validate()
         .map_err(|e| ApiError::bad_request(e.to_string()))?;

@@ -402,4 +402,15 @@ VmCheckRequest {                     // deny_unknown_fields
 
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
 
-(구현하면서 스테이지마다 채움)
+### 스테이지 1
+
+- **요청 타입 자리**: `VmCheckRequest`는 `opl-types`가 아니라 `crates/opl-api/src/vm_checks.rs`에 둔다 — `volumes`·`rules`가 쓰는 `CreateRequest<S>`가 opl-api 타입이다(OpenAPI 이름 `CreateRequest_VolumeSpec`·`CreateRequest_PlacementRuleSpec`, `spec`은 `VmSpec` 스키마). 응답 `VmCheck`·`VmCheckProblem`·`VmCheckLevel`은 `opl-types/src/vm_check.rs`.
+- **문제에 `level`(`error`·`warn`)을 더함**: §9.1 표에는 없지만 §9.2의 풀 용량 경고와 `ok`(오류 없음)의 정의에 필요하다. 경고 코드는 `pool_space`(만들 볼륨의 노드가 알린 풀 상태가 `total_bytes > 0`이고 `available_bytes < size_bytes`).
+- **`node`·`machine`·`cpu_model`은 null일 수 있음**: `prepare`를 지나지 못했으면(또는 머신을 채우지 못했으면) null, `ips`는 빈 목록. `prepare`를 지나면 앞 단계 문제(권한·할당량 등)가 있어도 채운다. `node`는 켜진 채 노드 없이 만들 때 스케줄러가 고른 노드나 준 노드의 이름이고, 루트 `cluster.read`가 없으면 null.
+- **자리 정하기**: `area_of(code)` 표에 더해 `slot_of` — 문구가 따옴표 이름(`{:?}`)으로 가리키는 NIC 네트워크·디스크 볼륨·CD ISO가 있으면 `nics.N`·`disks.N`·`cdroms.N`이다. `prepare`의 많은 400이 `invalid_request` 한 코드라서(예: 없는 ISO `volume "x.iso" not found` → `cdroms.0`, `network "x" not found` → `nics.N`). 자리가 정해진 코드(`no_node` 등)는 그대로.
+- **감사**: 미들웨어가 `/vm-checks`를 GET처럼 그냥 넘기면 요청 자리가 없어 `audit::principal()`이 None이 되고, IPAM이 주체 없음을 관리자처럼 본다(공급자 네트워크 주소 검사를 건너뜀 — 만들기와 갈라짐). 그래서 자리(주체)는 그대로 두고 **기록만 하지 않는다**(`QUIET_CHECK`).
+- **`check_attachments`**를 항목마다 자리를 붙여 모두 모으는 `attachment_problems` 위로 다시 썼다(만들기는 그 첫 거절). 여러 볼륨이 함께 거절될 때 알리는 것이 이름 순 첫 것에서 디스크 순 첫 것으로 바뀐다(상태·코드는 같음).
+- **머신을 채울 수 없음**(아키텍처 섞임 400): spec을 `VmSpec`으로 풀 수 없으므로 spec의 `folder`만 읽어 권한(403)을 본 뒤 `compute` 문제 하나로 답한다. 그 밖에 spec을 풀 수 없으면 400.
+- **만들 규칙**: 권한(`placement-rule` 쓰기) → 이름 → 같은 이름 규칙(`name_taken`) → `placement_rules::check`(형식·노드·모순) 차례로 `placement`. 맞는 노드가 없는 영역 규칙은 규칙 만들기가 422 `rule_conflict`로 거절하므로 `rule_conflict`와 `prepare`의 `placement_rule`이 함께 `placement`에 나온다.
+- **만들 볼륨**: 같은 이름 볼륨(또는 만들 볼륨끼리 같은 이름) → `name_taken`. 검사를 지나지 못한 볼륨도 풀이 있으면 그 노드에 둔 준비된 볼륨으로 얹는다(스케줄러가 "풀에 닿는 노드 없음"을 덧붙이지 않게). 할당량에는 만들 볼륨 크기를 디스크로 더한다(`quota::precheck_new_vm`).
+- **CLI** `vm create --dry-run`: 경고는 `MESSAGE` 앞에 `warning: `, 오류가 있으면 표 뒤 `error: the check found N problem(s); the VM would not be created`(끝 코드 1), `--start`와 함께 쓸 수 없다. `-o json`은 답 그대로.

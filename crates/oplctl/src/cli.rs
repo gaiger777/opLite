@@ -1917,6 +1917,48 @@ struct VmCreate {
     replicate: Vec<ReplicateArg>,
     #[command(flatten)]
     cloud_init: CloudInitArgs,
+    /// 만들지 않고 서버가 만들기와 같은 검사를 돌린다(`POST /vm-checks`): 문제를 `AT  CODE  MESSAGE` 표로 찍고(통과면 고를
+    /// 노드·CPU 모델·머신), 오류가 있으면 끝 코드 1이다.
+    #[arg(long, conflicts_with = "start")]
+    dry_run: bool,
+}
+
+/// `vm create --dry-run`의 답(`POST /vm-checks`)을 찍는다. 오류(`error`)가 있으면 `Err`(끝 코드 1).
+fn print_vm_check(out: &mut dyn Write, check: &Value, json_out: bool) -> anyhow::Result<()> {
+    let problems = check["problems"].as_array().cloned().unwrap_or_default();
+    if json_out {
+        print_json(out, check)?;
+    } else {
+        if !problems.is_empty() {
+            let rows: Vec<Vec<String>> = problems
+                .iter()
+                .map(|p| {
+                    let message = cell(&p["message"]);
+                    let message = if p["level"] == "warn" {
+                        format!("warning: {message}")
+                    } else {
+                        message
+                    };
+                    vec![cell(&p["at"]), cell(&p["code"]), message]
+                })
+                .collect();
+            table(out, &["AT", "CODE", "MESSAGE"], &rows)?;
+        }
+        if check["ok"] == true {
+            writeln!(
+                out,
+                "ok: node {}, cpu {}, machine {}",
+                cell(&check["node"]),
+                cell(&check["cpu_model"]),
+                cell(&check["machine"])
+            )?;
+        }
+    }
+    if check["ok"] != true {
+        let errors = problems.iter().filter(|p| p["level"] != "warn").count();
+        anyhow::bail!("the check found {errors} problem(s); the VM would not be created");
+    }
+    Ok(())
 }
 
 /// `--nic`으로 받은 네트워크와 보안 그룹, SDN 주소
@@ -8544,6 +8586,10 @@ async fn vm(
                 apply_preset(&mut body["spec"], preset);
             }
             firmware_update(&mut body["spec"], &args.fw, false)?;
+            if args.dry_run {
+                let check = client.post("/vm-checks", &body).await?;
+                return print_vm_check(out, &check, json_out);
+            }
             let r = client.request(Method::POST, "/vms").json(&body);
             let (headers, _) = client.send_with_headers(r).await?;
             writeln!(out, "vm {} created", args.name)?;
@@ -19657,6 +19703,87 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "labels": { "zone": "rack-b", "tier": "gold" },
                 "spec": { "address": "10.0.0.1:7443", "maintenance": false, "witness": false }
             })
+        );
+    }
+
+    /// `vm create --dry-run`(계획 71)은 만들기와 같은 본문을 `/vm-checks`로만 보내고(VM을 만들지 않음) 문제를 표로, 통과면
+    /// 고를 노드를 찍으며, 오류가 있으면 실패(끝 코드 1)다. `-o json`은 답 그대로다.
+    #[tokio::test]
+    async fn vm_create_dry_run_checks_without_creating() {
+        let passed = json!({ "ok": true, "node": "n3", "machine": "virt", "cpu_model": "host",
+            "ips": [[]], "problems": [{ "at": "disks.0", "code": "pool_space",
+            "message": "storage pool \"local\" is nearly full", "level": "warn" }] });
+        let failed = json!({ "ok": false, "node": null, "machine": null, "cpu_model": null, "ips": [],
+            "problems": [
+                { "at": "nics.0", "code": "forbidden", "message": "permission denied", "level": "error" },
+                { "at": "quota", "code": "quota_exceeded", "message": "folder /team would use 3 of 2 VMs", "level": "error" }] });
+        let run = |answer: Value, json_out: bool| async move {
+            let (client, seen) =
+                crate::fake_api::fake_api(move |method, path| match (method, path) {
+                    ("POST", "/api/v1/vm-checks") => (200, answer.clone()),
+                    _ => (500, json!({ "code": "internal", "message": "unexpected" })),
+                })
+                .await;
+            let cli = Cli::try_parse_from([
+                "oplctl",
+                "vm",
+                "create",
+                "web",
+                "--machine",
+                "virt",
+                "--disk",
+                "web-disk0",
+                "--nic",
+                "lan",
+                "--dry-run",
+            ])
+            .unwrap();
+            let Cmd::Vm { cmd } = cli.cmd else {
+                panic!("not a vm command");
+            };
+            let mut out = Vec::new();
+            let result = vm(&client, cmd, json_out, &mut out).await;
+            let seen = seen.lock().unwrap().clone();
+            (result, String::from_utf8(out).unwrap(), seen)
+        };
+
+        let (result, text, seen) = run(passed.clone(), false).await;
+        result.unwrap();
+        assert_eq!(
+            seen.iter().map(|s| s.line.as_str()).collect::<Vec<_>>(),
+            ["POST /api/v1/vm-checks HTTP/1.1"]
+        );
+        assert_eq!(seen[0].body["name"], "web");
+        assert_eq!(seen[0].body["spec"]["machine"], "virt");
+        assert_eq!(seen[0].body["spec"]["disks"][0]["volume"], "web-disk0");
+        assert_eq!(seen[0].body["spec"]["nics"][0]["network"], "lan");
+        assert_eq!(
+            text,
+            "AT       CODE        MESSAGE\n\
+             disks.0  pool_space  warning: storage pool \"local\" is nearly full\n\
+             ok: node n3, cpu host, machine virt\n"
+        );
+
+        let (result, text, _) = run(failed.clone(), false).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("2 problem"), "{err}");
+        assert!(
+            text.contains("nics.0  forbidden       permission denied"),
+            "{text}"
+        );
+        assert!(
+            text.contains("quota   quota_exceeded  folder /team"),
+            "{text}"
+        );
+        assert!(!text.contains("ok:"), "{text}");
+
+        let (result, text, _) = run(failed.clone(), true).await;
+        assert!(result.is_err());
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), failed);
+
+        // 만들지 않으므로 켜기와 함께 줄 수 없다.
+        assert!(
+            Cli::try_parse_from(["oplctl", "vm", "create", "web", "--dry-run", "--start"]).is_err()
         );
     }
 }

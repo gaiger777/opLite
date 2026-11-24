@@ -189,7 +189,11 @@ fn no_node_error(vm: &Vm, inv: &Inventory, e: ScheduleError) -> ApiError {
 
 /// 루트 `cluster.read`가 없는 사용자에게는 `no_node`의 노드마다 까닭(노드 이름이 든다)을 보이지 않는다 — `/cpu/models`와
 /// 같은 규칙(리뷰 1 M2).
-fn hide_node_reasons(state: &AppState, principal: &Principal, mut e: ApiError) -> ApiError {
+pub(crate) fn hide_node_reasons(
+    state: &AppState,
+    principal: &Principal,
+    mut e: ApiError,
+) -> ApiError {
     if e.code == "no_node" && e.details.is_some() && !crate::cpu::sees_node_names(state, principal)
     {
         e.message = ScheduleError::NoNode.to_string();
@@ -274,9 +278,30 @@ fn check_ha_capacity(state: &AppState, inv: &Inventory, vm: &Vm) -> Result<(), A
 /// `vm`은 저장할 모양이다(id·이름·레이블은 배치 규칙에 쓰고, 자기 자신의 MAC과 디스크는 충돌로 보지 않는다).
 /// 노드를 고를 때 `scorer`의 부하 점수를 쓴다.
 pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<(), ApiError> {
+    prepare_with(state, vm, scorer, &Planned::default())
+}
+
+/// 아직 만들지 않은 것(계획 71 미리 확인 `POST /vm-checks`): 만들 볼륨(준비된 볼륨으로 본다)과 배치 규칙. 만들기·고치기는
+/// 빈 것으로 [`prepare`]를 부른다.
+#[derive(Debug, Default)]
+pub(crate) struct Planned {
+    pub volumes: Vec<Volume>,
+    pub rules: Vec<opl_types::placement::PlacementRule>,
+}
+
+/// [`prepare`]를 `planned`를 얹은 목록으로 돈다(검사는 같다).
+pub(crate) fn prepare_with(
+    state: &AppState,
+    vm: &mut Vm,
+    scorer: &Scorer,
+    planned: &Planned,
+) -> Result<(), ApiError> {
     let id = vm.id;
     let spec = &mut vm.spec;
-    let inv = Inventory::load(&state.cluster)?;
+    let mut inv = Inventory::load(&state.cluster)?;
+    inv.volumes.extend(planned.volumes.iter().cloned());
+    inv.rules.extend(planned.rules.iter().cloned());
+    let inv = inv;
     let others = inv.vms.iter().filter(|v| v.id != id);
 
     let mut used: BTreeSet<MacAddr> = others
@@ -768,39 +793,75 @@ pub(crate) fn mask_spec(
 }
 
 /// 새로 붙이는 네트워크(NIC마다 `network.assign`)와 볼륨(디스크마다 볼륨 주인의 `storage.allocate`). `current`가 있으면
-/// 이미 붙은 것은 다시 보지 않는다.
+/// 이미 붙은 것은 다시 보지 않는다. 첫 거절을 돌려준다([`attachment_problems`]의 첫 것).
 pub(crate) fn check_attachments(
     state: &AppState,
     principal: &Principal,
     spec: &VmSpec,
     current: Option<&VmSpec>,
 ) -> Result<(), ApiError> {
+    match attachment_problems(state, principal, spec, current)?
+        .into_iter()
+        .next()
+    {
+        Some((_, e)) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// [`check_attachments`]의 거절을 모두 자리(`nics.N`·`disks.N`·`cdroms.N`·`replication` — 계획 71 미리 확인의 칸)와 함께
+/// 차례대로 모은다. 권한 판단 밖의 오류(저장소 읽기)는 `Err`다.
+pub(crate) fn attachment_problems(
+    state: &AppState,
+    principal: &Principal,
+    spec: &VmSpec,
+    current: Option<&VmSpec>,
+) -> Result<Vec<(String, ApiError)>, ApiError> {
+    let mut found = Vec::new();
+    let mut note = |at: String, r: Result<(), ApiError>| -> Result<(), ApiError> {
+        match r {
+            Err(e) if e.status.is_client_error() => {
+                found.push((at, e));
+                Ok(())
+            }
+            r => r,
+        }
+    };
     let had = |name: &str| current.is_some_and(|c| c.nics.iter().any(|n| n.network == name));
-    state.authz.require_networks(
-        principal,
-        spec.nics
-            .iter()
-            .map(|n| n.network.as_str())
-            .filter(|n| !had(n)),
-    )?;
+    for (i, nic) in spec.nics.iter().enumerate() {
+        if !had(&nic.network) {
+            note(
+                format!("nics.{i}"),
+                state
+                    .authz
+                    .require_networks(principal, [nic.network.as_str()]),
+            )?;
+        }
+    }
     let had_disk = |name: &str| current.is_some_and(|c| c.disks.iter().any(|d| d.volume == name));
-    state.authz.require_volumes(
-        principal,
-        spec.disks
-            .iter()
-            .map(|d| d.volume.as_str())
-            .filter(|v| !had_disk(v)),
-    )?;
+    for (i, disk) in spec.disks.iter().enumerate() {
+        if !had_disk(&disk.volume) {
+            note(
+                format!("disks.{i}"),
+                state
+                    .authz
+                    .require_volumes(principal, [disk.volume.as_str()]),
+            )?;
+        }
+    }
     let had_iso = |name: &str| {
         current.is_some_and(|c| c.cdroms.iter().any(|d| d.iso.as_deref() == Some(name)))
     };
-    state.authz.require_isos(
-        principal,
-        spec.cdroms
-            .iter()
-            .filter_map(|d| d.iso.as_deref())
-            .filter(|v| !had_iso(v)),
-    )?;
+    for (i, cdrom) in spec.cdroms.iter().enumerate() {
+        if let Some(iso) = cdrom.iso.as_deref()
+            && !had_iso(iso)
+        {
+            note(
+                format!("cdroms.{i}"),
+                state.authz.require_isos(principal, [iso]),
+            )?;
+        }
+    }
     // 새 복제 대상(리뷰 2 N2): 복제본을 만들 풀마다 `storage.allocate`. 대상에 풀이 없으면 디스크마다 같은 이름의 풀이다.
     let had_target = |t: &opl_types::replication::ReplicationTarget| {
         current.is_some_and(|c| {
@@ -810,18 +871,20 @@ pub(crate) fn check_attachments(
         })
     };
     for target in spec.replication.iter().filter(|t| !had_target(t)) {
-        match &target.pool {
-            Some(pool) => state.authz.require_pool(principal, pool)?,
-            None => {
+        let r = match &target.pool {
+            Some(pool) => state.authz.require_pool(principal, pool),
+            None => (|| {
                 for disk in &spec.disks {
                     if let Some(v) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? {
                         state.authz.require_pool(principal, &v.spec.pool)?;
                     }
                 }
-            }
-        }
+                Ok(())
+            })(),
+        };
+        note("replication".into(), r)?;
     }
-    Ok(())
+    Ok(found)
 }
 
 /// PUT 본문의 `user_data`·`vendor_data`가 [`PASSWORD_MASK`]면(가린 응답을 그대로 되보냄) 저장된 값을 둔다. 저장된 것이
@@ -1175,6 +1238,13 @@ fn with_machine(
         labels,
         mut spec,
     } = req;
+    fill_machine(state, &mut spec)?;
+    let spec = parse_spec(spec)?;
+    Ok(CreateRequest { name, labels, spec })
+}
+
+/// 만들기 spec(JSON)에 `machine`이 없으면 [`default_machine`]으로 채운다.
+pub(crate) fn fill_machine(state: &AppState, spec: &mut serde_json::Value) -> Result<(), ApiError> {
     if let Some(obj) = spec.as_object_mut()
         && !obj.contains_key("machine")
     {
@@ -1189,9 +1259,12 @@ fn with_machine(
             serde_json::to_value(machine).expect("machine"),
         );
     }
-    let spec: VmSpec =
-        serde_json::from_value(spec).map_err(|e| ApiError::bad_request(format!("spec: {e}")))?;
-    Ok(CreateRequest { name, labels, spec })
+    Ok(())
+}
+
+/// 만들기 spec(JSON)을 푼다(못 풀면 400).
+pub(crate) fn parse_spec(spec: serde_json::Value) -> Result<VmSpec, ApiError> {
+    serde_json::from_value(spec).map_err(|e| ApiError::bad_request(format!("spec: {e}")))
 }
 
 /// `machine`을 뺀 만들기의 머신: 지정 노드(`node`)의 아키텍처, 아니면 아키텍처를 아는 노드(위트니스 제외)가 모두
