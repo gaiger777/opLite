@@ -17,7 +17,6 @@ import {
   fileRestoreError,
   type GuestConflict,
   type Part,
-  partOf,
   type Session,
   targetDirOk,
   type VolumeView,
@@ -26,6 +25,12 @@ import { trackTask } from "@/tasks/tasks";
 import { agentChannel } from "@/vms/guest";
 
 const CONFLICTS: GuestConflict[] = ["keep", "skip", "overwrite"];
+
+/** 되돌려 쓸 항목 하나: `parent` 아래의 이름(없으면 `parent` 자신 — 볼륨 루트)과 종류 */
+export interface RestoreItem {
+  part?: Part;
+  kind: EntryView["kind"];
+}
 
 /**
  * 고른 항목을 실행 중 VM에 게스트 에이전트로 되돌려 쓰는 대화상자(설계 §12·§14): VM(실행 중이고 에이전트 채널이 있고 내가
@@ -37,16 +42,16 @@ export function RestoreToVmDialog({
   session,
   volume,
   parent,
-  entries,
+  items,
   originalVm,
   returnFocus,
   onClose,
 }: {
   session: Session;
   volume: VolumeView;
-  /** 고른 항목이 있는 디렉터리 */
+  /** 고른 항목이 있는 디렉터리(기본 대상 디렉터리) */
   parent: readonly Part[];
-  entries: readonly EntryView[];
+  items: readonly RestoreItem[];
   originalVm?: string;
   returnFocus: RefObject<HTMLElement | null>;
   onClose(): void;
@@ -78,7 +83,7 @@ export function RestoreToVmDialog({
   const dir = typed ?? defaultTargetDir(parent, os);
   const [conflict, setConflict] = useState<GuestConflict>("keep");
   const [dirError, setDirError] = useState<string | undefined>();
-  const hasDir = entries.some((e) => e.kind === "dir");
+  const hasDir = items.some((e) => e.kind === "dir");
   const writable = caps.data?.file_write === true;
   const exec = caps.data?.exec === true;
   const blocked =
@@ -100,7 +105,7 @@ export function RestoreToVmDialog({
           params: { path: { id: session.id } },
           body: {
             volume: volume.id,
-            paths: entries.map((e) => entryPath([...parent, partOf(e)])),
+            paths: items.map((e) => entryPath(e.part ? [...parent, e.part] : parent)),
             vm: vm.id,
             target_dir: dir,
             conflict,
@@ -110,16 +115,13 @@ export function RestoreToVmDialog({
     } catch (err) {
       throw err instanceof ApiError ? new Error(fileRestoreError(t, err)) : err;
     }
-    trackTask(
-      task,
-      t("tasks.op.file-restore-to-guest", { target: vm.name, count: entries.length }),
-    );
+    trackTask(task, t("tasks.op.file-restore-to-guest", { target: vm.name, count: items.length }));
   }
 
   const capsError = caps.error ? fileRestoreError(t, caps.error) : null;
   return (
     <FormDialog
-      title={t("fileRestore.toVmTitle", { count: entries.length })}
+      title={t("fileRestore.toVmTitle", { count: items.length })}
       description={t("fileRestore.toVmDescription")}
       submitLabel={t("fileRestore.toVmSubmit")}
       submitDisabled={blocked}

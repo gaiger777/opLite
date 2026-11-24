@@ -11,7 +11,16 @@ import {
   Link2,
   Undo2,
 } from "lucide-react";
-import { type KeyboardEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type KeyboardEvent,
+  memo,
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -41,13 +50,14 @@ import {
   entryPath,
   type EntryView,
   fileRestoreError,
+  MAX_PATHS,
   modeString,
-  nameSegments,
   PAGE_SIZE,
   type Part,
   partOf,
   pathQuery,
   RENDER_STEP,
+  REPORT_FILE,
   type Session,
   sessionKey,
   volumeLabel,
@@ -55,30 +65,11 @@ import {
   visiblePath,
   type VolumeView,
 } from "@/fileRestore/fileRestore";
-import { RestoreToVmDialog } from "@/fileRestore/RestoreToVmDialog";
+import { type RestoreItem, RestoreToVmDialog } from "@/fileRestore/RestoreToVmDialog";
+import { SafeName } from "@/fileRestore/SafeName";
 import { formatBytes, formatTime } from "@/lib/format";
 
 const KIND_ICON = { dir: Folder, file: File, symlink: Link2, other: FileQuestion } as const;
-
-/**
- * 백업 안 이름(게스트가 정한 것)을 보인다: 양방향 서식은 `<bdi>`로 가두고, 숨은 문자(제어·양방향·폭 없는 문자)는 `\u202E`
- * 같은 글로 바꿔 드러낸다. 원래 이름은 API로만 간다.
- */
-function SafeName({ name }: { name: string }) {
-  return (
-    <bdi>
-      {nameSegments(name).map((s, i) =>
-        s.escaped ? (
-          <span key={i} className="rounded-sm bg-warning-soft px-0.5 font-mono text-warning-fg">
-            {s.text}
-          </span>
-        ) : (
-          s.text
-        ),
-      )}
-    </bdi>
-  );
-}
 
 /**
  * 오른쪽 파일 표(설계 §14): 이동 경로, 이 디렉터리 안 이름 거르기, 이름·크기·수정 시각·모드·소유자, 쪽 넘김(아래에 닿으면 다음
@@ -107,8 +98,10 @@ export function FileBrowser({
   const [busy, setBusy] = useState(false);
   const rows = useRef<(HTMLTableRowElement | null)[]>([]);
   const box = useRef<HTMLDivElement | null>(null);
+  const alertRef = useRef<HTMLParagraphElement | null>(null);
   const sentinel = useRef<HTMLDivElement | null>(null);
   const restoreButton = useRef<HTMLButtonElement | null>(null);
+  const tooManyId = useId();
   // 옮긴 뒤 새 목록이 오면 키보드 초점을 둘 행: null이면 첫 행, 글이면 그 열쇠의 행(위로 가면 온 폴더), undefined면 그대로
   const focusAfterLoad = useRef<string | null | undefined>(undefined);
   const where = pathQuery(parts);
@@ -190,9 +183,18 @@ export function FileBrowser({
   }, [canGrow, autoFetch, isFetchingNextPage, loadMore, shown.length]);
 
   // 옮긴 뒤 새 목록이 오면 초점을 표에 둔다(지운 행에 있던 초점이 문서로 빠지지 않게).
+  // 새 폴더의 첫 쪽이 실패했으면 오류 글에 둔다(Backspace로 위로 갈 수 있게).
   useEffect(() => {
     const want = focusAfterLoad.current;
-    if (want === undefined || !entries.data) {
+    if (want === undefined) {
+      return;
+    }
+    if (firstError) {
+      focusAfterLoad.current = undefined;
+      alertRef.current?.focus();
+      return;
+    }
+    if (!entries.data) {
       return;
     }
     focusAfterLoad.current = undefined;
@@ -205,7 +207,7 @@ export function FileBrowser({
           );
     const row = shown.length > 0 ? rows.current[at] : null;
     (row ?? box.current)?.focus();
-  }, [entries.data, shown]);
+  }, [entries.data, shown, firstError]);
 
   const go = useCallback((next: Part[], from?: Part) => {
     setParts(next);
@@ -276,6 +278,22 @@ export function FileBrowser({
     [count, open, toggle, up, parts.length],
   );
 
+  // 빈 폴더의 표 상자·첫 쪽 오류 글에 초점이 있을 때: Backspace로 위로, ↓·Home으로 첫 행에
+  function onBoxKey(e: KeyboardEvent<HTMLElement>) {
+    if (e.target !== e.currentTarget) {
+      return;
+    }
+    if (e.key === "Backspace" && parts.length > 0) {
+      up();
+    } else if ((e.key === "ArrowDown" || e.key === "Home") && count > 0) {
+      setFocus(0);
+      rows.current[0]?.focus();
+    } else {
+      return;
+    }
+    e.preventDefault();
+  }
+
   const setRow = useCallback((i: number, el: HTMLTableRowElement | null) => {
     rows.current[i] = el;
   }, []);
@@ -283,11 +301,10 @@ export function FileBrowser({
   async function download(wanted?: "tar.gz") {
     setBusy(true);
     try {
-      // 고른 것이 없으면 지금 디렉터리 전체다(볼륨 루트도 된다).
-      const paths = chosen.length
-        ? chosen.map((e) => entryPath([...parts, partOf(e)]))
-        : [entryPath(parts)];
-      const format = chosen.length ? downloadFormat(chosen, wanted) : (wanted ?? "zip");
+      // 고른 것이 없거나 (한도를 넘게) 다 골랐으면 지금 디렉터리 전체다(볼륨 루트도 된다).
+      const each = chosen.length > 0 && !wholeFolder;
+      const paths = each ? chosen.map((e) => entryPath([...parts, partOf(e)])) : [entryPath(parts)];
+      const format = each ? downloadFormat(chosen, wanted) : (wanted ?? "zip");
       const link = await call(
         api.POST("/file-restore/sessions/{id}/download-link", {
           params: { path: { id: session.id } },
@@ -295,7 +312,12 @@ export function FileBrowser({
         }),
       );
       startDownload(`/api/v1${link.url}`);
-      toast.success(t("fileRestore.downloadStarted"));
+      // 묶음(zip·tar.gz)은 건너뛴 항목이나 일찍 멈춘 까닭을 맨 위 보고서 파일에 적는다.
+      toast.success(
+        format === "auto"
+          ? t("fileRestore.downloadStarted")
+          : t("fileRestore.downloadStartedArchive", { report: REPORT_FILE }),
+      );
     } catch (err) {
       toast.error(fileRestoreError(t, err));
       if (err instanceof ApiError && err.code === "session_closed") {
@@ -308,12 +330,22 @@ export function FileBrowser({
 
   const root = volumeLabel(volume);
   const allChosen = visible.length > 0 && chosen.length === visible.length;
+  // 서버는 한 번에 `MAX_PATHS`개까지 받는다. 다 읽은 폴더의 모든 항목을 (거르지 않고) 골랐으면 폴더 하나로 보내고, 아니면 막는다.
+  const overLimit = chosen.length > MAX_PATHS;
+  const wholeFolder = overLimit && !hasNextPage && !needle && chosen.length === all.length;
+  const tooMany = overLimit && !wholeFolder;
   const canRestore = perms.anywhere("vm.config");
-  const downloadLabel = chosen.length
-    ? chosen.length === 1 && chosen[0]!.kind === "file"
-      ? t("fileRestore.downloadFile")
-      : t("fileRestore.downloadZip", { count: chosen.length })
-    : t("fileRestore.downloadFolder");
+  const downloadLabel =
+    chosen.length && !wholeFolder
+      ? chosen.length === 1 && chosen[0]!.kind === "file"
+        ? t("fileRestore.downloadFile")
+        : t("fileRestore.downloadZip", { count: chosen.length })
+      : t("fileRestore.downloadFolder");
+  // VM으로 복원할 것: 고른 항목, 또는 폴더를 통째로 보낼 때는 그 폴더(부모 아래에 그 이름으로 — 볼륨 루트면 그 내용)
+  const restoreParent = wholeFolder ? parts.slice(0, -1) : parts;
+  const restoreItems: readonly RestoreItem[] = wholeFolder
+    ? [{ part: parts.at(-1), kind: "dir" }]
+    : chosen.map((e) => ({ part: partOf(e), kind: e.kind }));
 
   // 머리의 "모두 고르기"는 보이는 행만 넣고 뺀다(숨은 고른 행은 그대로 둔다).
   function selectAll() {
@@ -400,11 +432,17 @@ export function FileBrowser({
               {hiddenChosen > 0 && ` ${t("fileRestore.selectedHidden", { count: hiddenChosen })}`}
             </span>
           )}
+          {tooMany && (
+            <span id={tooManyId} role="status" className="text-sm text-destructive">
+              {t("fileRestore.tooMany", { max: MAX_PATHS })}
+            </span>
+          )}
           <div className="flex">
             <Button
               size="sm"
               className="rounded-r-none"
-              disabled={busy || !loaded}
+              disabled={busy || !loaded || tooMany}
+              aria-describedby={tooMany ? tooManyId : undefined}
               onClick={() => void download()}
             >
               <Download />
@@ -415,7 +453,7 @@ export function FileBrowser({
                 <Button
                   size="sm"
                   className="rounded-l-none border-l border-primary-foreground/20 px-2"
-                  disabled={busy || !loaded}
+                  disabled={busy || !loaded || tooMany}
                   aria-label={t("fileRestore.downloadAs")}
                 >
                   <ChevronDown />
@@ -423,7 +461,7 @@ export function FileBrowser({
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuItem onSelect={() => void download()}>
-                  {chosen.length === 1 && chosen[0]!.kind === "file"
+                  {chosen.length === 1 && chosen[0]!.kind === "file" && !wholeFolder
                     ? t("fileRestore.asFile")
                     : t("fileRestore.asZip")}
                 </DropdownMenuItem>
@@ -443,7 +481,8 @@ export function FileBrowser({
               ref={restoreButton}
               variant="outline"
               size="sm"
-              disabled={chosen.length === 0}
+              disabled={chosen.length === 0 || tooMany}
+              aria-describedby={tooMany ? tooManyId : undefined}
               title={chosen.length === 0 ? t("fileRestore.selectFirst") : undefined}
               onClick={() => setRestoring(true)}
             >
@@ -455,13 +494,20 @@ export function FileBrowser({
       </div>
 
       {firstError ? (
-        <p role="alert" className="text-sm text-destructive">
+        <p
+          ref={alertRef}
+          role="alert"
+          tabIndex={-1}
+          className="text-sm text-destructive outline-none"
+          onKeyDown={onBoxKey}
+        >
           {fileRestoreError(t, firstError)}
         </p>
       ) : (
         <div
           ref={box}
           tabIndex={-1}
+          onKeyDown={onBoxKey}
           className="min-w-0 overflow-x-auto rounded-lg border outline-none"
         >
           <Table aria-label={t("fileRestore.filesIn", { path: visiblePath(parts) })}>
@@ -537,7 +583,8 @@ export function FileBrowser({
           </Table>
         </div>
       )}
-      {!firstError && !pageError && (canGrow || hasNextPage) && (
+      {/* 다음 쪽이 실패해도 읽은 행은 더 그릴 수 있다 — 다음 쪽 읽기만 다시 시도 줄에 맡긴다. */}
+      {!firstError && (canGrow || (hasNextPage && !pageError)) && (
         <div ref={sentinel} className="flex flex-col items-center gap-1">
           <Button variant="outline" size="sm" disabled={isFetchingNextPage} onClick={loadMore}>
             {isFetchingNextPage
@@ -551,7 +598,7 @@ export function FileBrowser({
               {t("fileRestore.showing", { shown: shown.length, loaded: visible.length })}
             </span>
           )}
-          {needle && hasNextPage && (
+          {needle && hasNextPage && !pageError && (
             <span className="text-xs text-muted-foreground">{t("fileRestore.filterLoaded")}</span>
           )}
         </div>
@@ -561,8 +608,8 @@ export function FileBrowser({
         <RestoreToVmDialog
           session={session}
           volume={volume}
-          parent={parts}
-          entries={chosen}
+          parent={restoreParent}
+          items={restoreItems}
           originalVm={originalVm}
           returnFocus={restoreButton}
           onClose={() => setRestoring(false)}

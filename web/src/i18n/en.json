@@ -5092,6 +5092,7 @@
     "bootingHint": "The backup is attached read-only to a small isolated VM. This usually takes a few seconds.",
     "bootingSlowHint": "The backup is attached read-only to a small isolated VM. This node has no hardware acceleration, so it can take up to a minute.",
     "failed": "The helper VM stopped",
+    "unusable": "This browsing session cannot be used",
     "closed": "This browsing session is closed",
     "nothingToBrowse": "No volume can be browsed",
     "nothingToBrowseHint": "The disks in this backup have no supported filesystem. The list on the left says why for each one.",
@@ -5147,7 +5148,9 @@
     "asTarGz": "Download as tar.gz",
     "asTarGzHint": "Keeps permissions, owners and links",
     "downloadStarted": "Download started.",
+    "downloadStartedArchive": "Download started. If items are skipped or the archive stops early, {{report}} at the top of the archive says why.",
     "selectFirst": "Select files or folders first.",
+    "tooMany": "Select at most {{max}} items, or clear the selection to download the whole folder.",
     "toVm": "Restore to VM",
     "toVmTitle_one": "Restore {{count}} item to a VM",
     "toVmTitle_other": "Restore {{count}} items to a VM",
@@ -5191,7 +5194,11 @@
       "invalid_target_dir": "The folder in the guest is not valid: {{message}}",
       "guest_mkdir_unavailable": "Creating folders needs guest-exec, which the guest agent does not allow. Select files only.",
       "guest_overwrite_unavailable": "Overwriting needs guest-exec, which the guest agent does not allow. Choose Keep both or Skip.",
-      "guest_agent_restricted": "The guest agent blocks file writes: {{message}}"
+      "guest_agent_restricted": "The guest agent blocks file writes: {{message}}",
+      "invalid_path": "The selection cannot be used: {{message}}",
+      "bad_request": "The request was not valid: {{message}}",
+      "volume_not_found": "This volume is no longer in the session. Open the backup again.",
+      "file_restore_too_large": "The selection is too large: {{message}}"
     }
   }
 }

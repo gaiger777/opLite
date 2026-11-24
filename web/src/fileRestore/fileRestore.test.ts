@@ -179,3 +179,39 @@ it("measures the server clock from the Date header", () => {
   expect(serverSkew(null, now)).toBe(0);
   expect(serverSkew("garbage", now)).toBe(0);
 });
+
+// 리뷰 2 웹 S1: 빈칸으로 보이거나 보이지 않는 다른 문자(BMP 밖의 태그 문자도)를 드러낸다.
+it("escapes blank-looking and tag characters too", () => {
+  expect(visibleName("a\u00adb")).toBe("a\\u00ADb");
+  expect(visibleName("\u3164")).toBe("\\u3164");
+  expect(visibleName("x\u2028y\u2029")).toBe("x\\u2028y\\u2029");
+  expect(visibleName("a\u034fb\u180e\ufffa")).toBe("a\\u034Fb\\u180E\\uFFFA");
+  expect(visibleName("\u115f\u1160")).toBe("\\u115F\\u1160");
+  // 태그 문자(U+E0041)는 한 글자로 드러낸다(대리 쌍을 둘로 쪼개지 않는다).
+  expect(visibleName("flag\u{e0041}")).toBe("flag\\u{E0041}");
+  expect(nameSegments("a\u{e007f}b")).toEqual([
+    { text: "a", escaped: false },
+    { text: "\\u{E007F}", escaped: true },
+    { text: "b", escaped: false },
+  ]);
+  // 보이는 BMP 밖 글자(이모지)는 그대로다.
+  expect(visibleName("😀.txt")).toBe("😀.txt");
+});
+
+// 리뷰 2 웹 #7: 숨은 문자가 든 부모 폴더는 고칠 수 있는 대상 칸에 넣지 않고 루트를 기본으로 한다.
+it("does not default the target folder to a parent with hidden characters", () => {
+  expect(defaultTargetDir([{ name: "srv" }, { name: "‮gnp.exe" }], "linux")).toBe("/");
+  expect(defaultTargetDir([{ name: "two\nlines" }], "windows")).toBe("C:\\");
+  expect(defaultTargetDir([{ name: "srv" }, { name: "www" }], "linux")).toBe("/srv/www");
+});
+
+// 리뷰 2 웹 #6: 볼륨의 덧붙임(마운트 오류 글)과 파일시스템 이름은 게스트에서 온다 — 숨은 문자를 드러낸다.
+it("escapes hidden characters in volume notes", () => {
+  expect(volumeBlocked(vol("d", { state: "failed", note: "bad\u202esb" }))).toEqual({
+    key: "fileRestore.blocked.failed",
+    values: { note: "bad\\u202Esb" },
+  });
+  expect(volumeBlocked(vol("d", { mountable: false, note: "x\ny" }))?.values).toEqual({
+    note: "x\\ny",
+  });
+});

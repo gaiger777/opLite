@@ -8,7 +8,9 @@ import {
   type EntryView,
   type GuestRestoreCaps,
   RENDER_STEP,
+  MAX_PATHS,
   type Session,
+  sessionKey,
   type VolumeView,
 } from "@/fileRestore/fileRestore";
 import { FileRestorePage } from "@/fileRestore/FileRestorePage";
@@ -317,9 +319,16 @@ it("downloads through a one-time link: one file as is, several as zip, or tar.gz
   await user.click(screen.getByRole("button", { name: "Download folder" }));
   await waitFor(() => expect(startDownload).toHaveBeenCalledTimes(1));
   expect(startDownload).toHaveBeenCalledWith(`/api/v1/file-restore/sessions/${SID}/download/tok`);
+  // 묶음은 맨 위 보고서 파일을 알린다(리뷰 2 웹 S2).
+  expect(
+    await screen.findByText(
+      "Download started. If items are skipped or the archive stops early, ORBIVISOR-RESTORE-REPORT.txt at the top of the archive says why.",
+    ),
+  ).toBeInTheDocument();
   await user.click(within(table).getByRole("checkbox", { name: "Select hello.txt" }));
   await user.click(screen.getByRole("button", { name: "Download" }));
   await waitFor(() => expect(startDownload).toHaveBeenCalledTimes(2));
+  expect(await screen.findByText("Download started.")).toBeInTheDocument();
   await user.click(within(table).getByRole("checkbox", { name: "Select �.bin" }));
   await user.click(screen.getByRole("button", { name: "Download 2 as zip" }));
   await waitFor(() => expect(startDownload).toHaveBeenCalledTimes(3));
@@ -583,49 +592,118 @@ it("renders large folders in steps and does not fetch every page while filtering
   expect(calls.list).toEqual(["disk0p1 /"]);
   await user.click(screen.getByRole("button", { name: "Load more" }));
   await waitFor(() => expect(calls.list).toEqual(["disk0p1 /", "disk0p1 / @1"]));
-});
+  // 행 600개를 그린다 — 부하가 큰 CI에서는 기본 5초를 넘을 수 있다.
+}, 15_000);
 
 // 리뷰 1 웹 #2: 노드에 잠깐 닿지 않아 서버가 볼륨 없는 Raft 보기를 주어도 찾아보기 상태(폴더·고른 것)를 버리지 않는다.
+// 세션을 다시 묻는 간격(setInterval·clearInterval)만 가짜 시계로 돌린다 — setTimeout·응답은 진짜라, 시계를 한 번에 움직여도 그 사이에
+// 응답이 끼어 다른 간격이 돌지 않는다(예전에는 가짜 20초 동안 2초 간격 묻기가 섞여 부하가 크면 5초를 넘겼다).
 it("keeps the browser while the session node is briefly unreachable", async () => {
-  vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "setInterval"] });
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
   mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
   mockSession([session("ready")], {
     "disk0p1:/": [ROOT],
     "disk0p1:/etc": [[e("hosts"), e("passwd")]],
   });
   let reachable = true;
+  let polls = 0;
   server.use(
-    http.get(apiUrl("/file-restore/sessions/:id"), () =>
-      HttpResponse.json(
+    http.get(apiUrl("/file-restore/sessions/:id"), () => {
+      polls += 1;
+      return HttpResponse.json(
         reachable ? session("ready") : session("ready", { volumes: [], expires_at: 0 }),
-      ),
-    ),
+      );
+    }),
   );
-  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-  open();
+  const user = userEvent.setup();
+  const { queryClient } = open();
   const root = await screen.findByRole("table", { name: "Files in /" });
   await user.click(await within(root).findByRole("button", { name: "etc" }));
   const inEtc = await screen.findByRole("table", { name: "Files in /etc" });
   await user.click(await within(inEtc).findByRole("checkbox", { name: "Select hosts" }));
+  // 첫 나열 뒤 세션을 다시 읽는 것이 끝나야 다음 묻기 간격이 정해진다.
+  await vi.waitFor(() => expect(queryClient.isFetching({ queryKey: sessionKey(SID) })).toBe(0));
   reachable = false;
-  await act(() => vi.advanceTimersByTimeAsync(20_000));
+  const before = polls;
+  act(() => vi.advanceTimersByTime(20_000));
   expect(
     await screen.findByText("Cannot reach the node of this session right now. Retrying…"),
   ).toBeInTheDocument();
+  expect(polls).toBe(before + 1);
   expect(screen.queryByText("No volume can be browsed")).not.toBeInTheDocument();
   expect(screen.getByRole("table", { name: "Files in /etc" })).toBe(inEtc);
   expect(within(inEtc).getByRole("checkbox", { name: "Select hosts" })).toBeChecked();
   expect(screen.getByRole("navigation", { name: "Volumes" })).toHaveTextContent("Partition 1");
-  // 다시 닿으면 알림이 사라진다(닿지 않는 동안은 2초마다 묻는다).
+  // 닿지 않는 동안은 2초마다 묻는다. 다시 닿으면 알림이 사라진다.
+  await vi.waitFor(() => expect(queryClient.isFetching({ queryKey: sessionKey(SID) })).toBe(0));
   reachable = true;
-  await act(() => vi.advanceTimersByTimeAsync(2000));
+  act(() => vi.advanceTimersByTime(2000));
   await waitFor(() =>
     expect(
       screen.queryByText("Cannot reach the node of this session right now. Retrying…"),
     ).not.toBeInTheDocument(),
   );
+  expect(polls).toBe(before + 2);
   expect(within(inEtc).getByRole("checkbox", { name: "Select hosts" })).toBeChecked();
   expect(screen.getByText("Closes in 14 min without use")).toBeInTheDocument();
+});
+
+// 리뷰 2 웹 #1: 노드에 닿지 않음(5xx)은 다시 묻지만, 권한을 뺀 것(403) 같은 4xx는 묻기를 멈추고 까닭을 보인다.
+it("retries while the node is unreachable but stops on a permission error", async () => {
+  vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  mockSession([session("ready")], { "disk0p1:/": [ROOT] });
+  let answer: "ready" | "down" | "denied" = "ready";
+  let polls = 0;
+  server.use(
+    http.get(apiUrl("/file-restore/sessions/:id"), () => {
+      polls += 1;
+      switch (answer) {
+        case "ready":
+          return HttpResponse.json(session("ready"));
+        case "down":
+          return HttpResponse.json(
+            { code: "node_unreachable", message: "node-2 does not answer" },
+            { status: 503 },
+          );
+        case "denied":
+          return HttpResponse.json(
+            { code: "forbidden", message: "missing backup.file_restore" },
+            { status: 403 },
+          );
+      }
+    }),
+  );
+  const { queryClient } = open();
+  await screen.findByText("hello.txt");
+  const idle = () =>
+    vi.waitFor(() => expect(queryClient.isFetching({ queryKey: sessionKey(SID) })).toBe(0));
+  await idle();
+  answer = "down";
+  act(() => vi.advanceTimersByTime(20_000));
+  expect(
+    await screen.findByText("Cannot reach the node of this session right now. Retrying…"),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("table", { name: "Files in /" })).toBeInTheDocument();
+  await idle();
+  const down = polls;
+  act(() => vi.advanceTimersByTime(2000));
+  await vi.waitFor(() => expect(polls).toBe(down + 1));
+  await idle();
+  answer = "denied";
+  act(() => vi.advanceTimersByTime(2000));
+  expect(await screen.findByText("This browsing session cannot be used")).toBeInTheDocument();
+  expect(screen.getByText("You do not have permission to do this.")).toBeInTheDocument();
+  expect(
+    screen.queryByText("Cannot reach the node of this session right now. Retrying…"),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByRole("table")).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Open again" })).toBeInTheDocument();
+  // 더 묻지 않는다.
+  const denied = polls;
+  act(() => vi.advanceTimersByTime(60_000));
+  await new Promise((r) => setTimeout(r, 50));
+  expect(polls).toBe(denied);
 });
 
 // 리뷰 1 웹 #3: 닫기는 서버가 닫힘을 알릴 때까지 "닫는 중"이고 다시 누를 수 없다(부팅 중 닫기는 부팅이 끝나야 된다).
@@ -810,4 +888,190 @@ it("counts the idle time with the server clock", async () => {
   );
   open();
   expect(await screen.findByText("Closes in 11 min without use")).toBeInTheDocument();
+});
+
+// 리뷰 2 웹 #2·#5: 서버는 한 번에 MAX_PATHS개까지 받는다. 다 읽은 폴더를 통째로 고르면 폴더 하나로 보내고, 아니면 막고
+// 까닭을 보인다. 서버가 거절한 경로(invalid_path)도 번역해 보인다.
+it("sends a fully selected big folder as one path and blocks larger partial selections", async () => {
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  const many = Array.from({ length: MAX_PATHS + 1 }, (_, i) => e(`f${String(i).padStart(4, "0")}`));
+  const calls = mockSession([session("ready")], {
+    "disk0p1:/": [[e("etc", { kind: "dir" }), e("big", { kind: "dir" })]],
+    "disk0p1:/etc": [many],
+    "disk0p1:/big": [many, [e("last")]],
+  });
+  server.use(
+    http.get(apiUrl("/vms/:key/guest/restore-caps"), () =>
+      HttpResponse.json({ os: "linux", file_write: true, exec: true }),
+    ),
+  );
+  const user = userEvent.setup();
+  open();
+  const root = await screen.findByRole("table", { name: "Files in /" });
+  await user.click(await within(root).findByRole("button", { name: "etc" }));
+  const inEtc = await screen.findByRole("table", { name: "Files in /etc" });
+  await within(inEtc).findByText("f0000");
+  await user.click(within(inEtc).getByRole("checkbox", { name: "Select all" }));
+  expect(screen.getByText(`${MAX_PATHS + 1} selected`)).toBeInTheDocument();
+  // 폴더 전체 — 그 폴더 하나로 보낸다.
+  await user.click(screen.getByRole("button", { name: "Download folder" }));
+  await waitFor(() => expect(calls.links).toHaveLength(1));
+  expect(calls.links[0]).toEqual({ volume: "disk0p1", paths: [["etc"]], format: "zip" });
+  // VM으로 복원도 그 폴더 하나를 원래 부모(/) 아래로
+  await user.click(screen.getByRole("button", { name: "Restore to VM" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore 1 item to a VM" });
+  expect(within(dialog).getByRole("textbox", { name: "Folder in the guest" })).toHaveValue("/");
+  await waitFor(() =>
+    expect(within(dialog).getByRole("button", { name: "Restore" })).toBeEnabled(),
+  );
+  await user.click(within(dialog).getByRole("button", { name: "Restore" }));
+  await waitFor(() => expect(calls.restores).toHaveLength(1));
+  expect(calls.restores[0]).toMatchObject({ paths: [["etc"]], target_dir: "/" });
+
+  // 아직 다 읽지 않은 폴더에서 한도를 넘게 고르면 막고 까닭을 보인다.
+  await user.click(screen.getByRole("button", { name: "Up" }));
+  const back = await screen.findByRole("table", { name: "Files in /" });
+  await user.click(await within(back).findByRole("button", { name: "big" }));
+  const inBig = await screen.findByRole("table", { name: "Files in /big" });
+  await within(inBig).findByText("f0000");
+  await user.click(within(inBig).getByRole("checkbox", { name: "Select all" }));
+  const hint = screen.getByText(
+    `Select at most ${MAX_PATHS} items, or clear the selection to download the whole folder.`,
+  );
+  const zip = screen.getByRole("button", { name: `Download ${MAX_PATHS + 1} as zip` });
+  expect(zip).toBeDisabled();
+  expect(zip).toHaveAccessibleDescription(hint.textContent!);
+  expect(screen.getByRole("button", { name: "Download format" })).toBeDisabled();
+  expect(screen.getByRole("button", { name: "Restore to VM" })).toBeDisabled();
+  // 한도 안으로 줄이면 풀린다. 서버가 경로를 거절하면 번역한 글로 알린다.
+  await user.click(within(inBig).getByRole("checkbox", { name: "Select f0000" }));
+  expect(screen.queryByText(/^Select at most/)).not.toBeInTheDocument();
+  server.use(
+    http.post(apiUrl("/file-restore/sessions/:id/download-link"), () =>
+      HttpResponse.json(
+        { code: "invalid_path", message: "choose between 1 and 1000 entries" },
+        { status: 400 },
+      ),
+    ),
+  );
+  await user.click(screen.getByRole("button", { name: `Download ${MAX_PATHS} as zip` }));
+  expect(
+    await screen.findByText("The selection cannot be used: choose between 1 and 1000 entries"),
+  ).toBeInTheDocument();
+}, 20_000);
+
+// 리뷰 2 웹 #3: 다음 쪽이 실패해도 이미 읽은 행(그리기 한도 밖)은 "더 보이기"로 볼 수 있다.
+it("still shows more loaded rows while a next page has failed", async () => {
+  useFakeObserver();
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  mockSession([session("ready")]);
+  const many = Array.from({ length: RENDER_STEP + 20 }, (_, i) =>
+    e(`f${String(i).padStart(3, "0")}`),
+  );
+  server.use(
+    http.get(apiUrl("/file-restore/sessions/:id/volumes/:volume/entries"), ({ request }) =>
+      new URL(request.url).searchParams.get("cursor")
+        ? HttpResponse.json({ code: "file_restore_io", message: "read error" }, { status: 502 })
+        : HttpResponse.json({ entries: many, next: "1" }),
+    ),
+  );
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  await within(table).findByText("f000");
+  // 거르는 동안 단추로 다음 쪽을 읽다가 실패한다.
+  const filter = screen.getByRole("searchbox", { name: "Filter names in this folder" });
+  await user.type(filter, "zzz");
+  await user.click(screen.getByRole("button", { name: "Load more" }));
+  expect(await within(table).findByRole("alert")).toHaveTextContent(/^Could not load more names/);
+  await user.clear(filter);
+  expect(within(table).getAllByRole("row")).toHaveLength(RENDER_STEP + 2);
+  await user.click(screen.getByRole("button", { name: "Show more" }));
+  await within(table).findByText(`f${RENDER_STEP + 19}`);
+  expect(screen.queryByRole("button", { name: /^Show more|^Load more/ })).not.toBeInTheDocument();
+  expect(within(table).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+}, 15_000);
+
+// 리뷰 2 웹 #4: 빈 폴더에서도 Backspace로 위로 가고, 첫 쪽이 실패한 폴더에서는 초점이 오류 글에 있다.
+it("keeps keyboard focus usable in empty folders and after a failed first page", async () => {
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  mockSession([session("ready")], {
+    "disk0p1:/": [[e("empty", { kind: "dir" }), e("broken", { kind: "dir" }), e("x.txt")]],
+    "disk0p1:/empty": [[]],
+  });
+  server.use(
+    http.get(
+      apiUrl("/file-restore/sessions/:id/volumes/:volume/entries"),
+      ({ request }) =>
+        new URL(request.url).searchParams.get("path") === "/broken"
+          ? HttpResponse.json({ code: "file_restore_io", message: "bad inode" }, { status: 502 })
+          : undefined,
+      // 나머지는 mockSession의 처리기가 답한다.
+    ),
+  );
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  const rowOf = (t: HTMLElement, name: string) =>
+    within(t)
+      .getByRole("checkbox", { name: `Select ${name}` })
+      .closest("tr")!;
+  await within(table).findByText("x.txt");
+  rowOf(table, "empty").focus();
+  await user.keyboard("{Enter}");
+  const empty = await screen.findByRole("table", { name: "Files in /empty" });
+  await within(empty).findByText("This folder is empty.");
+  await waitFor(() => expect(empty.closest('div[tabindex="-1"]')).toHaveFocus());
+  await user.keyboard("{Backspace}");
+  const back = await screen.findByRole("table", { name: "Files in /" });
+  await waitFor(() => expect(rowOf(back, "empty")).toHaveFocus());
+  // 첫 쪽이 실패한 폴더: 오류 글에 초점, Backspace로 위로
+  await user.keyboard("{ArrowDown}{Enter}");
+  const alert = await screen.findByText("Reading the backup failed: bad inode");
+  await waitFor(() => expect(alert).toHaveFocus());
+  await user.keyboard("{Backspace}");
+  const again = await screen.findByRole("table", { name: "Files in /" });
+  await waitFor(() => expect(rowOf(again, "broken")).toHaveFocus());
+});
+
+// 리뷰 2 웹 #6: 볼륨의 파일시스템 레이블과 덧붙임도 게스트가 정한 글이다 — 숨은 문자를 드러내고 가둔다.
+it("shows hidden characters in volume labels and notes as escapes", () => {
+  render(
+    <VolumeTree
+      volumes={[
+        {
+          id: "disk0p1",
+          disk: 0,
+          kind: "partition",
+          fs: "ext4",
+          label: "‮txt.exe",
+          mountable: true,
+          size: 1 << 30,
+          state: "unmounted",
+          note: "journal\nnot replayed",
+          partition: { number: 1, table: "gpt", type_name: "Linux filesystem" },
+        },
+        {
+          id: "disk0p2",
+          disk: 0,
+          kind: "partition",
+          fs: "ext4",
+          mountable: true,
+          size: 1 << 30,
+          state: "failed",
+          note: "mount: ‮oops",
+          partition: { number: 2, table: "gpt", type_name: "Linux filesystem" },
+        },
+      ]}
+      chosen={undefined}
+      onChoose={() => {}}
+    />,
+  );
+  const p1 = screen.getByRole("button", { name: /Partition 1/ });
+  expect(p1).toHaveTextContent("\\u202Etxt.exe · Linux filesystem");
+  expect(p1.textContent).not.toContain("‮");
+  expect(p1.querySelectorAll("bdi").length).toBeGreaterThan(0);
+  const p2 = screen.getByRole("button", { name: /Partition 2/ });
+  expect(p2).toHaveAccessibleDescription(/mount: \\u202Eoops/);
+  expect(p2.getAttribute("title")).not.toContain("‮");
 });

@@ -102,6 +102,20 @@ function isGone(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
+/**
+ * 다시 물어도 같을 답: 4xx(권한을 뺐으면 403, 기능이 꺼졌으면 409 …). 408·429는 잠깐의 것이다. 네트워크 오류·5xx·
+ * `node_unreachable`(503)는 노드에 잠깐 닿지 않은 것으로 보고 다시 묻는다.
+ */
+function isFinal(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 408 &&
+    error.status !== 429
+  );
+}
+
 /** 세션 보기와 서버 시계의 차이(초, 서버 − 브라우저 — 응답의 `Date`로 잰 것) */
 type SessionData = Session & { skew?: number };
 
@@ -135,7 +149,7 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
     retry: false,
     refetchInterval: (q) => {
       const phase = q.state.data?.phase;
-      if (isGone(q.state.error) || (phase !== "booting" && phase !== "ready")) {
+      if (isFinal(q.state.error) || (phase !== "booting" && phase !== "ready")) {
         return false;
       }
       // 부팅 중·닫는 중·노드에 닿지 않을 때는 자주 묻는다.
@@ -155,8 +169,10 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
   // 서버 시각(초): 닫힐 시각·부팅 경과는 서버 시계로 센다(브라우저 시계가 어긋나도).
   const now = useNow(session.phase === "booting" ? 1000 : 15_000) + (session.skew ?? 0);
   const [volumeId, setVolumeId] = useState<string | null>(null);
-  // 세션이 없어졌으면(노드 재시작으로 세션을 잊음) 끝난 것으로 본다. 잠깐 닿지 않은 것은 지금 화면을 두고 다시 묻는다.
-  const lost = isGone(query.error);
+  // 세션이 없어졌거나(노드 재시작으로 세션을 잊음) 더는 쓸 수 없으면(권한을 뺐음 …) 끝난 것으로 본다. 잠깐 닿지 않은 것은
+  // 지금 화면을 두고 다시 묻는다.
+  const lost = isFinal(query.error);
+  const gone = isGone(query.error);
   const phase = lost ? "failed" : session.phase;
   const fallback = isFallback(session);
   const unreachable = (phase === "booting" || phase === "ready") && (fallback || !!query.error);
@@ -244,7 +260,13 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
       {(phase === "failed" || phase === "closed") && (
         <EmptyState
           icon={phase === "failed" ? CircleX : FolderSearch}
-          title={t(phase === "failed" ? "fileRestore.failed" : "fileRestore.closed")}
+          title={t(
+            lost && !gone
+              ? "fileRestore.unusable"
+              : phase === "failed"
+                ? "fileRestore.failed"
+                : "fileRestore.closed",
+          )}
           description={lost ? fileRestoreError(t, query.error) : (session.error ?? undefined)}
           action={<Button onClick={onReopen}>{t("fileRestore.reopen")}</Button>}
         />

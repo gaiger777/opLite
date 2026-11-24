@@ -21,21 +21,33 @@ export interface Part {
 /** 나열 한 쪽의 항목 수(서버 기본과 같다) */
 export const PAGE_SIZE = 200;
 
+/**
+ * 내려받기·VM으로 복원 한 번에 고를 수 있는 항목 수(서버 `MAX_DOWNLOAD_PATHS`). 디렉터리를 통째로 고르면 그 디렉터리 하나로
+ * 보낸다.
+ */
+export const MAX_PATHS = 1000;
+
+/** zip·tar.gz 맨 위의 보고서 파일(건너뛴 항목·일찍 멈춘 까닭 — 서버 `REPORT_NAME`, 이름이 겹치면 `-2` …가 붙는다) */
+export const REPORT_FILE = "ORBIVISOR-RESTORE-REPORT.txt";
+
 /** 파일 표가 한 번에 더 그리는 행 수. 큰 디렉터리를 다 그리지 않고 아래에 닿을 때마다 이만큼 늘린다. */
 export const RENDER_STEP = 500;
 
 /**
- * 이름에서 화면에 보이지 않거나 글 방향을 바꾸는 문자(C0·C1 제어 문자, 양방향 서식 문자, 폭 없는 문자, BOM). 백업 안 이름은
- * 게스트가 정한 것이라 `invoice` + U+202E + `txt.exe`처럼 다른 이름으로 보이게 할 수 있다.
+ * 이름에서 화면에 보이지 않거나 글 방향을 바꾸는 문자(C0·C1 제어 문자, 양방향 서식 문자, 폭 없는 문자, BOM, 줄·문단 구분자,
+ * 소프트 하이픈·결합 문자 지우개·한글 채움 문자·몽골어 모음 구분자처럼 빈칸으로 보이는 문자, 행간 주석 문자, 태그 문자). 백업 안
+ * 이름은 게스트가 정한 것이라 `invoice` + U+202E + `txt.exe`처럼 다른 이름으로 보이게 하거나 두 이름을 같아 보이게 할 수 있다.
  */
 const HIDDEN_CHARS =
-  // eslint-disable-next-line no-control-regex
-  /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+  // eslint-disable-next-line no-control-regex, no-misleading-character-class -- U+034F(결합 문자 지우개)도 하나씩 드러낸다
+  /[\u0000-\u001f\u007f-\u009f\u00ad\u034f\u061c\u115f\u1160\u180e\u200b-\u200f\u2028-\u202e\u2060-\u2069\u3164\ufeff\ufff9-\ufffb\u{e0000}-\u{e007f}]/gu;
 
 const SHORT_ESCAPES: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
 
 function escapeChar(c: string): string {
-  return SHORT_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`;
+  const code = c.codePointAt(0)!;
+  const hex = code.toString(16).toUpperCase();
+  return SHORT_ESCAPES[c] ?? (code > 0xffff ? `\\u{${hex}}` : `\\u${hex.padStart(4, "0")}`);
 }
 
 /** 보이는 이름의 조각: 그대로 보일 글과, 숨은 문자를 바꾼 `\u202E`·`\n` 같은 글(`escaped`) */
@@ -66,7 +78,7 @@ export function visibleName(name: string): string {
   return name.replace(HIDDEN_CHARS, escapeChar);
 }
 
-export function partOf(entry: EntryView): Part {
+export function partOf(entry: Part): Part {
   return entry.raw ? { name: entry.name, raw: entry.raw } : { name: entry.name };
 }
 
@@ -176,19 +188,20 @@ export function volumeLabel(v: VolumeView): {
 }
 
 /**
- * 찾아볼 수 없는 까닭(번역 키와 값). 마운트를 해 봤다가 실패했으면 서버의 덧붙임을 쓴다. 찾아볼 수 있으면 null.
+ * 찾아볼 수 없는 까닭(번역 키와 값). 마운트를 해 봤다가 실패했으면 서버의 덧붙임을 쓴다. 찾아볼 수 있으면 null. 덧붙임(마운트
+ * 오류 글)과 파일시스템 이름은 게스트 디스크에서 오므로 숨은 문자를 보이는 글로 바꾼다.
  */
 export function volumeBlocked(
   v: VolumeView,
 ): { key: string; values?: Record<string, string> } | null {
   if (v.state === "failed") {
-    return { key: "fileRestore.blocked.failed", values: { note: v.note ?? "" } };
+    return { key: "fileRestore.blocked.failed", values: { note: visibleName(v.note ?? "") } };
   }
   if (v.mountable) {
     return null;
   }
   if (v.note) {
-    return { key: "fileRestore.blocked.note", values: { note: v.note } };
+    return { key: "fileRestore.blocked.note", values: { note: visibleName(v.note) } };
   }
   switch (v.fs) {
     case undefined:
@@ -202,7 +215,7 @@ export function volumeBlocked(
     case "swap":
       return { key: "fileRestore.blocked.swap" };
     default:
-      return { key: "fileRestore.blocked.unsupported", values: { fs: v.fs } };
+      return { key: "fileRestore.blocked.unsupported", values: { fs: visibleName(v.fs) } };
   }
 }
 
@@ -224,11 +237,13 @@ export function firstBrowsable(volumes: readonly VolumeView[]): VolumeView | und
 }
 
 /**
- * VM으로 되돌려 쓸 기본 대상 디렉터리: 고른 항목의 원래 부모(설계 §14). Windows 게스트는 `C:\…`로 바꾼다. UTF-8이 아닌 조각이
- * 있으면 루트다(게스트 쪽 이름을 짐작하지 않는다).
+ * VM으로 되돌려 쓸 기본 대상 디렉터리: 고른 항목의 원래 부모(설계 §14). Windows 게스트는 `C:\…`로 바꾼다. UTF-8이 아니거나 숨은
+ * 문자(양방향·제어·폭 없는 문자)가 든 조각이 있으면 루트다(게스트 쪽 이름을 짐작하지 않고, 고칠 수 있는 칸에 보이지 않는 글을
+ * 넣지 않는다).
  */
 export function defaultTargetDir(parent: readonly Part[], os: GuestRestoreCaps["os"] | undefined) {
-  const names = parent.some((p) => p.raw) ? [] : parent.map((p) => p.name);
+  const odd = parent.some((p) => p.raw || visibleName(p.name) !== p.name);
+  const names = odd ? [] : parent.map((p) => p.name);
   return os === "windows" ? `C:\\${names.join("\\")}` : `/${names.join("/")}`;
 }
 

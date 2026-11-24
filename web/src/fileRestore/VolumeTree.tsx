@@ -9,8 +9,10 @@ import {
   volumeBlocked,
   volumeLabel,
   type VolumeView,
+  visibleName,
   volumeWarning,
 } from "@/fileRestore/fileRestore";
+import { SafeName } from "@/fileRestore/SafeName";
 import { formatBytes } from "@/lib/format";
 
 /**
@@ -83,7 +85,7 @@ function VolumeRow({
         aria-current={chosen ? "true" : undefined}
         aria-disabled={blocked ? true : undefined}
         aria-describedby={reason || warning ? reasonId : undefined}
-        title={reason ?? warning ?? undefined}
+        title={reason ?? (warning ? visibleName(warning) : undefined)}
         onClick={() => !blocked && onChoose(volume.id)}
         className={cn(
           "flex w-full min-w-0 flex-col items-start gap-0.5 rounded-md px-2 py-1.5 text-left text-sm",
@@ -97,7 +99,7 @@ function VolumeRow({
           <span className="truncate">{t(label.key, label.values)}</span>
           {volume.fs && (
             <Badge variant="outline" className="font-mono">
-              {volume.fs}
+              <SafeName name={volume.fs} />
             </Badge>
           )}
           {warning && <TriangleAlert aria-hidden className="size-3.5 shrink-0 text-warning-fg" />}
@@ -107,7 +109,9 @@ function VolumeRow({
         </span>
         {(volume.label || volume.partition?.type_name) && (
           <span className="truncate text-xs text-muted-foreground">
-            {[volume.label, volume.partition?.type_name].filter(Boolean).join(" · ")}
+            {volume.label && <SafeName name={volume.label} />}
+            {volume.label && volume.partition?.type_name && " · "}
+            {volume.partition?.type_name}
           </span>
         )}
         {(reason || warning) && (
@@ -118,7 +122,7 @@ function VolumeRow({
               blocked ? "text-muted-foreground" : "text-warning-fg",
             )}
           >
-            {reason ?? warning}
+            {reason ? <bdi>{reason}</bdi> : warning && <SafeName name={warning} />}
           </span>
         )}
       </button>
