@@ -373,6 +373,7 @@ pnpm -C web test             # 단위·컴포넌트 테스트 (Vitest) — axe �
 pnpm -C web test src/tokens.test.ts   # 색 토큰 대비만: index.css의 밝음·어두움 oklch 값으로 글 4.5:1, 상태 칩 4.5:1, 포커스 링·차트 3:1
 pnpm -C web test src/cpu           # CPU 모델 고르기·플래그 칩·보류 표시·설정의 CPU 칸(msw)
 pnpm -C web test src/numa          # CPU 배치·NUMA 칸, 들어갈 노드 어림, vCPU 고정 표, 노드 토폴로지 격자, 호스트 자원 대화상자 409(msw)
+pnpm -C web test src/clusterMap src/components/iso   # 클러스터 지도(계획 70): 묶기·배치·단계·합친 경로·적중·키보드 이웃(순수), 100 × 50 배치 시간과 원소 수 예산, 그린 원소 수, 화면·서랍·목록·휴대폰·axe·대비(msw)
 pnpm -C web typecheck && pnpm -C web lint
 pnpm -C web gen:api          # API를 바꾼 뒤 src/api/schema.d.ts를 다시 만든다(CI가 확인한다)
 pnpm -C web exec playwright install chromium
@@ -383,7 +384,9 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 브라우저 E2E(`web/e2e/vm.spec.ts`, Playwright Chromium)는 영역 탭으로 화면을 옮기고, ⌘K 팔레트로 VM을 열고, VM 목록의
 일괄 막대로 강제 정지하고, VM 동작 메뉴(⋯)로 복제·편집·지우기를 하고, 노드 상세의 "CPU 모델" 칸(실제 탐침이 읽은 QEMU와
 다시 읽기 단추)과 설정 › 일반의 CPU 기준 칸을 보고, 꺼진 VM을 소켓 2·게스트 NUMA 노드 2로 고쳐 요약을 보며, 노드 상세의 "NUMA
-토폴로지"(Linux는 탐침 요약, macOS는 "알리지 않았습니다")를 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
+토폴로지"(Linux는 탐침 요약, macOS는 "알리지 않았습니다")를 보고, VM이 켜진 뒤 인프라 › 노드의 보기 "지도"(계획 70 — 노드 블록·VM 타일,
+키보드 `]`·`Enter` 서랍·`Esc`·`[`, 실제 브라우저 가리키기 카드와 타일 누르기, 목록 보기, 동작 줄이기·어둠 테마, 390 × 844 폭의 "보기 설정"과
+가로 스크롤 없음, 기억한 보기)를 본다. 이 Mac(Homebrew QEMU)에서도 돈다(약 25초). jsdom
 시험이 잡지 못하는 경로 이동·렌더 문제가 있으므로 **웹을 바꾸면 커밋 전에 이 Mac에서 돌린다.** 실패하면
 `web/test-results/*/error-context.md`(화면 스냅숏)와 `trace.zip`이 남는다.
 
@@ -395,6 +398,12 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 접근성 검사는 `src/test/axe.ts`의 `expectNoAxeViolations(container)`가 `axe-core`를 직접 부른다(jsdom에서 안 되는
 `color-contrast` 규칙은 끄고 `src/tokens.test.ts`가 대신한다). 머리줄·팔레트·서랍·목록·상세·설정·홈 시험에서 돈다. 새 색
 토큰 짝은 `tokens.test.ts`의 표에 더한다.
+
+늦게 읽는 화면의 문구는 첫 화면 묶음에 넣지 않을 수 있다: 클러스터 지도는 `clusterMap.*`를 `web/src/clusterMap/i18n/{en,ko}.json`에 두고
+경로를 열 때 `clusterMap/strings.ts`가 `addResourceBundle`로 얕게 더한다(첫 화면에는 `nav.clusterMap`·팔레트 별칭·단축키 글만). 시험은
+`src/test/setup.ts`가 미리 더하고 `i18n.test`가 두 파일의 키를 맞춘다. 화면 안에서만 받는 키는 `lib/shortcuts.ts`의 `SHORTCUTS`에 따로
+묶음(`map`)으로 적어 `?` 도움말에만 보이고 전역 해석기는 받지 않는다. 첫 화면 묶음 크기는 `pnpm -C web build` 뒤 진입 조각 +
+modulepreload + index CSS의 gzip -9 합으로 잰다(계획 70 끝 478,317 B).
 
 `cargo test --workspace --all-features`는 `web-it`도 켜므로 위 준비(빌드한 `web/dist`, pnpm, Chromium)가
 필요하다.
