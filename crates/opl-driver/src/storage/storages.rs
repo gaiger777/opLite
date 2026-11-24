@@ -8,8 +8,8 @@ use opl_types::storage::{PoolBackend, SourceFormat, StoragePool, is_shared};
 use uuid::Uuid;
 
 use super::{
-    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, create_target, export_to, fmt_name,
-    path_str, rbd, require_absolute, run_qemu_img,
+    Capacity, Storage, VolumeInfo, VolumeSource, convert_from, create_target, export_to,
+    export_vmdk_to, fmt_name, path_str, rbd, require_absolute, run_qemu_img,
 };
 use crate::error::DriverError;
 
@@ -475,6 +475,16 @@ impl Storage for Storages {
         dest: &Path,
     ) -> Result<(), DriverError> {
         export_to(&self.qemu_img, src, force_share, dest).await
+    }
+
+    /// 원본의 백엔드와 상관없이 `qemu-img`로 내보낸다(RBD는 이미지 옵션으로 연다).
+    async fn export_vmdk(
+        &self,
+        src: &VolumeSource,
+        dest: &Path,
+        hw_version: u8,
+    ) -> Result<(), DriverError> {
+        export_vmdk_to(&self.qemu_img, src, dest, hw_version).await
     }
 
     async fn create_backup_target(&self, dest: &Path, size_bytes: u64) -> Result<(), DriverError> {

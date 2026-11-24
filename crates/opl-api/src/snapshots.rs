@@ -285,6 +285,7 @@ pub(crate) fn check_settled(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
 /// 담는 스펙이 실제와 달라진다. 꺼진 VM을 복사하는 동안 켜면 디스크 잠금 때문에 시작이 실패한다. 시작한 Task는 실행기의 시간 제한 안에 끝나지만, 오프라인 노드에 배정된
 /// Task는 그 노드가 돌아올 때까지 남는다(설계 §11).
 pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    check_no_export_task(state, vm)?;
     check_no_task(
         state,
         vm,
@@ -299,6 +300,26 @@ pub(crate) fn check_no_snapshot_task(state: &AppState, vm: &Vm) -> Result<(), Ap
             )
         },
     )
+}
+
+/// 이 VM을 OVF로 내보내는 Task(`vm-export`, 계획 72)가 끝나지 않았으면 409 `vm_exporting`. 내보내기는 꺼진 VM의 디스크를
+/// 읽으므로 그사이 켜거나 디스크·스펙을 바꾸면 내보낸 것이 섞인다(켜기는 디스크 잠금에도 막힌다).
+pub(crate) fn check_no_export_task(state: &AppState, vm: &Vm) -> Result<(), ApiError> {
+    let (_, tasks) = state.cluster.list::<TaskSpec>()?;
+    if tasks.iter().any(|t| {
+        t.spec.target == vm.id
+            && !t.status.state.is_finished()
+            && matches!(t.spec.op, TaskOp::VmExport { .. })
+    }) {
+        return Err(ApiError::conflict(
+            "vm_exporting",
+            format!(
+                "VM {:?} is being exported; try again when the export has finished",
+                vm.name
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// 이 VM의 템플릿 되돌리기 Task(`vm-untemplate`)가 끝나지 않았으면 409 `vm_busy`. 되돌리기는 표시를 지운 뒤 연결 복제가

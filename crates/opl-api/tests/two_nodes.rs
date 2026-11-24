@@ -238,6 +238,10 @@ impl Node {
             .with_audit(audit.clone())
             .with_guest_agent(self.guest.clone())
             .with_file_restore(self.file_sessions.clone())
+            .with_exports(Arc::new(opl_api::ExportFiles {
+                cluster: self.cluster.clone(),
+                mount_root: MOUNT_ROOT.into(),
+            }))
             .with_ceph(Arc::new(CephPeerSource::new(
                 self.cluster.clone(),
                 self.id,
@@ -3657,4 +3661,90 @@ async fn files_are_restored_into_a_guest_on_another_node() {
     assert_eq!(g.files["/srv/r/etc/hostname"], b"web-01\n");
     assert_eq!(g.files["/srv/r/app.log"].len(), 3 << 20);
     assert!(b.hv.guest_fs(vm).is_none());
+}
+
+/// VM 내보내기(계획 72 §12.3): 파일이 B의 로컬 dir 풀에만 있으면 A의 API가 링크를 서명하고(어느 노드든 같은 키), 내려받기를
+/// 노드 사이 흐름 `ExportDownload`로 B에서 받아 넘긴다 — OVA 크기·차례·본문이 그대로다. 파일 하나도 같다.
+#[tokio::test]
+async fn vm_exports_on_another_node_are_relayed() {
+    use opl_types::storage::{PoolBackend, StoragePoolSpec};
+    use opl_types::vm_export::{VmExport, VmExportFile, VmExportPhase, VmExportSpec};
+    use sha2::Digest as _;
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    // 링크 키는 클러스터 CA 키에서 뽑는다.
+    common::seed_cluster_info(&a.cluster).await;
+    let dir = root.path().join("exp-b");
+    std::fs::create_dir_all(&dir).unwrap();
+    let pool = Resource::new(
+        "exp",
+        StoragePoolSpec {
+            backend: PoolBackend::Dir { path: dir.clone() },
+            nodes: vec![b.id],
+            shared: false,
+            backups: false,
+            folder: None,
+        },
+    );
+    a.cluster.create(&pool).await.unwrap();
+    let mut export: VmExport = Resource::new(
+        "web-out",
+        VmExportSpec {
+            vm: Uuid::now_v7(),
+            pool: "exp".into(),
+            guest_os: None,
+            hw_version: 14,
+            keep_macs: false,
+            node: b.id,
+        },
+    );
+    let files_dir = dir.join(VmExportSpec::dir(export.id));
+    std::fs::create_dir_all(&files_dir).unwrap();
+    let contents: [(&str, Vec<u8>); 3] = [
+        ("web.ovf", b"<Envelope/>".to_vec()),
+        ("web.mf", b"SHA256(web.ovf)= 00\n".to_vec()),
+        ("web-disk0.vmdk", vec![7u8; 3000]),
+    ];
+    let mut files = Vec::new();
+    for (name, data) in &contents {
+        std::fs::write(files_dir.join(name), data).unwrap();
+        files.push(VmExportFile {
+            name: name.to_string(),
+            size: data.len() as u64,
+            sha256: hex::encode(sha2::Sha256::digest(data)),
+        });
+    }
+    export.status.phase = VmExportPhase::Ready;
+    export.status.files = files;
+    a.cluster.create(&export).await.unwrap();
+    a.cluster
+        .update_status::<VmExportSpec>(export.id, &export.status)
+        .await
+        .unwrap();
+
+    let (status, link) = admin
+        .post("/vm-exports/web-out/download-link", serde_json::json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{link}");
+    let get = |query: &'static str| {
+        let url = format!("{}/api/v1{}{query}", a.base, link["url"].as_str().unwrap());
+        let (http, token) = (admin.http.clone(), admin.token.clone().unwrap());
+        async move {
+            let resp = http.get(url).bearer_auth(token).send().await.unwrap();
+            let status = resp.status();
+            let len = resp.content_length();
+            (status, len, resp.bytes().await.unwrap().to_vec())
+        }
+    };
+    let (status, len, ova) = get("").await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&ova));
+    assert_eq!(len, Some(ova.len() as u64));
+    // 머리 512 + 본문(512로 채움)마다, 끝 0 블록 둘
+    assert_eq!(ova.len(), 512 + 512 + 512 + 512 + 512 + 3072 + 1024);
+    assert_eq!(&ova[..7], b"web.ovf");
+    assert_eq!(&ova[512..523], b"<Envelope/>");
+    assert_eq!(&ova[2560..2560 + 3000], &[7u8; 3000][..]);
+    let (status, _, disk) = get("?format=ovf&file=web-disk0.vmdk").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(disk, vec![7u8; 3000]);
 }

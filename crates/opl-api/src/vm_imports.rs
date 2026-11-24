@@ -6,6 +6,7 @@
 pub mod esxi;
 pub mod ova;
 pub mod ovf;
+pub mod ovf_write;
 pub mod vmx;
 
 use std::collections::{BTreeSet, HashMap};

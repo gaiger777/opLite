@@ -767,6 +767,7 @@ pub(crate) fn folder_kind(kind: Kind) -> bool {
             | Kind::StoragePool
             | Kind::Task
             | Kind::Folder
+            | Kind::VmExport
     )
 }
 

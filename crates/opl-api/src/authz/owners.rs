@@ -130,6 +130,15 @@ impl Owners {
         Ok(o.volume(name, pool))
     }
 
+    /// 내보내기(계획 72)의 주인: 내보낸 VM(지워졌으면 루트에 있는 VM으로 본다)
+    pub fn around_export(cluster: &Cluster, vm: Uuid) -> Result<AuthzTarget, ApiError> {
+        let mut o = Owners::default();
+        if let Some(v) = cluster.get::<VmSpec>(vm)? {
+            o.put_vm(v.id, &v.spec);
+        }
+        Ok(o.vm(vm))
+    }
+
     /// Task 하나의 주인을 찾는 데 드는 것만 뜬다.
     pub fn around_task(cluster: &Cluster, task: &TaskSpec) -> Result<Self, ApiError> {
         let mut o = Owners::default();
@@ -265,7 +274,8 @@ impl Owners {
             | TaskOp::VmHotplug
             | TaskOp::VmReplicate { .. }
             | TaskOp::VmUntemplate
-            | TaskOp::VmFirmwareReset { .. } => Some(self.vm(t)),
+            | TaskOp::VmFirmwareReset { .. }
+            | TaskOp::VmExport { .. } => Some(self.vm(t)),
             TaskOp::VolumeCreate
             | TaskOp::VolumeImport { .. }
             | TaskOp::VolumeDownload { .. }

@@ -3396,6 +3396,84 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vm-exports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_vm_exports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-exports/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_vm_export"];
+        put?: never;
+        post?: never;
+        /**
+         * 내보내기의 파일과 리소스를 지울 Task를 돌려준다(202). 실패한 내보내기도 지운다. 쓰거나 지우는 Task가 끝나지 않았으면 409
+         *     `export_busy`, 파일이 있는 노드가 오프라인이면 409 `node_offline`.
+         */
+        delete: operations["delete_export"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-exports/{key}/download-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 내려받기 링크(§12.3): 10분 사는 서명 링크를 만든다(요청한 사용자에 묶임). 브라우저·CLI가 `GET url`로 받는다(같은 사용자의
+         *     인증이 다시 필요하다). 다 쓰지 않은 내보내기는 409 `export_not_ready`.
+         */
+        post: operations["export_download_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vm-exports/{key}/download/{token}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 링크로 내려받는다(GET — 브라우저 내려받기). 링크를 만든 사용자만(403), 지났거나 틀린 링크는 410 `link_expired`. 기본은 OVA
+         *     (`application/x-tar`, `{VM}.ova`, 정확한 `Content-Length` — 서술자 → 매니페스트 → 디스크), `format=ovf&file=NAME`은 파일
+         *     하나다. 파일이 이 노드에 없으면 쓴 노드에서 받아 넘긴다(닿지 않으면 503 `node_unreachable`). 도중의 읽기 실패는 연결을
+         *     끊는다(받은 파일이 잘렸음을 클라이언트가 안다). 감사는 흐름이 끝날 때 적는다.
+         */
+        get: operations["download_export"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/vm-imports": {
         parameters: {
             query?: never;
@@ -3751,6 +3829,29 @@ export interface paths {
         get: operations["get_vm_cpu"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/export": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * VM을 OVF 패키지로 내보내는 `pending` 내보내기와 그것을 쓸 Task를 만든다(202 `{export, task}`). 모든 노드가 `vm-export`를
+         *     알아야 하고(409 `cluster_upgrading`), VM이 꺼져 있어야 하며(409 `vm_running` — 템플릿도 된다), 켜고 끄는 중이면 409 `vm_busy`,
+         *     풀은 dir·NFS여야 한다(400 `pool_not_file`). 풀의 `storage.allocate`가 든다(403). Task는 VM 디스크와 풀을 함께 읽고 쓸 수 있는
+         *     노드에서 돈다(없으면 409 `no_node`·`pool_not_on_node`). 디스크 합 + 1 GiB가 풀에 없으면 507 `insufficient_storage`. 이름이
+         *     겹치면 409 `name_taken`. 쓰는 동안 VM 켜기·디스크 바꾸기는 409 `vm_exporting`이다.
+         */
+        post: operations["export_vm"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6444,6 +6545,21 @@ export interface components {
             /** @description 데이터스토어 안의 `.vmx` 경로(`web01/web01.vmx`) */
             vmx: string;
         };
+        ExportVmRequest: {
+            /** @description OVF `vmw:osType`(VMware guestId, 예: `ubuntu64Guest`). 없으면 가져온 VM의 원본 값, 그것도 없으면 `otherGuest64`다. */
+            guest_os?: string;
+            /**
+             * Format: int32
+             * @description VMware 하드웨어 버전(`vmx-N`, 7~21, 기본 14 — ESXi 6.7 이상)
+             */
+            hw_version?: number;
+            /** @description NIC의 MAC 주소를 그대로 적는다(`addressType=manual`). */
+            keep_macs?: boolean;
+            /** @description 내보내기 이름(클러스터에서 고유). 없으면 `{VM 이름}-{yyyymmdd-HHMMSS}`(UTC)다. */
+            name?: string;
+            /** @description 파일을 둘 풀(dir·NFS) */
+            pool: string;
+        };
         /** @description 영역의 디렉터리 그룹(LDAP 그룹 DN 또는 OIDC `groups` 클레임 값) */
         ExternalGroup: {
             group: string;
@@ -8751,6 +8867,69 @@ export interface components {
                     progress?: components["schemas"]["TaskProgress"];
                     /** @default pending */
                     state: components["schemas"]["TaskState"];
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_VmExportSpec_VmExportStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                spec: {
+                    /** @description OVF `vmw:osType`(VMware guestId). 없으면 가져온 VM의 원본 값, 그것도 없으면 `otherGuest64`다. */
+                    guest_os?: string;
+                    /**
+                     * Format: int32
+                     * @description VMware 하드웨어 버전(`vmx-N`, 7~21)
+                     * @default 14
+                     */
+                    hw_version: number;
+                    /** @description NIC의 MAC 주소를 그대로 적는다(`addressType=manual`). 끄면 받는 쪽이 새로 정한다. */
+                    keep_macs?: boolean;
+                    /**
+                     * Format: uuid
+                     * @description 파일을 쓴 노드
+                     */
+                    node: string;
+                    /** @description 파일을 둘 풀(dir·NFS) */
+                    pool: string;
+                    /**
+                     * Format: uuid
+                     * @description 내보낸 VM
+                     */
+                    vm: string;
+                };
+                status: {
+                    error?: string;
+                    /**
+                     * @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
+                     * @default []
+                     */
+                    files: components["schemas"]["VmExportFile"][];
+                    /**
+                     * Format: int64
+                     * @description 내려받을 OVA(ustar)의 정확한 크기
+                     * @default 0
+                     */
+                    ova_bytes: number;
+                    /** @default pending */
+                    phase: components["schemas"]["VmExportPhase"];
+                    /**
+                     * @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
+                     * @default []
+                     */
+                    warnings: string[];
                 };
             }[];
             /** Format: int64 */
@@ -12380,6 +12559,65 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_VmExportSpec_VmExportStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            spec: {
+                /** @description OVF `vmw:osType`(VMware guestId). 없으면 가져온 VM의 원본 값, 그것도 없으면 `otherGuest64`다. */
+                guest_os?: string;
+                /**
+                 * Format: int32
+                 * @description VMware 하드웨어 버전(`vmx-N`, 7~21)
+                 * @default 14
+                 */
+                hw_version: number;
+                /** @description NIC의 MAC 주소를 그대로 적는다(`addressType=manual`). 끄면 받는 쪽이 새로 정한다. */
+                keep_macs?: boolean;
+                /**
+                 * Format: uuid
+                 * @description 파일을 쓴 노드
+                 */
+                node: string;
+                /** @description 파일을 둘 풀(dir·NFS) */
+                pool: string;
+                /**
+                 * Format: uuid
+                 * @description 내보낸 VM
+                 */
+                vm: string;
+            };
+            status: {
+                error?: string;
+                /**
+                 * @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
+                 * @default []
+                 */
+                files: components["schemas"]["VmExportFile"][];
+                /**
+                 * Format: int64
+                 * @description 내려받을 OVA(ustar)의 정확한 크기
+                 * @default 0
+                 */
+                ova_bytes: number;
+                /** @default pending */
+                phase: components["schemas"]["VmExportPhase"];
+                /**
+                 * @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
+                 * @default []
+                 */
+                warnings: string[];
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_VmImportSpec_VmImportStatus: {
             /** Format: uuid */
             id: string;
@@ -14831,6 +15069,67 @@ export interface components {
             /** @description 켤 때 기록한 CPU(도는 VM). 계획 63 전에 켠 VM은 모델만 편 것이다. */
             running?: components["schemas"]["ResolvedCpu"];
             spec: components["schemas"]["CpuSpec"];
+        };
+        /** @description 내보낸 파일 하나 */
+        VmExportFile: {
+            /** @description 디렉터리 안 파일 이름(`web.ovf`, `web.mf`, `web-disk0.vmdk`) */
+            name: string;
+            /** @description SHA-256(소문자 16진 64자) */
+            sha256: string;
+            /** Format: int64 */
+            size: number;
+        };
+        /** @enum {string} */
+        VmExportPhase: "pending" | "writing" | "ready" | "failed";
+        VmExportSpec: {
+            /** @description OVF `vmw:osType`(VMware guestId). 없으면 가져온 VM의 원본 값, 그것도 없으면 `otherGuest64`다. */
+            guest_os?: string;
+            /**
+             * Format: int32
+             * @description VMware 하드웨어 버전(`vmx-N`, 7~21)
+             * @default 14
+             */
+            hw_version: number;
+            /** @description NIC의 MAC 주소를 그대로 적는다(`addressType=manual`). 끄면 받는 쪽이 새로 정한다. */
+            keep_macs?: boolean;
+            /**
+             * Format: uuid
+             * @description 파일을 쓴 노드
+             */
+            node: string;
+            /** @description 파일을 둘 풀(dir·NFS) */
+            pool: string;
+            /**
+             * Format: uuid
+             * @description 내보낸 VM
+             */
+            vm: string;
+        };
+        /** @description 내보내기 시작의 응답(202) */
+        VmExportStarted: {
+            export: components["schemas"]["Resource_VmExportSpec_VmExportStatus"];
+            task: components["schemas"]["Resource_TaskSpec_TaskStatus"];
+        };
+        VmExportStatus: {
+            error?: string;
+            /**
+             * @description 쓴 파일(OVA 차례: `.ovf` → `.mf` → 디스크)
+             * @default []
+             */
+            files: components["schemas"]["VmExportFile"][];
+            /**
+             * Format: int64
+             * @description 내려받을 OVA(ustar)의 정확한 크기
+             * @default 0
+             */
+            ova_bytes: number;
+            /** @default pending */
+            phase: components["schemas"]["VmExportPhase"];
+            /**
+             * @description OVF에 넣지 못한 것(vTPM·CD·cloud-init 등)
+             * @default []
+             */
+            warnings: string[];
         };
         /** @description VM의 HA 정책. */
         VmHa: {
@@ -22939,6 +23238,168 @@ export interface operations {
             };
         };
     };
+    list_vm_exports: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_VmExportSpec_VmExportStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vm_export: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmExportSpec_VmExportStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_export: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    export_download_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DownloadLink"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    download_export: {
+        parameters: {
+            query?: {
+                /** @description `ova`(기본) 또는 `ovf`(파일 하나 — `file`이 든다) */
+                format?: "ova" | "ovf";
+                /** @description `ovf`에서 받을 파일 이름(`status.files`의 하나) */
+                file?: string;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the OVA, or one file of the OVF folder */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-tar": unknown;
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_vm_imports: {
         parameters: {
             query?: never;
@@ -23563,6 +24024,48 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["VmCpuInfo"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    export_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description VM id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ExportVmRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VmExportStarted"];
+                };
+            };
+            507: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {

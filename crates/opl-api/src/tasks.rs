@@ -9,6 +9,7 @@ mod ceph;
 mod clone;
 mod download;
 mod drain;
+mod export;
 pub(crate) mod file_restore;
 mod firmware;
 mod hotplug;
@@ -710,6 +711,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
                 | TaskOp::VmUntemplate
                 | TaskOp::VmFirmwareReset { .. }
                 | TaskOp::FileRestoreToGuest { .. }
+                | TaskOp::VmExport { .. }
         );
         let backup_queue = matches!(
             task.spec.op,
@@ -718,6 +720,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
                 | TaskOp::BackupConvert { .. }
                 | TaskOp::BackupCopy { .. }
                 | TaskOp::VmImportDelete
+                | TaskOp::VmExportDelete
         );
         let node_queue = task.spec.op == TaskOp::NodeDrain;
         return (is_volume_op(&task.spec.op)
@@ -828,7 +831,9 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
         || matches!(
             task.spec.op,
             TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. }
-        );
+        )
+        // VM 내보내기(계획 72)는 디스크 크기만큼 변환하고 다시 읽어 해시를 잰다.
+        || matches!(task.spec.op, TaskOp::VmExport { .. });
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -953,6 +958,9 @@ async fn cleanup(ctx: &Ctx, task: &Task, error: &str, unfinished: bool) {
     }
     if let TaskOp::VmImport { import, .. } = task.spec.op {
         import::discard(ctx, task, import, error).await;
+    }
+    if let TaskOp::VmExport { export } = task.spec.op {
+        export::discard(ctx, export, error).await;
     }
     if let TaskOp::VmReplicate { .. } = task.spec.op {
         vm_replicate::discard(ctx, task, error).await;
@@ -1232,16 +1240,15 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             };
             return Box::pin(file_restore::to_guest(ctx, task, req)).await;
         }
-        // VMware 이전 Task(계획 72)는 스테이지 4·5가, 내보내기 Task는 스테이지 6이 더한다. 그 전에는 API가 만들지 않는다.
+        // VMware 이전 Task(계획 72)는 스테이지 4·5가 더한다. 그 전에는 API가 만들지 않는다.
         TaskOp::VmwareSync { .. }
         | TaskOp::VmwareCutover
         | TaskOp::VmwareRevert
         | TaskOp::VmwareCleanup { .. } => {
             Err("VMware migration tasks are not available yet".into())
         }
-        TaskOp::VmExport { .. } | TaskOp::VmExportDelete => {
-            Err("VM export tasks are not available yet".into())
-        }
+        TaskOp::VmExport { export } => return export::export(ctx, task, *export).await,
+        TaskOp::VmExportDelete => return export::delete(ctx, id).await,
     };
     done.map(|()| None)
 }

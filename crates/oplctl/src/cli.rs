@@ -195,6 +195,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
+    /// VM 내보내기(OVA/OVF, 계획 72): 목록·보기·내려받기·지우기. 만들기는 `vm export`
+    Export {
+        #[command(subcommand)]
+        cmd: crate::vm_export::ExportCmd,
+    },
     Task {
         #[command(subcommand)]
         cmd: TaskCmd,
@@ -1699,6 +1704,8 @@ enum VmCmd {
         #[command(subcommand)]
         cmd: crate::backup_store::LiveRestoreCmd,
     },
+    /// 꺼진 VM을 파일 풀(dir·NFS)에 OVF 패키지로 내보낸다(vSphere·Workstation·VirtualBox가 받는 OVA로 내려받는다, `vm.export`).
+    Export(crate::vm_export::VmExportArgs),
     /// NIC의 보안 그룹을 바꾼다. 실행 중이어도 곧바로 적용된다. 그룹을 주지 않으면 모두 뺀다.
     NicSg {
         vm: String,
@@ -6617,6 +6624,16 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             .await?
         }
         Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
+        Cmd::Export { cmd } => {
+            Box::pin(crate::vm_export::export(
+                &client,
+                cmd,
+                json_out,
+                out,
+                &mut std::io::stderr(),
+            ))
+            .await?
+        }
         Cmd::Task { cmd } => match cmd {
             TaskCmd::List => {
                 let list = client.get("/tasks").await?;
@@ -8488,6 +8505,15 @@ async fn vm(
         VmCmd::LiveRestore { cmd } => {
             Box::pin(crate::backup_store::live_restore(
                 client, cmd, json_out, out,
+            ))
+            .await?
+        }
+        VmCmd::Export(args) => {
+            Box::pin(crate::vm_export::vm_export(
+                client,
+                args,
+                out,
+                &mut std::io::stderr(),
             ))
             .await?
         }
@@ -14276,6 +14302,49 @@ mod tests {
     }
 
     /// `import` 명령의 인자
+    /// `vm export`·`export …`(계획 72)의 인자
+    #[test]
+    fn parses_vm_export_and_export_commands() {
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vm",
+            "export",
+            "web",
+            "--pool",
+            "nfs1",
+            "--guest-os",
+            "ubuntu64Guest",
+            "--hw-version",
+            "19",
+            "--keep-macs",
+            "--download",
+            "web.ova",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vm {
+                cmd: VmCmd::Export(_)
+            }
+        ));
+        assert!(Cli::try_parse_from(["oplctl", "vm", "export", "web"]).is_err());
+        let cli = Cli::try_parse_from([
+            "oplctl", "export", "download", "web-out", "-O", "x.ova", "--file", "web.ovf",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Export {
+                cmd: crate::vm_export::ExportCmd::Download { ref export, ref out_file, ref file }
+            } if export == "web-out" && out_file.as_deref() == Some("x.ova") && file.as_deref() == Some("web.ovf")
+        ));
+        for sub in [&["list"][..], &["get", "x"], &["delete", "x"]] {
+            let mut argv = vec!["oplctl", "export"];
+            argv.extend_from_slice(sub);
+            assert!(Cli::try_parse_from(argv).is_ok(), "{sub:?}");
+        }
+    }
+
     fn parse_import(args: &[&str]) -> Result<ImportCmd, clap::Error> {
         let mut argv = vec!["oplctl", "import"];
         argv.extend_from_slice(args);

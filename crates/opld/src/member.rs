@@ -686,6 +686,11 @@ impl Member {
             .with_firmware_copies(vars_templates)
             .with_guest_agent(guest.clone())
             .with_file_restore(file_sessions.clone())
+            // VM 내보내기 파일(계획 72): 이 노드의 로컬 풀에 쓴 OVF 패키지를 다른 API 노드가 받아 간다.
+            .with_exports(Arc::new(opl_api::ExportFiles {
+                cluster: cluster.clone(),
+                mount_root: mount_root.clone(),
+            }))
             .with_audit(audit.clone())
             .with_alerts(Arc::new(alert_book.clone()))
             .with_metrics(metrics_source.clone())

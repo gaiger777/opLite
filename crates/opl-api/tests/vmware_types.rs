@@ -104,9 +104,9 @@ async fn vm_export_privilege_needs_every_node() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-fn ops() -> Vec<(TaskOp, &'static str, &'static str)> {
-    let vmware = "VMware migration tasks are not available yet";
-    let export = "VM export tasks are not available yet";
+/// (Task, 기능, 없는 대상에 대한 결과 — `None`이면 성공)
+fn ops() -> Vec<(TaskOp, &'static str, Option<&'static str>)> {
+    let vmware = Some("VMware migration tasks are not available yet");
     vec![
         (TaskOp::VmwareSync { full: true }, VMWARE_MIGRATE, vmware),
         (TaskOp::VmwareCutover, VMWARE_MIGRATE, vmware),
@@ -118,18 +118,19 @@ fn ops() -> Vec<(TaskOp, &'static str, &'static str)> {
             VMWARE_MIGRATE,
             vmware,
         ),
+        // 스테이지 6: 내보내기 Task는 돈다 — 없는 내보내기는 쓸 수 없고, 지우기는 할 일이 없다.
         (
             TaskOp::VmExport {
                 export: Uuid::now_v7(),
             },
             VM_EXPORT,
-            export,
+            Some("export was deleted"),
         ),
-        (TaskOp::VmExportDelete, VM_EXPORT, export),
+        (TaskOp::VmExportDelete, VM_EXPORT, None),
     ]
 }
 
-/// 실행 스테이지 전의 새 Task(Raft에 직접 쓴 것)는 실패로 끝난다.
+/// 실행 스테이지 전의 새 Task(Raft에 직접 쓴 것)는 실패로 끝난다(스테이지 6부터 내보내기 Task는 없는 대상을 그대로 알린다).
 #[tokio::test]
 async fn vmware_and_export_tasks_are_not_available_yet() {
     let env = Env::start().await;
@@ -146,8 +147,13 @@ async fn vmware_and_export_tasks_are_not_available_yet() {
         t.name = t.id.to_string();
         env.cluster.create(&t).await.unwrap();
         let done = admin.wait_task(&json!({ "id": t.id })).await;
-        assert_eq!(done["status"]["state"], "failed", "{done}");
-        assert_eq!(done["status"]["error"], error, "{done}");
+        match error {
+            Some(error) => {
+                assert_eq!(done["status"]["state"], "failed", "{done}");
+                assert_eq!(done["status"]["error"], error, "{done}");
+            }
+            None => assert_eq!(done["status"]["state"], "succeeded", "{done}"),
+        }
     }
 }
 

@@ -274,7 +274,7 @@ pub(crate) fn check_no_backups(state: &AppState, pool: &StoragePool) -> Result<(
 }
 
 /// VM 디스크의 볼륨과 풀. 없으면 400, 만드는 중이면 409 `volume_not_ready`.
-fn vm_disks(state: &AppState, vm: &Vm) -> Result<Vec<(Volume, StoragePool)>, ApiError> {
+pub(crate) fn vm_disks(state: &AppState, vm: &Vm) -> Result<Vec<(Volume, StoragePool)>, ApiError> {
     let mut disks = Vec::with_capacity(vm.spec.disks.len());
     for disk in &vm.spec.disks {
         let volume = state
@@ -296,7 +296,7 @@ fn vm_disks(state: &AppState, vm: &Vm) -> Result<Vec<(Volume, StoragePool)>, Api
 /// 백업 Task를 실행할 노드. 실행 중인 VM은 그 노드, 꺼진 VM은 `spec.node`이고, 노드가 없으면 백업
 /// 풀과 모든 디스크를 쓸 수 있는 온라인 노드 가운데 이름이 가장 앞선 노드다(로컬 풀의 디스크는 파일이
 /// 있는 노드에서만 읽힌다). 그런 노드가 없으면 409 `no_node`.
-fn backup_node(
+pub(crate) fn backup_node(
     state: &AppState,
     vm: &Vm,
     dest: &Dest,

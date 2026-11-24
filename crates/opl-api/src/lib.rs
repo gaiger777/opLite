@@ -85,6 +85,7 @@ mod updates;
 pub mod users;
 pub mod vip;
 mod vm_checks;
+pub mod vm_exports;
 mod vm_firmware;
 pub mod vm_imports;
 mod vms;
@@ -132,6 +133,7 @@ pub use tasks::{TaskRunner, TaskRunnerConfig};
 pub use telemetry::{TelemetryConfig, TelemetryReporter};
 pub use updates::{AUTH_FILE, KEYRING, UpdateAgent, Updates, UpdatesConfig};
 pub use vip::{VipAgent, VipAgentConfig, VipManager, VipManagerConfig};
+pub use vm_exports::ExportFiles;
 
 use crate::resources as r;
 
@@ -442,6 +444,11 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vm_imports::check_ova))
         .routes(routes!(vm_imports::browse_esxi))
         .routes(routes!(vm_imports::create_esxi))
+        .routes(routes!(vm_exports::export_vm))
+        .routes(routes!(r::list_vm_exports))
+        .routes(routes!(r::get_vm_export, vm_exports::delete_export))
+        .routes(routes!(vm_exports::export_download_link))
+        .routes(routes!(vm_exports::download_export))
         .routes(routes!(r::list_volumes, volumes::create_volume))
         .routes(routes!(volumes::import_volume))
         .routes(routes!(volumes::check_import_volume))

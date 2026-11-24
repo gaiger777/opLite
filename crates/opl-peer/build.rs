@@ -205,6 +205,16 @@ fn main() {
         )
         .method(
             Method::builder()
+                .name("export_download")
+                .route_name("ExportDownload")
+                .input_type("crate::vm_export::ExportDownloadRequest")
+                .output_type("crate::file_restore::FileRestoreChunk")
+                .codec_path("crate::codec::BinaryCodec")
+                .server_streaming()
+                .build(),
+        )
+        .method(
+            Method::builder()
                 .name("follow")
                 .route_name("Follow")
                 .input_type("crate::wire::FollowRequest")

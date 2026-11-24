@@ -733,6 +733,10 @@ pub struct FakeStorage {
     failing_commits: std::sync::Mutex<usize>,
     /// 있으면 `commit_overlay`가 (호출을 적은 뒤) 이 세마포어의 허가를 하나 받을 때까지 멈춘다(느린 합치기).
     commit_gate: std::sync::Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// 켜면 `volume_source`가 크기를 아는 볼륨에 `/fake/{id}`를 돌려준다(VM 내보내기 시험, 계획 72). 끄면 지원하지 않는다.
+    sources: std::sync::atomic::AtomicBool,
+    /// 남은 횟수만큼 `export_vmdk`가 반쯤 쓰고 실패한다.
+    failing_exports: std::sync::Mutex<usize>,
 }
 
 impl FakeStorage {
@@ -893,6 +897,24 @@ impl FakeStorage {
 
     pub fn pause(&self) {
         self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `volume_source`가 원본을 돌려주게 한다(내보내기 시험).
+    pub fn enable_sources(&self) {
+        self.sources
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 다음 `n`번의 `export_vmdk`가 실패한다.
+    pub fn fail_exports(&self, n: usize) {
+        *self.failing_exports.lock().unwrap() = n;
+    }
+
+    /// [`Storage::export_vmdk`]가 쓰는 가짜 VMDK 내용(볼륨마다 다르고 512의 배수가 아니다)
+    pub fn vmdk_bytes(id: Uuid) -> Vec<u8> {
+        let mut out = format!("KDMV fake streamOptimized {id}\n").into_bytes();
+        out.resize(1500, b'.');
+        out
     }
 
     /// 멈춘 호출이 들어올 때까지 기다린다.
@@ -1161,11 +1183,44 @@ impl Storage for FakeStorage {
     async fn volume_source(
         &self,
         _: &StoragePool,
-        _: Uuid,
-        _: ImageFormat,
-        _: Option<&str>,
+        id: Uuid,
+        format: ImageFormat,
+        tag: Option<&str>,
     ) -> Result<VolumeSource, DriverError> {
-        Err(DriverError::InvalidSpec("not supported".into()))
+        if !self.sources.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DriverError::InvalidSpec("not supported".into()));
+        }
+        let size = self.sizes.lock().unwrap().get(&id).copied();
+        Ok(VolumeSource {
+            path: format!("/fake/{id}").into(),
+            format,
+            snapshot: tag.map(str::to_string),
+            size_bytes: size.ok_or(DriverError::VolumeNotFound(id))?,
+            rbd: None,
+        })
+    }
+    /// `dest`에 [`FakeStorage::vmdk_bytes`]를 쓴다(`export_vmdk`로 적는다). 실패를 주입했으면 반쯤 쓰고 실패한다.
+    async fn export_vmdk(&self, src: &VolumeSource, dest: &Path, _: u8) -> Result<(), DriverError> {
+        let id: Uuid = src
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_default();
+        self.record("export_vmdk", id).await;
+        {
+            let mut failing = self.failing_exports.lock().unwrap();
+            if *failing > 0 {
+                *failing -= 1;
+                std::fs::write(dest, b"partial")?;
+                return Err(DriverError::ToolFailed {
+                    tool: "qemu-img",
+                    stderr: "No space left on device".into(),
+                });
+            }
+        }
+        std::fs::write(dest, Self::vmdk_bytes(id))?;
+        Ok(())
     }
     async fn release_source(
         &self,

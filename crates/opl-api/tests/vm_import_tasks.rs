@@ -648,3 +648,110 @@ async fn esxi_import_without_credentials_fails() {
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["code"], "import_failed");
 }
+
+/// 계획 72 §12 왕복: OVA로 가져온 VM을 OVA로 내보내(실제 `qemu-img` streamOptimized VMDK) 링크로 받고, 그것을 다시 가져오면
+/// 같은 디스크 바이트(`qemu-img compare`)·CPU·메모리의 VM이 된다. 서술자의 guestId·MAC은 처음 가져온 원본의 것이다.
+/// `OPL_EXPORT_OVA_OUT`이 있으면 받은 OVA를 그 파일에 남긴다.
+#[tokio::test]
+async fn an_exported_ova_imports_back_with_the_same_disk() {
+    let mut env = Env::start().await;
+    let admin = env.admin().await;
+    setup(&env).await;
+    env.stop_runner().await;
+    env.start_runner_config(Arc::new(DirStorage::new("qemu-img", MOUNT_ROOT)), |c| {
+        c.timeout = Duration::ZERO
+    })
+    .await;
+    let disk = vmdk(env.dir.path(), "src", 0xaa);
+    upload(&admin, ova(&[("web-disk1.vmdk", &disk)], None)).await;
+    let task = run(&admin, run_request()).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let (status, started) = admin
+        .post(
+            "/vms/web/export",
+            json!({ "pool": "local", "name": "web-out", "keep_macs": true, "hw_version": 19 }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{started}");
+    let task = admin.wait_task(&started["task"]).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (_, ex) = admin.get("/vm-exports/web-out").await;
+    assert_eq!(ex["status"]["phase"], "ready", "{ex}");
+    let dir = pool_dir(&env)
+        .join("orbivisor-exports")
+        .join(ex["id"].as_str().unwrap());
+    let ovf = std::fs::read_to_string(dir.join("web.ovf")).unwrap();
+    assert!(ovf.contains(r#"vmw:osType="ubuntu64Guest""#), "{ovf}");
+    assert!(ovf.contains("<vssd:VirtualSystemType>vmx-19</vssd:VirtualSystemType>"));
+    let out = std::process::Command::new("qemu-img")
+        .args([
+            "info",
+            "--output=json",
+            dir.join("web-disk0.vmdk").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    let info: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        info["format-specific"]["data"]["create-type"], "streamOptimized",
+        "{info}"
+    );
+
+    let (status, link) = admin
+        .post("/vm-exports/web-out/download-link", json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{link}");
+    let resp = admin
+        .http
+        .get(format!(
+            "{}/api/v1{}",
+            admin.base,
+            link["url"].as_str().unwrap()
+        ))
+        .bearer_auth(admin.token.as_ref().unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let length = resp.content_length();
+    let exported = resp.bytes().await.unwrap().to_vec();
+    assert_eq!(length, Some(exported.len() as u64));
+    assert_eq!(ex["status"]["ova_bytes"], exported.len() as u64);
+    // GitHub `vmware-sim` 작업이 이 OVA를 `govc import.ova`로 vcsim에 넣어 본다(govmomi의 OVF 해석).
+    if let Some(out) = std::env::var_os("OPL_EXPORT_OVA_OUT") {
+        std::fs::write(out, &exported).unwrap();
+    }
+
+    let (status, back) = admin.upload("/vm-imports/ova?name=web2", exported).await;
+    assert_eq!(status, StatusCode::CREATED, "{back}");
+    assert_eq!(back["status"]["source_vm"]["guest_os"], "ubuntu64Guest");
+    assert_eq!(back["status"]["source_vm"]["nics"][0]["mac"], MAC);
+    let (status, task) = admin
+        .post(
+            "/vm-imports/web2/run",
+            // 원본 VM이 그 MAC을 쓰고 있으므로 새 MAC으로(내보낸 MAC은 위 원본 VM에서 본다)
+            json!({ "name": "web2", "pool": "local", "networks": { "lan": "lan" }, "keep_macs": false }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let (a, b) = (get_vm(&env, "web").unwrap(), get_vm(&env, "web2").unwrap());
+    assert_ne!(a.spec.nics[0].mac, b.spec.nics[0].mac);
+    assert_eq!(a.spec.cpu.vcpus(), b.spec.cpu.vcpus());
+    assert_eq!(a.spec.memory_mib, b.spec.memory_mib);
+    let path = |name: &str| {
+        let v = get_volume(&env, name).unwrap();
+        pool_dir(&env).join(format!("{}.qcow2", v.id))
+    };
+    qemu_img(&[
+        "compare",
+        "-f",
+        "qcow2",
+        "-F",
+        "qcow2",
+        path("web-disk0").to_str().unwrap(),
+        path("web2-disk0").to_str().unwrap(),
+    ]);
+}

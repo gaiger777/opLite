@@ -32,8 +32,8 @@ use crate::ceph::{
 };
 use crate::fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
 use crate::file_restore::{
-    DownloadPiece, FileRestoreCallRequest, FileRestoreChunk, FileRestoreDownloadRequest,
-    FileRestoreReply, FileRestoreSource,
+    DownloadHead, DownloadPiece, DownloadStream, FileRestoreCallRequest, FileRestoreChunk,
+    FileRestoreDownloadRequest, FileRestoreFault, FileRestoreReply, FileRestoreSource,
 };
 use crate::firmware::{
     PurgeFirmwareReply, PurgeFirmwareRequest, PushFirmwareReply, PushFirmwareRequest,
@@ -54,6 +54,7 @@ use crate::replica::{
     ReplicaAbortRequest, ReplicaFinishRequest, ReplicaPrepareRequest, ReplicaReceiver,
 };
 use crate::topology::{TopologyRequest, TopologySource};
+use crate::vm_export::{ExportDownloadRequest, ExportSource};
 use crate::wire::{
     AppendEntriesReply, AppendEntriesRequest, FollowRequest, IncomingReply, InstallSnapshotReply,
     InstallSnapshotRequest, LeaderReply, MigrateIncomingReply, ReplicaPrepareReply, ReplicaReply,
@@ -90,6 +91,8 @@ pub struct PeerService {
     guest: Option<Arc<dyn GuestAgentSource>>,
     /// 이 노드의 파일 복원 세션(계획 69). 없으면 `unimplemented`로 거부한다(옛 노드와 같다).
     file_restore: Option<Arc<dyn FileRestoreSource>>,
+    /// 이 노드의 VM 내보내기 파일(계획 72). 없으면 `unimplemented`로 거부한다(옛 노드와 같다).
+    exports: Option<Arc<dyn ExportSource>>,
     /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
     /// 실행기. 없으면 서버의 실행기에서 돈다.
     work: Option<Handle>,
@@ -114,6 +117,7 @@ impl PeerService {
             firmware_copies: None,
             guest: None,
             file_restore: None,
+            exports: None,
             work: None,
         }
     }
@@ -147,6 +151,12 @@ impl PeerService {
     /// 이 노드의 파일 복원 세션을 `source`로 다룬다. 없으면 `unimplemented`로 거부한다.
     pub fn with_file_restore(mut self, source: Arc<dyn FileRestoreSource>) -> Self {
         self.file_restore = Some(source);
+        self
+    }
+
+    /// 이 노드의 VM 내보내기 파일 내려받기를 `source`로 한다. 없으면 `unimplemented`로 거부한다.
+    pub fn with_exports(mut self, source: Arc<dyn ExportSource>) -> Self {
+        self.exports = Some(source);
         self
     }
 
@@ -826,19 +836,26 @@ impl Peer for PeerService {
         let started = self
             .offload(async move { source.download(req).await })
             .await?;
-        let stream = match started {
-            Err(f) => futures_util::stream::iter([Ok(FileRestoreChunk::Fault(f))]).boxed(),
-            Ok((head, rx)) => futures_util::stream::iter([Ok(FileRestoreChunk::Head(head))])
-                .chain(ReceiverStream::new(rx).map(|piece| {
-                    Ok(match piece {
-                        Ok(DownloadPiece::Data(d)) => FileRestoreChunk::Data(d),
-                        Ok(DownloadPiece::Done { entries }) => FileRestoreChunk::Done { entries },
-                        Err(m) => FileRestoreChunk::Failed(m),
-                    })
-                }))
-                .boxed(),
-        };
-        Ok(Response::new(stream))
+        Ok(Response::new(chunk_stream(started)))
+    }
+
+    type ExportDownloadStream = BoxStream<'static, Result<FileRestoreChunk, Status>>;
+
+    /// VM 내보내기 내려받기(계획 72): 머리(또는 거절) 하나 뒤 조각들. 받는 쪽이 흐름을 버리면 파일 읽기도 멈춘다.
+    async fn export_download(
+        &self,
+        req: Request<ExportDownloadRequest>,
+    ) -> Result<Response<Self::ExportDownloadStream>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .exports
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not serve VM exports"))?;
+        let req = req.into_inner();
+        let started = self
+            .offload(async move { source.download(req).await })
+            .await?;
+        Ok(Response::new(chunk_stream(started)))
     }
 
     type FollowStream = BoxStream<'static, Result<FollowFrame, Status>>;
@@ -970,4 +987,22 @@ pub async fn serve(
         .add_service(service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
+}
+
+/// 내려받기 시작 결과를 흐름 메시지로: 거절 하나, 또는 머리 뒤 조각들
+fn chunk_stream(
+    started: Result<(DownloadHead, DownloadStream), FileRestoreFault>,
+) -> BoxStream<'static, Result<FileRestoreChunk, Status>> {
+    match started {
+        Err(f) => futures_util::stream::iter([Ok(FileRestoreChunk::Fault(f))]).boxed(),
+        Ok((head, rx)) => futures_util::stream::iter([Ok(FileRestoreChunk::Head(head))])
+            .chain(ReceiverStream::new(rx).map(|piece| {
+                Ok(match piece {
+                    Ok(DownloadPiece::Data(d)) => FileRestoreChunk::Data(d),
+                    Ok(DownloadPiece::Done { entries }) => FileRestoreChunk::Done { entries },
+                    Err(m) => FileRestoreChunk::Failed(m),
+                })
+            }))
+            .boxed(),
+    }
 }

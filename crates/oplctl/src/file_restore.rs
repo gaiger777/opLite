@@ -482,8 +482,9 @@ fn disposition_name(header: &str) -> Option<String> {
     (!name.is_empty() && name != "." && name != "..").then(|| name.to_string())
 }
 
-/// 링크를 받아 `output`(없으면 서버 이름, `-`면 표준 출력)에 쓴다. 끊기면(받은 크기가 다르면) 실패다.
-async fn download(
+/// 링크를 받아 `output`(없으면 서버 이름, `-`면 표준 출력)에 쓴다. 끊기면(받은 크기가 다르면) 실패다. VM 내보내기
+/// 내려받기(계획 72)도 쓴다.
+pub(crate) async fn download(
     client: &Client,
     url: &str,
     output: Option<&str>,

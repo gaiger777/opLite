@@ -21,6 +21,7 @@ use opl_types::storage::{
 };
 use opl_types::task::{TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{VmSpec, VmStatus};
+use opl_types::vm_export::{VmExportSpec, VmExportStatus};
 use opl_types::vm_import::{VmImportSpec, VmImportStatus};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -177,6 +178,23 @@ impl Visible for VmImportSpec {
 
     fn owned(_owners: &Owners, item: &Typed<Self>) -> Owned {
         Owned::object(Owners::import(item.id))
+    }
+}
+
+/// 내보내기(계획 72)는 VM을 따른다(지운 VM이면 루트).
+impl Visible for VmExportSpec {
+    const SCOPED: bool = true;
+    const NEEDS_OWNERS: bool = true;
+
+    fn owned(owners: &Owners, item: &Typed<Self>) -> Owned {
+        Owned::object(owners.vm(item.spec.vm))
+    }
+
+    fn owned_one(state: &AppState, item: &Typed<Self>) -> Result<Owned, ApiError> {
+        Ok(Owned::object(Owners::around_export(
+            &state.cluster,
+            item.spec.vm,
+        )?))
     }
 }
 
@@ -361,6 +379,15 @@ list_and_get!(
     "vm-imports"
 );
 list_and_get!(
+    list_vm_exports,
+    get_vm_export,
+    VmExportSpec,
+    VmExportStatus,
+    "/vm-exports",
+    "/vm-exports/{key}",
+    "vm-exports"
+);
+list_and_get!(
     list_ha_groups,
     get_ha_group,
     HaGroupSpec,
@@ -525,6 +552,7 @@ pub async fn delete_pool(
         ));
     }
     check_no_backups(&state, &pool)?;
+    crate::vm_exports::check_no_exports(&state, &pool)?;
     state
         .cluster
         .delete::<StoragePoolSpec>(pool.id, if_match(&headers)?)

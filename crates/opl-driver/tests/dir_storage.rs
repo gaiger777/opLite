@@ -730,6 +730,65 @@ fn image_info(path: &Path) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+/// VM 내보내기(계획 72): qcow2·raw 볼륨을 streamOptimized VMDK로 쓴다. 쓴 파일은 `qemu-img`가 VMDK(streamOptimized)로
+/// 읽고 원본과 같은 크기·내용이며, 디스크립터에 어댑터·하드웨어 버전이 적힌다.
+#[tokio::test]
+async fn export_vmdk_writes_stream_optimized_vmdk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src_dir, out) = (tmp.path().join("src"), tmp.path().join("out"));
+    std::fs::create_dir(&src_dir).unwrap();
+    std::fs::create_dir(&out).unwrap();
+    let src_pool = pool(&src_dir);
+    let storages = Storages::new("qemu-img", Arc::new(DirStorage::new("qemu-img", MNT)));
+    for (i, format) in [ImageFormat::Qcow2, ImageFormat::Raw]
+        .into_iter()
+        .enumerate()
+    {
+        let id = Uuid::now_v7();
+        let path = storages
+            .create_volume(&src_pool, id, 16 * MIB, format)
+            .await
+            .unwrap();
+        assert!(qemu_io_fmt(&path, format, "write -P 0x6b 1M 128k"));
+        let source = storages
+            .volume_source(&src_pool, id, format, None)
+            .await
+            .unwrap();
+        let dest = out.join(format!("web-disk{i}.vmdk"));
+        storages.export_vmdk(&source, &dest, 19).await.unwrap();
+        let info = image_info(&dest);
+        assert_eq!(info["format"], "vmdk", "{info}");
+        assert_eq!(info["virtual-size"], 16 * MIB);
+        assert_eq!(
+            info["format-specific"]["data"]["create-type"], "streamOptimized",
+            "{info}"
+        );
+        // qemu-io는 VMDK를 형식 이름으로 연다.
+        let read = std::process::Command::new("qemu-io")
+            .args([
+                "-f",
+                "vmdk",
+                "-c",
+                "read -P 0x6b 1M 128k",
+                dest.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(read.success());
+        let head = std::fs::read(&dest).unwrap();
+        let text = String::from_utf8_lossy(&head[..head.len().min(64 << 10)]).into_owned();
+        assert!(text.contains("ddb.adapterType = \"lsilogic\""), "{text}");
+        assert!(text.contains("ddb.virtualHWVersion = \"19\""), "{text}");
+    }
+    let mut files: Vec<String> = std::fs::read_dir(&out)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    files.sort();
+    assert_eq!(files, ["web-disk0.vmdk", "web-disk1.vmdk"]);
+}
+
 /// 백업 내보내기: qcow2 볼륨의 스냅샷(실행 중인 VM처럼 `-U`)과 raw 볼륨의 지금 내용을 압축 qcow2
 /// 파일로 쓴다. 내보낸 파일은 스냅샷 없는 qcow2이고 원본의 크기와 내용을 갖는다.
 #[tokio::test]

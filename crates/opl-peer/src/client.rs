@@ -59,6 +59,7 @@ use crate::replica::{
     ReplicaPrepareResponse,
 };
 use crate::topology::TopologyRequest;
+use crate::vm_export::ExportDownloadRequest;
 use crate::wire::FollowRequest;
 use crate::{
     FIRMWARE_EPOCH_METADATA, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, MAX_MESSAGE_BYTES,
@@ -763,44 +764,44 @@ impl Peers {
                 async move { within(open_timeout, client.file_restore_download(req)).await }
             })
             .await;
-        let mut chunks = match reply {
+        let chunks = match reply {
             Ok(reply) => reply.into_inner(),
             Err(s) if s.code() == Code::Unimplemented => {
                 return Err(FileRestoreFault::unsupported());
             }
             Err(s) => return Err(FileRestoreFault::unreachable(s.message())),
         };
-        let first = tokio::time::timeout(open_timeout, chunks.message())
-            .await
-            .map_err(|_| FileRestoreFault::unreachable("timed out"))?;
-        let head = match first {
-            Ok(Some(FileRestoreChunk::Head(head))) => head,
-            Ok(Some(FileRestoreChunk::Fault(f))) => return Err(f),
-            Ok(_) => return Err(FileRestoreFault::unreachable("the download ended early")),
-            Err(s) => return Err(FileRestoreFault::unreachable(s.message())),
-        };
-        let (tx, rx) = tokio::sync::mpsc::channel(4);
-        tokio::spawn(async move {
-            loop {
-                let piece = match chunks.message().await {
-                    Ok(Some(FileRestoreChunk::Data(d))) => Ok(DownloadPiece::Data(d)),
-                    Ok(Some(FileRestoreChunk::Done { entries })) => {
-                        let _ = tx.send(Ok(DownloadPiece::Done { entries })).await;
-                        return;
-                    }
-                    Ok(Some(FileRestoreChunk::Failed(m))) => Err(m),
-                    Ok(Some(_)) => Err("unexpected download message".to_string()),
-                    Ok(None) => Err("the download ended early".to_string()),
-                    Err(s) => Err(s.message().to_string()),
-                };
-                let end = piece.is_err();
-                // 받는 쪽이 버렸으면 흐름을 버린다(gRPC 취소 → 세션 노드가 에이전트 흐름을 취소).
-                if tx.send(piece).await.is_err() || end {
-                    return;
-                }
+        relay_chunks(chunks, open_timeout, |w| FileRestoreFault::unreachable(w)).await
+    }
+
+    /// 노드 `node`(첫 링크 `addr`)에서 VM 내보내기 `req`를 내려받는다(계획 72 §12.3): 머리와 조각 흐름. 머리는
+    /// `open_timeout` 안에 와야 하고, 그 뒤로는 시간 제한이 없다. 그 노드가 이 RPC를 모르면 409 `cluster_upgrading`,
+    /// 닿지 못하면 503 `node_unreachable`이다.
+    pub async fn export_download(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: ExportDownloadRequest,
+        open_timeout: Duration,
+    ) -> Result<(DownloadHead, DownloadStream), FileRestoreFault> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                addressed(&mut req, Some(node));
+                async move { within(open_timeout, client.export_download(req)).await }
+            })
+            .await;
+        let chunks = match reply {
+            Ok(reply) => reply.into_inner(),
+            Err(s) if s.code() == Code::Unimplemented => {
+                return Err(crate::vm_export::export_unsupported());
             }
-        });
-        Ok((head, rx))
+            Err(s) => return Err(crate::vm_export::export_unreachable(s.message())),
+        };
+        relay_chunks(chunks, open_timeout, |w| {
+            crate::vm_export::export_unreachable(w)
+        })
+        .await
     }
 }
 
@@ -1305,4 +1306,43 @@ impl RaftNetwork<TypeConfig> for GrpcConnection {
         let reply = reply.map_err(rpc_error)?.into_inner();
         reply.map_err(|e| RPCError::RemoteError(RemoteError::new(self.target, e)))
     }
+}
+
+/// 내려받기 흐름(머리 하나 뒤 조각)을 받아 머리와 조각 채널로 바꾼다. 머리는 `open_timeout` 안에 와야 한다. 받는 쪽이
+/// 채널을 버리면 흐름을 버린다(gRPC 취소 → 주는 노드가 읽기를 멈춘다).
+async fn relay_chunks(
+    mut chunks: tonic::Streaming<FileRestoreChunk>,
+    open_timeout: Duration,
+    unreachable: fn(&str) -> FileRestoreFault,
+) -> Result<(DownloadHead, DownloadStream), FileRestoreFault> {
+    let first = tokio::time::timeout(open_timeout, chunks.message())
+        .await
+        .map_err(|_| unreachable("timed out"))?;
+    let head = match first {
+        Ok(Some(FileRestoreChunk::Head(head))) => head,
+        Ok(Some(FileRestoreChunk::Fault(f))) => return Err(f),
+        Ok(_) => return Err(unreachable("the download ended early")),
+        Err(s) => return Err(unreachable(s.message())),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move {
+        loop {
+            let piece = match chunks.message().await {
+                Ok(Some(FileRestoreChunk::Data(d))) => Ok(DownloadPiece::Data(d)),
+                Ok(Some(FileRestoreChunk::Done { entries })) => {
+                    let _ = tx.send(Ok(DownloadPiece::Done { entries })).await;
+                    return;
+                }
+                Ok(Some(FileRestoreChunk::Failed(m))) => Err(m),
+                Ok(Some(_)) => Err("unexpected download message".to_string()),
+                Ok(None) => Err("the download ended early".to_string()),
+                Err(s) => Err(s.message().to_string()),
+            };
+            let end = piece.is_err();
+            if tx.send(piece).await.is_err() || end {
+                return;
+            }
+        }
+    });
+    Ok((head, rx))
 }

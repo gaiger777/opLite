@@ -344,6 +344,21 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// 원본 `src`(`volume_source`가 돌려준 것)를 VMware가 받는 streamOptimized VMDK 파일 `dest`로 내보낸다(VM 내보내기 —
+    /// 계획 72 §12). 디스크립터의 하드웨어 버전은 `hw_version`(`ddb.virtualHWVersion`), 어댑터는 `lsilogic`이다(장치는
+    /// OVF가 정한다). [`export_volume`](Storage::export_volume)처럼 `{dest}.part`에 쓰고 이름을 바꾸며, 실패하면 `.part`를
+    /// 남기지 않는다. `dest`는 절대 경로여야 한다. 기본은 지원하지 않는다.
+    async fn export_vmdk(
+        &self,
+        _src: &VolumeSource,
+        _dest: &Path,
+        _hw_version: u8,
+    ) -> Result<(), DriverError> {
+        Err(DriverError::InvalidSpec(
+            "this storage cannot export VMDK files".into(),
+        ))
+    }
+
     /// 증분 백업의 대상으로 backing 없는 빈 qcow2 파일 `dest`(절대 경로)를 가상 크기 `size_bytes`로
     /// 만든다(있으면 덮어쓴다). 기본은 지원하지 않는다.
     async fn create_backup_target(
@@ -1205,6 +1220,45 @@ async fn export_to(
     written
 }
 
+/// [`Storage::export_vmdk`]: `qemu-img convert -O vmdk -o subformat=streamOptimized,…`로 `{dest}.part`에 쓰고(`-t
+/// writeback`) `dest`로 이름을 바꾼다. streamOptimized는 grain마다 deflate로 압축하므로 `-c`는 쓰지 않는다. 실행 중인 VM은
+/// 내보내지 않으므로 잠금을 지킨다(`-U` 없음 — 그새 VM을 켜면 둘 중 하나가 잠금에 막힌다).
+async fn export_vmdk_to(
+    qemu_img: &Path,
+    src: &VolumeSource,
+    dest: &Path,
+    hw_version: u8,
+) -> Result<(), DriverError> {
+    require_absolute(dest)?;
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let mut from = convert_from(src, false, None)?;
+    // 원본(경로·이미지 옵션)은 마지막이다. 출력 형식과 옵션을 그 앞에 둔다.
+    let source = from
+        .pop()
+        .ok_or_else(|| DriverError::InvalidSpec("the volume source has no path".into()))?;
+    let options = format!("subformat=streamOptimized,adapter_type=lsilogic,hwversion={hw_version}");
+    let mut args = vec!["convert", "-q", "-t", "writeback"];
+    args.extend(from.iter().map(String::as_str));
+    args.extend(["-O", "vmdk", "-o", options.as_str(), source.as_str()]);
+    args.push(path_str(&part)?);
+    let dir = dest.parent().unwrap_or(dest);
+    let written = match run_qemu_img(qemu_img, &args).await {
+        Ok(_) => {
+            let (from, to) = (part.clone(), dest.to_path_buf());
+            on_pool(FS_TIMEOUT, dir, move || std::fs::rename(from, to))
+                .await
+                .and_then(|r| Ok(r?))
+        }
+        Err(e) => Err(e),
+    };
+    if written.is_err() {
+        let _ = on_pool(FS_TIMEOUT, dir, move || std::fs::remove_file(part)).await;
+    }
+    written
+}
+
 /// `f`를 blocking 스레드에서 돌린다. 멈춘 NFS에서 끝나지 않는 호출이 tokio 워커를 붙잡지 않게
 /// 하고, `timeout`이 지나면 기다리지 않고 `PoolNotResponding(root)`(일시 오류)를 돌려준다.
 /// 끝나지 않은 호출은 blocking 스레드에 남는다.
@@ -1697,6 +1751,15 @@ impl Storage for DirStorage {
         dest: &Path,
     ) -> Result<(), DriverError> {
         export_to(&self.qemu_img, src, force_share, dest).await
+    }
+
+    async fn export_vmdk(
+        &self,
+        src: &VolumeSource,
+        dest: &Path,
+        hw_version: u8,
+    ) -> Result<(), DriverError> {
+        export_vmdk_to(&self.qemu_img, src, dest, hw_version).await
     }
 
     async fn create_backup_target(&self, dest: &Path, size_bytes: u64) -> Result<(), DriverError> {
@@ -3134,6 +3197,66 @@ pub(crate) mod tests {
         // 상대 경로는 받지 않는다.
         let err = storage
             .export_volume(&raw, false, Path::new("backups/disk0.qcow2"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");
+    }
+
+    /// VM 내보내기(계획 72): 원본을 복사와 같은 인자로 열고(잠금은 지킨다) `-O vmdk -o subformat=streamOptimized,…`로
+    /// `.part`에 쓴 뒤 이름을 바꾼다. 실패하면 `.part`를 지우고, 상대 경로는 받지 않는다.
+    #[tokio::test]
+    async fn export_vmdk_writes_stream_optimized_through_a_part_file() {
+        let tools = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let args = tools.path().join("args");
+        let storage = dir_storage(fake_tool(
+            tools.path(),
+            &format!("printf '%s\\n' \"$@\" > {args:?}\necho vmdk > \"$last\""),
+        ));
+        let src = VolumeSource {
+            path: "/pools/local/v.qcow2".into(),
+            format: ImageFormat::Qcow2,
+            snapshot: None,
+            size_bytes: 5,
+            rbd: None,
+        };
+        let dest = out.path().join("web-disk0.vmdk");
+        storage.export_vmdk(&src, &dest, 14).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"vmdk\n");
+        assert_eq!(pool_files(out.path()), vec!["web-disk0.vmdk".to_string()]);
+        let got = std::fs::read_to_string(&args).unwrap();
+        let part = format!("{}.part", dest.to_str().unwrap());
+        assert_eq!(
+            got.lines().collect::<Vec<_>>(),
+            [
+                "convert",
+                "-q",
+                "-t",
+                "writeback",
+                "-f",
+                "qcow2",
+                "-O",
+                "vmdk",
+                "-o",
+                "subformat=streamOptimized,adapter_type=lsilogic,hwversion=14",
+                "/pools/local/v.qcow2",
+                part.as_str(),
+            ]
+        );
+
+        let failing = dir_storage(fake_tool(
+            tools.path(),
+            "echo partial > \"$last\"\necho full >&2\nexit 1",
+        ));
+        let err = failing
+            .export_vmdk(&src, &out.path().join("web-disk1.vmdk"), 14)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DriverError::ToolFailed { .. }), "{err:?}");
+        assert_eq!(pool_files(out.path()), vec!["web-disk0.vmdk".to_string()]);
+
+        let err = storage
+            .export_vmdk(&src, Path::new("exports/web-disk0.vmdk"), 14)
             .await
             .unwrap_err();
         assert!(matches!(err, DriverError::InvalidSpec(_)), "{err:?}");

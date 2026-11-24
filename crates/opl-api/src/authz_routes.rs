@@ -25,6 +25,7 @@ use opl_types::router::RouterSpec;
 use opl_types::storage::{StoragePoolSpec, VolumeSpec};
 use opl_types::task::TaskSpec;
 use opl_types::vm::VmSpec;
+use opl_types::vm_export::VmExportSpec;
 use opl_types::vm_import::VmImportSpec;
 
 use crate::auth::Principal;
@@ -48,6 +49,8 @@ pub(crate) enum Obj {
     FloatingIp,
     LoadBalancer,
     NetworkMigration,
+    /// VM 내보내기(계획 72) — 내보낸 VM이 주인
+    Export,
 }
 
 /// 경로가 요구하는 것
@@ -503,6 +506,21 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/vm-imports/ova/check", Root(VmCreate)),
     ("POST", "/vm-imports/esxi/browse", Root(VmCreate)),
     ("POST", "/vm-imports/esxi", Root(VmCreate)),
+    // VM 내보내기(계획 72 §12): 만들기는 VM의 `vm.export`(+ 풀 `storage.allocate` — 핸들러), 나머지는 내보낸 VM의 것
+    ("POST", "/vms/{key}/export", Object(Vm, VmExport)),
+    ("GET", "/vm-exports", List),
+    ("GET", "/vm-exports/{key}", Read(Export)),
+    ("DELETE", "/vm-exports/{key}", Object(Export, VmExport)),
+    (
+        "POST",
+        "/vm-exports/{key}/download-link",
+        Object(Export, VmExport),
+    ),
+    (
+        "GET",
+        "/vm-exports/{key}/download/{token}",
+        Object(Export, VmExport),
+    ),
     // 볼륨: 만들기는 풀 `storage.allocate`(핸들러), 볼륨은 붙은 VM 또는 풀을 따른다.
     ("GET", "/volumes", List),
     ("POST", "/volumes", Handler),
@@ -628,6 +646,13 @@ pub(crate) fn resolve(cluster: &Cluster, obj: Obj, key: &str) -> Result<Option<F
             owned: object(AuthzTarget::Folder(f.id)),
             missing: missing::<FolderSpec>(key),
         }),
+        Export => match get::<VmExportSpec>(cluster, key)? {
+            None => None,
+            Some(e) => Some(Found {
+                owned: object(Owners::around_export(cluster, e.spec.vm)?),
+                missing: missing::<VmExportSpec>(key),
+            }),
+        },
         VmImport => get::<VmImportSpec>(cluster, key)?.map(|i| Found {
             owned: object(Owners::import(i.id)),
             missing: missing::<VmImportSpec>(key),

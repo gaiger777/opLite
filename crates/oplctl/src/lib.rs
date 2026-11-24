@@ -23,6 +23,7 @@ mod routing;
 mod sdn;
 mod template;
 mod two_factor;
+mod vm_export;
 #[cfg(test)]
 mod web_cross;
 
