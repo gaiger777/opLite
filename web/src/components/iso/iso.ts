@@ -147,3 +147,65 @@ export function linkPath(from: Point, to: Point, lift = 0): string {
   const my = (from.y + to.y) / 2 - lift;
   return `M${round(from.x)},${round(from.y)} Q${round(mx)},${round(my)} ${round(to.x)},${round(to.y)}`;
 }
+
+/** 상자의 보이는 면 하나(`boxFaces`의 한 칸 — 셋을 다 셈하지 않는다) */
+export function boxFace(b: Box, face: Face): Point[] {
+  const { x, y, z, w, d, h } = b;
+  const top = z + h;
+  switch (face) {
+    case "top":
+      return [iso(x, y, top), iso(x + w, y, top), iso(x + w, y + d, top), iso(x, y + d, top)];
+    case "left":
+      return [iso(x, y + d, top), iso(x + w, y + d, top), iso(x + w, y + d, z), iso(x, y + d, z)];
+    case "right":
+      return [iso(x + w, y, top), iso(x + w, y + d, top), iso(x + w, y + d, z), iso(x + w, y, z)];
+  }
+}
+
+/**
+ * 다각형 여럿을 SVG `<path d>` 하나로(계획 70 §4): `M…L…Z`를 늘어놓는다. 채움 규칙 `nonzero`라 겹치지 않는 면이면 다각형을
+ * 따로 그린 것과 같고, 겹치면 뒤에 놓은 조각이 위다(한 색이라 보이는 것은 같다). 원소 하나라 노드마다 "색 × 면" 수만큼만
+ * 원소가 생긴다.
+ */
+export function facesPath(polys: readonly (readonly Point[])[]): string {
+  const parts: string[] = [];
+  for (const p of polys) {
+    if (p.length < 3) {
+      continue;
+    }
+    parts.push(`M${p.map((q) => `${round(q.x)},${round(q.y)}`).join("L")}Z`);
+  }
+  return parts.join(" ");
+}
+
+/** 상자 여럿의 같은 면을 경로 하나로 */
+export function boxesPath(boxes: readonly Box[], face: Face): string {
+  return facesPath(boxes.map((b) => boxFace(b, face)));
+}
+
+/**
+ * 화면 좌표 → 높이 `z`의 세계 좌표(`iso`의 역). 높이를 알아야 한 점으로 정해진다(화면의 한 점은 세계의 (1, 1, 1) 방향 선
+ * 하나다 — `z`가 1 늘면 x·y도 1씩 는다).
+ */
+export function screenToWorld(p: Point, z = 0): { x: number; y: number } {
+  const diff = p.x / COS30;
+  const sum = (p.y + z) / SIN30;
+  return { x: (sum + diff) / 2, y: (sum - diff) / 2 };
+}
+
+/**
+ * 채움 면(`IsoGauge`): 상자의 옆면 하나를 아래 `fraction`(0~1)만큼의 "채움"과 그 위의 "나머지" 두 다각형으로 나눈다.
+ * 노드 블록의 왼쪽 면이 메모리, 오른쪽 면이 CPU 사용률이다(계획 70 §7.1).
+ */
+export function gaugeFaces(
+  b: Box,
+  face: "left" | "right",
+  fraction: number,
+): { fill: Point[]; rest: Point[] } {
+  const f = Math.min(1, Math.max(0, Number.isFinite(fraction) ? fraction : 0));
+  const filled = b.h * f;
+  return {
+    fill: boxFace({ ...b, h: filled }, face),
+    rest: boxFace({ ...b, z: b.z + filled, h: b.h - filled }, face),
+  };
+}

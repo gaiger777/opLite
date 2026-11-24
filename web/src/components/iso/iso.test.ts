@@ -1,15 +1,21 @@
 import {
   boxBounds,
+  boxFace,
+  boxesPath,
   boxFaces,
   byDepth,
   COS30,
   depthOf,
+  facesPath,
+  gaugeFaces,
   iso,
   linkPath,
   pointsAttr,
   prismFaces,
+  screenToWorld,
   shade,
 } from "@/components/iso/iso";
+import { rng } from "@/test/clusterMap";
 import { fitBox, zoomAt } from "@/components/iso/viewport";
 
 it("projects world points isometrically", () => {
@@ -76,4 +82,56 @@ it("fits and zooms the view box around a point within limits", () => {
     v = zoomAt(v, 2, 50, 25, fit);
   }
   expect(fit.w / v.w).toBeCloseTo(6);
+});
+
+it("merges polygons into one path and boxes' faces into one path", () => {
+  expect(
+    facesPath([
+      [
+        { x: 0, y: 0 },
+        { x: 1, y: 0 },
+        { x: 1, y: 1 },
+      ],
+      // 꼭짓점이 셋보다 적은 것은 뺀다
+      [{ x: 5, y: 5 }],
+      [
+        { x: 2, y: 2 },
+        { x: 3.333, y: 2 },
+        { x: 3, y: 3 },
+      ],
+    ]),
+  ).toBe("M0,0L1,0L1,1Z M2,2L3.33,2L3,3Z");
+  expect(facesPath([])).toBe("");
+  const a = { x: 0, y: 0, z: 0, w: 10, d: 10, h: 4 };
+  const b = { x: 20, y: 0, z: 0, w: 10, d: 10, h: 4 };
+  for (const face of ["top", "left", "right"] as const) {
+    expect(boxFace(a, face)).toEqual(boxFaces(a)[face]);
+    expect(boxesPath([a, b], face)).toBe(facesPath([boxFaces(a)[face], boxFaces(b)[face]]));
+  }
+});
+
+it("maps screen points back to the world at a known height", () => {
+  expect(screenToWorld(iso(10, 4, 0))).toEqual({ x: expect.closeTo(10), y: expect.closeTo(4) });
+  // 성질: 무작위 점 천 개가 왕복한다
+  const r = rng(7);
+  for (let i = 0; i < 1000; i++) {
+    const x = (r() - 0.5) * 4000;
+    const y = (r() - 0.5) * 4000;
+    const z = r() * 200;
+    const back = screenToWorld(iso(x, y, z), z);
+    expect(back.x).toBeCloseTo(x, 6);
+    expect(back.y).toBeCloseTo(y, 6);
+  }
+});
+
+it("splits a side face into a gauge fill and the rest", () => {
+  const box = { x: 0, y: 0, z: 10, w: 120, d: 120, h: 40 };
+  const g = gaugeFaces(box, "left", 0.25);
+  // 채움은 아래 10, 나머지는 위 30
+  expect(g.fill).toEqual(boxFace({ ...box, h: 10 }, "left"));
+  expect(g.rest).toEqual(boxFace({ ...box, z: 20, h: 30 }, "left"));
+  // 범위 밖·숫자 아님은 0~1로
+  expect(gaugeFaces(box, "right", 2).fill).toEqual(boxFace(box, "right"));
+  expect(gaugeFaces(box, "right", Number.NaN).rest).toEqual(boxFace(box, "right"));
+  expect(gaugeFaces(box, "right", -1).rest).toEqual(boxFace(box, "right"));
 });

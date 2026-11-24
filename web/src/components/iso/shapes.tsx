@@ -3,6 +3,7 @@
 import {
   boxFaces,
   type Box,
+  gaugeFaces,
   iso,
   linkPath,
   type Point,
@@ -247,5 +248,31 @@ export function IsoLink({
       strokeDasharray={dashed ? "5 4" : undefined}
       markerEnd={arrow ? `url(#${arrow})` : undefined}
     />
+  );
+}
+
+/**
+ * 채움 면(계획 70 §7.1): 상자 옆면 하나를 아래 `fraction`만큼 `fill` 색, 나머지를 `color`로 칠한다(다각형 둘). 블록 위에
+ * 덧그린다 — 블록의 테두리는 그대로 보인다.
+ */
+export function IsoGauge({
+  box,
+  face,
+  fraction,
+  color,
+  fill,
+}: {
+  box: Box;
+  face: "left" | "right";
+  fraction: number;
+  color: string;
+  fill: string;
+}) {
+  const g = gaugeFaces(box, face, fraction);
+  return (
+    <>
+      <polygon points={pointsAttr(g.rest)} style={{ fill: shade(color, face) }} />
+      <polygon points={pointsAttr(g.fill)} style={{ fill: shade(fill, face) }} />
+    </>
   );
 }
