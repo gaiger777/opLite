@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import type { AlertView } from "@/alerts/alerts";
+import { listKey } from "@/api/live";
 import type { Task } from "@/api/types";
 import { ClusterMapPage } from "@/clusterMap/ClusterMapPage";
 import { AppLayout } from "@/layout/AppLayout";
@@ -466,6 +467,27 @@ it("hides Apply and node actions from a user who may not use them", async () => 
   expect(within(node).queryByRole("button", { name: "Node actions" })).toBeNull();
 });
 
+it("shows Apply to a folder operator who may migrate the VM in its folder", async () => {
+  // 루트에는 `vm.migrate`가 없고 `job`의 폴더 안에만 있다 — 화면은 VM마다(그 폴더로) 묻는다
+  const folder = "019a0f3c-0000-7000-8f00-000000000001";
+  mockCluster({
+    limited: true,
+    vms: VMS.map((vm) => (vm.name === "job" ? { ...vm, spec: { ...vm.spec, folder } } : vm)),
+  });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({ ...LIMITED, contents: { [folder]: ["system.read", "vm.migrate"] } }),
+    ),
+  );
+  localStorage.setItem(`opl.${ADMIN.user}.clusterMap.layers`, "load,recommendations");
+  const user = userEvent.setup();
+  renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const map = await picture();
+  await user.click(await within(map).findByText("Recommended: job n2 → n1"));
+  const sheet = await screen.findByRole("dialog", { name: "Recommended move of job" });
+  expect(await within(sheet).findByRole("button", { name: "Apply" })).toBeVisible();
+});
+
 it("leaves Ctrl/⌘ with + - 0 to the browser's page zoom", async () => {
   mockCluster();
   renderPage(<ClusterMapPage />, { path: "/cluster/map" });
@@ -492,7 +514,7 @@ it("reaches arrows without a mouse: the node drawer and the list view list them 
     }),
   );
   const user = userEvent.setup();
-  const { container } = renderPage(<ClusterMapPage />, { path: "/cluster/map" });
+  const { container, queryClient } = renderPage(<ClusterMapPage />, { path: "/cluster/map" });
   const map = await picture();
   // 그림: n2에 초점 → Enter → 노드 서랍의 "마이그레이션과 추천" → 추천 서랍 → 적용
   const n1 = await within(map).findByRole("button", { name: /^Node n1,/ });
@@ -530,6 +552,58 @@ it("reaches arrows without a mouse: the node drawer and the list view list them 
   expect(within(task).getByRole("link", { name: "Open tasks" })).toBeVisible();
   await user.keyboard("{Escape}");
   await waitFor(() => expect(document.activeElement).toBe(mig));
+
+  // 목록에서 적용: 서버가 추천에 Task를 달고 `job`이 옮겨 가기 시작한다 → 추천 단추가 사라지고 초점은 `job`의 새
+  // 화살표로(사라진 단추나 `<body>`가 아니라)
+  const moving = VMS.map((vm) =>
+    vm.name === "job"
+      ? mapVm(3, "job", B.id, "migrating", {
+          spec: { power: "running" },
+          status: { node: B.id, migration: { node: A.id, task: "t2" } },
+        })
+      : vm,
+  );
+  server.use(
+    http.post(apiUrl("/placement/recommendations/:id/apply"), async () => {
+      mockCluster({ vms: moving });
+      const body = placementBody();
+      server.use(
+        http.get(apiUrl("/placement"), () =>
+          HttpResponse.json({
+            ...body,
+            recommendations: body.recommendations.map((r) => ({ ...r, task: "t2" })),
+          }),
+        ),
+      );
+      await queryClient.refetchQueries({ queryKey: listKey("vm") });
+      return HttpResponse.json({ ...MIGRATION, id: "t2", name: "t2" });
+    }),
+  );
+  await user.click(within(list).getByRole("button", { name: "Recommended: job n2 → n1" }));
+  const rec2 = await screen.findByRole("dialog", { name: "Recommended move of job" });
+  await user.click(within(rec2).getByRole("button", { name: "Apply" }));
+  const confirm2 = await screen.findByRole("alertdialog", { name: "Move job?" });
+  await user.click(within(confirm2).getByRole("button", { name: "Apply" }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+  await waitFor(
+    () => expect(document.activeElement?.getAttribute("data-key")).toBe(`move:${vmId(3)}`),
+    { timeout: 3000 },
+  );
+  expect(within(list).queryByRole("button", { name: /^Recommended:/ })).toBeNull();
+
+  // 서랍을 연 채 마이그레이션이 끝난다 → 화살표와 서랍이 사라지고 초점은 "마이그레이션과 추천" 머리글로
+  await user.click(within(list).getByRole("button", { name: "mig → n2 · 62%" }));
+  await screen.findByRole("dialog", { name: "Migration of mig" });
+  mockCluster({
+    vms: moving.map((vm) => (vm.name === "mig" ? mapVm(4, "mig", B.id, "running") : vm)),
+  });
+  await queryClient.refetchQueries({ queryKey: listKey("vm") });
+  await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull(), { timeout: 3000 });
+  await waitFor(() =>
+    expect(document.activeElement).toBe(
+      within(list).getByRole("heading", { name: "Migrations and recommendations" }),
+    ),
+  );
 });
 
 it("does not list recommendations in the list view while their layer is off", async () => {

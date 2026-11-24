@@ -1,15 +1,16 @@
 import { Server, SlidersHorizontal } from "lucide-react";
-import { lazy, Suspense, useCallback, useId, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router";
 
 import { usePrincipal } from "@/auth/AuthProvider";
-import { type ClusterMapData, useClusterMapData } from "@/clusterMap/data";
+import { COALESCE_MS, type ClusterMapData, useClusterMapData } from "@/clusterMap/data";
 import type { Focus } from "@/clusterMap/keys";
 import { mapLabels } from "@/clusterMap/labels";
 import {
   type GroupBy,
   layoutCluster,
+  type MapLink,
   type MapScene as Scene,
   type SlabItem,
 } from "@/clusterMap/layout";
@@ -221,6 +222,8 @@ export function ClusterMapPage() {
     setOpened(true);
   }
   const returnFocus = useRef<HTMLElement | null>(null);
+  // 목록에서 연 화살표는 단추가 아니라 화살표를 기억한다 — 적용하거나 마이그레이션이 끝나면 그 단추가 사라진다
+  const returnLink = useRef<MapLink | null>(null);
   const [lod, setLod] = useState<Lod | null>(null);
   const [settings, setSettings] = useState(false);
   const focus = useRef<Focus | null>(null);
@@ -284,8 +287,43 @@ export function ClusterMapPage() {
 
   const onOpen = (open: MapOpen) => {
     returnFocus.current = open.owner as HTMLElement | null;
+    returnLink.current = null;
     setSheet(targetOf(open.key));
   };
+  /**
+   * 서랍이 닫힐 때: 목록에서 연 화살표의 단추가 사라졌으면 같은 VM의 새 화살표, 없으면 "마이그레이션과 추천" 머리글,
+   * 그것도 없으면 출발 노드로 초점을 돌린다(`<body>`로 떨어뜨리지 않게).
+   */
+  const resolveReturn = () => {
+    const link = returnLink.current;
+    const list = document.querySelector<HTMLElement>("[data-map-list]");
+    if (!link || !list || returnFocus.current?.isConnected) {
+      return;
+    }
+    const byKey = (key: string) =>
+      [...list.querySelectorAll<HTMLElement>("[data-key]")].find((el) => el.dataset.key === key);
+    returnFocus.current =
+      byKey(link.key) ??
+      byKey(`move:${link.vm}`) ??
+      list.querySelector<HTMLElement>("[data-moves]") ??
+      byKey(link.ends[0]) ??
+      null;
+  };
+  // 닫은 바로 뒤 모은 갱신(`COALESCE_MS`)이 늦게 와서 돌려준 단추를 없애도 초점을 `<body>`에 두지 않는다 —
+  // 진행 중 마이그레이션이 있으면 갱신이 늘 모여 오므로 "적용"의 추천 단추는 닫은 뒤에 사라지기 쉽다.
+  const returnUntil = useRef(0);
+  const beforeReturn = () => {
+    returnUntil.current = returnLink.current ? Date.now() + 2 * COALESCE_MS : 0;
+    resolveReturn();
+  };
+  useEffect(() => {
+    const lost = returnFocus.current && !returnFocus.current.isConnected;
+    if (lost && Date.now() < returnUntil.current && document.activeElement === document.body) {
+      resolveReturn();
+      returnFocus.current?.focus();
+    }
+  });
+
   const onDetail = (open: MapOpen) => {
     const target = targetOf(open.key);
     if (target?.kind === "node") {
@@ -515,7 +553,10 @@ export function ClusterMapPage() {
               links={links}
               labels={labels}
               slabName={slabName}
-              onOpen={(key, owner) => onOpen({ key, owner })}
+              onOpen={(key, owner) => {
+                onOpen({ key, owner });
+                returnLink.current = links.find((l) => l.key === key) ?? null;
+              }}
             />
           )
         }
@@ -531,6 +572,7 @@ export function ClusterMapPage() {
             moves={data.placement.data?.recommendations ?? []}
             actions={actions}
             returnFocus={returnFocus}
+            beforeReturn={beforeReturn}
             onTarget={setSheet}
             onClose={() => setSheet(null)}
           />

@@ -1,6 +1,7 @@
 // "목록으로 보기"(계획 70 §10.3): 같은 모델의 나무 목록 — 판 → 노드(상태·부하 글) → VM(상태). `role="tree"`가 아닌 평범한
 // 중첩 목록과 머리글이라 화면 읽기 프로그램이 이미 잘 읽고 인쇄에도 맞다. 노드 단위 정렬·숫자 비교는 노드 표가 맡는다.
 // 그림의 화살표(진행 중 마이그레이션·켠 추천)는 "마이그레이션과 추천" 절의 단추 — 누르면 같은 화살표 서랍(Task 줄·"적용").
+// 적용·끝남으로 그 단추가 사라지면 초점은 같은 VM의 새 화살표 → 이 절의 머리글 → 출발 노드로 돌아온다.
 import { useTranslation } from "react-i18next";
 
 import type { MapLink, MapScene, NodeItem, SlabItem } from "@/clusterMap/layout";
@@ -108,7 +109,11 @@ export function MapList({
   };
 
   return (
-    <section aria-label={t("clusterMap.listLabel")} className="flex flex-col gap-4">
+    <section
+      aria-label={t("clusterMap.listLabel")}
+      className="flex flex-col gap-4"
+      data-map-list=""
+    >
       {scene.slabs
         .filter((s) => s.kind !== "unplaced")
         .map((slab) => (
@@ -121,7 +126,10 @@ export function MapList({
         ))}
       {links.length > 0 && (
         <div className="flex flex-col gap-1">
-          <h2 className="text-sm font-semibold">{t("clusterMap.moves")}</h2>
+          {/* 목록에서 연 화살표가 사라지면 초점이 여기로 온다(ClusterMapPage `resolveReturn`) */}
+          <h2 className="text-sm font-semibold" tabIndex={-1} data-moves="">
+            {t("clusterMap.moves")}
+          </h2>
           <ul className="flex flex-col gap-0.5">
             {links.map((link) => (
               <li key={link.key}>

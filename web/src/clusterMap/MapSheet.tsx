@@ -325,6 +325,7 @@ export function MapSheet({
   moves,
   actions,
   returnFocus,
+  beforeReturn,
   onTarget,
   onClose,
 }: {
@@ -336,6 +337,8 @@ export function MapSheet({
   moves: readonly PlacementMove[];
   actions: ReturnType<typeof useNodeActions>;
   returnFocus: RefObject<HTMLElement | null>;
+  /** 닫힐 때 초점을 돌려주기 전에(`returnFocus`를 고쳐 둘 수 있다) */
+  beforeReturn?(): void;
   onTarget(target: SheetTarget): void;
   onClose(): void;
 }) {
@@ -395,7 +398,10 @@ export function MapSheet({
         side={phone ? "bottom" : "right"}
         className={phone ? "max-h-[85vh] overflow-y-auto" : "overflow-y-auto"}
         aria-describedby={undefined}
-        onCloseAutoFocus={(e) => focusBack(e, returnFocus)}
+        onCloseAutoFocus={(e) => {
+          beforeReturn?.();
+          focusBack(e, returnFocus);
+        }}
       >
         {body}
       </SheetContent>
