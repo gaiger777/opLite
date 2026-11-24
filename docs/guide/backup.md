@@ -1,10 +1,11 @@
 # 백업·복제·가져오기
 
-백업과 복원, 백업 저장소(중복 제거·암호화·S3·검증·라이브 복원), 원격 클러스터, 원격 복제(DR), VMware에서 가져오기. 처음 보는
+백업과 복원, 백업 저장소(중복 제거·암호화·S3·검증·라이브 복원), 파일 단위 복원, 원격 클러스터, 원격 복제(DR), VMware에서 가져오기. 처음 보는
 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [백업과 복원](#백업과-복원)
 - [백업 저장소(중복 제거·암호화·S3)](#백업-저장소중복-제거암호화s3)
+- [파일 단위 복원](#파일-단위-복원)
 - [원격 클러스터](#원격-클러스터)
 - [원격 복제(DR)](#원격-복제dr)
 - [VMware에서 가져오기](#vmware에서-가져오기)
@@ -594,7 +595,7 @@ orbivisorctl backup-store take-over prod-s3
 | 검증 | 예약·새 백업 검증, 깨진 청크 격리·스스로 낫기 | 예약 검증 | SureBackup(부팅 검증), 상태 검사 |
 | 라이브 복원 | 모든 풀, 이어 가는 Task(헬퍼·데몬·QEMU 죽음) | 있음 | Instant Recovery |
 | 따로 둘 서버 | 없음(클러스터 노드가 함) | PBS 서버 | 백업 서버·프록시·저장소 |
-| 없는 것 | 불변 백업, 파일 단위 복원(계획 69), 부팅 검증, 테이프 | — | — |
+| 없는 것 | 불변 백업, 부팅 검증, 테이프 | — | — |
 
 PBS·Veeam 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
 
@@ -617,7 +618,336 @@ PBS·Veeam 칸은 공개 문서의 일반적인 값이고 이 저장소에서 �
 - **용량**: GC는 청크 수만큼 나열하고 Bloom 필터(청크마다 약 10비트)를 메모리에 둔다. 아주 큰 저장소(청크 수억 개)의 GC 시간은 재지
   않았다.
 - **로컬 저장소**(공유 아닌 dir 풀)는 그 노드에 묶인다. 백업 데이터를 지키려면 NFS나 S3를 쓴다.
-- 파일 단위 복원(계획 69), 부팅 검증(SureBackup), 꺼진 VM의 증분 읽기, zstd 압축, 노드 백업 대역폭 제한은 다음 계획이다.
+- 부팅 검증(SureBackup), 꺼진 VM의 증분 읽기, zstd 압축, 노드 백업 대역폭 제한은 다음 계획이다. 파일 단위 복원은 계획 69
+  ([파일 단위 복원](#파일-단위-복원)).
+
+## 파일 단위 복원
+
+**파일 단위 복원**(계획 69)은 VM을 통째로 되살리지 않고 백업 안의 파일을 꺼낸다(Proxmox Backup Server의 file restore, Veeam의
+FLR과 같은 자리). 백업 하나를 **일회용 도우미 마이크로 VM**에 읽기 전용으로 붙여 디스크 → 파티션(MBR·GPT)·LVM 논리 볼륨 →
+파일시스템 → 디렉터리를 웹·CLI·API로 찾아보고, 파일 하나는 그대로, 여러 항목·디렉터리는 **zip**이나 **tar.gz**로 흘려 내려받는다.
+고르면 실행 중인 VM 안으로 **게스트 에이전트**를 거쳐 되돌려 쓴다. 디스크를 복원하지 않는다 — 필요한 블록만 백업에서 읽는다.
+
+모든 백업에서 된다: 저장소 백업(평문·암호화, 로컬·S3), 백업 풀의 옛 풀 백업(증분이면 체인 전체를 붙여 그 시점을 봄), 원격에서 받은
+사본, 읽기 전용으로 붙인 저장소의 백업(DR 클러스터에서 원본 없이 파일 꺼내기). 백업은 **읽기만** 한다 — 백업 데이터·매니페스트는
+바뀌지 않고, 도우미 VM에는 쓰기 가능한 백업 장치가 없다. 이 기능을 쓰지 않는 클러스터·백업은 계획 68과 바이트까지 같다.
+
+클러스터의 모든 노드(위트니스·관찰 노드 포함)에 기능 `file-restore`가 있어야 하고, 아니면 **409** `cluster_upgrading`이다. 기능과
+따로, 세션을 여는 노드에는 **도우미 이미지**가 있어야 한다(아래 [도우미 이미지 설치](#도우미-이미지-설치)) — 이미지가 있는 노드가
+없으면 **409** `file_restore_unavailable`("install orbivisor-restore-image").
+
+- [찾아보기와 내려받기](#찾아보기와-내려받기)
+- [지원하는 디스크와 파일시스템](#지원하는-디스크와-파일시스템)
+- [VM으로 되돌려 쓰기](#vm으로-되돌려-쓰기)
+- [RHEL·Rocky 게스트 에이전트 설정](#rhelrocky-게스트-에이전트-설정)
+- [도우미 이미지 설치](#도우미-이미지-설치)
+- [노드 설정 `[file_restore]`](#노드-설정-file_restore)
+- [보안 모형](#보안-모형)
+- [권한·감사·다른 기능과의 관계](#권한감사다른-기능과의-관계)
+- [시간과 속도](#시간과-속도)
+- [PBS·Veeam과 견주기 (파일 단위 복원)](#pbsveeam과-견주기-파일-단위-복원)
+- [한계와 계획 69가 아직 하지 않는 것](#한계와-계획-69가-아직-하지-않는-것)
+
+### 찾아보기와 내려받기
+
+**세션**은 백업 하나를 붙인 도우미 VM이다. 처음 열면 도우미가 부팅해 디스크를 탐지하고(하드웨어 가속 노드 1~2초, TCG 노드 몇 초 —
+[시간과 속도](#시간과-속도)), 같은 사용자가 같은 백업을 다시 열면 열린 세션을 그대로 쓴다. 나열·내려받기·되돌려 쓰기가
+**15분** 없으면 닫히고, 열린 지 **8시간**이면 닫힌다(진행 중 내려받기는 끊김). 화면을 떠나도 세션은 열려 있어 돌아와서 다시 쓴다.
+
+**웹**: 보호 › 백업 표(또는 VM 상세의 "백업" 탭)의 행 동작 **"파일 찾아보기"** → 화면 `/backups/<백업 id>/files`. 머리에 상태
+칩("시작 중 0:03" → "준비됨", 하드웨어 가속이 없는 노드면 "느린 노드: 1분까지")과 닫힐 때까지 남은 시간, 닫기 단추가 있다. 왼쪽은
+디스크마다 묶은 **볼륨 나무**(파일시스템·레이블·크기, 찾아볼 수 없는 볼륨은 흐리게 까닭을 글로), 오른쪽은 **파일 표**(이름·크기·
+수정 시각·모드·uid:gid, 심볼릭 링크 대상, 체크 상자, 끝까지 내리면 다음 쪽). **내려받기**는 고른 것이 없으면 지금 폴더 전체를 zip,
+일반 파일 하나면 그대로, 여럿·폴더면 zip이고, 메뉴에서 tar.gz(권한·소유자·링크 보존)를 고른다. 화면 구성은
+[웹 화면 둘러보기](web-ui.md#파일-찾아보기-화면).
+
+```bash
+orbivisorctl backup files open web-20261123-030000 --wait     # 세션을 열고 준비될 때까지(없어도 아래 명령이 열고 기다린다)
+# opening a file restore session for backup web-20261123-030000 (the helper VM is booting; this can take a minute)
+# file restore session 0190a5b2-… (ready)
+orbivisorctl backup files volumes web-20261123-030000
+# VOLUME       DISK  KIND            FS           LABEL  SIZE      STATE      NOTE
+# disk0p1      0     partition       vfat         -      600.0MiB  unmounted  -
+# disk0p2      0     partition       xfs          -      1.0GiB    unmounted  -
+# disk0p3      0     partition       LVM2_member  -      38.4GiB   unmounted  LVM physical volume
+# lvm/rl/root  0     logical_volume  xfs          -      34.4GiB   unmounted  -
+orbivisorctl backup files ls web-20261123-030000 lvm/rl/root:/etc/nginx        # 디렉터리는 끝에 /, 링크는 -> 대상
+orbivisorctl backup files ls web-20261123-030000 lvm/rl/root:/etc/nginx -l     # MODE OWNER SIZE MODIFIED NAME
+orbivisorctl backup files get web-20261123-030000 lvm/rl/root:/etc/nginx/nginx.conf             # 파일 하나 그대로 → ./nginx.conf
+orbivisorctl backup files get web-20261123-030000 lvm/rl/root:/etc/nginx lvm/rl/root:/etc/hosts  # 여럿·디렉터리 → zip
+orbivisorctl backup files get web-20261123-030000 lvm/rl/root:/home/app --format tar.gz -O app.tar.gz
+orbivisorctl backup files get web-20261123-030000 lvm/rl/root:/var/log/app.log -O - | tail      # -O -는 표준 출력
+orbivisorctl backup files sessions                          # 내 열린 세션(--all은 모두 — admin)
+orbivisorctl backup files close web-20261123-030000         # 백업 이름(그 백업의 내 세션)이나 세션 id
+```
+
+- 경로는 `VOLUME:/경로`이고 볼륨만 주면 그 루트다. 한 번에 고르는 경로는 같은 볼륨이어야 한다. 볼륨 id는 `disk{i}`(파티션 표 없이
+  디스크 전체), `disk{i}p{n}`(파티션 번호 — MBR 논리 파티션은 5부터), `lvm/{vg}/{lv}`이고 세션 안에서만 뜻이 있다.
+- **`get`의 출력 파일은 `-O`(`--out-file`)다**(`-o`는 전역 출력 형식 `-o json`). 없으면 서버가 정한 이름으로 지금 디렉터리에 쓴다:
+  파일 하나는 그 이름, zip·tar.gz는 `<백업>-<마지막 조각>.zip`(여럿·루트면 볼륨 id). 진행은 표준 오류에.
+- **형식**: `auto`(기본 — 일반 파일 하나면 `raw`, 아니면 `zip`), `raw`(일반 파일 하나만), `zip`, `tar.gz`. **zip**은 Windows 탐색기가 바로
+  열고, 심볼릭 링크·장치·FIFO는 넣지 않는다(풀 때 링크가 대상 밖을 가리키지 않게) — 빠진 것과 읽기 오류 난 파일, 이름을 바꾼 항목
+  (UTF-8이 아닌 바이트·`\`·제어 문자는 `%XX`)은 아카이브 끝의 `ORBIVISOR-RESTORE-REPORT.txt`에 적는다. **tar.gz**(pax)는 모드·uid·
+  gid·나노초 시각·심볼릭 링크·하드 링크를 그대로 둔다(장치·FIFO는 빼고 보고서) — **권한까지 되살리려면 tar.gz를 받아 root로 푼다.**
+- 한 번에 내려받는 항목 수는 `download_max_entries`(기본 100만)까지, 바이트 한도는 없다(흐름). 한 파일의 읽기 오류(S3 끊김·깨진
+  블록)는 그 파일만 오류 항목으로 끝내고 보고서에 적는다 — 처음부터 다시 받는다. `raw`는 흐름을 끊는다(`the download was cut off`).
+- **API**(태그 `file-restore`, `/api/v1` 아래): `POST /backups/{key}/file-restore` → 202(새로)·200(다시 씀) `{session, task}`,
+  `GET /file-restore/sessions[?all=true][&backup=]`, `GET`·`DELETE /file-restore/sessions/{id}`, `GET /file-restore/sessions/{id}/volumes/{volume}/entries?path=…|path_b64=…&cursor=&limit=`
+  (볼륨 id의 `/`는 `%2F`, 쪽 크기 기본 200·상한 1000), `…/volumes/{volume}/stat?path=`, `POST /file-restore/sessions/{id}/download-link
+  {volume, paths, format, name?}` → `{url, expires_in: 60}`, 그 `url`(`/api/v1` 기준)을 **같은 사용자의 인증으로 60초 안에 한 번** GET.
+  두 걸음인 까닭은 큰 zip을 브라우저 메모리에 담지 않고 브라우저 내려받기 관리자에 맡기기 위해서다. 이름이 UTF-8이 아니면 `EntryView.raw`
+  (조각의 base64)를 쓰고, 경로 조각은 `{"b64": …}`, 디렉터리는 `path_b64`(조각 바이트를 `/`로 이은 것의 URL-safe base64)로 보낸다.
+- **세션 단계**는 Task(`file-restore-session`, 대상 = 세션 id)의 `status.progress.stage`(`booting`·`ready`·`closing`)이고, 보기의
+  `phase`는 `booting`·`ready`·`failed`·`closed`다. 실패·닫힘의 까닭(예 `closed after 15 min without use`, `the helper VM exited …`)은
+  `error`에 있다. 세션 노드가 아닌 노드의 API로도 나열·내려받기가 된다(노드 사이 RPC로 넘김, 끊으면 도우미 쪽 흐름도 취소).
+- **오류 코드**: 400 `invalid_path`(경로 0개·1000개 넘음, `raw`에 일반 파일 아님), 404 `session_not_found`·`volume_not_found`·
+  `entry_not_found`, 409 `backup_not_ready`·`backup_busy`·`store_not_ready`·`file_restore_unavailable`·`session_not_ready`·`session_closed`·
+  `volume_not_mountable`, 410 `link_expired`, 429 `file_restore_busy`(노드 세션이 꽉 참·세션당 동시 흐름 4), 502 `file_restore_io`
+  (백업을 읽지 못함), 503 `node_unreachable`, 504 `file_restore_timeout`(도우미가 60초 안에 답하지 않음).
+
+### 지원하는 디스크와 파일시스템
+
+| 종류 | 붙이는 법(늘 `ro,nodev,nosuid,noexec`) | 비고 |
+|---|---|---|
+| ext2·ext3·ext4 | 저널 재생 → 안 되면 `noload` | |
+| XFS(v4·v5) | `nouuid` → 안 되면 `norecovery,nouuid` | 같은 UUID의 XFS 둘(복제한 VM)도 함께 붙음 |
+| Btrfs | `subvolid=5` → 안 되면 `rescue=nologreplay` | 최상위를 붙여 모든 하위 볼륨이 디렉터리(`@`, `root` …)로 보임 |
+| NTFS | `ntfs3`, `iocharset=utf8` | 빠른 시작·최대 절전으로 더러운 볼륨도 읽기 전용으로 붙음. 압축·스파스 파일 읽음 |
+| FAT12/16/32(vfat) | `utf8,shortname=mixed` | EFI 시스템 파티션 포함 |
+| exFAT | `iocharset=utf8` | |
+| 파티션 | MBR(확장·논리 파티션 포함)·GPT, 파티션 표 없는 디스크 | |
+| LVM2 | 선형·줄무늬·미러·thin LV가 따로 볼륨 | PV 자체는 "LVM physical volume" |
+| LUKS·BitLocker | 붙이지 않음 | "encrypted (LUKS) — not supported" |
+| swap·ZFS·mdraid·ReFS·HFS+·F2FS·Windows 동적 디스크 | 붙이지 않음 | "<종류> — not supported" |
+
+**저널은 재생한다.** 백업은 crash-consistent라(게스트 에이전트 얼리기가 없으면) 저널에 커밋만 된 변경이 있을 수 있다. 원본은 읽기
+전용으로 두고 디스크마다 **버리는 qcow2 덮개** 위에 붙여 저널을 재생하므로 최근 파일이 빠지지 않고 백업은 바뀌지 않는다. 재생이
+실패하면 재생 없이 붙이고 볼륨에 "journal not replayed — recent changes may be missing"을 단다(웹은 경고 표시). 덮개 합이
+`overlay_max_mib`(기본 2 GiB)를 넘으면 세션을 닫는다 — 보통 재생은 수십 MiB다(실측 9.2 MiB). 파일시스템 고치기(`fsck`)는 하지 않는다.
+
+### VM으로 되돌려 쓰기
+
+고른 파일·디렉터리를 **실행 중인 VM** 안으로 QEMU 게스트 에이전트(`guest-file-open`·`-write`·`-flush`·`-close`)를 거쳐 쓴다(Veeam의
+"Restore to original location"과 같은 자리). 대상은 원래 VM이 기본이고 다른 VM도 된다. VM에 게스트 에이전트 채널이 있고
+(`orbivisorctl vm set web --guest-agent on` — [게스트 에이전트](vms.md#게스트-에이전트)) 게스트 안에 `qemu-guest-agent`가 돌아야 한다.
+자격 증명도 네트워크도 필요 없다.
+
+```bash
+orbivisorctl backup files restore web-20261123-030000 lvm/rl/root:/etc/nginx --vm web --to /etc --wait
+# restored 3 file(s) (4198 bytes) and 1 directory into VM web:/etc; kept existing files, wrote nginx.conf.restored-20261124-101500; owners, modes and times were not restored
+orbivisorctl backup files restore web-20261123-030000 lvm/rl/root:/etc/hosts --vm web --to /etc --conflict overwrite
+orbivisorctl backup files restore win-20261123-030000 disk0p2:/Users/kim/Documents/report.docx --vm win --to 'C:\restored'
+```
+
+- **충돌**(`--conflict`, 기본 `keep`): `keep` — 있는 파일은 그대로 두고 `<이름>.restored-YYYYMMDD-HHMMSS`(UTC, 그것도 있으면 `-2` …)로
+  옆에 쓴다. `skip` — 있는 파일은 건너뛴다. `overwrite` — 임시 `<이름>.orbivisor-<task>`에 다 쓴 뒤 `mv -f`로 바꿔 넣는다(쓰다 끊겨도
+  원래 파일은 그대로).
+- **디렉터리 만들기와 `overwrite`는 `guest-exec`도 있어야 한다**(Linux `/bin/mkdir -p --`·`/bin/mv -f -T --`·`/bin/rm -f --`를 argv로 —
+  셸 없음, Windows는 PowerShell `-EncodedCommand`에 경로를 작은따옴표 글자로). 에이전트가 `guest-exec`를 막으면 이미 있는 대상 디렉터리
+  바로 아래에 파일만 쓸 수 있다 — 디렉터리를 고르면 **400** `guest_mkdir_unavailable`, `overwrite`면 **400** `guest_overwrite_unavailable`.
+  파일 쓰기(`guest-file-*`)를 막으면 **409** `guest_agent_restricted`(RHEL·Rocky의 기본 — [다음 절](#rhelrocky-게스트-에이전트-설정)).
+- **대상 디렉터리**(`--to`): Linux는 `/`로 시작하는 절대 경로, Windows는 `C:\…`(UNC 없음). `.`·`..`·빈 조각은 받지 않고 Windows는 금지
+  문자·예약 이름(`CON`·`NUL`·`COM1` …)과 260자 넘는 경로를 거절한다(**400** `invalid_target_dir`, 항목이면 건너뛰고 결과에). 심볼릭 링크·
+  장치는 건너뛰고, UTF-8이 아닌 이름도 건너뛴다(그런 파일은 tar.gz로 받는다).
+- **소유자·모드·시각·ACL·xattr은 되돌리지 않는다.** 만든 파일은 에이전트의 사용자(Linux root, umask 따름) 것이다 — 결과 문구에
+  "owners, modes and times were not restored"가 붙는다. 권한이 중요하면 tar.gz로 받아 푼다.
+- **한도**: 한 번에 `guest_max_files`(1만 개)·`guest_max_bytes`(4 GiB) — 미리 알 수 없어 넘는 순간 멈추고 실패한다(이미 쓴 파일은 남고
+  결과에 목록). 한 파일이 실패하면(거절된 열기·쓰기, 백업 읽기 오류) 다 쓰지 못한 그 파일을 지우고(`guest-exec`가 없으면 남기고 결과에)
+  이어 가며, 하나라도 실패하면 Task는 실패다. 속도는 초당 1~3 MB 안팎이다(1 MiB마다 에이전트 잠금을 쥐고 놓아 게스트 정보 수집·
+  얼리기를 오래 막지 않음).
+- **Task**는 `file-restore-to-guest`(대상 = VM, 세션 노드에서 돎)이고 `status.progress.stage = writing`·`done_bytes`로 진행을 본다.
+  성공해도 결과 문구는 `status.error`(경고)에 있다 — 웹은 작업 알림, CLI는 `--wait`로 보인다. 지금은 Task를 취소하는 API가 없다.
+  세션이 닫히거나 Task가 버려지면 지금 쓰던 파일을 닫고 지운다.
+- **API**: `GET /vms/{key}/guest/restore-caps` → `{os, file_write, exec, reason?}`(VM `system.read`, 꺼진 VM 409 `vm_not_running`, 에이전트
+  없음 409 `guest_agent_unavailable`), `POST /file-restore/sessions/{id}/restore-to-vm {volume, paths, vm, target_dir, conflict}` → 202 Task.
+  웹의 "VM으로 복원" 대화상자는 VM을 고를 때마다 restore-caps를 물어 막힌 선택을 까닭과 함께 끈다.
+- **Windows 게스트**는 CI에 Windows 이미지가 없어 손으로 확인한다: VirtIO 드라이버 ISO의 guest agent를 설치하고 VM의 게스트 에이전트를
+  켠 뒤, (1) restore-caps가 `{"os": "windows", "file_write": true, "exec": true}`인지, (2) 폴더 하나를 `--to 'C:\restored'`로 되돌려
+  쓰고 탐색기에서 내용을 보는지, (3) 같은 파일을 `keep`으로 다시 써 `.restored-…` 파일이 생기는지, (4) `overwrite`로 바꾼 뒤
+  `C:\restored`에 `.orbivisor-` 임시 파일이 남지 않았는지 본다.
+
+### RHEL·Rocky 게스트 에이전트 설정
+
+RHEL·Rocky·AlmaLinux의 `qemu-guest-agent`는 **기본으로 파일 읽기·쓰기와 `guest-exec`를 막는다**. 막혀 있으면 웹 대화상자가
+"the guest agent blocks guest-file-* (the default on RHEL/Rocky: allow them in /etc/sysconfig/qemu-ga)"를 보이고 API는 409
+`guest_agent_restricted`다. **게스트 안에서** `/etc/sysconfig/qemu-ga`의 설정을 바꾸고 에이전트를 다시 시작한다. 설정 줄은 판마다
+다르다 — 파일을 열어 어느 꼴인지 본다.
+
+```bash
+# 게스트 안(root). 지금 허락 목록·막는 목록 보기
+grep -E '^(FILTER_RPC_ARGS|BLOCK_RPCS|BLACKLIST_RPC)' /etc/sysconfig/qemu-ga
+# (1) RHEL·Rocky 9·10 꼴 — FILTER_RPC_ARGS="--allow-rpcs=guest-sync-delimited,…"(허락 목록): 쓰기 넷과 exec 둘을 더한다
+sed -i '/^FILTER_RPC_ARGS=.*--allow-rpcs=/ s/"$/,guest-file-open,guest-file-write,guest-file-flush,guest-file-close,guest-exec,guest-exec-status"/' /etc/sysconfig/qemu-ga
+# (2) 옛 꼴 — BLACKLIST_RPC=guest-file-open,…(또는 BLOCK_RPCS, 막는 목록): 그 줄에서 위 여섯 이름을 지운다
+systemctl restart qemu-guest-agent
+```
+
+- 파일만 되돌려 쓸 것이면 `guest-file-open`·`-write`·`-flush`·`-close` 넷이면 된다. 디렉터리 만들기와 `overwrite`는 `guest-exec`·
+  `guest-exec-status`도 필요하다. **`guest-exec`는 게스트 안 root로 아무 명령이나 돌리는 권한이다** — Orbivisor는 `mkdir`·`mv`·`rm`만
+  argv로 부르지만, 에이전트 채널에 닿는 쪽(VM의 `vm.config`를 가진 사람·노드 root)을 믿을 때만 연다.
+- 바꾼 뒤 확인: `GET /api/v1/vms/web/guest/restore-caps`가 `"file_write": true`(와 `"exec": true`). 에이전트 정보는 1분마다 다시 묻고
+  restore-caps는 요청할 때 묻는다.
+- SELinux가 에이전트의 쓰기를 막으면 그 파일 열기가 거절로 끝나 Task 결과에 남는다(`ausearch -m avc -c qemu-ga`로 확인). 이 절의 설정
+  줄은 RHEL 계열 꾸러미의 일반적인 모양이고 실제 RHEL 게스트로 시험하지 않았다(막힘은 가짜 에이전트의 `supported_commands`로 시험).
+
+### 도우미 이미지 설치
+
+도우미 이미지는 Debian 13 커널(잠금 파일로 해시를 못 박은 꾸러미)과 우리 initramfs(정적 Rust 에이전트가 PID 1, Debian의 `lvm`·
+`blkid`, 고른 커널 모듈)다. 셸·busybox·네트워크는 없다. 노드마다 `[file_restore] image_dir`(기본 Linux `/usr/share/orbivisor/restore`,
+macOS `{data_dir}/restore-image`) 아래 `<arch>/`에 커널(x86_64 `vmlinuz`, aarch64 `Image`)·`initrd.img`·`manifest.json`이 있어야 한다.
+opld는 시작할 때와 그 뒤 1분마다 `manifest.json`이 바뀌었으면 파일 해시와 통신 규약 판, **이미지 판이 이 opld의 판과 같은지**를 보고,
+지나면 노드 상태에 알린다(`NodeStatus.file_restore` — 이미지 판·아키텍처·가속·세션 수). 지나지 못하면 로그에 한 줄(`file restore
+disabled: no helper image in /usr/share/orbivisor/restore/x86_64` 따위)을 남기고 그 노드는 세션을 받지 않는다 —
+다른 노드에 이미지가 있으면 거기서 연다. 다시 시작할 필요는 없다.
+
+- **Debian·Ubuntu(deb, amd64)**: `orbivisor-restore-image` 꾸러미(약 20 MB — 커널 12 MB·initrd 7 MB, `/usr/share/orbivisor/restore/x86_64/`)를 `orbivisor`가
+  `Recommends:`로 둔다 — apt 기본 설정이면 함께 깔린다. 아니면 `apt install orbivisor-restore-image`. `Depends: orbivisor (= 판)`이라
+  업그레이드 때 함께 올라간다. GPL 바이너리의 출처는 `/usr/share/doc/orbivisor-restore-image/debian.lock`(snapshot.debian.org의 같은 판).
+- **Rocky·소스 빌드 노드(aarch64 포함)**: 노드의 소스 트리(opld를 빌드한 것과 **같은 판**)에서 빌드해 기본 자리에 둔다. bsdtar·zstd·
+  python3·curl과 musl 타깃이 필요하다(에이전트는 `rust-lld`로 C 툴체인 없이 빌드됨). 받은 deb은 `~/.cache/orbivisor-restore-image`에
+  두고(아키텍처마다 약 115 MB) 다음 빌드에 다시 쓴다.
+
+  ```bash
+  sudo dnf install bsdtar zstd python3 curl
+  rustup target add aarch64-unknown-linux-musl                 # x86_64 노드면 x86_64-unknown-linux-musl
+  sudo install -d -o "$USER" /usr/share/orbivisor/restore/aarch64
+  packaging/restore-image/build.sh --arch aarch64 --out /usr/share/orbivisor/restore/aarch64
+  # build-restore-image: /usr/share/orbivisor/restore/aarch64: Image … bytes, initrd.img … bytes
+  orbivisorctl node get svc01 | jq .status.file_restore      # {"image_version": "orbivisor 0.1.0 lock-…", "arch": "aarch64", "accel": "tcg", …}
+  ```
+
+  opld를 `OPL_VERSION`을 주고 빌드했으면 같은 값을 `--version`으로 준다(이미지 판 `orbivisor <판> lock-<debian.lock 해시 앞 12자>`가
+  opld 판으로 시작해야 한다). **opld를 올릴 때마다 이미지도 다시 빌드한다** — 판이 다르면 그 노드는 알리지 않는다(굴려 올리는 동안은
+  올린 노드에서만 세션이 열린다). 빌드 결과는 같은 입력이면 바이트까지 같다(zstd 판이 같을 때).
+- **macOS(개발)**: 같은 스크립트를 `--out <data_dir>/restore-image/aarch64`로. HVF로 돈다(권한 내림·sandbox는 없다 — 개발용).
+- **설치 ISO**는 아직 이미지 꾸러미를 넣지 않는다(설치 뒤 `apt install orbivisor-restore-image`). arm64 deb·RPM은 없다.
+
+### 노드 설정 `[file_restore]`
+
+`opld.toml`의 `[file_restore]`(모두 생략 가능, 모르는 키는 시작 실패):
+
+| 키 | 기본 | 뜻 |
+|---|---|---|
+| `image_dir` | Linux `/usr/share/orbivisor/restore`, macOS `{data_dir}/restore-image` | 도우미 이미지(`<arch>/manifest.json` …) |
+| `max_sessions` | 4 | 노드당 세션(0이면 이 노드는 세션을 받지 않음, 64까지) |
+| `memory_mib` · `vcpus` | 512 · 2 | 도우미 VM(128~16384 MiB · 1~16). systemd scope의 `MemoryMax`는 메모리 + 256 MiB |
+| `boot_timeout_secs` | 300 | 에이전트 인사까지(10~3600 — TCG 노드를 생각해 넉넉히) |
+| `idle_minutes` · `max_hours` | 15 · 8 | 쓰지 않으면 닫음(1~10080) · 세션 최대 시간(1~168) |
+| `overlay_max_mib` | 2048 | 디스크 덮개 합(저널 재생이 쓰는 곳, 64 이상) |
+| `run_as` | `nobody` | 도우미 QEMU가 디스크·소켓을 연 뒤 내려갈 사용자(Linux, opld가 root일 때). `""`이면 내리지 않음 |
+| `guest_max_bytes` · `guest_max_files` | 4 GiB · 10000 | VM으로 되돌려 쓰기 한 번의 상한 |
+| `download_max_entries` | 1000000 | zip·tar.gz 한 번의 항목 수 상한 |
+
+```toml
+[file_restore]
+max_sessions = 2       # 작은 노드
+memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
+```
+
+### 보안 모형
+
+백업 안 파일시스템은 **믿을 수 없는 입력**이다(테넌트가 만든 디스크, 랜섬웨어가 망가뜨린 디스크). 그래서 호스트 커널도 opld도 그것을
+해석하지 않는다 — 해석은 세션마다 새로 띄우고 버리는 도우미 VM의 커널이 한다(PBS의 restore VM과 같은 길). 그 커널이 뚫려도 공격자는
+**그 세션의 백업 디스크만 읽을 수 있는 네트워크 없는 VM** 안에 있고, 그 뒤에 벽이 차례로 있다:
+
+| 벽 | 무엇을 막나 |
+|---|---|
+| 게스트 커널·에이전트 | 마운트는 늘 `ro,nodev,nosuid,noexec`. 에이전트가 PID 1(셸 없음)이라 게스트 안에 다른 프로그램이 돌지 않고, `lvm`·`blkid`는 argv로만 부른다. 경로는 조각마다 `O_NOFOLLOW`로 따라가 심볼릭 링크로 볼륨 밖에 나가지 못한다 |
+| QEMU 장치 면 | virtio-blk(디스크)·virtio-serial 하나(통신)·직렬 콘솔(로그 파일)·virtio-rng만. **네트워크·화면·USB·9p·virtiofs 없음**(`-nodefaults -no-user-config -net none -display none`) |
+| QEMU 프로세스 | Linux systemd면 `opl-fr-<id>.scope`(`MemoryMax`·`TasksMax=64`·`CPUQuota` vCPU × 100%), opld가 root면 디스크·소켓을 연 뒤 `-run-with user=nobody`(옛 QEMU `-runas`)로 내려감 — 내릴 수 없는 QEMU면 세션이 실패한다(몰래 root로 돌리지 않음). seccomp를 넣어 빌드한 QEMU면 `-sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny`(내리지 않을 때는 `elevateprivileges=deny`까지 — 내릴 때 그것을 걸면 QEMU 자신의 setuid가 막힌다). svc01 Rocky `qemu-kvm`에서 Uid 65534·Seccomp 2를 확인했다. upstream QEMU를 seccomp 없이 빌드했으면 sandbox는 없다 |
+| 백업 원본 | QEMU `read-only=on`. 저장소 백업은 opld 안 NBD 서버(쓰기는 `EPERM`)를 세션 디렉터리의 0600 유닉스 소켓으로, 옛 풀 백업은 qcow2를 읽기로 연다. 도우미가 덮개를 아무리 써도 백업은 그대로다 |
+| opld 쪽 통신 규약 | 프레임·이름(1024바이트)·경로 깊이(256)·링크 대상(4096)·볼륨 수(256)·쪽 항목(1000)·걷기 항목에 상한, 선언한 크기와 데이터가 다르면 그 흐름 오류, 첫 답·데이터 사이 60초(세 번 이어지면 세션 닫음). 어긋나면 세션을 닫는다(`agent protocol violation: …`). 게스트가 보낸 글은 로그·감사에서 제어 문자를 이스케이프하고 자른다 |
+| 아카이브 | zip·tar.gz 작성기가 깊이 우선 차례를 다시 본다 — 부모는 앞서 받은 디렉터리, 같은 경로는 한 번, 절대 경로·`..` 없음. zip에는 링크를 넣지 않는다. 그래서 받은 아카이브를 풀어도 대상 디렉터리 밖에 아무것도 생기지 않는다 |
+| 게스트로 되돌려 쓰기 | 이름은 백업에서 온 믿을 수 없는 값이라 셸을 거치지 않고(argv, Windows는 인코딩한 스크립트와 작은따옴표 글자), 조각마다 OS 규칙으로 거른다. 덮어쓰기는 임시 파일 뒤 이름 바꾸기 |
+
+- **암호화 저장소의 키는 opld를 떠나지 않는다.** opld가 청크를 받아 풀고 평문 블록을 NBD로 도우미에 준다(`backup-serve` 헬퍼를 쓰지
+  않음 — 세션은 opld와 생애를 같이한다). 도우미는 평문을 보지만 그것은 사용자가 지금 열람하려는 바로 그 데이터다.
+- **내려받기 링크**는 32바이트 무작위 토큰, 60초·한 번만, 그리고 GET 때 **같은 사용자의 인증을 다시 본다** — 링크가 새어도 남이 쓰지
+  못한다(다른 사용자 403, 쓴·지난 링크 410). 응답은 `Cache-Control: no-store`.
+- **열린 세션의 요청마다 권한을 다시 본다** — 권한을 빼면 다음 요청부터 403이고 세션은 유휴로 닫힌다. 다른 사용자의 세션은 보이지
+  않는다(루트 `cluster.admin`만 `--all`로 보고 닫음).
+- **남은 것 치우기**: 세션을 닫거나 도우미가 죽으면 QEMU(Shutdown → SIGTERM → SIGKILL)·scope·세션 디렉터리 둘(`{run_dir}/file-restore/<id>`,
+  `{data_dir}/file-restore/<id>` — 덮개·콘솔 로그)을 지운다. opld가 죽었다 뜨면 시작할 때 남은 도우미(명령줄에 `opl-fr-<id>`가 있는
+  프로세스만)·scope·두 디렉터리를 모두 치운다.
+- **macOS 노드**는 HVF 자식 프로세스로 돌고 권한 내림·sandbox·scope가 없다 — 개발용이다.
+
+### 권한·감사·다른 기능과의 관계
+
+| 일 | 필요한 것 |
+|---|---|
+| 세션 열기·나열·내려받기·닫기(자기 세션) | 백업 `backup.file_restore`(백업의 주인 = VM, 지운 VM이면 백업 때 폴더) |
+| 남의 세션 보기(`--all`)·닫기 | 루트 `cluster.admin` |
+| VM으로 되돌려 쓰기 | 백업 `backup.file_restore` + 대상 VM `vm.config` |
+| restore-caps 보기 | 대상 VM `system.read` |
+
+**`backup.file_restore`는 새 권한이고 내장 `operator`에 들어 있지 않다**(통째 복원 `backup.restore`와 따로 — 파일 꺼내기는 폴더·풀·할당량
+문이 없는 데이터 읽기다). `admin`은 가진다. 헬프데스크에게 파일 꺼내기만 맡기려면 사용자 정의 역할을 만든다
+([폴더와 권한](folders.md#사용자-정의-역할)):
+
+```bash
+orbivisorctl role create helpdesk-files --privileges system.read,backup.file_restore --description "백업에서 파일 꺼내기"
+orbivisorctl grant add --group helpdesk --role helpdesk-files --on /teamA
+```
+
+역할·토큰 범위에 `backup.file_restore`를 쓰는 것도 모든 노드에 기능 `file-restore`가 있어야 한다(아니면 409 `cluster_upgrading` — 옛 노드는
+이 이름을 몰라 권한 판단이 노드마다 달라지므로).
+
+- **감사**: `backup file-restore open web-20261123-030000 (session 0190a5b2, node node1)`, `… download-link … disk0p1:/etc/hostname (auto)`,
+  `backup file-restore download web-… lvm/rl/root:/etc (zip, 12 entries, 3.1 MiB)`(흐름이 끝날 때 — 끊기면 `interrupted after …`, 실패면
+  `failed after …`), `backup file-restore to-vm web-… disk0p1:/etc → vm web:/srv (keep)`, `… close …`. 경로는 처음 5개 + `and N more`,
+  이름은 제어 문자 이스케이프·200자. 유휴·최대 시간·도우미 죽음으로 스스로 닫힌 것은 요청이 아니라 감사가 아니고 Task 결과에 남는다.
+- **백업 지우기**: 세션이 열린 백업은 **409** `backup_in_use`("a file restore session is open …"). `orbivisorctl backup delete B --force`는
+  그 백업의 세션을 모두(누가 열었든) 닫고 지운다. **보존**(백업 작업)은 세션이 열린 백업을 그 틱에 건너뛰고 세션이 닫힌 뒤 다음 틱에 지운다.
+  저장소 GC는 세션과 무관하다(지우지 않은 백업의 청크는 표시됨).
+- **할당량**: 세션은 폴더 할당량에 세지 않는다 — 볼륨·VM·백업을 만들지 않고, 노드 자원(메모리·덮개)은 노드 한도가 지킨다.
+- **노드 고르기**: 이미지가 있고 온라인이고 자리가 있으며 백업을 읽을 수 있는 노드(저장소 백업은 저장소에 닿는 노드, 풀 백업은 그
+  풀을 읽는 노드 — 공유가 아닌 dir 풀이면 백업을 쓴 노드) 가운데 **API를 받은 노드** → 세션이 적은 노드 → 가속(KVM·HVF)이 TCG보다 →
+  이름 차례. 유지보수 노드는 뺀다. **노드 비우기**(drain)는 그 노드의 세션을 닫는다.
+- **라이브 복원 중인 백업**도 열 수 있다(둘 다 읽기만). 세션은 VM이 아니라 HA·마이그레이션 대상이 아니다. 노드가 죽거나 opld가 다시
+  뜨면 세션은 실패로 끝나고(이어 가지 않는 Task) 다시 연다. 위트니스는 세션을 받지 않는다.
+
+### 시간과 속도
+
+계획 69에서 잰 값(도우미 QEMU 시작 → 에이전트 인사, 흘리기는 받기만):
+
+| 곳 | 부팅 | 흘리기 |
+|---|---|---|
+| Apple Silicon Mac(HVF, Homebrew QEMU) | 1.2~1.3초(고정물 디스크 11개) | 227 MB/s |
+| svc01(Rocky 10 aarch64, TCG, QEMU 10.1) | 2.9~3.1초 | 88 MB/s(upstream QEMU)·109 MB/s(Rocky `qemu-kvm`) |
+| x86_64 TCG(이 Mac, 탐침) | 7.0초 | — |
+| x86_64 KVM·강제 TCG(GitHub `file-restore`) | 첫 실행 로그의 `PROBE` 줄 | 〃 |
+
+웹·CLI에서 세션 열기는 이 부팅에 탐지(0.2~0.9초)와 Task 시작이 더해진다. 흘리기는 virtio-serial이라 TCG에서는 CPU에 묶인다.
+VM으로 되돌려 쓰기는 게스트 에이전트의 1 MiB 쓰기마다 왕복이 있어 **초당 1.5~2.5 MB**(svc01 TCG·이 Mac HVF, 3 MiB 파일)이고, 작은
+파일 하나는 0.5~0.8초다 — 큰 것은 내려받아 다른 길로 옮긴다.
+
+### PBS·Veeam과 견주기 (파일 단위 복원)
+
+| | Orbivisor | Proxmox VE + PBS | Veeam B&R |
+|---|---|---|---|
+| 격리 | 세션마다 네트워크 없는 도우미 마이크로 VM(Debian 커널, 정적 Rust 에이전트), scope·권한 내림·sandbox | restore VM(같은 길) | Windows 마운트 서버 / Linux 도우미 어플라이언스 |
+| 파일시스템 | ext2/3/4·XFS·Btrfs·NTFS·FAT·exFAT, MBR·GPT·LVM(thin 포함), 저널 재생(버리는 덮개) | 비슷한 범위 | 넓음(ReFS 등) |
+| 백업 종류 | 저장소 백업(암호화·S3 포함)·옛 풀 백업 체인·받은 사본·읽기 전용 저장소 | PBS 백업 | Veeam 백업 |
+| 내려받기 | 파일 그대로·zip·tar.gz(pax, 권한·링크), 흘려 보냄, 일회용 링크 | zip·tar.zst | 탐색기 복사·내려받기 |
+| VM으로 되돌리기 | 게스트 에이전트(자격 증명 없음, keep·skip·overwrite) | 없음(내려받기) | 게스트 자격 증명으로 원래 자리(Windows·Linux) |
+| 따로 둘 서버 | 없음(클러스터 노드가 함, 이미지 꾸러미 하나) | PBS | 백업 서버·마운트 서버 |
+| 없는 것 | 카탈로그·이름 검색, LUKS·BitLocker, 권한 되돌리기 | — | — |
+
+PBS·Veeam 칸은 공개 문서의 일반적인 값이고 이 저장소에서 확인한 것이 아니다.
+
+### 한계와 계획 69가 아직 하지 않는 것
+
+- **카탈로그·이름 검색이 없다** — 백업마다 열어 디렉터리로 찾는다. 백업 사이 차이, 파일 미리 보기(텍스트·이미지)도 없다.
+- **LUKS·BitLocker·ZFS·ReFS·HFS+·F2FS·mdraid·Windows 동적 디스크·저장소 공간**은 알아보기만 하고 열지 않는다. 같은 VG UUID를 가진 LVM
+  디스크 둘(복제한 VM의 디스크를 한 백업에)은 확인하지 않았다.
+- **첫 세션은 부팅을 기다린다**(TCG 노드 몇 초 — 세션 다시 쓰기·유휴 15분으로 덜어 냄). TCG에서 흘리기는 CPU에 묶인다.
+- **되돌려 쓰기**는 권한·소유자·시각·ACL을 되돌리지 않고, 실행 중인 VM만, 게스트 에이전트가 허락할 때만(RHEL·Rocky는 설정 필요),
+  `guest-exec` 없으면 있는 디렉터리 바로 아래 파일만 된다. 속도는 초당 몇 MB다. Task 취소 API가 없다. 꺼진 VM 디스크에 직접 쓰기,
+  ISO로 묶어 꽂기는 없다. Windows 게스트는 손 확인만.
+- **zip**은 심볼릭 링크·장치·FIFO를 넣지 않는다(보고서 항목). 읽기 오류 난 파일은 오류 항목으로 남는다.
+- **이미지 배포**: deb는 amd64만, Rocky·소스 노드·macOS는 빌드 스크립트, 설치 ISO에는 아직 없다. opld를 올릴 때 이미지도 같은 판이어야 한다.
+- **macOS 노드**는 권한 내림·sandbox·scope가 없다(개발용).
+- 실행 중인 VM의 디스크·스냅샷·복제본 찾아보기, 세션 공유, 내려받기 대역폭 제한, 더 빠른 부팅(따뜻한 도우미)은 다음 계획이다.
 
 ## 원격 클러스터
 

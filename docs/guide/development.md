@@ -123,6 +123,23 @@ pnpm -C web test src/backupStores src/backups                       # 저장소 
 OPL_S3_ENDPOINT=http://127.0.0.1:9000 OPL_S3_TLS_ENDPOINT=https://127.0.0.1:9443 OPL_S3_CA=/tmp/opl-s3-certs/ca.pem \
   OPL_S3_ACCESS_KEY=… OPL_S3_SECRET_KEY=… OPL_S3_BUCKET=orbi OPL_S3_CONTAINER=opl-s3 \
   cargo test -p opld --features s3-it --test backup_s3 -- --nocapture --test-threads=1
+# 파일 단위 복원(계획 69) — 가짜 도우미(MockHypervisor: 에이전트 몸통 + 메모리 나무)와 가짜 게스트 에이전트로 QEMU 없이
+cargo test -p opl-restore                                           # 통신 규약(프레임·이름·흐름 검사, 해석기 proptest), 에이전트 몸통(소켓 쌍 + 임시 디렉터리: 쪽 나눔·링크 탈출·하드 링크·취소·동시 흐름), 탐지 고정물·마운트 표, zip·tar.gz 작성기(무작위 나무 왕복)
+cargo test -p opl-restore --features storage-it --test archive_tools   # 만든 zip·tar.gz를 unzip -t·bsdtar·GNU tar·Python zipfile로 읽음(Debian: unzip libarchive-tools), 7만 항목 zip64
+cargo test -p opl-types file_restore                                # EntryPath·볼륨 id·guest_path_ok·guest_target_name·content_disposition·노드 고르기, serde 하위 호환
+cargo test -p opl-api --test file_restore --test file_restore_types --test two_nodes   # 세션 API·권한·토큰·감사·backup_in_use·보존·되돌려 쓰기(가짜 QGA), 기능 게이트, 다른 노드의 세션
+cargo test -p oplctl -- file_restore                                # backup files 경로 나누기·volumes 표·ls 쪽 넘김·ls -l
+pnpm -C web test src/fileRestore src/backups                        # 볼륨 나무·파일 표·키보드·내려받기 링크·VM으로 복원 대화상자, 백업 표 동작(msw, axe)
+bash packaging/tests/restore-image-test.sh                          # 이미지 빌더(가짜 deb·ELF·.ko — 네트워크·cargo 없이), 시험 게스트 갈래, 두 번 빌드 같음
+# 실제 도우미 VM(아래 "파일 단위 복원 시험"): 이미지(rustup의 <arch>-unknown-linux-musl 타깃, bsdtar·zstd·python3)와 고정물 디스크
+packaging/restore-image/build.sh --arch aarch64 --out /tmp/fr/img/aarch64       # x86_64 호스트면 --arch x86_64 --out /tmp/fr/img/x86_64
+crates/opl-restore/tests/fixtures/make-disks.sh /tmp/fr/fx                       # 있는 도구만(macOS: Homebrew e2fsprogs·dosfstools·mtools), lvm.img는 root
+OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
+  cargo test -p opl-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1   # 탐지·SHA-256·저널 재생·덮개 한도·kill -9·치우기, PROBE 줄
+OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
+  cargo test -p opld --features restore-it --test file_restore -- --nocapture   # E2E (1)~(5)(orbivisorctl backup files — (5)는 OPL_RESTORE_TEST_GUEST가 있을 때)
+pnpm -C web build && OPL_RESTORE_IMAGE_DIR=/tmp/fr/img OPL_RESTORE_FIXTURES=/tmp/fr/fx \
+  cargo test -p opld --features web-it --test web browser_browses_backup_files   # 브라우저로 찾아보기·내려받기
 # 여러 노드 OVN(아래 "여러 노드 SDN 시험"): Linux, root, docker, 커널 모듈 openvswitch·geneve·vxlan
 sudo modprobe -a openvswitch geneve vxlan && docker build -t opl-sdn-node ci/sdn-node
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target OPL_MULTINODE_IMAGE=opl-sdn-node \
@@ -323,6 +340,29 @@ remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 
 컨테이너 둘(HTTP `:9000`, 시험 CA로 서명한 `127.0.0.1` 인증서의 HTTPS `:9443`)을 띄우고 버킷을 러너의 AWS CLI로 만든 뒤 위
 `cargo test`를 돌린다(MinIO는 2025년 가을부터 이미지·바이너리를 내지 않아 바꿨다). 로컬에서 돌리려면 같은 컨테이너를 띄우고
 `OPL_S3_CONTAINER`에 HTTP 쪽 컨테이너 이름을 준다(멈춤 시험이 `docker pause`한다). svc 배포 서버에는 S3가 없어 이 시험은 GitHub에서만 돈다.
+
+**파일 단위 복원 시험**(계획 69)은 실제 도우미 이미지와 고정물 디스크가 있어야 돈다 — `OPL_RESTORE_IMAGE_DIR`(그 아래
+`<arch>/manifest.json`, `packaging/restore-image/build.sh`가 만듦)와 `OPL_RESTORE_FIXTURES`(`make-disks.sh`가 만든 이미지·`expected.sha256`)가
+없으면 건너뛴다. 이미지 판은 시험 빌드의 opld 판과 같아야 하므로 같은 소스 트리에서 만든다. `crates/opl-driver/tests/restore_helper.rs`
+(`restore-it` = `qemu-it`)는 도우미를 직접 띄워 고정물 11개(ext4는 opl-store NBD 서버 원본, 나머지 qcow2 원본)의 탐지 표·파일마다 SHA-256·
+더러운 ext4·XFS 저널 재생·같은 UUID XFS 둘·MBR·GPT·LUKS "not supported"·LVM 선형·씬, 덮개 한도, `kill -9`, 버려 둔 도우미의 치우기를 보고,
+부팅 시간·흘리기 MB/s를 `PROBE` 줄로 찍는다. 고르는 것: `OPL_RESTORE_QEMU`·`OPL_RESTORE_QEMU_IMG`(바이너리), `OPL_RESTORE_ACCEL=tcg`(가속
+강제), `OPL_RESTORE_BIG_MIB`(흘리기 크기, 기본 256), `OPL_RESTORE_SCOPE=1`(systemd scope). Linux에서 root로 돌리면 `-run-with user=nobody`
+뒤 QEMU uid와 seccomp도 본다. XFS 더러운 로그 고정물(`xfs-dirty.img`)은 root가 만든다(CI `file-restore` 작업의 "Fixture disks" 걸음 —
+루프 마운트, 파일 쓰기·fsync, `xfs_io -x -c shutdown`). `crates/opld/tests/file_restore.rs`(`restore-it` = `backup-it`, unzip·tar 필요)는
+orbivisorctl `backup files`로 (1) 고정물 ext4 VM의 암호화 로컬 저장소 백업 — 나열·raw·zip·tar.gz를 고정물과 견주고 닫은 뒤 도우미·세션
+디렉터리가 남지 않음, (2) 옛 풀 전체 → 더러운 저널 증분 체인, (3) 도우미 `kill -9`, (4) 세션이 열린 채 opld `SIGKILL` 뒤 치우기, (5) 실제
+게스트 에이전트로 되돌려 쓰기를 본다. (5)는 `build.sh --test-guest --out <dir>`(같은 커널에 Debian `qemu-guest-agent`·정적 busybox,
+`test-guest.lock`)로 만든 시험 게스트를 `OPL_RESTORE_TEST_GUEST`로 주면 돈다 — 시험이 QEMU 감싸개로 그 VM에만 `-kernel`·`-initrd`를 더한다.
+QEMU가 PATH 밖이면(svc01의 `/opt/qemu`) `OPL_TEST_QEMU`·`OPL_TEST_ACCEL`(기본 `tcg`)로, systemd scope는 `OPL_TEST_SYSTEMD=1`로, 배포판
+펌웨어가 `-kernel` 게스트를 띄우지 못하면(svc01 Rocky AAVMF) `OPL_TEST_UEFI_CODE`·`OPL_TEST_UEFI_VARS`로 QEMU에 딸린 edk2를 준다.
+macOS 유닉스 소켓 경로는 104바이트 안이어야 하므로 이미지·고정물·임시 디렉터리를 짧은 경로에 둔다. 웹 E2E `browser_browses_backup_files`
+(`web/e2e/file-restore.spec.ts`)도 같은 두 변수가 있을 때만 돌고, `OPL_SCREENSHOTS=<디렉터리>`면 화면 `file-restore.png`를 남긴다.
+CI **`file-restore`** 작업(Ubuntu 24.04 러너, KVM, root, `timeout-minutes: 60`)은 도구를 깔고 x86_64 이미지를 **두 번** 빌드해 세 파일의
+해시가 같은지 보고(재현), aarch64 이미지는 빌드만(부팅은 svc01), x86_64 시험 게스트를 만든 뒤, 고정물 전체(btrfs·ntfs·LVM·XFS 더러운 로그)를
+root로 만들고, root로 `restore_helper`(`OPL_RESTORE_SCOPE=1`)와 opld E2E (1)~(5)를, 마지막에 `OPL_RESTORE_ACCEL=tcg`로 도우미 시험을 한 번
+더 돌린다. `check (ubuntu)`는 musl 두 타깃의 `cargo tree -p opl-restore`에 C 빌드 스크립트(`cc`·`ring`·`openssl-sys`)가 없는지와
+`archive_tools`를, `shell`은 `restore-image-test.sh`를, `package`는 `orbivisor-restore-image` deb 빌드·설치를 본다.
 
 웹 UI (`web/`):
 

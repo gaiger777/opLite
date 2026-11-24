@@ -1534,7 +1534,6 @@ fn default_qemu_img() -> PathBuf {
 }
 
 impl Config {
-    /// `qemu-nbd`(계획 68 — 꺼진 VM·옛 백업을 저장소로 읽기): `qemu_img`과 같은 디렉터리의 것, 경로 없는 이름이면 PATH
     /// 도우미 이미지 디렉터리(`[file_restore] image_dir`, 없으면 Linux `/usr/share/orbivisor/restore`, macOS
     /// `{data_dir}/restore-image`)
     pub fn file_restore_image_dir(&self) -> PathBuf {
@@ -1580,6 +1579,7 @@ impl Config {
         )
     }
 
+    /// `qemu-nbd`(계획 68 — 꺼진 VM·옛 백업을 저장소로 읽기): `qemu_img`과 같은 디렉터리의 것, 경로 없는 이름이면 PATH
     pub fn qemu_nbd(&self) -> PathBuf {
         match self.qemu_img.parent().filter(|p| !p.as_os_str().is_empty()) {
             Some(dir) => dir.join("qemu-nbd"),
