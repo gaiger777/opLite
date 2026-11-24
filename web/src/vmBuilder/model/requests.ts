@@ -21,34 +21,10 @@ export type BuilderRequest =
   | { method: "POST"; path: "/vms"; body: { name: string; spec: VmSpec } }
   | { method: "POST"; path: "/vms/{key}/clone"; key: string; body: Schemas["CloneRequest"] };
 
-/**
- * `POST /vm-checks` 본문(설계 §9.1 — 스테이지 1의 `VmCheckRequest`). 스테이지 3이 `schema.d.ts`의 타입으로 바꾼다.
- */
-export interface VmCheckRequest {
-  name: string;
-  labels: Record<string, string>;
-  spec: VmSpec;
-  volumes: VolumeRequest[];
-  rules: RuleRequest[];
-}
-
-/** `POST /vm-checks`의 문제 하나(`level`이 없으면 오류) */
-export interface VmCheckProblem {
-  at: string;
-  code: string;
-  message: string;
-  level?: "error" | "warn";
-}
-
-/** `POST /vm-checks` 응답(설계 §9.1). 통과하지 못하면 고른 노드·머신·CPU 모델이 없을 수 있다. */
-export interface VmCheck {
-  ok: boolean;
-  problems: VmCheckProblem[];
-  node?: string | null;
-  machine?: Schemas["MachineType"] | null;
-  cpu_model?: string | null;
-  ips: string[][];
-}
+/** `POST /vm-checks` 본문·응답·문제 하나(설계 §9.1 — 스테이지 1의 서버 타입) */
+export type VmCheckRequest = Schemas["VmCheckRequest"];
+export type VmCheck = Schemas["VmCheck"];
+export type VmCheckProblem = Schemas["VmCheckProblem"];
 
 const MIB = 1024 ** 2;
 

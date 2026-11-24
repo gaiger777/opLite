@@ -69,6 +69,7 @@ it.each([
   ["/vms", "vms", "/vms"],
   ["/vms/web", "vms", "/vms"],
   ["/vms/-new", "vms", "/vms"],
+  ["/vms/-new/builder", "vms", "/vms"],
   ["/vms/web/edit", "vms", "/vms"],
   ["/vms/web/console", "vms", "/vms"],
   ["/isos", "vms", "/images"],
@@ -194,6 +195,11 @@ it.each([
   ],
   [
     "/vms/-new",
+    [{ label: "Virtual machines", to: "/vms" }, { label: "VMs", to: "/vms" }, { label: "New" }],
+  ],
+  // VM 빌더(계획 71)는 만들기 화면의 보기다.
+  [
+    "/vms/-new/builder",
     [{ label: "Virtual machines", to: "/vms" }, { label: "VMs", to: "/vms" }, { label: "New" }],
   ],
   ["/settings/tokens", [{ label: "Settings", to: "/settings" }, { label: "API tokens" }]],

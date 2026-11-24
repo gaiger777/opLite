@@ -696,9 +696,9 @@ describe("problems", () => {
     const list = problems(s, ctx, {
       ok: false,
       problems: [
-        { at: "quota", code: "quota_exceeded", message: "over" },
+        { at: "quota", code: "quota_exceeded", message: "over", level: "error" },
         { at: "disks.0", code: "pool_space", message: "tight", level: "warn" },
-        { at: "quota", code: "quota_exceeded", message: "again" },
+        { at: "quota", code: "quota_exceeded", message: "again", level: "error" },
       ],
       ips: [],
     });

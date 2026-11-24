@@ -71,6 +71,19 @@ export const appRoutes: RouteObject[] = [
               ]),
               // VM 이름은 `-`로 시작할 수 없으므로 "new"라는 VM과 겹치지 않는다.
               { path: "vms/-new", lazy: page(() => import("@/vms/VmFormPage"), "VmCreatePage") },
+              {
+                path: "vms/-new/builder",
+                // 빌더·끌기 틀 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다(계획 71 §12).
+                lazy: page(
+                  () =>
+                    Promise.all([
+                      import("@/vmBuilder/BuilderPage"),
+                      import("@/dnd/strings").then((s) => s.loadDndStrings()),
+                      import("@/vmBuilder/strings").then((s) => s.loadBuilderStrings()),
+                    ]).then(([m]) => m),
+                  "BuilderPage",
+                ),
+              },
               { path: "vms/:name", lazy: page(() => import("@/vms/VmDetailPage"), "VmDetailPage") },
               {
                 path: "vms/:name/edit",

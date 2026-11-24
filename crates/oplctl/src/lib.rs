@@ -23,6 +23,8 @@ mod routing;
 mod sdn;
 mod template;
 mod two_factor;
+#[cfg(test)]
+mod web_cross;
 
 pub use cli::run;
 pub use client::Client;

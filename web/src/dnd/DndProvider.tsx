@@ -179,6 +179,16 @@ export function DndProvider<I extends Item>({
 
   const phase = state.phase;
   const touchPress = state.phase === "pressing" && state.touch;
+  // 들고 있는 동안 전역 단축키를 받지 않게 알린다(`lib/shortcuts.ts` `dndHeld`, 설계 §6.2).
+  const held = phase === "dragging" || phase === "picked";
+  useEffect(() => {
+    if (!held) {
+      return;
+    }
+    const root = document.documentElement;
+    root.setAttribute("data-dnd-held", "");
+    return () => root.removeAttribute("data-dnd-held");
+  }, [held]);
   // 누르는 중·끄는 중: 창 전체의 포인터·키·스크롤
   useEffect(() => {
     if (phase !== "pressing" && phase !== "dragging") {

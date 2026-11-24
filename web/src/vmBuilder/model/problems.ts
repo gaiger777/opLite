@@ -243,13 +243,13 @@ export function browserProblems(s: BuilderState, ctx: BuilderCtx): Problem[] {
   return out;
 }
 
-/** 서버 미리 확인의 문제(그대로 — 수준이 없으면 오류) */
+/** 서버 미리 확인의 문제(그대로) */
 export function serverProblems(check: VmCheck | null | undefined): Problem[] {
   return (check?.problems ?? []).map((p) => ({
     at: p.at,
     key: p.code,
     message: p.message,
-    level: p.level ?? "error",
+    level: p.level,
     source: "server" as const,
   }));
 }

@@ -231,6 +231,18 @@ it("returns to the last tab from the sidebar and moves focus to the new page", a
   await vi.waitFor(() => expect(where(router)).toBe("/volumes"));
 });
 
+it("opens the VM builder as a lazy view of the create page with its strings", async () => {
+  renderApp("/vms/-new/builder");
+  expect(
+    await screen.findByRole(
+      "button",
+      { name: "Start with a medium Linux server" },
+      { timeout: 3000 },
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Builder" })).toHaveAttribute("aria-current", "page");
+});
+
 it("opens the cluster map as a lazy view of Infrastructure › Nodes and keeps [ inside the map", async () => {
   const router = renderApp("/cluster/map");
   // 노드 하나(레이블 없음) — 그림이 노드 블록을 그린다

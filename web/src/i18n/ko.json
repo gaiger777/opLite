@@ -1975,6 +1975,9 @@
   "vmForm": {
     "createTitle": "가상 머신 만들기",
     "editTitle": "{{name}} 편집",
+    "view": "보기",
+    "viewForm": "폼",
+    "viewBuilder": "빌더",
     "runningNote": "VM이 실행 중이라 노드·디스크와 인터페이스의 개수·순서·MAC은 바꿀 수 없고, 보안 그룹이 걸린 인터페이스가 있으면 인터페이스는 그룹만 바꿀 수 있습니다. 보안 그룹은 곧바로, 다른 변경은 다음 시작부터 적용됩니다.",
     "general": "일반",
     "cores": "vCPU 코어",
@@ -3335,7 +3338,9 @@
     "notTarget": "{{node}}(으)로 옮길 수 없습니다",
     "create": "만들기: {{what}}",
     "theme": "테마: {{theme}}",
-    "density": "밀도: {{density}}"
+    "density": "밀도: {{density}}",
+    "openBuilder": "VM 빌더 열기",
+    "builderKeywords": "빌더, 끌어 놓기, 조립"
   },
   "shortcuts": {
     "title": "단축키",

@@ -342,6 +342,13 @@ it("finds the cluster map by its other names (plan 70)", async () => {
   await waitFor(() => expect(router.state.location.pathname).toBe("/cluster/map"));
 });
 
+it("opens the VM builder by its other names (plan 71)", async () => {
+  const { router } = shell();
+  const { user } = await search("drag", "Open the VM builder");
+  await user.click(screen.getByRole("option", { name: "Open the VM builder" }));
+  await waitFor(() => expect(router.state.location.pathname).toBe("/vms/-new/builder"));
+});
+
 it("runs create, theme and help commands", async () => {
   const { router } = shell();
   let { user } = await search("create storage", "Create: Storage pool");

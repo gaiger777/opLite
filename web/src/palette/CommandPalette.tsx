@@ -612,6 +612,20 @@ function usePaletteItems(
       to: item.to,
       run: go(item.to),
     }));
+    // 끌어 놓기 VM 빌더(계획 71 — 만들기 화면의 보기 "빌더")
+    if (list.some((item) => item.id === "create:vm")) {
+      const to = "/vms/-new/builder";
+      list.push({
+        id: "create:vm-builder",
+        group: "commands",
+        label: t("palette.openBuilder"),
+        keywords: t("palette.builderKeywords")
+          .split(",")
+          .map((w) => w.trim()),
+        to,
+        run: go(to),
+      });
+    }
     for (const theme of ["light", "dark", "system"] as const) {
       list.push({
         id: `theme:${theme}`,

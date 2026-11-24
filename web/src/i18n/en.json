@@ -1975,6 +1975,9 @@
   "vmForm": {
     "createTitle": "Create a virtual machine",
     "editTitle": "Edit {{name}}",
+    "view": "View",
+    "viewForm": "Form",
+    "viewBuilder": "Builder",
     "runningNote": "The VM is running: its node, disks, and the number, order and MAC addresses of its interfaces cannot change, and if an interface has security groups, only the groups of the interfaces can change. Security groups apply right away; other changes apply from the next start.",
     "general": "General",
     "cores": "vCPU cores",
@@ -3335,7 +3338,9 @@
     "notTarget": "Cannot move to {{node}}",
     "create": "Create: {{what}}",
     "theme": "Theme: {{theme}}",
-    "density": "Density: {{density}}"
+    "density": "Density: {{density}}",
+    "openBuilder": "Open the VM builder",
+    "builderKeywords": "builder, drag, compose"
   },
   "shortcuts": {
     "title": "Keyboard shortcuts",

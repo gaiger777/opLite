@@ -59,6 +59,9 @@ const TEXT: [string, string][] = [
     [`--${tone}-fg`, `--${tone}-soft`],
     [`--${tone}-fg`, "--background"],
   ]),
+  // VM 빌더 칸의 문제 글(계획 71 §11)
+  ["--warning-fg", "--card"],
+  ["--danger-fg", "--card"],
 ];
 
 /** 아이콘·포커스 링·차트 선·상태 점/바탕: 3:1 */
@@ -66,6 +69,9 @@ const GRAPHIC: [string, string][] = [
   ["--ring", "--background"],
   ["--ring", "--card"],
   ["--brand", "--card"],
+  // VM 빌더의 놓을 칸 테두리·문제 칸 테두리(계획 71 §11)
+  ["--warning", "--card"],
+  ["--danger", "--card"],
   ...["--chart-1", "--chart-2", "--chart-3", "--chart-4", "--chart-5"].flatMap(
     (chart): [string, string][] => [
       [chart, "--background"],

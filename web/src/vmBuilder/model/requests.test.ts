@@ -145,8 +145,8 @@ it("checks without the plain password and not for templates", () => {
   const body = checkBody(s, ctx)!;
   expect(body.name).toBe("web");
   expect(body.labels).toEqual({});
-  expect(body.volumes.map((v) => v.name)).toEqual(["web-disk0"]);
-  expect(body.rules.map((r) => r.name)).toEqual(["web-zone"]);
+  expect(body.volumes?.map((v) => v.name)).toEqual(["web-disk0"]);
+  expect(body.rules?.map((r) => r.name)).toEqual(["web-zone"]);
   expect(JSON.stringify(body)).not.toContain("secret");
   expect(body.spec.cloud_init).toBeDefined();
   expect(checkBody(build([[`template:${TEMPLATE.id}`, "vm"]]), ctx)).toBeNull();

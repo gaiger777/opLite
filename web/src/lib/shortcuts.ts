@@ -123,6 +123,14 @@ export function dialogOpen(): boolean {
 }
 
 /**
+ * 끌어 놓기로 무엇을 들고 있다(계획 71 설계 §6.2 — 끌기 틀이 `<html data-dnd-held>`를 단다). 그동안은 전역 단축키를
+ * 받지 않는다(⌘K도 — 들고 있는 동안 키는 놓을 칸을 고른다).
+ */
+export function dndHeld(): boolean {
+  return document.documentElement.hasAttribute("data-dnd-held");
+}
+
+/**
  * 눌린 글자. 한글 입력 상태에서는 `e.key`가 `ㅎ`처럼 영문이 아니므로, 영문이 아닌 한 글자이면 물리 키(`e.code`의
  * `KeyG`)의 영문자로 바꾼다(Shift면 대문자). 영문 자판(AZERTY 등)은 `e.key`를 그대로 쓴다.
  */
@@ -161,7 +169,7 @@ export function useShortcuts(handlers: Partial<Record<ShortcutId, () => void>>, 
     }
     const sequence = createSequence();
     const onKey = (e: KeyboardEvent) => {
-      if (e.defaultPrevented || e.isComposing) {
+      if (e.defaultPrevented || e.isComposing || dndHeld()) {
         return;
       }
       const key = keyName(e);

@@ -2,17 +2,17 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { useTranslation } from "react-i18next";
-import { Link, useNavigate, useParams, useSearchParams } from "react-router";
+import { Link, Navigate, useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 
 import { useList } from "@/api/live";
 import type { Vm } from "@/api/types";
-import type { Permissions } from "@/auth/permissions";
+import { usePrincipal } from "@/auth/AuthProvider";
 import { usePermissions, usePermissionsReady } from "@/auth/usePermissions";
 import { ListPending } from "@/components/ListPending";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "@/components/ui/label";
-import { folderPath, folderTree, type FolderTree } from "@/folders/folders";
+import { folderTree } from "@/folders/folders";
 import { errorMessage, HOTPLUG_ERROR_CODES, serverErrorMessage } from "@/i18n/errors";
 import { choosableIsos } from "@/isos/isos";
 import { sdnNetworkNamed } from "@/sdn/ips";
@@ -52,6 +52,8 @@ import { createVm, createVolume, isConflict, trackHotplug, updateVm } from "@/vm
 import { firstLocalDisk } from "@/vms/replication";
 import { formSnapshotSupport } from "@/vms/snapshots";
 import { useVmByName } from "@/vms/VmDetailPage";
+import { clearDraft, defaultFolder, putDraft, readDraft, readMode } from "@/vmBuilder/draft";
+import { ViewSwitch } from "@/vmBuilder/ViewSwitch";
 
 export function VmCreatePage() {
   const perms = usePermissions();
@@ -59,35 +61,28 @@ export function VmCreatePage() {
   const nodes = useList("node");
   const folders = useList("folder");
   const [params] = useSearchParams();
+  const { user } = usePrincipal();
+  const { search } = useLocation();
   // 노드 목록을 읽을 수 없는 폴더 사용자는 머신을 서버에 맡긴다(계획 62).
   const readsNodes = perms.reads("node");
+  // 빌더(계획 71)에서 넘어온 값, 아니면 마지막 보기가 빌더면 그리로(쿼리를 지킴)
+  const draft = readDraft();
+  if (!draft && readMode(user) === "builder") {
+    return <Navigate to={`/vms/-new/builder${search}`} replace />;
+  }
   // 기본 폴더는 내 권한을 받은 뒤에 정한다(전역 역할만 본 값으로는 폴더 사용자가 루트를 받는다, 폼이 첫 값을 굳힌다).
   if (!ready || (readsNodes && !nodes.data) || !folders.data) {
     return <ListPending error={nodes.error ?? folders.error} />;
   }
   const folder = defaultFolder(perms, folderTree(folders.data, "vm"), params.get("folder"));
-  return <VmForm initial={emptyForm(readsNodes ? defaultMachine(nodes.data ?? []) : "", folder)} />;
-}
-
-/**
- * 새 VM의 폴더: 주소의 `?folder=`(폴더 보기의 "여기에 만들기"), 아니면 루트에 만들 수 있으면 루트, 아니면
- * `vm.create`가 있는 첫 폴더(경로순)다.
- */
-export function defaultFolder(
-  perms: Pick<Permissions, "has">,
-  tree: FolderTree,
-  asked: string | null,
-): string {
-  if (asked && tree.byId.has(asked)) {
-    return asked;
-  }
-  if (perms.has("vm.create")) {
-    return "";
-  }
-  const allowed = tree.folders
-    .filter((f) => perms.has("vm.create", { type: "object", kind: "vm", folder: f.id }))
-    .sort((a, b) => folderPath(tree, a.id).localeCompare(folderPath(tree, b.id)));
-  return allowed[0]?.id ?? "";
+  return (
+    <VmForm
+      initial={
+        draft?.values ?? emptyForm(readsNodes ? defaultMachine(nodes.data ?? []) : "", folder)
+      }
+      initialPreset={draft?.preset}
+    />
+  );
 }
 
 export function VmEditPage() {
@@ -118,7 +113,15 @@ function firstInvalid(section: HTMLElement): HTMLElement | null {
 }
 
 /** VM 만들기(`vm` 없음)와 고치기 */
-function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
+function VmForm({
+  vm,
+  initial,
+  initialPreset = "blank",
+}: {
+  vm?: Vm;
+  initial: VmFormValues;
+  initialPreset?: Preset;
+}) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -139,7 +142,9 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
   // 사용자가 머신을 직접 고르기 전에는 노드를 바꾸면 그 노드에 맞게 기본값을 다시 정한다(만들 때만).
   const [machineChosen, setMachineChosen] = useState(false);
   // 고른 프리셋(만들 때만). "Windows 11"이면 그 뒤에 더하는 디스크는 SATA, NIC는 e1000e로 시작한다.
-  const [preset, setPreset] = useState<Preset>("blank");
+  const [preset, setPreset] = useState<Preset>(initialPreset);
+  // 빌더가 넘긴 초안은 한 번만 쓴다(계획 71 §8.6).
+  useEffect(() => clearDraft(), []);
   // 폼 값에 마지막으로 얹은 프리셋(템플릿은 값을 바꾸지 않으므로 빠진다). Windows에서 떠날 때 장치를 돌린다.
   const [applied, setApplied] = useState<Preset>("blank");
   const windows = preset === "windows";
@@ -320,9 +325,13 @@ function VmForm({ vm, initial }: { vm?: Vm; initial: VmFormValues }) {
       className="grid max-w-5xl grid-cols-1 gap-x-8 gap-y-4 lg:grid-cols-[12rem_minmax(0,1fr)]"
       noValidate
     >
-      <h1 className="text-xl font-semibold lg:col-span-2">
-        {creating ? t("vmForm.createTitle") : t("vmForm.editTitle", { name: vm.name })}
-      </h1>
+      <div className="flex flex-wrap items-center gap-3 lg:col-span-2">
+        <h1 className="text-xl font-semibold">
+          {creating ? t("vmForm.createTitle") : t("vmForm.editTitle", { name: vm.name })}
+        </h1>
+        {/* 보기 전환 "폼 | 빌더"(계획 71): 지금 값을 빌더로 넘긴다. */}
+        {creating && <ViewSwitch mode="form" onLeave={() => putDraft({ values })} />}
+      </div>
       {/* 긴 폼은 넓은 화면에서 쓰기 좋다(설계 §5.9 당직 보기). */}
       <p className="text-sm text-muted-foreground md:hidden lg:col-span-2">
         {t("common.desktopOnly")}

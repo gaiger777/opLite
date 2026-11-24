@@ -5,6 +5,7 @@ import { useEffect } from "react";
 import { DndProvider, useDnd } from "@/dnd/DndProvider";
 import { LONG_PRESS_MS } from "@/dnd/core";
 import type { Item, Verdict } from "@/dnd/types";
+import { useShortcuts } from "@/lib/shortcuts";
 import { useDraggable } from "@/dnd/useDraggable";
 import { useDropSlot } from "@/dnd/useDropSlot";
 
@@ -135,6 +136,28 @@ it("cancels with Escape and gives focus back to the part", () => {
   expect(part("ceph")).toHaveFocus();
   expect(live()).toHaveTextContent("Cancelled.");
   expect(slot("Disks")).not.toHaveAttribute("data-drop");
+});
+
+it("pauses global shortcuts while something is held", () => {
+  const create = vi.fn();
+  const palette = vi.fn();
+  function Shortcuts() {
+    useShortcuts({ create, palette });
+    return null;
+  }
+  render(<Shortcuts />);
+  setup();
+  part("ceph").focus();
+  fireEvent.keyDown(part("ceph"), { key: " " });
+  expect(document.documentElement).toHaveAttribute("data-dnd-held");
+  fireEvent.keyDown(document.activeElement!, { key: "c" });
+  fireEvent.keyDown(document.activeElement!, { key: "k", metaKey: true });
+  expect(create).not.toHaveBeenCalled();
+  expect(palette).not.toHaveBeenCalled();
+  fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+  expect(document.documentElement).not.toHaveAttribute("data-dnd-held");
+  fireEvent.keyDown(document.body, { key: "c" });
+  expect(create).toHaveBeenCalledTimes(1);
 });
 
 it("picks with a tap and drops with a tap on a lit slot", () => {

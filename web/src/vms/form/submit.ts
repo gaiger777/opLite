@@ -17,7 +17,17 @@ export async function createVolume(
   label: string,
   signal: AbortSignal,
 ): Promise<void> {
-  const task = await call(api.POST("/volumes", { body: volumeRequest(disk, format) }));
+  await postVolume(queryClient, volumeRequest(disk, format), label, signal);
+}
+
+/** `POST /volumes` 본문 그대로 볼륨을 만들고 Task를 기다린다(VM 빌더의 `requests()` 본문 — 폼도 이 길로 보낸다). */
+export async function postVolume(
+  queryClient: QueryClient,
+  body: ReturnType<typeof volumeRequest>,
+  label: string,
+  signal: AbortSignal,
+): Promise<void> {
+  const task = await call(api.POST("/volumes", { body }));
   trackTask(task, label);
   await waitForTask(queryClient, task.id, signal);
 }
