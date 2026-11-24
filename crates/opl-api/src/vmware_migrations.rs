@@ -1181,7 +1181,7 @@ pub async fn resume_migration(
 }
 
 /// 계획을 취소한다(`cancelled`, 끝난 계획은 409 `migration_state`). 원본·우리 쪽에 남긴 것이 없는 항목은 곧 `cancelled`다.
-/// 복사를 시작한 항목은 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다(스테이지 4·5).
+/// 복사를 시작한 항목은 스케줄러가 만드는 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다.
 #[utoipa::path(post, path = "/vmware-migrations/{key}/actions/cancel", tag = "vmware",
     params(("key" = String, Path, description = "id or name")),
     responses((status = 200, body = MigrationView), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -1226,6 +1226,207 @@ pub async fn cancel_migration(
     }
     recount(&state, m.id).await?;
     Ok(Json(view(&state, m.id)?))
+}
+
+/// 항목 동작(`retry`·`cancel`)의 답: 바뀐 항목과 만든 Task(정리)
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ItemAction {
+    pub item: Resource<VmwareVmSpec, VmwareVmStatus>,
+    /// 만든 Task(취소가 원본·우리 쪽에 남은 것을 치우는 `vmware-cleanup`)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub task: Option<Uuid>,
+}
+
+fn item_state_conflict(item: &VmwareVm, what: &str) -> ApiError {
+    ApiError::conflict(
+        "vmware_vm_state",
+        format!(
+            "vmware-vm {:?} is {}; {what}",
+            item.name,
+            item.status.state.as_str()
+        ),
+    )
+}
+
+/// 항목의 끝나지 않은 VMware Task가 있나
+fn item_busy(state: &AppState, item: Uuid) -> Result<bool, ApiError> {
+    let (_, tasks) = state.cluster.list::<opl_types::task::TaskSpec>()?;
+    Ok(tasks.iter().any(|t| {
+        t.spec.target == item
+            && !t.status.state.is_finished()
+            && matches!(
+                t.spec.op,
+                opl_types::task::TaskOp::VmwareSync { .. }
+                    | opl_types::task::TaskOp::VmwareCutover
+                    | opl_types::task::TaskOp::VmwareRevert
+                    | opl_types::task::TaskOp::VmwareCleanup { .. }
+            )
+    }))
+}
+
+/// 실패한 항목을 다시 한다(계획이 `running`·`paused`일 때, 아니면 409 `migration_state`). 복사를 시작하지 않은 항목(미리
+/// 확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
+/// (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
+/// 다음 동기화 없음)은 다시 시작한다. 그 밖은 409 `vmware_vm_state`.
+#[utoipa::path(post, path = "/vmware-vms/{key}/retry", tag = "vmware",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody),
+        (status = 502, body = crate::error::ErrorBody)))]
+pub async fn retry_item(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<Json<ItemAction>, ApiError> {
+    require_feature(&state.cluster, VMWARE_MIGRATE)?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &key)?;
+    audit.detail(format!("vmware-vm retry {}", item.name));
+    let m = state
+        .cluster
+        .get::<VmwareMigrationSpec>(item.spec.migration)?
+        .ok_or_else(|| ApiError::not_found("vmware-migration not found"))?;
+    if !matches!(
+        m.status.phase,
+        VmwareMigrationPhase::Running | VmwareMigrationPhase::Paused
+    ) {
+        return Err(ApiError::conflict(
+            "migration_state",
+            format!(
+                "vmware-migration {:?} is {}, not running or paused",
+                m.name,
+                phase_name(m.status.phase)
+            ),
+        ));
+    }
+    if item_busy(&state, item.id)? {
+        return Err(ApiError::conflict(
+            "migration_busy",
+            format!(
+                "vmware-vm {:?} has a task running; try again later",
+                item.name
+            ),
+        ));
+    }
+    let at = now();
+    let stopped = item.status.state == VmwareVmState::Syncing && item.status.next_sync_at.is_none();
+    if item.status.state == VmwareVmState::Failed && not_started(&item.status) {
+        let mut again = item.clone();
+        again.status.sync_failures = 0;
+        let (checked, _) = Box::pin(preflight_items(
+            &state,
+            &principal,
+            &m,
+            std::slice::from_ref(&again),
+            true,
+        ))
+        .await?;
+        admit(&state, std::slice::from_ref(&again), &checked).await?;
+    } else if item.status.state == VmwareVmState::Failed || stopped {
+        let mut status = item.status.clone();
+        let warm = m.spec.mode == VmwareMigrationMode::Warm;
+        status.state = if item.status.rounds == 0 {
+            VmwareVmState::Copying
+        } else if warm {
+            VmwareVmState::Syncing
+        } else {
+            VmwareVmState::Ready
+        };
+        status.next_sync_at = (warm || item.status.rounds == 0).then_some(at);
+        if stopped {
+            // 멈춘 날부터 다시 센다.
+            status.started_at = Some(at);
+        }
+        status.error = None;
+        status.sync_failures = 0;
+        status.push_history(at, "retry requested");
+        state
+            .cluster
+            .update_status_checked::<VmwareVmSpec>(item.id, item.revision, &status)
+            .await
+            .map_err(|e| match e {
+                ClusterError::Rejected(Rejection::RevisionMismatch { .. }) => ApiError::conflict(
+                    "migration_busy",
+                    format!(
+                        "vmware-vm {:?} was changed by another request; try again",
+                        item.name
+                    ),
+                ),
+                e => e.into(),
+            })?;
+    } else {
+        return Err(item_state_conflict(
+            &item,
+            "only failed or stopped VMs can be retried",
+        ));
+    }
+    recount(&state, m.id).await?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &item.id.to_string())?;
+    Ok(Json(ItemAction { item, task: None }))
+}
+
+/// 항목 하나를 취소한다(설계 §10.3): 원본·우리 쪽에 남긴 것이 없으면 곧 `cancelled`, 있으면 `vmware-cleanup` Task(우리
+/// 스냅샷 지움, 우리가 켠 CBT 끔, 대상 볼륨 지움 — 원본 VM·디스크는 그대로)를 항목의 노드에 만든다(도는 동기화 뒤에 돈다).
+/// 끝났거나 전환 중·전환한 항목은 409 `vmware_vm_state`.
+#[utoipa::path(post, path = "/vmware-vms/{key}/cancel", tag = "vmware",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 200, body = ItemAction), (status = "4XX", body = crate::error::ErrorBody)))]
+pub async fn cancel_item(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    audit: AuditNote,
+    Path(key): Path<String>,
+) -> Result<Json<ItemAction>, ApiError> {
+    require_feature(&state.cluster, VMWARE_MIGRATE)?;
+    let item = lookup::<VmwareVmSpec>(&state.cluster, &key)?;
+    audit.detail(format!("vmware-vm cancel {}", item.name));
+    if item.status.state.is_final()
+        || matches!(
+            item.status.state,
+            VmwareVmState::CuttingOver | VmwareVmState::Done
+        )
+    {
+        return Err(item_state_conflict(
+            &item,
+            "only VMs that have not been cut over can be cancelled",
+        ));
+    }
+    if holds_nothing(&item.status) && !item_busy(&state, item.id)? {
+        let mut status = item.status.clone();
+        status.state = VmwareVmState::Cancelled;
+        status.next_sync_at = None;
+        status.push_history(now(), "cancelled");
+        state
+            .cluster
+            .update_status::<VmwareVmSpec>(item.id, &status)
+            .await?;
+        recount(&state, item.spec.migration).await?;
+        let item = lookup::<VmwareVmSpec>(&state.cluster, &item.id.to_string())?;
+        return Ok(Json(ItemAction { item, task: None }));
+    }
+    // 대상 볼륨은 항목의 노드(로컬 풀일 수 있다)에 있다. 그 노드가 오프라인이면 이 노드가 원본 쪽만이라도 치운다.
+    let online = |id: Uuid| {
+        state
+            .cluster
+            .get::<opl_types::node::NodeSpec>(id)
+            .ok()
+            .flatten()
+            .is_some_and(|n| n.status.online)
+    };
+    let node = item.spec.node.filter(|n| online(*n)).unwrap_or(state.node);
+    let task = crate::tasks::create_task(
+        &state.cluster,
+        opl_types::task::TaskOp::VmwareCleanup {
+            delete_target: true,
+        },
+        item.id,
+        node,
+    )
+    .await?;
+    Ok(Json(ItemAction {
+        item,
+        task: Some(task.id),
+    }))
 }
 
 /// 이전 항목(`vmware-vm`). `migration`을 주면 그 계획의 것만(없는 계획은 404).

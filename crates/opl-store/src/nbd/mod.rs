@@ -1,8 +1,10 @@
 //! NBD(네트워크 블록 장치) 클라이언트와 서버(계획 68 설계 §8·§11.1). 프로토콜은 `nbd/doc/proto.md`의 fixed
 //! newstyle 협상과 구조화 응답만 쓴다(TLS·확장 머리는 쓰지 않는다 — 유닉스 소켓 0600).
 //!
-//! - [`client`]: QEMU의 fleecing 내보내기·`qemu-nbd`를 읽는다(`base:allocation`·`qemu:dirty-bitmap:*` 문맥).
-//! - [`server`]: 읽기 전용 내보내기를 여는 서버(`base:allocation` 문맥). [`export`]가 저장소 백업 디스크를 원본으로 준다.
+//! - [`client`]: QEMU의 fleecing 내보내기·`qemu-nbd`를 읽는다(`base:allocation`·`qemu:dirty-bitmap:*` 문맥). 쓰기로 연
+//!   `qemu-nbd`에 쓴다(`WRITE`·`WRITE_ZEROES`·`FLUSH` — 계획 72 VMware 이전의 대상 볼륨).
+//! - [`server`]: 내보내기를 여는 서버(`base:allocation` 문맥). [`export`]가 저장소 백업 디스크를 원본으로 준다. 원본이 쓰기를
+//!   받으면(시험의 [`export::MemoryTarget`]) 쓰기 명령도 받는다.
 //! - [`serve`]: `orbivisord backup-serve` 헬퍼의 몸통(표준 입력 설정 → 저장소 열기 → 디스크마다 내보내기).
 
 pub mod client;
@@ -61,6 +63,7 @@ pub(crate) const INFO_BLOCK_SIZE: u16 = 3;
 pub(crate) const TFLAG_HAS_FLAGS: u16 = 1 << 0;
 pub(crate) const TFLAG_READ_ONLY: u16 = 1 << 1;
 pub(crate) const TFLAG_SEND_FLUSH: u16 = 1 << 2;
+pub(crate) const TFLAG_SEND_WRITE_ZEROES: u16 = 1 << 6;
 pub(crate) const TFLAG_SEND_DF: u16 = 1 << 7;
 pub(crate) const TFLAG_CAN_MULTI_CONN: u16 = 1 << 8;
 
@@ -69,6 +72,7 @@ pub(crate) const CMD_READ: u16 = 0;
 pub(crate) const CMD_WRITE: u16 = 1;
 pub(crate) const CMD_DISC: u16 = 2;
 pub(crate) const CMD_FLUSH: u16 = 3;
+pub(crate) const CMD_WRITE_ZEROES: u16 = 6;
 pub(crate) const CMD_BLOCK_STATUS: u16 = 7;
 // 명령 깃발
 pub(crate) const CMD_FLAG_REQ_ONE: u16 = 1 << 3;

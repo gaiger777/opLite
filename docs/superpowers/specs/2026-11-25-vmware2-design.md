@@ -503,6 +503,58 @@ OVF 1.0 봉투(ovftool·vSphere·VirtualBox가 모두 받는 판, `vmw` 확장):
   `45m`·`2h`·분, `--cutover-at`은 RFC 3339, `--folders mirror|flat --folder 경로`, `--new-macs`·`--no-start`(설계의
   `keep_macs`·`start_after` 끄기). `preflight`에 막힌 VM이 있으면 끝 코드 1. `vmware vm …`(전환·되돌리기 등)은 스테이지 4·5.
 
+### 스테이지 4
+
+- **쓰기 길**: `opl-store` `NbdClient::{write, write_zeroes, flush, can_write_zeroes}`(읽기 전용 내보내기에는 보내지 않음, 서버가
+  `WRITE_ZEROES`를 모르면 0 바이트를 씀). `opl-driver` `nbd_target`·`NbdTarget`과 `Storage::open_target`(기본 = `qemu-nbd`, 모든 풀
+  형식). `qemu-nbd` 인자는 `--shared=1 --persistent --discard=unmap --detect-zeroes=unmap --image-opts …`이고 **캐시는 기본
+  (writeback)** 이다 — §9.1의 `--cache=none --aio=native`는 O_DIRECT를 받지 않는 파일 시스템(tmpfs, 옛 ZFS 데이터셋)에서 열리지
+  않으므로 빼고, 체크포인트마다·디스크 끝에 클라이언트 `FLUSH` 뒤 SIGTERM으로 닫는다(`--persistent`는 띄웠는지 보는 탐침 연결이
+  서버를 끝내지 않게). 시험의 가짜 스토리지는 `open_target`을 같은 프로세스 NBD 서버로 바꾼다 — 그래서 `opl-store` 서버가 쓰는
+  원본(`ExportSource::writable`·`write`·`write_zeroes`·`flush`, 메모리 `MemoryTarget`)도 받게 했다(백업 내보내기는 그대로 읽기
+  전용).
+- **회차 표시**: 회차 n이 진행 중인지는 `snapshot.name == snapshot_name(id, rounds + 1)`로, 디스크가 이번 회차를 끝냈는지는
+  `disk.rounds >= n`으로 안다(디스크 `change_id`·`rounds`·`last_delta_bytes`를 함께 적는다). 스냅샷을 만들고 적기 전에 끊겼으면
+  원본 스냅샷 나무에서 이번 이름의 것을 찾아 쓴다. 체크포인트 `copied_bytes`는 구역 목록 안의 위치이고 조각을 다 쓰고 `FLUSH`한
+  뒤에만 적는다(64 KiB·512 MiB·30초 — 시험이 바이트 간격을 줄인다).
+- **구역 잇기**: 사이가 256 KiB 이하인 CBT 구역은 하나로 읽는다(`cbt::coalesce` — 작은 범위마다 티켓·HTTPS 요청이 드는 것을 줄임).
+  사이는 얼어 있는 기반의 바뀌지 않은 내용이라 다시 써도 대상이 바뀌지 않는다. 그래서 `/folder`로 읽는 바이트가 바뀐 블록보다
+  조금 많을 수 있다(가짜 vSphere의 빈 블록 하나짜리 사이는 모두 이어진다).
+- **실패**: 다시 해도 같은 것(인증·권한·지문·무료 ESXi, VM이 없어짐·바뀜, 디스크 수·키가 바뀜·줄어듦, 켜진 VM의 차가운 이전,
+  차가운 이전의 사용자 스냅샷, 스냅샷 지우기 실패, 볼륨 이름 겹침)은 곧 `failed`, 나머지는 항목에 `error`와 `sync_failures`를 적고
+  상태를 둔 채 스케줄러가 다음 틱에 체크포인트부터 다시 한다(연달아 3번 — `MAX_SYNC_FAILURES` — 이면 `failed`). 무료 ESXi
+  (`RestrictedVersion`)면 원본 연결 `status.restricted`를 적는다. 바이트가 10분(`vmware_stall`) 늘지 않으면 조각 하나의 읽기·쓰기가
+  끝나지 않은 것으로 보고 실패한다.
+- **타입 더함**(빈 값은 쓰지 않음 — 옛 JSON 그대로): `VmwareSyncDisk.source_mtime`(차가운 이전의 flat 수정 시각 —
+  `SearchDatastore_Task`, 읽지 못하면 경고), `VmwareVmStatus.started_at`(`stop_after_days`를 셈), `sync_failures`.
+- **`stop_after_days`**: 스케줄러가 아니라 동기화 Task가 본다 — 지났으면 회차 대신 우리 스냅샷을 지우고 `next_sync_at`을 비운 뒤
+  경고(changeId는 남김). `POST /vmware-vms/{key}/retry`가 다시 시작하고 날을 새로 센다.
+- **차가운 이전**: 디스크 전체를 읽는다(0 조각은 `WRITE_ZEROES`). §9.2의 "CBT가 켜져 있으면 `*`로 빈 곳 건너뛰기"는 하지 않았다
+  (스냅샷 없는 `QueryChangedDiskAreas`가 실제 vSphere에서 되는지 확인하지 못함). 끝에 원본이 아직 꺼져 있는지 본다. 상태는
+  `ready`(따뜻한 이전은 `syncing`).
+- **대역**: 계획의 `bandwidth_mib_s`를 Task마다 `한도 ÷ max_parallel`로 나눠 그 Task 안에서 지킨다(노드 안 공유 토큰 통은 넣지
+  않았다). 진행률은 디스크마다(`copying disk N`, 이번 회차 구역 바이트).
+- **스케줄러**(`vmware_scheduler.rs`, 15초, 리더만, 기능 `vmware-migrate`가 모든 노드에 있을 때): `pending` → `vmware-sync{full}`,
+  `copying`(끊김·실패) → 다시, `syncing`·`rolled-back`이고 `next_sync_at` 지남 → 델타. 델타 → 이어 가기 → 새 복사 차례. 한도는 그
+  계획의 `max_parallel`과, 모든 계획의 Task를 센 같은 ESXi 호스트·같은 노드 수. 노드는 항목 `spec.node` > 규칙 `node` > 디스크
+  풀을 모두 쓸 수 있는 온라인 노드 중 VMware Task가 가장 적은 것(고른 노드는 항목 스펙에 먼저 적는다). `cancelled` 계획은 남긴
+  것이 있는 항목마다 `vmware-cleanup{delete_target}`(세 번 실패하면 손으로), 없는 항목은 곧 `cancelled`. 모든 항목이 끝난
+  `running` 계획은 `finished`. 예약 전환은 스테이지 5.
+- **정리 Task**: `vmware-cleanup`을 이 스테이지에서 넣었다(취소에 필요). 우리 스냅샷(Raft moref만)·우리가 켠 CBT·적어 둔 원본
+  설정(NIC `startConnected`·설명)을 되돌리고, `delete_target`이면 대상 볼륨을 지워 `cancelled`, 아니면 `finalized`(마무리 API는
+  스테이지 5). 원본 전원과 대상 VM은 건드리지 않는다(스테이지 5). 실패하면 항목을 `failed`로 두고 다시 취소하면 남은 것부터 한다.
+- **API·CLI**: `POST /vmware-vms/{key}/retry`·`/cancel`(루트 `vm.create`, 기능) → `ItemAction{item, task?}`. 다시 하기는 계획이
+  `running`·`paused`일 때 `failed`(시작 전이면 미리 확인부터, 복사를 시작했으면 체크포인트부터)와 멈춘 동기화만, 그 밖 409
+  `vmware_vm_state`·`migration_state`, Task가 돌면 409 `migration_busy`. 취소는 남긴 것이 없으면 곧 `cancelled`, 있으면 항목
+  노드(오프라인이면 이 노드)에 정리 Task(항목 줄 — 도는 동기화 뒤). `orbivisorctl vmware vm retry|cancel NAME [--wait]`.
+- **Task 실행기**: `vmware-sync`·`vmware-cleanup`은 항목 줄·시간 제한 없음·이어 가는 Task. 노드 시작 sweep은 레이블
+  `orbivisor.io/vmware-vm`의 항목이 끝나지 않았고 그 디스크 표에 든 `pending` 볼륨을 지우지 않는다(취소된 항목의 볼륨은 정리 Task가
+  지운다). 동기화 Task는 API와 같은 노드 세션·인벤토리 캐시(`TaskRunnerConfig.api`의 `vmware_cache`)를 쓰고, 회차마다 VM 하나를
+  새로 읽는다(`inventory::refresh_vm`). VDDK 길은 디스크마다 nbdkit 하나(스냅샷 moref)다.
+- **잰 것**(개발 Mac, 디버그 빌드, 가짜 vSphere 루프백 + 가짜 스토리지): 256 MiB 디스크(할당 2/3) 전체 복사 107 MiB/s(2.4초),
+  64 KiB 블록 16개 델타 0.28초. 실제 `qemu-nbd` 쓰기(디렉터리 풀 qcow2, `storage-it`)도 이 Mac에서 바이트가 같다. 실제 vCenter
+  수치는 손 확인.
+
 ### 스테이지 6
 
 - **응답과 이름**: `POST /vms/{key}/export`는 202 `{export, task}`(`VmExportStarted`)다. 요청에 `name`을 더했다(없으면 백업과 같은

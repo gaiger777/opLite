@@ -91,6 +91,7 @@ pub mod vm_imports;
 mod vms;
 pub mod vmware;
 pub mod vmware_migrations;
+mod vmware_scheduler;
 pub mod vmware_sources;
 mod volumes;
 mod watch;
@@ -136,6 +137,7 @@ pub use telemetry::{TelemetryConfig, TelemetryReporter};
 pub use updates::{AUTH_FILE, KEYRING, UpdateAgent, Updates, UpdatesConfig};
 pub use vip::{VipAgent, VipAgentConfig, VipManager, VipManagerConfig};
 pub use vm_exports::ExportFiles;
+pub use vmware_scheduler::{VmwareScheduler, VmwareSchedulerConfig};
 
 use crate::resources as r;
 
@@ -473,6 +475,8 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vmware_migrations::cancel_migration))
         .routes(routes!(vmware_migrations::list_items))
         .routes(routes!(vmware_migrations::get_item))
+        .routes(routes!(vmware_migrations::retry_item))
+        .routes(routes!(vmware_migrations::cancel_item))
         .routes(routes!(vm_exports::export_vm))
         .routes(routes!(r::list_vm_exports))
         .routes(routes!(r::get_vm_export, vm_exports::delete_export))

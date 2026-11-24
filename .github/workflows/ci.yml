@@ -35,8 +35,8 @@ jobs:
       # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
       - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
       # 가짜 vSphere(계획 72, 같은 프로세스 — 시스템 도구 없음): 세션·인벤토리·CBT 회차와 게스트 쓰기·티켓 범위 읽기·결함,
-      # 원본 연결·찾아보기·이전 계획·미리 확인 API
-      - run: cargo test -p opl-api --features fake-vsphere --test vsphere --test vmware_api
+      # 원본 연결·찾아보기·이전 계획·미리 확인 API, 전체 복사·CBT 델타 동기화·스케줄러(가짜 스토리지)
+      - run: cargo test -p opl-api --features fake-vsphere --test vsphere --test vmware_api --test vmware_sync
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)
@@ -55,6 +55,8 @@ jobs:
           cargo test -p opl-store --features storage-it --test nbd_qemu -- --nocapture
           cargo test -p opl-api --features storage-it --test volumes --test downloads
           cargo test -p opl-api --features storage-it --test backup_tasks --test backup_job_runs --test vm_import_tasks --test backup_store_tasks --test live_restore_tasks
+          # VMware 동기화의 실제 qemu-nbd 쓰기 길(계획 72)
+          cargo test -p opl-api --features fake-vsphere,storage-it --test vmware_sync qemu_nbd
           # 파일 복원 zip·tar.gz를 unzip·bsdtar·GNU tar·Python zipfile로 읽어 봄(계획 69)
           cargo test -p opl-restore --features storage-it --test archive_tools
       # 도우미 VM 에이전트는 정적 musl로 C 툴체인 없이 빌드한다 — C를 쓰는 의존성(cc 빌드 스크립트·ring)이 들어오면 실패(계획 69 §8.2)

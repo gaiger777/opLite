@@ -737,6 +737,10 @@ pub struct FakeStorage {
     sources: std::sync::atomic::AtomicBool,
     /// 남은 횟수만큼 `export_vmdk`가 반쯤 쓰고 실패한다.
     failing_exports: std::sync::Mutex<usize>,
+    /// `open_target`으로 쓴 볼륨 내용(계획 72 VMware 이전 — 같은 프로세스 NBD 서버가 쓴다)
+    contents: std::sync::Mutex<std::collections::HashMap<Uuid, Arc<std::sync::Mutex<Vec<u8>>>>>,
+    /// `open_target`으로 연 수(볼륨마다)
+    opened_targets: std::sync::Mutex<std::collections::HashMap<Uuid, usize>>,
 }
 
 impl FakeStorage {
@@ -908,6 +912,25 @@ impl FakeStorage {
     /// 다음 `n`번의 `export_vmdk`가 실패한다.
     pub fn fail_exports(&self, n: usize) {
         *self.failing_exports.lock().unwrap() = n;
+    }
+
+    /// `open_target`으로 쓴 볼륨 `id`의 내용(쓰지 않았으면 없음)
+    pub fn contents(&self, id: Uuid) -> Option<Vec<u8>> {
+        self.contents
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|d| d.lock().unwrap().clone())
+    }
+
+    /// 볼륨 `id`를 `open_target`으로 연 수
+    pub fn opened_targets(&self, id: Uuid) -> usize {
+        self.opened_targets
+            .lock()
+            .unwrap()
+            .get(&id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// [`Storage::export_vmdk`]가 쓰는 가짜 VMDK 내용(볼륨마다 다르고 512의 배수가 아니다)
@@ -1198,6 +1221,46 @@ impl Storage for FakeStorage {
             size_bytes: size.ok_or(DriverError::VolumeNotFound(id))?,
             rbd: None,
         })
+    }
+    /// 볼륨의 메모리 내용(크기가 늘었으면 0으로 늘림)을 같은 프로세스 NBD 서버로 `socket`에 쓰기로 내보낸다(`qemu-nbd`
+    /// 없이 — 계획 72). 내용은 [`FakeStorage::contents`]로 읽는다.
+    async fn open_target(
+        &self,
+        _: &Path,
+        src: &VolumeSource,
+        socket: &Path,
+    ) -> Result<opl_driver::NbdTarget, DriverError> {
+        let id: Uuid = src
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| DriverError::InvalidSpec("not a fake volume".into()))?;
+        let data = self.contents.lock().unwrap().entry(id).or_default().clone();
+        {
+            let mut d = data.lock().unwrap();
+            if (d.len() as u64) < src.size_bytes {
+                d.resize(src.size_bytes as usize, 0);
+            }
+        }
+        *self.opened_targets.lock().unwrap().entry(id).or_default() += 1;
+        let mut server = opl_store::nbd::NbdServer::new();
+        server.add(
+            "",
+            Arc::new(opl_store::nbd::export::MemoryTarget::new(data)),
+        );
+        let _ = std::fs::remove_file(socket);
+        let listener = tokio::net::UnixListener::bind(socket)?;
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(Arc::new(server).serve(listener, async {
+            let _ = stopped.await;
+        }));
+        Ok(opl_driver::NbdTarget::in_process(
+            socket.to_path_buf(),
+            "",
+            src.size_bytes,
+            Box::new(stop),
+        ))
     }
     /// `dest`에 [`FakeStorage::vmdk_bytes`]를 쓴다(`export_vmdk`로 적는다). 실패를 주입했으면 반쯤 쓰고 실패한다.
     async fn export_vmdk(&self, src: &VolumeSource, dest: &Path, _: u8) -> Result<(), DriverError> {

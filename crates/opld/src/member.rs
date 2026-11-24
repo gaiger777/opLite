@@ -18,7 +18,7 @@ use opl_api::{
     OvnTransport, PlacementBoard, PlacementStatusSource, PowerFence, RemotePoller, ReplicaConfig,
     ReplicationScheduler, RuntimeProbe, SnapshotScheduler, TaskRunner, TaskRunnerConfig,
     TelemetryReporter, UefiVarsFetcher, UpdateAgent, Updates, VipAgent, VipManager,
-    VipManagerConfig,
+    VipManagerConfig, VmwareScheduler, VmwareSchedulerConfig,
 };
 use opl_cluster::types::{LeaderRequest, NodeId, OrbNode};
 use opl_cluster::{
@@ -211,6 +211,8 @@ struct Services {
     backups: BackupJobScheduler,
     /// 리더가 주기가 지난 로컬 디스크 복제를 요청한다.
     replication: ReplicationScheduler,
+    /// 리더가 VMware 이전의 동기화·정리 Task를 만든다(계획 72).
+    vmware: VmwareScheduler,
     /// 리더가 SDN 네트워크를 OVN NB에 맞추고 지운 노드의 SB chassis를 지운다(계획 65).
     ovn_sync: OvnSync,
     /// 리더가 리스가 끝난 노드의 HA VM을 옮긴다(이 노드의 펜싱 설정과 상관없다).
@@ -283,6 +285,7 @@ impl Services {
         self.balancer.shutdown().await;
         self.backups.shutdown().await;
         self.replication.shutdown().await;
+        self.vmware.shutdown().await;
         self.ovn_sync.shutdown().await;
         self.telemetry.shutdown().await;
         self.alerts.shutdown().await;
@@ -1073,6 +1076,9 @@ impl Member {
                     AlertEngine::spawn(state.clone(), config.alert_engine_config()),
                 )
             });
+        let vmware = on(&rt.work, || {
+            VmwareScheduler::spawn(state.clone(), VmwareSchedulerConfig::default())
+        });
         // 리더가 Raft의 SDN 네트워크를 OVN NB에 맞춘다(계획 65 — `Sdn`이 준비되기 전에는 쉰다).
         let ovn_sync = on(&rt.work, || {
             OvnSync::spawn(cluster.clone(), ovn_sync_config)
@@ -1133,6 +1139,7 @@ impl Member {
                 balancer,
                 backups,
                 replication,
+                vmware,
                 ovn_sync,
                 telemetry,
                 alerts,

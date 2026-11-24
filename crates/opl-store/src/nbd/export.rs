@@ -305,3 +305,81 @@ impl ExportSource for MemoryExport {
         }))
     }
 }
+
+/// 쓰기를 받는 메모리 내보내기(시험의 가짜 대상 볼륨 — 계획 72 VMware 이전이 `qemu-nbd` 없이 쓴다). 바이트는 함께 쥔
+/// `Arc<Mutex<Vec<u8>>>`에 있어 시험이 쓴 뒤 읽는다. `WRITE_ZEROES`는 0으로 채우고 셌다(`zeroed`).
+pub struct MemoryTarget {
+    data: Arc<Mutex<Vec<u8>>>,
+    zeroed: Arc<std::sync::atomic::AtomicU64>,
+    flushes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl MemoryTarget {
+    pub fn new(data: Arc<Mutex<Vec<u8>>>) -> Self {
+        MemoryTarget {
+            data,
+            zeroed: Arc::default(),
+            flushes: Arc::default(),
+        }
+    }
+
+    /// `WRITE_ZEROES`로 0을 쓴 바이트 수
+    pub fn zeroed(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.zeroed.clone()
+    }
+
+    /// `FLUSH` 수
+    pub fn flushes(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.flushes.clone()
+    }
+
+    fn bytes(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
+        self.data.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[async_trait]
+impl ExportSource for MemoryTarget {
+    fn size(&self) -> u64 {
+        self.bytes().len() as u64
+    }
+
+    async fn read(&self, offset: u64, len: u32) -> Result<Vec<u8>, SourceError> {
+        Ok(self.bytes()[offset as usize..offset as usize + len as usize].to_vec())
+    }
+
+    async fn allocation(&self, offset: u64, len: u32) -> Result<Vec<Extent>, SourceError> {
+        let data = self.bytes();
+        Ok(runs(offset, len as u64, 65536, |a, b| {
+            if data[a as usize..b as usize].iter().all(|x| *x == 0) {
+                STATE_HOLE | STATE_ZERO
+            } else {
+                0
+            }
+        }))
+    }
+
+    fn writable(&self) -> bool {
+        true
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<(), SourceError> {
+        let at = offset as usize;
+        self.bytes()[at..at + data.len()].copy_from_slice(data);
+        Ok(())
+    }
+
+    async fn write_zeroes(&self, offset: u64, len: u32) -> Result<(), SourceError> {
+        let at = offset as usize;
+        self.bytes()[at..at + len as usize].fill(0);
+        self.zeroed
+            .fetch_add(u64::from(len), std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn flush(&self) -> Result<(), SourceError> {
+        self.flushes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}

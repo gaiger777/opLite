@@ -359,6 +359,18 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// 볼륨 `src`([`volume_source`](Storage::volume_source)가 돌려준 것, 스냅샷 없이)를 유닉스 소켓 `socket`에 **쓰기로**
+    /// 내보낸다(VMware 이전이 받은 구역을 대상 볼륨에 그 자리 쓰기 — 계획 72 §9.1). 기본은 `qemu_nbd`로 연다([`nbd_target`]
+    /// — 모든 풀 형식). 다 쓰면 [`NbdTarget::close`] 뒤 `release_source`를 부른다.
+    async fn open_target(
+        &self,
+        qemu_nbd: &Path,
+        src: &VolumeSource,
+        socket: &Path,
+    ) -> Result<NbdTarget, DriverError> {
+        nbd_target(qemu_nbd, src, socket).await
+    }
+
     /// 증분 백업의 대상으로 backing 없는 빈 qcow2 파일 `dest`(절대 경로)를 가상 크기 `size_bytes`로
     /// 만든다(있으면 덮어쓴다). 기본은 지원하지 않는다.
     async fn create_backup_target(
@@ -1135,6 +1147,21 @@ async fn spawn_nbd(
     socket: &Path,
     size_bytes: u64,
 ) -> Result<NbdSource, DriverError> {
+    let child = spawn_qemu_nbd(qemu_nbd, args, socket).await?;
+    Ok(NbdSource {
+        child,
+        socket: socket.to_path_buf(),
+        export: String::new(),
+        size_bytes,
+    })
+}
+
+/// `qemu-nbd args`를 띄우고(남은 소켓 `socket`은 지운다) 답할 때까지 기다린다(30초). 실패하면 프로세스를 끝낸다.
+async fn spawn_qemu_nbd(
+    qemu_nbd: &Path,
+    args: Vec<String>,
+    socket: &Path,
+) -> Result<tokio::process::Child, DriverError> {
     match std::fs::remove_file(socket) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
         _ => {}
@@ -1158,33 +1185,161 @@ async fn spawn_nbd(
             tool: "qemu-nbd",
             stderr: format!("{}: {e}", qemu_nbd.display()),
         })?;
-    let mut source = NbdSource {
-        child,
-        socket: socket.to_path_buf(),
-        export: String::new(),
-        size_bytes,
-    };
+    let mut child = child;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if opl_store::nbd::NbdClient::list(socket).await.is_ok() {
-            return Ok(source);
+            return Ok(child);
         }
-        if let Some(status) = source.child.try_wait()? {
+        if let Some(status) = child.try_wait()? {
             let mut stderr = String::new();
-            if let Some(mut e) = source.child.stderr.take() {
+            if let Some(mut e) = child.stderr.take() {
                 use tokio::io::AsyncReadExt;
                 let _ = e.read_to_string(&mut stderr).await;
             }
+            let _ = std::fs::remove_file(socket);
             return Err(DriverError::ToolFailed {
                 tool: "qemu-nbd",
                 stderr: format!("{status}: {}", stderr.trim()),
             });
         }
         if tokio::time::Instant::now() >= deadline {
+            let _ = child.start_kill();
+            let _ = std::fs::remove_file(socket);
             return Err(DriverError::Timeout("qemu-nbd to listen"));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+/// 쓰기로 연 볼륨의 NBD 내보내기(계획 72 VMware 이전의 대상 — 설계 §9.1). 연결 하나로 쓰고 [`NbdTarget::close`] 전에
+/// `FLUSH`한다. drop되면 서버를 끝내고 소켓을 지운다.
+pub struct NbdTarget {
+    /// `qemu-nbd`(없으면 시험의 같은 프로세스 서버 — `guard`가 쥔다)
+    child: Option<tokio::process::Child>,
+    guard: Option<Box<dyn std::any::Any + Send + Sync>>,
+    /// 유닉스 소켓
+    pub socket: PathBuf,
+    /// 내보내기 이름(`qemu-nbd`의 기본 — 빈 이름)
+    pub export: String,
+    /// 볼륨의 가상 크기
+    pub size_bytes: u64,
+}
+
+impl std::fmt::Debug for NbdTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NbdTarget")
+            .field("socket", &self.socket)
+            .field("export", &self.export)
+            .field("size_bytes", &self.size_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl NbdTarget {
+    /// 같은 프로세스 안의 서버(시험의 가짜 스토리지): `guard`를 버리면 서버가 멈춘다.
+    pub fn in_process(
+        socket: PathBuf,
+        export: impl Into<String>,
+        size_bytes: u64,
+        guard: Box<dyn std::any::Any + Send + Sync>,
+    ) -> Self {
+        NbdTarget {
+            child: None,
+            guard: Some(guard),
+            socket,
+            export: export.into(),
+            size_bytes,
+        }
+    }
+
+    /// 서버를 끝내고 기다린다: `qemu-nbd`는 SIGTERM으로 이미지를 닫게 하고(30초 안에 끝나지 않으면 SIGKILL) 소켓을
+    /// 지운다. 쓴 내용은 그 전에 클라이언트가 `FLUSH`했다.
+    pub async fn close(mut self) {
+        if let Some(mut child) = self.child.take() {
+            if let Some(pid) = child.id().and_then(|p| i32::try_from(p).ok()) {
+                // SAFETY: 우리가 띄운 자식 프로세스에 보내는 신호다.
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+            if tokio::time::timeout(Duration::from_secs(30), child.wait())
+                .await
+                .is_err()
+            {
+                let _ = child.kill().await;
+            }
+        }
+        self.guard.take();
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+impl Drop for NbdTarget {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+        }
+        let _ = std::fs::remove_file(&self.socket);
+    }
+}
+
+/// `qemu-nbd`가 볼륨 `src`를 쓰기로 여는 인자: 연결 하나(`--shared=1`, 띄웠는지 보는 탐침이 끊긴 뒤에도 남게
+/// `--persistent`), 0 블록은 구멍으로(`--detect-zeroes=unmap --discard=unmap` — 씬 볼륨이 씬으로 남는다). 캐시는 기본
+/// (writeback)이고 클라이언트의 `FLUSH`가 내려 쓴다(`cache=none`·`aio=native`는 O_DIRECT를 받지 않는 파일 시스템에서
+/// 열리지 않는다). 파일·블록 장치는 형식과 원본 드라이버를 정하고, RBD는 그 옵션 문자열이다. 스냅샷에는 쓸 수 없다.
+fn nbd_target_args(
+    src: &VolumeSource,
+    socket: &Path,
+    block: bool,
+) -> Result<Vec<String>, DriverError> {
+    if src.snapshot.is_some() {
+        return Err(DriverError::InvalidSpec(
+            "cannot write to a volume snapshot".into(),
+        ));
+    }
+    let mut args = vec![
+        "--shared=1".to_string(),
+        "--persistent".into(),
+        "--discard=unmap".into(),
+        "--detect-zeroes=unmap".into(),
+        format!("--socket={}", path_str(socket)?),
+        "--image-opts".into(),
+    ];
+    match &src.rbd {
+        Some(image) => args.push(rbd::image_opts(image, None)),
+        None => {
+            require_absolute(&src.path)?;
+            args.push(format!(
+                "driver={},file.driver={},file.filename={}",
+                fmt_name(src.format),
+                if block { "host_device" } else { "file" },
+                path_str(&src.path)?.replace(',', ",,")
+            ));
+        }
+    }
+    Ok(args)
+}
+
+/// 볼륨 `src`([`Storage::volume_source`], 스냅샷 없이)를 `qemu-nbd`(`qemu_nbd`)로 유닉스 소켓 `socket`(있으면 지움)에
+/// **쓰기로** 내보내고 답할 때까지 기다린다(30초). 실패하면 `ToolFailed`(stderr).
+pub async fn nbd_target(
+    qemu_nbd: &Path,
+    src: &VolumeSource,
+    socket: &Path,
+) -> Result<NbdTarget, DriverError> {
+    use std::os::unix::fs::FileTypeExt;
+    let block = src.rbd.is_none()
+        && std::fs::metadata(&src.path).is_ok_and(|m| m.file_type().is_block_device());
+    let args = nbd_target_args(src, socket, block)?;
+    let child = spawn_qemu_nbd(qemu_nbd, args, socket).await?;
+    Ok(NbdTarget {
+        child: Some(child),
+        guard: None,
+        socket: socket.to_path_buf(),
+        export: String::new(),
+        size_bytes: src.size_bytes,
+    })
 }
 
 /// [`Storage::export_volume`]: `qemu-img convert -c -O qcow2`로 `{dest}.part`에 쓰고(`-t writeback`:

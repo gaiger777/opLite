@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use super::client::{Extent, NbdClient, NbdError};
-use super::export::{ChunkCache, MemoryExport, StoreExport, allocation};
+use super::export::{ChunkCache, MemoryExport, MemoryTarget, StoreExport, allocation};
 use super::serve::{ServeBackend, ServeConfig};
 use super::server::{ExportSource, NbdServer, SourceError};
 use super::*;
@@ -168,6 +168,44 @@ async fn source_errors_come_back_as_server_errors_and_the_connection_survives() 
         matches!(&e, NbdError::Server { code, message } if *code == EIO && message.contains("injected")),
         "{e}"
     );
+    assert_eq!(c.read(0, 10).await.unwrap(), image()[..10]);
+}
+
+/// 쓰는 원본: `WRITE`·`WRITE_ZEROES`·`FLUSH`, 범위 밖 쓰기는 오류이고 연결은 산다. 읽기 전용 내보내기에는 클라이언트가
+/// 쓰기를 보내지 않는다.
+#[tokio::test]
+async fn client_writes_zeroes_and_flushes_a_writable_export() {
+    let bytes = Arc::new(std::sync::Mutex::new(vec![7u8; 2 * MIB]));
+    let target = MemoryTarget::new(bytes.clone());
+    let (zeroed, flushes) = (target.zeroed(), target.flushes());
+    let mut s = NbdServer::new();
+    s.add("disk0", Arc::new(target));
+    let server = Arc::new(s);
+    let mut c = connect(&server, "disk0", &[]).await.unwrap();
+    assert!(!c.read_only() && c.can_write_zeroes());
+    let data = pattern(MIB + 5, 11);
+    c.write(100, &data).await.unwrap();
+    c.write_zeroes(1536 << 10, 256 << 10).await.unwrap();
+    c.flush().await.unwrap();
+    assert!(c.write(2 * MIB as u64 - 2, b"abc").await.is_err());
+    // 범위 밖은 보내기 전에 거절하고 연결은 그대로다.
+    assert_eq!(c.read(100, 4).await.unwrap(), data[..4]);
+    let mut want = vec![7u8; 2 * MIB];
+    want[100..100 + data.len()].copy_from_slice(&data);
+    want[1536 << 10..1792 << 10].fill(0);
+    assert!(*bytes.lock().unwrap() == want);
+    assert_eq!(zeroed.load(std::sync::atomic::Ordering::SeqCst), 256 << 10);
+    assert_eq!(flushes.load(std::sync::atomic::Ordering::SeqCst), 1);
+    c.disconnect().await.unwrap();
+
+    let ro = server_with(image(), None);
+    let mut c = connect(&ro, "disk0", &[]).await.unwrap();
+    assert!(c.read_only());
+    let e = c.write(0, b"x").await.unwrap_err();
+    assert!(matches!(e, NbdError::Export(_)), "{e}");
+    assert!(c.write_zeroes(0, 10).await.is_err());
+    // 읽기 전용 원본의 FLUSH는 할 일 없이 성공
+    c.flush().await.unwrap();
     assert_eq!(c.read(0, 10).await.unwrap(), image()[..10]);
 }
 

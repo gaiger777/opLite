@@ -547,6 +547,8 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ),
     ("GET", "/vmware-vms", Root(SystemRead)),
     ("GET", "/vmware-vms/{key}", Root(SystemRead)),
+    ("POST", "/vmware-vms/{key}/retry", Root(VmCreate)),
+    ("POST", "/vmware-vms/{key}/cancel", Root(VmCreate)),
     // VM 내보내기(계획 72 §12): 만들기는 VM의 `vm.export`(+ 풀 `storage.allocate` — 핸들러), 나머지는 내보낸 VM의 것
     ("POST", "/vms/{key}/export", Object(Vm, VmExport)),
     ("GET", "/vm-exports", List),

@@ -535,6 +535,33 @@ pub fn build(root: &MoRef, objects: Vec<ObjectContent>) -> Inventory {
     inv
 }
 
+/// VM 하나를 다시 읽는다(동기화 회차마다 — 스냅샷·디스크·전원·CBT·호스트가 그새 바뀌었을 수 있다). 경로·폴더·데이터센터는
+/// `inv`의 것을 쓰고 호스트는 지금 `runtime.host`로 `inv`에서 찾는다. `inv`에 없거나 원본에서 없어진 VM은 `NotFound`.
+pub async fn refresh_vm(
+    session: &Session,
+    inv: &Inventory,
+    moref: &str,
+) -> Result<InvVm, VsphereError> {
+    let cached = inv.vm(moref).ok_or_else(|| VsphereError::NotFound {
+        kind: "ManagedObjectNotFound".into(),
+        message: format!("VM {moref} is not in the inventory"),
+    })?;
+    let o = session
+        .retrieve_one(&MoRef::new("VirtualMachine", moref), &VM_PATHS)
+        .await?;
+    let host = o.moref("runtime.host");
+    let host_inv = host.as_ref().and_then(|h| inv.host(&h.value));
+    let place = VmPlace {
+        path: cached.path.clone(),
+        folder: cached.folder.clone(),
+        datacenter: cached.datacenter.clone(),
+        host_name: host_inv.map(|h| h.name.clone()),
+        cluster: host_inv.and_then(|h| h.cluster.clone()),
+        host: host.map(|h| h.value),
+    };
+    Ok(vm_from(&o, inv, place))
+}
+
 struct VmPlace {
     path: String,
     folder: Option<String>,

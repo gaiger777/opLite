@@ -23,6 +23,7 @@ mod snapshot;
 mod store_tasks;
 mod template;
 mod vm_replicate;
+pub(crate) mod vmware;
 
 pub(crate) use clone::{LINKED_ONLY_FROM_TEMPLATES, unlinkable, volume_name};
 
@@ -198,6 +199,10 @@ pub struct TaskRunnerConfig {
     pub backup_serve_exe: Option<PathBuf>,
     /// 헬퍼를 systemd scope(`opl-bkserve-<id>`)로 감싸 opld가 다시 떠도 살게 한다(systemd가 있는 Linux).
     pub backup_serve_scope: bool,
+    /// VMware 이전 동기화(계획 72): 읽기·쓰기 한 조각이 이만큼 끝나지 않으면 회차가 실패한다(바이트가 늘지 않음).
+    pub vmware_stall: Duration,
+    /// VMware 이전 동기화: 디스크별 체크포인트를 적는 바이트 간격(시험이 줄인다).
+    pub vmware_checkpoint_bytes: u64,
 }
 
 impl TaskRunnerConfig {
@@ -241,6 +246,8 @@ impl TaskRunnerConfig {
             qemu_img: PathBuf::from("qemu-img"),
             backup_serve_exe: None,
             backup_serve_scope: false,
+            vmware_stall: vmware::STALL,
+            vmware_checkpoint_bytes: vmware::CHECKPOINT_BYTES,
         }
     }
 }
@@ -695,6 +702,11 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
         TaskOp::VmImport { import, .. } => return Some(import),
         // 옮기기의 걸음은 그 옮기기의 줄에서 차례로(계획 67)
         TaskOp::NetworkMigrate { .. } => return Some(target),
+        // VMware 이전 Task는 항목(`vmware-vm`)의 줄에서 차례로 — 같은 VM의 회차·정리가 겹치지 않는다(계획 72).
+        TaskOp::VmwareSync { .. }
+        | TaskOp::VmwareCutover
+        | TaskOp::VmwareRevert
+        | TaskOp::VmwareCleanup { .. } => return Some(target),
         _ => {}
     }
     if !matches!(
@@ -769,9 +781,14 @@ fn start(
             let _ = previous.await;
         }
         // 옮기기 Task(계획 67 §9.4)는 VM마다 상태를 리소스에 적으므로 다시 뜬 opld가 이어서 한다.
+        // VMware 동기화·정리(계획 72 §9.5)도 걸음마다 항목에 먼저 적으므로 체크포인트부터 잇는다.
         let resumes = matches!(
             task.spec.op,
-            TaskOp::NodeUpgrade | TaskOp::NetworkMigrate { .. } | TaskOp::BackupLiveRestore { .. }
+            TaskOp::NodeUpgrade
+                | TaskOp::NetworkMigrate { .. }
+                | TaskOp::BackupLiveRestore { .. }
+                | TaskOp::VmwareSync { .. }
+                | TaskOp::VmwareCleanup { .. }
         );
         if interrupted && !resumes {
             let error = "interrupted: orbivisord restarted while the task was running".to_string();
@@ -833,7 +850,13 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
             TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. }
         )
         // VM 내보내기(계획 72)는 디스크 크기만큼 변환하고 다시 읽어 해시를 잰다.
-        || matches!(task.spec.op, TaskOp::VmExport { .. });
+        || matches!(task.spec.op, TaskOp::VmExport { .. })
+        // VMware 동기화는 디스크 크기만큼 복사하고(조각마다 멈춤 한도 `vmware_stall`), 정리는 스냅샷 합치기를 기다린다
+        // (vSphere Task마다 한도).
+        || matches!(
+            task.spec.op,
+            TaskOp::VmwareSync { .. } | TaskOp::VmwareCleanup { .. }
+        );
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -1240,11 +1263,13 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             };
             return Box::pin(file_restore::to_guest(ctx, task, req)).await;
         }
-        // VMware 이전 Task(계획 72)는 스테이지 4·5가 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::VmwareSync { .. }
-        | TaskOp::VmwareCutover
-        | TaskOp::VmwareRevert
-        | TaskOp::VmwareCleanup { .. } => {
+        // VMware 동기화 회차(계획 72 §9). 건너뛴 회차·경고는 Task 경고로 남긴다.
+        TaskOp::VmwareSync { full } => return Box::pin(vmware::sync(ctx, task, *full)).await,
+        TaskOp::VmwareCleanup { delete_target } => {
+            return Box::pin(vmware::cleanup(ctx, task, *delete_target)).await;
+        }
+        // 전환·되돌리기는 스테이지 5가 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::VmwareCutover | TaskOp::VmwareRevert => {
             Err("VMware migration tasks are not available yet".into())
         }
         TaskOp::VmExport { export } => return export::export(ctx, task, *export).await,
@@ -1781,6 +1806,30 @@ async fn remove_volume(ctx: &Ctx, id: Uuid) -> Result<(), RemoveError> {
     }
 }
 
+/// 볼륨이 끝나지 않은 VMware 이전 항목의 대상 볼륨인가(레이블 `orbivisor.io/vmware-vm`의 항목이 있고 끝나지 않았고 그
+/// 디스크 표에 이 볼륨이 있다). 읽지 못하면 지우지 않게 참이다.
+fn vmware_target_alive(ctx: &Ctx, volume: &Volume) -> bool {
+    let Some(item) = volume
+        .labels
+        .get(opl_types::vmware::VMWARE_VM_LABEL)
+        .and_then(|v| v.parse::<Uuid>().ok())
+    else {
+        return false;
+    };
+    match ctx.cluster.get::<opl_types::vmware::VmwareVmSpec>(item) {
+        Ok(Some(item)) => {
+            !item.status.state.is_final()
+                && item
+                    .status
+                    .disks
+                    .iter()
+                    .any(|d| d.volume == Some(volume.id))
+        }
+        Ok(None) => false,
+        Err(_) => true,
+    }
+}
+
 /// 이전 opld가 남긴 고아를 지운다: 이 노드가 만들던, 실행할 Task가 없는 Pending 볼륨(볼륨을 만든
 /// 뒤 Task를 만들기 전에, 또는 업로드 도중 opld가 죽었다)과 Pending 스냅샷, 가져오기 Task가 없는
 /// 올린 파일, VM 가져오기의 남은 파일([`crate::vm_imports::sweep`]).
@@ -1803,7 +1852,11 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
                     continue;
                 }
                 let has_task = unfinished.iter().any(|t| t.spec.target == volume.id);
-                if volume.status.phase == VolumePhase::Pending && !has_task {
+                // VMware 이전의 대상 볼륨은 전환까지 Pending이다 — 그 항목이 살아 있으면 둔다(계획 72 §9.1).
+                if volume.status.phase == VolumePhase::Pending
+                    && !has_task
+                    && !vmware_target_alive(ctx, &volume)
+                {
                     tracing::warn!(volume = %volume.name, "removing a volume left unfinished");
                     match remove_volume(ctx, volume.id).await {
                         Ok(()) => {}

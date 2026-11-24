@@ -1,5 +1,6 @@
-//! `orbivisorctl vmware source …`·`vmware migration …`(계획 72 §13): 저장한 vCenter·ESXi 연결(지문 확인 흐름, 비밀번호는
-//! 파일·`OPL_VMWARE_PASSWORD`·터미널에서), 인벤토리 찾아보기, 이전 계획 만들기·미리 확인·시작·멈춤·이어 가기·취소·지우기.
+//! `orbivisorctl vmware source …`·`vmware migration …`·`vmware vm …`(계획 72 §13): 저장한 vCenter·ESXi 연결(지문 확인 흐름,
+//! 비밀번호는 파일·`OPL_VMWARE_PASSWORD`·터미널에서), 인벤토리 찾아보기, 이전 계획 만들기·미리 확인·시작·멈춤·이어 가기·
+//! 취소·지우기, 계획 안 VM 하나의 다시 하기·취소.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Map, Value, json};
 
-use crate::client::{ApiError, Client, seg};
+use crate::client::{ApiError, BACKUP_WAIT, Client, seg};
 use crate::output::{bytes, cell, json as print_json, table};
 
 #[derive(Subcommand)]
@@ -22,6 +23,25 @@ pub(crate) enum VmwareCmd {
     Migration {
         #[command(subcommand)]
         cmd: MigrationCmd,
+    },
+    /// 계획 안 VM 하나(항목 이름·원본 이름·moref·id)
+    Vm {
+        #[command(subcommand)]
+        cmd: VmCmd,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum VmCmd {
+    /// 실패한 VM을 다시 한다(복사를 시작하지 않았으면 미리 확인부터, 아니면 체크포인트부터). 오래 전환하지 않아 멈춘
+    /// 동기화도 다시 시작한다.
+    Retry { vm: String },
+    /// VM 하나를 취소한다: 원본의 Orbivisor 스냅샷·우리가 켠 CBT·대상 볼륨을 치운다(원본 VM·디스크는 그대로).
+    Cancel {
+        vm: String,
+        /// 정리 Task가 끝날 때까지 기다린다.
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -351,7 +371,47 @@ pub(crate) async fn vmware(
     match cmd {
         VmwareCmd::Source { cmd } => Box::pin(source(client, cmd, json_out, out)).await,
         VmwareCmd::Migration { cmd } => Box::pin(migration(client, cmd, json_out, out)).await,
+        VmwareCmd::Vm { cmd } => Box::pin(vm(client, cmd, json_out, out)).await,
     }
+}
+
+async fn vm(
+    client: &Client,
+    cmd: VmCmd,
+    json_out: bool,
+    out: &mut (dyn Write + Send),
+) -> anyhow::Result<()> {
+    let (vm, action, wait) = match &cmd {
+        VmCmd::Retry { vm } => (vm, "retry", false),
+        VmCmd::Cancel { vm, wait } => (vm, "cancel", *wait),
+    };
+    let got = client
+        .post(&format!("/vmware-vms/{}/{action}", seg(vm)), &json!({}))
+        .await?;
+    if json_out && !wait {
+        return Ok(print_json(out, &got)?);
+    }
+    let name = cell(&got["item"]["name"]);
+    match (&cmd, got.get("task").filter(|t| t.is_string())) {
+        (VmCmd::Retry { .. }, _) => writeln!(
+            out,
+            "vmware-vm {name} is {} again",
+            cell(&got["item"]["status"]["state"])
+        )?,
+        (VmCmd::Cancel { .. }, None) => writeln!(out, "vmware-vm {name} cancelled")?,
+        (VmCmd::Cancel { .. }, Some(task)) if wait => {
+            client
+                .wait_task_for(&json!({ "id": task }), BACKUP_WAIT)
+                .await?;
+            writeln!(out, "vmware-vm {name} cancelled")?;
+        }
+        (VmCmd::Cancel { .. }, Some(task)) => writeln!(
+            out,
+            "vmware-vm {name} is being cancelled (task {})",
+            cell(task)
+        )?,
+    }
+    Ok(())
 }
 
 async fn source(
@@ -963,6 +1023,46 @@ mod tests {
                 "cutover": { "at": 1_796_090_400u64, "shutdown": "power-off" },
             })
         );
+    }
+
+    /// `vm retry`·`vm cancel`은 항목 경로로 보내고, 정리 Task가 있으면 알린다.
+    #[tokio::test]
+    async fn vm_retry_and_cancel_post_to_the_item() {
+        let (client, seen) = fake_api(|method, path| match (method, path) {
+            ("POST", "/api/v1/vmware-vms/w-web01/retry") => (
+                200,
+                json!({ "item": { "name": "w-web01", "status": { "state": "syncing" } } }),
+            ),
+            ("POST", "/api/v1/vmware-vms/w-web01/cancel") => (
+                200,
+                json!({ "item": { "name": "w-web01", "status": { "state": "syncing" } }, "task": "t-1" }),
+            ),
+            _ => (404, json!({ "code": "not_found", "message": path })),
+        })
+        .await;
+        let mut out = Vec::new();
+        vm(
+            &client,
+            VmCmd::Retry {
+                vm: "w-web01".into(),
+            },
+            false,
+            &mut out,
+        )
+        .await
+        .unwrap();
+        let cmd = VmCmd::Cancel {
+            vm: "w-web01".into(),
+            wait: false,
+        };
+        vm(&client, cmd, false, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("vmware-vm w-web01 is syncing again"),
+            "{text}"
+        );
+        assert!(text.contains("being cancelled (task t-1)"), "{text}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
     }
 
     /// 지문 없이 더하면 서버 지문을 알려 주고 비밀번호를 묻지 않는다. 막힌 VM이 있는 미리 확인은 실패로 끝난다.

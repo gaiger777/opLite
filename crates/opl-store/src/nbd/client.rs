@@ -534,6 +534,103 @@ impl<S: AsyncRead + AsyncWrite + Unpin> NbdClient<S> {
         Ok(out)
     }
 
+    /// 서버가 `WRITE_ZEROES`를 받는가(아니면 [`NbdClient::write_zeroes`]가 0 바이트를 써 보낸다)
+    pub fn can_write_zeroes(&self) -> bool {
+        self.flags & TFLAG_SEND_WRITE_ZEROES != 0
+    }
+
+    /// 쓰기 명령의 단순 응답(구조화 응답이면 `NONE`·오류 조각)을 기다린다.
+    async fn write_reply(&mut self, cookie: u64) -> Result<(), NbdError> {
+        let mut error = None;
+        loop {
+            match self.reply_head(cookie).await? {
+                Head::Simple(0) => return Ok(()),
+                Head::Simple(code) => {
+                    return Err(NbdError::Server {
+                        code,
+                        message: String::new(),
+                    });
+                }
+                Head::Chunk { done, kind, len } => {
+                    let data = self.read_payload(len).await?;
+                    match kind {
+                        REPLY_TYPE_NONE => {}
+                        REPLY_TYPE_ERROR | REPLY_TYPE_ERROR_OFFSET => {
+                            error.get_or_insert(Self::chunk_error(&data));
+                        }
+                        k => return Err(proto(format!("unexpected reply chunk {k} to a write"))),
+                    }
+                    if done {
+                        return error.map_or(Ok(()), Err);
+                    }
+                }
+            }
+        }
+    }
+
+    fn check_writable(&self) -> Result<(), NbdError> {
+        if self.read_only() {
+            return Err(NbdError::Export("the export is read-only".into()));
+        }
+        Ok(())
+    }
+
+    /// `offset`에 `data`를 쓴다(32 MiB까지 — [`MAX_REQUEST`]).
+    pub async fn write(&mut self, offset: u64, data: &[u8]) -> Result<(), NbdError> {
+        self.check_writable()?;
+        self.check_range(offset, data.len() as u64)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        let cookie = self
+            .request(CMD_WRITE, 0, offset, data.len() as u32)
+            .await?;
+        // 머리는 `request`가 이미 보냈다 — 몸통을 잇는다.
+        self.io.write_all(data).await?;
+        self.io.flush().await?;
+        self.write_reply(cookie).await
+    }
+
+    /// `offset`부터 `len` 바이트를 0으로 쓴다. `NBD_CMD_FLAG_NO_HOLE` 없이 보내므로 서버가 구멍으로 둘 수 있다(씬 대상이
+    /// 씬으로 남는다). 서버가 `WRITE_ZEROES`를 모르면 0 바이트를 [`NbdClient::write`]로 쓴다.
+    pub async fn write_zeroes(&mut self, offset: u64, len: u64) -> Result<(), NbdError> {
+        self.check_writable()?;
+        if offset.checked_add(len).is_none_or(|e| e > self.size) {
+            return Err(proto(format!(
+                "request {offset}+{len} is out of range (size {})",
+                self.size
+            )));
+        }
+        // 한 요청의 길이는 u32다 — 1 GiB씩 나눈다.
+        const STEP: u64 = 1 << 30;
+        let mut at = offset;
+        let end = offset + len;
+        while at < end {
+            let n = (end - at).min(if self.can_write_zeroes() {
+                STEP
+            } else {
+                MAX_REQUEST as u64
+            });
+            if self.can_write_zeroes() {
+                let cookie = self.request(CMD_WRITE_ZEROES, 0, at, n as u32).await?;
+                self.write_reply(cookie).await?;
+            } else {
+                self.write(at, &vec![0; n as usize]).await?;
+            }
+            at += n;
+        }
+        Ok(())
+    }
+
+    /// 쓴 것을 저장소에 내려 쓴다(`FLUSH`). 서버가 `FLUSH`를 알리지 않으면 할 일이 없다.
+    pub async fn flush(&mut self) -> Result<(), NbdError> {
+        if self.flags & TFLAG_SEND_FLUSH == 0 {
+            return Ok(());
+        }
+        let cookie = self.request(CMD_FLUSH, 0, 0, 0).await?;
+        self.write_reply(cookie).await
+    }
+
     /// 연결을 닫는다(`DISC`).
     pub async fn disconnect(mut self) -> Result<(), NbdError> {
         self.request(CMD_DISC, 0, 0, 0).await?;

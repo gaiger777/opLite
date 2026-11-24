@@ -1,6 +1,7 @@
-//! 읽기 전용 NBD 서버(설계 §11.1): fixed newstyle 협상(`OPT_GO`·`OPT_INFO`·`OPT_LIST`·`OPT_EXPORT_NAME`), 구조화
-//! 응답, `base:allocation` 문맥, 명령 `READ`·`BLOCK_STATUS`·`FLUSH`(할 일 없음)·`DISC`. 쓰기 명령은 `EPERM`.
-//! 한 연결의 요청은 나란히 처리하고(QEMU·`qemu-img convert`는 여러 요청을 한꺼번에 보낸다) 끝나는 대로 답한다.
+//! NBD 서버(설계 §11.1): fixed newstyle 협상(`OPT_GO`·`OPT_INFO`·`OPT_LIST`·`OPT_EXPORT_NAME`), 구조화
+//! 응답, `base:allocation` 문맥, 명령 `READ`·`BLOCK_STATUS`·`FLUSH`·`DISC`. 읽기 요청은 나란히 처리하고(QEMU·
+//! `qemu-img convert`는 여러 요청을 한꺼번에 보낸다) 끝나는 대로 답한다. 쓰기 명령(`WRITE`·`WRITE_ZEROES`)은 원본이 쓰기를
+//! 받을 때만([`ExportSource::writable`] — 시험의 가짜 대상 볼륨, 계획 72) 받은 차례대로 하고, 아니면 `EPERM`이다.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -50,6 +51,26 @@ pub trait ExportSource: Send + Sync + 'static {
             code: EINVAL,
             message: format!("no meta context {name}"),
         })
+    }
+    /// 쓰기를 받는가(기본은 읽기 전용)
+    fn writable(&self) -> bool {
+        false
+    }
+    /// `offset`에 `data`를 쓴다(범위는 서버가 확인했다). [`ExportSource::writable`]일 때만 불린다.
+    async fn write(&self, offset: u64, data: &[u8]) -> Result<(), SourceError> {
+        let _ = (offset, data);
+        Err(SourceError {
+            code: EPERM,
+            message: "the export is read-only".into(),
+        })
+    }
+    /// `offset`부터 `len` 바이트를 0으로(기본은 0 바이트를 [`ExportSource::write`]로)
+    async fn write_zeroes(&self, offset: u64, len: u32) -> Result<(), SourceError> {
+        self.write(offset, &vec![0; len as usize]).await
+    }
+    /// 쓴 것을 내려 쓴다(기본은 할 일 없음).
+    async fn flush(&self) -> Result<(), SourceError> {
+        Ok(())
     }
 }
 
@@ -164,7 +185,7 @@ impl NbdServer {
                         return Ok(None);
                     };
                     w.write_u64(source.size()).await?;
-                    w.write_u16(TRANSMISSION_FLAGS).await?;
+                    w.write_u16(transmission_flags(source.as_ref())).await?;
                     if !no_zeroes {
                         w.write_all(&[0; 124]).await?;
                     }
@@ -249,7 +270,7 @@ impl NbdServer {
                     let mut d = Vec::new();
                     d.extend_from_slice(&INFO_EXPORT.to_be_bytes());
                     d.extend_from_slice(&source.size().to_be_bytes());
-                    d.extend_from_slice(&TRANSMISSION_FLAGS.to_be_bytes());
+                    d.extend_from_slice(&transmission_flags(source.as_ref()).to_be_bytes());
                     reply(w, option, REP_INFO, &d).await?;
                     let mut d = Vec::new();
                     d.extend_from_slice(&INFO_BLOCK_SIZE.to_be_bytes());
@@ -274,9 +295,16 @@ impl NbdServer {
     }
 }
 
-/// 이 서버의 내보내기 전송 깃발: 읽기 전용, `FLUSH`(할 일 없음)·`DF` 받음, 여러 연결 됨
-const TRANSMISSION_FLAGS: u16 =
-    TFLAG_HAS_FLAGS | TFLAG_READ_ONLY | TFLAG_SEND_FLUSH | TFLAG_SEND_DF | TFLAG_CAN_MULTI_CONN;
+/// 이 서버의 내보내기 전송 깃발: `FLUSH`·`DF` 받음, 여러 연결 됨. 읽기 전용 원본이면 `READ_ONLY`, 쓰는 원본이면
+/// `WRITE_ZEROES`도 받는다.
+fn transmission_flags(source: &dyn ExportSource) -> u16 {
+    let base = TFLAG_HAS_FLAGS | TFLAG_SEND_FLUSH | TFLAG_SEND_DF | TFLAG_CAN_MULTI_CONN;
+    if source.writable() {
+        base | TFLAG_SEND_WRITE_ZEROES
+    } else {
+        base | TFLAG_READ_ONLY
+    }
+}
 
 struct Conn {
     source: Arc<dyn ExportSource>,
@@ -431,14 +459,44 @@ where
             };
             match cmd {
                 CMD_DISC => return Ok(()),
-                CMD_FLUSH => send(simple_reply(cookie, 0, &[])).await?,
+                CMD_FLUSH => {
+                    let frame = match conn.source.flush().await {
+                        Ok(()) => simple_reply(cookie, 0, &[]),
+                        Err(e) => error_reply(conn.structured, cookie, &e),
+                    };
+                    send(frame).await?;
+                }
                 CMD_WRITE => {
                     if len > MAX_REQUEST {
                         return Err(NbdError::Protocol("write payload too long".into()));
                     }
-                    let mut sink = vec![0; len as usize];
-                    r.read_exact(&mut sink).await?;
-                    send(simple_reply(cookie, EPERM, &[])).await?;
+                    let mut data = vec![0; len as usize];
+                    r.read_exact(&mut data).await?;
+                    let frame = if !conn.source.writable() {
+                        simple_reply(cookie, EPERM, &[])
+                    } else if !in_range {
+                        error_reply(conn.structured, cookie, &invalid("write out of range"))
+                    } else {
+                        match conn.source.write(offset, &data).await {
+                            Ok(()) => simple_reply(cookie, 0, &[]),
+                            Err(e) => error_reply(conn.structured, cookie, &e),
+                        }
+                    };
+                    send(frame).await?;
+                }
+                CMD_WRITE_ZEROES => {
+                    let in_range = offset.checked_add(len as u64).is_some_and(|e| e <= size);
+                    let frame = if !conn.source.writable() {
+                        simple_reply(cookie, EPERM, &[])
+                    } else if !in_range {
+                        error_reply(conn.structured, cookie, &invalid("write out of range"))
+                    } else {
+                        match conn.source.write_zeroes(offset, len).await {
+                            Ok(()) => simple_reply(cookie, 0, &[]),
+                            Err(e) => error_reply(conn.structured, cookie, &e),
+                        }
+                    };
+                    send(frame).await?;
                 }
                 CMD_READ | CMD_BLOCK_STATUS => {
                     if !in_range {

@@ -4241,7 +4241,7 @@ export interface paths {
         put?: never;
         /**
          * 계획을 취소한다(`cancelled`, 끝난 계획은 409 `migration_state`). 원본·우리 쪽에 남긴 것이 없는 항목은 곧 `cancelled`다.
-         *     복사를 시작한 항목은 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다(스테이지 4·5).
+         *     복사를 시작한 항목은 스케줄러가 만드는 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다.
          */
         post: operations["cancel_migration"];
         delete?: never;
@@ -4439,6 +4439,49 @@ export interface paths {
         get: operations["get_item"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-vms/{key}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 항목 하나를 취소한다(설계 §10.3): 원본·우리 쪽에 남긴 것이 없으면 곧 `cancelled`, 있으면 `vmware-cleanup` Task(우리
+         *     스냅샷 지움, 우리가 켠 CBT 끔, 대상 볼륨 지움 — 원본 VM·디스크는 그대로)를 항목의 노드에 만든다(도는 동기화 뒤에 돈다).
+         *     끝났거나 전환 중·전환한 항목은 409 `vmware_vm_state`.
+         */
+        post: operations["cancel_item"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-vms/{key}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 실패한 항목을 다시 한다(계획이 `running`·`paused`일 때, 아니면 409 `migration_state`). 복사를 시작하지 않은 항목(미리
+         *     확인에서 막힘)은 미리 확인을 다시 돌려 `pending` 또는 `failed`로, 복사를 시작한 항목은 체크포인트부터 잇게
+         *     (`copying`·`syncing`·`ready`) 둔다 — 스케줄러가 다음 틱에 동기화를 만든다. 오래 전환하지 않아 멈춘 따뜻한 항목(`syncing`,
+         *     다음 동기화 없음)은 다시 시작한다. 그 밖은 409 `vmware_vm_state`.
+         */
+        post: operations["retry_item"];
         delete?: never;
         options?: never;
         head?: never;
@@ -8073,6 +8116,15 @@ export interface components {
             /** @description 타깃 이름(`iqn.`·`eui.`·`naa.`로 시작) */
             target: string;
         };
+        /** @description 항목 동작(`retry`·`cancel`)의 답: 바뀐 항목과 만든 Task(정리) */
+        ItemAction: {
+            item: components["schemas"]["Resource_VmwareVmSpec_VmwareVmStatus"];
+            /**
+             * Format: uuid
+             * @description 만든 Task(취소가 원본·우리 쪽에 남은 것을 치우는 `vmware-cleanup`)
+             */
+            task?: string;
+        };
         JobError: {
             error: string;
             /** @description VM 이름 */
@@ -9796,8 +9848,19 @@ export interface components {
                      * @default {}
                      */
                     source_changes: components["schemas"]["VmwareSourceChanges"];
+                    /**
+                     * Format: int64
+                     * @description 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
+                     */
+                    started_at?: number;
                     /** @default draft */
                     state: components["schemas"]["VmwareVmState"];
+                    /**
+                     * Format: int32
+                     * @description 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
+                     * @default 0
+                     */
+                    sync_failures: number;
                     /**
                      * Format: uuid
                      * @description 만든 VM
@@ -13728,8 +13791,19 @@ export interface components {
                  * @default {}
                  */
                 source_changes: components["schemas"]["VmwareSourceChanges"];
+                /**
+                 * Format: int64
+                 * @description 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
+                 */
+                started_at?: number;
                 /** @default draft */
                 state: components["schemas"]["VmwareVmState"];
+                /**
+                 * Format: int32
+                 * @description 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
+                 * @default 0
+                 */
+                sync_failures: number;
                 /**
                  * Format: uuid
                  * @description 만든 VM
@@ -16789,6 +16863,8 @@ export interface components {
             last_delta_bytes?: number;
             /** Format: int32 */
             rounds?: number;
+            /** @description 차가운 이전: 복사를 시작할 때 flat 파일의 수정 시각(전환이 다시 봐서 그새 켜졌는지 안다 — 설계 §9.2) */
+            source_mtime?: string;
             /**
              * Format: uuid
              * @description 대상 볼륨(첫 동기화가 만들어 먼저 적는다)
@@ -16887,8 +16963,19 @@ export interface components {
              * @default {}
              */
             source_changes: components["schemas"]["VmwareSourceChanges"];
+            /**
+             * Format: int64
+             * @description 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
+             */
+            started_at?: number;
             /** @default draft */
             state: components["schemas"]["VmwareVmState"];
+            /**
+             * Format: int32
+             * @description 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
+             * @default 0
+             */
+            sync_failures: number;
             /**
              * Format: uuid
              * @description 만든 VM
@@ -26709,6 +26796,74 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_VmwareVmSpec_VmwareVmStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemAction"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    retry_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ItemAction"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "4XX": {

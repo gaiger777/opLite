@@ -52,11 +52,11 @@ pub use qemu::{QemuConfig, QemuHypervisor, uefi_vars_path, vm_state_dir};
 pub use replication::{REPLICA_TLS_ID, ReceiverExport, ReplicaDiskTarget, ReplicateRequest};
 pub use storage::{
     Capacity, DirStorage, DiskLocation, ISO_HEADER_LEN, LvInfo, LvmOps, LvmSharedStorage,
-    LvmThinStorage, NbdSource, RBD_DEFAULT_USER, RbdOps, RbdSnapshot, RbdSpace, RbdStorage,
-    Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VgInfo, VolumeInfo, VolumeSource,
-    ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root,
-    create_overlay, disk_location, is_iso_image, nbd_chain_source, nbd_source, parse_ceph_df,
-    parse_lvs, parse_vgs, parse_zfs_dataset, pool_root,
+    LvmThinStorage, NbdSource, NbdTarget, RBD_DEFAULT_USER, RbdOps, RbdSnapshot, RbdSpace,
+    RbdStorage, Storage, Storages, SystemLvm, SystemRbd, SystemZfs, VgInfo, VolumeInfo,
+    VolumeSource, ZfsDataset, ZfsOps, ZfsSnapshot, ZfsSpace, ZfsStorage, ZvolInfo, check_pool_root,
+    create_overlay, disk_location, is_iso_image, nbd_chain_source, nbd_source, nbd_target,
+    parse_ceph_df, parse_lvs, parse_vgs, parse_zfs_dataset, pool_root,
 };
 pub use tpm::{
     KeepFirmware, SwtpmConfig, adopt_firmware_epoch, firmware_epoch_differs, read_firmware_epoch,

@@ -77,6 +77,21 @@ pub fn chunks(areas: &[(u64, u64)], chunk: u64) -> Vec<(u64, u32)> {
     out
 }
 
+/// 사이가 `gap` 바이트 이하인 구역을 하나로 잇는다(작은 범위 읽기 — 요청·티켓 — 를 줄인다). 사이는 얼어 있는 기반의 같은
+/// 내용이라 다시 써도 대상이 바뀌지 않는다(설계 §9.2 — 바뀌지 않은 곳은 앞 회차가 이미 같은 바이트로 썼다).
+pub fn coalesce(areas: &[(u64, u64)], gap: u64) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(areas.len());
+    for &(start, len) in areas {
+        match out.last_mut() {
+            Some((s, l)) if start <= (*s + *l).saturating_add(gap) => {
+                *l = (*l).max(start + len - *s);
+            }
+            _ => out.push((start, len)),
+        }
+    }
+    out
+}
+
 /// 구역들의 바이트 합
 pub fn total(areas: &[(u64, u64)]) -> u64 {
     areas.iter().map(|(_, l)| l).sum()
@@ -118,6 +133,18 @@ mod tests {
             ]
         );
         assert_eq!(total(&[(0, 5), (10, 7)]), 12);
+    }
+
+    #[test]
+    fn coalesces_areas_with_small_gaps() {
+        let k = 1 << 10;
+        assert_eq!(
+            coalesce(&[(0, 128 * k), (192 * k, 128 * k), (2048 * k, k)], 64 * k),
+            vec![(0, 320 * k), (2048 * k, k)]
+        );
+        assert_eq!(coalesce(&[(0, 10), (20, 5)], 9), vec![(0, 10), (20, 5)]);
+        assert_eq!(coalesce(&[(0, 10), (20, 5)], 10), vec![(0, 25)]);
+        assert!(coalesce(&[], 1).is_empty());
     }
 
     #[test]

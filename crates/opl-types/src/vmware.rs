@@ -32,6 +32,8 @@ pub const VMWARE_VM_LABEL: &str = "orbivisor.io/vmware-vm";
 /// 원본 VM에 만드는 우리 스냅샷 이름의 접두(`orbivisor-migration-{항목 id 앞 8자}-{n}`). 우리 것인지는 Raft의 moref로만
 /// 판단하고 이름은 표시용이다.
 pub const SNAPSHOT_PREFIX: &str = "orbivisor-migration-";
+/// 동기화가 연달아 이만큼 실패하면 항목이 `failed`다(설계 §9.5).
+pub const MAX_SYNC_FAILURES: u32 = 3;
 
 /// 비밀 문자열. JSON은 문자열 그대로(Raft에 저장)이고 `Debug`는 `<redacted>`다. API 보기·watch·감사에는 내지 않는다.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -834,6 +836,13 @@ pub struct VmwareVmStatus {
     /// 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<VmwareHistory>,
+    /// 첫 동기화를 시작한 시각(유닉스 초 — `sync.stop_after_days`를 센다)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub started_at: Option<u64>,
+    /// 연달아 실패한 동기화 수(성공하면 0 — [`MAX_SYNC_FAILURES`]번이면 `failed`)
+    #[serde(skip_serializing_if = "is_zero32")]
+    pub sync_failures: u32,
 }
 
 impl VmwareVmStatus {
@@ -999,6 +1008,10 @@ pub struct VmwareSyncDisk {
     #[serde(default, skip_serializing_if = "is_zero")]
     #[cfg_attr(feature = "openapi", schema(default))]
     pub last_delta_bytes: u64,
+    /// 차가운 이전: 복사를 시작할 때 flat 파일의 수정 시각(전환이 다시 봐서 그새 켜졌는지 안다 — 설계 §9.2)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub source_mtime: Option<String>,
 }
 
 /// 원본의 우리 스냅샷
@@ -1486,6 +1499,7 @@ mod tests {
                 copied_bytes: 0,
                 rounds: 3,
                 last_delta_bytes: 1 << 20,
+                source_mtime: None,
             }],
             snapshot: Some(VmwareSnapshotRef {
                 moref: "snapshot-7".into(),

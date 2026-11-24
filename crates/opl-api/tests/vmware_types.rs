@@ -107,8 +107,10 @@ async fn vm_export_privilege_needs_every_node() {
 /// (Task, 기능, 없는 대상에 대한 결과 — `None`이면 성공)
 fn ops() -> Vec<(TaskOp, &'static str, Option<&'static str>)> {
     let vmware = Some("VMware migration tasks are not available yet");
+    // 스테이지 4: 동기화·정리는 돈다 — 없는 항목은 그대로 알린다.
+    let gone = Some("vmware-vm was deleted");
     vec![
-        (TaskOp::VmwareSync { full: true }, VMWARE_MIGRATE, vmware),
+        (TaskOp::VmwareSync { full: true }, VMWARE_MIGRATE, gone),
         (TaskOp::VmwareCutover, VMWARE_MIGRATE, vmware),
         (TaskOp::VmwareRevert, VMWARE_MIGRATE, vmware),
         (
@@ -116,7 +118,7 @@ fn ops() -> Vec<(TaskOp, &'static str, Option<&'static str>)> {
                 delete_target: false,
             },
             VMWARE_MIGRATE,
-            vmware,
+            gone,
         ),
         // 스테이지 6: 내보내기 Task는 돈다 — 없는 내보내기는 쓸 수 없고, 지우기는 할 일이 없다.
         (

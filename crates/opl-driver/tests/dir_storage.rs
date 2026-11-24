@@ -1307,6 +1307,93 @@ async fn interrupted_flatten_can_be_redone() {
 
 /// 꺼진 VM의 저장소 백업 원본(계획 68 설계 §8.2): `qemu-nbd`가 볼륨(지금 내용과 qcow2 내부 스냅샷)을 유닉스 소켓에
 /// 읽기 전용으로 내보내고, opl-store의 NBD 클라이언트가 읽고 구멍을 본다. 끝나면 `qemu-nbd`가 사라진다.
+/// 쓰기로 연 볼륨(계획 72 §9.1·§14): `write`·`write_zeroes`·`flush` → `qemu-img compare`로 같은 내용, 0으로 쓴 곳과 쓰지 않은
+/// 곳은 qcow2에서 할당되지 않은 채(씬 유지 — `qemu-img map`), 닫은 뒤 이미지가 깨끗하다(`qemu-img check`). qcow2·raw.
+#[tokio::test]
+async fn qemu_nbd_target_writes_zeroes_and_flushes_a_volume_thin() {
+    use opl_store::nbd::NbdClient;
+    let tmp = tempfile::Builder::new()
+        .prefix("opl")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let pool = pool(tmp.path());
+    let storage = DirStorage::new("qemu-img", MNT);
+    for format in [ImageFormat::Qcow2, ImageFormat::Raw] {
+        let f = if format == ImageFormat::Qcow2 {
+            "qcow2"
+        } else {
+            "raw"
+        };
+        let id = Uuid::now_v7();
+        let path = storage
+            .create_volume(&pool, id, 16 * MIB, format)
+            .await
+            .unwrap();
+        let src = storage
+            .volume_source(&pool, id, format, None)
+            .await
+            .unwrap();
+        let sock = tmp.path().join(format!("w-{f}.sock"));
+        let target = storage
+            .open_target(Path::new("qemu-nbd"), &src, &sock)
+            .await
+            .unwrap();
+        assert_eq!(target.size_bytes, 16 * MIB);
+        let mut c = NbdClient::connect(&target.socket, &target.export, &[])
+            .await
+            .unwrap();
+        assert!(!c.read_only());
+        let data: Vec<u8> = (0..(4 * MIB) as usize)
+            .map(|i| (i % 251) as u8 + 1)
+            .collect();
+        c.write(MIB, &data).await.unwrap();
+        // 쓴 곳 일부를 0으로(델타가 0으로 바꾼 블록), 쓰지 않은 곳도 0으로(새 볼륨의 빈 곳)
+        c.write_zeroes(2 * MIB, MIB).await.unwrap();
+        c.write_zeroes(8 * MIB, 4 * MIB).await.unwrap();
+        c.flush().await.unwrap();
+        c.disconnect().await.unwrap();
+        target.close().await;
+        assert!(NbdClient::list(&sock).await.is_err());
+
+        let mut want = vec![0u8; (16 * MIB) as usize];
+        want[MIB as usize..(5 * MIB) as usize].copy_from_slice(&data);
+        want[(2 * MIB) as usize..(3 * MIB) as usize].fill(0);
+        let expect = tmp.path().join(format!("want-{f}.raw"));
+        std::fs::write(&expect, &want).unwrap();
+        let p = path.to_str().unwrap();
+        qemu_img(&["compare", "-f", f, "-F", "raw", p, expect.to_str().unwrap()]);
+        if format == ImageFormat::Qcow2 {
+            qemu_img(&["check", p]);
+            let out = std::process::Command::new("qemu-img")
+                .args(["map", "--output=json", "-f", f, p])
+                .output()
+                .unwrap();
+            let map: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            let allocated: u64 = map
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["data"] == true)
+                .map(|e| e["length"].as_u64().unwrap())
+                .sum();
+            // 데이터는 쓴 4 MiB 중 0으로 바꾼 1 MiB를 뺀 3 MiB뿐(0 블록은 구멍)
+            assert_eq!(allocated, 3 * MIB, "{map}");
+        }
+    }
+    // 스냅샷에는 쓰지 않는다.
+    let snap = VolumeSource {
+        path: tmp.path().join("x.qcow2"),
+        format: ImageFormat::Qcow2,
+        snapshot: Some("t".into()),
+        size_bytes: 0,
+        rbd: None,
+    };
+    let e = opl_driver::nbd_target(Path::new("qemu-nbd"), &snap, &tmp.path().join("y.sock"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, DriverError::InvalidSpec(_)), "{e}");
+}
+
 #[tokio::test]
 async fn qemu_nbd_exports_a_volume_and_its_snapshot() {
     use opl_store::nbd::{BASE_ALLOCATION, NbdClient, STATE_ZERO};

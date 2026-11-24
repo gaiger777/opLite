@@ -92,6 +92,55 @@ pub(crate) fn target_folder(rules: &VmwareRules, item: &VmwareVmSpec) -> Option<
         })
 }
 
+/// 디스크마다 만들 대상 볼륨(`{대상}-disk{i}`, 크기 = 원본 용량, 레이블 [`VMWARE_VM_LABEL`] = 항목 id). 풀은 덮어쓰기(디스크
+/// 순번) > 데이터스토어 규칙 > `default_pool`. 풀이 없는 디스크는 문제다(미리 확인과 첫 동기화가 함께 쓴다).
+pub(crate) fn disk_volumes(
+    rules: &VmwareRules,
+    item_id: Uuid,
+    item: &VmwareVmSpec,
+    vm: &InvVm,
+    format: &dyn Fn(&str) -> ImageFormat,
+) -> Result<Vec<CreateRequest<VolumeSpec>>, Vec<VmCheckProblem>> {
+    let empty = Default::default();
+    let o = item.overrides.as_ref().unwrap_or(&empty);
+    let mut problems = Vec::new();
+    let mut volumes = Vec::new();
+    for (i, d) in vm.disks.iter().enumerate() {
+        let ds = d.datastore.as_deref().unwrap_or("");
+        let pool = o
+            .pools
+            .get(i)
+            .map(String::as_str)
+            .or_else(|| rules.pool_for(ds));
+        let Some(pool) = pool else {
+            problems.push(blocked(
+                &format!("disks.{i}"),
+                "pool_unmapped",
+                format!(
+                    "datastore {ds:?} has no storage pool; add a datastore rule or a default pool"
+                ),
+            ));
+            continue;
+        };
+        volumes.push(CreateRequest {
+            name: volume_name(&item.target_name, i),
+            labels: BTreeMap::from([(VMWARE_VM_LABEL.to_string(), item_id.to_string())]),
+            spec: VolumeSpec {
+                pool: pool.to_string(),
+                size_bytes: d.capacity,
+                format: format(pool),
+                content: Default::default(),
+                base: None,
+            },
+        });
+    }
+    if problems.is_empty() {
+        Ok(volumes)
+    } else {
+        Err(problems)
+    }
+}
+
 /// 원본 VM을 우리 VM 스펙과 만들 볼륨으로 옮긴다. 옮길 수 없으면(네트워크·풀 매핑 없음, SATA 개수) 그 문제들이다.
 pub(crate) fn map_vm(input: &MapInput<'_>) -> Result<Mapped, Vec<VmCheckProblem>> {
     let MapInput {
@@ -142,37 +191,13 @@ pub(crate) fn map_vm(input: &MapInput<'_>) -> Result<Mapped, Vec<VmCheckProblem>
         }
     }
 
-    // 풀: 덮어쓰기(디스크 순번) > 데이터스토어 규칙 > `default_pool`
-    let mut volumes = Vec::new();
-    for (i, d) in vm.disks.iter().enumerate() {
-        let ds = d.datastore.as_deref().unwrap_or("");
-        let pool = o
-            .pools
-            .get(i)
-            .map(String::as_str)
-            .or_else(|| rules.pool_for(ds));
-        let Some(pool) = pool else {
-            problems.push(blocked(
-                &format!("disks.{i}"),
-                "pool_unmapped",
-                format!(
-                    "datastore {ds:?} has no storage pool; add a datastore rule or a default pool"
-                ),
-            ));
-            continue;
-        };
-        volumes.push(CreateRequest {
-            name: volume_name(&item.target_name, i),
-            labels: BTreeMap::from([(VMWARE_VM_LABEL.to_string(), item_id.to_string())]),
-            spec: VolumeSpec {
-                pool: pool.to_string(),
-                size_bytes: d.capacity,
-                format: format(pool),
-                content: Default::default(),
-                base: None,
-            },
-        });
-    }
+    let volumes = match disk_volumes(rules, *item_id, item, vm, format) {
+        Ok(v) => v,
+        Err(p) => {
+            problems.extend(p);
+            Vec::new()
+        }
+    };
     if !problems.is_empty() {
         return Err(problems);
     }
