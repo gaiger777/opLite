@@ -1,11 +1,18 @@
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 
 import type { Node, Vm } from "@/api/types";
 import { startDownload } from "@/fileRestore/download";
-import type { EntryView, GuestRestoreCaps, Session, VolumeView } from "@/fileRestore/fileRestore";
+import {
+  type EntryView,
+  type GuestRestoreCaps,
+  RENDER_STEP,
+  type Session,
+  type VolumeView,
+} from "@/fileRestore/fileRestore";
 import { FileRestorePage } from "@/fileRestore/FileRestorePage";
+import { VolumeTree } from "@/fileRestore/VolumeTree";
 import { resetTasks } from "@/tasks/tasks";
 import { expectNoAxeViolations } from "@/test/axe";
 import { backup, NODE, task, vm } from "@/test/fixtures";
@@ -17,7 +24,44 @@ vi.mock("@/fileRestore/download", () => ({ startDownload: vi.fn() }));
 afterEach(() => {
   resetTasks();
   vi.mocked(startDownload).mockClear();
+  vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
+
+/**
+ * jsdom에는 IntersectionObserver가 없다. 관찰 중인 것을 모아 두고 `scrolledToEnd()`가 "아래 끝이 보인다"를 알린다(진짜와
+ * 달리 관찰을 시작할 때 저절로 알리지 않는다).
+ */
+class FakeObserver {
+  static live = new Set<FakeObserver>();
+  constructor(readonly callback: IntersectionObserverCallback) {}
+  observe() {
+    FakeObserver.live.add(this);
+  }
+  unobserve() {}
+  disconnect() {
+    FakeObserver.live.delete(this);
+  }
+  takeRecords() {
+    return [];
+  }
+}
+
+function useFakeObserver() {
+  FakeObserver.live.clear();
+  vi.stubGlobal("IntersectionObserver", FakeObserver);
+}
+
+function scrolledToEnd() {
+  act(() => {
+    for (const o of [...FakeObserver.live]) {
+      o.callback(
+        [{ isIntersecting: true } as IntersectionObserverEntry],
+        o as unknown as IntersectionObserver,
+      );
+    }
+  });
+}
 
 const base = vm("web", "running");
 const web: Vm = { ...base, spec: { ...base.spec, guest_agent: { freeze_fs: true } } };
@@ -165,7 +209,7 @@ function open() {
 const ROOT = [
   e("etc", { kind: "dir", mode: 0o755 }),
   e("hello.txt", { size: 13 }),
-  e("link", { kind: "symlink", mode: 0o777, link_target: "hello.txt" }),
+  e("link", { kind: "symlink", mode: 0o777, link_target: "./hello.txt" }),
   e("�.bin", { raw: btoa("\xff.bin") }),
 ];
 
@@ -194,7 +238,7 @@ it("shows the helper VM starting with the elapsed time and a slow-node hint, the
   // 첫 찾아볼 수 있는 볼륨을 나열한다.
   const table = await screen.findByRole("table", { name: "Files in /" });
   await within(table).findByText("hello.txt");
-  expect(within(table).getByText("→ hello.txt")).toBeInTheDocument();
+  expect(within(table).getByTitle("./hello.txt")).toHaveTextContent("→ ./hello.txt");
   expect(within(table).getByText("drwxr-xr-x")).toBeInTheDocument();
   expect(within(table).getByText("(not UTF-8)")).toBeInTheDocument();
 });
@@ -234,19 +278,25 @@ it("enters folders, pages, filters and selects with the keyboard", async () => {
   await user.keyboard(" ");
   expect(within(rows[2]!).getByRole("checkbox", { name: "Select passwd" })).toBeChecked();
   expect(screen.getByText("1 selected")).toBeInTheDocument();
-  // Enter로 폴더 들어가기
-  rows[1]!.focus();
+  // Enter로 폴더 들어가기 — 새 목록의 첫 행에 초점이 남아 키보드로 이어 간다(리뷰 1 웹 #4).
+  await user.keyboard("{ArrowUp}");
+  expect(rows[1]).toHaveFocus();
   await user.keyboard("{Enter}");
-  await screen.findByRole("table", { name: "Files in /etc/nginx" });
+  const inNginx = await screen.findByRole("table", { name: "Files in /etc/nginx" });
   expect(screen.getByRole("navigation", { name: "Folder path" })).toHaveTextContent(
     "Partition 1etcnginx",
   );
-  const nginxRows = within(screen.getByRole("table", { name: "Files in /etc/nginx" })).getAllByRole(
-    "row",
-  );
-  nginxRows[1]!.focus();
+  await waitFor(() => expect(within(inNginx).getAllByRole("row")[1]).toHaveFocus());
+  // Backspace로 위로 — 온 폴더(nginx)의 행에 초점
   await user.keyboard("{Backspace}");
-  await screen.findByRole("table", { name: "Files in /etc" });
+  const back = await screen.findByRole("table", { name: "Files in /etc" });
+  await waitFor(() =>
+    expect(
+      within(back).getByRole("checkbox", { name: "Select nginx" }).closest("tr"),
+    ).toHaveFocus(),
+  );
+  await user.keyboard("{ArrowDown}");
+  expect(within(back).getByRole("checkbox", { name: "Select passwd" }).closest("tr")).toHaveFocus();
   // 이동 경로로 루트에
   await user.click(
     within(screen.getByRole("navigation", { name: "Folder path" })).getByRole("button", {
@@ -456,4 +506,308 @@ it("treats a session the node forgot as ended", async () => {
   expect(
     screen.getByText(/^This browsing session no longer exists \(the node may have restarted\)/),
   ).toBeInTheDocument();
+});
+
+// 리뷰 1 웹 #1: 다음 쪽이 실패해도 읽은 행과 내려받기는 그대로고, 다시 시도는 단추로만 한다(저절로 되풀이하지 않는다).
+it("keeps the loaded rows when a next page fails and retries only on request", async () => {
+  useFakeObserver();
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  mockSession([session("ready")]);
+  let calls = 0;
+  let failing = true;
+  server.use(
+    http.get(apiUrl("/file-restore/sessions/:id/volumes/:volume/entries"), ({ request }) => {
+      calls += 1;
+      const cursor = new URL(request.url).searchParams.get("cursor");
+      if (!cursor) {
+        return HttpResponse.json({ entries: [e("hosts"), e("motd")], next: "1" });
+      }
+      if (failing) {
+        return HttpResponse.json(
+          { code: "file_restore_io", message: "read error" },
+          { status: 502 },
+        );
+      }
+      return HttpResponse.json({ entries: [e("passwd")] });
+    }),
+  );
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  await within(table).findByText("hosts");
+  scrolledToEnd();
+  expect(await within(table).findByRole("alert")).toHaveTextContent(/^Could not load more names: /);
+  expect(calls).toBe(2);
+  expect(within(table).getByText("hosts")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Download folder" })).toBeEnabled();
+  expect(screen.queryByRole("button", { name: "Load more" })).not.toBeInTheDocument();
+  // 아래 끝이 계속 보여도 다시 묻지 않는다.
+  expect(FakeObserver.live.size).toBe(0);
+  scrolledToEnd();
+  await new Promise((r) => setTimeout(r, 50));
+  expect(calls).toBe(2);
+  failing = false;
+  await user.click(within(table).getByRole("button", { name: "Retry" }));
+  await within(table).findByText("passwd");
+  expect(calls).toBe(3);
+  expect(within(table).queryByRole("alert")).not.toBeInTheDocument();
+});
+
+// 리뷰 1 웹 #7: 큰 디렉터리는 `RENDER_STEP`씩 그리고, 거르는 동안은 다음 쪽을 저절로 읽지 않는다.
+it("renders large folders in steps and does not fetch every page while filtering", async () => {
+  useFakeObserver();
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  const many = Array.from({ length: RENDER_STEP + 100 }, (_, i) =>
+    e(`f${String(i).padStart(3, "0")}`),
+  );
+  const calls = mockSession([session("ready")], { "disk0p1:/": [many, [e("zzz")]] });
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  await within(table).findByText("f000");
+  expect(within(table).getAllByRole("row")).toHaveLength(RENDER_STEP + 1);
+  expect(
+    screen.getByText(`Showing ${RENDER_STEP} of ${RENDER_STEP + 100} loaded names`),
+  ).toBeInTheDocument();
+  // 아래 끝에 닿으면 먼저 읽은 행을 더 그린다(묻지 않는다).
+  scrolledToEnd();
+  await waitFor(() => expect(within(table).getAllByRole("row")).toHaveLength(RENDER_STEP + 101));
+  expect(calls.list).toEqual(["disk0p1 /"]);
+  // 거르는 동안은 아래 끝이 보여도 묻지 않는다 — 단추로만.
+  await user.type(screen.getByRole("searchbox", { name: "Filter names in this folder" }), "f05");
+  expect(within(table).getAllByRole("row")).toHaveLength(11);
+  expect(
+    screen.getByText("The filter only sees the names loaded so far. Load more to search further."),
+  ).toBeInTheDocument();
+  scrolledToEnd();
+  expect(calls.list).toEqual(["disk0p1 /"]);
+  await user.click(screen.getByRole("button", { name: "Load more" }));
+  await waitFor(() => expect(calls.list).toEqual(["disk0p1 /", "disk0p1 / @1"]));
+});
+
+// 리뷰 1 웹 #2: 노드에 잠깐 닿지 않아 서버가 볼륨 없는 Raft 보기를 주어도 찾아보기 상태(폴더·고른 것)를 버리지 않는다.
+it("keeps the browser while the session node is briefly unreachable", async () => {
+  vi.useFakeTimers({ shouldAdvanceTime: true, toFake: ["setTimeout", "setInterval"] });
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  mockSession([session("ready")], {
+    "disk0p1:/": [ROOT],
+    "disk0p1:/etc": [[e("hosts"), e("passwd")]],
+  });
+  let reachable = true;
+  server.use(
+    http.get(apiUrl("/file-restore/sessions/:id"), () =>
+      HttpResponse.json(
+        reachable ? session("ready") : session("ready", { volumes: [], expires_at: 0 }),
+      ),
+    ),
+  );
+  const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+  open();
+  const root = await screen.findByRole("table", { name: "Files in /" });
+  await user.click(await within(root).findByRole("button", { name: "etc" }));
+  const inEtc = await screen.findByRole("table", { name: "Files in /etc" });
+  await user.click(await within(inEtc).findByRole("checkbox", { name: "Select hosts" }));
+  reachable = false;
+  await act(() => vi.advanceTimersByTimeAsync(20_000));
+  expect(
+    await screen.findByText("Cannot reach the node of this session right now. Retrying…"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("No volume can be browsed")).not.toBeInTheDocument();
+  expect(screen.getByRole("table", { name: "Files in /etc" })).toBe(inEtc);
+  expect(within(inEtc).getByRole("checkbox", { name: "Select hosts" })).toBeChecked();
+  expect(screen.getByRole("navigation", { name: "Volumes" })).toHaveTextContent("Partition 1");
+  // 다시 닿으면 알림이 사라진다(닿지 않는 동안은 2초마다 묻는다).
+  reachable = true;
+  await act(() => vi.advanceTimersByTimeAsync(2000));
+  await waitFor(() =>
+    expect(
+      screen.queryByText("Cannot reach the node of this session right now. Retrying…"),
+    ).not.toBeInTheDocument(),
+  );
+  expect(within(inEtc).getByRole("checkbox", { name: "Select hosts" })).toBeChecked();
+  expect(screen.getByText("Closes in 14 min without use")).toBeInTheDocument();
+});
+
+// 리뷰 1 웹 #3: 닫기는 서버가 닫힘을 알릴 때까지 "닫는 중"이고 다시 누를 수 없다(부팅 중 닫기는 부팅이 끝나야 된다).
+it("shows closing until the server reports the session closed", async () => {
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  const calls = mockSession([session("booting")]);
+  let closed = false;
+  server.use(
+    http.get(apiUrl("/file-restore/sessions/:id"), () =>
+      HttpResponse.json(closed ? session("closed") : session("booting")),
+    ),
+    http.delete(apiUrl("/file-restore/sessions/:id"), () => {
+      calls.deleted += 1;
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const user = userEvent.setup();
+  open();
+  await user.click(await screen.findByRole("button", { name: "Close" }));
+  const closing = await screen.findByRole("button", { name: "Closing…" });
+  expect(closing).toBeDisabled();
+  expect(screen.getByText("Closing")).toBeInTheDocument();
+  expect(calls.deleted).toBe(1);
+  // 서버가 아직 부팅 중이라고 해도 그대로 "닫는 중"이다.
+  await new Promise((r) => setTimeout(r, 300));
+  expect(screen.getByRole("button", { name: "Closing…" })).toBeDisabled();
+  closed = true;
+  expect(
+    await screen.findByText("This browsing session is closed", {}, { timeout: 4000 }),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /^Clos/ })).not.toBeInTheDocument();
+});
+
+// 리뷰 1 웹 #5·#6: VM 목록은 서버 조건(HA 게스트 감시 채널 포함, 그 VM의 vm.config)을 따르고, 원래 VM이 없으면 고르게 한다.
+it("lists only VMs the user may restore into and never preselects another VM", async () => {
+  const stopped: Vm = { ...web, status: { ...web.status, phase: "stopped", node: null } };
+  const watched: Vm = {
+    ...vm("gw", "running"),
+    spec: {
+      ...vm("gw", "running").spec,
+      ha: {
+        state: "started",
+        max_restart: 1,
+        max_relocate: 1,
+        priority: 50,
+        guest_watch: { timeout_secs: 60 },
+      },
+    },
+  };
+  const locked: Vm = {
+    ...other,
+    name: "locked",
+    id: vm("locked", "running").id,
+    spec: { ...other.spec, folder: "f1" },
+  };
+  mockLists({ vm: [stopped, watched, locked, other], node: [node("kvm")], backup: [b1] });
+  server.use(
+    http.get(apiUrl("/permissions/mine"), () =>
+      HttpResponse.json({
+        all: false,
+        root: ["system.read"],
+        root_contents: ["system.read", "vm.config"],
+        folders: { f1: ["system.read"] },
+        contents: { f1: ["system.read"] },
+        objects: [],
+      }),
+    ),
+  );
+  mockSession([session("ready")], { "disk0p1:/": [ROOT] });
+  const asked: string[] = [];
+  server.use(
+    http.get(apiUrl("/vms/:key/guest/restore-caps"), ({ params }) => {
+      asked.push(String(params.key));
+      return HttpResponse.json({ os: "linux", file_write: true, exec: true });
+    }),
+  );
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  await user.click(await within(table).findByRole("checkbox", { name: "Select hello.txt" }));
+  await user.click(screen.getByRole("button", { name: "Restore to VM" }));
+  const dialog = await screen.findByRole("dialog", { name: "Restore 1 item to a VM" });
+  const select = within(dialog).getByRole("combobox", { name: "VM" });
+  expect(select).toHaveDisplayValue("Choose a VM");
+  expect(
+    within(select)
+      .getAllByRole("option")
+      .map((o) => o.textContent),
+  ).toEqual(["Choose a VM", "gw", "db"]);
+  expect(within(dialog).getByRole("button", { name: "Restore" })).toBeDisabled();
+  expect(asked).toEqual([]);
+  await user.selectOptions(select, "gw");
+  await waitFor(() =>
+    expect(within(dialog).getByRole("button", { name: "Restore" })).toBeEnabled(),
+  );
+  expect(asked).toEqual([watched.id]);
+});
+
+// 리뷰 1 웹 #8: 거르기로 숨은 고른 행은 동작에 넣지 않고 수만 알린다. 모두 고르기는 보이는 행만 바꾼다.
+it("applies actions only to the selected rows the filter shows", async () => {
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  const calls = mockSession([session("ready")], { "disk0p1:/": [ROOT] });
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  await user.click(await within(table).findByRole("checkbox", { name: "Select hello.txt" }));
+  await user.type(screen.getByRole("searchbox", { name: "Filter names in this folder" }), "etc");
+  expect(
+    screen.getByText("0 selected (+1 hidden by the filter, not included)"),
+  ).toBeInTheDocument();
+  await user.click(within(table).getByRole("checkbox", { name: "Select all" }));
+  expect(
+    screen.getByText("1 selected (+1 hidden by the filter, not included)"),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Download 1 as zip" }));
+  await waitFor(() => expect(calls.links).toHaveLength(1));
+  expect(calls.links[0]).toEqual({ volume: "disk0p1", paths: [["etc"]], format: "zip" });
+  // 모두 고르기를 다시 누르면 보이는 행만 뺀다 — 숨은 hello.txt는 남는다.
+  await user.click(within(table).getByRole("checkbox", { name: "Select all" }));
+  await user.clear(screen.getByRole("searchbox", { name: "Filter names in this folder" }));
+  expect(screen.getByText("1 selected")).toBeInTheDocument();
+  expect(within(table).getByRole("checkbox", { name: "Select hello.txt" })).toBeChecked();
+});
+
+// 리뷰 1 웹 #9: 게스트가 정한 이름의 양방향·제어 문자를 드러내고, 긴 이름은 툴팁으로 다 본다.
+it("shows hidden and bidi characters in names as visible escapes", async () => {
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  const spoof = "invoice‮txt.exe";
+  mockSession([session("ready")], {
+    "disk0p1:/": [[e(spoof), e("two\nlines", { kind: "dir" })]],
+    "disk0p1:/two\nlines": [[e("x")]],
+  });
+  const user = userEvent.setup();
+  open();
+  const table = await screen.findByRole("table", { name: "Files in /" });
+  const name = await within(table).findByTitle("invoice\\u202Etxt.exe");
+  expect(name).toHaveTextContent("invoice\\u202Etxt.exe");
+  expect(name.querySelector("bdi")).not.toBeNull();
+  expect(name.textContent).not.toContain("‮");
+  expect(
+    within(table).getByRole("checkbox", { name: "Select invoice\\u202Etxt.exe" }),
+  ).toBeInTheDocument();
+  await user.click(within(table).getByRole("button", { name: "two\\nlines" }));
+  await screen.findByRole("table", { name: "Files in /two\\nlines" });
+  const crumbs = screen.getByRole("navigation", { name: "Folder path" });
+  expect(within(crumbs).getByTitle("two\\nlines")).toHaveTextContent("two\\nlines");
+});
+
+// 리뷰 1 웹 #10: 백업에서 온 LV 이름이 비슷해도 까닭 id가 겹치지 않는다.
+it("gives each volume row its own description id", () => {
+  const lv = (id: string, note: string): VolumeView => ({
+    id,
+    disk: 1,
+    kind: "logical_volume",
+    fs: "xfs",
+    mountable: false,
+    size: 1 << 30,
+    state: "unmounted",
+    note,
+  });
+  render(
+    <VolumeTree
+      volumes={[lv("lvm/vg/data.old", "first"), lv("lvm/vg/data_old", "second")]}
+      chosen={undefined}
+      onChoose={() => {}}
+    />,
+  );
+  expect(screen.getByRole("button", { name: /data\.old/ })).toHaveAccessibleDescription("first");
+  expect(screen.getByRole("button", { name: /data_old/ })).toHaveAccessibleDescription("second");
+});
+
+// 리뷰 1 웹 #11: 닫힐 때까지 남은 시간은 서버 시계로 센다(응답의 Date 머리).
+it("counts the idle time with the server clock", async () => {
+  mockLists({ vm: [web], node: [node("kvm")], backup: [b1] });
+  mockSession([session("ready")], { "disk0p1:/": [ROOT] });
+  server.use(
+    http.get(apiUrl("/file-restore/sessions/:id"), () =>
+      HttpResponse.json(session("ready"), {
+        headers: { Date: new Date(Date.now() + 3 * 60_000).toUTCString() },
+      }),
+    ),
+  );
+  open();
+  expect(await screen.findByText("Closes in 11 min without use")).toBeInTheDocument();
 });

@@ -21,6 +21,51 @@ export interface Part {
 /** 나열 한 쪽의 항목 수(서버 기본과 같다) */
 export const PAGE_SIZE = 200;
 
+/** 파일 표가 한 번에 더 그리는 행 수. 큰 디렉터리를 다 그리지 않고 아래에 닿을 때마다 이만큼 늘린다. */
+export const RENDER_STEP = 500;
+
+/**
+ * 이름에서 화면에 보이지 않거나 글 방향을 바꾸는 문자(C0·C1 제어 문자, 양방향 서식 문자, 폭 없는 문자, BOM). 백업 안 이름은
+ * 게스트가 정한 것이라 `invoice` + U+202E + `txt.exe`처럼 다른 이름으로 보이게 할 수 있다.
+ */
+const HIDDEN_CHARS =
+  // eslint-disable-next-line no-control-regex
+  /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g;
+
+const SHORT_ESCAPES: Record<string, string> = { "\n": "\\n", "\r": "\\r", "\t": "\\t" };
+
+function escapeChar(c: string): string {
+  return SHORT_ESCAPES[c] ?? `\\u${c.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+/** 보이는 이름의 조각: 그대로 보일 글과, 숨은 문자를 바꾼 `\u202E`·`\n` 같은 글(`escaped`) */
+export interface NameSegment {
+  text: string;
+  escaped: boolean;
+}
+
+/** 이름을 보이는 조각으로 나눈다(보이기만 — API에는 원래 이름을 보낸다). */
+export function nameSegments(name: string): NameSegment[] {
+  const out: NameSegment[] = [];
+  let last = 0;
+  for (const m of name.matchAll(HIDDEN_CHARS)) {
+    if (m.index > last) {
+      out.push({ text: name.slice(last, m.index), escaped: false });
+    }
+    out.push({ text: escapeChar(m[0]), escaped: true });
+    last = m.index + m[0].length;
+  }
+  if (last < name.length || out.length === 0) {
+    out.push({ text: name.slice(last), escaped: false });
+  }
+  return out;
+}
+
+/** 숨은 문자를 보이는 글로 바꾼 이름(툴팁·접근 이름) */
+export function visibleName(name: string): string {
+  return name.replace(HIDDEN_CHARS, escapeChar);
+}
+
 export function partOf(entry: EntryView): Part {
   return entry.raw ? { name: entry.name, raw: entry.raw } : { name: entry.name };
 }
@@ -33,6 +78,11 @@ export function entryKey(entry: Part): string {
 /** 보이는 경로(`/etc/nginx`). UTF-8이 아닌 조각은 U+FFFD가 든 이름 그대로다. */
 export function displayPath(parts: readonly Part[]): string {
   return `/${parts.map((p) => p.name).join("/")}`;
+}
+
+/** 화면에 보일 경로: `displayPath`에서 숨은 문자를 보이는 글로 바꾼 것 */
+export function visiblePath(parts: readonly Part[]): string {
+  return `/${parts.map((p) => visibleName(p.name)).join("/")}`;
 }
 
 /** API의 `EntryPath`: 조각 목록(UTF-8이 아닌 조각은 `{ b64 }`) */
@@ -209,6 +259,19 @@ export function fileRestoreError(t: TFunction, err: unknown): string {
   return err instanceof ApiError
     ? codeMessage(t, err.code, err.message, "fileRestore.errors")
     : errorMessage(t, err);
+}
+
+/**
+ * 서버 시계와 이 브라우저 시계의 차이(초, 서버 − 브라우저). 응답의 `Date` 머리(초 단위)로 잰다. 없거나 2초보다 작으면 0이다
+ * (초 단위로 잘린 머리 때문에 흔들리지 않게).
+ */
+export function serverSkew(date: string | null | undefined, nowMs = Date.now()): number {
+  const server = date ? Date.parse(date) : NaN;
+  if (Number.isNaN(server)) {
+    return 0;
+  }
+  const skew = (server - nowMs) / 1000;
+  return Math.abs(skew) < 2 ? 0 : skew;
 }
 
 /** 세션 보기의 캐시 키 */

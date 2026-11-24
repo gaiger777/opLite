@@ -11,8 +11,12 @@ import {
   firstBrowsable,
   groupVolumes,
   modeString,
+  nameSegments,
   pathQuery,
+  serverSkew,
   targetDirOk,
+  visibleName,
+  visiblePath,
   volumeBlocked,
   type VolumeView,
   volumeWarning,
@@ -147,4 +151,31 @@ it("shows the browse action only when the cluster can do it", () => {
   );
   // 노드를 읽지 못하는 사용자는 서버가 판단한다.
   expect(fileRestoreAction(undefined, false)).toBe("ready");
+});
+
+it("makes hidden and bidi characters in names visible", () => {
+  expect(visibleName("plain.txt")).toBe("plain.txt");
+  expect(visibleName("a\nb\tc\rd")).toBe("a\\nb\\tc\\rd");
+  expect(visibleName("invoice‮txt.exe")).toBe("invoice\\u202Etxt.exe");
+  expect(visibleName("\u0000\u007f\u0085​⁦﻿")).toBe("\\u0000\\u007F\\u0085\\u200B\\u2066\\uFEFF");
+  // 한글·U+FFFD(UTF-8이 아닌 이름)·이모지는 그대로
+  expect(visibleName("문서 � 😀")).toBe("문서 � 😀");
+  expect(nameSegments("a‮b")).toEqual([
+    { text: "a", escaped: false },
+    { text: "\\u202E", escaped: true },
+    { text: "b", escaped: false },
+  ]);
+  expect(nameSegments("\n")).toEqual([{ text: "\\n", escaped: true }]);
+  expect(nameSegments("")).toEqual([{ text: "", escaped: false }]);
+  expect(visiblePath([{ name: "etc" }, { name: "x‏y" }])).toBe("/etc/x\\u200Fy");
+});
+
+it("measures the server clock from the Date header", () => {
+  const now = Date.parse("2026-11-24T10:00:00Z");
+  expect(serverSkew("Tue, 24 Nov 2026 10:03:00 GMT", now)).toBe(180);
+  expect(serverSkew("Tue, 24 Nov 2026 09:58:00 GMT", now)).toBe(-120);
+  // 초 단위로 잘린 머리와 지연은 무시한다.
+  expect(serverSkew("Tue, 24 Nov 2026 10:00:01 GMT", now + 300)).toBe(0);
+  expect(serverSkew(null, now)).toBe(0);
+  expect(serverSkew("garbage", now)).toBe(0);
 });

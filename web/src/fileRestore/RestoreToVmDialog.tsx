@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 
 import { ApiError, api, call } from "@/api/client";
 import { useList } from "@/api/live";
+import { objectTarget } from "@/auth/permissions";
+import { usePermissions } from "@/auth/usePermissions";
 import { Field } from "@/components/Field";
 import { FormDialog } from "@/components/FormDialog";
 import { Input } from "@/components/ui/input";
@@ -21,12 +23,14 @@ import {
   type VolumeView,
 } from "@/fileRestore/fileRestore";
 import { trackTask } from "@/tasks/tasks";
+import { agentChannel } from "@/vms/guest";
 
 const CONFLICTS: GuestConflict[] = ["keep", "skip", "overwrite"];
 
 /**
- * 고른 항목을 실행 중 VM에 게스트 에이전트로 되돌려 쓰는 대화상자(설계 §12·§14): VM(기본은 원래 VM — 실행 중이고 에이전트 채널이
- * 있는 것만), 대상 디렉터리(기본은 원래 부모 경로), 충돌 정책. VM을 고르면 에이전트가 허락하는 것(`restore-caps`)을 미리 묻고,
+ * 고른 항목을 실행 중 VM에 게스트 에이전트로 되돌려 쓰는 대화상자(설계 §12·§14): VM(실행 중이고 에이전트 채널이 있고 내가
+ * `vm.config`를 가진 것만 — 원래 VM이 그렇다면 그것이 기본이고, 아니면 직접 고르게 한다), 대상 디렉터리(기본은 원래 부모
+ * 경로), 충돌 정책. VM을 고르면 에이전트가 허락하는 것(`restore-caps`)을 미리 묻고,
  * 허락하지 않은 선택은 막고 까닭을 보인다. 보내면 Task 진행을 알림으로 본다.
  */
 export function RestoreToVmDialog({
@@ -49,13 +53,17 @@ export function RestoreToVmDialog({
 }) {
   const { t } = useTranslation();
   const vms = useList("vm");
+  const perms = usePermissions();
+  // 서버와 같은 조건: 실행 중, 에이전트 채널(`guest_agent`나 HA 게스트 감시), 그 VM의 `vm.config`
   const running = (vms.data ?? []).filter(
-    (v) => v.status.phase === "running" && v.spec.guest_agent != null,
+    (v) =>
+      v.status.phase === "running" &&
+      agentChannel(v) &&
+      perms.has("vm.config", objectTarget("vm", v)),
   );
   const [vmId, setVmId] = useState<string | undefined>(undefined);
-  const vm =
-    running.find((v) => v.id === vmId) ??
-    (vmId === undefined ? (running.find((v) => v.id === originalVm) ?? running[0]) : undefined);
+  // 다른 VM을 저절로 고르지 않는다(엉뚱한 게스트에 쓰지 않게) — 원래 VM이 없으면 사용자가 고른다.
+  const vm = running.find((v) => v.id === (vmId ?? originalVm));
   const caps = useQuery({
     queryKey: ["file-restore", "caps", vm?.id],
     queryFn: () =>

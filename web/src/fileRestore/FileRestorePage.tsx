@@ -16,9 +16,11 @@ import {
   clock,
   fileRestoreError,
   firstBrowsable,
+  serverSkew,
   type Session,
   sessionKey,
   volumeBlocked,
+  type VolumeView,
 } from "@/fileRestore/fileRestore";
 import { VolumeTree } from "@/fileRestore/VolumeTree";
 import { formatTime } from "@/lib/format";
@@ -100,25 +102,46 @@ function isGone(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
 }
 
+/** 세션 보기와 서버 시계의 차이(초, 서버 − 브라우저 — 응답의 `Date`로 잰 것) */
+type SessionData = Session & { skew?: number };
+
+/**
+ * 세션 노드에 닿지 못해 서버가 Raft로 만든 보기: 준비됨인데 볼륨이 없고 닫힐 시각을 모른다(서버 `raft_view`). 볼륨이 정말
+ * 없는 세션이 아니다 — 지금 화면을 두고 다시 묻는다.
+ */
+function isFallback(s: Session | undefined): boolean {
+  return s?.phase === "ready" && s.expires_at === 0 && !s.volumes?.length;
+}
+
+const NO_VOLUMES: readonly VolumeView[] = [];
+
 function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void }) {
   const { t, i18n } = useTranslation();
   const queryClient = useQueryClient();
-  const query = useQuery({
+  // 닫기를 보냈다. 서버가 닫힘(또는 실패)을 알릴 때까지 "닫는 중"으로 보이고 자주 묻는다.
+  const [closeRequested, setCloseRequested] = useState(false);
+  const query = useQuery<SessionData>({
     queryKey: sessionKey(initial.id),
-    queryFn: () =>
-      call(api.GET("/file-restore/sessions/{id}", { params: { path: { id: initial.id } } })),
+    queryFn: async () => {
+      const request = api.GET("/file-restore/sessions/{id}", {
+        params: { path: { id: initial.id } },
+      });
+      const view = await call(request);
+      const { response } = await request;
+      return { ...view, skew: serverSkew(response.headers.get("date")) };
+    },
     initialData: initial,
     initialDataUpdatedAt: 0,
     retry: false,
     refetchInterval: (q) => {
       const phase = q.state.data?.phase;
-      return isGone(q.state.error)
-        ? false
-        : phase === "booting"
-          ? BOOT_POLL_MS
-          : phase === "ready"
-            ? READY_POLL_MS
-            : false;
+      if (isGone(q.state.error) || (phase !== "booting" && phase !== "ready")) {
+        return false;
+      }
+      // 부팅 중·닫는 중·노드에 닿지 않을 때는 자주 묻는다.
+      return phase === "booting" || closeRequested || q.state.error || isFallback(q.state.data)
+        ? BOOT_POLL_MS
+        : READY_POLL_MS;
     },
   });
   const session = query.data;
@@ -129,28 +152,37 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
   const vm = vms.data?.find((v) => v.id === backup?.spec.vm);
   const node = nodes.data?.find((n) => n.id === session.node);
   const slow = node?.status.file_restore?.accel === "tcg";
-  const now = useNow(session.phase === "booting" ? 1000 : 15_000);
-  const [closing, setClosing] = useState(false);
+  // 서버 시각(초): 닫힐 시각·부팅 경과는 서버 시계로 센다(브라우저 시계가 어긋나도).
+  const now = useNow(session.phase === "booting" ? 1000 : 15_000) + (session.skew ?? 0);
   const [volumeId, setVolumeId] = useState<string | null>(null);
-  // 세션이 없어졌으면(노드 재시작으로 세션을 잊음) 끝난 것으로 본다. 잠깐 닿지 않은 것은 다음 물음을 기다린다.
+  // 세션이 없어졌으면(노드 재시작으로 세션을 잊음) 끝난 것으로 본다. 잠깐 닿지 않은 것은 지금 화면을 두고 다시 묻는다.
   const lost = isGone(query.error);
   const phase = lost ? "failed" : session.phase;
-  const volumes = session.volumes ?? [];
+  const fallback = isFallback(session);
+  const unreachable = (phase === "booting" || phase === "ready") && (fallback || !!query.error);
+  const closingNow = closeRequested && (phase === "booting" || phase === "ready");
+  // 노드가 알려 준 마지막 볼륨 목록. 노드에 잠깐 닿지 않는 동안에도 나무와 파일 표(고른 것·열린 대화상자)를 그대로 둔다.
+  const [kept, setKept] = useState<readonly VolumeView[]>(NO_VOLUMES);
+  const live = session.phase === "ready" && !fallback ? session.volumes : undefined;
+  if (live && live !== kept) {
+    setKept(live);
+  }
+  const volumes = live ?? (fallback ? kept : NO_VOLUMES);
   const chosen =
     volumes.find((v) => v.id === volumeId && !volumeBlocked(v)) ?? firstBrowsable(volumes);
 
   async function close() {
-    setClosing(true);
+    setCloseRequested(true);
     try {
       await call(
         api.DELETE("/file-restore/sessions/{id}", { params: { path: { id: session.id } } }),
       );
-      await queryClient.invalidateQueries({ queryKey: sessionKey(session.id) });
     } catch (err) {
+      setCloseRequested(false);
       toast.error(fileRestoreError(t, err));
-    } finally {
-      setClosing(false);
+      return;
     }
+    void queryClient.invalidateQueries({ queryKey: sessionKey(session.id) });
   }
 
   const name = backup?.name ?? session.backup_name;
@@ -169,22 +201,39 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
         name={name}
         title={t("fileRestore.title", { name })}
         meta={meta || undefined}
-        status={<PhaseChip phase={phase} elapsed={now - session.opened_at} slow={slow} />}
+        status={
+          <PhaseChip
+            phase={phase}
+            closing={closingNow}
+            elapsed={now - session.opened_at}
+            slow={slow}
+          />
+        }
         actions={
           (phase === "booting" || phase === "ready") && (
             <>
-              {phase === "ready" && left !== null && (
+              {phase === "ready" && left !== null && !closingNow && (
                 <span className="text-sm text-muted-foreground" title={t("fileRestore.idleHint")}>
                   {t("fileRestore.closesIn", { count: Math.ceil(left / 60) })}
                 </span>
               )}
-              <Button variant="outline" size="sm" disabled={closing} onClick={() => void close()}>
-                {t("fileRestore.close")}
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={closeRequested}
+                onClick={() => void close()}
+              >
+                {closeRequested ? t("fileRestore.closing") : t("fileRestore.close")}
               </Button>
             </>
           )
         }
       />
+      {unreachable && (
+        <p role="status" className="rounded-md bg-warning-soft px-3 py-2 text-sm text-warning-fg">
+          {t("fileRestore.unreachable")}
+        </p>
+      )}
       {phase === "booting" && (
         <EmptyState
           icon={LoaderCircle}
@@ -210,6 +259,8 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
               volume={chosen}
               originalVm={backup?.spec.vm}
             />
+          ) : fallback ? (
+            <EmptyState icon={LoaderCircle} title={t("fileRestore.waitingForNode")} />
           ) : (
             <EmptyState
               icon={CircleAlert}
@@ -223,17 +274,27 @@ function SessionView({ initial, onReopen }: { initial: Session; onReopen(): void
   );
 }
 
-/** 세션 상태 칩: 부팅 중(경과, 느린 노드 안내), 준비됨, 실패, 닫힘 */
+/** 세션 상태 칩: 부팅 중(경과, 느린 노드 안내), 준비됨, 닫는 중, 실패, 닫힘 */
 function PhaseChip({
   phase,
+  closing,
   elapsed,
   slow,
 }: {
   phase: Session["phase"];
+  /** 닫기를 보냈고 서버가 아직 닫힘을 알리지 않았다 */
+  closing: boolean;
   elapsed: number;
   slow: boolean;
 }) {
   const { t } = useTranslation();
+  if (closing) {
+    return (
+      <StatusChip tone="neutral" busy>
+        {t("fileRestore.phase.closing")}
+      </StatusChip>
+    );
+  }
   switch (phase) {
     case "booting":
       return (

@@ -50,7 +50,8 @@ test("browses a backup, downloads a file and a folder, and closes the session", 
   await expect(tree.getByRole("button", { name: /Disk 0/ })).toContainText("ext4");
 
   const root = page.getByRole("table", { name: "Files in /" });
-  await expect(root.getByText("hello.txt", { exact: true })).toBeVisible();
+  // 이름은 <bdi> 안이고 링크 대상(→ hello.txt)도 같은 글이라 행의 체크 상자로 찾는다.
+  await expect(root.getByRole("checkbox", { name: "Select hello.txt" })).toBeVisible();
   await expect(root.getByText("→ hello.txt")).toBeVisible();
   // 문서용 화면(설정했을 때만): `OPL_SCREENSHOTS=<디렉터리>`
   if (process.env.OPL_SCREENSHOTS) {
@@ -64,7 +65,7 @@ test("browses a backup, downloads a file and a folder, and closes the session", 
     .getByRole("navigation", { name: "Folder path" })
     .getByRole("button", { name: "Disk 0" })
     .click();
-  await expect(root.getByText("hello.txt", { exact: true })).toBeVisible();
+  await expect(root.getByRole("checkbox", { name: "Select hello.txt" })).toBeVisible();
 
   // 파일 하나는 그대로(raw)
   await root.getByRole("checkbox", { name: "Select hello.txt" }).click();
@@ -87,6 +88,7 @@ test("browses a backup, downloads a file and a folder, and closes the session", 
   expect(bytes.includes(Buffer.from("dir/nested/deep.txt"))).toBe(true);
 
   await page.getByRole("button", { name: "Close", exact: true }).click();
-  await expect(page.getByText("This browsing session is closed")).toBeVisible();
+  // 서버가 닫힘을 알릴 때까지 "닫는 중"이고 2초마다 묻는다.
+  await expect(page.getByText("This browsing session is closed")).toBeVisible({ timeout: 30_000 });
   await expect(page.getByRole("button", { name: "Open again" })).toBeVisible();
 });

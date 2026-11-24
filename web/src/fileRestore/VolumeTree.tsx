@@ -1,5 +1,6 @@
 import { cn } from "cn";
 import { HardDrive, TriangleAlert } from "lucide-react";
+import { useId } from "react";
 import { useTranslation } from "react-i18next";
 
 import { Badge } from "@/components/ui/badge";
@@ -73,7 +74,8 @@ function VolumeRow({
   const warning = volumeWarning(volume);
   const label = volumeLabel(volume);
   const reason = blocked ? t(blocked.key, blocked.values) : undefined;
-  const reasonId = `fr-vol-${volume.id.replace(/[^A-Za-z0-9_-]/g, "_")}-why`;
+  // 볼륨 id(LV 이름은 백업에서 온다)로 만들면 `vg/a.b`와 `vg/a_b`가 같아진다 — 행마다 고유한 id
+  const reasonId = useId();
   return (
     <li>
       <button

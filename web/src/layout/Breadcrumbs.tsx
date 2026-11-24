@@ -15,8 +15,9 @@ export function Breadcrumbs() {
   const me = useNavUser();
   const { pathname } = useLocation();
   const folders = useList("folder");
-  // 백업 파일 찾아보기(계획 69)의 백업 id는 백업 이름으로 보인다. 그 화면에서만 백업 목록을 읽는다(화면이 이미 읽는다).
-  const onBackup = pathname.startsWith("/backups/");
+  // 백업 파일 찾아보기(계획 69)의 백업 id는 백업 이름으로 보인다. 그 화면에서만, 백업을 읽을 수 있을 때만 백업 목록을 읽는다
+  // (화면이 이미 읽는다). 읽을 수 없으면 id 그대로다.
+  const onBackup = pathname.startsWith("/backups/") && me.gate.reads("backup");
   const backups = useQuery({
     queryKey: listKey("backup"),
     queryFn: () => fetchList("backup"),
