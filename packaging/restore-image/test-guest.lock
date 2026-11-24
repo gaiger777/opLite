@@ -1,0 +1,26 @@
+# 파일 복원 E2E (5)의 시험 게스트(packaging/restore-image/build.sh --test-guest — 계획 69 설계 §14)가 debian.lock에 더해
+# 쓰는 Debian 13(trixie) deb. 형식은 debian.lock과 같다(`NAME VERSION URL SHA256`, 같은 snapshot 시각). 커널·libc6·libudev1
+# 같은 공통 꾸러미는 debian.lock의 것을 쓴다. 이 파일은 시험 전용이라 도우미 이미지 판(debian.lock의 해시)에 들지 않는다.
+# qemu-guest-agent는 glib·libnuma·liburing을 끌어오고, 셸·mkdir·mv·rm·mount는 정적 busybox 하나로 댄다.
+DEBS_x86_64='
+qemu-guest-agent 1:10.0.13+ds-0+deb13u1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/q/qemu/qemu-guest-agent_10.0.13+ds-0+deb13u1_amd64.deb 7d7d6be6a52d6ea21eabdb78f686e4bb886f933171d33f5f3cf3cf2390343abd
+libglib2.0-0t64 2.84.4-3~deb13u5 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/g/glib2.0/libglib2.0-0t64_2.84.4-3~deb13u5_amd64.deb e2baf92c57d1db1753e5781a61450d9a01e7833c7bd2dfe87776a6811c11ecc2
+libatomic1 14.2.0-19 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/g/gcc-14/libatomic1_14.2.0-19_amd64.deb 212b399aae2f7299203d261a57e49372e09565a9a5ea971905f94a3960366c05
+libffi8 3.4.8-2 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/libf/libffi/libffi8_3.4.8-2_amd64.deb 0ebdc340de33333639c3c63874cd4b15ac2e83dfa1ef3053b7eefaf4919f4f68
+libmount1 2.41.5-0+deb13u1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_amd64.deb 6d00f45f2e80e078e906e3eedecd3ba6913e39fef49bff361ee583f17f00ec05
+libnuma1 2.0.19-1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/n/numactl/libnuma1_2.0.19-1_amd64.deb e578583f73f8208564e5035b18aa729c441fc7ecb389c666923552e123f4d655
+liburing2 2.9-1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/libu/liburing/liburing2_2.9-1_amd64.deb 4b589c00c7a51172aace2cb2fb3d3ff32daf86c644023126dcfcaa840cc941ea
+zlib1g 1:1.3.dfsg+really1.3.1-1+deb13u1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_amd64.deb 8c27c342230503b73dfde629642c3b352e87b554e06d60cf58772f236a305ceb
+busybox-static 1:1.37.0-6+b9 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/b/busybox/busybox-static_1.37.0-6+b9_amd64.deb 598a3fd92bdafc34cd81196b2952ad36e910e47a4ecf162f8ce5e8e262598e53
+'
+DEBS_aarch64='
+qemu-guest-agent 1:10.0.13+ds-0+deb13u1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/q/qemu/qemu-guest-agent_10.0.13+ds-0+deb13u1_arm64.deb c8f5c9563813647af363c7cedd7c14f012b43bda77e269b3b91145d5ca905ec4
+libglib2.0-0t64 2.84.4-3~deb13u5 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/g/glib2.0/libglib2.0-0t64_2.84.4-3~deb13u5_arm64.deb d446f0ea85fb9dc411219ce861e59e5eabe1981c796918771a7d2aa97cc72481
+libatomic1 14.2.0-19 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/g/gcc-14/libatomic1_14.2.0-19_arm64.deb 7ccff90234484bf21ae5ecb79d25b6a84b2f4038f65dd139085b2e3a937cd8dc
+libffi8 3.4.8-2 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/libf/libffi/libffi8_3.4.8-2_arm64.deb d84a783b818f2386627604e64b793eb4ac5bb9ea1ba321a194a1c9c82fe09a01
+libmount1 2.41.5-0+deb13u1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_arm64.deb 14e2d555459f3c0b1442bb49dd2d266ea202a003198c86f65508a1dbfaa18732
+libnuma1 2.0.19-1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/n/numactl/libnuma1_2.0.19-1_arm64.deb 23bd0d4ecdc8cb44438791c10aab969bc9eb11a4b635aae573376c4e23994ff5
+liburing2 2.9-1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/libu/liburing/liburing2_2.9-1_arm64.deb 523dfbe829acf3aeae6df81528426a75995944923fd6bd35f6ccd0332034c713
+zlib1g 1:1.3.dfsg+really1.3.1-1+deb13u1 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/z/zlib/zlib1g_1.3.dfsg+really1.3.1-1+deb13u1_arm64.deb 0e41b3d7ad8ad7fcd36dd4d61ca91a70018478fc4af652e044f4be770784ddff
+busybox-static 1:1.37.0-6+b9 https://snapshot.debian.org/archive/debian/20261122T000000Z/pool/main/b/busybox/busybox-static_1.37.0-6+b9_arm64.deb c833be48abfa16bc19c4966ec93e289ff1ce5d2f1476cad3a57bd105378cd15c
+'

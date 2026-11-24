@@ -764,6 +764,7 @@ impl Peer for PeerService {
                     GuestAgentOp::Info { refresh } => GuestAgentReply {
                         info: Some(source.info(vm, refresh).await),
                         error: None,
+                        file: None,
                     },
                     GuestAgentOp::SetPassword { user, password } => {
                         let error =
@@ -771,8 +772,24 @@ impl Peer for PeerService {
                                 Err(e) => Some(GuestAgentError::Invalid(e.to_string())),
                                 Ok(()) => source.set_password(vm, &user, &password).await.err(),
                             };
-                        GuestAgentReply { info: None, error }
+                        GuestAgentReply {
+                            info: None,
+                            error,
+                            file: None,
+                        }
                     }
+                    GuestAgentOp::File { file } => match source.file(vm, file).await {
+                        Ok(answer) => GuestAgentReply {
+                            info: None,
+                            error: None,
+                            file: Some(answer),
+                        },
+                        Err(e) => GuestAgentReply {
+                            info: None,
+                            error: Some(e),
+                            file: None,
+                        },
+                    },
                 }
             })
             .await?;

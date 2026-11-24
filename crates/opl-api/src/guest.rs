@@ -9,9 +9,10 @@ use std::time::Duration;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use opl_cluster::types::NodeId;
-use opl_peer::{GuestAgentError, GuestAgentOp, GuestAgentRequest};
+use opl_peer::{GuestAgentError, GuestAgentOp, GuestAgentReply, GuestAgentRequest};
+use opl_types::file_restore::{GuestFileAnswer, GuestFileOp, GuestRestoreCaps};
 use opl_types::guest::{GuestInfoResponse, GuestInfoState, validate_guest_password};
-use opl_types::node::{GUEST_AGENT, NodeSpec};
+use opl_types::node::{FILE_RESTORE, GUEST_AGENT, NodeSpec};
 use opl_types::vm::{Vm, VmPhase, VmSpec};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
@@ -68,36 +69,44 @@ pub struct GuestPasswordResponse {
 }
 
 /// VM이 도는 노드(실행 중이 아니면 None)
-fn running_node(vm: &Vm) -> Option<uuid::Uuid> {
+pub(crate) fn running_node(vm: &Vm) -> Option<uuid::Uuid> {
     vm.status
         .node
         .filter(|_| matches!(vm.status.phase, VmPhase::Running | VmPhase::Stopping))
 }
 
 /// VM에 게스트 에이전트 채널이 있는지: 스펙이나 도는 QEMU(실행 중에 끈 채널은 다시 켤 때까지 남는다)
-fn has_channel(vm: &Vm) -> bool {
+pub(crate) fn has_channel(vm: &Vm) -> bool {
     vm.spec.agent_channel() || vm.status.hardware.as_ref().is_some_and(|hw| hw.guest_agent)
 }
 
 /// VM이 도는 노드 `node`의 게스트 에이전트에 `op`를 묻는다: 이 노드면 [`AppState::guest`], 아니면 RPC `GuestAgent`.
-/// 정보 읽기면 그 답이다.
+/// 정보 읽기면 `info`, 파일 일이면 `file`이 든 답이다(오류는 `Err`).
 async fn ask(
     state: &AppState,
-    vm: &Vm,
+    vm: uuid::Uuid,
     node: uuid::Uuid,
     op: GuestAgentOp,
     timeout: Duration,
-) -> Result<Option<GuestInfoResponse>, GuestAgentError> {
+) -> Result<GuestAgentReply, GuestAgentError> {
+    let reply = |info, file| GuestAgentReply {
+        info,
+        error: None,
+        file,
+    };
     if node == state.node {
         let Some(source) = &state.guest else {
             return Err(GuestAgentError::Unsupported);
         };
         return match op {
-            GuestAgentOp::Info { refresh } => Ok(Some(source.info(vm.id, refresh).await)),
+            GuestAgentOp::Info { refresh } => Ok(reply(Some(source.info(vm, refresh).await), None)),
             GuestAgentOp::SetPassword { user, password } => source
-                .set_password(vm.id, &user, &password)
+                .set_password(vm, &user, &password)
                 .await
-                .map(|()| None),
+                .map(|()| reply(None, None)),
+            GuestAgentOp::File { file } => {
+                source.file(vm, file).await.map(|a| reply(None, Some(a)))
+            }
         };
     }
     if state
@@ -122,7 +131,7 @@ async fn ask(
     else {
         return Err(GuestAgentError::Unreachable("not a cluster member".into()));
     };
-    let req = GuestAgentRequest { vm: vm.id, op };
+    let req = GuestAgentRequest { vm, op };
     let reply = tokio::time::timeout(
         timeout,
         peers.guest_agent(NodeId(node), &addr, req, timeout),
@@ -131,8 +140,25 @@ async fn ask(
     .map_err(|_| GuestAgentError::Unreachable("timed out".into()))??;
     match reply.error {
         Some(e) => Err(e),
-        None => Ok(reply.info),
+        None => Ok(reply),
     }
+}
+
+/// 게스트 파일 일 하나의 한도(에이전트 잠금 기다림 30초 + 1 MiB 쓰기 30초 — `exec`은 60초까지 끝나기를 기다림)
+pub(crate) const GUEST_FILE_TIMEOUT: Duration = Duration::from_secs(100);
+
+/// 실행 중인 VM(`node`에서 돎)의 게스트 에이전트에 파일 일 하나를 한다(계획 69 §12 — 되돌려 쓰기 Task와 `restore-caps`).
+/// 그 노드가 일마다 에이전트 잠금을 쥐고 놓는다. 다른 노드면 노드 사이 RPC `GuestAgent`의 `File` 갈래다.
+pub(crate) async fn guest_file(
+    state: &AppState,
+    vm: uuid::Uuid,
+    node: uuid::Uuid,
+    op: GuestFileOp,
+) -> Result<GuestFileAnswer, GuestAgentError> {
+    let file = GuestAgentOp::File { file: op };
+    let reply = Box::pin(ask(state, vm, node, file, GUEST_FILE_TIMEOUT)).await?;
+    // 파일 일을 모르는 노드는 빈 답을 보낼 수 없다(요청을 풀지 못함) — 그래도 답이 없으면 모르는 것으로 본다.
+    reply.file.ok_or(GuestAgentError::Unsupported)
 }
 
 /// 켜진 VM의 게스트 정보(캐시 — 지금 묻지 않음). 꺼졌거나 채널이 없거나 답하지 않으면 None(계획 67 §9.2 옮기기 계획의
@@ -143,8 +169,11 @@ pub(crate) async fn cached_info(state: &AppState, vm: &Vm) -> Option<opl_types::
         return None;
     }
     let op = GuestAgentOp::Info { refresh: false };
-    match Box::pin(ask(state, vm, node, op, GUEST_READ_TIMEOUT)).await {
-        Ok(Some(response)) => response.info,
+    match Box::pin(ask(state, vm.id, node, op, GUEST_READ_TIMEOUT)).await {
+        Ok(GuestAgentReply {
+            info: Some(response),
+            ..
+        }) => response.info,
         _ => None,
     }
 }
@@ -190,9 +219,12 @@ pub async fn get_guest(
     let op = GuestAgentOp::Info {
         refresh: params.refresh,
     };
-    let response = match ask(&state, &vm, node, op, timeout).await {
-        Ok(Some(response)) => response,
-        Ok(None) => only(GuestInfoState::Unsupported),
+    let response = match ask(&state, vm.id, node, op, timeout).await {
+        Ok(GuestAgentReply {
+            info: Some(response),
+            ..
+        }) => response,
+        Ok(_) => only(GuestInfoState::Unsupported),
         Err(e) => {
             tracing::debug!(vm = %vm.id, error = %e, "cannot read the guest information");
             only(info_state(&e))
@@ -201,8 +233,8 @@ pub async fn get_guest(
     Ok(Json(response))
 }
 
-/// 비밀번호 설정이 실패한 이유를 API 오류로 바꾼다. 문구에 비밀번호가 들지 않는다.
-fn password_error(vm: &Vm, e: GuestAgentError) -> ApiError {
+/// 비밀번호 설정·파일 일이 실패한 이유를 API 오류로 바꾼다. 문구에 비밀번호가 들지 않는다.
+pub(crate) fn agent_error(vm: &Vm, e: GuestAgentError) -> ApiError {
     match e {
         GuestAgentError::NotRunning => not_running(vm),
         GuestAgentError::NoAgent => no_channel(vm),
@@ -226,11 +258,11 @@ fn password_error(vm: &Vm, e: GuestAgentError) -> ApiError {
     }
 }
 
-fn not_running(vm: &Vm) -> ApiError {
+pub(crate) fn not_running(vm: &Vm) -> ApiError {
     ApiError::conflict("vm_not_running", format!("VM {:?} is not running", vm.name))
 }
 
-fn no_channel(vm: &Vm) -> ApiError {
+pub(crate) fn no_channel(vm: &Vm) -> ApiError {
     ApiError::conflict(
         "guest_agent_unavailable",
         format!(
@@ -272,10 +304,51 @@ pub async fn set_guest_password(
         user: user.clone(),
         password,
     };
-    ask(&state, &vm, node, op, GUEST_PASSWORD_TIMEOUT)
+    ask(&state, vm.id, node, op, GUEST_PASSWORD_TIMEOUT)
         .await
-        .map_err(|e| password_error(&vm, e))?;
+        .map_err(|e| agent_error(&vm, e))?;
     Ok(Json(GuestPasswordResponse { user }))
+}
+
+/// 실행 중인 VM의 게스트 에이전트가 되돌려 쓰기에 허락하는 것과 VM이 도는 노드. VM이 돌지 않으면 409 `vm_not_running`,
+/// 채널이 없거나 에이전트가 답하지 않으면 409 `guest_agent_unavailable`, 그 노드가 답하지 않으면 503 `node_unreachable`.
+pub(crate) async fn vm_restore_caps(
+    state: &AppState,
+    vm: &Vm,
+) -> Result<(uuid::Uuid, GuestRestoreCaps), ApiError> {
+    let Some(node) = running_node(vm) else {
+        return Err(not_running(vm));
+    };
+    if !has_channel(vm) {
+        return Err(no_channel(vm));
+    }
+    match guest_file(state, vm.id, node, GuestFileOp::Caps).await {
+        Ok(GuestFileAnswer::Caps { caps }) => Ok((node, caps)),
+        Ok(other) => Err(ApiError::internal(format!(
+            "unexpected guest agent answer {other:?}"
+        ))),
+        Err(e) => Err(agent_error(vm, e)),
+    }
+}
+
+/// VM의 게스트 에이전트가 파일 되돌려 쓰기(계획 69 §12)에 허락하는 것: OS 갈래, 파일 쓰기(`guest-file-*`), 디렉터리
+/// 만들기·덮어쓰기(`guest-exec`), 못 하는 까닭(RHEL·Rocky 에이전트는 기본으로 막는다). 웹은 "VM으로 복원" 대화상자를 열 때
+/// 미리 보인다. 모든 노드가 `file-restore`를 알아야 하고(409 `cluster_upgrading`), VM이 돌지 않으면 409 `vm_not_running`,
+/// 채널이 없거나 에이전트가 답하지 않으면 409 `guest_agent_unavailable`, VM이 도는 노드가 답하지 않으면 503
+/// `node_unreachable`이다.
+#[utoipa::path(get, path = "/vms/{key}/guest/restore-caps", tag = "vms",
+    params(("key" = String, Path, description = "id or name")),
+    responses((status = 200, body = GuestRestoreCaps), (status = "4XX", body = crate::error::ErrorBody),
+        (status = 503, body = crate::error::ErrorBody)))]
+pub async fn restore_caps(
+    State(state): State<Arc<AppState>>,
+    _principal: Principal,
+    Path(key): Path<String>,
+) -> Result<Json<GuestRestoreCaps>, ApiError> {
+    require_feature(&state.cluster, FILE_RESTORE)?;
+    let vm = lookup::<VmSpec>(&state.cluster, &key)?;
+    let (_, caps) = vm_restore_caps(&state, &vm).await?;
+    Ok(Json(caps))
 }
 
 #[cfg(test)]
@@ -301,14 +374,14 @@ mod tests {
         }))
         .unwrap();
         let vm: Vm = opl_types::resource::Resource::new("win", spec);
-        let e = password_error(&vm, GuestAgentError::Unavailable("timed out".into()));
+        let e = agent_error(&vm, GuestAgentError::Unavailable("timed out".into()));
         assert_eq!(
             (e.status, e.code),
             (StatusCode::CONFLICT, "guest_agent_unavailable")
         );
-        let e = password_error(&vm, GuestAgentError::Invalid("bad user".into()));
+        let e = agent_error(&vm, GuestAgentError::Invalid("bad user".into()));
         assert_eq!(e.status, StatusCode::BAD_REQUEST);
-        let e = password_error(&vm, GuestAgentError::Unreachable("offline".into()));
+        let e = agent_error(&vm, GuestAgentError::Unreachable("offline".into()));
         assert_eq!(e.status, StatusCode::SERVICE_UNAVAILABLE);
     }
 

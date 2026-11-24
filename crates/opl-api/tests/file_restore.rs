@@ -8,10 +8,12 @@ mod common;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::file_restore::{backup_pool, node_state, pool_backup, report, reported, sessions};
-use common::{Client, Env, FakeStorage, WAIT};
+use common::file_restore::{
+    HvGuest, backup_pool, node_state, pool_backup, report, reported, sessions,
+};
+use common::{Client, Env, FakeStorage, WAIT, vm_request};
 use opl_api::FileRestoreSessions;
-use opl_driver::DriverError;
+use opl_driver::{DriverError, GuestAnswer, MockGuestFs};
 use opl_types::backup::{Backup, BackupSpec};
 use opl_types::node::{FILE_RESTORE, NodeSpec};
 use opl_types::task::{TaskSpec, TaskState};
@@ -31,10 +33,16 @@ async fn start(max_sessions: u32, idle: Duration) -> Fr {
     let dir = TempDir::new().unwrap();
     let state = node_state(dir.path(), max_sessions, idle, Duration::from_secs(3600));
     let reg = sessions(dir.path(), Some(state));
+    let guest = Arc::new(HvGuest::default());
     let mut env = {
-        let reg = reg.clone();
-        Env::start_with_state(move |s| s.file_restore = reg).await
+        let (reg, guest) = (reg.clone(), guest.clone());
+        Env::start_with_state(move |s| {
+            s.file_restore = reg;
+            s.guest = Some(guest);
+        })
+        .await
     };
+    let _ = guest.0.set(env.hv.clone());
     // 가짜 하이퍼바이저의 도우미는 백업 파일을 읽지 않는다 — 백업 파일 확인(qemu-img)도 가짜 저장소로.
     env.stop_runner().await;
     env.start_runner_with(Arc::new(FakeStorage::default()))
@@ -675,5 +683,369 @@ async fn force_deleting_a_backup_closes_its_sessions() {
             .get::<BackupSpec>(fr.backup.id)
             .unwrap()
             .is_none()
+    );
+}
+
+/// 실행 중이고 게스트 에이전트가 답하는 VM `name`(가짜 게스트 파일시스템 `fs`)
+async fn guest_vm(env: &Env, admin: &Client, name: &str, fs: MockGuestFs) -> uuid::Uuid {
+    let mut req = vm_request(name);
+    req["spec"]["guest_agent"] = json!({});
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let id: uuid::Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    env.hv.set_guest_agent(id, GuestAnswer::Ok);
+    env.hv.set_guest_fs(id, fs);
+    let t = admin.act(name, "start").await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    id
+}
+
+/// 되돌려 쓰기를 요청하고 Task가 끝날 때까지 기다린다.
+async fn restore_into(c: &Client, id: &str, body: Value) -> Value {
+    let (status, task) = c
+        .post(&format!("/file-restore/sessions/{id}/restore-to-vm"), body)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(
+        task["spec"]["op"]["kind"], "file-restore-to-guest",
+        "{task}"
+    );
+    wait_any(c, &task).await
+}
+
+/// 성공·실패 어느 쪽이든 끝난 Task
+async fn wait_any(c: &Client, task: &Value) -> Value {
+    let id = task["id"].as_str().unwrap();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, t) = c.get(&format!("/tasks/{id}")).await;
+        if t["status"]["state"] == "succeeded" || t["status"]["state"] == "failed" {
+            return t;
+        }
+        assert!(Instant::now() < deadline, "task did not end: {t}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn text(fs: &MockGuestFs, path: &str) -> String {
+    String::from_utf8(fs.files.get(path).cloned().unwrap_or_default()).unwrap()
+}
+
+/// 게스트로 되돌려 쓰기(§12): 디렉터리째(keep — 있는 파일은 `.restored-…`로), 덮어쓰기(임시 파일 → mv), 건너뛰기, 큰 파일은
+/// 1 MiB 쓰기마다 따로(에이전트 잠금을 쓰기마다), 심볼릭 링크는 건너뜀, 쓰기 실패는 다 쓰지 못한 파일을 지우고 Task 실패.
+#[tokio::test]
+async fn files_are_restored_into_a_running_guest() {
+    let fr = start(2, Duration::from_secs(600)).await;
+    let env = &fr.env;
+    let admin = env.admin().await;
+    let mut fs = MockGuestFs::linux(&["/srv", "/srv/etc"]);
+    fs.files
+        .insert("/srv/etc/hostname".into(), b"old\n".to_vec());
+    let vm = guest_vm(env, &admin, "web", fs).await;
+    let s = ready(&admin, "web-1").await;
+    let id = s["id"].as_str().unwrap().to_string();
+
+    let (status, caps) = admin.get("/vms/web/guest/restore-caps").await;
+    assert_eq!(status, StatusCode::OK, "{caps}");
+    assert_eq!(
+        caps,
+        json!({ "os": "linux", "file_write": true, "exec": true })
+    );
+
+    // 디렉터리째, keep(기본)
+    let t = restore_into(
+        &admin,
+        &id,
+        json!({ "volume": "disk0p1", "paths": ["/etc"], "vm": "web", "target_dir": "/srv" }),
+    )
+    .await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    let warning = t["status"]["error"].as_str().unwrap();
+    assert!(warning.contains("restored 2 file(s)"), "{warning}");
+    assert!(warning.contains("kept existing files"), "{warning}");
+    assert!(
+        warning.contains("etc/localtime (symbolic links are not restored)"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("owners, modes and times were not restored"),
+        "{warning}"
+    );
+    let g = env.hv.guest_fs(vm).unwrap();
+    assert_eq!(text(&g, "/srv/etc/hostname"), "old\n");
+    let kept: Vec<&String> = g
+        .files
+        .keys()
+        .filter(|k| k.starts_with("/srv/etc/hostname.restored-"))
+        .collect();
+    assert_eq!(kept.len(), 1, "{:?}", g.files.keys());
+    assert_eq!(text(&g, kept[0]), "web-01\n");
+    assert_eq!(
+        text(&g, "/srv/etc/nginx/nginx.conf"),
+        "worker_processes auto;\n"
+    );
+    assert!(g.dirs.contains("/srv/etc/nginx"));
+    assert!(!g.files.contains_key("/srv/etc/localtime"));
+    assert_eq!(g.open_handles(), 0);
+
+    // 덮어쓰기: 임시 이름에 다 쓴 뒤 mv -f -T
+    let t = restore_into(
+        &admin,
+        &id,
+        json!({ "volume": "disk0p1", "paths": ["/etc/hostname"], "vm": "web",
+            "target_dir": "/srv/etc", "conflict": "overwrite" }),
+    )
+    .await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    let g = env.hv.guest_fs(vm).unwrap();
+    assert_eq!(text(&g, "/srv/etc/hostname"), "web-01\n");
+    assert!(
+        !g.files.keys().any(|k| k.contains(".orbivisor-")),
+        "{:?}",
+        g.files.keys()
+    );
+    assert!(
+        g.ops
+            .iter()
+            .any(|o| o.starts_with("exec /bin/mv -f -T -- /srv/etc/hostname.orbivisor-")),
+        "{:?}",
+        g.ops
+    );
+
+    // 건너뛰기
+    let t = restore_into(
+        &admin,
+        &id,
+        json!({ "volume": "disk0p1", "paths": ["/etc/hostname"], "vm": "web",
+            "target_dir": "/srv/etc", "conflict": "skip" }),
+    )
+    .await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    assert!(
+        t["status"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("skipped hostname (exists)")
+    );
+
+    // 3 MiB 파일은 1 MiB 쓰기 셋(일마다 따로 — 잠금을 쓰기마다 놓는다)
+    let before = env.hv.guest_fs(vm).unwrap().ops.len();
+    let t = restore_into(
+        &admin,
+        &id,
+        json!({ "volume": "disk0p1", "paths": ["/var/log/app.log"], "vm": "web", "target_dir": "/srv/log" }),
+    )
+    .await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    let g = env.hv.guest_fs(vm).unwrap();
+    assert_eq!(g.files["/srv/log/app.log"].len(), 3 << 20);
+    assert_eq!(
+        g.ops[before..]
+            .iter()
+            .filter(|o| o.starts_with("write "))
+            .count(),
+        3
+    );
+
+    // 쓰기가 거절되면 다 쓰지 못한 파일을 지우고 Task는 실패(쓴 것은 결과에)
+    let mut broken = env.hv.guest_fs(vm).unwrap();
+    broken.fail_writes_after = Some(
+        broken
+            .ops
+            .iter()
+            .filter(|o| o.starts_with("write "))
+            .count()
+            + 1,
+    );
+    env.hv.set_guest_fs(vm, broken);
+    let t = restore_into(
+        &admin,
+        &id,
+        json!({ "volume": "disk0p1", "paths": ["/var/log/app.log"], "vm": "web", "target_dir": "/srv/log2" }),
+    )
+    .await;
+    assert_eq!(t["status"]["state"], "failed", "{t}");
+    let err = t["status"]["error"].as_str().unwrap();
+    assert!(err.contains("1 item(s) could not be restored"), "{err}");
+    assert!(err.contains("No space left on device"), "{err}");
+    let g = env.hv.guest_fs(vm).unwrap();
+    assert!(
+        !g.files.contains_key("/srv/log2/app.log"),
+        "{:?}",
+        g.files.keys()
+    );
+    assert_eq!(g.open_handles(), 0);
+
+    // 감사
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, audit) = admin.get("/audit?limit=500").await;
+        let text = audit.to_string();
+        if text.contains("backup file-restore to-vm web-1 disk0p1:/etc → vm web:/srv (keep)") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "audit entry missing: {text}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// 에이전트가 막은 것과 요청 검사: `guest-exec`가 없으면 디렉터리·덮어쓰기는 400, `guest-file-*`가 없으면 409
+/// `guest_agent_restricted`, 대상 디렉터리는 절대 경로, 꺼진 VM은 409, 대상 VM의 `vm.config`가 없으면 403.
+#[tokio::test]
+async fn restoring_into_a_guest_checks_the_agent_and_the_request() {
+    let fr = start(2, Duration::from_secs(600)).await;
+    let env = &fr.env;
+    let admin = env.admin().await;
+    let mut fs = MockGuestFs::linux(&["/srv"]);
+    fs.exec = false;
+    let vm = guest_vm(env, &admin, "web", fs).await;
+    let s = ready(&admin, "web-1").await;
+    let id = s["id"].as_str().unwrap().to_string();
+    let url = format!("/file-restore/sessions/{id}/restore-to-vm");
+    let (_, caps) = admin.get("/vms/web/guest/restore-caps").await;
+    assert_eq!(caps["exec"], false, "{caps}");
+    assert!(
+        caps["reason"].as_str().unwrap().contains("guest-exec"),
+        "{caps}"
+    );
+    let body = |paths: Value, dir: &str, conflict: &str| json!({ "volume": "disk0p1", "paths": paths, "vm": "web", "target_dir": dir, "conflict": conflict });
+    for (req, code) in [
+        (
+            body(json!(["/etc"]), "/srv", "keep"),
+            "guest_mkdir_unavailable",
+        ),
+        (
+            body(json!(["/"]), "/srv", "keep"),
+            "guest_mkdir_unavailable",
+        ),
+        (
+            body(json!(["/etc/hostname"]), "/srv", "overwrite"),
+            "guest_overwrite_unavailable",
+        ),
+        (
+            body(json!(["/etc/hostname"]), "srv", "keep"),
+            "invalid_target_dir",
+        ),
+        (
+            body(json!(["/etc/hostname"]), "/srv/../etc", "keep"),
+            "invalid_target_dir",
+        ),
+        (body(json!([]), "/srv", "keep"), "invalid_path"),
+    ] {
+        let (status, err) = admin.post(&url, req.clone()).await;
+        assert_eq!(
+            (status, err["code"].as_str()),
+            (StatusCode::BAD_REQUEST, Some(code)),
+            "{req} {err}"
+        );
+    }
+    // 파일 하나는 exec 없이도 된다(있는 디렉터리 바로 아래).
+    let t = restore_into(&admin, &id, body(json!(["/etc/hostname"]), "/srv", "keep")).await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    assert_eq!(
+        text(&env.hv.guest_fs(vm).unwrap(), "/srv/hostname"),
+        "web-01\n"
+    );
+
+    // guest-file-*를 막은 에이전트(RHEL·Rocky 기본)
+    let mut fs = env.hv.guest_fs(vm).unwrap();
+    fs.file_write = false;
+    env.hv.set_guest_fs(vm, fs);
+    let (status, err) = admin
+        .post(&url, body(json!(["/etc/hostname"]), "/srv", "keep"))
+        .await;
+    assert_eq!(
+        (status, err["code"].as_str()),
+        (StatusCode::CONFLICT, Some("guest_agent_restricted")),
+        "{err}"
+    );
+    assert!(
+        err["message"]
+            .as_str()
+            .unwrap()
+            .contains("/etc/sysconfig/qemu-ga"),
+        "{err}"
+    );
+
+    // 꺼진 VM
+    let mut req = vm_request("off");
+    req["spec"]["guest_agent"] = json!({});
+    let (status, _) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let mut off = body(json!(["/etc/hostname"]), "/srv", "keep");
+    off["vm"] = json!("off");
+    let (status, err) = admin.post(&url, off).await;
+    assert_eq!(
+        (status, err["code"].as_str()),
+        (StatusCode::CONFLICT, Some("vm_not_running")),
+        "{err}"
+    );
+    let (status, err) = admin.get("/vms/off/guest/restore-caps").await;
+    assert_eq!(
+        (status, err["code"].as_str()),
+        (StatusCode::CONFLICT, Some("vm_not_running"))
+    );
+
+    // 파일만 꺼내는 역할(backup.file_restore)은 VM에 쓰지 못한다(vm.config가 없음).
+    let (status, role) = admin
+        .post(
+            "/access-roles",
+            json!({ "name": "helpdesk", "privileges": ["system.read", "backup.file_restore"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let (_, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "hd", "password": "password-1", "role": "viewer" }),
+        )
+        .await;
+    let (status, _) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": user["id"] },
+                "role": { "type": "custom", "id": role["id"] },
+                "target": { "type": "root" },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let hd = env.login("hd", "password-1").await;
+    let s = ready(&hd, "web-1").await;
+    let hd_id = s["id"].as_str().unwrap();
+    let (status, err) = hd
+        .post(
+            &format!("/file-restore/sessions/{hd_id}/restore-to-vm"),
+            body(json!(["/etc/hostname"]), "/srv", "keep"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+    // viewer도 능력은 본다(system.read).
+    let (status, caps) = hd.get("/vms/web/guest/restore-caps").await;
+    assert_eq!(status, StatusCode::OK, "{caps}");
+    assert_eq!(caps["file_write"], false, "{caps}");
+}
+
+/// 노드 비우기는 그 노드의 세션을 닫고(설계 §13), 유지보수 노드에는 새 세션을 열지 않는다.
+#[tokio::test]
+async fn draining_the_node_closes_its_sessions() {
+    let fr = start(2, Duration::from_secs(600)).await;
+    let env = &fr.env;
+    let admin = env.admin().await;
+    let s = ready(&admin, "web-1").await;
+    let id = s["id"].as_str().unwrap().to_string();
+    let (status, task) = admin
+        .post(&format!("/nodes/{}/drain", env.node), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    let t = wait_task_done(env, &id).await;
+    assert_eq!(t.status.state, TaskState::Succeeded, "{t:?}");
+    assert!(fr.sessions.is_empty());
+    let (status, body) = open(&admin, "web-1").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("file_restore_unavailable")),
+        "{body}"
     );
 }

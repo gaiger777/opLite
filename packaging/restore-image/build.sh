@@ -3,6 +3,7 @@
 #
 # 쓰는 법: packaging/restore-image/build.sh --arch x86_64|aarch64 --out <dir>
 #            [--agent <정적 바이너리>] [--version <판>] [--lock <debian.lock>] [--cache <dir>]
+#            [--test-guest | --test-lock <test-guest.lock>]
 #   결과(<dir>): 커널(x86_64 `vmlinuz`, aarch64 푼 `Image`), `initrd.img`(cpio newc + zstd), `manifest.json`
 #   (이미지 판, 아키텍처, 커널 판, 통신 규약 판, 파일마다 SHA-256 — 맨 나중에 쓴다).
 #   설치 자리: deb `orbivisor-restore-image`는 /usr/share/orbivisor/restore/x86_64, Rocky·소스 빌드 노드는
@@ -28,6 +29,11 @@
 # 판: 기본은 워크스페이스 판(Cargo.toml). 이미지 판 = `orbivisor <판> lock-<debian.lock SHA-256 앞 12자>`.
 # 받은 deb은 --cache(기본 ${XDG_CACHE_HOME:-~/.cache}/orbivisor-restore-image)에 두고 다시 쓴다(해시는 늘 다시 봄).
 #   snapshot.debian.org에서 받지 못하면 같은 pool 경로를 $DEBIAN_MIRROR(기본 deb.debian.org)에서 한 번 더 받아 본다.
+# --test-guest: 도우미 이미지 대신 파일 복원 E2E (5)의 **시험 게스트**를 만든다(설계 §14) — 같은 커널·모듈에 Debian
+#   `qemu-guest-agent`(test-guest.lock)와 정적 busybox를 넣고, `/init`(셸 스크립트)이 첫 virtio 디스크(/dev/vda, ext4)를
+#   /target에 붙인 뒤 qemu-ga를 PID 1로 띄운다(1초마다 sync — 시험이 VM을 강제로 꺼도 쓴 것이 디스크에 남게). 결과는 커널과
+#   `initrd.img`뿐(manifest 없음 — opld가 도우미로 쓰지 않는다). 시험은 이 커널을 QEMU 감싸개로 `-kernel`·`-initrd`에 준다.
+#   `--test-lock`은 test-guest.lock 대신 다른 잠금 파일로(빌더 시험).
 # 필요한 것: bash, curl, bsdtar(Debian·Ubuntu libarchive-tools, Rocky bsdtar, macOS 기본), zstd, python3
 #   (imagetool.py — ELF·모듈 정보 읽기, cpio 쓰기), sha256sum 또는 shasum.
 set -euo pipefail
@@ -37,7 +43,7 @@ ROOT=$(cd "$IMAGE_DIR/../.." && pwd)
 TOOL="$IMAGE_DIR/imagetool.py"
 
 usage() {
-	echo "usage: $0 --arch x86_64|aarch64 --out <dir> [--agent <file>] [--version <version>] [--lock <file>] [--cache <dir>]" >&2
+	echo "usage: $0 --arch x86_64|aarch64 --out <dir> [--agent <file>] [--version <version>] [--lock <file>] [--cache <dir>] [--test-guest | --test-lock <file>]" >&2
 	exit 2
 }
 
@@ -46,9 +52,14 @@ die() {
 	exit 1
 }
 
-ARCH="" OUT="" AGENT="" VERSION="" LOCK="$IMAGE_DIR/debian.lock"
+ARCH="" OUT="" AGENT="" VERSION="" LOCK="$IMAGE_DIR/debian.lock" TEST_GUEST=""
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/orbivisor-restore-image"
 while [ $# -gt 0 ]; do
+	if [ "$1" = --test-guest ]; then
+		TEST_GUEST="$IMAGE_DIR/test-guest.lock"
+		shift
+		continue
+	fi
 	[ $# -ge 2 ] || usage
 	case $1 in
 	--arch) ARCH=$2 ;;
@@ -57,6 +68,7 @@ while [ $# -gt 0 ]; do
 	--version) VERSION=$2 ;;
 	--lock) LOCK=$2 ;;
 	--cache) CACHE=$2 ;;
+	--test-lock) TEST_GUEST=$2 ;;
 	*) usage ;;
 	esac
 	shift 2
@@ -94,6 +106,15 @@ IMAGE_VERSION="orbivisor $VERSION lock-${LOCK_SHA:0:12}"
 DEBS_VAR="DEBS_$ARCH"
 DEBS=${!DEBS_VAR:-}
 [ -n "$DEBS" ] || die "$LOCK has no $DEBS_VAR"
+if [ -n "$TEST_GUEST" ]; then
+	[ -f "$TEST_GUEST" ] || die "no lock file $TEST_GUEST"
+	unset "$DEBS_VAR"
+	# shellcheck source=/dev/null
+	. "$TEST_GUEST"
+	EXTRA=${!DEBS_VAR:-}
+	[ -n "$EXTRA" ] || die "$TEST_GUEST has no $DEBS_VAR"
+	DEBS="$DEBS$EXTRA"
+fi
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -154,7 +175,7 @@ RELEASE=${kernels[0]##*/vmlinuz-}
 echo "build-restore-image: kernel $RELEASE"
 python3 "$TOOL" config "$SYSROOT/boot/config-$RELEASE"
 
-if [ -z "$AGENT" ]; then
+if [ -z "$AGENT" ] && [ -z "$TEST_GUEST" ]; then
 	TARGET="$ARCH-unknown-linux-musl"
 	LINKER_VAR="CARGO_TARGET_$(echo "$TARGET" | tr 'a-z-' 'A-Z_')_LINKER"
 	echo "build-restore-image: building the agent for $TARGET"
@@ -169,6 +190,19 @@ x86_64) KERNEL_FILE=vmlinuz ;;
 aarch64) KERNEL_FILE=Image ;;
 esac
 python3 "$TOOL" kernel --arch "$ARCH" "${kernels[0]}" "$WORK/out/$KERNEL_FILE"
+if [ -n "$TEST_GUEST" ]; then
+	python3 "$TOOL" assemble-test-guest --arch "$ARCH" --sysroot "$SYSROOT" --release "$RELEASE" \
+		--tree "$WORK/tree" --cpio "$WORK/initrd.cpio"
+	zstd -q -19 -T1 -c "$WORK/initrd.cpio" >"$WORK/out/initrd.img"
+	mkdir -p "$OUT"
+	for f in "$KERNEL_FILE" initrd.img; do
+		cp "$WORK/out/$f" "$OUT/$f.tmp"
+		chmod 0644 "$OUT/$f.tmp"
+		mv -f "$OUT/$f.tmp" "$OUT/$f"
+	done
+	echo "build-restore-image: test guest $OUT: $KERNEL_FILE, initrd.img $(wc -c <"$OUT/initrd.img" | tr -d ' ') bytes"
+	exit 0
+fi
 python3 "$TOOL" assemble --arch "$ARCH" --sysroot "$SYSROOT" --release "$RELEASE" --agent "$AGENT" \
 	--image-version "$IMAGE_VERSION" --tree "$WORK/tree" --cpio "$WORK/initrd.cpio"
 zstd -q -19 -T1 -c "$WORK/initrd.cpio" >"$WORK/out/initrd.img"

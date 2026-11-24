@@ -9,6 +9,7 @@ use opl_qemu::QmpError;
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
 use opl_types::cloud_init::CloudInitSeed;
 use opl_types::cpu::{Bits, CatalogModel, CpuCatalogSpec};
+use opl_types::file_restore::{GuestFileAnswer, GuestFileOp, GuestOsKind, guest_restore_caps};
 use opl_types::guest::GuestInfo;
 use opl_types::node::{FirmwareCaps, NodeHotplug};
 use opl_types::replication::{MIGRATION_BITMAP_PREFIX, migration_bitmap};
@@ -203,6 +204,183 @@ pub enum GuestAnswer {
     Ok,
     /// 답하지 않는다(false, 게스트 에이전트 없음·멈춤).
     Hang,
+}
+
+/// 가짜 게스트 파일시스템([`MockHypervisor::set_guest_fs`]): 게스트 에이전트의 `guest-file-*`·`guest-exec`(Linux의
+/// `/bin/mkdir -p`·`/bin/mv -f -T`·`/bin/rm -f`)를 메모리 나무로 흉내 낸다. 부모 디렉터리가 없으면 쓰기를 거절한다.
+#[derive(Debug, Clone)]
+pub struct MockGuestFs {
+    pub os: GuestOsKind,
+    /// `guest-file-*`를 허락하는지
+    pub file_write: bool,
+    /// `guest-exec`를 허락하는지
+    pub exec: bool,
+    pub files: BTreeMap<String, Vec<u8>>,
+    pub dirs: BTreeSet<String>,
+    /// 한 일(`open /a`, `write 3`, `exec /bin/mkdir -p -- /a` …)
+    pub ops: Vec<String>,
+    /// 이만큼 쓰기를 받은 뒤 쓰기를 거절한다(시험).
+    pub fail_writes_after: Option<usize>,
+    /// 지금 열린 핸들
+    open: HashMap<i64, String>,
+    next_handle: i64,
+    writes: usize,
+}
+
+impl MockGuestFs {
+    /// 모든 명령을 허락하는 Linux 게스트(디렉터리 `/`와 `dirs`)
+    pub fn linux(dirs: &[&str]) -> Self {
+        let mut all: BTreeSet<String> = BTreeSet::from(["/".to_string()]);
+        all.extend(dirs.iter().map(|d| d.to_string()));
+        MockGuestFs {
+            os: GuestOsKind::Linux,
+            file_write: true,
+            exec: true,
+            files: BTreeMap::new(),
+            dirs: all,
+            ops: Vec::new(),
+            fail_writes_after: None,
+            open: HashMap::new(),
+            next_handle: 1000,
+            writes: 0,
+        }
+    }
+
+    /// 지금 열린 핸들 수(닫지 않은 것)
+    pub fn open_handles(&self) -> usize {
+        self.open.len()
+    }
+
+    fn parent(path: &str) -> String {
+        match path.rsplit_once('/') {
+            Some(("", _)) | None => "/".into(),
+            Some((p, _)) => p.into(),
+        }
+    }
+
+    fn refused(message: &str) -> GuestFileAnswer {
+        GuestFileAnswer::Refused {
+            message: format!("guest agent error (GenericError): {message}"),
+        }
+    }
+
+    fn run(&mut self, op: &GuestFileOp) -> GuestFileAnswer {
+        use base64::Engine;
+        match op {
+            GuestFileOp::Caps => {
+                let on = |c: &str, yes: bool| (c.to_string(), yes);
+                let commands = [
+                    on("guest-file-open", self.file_write),
+                    on("guest-file-write", self.file_write),
+                    on("guest-file-flush", self.file_write),
+                    on("guest-file-close", self.file_write),
+                    on("guest-exec", self.exec),
+                    on("guest-exec-status", self.exec),
+                ];
+                GuestFileAnswer::Caps {
+                    caps: guest_restore_caps(self.os, &commands),
+                }
+            }
+            GuestFileOp::Exists { path } => {
+                self.ops.push(format!("exists {path}"));
+                GuestFileAnswer::Exists {
+                    exists: self.files.contains_key(path) || self.dirs.contains(path),
+                }
+            }
+            GuestFileOp::Open { path } => {
+                self.ops.push(format!("open {path}"));
+                if !self.file_write {
+                    return Self::refused("command guest-file-open has been disabled");
+                }
+                if !self.dirs.contains(&Self::parent(path)) {
+                    return Self::refused("failed to open file: No such file or directory");
+                }
+                if self.dirs.contains(path) {
+                    return Self::refused("failed to open file: Is a directory");
+                }
+                self.files.insert(path.clone(), Vec::new());
+                self.next_handle += 1;
+                self.open.insert(self.next_handle, path.clone());
+                GuestFileAnswer::Opened {
+                    handle: self.next_handle,
+                }
+            }
+            GuestFileOp::Write { handle, data } => {
+                self.ops.push(format!("write {handle}"));
+                if self.fail_writes_after.is_some_and(|n| self.writes >= n) {
+                    return Self::refused("failed to write to file: No space left on device");
+                }
+                let Some(path) = self.open.get(handle) else {
+                    return Self::refused("handle not found");
+                };
+                let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    return Self::refused("invalid base64");
+                };
+                self.writes += 1;
+                self.files
+                    .entry(path.clone())
+                    .or_default()
+                    .extend_from_slice(&bytes);
+                GuestFileAnswer::Written {
+                    count: bytes.len() as u64,
+                }
+            }
+            GuestFileOp::Close { handle } => {
+                self.ops.push(format!("close {handle}"));
+                match self.open.remove(handle) {
+                    Some(_) => GuestFileAnswer::Closed,
+                    None => Self::refused("handle not found"),
+                }
+            }
+            GuestFileOp::Exec { path, args } => {
+                self.ops.push(format!("exec {path} {}", args.join(" ")));
+                if !self.exec {
+                    return Self::refused("command guest-exec has been disabled");
+                }
+                let code = match (path.as_str(), args.as_slice()) {
+                    ("/bin/mkdir", [p, dd, dir]) if p == "-p" && dd == "--" => {
+                        let mut d = dir.clone();
+                        let mut add = Vec::new();
+                        while d != "/" {
+                            if self.files.contains_key(&d) {
+                                return GuestFileAnswer::Exited {
+                                    code: 1,
+                                    stderr: format!("mkdir: {d}: File exists"),
+                                };
+                            }
+                            add.push(d.clone());
+                            d = Self::parent(&d);
+                        }
+                        self.dirs.extend(add);
+                        0
+                    }
+                    ("/bin/mv", [f, t, dd, from, to]) if f == "-f" && t == "-T" && dd == "--" => {
+                        if self.dirs.contains(to) || !self.dirs.contains(&Self::parent(to)) {
+                            1
+                        } else if let Some(data) = self.files.remove(from) {
+                            self.files.insert(to.clone(), data);
+                            0
+                        } else {
+                            1
+                        }
+                    }
+                    ("/bin/rm", [f, dd, p]) if f == "-f" && dd == "--" => {
+                        self.files.remove(p);
+                        0
+                    }
+                    _ => 0,
+                };
+                GuestFileAnswer::Exited {
+                    code,
+                    stderr: if code == 0 {
+                        String::new()
+                    } else {
+                        format!("{path} failed")
+                    },
+                }
+            }
+        }
+    }
 }
 
 /// 메모리 안에서만 동작하는 하이퍼바이저. reconciler 테스트에서 장애를 주입하는 데 쓴다.
@@ -420,6 +598,8 @@ struct MockState {
     guest_info_calls: Vec<Uuid>,
     /// `set_user_password` 호출의 (VM, 사용자). 비밀번호는 남기지 않는다.
     password_sets: Vec<(Uuid, String)>,
+    /// `set_guest_fs`로 정한 VM별 가짜 게스트 파일시스템(되돌려 쓰기). 다시 켜도 남는다.
+    guest_fs: HashMap<Uuid, MockGuestFs>,
     /// `stop(Acpi|Agent)`가 실제로 보낸 종료 요청(에이전트가 답하지 않으면 `Acpi`)
     stop_requests: Vec<(Uuid, StopMode)>,
     /// 얼리기가 이 이유로 실패하는 VM(`fail_freeze`)
@@ -622,6 +802,16 @@ impl MockHypervisor {
     pub fn guest_info_calls(&self, id: Uuid) -> usize {
         let st = self.state.lock().unwrap();
         st.guest_info_calls.iter().filter(|vm| **vm == id).count()
+    }
+
+    /// 이후 이 VM의 `guest_file`이 이 가짜 게스트 파일시스템을 쓴다(에이전트가 `Ok`로 답할 때, 다시 켜도 그대로).
+    pub fn set_guest_fs(&self, id: Uuid, fs: MockGuestFs) {
+        self.state.lock().unwrap().guest_fs.insert(id, fs);
+    }
+
+    /// 이 VM의 가짜 게스트 파일시스템(지금 내용)
+    pub fn guest_fs(&self, id: Uuid) -> Option<MockGuestFs> {
+        self.state.lock().unwrap().guest_fs.get(&id).cloned()
     }
 
     /// 이 VM에 성공한 `set_user_password`의 사용자들(비밀번호는 남기지 않는다)
@@ -2218,6 +2408,19 @@ impl Hypervisor for MockHypervisor {
         Self::agent_session(&st, id)?;
         st.password_sets.push((id, user.to_string()));
         Ok(())
+    }
+
+    /// `set_guest_fs`로 정한 가짜 게스트(없으면 모든 명령을 막은 에이전트)
+    async fn guest_file(&self, id: Uuid, op: &GuestFileOp) -> Result<GuestFileAnswer, DriverError> {
+        let mut st = self.state.lock().unwrap();
+        Self::controllable(&st, id)?;
+        Self::agent_session(&st, id)?;
+        let fs = st.guest_fs.entry(id).or_insert_with(|| MockGuestFs {
+            file_write: false,
+            exec: false,
+            ..MockGuestFs::linux(&[])
+        });
+        Ok(fs.run(op))
     }
 
     async fn start_incoming(

@@ -2,7 +2,8 @@
 # packaging/restore-image/build.sh(파일 복원 도우미 이미지)를 가짜 deb으로 돌려 본다: 인자, debian.lock 형식, 해시가
 # 어긋나면 실패, ELF NEEDED를 따라 라이브러리를 모으고 빠지면 이름을 알리며 실패, 정적이 아닌·다른 아키텍처 에이전트
 # 거절, 커널 설정 탐침, 모듈 의존 차례(depmod 없이)와 내장 모듈 건너뜀, initramfs 내용(/init 링크, /dev/console,
-# 동적 링커 자리, 소유자 0·시각 0), manifest.json, 두 번 빌드하면 같은 바이트.
+# 동적 링커 자리, 소유자 0·시각 0), manifest.json, 두 번 빌드하면 같은 바이트, 시험 게스트(--test-guest — qemu-ga와
+# 그 라이브러리, 정적 busybox와 애플릿 링크, /init 스크립트, manifest 없음).
 # 가짜 deb(ar + data.tar.xz)·ELF·커널 모듈은 아래 Python이 만들고 file:// URL로 받는다 — 네트워크·cargo가 필요 없다.
 # 필요한 것: bash, curl, bsdtar, zstd, python3(Linux·macOS).
 # 쓰는 법: bash packaging/tests/restore-image-test.sh
@@ -148,12 +149,22 @@ with open(os.path.join(work, "agent-dynamic"), "wb") as f:
     f.write(elf(interp="/lib/ld-musl-x86_64.so.1", needed=["libc.so"]))
 with open(os.path.join(work, "agent-arm"), "wb") as f:
     f.write(elf(machine=183))
-with open(os.path.join(work, "debian.lock"), "w") as f:
-    f.write("# fake\nDEBS_x86_64='\n")
-    for name, path in debs:
-        sha = hashlib.sha256(open(path, "rb").read()).hexdigest()
-        f.write(f"{name} 1.0 file://{path} {sha}\n")
-    f.write("'\n")
+def write_lock(path, debs):
+    with open(path, "w") as f:
+        f.write("# fake\nDEBS_x86_64='\n")
+        for name, deb_path in debs:
+            sha = hashlib.sha256(open(deb_path, "rb").read()).hexdigest()
+            f.write(f"{name} 1.0 file://{deb_path} {sha}\n")
+        f.write("'\n")
+
+write_lock(os.path.join(work, "debian.lock"), debs)
+# 시험 게스트(--test-guest): qemu-ga(glib을 거쳐 libc), 정적 busybox
+guest = [("qemu-guest-agent", deb("qemu-guest-agent", {"usr/sbin/qemu-ga": (elf(interp=INTERP, needed=["libglib-2.0.so.0", "libc.so.6"]), 0o755)})),
+         ("libglib2.0-0t64", deb("libglib2.0-0t64", {f"{T}/libglib-2.0.so.0": (elf(needed=["libc.so.6"]), 0o644)})),
+         ("busybox-static", deb("busybox-static", {"usr/bin/busybox": (elf(), 0o755)}))]
+write_lock(os.path.join(work, "guest.lock"), guest)
+write_lock(os.path.join(work, "guest-dynbb.lock"), guest[:2] + [
+    ("busybox-static", deb("busybox-dyn", {"usr/bin/busybox": (elf(interp=INTERP, needed=["libc.so.6"]), 0o755)}))])
 EOF
 
 LOCK="$WORK/debian.lock"
@@ -337,6 +348,35 @@ run "$WORK/obad" --arch x86_64 --agent "$WORK/agent-dynamic" --lock "$LOCK" --ve
 expect_fail "정적이 아닌 에이전트 거절" 1 "the agent must be a static binary"
 run "$WORK/obad" --arch x86_64 --agent "$WORK/agent-arm" --lock "$LOCK" --version 9.9.9
 expect_fail "다른 아키텍처의 에이전트 거절" 1 "ELF machine 183 is not x86_64"
+
+# 시험 게스트(--test-guest, 파일 복원 E2E (5)): 에이전트 없이, qemu-ga와 라이브러리, busybox 애플릿, /init 스크립트
+run "$WORK/guest" --arch x86_64 --lock "$LOCK" --test-lock "$WORK/guest.lock"
+if [ "$code" -eq 0 ] && [ -f "$WORK/guest/vmlinuz" ] && [ -f "$WORK/guest/initrd.img" ] && [ ! -e "$WORK/guest/manifest.json" ]; then
+	ok "시험 게스트: 커널과 initrd.img만(manifest 없음, 에이전트 빌드 없음)"
+else
+	fail "시험 게스트 빌드: 종료 코드 $code"
+	cat "$WORK/log"
+fi
+mkdir -p "$WORK/gx"
+zstd -dcq "$WORK/guest/initrd.img" >"$WORK/guest.cpio"
+bsdtar -tvf "$WORK/guest.cpio" >"$WORK/glisting"
+bsdtar -xf "$WORK/guest.cpio" -C "$WORK/gx" --exclude ./dev/console
+if grep -qE '^-rwxr-xr-x .* \./init$' "$WORK/glisting" &&
+	grep -qE '^-rwxr-xr-x .* \./bin/qemu-ga$' "$WORK/glisting" &&
+	grep -qE '^-rwxr-xr-x .* \./bin/busybox$' "$WORK/glisting" &&
+	grep -qE '^lrwxrwxrwx .* \./bin/mv -> busybox$' "$WORK/glisting" &&
+	grep -qE '^lrwxrwxrwx .* \./bin/mkdir -> busybox$' "$WORK/glisting" &&
+	grep -qE '^drwxr-xr-x .* \./target$' "$WORK/glisting" &&
+	[ -f "$WORK/gx/lib/x86_64-linux-gnu/libglib-2.0.so.0" ] &&
+	grep -q 'exec /bin/qemu-ga -m virtio-serial' "$WORK/gx/init" &&
+	grep -q 'mount -t ext4 /dev/vda /target' "$WORK/gx/init" &&
+	! grep -q orbivisor-restore-agent "$WORK/glisting"; then
+	ok "시험 게스트 initramfs: /init 스크립트, qemu-ga와 glib, busybox 애플릿, /target"
+else
+	fail "시험 게스트 initramfs: $(cat "$WORK/glisting")"
+fi
+run "$WORK/obad" --arch x86_64 --lock "$LOCK" --test-lock "$WORK/guest-dynbb.lock"
+expect_fail "시험 게스트의 busybox는 정적이어야 한다" 1 "busybox must be static"
 
 if [ "$FAILED" -ne 0 ]; then
 	echo "restore-image-test: 실패"

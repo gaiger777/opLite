@@ -3266,6 +3266,21 @@ impl GuestAgentSource for FakeGuest {
         }
         Ok(())
     }
+
+    async fn file(
+        &self,
+        _vm: Uuid,
+        op: opl_types::file_restore::GuestFileOp,
+    ) -> Result<opl_types::file_restore::GuestFileAnswer, GuestAgentError> {
+        use opl_types::file_restore::{GuestFileAnswer, GuestFileOp};
+        self.calls.lock().unwrap().push(format!("file {op:?}"));
+        match op {
+            GuestFileOp::Write { data, .. } => Ok(GuestFileAnswer::Written {
+                count: data.len() as u64,
+            }),
+            _ => Err(GuestAgentError::NotRunning),
+        }
+    }
 }
 
 #[tokio::test]
@@ -3308,7 +3323,8 @@ async fn guest_agent_requests_reach_the_node_running_the_vm() {
             .unwrap(),
         GuestAgentReply {
             info: None,
-            error: None
+            error: None,
+            file: None
         }
     );
     let reply = peers
@@ -3328,12 +3344,42 @@ async fn guest_agent_requests_reach_the_node_running_the_vm() {
         matches!(reply.error, Some(GuestAgentError::Invalid(_))),
         "{reply:?}"
     );
+    // 파일 일(계획 69): 답과 오류가 그대로 온다.
+    let file = |op| ask(GuestAgentOp::File { file: op });
+    let reply = peers
+        .guest_agent(
+            target.id(),
+            &target.addr,
+            file(opl_types::file_restore::GuestFileOp::Write {
+                handle: 1,
+                data: "YWJj".into(),
+            }),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reply.file,
+        Some(opl_types::file_restore::GuestFileAnswer::Written { count: 4 })
+    );
+    let reply = peers
+        .guest_agent(
+            target.id(),
+            &target.addr,
+            file(opl_types::file_restore::GuestFileOp::Caps),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert_eq!(reply.error, Some(GuestAgentError::NotRunning));
     assert_eq!(
         *guest.calls.lock().unwrap(),
         [
             format!("info {vm} true"),
             "password Administrator".into(),
-            "password nobody".into()
+            "password nobody".into(),
+            "file Write { handle: 1, base64_len: 4 }".into(),
+            "file Caps".into()
         ]
     );
     // 게스트 에이전트를 모르는 노드는 Unsupported다.

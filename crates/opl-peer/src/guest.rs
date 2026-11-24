@@ -1,9 +1,11 @@
 //! 게스트 에이전트의 노드 사이 RPC(`GuestAgent`, 계획 59 §8): 한 노드의 API가 VM이 도는 노드의 게스트 정보 캐시를
-//! 읽거나(필요하면 지금 묻기) 게스트 비밀번호를 설정한다. 처리는 opld가 [`GuestAgentSource`]로 넣는다.
+//! 읽거나(필요하면 지금 묻기) 게스트 비밀번호를 설정한다. 파일 복원 세션 노드는 다른 노드에서 도는 VM에 파일 일
+//! 하나씩(`File` — 계획 69 §12)을 보낸다. 처리는 opld가 [`GuestAgentSource`]로 넣는다.
 
 use std::fmt;
 
 use async_trait::async_trait;
+use opl_types::file_restore::{GuestFileAnswer, GuestFileOp};
 use opl_types::guest::GuestInfoResponse;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -16,6 +18,9 @@ pub enum GuestAgentOp {
     Info { refresh: bool },
     /// 게스트 사용자의 비밀번호 설정. 비밀번호는 저장하지도 적지도 않는다.
     SetPassword { user: String, password: String },
+    /// 게스트 파일 일 하나(되돌려 쓰기 — `FileOpen`·`FileWrite`·`FileClose`·`FileExists`·`Exec`·능력). 그 노드가 일마다
+    /// 에이전트 잠금을 쥐고 놓는다.
+    File { file: GuestFileOp },
 }
 
 /// 비밀번호는 적지 않는다.
@@ -28,6 +33,7 @@ impl fmt::Debug for GuestAgentOp {
                 .field("user", user)
                 .field("password", &"<redacted>")
                 .finish(),
+            Self::File { file } => f.debug_struct("File").field("file", file).finish(),
         }
     }
 }
@@ -70,6 +76,9 @@ pub struct GuestAgentReply {
     pub info: Option<GuestInfoResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<GuestAgentError>,
+    /// 파일 일의 답
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GuestFileAnswer>,
 }
 
 /// 이 노드에서 도는 VM의 게스트 에이전트를 다루는 처리(opld의 게스트 정보 캐시)
@@ -85,6 +94,12 @@ pub trait GuestAgentSource: Send + Sync {
         user: &str,
         password: &str,
     ) -> Result<(), GuestAgentError>;
+
+    /// VM의 게스트 에이전트에 파일 일 하나를 한다(계획 69 §12). 기본은 하지 않는다(`Unsupported`).
+    async fn file(&self, vm: Uuid, op: GuestFileOp) -> Result<GuestFileAnswer, GuestAgentError> {
+        let _ = (vm, op);
+        Err(GuestAgentError::Unsupported)
+    }
 }
 
 #[cfg(test)]
@@ -108,6 +123,39 @@ mod tests {
         assert!(!shown.contains("hunter2"), "{shown}");
     }
 
+    /// 파일 일은 `{"op":"file","file":{"op":…}}`로 가고, 쓰는 데이터는 디버그 출력에 나오지 않는다.
+    #[test]
+    fn file_ops_round_trip_and_hide_data() {
+        let req = GuestAgentRequest {
+            vm: Uuid::nil(),
+            op: GuestAgentOp::File {
+                file: GuestFileOp::Write {
+                    handle: 1,
+                    data: "c2VjcmV0".into(),
+                },
+            },
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["op"]["op"], "file");
+        assert_eq!(json["op"]["file"]["op"], "write");
+        assert_eq!(
+            serde_json::from_value::<GuestAgentRequest>(json).unwrap(),
+            req
+        );
+        assert!(!format!("{req:?}").contains("c2VjcmV0"));
+        let reply = GuestAgentReply {
+            info: None,
+            error: None,
+            file: Some(GuestFileAnswer::Written { count: 6 }),
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(json, r#"{"file":{"answer":"written","count":6}}"#);
+        assert_eq!(
+            serde_json::from_str::<GuestAgentReply>(&json).unwrap(),
+            reply
+        );
+    }
+
     #[test]
     fn requests_and_errors_round_trip_as_json() {
         let req = GuestAgentRequest {
@@ -123,6 +171,7 @@ mod tests {
         let reply = GuestAgentReply {
             info: None,
             error: Some(GuestAgentError::Unavailable("timed out".into())),
+            file: None,
         };
         let json = serde_json::to_string(&reply).unwrap();
         assert_eq!(

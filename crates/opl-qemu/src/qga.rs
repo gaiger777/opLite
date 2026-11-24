@@ -317,6 +317,111 @@ pub async fn set_user_password(
         .map(drop)
 }
 
+/// 파일 쓰기 명령 하나를 기다리는 시간(1 MiB `guest-file-write` — TCG 게스트에서도 넉넉히)
+pub const FILE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 에이전트가 아는 명령과 허락 여부(`guest-info.supported_commands[].{name,enabled}`). RHEL·Rocky 에이전트는 막은 명령을
+/// `enabled: false`로 알린다.
+pub async fn supported_commands(session: &mut Session) -> Result<Vec<(String, bool)>, QgaError> {
+    let info = session.execute("guest-info", None, AGENT_TIMEOUT).await?;
+    let Some(list) = info["supported_commands"].as_array() else {
+        return Err(QgaError::BadReply("guest-info".into()));
+    };
+    Ok(list
+        .iter()
+        .filter_map(|c| {
+            let name = c["name"].as_str()?;
+            Some((name.to_string(), c["enabled"].as_bool().unwrap_or(false)))
+        })
+        .take(1024)
+        .collect())
+}
+
+/// 게스트 파일을 연다(`guest-file-open`, `mode`는 fopen 꼴 — `r`·`wb`) → 핸들. 핸들은 에이전트 전역이라 연결이 바뀌어도
+/// 남는다(닫을 때까지).
+pub async fn file_open(session: &mut Session, path: &str, mode: &str) -> Result<i64, QgaError> {
+    let args = json!({ "path": path, "mode": mode });
+    let handle = session
+        .execute("guest-file-open", Some(args), AGENT_TIMEOUT)
+        .await?;
+    handle
+        .as_i64()
+        .ok_or_else(|| QgaError::BadReply("guest-file-open".into()))
+}
+
+/// 핸들에 쓴다(`guest-file-write`, 날 바이트의 표준 base64) → 쓴 바이트 수
+pub async fn file_write(session: &mut Session, handle: i64, base64: &str) -> Result<u64, QgaError> {
+    let args = json!({ "handle": handle, "buf-b64": base64 });
+    let ret = session
+        .execute("guest-file-write", Some(args), FILE_TIMEOUT)
+        .await?;
+    ret["count"]
+        .as_u64()
+        .ok_or_else(|| QgaError::BadReply("guest-file-write".into()))
+}
+
+/// 핸들의 버퍼를 비운다(`guest-file-flush`)
+pub async fn file_flush(session: &mut Session, handle: i64) -> Result<(), QgaError> {
+    let args = json!({ "handle": handle });
+    session
+        .execute("guest-file-flush", Some(args), FILE_TIMEOUT)
+        .await
+        .map(drop)
+}
+
+/// 핸들을 닫는다(`guest-file-close`)
+pub async fn file_close(session: &mut Session, handle: i64) -> Result<(), QgaError> {
+    let args = json!({ "handle": handle });
+    session
+        .execute("guest-file-close", Some(args), FILE_TIMEOUT)
+        .await
+        .map(drop)
+}
+
+/// 프로그램을 셸 없이 띄운다(`guest-exec`, 출력을 모음) → pid. 끝은 [`exec_status`]로 본다.
+pub async fn exec(session: &mut Session, path: &str, args: &[String]) -> Result<i64, QgaError> {
+    let args = json!({ "path": path, "arg": args, "capture-output": true });
+    let ret = session
+        .execute("guest-exec", Some(args), AGENT_TIMEOUT)
+        .await?;
+    ret["pid"]
+        .as_i64()
+        .ok_or_else(|| QgaError::BadReply("guest-exec".into()))
+}
+
+/// `guest-exec-status`의 답
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ExecStatus {
+    pub exited: bool,
+    /// 종료 코드(끝났고 시그널이 아니면)
+    pub code: Option<i64>,
+    /// 끝낸 시그널(Linux)
+    pub signal: Option<i64>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// 띄운 프로그램의 상태(`guest-exec-status`). 끝난 뒤 한 번 답하면 에이전트가 그 pid를 잊는다.
+pub async fn exec_status(session: &mut Session, pid: i64) -> Result<ExecStatus, QgaError> {
+    let args = json!({ "pid": pid });
+    let ret = session
+        .execute("guest-exec-status", Some(args), AGENT_TIMEOUT)
+        .await?;
+    let data = |key: &str| {
+        ret[key]
+            .as_str()
+            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
+            .unwrap_or_default()
+    };
+    Ok(ExecStatus {
+        exited: ret["exited"].as_bool().unwrap_or(false),
+        code: ret["exitcode"].as_i64(),
+        signal: ret["signal"].as_i64(),
+        stdout: data("out-data"),
+        stderr: data("err-data"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -644,6 +749,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!err.to_string().contains("s3cret"), "{err}");
+    }
+
+    /// 파일 명령과 exec: 인자 이름(`buf-b64`·`capture-output`)과 답 읽기, 막힌 명령은 `Command` 오류다.
+    #[tokio::test]
+    async fn file_and_exec_commands() {
+        let (_dir, path) = serve_with(|cmd| {
+            let a = &cmd["arguments"];
+            match cmd["execute"].as_str().unwrap() {
+                "guest-info" => ret(json!({ "version": "10.0", "supported_commands": [
+                    { "name": "guest-file-open", "enabled": true, "success-response": true },
+                    { "name": "guest-exec", "enabled": false, "success-response": true },
+                    { "enabled": true }
+                ] })),
+                "guest-file-open" if a["path"] == "/missing" => Some(
+                    b"{\"error\": {\"class\": \"GenericError\", \"desc\": \"No such file\"}}\n"
+                        .to_vec(),
+                ),
+                "guest-file-open" => {
+                    assert_eq!(a["mode"], "wb");
+                    ret(json!(1000))
+                }
+                "guest-file-write" => {
+                    assert_eq!(a["handle"], 1000);
+                    assert_eq!(a["buf-b64"], "aGVsbG8=");
+                    ret(json!({ "count": 5, "eof": false }))
+                }
+                "guest-file-flush" | "guest-file-close" => {
+                    assert_eq!(a["handle"], 1000);
+                    ret(json!({}))
+                }
+                "guest-exec" => {
+                    assert_eq!(a["path"], "/bin/mkdir");
+                    assert_eq!(a["arg"], json!(["-p", "--", "/x"]));
+                    assert_eq!(a["capture-output"], true);
+                    ret(json!({ "pid": 42 }))
+                }
+                "guest-exec-status" => ret(json!({
+                    "exited": true, "exitcode": 1, "err-data": "bm8gd2F5", "out-data": "!!"
+                })),
+                other => panic!("unexpected {other}"),
+            }
+        });
+        let mut s = Session::connect(&path, SYNC_TIMEOUT).await.unwrap();
+        assert_eq!(
+            supported_commands(&mut s).await.unwrap(),
+            [
+                ("guest-file-open".to_string(), true),
+                ("guest-exec".to_string(), false)
+            ]
+        );
+        let err = file_open(&mut s, "/missing", "r").await.unwrap_err();
+        assert!(err.is_command(), "{err}");
+        let h = file_open(&mut s, "/x/a", "wb").await.unwrap();
+        assert_eq!(file_write(&mut s, h, "aGVsbG8=").await.unwrap(), 5);
+        file_flush(&mut s, h).await.unwrap();
+        file_close(&mut s, h).await.unwrap();
+        let args = ["-p".to_string(), "--".into(), "/x".into()];
+        let pid = exec(&mut s, "/bin/mkdir", &args).await.unwrap();
+        let st = exec_status(&mut s, pid).await.unwrap();
+        assert_eq!(
+            st,
+            ExecStatus {
+                exited: true,
+                code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: b"no way".to_vec()
+            }
+        );
     }
 
     /// sync에 답하지 않는 채널(게스트 에이전트 없음)은 `Timeout`이다.

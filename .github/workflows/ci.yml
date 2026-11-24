@@ -410,6 +410,74 @@ jobs:
           # 계획 64: NUMA 탐침 시험이 2M hugepages를 실행 중 예약했다가 되돌린다(`/sys` 쓰기).
           OPL_TEST_NUMA_SYS: "1"
 
+  # 파일 단위 복원(계획 69 설계 §14): 도우미 이미지 빌드(x86_64를 두 번 — 바이트가 같아야 한다, aarch64는 빌드만 — 부팅은
+  # svc01)와 시험 게스트(--test-guest, Debian qemu-guest-agent), 고정물 디스크 전체(btrfs·ntfs 포함, LVM은 root, XFS 더러운
+  # 로그), 실제 QEMU 도우미 시험(restore-it — KVM·root·systemd scope·권한 내림), opld E2E (1)~(5)((5)는 실제 게스트 에이전트로
+  # 되돌려 쓰기), 그리고 `-accel tcg`를 강제한 도우미 시험 한 번. 부팅 시간·흘리기 MB/s는 로그의 PROBE 줄과 E2E 출력.
+  file-restore:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      OPL_RESTORE_IMAGE_DIR: ${{ github.workspace }}/../fr/img
+      OPL_RESTORE_FIXTURES: ${{ github.workspace }}/../fr/fx
+      OPL_RESTORE_TEST_GUEST: ${{ github.workspace }}/../fr/guest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-musl
+      - name: KVM, QEMU and fixture tools
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config qemu-system-x86 qemu-utils ovmf libarchive-tools zstd \
+            e2fsprogs xfsprogs btrfs-progs dosfstools mtools exfatprogs ntfs-3g fdisk cryptsetup-bin lvm2 \
+            thin-provisioning-tools unzip
+          ls -l /dev/kvm
+          qemu-system-x86_64 --version
+          mkdir -p "$OPL_RESTORE_IMAGE_DIR" "$OPL_RESTORE_FIXTURES" "$OPL_RESTORE_TEST_GUEST"
+      # 같은 입력(잠금 파일의 deb, 같은 에이전트)이면 같은 바이트다(설계 §8.2) — 두 번 빌드해 견준다.
+      - name: Helper images (x86_64 twice, aarch64) and the test guest
+        env:
+          CACHE: ${{ runner.temp }}/debs
+        run: |
+          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$OPL_RESTORE_IMAGE_DIR/x86_64"
+          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$RUNNER_TEMP/again/x86_64"
+          (cd "$OPL_RESTORE_IMAGE_DIR/x86_64" && sha256sum vmlinuz initrd.img manifest.json) | tee "$RUNNER_TEMP/first.sum"
+          (cd "$RUNNER_TEMP/again/x86_64" && sha256sum vmlinuz initrd.img manifest.json) >"$RUNNER_TEMP/second.sum"
+          diff "$RUNNER_TEMP/first.sum" "$RUNNER_TEMP/second.sum"
+          packaging/restore-image/build.sh --arch aarch64 --cache "$CACHE" --out "$RUNNER_TEMP/arm/aarch64"
+          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --test-guest --out "$OPL_RESTORE_TEST_GUEST"
+          ls -l "$OPL_RESTORE_IMAGE_DIR/x86_64" "$RUNNER_TEMP/arm/aarch64" "$OPL_RESTORE_TEST_GUEST"
+      # LVM(VG oplfixvg)은 root가 만든다. XFS 더러운 로그: 복사본을 붙여 쓰고 fsync한 뒤 로그를 남긴 채 내린다.
+      - name: Fixture disks
+        run: |
+          sudo crates/opl-restore/tests/fixtures/make-disks.sh "$OPL_RESTORE_FIXTURES"
+          cat "$OPL_RESTORE_FIXTURES/disks.txt"
+          sudo cp --sparse=always "$OPL_RESTORE_FIXTURES/xfs.img" "$OPL_RESTORE_FIXTURES/xfs-dirty.img"
+          sudo mkdir -p /mnt/oplxfs
+          sudo mount -o loop "$OPL_RESTORE_FIXTURES/xfs-dirty.img" /mnt/oplxfs
+          printf 'replayed\n' | sudo tee /mnt/oplxfs/replay.txt >/dev/null
+          sudo xfs_io -c fsync /mnt/oplxfs/replay.txt
+          sudo xfs_io -x -c shutdown /mnt/oplxfs
+          sudo umount /mnt/oplxfs
+          sudo chown -R "$(id -u):$(id -g)" "$OPL_RESTORE_FIXTURES"
+          ls -l "$OPL_RESTORE_FIXTURES"
+      # root로 빌드하므로 캐시하지 않고 임시 디렉터리에 빌드한다(linux-kvm과 같음).
+      - name: Real helper VM (KVM) and opld E2E (1)-(5)
+        run: |
+          sudo -E env "PATH=$PATH" OPL_RESTORE_SCOPE=1 OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+            cargo test -p opl-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
+          sudo -E env "PATH=$PATH" OPL_TEST_SYSTEMD=1 CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+            cargo test -p opld --features restore-it --test file_restore -- --nocapture
+      - name: Real helper VM with forced TCG
+        run: |
+          sudo -E env "PATH=$PATH" OPL_RESTORE_ACCEL=tcg CARGO_TARGET_DIR="$RUNNER_TEMP/target" \
+            cargo test -p opl-driver --features restore-it --test restore_helper -- --nocapture --test-threads 1
+
   # Ceph 자동 구성(계획 56): Ceph가 없는 깨끗한 러너에서 orbivisord가 apt로 Ceph를 설치하고 mon·mgr, 루프 장치
   # 위 OSD(ceph-volume LVM), RBD 풀을 세워 그 풀의 볼륨으로 VM을 켠다. linux-kvm은 손으로 띄운 Ceph(바깥 Ceph를
   # RBD 풀로 쓰는 시험)의 /etc/ceph/ceph.conf가 있어 Orbivisor가 관리할 Ceph를 세울 수 없으므로 작업을 나눈다.

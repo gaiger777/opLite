@@ -702,6 +702,7 @@ fn queue(ctx: &Ctx, task: &Task) -> Option<Uuid> {
                 | TaskOp::VmReplicate { .. }
                 | TaskOp::VmUntemplate
                 | TaskOp::VmFirmwareReset { .. }
+                | TaskOp::FileRestoreToGuest { .. }
         );
         let backup_queue = matches!(
             task.spec.op,
@@ -815,8 +816,12 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
                 | TaskOp::BackupLiveRestore { .. }
         )
         || matches!(task.spec.op, TaskOp::NetworkMigrate { .. })
-        // 파일 복원 세션은 스스로 유휴·최대 시간으로 끝난다(계획 69 §10.3).
-        || matches!(task.spec.op, TaskOp::FileRestoreSession { .. });
+        // 파일 복원 세션은 스스로 유휴·최대 시간으로 끝난다(계획 69 §10.3). 게스트로 되돌려 쓰기는 바이트·파일 수 한도와
+        // 파일 일마다의 한도(에이전트 잠금 30초·쓰기 30초)가 있다.
+        || matches!(
+            task.spec.op,
+            TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. }
+        );
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -1202,8 +1207,24 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::FileRestoreSession { backup } => {
             return Box::pin(file_restore::run(ctx, task, *backup)).await;
         }
-        // 게스트로 되돌려 쓰기는 스테이지 6이 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::FileRestoreToGuest { .. } => Err("file restore tasks are not available yet".into()),
+        // 게스트로 되돌려 쓰기(계획 69 §12): 결과(쓴·건너뛴 파일, 권한은 되돌리지 않음)를 경고로 남긴다.
+        TaskOp::FileRestoreToGuest {
+            session,
+            volume,
+            paths,
+            target_dir,
+            conflict,
+            ..
+        } => {
+            let req = file_restore::ToGuest {
+                session: *session,
+                volume,
+                paths,
+                target_dir,
+                conflict: *conflict,
+            };
+            return Box::pin(file_restore::to_guest(ctx, task, req)).await;
+        }
     };
     done.map(|()| None)
 }

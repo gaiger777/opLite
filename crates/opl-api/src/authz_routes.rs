@@ -348,6 +348,8 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     // VM 읽기. 루트 `cluster.read`가 없으면 핸들러가 노드 이름·pCPU를 뺀다(계획 64).
     ("GET", "/vms/{key}/numa", Read(Vm)),
     ("POST", "/vms/{key}/guest/password", Object(Vm, VmConfig)),
+    // 되돌려 쓰기 능력(계획 69 §13): VM 읽기(`system.read`)
+    ("GET", "/vms/{key}/guest/restore-caps", Read(Vm)),
     ("GET", "/vms/{key}/console", Object(Vm, VmConsole)),
     ("POST", "/vms/{key}/backups", Object(Vm, BackupCreate)),
     ("GET", "/snapshots", List),
@@ -436,6 +438,8 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
         Handler,
     ),
     ("POST", "/file-restore/sessions/{id}/download-link", Handler),
+    // 게스트로 되돌려 쓰기: 핸들러가 세션(위와 같음)과 대상 VM의 `vm.config`를 본다.
+    ("POST", "/file-restore/sessions/{id}/restore-to-vm", Handler),
     (
         "GET",
         "/file-restore/sessions/{id}/download/{token}",

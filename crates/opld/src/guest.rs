@@ -11,6 +11,7 @@ use opl_cluster::Cluster;
 use opl_driver::{DriverError, Hypervisor};
 use opl_peer::{GuestAgentError, GuestAgentSource};
 use opl_reconciler::GuestInfoSink;
+use opl_types::file_restore::{GuestFileAnswer, GuestFileOp};
 use opl_types::guest::{GuestInfo, GuestInfoResponse, GuestInfoState};
 use opl_types::vm::VmSpec;
 use tokio::time::Instant;
@@ -124,6 +125,14 @@ impl GuestAgentSource for GuestInfoStore {
             .await
             .map_err(agent_error)
     }
+
+    /// 파일 일 하나(계획 69 §12). 이 노드에서 돌지 않으면 `NotRunning`이다.
+    async fn file(&self, vm: Uuid, op: GuestFileOp) -> Result<GuestFileAnswer, GuestAgentError> {
+        if !self.running(vm).await {
+            return Err(GuestAgentError::NotRunning);
+        }
+        self.hv.guest_file(vm, &op).await.map_err(agent_error)
+    }
 }
 
 #[cfg(test)]
@@ -234,5 +243,29 @@ mod tests {
         hv.set_guest_agent(vm, GuestAnswer::Ok);
         store.set_password(vm, "root", "pw").await.unwrap();
         assert_eq!(hv.password_sets(vm), ["root"]);
+    }
+
+    #[tokio::test]
+    async fn file_ops_reach_the_hypervisor() {
+        let (_dir, hv, store) = store().await;
+        let vm = Uuid::now_v7();
+        assert_eq!(
+            store.file(vm, GuestFileOp::Caps).await,
+            Err(GuestAgentError::NotRunning)
+        );
+        start(&hv, vm).await;
+        hv.set_guest_agent(vm, GuestAnswer::Ok);
+        hv.set_guest_fs(vm, opl_driver::MockGuestFs::linux(&["/srv"]));
+        let open = GuestFileOp::Open {
+            path: "/srv/a".into(),
+        };
+        assert!(matches!(
+            store.file(vm, open).await,
+            Ok(GuestFileAnswer::Opened { .. })
+        ));
+        assert_eq!(
+            hv.guest_fs(vm).unwrap().files.keys().collect::<Vec<_>>(),
+            ["/srv/a"]
+        );
     }
 }

@@ -2,9 +2,13 @@
 //! (1) 고정물 ext4 디스크를 단 꺼진 VM을 로컬 암호화 저장소에 백업해 나열·파일·zip·tar.gz를 고정물 해시와 견주고 닫은 뒤
 //! 도우미 프로세스·세션 디렉터리가 남지 않는지, (2) 같은 디스크의 옛 풀 증분 체인(전체 → 디스크를 저널이 더러운 ext4로 바꾼
 //! 증분)을 열면 체인을 다 붙인 디스크(재생된 저널)가 보이는지, (3) 도우미 QEMU를 `kill -9`하면 세션이 실패로 끝나고 치워지는지,
-//! (4) 세션이 열린 채 opld가 죽었다가 다시 뜨면 남은 도우미를 치우고 세션은 실패로 남는지 본다.
+//! (4) 세션이 열린 채 opld가 죽었다가 다시 뜨면 남은 도우미를 치우고 세션은 실패로 남는지, (5) 실제 게스트 에이전트(시험
+//! 게스트 — `packaging/restore-image/build.sh --test-guest`, Debian qemu-ga)가 도는 VM에 디렉터리·keep·overwrite로 되돌려
+//! 쓴 뒤 그 VM을 끄고 다시 백업해 세션으로 열면 쓴 파일이 고정물과 같은지 본다. (5)는 `OPL_RESTORE_TEST_GUEST=<시험 게스트
+//! 디렉터리>`가 있을 때만 — 시험 게스트 VM은 QEMU 감싸개가 `-kernel`·`-initrd`를 더해 띄운다(VM 스펙에 직접 커널 부팅이 없다).
 //! `OPL_RESTORE_IMAGE_DIR=<이미지> OPL_RESTORE_FIXTURES=<고정물> cargo test -p opld --features restore-it --test file_restore`
-//! (QEMU가 PATH 밖이면 `OPL_TEST_QEMU=<qemu-system-…>`, 가속 `OPL_TEST_ACCEL`, 기본 tcg)
+//! (QEMU가 PATH 밖이면 `OPL_TEST_QEMU=<qemu-system-…>`, 가속 `OPL_TEST_ACCEL`, 기본 tcg; 배포판 UEFI 펌웨어가 `-kernel`을
+//! 띄우지 못하면 `OPL_TEST_UEFI_CODE`·`OPL_TEST_UEFI_VARS`)
 #![cfg(feature = "restore-it")]
 
 mod common;
@@ -67,19 +71,44 @@ fn hex(b: &[u8]) -> String {
 
 /// 파일 복원을 켠 노드 하나, 풀 `local`·백업 풀 `bk`
 async fn daemon(inputs: &Inputs) -> Daemon {
+    daemon_with(inputs, None).await
+}
+
+/// `daemon`과 같고 QEMU 실행 파일을 `qemu`로(시험 게스트 감싸개)
+async fn daemon_with(inputs: &Inputs, qemu: Option<&Path>) -> Daemon {
     let extra = format!(
         "[reconciler]\nacpi_timeout_secs = 5\n[file_restore]\nimage_dir = \"{}\"\nrun_as = \"\"\n",
         inputs.image_dir.display()
     );
     // QEMU가 PATH 밖이면(svc01의 /opt/qemu) `OPL_TEST_QEMU`·`OPL_TEST_ACCEL`로 준다.
-    let mut d = match std::env::var("OPL_TEST_QEMU") {
+    let mut d = match qemu
+        .map(|q| q.display().to_string())
+        .ok_or(())
+        .or_else(|()| std::env::var("OPL_TEST_QEMU"))
+    {
         Ok(qemu) => {
-            let accel = std::env::var("OPL_TEST_ACCEL").unwrap_or_else(|_| "tcg".into());
+            // 시험 게스트 감싸개만이면(`OPL_TEST_QEMU` 없음) 호스트에 맞는 가속(KVM·HVF)
+            let fallback = if std::env::var_os("OPL_TEST_QEMU").is_some() {
+                "tcg"
+            } else {
+                "auto"
+            };
+            let accel = std::env::var("OPL_TEST_ACCEL").unwrap_or_else(|_| fallback.into());
             let scope = std::env::var_os("OPL_TEST_SYSTEMD").is_some();
+            // 배포판 펌웨어가 `-kernel`을 띄우지 못하면(svc01 Rocky AAVMF) QEMU에 딸린 edk2를 준다.
+            let mut uefi = String::new();
+            if let (Ok(code), Ok(vars)) = (
+                std::env::var("OPL_TEST_UEFI_CODE"),
+                std::env::var("OPL_TEST_UEFI_VARS"),
+            ) {
+                uefi = format!("\nuefi_code = \"{code}\"\nuefi_vars = \"{vars}\"");
+            }
             Daemon::with_hypervisor(
                 "node1",
                 &extra,
-                &format!("qemu_binary = \"{qemu}\"\naccel = \"{accel}\"\nsystemd_scope = {scope}"),
+                &format!(
+                    "qemu_binary = \"{qemu}\"\naccel = \"{accel}\"\nsystemd_scope = {scope}{uefi}"
+                ),
             )
         }
         Err(_) => Daemon::new("node1", &extra),
@@ -445,4 +474,219 @@ async fn killed_helpers_and_restarts_leave_nothing_behind() {
     assert_ne!(again, open);
     d.ctl(&["backup", "files", "close", "b1"]).await.unwrap();
     gone(&d, &again).await;
+}
+
+/// 이 호스트의 QEMU(`OPL_TEST_QEMU`, 없으면 PATH의 `qemu-system-<arch>`) 절대 경로
+fn real_qemu() -> String {
+    if let Ok(q) = std::env::var("OPL_TEST_QEMU") {
+        return q;
+    }
+    let name = format!("qemu-system-{}", std::env::consts::ARCH);
+    let out = Command::new("sh")
+        .args(["-c", &format!("command -v {name}")])
+        .output()
+        .unwrap();
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(!path.is_empty(), "{name} is not on PATH");
+    path
+}
+
+/// 시험 게스트 VM(`-name guest=tguest,…`)에만 `-kernel`·`-initrd`·`-append`를 더하는 QEMU 감싸개. 도우미·탐침은 그대로.
+fn guest_wrapper(dir: &Path, guest: &Path) -> PathBuf {
+    let (kernel, console) = if std::env::consts::ARCH == "x86_64" {
+        ("vmlinuz", "ttyS0")
+    } else {
+        ("Image", "ttyAMA0")
+    };
+    let script = format!(
+        "#!/bin/sh\ncase \" $* \" in\n*\" guest=tguest,\"*)\n\texec '{qemu}' \"$@\" -kernel '{k}' -initrd '{i}' -append 'console={console} panic=-1' ;;\nesac\nexec '{qemu}' \"$@\"\n",
+        qemu = real_qemu(),
+        k = guest.join(kernel).display(),
+        i = guest.join("initrd.img").display(),
+    );
+    let path = dir.join("qemu-wrap");
+    std::fs::write(&path, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// 백업 `backup`의 `disk0:<path>`를 받아 SHA-256
+async fn got_hash(d: &Daemon, backup: &str, path: &str, work: &Path) -> String {
+    let file = work.join("got.bin");
+    d.ctl(&[
+        "backup",
+        "files",
+        "get",
+        backup,
+        &format!("disk0:{path}"),
+        "-O",
+        file.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    sha256(&file)
+}
+
+/// (5) 실제 게스트 에이전트로 되돌려 쓰기: 디렉터리(새 자리), keep(있는 hello.txt는 두고 `.restored-…`), overwrite(hard.txt를
+/// 임시 파일 → mv), 3 MiB 파일(1 MiB 쓰기 셋). VM을 끄고 다시 백업해 세션으로 열면 쓴 파일이 고정물과 같다.
+#[tokio::test]
+async fn files_are_restored_into_a_real_guest_agent() {
+    let Some(inputs) = inputs() else { return };
+    let Some(guest) = std::env::var_os("OPL_RESTORE_TEST_GUEST") else {
+        eprintln!(
+            "skipping (5): set OPL_RESTORE_TEST_GUEST (packaging/restore-image/build.sh --test-guest)"
+        );
+        return;
+    };
+    let wrap = tempfile::Builder::new()
+        .prefix("oplw")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let qemu = guest_wrapper(wrap.path(), Path::new(&guest));
+    let d = daemon_with(&inputs, Some(&qemu)).await;
+    let want = expected(&inputs.fixtures);
+    // 원본: 고정물 ext4 디스크 VM의 저장소 백업
+    fixture_volume(&d, "src", &inputs.fixtures.join("ext4.img")).await;
+    d.ctl(&["vm", "create", "src", "--memory", "256", "--disk", "src"])
+        .await
+        .unwrap();
+    d.ctl(&["backup-store", "create", "st", "--pool", "bk"])
+        .await
+        .unwrap();
+    d.ctl(&["backup", "create", "src", "--store", "st", "--name", "sb"])
+        .await
+        .unwrap();
+    // 대상: 저널이 더러운 ext4(게스트가 붙일 때 재생 — hello.txt·hard.txt가 "journal replayed…")를 단 시험 게스트
+    fixture_volume(&d, "gdisk", &inputs.fixtures.join("ext4-dirty.img")).await;
+    d.ctl(&[
+        "vm",
+        "create",
+        "tguest",
+        "--memory",
+        "512",
+        "--disk",
+        "gdisk",
+        "--guest-agent",
+        "on",
+        "--start",
+    ])
+    .await
+    .unwrap();
+    let started = std::time::Instant::now();
+    eventually("the test guest agent answers", || async {
+        let g = d.ctl_json(&["vm", "guest", "tguest", "--refresh"]).await;
+        g["state"] == "answered"
+    })
+    .await;
+    eprintln!("test guest agent answered after {:?}", started.elapsed());
+
+    let restore = |paths: &'static [&'static str], to: &'static str, conflict: &'static str| {
+        let d = &d;
+        async move {
+            let mut args = vec!["backup", "files", "restore", "sb"];
+            args.extend(paths);
+            args.extend([
+                "--vm",
+                "tguest",
+                "--to",
+                to,
+                "--conflict",
+                conflict,
+                "--wait",
+            ]);
+            let t = std::time::Instant::now();
+            let out = d.ctl(&args).await.unwrap();
+            eprintln!(
+                "restore {paths:?} → {to} ({conflict}) in {:?}: {out}",
+                t.elapsed()
+            );
+            out
+        }
+    };
+    let out = restore(
+        &["disk0:/dir", "disk0:/big.bin"],
+        "/target/restored",
+        "keep",
+    )
+    .await;
+    assert!(out.contains("restored 2 file(s)"), "{out}");
+    assert!(
+        out.contains("owners, modes and times were not restored"),
+        "{out}"
+    );
+    let out = restore(&["disk0:/hello.txt"], "/target", "keep").await;
+    assert!(
+        out.contains("kept existing files, wrote hello.txt as /target/hello.txt.restored-"),
+        "{out}"
+    );
+    let out = restore(&["disk0:/hard.txt"], "/target", "overwrite").await;
+    assert!(out.contains("restored 1 file(s)"), "{out}");
+    // 쓰기 속도(세션이 이미 열려 있음 — 3 MiB, 1 MiB `guest-file-write` 셋)
+    let t = std::time::Instant::now();
+    restore(&["disk0:/big.bin"], "/target/speed", "keep").await;
+    eprintln!(
+        "guest write: {:.1} MB/s",
+        3.0 * 1.048_576 / t.elapsed().as_secs_f64()
+    );
+    let out = restore(&["disk0:/link"], "/target/restored", "keep").await;
+    assert!(out.contains("symbolic links are not restored"), "{out}");
+
+    // 게스트가 1초마다 sync한다 — 그 뒤 끄고 다시 백업해 세션으로 본다.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    d.ctl(&["vm", "stop", "tguest", "--force"]).await.unwrap();
+    d.ctl(&[
+        "backup", "create", "tguest", "--store", "st", "--name", "gb",
+    ])
+    .await
+    .unwrap();
+    let work = d.path("got5");
+    std::fs::create_dir(&work).unwrap();
+    for (path, name) in [
+        ("/restored/dir/nested/deep.txt", "dir/nested/deep.txt"),
+        ("/restored/big.bin", "big.bin"),
+        ("/hard.txt", "hard.txt"),
+    ] {
+        assert_eq!(got_hash(&d, "gb", path, &work).await, want[name], "{path}");
+    }
+    let ls = d
+        .ctl(&["backup", "files", "ls", "gb", "disk0:/"])
+        .await
+        .unwrap();
+    let kept = ls
+        .lines()
+        .find(|l| l.starts_with("hello.txt.restored-"))
+        .unwrap_or_else(|| panic!("no kept copy: {ls}"))
+        .to_string();
+    assert_eq!(
+        got_hash(&d, "gb", &format!("/{kept}"), &work).await,
+        want["hello.txt"]
+    );
+    assert!(!ls.contains(".orbivisor-"), "{ls}");
+    let hello = work.join("hello.txt");
+    d.ctl(&[
+        "backup",
+        "files",
+        "get",
+        "gb",
+        "disk0:/hello.txt",
+        "-O",
+        hello.to_str().unwrap(),
+    ])
+    .await
+    .unwrap();
+    assert!(
+        std::fs::read_to_string(&hello)
+            .unwrap()
+            .starts_with("journal replayed"),
+        "the existing hello.txt was replaced"
+    );
+    let restored = d
+        .ctl(&["backup", "files", "ls", "gb", "disk0:/restored"])
+        .await
+        .unwrap();
+    assert!(!restored.contains("link"), "{restored}");
+    for b in ["sb", "gb"] {
+        d.ctl(&["backup", "files", "close", b]).await.unwrap();
+    }
 }

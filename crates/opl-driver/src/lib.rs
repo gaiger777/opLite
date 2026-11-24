@@ -42,8 +42,8 @@ pub use migration::{
     tcp_uri, write_migration_tls,
 };
 pub use mock::{
-    CatchUpCall, GuestAnswer, HotplugCall, IncrementalCall, MOCK_INCREMENT_BYTES, MockHypervisor,
-    ReplicationCall, mock_cpu_probe,
+    CatchUpCall, GuestAnswer, HotplugCall, IncrementalCall, MOCK_INCREMENT_BYTES, MockGuestFs,
+    MockHypervisor, ReplicationCall, mock_cpu_probe,
 };
 pub use net::{HostNet, IpRoute, Overlay, OverlayChanges, Tap};
 pub use opl_types::runtime::{LiveRestoreDisk, LiveRestoreSource};

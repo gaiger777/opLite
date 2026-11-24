@@ -1,6 +1,6 @@
 //! 계획 69: 파일 복원의 새 권한 `backup.file_restore`을 역할·토큰 범위에 넣는 쓰기는 옛 노드가 남았으면 409
 //! `cluster_upgrading`(검증보다 먼저)이고 모든 노드가 알면 된다(스테이지 5). 내장 admin은 그 권한을 가지고 operator는
-//! 가지지 않는다. 파일 복원을 차리지 않은 노드의 세션 Task와 아직 없는 되돌려 쓰기 Task(스테이지 6)는 실패로 끝난다.
+//! 가지지 않는다. 파일 복원을 차리지 않은 노드의 세션 Task와 되돌려 쓰기 Task는 실패로 끝난다.
 
 mod common;
 
@@ -94,7 +94,7 @@ async fn file_restore_privilege_needs_every_node() {
     upgrading(status, &body);
 }
 
-/// 도우미 이미지를 차리지 않은 노드의 세션 Task와 아직 없는 되돌려 쓰기 Task(스테이지 6)는 실패로 끝난다(Raft에 직접 쓴 것).
+/// 도우미 이미지를 차리지 않은 노드의 세션 Task와 되돌려 쓰기 Task는 실패로 끝난다(Raft에 직접 쓴 것).
 #[tokio::test]
 async fn file_restore_tasks_fail_where_they_cannot_run() {
     let env = Env::start().await;
@@ -114,7 +114,7 @@ async fn file_restore_tasks_fail_where_they_cannot_run() {
                 target_dir: "/tmp".into(),
                 conflict: GuestConflict::Keep,
             },
-            "file restore tasks are not available yet",
+            "file restore is not set up on this node",
         ),
     ] {
         let mut t: opl_types::task::Task = Resource::new(

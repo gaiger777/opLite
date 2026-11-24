@@ -15,6 +15,7 @@ use opl_qemu::{
     build_live_restore_cmdline, build_replica_receiver_cmdline,
 };
 use opl_types::backup::{BITMAP_PREFIX, is_backup_bitmap};
+use opl_types::file_restore::{GuestFileAnswer, GuestFileOp, guest_os_kind, guest_restore_caps};
 use opl_types::guest::GuestInfo;
 use opl_types::network::{tap_name, tap_prefix};
 use opl_types::node::{FirmwareCaps, NodeHotplug};
@@ -75,6 +76,10 @@ const SHUTDOWN_EXIT_WAIT: Duration = Duration::from_secs(1);
 const GUEST_PING_TIMEOUT: Duration = Duration::from_secs(3);
 /// 게스트 에이전트 잠금을 기다리는 한도(그 뒤는 바쁨으로 본다)
 const AGENT_LOCK_WAIT: Duration = Duration::from_secs(2);
+/// 되돌려 쓰기의 파일 일이 에이전트 잠금을 기다리는 시간(얼리기 창 10초 + 녹이기 다시 하기 15초를 넘게)
+const GUEST_FILE_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// 되돌려 쓰기의 `guest-exec`(mkdir·mv·rm)가 끝나기를 기다리는 시간
+const GUEST_EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 /// 내부 스냅샷(저장·불러오기·삭제) 하나를 기다리는 한도. 메모리 스냅샷은 메모리 크기만큼 걸린다.
 /// Task 한도(600초)보다 짧아야 Task가 먼저 끊기지 않고 이 오류(작업이 남아 있을 수 있음)를 받는다.
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(540);
@@ -1799,6 +1804,58 @@ impl Hypervisor for QemuHypervisor {
             .map_err(|e| DriverError::GuestAgent(e.to_string()))
     }
 
+    async fn guest_file(&self, id: Uuid, op: &GuestFileOp) -> Result<GuestFileAnswer, DriverError> {
+        let handle = self.running_handle(id)?;
+        let sock = agent_socket(&handle, id)?;
+        let GuestFileOp::Exec { path, args } = op else {
+            let (_agent, mut session) = file_session(&handle, id, &sock).await?;
+            return guest_file_once(&mut session, op).await;
+        };
+        // 띄울 때와 물을 때만 잠금을 쥔다(mv·mkdir는 금방 끝나지만 게스트가 느리면 몇 초 걸린다).
+        let pid = {
+            let (_agent, mut session) = file_session(&handle, id, &sock).await?;
+            match qga::exec(&mut session, path, args).await {
+                Ok(pid) => pid,
+                Err(e) if e.is_command() => {
+                    return Ok(GuestFileAnswer::Refused {
+                        message: e.to_string(),
+                    });
+                }
+                Err(e) => return Err(DriverError::GuestAgent(e.to_string())),
+            }
+        };
+        let deadline = tokio::time::Instant::now() + GUEST_EXEC_TIMEOUT;
+        let mut pause = Duration::from_millis(50);
+        loop {
+            tokio::time::sleep(pause).await;
+            pause = (pause * 2).min(Duration::from_secs(1));
+            let status = {
+                let (_agent, mut session) = file_session(&handle, id, &sock).await?;
+                qga::exec_status(&mut session, pid)
+                    .await
+                    .map_err(|e| DriverError::GuestAgent(e.to_string()))?
+            };
+            if status.exited {
+                let code = status.code.or(status.signal.map(|s| 128 + s)).unwrap_or(-1);
+                let mut stderr = String::from_utf8_lossy(&status.stderr).trim().to_string();
+                if stderr.len() > 1024 {
+                    let mut cut = 1024;
+                    while !stderr.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    stderr.truncate(cut);
+                }
+                return Ok(GuestFileAnswer::Exited { code, stderr });
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(DriverError::GuestAgent(format!(
+                    "{path} did not finish in the guest within {} s",
+                    GUEST_EXEC_TIMEOUT.as_secs()
+                )));
+            }
+        }
+    }
+
     async fn start_incoming(
         &self,
         vm: &VmRuntimeSpec,
@@ -2849,6 +2906,74 @@ async fn agent_lock(handle: &VmHandle) -> Option<tokio::sync::MutexGuard<'_, ()>
     tokio::time::timeout(AGENT_LOCK_WAIT, handle.agent.lock())
         .await
         .ok()
+}
+
+/// 파일 일 하나의 에이전트 잠금과 세션. 얼리기 창(녹이기 포함 25초쯤)이 끝나기를 기다릴 만큼 쥐어 본다 — 되돌려 쓰기
+/// Task가 그 창 때문에 실패하지 않게.
+async fn file_session<'a>(
+    handle: &'a VmHandle,
+    id: Uuid,
+    sock: &Path,
+) -> Result<(tokio::sync::MutexGuard<'a, ()>, Session), DriverError> {
+    let guard = tokio::time::timeout(GUEST_FILE_LOCK_WAIT, handle.agent.lock())
+        .await
+        .map_err(|_| agent_busy())?;
+    agent::thaw_left(id, &handle.paths).await;
+    let session = Session::connect(sock, qga::SYNC_TIMEOUT)
+        .await
+        .map_err(|e| DriverError::GuestAgent(e.to_string()))?;
+    Ok((guard, session))
+}
+
+/// `Exec`이 아닌 파일 일 하나(잠금을 쥔 세션으로). 에이전트가 오류로 답하면 `Refused`다.
+async fn guest_file_once(
+    session: &mut Session,
+    op: &GuestFileOp,
+) -> Result<GuestFileAnswer, DriverError> {
+    let answer = match op {
+        GuestFileOp::Caps => {
+            let commands = qga::supported_commands(session).await;
+            let commands = commands.map_err(|e| DriverError::GuestAgent(e.to_string()))?;
+            let os = match session
+                .execute("guest-get-osinfo", None, qga::AGENT_TIMEOUT)
+                .await
+            {
+                Ok(v) => guest_os_kind(v["id"].as_str(), true),
+                Err(e) if e.is_command() => guest_os_kind(None, false),
+                Err(e) => return Err(DriverError::GuestAgent(e.to_string())),
+            };
+            Ok(GuestFileAnswer::Caps {
+                caps: guest_restore_caps(os, &commands),
+            })
+        }
+        GuestFileOp::Exists { path } => match qga::file_open(session, path, "r").await {
+            Ok(h) => qga::file_close(session, h)
+                .await
+                .map(|()| GuestFileAnswer::Exists { exists: true }),
+            Err(e) if e.is_command() => Ok(GuestFileAnswer::Exists { exists: false }),
+            Err(e) => Err(e),
+        },
+        GuestFileOp::Open { path } => qga::file_open(session, path, "wb")
+            .await
+            .map(|handle| GuestFileAnswer::Opened { handle }),
+        GuestFileOp::Write { handle, data } => qga::file_write(session, *handle, data)
+            .await
+            .map(|count| GuestFileAnswer::Written { count }),
+        GuestFileOp::Close { handle } => {
+            let flushed = qga::file_flush(session, *handle).await;
+            // 비우기가 실패해도 핸들은 닫는다(에이전트 전역이라 남으면 새지 않게).
+            let closed = qga::file_close(session, *handle).await;
+            flushed.and(closed).map(|()| GuestFileAnswer::Closed)
+        }
+        GuestFileOp::Exec { .. } => unreachable!("exec is handled by guest_file"),
+    };
+    match answer {
+        Ok(a) => Ok(a),
+        Err(e) if e.is_command() => Ok(GuestFileAnswer::Refused {
+            message: e.to_string(),
+        }),
+        Err(e) => Err(DriverError::GuestAgent(e.to_string())),
+    }
 }
 
 fn agent_busy() -> DriverError {
@@ -10444,6 +10569,94 @@ time.sleep(60)
         assert!(handle.agent.try_lock().is_ok());
         assert!(!mark.exists());
         assert_eq!(thaws.load(Ordering::SeqCst), 3);
+    }
+
+    /// 파일 일은 일마다 잠금을 쥐고 놓는다: 쓰기 사이에 다른 에이전트 일(정보 수집)이 끼어들 수 있다. 에이전트가 오류로
+    /// 답한 일은 `Refused`, exec은 끝날 때까지 상태를 묻는다.
+    #[tokio::test]
+    async fn guest_file_ops_take_the_agent_lock_one_at_a_time() {
+        let tmp = short_tempdir();
+        let (hv, id, _fake, _qemu) = running_vm(tmp.path()).await;
+        let sock = hv.paths(id).unwrap().qga_socket;
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let polled = polls.clone();
+        let seen = fake_agent(&sock, move |cmd| match cmd {
+            "guest-info" => Some(json!({ "return": { "version": "10", "supported_commands": [
+                { "name": "guest-file-open", "enabled": true }, { "name": "guest-file-write", "enabled": true },
+                { "name": "guest-file-flush", "enabled": true }, { "name": "guest-file-close", "enabled": true },
+                { "name": "guest-exec", "enabled": false }, { "name": "guest-exec-status", "enabled": true }
+            ] } })),
+            "guest-get-osinfo" => Some(json!({ "return": { "id": "mswindows" } })),
+            "guest-file-open" => Some(json!({ "return": 7 })),
+            "guest-file-write" => Some(json!({ "return": { "count": 3 } })),
+            "guest-file-flush" => {
+                Some(json!({ "error": { "class": "GenericError", "desc": "disk full" } }))
+            }
+            "guest-file-close" => Some(json!({ "return": {} })),
+            "guest-exec" => Some(json!({ "return": { "pid": 9 } })),
+            "guest-exec-status" => {
+                let n = polled.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(json!({ "return": { "exited": n >= 2, "exitcode": 0 } }))
+            }
+            _ => Some(json!({ "error": { "class": "CommandNotFound", "desc": "no" } })),
+        });
+        let caps = hv.guest_file(id, &GuestFileOp::Caps).await.unwrap();
+        let GuestFileAnswer::Caps { caps } = caps else {
+            panic!("{caps:?}")
+        };
+        assert_eq!(caps.os, opl_types::file_restore::GuestOsKind::Windows);
+        assert!(caps.file_write && !caps.exec);
+        let exists = GuestFileOp::Exists {
+            path: "C:\\a".into(),
+        };
+        assert_eq!(
+            hv.guest_file(id, &exists).await.unwrap(),
+            GuestFileAnswer::Exists { exists: true }
+        );
+        let open = GuestFileOp::Open {
+            path: "C:\\a".into(),
+        };
+        assert_eq!(
+            hv.guest_file(id, &open).await.unwrap(),
+            GuestFileAnswer::Opened { handle: 7 }
+        );
+        let handle = hv.handle(id).unwrap();
+        for _ in 0..2 {
+            let write = GuestFileOp::Write {
+                handle: 7,
+                data: "YWJj".into(),
+            };
+            assert_eq!(
+                hv.guest_file(id, &write).await.unwrap(),
+                GuestFileAnswer::Written { count: 3 }
+            );
+            // 쓰기 사이에는 잠금이 풀려 있다.
+            assert!(handle.agent.try_lock().is_ok());
+        }
+        let closed = hv
+            .guest_file(id, &GuestFileOp::Close { handle: 7 })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&closed, GuestFileAnswer::Refused { message } if message.contains("disk full")),
+            "{closed:?}"
+        );
+        let exec = GuestFileOp::Exec {
+            path: "/bin/true".into(),
+            args: vec![],
+        };
+        assert_eq!(
+            hv.guest_file(id, &exec).await.unwrap(),
+            GuestFileAnswer::Exited {
+                code: 0,
+                stderr: String::new()
+            }
+        );
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        let log = seen.lock().unwrap().clone();
+        // 닫기는 비우기가 실패해도 핸들을 닫는다.
+        let close_at = log.iter().position(|c| c == "guest-file-flush").unwrap();
+        assert_eq!(log[close_at + 1], "guest-file-close");
     }
 
     #[tokio::test]

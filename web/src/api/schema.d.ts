@@ -1362,6 +1362,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/file-restore/sessions/{id}/restore-to-vm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 게스트로 되돌려 쓰기(설계 §12): 세션의 볼륨에서 고른 항목을 실행 중인 VM의 게스트 에이전트로 `target_dir` 아래에 쓰는
+         *     Task `file-restore-to-guest`를 만든다(202 — 대상은 VM, 세션 노드에서 돈다). 세션의 권한(위 경로들과 같음)에 더해 대상 VM의
+         *     `vm.config`가 든다. 항목은 1~1000개, 대상 디렉터리는 절대 경로(Linux `/…`, Windows `C:\\…`)여야 하고(400
+         *     `invalid_target_dir`), VM이 돌지 않으면 409 `vm_not_running`, 채널이 없거나 에이전트가 답하지 않으면 409
+         *     `guest_agent_unavailable`, 에이전트가 `guest-file-*`를 막으면 409 `guest_agent_restricted`(RHEL·Rocky 기본), `guest-exec`가
+         *     막혔는데 디렉터리를 고르면 400 `guest_mkdir_unavailable`, `overwrite`를 고르면 400 `guest_overwrite_unavailable`이다.
+         *     소유자·모드·시각은 되돌리지 않는다(Task 경고 — 권한까지는 tar.gz 내려받기).
+         */
+        post: operations["restore_to_vm"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/file-restore/sessions/{id}/volumes/{volume}/entries": {
         parameters: {
             query?: never;
@@ -3773,6 +3798,29 @@ export interface paths {
          *     `guest_agent_unavailable`, VM이 도는 노드가 답하지 않으면 503 `node_unreachable`이다.
          */
         post: operations["set_guest_password"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vms/{key}/guest/restore-caps": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * VM의 게스트 에이전트가 파일 되돌려 쓰기(계획 69 §12)에 허락하는 것: OS 갈래, 파일 쓰기(`guest-file-*`), 디렉터리
+         *     만들기·덮어쓰기(`guest-exec`), 못 하는 까닭(RHEL·Rocky 에이전트는 기본으로 막는다). 웹은 "VM으로 복원" 대화상자를 열 때
+         *     미리 보인다. 모든 노드가 `file-restore`를 알아야 하고(409 `cluster_upgrading`), VM이 돌지 않으면 409 `vm_not_running`,
+         *     채널이 없거나 에이전트가 답하지 않으면 409 `guest_agent_unavailable`, VM이 도는 노드가 답하지 않으면 503
+         *     `node_unreachable`이다.
+         */
+        get: operations["restore_caps"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -6892,6 +6940,11 @@ export interface components {
             name?: string;
             version?: string;
         };
+        /**
+         * @description 게스트 OS 갈래(되돌려 쓸 경로 규칙)
+         * @enum {string}
+         */
+        GuestOsKind: "linux" | "windows" | "other";
         /** @description 게스트 사용자 비밀번호 설정 */
         GuestPasswordRequest: {
             /**
@@ -6905,6 +6958,16 @@ export interface components {
         /** @description 비밀번호를 설정한 사용자 */
         GuestPasswordResponse: {
             user: string;
+        };
+        /** @description 대상 VM의 게스트 에이전트가 허락하는 것(`guest-info.supported_commands`) */
+        GuestRestoreCaps: {
+            /** @description `guest-exec`·`guest-exec-status`(디렉터리 만들기·덮어쓰기) */
+            exec: boolean;
+            /** @description `guest-file-open`·`guest-file-write`·`guest-file-close` */
+            file_write: boolean;
+            os: components["schemas"]["GuestOsKind"];
+            /** @description 못 하는 까닭(예: RHEL 에이전트의 기본 막힘) */
+            reason?: string;
         };
         /** @description 게스트 에이전트(QGA) 감시: 한 번 답한 에이전트가 `timeout_secs` 동안 답하지 않으면 VM을 강제로 다시 켠다. */
         GuestWatch: {
@@ -12575,6 +12638,19 @@ export interface components {
             /** @description 새 디스크를 둘 풀 */
             pool: string;
         };
+        /** @description 게스트로 되돌려 쓰기 요청(`POST /file-restore/sessions/{id}/restore-to-vm`) */
+        RestoreToVmRequest: {
+            /** @description 같은 이름이 있을 때(기본 `keep`) */
+            conflict?: components["schemas"]["GuestConflict"];
+            /** @description 되돌려 쓸 항목(1~1000개, 같은 볼륨) */
+            paths: components["schemas"]["EntryPath"][];
+            /** @description 게스트 안 대상 디렉터리(Linux `/srv/restored`, Windows `C:\\restored`). 고른 항목의 이름이 그 아래에 놓인다. */
+            target_dir: string;
+            /** @description 대상 VM(id나 이름) — 실행 중이고 게스트 에이전트 채널이 있어야 한다 */
+            vm: string;
+            /** @description 세션의 볼륨 id */
+            volume: string;
+        };
         /** @enum {string} */
         Role: "admin" | "operator" | "viewer" | "none";
         /** @description 전역 역할이 있는 사용자 */
@@ -17811,6 +17887,48 @@ export interface operations {
                 };
             };
             "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    restore_to_vm: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreToVmRequest"];
+            };
+        };
+        responses: {
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -23424,6 +23542,44 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["GuestPasswordResponse"];
+                };
+            };
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    restore_caps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GuestRestoreCaps"];
                 };
             };
             503: {

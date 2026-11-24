@@ -2,8 +2,14 @@
 //! 백업(매니페스트와 빈 디스크 파일 — 가짜 하이퍼바이저의 도우미는 파일을 읽지 않는다).
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+
+use async_trait::async_trait;
+use opl_driver::{DriverError, Hypervisor, MockHypervisor};
+use opl_peer::{GuestAgentError, GuestAgentSource};
+use opl_types::file_restore::{GuestFileAnswer, GuestFileOp};
+use opl_types::guest::{GuestInfoResponse, GuestInfoState};
 
 use opl_api::FileRestoreSessions;
 use opl_cluster::Cluster;
@@ -161,4 +167,31 @@ pub async fn pool_backup(
         .await
         .unwrap();
     cluster.get::<BackupSpec>(backup.id).unwrap().unwrap()
+}
+
+/// 가짜 하이퍼바이저의 게스트 에이전트(파일 일만 — opld의 게스트 정보 캐시 대신). 하이퍼바이저는 `Env`가 뜬 뒤 넣는다.
+#[derive(Default)]
+pub struct HvGuest(pub OnceLock<Arc<MockHypervisor>>);
+
+#[async_trait]
+impl GuestAgentSource for HvGuest {
+    async fn info(&self, _vm: Uuid, _refresh: bool) -> GuestInfoResponse {
+        GuestInfoResponse {
+            state: GuestInfoState::NoAgent,
+            info: None,
+        }
+    }
+
+    async fn set_password(&self, _vm: Uuid, _u: &str, _p: &str) -> Result<(), GuestAgentError> {
+        Err(GuestAgentError::Unsupported)
+    }
+
+    async fn file(&self, vm: Uuid, op: GuestFileOp) -> Result<GuestFileAnswer, GuestAgentError> {
+        let hv = self.0.get().ok_or(GuestAgentError::Unsupported)?;
+        hv.guest_file(vm, &op).await.map_err(|e| match e {
+            DriverError::NotRunning(_) => GuestAgentError::NotRunning,
+            DriverError::InvalidSpec(_) => GuestAgentError::NoAgent,
+            e => GuestAgentError::Unavailable(e.to_string()),
+        })
+    }
 }

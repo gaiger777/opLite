@@ -373,6 +373,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(numa::get_vm_numa))
         .routes(routes!(guest::get_guest))
         .routes(routes!(guest::set_guest_password))
+        .routes(routes!(guest::restore_caps))
         .routes(routes!(metrics::get_vm_metrics))
         .routes(routes!(metrics_history::get_vm_history))
         .routes(routes!(snapshots::list_snapshots))
@@ -406,6 +407,7 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(file_restore::stat_entry))
         .routes(routes!(file_restore::download_link))
         .routes(routes!(file_restore::download))
+        .routes(routes!(file_restore::restore_to_vm))
         .routes(routes!(vms::cancel_live_restore))
         .routes(routes!(
             backup_stores::list_stores,

@@ -41,13 +41,15 @@ use opl_types::authz::Privilege;
 use opl_types::backup::{Backup, BackupPhase, BackupSpec};
 use opl_types::file_restore::{
     DownloadFormat, DownloadLink, DownloadLinkRequest, EntryPath, EntryView, FileRestoreOpened,
-    FileRestoreSessionView, ListPage, MAX_DOWNLOAD_NAME, MAX_DOWNLOAD_PATHS, MAX_PAGE_ENTRIES,
-    PathPart, SessionNodeCandidate, SessionPhase, VolumeState, VolumeView, choose_session_node,
-    content_disposition, valid_volume_id,
+    FileRestoreSessionView, GuestConflict, GuestDir, ListPage, MAX_DOWNLOAD_NAME,
+    MAX_DOWNLOAD_PATHS, MAX_PAGE_ENTRIES, PathPart, RestoreToVmRequest, SessionNodeCandidate,
+    SessionPhase, VolumeState, VolumeView, choose_session_node, content_disposition,
+    valid_volume_id,
 };
 use opl_types::node::{FILE_RESTORE, NodeSpec};
 use opl_types::storage::{StoragePoolSpec, pool_usable_on};
 use opl_types::task::{Task, TaskOp, TaskSpec, TaskState};
+use opl_types::vm::VmSpec;
 use serde::Deserialize;
 use tokio::sync::{mpsc, watch};
 use utoipa::IntoParams;
@@ -379,6 +381,13 @@ impl Session {
         }
     }
 
+    /// 게스트로 되돌려 쓰기 Task가 쓸 채널(계획 69 §12): 볼륨을 붙이고 채널을 돌려준다. Task는 걷는 동안 [`Busy`]를 쥔다.
+    pub(crate) async fn helper_for(&self, volume: &str) -> Result<HelperClient, ApiError> {
+        let client = self.client()?;
+        self.ensure_mounted(&client, volume).await?;
+        Ok(client)
+    }
+
     /// 쓸 수 있는 채널(부팅 중이면 409 `session_not_ready`, 끝났으면 409 `session_closed`)
     fn client(&self) -> Result<HelperClient, ApiError> {
         let st = self.state.lock().unwrap();
@@ -607,11 +616,11 @@ impl Session {
     }
 }
 
-/// 도는 내려받기 하나(유휴가 아님). 버리면 마지막 사용 시각을 지금으로 둔다.
-struct Busy(Arc<Session>);
+/// 도는 내려받기·되돌려 쓰기 하나(유휴가 아님). 버리면 마지막 사용 시각을 지금으로 둔다.
+pub(crate) struct Busy(Arc<Session>);
 
 impl Busy {
-    fn new(session: Arc<Session>) -> Self {
+    pub(crate) fn new(session: Arc<Session>) -> Self {
         session.busy.fetch_add(1, Ordering::Relaxed);
         session.touch();
         Busy(session)
@@ -800,7 +809,7 @@ fn volume_not_found(id: &str) -> ApiError {
 }
 
 /// 도우미 오류 → API 오류(설계 §14)
-fn helper_error(volume: &str, e: HelperError) -> ApiError {
+pub(crate) fn helper_error(volume: &str, e: HelperError) -> ApiError {
     match e {
         HelperError::Agent(a) => match a.code {
             ErrorCode::NotFound => ApiError::not_found(format!("entry not found: {}", a.message))
@@ -1176,6 +1185,26 @@ pub(crate) async fn close_session(
     call(state, task, user, op, INFO_TIMEOUT).await.map(|_| ())
 }
 
+/// 노드 `node`에서 열린 세션을 모두 닫는다(노드 비우기 — 설계 §13; 비우는 노드에는 새 세션을 열지 않는다). 닫기를 보낸
+/// 수다. 세션 노드가 답하지 않으면 건너뛴다(그 세션은 유휴·최대 시간으로 닫힌다).
+pub(crate) async fn close_node_sessions(state: &AppState, node: Uuid, reason: &str) -> usize {
+    let Ok(tasks) = session_tasks(state) else {
+        return 0;
+    };
+    let mut closed = 0;
+    for task in tasks
+        .iter()
+        .filter(|t| t.spec.node == node && !t.status.state.is_finished())
+    {
+        match close_session(state, task, Uuid::nil(), reason).await {
+            Ok(()) => closed += 1,
+            Err(e) => tracing::warn!(session = %task.spec.target, error = %e.message,
+                "cannot close a file restore session on a draining node"),
+        }
+    }
+    closed
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // 세션 노드 고르기(§10.2)
 // ---------------------------------------------------------------------------------------------------------------
@@ -1220,7 +1249,8 @@ fn choose_node(state: &AppState, backup: &Backup) -> Result<Uuid, ApiError> {
         .map(|n| SessionNodeCandidate {
             id: n.id,
             name: &n.name,
-            online: n.status.online && !n.spec.witness,
+            // 비우는(유지보수) 노드에는 열지 않는다(비우기가 그 노드의 세션을 닫는다).
+            online: n.status.online && !n.spec.witness && !n.spec.maintenance,
             reads_backup: reads(n),
             file_restore: n.status.file_restore.as_ref(),
         })
@@ -1608,6 +1638,128 @@ pub async fn download(
     }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(resp)
+}
+
+/// 게스트로 되돌려 쓰기(설계 §12): 세션의 볼륨에서 고른 항목을 실행 중인 VM의 게스트 에이전트로 `target_dir` 아래에 쓰는
+/// Task `file-restore-to-guest`를 만든다(202 — 대상은 VM, 세션 노드에서 돈다). 세션의 권한(위 경로들과 같음)에 더해 대상 VM의
+/// `vm.config`가 든다. 항목은 1~1000개, 대상 디렉터리는 절대 경로(Linux `/…`, Windows `C:\\…`)여야 하고(400
+/// `invalid_target_dir`), VM이 돌지 않으면 409 `vm_not_running`, 채널이 없거나 에이전트가 답하지 않으면 409
+/// `guest_agent_unavailable`, 에이전트가 `guest-file-*`를 막으면 409 `guest_agent_restricted`(RHEL·Rocky 기본), `guest-exec`가
+/// 막혔는데 디렉터리를 고르면 400 `guest_mkdir_unavailable`, `overwrite`를 고르면 400 `guest_overwrite_unavailable`이다.
+/// 소유자·모드·시각은 되돌리지 않는다(Task 경고 — 권한까지는 tar.gz 내려받기).
+#[utoipa::path(post, path = "/file-restore/sessions/{id}/restore-to-vm", tag = "file-restore",
+    params(("id" = Uuid, Path, description = "session id")),
+    request_body = RestoreToVmRequest,
+    responses((status = 202, body = opl_types::resource::Resource<TaskSpec, opl_types::task::TaskStatus>),
+        (status = "4XX", body = crate::error::ErrorBody), (status = "5XX", body = crate::error::ErrorBody)))]
+pub async fn restore_to_vm(
+    State(state): State<Arc<AppState>>,
+    principal: Principal,
+    audit: AuditNote,
+    Path(id): Path<Uuid>,
+    Json(req): Json<RestoreToVmRequest>,
+) -> Result<(StatusCode, Json<Task>), ApiError> {
+    let session = find_session(&state, &principal, id)?;
+    if session.status.state.is_finished() {
+        return Err(session_closed(session.status.error.as_deref()));
+    }
+    check_volume(&req.volume)?;
+    if req.paths.is_empty() || req.paths.len() > MAX_DOWNLOAD_PATHS {
+        return Err(invalid_path(format!(
+            "choose between 1 and {MAX_DOWNLOAD_PATHS} entries"
+        )));
+    }
+    let found = resolve(&state.cluster, Obj::Vm, &req.vm)?
+        .ok_or_else(|| ApiError::not_found(format!("vm {:?} not found", req.vm)))?;
+    state
+        .authz
+        .require(&principal, Privilege::VmConfig, &found)?;
+    let vm = lookup::<VmSpec>(&state.cluster, &req.vm)?;
+    let (_, caps) = crate::guest::vm_restore_caps(&state, &vm).await?;
+    if !caps.file_write {
+        return Err(ApiError::conflict(
+            "guest_agent_restricted",
+            format!(
+                "files cannot be restored into VM {:?}: {}",
+                vm.name,
+                caps.reason
+                    .as_deref()
+                    .unwrap_or("the guest agent blocks guest-file-*")
+            ),
+        ));
+    }
+    GuestDir::parse(caps.os, &req.target_dir).map_err(|e| {
+        ApiError::bad_request(format!("invalid target directory: {e}"))
+            .with_code("invalid_target_dir")
+    })?;
+    if !caps.exec {
+        if req.conflict == GuestConflict::Overwrite {
+            return Err(ApiError::bad_request(format!(
+                "overwrite needs guest-exec, which the guest agent of VM {:?} blocks; choose keep or skip",
+                vm.name
+            ))
+            .with_code("guest_overwrite_unavailable"));
+        }
+        // 디렉터리를 만들 수 없다: 고른 항목이 모두 일반 파일이어야 한다.
+        for path in &req.paths {
+            let dir = path.is_root()
+                || match open_call(
+                    &state,
+                    &session,
+                    principal.user,
+                    FileRestoreOp::Stat {
+                        volume: req.volume.clone(),
+                        path: path.clone(),
+                    },
+                )
+                .await?
+                {
+                    FileRestoreAnswer::Entry(e) => {
+                        e.kind != opl_types::file_restore::EntryKind::File
+                    }
+                    _ => true,
+                };
+            if dir {
+                return Err(ApiError::bad_request(format!(
+                    "{} is not a regular file, and directories need guest-exec, which the guest agent of VM {:?} blocks",
+                    path.display(),
+                    vm.name
+                ))
+                .with_code("guest_mkdir_unavailable"));
+            }
+        }
+    }
+    let backup_name = raft_view(&state, &session).backup_name;
+    audit.detail(format!(
+        "backup file-restore to-vm {} → vm {}:{} ({})",
+        describe(&backup_name, &req.volume, &req.paths),
+        audit_text(&vm.name),
+        audit_text(&req.target_dir),
+        conflict_name(req.conflict),
+    ));
+    let task = create_task(
+        &state.cluster,
+        TaskOp::FileRestoreToGuest {
+            session: id,
+            backup: backup_of(&session),
+            volume: req.volume,
+            paths: req.paths,
+            target_dir: req.target_dir,
+            conflict: req.conflict,
+        },
+        vm.id,
+        session.spec.node,
+    )
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(task)))
+}
+
+fn conflict_name(c: GuestConflict) -> &'static str {
+    match c {
+        GuestConflict::Keep => "keep",
+        GuestConflict::Skip => "skip",
+        GuestConflict::Overwrite => "overwrite",
+    }
 }
 
 /// 내려받기 흐름이 끝날 때(끊겨도) 적는 감사 항목

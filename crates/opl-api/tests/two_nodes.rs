@@ -135,13 +135,14 @@ impl Node {
                 .unwrap()
                 .with_forwarder(peers.clone()),
         );
+        let hv = Arc::new(MockHypervisor::default());
         Node {
             id,
             name: name.into(),
             addr,
             cluster,
             peers,
-            hv: Arc::new(MockHypervisor::default()),
+            hv: hv.clone(),
             storage: Arc::new(FakeStorage::default()),
             tls,
             listener: Some(listener),
@@ -162,6 +163,7 @@ impl Node {
             guest: Arc::new(NodeGuest {
                 hostname: format!("{name}-guest"),
                 passwords: Default::default(),
+                hv,
             }),
             file_sessions: {
                 let dir = root.path().join(format!("{id}-fr"));
@@ -2325,6 +2327,8 @@ async fn a_node_with_the_audit_log_off_is_disabled_not_unreachable() {
 struct NodeGuest {
     hostname: String,
     passwords: std::sync::Mutex<Vec<(String, String)>>,
+    /// 파일 일(계획 69)은 이 노드의 가짜 하이퍼바이저로
+    hv: Arc<MockHypervisor>,
 }
 
 #[async_trait::async_trait]
@@ -2350,6 +2354,18 @@ impl opl_peer::GuestAgentSource for NodeGuest {
             .unwrap()
             .push((user.into(), password.into()));
         Ok(())
+    }
+
+    async fn file(
+        &self,
+        vm: Uuid,
+        op: opl_types::file_restore::GuestFileOp,
+    ) -> Result<opl_types::file_restore::GuestFileAnswer, opl_peer::GuestAgentError> {
+        use opl_driver::Hypervisor;
+        self.hv
+            .guest_file(vm, &op)
+            .await
+            .map_err(|e| opl_peer::GuestAgentError::Unavailable(e.to_string()))
     }
 }
 
@@ -3586,4 +3602,59 @@ async fn file_restore_sessions_on_another_node_are_reached_through_any_api() {
     }
     assert_eq!(b.hv.restore_launches().len(), 1);
     assert!(a.hv.restore_launches().is_empty());
+}
+
+/// 게스트로 되돌려 쓰기(계획 69 §12.2 4): 세션은 B(이미지가 있는 노드)에, VM은 A에서 돈다 — B의 Task가 파일 일마다
+/// 노드 사이 RPC `GuestAgent`의 `File` 갈래로 A의 에이전트에 쓴다.
+#[tokio::test]
+async fn files_are_restored_into_a_guest_on_another_node() {
+    use common::file_restore::{backup_pool, pool_backup, report, reported};
+    use serde_json::{Value, json};
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    report(&a.cluster, b.id, Some(reported(0, 4))).await;
+    backup_pool(&a.cluster, root.path(), "bk", vec![b.id]).await;
+    mark_pool_ready(&a.cluster, b.id, "bk").await;
+    pool_backup(&a.cluster, root.path(), "bk", "web-1", Some(b.id)).await;
+    let mut req = vm_request("web");
+    req["spec"]["node"] = json!(a.id);
+    req["spec"]["guest_agent"] = json!({});
+    let (status, body) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let vm: Uuid = body["id"].as_str().unwrap().parse().unwrap();
+    a.hv.set_guest_agent(vm, opl_driver::GuestAnswer::Ok);
+    a.hv.set_guest_fs(vm, opl_driver::MockGuestFs::linux(&["/srv"]));
+    let task = admin.act("web", "start").await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+
+    let (status, body) = admin.post("/backups/web-1/file-restore", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let id = body["session"]["id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, s) = admin.get(&format!("/file-restore/sessions/{id}")).await;
+        if s["phase"] == "ready" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{s}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let (status, caps) = admin.get("/vms/web/guest/restore-caps").await;
+    assert_eq!(status, StatusCode::OK, "{caps}");
+    assert_eq!(caps["exec"], true, "{caps}");
+    let (status, task) = admin
+        .post(
+            &format!("/file-restore/sessions/{id}/restore-to-vm"),
+            json!({ "volume": "disk0p1", "paths": ["/etc", "/var/log/app.log"], "vm": "web",
+                "target_dir": "/srv/r" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    assert_eq!(task["spec"]["node"], b.id.to_string());
+    let task = admin.wait_task(&task).await;
+    assert_eq!(task["status"]["state"], "succeeded", "{task}");
+    let g = a.hv.guest_fs(vm).unwrap();
+    assert_eq!(g.files["/srv/r/etc/hostname"], b"web-01\n");
+    assert_eq!(g.files["/srv/r/app.log"].len(), 3 << 20);
+    assert!(b.hv.guest_fs(vm).is_none());
 }

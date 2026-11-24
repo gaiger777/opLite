@@ -52,6 +52,26 @@ pub(crate) enum FilesCmd {
         #[arg(long, value_enum, default_value_t = FormatArg::Auto)]
         format: FormatArg,
     },
+    /// 실행 중인 VM 안으로 되돌려 쓴다(게스트 에이전트 `guest-file-*` — 디렉터리·덮어쓰기는 `guest-exec`도). 소유자·모드·
+    /// 시각은 되돌리지 않는다.
+    Restore {
+        backup: String,
+        /// 같은 볼륨의 `VOLUME:/path`(여러 개)
+        #[arg(value_name = "VOLUME:/PATH", required = true)]
+        paths: Vec<String>,
+        /// 대상 VM(실행 중, 게스트 에이전트 채널)
+        #[arg(long)]
+        vm: String,
+        /// 게스트 안 대상 디렉터리(Linux `/srv/restored`, Windows `C:\restored`)
+        #[arg(long = "to", value_name = "DIR")]
+        to: String,
+        /// 같은 이름이 있을 때: keep(`.restored-…`로 새 이름), skip, overwrite(임시 파일에 다 쓴 뒤 바꿔 넣음)
+        #[arg(long, value_enum, default_value_t = ConflictArg::Keep)]
+        conflict: ConflictArg,
+        /// Task가 끝날 때까지 기다린다.
+        #[arg(long)]
+        wait: bool,
+    },
     /// 열린 세션(자기 것, `--all`이면 모두 — admin)
     Sessions {
         #[arg(long)]
@@ -83,6 +103,26 @@ impl FormatArg {
         }
     }
 }
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum ConflictArg {
+    Keep,
+    Skip,
+    Overwrite,
+}
+
+impl ConflictArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            ConflictArg::Keep => "keep",
+            ConflictArg::Skip => "skip",
+            ConflictArg::Overwrite => "overwrite",
+        }
+    }
+}
+
+/// 되돌려 쓰기 Task를 기다리는 한도(4 GiB를 TCG 게스트에 쓰는 시간까지)
+const RESTORE_WAIT: Duration = Duration::from_secs(6 * 3600);
 
 const VOLUME_HEADERS: &[&str] = &[
     "VOLUME", "DISK", "KIND", "FS", "LABEL", "SIZE", "STATE", "NOTE",
@@ -160,20 +200,7 @@ pub(crate) async fn files(
             out_file,
             format,
         } => {
-            let mut volume = None;
-            let mut picked = Vec::new();
-            for p in &paths {
-                let (v, path) = split_path(p)?;
-                if volume.as_ref().is_some_and(|x| *x != v) {
-                    bail!(
-                        "all paths must be on the same volume ({} and {v})",
-                        volume.unwrap_or_default()
-                    );
-                }
-                volume = Some(v);
-                picked.push(path);
-            }
-            let volume = volume.unwrap_or_default();
+            let (volume, picked) = same_volume(&paths)?;
             let session = ensure(client, &backup, err).await?;
             let id = cell(&session["id"]);
             let link = client
@@ -184,6 +211,46 @@ pub(crate) async fn files(
                 .await?;
             let url = link["url"].as_str().context("no download url")?;
             download(client, url, out_file.as_deref(), out, err).await?;
+        }
+        FilesCmd::Restore {
+            backup,
+            paths,
+            vm,
+            to,
+            conflict,
+            wait,
+        } => {
+            let (volume, picked) = same_volume(&paths)?;
+            let session = ensure(client, &backup, err).await?;
+            let id = cell(&session["id"]);
+            let task = client
+                .post(
+                    &format!("/file-restore/sessions/{}/restore-to-vm", seg(&id)),
+                    &json!({
+                        "volume": volume, "paths": picked, "vm": vm, "target_dir": to,
+                        "conflict": conflict.as_str(),
+                    }),
+                )
+                .await?;
+            if !wait {
+                if json_out {
+                    return Ok(print_json(out, &task)?);
+                }
+                writeln!(
+                    out,
+                    "restoring into vm {vm}:{to} (task {})",
+                    cell(&task["id"])
+                )?;
+                return Ok(());
+            }
+            let done = client.wait_task_for(&task, RESTORE_WAIT).await?;
+            if json_out {
+                return Ok(print_json(out, &done)?);
+            }
+            match done["status"]["error"].as_str() {
+                Some(summary) => writeln!(out, "{summary}")?,
+                None => writeln!(out, "restored into vm {vm}:{to}")?,
+            }
         }
         FilesCmd::Sessions { all } => {
             let mut r = client.request(Method::GET, "/file-restore/sessions");
@@ -298,6 +365,23 @@ async fn ensure(
         return Ok(session);
     }
     wait_ready(client, &session, err).await
+}
+
+/// 여러 `VOLUME:/path` → (볼륨, 경로들). 볼륨이 다르면 오류
+fn same_volume(paths: &[String]) -> anyhow::Result<(String, Vec<String>)> {
+    let mut volume: Option<String> = None;
+    let mut picked = Vec::new();
+    for p in paths {
+        let (v, path) = split_path(p)?;
+        if let Some(x) = &volume
+            && *x != v
+        {
+            bail!("all paths must be on the same volume ({x} and {v})");
+        }
+        volume = Some(v);
+        picked.push(path);
+    }
+    Ok((volume.unwrap_or_default(), picked))
 }
 
 /// `VOLUME:/path` → (볼륨, 경로). 볼륨만이면 루트
@@ -574,6 +658,68 @@ mod tests {
                 .any(|l| l.contains("/volumes/disk0p1/entries?path=%2Fetc&limit=1000&cursor=c1")),
             "{lines:?}"
         );
+    }
+
+    /// `restore`는 세션을 열거나 다시 쓰고 `restore-to-vm`에 경로·VM·대상·충돌 정책을 보낸 뒤 `--wait`이면 Task 결과를 보인다.
+    #[tokio::test]
+    async fn restore_sends_the_request_and_waits_for_the_task() {
+        let (client, seen) = fake_api(|method, path| match (method, path) {
+            ("POST", "/api/v1/backups/web-1/file-restore") => {
+                (200, json!({ "session": session("ready"), "task": "t" }))
+            }
+            ("POST", p) if p.ends_with("/restore-to-vm") => (
+                202,
+                json!({ "id": "t2", "status": { "state": "pending" } }),
+            ),
+            ("GET", "/api/v1/tasks/t2") => (
+                200,
+                json!({ "id": "t2", "status": { "state": "succeeded",
+                    "error": "restored 2 file(s) (10 bytes) and 0 directories into VM web:/srv" } }),
+            ),
+            _ => (404, json!({ "code": "not_found", "message": "no" })),
+        })
+        .await;
+        let cmd = FilesCmd::Restore {
+            backup: "web-1".into(),
+            paths: vec!["disk0p1:/etc/hosts".into(), "disk0p1:/etc/hostname".into()],
+            vm: "web".into(),
+            to: "/srv".into(),
+            conflict: ConflictArg::Overwrite,
+            wait: true,
+        };
+        let mut out = Vec::new();
+        files(&client, cmd, false, &mut out, &mut Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "restored 2 file(s) (10 bytes) and 0 directories into VM web:/srv\n"
+        );
+        let body = {
+            let seen = seen.lock().unwrap();
+            seen.iter()
+                .find(|s| s.line.contains("/restore-to-vm"))
+                .unwrap()
+                .body
+                .clone()
+        };
+        assert_eq!(
+            body,
+            json!({ "volume": "disk0p1", "paths": ["/etc/hosts", "/etc/hostname"], "vm": "web",
+                "target_dir": "/srv", "conflict": "overwrite" })
+        );
+        let bad = FilesCmd::Restore {
+            backup: "web-1".into(),
+            paths: vec!["disk0p1:/a".into(), "disk1:/b".into()],
+            vm: "web".into(),
+            to: "/srv".into(),
+            conflict: ConflictArg::Keep,
+            wait: false,
+        };
+        let err = files(&client, bad, false, &mut Vec::new(), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("same volume"), "{err}");
     }
 
     #[tokio::test]

@@ -6,6 +6,8 @@
   assemble --arch A --sysroot S --release R --agent F --image-version V --tree T --cpio C
                                               initramfs 트리(T)와 그 cpio newc(C, 소유자 0·시각 0·차례 inode)
   manifest --arch A --release R --image-version V --proto N --dir D
+  assemble-test-guest --arch A --sysroot S --release R --tree T --cpio C
+                                              파일 복원 E2E (5)의 시험 게스트 initramfs(qemu-ga + busybox + /init 스크립트)
 
 assemble은 ELF `NEEDED`를 따라 sysroot에서 공유 라이브러리를 모으고(없으면 이름을 알리고 실패), 커널 모듈은
 `.modinfo`의 `depends=`·`softdep=pre:`를 따라 모아(depmod 없이) 의존이 먼저 오는 `modules.order`를 만든다. 모듈은 풀어
@@ -493,6 +495,77 @@ def cmd_assemble(args):
     write_cpio(tree, args.cpio)
 
 
+# --- 시험 게스트(build.sh --test-guest) ---------------------------------------------------------------
+
+# busybox 애플릿: /init과 되돌려 쓰기가 부르는 것(`guest-exec`의 /bin/mkdir·/bin/mv·/bin/rm)
+TEST_GUEST_APPLETS = [
+    "sh", "mount", "umount", "mkdir", "mv", "rm", "cat", "ls", "sleep", "sync", "insmod", "uname", "poweroff",
+]
+
+TEST_GUEST_INIT = """\
+#!/bin/sh
+# orbivisor 시험 게스트(계획 69 파일 복원 E2E (5)): 모듈을 올리고 첫 virtio 디스크(/dev/vda, ext4)를 /target에 붙인 뒤
+# qemu-ga를 PID 1로 띄운다. 1초마다 sync — 시험이 VM을 강제로 꺼도 되돌려 쓴 파일이 디스크에 남는다.
+export PATH=/bin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+rel=$(uname -r)
+while read -r m; do
+\tinsmod "/lib/modules/$rel/$m" 2>/dev/null
+done <"/lib/modules/$rel/modules.order"
+port=""
+i=0
+while [ -z "$port" ] && [ "$i" -lt 60 ]; do
+\tfor p in /sys/class/virtio-ports/*; do
+\t\tif [ -f "$p/name" ] && [ "$(cat "$p/name")" = org.qemu.guest_agent.0 ]; then
+\t\t\tport="/dev/${p##*/}"
+\t\tfi
+\tdone
+\t[ -n "$port" ] || { sleep 1; i=$((i + 1)); }
+done
+i=0
+while [ ! -b /dev/vda ] && [ "$i" -lt 60 ]; do
+\tsleep 1
+\ti=$((i + 1))
+done
+mkdir -p /target
+mount -t ext4 /dev/vda /target || echo "test-guest: cannot mount /dev/vda" >/dev/console
+(while :; do sleep 1; sync; done) &
+echo "test-guest: qemu-ga on ${port:-?}" >/dev/console
+exec /bin/qemu-ga -m virtio-serial -p "$port" --statedir=/run --pidfile=/run/qemu-ga.pid
+"""
+
+
+def cmd_assemble_test_guest(args):
+    tree = args.tree
+    if os.path.exists(tree):
+        shutil.rmtree(tree)
+    os.makedirs(os.path.join(tree, "bin"))
+    qga = resolve_in_sysroot(args.sysroot, "usr/sbin/qemu-ga")
+    if not qga:
+        die("/usr/sbin/qemu-ga is not in the packages (test-guest.lock: qemu-guest-agent)")
+    install(qga, os.path.join(tree, "bin/qemu-ga"), 0o755)
+    busybox = resolve_in_sysroot(args.sysroot, "usr/bin/busybox") or resolve_in_sysroot(
+        args.sysroot, "bin/busybox"
+    )
+    if not busybox:
+        die("busybox is not in the packages (test-guest.lock: busybox-static)")
+    elf = read_elf(busybox, args.arch, "busybox")
+    if elf.interp() or elf.needed():
+        die("busybox must be static (busybox-static)")
+    install(busybox, os.path.join(tree, "bin/busybox"), 0o755)
+    for applet in TEST_GUEST_APPLETS:
+        os.symlink("busybox", os.path.join(tree, "bin", applet))
+    collect_libraries(args.arch, args.sysroot, tree, [(qga, "/bin/qemu-ga")])
+    collect_modules(args.sysroot, args.release, tree)
+    init = os.path.join(tree, "init")
+    write_text(init, TEST_GUEST_INIT)
+    os.chmod(init, 0o755)
+    os.makedirs(os.path.join(tree, "target"))
+    write_cpio(tree, args.cpio)
+
+
 # --- manifest.json -------------------------------------------------------------------------------
 
 
@@ -533,6 +606,10 @@ def main():
     a.add_argument("--arch", choices=ARCHES, required=True)
     for opt in ("--sysroot", "--release", "--agent", "--image-version", "--tree", "--cpio"):
         a.add_argument(opt, required=True)
+    t = sub.add_parser("assemble-test-guest")
+    t.add_argument("--arch", choices=ARCHES, required=True)
+    for opt in ("--sysroot", "--release", "--tree", "--cpio"):
+        t.add_argument(opt, required=True)
     m = sub.add_parser("manifest")
     m.add_argument("--arch", choices=ARCHES, required=True)
     m.add_argument("--release", required=True)
@@ -540,9 +617,13 @@ def main():
     m.add_argument("--proto", type=int, required=True)
     m.add_argument("--dir", required=True)
     args = p.parse_args()
-    {"config": cmd_config, "kernel": cmd_kernel, "assemble": cmd_assemble, "manifest": cmd_manifest}[
-        args.cmd
-    ](args)
+    {
+        "config": cmd_config,
+        "kernel": cmd_kernel,
+        "assemble": cmd_assemble,
+        "assemble-test-guest": cmd_assemble_test_guest,
+        "manifest": cmd_manifest,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":

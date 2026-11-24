@@ -435,6 +435,16 @@ pub trait Hypervisor: Send + Sync {
         password: &str,
     ) -> Result<(), DriverError>;
 
+    /// 실행 중인 VM의 게스트 에이전트에 파일 일 하나를 한다(계획 69 §12 — 되돌려 쓰기). 일마다 에이전트 잠금을 쥐고
+    /// 놓는다(쓰기 한 번 = 1 MiB). `Exec`은 띄운 뒤 끝날 때까지(60초) `guest-exec-status`를 묻되 물을 때만 잠금을 쥔다.
+    /// 에이전트가 오류로 답한 일은 `GuestFileAnswer::Refused`다. 채널이 없으면 `InvalidSpec`, 에이전트가 답하지 않으면
+    /// `GuestAgent`다.
+    async fn guest_file(
+        &self,
+        id: Uuid,
+        op: &opl_types::file_restore::GuestFileOp,
+    ) -> Result<opl_types::file_restore::GuestFileAnswer, DriverError>;
+
     /// 라이브 마이그레이션을 받을 QEMU를 `-incoming defer`로 띄우고, 받는 중 표시(마이그레이션 Task
     /// `task`)를 남기고, TLS
     /// 자격 증명(받는 쪽, 상대 인증서 확인)과 능력을 정한 뒤 `ports`에서 빈 포트로 `listen_host`에서

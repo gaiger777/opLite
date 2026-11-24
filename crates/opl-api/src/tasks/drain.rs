@@ -1,7 +1,8 @@
 //! 노드 비우기 Task(설계 §3.2): 비울 노드의 실행 중인 VM을 이름 순으로 하나씩 다른 노드로 라이브
 //! 마이그레이션한다. 옮기지 못한 VM은 건너뛰고 끝에 이유와 함께 실패로 알린다. 이 노드로 들어오던
 //! 마이그레이션은 끝나기를 기다려 그 VM도 옮기므로, 성공하면 노드가 비어 있다. hard `affinity`로 묶인 VM은
-//! 묶음 전체를 받을 수 있는 노드로 차례로 옮긴다(첫 VM이 간 뒤 나머지는 규칙 때문에 그 노드로만 간다).
+//! 묶음 전체를 받을 수 있는 노드로 차례로 옮긴다(첫 VM이 간 뒤 나머지는 규칙 때문에 그 노드로만 간다). 그 노드의
+//! 파일 복원 세션(계획 69)은 먼저 닫는다.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Duration;
@@ -51,6 +52,17 @@ pub(super) async fn drain(ctx: &Ctx, node: Uuid) -> Result<(), String> {
         .api
         .clone()
         .ok_or("this node cannot create migration tasks")?;
+    // 이 노드의 파일 복원 세션을 닫는다(계획 69 §13 — 세션은 VM이 아니라 옮기지 않는다). 유지보수 노드에는 새 세션을 열지
+    // 않는다.
+    let closed = crate::file_restore::close_node_sessions(
+        &state,
+        node,
+        "closed because its node is being drained",
+    )
+    .await;
+    if closed > 0 {
+        tracing::info!(%node, sessions = closed, "closed file restore sessions on the draining node");
+    }
     // 옮긴 VM. 다시 들어오면 한 번 더 옮기지 않고 옮기지 못한 VM으로 남긴다.
     let mut moved = HashSet::new();
     // VM마다 옮길 것이 없어졌던 횟수. 다시 나타나면(예: 껐다 다시 켬) 다시 본다.

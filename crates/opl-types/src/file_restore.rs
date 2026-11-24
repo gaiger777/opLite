@@ -765,23 +765,312 @@ pub fn guest_target_name(
     match conflict {
         GuestConflict::Skip => Ok(GuestTarget::Skip),
         GuestConflict::Overwrite => Ok(GuestTarget::Overwrite),
-        GuestConflict::Keep => {
-            let base = format!("{name}.restored-{}", stamp(now));
-            (1..=MAX_KEEP_NAMES)
-                .map(|n| match n {
-                    1 => base.clone(),
-                    n => format!("{base}-{n}"),
-                })
-                .find(|candidate| !exists(candidate))
-                .map(GuestTarget::Write)
-                .ok_or_else(|| NoFreeName(name.to_string()))
-        }
+        GuestConflict::Keep => guest_keep_names(name, now)
+            .find(|candidate| !exists(candidate))
+            .map(GuestTarget::Write)
+            .ok_or_else(|| NoFreeName(name.to_string())),
     }
+}
+
+/// `keep`이 차례로 붙여 볼 이름: `<이름>.restored-YYYYMMDD-HHMMSS`, 그다음 `-2` … `-99`([`MAX_KEEP_NAMES`]개)
+pub fn guest_keep_names(name: &str, now: u64) -> impl Iterator<Item = String> + use<> {
+    let base = format!("{name}.restored-{}", stamp(now));
+    (1..=MAX_KEEP_NAMES).map(move |n| match n {
+        1 => base.clone(),
+        n => format!("{base}-{n}"),
+    })
 }
 
 /// `overwrite`가 먼저 쓰는 임시 이름 `<이름>.orbivisor-<task>`(다 쓴 뒤 원래 이름으로 바꾼다 — 끊겨도 원래 파일은 그대로)
 pub fn guest_temp_name(name: &str, task: Uuid) -> String {
     format!("{name}.orbivisor-{task}")
+}
+
+/// 게스트에 한 번에 쓰는 날 바이트(`guest-file-write` 하나 — base64로 1.4 MiB 줄, 에이전트 잠금을 이만큼마다 놓는다)
+pub const GUEST_WRITE_CHUNK: usize = 1 << 20;
+/// Windows 경로 길이 상한(`\\?\` 없이 — `MAX_PATH` 260에서 끝 NUL을 뺀 글자 수)
+pub const MAX_WINDOWS_PATH: usize = 259;
+
+/// 게스트 에이전트에 하는 파일 일 하나(계획 69 §12). 하이퍼바이저(`guest_file`)와 노드 사이 RPC `GuestAgent`가 그대로
+/// 나른다. 일마다 VM의 에이전트 잠금을 쥐고 놓는다 — 큰 파일을 쓰는 동안에도 게스트 정보 수집·fs-freeze가 기다리지 않게.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum GuestFileOp {
+    /// 에이전트가 허락하는 것(`guest-info.supported_commands`)과 OS(`guest-get-osinfo`)
+    Caps,
+    /// 그 경로를 읽기로 열 수 있는지(`guest-file-open mode=r` → `guest-file-close`)
+    Exists { path: String },
+    /// 쓰기로 연다(`guest-file-open mode=wb` — 있으면 비운다) → 핸들
+    Open { path: String },
+    /// 핸들에 쓴다(`guest-file-write`, 날 바이트의 표준 base64 — [`GUEST_WRITE_CHUNK`]까지)
+    Write { handle: i64, data: String },
+    /// 비우고 닫는다(`guest-file-flush` → `guest-file-close`)
+    Close { handle: i64 },
+    /// 셸 없이 프로그램을 돌려 끝날 때까지 기다린다(`guest-exec` → `guest-exec-status`)
+    Exec { path: String, args: Vec<String> },
+}
+
+/// 쓰는 데이터는 길이만 적는다.
+impl fmt::Debug for GuestFileOp {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Caps => f.write_str("Caps"),
+            Self::Exists { path } => f.debug_struct("Exists").field("path", path).finish(),
+            Self::Open { path } => f.debug_struct("Open").field("path", path).finish(),
+            Self::Write { handle, data } => f
+                .debug_struct("Write")
+                .field("handle", handle)
+                .field("base64_len", &data.len())
+                .finish(),
+            Self::Close { handle } => f.debug_struct("Close").field("handle", handle).finish(),
+            Self::Exec { path, args } => f
+                .debug_struct("Exec")
+                .field("path", path)
+                .field("args", args)
+                .finish(),
+        }
+    }
+}
+
+/// [`GuestFileOp`]의 답. 에이전트가 오류로 답한 일(없는 디렉터리, 권한, 막힌 명령)은 `Refused`다 — 채널은 살아 있다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "answer", rename_all = "snake_case")]
+pub enum GuestFileAnswer {
+    Caps {
+        caps: GuestRestoreCaps,
+    },
+    Exists {
+        exists: bool,
+    },
+    Opened {
+        handle: i64,
+    },
+    Written {
+        count: u64,
+    },
+    Closed,
+    /// 프로그램이 끝났다: 종료 코드(시그널이면 128+번호)와 표준 오류(1 KiB까지)
+    Exited {
+        code: i64,
+        stderr: String,
+    },
+    Refused {
+        message: String,
+    },
+}
+
+/// 에이전트가 허락하는 명령(`guest-info.supported_commands`의 이름과 `enabled`)으로 되돌려 쓰기 능력을 정한다. 파일 쓰기는
+/// `guest-file-open`·`-write`·`-flush`·`-close`, 디렉터리 만들기·덮어쓰기는 `guest-exec`·`guest-exec-status`가 든다.
+pub fn guest_restore_caps(os: GuestOsKind, commands: &[(String, bool)]) -> GuestRestoreCaps {
+    let enabled = |name: &str| commands.iter().any(|(n, on)| n == name && *on);
+    let file_write = [
+        "guest-file-open",
+        "guest-file-write",
+        "guest-file-flush",
+        "guest-file-close",
+    ]
+    .iter()
+    .all(|c| enabled(c));
+    let exec = enabled("guest-exec") && enabled("guest-exec-status");
+    let reason = if !file_write {
+        Some(
+            "the guest agent blocks guest-file-* (the default on RHEL/Rocky: allow them in /etc/sysconfig/qemu-ga)"
+                .to_string(),
+        )
+    } else if !exec {
+        Some(
+            "the guest agent blocks guest-exec: only files directly in an existing directory can be restored, \
+             and overwrite is not available"
+                .to_string(),
+        )
+    } else {
+        None
+    };
+    GuestRestoreCaps {
+        os,
+        file_write,
+        exec,
+        reason,
+    }
+}
+
+/// 게스트 OS 갈래: `guest-get-osinfo`의 `id`가 `mswindows`면 Windows, 답했으면 Linux(POSIX — 같은 규칙), 답하지 않으면 기타
+pub fn guest_os_kind(osinfo_id: Option<&str>, answered: bool) -> GuestOsKind {
+    match osinfo_id {
+        Some("mswindows") => GuestOsKind::Windows,
+        _ if answered => GuestOsKind::Linux,
+        _ => GuestOsKind::Other,
+    }
+}
+
+/// 게스트 안 대상 디렉터리(거른 조각). [`GuestDir::parse`]로 만든다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestDir {
+    os: GuestOsKind,
+    /// Windows 드라이브(`C:`), 아니면 빈 값
+    drive: String,
+    parts: Vec<String>,
+}
+
+impl GuestDir {
+    /// 사용자가 준 대상 디렉터리: Linux·기타는 `/`로 시작하는 절대 경로, Windows는 `C:\…`(`/`도 받음). 빈 조각(`//`·끝
+    /// `/`)은 버리고, 조각마다 [`guest_path_ok`]를 지나야 한다(`.`·`..` 없음). Windows는 260자 안.
+    pub fn parse(os: GuestOsKind, s: &str) -> Result<Self, String> {
+        let (drive, rest) = if os == GuestOsKind::Windows {
+            let b = s.as_bytes();
+            if b.len() < 2 || !b[0].is_ascii_alphabetic() || b[1] != b':' {
+                return Err(format!(
+                    "{s:?} is not an absolute Windows path (like C:\\restore)"
+                ));
+            }
+            let rest = &s[2..];
+            if !rest.is_empty() && !rest.starts_with(['\\', '/']) {
+                return Err(format!(
+                    "{s:?} is not an absolute Windows path (like C:\\restore)"
+                ));
+            }
+            (s[..2].to_ascii_uppercase(), rest)
+        } else {
+            let Some(rest) = s.strip_prefix('/') else {
+                return Err(format!("{s:?} is not an absolute path"));
+            };
+            (String::new(), rest)
+        };
+        let seps: &[char] = if os == GuestOsKind::Windows {
+            &['\\', '/']
+        } else {
+            &['/']
+        };
+        let mut parts = Vec::new();
+        for part in rest.split(seps).filter(|p| !p.is_empty()) {
+            guest_path_ok(os, part).map_err(|e| format!("{part:?} in {s:?}: {e}"))?;
+            parts.push(part.to_string());
+        }
+        let dir = GuestDir { os, drive, parts };
+        dir.join(&[]).map_err(|e| format!("{s:?}: {e}"))?;
+        Ok(dir)
+    }
+
+    pub fn os(&self) -> GuestOsKind {
+        self.os
+    }
+
+    /// 이 디렉터리
+    pub fn path(&self) -> String {
+        self.join(&[]).unwrap_or_default()
+    }
+
+    /// 아래 경로(조각은 이미 [`guest_path_ok`]를 지난 것). Windows에서 260자를 넘으면 오류다.
+    pub fn join(&self, more: &[String]) -> Result<String, String> {
+        let all: Vec<&str> = self.parts.iter().chain(more).map(String::as_str).collect();
+        if self.os == GuestOsKind::Windows {
+            let path = format!("{}\\{}", self.drive, all.join("\\"));
+            if path.chars().count() > MAX_WINDOWS_PATH {
+                return Err(format!(
+                    "the Windows path is longer than {MAX_WINDOWS_PATH} characters"
+                ));
+            }
+            Ok(path)
+        } else {
+            Ok(format!("/{}", all.join("/")))
+        }
+    }
+}
+
+/// PowerShell 작은따옴표 문자열(`'`와 같은 뜻의 ‘ ’ ‚ ‛는 두 번 — 그 밖의 글자는 그대로 글자다)
+fn ps_quote(s: &str) -> String {
+    let mut out = String::from("'");
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// PowerShell 스크립트를 명령줄 해석 없이 넘긴다(`-EncodedCommand` — UTF-16LE의 base64).
+fn powershell(script: &str) -> (String, Vec<String>) {
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    (
+        "powershell.exe".into(),
+        vec![
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-EncodedCommand".into(),
+            STANDARD.encode(utf16),
+        ],
+    )
+}
+
+/// 디렉터리 만들기(`guest-exec` argv — 셸 없음): Linux·기타 `/bin/mkdir -p -- <경로>`, Windows `New-Item -ItemType
+/// Directory -Force`
+pub fn guest_mkdir_command(os: GuestOsKind, path: &str) -> (String, Vec<String>) {
+    if os == GuestOsKind::Windows {
+        return powershell(&format!(
+            "$ErrorActionPreference='Stop'; New-Item -ItemType Directory -Force -Path {} | Out-Null",
+            ps_quote(path)
+        ));
+    }
+    (
+        "/bin/mkdir".into(),
+        vec!["-p".into(), "--".into(), path.into()],
+    )
+}
+
+/// 다 쓴 임시 파일을 원래 이름으로 바꿔 넣기(`overwrite`): Linux·기타 `/bin/mv -f -T -- <임시> <이름>`(이름이 디렉터리면
+/// 실패 — 그 안으로 옮기지 않음), Windows `Move-Item -Force -LiteralPath`
+pub fn guest_move_command(os: GuestOsKind, from: &str, to: &str) -> (String, Vec<String>) {
+    if os == GuestOsKind::Windows {
+        return powershell(&format!(
+            "$ErrorActionPreference='Stop'; Move-Item -Force -LiteralPath {} -Destination {}",
+            ps_quote(from),
+            ps_quote(to)
+        ));
+    }
+    (
+        "/bin/mv".into(),
+        vec![
+            "-f".into(),
+            "-T".into(),
+            "--".into(),
+            from.into(),
+            to.into(),
+        ],
+    )
+}
+
+/// 파일 지우기(끊긴 쓰기의 임시 파일): Linux·기타 `/bin/rm -f -- <경로>`, Windows `Remove-Item -Force -LiteralPath`
+pub fn guest_remove_command(os: GuestOsKind, path: &str) -> (String, Vec<String>) {
+    if os == GuestOsKind::Windows {
+        return powershell(&format!(
+            "Remove-Item -Force -ErrorAction SilentlyContinue -LiteralPath {}",
+            ps_quote(path)
+        ));
+    }
+    (
+        "/bin/rm".into(),
+        vec!["-f".into(), "--".into(), path.into()],
+    )
+}
+
+/// 게스트로 되돌려 쓰기 요청(`POST /file-restore/sessions/{id}/restore-to-vm`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct RestoreToVmRequest {
+    /// 세션의 볼륨 id
+    pub volume: String,
+    /// 되돌려 쓸 항목(1~1000개, 같은 볼륨)
+    pub paths: Vec<EntryPath>,
+    /// 대상 VM(id나 이름) — 실행 중이고 게스트 에이전트 채널이 있어야 한다
+    pub vm: String,
+    /// 게스트 안 대상 디렉터리(Linux `/srv/restored`, Windows `C:\\restored`). 고른 항목의 이름이 그 아래에 놓인다.
+    pub target_dir: String,
+    /// 같은 이름이 있을 때(기본 `keep`)
+    #[serde(default)]
+    pub conflict: GuestConflict,
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -1135,6 +1424,153 @@ mod tests {
             guest_temp_name("a.conf", task),
             "a.conf.orbivisor-00000000-0000-0000-0000-000000000000"
         );
+    }
+
+    #[test]
+    fn guest_caps_follow_the_enabled_commands() {
+        let all: Vec<(String, bool)> = [
+            "guest-file-open",
+            "guest-file-write",
+            "guest-file-flush",
+            "guest-file-close",
+            "guest-exec",
+            "guest-exec-status",
+        ]
+        .iter()
+        .map(|c| (c.to_string(), true))
+        .collect();
+        let caps = guest_restore_caps(GuestOsKind::Linux, &all);
+        assert!(caps.file_write && caps.exec && caps.reason.is_none());
+        // RHEL·Rocky의 기본: guest-file-*·guest-exec*가 막힘(목록에 있으나 enabled=false)
+        let blocked: Vec<(String, bool)> = all
+            .iter()
+            .map(|(c, _)| {
+                (
+                    c.clone(),
+                    !c.starts_with("guest-file") && !c.starts_with("guest-exec"),
+                )
+            })
+            .collect();
+        let caps = guest_restore_caps(GuestOsKind::Linux, &blocked);
+        assert!(!caps.file_write && !caps.exec);
+        assert!(caps.reason.unwrap().contains("/etc/sysconfig/qemu-ga"));
+        let no_exec: Vec<(String, bool)> = all
+            .iter()
+            .map(|(c, on)| (c.clone(), *on && c != "guest-exec-status"))
+            .collect();
+        let caps = guest_restore_caps(GuestOsKind::Windows, &no_exec);
+        assert!(caps.file_write && !caps.exec);
+        assert!(caps.reason.unwrap().contains("guest-exec"));
+        assert_eq!(guest_os_kind(Some("mswindows"), true), GuestOsKind::Windows);
+        assert_eq!(guest_os_kind(Some("debian"), true), GuestOsKind::Linux);
+        assert_eq!(guest_os_kind(None, true), GuestOsKind::Linux);
+        assert_eq!(guest_os_kind(None, false), GuestOsKind::Other);
+        let names: Vec<String> = guest_keep_names("a", 0).collect();
+        assert_eq!(names.len(), MAX_KEEP_NAMES as usize);
+        assert_eq!(names[0], "a.restored-19700101-000000");
+        assert_eq!(names[1], "a.restored-19700101-000000-2");
+    }
+
+    #[test]
+    fn guest_dirs_are_absolute_and_filtered() {
+        use GuestOsKind::*;
+        let d = GuestDir::parse(Linux, "/srv//restored/").unwrap();
+        assert_eq!(d.path(), "/srv/restored");
+        assert_eq!(
+            d.join(&["etc".into(), "a.conf".into()]).unwrap(),
+            "/srv/restored/etc/a.conf"
+        );
+        assert_eq!(GuestDir::parse(Linux, "/").unwrap().path(), "/");
+        assert_eq!(
+            GuestDir::parse(Linux, "/")
+                .unwrap()
+                .join(&["x".into()])
+                .unwrap(),
+            "/x"
+        );
+        for bad in ["srv", "", "/srv/../etc", "/srv/./x", "C:\\x"] {
+            assert!(GuestDir::parse(Linux, bad).is_err(), "{bad:?}");
+        }
+        let w = GuestDir::parse(Windows, "c:/Users\\me").unwrap();
+        assert_eq!(w.path(), "C:\\Users\\me");
+        assert_eq!(w.join(&["a.txt".into()]).unwrap(), "C:\\Users\\me\\a.txt");
+        assert_eq!(GuestDir::parse(Windows, "D:").unwrap().path(), "D:\\");
+        for bad in [
+            "/srv", "C", "1:\\x", "C:x", "C:\\a:b", "C:\\CON", "C:\\dir.",
+        ] {
+            assert!(GuestDir::parse(Windows, bad).is_err(), "{bad:?}");
+        }
+        let long = format!("C:\\{}", "a".repeat(300));
+        assert!(GuestDir::parse(Windows, &long).is_err());
+        let near = GuestDir::parse(Windows, &format!("C:\\{}", "a".repeat(250))).unwrap();
+        assert!(near.join(&["b".repeat(5)]).is_ok());
+        assert!(near.join(&["b".repeat(10)]).is_err());
+    }
+
+    /// 명령은 셸 없이(argv). Windows는 `-EncodedCommand`라 경로가 명령줄로 해석되지 않고, 작은따옴표는 두 번 쓴다.
+    #[test]
+    fn guest_commands_are_argv_without_a_shell() {
+        use GuestOsKind::*;
+        assert_eq!(
+            guest_mkdir_command(Linux, "/srv/a b"),
+            (
+                "/bin/mkdir".to_string(),
+                vec!["-p".to_string(), "--".into(), "/srv/a b".into()]
+            )
+        );
+        assert_eq!(
+            guest_move_command(Other, "/a/x.tmp", "/a/x").1,
+            ["-f", "-T", "--", "/a/x.tmp", "/a/x"]
+        );
+        assert_eq!(
+            guest_remove_command(Linux, "/a/-x").1,
+            ["-f", "--", "/a/-x"]
+        );
+        let (exe, args) = guest_move_command(Windows, "C:\\it's $(x).tmp", "C:\\it\u{2019}s");
+        assert_eq!(exe, "powershell.exe");
+        assert_eq!(
+            &args[..3],
+            ["-NoProfile", "-NonInteractive", "-EncodedCommand"]
+        );
+        let raw = STANDARD.decode(&args[3]).unwrap();
+        let units: Vec<u16> = raw
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        let script = String::from_utf16(&units).unwrap();
+        assert_eq!(
+            script,
+            "$ErrorActionPreference='Stop'; Move-Item -Force -LiteralPath 'C:\\it''s $(x).tmp' -Destination 'C:\\it\u{2019}\u{2019}s'"
+        );
+        let (_, args) = guest_mkdir_command(Windows, "C:\\a");
+        assert_eq!(args.len(), 4);
+    }
+
+    #[test]
+    fn guest_file_ops_round_trip_and_hide_data() {
+        let op = GuestFileOp::Write {
+            handle: 3,
+            data: "c2VjcmV0".into(),
+        };
+        let json = serde_json::to_value(&op).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"op": "write", "handle": 3, "data": "c2VjcmV0"})
+        );
+        assert_eq!(serde_json::from_value::<GuestFileOp>(json).unwrap(), op);
+        assert!(!format!("{op:?}").contains("c2VjcmV0"));
+        let a = GuestFileAnswer::Exited {
+            code: 1,
+            stderr: "no".into(),
+        };
+        let json = serde_json::to_string(&a).unwrap();
+        assert_eq!(json, r#"{"answer":"exited","code":1,"stderr":"no"}"#);
+        assert_eq!(serde_json::from_str::<GuestFileAnswer>(&json).unwrap(), a);
+        let r: RestoreToVmRequest = serde_json::from_value(serde_json::json!({
+            "volume": "disk0", "paths": ["/etc/hosts"], "vm": "web", "target_dir": "/tmp"
+        }))
+        .unwrap();
+        assert_eq!(r.conflict, GuestConflict::Keep);
     }
 
     #[test]
