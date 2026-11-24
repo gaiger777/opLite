@@ -120,6 +120,22 @@ async function clusterMap(page: Page, vm: string) {
   await page.keyboard.press("Escape");
   await expect(sheet).toBeHidden();
 
+  // 계획 71: VM 타일에서 `m`(끌어 옮기기의 키보드 길). 판정 함수는 서랍 조각과 함께 오는데 위에서 서랍을 열었으니 왔다.
+  // 노드가 하나라 놓을 곳이 없다고 끌기 틀의 알림 줄이 읽고, Esc는 취소하고 초점을 노드에 돌려준다.
+  const announcer = page.locator("div[role=status][aria-live=polite]");
+  await expect(node).toBeFocused();
+  await page.keyboard.press("]");
+  await expect(live).toHaveText(new RegExp(`^VM ${vm}, `));
+  await page.keyboard.press("m");
+  await expect(announcer).toHaveText(`Moving ${vm}: no node can take it. Escape cancels.`);
+  await expect(page.locator("html")).toHaveAttribute("data-dnd-held", /.*/);
+  await page.keyboard.press("Escape");
+  await expect(announcer).toHaveText("Cancelled.");
+  await expect(page.locator("html")).not.toHaveAttribute("data-dnd-held", /.*/);
+  await expect(node).toBeFocused();
+  await page.keyboard.press("[");
+  await expect(live).toHaveText(/^Node node1, /);
+
   // 진짜 브라우저의 가리키기·누르기: 타일은 합친 경로라 DOM 원소가 없고, 적중 검사가 그 점의 타일을 찾는다.
   const box = (await tileText.boundingBox())!;
   const at = { x: box.x + box.width / 2, y: box.y + box.height / 2 };

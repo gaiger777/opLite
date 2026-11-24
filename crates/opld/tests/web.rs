@@ -6,6 +6,8 @@
 //! 계획 69: 고정물 ext4 디스크 VM의 저장소 백업을 브라우저로 찾아보고 파일 하나·폴더(zip)를 내려받은 뒤 닫는다
 //! (`file-restore.spec.ts`, 실제 도우미 이미지 — `OPL_RESTORE_IMAGE_DIR`·`OPL_RESTORE_FIXTURES`가 없으면 건너뜀).
 //! 계획 70: VM을 켠 뒤 인프라 › 노드의 보기 "지도"에서 노드 블록·VM 타일을 보고 키보드·누르기로 서랍을 열고 목록 보기·휴대폰 폭을 본다.
+//! 계획 71: 지도에서 `m`(한 노드라 옮길 곳 없음 알림과 Esc), 보기 "빌더"로 마우스·키보드·휴대폰 폭에서 VM을 만든다
+//! (`builder.spec.ts`, QEMU를 켜지 않음).
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -254,6 +256,83 @@ async fn browser_shows_a_folder_user_only_their_folder() {
         .find(|u| u["name"] == "alice")
         .unwrap();
     assert_eq!(alice["two_factor"], true, "{alice}");
+    d.stop();
+}
+
+/// 계획 71: 보기 "빌더"로 꺼진 VM 셋(b1 마우스·b2 키보드·b3 휴대폰 폭)을 만든다. 볼륨 `b1-disk0`(이름 겹침 — 브라우저
+/// 오류)과 vCPU 할당량 1인 폴더 `/q`(서버 미리 확인의 할당량 오류)를 미리 만든다. b2·b3은 보통 크기(vCPU 2·메모리
+/// 4 GiB)·새 디스크 하나·NAT NIC 하나, b1은 `/q`에 작게(vCPU 1·1 GiB)와 살피기에서 바꾼 이름·크기의 디스크다.
+#[tokio::test]
+async fn browser_builds_vms_with_the_builder() {
+    let _one = BROWSER.lock().await;
+    web_dir();
+    let mut d = Daemon::new("node1", "");
+    d.start().await;
+    d.init("web-builder").await;
+    d.login().await;
+    let dir = d.path("local");
+    std::fs::create_dir(&dir).unwrap();
+    d.ctl(&["pool", "create", "local", "--path", dir.to_str().unwrap()])
+        .await
+        .unwrap();
+    d.wait_pool_ready("local").await;
+    d.ctl(&[
+        "volume", "create", "b1-disk0", "--pool", "local", "--size", "1M",
+    ])
+    .await
+    .unwrap();
+    d.ctl(&["folder", "create", "/q"]).await.unwrap();
+    d.ctl(&["folder", "quota", "set", "/q", "--vcpus", "1"])
+        .await
+        .unwrap();
+
+    let out = playwright(
+        "e2e/builder.spec.ts",
+        vec![
+            ("OPL_URL", d.server()),
+            ("OPL_USER", "admin".into()),
+            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
+            ("OPL_POOL", "local".into()),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "playwright failed:\n{}\n{}\nopld log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        d.log()
+    );
+    for (vm, vcpus, memory, volume, size) in [
+        ("b1", 1, 1024, "b1-root", 1u64 << 30),
+        ("b2", 2, 4096, "b2-disk0", 20 << 30),
+        ("b3", 2, 4096, "b3-disk0", 20 << 30),
+    ] {
+        let v = d.ctl_json(&["vm", "get", vm]).await;
+        let spec = &v["spec"];
+        assert_eq!(spec["cpu"]["cores"], vcpus, "{v}");
+        assert_eq!(spec["memory_mib"], memory, "{v}");
+        assert_eq!(spec["power"], "stopped", "{v}");
+        assert_eq!(spec["disks"].as_array().map(Vec::len), Some(1), "{v}");
+        assert_eq!(spec["nics"].as_array().map(Vec::len), Some(1), "{v}");
+        assert_eq!(spec["nics"][0]["network"], "user", "{v}");
+        assert_eq!(spec["disks"][0]["volume"], volume, "{v}");
+        let vol = d.ctl_json(&["volume", "get", volume]).await;
+        assert_eq!(vol["spec"]["size_bytes"], size, "{vol}");
+    }
+    // b1은 할당량을 단 폴더 /q에 있다.
+    let names: Vec<Value> = d
+        .ctl_json(&["vm", "list", "--folder", "/q"])
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["name"].clone())
+        .collect();
+    assert_eq!(names, ["b1"]);
+    // 미리 만든 볼륨은 그대로 남고 어디에도 붙지 않았다.
+    let taken = d.ctl_json(&["volume", "get", "b1-disk0"]).await;
+    assert!(taken["status"]["attached_to"].is_null(), "{taken}");
     d.stop();
 }
 
