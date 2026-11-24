@@ -1,0 +1,34 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: Orbivisor file restore helper image
+Source: https://github.com/gaiger777/opLite
+
+Files: *
+Copyright: Orbivisor developers
+License: Apache-2.0
+Comment: The restore agent (/bin/orbivisor-restore-agent and /init in initrd.img).
+
+Files: usr/share/orbivisor/restore/*
+Copyright: The authors of the Linux kernel, LVM2, util-linux, the GNU C Library and the other Debian packages listed in debian.lock
+License: GPL-2 and LGPL-2.1+ and others
+Comment: The kernel (vmlinuz), its modules and the programs and libraries in
+ initrd.img other than the restore agent are unmodified files from the
+ Debian 13 binary packages listed with their versions and SHA-256 in
+ /usr/share/doc/orbivisor-restore-image/debian.lock. The sources of those
+ exact versions are on https://snapshot.debian.org/, and their copyright
+ files are in the same Debian packages.
+
+License: Apache-2.0
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+ .
+ http://www.apache.org/licenses/LICENSE-2.0
+ .
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+ .
+ On Debian systems, the complete text of the Apache License, Version 2.0
+ can be found in "/usr/share/common-licenses/Apache-2.0".

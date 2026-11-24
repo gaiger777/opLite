@@ -2,6 +2,7 @@
 # 이미 빌드한 릴리스 바이너리로 Debian 패키지 둘을 만든다: orbivisor_<version>_amd64.deb(실제 패키지)와
 # oplite_<version>_amd64.deb(옛 이름의 빈 전환 패키지 — 설치된 oplite가 dist-upgrade로 orbivisor로 넘어가게 함).
 # 쓰는 법: packaging/deb/build-deb.sh <version> <out dir>
+# (OPL_RESTORE_IMAGE_DIR가 있으면 셋째 패키지 orbivisor-restore-image_<version>_amd64.deb도 — 아래)
 # 바이너리(orbivisord, orbivisorctl)는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
 #   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p opld --features web-ui -p oplctl
 # 바이너리 위치는 기본 target/release이고 OPL_BIN_DIR로 바꾼다.
@@ -11,6 +12,10 @@
 # 저장소의 개발 키를 믿는 바이너리이므로 OPL_DEV_LICENSE=1(개발 패키지)일 때만 만든다.
 # OPL_LICENSE_KEYS에는 정규 base64(44자, 32바이트) 항목이 하나 이상 있어야 하고, 개발 키가 들어 있으면
 # 안 되며, orbivisord에 그 값이 그대로 들어 있어야 한다(그 값으로 빌드했는지).
+# 파일 복원 도우미 이미지(계획 69): OPL_RESTORE_IMAGE_DIR이 있으면 셋째 패키지
+# orbivisor-restore-image_<version>_amd64.deb(/usr/share/orbivisor/restore/x86_64)도 만든다. 그 디렉터리는
+# packaging/restore-image/build.sh --arch x86_64 --version <version> --out <dir>의 결과여야 한다 — manifest.json의
+# 이미지 판이 이 버전과 저장소의 packaging/restore-image/debian.lock으로 만든 것인지 본다.
 set -eu
 # 만드는 파일·디렉터리 권한이 호출한 셸의 umask에 휘둘리지 않게 한다.
 umask 022
@@ -84,6 +89,33 @@ if [ -n "${OPL_LICENSE_KEYS:-}" ] && ! grep -qaF -- "$OPL_LICENSE_KEYS" "$BIN_DI
 	exit 1
 fi
 
+# sha256 <파일>: 16진 해시(Linux sha256sum, macOS shasum)
+sha256() {
+	if command -v sha256sum >/dev/null; then
+		sha256sum "$1" | cut -d' ' -f1
+	else
+		shasum -a 256 "$1" | cut -d' ' -f1
+	fi
+}
+
+IMAGE_SRC=${OPL_RESTORE_IMAGE_DIR:-}
+IMAGE_LOCK="$ROOT/packaging/restore-image/debian.lock"
+if [ -n "$IMAGE_SRC" ]; then
+	for f in vmlinuz initrd.img manifest.json; do
+		[ -f "$IMAGE_SRC/$f" ] || {
+			echo "build-deb: OPL_RESTORE_IMAGE_DIR has no $f (packaging/restore-image/build.sh --arch x86_64 --out <dir>)" >&2
+			exit 1
+		}
+	done
+	lock_sha=$(sha256 "$IMAGE_LOCK")
+	want="\"image_version\": \"orbivisor $VERSION lock-$(printf %s "$lock_sha" | cut -c1-12)\""
+	if ! grep -qF -- "$want" "$IMAGE_SRC/manifest.json" || ! grep -qF '"arch": "x86_64"' "$IMAGE_SRC/manifest.json"; then
+		echo "build-deb: $IMAGE_SRC is not an x86_64 image built for $VERSION with packaging/restore-image/debian.lock" >&2
+		echo "build-deb: packaging/restore-image/build.sh --arch x86_64 --version $VERSION --out $IMAGE_SRC 로 다시 빌드한다" >&2
+		exit 1
+	fi
+fi
+
 APT_KEY=${OPL_APT_KEY:-}
 if [ -n "$APT_KEY" ] && [ ! -f "$APT_KEY" ]; then
 	echo "build-deb: OPL_APT_KEY의 $APT_KEY 이 없다" >&2
@@ -97,9 +129,10 @@ fi
 
 STAGE=$(mktemp -d)
 TRANS=$(mktemp -d)
-trap 'rm -rf "$STAGE" "$TRANS"' EXIT
+IMAGE=$(mktemp -d)
+trap 'rm -rf "$STAGE" "$TRANS" "$IMAGE"' EXIT
 # mktemp -d는 0700이다. 패키지 루트(/)의 권한이 되므로 0755로 한다.
-chmod 0755 "$STAGE" "$TRANS"
+chmod 0755 "$STAGE" "$TRANS" "$IMAGE"
 
 # 파일 트리. 옛 이름(opld, oplctl, orbivisord.service의 원래 유닛 opld.service)은 상대 심볼릭 링크다.
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/lib/systemd/system" \
@@ -144,6 +177,16 @@ echo /etc/apparmor.d/abstractions/orbivisor-swtpm >"$STAGE/DEBIAN/conffiles"
 chmod 0644 "$STAGE/DEBIAN/conffiles"
 debian_dir "$TRANS" "$DEB_DIR/oplite.control.in"
 
+# 도우미 이미지 패키지: 이미지 파일, copyright, 이미지를 만든 debian.lock(들어 있는 Debian 바이너리의 출처)
+if [ -n "$IMAGE_SRC" ]; then
+	mkdir -p "$IMAGE/usr/share/orbivisor/restore/x86_64" "$IMAGE/usr/share/doc/orbivisor-restore-image"
+	install -m 0644 "$IMAGE_SRC/vmlinuz" "$IMAGE_SRC/initrd.img" "$IMAGE_SRC/manifest.json" \
+		"$IMAGE/usr/share/orbivisor/restore/x86_64/"
+	install -m 0644 "$DEB_DIR/restore-image.copyright" "$IMAGE/usr/share/doc/orbivisor-restore-image/copyright"
+	install -m 0644 "$IMAGE_LOCK" "$IMAGE/usr/share/doc/orbivisor-restore-image/debian.lock"
+	debian_dir "$IMAGE" "$DEB_DIR/restore-image.control.in"
+fi
+
 mkdir -p "$OUT_DIR"
 DEB="$OUT_DIR/orbivisor_${VERSION}_amd64.deb"
 TRANS_DEB="$OUT_DIR/oplite_${VERSION}_amd64.deb"
@@ -151,3 +194,8 @@ dpkg-deb --build --root-owner-group -Zxz "$STAGE" "$DEB"
 dpkg-deb --build --root-owner-group -Zxz "$TRANS" "$TRANS_DEB"
 echo "$DEB"
 echo "$TRANS_DEB"
+if [ -n "$IMAGE_SRC" ]; then
+	IMAGE_DEB="$OUT_DIR/orbivisor-restore-image_${VERSION}_amd64.deb"
+	dpkg-deb --build --root-owner-group -Zxz "$IMAGE" "$IMAGE_DEB"
+	echo "$IMAGE_DEB"
+fi

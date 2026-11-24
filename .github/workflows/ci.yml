@@ -120,22 +120,40 @@ jobs:
           sudo apt-get install -y busybox
           OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
       - run: bash packaging/tests/iso-test.sh
+      # 파일 복원 도우미 이미지 빌더(계획 69): 가짜 deb으로 잠금 파일·해시·라이브러리·모듈 차례·initramfs·재현
+      - name: restore-image-test
+        run: |
+          sudo apt-get install -y libarchive-tools zstd
+          bash packaging/tests/restore-image-test.sh
 
   # Debian 패키지 orbivisor와 전환 패키지 oplite: 웹 UI를 넣은 릴리스 빌드 → build-deb.sh(.github/actions/build-deb) →
   # Debian 13 컨테이너에서 설치 시험, build-repo.sh로 만든 APT 저장소에서 옛 oplite를 설치하고 testing 채널의
-  # orbivisor로 넘어가는 시험
+  # orbivisor로 넘어가는 시험. 파일 복원 도우미 이미지 꾸러미 orbivisor-restore-image(계획 69)도 만들어 함께 설치해 본다.
   package:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/build-deb
         id: build
+      # 파일 복원 도우미 이미지(계획 69): 에이전트를 정적 musl로(rust-lld) 빌드하고 debian.lock의 Debian 13 deb으로 x86_64
+      # 이미지를 만든 뒤, build-deb.sh를 OPL_RESTORE_IMAGE_DIR와 다시 돌려 셋째 꾸러미 orbivisor-restore-image를 만든다.
+      - name: File restore helper image
+        id: image
+        env:
+          OPL_DEV_LICENSE: "1"
+        run: |
+          sudo apt-get install -y libarchive-tools zstd
+          rustup target add x86_64-unknown-linux-musl
+          packaging/restore-image/build.sh --arch x86_64 --version "$OPL_VERSION" --out dist/restore-image/x86_64
+          OPL_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 packaging/deb/build-deb.sh "$OPL_VERSION" dist
+          echo "deb=dist/orbivisor-restore-image_${OPL_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
       - name: Package info and contents
         env:
           DEB: ${{ steps.build.outputs.deb }}
           TRANS_DEB: ${{ steps.build.outputs.transitional }}
+          IMAGE_DEB: ${{ steps.image.outputs.deb }}
         run: |
-          for deb in "$DEB" "$TRANS_DEB"; do
+          for deb in "$DEB" "$TRANS_DEB" "$IMAGE_DEB"; do
             dpkg-deb --info "$deb"
             dpkg-deb --contents "$deb"
           done
@@ -143,9 +161,10 @@ jobs:
         env:
           DEB: ${{ steps.build.outputs.deb }}
           TRANS_DEB: ${{ steps.build.outputs.transitional }}
+          IMAGE_DEB: ${{ steps.image.outputs.deb }}
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
-            bash /work/packaging/tests/deb-test.sh "/work/$DEB" "/work/$TRANS_DEB"
+            bash /work/packaging/tests/deb-test.sh "/work/$DEB" "/work/$TRANS_DEB" "/work/$IMAGE_DEB"
       - name: APT repository test in Debian 13
         env:
           DEB: ${{ steps.build.outputs.deb }}

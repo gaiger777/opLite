@@ -1,14 +1,16 @@
 #!/bin/bash
 # orbivisor 패키지와 전환 패키지 oplite를 Debian 13 컨테이너 안에서 설치해 본다(root, systemd는 돌지 않음).
-# 쓰는 법(CI): docker run --rm -v "$PWD:/work" debian:13 bash /work/packaging/tests/deb-test.sh /work/<orbivisor deb> /work/<oplite deb>
+# 셋째 인자(파일 복원 도우미 이미지 꾸러미 orbivisor-restore-image)가 있으면 그것도 설치해 파일 자리·판을 본다.
+# 쓰는 법(CI): docker run --rm -v "$PWD:/work" debian:13 bash /work/packaging/tests/deb-test.sh /work/<orbivisor deb> /work/<oplite deb> [/work/<orbivisor-restore-image deb>]
 set -eu
 
-[ $# -eq 2 ] || {
-	echo "usage: $0 <orbivisor deb> <oplite deb>" >&2
+[ $# -eq 2 ] || [ $# -eq 3 ] || {
+	echo "usage: $0 <orbivisor deb> <oplite deb> [<orbivisor-restore-image deb>]" >&2
 	exit 2
 }
 DEB=$1
 TRANS_DEB=$2
+IMAGE_DEB=${3:-}
 
 fail() {
 	echo "deb-test: FAIL: $*" >&2
@@ -73,6 +75,31 @@ apt-get remove -y oplite
 [ "$(dpkg-query -W -f '${Status}' orbivisor)" = "install ok installed" ] || fail "oplite를 지우자 orbivisor가 바뀜"
 [ -L "$LINK" ] || fail "oplite를 지운 뒤 enable 링크 없음"
 [ -x /usr/bin/opld ] || fail "oplite를 지운 뒤 /usr/bin/opld 없음"
+
+# 파일 복원 도우미 이미지(계획 69): orbivisor 같은 판에 의존, /usr/share/orbivisor/restore/x86_64의 커널·initrd·manifest,
+# manifest의 이미지 판이 꾸러미 판. 지우면 파일이 사라지고 orbivisor는 그대로다.
+if [ -n "$IMAGE_DEB" ]; then
+	[ "$(dpkg-deb -f "$IMAGE_DEB" Depends)" = "orbivisor (= $VERSION)" ] || fail "image Depends: $(dpkg-deb -f "$IMAGE_DEB" Depends)"
+	apt-get install -y --no-install-recommends "$IMAGE_DEB"
+	[ "$(dpkg-query -W -f '${Version}' orbivisor-restore-image)" = "$VERSION" ] || fail "orbivisor-restore-image 버전"
+	R=/usr/share/orbivisor/restore/x86_64
+	for path in "$R/vmlinuz" "$R/initrd.img" "$R/manifest.json" /usr/share/doc/orbivisor-restore-image/copyright \
+		/usr/share/doc/orbivisor-restore-image/debian.lock; do
+		[ "$(stat -c '%a %U' "$path")" = "644 root" ] || fail "$path: $(stat -c '%a %U' "$path" 2>&1)"
+	done
+	grep -q "\"image_version\": \"orbivisor $VERSION lock-" "$R/manifest.json" || fail "manifest: $(cat "$R/manifest.json")"
+	grep -q '"arch": "x86_64"' "$R/manifest.json" || fail "manifest arch: $(cat "$R/manifest.json")"
+	# initrd는 zstd, 커널은 bzImage, 해시는 manifest와 같다
+	[ "$(od -An -tx1 -N4 "$R/initrd.img" | tr -d ' ')" = 28b52ffd ] || fail "initrd.img is not zstd"
+	[ "$(dd if="$R/vmlinuz" bs=1 skip=514 count=4 2>/dev/null)" = HdrS ] || fail "vmlinuz is not a bzImage"
+	for f in vmlinuz initrd.img; do
+		grep -q "\"$f\": \"$(sha256sum "$R/$f" | cut -d' ' -f1)\"" "$R/manifest.json" || fail "$f hash is not in manifest.json"
+	done
+	dpkg --verify orbivisor-restore-image || fail "dpkg --verify orbivisor-restore-image"
+	apt-get remove -y orbivisor-restore-image
+	[ ! -e "$R/initrd.img" ] || fail "orbivisor-restore-image를 지운 뒤 initrd.img가 남음"
+	[ "$(dpkg-query -W -f '${Status}' orbivisor)" = "install ok installed" ] || fail "이미지를 지우자 orbivisor가 바뀜"
+fi
 
 # purge: enable 링크와 opld가 쓴 APT 소스 파일은 지우고, 데이터(/var/lib/opl)와 설정(/etc/opl)은 남긴다.
 mkdir -p /var/lib/opl /etc/opl

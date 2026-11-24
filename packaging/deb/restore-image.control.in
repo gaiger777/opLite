@@ -1,0 +1,16 @@
+Package: orbivisor-restore-image
+Version: @VERSION@
+Architecture: amd64
+Maintainer: Orbivisor developers <gaiger777@gmail.com>
+Installed-Size: @INSTALLED_SIZE@
+Depends: orbivisor (= @VERSION@)
+Section: admin
+Priority: optional
+Homepage: https://github.com/gaiger777/opLite
+Description: Orbivisor file restore helper VM image
+ The kernel and initramfs of the disposable helper VM that Orbivisor starts
+ to browse VM backups and download single files from them (file-level
+ restore). The guest kernel, not the host, reads the filesystems in the
+ backup. The image is built from the Debian 13 packages pinned in
+ /usr/share/doc/orbivisor-restore-image/debian.lock and the Orbivisor
+ restore agent.

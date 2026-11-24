@@ -288,6 +288,71 @@ OPL_LICENSE_KEYS=$RELEASE_KEYS OPL_DEV_LICENSE='' run 0.1.0
 check_key_error "orbivisord에 OPL_LICENSE_KEYS가 그대로 없으면 거절" \
 	'build-deb: orbivisord was not built with this OPL_LICENSE_KEYS'
 
+# 파일 복원 도우미 이미지(계획 69): OPL_RESTORE_IMAGE_DIR이 있으면 셋째 패키지 orbivisor-restore-image를 만든다.
+# manifest.json의 이미지 판은 패키지 버전과 저장소 debian.lock 해시 앞 12자여야 하고, 아키텍처는 x86_64여야 한다.
+if command -v sha256sum >/dev/null; then
+	LOCK_SHA=$(sha256sum "$DEB_DIR/../restore-image/debian.lock" | cut -c1-12)
+else
+	LOCK_SHA=$(shasum -a 256 "$DEB_DIR/../restore-image/debian.lock" | cut -c1-12)
+fi
+# fake_image <이미지 판> [아키텍처]: 가짜 이미지 디렉터리 $WORK/image
+fake_image() {
+	rm -rf "${WORK:?}/image"
+	mkdir -p "$WORK/image"
+	printf 'kernel' >"$WORK/image/vmlinuz"
+	printf 'initrd' >"$WORK/image/initrd.img"
+	chmod 0600 "$WORK/image/initrd.img"
+	printf '{\n  "arch": "%s",\n  "image_version": "%s",\n  "proto": 1\n}\n' "${2:-x86_64}" "$1" >"$WORK/image/manifest.json"
+}
+fake_bins 0.1.0~ci7 0.1.0~ci7
+fake_image "orbivisor 0.1.0~ci7 lock-$LOCK_SHA"
+OPL_RESTORE_IMAGE_DIR="$WORK/image" run 0.1.0~ci7
+I="$WORK/tree-orbivisor-restore-image"
+R=usr/share/orbivisor/restore/x86_64
+if [ "$code" -eq 0 ] && [ "$(sed -n 3p "$WORK/stdout")" = "$WORK/out/orbivisor-restore-image_0.1.0~ci7_amd64.deb" ] &&
+	[ -f "$WORK/out/orbivisor-restore-image_0.1.0~ci7_amd64.deb" ] &&
+	[ "$(cd "$I" && find usr ! -type d | LC_ALL=C sort)" = "usr/share/doc/orbivisor-restore-image/copyright
+usr/share/doc/orbivisor-restore-image/debian.lock
+$R/initrd.img
+$R/manifest.json
+$R/vmlinuz" ] && cmp -s "$WORK/image/initrd.img" "$I/$R/initrd.img" &&
+	[ -n "$(find "$I/$R/initrd.img" -perm 0644)" ] &&
+	cmp -s "$DEB_DIR/../restore-image/debian.lock" "$I/usr/share/doc/orbivisor-restore-image/debian.lock" &&
+	grep -qx 'Package: orbivisor-restore-image' "$I/DEBIAN/control" &&
+	grep -qx 'Version: 0.1.0~ci7' "$I/DEBIAN/control" &&
+	grep -qx 'Architecture: amd64' "$I/DEBIAN/control" &&
+	grep -qx 'Depends: orbivisor (= 0.1.0~ci7)' "$I/DEBIAN/control" &&
+	grep -q " $R/manifest.json\$" "$I/DEBIAN/md5sums" && [ "$(ls "$I/DEBIAN")" = "control
+md5sums" ] &&
+	grep -q '^Recommends: .*orbivisor-restore-image' "$WORK/tree-orbivisor/DEBIAN/control"; then
+	ok "OPL_RESTORE_IMAGE_DIR가 있으면 셋째 패키지 orbivisor-restore-image(/$R, Depends orbivisor 같은 판)"
+else
+	fail "도우미 이미지 패키지: 종료 코드 $code $(cat "$WORK/stdout" "$WORK/stderr") $(find "$I" | sort)"
+fi
+# check_image_error <이름>: 종료 코드 1, 패키지 없음
+check_image_error() {
+	if [ "$code" -eq 1 ] && grep -q -e 'OPL_RESTORE_IMAGE_DIR has no' -e 'is not an x86_64 image built for' "$WORK/stderr" &&
+		[ ! -e "$WORK/out" ]; then
+		ok "$1"
+	else
+		fail "$1: 종료 코드 $code"
+		cat "$WORK/stderr"
+	fi
+}
+fake_image "orbivisor 0.1.0~ci6 lock-$LOCK_SHA"
+OPL_RESTORE_IMAGE_DIR="$WORK/image" run 0.1.0~ci7
+check_image_error "이미지 판이 패키지 버전과 다르면 실패"
+fake_image "orbivisor 0.1.0~ci7 lock-000000000000"
+OPL_RESTORE_IMAGE_DIR="$WORK/image" run 0.1.0~ci7
+check_image_error "이미지가 다른 debian.lock으로 만든 것이면 실패"
+fake_image "orbivisor 0.1.0~ci7 lock-$LOCK_SHA" aarch64
+OPL_RESTORE_IMAGE_DIR="$WORK/image" run 0.1.0~ci7
+check_image_error "aarch64 이미지는 실패"
+fake_image "orbivisor 0.1.0~ci7 lock-$LOCK_SHA"
+rm "$WORK/image/initrd.img"
+OPL_RESTORE_IMAGE_DIR="$WORK/image" run 0.1.0~ci7
+check_image_error "이미지 파일이 빠지면 실패"
+
 if [ "$FAILED" -ne 0 ]; then
 	echo "build-deb-test: 실패"
 	exit 1
