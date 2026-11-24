@@ -218,6 +218,35 @@ pub async fn check_vm(
             "a check can plan at most {MAX_PLANNED_VOLUMES} volumes and {MAX_PLANNED_RULES} placement rules"
         )));
     }
+    Ok(Json(
+        Box::pin(check_planned(&state, &principal, req))
+            .await?
+            .check,
+    ))
+}
+
+/// 미리 확인 하나의 결과: 답과, 통과했을 때 스케줄러가 고른 노드 id(이름을 볼 수 없어도 — 안쪽에서만 쓴다)
+pub(crate) struct Checked {
+    pub check: VmCheck,
+    pub node: Option<Uuid>,
+}
+
+impl Checked {
+    fn answer(found: Problems) -> Self {
+        Self {
+            check: found.answer(),
+            node: None,
+        }
+    }
+}
+
+/// [`check_vm`]의 검사(기능·개수 한도 없이 — VMware 이전의 VM마다 미리 확인도 부른다, 계획 72 §8.5). 대상 폴더에 `vm.create`가
+/// 없으면 403(404)이고, 그 밖의 문제는 답에 모은다.
+pub(crate) async fn check_planned(
+    state: &AppState,
+    principal: &Principal,
+    req: VmCheckRequest,
+) -> Result<Checked, ApiError> {
     let mut found = Problems::default();
     match check_name(&req.name) {
         Err(e) => found.error("name", e)?,
@@ -230,7 +259,7 @@ pub async fn check_vm(
         Ok(()) => {}
     }
     let mut spec = req.spec;
-    let machine = match fill_machine(&state, &mut spec) {
+    let machine = match fill_machine(state, &mut spec) {
         Ok(()) => None,
         Err(e) if e.status.is_client_error() => Some(e),
         Err(e) => return Err(e),
@@ -247,22 +276,22 @@ pub async fn check_vm(
     }
     state
         .authz
-        .require_new(&principal, Privilege::VmCreate, Kind::Vm, folder)?;
+        .require_new(principal, Privilege::VmCreate, Kind::Vm, folder)?;
     let (Some(spec), None) = (parsed, machine.as_ref()) else {
         found.error("compute", machine.expect("no spec without a machine error"))?;
-        return Ok(Json(found.answer()));
+        return Ok(Checked::answer(found));
     };
 
-    for (at, e) in attachment_problems(&state, &principal, &spec, None)? {
+    for (at, e) in attachment_problems(state, principal, &spec, None)? {
         found.error(&at, e)?;
     }
     found.check(
         "compute",
-        crate::cpu::check_flag_privilege(&state, &principal, &spec.cpu.flags, &[]),
+        crate::cpu::check_flag_privilege(state, principal, &spec.cpu.flags, &[]),
     )?;
     found.check(
         "compute",
-        crate::numa::check_privilege(&state, &principal, &spec, None),
+        crate::numa::check_privilege(state, principal, &spec, None),
     )?;
 
     let mut planned = Planned {
@@ -279,10 +308,10 @@ pub async fn check_vm(
         // 풀 권한을 다른 볼륨 검사보다 먼저 본다(리뷰 2 — `check_new_volume`은 400 검사(이름·내용·크기·`base`)가
         // 앞서므로, 400인 볼륨을 얹으면 할당할 수 없는(볼 수도 없는) 풀의 성질이 `prepare`로 드러났다). 없는 풀도 거절처럼
         // 멈춘다. `POST /volumes`의 차례는 그대로다.
-        let pool = match find_pool(&state, &v.spec.pool).and_then(|pool| {
+        let pool = match find_pool(state, &v.spec.pool).and_then(|pool| {
             state
                 .authz
-                .require(&principal, Privilege::StorageAllocate, &pool)
+                .require(principal, Privilege::StorageAllocate, &pool)
                 .map(|()| pool)
         }) {
             Ok(pool) => pool,
@@ -305,7 +334,7 @@ pub async fn check_vm(
                 format!("a volume named {:?} already exists", v.name),
             );
         }
-        match check_new_volume(&state, &principal, v) {
+        match check_new_volume(state, principal, v) {
             Ok((pool, node)) => {
                 volume.status.node = Some(node);
                 let free = state
@@ -332,14 +361,14 @@ pub async fn check_vm(
                 found.error(&at, e)?;
                 // 검사를 지나지 못한 볼륨도(풀 권한은 위에서 지났다) 그 풀의 노드에 둔다(뒤의 만들기 검사가 "풀에 닿는 노드
                 // 없음"을 덧붙이지 않게).
-                volume.status.node = pool_node(&state, &pool).ok();
+                volume.status.node = pool_node(state, &pool).ok();
             }
         }
         planned.volumes.push(volume);
     }
     for r in &req.rules {
         // 만들 권한이 없는 규칙은 보지도 얹지도 않는다(리뷰 1 2 — 얹으면 숨은 VM이 도는 노드가 드러난다).
-        if let Err(e) = state.authorize(&principal, Action::Write, PlacementRuleSpec::KIND) {
+        if let Err(e) = state.authorize(principal, Action::Write, PlacementRuleSpec::KIND) {
             found.error("placement", e)?;
             continue;
         }
@@ -351,7 +380,7 @@ pub async fn check_vm(
                     "name_taken",
                     format!("a placement rule named {:?} already exists", r.name),
                 )),
-                None => crate::placement_rules::check(&state, &rule),
+                None => crate::placement_rules::check(state, &rule),
             }
         });
         found.check("placement", checked)?;
@@ -359,7 +388,7 @@ pub async fn check_vm(
     }
     // 권한 거절이 있으면 만들기도 거기서 멈춘다: 거절만 돌려준다(노드·주소 없이).
     if found.refused {
-        return Ok(Json(found.answer()));
+        return Ok(Checked::answer(found));
     }
     found.check(
         "quota",
@@ -369,28 +398,31 @@ pub async fn check_vm(
     let mut vm: Vm = Resource::new(req.name, spec);
     vm.labels = req.labels;
     let picks = vm.spec.power == PowerState::Running && vm.spec.node.is_none();
-    let scoring = score::scorer(&state, picks).await;
-    match prepare_with(&state, &mut vm, &scoring.scorer(), &planned) {
+    let scoring = score::scorer(state, picks).await;
+    match prepare_with(state, &mut vm, &scoring.scorer(), &planned) {
         Err(e) => {
-            let e = hide_node_reasons(&state, &principal, e);
+            let e = hide_node_reasons(state, principal, e);
             let at = slot_of(&e, &vm.spec);
             found.error(&at, e)?;
-            Ok(Json(found.answer()))
+            Ok(Checked::answer(found))
         }
         Ok(()) => {
             let node = match vm.spec.node {
-                Some(id) if crate::cpu::sees_node_names(&state, &principal) => {
+                Some(id) if crate::cpu::sees_node_names(state, principal) => {
                     state.cluster.get::<NodeSpec>(id)?.map(|n| n.name)
                 }
                 _ => None,
             };
-            Ok(Json(VmCheck {
-                node,
-                machine: Some(vm.spec.machine),
-                cpu_model: Some(vm.spec.cpu.model.clone()),
-                ips: vm.spec.nics.iter().map(|n| n.ips.clone()).collect(),
-                ..found.answer()
-            }))
+            Ok(Checked {
+                check: VmCheck {
+                    node,
+                    machine: Some(vm.spec.machine),
+                    cpu_model: Some(vm.spec.cpu.model.clone()),
+                    ips: vm.spec.nics.iter().map(|n| n.ips.clone()).collect(),
+                    ..found.answer()
+                },
+                node: vm.spec.node,
+            })
         }
     }
 }

@@ -195,6 +195,11 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ImportCmd,
     },
+    /// VMware 이전(계획 72): 저장한 vCenter·ESXi 연결과 인벤토리, 여러 VM의 이전 계획·미리 확인
+    Vmware {
+        #[command(subcommand)]
+        cmd: crate::vmware::VmwareCmd,
+    },
     /// VM 내보내기(OVA/OVF, 계획 72): 목록·보기·내려받기·지우기. 만들기는 `vm export`
     Export {
         #[command(subcommand)]
@@ -6624,6 +6629,7 @@ async fn run_cli(cli: Cli, out: &mut (dyn Write + Send)) -> anyhow::Result<()> {
             .await?
         }
         Cmd::Import { cmd } => import(&client, cmd, json_out, out).await?,
+        Cmd::Vmware { cmd } => Box::pin(crate::vmware::vmware(&client, cmd, json_out, out)).await?,
         Cmd::Export { cmd } => {
             Box::pin(crate::vm_export::export(
                 &client,
@@ -14302,6 +14308,125 @@ mod tests {
     }
 
     /// `import` 명령의 인자
+    /// `vmware source …`·`vmware migration …`(계획 72)의 인자
+    #[test]
+    fn parses_vmware_commands() {
+        use crate::vmware::{MigrationCmd, SourceCmd, VmwareCmd};
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vmware",
+            "source",
+            "add",
+            "vc1",
+            "--host",
+            "vc",
+            "--user",
+            "u",
+            "--fingerprint",
+            "AB",
+            "--vddk",
+            "--vddk-libdir",
+            "/opt/vddk",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vmware {
+                cmd: VmwareCmd::Source {
+                    cmd: SourceCmd::Add { .. }
+                }
+            }
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "oplctl",
+                "vmware",
+                "source",
+                "add",
+                "vc1",
+                "--host",
+                "vc",
+                "--user",
+                "u",
+                "--vddk-libdir",
+                "/x"
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "oplctl",
+            "vmware",
+            "migration",
+            "create",
+            "wave1",
+            "--source",
+            "vc1",
+            "--warm",
+            "--vm",
+            "DC1/vm/web01",
+            "--vm",
+            "vm-7",
+            "--net",
+            "VM Network=lan",
+            "--datastore",
+            "ds1=fast",
+            "--sync-every",
+            "2h",
+            "--cutover-at",
+            "2026-12-01T02:00:00Z",
+            "--shutdown",
+            "power-off",
+            "--folders",
+            "mirror",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Vmware {
+                cmd: VmwareCmd::Migration {
+                    cmd: MigrationCmd::Create(_)
+                }
+            }
+        ));
+        // 따뜻한·차가운 가운데 하나, VM은 하나 이상
+        for bad in [
+            &["--source", "vc1", "--vm", "x"][..],
+            &["--source", "vc1", "--warm", "--cold", "--vm", "x"],
+            &["--source", "vc1", "--warm"],
+            &[
+                "--source",
+                "vc1",
+                "--warm",
+                "--vm",
+                "x",
+                "--sync-every",
+                "soon",
+            ],
+        ] {
+            let mut argv = vec!["oplctl", "vmware", "migration", "create", "w"];
+            argv.extend_from_slice(bad);
+            assert!(Cli::try_parse_from(argv).is_err(), "{bad:?}");
+        }
+        for sub in [
+            &["source", "list"][..],
+            &["source", "browse", "vc1", "--path", "DC1/vm", "--refresh"],
+            &["source", "set", "vc1", "--password", "--no-vddk"],
+            &["source", "check", "vc1"],
+            &["migration", "preflight", "w", "--vm", "web01"],
+            &["migration", "start", "w"],
+            &["migration", "pause", "w"],
+            &["migration", "resume", "w"],
+            &["migration", "cancel", "w"],
+            &["migration", "delete", "w"],
+            &["migration", "get", "w"],
+            &["migration", "list"],
+        ] {
+            let mut argv = vec!["oplctl", "vmware"];
+            argv.extend_from_slice(sub);
+            assert!(Cli::try_parse_from(argv).is_ok(), "{sub:?}");
+        }
+    }
+
     /// `vm export`·`export …`(계획 72)의 인자
     #[test]
     fn parses_vm_export_and_export_commands() {

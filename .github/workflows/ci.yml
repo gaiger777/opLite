@@ -34,8 +34,9 @@ jobs:
       # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
       # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
       - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
-      # 가짜 vSphere(계획 72, 같은 프로세스 — 시스템 도구 없음): 세션·인벤토리·CBT 회차와 게스트 쓰기·티켓 범위 읽기·결함
-      - run: cargo test -p opl-api --features fake-vsphere --test vsphere
+      # 가짜 vSphere(계획 72, 같은 프로세스 — 시스템 도구 없음): 세션·인벤토리·CBT 회차와 게스트 쓰기·티켓 범위 읽기·결함,
+      # 원본 연결·찾아보기·이전 계획·미리 확인 API
+      - run: cargo test -p opl-api --features fake-vsphere --test vsphere --test vmware_api
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)

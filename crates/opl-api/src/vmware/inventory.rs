@@ -120,7 +120,7 @@ pub fn prop_specs() -> Vec<PropSpec<'static>> {
 /// 디스크 컨트롤러 종류의 차례(계획 30 `.vmx`와 같다)
 const CONTROLLERS: [&str; 4] = ["ide", "sata", "scsi", "nvme"];
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvDatacenter {
     pub moref: String,
     pub name: String,
@@ -128,7 +128,7 @@ pub struct InvDatacenter {
     pub path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvFolder {
     pub moref: String,
     pub name: String,
@@ -139,7 +139,7 @@ pub struct InvFolder {
     pub child_types: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvCompute {
     pub moref: String,
     pub name: String,
@@ -150,7 +150,7 @@ pub struct InvCompute {
     pub datacenter: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvHost {
     pub moref: String,
     /// 관리 주소(vCenter에 더한 이름 — 보통 FQDN이나 IP)
@@ -165,7 +165,7 @@ pub struct InvHost {
     pub datacenter: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvDatastore {
     pub moref: String,
     pub name: String,
@@ -186,7 +186,7 @@ impl InvDatastore {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum NetworkKind {
     Standard,
@@ -194,7 +194,7 @@ pub enum NetworkKind {
     Opaque,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvNetwork {
     pub moref: String,
     pub name: String,
@@ -207,7 +207,7 @@ pub struct InvNetwork {
     pub datacenter: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvDisk {
     /// 장치 키
     pub key: i32,
@@ -237,7 +237,7 @@ impl InvDisk {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvNic {
     pub key: i32,
     /// 네트워크 이름(분산 포트 그룹은 포트 그룹 이름, 모르면 `dvs:{키}`·`nsx:{id}`)
@@ -249,7 +249,7 @@ pub struct InvNic {
     pub start_connected: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvSnapshot {
     pub moref: String,
     pub name: String,
@@ -259,7 +259,7 @@ pub struct InvSnapshot {
     pub parent: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct InvVm {
     pub moref: String,
     pub name: String,
@@ -293,6 +293,7 @@ pub struct InvVm {
     pub template: bool,
     pub annotation: Option<String>,
     /// Tools가 알린 MAC(소문자) → IP
+    #[schema(value_type = BTreeMap<String, Vec<String>>)]
     pub guest_ips: BTreeMap<String, Vec<IpAddr>>,
     pub committed_bytes: u64,
     pub resource_pool: Option<String>,
@@ -346,7 +347,7 @@ impl InvVm {
 }
 
 /// 읽은 인벤토리
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 pub struct Inventory {
     pub datacenters: Vec<InvDatacenter>,
     pub folders: Vec<InvFolder>,

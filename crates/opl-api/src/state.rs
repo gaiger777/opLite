@@ -97,6 +97,8 @@ pub struct AppState {
     pub file_restore: Arc<crate::file_restore::FileRestoreSessions>,
     /// 노드 설정 `[vmware]`(계획 72 — 선택 VDDK 길의 nbdkit·라이브러리 자리)
     pub vmware: crate::vmware::VmwareNodeConfig,
+    /// 원본별 vSphere 세션(5분)·인벤토리(60초) 캐시(계획 72 §7.1·§8.2 — 이 노드의 API가 쓴다)
+    pub vmware_cache: Arc<crate::vmware_sources::VsphereCache>,
 }
 
 impl AppState {
@@ -143,6 +145,7 @@ impl AppState {
             prometheus_cache: Default::default(),
             file_restore: Arc::default(),
             vmware: Default::default(),
+            vmware_cache: Default::default(),
         }
     }
 }

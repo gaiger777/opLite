@@ -447,6 +447,62 @@ OVF 1.0 봉투(ovftool·vSphere·VirtualBox가 모두 받는 판, `vmw` 확장):
   호스트에서 읽음을 본다 — 스테이지 4 회차 알고리즘의 본보기다.
 - **잰 것**: 가짜 vSphere VM 2 000대 인벤토리(객체 2 035개, 쪽 다섯) — 개발 Mac(디버그 빌드) 1.1초. 실제 vCenter 수치는 손 확인.
 
+### 스테이지 3
+
+- **권한 모델**: 계획(`vmware-migration`)·항목(`vmware-vm`)은 **루트 종류**로 두었다(폴더 트리 `FolderKind`에 넣지 않음). 읽기는 루트
+  `system.read`, 만들기·바꾸기·지우기·미리 확인·시작/멈춤/이어 가기/취소는 경로표의 루트 `vm.create`(§13 표 그대로 —
+  `kind_privilege`의 `cluster.admin` 쓰기는 핸들러가 부르지 않는다). 그래서 `VmwareMigrationSpec.folder`는 쓰지 않는다(API가 늘
+  비워 만든다 — 폴더에 사는 계획은 나중 일). 규칙·덮어쓰기가 가리키는 폴더는 만들기·바꾸기 때 그 폴더의 `vm.create`(Mirror는
+  `under`의 `inventory.folder`)를 보고, 미리 확인이 VM마다 대상 폴더의 `vm.create`를 다시 본다. watch는 둘을 루트 종류로 더했다
+  (비밀 없음).
+- **원본 연결 API**: 본문은 `{name, host, port?, user, password, fingerprint?, vddk?: {libdir?}, datacenter_hint?}`(전송은
+  `vddk` 칸 — 썸프린트는 서버가 잰다). 지문이 없으면 다른 칸을 먼저 검증한 뒤 연결만 해 409 `untrusted_certificate`
+  (`details.fingerprint`·`thumbprint_sha1`, 로그인 없음). `PATCH`는 주어진 칸만 바꾸고 **다시 로그인해 본 뒤에만** 저장한다(틀린
+  비밀번호는 저장되지 않는다, `vddk: null`이면 `/folder`로). `actions/check`는 캐시를 버리고 다시 로그인해 `status`를 적고,
+  실패하면 `status.error`를 적은 뒤 그 오류를 돌려준다. 보기는 `VmwareSourceSpecView`(비밀번호 칸 없음). 무료 ESXi의
+  `status.restricted`는 만들 때 알 수 없어 거짓으로 둔다(스테이지 4가 `RestrictedVersion`을 받으면 적는다).
+- **캐시**: `AppState.vmware_cache`(`VsphereCache`, `Arc`) — 원본 id별 세션(5분 쉬면 버림 → `Logout`)과 인벤토리(60초). 열쇠의
+  스펙이 지금 스펙과 다르면 쓰지 않고, 바꾸기·지우기·다시 확인이 버린다. 읽기가 실패하면 그 세션을 버린다. 30초마다 훑는 작업은
+  첫 세션을 둘 때 한 번 띄우고 캐시가 없어지면 끝난다. 시험이 시간을 줄인다(`VsphereCache::new`).
+- **찾아보기 응답**: `{fetched_at, inventory, migrating}` — `Inventory` 타입들에 `ToSchema`를 붙였다. `migrating`(끝나지 않은
+  항목의 instanceUuid·계획·항목 이름)은 항목을 읽을 수 있을 때만 채운다.
+- **계획 만들기**: VM은 `ref`(moref·인벤토리 경로·instanceUuid)로 고른다(없으면 400 `vmware_vm_not_found`). 대상 이름은
+  `target_name` 또는 원본 이름을 다듬은 것, 계획 안에서 겹치면 400 `name_taken`. 항목 이름이 겹치면 `-2`… 를 붙인다. 항목은
+  `draft` 상태에 인벤토리의 `source`를 적고(디스크 표 `disks`는 스테이지 4가 채운다), 하나라도 만들지 못하면 만든 항목과 계획을
+  지운다. Raft 독점 키 거절은 409 `vm_in_migration`(그 VM을 가진 계획·항목 이름을 알린다). `cutover.at`은 API에서도 유닉스
+  초이고 CLI가 RFC 3339를 바꾼다.
+- **매핑**: `import_spec_with`는 더하지 않았다 — 지금 `import_spec`은 풀을 받지 않고(볼륨 이름만) 디스크별 풀은 만들 볼륨 목록
+  (`vmware_migrations/plan.rs` `map_vm` — `{대상}-disk{i}`, 크기 = 원본 용량, 풀의 기본 형식, 레이블 `orbivisor.io/vmware-vm`)에
+  있다. 네트워크는 덮어쓰기(원본 이름) > 규칙(이름 또는 `moref:{키}`) > 제안(**묻는 주체가 볼 수 있는** 같은 이름 네트워크만 —
+  숨은 네트워크를 고르지 않게). `reserve_ips`의 Tools IP 예약은 스테이지 5(덮어쓰기 `ips`만 쓴다). Windows + `driver_iso`면 CD를
+  붙인다. `start_after`면 켜진 채 만드는 VM으로 확인한다(스케줄러가 노드를 고른다). 제안의 "원본을 끄고 켜라"(MAC) 경고는
+  전환이 끄므로 뺐다.
+- **머신**: 미리 확인은 `import_spec`의 `q35`를 빼고 만들기처럼 노드 아키텍처로 채운다(x86 클러스터는 q35, aarch64 실험실은
+  virt — 그러면 Windows의 SATA는 막힌다). 스테이지 5의 VM 만들기도 같게 채워야 미리 확인과 맞다.
+- **미리 확인 차례(VM마다)**: 매핑을 풀지 못하면(네트워크 `network_unmapped`·풀 `pool_unmapped`·SATA 개수) 대상 폴더 권한을 먼저
+  보고(거절이면 그것만) 매핑 문제를 낸다. 풀면 계획 71 `vm_checks::check_planned`(핸들러에서 꺼낸 안쪽 — 대상 폴더 `vm.create`
+  먼저, 첫 거절에서 멈춤, 만들 볼륨 16개 한도 없이)를 부르고, 거절이 없을 때만 제안 경고·게스트 힌트·Mirror 폴더 알림
+  (`folder_created`)을 더한다. VMware 쪽 표(`source`·`disks.N` 자리, 인벤토리 값만)는 늘 더한다(우리 숨은 것이 아니다). 자리는
+  계획 71의 것에 `folder`·`source`·`guest`를 더했다. `node`는 노드 이름을 볼 수 있을 때만, `spec_preview`는 우리 쪽을 통과했을
+  때만. 미리 확인 끝점은 노드 캐시를 쓰고(`refresh`로 다시), 시작은 늘 다시 읽는다.
+- **VMware 쪽 코드**: `vmware_vm_replaced`(instanceUuid 바뀜)·`vmware_vm_gone`·`vmware_snapshots`(우리 moref 아닌 스냅샷)·`vmware_ft`·
+  `vmware_template`·`vmware_hw_version`·`vmware_restricted`(따뜻한만)·`vmware_powered_on`(차가운만)·`vmware_no_tools`(경고 —
+  따뜻한 + 게스트 종료)·`vmware_too_many_disks`(32)·`vmware_no_disks`·`vmware_rdm`·`vmware_disk_backing`(flat이 아님)·
+  `vmware_multi_writer`·`vmware_independent_disk`(따뜻한만)·`vmware_needs_vddk`(vSAN·vVols + `/folder`). 게스트 힌트:
+  `guest_initramfs`(RHEL 계열 + virtio-blk)·`guest_drivers`(Windows, ISO 없음)·`guest_nic_renamed`(Tools IP가 있고 NIC 모델이 바뀜).
+  NIC 16개 한도는 VmSpec 검증(우리 쪽)이 잡는다.
+- **상태 동작**: `start`(`draft`만 — 409 `migration_not_draft`)는 계획을 먼저 `running`으로(revision 확인 — 겹친 요청은 409
+  `migration_busy`) 바꾸고 막힌 항목은 `failed`(`error`에 코드·이유), 통과는 `pending`(+ 고른 노드를 `spec.node`에 — 고르지
+  못했으면 비움, 경고는 `warnings`)로 둔다. `pause`·`resume`은 `running`↔`paused`(409 `migration_state`), 멈춘 사이 더한 VM은
+  `resume`이 미리 확인한다. `cancel`은 원본·우리 쪽에 남긴 것이 없는 항목(`draft`·`pending`·`failed`이고 스냅샷·CBT·볼륨·대상
+  VM·바꾼 원본 설정 없음)만 곧 `cancelled`로 둔다. `PATCH`는 `draft`·`paused`만(409 `migration_running`), 시작한 VM 빼기는 409
+  `vm_started`. `DELETE`는 `draft`이거나 끝난 계획이고 모든 항목이 끝났거나 시작하지 않았을 때만(409 `migration_active`). 항목은
+  이름·id·moref·instanceUuid·원본 VM 이름으로 고른다.
+- **CLI**: `vmware source add|list|get|set|check|delete|browse`, `vmware migration create|preflight|list|get|start|pause|resume|cancel|
+  delete`(`oplctl/src/vmware.rs`). `source add`에 지문이 없으면 비밀번호를 묻지 않고(자리 값 `-`) 서버 지문을 알린다. `--sync-every`는
+  `45m`·`2h`·분, `--cutover-at`은 RFC 3339, `--folders mirror|flat --folder 경로`, `--new-macs`·`--no-start`(설계의
+  `keep_macs`·`start_after` 끄기). `preflight`에 막힌 VM이 있으면 끝 코드 1. `vmware vm …`(전환·되돌리기 등)은 스테이지 4·5.
+
 ### 스테이지 6
 
 - **응답과 이름**: `POST /vms/{key}/export`는 202 `{export, task}`(`VmExportStarted`)다. 요청에 `name`을 더했다(없으면 백업과 같은

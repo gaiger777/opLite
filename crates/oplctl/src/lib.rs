@@ -24,6 +24,7 @@ mod sdn;
 mod template;
 mod two_factor;
 mod vm_export;
+mod vmware;
 #[cfg(test)]
 mod web_cross;
 

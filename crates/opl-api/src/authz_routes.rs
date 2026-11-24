@@ -506,6 +506,47 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
     ("POST", "/vm-imports/ova/check", Root(VmCreate)),
     ("POST", "/vm-imports/esxi/browse", Root(VmCreate)),
     ("POST", "/vm-imports/esxi", Root(VmCreate)),
+    // VMware 이전(계획 72 §13): 원본 연결은 루트 `cluster.read`·`cluster.admin`(vCenter 비밀번호를 든다), 찾아보기·계획·
+    // 미리 확인·동작은 루트 `vm.create`(대상 폴더의 `vm.create`는 핸들러·미리 확인이 VM마다 본다)
+    ("GET", "/vmware-sources", Root(ClusterRead)),
+    ("POST", "/vmware-sources", Root(ClusterAdmin)),
+    ("GET", "/vmware-sources/{key}", Root(ClusterRead)),
+    ("PATCH", "/vmware-sources/{key}", Root(ClusterAdmin)),
+    ("DELETE", "/vmware-sources/{key}", Root(ClusterAdmin)),
+    (
+        "POST",
+        "/vmware-sources/{key}/actions/check",
+        Root(ClusterAdmin),
+    ),
+    ("GET", "/vmware-sources/{key}/inventory", Root(VmCreate)),
+    ("GET", "/vmware-migrations", Root(SystemRead)),
+    ("POST", "/vmware-migrations", Root(VmCreate)),
+    ("GET", "/vmware-migrations/{key}", Root(SystemRead)),
+    ("PATCH", "/vmware-migrations/{key}", Root(VmCreate)),
+    ("DELETE", "/vmware-migrations/{key}", Root(VmCreate)),
+    ("POST", "/vmware-migrations/{key}/preflight", Root(VmCreate)),
+    (
+        "POST",
+        "/vmware-migrations/{key}/actions/start",
+        Root(VmCreate),
+    ),
+    (
+        "POST",
+        "/vmware-migrations/{key}/actions/pause",
+        Root(VmCreate),
+    ),
+    (
+        "POST",
+        "/vmware-migrations/{key}/actions/resume",
+        Root(VmCreate),
+    ),
+    (
+        "POST",
+        "/vmware-migrations/{key}/actions/cancel",
+        Root(VmCreate),
+    ),
+    ("GET", "/vmware-vms", Root(SystemRead)),
+    ("GET", "/vmware-vms/{key}", Root(SystemRead)),
     // VM 내보내기(계획 72 §12): 만들기는 VM의 `vm.export`(+ 풀 `storage.allocate` — 핸들러), 나머지는 내보낸 VM의 것
     ("POST", "/vms/{key}/export", Object(Vm, VmExport)),
     ("GET", "/vm-exports", List),

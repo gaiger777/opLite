@@ -29,6 +29,10 @@ name = "vsphere"
 required-features = ["fake-vsphere"]
 
 [[test]]
+name = "vmware_api"
+required-features = ["fake-vsphere"]
+
+[[test]]
 name = "vcsim"
 required-features = ["vcsim-it"]
 

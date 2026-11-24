@@ -132,6 +132,8 @@ impl From<ClusterError> for ApiError {
                             }
                             // 계획 68: 같은 백업 풀·S3 버킷/접두사의 다른 저장소
                             "backup-store-target" => "store_target_in_use",
+                            // 계획 72: 같은 원본 VM의 끝나지 않은 이전 항목
+                            "vmware-vm" => "vm_in_migration",
                             _ => "volume_in_use",
                         },
                         message,
@@ -282,6 +284,20 @@ mod tests {
                 (StatusCode::CONFLICT, "migration_overlap")
             );
         }
+    }
+
+    #[test]
+    fn a_source_vm_in_another_migration_is_a_conflict() {
+        let e = ApiError::from(ClusterError::Rejected(Rejection::InUse {
+            kind: opl_types::resource::Kind::VmwareVm,
+            field: "vmware-vm".into(),
+            value: "5003-aa".into(),
+            holder: uuid::Uuid::nil(),
+        }));
+        assert_eq!(
+            (e.status, e.code),
+            (StatusCode::CONFLICT, "vm_in_migration")
+        );
     }
 
     #[test]

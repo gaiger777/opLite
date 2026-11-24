@@ -23,6 +23,7 @@ use opl_types::task::{TaskOp, TaskSpec, TaskStatus};
 use opl_types::vm::{VmSpec, VmStatus};
 use opl_types::vm_export::{VmExportSpec, VmExportStatus};
 use opl_types::vm_import::{VmImportSpec, VmImportStatus};
+use opl_types::vmware::{VmwareMigrationSpec, VmwareMigrationStatus};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -133,6 +134,7 @@ macro_rules! root_kinds {
 }
 
 root_kinds!(
+    VmwareMigrationSpec,
     NodeSpec,
     SecurityGroupSpec,
     BackupJobSpec,
@@ -386,6 +388,16 @@ list_and_get!(
     "/vm-exports",
     "/vm-exports/{key}",
     "vm-exports"
+);
+// VMware 이전 계획(계획 72 — 루트 종류, `system.read`)
+list_and_get!(
+    list_vmware_migrations,
+    get_vmware_migration,
+    VmwareMigrationSpec,
+    VmwareMigrationStatus,
+    "/vmware-migrations",
+    "/vmware-migrations/{key}",
+    "vmware"
 );
 list_and_get!(
     list_ha_groups,

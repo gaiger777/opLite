@@ -4183,6 +4183,268 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/vmware-migrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_vmware_migrations"];
+        put?: never;
+        /**
+         * 이전 계획을 만든다(201 `draft`, 항목마다 `vmware-vm`): 원본 연결의 인벤토리(노드 캐시)에서 VM을 찾고(없으면 400
+         *     `vmware_vm_not_found`), 규칙을 검증한다(400 `invalid_vmware_migration`). 같은 VM이 끝나지 않은 다른 계획에 있으면 409
+         *     `vm_in_migration`. 규칙·덮어쓰기의 폴더는 그 폴더의 `vm.create`(Mirror는 `inventory.folder`)가 든다. 모든 노드가
+         *     `vmware-migrate`를 알아야 한다(409 `cluster_upgrading`). 아직 아무것도 복사하지 않는다 — 미리 확인하고 시작한다.
+         */
+        post: operations["create_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-migrations/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_vmware_migration"];
+        put?: never;
+        post?: never;
+        /**
+         * 계획과 항목을 지운다(204) — 만든 VM·볼륨·원본 VM은 그대로다. `draft`이거나 끝난(`finished`·`cancelled`) 계획이고 항목이
+         *     모두 끝났거나 시작하지 않았을 때만(아니면 409 `migration_active` — 먼저 취소한다).
+         */
+        delete: operations["delete_migration"];
+        options?: never;
+        head?: never;
+        /**
+         * 계획을 바꾼다(`draft`·`paused`만 — 아니면 409 `migration_running`): 규칙·한도·주기·전환 정책, VM 더하기·빼기. 시작한
+         *     VM은 뺄 수 없다(409 `vm_started` — 취소한다). 멈춘 계획에 더한 VM은 이어 갈 때 미리 확인한다. `If-Match`로 revision을 볼 수
+         *     있다.
+         */
+        patch: operations["patch_migration"];
+        trace?: never;
+    };
+    "/vmware-migrations/{key}/actions/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 계획을 취소한다(`cancelled`, 끝난 계획은 409 `migration_state`). 원본·우리 쪽에 남긴 것이 없는 항목은 곧 `cancelled`다.
+         *     복사를 시작한 항목은 정리 Task(우리 스냅샷·대상 볼륨 지움 — 원본은 그대로)가 맡는다(스테이지 4·5).
+         */
+        post: operations["cancel_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-migrations/{key}/actions/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 계획을 멈춘다(`running` → `paused`, 아니면 409 `migration_state`): 스케줄러가 새 동기화·전환을 만들지 않는다(도는 Task는
+         *     끝까지 간다).
+         */
+        post: operations["pause_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-migrations/{key}/actions/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** 멈춘 계획을 잇는다(`paused` → `running`, 아니면 409 `migration_state`). 멈춘 사이 더한 VM은 미리 확인해 받아들인다. */
+        post: operations["resume_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-migrations/{key}/actions/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 계획을 시작한다(`draft` → `running`, 아니면 409 `migration_not_draft`): 인벤토리를 다시 읽어 미리 확인하고, 막힌 VM은
+         *     `failed`(이유 — 나머지는 간다), 통과한 VM은 `pending`(고른 노드)로 둔다. 복사는 스케줄러가 한다(스테이지 4).
+         */
+        post: operations["start_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-migrations/{key}/preflight": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * VM마다 미리 확인한다(200 — 문제가 있어도): 계획 71 `vm-checks`의 만들기 검사(대상 폴더 권한 먼저, 첫 거절에서 멈춤),
+         *     만들 볼륨(디스크마다 — 크기 = 원본 용량, 데이터스토어 규칙의 풀), 할당량·이름·MAC·노드, 그리고 VMware 쪽(사용자 스냅샷·
+         *     독립 디스크·RDM·vSAN·FT·템플릿·하드웨어 버전·무료 ESXi·전원·Tools·멀티라이터)과 게스트 힌트. 아무것도 쓰지 않는다.
+         */
+        post: operations["preflight_migration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-sources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_sources"];
+        put?: never;
+        /**
+         * 원본 연결을 만든다(201): 로그인해 종류(vCenter·ESXi)·판을 `status`에 적는다. 지문이 없으면 연결만 해 409
+         *     `untrusted_certificate`(`details.fingerprint`·`details.thumbprint_sha1` — 확인하고 다시 보낸다), 다르면 409
+         *     `fingerprint_mismatch`. 로그인이 거절되면 400 `vmware_auth`, 닿지 않으면 502 `vmware_unreachable`. 비밀번호는 응답·
+         *     watch·감사에 없다. 모든 노드가 `vmware-migrate`를 알아야 한다(409 `cluster_upgrading`).
+         */
+        post: operations["create_source"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-sources/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_source"];
+        put?: never;
+        post?: never;
+        /** 원본 연결을 지운다(204). 쓰는 이전 계획이 있으면 409 `source_in_use`. */
+        delete: operations["delete_source"];
+        options?: never;
+        head?: never;
+        /**
+         * 원본 연결을 바꾼다: 주어진 값만 바꾸고 다시 로그인해 본 뒤 저장한다(로그인이 거절되면 저장하지 않는다). 지문을
+         *     바꾸려면 새 지문을 준다(서버 인증서가 바뀐 뒤). VDDK 길이면 썸프린트를 다시 잰다. `If-Match`로 revision을 볼 수 있다.
+         */
+        patch: operations["patch_source"];
+        trace?: never;
+    };
+    "/vmware-sources/{key}/actions/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 원본에 다시 로그인해 종류·판을 `status`에 적는다(캐시를 쓰지 않는다). 실패하면 `status.error`에 적고 그 오류를
+         *     돌려준다(400 `vmware_auth`, 502 `vmware_unreachable`, 409 `fingerprint_mismatch` …).
+         */
+        post: operations["check_source"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-sources/{key}/inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 원본의 인벤토리(데이터센터·폴더·클러스터·호스트·데이터스토어·네트워크·VM — §7.3). 노드가 60초 담아 두고
+         *     (`refresh=true`면 다시 읽는다) 비밀은 없다. 이전 계획 항목을 볼 수 있으면 끝나지 않은 계획에 든 VM도 알린다. 닿지
+         *     않으면 502 `vmware_unreachable`, 로그인이 거절되면 400 `vmware_auth`.
+         */
+        get: operations["source_inventory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-vms": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 이전 항목(`vmware-vm`). `migration`을 주면 그 계획의 것만(없는 계획은 404). */
+        get: operations["list_items"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/vmware-vms/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_item"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/volumes": {
         parameters: {
             query?: never;
@@ -5896,6 +6158,23 @@ export interface components {
             /** @description `monitors`는 API가 채운다(주면 400). */
             spec: components["schemas"]["LoadBalancerSpec"];
         };
+        /** @description 이전 계획 만들기 본문 */
+        CreateMigrationRequest: {
+            /** @description 전환 정책. `at`은 유닉스 초(CLI는 RFC 3339를 받아 바꾼다). */
+            cutover?: components["schemas"]["VmwareCutoverPolicy"];
+            labels?: {
+                [key: string]: string;
+            };
+            limits?: components["schemas"]["VmwareLimits"];
+            mode: components["schemas"]["VmwareMigrationMode"];
+            name: string;
+            rules?: components["schemas"]["VmwareRules"];
+            /** @description 원본 연결(`vmware-source`의 이름 또는 id) */
+            source: string;
+            sync?: components["schemas"]["VmwareSyncPolicy"];
+            /** @description 옮길 VM(1~200대) */
+            vms: components["schemas"]["MigrationVmRequest"][];
+        };
         /** @description `POST /network-migrations` */
         CreateNetworkMigration: {
             labels?: {
@@ -6261,6 +6540,29 @@ export interface components {
             memory?: boolean | null;
             /** @description VM 안에서 고유한 이름 */
             name: string;
+        };
+        /** @description 원본 연결 만들기 본문 */
+        CreateSourceRequest: {
+            /** @description 데이터센터 이름 힌트(ESXi는 `ha-datacenter`) */
+            datacenter_hint?: string;
+            /** @description 믿을 서버 인증서의 SHA-256 지문. 없으면 409 `untrusted_certificate`(`details.fingerprint`)로 알려 준다. */
+            fingerprint?: string;
+            /** @description vCenter·ESXi 호스트 이름 또는 IP */
+            host: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /** @description 저장한다(Raft). 응답·watch·감사에는 없다. */
+            password: string;
+            /**
+             * Format: int32
+             * @description 기본 443
+             */
+            port?: number;
+            user: string;
+            /** @description 디스크를 VDDK로 읽는다(없으면 데이터스토어 `/folder` 범위 읽기). */
+            vddk?: components["schemas"]["VddkRequest"];
         };
         /** @description 저장소 만들기 본문 */
         CreateStoreRequest: {
@@ -7527,6 +7829,171 @@ export interface components {
          * @enum {string}
          */
         InterfaceKind: "ethernet" | "bond" | "bridge" | "vlan" | "dummy" | "veth" | "other";
+        InvCompute: {
+            /** @description 클러스터(`ClusterComputeResource`)인가 — 아니면 단독 호스트의 컴퓨트 리소스 */
+            cluster: boolean;
+            /** @description 데이터센터 경로(`DC1`, `Europe/DC2` — `/folder`의 `dcPath`) */
+            datacenter?: string | null;
+            moref: string;
+            name: string;
+            path: string;
+        };
+        InvDatacenter: {
+            moref: string;
+            name: string;
+            /** @description 루트 폴더 아래 경로(`DC1`, `Europe/DC2`) — `/folder`의 `dcPath` */
+            path: string;
+        };
+        InvDatastore: {
+            browser?: string | null;
+            /** Format: int64 */
+            capacity: number;
+            /** @description 데이터센터 경로(`DC1`, `Europe/DC2` — `/folder`의 `dcPath`) */
+            datacenter?: string | null;
+            /** Format: int64 */
+            free: number;
+            /** @description `summary.type`(`VMFS`, `NFS`, `NFS41`, `vsan`, `VVOL` …) */
+            kind: string;
+            moref: string;
+            name: string;
+        };
+        InvDisk: {
+            /** @description `flat` | `rdm` | `sparse` | `other` */
+            backing: string;
+            /** Format: int32 */
+            bus: number;
+            /** Format: int64 */
+            capacity: number;
+            change_id?: string | null;
+            /** @description `ide`·`sata`·`scsi`·`nvme` */
+            controller: string;
+            /** @description 지금 쓰는 디스크(스냅샷이 있으면 델타 `web-000001.vmdk`) */
+            current_file: string;
+            datastore?: string | null;
+            /** @description 기반 디스크 디스크립터(`[ds] web/web.vmdk` — 스냅샷이 있어도 체인의 맨 아래) */
+            file: string;
+            /**
+             * Format: int32
+             * @description 장치 키
+             */
+            key: number;
+            /** @description `persistent`, `independent_persistent`, `independent_nonpersistent` … */
+            mode: string;
+            /** @description `sharingMultiWriter`면 여러 VM이 쓴다 */
+            multi_writer: boolean;
+            thin: boolean;
+            /** Format: int32 */
+            unit: number;
+        };
+        InvFolder: {
+            /** @description 담는 형식(`VirtualMachine`, `Datacenter` …) */
+            child_types: string[];
+            moref: string;
+            name: string;
+            parent?: string | null;
+            /** @description `DC1/vm/Prod` */
+            path: string;
+        };
+        InvHost: {
+            /** @description vCenter가 아는 호스트 인증서의 SHA-256 지문(`config.certificate`) */
+            certificate_sha256?: string | null;
+            /** @description 클러스터 이름(단독 호스트면 없음) */
+            cluster?: string | null;
+            compute?: string | null;
+            connection_state?: string | null;
+            /** @description 데이터센터 경로(`DC1`, `Europe/DC2` — `/folder`의 `dcPath`) */
+            datacenter?: string | null;
+            moref: string;
+            /** @description 관리 주소(vCenter에 더한 이름 — 보통 FQDN이나 IP) */
+            name: string;
+        };
+        InvNetwork: {
+            /** @description 데이터센터 경로(`DC1`, `Europe/DC2` — `/folder`의 `dcPath`) */
+            datacenter?: string | null;
+            /** @description 분산 포트 그룹 키(`dvportgroup-12`) */
+            key?: string | null;
+            kind: components["schemas"]["NetworkKind"];
+            moref: string;
+            name: string;
+            /** @description NSX 불투명 네트워크 id */
+            opaque_id?: string | null;
+        };
+        InvNic: {
+            /** @description `vmxnet3`, `e1000`, `e1000e` …(`.vmx` `virtualDev`와 같은 이름) */
+            adapter: string;
+            /** Format: int32 */
+            key: number;
+            mac?: string | null;
+            /** @description 네트워크 이름(분산 포트 그룹은 포트 그룹 이름, 모르면 `dvs:{키}`·`nsx:{id}`) */
+            network: string;
+            network_ref?: string | null;
+            start_connected?: boolean | null;
+        };
+        InvSnapshot: {
+            created?: string | null;
+            description: string;
+            /** Format: int64 */
+            id?: number | null;
+            moref: string;
+            name: string;
+            parent?: string | null;
+        };
+        InvVm: {
+            annotation?: string | null;
+            cbt: boolean;
+            cluster?: string | null;
+            /** Format: int64 */
+            committed_bytes: number;
+            /** Format: int32 */
+            cores_per_socket: number;
+            /** Format: int32 */
+            cpus: number;
+            current_snapshot?: string | null;
+            /** @description 데이터센터 경로(`DC1`, `Europe/DC2` — `/folder`의 `dcPath`) */
+            datacenter?: string | null;
+            disks: components["schemas"]["InvDisk"][];
+            firmware: components["schemas"]["Firmware"];
+            /** @description VM이 든 폴더 경로(`DC1/vm/Prod`) */
+            folder?: string | null;
+            ft: boolean;
+            guest_full_name?: string | null;
+            guest_id: string;
+            /** @description Tools가 알린 MAC(소문자) → IP */
+            guest_ips: {
+                [key: string]: string[];
+            };
+            host?: string | null;
+            host_name?: string | null;
+            /**
+             * Format: int32
+             * @description `vmx-NN`의 NN
+             */
+            hw_version?: number | null;
+            instance_uuid?: string | null;
+            /** Format: int64 */
+            memory_mib: number;
+            moref: string;
+            name: string;
+            nics: components["schemas"]["InvNic"][];
+            /** @description `DC1/vm/Prod/web01` */
+            path: string;
+            power?: components["schemas"]["VmwarePower"] | null;
+            resource_pool?: string | null;
+            snapshots: components["schemas"]["InvSnapshot"][];
+            template: boolean;
+            tools?: string | null;
+            uuid?: string | null;
+        };
+        /** @description 읽은 인벤토리 */
+        Inventory: {
+            computes: components["schemas"]["InvCompute"][];
+            datacenters: components["schemas"]["InvDatacenter"][];
+            datastores: components["schemas"]["InvDatastore"][];
+            folders: components["schemas"]["InvFolder"][];
+            hosts: components["schemas"]["InvHost"][];
+            networks: components["schemas"]["InvNetwork"][];
+            vms: components["schemas"]["InvVm"][];
+        };
         /** @description NIC(또는 라우터 외부·유동 IP) 하나의 주소 */
         IpAllocation: {
             ips: string[];
@@ -9153,6 +9620,197 @@ export interface components {
             revision: number;
         };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_VmwareMigrationSpec_VmwareMigrationStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 여러 VM을 같은 규칙으로 옮기는 이전 계획(`vmware-migration`). 진행은 항목([`VmwareVm`])과 Task에 있다. */
+                spec: {
+                    cutover?: components["schemas"]["VmwareCutoverPolicy"];
+                    /**
+                     * Format: uuid
+                     * @description 계획 리소스가 사는 VM 폴더(권한용). 없으면 루트다.
+                     */
+                    folder?: string;
+                    limits?: components["schemas"]["VmwareLimits"];
+                    mode: components["schemas"]["VmwareMigrationMode"];
+                    rules?: components["schemas"]["VmwareRules"];
+                    /**
+                     * Format: uuid
+                     * @description 원본 연결(`vmware-source` id)
+                     */
+                    source: string;
+                    sync?: components["schemas"]["VmwareSyncPolicy"];
+                };
+                status: {
+                    /**
+                     * @description 항목 상태(`VmwareVmState::as_str`)별 VM 수
+                     * @default {}
+                     */
+                    counts: {
+                        [key: string]: number;
+                    };
+                    error?: string;
+                    /** @default draft */
+                    phase: components["schemas"]["VmwareMigrationPhase"];
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_VmwareSourceSpecView_VmwareSourceStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /** @description 비밀번호를 뺀 원본 스펙 */
+                spec: {
+                    datacenter_hint?: string;
+                    /** @description 믿기로 한 서버 인증서의 SHA-256 지문 */
+                    fingerprint: string;
+                    host: string;
+                    /** Format: int32 */
+                    port: number;
+                    transport?: components["schemas"]["VmwareTransport"];
+                    user: string;
+                };
+                /** @description 만들기·"다시 확인"이 채우는 원본 상태 */
+                status: {
+                    /** @description `about.build` */
+                    build?: string;
+                    /**
+                     * Format: int64
+                     * @description 마지막으로 확인한 시각(유닉스 초)
+                     */
+                    checked_at?: number;
+                    /** @description 마지막 확인이 실패한 이유 */
+                    error?: string;
+                    /** @description `about.instanceUuid`(vCenter). 같은 vCenter인지 본다. */
+                    instance_uuid?: string;
+                    kind?: components["schemas"]["VmwareApiKind"];
+                    /** @description 무료 ESXi(API 읽기 전용 — 스냅샷·설정 바꾸기가 거절되어 차가운 이전만) */
+                    restricted?: boolean;
+                    /** @description `about.version`(예: `8.0.2`) */
+                    version?: string;
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
+        List_Resource_VmwareVmSpec_VmwareVmStatus: {
+            items: {
+                /** Format: uuid */
+                id: string;
+                labels?: {
+                    [key: string]: string;
+                };
+                name: string;
+                /**
+                 * Format: int64
+                 * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+                 */
+                revision: number;
+                /**
+                 * @description 이전 계획 안의 VM 하나(`vmware-vm`, 이름 [`item_name`]). 동시 Task가 계획 리소스 하나를 서로 고쳐 revision이
+                 *     부딪치지 않게, 권한(대상 폴더)과 watch가 VM마다 오게 따로 둔다.
+                 */
+                spec: {
+                    /** @description 원본 VM의 `config.instanceUuid`(moref가 바뀌어도 같은 VM인지 — 끝나지 않은 항목은 클러스터에 하나) */
+                    instance_uuid: string;
+                    /**
+                     * Format: uuid
+                     * @description 계획(`vmware-migration` id)
+                     */
+                    migration: string;
+                    /**
+                     * Format: uuid
+                     * @description 대상 노드(미리 확인·시작 때 정한다)
+                     */
+                    node?: string;
+                    /** @description 이 VM만의 덮어쓰기(규칙보다 앞선다) */
+                    overrides?: components["schemas"]["VmwareOverrides"];
+                    /** @description 원본 VM의 managed object id(`vm-123`) */
+                    source_ref: string;
+                    /** @description 만들 VM 이름 */
+                    target_name: string;
+                };
+                /** @description VM 하나의 이전 상태(설계 §6). 진행 걸음마다 Raft에 먼저 적고 한다(이어 가기·되돌리기). */
+                status: {
+                    /**
+                     * @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
+                     * @default false
+                     */
+                    cbt_enabled_by_us: boolean;
+                    /** @description `state`가 `cutting-over`일 때 지금 걸음 */
+                    cutover_step?: components["schemas"]["VmwareCutoverStep"];
+                    /** @default [] */
+                    disks: components["schemas"]["VmwareSyncDisk"][];
+                    error?: string;
+                    /**
+                     * Format: int64
+                     * @description 예상 마지막 델타 시간(초 — 마지막 델타 바이트 ÷ 잰 속도)
+                     */
+                    estimate_s?: number;
+                    /**
+                     * @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
+                     * @default []
+                     */
+                    history: components["schemas"]["VmwareHistory"][];
+                    /** Format: int64 */
+                    last_sync_at?: number;
+                    /** Format: int64 */
+                    next_sync_at?: number;
+                    /** @description 만들었지만 옛 스냅샷을 아직 지우지 못한 새 스냅샷(회차 1·2단계 사이 — 다음 시도가 먼저 옛 것을 지운다) */
+                    pending_snapshot?: components["schemas"]["VmwareSnapshotRef"];
+                    /**
+                     * Format: int32
+                     * @description 끝낸 회차 수
+                     * @default 0
+                     */
+                    rounds: number;
+                    /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
+                    snapshot?: components["schemas"]["VmwareSnapshotRef"];
+                    /** @description 원본 VM(인벤토리에서 읽은 것) */
+                    source?: components["schemas"]["VmwareSourceVm"];
+                    /**
+                     * @description 바꾼 원본 설정(되돌림·취소가 되돌린다)
+                     * @default {}
+                     */
+                    source_changes: components["schemas"]["VmwareSourceChanges"];
+                    /** @default draft */
+                    state: components["schemas"]["VmwareVmState"];
+                    /**
+                     * Format: uuid
+                     * @description 만든 VM
+                     */
+                    target_vm?: string;
+                    /** @default [] */
+                    warnings: string[];
+                };
+            }[];
+            /** Format: int64 */
+            revision: number;
+        };
+        /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_Resource_VolumeSpec_VolumeStatus: {
             items: {
                 /** Format: uuid */
@@ -9506,6 +10164,15 @@ export interface components {
             /** @description 노드 로컬 풀의 디스크를 복사해 둘 대상 노드의 풀. 없으면 디스크마다 같은 이름의 풀이다. */
             pool?: string | null;
         };
+        /** @description 끝나지 않은 이전 계획에 든 원본 VM(같은 VM은 계획 하나에만) */
+        MigratingVm: {
+            /** @description 원본 VM의 `config.instanceUuid` */
+            instance_uuid: string;
+            /** @description 항목(`vmware-vm`) 이름 */
+            item: string;
+            /** @description 이전 계획 이름 */
+            migration: string;
+        };
         /** @description 사용자가 주는 NIC 하나의 주소 */
         MigrationAddress: {
             /** @description 주소 체계마다 하나까지 */
@@ -9527,6 +10194,17 @@ export interface components {
         };
         /** @enum {string} */
         MigrationMode: "auto" | "offline" | "restart" | "live";
+        /** @description 계획에서 바꿀 값(`draft`·`paused`에서만). 주어진 것만 바꾼다. */
+        MigrationPatch: {
+            /** @description 더할 VM */
+            add_vms?: components["schemas"]["MigrationVmRequest"][];
+            cutover?: components["schemas"]["VmwareCutoverPolicy"];
+            limits?: components["schemas"]["VmwareLimits"];
+            /** @description 뺄 VM(항목 이름, 원본 moref·instanceUuid 또는 원본 VM 이름). 시작한 VM은 뺄 수 없다(취소한다). */
+            remove_vms?: string[];
+            rules?: components["schemas"]["VmwareRules"];
+            sync?: components["schemas"]["VmwareSyncPolicy"];
+        };
         /** @enum {string} */
         MigrationPhase: "planned" | "running" | "paused" | "moved" | "finished" | "rolling-back" | "rolled-back" | "failed";
         /** @description 계획 전체 */
@@ -9566,6 +10244,20 @@ export interface components {
          * @enum {string}
          */
         MigrationStep: "start" | "rollback" | "finish";
+        /** @description 계획과 그 항목 */
+        MigrationView: {
+            migration: components["schemas"]["Resource_VmwareMigrationSpec_VmwareMigrationStatus"];
+            vms: components["schemas"]["Resource_VmwareVmSpec_VmwareVmStatus"][];
+        };
+        /** @description 계획에 넣을 원본 VM */
+        MigrationVmRequest: {
+            /** @description 이 VM만의 덮어쓰기(규칙보다 앞선다) */
+            overrides?: components["schemas"]["VmwareOverrides"];
+            /** @description 원본 VM: managed object id(`vm-42`), 인벤토리 경로(`DC1/vm/Prod/web01`) 또는 `config.instanceUuid` */
+            ref: string;
+            /** @description 만들 VM 이름. 없으면 원본 이름을 다듬은 것(소문자·`-`)이다. */
+            target_name?: string;
+        };
         /** @description 받는 쪽 저장소에 없는 청크 */
         MissingChunks: {
             missing: string[];
@@ -9633,6 +10325,8 @@ export interface components {
             network: string;
             subnets: components["schemas"]["SubnetUsage"][];
         };
+        /** @enum {string} */
+        NetworkKind: "standard" | "dv-portgroup" | "opaque";
         /** @description 만든 옮기기와 그 계획(VM NIC마다 막는 까닭·경고) */
         NetworkMigrationCreated: components["schemas"]["Resource_NetworkMigrationSpec_NetworkMigrationStatus"] & {
             plan: components["schemas"]["MigrationPlan"];
@@ -10973,6 +11667,46 @@ export interface components {
         Power: "on" | "off" | "unknown";
         /** @enum {string} */
         PowerState: "running" | "stopped";
+        /** @description 미리 확인의 답(문제가 있어도 200) */
+        PreflightAnswer: {
+            /**
+             * Format: int64
+             * @description 원본 인벤토리를 읽은 시각(유닉스 초)
+             */
+            fetched_at: number;
+            vms: components["schemas"]["PreflightVm"][];
+        };
+        /**
+         * @description VM 하나의 미리 확인 판정
+         * @enum {string}
+         */
+        PreflightLevel: "ok" | "warn" | "blocked";
+        /** @description 미리 확인할 VM(없으면 계획의 모든 VM) */
+        PreflightRequest: {
+            /** @description 노드 캐시(60초)를 쓰지 않고 인벤토리를 다시 읽는다. */
+            refresh?: boolean;
+            /** @description 항목 이름, 원본 moref·instanceUuid 또는 원본 VM 이름 */
+            vms?: string[];
+        };
+        /** @description VM 하나의 미리 확인 */
+        PreflightVm: {
+            /** @description 항목(`vmware-vm`) 이름 */
+            item: string;
+            level: components["schemas"]["PreflightLevel"];
+            /** @description 원본 VM 이름 */
+            name: string;
+            /** @description 스케줄러가 고를 대상 노드(노드 이름을 볼 수 있을 때만) */
+            node?: string;
+            /**
+             * @description 자리: 계획 71 `vm-checks`의 자리(`name`·`disks.N`·`nics.N`·`placement`·`quota` …)와 `folder`(대상 폴더 권한),
+             *     `source`(VMware 쪽), `guest`(게스트 힌트)
+             */
+            problems: components["schemas"]["VmCheckProblem"][];
+            /** @description 원본 VM moref */
+            ref: string;
+            /** @description 만들 VM의 스펙(우리 쪽 검사를 통과했을 때 — 채운 머신) */
+            spec_preview?: components["schemas"]["VmSpec"];
+        };
         /** @description 바뀌기 전 기준 */
         PreviousBaseline: {
             flags?: {
@@ -12827,6 +13561,185 @@ export interface components {
             };
         };
         /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_VmwareMigrationSpec_VmwareMigrationStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 여러 VM을 같은 규칙으로 옮기는 이전 계획(`vmware-migration`). 진행은 항목([`VmwareVm`])과 Task에 있다. */
+            spec: {
+                cutover?: components["schemas"]["VmwareCutoverPolicy"];
+                /**
+                 * Format: uuid
+                 * @description 계획 리소스가 사는 VM 폴더(권한용). 없으면 루트다.
+                 */
+                folder?: string;
+                limits?: components["schemas"]["VmwareLimits"];
+                mode: components["schemas"]["VmwareMigrationMode"];
+                rules?: components["schemas"]["VmwareRules"];
+                /**
+                 * Format: uuid
+                 * @description 원본 연결(`vmware-source` id)
+                 */
+                source: string;
+                sync?: components["schemas"]["VmwareSyncPolicy"];
+            };
+            status: {
+                /**
+                 * @description 항목 상태(`VmwareVmState::as_str`)별 VM 수
+                 * @default {}
+                 */
+                counts: {
+                    [key: string]: number;
+                };
+                error?: string;
+                /** @default draft */
+                phase: components["schemas"]["VmwareMigrationPhase"];
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_VmwareSourceSpecView_VmwareSourceStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /** @description 비밀번호를 뺀 원본 스펙 */
+            spec: {
+                datacenter_hint?: string;
+                /** @description 믿기로 한 서버 인증서의 SHA-256 지문 */
+                fingerprint: string;
+                host: string;
+                /** Format: int32 */
+                port: number;
+                transport?: components["schemas"]["VmwareTransport"];
+                user: string;
+            };
+            /** @description 만들기·"다시 확인"이 채우는 원본 상태 */
+            status: {
+                /** @description `about.build` */
+                build?: string;
+                /**
+                 * Format: int64
+                 * @description 마지막으로 확인한 시각(유닉스 초)
+                 */
+                checked_at?: number;
+                /** @description 마지막 확인이 실패한 이유 */
+                error?: string;
+                /** @description `about.instanceUuid`(vCenter). 같은 vCenter인지 본다. */
+                instance_uuid?: string;
+                kind?: components["schemas"]["VmwareApiKind"];
+                /** @description 무료 ESXi(API 읽기 전용 — 스냅샷·설정 바꾸기가 거절되어 차가운 이전만) */
+                restricted?: boolean;
+                /** @description `about.version`(예: `8.0.2`) */
+                version?: string;
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
+        Resource_VmwareVmSpec_VmwareVmStatus: {
+            /** Format: uuid */
+            id: string;
+            labels?: {
+                [key: string]: string;
+            };
+            name: string;
+            /**
+             * Format: int64
+             * @description 마지막 수정이 커밋된 Raft 로그 인덱스. 아직 저장되지 않았으면 0.
+             */
+            revision: number;
+            /**
+             * @description 이전 계획 안의 VM 하나(`vmware-vm`, 이름 [`item_name`]). 동시 Task가 계획 리소스 하나를 서로 고쳐 revision이
+             *     부딪치지 않게, 권한(대상 폴더)과 watch가 VM마다 오게 따로 둔다.
+             */
+            spec: {
+                /** @description 원본 VM의 `config.instanceUuid`(moref가 바뀌어도 같은 VM인지 — 끝나지 않은 항목은 클러스터에 하나) */
+                instance_uuid: string;
+                /**
+                 * Format: uuid
+                 * @description 계획(`vmware-migration` id)
+                 */
+                migration: string;
+                /**
+                 * Format: uuid
+                 * @description 대상 노드(미리 확인·시작 때 정한다)
+                 */
+                node?: string;
+                /** @description 이 VM만의 덮어쓰기(규칙보다 앞선다) */
+                overrides?: components["schemas"]["VmwareOverrides"];
+                /** @description 원본 VM의 managed object id(`vm-123`) */
+                source_ref: string;
+                /** @description 만들 VM 이름 */
+                target_name: string;
+            };
+            /** @description VM 하나의 이전 상태(설계 §6). 진행 걸음마다 Raft에 먼저 적고 한다(이어 가기·되돌리기). */
+            status: {
+                /**
+                 * @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
+                 * @default false
+                 */
+                cbt_enabled_by_us: boolean;
+                /** @description `state`가 `cutting-over`일 때 지금 걸음 */
+                cutover_step?: components["schemas"]["VmwareCutoverStep"];
+                /** @default [] */
+                disks: components["schemas"]["VmwareSyncDisk"][];
+                error?: string;
+                /**
+                 * Format: int64
+                 * @description 예상 마지막 델타 시간(초 — 마지막 델타 바이트 ÷ 잰 속도)
+                 */
+                estimate_s?: number;
+                /**
+                 * @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
+                 * @default []
+                 */
+                history: components["schemas"]["VmwareHistory"][];
+                /** Format: int64 */
+                last_sync_at?: number;
+                /** Format: int64 */
+                next_sync_at?: number;
+                /** @description 만들었지만 옛 스냅샷을 아직 지우지 못한 새 스냅샷(회차 1·2단계 사이 — 다음 시도가 먼저 옛 것을 지운다) */
+                pending_snapshot?: components["schemas"]["VmwareSnapshotRef"];
+                /**
+                 * Format: int32
+                 * @description 끝낸 회차 수
+                 * @default 0
+                 */
+                rounds: number;
+                /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
+                snapshot?: components["schemas"]["VmwareSnapshotRef"];
+                /** @description 원본 VM(인벤토리에서 읽은 것) */
+                source?: components["schemas"]["VmwareSourceVm"];
+                /**
+                 * @description 바꾼 원본 설정(되돌림·취소가 되돌린다)
+                 * @default {}
+                 */
+                source_changes: components["schemas"]["VmwareSourceChanges"];
+                /** @default draft */
+                state: components["schemas"]["VmwareVmState"];
+                /**
+                 * Format: uuid
+                 * @description 만든 VM
+                 */
+                target_vm?: string;
+                /** @default [] */
+                warnings: string[];
+            };
+        };
+        /** @description 모든 리소스가 공유하는 봉투. spec은 API가, status는 reconciler가 쓴다. */
         Resource_VolumeSpec_VolumeStatus: {
             /** Format: uuid */
             id: string;
@@ -13598,12 +14511,35 @@ export interface components {
          * @enum {string}
          */
         SourceFormat: "vmdk" | "qcow2" | "raw";
+        /** @description 인벤토리 찾아보기의 답 */
+        SourceInventory: {
+            /**
+             * Format: int64
+             * @description 원본에서 읽은 시각(유닉스 초 — 노드 캐시면 그때)
+             */
+            fetched_at: number;
+            inventory: components["schemas"]["Inventory"];
+            /** @description 이미 끝나지 않은 계획에 든 VM(항목을 볼 수 있을 때만) */
+            migrating: components["schemas"]["MigratingVm"][];
+        };
         SourceNic: {
             /** @description 원본 어댑터 종류(`vmxnet3`, `e1000` 등) */
             adapter: string;
             mac?: components["schemas"]["MacAddr"] | null;
             /** @description 원본 네트워크 이름 */
             network: string;
+        };
+        /** @description 원본 연결에서 바꿀 값(주어진 것만). 바꾸면 다시 로그인해 본 뒤 저장한다 — 쓰는 계획은 다음 Task부터 새 값을 쓴다. */
+        SourcePatch: {
+            /** @description `null`이면 지운다. */
+            datacenter_hint?: string | null;
+            fingerprint?: string;
+            host?: string;
+            password?: string;
+            /** Format: int32 */
+            port?: number;
+            user?: string;
+            vddk?: components["schemas"]["VddkRequest"] | null;
         };
         /** @description 원본 VM에서 읽은 것 */
         SourceVm: {
@@ -14946,6 +15882,17 @@ export interface components {
             /** @description 2단계 인증 요소(확인된 TOTP 또는 패스키)가 있다(계획 62) */
             two_factor?: boolean;
         };
+        /** @description VDDK 길(운영자가 설치한 nbdkit `vddk` 플러그인 — vSAN·vVols). 썸프린트는 서버가 잰다. */
+        VddkRequest: {
+            /** @description VDDK 라이브러리 디렉터리. 없으면 노드 설정 `[vmware] vddk_libdir`다. */
+            libdir?: string;
+        };
+        VddkTransport: {
+            /** @description VDDK 라이브러리 디렉터리. 없으면 노드 설정 `[vmware] vddk_libdir`다. */
+            libdir?: string;
+            /** @description 서버 인증서의 SHA-1 썸프린트(VDDK가 받는 꼴, 대문자 콜론 구분). 만들 때 서버가 잰다. */
+            thumbprint_sha1: string;
+        };
         /** @enum {string} */
         VerifyMode: "full" | "metadata";
         /** @description 예약 검증(§10.5) */
@@ -15491,6 +16438,464 @@ export interface components {
              *     멈출 때와 실행 중 주기적으로 쓴다. 없으면(아직 TPM 상태가 없음, 초기화 뒤) 쓰지 않는다.
              */
             tpm_sha256?: string;
+        };
+        /**
+         * @description 원본의 종류(`about.apiType`)
+         * @enum {string}
+         */
+        VmwareApiKind: "vcenter" | "esxi";
+        /** @description 전환 정책(설계 §10.1) */
+        VmwareCutoverPolicy: {
+            /**
+             * Format: int64
+             * @description 예약 전환 시각(유닉스 초). 그 시각에 `ready`·`syncing` 항목을 모두 전환한다.
+             * @default null
+             */
+            at: number;
+            /**
+             * Format: int32
+             * @description 마지막 델타가 이보다 크면 원본을 끄기 전에 멈추고 알린다(GiB).
+             * @default null
+             */
+            max_final_delta_gib: number;
+            /**
+             * @description 원본 NIC를 켤 때 끊긴 채로(`startConnected=false`) 두고 설명을 단다(실수로 켜도 같은 MAC·IP가 붙지 않게).
+             * @default true
+             */
+            protect_source: boolean;
+            /** @default guest */
+            shutdown: components["schemas"]["VmwareShutdown"];
+            /**
+             * Format: int32
+             * @description 게스트 종료를 기다리는 시간(초, 30~3600)
+             * @default 600
+             */
+            shutdown_timeout_s: number;
+        };
+        /**
+         * @description 전환 걸음(설계 §10.1). 각 걸음은 Raft에 먼저 적고 한다.
+         * @enum {string}
+         */
+        VmwareCutoverStep: "preparing" | "stopping-source" | "final-sync" | "creating-vm" | "starting-vm";
+        /** @description 고정한 장치 */
+        VmwareDevices: {
+            disk_bus: components["schemas"]["DiskBus"];
+            nic_model: components["schemas"]["NicModel"];
+        };
+        /** @description 만든 VM을 둘 폴더 */
+        VmwareFolderRule: {
+            /** Format: uuid */
+            into?: string;
+            /** @enum {string} */
+            kind: "flat";
+        } | {
+            /** @enum {string} */
+            kind: "mirror";
+            /** Format: uuid */
+            under?: string;
+        };
+        VmwareHistory: {
+            /**
+             * Format: int64
+             * @description 유닉스 초
+             */
+            at: number;
+            event: string;
+        };
+        /** @description 동시 수·대역 한도(설계 §9.3·§9.4) */
+        VmwareLimits: {
+            /**
+             * Format: int32
+             * @description 계획 전체 대역(MiB/s). 없으면 한도 없음.
+             * @default null
+             */
+            bandwidth_mib_s: number;
+            /**
+             * Format: int32
+             * @description 계획의 끝나지 않은 동기화·전환 Task 수(1~64)
+             * @default 4
+             */
+            max_parallel: number;
+            /**
+             * Format: int32
+             * @description 같은 ESXi 호스트의 VM(1~64)
+             * @default 2
+             */
+            max_per_host: number;
+            /**
+             * Format: int32
+             * @description 같은 대상 노드(1~64)
+             * @default 2
+             */
+            max_per_node: number;
+            /**
+             * Format: int32
+             * @description 디스크마다 동시 범위 읽기(1~16)
+             * @default 4
+             */
+            streams_per_disk: number;
+        };
+        /** @description 규칙 한 줄: 원본 이름 → 우리 이름 */
+        VmwareMapping: {
+            from: string;
+            to: string;
+        };
+        /** @enum {string} */
+        VmwareMigrationMode: "warm" | "cold";
+        /** @enum {string} */
+        VmwareMigrationPhase: "draft" | "running" | "paused" | "finished" | "cancelled";
+        /** @description 여러 VM을 같은 규칙으로 옮기는 이전 계획(`vmware-migration`). 진행은 항목([`VmwareVm`])과 Task에 있다. */
+        VmwareMigrationSpec: {
+            cutover?: components["schemas"]["VmwareCutoverPolicy"];
+            /**
+             * Format: uuid
+             * @description 계획 리소스가 사는 VM 폴더(권한용). 없으면 루트다.
+             */
+            folder?: string;
+            limits?: components["schemas"]["VmwareLimits"];
+            mode: components["schemas"]["VmwareMigrationMode"];
+            rules?: components["schemas"]["VmwareRules"];
+            /**
+             * Format: uuid
+             * @description 원본 연결(`vmware-source` id)
+             */
+            source: string;
+            sync?: components["schemas"]["VmwareSyncPolicy"];
+        };
+        VmwareMigrationStatus: {
+            /**
+             * @description 항목 상태(`VmwareVmState::as_str`)별 VM 수
+             * @default {}
+             */
+            counts: {
+                [key: string]: number;
+            };
+            error?: string;
+            /** @default draft */
+            phase: components["schemas"]["VmwareMigrationPhase"];
+        };
+        /** @description VM 하나의 덮어쓰기(`ImportRun`의 부분 값). 비운 칸은 규칙·제안을 쓴다. */
+        VmwareOverrides: {
+            /**
+             * Format: int32
+             * @default null
+             */
+            cores: number;
+            /** @default null */
+            cpu_model: components["schemas"]["CpuModel"];
+            /** @default null */
+            disk_bus: components["schemas"]["DiskBus"];
+            /** @default null */
+            firmware: components["schemas"]["Firmware"];
+            /**
+             * Format: uuid
+             * @description 만든 VM을 둘 폴더(폴더 규칙보다 앞선다)
+             * @default null
+             */
+            folder: string;
+            /**
+             * @description 원본 NIC 순번별 SDN 주소
+             * @default []
+             */
+            ips: string[][];
+            /** @default null */
+            keep_macs: boolean;
+            /**
+             * Format: int32
+             * @default null
+             */
+            memory_mib: number;
+            /**
+             * @description 원본 네트워크 → 우리 네트워크
+             * @default {}
+             */
+            networks: {
+                [key: string]: string;
+            };
+            /** @default null */
+            nic_model: components["schemas"]["NicModel"];
+            /**
+             * @description 디스크 순번별 풀(비면 데이터스토어 규칙)
+             * @default []
+             */
+            pools: string[];
+            /**
+             * Format: int32
+             * @default null
+             */
+            sockets: number;
+        };
+        /** @enum {string} */
+        VmwarePower: "powered-on" | "powered-off" | "suspended";
+        /** @description 매핑 규칙(설계 §8.4 — VM 덮어쓰기 > 규칙 > 제안 `propose`) */
+        VmwareRules: {
+            /**
+             * @description 대상 VM의 CPU 모델. 없으면 `host`다.
+             * @default null
+             */
+            cpu_model: components["schemas"]["CpuModel"];
+            /**
+             * @description 원본 데이터스토어 이름 → 우리 풀(디스크마다)
+             * @default []
+             */
+            datastores: components["schemas"]["VmwareMapping"][];
+            /**
+             * @description 규칙에 없는 데이터스토어의 디스크를 둘 풀
+             * @default null
+             */
+            default_pool: string;
+            /**
+             * @description 디스크 버스·NIC 모델을 모든 VM에 고정한다. 없으면 게스트 OS로 고른다(`propose`).
+             * @default null
+             */
+            devices: components["schemas"]["VmwareDevices"];
+            /**
+             * @description Windows VM에 CD로 붙일 드라이버 ISO 볼륨(virtio-win)
+             * @default null
+             */
+            driver_iso: string;
+            /**
+             * @default {
+             *       "kind": "flat"
+             *     }
+             */
+            folders: components["schemas"]["VmwareFolderRule"];
+            /**
+             * @description 원본 MAC 주소를 그대로 쓴다.
+             * @default true
+             */
+            keep_macs: boolean;
+            /**
+             * @description 원본 네트워크(이름 또는 `moref:dvportgroup-12`) → 우리 네트워크
+             * @default []
+             */
+            networks: components["schemas"]["VmwareMapping"][];
+            /**
+             * Format: uuid
+             * @description 대상 노드. 없으면 시작할 때 고른다(풀이 보이고 메모리 여유).
+             * @default null
+             */
+            node: string;
+            /**
+             * @description 대상 네트워크가 SDN이면 VMware Tools가 알린 IP를 그 주소로 예약한다.
+             * @default true
+             */
+            reserve_ips: boolean;
+            /**
+             * @description 전환 끝에 대상 VM을 켠다.
+             * @default true
+             */
+            start_after: boolean;
+        };
+        /** @enum {string} */
+        VmwareShutdown: "guest" | "power-off";
+        /** @description 원본의 우리 스냅샷 */
+        VmwareSnapshotRef: {
+            /**
+             * Format: int64
+             * @description 만든 시각(유닉스 초)
+             */
+            created_at: number;
+            /** @description managed object id(`snapshot-7`). 지우기는 이 값에만 한다. */
+            moref: string;
+            /** @description 표시용 이름([`snapshot_name`]) */
+            name: string;
+        };
+        /** @description 우리가 바꾼 원본 설정. 바꾸기 전에 옛 값을 먼저 적는다. */
+        VmwareSourceChanges: {
+            /**
+             * @description 설명(annotation)을 바꿨다.
+             * @default false
+             */
+            annotation_added: boolean;
+            /**
+             * @description `startConnected=false`로 바꾼 NIC 장치 키
+             * @default []
+             */
+            nics_disconnected: number[];
+            /**
+             * @description 바꾸기 전 설명(되돌림이 되살린다)
+             * @default null
+             */
+            old_annotation: string;
+            /**
+             * @description 전환이 원본을 껐다(되돌림이 켠다).
+             * @default false
+             */
+            powered_off_by_us: boolean;
+        };
+        /** @description 비밀번호를 뺀 원본 스펙 */
+        VmwareSourceSpecView: {
+            datacenter_hint?: string;
+            /** @description 믿기로 한 서버 인증서의 SHA-256 지문 */
+            fingerprint: string;
+            host: string;
+            /** Format: int32 */
+            port: number;
+            transport?: components["schemas"]["VmwareTransport"];
+            user: string;
+        };
+        /** @description 만들기·"다시 확인"이 채우는 원본 상태 */
+        VmwareSourceStatus: {
+            /** @description `about.build` */
+            build?: string;
+            /**
+             * Format: int64
+             * @description 마지막으로 확인한 시각(유닉스 초)
+             */
+            checked_at?: number;
+            /** @description 마지막 확인이 실패한 이유 */
+            error?: string;
+            /** @description `about.instanceUuid`(vCenter). 같은 vCenter인지 본다. */
+            instance_uuid?: string;
+            kind?: components["schemas"]["VmwareApiKind"];
+            /** @description 무료 ESXi(API 읽기 전용 — 스냅샷·설정 바꾸기가 거절되어 차가운 이전만) */
+            restricted?: boolean;
+            /** @description `about.version`(예: `8.0.2`) */
+            version?: string;
+        };
+        /** @description 원본 VM(계획 29 `SourceVm` + 인벤토리의 실행 정보) */
+        VmwareSourceVm: {
+            /** @description Tools가 알린 MAC → IP */
+            guest_ips?: {
+                [key: string]: string[];
+            };
+            /** @description VM이 있는 ESXi 호스트 이름 */
+            host?: string;
+            power?: components["schemas"]["VmwarePower"];
+            /** @description VMware Tools 상태(`guestToolsRunning` 등) */
+            tools?: string;
+            vm: components["schemas"]["SourceVm"];
+        };
+        /** @description 디스크 하나의 동기화 */
+        VmwareSyncDisk: {
+            /** Format: int64 */
+            capacity_bytes: number;
+            /** @description 마지막 회차 스냅샷의 CBT `changeId`(다음 델타의 시작) */
+            change_id?: string;
+            /**
+             * Format: int64
+             * @description 지금 회차에서 복사한 바이트(체크포인트)
+             */
+            copied_bytes?: number;
+            /** @description 기반 flat 파일(`[ds] web/web-flat.vmdk`) */
+            file: string;
+            /**
+             * Format: int32
+             * @description 원본 장치 키
+             */
+            key: number;
+            /** Format: int64 */
+            last_delta_bytes?: number;
+            /** Format: int32 */
+            rounds?: number;
+            /**
+             * Format: uuid
+             * @description 대상 볼륨(첫 동기화가 만들어 먼저 적는다)
+             */
+            volume?: string;
+        };
+        /** @description 따뜻한 이전의 동기화 주기 */
+        VmwareSyncPolicy: {
+            /**
+             * Format: int32
+             * @description 델타 회차 사이(분, 5~1440)
+             * @default 60
+             */
+            interval_min: number;
+            /**
+             * Format: int32
+             * @description 이 날 수가 지나도록 전환하지 않으면 동기화를 멈춘다(원본에 스냅샷이 오래 남지 않게, 0은 멈추지 않음, 최대 365).
+             * @default 14
+             */
+            stop_after_days: number;
+        };
+        /** @description 디스크 읽기 길(설계 §7.4) */
+        VmwareTransport: "folder" | {
+            /** @description 운영자가 설치한 nbdkit `vddk` 플러그인(vSAN·vVols에 필요) */
+            vddk: components["schemas"]["VddkTransport"];
+        };
+        /**
+         * @description 이전 계획 안의 VM 하나(`vmware-vm`, 이름 [`item_name`]). 동시 Task가 계획 리소스 하나를 서로 고쳐 revision이
+         *     부딪치지 않게, 권한(대상 폴더)과 watch가 VM마다 오게 따로 둔다.
+         */
+        VmwareVmSpec: {
+            /** @description 원본 VM의 `config.instanceUuid`(moref가 바뀌어도 같은 VM인지 — 끝나지 않은 항목은 클러스터에 하나) */
+            instance_uuid: string;
+            /**
+             * Format: uuid
+             * @description 계획(`vmware-migration` id)
+             */
+            migration: string;
+            /**
+             * Format: uuid
+             * @description 대상 노드(미리 확인·시작 때 정한다)
+             */
+            node?: string;
+            /** @description 이 VM만의 덮어쓰기(규칙보다 앞선다) */
+            overrides?: components["schemas"]["VmwareOverrides"];
+            /** @description 원본 VM의 managed object id(`vm-123`) */
+            source_ref: string;
+            /** @description 만들 VM 이름 */
+            target_name: string;
+        };
+        /**
+         * @description 항목 상태(설계 §6). `Ready`는 차가운 이전의 복사 끝, 따뜻한 이전은 첫 델타 뒤 `Syncing`과 같은 뜻의 화면 이름이다.
+         * @enum {string}
+         */
+        VmwareVmState: "draft" | "pending" | "copying" | "syncing" | "ready" | "cutting-over" | "done" | "finalized" | "failed" | "rolled-back" | "reverted" | "cancelled";
+        /** @description VM 하나의 이전 상태(설계 §6). 진행 걸음마다 Raft에 먼저 적고 한다(이어 가기·되돌리기). */
+        VmwareVmStatus: {
+            /**
+             * @description 원본의 CBT를 우리가 켰다(마무리·취소가 끈다).
+             * @default false
+             */
+            cbt_enabled_by_us: boolean;
+            /** @description `state`가 `cutting-over`일 때 지금 걸음 */
+            cutover_step?: components["schemas"]["VmwareCutoverStep"];
+            /** @default [] */
+            disks: components["schemas"]["VmwareSyncDisk"][];
+            error?: string;
+            /**
+             * Format: int64
+             * @description 예상 마지막 델타 시간(초 — 마지막 델타 바이트 ÷ 잰 속도)
+             */
+            estimate_s?: number;
+            /**
+             * @description 최근 사건([`MAX_HISTORY`]개까지, 오래된 것부터)
+             * @default []
+             */
+            history: components["schemas"]["VmwareHistory"][];
+            /** Format: int64 */
+            last_sync_at?: number;
+            /** Format: int64 */
+            next_sync_at?: number;
+            /** @description 만들었지만 옛 스냅샷을 아직 지우지 못한 새 스냅샷(회차 1·2단계 사이 — 다음 시도가 먼저 옛 것을 지운다) */
+            pending_snapshot?: components["schemas"]["VmwareSnapshotRef"];
+            /**
+             * Format: int32
+             * @description 끝낸 회차 수
+             * @default 0
+             */
+            rounds: number;
+            /** @description 원본에 있는 우리 스냅샷(기반 flat 파일이 이 시점에 얼어 있다) */
+            snapshot?: components["schemas"]["VmwareSnapshotRef"];
+            /** @description 원본 VM(인벤토리에서 읽은 것) */
+            source?: components["schemas"]["VmwareSourceVm"];
+            /**
+             * @description 바꾼 원본 설정(되돌림·취소가 되돌린다)
+             * @default {}
+             */
+            source_changes: components["schemas"]["VmwareSourceChanges"];
+            /** @default draft */
+            state: components["schemas"]["VmwareVmState"];
+            /**
+             * Format: uuid
+             * @description 만든 VM
+             */
+            target_vm?: string;
+            /** @default [] */
+            warnings: string[];
         };
         /**
          * @description 볼륨의 내용 종류
@@ -24647,6 +26052,663 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Resource_TaskSpec_TaskStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_vmware_migrations: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_VmwareMigrationSpec_VmwareMigrationStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateMigrationRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationView"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_vmware_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmwareMigrationSpec_VmwareMigrationStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_migration: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MigrationPatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationView"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    cancel_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    pause_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    resume_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationView"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    start_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MigrationView"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    preflight_migration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PreflightRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PreflightAnswer"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_sources: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_VmwareSourceSpecView_VmwareSourceStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateSourceRequest"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmwareSourceSpecView_VmwareSourceStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmwareSourceSpecView_VmwareSourceStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_source: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    patch_source: {
+        parameters: {
+            query?: never;
+            header?: {
+                "If-Match"?: number | null;
+            };
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SourcePatch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmwareSourceSpecView_VmwareSourceStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    check_source: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmwareSourceSpecView_VmwareSourceStatus"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    source_inventory: {
+        parameters: {
+            query?: {
+                /** @description 노드 캐시(60초)를 쓰지 않고 다시 읽는다. */
+                refresh?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceInventory"];
+                };
+            };
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_items: {
+        parameters: {
+            query?: {
+                /** @description 이 계획(이름 또는 id)의 항목만 */
+                migration?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["List_Resource_VmwareVmSpec_VmwareVmStatus"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_item: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Resource_VmwareVmSpec_VmwareVmStatus"];
                 };
             };
             "4XX": {

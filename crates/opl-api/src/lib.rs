@@ -90,6 +90,8 @@ mod vm_firmware;
 pub mod vm_imports;
 mod vms;
 pub mod vmware;
+pub mod vmware_migrations;
+pub mod vmware_sources;
 mod volumes;
 mod watch;
 pub mod webauthn;
@@ -444,6 +446,33 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(vm_imports::check_ova))
         .routes(routes!(vm_imports::browse_esxi))
         .routes(routes!(vm_imports::create_esxi))
+        .routes(routes!(
+            vmware_sources::list_sources,
+            vmware_sources::create_source
+        ))
+        .routes(routes!(
+            vmware_sources::get_source,
+            vmware_sources::patch_source,
+            vmware_sources::delete_source
+        ))
+        .routes(routes!(vmware_sources::check_source))
+        .routes(routes!(vmware_sources::source_inventory))
+        .routes(routes!(
+            r::list_vmware_migrations,
+            vmware_migrations::create_migration
+        ))
+        .routes(routes!(
+            r::get_vmware_migration,
+            vmware_migrations::patch_migration,
+            vmware_migrations::delete_migration
+        ))
+        .routes(routes!(vmware_migrations::preflight_migration))
+        .routes(routes!(vmware_migrations::start_migration))
+        .routes(routes!(vmware_migrations::pause_migration))
+        .routes(routes!(vmware_migrations::resume_migration))
+        .routes(routes!(vmware_migrations::cancel_migration))
+        .routes(routes!(vmware_migrations::list_items))
+        .routes(routes!(vmware_migrations::get_item))
         .routes(routes!(vm_exports::export_vm))
         .routes(routes!(r::list_vm_exports))
         .routes(routes!(r::get_vm_export, vm_exports::delete_export))
