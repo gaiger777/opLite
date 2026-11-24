@@ -2,14 +2,16 @@
 // 예산 안이며, 가리키기·초점 이동·끌기가 노드 블록을 다시 그리지 않는다(블록은 `memo`, 밝히기는 `<style>` 한 줄).
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 
-import { layoutCluster } from "@/clusterMap/layout";
+import { layoutCluster, nodeTop } from "@/clusterMap/layout";
 import { mapLabels } from "@/clusterMap/labels";
 import type { Lod } from "@/clusterMap/lod";
 import { MapScene, pillWidth } from "@/clusterMap/MapScene";
 import { type ClusterModel, toModel } from "@/clusterMap/model";
 import { elementCount, type MapLayer, scenePaths } from "@/clusterMap/paths";
+import { topCenter } from "@/components/iso";
+import { DndProvider } from "@/dnd/DndProvider";
 import i18n from "@/i18n";
-import { bigCluster, layerStatus, mapNode, mapVm } from "@/test/clusterMap";
+import { bigCluster, layerStatus, mapNode, mapVm, stubSvgMatrix } from "@/test/clusterMap";
 
 // 노드 블록(`NodeShape`)을 몇 번 그렸는지: 그릴 때마다 덧표시를 한 번 셈한다.
 const drawn = vi.hoisted(() => ({ blocks: 0 }));
@@ -146,4 +148,61 @@ it("sizes tag pills for wide Hangul glyphs as well as Latin ones", () => {
   expect(pillWidth("오프라인")).toBe(4 * 10 + 12);
   expect(pillWidth("펜스 확인 실패")).toBe(6 * 10 + 2 * 6 + 12);
   expect(pillWidth("비우는 중 2/5")).toBeGreaterThanOrEqual(4 * 10 + 5 * 6 + 12);
+});
+
+it("does not redraw node blocks while a VM tile is dragged across nodes", () => {
+  const restore = stubSvgMatrix();
+  try {
+    const model = toModel(bigCluster(12, 4, 3));
+    const scene = layoutCluster(model);
+    const labels = mapLabels(i18n.t, model, scene);
+    const nodes = scene.nodes.filter((n) => n.kind === "node");
+    render(
+      <DndProvider
+        accepts={(_, slot) =>
+          nodes.findIndex((n) => n.key === slot) % 2 === 0
+            ? { ok: true }
+            : { ok: false, reason: { key: "clusterMap.drag.here" } }
+        }
+        onDrop={() => {}}
+      >
+        <MapScene
+          scene={scene}
+          nodes={new Map(model.nodes.map((n) => [`node:${n.id}`, n]))}
+          labels={labels}
+          vmNames={new Map(model.vms.map((v) => [v.id, v.name]))}
+          layers={["load"]}
+          slabName={(s) => s.name ?? "—"}
+          onOpen={() => {}}
+          onDetail={() => {}}
+          onSummaryEnter={() => {}}
+          renderCard={(key) => labels.get(key)}
+          drag={{ item: (key) => ({ id: key, label: key }), free: () => null, onHold: () => {} }}
+        />
+      </DndProvider>,
+    );
+    const svg = screen.getByRole("group", { name: "Cluster map" });
+    const [, first] = [...scene.tiles].find(([, t]) => t.cell.kind === "vm")!;
+    const start = topCenter(first.cell.box);
+    const pointer = (p: { x: number; y: number }) => ({
+      pointerId: 1,
+      pointerType: "mouse",
+      button: 0,
+      isPrimary: true,
+      clientX: p.x,
+      clientY: p.y,
+    });
+    drawn.blocks = 0;
+    fireEvent.pointerDown(svg, pointer(start));
+    for (const n of nodes.slice(0, 10)) {
+      fireEvent.pointerMove(svg, pointer(nodeTop(n)));
+    }
+    const css = [...svg.querySelectorAll("style")].map((el) => el.textContent).join("");
+    expect(css).toContain("stroke:var(--brand)");
+    expect(css).toContain("opacity:.45");
+    fireEvent.pointerUp(svg, pointer(nodeTop(nodes[0]!)));
+    expect(drawn.blocks).toBe(0);
+  } finally {
+    restore();
+  }
 });

@@ -57,6 +57,7 @@ it("has a single-key shortcut for no power or delete action", () => {
     "list.open",
     "map.enter",
     "map.leave",
+    "map.move",
   ]);
 });
 

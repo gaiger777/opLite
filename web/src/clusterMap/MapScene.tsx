@@ -3,6 +3,7 @@ import {
   Fragment,
   memo,
   type ReactNode,
+  useCallback,
   useEffect,
   useId,
   useLayoutEffect,
@@ -69,11 +70,16 @@ import {
   scenePaths,
   SHADE_OPACITY,
 } from "@/clusterMap/paths";
+import { scrollStep } from "@/dnd/autoscroll";
+import { useDndMaybe } from "@/dnd/DndProvider";
+import type { Item, Point as DndPoint, Verdict } from "@/dnd/types";
 
 /** 그림 상자의 크기를 모를 때(첫 그리기·jsdom) 쓰는 크기 */
 const DEFAULT_SIZE = { width: 960, height: 560 };
 /** 끌기로 본 움직임(px) — 이보다 많이 움직였으면 누르기가 아니다 */
 const CLICK_SLOP = 4;
+/** 동작 줄이기에서 끌기 가장자리 보기 옮기기의 뛰기 사이(ms) — 미끄러지지 않고 한 번에 뛴다 */
+const JUMP_MS = 600;
 
 /** 그림이 연 것(열쇠: `node:`·`unplaced`·`vm:`·`more:`·`hidden:`·`ghost:`·화살표) */
 export interface MapOpen {
@@ -201,6 +207,35 @@ function glowStyle(svg: string, scene: Scene, lit: string | null, problems: bool
     css += links.map((l) => `#${svg} [data-link="${l.key}"]`).join(",") + "{opacity:1}";
   }
   return css;
+}
+
+/** 끌기 틀의 판정 → 밝히기 수준 */
+export function levelOf(v: Verdict): "ok" | "warn" | "blocked" {
+  return !v.ok ? "blocked" : v.warn ? "warn" : "ok";
+}
+
+/**
+ * 끌어 옮기기의 밝히기(계획 71 §10.1): 노드마다 놓을 수 있음(브랜드 테두리)·경고(노랑 테두리)·막힘(빗금 흐림), 포인터 아래
+ * 노드는 더 굵게. 원래 노드는 꼬리표("여기서")만. 블록을 다시 그리지 않고 `<style>` 한 장이다.
+ */
+function dragStyle(
+  svg: string,
+  defs: string,
+  levels: readonly [string, "ok" | "warn" | "blocked"][],
+  over: string | null,
+): string {
+  const of = (level: string) => levels.filter(([, l]) => l === level).map(([k]) => k);
+  const rules: [string[], string, string][] = [
+    [of("ok"), " .cm-top", "stroke:var(--brand);stroke-width:3"],
+    [of("warn"), " .cm-top", "stroke:var(--warning);stroke-width:3"],
+    [of("blocked"), "", "opacity:.45"],
+    [of("blocked"), " .cm-top", `fill:url(#${defs}-unknown)!important`],
+    [over ? [over] : [], " .cm-top", "stroke-width:5"],
+  ];
+  return rules
+    .filter(([keys]) => keys.length > 0)
+    .map(([keys, tail, body]) => `${keys.map((k) => `#${svg} g[data-key="${k}"]${tail}`)}{${body}}`)
+    .join("");
 }
 
 /** 움직임(§8): 흐르는 점선·맥박. 동작 줄이기면 키프레임이 없다 — 점선은 멈추고 진행률 글은 남는다. */
@@ -807,6 +842,20 @@ export interface MapSceneProps {
   onLod?(lod: Lod): void;
   /** 가리킨·초점 원소의 카드 몸통 */
   renderCard(key: string): ReactNode;
+  /** 끌어 옮기기(계획 71 §10) — 쪽이 그림을 `DndProvider` 안에 두고 준다. 없으면 끌기가 없다. */
+  drag?: MapDrag;
+}
+
+/** 지도 끌어 옮기기에서 쪽이 주는 것 */
+export interface MapDrag {
+  /**
+   * VM 타일 열쇠 → 끌 수 있으면 끌 것(VM id·이름), 끌 수 없으면 `m`이 읽을 까닭(번역한 글), VM 타일이 아니면(`+N`) null
+   */
+  item(tileKey: string): Item | string | null;
+  /** 노드 열쇠 → 메모리 여유 글(키보드 옮기기가 노드마다 읽음, 모르면 null) */
+  free(nodeKey: string): string | null;
+  /** 든 VM이 바뀜(쪽이 그 VM의 CPU·NUMA 맞음을 묻는다) */
+  onHold(vm: string | null): void;
 }
 
 /**
@@ -825,7 +874,7 @@ export function MapScene(props: MapSceneProps) {
   const size = useSize(wrap);
   const fit = useMemo(() => fitBox(scene.bounds, 40), [scene.bounds]);
   const viewport = useIsoViewport(fit);
-  const { view, attach, handlers, zoomIn, zoomOut, reset, reveal } = viewport;
+  const { view, attach, handlers, zoomIn, zoomOut, reset, reveal, pan } = viewport;
 
   // 자세히 보기 단계(문턱 둘레 이력 — 지난 단계를 기억)
   const [prevLod, setPrevLod] = useState<Lod | null>(null);
@@ -859,8 +908,11 @@ export function MapScene(props: MapSceneProps) {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const press = useRef<{ x: number; y: number } | null>(null);
   const latest = useRef(props);
+  // 포인터 사건·프레임 사이에 읽는 지금 값(끌기의 칸 찾기·가장자리 보기 옮기기)
+  const now = useRef({ lod, view, pan, reduced });
   useLayoutEffect(() => {
     latest.current = props;
+    now.current = { lod, view, pan, reduced };
   });
   const { onLod, onFocusChange } = props;
   useEffect(() => onLod?.(lod), [onLod, lod]);
@@ -869,10 +921,12 @@ export function MapScene(props: MapSceneProps) {
   const nodeEl = (key: string): SVGGElement | null =>
     svgRef.current?.querySelector<SVGGElement>(`g[data-key="${key}"]`) ?? null;
 
-  const moveTo = (next: Focus, dom = true) => {
+  const moveTo = (next: Focus, dom = true, quiet = false) => {
     setFocus(next);
     const key = next.kind === "node" ? next.key : next.key;
-    setAnnounce(labels.get(key) ?? "");
+    if (!quiet) {
+      setAnnounce(labels.get(key) ?? "");
+    }
     const at = anchorOf(scene, key);
     if (at) {
       reveal(at.x, at.y);
@@ -934,9 +988,196 @@ export function MapScene(props: MapSceneProps) {
     }
   };
 
+  // 끌어 옮기기(계획 71 §10): 켜진 VM 타일에서 시작한 누르기만 끌기이고 나머지는 보기 움직이기 그대로다. 놓을 자리는
+  // 노드(`hitTest` — 타일을 맞히면 그 노드), 판정은 쪽의 `accepts`(틀의 `verdict`), 놓으면 쪽의 `onDrop`(대화상자).
+  const dnd = useDndMaybe();
+  const drag = dnd && props.drag ? props.drag : null;
+  const ds = dnd?.state;
+  const heldState = ds?.phase === "dragging" || ds?.phase === "picked" ? ds : null;
+  const held = heldState?.item ?? null;
+  const over = heldState?.over ?? null;
+  /** 키보드 옮기기 모드(`m`) — 누르기 들기는 지도에 없으므로 든 채(`picked`)는 늘 이것이다 */
+  const moving = ds?.phase === "picked";
+  const [origin, setOrigin] = useState<{ node: string; tile: Focus } | null>(null);
+  /** 끌기를 시작할 수 있는 누르기의 포인터 */
+  const dragPointer = useRef<number | null>(null);
+  /** 이 누르기가 끌기였음(뒤따르는 click은 서랍을 열지 않음) */
+  const dragged = useRef(false);
+  const heldId = held?.id ?? null;
+  useEffect(() => {
+    latest.current.drag?.onHold(heldId);
+  }, [heldId]);
+
+  /** 화면 점 → 놓을 노드 열쇠(타일을 맞히면 그 노드, "배치 안 됨" 판은 아님) */
+  const findNode = useCallback((p: DndPoint): string | null => {
+    const svg = svgRef.current;
+    const at = svg ? toScene(svg, p.x, p.y) : null;
+    const hit = at ? hitTest(latest.current.scene, now.current.lod, at) : null;
+    const key = hit ? (hit.kind === "node" ? hit.key : hit.node) : null;
+    return key === "unplaced" ? null : key;
+  }, []);
+  const hasDrag = drag !== null;
+  const surface = dnd?.surface;
+  useEffect(() => {
+    if (!hasDrag || !surface) {
+      return;
+    }
+    return surface({
+      find: findNode,
+      ids: () => latest.current.scene.nodes.filter((n) => n.kind !== "unplaced").map((n) => n.key),
+      label: (id) => latest.current.scene.byKey.get(id)?.name ?? id,
+    });
+    // 틀의 `surface`는 상태마다 새 함수지만 하는 일(같은 모음에 넣기)은 같다 — 끌기가 있는 동안 한 번 단다.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasDrag, findNode]);
+
+  // 끄는 동안 그림 가장자리 48px 안이면 보기를 그쪽으로 옮긴다(동작 줄이기면 미끄러지지 않고 한 번에 뛴다).
+  const dragging = ds?.phase === "dragging";
+  const send = dnd?.send;
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!dragging || !svg || !send) {
+      return;
+    }
+    let p: DndPoint | null = null;
+    let frame = 0;
+    let jumped = -Infinity;
+    const track = (e: PointerEvent) => {
+      p = { x: e.clientX, y: e.clientY };
+    };
+    const tick = () => {
+      frame = requestAnimationFrame(tick);
+      const r = svg.getBoundingClientRect();
+      const { dx, dy } = p ? scrollStep(r, p) : { dx: 0, dy: 0 };
+      if (!p || (dx === 0 && dy === 0) || r.width === 0) {
+        return;
+      }
+      const { view: v, pan: move, reduced: still } = now.current;
+      if (still) {
+        const at = performance.now();
+        if (at - jumped < JUMP_MS) {
+          return;
+        }
+        jumped = at;
+        move((Math.sign(dx) * v.w) / 3, (Math.sign(dy) * v.h) / 3);
+      } else {
+        move((dx * v.w) / r.width, (dy * v.h) / r.width);
+      }
+      send({ type: "move", point: p, slot: findNode(p) });
+    };
+    addEventListener("pointermove", track);
+    frame = requestAnimationFrame(tick);
+    return () => {
+      removeEventListener("pointermove", track);
+      cancelAnimationFrame(frame);
+    };
+  }, [dragging, send, findNode]);
+
+  /** 누른 곳의 VM 타일(요약 단계에는 타일이 없다) */
+  const tileAt = (e: React.PointerEvent): { key: string; node: string } | null => {
+    const svg = svgRef.current;
+    const p = svg ? toScene(svg, e.clientX, e.clientY) : null;
+    const hit = p ? hitTest(scene, lod, p) : null;
+    return hit?.kind === "tile" ? hit : null;
+  };
+  /** 들기 시작: 원래 노드를 기억하고(꼬리표·Esc로 돌아올 곳), 취소하면 틀이 초점을 그 노드로 돌린다. */
+  const hold = (item: Item, tile: { key: string; node: string }) => {
+    setOrigin({ node: tile.node, tile: { kind: "tile", node: tile.node, key: tile.key } });
+    dnd!.item(item.id, nodeEl(tile.node));
+  };
+  /** 노드 위에서 읽을 말: 놓을 수 있음·경고·까닭, 놓을 수 있으면 메모리 여유 */
+  const overText = (item: Item, key: string): string => {
+    const v: Verdict = dnd!.verdict(item, key);
+    const slot = scene.byKey.get(key)?.name ?? key;
+    const why = (r?: { key: string; values?: Record<string, string | number> }) =>
+      r ? t(r.key, r.values) : "";
+    const text = v.ok
+      ? v.warn
+        ? t("dnd.overWarn", { slot, warn: why(v.warn) })
+        : t("dnd.overOk", { slot })
+      : v.reason
+        ? t("dnd.overNo", { slot, reason: why(v.reason) })
+        : t("dnd.overNoPlain", { slot });
+    const free = v.ok ? drag?.free(key) : null;
+    return free ? `${text} ${free}` : text;
+  };
+
+  /** 옮기기 모드의 키(§10.3): 화살표·Home·End로 노드, Enter·Space로 놓기, Esc로 취소, Tab은 취소하고 나감 */
+  const onMoveKey = (e: React.KeyboardEvent<SVGGElement>, item: Item) => {
+    const at = over ?? origin?.node ?? null;
+    const back = () => {
+      if (origin) {
+        setFocus(origin.tile);
+      }
+    };
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.stopPropagation();
+      dnd!.send({ type: "cancel" });
+      back();
+    } else if (e.key === "Tab") {
+      dnd!.send({ type: "cancel" });
+      back();
+    } else if ((e.key === "Enter" || e.key === " ") && at) {
+      e.preventDefault();
+      e.stopPropagation();
+      dnd!.send({ type: "drop", slot: at });
+    } else if (at && isNavKey(e.key) && e.key !== "[" && e.key !== "]") {
+      e.preventDefault();
+      e.stopPropagation();
+      const next = neighbor(scene, { kind: "node", key: at }, e.key);
+      if (next?.kind === "node" && next.key !== "unplaced") {
+        moveTo(next, true, true);
+        dnd!.send({ type: "over", slot: next.key });
+        dnd!.announce(overText(item, next.key));
+      }
+    }
+  };
+
+  /** `m`(VM 타일 단계): 옮기기 모드. 끌 수 없는 VM이면 까닭만 읽는다. */
+  const startMove = (tile: Focus & { kind: "tile" }): boolean => {
+    const it = drag?.item(tile.key) ?? null;
+    if (it === null) {
+      return false;
+    }
+    if (typeof it === "string") {
+      dnd!.announce(it);
+      return true;
+    }
+    hold(it, tile);
+    dnd!.send({ type: "pick", item: it, key: true });
+    setFocus({ kind: "node", key: tile.node });
+    const count = scene.nodes.filter(
+      (n) => n.kind !== "unplaced" && dnd!.verdict(it, n.key).ok,
+    ).length;
+    dnd!.announce(
+      count > 0
+        ? t("clusterMap.drag.start", { vm: it.label, count })
+        : t("clusterMap.drag.none", { vm: it.label }),
+    );
+    return true;
+  };
+
   const onKey = (e: React.KeyboardEvent<SVGGElement>, nodeKey: string) => {
+    if (moving && held) {
+      onMoveKey(e, held);
+      return;
+    }
     const current: Focus = focus && focusNode === nodeKey ? focus : { kind: "node", key: nodeKey };
     const key = current.kind === "tile" ? current.key : current.key;
+    if (
+      e.key === "m" &&
+      !e.altKey &&
+      !e.ctrlKey &&
+      !e.metaKey &&
+      drag &&
+      current.kind === "tile" &&
+      startMove(current)
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       open(key, e.key === "Enter" && e.shiftKey);
@@ -981,7 +1222,18 @@ export function MapScene(props: MapSceneProps) {
     }
   };
 
-  const lit = hover ?? (focused ? focusKey : null);
+  // 들고 있는 동안은 포인터 아래(키보드면 고른) 노드를 둘레로, 가리키기 밝히기 대신 놓을 수 있음 밝히기
+  const lit = held ? (over ?? origin?.node ?? null) : (hover ?? (focused ? focusKey : null));
+  const levels =
+    held && dnd
+      ? scene.nodes
+          .filter((n) => n.kind !== "unplaced" && n.key !== origin?.node)
+          .map(
+            (n) =>
+              [n.key, levelOf(dnd.verdict(held, n.key))] as [string, ReturnType<typeof levelOf>],
+          )
+      : [];
+  const here = held && origin ? scene.byKey.get(origin.node) : undefined;
   const outlineBox = (() => {
     if (!lit) {
       return null;
@@ -1038,7 +1290,11 @@ export function MapScene(props: MapSceneProps) {
     [scene.links, showRecs, labels, defs],
   );
 
-  const card = lit ? props.renderCard(lit) : null;
+  const card = held
+    ? over && <p className="font-medium">{overText(held, over)}</p>
+    : lit
+      ? props.renderCard(lit)
+      : null;
   const cardAt = lit ? anchorOf(scene, lit) : null;
   const px = cardAt ? toPixel(view, size, cardAt) : null;
 
@@ -1058,19 +1314,65 @@ export function MapScene(props: MapSceneProps) {
         {...handlers}
         onPointerDown={(e) => {
           press.current = { x: e.clientX, y: e.clientY };
+          dragged.current = false;
+          // 다른 손가락이 닿으면 끌기를 그만두고 확대(보기 쪽)
+          if (dnd && dragPointer.current !== null && dragPointer.current !== e.pointerId) {
+            dragPointer.current = null;
+            dnd.send({ type: "cancel" });
+          }
+          const tile =
+            drag && dnd?.current().phase === "idle" && e.isPrimary && e.button === 0
+              ? tileAt(e)
+              : null;
+          const item = tile ? drag!.item(tile.key) : null;
+          if (tile && item && typeof item === "object") {
+            dragPointer.current = e.pointerId;
+            hold(item, tile);
+            dnd!.send({
+              type: "down",
+              item,
+              point: { x: e.clientX, y: e.clientY },
+              touch: e.pointerType === "touch",
+            });
+            // 마우스·펜은 보기를 움직이지 않는다. 터치는 길게 누르기 전에 움직이면 보기 움직이기라 넘겨 둔다.
+            if (e.pointerType !== "touch") {
+              return;
+            }
+          }
           handlers.onPointerDown(e);
         }}
         onPointerMove={(e) => {
-          handlers.onPointerMove(e);
-          if (e.pointerType !== "touch") {
+          // 끌기를 기다리거나 끄는 손가락은 보기를 움직이지 않는다(길게 누르기 전에 움직여 틀이 놓으면 다시 보기).
+          if (dragPointer.current !== e.pointerId || dnd?.current().phase === "idle") {
+            handlers.onPointerMove(e);
+          }
+          if (e.pointerType !== "touch" && !held) {
             const key = hitAt(e);
             setHover((was) => (was === key ? was : key));
           }
         }}
+        onPointerUp={(e) => {
+          if (dragPointer.current === e.pointerId) {
+            dragPointer.current = null;
+            const phase = dnd?.current().phase;
+            dragged.current = phase === "dragging";
+            // 끌지 않고 뗐다: 지도에는 누르기 들기가 없다 — 누르기는 서랍(click)이다.
+            if (phase === "pressing") {
+              dnd!.send({ type: "cancel" });
+            }
+          }
+          handlers.onPointerUp(e);
+        }}
         onPointerLeave={() => setHover(null)}
+        // 길게 누르기(터치 끌기)의 문맥 메뉴를 막는다
+        onContextMenu={(e) => dragPointer.current !== null && e.preventDefault()}
         onClick={(e) => {
           const from = press.current;
           press.current = null;
+          if (dragged.current) {
+            dragged.current = false;
+            return;
+          }
           if (from && Math.hypot(e.clientX - from.x, e.clientY - from.y) > CLICK_SLOP) {
             return;
           }
@@ -1086,7 +1388,8 @@ export function MapScene(props: MapSceneProps) {
           }
         }}
       >
-        <style>{glowStyle(svgId, scene, lit, props.problemsOnly === true)}</style>
+        <style>{glowStyle(svgId, scene, held ? null : lit, props.problemsOnly === true)}</style>
+        {held && <style>{dragStyle(svgId, defs, levels, over)}</style>}
         <style>{motionStyle(svgId, reduced)}</style>
         <defs>
           {(
@@ -1156,6 +1459,14 @@ export function MapScene(props: MapSceneProps) {
           ))}
         </g>
         <g>{linkEls}</g>
+        {here && (
+          <g aria-hidden pointerEvents="none">
+            <Tags
+              at={{ x: nodeTop(here).x, y: nodeTop(here).y - 24 }}
+              tags={[{ key: "here", text: t("clusterMap.drag.hereTag"), tone: "info" }]}
+            />
+          </g>
+        )}
         <path
           d={outlineBox ? hullPath(outlineBox) : ""}
           fill="none"

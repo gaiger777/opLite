@@ -24,6 +24,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
+import { dragBlock, dropCheck, toVerdict } from "@/clusterMap/drop";
 import { linkText } from "@/clusterMap/labels";
 import type { MapLink } from "@/clusterMap/layout";
 import { byName, placeOf } from "@/clusterMap/model";
@@ -34,6 +35,7 @@ import { moveReasonText, PLACEMENT_KEY } from "@/placement/balance";
 import { migrationStageText, trackTask } from "@/tasks/tasks";
 import { availability } from "@/vms/actions";
 import { useVmActionHost } from "@/vms/actionHost";
+import { localDisks } from "@/vms/migrate";
 import { VmMenu } from "@/vms/VmMenu";
 import { VmPeek } from "@/vms/VmPeek";
 
@@ -408,3 +410,10 @@ export function MapSheet({
     </Sheet>
   );
 }
+
+/**
+ * 지도 끌어 옮기기의 판정(계획 71 §10.2)은 이 서랍 조각과 함께 받는다. VM 동작·옮기기 대화상자 모듈을 이미 쓰는 조각이라,
+ * 지도 조각이 그 모듈을 직접 읽어 첫 화면 묶음의 조각이 쪼개지는 일(+0.4 KB)이 없다. 쪽은 그림을 그린 뒤 미리 받는다.
+ */
+export const dragLogic = { dropCheck, dragBlock, toVerdict, localDisks };
+export type DragLogic = typeof dragLogic;

@@ -19,9 +19,10 @@ import type { Lod } from "@/clusterMap/lod";
 import { NodeCard, TextCard, VmCard } from "@/clusterMap/MapCard";
 import { MapList } from "@/clusterMap/MapList";
 import { MapScene, type MapOpen } from "@/clusterMap/MapScene";
-import type { SheetTarget } from "@/clusterMap/MapSheet";
+import type { DragLogic, SheetTarget } from "@/clusterMap/MapSheet";
 import { type ClusterModel, labelKeys, toModel } from "@/clusterMap/model";
 import { MAP_LAYERS, type MapLayer } from "@/clusterMap/paths";
+import { useMapDrag } from "@/clusterMap/useMapDrag";
 import { useIsPhone } from "@/components/data-table/DataTable";
 import { EmptyState } from "@/components/EmptyState";
 import { Field } from "@/components/Field";
@@ -33,6 +34,7 @@ import { Label } from "@/components/ui/label";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import { DndProvider } from "@/dnd/DndProvider";
 import { readUserPref, writeUserPref } from "@/lib/prefs";
 import { useNodeActions } from "@/nodes/NodeActions";
 
@@ -144,6 +146,17 @@ export function ClusterMapPage() {
   const data = useClusterMapData();
   const actions = useNodeActions();
   const keysId = useId();
+  // 켜진 VM 타일을 노드로 끌거나 `m`으로 옮기기 대화상자를 연다(계획 71 §10). 판정 함수는 서랍 조각과 함께 그림을
+  // 그린 뒤 미리 받는다(첫 누르기의 서랍도 빨라진다).
+  const [logic, setLogic] = useState<DragLogic | null>(null);
+  useEffect(() => {
+    let live = true;
+    void import("@/clusterMap/MapSheet").then((m) => live && setLogic(m.dragLogic));
+    return () => {
+      live = false;
+    };
+  }, []);
+  const drag = useMapDrag(data.nodes.data, data.vms.data, data.placement.data, logic);
 
   const pref = (key: string) => readUserPref(user, `clusterMap.${key}`);
   const [mode, setModeState] = useState<Mode>(() => (pref("mode") === "list" ? "list" : "picture"));
@@ -519,7 +532,7 @@ export function ClusterMapPage() {
         mode={mode}
         render={(m, s) =>
           mode === "picture" ? (
-            <>
+            <DndProvider accepts={drag.accepts} onDrop={drag.onDrop}>
               <MapScene
                 scene={s}
                 nodes={nodesByKey}
@@ -540,12 +553,13 @@ export function ClusterMapPage() {
                 }}
                 onLod={setLod}
                 renderCard={renderCard}
+                drag={drag.drag ?? undefined}
               />
               <Legend layers={shown} />
               <p id={keysId} className="text-xs text-muted-foreground">
                 {t("clusterMap.keys")}
               </p>
-            </>
+            </DndProvider>
           ) : (
             <MapList
               model={m}

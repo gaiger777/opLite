@@ -79,7 +79,7 @@
     },
     "big": "노드가 많습니다: 판 하나만 보면 읽기 쉽습니다.",
     "loadUnknownNote": "부하 모름: 리더의 배치 요약을 읽을 수 없습니다.",
-    "keys": "화살표로 노드 사이를 옮기고 ]로 노드의 VM에 들어가며 [나 Esc로 나옵니다. Enter로 열고 Shift+Enter로 화면을 엽니다. 끌어서 옮기고 Ctrl + 휠·두 손가락·+ − 0으로 확대합니다.",
+    "keys": "화살표로 노드 사이를 옮기고 ]로 노드의 VM에 들어가며 [나 Esc로 나옵니다. Enter로 열고 Shift+Enter로 화면을 엽니다. 끌어서 옮기고 Ctrl + 휠·두 손가락·+ − 0으로 확대합니다. 켜진 VM 타일을 노드로 끌거나 그 VM에서 m을 눌러 옮깁니다.",
     "cluster": "클러스터",
     "noGroup": "영역 없음",
     "unplaced": "배치 안 됨",
@@ -139,6 +139,27 @@
       "applyDescription": "{{vm}}을(를) {{from}}에서 {{to}}(으)로 라이브 마이그레이션합니다(최적 배치 화면의 적용과 같음)."
     },
     "tagAlloc": "할당 {{pct}}%",
-    "tagFence": "펜스 확인 실패"
+    "tagFence": "펜스 확인 실패",
+    "drag": {
+      "here": "VM이 이미 여기 있습니다",
+      "hereTag": "여기서",
+      "witness": "{{node}}는 위트니스 노드입니다",
+      "offline": "{{node}}는 오프라인입니다",
+      "frozen": "{{node}}는 종료 뒤 얼어 있습니다",
+      "maintenance": "{{node}}는 유지보수 중입니다",
+      "arch": "{{node}}는 {{arch}}라 VM의 아키텍처가 아닙니다",
+      "cpu": "{{node}}에서 VM의 CPU를 켤 수 없습니다({{why}})",
+      "numa": "{{node}}가 VM의 전용 CPU·hugepages·vNUMA를 받을 수 없습니다({{why}})",
+      "rules": "배치 규칙 {{rules}}을 어깁니다",
+      "rulesForce": "배치 규칙 {{rules}}을 어깁니다(대화상자에서 넘길 수 있음)",
+      "memory": "메모리 여유가 {{free}}뿐입니다(VM {{need}})",
+      "copy": "로컬 디스크 {{size}}를 복사합니다",
+      "stopped": "꺼진 VM은 편집에서 노드를 바꿉니다.",
+      "denied": "{{vm}}을 옮길 권한이 없습니다.",
+      "free": "메모리 여유 {{free}}.",
+      "start_one": "{{vm}} 옮기기. 화살표로 노드를 고르고 Enter로 놓고 Esc로 취소합니다. 놓을 수 있는 노드 {{count}}개.",
+      "start_other": "{{vm}} 옮기기. 화살표로 노드를 고르고 Enter로 놓고 Esc로 취소합니다. 놓을 수 있는 노드 {{count}}개.",
+      "none": "{{vm}} 옮기기: 놓을 수 있는 노드가 없습니다. Esc로 취소합니다."
+    }
   }
 }

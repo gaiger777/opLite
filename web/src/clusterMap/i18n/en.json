@@ -79,7 +79,7 @@
     },
     "big": "Many nodes: show one group to read the map more easily.",
     "loadUnknownNote": "Load unknown: the leader's placement summary can't be read.",
-    "keys": "Arrows move between nodes, ] enters a node's VMs and [ or Esc leaves. Enter opens, Shift+Enter opens the page. Drag to pan; Ctrl + wheel, pinch or + − 0 to zoom.",
+    "keys": "Arrows move between nodes, ] enters a node's VMs and [ or Esc leaves. Enter opens, Shift+Enter opens the page. Drag to pan; Ctrl + wheel, pinch or + − 0 to zoom. Drag a running VM's tile onto a node, or press m on it, to migrate it.",
     "cluster": "Cluster",
     "noGroup": "No zone",
     "unplaced": "Not placed",
@@ -139,6 +139,27 @@
       "applyDescription": "Live-migrates {{vm}} from {{from}} to {{to}}, as Apply on the placement page does."
     },
     "tagAlloc": "alloc {{pct}}%",
-    "tagFence": "fence check failed"
+    "tagFence": "fence check failed",
+    "drag": {
+      "here": "the VM is already here",
+      "hereTag": "here",
+      "witness": "{{node}} is a witness node",
+      "offline": "{{node}} is offline",
+      "frozen": "{{node}} is frozen after a shutdown",
+      "maintenance": "{{node}} is in maintenance",
+      "arch": "{{node}} is {{arch}}, not the VM's architecture",
+      "cpu": "{{node}} can't run the VM's CPU ({{why}})",
+      "numa": "{{node}} can't hold the VM's dedicated CPUs, hugepages or vNUMA ({{why}})",
+      "rules": "breaks placement rule {{rules}}",
+      "rulesForce": "breaks placement rule {{rules}} (you may override it in the dialog)",
+      "memory": "only {{free}} memory free, the VM has {{need}}",
+      "copy": "copies {{size}} of local disks",
+      "stopped": "Stopped VMs change node in Edit.",
+      "denied": "You may not migrate {{vm}}.",
+      "free": "{{free}} memory free.",
+      "start_one": "Moving {{vm}}. Arrows choose a node, Enter drops, Escape cancels. {{count}} node can take it.",
+      "start_other": "Moving {{vm}}. Arrows choose a node, Enter drops, Escape cancels. {{count}} nodes can take it.",
+      "none": "Moving {{vm}}: no node can take it. Escape cancels."
+    }
   }
 }

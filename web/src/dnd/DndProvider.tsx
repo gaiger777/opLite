@@ -23,13 +23,15 @@ type T = (key: string, values?: Record<string, unknown>) => string;
 
 export interface DndApi {
   state: DndState;
+  /** 지금 상태(그리기를 기다리지 않음 — 포인터 사건 사이에 읽는 쪽, 지도) */
+  current(): DndState;
   send(e: DndEvent): void;
   /** 든 것을 이 칸에 놓을 수 있는지 */
   verdict(item: Item, slot: string): Verdict;
   /** DOM 칸을 단다(`el`이 null이면 뗀다). 돌려준 함수로 뗀다. */
   slot(id: string, el: HTMLElement | null, label: string): () => void;
   /** 끌 수 있는 원소(취소하면 초점을 돌려줄 곳) */
-  item(id: string, el: HTMLElement | null): void;
+  item(id: string, el: HTMLElement | SVGElement | null): void;
   /** 찾기 함수 그림(지도)을 단다. */
   surface(s: Surface): () => void;
   /** 알림 줄에 한 마디(빌더의 서버 확인 결과 등) */
@@ -46,6 +48,11 @@ export function useDnd(): DndApi {
     throw new Error("useDnd outside DndProvider");
   }
   return api;
+}
+
+/** 제공자 안이면 그 틀, 밖이면 null(끌기가 없는 그림 — 지도는 제공자 없이도 그린다) */
+export function useDndMaybe(): DndApi | null {
+  return useContext(DndContext);
 }
 
 /** 알림 줄 말을 옮긴다(값의 `reason`·`warn`도 키다). */
@@ -79,7 +86,7 @@ export function DndProvider<I extends Item>({
   });
   const [m] = useState(() => {
     const slots = new Map<string, { el: HTMLElement; label: string }>();
-    const items = new Map<string, HTMLElement>();
+    const items = new Map<string, HTMLElement | SVGElement>();
     const surfaces = new Set<Surface>();
     /** DOM 칸의 문서 차례 */
     const order = () =>
@@ -147,6 +154,7 @@ export function DndProvider<I extends Item>({
   const api = useMemo<DndApi>(
     () => ({
       state,
+      current: () => live.current.state,
       send: m.send,
       verdict: (item, slot) => m.ctx.accepts(item, slot),
       slot(id, el, label) {

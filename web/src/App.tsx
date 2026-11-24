@@ -187,12 +187,13 @@ export const appRoutes: RouteObject[] = [
               { path: "cluster", lazy: page(() => import("@/cluster/ClusterPage"), "ClusterPage") },
               {
                 path: "cluster/map",
-                // 지도 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다(계획 70 §12).
+                // 지도 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다(계획 70 §12). 끌어 옮기기의 끌기 틀 문구도(계획 71).
                 lazy: page(
                   () =>
                     Promise.all([
                       import("@/clusterMap/ClusterMapPage"),
                       import("@/clusterMap/strings").then((s) => s.loadMapStrings()),
+                      import("@/dnd/strings").then((s) => s.loadDndStrings()),
                     ]).then(([m]) => m),
                   "ClusterMapPage",
                 ),

@@ -192,6 +192,8 @@ export function useIsoViewport(fit: ViewBox) {
     zoomIn: () => set((v) => zoomAt(v, 1.25, center().x, center().y, state.fit)),
     zoomOut: () => set((v) => zoomAt(v, 1 / 1.25, center().x, center().y, state.fit)),
     reset: () => setState((s) => ({ ...s, view: s.fit, moved: false })),
+    /** 보기를 (dx, dy)(viewBox 좌표)만큼 옮긴다(지도 끌기의 가장자리 보기 옮기기 — 계획 71) */
+    pan: (dx: number, dy: number) => set((v) => ({ ...v, x: v.x + dx, y: v.y + dy })),
     /** 화면 점(viewBox 좌표)이 보이게 옮긴다(키보드 초점이 그림 밖으로 나가면) */
     reveal(x: number, y: number) {
       if (x >= view.x && x <= view.x + view.w && y >= view.y && y <= view.y + view.h) {

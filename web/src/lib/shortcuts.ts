@@ -23,7 +23,8 @@ export type ShortcutId =
   | "list.peek"
   | "list.open"
   | "map.enter"
-  | "map.leave";
+  | "map.leave"
+  | "map.move";
 
 export interface Shortcut {
   id: ShortcutId;
@@ -57,6 +58,8 @@ export const SHORTCUTS: readonly Shortcut[] = [
   // 클러스터 지도(계획 70)가 그림에 초점이 있을 때만 받는다(`[`는 그 밖에서 사이드바 접기). 여기서는 도움말에만 보인다.
   { id: "map.enter", keys: ["]"], group: "map" },
   { id: "map.leave", keys: ["["], group: "map" },
+  // VM 타일 단계에서 옮기기 모드(계획 71 — 끌기 대신): 화살표로 노드, Enter로 옮기기 대화상자, Esc로 취소
+  { id: "map.move", keys: ["m"], group: "map" },
 ];
 
 /** 머리줄이 받는 단축키(목록 키는 표가, 지도 키는 지도가 받는다) */

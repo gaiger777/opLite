@@ -3376,7 +3376,8 @@
     },
     "map": {
       "enter": "Go into a node's VMs",
-      "leave": "Back to the node"
+      "leave": "Back to the node",
+      "move": "Move the VM to another node (instead of dragging)"
     }
   },
   "table": {

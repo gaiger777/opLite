@@ -198,3 +198,26 @@ export function randomCluster(seed: number) {
   }
   return { nodes, vms };
 }
+
+/**
+ * jsdom의 SVG에는 화면 ↔ 사용자 좌표 행렬이 없다. 같은 좌표로 두어(화면 점 = viewBox 점) 지도의 적중 셈(`hitTest`)을
+ * 포인터 사건으로 시험한다(계획 71 끌어 옮기기). 돌려준 함수로 되돌린다.
+ */
+export function stubSvgMatrix(): () => void {
+  const proto = SVGSVGElement.prototype as unknown as Record<string, unknown>;
+  Object.defineProperty(proto, "getScreenCTM", {
+    configurable: true,
+    value: () => ({ inverse: () => ({}) }),
+  });
+  Object.defineProperty(proto, "createSVGPoint", {
+    configurable: true,
+    value: () => {
+      const p = { x: 0, y: 0, matrixTransform: () => ({ x: p.x, y: p.y }) };
+      return p;
+    },
+  });
+  return () => {
+    delete proto.getScreenCTM;
+    delete proto.createSVGPoint;
+  };
+}
