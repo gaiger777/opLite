@@ -435,6 +435,20 @@ describe("accepts", () => {
       ok: false,
       reason: { key: "vmBuilder.reason.templateFixed", values: undefined },
     });
+    // 배포 요청은 HA를 싣지 못한다.
+    expect(verdict("ha", "protection", t)).toBe("no:vmBuilder.reason.templateHa");
+  });
+
+  it("refuses a held block whose place is gone (undo while held)", () => {
+    const s = build([
+      ["pool:ceph", "disks"],
+      ["pool:ceph", "disks"],
+    ]);
+    const gone: Thing = { kind: "block", id: "block:disks.2", list: "disks", index: 2 };
+    expect(accepts(gone, "disks.0", s, ctx).ok).toBe(false);
+    expect(accepts(gone, "disks", s, ctx).ok).toBe(false);
+    expect(accepts(gone, "trash", s, ctx).ok).toBe(false);
+    expect(drop(s, gone, "disks.0", ctx)).toBe(s);
   });
 
   it("moves blocks within their own list and to the trash", () => {
@@ -618,6 +632,18 @@ describe("drop", () => {
     expect(s.values.disks.map((d) => d.volume)).toEqual(["web-disk0", "spare"]);
     expect(s.autoNames).toEqual([true, false]);
     expect(moveBlock(s, "disks", 0, 5)).toBe(s);
+    expect(moveBlock(s, "disks", 5, 0)).toBe(s);
+    expect(moveBlock(s, "disks", -1, 0)).toBe(s);
+  });
+
+  it("turns off what a template deployment cannot carry (HA, pinning, the agent flag)", () => {
+    let s = build([["ha", "protection"]]);
+    s = { ...s, values: { ...s.values, pinned: true, guestAgent: false } };
+    s = build([[`template:${TEMPLATE.id}`, "vm"]], ctx, s);
+    expect(s.values).toMatchObject({ ha: false, haGroup: "", pinned: false });
+    s = build([["ci:packages", "cloudInit"]], ctx, s);
+    expect(s.values.cloudInit.userData).toBe(PACKAGES_USER_DATA);
+    expect(s.values.guestAgent).toBe(false);
   });
 });
 

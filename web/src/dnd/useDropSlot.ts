@@ -1,4 +1,4 @@
-import { useCallback } from "react";
+import { type MouseEvent, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 
 import { speak, useDnd } from "@/dnd/DndProvider";
@@ -39,7 +39,13 @@ export function useDropSlot<E extends HTMLElement = HTMLElement>(id: string, lab
       "aria-description": description,
       onClick:
         s.phase === "picked"
-          ? () => {
+          ? (e: MouseEvent) => {
+              // 가장 안쪽 칸만 받는다(바깥 목록 칸이 같은 누르기를 "끝에 놓기"로 받지 않게).
+              e.stopPropagation();
+              // 든 것 안의 누르기(누르기로 든 바로 뒤의 click)는 놓기가 아니다.
+              if ((e.target as Element).closest?.("[data-held]")) {
+                return;
+              }
               dnd.send({ type: "drop", slot: id });
             }
           : undefined,

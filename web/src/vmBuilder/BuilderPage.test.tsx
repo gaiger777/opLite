@@ -161,6 +161,70 @@ it("picks with a tap and drops with a tap on a lit slot", async () => {
   expect(block("NIC 1 (lan)")).toBeInTheDocument();
 });
 
+/** 디스크 둘(새 디스크 web-disk0, 있는 볼륨 spare)을 메뉴로 더한다. 블록 이름을 차례로 돌려주는 함수를 준다. */
+async function twoDisks(user: ReturnType<typeof userEvent.setup>) {
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "Ways to add New disk in ceph" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Disks (top boots first)" }));
+  await user.click(screen.getByRole("button", { name: "Ways to add spare" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Disks (top boots first)" }));
+  const names = () =>
+    within(slot(/^Disks \(top boots first\)/))
+      .getAllByRole("button", { name: /^Disk \d/ })
+      .map((b) => /^Disk \d \([^)]*\)/.exec(b.textContent ?? "")?.[0]);
+  expect(names()).toEqual(["Disk 1 (web-disk0)", "Disk 2 (spare)"]);
+  return names;
+}
+
+it("picks a block with a tap on its grip without moving it (the click after the tap)", async () => {
+  world();
+  open();
+  const user = userEvent.setup();
+  const names = await twoDisks(user);
+  const grip = screen.getByRole("button", { name: "Pick up Disk 1 (web-disk0)" });
+  // 실제 누르기: pointerdown → pointerup → 누른 원소의 click(바깥 칸들로 올라감)
+  fireEvent.pointerDown(grip, { button: 0, isPrimary: true, clientX: 10, clientY: 10 });
+  fireEvent.pointerUp(window, { clientX: 10, clientY: 10 });
+  fireEvent.click(grip);
+  expect(names()).toEqual(["Disk 1 (web-disk0)", "Disk 2 (spare)"]);
+  expect(grip).toHaveAttribute("data-held");
+  expect(live()).toHaveTextContent(/Picked up Disk 1 \(web-disk0\)/);
+  // 다른 블록 줄을 누르면 그 자리에 놓는다(가장 안쪽 칸만 받는다).
+  fireEvent.click(block("Disk 2 (spare)"));
+  expect(names()).toEqual(["Disk 1 (spare)", "Disk 2 (web-disk1)"]);
+});
+
+it("does not undo while a block is held, and refuses a drop whose block is gone", async () => {
+  world();
+  open();
+  const user = userEvent.setup();
+  const names = await twoDisks(user);
+  const grip = screen.getByRole("button", { name: "Pick up Disk 2 (spare)" });
+  grip.focus();
+  fireEvent.keyDown(grip, { key: " " });
+  expect(screen.getByRole("button", { name: "Undo" })).toBeDisabled();
+  fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
+  expect(names()).toEqual(["Disk 1 (web-disk0)", "Disk 2 (spare)"]);
+  // 첫 블록 자리에 놓는다(되돌리기가 블록을 지웠다면 페이지가 깨졌을 것).
+  fireEvent.keyDown(document.activeElement!, { key: "Tab" });
+  expect(slot("Disk 1 (web-disk0)")).toHaveFocus();
+  fireEvent.keyDown(document.activeElement!, { key: " " });
+  expect(names()).toEqual(["Disk 1 (spare)", "Disk 2 (web-disk1)"]);
+  // 옮긴 블록으로 초점
+  expect(block("Disk 1 (spare)")).toHaveFocus();
+  expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
+  fireEvent.keyDown(document.body, { key: "z", ctrlKey: true });
+  expect(names()).toEqual(["Disk 1 (web-disk0)", "Disk 2 (spare)"]);
+});
+
+it("gives focus to the slot heading after a keyboard drop on a slot that is not a list", async () => {
+  world();
+  open();
+  await screen.findByLabelText("Name");
+  keyDrop(part(/^Medium/), () => slot("Compute"));
+  expect(screen.getByRole("heading", { name: "Compute" })).toHaveFocus();
+});
+
 it("drags with the mouse onto a slot and reads why another slot refuses", async () => {
   world();
   open();
@@ -313,6 +377,26 @@ it("checks with the server after a pause, shows problems on their slots and bloc
   expect(create()).toBeEnabled();
 });
 
+it("does not show a passed server check next to browser errors", async () => {
+  world({ features: true });
+  server.use(
+    http.post(apiUrl("/vm-checks"), () =>
+      HttpResponse.json({ ok: true, node: "n1", ips: [], problems: [] }),
+    ),
+  );
+  open();
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  expect(
+    await screen.findByText("Server check: passed.", { selector: "p" }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  await user.clear(screen.getByLabelText("Name"));
+  expect(
+    screen.getByText("The server check runs when the browser finds no errors."),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("Server check: passed.", { selector: "p" })).toBeNull();
+});
+
 it("does not ask the server while the browser finds errors, or when a node lacks the feature", async () => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   try {
@@ -413,8 +497,131 @@ it("says what was already made when the VM cannot be created, and does not make 
   expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-disk0\./);
   await user.click(create());
   await waitFor(() => expect(screen.getByRole("alert")).toHaveTextContent("over the quota"));
+  // 두 번째 실패에도 이미 만든 볼륨을 알린다.
+  expect(screen.getByRole("alert")).toHaveTextContent(/Already created: web-disk0\./);
   expect(volumes).toBe(1);
 });
+
+it("reuses the zone rule of a failed create only while it is the same, and deletes a stale one", async () => {
+  world({ features: true });
+  const checks: { rules?: unknown[] }[] = [];
+  const rules: unknown[] = [];
+  const deleted: string[] = [];
+  let vmReply = () =>
+    HttpResponse.json({ code: "quota_exceeded", message: "over the quota" }, { status: 409 });
+  server.use(
+    http.post(apiUrl("/vm-checks"), async ({ request }) => {
+      checks.push((await request.json()) as { rules?: unknown[] });
+      return HttpResponse.json({ ok: true, node: null, ips: [], problems: [] });
+    }),
+    http.post(apiUrl("/placement-rules"), async ({ request }) => {
+      const body = (await request.json()) as { name: string };
+      rules.push(body);
+      return HttpResponse.json({ ...body, id: `r${rules.length}` }, { status: 201 });
+    }),
+    http.delete(apiUrl("/placement-rules/:key"), ({ params }) => {
+      deleted.push(String(params.key));
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.post(apiUrl("/vms"), () => vmReply()),
+  );
+  open();
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
+  await user.click(create());
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-zone\./);
+  // 만든 규칙은 확인 본문의 "만들 규칙"에서 빠진다(name_taken이 만들기를 막지 않게).
+  await waitFor(() => expect(checks.at(-1)?.rules).toEqual([]), { timeout: 3000 });
+  // 같은 것으로 다시: 규칙을 다시 만들지 않는다. 만든 것은 두 번째 실패에도 알린다.
+  await user.click(create());
+  await waitFor(() =>
+    expect(screen.getByRole("alert")).toHaveTextContent(/Already created: web-zone\./),
+  );
+  expect(rules).toHaveLength(1);
+  // hard → soft: 지난 규칙(r1)을 곧 지우고, 만들 때 새로 만든다.
+  await user.click(within(slot("Placement")).getByRole("button", { name: "Inspect" }));
+  await user.selectOptions(screen.getByLabelText("Zone b"), "soft");
+  await waitFor(() => expect(deleted).toEqual(["r1"]));
+  vmReply = () => HttpResponse.json(vm("web", "stopped"), { status: 201 });
+  await user.click(create());
+  expect(await screen.findByText("moved")).toBeInTheDocument();
+  expect(rules).toHaveLength(2);
+  expect(rules[1]).toMatchObject({ name: "web-zone", spec: { kind: "soft-node-affinity" } });
+});
+
+it("deletes the zone rule of a failed create when the zone is removed or the VM renamed", async () => {
+  world();
+  const deleted: string[] = [];
+  let made = 0;
+  server.use(
+    http.post(apiUrl("/placement-rules"), async ({ request }) => {
+      made += 1;
+      const body = (await request.json()) as { name: string };
+      return HttpResponse.json({ ...body, id: `r${made}` }, { status: 201 });
+    }),
+    http.delete(apiUrl("/placement-rules/:key"), ({ params }) => {
+      deleted.push(String(params.key));
+      return new HttpResponse(null, { status: 204 });
+    }),
+    http.post(apiUrl("/vms"), () =>
+      HttpResponse.json({ code: "quota_exceeded", message: "over the quota" }, { status: 409 }),
+    ),
+  );
+  open();
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(screen.getByRole("button", { name: "Ways to add Zone b" }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
+  await user.click(create());
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web-zone\./);
+  // 이름을 바꾸면 old 이름의 규칙(web-zone)을 지운다.
+  await user.type(screen.getByLabelText("Name"), "2");
+  await waitFor(() => expect(deleted).toEqual(["r1"]));
+  await user.click(create());
+  expect(await screen.findByRole("alert")).toHaveTextContent(/Already created: web2-zone\./);
+  // 영역을 빼면(자동) 그 규칙도 지운다.
+  await user.click(screen.getByRole("button", { name: /^Ways to add Automatic/ }));
+  await user.click(screen.getByRole("menuitem", { name: "Add to Placement" }));
+  await waitFor(() => expect(deleted).toEqual(["r1", "r2"]));
+});
+
+it("does not navigate after the VM is created when the user already left", async () => {
+  world();
+  let release!: () => void;
+  const wait = new Promise<void>((r) => (release = r));
+  server.use(
+    http.post(apiUrl("/vms"), async () => {
+      await wait;
+      return HttpResponse.json(vm("web", "stopped"), { status: 201 });
+    }),
+  );
+  const { router } = open();
+  const user = userEvent.setup();
+  await user.type(await screen.findByLabelText("Name"), "web");
+  await user.click(create());
+  await act(() => router.navigate("/elsewhere"));
+  release();
+  await act(() => new Promise((r) => setTimeout(r, 50)));
+  expect(router.state.location.pathname).toBe("/elsewhere");
+});
+
+it("keeps no draft or view in this tab when the view switch opens a new tab", async () => {
+  world();
+  open();
+  await user_type_name();
+  const form = screen.getByRole("link", { name: "Form" });
+  fireEvent.click(form, { metaKey: true });
+  fireEvent.click(form, { ctrlKey: true });
+  fireEvent.click(form, { shiftKey: true });
+  expect(readDraft()).toBeNull();
+  expect(localStorage.getItem(`opl.${ADMIN.user}.vmCreate.mode`)).toBe("builder");
+});
+
+async function user_type_name() {
+  await userEvent.setup().type(await screen.findByLabelText("Name"), "web");
+}
 
 it("deploys from a template with the clone request and keeps its devices fixed", async () => {
   world();
@@ -439,6 +646,19 @@ it("deploys from a template with the clone request and keeps its devices fixed",
     "true",
   );
   await user.keyboard("{Escape}");
+  // 배포는 HA·NIC 모델·노드 고정을 싣지 못한다: 놓지 못하고 살피기에도 없다.
+  await user.click(screen.getByRole("button", { name: /^Ways to add High availability/ }));
+  expect(screen.getByRole("menuitem", { name: "Nothing takes this part now." })).toHaveAttribute(
+    "aria-disabled",
+    "true",
+  );
+  await user.keyboard("{Escape}");
+  await user.click(within(slot("Protection")).getByRole("button", { name: "Inspect" }));
+  expect(
+    screen.getByText("A template deployment does not set HA. Turn it on after creating."),
+  ).toBeInTheDocument();
+  await user.click(block("NIC 1 (lan)"));
+  expect(screen.queryByLabelText("Model")).toBeNull();
   expect(
     screen.getByText("The server checks a template deployment when you create it."),
   ).toBeInTheDocument();

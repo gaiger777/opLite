@@ -25,8 +25,10 @@ export function ViewSwitch({ mode, onLeave }: { mode: CreateMode; onLeave(): voi
             "rounded-md px-3 py-1",
             m === mode ? "bg-muted font-medium" : "text-muted-foreground hover:text-foreground",
           )}
-          onClick={() => {
-            if (m !== mode) {
+          onClick={(e) => {
+            // 새 탭·창으로 여는 누르기(⌘·Ctrl·Shift·Alt·가운데 단추)는 이 탭에 초안·보기를 남기지 않는다.
+            const plain = e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+            if (plain && m !== mode) {
               onLeave();
               writeMode(user, m);
             }

@@ -257,7 +257,8 @@ export function cpuCheck(model: string, ctx: BuilderCtx, node: string): Verdict 
 /** 블록(디스크·CD·NIC 줄)을 놓기: 같은 목록 안 다른 자리(순서 바꾸기)·목록 끝·빼기 */
 function acceptsBlock(b: Block, at: string, s: BuilderState): Verdict {
   const slot = slotOf(at);
-  if (!slot) {
+  // 든 사이 목록이 줄었으면(되돌리기 등) 그 블록은 없다.
+  if (!slot || b.index < 0 || b.index >= s.values[b.list].length) {
     return NO;
   }
   const list = listOf(slot);
@@ -306,6 +307,10 @@ export function accepts(t: Thing, at: string, s: BuilderState, ctx: BuilderCtx):
       (t.kind === "network" && index === null))
   ) {
     return no("templateFixed");
+  }
+  // 배포 요청(`CloneRequest`)은 HA를 싣지 못한다 — 만든 뒤 켠다.
+  if (template && (t.kind === "ha" || t.kind === "haGroup")) {
+    return no("templateHa");
   }
   const windows = s.preset === "windows";
   switch (t.kind) {

@@ -276,16 +276,19 @@ export function Inspector() {
       const sdn = isSdnNetwork(b.ctx.networks.find((x) => x.name === n.network));
       body = (
         <>
-          <Select
-            id="vb-nic-model"
-            label={i("nicModel")}
-            value={n.model}
-            options={[
-              ["virtio", "virtio"],
-              ["e1000e", "e1000e"],
-            ]}
-            onChange={(model) => setNic({ model: model as typeof n.model })}
-          />
+          {/* 배포는 템플릿의 NIC 모델·MAC을 그대로 쓴다(배포 요청에 칸이 없음). */}
+          {!template && (
+            <Select
+              id="vb-nic-model"
+              label={i("nicModel")}
+              value={n.model}
+              options={[
+                ["virtio", "virtio"],
+                ["e1000e", "e1000e"],
+              ]}
+              onChange={(model) => setNic({ model: model as typeof n.model })}
+            />
+          )}
           {!template && (
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="vb-mac">{i("mac")}</Label>
@@ -359,18 +362,23 @@ export function Inspector() {
           onChange={(h) => b.set({ ...s, zone: { ...s.zone!, hard: h === "hard" } })}
         />
       ) : v.node ? (
-        <Check
-          id="vb-pinned"
-          label={i("pinned")}
-          checked={v.pinned}
-          onChange={(pinned) => b.edit({ pinned })}
-        />
+        // 배포는 노드 고정을 싣지 못한다.
+        !template && (
+          <Check
+            id="vb-pinned"
+            label={i("pinned")}
+            checked={v.pinned}
+            onChange={(pinned) => b.edit({ pinned })}
+          />
+        )
       ) : (
         <p className="text-sm text-muted-foreground">{i("auto")}</p>
       );
       break;
     case "protection":
-      body = (
+      body = template ? (
+        <p className="text-sm text-muted-foreground">{t("vmBuilder.reason.templateHa")}</p>
+      ) : (
         <>
           <Check
             id="vb-ha"

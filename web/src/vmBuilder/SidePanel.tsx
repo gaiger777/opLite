@@ -68,7 +68,7 @@ export function SidePanel({
   const status =
     b.s.base.kind === "template"
       ? t("vmBuilder.check.template")
-      : server.status === "done" || (server.status === "off" && check)
+      : server.status === "done"
         ? count
           ? t("vmBuilder.check.problems", { count })
           : t("vmBuilder.check.ok")
@@ -143,7 +143,7 @@ export function SidePanel({
                 {check.machine && (
                   <li>{t("vmBuilder.check.machine", { machine: check.machine })}</li>
                 )}
-                {check.ips.map(
+                {(check.ips ?? []).map(
                   (ips, i) =>
                     ips.length > 0 && (
                       <li key={i}>{t("vmBuilder.check.ips", { n: i + 1, ips: ips.join(", ") })}</li>

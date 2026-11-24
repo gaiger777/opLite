@@ -28,7 +28,7 @@ function padNets(nets: readonly NetRow[], n: number): NetRow[] {
 /** 목록 블록을 옮긴다(디스크 순서가 부팅 순서, NIC면 cloud-init 주소도 따라감). */
 export function moveBlock(s: BuilderState, list: ListKind, from: number, to: number): BuilderState {
   const v = s.values;
-  if (from === to || to < 0 || to >= v[list].length) {
+  if (from === to || from < 0 || from >= v[list].length || to < 0 || to >= v[list].length) {
     return s;
   }
   const values: VmFormValues = { ...v, [list]: move(v[list] as unknown[], from, to) };
@@ -96,6 +96,10 @@ export function templateValues(v: VmFormValues, t: Vm): VmFormValues {
     })),
     // 배포의 cloud-init은 덮어쓰기다(비면 템플릿 것 그대로 — 배포 대화상자와 같다).
     cloudInit: emptyCloudInit(),
+    // 배포 요청이 싣지 못하는 칸(HA·노드 고정)은 끈다 — 틀이 켜졌다고 보이지 않게.
+    ha: false,
+    haGroup: "",
+    pinned: false,
   };
 }
 
@@ -236,7 +240,11 @@ export function drop(s: BuilderState, t: Thing, at: string, ctx: BuilderCtx): Bu
     case "ci": {
       const ci = { ...v.cloudInit, enabled: true };
       if (t.snippet === "packages" && ci.userData === "") {
-        return set({ cloudInit: { ...ci, userData: PACKAGES_USER_DATA }, guestAgent: true });
+        // 게스트 에이전트 장치는 템플릿 것 그대로다(배포 요청이 싣지 못함).
+        return set({
+          cloudInit: { ...ci, userData: PACKAGES_USER_DATA },
+          ...(s.base.kind !== "template" && { guestAgent: true }),
+        });
       }
       return set({ cloudInit: ci });
     }
