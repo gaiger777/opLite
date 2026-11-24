@@ -446,3 +446,49 @@ OVF 1.0 봉투(ovftool·vSphere·VirtualBox가 모두 받는 판, `vmw` 확장):
   마지막 델타, 사이마다 게스트 쓰기)이 클라이언트만으로 대상 바이트 = 원본 최종 바이트, 델타 회차가 바뀐 블록만 티켓으로
   호스트에서 읽음을 본다 — 스테이지 4 회차 알고리즘의 본보기다.
 - **잰 것**: 가짜 vSphere VM 2 000대 인벤토리(객체 2 035개, 쪽 다섯) — 개발 Mac(디버그 빌드) 1.1초. 실제 vCenter 수치는 손 확인.
+
+### 스테이지 6
+
+- **응답과 이름**: `POST /vms/{key}/export`는 202 `{export, task}`(`VmExportStarted`)다. 요청에 `name`을 더했다(없으면 백업과 같은
+  `{VM}-{yyyymmdd-HHMMSS}`). 요청 칸은 `pool`·`name?`·`guest_os?`·`hw_version?`·`keep_macs`.
+- **링크**: 파일 복원의 메모리 토큰 대신 **서명 링크**다 — `{만료}.{사용자}.{HMAC}`, 키는 클러스터 CA 키에서 HKDF(info
+  `orbivisor vm-export download link v1`, OIDC 상태 키와 다름)로 뽑아 어느 노드든 확인한다. 10분, 사용자에 묶임(남이면 403,
+  틀리거나 지나면 410 `link_expired`), 한 번만 쓰는 것은 아니다(내보내기에는 세션 노드가 없고, NFS 풀이면 어느 노드든 흘릴 수
+  있다). 내려받기 경로도 경로표가 `vm.export`를 다시 본다. 감사에는 토큰 대신 `/download/-`를 적는다.
+- **중계**: 파일이 이 노드에서 보이지 않으면(쓴 노드가 아니고 공유 풀이 여기서 준비되지 않음) 새 노드 사이 흐름
+  `ExportDownload`로 쓴 노드(`spec.node`)에서 받는다 — `proxy.rs`가 HTTP 중계가 아니라서 파일 복원 흐름과 같은 조각
+  꼴(`FileRestoreChunk`)을 쓰는 gRPC를 더했다. 옛 노드는 기능 `vm-export` 게이트 때문에 내보내기를 가질 수 없고, 모르면 409
+  `cluster_upgrading`이다.
+- **tar**: 8 GiB를 넘는 파일은 pax `size=` 머리와 base-256 크기 칸을 함께 쓴다(계획 29 읽개·GNU·Go 모두 읽는다). `mtime`은
+  서술자 파일의 수정 시각. `?format=ovf&file=NAME`은 파일 하나(`.ovf`는 `application/xml`).
+- **OVF**: OVF 1.0 봉투(`ovf:version="1.0" xml:lang="en-US"`), `rasd`·`vssd` 요소는 CIM 스키마 차례(알파벳)로, `vmw:` 확장은 그 뒤.
+  pvscsi 하나에 디스크 15개(단위 7 건너뜀), AHCI 하나에 30개. 디스크 버스가 섞인 VM은 컨트롤러 종류 차례가 VM 디스크 차례와
+  다를 수 있다(읽개가 "more than one controller" 경고 — 부팅 디스크는 첫 컨트롤러 종류의 첫 디스크로 남는다).
+  `OperatingSystemSection ovf:id`는 guestId에서 고른 CIM 번호(Windows 103/105, Linux 101/36, 그 밖 1 — VirtualBox가 본다).
+  `populatedSize`는 볼륨의 할당 크기(알 때만). BIOS VM은 `firmware=bios`. `keep_macs`면 `rasd:Address` + `vmw:Config
+  addressType=manual`(vSphere가 이것으로 MAC을 지키는지는 실제 vSphere에서 확인하지 못함 — 가정).
+- **guestId**: 요청 값, 없으면 그 VM을 만든 가져오기(`VmImport.status.vm`)의 원본 `guest_os`가 guestId 꼴(`…Guest`)일 때만, 아니면
+  `otherGuest64` + 경고. 경고: guestId 모름, aarch64 VM, vTPM, CD-ROM, cloud-init, NUMA·전용 CPU·hugepages, 핫플러그 한도,
+  HA·배치·복제, 보안 그룹·SDN 주소·NIC 속도 제한, MAC 없는 NIC.
+- **막기**: 쓰는 동안 VM 켜기·스펙 바꾸기·지우기·마이그레이션은 409 `vm_exporting`(`check_no_snapshot_task` 앞에서 — 그 검사를
+  부르는 모든 길). 지우기 중 다른 Task는 409 `export_busy`, 덜 쓴·실패한 내보내기의 링크는 409 `export_not_ready`. 공간은 노드가
+  알린 풀의 남은 바이트와 디스크 할당 크기(모르면 가상 크기) 합 + 1 GiB를 견주고(507), 노드가 크기를 모르면 막지 않는다.
+  내보내기가 남은 풀은 지울 수 없다(409 `pool_in_use`).
+- **권한**: 경로표 객체 `Export`(이름은 `Privilege::VmExport`와 겹치지 않게) — 주인은 내보낸 VM(지운 VM이면 루트), `folder_kind`에
+  `vm-export`를 넣었다. `vm-export` Task의 주인은 VM, `vm-export-delete`는 객체 없는 Task(`cluster.read`)로 둔다.
+- **Task**: `vm-export`는 VM 줄·시간 제한 없음·이어 가지 않음(다시 시작으로 끊기면 실패 → 디렉터리 지움). 내보내기 디렉터리를 쓴 뒤
+  파일·디렉터리·`orbivisor-exports`·풀 루트를 fsync한다. `vm-export-delete`는 내보내기 줄, 풀이 없어졌으면 리소스만 지운다.
+- **watch**: `vm-export`는 아직 `WATCHABLE`에 넣지 않았다(폴더 거르기·주인 표 이벤트가 필요 — 스테이지 7이 필요하면 더한다;
+  그때까지 화면은 Task watch와 목록 다시 읽기).
+- **CLI**: `export download`는 전역 `-o`(출력 형식)와 겹치지 않게 `-O FILE`(파일 복원 `get`과 같다), `--file NAME`은 파일 하나.
+  `vm export --download FILE`은 `--wait`를 품는다.
+- **CI**: `govc import.ova` 단계는 스테이지 2의 `vmware-sim` 작업에 붙인다(`OPL_EXPORT_OVA_OUT`로 storage-it 왕복 시험이 OVA를 남김).
+
+For stage 7 (web): API = `POST /vms/{key}/export` body `ExportVmRequest`, 202 `VmExportStarted`; list/get `VmExport`; `DELETE` → Task;
+  `POST /vm-exports/{key}/download-link` → `DownloadLink{url, expires_in}` (url relative to /api/v1, like file restore) — navigate
+  the browser to `/api/v1{url}` (cookie auth works; same user). Errors: `vm_running`, `pool_not_file`, `insufficient_storage`(507),
+  `vm_exporting`, `export_busy`, `export_not_ready`, `cluster_upgrading`. Only dir/nfs pools qualify. No watch for vm-export yet.
+  `web/src/auth/permissions.ts` still lacks "vm.export".
+For stage 8: docs (vms.md export section, access.md vm.export, development.md test commands incl. storage-it round trip), real test
+  in opld `qemu-it` can reuse the `an_exported_ova_imports_back_with_the_same_disk` flow; guide must say MAC/addressType and vSphere
+  import are unverified on real vSphere.
