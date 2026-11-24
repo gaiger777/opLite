@@ -38,6 +38,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "web-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -97,6 +111,7 @@
         ]
       ],
       "missing": [],
+      "before": [],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -171,6 +186,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "win-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -257,6 +286,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "multi-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -339,6 +382,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "sdn-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -439,6 +496,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "ci-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -547,6 +618,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "pkg-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -629,6 +714,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "pin-disk0",
+            "spec": {
+              "pool": "local",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -713,6 +812,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "ha-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -804,6 +917,35 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "zoned-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        },
+        {
+          "method": "POST",
+          "path": "/placement-rules",
+          "body": {
+            "name": "zoned-zone",
+            "spec": {
+              "kind": "node-affinity",
+              "vms": [
+                "zoned"
+              ],
+              "node_tag": "zone=b",
+              "enabled": true
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -881,6 +1023,20 @@
         ]
       ],
       "missing": [],
+      "before": [
+        {
+          "method": "POST",
+          "path": "/volumes",
+          "body": {
+            "name": "team-disk0",
+            "spec": {
+              "pool": "ceph",
+              "size_bytes": 21474836480,
+              "format": "qcow2"
+            }
+          }
+        }
+      ],
       "request": {
         "method": "POST",
         "path": "/vms",
@@ -951,6 +1107,7 @@
         ]
       ],
       "missing": [],
+      "before": [],
       "request": {
         "method": "POST",
         "path": "/vms/{key}/clone",

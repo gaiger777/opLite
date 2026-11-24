@@ -38,13 +38,18 @@ pub struct VmCheckRequest {
     /// `POST /vms`의 spec과 같다(`machine`을 빼면 채운다).
     #[schema(value_type = VmSpec)]
     pub spec: serde_json::Value,
-    /// VM보다 먼저 만들 볼륨(`POST /volumes`의 본문). 디스크가 이름으로 가리키면 준비된 볼륨으로 본다.
+    /// VM보다 먼저 만들 볼륨(`POST /volumes`의 본문, 16개까지). 디스크가 이름으로 가리키면 준비된 볼륨으로 본다.
     #[serde(default)]
     pub volumes: Vec<CreateRequest<VolumeSpec>>,
-    /// VM보다 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 장애 영역 규칙)
+    /// VM보다 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 장애 영역 규칙, 16개까지)
     #[serde(default)]
     pub rules: Vec<CreateRequest<PlacementRuleSpec>>,
 }
+
+/// 한 확인에 얹을 수 있는 만들 볼륨 수(넘으면 400 — 리뷰 1 4). VM 하나의 NIC 상한과 같다.
+pub const MAX_PLANNED_VOLUMES: usize = 16;
+/// 한 확인에 얹을 수 있는 만들 배치 규칙 수(넘으면 400)
+pub const MAX_PLANNED_RULES: usize = 16;
 
 /// 오류 `code`의 자리. `prepare`는 첫 오류에서 멈추므로 그 오류의 자리를 이 표로 정한다(코드마다 시험).
 pub(crate) fn area_of(code: &str) -> &'static str {
@@ -84,41 +89,62 @@ pub(crate) fn area_of(code: &str) -> &'static str {
     }
 }
 
-/// `prepare` 오류 `e`의 자리: [`area_of`]에 더해, 문구가 따옴표 이름(`{:?}`)으로 가리키는 NIC 네트워크·디스크 볼륨·CD ISO가
-/// 있으면 그 칸(`nics.N`·`disks.N`·`cdroms.N`)이다 — 예: 400 `volume "x.iso" not found`는 `cdroms.0`.
+/// `prepare` 오류 `e`의 자리: [`area_of`]에 더해, 문구가 주어 자리(`network "n"`·`volume "v"`·`ISO "i"`)로 가리키는 NIC
+/// 네트워크·디스크 볼륨·CD ISO가 있으면 그 칸(`nics.N`·`disks.N`·`cdroms.N`)이다 — 예: 400 `volume "x.iso" not found`는
+/// `cdroms.0`. 문구에 함께 든 다른 따옴표 이름(`… attached to VM "a"`)은 보지 않는다. 디스크 코드(`volume_in_use` 등)는
+/// 맞는 디스크가 없으면 CD를 본다(`ISO "x" is being deleted`).
 fn slot_of(e: &ApiError, spec: &VmSpec) -> String {
-    let named = |name: &str| e.message.contains(&format!("{name:?}"));
+    let named = |kinds: &[&str], name: &str| {
+        kinds
+            .iter()
+            .any(|kind| e.message.contains(&format!("{kind} {name:?}")))
+    };
     let find = |kind: &str| -> Option<String> {
         let i = match kind {
-            "nics" => spec.nics.iter().position(|n| named(&n.network)),
-            "disks" => spec.disks.iter().position(|d| named(&d.volume)),
-            _ => spec
-                .cdroms
+            "nics" => spec
+                .nics
                 .iter()
-                .position(|c| c.iso.as_deref().is_some_and(named)),
+                .position(|n| named(&["network"], &n.network)),
+            "disks" => spec
+                .disks
+                .iter()
+                .position(|d| named(&["volume"], &d.volume)),
+            _ => spec.cdroms.iter().position(|c| {
+                c.iso
+                    .as_deref()
+                    .is_some_and(|iso| named(&["volume", "ISO"], iso))
+            }),
         }?;
         Some(format!("{kind}.{i}"))
     };
-    match area_of(e.code) {
-        area @ ("nics" | "disks" | "cdroms") => find(area).unwrap_or_else(|| area.into()),
-        "spec" => ["disks", "cdroms", "nics"]
-            .into_iter()
-            .find_map(find)
-            .unwrap_or_else(|| "spec".into()),
-        area => area.into(),
-    }
+    let kinds: &[&str] = match area_of(e.code) {
+        "nics" => &["nics"],
+        "disks" => &["disks", "cdroms"],
+        "cdroms" => &["cdroms"],
+        "spec" => &["disks", "cdroms", "nics"],
+        area => return area.into(),
+    };
+    kinds
+        .iter()
+        .find_map(|k| find(k))
+        .unwrap_or_else(|| area_of(e.code).into())
 }
 
 /// 모은 문제(같은 자리·코드는 하나로)
 #[derive(Default)]
-struct Problems(Vec<VmCheckProblem>);
+struct Problems {
+    found: Vec<VmCheckProblem>,
+    /// 권한 거절(403·404)이 있었다: 만들기처럼 거기서 멈추고 더 깊은 검사(할당량·`prepare` — 숨은 VM·주소·볼륨 상태가
+    /// 드러난다)를 돌리지 않는다(리뷰 1 1).
+    refused: bool,
+}
 
 impl Problems {
     fn push(&mut self, at: &str, level: VmCheckLevel, code: &str, message: String) {
-        if self.0.iter().any(|p| p.at == at && p.code == code) {
+        if self.found.iter().any(|p| p.at == at && p.code == code) {
             return;
         }
-        self.0.push(VmCheckProblem {
+        self.found.push(VmCheckProblem {
             at: at.into(),
             code: code.into(),
             message,
@@ -131,6 +157,7 @@ impl Problems {
         if !e.status.is_client_error() {
             return Err(e);
         }
+        self.refused |= is_refusal(&e);
         self.push(at, VmCheckLevel::Error, e.code, e.message);
         Ok(())
     }
@@ -144,14 +171,22 @@ impl Problems {
 
     fn answer(self) -> VmCheck {
         VmCheck {
-            ok: !self.0.iter().any(|p| p.level == VmCheckLevel::Error),
-            problems: self.0,
+            ok: !self.found.iter().any(|p| p.level == VmCheckLevel::Error),
+            problems: self.found,
             node: None,
             machine: None,
             cpu_model: None,
             ips: Vec::new(),
         }
     }
+}
+
+/// 권한 거절(403, 또는 읽을 수 없어 404)인지
+fn is_refusal(e: &ApiError) -> bool {
+    matches!(
+        e.status,
+        axum::http::StatusCode::FORBIDDEN | axum::http::StatusCode::NOT_FOUND
+    )
 }
 
 /// 머신을 채우지 못한 spec에서 폴더만 읽는다(권한 확인용).
@@ -167,7 +202,8 @@ fn folder_of(spec: &serde_json::Value) -> Result<Option<Uuid>, ApiError> {
 /// 만들기를 미리 확인한다: 만들기와 같은 검사(이름, 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨(`POST /volumes`의 검사와 풀
 /// 남은 용량 경고), 만들 배치 규칙(`POST /placement-rules`의 검사), 폴더 할당량, 그리고 만들 것을 얹은 `prepare`)를 쓰지
 /// 않고 돌려 문제를 자리마다 모은다. 문제가 있어도 200이다. 대상 폴더에 `vm.create`가 없으면 403(그 밖을 알려 주지
-/// 않음), 기능 `vm-check`를 모르는 노드가 있으면 409 `cluster_upgrading`, 본문을 풀 수 없으면 400.
+/// 않음), 기능 `vm-check`를 모르는 노드가 있으면 409 `cluster_upgrading`, 본문을 풀 수 없거나 만들 볼륨·규칙이 16개를
+/// 넘으면 400. 첨부·만들 것의 권한 거절(403·404)이 있으면 그 거절만 돌려준다(할당량·배치·주소 검사 없이, `node`·`ips` 없이).
 #[utoipa::path(post, path = "/vm-checks", tag = "vms",
     request_body = VmCheckRequest,
     responses((status = 200, body = VmCheck), (status = "4XX", body = crate::error::ErrorBody)))]
@@ -177,6 +213,11 @@ pub async fn check_vm(
     Json(req): Json<VmCheckRequest>,
 ) -> Result<Json<VmCheck>, ApiError> {
     require_feature(&state.cluster, VM_CHECK)?;
+    if req.volumes.len() > MAX_PLANNED_VOLUMES || req.rules.len() > MAX_PLANNED_RULES {
+        return Err(ApiError::bad_request(format!(
+            "a check can plan at most {MAX_PLANNED_VOLUMES} volumes and {MAX_PLANNED_RULES} placement rules"
+        )));
+    }
     let mut found = Problems::default();
     match check_name(&req.name) {
         Err(e) => found.error("name", e)?,
@@ -224,7 +265,10 @@ pub async fn check_vm(
         crate::numa::check_privilege(&state, &principal, &spec, None),
     )?;
 
-    let mut planned = Planned::default();
+    let mut planned = Planned {
+        preview: true,
+        ..Planned::default()
+    };
     let mut sizes = BTreeMap::new();
     for v in &req.volumes {
         let at = spec
@@ -268,6 +312,11 @@ pub async fn check_vm(
                     );
                 }
             }
+            // 만들 권한이 없는 볼륨은 얹지 않는다(리뷰 1 2 — 아래에서 멈춘다).
+            Err(e) if is_refusal(&e) => {
+                found.error(&at, e)?;
+                continue;
+            }
             Err(e) => {
                 found.error(&at, e)?;
                 // 검사를 지나지 못한 볼륨도 풀이 있으면 그 노드에 둔다(뒤의 만들기 검사가 "풀에 닿는 노드 없음"을 덧붙이지 않게).
@@ -279,22 +328,28 @@ pub async fn check_vm(
         planned.volumes.push(volume);
     }
     for r in &req.rules {
+        // 만들 권한이 없는 규칙은 보지도 얹지도 않는다(리뷰 1 2 — 얹으면 숨은 VM이 도는 노드가 드러난다).
+        if let Err(e) = state.authorize(&principal, Action::Write, PlacementRuleSpec::KIND) {
+            found.error("placement", e)?;
+            continue;
+        }
         let mut rule: PlacementRule = Resource::new(r.name.clone(), r.spec.clone());
         rule.labels = r.labels.clone();
-        let checked = state
-            .authorize(&principal, Action::Write, PlacementRuleSpec::KIND)
-            .and_then(|()| check_name(&r.name))
-            .and_then(
-                |()| match state.cluster.get_by_name::<PlacementRuleSpec>(&r.name)? {
-                    Some(_) => Err(ApiError::conflict(
-                        "name_taken",
-                        format!("a placement rule named {:?} already exists", r.name),
-                    )),
-                    None => crate::placement_rules::check(&state, &rule),
-                },
-            );
+        let checked = check_name(&r.name).and_then(|()| {
+            match state.cluster.get_by_name::<PlacementRuleSpec>(&r.name)? {
+                Some(_) => Err(ApiError::conflict(
+                    "name_taken",
+                    format!("a placement rule named {:?} already exists", r.name),
+                )),
+                None => crate::placement_rules::check(&state, &rule),
+            }
+        });
         found.check("placement", checked)?;
         planned.rules.push(rule);
+    }
+    // 권한 거절이 있으면 만들기도 거기서 멈춘다: 거절만 돌려준다(노드·주소 없이).
+    if found.refused {
+        return Ok(Json(found.answer()));
     }
     found.check(
         "quota",
@@ -407,6 +462,28 @@ mod tests {
             "disks.1"
         );
         assert_eq!(at("volume_in_use", "something else"), "disks");
+        // 주어 자리의 이름만 본다(뒤의 VM 이름 "a"는 디스크 a가 아니다 — 리뷰 1 7).
+        assert_eq!(
+            at(
+                "volume_in_use",
+                "volume \"b\" is already attached to VM \"a\""
+            ),
+            "disks.1"
+        );
+        // 지우는 중인 ISO는 디스크 코드지만 CD 칸이다.
+        assert_eq!(
+            at("volume_in_use", "ISO \"x.iso\" is being deleted (task t)"),
+            "cdroms.0"
+        );
+        assert_eq!(
+            at(
+                "invalid_request",
+                "HA and replicated VMs can use ISOs only from shared pools; ISO \"x.iso\" is in node-local pool \"a\""
+            ),
+            "cdroms.0"
+        );
+        // 다른 종류의 같은 이름(네트워크 문구의 "a")은 디스크가 아니다.
+        assert_eq!(at("invalid_request", "network \"a\" not found"), "spec");
         assert_eq!(at("ip_in_use", "address taken"), "nics");
         // 자리가 정해진 코드는 이름이 있어도 그대로다.
         assert_eq!(at("no_node", "volume \"a\""), "placement");
@@ -418,7 +495,7 @@ mod tests {
         p.push("disks.0", VmCheckLevel::Error, "volume_in_use", "a".into());
         p.push("disks.0", VmCheckLevel::Error, "volume_in_use", "b".into());
         p.push("disks", VmCheckLevel::Error, "volume_in_use", "c".into());
-        assert_eq!(p.0.len(), 2);
+        assert_eq!(p.found.len(), 2);
         p.error("x", ApiError::internal("boom")).unwrap_err();
         let answer = p.answer();
         assert!(!answer.ok);

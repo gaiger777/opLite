@@ -183,26 +183,239 @@ async fn independent_problems_are_collected_with_their_slots() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let alice = folder_user(&env, &admin, "alice", &[&team]).await;
-    let mut body = check_body("web");
+    let mut body = check_body("Bad_Name!");
     body["spec"]["folder"] = json!(team);
     body["spec"]["nics"] = json!([
         { "network": "user", "model": "virtio" },
         { "network": "lan-net", "model": "virtio" }]);
     body["spec"]["cdroms"] = json!([{ "iso": "nope.iso" }]);
-    let answer = check(&alice, body).await;
+    let answer = check(&alice, body.clone()).await;
     assert_eq!(answer["ok"], false, "{answer}");
     let found = problems(&answer);
-    // 권한 없는 네트워크(읽을 수도 없으면 404), 할당량 넘음, 없는 ISO(만들기 검사의 첫 오류)가 한 답에 셋
-    assert_eq!(found.len(), 3, "{answer}");
-    assert_eq!(found[0].0, "nics.1", "{answer}");
+    // 이름 문제와 권한 없는 네트워크(읽을 수도 없으면 404). 권한 거절이 있으면 만들기처럼 거기서 멈춘다(할당량·만들기
+    // 검사를 돌리지 않는다 — 리뷰 1 1).
+    assert_eq!(found.len(), 2, "{answer}");
+    assert_eq!(found[0].0, "name", "{answer}");
+    assert_eq!(found[1].0, "nics.1", "{answer}");
     assert!(
-        ["forbidden", "not_found"].contains(&found[0].1.as_str()),
+        ["forbidden", "not_found"].contains(&found[1].1.as_str()),
         "{answer}"
     );
-    assert_eq!(found[1], problem("quota", "quota_exceeded", "error"));
-    assert_eq!(found[2], problem("cdroms.0", "invalid_request", "error"));
     assert_eq!(answer["node"], Value::Null);
     assert_eq!(answer["machine"], Value::Null);
+    // 권한 거절이 없으면 할당량 넘음과 없는 ISO(만들기 검사의 첫 오류)가 한 답에 함께
+    body["spec"]["nics"] = json!([{ "network": "user", "model": "virtio" }]);
+    let answer = check(&alice, body).await;
+    let found = problems(&answer);
+    assert_eq!(found.len(), 3, "{answer}");
+    assert_eq!(found[0].0, "name", "{answer}");
+    assert_eq!(found[1], problem("quota", "quota_exceeded", "error"));
+    assert_eq!(found[2], problem("cdroms.0", "invalid_request", "error"));
+}
+
+/// 관리자가 폴더 `theirs`에 볼륨 `secret-disk`를 붙인 VM `payroll`(켜짐)과 그 폴더의 네트워크 폴더에 SDN 네트워크
+/// `hidden`(10.20.0.0/29)을 만든다. 폴더 `mine`의 operator `alice`를 돌려준다(둘 다 볼 수 없다).
+async fn hidden_payroll(env: &Env, admin: &Client) -> (Client, String) {
+    local_pool(env, admin, "local", None).await;
+    let mine = folder(admin, "mine", "vm", json!(null)).await;
+    let theirs = folder(admin, "theirs", "vm", json!(null)).await;
+    let nets = folder(admin, "nets", "network", json!(null)).await;
+    let (status, task) = admin
+        .post(
+            "/volumes",
+            json!({ "name": "secret-disk", "spec": { "pool": "local", "size_bytes": GIB, "format": "qcow2" } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+    admin.wait_task(&task).await;
+    let mut payroll = check_body("payroll");
+    payroll["spec"]["folder"] = json!(theirs);
+    payroll["spec"]["disks"] = json!([{ "volume": "secret-disk", "bus": "virtio-blk" }]);
+    let (status, body) = admin.post("/vms", payroll).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let net: opl_types::network::Network = Resource::new(
+        "hidden",
+        serde_json::from_value(
+            json!({ "sdn": {}, "subnets": [{ "cidr": "10.20.0.0/29" }], "folder": nets }),
+        )
+        .unwrap(),
+    );
+    env.cluster.create(&net).await.unwrap();
+    let alice = folder_user(env, admin, "alice", &[&mine]).await;
+    (alice, mine)
+}
+
+#[tokio::test]
+async fn refused_attachments_do_not_run_the_deeper_checks() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (alice, mine) = hidden_payroll(&env, &admin).await;
+
+    // 볼 수 없는 볼륨: 만들기는 404, 미리 확인도 그 거절 하나뿐 — 볼륨을 쓰는 VM 이름이 드러나지 않는다(리뷰 1 1).
+    let mut body = check_body("web");
+    body["spec"]["folder"] = json!(mine);
+    body["spec"]["disks"] = json!([{ "volume": "secret-disk", "bus": "virtio-blk" }]);
+    let (status, created) = alice.post("/vms", body.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{created}");
+    let answer = check(&alice, body).await;
+    assert_eq!(
+        problems(&answer),
+        [problem("disks.0", "not_found", "error")],
+        "{answer}"
+    );
+    assert_eq!(answer["problems"][0]["message"], created["message"]);
+    let text = answer.to_string();
+    assert!(
+        !text.contains("payroll") && !text.contains("volume_in_use"),
+        "{answer}"
+    );
+    assert_eq!(answer["ok"], false);
+    assert_eq!(answer["node"], Value::Null);
+    assert_eq!(answer["ips"], json!([]));
+
+    // 볼 수 없는 SDN 네트워크: 주소를 고르지도(빈 주소), 준 주소를 검사하지도 않는다.
+    for nic in [
+        json!({ "network": "hidden", "model": "virtio" }),
+        json!({ "network": "hidden", "model": "virtio", "ips": ["10.20.0.2"] }),
+        json!({ "network": "hidden", "model": "virtio", "ips": ["10.99.0.2"] }),
+    ] {
+        let mut body = check_body("web");
+        body["spec"]["folder"] = json!(mine);
+        body["spec"]["nics"] = json!([nic]);
+        let answer = check(&alice, body).await;
+        assert_eq!(
+            problems(&answer),
+            [problem("nics.0", "not_found", "error")],
+            "{answer}"
+        );
+        assert_eq!(answer["ips"], json!([]), "{answer}");
+        assert!(!answer.to_string().contains("10.20"), "{answer}");
+    }
+}
+
+#[tokio::test]
+async fn rules_the_caller_may_not_create_do_not_steer_the_check() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let (alice, mine) = hidden_payroll(&env, &admin).await;
+    let probe = |folder: Option<&str>| {
+        let mut body = check_body("web2");
+        body["spec"]["node"] = json!(env.node.to_string());
+        if let Some(folder) = folder {
+            body["spec"]["folder"] = json!(folder);
+        }
+        body["rules"] = json!([{ "name": "probe",
+            "spec": { "kind": "anti-affinity", "vms": ["payroll", "web2"] } }]);
+        body
+    };
+    // 관리자에게는 규칙이 얹혀 payroll과 같은 노드라고 알린다 — 권한 없는 주체에게 이것이 드러나면 안 된다.
+    let answer = check(&admin, probe(None)).await;
+    assert!(
+        problems(&answer)
+            .iter()
+            .any(|p| p.0 == "placement" && p.1 == "placement_rule"),
+        "{answer}"
+    );
+    // 규칙을 만들 수 없는 alice: 거절 하나뿐(리뷰 1 2)
+    let answer = check(&alice, probe(Some(&mine))).await;
+    assert_eq!(
+        problems(&answer),
+        [problem("placement", "forbidden", "error")],
+        "{answer}"
+    );
+    assert!(!answer.to_string().contains("payroll"), "{answer}");
+    assert_eq!(answer["node"], Value::Null);
+}
+
+/// 같은 이름 사용자에게 폴더 `folder`의 내장 역할 `role`을 준다.
+async fn grant(admin: &Client, user: &str, role: &str, folder: &str) {
+    let (status, users) = admin.get("/users").await;
+    assert_eq!(status, StatusCode::OK, "{users}");
+    let id = users
+        .as_array()
+        .or_else(|| users["items"].as_array())
+        .unwrap()
+        .iter()
+        .find(|u| u["name"] == user)
+        .unwrap()["id"]
+        .clone();
+    let (status, body) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": id },
+                "role": { "type": "builtin", "role": role },
+                "target": { "type": "folder", "id": folder },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+#[tokio::test]
+async fn creates_keep_the_first_refusal_by_volume_name() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let mine = folder(&admin, "mine", "vm", json!(null)).await;
+    let seen = folder(&admin, "seen", "storage", json!(null)).await;
+    let hid = folder(&admin, "hid", "storage", json!(null)).await;
+    local_pool(&env, &admin, "ro", Some(&seen)).await;
+    local_pool(&env, &admin, "secret", Some(&hid)).await;
+    for (name, pool) in [("a", "ro"), ("b", "secret")] {
+        let (status, task) = admin
+            .post(
+                "/volumes",
+                json!({ "name": name, "spec": { "pool": pool, "size_bytes": GIB, "format": "qcow2" } }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{task}");
+        admin.wait_task(&task).await;
+    }
+    let alice = folder_user(&env, &admin, "alice", &[&mine]).await;
+    grant(&admin, "alice", "viewer", &seen).await;
+    // 디스크 [b, a]: a는 볼 수 있지만 할당할 수 없어 403, b는 볼 수 없어 404. 만들기·고치기는 계획 71 앞처럼 이름 차례의
+    // 첫 거절(a의 403 — 디스크 차례면 b의 404)이다(리뷰 1 3). 미리 확인은 둘 다 칸마다 낸다.
+    let mut body = check_body("web");
+    body["spec"]["power"] = json!("stopped");
+    body["spec"]["folder"] = json!(mine);
+    body["spec"]["disks"] = json!([
+        { "volume": "b", "bus": "virtio-blk" }, { "volume": "a", "bus": "virtio-blk" }]);
+    let (status, refused) = alice.post("/vms", body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+    let answer = check(&alice, body.clone()).await;
+    assert_eq!(
+        problems(&answer),
+        [
+            problem("disks.0", "not_found", "error"),
+            problem("disks.1", "forbidden", "error")
+        ],
+        "{answer}"
+    );
+    let disks = std::mem::replace(&mut body["spec"]["disks"], json!([]));
+    let (status, created) = alice.post("/vms", body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let mut spec = created["spec"].clone();
+    spec["disks"] = disks;
+    let (status, refused) = alice.put("/vms/web", json!({ "spec": spec }), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+}
+
+#[tokio::test]
+async fn planned_lists_are_capped() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    let volume = |i: usize| json!({ "name": format!("v{i}"), "spec": { "pool": "local", "size_bytes": GIB, "format": "qcow2" } });
+    let rule = |i: usize| json!({ "name": format!("r{i}"), "spec": { "kind": "anti-affinity", "vms": ["web", "x"] } });
+    let mut body = check_body("web");
+    body["volumes"] = (0..16).map(volume).collect();
+    body["rules"] = (0..16).map(rule).collect();
+    check(&admin, body.clone()).await;
+    for (key, item) in [("volumes", volume(16)), ("rules", rule(16))] {
+        let mut over = body.clone();
+        over[key].as_array_mut().unwrap().push(item);
+        let (status, answer) = admin.post("/vm-checks", over).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{key}: {answer}");
+    }
 }
 
 #[tokio::test]

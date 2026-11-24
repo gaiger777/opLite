@@ -1918,9 +1918,31 @@ struct VmCreate {
     #[command(flatten)]
     cloud_init: CloudInitArgs,
     /// 만들지 않고 서버가 만들기와 같은 검사를 돌린다(`POST /vm-checks`): 문제를 `AT  CODE  MESSAGE` 표로 찍고(통과면 고를
-    /// 노드·CPU 모델·머신), 오류가 있으면 끝 코드 1이다.
-    #[arg(long, conflicts_with = "start")]
+    /// 노드·CPU 모델·머신), 오류가 있으면 끝 코드 1이다. `--start`와 함께면 켠 채로 확인해 놓을 노드·용량·배치 규칙까지
+    /// 본다(켜지도 않는다).
+    #[arg(long)]
     dry_run: bool,
+}
+
+/// `vm create --dry-run`의 확인(`POST /vm-checks`)을 보낸다. 그 API가 없는 옛 서버(404 `no API at …`)와 아직 올리지 않은
+/// 노드가 있는 클러스터(409 `cluster_upgrading`)는 그렇다고 알린다(리뷰 1 5 — "not found"는 VM이 없다는 뜻으로 읽힌다).
+async fn post_vm_check(client: &Client, body: &Value) -> anyhow::Result<Value> {
+    client.post("/vm-checks", body).await.map_err(|e| {
+        let api = e.downcast_ref::<ApiError>();
+        let old_server = match api {
+            Some(a) => a.code == "not_found" && a.message.starts_with("no API at"),
+            None => e.to_string().starts_with("404"),
+        };
+        if old_server {
+            anyhow::anyhow!("the server does not support --dry-run (POST /vm-checks); upgrade it")
+        } else if api.is_some_and(|a| a.code == "cluster_upgrading") {
+            anyhow::anyhow!(
+                "the cluster does not support --dry-run until every node is upgraded: {e}"
+            )
+        } else {
+            e
+        }
+    })
 }
 
 /// `vm create --dry-run`의 답(`POST /vm-checks`)을 찍는다. 오류(`error`)가 있으면 `Err`(끝 코드 1).
@@ -8587,7 +8609,11 @@ async fn vm(
             }
             firmware_update(&mut body["spec"], &args.fw, false)?;
             if args.dry_run {
-                let check = client.post("/vm-checks", &body).await?;
+                // 켤 VM은 켠 채로 확인해야 놓을 노드·용량·hard 배치 규칙을 본다(만들기는 꺼진 채 만들고 켠다).
+                if args.start {
+                    body["spec"]["power"] = json!("running");
+                }
+                let check = post_vm_check(client, &body).await?;
                 return print_vm_check(out, &check, json_out);
             }
             let r = client.request(Method::POST, "/vms").json(&body);
@@ -19707,24 +19733,27 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
     }
 
     /// `vm create --dry-run`(계획 71)은 만들기와 같은 본문을 `/vm-checks`로만 보내고(VM을 만들지 않음) 문제를 표로, 통과면
-    /// 고를 노드를 찍으며, 오류가 있으면 실패(끝 코드 1)다. `-o json`은 답 그대로다.
+    /// 고를 노드를 찍으며, 오류가 있으면 실패(끝 코드 1)다. `-o json`은 답 그대로다. `--start`면 켠 채로(`power: running`)
+    /// 확인해 서버가 놓을 노드를 고른다. 그 API가 없는 옛 서버·올리는 중인 클러스터는 그렇게 알린다.
     #[tokio::test]
     async fn vm_create_dry_run_checks_without_creating() {
         let passed = json!({ "ok": true, "node": "n3", "machine": "virt", "cpu_model": "host",
             "ips": [[]], "problems": [{ "at": "disks.0", "code": "pool_space",
             "message": "storage pool \"local\" is nearly full", "level": "warn" }] });
+        let stopped = json!({ "ok": true, "node": null, "machine": "virt", "cpu_model": "host",
+            "ips": [[]], "problems": [] });
         let failed = json!({ "ok": false, "node": null, "machine": null, "cpu_model": null, "ips": [],
             "problems": [
                 { "at": "nics.0", "code": "forbidden", "message": "permission denied", "level": "error" },
                 { "at": "quota", "code": "quota_exceeded", "message": "folder /team would use 3 of 2 VMs", "level": "error" }] });
-        let run = |answer: Value, json_out: bool| async move {
+        let run = |status: u16, answer: Value, json_out: bool, start: bool| async move {
             let (client, seen) =
                 crate::fake_api::fake_api(move |method, path| match (method, path) {
-                    ("POST", "/api/v1/vm-checks") => (200, answer.clone()),
+                    ("POST", "/api/v1/vm-checks") => (status, answer.clone()),
                     _ => (500, json!({ "code": "internal", "message": "unexpected" })),
                 })
                 .await;
-            let cli = Cli::try_parse_from([
+            let mut argv = vec![
                 "oplctl",
                 "vm",
                 "create",
@@ -19736,8 +19765,11 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
                 "--nic",
                 "lan",
                 "--dry-run",
-            ])
-            .unwrap();
+            ];
+            if start {
+                argv.push("--start");
+            }
+            let cli = Cli::try_parse_from(argv).unwrap();
             let Cmd::Vm { cmd } = cli.cmd else {
                 panic!("not a vm command");
             };
@@ -19747,13 +19779,15 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
             (result, String::from_utf8(out).unwrap(), seen)
         };
 
-        let (result, text, seen) = run(passed.clone(), false).await;
+        // `--start`: 켠 채로 확인하고(서버가 노드를 고른다) 켜지 않는다.
+        let (result, text, seen) = run(200, passed.clone(), false, true).await;
         result.unwrap();
         assert_eq!(
             seen.iter().map(|s| s.line.as_str()).collect::<Vec<_>>(),
             ["POST /api/v1/vm-checks HTTP/1.1"]
         );
         assert_eq!(seen[0].body["name"], "web");
+        assert_eq!(seen[0].body["spec"]["power"], "running");
         assert_eq!(seen[0].body["spec"]["machine"], "virt");
         assert_eq!(seen[0].body["spec"]["disks"][0]["volume"], "web-disk0");
         assert_eq!(seen[0].body["spec"]["nics"][0]["network"], "lan");
@@ -19764,7 +19798,18 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
              ok: node n3, cpu host, machine virt\n"
         );
 
-        let (result, text, _) = run(failed.clone(), false).await;
+        // `--start` 없이는 만들기처럼 꺼진 채(`power`를 보내지 않음)라 고를 노드가 없다.
+        let (result, text, seen) = run(200, stopped, false, false).await;
+        result.unwrap();
+        assert_eq!(
+            seen[0].body["spec"].get("power"),
+            None,
+            "{:?}",
+            seen[0].body
+        );
+        assert_eq!(text, "ok: node -, cpu host, machine virt\n");
+
+        let (result, text, _) = run(200, failed.clone(), false, false).await;
         let err = result.unwrap_err().to_string();
         assert!(err.contains("2 problem"), "{err}");
         assert!(
@@ -19777,13 +19822,24 @@ datastore1  db/db.vmx        error: memsize is missing  -          -    -       
         );
         assert!(!text.contains("ok:"), "{text}");
 
-        let (result, text, _) = run(failed.clone(), true).await;
+        let (result, text, _) = run(200, failed.clone(), true, false).await;
         assert!(result.is_err());
         assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), failed);
 
-        // 만들지 않으므로 켜기와 함께 줄 수 없다.
-        assert!(
-            Cli::try_parse_from(["oplctl", "vm", "create", "web", "--dry-run", "--start"]).is_err()
-        );
+        // 옛 서버(그 API가 없음)와 올리는 중인 클러스터
+        let old = json!({ "code": "not_found", "message": "no API at /api/v1/vm-checks" });
+        let (result, _, _) = run(404, old, false, false).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("does not support --dry-run"), "{err}");
+        let upgrading =
+            json!({ "code": "cluster_upgrading", "message": "node n2 does not support vm-check" });
+        let (result, _, _) = run(409, upgrading, false, false).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("until every node is upgraded"), "{err}");
+        // 다른 404(볼 수 없는 폴더)는 그대로다.
+        let folder = json!({ "code": "not_found", "message": "folder not found" });
+        let (result, _, _) = run(404, folder, false, false).await;
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("folder not found"), "{err}");
     }
 }

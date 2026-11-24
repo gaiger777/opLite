@@ -287,6 +287,8 @@ pub(crate) fn prepare(state: &AppState, vm: &mut Vm, scorer: &Scorer) -> Result<
 pub(crate) struct Planned {
     pub volumes: Vec<Volume>,
     pub rules: Vec<opl_types::placement::PlacementRule>,
+    /// 미리 확인이다: 평문 cloud-init 비밀번호를 해시하지 않는다(저장하지 않으니 검증만 하면 된다 — 리뷰 1 4).
+    pub preview: bool,
 }
 
 /// [`prepare`]를 `planned`를 얹은 목록으로 돈다(검사는 같다).
@@ -478,7 +480,7 @@ pub(crate) fn prepare_with(
         }
     }
     let current = inv.vms.iter().find(|v| v.id == id);
-    hash_password(spec, current)?;
+    hash_password(spec, current, !planned.preview)?;
     keep_masked_data(spec, current)?;
     check_replication(state, vm, &inv)?;
     // 이미 그 노드에 있는 VM(실행 중이거나 고정된 채 꺼진 VM)의 다른 고치기는 유지보수로 막지 않는다.
@@ -719,8 +721,9 @@ fn check_cdrom_node(
 }
 
 /// cloud-init 비밀번호를 저장할 모양으로 바꾼다: crypt 해시는 그대로, 평문은 SHA-512 crypt(무작위 솔트 16자),
-/// [`PASSWORD_MASK`]는 저장된 VM(`current`)의 해시(없으면 400). 검증([`VmSpec::validate`]) 뒤에 부른다.
-fn hash_password(spec: &mut VmSpec, current: Option<&Vm>) -> Result<(), ApiError> {
+/// [`PASSWORD_MASK`]는 저장된 VM(`current`)의 해시(없으면 400). 검증([`VmSpec::validate`]) 뒤에 부른다. `crypt`가
+/// 거짓이면(미리 확인) 평문을 그대로 둔다.
+fn hash_password(spec: &mut VmSpec, current: Option<&Vm>, crypt: bool) -> Result<(), ApiError> {
     let Some(password) = spec.cloud_init.as_mut().and_then(|c| c.password.as_mut()) else {
         return Ok(());
     };
@@ -735,7 +738,7 @@ fn hash_password(spec: &mut VmSpec, current: Option<&Vm>) -> Result<(), ApiError
             ));
         };
         *password = stored.clone();
-    } else if !is_crypt_hash(password) {
+    } else if crypt && !is_crypt_hash(password) {
         *password = crypt_password(password);
     }
     Ok(())
@@ -793,24 +796,65 @@ pub(crate) fn mask_spec(
 }
 
 /// 새로 붙이는 네트워크(NIC마다 `network.assign`)와 볼륨(디스크마다 볼륨 주인의 `storage.allocate`). `current`가 있으면
-/// 이미 붙은 것은 다시 보지 않는다. 첫 거절을 돌려준다([`attachment_problems`]의 첫 것).
+/// 이미 붙은 것은 다시 보지 않는다. 첫 거절에서 멈춘다: 네트워크는 NIC 차례, 볼륨·ISO는 이름 차례, 복제 대상 순(계획 71
+/// 앞과 같은 상태·코드 — 리뷰 1 3). 미리 확인은 모두 모으는 [`attachment_problems`]를 쓴다.
 pub(crate) fn check_attachments(
     state: &AppState,
     principal: &Principal,
     spec: &VmSpec,
     current: Option<&VmSpec>,
 ) -> Result<(), ApiError> {
-    match attachment_problems(state, principal, spec, current)?
-        .into_iter()
-        .next()
-    {
-        Some((_, e)) => Err(e),
-        None => Ok(()),
+    let had = |name: &str| current.is_some_and(|c| c.nics.iter().any(|n| n.network == name));
+    state.authz.require_networks(
+        principal,
+        spec.nics
+            .iter()
+            .map(|n| n.network.as_str())
+            .filter(|n| !had(n)),
+    )?;
+    let had_disk = |name: &str| current.is_some_and(|c| c.disks.iter().any(|d| d.volume == name));
+    state.authz.require_volumes(
+        principal,
+        spec.disks
+            .iter()
+            .map(|d| d.volume.as_str())
+            .filter(|v| !had_disk(v)),
+    )?;
+    let had_iso = |name: &str| {
+        current.is_some_and(|c| c.cdroms.iter().any(|d| d.iso.as_deref() == Some(name)))
+    };
+    state.authz.require_isos(
+        principal,
+        spec.cdroms
+            .iter()
+            .filter_map(|d| d.iso.as_deref())
+            .filter(|v| !had_iso(v)),
+    )?;
+    // 새 복제 대상(리뷰 2 N2): 복제본을 만들 풀마다 `storage.allocate`. 대상에 풀이 없으면 디스크마다 같은 이름의 풀이다.
+    let had_target = |t: &opl_types::replication::ReplicationTarget| {
+        current.is_some_and(|c| {
+            c.replication
+                .iter()
+                .any(|s| s.node == t.node && s.pool == t.pool)
+        })
+    };
+    for target in spec.replication.iter().filter(|t| !had_target(t)) {
+        match &target.pool {
+            Some(pool) => state.authz.require_pool(principal, pool)?,
+            None => {
+                for disk in &spec.disks {
+                    if let Some(v) = state.cluster.get_by_name::<VolumeSpec>(&disk.volume)? {
+                        state.authz.require_pool(principal, &v.spec.pool)?;
+                    }
+                }
+            }
+        }
     }
+    Ok(())
 }
 
-/// [`check_attachments`]의 거절을 모두 자리(`nics.N`·`disks.N`·`cdroms.N`·`replication` — 계획 71 미리 확인의 칸)와 함께
-/// 차례대로 모은다. 권한 판단 밖의 오류(저장소 읽기)는 `Err`다.
+/// [`check_attachments`]의 검사를 멈추지 않고 돌려 거절을 모두 자리(`nics.N`·`disks.N`·`cdroms.N`·`replication` — 계획 71
+/// 미리 확인의 칸)와 함께 칸 차례대로 모은다. 권한 판단 밖의 오류(저장소 읽기)는 `Err`다.
 pub(crate) fn attachment_problems(
     state: &AppState,
     principal: &Principal,
@@ -2899,6 +2943,23 @@ mod tests {
         );
         assert_eq!(host_full(&ApiError::conflict("no_capacity", "full")), None);
         assert_eq!(host_full(&ApiError::conflict("no_node", "none")), None);
+    }
+
+    /// 미리 확인(`crypt` 거짓)은 평문 비밀번호를 해시하지 않지만 가린 값은 만들기처럼 400이다(리뷰 1 4).
+    #[test]
+    fn previews_do_not_hash_passwords() {
+        let mut spec: VmSpec = serde_json::from_value(serde_json::json!({
+            "cpu": { "cores": 1 }, "memory_mib": 256, "machine": "virt",
+            "cloud_init": { "password": "secret-1" }
+        }))
+        .unwrap();
+        let password = |spec: &VmSpec| spec.cloud_init.as_ref().unwrap().password.clone().unwrap();
+        hash_password(&mut spec, None, false).unwrap();
+        assert_eq!(password(&spec), "secret-1");
+        hash_password(&mut spec, None, true).unwrap();
+        assert!(is_crypt_hash(&password(&spec)), "{}", password(&spec));
+        spec.cloud_init.as_mut().unwrap().password = Some(PASSWORD_MASK.into());
+        hash_password(&mut spec, None, false).unwrap_err();
     }
 
     /// 켜진 VM의 있던 NIC 주소는 바꾸지 않는다(핫플러그 장치 변경이 아니라서 따로 막는다, 계획 65).

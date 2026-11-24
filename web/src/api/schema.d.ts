@@ -3386,7 +3386,8 @@ export interface paths {
          * 만들기를 미리 확인한다: 만들기와 같은 검사(이름, 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨(`POST /volumes`의 검사와 풀
          *     남은 용량 경고), 만들 배치 규칙(`POST /placement-rules`의 검사), 폴더 할당량, 그리고 만들 것을 얹은 `prepare`)를 쓰지
          *     않고 돌려 문제를 자리마다 모은다. 문제가 있어도 200이다. 대상 폴더에 `vm.create`가 없으면 403(그 밖을 알려 주지
-         *     않음), 기능 `vm-check`를 모르는 노드가 있으면 409 `cluster_upgrading`, 본문을 풀 수 없으면 400.
+         *     않음), 기능 `vm-check`를 모르는 노드가 있으면 409 `cluster_upgrading`, 본문을 풀 수 없거나 만들 볼륨·규칙이 16개를
+         *     넘으면 400. 첨부·만들 것의 권한 거절(403·404)이 있으면 그 거절만 돌려준다(할당량·배치·주소 검사 없이, `node`·`ips` 없이).
          */
         post: operations["check_vm"];
         delete?: never;
@@ -14773,11 +14774,11 @@ export interface components {
                 [key: string]: string;
             };
             name: string;
-            /** @description VM보다 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 장애 영역 규칙) */
+            /** @description VM보다 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 장애 영역 규칙, 16개까지) */
             rules?: components["schemas"]["CreateRequest_PlacementRuleSpec"][];
             /** @description `POST /vms`의 spec과 같다(`machine`을 빼면 채운다). */
             spec: components["schemas"]["VmSpec"];
-            /** @description VM보다 먼저 만들 볼륨(`POST /volumes`의 본문). 디스크가 이름으로 가리키면 준비된 볼륨으로 본다. */
+            /** @description VM보다 먼저 만들 볼륨(`POST /volumes`의 본문, 16개까지). 디스크가 이름으로 가리키면 준비된 볼륨으로 본다. */
             volumes?: components["schemas"]["CreateRequest_VolumeSpec"][];
         };
         VmCounts: {

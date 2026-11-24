@@ -312,13 +312,15 @@ it("keeps the CLI cross-check fixture (web CLI lines → same POST body as the w
   const cases = CASES.map(([name, make]) => {
     const s = make();
     const plan = cliPlan(s, ctx);
-    const last = requests(s, ctx).at(-1)!;
+    const all = requests(s, ctx);
     return {
       name,
       files: plan.files,
       commands: plan.commands,
       missing: plan.missing,
-      request: last,
+      // 마지막 요청(VM 만들기·배포) 앞에 보낼 볼륨·배치 규칙 만들기(차례대로)
+      before: all.slice(0, -1),
+      request: all.at(-1)!,
     };
   });
   expect(cases).toHaveLength(12);
