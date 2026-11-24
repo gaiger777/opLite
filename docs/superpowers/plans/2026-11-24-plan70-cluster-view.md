@@ -99,7 +99,7 @@
 - 리뷰: 웹 두 번. 1차(중간 2·중하 2·낮음 6·제안 2, 거짓 경보 없음 → `fix(web): 리뷰 1`) — 메모리 단계에 100% 진행률(디스크 복사 바이트) → 디스크 복사 단계만 퍼센트·`tasks.ts`와 한 규칙, 관리자에게 "볼 수 없는 VM +1" 유령 타일, 지도 포커스 때 Ctrl/⌘ +·−·0을 삼킴, 화살표(마이그레이션·추천)가 마우스로만 → 노드 서랍·목록 보기의 "마이그레이션과 추천", 포커스 돌려주기, 한글 꼬리표 폭, 사라진 기억 설정, HA 칩·서랍 배치 규칙, 마이그레이션 Task만 다시 그리기, 그 VM을 옮길 수 있을 때만 적용. 2차(1차 수정 13개 모두 맞음, 낮음 1·시험 제안 1 → `fix(web): 리뷰 2`) — 목록 보기에서 적용·마이그레이션 끝난 뒤 포커스가 body로 → 화살표 키로 기억, 폴더 운영자의 적용 시험.
 - svc01 일반 시험(리뷰 1 커밋, Rust 바뀜 없음): fmt·clippy·test·starve·scale·storage-dir·storage-api 모두 통과, 4277개 통과·0 실패.
 - GitHub 탐침(`38e79562`, main 위로 다시 쌓은 뒤, `web` 작업 포함): 13개 작업 모두 통과(web·package·file-restore·linux-kvm·ldap·ceph·ovn·sdn-multinode·backup-s3·install-media·iso-e2e 둘·catalog-links).
-- 배포: (배포 후 채움 — svc01·svc02 지도에 두 노드·test-vm 타일·리더 꼬리표, `zone` 레이블로 판 둘, test-vm svc01 ↔ svc02 라이브 마이그레이션의 화살표·진행률·유령 타일, 유지보수 줄무늬, 휴대폰 폭)
+- 배포(2026-11-24 20:11, `c35c2508`): svc01에서 빌드한 `orbivisord`(sha256 `2d6628c0…`)를 svc02 → svc01에 설치, 두 노드 active·경고 없음, test-vm(PID 40553) 그대로. 확인(Playwright 화면, 어두운 테마 1400×900): 인프라 › 노드 › 지도에 판 "lab · 2 nodes", svc01·svc02 블록(CPU·메모리, 리더 꼬리표), test-vm 타일. 라이브 마이그레이션은 test-vm이 노드 로컬 ISO를 꽂아 막혀(`cdrom_local` — 맞는 보호) 확인용 VM `map-demo`(256 MiB 디스크)로 했다 — **처음엔 실패**: 랩의 `/opt/qemu`(직접 빌드 QEMU 10.1.2)에 GnuTLS가 없어 TLS 마이그레이션이 처음부터 안 되던 랩 문제(`TLS credentials support requires GNUTLS`). QEMU를 `--enable-gnutls --enable-seccomp`로 다시 빌드해 두 노드에 넣고 opld를 다시 띄운 뒤 svc01 → svc02 → svc01 둘 다 성공(각 15초 안). 지도에 점선 흐르는 화살표 `map-demo → svc01`, 원본 테두리 타일·대상 점선 유령 타일, 끝나면 타일이 대상 블록으로 옮겨짐을 1초 간격 화면으로 확인. `map-demo`는 지웠다.
 
 ## 다음 계획으로 넘길 사항
 
