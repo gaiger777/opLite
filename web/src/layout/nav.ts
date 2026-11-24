@@ -9,6 +9,8 @@ export interface NavView {
   to: string;
   key: string;
   kind?: Kind;
+  /** 팔레트 이동 항목이 더 찾는 낱말(번역 키 — 쉼표로 나눔) */
+  keywords?: string;
 }
 
 /** 탭을 보일지 정하는 권한(`usePermissions()`) */
@@ -74,6 +76,8 @@ export const AREAS: NavArea[] = [
         kind: "node",
         views: [
           { to: "/nodes", key: "nav.nodes" },
+          // 2.5D 클러스터 지도(계획 70). `/nodes/map`은 노드 상세 `/nodes/:name`과 겹쳐 `/cluster` 아래에 둔다.
+          { to: "/cluster/map", key: "nav.clusterMap", keywords: "nav.clusterMapKeywords" },
           { to: "/cluster", key: "nav.cluster" },
         ],
       },

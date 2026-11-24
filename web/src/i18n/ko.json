@@ -246,7 +246,9 @@
     "floatingIps": "유동 IP",
     "loadBalancers": "부하 분산",
     "topology": "토폴로지",
-    "backupStores": "백업 저장소"
+    "backupStores": "백업 저장소",
+    "clusterMap": "지도",
+    "clusterMapKeywords": "지도, 클러스터 보기, 3d, map"
   },
   "header": {
     "language": "언어",
@@ -3342,7 +3344,8 @@
     "group": {
       "general": "일반",
       "navigation": "이동",
-      "list": "목록"
+      "list": "목록",
+      "map": "클러스터 지도"
     },
     "palette": "명령 팔레트",
     "help": "이 도움말",
@@ -3365,6 +3368,10 @@
       "select": "행 고르기",
       "peek": "행 미리 보기",
       "open": "행 열기"
+    },
+    "map": {
+      "enter": "노드의 VM으로 들어가기",
+      "leave": "노드로 나오기"
     }
   },
   "table": {
@@ -4627,56 +4634,6 @@
     },
     "nicless_one": "볼 수 없는 네트워크에만 있는 VM {{count}}대는 그리지 않습니다.",
     "nicless_other": "볼 수 없는 네트워크에만 있는 VM {{count}}대는 그리지 않습니다."
-  },
-  "clusterMap": {
-    "label": {
-      "node": "노드 {{name}}",
-      "witness": "증인 노드 {{name}}",
-      "slab": "판 {{name}}",
-      "noGroup": "영역 없음",
-      "online": "온라인",
-      "offline": "오프라인",
-      "frozen": "얼림",
-      "maintenance": "유지보수",
-      "draining": "비우는 중 {{moving}}/{{total}}",
-      "leader": "리더",
-      "load": "CPU {{cpu}}%, 메모리 {{mem}}%",
-      "loadUnknown": "부하 모름",
-      "overcommit": "메모리 할당 {{pct}}%",
-      "noVms": "VM 없음",
-      "vms_one": "VM {{count}}개({{detail}})",
-      "vms_other": "VM {{count}}개({{detail}})",
-      "count": {
-        "running": "켜짐 {{count}}",
-        "busy": "바뀌는 중 {{count}}",
-        "failed": "실패 {{count}}",
-        "stopped": "꺼짐 {{count}}"
-      },
-      "hiddenCount": "볼 수 없음 {{count}}",
-      "alerts_one": "경보 {{count}}",
-      "alerts_other": "경보 {{count}}",
-      "vm": "VM {{name}}, {{phase}}",
-      "onNode": "노드 {{node}}",
-      "notPlaced": "배치 안 됨",
-      "ha": "HA",
-      "violations_one": "배치 규칙 {{count}}개 어김",
-      "violations_other": "배치 규칙 {{count}}개 어김",
-      "moving": "{{node}}(으)로 옮기는 중",
-      "movingPct": "{{node}}(으)로 옮기는 중 {{progress}}%",
-      "stale": "노드 오프라인, 마지막으로 알려진 자리",
-      "ghost": "{{node}}에서 옮겨 오는 VM {{name}}",
-      "more_one": "{{node}}의 VM {{count}}개 더",
-      "more_other": "{{node}}의 VM {{count}}개 더",
-      "hidden_one": "{{node}}에서 볼 수 없는 VM {{count}}개",
-      "hidden_other": "{{node}}에서 볼 수 없는 VM {{count}}개",
-      "unplaced_one": "배치 안 됨, VM {{count}}개",
-      "unplaced_other": "배치 안 됨, VM {{count}}개",
-      "unplacedName": "배치 안 됨",
-      "migration": "{{vm}} → {{to}}",
-      "migrationPct": "{{vm}} → {{to}} · {{progress}}%",
-      "migrationStage": "{{vm}} → {{to}} · {{stage}}",
-      "recommendation": "추천: {{vm}} {{from}} → {{to}}"
-    }
   },
   "migration": {
     "title": "{{name}}을(를) SDN으로 옮기기",

@@ -1,7 +1,14 @@
 import { boxesPath } from "@/components/iso/iso";
 import { layoutCluster, PER_LAYER } from "@/clusterMap/layout";
 import { toModel } from "@/clusterMap/model";
-import { elementCount, scenePaths } from "@/clusterMap/paths";
+import {
+  elementCount,
+  FRAME_ELEMENTS,
+  nodeElements,
+  nodeMarks,
+  scenePaths,
+} from "@/clusterMap/paths";
+import type { StoragePool } from "@/api/types";
 import { mapNode, mapVm, randomCluster } from "@/test/clusterMap";
 
 const subpaths = (d: string) => (d.match(/M/g) ?? []).length;
@@ -123,11 +130,64 @@ it("counts the SVG elements a picture would make", () => {
   const n = mapNode(1, "a", { spec: { maintenance: true } });
   const scene = layoutCluster(toModel({ nodes: [n], vms: [mapVm(1, "x", n.id)] }));
   const tiles = scenePaths(scene, "tiles");
-  // 틀 12 + 판 4 + 노드(g + 윗면 + 채움 면 둘 × 다각형 둘 + 꼬리표 하나 × 2) 8 + 경로 셋(옆면·그늘·윗면)
-  expect(elementCount(scene, tiles, "tiles")).toBe(12 + 4 + 8 + 3);
-  // 요약: g + 블록 면 셋 + 꼬리표, 막대 면 셋
-  expect(elementCount(scene, scenePaths(scene, "summary"), "summary")).toBe(12 + 4 + 6 + 3);
-  // 자세히: 윗면 글 + 타일 이름 하나, 레이어 켜면 노드마다 더
-  expect(elementCount(scene, tiles, "detail")).toBe(12 + 4 + 9 + 3 + 1);
-  expect(elementCount(scene, tiles, "tiles", ["load", "storage", "network", "ha"])).toBe(27 + 5);
+  const F = FRAME_ELEMENTS;
+  // 틀 + 판 4 + 노드(g + 이름 + 윗면 + 채움 면 둘 × 다각형 둘 + 유지보수 꼬리표 × 2 + 줄무늬 띠) 10 + 경로 셋(옆면·그늘·윗면)
+  expect(elementCount(scene, tiles, "tiles")).toBe(F + 4 + 10 + 3);
+  // 요약: g + 이름 + 블록 면 셋 + 꼬리표 + 띠, 막대 면 셋
+  expect(elementCount(scene, scenePaths(scene, "summary"), "summary")).toBe(F + 4 + 8 + 3);
+  // 자세히: 부하 글 + 타일 이름 하나
+  expect(elementCount(scene, tiles, "detail")).toBe(F + 4 + 11 + 3 + 1);
+  // 레이어 자료가 없는 노드(풀·인터페이스·버전 없음)에는 레이어가 더하는 것이 없다
+  expect(elementCount(scene, tiles, "tiles", ["load", "storage", "network", "ha"])).toBe(
+    F + 4 + 10 + 3,
+  );
+});
+
+it("counts what each layer adds to a node", () => {
+  const n = mapNode(1, "a", {
+    spec: { sdn: { gateway: 1 } },
+    status: {
+      version: "1.0",
+      pools: {
+        local: { available_bytes: 0, total_bytes: 10, ready: false, error: "x", pool_id: "p" },
+        nfs: { available_bytes: 0, total_bytes: 0, ready: false, error: "y", pool_id: "q" },
+      },
+      interfaces: [{ name: "eth0", kind: "ethernet", state: "up", carrier: true, master: "br0" }],
+      fence_check: { at: 1, by: "b", error: "ipmi: timeout" },
+    },
+  });
+  const pools = [
+    {
+      id: "p",
+      name: "local",
+      revision: 1,
+      labels: {},
+      spec: { backend: { kind: "dir", path: "/x" } },
+    },
+    {
+      id: "q",
+      name: "nfs",
+      revision: 1,
+      labels: {},
+      spec: { backend: { kind: "dir", path: "/y" }, shared: true },
+    },
+  ] as unknown as StoragePool[];
+  const scene = layoutCluster(toModel({ nodes: [n], vms: [], pools }));
+  const item = scene.nodes[0]!;
+  const marks = nodeMarks(item, new Set(["storage", "network", "ha"]));
+  expect(marks).toMatchObject({
+    tags: ["gateway", "fence"],
+    pedestal: true,
+    poolBad: true,
+    sharedTick: true,
+    uplink: true,
+    ring: true,
+  });
+  expect(nodeMarks(item, new Set(["load"]))).toMatchObject({ tags: [], pedestal: false });
+  // g + 이름 + 윗면·채움 5 + 꼬리표 둘 × 2 + 받침·빗금·눈금·띠·둘레
+  expect(nodeElements(item, "tiles", marks)).toBe(2 + 5 + 4 + 5);
+  // 공유 풀 띠는 판마다 둘
+  expect(elementCount(scene, [], "tiles", ["storage"]) - elementCount(scene, [], "tiles")).toBe(
+    2 + 3,
+  );
 });

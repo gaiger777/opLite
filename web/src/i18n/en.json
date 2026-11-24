@@ -246,7 +246,9 @@
     "floatingIps": "Floating IPs",
     "loadBalancers": "Load balancers",
     "topology": "Topology",
-    "backupStores": "Backup stores"
+    "backupStores": "Backup stores",
+    "clusterMap": "Map",
+    "clusterMapKeywords": "map, topology, 3d, cluster view"
   },
   "header": {
     "language": "Language",
@@ -3342,7 +3344,8 @@
     "group": {
       "general": "General",
       "navigation": "Go to",
-      "list": "Lists"
+      "list": "Lists",
+      "map": "Cluster map"
     },
     "palette": "Command palette",
     "help": "Show this help",
@@ -3365,6 +3368,10 @@
       "select": "Select the row",
       "peek": "Preview the row",
       "open": "Open the row"
+    },
+    "map": {
+      "enter": "Go into a node's VMs",
+      "leave": "Back to the node"
     }
   },
   "table": {
@@ -4627,56 +4634,6 @@
     },
     "nicless_one": "{{count}} VM is only on networks you can't see and is not drawn.",
     "nicless_other": "{{count}} VMs are only on networks you can't see and are not drawn."
-  },
-  "clusterMap": {
-    "label": {
-      "node": "Node {{name}}",
-      "witness": "Witness node {{name}}",
-      "slab": "group {{name}}",
-      "noGroup": "no group",
-      "online": "online",
-      "offline": "offline",
-      "frozen": "frozen",
-      "maintenance": "maintenance",
-      "draining": "draining {{moving}}/{{total}}",
-      "leader": "leader",
-      "load": "CPU {{cpu}}%, memory {{mem}}%",
-      "loadUnknown": "load unknown",
-      "overcommit": "memory allocated {{pct}}%",
-      "noVms": "no VMs",
-      "vms_one": "{{count}} VM ({{detail}})",
-      "vms_other": "{{count}} VMs ({{detail}})",
-      "count": {
-        "running": "{{count}} running",
-        "busy": "{{count}} changing",
-        "failed": "{{count}} failed",
-        "stopped": "{{count}} stopped"
-      },
-      "hiddenCount": "{{count}} you can't see",
-      "alerts_one": "{{count}} alert",
-      "alerts_other": "{{count}} alerts",
-      "vm": "VM {{name}}, {{phase}}",
-      "onNode": "node {{node}}",
-      "notPlaced": "not placed",
-      "ha": "HA",
-      "violations_one": "breaks {{count}} placement rule",
-      "violations_other": "breaks {{count}} placement rules",
-      "moving": "moving to {{node}}",
-      "movingPct": "moving to {{node}} {{progress}}%",
-      "stale": "node offline, last known place",
-      "ghost": "VM {{name}} arriving from {{node}}",
-      "more_one": "{{count}} more VM on {{node}}",
-      "more_other": "{{count}} more VMs on {{node}}",
-      "hidden_one": "{{count}} VM on {{node}} you can't see",
-      "hidden_other": "{{count}} VMs on {{node}} you can't see",
-      "unplaced_one": "Not placed, {{count}} VM",
-      "unplaced_other": "Not placed, {{count}} VMs",
-      "unplacedName": "not placed",
-      "migration": "{{vm}} → {{to}}",
-      "migrationPct": "{{vm}} → {{to}} · {{progress}}%",
-      "migrationStage": "{{vm}} → {{to}} · {{stage}}",
-      "recommendation": "Recommended: {{vm}} {{from}} → {{to}}"
-    }
   },
   "migration": {
     "title": "Migrate {{name}} to SDN",

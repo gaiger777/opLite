@@ -120,6 +120,12 @@ export interface Counts {
   busy: number;
 }
 
+/** 레이어가 그리는 노드 자료(§7.3 — 모델의 노드에서 그대로) */
+export type NodeLayers = Pick<
+  MapNode,
+  "pools" | "sharedDown" | "uplink" | "gateway" | "fencing" | "fenceError"
+>;
+
 export interface NodeItem {
   /** `node:<id>`, "배치 안 됨" 판은 `unplaced` */
   key: string;
@@ -143,6 +149,8 @@ export interface NodeItem {
   bars: Bar[];
   /** 블록 윗면에서 쌓인 타일 높이 */
   stack: number;
+  /** 스토리지·네트워크·HA 레이어의 자료(배치 안 됨 판은 `null`) */
+  layers: NodeLayers | null;
 }
 
 export interface SlabItem {
@@ -182,6 +190,8 @@ export interface MapScene {
   byKey: Map<string, NodeItem>;
   /** 타일 열쇠 → 그 노드와 칸 */
   tiles: Map<string, { node: NodeItem; cell: TileCell }>;
+  /** 공유 풀 이름(스토리지 레이어 — 판마다 앞 가장자리의 띠) */
+  shared: string[];
 }
 
 /** VM 상태 → 타일 색 */
@@ -580,6 +590,14 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
         grid,
         bars: n.witness ? [] : bars(box, c),
         stack: (grid?.layers ?? 0) * TILE_H,
+        layers: {
+          pools: n.pools,
+          sharedDown: n.sharedDown,
+          uplink: n.uplink,
+          gateway: n.gateway,
+          fencing: n.fencing,
+          fenceError: n.fenceError,
+        },
       });
     }
     if (order.length > 0) {
@@ -631,6 +649,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
       grid,
       bars: [],
       stack: TILE_H,
+      layers: null,
     });
     band += 1;
   }
@@ -652,6 +671,7 @@ export function layoutCluster(model: ClusterModel, opts: LayoutOptions = {}): Ma
     bands: band,
     byKey,
     tiles,
+    shared: model.shared ?? [],
   };
 }
 

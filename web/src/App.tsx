@@ -172,6 +172,18 @@ export const appRoutes: RouteObject[] = [
               { path: "alerts", lazy: page(() => import("@/alerts/AlertsPage"), "AlertsPage") },
               { path: "audit", lazy: page(() => import("@/audit/AuditPage"), "AuditPage") },
               { path: "cluster", lazy: page(() => import("@/cluster/ClusterPage"), "ClusterPage") },
+              {
+                path: "cluster/map",
+                // 지도 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다(계획 70 §12).
+                lazy: page(
+                  () =>
+                    Promise.all([
+                      import("@/clusterMap/ClusterMapPage"),
+                      import("@/clusterMap/strings").then((s) => s.loadMapStrings()),
+                    ]).then(([m]) => m),
+                  "ClusterMapPage",
+                ),
+              },
               { path: "remotes", lazy: page(() => import("@/remotes/RemotesPage"), "RemotesPage") },
               {
                 path: "remotes/:name",

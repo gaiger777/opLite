@@ -85,6 +85,7 @@ it("switches views inside a tab", async () => {
   const views = await screen.findByRole("navigation", { name: "Nodes views" });
   expect(links(views)).toEqual([
     ["Nodes", "/nodes"],
+    ["Map", "/cluster/map"],
     ["Cluster", "/cluster"],
   ]);
   expect(within(views).getByRole("link", { name: "Cluster" })).toHaveAttribute(

@@ -335,6 +335,13 @@ it("goes to every sub-screen, including views", async () => {
   await waitFor(() => expect(router.state.location.pathname).toBe("/cluster"));
 });
 
+it("finds the cluster map by its other names (plan 70)", async () => {
+  const { router } = shell();
+  const { user } = await search("3d", "Infrastructure › Map");
+  await user.click(screen.getByRole("option", { name: "Infrastructure › Map" }));
+  await waitFor(() => expect(router.state.location.pathname).toBe("/cluster/map"));
+});
+
 it("runs create, theme and help commands", async () => {
   const { router } = shell();
   let { user } = await search("create storage", "Create: Storage pool");

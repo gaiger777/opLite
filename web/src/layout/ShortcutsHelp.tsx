@@ -20,7 +20,7 @@ export function ShortcutsHelp({
   onOpenChange(v: boolean): void;
 }) {
   const { t } = useTranslation();
-  const groups = ["general", "navigation", "list"] as const;
+  const groups = ["general", "navigation", "list", "map"] as const;
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-md">

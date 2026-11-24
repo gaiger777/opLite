@@ -34,6 +34,7 @@ import {
   moveReasonText,
   pausedText,
   pct,
+  PLACEMENT_KEY,
   type PlacementForm,
   placementPatch,
   POLICIES,
@@ -42,8 +43,6 @@ import {
 import { patchSettings, settingsError } from "@/settings/save";
 import { trackTask } from "@/tasks/tasks";
 
-/** 상태의 캐시 키. 리더의 메모리라 watch가 없어 이 화면에서 주기적으로 다시 읽는다. */
-const PLACEMENT_KEY = ["placement"] as const;
 const REFRESH_MS = 15_000;
 
 /** 최적 배치: 균형 조정기의 상태, 노드 부하, 추천과 적용, admin의 설정 */

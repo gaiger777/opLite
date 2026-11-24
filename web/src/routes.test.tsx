@@ -1,5 +1,5 @@
 import { QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse, ws } from "msw";
 import { createMemoryRouter, RouterProvider } from "react-router";
@@ -12,6 +12,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { AREAS, LEGACY_REDIRECTS } from "@/layout/nav";
 import { DensityProvider } from "@/lib/density";
 import { ThemeProvider } from "@/lib/theme";
+import { NODE } from "@/test/fixtures";
 import { ADMIN, mockLists } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 
@@ -228,4 +229,32 @@ it("returns to the last tab from the sidebar and moves focus to the new page", a
   );
   await user.click(within(main).getByRole("link", { name: "Infrastructure" }));
   await vi.waitFor(() => expect(where(router)).toBe("/volumes"));
+});
+
+it("opens the cluster map as a lazy view of Infrastructure › Nodes and keeps [ inside the map", async () => {
+  const router = renderApp("/cluster/map");
+  // 노드 하나(레이블 없음) — 그림이 노드 블록을 그린다
+  server.use(http.get(apiUrl("/nodes"), () => HttpResponse.json({ revision: 1, items: [NODE] })));
+  expect(
+    await screen.findByRole("heading", { level: 1, name: "Map" }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  const views = screen.getByRole("navigation", { name: "Nodes views" });
+  expect(
+    within(views)
+      .getAllByRole("link")
+      .map((a) => a.textContent),
+  ).toEqual(["Nodes", "Map", "Cluster"]);
+  expect(within(views).getByRole("link", { name: "Map" })).toHaveAttribute("aria-current", "page");
+  const block = await screen.findByRole("button", { name: /^Node node-a, online/ });
+  // 그림 밖의 `[`는 사이드바를 접는다
+  expect(localStorage.getItem("opl.nav.rail")).toBeNull();
+  fireEvent.keyDown(document.body, { key: "[" });
+  const rail = localStorage.getItem("opl.nav.rail");
+  expect(rail).not.toBeNull();
+  // 그림 안의 `[`·`]`는 그림이 받는다(사이드바 그대로)
+  block.focus();
+  fireEvent.keyDown(block, { key: "]" });
+  fireEvent.keyDown(block, { key: "[" });
+  expect(localStorage.getItem("opl.nav.rail")).toBe(rail);
+  expect(where(router)).toBe("/cluster/map");
 });

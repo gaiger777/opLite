@@ -75,6 +75,7 @@ it.each([
   ["/imports/esxi-1", "vms", "/imports"],
   ["/nodes/node-a", "infra", "/nodes"],
   ["/cluster", "infra", "/nodes"],
+  ["/cluster/map", "infra", "/nodes"],
   ["/security-groups/web", "infra", "/security-groups"],
   ["/remotes/dr", "protect", "/remotes"],
   ["/placement", "protect", "/placement-rules"],
@@ -186,6 +187,7 @@ it.each([
   ["/", [{ label: "Home" }]],
   ["/storage-pools", [{ label: "Infrastructure", to: "/nodes" }, { label: "Storage pools" }]],
   ["/cluster", [{ label: "Infrastructure", to: "/nodes" }, { label: "Cluster" }]],
+  ["/cluster/map", [{ label: "Infrastructure", to: "/nodes" }, { label: "Map" }]],
   [
     "/vms/web%20db/edit",
     [{ label: "Virtual machines", to: "/vms" }, { label: "VMs", to: "/vms" }, { label: "web db" }],
@@ -220,4 +222,16 @@ it("does not restore a remembered view the user can no longer read", () => {
     objects: [],
   });
   expect(lastTab(area("infra"), { user: U1, gate: folderOnly })).toBe("/networks");
+});
+
+it("puts the cluster map between the node table and the cluster view (plan 70)", () => {
+  const nodes = area("infra").tabs.find((tab) => tab.to === "/nodes")!;
+  expect(nodes.kind).toBe("node");
+  expect(nodes.views?.map((v) => v.to)).toEqual(["/nodes", "/cluster/map", "/cluster"]);
+  // `/cluster/map`은 `/cluster`보다 긴 접두사라 지도 보기다
+  expect(areaOf("/cluster/map")?.view?.to).toBe("/cluster/map");
+  expect(areaOf("/cluster")?.view?.to).toBe("/cluster");
+  // 영역은 마지막 보기를 기억한다
+  rememberTab(U1, "/cluster/map", "?focus=node:n3");
+  expect(lastTab(area("infra"), as("admin"))).toBe("/cluster/map?focus=node:n3");
 });

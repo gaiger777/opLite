@@ -1,4 +1,6 @@
 import { ApiError, NetworkError } from "@/api/client";
+import mapEn from "@/clusterMap/i18n/en.json";
+import mapKo from "@/clusterMap/i18n/ko.json";
 import en from "@/i18n/en.json";
 import { errorMessage } from "@/i18n/errors";
 import i18n from "@/i18n";
@@ -13,6 +15,10 @@ function keys(value: unknown, prefix = ""): string[] {
 
 it("has the same keys in every language", () => {
   expect(keys(ko).sort()).toEqual(keys(en).sort());
+  // 늦게 받는 클러스터 지도 문구(`clusterMap/strings.ts`)도
+  expect(keys(mapKo).sort()).toEqual(keys(mapEn).sort());
+  expect(Object.keys(mapEn)).toEqual(["clusterMap"]);
+  expect(Object.keys(en)).not.toContain("clusterMap");
 });
 
 // `common.*`으로 옮긴 키. 같은 뜻의 개별 키를 다시 만들지 않는다.

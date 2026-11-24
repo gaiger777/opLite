@@ -6,7 +6,7 @@
 // 그리지 않는다.
 import { boxesPath, boxFace, type Face, facesPath, type Point, round } from "@/components/iso/iso";
 import type { Lod } from "@/clusterMap/lod";
-import type { BarTone, MapScene, NodeItem, TileCell, TileTone } from "@/clusterMap/layout";
+import type { BarTone, MapScene, NodeItem, NodeTag, TileCell, TileTone } from "@/clusterMap/layout";
 
 export interface PathPiece {
   /** 그림 안에서 하나뿐인 열쇠(React key) */
@@ -221,15 +221,115 @@ export function scenePaths(scene: MapScene, lod: Lod): BandPaths[] {
   return out;
 }
 
-/** 레이어 하나가 노드마다 더하는 원소(§7.3 — 많아야 서넛): 스토리지 받침 3, 네트워크 띠 1, HA 둘레 1 */
-export const LAYER_COST = { storage: 3, network: 1, ha: 1 } as const;
-export type MapLayer = keyof typeof LAYER_COST | "load" | "recommendations";
+/** 켜고 끄는 레이어(§7.3) */
+export type MapLayer = "load" | "storage" | "network" | "ha" | "recommendations";
+export const MAP_LAYERS: readonly MapLayer[] = [
+  "load",
+  "storage",
+  "network",
+  "ha",
+  "recommendations",
+];
+
+/** 노드 꼬리표(알약)의 열쇠: 상태 꼬리표와 레이어가 더하는 게이트웨이·펜스 확인 실패 */
+export type MarkTag = NodeTag | "gateway" | "fence";
 
 /**
- * 그리면 생길 SVG 원소 수(그리기 없이 장면으로 셈 — §9.2 예산). 화면(스테이지 2)이 같은 셈을 따른다: 판 = 면 셋 + 이름 글,
- * 노드 = `<g>` + 요약이면 블록 면 셋, 아니면 윗면 + 옆면 둘을 `IsoGauge`(다각형 둘씩)로 + 꼬리표마다 둘 + (자세히면 윗면 글), 증인 = `<g>` + 기둥
- * 면 셋, 배치 안 됨 = `<g>`, 경로 조각 = 하나, 화살표 = 선 + 글, 자세히 단계의 타일마다 이름 글(+ 규칙 어김 삼각형),
- * 켠 레이어마다 노드당 `LAYER_COST`, 그림 틀(`<svg>`·`<defs>`·`<style>`·무늬) 12.
+ * 노드 하나에 그릴 덧표시(상태 꼬리표·레이어). 그리는 쪽(`MapScene`)과 원소 셈(`elementCount`)이 같은 것을 쓴다. 레이어마다
+ * 노드당 많아야 서넛이다: 스토리지 = 받침(로컬 풀 조각들, 가장 나쁜 색) + 준비 안 됨 빗금 + 공유 풀 경고 눈금, 네트워크 =
+ * 업링크 띠 + "GW" 꼬리표, HA = 펜싱 없음 점선 둘레 + 펜스 확인 실패 꼬리표.
+ */
+export interface NodeMarks {
+  tags: MarkTag[];
+  /** 유지보수 줄무늬 띠(윗면 앞 가장자리) */
+  stripe: boolean;
+  /** 과다 할당 띠(왼쪽 면 위 가장자리) */
+  overcommit: boolean;
+  /** 스토리지: 받침 / 준비 안 된 조각의 빗금 / 공유 풀 경고 눈금 */
+  pedestal: boolean;
+  poolBad: boolean;
+  sharedTick: boolean;
+  /** 네트워크 띠(정보가 없으면 그리지 않음) */
+  uplink: boolean;
+  /** HA: 펜싱 없음 점선 둘레 */
+  ring: boolean;
+}
+
+export function nodeMarks(node: NodeItem, layers: ReadonlySet<MapLayer>): NodeMarks {
+  const l = node.layers;
+  const storage = layers.has("storage") && node.kind === "node" && l !== null;
+  const network = layers.has("network") && l !== null;
+  const ha = layers.has("ha") && node.kind === "node" && l !== null;
+  const tags: MarkTag[] = [...node.tags];
+  if (network && l.gateway) {
+    tags.push("gateway");
+  }
+  if (ha && l.fenceError !== null) {
+    tags.push("fence");
+  }
+  return {
+    tags,
+    stripe: node.tags.includes("maintenance"),
+    overcommit: node.tags.includes("overcommit"),
+    pedestal: storage && l.pools.length > 0,
+    poolBad: storage && l.pools.some((p) => p.tone === "bad"),
+    sharedTick: storage && l.sharedDown.length > 0,
+    uplink: network && node.kind === "node" && l.uplink !== null,
+    ring: ha && l.fencing === false,
+  };
+}
+
+/** 노드 원소 하나가 만드는 SVG 원소 수(`MapScene`의 `NodeShape`와 같은 셈) */
+export function nodeElements(node: NodeItem, lod: Lod, marks: NodeMarks): number {
+  if (node.kind === "unplaced") {
+    return 1;
+  }
+  // <g> + 이름 글 + 꼬리표마다 알약·글
+  let n = 2 + marks.tags.length * 2;
+  if (node.kind === "witness") {
+    // 네모 기둥: 보이는 옆면 둘 + 윗면
+    return n + 3;
+  }
+  // 요약은 블록 면 셋, 타일·자세히는 윗면 + 채움 면 둘(다각형 둘씩)
+  n += lod === "summary" ? 3 : 5;
+  if (lod === "detail") {
+    n += 1; // 부하 글
+  }
+  for (const on of [
+    marks.stripe,
+    marks.overcommit,
+    marks.pedestal,
+    marks.poolBad,
+    marks.sharedTick,
+    marks.uplink,
+    marks.ring,
+  ]) {
+    n += on ? 1 : 0;
+  }
+  return n;
+}
+
+/**
+ * 그림 틀의 원소: `<svg>`, `<style>` 둘(밝히기·움직임), `<defs>`, 무늬 셋(부하 모름 빗금·준비 안 됨 빨간 빗금·유지보수
+ * 줄무늬 — `<pattern>` + 바탕 + 선), 화살표 끝(`<marker>` + 경로), 층 `<g>` 셋(바닥·띠·화살표), 초점 테두리 경로 하나.
+ */
+export const FRAME_ELEMENTS = 1 + 2 + 1 + 3 * 3 + 2 + 3 + 1;
+
+/**
+ * 칸에 글을 적는가: 윗면이 보이는 칸만(위 층이 덮으면 아니다) — 자세히는 모든 칸(이름 앞 8자·"+N"), 타일 단계는 "+N" 칸만.
+ */
+export function cellText(node: NodeItem, cell: TileCell, lod: Lod): boolean {
+  const grid = node.grid;
+  if (lod === "summary" || !grid || coveredTop(grid.cells, cell, grid.perLayer)) {
+    return false;
+  }
+  return lod === "detail" || cell.kind === "more" || cell.kind === "hidden";
+}
+
+/**
+ * 그리면 생길 SVG 원소 수(그리기 없이 장면으로 셈 — §9.2 예산). 화면(`MapScene`)이 이 셈 그대로 그리고, DOM 시험이 그린
+ * 원소 수와 맞춰 본다: 틀 `FRAME_ELEMENTS`, 판마다 면 셋 + 이름 글(스토리지 레이어에 공유 풀이 있으면 띠 + 글), 노드마다
+ * `nodeElements`, 경로 조각마다 하나, 글이 있는 칸마다 하나(자세히 단계의 규칙 어김 삼각형 하나 더), 화살표마다 선 + 글.
  */
 export function elementCount(
   scene: MapScene,
@@ -237,35 +337,22 @@ export function elementCount(
   lod: Lod,
   layers: readonly MapLayer[] = ["load"],
 ): number {
-  let n = 12 + scene.slabs.length * 4;
-  const perLayer = layers.reduce(
-    (sum, l) => sum + (l in LAYER_COST ? LAYER_COST[l as keyof typeof LAYER_COST] : 0),
-    0,
-  );
+  const on = new Set(layers);
+  let n = FRAME_ELEMENTS + scene.slabs.length * 4;
+  if (on.has("storage") && scene.shared.length > 0) {
+    n += scene.slabs.filter((s) => s.kind !== "unplaced").length * 2;
+  }
   for (const node of scene.nodes) {
-    switch (node.kind) {
-      case "unplaced":
-        n += 1;
-        break;
-      case "witness":
-        n += 4 + node.tags.length * 2;
-        break;
-      case "node":
-        n += (lod === "summary" ? 4 : 6) + node.tags.length * 2 + (lod === "detail" ? 1 : 0);
-        n += perLayer;
-        break;
-    }
-    if (lod === "detail") {
-      for (const cell of node.grid?.cells ?? []) {
-        n += 1 + (cell.warn ? 1 : 0);
+    n += nodeElements(node, lod, nodeMarks(node, on));
+    for (const cell of node.grid?.cells ?? []) {
+      if (cellText(node, cell, lod)) {
+        n += 1 + (lod === "detail" && cell.warn ? 1 : 0);
       }
     }
   }
   for (const band of paths) {
     n += band.pieces.length;
   }
-  n +=
-    scene.links.filter((l) => l.kind === "migration" || layers.includes("recommendations")).length *
-    2;
+  n += scene.links.filter((l) => l.kind === "migration" || on.has("recommendations")).length * 2;
   return n;
 }

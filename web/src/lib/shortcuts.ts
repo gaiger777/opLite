@@ -21,13 +21,15 @@ export type ShortcutId =
   | "list.prev"
   | "list.select"
   | "list.peek"
-  | "list.open";
+  | "list.open"
+  | "map.enter"
+  | "map.leave";
 
 export interface Shortcut {
   id: ShortcutId;
   /** 차례로 누를 키(`["g", "v"]`). `mod+k`는 ⌘K(맥)·Ctrl+K다. */
   keys: string[];
-  group: "general" | "navigation" | "list";
+  group: "general" | "navigation" | "list" | "map";
 }
 
 /** 도움말 표의 순서이기도 하다. */
@@ -52,10 +54,13 @@ export const SHORTCUTS: readonly Shortcut[] = [
   { id: "list.select", keys: ["x"], group: "list" },
   { id: "list.peek", keys: ["Space"], group: "list" },
   { id: "list.open", keys: ["Enter"], group: "list" },
+  // 클러스터 지도(계획 70)가 그림에 초점이 있을 때만 받는다(`[`는 그 밖에서 사이드바 접기). 여기서는 도움말에만 보인다.
+  { id: "map.enter", keys: ["]"], group: "map" },
+  { id: "map.leave", keys: ["["], group: "map" },
 ];
 
-/** 머리줄이 받는 단축키(목록 키는 표가 받는다) */
-const GLOBAL = SHORTCUTS.filter((s) => s.group !== "list");
+/** 머리줄이 받는 단축키(목록 키는 표가, 지도 키는 지도가 받는다) */
+const GLOBAL = SHORTCUTS.filter((s) => s.group !== "list" && s.group !== "map");
 
 /** 순서 키의 둘째 키를 기다리는 시간 */
 export const SEQUENCE_MS = 1000;

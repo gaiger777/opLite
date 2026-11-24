@@ -8,6 +8,12 @@ import type {
   PlacementSettings,
 } from "@/api/types";
 
+/**
+ * `GET /placement`의 캐시 키. 리더의 메모리라 watch가 없어 쓰는 화면(최적 배치·클러스터 지도)이 15초마다 다시 읽고 캐시를
+ * 함께 쓴다.
+ */
+export const PLACEMENT_KEY = ["placement"] as const;
+
 /** 서버의 `DEFAULT_PLACEMENT_THRESHOLD`·`MAX_PLACEMENT_THRESHOLD`(정수 백분율) */
 export const DEFAULT_THRESHOLD = 15;
 export const MAX_THRESHOLD = 50;
