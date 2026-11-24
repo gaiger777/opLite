@@ -88,6 +88,7 @@ mod vm_checks;
 mod vm_firmware;
 pub mod vm_imports;
 mod vms;
+pub mod vmware;
 mod volumes;
 mod watch;
 pub mod webauthn;

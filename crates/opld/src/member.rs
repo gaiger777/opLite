@@ -958,6 +958,7 @@ impl Member {
         runner_config.ceph = Some(ceph.clone());
         runner_config.sdn = Some(ovn.clone());
         state.ceph = Some(ceph.clone());
+        state.vmware = config.vmware();
         // 네트워크 주소 목록이 논리 포트 상태를 OvnSync와 같은 TLS로 읽는다(계획 65).
         state.ovn = Some(ovn_sync_config.clone());
         state.ceph_status_ttl = config.ceph.status_cache();

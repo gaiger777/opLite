@@ -34,6 +34,8 @@ jobs:
       # 지표 기록·경보 시험 고리(`[test] metrics_flush_secs`·`alert_tick_ms`)로 재시작 뒤 기록, Prometheus 긁기(엄격한
       # 파서), webhook으로 경보 발생·해제(계획 60, QEMU 없음)
       - run: cargo test -p opld --features metrics-it --test metrics_history --test alerts
+      # 가짜 vSphere(계획 72, 같은 프로세스 — 시스템 도구 없음): 세션·인벤토리·CBT 회차와 게스트 쓰기·티켓 범위 읽기·결함
+      - run: cargo test -p opl-api --features fake-vsphere --test vsphere
       # 노드 100개(투표 5, 대기 learner 2, 나머지 관찰 노드)를 한 프로세스에 띄워 리더 RPC(확인 묶기 비율 포함)·쓰기
       # p99·관찰 노드 뒤처짐·노드 추가·투표 멤버와 리더 장애를 잰다(설계 §5·§6·§14·§15, 개발 Mac에서 16초쯤)
       - name: Scale test (100 nodes in one process)
@@ -736,6 +738,53 @@ jobs:
       - name: slapd log
         if: failure()
         run: sudo journalctl -u slapd --no-pager -n 200
+
+  # VMware 이전(계획 72 §14): govmomi vcsim을 상대로 우리 손 SOAP 클라이언트의 꼴(로그인·결함·인벤토리 쪽 나눔·CBT 켜기·
+  # 스냅샷·전원·티켓·/folder 범위 읽기)과 가짜 vSphere가 같은 꼴을 내는지 본다. vcsim·govc는 govmomi 릴리스 실행 파일을
+  # 판을 박아 받고 SHA-256을 확인한다(컨테이너 없이). nbdkit(우분투 꾸러미)의 file 플러그인을 vddk 자리에 두고
+  # VDDK 읽기 배선도 본다. vcsim의 QueryChangedDiskAreas는 MethodNotFound다 — CBT 의미는 가짜 vSphere 시험이 맡는다.
+  vmware-sim:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GOVMOMI_VERSION: v0.56.2
+      VCSIM_SHA256: 4c79fd49d94ffdb7a9095350ff71f38e77e90036bd0bc26b50362219ac88fd13
+      GOVC_SHA256: 12889f30e42e868487041f6628e9789606c80e13a194fb37c099abffc92d5a59
+      OPL_TEST_VCSIM: "127.0.0.1:8989"
+      OPL_TEST_VCSIM_USER: user
+      OPL_TEST_VCSIM_PASSWORD: pass
+      OPL_TEST_NBDKIT: /usr/sbin/nbdkit
+      GOVC_URL: "https://user:pass@127.0.0.1:8989/sdk"
+      GOVC_INSECURE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: OpenSSL headers (native-tls) and nbdkit
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config nbdkit
+          nbdkit --version
+      - name: govmomi vcsim and govc (pinned release, SHA-256 checked)
+        run: |
+          mkdir -p "$RUNNER_TEMP/govmomi" && cd "$RUNNER_TEMP/govmomi"
+          base="https://github.com/vmware/govmomi/releases/download/$GOVMOMI_VERSION"
+          curl -fsSL -o vcsim.tar.gz "$base/vcsim_Linux_x86_64.tar.gz"
+          curl -fsSL -o govc.tar.gz "$base/govc_Linux_x86_64.tar.gz"
+          echo "$VCSIM_SHA256  vcsim.tar.gz" | sha256sum -c -
+          echo "$GOVC_SHA256  govc.tar.gz" | sha256sum -c -
+          tar xzf vcsim.tar.gz vcsim && tar xzf govc.tar.gz govc
+          echo "$RUNNER_TEMP/govmomi" >> "$GITHUB_PATH"
+      - name: Start vcsim
+        run: |
+          nohup vcsim -l 127.0.0.1:8989 -username user -password pass > "$RUNNER_TEMP/vcsim.log" 2>&1 &
+          for _ in $(seq 1 60); do govc about > /dev/null 2>&1 && break; sleep 1; done
+          govc about
+          govc find / -type m
+      - run: cargo test -p opl-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
+      - name: vcsim log
+        if: failure()
+        run: tail -n 200 "$RUNNER_TEMP/vcsim.log"
 
   deny:
     runs-on: ubuntu-24.04

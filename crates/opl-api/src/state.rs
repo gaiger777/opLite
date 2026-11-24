@@ -95,6 +95,8 @@ pub struct AppState {
     pub(crate) prometheus_cache: crate::prometheus::PrometheusCache,
     /// 이 노드의 파일 복원 세션(계획 69 — 세션 Task·API·노드 사이 RPC가 함께 쓴다). 기본은 세션을 돌리지 않는 노드다.
     pub file_restore: Arc<crate::file_restore::FileRestoreSessions>,
+    /// 노드 설정 `[vmware]`(계획 72 — 선택 VDDK 길의 nbdkit·라이브러리 자리)
+    pub vmware: crate::vmware::VmwareNodeConfig,
 }
 
 impl AppState {
@@ -140,6 +142,7 @@ impl AppState {
             digest_cache: Default::default(),
             prometheus_cache: Default::default(),
             file_restore: Arc::default(),
+            vmware: Default::default(),
         }
     }
 }

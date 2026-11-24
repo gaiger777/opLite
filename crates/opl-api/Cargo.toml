@@ -13,6 +13,24 @@ storage-it = []
 # 실제 OpenLDAP(slapd)로 LDAP 영역을 확인하는 테스트. 디렉터리는 .github/scripts/ldap-setup.sh가 만들고
 # OPL_TEST_LDAP_* 환경 변수로 알린다.
 ldap-it = []
+# 시험·데모용 가짜 vSphere(vCenter·ESXi SOAP·데이터스토어 `/folder`·호스트 티켓, 계획 72). opl-api·opld 시험과 실행 파일
+# `fake-vsphere`가 켠다. 배포 빌드에는 없다.
+fake-vsphere = ["dep:rcgen"]
+# govmomi vcsim(GitHub `vmware-sim` 작업)을 상대로 SOAP 꼴을 보는 시험. vcsim 주소는 OPL_TEST_VCSIM_URL로 알린다.
+vcsim-it = ["fake-vsphere"]
+
+[[bin]]
+name = "fake-vsphere"
+path = "src/bin/fake-vsphere.rs"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vsphere"
+required-features = ["fake-vsphere"]
+
+[[test]]
+name = "vcsim"
+required-features = ["vcsim-it"]
 
 [dependencies]
 argon2.workspace = true
@@ -52,6 +70,8 @@ ring.workspace = true
 roxmltree.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
+# 가짜 vSphere의 자체 서명 인증서(기능 fake-vsphere)
+rcgen = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha1.workspace = true

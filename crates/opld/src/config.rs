@@ -109,6 +109,8 @@ pub struct Config {
     pub metrics: MetricsSection,
     #[serde(default)]
     pub file_restore: FileRestoreSection,
+    #[serde(default)]
+    pub vmware: VmwareSection,
     /// 시험 빌드(`starve-it`·`ha-it`·`migration-it`·`qemu-it`·`metrics-it`)에만 있다. 배포 빌드는 `[test]`를 모르는
     /// 키로 거부한다.
     #[cfg(any(
@@ -1051,6 +1053,30 @@ impl FileRestoreSection {
     }
 }
 
+/// VMware 이전(계획 72 §7.4). 선택 VDDK 길: 운영자가 nbdkit(`vddk` 플러그인)과 VMware VDDK 라이브러리를 깔고 적는다.
+/// 둘 다 없으면 데이터스토어 `/folder` 범위 읽기만 쓴다(vSAN·vVols 디스크는 읽을 수 없다).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmwareSection {
+    /// nbdkit 실행 파일(예: `/usr/sbin/nbdkit`)
+    #[serde(default)]
+    pub nbdkit: Option<PathBuf>,
+    /// VDDK 라이브러리 디렉터리(예: `/opt/vmware-vix-disklib-distrib`). 원본의 `transport.vddk.libdir`가 먼저다.
+    #[serde(default)]
+    pub vddk_libdir: Option<PathBuf>,
+}
+
+impl VmwareSection {
+    fn validate(&self) -> anyhow::Result<()> {
+        for (key, path) in [("nbdkit", &self.nbdkit), ("vddk_libdir", &self.vddk_libdir)] {
+            if path.as_ref().is_some_and(|p| !p.is_absolute()) {
+                anyhow::bail!("vmware.{key} must be an absolute path");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// 지표 기록(계획 60 §6). 위트니스는 쓰지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1580,6 +1606,14 @@ impl Config {
         )
     }
 
+    /// VMware 이전의 노드 설정(계획 72 `[vmware]`)
+    pub fn vmware(&self) -> opl_api::vmware::VmwareNodeConfig {
+        opl_api::vmware::VmwareNodeConfig {
+            nbdkit: self.vmware.nbdkit.clone(),
+            vddk_libdir: self.vmware.vddk_libdir.clone(),
+        }
+    }
+
     /// `qemu-nbd`(계획 68 — 꺼진 VM·옛 백업을 저장소로 읽기): `qemu_img`과 같은 디렉터리의 것, 경로 없는 이름이면 PATH
     pub fn qemu_nbd(&self) -> PathBuf {
         match self.qemu_img.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -1834,6 +1868,7 @@ impl Config {
         }
         self.validate_vip(linux)?;
         self.file_restore.validate()?;
+        self.vmware.validate()?;
         if self.node.zone.as_ref().is_some_and(|z| z.trim().is_empty()) {
             anyhow::bail!("node.zone must not be empty");
         }
@@ -3503,6 +3538,28 @@ mod tests {
         assert!(
             toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[file_restore]\nnope = 1")
                 .is_err()
+        );
+    }
+
+    /// 계획 72 `[vmware]`: 기본은 비어 있고(VDDK 길 없음), 절대 경로만 받는다.
+    #[test]
+    fn vmware_section() {
+        let c = parse("name = \"n\"\naddress = \"h\"");
+        assert_eq!(c.vmware(), opl_api::vmware::VmwareNodeConfig::default());
+        let c = parse(
+            "name = \"n\"\naddress = \"h\"\n[vmware]\nnbdkit = \"/usr/sbin/nbdkit\"\nvddk_libdir = \"/opt/vddk\"",
+        );
+        assert!(c.validate().is_ok());
+        assert_eq!(c.vmware().nbdkit, Some(PathBuf::from("/usr/sbin/nbdkit")));
+        assert_eq!(
+            c.vmware().libdir_for(None),
+            Some(PathBuf::from("/opt/vddk"))
+        );
+        let c = parse("name = \"n\"\naddress = \"h\"\n[vmware]\nnbdkit = \"nbdkit\"");
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.starts_with("vmware.nbdkit"), "{err}");
+        assert!(
+            toml::from_str::<Config>("name = \"n\"\naddress = \"h\"\n[vmware]\nnope = 1").is_err()
         );
     }
 }

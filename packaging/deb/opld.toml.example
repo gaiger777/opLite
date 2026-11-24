@@ -41,3 +41,6 @@ address = "10.0.0.11"
 # guest_max_bytes = 4294967296  # 게스트로 되돌려 쓰기 한 번의 바이트 상한
 # guest_max_files = 10000   # 게스트로 되돌려 쓰기 한 번의 파일 수 상한
 # download_max_entries = 1000000  # 내려받기·되돌려 쓰기 한 번의 항목 수 상한(건너뛴 항목도 셈)
+# [vmware]                   # VMware 이전의 선택 VDDK 길(vSAN·vVols 디스크 — 운영자가 nbdkit vddk 플러그인과 VDDK를 깜)
+# nbdkit = "/usr/sbin/nbdkit"
+# vddk_libdir = "/opt/vmware-vix-disklib-distrib"  # 원본의 transport.vddk.libdir가 먼저

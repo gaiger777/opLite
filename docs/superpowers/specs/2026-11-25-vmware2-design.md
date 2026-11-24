@@ -388,3 +388,61 @@ OVF 1.0 봉투(ovftool·vSphere·VirtualBox가 모두 받는 판, `vmw` 확장):
   전까지 400으로 막지 않았다(이름뿐인 권한이라 줄 곳이 없어도 해가 없고 스테이지 6이 풀 일이 없다).
 - **watch**: `vmware-source`만 더했다(루트, 이벤트에서 `password`를 뺌). 계획·항목·내보내기는 폴더·VM 권한 거르기가 들어
   스테이지 3·6이 더한다. 새 종류를 만드는 API는 아직 없으므로 막을 경로가 없다.
+
+### 스테이지 2
+
+- **vcsim 판과 받는 길**: govmomi `v0.56.2`(2026-10-26 릴리스)의 `vcsim`·`govc` 실행 파일(Linux x86_64)을 판과 SHA-256을
+  박아 받는다 — §14의 "컨테이너" 대신(컨테이너 내려받기 한도·이미지 태그 바뀜을 피하고, 같은 실행 파일을 개발 Mac에서도
+  띄워 꼴을 맞춰 볼 수 있다). GitHub `vmware-sim` 작업이 `vcsim -l 127.0.0.1:8989 -username user -password pass`를 띄우고
+  `cargo test -p opl-api --features vcsim-it --test vcsim`을 돈다. 스테이지 6은 같은 작업에 `govc import.ova` 단계를 더한다
+  (`govc`가 PATH에, `GOVC_URL`·`GOVC_INSECURE`가 작업 환경에 있다).
+- **vcsim이 하는 것·안 하는 것(v0.56.2로 확인)**: 로그인(`InvalidLogin` 결함)·세션 쿠키·`NotAuthenticated`(faultstring이 빈
+  값 — 형식 이름을 메시지로 쓴다), `CreateContainerView`+`RetrievePropertiesEx`(`maxObjects` 쪽 나눔·토큰·
+  `ContinueRetrievePropertiesEx`, 하위 형식 맞춤 — `ComputeResource`가 클러스터를, `Network`가 분산 포트 그룹을 덮는다),
+  `ReconfigVM_Task`(`changeTrackingEnabled`·`annotation`·NIC `connectable.startConnected` 편집 반영), 스냅샷 만들기·지우기,
+  `PowerOn/OffVM_Task`(두 번 끄기는 Task 결함 `InvalidPowerState`), `ShutdownGuest`(받음), `AcquireGenericServiceTicket`
+  (`hostName`은 vcsim 자신 `127.0.0.1:8989`, 티켓 검사 없음), `/folder` GET `Range`(206·`Content-Range`, 인증 없이도 200)와
+  PUT. **하지 않는 것**: `QueryChangedDiskAreas`는 `MethodNotFound` 결함(우리는 `VsphereError::NotSupported`), 스냅샷 디스크
+  backing에 `changeId`가 없고 델타 파일·`parent` 체인도 없다(스냅샷 뒤에도 `fileName`이 기반), 기반 flat 파일은 0바이트(시험이
+  PUT으로 채운다), 분산 포트 그룹의 `config.uplink`를 주지 않는다(업링크 포트 그룹이 네트워크 목록에 남는다 — 실제 vCenter는
+  `uplink = true`로 뺀다), 스냅샷 `state`를 늘 `poweredOff`로 적는다. 설정 안 된 속성(`changeTrackingEnabled`·`snapshot`·
+  `annotation`)은 `propSet`에서 아예 빠진다 — 우리 읽개는 빠진 값을 기본값으로 본다. 호스트 `config.certificate`는
+  `ArrayOfByte`(`<byte>` 요소, 부호 있는 10진)인 PEM이고 vcsim 서버 인증서와 같다. **`xsi:type` 접두어**가 govmomi는
+  `_XMLSchema-instance:type`이다 — 읽개는 접두어가 아니라 네임스페이스 URI로 찾는다(실제 vCenter는 `xsi:`).
+- **가짜와 vcsim이 같은 꼴인지**: `tests/vcsim.rs`가 같은 VM 속성 요청에 대해 값의 `xsi:type`이 같은지, 디스크·NIC 장치의
+  요소 나무(이름·`xsi:type`)에서 가짜 것이 vcsim 것의 부분 집합인지 본다(가짜만 주는 것은 CBT `changeId`·`parent` 체인뿐).
+  견본 XML(`tests/fixtures/vsphere/`)은 vcsim 응답을 그대로 잡은 것(`retrieve-service-content`·`inventory-page1/2`)과 실제
+  vCenter·ESXi 꼴을 손으로 줄인 것(`vcenter-vm` — 스냅샷 둘·디스크 셋·hddOrder·NSX NIC, `esxi-service-content`,
+  `query-changed-disk-areas`)이다.
+- **오류 갈래 더함**: `VsphereError`에 `NotSupported`(`MethodNotFound`·`NotSupported`), `Untrusted{sha256, sha1}`(VDDK
+  썸프린트도 함께 — 409 `untrusted_certificate`의 `details.thumbprint_sha1`), `Invalid`(응답 꼴 틀림), `Timeout`(vSphere Task
+  한도)을 더했다. API 코드: 무료 ESXi 400 `vmware_restricted`, 그 밖의 결함 400 `vmware_error`, `Invalid`·`Timeout`·HTTP
+  오류 502 `vmware_unreachable`(§7.1의 나머지는 설계대로). 상태·파일 결함은 흔한 하위 형식 표로 나눈다(`ToolsUnavailable`·
+  `TaskInProgress` → `InvalidState`, `GenericVmConfigFault`·`CannotAccessFile` → `FileFault`).
+- **SOAPAction**: 첫 `RetrieveServiceContent`는 판 없는 `urn:vim25`로, 그다음은 서버가 알린 `about.apiVersion`
+  (`urn:vim25/8.0.2.0`)으로 보낸다(서버가 모르는 판을 보내지 않게).
+- **세션**: `Session`을 `Arc`로 여러 읽개가 나눠 쓴다. `Drop`이 `Logout`을 띄워 보낸다. §7.1의 "노드마다 원본별 세션
+  캐시(5분)"는 API 쪽 소유라 스테이지 3으로 미뤘다. vSphere Task 기다리기 간격은 `Session::with_poll`(기본 1초 → 5초).
+- **연결 재사용**: `HttpClient`가 다 읽은 연결을 쉬는 줄(4개, 30초)에 두고 다시 쓴다. 다시 쓴 연결이 보내기 전에 닫혔으면 새
+  연결로 한 번 더 보낸다(보낸 요청은 다시 보내지 않는다 — SOAP 쓰기는 되풀이하면 안 된다). 계획 30 `esxi.rs`는 지문 고정 TLS만
+  `vmware/http.rs`를 부르고 요청마다 새 연결 그대로다(시험 그대로 통과).
+- **호스트로 바로 읽기**: `HostRoute{name, fingerprint}`의 이름은 `호스트[:포트]`(가짜는 호스트를 `127.0.0.1:포트`로 알린다).
+  티켓 URL은 `https://{호스트 이름}/folder/…`, 범위마다 새 티켓. 호스트가 티켓을 거절(401·403)하거나, 연결이 세 번 실패하거나,
+  호스트 인증서가 vCenter가 알려 준 것과 다르면 그 읽개는 vCenter `/folder`(세션 쿠키)로 내려가 경고를 남긴다. 세션 쿠키 읽기가
+  401이면 한 번 다시 로그인한다. 끊긴 범위 읽기(짧은 본문·연결 끊김)는 세 번까지 다시 한다.
+- **`dcPath`**: 인벤토리의 `datacenter` 칸은 데이터센터 **경로**(폴더 안이면 `Europe/DC2`)다 — `/folder`의 `dcPath`가 받는 값.
+- **VDDK 읽개**: `VddkReader` 대신 `NbdkitReader` 하나(`open_vddk(VddkParams)`·아무 플러그인이나 `spawn`) — CI가 `file`
+  플러그인으로 같은 배선을 본다. 소켓은 `{run_dir}/vddk-{무작위}/nbd.sock`(디렉터리 0700), 비밀번호는 `password=-`로 표준
+  입력 첫 줄, Linux는 `--exit-with-parent`, 버리면 nbdkit을 끝내고 디렉터리를 지운다. 노드 설정 `[vmware] nbdkit`·
+  `vddk_libdir`(절대 경로)는 `AppState.vmware`(`VmwareNodeConfig`)로 간다 — Task 실행기 설정으로 옮기는 것은 `tasks.rs`를
+  고치는 스테이지 4.
+- **가짜 vSphere**: `vmware/fake.rs`(기능 `fake-vsphere`, 실행 파일 `fake-vsphere` — 연결 정보 JSON 한 줄을 찍는다). vCenter
+  모드는 호스트마다 인증서가 다른 TLS 서버를 띄운다. 디스크는 64 KiB 블록 층(기반 + 스냅샷마다 델타), 스냅샷 지우기는 그 위
+  델타를 아래 층으로 합친다. CBT는 켠 뒤 다음 stun부터 돌고 스냅샷마다 `changeId = "52 …-…/{n}"`, `QueryChangedDiskAreas`는
+  구간 `[changeId의 n, 스냅샷의 n)`의 블록(또는 `"*"`면 스냅샷 시점에 할당된 블록)을 창 단위로 준다. 처음 디스크는 블록 셋 중
+  둘만 채운다(씬 디스크의 빈 곳). 꺼진 VM에 쓰면(스냅샷 없이 기반) flat 파일의 수정 시각이 바뀐다(`SearchDatastore_Task`).
+- **시험 단계**: `tests/vsphere.rs`는 기능이 있어야 빌드되므로(`required-features`) CI `check`에 `cargo test -p opl-api
+  --features fake-vsphere --test vsphere` 단계를 더했다(시스템 도구 없음). 따뜻한 이전 회차 시험(전체 복사 → 델타 둘 → 끄고
+  마지막 델타, 사이마다 게스트 쓰기)이 클라이언트만으로 대상 바이트 = 원본 최종 바이트, 델타 회차가 바뀐 블록만 티켓으로
+  호스트에서 읽음을 본다 — 스테이지 4 회차 알고리즘의 본보기다.
+- **잰 것**: 가짜 vSphere VM 2 000대 인벤토리(객체 2 035개, 쪽 다섯) — 개발 Mac(디버그 빌드) 1.1초. 실제 vCenter 수치는 손 확인.

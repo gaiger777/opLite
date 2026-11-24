@@ -1,33 +1,25 @@
 //! ESXi·vCenter 데이터스토어 HTTPS 클라이언트(`/folder`). 서버 인증서는 CA로 검증하지 않고 TLS
 //! 핸드셰이크 안에서 SHA-256 지문을 고정해 비교한다. 지문이 다르면 자격 증명을 보내기 전에 끊는다.
-//! 요청마다 새 연결을 연다(HTTP/1.1, 기본 인증).
+//! 요청마다 새 연결을 연다(HTTP/1.1, 기본 인증). 지문 고정 TLS는 [`crate::vmware::http`]에 있다(계획 72).
 
 use std::collections::HashSet;
 use std::io;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
-use http_body_util::{BodyExt, Empty};
+use http_body_util::Empty;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use opl_types::vm_import::{EsxiConnection, normalize_fingerprint};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::WebPkiSupportedAlgorithms;
-use rustls::{DigitallySignedStruct, SignatureScheme};
-use rustls_pki_types::{CertificateDer, ServerName, UnixTime};
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::client::TlsStream;
 
-/// TCP 연결과 TLS 핸드셰이크의 시간 제한
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-/// 응답 헤더나 본문 조각을 기다리는 최대 시간. 멈춘 서버가 요청을 붙잡고 있지 못하게 한다.
-const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+use crate::vmware::http::{
+    HttpError, IDLE_TIMEOUT, connect as tls_connect, host_header, next_data as http_next_data,
+    percent_encode,
+};
+pub use crate::vmware::http::{basic_auth, fingerprint_of};
+
 /// 디렉터리 목록(HTML) 응답의 최대 크기
 const MAX_LISTING_BYTES: usize = 1 << 20;
 /// HTML 문자 참조 `&…;`의 `&`와 `;` 사이 최대 길이(`#x10FFFF`도 들어간다)
@@ -93,23 +85,32 @@ pub struct Entry {
     pub is_dir: bool,
 }
 
-/// 인증서 DER의 SHA-256 지문(대문자 콜론 구분, ESXi 화면과 같은 모양)
-pub fn fingerprint_of(der: &[u8]) -> String {
-    let hex = hex::encode_upper(Sha256::digest(der));
-    hex.as_bytes()
-        .chunks(2)
-        .map(|pair| std::str::from_utf8(pair).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 /// 서버 인증서의 지문만 읽고 끊는다(자격 증명은 보내지 않는다).
 pub async fn probe(host: &str, port: u16) -> Result<String, EsxiError> {
-    match connect(host, port, None).await {
-        Err(EsxiError::Untrusted(actual)) => Ok(actual),
-        Err(e) => Err(e),
-        Ok(_) => Err(connect_error("the TLS handshake did not stop")),
+    crate::vmware::http::probe(host, port)
+        .await
+        .map(|cert| cert.sha256)
+        .map_err(tls_error)
+}
+
+/// 지문 고정 TLS 오류를 ESXi 오류로(계획 30과 같은 뜻)
+fn tls_error(e: HttpError) -> EsxiError {
+    match e {
+        HttpError::Untrusted { sha256, .. } => EsxiError::Untrusted(sha256),
+        HttpError::Fingerprint { expected, actual } => EsxiError::Fingerprint { expected, actual },
+        HttpError::Connect(m) => EsxiError::Connect(m),
+        HttpError::TooLarge(limit) => {
+            EsxiError::Invalid(format!("response larger than {limit} bytes"))
+        }
     }
+}
+
+async fn connect(
+    host: &str,
+    port: u16,
+    expected: Option<String>,
+) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, EsxiError> {
+    tls_connect(host, port, expected).await.map_err(tls_error)
 }
 
 /// 디렉터리 목록. `datastore`가 없으면 데이터센터의 데이터스토어 목록(`dir`은 무시), 있으면 그
@@ -224,40 +225,6 @@ fn folder_url(datacenter: &str, datastore: Option<&str>, path: &str) -> String {
     url
 }
 
-/// RFC 3986 unreserved 밖의 바이트를 `%XX`로. `keep_slash`면 `/`는 그대로 둔다.
-fn percent_encode(text: &str, keep_slash: bool) -> String {
-    let mut out = String::new();
-    for b in text.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) || (keep_slash && b == b'/') {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
-/// `Authorization: Basic …` 값
-pub fn basic_auth(user: &str, password: &str) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let input = format!("{user}:{password}");
-    let mut out = String::from("Basic ");
-    for chunk in input.as_bytes().chunks(3) {
-        let n = chunk
-            .iter()
-            .enumerate()
-            .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(TABLE[(n >> (18 - 6 * i) & 63) as usize] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 /// GET 하나. 200이 아니면 오류다.
 async fn get(
     conn: &EsxiConnection,
@@ -295,19 +262,7 @@ async fn get(
 
 /// 본문의 다음 데이터 조각(끝이면 None)
 async fn next_data(body: &mut Incoming) -> Result<Option<Bytes>, EsxiError> {
-    loop {
-        let frame = tokio::time::timeout(IDLE_TIMEOUT, body.frame())
-            .await
-            .map_err(|_| connect_error("timed out reading the response"))?;
-        match frame {
-            None => return Ok(None),
-            Some(frame) => {
-                if let Ok(data) = frame.map_err(connect_error)?.into_data() {
-                    return Ok(Some(data));
-                }
-            }
-        }
-    }
+    http_next_data(body).await.map_err(tls_error)
 }
 
 async fn read_limited(mut body: Incoming, limit: usize, what: &str) -> Result<Vec<u8>, EsxiError> {
@@ -322,124 +277,6 @@ async fn read_limited(mut body: Incoming, limit: usize, what: &str) -> Result<Ve
         out.extend_from_slice(&data);
     }
     Ok(out)
-}
-
-/// 연결할 호스트: IPv6 주소를 `[::1]`처럼 괄호로 적었으면 괄호를 뗀다.
-fn bare_host(host: &str) -> &str {
-    host.strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host)
-}
-
-/// Host 헤더 값(IPv6 주소는 괄호로 감싼다)
-fn host_header(host: &str, port: u16) -> String {
-    let host = bare_host(host);
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-/// TCP와 TLS를 연다. `expected`가 없거나 서버 지문과 다르면 핸드셰이크 안에서 끊는다.
-async fn connect(
-    host: &str,
-    port: u16,
-    expected: Option<String>,
-) -> Result<TlsStream<TcpStream>, EsxiError> {
-    let host = bare_host(host);
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let verifier = Arc::new(PinnedCert {
-        expected: expected.clone(),
-        seen: Mutex::new(None),
-        algorithms: provider.signature_verification_algorithms,
-    });
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(connect_error)?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier.clone())
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    // IP 주소면 SNI를 보내지 않는다(rustls가 알아서 뺀다).
-    let name = ServerName::try_from(host.to_owned())
-        .map_err(|_| connect_error(format!("invalid host name {host}")))?;
-    let connector = TlsConnector::from(Arc::new(config));
-    let result = tokio::time::timeout(CONNECT_TIMEOUT, async {
-        let tcp = TcpStream::connect((host, port)).await?;
-        connector.connect(name, tcp).await
-    })
-    .await;
-    match result {
-        Err(_) => Err(connect_error("timed out")),
-        Ok(Ok(tls)) => Ok(tls),
-        Ok(Err(e)) => {
-            let seen = verifier
-                .seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take();
-            Err(match (expected, seen) {
-                (None, Some(actual)) => EsxiError::Untrusted(actual),
-                (Some(expected), Some(actual)) if expected != actual => {
-                    EsxiError::Fingerprint { expected, actual }
-                }
-                _ => connect_error(e),
-            })
-        }
-    }
-}
-
-/// 서버 끝 인증서의 지문을 고정해 비교한다. 본 지문은 `seen`에 남겨 오류에 쓴다.
-#[derive(Debug)]
-struct PinnedCert {
-    expected: Option<String>,
-    seen: Mutex<Option<String>>,
-    algorithms: WebPkiSupportedAlgorithms,
-}
-
-impl ServerCertVerifier for PinnedCert {
-    fn verify_server_cert(
-        &self,
-        end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let actual = fingerprint_of(end_entity);
-        let trusted = self.expected.as_deref() == Some(actual.as_str());
-        *self.seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(actual);
-        if trusted {
-            Ok(ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::General(
-                "the certificate fingerprint is not trusted".into(),
-            ))
-        }
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algorithms)
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.algorithms.supported_schemes()
-    }
 }
 
 /// `/folder` HTML 목록을 읽는다. `<a href="…">`의 href만 본다(링크 글자는 잘리거나 바뀔 수 있다).
@@ -613,17 +450,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn basic_auth_is_base64_of_user_and_password() {
-        // RFC 7617의 예
-        assert_eq!(
-            basic_auth("Aladdin", "open sesame"),
-            "Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
-        );
-        assert_eq!(basic_auth("root", "p"), "Basic cm9vdDpw");
-        assert_eq!(basic_auth("ro", "x"), "Basic cm86eA==");
-    }
-
-    #[test]
     fn folder_urls_encode_paths_and_names() {
         assert_eq!(
             folder_url("ha-datacenter", None, ""),
@@ -651,18 +477,6 @@ mod tests {
             percent_decode("ha%2ddatacenter%20x%zz%E2%82%AC"),
             "ha-datacenter x%zz€"
         );
-    }
-
-    #[test]
-    fn bracketed_ipv6_hosts_connect_without_brackets() {
-        assert_eq!(bare_host("[::1]"), "::1");
-        assert_eq!(bare_host("::1"), "::1");
-        assert_eq!(bare_host("esxi1.lab"), "esxi1.lab");
-        assert_eq!(bare_host("10.0.0.5"), "10.0.0.5");
-        // Host 헤더는 IPv6면 괄호로 감싼다(한 번만).
-        assert_eq!(host_header("[::1]", 443), "[::1]:443");
-        assert_eq!(host_header("fe80::1", 8443), "[fe80::1]:8443");
-        assert_eq!(host_header("esxi1.lab", 443), "esxi1.lab:443");
     }
 
     #[test]
