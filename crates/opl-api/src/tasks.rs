@@ -87,6 +87,13 @@ pub(crate) async fn create_task(
     if op.needs_file_restore() {
         crate::cluster::require_feature(cluster, opl_types::node::FILE_RESTORE)?;
     }
+    // VMware 이전·VM 내보내기 Task도 옛 노드가 풀지 못한다(계획 72).
+    if op.needs_vmware_migrate() {
+        crate::cluster::require_feature(cluster, opl_types::node::VMWARE_MIGRATE)?;
+    }
+    if op.needs_vm_export() {
+        crate::cluster::require_feature(cluster, opl_types::node::VM_EXPORT)?;
+    }
     let mut task: Task = Resource::new("", TaskSpec { op, target, node });
     task.name = task.id.to_string();
     // 요청한 사용자(리뷰 2 N7). 레이블이라 옛 노드도 그대로 읽는다(`TaskSpec`은 모르는 칸을 거절한다).
@@ -1225,6 +1232,16 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
             };
             return Box::pin(file_restore::to_guest(ctx, task, req)).await;
         }
+        // VMware 이전 Task(계획 72)는 스테이지 4·5가, 내보내기 Task는 스테이지 6이 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::VmwareSync { .. }
+        | TaskOp::VmwareCutover
+        | TaskOp::VmwareRevert
+        | TaskOp::VmwareCleanup { .. } => {
+            Err("VMware migration tasks are not available yet".into())
+        }
+        TaskOp::VmExport { .. } | TaskOp::VmExportDelete => {
+            Err("VM export tasks are not available yet".into())
+        }
     };
     done.map(|()| None)
 }
@@ -1856,4 +1873,98 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
         }
     }
     unmounted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opl_types::node::{FEATURES, Node, NodeSpec, NodeStatus};
+
+    /// 노드 하나짜리 클러스터
+    async fn one_node_cluster(dir: &std::path::Path) -> Cluster {
+        use opl_cluster::ClusterConfig;
+        use opl_cluster::memnet::MemRouter;
+        use opl_cluster::types::{NodeId, OrbNode};
+
+        let router = MemRouter::default();
+        let id = NodeId(Uuid::now_v7());
+        let cluster = Cluster::open(ClusterConfig::new(id, dir), router.network(id))
+            .await
+            .unwrap();
+        router.register(id, &cluster);
+        cluster
+            .initialize(std::collections::BTreeMap::from([(
+                id,
+                OrbNode::single(id.to_string()),
+            )]))
+            .await
+            .unwrap();
+        cluster
+            .raft()
+            .unwrap()
+            .wait(Some(Duration::from_secs(10)))
+            .metrics(|m| m.state == openraft::ServerState::Leader, "leader")
+            .await
+            .unwrap();
+        cluster
+    }
+
+    /// 계획 72: VMware 이전·내보내기 Task는 모든 노드가 그 기능을 알 때만 만든다(409 `cluster_upgrading`).
+    #[tokio::test]
+    async fn vmware_and_export_tasks_need_every_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cluster = one_node_cluster(dir.path()).await;
+        let mut node: Node = Resource::new(
+            "n1",
+            serde_json::from_value(serde_json::json!({ "address": "10.0.0.1:8007" })).unwrap(),
+        );
+        node.status = NodeStatus {
+            features: FEATURES
+                .iter()
+                .filter(|f| {
+                    !matches!(
+                        **f,
+                        opl_types::node::VMWARE_MIGRATE | opl_types::node::VM_EXPORT
+                    )
+                })
+                .map(|f| f.to_string())
+                .collect(),
+            ..NodeStatus::default()
+        };
+        cluster.create(&node).await.unwrap();
+        let ops = [
+            TaskOp::VmwareSync { full: false },
+            TaskOp::VmwareCutover,
+            TaskOp::VmwareRevert,
+            TaskOp::VmwareCleanup {
+                delete_target: true,
+            },
+            TaskOp::VmExport {
+                export: Uuid::now_v7(),
+            },
+            TaskOp::VmExportDelete,
+        ];
+        for op in ops.clone() {
+            let err = create_task(&cluster, op.clone(), Uuid::now_v7(), node.id)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, "cluster_upgrading", "{op:?}");
+        }
+        // 옛 Task는 그대로 만든다.
+        create_task(&cluster, TaskOp::VmStart, Uuid::now_v7(), node.id)
+            .await
+            .unwrap();
+        let mut status = cluster.get::<NodeSpec>(node.id).unwrap().unwrap().status;
+        status.features = FEATURES.iter().map(|f| f.to_string()).collect();
+        cluster
+            .update_status::<NodeSpec>(node.id, &status)
+            .await
+            .unwrap();
+        for op in ops {
+            create_task(&cluster, op, Uuid::now_v7(), node.id)
+                .await
+                .unwrap();
+        }
+        cluster.shutdown().await.unwrap();
+    }
 }

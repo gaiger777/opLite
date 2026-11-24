@@ -358,3 +358,33 @@ OVF 1.0 봉투(ovftool·vSphere·VirtualBox가 모두 받는 판, `vmw` 확장):
 ## 18. 스테이지 보고 (설계와 다른 것·결정)
 
 (구현하면서 스테이지마다 채운다.)
+
+### 스테이지 1
+
+- **타입 이름**: OpenAPI 스키마 이름이 계획 67(`MigrationMode`·`MigrationPhase`·`MigrationStatus`)과 겹치지 않게 새 타입은 모두
+  `Vmware…`(`VmwareMigrationSpec`·`VmwareRules`·`VmwareLimits`·`VmwareSyncPolicy`·`VmwareCutoverPolicy`·`VmwareSyncDisk`·
+  `VmwareSnapshotRef`·`VmwareSourceChanges` 등)와 `VmExport…`로 지었다. 비밀번호는 `vmware::Secret`(JSON은 문자열 그대로,
+  `Debug`는 `<redacted>`)이고 보기·watch는 `redact_source_json`, 감사는 `VmwareSourceSpec::audit_summary`를 쓴다.
+- **Task 칸**: 이전 Task에 `vm` 칸을 두지 않았다 — 대상 `spec.target`이 `vmware-vm` 항목 id다(계획 67 `NetworkMigrate`와 같은
+  꼴, 줄도 대상). `vmware-sync {full}`·`vmware-cleanup {delete_target}`은 거짓이면 쓰지 않는다. `vm-export {export}`의 대상은
+  VM(VM 줄), `vm-export-delete`의 대상은 내보내기다. 실행은 "not available yet" 실패(스테이지 4·5·6이 바꾼다). 이어 가는
+  목록·시간 제한 없는 목록·줄은 설계대로 스테이지 4·6이 더한다.
+- **항목 상태**: `CuttingOver { step }` 대신 `state: cutting-over` + 따로 `cutover_step` 칸(상태가 늘 문자열 하나라 거르기·
+  `counts`·화면이 쉽다). 기본 상태 `draft`(시작 전 계획의 항목)를 더했다. `pending_snapshot`(§9.2)과 설명 되돌리기에 쓸
+  `source_changes.old_annotation`을 더했다. `overrides`는 `VmwareOverrides`(`ImportRun` 부분 값 + 디스크 순번별 `pools`).
+- **규칙 모양**: `node: Auto | Node(id)` → `node?: Uuid`(없으면 자동), `devices: Auto | Fixed` → `devices?: {disk_bus, nic_model}`,
+  `folders`는 `{kind: flat, into?}` | `{kind: mirror, under?}`. `sync.stop_after_days`는 숫자(기본 14, 0은 멈추지 않음),
+  `cutover.at`은 유닉스 초(API·CLI가 RFC 3339를 받아 바꾼다 — 스테이지 3). 한도·주기·전환 정책은 기본값도 늘 적는다(빈 값만
+  뺀다). 검증 범위: 동시 수·호스트당·노드당 1~64, 디스크당 흐름 1~16, 주기 5~1440분, 종료 기다림 30~3600초.
+- **겹침**: Raft 독점 키 `vmware-vm`(`instance_uuid`)를 더했다 — 한 원본 VM은 끝나지 않은 항목 하나에만(`finalized`·`reverted`·
+  `cancelled`는 놓아 줌). §8.3의 409 `vm_in_migration`을 상태 머신이 원자적으로 지킨다(스테이지 3은 `InUse{field:"vmware-vm"}`를
+  그 코드로 바꾸면 된다). vCenter 둘에 같은 instanceUuid는 없다고 본다.
+- **권한 갈래(`kind_privilege`)**: 원본 읽기 `cluster.read`·쓰기 `cluster.admin`, 계획·항목·내보내기 읽기 `system.read`, 내보내기
+  쓰기·동작 `vm.export`. 계획·항목의 종류 단위 쓰기는 `cluster.admin`으로 두었다 — 내장 역할 동치 시험(옛 `RoleAuthorizer`는
+  operator 쓰기를 VM·볼륨·백업·작업·가져오기에만 준다) 때문이고, 설계 §13의 실제 확인(루트·대상 폴더 `vm.create`·`vm.power`)은
+  스테이지 3 경로표가 권한을 이름으로 본다. 폴더 트리(`FolderKind`)에는 아직 넣지 않았다(계획 `folder`의 권한 모델과 함께
+  스테이지 3).
+- **`vm.export` 쓰기 막기**: 역할·토큰 범위에 넣는 쓰기는 기능 `vm-export`가 없는 노드가 있으면 409만 한다. 계획 69처럼 API
+  전까지 400으로 막지 않았다(이름뿐인 권한이라 줄 곳이 없어도 해가 없고 스테이지 6이 풀 일이 없다).
+- **watch**: `vmware-source`만 더했다(루트, 이벤트에서 `password`를 뺌). 계획·항목·내보내기는 폴더·VM 권한 거르기가 들어
+  스테이지 3·6이 더한다. 새 종류를 만드는 API는 아직 없으므로 막을 경로가 없다.

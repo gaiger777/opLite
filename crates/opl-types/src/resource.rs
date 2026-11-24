@@ -78,11 +78,19 @@ pub enum Kind {
     NetworkMigration,
     /// 백업 저장소(계획 68)
     BackupStore,
+    /// 저장한 vCenter·ESXi 연결(계획 72)
+    VmwareSource,
+    /// VMware 이전 계획(계획 72)
+    VmwareMigration,
+    /// VMware 이전 계획 안의 VM 하나(계획 72)
+    VmwareVm,
+    /// VM의 OVA/OVF 내보내기(계획 72)
+    VmExport,
 }
 
 impl Kind {
     /// 모든 종류(선언 순서). 종류마다 도는 시험과 권한 표가 쓴다.
-    pub const ALL: [Kind; 39] = [
+    pub const ALL: [Kind; 43] = [
         Kind::Vm,
         Kind::StoragePool,
         Kind::Volume,
@@ -122,6 +130,10 @@ impl Kind {
         Kind::LoadBalancer,
         Kind::NetworkMigration,
         Kind::BackupStore,
+        Kind::VmwareSource,
+        Kind::VmwareMigration,
+        Kind::VmwareVm,
+        Kind::VmExport,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -165,6 +177,10 @@ impl Kind {
             Kind::LoadBalancer => "load-balancer",
             Kind::NetworkMigration => "network-migration",
             Kind::BackupStore => "backup-store",
+            Kind::VmwareSource => "vmware-source",
+            Kind::VmwareMigration => "vmware-migration",
+            Kind::VmwareVm => "vmware-vm",
+            Kind::VmExport => "vm-export",
         }
     }
 }
@@ -237,7 +253,7 @@ mod tests {
         assert_eq!(set.len(), Kind::ALL.len());
         assert_eq!(
             Kind::ALL.last().map(|k| k.as_str()),
-            Some("backup-store"),
+            Some("vm-export"),
             "새 종류는 ALL 끝에도 더한다"
         );
     }

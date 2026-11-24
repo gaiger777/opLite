@@ -1269,6 +1269,25 @@ mod tests {
         assert_eq!(sm.create(Kind::BackupStore, id(3), s3("b")), Ok(()));
     }
 
+    /// 계획 72: 한 원본 VM(`instance_uuid`)은 끝나지 않은 VMware 이전 항목 하나에만 든다. 취소한 항목은 놓아 준다.
+    #[test]
+    fn a_source_vm_is_in_one_unfinished_migration_item() {
+        let mut sm = Sm::new();
+        let item = |m: u128| json!({"migration": id(m), "source_ref": "vm-12", "instance_uuid": "5003-aa", "target_name": "web"});
+        sm.create(Kind::VmwareVm, id(1), item(10)).unwrap();
+        assert_eq!(
+            in_use(sm.create(Kind::VmwareVm, id(2), item(11))),
+            Some((Kind::VmwareVm, "vmware-vm".into(), "5003-aa".into(), id(1)))
+        );
+        sm.apply(Command::UpdateStatus {
+            kind: Kind::VmwareVm,
+            id: id(1),
+            status: json!({"state": "cancelled"}),
+        })
+        .unwrap();
+        assert_eq!(sm.create(Kind::VmwareVm, id(2), item(11)), Ok(()));
+    }
+
     /// 상태를 apply 없이 바로 쓴다(규모 시험의 준비).
     fn put_all(sm: &Sm, items: Vec<(Kind, Uuid, String, Value)>) {
         let txn = sm.db.begin_write().unwrap();

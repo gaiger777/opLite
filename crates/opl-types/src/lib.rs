@@ -54,4 +54,6 @@ pub mod version;
 pub mod vip;
 pub mod vm;
 pub mod vm_check;
+pub mod vm_export;
 pub mod vm_import;
+pub mod vmware;

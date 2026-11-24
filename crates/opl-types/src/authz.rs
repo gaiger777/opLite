@@ -114,6 +114,9 @@ privileges! {
     /// 백업 안 파일 찾아보기·내려받기·게스트로 되돌려 쓰기(계획 69). VM 통째 복원과 다른 무게의 데이터 읽기라
     /// operator에 넣지 않는다(관리자가 따로 준다).
     BackupFileRestore = "backup.file_restore",
+    /// VM을 OVA/OVF로 내보내기·내려받기(계획 72). VM 디스크 전체가 클러스터 밖으로 나가므로 `backup.file_restore`처럼
+    /// operator에 넣지 않는다(관리자가 따로 준다).
+    VmExport = "vm.export",
 }
 
 impl Privilege {
@@ -326,7 +329,10 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             | Kind::StoragePool
             | Kind::BackupStore
             | Kind::Task
-            | Kind::Folder => SystemRead,
+            | Kind::Folder
+            | Kind::VmwareMigration
+            | Kind::VmwareVm
+            | Kind::VmExport => SystemRead,
             _ => ClusterRead,
         },
         Action::Write => match kind {
@@ -344,6 +350,7 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             | Kind::NetworkMigration => NetworkConfig,
             Kind::AlertRule => AlertManage,
             Kind::Folder => InventoryFolder,
+            Kind::VmExport => VmExport,
             _ => ClusterAdmin,
         },
         Action::Operate => match kind {
@@ -353,6 +360,7 @@ pub fn kind_privilege(action: Action, kind: Kind) -> Privilege {
             Kind::Backup => BackupRestore,
             Kind::BackupJob => BackupJob,
             Kind::BackupStore => StorageConfig,
+            Kind::VmExport => VmExport,
             _ => ClusterAdmin,
         },
     }
@@ -627,10 +635,12 @@ mod tests {
 
     #[test]
     fn privilege_names_round_trip() {
-        assert_eq!(Privilege::ALL.len(), 27);
-        // 계획 69: 새 권한은 목록 끝(비트 순서 유지)
-        assert_eq!(Privilege::ALL.last(), Some(&Privilege::BackupFileRestore));
+        assert_eq!(Privilege::ALL.len(), 28);
+        // 계획 69·72: 새 권한은 목록 끝(비트 순서 유지)
+        assert_eq!(Privilege::ALL[26], Privilege::BackupFileRestore);
         assert_eq!(Privilege::BackupFileRestore.as_str(), "backup.file_restore");
+        assert_eq!(Privilege::ALL.last(), Some(&Privilege::VmExport));
+        assert_eq!(Privilege::VmExport.as_str(), "vm.export");
         assert!(Privilege::ALL.len() <= 64);
         for (i, p) in Privilege::ALL.iter().enumerate() {
             assert_eq!(*p as usize, i);
@@ -690,6 +700,27 @@ mod tests {
         assert!(set.contains(Privilege::BackupFileRestore));
         let op = serde_json::to_string(&builtin_privileges(Role::Operator)).unwrap();
         assert!(!op.contains("file_restore"), "{op}");
+        // 계획 72의 `vm.export`도 이 빌드가 알고 operator에는 없다.
+        let set: PrivSet =
+            serde_json::from_value(serde_json::json!(["vm.export", "vm.create"])).unwrap();
+        assert!(set.contains(Privilege::VmExport) && set.contains(Privilege::VmCreate));
+        assert!(!op.contains("vm.export"), "{op}");
+        assert_eq!(
+            kind_privilege(Action::Operate, Kind::VmExport),
+            Privilege::VmExport
+        );
+        assert_eq!(
+            kind_privilege(Action::Read, Kind::VmwareSource),
+            Privilege::ClusterRead
+        );
+        assert_eq!(
+            kind_privilege(Action::Write, Kind::VmwareSource),
+            Privilege::ClusterAdmin
+        );
+        assert_eq!(
+            kind_privilege(Action::Read, Kind::VmwareVm),
+            Privilege::SystemRead
+        );
         assert_eq!(
             serde_json::from_str::<PrivSet>(&op).unwrap(),
             builtin_privileges(Role::Operator)
@@ -716,6 +747,7 @@ mod tests {
             Privilege::ClusterAdmin,
             Privilege::VmDedicated,
             Privilege::BackupFileRestore,
+            Privilege::VmExport,
         ] {
             assert!(!op.contains(p), "{p}");
         }

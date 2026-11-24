@@ -348,6 +348,30 @@ pub enum TaskOp {
         target_dir: String,
         conflict: crate::file_restore::GuestConflict,
     },
+    /// VMware 이전 항목(대상 — `vmware-vm` id)의 동기화 회차 하나(계획 72 §9.2): `full`이면 전체 복사(첫 회차·CBT가
+    /// 초기화된 디스크), 아니면 CBT 델타. 대상 노드에서 돌고 항목의 체크포인트로 이어 간다. 같은 항목의 Task는 그 항목의
+    /// 줄에 선다.
+    VmwareSync {
+        #[serde(default, skip_serializing_if = "is_false")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        full: bool,
+    },
+    /// 항목의 전환(계획 72 §10.1): 원본 끄기·마지막 델타·VM 만들기·켜기. 걸음은 항목 상태에 먼저 적고 이어 간다.
+    VmwareCutover,
+    /// `Done` 항목을 원본으로 되돌린다(계획 72 §10.3 — 대상 VM 끄기, 원본 설정 되돌림, 원본 켜기).
+    VmwareRevert,
+    /// 항목의 정리(계획 72 §10.3): 우리 스냅샷을 지우고 우리가 켠 CBT를 끈다. `delete_target`이면(취소) 대상 볼륨도 지운다.
+    VmwareCleanup {
+        #[serde(default, skip_serializing_if = "is_false")]
+        #[cfg_attr(feature = "openapi", schema(default))]
+        delete_target: bool,
+    },
+    /// 대상 VM을 내보내기 `export`(`vm-export` id)의 OVF 패키지로 쓴다(계획 72 §12.1). VM의 줄에 선다.
+    VmExport {
+        export: Uuid,
+    },
+    /// 대상 내보내기(`vm-export`)의 디렉터리를 지운다(계획 72 §12.1).
+    VmExportDelete,
 }
 
 impl TaskOp {
@@ -420,6 +444,22 @@ impl TaskOp {
             self,
             TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. }
         )
+    }
+
+    /// VMware 이전 기능(계획 72, `node::VMWARE_MIGRATE`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_vmware_migrate(&self) -> bool {
+        matches!(
+            self,
+            TaskOp::VmwareSync { .. }
+                | TaskOp::VmwareCutover
+                | TaskOp::VmwareRevert
+                | TaskOp::VmwareCleanup { .. }
+        )
+    }
+
+    /// VM 내보내기 기능(계획 72, `node::VM_EXPORT`)을 모르는 노드가 풀지 못하는 Task인지
+    pub fn needs_vm_export(&self) -> bool {
+        matches!(self, TaskOp::VmExport { .. } | TaskOp::VmExportDelete)
     }
 
     /// SDN 서비스 기능(계획 67, `node::SDN_SERVICES`)을 모르는 노드가 풀지 못하는 Task인지
@@ -629,6 +669,65 @@ mod tests {
         let old = serde_json::json!({ "kind": "backup-restore", "backup": backup, "name": "web-2", "pool": "local" });
         let op: TaskOp = serde_json::from_value(old.clone()).unwrap();
         assert!(!op.needs_file_restore());
+        assert_eq!(serde_json::to_value(&op).unwrap(), old);
+    }
+
+    /// 계획 72의 VMware 이전 Task 넷과 내보내기 Task 둘: 태그와 칸 이름(거짓 칸은 쓰지 않는다), 옛 Task JSON은 그대로다.
+    #[test]
+    fn vmware_and_export_ops_are_tagged() {
+        let export = Uuid::now_v7();
+        let cases = [
+            (
+                TaskOp::VmwareSync { full: true },
+                serde_json::json!({ "kind": "vmware-sync", "full": true }),
+                true,
+            ),
+            (
+                TaskOp::VmwareSync { full: false },
+                serde_json::json!({ "kind": "vmware-sync" }),
+                true,
+            ),
+            (
+                TaskOp::VmwareCutover,
+                serde_json::json!({ "kind": "vmware-cutover" }),
+                true,
+            ),
+            (
+                TaskOp::VmwareRevert,
+                serde_json::json!({ "kind": "vmware-revert" }),
+                true,
+            ),
+            (
+                TaskOp::VmwareCleanup {
+                    delete_target: true,
+                },
+                serde_json::json!({ "kind": "vmware-cleanup", "delete_target": true }),
+                true,
+            ),
+            (
+                TaskOp::VmExport { export },
+                serde_json::json!({ "kind": "vm-export", "export": export }),
+                false,
+            ),
+            (
+                TaskOp::VmExportDelete,
+                serde_json::json!({ "kind": "vm-export-delete" }),
+                false,
+            ),
+        ];
+        for (op, json, vmware) in cases {
+            assert_eq!(op.needs_vmware_migrate(), vmware, "{json}");
+            assert_eq!(op.needs_vm_export(), !vmware, "{json}");
+            assert!(
+                !op.needs_file_restore() && !op.needs_backup_store(),
+                "{json}"
+            );
+            assert_eq!(serde_json::to_value(&op).unwrap(), json);
+            assert_eq!(serde_json::from_value::<TaskOp>(json).unwrap(), op);
+        }
+        let old = serde_json::json!({ "kind": "vm-import-delete" });
+        let op: TaskOp = serde_json::from_value(old.clone()).unwrap();
+        assert!(!op.needs_vmware_migrate() && !op.needs_vm_export());
         assert_eq!(serde_json::to_value(&op).unwrap(), old);
     }
 

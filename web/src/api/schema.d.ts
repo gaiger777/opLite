@@ -7604,7 +7604,7 @@ export interface components {
          * @description 클러스터 저장소가 구분하는 리소스 종류.
          * @enum {string}
          */
-        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store";
+        Kind: "vm" | "storage-pool" | "volume" | "node" | "task" | "user" | "api-token" | "cluster" | "join-token" | "network" | "snapshot" | "security-group" | "backup" | "backup-job" | "vm-import" | "settings" | "realm" | "remote" | "session" | "vip-holder" | "ha-group" | "placement-rule" | "node-fence" | "ha-check" | "ceph" | "alert-rule" | "notification-target" | "folder" | "grant" | "access-role" | "group" | "two-factor" | "cpu-catalog" | "sdn" | "router" | "floating-ip" | "load-balancer" | "network-migration" | "backup-store" | "vmware-source" | "vmware-migration" | "vmware-vm" | "vm-export";
         /** @description 바깥 VIP */
         LbExternal: {
             /**
@@ -13998,6 +13998,28 @@ export interface components {
             session: string;
             target_dir: string;
             volume: string;
+        } | {
+            full?: boolean;
+            /** @enum {string} */
+            kind: "vmware-sync";
+        } | {
+            /** @enum {string} */
+            kind: "vmware-cutover";
+        } | {
+            /** @enum {string} */
+            kind: "vmware-revert";
+        } | {
+            delete_target?: boolean;
+            /** @enum {string} */
+            kind: "vmware-cleanup";
+        } | {
+            /** Format: uuid */
+            export: string;
+            /** @enum {string} */
+            kind: "vm-export";
+        } | {
+            /** @enum {string} */
+            kind: "vm-export-delete";
         };
         /** @description Task의 진행률: 단계(`copying-disks`, `migrating-memory`)와 복사한 바이트 */
         TaskProgress: {

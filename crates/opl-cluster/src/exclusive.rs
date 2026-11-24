@@ -22,6 +22,8 @@ pub(crate) const SHARED_IP_KINDS: [Kind; 4] =
 /// (`bridge`가 `false`가 아닌) 옮기기의 대상 `migration-target`(한 대상 네트워크에 다리 하나 — 리뷰 1 I1).
 /// 계획 68: 백업 저장소의 자리 `backup-store-target`(`pool:<풀 이름>` 또는 `s3:<host>/<버킷>/<접두사>` — 한 곳에 저장소
 /// 하나).
+/// 계획 72: VMware 이전 항목의 원본 VM `vmware-vm`(`instance_uuid` — 한 원본 VM은 끝나지 않은 항목 하나에만. 끝난 항목
+/// `finalized`·`reverted`·`cancelled`는 잡지 않아 같은 VM을 새 계획에 넣을 수 있다).
 pub(crate) fn exclusive_values(
     kind: Kind,
     spec: &Value,
@@ -131,6 +133,19 @@ pub(crate) fn exclusive_values(
                 .into_iter()
                 .collect();
         }
+        Kind::VmwareVm => {
+            if matches!(
+                status["state"].as_str(),
+                Some("finalized" | "reverted" | "cancelled")
+            ) {
+                return Vec::new();
+            }
+            return spec["instance_uuid"]
+                .as_str()
+                .map(|u| ("vmware-vm", u.to_string()))
+                .into_iter()
+                .collect();
+        }
         Kind::Vm => {}
         _ => return Vec::new(),
     }
@@ -179,6 +194,32 @@ mod tests {
             ]
         );
         assert!(values(Kind::Volume, &spec).is_empty());
+    }
+
+    /// 계획 72: 한 원본 VM은 끝나지 않은 VMware 이전 항목 하나에만 든다. 끝난 항목은 잡지 않는다.
+    #[test]
+    fn extracts_vmware_source_vms() {
+        let item = json!({ "migration": "m", "source_ref": "vm-1", "instance_uuid": "5003-a", "target_name": "web" });
+        assert_eq!(
+            values(Kind::VmwareVm, &item),
+            vec![("vmware-vm", "5003-a".to_string())]
+        );
+        for state in ["draft", "syncing", "done", "failed", "rolled-back"] {
+            assert_eq!(
+                exclusive_values(Kind::VmwareVm, &item, &json!({ "state": state })).len(),
+                1,
+                "{state}"
+            );
+        }
+        for state in ["finalized", "reverted", "cancelled"] {
+            assert!(
+                exclusive_values(Kind::VmwareVm, &item, &json!({ "state": state })).is_empty(),
+                "{state}"
+            );
+        }
+        for kind in [Kind::VmwareSource, Kind::VmwareMigration, Kind::VmExport] {
+            assert!(values(kind, &item).is_empty(), "{kind:?}");
+        }
     }
 
     /// 계획 68: 백업 저장소 하나는 한 곳(풀 또는 S3 버킷·접두사)에만 둔다.

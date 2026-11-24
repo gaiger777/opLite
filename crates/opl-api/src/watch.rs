@@ -21,7 +21,7 @@ use opl_cluster::types::RawResource;
 use opl_types::authz::Privilege;
 
 /// 구독할 수 있는 종류. 사용자와 토큰은 해시를 담고 있어 내보내지 않는다.
-const WATCHABLE: [Kind; 24] = [
+const WATCHABLE: [Kind; 25] = [
     Kind::Vm,
     Kind::Volume,
     Kind::StoragePool,
@@ -51,6 +51,8 @@ const WATCHABLE: [Kind; 24] = [
     Kind::NetworkMigration,
     // 계획 68: 백업 저장소(루트 — system.read). S3 비밀 키·주 키는 이벤트에서 뺀다.
     Kind::BackupStore,
+    // 계획 72: 저장한 vCenter·ESXi 연결(루트 — cluster.read). 비밀번호는 이벤트에서 뺀다.
+    Kind::VmwareSource,
 ];
 
 /// 이벤트마다 거르는 종류(폴더를 따르는 것과 grant). 나머지는 구독할 때 종류 단위로 루트에서 본다.
@@ -206,6 +208,18 @@ impl Filter {
         } = &mut event
         {
             crate::backup_stores::redact_json(&mut resource.spec);
+        }
+        if let WatchEvent::Put {
+            kind: Kind::VmwareSource,
+            resource,
+        }
+        | WatchEvent::Deleted {
+            kind: Kind::VmwareSource,
+            resource,
+            ..
+        } = &mut event
+        {
+            opl_types::vmware::redact_source_json(&mut resource.spec);
         }
         event
     }
@@ -442,6 +456,16 @@ mod tests {
         let kinds = parse_kinds("router,floating-ip,load-balancer,network-migration").unwrap();
         assert_eq!(kinds.len(), 4);
         assert!(kinds.iter().all(|k| per_event(*k)));
+    }
+
+    /// 계획 72: 저장한 VMware 연결은 루트에서 본다(사건마다 거르지 않음). 계획·항목·내보내기는 API 스테이지가 더한다.
+    #[test]
+    fn vmware_sources_are_watchable_at_the_root() {
+        let kinds = parse_kinds("vmware-source").unwrap();
+        assert!(kinds.iter().all(|k| !per_event(*k)));
+        for kind in ["vmware-migration", "vmware-vm", "vm-export"] {
+            assert!(parse_kinds(kind).is_err(), "{kind}");
+        }
     }
 
     #[test]

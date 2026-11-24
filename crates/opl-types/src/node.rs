@@ -421,6 +421,8 @@ pub const FEATURES: &[&str] = &[
     BACKUP_STORE,
     FILE_RESTORE,
     VM_CHECK,
+    VMWARE_MIGRATE,
+    VM_EXPORT,
 ];
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
@@ -519,6 +521,16 @@ pub const FILE_RESTORE: &str = "file-restore";
 /// VM 만들기 미리 확인(계획 71): `POST /vm-checks`. 저장하는 것은 없지만 섞인 클러스터에서 웹이 옛 노드에 확인을 보내
 /// 404를 받거나 노드마다 다른 규칙으로 답하지 않게 모든 노드가 알릴 때만 받는다.
 pub const VM_CHECK: &str = "vm-check";
+
+/// VMware 이전 2(계획 72): 종류 `VmwareSource`·`VmwareMigration`·`VmwareVm`, Task `vmware-sync`·`vmware-cutover`·
+/// `vmware-revert`·`vmware-cleanup`, 원본·인벤토리·계획·항목 경로. 옛 노드는 새 종류·Task를 풀지 못하고 이어 가는 동기화·
+/// 전환이 어느 노드에서든 돌 수 있어야 하므로 모든 노드가 알릴 때만 쓴다.
+pub const VMWARE_MIGRATE: &str = "vmware-migrate";
+
+/// VM 내보내기(계획 72): 종류 `VmExport`, Task `vm-export`·`vm-export-delete`, 권한 `vm.export`을 쓴 역할·토큰 범위,
+/// 내보내기·내려받기 경로. 옛 노드는 새 종류·Task를 풀지 못하고 새 권한 이름을 버려(권한 판단이 노드마다 달라진다) 모든
+/// 노드가 알릴 때만 쓴다.
+pub const VM_EXPORT: &str = "vm-export";
 
 /// 노드의 APT 업데이트 확인 결과(`apt-get -s dist-upgrade`가 올릴 패키지)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1010,7 +1022,9 @@ mod tests {
                 "sdn-services",
                 "backup-store",
                 "file-restore",
-                "vm-check"
+                "vm-check",
+                "vmware-migrate",
+                "vm-export"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1229,7 +1243,7 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&VM_CHECK));
+        assert_eq!(FEATURES.last(), Some(&VM_EXPORT));
     }
 
     /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

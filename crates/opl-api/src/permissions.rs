@@ -16,7 +16,7 @@ use opl_types::authz::{
 use opl_types::authz_eval::{AuthzTarget, chain_of, groups_of, reaches};
 use opl_types::folder::FolderSpec;
 use opl_types::network::NetworkSpec;
-use opl_types::node::{FILE_RESTORE, FOLDERS};
+use opl_types::node::{FILE_RESTORE, FOLDERS, VM_EXPORT};
 use opl_types::resource::{Kind, Resource};
 use opl_types::storage::StoragePoolSpec;
 use opl_types::vm::VmSpec;
@@ -49,16 +49,18 @@ fn bad(e: impl std::fmt::Display) -> ApiError {
 
 /// 역할·토큰 범위의 권한 이름에 기능이 드는 권한이 있으면 그 기능을 검증보다 먼저 본다(409 `cluster_upgrading`):
 /// `backup.file_restore`(계획 69)는 옛 노드가 이름을 버려 권한 판단이 노드마다 달라지므로 모든 노드가 `file-restore`를
-/// 알 때만.
+/// 알 때만. `vm.export`(계획 72)도 같은 까닭으로 모든 노드가 `vm-export`를 알 때만.
 pub(crate) fn check_privilege_features(
     cluster: &Cluster,
     privileges: &[String],
 ) -> Result<(), ApiError> {
-    if privileges
-        .iter()
-        .any(|p| p == Privilege::BackupFileRestore.as_str())
-    {
-        require_feature(cluster, FILE_RESTORE)?;
+    for (privilege, feature) in [
+        (Privilege::BackupFileRestore, FILE_RESTORE),
+        (Privilege::VmExport, VM_EXPORT),
+    ] {
+        if privileges.iter().any(|p| p == privilege.as_str()) {
+            require_feature(cluster, feature)?;
+        }
     }
     Ok(())
 }
