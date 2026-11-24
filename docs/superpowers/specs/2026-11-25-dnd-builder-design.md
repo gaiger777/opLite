@@ -406,14 +406,14 @@ VmCheckRequest {                     // deny_unknown_fields
 
 - **요청 타입 자리**: `VmCheckRequest`는 `opl-types`가 아니라 `crates/opl-api/src/vm_checks.rs`에 둔다 — `volumes`·`rules`가 쓰는 `CreateRequest<S>`가 opl-api 타입이다(OpenAPI 이름 `CreateRequest_VolumeSpec`·`CreateRequest_PlacementRuleSpec`, `spec`은 `VmSpec` 스키마). 응답 `VmCheck`·`VmCheckProblem`·`VmCheckLevel`은 `opl-types/src/vm_check.rs`.
 - **문제에 `level`(`error`·`warn`)을 더함**: §9.1 표에는 없지만 §9.2의 풀 용량 경고와 `ok`(오류 없음)의 정의에 필요하다. 경고 코드는 `pool_space`(만들 볼륨의 노드가 알린 풀 상태가 `total_bytes > 0`이고 `available_bytes < size_bytes`).
-- **`node`·`machine`·`cpu_model`은 null일 수 있음**: `prepare`를 지나지 못했으면(또는 머신을 채우지 못했으면) null, `ips`는 빈 목록. `prepare`를 지나면 앞 단계 문제(권한·할당량 등)가 있어도 채운다. `node`는 켜진 채 노드 없이 만들 때 스케줄러가 고른 노드나 준 노드의 이름이고, 루트 `cluster.read`가 없으면 null.
+- **`node`·`machine`·`cpu_model`은 null일 수 있음**: `prepare`를 지나지 못했으면(또는 머신을 채우지 못했으면) null, `ips`는 빈 목록. `prepare`를 지나면 앞 단계 문제(할당량 등)가 있어도 채운다 — 권한 거절이 하나라도 있으면 `prepare`를 돌리지 않으므로 null·빈 목록이다(리뷰 1 (api) 1). `node`는 켜진 채 노드 없이 만들 때 스케줄러가 고른 노드나 준 노드의 이름이고, 루트 `cluster.read`가 없으면 null.
 - **자리 정하기**: `area_of(code)` 표에 더해 `slot_of` — 문구가 따옴표 이름(`{:?}`)으로 가리키는 NIC 네트워크·디스크 볼륨·CD ISO가 있으면 `nics.N`·`disks.N`·`cdroms.N`이다. `prepare`의 많은 400이 `invalid_request` 한 코드라서(예: 없는 ISO `volume "x.iso" not found` → `cdroms.0`, `network "x" not found` → `nics.N`). 자리가 정해진 코드(`no_node` 등)는 그대로.
 - **감사**: 미들웨어가 `/vm-checks`를 GET처럼 그냥 넘기면 요청 자리가 없어 `audit::principal()`이 None이 되고, IPAM이 주체 없음을 관리자처럼 본다(공급자 네트워크 주소 검사를 건너뜀 — 만들기와 갈라짐). 그래서 자리(주체)는 그대로 두고 **기록만 하지 않는다**(`QUIET_CHECK`).
-- **`check_attachments`**를 항목마다 자리를 붙여 모두 모으는 `attachment_problems` 위로 다시 썼다(만들기는 그 첫 거절). 여러 볼륨이 함께 거절될 때 알리는 것이 이름 순 첫 것에서 디스크 순 첫 것으로 바뀐다(상태·코드는 같음).
+- **`check_attachments`**를 항목마다 자리를 붙여 모두 모으는 `attachment_problems` 위로 다시 썼다(만들기는 그 첫 거절). 여러 볼륨이 함께 거절될 때 알리는 것이 이름 순 첫 것에서 디스크 순 첫 것으로 바뀐다(상태·코드는 같음). — 리뷰 1 (api) 3에서 만들기·고치기는 계획 71 앞의 `check_attachments`로 되돌렸다(미리 확인만 `attachment_problems`).
 - **머신을 채울 수 없음**(아키텍처 섞임 400): spec을 `VmSpec`으로 풀 수 없으므로 spec의 `folder`만 읽어 권한(403)을 본 뒤 `compute` 문제 하나로 답한다. 그 밖에 spec을 풀 수 없으면 400.
 - **만들 규칙**: 권한(`placement-rule` 쓰기) → 이름 → 같은 이름 규칙(`name_taken`) → `placement_rules::check`(형식·노드·모순) 차례로 `placement`. 맞는 노드가 없는 영역 규칙은 규칙 만들기가 422 `rule_conflict`로 거절하므로 `rule_conflict`와 `prepare`의 `placement_rule`이 함께 `placement`에 나온다.
 - **만들 볼륨**: 같은 이름 볼륨(또는 만들 볼륨끼리 같은 이름) → `name_taken`. 검사를 지나지 못한 볼륨도 풀이 있으면 그 노드에 둔 준비된 볼륨으로 얹는다(스케줄러가 "풀에 닿는 노드 없음"을 덧붙이지 않게). 할당량에는 만들 볼륨 크기를 디스크로 더한다(`quota::precheck_new_vm`).
-- **CLI** `vm create --dry-run`: 경고는 `MESSAGE` 앞에 `warning: `, 오류가 있으면 표 뒤 `error: the check found N problem(s); the VM would not be created`(끝 코드 1), `--start`와 함께 쓸 수 없다. `-o json`은 답 그대로.
+- **CLI** `vm create --dry-run`: 경고는 `MESSAGE` 앞에 `warning: `, 오류가 있으면 표 뒤 `error: the check found N problem(s); the VM would not be created`(끝 코드 1). `--start`와 함께 쓸 수 없었으나 리뷰 1 (api) 5에서 함께 줄 수 있게 바꿨다. `-o json`은 답 그대로.
 
 ### 스테이지 2
 
@@ -480,3 +480,25 @@ VmCheckRequest {                     // deny_unknown_fields
 - **"폼에서 고친 칸 n개" 칩은 화면에 없음**: §8.6·§13의 칩은 모델 함수(`state.ts` `formOnly`)만 있고 `Chassis`가 그리지 않는다. 값은 들고 다녀 JSON·CLI·만들기에 들어간다. 가이드 한계와 계획 문서 제한에 적고 이 스테이지에서 화면은 고치지 않았다(문서 스테이지).
 - **서버 확인 시험의 빈 곳**: 앞 요청 끊기·403("이 폴더에 만들 권한 없음")·그 밖 실패의 "다시 확인"은 `useServerCheck.ts`의 갈래로 있으나 따로 된 vitest가 없다(409 → 업그레이드 안내와 흐림은 있음). 계획 문서 결과 줄에 그대로 적었다.
 - **설계 §18 스테이지 2의 남은 줄**: 노트에서 옮길 때 남은 "(§18에 옮길 글)" 줄을 지웠다.
+
+### 리뷰 1 (web)
+
+- 블록 손잡이를 누르기(탭)로 들면 바로 뒤의 click이 바깥 목록 칸까지 올라가 "끝에 놓기"가 되던 것: 칸의 click은 가장 안쪽 칸만 받고(`stopPropagation`), 든 것(`[data-held]`) 안에서 난 click은 놓기가 아니다(`useDropSlot`).
+- 든 채(끌기·누르기·키보드)·만드는 중에는 되돌리기(⌘Z·Ctrl+Z, 단추)를 하지 않는다. 모델도 막는다: `acceptsBlock`은 목록에 없는 자리의 블록을 받지 않고, `moveBlock`은 범위 밖 `from`이면 그대로다.
+- 만들다 실패한 뒤 남은 영역 규칙: 이 화면이 만든 규칙을 이름 → (id, 요청 열쇠)로 기억한다. 다시 만들 때 지금 영역 규칙과 이름·내용이 같으면 다시 쓰고, 다르면(영역·hard/soft가 바뀜, VM 이름이 바뀜, 영역을 뺌·노드·자동) 바뀐 즉시 그 규칙을 지운다(`DELETE /placement-rules/{id}`, 404는 지운 셈). 곧 지우는 까닭: 남은 hard 규칙이 브라우저 확인(`hardViolations`)과 서버 확인을 막아 만들기에 갈 수 없게 되기 때문이다. 이 화면이 방금 만든, VM을 만들지 못한 규칙만 지운다(만드는 중에는 지우지 않음). 지우지 못하면 알림에 "지난 시도가 남긴 배치 규칙 …을 지우지 못했습니다"를 보이고, 다음 만들기가 먼저 다시 지운다. 만든 규칙은 서버 확인 본문의 `rules`에서 뺀다(이미 있으니 보내면 `name_taken`). "이미 만든 것"은 이 화면이 만든 볼륨·남은 규칙을 두 번째 실패에도 알린다(리뷰 9).
+- 템플릿 바탕: 배포 요청(`CloneRequest`)이 싣지 못하는 칸은 고를 수 없다 — HA·HA 그룹 부품은 `templateHa`("만든 뒤 켭니다")로 받지 않고, 템플릿을 놓으면 HA·HA 그룹·노드 고정을 끄며, 살피기에서 NIC 모델·노드 고정을 숨기고 보호 칸에는 그 안내를 보인다. "꾸러미" 조각은 템플릿 바탕에서 게스트 에이전트 칸을 켜지 않는다(user-data만 — 장치는 템플릿 것).
+- 만든 뒤 화면을 이미 떠났으면(`signal.aborted`) 옮기지 않는다(폼과 같다, VM·배포 둘 다).
+- 보기 전환 "폼 | 빌더"를 ⌘·Ctrl·Shift·Alt·가운데 단추로 누르면(새 탭·창) 이 탭에 초안·보기를 남기지 않는다.
+- 브라우저 오류로 서버 확인이 꺼지면 상태 줄은 "브라우저가 찾은 오류가 없으면 서버 확인을 합니다."다(지난 "통과"를 보이지 않음). 서버 답에 `node`·`ips`가 없어도 된다(권한 문제만 돌려줄 때).
+- 놓은 뒤 초점: 목록에 더하면 새 블록(전과 같음), 블록을 옮기면 옮긴 블록, 빼면 그 목록 제목, 블록 줄에 부품을 놓으면 그 블록, 그 밖의 칸이면 칸 제목(`#vb-<칸>`).
+- **남은 한계**: VM 요청이 서버에서는 성공했는데 답이 끊긴(네트워크 오류) 뒤 영역·이름을 바꾸면 그 VM의 규칙을 지울 수 있다(드묾 — 알림에 "이미 만든 것"이 뜬다).
+
+### 리뷰 1 (api)
+
+- 리뷰 1 1(보안): 첨부(네트워크·볼륨·ISO·복제 풀)·CPU 플래그·NUMA·만들 볼륨·만들 규칙에서 권한 거절(403, 또는 읽을 수 없어 404)이 하나라도 있으면 만들기처럼 거기서 멈춘다: 할당량·`prepare`(배치·IPAM·볼륨 사용 중·볼륨 상태)를 돌리지 않고 이름 문제와 거절만 돌려준다(`node`·`machine`·`cpu_model` null, `ips` 빈 목록). 앞의 "prepare를 지나면 앞 단계 문제(권한·할당량 등)가 있어도 채운다"는 권한 거절에는 맞지 않는다 — 숨은 VM 이름(`volume_in_use`)과 숨은 SDN 서브넷의 빈 주소·점유가 드러났다. 권한 거절이 없으면 할당량·`prepare` 문제는 그대로 함께 모은다.
+- 리뷰 1 2(보안): 만들 권한(루트 `cluster.admin`의 배치 규칙 쓰기)이 없는 규칙은 검사하지도 목록에 얹지도 않는다(`placement` `forbidden` 하나). 만들 권한이 없는 볼륨(풀 403·404)도 얹지 않는다. 400(없는 풀 등)인 볼륨은 전처럼 얹는다(뒤따르는 "볼륨 없음"을 막으려고).
+- 리뷰 1 3: `POST /vms`·`PUT /vms/{key}`의 `check_attachments`를 계획 71 앞의 본문으로 되돌렸다(네트워크는 NIC 차례, 볼륨·ISO는 이름 차례로 첫 거절, 저장소 오류도 그 차례) — 상태·코드가 전과 같다. 미리 확인만 모두 모으는 `attachment_problems`(칸 차례)를 쓴다. 앞의 "상태·코드는 같음" 문장은 이것으로 참이 된다.
+- 리뷰 1 4: `volumes`·`rules`는 16개까지(넘으면 400, VM NIC 상한 `MAX_NICS`와 같은 수). 미리 확인은 평문 cloud-init 비밀번호를 SHA-512 crypt하지 않는다(`Planned.preview` — 저장하지 않으니 검증만; 가린 값 `********`은 만들기처럼 400).
+- 리뷰 1 5: `vm create --dry-run`은 `--start`와 함께 줄 수 있다: 그때 확인 본문에 `power: running`을 넣어 서버가 노드·용량·hard 배치 규칙을 본다(켜지 않는다). `--start` 없이는 만들기처럼 꺼진 채라 `ok: node -`. 옛 서버(404 `no API at …`)는 "the server does not support --dry-run (POST /vm-checks); upgrade it", 올리는 중인 클러스터(409 `cluster_upgrading`)는 "the cluster does not support --dry-run until every node is upgraded: …". 다른 404(볼 수 없는 폴더 등)는 그대로.
+- 리뷰 1 6: 교차 시험 고정 파일의 사례마다 `before`(마지막 요청 앞의 `POST /volumes`·`POST /placement-rules`, 차례대로)를 더했고, Rust 시험이 CLI가 보낸 같은 종류의 요청과 차례·본문(null 뺌)을 맞춰 본다. `power`는 지우지 않고 맞춰 본다: 웹 `power: running` ⇔ CLI 마지막 명령에 `--start` ⇔ `POST /vms/<name>/actions/start`가 있음, 그리고 CLI 본문에는 `power`가 없음.
+- 리뷰 1 7: `slot_of`는 문구의 주어 자리(`network "n"`·`volume "v"`·`ISO "i"`)만 본다(뒤의 `VM "a"`는 디스크 a가 아님). 디스크 코드(`volume_in_use` 등)는 맞는 디스크가 없으면 CD를 본다(`ISO "x" is being deleted` → `cdroms.N`).

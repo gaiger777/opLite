@@ -1217,7 +1217,10 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
 
 - **CLI.** `--dry-run`은 `vm create`의 다른 플래그로 짠 같은 본문을 `POST /api/v1/vm-checks`로만 보낸다. 문제가 있으면 `AT  CODE  MESSAGE` 표
   (경고는 `MESSAGE` 앞에 `warning: `), 오류가 없으면 `ok: node …, cpu …, machine …`이다. 오류가 있으면 표 뒤
-  `error: the check found N problem(s); the VM would not be created`와 끝 코드 1, 경고만이면 0이다. `--start`와 함께 줄 수 없다(서로 막음).
+  `error: the check found N problem(s); the VM would not be created`와 끝 코드 1, 경고만이면 0이다. `--start`와 함께 주면 켠 채(`power: running`)로
+  확인해 놓을 노드·용량·hard 배치 규칙을 보고 고를 노드를 `ok: node …`에 보인다(켜지는 않는다). `--start`가 없으면 만들기처럼 꺼진 채라 노드를
+  주지 않았으면 `ok: node -`다. 미리 확인 API가 없는 옛 서버에는 `the server does not support --dry-run (POST /vm-checks); upgrade it`,
+  아직 올리지 않은 노드가 있는 클러스터(409 `cluster_upgrading`)에는 `the cluster does not support --dry-run until every node is upgraded: …`로 끝난다.
   CLI의 `vm create`는 있는 볼륨만 붙이므로 아래 `volumes`·`rules`는 늘 비어 있다.
 - **API.** `POST /api/v1/vm-checks`. 권한은 만들기와 같다 — 그 폴더(spec `folder`)의 `vm.create`.
 
@@ -1234,7 +1237,8 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
 
   `spec`은 `POST /vms`의 spec 그대로다(`machine`을 빼면 서버가 채운다). `volumes`는 VM보다 먼저 만들 볼륨(`POST /volumes`의 본문 —
   디스크가 이름으로 가리키면 준비된 볼륨으로 얹어 본다), `rules`는 먼저 만들 배치 규칙(`POST /placement-rules`의 본문 — 예: 빌더의 장애
-  영역 규칙)이다. 둘 다 생략할 수 있다. 모르는 칸은 400이다.
+  영역 규칙)이다. 둘 다 생략할 수 있고 각각 16개까지다(넘으면 400). 모르는 칸은 400이다. cloud-init 평문 비밀번호는 검증만 하고
+  해시하지 않는다(가린 값 `********`은 만들기처럼 400).
 - **응답은 문제가 있어도 200이다**:
 
 ```json
@@ -1261,8 +1265,10 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
   끝난다(만들 수 없는 곳의 규칙·노드를 알려 주지 않음). 폴더를 주지 않고 루트 `vm.create`도 없으면 400 `folder_required` ③ **모으는** 검사(하나가
   실패해도 다음을 봄): 네트워크·볼륨·ISO·복제 풀의 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨마다 `POST /volumes`의 검사(이름·`name_taken`·풀·
   `storage.allocate`·형식·풀 노드)와 풀 남은 용량 경고, 만들 규칙마다 배치 규칙 만들기의 검사(`placement-rule` 쓰기 권한·이름·모양·모순 —
-  맞는 노드가 없는 영역 규칙은 `rule_conflict`와 아래 `placement_rule`이 함께 나온다), 폴더 할당량(만들 볼륨 크기를 더해) ④ 만들 볼륨·규칙을
-  얹은 준비 단계(MAC·SDN 주소·CPU 모델·볼륨·ISO·노드 조건·hard 배치 규칙·스케줄러·HA 용량 — 만들기의 `prepare`와 같은 함수)는 **첫 오류
+  맞는 노드가 없는 영역 규칙은 `rule_conflict`와 아래 `placement_rule`이 함께 나온다). 여기까지 **권한 거절**(403, 또는 읽을 수 없어 404)이
+  하나라도 있으면 만들기처럼 거기서 멈춘다: 이름 문제와 거절만 돌려주고 `node`·`machine`·`cpu_model`은 `null`, `ips`는 빈 목록이다(권한 없는
+  볼륨·규칙은 아래 준비 단계에 얹지도 않는다 — 볼 수 없는 VM·주소가 드러나지 않게). 거절이 없으면 폴더 할당량(만들 볼륨 크기를 더해)을 함께
+  모으고 ④ 만들 볼륨·규칙을 얹은 준비 단계(MAC·SDN 주소·CPU 모델·볼륨·ISO·노드 조건·hard 배치 규칙·스케줄러·HA 용량 — 만들기의 `prepare`와 같은 함수)는 **첫 오류
   하나**만 준다.
 - **거절.** 401(로그인 없음), 400(본문을 풀 수 없음·`folder_required`), 403·404(위), **409 `cluster_upgrading`** — 노드 하나라도(위트니스 포함)
   기능 `vm-check`를 알리지 않으면(롤링 업그레이드 중). 웹은 이때 "모든 노드를 올린 뒤에" 안내를 보이고 만들기는 그대로 된다. 질의 꼴

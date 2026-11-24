@@ -414,7 +414,8 @@ pnpm -C web build && cargo test -p opld --features web-it --test web browser_sho
 **웹 CLI 미리 보기 교차 시험.** 빌더 모델 시험(`web/src/vmBuilder/model/cli.test.ts`)이 대표 상태 열둘의 CLI 명령(셸을 거치지 않는 인자 배열)·
 user-data 파일·웹 요청 본문을 `web/src/vmBuilder/model/__fixtures__/cli.json`과 견주고(다르면 실패), `crates/oplctl/src/web_cross.rs`가 같은
 파일의 명령을 진짜 CLI(`run`)로 가짜 API에 보내 받은 `POST /vms`(템플릿은 `POST /vms/{key}/clone`) 본문이 웹 본문과 같은지 본다(CLI가 보내지
-않는 서버 기본값은 고르게 한 뒤). CLI 플래그나 웹 본문을 바꾸면 한쪽이 깨진다 — 의도한 바뀜이면 `UPDATE_FIXTURES=1 pnpm -C web test
+않는 서버 기본값은 고르게 한 뒤). 사례마다 `before`(그 앞의 `POST /volumes`·`POST /placement-rules`, 차례대로)도 CLI가 보낸 요청과
+차례·본문을 맞춰 보고, 웹 `power: running`은 CLI 명령의 `--start`와 그 켜기 요청(`POST /vms/<이름>/actions/start`)이 있을 때만이다. CLI 플래그나 웹 본문을 바꾸면 한쪽이 깨진다 — 의도한 바뀜이면 `UPDATE_FIXTURES=1 pnpm -C web test
 src/vmBuilder`로 고정 파일을 다시 쓰고 `cargo test -p oplctl web_cross`를 돌린다. 고정 파일은 prettier가 건드리지 않는다(`.prettierignore`).
 
 접근성 검사는 `src/test/axe.ts`의 `expectNoAxeViolations(container)`가 `axe-core`를 직접 부른다(jsdom에서 안 되는
