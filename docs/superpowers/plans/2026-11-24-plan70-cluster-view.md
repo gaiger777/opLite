@@ -96,9 +96,9 @@
 - **Mac 시험**(aarch64 HVF, Homebrew QEMU): 스테이지마다 `pnpm -C web typecheck`·`lint`·`test`·`build` 통과. 스테이지 3에서 `cargo test -p opld --features web-it --test web` 셋 통과(큰 줄기 약 50초, 셋 합 약 72초 — 파일 복원 줄기는 도우미 이미지 환경 값이 없어 건너뜀). 진짜 브라우저(Chromium, 가짜 API — 넓은 화면 밝음·어둠·390px)에서 그림·가리키기 카드·서랍·확대 단계 바뀜을 손으로 봤다(스테이지 2).
 - **스테이지 4 확인:** 가이드의 키·문구·주소를 코드에서 읽어 맞췄다(`MapScene.tsx` `onKey` — 화살표·`]`·`[`·`Esc`(VM 단계만)·`Home`·`End`·`Enter`·`Space`·`Shift+Enter`·`+`·`=`·`-`·`0`, 더블클릭·Ctrl/⌘+누르기 = 상세, 4px 넘게 끌면 열지 않음; `lib/shortcuts.ts` 묶음 `map`; `clusterMap/i18n/ko.json`의 도구 띠·단계·범례·서랍 문구; `ClusterMapPage.tsx`의 기억 `opl.<사용자>.clusterMap.{mode,group,layers,filter}`·기본 레이어 `load`·노드 200 띠·`?focus=`; `lod.ts` 문턱; `data.ts` 15초·30초). `web-ui.md`에 영역 표·단축키 표·새 절·한계, `cluster.md`·`ha.md`에 한 줄씩, `development.md`에 시험 명령·E2E 줄기·늦게 받는 문구 규약, `docs/index.md`, README 한 줄. `docs/architecture.md`는 화면을 하나씩 적지 않아 그대로 두었다.
 - **웹 번들(eager, gzip -9):** 계획 69 끝 476,367 → 스테이지 1 477,319 → 스테이지 2·3 478,317 B(계획 70 합 +1,950 B, 목표 3 KB 밑). 늦은 조각: 지도 18,750 B(목표 20 KB 밑)·서랍 2,516 B·문구 en 1,731 B·ko 2,101 B·불러오기 308 B. 스테이지 4는 문서만이라 같다.
-- 리뷰: (채움)
-- svc01 일반 시험: (채움)
-- GitHub 탐침: (채움 — 웹만 바뀌어 `check`·`web` 작업과 나머지 작업의 통과 확인)
+- 리뷰: 웹 두 번. 1차(중간 2·중하 2·낮음 6·제안 2, 거짓 경보 없음 → `fix(web): 리뷰 1`) — 메모리 단계에 100% 진행률(디스크 복사 바이트) → 디스크 복사 단계만 퍼센트·`tasks.ts`와 한 규칙, 관리자에게 "볼 수 없는 VM +1" 유령 타일, 지도 포커스 때 Ctrl/⌘ +·−·0을 삼킴, 화살표(마이그레이션·추천)가 마우스로만 → 노드 서랍·목록 보기의 "마이그레이션과 추천", 포커스 돌려주기, 한글 꼬리표 폭, 사라진 기억 설정, HA 칩·서랍 배치 규칙, 마이그레이션 Task만 다시 그리기, 그 VM을 옮길 수 있을 때만 적용. 2차(1차 수정 13개 모두 맞음, 낮음 1·시험 제안 1 → `fix(web): 리뷰 2`) — 목록 보기에서 적용·마이그레이션 끝난 뒤 포커스가 body로 → 화살표 키로 기억, 폴더 운영자의 적용 시험.
+- svc01 일반 시험(리뷰 1 커밋, Rust 바뀜 없음): fmt·clippy·test·starve·scale·storage-dir·storage-api 모두 통과, 4277개 통과·0 실패.
+- GitHub 탐침(`38e79562`, main 위로 다시 쌓은 뒤, `web` 작업 포함): 13개 작업 모두 통과(web·package·file-restore·linux-kvm·ldap·ceph·ovn·sdn-multinode·backup-s3·install-media·iso-e2e 둘·catalog-links).
 - 배포: (배포 후 채움 — svc01·svc02 지도에 두 노드·test-vm 타일·리더 꼬리표, `zone` 레이블로 판 둘, test-vm svc01 ↔ svc02 라이브 마이그레이션의 화살표·진행률·유령 타일, 유지보수 줄무늬, 휴대폰 폭)
 
 ## 다음 계획으로 넘길 사항
