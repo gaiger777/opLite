@@ -3,6 +3,8 @@
 //! 지우고, 볼륨을 늘리고, 예약 스냅샷이 생기고 보관 개수대로 지워지는지 본 뒤, VM(스냅샷과 함께)·볼륨·풀을 모두 지운다. 클러스터와 로그인 정보는 여기서 준비한다.
 //! 계획 62: 전역 역할이 없는 폴더 사용자로 로그인하면 자기 폴더만 보이고 2단계 인증으로 다시 로그인한다
 //! (`permissions.spec.ts`, QEMU 없음).
+//! 계획 69: 고정물 ext4 디스크 VM의 저장소 백업을 브라우저로 찾아보고 파일 하나·폴더(zip)를 내려받은 뒤 닫는다
+//! (`file-restore.spec.ts`, 실제 도우미 이미지 — `OPL_RESTORE_IMAGE_DIR`·`OPL_RESTORE_FIXTURES`가 없으면 건너뜀).
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]
@@ -251,5 +253,101 @@ async fn browser_shows_a_folder_user_only_their_folder() {
         .find(|u| u["name"] == "alice")
         .unwrap();
     assert_eq!(alice["two_factor"], true, "{alice}");
+    d.stop();
+}
+
+/// 계획 69: 도우미 이미지를 켠 노드에서 고정물 ext4 디스크(`make-disks.sh`의 `ext4.img`)를 단 꺼진 VM을 저장소에
+/// 백업하고, 브라우저가 백업 표의 "Browse files"로 세션을 열어 디렉터리에 들어가고 `hello.txt`(raw)와 볼륨 루트(zip)를
+/// 내려받은 뒤 닫는다. 닫은 세션은 목록에 없다. `OPL_RESTORE_IMAGE_DIR=<이미지> OPL_RESTORE_FIXTURES=<고정물>`이
+/// 없으면 건너뛴다(`file_restore.rs`와 같은 입력).
+#[tokio::test]
+async fn browser_browses_backup_files() {
+    let (Some(image_dir), Some(fixtures)) = (
+        std::env::var_os("OPL_RESTORE_IMAGE_DIR"),
+        std::env::var_os("OPL_RESTORE_FIXTURES"),
+    ) else {
+        eprintln!("skipping: set OPL_RESTORE_IMAGE_DIR and OPL_RESTORE_FIXTURES");
+        return;
+    };
+    let _one = BROWSER.lock().await;
+    web_dir();
+    let mut d = Daemon::new(
+        "node1",
+        &format!(
+            "[file_restore]\nimage_dir = \"{}\"\nrun_as = \"\"\n",
+            Path::new(&image_dir).display()
+        ),
+    );
+    d.start().await;
+    d.init("web-fr").await;
+    d.login().await;
+    for (name, extra) in [("local", None), ("bk", Some("--backups"))] {
+        let dir = d.path(name);
+        std::fs::create_dir(&dir).unwrap();
+        let mut args = vec!["pool", "create", name, "--path", dir.to_str().unwrap()];
+        args.extend(extra);
+        d.ctl(&args).await.unwrap();
+        d.wait_pool_ready(name).await;
+    }
+    common::eventually("the node reports file restore", || async {
+        let nodes = d.ctl_json(&["node", "list"]).await;
+        nodes[0]["status"]["file_restore"]["image_version"].is_string()
+    })
+    .await;
+    d.ctl(&[
+        "volume", "create", "root", "--pool", "local", "--size", "64M", "--format", "qcow2",
+    ])
+    .await
+    .unwrap();
+    let v = d.ctl_json(&["volume", "get", "root"]).await;
+    let file = d
+        .path("local")
+        .join(format!("{}.qcow2", v["id"].as_str().unwrap()));
+    let image = Path::new(&fixtures).join("ext4.img");
+    let out = Command::new("qemu-img")
+        .args(["convert", "-n", "-f", "raw", "-O", "qcow2"])
+        .arg(&image)
+        .arg(&file)
+        .output()
+        .expect("run qemu-img");
+    assert!(out.status.success(), "qemu-img convert: {out:?}");
+    d.ctl(&["vm", "create", "web", "--memory", "256", "--disk", "root"])
+        .await
+        .unwrap();
+    d.ctl(&["backup-store", "create", "st", "--pool", "bk"])
+        .await
+        .unwrap();
+    d.ctl(&["backup", "create", "web", "--store", "st", "--name", "fr1"])
+        .await
+        .unwrap();
+
+    let out = playwright(
+        "e2e/file-restore.spec.ts",
+        vec![
+            ("OPL_URL", d.server()),
+            ("OPL_USER", "admin".into()),
+            ("OPL_PASSWORD", d.admin_password.clone().unwrap()),
+            ("OPL_BACKUP", "fr1".into()),
+        ],
+    )
+    .await;
+    assert!(
+        out.status.success(),
+        "playwright failed:\n{}\n{}\nopld log:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        d.log()
+    );
+    // 브라우저가 닫은 세션은 열린 목록에 없고, 도우미 디렉터리도 치워진다.
+    common::eventually("the browser's session is closed", || async {
+        let open = d.ctl_json(&["backup", "files", "sessions"]).await;
+        open.as_array().is_some_and(Vec::is_empty)
+            && !d
+                .path("run")
+                .join("file-restore")
+                .read_dir()
+                .is_ok_and(|mut e| e.next().is_some())
+    })
+    .await;
     d.stop();
 }

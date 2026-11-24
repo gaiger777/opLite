@@ -1,9 +1,10 @@
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "cn";
 import { ChevronRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { Link, useLocation } from "react-router";
 
-import { useList } from "@/api/live";
+import { fetchList, listKey, useList } from "@/api/live";
 import { useNavUser } from "@/auth/usePermissions";
 import { FOLDER_PATHS } from "@/folders/folders";
 import { crumbsOf } from "@/layout/nav";
@@ -14,11 +15,22 @@ export function Breadcrumbs() {
   const me = useNavUser();
   const { pathname } = useLocation();
   const folders = useList("folder");
+  // 백업 파일 찾아보기(계획 69)의 백업 id는 백업 이름으로 보인다. 그 화면에서만 백업 목록을 읽는다(화면이 이미 읽는다).
+  const onBackup = pathname.startsWith("/backups/");
+  const backups = useQuery({
+    queryKey: listKey("backup"),
+    queryFn: () => fetchList("backup"),
+    staleTime: Infinity,
+    select: (list) => list.items,
+    enabled: onBackup,
+  });
   // 폴더 상세 주소의 id는 폴더 이름으로 보인다.
   const crumbs = crumbsOf(pathname, me, t, (prefix, segment) =>
     Object.values(FOLDER_PATHS).includes(prefix)
       ? folders.data?.find((f) => f.id === segment)?.spec.name
-      : undefined,
+      : prefix === "/backups"
+        ? backups.data?.find((b) => b.id === segment)?.name
+        : undefined,
   );
   if (crumbs.length === 0) {
     return null;

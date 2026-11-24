@@ -49,6 +49,13 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
   if (op.kind === "backup-restore" || op.kind === "backup-live-restore") {
     return { name: op.name };
   }
+  // 파일 복원 세션(계획 69)의 대상은 세션 id다. 백업과 그 찾아보기 화면을 보인다.
+  if (op.kind === "file-restore-session") {
+    const backup = lookup.backup.get(op.backup);
+    return backup
+      ? { name: backup.name, href: `/backups/${enc(backup.id)}/files` }
+      : { name: op.backup.slice(-8) };
+  }
   if (op.kind === "vm-import") {
     return { name: op.run.name };
   }

@@ -382,7 +382,9 @@
       "backup-store-scan": "Scan backup store {{target}}",
       "backup-convert": "Move backup {{target}} to store {{store}}",
       "backup-copy": "Copy backup {{target}} to store {{store}}",
-      "backup-live-restore": "Live restore a backup as {{target}}"
+      "backup-live-restore": "Live restore a backup as {{target}}",
+      "file-restore-session": "Browse files of backup {{target}}",
+      "file-restore-to-guest": "Restore files from a backup into {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -393,7 +395,8 @@
       "verifying": "Checking the checksum",
       "importing": "Importing into the volume",
       "checksum": "Fetching the checksum file",
-      "template": "Creating the template VM"
+      "template": "Creating the template VM",
+      "guestWriting": "Writing into the guest ({{done}} so far)"
     },
     "detail": {
       "vms": "VMs: {{vms}}.",
@@ -425,6 +428,11 @@
       "leaving-cluster": "Leaving the databases",
       "stopping": "Stopping the services",
       "kicking-server": "Kicking the dead server out"
+    },
+    "fileRestoreStage": {
+      "booting": "Starting the helper VM",
+      "ready": "Open",
+      "closing": "Closing"
     }
   },
   "pager": {
@@ -977,7 +985,10 @@
     "copy": "Copy to store",
     "copyNamed": "Copy {{name}} to another backup store",
     "copyDescription": "Copies the backup into another store, sending only the chunks that store does not have. The copy is a separate backup with its own retention.",
-    "incrementalStoreHint": "Reads only the blocks changed since the last backup of this VM in the store. Every backup still has a complete index, so any backup can be restored or deleted on its own."
+    "incrementalStoreHint": "Reads only the blocks changed since the last backup of this VM in the store. Every backup still has a complete index, so any backup can be restored or deleted on its own.",
+    "browse": "Browse files",
+    "browseNamed": "Browse files of {{name}}",
+    "browseUnavailable": "Browsing files needs the orbivisor-restore-image package on at least one node."
   },
   "backupJobs": {
     "pageHint": "Back up the chosen VMs at a set time and delete old backups by the retention rules. Times are in UTC. The cluster leader runs the jobs, at most a few backups per node at a time.",
@@ -5058,5 +5069,119 @@
       "cancel": "Cancel live restore of {{name}}"
     },
     "blockedBackup": "The VM is being live-restored. Back it up when the restore has finished."
+  },
+  "fileRestore": {
+    "title": "Files in {{name}}",
+    "opening": "Opening the backup…",
+    "openFailed": "Could not open the backup",
+    "reopen": "Open again",
+    "close": "Close",
+    "closesIn_one": "Closes in {{count}} min without use",
+    "closesIn_other": "Closes in {{count}} min without use",
+    "idleHint": "The helper VM stops after a while without browsing, downloads or restores. Leaving this page keeps it open; come back to use it again.",
+    "phase": {
+      "booting": "Starting {{time}}",
+      "ready": "Ready",
+      "failed": "Failed",
+      "closed": "Closed"
+    },
+    "slowNode": "Slow node (no hardware acceleration): up to a minute",
+    "booting": "Starting a helper VM to read the backup ({{time}})",
+    "bootingHint": "The backup is attached read-only to a small isolated VM. This usually takes a few seconds.",
+    "bootingSlowHint": "The backup is attached read-only to a small isolated VM. This node has no hardware acceleration, so it can take up to a minute.",
+    "failed": "The helper VM stopped",
+    "closed": "This browsing session is closed",
+    "nothingToBrowse": "No volume can be browsed",
+    "nothingToBrowseHint": "The disks in this backup have no supported filesystem. The list on the left says why for each one.",
+    "volumes": "Volumes",
+    "noVolumes": "No disks found in the backup.",
+    "disk": "Disk {{n}}",
+    "partition": "Partition {{n}}",
+    "logicalVolume": "LV {{name}}",
+    "blocked": {
+      "failed": "Could not mount: {{note}}",
+      "note": "{{note}}",
+      "none": "No filesystem",
+      "lvm": "LVM physical volume — browse its logical volumes",
+      "luks": "Encrypted (LUKS) — not supported",
+      "swap": "Swap space",
+      "unsupported": "Unsupported content: {{fs}}"
+    },
+    "files": "Files",
+    "folderPath": "Folder path",
+    "filesIn": "Files in {{path}}",
+    "filter": "Filter names in this folder",
+    "filterLoaded": "The filter only sees the names loaded so far.",
+    "up": "Up",
+    "selected_one": "{{count}} selected",
+    "selected_other": "{{count}} selected",
+    "selectAll": "Select all",
+    "select": "Select {{name}}",
+    "size": "Size",
+    "modified": "Modified",
+    "mode": "Mode",
+    "owner": "Owner (uid:gid)",
+    "emptyDir": "This folder is empty.",
+    "noMatch": "No names match the filter.",
+    "more": "Load more",
+    "rawName": "(not UTF-8)",
+    "rawNameHint": "This name is not valid UTF-8. Unknown bytes are shown as �; downloads keep the original bytes.",
+    "keys": "Keys: ↑/↓ move, Enter opens a folder, Backspace goes up, Space selects.",
+    "downloadFile": "Download",
+    "downloadZip_one": "Download {{count}} as zip",
+    "downloadZip_other": "Download {{count}} as zip",
+    "downloadFolder": "Download folder",
+    "downloadAs": "Download format",
+    "asFile": "Download the file",
+    "asZip": "Download as zip",
+    "asTarGz": "Download as tar.gz",
+    "asTarGzHint": "Keeps permissions, owners and links",
+    "downloadStarted": "Download started.",
+    "selectFirst": "Select files or folders first.",
+    "toVm": "Restore to VM",
+    "toVmTitle_one": "Restore {{count}} item to a VM",
+    "toVmTitle_other": "Restore {{count}} items to a VM",
+    "toVmDescription": "Writes the selected files into a running VM through its guest agent. Owners, modes and times are not restored.",
+    "toVmSubmit": "Restore",
+    "vm": "VM",
+    "chooseVm": "Choose a VM",
+    "originalVm": "{{name}} (original VM)",
+    "noRunningVms": "No running VM has a guest agent channel. Turn on the guest agent of a VM and start it.",
+    "checkingAgent": "Asking the guest agent what it allows…",
+    "noFileWrite": "The guest agent does not allow writing files. {{reason}}",
+    "noMkdir": "The selection has folders, but the guest agent does not allow running commands, which creating folders needs. Select files only, or allow guest-exec. {{reason}}",
+    "overwriteNeedsExec": "Needs guest-exec, which the agent does not allow. {{reason}}",
+    "targetDir": "Folder in the guest",
+    "targetDirHint": "The selected items are placed in this folder. It is created if it does not exist.",
+    "dirLinux": "Use an absolute path that starts with /.",
+    "dirWindows": "Use a path like C:\\restored.",
+    "conflict": "If a file already exists",
+    "conflicts": {
+      "keep": "Keep both",
+      "skip": "Skip",
+      "overwrite": "Overwrite"
+    },
+    "conflictHints": {
+      "keep": "Write the restored file next to it as name.restored-<time>.",
+      "skip": "Leave the existing file and do not write the restored one.",
+      "overwrite": "Replace the existing file (written to a temporary name first)."
+    },
+    "toVmLimits": "Writing through the guest agent is slow (about 1–3 MB/s). The node limits how many files and bytes one restore can write. Follow the progress in Tasks.",
+    "errors": {
+      "file_restore_busy": "Too many browsing sessions or downloads are running. Try again in a moment. {{message}}",
+      "file_restore_unavailable": "No node can open this backup: {{message}}",
+      "session_closed": "The browsing session is closed. Open the backup again.",
+      "session_not_ready": "The helper VM is still starting.",
+      "session_not_found": "This browsing session no longer exists (the node may have restarted). Open the backup again.",
+      "volume_not_mountable": "This volume cannot be browsed: {{message}}",
+      "entry_not_found": "The file or folder was not found in the backup.",
+      "link_expired": "The download link expired. Start the download again.",
+      "file_restore_io": "Reading the backup failed: {{message}}",
+      "file_restore_timeout": "The helper VM did not answer in time. Try again.",
+      "invalid_target_dir": "The folder in the guest is not valid: {{message}}",
+      "guest_mkdir_unavailable": "Creating folders needs guest-exec, which the guest agent does not allow. Select files only.",
+      "guest_overwrite_unavailable": "Overwriting needs guest-exec, which the guest agent does not allow. Choose Keep both or Skip.",
+      "guest_agent_restricted": "The guest agent blocks file writes: {{message}}"
+    }
   }
 }

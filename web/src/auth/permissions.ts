@@ -59,6 +59,8 @@ export const PRIVILEGES = [
   "alert.manage",
   "cluster.read",
   "cluster.admin",
+  // 백업 안 파일 찾아보기·내려받기·되돌려 쓰기(계획 69). 서버 차례대로 마지막이고, 내장 operator에는 없다.
+  "backup.file_restore",
 ] as const;
 export type Privilege = (typeof PRIVILEGES)[number];
 

@@ -98,6 +98,11 @@ export const appRoutes: RouteObject[] = [
               },
               { path: "ceph", lazy: page(() => import("@/ceph/CephPage"), "CephPage") },
               { path: "backups", lazy: page(() => import("@/backups/BackupsPage"), "BackupsPage") },
+              // 백업 안 파일 찾아보기(계획 69): 백업 탭 아래 상세(사이드바 항목이 아니다)
+              {
+                path: "backups/:id/files",
+                lazy: page(() => import("@/fileRestore/FileRestorePage"), "FileRestorePage"),
+              },
               {
                 path: "backup-jobs",
                 lazy: page(() => import("@/backups/BackupJobsPage"), "BackupJobsPage"),

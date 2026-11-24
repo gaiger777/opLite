@@ -1,4 +1,4 @@
-import { CircleAlert, CircleCheck, CircleDashed, LoaderCircle } from "lucide-react";
+import { CircleAlert, CircleCheck, CircleDashed, FolderSearch, LoaderCircle } from "lucide-react";
 import { type RefObject, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link } from "react-router";
@@ -30,6 +30,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { NativeSelect, NativeSelectOption } from "@/components/ui/native-select";
+import { fileRestoreAction, filesHref } from "@/fileRestore/availability";
 import { codeMessage, errorMessage } from "@/i18n/errors";
 import { formatBytes, formatTime } from "@/lib/format";
 import { trackTask } from "@/tasks/tasks";
@@ -157,7 +158,12 @@ export function BackupTable({
   const replicate = perms.has("cluster.admin");
   // 검증·옮기기·복사는 백업의 `backup.create`다(서버가 VM마다 본다).
   const create = perms.anywhere("backup.create");
-  const actions = restore || remove || replicate || create;
+  // 파일 찾아보기(계획 69)는 백업의 `backup.file_restore`다(내장 operator에는 없다). 기능을 모르는 노드가 있으면 숨기고,
+  // 도우미 이미지가 있는 노드가 없으면 막고 까닭을 보인다.
+  const nodes = useList("node");
+  const browseState = fileRestoreAction(nodes.data, perms.reads("node"));
+  const browse = perms.anywhere("backup.file_restore") && browseState !== "hidden";
+  const actions = restore || remove || replicate || create || browse;
   const state = useTableState("backups", [], url);
   const vmById = new Map((vms.data ?? []).map((v) => [v.id, v]));
   const originHint = (origin: NonNullable<Backup["spec"]["origin"]>) =>
@@ -460,6 +466,33 @@ export function BackupTable({
               );
               return (
                 <>
+                  {browse &&
+                    (phase === "ready" && browseState === "ready" ? (
+                      <Button
+                        asChild
+                        variant="outline"
+                        size="sm"
+                        className="mr-2"
+                        aria-label={t("backups.browseNamed", { name: backup.name })}
+                      >
+                        <Link to={filesHref(backup.id)}>
+                          <FolderSearch />
+                          {t("backups.browse")}
+                        </Link>
+                      </Button>
+                    ) : (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="mr-2"
+                        disabled
+                        aria-label={t("backups.browseNamed", { name: backup.name })}
+                        title={phase === "ready" ? t("backups.browseUnavailable") : undefined}
+                      >
+                        <FolderSearch />
+                        {t("backups.browse")}
+                      </Button>
+                    ))}
                   {restore && (
                     <Button
                       variant="outline"
@@ -559,6 +592,10 @@ export function BackupTable({
 
   return (
     <>
+      {/* 막힌 "파일 찾아보기"의 까닭(버튼마다 두지 않고 표 위에 한 번) */}
+      {browse && browseState === "unavailable" && (
+        <p className="text-sm text-muted-foreground">{t("backups.browseUnavailable")}</p>
+      )}
       <DataTable
         id="backups"
         rows={backups}

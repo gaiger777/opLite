@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import { type List, listKey } from "@/api/live";
 import type { Task } from "@/api/types";
+import { formatBytes } from "@/lib/format";
 import { UNDO_MS } from "@/lib/undo";
 import { isCenterOpen, setCenterOpen } from "@/tasks/center";
 
@@ -235,6 +236,13 @@ export function describeProgress(task: Task, t: TFunction): string | null {
   // Ceph Task는 단계 이름만 알린다(바이트 0/0).
   if (progress && task.spec.op.kind.startsWith("ceph-")) {
     return t(`tasks.cephStage.${progress.stage}`, { defaultValue: progress.stage });
+  }
+  // 파일 복원(계획 69): 세션은 단계(부팅·준비·닫는 중), VM으로 되돌려 쓰기는 쓴 양
+  if (progress && task.spec.op.kind === "file-restore-to-guest") {
+    return t("tasks.progress.guestWriting", { done: formatBytes(progress.done_bytes) });
+  }
+  if (progress && task.spec.op.kind === "file-restore-session") {
+    return t(`tasks.fileRestoreStage.${progress.stage}`, { defaultValue: progress.stage });
   }
   // SDN(OVN) Task도 단계 이름만 알린다.
   if (progress && task.spec.op.kind.startsWith("sdn-")) {
