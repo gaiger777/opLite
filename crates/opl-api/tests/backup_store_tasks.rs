@@ -1104,7 +1104,16 @@ async fn the_scheduler_queues_gc_verify_and_store_jobs() {
             .iter()
             .any(|o| matches!(o, TaskOp::BackupStoreVerify { backups } if !backups.is_empty()));
         let backed_up = done.iter().any(|o| matches!(o, TaskOp::VmBackup { .. }));
-        if gc && verify_new && backed_up {
+        // 새 백업이 예약 전체 검증보다 먼저 `ready`가 되면 그 전체 검증이 새 백업까지 검증하므로 새 백업
+        // 검증 Task는 생기지 않는다 — 둘 중 하나면 된다.
+        let verified = env
+            .cluster
+            .list::<BackupSpec>()
+            .unwrap()
+            .1
+            .iter()
+            .any(|b| b.spec.job == Some(job.id) && b.status.verify.is_some());
+        if gc && (verify_new || verified) && backed_up {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "{done:?}");
