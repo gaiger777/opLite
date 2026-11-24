@@ -939,7 +939,8 @@ orbivisorctl grant add --group helpdesk --role helpdesk-files --on /teamA
 | Apple Silicon Mac(HVF, Homebrew QEMU) | 1.2~1.3초(고정물 디스크 11개) | 227 MB/s |
 | svc01(Rocky 10 aarch64, TCG, QEMU 10.1) | 2.9~3.1초 | 88 MB/s(upstream QEMU)·109 MB/s(Rocky `qemu-kvm`) |
 | x86_64 TCG(이 Mac, 탐침) | 7.0초 | — |
-| x86_64 KVM·강제 TCG(GitHub `file-restore`) | 첫 실행 로그의 `PROBE` 줄 | 〃 |
+| x86_64 KVM(GitHub `file-restore`) | 1.7초(디스크 1개)·2.1초(13개) | 481 MB/s |
+| x86_64 강제 TCG(GitHub `file-restore`) | 8.4초(1개)·8.9초(13개) | 35 MB/s |
 
 웹·CLI에서 세션 열기는 이 부팅에 탐지(0.2~0.9초)와 Task 시작이 더해진다. 흘리기는 virtio-serial이라 TCG에서는 CPU에 묶인다.
 VM으로 되돌려 쓰기는 게스트 에이전트의 1 MiB 쓰기마다 왕복이 있어 **초당 1.5~2.5 MB**(svc01 TCG·이 Mac HVF, 3 MiB 파일)이고, 작은

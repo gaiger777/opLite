@@ -102,9 +102,9 @@
 - **탐침(설계 §18 스테이지 3·4·6):** 커널 설정(두 아키텍처 같음 — 필요한 것은 `m`·`y`), 부팅(Mac HVF 1.26초, svc01 TCG 2.96초 — 고정물 8개를 탐지·마운트·나열·읽기·끄기까지 4.0초, Mac x86_64 TCG 7.0초), 흘리기(svc01 88·109 MB/s, Mac 227 MB/s), 권한 내림·sandbox(Rocky `qemu-kvm` Uid 65534·Seccomp 2, upstream QEMU 10.1.2는 `-runas` 없음·seccomp 없음), scope 속성, 덮개 9.2 MiB, 게스트로 되돌려 쓰기 1.5~2.5 MB/s, svc01 Rocky AAVMF가 TCG에서 `-kernel` 게스트를 띄우지 못함(→ `OPL_TEST_UEFI_*`).
 - **웹 번들(eager, gzip -9):** 470,957 B → 475,397 B, **+4.4 KB**(대부분 en·ko 문구). 파일 찾아보기 화면 `FileRestorePage`는 늦게 읽는 조각(8.4 KB).
 - **스테이지 8 확인:** 문서의 CLI·설정 키·환경 변수를 코드에서 읽어 맞췄다(`backup files` 하위 명령과 `-O`·`--format`·`--conflict`·`--to`·`--all`, `[file_restore]` 열두 키의 기본값·범위, `OPL_RESTORE_*`·`OPL_TEST_QEMU`·`_ACCEL`·`_SYSTEMD`·`_UEFI_CODE`·`_UEFI_VARS`, `build.sh` 인자, restore-caps 까닭 문구, 오류 코드, 감사 문구). `folders.md` 권한 표에 `backup.file_restore`를 더하고, `Config::qemu_nbd`의 문서 주석이 스테이지 4에서 `file_restore_image_dir`에 붙어 있던 것을 제자리로 옮겼다.
-- 리뷰: (채움)
-- svc01 일반 시험: (채움)
-- GitHub 탐침: (채움 — `file-restore` 작업 첫 실행, x86_64 KVM·강제 TCG 부팅·MB/s `PROBE` 줄, btrfs·ntfs 고정물, `package`의 이미지 deb 설치)
+- 리뷰: 백엔드·웹 두 번씩. 1차(`c49c80a9` 백엔드 — 헬퍼가 끝없는 `Skipped`로 opld 메모리를 채움, 64 KiB 넘는 zip 이름이 압축을 깸, 항목 수만 세던 메모리 한도, 폴더 범위 사용자의 Task 403, 느린 흐름 하나가 채널을 막음 → **흐름마다 받을 몫(규약 판 2)**, 부팅 중 덮개 지킴이, 열기·지우기·닫기 경쟁, 세션 목록 권한; `acec4a30` 웹 — 다음 쪽 실패의 끝없는 요청, 노드 일시 단절에 상태를 잃음, 엉뚱한 VM 미리 고름, `vm.config` 없는 VM, 큰 폴더, 숨은 글자 이름). 2차(`08742fb1` 백엔드 — 노드 사이 zip 끝 덩어리가 64 MiB gRPC 한도를 넘음, zip 장부가 이스케이프한 이름을 세지 않음, 건너뛴 폴더 목록의 제곱 비용, CI 재현성은 새 target 디렉터리로, 이미지 deb 게시 시험; `2d29e3be` 웹 — 404 아닌 4xx에 끝없이 묻기, 1000개 넘는 선택은 폴더째, 흔들리던 시험).
+- svc01 일반 시험(`08742fb1`, Rocky 10 aarch64, rustc 1.100): fmt·clippy·test·starve·scale·storage-dir·storage-api 모두 통과, **4277개 통과·0 실패**. 스테이지 4~6의 `restore-it` E2E도 svc01 TCG에서 통과(41·72초).
+- GitHub 탐침: 세 번. 첫째(`f561252a`)에서 **실제 버그** — opld 시작의 남은 도우미 치우기가 같은 호스트의 다른 opld 도우미(scope)까지 멈춤 → 자기 디렉터리의 세션만(리뷰 1 커밋), 그리고 root에서 도는 단위 시험의 `run_as`. 둘째에서 덮개 지킴이 시험(부팅 중에도 지킴이가 돌아 1바이트 한도가 부팅에서 걸림 — 시험·문구 고침). 마지막(`b8a43a2f`) **12개 작업 모두 통과** — `file-restore`(x86_64 이미지 두 번 빌드 같은 해시, KVM 부팅 1.7~2.1초·481 MB/s, 강제 TCG 8.4~8.9초·35 MB/s, btrfs·ntfs·exfat 포함 17 볼륨, Uid 65534·Seccomp 2·scope), `package`(이미지 deb 빌드·Debian 13 설치), linux-kvm·ldap·ceph·ovn·backup-s3·sdn-multinode·install-media·iso-e2e 둘·catalog-links.
 - 배포: (배포 후 채움)
 
 ## 다음 계획으로 넘길 사항
