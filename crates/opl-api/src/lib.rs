@@ -24,6 +24,7 @@ mod cpu_baseline;
 mod drain;
 pub mod error;
 mod fan_out;
+pub mod file_restore;
 mod firmware;
 mod folders;
 mod guest;
@@ -109,6 +110,7 @@ pub use ceph::CephPeerSource;
 pub use ceph_agent::CephAgent;
 pub use cpu::CpuRefresher;
 pub use drain::start_drain;
+pub use file_restore::FileRestoreSessions;
 pub use firmware::UefiVarsFetcher;
 pub use ha::{HaManager, HaManagerConfig, LEASE_EXPIRED, RecoveryWriter};
 pub use health::RuntimeProbe;
@@ -394,6 +396,16 @@ fn api() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(backups::verify_backup))
         .routes(routes!(backups::convert_backup))
         .routes(routes!(backups::copy_backup))
+        .routes(routes!(file_restore::open_session))
+        .routes(routes!(file_restore::list_sessions))
+        .routes(routes!(
+            file_restore::get_session,
+            file_restore::close_session_route
+        ))
+        .routes(routes!(file_restore::list_entries))
+        .routes(routes!(file_restore::stat_entry))
+        .routes(routes!(file_restore::download_link))
+        .routes(routes!(file_restore::download))
         .routes(routes!(vms::cancel_live_restore))
         .routes(routes!(
             backup_stores::list_stores,

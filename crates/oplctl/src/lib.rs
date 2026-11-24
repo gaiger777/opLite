@@ -11,6 +11,7 @@ mod console;
 mod cpu;
 #[cfg(test)]
 mod fake_api;
+mod file_restore;
 mod firmware;
 mod lb;
 mod media;

@@ -8,6 +8,7 @@
 //! OIDC: 한 노드에서 시작한 로그인을 다른 노드가 끝낸다(상태 쿠키의 키는 클러스터 CA 키에서).
 //! 최적 배치: 리더가 아닌 노드의 API가 리더의 노드 부하를 노드 사이 RPC로 읽어 보이고 VM을 놓는다.
 //! 게스트 에이전트: 한 노드의 API가 다른 노드에서 도는 VM의 게스트 정보를 읽고 비밀번호를 설정한다.
+//! 파일 복원(계획 69): 한 노드의 API가 다른 노드의 세션을 열고 보고 내려받고(흐름을 끊으면 에이전트 흐름이 취소됨) 닫는다.
 //! 세션: 한 노드에서 만든 로그인 세션을 다른 노드가 받고, 로그아웃이 두 노드에 반영된다. 정족수가 없으면
 //! 로그인 세션을 그 노드 메모리에 둔다.
 
@@ -58,8 +59,8 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use uuid::Uuid;
 
 use common::{
-    ADMIN_PASSWORD, FakeStorage, MOUNT_ROOT, WAIT, login_at, reconciler_config, runner_config,
-    vm_request,
+    ADMIN_PASSWORD, FakeStorage, MOUNT_ROOT, WAIT, login_at, mark_pool_ready, reconciler_config,
+    runner_config, vm_request,
 };
 
 /// 받는 노드가 마이그레이션을 받는 포트 범위. Mock 하이퍼바이저는 첫 포트를 연다.
@@ -103,6 +104,8 @@ struct Node {
     ceph: Arc<FakeRunner>,
     /// 이 노드의 게스트 에이전트 소스(API와 노드 간 서버가 같은 것을 쓴다)
     guest: Arc<NodeGuest>,
+    /// 이 노드의 파일 복원 세션 등록부(도우미 이미지가 있는 노드 — API·노드 간 서버·Task 실행기가 함께 쓴다)
+    file_sessions: Arc<opl_api::FileRestoreSessions>,
 }
 
 impl Node {
@@ -160,6 +163,16 @@ impl Node {
                 hostname: format!("{name}-guest"),
                 passwords: Default::default(),
             }),
+            file_sessions: {
+                let dir = root.path().join(format!("{id}-fr"));
+                let state = common::file_restore::node_state(
+                    &dir,
+                    4,
+                    Duration::from_secs(600),
+                    Duration::from_secs(3600),
+                );
+                common::file_restore::sessions(&dir, Some(state))
+            },
         }
     }
 
@@ -222,6 +235,7 @@ impl Node {
             .with_uefi_vars(work.join("state"))
             .with_audit(audit.clone())
             .with_guest_agent(self.guest.clone())
+            .with_file_restore(self.file_sessions.clone())
             .with_ceph(Arc::new(CephPeerSource::new(
                 self.cluster.clone(),
                 self.id,
@@ -275,6 +289,7 @@ impl Node {
         state.audit = audit;
         state.metrics = metrics;
         state.guest = Some(self.guest.clone());
+        state.file_restore = self.file_sessions.clone();
         state.placement = board;
         state.ceph = Some(ceph);
         let state = Arc::new(state);
@@ -3446,4 +3461,129 @@ async fn ceph_daemon_tasks_take_turns_across_nodes() {
             .count(),
         1
     );
+}
+
+/// 파일 복원(계획 69 §10.4): 백업을 읽는 노드(B)에만 이미지가 있으면 A의 API가 B에 세션을 열고, 나열·내려받기·닫기를 노드
+/// 사이 RPC로 넘긴다. 내려받기를 중간에 끊으면 B의 에이전트 흐름이 취소된다(끊은 내려받기가 동시 흐름 4개를 쥐고 남지 않음).
+#[tokio::test]
+async fn file_restore_sessions_on_another_node_are_reached_through_any_api() {
+    use common::file_restore::{backup_pool, pool_backup, report, reported};
+    use serde_json::{Value, json};
+    let (root, a, b) = two_nodes().await;
+    let admin = login_at(&a.base, "admin", ADMIN_PASSWORD).await;
+    report(&a.cluster, b.id, Some(reported(0, 4))).await;
+    backup_pool(&a.cluster, root.path(), "bk", vec![b.id]).await;
+    mark_pool_ready(&a.cluster, b.id, "bk").await;
+    pool_backup(&a.cluster, root.path(), "bk", "web-1", Some(b.id)).await;
+
+    let (status, body) = admin.post("/backups/web-1/file-restore", Value::Null).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["session"]["node"], b.id.to_string());
+    let id = body["session"]["id"].as_str().unwrap().to_string();
+    let deadline = Instant::now() + WAIT;
+    let session = loop {
+        let (status, s) = admin.get(&format!("/file-restore/sessions/{id}")).await;
+        assert_eq!(status, StatusCode::OK, "{s}");
+        if s["phase"] == "ready" {
+            break s;
+        }
+        assert!(Instant::now() < deadline, "{s}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(session["volumes"].as_array().unwrap().len(), 4, "{session}");
+    assert_eq!(b.file_sessions.len(), 1);
+    assert!(a.file_sessions.is_empty());
+
+    let (status, page) = admin
+        .get(&format!(
+            "/file-restore/sessions/{id}/volumes/disk0p1/entries?path=/etc"
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["entries"].as_array().unwrap().len(), 3, "{page}");
+    let (status, body) = admin
+        .get(&format!(
+            "/file-restore/sessions/{id}/volumes/disk0p1/entries?path=/nope"
+        ))
+        .await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("entry_not_found"))
+    );
+
+    let link = |paths: Value, format: &'static str| {
+        let admin = admin.clone();
+        let id = id.clone();
+        async move {
+            let (status, l) = admin
+                .post(
+                    &format!("/file-restore/sessions/{id}/download-link"),
+                    json!({ "volume": "disk0p1", "paths": paths, "format": format }),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{l}");
+            l["url"].as_str().unwrap().to_string()
+        }
+    };
+    let get = |url: String| {
+        let admin = admin.clone();
+        async move {
+            admin
+                .http
+                .get(format!("{}/api/v1{url}", admin.base))
+                .bearer_auth(admin.token.as_deref().unwrap())
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    // 파일 하나는 길이와 함께, 3 MiB도 그대로(노드 사이 흐름)
+    let resp = get(link(json!(["/var/log/app.log"]), "raw").await).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["content-length"], (3u64 << 20).to_string());
+    let body = resp.bytes().await.unwrap();
+    assert_eq!(body.len(), 3 << 20);
+    let resp = get(link(json!(["/etc"]), "zip").await).await;
+    assert_eq!(resp.headers()["content-type"], "application/zip");
+    let zip = resp.bytes().await.unwrap();
+    assert_eq!(&zip[..4], b"PK\x03\x04");
+    // 남의 토큰·쓴 토큰
+    let url = link(json!(["/etc/hostname"]), "auto").await;
+    assert_eq!(get(url.clone()).await.status(), StatusCode::OK);
+    assert_eq!(get(url).await.status(), StatusCode::GONE);
+
+    // 끊은 내려받기 다섯(동시 흐름 상한 4보다 많이) 뒤에도 세션이 답한다 — 끊을 때마다 에이전트 흐름이 취소됐다.
+    for _ in 0..5 {
+        let mut resp = get(link(json!(["/var/log/app.log"]), "raw").await).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let first = resp.chunk().await.unwrap().unwrap();
+        assert!(!first.is_empty());
+        drop(resp);
+    }
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let resp = get(link(json!(["/var/log/app.log"]), "raw").await).await;
+        if resp.status() == StatusCode::OK && resp.bytes().await.is_ok_and(|b| b.len() == 3 << 20) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the cut downloads still hold the session"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let (status, _) = admin.delete(&format!("/file-restore/sessions/{id}")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let (_, s) = admin.get(&format!("/file-restore/sessions/{id}")).await;
+        if s["phase"] == "closed" && b.file_sessions.is_empty() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{s}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(b.hv.restore_launches().len(), 1);
+    assert!(a.hv.restore_launches().is_empty());
 }

@@ -415,6 +415,32 @@ pub(crate) const ROUTES: &[(&str, &str, Rule)] = &[
         Object(Vm, VmDelete),
     ),
     // 백업 저장소(계획 68 §13): 루트 종류. 키·넘겨받기는 cluster.admin.
+    // 파일 복원(계획 69): 열기는 백업 `backup.file_restore`. 세션 경로는 핸들러가 요청마다 세션 주인(남의 것은 루트
+    // `cluster.admin`)과 그 백업의 `backup.file_restore`를 본다. 목록은 자기 세션(`all`은 루트 `cluster.admin`).
+    (
+        "POST",
+        "/backups/{key}/file-restore",
+        Object(Backup, BackupFileRestore),
+    ),
+    ("GET", "/file-restore/sessions", List),
+    ("GET", "/file-restore/sessions/{id}", Handler),
+    ("DELETE", "/file-restore/sessions/{id}", Handler),
+    (
+        "GET",
+        "/file-restore/sessions/{id}/volumes/{volume}/entries",
+        Handler,
+    ),
+    (
+        "GET",
+        "/file-restore/sessions/{id}/volumes/{volume}/stat",
+        Handler,
+    ),
+    ("POST", "/file-restore/sessions/{id}/download-link", Handler),
+    (
+        "GET",
+        "/file-restore/sessions/{id}/download/{token}",
+        Handler,
+    ),
     ("GET", "/backup-stores", Root(SystemRead)),
     ("POST", "/backup-stores", Root(StorageConfig)),
     ("GET", "/backup-stores/{key}", Root(SystemRead)),

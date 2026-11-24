@@ -31,6 +31,10 @@ use crate::ceph::{
     CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, NodeDisksRequest,
 };
 use crate::fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
+use crate::file_restore::{
+    DownloadPiece, FileRestoreCallRequest, FileRestoreChunk, FileRestoreDownloadRequest,
+    FileRestoreReply, FileRestoreSource,
+};
 use crate::firmware::{
     PurgeFirmwareReply, PurgeFirmwareRequest, PushFirmwareReply, PushFirmwareRequest,
     TpmStateRequest, UefiVarsChunk, UefiVarsRequest, VarsTemplates,
@@ -84,6 +88,8 @@ pub struct PeerService {
     firmware_copies: Option<VarsTemplates>,
     /// 이 노드에서 도는 VM의 게스트 에이전트(계획 59). 없으면 `unimplemented`로 거부한다(옛 노드와 같다).
     guest: Option<Arc<dyn GuestAgentSource>>,
+    /// 이 노드의 파일 복원 세션(계획 69). 없으면 `unimplemented`로 거부한다(옛 노드와 같다).
+    file_restore: Option<Arc<dyn FileRestoreSource>>,
     /// Raft·리스가 아닌 처리(마이그레이션 받기, 콘솔 중계, UEFI 변수·감사 로그·지표 읽기)를 돌릴
     /// 실행기. 없으면 서버의 실행기에서 돈다.
     work: Option<Handle>,
@@ -107,6 +113,7 @@ impl PeerService {
             state_dir: None,
             firmware_copies: None,
             guest: None,
+            file_restore: None,
             work: None,
         }
     }
@@ -134,6 +141,12 @@ impl PeerService {
     /// 이 노드에서 도는 VM의 게스트 정보 읽기·비밀번호 설정을 `source`로 한다. 없으면 `unimplemented`로 거부한다.
     pub fn with_guest_agent(mut self, source: Arc<dyn GuestAgentSource>) -> Self {
         self.guest = Some(source);
+        self
+    }
+
+    /// 이 노드의 파일 복원 세션을 `source`로 다룬다. 없으면 `unimplemented`로 거부한다.
+    pub fn with_file_restore(mut self, source: Arc<dyn FileRestoreSource>) -> Self {
+        self.file_restore = Some(source);
         self
     }
 
@@ -764,6 +777,51 @@ impl Peer for PeerService {
             })
             .await?;
         Ok(Response::new(reply))
+    }
+
+    async fn file_restore_call(
+        &self,
+        req: Request<FileRestoreCallRequest>,
+    ) -> Result<Response<FileRestoreReply>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .file_restore
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not serve file restore"))?;
+        let req = req.into_inner();
+        let reply = self.offload(async move { source.call(req).await }).await?;
+        Ok(Response::new(reply))
+    }
+
+    type FileRestoreDownloadStream = BoxStream<'static, Result<FileRestoreChunk, Status>>;
+
+    /// 내려받기: 머리(또는 거절) 하나 뒤 조각들. 받는 쪽이 흐름을 버리면 조각 흐름도 버려져 세션 노드의 만들기가 멈춘다.
+    async fn file_restore_download(
+        &self,
+        req: Request<FileRestoreDownloadRequest>,
+    ) -> Result<Response<Self::FileRestoreDownloadStream>, Status> {
+        self.authorize(&req)?;
+        let source = self
+            .file_restore
+            .clone()
+            .ok_or_else(|| Status::unimplemented("this node does not serve file restore"))?;
+        let req = req.into_inner();
+        let started = self
+            .offload(async move { source.download(req).await })
+            .await?;
+        let stream = match started {
+            Err(f) => futures_util::stream::iter([Ok(FileRestoreChunk::Fault(f))]).boxed(),
+            Ok((head, rx)) => futures_util::stream::iter([Ok(FileRestoreChunk::Head(head))])
+                .chain(ReceiverStream::new(rx).map(|piece| {
+                    Ok(match piece {
+                        Ok(DownloadPiece::Data(d)) => FileRestoreChunk::Data(d),
+                        Ok(DownloadPiece::Done { entries }) => FileRestoreChunk::Done { entries },
+                        Err(m) => FileRestoreChunk::Failed(m),
+                    })
+                }))
+                .boxed(),
+        };
+        Ok(Response::new(stream))
     }
 
     type FollowStream = BoxStream<'static, Result<FollowFrame, Status>>;

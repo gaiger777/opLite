@@ -9,6 +9,7 @@ mod ceph;
 mod clone;
 mod download;
 mod drain;
+pub(crate) mod file_restore;
 mod firmware;
 mod hotplug;
 mod import;
@@ -813,7 +814,9 @@ async fn execute(ctx: &Ctx, task: Task, resume: bool) {
                 | TaskOp::BackupCopy { .. }
                 | TaskOp::BackupLiveRestore { .. }
         )
-        || matches!(task.spec.op, TaskOp::NetworkMigrate { .. });
+        || matches!(task.spec.op, TaskOp::NetworkMigrate { .. })
+        // 파일 복원 세션은 스스로 유휴·최대 시간으로 끝난다(계획 69 §10.3).
+        || matches!(task.spec.op, TaskOp::FileRestoreSession { .. });
     let (result, unfinished) = if unlimited {
         (perform(ctx, &task, resume).await, false)
     } else {
@@ -1195,10 +1198,12 @@ async fn perform(ctx: &Ctx, task: &Task, resume: bool) -> Result<Option<String>,
         TaskOp::BackupCopy { store } => {
             return Box::pin(backup_store::copy(ctx, task, store)).await;
         }
-        // 파일 복원 Task(계획 69)는 스테이지 5·6이 더한다. 그 전에는 API가 만들지 않는다.
-        TaskOp::FileRestoreSession { .. } | TaskOp::FileRestoreToGuest { .. } => {
-            Err("file restore tasks are not available yet".into())
+        // 파일 복원 세션(계획 69 §10): 유휴·최대 시간·닫기로 끝나면 그 까닭을 경고로 남긴다.
+        TaskOp::FileRestoreSession { backup } => {
+            return Box::pin(file_restore::run(ctx, task, *backup)).await;
         }
+        // 게스트로 되돌려 쓰기는 스테이지 6이 더한다. 그 전에는 API가 만들지 않는다.
+        TaskOp::FileRestoreToGuest { .. } => Err("file restore tasks are not available yet".into()),
     };
     done.map(|()| None)
 }

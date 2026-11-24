@@ -657,6 +657,13 @@ impl Member {
             });
         // 게스트 정보 캐시(계획 59): reconciler가 모아 넣고 API와 다른 노드가 읽는다.
         let guest = Arc::new(GuestInfoStore::new(cluster.clone(), hv.clone()));
+        // 파일 복원 세션 등록부(계획 69): 세션 Task·API·노드 사이 RPC가 함께 쓴다. 세션 디렉터리는 QEMU 드라이버의
+        // run_dir·state_dir(시작 때 `sweep_restore_helpers`가 치우는 자리)이다.
+        let file_sessions = Arc::new(opl_api::FileRestoreSessions::new(
+            host.file_restore.clone(),
+            config.run_dir.clone(),
+            config.data_dir.clone(),
+        ));
         // 밀어 둔 펌웨어 사본의 변수 크기를 이 노드의 템플릿과 견준다.
         let vars_templates = VarsTemplates {
             uefi: host.profile.uefi_vars_template.clone(),
@@ -678,6 +685,7 @@ impl Member {
             .with_uefi_vars(config.data_dir.clone())
             .with_firmware_copies(vars_templates)
             .with_guest_agent(guest.clone())
+            .with_file_restore(file_sessions.clone())
             .with_audit(audit.clone())
             .with_alerts(Arc::new(alert_book.clone()))
             .with_metrics(metrics_source.clone())
@@ -727,6 +735,7 @@ impl Member {
             state.metrics = Some(metrics_source);
             state.alerts = Some(alert_book);
             state.guest = Some(guest.clone());
+            state.file_restore = file_sessions.clone();
             state.topology = topology_source.clone();
             state.fence = fence;
             state.placement = placement;

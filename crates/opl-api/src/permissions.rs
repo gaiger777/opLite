@@ -49,7 +49,7 @@ fn bad(e: impl std::fmt::Display) -> ApiError {
 
 /// 역할·토큰 범위의 권한 이름에 기능이 드는 권한이 있으면 그 기능을 검증보다 먼저 본다(409 `cluster_upgrading`):
 /// `backup.file_restore`(계획 69)는 옛 노드가 이름을 버려 권한 판단이 노드마다 달라지므로 모든 노드가 `file-restore`를
-/// 알 때만. 파일 복원 API(스테이지 5) 전까지는 400으로 막는다.
+/// 알 때만.
 pub(crate) fn check_privilege_features(
     cluster: &Cluster,
     privileges: &[String],
@@ -59,9 +59,6 @@ pub(crate) fn check_privilege_features(
         .any(|p| p == Privilege::BackupFileRestore.as_str())
     {
         require_feature(cluster, FILE_RESTORE)?;
-        return Err(ApiError::bad_request(
-            "backup.file_restore is not available yet (file restore)",
-        ));
     }
     Ok(())
 }

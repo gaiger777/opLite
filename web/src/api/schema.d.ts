@@ -748,7 +748,8 @@ export interface paths {
          *     쓴 노드, 공유 풀은 백업 풀을 쓸 수 있는 노드)에서 돈다. 풀이 없어졌으면 이 노드의 Task가 리소스만
          *     지운다. 파일을 지울 노드가 없으면 409(`node_offline`, `pool_unavailable` 등)이고, `force`면 리소스만
          *     바로 지우고 200이다(파일은 백업 풀에 남는다). 증분 백업(`failed`가 아닌 것)의 부모는 `force`여도 409
-         *     `backup_in_use`다(자식부터 지운다).
+         *     `backup_in_use`다(자식부터 지운다). 파일 복원 세션이 열린 백업은 409 `backup_in_use`이고, `force`면 그 세션들을 닫고
+         *     지운다(계획 69 §10.5).
          */
         delete: operations["delete_backup"];
         options?: never;
@@ -898,6 +899,30 @@ export interface paths {
          */
         put: operations["put_chunk"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/backups/{key}/file-restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 백업 `key`의 파일 복원 세션을 연다(설계 §10.1). 같은 사용자(토큰이면 토큰 주인)의 같은 백업 세션이 열려 있으면 그것을
+         *     돌려준다(200), 아니면 도우미 이미지가 있고 백업을 읽을 수 있는 노드(이 노드 먼저 → 세션이 적은 노드 → KVM·HVF)에
+         *     Task `file-restore-session`을 만든다(202 — 단계는 세션 보기나 Task로 본다). 백업의 `backup.file_restore`가 든다.
+         *     모든 노드가 `file-restore`를 알아야 하고(409 `cluster_upgrading`), 백업이 `ready`가 아니면 409 `backup_not_ready`,
+         *     지우는 중이면 409 `backup_busy`, 열 노드가 없으면 409 `file_restore_unavailable`(이미지 없음)·`file_restore_busy`(모두
+         *     꽉 참)다.
+         */
+        post: operations["open_session"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1250,6 +1275,124 @@ export interface paths {
          *     노드마다 켤 수 있는지·빠진 플래그다(숨김 목록·기준을 지금처럼 적용). VM을 만들거나 고칠 수 있는 사용자가 읽는다.
          */
         get: operations["list_cpu_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/file-restore/sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 열린 파일 복원 세션(자기 것, `all`이면 모두 — 루트 `cluster.admin`). 세션 노드에 물어 볼륨·만료 시각을 채운다(닿지
+         *     않으면 Raft의 단계만).
+         */
+        get: operations["list_sessions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/file-restore/sessions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 세션 하나(부팅 중이면 `volumes`가 비어 있다). 끝난 세션은 `closed`·`failed`와 까닭. */
+        get: operations["get_session"];
+        put?: never;
+        post?: never;
+        /** 세션을 닫는다(204 — Task가 도우미를 끝내고 치운다). 끝난 세션도 204. */
+        delete: operations["close_session_route"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/file-restore/sessions/{id}/download-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * 내려받기 링크(§11): 세션 노드 메모리에 60초·한 번만 쓰는 토큰을 만든다(요청한 사용자에 묶임). 브라우저·CLI가
+         *     `GET url`로 받는다(같은 사용자의 인증이 다시 필요하다). 항목은 1~1000개, `raw`는 일반 파일 하나만(400 `invalid_path`).
+         */
+        post: operations["download_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/file-restore/sessions/{id}/download/{token}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 링크로 내려받는다(GET — 브라우저 내려받기). 링크를 만든 사용자만(403), 지났거나 쓴 링크는 410 `link_expired`. `raw`는
+         *     `Content-Length`와 `application/octet-stream`, zip·tar.gz는 길이 없이 흘린다. 도중의 읽기 실패는 연결을 끊는다(받은
+         *     파일이 잘렸음을 클라이언트가 안다). 감사는 흐름이 끝날 때 바이트·항목 수와 함께 적는다.
+         */
+        get: operations["download"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/file-restore/sessions/{id}/volumes/{volume}/entries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * 디렉터리 한 쪽(이름 바이트 차례). 볼륨을 처음 보면 붙인다(저널이 재생되지 않았으면 볼륨 `note`). 볼륨이 없으면 404
+         *     `volume_not_found`, 항목이 없으면 404 `entry_not_found`, 디렉터리가 아니면 400 `invalid_path`, 찾아볼 수 없는 볼륨은 409
+         *     `volume_not_mountable`, 부팅 중이면 409 `session_not_ready`, 동시 요청이 많으면 429 `file_restore_busy`, 도우미가 60초 안에
+         *     답하지 않으면 504 `file_restore_timeout`.
+         */
+        get: operations["list_entries"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/file-restore/sessions/{id}/volumes/{volume}/stat": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** 항목 하나(링크는 따라가지 않음). 오류는 나열과 같다. */
+        get: operations["stat_entry"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6062,6 +6205,30 @@ export interface components {
             /** @enum {string} */
             state: "in-use";
         };
+        /**
+         * @description 내려받기 형식
+         * @enum {string}
+         */
+        DownloadFormat: "auto" | "raw" | "zip" | "tar.gz";
+        /** @description 내려받기 링크: 60초 안에 한 번, 같은 사용자만 쓴다. */
+        DownloadLink: {
+            /**
+             * Format: int64
+             * @description 남은 초
+             */
+            expires_in: number;
+            /** @description `/api/v1` 아래 경로(`/file-restore/sessions/{id}/download/{token}`) */
+            url: string;
+        };
+        /** @description 내려받기 링크 요청(`POST /file-restore/sessions/{id}/download-link`) */
+        DownloadLinkRequest: {
+            format?: components["schemas"]["DownloadFormat"];
+            /** @description 내려받을 파일 이름(확장자 포함). 없으면 `<백업 이름>-<마지막 조각>.<형식>` */
+            name?: string;
+            /** @description 고른 항목(같은 볼륨, 1~1000개). 볼륨 루트(빈 경로)는 그 아래 모두 */
+            paths: components["schemas"]["EntryPath"][];
+            volume: string;
+        };
         /** @description 유효 권한과 그 근거 */
         EffectivePermissions: {
             /** @description 이 대상에 닿는 그 사용자(와 그 그룹)의 grant */
@@ -6087,11 +6254,45 @@ export interface components {
             /** @description 복구 키(`OPK1-…`) */
             recovery_key?: string;
         };
+        /**
+         * @description 디렉터리 항목 종류(장치·FIFO·소켓은 `other`)
+         * @enum {string}
+         */
+        EntryKind: "file" | "dir" | "symlink" | "other";
         /** @description a path inside a volume: a list of names (empty = the volume root), or a string "/etc/nginx" (UTF-8 names only; written back as a list) */
         EntryPath: (string | {
             /** @description standard base64 of a name that is not UTF-8 */
             b64: string;
         })[] | string;
+        /** @description 디렉터리 항목 하나 */
+        EntryView: {
+            /** Format: int32 */
+            gid: number;
+            kind: components["schemas"]["EntryKind"];
+            /** @description 심볼릭 링크 대상(따라가지 않는다) */
+            link_target?: string;
+            /**
+             * Format: int32
+             * @description 권한 비트(`st_mode & 0o7777`)
+             */
+            mode: number;
+            /**
+             * Format: int64
+             * @description 수정 시각(유닉스 초, 1970 전이면 음수)
+             */
+            mtime: number;
+            /** @description 이름(UTF-8이 아닌 바이트는 U+FFFD) */
+            name: string;
+            /** @description 이름이 UTF-8이 아니면 원래 바이트의 표준 base64(경로 조각 `{ "b64": … }`로 되보낸다) */
+            raw?: string;
+            /**
+             * Format: int64
+             * @description 크기(바이트, 일반 파일)
+             */
+            size: number;
+            /** Format: int32 */
+            uid: number;
+        };
         /** @description 오류 응답 본문 */
         ErrorBody: {
             /** @description 기계가 읽는 오류 종류. 예: `not_found`, `revision_mismatch`, `cluster_no_quorum` */
@@ -6253,6 +6454,46 @@ export interface components {
              * @description 지금 열린 세션 수
              */
             sessions: number;
+        };
+        /** @description 세션 열기의 답: 세션과 그 Task(단계를 Task watch로 볼 수 있다) */
+        FileRestoreOpened: {
+            session: components["schemas"]["FileRestoreSessionView"];
+            /** Format: uuid */
+            task: string;
+        };
+        /** @description 파일 복원 세션(API 보기). 세션은 Task `file-restore-session`이고 볼륨 목록은 세션 노드 메모리에 있다. */
+        FileRestoreSessionView: {
+            /** Format: uuid */
+            backup: string;
+            backup_name: string;
+            error?: string;
+            /** Format: int64 */
+            expires_at: number;
+            /**
+             * Format: uuid
+             * @description 세션 id(= Task 대상)
+             */
+            id: string;
+            /** Format: int64 */
+            last_used_at: number;
+            /**
+             * Format: uuid
+             * @description 세션 노드
+             */
+            node: string;
+            /**
+             * Format: int64
+             * @description 연 시각·마지막으로 쓴 시각·닫힐 시각(유닉스 초 — 유휴와 최대 시간 가운데 이른 것)
+             */
+            opened_at: number;
+            /**
+             * Format: uuid
+             * @description 연 사용자(토큰이면 토큰 주인)
+             */
+            opened_by: string;
+            phase: components["schemas"]["SessionPhase"];
+            /** @description 볼륨(부팅 중이면 빈 목록) */
+            volumes?: components["schemas"]["VolumeView"][];
         };
         FinishRegistrationRequest: {
             credential: components["schemas"]["RegistrationCredential"];
@@ -7426,6 +7667,12 @@ export interface components {
          * @enum {string}
          */
         Level: "standard" | "premium";
+        /** @description 디렉터리 나열 한 쪽 */
+        ListPage: {
+            entries: components["schemas"]["EntryView"][];
+            /** @description 다음 쪽 커서. 없으면 마지막 쪽 */
+            next?: string;
+        };
         /** @description 목록과 그 목록이 반영하는 revision. `GET /api/v1/watch?since=<revision>`으로 이어서 구독한다. */
         List_AccessRoleView: {
             items: {
@@ -10074,6 +10321,24 @@ export interface components {
              */
             used: number;
         };
+        /** @description 파티션 정보 */
+        PartitionInfo: {
+            /**
+             * Format: int32
+             * @description 파티션 번호(1부터, MBR 논리 파티션은 5부터)
+             */
+            number: number;
+            table: components["schemas"]["PartitionTable"];
+            /** @description 파티션 종류 이름(예: `Linux filesystem`, `EFI System`, `0x83`) */
+            type_name: string;
+            /** @description GPT 파티션 UUID(MBR은 없음) */
+            uuid?: string;
+        };
+        /**
+         * @description 파티션 표 종류
+         * @enum {string}
+         */
+        PartitionTable: "mbr" | "gpt";
         PasskeyAdded: {
             passkey: components["schemas"]["PasskeyView"];
             /** @description 첫 요소라 새로 만든 복구 코드(한 번만 보인다). 아니면 비어 있다. */
@@ -12744,6 +13009,11 @@ export interface components {
             id: string;
             name: string;
         };
+        /**
+         * @description 세션 단계
+         * @enum {string}
+         */
+        SessionPhase: "booting" | "ready" | "failed" | "closed";
         /** @description 설정에서 바꿀 값. 주어진 필드만 바꾼다. */
         SettingsPatch: {
             /** @description 노드 API 인증서에 더할 이름(DNS 이름·IP) 전체. `[]`는 지워 노드 이름만 쓴다. */
@@ -14784,6 +15054,11 @@ export interface components {
             url: string;
         };
         /**
+         * @description 볼륨 종류
+         * @enum {string}
+         */
+        VolumeKind: "disk" | "partition" | "logical_volume";
+        /**
          * @description 볼륨 파일이 준비됐는지. VM은 준비된 볼륨만 붙일 수 있다.
          * @enum {string}
          */
@@ -14803,6 +15078,11 @@ export interface components {
             /** Format: int64 */
             size_bytes: number;
         };
+        /**
+         * @description 볼륨 마운트 상태
+         * @enum {string}
+         */
+        VolumeState: "unmounted" | "mounted" | "failed";
         VolumeStatus: {
             /**
              * Format: int64
@@ -14829,6 +15109,32 @@ export interface components {
             node: string | null;
             /** @default pending */
             phase: components["schemas"]["VolumePhase"];
+        };
+        /** @description 세션의 볼륨 하나(디스크·파티션·LVM 논리 볼륨). 도우미가 탐지하고 opld가 한도를 검사한다. */
+        VolumeView: {
+            /**
+             * Format: int32
+             * @description 백업 디스크 번호(LV는 첫 PV의 디스크)
+             */
+            disk: number;
+            /** @description 파일시스템·내용 종류(blkid `TYPE` — `ext4`, `xfs`, `LVM2_member`, `crypto_LUKS` …). 모르면 없음 */
+            fs?: string;
+            /** @description `disk0`, `disk0p2`, `lvm/rl/root`(세션 안에서만 뜻이 있다) */
+            id: string;
+            kind: components["schemas"]["VolumeKind"];
+            label?: string;
+            /** @description 찾아볼 수 있는 파일시스템인지(LVM PV·암호화·swap·모르는 것은 거짓) */
+            mountable: boolean;
+            /** @description 덧붙임(예: `journal not replayed — recent changes may be missing`, `encrypted (LUKS) — not supported`) */
+            note?: string;
+            partition?: components["schemas"]["PartitionInfo"];
+            /**
+             * Format: int64
+             * @description 크기(바이트)
+             */
+            size: number;
+            state: components["schemas"]["VolumeState"];
+            uuid?: string;
         };
         Vxlan: {
             /**
@@ -16746,6 +17052,46 @@ export interface operations {
             };
         };
     };
+    open_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description backup id or name */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description your open session of this backup */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileRestoreOpened"];
+                };
+            };
+            /** @description a new session is starting */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileRestoreOpened"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     put_backup_file: {
         parameters: {
             query?: never;
@@ -17309,6 +17655,254 @@ export interface operations {
                 };
             };
             "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_sessions: {
+        parameters: {
+            query?: {
+                /** @description 모든 사용자의 세션(루트 `cluster.admin`) */
+                all?: boolean;
+                /** @description 이 백업(id나 이름)의 세션만 */
+                backup?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileRestoreSessionView"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_session: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["FileRestoreSessionView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    close_session_route: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    download_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DownloadLinkRequest"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DownloadLink"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    download: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+                token: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description the file or archive */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_entries: {
+        parameters: {
+            query?: {
+                /** @description 디렉터리 경로(`/etc/nginx`, UTF-8 이름만 — 없으면 볼륨 루트) */
+                path?: string;
+                /** @description UTF-8이 아닌 이름이 든 경로: 조각 바이트를 `/`로 이은 것의 URL-safe base64 */
+                path_b64?: string;
+                /** @description 앞 쪽의 `next` */
+                cursor?: string;
+                /** @description 한 쪽 항목 수(1~1000, 기본 200) */
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+                /** @description volume id (`disk0p1`, `lvm/vg/lv` — percent-encode `/`) */
+                volume: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ListPage"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    stat_entry: {
+        parameters: {
+            query?: {
+                path?: string;
+                path_b64?: string;
+            };
+            header?: never;
+            path: {
+                /** @description session id */
+                id: string;
+                /** @description volume id */
+                volume: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EntryView"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
                 headers: {
                     [name: string]: unknown;
                 };

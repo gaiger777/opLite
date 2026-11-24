@@ -187,6 +187,22 @@ fn main() {
             "crate::guest::GuestAgentRequest",
             "crate::guest::GuestAgentReply",
         ))
+        .method(json(
+            "file_restore_call",
+            "FileRestoreCall",
+            "crate::file_restore::FileRestoreCallRequest",
+            "crate::file_restore::FileRestoreReply",
+        ))
+        .method(
+            Method::builder()
+                .name("file_restore_download")
+                .route_name("FileRestoreDownload")
+                .input_type("crate::file_restore::FileRestoreDownloadRequest")
+                .output_type("crate::file_restore::FileRestoreChunk")
+                .codec_path("crate::codec::BinaryCodec")
+                .server_streaming()
+                .build(),
+        )
         .method(
             Method::builder()
                 .name("follow")

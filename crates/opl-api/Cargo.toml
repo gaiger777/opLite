@@ -40,6 +40,10 @@ opl-peer.workspace = true
 opl-reconciler.workspace = true
 # 백업 저장소(계획 68): 형식·백엔드·GC·검증·NBD
 opl-store.workspace = true
+# 파일 복원(계획 69): 통신 규약 이름·사건과 zip·tar.gz 흘려 쓰기
+opl-restore.workspace = true
+# 파일 복원 내려받기 흐름의 조각
+bytes.workspace = true
 opl-types = { workspace = true, features = ["openapi"] }
 # OIDC 토큰 교환의 폼 본문
 reqwest = { workspace = true, features = ["form"] }
@@ -66,7 +70,6 @@ uuid.workspace = true
 insta.workspace = true
 proptest.workspace = true
 # 시험용 가짜 LDAP 서버의 BER
-bytes.workspace = true
 lber.workspace = true
 openraft.workspace = true
 opl-qemu.workspace = true

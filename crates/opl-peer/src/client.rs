@@ -38,6 +38,10 @@ use uuid::Uuid;
 
 use crate::ceph::{CephStatusRequest, NodeDisksRequest};
 use crate::fence::FenceStatusRequest;
+use crate::file_restore::{
+    DownloadHead, DownloadPiece, DownloadStream, FileRestoreCallRequest, FileRestoreChunk,
+    FileRestoreDownloadRequest, FileRestoreFault, FileRestoreReply,
+};
 use crate::firmware::{
     Expect, MAX_TPM_BYTES, PurgeFirmwareRequest, PushFirmwareRequest, TpmStateError,
     TpmStateRequest, UefiVarsError, UefiVarsRequest,
@@ -717,6 +721,86 @@ impl Peers {
             Err(s) if s.code() == Code::Unimplemented => Err(GuestAgentError::Unsupported),
             Err(s) => Err(GuestAgentError::Unreachable(s.message().to_string())),
         }
+    }
+
+    /// 노드 `node`(첫 링크 `addr`)의 파일 복원 세션에 `req`를 보낸다(계획 69 §10.4). 그 노드가 이 RPC를 모르면 409
+    /// `cluster_upgrading`, 닿지 못하면 503 `node_unreachable`의 [`FileRestoreFault`]다.
+    pub async fn file_restore_call(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: FileRestoreCallRequest,
+        timeout: Duration,
+    ) -> FileRestoreReply {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                req.set_timeout(timeout);
+                addressed(&mut req, Some(node));
+                async move { within(timeout, client.file_restore_call(req)).await }
+            })
+            .await;
+        match reply {
+            Ok(reply) => reply.into_inner(),
+            Err(s) if s.code() == Code::Unimplemented => Err(FileRestoreFault::unsupported()),
+            Err(s) => Err(FileRestoreFault::unreachable(s.message())),
+        }
+    }
+
+    /// 노드 `node`(첫 링크 `addr`)의 세션에서 내려받기를 연다: 머리와 조각 흐름. 머리는 `open_timeout` 안에 와야 하고,
+    /// 그 뒤로는 시간 제한이 없다(gRPC 흐름 제어가 되밀고, 받는 쪽이 흐름을 버리면 취소된다).
+    pub async fn file_restore_download(
+        &self,
+        node: NodeId,
+        addr: &str,
+        req: FileRestoreDownloadRequest,
+        open_timeout: Duration,
+    ) -> Result<(DownloadHead, DownloadStream), FileRestoreFault> {
+        let reply = self
+            .send_bulk(addr, |mut client| {
+                let mut req = Request::new(req.clone());
+                addressed(&mut req, Some(node));
+                async move { within(open_timeout, client.file_restore_download(req)).await }
+            })
+            .await;
+        let mut chunks = match reply {
+            Ok(reply) => reply.into_inner(),
+            Err(s) if s.code() == Code::Unimplemented => {
+                return Err(FileRestoreFault::unsupported());
+            }
+            Err(s) => return Err(FileRestoreFault::unreachable(s.message())),
+        };
+        let first = tokio::time::timeout(open_timeout, chunks.message())
+            .await
+            .map_err(|_| FileRestoreFault::unreachable("timed out"))?;
+        let head = match first {
+            Ok(Some(FileRestoreChunk::Head(head))) => head,
+            Ok(Some(FileRestoreChunk::Fault(f))) => return Err(f),
+            Ok(_) => return Err(FileRestoreFault::unreachable("the download ended early")),
+            Err(s) => return Err(FileRestoreFault::unreachable(s.message())),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tokio::spawn(async move {
+            loop {
+                let piece = match chunks.message().await {
+                    Ok(Some(FileRestoreChunk::Data(d))) => Ok(DownloadPiece::Data(d)),
+                    Ok(Some(FileRestoreChunk::Done { entries })) => {
+                        let _ = tx.send(Ok(DownloadPiece::Done { entries })).await;
+                        return;
+                    }
+                    Ok(Some(FileRestoreChunk::Failed(m))) => Err(m),
+                    Ok(Some(_)) => Err("unexpected download message".to_string()),
+                    Ok(None) => Err("the download ended early".to_string()),
+                    Err(s) => Err(s.message().to_string()),
+                };
+                let end = piece.is_err();
+                // 받는 쪽이 버렸으면 흐름을 버린다(gRPC 취소 → 세션 노드가 에이전트 흐름을 취소).
+                if tx.send(piece).await.is_err() || end {
+                    return;
+                }
+            }
+        });
+        Ok((head, rx))
     }
 }
 

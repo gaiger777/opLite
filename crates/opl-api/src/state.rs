@@ -93,6 +93,8 @@ pub struct AppState {
     pub(crate) digest_cache: std::sync::Mutex<crate::metrics_history::DigestCache>,
     /// Prometheus 끝점(`GET /metrics`)의 5초 캐시
     pub(crate) prometheus_cache: crate::prometheus::PrometheusCache,
+    /// 이 노드의 파일 복원 세션(계획 69 — 세션 Task·API·노드 사이 RPC가 함께 쓴다). 기본은 세션을 돌리지 않는 노드다.
+    pub file_restore: Arc<crate::file_restore::FileRestoreSessions>,
 }
 
 impl AppState {
@@ -137,6 +139,7 @@ impl AppState {
             ovn: None,
             digest_cache: Default::default(),
             prometheus_cache: Default::default(),
+            file_restore: Arc::default(),
         }
     }
 }

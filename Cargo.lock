@@ -1655,6 +1655,7 @@ dependencies = [
  "opl-peer",
  "opl-qemu",
  "opl-reconciler",
+ "opl-restore",
  "opl-store",
  "opl-types",
  "proptest",

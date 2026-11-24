@@ -367,6 +367,16 @@ impl FileRestoreState {
         changed
     }
 
+    /// 검사 결과를 바로 둔다(시험과 가짜 하이퍼바이저 — 이미지 파일 없이 세션을 띄운다). manifest가 그대로면 다시 검사하지
+    /// 않는다.
+    pub fn set_checked_image(&self, image: CheckedImage) {
+        let stamp = manifest_stamp(&self.image_dir, self.arch);
+        *self.image.lock().unwrap() = Some(ImageCheck {
+            stamp,
+            result: Ok(image),
+        });
+    }
+
     /// 검사를 지난 이미지
     pub fn image(&self) -> Option<CheckedImage> {
         self.image

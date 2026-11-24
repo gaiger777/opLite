@@ -14,6 +14,7 @@ mod codec;
 #[cfg(feature = "fault-it")]
 pub mod fault;
 pub mod fence;
+pub mod file_restore;
 pub mod firmware;
 pub mod guest;
 pub mod metrics;
@@ -32,6 +33,11 @@ pub use audit::{AuditReply, AuditSource};
 pub use ceph::{CephSource, CephStatusReply, CephStatusRequest, NodeDisksReply, NodeDisksRequest};
 pub use client::{ConsoleError, ConsoleReceiver, ConsoleSender, ConsoleStream, GrpcNetwork, Peers};
 pub use fence::{FenceSource, FenceStatusReply, FenceStatusRequest};
+pub use file_restore::{
+    DownloadHead, DownloadPiece, DownloadStream, FileRestoreAnswer, FileRestoreCallRequest,
+    FileRestoreDownloadRequest, FileRestoreFault, FileRestoreOp, FileRestoreReply,
+    FileRestoreSource,
+};
 pub use firmware::{
     PurgeFirmwareRequest, PushFirmwareRequest, TpmStateError, UefiVarsChunk, UefiVarsError,
     VarsTemplates, read_chunks, sha256_hex,

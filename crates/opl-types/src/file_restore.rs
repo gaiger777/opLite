@@ -788,6 +788,75 @@ pub fn guest_temp_name(name: &str, task: Uuid) -> String {
 // 내려받기
 // ---------------------------------------------------------------------------------------------------------------
 
+/// 내려받기 형식
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum DownloadFormat {
+    /// 일반 파일 하나면 `raw`, 아니면 `zip`
+    #[default]
+    #[serde(rename = "auto")]
+    Auto,
+    /// 파일 하나 그대로(`Content-Length`)
+    #[serde(rename = "raw")]
+    Raw,
+    /// zip(deflate, 필요하면 zip64). 심볼릭 링크·특수 파일은 넣지 않고 보고서에 적는다.
+    #[serde(rename = "zip")]
+    Zip,
+    /// tar.gz(pax — 모드·소유자·시각·링크 보존)
+    #[serde(rename = "tar.gz")]
+    TarGz,
+}
+
+impl DownloadFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DownloadFormat::Auto => "auto",
+            DownloadFormat::Raw => "raw",
+            DownloadFormat::Zip => "zip",
+            DownloadFormat::TarGz => "tar.gz",
+        }
+    }
+}
+
+/// 내려받기 링크 요청(`POST /file-restore/sessions/{id}/download-link`)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(deny_unknown_fields)]
+pub struct DownloadLinkRequest {
+    pub volume: String,
+    /// 고른 항목(같은 볼륨, 1~1000개). 볼륨 루트(빈 경로)는 그 아래 모두
+    pub paths: Vec<EntryPath>,
+    #[serde(default)]
+    pub format: DownloadFormat,
+    /// 내려받을 파일 이름(확장자 포함). 없으면 `<백업 이름>-<마지막 조각>.<형식>`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "openapi", schema(nullable = false, default))]
+    pub name: Option<String>,
+}
+
+/// 내려받기 요청의 항목 수 상한
+pub const MAX_DOWNLOAD_PATHS: usize = 1000;
+/// 내려받기 이름의 최대 길이(바이트)
+pub const MAX_DOWNLOAD_NAME: usize = 255;
+
+/// 내려받기 링크: 60초 안에 한 번, 같은 사용자만 쓴다.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct DownloadLink {
+    /// `/api/v1` 아래 경로(`/file-restore/sessions/{id}/download/{token}`)
+    pub url: String,
+    /// 남은 초
+    pub expires_in: u64,
+}
+
+/// 세션 열기의 답: 세션과 그 Task(단계를 Task watch로 볼 수 있다)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct FileRestoreOpened {
+    pub session: FileRestoreSessionView,
+    pub task: Uuid,
+}
+
 /// `Content-Disposition` 값(RFC 6266): ASCII 대체 `filename="…"`(ASCII 아닌 글자·따옴표·`\`·`/`·제어 문자는 `_`)과
 /// `filename*=UTF-8''…`(퍼센트 부호화). 이름이 비면 `download`.
 pub fn content_disposition(name: &str) -> String {
@@ -1201,5 +1270,33 @@ mod tests {
             serde_json::to_value(VolumeKind::LogicalVolume).unwrap(),
             json!("logical_volume")
         );
+    }
+
+    #[test]
+    fn download_link_requests_take_formats_and_string_paths() {
+        let req: DownloadLinkRequest = serde_json::from_value(json!({
+            "volume": "disk0p1", "paths": ["/etc/nginx", [{ "b64": "/w==" }]], "format": "tar.gz",
+        }))
+        .unwrap();
+        assert_eq!(req.format, DownloadFormat::TarGz);
+        assert_eq!(req.paths[0], EntryPath::parse("/etc/nginx").unwrap());
+        assert_eq!(req.paths[1].parts()[0].as_bytes(), [0xff]);
+        let auto: DownloadLinkRequest =
+            serde_json::from_value(json!({ "volume": "disk0", "paths": ["/"] })).unwrap();
+        assert_eq!(auto.format, DownloadFormat::Auto);
+        assert!(
+            serde_json::from_value::<DownloadLinkRequest>(
+                json!({ "volume": "disk0", "paths": [], "format": "rar" })
+            )
+            .is_err()
+        );
+        for f in [
+            DownloadFormat::Auto,
+            DownloadFormat::Raw,
+            DownloadFormat::Zip,
+            DownloadFormat::TarGz,
+        ] {
+            assert_eq!(serde_json::to_value(f).unwrap(), json!(f.as_str()));
+        }
     }
 }

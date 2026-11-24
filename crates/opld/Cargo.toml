@@ -107,6 +107,12 @@ backup-it = ["qemu-it"]
 # `OPL_S3_TLS_ENDPOINT`·`OPL_S3_CA`·`OPL_S3_ACCESS_KEY`·`OPL_S3_SECRET_KEY`·`OPL_S3_CONTAINER`(멈춤 시험의 docker 컨테이너
 # 이름)가 필요하다(CI `backup-s3` 작업).
 s3-it = ["backup-it"]
+# 실제 도우미 이미지로 파일 단위 복원(계획 69)을 보는 E2E(`tests/file_restore.rs` — orbivisorctl `backup files`): 암호화 저장소 백업과
+# 옛 풀 증분 체인을 열어 나열·파일·zip·tar.gz를 고정물과 견주고, 닫기·도우미 `kill -9`·opld 다시 시작 뒤 남은 것이 없는지 본다.
+# backup-it의 준비물에 더해 도우미 이미지 디렉터리(`OPL_RESTORE_IMAGE_DIR` — packaging/restore-image/build.sh)와 고정물 디스크
+# (`OPL_RESTORE_FIXTURES` — crates/opl-restore/tests/fixtures/make-disks.sh의 ext4.img·ext4-dirty.img·expected.sha256), unzip과 tar가
+# 필요하다. 둘 중 하나가 없으면 시험을 건너뛴다.
+restore-it = ["backup-it"]
 # 여러 노드 SDN E2E(계획 66 스테이지 6): 한 호스트에 privileged systemd 컨테이너 셋(`ci/sdn-node/Dockerfile`)으로 Orbivisor
 # 노드 셋을 띄워 실제 OVN Raft 셋·Geneve·SNAT·분산·중앙 유동 IP·게이트웨이 넘김·죽은 중앙 내쫓기·두 chassis 마이그레이션을
 # orbivisorctl로 본다. Linux에서 root, docker와 이미지, 커널 모듈 openvswitch·geneve, tcpdump가 필요하고 호스트에 도커 망·

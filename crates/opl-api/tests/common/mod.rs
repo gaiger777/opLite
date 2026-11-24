@@ -5,6 +5,7 @@ pub mod authenticator;
 pub mod collector;
 pub mod esxi;
 pub mod fake_apt;
+pub mod file_restore;
 pub mod idp;
 pub mod ldap;
 pub mod promtext;

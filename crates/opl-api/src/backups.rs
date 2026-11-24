@@ -607,7 +607,8 @@ pub(crate) fn files_node(
 /// 쓴 노드, 공유 풀은 백업 풀을 쓸 수 있는 노드)에서 돈다. 풀이 없어졌으면 이 노드의 Task가 리소스만
 /// 지운다. 파일을 지울 노드가 없으면 409(`node_offline`, `pool_unavailable` 등)이고, `force`면 리소스만
 /// 바로 지우고 200이다(파일은 백업 풀에 남는다). 증분 백업(`failed`가 아닌 것)의 부모는 `force`여도 409
-/// `backup_in_use`다(자식부터 지운다).
+/// `backup_in_use`다(자식부터 지운다). 파일 복원 세션이 열린 백업은 409 `backup_in_use`이고, `force`면 그 세션들을 닫고
+/// 지운다(계획 69 §10.5).
 #[utoipa::path(delete, path = "/backups/{key}", tag = "backups",
     params(("key" = String, Path, description = "id or name"), DeleteBackupQuery),
     responses(
@@ -617,13 +618,14 @@ pub(crate) fn files_node(
     ))]
 pub async fn delete_backup(
     State(state): State<Arc<AppState>>,
-    _principal: Principal,
+    principal: Principal,
     Path(key): Path<String>,
     Query(q): Query<DeleteBackupQuery>,
 ) -> Result<Response, ApiError> {
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     if q.force {
         check_backup_idle(&state, &backup)?;
+        close_file_restore(&state, &principal, &backup).await?;
         check_not_parent(&state, &backup)?;
         if let Err(e) = delete_node(&state, &backup)
             && e.status == StatusCode::CONFLICT
@@ -637,8 +639,36 @@ pub async fn delete_backup(
             return Ok(Json(BackupForgotten { message }).into_response());
         }
     }
-    let task = start_backup_delete(&state, &backup).await?;
+    let task = start_delete(&state, &backup, q.force).await?;
     Ok((StatusCode::ACCEPTED, Json(task)).into_response())
+}
+
+/// 백업에 파일 복원 세션이 열려 있으면 409 `backup_in_use`(계획 69 §10.5 — 백업 작업의 보존도 이것으로 이번 차례를 건너뛴다)
+fn check_no_file_restore(state: &AppState, backup: &Backup) -> Result<(), ApiError> {
+    if crate::file_restore::open_sessions(state, backup.id)?.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::conflict(
+        "backup_in_use",
+        format!(
+            "a file restore session is open on backup {:?}; close it or wait (or delete with force)",
+            backup.name
+        ),
+    ))
+}
+
+/// `force` 지우기: 백업의 파일 복원 세션을 모두 닫는다(누가 열었든). 세션 노드에 닿지 않으면 그 오류(503)다.
+async fn close_file_restore(
+    state: &AppState,
+    principal: &Principal,
+    backup: &Backup,
+) -> Result<(), ApiError> {
+    for task in crate::file_restore::open_sessions(state, backup.id)? {
+        tracing::info!(backup = %backup.name, session = %task.spec.target, "closing a file restore session to delete its backup");
+        let reason = format!("backup {:?} was deleted by {}", backup.name, principal.name);
+        crate::file_restore::close_session(state, &task, principal.user, &reason).await?;
+    }
+    Ok(())
 }
 
 /// 백업을 만들거나 되살리거나 지우거나 복제하는 Task가 끝나지 않았으면 409 `backup_busy`
@@ -727,6 +757,18 @@ pub(crate) async fn start_backup_delete(
     state: &AppState,
     backup: &Backup,
 ) -> Result<Task, ApiError> {
+    start_delete(state, backup, false).await
+}
+
+/// [`start_backup_delete`]. `sessions_closed`면 파일 복원 세션을 보지 않는다(`force`가 닫았다 — 닫히는 중이다).
+async fn start_delete(
+    state: &AppState,
+    backup: &Backup,
+    sessions_closed: bool,
+) -> Result<Task, ApiError> {
+    if !sessions_closed {
+        check_no_file_restore(state, backup)?;
+    }
     check_backup_idle(state, backup)?;
     check_not_parent(state, backup)?;
     let node = delete_node(state, backup)?;

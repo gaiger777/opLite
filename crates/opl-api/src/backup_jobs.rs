@@ -688,7 +688,8 @@ async fn advance(
 }
 
 /// 끝난 실행의 보존 정리: 실행이 끝나 있으면 보존 규칙이 지울 백업([`retention`])마다 지우기 Task를
-/// 만든다. 만들지 못한 백업(복제·복원 중이라 `backup_busy` 등)은 tick마다 다시 본다. 실행이 끝난 뒤
+/// 만든다. 만들지 못한 백업(복제·복원 중이라 `backup_busy`, 파일 복원 세션이 열려 `backup_in_use` 등 — 계획 69)은 tick마다
+/// 다시 본다. 실행이 끝난 뒤
 /// 이미 지우기 Task를 만든 백업은 그 Task가 실패했어도 다음 실행이 끝날 때까지 다시 만들지 않는다.
 async fn prune_after_run(state: &AppState, id: Uuid) -> Result<(), ApiError> {
     let cluster = &state.cluster;

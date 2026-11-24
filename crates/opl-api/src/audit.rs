@@ -507,6 +507,43 @@ pub(crate) async fn layer(
     response
 }
 
+/// 응답 머리를 보낸 뒤에 끝나는 흐름(파일 복원 내려받기, 계획 69 §13)의 감사 항목. 미들웨어는 GET을 적지 않으므로 흐름이
+/// 끝날 때(끊겨도) 핸들러가 바이트·항목 수를 담아 적는다.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_stream(
+    state: &AppState,
+    principal: &Principal,
+    ip: std::net::IpAddr,
+    template: &str,
+    path: &str,
+    status: u16,
+    started: Instant,
+    detail: String,
+) {
+    let path = api_path(path).to_string();
+    state.audit.record(AuditEntry {
+        id: Uuid::now_v7(),
+        time: now_ms(),
+        node: String::new(),
+        user: Some(principal.name.clone()),
+        user_id: Some(principal.user),
+        role: Some(principal.role),
+        auth: if principal.token.is_some() {
+            AuditAuth::Token
+        } else {
+            AuditAuth::Session
+        },
+        ip: ip.to_canonical().to_string(),
+        action: format!("GET {template}"),
+        target: target(template, &path),
+        method: "GET".into(),
+        path,
+        status,
+        duration_ms: started.elapsed().as_millis() as u64,
+        detail: Some(detail),
+    });
+}
+
 /// `/api/v1` 아래의 경로
 pub(crate) fn api_path(path: &str) -> &str {
     path.strip_prefix("/api/v1").unwrap_or(path)

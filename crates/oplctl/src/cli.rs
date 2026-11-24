@@ -2704,6 +2704,11 @@ enum BackupCmd {
         #[arg(long)]
         wait: bool,
     },
+    /// 파일 단위 복원(계획 69): 백업을 도우미 VM에 붙인 세션으로 파일을 찾아보고 내려받는다(`backup.file_restore`).
+    Files {
+        #[command(subcommand)]
+        cmd: crate::file_restore::FilesCmd,
+    },
     /// 백업을 원격 클러스터(`remote add`로 등록)의 백업 풀에 사본으로 보낸다. 원격 쪽 토큰 주인은
     /// operator 이상이어야 한다.
     Replicate {
@@ -6778,6 +6783,16 @@ async fn backup(
             print_json(out, &b)?
         }
         BackupCmd::Delete { backup, force } => backup_delete(client, &backup, force, out).await?,
+        BackupCmd::Files { cmd } => {
+            Box::pin(crate::file_restore::files(
+                client,
+                cmd,
+                json_out,
+                out,
+                &mut std::io::stderr(),
+            ))
+            .await?
+        }
         BackupCmd::Restore {
             backup,
             name,
