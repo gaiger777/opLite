@@ -496,9 +496,14 @@ VmCheckRequest {                     // deny_unknown_fields
 ### 리뷰 1 (api)
 
 - 리뷰 1 1(보안): 첨부(네트워크·볼륨·ISO·복제 풀)·CPU 플래그·NUMA·만들 볼륨·만들 규칙에서 권한 거절(403, 또는 읽을 수 없어 404)이 하나라도 있으면 만들기처럼 거기서 멈춘다: 할당량·`prepare`(배치·IPAM·볼륨 사용 중·볼륨 상태)를 돌리지 않고 이름 문제와 거절만 돌려준다(`node`·`machine`·`cpu_model` null, `ips` 빈 목록). 앞의 "prepare를 지나면 앞 단계 문제(권한·할당량 등)가 있어도 채운다"는 권한 거절에는 맞지 않는다 — 숨은 VM 이름(`volume_in_use`)과 숨은 SDN 서브넷의 빈 주소·점유가 드러났다. 권한 거절이 없으면 할당량·`prepare` 문제는 그대로 함께 모은다.
-- 리뷰 1 2(보안): 만들 권한(루트 `cluster.admin`의 배치 규칙 쓰기)이 없는 규칙은 검사하지도 목록에 얹지도 않는다(`placement` `forbidden` 하나). 만들 권한이 없는 볼륨(풀 403·404)도 얹지 않는다. 400(없는 풀 등)인 볼륨은 전처럼 얹는다(뒤따르는 "볼륨 없음"을 막으려고).
+- 리뷰 1 2(보안): 만들 권한(루트 `cluster.admin`의 배치 규칙 쓰기)이 없는 규칙은 검사하지도 목록에 얹지도 않는다(`placement` `forbidden` 하나). 만들 권한이 없는 볼륨(풀 403·404)도 얹지 않는다. ~~400(없는 풀 등)인 볼륨은 전처럼 얹는다(뒤따르는 "볼륨 없음"을 막으려고).~~ — 리뷰 2에서 고침(아래): 400 가운데 넷(이름·내용·크기·`base`)은 풀 권한보다 먼저였다.
 - 리뷰 1 3: `POST /vms`·`PUT /vms/{key}`의 `check_attachments`를 계획 71 앞의 본문으로 되돌렸다(네트워크는 NIC 차례, 볼륨·ISO는 이름 차례로 첫 거절, 저장소 오류도 그 차례) — 상태·코드가 전과 같다. 미리 확인만 모두 모으는 `attachment_problems`(칸 차례)를 쓴다. 앞의 "상태·코드는 같음" 문장은 이것으로 참이 된다.
 - 리뷰 1 4: `volumes`·`rules`는 16개까지(넘으면 400, VM NIC 상한 `MAX_NICS`와 같은 수). 미리 확인은 평문 cloud-init 비밀번호를 SHA-512 crypt하지 않는다(`Planned.preview` — 저장하지 않으니 검증만; 가린 값 `********`은 만들기처럼 400).
 - 리뷰 1 5: `vm create --dry-run`은 `--start`와 함께 줄 수 있다: 그때 확인 본문에 `power: running`을 넣어 서버가 노드·용량·hard 배치 규칙을 본다(켜지 않는다). `--start` 없이는 만들기처럼 꺼진 채라 `ok: node -`. 옛 서버(404 `no API at …`)는 "the server does not support --dry-run (POST /vm-checks); upgrade it", 올리는 중인 클러스터(409 `cluster_upgrading`)는 "the cluster does not support --dry-run until every node is upgraded: …". 다른 404(볼 수 없는 폴더 등)는 그대로.
 - 리뷰 1 6: 교차 시험 고정 파일의 사례마다 `before`(마지막 요청 앞의 `POST /volumes`·`POST /placement-rules`, 차례대로)를 더했고, Rust 시험이 CLI가 보낸 같은 종류의 요청과 차례·본문(null 뺌)을 맞춰 본다. `power`는 지우지 않고 맞춰 본다: 웹 `power: running` ⇔ CLI 마지막 명령에 `--start` ⇔ `POST /vms/<name>/actions/start`가 있음, 그리고 CLI 본문에는 `power`가 없음.
 - 리뷰 1 7: `slot_of`는 문구의 주어 자리(`network "n"`·`volume "v"`·`ISO "i"`)만 본다(뒤의 `VM "a"`는 디스크 a가 아님). 디스크 코드(`volume_in_use` 등)는 맞는 디스크가 없으면 CD를 본다(`ISO "x" is being deleted` → `cdroms.N`).
+
+### 리뷰 2 (api)
+
+- 리뷰 2 1(보안): 미리 확인의 만들 볼륨은 **풀 찾기와 `storage.allocate`를 다른 볼륨 검사보다 먼저** 본다(`vm_checks.rs`). `check_new_volume`은 `POST /volumes`의 차례(이름·디스크 내용·크기 0·`base` → 400, 그다음 풀·권한)라, 앞선 400(예: `size_bytes: 0`)이면 권한 검사를 건너뛰고 리뷰 1의 400 갈래가 권한 없이 풀 노드를 붙여 볼륨을 얹었다 — `prepare`가 볼 수 없는 풀이 노드 로컬인지(복제·HA·ISO 검사), 어느 노드에서 쓰이는지·준비됐는지를 드러냈다. 이제 풀 권한 거절(403·404)은 그 거절 하나만 내고 얹지 않으며(같은 이름 `name_taken`·크기 검사도 보지 않음), **없는 풀(400)도 거절처럼 멈춘다**(그 볼륨은 만들 수 없으니 준비 단계 답은 쓸모없다 — `node`·`machine`·`cpu_model` null). 권한을 지난 볼륨의 400(크기 0 등)은 전처럼 그 풀 노드에 얹는다. `POST /volumes`(`check_new_volume`)의 차례·상태는 그대로다. 시험: `planned_volumes_in_hidden_pools_are_refused_before_other_checks`(크기 0·나쁜 이름·없는 풀 + 복제 → 문제 하나, `node-local` 없음).
+

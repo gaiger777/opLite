@@ -276,6 +276,22 @@ pub async fn check_vm(
             .iter()
             .position(|d| d.volume == v.name)
             .map_or_else(|| "disks".to_string(), |i| format!("disks.{i}"));
+        // 풀 권한을 다른 볼륨 검사보다 먼저 본다(리뷰 2 — `check_new_volume`은 400 검사(이름·내용·크기·`base`)가
+        // 앞서므로, 400인 볼륨을 얹으면 할당할 수 없는(볼 수도 없는) 풀의 성질이 `prepare`로 드러났다). 없는 풀도 거절처럼
+        // 멈춘다. `POST /volumes`의 차례는 그대로다.
+        let pool = match find_pool(&state, &v.spec.pool).and_then(|pool| {
+            state
+                .authz
+                .require(&principal, Privilege::StorageAllocate, &pool)
+                .map(|()| pool)
+        }) {
+            Ok(pool) => pool,
+            Err(e) => {
+                found.error(&at, e)?;
+                found.refused = true;
+                continue;
+            }
+        };
         let mut volume: Volume = Resource::new(v.name.clone(), v.spec.clone());
         volume.labels = v.labels.clone();
         volume.status.phase = VolumePhase::Ready;
@@ -312,17 +328,11 @@ pub async fn check_vm(
                     );
                 }
             }
-            // 만들 권한이 없는 볼륨은 얹지 않는다(리뷰 1 2 — 아래에서 멈춘다).
-            Err(e) if is_refusal(&e) => {
-                found.error(&at, e)?;
-                continue;
-            }
             Err(e) => {
                 found.error(&at, e)?;
-                // 검사를 지나지 못한 볼륨도 풀이 있으면 그 노드에 둔다(뒤의 만들기 검사가 "풀에 닿는 노드 없음"을 덧붙이지 않게).
-                volume.status.node = find_pool(&state, &v.spec.pool)
-                    .and_then(|pool| pool_node(&state, &pool))
-                    .ok();
+                // 검사를 지나지 못한 볼륨도(풀 권한은 위에서 지났다) 그 풀의 노드에 둔다(뒤의 만들기 검사가 "풀에 닿는 노드
+                // 없음"을 덧붙이지 않게).
+                volume.status.node = pool_node(&state, &pool).ok();
             }
         }
         planned.volumes.push(volume);

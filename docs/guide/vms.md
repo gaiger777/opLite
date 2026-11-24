@@ -1263,8 +1263,8 @@ orbivisorctl -o json vm create web --disk web-disk0 --nic lan --dry-run   # 응�
   가리키는 `disks.N`(없으면 `disks`), 만들 규칙의 문제는 `placement`에 붙는다. 같은 `at`·`code`는 하나로 모은다.
 - **검사 차례.** ① 이름(형식·같은 이름 VM `name_taken`)과 머신 채우기 ② 폴더의 `vm.create` — 없으면 **403**(폴더를 읽을 수도 없으면 404)으로
   끝난다(만들 수 없는 곳의 규칙·노드를 알려 주지 않음). 폴더를 주지 않고 루트 `vm.create`도 없으면 400 `folder_required` ③ **모으는** 검사(하나가
-  실패해도 다음을 봄): 네트워크·볼륨·ISO·복제 풀의 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨마다 `POST /volumes`의 검사(이름·`name_taken`·풀·
-  `storage.allocate`·형식·풀 노드)와 풀 남은 용량 경고, 만들 규칙마다 배치 규칙 만들기의 검사(`placement-rule` 쓰기 권한·이름·모양·모순 —
+  실패해도 다음을 봄): 네트워크·볼륨·ISO·복제 풀의 첨부 권한, CPU 플래그·NUMA 권한, 만들 볼륨마다 풀과 `storage.allocate`를 먼저(없는 풀도 거절처럼 여기서
+  멈춤), 그다음 `POST /volumes`의 나머지 검사(이름·`name_taken`·크기·형식·풀 노드)와 풀 남은 용량 경고, 만들 규칙마다 배치 규칙 만들기의 검사(`placement-rule` 쓰기 권한·이름·모양·모순 —
   맞는 노드가 없는 영역 규칙은 `rule_conflict`와 아래 `placement_rule`이 함께 나온다). 여기까지 **권한 거절**(403, 또는 읽을 수 없어 404)이
   하나라도 있으면 만들기처럼 거기서 멈춘다: 이름 문제와 거절만 돌려주고 `node`·`machine`·`cpu_model`은 `null`, `ips`는 빈 목록이다(권한 없는
   볼륨·규칙은 아래 준비 단계에 얹지도 않는다 — 볼 수 없는 VM·주소가 드러나지 않게). 거절이 없으면 폴더 할당량(만들 볼륨 크기를 더해)을 함께

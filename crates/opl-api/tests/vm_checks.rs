@@ -463,13 +463,14 @@ async fn planned_volumes_are_checked_like_volume_creates() {
     let team = folder(&admin, "team", "vm", json!(null)).await;
     let alice = folder_user(&env, &admin, "alice", &[&team]).await;
 
-    // 없는 풀: 그 볼륨을 가리키는 디스크 칸. 디스크 자체는 만들 볼륨으로 보아 만들기 검사를 지난다.
+    // 없는 풀: 그 볼륨을 가리키는 디스크 칸. 거절처럼 거기서 멈춘다(리뷰 2 — 준비 단계를 돌리지 않음).
     let answer = check(&admin, with_new_disk("web", "nope")).await;
     assert_eq!(
         problems(&answer),
         [problem("disks.0", "invalid_request", "error")]
     );
-    assert_eq!(answer["node"], "node1", "{answer}");
+    assert_eq!(answer["node"], Value::Null, "{answer}");
+    assert_eq!(answer["machine"], Value::Null, "{answer}");
 
     // 이 풀에 할당할 권한이 없는 폴더 사용자(루트 풀)
     let mut body = with_new_disk("web", "local");
@@ -516,6 +517,46 @@ async fn planned_volumes_are_checked_like_volume_creates() {
         [problem("disks.0", "pool_space", "warn")]
     );
     assert_eq!(answer["ok"], true, "{answer}");
+}
+
+/// 리뷰 2: 만들 볼륨의 400 검사(크기·이름)가 풀 권한보다 앞서 실패해도, 할당할 수 없는(볼 수 없는) 풀의 볼륨은 얹지 않고
+/// 거절만 돌려준다 — 준비 단계가 그 풀의 성질(노드 로컬인지·어느 노드인지)을 드러내지 않게. 없는 풀도 거기서 멈춘다.
+#[tokio::test]
+async fn planned_volumes_in_hidden_pools_are_refused_before_other_checks() {
+    let env = Env::start().await;
+    let admin = env.admin().await;
+    local_pool(&env, &admin, "local", None).await;
+    let team = folder(&admin, "team", "vm", json!(null)).await;
+    let alice = folder_user(&env, &admin, "alice", &[&team]).await;
+
+    let node = env.node.to_string();
+    for (volume, pool, size) in [
+        ("web-disk0", "local", 0),
+        ("Bad Name!", "local", GIB),
+        ("web-disk0", "nope", 0),
+    ] {
+        let mut body = check_body("web");
+        body["spec"]["folder"] = json!(team);
+        body["spec"]["disks"] = json!([{ "volume": volume, "bus": "virtio-blk" }]);
+        body["spec"]["replication"] = json!([{ "node": node }]);
+        body["volumes"] = json!([{ "name": volume,
+            "spec": { "pool": pool, "size_bytes": size, "format": "qcow2" } }]);
+        let answer = check(&alice, body).await;
+        let found = problems(&answer);
+        assert_eq!(found.len(), 1, "{volume} {pool} {size}: {answer}");
+        assert_eq!(found[0].0, "disks.0", "{answer}");
+        let expected: &[&str] = if pool == "nope" {
+            &["invalid_request"]
+        } else {
+            &["forbidden", "not_found"]
+        };
+        assert!(expected.contains(&found[0].1.as_str()), "{answer}");
+        for key in ["node", "machine", "cpu_model"] {
+            assert_eq!(answer[key], Value::Null, "{key}: {answer}");
+        }
+        assert_eq!(answer["ips"], json!([]), "{answer}");
+        assert!(!answer.to_string().contains("node-local"), "{answer}");
+    }
 }
 
 #[tokio::test]
