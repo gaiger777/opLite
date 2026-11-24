@@ -539,21 +539,30 @@ async fn streaming_throughput() {
 #[tokio::test(flavor = "multi_thread")]
 async fn guard_and_kill_end_the_session() {
     let Some(env) = env().await else { return };
-    let Some(disk) = env.qcow2("ext4-dirty.img") else {
+    // 깨끗한 ext4(부팅 중 저널 재생 없음)로 띄운다. 빈 덮개(머리 몇백 KiB)도 부팅 지킴이(2초마다)가 재므로 한도는 부팅이
+    // 닿지 못할 8 MiB로 두고, 띄운 뒤 덮개 파일을 한도 너머로 늘려(qcow2는 끝 뒤를 읽지 않음) 지킴이가 닫는지 본다.
+    let Some(disk) = env.qcow2("ext4.img") else {
         return;
     };
-    // 덮개 1바이트: 첫 지킴이 회차(10초)에 닫힌다.
-    let tiny = HelperConfig {
-        overlay_max: 1,
+    let limited = HelperConfig {
+        overlay_max: 8 << 20,
         ..env.helper_config()
     };
     let id = Uuid::now_v7();
-    let h = env.start(id, vec![disk.clone()], &tiny).await;
+    let h = env.start(id, vec![disk.clone()], &limited).await;
+    let paths = HelperPaths::new(&env.config.run_dir, &env.config.state_dir, id);
+    let ov = std::fs::OpenOptions::new()
+        .write(true)
+        .open(paths.overlay(0))
+        .unwrap();
+    assert!(ov.metadata().unwrap().len() < 8 << 20);
+    ov.set_len(9 << 20).unwrap();
+    drop(ov);
     let reason = tokio::time::timeout(Duration::from_secs(30), h.ended())
         .await
         .unwrap();
     assert!(
-        reason.contains("journal replay wrote more than 1 MiB"),
+        reason.contains("the disk overlays grew past 8 MiB"),
         "{reason}"
     );
     let err = h.client.probe().await.unwrap_err();
@@ -562,7 +571,6 @@ async fn guard_and_kill_end_the_session() {
         format!("the file restore session is closed: {reason}")
     );
     println!("PROBE overlay guard: {reason} / {err}");
-    let paths = HelperPaths::new(&env.config.run_dir, &env.config.state_dir, id);
     stop_helper(h).await;
     assert!(!paths.run.exists() && !paths.state.exists());
 

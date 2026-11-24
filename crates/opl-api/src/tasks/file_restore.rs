@@ -517,7 +517,7 @@ pub(super) async fn to_guest(
         limits: &limits,
         report: GuestReport::default(),
         guard: PathGuard::new(),
-        bad_dirs: Vec::new(),
+        bad_dirs: BadDirs::default(),
         sink: Sink::None,
         now: crate::backups::now(),
     };
@@ -564,6 +564,30 @@ pub(super) async fn to_guest(
     }
 }
 
+/// 되돌려 쓰지 않은 디렉터리들. 항목은 깊이 우선 차례(PathGuard가 확인)라 조상 쌓기로 든다: 지금 항목의 조상이 아닌
+/// 것을 걷어 내면 남은 것은 모두 조상이고, 검사는 깊이만큼만 든다(리뷰 2 — 전부 훑으면 건너뛴 디렉터리 수의 제곱).
+#[derive(Default)]
+struct BadDirs(Vec<Vec<Vec<u8>>>);
+
+impl BadDirs {
+    /// 이 경로가 되돌려 쓰지 않은 디렉터리 아래인지. PathGuard를 지난 항목마다 차례대로 부른다.
+    fn under(&mut self, path: &[Vec<u8>]) -> bool {
+        while self
+            .0
+            .last()
+            .is_some_and(|d| !(path.len() > d.len() && path.starts_with(d)))
+        {
+            self.0.pop();
+        }
+        !self.0.is_empty()
+    }
+
+    /// 방금 [`under`](Self::under)로 본 디렉터리를 되돌려 쓰지 않았다.
+    fn push(&mut self, dir: Vec<Vec<u8>>) {
+        self.0.push(dir);
+    }
+}
+
 /// 걷기 흐름을 게스트 쓰기로 옮기는 상태
 struct Walker<'a> {
     guest: &'a Guest,
@@ -574,7 +598,7 @@ struct Walker<'a> {
     report: GuestReport,
     guard: PathGuard,
     /// 만들지 못했거나 건너뛴 디렉터리(그 아래 항목은 건너뜀)
-    bad_dirs: Vec<Vec<Vec<u8>>>,
+    bad_dirs: BadDirs,
     sink: Sink,
     now: u64,
 }
@@ -631,13 +655,16 @@ impl Walker<'_> {
             Ok(())
         };
         if let Err(why) = self.guard.admit(&raw, is_dir) {
-            return skip(self, why.to_string());
+            // 그 아래는 PathGuard가 거른다 — `bad_dirs`(조상 쌓기)에 넣지 않는다.
+            self.report.skipped.push(format!("{shown} ({why})"));
+            self.sink = if data > 0 {
+                Sink::Discard(data)
+            } else {
+                Sink::None
+            };
+            return Ok(());
         }
-        if self
-            .bad_dirs
-            .iter()
-            .any(|d| raw.len() > d.len() && raw.starts_with(d))
-        {
+        if self.bad_dirs.under(&raw) {
             return skip(self, "its directory was not restored".into());
         }
         let mut parts = Vec::with_capacity(raw.len());
@@ -889,5 +916,32 @@ mod tests {
         assert!(text.starts_with("f0 (special file); f1"), "{text}");
         assert!(text.ends_with("and 99990 more"), "{text}");
         assert!(Names::default().is_empty());
+    }
+
+    /// 리뷰 2: 건너뛴 디렉터리가 아주 많아도 검사는 깊이만큼만 들고(쌓기는 조상만), 그 아래는 늘 건너뛴다.
+    #[test]
+    fn skipped_dirs_are_an_ancestor_stack() {
+        let p = |parts: &[&str]| -> Vec<Vec<u8>> {
+            parts.iter().map(|s| s.as_bytes().to_vec()).collect()
+        };
+        let mut bad = BadDirs::default();
+        let mut max = 0;
+        for i in 0..200_000 {
+            let d = format!("d{i}");
+            assert!(!bad.under(&p(&["top", &d])));
+            bad.push(p(&["top", &d]));
+            assert!(bad.under(&p(&["top", &d, "f"])));
+            // 건너뛴 디렉터리 아래의 디렉터리도 건너뛴다(쌓기에 들어감).
+            assert!(bad.under(&p(&["top", &d, "sub"])));
+            bad.push(p(&["top", &d, "sub"]));
+            assert!(bad.under(&p(&["top", &d, "sub", "g"])));
+            assert!(bad.under(&p(&["top", &d, "h"])));
+            max = max.max(bad.0.len());
+        }
+        assert!(max <= 2, "{max}");
+        // 옆 디렉터리·같은 이름으로 시작하는 다른 이름은 아래가 아니다.
+        assert!(!bad.under(&p(&["top", "d1x"])));
+        assert!(!bad.under(&p(&["top"])));
+        assert!(bad.0.is_empty());
     }
 }

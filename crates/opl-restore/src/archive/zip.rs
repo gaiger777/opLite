@@ -33,6 +33,12 @@ const STORED_EXT: &[&str] = &[
     "webp", "heic", "avif", "mp3", "mp4", "m4a", "m4v", "mkv", "mov", "avi", "webm", "ogg", "flac",
     "docx", "xlsx", "pptx", "jar", "apk", "deb", "rpm", "cab", "msi",
 ];
+/// 작성기가 끝까지 들고 있는 이름 장부(중앙 디렉터리 항목·겹침 검사·`finish`가 한 번에 쓰는 중앙 디렉터리)의 기본
+/// 상한(바이트). 도우미의 경로 바이트 한도는 받은 그대로의 이름을 세지만, zip은 바꾼 이름(`%XX` — 바이트당 3)을 두
+/// 번 들고 끝에 한 번 더 쓰므로 여기서 따로 센다(리뷰 2).
+pub const DEFAULT_MAX_HELD_BYTES: u64 = 256 << 20;
+/// 항목 하나의 장부 몫(이름 바이트 밖: 중앙 디렉터리 머리·덧붙임, 구조체·집합 칸)
+const HELD_PER_ENTRY: u64 = 160;
 
 /// 바이트 수를 세는 쓰기
 struct Counter<W> {
@@ -88,6 +94,11 @@ pub struct ZipWriter<W: Write> {
     current: Option<Current>,
     force_zip64: bool,
     level: u32,
+    /// 이름 장부 바이트(어림 — [`DEFAULT_MAX_HELD_BYTES`])
+    held: u64,
+    max_held: u64,
+    /// 장부 한도에 닿아 더 받지 않는다
+    stopped: bool,
 }
 
 /// zip 안 조각: UTF-8이 아닌 바이트·`\`·제어 문자·`%XX`로
@@ -156,7 +167,26 @@ impl<W: Write> ZipWriter<W> {
             current: None,
             force_zip64: false,
             level: 6,
+            held: 0,
+            max_held: DEFAULT_MAX_HELD_BYTES,
+            stopped: false,
         }
+    }
+
+    /// 이름 장부 상한(기본 [`DEFAULT_MAX_HELD_BYTES`] — 시험이 작게 둔다)
+    pub fn with_max_held_bytes(mut self, max: u64) -> Self {
+        self.max_held = max;
+        self
+    }
+
+    /// 지금 들고 있는 이름 장부 바이트(어림)
+    pub fn held_bytes(&self) -> u64 {
+        self.held
+    }
+
+    /// 장부 한도에 닿아 멈췄는지 — 부르는 쪽은 걷기를 그만두고 [`finish`](Self::finish)한다(보고서에 `stopped:` 줄).
+    pub fn stopped(&self) -> bool {
+        self.stopped
     }
 
     /// 크기와 무관하게 모든 항목을 zip64로 쓴다(시험 — 4 GiB를 흘리지 않고 zip64 머리를 풀어 보는 데).
@@ -175,18 +205,36 @@ impl<W: Write> ZipWriter<W> {
         &self.report
     }
 
-    /// 보고서에 한 줄을 더한다(내려받기가 한도에서 멈춘 까닭 따위)
-    pub fn note(&mut self, line: String) {
-        self.report.note(line);
+    /// 내려받기가 멈춘 까닭(한도)을 보고서에 적는다 — 줄 수 한도와 무관하게 늘 남는다([`Report::stop`]).
+    pub fn stop(&mut self, line: String) {
+        self.report.stop(line);
     }
 
     /// 경로를 zip 이름 조각으로 바꾸고 검사한다. 거르면 보고서에 적고 없음. 이름 길이 칸은 16비트라 이음 이름이
     /// 65,535바이트를 넘는 항목(디렉터리면 그 아래도)은 넣지 않는다 — 넣으면 아카이브 전체가 깨진다.
     fn admit(&mut self, path: &[Name], is_dir: bool) -> Option<Vec<Vec<u8>>> {
+        if self.stopped {
+            return None;
+        }
         let parts: Vec<Vec<u8>> = path.iter().map(|p| zip_component(p.as_bytes())).collect();
         let name_len = parts.iter().map(|p| p.len() + 1).sum::<usize>() - usize::from(!is_dir);
+        // 장부: 중앙 디렉터리 항목의 이름과 끝에 쓰는 같은 이름(2 ×), 겹침 검사의 마지막 조각, 항목 몫
+        let cost =
+            2 * name_len as u64 + parts.last().map_or(0, |p| p.len() as u64) + HELD_PER_ENTRY;
+        if self.held + cost > self.max_held {
+            self.stopped = true;
+            self.report.stop(format!(
+                "stopped: the zip's list of names reached {} MiB — the archive holds only the items before {}; \
+                 download smaller folders or use tar.gz",
+                self.max_held >> 20,
+                super::escape_path(path)
+            ));
+            return None;
+        }
         let too_long = (name_len > usize::from(u16::MAX))
             .then_some("the path is longer than the 65,535 bytes a zip name can hold (use tar.gz)");
+        // 거른 항목도 센다(겹침 검사에 자리를 남기는 것이 있다 — 넉넉히).
+        self.held += cost;
         match self.guard.admit_unless(&parts, is_dir, too_long) {
             Ok(()) => {
                 if parts.iter().zip(path).any(|(a, b)| a != b.as_bytes()) {

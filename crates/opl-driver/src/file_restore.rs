@@ -1739,10 +1739,11 @@ fn trim_console(path: &Path) {
     }
 }
 
-/// 덮개 한도를 넘은 까닭
+/// 덮개 한도를 넘은 까닭. 재는 것은 덮개 qcow2 파일 크기 합(빈 덮개의 머리 몇백 KiB 포함)이고, 덮개에 쓰는 것은 보통 저널
+/// 재생이지만 도우미가 디스크에 쓴 무엇이든 될 수 있다.
 fn overlay_reason(max: u64) -> String {
     format!(
-        "the filesystem journal replay wrote more than {} MiB",
+        "the disk overlays grew past {} MiB (filesystem journal replay or other writes by the helper VM)",
         max.div_ceil(1 << 20)
     )
 }

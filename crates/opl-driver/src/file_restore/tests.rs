@@ -748,7 +748,7 @@ sleep 30"#,
         .unwrap_err();
     assert!(
         err.to_string()
-            .contains("journal replay wrote more than 1 MiB"),
+            .contains("the disk overlays grew past 1 MiB"),
         "{err}"
     );
     assert!(

@@ -133,9 +133,9 @@ impl<W: Write> TarGzWriter<W> {
         &self.report
     }
 
-    /// 보고서에 한 줄을 더한다(내려받기가 한도에서 멈춘 까닭 따위)
-    pub fn note(&mut self, line: String) {
-        self.report.note(line);
+    /// 내려받기가 멈춘 까닭(한도)을 보고서에 적는다 — 줄 수 한도와 무관하게 늘 남는다([`Report::stop`]).
+    pub fn stop(&mut self, line: String) {
+        self.report.stop(line);
     }
 
     fn admit(&mut self, path: &[Name], is_dir: bool) -> Option<Vec<Vec<u8>>> {

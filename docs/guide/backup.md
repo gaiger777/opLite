@@ -732,7 +732,7 @@ orbivisorctl backup files close web-20261123-030000         # 백업 이름(그 
 **저널은 재생한다.** 백업은 crash-consistent라(게스트 에이전트 얼리기가 없으면) 저널에 커밋만 된 변경이 있을 수 있다. 원본은 읽기
 전용으로 두고 디스크마다 **버리는 qcow2 덮개** 위에 붙여 저널을 재생하므로 최근 파일이 빠지지 않고 백업은 바뀌지 않는다. 재생이
 실패하면 재생 없이 붙이고 볼륨에 "journal not replayed — recent changes may be missing"을 단다(웹은 경고 표시). 덮개 합이
-`overlay_max_mib`(기본 2 GiB)를 넘으면 세션을 닫는다 — 보통 재생은 수십 MiB다(실측 9.2 MiB). 덮개는 2초마다, 부팅 중(에이전트 인사
+`overlay_max_mib`(기본 2 GiB)를 넘으면 세션을 닫는다("the disk overlays grew past N MiB …") — 보통 재생은 수십 MiB다(실측 9.2 MiB). 덮개는 2초마다, 부팅 중(에이전트 인사
 전 — 파티션 표·저널은 그때 이미 읽힌다)에도 본다. 파일시스템 고치기(`fsck`)는 하지 않는다.
 
 ### VM으로 되돌려 쓰기
@@ -871,7 +871,7 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
 | QEMU 프로세스 | Linux systemd면 `opl-fr-<id>.scope`(`MemoryMax`·`TasksMax=64`·`CPUQuota` vCPU × 100%), opld가 root면 디스크·소켓을 연 뒤 `-run-with user=nobody`(옛 QEMU `-runas`)로 내려감 — 내릴 수 없는 QEMU면 세션이 실패한다(몰래 root로 돌리지 않음). seccomp를 넣어 빌드한 QEMU면 `-sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny`(내리지 않을 때는 `elevateprivileges=deny`까지 — 내릴 때 그것을 걸면 QEMU 자신의 setuid가 막힌다). svc01 Rocky `qemu-kvm`에서 Uid 65534·Seccomp 2를 확인했다. upstream QEMU를 seccomp 없이 빌드했으면 sandbox는 없다 |
 | 백업 원본 | QEMU `read-only=on`. 저장소 백업은 opld 안 NBD 서버(쓰기는 `EPERM`)를 세션 디렉터리의 0600 유닉스 소켓으로, 옛 풀 백업은 qcow2를 읽기로 연다. 도우미가 덮개를 아무리 써도 백업은 그대로다 |
 | opld 쪽 통신 규약 | 프레임·이름(1024바이트)·경로 깊이(256)·링크 대상(4096)·볼륨 수(256)·쪽 항목(1000)·걷기 항목(건너뜀 포함)·걷기 경로 바이트(256 MiB)에 상한, 흐름마다 받을 몫 4 MiB(넘겨 보내면 위반 — opld가 흐름마다 쌓는 메모리가 이것으로 묶인다), 선언한 크기와 데이터가 다르면 그 흐름 오류, 첫 답·데이터 사이 60초(세 번 이어지면 세션 닫음). 어긋나면 세션을 닫는다(`agent protocol violation: …` — 걷기 한도는 그 흐름만 끝낸다). 보고서·결과 문구는 처음 몇 줄만 들고 나머지는 센다. 게스트가 보낸 글은 로그·감사에서 제어 문자를 이스케이프하고 자른다 |
-| 아카이브 | zip·tar.gz 작성기가 깊이 우선 차례를 다시 본다 — 부모는 앞서 받은 디렉터리, 같은 경로는 한 번, 절대 경로·`..` 없음, zip 이름은 65,535바이트까지. zip에는 링크를 넣지 않는다. 그래서 받은 아카이브를 풀어도 대상 디렉터리 밖에 아무것도 생기지 않는다 |
+| 아카이브 | zip·tar.gz 작성기가 깊이 우선 차례를 다시 본다 — 부모는 앞서 받은 디렉터리, 같은 경로는 한 번, 절대 경로·`..` 없음, zip 이름은 65,535바이트까지. zip에는 링크를 넣지 않는다. 그래서 받은 아카이브를 풀어도 대상 디렉터리 밖에 아무것도 생기지 않는다. zip은 끝에 쓸 이름 목록(중앙 디렉터리)을 들고 있으므로 바꾼 이름(`%XX`) 기준 이름 장부가 256 MiB에 닿으면 거기서 맺는다(보고서 맨 앞 `stopped: the zip's list of names reached …` — tar.gz로 받거나 나누어 받는다). 노드 사이로 흘리는 조각은 256 KiB 이하 |
 | 게스트로 되돌려 쓰기 | 이름은 백업에서 온 믿을 수 없는 값이라 셸을 거치지 않고(argv, Windows는 인코딩한 스크립트와 작은따옴표 글자), 조각마다 OS 규칙으로 거른다. 덮어쓰기는 임시 파일 뒤 이름 바꾸기 |
 
 - **암호화 저장소의 키는 opld를 떠나지 않는다.** opld가 청크를 받아 풀고 평문 블록을 NBD로 도우미에 준다(`backup-serve` 헬퍼를 쓰지
@@ -888,6 +888,9 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
   다른 도우미(와 `nobody`로 도는 다른 데몬)에 신호를 보낼 수 있다(다른 세션의 덮개·소켓은 root의 0700 디렉터리 안이라
   열지 못한다). `nobody`로 도는 다른 데몬과 떼려면 `run_as`를 도우미 전용 시스템 사용자(`useradd -r -s /usr/sbin/nologin
   orbivisor-fr`)로 바꾼다. 세션끼리 떼는 세션마다의 uid는 아직 없다(다음 계획).
+- **되돌려 쓰기 Task의 결과 문구에는 파일 이름이 있다.** 되돌려 쓴·건너뛴·실패한 경로를 처음 10개까지 적고(`… and N more`), 그
+  Task의 주인은 대상 VM이다. 그래서 그 VM(폴더)에 `system.read`만 있는 사용자도 `backup.file_restore` 없이 그 이름들을 Task 목록에서
+  본다. 그 파일은 이미 VM 안에 있으므로 받아들인 것이지만, 이름 자체가 민감한 백업이면 되돌려 쓸 VM의 읽기 권한을 함께 따져 본다.
 - **macOS 노드**는 HVF 자식 프로세스로 돌고 권한 내림·sandbox·scope가 없다 — 개발용이다.
 
 ### 권한·감사·다른 기능과의 관계

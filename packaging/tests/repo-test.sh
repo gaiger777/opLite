@@ -7,15 +7,19 @@
 # 두 패키지를 보이고, 실제 dist-upgrade 뒤 orbivisor가 옛 유닛·enable 링크·명령 이름·저장소 키를 이어받는지,
 # dpkg가 oplite를 먼저 올리고 orbivisor를 설치했는지, orbivisor가 수동 설치로 남아 autoremove되지 않는지 본다.
 # V1 orbivisor는 받은 deb의 바이너리로 build-deb.sh를 OPL_APT_KEY와 함께 다시 돌려 만든다(키를 실은 정식 패키지처럼).
-# 쓰는 법(CI): docker run --rm -v "$PWD:/work" debian:13 bash /work/packaging/tests/repo-test.sh /work/<orbivisor deb> /work/<oplite deb>
+# 셋째 인자(파일 복원 도우미 이미지 꾸러미 orbivisor-restore-image, 계획 69)가 있으면 testing에 함께 올려 저장소에서
+# 설치하고, 다음 판(받은 둘을 판만 바꿔 다시 묶음)을 둘 다 올리면 dist-upgrade가 둘을 함께 올리는지 본다 —
+# 이미지는 Depends: orbivisor (= 판)이라 판마다 함께 내야 한다.
+# 쓰는 법(CI): docker run --rm -v "$PWD:/work" debian:13 bash /work/packaging/tests/repo-test.sh /work/<orbivisor deb> /work/<oplite deb> [/work/<orbivisor-restore-image deb>]
 set -eu
 
-[ $# -eq 2 ] || {
-	echo "usage: $0 <orbivisor deb> <oplite deb>" >&2
+[ $# -eq 2 ] || [ $# -eq 3 ] || {
+	echo "usage: $0 <orbivisor deb> <oplite deb> [<orbivisor-restore-image deb>]" >&2
 	exit 2
 }
 DEB=$1
 TRANS_DEB=$2
+IMAGE_DEB=${3:-}
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_SCRIPT="$TESTS_DIR/../repo/build-repo.sh"
 DEB_DIR="$TESTS_DIR/../deb"
@@ -85,7 +89,7 @@ dpkg-deb --build --root-owner-group "$P" "$V0_DEB"
 
 # stable: 옛 oplite V0, testing: V1의 orbivisor와 전환 oplite
 OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" stable "$V0_DEB"
-OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing "$DEB" "$TRANS_DEB"
+OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing "$DEB" "$TRANS_DEB" ${IMAGE_DEB:+"$IMAGE_DEB"}
 
 # 서명과 Release 값(Origin·Label은 이름 바꾸기 전 그대로 — 바뀌면 설치된 노드의 apt-get update가 실패한다)
 gpgv --keyring "$KEYRING" "$REPO/dists/trixie/InRelease" || fail "InRelease 서명"
@@ -173,5 +177,31 @@ check_moved "oplite를 지운 뒤"
 LANG=C apt-get -s autoremove | tee "$WORK/autoremove.txt"
 if grep -qw orbivisor "$WORK/autoremove.txt"; then fail "oplite를 지운 뒤 autoremove가 orbivisor를 지우려 함"; fi
 apt-get update
+
+# 도우미 이미지 꾸러미: 저장소에서 설치하고, 다음 판(V2)을 둘 다 올리면 dist-upgrade가 함께 올린다.
+if [ -n "$IMAGE_DEB" ]; then
+	[ "$(dpkg-deb -f "$IMAGE_DEB" Version)" = "$VERSION" ] || fail "이미지 꾸러미 판: $(dpkg-deb -f "$IMAGE_DEB" Version)"
+	apt-get install -y --no-install-recommends orbivisor-restore-image
+	[ "$(dpkg-query -W -f '${Version}' orbivisor-restore-image)" = "$VERSION" ] || fail "저장소에서 설치한 이미지 판"
+	V2="$VERSION+v2"
+	# rebuild_v2 <deb> <out>: 판(과 이미지의 Depends)만 V2로 바꿔 다시 묶는다.
+	rebuild_v2() {
+		rm -rf "$WORK/re"
+		dpkg-deb -R "$1" "$WORK/re"
+		sed -i -e "s/^Version: .*/Version: $V2/" -e "s/^Depends: orbivisor (= .*)\$/Depends: orbivisor (= $V2)/" \
+			"$WORK/re/DEBIAN/control"
+		dpkg-deb --build --root-owner-group "$WORK/re" "$2" >/dev/null
+	}
+	rebuild_v2 "$DEB" "$WORK/orbivisor_${V2}_amd64.deb"
+	rebuild_v2 "$IMAGE_DEB" "$WORK/orbivisor-restore-image_${V2}_amd64.deb"
+	[ "$(dpkg-deb -f "$WORK/orbivisor-restore-image_${V2}_amd64.deb" Depends)" = "orbivisor (= $V2)" ] || fail "V2 이미지 Depends"
+	OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing \
+		"$WORK/orbivisor_${V2}_amd64.deb" "$WORK/orbivisor-restore-image_${V2}_amd64.deb"
+	apt-get update
+	LANG=C apt-get -s -q dist-upgrade | tee "$WORK/simulate2.txt"
+	grep -qF "Inst orbivisor [$VERSION] ($V2 " "$WORK/simulate2.txt" || fail "V2 dist-upgrade에 orbivisor 없음"
+	grep -qF "Inst orbivisor-restore-image [$VERSION] ($V2 " "$WORK/simulate2.txt" || fail "V2 dist-upgrade에 이미지 없음"
+	if grep -q "^Remv " "$WORK/simulate2.txt"; then fail "V2 dist-upgrade가 꾸러미를 지우려 함"; fi
+fi
 
 echo "repo-test: 모두 통과"

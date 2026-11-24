@@ -307,9 +307,13 @@ gpg --export "$KEY_ID" > oplite-archive-keyring.gpg
 KEYS=<opl-license keygen이 출력한 공개 키>
 OPL_LICENSE_KEYS=$KEYS OPL_VERSION=0.2.0 OPL_APT_URL=https://apt.example.com/oplite \
     cargo build --release -p opld --features web-ui -p oplctl
-OPL_LICENSE_KEYS=$KEYS OPL_APT_KEY=oplite-archive-keyring.gpg packaging/deb/build-deb.sh 0.2.0 dist
+# 파일 복원 도우미 이미지(백업 "파일 단위 복원"): OPL_RESTORE_IMAGE_DIR을 주면 build-deb.sh가 셋째 패키지
+# orbivisor-restore-image(같은 판)도 만든다.
+packaging/restore-image/build.sh --arch x86_64 --version 0.2.0 --out dist/restore-image/x86_64
+OPL_LICENSE_KEYS=$KEYS OPL_APT_KEY=oplite-archive-keyring.gpg OPL_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 \
+    packaging/deb/build-deb.sh 0.2.0 dist
 # 저장소: 채널(stable|testing|enterprise)에 패키지를 더하고 색인을 다시 만들어 서명한다(apt-ftparchive, apt-utils)
-OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo testing dist/*_0.2.0_amd64.deb   # orbivisor와 전환 패키지 둘
+OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo testing dist/*_0.2.0_amd64.deb   # orbivisor·전환 패키지·이미지 셋
 # testing에서 확인한 뒤 같은 패키지를 stable에도
 OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo stable dist/*_0.2.0_amd64.deb
 ```
@@ -317,7 +321,10 @@ OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo stable dist/*_0.2.
 레이아웃: `pool/<채널>/*.deb`, `dists/trixie/<채널>/binary-amd64/Packages(.gz)`, `dists/trixie/Release`
 (있는 모든 채널을 묶는다)와 서명 `InRelease`·`Release.gpg`. `repo/`를 `apt_url`이 가리키는 곳에 그대로 올린다.
 `build-repo.sh`는 고른 채널의 `Packages`만 다시 만들고 다른 채널은 그대로 둔다. pool의 옛 패키지는 지우지 않으므로
-옛 버전도 색인에 남는다(apt는 가장 새 버전을 고른다). 이미 올린 이름에 내용이 다른 deb는 거절한다("version already
+옛 버전도 색인에 남는다(apt는 가장 새 버전을 고른다). **판마다 `orbivisor-restore-image`도 같은 채널에 함께 낸다**:
+이미지 꾸러미는 `Depends: orbivisor (= 판)`이라, 새 `orbivisor`만 올리면 이미지를 설치한 노드에서 apt가 `orbivisor`를
+붙잡아 두거나(`apt-get upgrade`의 "kept back") 이미지 꾸러미를 지운다(`dist-upgrade`) — 파일 단위 복원이 그 노드에서
+멈춘다. `repo-test.sh`(CI `package`)가 셋을 한 채널에 올리고 다음 판으로 함께 올라가는지 본다. 이미 올린 이름에 내용이 다른 deb는 거절한다("version already
 published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새 색인과 Release는 옆 디렉터리에서 만들어 두 서명이 다
 끝난 뒤에 옮기므로(`InRelease`가 마지막) 서명이 실패해도 저장소는 옛 색인 그대로다. 웹 서버에 올릴 때도 같은 순서로
 `pool/`과 `Packages`를 먼저, `Release`·`Release.gpg`를 다음, `InRelease`를 마지막에 올린다. `OPL_APT_KEY`는

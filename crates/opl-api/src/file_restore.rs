@@ -22,7 +22,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use opl_cluster::types::NodeId;
 use opl_driver::file_restore::{
     FileRestoreState, HelperClient, HelperError, ReplyStream, StreamItem, decode_cursor,
@@ -672,7 +672,7 @@ async fn pump_raw(
 
 /// 아카이브 작성기가 쓰는 버퍼(조각으로 떼어 보낸다)
 #[derive(Clone, Default)]
-struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+struct SharedBuf(Arc<Mutex<BytesMut>>);
 
 impl std::io::Write for SharedBuf {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -686,9 +686,26 @@ impl std::io::Write for SharedBuf {
 }
 
 impl SharedBuf {
-    fn take(&self, min: usize) -> Option<Bytes> {
+    /// 앞에서 [`CHUNK`]바이트를 떼어 낸다. `all`이 아니면 `CHUNK`만큼 쌓였을 때만, `all`이면 남은 꼬리도. 조각은 늘
+    /// `CHUNK` 이하 — 노드 사이 흐름은 조각 하나를 gRPC 메시지 하나로 보내므로 `finish`가 한 번에 쓴 중앙
+    /// 디렉터리(수십 MiB)도 나누어야 한다(리뷰 2).
+    fn take(&self, all: bool) -> Option<Bytes> {
         let mut b = self.0.lock().unwrap();
-        (b.len() >= min && !b.is_empty()).then(|| Bytes::from(std::mem::take(&mut *b)))
+        if b.is_empty() || (!all && b.len() < CHUNK) {
+            return None;
+        }
+        let n = b.len().min(CHUNK);
+        Some(b.split_to(n).freeze())
+    }
+
+    /// 떼어 낼 수 있는 조각을 모두 보낸다. 받는 쪽이 버렸으면 거짓.
+    async fn send(&self, all: bool, tx: &mpsc::Sender<Result<DownloadPiece, String>>) -> bool {
+        while let Some(chunk) = self.take(all) {
+            if tx.send(Ok(DownloadPiece::Data(chunk))).await.is_err() {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -705,10 +722,18 @@ impl Writer {
         }
     }
 
-    fn note(&mut self, line: String) {
+    fn stop(&mut self, line: String) {
         match self {
-            Writer::Zip(w) => w.note(line),
-            Writer::Tar(w) => w.note(line),
+            Writer::Zip(w) => w.stop(line),
+            Writer::Tar(w) => w.stop(line),
+        }
+    }
+
+    /// zip 이름 장부가 한도에 닿아 더 받지 않는다(보고서에 `stopped:` 줄이 이미 있다)
+    fn stopped(&self) -> bool {
+        match self {
+            Writer::Zip(w) => w.stopped(),
+            Writer::Tar(_) => false,
         }
     }
 
@@ -748,7 +773,7 @@ async fn pump_archive(
             Ok(None) => break None,
             // 한도(항목 수·경로 바이트)에서 멈춘 걷기: 받은 데까지로 아카이브를 맺고 까닭을 보고서에 적는다.
             Err(HelperError::Limit(why)) => {
-                w.note(format!(
+                w.stop(format!(
                     "stopped: {why} — the archive holds only the items before this point; download smaller folders"
                 ));
                 break None;
@@ -758,10 +783,12 @@ async fn pump_archive(
         if let Err(e) = w.feed(&mut feeder, &ev) {
             break Some(format!("cannot write the archive: {e}"));
         }
-        if let Some(chunk) = buf.take(CHUNK)
-            && tx.send(Ok(DownloadPiece::Data(chunk))).await.is_err()
-        {
+        if !buf.send(false, &tx).await {
             return;
+        }
+        // 이름 장부 한도: 받은 데까지로 맺는다(흐름을 버리면 에이전트 걷기는 취소된다).
+        if w.stopped() {
+            break None;
         }
         if last_touch.elapsed() > Duration::from_secs(10) {
             busy.0.touch();
@@ -781,9 +808,7 @@ async fn pump_archive(
             return;
         }
     };
-    if let Some(chunk) = buf.take(1)
-        && tx.send(Ok(DownloadPiece::Data(chunk))).await.is_err()
-    {
+    if !buf.send(true, &tx).await {
         return;
     }
     let _ = tx.send(Ok(DownloadPiece::Done { entries })).await;
@@ -2134,6 +2159,63 @@ mod tests {
         assert_eq!(
             waiter.await.unwrap(),
             SessionEnd::Closed("closed by admin".into())
+        );
+    }
+
+    /// 리뷰 2: `finish`가 한 번에 쓰는 중앙 디렉터리(여기서 수 MiB)도 [`CHUNK`] 이하 조각으로 나뉘어 나간다 — 노드 사이
+    /// 흐름은 조각 하나를 gRPC 메시지 하나(상한 64 MiB)로 보낸다.
+    #[tokio::test]
+    async fn archive_pieces_never_exceed_a_chunk() {
+        use opl_restore::proto::{Attrs, EntryKind};
+        let buf = SharedBuf::default();
+        let mut w = ZipWriter::new(buf.clone());
+        let attrs = Attrs {
+            kind: EntryKind::File,
+            size: 0,
+            mtime: 1_700_000_000,
+            mtime_nsec: 0,
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+        };
+        let (tx, mut rx) = mpsc::channel(1 << 16);
+        let mut all = Vec::new();
+        for i in 0..40_000 {
+            let name = Name::new(format!("{i:0>90}")).unwrap();
+            assert!(w.begin_file(&[name], &attrs).unwrap());
+            w.end_file(None).unwrap();
+            assert!(buf.send(false, &tx).await);
+        }
+        // 걷는 동안에는 꽉 찬 조각만 나간다.
+        while let Ok(piece) = rx.try_recv() {
+            let Ok(DownloadPiece::Data(d)) = piece else {
+                panic!("data expected")
+            };
+            assert_eq!(d.len(), CHUNK);
+            all.extend_from_slice(&d);
+        }
+        let before = buf.0.lock().unwrap().len();
+        w.finish().unwrap();
+        let burst = buf.0.lock().unwrap().len() - before;
+        assert!(burst > 4 * CHUNK, "central directory burst {burst}");
+        assert!(buf.send(true, &tx).await);
+        drop(tx);
+        let mut pieces = 0;
+        while let Some(piece) = rx.recv().await {
+            let Ok(DownloadPiece::Data(d)) = piece else {
+                panic!("data expected")
+            };
+            assert!(!d.is_empty() && d.len() <= CHUNK, "{}", d.len());
+            all.extend_from_slice(&d);
+            pieces += 1;
+        }
+        assert!(pieces > 4);
+        assert!(buf.0.lock().unwrap().is_empty());
+        // 이은 바이트는 온전한 zip(끝 레코드 서명으로 끝남).
+        assert_eq!(
+            &all[all.len() - 22..all.len() - 18],
+            &0x0605_4b50u32.to_le_bytes()
         );
     }
 }

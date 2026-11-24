@@ -169,9 +169,10 @@ jobs:
         env:
           DEB: ${{ steps.build.outputs.deb }}
           TRANS_DEB: ${{ steps.build.outputs.transitional }}
+          IMAGE_DEB: ${{ steps.image.outputs.deb }}
         run: |
           docker run --rm -v "$PWD:/work" debian:13 \
-            bash /work/packaging/tests/repo-test.sh "/work/$DEB" "/work/$TRANS_DEB"
+            bash /work/packaging/tests/repo-test.sh "/work/$DEB" "/work/$TRANS_DEB" "/work/$IMAGE_DEB"
       # 빌드 버전 시험을 OPL_VERSION을 준 빌드로 다시 돌린다(clap 기본 version으로 되돌리면 실패한다).
       - name: Version tests with OPL_VERSION
         run: OPL_VERSION=9.9.9~t cargo test -p opl-types -p opld -p oplctl --lib --test version
@@ -445,7 +446,9 @@ jobs:
           CACHE: ${{ runner.temp }}/debs
         run: |
           packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$OPL_RESTORE_IMAGE_DIR/x86_64"
-          packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$RUNNER_TEMP/again/x86_64"
+          # 둘째 빌드는 새 CARGO_TARGET_DIR로 — 에이전트 빌드까지 재현되는지 본다(설계 §8.2).
+          CARGO_TARGET_DIR="$RUNNER_TEMP/again-target" \
+            packaging/restore-image/build.sh --arch x86_64 --cache "$CACHE" --out "$RUNNER_TEMP/again/x86_64"
           (cd "$OPL_RESTORE_IMAGE_DIR/x86_64" && sha256sum vmlinuz initrd.img manifest.json) | tee "$RUNNER_TEMP/first.sum"
           (cd "$RUNNER_TEMP/again/x86_64" && sha256sum vmlinuz initrd.img manifest.json) >"$RUNNER_TEMP/second.sum"
           diff "$RUNNER_TEMP/first.sum" "$RUNNER_TEMP/second.sum"

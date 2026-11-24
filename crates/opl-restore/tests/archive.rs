@@ -565,6 +565,56 @@ fn reports_keep_a_bounded_number_of_lines() {
     assert_eq!(r.len(), 1000);
 }
 
+/// 리뷰 2: zip 이름 장부는 바꾼 이름(`%XX` — 바이트당 3)으로 센다. UTF-8이 아닌 긴 이름이 한 디렉터리에 많아도
+/// 장부 한도에서 멈추고(`stopped:` 줄), 중앙 디렉터리는 한도를 넘지 않으며 아카이브는 온전하다.
+#[test]
+fn zip_name_bookkeeping_is_bounded_with_non_utf8_names() {
+    const MAX: u64 = 4 << 20;
+    let mut z = ZipWriter::new(Vec::new()).with_max_held_bytes(MAX);
+    z.dir(&path_of("d"), &attrs(EntryKind::Dir, 0, 0o755))
+        .unwrap();
+    let mut fed = 0u64;
+    let mut admitted = 0u64;
+    for i in 0..20_000u32 {
+        let mut raw = format!("{i:08}").into_bytes();
+        raw.resize(250, 0xFF);
+        let path = vec![Name::new(b"d".to_vec()).unwrap(), Name::new(raw).unwrap()];
+        fed += 254;
+        if z.begin_file(&path, &attrs(EntryKind::File, 0, 0o644))
+            .unwrap()
+        {
+            z.end_file(None).unwrap();
+            admitted += 1;
+        }
+        assert!(z.held_bytes() <= MAX, "{}", z.held_bytes());
+        if z.stopped() {
+            break;
+        }
+    }
+    assert!(z.stopped(), "fed {fed} raw name bytes");
+    // 받은 그대로의 이름은 한도의 반도 안 되지만 바꾼 이름이 세 배라 멈췄다.
+    assert!(fed < MAX / 2, "{fed}");
+    assert!(admitted > 1000, "{admitted}");
+    // 멈춘 뒤에는 받지 않는다.
+    assert!(
+        !z.begin_file(&path_of("d/late"), &attrs(EntryKind::File, 0, 0o644))
+            .unwrap()
+    );
+    let bytes = z.finish().unwrap();
+    assert!((bytes.len() as u64) < 2 * MAX, "{}", bytes.len());
+    let zip = common::read_zip(&bytes);
+    assert_eq!(
+        zip.entries.len() as u64,
+        admitted + 2,
+        "dir + files + report"
+    );
+    let report = zip_report(&zip);
+    assert!(
+        report.contains("stopped: the zip's list of names reached 4 MiB"),
+        "{report}"
+    );
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(16))]
 

@@ -101,6 +101,8 @@ pub const MAX_REPORT_BYTES: usize = 256 << 10;
 /// 보고서(건너뛴 항목·오류). 처음 [`MAX_REPORT_LINES`]줄·[`MAX_REPORT_BYTES`]바이트만 들고 나머지는 센다.
 #[derive(Debug, Default, Clone)]
 pub struct Report {
+    /// 내려받기가 멈춘 까닭(첫 줄만 — 줄 수 한도 밖이라 건너뜀 줄이 넘쳐도 남는다)
+    stopped: Option<String>,
     lines: Vec<String>,
     bytes: usize,
     omitted: u64,
@@ -160,13 +162,18 @@ impl Report {
         self.push(|| line);
     }
 
+    /// 내려받기가 멈춘 까닭(`stopped: …`). 처음 한 줄만 들고 보고서 맨 앞에 적는다.
+    pub fn stop(&mut self, line: String) {
+        self.stopped.get_or_insert(line);
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty() && self.omitted == 0
+        self.stopped.is_none() && self.lines.is_empty() && self.omitted == 0
     }
 
     /// 적은 줄과 세기만 한 줄의 합
     pub fn len(&self) -> usize {
-        self.lines.len() + self.omitted as usize
+        usize::from(self.stopped.is_some()) + self.lines.len() + self.omitted as usize
     }
 
     /// 보고서 본문
@@ -174,6 +181,10 @@ impl Report {
         let mut s = String::from(
             "Orbivisor file restore: items that are missing from this archive or incomplete\n\n",
         );
+        if let Some(l) = &self.stopped {
+            s.push_str(l);
+            s.push('\n');
+        }
         for l in &self.lines {
             s.push_str(l);
             s.push('\n');
