@@ -104,7 +104,7 @@
 - svc01 일반 시험: `f60a8164`에서 fmt·clippy·test·starve·scale·storage-dir·storage-api 모두 통과(4,297 통과, 0 실패).
 - GitHub 탐침(`2620c085`, `web` 작업 포함): 13개 작업 모두 통과(web·package·file-restore·linux-kvm·ldap·ceph·ovn·sdn-multinode·backup-s3·install-media·iso-e2e 둘·catalog-links). svc01 일반 시험도 같은 커밋에서 다시 — 4298개 통과·0 실패.
 - 웹 번들(eager, gzip -9): 계획 시작 478,636 B(이 도구) → 스테이지 3 479,196 B → 스테이지 4·5 **479,457 B(+821 B, 1 KB 밑)**. 조각: 빌더 20,450 B(25 KB 밑), 끌기 틀 공유 `DndProvider` 3,081 B(4 KB 밑), 지도 18,601 → 21,094 B(+2,493 B, 2.5 KB 밑), 서랍 `MapSheet` 3,296 B, `hard` 634 B. 스테이지 5는 E2E만 더해 번들이 그대로다.
-- 배포: (배포 후 채움 — svc01·svc02에서 빌더로 VM 하나(풀·네트워크·노드 svc02 → 서버 확인 "통과, svc02" → 만들기)와 영역 놓기(노드 `zone` 레이블 + hard 규칙 → 그 영역 노드), 지도에서 test-vm 타일을 svc01 → svc02로 끌어 대화상자(로컬 디스크 복사 안내)·옮기기, `m` 키 길, 휴대폰 폭, VoiceOver 손 확인)
+- 배포(2026-11-25 02:12, `14ca549c`): svc01에서 빌드한 `orbivisord`(sha256 `b2ffa5b9…`)를 svc02 → svc01에 설치, 두 노드 active·경고 없음, test-vm(PID 40553) 그대로. 확인: `POST /vm-checks`가 만들 볼륨을 얹은 요청에 `ok`·예상 노드 svc01, 있는 이름에 `name` 칸 `name_taken`(아무것도 만들지 않음). Playwright(어두운 테마 1440×950): 빌더 화면(폼 | 빌더, 부품 상자의 크기 "들어감/안 들어감", 칸, 확인·JSON·CLI, 만들기 옆 까닭). 지도에서 확인용 VM `dnd-demo`(256 MiB) 타일에 `]` → `m` — "Moving dnd-demo … 1 node can take it", → svc02 흰 테두리와 카드 "Can drop here: copies 256 MiB of local disks 7596 MiB memory free", Enter → 대상 svc02가 골라진 옮기기 대화상자(곧바로 옮기지 않음). `dnd-demo`는 지웠다. 남은 한계: 미리 확인(과 `POST /vms`)은 노드 용량(64 vCPU·1 TB)을 거절하지 않는다 — 배치는 만든 뒤 스케줄러가 하고, 빌더는 크기 부품의 "안 들어감"으로만 알린다.
 
 ## 다음 계획으로 넘길 사항
 
