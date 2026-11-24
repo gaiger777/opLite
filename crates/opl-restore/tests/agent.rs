@@ -17,7 +17,7 @@ use opl_restore::archive::zip::ZipWriter;
 use opl_restore::archive::{Archive, Feeder};
 use opl_restore::proto::{
     AgentError, Attrs, EntryKind, ErrorCode, Event, Frame, FrameKind, Hello, Name, PROTO_VERSION,
-    Reply, Request, StreamCheck, Volume, VolumeKind, read_frame, write_frame,
+    Reply, Request, STREAM_WINDOW, StreamCheck, Volume, VolumeKind, read_frame, write_frame,
 };
 
 fn volume(id: &str, fs: Option<&str>) -> Volume {
@@ -40,6 +40,8 @@ struct Client {
     next: u32,
     /// 다른 흐름의 틀(나중에 읽음)
     parked: HashMap<u32, Vec<Frame>>,
+    /// 몫을 돌려주지 않는 흐름(받는 쪽이 멈춘 흐름 흉내)
+    held: Option<u32>,
     agent: Option<JoinHandle<std::io::Result<()>>>,
 }
 
@@ -61,6 +63,7 @@ fn start(fs: Arc<dyn Fs>, opts: ServeOptions) -> (Client, Hello) {
         sock: ours,
         next: 1,
         parked: HashMap::new(),
+        held: None,
         agent: Some(agent),
     };
     let f = read_frame(&mut c.sock).unwrap().unwrap();
@@ -88,6 +91,10 @@ impl Client {
         }
         loop {
             let f = read_frame(&mut self.sock).unwrap().expect("agent closed");
+            // 받자마자 몫을 돌려준다(이 시험 클라이언트는 다른 흐름의 틀을 메모리에 둔다).
+            if f.cost() > 0 && self.held != Some(f.stream) {
+                write_frame(&mut self.sock, &Frame::ack(f.stream, f.cost() as u32)).unwrap();
+            }
             if f.stream == id {
                 return f;
             }
@@ -598,6 +605,70 @@ fn concurrent_streams_and_busy() {
         c.call(Request::Probe)[0],
         Event::Reply(Reply::Volumes { .. })
     ));
+    c.shutdown();
+}
+
+/// 규약 판 2: 몫을 돌려받지 못한 흐름은 창(4 MiB)까지만 보내고 기다린다 — 그동안 다른 흐름은 그대로 답하고, 몫을
+/// 돌려주면 이어 보내며, 기다리는 흐름도 취소된다.
+#[test]
+fn a_stream_without_credit_waits_and_others_go_on() {
+    let m = MemFs::new();
+    m.file(&path_of("big"), vec![b'z'; 16 << 20]);
+    m.file(&path_of("other"), vec![b'o'; 16 << 20]);
+    let (mut c, _) = start(Arc::new(m), ServeOptions::default());
+    let ra = Request::Read {
+        volume: "disk0p1".into(),
+        path: path_of("big"),
+    };
+    let a = c.send(&ra);
+    c.held = Some(a);
+    std::thread::sleep(Duration::from_millis(200));
+    // 다른 흐름은 막히지 않는다.
+    assert!(matches!(
+        c.call(Request::Probe)[0],
+        Event::Reply(Reply::Volumes { .. })
+    ));
+    let rb = Request::Read {
+        volume: "disk0p1".into(),
+        path: path_of("other"),
+    };
+    let eb = c.call(rb);
+    assert_eq!(data(&eb).len(), 16 << 20);
+    // 멈춘 흐름이 보낸 것은 창을 넘지 않는다.
+    let parked: u64 = c
+        .parked
+        .get(&a)
+        .map_or(0, |q| q.iter().map(Frame::cost).sum());
+    assert!(parked > 0 && parked <= STREAM_WINDOW, "{parked}");
+    // 몫을 돌려주면 끝까지 온다.
+    c.held = None;
+    write_frame(&mut c.sock, &Frame::ack(a, parked as u32)).unwrap();
+    let ea = c.collect(a, &ra);
+    assert_eq!(data(&ea), vec![b'z'; 16 << 20]);
+
+    // 몫을 기다리는 흐름도 취소된다.
+    let rc = Request::Read {
+        volume: "disk0p1".into(),
+        path: path_of("big"),
+    };
+    let id = c.send(&rc);
+    c.held = Some(id);
+    std::thread::sleep(Duration::from_millis(200));
+    let cancel = c.send(&Request::Cancel { stream: id });
+    assert_eq!(c.frame_for(cancel), Frame::end(cancel));
+    let mut check = StreamCheck::new(&rc, 0);
+    let mut last = None;
+    while !check.done() {
+        last = Some(check.feed(c.frame_for(id)).unwrap());
+    }
+    assert!(matches!(
+        last,
+        Some(Event::Failed(AgentError {
+            code: ErrorCode::Cancelled,
+            ..
+        }))
+    ));
+    c.held = None;
     c.shutdown();
 }
 

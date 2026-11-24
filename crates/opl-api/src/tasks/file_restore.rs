@@ -64,9 +64,6 @@ pub(super) async fn run(ctx: &Ctx, task: &Task, backup: Uuid) -> Result<Option<S
         .ok_or("this node does not run file restore sessions")?;
     let sessions = api.file_restore.clone();
     let id = task.spec.target;
-    if sessions.take_closed_early(id) {
-        return Ok(Some("closed before it started".into()));
-    }
     let node = sessions
         .node
         .clone()
@@ -102,6 +99,12 @@ pub(super) async fn run(ctx: &Ctx, task: &Task, backup: Uuid) -> Result<Option<S
         session: session.clone(),
         paths: paths.clone(),
     };
+    // 등록한 뒤에 본다: 그 전에 온 닫기는 `closed_early`에, 그 뒤의 닫기는 세션에 간다(리뷰 1 — 사이에 온 닫기를 잃지 않게).
+    if sessions.take_closed_early(id) {
+        return Ok(Some("closed before it started".into()));
+    }
+    // 여는 요청과 지우기가 엇갈렸으면(각자 상대를 본 뒤 Raft에 썼다) 지우는 백업은 열지 않는다(리뷰 1).
+    crate::backups::check_not_deleting(api, &backup).map_err(|e| e.message)?;
     write_stage(ctx, task.id, STAGE_BOOTING).await;
     paths
         .prepare()
@@ -244,6 +247,10 @@ impl Guest {
     async fn exists(&self, path: &str) -> Step<bool> {
         match self.call(GuestFileOp::Exists { path: path.into() }).await? {
             GuestFileAnswer::Exists { exists } => Ok(Ok(exists)),
+            // 있는지 알 수 없다(읽기로 열 수 없음): 그 파일만 실패로 적는다 — 덮어쓰지 않는다.
+            GuestFileAnswer::Refused { message } => Ok(Err(format!(
+                "cannot tell whether it exists in the guest: {message}"
+            ))),
             other => Err(unexpected(&other)),
         }
     }
@@ -359,20 +366,40 @@ struct GuestReport {
     files: u64,
     bytes: u64,
     dirs: u64,
-    renamed: Vec<String>,
-    skipped: Vec<String>,
-    failed: Vec<String>,
+    renamed: Names,
+    skipped: Names,
+    failed: Names,
     /// 지우지 못하고 남은 다 쓰지 못한 파일
-    left: Vec<String>,
+    left: Names,
 }
 
-fn names_list(items: &[String]) -> String {
-    let mut shown: Vec<&str> = items
-        .iter()
-        .take(REPORT_NAMES)
-        .map(String::as_str)
-        .collect();
-    let more = items.len().saturating_sub(REPORT_NAMES);
+/// 결과 문구의 이름 목록: 처음 [`REPORT_NAMES`]개만 들고 나머지는 센다(도우미가 끝없이 건너뛰어도 메모리가 늘지 않게).
+#[derive(Default)]
+struct Names {
+    shown: Vec<String>,
+    total: u64,
+}
+
+impl Names {
+    fn push(&mut self, name: String) {
+        self.total += 1;
+        if self.shown.len() < REPORT_NAMES {
+            self.shown.push(name);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.total == 0
+    }
+
+    fn len(&self) -> u64 {
+        self.total
+    }
+}
+
+fn names_list(items: &Names) -> String {
+    let mut shown: Vec<&str> = items.shown.iter().map(String::as_str).collect();
+    let more = items.total - items.shown.len() as u64;
     let more_text = format!("and {more} more");
     if more > 0 {
         shown.push(&more_text);
@@ -678,41 +705,49 @@ impl Walker<'_> {
         };
         let name = parts.last().cloned().unwrap_or_default();
         let parent = &parts[..parts.len().saturating_sub(1)];
-        let (write_name, temp, renamed_from) =
-            if !self.guest.exists(&target).await?.unwrap_or(false) {
-                (name.clone(), false, None)
-            } else {
-                match self.conflict {
-                    GuestConflict::Skip => {
-                        self.report.skipped.push(format!("{shown} (exists)"));
-                        discard(self);
-                        return Ok(());
-                    }
-                    GuestConflict::Overwrite => (guest_temp_name(&name, self.task), true, None),
-                    GuestConflict::Keep => {
-                        let mut chosen = None;
-                        for candidate in guest_keep_names(&name, self.now) {
-                            let mut p = parent.to_vec();
-                            p.push(candidate.clone());
-                            let path = self.dir.join(&p).map_err(|e| format!("{shown}: {e}"))?;
-                            if !self.guest.exists(&path).await?.unwrap_or(true) {
-                                chosen = Some(candidate);
-                                break;
-                            }
+        let exists = match self.guest.exists(&target).await? {
+            Ok(e) => e,
+            Err(e) => {
+                self.report.failed.push(format!("{shown} ({e})"));
+                discard(self);
+                return Ok(());
+            }
+        };
+        let (write_name, temp, renamed_from) = if !exists {
+            (name.clone(), false, None)
+        } else {
+            match self.conflict {
+                GuestConflict::Skip => {
+                    self.report.skipped.push(format!("{shown} (exists)"));
+                    discard(self);
+                    return Ok(());
+                }
+                GuestConflict::Overwrite => (guest_temp_name(&name, self.task), true, None),
+                GuestConflict::Keep => {
+                    let mut chosen = None;
+                    for candidate in guest_keep_names(&name, self.now) {
+                        let mut p = parent.to_vec();
+                        p.push(candidate.clone());
+                        let path = self.dir.join(&p).map_err(|e| format!("{shown}: {e}"))?;
+                        // 알 수 없는 이름은 있는 것으로 보고 다음 이름을 고른다.
+                        if !self.guest.exists(&path).await?.unwrap_or(true) {
+                            chosen = Some(candidate);
+                            break;
                         }
-                        match chosen {
-                            Some(c) => (c, false, Some(name.clone())),
-                            None => {
-                                self.report
-                                    .failed
-                                    .push(format!("{shown} ({})", NoFreeName(name.clone())));
-                                discard(self);
-                                return Ok(());
-                            }
+                    }
+                    match chosen {
+                        Some(c) => (c, false, Some(name.clone())),
+                        None => {
+                            self.report
+                                .failed
+                                .push(format!("{shown} ({})", NoFreeName(name.clone())));
+                            discard(self);
+                            return Ok(());
                         }
                     }
                 }
-            };
+            }
+        };
         let mut p = parent.to_vec();
         p.push(write_name);
         let write_path = match self.dir.join(&p) {
@@ -834,5 +869,25 @@ impl Walker<'_> {
         if !self.guest.remove(&f.write_path).await {
             self.report.left.push(f.write_path.clone());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 리뷰 1: 결과 문구의 이름 목록은 처음 몇 개만 들고 나머지는 센다(끝없는 건너뜀에도 메모리가 늘지 않음).
+    #[test]
+    fn report_names_are_bounded() {
+        let mut n = Names::default();
+        for i in 0..100_000 {
+            n.push(format!("f{i} (special file)"));
+        }
+        assert_eq!(n.len(), 100_000);
+        assert_eq!(n.shown.len(), REPORT_NAMES);
+        let text = names_list(&n);
+        assert!(text.starts_with("f0 (special file); f1"), "{text}");
+        assert!(text.ends_with("and 99990 more"), "{text}");
+        assert!(Names::default().is_empty());
     }
 }

@@ -150,7 +150,9 @@ impl Owners {
             o.volumes.insert(v.id, (v.name, v.spec.pool));
         }
         let mut backups = vec![t];
-        if let TaskOp::BackupRestore { backup, .. } = &task.op {
+        if let TaskOp::BackupRestore { backup, .. } | TaskOp::FileRestoreSession { backup } =
+            &task.op
+        {
             backups.push(*backup);
         }
         for id in backups {
@@ -289,6 +291,9 @@ impl Owners {
                 Self::import(*import)
             }),
             TaskOp::VmImportDelete => Some(Self::import(t)),
+            // 세션 Task의 대상은 세션 id라 백업이, 되돌려 쓰기는 쓰는 VM이 주인이다(폴더 권한으로 따라갈 수 있게).
+            TaskOp::FileRestoreSession { backup } => self.backup_id(*backup),
+            TaskOp::FileRestoreToGuest { .. } => Some(self.vm(t)),
             _ => None,
         };
         match object {

@@ -712,8 +712,9 @@ pub struct RestoreHelperArgs<'a> {
 /// 도우미 VM 디스크 수 상한(virtio-blk-pci는 PCI 자리 하나씩 — q35·virt 모두 넉넉히 남는 수)
 pub const MAX_HELPER_DISKS: usize = 24;
 
-/// 도우미 이미지의 통신 규약 판(`opl.proto=` — 에이전트가 다르면 끈다)
-pub const HELPER_PROTO: u32 = 1;
+/// 도우미 이미지의 통신 규약 판(`opl.proto=` — 에이전트가 다르면 끈다). `opl_restore::proto::PROTO_VERSION`과 같아야
+/// 한다(opl-driver 시험이 본다).
+pub const HELPER_PROTO: u32 = 2;
 
 /// 파일 복원 도우미 VM의 QEMU 인자(바이너리 제외, 계획 69 §7.4). 펌웨어 없이 커널을 바로 올리고(`-kernel`·`-initrd`),
 /// 장치는 디스크마다 virtio-blk(읽기 전용 원본 → 덮개), virtio-serial 하나, virtio-rng, 직렬 콘솔(파일)뿐이다 —
@@ -2171,7 +2172,7 @@ mod tests {
             "-name opl-fr-00000000-0000-0000-0000-000000000000 -nodefaults -no-user-config -display none -net none",
             " -machine virt,accel=tcg,gic-version=max -cpu max,pauth-impdef=on -smp 2 -m 512M",
             " -kernel /usr/share/orbivisor/restore/aarch64/Image -initrd /usr/share/orbivisor/restore/aarch64/initrd.img",
-            " -append console=ttyAMA0 panic=-1 quiet opl.session=00000000-0000-0000-0000-000000000000 opl.proto=1",
+            " -append console=ttyAMA0 panic=-1 quiet opl.session=00000000-0000-0000-0000-000000000000 opl.proto=2",
             " -blockdev driver=nbd,server.type=unix,server.path=/run/opl/file-restore/x/nbd,,1.sock,export=disk0,read-only=on,node-name=src0",
             " -blockdev driver=qcow2,file.driver=file,file.filename=/var/lib/opl/file-restore/x/ov0.qcow2,backing=src0,node-name=ov0",
             " -device virtio-blk-pci,drive=ov0,serial=opl-disk0",

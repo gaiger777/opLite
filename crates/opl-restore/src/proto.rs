@@ -1,9 +1,14 @@
-//! opld ↔ 도우미 에이전트 통신 규약(판 1, 설계 §9.2). virtio-serial 위 바이트 흐름에 틀을 붙인다:
+//! opld ↔ 도우미 에이전트 통신 규약(판 2, 설계 §9.2). virtio-serial 위 바이트 흐름에 틀을 붙인다:
 //! `u32 길이(BE, 머리 9바이트 포함)` · `u32 흐름 번호(BE)` · `u8 종류` · 내용. `Req`·`Resp`·`Err`의 내용은 JSON,
 //! `Data`는 날 바이트, `End`는 비어 있다. 내용은 1 MiB를 넘지 않는다.
 //!
 //! 흐름: opld가 요청마다 새 흐름 번호(1 이상)로 `Req` 하나를 보내고, 에이전트는 그 흐름에 `Resp`·`Data`를 0개 이상
 //! 보낸 뒤 `End`(성공)나 `Err`(실패)로 끝낸다. 흐름 0은 에이전트가 처음 보내는 `Hello`만 쓴다.
+//!
+//! 흐름마다 받을 몫(판 2): 에이전트는 한 흐름에 `Resp`·`Data` 틀을 [`STREAM_WINDOW`] 바이트(틀 머리 포함)까지만
+//! 보내 두고, 더 보내려면 opld가 그 흐름에 `Ack`(받아 쓴 바이트, u32 BE)를 보내야 한다. 그래서 한 흐름의 받는 쪽이
+//! 느려도(멈춘 브라우저, 느린 게스트 쓰기) 그 흐름만 기다리고 채널의 다른 흐름은 막히지 않으며, opld가 흐름마다 쌓아 두는
+//! 것도 몫을 넘지 않는다. `End`·`Err`는 몫을 쓰지 않는다.
 //!
 //! 에이전트가 보낸 것은 백업 안 파일시스템(믿을 수 없는 입력)을 해석한 결과다. opld는 [`StreamCheck`]로 흐름마다
 //! 차례·크기·한도를 검사하고, 어긋나면 세션을 닫는다(`agent protocol violation: …`).
@@ -17,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 /// 통신 규약 판. 커널 명령줄 `opl.proto=`·`Hello.proto`·이미지 `manifest.json`이 같아야 한다.
-pub const PROTO_VERSION: u32 = 1;
+pub const PROTO_VERSION: u32 = 2;
 /// 도우미 VM의 virtio-serial 포트 이름
 pub const PORT_NAME: &str = "org.orbivisor.restore.0";
 
@@ -45,6 +50,11 @@ pub const MAX_TEXT: usize = 1024;
 pub const MAX_LABEL: usize = 256;
 /// 한 번에 붙여 보내는 요청 경로 수 상한(걷기)
 pub const MAX_WALK_PATHS: usize = 1000;
+/// 흐름 하나의 받을 몫(바이트, 틀 머리 포함): `Ack` 없이 보낼 수 있는 `Resp`·`Data` 틀의 합. 가장 큰 틀보다 커야 한다.
+pub const STREAM_WINDOW: u64 = 4 << 20;
+/// 걷기 한 번에 받는 경로 바이트 합의 기본 상한(항목·하드 링크 대상·건너뛴 경로) — opld가 아카이브를 쓰며 들고 있는
+/// 이름(zip 중앙 디렉터리·겹침 검사)을 바이트로 묶는다.
+pub const DEFAULT_MAX_PATH_BYTES: u64 = 256 << 20;
 
 // ---------------------------------------------------------------------------------------------------------------
 // 틀
@@ -64,6 +74,8 @@ pub enum FrameKind {
     End = 4,
     /// 흐름 끝(실패, JSON [`AgentError`])
     Err = 5,
+    /// 받아 쓴 바이트(opld → 에이전트, u32 BE — 그 흐름의 몫을 돌려준다)
+    Ack = 6,
 }
 
 impl FrameKind {
@@ -74,6 +86,7 @@ impl FrameKind {
             3 => FrameKind::Data,
             4 => FrameKind::End,
             5 => FrameKind::Err,
+            6 => FrameKind::Ack,
             _ => return None,
         })
     }
@@ -120,6 +133,25 @@ impl Frame {
 
     pub fn end(stream: u32) -> Self {
         Frame::new(stream, FrameKind::End, Vec::new())
+    }
+
+    /// 몫을 돌려주는 틀(`bytes`만큼 받아 썼다)
+    pub fn ack(stream: u32, bytes: u32) -> Self {
+        Frame::new(stream, FrameKind::Ack, bytes.to_be_bytes().to_vec())
+    }
+
+    /// `Ack` 틀의 바이트 수(꼴이 틀리면 없음)
+    pub fn ack_bytes(&self) -> Option<u32> {
+        let b: [u8; 4] = self.payload.as_slice().try_into().ok()?;
+        (self.kind == FrameKind::Ack).then(|| u32::from_be_bytes(b))
+    }
+
+    /// 이 틀이 쓰는 몫(`Resp`·`Data`는 머리를 포함한 길이, 나머지는 0)
+    pub fn cost(&self) -> u64 {
+        match self.kind {
+            FrameKind::Resp | FrameKind::Data => (HEADER_LEN + self.payload.len()) as u64,
+            _ => 0,
+        }
     }
 
     /// 머리를 붙인 바이트(내용이 [`MAX_PAYLOAD`]를 넘으면 부르는 쪽 잘못 — 보내기 전에 나눈다)
@@ -853,6 +885,9 @@ pub struct StreamCheck {
     state: State,
     max_entries: u64,
     entries: u64,
+    max_path_bytes: u64,
+    path_bytes: u64,
+    limited: bool,
 }
 
 impl StreamCheck {
@@ -872,7 +907,47 @@ impl StreamCheck {
             state: State::Start,
             max_entries,
             entries: 0,
+            max_path_bytes: DEFAULT_MAX_PATH_BYTES,
+            path_bytes: 0,
+            limited: false,
         }
+    }
+
+    /// 걷기 한 번의 경로 바이트 합 상한(기본 [`DEFAULT_MAX_PATH_BYTES`])
+    pub fn with_max_path_bytes(mut self, max: u64) -> Self {
+        self.max_path_bytes = max;
+        self
+    }
+
+    /// 마지막 오류가 규약 위반이 아니라 한도(항목 수·경로 바이트)였는지 — 부르는 쪽은 세션이 아니라 그 흐름만 끝낸다.
+    pub fn limit_reached(&self) -> bool {
+        self.limited
+    }
+
+    /// 걷기 항목 하나(건너뜀 포함)를 센다: 항목 수와 경로 바이트(조각마다 구분자 1바이트를 더함)
+    fn count(&mut self, paths: &[&[Name]]) -> Result<(), Violation> {
+        self.entries += 1;
+        if self.entries > self.max_entries {
+            self.limited = true;
+            return Err(violation(format!(
+                "more than {} entries in one download",
+                self.max_entries
+            )));
+        }
+        let bytes: u64 = paths
+            .iter()
+            .flat_map(|p| p.iter())
+            .map(|n| n.as_bytes().len() as u64 + 1)
+            .sum();
+        self.path_bytes += bytes;
+        if self.path_bytes > self.max_path_bytes {
+            self.limited = true;
+            return Err(violation(format!(
+                "more than {} MiB of path names in one download",
+                self.max_path_bytes >> 20
+            )));
+        }
+        Ok(())
     }
 
     pub fn done(&self) -> bool {
@@ -891,6 +966,7 @@ impl StreamCheck {
         }
         match frame.kind {
             FrameKind::Req => Err(violation("the agent sent a request frame")),
+            FrameKind::Ack => Err(violation("the agent sent an ack frame")),
             FrameKind::Err => {
                 let err: AgentError = frame
                     .parse()
@@ -995,13 +1071,8 @@ impl StreamCheck {
                     }
                     check_path(h)?;
                 }
-                self.entries += 1;
-                if self.entries > self.max_entries {
-                    return Err(violation(format!(
-                        "more than {} entries in one download",
-                        self.max_entries
-                    )));
-                }
+                let link: &[Name] = item.hardlink.as_deref().unwrap_or(&[]);
+                self.count(&[&item.path, link])?;
                 self.state = match item.data_len() {
                     0 => State::Walking,
                     n => State::Data { remaining: n },
@@ -1014,6 +1085,8 @@ impl StreamCheck {
             (Op::Walk, State::Start | State::Walking, Reply::Skipped { path, reason }) => {
                 check_path(path)?;
                 check_text("reason", reason)?;
+                // 건너뜀도 항목으로 센다(끝없는 건너뜀으로 opld 메모리를 채우지 못하게). 파일 오류는 열린 파일마다 하나뿐이다.
+                self.count(&[path])?;
                 self.state = State::Walking;
             }
             (

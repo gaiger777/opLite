@@ -9,7 +9,7 @@
 //! - **내려받기**는 두 걸음이다: `download-link`가 세션 노드 메모리에 60초·한 번만 쓰는 토큰을 만들고(사용자에 묶임),
 //!   `GET …/download/{token}`이 같은 사용자의 인증을 다시 보고 흘려 보낸다. 감사는 흐름이 끝날 때 바이트·항목 수와 함께.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -77,6 +77,8 @@ const CHUNK: usize = 256 << 10;
 /// 감사 문구에 넣는 경로 수와 이름 길이(§13)
 const AUDIT_PATHS: usize = 5;
 const AUDIT_NAME: usize = 200;
+/// 시작하기 전에 받은 닫기를 들고 있는 시간(그동안 Task가 시작하지 않으면 버림)
+const CLOSED_EARLY_KEEP: Duration = Duration::from_secs(3600);
 
 // ---------------------------------------------------------------------------------------------------------------
 // 세션 등록부(세션 노드 메모리)
@@ -90,8 +92,9 @@ pub struct FileRestoreSessions {
     pub run_dir: PathBuf,
     pub state_dir: PathBuf,
     sessions: Mutex<HashMap<Uuid, Arc<Session>>>,
-    /// Task가 시작하기 전에 닫기를 받은 세션(Task가 시작하면 곧바로 끝낸다)
-    closed_early: Mutex<HashSet<Uuid>>,
+    /// Task가 시작하기 전에 닫기를 받은 세션(Task가 시작하면 곧바로 끝낸다)과 받은 때. 끝내 시작하지 않은 Task의 것은
+    /// [`CLOSED_EARLY_KEEP`]이 지나면 버린다.
+    closed_early: Mutex<HashMap<Uuid, Instant>>,
 }
 
 impl Default for FileRestoreSessions {
@@ -126,7 +129,7 @@ impl FileRestoreSessions {
 
     /// Task가 시작하기 전에 닫기를 받았는지(받았으면 지운다)
     pub(crate) fn take_closed_early(&self, id: Uuid) -> bool {
-        self.closed_early.lock().unwrap().remove(&id)
+        self.closed_early.lock().unwrap().remove(&id).is_some()
     }
 
     /// 열린 세션 수(시험)
@@ -141,7 +144,9 @@ impl FileRestoreSessions {
     async fn local_call(&self, req: FileRestoreCallRequest) -> Result<FileRestoreAnswer, ApiError> {
         let Some(session) = self.get(req.session) else {
             if let FileRestoreOp::Close { .. } = req.op {
-                self.closed_early.lock().unwrap().insert(req.session);
+                let mut early = self.closed_early.lock().unwrap();
+                early.retain(|_, at| at.elapsed() < CLOSED_EARLY_KEEP);
+                early.insert(req.session, Instant::now());
                 return Ok(FileRestoreAnswer::Closed);
             }
             return Err(not_ready());
@@ -504,6 +509,10 @@ impl Session {
         if req.format == DownloadFormat::Raw && req.paths.len() != 1 {
             return Err(invalid_path("a raw download takes exactly one file"));
         }
+        // 잘못된 경로는 링크를 만들기 전에 거절한다(한 번 쓰는 토큰을 내려받기에서야 버리지 않게).
+        for p in &req.paths {
+            names(p)?;
+        }
         if let Some(name) = &req.name {
             req.name = Some(clean_name(name)?);
         }
@@ -696,6 +705,13 @@ impl Writer {
         }
     }
 
+    fn note(&mut self, line: String) {
+        match self {
+            Writer::Zip(w) => w.note(line),
+            Writer::Tar(w) => w.note(line),
+        }
+    }
+
     fn finish(self) -> std::io::Result<u64> {
         match self {
             Writer::Zip(w) => {
@@ -730,6 +746,13 @@ async fn pump_archive(
             Ok(Some(StreamItem::Reply(r))) => Event::Reply(r),
             Ok(Some(StreamItem::Data(d))) => Event::Data(d),
             Ok(None) => break None,
+            // 한도(항목 수·경로 바이트)에서 멈춘 걷기: 받은 데까지로 아카이브를 맺고 까닭을 보고서에 적는다.
+            Err(HelperError::Limit(why)) => {
+                w.note(format!(
+                    "stopped: {why} — the archive holds only the items before this point; download smaller folders"
+                ));
+                break None;
+            }
             Err(e) => break Some(e.to_string()),
         };
         if let Err(e) = w.feed(&mut feeder, &ev) {
@@ -835,6 +858,11 @@ pub(crate) fn helper_error(volume: &str, e: HelperError) -> ApiError {
             "the file restore helper did not answer within 60 seconds",
         ),
         HelperError::Closed(why) => session_closed(Some(&why)),
+        HelperError::Limit(why) => ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "file_restore_too_large",
+            format!("{why}; choose fewer or smaller folders"),
+        ),
     }
 }
 
@@ -859,6 +887,7 @@ const CODES: &[&str] = &[
     "file_restore_busy",
     "file_restore_io",
     "file_restore_timeout",
+    "file_restore_too_large",
     "file_restore_unavailable",
     "forbidden",
     "not_found",
@@ -1353,20 +1382,36 @@ pub async fn list_sessions(
     Query(params): Query<SessionListParams>,
 ) -> Result<Json<Vec<FileRestoreSessionView>>, ApiError> {
     require_feature(&state.cluster, FILE_RESTORE)?;
-    if params.all && !is_admin(&state, &principal) {
+    let admin = is_admin(&state, &principal);
+    if params.all && !admin {
         return Err(ApiError::forbidden());
     }
-    let backup = params
-        .backup
-        .as_deref()
-        .map(|k| lookup::<BackupSpec>(&state.cluster, k).map(|b| b.id))
-        .transpose()?;
+    // 없는 백업은 빈 목록이다(404면 남의 백업 이름이 있는지 알려 준다 — 리뷰 1).
+    let backup = match params.backup.as_deref() {
+        None => None,
+        Some(k) => match lookup::<BackupSpec>(&state.cluster, k) {
+            Ok(b) => Some(b.id),
+            Err(e) if e.status == StatusCode::NOT_FOUND => return Ok(Json(Vec::new())),
+            Err(e) => return Err(e),
+        },
+    };
     let mut out = Vec::new();
     for task in session_tasks(&state)? {
         if task.status.state.is_finished()
             || (!params.all && owner_of(&task) != Some(principal.user))
             || backup.is_some_and(|b| b != backup_of(&task))
         {
+            continue;
+        }
+        // 다른 세션 경로처럼 백업의 `backup.file_restore`를 다시 본다(권한을 빼면 목록에서도 사라짐 — 리뷰 1).
+        let allowed = match resolve(&state.cluster, Obj::Backup, &backup_of(&task).to_string())? {
+            Some(found) => state
+                .authz
+                .require(&principal, Privilege::BackupFileRestore, &found)
+                .is_ok(),
+            None => admin,
+        };
+        if !allowed {
             continue;
         }
         out.push(view_of(&state, &task, principal.user).await);
@@ -1916,6 +1961,11 @@ mod tests {
             (HelperError::Busy, 429, "file_restore_busy"),
             (HelperError::Timeout, 504, "file_restore_timeout"),
             (HelperError::Closed("gone".into()), 409, "session_closed"),
+            (
+                HelperError::Limit("too many".into()),
+                413,
+                "file_restore_too_large",
+            ),
         ];
         for (e, status, code) in cases {
             let got = helper_error("disk0", e);
@@ -2006,6 +2056,32 @@ mod tests {
             },
         );
         assert_eq!(s.take_link("old", me).unwrap_err().code, "link_expired");
+    }
+
+    /// 리뷰 1: 시작 전에 받은 닫기는 Task가 시작할 때 한 번 쓰이고, 끝내 시작하지 않은 Task의 것은 시간이 지나면 버린다.
+    #[tokio::test]
+    async fn early_closes_are_taken_once_and_expire() {
+        let reg = FileRestoreSessions::default();
+        let close = |session| FileRestoreCallRequest {
+            session,
+            user: Uuid::nil(),
+            op: FileRestoreOp::Close {
+                reason: "bye".into(),
+            },
+        };
+        let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+        reg.local_call(close(a)).await.unwrap();
+        assert!(reg.take_closed_early(a));
+        assert!(!reg.take_closed_early(a));
+        reg.local_call(close(b)).await.unwrap();
+        // b를 오래전에 받은 것으로 — 다음 닫기가 치운다.
+        let old = Instant::now()
+            .checked_sub(CLOSED_EARLY_KEEP + Duration::from_secs(1))
+            .unwrap();
+        reg.closed_early.lock().unwrap().insert(b, old);
+        reg.local_call(close(a)).await.unwrap();
+        assert!(!reg.take_closed_early(b));
+        assert!(reg.take_closed_early(a));
     }
 
     #[tokio::test]

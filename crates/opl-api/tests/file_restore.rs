@@ -523,6 +523,13 @@ async fn sessions_need_the_privilege_and_stay_with_their_owner() {
         ))
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // 리뷰 1: 목록도 권한을 다시 본다(볼륨·백업 이름이 보이지 않음). 없는 백업은 404가 아니라 빈 목록이다.
+    let (status, list) = hd.get("/file-restore/sessions").await;
+    assert_eq!((status, list), (StatusCode::OK, json!([])));
+    let (_, list) = hd.get("/file-restore/sessions?backup=web-1").await;
+    assert_eq!(list, json!([]));
+    let (status, list) = hd.get("/file-restore/sessions?backup=no-such-backup").await;
+    assert_eq!((status, list), (StatusCode::OK, json!([])));
     let (status, _) = admin.delete(&format!("/file-restore/sessions/{id}")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
@@ -672,6 +679,28 @@ async fn force_deleting_a_backup_closes_its_sessions() {
     let admin = env.admin().await;
     let s = ready(&admin, "web-1").await;
     let id = s["id"].as_str().unwrap().to_string();
+
+    // 리뷰 1: 거절할 지우기(증분의 부모)는 세션을 닫지 않는다.
+    let child = pool_backup(&env.cluster, env.dir.path(), "bk", "web-2", None).await;
+    let mut st = child.status.clone();
+    st.parent = Some(fr.backup.id);
+    env.cluster
+        .update_status::<BackupSpec>(child.id, &st)
+        .await
+        .unwrap();
+    let (status, body) = admin.delete("/backups/web-1?force=true").await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::CONFLICT, Some("backup_in_use")),
+        "{body}"
+    );
+    let (_, s) = admin.get(&format!("/file-restore/sessions/{id}")).await;
+    assert_eq!(s["phase"], "ready", "{s}");
+    env.cluster
+        .delete::<BackupSpec>(child.id, None)
+        .await
+        .unwrap();
+
     let (status, body) = admin.delete("/backups/web-1?force=true").await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let t = wait_task_done(env, &id).await;
@@ -1025,6 +1054,129 @@ async fn restoring_into_a_guest_checks_the_agent_and_the_request() {
     let (status, caps) = hd.get("/vms/web/guest/restore-caps").await;
     assert_eq!(status, StatusCode::OK, "{caps}");
     assert_eq!(caps["file_write"], false, "{caps}");
+}
+
+/// 리뷰 1: 있는지 알 수 없는 대상(읽기로 열 수 없음 — SELinux, Windows 공유 잠금)은 없는 것으로 보지 않는다: 그 파일은
+/// 실패로 적고 덮어쓰지 않는다.
+#[tokio::test]
+async fn files_whose_existence_is_unknown_are_not_overwritten() {
+    let fr = start(2, Duration::from_secs(600)).await;
+    let env = &fr.env;
+    let admin = env.admin().await;
+    let mut fs = MockGuestFs::linux(&["/srv", "/srv/etc"]);
+    fs.files
+        .insert("/srv/etc/hostname".into(), b"old\n".to_vec());
+    fs.unreadable.insert("/srv/etc/hostname".into());
+    let vm = guest_vm(env, &admin, "web", fs).await;
+    let s = ready(&admin, "web-1").await;
+    let id = s["id"].as_str().unwrap().to_string();
+    for conflict in ["overwrite", "keep", "skip"] {
+        let t = restore_into(
+            &admin,
+            &id,
+            json!({ "volume": "disk0p1", "paths": ["/etc/hostname"], "vm": "web",
+                    "target_dir": "/srv/etc", "conflict": conflict }),
+        )
+        .await;
+        assert_eq!(t["status"]["state"], "failed", "{conflict}: {t}");
+        let err = t["status"]["error"].as_str().unwrap();
+        assert!(
+            err.contains("cannot tell whether it exists"),
+            "{conflict}: {err}"
+        );
+        let g = env.hv.guest_fs(vm).unwrap();
+        assert_eq!(text(&g, "/srv/etc/hostname"), "old\n");
+        assert!(!g.ops.iter().any(|o| o.starts_with("open ")), "{:?}", g.ops);
+    }
+}
+
+/// 리뷰 1: 폴더에만 권한이 있는 사용자(계획 62)도 자기 세션 Task와 되돌려 쓰기 Task를 따라간다 — 세션 Task는 백업이,
+/// 되돌려 쓰기 Task는 VM이 주인이다(클러스터 Task가 아님).
+#[tokio::test]
+async fn folder_scoped_users_follow_their_file_restore_tasks() {
+    let fr = start(2, Duration::from_secs(600)).await;
+    let env = &fr.env;
+    let admin = env.admin().await;
+    let (status, folder) = admin
+        .post("/folders", json!({ "name": "team", "kind": "vm" }))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{folder}");
+    let team: uuid::Uuid = folder["id"].as_str().unwrap().parse().unwrap();
+    // 백업한 때의 폴더가 team인 백업과 team 안의 VM
+    let mut backup = env
+        .cluster
+        .get::<BackupSpec>(fr.backup.id)
+        .unwrap()
+        .unwrap();
+    backup.spec.vm_spec.folder = Some(team);
+    env.cluster
+        .update_spec(backup.id, None, backup.labels.clone(), &backup.spec)
+        .await
+        .unwrap();
+    let mut req = vm_request("web");
+    req["spec"]["guest_agent"] = json!({});
+    req["spec"]["folder"] = json!(team);
+    let (status, vm) = admin.post("/vms", req).await;
+    assert_eq!(status, StatusCode::CREATED, "{vm}");
+    let vm_id: uuid::Uuid = vm["id"].as_str().unwrap().parse().unwrap();
+    env.hv.set_guest_agent(vm_id, GuestAnswer::Ok);
+    env.hv.set_guest_fs(vm_id, MockGuestFs::linux(&["/srv"]));
+    let t = admin.act("web", "start").await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+
+    let (status, role) = admin
+        .post(
+            "/access-roles",
+            json!({ "name": "team-restore", "privileges": ["system.read", "vm.config", "backup.file_restore"] }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{role}");
+    let (status, user) = admin
+        .post(
+            "/users",
+            json!({ "name": "fu", "password": "password-1", "role": "none" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{user}");
+    let (status, grant) = admin
+        .post(
+            "/grants",
+            json!({
+                "principal": { "type": "user", "id": user["id"] },
+                "role": { "type": "custom", "id": role["id"] },
+                "target": { "type": "folder", "id": team },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{grant}");
+    let fu = env.login("fu", "password-1").await;
+
+    let (status, opened) = open(&fu, "web-1").await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{opened}");
+    let task = opened["task"].as_str().unwrap();
+    let (status, t) = fu.get(&format!("/tasks/{task}")).await;
+    assert_eq!(status, StatusCode::OK, "{t}");
+    assert_eq!(t["spec"]["op"]["kind"], "file-restore-session");
+    let id = opened["session"]["id"].as_str().unwrap().to_string();
+    wait_phase(&fu, &id, "ready").await;
+
+    let (status, t) = fu
+        .post(
+            &format!("/file-restore/sessions/{id}/restore-to-vm"),
+            json!({ "volume": "disk0p1", "paths": ["/etc/hostname"], "vm": "web", "target_dir": "/srv" }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{t}");
+    let task = t["id"].as_str().unwrap();
+    let t = wait_any(&fu, &t).await;
+    assert_eq!(t["status"]["state"], "succeeded", "{t}");
+    let (status, got) = fu.get(&format!("/tasks/{task}")).await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["spec"]["op"]["kind"], "file-restore-to-guest");
+    // 폴더 밖 사용자는 보지 못한다.
+    let other = env.user("other", "none").await;
+    let (status, _) = other.get(&format!("/tasks/{task}")).await;
+    assert_ne!(status, StatusCode::OK);
 }
 
 /// 노드 비우기는 그 노드의 세션을 닫고(설계 §13), 유지보수 노드에는 새 세션을 열지 않는다.

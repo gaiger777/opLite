@@ -982,7 +982,8 @@ pub struct FileRestoreSection {
     pub guest_max_bytes: u64,
     #[serde(default = "default_fr_guest_max_files")]
     pub guest_max_files: u64,
-    /// 내려받기(zip·tar.gz) 한 번의 항목 수 상한
+    /// 걷기(zip·tar.gz 내려받기, 게스트로 되돌려 쓰기) 한 번의 항목 수 상한(건너뛴 항목도 셈). 경로 이름의 합은 따로
+    /// 256 MiB까지. 넘으면 내려받기는 받은 데까지로 아카이브를 맺고 보고서에 적으며, 되돌려 쓰기는 멈춘다
     #[serde(default = "default_fr_download_max_entries")]
     pub download_max_entries: u64,
 }

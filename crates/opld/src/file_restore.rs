@@ -105,7 +105,7 @@ mod tests {
             "initrd": "initrd.img",
             "kernel": "Image",
             "kernel_release": "6.12",
-            "proto": 1,
+            "proto": 2,
         });
         std::fs::write(d.join("manifest.json"), manifest.to_string()).unwrap();
     }

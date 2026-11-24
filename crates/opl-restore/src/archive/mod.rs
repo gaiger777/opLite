@@ -32,6 +32,17 @@ impl PathGuard {
 
     /// 항목 하나를 받을지. 받으면 `Ok`, 아니면 까닭. 건너뛴 디렉터리의 아래 항목도 건너뛴다.
     pub fn admit(&mut self, path: &[Vec<u8>], is_dir: bool) -> Result<(), &'static str> {
+        self.admit_unless(path, is_dir, None)
+    }
+
+    /// [`admit`](Self::admit)과 같되, 차례·겹침 검사를 지난 항목도 `reject`가 있으면 그 까닭으로 건너뛴다(디렉터리면 그
+    /// 아래도). 작성기만 아는 까닭(zip 이름 길이)에 쓴다.
+    pub fn admit_unless(
+        &mut self,
+        path: &[Vec<u8>],
+        is_dir: bool,
+        reject: Option<&'static str>,
+    ) -> Result<(), &'static str> {
         let Some((name, parent)) = path.split_last() else {
             return Err("empty path");
         };
@@ -61,10 +72,12 @@ impl PathGuard {
                 Some((_, children, _)) => children,
                 None => &mut self.top,
             };
-            if siblings.insert(name.clone()) {
-                Ok(())
-            } else {
+            if !siblings.insert(name.clone()) {
                 Err("another item has the same path")
+            } else if let Some(why) = reject {
+                Err(why)
+            } else {
+                Ok(())
             }
         };
         if is_dir {
@@ -80,10 +93,17 @@ impl PathGuard {
     }
 }
 
-/// 보고서(건너뛴 항목·오류)
+/// 보고서에 적는 줄 수 상한(넘는 줄은 세기만 한다 — 도우미가 끝없이 건너뛰어도 opld 메모리가 늘지 않게)
+pub const MAX_REPORT_LINES: usize = 1000;
+/// 보고서 본문 바이트 상한
+pub const MAX_REPORT_BYTES: usize = 256 << 10;
+
+/// 보고서(건너뛴 항목·오류). 처음 [`MAX_REPORT_LINES`]줄·[`MAX_REPORT_BYTES`]바이트만 들고 나머지는 센다.
 #[derive(Debug, Default, Clone)]
 pub struct Report {
     lines: Vec<String>,
+    bytes: usize,
+    omitted: u64,
 }
 
 /// 보고서·로그에 쓰는 경로: UTF-8이 아닌 바이트와 제어 문자는 `\xNN`
@@ -108,28 +128,45 @@ pub fn escape_path(path: &[impl AsRef<[u8]>]) -> String {
 }
 
 impl Report {
-    pub fn skipped(&mut self, path: &[impl AsRef<[u8]>], reason: &str) {
-        self.lines
-            .push(format!("skipped: {} — {reason}", escape_path(path)));
-    }
-
-    pub fn error(&mut self, path: &[impl AsRef<[u8]>], message: &str) {
-        self.lines.push(format!(
-            "incomplete: {} — {message} (the copy in this archive is cut short; download it again)",
-            escape_path(path)
-        ));
-    }
-
-    pub fn note(&mut self, line: String) {
+    fn push(&mut self, line: impl FnOnce() -> String) {
+        if self.lines.len() >= MAX_REPORT_LINES || self.bytes >= MAX_REPORT_BYTES {
+            self.omitted += 1;
+            return;
+        }
+        let line = line();
+        if self.bytes + line.len() + 1 > MAX_REPORT_BYTES {
+            self.omitted += 1;
+            self.bytes = MAX_REPORT_BYTES;
+            return;
+        }
+        self.bytes += line.len() + 1;
         self.lines.push(line);
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+    pub fn skipped(&mut self, path: &[impl AsRef<[u8]>], reason: &str) {
+        self.push(|| format!("skipped: {} — {reason}", escape_path(path)));
     }
 
+    pub fn error(&mut self, path: &[impl AsRef<[u8]>], message: &str) {
+        self.push(|| {
+            format!(
+                "incomplete: {} — {message} (the copy in this archive is cut short; download it again)",
+                escape_path(path)
+            )
+        });
+    }
+
+    pub fn note(&mut self, line: String) {
+        self.push(|| line);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty() && self.omitted == 0
+    }
+
+    /// 적은 줄과 세기만 한 줄의 합
     pub fn len(&self) -> usize {
-        self.lines.len()
+        self.lines.len() + self.omitted as usize
     }
 
     /// 보고서 본문
@@ -140,6 +177,13 @@ impl Report {
         for l in &self.lines {
             s.push_str(l);
             s.push('\n');
+        }
+        if self.omitted > 0 {
+            s.push_str(&format!(
+                "… and {} more line(s) not listed (the report keeps the first {} lines)\n",
+                self.omitted,
+                self.lines.len()
+            ));
         }
         s.into_bytes()
     }

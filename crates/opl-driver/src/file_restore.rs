@@ -46,14 +46,15 @@ pub const SUBDIR: &str = "file-restore";
 pub const UNIT_PREFIX: &str = "opl-fr-";
 /// 콘솔 로그 상한(넘으면 지킴이가 비운다 — 게스트가 쓴 내용이라 디스크를 채우지 못하게)
 pub const CONSOLE_MAX: u64 = 1 << 20;
-/// 덮개·콘솔을 보는 간격(§9.4)
-pub const GUARD_EVERY: Duration = Duration::from_secs(10);
+/// 덮개·콘솔을 보는 간격(§9.4). 부팅 중(`Hello` 전)에도 본다 — 파티션 표·저널은 부팅 때 이미 해석된다.
+pub const GUARD_EVERY: Duration = Duration::from_secs(2);
 /// 끝낼 때 에이전트 `Shutdown`·SIGTERM 뒤 기다리는 시간
 const STOP_WAIT: Duration = Duration::from_secs(5);
 /// 유닉스 소켓 경로 상한(macOS `sun_path` 104바이트, NUL 포함)
 const MAX_SOCKET_PATH: usize = 103;
-/// 흐름 하나에 쌓아 두는 사건 수(데이터 틀 ≤ 1 MiB씩)
-const STREAM_BUFFER: usize = 4;
+/// 받는 쪽이 이만큼 받아 쓰면 몫을 돌려준다(창의 1/4 — 작은 틀마다 `Ack`를 보내지 않게). 받을 것이 없어 기다리기
+/// 전에는 남은 것을 모두 돌려준다(에이전트가 몫을 기다리는 채 서로 기다리지 않게).
+const ACK_EVERY: u64 = proto::STREAM_WINDOW / 4;
 /// QEMU 탐침 한도
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// manifest.json 크기 상한
@@ -70,8 +71,10 @@ pub struct ClientOptions {
     pub reply_timeout: Duration,
     /// 세션 하나의 동시 흐름(넘으면 [`HelperError::Busy`])
     pub max_streams: usize,
-    /// 걷기 한 번의 항목 상한(`download_max_entries`)
+    /// 걷기 한 번의 항목 상한(`download_max_entries` — 건너뛴 항목도 셈)
     pub max_entries: u64,
+    /// 걷기 한 번의 경로 바이트 합 상한(아카이브가 들고 있는 이름을 바이트로 묶음)
+    pub max_path_bytes: u64,
     /// 시간 초과가 이만큼 이어지면 세션을 닫는다
     pub max_strikes: u32,
 }
@@ -82,6 +85,7 @@ impl Default for ClientOptions {
             reply_timeout: Duration::from_secs(60),
             max_streams: 4,
             max_entries: 1_000_000,
+            max_path_bytes: proto::DEFAULT_MAX_PATH_BYTES,
             max_strikes: 3,
         }
     }
@@ -546,6 +550,9 @@ pub enum HelperError {
     /// 세션 채널이 닫혔다(도우미가 끝났거나 규약을 어겼다 — 까닭)
     #[error("the file restore session is closed: {0}")]
     Closed(String),
+    /// 걷기가 한도(항목 수·경로 바이트)를 넘어 그 흐름만 멈췄다(세션은 그대로)
+    #[error("{0}")]
+    Limit(String),
 }
 
 /// 흐름에서 받은 것
@@ -555,11 +562,16 @@ pub enum StreamItem {
     Data(Vec<u8>),
 }
 
-type Sink = mpsc::Sender<Result<Event, HelperError>>;
+/// 흐름의 사건과 그 틀이 쓴 몫(받는 쪽이 받아 쓰면 돌려준다)
+type Sink = mpsc::UnboundedSender<(Result<Event, HelperError>, u64)>;
 
 struct Slot {
     check: StreamCheck,
     tx: Option<Sink>,
+    /// 받았으나 몫을 돌려주지 않은 바이트(창을 넘으면 에이전트가 규약을 어긴 것)
+    queued: u64,
+    /// 한도로 끊어 취소한 흐름: 끝 틀이 올 때까지 틀을 버린다
+    draining: bool,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -705,7 +717,8 @@ impl HelperClient {
         } else {
             None
         };
-        let (tx, rx) = mpsc::channel(STREAM_BUFFER);
+        // 묶지 않은 통로지만 쌓이는 것은 흐름의 몫(STREAM_WINDOW)을 넘지 못한다(넘으면 위반).
+        let (tx, rx) = mpsc::unbounded_channel();
         let id = {
             let mut t = self.inner.table.lock().unwrap();
             let mut id = t.next;
@@ -719,8 +732,11 @@ impl HelperClient {
             t.streams.insert(
                 id,
                 Slot {
-                    check: StreamCheck::new(&req, self.inner.opts.max_entries),
+                    check: StreamCheck::new(&req, self.inner.opts.max_entries)
+                        .with_max_path_bytes(self.inner.opts.max_path_bytes),
                     tx: Some(tx),
+                    queued: 0,
+                    draining: false,
                     _permit: permit,
                 },
             );
@@ -735,6 +751,7 @@ impl HelperClient {
             rx,
             client: self.clone(),
             done: false,
+            unacked: 0,
         })
     }
 
@@ -904,7 +921,7 @@ impl Inner {
         let streams = std::mem::take(&mut self.table.lock().unwrap().streams);
         for (_, slot) in streams {
             if let Some(tx) = slot.tx {
-                let _ = tx.try_send(Err(HelperError::Closed(reason.clone())));
+                let _ = tx.send((Err(HelperError::Closed(reason.clone())), 0));
             }
         }
     }
@@ -915,49 +932,81 @@ impl Inner {
         }
     }
 
-    /// 받은 틀 하나를 그 흐름으로. 규약 위반이면 까닭
-    async fn dispatch(self: &Arc<Self>, frame: Frame) -> Result<(), String> {
+    /// 받은 틀 하나를 그 흐름으로(기다리지 않음 — 받는 쪽이 느려도 다른 흐름을 막지 않는다. 쌓이는 것은 흐름의 몫까지).
+    /// 규약 위반이면 까닭. 걷기 한도를 넘으면 그 흐름만 [`HelperError::Limit`]으로 끝내고 취소한다.
+    fn dispatch(self: &Arc<Self>, frame: Frame) -> Result<(), String> {
         let id = frame.stream;
         if id == 0 {
             return Err("agent protocol violation: unexpected frame on stream 0".into());
         }
-        let (event, tx, finished) = {
-            let mut t = self.table.lock().unwrap();
-            let Some(slot) = t.streams.get_mut(&id) else {
-                return Err(format!(
-                    "agent protocol violation: frame for unknown stream {id}"
-                ));
-            };
-            let event = slot.check.feed(frame).map_err(|v| v.to_string())?;
-            let finished = slot.check.done();
-            let tx = slot.tx.clone();
-            if finished {
+        let cost = frame.cost();
+        let last = matches!(frame.kind, FrameKind::End | FrameKind::Err);
+        let mut t = self.table.lock().unwrap();
+        let Some(slot) = t.streams.get_mut(&id) else {
+            return Err(format!(
+                "agent protocol violation: frame for unknown stream {id}"
+            ));
+        };
+        slot.queued += cost;
+        if slot.queued > proto::STREAM_WINDOW {
+            return Err(format!(
+                "agent protocol violation: stream {id} sent more than its window"
+            ));
+        }
+        if slot.draining {
+            if last {
                 t.streams.remove(&id);
             }
-            (event, tx, finished)
+            return Ok(());
+        }
+        let event = match slot.check.feed(frame) {
+            Ok(event) => event,
+            Err(v) if slot.check.limit_reached() => {
+                slot.draining = true;
+                let tx = slot.tx.take();
+                drop(t);
+                if let Some(tx) = tx {
+                    let _ = tx.send((Err(HelperError::Limit(v.0)), 0));
+                }
+                let client = HelperClient {
+                    inner: self.clone(),
+                };
+                tokio::spawn(async move { client.cancel(id).await });
+                return Ok(());
+            }
+            Err(v) => return Err(v.to_string()),
         };
+        let finished = slot.check.done();
+        let tx = slot.tx.clone();
+        if finished {
+            t.streams.remove(&id);
+        }
+        drop(t);
         if finished {
             self.strikes.store(0, Ordering::Relaxed);
         }
-        let Some(tx) = tx else {
-            return Ok(());
-        };
-        match tokio::time::timeout(self.opts.reply_timeout, tx.send(Ok(event))).await {
-            Ok(Ok(())) => {}
-            // 받는 쪽이 흐름을 버렸다(버릴 때 취소를 보냈다).
-            Ok(Err(_)) => self.detach(id),
-            // 받는 쪽이 오래 읽지 않는다: 다른 흐름을 막지 않게 이 흐름을 떼고 취소한다.
-            Err(_) => {
-                self.detach(id);
-                if !finished {
-                    let client = HelperClient {
-                        inner: self.clone(),
-                    };
-                    client.cancel(id).await;
-                }
-            }
+        // 받는 쪽이 흐름을 버렸으면(버릴 때 취소를 보냈다) 떼어 둔다.
+        if let Some(tx) = tx
+            && tx.send((Ok(event), cost)).is_err()
+        {
+            self.detach(id);
         }
         Ok(())
+    }
+
+    /// 받는 쪽이 `bytes`를 받아 썼다: 흐름의 몫을 돌려준다(끝난 흐름이면 보내지 않음).
+    async fn ack(&self, id: u32, bytes: u64) {
+        {
+            let mut t = self.table.lock().unwrap();
+            let Some(slot) = t.streams.get_mut(&id) else {
+                return;
+            };
+            slot.queued = slot.queued.saturating_sub(bytes);
+        }
+        // 실패하면 세션이 닫힌다(send가 닫음) — 받는 쪽은 다음 next에서 그 까닭을 받는다.
+        let _ = self
+            .send(Frame::ack(id, bytes.min(u64::from(u32::MAX)) as u32))
+            .await;
     }
 }
 
@@ -985,7 +1034,7 @@ async fn read_loop(
             if inner.closed.borrow().is_some() {
                 return;
             }
-            if let Err(reason) = inner.dispatch(frame).await {
+            if let Err(reason) = inner.dispatch(frame) {
                 inner.close(reason);
                 return;
             }
@@ -1011,9 +1060,11 @@ async fn read_loop(
 /// 요청 하나의 답 흐름. 다 받기 전에 버리면 에이전트에 취소를 보낸다.
 pub struct ReplyStream {
     id: u32,
-    rx: mpsc::Receiver<Result<Event, HelperError>>,
+    rx: mpsc::UnboundedReceiver<(Result<Event, HelperError>, u64)>,
     client: HelperClient,
     done: bool,
+    /// 받아 썼으나 아직 돌려주지 않은 몫
+    unacked: u64,
 }
 
 impl std::fmt::Debug for ReplyStream {
@@ -1039,7 +1090,24 @@ impl ReplyStream {
         }
         let opts = self.client.inner.opts;
         loop {
-            let got = tokio::time::timeout(opts.reply_timeout, self.rx.recv()).await;
+            let got = match self.rx.try_recv() {
+                Ok(x) => Ok(Some(x)),
+                Err(mpsc::error::TryRecvError::Disconnected) => Ok(None),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    // 기다리기 전에 몫을 모두 돌려준다 — 에이전트가 몫을 기다리고 있을 수 있다.
+                    self.flush_ack().await;
+                    tokio::time::timeout(opts.reply_timeout, self.rx.recv()).await
+                }
+            };
+            let got = got.map(|x| {
+                x.map(|(ev, cost)| {
+                    self.unacked += cost;
+                    ev
+                })
+            });
+            if self.unacked >= ACK_EVERY {
+                self.flush_ack().await;
+            }
             let ev = match got {
                 Err(_) => {
                     self.done = true;
@@ -1086,6 +1154,13 @@ impl ReplyStream {
 
     fn detach(&self) {
         self.client.inner.detach(self.id);
+    }
+
+    async fn flush_ack(&mut self) {
+        if self.unacked > 0 {
+            let n = std::mem::take(&mut self.unacked);
+            self.client.inner.ack(self.id, n).await;
+        }
     }
 }
 
@@ -1412,7 +1487,11 @@ pub async fn start_helper(
             return Err(e);
         }
     };
-    let connected = Box::pin(connect_helper(&mut child, &paths, cfg, launch, started)).await;
+    let overlays: Vec<PathBuf> = (0..launch.disks.len()).map(|i| paths.overlay(i)).collect();
+    let connected = tokio::select! {
+        r = Box::pin(connect_helper(&mut child, &paths, cfg, launch, started)) => r,
+        e = boot_guard(&paths, &overlays, cfg.overlay_max) => Err(e),
+    };
     let (client, hello) = match connected {
         Ok(c) => c,
         Err(e) => {
@@ -1431,7 +1510,6 @@ pub async fn start_helper(
     tracing::info!(session = %launch.id, pid, boot_ms = boot_time.as_millis() as u64, "file restore helper is up");
     let (ended_tx, ended) = watch::channel(None);
     let (stop, stop_rx) = oneshot::channel();
-    let overlays: Vec<PathBuf> = (0..launch.disks.len()).map(|i| paths.overlay(i)).collect();
     let monitor = tokio::spawn(monitor_qemu(Monitor {
         child,
         paths,
@@ -1661,6 +1739,28 @@ fn trim_console(path: &Path) {
     }
 }
 
+/// 덮개 한도를 넘은 까닭
+fn overlay_reason(max: u64) -> String {
+    format!(
+        "the filesystem journal replay wrote more than {} MiB",
+        max.div_ceil(1 << 20)
+    )
+}
+
+/// 부팅 중 지킴이(`Hello`까지): 콘솔 로그를 자르고 덮개 한도를 본다. 넘으면 그 까닭(부르는 쪽이 QEMU를 끝낸다).
+async fn boot_guard(paths: &HelperPaths, overlays: &[PathBuf], max: u64) -> DriverError {
+    let mut tick = tokio::time::interval(GUARD_EVERY);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        trim_console(&paths.console_log());
+        if overlay_bytes(overlays) > max {
+            return DriverError::FileRestore(overlay_reason(max));
+        }
+    }
+}
+
 /// 도우미 지킴이: QEMU가 끝나거나, 덮개가 한도를 넘거나(§9.4), 끝내라고 할 때까지. 끝난 까닭을 알리고 채널을 닫고
 /// scope·디렉터리를 치운다.
 async fn monitor_qemu(mut m: Monitor) {
@@ -1682,10 +1782,7 @@ async fn monitor_qemu(mut m: Monitor) {
                 trim_console(&m.paths.console_log());
                 let used = overlay_bytes(&m.overlays);
                 if used > m.overlay_max {
-                    let reason = format!(
-                        "the filesystem journal replay wrote more than {} MiB",
-                        m.overlay_max.div_ceil(1 << 20)
-                    );
+                    let reason = overlay_reason(m.overlay_max);
                     // 채널이 끊긴 까닭보다 먼저 이 까닭을 남긴다.
                     set_once(&m.ended, &reason);
                     m.client.close(reason.clone());
@@ -1702,7 +1799,8 @@ async fn monitor_qemu(mut m: Monitor) {
 }
 
 /// opld가 시작할 때 앞 프로세스의 도우미를 치운다(§10.5 — 세션은 이어 가지 않는다): `{run_dir}/file-restore/*/qemu.pid`의
-/// 살아 있는 QEMU(명령줄에 `opl-fr-<id>`)를 끝내고, `opl-fr-*.scope`를 멈추고, 두 `file-restore` 디렉터리를 지운다.
+/// 살아 있는 QEMU(명령줄에 `opl-fr-<id>`)를 끝내고, 그 세션들의 `opl-fr-<id>.scope`를 멈추고, 두 `file-restore` 디렉터리를
+/// 지운다. 이 opld의 디렉터리에 있는 세션만 건드린다 — 같은 호스트의 다른 opld(시험, 여러 인스턴스)의 도우미는 두지 않는다.
 /// 치운 세션 수다.
 pub async fn sweep_leftovers(run_dir: &Path, state_dir: &Path, systemd_scope: bool) -> usize {
     let mut ids = std::collections::BTreeSet::new();
@@ -1739,7 +1837,7 @@ pub async fn sweep_leftovers(run_dir: &Path, state_dir: &Path, systemd_scope: bo
         }
     }
     if systemd_scope {
-        for unit in leftover_units().await {
+        for unit in session_scopes(&ids) {
             crate::qemu::clear_stale_scope(&unit).await;
         }
     }
@@ -1754,30 +1852,11 @@ pub async fn sweep_leftovers(run_dir: &Path, state_dir: &Path, systemd_scope: bo
     ids.len()
 }
 
-/// 남은 `opl-fr-*.scope`
-async fn leftover_units() -> Vec<String> {
-    let out = tokio::process::Command::new("systemctl")
-        .args([
-            "list-units",
-            "--all",
-            "--plain",
-            "--no-legend",
-            "--type=scope",
-        ])
-        .arg(format!("{UNIT_PREFIX}*"))
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(PROBE_TIMEOUT, out).await {
-        Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().next())
-            .filter(|u| u.starts_with(UNIT_PREFIX) && u.ends_with(".scope"))
-            .map(String::from)
-            .collect(),
-        _ => Vec::new(),
-    }
+/// 세션들의 scope 이름(`opl-fr-<id>.scope`) — 치우기는 제 디렉터리에서 찾은 세션의 것만 멈춘다(모든 `opl-fr-*`가 아니라).
+fn session_scopes(ids: &std::collections::BTreeSet<Uuid>) -> Vec<String> {
+    ids.iter()
+        .map(|id| format!("{UNIT_PREFIX}{id}.scope"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------

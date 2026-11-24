@@ -2950,7 +2950,11 @@ async fn guest_file_once(
             Ok(h) => qga::file_close(session, h)
                 .await
                 .map(|()| GuestFileAnswer::Exists { exists: true }),
-            Err(e) if e.is_command() => Ok(GuestFileAnswer::Exists { exists: false }),
+            // 없다고 확실할 때만 없음 — 읽을 수 없는 것(SELinux·Windows 공유 잠금)은 `Refused`로 그 파일을 실패로
+            // 적게 한다(있는 파일을 `wb`로 열어 비우지 않게).
+            Err(qga::QgaError::Command { desc, .. }) if guest_not_found(&desc) => {
+                Ok(GuestFileAnswer::Exists { exists: false })
+            }
             Err(e) => Err(e),
         },
         GuestFileOp::Open { path } => qga::file_open(session, path, "wb")
@@ -2974,6 +2978,15 @@ async fn guest_file_once(
         }),
         Err(e) => Err(DriverError::GuestAgent(e.to_string())),
     }
+}
+
+/// `guest-file-open`의 오류가 "그런 파일이 없음"인지. Linux qemu-ga는 `strerror`(서비스는 C 로캘)를, Windows는
+/// `… (error: <16진 코드>)`를 붙인다(`ERROR_FILE_NOT_FOUND` 2·`ERROR_PATH_NOT_FOUND` 3 — 글은 지역화되지만 코드는 그대로).
+fn guest_not_found(desc: &str) -> bool {
+    desc.ends_with(": No such file or directory")
+        || desc.ends_with(": Not a directory")
+        || desc.ends_with("(error: 2)")
+        || desc.ends_with("(error: 3)")
 }
 
 fn agent_busy() -> DriverError {
@@ -4987,6 +5000,27 @@ mod tests {
     use opl_types::vm::{Arch, CpuModel, CpuSpec, MachineType, NicModel};
 
     use super::*;
+
+    /// 리뷰 1: `Exists`는 확실한 "없음"(Linux strerror, Windows 오류 2·3)만 없음으로 본다.
+    #[test]
+    fn only_definite_not_found_is_absent() {
+        for desc in [
+            "failed to open file '/srv/a' (mode: 'r'): No such file or directory",
+            "failed to open file '/srv/a/b' (mode: 'r'): Not a directory",
+            "failed to open file 'C:\\a': 지정된 파일을 찾을 수 없습니다. (error: 2)",
+            "failed to open file 'C:\\x\\a': The system cannot find the path specified. (error: 3)",
+        ] {
+            assert!(guest_not_found(desc), "{desc}");
+        }
+        for desc in [
+            "failed to open file '/srv/a' (mode: 'r'): Permission denied",
+            "failed to open file 'C:\\a': The process cannot access the file (error: 20)",
+            "failed to open file 'C:\\a': Access is denied. (error: 5)",
+            "command guest-file-open has been disabled",
+        ] {
+            assert!(!guest_not_found(desc), "{desc}");
+        }
+    }
 
     fn config(root: &Path, qemu_binary: PathBuf) -> QemuConfig {
         let template = root.join("vars-template.fd");

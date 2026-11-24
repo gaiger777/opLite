@@ -211,7 +211,7 @@ m = json.load(open(os.path.join(d, "manifest.json")))
 sha = lambda n: hashlib.sha256(open(os.path.join(d, n), "rb").read()).hexdigest()
 assert m == {"arch": "x86_64", "files": {"vmlinuz": sha("vmlinuz"), "initrd.img": sha("initrd.img")},
              "image_version": f"orbivisor 9.9.9 lock-{lock}", "initrd": "initrd.img", "kernel": "vmlinuz",
-             "kernel_release": rel, "proto": 1}, m
+             "kernel_release": rel, "proto": 2}, m
 EOF
 	ok "manifest.json(이미지 판 = 판 + 잠금 파일 해시, 파일 해시, 통신 규약 판)"
 else

@@ -221,6 +221,8 @@ pub struct MockGuestFs {
     pub ops: Vec<String>,
     /// 이만큼 쓰기를 받은 뒤 쓰기를 거절한다(시험).
     pub fail_writes_after: Option<usize>,
+    /// 있는지 알 수 없는 경로(읽기로 열 수 없음 — `Exists`가 `Refused`)
+    pub unreadable: BTreeSet<String>,
     /// 지금 열린 핸들
     open: HashMap<i64, String>,
     next_handle: i64,
@@ -240,6 +242,7 @@ impl MockGuestFs {
             dirs: all,
             ops: Vec::new(),
             fail_writes_after: None,
+            unreadable: BTreeSet::new(),
             open: HashMap::new(),
             next_handle: 1000,
             writes: 0,
@@ -283,6 +286,9 @@ impl MockGuestFs {
             }
             GuestFileOp::Exists { path } => {
                 self.ops.push(format!("exists {path}"));
+                if self.unreadable.contains(path) {
+                    return Self::refused("failed to open file: Permission denied");
+                }
                 GuestFileAnswer::Exists {
                     exists: self.files.contains_key(path) || self.dirs.contains(path),
                 }

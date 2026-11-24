@@ -175,10 +175,19 @@ impl<W: Write> ZipWriter<W> {
         &self.report
     }
 
-    /// 경로를 zip 이름 조각으로 바꾸고 검사한다. 거르면 보고서에 적고 없음.
+    /// 보고서에 한 줄을 더한다(내려받기가 한도에서 멈춘 까닭 따위)
+    pub fn note(&mut self, line: String) {
+        self.report.note(line);
+    }
+
+    /// 경로를 zip 이름 조각으로 바꾸고 검사한다. 거르면 보고서에 적고 없음. 이름 길이 칸은 16비트라 이음 이름이
+    /// 65,535바이트를 넘는 항목(디렉터리면 그 아래도)은 넣지 않는다 — 넣으면 아카이브 전체가 깨진다.
     fn admit(&mut self, path: &[Name], is_dir: bool) -> Option<Vec<Vec<u8>>> {
         let parts: Vec<Vec<u8>> = path.iter().map(|p| zip_component(p.as_bytes())).collect();
-        match self.guard.admit(&parts, is_dir) {
+        let name_len = parts.iter().map(|p| p.len() + 1).sum::<usize>() - usize::from(!is_dir);
+        let too_long = (name_len > usize::from(u16::MAX))
+            .then_some("the path is longer than the 65,535 bytes a zip name can hold (use tar.gz)");
+        match self.guard.admit_unless(&parts, is_dir, too_long) {
             Ok(()) => {
                 if parts.iter().zip(path).any(|(a, b)| a != b.as_bytes()) {
                     self.report.note(format!(

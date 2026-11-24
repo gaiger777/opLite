@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use opl_restore::agent::fs::path_of;
 use opl_restore::archive::tar::TarGzWriter;
 use opl_restore::archive::zip::ZipWriter;
-use opl_restore::archive::{Archive, Feeder, REPORT_NAME};
+use opl_restore::archive::{
+    Archive, Feeder, MAX_REPORT_BYTES, MAX_REPORT_LINES, REPORT_NAME, Report,
+};
 use opl_restore::proto::{Attrs, EntryKind, Event, Item, LinkTarget, Name, Reply};
 use proptest::prelude::*;
 
@@ -487,6 +489,98 @@ fn emit<A: Archive>(
                 emit(a, &p, children, chunk, want);
             }
         }
+    }
+}
+
+/// `depth`개의 `len`바이트 디렉터리 아래 파일 하나(깊은 나무)
+fn deep_tree<A: Archive>(a: &mut A, depth: usize, len: usize) -> Vec<Name> {
+    let mut p = Vec::new();
+    for i in 0..depth {
+        let n = format!("{i:0>len$}");
+        p.push(Name::new(n.as_str()).unwrap());
+        a.dir(&p, &attrs(EntryKind::Dir, 0, 0o755)).unwrap();
+    }
+    p.push(Name::new("leaf.txt").unwrap());
+    if a.begin_file(&p, &attrs(EntryKind::File, 2, 0o644)).unwrap() {
+        a.write(b"hi").unwrap();
+        a.end_file(None).unwrap();
+    }
+    p
+}
+
+/// 리뷰 1: zip 이름 칸은 16비트 — 65,535바이트를 넘는 이름(과 그 아래)은 넣지 않고 보고서에 적어 아카이브가 깨지지 않는다.
+#[test]
+fn zip_skips_names_longer_than_65535_bytes() {
+    let mut z = ZipWriter::new(Vec::new());
+    deep_tree(&mut z, 70, 1000);
+    file(&mut z, "after.txt", b"ok");
+    let zip = common::read_zip(&z.finish().unwrap());
+    let got = names(&zip);
+    assert!(got.iter().all(|n| n.len() <= 65_535));
+    // 65개(65 × 1001 = 65,065바이트)까지는 들어가고 66째부터 빠진다.
+    assert_eq!(got.iter().filter(|n| n.ends_with('/')).count(), 65);
+    assert!(got.contains(&"after.txt".to_string()));
+    assert!(!got.iter().any(|n| n.ends_with("leaf.txt")));
+    let report = zip_report(&zip);
+    assert!(report.contains("65,535 bytes"), "{report}");
+    assert!(
+        report.contains("its parent directory was skipped"),
+        "{report}"
+    );
+    // tar는 pax 머리라 그대로 담는다.
+    let mut t = TarGzWriter::new(Vec::new());
+    let leaf = deep_tree(&mut t, 70, 1000);
+    let tar = common::read_tar_gz(&t.finish().unwrap());
+    let want = leaf
+        .iter()
+        .map(|n| n.as_bytes())
+        .collect::<Vec<_>>()
+        .join(&b'/');
+    assert!(tar.iter().any(|e| e.path == want));
+}
+
+/// 리뷰 1: 보고서는 처음 1000줄·256 KiB만 들고 나머지는 센다(끝없는 건너뜀에도 메모리가 늘지 않음).
+#[test]
+fn reports_keep_a_bounded_number_of_lines() {
+    let mut r = Report::default();
+    for i in 0..5000 {
+        r.skipped(&[format!("f{i}").as_bytes()], "special file");
+    }
+    assert_eq!(r.len(), 5000);
+    let text = String::from_utf8(r.render()).unwrap();
+    assert_eq!(
+        text.lines().filter(|l| l.starts_with("skipped:")).count(),
+        MAX_REPORT_LINES
+    );
+    assert!(text.contains("and 4000 more line(s) not listed"), "{text}");
+
+    let long = vec![b'x'; 1000];
+    let path: Vec<&[u8]> = (0..200).map(|_| long.as_slice()).collect();
+    let mut r = Report::default();
+    for _ in 0..1000 {
+        r.skipped(&path, "x");
+    }
+    let text = r.render();
+    assert!(text.len() < MAX_REPORT_BYTES + 1024, "{}", text.len());
+    assert_eq!(r.len(), 1000);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(16))]
+
+    /// 이름 길이 한도 둘레의 깊은 나무: zip은 늘 읽히고, 넘는 이름만 빠지며 보고서에 적힌다.
+    #[test]
+    fn deep_zip_names_stay_readable(depth in 55usize..75, len in 900usize..1024) {
+        let mut z = ZipWriter::new(Vec::new());
+        let leaf = deep_tree(&mut z, depth, len);
+        let full = leaf.iter().map(|n| n.as_bytes().len() + 1).sum::<usize>() - 1;
+        let zip = common::read_zip(&z.finish().unwrap());
+        let got = names(&zip);
+        prop_assert!(got.iter().all(|n| n.len() <= 65_535));
+        let leaf_in = got.iter().any(|n| n.ends_with("leaf.txt"));
+        prop_assert_eq!(leaf_in, full <= 65_535);
+        let has_report = got.iter().any(|n| n == REPORT_NAME);
+        prop_assert_eq!(has_report, !leaf_in);
     }
 }
 

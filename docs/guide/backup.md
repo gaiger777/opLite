@@ -689,8 +689,14 @@ orbivisorctl backup files close web-20261123-030000         # 백업 이름(그 
   열고, 심볼릭 링크·장치·FIFO는 넣지 않는다(풀 때 링크가 대상 밖을 가리키지 않게) — 빠진 것과 읽기 오류 난 파일, 이름을 바꾼 항목
   (UTF-8이 아닌 바이트·`\`·제어 문자는 `%XX`)은 아카이브 끝의 `ORBIVISOR-RESTORE-REPORT.txt`에 적는다. **tar.gz**(pax)는 모드·uid·
   gid·나노초 시각·심볼릭 링크·하드 링크를 그대로 둔다(장치·FIFO는 빼고 보고서) — **권한까지 되살리려면 tar.gz를 받아 root로 푼다.**
-- 한 번에 내려받는 항목 수는 `download_max_entries`(기본 100만)까지, 바이트 한도는 없다(흐름). 한 파일의 읽기 오류(S3 끊김·깨진
+- 한 번에 내려받는 항목 수는 `download_max_entries`(기본 100만, 도우미가 건너뛴 항목도 셈)까지, 경로 이름의 합은 256 MiB까지이고
+  바이트 한도는 없다(흐름). 한도에 닿으면 받은 데까지로 아카이브를 맺고 보고서 첫 줄에 `stopped: more than …`을 적는다 — 더 작은
+  폴더로 나눠 받는다. zip은 한 항목의 이름(경로)이 65,535바이트를 넘으면(깊은 나무) 그 항목과 그 아래를 빼고 보고서에 적는다(tar.gz는
+  담는다). 보고서는 처음 1000줄(256 KiB)까지 적고 나머지는 `… and N more line(s)`로 센다. 한 파일의 읽기 오류(S3 끊김·깨진
   블록)는 그 파일만 오류 항목으로 끝내고 보고서에 적는다 — 처음부터 다시 받는다. `raw`는 흐름을 끊는다(`the download was cut off`).
+- **멈춘 내려받기는 그 흐름만 기다린다.** 도우미는 흐름마다 4 MiB까지만 앞서 보내고 opld가 받아 쓴 만큼 더 보낸다(통신 규약 판 2).
+  그래서 브라우저가 내려받기를 멈추거나 게스트 쓰기가 느려도 같은 세션의 나열·다른 내려받기는 막히지 않고, 멈춘 흐름은 이어 받으면
+  계속된다(세션이 열려 있는 동안 — 도는 흐름이 있으면 유휴로 닫지 않는다).
 - **API**(태그 `file-restore`, `/api/v1` 아래): `POST /backups/{key}/file-restore` → 202(새로)·200(다시 씀) `{session, task}`,
   `GET /file-restore/sessions[?all=true][&backup=]`, `GET`·`DELETE /file-restore/sessions/{id}`, `GET /file-restore/sessions/{id}/volumes/{volume}/entries?path=…|path_b64=…&cursor=&limit=`
   (볼륨 id의 `/`는 `%2F`, 쪽 크기 기본 200·상한 1000), `…/volumes/{volume}/stat?path=`, `POST /file-restore/sessions/{id}/download-link
@@ -700,10 +706,13 @@ orbivisorctl backup files close web-20261123-030000         # 백업 이름(그 
 - **세션 단계**는 Task(`file-restore-session`, 대상 = 세션 id)의 `status.progress.stage`(`booting`·`ready`·`closing`)이고, 보기의
   `phase`는 `booting`·`ready`·`failed`·`closed`다. 실패·닫힘의 까닭(예 `closed after 15 min without use`, `the helper VM exited …`)은
   `error`에 있다. 세션 노드가 아닌 노드의 API로도 나열·내려받기가 된다(노드 사이 RPC로 넘김, 끊으면 도우미 쪽 흐름도 취소).
-- **오류 코드**: 400 `invalid_path`(경로 0개·1000개 넘음, `raw`에 일반 파일 아님), 404 `session_not_found`·`volume_not_found`·
+- **오류 코드**: 400 `invalid_path`(경로 0개·1000개 넘음·잘못된 경로 — 링크를 만들기 전에 본다, `raw`에 일반 파일 아님), 404 `session_not_found`·`volume_not_found`·
   `entry_not_found`, 409 `backup_not_ready`·`backup_busy`·`store_not_ready`·`file_restore_unavailable`·`session_not_ready`·`session_closed`·
   `volume_not_mountable`, 410 `link_expired`, 429 `file_restore_busy`(노드 세션이 꽉 참·세션당 동시 흐름 4), 502 `file_restore_io`
-  (백업을 읽지 못함), 503 `node_unreachable`, 504 `file_restore_timeout`(도우미가 60초 안에 답하지 않음).
+  (백업을 읽지 못함), 413 `file_restore_too_large`(걷기 한도 — 위), 503 `node_unreachable`, 504 `file_restore_timeout`(도우미가 60초 안에
+  답하지 않음).
+- **세션 목록**(`GET /file-restore/sessions`)도 다른 세션 경로처럼 백업의 `backup.file_restore`를 다시 본다 — 권한을 빼면 목록에서도
+  사라진다. `?backup=`에 없는(또는 볼 수 없는) 백업을 주면 404가 아니라 빈 목록이다.
 
 ### 지원하는 디스크와 파일시스템
 
@@ -723,7 +732,8 @@ orbivisorctl backup files close web-20261123-030000         # 백업 이름(그 
 **저널은 재생한다.** 백업은 crash-consistent라(게스트 에이전트 얼리기가 없으면) 저널에 커밋만 된 변경이 있을 수 있다. 원본은 읽기
 전용으로 두고 디스크마다 **버리는 qcow2 덮개** 위에 붙여 저널을 재생하므로 최근 파일이 빠지지 않고 백업은 바뀌지 않는다. 재생이
 실패하면 재생 없이 붙이고 볼륨에 "journal not replayed — recent changes may be missing"을 단다(웹은 경고 표시). 덮개 합이
-`overlay_max_mib`(기본 2 GiB)를 넘으면 세션을 닫는다 — 보통 재생은 수십 MiB다(실측 9.2 MiB). 파일시스템 고치기(`fsck`)는 하지 않는다.
+`overlay_max_mib`(기본 2 GiB)를 넘으면 세션을 닫는다 — 보통 재생은 수십 MiB다(실측 9.2 MiB). 덮개는 2초마다, 부팅 중(에이전트 인사
+전 — 파티션 표·저널은 그때 이미 읽힌다)에도 본다. 파일시스템 고치기(`fsck`)는 하지 않는다.
 
 ### VM으로 되돌려 쓰기
 
@@ -741,7 +751,9 @@ orbivisorctl backup files restore win-20261123-030000 disk0p2:/Users/kim/Documen
 
 - **충돌**(`--conflict`, 기본 `keep`): `keep` — 있는 파일은 그대로 두고 `<이름>.restored-YYYYMMDD-HHMMSS`(UTC, 그것도 있으면 `-2` …)로
   옆에 쓴다. `skip` — 있는 파일은 건너뛴다. `overwrite` — 임시 `<이름>.orbivisor-<task>`에 다 쓴 뒤 `mv -f`로 바꿔 넣는다(쓰다 끊겨도
-  원래 파일은 그대로).
+  원래 파일은 그대로). 대상이 있는지는 게스트 에이전트로 읽기로 열어 본다 — **없다고 확실할 때만**(Linux `No such file or directory`·
+  `Not a directory`, Windows 오류 2·3) 없는 것으로 보고, 읽기로 열 수 없으면(SELinux·Windows 공유 잠금 …) 어느 정책이든 그 파일을
+  `cannot tell whether it exists in the guest: …`로 실패로 적고 쓰지 않는다(있는 파일을 비우지 않게).
 - **디렉터리 만들기와 `overwrite`는 `guest-exec`도 있어야 한다**(Linux `/bin/mkdir -p --`·`/bin/mv -f -T --`·`/bin/rm -f --`를 argv로 —
   셸 없음, Windows는 PowerShell `-EncodedCommand`에 경로를 작은따옴표 글자로). 에이전트가 `guest-exec`를 막으면 이미 있는 대상 디렉터리
   바로 아래에 파일만 쓸 수 있다 — 디렉터리를 고르면 **400** `guest_mkdir_unavailable`, `overwrite`면 **400** `guest_overwrite_unavailable`.
@@ -836,7 +848,9 @@ disabled: no helper image in /usr/share/orbivisor/restore/x86_64` 따위)을 남
 | `overlay_max_mib` | 2048 | 디스크 덮개 합(저널 재생이 쓰는 곳, 64 이상) |
 | `run_as` | `nobody` | 도우미 QEMU가 디스크·소켓을 연 뒤 내려갈 사용자(Linux, opld가 root일 때). `""`이면 내리지 않음 |
 | `guest_max_bytes` · `guest_max_files` | 4 GiB · 10000 | VM으로 되돌려 쓰기 한 번의 상한 |
-| `download_max_entries` | 1000000 | zip·tar.gz 한 번의 항목 수 상한 |
+| `download_max_entries` | 1000000 | zip·tar.gz 내려받기와 VM으로 되돌려 쓰기 한 번의 항목 수 상한(건너뛴 항목도 셈) |
+
+모든 키의 주석 달린 예시는 `/usr/share/orbivisor/opld.toml.example`의 `[file_restore]`에 있다.
 
 ```toml
 [file_restore]
@@ -856,8 +870,8 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
 | QEMU 장치 면 | virtio-blk(디스크)·virtio-serial 하나(통신)·직렬 콘솔(로그 파일)·virtio-rng만. **네트워크·화면·USB·9p·virtiofs 없음**(`-nodefaults -no-user-config -net none -display none`) |
 | QEMU 프로세스 | Linux systemd면 `opl-fr-<id>.scope`(`MemoryMax`·`TasksMax=64`·`CPUQuota` vCPU × 100%), opld가 root면 디스크·소켓을 연 뒤 `-run-with user=nobody`(옛 QEMU `-runas`)로 내려감 — 내릴 수 없는 QEMU면 세션이 실패한다(몰래 root로 돌리지 않음). seccomp를 넣어 빌드한 QEMU면 `-sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny`(내리지 않을 때는 `elevateprivileges=deny`까지 — 내릴 때 그것을 걸면 QEMU 자신의 setuid가 막힌다). svc01 Rocky `qemu-kvm`에서 Uid 65534·Seccomp 2를 확인했다. upstream QEMU를 seccomp 없이 빌드했으면 sandbox는 없다 |
 | 백업 원본 | QEMU `read-only=on`. 저장소 백업은 opld 안 NBD 서버(쓰기는 `EPERM`)를 세션 디렉터리의 0600 유닉스 소켓으로, 옛 풀 백업은 qcow2를 읽기로 연다. 도우미가 덮개를 아무리 써도 백업은 그대로다 |
-| opld 쪽 통신 규약 | 프레임·이름(1024바이트)·경로 깊이(256)·링크 대상(4096)·볼륨 수(256)·쪽 항목(1000)·걷기 항목에 상한, 선언한 크기와 데이터가 다르면 그 흐름 오류, 첫 답·데이터 사이 60초(세 번 이어지면 세션 닫음). 어긋나면 세션을 닫는다(`agent protocol violation: …`). 게스트가 보낸 글은 로그·감사에서 제어 문자를 이스케이프하고 자른다 |
-| 아카이브 | zip·tar.gz 작성기가 깊이 우선 차례를 다시 본다 — 부모는 앞서 받은 디렉터리, 같은 경로는 한 번, 절대 경로·`..` 없음. zip에는 링크를 넣지 않는다. 그래서 받은 아카이브를 풀어도 대상 디렉터리 밖에 아무것도 생기지 않는다 |
+| opld 쪽 통신 규약 | 프레임·이름(1024바이트)·경로 깊이(256)·링크 대상(4096)·볼륨 수(256)·쪽 항목(1000)·걷기 항목(건너뜀 포함)·걷기 경로 바이트(256 MiB)에 상한, 흐름마다 받을 몫 4 MiB(넘겨 보내면 위반 — opld가 흐름마다 쌓는 메모리가 이것으로 묶인다), 선언한 크기와 데이터가 다르면 그 흐름 오류, 첫 답·데이터 사이 60초(세 번 이어지면 세션 닫음). 어긋나면 세션을 닫는다(`agent protocol violation: …` — 걷기 한도는 그 흐름만 끝낸다). 보고서·결과 문구는 처음 몇 줄만 들고 나머지는 센다. 게스트가 보낸 글은 로그·감사에서 제어 문자를 이스케이프하고 자른다 |
+| 아카이브 | zip·tar.gz 작성기가 깊이 우선 차례를 다시 본다 — 부모는 앞서 받은 디렉터리, 같은 경로는 한 번, 절대 경로·`..` 없음, zip 이름은 65,535바이트까지. zip에는 링크를 넣지 않는다. 그래서 받은 아카이브를 풀어도 대상 디렉터리 밖에 아무것도 생기지 않는다 |
 | 게스트로 되돌려 쓰기 | 이름은 백업에서 온 믿을 수 없는 값이라 셸을 거치지 않고(argv, Windows는 인코딩한 스크립트와 작은따옴표 글자), 조각마다 OS 규칙으로 거른다. 덮어쓰기는 임시 파일 뒤 이름 바꾸기 |
 
 - **암호화 저장소의 키는 opld를 떠나지 않는다.** opld가 청크를 받아 풀고 평문 블록을 NBD로 도우미에 준다(`backup-serve` 헬퍼를 쓰지
@@ -867,8 +881,13 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
 - **열린 세션의 요청마다 권한을 다시 본다** — 권한을 빼면 다음 요청부터 403이고 세션은 유휴로 닫힌다. 다른 사용자의 세션은 보이지
   않는다(루트 `cluster.admin`만 `--all`로 보고 닫음).
 - **남은 것 치우기**: 세션을 닫거나 도우미가 죽으면 QEMU(Shutdown → SIGTERM → SIGKILL)·scope·세션 디렉터리 둘(`{run_dir}/file-restore/<id>`,
-  `{data_dir}/file-restore/<id>` — 덮개·콘솔 로그)을 지운다. opld가 죽었다 뜨면 시작할 때 남은 도우미(명령줄에 `opl-fr-<id>`가 있는
-  프로세스만)·scope·두 디렉터리를 모두 치운다.
+  `{data_dir}/file-restore/<id>` — 덮개·콘솔 로그)을 지운다. opld가 죽었다 뜨면 시작할 때 제 두 디렉터리에 남은 세션의 도우미(명령줄에
+  `opl-fr-<id>`가 있는 프로세스만)·그 세션의 `opl-fr-<id>.scope`·두 디렉터리를 치운다 — 같은 호스트의 다른 opld(다른 `run_dir`)의
+  도우미는 건드리지 않는다.
+- **도우미는 모두 같은 사용자(`run_as`, 기본 `nobody`)로 돈다.** 한 도우미의 커널을 뚫고 QEMU 프로세스까지 빠져나오면 같은 노드의
+  다른 도우미(와 `nobody`로 도는 다른 데몬)에 신호를 보낼 수 있다(다른 세션의 덮개·소켓은 root의 0700 디렉터리 안이라
+  열지 못한다). `nobody`로 도는 다른 데몬과 떼려면 `run_as`를 도우미 전용 시스템 사용자(`useradd -r -s /usr/sbin/nologin
+  orbivisor-fr`)로 바꾼다. 세션끼리 떼는 세션마다의 uid는 아직 없다(다음 계획).
 - **macOS 노드**는 HVF 자식 프로세스로 돌고 권한 내림·sandbox·scope가 없다 — 개발용이다.
 
 ### 권한·감사·다른 기능과의 관계
@@ -876,6 +895,7 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
 | 일 | 필요한 것 |
 |---|---|
 | 세션 열기·나열·내려받기·닫기(자기 세션) | 백업 `backup.file_restore`(백업의 주인 = VM, 지운 VM이면 백업 때 폴더) |
+| 세션 Task·되돌려 쓰기 Task 보기(`GET /tasks/{id}`, `--wait`) | 세션 Task는 백업, 되돌려 쓰기 Task는 대상 VM의 `system.read` — 폴더에만 권한이 있어도 따라간다 |
 | 남의 세션 보기(`--all`)·닫기 | 루트 `cluster.admin` |
 | VM으로 되돌려 쓰기 | 백업 `backup.file_restore` + 대상 VM `vm.config` |
 | restore-caps 보기 | 대상 VM `system.read` |
@@ -897,7 +917,8 @@ orbivisorctl grant add --group helpdesk --role helpdesk-files --on /teamA
   `failed after …`), `backup file-restore to-vm web-… disk0p1:/etc → vm web:/srv (keep)`, `… close …`. 경로는 처음 5개 + `and N more`,
   이름은 제어 문자 이스케이프·200자. 유휴·최대 시간·도우미 죽음으로 스스로 닫힌 것은 요청이 아니라 감사가 아니고 Task 결과에 남는다.
 - **백업 지우기**: 세션이 열린 백업은 **409** `backup_in_use`("a file restore session is open …"). `orbivisorctl backup delete B --force`는
-  그 백업의 세션을 모두(누가 열었든) 닫고 지운다. **보존**(백업 작업)은 세션이 열린 백업을 그 틱에 건너뛰고 세션이 닫힌 뒤 다음 틱에 지운다.
+  그 백업의 세션을 모두(누가 열었든) 닫고 지운다(증분의 부모라 거절할 지우기는 세션을 닫지 않는다). 여는 요청과 지우기가 엇갈리면
+  세션 Task가 시작할 때 지우는 중인 백업을 다시 보고 실패한다. **보존**(백업 작업)은 세션이 열린 백업을 그 틱에 건너뛰고 세션이 닫힌 뒤 다음 틱에 지운다.
   저장소 GC는 세션과 무관하다(지우지 않은 백업의 청크는 표시됨).
 - **할당량**: 세션은 폴더 할당량에 세지 않는다 — 볼륨·VM·백업을 만들지 않고, 노드 자원(메모리·덮개)은 노드 한도가 지킨다.
 - **노드 고르기**: 이미지가 있고 온라인이고 자리가 있으며 백업을 읽을 수 있는 노드(저장소 백업은 저장소에 닿는 노드, 풀 백업은 그

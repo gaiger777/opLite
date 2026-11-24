@@ -386,7 +386,8 @@ fn walk_stream() {
         kind: EntryKind::Dir,
         ..file_attrs(0)
     };
-    let mut c = StreamCheck::new(&req, 4);
+    // 건너뜀도 항목으로 센다(넷 + 건너뜀 하나).
+    let mut c = StreamCheck::new(&req, 5);
     c.feed(resp(1, &item(&["d"], dir))).unwrap();
     c.feed(resp(1, &item(&["d", "a"], file_attrs(3)))).unwrap();
     assert!(
@@ -439,13 +440,14 @@ fn walk_stream() {
     ))
     .unwrap();
     c.feed(resp(1, &item(&["d", "e"], file_attrs(0)))).unwrap();
-    assert_eq!(c.entries(), 4);
+    assert_eq!(c.entries(), 5);
+    let mut over = c.clone();
     assert!(
-        c.clone()
-            .feed(resp(1, &item(&["d", "f"], file_attrs(0))))
+        over.feed(resp(1, &item(&["d", "f"], file_attrs(0))))
             .is_err(),
         "entry limit"
     );
+    assert!(over.limit_reached());
     c.feed(Frame::end(1)).unwrap();
 
     let mut c = StreamCheck::new(&req, 100);
@@ -485,6 +487,61 @@ fn hello_check() {
         kernel: "6.12.57".into(),
     };
     check_hello(&h).unwrap();
-    h.proto = 2;
+    h.proto = PROTO_VERSION + 1;
     assert!(check_hello(&h).is_err());
+    h.proto = 1;
+    assert!(check_hello(&h).is_err(), "protocol 1 has no acks");
+}
+
+/// 리뷰 1: 끝없는 `Skipped`는 항목 한도에 걸리고, 긴 경로는 바이트 한도에 걸린다(둘 다 위반이 아니라 한도).
+#[test]
+fn skipped_floods_and_long_paths_hit_the_walk_limits() {
+    let req = Request::Walk {
+        volume: "disk0".into(),
+        paths: vec![vec![n("d")]],
+        hardlinks: false,
+    };
+    let long: Vec<String> = (0..200).map(|i| format!("{i:0>1000}")).collect();
+    let long: Vec<Name> = long.iter().map(|s| n(s)).collect();
+    let skipped = Reply::Skipped {
+        path: long.clone(),
+        reason: "x".into(),
+    };
+    let mut c = StreamCheck::new(&req, 10).with_max_path_bytes(u64::MAX);
+    for _ in 0..10 {
+        c.feed(resp(1, &skipped)).unwrap();
+    }
+    let err = c.feed(resp(1, &skipped)).unwrap_err();
+    assert!(err.0.contains("more than 10 entries"), "{err}");
+    assert!(c.limit_reached());
+
+    // 경로 바이트: 200 × 1001 바이트 = 약 196 KiB인 경로 다섯 개는 1 MiB 한도 안, 여섯째에서 넘는다.
+    let mut c = StreamCheck::new(&req, 1000).with_max_path_bytes(1 << 20);
+    for _ in 0..5 {
+        c.feed(resp(1, &skipped)).unwrap();
+    }
+    let err = c.feed(resp(1, &skipped)).unwrap_err();
+    assert!(err.0.contains("MiB of path names"), "{err}");
+    assert!(c.limit_reached());
+
+    // 위반은 한도가 아니다.
+    let mut c = StreamCheck::new(&req, 1000);
+    assert!(c.feed(data(1, b"x")).is_err());
+    assert!(!c.limit_reached());
+    // 에이전트가 보낸 `Ack`는 위반
+    let mut c = StreamCheck::new(&req, 1000);
+    assert!(c.feed(Frame::ack(1, 10)).is_err());
+}
+
+#[test]
+fn ack_frames_carry_four_bytes() {
+    let a = Frame::ack(7, 1 << 20);
+    assert_eq!(a.ack_bytes(), Some(1 << 20));
+    assert_eq!(a.cost(), 0);
+    let mut dec = FrameDecoder::new();
+    dec.push(&a.encode());
+    assert_eq!(dec.next_frame().unwrap(), Some(a));
+    assert_eq!(Frame::new(7, FrameKind::Ack, vec![1]).ack_bytes(), None);
+    assert_eq!(data(1, b"abc").cost(), (HEADER_LEN + 3) as u64);
+    assert_eq!(Frame::end(1).cost(), 0);
 }

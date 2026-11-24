@@ -552,3 +552,38 @@ opld는 시작할 때와 `image_dir`의 `manifest.json`이 바뀔 때 파일 해
 - **아키텍처 문서**: 크레이트 지도에 `opl-restore`(opl-types를 쓰지 않는 까닭), §1.1 백업 줄, §2.3 파일 자리(`{data_dir}/file-restore/<id>/`·`{run_dir}/file-restore/<id>/`), §6.1 RPC 30개(`FileRestoreCall`·`FileRestoreDownload`, `GuestAgent`의 `file` 갈래), §8.3 시간 제한 없는 Task, §10.3 파일 단위 복원(도우미 VM·통신 규약·내려받기·되돌려 쓰기·치우기), §13 보안 표, §14 기능 `file-restore`, §16.1 꾸러미 `orbivisor-restore-image`, §17 `restore-it`·`file-restore` 작업, §19 확인하지 못한 것.
 - **고친 것**: 스테이지 4가 `Config::file_restore_image_dir`를 `qemu_nbd`의 문서 주석 사이에 넣어 `qemu_nbd`의 주석 첫 줄이 `file_restore_image_dir`에 붙어 있었다 — 제자리로 옮겼다(동작 변화 없음).
 - **알고 남긴 것**: `OPL_RESTORE_IMAGE_DIR`은 시험(`restore_helper`·opld E2E·web E2E)에서는 `<arch>/`의 부모 디렉터리, `build-deb.sh`에서는 `x86_64` 디렉터리 자체다(같은 이름 다른 뜻 — 두 곳 모두 문서·오류 문구가 맞게 적혀 있어 고치지 않음). `packaging/deb/opld.toml.example`에는 `[file_restore]` 예시가 없다(기본값으로 충분 — 가이드에 키 표). 웹 대화상자의 RHEL 까닭은 아직 이 가이드 절로 링크하지 않는다.
+
+### 리뷰 1 (opl-restore·opl-qemu·opl-driver·opl-api·opld·문서)
+
+- **통신 규약 판 2 — 흐름마다 받을 몫**: 리뷰는 읽기 고리가 느린 받는 쪽(멈춘 브라우저, 90초까지 걸리는 게스트 명령)을 60초까지 기다리며
+  세션의 모든 흐름을 막고, 넘으면 되돌려 쓰기의 걷기를 끊는다고 짚었다. 규약에 몫을 넣었다: `FrameKind::Ack`(opld → 에이전트, u32 BE),
+  `STREAM_WINDOW` 4 MiB(틀 머리 포함, `Resp`·`Data`만 셈 — `End`·`Err`는 몫 없이). 에이전트 흐름 스레드는 몫이 모자라면 조건 변수로
+  기다리고(취소가 깨움), opld는 흐름마다 받은 바이트를 세어 창을 넘으면 위반이며, `ReplyStream`이 받아 쓴 만큼 1 MiB마다·기다리기 전에
+  돌려준다. 읽기 고리는 이제 기다리지 않는다(묶지 않은 통로지만 몫이 묶음). 되돌려 쓰기의 걷기는 게스트 명령이 오래 걸려도 그 흐름만
+  멈춘다. 이미지와 opld는 판이 같아야 하므로(§8.3 운영 규칙) 판을 올렸다: `PROTO_VERSION`·`opl_qemu::HELPER_PROTO`(커널 명령줄 — 둘이
+  같은지 시험이 봄) 2, 옛 이미지(manifest `proto: 1`)는 검사에서 거절된다. Mac HVF 흘리기 244 MB/s(앞 227).
+- **걷기 한도는 그 흐름만 끝낸다**: `Skipped`도 항목으로 세고, 걷기 경로 바이트 합(항목·하드 링크 대상·건너뛴 경로, 기본 256 MiB —
+  `ClientOptions.max_path_bytes`, 설정 키는 두지 않음)을 더했다. 한도는 규약 위반이 아니라 `HelperError::Limit`(API 413
+  `file_restore_too_large`)이고 세션은 그대로다(그 흐름은 취소하고 끝 틀까지 버림). zip·tar.gz 내려받기는 받은 데까지로 아카이브를 맺고
+  보고서에 `stopped: …`를 적는다(잘린 흐름보다 열리는 아카이브가 낫다). 보고서(`Report`)는 1000줄·256 KiB, 되돌려 쓰기 결과의 이름
+  목록은 처음 10개만 들고 나머지는 센다.
+- **zip 이름 65,535바이트**: 넘는 항목(디렉터리면 그 아래도)은 `PathGuard::admit_unless`로 건너뛰고 보고서에 적는다(tar는 pax라 그대로).
+- **`Exists`는 확실한 "없음"만**: qemu-ga 오류 문구가 Linux `: No such file or directory`·`: Not a directory`, Windows `(error: 2)`·
+  `(error: 3)`(QEMU `error_setg_win32`가 지역화된 글 뒤에 16진 코드를 붙임)으로 끝날 때만 없음, 다른 오류는 `Refused` → 그 파일 실패
+  (`cannot tell whether it exists in the guest`, 어느 충돌 정책이든 쓰지 않음). `keep`의 새 이름 고르기에서 알 수 없는 이름은 있는 것으로 본다.
+- **Task 주인**: `FileRestoreSession { backup }`은 그 백업, `FileRestoreToGuest`는 대상 VM(`Owners::task`·`around_task`) — 폴더 권한 사용자가
+  `GET /tasks/{id}`·`--wait`로 따라간다.
+- **지킴이**: 덮개·콘솔 지킴이를 `Hello` 전(부팅 중)에도 돌리고 간격을 10초 → 2초로. QEMU 수준의 쓰기 한도(throttle 그룹·크기 제한 자리)는
+  넣지 않았다 — 넘침은 2초 × 디스크 대역폭까지다.
+- **경합**: 세션 Task는 등록한 뒤에 `closed_early`를 보고(사이에 온 닫기를 잃지 않음), 지우는 중인 백업이면 실패한다. `closed_early`는
+  1시간 지나면 버린다. `force` 지우기는 `check_not_parent`를 세션 닫기 앞에.
+- **목록 권한**: `list_sessions`가 세션마다 백업의 `backup.file_restore`를 다시 보고, `?backup=`의 없는 백업은 404가 아니라 빈 목록.
+  내려받기 링크는 만들 때 경로를 검사한다(`EntryPath`가 이미 같은 규칙으로 풀리므로 지금 길로는 닿지 않는 방어).
+- **치우기는 제 세션만**(GitHub `file-restore` 실패): `sweep_leftovers`가 모든 `opl-fr-*.scope`를 멈춰, 나란히 도는 opld E2E의 다른 opld가
+  막 띄운 도우미가 systemd의 SIGTERM으로 죽었다. 이제 제 두 디렉터리에서 찾은 세션의 `opl-fr-<id>.scope`만 멈춘다(세션 id는 클러스터에서
+  유일). 디렉터리를 지운 뒤 남은 scope는 없다 — 끝내기는 scope를 먼저 멈추고 디렉터리를 지운다.
+- **root로 도는 단위 시험**(GitHub `linux-kvm`): `a_helper_that_dies_before_hello…`의 가짜 QEMU는 `-run-with`를 모르는데 root면 기본
+  `run_as = nobody`가 걸려 띄우기 전에 거절됐다 — 시험 설정에 `run_as: None`.
+- **같은 `nobody`**(제안 S2): 세션마다 uid는 싸지 않아(사용자 만들기·덮개 chown·uid 범위 관리) 두지 않고 가이드 보안 모형에 적었다 —
+  다른 세션 도우미에 신호는 보낼 수 있으나 덮개·소켓은 root 0700 디렉터리 안. 전용 시스템 사용자를 `run_as`로 권한다.
+- **설정 예시**: `packaging/deb/opld.toml.example`에 `[file_restore]` 주석 예시(스테이지 8이 남긴 것).

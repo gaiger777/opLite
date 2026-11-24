@@ -57,6 +57,8 @@ async fn the_fake_helper_answers_like_the_agent() {
         .unwrap();
     assert_eq!(helper.hello.image_version, l.image.image_version);
     assert_eq!(helper.hello.proto, PROTO_VERSION);
+    // 커널 명령줄의 판(opl-qemu)도 같다 — 다르면 실제 에이전트가 곧바로 꺼진다.
+    assert_eq!(opl_qemu::HELPER_PROTO, PROTO_VERSION);
     let c = helper.client.clone();
 
     let volumes = c.probe().await.unwrap();
@@ -136,13 +138,14 @@ async fn the_fake_helper_answers_like_the_agent() {
 /// 세션당 동시 흐름은 4개 — 다섯째는 곧바로 바쁨. 다 받지 않고 버린 흐름은 에이전트에 취소를 보내 자리가 돌아온다.
 #[tokio::test]
 async fn concurrent_streams_are_limited_and_dropped_streams_are_cancelled() {
-    let helper = fake_helper(&launch(), crate::mock::mock_restore_volumes(), quick())
+    // 창(4 MiB)보다 큰 파일이라야 받지 않는 흐름이 끝나지 않고 남는다.
+    let helper = fake_helper(&launch(), big_volumes(), quick())
         .await
         .unwrap();
     let c = helper.client.clone();
     let mut open = Vec::new();
     for _ in 0..4 {
-        open.push(c.read("disk0p1", path_of("var/log/app.log")).await.unwrap());
+        open.push(c.read("disk0p1", path_of("big")).await.unwrap());
     }
     assert_eq!(c.active_streams(), 4);
     let err = c.probe().await.unwrap_err();
@@ -152,6 +155,112 @@ async fn concurrent_streams_are_limited_and_dropped_streams_are_cancelled() {
     assert!(freed, "{} streams still open", c.active_streams());
     assert_eq!(c.probe().await.unwrap().len(), 4);
     assert_eq!(helper.ended_reason(), None);
+    stop_helper(helper).await;
+}
+
+/// 큰 파일 둘과 건너뛸 것이 많은 디렉터리가 있는 볼륨(`disk0p1`)
+fn big_volumes() -> FakeVolumes {
+    use opl_restore::agent::MemFs;
+    let m = MemFs::new();
+    m.file(&path_of("big"), vec![b'b'; 24 << 20])
+        .file(&path_of("small.txt"), "hi\n");
+    for i in 0..50 {
+        m.file(&path_of(&format!("many/f{i:02}")), "x");
+    }
+    let mut v = crate::mock::mock_restore_volumes();
+    v[0].1 = Some(Arc::new(m) as Arc<dyn opl_restore::agent::Fs>);
+    v
+}
+
+/// 리뷰 1: 받는 쪽이 멈춘 흐름(멈춘 브라우저·느린 게스트 쓰기)은 그 흐름만 기다린다 — 다른 흐름은 바로 답하고, 시간
+/// 초과(되풀이 세 번이면 세션 닫힘)를 세지 않으며, 멈춘 흐름은 `reply_timeout`보다 오래 쉬어도 이어서 끝까지 받는다.
+#[tokio::test]
+async fn a_stalled_stream_does_not_block_the_others() {
+    let helper = fake_helper(&launch(), big_volumes(), quick())
+        .await
+        .unwrap();
+    let c = helper.client.clone();
+    let (size, mut big) = c.read("disk0p1", path_of("big")).await.unwrap();
+    assert_eq!(size, 24 << 20);
+    let mut got = match big.next().await.unwrap() {
+        Some(StreamItem::Data(d)) => d.len(),
+        other => panic!("{other:?}"),
+    };
+    // 멈춘 흐름 곁에서: reply_timeout(300 ms)의 몇 배 동안 다른 요청이 줄곧 답한다.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_millis(1500) {
+        let t = Instant::now();
+        assert_eq!(c.probe().await.unwrap().len(), 4);
+        let (entries, _) = c.list("disk0p1", vec![], None, 100).await.unwrap();
+        assert!(entries.iter().any(|e| e.name.as_bytes() == b"small.txt"));
+        let (_, mut small) = c.read("disk0p1", path_of("small.txt")).await.unwrap();
+        assert_eq!(read_all(&mut small).await.unwrap(), b"hi\n");
+        assert!(
+            t.elapsed() < Duration::from_millis(250),
+            "{:?}",
+            t.elapsed()
+        );
+    }
+    // 멈춘 흐름도 이어서 끝까지
+    got += read_all(&mut big).await.unwrap().len();
+    assert_eq!(got, 24 << 20);
+    assert_eq!(c.closed_reason(), None);
+    stop_helper(helper).await;
+}
+
+/// 리뷰 1: 걷기 한도(항목 수 — 건너뜀도 셈)를 넘으면 그 흐름만 `Limit`으로 끝나고 취소된다. 세션은 그대로다.
+#[tokio::test]
+async fn a_walk_over_the_limit_ends_only_that_stream() {
+    let opts = ClientOptions {
+        max_entries: 10,
+        ..quick()
+    };
+    let helper = fake_helper(&launch(), big_volumes(), opts).await.unwrap();
+    let c = helper.client.clone();
+    let mut w = c
+        .walk("disk0p1", vec![path_of("many")], false)
+        .await
+        .unwrap();
+    let err = loop {
+        match w.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the walk should stop"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(&err, HelperError::Limit(m) if m.contains("more than 10 entries")),
+        "{err:?}"
+    );
+    let freed = crate::qemu::wait_until(Duration::from_secs(5), || c.active_streams() == 0).await;
+    assert!(freed, "{} streams still open", c.active_streams());
+    assert_eq!(c.probe().await.unwrap().len(), 4);
+    assert_eq!(c.closed_reason(), None);
+
+    // 경로 바이트 한도도 같다.
+    let opts = ClientOptions {
+        max_path_bytes: 64,
+        ..quick()
+    };
+    let helper2 = fake_helper(&launch(), big_volumes(), opts).await.unwrap();
+    let mut w = helper2
+        .client
+        .walk("disk0p1", vec![path_of("many")], false)
+        .await
+        .unwrap();
+    let err = loop {
+        match w.next().await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("the walk should stop"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        matches!(&err, HelperError::Limit(m) if m.contains("MiB of path names")),
+        "{err:?}"
+    );
+    assert_eq!(helper2.client.closed_reason(), None);
+    stop_helper(helper2).await;
     stop_helper(helper).await;
 }
 
@@ -375,7 +484,7 @@ fn image_check() {
         dir.path(),
         arch,
         "orbivisor 0.1.0 lock-233004539824",
-        1,
+        PROTO_VERSION,
         false,
     );
     let img = check_image(dir.path(), arch, "0.1.0").unwrap();
@@ -394,7 +503,7 @@ fn image_check() {
         dir.path(),
         arch,
         "orbivisor 0.1.0-1 lock-233004539824",
-        1,
+        PROTO_VERSION,
         false,
     );
     assert!(check_image(dir.path(), arch, "0.1.0").is_err());
@@ -403,17 +512,18 @@ fn image_check() {
         dir.path(),
         arch,
         "orbivisor 0.1.0 lock-233004539824",
-        2,
+        1,
         false,
     );
+    // 판 1(몫 없는 옛 이미지)은 다시 빌드해야 한다.
     let err = check_image(dir.path(), arch, "0.1.0").unwrap_err();
-    assert!(err.contains("protocol 2"), "{err}");
+    assert!(err.contains("protocol 1"), "{err}");
 
     write_image(
         dir.path(),
         arch,
         "orbivisor 0.1.0 lock-233004539824",
-        1,
+        PROTO_VERSION,
         true,
     );
     let err = check_image(dir.path(), arch, "0.1.0").unwrap_err();
@@ -424,7 +534,7 @@ fn image_check() {
         dir.path(),
         Arch::X86_64,
         "orbivisor 0.1.0 lock-233004539824",
-        1,
+        PROTO_VERSION,
         false,
     );
     std::fs::copy(
@@ -464,7 +574,7 @@ async fn node_state_follows_the_image_and_the_sessions() {
         dir.path(),
         Arch::Aarch64,
         "orbivisor 0.1.0 lock-233004539824",
-        1,
+        PROTO_VERSION,
         false,
     );
     assert!(st.refresh_image().await);
@@ -561,9 +671,12 @@ exit 1"#,
         qemu_binary: qemu,
         ..HostProfile::debian(Arch::native(), opl_qemu::Accel::Tcg)
     };
+    // 권한 내림은 정하지 않는다: root로 돌리는 시험(GitHub linux-kvm)에서 기본 `nobody`면 가짜 QEMU가 `-run-with`를 몰라
+    // 띄우기 전에 거절된다.
     let cfg = HelperConfig {
         qemu_img,
         boot_timeout: Duration::from_secs(10),
+        run_as: None,
         ..HelperConfig::default()
     };
     let (run, state) = (dir.path().join("run"), dir.path().join("state"));
@@ -600,6 +713,53 @@ exit 1"#,
     assert!(err.to_string().contains("longer than"), "{err}");
 }
 
+/// 리뷰 1: 덮개 지킴이는 `Hello` 전(부팅 중)에도 돈다 — 부팅 때 저널 재생이 덮개를 한도 넘게 채우면 세션이 곧 실패한다.
+#[tokio::test]
+async fn the_overlay_guard_runs_while_booting() {
+    let dir = short_tempdir();
+    let (run, state) = (dir.path().join("run"), dir.path().join("state"));
+    let l = launch();
+    let overlay = HelperPaths::new(&run, &state, l.id).overlay(0);
+    let qemu = script(
+        dir.path(),
+        "qemu",
+        &format!(
+            r#"case " $* " in *" -kernel "*) ;; *) exit 1 ;; esac
+dd if=/dev/zero of="{}" bs=1048576 count=4 2>/dev/null
+sleep 30"#,
+            overlay.display()
+        ),
+    );
+    let qemu_img = script(dir.path(), "qemu-img", r#"touch "$5""#);
+    let host = HostProfile {
+        qemu_binary: qemu,
+        ..HostProfile::debian(Arch::native(), opl_qemu::Accel::Tcg)
+    };
+    let cfg = HelperConfig {
+        qemu_img,
+        boot_timeout: Duration::from_secs(25),
+        overlay_max: 1 << 20,
+        run_as: None,
+        ..HelperConfig::default()
+    };
+    let started = Instant::now();
+    let err = start_helper(&host, false, &run, &state, &cfg, &l)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("journal replay wrote more than 1 MiB"),
+        "{err}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    let paths = HelperPaths::new(&run, &state, l.id);
+    assert!(!paths.run.exists() && !paths.state.exists());
+}
+
 /// 다시 뜬 opld: 앞 프로세스가 남긴 도우미(명령줄에 `opl-fr-<id>`)를 끝내고 두 디렉터리를 지운다. 남의 프로세스는 두지 않는다.
 #[tokio::test]
 async fn sweep_stops_leftover_helpers_and_removes_their_files() {
@@ -632,7 +792,31 @@ async fn sweep_stops_leftover_helpers_and_removes_their_files() {
         .unwrap();
     std::fs::write(other_paths.pid_file(), other.id().to_string()).unwrap();
 
+    // 같은 호스트의 다른 opld(다른 run_dir·state_dir)의 도우미
+    let (run_b, state_b) = (dir.path().join("run-b"), dir.path().join("state-b"));
+    let id_b = Uuid::now_v7();
+    let paths_b = HelperPaths::new(&run_b, &state_b, id_b);
+    paths_b.prepare().unwrap();
+    let mut helper_b = std::process::Command::new("perl")
+        .args(["-e", "sleep 60", &format!("{UNIT_PREFIX}{id_b}")])
+        .spawn()
+        .unwrap();
+    std::fs::write(paths_b.pid_file(), helper_b.id().to_string()).unwrap();
+
     assert_eq!(sweep_leftovers(&run, &state, false).await, 2);
+    // 리뷰 1(GitHub file-restore 실패): 다른 opld의 도우미·디렉터리·scope는 건드리지 않는다.
+    assert!(
+        helper_b.try_wait().unwrap().is_none(),
+        "another opld's helper"
+    );
+    assert!(paths_b.run.exists() && paths_b.state.exists());
+    let ids = [id, other_id].into_iter().collect();
+    let scopes = session_scopes(&ids);
+    assert_eq!(scopes.len(), 2);
+    assert!(scopes.contains(&format!("opl-fr-{id}.scope")));
+    assert!(!scopes.iter().any(|u| u.contains(&id_b.to_string())));
+    assert_eq!(sweep_leftovers(&run_b, &state_b, false).await, 1);
+    assert!(!helper_b.wait().unwrap().success());
     let status = helper.wait().unwrap();
     assert!(!status.success());
     assert!(other.try_wait().unwrap().is_none(), "not ours to kill");
@@ -640,4 +824,35 @@ async fn sweep_stops_leftover_helpers_and_removes_their_files() {
     other.kill().unwrap();
     other.wait().unwrap();
     assert_eq!(sweep_leftovers(&run, &state, false).await, 0);
+}
+
+/// 리뷰 1: 몫(창)을 넘겨 보내는 에이전트는 규약 위반이다(opld가 흐름마다 쌓는 것이 창을 넘지 않는다).
+#[tokio::test]
+async fn an_agent_that_ignores_the_window_is_closed() {
+    let (ours, mut agent) = raw_pair();
+    agent.hello(PROTO_VERSION).await;
+    let (c, _) = HelperClient::connect(ours, Duration::from_secs(5), quick())
+        .await
+        .unwrap();
+    let flood = tokio::spawn(async move {
+        let (id, _) = agent.request().await.unwrap();
+        let size = 64u64 << 20;
+        agent
+            .send(Frame::json(id, FrameKind::Resp, &Reply::FileHead { size }))
+            .await;
+        for _ in 0..8 {
+            agent
+                .send(Frame::new(id, FrameKind::Data, vec![0; 1 << 20]))
+                .await;
+        }
+        agent
+    });
+    // 받는 쪽이 읽지 않아도 채널을 읽는 쪽이 창을 넘는 것을 알아챈다.
+    let (_, _stream) = c.read("disk0p1", path_of("x")).await.unwrap();
+    let reason = tokio::time::timeout(Duration::from_secs(5), c.closed())
+        .await
+        .unwrap();
+    assert!(reason.contains("more than its window"), "{reason}");
+    // 아무도 읽지 않으니 가짜 에이전트의 남은 쓰기는 막혀 있다.
+    flood.abort();
 }

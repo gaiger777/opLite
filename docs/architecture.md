@@ -1183,9 +1183,11 @@ flowchart LR
     (`MemoryMax`·`TasksMax=64`·`CPUQuota`), opld가 root면 `-run-with user=nobody`(또는 `-runas`), seccomp QEMU면 `-sandbox on,…` — QEMU가
     무엇을 받는지는 `<옵션> -version`으로 바이너리마다 한 번 묻는다. 원본은 저장소 백업이면 opld 안 NBD 서버(계획 68 `serve`, 세션
     디렉터리의 `nbd.sock` — 키는 opld를 떠나지 않음, `reconnect-delay` 없음), 옛 풀 백업이면 qcow2 체인 json이다.
-  - **통신 규약**(`opl-restore::proto`, 판 1): 프레임 = 길이(u32 BE)·흐름 번호·종류(`Req`·`Resp`·`Data`·`End`·`Err`) + JSON(≤ 1 MiB) 또는
-    데이터(≤ 1 MiB). 요청 `Probe`·`Mount`·`List`·`Stat`·`Read`·`Walk`·`Cancel`·`Shutdown`, 에이전트는 첫 `Hello{proto, image_version}`와 걷기 중
-    `Progress`. opld 쪽 `HelperClient`가 흐름마다 `StreamCheck`(차례·크기·이름·깊이·항목 수 한도)를 걸고 세션당 데이터 흐름 4·첫 답과
+  - **통신 규약**(`opl-restore::proto`, 판 2): 프레임 = 길이(u32 BE)·흐름 번호·종류(`Req`·`Resp`·`Data`·`End`·`Err`·`Ack`) + JSON(≤ 1 MiB) 또는
+    데이터(≤ 1 MiB). 흐름마다 받을 몫 4 MiB: 에이전트는 `Resp`·`Data`를 몫만큼만 보내고 opld가 받아 쓴 만큼 `Ack`로 돌려준다 — 느린 받는
+    쪽(멈춘 브라우저·느린 게스트 쓰기)은 그 흐름만 멈추고, opld의 읽기 고리는 기다리지 않는다. 요청 `Probe`·`Mount`·`List`·`Stat`·`Read`·`Walk`·`Cancel`·`Shutdown`, 에이전트는 첫 `Hello{proto, image_version}`와 걷기 중
+    `Progress`. opld 쪽 `HelperClient`가 흐름마다 `StreamCheck`(차례·크기·이름·깊이·몫·걷기 항목 수(건너뜀 포함)·경로 바이트 한도 —
+    걷기 한도는 그 흐름만 `Limit`으로 끝냄)를 걸고 세션당 데이터 흐름 4·첫 답과
     데이터 사이 60초(세 번 이어지면 세션 닫음), 위반은 세션을 닫는다. 에이전트 몸통은 `Fs` trait 위라 같은 코드가 가짜 하이퍼바이저의
     가짜 도우미(소켓 쌍 + 메모리 나무)가 된다.
   - **내려받기**는 일회용 토큰(32바이트, 60초·한 번·같은 사용자) + GET 흐름이고, zip(zip64·deflate, 링크 빼고 보고서)·tar.gz(pax)는
@@ -1196,8 +1198,9 @@ flowchart LR
     Windows는 PowerShell `-EncodedCommand`)로 쓴다. 하이퍼바이저 `guest_file(id, &GuestFileOp)` 하나, 다른 노드의 VM이면 `GuestAgent` RPC의
     `file` 갈래. 허락 여부는 `guest-info.supported_commands`로 본다.
   - **치우기**: 세션 끝·실패에 Drop 지킴이가 도우미(Shutdown → SIGTERM → SIGKILL)·scope·두 세션 디렉터리·NBD 서버·세션 자리를 거두고,
-    opld 시작 때 `sweep_restore_helpers`가 남은 `opl-fr-*`(명령줄을 확인한 pid만)·scope·`{run_dir,data_dir}/file-restore`를 지운다. 덮개
-    지킴이는 10초마다 합이 `overlay_max_mib`를 넘으면 세션을 닫는다.
+    opld 시작 때 `sweep_restore_helpers`가 제 `{run_dir,data_dir}/file-restore`에 남은 세션의 `opl-fr-<id>`(명령줄을 확인한 pid만)·그
+    세션의 scope·두 디렉터리를 지운다(같은 호스트의 다른 opld 것은 두지 않음). 덮개 지킴이는 부팅 중에도 2초마다 합이 `overlay_max_mib`를
+    넘으면 세션을 닫는다.
   - 자세한 것은 [파일 단위 복원 안내](guide/backup.md#파일-단위-복원)와 [설계](superpowers/specs/2026-11-24-file-restore-design.md).
 - **로컬 디스크 복제(HA)**는 §5.7.
 - VMware 가져오기(OVA, ESXi)는 `VmImport` 리소스와 Task다([백업·복제·가져오기 안내](guide/backup.md)).

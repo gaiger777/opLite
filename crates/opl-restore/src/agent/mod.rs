@@ -11,7 +11,7 @@ pub mod probe;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
@@ -20,8 +20,8 @@ pub use fs::{DirFs, Fs, MemFs, Meta};
 
 use crate::proto::{
     AgentError, Entry, EntryKind, ErrorCode, Frame, FrameKind, Hello, Item, MAX_PAGE_ENTRIES,
-    MAX_PATH_DEPTH, MAX_PAYLOAD, MAX_TEXT, MAX_WALK_PATHS, Name, Reply, Request, Volume,
-    read_frame, write_frame,
+    MAX_PATH_DEPTH, MAX_PAYLOAD, MAX_TEXT, MAX_WALK_PATHS, Name, Reply, Request, STREAM_WINDOW,
+    Volume, read_frame, write_frame,
 };
 
 /// 붙인 볼륨
@@ -106,11 +106,56 @@ impl<W: Write> Out<W> {
     }
 }
 
+/// 흐름 하나의 취소 깃발과 받을 몫(규약 판 2): `Resp`·`Data` 틀은 몫이 있을 때만 보낸다.
+struct Ctl {
+    cancel: AtomicBool,
+    credit: Mutex<u64>,
+    wake: Condvar,
+}
+
+impl Ctl {
+    fn new() -> Self {
+        Ctl {
+            cancel: AtomicBool::new(false),
+            credit: Mutex::new(STREAM_WINDOW),
+            wake: Condvar::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        let _guard = self.credit.lock().unwrap_or_else(|e| e.into_inner());
+        self.wake.notify_all();
+    }
+
+    /// opld가 돌려준 몫(몫은 창보다 커지지 않는다 — 넘게 돌려주면 opld 잘못이라 창에서 자른다)
+    fn grant(&self, bytes: u32) {
+        let mut c = self.credit.lock().unwrap_or_else(|e| e.into_inner());
+        *c = (*c + u64::from(bytes)).min(STREAM_WINDOW);
+        self.wake.notify_all();
+    }
+
+    /// 몫 `cost`를 쓴다(모자라면 opld가 돌려줄 때까지 기다림, 취소되면 멈춤)
+    fn take(&self, cost: u64) -> Result<(), Stop> {
+        let mut c = self.credit.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err(AgentError::new(ErrorCode::Cancelled, "cancelled").into());
+            }
+            if *c >= cost {
+                *c -= cost;
+                return Ok(());
+            }
+            c = self.wake.wait(c).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
 /// 흐름 하나의 보내기
 struct Stream<'a, W> {
     id: u32,
     out: &'a Out<W>,
-    cancel: &'a AtomicBool,
+    ctl: &'a Ctl,
     last_sent: Instant,
 }
 
@@ -134,20 +179,22 @@ impl From<io::Error> for Stop {
 
 impl<W: Write> Stream<'_, W> {
     fn send(&mut self, kind: FrameKind, payload: Vec<u8>) -> Result<(), Stop> {
-        self.out.send(&Frame::new(self.id, kind, payload))?;
-        self.last_sent = Instant::now();
-        Ok(())
+        self.put(&Frame::new(self.id, kind, payload))
     }
 
     fn reply(&mut self, reply: &Reply) -> Result<(), Stop> {
-        self.out
-            .send(&Frame::json(self.id, FrameKind::Resp, reply))?;
+        self.put(&Frame::json(self.id, FrameKind::Resp, reply))
+    }
+
+    fn put(&mut self, frame: &Frame) -> Result<(), Stop> {
+        self.ctl.take(frame.cost())?;
+        self.out.send(frame)?;
         self.last_sent = Instant::now();
         Ok(())
     }
 
     fn check_cancel(&self) -> Result<(), Stop> {
-        if self.cancel.load(Ordering::Relaxed) {
+        if self.ctl.cancel.load(Ordering::Relaxed) {
             return Err(AgentError::new(ErrorCode::Cancelled, "cancelled").into());
         }
         Ok(())
@@ -200,8 +247,8 @@ pub fn cmdline_value<'a>(cmdline: &'a str, key: &str) -> Option<&'a str> {
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// 흐름 표(취소 깃발)
-type Active = Arc<Mutex<HashMap<u32, Arc<AtomicBool>>>>;
+/// 흐름 표(취소 깃발·받을 몫)
+type Active = Arc<Mutex<HashMap<u32, Arc<Ctl>>>>;
 
 /// 연결 하나를 처리한다: `Hello`를 보내고, 요청을 읽어 흐름마다 스레드로 답한다. `Shutdown`이나 읽는 쪽 끝(EOF)에서
 /// 돌아온다(도는 흐름은 취소한다). 규약을 어긴 틀은 연결을 끝낸다(opld가 세션을 닫는다).
@@ -231,6 +278,19 @@ where
                 break Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
         };
+        if frame.kind == FrameKind::Ack && frame.stream != 0 {
+            let Some(bytes) = frame.ack_bytes() else {
+                break Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "an ack frame must carry 4 bytes",
+                ));
+            };
+            // 이미 끝난 흐름의 몫은 버린다(끝과 엇갈려 온다).
+            if let Some(ctl) = active.lock().unwrap().get(&frame.stream) {
+                ctl.grant(bytes);
+            }
+            continue;
+        }
         if frame.kind != FrameKind::Req || frame.stream == 0 {
             break Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -251,8 +311,8 @@ where
         };
         match req {
             Request::Cancel { stream } => {
-                if let Some(flag) = active.lock().unwrap().get(&stream) {
-                    flag.store(true, Ordering::Relaxed);
+                if let Some(ctl) = active.lock().unwrap().get(&stream) {
+                    ctl.cancel();
                 }
                 out.send(&Frame::end(id))?;
             }
@@ -261,7 +321,7 @@ where
                 break Ok(());
             }
             req => {
-                let cancel = Arc::new(AtomicBool::new(false));
+                let ctl = Arc::new(Ctl::new());
                 {
                     let mut a = active.lock().unwrap();
                     let refuse = if a.contains_key(&id) {
@@ -279,7 +339,7 @@ where
                         out.send(&Frame::json(id, FrameKind::Err, &e))?;
                         continue;
                     }
-                    a.insert(id, cancel.clone());
+                    a.insert(id, ctl.clone());
                 }
                 let (volumes, out, active, opts) =
                     (volumes.clone(), out.clone(), active.clone(), opts.clone());
@@ -287,7 +347,7 @@ where
                     let mut s = Stream {
                         id,
                         out: &out,
-                        cancel: &cancel,
+                        ctl: &ctl,
                         last_sent: Instant::now(),
                     };
                     let r = handle(&*volumes, &req, &mut s, &opts);
@@ -302,8 +362,8 @@ where
             }
         }
     };
-    for flag in active.lock().unwrap().values() {
-        flag.store(true, Ordering::Relaxed);
+    for ctl in active.lock().unwrap().values() {
+        ctl.cancel();
     }
     result
 }

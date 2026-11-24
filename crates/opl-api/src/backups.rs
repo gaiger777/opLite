@@ -625,8 +625,9 @@ pub async fn delete_backup(
     let backup = lookup::<BackupSpec>(&state.cluster, &key)?;
     if q.force {
         check_backup_idle(&state, &backup)?;
-        close_file_restore(&state, &principal, &backup).await?;
+        // 거절할 지우기가 세션부터 닫지 않게(리뷰 1)
         check_not_parent(&state, &backup)?;
+        close_file_restore(&state, &principal, &backup).await?;
         if let Err(e) = delete_node(&state, &backup)
             && e.status == StatusCode::CONFLICT
         {

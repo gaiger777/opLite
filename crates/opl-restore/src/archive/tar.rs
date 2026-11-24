@@ -133,6 +133,11 @@ impl<W: Write> TarGzWriter<W> {
         &self.report
     }
 
+    /// 보고서에 한 줄을 더한다(내려받기가 한도에서 멈춘 까닭 따위)
+    pub fn note(&mut self, line: String) {
+        self.report.note(line);
+    }
+
     fn admit(&mut self, path: &[Name], is_dir: bool) -> Option<Vec<Vec<u8>>> {
         let parts: Vec<Vec<u8>> = path.iter().map(|p| p.as_bytes().to_vec()).collect();
         match self.guard.admit(&parts, is_dir) {
