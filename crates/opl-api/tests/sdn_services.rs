@@ -13,6 +13,19 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 /// 이 노드가 `sdn-services`를 모르는 것으로 적거나(옛 노드처럼) 되돌린다.
+/// 감사 기록은 응답 뒤에 쓰일 수 있어, 바라는 줄이 보일 때까지 잠깐 기다린다.
+async fn audit_has(admin: &common::Client, needle: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let (_, audit) = admin.get("/audit?limit=5").await;
+        if audit.to_string().contains(needle) {
+            return;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{needle}: {audit}");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 async fn set_services(env: &Env, on: bool) {
     let mut status = env
         .cluster
@@ -159,11 +172,7 @@ async fn gates_qos_and_network_quotas() {
         body["spec"]["nics"][0]["qos"],
         json!({ "out_mbps": 100, "in_mbps": 200 })
     );
-    let (_, audit) = admin.get("/audit?limit=5").await;
-    assert!(
-        audit.to_string().contains("nic-qos 0 out=100 in=200"),
-        "{audit}"
-    );
+    audit_has(&admin, "nic-qos 0 out=100 in=200").await;
 
     // 네트워크 폴더 할당량 `networks`
     let (status, f) = admin
@@ -326,13 +335,11 @@ async fn load_balancers() {
     assert_eq!(monitors.len(), 1, "{lb}");
     assert_eq!(monitors[0]["network"], "t1");
     assert_ne!(monitors[0]["ip"], vip.as_str());
-    let (_, audit) = admin.get("/audit?limit=5").await;
-    assert!(
-        audit.to_string().contains(&format!(
-            "lb create web t1 vip {vip} tcp/80 → web1, lb external web ext 203.0.113.101"
-        )),
-        "{audit}"
-    );
+    audit_has(
+        &admin,
+        &format!("lb create web t1 vip {vip} tcp/80 → web1, lb external web ext 203.0.113.101"),
+    )
+    .await;
 
     // 보기(OVN을 읽지 않음): VIP·바깥 VIP 준비, 멤버 주소, 건강 검사 결과 없음
     let (status, view) = admin.get("/load-balancers/web?live=false").await;
@@ -625,11 +632,7 @@ async fn lockdown_dry_run_and_view() {
             .contains(&json!("127.0.0.1")),
         "{view}"
     );
-    let (_, audit) = admin.get("/audit?limit=5").await;
-    assert!(
-        audit.to_string().contains("sdn lockdown on --force"),
-        "{audit}"
-    );
+    audit_has(&admin, "sdn lockdown on --force").await;
 }
 
 /// 리뷰 1 M6: 토폴로지는 읽을 수 없는 VM 멤버의 주소를 내지 않고, 읽을 수 없는 폴더로 거르면 404다. 잠금 미리 확인은 Raft
