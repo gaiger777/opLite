@@ -1,0 +1,20 @@
+{
+  "dnd": {
+    "role": "draggable",
+    "hint": "Press Space or Enter to pick up. Then Tab moves between places that accept it, Space drops, and Escape cancels.",
+    "picked_one": "Picked up {{item}}. {{count}} place to drop.",
+    "picked_other": "Picked up {{item}}. {{count}} places to drop.",
+    "pickedKey_one": "Picked up {{item}}. {{count}} place to drop. Tab to choose, Space to drop, Escape to cancel.",
+    "pickedKey_other": "Picked up {{item}}. {{count}} places to drop. Tab to choose, Space to drop, Escape to cancel.",
+    "overOk": "{{slot}}. Can drop here.",
+    "overWarn": "{{slot}}. Can drop here: {{warn}}",
+    "overNo": "{{slot}}. Cannot drop here: {{reason}}",
+    "overNoPlain": "{{slot}}. Cannot drop here.",
+    "ok": "Can drop here.",
+    "warn": "Can drop here: {{warn}}",
+    "no": "Cannot drop here: {{reason}}",
+    "noPlain": "Cannot drop here.",
+    "dropped": "Dropped {{item}} on {{slot}}.",
+    "cancelled": "Cancelled."
+  }
+}

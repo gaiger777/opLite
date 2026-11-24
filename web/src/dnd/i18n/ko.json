@@ -1,0 +1,20 @@
+{
+  "dnd": {
+    "role": "끌 수 있는 것",
+    "hint": "Space나 Enter로 듭니다. 그다음 Tab으로 놓을 수 있는 곳 사이를 옮기고 Space로 놓으며 Esc로 취소합니다.",
+    "picked_one": "{{item}}을(를) 들었습니다. 놓을 수 있는 곳 {{count}}개.",
+    "picked_other": "{{item}}을(를) 들었습니다. 놓을 수 있는 곳 {{count}}개.",
+    "pickedKey_one": "{{item}}을(를) 들었습니다. 놓을 수 있는 곳 {{count}}개. Tab으로 고르고 Space로 놓고 Esc로 취소합니다.",
+    "pickedKey_other": "{{item}}을(를) 들었습니다. 놓을 수 있는 곳 {{count}}개. Tab으로 고르고 Space로 놓고 Esc로 취소합니다.",
+    "overOk": "{{slot}} 위. 놓을 수 있습니다.",
+    "overWarn": "{{slot}} 위. 놓을 수 있습니다: {{warn}}",
+    "overNo": "{{slot}} 위. 놓을 수 없습니다: {{reason}}",
+    "overNoPlain": "{{slot}} 위. 놓을 수 없습니다.",
+    "ok": "놓을 수 있습니다.",
+    "warn": "놓을 수 있습니다: {{warn}}",
+    "no": "놓을 수 없습니다: {{reason}}",
+    "noPlain": "놓을 수 없습니다.",
+    "dropped": "{{item}}을(를) {{slot}}에 놓았습니다.",
+    "cancelled": "취소했습니다."
+  }
+}

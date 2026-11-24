@@ -1,0 +1,61 @@
+{
+  "vmBuilder": {
+    "reason": {
+      "gone": "{{name}}이(가) 더는 없습니다.",
+      "permPool": "풀 {{name}}에 디스크를 만들 권한이 없습니다.",
+      "permVolume": "볼륨 {{name}}을(를) 붙일 권한이 없습니다.",
+      "permNetwork": "네트워크 {{name}}에 NIC를 붙일 권한이 없습니다.",
+      "permRules": "배치 규칙을 쓸 수 있는 사용자만 장애 영역을 씁니다.",
+      "permFolder": "이 폴더에 VM을 만들 권한이 없습니다.",
+      "poolNowhere": "풀 {{name}}이(가) 준비된 온라인 노드가 없습니다.",
+      "poolNotOnNode": "풀 {{name}}은(는) 노드 {{node}}에서 쓸 수 없습니다.",
+      "volumeElsewhere": "볼륨 {{name}}은(는) {{node}}이(가) 아닌 다른 노드에 있습니다.",
+      "cpuNowhere": "이 CPU 모델을 켤 수 있는 노드가 없습니다.",
+      "cpuCannotRun": "노드 {{name}}에서 CPU 모델 {{model}}을(를) 켤 수 없습니다: {{why}}",
+      "arch": "{{name}}은(는) CPU 아키텍처가 다릅니다.",
+      "windowsArch": "Windows 11은 x86_64 노드(q35)가 있어야 합니다.",
+      "isoLocalHa": "ISO {{name}}은(는) 노드 로컬 풀에 있습니다. HA VM은 공유 풀의 ISO만 씁니다.",
+      "nodeWitness": "{{name}}은(는) 위트니스 노드라 VM을 켜지 않습니다.",
+      "nodeOffline": "노드 {{name}}이(가) 오프라인입니다.",
+      "nodeMaintenance": "노드 {{name}}이(가) 유지보수 중입니다.",
+      "hardRule": "배치 규칙이 이 VM을 {{name}}에 두지 않습니다: {{rules}}",
+      "templateFixed": "템플릿 배포는 템플릿의 디스크·NIC·CD 드라이브를 그대로 씁니다. 만든 뒤 고치기에서 바꿉니다.",
+      "sataPorts": "빈 SATA 포트가 없습니다: q35의 포트 {{max}}개를 SATA 디스크·CD 드라이브·cloud-init이 나눠 씁니다.",
+      "maxCdroms": "VM의 CD 드라이브는 {{max}}개까지입니다.",
+      "maxNics": "VM의 NIC는 {{max}}개까지입니다.",
+      "maxSgs": "NIC 하나에 보안 그룹은 {{max}}개까지입니다.",
+      "userNoSg": "user 네트워크(NAT)에는 보안 그룹을 걸 수 없습니다.",
+      "sdnStatic": "SDN 네트워크는 주소를 직접 나눠 줍니다. NIC 주소 칸에서 고르세요.",
+      "zoneEmpty": "장애 영역 {{name}}에 노드가 더는 없습니다."
+    },
+    "warn": {
+      "poolFull": "풀 {{name}}에 {{free}} GiB만 남았습니다.",
+      "nodeMemory": "노드 {{name}}에 메모리가 {{free}} MiB만 남았습니다.",
+      "sizeMemory": "메모리 {{memory}} MiB가 남은 노드가 없습니다.",
+      "quotaVcpus": "이 VM을 만들면 {{path}}의 vCPU 할당량을 넘습니다.",
+      "quotaMemory": "이 VM을 만들면 {{path}}의 메모리 할당량을 넘습니다.",
+      "quotaDisk": "이 VM을 만들면 {{path}}의 디스크 할당량을 넘습니다.",
+      "userData": "직접 쓴 user-data가 만든 user-data를 대신합니다: 사용자·비밀번호·SSH 키는 쓰이지 않습니다.",
+      "noBoot": "부팅할 디스크나 CD 드라이브가 없습니다."
+    },
+    "problem": {
+      "nameTaken": "이름이 {{name}}인 VM이 이미 있습니다."
+    },
+    "cli": {
+      "noFlag": "{{what}}은(는) CLI 플래그가 없습니다 — JSON 요청을 쓰세요.",
+      "password": "비밀번호는 --ci-password-prompt가 묻습니다(여기에 보이지 않음).",
+      "what": {
+        "diskBus": "디스크마다의 버스",
+        "nicModel": "NIC마다의 모델",
+        "mac": "고정 MAC 주소",
+        "numa": "CPU 배치와 NUMA",
+        "schedule": "스냅샷 예약",
+        "folder": "템플릿 배포의 폴더",
+        "templateSg": "템플릿 배포의 보안 그룹"
+      }
+    },
+    "json": {
+      "masked": "cloud-init 비밀번호를 ********로 가렸습니다. 보내기 전에 진짜 비밀번호로 바꾸세요."
+    }
+  }
+}

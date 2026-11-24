@@ -4,7 +4,6 @@ import { toast } from "sonner";
 
 import { api, call } from "@/api/client";
 import { useList } from "@/api/live";
-import type { components } from "@/api/schema";
 import type { Vm } from "@/api/types";
 import { useOptionalPrincipal } from "@/auth/AuthProvider";
 import { Field } from "@/components/Field";
@@ -30,17 +29,19 @@ import { ipsOverride, sdnNetworkNamed } from "@/sdn/ips";
 import { choosablePoolsOn } from "@/storage/pools";
 import { usePoolNodes } from "@/storage/usePoolNodes";
 import { trackTask } from "@/tasks/tasks";
-import { deployNames, diskVolumes, linkableDisks, templateNode } from "@/templates/templates";
+import {
+  cloneBody,
+  type DeployMode as Mode,
+  deployNames,
+  diskVolumes,
+  linkableDisks,
+  templateNode,
+} from "@/templates/templates";
 import { cloudInitErrors, emptyCloudInit, toCloudInit } from "@/vms/cloudInit";
 import { gibToBytes, MAX_VCPUS, MIN_MEMORY_MIB, validName } from "@/vms/form";
 import { CloudInitSection } from "@/vms/form/CloudInitSection";
 
-type CloneRequest = components["schemas"]["CloneRequest"];
-
 const MIB = 1024 ** 2;
-
-/** 연결 복제 방식: 되는 디스크는 연결(서버 기본), 모두 연결(안 되면 거절), 전체 복사 */
-type Mode = "auto" | "linked" | "full";
 
 /** `min`부터 `max`까지의 정수인지 */
 function intIn(value: string, min: number, max: number): boolean {
@@ -181,21 +182,21 @@ export function DeployDialog({
       return false;
     }
     const ci = toCloudInit(cloudInit, nicCount, sdnNics);
-    const body = (vmName: string): CloneRequest => ({
-      name: vmName,
-      ...(mode !== "auto" && { linked: mode === "linked" }),
-      ...(pool !== "" && { pool }),
-      ...(node !== "" && { node }),
+    const overrides = {
+      mode,
+      pool,
+      node,
       ...(cpus !== "" && { vcpus: Number(cpus) }),
-      ...(memory !== "" && { memory_mib: Number(memory) }),
-      ...(nics.some((n) => n !== "") && { nics: nics.map((n) => (n === "" ? null : n)) }),
-      ...(wantIps && { ips: wantIps }),
-      ...(diskBytes.some((b) => b !== null) && { disks: diskBytes }),
-      ...(ci && Object.keys(ci).length > 0 && { cloud_init: ci }),
-      ...(start && { start: true }),
-      ...cpuOverride(cpu, templateCpu),
-      ...numaOverride(numa, templateNuma),
-    });
+      ...(memory !== "" && { memoryMib: Number(memory) }),
+      nics,
+      ips: wantIps,
+      disks: diskBytes,
+      cloudInit: ci,
+      start,
+      cpu: cpuOverride(cpu, templateCpu),
+      numa: numaOverride(numa, templateNuma),
+    };
+    const body = (vmName: string) => cloneBody(vmName, overrides);
     let made = 0;
     for (const vmName of names) {
       try {

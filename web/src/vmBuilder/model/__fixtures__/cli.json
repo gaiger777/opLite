@@ -1,0 +1,979 @@
+{
+  "nodes": {
+    "n1": "node-a",
+    "n2": "node-b",
+    "n3": "node-arm"
+  },
+  "cases": [
+    {
+      "name": "minimal",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "web-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "web",
+          "--cores",
+          "2",
+          "--memory",
+          "4096",
+          "--machine",
+          "q35",
+          "--disk",
+          "web-disk0",
+          "--nic",
+          "lan",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "web",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 4096,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "web-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "existing-volume-user-net",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "vol",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--disk",
+          "spare",
+          "--nic",
+          "user"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "vol",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "spare",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "user",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "stopped",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "windows",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "win-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "win",
+          "--cores",
+          "2",
+          "--memory",
+          "4096",
+          "--machine",
+          "q35",
+          "--preset",
+          "windows11",
+          "--disk",
+          "win-disk0",
+          "--cdrom",
+          "alpine",
+          "--nic",
+          "lan",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "win",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 4096,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "win-disk0",
+                "bus": "sata",
+                "boot_order": null
+              }
+            ],
+            "cdroms": [
+              {
+                "iso": "alpine"
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "e1000e",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false,
+            "tpm": true,
+            "secure_boot": true,
+            "guest_agent": {
+              "freeze_fs": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "two-disks-cd",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "multi-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "multi",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--disk",
+          "multi-disk0",
+          "--disk",
+          "spare",
+          "--boot",
+          "disk0,disk1,cdrom0",
+          "--cdrom",
+          "alpine",
+          "--nic",
+          "lan",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "multi",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "multi-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              },
+              {
+                "volume": "spare",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "cdroms": [
+              {
+                "iso": "alpine"
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "sdn-and-groups",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "sdn-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "sdn",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--disk",
+          "sdn-disk0",
+          "--nic",
+          "lan,sg=web+ssh",
+          "--nic",
+          "tenant,ip=10.10.0.5",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "sdn",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "sdn-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null,
+                "security_groups": [
+                  "web",
+                  "ssh"
+                ]
+              },
+              {
+                "network": "tenant",
+                "model": "virtio",
+                "mac": null,
+                "ips": [
+                  "10.10.0.5"
+                ]
+              }
+            ],
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "cloud-init",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "ci-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "ci",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--disk",
+          "ci-disk0",
+          "--nic",
+          "lan",
+          "--ci-hostname",
+          "ci.example",
+          "--ci-user",
+          "ops",
+          "--ci-ssh-key",
+          "ssh-ed25519 AAAAC3Nza ops@laptop",
+          "--ci-ssh-key",
+          "ssh-rsa AAAAB3Nza other",
+          "--ci-ip",
+          "nic0=192.168.1.10/24,gw=192.168.1.1",
+          "--ci-ip6",
+          "nic0=slaac",
+          "--ci-dns",
+          "1.1.1.1",
+          "--ci-dns",
+          "8.8.8.8",
+          "--ci-search",
+          "example.com",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "ci",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "ci-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "cloud_init": {
+              "hostname": "ci.example",
+              "user": "ops",
+              "ssh_keys": [
+                "ssh-ed25519 AAAAC3Nza ops@laptop",
+                "ssh-rsa AAAAB3Nza other"
+              ],
+              "networks": [
+                {
+                  "ipv4": {
+                    "mode": "static",
+                    "address": "192.168.1.10/24",
+                    "gateway": "192.168.1.1"
+                  },
+                  "ipv6": {
+                    "mode": "slaac"
+                  }
+                }
+              ],
+              "dns": {
+                "servers": [
+                  "1.1.1.1",
+                  "8.8.8.8"
+                ],
+                "search": [
+                  "example.com"
+                ]
+              }
+            },
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "packages",
+      "files": [
+        {
+          "name": "user-data.yaml",
+          "content": "#cloud-config\npackage_update: true\npackages: [qemu-guest-agent]\n"
+        }
+      ],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "pkg-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "pkg",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--guest-agent",
+          "on",
+          "--disk",
+          "pkg-disk0",
+          "--nic",
+          "lan",
+          "--ci-user-data",
+          "user-data.yaml",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "pkg",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "pkg-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "cloud_init": {
+              "user_data": "#cloud-config\npackage_update: true\npackages: [qemu-guest-agent]\n"
+            },
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false,
+            "guest_agent": {
+              "freeze_fs": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "node-cpu",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "pin-disk0",
+          "--pool",
+          "local",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "pin",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--cpu-model",
+          "x86-64-v3",
+          "--cpu-flags=-avx512f,+aes",
+          "--disk",
+          "pin-disk0",
+          "--nic",
+          "lan",
+          "--node",
+          "node-a",
+          "--pinned",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "pin",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "x86-64-v3",
+              "flags": [
+                "-avx512f",
+                "+aes"
+              ]
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "pin-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": "n1",
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false,
+            "placement": {
+              "pinned": true
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "ha",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "ha-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "ha",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--disk",
+          "ha-disk0",
+          "--nic",
+          "lan",
+          "--ha",
+          "--ha-group",
+          "pair",
+          "--ha-priority",
+          "70",
+          "--guest-watch",
+          "120",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "ha",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "ha-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": {
+              "state": "started",
+              "max_restart": 1,
+              "max_relocate": 1,
+              "priority": 70,
+              "group": "pair",
+              "guest_watch": {
+                "timeout_secs": 120
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "zone",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "zoned-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "placement-rule",
+          "create",
+          "zoned-zone",
+          "--kind",
+          "node-affinity",
+          "--vm",
+          "zoned",
+          "--node-tag",
+          "zone=b"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "zoned",
+          "--cores",
+          "2",
+          "--memory",
+          "2048",
+          "--machine",
+          "q35",
+          "--disk",
+          "zoned-disk0",
+          "--nic",
+          "lan",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "zoned",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 2,
+              "model": "host"
+            },
+            "memory_mib": 2048,
+            "firmware": "uefi",
+            "machine": "q35",
+            "disks": [
+              {
+                "volume": "zoned-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "running",
+            "restart": "never",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "folder-carried",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "volume",
+          "create",
+          "team-disk0",
+          "--pool",
+          "ceph",
+          "--size",
+          "20G"
+        ],
+        [
+          "orbivisorctl",
+          "vm",
+          "create",
+          "team",
+          "--cores",
+          "4",
+          "--memory",
+          "8192",
+          "--max-vcpus",
+          "8",
+          "--max-memory",
+          "16384",
+          "--machine",
+          "q35",
+          "--disk",
+          "team-disk0",
+          "--nic",
+          "lan",
+          "--restart",
+          "on-failure",
+          "--folder",
+          "/team/prod"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms",
+        "body": {
+          "name": "team",
+          "spec": {
+            "cpu": {
+              "sockets": 1,
+              "cores": 4,
+              "model": "host",
+              "max_vcpus": 8
+            },
+            "memory_mib": 8192,
+            "max_memory_mib": 16384,
+            "firmware": "uefi",
+            "machine": "q35",
+            "folder": "019a0f3c-0000-7000-8009-00000000prod",
+            "disks": [
+              {
+                "volume": "team-disk0",
+                "bus": "virtio-blk",
+                "boot_order": null
+              }
+            ],
+            "nics": [
+              {
+                "network": "lan",
+                "model": "virtio",
+                "mac": null
+              }
+            ],
+            "node": null,
+            "power": "stopped",
+            "restart": "on-failure",
+            "snapshot_schedule": null,
+            "ha": false
+          }
+        }
+      }
+    },
+    {
+      "name": "template",
+      "files": [],
+      "commands": [
+        [
+          "orbivisorctl",
+          "template",
+          "deploy",
+          "tmpl",
+          "--name",
+          "from-tmpl",
+          "--full",
+          "--node",
+          "node-a",
+          "--pool",
+          "ceph",
+          "--cpus",
+          "4",
+          "--memory",
+          "8192",
+          "--network",
+          "nic0=tenant",
+          "--disk-size",
+          "disk0=40G",
+          "--ci-user",
+          "ops",
+          "--start"
+        ]
+      ],
+      "missing": [],
+      "request": {
+        "method": "POST",
+        "path": "/vms/{key}/clone",
+        "key": "019a0f3c-0000-7000-8000-00000000tmpl",
+        "body": {
+          "name": "from-tmpl",
+          "linked": false,
+          "pool": "ceph",
+          "node": "n1",
+          "vcpus": 4,
+          "memory_mib": 8192,
+          "nics": [
+            "tenant"
+          ],
+          "disks": [
+            42949672960
+          ],
+          "cloud_init": {
+            "user": "ops"
+          },
+          "start": true
+        }
+      }
+    }
+  ]
+}

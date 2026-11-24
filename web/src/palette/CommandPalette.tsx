@@ -26,7 +26,7 @@ import { type Candidate, matchScore, PREFIX, rank } from "@/palette/rank";
 import { availability, isBusy, useVmActions } from "@/vms/actions";
 import { type GuestInfoResponse, guestAddresses } from "@/vms/guest";
 import { useVmActionHost } from "@/vms/actionHost";
-import { migrationTargets } from "@/vms/VmMigrateDialog";
+import { migrationTargets } from "@/vms/migrate";
 
 /** 그룹 순서. 즐겨찾기가 맨 위다(설계 §5.7). */
 const GROUPS = [

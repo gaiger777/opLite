@@ -1,10 +1,58 @@
 import type { components } from "@/api/schema";
 import type { Node, Snapshot, StoragePool, Vm, Volume } from "@/api/types";
+import type { NumaOverride } from "@/numa/numa";
 import { isShared, usableOn } from "@/storage/pools";
 import { isStopped } from "@/vms/actions";
+import type { CloudInit } from "@/vms/cloudInit";
 import { haEnabled } from "@/vms/ha";
 
 type ImageFormat = components["schemas"]["ImageFormat"];
+type CloneRequest = components["schemas"]["CloneRequest"];
+
+/** 연결 복제 방식: 되는 디스크는 연결(서버 기본), 모두 연결(안 되면 거절), 전체 복사 */
+export type DeployMode = "auto" | "linked" | "full";
+
+/** 템플릿 배포의 덮어쓰기. 비운 값(빈 글·null·없음)은 템플릿 그대로다. */
+export interface DeployOverrides {
+  mode: DeployMode;
+  pool: string;
+  node: string;
+  vcpus?: number;
+  memoryMib?: number;
+  /** NIC마다 바꿀 네트워크(빈 글은 그대로) */
+  nics: readonly string[];
+  /** NIC마다 SDN 주소(모두 비면 없음) */
+  ips?: string[][];
+  /** 디스크마다 새 크기(바이트, 늘리기만 — null은 그대로) */
+  disks: readonly (number | null)[];
+  cloudInit?: CloudInit;
+  start: boolean;
+  folder?: string;
+  cpu: { cpu_model?: string; cpu_flags?: string[] };
+  numa: NumaOverride;
+}
+
+/**
+ * `POST /vms/{key}/clone` 본문(배포 대화상자와 VM 빌더의 템플릿 바탕이 함께 쓴다): 바꾼 칸만 넣는다(옛 서버도 받는다).
+ */
+export function cloneBody(name: string, o: DeployOverrides): CloneRequest {
+  return {
+    name,
+    ...(o.mode !== "auto" && { linked: o.mode === "linked" }),
+    ...(o.pool !== "" && { pool: o.pool }),
+    ...(o.node !== "" && { node: o.node }),
+    ...(o.vcpus !== undefined && { vcpus: o.vcpus }),
+    ...(o.memoryMib !== undefined && { memory_mib: o.memoryMib }),
+    ...(o.nics.some((n) => n !== "") && { nics: o.nics.map((n) => (n === "" ? null : n)) }),
+    ...(o.ips && { ips: o.ips }),
+    ...(o.disks.some((b) => b !== null) && { disks: [...o.disks] }),
+    ...(o.cloudInit && Object.keys(o.cloudInit).length > 0 && { cloud_init: o.cloudInit }),
+    ...(o.folder && { folder: o.folder }),
+    ...(o.start && { start: true }),
+    ...o.cpu,
+    ...o.numa,
+  };
+}
 
 /** 한 번에 배포할 수 있는 VM 수(CLI의 `MAX_COUNT`와 같다) */
 export const MAX_COUNT = 100;

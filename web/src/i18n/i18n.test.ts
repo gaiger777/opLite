@@ -1,10 +1,14 @@
 import { ApiError, NetworkError } from "@/api/client";
 import mapEn from "@/clusterMap/i18n/en.json";
 import mapKo from "@/clusterMap/i18n/ko.json";
+import dndEn from "@/dnd/i18n/en.json";
+import dndKo from "@/dnd/i18n/ko.json";
 import en from "@/i18n/en.json";
 import { errorMessage } from "@/i18n/errors";
 import i18n from "@/i18n";
 import ko from "@/i18n/ko.json";
+import builderEn from "@/vmBuilder/i18n/en.json";
+import builderKo from "@/vmBuilder/i18n/ko.json";
 
 function keys(value: unknown, prefix = ""): string[] {
   if (typeof value !== "object" || value === null) {
@@ -19,6 +23,13 @@ it("has the same keys in every language", () => {
   expect(keys(mapKo).sort()).toEqual(keys(mapEn).sort());
   expect(Object.keys(mapEn)).toEqual(["clusterMap"]);
   expect(Object.keys(en)).not.toContain("clusterMap");
+  // 끌기 틀(`dnd/strings.ts`)과 VM 빌더(`vmBuilder/strings.ts`) 문구도
+  expect(keys(dndKo).sort()).toEqual(keys(dndEn).sort());
+  expect(keys(builderKo).sort()).toEqual(keys(builderEn).sort());
+  expect(Object.keys(dndEn)).toEqual(["dnd"]);
+  expect(Object.keys(builderEn)).toEqual(["vmBuilder"]);
+  expect(Object.keys(en)).not.toContain("dnd");
+  expect(Object.keys(en)).not.toContain("vmBuilder");
 });
 
 // `common.*`으로 옮긴 키. 같은 뜻의 개별 키를 다시 만들지 않는다.

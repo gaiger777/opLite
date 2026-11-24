@@ -2,7 +2,7 @@
 import type { Node, Snapshot, Task, Vm } from "@/api/types";
 import type { Privilege } from "@/auth/permissions";
 import { availability, isBusy, isMigrating } from "@/vms/actions";
-import { migrationTargets } from "@/vms/VmMigrateDialog";
+import { migrationTargets } from "@/vms/migrate";
 
 export type BulkAction =
   "start" | "stop" | "force-stop" | "reboot" | "snapshot" | "migrate" | "delete";

@@ -4,7 +4,7 @@ import { ApiError, api, call } from "@/api/client";
 import type { components } from "@/api/schema";
 import type { Vm } from "@/api/types";
 import { trackTask, waitForTask } from "@/tasks/tasks";
-import { type DiskRow, gibToBytes, toSpec, type VmFormValues } from "@/vms/form";
+import { type DiskRow, toSpec, type VmFormValues, volumeRequest } from "@/vms/form";
 
 /**
  * 새 빈 볼륨을 `format`(풀 종류의 기본 형식)으로 만들고 그 Task가 끝날 때까지 기다린다. `label`은
@@ -17,18 +17,7 @@ export async function createVolume(
   label: string,
   signal: AbortSignal,
 ): Promise<void> {
-  const task = await call(
-    api.POST("/volumes", {
-      body: {
-        name: disk.volume,
-        spec: {
-          pool: disk.pool,
-          size_bytes: gibToBytes(disk.sizeGib)!,
-          format,
-        },
-      },
-    }),
-  );
+  const task = await call(api.POST("/volumes", { body: volumeRequest(disk, format) }));
   trackTask(task, label);
   await waitForTask(queryClient, task.id, signal);
 }

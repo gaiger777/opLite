@@ -9,7 +9,8 @@ import { NODE, pool, poolState, replicatedVm, snapshot, task, vm, volume } from 
 import { ADMIN, mockLists, renderPage } from "@/test/render";
 import { apiUrl, server } from "@/test/server";
 import { VmDetailPage } from "@/vms/VmDetailPage";
-import { migrationTargets, VmMigrateDialog } from "@/vms/VmMigrateDialog";
+import { migrationTargets } from "@/vms/migrate";
+import { VmMigrateDialog } from "@/vms/VmMigrateDialog";
 
 afterEach(() => {
   toast.dismiss();

@@ -4,13 +4,24 @@ import { cleanup } from "@testing-library/react";
 
 import mapEn from "@/clusterMap/i18n/en.json";
 import mapKo from "@/clusterMap/i18n/ko.json";
+import dndEn from "@/dnd/i18n/en.json";
+import dndKo from "@/dnd/i18n/ko.json";
 import i18n from "@/i18n";
 import { FakeXhr } from "@/test/fakeXhr";
 import { server } from "@/test/server";
+import builderEn from "@/vmBuilder/i18n/en.json";
+import builderKo from "@/vmBuilder/i18n/ko.json";
 
-// 늦게 받는 문구(클러스터 지도 — `clusterMap/strings.ts`)도 시험에서는 처음부터 둔다.
-i18n.addResourceBundle("en", "translation", mapEn, false, false);
-i18n.addResourceBundle("ko", "translation", mapKo, false, false);
+// 늦게 받는 문구(클러스터 지도 — `clusterMap/strings.ts`, 끌기 틀 — `dnd/strings.ts`, VM 빌더 —
+// `vmBuilder/strings.ts`)도 시험에서는 처음부터 둔다.
+for (const [en, ko] of [
+  [mapEn, mapKo],
+  [dndEn, dndKo],
+  [builderEn, builderKo],
+] as const) {
+  i18n.addResourceBundle("en", "translation", en, false, false);
+  i18n.addResourceBundle("ko", "translation", ko, false, false);
+}
 
 // uPlot은 캔버스를 쓰므로 jsdom에서 그리지 않는다. 차트는 받은 선 이름만 보이는 가짜다(설계 §13).
 vi.mock("@/charts/TimeChart", () => ({

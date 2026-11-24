@@ -437,6 +437,17 @@ export function gibToBytes(text: string): number | undefined {
   return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : undefined;
 }
 
+/** 새 빈 볼륨 만들기 본문(`POST /volumes`). 폼의 보내기와 VM 빌더의 요청 미리 보기가 함께 쓴다. */
+export function volumeRequest(
+  disk: Pick<DiskRow, "volume" | "pool" | "sizeGib">,
+  format: Schemas["ImageFormat"],
+): { name: string; spec: { pool: string; size_bytes: number; format: Schemas["ImageFormat"] } } {
+  return {
+    name: disk.volume,
+    spec: { pool: disk.pool, size_bytes: gibToBytes(disk.sizeGib)!, format },
+  };
+}
+
 /** `min`부터 `max`까지의 정수인지 */
 function intIn(value: string, min: number, max: number): boolean {
   const n = Number(value);
