@@ -5,6 +5,7 @@
 //! (`permissions.spec.ts`, QEMU 없음).
 //! 계획 69: 고정물 ext4 디스크 VM의 저장소 백업을 브라우저로 찾아보고 파일 하나·폴더(zip)를 내려받은 뒤 닫는다
 //! (`file-restore.spec.ts`, 실제 도우미 이미지 — `OPL_RESTORE_IMAGE_DIR`·`OPL_RESTORE_FIXTURES`가 없으면 건너뜀).
+//! 계획 70: VM을 켠 뒤 인프라 › 노드의 보기 "지도"에서 노드 블록·VM 타일을 보고 키보드·누르기로 서랍을 열고 목록 보기·휴대폰 폭을 본다.
 //! `pnpm -C web build && cargo test -p opld --features web-it --test web`
 //! QEMU(`qemu-it`와 같다), pnpm, `pnpm -C web exec playwright install chromium`이 필요하다.
 #![cfg(feature = "web-it")]

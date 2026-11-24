@@ -75,6 +75,110 @@ async function scheduledSnapshots(page: Page) {
   }));
 }
 
+/**
+ * 계획 70: 인프라 › 노드의 보기 "지도"(늦게 읽는 조각). 켜 둔 VM `vm`이 노드 블록 위 타일로 보이고, 키보드(`]`·화살표·Enter)와
+ * 진짜 브라우저의 타일 누르기(SVG 점 적중 검사)가 서랍을 열며, 목록 보기·동작 줄이기·어둠 테마·휴대폰 폭(가로 스크롤 없음)을 본다.
+ * 끝에 보기 "노드"로 돌아가 인프라를 다시 누르면 기억한 보기로 온다.
+ */
+async function clusterMap(page: Page, vm: string) {
+  await openTab(page, "Infrastructure", "Nodes");
+  const views = page.getByRole("navigation", { name: "Nodes views" });
+  await views.getByRole("link", { name: "Map", exact: true }).click();
+  await expect(page).toHaveURL(/\/cluster\/map$/);
+  const picture = page.getByRole("group", { name: "Cluster map" });
+  const node = picture.getByRole("button", { name: /^Node node1, .*\bonline\b/ });
+  await expect(node).toBeVisible();
+  await expect(node).toHaveAttribute("aria-label", /\b1 VM \(1 running\)/);
+  // 한 노드·VM 하나는 맞추기 배율이 커서 "자세히" 단계 — 타일 윗면에 VM 이름이 있다.
+  await expect(page.getByRole("status").filter({ hasText: "Detail." })).toBeVisible();
+  const tileText = picture.locator("text").filter({ hasText: new RegExp(`^${vm}$`) });
+  await expect(tileText).toBeVisible();
+
+  // 키보드: 노드에 초점 → `]`로 그 노드의 VM 타일(화면 초점은 노드에 남고 aria-live 줄이 읽는다) → Enter로 서랍
+  const live = page.locator("p[aria-live=polite]").filter({ hasText: /^(Node|VM) / });
+  // 처음 초점은 노드 자신의 이름(aria-label)으로 읽고, 옮겨 갈 때부터 aria-live 줄이 읽는다.
+  await node.focus();
+  await expect(node).toBeFocused();
+  await page.keyboard.press("]");
+  await expect(live).toHaveText(new RegExp(`^VM ${vm}, Running, node node1`));
+  await expect(node).toBeFocused();
+  await page.keyboard.press("Enter");
+  // 서랍 조각은 처음 열 때 받는다.
+  let sheet = page.getByRole("dialog");
+  await expect(sheet.getByRole("heading", { name: vm, exact: true })).toBeVisible();
+  await expect(sheet.getByRole("button", { name: "Migrate…" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
+  await expect(node).toBeFocused();
+  // `[`는 그림 안에서 노드로 나온다(그림 밖에서는 전역 단축키 — 사이드바 접기).
+  await page.keyboard.press("[");
+  await expect(live).toHaveText(/^Node node1, /);
+  await page.keyboard.press("Enter");
+  sheet = page.getByRole("dialog");
+  await expect(sheet.getByRole("heading", { name: "node1", exact: true })).toBeVisible();
+  await expect(sheet.getByRole("button", { name: "Node actions" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
+
+  // 진짜 브라우저의 가리키기·누르기: 타일은 합친 경로라 DOM 원소가 없고, 적중 검사가 그 점의 타일을 찾는다.
+  const box = (await tileText.boundingBox())!;
+  const at = { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+  await page.mouse.move(at.x, at.y);
+  await expect(page.locator("[data-map-card]")).toContainText(vm);
+  await page.mouse.click(at.x, at.y);
+  sheet = page.getByRole("dialog");
+  await expect(sheet.getByRole("heading", { name: vm, exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
+
+  // 목록 보기에 같은 노드·VM
+  await page.getByRole("radio", { name: "List" }).click();
+  const list = page.getByRole("region", { name: "Cluster map as a list" });
+  await expect(list.getByRole("button", { name: "node1", exact: true })).toBeVisible();
+  await expect(list.getByRole("button", { name: vm, exact: true })).toBeVisible();
+  await page.getByRole("radio", { name: "Picture" }).click();
+  await expect(node).toBeVisible();
+
+  // 동작 줄이기면 움직임 키프레임이 없다(그림의 <style>). 어둠 테마에서도 그린다.
+  const motion = () =>
+    picture.evaluate((svg) =>
+      [...svg.querySelectorAll("style")].some((s) => /@keyframes/.test(s.textContent ?? "")),
+    );
+  expect(await motion()).toBe(true);
+  await page.emulateMedia({ reducedMotion: "reduce", colorScheme: "dark" });
+  await expect.poll(motion).toBe(false);
+  await expect(page.locator("html")).toHaveClass(/\bdark\b/);
+  await expect(node).toBeVisible();
+  await expect(tileText).toBeVisible();
+  await page.emulateMedia({ reducedMotion: null, colorScheme: null });
+
+  // 휴대폰 폭: 도구 띠는 그림 | 목록과 "보기 설정" 하나, 문서는 가로로 넘치지 않는다.
+  const wide = page.viewportSize()!;
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.getByRole("checkbox", { name: "Storage" })).toBeHidden();
+  await page.getByRole("button", { name: "View settings" }).click();
+  sheet = page.getByRole("dialog", { name: "View settings" });
+  await expect(sheet.getByRole("checkbox", { name: "Storage" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(sheet).toBeHidden();
+  await expect(node).toBeVisible();
+  expect(
+    await page.evaluate(
+      () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+    ),
+  ).toBe(true);
+  await page.setViewportSize(wide);
+
+  // 보기 "노드"로 돌아가면 영역이 그 보기를 기억한다.
+  await views.getByRole("link", { name: "Nodes", exact: true }).click();
+  await expect(page).toHaveURL(/\/nodes$/);
+  await page
+    .getByRole("navigation", { name: "Main" })
+    .getByRole("link", { name: "Infrastructure", exact: true })
+    .click();
+  await expect(page).toHaveURL(/\/nodes$/);
+}
+
 test.use({ locale: "en-US" });
 
 test("upload an image, run a VM from it, clone and snapshot it, then delete everything", async ({
@@ -125,6 +229,12 @@ test("upload an image, run a VM from it, clone and snapshot it, then delete ever
   // 요약의 "원하는 전원 상태"가 아니라 머리글의 단계 표시를 본다. 상세 화면에는 하나뿐이다.
   await expect(page.getByTestId("vm-phase")).toHaveCount(1);
   await expect(page.getByTestId("vm-phase")).toHaveText("Running", { timeout: 60_000 });
+
+  // 계획 70: 켜진 VM을 클러스터 지도에서 본 뒤 VM 화면으로 돌아온다.
+  await clusterMap(page, "web");
+  await openTab(page, "Virtual machines", "VMs");
+  await page.getByRole("link", { name: "web", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "web" })).toBeVisible();
 
   await page.getByRole("tab", { name: "Console" }).click();
   await expect(page.getByRole("status").filter({ hasText: "Connected" })).toBeVisible();
