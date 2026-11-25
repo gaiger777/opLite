@@ -180,18 +180,16 @@ pub fn spawn(parts: Vec<Part>, tar: bool, mtime: u64) -> DownloadStream {
                     break;
                 }
             }
-            if tar
-                && tx
+            // ustar 끝 표시(0 블록 둘). 받는 쪽이 끊었으면 false
+            let sent = !tar
+                || tx
                     .send(Ok(DownloadPiece::Data(Bytes::from(vec![
                         0u8;
                         2 * BLOCK as usize
                     ]))))
                     .await
-                    .is_err()
-            {
-                return Ok(false);
-            }
-            Ok::<_, String>(true)
+                    .is_ok();
+            Ok::<_, String>(sent)
         };
         match run.await {
             Ok(true) => {
