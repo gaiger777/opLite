@@ -27,7 +27,10 @@ use uuid::Uuid;
 use crate::error::ApiError;
 use crate::state::AppState;
 
-pub const SESSION_COOKIE: &str = "opl_session";
+pub const SESSION_COOKIE: &str = "orbivisor_session";
+/// 옛 세션 쿠키 이름. 계획 74: 한 릴리스 동안 옛 판 노드와 세션을 나눈다(다음 판에서 뺌) — 새 이름과 함께
+/// 쓰고, 새 이름이 없을 때 읽는다.
+pub const LEGACY_SESSION_COOKIE: &str = "opl_session";
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 /// 세션의 마지막 사용 시각을 다시 적기까지의 간격. 요청마다 Raft에 쓰지 않으려고 묶는다.
 pub const SESSION_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -317,13 +320,19 @@ fn deleted(result: Result<u64, ClusterError>) -> Result<(), ApiError> {
     }
 }
 
+/// 세션 쿠키의 값. 새 이름 먼저, 없으면 옛 이름(둘 다 있으면 새 것).
 pub(crate) fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    cookie_value(headers, SESSION_COOKIE).or_else(|| cookie_value(headers, LEGACY_SESSION_COOKIE))
+}
+
+/// `Cookie` 헤더들에서 `name` 쿠키의 값
+pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get_all(COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix(SESSION_COOKIE)?.strip_prefix('='))
+        .find_map(|c| c.trim().strip_prefix(name)?.strip_prefix('='))
 }
 
 /// `Origin`이 없거나(브라우저 밖의 클라이언트) `Host`와 같다. 믿는 프록시가 scheme(`proto`)을 알렸으면
@@ -1053,5 +1062,23 @@ mod tests {
             &headers(&[("host", "a"), ("origin", "ftp://a")]),
             None
         ));
+    }
+
+    #[test]
+    fn session_cookie_prefers_the_new_name() {
+        let cookies = |v: &str| {
+            let mut h = HeaderMap::new();
+            h.insert(COOKIE, v.parse().unwrap());
+            h
+        };
+        assert_eq!(session_cookie(&cookies("orbivisor_session=n")), Some("n"));
+        // 옛 판 노드가 만든 세션
+        assert_eq!(session_cookie(&cookies("a=1; opl_session=o")), Some("o"));
+        assert_eq!(
+            session_cookie(&cookies("opl_session=o; orbivisor_session=n")),
+            Some("n")
+        );
+        assert_eq!(session_cookie(&cookies("x_opl_session=o")), None);
+        assert_eq!(session_cookie(&HeaderMap::new()), None);
     }
 }

@@ -113,7 +113,7 @@ async fn start(env: &Env, realm: &str) -> Hop {
     .await
 }
 
-/// `start` → 가짜 `/authorize` → 콜백 주소와 상태 쿠키(`opl_oidc=…`)
+/// `start` → 가짜 `/authorize` → 콜백 주소와 상태 쿠키(`orbivisor_oidc=…`)
 async fn authorize(env: &Env, idp: &Idp) -> (String, String) {
     let started = start(env, "okta").await;
     assert_eq!(started.status, StatusCode::FOUND);
@@ -122,7 +122,7 @@ async fn authorize(env: &Env, idp: &Idp) -> (String, String) {
         callback.starts_with(&format!("{}{CALLBACK}?", env.base)),
         "{callback}"
     );
-    (callback, started.pair("opl_oidc").unwrap())
+    (callback, started.pair("orbivisor_oidc").unwrap())
 }
 
 /// 처음부터 끝까지 로그인한다.
@@ -131,25 +131,40 @@ async fn sign_in(env: &Env, idp: &Idp) -> Hop {
     open(&callback, Some(&cookie)).await
 }
 
-/// 로그인에 성공해 세션 쿠키(`opl_session=…`)를 얻는다.
+/// 로그인에 성공해 세션 쿠키(`orbivisor_session=…`)를 얻는다.
 async fn signed_in(env: &Env, idp: &Idp) -> String {
     let hop = sign_in(env, idp).await;
     assert_eq!(
         (hop.status, hop.location.as_str()),
         (StatusCode::FOUND, "/")
     );
-    hop.pair("opl_session").unwrap()
+    hop.pair("orbivisor_session").unwrap()
 }
 
 /// 실패해 `/login?error=<code>`로 돌아가고 상태 쿠키를 지운다.
 fn assert_failed(hop: &Hop, code: &str) {
     assert_eq!(hop.status, StatusCode::FOUND);
     assert_eq!(hop.location, format!("/login?error={code}"));
-    assert!(hop.cookie("opl_session").is_none(), "{:?}", hop.cookies);
-    assert_eq!(
-        hop.cookie("opl_oidc"),
-        Some("opl_oidc=; Path=/api/v1/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0")
+    assert!(
+        hop.cookie("orbivisor_session").is_none(),
+        "{:?}",
+        hop.cookies
     );
+    assert!(hop.cookie("opl_session").is_none(), "{:?}", hop.cookies);
+    assert_state_cleared(hop);
+}
+
+/// 상태 쿠키를 두 이름(새 이름, 옛 판 노드가 읽는 옛 이름) 다 지운다.
+fn assert_state_cleared(hop: &Hop) {
+    for name in ["orbivisor_oidc", "opl_oidc"] {
+        assert_eq!(
+            hop.cookie(name),
+            Some(
+                format!("{name}=; Path=/api/v1/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0")
+                    .as_str()
+            )
+        );
+    }
 }
 
 async fn whoami(env: &Env, cookie: &str) -> (StatusCode, Value) {
@@ -199,13 +214,18 @@ async fn a_login_goes_through_the_identity_provider() {
         assert_eq!(q[name].len(), 43, "{name}: {}", q[name]);
     }
     assert_ne!(q["state"], q["nonce"]);
-    // 상태 쿠키는 OIDC 경로에만, 10분
-    let cookie = started.cookie("opl_oidc").unwrap();
+    // 상태 쿠키는 OIDC 경로에만, 10분. 옛 이름도 같은 값·속성으로(옛 판 노드가 콜백을 받을 수 있다).
+    let cookie = started.cookie("orbivisor_oidc").unwrap();
     let (pair, attrs) = cookie.split_once(';').unwrap();
     assert_eq!(
         attrs,
         " Path=/api/v1/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=600"
     );
+    assert_eq!(
+        started.cookie("opl_oidc"),
+        Some(cookie.replacen("orbivisor_oidc=", "opl_oidc=", 1).as_str())
+    );
+    assert_eq!(started.cookies.len(), 2, "{:?}", started.cookies);
 
     let callback = idp.follow(&started.location).await;
     let hop = open(&callback, Some(pair)).await;
@@ -213,16 +233,22 @@ async fn a_login_goes_through_the_identity_provider() {
         (hop.status, hop.location.as_str()),
         (StatusCode::FOUND, "/")
     );
-    assert_eq!(
-        hop.cookie("opl_oidc"),
-        Some("opl_oidc=; Path=/api/v1/auth/oidc; HttpOnly; SameSite=Lax; Max-Age=0")
-    );
-    let session = hop.cookie("opl_session").unwrap();
+    assert_state_cleared(&hop);
+    let session = hop.cookie("orbivisor_session").unwrap();
     assert!(
         session.ends_with("; Path=/; HttpOnly; SameSite=Strict; Max-Age=43200"),
         "{session}"
     );
-    let (status, me) = whoami(&env, &hop.pair("opl_session").unwrap()).await;
+    assert_eq!(
+        hop.cookie("opl_session"),
+        Some(
+            session
+                .replacen("orbivisor_session=", "opl_session=", 1)
+                .as_str()
+        )
+    );
+    assert_eq!(hop.cookies.len(), 4, "{:?}", hop.cookies);
+    let (status, me) = whoami(&env, &hop.pair("orbivisor_session").unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{me}");
     assert_eq!(
         (me["name"].as_str(), me["role"].as_str()),
@@ -299,7 +325,32 @@ async fn starting_fails_for_other_realms_and_unreachable_providers() {
 fn assert_failed_start(hop: &Hop, code: &str) {
     assert_eq!(hop.status, StatusCode::FOUND);
     assert_eq!(hop.location, format!("/login?error={code}"));
+    assert!(hop.cookie("orbivisor_oidc").is_none(), "{:?}", hop.cookies);
     assert!(hop.cookie("opl_oidc").is_none(), "{:?}", hop.cookies);
+}
+
+/// 계획 74: 옛 판 노드가 시작한 로그인(옛 이름 상태 쿠키 `opl_oidc`만)도 콜백이 받는다. 둘 다 있으면 새 이름을 읽는다.
+#[tokio::test]
+async fn the_callback_accepts_the_legacy_state_cookie() {
+    let (env, idp) = setup().await;
+    let (callback, cookie) = authorize(&env, &idp).await;
+    let legacy = cookie.replacen("orbivisor_oidc=", "opl_oidc=", 1);
+    let hop = open(&callback, Some(&legacy)).await;
+    assert_eq!(
+        (hop.status, hop.location.as_str()),
+        (StatusCode::FOUND, "/"),
+        "{:?}",
+        hop.cookies
+    );
+    assert_state_cleared(&hop);
+    let (status, me) = whoami(&env, &hop.pair("opl_session").unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+
+    // 새 이름이 틀렸으면 옛 이름이 맞아도 실패한다(새 이름 먼저).
+    let (callback, cookie) = authorize(&env, &idp).await;
+    let legacy = cookie.replacen("orbivisor_oidc=", "opl_oidc=", 1);
+    let hop = open(&callback, Some(&format!("orbivisor_oidc=x; {legacy}"))).await;
+    assert_failed(&hop, "sso_failed");
 }
 
 /// Host 헤더가 없거나 이상하면 `start`가 리디렉트 URI를 만들 수 없다. 콜백은 Host를 보지 않는다
@@ -383,7 +434,7 @@ async fn the_state_cookie_must_be_present_signed_fresh_and_match() {
             redirect_uri: format!("{}{CALLBACK}", env.base),
             created,
         };
-        format!("opl_oidc={}", state.seal(&state_key(key)))
+        format!("orbivisor_oidc={}", state.seal(&state_key(key)))
     };
     assert_failed(
         &open(&callback, Some(&forged("other", unix_now()))).await,
@@ -740,7 +791,13 @@ async fn callbacks_are_audited() {
     );
     assert!(!entries.iter().any(|e| e.action.contains("/start")));
     let text = serde_json::to_string(&entries).unwrap();
-    for secret in ["code=", "state=", "client-secret", "opl_oidc"] {
+    for secret in [
+        "code=",
+        "state=",
+        "client-secret",
+        "orbivisor_oidc",
+        "opl_oidc",
+    ] {
         assert!(!text.contains(secret), "{secret}: {text}");
     }
 }

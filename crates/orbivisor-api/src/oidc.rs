@@ -22,7 +22,9 @@ pub const STEP_DISCOVERY: &str = "discovery";
 pub const STEP_JWKS: &str = "jwks";
 
 /// 로그인 상태 쿠키 이름
-pub const STATE_COOKIE: &str = "opl_oidc";
+pub const STATE_COOKIE: &str = "orbivisor_oidc";
+/// 옛 로그인 상태 쿠키 이름. 계획 74: 한 릴리스 동안 옛 판 노드와 로그인 상태를 나눈다(다음 판에서 뺌).
+pub const LEGACY_STATE_COOKIE: &str = "opl_oidc";
 /// 로그인 상태 쿠키가 유효한 시간(초)
 pub const STATE_TTL_SECS: u64 = 600;
 /// ID 토큰의 `exp`·`iat`에 허용하는 시계 차(초)

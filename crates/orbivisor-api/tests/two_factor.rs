@@ -68,7 +68,7 @@ impl Browser {
         let resp = r.send().await.unwrap();
         if let Some(set) = resp.headers().get("set-cookie") {
             let c = set.to_str().unwrap().split(';').next().unwrap().to_string();
-            self.cookie = (c != "opl_session=").then_some(c);
+            self.cookie = (c != "orbivisor_session=").then_some(c);
         }
         let status = resp.status();
         let text = resp.text().await.unwrap();

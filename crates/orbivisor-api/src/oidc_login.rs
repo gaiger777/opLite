@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::Extension;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
-use axum::http::header::{COOKIE, HOST, LOCATION, SET_COOKIE};
+use axum::http::header::{HOST, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use orbivisor_types::audit::AuditAuth;
@@ -22,7 +22,9 @@ use utoipa::IntoParams;
 use crate::audit::AuditNote;
 use crate::auth::Principal;
 use crate::error::ApiError;
-use crate::oidc::{self, LoginState, OidcError, RealmKey, STATE_COOKIE, STATE_TTL_SECS};
+use crate::oidc::{
+    self, LEGACY_STATE_COOKIE, LoginState, OidcError, RealmKey, STATE_COOKIE, STATE_TTL_SECS,
+};
 use crate::proxy::ForwardedProto;
 use crate::state::AppState;
 
@@ -97,15 +99,18 @@ fn redirect(location: &str, cookies: impl IntoIterator<Item = HeaderValue>) -> R
     response
 }
 
-/// 로그인 상태 쿠키(값이 비고 `max_age`가 0이면 지우기)
-fn state_cookie(state: &AppState, value: &str, max_age: u64) -> HeaderValue {
-    let mut cookie = format!(
-        "{STATE_COOKIE}={value}; Path={STATE_COOKIE_PATH}; HttpOnly; SameSite=Lax; Max-Age={max_age}"
-    );
-    if state.secure_cookies {
-        cookie.push_str("; Secure");
-    }
-    HeaderValue::from_str(&cookie).expect("ASCII cookie")
+/// 로그인 상태 쿠키(값이 비고 `max_age`가 0이면 지우기). 새 이름과 옛 이름을 같은 값·속성으로 둘 다 쓴다
+/// (계획 74: 한 릴리스 동안 옛 판 노드와 나눈다, 다음 판에서 뺌).
+fn state_cookie(state: &AppState, value: &str, max_age: u64) -> [HeaderValue; 2] {
+    [STATE_COOKIE, LEGACY_STATE_COOKIE].map(|name| {
+        let mut cookie = format!(
+            "{name}={value}; Path={STATE_COOKIE_PATH}; HttpOnly; SameSite=Lax; Max-Age={max_age}"
+        );
+        if state.secure_cookies {
+            cookie.push_str("; Secure");
+        }
+        HeaderValue::from_str(&cookie).expect("ASCII cookie")
+    })
 }
 
 /// 이 요청이 온 주소의 콜백 URI. Host는 믿는 프록시가 알린 `X-Forwarded-Host`일 수 있다. scheme은 믿는
@@ -151,7 +156,7 @@ fn state_key(state: &AppState) -> Result<ring::hmac::Key, Failed> {
 }
 
 /// 영역의 IdP로 로그인을 시작한다. 로그인 상태(state·nonce·PKCE 검증자)를 서명한 쿠키
-/// `opl_oidc`(10분)에 넣고 IdP의 authorization endpoint로 보낸다. OIDC 영역이 아니면
+/// `orbivisor_oidc`(10분, 옛 이름 `opl_oidc`도)에 넣고 IdP의 authorization endpoint로 보낸다. OIDC 영역이 아니면
 /// `/login?error=sso_failed`, IdP의 discovery 문서를 읽지 못하면 `/login?error=realm_unavailable`로 보낸다.
 #[utoipa::path(get, path = "/auth/oidc/{realm}/start", tag = "auth", security(()),
     params(("realm" = String, Path, description = "OIDC realm name")),
@@ -170,7 +175,7 @@ pub async fn oidc_start(
     match begin(&state, &realm, &redirect_uri).await {
         Ok((location, cookie)) => Ok(redirect(
             &location,
-            [state_cookie(&state, &cookie, STATE_TTL_SECS)],
+            state_cookie(&state, &cookie, STATE_TTL_SECS),
         )),
         Err(f) => {
             tracing::warn!(realm, reason = %f.reason, "cannot start an OIDC login");
@@ -260,7 +265,10 @@ pub async fn oidc_callback(
             audit.detail(format!("realm={} username={username}", login.realm));
             // IdP에서 돌아온 탐색이라 출처가 없다.
             let session = crate::users::new_session(&state, &user, false).await?;
-            Ok(redirect("/", [session, state_cookie(&state, "", 0)]))
+            Ok(redirect(
+                "/",
+                session.into_iter().chain(state_cookie(&state, "", 0)),
+            ))
         }
         Err(f) => Ok(failure(&state, &audit, Some(&login.realm), f)),
     }
@@ -280,13 +288,10 @@ fn open_state(
     Ok((login, params))
 }
 
+/// 로그인 상태 쿠키의 값. 새 이름 먼저, 없으면 옛 이름(옛 판 노드가 시작한 로그인).
 fn state_cookie_value(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get_all(COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .find_map(|c| c.trim().strip_prefix(STATE_COOKIE)?.strip_prefix('='))
+    crate::auth::cookie_value(headers, STATE_COOKIE)
+        .or_else(|| crate::auth::cookie_value(headers, LEGACY_STATE_COOKIE))
 }
 
 /// 실패를 로그·감사 로그에 남기고 상태 쿠키를 지운 뒤 로그인 화면으로 보낸다.
@@ -296,7 +301,7 @@ fn failure(state: &AppState, audit: &AuditNote, realm: Option<&str>, f: Failed) 
     audit.detail(format!("realm={realm} error={}", f.code.as_str()));
     redirect(
         &format!("/login?error={}", f.code.as_str()),
-        [state_cookie(state, "", 0)],
+        state_cookie(state, "", 0),
     )
 }
 

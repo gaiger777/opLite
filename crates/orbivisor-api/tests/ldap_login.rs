@@ -63,7 +63,7 @@ async fn setup() -> (Env, FakeLdap) {
 struct Login {
     status: StatusCode,
     body: Value,
-    /// `opl_session=…`
+    /// `orbivisor_session=…`
     cookie: Option<String>,
 }
 

@@ -6,7 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::header::SET_COOKIE;
 use axum::http::request::Parts;
 use axum::http::{HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{AppendHeaders, IntoResponse, Response};
 use orbivisor_cluster::ClusterError;
 use orbivisor_cluster::types::Rejection;
 use orbivisor_types::audit::AuditAuth;
@@ -22,8 +22,8 @@ use uuid::Uuid;
 
 use crate::audit::AuditNote;
 use crate::auth::{
-    Action, Principal, SESSION_COOKIE, SESSION_TTL, dummy_hash, hash_password, new_token,
-    session_cookie, verify_password,
+    Action, LEGACY_SESSION_COOKIE, Principal, SESSION_COOKIE, SESSION_TTL, cookie_value,
+    dummy_hash, hash_password, new_token, session_cookie, verify_password,
 };
 use crate::cluster::require_feature;
 use crate::error::{ApiError, Json};
@@ -172,43 +172,48 @@ pub async fn login(
         None => (None, None),
     };
     let session = state.create_session(&user, pending).await?;
-    let cookie = session_set_cookie(&state, &session, SESSION_TTL.as_secs(), web_origin)?;
+    let cookies = session_set_cookie(&state, &session, SESSION_TTL.as_secs(), web_origin)?;
     let mut response = Json(LoginResponse {
         user: view(&state.cluster, user)?,
         second_factor,
     })
     .into_response();
-    response.headers_mut().insert(SET_COOKIE, cookie);
+    for cookie in cookies {
+        response.headers_mut().append(SET_COOKIE, cookie);
+    }
     Ok(response)
 }
 
-/// 사용자의 세션을 만들고 그 세션 쿠키(Set-Cookie 값)를 돌려준다. `web_origin`은 요청이 허용 출처에서
+/// 사용자의 세션을 만들고 그 세션 쿠키(Set-Cookie 값 둘)를 돌려준다. `web_origin`은 요청이 허용 출처에서
 /// 왔다는 뜻이다([`session_set_cookie`]).
 pub(crate) async fn new_session(
     state: &AppState,
     user: &User,
     web_origin: bool,
-) -> Result<HeaderValue, ApiError> {
+) -> Result<[HeaderValue; 2], ApiError> {
     let session = state.create_session(user, None).await?;
     session_set_cookie(state, &session, SESSION_TTL.as_secs(), web_origin)
 }
 
 /// 세션 쿠키(Set-Cookie 값). 허용 출처(다른 사이트일 수 있는 웹 포털)의 요청이면 그 출처가 보내는 요청에도
-/// 붙도록 `SameSite=None; Secure`, 아니면 `SameSite=Strict`다.
+/// 붙도록 `SameSite=None; Secure`, 아니면 `SameSite=Strict`다. 새 이름과 옛 이름을 같은 값·속성으로 둘 다
+/// 쓴다(계획 74: 한 릴리스 동안 옛 판 노드와 세션을 나눈다, 다음 판에서 뺌).
 fn session_set_cookie(
     state: &AppState,
     value: &str,
     max_age: u64,
     web_origin: bool,
-) -> Result<HeaderValue, ApiError> {
+) -> Result<[HeaderValue; 2], ApiError> {
     let same_site = if web_origin { "None" } else { "Strict" };
-    let mut cookie = format!(
-        "{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite={same_site}; Max-Age={max_age}"
-    );
-    if state.secure_cookies || web_origin {
-        cookie.push_str("; Secure");
-    }
-    HeaderValue::from_str(&cookie).map_err(ApiError::internal)
+    let one = |name: &str| {
+        let mut cookie =
+            format!("{name}={value}; Path=/; HttpOnly; SameSite={same_site}; Max-Age={max_age}");
+        if state.secure_cookies || web_origin {
+            cookie.push_str("; Secure");
+        }
+        HeaderValue::from_str(&cookie).map_err(ApiError::internal)
+    };
+    Ok([one(SESSION_COOKIE)?, one(LEGACY_SESSION_COOKIE)?])
 }
 
 /// 로컬 사용자의 비밀번호를 확인한다.
@@ -451,9 +456,20 @@ pub async fn logout(
         if let Err(e) = state.end_session(id, ip).await {
             return e.into_response();
         }
+        // 옛 이름 쿠키가 다른 세션(옛 판 노드에서 따로 로그인한 것)이면 그것도 끝낸다(계획 74, 다음 판에서 뺌).
+        if let Some(legacy) = cookie_value(&parts.headers, LEGACY_SESSION_COOKIE)
+            && legacy != id
+            && let Err(e) = state.end_session(legacy, ip).await
+        {
+            return e.into_response();
+        }
     }
     match session_set_cookie(&state, "", 0, web_origin) {
-        Ok(cookie) => (StatusCode::NO_CONTENT, [(SET_COOKIE, cookie)]).into_response(),
+        Ok([new, legacy]) => (
+            StatusCode::NO_CONTENT,
+            AppendHeaders([(SET_COOKIE, new), (SET_COOKIE, legacy)]),
+        )
+            .into_response(),
         Err(e) => e.into_response(),
     }
 }

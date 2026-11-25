@@ -48,7 +48,7 @@ async fn ctl_code(d: &Daemon, args: &[&str]) -> (u8, String) {
     (code, String::from_utf8(out).unwrap())
 }
 
-/// 웹처럼 로그인 세션(쿠키 `opl_session`)으로 VM 하나의 spec을 바꾼다 — `oplctl login`은 API 토큰이라 출처가 `api`다.
+/// 웹처럼 로그인 세션(쿠키 `orbivisor_session`)으로 VM 하나의 spec을 바꾼다 — `oplctl login`은 API 토큰이라 출처가 `api`다.
 /// 클라이언트 머리(`Orbivisor-Client`)가 없는 세션 요청은 출처 `web`으로 기록된다.
 async fn web_edit_vm(d: &Daemon, password: &str, vm: &str, edit: impl FnOnce(&mut Value)) {
     let http = reqwest::Client::builder()

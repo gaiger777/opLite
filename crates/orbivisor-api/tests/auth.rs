@@ -51,9 +51,16 @@ async fn login_checks_password_and_session_cookie_works() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let set_cookie = resp.headers()["set-cookie"].to_str().unwrap().to_string();
-    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
-    let cookie = set_cookie.split(';').next().unwrap().to_string();
+    // 새 이름과 옛 이름(옛 판 노드가 읽는다)을 같은 값·속성으로 둘 다 쓴다.
+    let set: Vec<String> = set_cookies(&resp);
+    assert_eq!(set.len(), 2, "{set:?}");
+    assert!(set[0].starts_with("orbivisor_session="), "{set:?}");
+    assert!(set[0].contains("HttpOnly"), "{set:?}");
+    assert_eq!(
+        set[1],
+        set[0].replacen("orbivisor_session=", "opl_session=", 1)
+    );
+    let cookie = set[0].split(';').next().unwrap().to_string();
     let who: serde_json::Value = http
         .get(url("/auth/whoami"))
         .header("cookie", &cookie)
@@ -82,10 +89,15 @@ async fn login_checks_password_and_session_cookie_works() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    // 브라우저의 쿠키도 지운다.
-    let cleared = resp.headers()["set-cookie"].to_str().unwrap();
-    assert!(cleared.starts_with("opl_session=;"), "{cleared}");
-    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    // 브라우저의 쿠키도 지운다(두 이름 다).
+    let cleared = set_cookies(&resp);
+    assert_eq!(cleared.len(), 2, "{cleared:?}");
+    assert!(cleared[0].starts_with("orbivisor_session=;"), "{cleared:?}");
+    assert!(cleared[1].starts_with("opl_session=;"), "{cleared:?}");
+    assert!(
+        cleared.iter().all(|c| c.contains("Max-Age=0")),
+        "{cleared:?}"
+    );
     let resp = http
         .get(url("/auth/whoami"))
         .header("cookie", &cookie)
@@ -93,6 +105,78 @@ async fn login_checks_password_and_session_cookie_works() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// 응답의 `Set-Cookie` 줄들(차례대로)
+fn set_cookies(resp: &reqwest::Response) -> Vec<String> {
+    resp.headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+/// 계획 74: 한 릴리스 동안 옛 이름 쿠키(`opl_session`)도 받는다 — VIP 뒤에서 한 브라우저가 옛 판 노드와 새 판
+/// 노드를 번갈아 만난다.
+#[tokio::test]
+async fn legacy_session_cookie_name_is_accepted() {
+    let env = Env::start().await;
+    let base = format!("{}/api/v1", env.base);
+    let new = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let value = cookie_value(&new).to_string();
+    // 옛 판 노드가 만든 세션(옛 이름만)
+    let legacy = format!("opl_session={value}");
+    assert_eq!(
+        whoami_with_cookie(&env.base, &legacy).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(whoami_with_cookie(&env.base, &new).await.0, StatusCode::OK);
+    // 둘 다 있으면 새 이름을 읽는다.
+    let both = format!("opl_session={:064x}; {new}", 1);
+    assert_eq!(whoami_with_cookie(&env.base, &both).await.0, StatusCode::OK);
+    let both = format!("orbivisor_session={:064x}; {legacy}", 1);
+    assert_eq!(
+        whoami_with_cookie(&env.base, &both).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 옛 이름만 든 로그아웃도 세션을 끝내고 두 이름을 다 지운다.
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/auth/logout"))
+        .header("cookie", &legacy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let cleared = set_cookies(&resp);
+    assert_eq!(cleared.len(), 2, "{cleared:?}");
+    assert!(cleared[0].starts_with("orbivisor_session=;"), "{cleared:?}");
+    assert!(cleared[1].starts_with("opl_session=;"), "{cleared:?}");
+    assert!(
+        cleared.iter().all(|c| c.contains("Max-Age=0")),
+        "{cleared:?}"
+    );
+    assert_eq!(
+        whoami_with_cookie(&env.base, &new).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+
+    // 두 이름이 다른 세션이면(옛 판 노드에서 따로 로그인) 로그아웃이 둘 다 끝낸다.
+    let first = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let second = cookie_login(&env.base, "admin", ADMIN_PASSWORD).await;
+    let old = format!("opl_session={}", cookie_value(&second));
+    assert_eq!(
+        logout_at(&env.base, &format!("{first}; {old}")).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        whoami_with_cookie(&env.base, &first).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        whoami_with_cookie(&env.base, &second).await.0,
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[tokio::test]
@@ -444,7 +528,7 @@ async fn serve_another_node(env: &Env) -> String {
     base
 }
 
-/// `base`에 로그인해 세션 쿠키(`opl_session=...`)를 돌려준다.
+/// `base`에 로그인해 세션 쿠키(`orbivisor_session=...`)를 돌려준다.
 async fn cookie_login(base: &str, user: &str, password: &str) -> String {
     let resp = reqwest::Client::new()
         .post(format!("{base}/api/v1/auth/login"))
@@ -526,9 +610,9 @@ fn sessions(env: &Env) -> Vec<Session> {
     env.cluster.list::<SessionSpec>().unwrap().1
 }
 
-/// 쿠키 `opl_session=<값>`의 값
+/// 쿠키 `orbivisor_session=<값>`의 값
 fn cookie_value(cookie: &str) -> &str {
-    cookie.strip_prefix("opl_session=").unwrap()
+    cookie.strip_prefix("orbivisor_session=").unwrap()
 }
 
 async fn logout_at(base: &str, cookie: &str) -> StatusCode {
@@ -776,7 +860,7 @@ async fn logging_out_on_another_node_ends_a_node_local_session() {
 async fn logout_marks_from_one_address_are_limited() {
     let env = Env::start().await;
     for i in 0..30u32 {
-        let cookie = format!("opl_session={i:064x}");
+        let cookie = format!("orbivisor_session={i:064x}");
         assert_eq!(logout_at(&env.base, &cookie).await, StatusCode::NO_CONTENT);
     }
     assert_eq!(

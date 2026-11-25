@@ -571,7 +571,7 @@ export interface paths {
         };
         /**
          * 영역의 IdP로 로그인을 시작한다. 로그인 상태(state·nonce·PKCE 검증자)를 서명한 쿠키
-         *     `opl_oidc`(10분)에 넣고 IdP의 authorization endpoint로 보낸다. OIDC 영역이 아니면
+         *     `orbivisor_oidc`(10분, 옛 이름 `opl_oidc`도)에 넣고 IdP의 authorization endpoint로 보낸다. OIDC 영역이 아니면
          *     `/login?error=sso_failed`, IdP의 discovery 문서를 읽지 못하면 `/login?error=realm_unavailable`로 보낸다.
          */
         get: operations["oidc_start"];

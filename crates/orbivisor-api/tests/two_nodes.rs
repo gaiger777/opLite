@@ -2813,7 +2813,7 @@ async fn an_oidc_login_started_on_one_node_finishes_on_the_other() {
         .get_all("set-cookie")
         .iter()
         .map(|v| v.to_str().unwrap())
-        .find(|c| c.starts_with("opl_session="))
+        .find(|c| c.starts_with("orbivisor_session="))
         .unwrap()
         .split(';')
         .next()
