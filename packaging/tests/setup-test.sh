@@ -1,23 +1,23 @@
 #!/bin/bash
 # 설치 ISO의 orbivisor-setup.sh 함수(interfaces 바꾸기, 주소 찾기, opld.toml·issue 쓰기, 설치 환경·대상
 # 두 곳의 interfaces)를 견본과 비교한다. bash만 있으면 되고 macOS에서도 돈다.
-# 함수는 셸 OPL_SH(기본 sh)로 source해 부른다. 설치 프로그램 환경과 같게 보려면(CI):
-#   OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
+# 함수는 셸 ORBIVISOR_SH(기본 sh)로 source해 부른다. 설치 프로그램 환경과 같게 보려면(CI):
+#   ORBIVISOR_SH="busybox sh" ORBIVISOR_AWK="busybox awk" bash packaging/tests/setup-test.sh
 # 쓰는 법: bash packaging/tests/setup-test.sh
 set -eu
 
 TESTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 FIXTURES="$TESTS_DIR/fixtures"
 SETUP="$TESTS_DIR/../iso/preseed/orbivisor-setup.sh"
-read -r -a SH <<<"${OPL_SH:-sh}"
+read -r -a SH <<<"${ORBIVISOR_SH:-sh}"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# OPL_AWK가 있으면 함수의 awk가 그것을 쓰게 PATH 앞에 awk를 둔다.
-if [ -n "${OPL_AWK:-}" ]; then
+# ORBIVISOR_AWK가 있으면 함수의 awk가 그것을 쓰게 PATH 앞에 awk를 둔다.
+if [ -n "${ORBIVISOR_AWK:-}" ]; then
 	mkdir -p "$WORK/bin"
-	printf '#!/bin/sh\nexec %s "$@"\n' "$OPL_AWK" >"$WORK/bin/awk"
+	printf '#!/bin/sh\nexec %s "$@"\n' "$ORBIVISOR_AWK" >"$WORK/bin/awk"
 	chmod 0755 "$WORK/bin/awk"
 	PATH="$WORK/bin:$PATH"
 fi
@@ -25,7 +25,7 @@ fi
 # lib <함수> [인자...]: orbivisor-setup.sh를 함수만 정의하게 source하고 그 함수를 부른다.
 lib() {
 	# shellcheck disable=SC2016 # $0·$@는 안쪽 셸이 푼다.
-	OPL_SETUP_LIB=1 "${SH[@]}" -c '. "$0"; "$@"' "$SETUP" "$@"
+	ORBIVISOR_SETUP_LIB=1 "${SH[@]}" -c '. "$0"; "$@"' "$SETUP" "$@"
 }
 
 # 함수 라이브러리를 그 셸로 읽을 수 있어야 한다.
@@ -119,7 +119,7 @@ check_network() {
 	[ "$inst_in" = - ] || cp "$inst_in" "$inst/etc/network/interfaces"
 	[ "$target_in" = - ] || cp "$target_in" "$target/etc/network/interfaces"
 	# shellcheck disable=SC2016 # $TARGET·$NIC는 안쪽 셸이 푼다.
-	got_nic=$(OPL_INSTALLER_ROOT="$inst" TARGET="$target" lib eval 'setup_network "$TARGET" >/dev/null; echo "$NIC"')
+	got_nic=$(ORBIVISOR_INSTALLER_ROOT="$inst" TARGET="$target" lib eval 'setup_network "$TARGET" >/dev/null; echo "$NIC"')
 	if [ "$got_nic" = "$want_nic" ]; then ok "setup_network $name NIC '$got_nic'"; else
 		fail "setup_network $name NIC '$got_nic' (기대 '$want_nic')"
 	fi
@@ -138,10 +138,10 @@ check_network "설치 환경 없음: 대상 원본" - "$FIXTURES/interfaces-dhcp
 # 노드 이름: 설치 환경(없으면 대상)의 호스트 이름을 소문자로
 mkdir -p "$WORK/name/installer/etc" "$WORK/name/target/etc"
 echo OPL-Node1 >"$WORK/name/target/etc/hostname"
-got=$(OPL_INSTALLER_ROOT="$WORK/name/installer" lib node_name "$WORK/name/target")
+got=$(ORBIVISOR_INSTALLER_ROOT="$WORK/name/installer" lib node_name "$WORK/name/target")
 if [ "$got" = opl-node1 ]; then ok "node_name 대상"; else fail "node_name 대상: '$got'"; fi
 echo Opl-CI >"$WORK/name/installer/etc/hostname"
-got=$(OPL_INSTALLER_ROOT="$WORK/name/installer" lib node_name "$WORK/name/target")
+got=$(ORBIVISOR_INSTALLER_ROOT="$WORK/name/installer" lib node_name "$WORK/name/target")
 if [ "$got" = opl-ci ]; then ok "node_name 설치 환경"; else fail "node_name 설치 환경: '$got'"; fi
 
 # 설치 환경의 busybox tr은 문자 집합([:upper:])을 모른다. 스크립트가 그런 tr을 쓰지 않는지 본다.
@@ -151,7 +151,7 @@ if grep -n "tr '\[:" "$SETUP" >/dev/null; then fail "orbivisor-setup.sh가 tr �
 mkdir -p "$WORK/steps"
 code=0
 # shellcheck disable=SC2016 # $?는 안쪽 셸이 푼다.
-OPL_CONSOLE="$WORK/steps/console" TMPDIR="$WORK/steps" \
+ORBIVISOR_CONSOLE="$WORK/steps/console" TMPDIR="$WORK/steps" \
 	lib eval 'trap "on_exit \$?" EXIT; step one true; step two sh -c "seq 1 40; exit 3"; step three true' \
 	>"$WORK/steps/log" 2>&1 || code=$?
 {
@@ -169,7 +169,7 @@ else
 fi
 # 콘솔에 쓰지 못해도(없는 디렉터리) 단계는 이어진다.
 code=0
-OPL_CONSOLE="$WORK/none/console" TMPDIR="$WORK/steps" lib eval 'step one true' >/dev/null 2>&1 || code=$?
+ORBIVISOR_CONSOLE="$WORK/none/console" TMPDIR="$WORK/steps" lib eval 'step one true' >/dev/null 2>&1 || code=$?
 if [ "$code" -eq 0 ]; then ok "step 콘솔 쓰기 실패 무시"; else fail "step 콘솔 쓰기 실패 무시: 종료 코드 $code"; fi
 
 # install_package: CD의 패키지를 대상에 복사하고 in-target으로 apt-get을 무인(질문 없이, stdin 없음)으로 부른다.
@@ -188,7 +188,7 @@ install_with() {
 	: >"$WORK/pkg/log"
 	code=0
 	PATH="$WORK/pkg/bin:$PATH" FAKE_LOG="$WORK/pkg/log" FAKE_TARGET="$WORK/pkg/target" FAKE_CODE=$1 \
-		OPL_CDROM="$WORK/pkg/cdrom" lib install_package "$WORK/pkg/target" >/dev/null 2>&1 || code=$?
+		ORBIVISOR_CDROM="$WORK/pkg/cdrom" lib install_package "$WORK/pkg/target" >/dev/null 2>&1 || code=$?
 }
 cat >"$WORK/pkg/want" <<'EOF'
 --pass-stdout sh -c DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold install ifupdown2 isc-dhcp-client /var/cache/orbivisor/orbivisor_0.1.0_amd64.deb </dev/null 2>&1
@@ -219,15 +219,15 @@ echo "2: ens3    inet 10.0.2.15/24 brd 10.0.2.255 scope global dynamic ens3"
 EOF
 chmod 0755 "$WORK/pkg/bin/ip"
 code=0
-PATH="$WORK/pkg/bin:$PATH" FAKE_LOG="$M/in-target.log" FAKE_TARGET="$M/target" OPL_CDROM="$M/cdrom" \
-	OPL_INSTALLER_ROOT="$M/installer" OPL_CONSOLE="$M/console" TMPDIR="$M" \
+PATH="$WORK/pkg/bin:$PATH" FAKE_LOG="$M/in-target.log" FAKE_TARGET="$M/target" ORBIVISOR_CDROM="$M/cdrom" \
+	ORBIVISOR_INSTALLER_ROOT="$M/installer" ORBIVISOR_CONSOLE="$M/console" TMPDIR="$M" \
 	"${SH[@]}" "$SETUP" "$M/target" || code=$?
 printf 'orbivisor-setup: %s\n' "start install-package" "done install-package" "start network" "done network" \
 	"start config" "done config" "start ci-init" "done ci-init" >"$M/console-want"
 if [ "$code" -eq 0 ]; then ok "main"; else fail "main: 종료 코드 $code"; fi
 same "main 콘솔" "$M/console-want" "$M/console"
 same "main interfaces" "$FIXTURES/interfaces-dhcp.out" "$M/target/etc/network/interfaces"
-same "main opld.toml" "$FIXTURES/opld-dhcp.toml" "$M/target/etc/opl/opld.toml"
+same "main orbivisord.toml" "$FIXTURES/opld-dhcp.toml" "$M/target/etc/orbivisor/orbivisord.toml"
 if [ -f "$M/target/etc/issue.d/orbivisor.issue" ] && [ -f "$M/target/etc/systemd/system/orbivisor-ci-init.service" ] &&
 	grep -qx 'systemctl enable orbivisor-ci-init.service' "$M/in-target.log" && [ -s "$M/target/root/orbivisor-setup.log" ]; then
 	ok "main issue·ci-init·로그"

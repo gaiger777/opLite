@@ -2,19 +2,19 @@
 # 설치 ISO의 preseed/late_command가 설치 프로그램 환경(busybox sh)에서 돌린다.
 #   sh /cdrom/preseed/orbivisor-setup.sh /target
 # orbivisor 패키지(와 ifupdown2, isc-dhcp-client)를 설치하고, 기본 경로 인터페이스를 브리지 vmbr0으로 옮기고,
-# /etc/opl/opld.toml과 콘솔 로그인 안내(/etc/issue.d/orbivisor.issue)를 쓴다. 로그: <target>/root/orbivisor-setup.log
+# /etc/orbivisor/orbivisord.toml과 콘솔 로그인 안내(/etc/issue.d/orbivisor.issue)를 쓴다. 로그: <target>/root/orbivisor-setup.log
 # 단계마다 시작·끝(실패면 출력 끝 30줄)을 설치 환경의 콘솔(무인 설치에서는 직렬)에도 "orbivisor-setup: "로 쓴다.
-# OPL_SETUP_LIB=1로 source하면 함수만 정의한다(packaging/tests/setup-test.sh).
+# ORBIVISOR_SETUP_LIB=1로 source하면 함수만 정의한다(packaging/tests/setup-test.sh).
 set -eu
 
-CDROM=${OPL_CDROM:-/cdrom}
+CDROM=${ORBIVISOR_CDROM:-/cdrom}
 # 단계 시작·끝을 쓰는 콘솔과 단계 출력을 잠시 두는 파일. 시험이 바꾼다.
-CONSOLE=${OPL_CONSOLE:-/dev/console}
+CONSOLE=${ORBIVISOR_CONSOLE:-/dev/console}
 STEP_OUT="${TMPDIR:-/tmp}/orbivisor-setup.step"
 STEP_NAME=""
 # 설치 프로그램 환경의 루트. late_command(finish-install 07preseed)는 netcfg가 interfaces·hostname을
 # /target으로 복사하는 단계(55netcfg-copy-config)보다 먼저 돌므로 원본은 이쪽에 있다. 시험이 바꾼다.
-INSTALLER_ROOT=${OPL_INSTALLER_ROOT:-}
+INSTALLER_ROOT=${ORBIVISOR_INSTALLER_ROOT:-}
 
 # default_nic <interfaces>: 기본 경로 인터페이스(inet dhcp 또는 gateway가 있는 inet 블록, lo 빼고 첫 번째).
 # 그런 블록이 없으면 lo가 아닌 첫 inet static 블록(게이트웨이 없는 고정 주소).
@@ -118,7 +118,7 @@ valid_name() {
 # name이 규칙에 맞지 않거나 address가 비면 그 줄을 주석으로 둔다(opld는 설정 오류로 멈춘다).
 write_opld_toml() {
 	{
-		echo '# Written by the Orbivisor installer. Example with all settings: /usr/share/orbivisor/opld.toml.example'
+		echo '# Written by the Orbivisor installer. Example with all settings: /usr/share/orbivisor/orbivisord.toml.example'
 		echo '# The address cannot change once this node is in a cluster (it is in the node certificate). Reserve the DHCP address or use a static one; before cluster init/join you may still edit it.'
 		if valid_name "$2"; then
 			echo "name = \"$2\""
@@ -251,10 +251,10 @@ node_name() {
 	head -n1 "$f" | tr ABCDEFGHIJKLMNOPQRSTUVWXYZ abcdefghijklmnopqrstuvwxyz
 }
 
-# write_config <target>: /etc/opl/opld.toml. 정적이면 그 주소, DHCP면 지금 받은 주소
+# write_config <target>: /etc/orbivisor/orbivisord.toml. 정적이면 그 주소, DHCP면 지금 받은 주소
 write_config() {
 	name=$(node_name "$1")
-	valid_name "$name" || log "호스트 이름 '$name'이 노드 이름 규칙에 맞지 않아 /etc/opl/opld.toml의 name을 주석으로 둔다"
+	valid_name "$name" || log "호스트 이름 '$name'이 노드 이름 규칙에 맞지 않아 /etc/orbivisor/orbivisord.toml의 name을 주석으로 둔다"
 	address=""
 	if [ -n "$NIC" ]; then
 		address=$(primary_address "$1/etc/network/interfaces")
@@ -264,11 +264,11 @@ write_config() {
 		address=$(current_address "$NIC" || true)
 		dhcp=dhcp
 	fi
-	[ -n "$address" ] || log "주소를 찾지 못해 /etc/opl/opld.toml의 address를 주석으로 둔다. 고친 뒤 opld를 다시 시작한다"
-	mkdir -p "$1/etc/opl"
-	write_opld_toml "$1/etc/opl/opld.toml" "$name" "$address" "$dhcp"
-	log "/etc/opl/opld.toml:"
-	cat "$1/etc/opl/opld.toml"
+	[ -n "$address" ] || log "주소를 찾지 못해 /etc/orbivisor/orbivisord.toml의 address를 주석으로 둔다. 고친 뒤 orbivisord를 다시 시작한다"
+	mkdir -p "$1/etc/orbivisor"
+	write_opld_toml "$1/etc/orbivisor/orbivisord.toml" "$name" "$address" "$dhcp"
+	log "/etc/orbivisor/orbivisord.toml:"
+	cat "$1/etc/orbivisor/orbivisord.toml"
 
 	mkdir -p "$1/etc/issue.d"
 	write_issue "$1/etc/issue.d/orbivisor.issue"
@@ -299,7 +299,7 @@ main() {
 	log "끝"
 }
 
-if [ "${OPL_SETUP_LIB:-}" = 1 ]; then
+if [ "${ORBIVISOR_SETUP_LIB:-}" = 1 ]; then
 	return 0
 fi
 main "$@"

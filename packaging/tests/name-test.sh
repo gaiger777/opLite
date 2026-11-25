@@ -47,7 +47,7 @@ RULES=(
 	'packaging/tests/build-deb-test.sh|usr/share/(doc/)?oplite|tree-oplite|Replaces oplite\)'
 	'packaging/tests/repo-test.sh|usr/share/(doc/)?oplite|"oplite\(:amd64\)\?: |\$4 == "oplite(:amd64)?"'
 	'packaging/tests/deb-test.sh|oplite\.\$script'
-	'packaging/tests/maint-test.sh|OPL_FAKE_OPLITE_CONFIG|mirror\.lan/oplite|-f \$\{Config-Version\} oplite'
+	'packaging/tests/maint-test.sh|ORBIVISOR_FAKE_OPLITE_CONFIG|mirror\.lan/oplite|-f \$\{Config-Version\} oplite'
 	'.github/workflows/ci.yml|\(oplite\)'
 	'.github/actions/build-deb/action.yml|transitional oplite package'
 	# docs/guide/getting-started.md의 "이름 바꾸기" 절이 보이는 옛 이름과 그대로 둔 저장소 주소 예

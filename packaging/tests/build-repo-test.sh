@@ -73,7 +73,7 @@ run() {
 	code=0
 	: >"$WORK/calls"
 	FAKE_LOG="$WORK/calls" APT_FTPARCHIVE="$WORK/fakebin/apt-ftparchive" GPG="$WORK/fakebin/gpg" \
-		OPL_REPO_GPG_KEY_ID=${KEY-ABCD1234} \
+		ORBIVISOR_REPO_GPG_KEY_ID=${KEY-ABCD1234} \
 		sh "$REPO_SCRIPT" "$@" >"$WORK/stdout" 2>"$WORK/stderr" || code=$?
 }
 
@@ -94,10 +94,10 @@ grep -q 'stable|testing|enterprise' "$WORK/stderr" || fail "채널 거절 문구
 run "$R" stable "$WORK/missing.deb"
 expect_usage "없는 deb는 거절"
 KEY='' run "$R" stable "$WORK/orbivisor_1.0_amd64.deb"
-if [ "$code" -eq 1 ] && [ ! -e "$R" ] && grep -q OPL_REPO_GPG_KEY_ID "$WORK/stderr"; then
-	ok "OPL_REPO_GPG_KEY_ID가 없으면 실패"
+if [ "$code" -eq 1 ] && [ ! -e "$R" ] && grep -q ORBIVISOR_REPO_GPG_KEY_ID "$WORK/stderr"; then
+	ok "ORBIVISOR_REPO_GPG_KEY_ID가 없으면 실패"
 else
-	fail "OPL_REPO_GPG_KEY_ID 없음: 종료 코드 $code"
+	fail "ORBIVISOR_REPO_GPG_KEY_ID 없음: 종료 코드 $code"
 fi
 
 # 첫 채널 stable

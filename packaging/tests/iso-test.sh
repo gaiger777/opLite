@@ -10,7 +10,7 @@ ISO_FIXTURES="$(cd "$(dirname "$0")/fixtures/iso" && pwd)"
 
 # 함수만 정의한다(ISO는 만들지 않는다). trap보다 먼저 해서 source 실패가 종료 코드로 남게 한다.
 # shellcheck source=packaging/iso/build-iso.sh
-OPL_ISO_LIB=1 . "$ISO_DIR/build-iso.sh"
+ORBIVISOR_ISO_LIB=1 . "$ISO_DIR/build-iso.sh"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

@@ -4,7 +4,7 @@
 #   --unattended: 시험 전용. 묻는 값을 모두 정한 preseed(unattended.cfg)와 첫 부팅 cluster init 유닛을 넣고,
 #                 BIOS는 메뉴 없이(vesamenu 없이 직렬 콘솔로) 바로, UEFI는 메뉴를 1초 뒤에 고르고 직렬 콘솔(ttyS0)을 쓴다.
 # netinst는 debian.lock의 SHA-256과 같아야 한다. Linux에서 xorriso가 필요하다.
-# OPL_ISO_LIB=1로 source하면 함수만 정의한다(packaging/tests/iso-test.sh).
+# ORBIVISOR_ISO_LIB=1로 source하면 함수만 정의한다(packaging/tests/iso-test.sh).
 set -euo pipefail
 
 ISO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -273,7 +273,7 @@ main() {
 	echo "$OUT"
 }
 
-if [ "${OPL_ISO_LIB:-}" = 1 ]; then
+if [ "${ORBIVISOR_ISO_LIB:-}" = 1 ]; then
 	return 0
 fi
 main "$@"

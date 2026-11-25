@@ -1,14 +1,14 @@
 #!/bin/sh
 # Orbivisor APT 저장소의 한 채널에 패키지를 더하고 색인을 다시 만들어 서명한다.
 # 한 판의 orbivisor와 전환 패키지 oplite는 같은 채널에 함께 넘긴다.
-# 쓰는 법: OPL_REPO_GPG_KEY_ID=<키> packaging/repo/build-repo.sh <repo dir> <channel> <deb…>
+# 쓰는 법: ORBIVISOR_REPO_GPG_KEY_ID=<키> packaging/repo/build-repo.sh <repo dir> <channel> <deb…>
 # 채널은 stable|testing|enterprise. 레이아웃:
 #   pool/<channel>/*.deb
 #   dists/trixie/<channel>/binary-amd64/Packages(.gz)
 #   dists/trixie/Release, InRelease, Release.gpg  (Release는 있는 모든 채널을 묶는다)
 # 그 채널의 Packages만 다시 만들고 다른 채널의 Packages는 그대로 둔다. pool의 옛 패키지는 지우지 않는다.
 # 이미 올린 이름에 내용이 다른 deb는 거절한다. 색인은 두 서명이 다 끝난 뒤에 바꾼다(InRelease가 마지막).
-# 서명 키는 OPL_REPO_GPG_KEY_ID(필수), GPG 홈은 호출하는 쪽(GNUPGHOME). 도구 경로는 APT_FTPARCHIVE·GPG로 바꾼다.
+# 서명 키는 ORBIVISOR_REPO_GPG_KEY_ID(필수), GPG 홈은 호출하는 쪽(GNUPGHOME). 도구 경로는 APT_FTPARCHIVE·GPG로 바꾼다.
 set -eu
 umask 022
 
@@ -39,9 +39,9 @@ for deb; do
 		usage
 	fi
 done
-KEY=${OPL_REPO_GPG_KEY_ID:-}
+KEY=${ORBIVISOR_REPO_GPG_KEY_ID:-}
 if [ -z "$KEY" ]; then
-	echo "build-repo: OPL_REPO_GPG_KEY_ID(서명 키)가 필요하다" >&2
+	echo "build-repo: ORBIVISOR_REPO_GPG_KEY_ID(서명 키)가 필요하다" >&2
 	exit 1
 fi
 APT_FTPARCHIVE=${APT_FTPARCHIVE:-apt-ftparchive}

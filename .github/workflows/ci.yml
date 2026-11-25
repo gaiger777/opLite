@@ -129,7 +129,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y busybox
-          OPL_SH="busybox sh" OPL_AWK="busybox awk" bash packaging/tests/setup-test.sh
+          ORBIVISOR_SH="busybox sh" ORBIVISOR_AWK="busybox awk" bash packaging/tests/setup-test.sh
       - run: bash packaging/tests/iso-test.sh
       # 파일 복원 도우미 이미지 빌더(계획 69): 가짜 deb으로 잠금 파일·해시·라이브러리·모듈 차례·initramfs·재현
       - name: restore-image-test
@@ -147,16 +147,16 @@ jobs:
       - uses: ./.github/actions/build-deb
         id: build
       # 파일 복원 도우미 이미지(계획 69): 에이전트를 정적 musl로(rust-lld) 빌드하고 debian.lock의 Debian 13 deb으로 x86_64
-      # 이미지를 만든 뒤, build-deb.sh를 OPL_RESTORE_IMAGE_DIR와 다시 돌려 셋째 꾸러미 orbivisor-restore-image를 만든다.
+      # 이미지를 만든 뒤, build-deb.sh를 ORBIVISOR_RESTORE_IMAGE_DIR와 다시 돌려 셋째 꾸러미 orbivisor-restore-image를 만든다.
       - name: File restore helper image
         id: image
         env:
-          OPL_DEV_LICENSE: "1"
+          ORBIVISOR_DEV_LICENSE: "1"
         run: |
           sudo apt-get install -y libarchive-tools zstd
           rustup target add x86_64-unknown-linux-musl
           packaging/restore-image/build.sh --arch x86_64 --version "$ORBIVISOR_VERSION" --out dist/restore-image/x86_64
-          OPL_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 packaging/deb/build-deb.sh "$ORBIVISOR_VERSION" dist
+          ORBIVISOR_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 packaging/deb/build-deb.sh "$ORBIVISOR_VERSION" dist
           echo "deb=dist/orbivisor-restore-image_${ORBIVISOR_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"
       - name: Package info and contents
         env:

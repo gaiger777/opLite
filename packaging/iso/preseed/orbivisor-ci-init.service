@@ -2,17 +2,17 @@
 # CA 지문)을 직렬 콘솔에 쓴다. ISO E2E가 직렬 로그에서 읽는다.
 [Unit]
 Description=Orbivisor CI first-boot cluster init
-After=opld.service
-Requires=opld.service
+After=orbivisord.service
+Requires=orbivisord.service
 ConditionPathExists=!/var/lib/orbivisor-ci-init.done
 
 [Service]
 Type=oneshot
 # 실패를 진단할 수 있게 설치 때의 orbivisor-setup.sh 로그를 먼저 직렬 콘솔에 찍는다.
 ExecStartPre=-/bin/cat /root/orbivisor-setup.log
-# 제어 소켓은 opld의 기본 run_dir(/run/opl)에 있다(oplctl --socket 기본값과 같다).
+# 제어 소켓은 orbivisord의 기본 run_dir(/run/orbivisor)에 있다(orbivisorctl --socket 기본값과 같다).
 # 완료 표시는 init이 성공했을 때만 남긴다. $$는 systemd가 $로 바꾼다.
-ExecStart=/bin/sh -c 'for i in $$(seq 1 60); do [ -S /run/opl/opld.sock ] && break; sleep 2; done; [ -S /run/opl/opld.sock ] && orbivisorctl cluster init --name ci && touch /var/lib/orbivisor-ci-init.done'
+ExecStart=/bin/sh -c 'for i in $$(seq 1 60); do [ -S /run/orbivisor/orbivisord.sock ] && break; sleep 2; done; [ -S /run/orbivisor/orbivisord.sock ] && orbivisorctl cluster init --name ci && touch /var/lib/orbivisor-ci-init.done'
 StandardOutput=tty
 TTYPath=/dev/ttyS0
 

@@ -1,18 +1,22 @@
 #!/bin/sh
-# orbivisor postinst. opld.service가 enable돼 있으면 다시 시작하고(업그레이드, 옛 oplite에서 넘어옴,
+# orbivisor postinst. orbivisord.service가 enable돼 있으면 다시 시작하고(업그레이드, 옛 oplite에서 넘어옴,
 # 재설정 — abort-remove 등 포함), 아니고 처음 설치면 켜고 시작한다(debhelper와 같다).
 # oplite에서 넘어올 때 orbivisor는 처음 설치($2 빔)지만 유닛은 이미 enable돼 돌고 있어 다시 시작해야
 # 새 바이너리가 돈다. 그래서 처음 설치인지보다 enable돼 있는지를 먼저 본다.
-# oplite가 전에 설정된 적이 있으면($2가 비어도) 처음 설치가 아니다: 관리자가 꺼 둔(disable) opld는
+# oplite가 전에 설정된 적이 있으면($2가 비어도) 처음 설치가 아니다: 관리자가 꺼 둔(disable) 데몬은
 # 넘어간 뒤에도 켜지 않는다.
-# systemd가 돌지 않으면(컨테이너, 설치 프로그램의 chroot) 처음 설치이고 enable 링크가 없을 때 enable(링크
-# 만들기)만 한다.
+# 이름 바꾸기(계획 74): 유닛의 실제 파일은 orbivisord.service, opld.service는 그 별칭 링크다. 옛 이름의 enable 링크
+# (multi-user.target.wants/opld.service)와 덮어쓰기(opld.service.d)를 새 이름으로 옮긴다 — 옛 enable 링크만 있으면
+# is-enabled orbivisord가 disabled다. 덮어쓰기 디렉터리는 옮긴 뒤 옛 이름을 링크로 남긴다.
+# systemd가 돌지 않으면(컨테이너, 설치 프로그램의 chroot) 링크만 옮기고, 처음 설치이고 enable 링크가 없을 때
+# enable(링크 만들기)만 한다.
 set -eu
 
 # 시험(packaging/tests/maint-test.sh)이 바꿀 수 있게 환경 변수로 둔다.
-SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
-SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
-APPARMOR_DIR="${OPL_APPARMOR_DIR:-/etc/apparmor.d}"
+SYSTEMD_DIR="${ORBIVISOR_SYSTEMD_DIR:-/run/systemd/system}"
+SYSTEMD_ETC="${ORBIVISOR_SYSTEMD_ETC:-/etc/systemd/system}"
+APPARMOR_DIR="${ORBIVISOR_APPARMOR_DIR:-/etc/apparmor.d}"
+UNIT=/usr/lib/systemd/system/orbivisord.service
 SWTPM_INCLUDE='include <abstractions/orbivisor-swtpm>'
 
 # swtpm AppArmor(계획 59): swtpm 프로필의 local 파일(swtpm 꾸러미가 만들고 소유하지 않는다)에 orbivisor 경로를 한 번만
@@ -29,6 +33,24 @@ swtpm_apparmor() {
 	fi
 }
 
+# 옛 이름의 enable 링크·덮어쓰기를 새 이름으로 옮긴다. 옮긴 것이 있으면 0으로 끝난다.
+move_unit_links() {
+	moved=1
+	wants="$SYSTEMD_ETC/multi-user.target.wants"
+	if [ -L "$wants/opld.service" ]; then
+		rm -f "$wants/opld.service"
+		ln -sf "$UNIT" "$wants/orbivisord.service"
+		moved=0
+	fi
+	if [ -d "$SYSTEMD_ETC/opld.service.d" ] && [ ! -L "$SYSTEMD_ETC/opld.service.d" ] &&
+		[ ! -e "$SYSTEMD_ETC/orbivisord.service.d" ]; then
+		mv "$SYSTEMD_ETC/opld.service.d" "$SYSTEMD_ETC/orbivisord.service.d"
+		ln -s orbivisord.service.d "$SYSTEMD_ETC/opld.service.d"
+		moved=0
+	fi
+	return $moved
+}
+
 case "$1" in
 configure | abort-remove | abort-deconfigure)
 	swtpm_apparmor
@@ -42,17 +64,24 @@ configure | abort-remove | abort-deconfigure)
 		fi
 	fi
 	if [ -d "$SYSTEMD_DIR" ]; then
+		# 돌고 있는 opld.service가 새 실제 파일의 별칭으로 orbivisord.service에 합쳐진다(MainPID 그대로).
 		systemctl daemon-reload || true
-		if systemctl is-enabled --quiet opld.service; then
-			# VM의 QEMU는 자기 scope에 있어 opld를 다시 시작해도 계속 돈다.
-			systemctl restart opld.service || true
-		elif [ "$first" = yes ]; then
-			systemctl enable opld.service || true
-			# 설정(/etc/opl/opld.toml)이 없으면 유닛 조건이 시작을 건너뛴다.
-			systemctl start opld.service || true
+		if move_unit_links; then
+			systemctl daemon-reload || true
 		fi
-	elif [ "$first" = yes ] && [ ! -L "$SYSTEMD_ETC/multi-user.target.wants/opld.service" ]; then
-		systemctl enable opld.service || true
+		if systemctl is-enabled --quiet orbivisord.service; then
+			# VM의 QEMU는 자기 scope에 있어 데몬을 다시 시작해도 계속 돈다.
+			systemctl restart orbivisord.service || true
+		elif [ "$first" = yes ]; then
+			systemctl enable orbivisord.service || true
+			# 설정(/etc/orbivisor/orbivisord.toml, 옛 /etc/opl/opld.toml)이 없으면 유닛 조건이 시작을 건너뛴다.
+			systemctl start orbivisord.service || true
+		fi
+	else
+		move_unit_links || true
+		if [ "$first" = yes ] && [ ! -L "$SYSTEMD_ETC/multi-user.target.wants/orbivisord.service" ]; then
+			systemctl enable orbivisord.service || true
+		fi
 	fi
 	;;
 esac

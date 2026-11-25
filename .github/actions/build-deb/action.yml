@@ -45,7 +45,7 @@ runs:
     - id: deb
       shell: bash
       env:
-        OPL_DEV_LICENSE: "1"
+        ORBIVISOR_DEV_LICENSE: "1"
       run: |
         packaging/deb/build-deb.sh "$ORBIVISOR_VERSION" dist
         echo "path=dist/orbivisor_${ORBIVISOR_VERSION}_amd64.deb" >> "$GITHUB_OUTPUT"

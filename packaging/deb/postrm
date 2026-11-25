@@ -1,13 +1,14 @@
 #!/bin/sh
-# orbivisor postrm. /var/lib/opl(Raft 데이터, 풀, 볼륨)과 /etc/opl은 purge여도 지우지 않는다.
+# orbivisor postrm. /var/lib/orbivisor(Raft 데이터, 풀, 볼륨)와 /etc/orbivisor(옛 이름 링크 /var/lib/opl·/etc/opl)는
+# purge여도 지우지 않는다.
 # opld가 쓴 APT 소스 파일(첫 줄이 관리 표시)은 지운다: 함께 지워진 저장소 공개 키를 가리켜 apt-get
 # update가 실패한다. 관리자가 직접 쓴 파일은 남긴다.
 set -eu
 
-SYSTEMD_DIR="${OPL_SYSTEMD_DIR:-/run/systemd/system}"
-SYSTEMD_ETC="${OPL_SYSTEMD_ETC:-/etc/systemd/system}"
-APT_SOURCES="${OPL_APT_SOURCES:-/etc/apt/sources.list.d/oplite.sources}"
-APPARMOR_DIR="${OPL_APPARMOR_DIR:-/etc/apparmor.d}"
+SYSTEMD_DIR="${ORBIVISOR_SYSTEMD_DIR:-/run/systemd/system}"
+SYSTEMD_ETC="${ORBIVISOR_SYSTEMD_ETC:-/etc/systemd/system}"
+APT_SOURCES="${ORBIVISOR_APT_SOURCES:-/etc/apt/sources.list.d/oplite.sources}"
+APPARMOR_DIR="${ORBIVISOR_APPARMOR_DIR:-/etc/apparmor.d}"
 SWTPM_INCLUDE='include <abstractions/orbivisor-swtpm>'
 
 # purge는 conffile(abstractions/orbivisor-swtpm)을 지우므로 swtpm 프로필의 local 파일에서 include 줄을 뺀다(남으면
@@ -29,9 +30,10 @@ case "$1" in
 remove | purge)
 	if [ "$1" = purge ]; then
 		# enable이 만든 링크를 정리한다(systemd가 돌지 않아도 된다).
-		systemctl disable opld.service || true
-		# systemctl이 없거나 실패해도 링크가 남지 않게 한다.
-		rm -f "$SYSTEMD_ETC/multi-user.target.wants/opld.service"
+		systemctl disable orbivisord.service || true
+		# systemctl이 없거나 실패해도 링크가 남지 않게 한다(옮기지 못한 옛 이름의 링크도).
+		rm -f "$SYSTEMD_ETC/multi-user.target.wants/orbivisord.service" \
+			"$SYSTEMD_ETC/multi-user.target.wants/opld.service"
 		swtpm_apparmor_purge
 	fi
 	if [ -f "$APT_SOURCES" ] && [ "$(head -n 1 "$APT_SOURCES")" = "# managed by opld; edits are overwritten" ]; then

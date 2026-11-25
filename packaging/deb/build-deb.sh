@@ -2,17 +2,17 @@
 # 이미 빌드한 릴리스 바이너리로 Debian 패키지 둘을 만든다: orbivisor_<version>_amd64.deb(실제 패키지)와
 # oplite_<version>_amd64.deb(옛 이름의 빈 전환 패키지 — 설치된 oplite가 dist-upgrade로 orbivisor로 넘어가게 함).
 # 쓰는 법: packaging/deb/build-deb.sh <version> <out dir>
-# (OPL_RESTORE_IMAGE_DIR가 있으면 셋째 패키지 orbivisor-restore-image_<version>_amd64.deb도 — 아래)
+# (ORBIVISOR_RESTORE_IMAGE_DIR가 있으면 셋째 패키지 orbivisor-restore-image_<version>_amd64.deb도 — 아래)
 # 바이너리(orbivisord, orbivisorctl)는 OPL_VERSION=<version>으로 빌드해 둔다(--version이 그 버전이 아니면 실패한다):
 #   pnpm -C web build && OPL_VERSION=<version> cargo build --release -p orbivisord --features web-ui -p orbivisorctl
-# 바이너리 위치는 기본 target/release이고 OPL_BIN_DIR로 바꾼다.
-# OPL_APT_KEY(APT 저장소 공개 키 파일, armor가 아닌 gpg --export)가 있으면
+# 바이너리 위치는 기본 target/release이고 ORBIVISOR_BIN_DIR로 바꾼다.
+# ORBIVISOR_APT_KEY(APT 저장소 공개 키 파일, armor가 아닌 gpg --export)가 있으면
 # /usr/share/keyrings/oplite-archive-keyring.gpg로 싣는다.
 # 구독 키 공개 키: 바이너리를 OPL_LICENSE_KEYS로 빌드한 정식 패키지는 그 값을 여기에도 준다. 없으면
-# 저장소의 개발 키를 믿는 바이너리이므로 OPL_DEV_LICENSE=1(개발 패키지)일 때만 만든다.
+# 저장소의 개발 키를 믿는 바이너리이므로 ORBIVISOR_DEV_LICENSE=1(개발 패키지)일 때만 만든다.
 # OPL_LICENSE_KEYS에는 정규 base64(44자, 32바이트) 항목이 하나 이상 있어야 하고, 개발 키가 들어 있으면
 # 안 되며, orbivisord에 그 값이 그대로 들어 있어야 한다(그 값으로 빌드했는지).
-# 파일 복원 도우미 이미지(계획 69): OPL_RESTORE_IMAGE_DIR이 있으면 셋째 패키지
+# 파일 복원 도우미 이미지(계획 69): ORBIVISOR_RESTORE_IMAGE_DIR이 있으면 셋째 패키지
 # orbivisor-restore-image_<version>_amd64.deb(/usr/share/orbivisor/restore/x86_64)도 만든다. 그 디렉터리는
 # packaging/restore-image/build.sh --arch x86_64 --version <version> --out <dir>의 결과여야 한다 — manifest.json의
 # 이미지 판이 이 버전과 저장소의 packaging/restore-image/debian.lock으로 만든 것인지 본다.
@@ -30,14 +30,14 @@ VERSION=$1
 OUT_DIR=$2
 [ -n "$VERSION" ] || usage
 
-if [ -z "${OPL_LICENSE_KEYS:-}" ] && [ "${OPL_DEV_LICENSE:-}" != 1 ]; then
-	echo "build-deb: OPL_LICENSE_KEYS is not set; set it for a release build or OPL_DEV_LICENSE=1 for a development package" >&2
+if [ -z "${OPL_LICENSE_KEYS:-}" ] && [ "${ORBIVISOR_DEV_LICENSE:-}" != 1 ]; then
+	echo "build-deb: OPL_LICENSE_KEYS is not set; set it for a release build or ORBIVISOR_DEV_LICENSE=1 for a development package" >&2
 	exit 1
 fi
 
 DEB_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT=$(cd "$DEB_DIR/../.." && pwd)
-BIN_DIR=${OPL_BIN_DIR:-$ROOT/target/release}
+BIN_DIR=${ORBIVISOR_BIN_DIR:-$ROOT/target/release}
 
 if [ -n "${OPL_LICENSE_KEYS:-}" ]; then
 	DEV_KEY=$(cat "$ROOT/crates/orbivisor-types/keys/dev-license.pub")
@@ -58,7 +58,7 @@ if [ -n "${OPL_LICENSE_KEYS:-}" ]; then
 			exit 1
 		fi
 		if [ "$k" = "$DEV_KEY" ]; then
-			echo "build-deb: OPL_LICENSE_KEYS contains the development key; use OPL_DEV_LICENSE=1 for a development package" >&2
+			echo "build-deb: OPL_LICENSE_KEYS contains the development key; use ORBIVISOR_DEV_LICENSE=1 for a development package" >&2
 			exit 1
 		fi
 	done
@@ -98,12 +98,12 @@ sha256() {
 	fi
 }
 
-IMAGE_SRC=${OPL_RESTORE_IMAGE_DIR:-}
+IMAGE_SRC=${ORBIVISOR_RESTORE_IMAGE_DIR:-}
 IMAGE_LOCK="$ROOT/packaging/restore-image/debian.lock"
 if [ -n "$IMAGE_SRC" ]; then
 	for f in vmlinuz initrd.img manifest.json; do
 		[ -f "$IMAGE_SRC/$f" ] || {
-			echo "build-deb: OPL_RESTORE_IMAGE_DIR has no $f (packaging/restore-image/build.sh --arch x86_64 --out <dir>)" >&2
+			echo "build-deb: ORBIVISOR_RESTORE_IMAGE_DIR has no $f (packaging/restore-image/build.sh --arch x86_64 --out <dir>)" >&2
 			exit 1
 		}
 	done
@@ -116,14 +116,14 @@ if [ -n "$IMAGE_SRC" ]; then
 	fi
 fi
 
-APT_KEY=${OPL_APT_KEY:-}
+APT_KEY=${ORBIVISOR_APT_KEY:-}
 if [ -n "$APT_KEY" ] && [ ! -f "$APT_KEY" ]; then
-	echo "build-deb: OPL_APT_KEY의 $APT_KEY 이 없다" >&2
+	echo "build-deb: ORBIVISOR_APT_KEY의 $APT_KEY 이 없다" >&2
 	exit 1
 fi
 # apt의 Signed-By는 .gpg 확장자의 armor 키를 읽지 못한다.
 if [ -n "$APT_KEY" ] && head -n 1 "$APT_KEY" | grep -q '^-----BEGIN PGP'; then
-	echo "build-deb: OPL_APT_KEY must be a binary keyring (gpg --export, not --armor)" >&2
+	echo "build-deb: ORBIVISOR_APT_KEY must be a binary keyring (gpg --export, not --armor)" >&2
 	exit 1
 fi
 
@@ -134,16 +134,16 @@ trap 'rm -rf "$STAGE" "$TRANS" "$IMAGE"' EXIT
 # mktemp -d는 0700이다. 패키지 루트(/)의 권한이 되므로 0755로 한다.
 chmod 0755 "$STAGE" "$TRANS" "$IMAGE"
 
-# 파일 트리. 옛 이름(opld, oplctl, orbivisord.service의 원래 유닛 opld.service)은 상대 심볼릭 링크다.
+# 파일 트리. 옛 이름(opld, oplctl, 유닛 opld.service)은 상대 심볼릭 링크다.
 mkdir -p "$STAGE/usr/bin" "$STAGE/usr/lib/systemd/system" \
 	"$STAGE/usr/share/orbivisor" "$STAGE/usr/share/doc/orbivisor"
 install -m 0755 "$BIN_DIR/orbivisord" "$BIN_DIR/orbivisorctl" "$STAGE/usr/bin/"
 ln -s orbivisord "$STAGE/usr/bin/opld"
 ln -s orbivisorctl "$STAGE/usr/bin/oplctl"
-install -m 0644 "$DEB_DIR/opld.service" "$STAGE/usr/lib/systemd/system/opld.service"
-# 별칭: systemctl status|restart orbivisord가 opld.service를 가리킨다.
-ln -s opld.service "$STAGE/usr/lib/systemd/system/orbivisord.service"
-install -m 0644 "$DEB_DIR/opld.toml.example" "$STAGE/usr/share/orbivisor/opld.toml.example"
+install -m 0644 "$DEB_DIR/orbivisord.service" "$STAGE/usr/lib/systemd/system/orbivisord.service"
+# 정적 별칭(계획 74): systemctl status|restart opld와 옛 VM 스코프의 Before=opld.service가 orbivisord.service를 가리킨다.
+ln -s orbivisord.service "$STAGE/usr/lib/systemd/system/opld.service"
+install -m 0644 "$DEB_DIR/orbivisord.toml.example" "$STAGE/usr/share/orbivisor/orbivisord.toml.example"
 install -m 0644 "$DEB_DIR/copyright" "$STAGE/usr/share/doc/orbivisor/copyright"
 # swtpm AppArmor 덧붙임(계획 59): Ubuntu·Debian swtpm 프로필의 local 파일이 이것을 include한다(postinst).
 mkdir -p "$STAGE/etc/apparmor.d/abstractions"

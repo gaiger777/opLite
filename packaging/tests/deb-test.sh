@@ -33,18 +33,19 @@ echo "deb-test: orbivisor $VERSION"
 [ "$(oplctl --version)" = "orbivisorctl $VERSION" ] || fail "oplctl --version: $(oplctl --version)"
 
 # 경로와 권한
-UNIT=/usr/lib/systemd/system/opld.service
+UNIT=/usr/lib/systemd/system/orbivisord.service
 for path in /usr/bin/orbivisord /usr/bin/orbivisorctl; do
 	[ "$(stat -c '%a %U' "$path")" = "755 root" ] || fail "$path: $(stat -c '%a %U' "$path")"
 done
-for path in "$UNIT" /usr/share/orbivisor/opld.toml.example /usr/share/doc/orbivisor/copyright; do
+for path in "$UNIT" /usr/share/orbivisor/orbivisord.toml.example /usr/share/doc/orbivisor/copyright; do
 	[ "$(stat -c '%a %U' "$path")" = "644 root" ] || fail "$path: $(stat -c '%a %U' "$path")"
 done
 # 옛 이름은 상대 심볼릭 링크
 [ "$(readlink /usr/bin/opld)" = orbivisord ] || fail "/usr/bin/opld: $(readlink /usr/bin/opld)"
 [ "$(readlink /usr/bin/oplctl)" = orbivisorctl ] || fail "/usr/bin/oplctl: $(readlink /usr/bin/oplctl)"
-ALIAS=/usr/lib/systemd/system/orbivisord.service
-[ "$(readlink "$ALIAS")" = opld.service ] || fail "$ALIAS: $(readlink "$ALIAS")"
+ALIAS=/usr/lib/systemd/system/opld.service
+[ "$(readlink "$ALIAS")" = orbivisord.service ] || fail "$ALIAS: $(readlink "$ALIAS")"
+[ ! -e /usr/share/orbivisor/opld.toml.example ] || fail "옛 이름 예시 설정이 있다"
 
 # md5sums(dpkg --verify)
 [ -s /var/lib/dpkg/info/orbivisor.md5sums ] || fail "md5sums 없음"
@@ -52,15 +53,18 @@ dpkg --verify orbivisor || fail "dpkg --verify orbivisor"
 
 # 유닛 파일 검사
 systemd-analyze verify "$UNIT" || fail "systemd-analyze verify $UNIT"
-grep -qx 'ExecStart=/usr/bin/orbivisord --config /etc/opl/opld.toml' "$UNIT" || fail "ExecStart: $(grep ExecStart "$UNIT")"
+grep -qx 'ExecStart=/usr/bin/orbivisord' "$UNIT" || fail "ExecStart: $(grep ExecStart "$UNIT")"
 
-# 설정이 없으면 유닛 조건이 거짓이다(설치가 /etc/opl/opld.toml을 만들지 않는다).
-grep -qx 'ConditionPathExists=/etc/opl/opld.toml' "$UNIT" || fail "ConditionPathExists 없음"
-[ ! -e /etc/opl/opld.toml ] || fail "/etc/opl/opld.toml이 있다"
+# 설정이 없으면 유닛 조건이 거짓이다(설치가 설정을 만들지 않는다). 새 경로나 옛 경로 중 하나면 된다.
+grep -qx 'ConditionPathExists=|/etc/orbivisor/orbivisord.toml' "$UNIT" || fail "ConditionPathExists(새) 없음"
+grep -qx 'ConditionPathExists=|/etc/opl/opld.toml' "$UNIT" || fail "ConditionPathExists(옛) 없음"
+[ ! -e /etc/orbivisor/orbivisord.toml ] || fail "/etc/orbivisor/orbivisord.toml이 있다"
 
-# systemd가 돌지 않아도 postinst가 enable 링크를 만든다.
-LINK=/etc/systemd/system/multi-user.target.wants/opld.service
+# systemd가 돌지 않아도 postinst가 enable 링크(새 이름)를 만든다.
+LINK=/etc/systemd/system/multi-user.target.wants/orbivisord.service
 [ -L "$LINK" ] || fail "enable 링크 없음"
+[ ! -e /etc/systemd/system/multi-user.target.wants/opld.service ] || fail "옛 이름 enable 링크가 있다"
+[ "$(systemctl is-enabled orbivisord.service)" = enabled ] || fail "is-enabled orbivisord: $(systemctl is-enabled orbivisord.service 2>&1)"
 
 # 전환 패키지: orbivisor 같은 버전에 의존하고 유지 스크립트가 없다. 지워도 orbivisor는 그대로다.
 apt-get install -y --no-install-recommends "$TRANS_DEB"
@@ -101,16 +105,16 @@ if [ -n "$IMAGE_DEB" ]; then
 	[ "$(dpkg-query -W -f '${Status}' orbivisor)" = "install ok installed" ] || fail "이미지를 지우자 orbivisor가 바뀜"
 fi
 
-# purge: enable 링크와 opld가 쓴 APT 소스 파일은 지우고, 데이터(/var/lib/opl)와 설정(/etc/opl)은 남긴다.
-mkdir -p /var/lib/opl /etc/opl
-echo keep >/var/lib/opl/deb-test.marker
-echo keep >/etc/opl/deb-test.marker
+# purge: enable 링크와 데몬이 쓴 APT 소스 파일은 지우고, 데이터(/var/lib/orbivisor)와 설정(/etc/orbivisor)은 남긴다.
+mkdir -p /var/lib/orbivisor /etc/orbivisor
+echo keep >/var/lib/orbivisor/deb-test.marker
+echo keep >/etc/orbivisor/deb-test.marker
 SOURCES=/etc/apt/sources.list.d/oplite.sources
 printf '# managed by opld; edits are overwritten\nTypes: deb\n' >"$SOURCES"
 dpkg --purge orbivisor
 [ ! -e "$SOURCES" ] || fail "purge 뒤 opld가 쓴 소스 파일이 남음"
 if [ -e "$LINK" ] || [ -L "$LINK" ]; then fail "purge 뒤 enable 링크가 남음"; fi
-[ -f /var/lib/opl/deb-test.marker ] || fail "purge가 /var/lib/opl을 지웠다"
-[ -f /etc/opl/deb-test.marker ] || fail "purge가 /etc/opl을 지웠다"
+[ -f /var/lib/orbivisor/deb-test.marker ] || fail "purge가 /var/lib/orbivisor를 지웠다"
+[ -f /etc/orbivisor/deb-test.marker ] || fail "purge가 /etc/orbivisor를 지웠다"
 
 echo "deb-test: 모두 통과"

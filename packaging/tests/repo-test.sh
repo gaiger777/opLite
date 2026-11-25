@@ -4,9 +4,11 @@
 # 임시 GPG 키로 stable에 옛 모양의 oplite V0(이름 바꾸기 전 build-deb.sh가 만들던 것: 실제 파일 /usr/bin/opld·
 # oplctl, 옛 control·유지 스크립트 — fixtures/oplite-v0)를, testing에 받은 V1의 orbivisor·oplite(전환)를 넣는다.
 # file:// 소스와 Signed-By로 stable에서 oplite를 설치한 뒤 소스를 testing으로 바꾸면 apt-get -s dist-upgrade가
-# 두 패키지를 보이고, 실제 dist-upgrade 뒤 orbivisor가 옛 유닛·enable 링크·명령 이름·저장소 키를 이어받는지,
+# 두 패키지를 보이고, 실제 dist-upgrade 뒤 orbivisor가 옛 유닛·enable 링크·명령 이름·저장소 키를 이어받는지(유닛과
+# enable 링크는 새 이름 orbivisord.service, 옛 이름 opld.service는 별칭 링크 — 계획 74), 새 데몬이 옛 배치(/etc/opl,
+# /var/lib/opl)를 새 이름으로 옮기고 옛 이름을 링크로 남기는지,
 # dpkg가 oplite를 먼저 올리고 orbivisor를 설치했는지, orbivisor가 수동 설치로 남아 autoremove되지 않는지 본다.
-# V1 orbivisor는 받은 deb의 바이너리로 build-deb.sh를 OPL_APT_KEY와 함께 다시 돌려 만든다(키를 실은 정식 패키지처럼).
+# V1 orbivisor는 받은 deb의 바이너리로 build-deb.sh를 ORBIVISOR_APT_KEY와 함께 다시 돌려 만든다(키를 실은 정식 패키지처럼).
 # 셋째 인자(파일 복원 도우미 이미지 꾸러미 orbivisor-restore-image, 계획 69)가 있으면 testing에 함께 올려 저장소에서
 # 설치하고, 다음 판(받은 둘을 판만 바꿔 다시 묶음)을 둘 다 올리면 dist-upgrade가 둘을 함께 올리는지 본다 —
 # 이미지는 Depends: orbivisor (= 판)이라 판마다 함께 내야 한다.
@@ -58,9 +60,9 @@ V0="$VERSION~v0"
 # 저장소 공개 키(V0도 V1도 이 경로에 싣는다 — 옛 이름 그대로)
 APT_KEYRING=/usr/share/keyrings/oplite-archive-keyring.gpg
 
-# V1 orbivisor를 저장소 키와 함께 다시 만든다: 받은 deb의 바이너리로 build-deb.sh(OPL_APT_KEY, 시험 키).
+# V1 orbivisor를 저장소 키와 함께 다시 만든다: 받은 deb의 바이너리로 build-deb.sh(ORBIVISOR_APT_KEY, 시험 키).
 dpkg-deb -x "$DEB" "$WORK/v1-files"
-OPL_DEV_LICENSE=1 OPL_APT_KEY="$KEYRING" OPL_BIN_DIR="$WORK/v1-files/usr/bin" \
+ORBIVISOR_DEV_LICENSE=1 ORBIVISOR_APT_KEY="$KEYRING" ORBIVISOR_BIN_DIR="$WORK/v1-files/usr/bin" \
 	sh "$DEB_DIR/build-deb.sh" "$VERSION" "$WORK/v1" >/dev/null
 DEB="$WORK/v1/orbivisor_${VERSION}_amd64.deb"
 dpkg-deb -c "$DEB" | grep -q " \.$APT_KEYRING\$" || fail "다시 만든 orbivisor에 키 없음"
@@ -73,7 +75,7 @@ for bin in opld oplctl; do
 	chmod 0755 "$P/usr/bin/$bin"
 done
 install -m 0644 "$V0_DIR/opld.service" "$P/usr/lib/systemd/system/opld.service"
-install -m 0644 "$DEB_DIR/opld.toml.example" "$P/usr/share/oplite/opld.toml.example"
+install -m 0644 "$DEB_DIR/orbivisord.toml.example" "$P/usr/share/oplite/opld.toml.example"
 install -m 0644 "$DEB_DIR/copyright" "$P/usr/share/doc/oplite/copyright"
 mkdir -p "$P/usr/share/keyrings"
 install -m 0644 "$KEYRING" "$P$APT_KEYRING"
@@ -88,8 +90,8 @@ V0_DEB="$WORK/oplite_${V0}_amd64.deb"
 dpkg-deb --build --root-owner-group "$P" "$V0_DEB"
 
 # stable: 옛 oplite V0, testing: V1의 orbivisor와 전환 oplite
-OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" stable "$V0_DEB"
-OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing "$DEB" "$TRANS_DEB" ${IMAGE_DEB:+"$IMAGE_DEB"}
+ORBIVISOR_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" stable "$V0_DEB"
+ORBIVISOR_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing "$DEB" "$TRANS_DEB" ${IMAGE_DEB:+"$IMAGE_DEB"}
 
 # 서명과 Release 값(Origin·Label은 이름 바꾸기 전 그대로 — 바뀌면 설치된 노드의 apt-get update가 실패한다)
 gpgv --keyring "$KEYRING" "$REPO/dists/trixie/InRelease" || fail "InRelease 서명"
@@ -115,14 +117,19 @@ EOF
 }
 
 # stable에서 옛 oplite 설치: 옛 postinst가 enable 링크를 만든다.
-LINK=/etc/systemd/system/multi-user.target.wants/opld.service
-UNIT=/usr/lib/systemd/system/opld.service
+OLD_LINK=/etc/systemd/system/multi-user.target.wants/opld.service
+LINK=/etc/systemd/system/multi-user.target.wants/orbivisord.service
+UNIT=/usr/lib/systemd/system/orbivisord.service
 write_sources stable
 apt-get update
 apt-get install -y --no-install-recommends oplite
 [ "$(dpkg-query -W -f '${Version}' oplite)" = "$V0" ] || fail "설치된 버전: $(dpkg-query -W -f '${Version}' oplite)"
 if [ -L /usr/bin/opld ] || [ ! -f /usr/bin/opld ]; then fail "V0의 /usr/bin/opld가 파일이 아님"; fi
-[ -L "$LINK" ] || fail "V0 enable 링크 없음"
+[ -L "$OLD_LINK" ] || fail "V0 enable 링크 없음"
+# V0 노드의 설정·데이터(옛 배치). 새 데몬이 새 이름으로 옮긴다.
+mkdir -p /etc/opl /var/lib/opl
+printf 'name = "repo-test"\naddress = "127.0.0.1"\n' >/etc/opl/opld.toml
+echo keep >/var/lib/opl/repo-test.marker
 dpkg -S "$APT_KEYRING" | grep -qxE "oplite(:amd64)?: $APT_KEYRING" || fail "V0 키: $(dpkg -S "$APT_KEYRING" 2>&1)"
 
 # testing으로 바꾸면 dist-upgrade가 orbivisor를 새로 설치하고 oplite를 전환 패키지로 올린다
@@ -153,17 +160,39 @@ check_moved() {
 	[ "$(readlink /usr/bin/opld)" = orbivisord ] || fail "$1: /usr/bin/opld: $(ls -l /usr/bin/opld 2>&1)"
 	[ "$(readlink /usr/bin/oplctl)" = orbivisorctl ] || fail "$1: /usr/bin/oplctl: $(ls -l /usr/bin/oplctl 2>&1)"
 	[ "$(opld --version)" = "orbivisord $VERSION" ] || fail "$1: opld --version: $(opld --version)"
-	[ -f "$UNIT" ] || fail "$1: 유닛 파일 없음"
-	grep -qx 'ExecStart=/usr/bin/orbivisord --config /etc/opl/opld.toml' "$UNIT" || fail "$1: 옛 유닛 파일"
-	[ "$(readlink /usr/lib/systemd/system/orbivisord.service)" = opld.service ] || fail "$1: 별칭 링크 없음"
+	[ -f "$UNIT" ] && [ ! -L "$UNIT" ] || fail "$1: 유닛 파일 없음"
+	grep -qx 'ExecStart=/usr/bin/orbivisord' "$UNIT" || fail "$1: 옛 유닛 파일"
+	[ "$(readlink /usr/lib/systemd/system/opld.service)" = orbivisord.service ] || fail "$1: 별칭 링크 없음"
 	[ -L "$LINK" ] || fail "$1: enable 링크 없음"
+	if [ -e "$OLD_LINK" ] || [ -L "$OLD_LINK" ]; then fail "$1: 옛 이름 enable 링크가 남음"; fi
+	[ "$(systemctl is-enabled orbivisord.service)" = enabled ] || fail "$1: is-enabled orbivisord: $(systemctl is-enabled orbivisord.service 2>&1)"
 	[ -f "$SOURCES" ] || fail "$1: 소스 파일 없음"
-	[ -f /usr/share/orbivisor/opld.toml.example ] || fail "$1: /usr/share/orbivisor/opld.toml.example 없음"
+	[ -f /usr/share/orbivisor/orbivisord.toml.example ] || fail "$1: /usr/share/orbivisor/orbivisord.toml.example 없음"
 	dpkg --verify orbivisor || fail "$1: dpkg --verify orbivisor"
 	[ -f "$APT_KEYRING" ] || fail "$1: 저장소 키 없음"
 	dpkg -S "$APT_KEYRING" | grep -qxE "orbivisor(:amd64)?: $APT_KEYRING" || fail "$1: 키: $(dpkg -S "$APT_KEYRING" 2>&1)"
 }
 check_moved "dist-upgrade 뒤"
+# 새 데몬의 배치 맞추기(계획 74 설계 §3.4): 옛 설정 경로로 뜨고, 시작하면서 /etc/opl·/var/lib/opl을 새 이름으로 옮기고
+# 옛 이름을 링크로 남긴다. systemd가 돌지 않으므로 직접 띄워 제어 소켓이 열리면 멈춘다(클러스터 밖 노드는 소켓만 연다).
+orbivisord >"$WORK/daemon.log" 2>&1 &
+DAEMON=$!
+for _ in $(seq 1 60); do
+	[ -S /run/orbivisor/orbivisord.sock ] && break
+	sleep 0.5
+done
+[ -S /run/orbivisor/orbivisord.sock ] || fail "새 데몬의 제어 소켓 없음: $(cat "$WORK/daemon.log")"
+for d in /etc /var/lib /run; do
+	[ -d "$d/orbivisor" ] && [ ! -L "$d/orbivisor" ] || fail "$d/orbivisor가 진짜 디렉터리가 아님: $(ls -la "$d")"
+	[ "$(readlink "$d/opl")" = orbivisor ] || fail "$d/opl이 링크가 아님: $(ls -la "$d")"
+done
+[ -f /etc/orbivisor/orbivisord.toml ] && [ ! -L /etc/orbivisor/orbivisord.toml ] || fail "orbivisord.toml이 진짜 파일이 아님"
+[ "$(readlink /etc/orbivisor/opld.toml)" = orbivisord.toml ] || fail "opld.toml이 링크가 아님"
+[ "$(cat /var/lib/opl/repo-test.marker)" = keep ] || fail "옛 경로로 데이터를 읽지 못함"
+[ "$(readlink /run/orbivisor/opld.sock)" = orbivisord.sock ] || fail "옛 이름 소켓 링크 없음"
+grep -q "moved /var/lib/opl to /var/lib/orbivisor" "$WORK/daemon.log" || fail "시작 로그에 옮긴 것이 없음: $(cat "$WORK/daemon.log")"
+kill "$DAEMON"
+wait "$DAEMON" || true
 [ ! -e /usr/share/oplite ] || fail "옛 /usr/share/oplite가 남음"
 # 수동으로 설치한 oplite가 oldlibs 전환 패키지가 되면 apt가 수동 표시를 새 의존 orbivisor로 옮긴다
 # (APT::Move-Autobit-Sections). 자동 설치 표시로 남으면 oplite를 지운 뒤 autoremove가 orbivisor를 지운다.
@@ -195,7 +224,7 @@ if [ -n "$IMAGE_DEB" ]; then
 	rebuild_v2 "$DEB" "$WORK/orbivisor_${V2}_amd64.deb"
 	rebuild_v2 "$IMAGE_DEB" "$WORK/orbivisor-restore-image_${V2}_amd64.deb"
 	[ "$(dpkg-deb -f "$WORK/orbivisor-restore-image_${V2}_amd64.deb" Depends)" = "orbivisor (= $V2)" ] || fail "V2 이미지 Depends"
-	OPL_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing \
+	ORBIVISOR_REPO_GPG_KEY_ID=$KEY_ID sh "$REPO_SCRIPT" "$REPO" testing \
 		"$WORK/orbivisor_${V2}_amd64.deb" "$WORK/orbivisor-restore-image_${V2}_amd64.deb"
 	apt-get update
 	LANG=C apt-get -s -q dist-upgrade | tee "$WORK/simulate2.txt"
