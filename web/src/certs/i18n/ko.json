@@ -65,7 +65,7 @@
       "tos": "CA 약관에 동의해야 합니다.",
       "eab": "EAB 키 id와 HMAC 키를 둘 다 주거나 둘 다 비우세요.",
       "required": "필요합니다.",
-      "hook": "훅은 /etc/opl/acme-hooks/ 아래 파일이어야 합니다.",
+      "hook": "훅은 /etc/orbivisor/acme-hooks/ 아래 파일이어야 합니다.",
       "names": "이름을 하나 이상 주세요.",
       "wildcard": "와일드카드 이름은 DNS-01이 필요합니다.",
       "account": "계정을 고르세요.",
@@ -100,7 +100,7 @@
       "kind": "공급자",
       "zones": "영역",
       "zonesHint": "쉼표로 나눕니다. 인증서는 이름을 덮는 영역의 공급자를 고릅니다.",
-      "hookHint": "모든 노드의 /etc/opl/acme-hooks/ 아래 실행 파일."
+      "hookHint": "모든 노드의 /etc/orbivisor/acme-hooks/ 아래 실행 파일."
     },
     "cert": {
       "open": "인증서 더하기",

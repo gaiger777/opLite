@@ -65,7 +65,7 @@
       "tos": "You must agree to the CA's terms of service.",
       "eab": "Give both the EAB key id and the HMAC key, or neither.",
       "required": "Required.",
-      "hook": "The hook must be a file under /etc/opl/acme-hooks/.",
+      "hook": "The hook must be a file under /etc/orbivisor/acme-hooks/.",
       "names": "Give at least one name.",
       "wildcard": "Wildcard names need DNS-01.",
       "account": "Choose an account.",
@@ -100,7 +100,7 @@
       "kind": "Provider",
       "zones": "Zones",
       "zonesHint": "Comma-separated. Certificates pick the provider whose zone covers the name.",
-      "hookHint": "An executable under /etc/opl/acme-hooks/ on every node."
+      "hookHint": "An executable under /etc/orbivisor/acme-hooks/ on every node."
     },
     "cert": {
       "open": "Add certificate",

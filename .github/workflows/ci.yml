@@ -284,7 +284,7 @@ jobs:
       # 닿지 않을 때가 있어 microceph를 쓰지 않는다). ceph-common의 rbd·ceph와 QEMU(qemu-block-extra의
       # librbd)가 읽도록 ceph.conf와 관리자 키링을 Ceph 기본 위치 /etc/ceph에 둔다. 제한된 사용자 시험을
       # 위해 네임스페이스 `rbd/opl`과 사용자 `client.opltest`(caps `profile rbd`)를 만들고, 그 키링은 Ceph
-      # 기본 위치가 아닌 /etc/opl-ceph에 두어 그곳의 ceph.conf로만 찾게 한다.
+      # 기본 위치가 아닌 /etc/orbivisor-ceph에 두어 그곳의 ceph.conf로만 찾게 한다.
       - name: Ceph (apt, single node) with an rbd pool
         timeout-minutes: 15
         run: |
@@ -357,13 +357,13 @@ jobs:
           sudo rbd rm --no-progress rbd/opl-ci-probe
           sudo ceph df
           sudo rbd namespace create rbd/opl
-          sudo mkdir -p /etc/opl-ceph
+          sudo mkdir -p /etc/orbivisor-ceph
           sudo ceph auth get-or-create client.opltest mon 'profile rbd' osd 'profile rbd pool=rbd' mgr 'profile rbd pool=rbd' \
-            | sudo tee /etc/opl-ceph/opltest.keyring >/dev/null
-          { sudo cat /etc/ceph/ceph.conf; printf '\n[client.opltest]\nkeyring = /etc/opl-ceph/opltest.keyring\n'; } \
-            | sudo tee /etc/opl-ceph/ceph.conf >/dev/null
-          sudo rbd --id opltest --conf /etc/opl-ceph/ceph.conf ls --pool rbd --namespace opl
-          sudo ceph --id opltest --conf /etc/opl-ceph/ceph.conf df detail >/dev/null
+            | sudo tee /etc/orbivisor-ceph/opltest.keyring >/dev/null
+          { sudo cat /etc/ceph/ceph.conf; printf '\n[client.opltest]\nkeyring = /etc/orbivisor-ceph/opltest.keyring\n'; } \
+            | sudo tee /etc/orbivisor-ceph/ceph.conf >/dev/null
+          sudo rbd --id opltest --conf /etc/orbivisor-ceph/ceph.conf ls --pool rbd --namespace opl
+          sudo ceph --id opltest --conf /etc/orbivisor-ceph/ceph.conf df detail >/dev/null
       # 공유 LVM 풀 시험이 LV를 만들 공유 VG `oplshared`. targetcli(LIO)로 파일 백스토어 LUN 하나를
       # 내보내는 루프백 iSCSI 타깃(데모 모드 ACL, 인증 없음)을 만들어 open-iscsi로 로그인하고,
       # lvmlockd와 sanlock(softdog 감시, host_id 1)으로 그 LUN 위에 공유 VG를 만든다. lvmlockd는 호스트
@@ -415,7 +415,7 @@ jobs:
           ORBIVISOR_TEST_RBD: rbd
           ORBIVISOR_TEST_RBD_USER: opltest
           ORBIVISOR_TEST_RBD_NAMESPACE: opl
-          ORBIVISOR_TEST_RBD_CONF: /etc/opl-ceph/ceph.conf
+          ORBIVISOR_TEST_RBD_CONF: /etc/orbivisor-ceph/ceph.conf
           ORBIVISOR_TEST_LVM_SHARED: oplshared
           ORBIVISOR_TEST_ISCSI: 127.0.0.1,iqn.2003-01.org.linux-iscsi.opl:shared
           ORBIVISOR_TEST_PROMTOOL: promtool

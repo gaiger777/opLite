@@ -44,9 +44,9 @@ CLI `orbivisorctl`이나 그 데몬이 내장한 웹 UI로 한다.
 - **QEMU 직접 제어.** libvirt 없이 QEMU 명령줄을 직접 만들고 QMP로 제어한다(`crates/orbivisor-qemu`).
 - **원하는 상태 모델.** API는 Raft에 "이렇게 되어야 한다"(spec)만 쓰고, 각 노드의 reconciler가 자기에게 배정된 VM을
   그 상태로 맞춘 뒤 결과(status)를 다시 Raft에 쓴다(Kubernetes와 비슷).
-- 바이너리 이름은 계획 43에서 바뀌었다. 크레이트는 여전히 `opld`·`oplctl`이고 `[[bin]] name`이 `orbivisord`·
-  `orbivisorctl`이다(`crates/orbivisord/Cargo.toml:10-14`, `crates/orbivisorctl/Cargo.toml:10-14`). 데이터 디렉터리·설정 파일·
-  유닛 이름에는 옛 이름(`opl`, `opld.toml`, `opld.service`)이 남아 있다.
+- 바이너리 이름은 계획 43에서, 크레이트·유닛·경로·환경 변수·쿠키 이름은 계획 74에서 바뀌었다. 크레이트는 `orbivisor-*`·
+  `orbivisord`·`orbivisorctl`이다. 노드 위의 옛 이름(경로·유닛·소켓)은 새 이름을 가리키는 링크·별칭으로 남는다(§16.1, 사용 안내
+  "이름 바꾸기 2"). VM 스코프·장치·저장소 이름 등 노드와 클러스터에 저장된 이름은 그대로다.
 
 ### 1.1 Proxmox VE·vSphere와 견주기
 
@@ -76,8 +76,8 @@ Proxmox·vSphere 칸은 공개 문서의 일반적인 값이고 이 저장소에
 | `orbivisor-peer` | 9k | 노드 간 gRPC(tonic, mTLS), Raft 전송, 클러스터 CA·인증서, 노드 감시(`NodeMonitor`) |
 | `orbivisor-reconciler` | 14k | 노드마다 VM을 원하는 상태로 맞추는 루프, HA watchdog(`HaGuard`), 펌웨어 사본 따라가기 |
 | `orbivisor-api` | 138k | HTTPS REST API(axum, utoipa), 인증·권한, Task 실행기, 스케줄러, HA 관리자, 백업·복제·마이그레이션 Task, 알림 |
-| `oplctl` | 29k | CLI `orbivisorctl`(HTTP API를 부름) |
-| `opld` | 35k | 데몬 `orbivisord`: 설정, 실행기, 시작 순서, 지표 수집·기록, 웹 UI 내장, 제어 소켓 |
+| `orbivisorctl` | 29k | CLI `orbivisorctl`(HTTP API를 부름) |
+| `orbivisord` | 35k | 데몬 `orbivisord`: 설정, 실행기, 시작 순서, 지표 수집·기록, 웹 UI 내장, 제어 소켓 |
 | `web/` | 91k(TS) | React 웹 UI |
 
 ```mermaid
@@ -104,21 +104,21 @@ graph TD
   api --> types
   api --> store
   api --> restore
-  opld["opld (orbivisord)"] --> api
-  opld --> rec
-  opld --> peer
-  opld --> cluster
-  opld --> driver
-  opld --> qemu
-  opld --> types
-  opld --> store
-  ctl["oplctl (orbivisorctl)"] --> types
-  web["web/ (React)"] -. "web-ui 기능으로 내장" .-> opld
+  orbivisord["orbivisord"] --> api
+  orbivisord --> rec
+  orbivisord --> peer
+  orbivisord --> cluster
+  orbivisord --> driver
+  orbivisord --> qemu
+  orbivisord --> types
+  orbivisord --> store
+  ctl["orbivisorctl"] --> types
+  web["web/ (React)"] -. "web-ui 기능으로 내장" .-> orbivisord
   ctl -. HTTPS .-> api
 ```
 
 의존은 각 `Cargo.toml`에서 확인했다(`crates/orbivisor-peer/Cargo.toml:23-25`, `crates/orbivisor-api/Cargo.toml:37-41`,
-`crates/orbivisord/Cargo.toml:93-99`). `oplctl`은 `orbivisor-types`만 쓰고 API와는 HTTPS로만 말한다.
+`crates/orbivisord/Cargo.toml:93-99`). `orbivisorctl`은 `orbivisor-types`만 쓰고 API와는 HTTPS로만 말한다.
 
 주요 외부 크레이트: openraft 0.9.25(`serde`, `storage-v2`), redb 4.4, tonic 0.14(gRPC), axum 0.8, utoipa 6·
 utoipa-axum, rustls 0.23(ring), rcgen(인증서), argon2, ldap3, lettre(메일), rust-embed(웹 내장)
@@ -374,7 +374,7 @@ task}, source: api|web|cli|apply|terraform|task|system, reason?, request?(감사
 
 ### 3.4 스냅샷과 로그 압축
 
-- opld의 `raft_config`(`crates/orbivisord/src/member.rs:162-176`)는 스냅샷 정책을 정하지 않으므로 openraft 0.9.25 기본값을
+- orbivisord의 `raft_config`(`crates/orbivisord/src/member.rs:162-176`)는 스냅샷 정책을 정하지 않으므로 openraft 0.9.25 기본값을
   쓴다: 로그 **5000개마다** 스냅샷(`LogsSinceLast(5000)`), 스냅샷 뒤 로그 **1000개** 남김. 바꾼 것은 조각 크기 1 MiB와
   조각마다 제한 시간 10초뿐이다.
 - 스냅샷은 상태 전체를 JSON 문서 하나 `{schema_version, objects: [(Kind, Resource)], history?}`로 만든다(`history`는 설정 기록
@@ -485,7 +485,7 @@ sequenceDiagram
 
 - 리더가 아니면 `NotLeader`를 받고 `Forwarder`(orbivisor-peer의 `Leader` RPC)로 보낸다
   (`crates/orbivisor-peer/src/client.rs:1053`, `crates/orbivisor-peer/src/server.rs:306-313`). 시도마다 3초
-  (`FORWARD_ATTEMPT_TIMEOUT`), 실패하면 50 ms마다 다시 시도해 전체 **10초**(opld의 `WRITE_TIMEOUT`,
+  (`FORWARD_ATTEMPT_TIMEOUT`), 실패하면 50 ms마다 다시 시도해 전체 **10초**(orbivisord의 `WRITE_TIMEOUT`,
   `member.rs:79,353`; 라이브러리 기본은 5초)까지 간다(`cluster.rs:36-43`).
 - 성공하면 자기 노드가 그 index를 적용할 때까지 기다리므로 같은 노드에서 자기 쓰기를 바로 읽는다
   (`cluster.rs:780-797`).
@@ -784,7 +784,7 @@ reconciler나 Task 실행기가 한다. `remote_proxy.rs`는 다른 **클러스�
   `/vm-checks`(만들기 미리 확인 — 쓰지 않고 감사 로그에 적지 않음, 계획 71),
   `/snapshots`, `/backups`, `/backup-jobs`, `/vm-imports`, `/images`, `/tasks`, `/watch`, `/audit`, 지표·알림·알림 대상,
   HA 그룹·검사·배치, Ceph, `/folders`, `/access-roles`, `/groups`, `/grants`, `/permissions/*`.
-- `GET /api/v1/openapi.json`은 인증 없이 열려 있다(`lib.rs:394-400`). 보안 방식은 Bearer 토큰과 쿠키 `opl_session`.
+- `GET /api/v1/openapi.json`은 인증 없이 열려 있다(`lib.rs:394-400`). 보안 방식은 Bearer 토큰과 쿠키 `orbivisor_session`(옛 이름 `opl_session`도 한 릴리스).
 - 웹의 타입은 `pnpm gen:api`가 `cargo run -p orbivisor-api --bin orbivisor-api-openapi`로 문서를 뽑고 openapi-typescript로
   `web/src/api/schema.d.ts`를 만든다(CI가 차이를 검사).
 
@@ -834,7 +834,7 @@ SSE는 없다. WebSocket 둘이다.
 | OIDC | code flow + PKCE S256 + nonce. 로그인 상태는 클러스터 CA 키에서 HKDF로 뽑은 키로 서명한 쿠키라 어느 노드든 콜백을 받음. RS256·ES256 | `oidc_login.rs:1-210` |
 | API 토큰 | `opl_<uuid>_<secret>`, SHA-256만 저장, 상수 시간 비교. 선택 `scope`(권한 × 대상)로 주인 권한과 교집합 | `auth.rs:155-176,591-611`, `crates/orbivisor-types/src/auth.rs:142-150` |
 | 2단계 인증 | TOTP(SHA-1), 복구 코드 10개(SHA-256), 패스키(직접 쓴 최소 WebAuthn 검증기, attestation none). 대기 세션 300초. 역할·영역별 강제, OIDC 사용자는 제외. **API 토큰은 2FA를 건너뜀** | `two_factor.rs`, `webauthn.rs:1-8`, `auth.rs:795` |
-| 세션 | 쿠키 `opl_session`(HttpOnly, SameSite=Strict, Secure), 12시간. 모든 노드가 `shared-sessions`를 알리면 Raft `Session`(쿠키의 SHA-256이 이름)에, 아니면 노드 메모리에. 사용자마다 32개, 마지막 사용은 60초에 한 번 씀. 비밀번호를 바꾸면 `session_epoch`가 올라 모든 노드의 세션이 끝남 | `auth.rs:28-38,356-541,634-639` |
+| 세션 | 쿠키 `orbivisor_session`(HttpOnly, SameSite=Strict, Secure — 옛 판 노드와 섞여도 되게 같은 값의 `opl_session`도 쓰고, 읽기는 새 것 먼저), 12시간. 모든 노드가 `shared-sessions`를 알리면 Raft `Session`(쿠키의 SHA-256이 이름)에, 아니면 노드 메모리에. 사용자마다 32개, 마지막 사용은 60초에 한 번 씀. 비밀번호를 바꾸면 `session_epoch`가 올라 모든 노드의 세션이 끝남 | `auth.rs:28-38,356-541,634-639` |
 
 - **CSRF.** 쿠키 요청은 `Origin`이 `Host`와 같거나 허용한 `web_origins`여야 한다(아니면 403 `cross_origin`). CSRF 토큰은
   없다(`auth.rs:329-344,692-718`).
@@ -875,7 +875,7 @@ SSE는 없다. WebSocket 둘이다.
   Tailwind 4, i18next, uPlot(차트), noVNC(콘솔), vitest·msw·Playwright(`web/package.json`).
 - **화면(계획 61).** 영역 여섯(홈, VM, 인프라, 보호, 활동, 설정)과 영역 안 탭, ⌘K 명령 팔레트(`web/src/layout/nav.ts:39-132`,
   `web/src/palette/`).
-- **빌드와 내장.** `pnpm -C web build`가 `web/dist`를 만든다. opld의 `web-ui` 기능이 rust-embed로 `$OPL_WEB_DIST`
+- **빌드와 내장.** `pnpm -C web build`가 `web/dist`를 만든다. orbivisord의 `web-ui` 기능이 rust-embed로 `$ORBIVISOR_WEB_DIST`
   (`crates/orbivisord/build.rs`가 `web/dist` 절대 경로로 정함)를 바이너리에 넣는다. 배포 빌드는 없으면 실패하고, 디버그
   빌드는 디스크에서 읽고 없어도 된다(`crates/orbivisord/src/web.rs:1-30`). `[web] enabled = false`면 웹을 내지 않는다
   (`member.rs:929-934`).
@@ -1042,7 +1042,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-  Q[노드 QEMU] -->|QMP 탐침| N[opld 검사 루프]
+  Q[노드 QEMU] -->|QMP 탐침| N[orbivisord 검사 루프]
   N -->|해시 이름| C[(CpuCatalog 리소스)]
   N -->|NodeStatus.cpu = 해시| R[(Raft)]
   C --> L[리더 janitor 틱: cpu::baseline]
@@ -1055,7 +1055,7 @@ flowchart LR
 - **모델.** `CpuModel`은 `host`·`max`·`cluster`·`x86-64-v2|v2-aes|v3|v4`·QEMU 이름(`Named`)이고 `CpuSpec.flags`는 `+이름`/`-이름`
   이다(`crates/orbivisor-types/src/cpu.rs`). 수준 넷만 코드에 얼린 정의(Proxmox와 같음)이고, 그 밖의 모델 목록은 코드에 없다.
   API는 별칭(`Icelake-Server`)을 노드들이 알린 카탈로그로 버전 모델(`-v1`)로 바꿔 저장한다(`crates/orbivisor-api/src/cpu.rs`).
-- **노드 탐침.** opld가 시작할 때와 QEMU 바이너리(경로·크기·mtime)가 바뀔 때 QEMU를 VM과 같은 머신·가속기로 띄워
+- **노드 탐침.** orbivisord가 시작할 때와 QEMU 바이너리(경로·크기·mtime)가 바뀔 때 QEMU를 VM과 같은 머신·가속기로 띄워
   `query-cpu-definitions`·모델마다 `query-cpu-model-expansion`·`-cpu help`를 읽어 `CpuCatalogSpec`을 만든다
   (`crates/orbivisor-qemu/src/cpu.rs:268`, `crates/orbivisord/src/cpu.rs:151` `CpuWatch`). 카탈로그 본문은 이름이 SHA-256인 `CpuCatalog`
   리소스 하나이고(같은 QEMU·CPU·가속기 노드가 나눠 씀, x86 약 41 KB), `NodeStatus.cpu`에는 해시·QEMU 버전·가속기·호스트
@@ -1084,7 +1084,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-  S["/sys/devices/system"] -->|"TopologyWatch 30초"| N[opld 검사 루프]
+  S["/sys/devices/system"] -->|"TopologyWatch 30초"| N[orbivisord 검사 루프]
   N -->|"NodeStatus.topology, 바뀔 때만"| R[(Raft)]
   A["API 스케줄러: Inventory.host_usage + numa::fit"] -->|spec.node| R
   R -->|"HostCheck: 노드마다 합계"| R
@@ -1101,7 +1101,7 @@ flowchart LR
   설정 `host_resources`가 바뀐 회차에 읽고, 값이 다를 때만 `NodeStatus.topology`에 쓴다(`probed_at`도 그때만 — 2소켓 256 CPU에서
   1,924바이트). **빈 자원은 노드 상태에 넣지 않는다** — VM을 켤 때마다 Raft 쓰기가 생기므로, 빈 것은 VM 기록에서 셈하고 화면은
   노드 RPC `ReadTopology`(빈 메모리·빈/남는 hugepages·orbivisord 친화)로 바로 묻는다. 같은 루프가 노드 설정을 적용한다: 예약 CPU로
-  opld 자기 스레드 친화, `nr_hugepages` 쓰기(설정이 바뀔 때만), 경고 문자열.
+  orbivisord 자기 스레드 친화, `nr_hugepages` 쓰기(설정이 바뀔 때만), 경고 문자열.
 - **세 층의 자원 세기.** 같은 순수 함수(`crates/orbivisor-types/src/numa.rs` — `layout:1165`, `fit:1480`, `fit_fixed:1531`,
   `demand:1952`, `HostLimits:2047`·`exceeded:2079`)를 셋이 쓴다. 위가 빠르고 거칠며 아래가 정확하고 마지막에 정한다.
   1. **Raft 받아들이기 검사**(`crates/orbivisor-cluster/src/hosts.rs:40` `HostCheck`, 폴더 할당량과 같은 VM 훑기): VM 만들기·스펙 쓰기
@@ -1115,11 +1115,11 @@ flowchart LR
      `fit`해 본다. 새로 켜기(배치·HA 복구·복제 배치)는 스펙 모양, 도는 VM 옮기기(마이그레이션·비우기·균형 조정·HA 되돌아가기)는
      `fit_fixed(hardware.numa)`다. 켜기는 `HostResourcesExceeded`면 그 노드를 빼고 한 번 다시 고른다. 균형 조정기는 전용 VM을
      옮기지 않는다. 빈 메모리 순위는 노드 메모리에서 hugepages 풀을 뺀 값이다. `numa_plan`(`:758`)이 `/vms/{key}/numa`에 같은 판정을 준다.
-  3. **노드 할당기**(`crates/orbivisor-reconciler/src/host_alloc.rs:52` `HostAllocator`, opld마다 하나 — 작업자들과 `IncomingMigrations`가
+  3. **노드 할당기**(`crates/orbivisor-reconciler/src/host_alloc.rs:52` `HostAllocator`, orbivisord마다 하나 — 작업자들과 `IncomingMigrations`가
      `Arc`로 나눔): 켜기·받기 때 잠금 안에서 `claim`(`:70`)이 정확한 pCPU·호스트 노드·페이지를 고르고 예약을 만든다. 보는 것은 이
      노드의 Raft 기록 + 켜는 중·받는 중 예약 + `/sys`의 실제 `free_hugepages`(다른 프로세스가 쓴 것)다. 한 노드의 QEMU는 그 노드의
-     opld만 띄우므로 이 잠금 하나로 pCPU가 두 번 잡히지 않는다. 다른 VM의 켜는 중 예약 때문에 안 되면 `Waiting`(실패로 세지 않음),
-     아니면 `Cannot`(꺼짐). 받는 중 예약은 실행 디렉터리의 `hardware.json`에 남아 opld가 다시 떠도 되살린다.
+     orbivisord만 띄우므로 이 잠금 하나로 pCPU가 두 번 잡히지 않는다. 다른 VM의 켜는 중 예약 때문에 안 되면 `Waiting`(실패로 세지 않음),
+     아니면 `Cannot`(꺼짐). 받는 중 예약은 실행 디렉터리의 `hardware.json`에 남아 orbivisord가 다시 떠도 되살린다.
 - **기록.** 켤 때 `RunningHardware.numa`(게스트가 보는 것: 노드마다 소켓·메모리, 거리, 페이지, 정책 — 마이그레이션 양쪽이 같아야
   한다)와 `host_placement`(이 노드에만 맞는 것: 자리마다 pCPU, 에뮬레이터 CPU, `isolate`가 비운 형제, 게스트 노드마다 호스트 노드)를
   쓴다(계획 63 `cpu_resolved`와 같은 길). 라이브 마이그레이션은 받는 쪽이 `fit_fixed`로 고른 배치를 `MigrateIncomingResponse.host_placement`로
@@ -1131,7 +1131,7 @@ flowchart LR
   고정 — vCPU는 `query-cpus-fast`의 소켓·코어로 자리를 찾아 그 pCPU, 나머지는 에뮬레이터 집합, 커널 일꾼(`PF_USER_WORKER` 등,
   `crates/orbivisor-driver/src/affinity.rs:28`)은 건너뜀(`qemu.rs:4072` `pin_threads`). vCPU는 `/proc/<pid>/task/<tid>/status`로 확인하고
   틀리면 QEMU를 끈다. 고정은 실행 디렉터리 `pinning.json`에 남아 실행 중 붙인 vCPU와 아래 루프가 읽는다. 노드에 예약·전용 집합이
-  없고 배치도 없으면 아무것도 걸지 않는다(opld가 예약 CPU로 자기를 묶었으면 공유 VM도 공유 집합으로 다시 건다 — 물려받지 않게).
+  없고 배치도 없으면 아무것도 걸지 않는다(orbivisord가 예약 CPU로 자기를 묶었으면 공유 VM도 공유 집합으로 다시 건다 — 물려받지 않게).
 - **어긋남 고치기.** `crates/orbivisord/src/checks.rs:191` `PinWatch`가 여섯 회차(30초)마다와 `host_resources`가 바뀐 회차에
   `host_alloc::repin`(`host_alloc.rs:296`)을 부른다: 도는 VM마다 기록과 지금 세 집합으로 고정을 다시 셈해 스코프 `AllowedCPUs`
   (`systemctl set-property --runtime`)와 스레드 친화가 다를 때만 다시 걸고 경고 로그를 남긴다(누가 `taskset`을 썼거나 공유 집합이
@@ -1185,14 +1185,14 @@ flowchart LR
   백업·복원·지우기·옮기기·복사), `tasks/store_tasks.rs`(초기화·GC·검증·scan), `tasks/live_restore.rs`가 걸음을 차례로 부른다.
   - **읽기는 pull**: 실행 중 VM은 복제(§5.7)와 같은 copy-before-write 플리싱(VM 상태 디렉터리의 성긴 파일) 위 snapshot-access
     노드를 QEMU가 유닉스 소켓 NBD로 내보내고(증분은 남의 노드 비트맵 문맥 `qemu:dirty-bitmap:opl-fl-point` — 부모 비트맵은 끄지
-    않고 같은 transaction에서 꺼진 임시 비트맵으로 시점을 얼림), 꺼진 VM은 `qemu-nbd`다. opld의 Task가 순수 Rust NBD 클라이언트로
+    않고 같은 transaction에서 꺼진 임시 비트맵으로 시점을 얼림), 꺼진 VM은 `qemu-nbd`다. orbivisord의 Task가 순수 Rust NBD 클라이언트로
     4 MiB씩 읽어 0 검사 → 청크 id(SHA-256 또는 키 HMAC) → base 같은 자리·이번 실행·`HEAD` 있음 확인 → lz4·AES-256-GCM(결정적
     nonce) → 올림을 겹쳐 돈다. 저장소 쪽 스냅샷이 필요 없어 모든 풀에서 같다.
   - **GC는 표시·쓸기**: 저장소 시계의 T0 → 시작 때 진행 중이던 백업을 기다림 → Raft CAS 쓰기 잠금(`committing`이 비어야
     `sweeping`, epoch + 1)과 늦은 표시 → T0 − 5분보다 오래된 표시 없는 청크를 지움. 표시 집합은 Bloom 필터. 백업은 매니페스트를
     쓰기 전에 `committing`에 들어가고, 시작 뒤 epoch가 바뀌었으면 "있음"으로 건너뛴 청크를 다시 확인해 사라진 것을 열린 원본에서
     다시 올린다. 안전은 `orbivisor-store`의 모형 proptest가 지킨다.
-  - **복원은 NBD 서버**: 보통 복원·옮기기·복사는 opld 안의 NBD 서버(`StoreExport` — 풀린 청크 LRU, 미리 읽기, 0 청크는 구멍)를
+  - **복원은 NBD 서버**: 보통 복원·옮기기·복사는 orbivisord 안의 NBD 서버(`StoreExport` — 풀린 청크 LRU, 미리 읽기, 0 청크는 구멍)를
     `qemu-img convert`가 읽고, 라이브 복원은 같은 서버를 헬퍼 `orbivisord backup-serve`(표준 입력 설정, Linux systemd면
     `orbivisor-bkserve-<id>` scope)로 띄워 QEMU가 오버레이의 backing으로 읽는다(`reconnect-delay=300`). Task가 배선 파일
     (`live-restore.json`)을 두면 reconciler의 보통 켜기가 드라이버를 거쳐 그 배선의 명령줄로 켜고, Task는 `blockdev-mirror`
@@ -1211,13 +1211,13 @@ flowchart LR
     `-kernel`·`-initrd`로 직접 부팅, `-nodefaults -no-user-config -net none -display none`, 디스크마다 읽기 전용 원본 + 버리는 qcow2
     덮개(`{data_dir}/file-restore/<id>/ov{i}.qcow2` — 저널 재생은 여기 씀) 위 virtio-blk(`serial=opl-disk{i}`), virtio-serial 포트
     `org.orbivisor.restore.0`(`{run_dir}/file-restore/<id>/ctl.sock`), virtio-rng, 콘솔은 파일. Linux systemd면 `orbivisor-fr-<id>.scope`
-    (`MemoryMax`·`TasksMax=64`·`CPUQuota`), opld가 root면 `-run-with user=nobody`(또는 `-runas`), seccomp QEMU면 `-sandbox on,…` — QEMU가
-    무엇을 받는지는 `<옵션> -version`으로 바이너리마다 한 번 묻는다. 원본은 저장소 백업이면 opld 안 NBD 서버(계획 68 `serve`, 세션
+    (`MemoryMax`·`TasksMax=64`·`CPUQuota`), orbivisord가 root면 `-run-with user=nobody`(또는 `-runas`), seccomp QEMU면 `-sandbox on,…` — QEMU가
+    무엇을 받는지는 `<옵션> -version`으로 바이너리마다 한 번 묻는다. 원본은 저장소 백업이면 orbivisord 안 NBD 서버(계획 68 `serve`, 세션
     디렉터리의 `nbd.sock` — 키는 opld를 떠나지 않음, `reconnect-delay` 없음), 옛 풀 백업이면 qcow2 체인 json이다.
   - **통신 규약**(`orbivisor-restore::proto`, 판 2): 프레임 = 길이(u32 BE)·흐름 번호·종류(`Req`·`Resp`·`Data`·`End`·`Err`·`Ack`) + JSON(≤ 1 MiB) 또는
-    데이터(≤ 1 MiB). 흐름마다 받을 몫 4 MiB: 에이전트는 `Resp`·`Data`를 몫만큼만 보내고 opld가 받아 쓴 만큼 `Ack`로 돌려준다 — 느린 받는
-    쪽(멈춘 브라우저·느린 게스트 쓰기)은 그 흐름만 멈추고, opld의 읽기 고리는 기다리지 않는다. 요청 `Probe`·`Mount`·`List`·`Stat`·`Read`·`Walk`·`Cancel`·`Shutdown`, 에이전트는 첫 `Hello{proto, image_version}`와 걷기 중
-    `Progress`. opld 쪽 `HelperClient`가 흐름마다 `StreamCheck`(차례·크기·이름·깊이·몫·걷기 항목 수(건너뜀 포함)·경로 바이트 한도 —
+    데이터(≤ 1 MiB). 흐름마다 받을 몫 4 MiB: 에이전트는 `Resp`·`Data`를 몫만큼만 보내고 orbivisord가 받아 쓴 만큼 `Ack`로 돌려준다 — 느린 받는
+    쪽(멈춘 브라우저·느린 게스트 쓰기)은 그 흐름만 멈추고, orbivisord의 읽기 고리는 기다리지 않는다. 요청 `Probe`·`Mount`·`List`·`Stat`·`Read`·`Walk`·`Cancel`·`Shutdown`, 에이전트는 첫 `Hello{proto, image_version}`와 걷기 중
+    `Progress`. orbivisord 쪽 `HelperClient`가 흐름마다 `StreamCheck`(차례·크기·이름·깊이·몫·걷기 항목 수(건너뜀 포함)·경로 바이트 한도 —
     걷기 한도는 그 흐름만 `Limit`으로 끝냄)를 걸고 세션당 데이터 흐름 4·첫 답과
     데이터 사이 60초(세 번 이어지면 세션 닫음), 위반은 세션을 닫는다. 에이전트 몸통은 `Fs` trait 위라 같은 코드가 가짜 하이퍼바이저의
     가짜 도우미(소켓 쌍 + 메모리 나무)가 된다.
@@ -1229,8 +1229,8 @@ flowchart LR
     Windows는 PowerShell `-EncodedCommand`)로 쓴다. 하이퍼바이저 `guest_file(id, &GuestFileOp)` 하나, 다른 노드의 VM이면 `GuestAgent` RPC의
     `file` 갈래. 허락 여부는 `guest-info.supported_commands`로 본다.
   - **치우기**: 세션 끝·실패에 Drop 지킴이가 도우미(Shutdown → SIGTERM → SIGKILL)·scope·두 세션 디렉터리·NBD 서버·세션 자리를 거두고,
-    opld 시작 때 `sweep_restore_helpers`가 제 `{run_dir,data_dir}/file-restore`에 남은 세션의 `orbivisor-fr-<id>`·옛 `opl-fr-<id>`(명령줄을 확인한 pid만)·그
-    세션의 scope·두 디렉터리를 지운다(같은 호스트의 다른 opld 것은 두지 않음). 덮개 지킴이는 부팅 중에도 2초마다 합이 `overlay_max_mib`를
+    orbivisord 시작 때 `sweep_restore_helpers`가 제 `{run_dir,data_dir}/file-restore`에 남은 세션의 `orbivisor-fr-<id>`·옛 `opl-fr-<id>`(명령줄을 확인한 pid만)·그
+    세션의 scope·두 디렉터리를 지운다(같은 호스트의 다른 orbivisord 것은 두지 않음). 덮개 지킴이는 부팅 중에도 2초마다 합이 `overlay_max_mib`를
     넘으면 세션을 닫는다.
   - 자세한 것은 [파일 단위 복원 안내](guide/backup.md#파일-단위-복원)와 [설계](superpowers/specs/2026-11-24-file-restore-design.md).
 - **로컬 디스크 복제(HA)**는 §5.7.
@@ -1274,7 +1274,7 @@ flowchart LR
 ### 11.2 VXLAN
 
 - 평범한 커널 장치: `oplv<vni>` 브리지 + `oplx<vni>`(`type vxlan id … local … dstport 4789`)(`net.rs:488-499`).
-- BUM 트래픽은 다른 모든 노드의 정적 목록으로 head-end 복제한다(MAC 0의 FDB 항목, `net.rs:552-593`). opld의 overlay
+- BUM 트래픽은 다른 모든 노드의 정적 목록으로 head-end 복제한다(MAC 0의 FDB 항목, `net.rs:552-593`). orbivisord의 overlay
   에이전트가 60초마다(바뀌면 1초 뒤) 맞춘다(`crates/orbivisord/src/overlay.rs:1-28`). 기본 MTU 1450.
 
 ### 11.3 보안 그룹(nftables)
@@ -1476,7 +1476,7 @@ graph LR
 - **옮기기 엔진**(`crates/orbivisor-types/src/network_migration.rs`, `crates/orbivisor-api/src/tasks/network_migrate.rs`, `network_migrations.rs`): 순수
   `plan(PlanInput) -> MigrationPlan`이 VM NIC마다 방식(`offline`·`live`·`restart`·`blocked`)·주소와 출처(`given` → `guest-agent` → `cloud-init` →
   `ipam`)·막힘·경고와 다리 노드를 낸다(미리 보기와 Task가 같은 함수). `network-migrate` Task(`TaskOp::NetworkMigrate { step: start|rollback|
-  finish }`)는 VM마다 그때 다시 계획해 다르면 그 VM만 `failed`, VM 스펙·전원·도는 NIC(`status.hardware`)를 보고 다음 한 걸음을 하므로 opld가
+  finish }`)는 VM마다 그때 다시 계획해 다르면 그 VM만 `failed`, VM 스펙·전원·도는 NIC(`status.hardware`)를 보고 다음 한 걸음을 하므로 orbivisord가
   다시 떠도 이어 간다(시간 제한 없음, `status.vms`에 VM마다 상태). `live`는 핫플러그 계획의 새 단계 `Step::RelinkNic(i)`(같은 순번·MAC·모델에
   네트워크만 단순 ↔ SDN — `hotplug::relinkable`/`plan_relink`, 일반 `plan`·`PUT`은 여전히 거절하고 `PUT`은 409 `nic_network_live`) →
   `HostNet::relink_tap`(브리지 `nomaster` → OVS `add-port`와 `iface-id`, MTU, tc 떼고 다시) → `ovn-installed` 30초 → QMP `set_link` 끔·켬, 오지
@@ -1486,7 +1486,7 @@ graph LR
   막음). Raft 겹침 키 `migration-source`(원본마다 진행 중 하나)·`migration-vm`(`spec.vms ∪ status.vms[].vm`, 끝난 옮기기는 값 없음 —
   `exclusive_values(kind, spec, status)`). 다리 동안 대상의 라우터 붙이기는 409 `network_migrating`. 다리 노드를 지우면(`DELETE /nodes`)
   옮기기를 `paused`로 두고 다리 기록을 지운다.
-- **OVN 접근 잠금**(`crates/orbivisor-driver/src/ovn/units.rs`·`lockdown.rs`, opld `SdnAgent`, `crates/orbivisor-api/src/tasks/sdn.rs`): 잠긴 중앙의 SB는
+- **OVN 접근 잠금**(`crates/orbivisor-driver/src/ovn/units.rs`·`lockdown.rs`, orbivisord `SdnAgent`, `crates/orbivisor-api/src/tasks/sdn.rs`): 잠긴 중앙의 SB는
   `--config-file=/etc/orbivisor/ovn/sb.json`(6642 `role=ovn-controller`, 6645 특권, `punix`)으로 뜨고 northd는 잠긴 중앙엔 6645, 아직 아닌 중앙엔
   6642로 붙는다(`northd_args(centrals, locked)`). **중앙을 바꾸는 것은 각 중앙의 에이전트**다(Task는 한 노드에서만 돌아 다른 중앙의 단위를 쓸 수
   없다): `sdn-lockdown` Task는 `SdnSpec.lockdown`과 `pending`을 쓰고 기다리기만 하며, 각 중앙이 자기 차례(`lockdown_turn` — 다른 중앙이 모두
@@ -1632,7 +1632,7 @@ graph LR
 | 제어 소켓 | 0600 유닉스 소켓, 인증 없음(루트 전용) | §7.1 |
 | OVN(계획 65~67) | NB·SB·Raft는 `pssl`만, 클러스터 CA mTLS(노드 인증서 사본), OvnSync는 서버 이름도 확인. 잠금(계획 67, 새 클러스터 기본): SB 역할 포트 `role=ovn-controller`(chassis는 자기 행만), northd 전용 특권 포트 6645, Raft 멤버십을 따르는 nftables 주소 허용 목록(지운 노드는 인증서가 살아 있어도 끊김). `Port_Binding`·`MAC_Binding`·`FDB`는 OVN RBAC가 id를 보지 않음, NB에는 RBAC 없음. SDN NIC의 보안 그룹은 OVN ACL(포트 보안이 IP 위조도 막음), 포트는 Port_Group이 있어야 생김(실패하면 닫힘) | §11.4~§11.6 |
 | swtpm | AppArmor 추가 규칙 | §9.2 |
-| 파일 단위 복원(계획 69) | 백업 안 파일시스템은 믿지 않는 입력 — 호스트 커널·opld가 해석하지 않고 세션마다 네트워크 없는 도우미 VM(에이전트 PID 1, 셸 없음, `ro,nodev,nosuid,noexec`)이 해석. 원본은 QEMU `read-only=on` + 버리는 덮개, scope·`-run-with user=nobody`·seccomp sandbox, 통신 규약 한도(위반이면 세션 닫음), 아카이브 경로 거르기·zip에 링크 없음, 내려받기 링크는 60초·한 번·같은 사용자, 요청마다 권한 다시 확인, 새 권한 `backup.file_restore`(operator 없음), 암호화 저장소 키는 opld 안에만. macOS는 권한 내림·sandbox 없음 | §10.3 |
+| 파일 단위 복원(계획 69) | 백업 안 파일시스템은 믿지 않는 입력 — 호스트 커널·orbivisord가 해석하지 않고 세션마다 네트워크 없는 도우미 VM(에이전트 PID 1, 셸 없음, `ro,nodev,nosuid,noexec`)이 해석. 원본은 QEMU `read-only=on` + 버리는 덮개, scope·`-run-with user=nobody`·seccomp sandbox, 통신 규약 한도(위반이면 세션 닫음), 아카이브 경로 거르기·zip에 링크 없음, 내려받기 링크는 60초·한 번·같은 사용자, 요청마다 권한 다시 확인, 새 권한 `backup.file_restore`(operator 없음), 암호화 저장소 키는 orbivisord 안에만. macOS는 권한 내림·sandbox 없음 | §10.3 |
 | VMware 이전·내보내기(계획 72) | 원본 비밀번호는 Raft에만(API·watch·감사·로그·`Debug`·Task에서 뺌, `Secret` 타입), vCenter·ESXi 인증서 SHA-256 지문 고정(틀리면 비밀번호를 보내기 전에 끊음 — 가짜 vSphere 요청 기록으로 시험), 호스트 티켓 길의 ESXi 인증서는 vCenter가 알려 준 PEM으로 고정, VDDK 비밀번호는 nbdkit 표준 입력, 원본 쓰기는 우리 스냅샷·CBT·보호 설정·전원뿐, 원본 바꾸기 `cluster.admin`·전환은 대상 폴더 `vm.create`+`vm.power`, 새 권한 `vm.export`(operator 없음), 내려받기 서명 링크(HKDF 키, 10분·사용자, 감사에 토큰 없음) | §10.3 |
 | 백업 저장소(계획 68) | 노드에서 AES-256-GCM(HKDF로 나눈 키, HMAC 청크 id, 결정적 nonce, 매니페스트 HMAC 인증), 주 키는 Raft에(API·watch·감사·`Debug`에서 뺌), 복구 키·저장소 안 argon2id escrow, S3는 rustls + SigV4(인증서 검증 실패는 다시 하지 않음), `backup-serve` 소켓 0600·설정은 표준 입력 | §10.3 |
 
@@ -1723,8 +1723,8 @@ ACME로 자동 갱신할 수 있다(계획 73).
   lvm2, ceph-common, swtpm 등. 옛 제품 이름의 패키지는 빈 전환 패키지로 남아 있다(`packaging/deb/`).
 - 패키지 `orbivisor-restore-image`(amd64, 계획 69): 파일 복원 도우미 이미지 `/usr/share/orbivisor/restore/x86_64/{vmlinuz,initrd.img,manifest.json}`
   (`packaging/restore-image/build.sh` — Debian 13 deb을 `debian.lock`의 SHA-256으로 고정, 재현 빌드). `orbivisor`가 추천하고 자신은
-  `Depends: orbivisor (= 판)`. `build-deb.sh`는 `OPL_RESTORE_IMAGE_DIR`이 있을 때만 만든다. 설치 ISO에는 아직 넣지 않는다.
-- 빌드: `pnpm -C web build && OPL_VERSION=… cargo build --release -p orbivisord --features web-ui -p orbivisorctl`
+  `Depends: orbivisor (= 판)`. `build-deb.sh`는 `ORBIVISOR_RESTORE_IMAGE_DIR`이 있을 때만 만든다. 설치 ISO에는 아직 넣지 않는다.
+- 빌드: `pnpm -C web build && ORBIVISOR_VERSION=… cargo build --release -p orbivisord --features web-ui -p orbivisorctl`
   (`packaging/deb/build-deb.sh:6`).
 
 | 설치 경로 | 내용 |
@@ -1744,13 +1744,13 @@ ACME로 자동 갱신할 수 있다(계획 73).
 VM은 `opl-vm-<id>.scope`, swtpm은 `opl-tpm-<id>.scope`로 데몬과 따로 돈다(§8.2).
 
 postinst는 swtpm AppArmor include를 더하고 첫 설치면 서비스를 켜고 시작한다(chroot 안이면 켜기만). postrm은
-`/var/lib/opl`, `/etc/opl`을 지우지 않는다.
+`/var/lib/orbivisor`, `/etc/orbivisor`와 옛 이름 링크를 지우지 않는다.
 
 ### 16.2 설치 ISO
 
 Debian 13(trixie) netinst(SHA-256 고정, `packaging/iso/debian.lock`)에 preseed를 더한다. LVM 분할, ssh 서버, 일반 사용자
 없음. `late_command`의 `orbivisor-setup.sh`가 CD의 패키지 설치 → 기본 경로 NIC를 `vmbr0` 브리지로 → 호스트 이름과
-주소로 `/etc/opl/opld.toml` 쓰기 → 콘솔 안내(`/etc/issue.d`)를 한다(`packaging/iso/preseed/orbivisor-setup.sh`).
+주소로 `/etc/orbivisor/orbivisord.toml` 쓰기 → 콘솔 안내(`/etc/issue.d`)를 한다(`packaging/iso/preseed/orbivisor-setup.sh`).
 `orbivisor-ci-init.service`는 무인 설치 시험 전용이다(cloud-init과 무관). 첫 부팅 뒤 `orbivisorctl cluster init` 또는
 `join`으로 클러스터를 만든다.
 
@@ -1771,20 +1771,20 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 
 | 기능 | 크레이트 | 시험하는 것 |
 |---|---|---|
-| `qemu-it`, `net-it`, `vtpm-it` | orbivisor-qemu, orbivisor-driver, orbivisor-reconciler, opld | 실제 QEMU, 브리지·tap, swtpm |
-| `storage-it`, `nfs-it`, `lvm-it`, `zfs-it`, `rbd-it`, `lvm-shared-it`, `ceph-it` | orbivisor-driver, orbivisor-api, opld | 저장소 백엔드, Ceph 자동 구성 |
-| `migration-it`, `ha-it`(+ `orbivisor-peer/fault-it`) | opld | 실제 프로세스 마이그레이션, HA·펜싱, 장애 주입 |
-| `install-media-it`, `templates-it` | opld | 설치 매체·cloud-init, 템플릿 |
-| `web-it`(= `qemu-it` + `web-ui`) | opld | 웹 내장과 실제 VM |
-| `starve-it` | opld | 실행기를 일부러 막고 Raft·리스가 견디는지(§2.2) |
-| `metrics-it` | opld | 지표 수집·기록 |
-| `backup-it`(= `qemu-it`), `s3-it`(= `backup-it`) | opld | 실제 QEMU로 백업 저장소 백업·증분·GC·검증·복원·라이브 복원(orbivisorctl로), S3 호환 저장소(HTTP·사설 CA HTTPS, GC와 백업 동시, 저장소 멈춤 도중 백업·라이브 복원, 두 클러스터 DR) |
-| `restore-it` | orbivisor-driver(= `qemu-it`), opld(= `backup-it`) | 실제 도우미 이미지·고정물 디스크로 도우미 VM 탐지·저널 재생·덮개 한도·`kill -9`·권한 내림·sandbox·scope(orbivisor-driver), orbivisorctl `backup files` E2E — 저장소·풀 증분 체인·도우미와 opld 죽음 뒤 치우기·실제 게스트 에이전트로 되돌려 쓰기(opld) |
-| `sdn-it` | opld | 깨끗한 Ubuntu 24.04에 OVN 설치·mTLS·OvnSync·DHCP·포트 바인딩, physnet·공급자 네트워크·라우터·SNAT·유동 IP·RA·DHCPv6·nftables와 OVN 보안 그룹 비교, 부하 분산·건강 검사 넘김·바깥 VIP·QoS 측정(iperf3)·단순 NIC tc·옮기기(라이브 tap·다리·되돌리기·끝내기)·잠금(RBAC·허용 목록)(root, OVN을 남김) |
-| `sdn-multinode-it` | opld | 한 호스트의 systemd 컨테이너 셋을 노드로: OVN Raft 셋, chassis 사이 Geneve·동서 라우팅, SNAT, 분산·중앙 유동 IP, 게이트웨이 넘김, 두 chassis 마이그레이션, 죽은 중앙 `cluster/kick`, 계획 67의 잠금 켜고 끄기·여러 chassis 보안 그룹·LB 넘김·바깥 VIP GARP·Geneve 너머 QoS·VXLAN 원본 옮기기와 다리 노드 바꾸기·SDN 경보(webhook)·지운 노드 끊기(root, docker) |
+| `qemu-it`, `net-it`, `vtpm-it` | orbivisor-qemu, orbivisor-driver, orbivisor-reconciler, orbivisord | 실제 QEMU, 브리지·tap, swtpm |
+| `storage-it`, `nfs-it`, `lvm-it`, `zfs-it`, `rbd-it`, `lvm-shared-it`, `ceph-it` | orbivisor-driver, orbivisor-api, orbivisord | 저장소 백엔드, Ceph 자동 구성 |
+| `migration-it`, `ha-it`(+ `orbivisor-peer/fault-it`) | orbivisord | 실제 프로세스 마이그레이션, HA·펜싱, 장애 주입 |
+| `install-media-it`, `templates-it` | orbivisord | 설치 매체·cloud-init, 템플릿 |
+| `web-it`(= `qemu-it` + `web-ui`) | orbivisord | 웹 내장과 실제 VM |
+| `starve-it` | orbivisord | 실행기를 일부러 막고 Raft·리스가 견디는지(§2.2) |
+| `metrics-it` | orbivisord | 지표 수집·기록 |
+| `backup-it`(= `qemu-it`), `s3-it`(= `backup-it`) | orbivisord | 실제 QEMU로 백업 저장소 백업·증분·GC·검증·복원·라이브 복원(orbivisorctl로), S3 호환 저장소(HTTP·사설 CA HTTPS, GC와 백업 동시, 저장소 멈춤 도중 백업·라이브 복원, 두 클러스터 DR) |
+| `restore-it` | orbivisor-driver(= `qemu-it`), orbivisord(= `backup-it`) | 실제 도우미 이미지·고정물 디스크로 도우미 VM 탐지·저널 재생·덮개 한도·`kill -9`·권한 내림·sandbox·scope(orbivisor-driver), orbivisorctl `backup files` E2E — 저장소·풀 증분 체인·도우미와 orbivisord 죽음 뒤 치우기·실제 게스트 에이전트로 되돌려 쓰기(orbivisord) |
+| `sdn-it` | orbivisord | 깨끗한 Ubuntu 24.04에 OVN 설치·mTLS·OvnSync·DHCP·포트 바인딩, physnet·공급자 네트워크·라우터·SNAT·유동 IP·RA·DHCPv6·nftables와 OVN 보안 그룹 비교, 부하 분산·건강 검사 넘김·바깥 VIP·QoS 측정(iperf3)·단순 NIC tc·옮기기(라이브 tap·다리·되돌리기·끝내기)·잠금(RBAC·허용 목록)(root, OVN을 남김) |
+| `sdn-multinode-it` | orbivisord | 한 호스트의 systemd 컨테이너 셋을 노드로: OVN Raft 셋, chassis 사이 Geneve·동서 라우팅, SNAT, 분산·중앙 유동 IP, 게이트웨이 넘김, 두 chassis 마이그레이션, 죽은 중앙 `cluster/kick`, 계획 67의 잠금 켜고 끄기·여러 chassis 보안 그룹·LB 넘김·바깥 VIP GARP·Geneve 너머 QoS·VXLAN 원본 옮기기와 다리 노드 바꾸기·SDN 경보(webhook)·지운 노드 끊기(root, docker) |
 | `scale-it` | orbivisor-cluster | 수백 노드 규모(§15) |
 | `ldap-it` | orbivisor-api | 실제 LDAP 서버 |
-| `catalog-it` | oplctl | 이미지 목록의 링크 |
+| `catalog-it` | orbivisorctl | 이미지 목록의 링크 |
 
 출처: 각 `Cargo.toml`의 `[features]`, [개발 안내](guide/development.md).
 
@@ -1798,9 +1798,9 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 | `ci.yml` `check`(Ubuntu, macOS) | fmt, clippy `--all-features -D warnings`, `cargo test --workspace`, `starve-it`, `metrics-it`, `scale-it`(노드 100, p99 기준 200 ms), `storage-it`(Linux — NBD·`qemu-nbd`, 저장소 백업·라이브 복원 Task 포함) |
 | `ci.yml` `web` | pnpm typecheck·lint·test·gen:api 차이·audit·build |
 | `ci.yml` `shell`, `package` | 패키지 스크립트(도우미 이미지 빌더 시험 포함), deb 빌드와 설치(`orbivisor-restore-image` 포함) |
-| `ci.yml` `linux-kvm`(root, 80분) | qemu·net·web·nfs·lvm·zfs·rbd·lvm-shared·migration·ha·vtpm·cpu·numa·backup 실제 시험, `OPL_TEST_SYSTEMD=1` |
+| `ci.yml` `linux-kvm`(root, 80분) | qemu·net·web·nfs·lvm·zfs·rbd·lvm-shared·migration·ha·vtpm·cpu·numa·backup 실제 시험, `ORBIVISOR_TEST_SYSTEMD=1` |
 | `ci.yml` `backup-s3` | SeaweedFS S3 컨테이너 둘(HTTP·사설 CA HTTPS)로 `s3-it`(계획 68) |
-| `ci.yml` `file-restore`(root, KVM) | 도우미 이미지 빌드(x86_64 두 번 — 바이트 같음, aarch64 빌드만)·시험 게스트, 고정물 전체(btrfs·ntfs·LVM·XFS 더러운 로그), `restore-it`(도우미 시험 + opld E2E (1)~(5)), 강제 TCG 도우미 시험(계획 69) |
+| `ci.yml` `file-restore`(root, KVM) | 도우미 이미지 빌드(x86_64 두 번 — 바이트 같음, aarch64 빌드만)·시험 게스트, 고정물 전체(btrfs·ntfs·LVM·XFS 더러운 로그), `restore-it`(도우미 시험 + orbivisord E2E (1)~(5)), 강제 TCG 도우미 시험(계획 69) |
 | `ci.yml` `ceph`, `ovn`, `install-media`, `ldap`, `deny` | Ceph, OVN(설치·mTLS·OvnSync·DHCP·바인딩·클라우드 이미지 게스트 DHCP·라우팅·보안 그룹 비교·부하 분산·QoS·옮기기·잠금), 설치 매체·템플릿·vTPM 실제 게스트, LDAP, cargo-deny |
 | `ci.yml` `sdn-multinode` | 한 러너의 privileged systemd 컨테이너 셋(`ci/sdn-node/Dockerfile`)이 Orbivisor 노드 셋 — 여러 노드 OVN(약 6분) |
 | `iso.yml` `iso-e2e` | BIOS·UEFI 설치 ISO 끝까지(주 1회, 태그, `ci-probe/**` 가지) |
@@ -1884,7 +1884,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 
 - **잰 값.** §15의 숫자(쓰기 p99, 적용 비용, 권한 색인 비용, 리더 장애 시간)와 §5.5의 HA 복구 잰 값은 설계 문서와 사용
   안내에 기록된 것을 옮겼다. 이 문서를 쓰며 다시 재지 않았다(cargo를 돌리지 않았다).
-- **openraft 기본값.** 스냅샷 5000개·남기는 로그 1000개는 opld가 정하지 않아 openraft 0.9.25의 기본값이라고 판단한 것이다.
+- **openraft 기본값.** 스냅샷 5000개·남기는 로그 1000개는 orbivisord가 정하지 않아 openraft 0.9.25의 기본값이라고 판단한 것이다.
   저장소 안 코드에는 그 숫자가 없다.
 - **Proxmox VE·vSphere 비교**(§1.1)는 일반적인 공개 정보이고 이 저장소에서 확인하지 않았다.
 - **확인하지 않은 세부**: `ha_reserve`(HA 예약 용량) 적용 코드, `guest_watch`의 실행 상수, 균형기의 동시 이동 한도(설계는
@@ -1898,10 +1898,10 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
 - **계획 67에서 확인하지 못한 것.** 부하 분산의 넘김 시간(3.6~4.4초)은 간격 2초·`fall` 2로 잰 것이고 기본값(5초·3번 — 약 15초)은 재지 않았다.
   QoS 정확도는 50 Mbit/s 안팎의 veth·Geneve 측정이고 높은 속도·실제 NIC·물리 스위치의 DSCP 처리는 보지 않았다. 옮기기 `live`의 게스트 쪽
   (링크 다시 보기·DHCP 다시 묻기)은 게스트 없는 QEMU VM으로만 봤다(tap이 `br-int`로, `ovn-installed`, PID 그대로). `sdn_quorum_lost`는 순수
-  시험 표로만 보았다(컨테이너 셋에서 중앙 둘을 죽이면 Orbivisor Raft도 정족수를 잃음). 단순 NIC tc는 opld를 다시 띄워도 다시 맞추지 않는다
+  시험 표로만 보았다(컨테이너 셋에서 중앙 둘을 죽이면 Orbivisor Raft도 정족수를 잃음). 단순 NIC tc는 orbivisord를 다시 띄워도 다시 맞추지 않는다
   (커널이 tap과 함께 들고 있다고 보고 재부팅 흉내로는 확인하지 않음). 토폴로지의 SVG 원소 수(2000 VM에 약 11,400)는 설계 목표 5000을 넘는다.
 - **계획 68(백업 저장소)에서 확인하지 못한 것.** S3는 CI의 SeaweedFS와 가짜 S3로만 시험했다(AWS·Wasabi·Ceph RGW는 손 확인).
-  아주 큰 저장소(청크 수억 개)의 GC 시간·메모리는 재지 않았다. 라이브 복원의 헬퍼·opld·QEMU 죽음은 실제 QEMU에서는 S3 큰 디스크
+  아주 큰 저장소(청크 수억 개)의 GC 시간·메모리는 재지 않았다. 라이브 복원의 헬퍼·orbivisord·QEMU 죽음은 실제 QEMU에서는 S3 큰 디스크
   시험(`backup-s3`)과 드라이버 재연결 탐침으로, 나머지는 가짜 하이퍼바이저로 본다. fleece가 1초에 1 GiB보다 빨리 차는 경우는
   QEMU 동작(게스트 쓰기는 성공, 내보내기 읽기만 실패)을 작은 APFS 이미지로만 확인했다.
 - **계획 69(파일 단위 복원)에서 확인하지 못한 것.** Windows 게스트 에이전트로 되돌려 쓰기는 PowerShell 명령줄 모양까지 단위 시험이고
@@ -1919,7 +1919,7 @@ APT 저장소는 trixie 아래 채널 `stable`, `testing`, `enterprise`(`packagi
   않았다 — Pebble 2.10.1·pebble-challtestsrv·BIND 9(RFC 2136)와 가짜 Cloudflare·Route 53·PowerDNS로만 보았다(스테이징 손 확인 절차는
   [안내](guide/cluster.md#lets-encrypt-스테이징으로-손-확인), 결과는 아직 없다). Terraform 공급자는 레지스트리에 게시하지 않았다(`dev_overrides`로만
   — 수용 시험은 terraform 1.17.2·OpenTofu 1.13.9와 `orbivisor-devserver`). 수백 노드에서 설정 기록의 크기·스냅샷 보내기·`GET /history` 훑기(한 요청
-  5만 줄)의 부하는 재지 않았다(잰 것은 노드 하나의 쓰기 비용뿐). 관찰 노드의 기록 읽기는 RPC 시험만, 여러 노드 opld 끝까지는 보지 않았다.
+  5만 줄)의 부하는 재지 않았다(잰 것은 노드 하나의 쓰기 비용뿐). 관찰 노드의 기록 읽기는 RPC 시험만, 여러 노드 orbivisord 끝까지는 보지 않았다.
 - **OVN 24.03 RBAC가 막지 않는 것.** 잠금은 SB `Chassis`·`Encap`·`Chassis_Private`의 주인만 보고, `Port_Binding`·`MAC_Binding`·`FDB` 쓰기는 id 검사
   없이 받는다(OVN이 그렇게 정의). 망가진 chassis의 포트 가로채기는 막지 못하고 탐지 경보도 아직 없다.
 - **OVN 판에 기대는 것.** 바깥 → 안의 큰 DF 패킷에 ICMP가 없는 것(`gateway_mtu`가 게이트웨이로 나가는 방향만 잼), ACL 우선순위

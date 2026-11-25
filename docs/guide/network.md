@@ -30,7 +30,7 @@ orbivisorctl vm create web --memory 1024 --disk root --nic ov --start
 (`mtu`는 선택), Node `status.underlay`다.
 
 ```toml
-# /etc/opl/opld.toml (노드마다, 선택)
+# /etc/orbivisor/orbivisord.toml (노드마다, 선택)
 [network]
 underlay = "10.1.0.11"    # VXLAN 패킷을 주고받을 이 노드의 주소. 없으면 address가 IP면 그것, 이름이면 푼 주소(loopback·link-local 빼고 IPv4 먼저)
 ```
@@ -262,9 +262,9 @@ orbivisorctl sdn central remove n3        # 마지막 중앙은 뺄 수 없다(4
 `DELETE /api/v1/sdn/centrals/{node}`, `POST /api/v1/sdn/chassis`(`{"nodes": [...]}` 또는 `{"all": true}`, 노드마다 Task 목록)이다.
 모두 루트 `cluster.admin`(읽기는 `cluster.read`)이다.
 
-- **무엇을 하나.** 중앙 Task는 빠진 꾸러미를 깔고, 노드 TLS를 `/etc/opl/ovn/`에 베끼고, 배포판의 중앙 단위(`ovn-central`·
-  `ovn-northd`·`ovn-ovsdb-server-nb`·`-sb`)를 끄고 가린 뒤(끈 목록은 `/etc/opl/ovn/distro-units`) Orbivisor 단위
-  `opl-ovn-nb`·`opl-ovn-sb`·`opl-ovn-northd`를 띄운다. DB는 `/var/lib/opl/ovn/{nb,sb}.db`, 로그는 `/var/log/opl/ovn-*.log`다.
+- **무엇을 하나.** 중앙 Task는 빠진 꾸러미를 깔고, 노드 TLS를 `/etc/orbivisor/ovn/`에 베끼고, 배포판의 중앙 단위(`ovn-central`·
+  `ovn-northd`·`ovn-ovsdb-server-nb`·`-sb`)를 끄고 가린 뒤(끈 목록은 `/etc/orbivisor/ovn/distro-units`) Orbivisor 단위
+  `orbivisor-ovn-nb`·`orbivisor-ovn-sb`·`orbivisor-ovn-northd`를 띄운다. DB는 `/var/lib/orbivisor/ovn/{nb,sb}.db`, 로그는 `/var/log/orbivisor/ovn-*.log`다.
   NB·SB는 노드 클러스터 주소 하나에만 듣는다(`--address`로 노드의 다른 주소 — 노드 주소나 클러스터 링크의 주소 — 를 고를
   수 있다. 루프백·링크 로컬·`0.0.0.0`은 다른 중앙과 chassis가 닿지 못해 400이다. 노드 주소 자체가 127.0.0.1인 한 기계
   클러스터만 루프백을 쓴다). chassis 구성은
@@ -301,7 +301,7 @@ orbivisorctl sdn central remove n3        # 마지막 중앙은 뺄 수 없다(4
   리더 OvnSync가). 그 노드가 옮기기 다리 노드였으면 그 옮기기는 멈춘다([옮기기](#단순-네트워크를-sdn으로-옮기기)).
 
 ```toml
-# /etc/opl/opld.toml (노드마다, 선택 — 기본값)
+# /etc/orbivisor/orbivisord.toml (노드마다, 선택 — 기본값)
 [sdn]
 central_packages = ["ovn-central", "ovn-host", "openvswitch-switch"]
 host_packages = ["ovn-host", "openvswitch-switch"]
@@ -942,7 +942,7 @@ orbivisorctl network migration finish lan-to-t-lan --router r1   # 다리를 걷
   --bridge-node`로 바꾼다 — 다리 기록을 지우고 새 노드에 놓으며, 그 노드가 돌아오면 에이전트가 기록에 없는 다리를 걷는다(끝내기도 오프라인
   다리 노드를 기다리지 않고 경고만). **온라인 노드에 다리가 놓인 동안 바꾸기는 409 `migration_bridge_laid`**다: 모두 되돌린 뒤 `network
   migrate … --bridge-node n2`로 다시 한다.
-- **견디기.** Task는 VM마다 상태를 리소스에 적고 VM 스펙·전원·도는 NIC를 보고 다음 한 걸음을 하므로 opld가 다시 떠도 이어 간다(시간 제한
+- **견디기.** Task는 VM마다 상태를 리소스에 적고 VM 스펙·전원·도는 NIC를 보고 다음 한 걸음을 하므로 orbivisord가 다시 떠도 이어 간다(시간 제한
   없음). 다리는 노드 하나를 지나는 길이다(넘김 없음 — 다리 노드가 죽으면 다리가 끊기고 경보 `sdn_physnet_not_ready`가 `mig…`로 뜬다).
   라이브 옮기기가 옮기기 전에 만든 핫플러그 Task를 기다렸는데 tap이 그대로면 새 Task로 한 번 더 하고, 그래도 안 되면 스펙을 원본으로
   되돌린다(스펙만 T에 남아 다음 켜기가 말없이 옮기지 않게).
@@ -970,7 +970,7 @@ orbivisorctl sdn status | grep lockdown     # lockdown: on (3/3 centrals, firewa
 orbivisorctl sdn lockdown off
 ```
 
-- **SB 역할 포트와 특권 포트.** SB `ovsdb-server`가 설정 파일 `/etc/opl/ovn/sb.json`(0600)로 뜬다: **6642**는 `role=ovn-controller`
+- **SB 역할 포트와 특권 포트.** SB `ovsdb-server`가 설정 파일 `/etc/orbivisor/ovn/sb.json`(0600)로 뜬다: **6642**는 `role=ovn-controller`
   (chassis는 인증서 CN = 노드 UUID = chassis 이름인 **자기 `Chassis`·`Encap`·`Chassis_Private` 행만** 쓴다 — 남의 행·`SB_Global` 쓰기는
   `RBAC rules … prohibit …`으로 거절, GitHub에서 확인), **6645**는 northd만 쓰는 특권 포트(중앙 주소만 받음), `punix`는 중앙의 root.
   OvnSync·API의 SB 읽기(바인딩·서비스 모니터)는 6642로 한다. 지운 노드의 `Chassis` 청소는 이제 SB 리더인 중앙의 에이전트가 로컬
@@ -997,7 +997,7 @@ orbivisorctl sdn lockdown off
   **걸기 전에 듣던** 다른 중앙마다·팔로어면 리더에게서 **건 뒤에** 소식을 받았어야 한다(다섯 번까지). 걸기 전부터 꺼졌던 중앙이나 중앙이
   아닌 Raft 서버(내쫓지 못한 것)는 보지 않는다. 끊겼으면 **표를 곧바로 걷고** 오류(`the address allow-list cut the OVN Raft connections …`)를
   알리며, `sdn-lockdown` Task는 그 중앙과 까닭으로 실패하고 **잠금을 다시 끈다**(`SdnSpec.lockdown = false` — 에이전트가 SB를 하나씩
-  되돌리고 걸었던 표를 걷는다, 걷기가 실패하면 차례마다 다시). Task가 끝나거나 opld를 다시 띄워도 그 표를 다시 넣지 않는다. opld를 다시
+  되돌리고 걸었던 표를 걷는다, 걷기가 실패하면 차례마다 다시). Task가 끝나거나 orbivisord를 다시 띄워도 그 표를 다시 넣지 않는다. orbivisord를 다시
   띄운 뒤의 다시 걸기나 이미 받아들인 표는 Raft를 보지 않으므로, 중앙 하나가 꺼져 있다고 맞게 걸린 표를 걷지 않는다. **중앙이 둘이면** 차례마다
   SB를 다시 띄우는 동안 남은 하나로는 과반이 아니어서 SB가 몇 초 멈춘다(데이터 길은 그대로) — 미리 확인이 경고하고, 셋째 중앙을 더하면
   없다.
@@ -1181,12 +1181,12 @@ OVN 단위도 그대로다.
 ### 보안
 
 - **OVN 연결은 모두 클러스터 CA mTLS다.** NB·SB·Raft 포트는 `pssl`만 열고(평문 `ptcp` 없음) 노드 인증서
-  (`/etc/opl/ovn/{ca.crt,node.crt,node.key}`, `{data_dir}/pki`의 사본, 0600 root, 디렉터리 0700)로 서로 확인한다. 이 클러스터의
+  (`/etc/orbivisor/ovn/{ca.crt,node.crt,node.key}`, `{data_dir}/pki`의 사본, 0600 root, 디렉터리 0700)로 서로 확인한다. 이 클러스터의
   노드 인증서가 없으면 NB·SB에 붙을 수 없다(다른 CA의 인증서·인증서 없음·평문은 거절 — `ovn` CI 작업이 본다). 노드 인증서가
   다시 서명되면 에이전트가 사본을 바꾼다.
 - OVS·OVN 서버는 상대 인증서의 CA만 보고 이름은 보지 않는다. Orbivisor의 OVSDB 클라이언트(OvnSync)는 서버 인증서의 이름도
   중앙 주소·노드 주소와 견준다.
-- 로컬 `punix` 소켓(`/run/opl/ovn/{nb,sb}.sock`)은 root만 쓴다.
+- 로컬 `punix` 소켓(`/run/orbivisor/ovn/{nb,sb}.sock`)은 root만 쓴다.
 - Geneve(UDP 6081)는 VXLAN처럼 암호화하지 않는다. underlay는 믿을 수 있는 망이어야 한다.
 - **잠금을 켜면**(새 클러스터의 기본) chassis는 SB에서 자기 행만 쓰고, northd만 특권 포트를 쓰며, 지운 노드는 인증서가 살아 있어도 붙지
   못한다([OVN 접근 잠금](#ovn-접근-잠금)). 계획 65·66으로 세운 클러스터는 `sdn lockdown on`을 할 때까지 chassis가 SB의 다른 chassis 행도
@@ -1196,31 +1196,31 @@ OVN 단위도 그대로다.
 
 ```bash
 # NB 보기(중앙 노드에서, root). 팔로어의 소켓에는 ovn-nbctl의 기본(--leader-only)이 붙지 못한다 — 리더 노드에서 하거나:
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only show
-ovn-sbctl --db=unix:/run/opl/ovn/sb.sock --no-leader-only show          # chassis와 포트 바인딩
-ovs-appctl -t /run/opl/ovn/nb.ctl cluster/status OVN_Northbound          # NB Raft(SB는 sb.ctl·OVN_Southbound)
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only show
+ovn-sbctl --db=unix:/run/orbivisor/ovn/sb.sock --no-leader-only show          # chassis와 포트 바인딩
+ovs-appctl -t /run/orbivisor/ovn/nb.ctl cluster/status OVN_Northbound          # NB Raft(SB는 sb.ctl·OVN_Southbound)
 ovn-appctl -t ovn-controller connection-status                          # chassis가 SB에 붙었나
 ovs-vsctl list Open_vSwitch . | grep external_ids                       # system-id·ovn-remote·encap
 ovs-vsctl --columns=name,external_ids list Interface             # VM tap의 iface-id(논리 포트)·ovn-installed
-journalctl -u opl-ovn-nb -u opl-ovn-sb -u opl-ovn-northd; less /var/log/opl/ovn-nb.log
+journalctl -u orbivisor-ovn-nb -u orbivisor-ovn-sb -u orbivisor-ovn-northd; less /var/log/orbivisor/ovn-nb.log
 # 라우터·NAT·게이트웨이(계획 66). 이름은 opl-r-<라우터 id>, 바깥 포트 opl-gw-<라우터 id>, HA 그룹 opl-ha-<라우터 id>
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lr-list
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lr-nat-list opl-r-<id>
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only ha-chassis-group-list
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only --bare get Logical_Router_Port opl-gw-<id> status:hosting-chassis
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only acl-list opl_<태그>_<h16>    # 그룹 목록 Port_Group의 ACL
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only lr-list
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only lr-nat-list opl-r-<id>
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only ha-chassis-group-list
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only --bare get Logical_Router_Port opl-gw-<id> status:hosting-chassis
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only acl-list opl_<태그>_<h16>    # 그룹 목록 Port_Group의 ACL
 ovs-vsctl get Open_vSwitch . external_ids:ovn-bridge-mappings                # 노드의 physnet 매핑
 ip -br link show master vmbr1                                                # 관리자 브리지에 매단 veth oplp…b
 # 부하 분산·QoS(계획 67). LB 행은 opl-lb-<LB id>-<tcp|udp>
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lb-list
-ovn-sbctl --db=unix:/run/opl/ovn/sb.sock --no-leader-only list Service_Monitor    # 멤버 건강(online·offline)
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only qos-list opl-<네트워크 id>
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only lb-list
+ovn-sbctl --db=unix:/run/orbivisor/ovn/sb.sock --no-leader-only list Service_Monitor    # 멤버 건강(online·offline)
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only qos-list opl-<네트워크 id>
 tc filter show dev <tap> ingress; tc filter show dev <tap> egress            # 단순 NIC의 police(pref 49152)
 # 잠금(계획 67)
-ovs-appctl -t /run/opl/ovn/sb.ctl ovsdb-server/list-remotes                  # 잠겼으면 pssl:6642·pssl:6645·punix
+ovs-appctl -t /run/orbivisor/ovn/sb.ctl ovsdb-server/list-remotes                  # 잠겼으면 pssl:6642·pssl:6645·punix
 nft list table inet opl_ovn_<태그>                                            # 허용 집합 members·centrals·geneve
 # 옮기기 다리(계획 67). 포트 opl-l2gw-<옮기기 id>, 다리 노드의 매핑 mig<h8>
-ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lsp-list opl-<대상 네트워크 id> | grep l2gw
+ovn-nbctl --db=unix:/run/orbivisor/ovn/nb.sock --no-leader-only lsp-list opl-<대상 네트워크 id> | grep l2gw
 ```
 
 - `sdn status`의 CHASSIS가 `down`이면 ovn-controller가 SB에 붙지 않은 것이다(중앙에 닿는지, TCP 6642). `configuring`은 붙었으나
@@ -1230,7 +1230,7 @@ ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lsp-list opl-<대상 �
 - `sdn status`의 동기화가 멈춰 있고 리더 orbivisord 로그에 "fence token from a newer Raft term" 오류가 차례마다 나오면 NB에
   지금 Raft보다 큰 임기의 토큰이 남은 것이다(Orbivisor 클러스터를 새로 세우고 OVN DB는 둔 경우). NB 리더에서
   `ovn-nbctl remove NB_Global . external_ids orbivisor:<태그>:fence`로 지운다.
-- 배포판 단위를 되살리려면 `/etc/opl/ovn/distro-units`의 단위를 `systemctl unmask`·`enable`한다(Orbivisor 단위를 먼저 멈춘다).
+- 배포판 단위를 되살리려면 `/etc/orbivisor/ovn/distro-units`의 단위를 `systemctl unmask`·`enable`한다(Orbivisor 단위를 먼저 멈춘다).
 - **physnet이 준비되지 않음.** `node sdn NODE`의 오류를 본다: 브리지 이름이 틀렸거나 없음(`ip link show vmbr1`), 같은 physnet이
   남의 OVS 브리지에 매핑됨(`ovn-bridge-mappings`), 노드가 chassis가 아님(`sdn chassis install`).
 - **라우터가 밖에 닿지 않음.** `router get`의 경고("no gateway node has physnet … ready" — 게이트웨이 후보가 없음)와 ACTIVE 노드를
@@ -1294,7 +1294,7 @@ ovn-nbctl --db=unix:/run/opl/ovn/nb.sock --no-leader-only lsp-list opl-<대상 �
 - 중앙 판은 첫 중앙의 OVN 판과 주·부 판이 같아야 한다(꾸러미를 올릴 때는 모든 중앙을 함께).
 - **부하 분산.** VIP·건강 검사는 IPv4만, UDP 검사는 약하다. 죽은 멤버는 새 연결에서만 빠진다(맺은 연결은 그 멤버로 가다 끊김). VIP 네트워크는
   라우터 인터페이스여야 한다. LB는 복제·템플릿·원격 복제를 따라가지 않는다.
-- **QoS는 폴리싱이다.** 넘는 패킷을 버리므로 UDP는 넘는 만큼 잃고 처음 몇 초는 버스트만큼 더 간다. 단순 NIC의 tc는 opld를 다시 띄워도
+- **QoS는 폴리싱이다.** 넘는 패킷을 버리므로 UDP는 넘는 만큼 잃고 처음 몇 초는 버스트만큼 더 간다. 단순 NIC의 tc는 orbivisord를 다시 띄워도
   다시 맞추지 않는다(커널이 tap과 함께 들고 있음 — 어긋나면 `vm hotplug`).
 - **옮기기.** cloud-init이 있는 VM은 instance-id가 바뀌어 다음 부팅에 인스턴스마다 하는 일(SSH 호스트 키 따위)을 다시 한다. 방식은 옮기기
   하나에 하나다. 켜진 VM이 chassis가 아닌 노드에 있으면 막힌다. 다리는 노드 하나를 지나고 넘김이 없으며, 살아 있는 다리 노드는 바꿀 수 없다

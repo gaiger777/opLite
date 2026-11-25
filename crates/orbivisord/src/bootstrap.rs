@@ -94,11 +94,11 @@ pub fn check_role(cluster: &Cluster, config: &Config) -> anyhow::Result<()> {
     };
     match (node.spec.witness, config.witness) {
         (true, false) => anyhow::bail!(
-            "this node joined as a witness but opld.toml says witness = false; leave the cluster \
+            "this node joined as a witness but orbivisord.toml says witness = false; leave the cluster \
              and join again to change the role"
         ),
         (false, true) => anyhow::bail!(
-            "this node joined as a non-witness node but opld.toml says witness = true; leave the \
+            "this node joined as a non-witness node but orbivisord.toml says witness = true; leave the \
              cluster and join again to change the role"
         ),
         _ => Ok(()),
@@ -1361,7 +1361,7 @@ pub(crate) mod tests {
         check_role(&cluster, &witness).unwrap();
         let err = check_role(&cluster, &normal).unwrap_err().to_string();
         assert!(
-            err.contains("joined as a witness but opld.toml says witness = false"),
+            err.contains("joined as a witness but orbivisord.toml says witness = false"),
             "{err}"
         );
 
@@ -1378,7 +1378,7 @@ pub(crate) mod tests {
         check_role(&cluster, &normal).unwrap();
         let err = check_role(&cluster, &witness).unwrap_err().to_string();
         assert!(
-            err.contains("joined as a non-witness node but opld.toml says witness = true"),
+            err.contains("joined as a non-witness node but orbivisord.toml says witness = true"),
             "{err}"
         );
         cluster.shutdown().await.unwrap();

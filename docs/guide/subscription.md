@@ -64,23 +64,23 @@ target/release/orbivisor-license keygen --out license.key
 # 키 발급: 표준 출력에 opl1.… 한 줄(--issued-at <유닉스 초>로 발급 시각을 정할 수 있다. 기본은 지금)
 target/release/orbivisor-license issue --key license.key --id acme-2026 --customer 'Acme Corp' \
     --level premium --nodes 3 --days 365
-# 비밀 키 파일의 공개 키(OPL_LICENSE_KEYS의 항목)를 다시 보기
+# 비밀 키 파일의 공개 키(ORBIVISOR_LICENSE_KEYS의 항목)를 다시 보기
 target/release/orbivisor-license pubkey --key license.key
 ```
 
 `issue`는 `--nodes`·`--days`가 1 이상인지 먼저 보고("orbivisor-license: --days must be at least 1"), 내용이 키 규칙에 맞지
 않으면 "orbivisor-license: invalid license: id must be …"처럼 멈춘다. `keygen`은 쓰다가 실패하면 만든 파일을 지운다.
 
-빌드 값 `OPL_LICENSE_KEYS`(base64 공개 키를 쉼표로)를 주고 빌드한 orbivisord만 그 키로 서명한 구독 키를 믿는다. 주지
+빌드 값 `ORBIVISOR_LICENSE_KEYS`(base64 공개 키를 쉼표로)를 주고 빌드한 orbivisord만 그 키로 서명한 구독 키를 믿는다. 주지
 않으면 저장소의 개발 키(`crates/orbivisor-types/keys/dev-license.pub`) 하나를 믿는데, 그 비밀 키가 시험 견본
 (`crates/orbivisor-types/tests/fixtures/dev-license.key`)으로 저장소에 있어 누구나 키를 만들 수 있다. 그래서 정식 패키지는
-반드시 `OPL_LICENSE_KEYS`를 주고(위 "저장소 만들기"처럼 `cargo build`와 `build-deb.sh`에 함께), `build-deb.sh`는 이 값이
-없으면 `OPL_DEV_LICENSE=1`(개발 패키지, CI의 패키지가 이렇다)이 아닌 한 "build-deb: OPL_LICENSE_KEYS is not set; …"로
+반드시 `ORBIVISOR_LICENSE_KEYS`를 주고(위 "저장소 만들기"처럼 `cargo build`와 `build-deb.sh`에 함께), `build-deb.sh`는 이 값이
+없으면 `ORBIVISOR_DEV_LICENSE=1`(개발 패키지, CI의 패키지가 이렇다)이 아닌 한 "build-deb: ORBIVISOR_LICENSE_KEYS is not set; …"로
 멈춘다. 값이 있으면 세 가지를 더 본다: 쉼표로 나눈 항목마다 정규 base64(44자, `=` 끝)로 푼 32바이트 Ed25519 공개
-키인지("build-deb: OPL_LICENSE_KEYS entry is not a base64 Ed25519 public key: …")와 그런 항목이 하나 이상인지(공백·쉼표뿐이면
-"build-deb: OPL_LICENSE_KEYS has no keys"), 개발 키가 들어 있지 않은지("… contains the development
-key; use OPL_DEV_LICENSE=1 for a development package"), orbivisord 바이너리에 그 값이 그대로 들어 있는지(같은 값으로
-빌드했는지, "build-deb: orbivisord was not built with this OPL_LICENSE_KEYS"). 그래도 개발 키를 넣고 빌드한 바이너리는 그
+키인지("build-deb: ORBIVISOR_LICENSE_KEYS entry is not a base64 Ed25519 public key: …")와 그런 항목이 하나 이상인지(공백·쉼표뿐이면
+"build-deb: ORBIVISOR_LICENSE_KEYS has no keys"), 개발 키가 들어 있지 않은지("… contains the development
+key; use ORBIVISOR_DEV_LICENSE=1 for a development package"), orbivisord 바이너리에 그 값이 그대로 들어 있는지(같은 값으로
+빌드했는지, "build-deb: orbivisord was not built with this ORBIVISOR_LICENSE_KEYS"). 그래도 개발 키를 넣고 빌드한 바이너리는 그
 키로 검증한 구독을 개발용으로 보인다. 빌드 값이 공백뿐이면 없는 것과 같지만(개발 키), 쉼표처럼 공백이 아닌 글자가 있는데
 풀리는 키가 없으면 개발 키로 떨어지지 않고 어떤 구독 키도 믿지 않는다. 발급 키를
 바꿀 때는 옛 공개 키와 새 공개 키를 함께 넣으면 이미 낸 키도 계속 풀린다. 이 키를 믿지 않는 빌드로 올리면 저장된 키는
@@ -90,7 +90,7 @@ key; use OPL_DEV_LICENSE=1 for a development package"), orbivisord 바이너리�
 
 ```bash
 orbivisorctl telemetry preview                     # admin. 지금 보낼 JSON 그대로(꺼져 있어도)
-orbivisorctl telemetry enable                      # admin. 저장된 끝점, 없으면 빌드 기본 끝점(OPL_TELEMETRY_URL)으로
+orbivisorctl telemetry enable                      # admin. 저장된 끝점, 없으면 빌드 기본 끝점(ORBIVISOR_TELEMETRY_URL)으로
 orbivisorctl telemetry enable --endpoint https://telemetry.example.com/v1/report
 orbivisorctl telemetry show                        # enabled, endpoint, id, last sent, last error
 orbivisorctl telemetry disable
@@ -100,7 +100,7 @@ orbivisorctl telemetry reset-id                    # 보고 id를 새로 만든�
 - **설정.** `PATCH /api/v1/settings`의 `{"telemetry":{"enabled":true,"endpoint":"https://…"}}`(admin)다. 끝점은
   호스트가 있는 `https://` 주소여야 하고 사용자 정보(`user:pass@`)를 넣을 수 없다(설정은 로그인한 누구나 읽는다.
   아니면 **400** `invalid_request`). `""`를 보내면 지워 빌드 값
-  `OPL_TELEMETRY_URL`을 쓴다. 켰는데 끝점도 빌드 값도 없으면 **400** `telemetry_endpoint_required`. 처음 켤 때 무작위
+  `ORBIVISOR_TELEMETRY_URL`을 쓴다. 켰는데 끝점도 빌드 값도 없으면 **400** `telemetry_endpoint_required`. 처음 켤 때 무작위
   UUID v4 보고 id를 만든다(클러스터 이름·CA와 관계없다). 꺼도 id는 남고, `POST /api/v1/telemetry/reset-id`(admin)가
   새로 만든다. 웹 설정 › 일반의 텔레메트리 칸은 "켜기…"를 누르면 보낼 JSON(`GET /api/v1/telemetry/preview`, admin)을 대화상자로
   보이고 확인해야 켠다(끝점 입력란에 저장하지 않은 값이 있으면 함께 보낸다).
@@ -113,8 +113,8 @@ orbivisorctl telemetry reset-id                    # 보고 id를 새로 만든�
   메모리의 전송 시각으로 다시 보내지 않는다. 다만 다시 보낼 시각과 그 전송 시각은 리더의 메모리에 있어, 실패 뒤
   리더가 바뀌면 새 리더가 곧 다시 보낼 수 있고, 보낸 뒤 기록하기 전에 리더가 바뀌면 새 리더가 한 번 더 보낼 수 있다.
   이 빌드보다 오래된 노드가 남아 있으면 보내지 않는다.
-- **프록시.** reqwest가 `HTTPS_PROXY` 환경 변수를 따른다. 패키지의 orbivisord는 systemd 서비스 `opld`이므로
-  `systemctl edit opld`로 덮어쓰기 파일에 다음을 넣고 `systemctl restart opld` 한다:
+- **프록시.** reqwest가 `HTTPS_PROXY` 환경 변수를 따른다. 패키지의 orbivisord는 systemd 서비스 `orbivisord`이므로
+  `systemctl edit orbivisord`로 덮어쓰기 파일에 다음을 넣고 `systemctl restart orbivisord` 한다:
 
   ```ini
   [Service]
@@ -157,8 +157,8 @@ orbivisorctl telemetry reset-id                    # 보고 id를 새로 만든�
 tick = "60s"         # 리더가 보낼 때가 됐는지 보는 간격
 interval = "24h"     # 보고 간격
 retry = "1h"         # 보내지 못한 뒤 다시 보내기까지
-# ca_file = "/etc/opl/telemetry-ca.pem"   # 시스템 루트에 더해 믿는 CA 인증서(PEM, 여럿 가능). 사설 수집 서버에 쓴다.
+# ca_file = "/etc/orbivisor/telemetry-ca.pem"   # 시스템 루트에 더해 믿는 CA 인증서(PEM, 여럿 가능). 사설 수집 서버에 쓴다.
 #                                         # 읽지 못하거나 인증서가 없으면 orbivisord가 시작하지 않는다
 ```
 
-수집 서버는 Orbivisor 밖이다. 끝점의 기본값은 빌드할 때 `OPL_TELEMETRY_URL`로 넣는다(없으면 기본 끝점이 없다).
+수집 서버는 Orbivisor 밖이다. 끝점의 기본값은 빌드할 때 `ORBIVISOR_TELEMETRY_URL`로 넣는다(없으면 기본 끝점이 없다).

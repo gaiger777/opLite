@@ -729,7 +729,7 @@ function CreatePoolDialog({ onClose }: { onClose(): void }) {
             {(a11y) => (
               <Input
                 id="pool-path"
-                placeholder="/var/lib/opl/pool"
+                placeholder="/var/lib/orbivisor/pool"
                 value={path}
                 onChange={(e) => setPath(e.target.value)}
                 {...a11y}

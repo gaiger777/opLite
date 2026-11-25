@@ -1942,7 +1942,7 @@
     "issuedDescription": "{{time}} 전에 새 노드에서 실행하세요. 다시 볼 수 없습니다.",
     "command": "명령",
     "copyCommand": "명령 복사",
-    "commandNote": "새 노드의 orbivisord가 /run/opl/opld.sock을 쓰지 않으면 --socket을 붙이세요.",
+    "commandNote": "새 노드의 orbivisord가 /run/orbivisor/orbivisord.sock을 쓰지 않으면 --socket을 붙이세요.",
     "switch": "클러스터 전환(지금 {{name}})",
     "thisCluster": "이 클러스터",
     "noRemotes": "원격 클러스터가 없습니다.",

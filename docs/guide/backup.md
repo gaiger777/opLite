@@ -468,7 +468,7 @@ orbivisorctl vm live-restore cancel web-dr --discard     # VM·새 디스크·�
 ```
 
 라이브 복원은 디스크를 다 옮기기 전에 새 VM을 켠다. 디스크마다 노드 로컬 오버레이(qcow2) 아래에 백업을 NBD로 두고(저장소 백업은
-`orbivisord backup-serve` 헬퍼, Linux systemd면 `opl-bkserve-<id>` scope라 orbivisord가 다시 떠도 산다), QEMU의 `blockdev-mirror`
+`orbivisord backup-serve` 헬퍼, Linux systemd면 `orbivisor-bkserve-<id>` scope라 orbivisord가 다시 떠도 산다), QEMU의 `blockdev-mirror`
 (`write-blocking`)가 뒤에서 대상 풀의 새 볼륨으로 옮긴다. 게스트가 아직 옮기지 않은 블록을 읽으면 그 청크를 저장소에서 곧바로
 읽는다. 다 옮기면 대상 볼륨으로 갈아타고(`job-complete`) 오버레이·헬퍼를 걷는다 — 그 뒤 VM은 보통 VM과 같다(스냅샷·마이그레이션·
 백업·HA).
@@ -694,7 +694,7 @@ orbivisorctl backup files close web-20261123-030000         # 백업 이름(그 
   폴더로 나눠 받는다. zip은 한 항목의 이름(경로)이 65,535바이트를 넘으면(깊은 나무) 그 항목과 그 아래를 빼고 보고서에 적는다(tar.gz는
   담는다). 보고서는 처음 1000줄(256 KiB)까지 적고 나머지는 `… and N more line(s)`로 센다. 한 파일의 읽기 오류(S3 끊김·깨진
   블록)는 그 파일만 오류 항목으로 끝내고 보고서에 적는다 — 처음부터 다시 받는다. `raw`는 흐름을 끊는다(`the download was cut off`).
-- **멈춘 내려받기는 그 흐름만 기다린다.** 도우미는 흐름마다 4 MiB까지만 앞서 보내고 opld가 받아 쓴 만큼 더 보낸다(통신 규약 판 2).
+- **멈춘 내려받기는 그 흐름만 기다린다.** 도우미는 흐름마다 4 MiB까지만 앞서 보내고 orbivisord가 받아 쓴 만큼 더 보낸다(통신 규약 판 2).
   그래서 브라우저가 내려받기를 멈추거나 게스트 쓰기가 느려도 같은 세션의 나열·다른 내려받기는 막히지 않고, 멈춘 흐름은 이어 받으면
   계속된다(세션이 열려 있는 동안 — 도는 흐름이 있으면 유휴로 닫지 않는다).
 - **API**(태그 `file-restore`, `/api/v1` 아래): `POST /backups/{key}/file-restore` → 202(새로)·200(다시 씀) `{session, task}`,
@@ -807,7 +807,7 @@ systemctl restart qemu-guest-agent
 도우미 이미지는 Debian 13 커널(잠금 파일로 해시를 못 박은 꾸러미)과 우리 initramfs(정적 Rust 에이전트가 PID 1, Debian의 `lvm`·
 `blkid`, 고른 커널 모듈)다. 셸·busybox·네트워크는 없다. 노드마다 `[file_restore] image_dir`(기본 Linux `/usr/share/orbivisor/restore`,
 macOS `{data_dir}/restore-image`) 아래 `<arch>/`에 커널(x86_64 `vmlinuz`, aarch64 `Image`)·`initrd.img`·`manifest.json`이 있어야 한다.
-opld는 시작할 때와 그 뒤 1분마다 `manifest.json`이 바뀌었으면 파일 해시와 통신 규약 판, **이미지 판이 이 opld의 판과 같은지**를 보고,
+orbivisord는 시작할 때와 그 뒤 1분마다 `manifest.json`이 바뀌었으면 파일 해시와 통신 규약 판, **이미지 판이 이 orbivisord의 판과 같은지**를 보고,
 지나면 노드 상태에 알린다(`NodeStatus.file_restore` — 이미지 판·아키텍처·가속·세션 수). 지나지 못하면 로그에 한 줄(`file restore
 disabled: no helper image in /usr/share/orbivisor/restore/x86_64` 따위)을 남기고 그 노드는 세션을 받지 않는다 —
 다른 노드에 이미지가 있으면 거기서 연다. 다시 시작할 필요는 없다.
@@ -815,7 +815,7 @@ disabled: no helper image in /usr/share/orbivisor/restore/x86_64` 따위)을 남
 - **Debian·Ubuntu(deb, amd64)**: `orbivisor-restore-image` 꾸러미(약 20 MB — 커널 12 MB·initrd 7 MB, `/usr/share/orbivisor/restore/x86_64/`)를 `orbivisor`가
   `Recommends:`로 둔다 — apt 기본 설정이면 함께 깔린다. 아니면 `apt install orbivisor-restore-image`. `Depends: orbivisor (= 판)`이라
   업그레이드 때 함께 올라간다. GPL 바이너리의 출처는 `/usr/share/doc/orbivisor-restore-image/debian.lock`(snapshot.debian.org의 같은 판).
-- **Rocky·소스 빌드 노드(aarch64 포함)**: 노드의 소스 트리(opld를 빌드한 것과 **같은 판**)에서 빌드해 기본 자리에 둔다. bsdtar·zstd·
+- **Rocky·소스 빌드 노드(aarch64 포함)**: 노드의 소스 트리(orbivisord를 빌드한 것과 **같은 판**)에서 빌드해 기본 자리에 둔다. bsdtar·zstd·
   python3·curl과 musl 타깃이 필요하다(에이전트는 `rust-lld`로 C 툴체인 없이 빌드됨). 받은 deb은 `~/.cache/orbivisor-restore-image`에
   두고(아키텍처마다 약 115 MB) 다음 빌드에 다시 쓴다.
 
@@ -828,15 +828,15 @@ disabled: no helper image in /usr/share/orbivisor/restore/x86_64` 따위)을 남
   orbivisorctl node get svc01 | jq .status.file_restore      # {"image_version": "orbivisor 0.1.0 lock-…", "arch": "aarch64", "accel": "tcg", …}
   ```
 
-  opld를 `OPL_VERSION`을 주고 빌드했으면 같은 값을 `--version`으로 준다(이미지 판 `orbivisor <판> lock-<debian.lock 해시 앞 12자>`가
-  opld 판으로 시작해야 한다). **opld를 올릴 때마다 이미지도 다시 빌드한다** — 판이 다르면 그 노드는 알리지 않는다(굴려 올리는 동안은
+  orbivisord를 `ORBIVISOR_VERSION`을 주고 빌드했으면 같은 값을 `--version`으로 준다(이미지 판 `orbivisor <판> lock-<debian.lock 해시 앞 12자>`가
+  orbivisord 판으로 시작해야 한다). **orbivisord를 올릴 때마다 이미지도 다시 빌드한다** — 판이 다르면 그 노드는 알리지 않는다(굴려 올리는 동안은
   올린 노드에서만 세션이 열린다). 빌드 결과는 같은 입력이면 바이트까지 같다(zstd 판이 같을 때).
 - **macOS(개발)**: 같은 스크립트를 `--out <data_dir>/restore-image/aarch64`로. HVF로 돈다(권한 내림·sandbox는 없다 — 개발용).
 - **설치 ISO**는 아직 이미지 꾸러미를 넣지 않는다(설치 뒤 `apt install orbivisor-restore-image`). arm64 deb·RPM은 없다.
 
 ### 노드 설정 `[file_restore]`
 
-`opld.toml`의 `[file_restore]`(모두 생략 가능, 모르는 키는 시작 실패):
+`orbivisord.toml`의 `[file_restore]`(모두 생략 가능, 모르는 키는 시작 실패):
 
 | 키 | 기본 | 뜻 |
 |---|---|---|
@@ -846,11 +846,11 @@ disabled: no helper image in /usr/share/orbivisor/restore/x86_64` 따위)을 남
 | `boot_timeout_secs` | 300 | 에이전트 인사까지(10~3600 — TCG 노드를 생각해 넉넉히) |
 | `idle_minutes` · `max_hours` | 15 · 8 | 쓰지 않으면 닫음(1~10080) · 세션 최대 시간(1~168) |
 | `overlay_max_mib` | 2048 | 디스크 덮개 합(저널 재생이 쓰는 곳, 64 이상) |
-| `run_as` | `nobody` | 도우미 QEMU가 디스크·소켓을 연 뒤 내려갈 사용자(Linux, opld가 root일 때). `""`이면 내리지 않음 |
+| `run_as` | `nobody` | 도우미 QEMU가 디스크·소켓을 연 뒤 내려갈 사용자(Linux, orbivisord가 root일 때). `""`이면 내리지 않음 |
 | `guest_max_bytes` · `guest_max_files` | 4 GiB · 10000 | VM으로 되돌려 쓰기 한 번의 상한 |
 | `download_max_entries` | 1000000 | zip·tar.gz 내려받기와 VM으로 되돌려 쓰기 한 번의 항목 수 상한(건너뛴 항목도 셈) |
 
-모든 키의 주석 달린 예시는 `/usr/share/orbivisor/opld.toml.example`의 `[file_restore]`에 있다.
+모든 키의 주석 달린 예시는 `/usr/share/orbivisor/orbivisord.toml.example`의 `[file_restore]`에 있다.
 
 ```toml
 [file_restore]
@@ -860,7 +860,7 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
 
 ### 보안 모형
 
-백업 안 파일시스템은 **믿을 수 없는 입력**이다(테넌트가 만든 디스크, 랜섬웨어가 망가뜨린 디스크). 그래서 호스트 커널도 opld도 그것을
+백업 안 파일시스템은 **믿을 수 없는 입력**이다(테넌트가 만든 디스크, 랜섬웨어가 망가뜨린 디스크). 그래서 호스트 커널도 orbivisord도 그것을
 해석하지 않는다 — 해석은 세션마다 새로 띄우고 버리는 도우미 VM의 커널이 한다(PBS의 restore VM과 같은 길). 그 커널이 뚫려도 공격자는
 **그 세션의 백업 디스크만 읽을 수 있는 네트워크 없는 VM** 안에 있고, 그 뒤에 벽이 차례로 있다:
 
@@ -868,21 +868,21 @@ memory_mib = 1024      # 큰 Btrfs·XFS 메타데이터
 |---|---|
 | 게스트 커널·에이전트 | 마운트는 늘 `ro,nodev,nosuid,noexec`. 에이전트가 PID 1(셸 없음)이라 게스트 안에 다른 프로그램이 돌지 않고, `lvm`·`blkid`는 argv로만 부른다. 경로는 조각마다 `O_NOFOLLOW`로 따라가 심볼릭 링크로 볼륨 밖에 나가지 못한다 |
 | QEMU 장치 면 | virtio-blk(디스크)·virtio-serial 하나(통신)·직렬 콘솔(로그 파일)·virtio-rng만. **네트워크·화면·USB·9p·virtiofs 없음**(`-nodefaults -no-user-config -net none -display none`) |
-| QEMU 프로세스 | Linux systemd면 `opl-fr-<id>.scope`(`MemoryMax`·`TasksMax=64`·`CPUQuota` vCPU × 100%), opld가 root면 디스크·소켓을 연 뒤 `-run-with user=nobody`(옛 QEMU `-runas`)로 내려감 — 내릴 수 없는 QEMU면 세션이 실패한다(몰래 root로 돌리지 않음). seccomp를 넣어 빌드한 QEMU면 `-sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny`(내리지 않을 때는 `elevateprivileges=deny`까지 — 내릴 때 그것을 걸면 QEMU 자신의 setuid가 막힌다). svc01 Rocky `qemu-kvm`에서 Uid 65534·Seccomp 2를 확인했다. upstream QEMU를 seccomp 없이 빌드했으면 sandbox는 없다 |
-| 백업 원본 | QEMU `read-only=on`. 저장소 백업은 opld 안 NBD 서버(쓰기는 `EPERM`)를 세션 디렉터리의 0600 유닉스 소켓으로, 옛 풀 백업은 qcow2를 읽기로 연다. 도우미가 덮개를 아무리 써도 백업은 그대로다 |
-| opld 쪽 통신 규약 | 프레임·이름(1024바이트)·경로 깊이(256)·링크 대상(4096)·볼륨 수(256)·쪽 항목(1000)·걷기 항목(건너뜀 포함)·걷기 경로 바이트(256 MiB)에 상한, 흐름마다 받을 몫 4 MiB(넘겨 보내면 위반 — opld가 흐름마다 쌓는 메모리가 이것으로 묶인다), 선언한 크기와 데이터가 다르면 그 흐름 오류, 첫 답·데이터 사이 60초(세 번 이어지면 세션 닫음). 어긋나면 세션을 닫는다(`agent protocol violation: …` — 걷기 한도는 그 흐름만 끝낸다). 보고서·결과 문구는 처음 몇 줄만 들고 나머지는 센다. 게스트가 보낸 글은 로그·감사에서 제어 문자를 이스케이프하고 자른다 |
+| QEMU 프로세스 | Linux systemd면 `orbivisor-fr-<id>.scope`(`MemoryMax`·`TasksMax=64`·`CPUQuota` vCPU × 100%), orbivisord가 root면 디스크·소켓을 연 뒤 `-run-with user=nobody`(옛 QEMU `-runas`)로 내려감 — 내릴 수 없는 QEMU면 세션이 실패한다(몰래 root로 돌리지 않음). seccomp를 넣어 빌드한 QEMU면 `-sandbox on,obsolete=deny,spawn=deny,resourcecontrol=deny`(내리지 않을 때는 `elevateprivileges=deny`까지 — 내릴 때 그것을 걸면 QEMU 자신의 setuid가 막힌다). svc01 Rocky `qemu-kvm`에서 Uid 65534·Seccomp 2를 확인했다. upstream QEMU를 seccomp 없이 빌드했으면 sandbox는 없다 |
+| 백업 원본 | QEMU `read-only=on`. 저장소 백업은 orbivisord 안 NBD 서버(쓰기는 `EPERM`)를 세션 디렉터리의 0600 유닉스 소켓으로, 옛 풀 백업은 qcow2를 읽기로 연다. 도우미가 덮개를 아무리 써도 백업은 그대로다 |
+| orbivisord 쪽 통신 규약 | 프레임·이름(1024바이트)·경로 깊이(256)·링크 대상(4096)·볼륨 수(256)·쪽 항목(1000)·걷기 항목(건너뜀 포함)·걷기 경로 바이트(256 MiB)에 상한, 흐름마다 받을 몫 4 MiB(넘겨 보내면 위반 — orbivisord가 흐름마다 쌓는 메모리가 이것으로 묶인다), 선언한 크기와 데이터가 다르면 그 흐름 오류, 첫 답·데이터 사이 60초(세 번 이어지면 세션 닫음). 어긋나면 세션을 닫는다(`agent protocol violation: …` — 걷기 한도는 그 흐름만 끝낸다). 보고서·결과 문구는 처음 몇 줄만 들고 나머지는 센다. 게스트가 보낸 글은 로그·감사에서 제어 문자를 이스케이프하고 자른다 |
 | 아카이브 | zip·tar.gz 작성기가 깊이 우선 차례를 다시 본다 — 부모는 앞서 받은 디렉터리, 같은 경로는 한 번, 절대 경로·`..` 없음, zip 이름은 65,535바이트까지. zip에는 링크를 넣지 않는다. 그래서 받은 아카이브를 풀어도 대상 디렉터리 밖에 아무것도 생기지 않는다. zip은 끝에 쓸 이름 목록(중앙 디렉터리)을 들고 있으므로 바꾼 이름(`%XX`) 기준 이름 장부가 256 MiB에 닿으면 거기서 맺는다(보고서 맨 앞 `stopped: the zip's list of names reached …` — tar.gz로 받거나 나누어 받는다). 노드 사이로 흘리는 조각은 256 KiB 이하 |
 | 게스트로 되돌려 쓰기 | 이름은 백업에서 온 믿을 수 없는 값이라 셸을 거치지 않고(argv, Windows는 인코딩한 스크립트와 작은따옴표 글자), 조각마다 OS 규칙으로 거른다. 덮어쓰기는 임시 파일 뒤 이름 바꾸기 |
 
-- **암호화 저장소의 키는 opld를 떠나지 않는다.** opld가 청크를 받아 풀고 평문 블록을 NBD로 도우미에 준다(`backup-serve` 헬퍼를 쓰지
-  않음 — 세션은 opld와 생애를 같이한다). 도우미는 평문을 보지만 그것은 사용자가 지금 열람하려는 바로 그 데이터다.
+- **암호화 저장소의 키는 orbivisord를 떠나지 않는다.** orbivisord가 청크를 받아 풀고 평문 블록을 NBD로 도우미에 준다(`backup-serve` 헬퍼를 쓰지
+  않음 — 세션은 orbivisord와 생애를 같이한다). 도우미는 평문을 보지만 그것은 사용자가 지금 열람하려는 바로 그 데이터다.
 - **내려받기 링크**는 32바이트 무작위 토큰, 60초·한 번만, 그리고 GET 때 **같은 사용자의 인증을 다시 본다** — 링크가 새어도 남이 쓰지
   못한다(다른 사용자 403, 쓴·지난 링크 410). 응답은 `Cache-Control: no-store`.
 - **열린 세션의 요청마다 권한을 다시 본다** — 권한을 빼면 다음 요청부터 403이고 세션은 유휴로 닫힌다. 다른 사용자의 세션은 보이지
   않는다(루트 `cluster.admin`만 `--all`로 보고 닫음).
 - **남은 것 치우기**: 세션을 닫거나 도우미가 죽으면 QEMU(Shutdown → SIGTERM → SIGKILL)·scope·세션 디렉터리 둘(`{run_dir}/file-restore/<id>`,
-  `{data_dir}/file-restore/<id>` — 덮개·콘솔 로그)을 지운다. opld가 죽었다 뜨면 시작할 때 제 두 디렉터리에 남은 세션의 도우미(명령줄에
-  `opl-fr-<id>`가 있는 프로세스만)·그 세션의 `opl-fr-<id>.scope`·두 디렉터리를 치운다 — 같은 호스트의 다른 opld(다른 `run_dir`)의
+  `{data_dir}/file-restore/<id>` — 덮개·콘솔 로그)을 지운다. orbivisord가 죽었다 뜨면 시작할 때 제 두 디렉터리에 남은 세션의 도우미(명령줄에
+  `orbivisor-fr-<id>`가 있는 프로세스만)·그 세션의 `orbivisor-fr-<id>.scope`·두 디렉터리를 치운다 — 같은 호스트의 다른 orbivisord(다른 `run_dir`)의
   도우미는 건드리지 않는다.
 - **도우미는 모두 같은 사용자(`run_as`, 기본 `nobody`)로 돈다.** 한 도우미의 커널을 뚫고 QEMU 프로세스까지 빠져나오면 같은 노드의
   다른 도우미(와 `nobody`로 도는 다른 데몬)에 신호를 보낼 수 있다(다른 세션의 덮개·소켓은 root의 0700 디렉터리 안이라
@@ -927,7 +927,7 @@ orbivisorctl grant add --group helpdesk --role helpdesk-files --on /teamA
 - **노드 고르기**: 이미지가 있고 온라인이고 자리가 있으며 백업을 읽을 수 있는 노드(저장소 백업은 저장소에 닿는 노드, 풀 백업은 그
   풀을 읽는 노드 — 공유가 아닌 dir 풀이면 백업을 쓴 노드) 가운데 **API를 받은 노드** → 세션이 적은 노드 → 가속(KVM·HVF)이 TCG보다 →
   이름 차례. 유지보수 노드는 뺀다. **노드 비우기**(drain)는 그 노드의 세션을 닫는다.
-- **라이브 복원 중인 백업**도 열 수 있다(둘 다 읽기만). 세션은 VM이 아니라 HA·마이그레이션 대상이 아니다. 노드가 죽거나 opld가 다시
+- **라이브 복원 중인 백업**도 열 수 있다(둘 다 읽기만). 세션은 VM이 아니라 HA·마이그레이션 대상이 아니다. 노드가 죽거나 orbivisord가 다시
   뜨면 세션은 실패로 끝나고(이어 가지 않는 Task) 다시 연다. 위트니스는 세션을 받지 않는다.
 
 ### 시간과 속도
@@ -970,7 +970,7 @@ PBS·Veeam 칸은 공개 문서의 일반적인 값이고 이 저장소에서 �
   `guest-exec` 없으면 있는 디렉터리 바로 아래 파일만 된다. 속도는 초당 몇 MB다. Task 취소 API가 없다. 꺼진 VM 디스크에 직접 쓰기,
   ISO로 묶어 꽂기는 없다. Windows 게스트는 손 확인만.
 - **zip**은 심볼릭 링크·장치·FIFO를 넣지 않는다(보고서 항목). 읽기 오류 난 파일은 오류 항목으로 남는다.
-- **이미지 배포**: deb는 amd64만, Rocky·소스 노드·macOS는 빌드 스크립트, 설치 ISO에는 아직 없다. opld를 올릴 때 이미지도 같은 판이어야 한다.
+- **이미지 배포**: deb는 amd64만, Rocky·소스 노드·macOS는 빌드 스크립트, 설치 ISO에는 아직 없다. orbivisord를 올릴 때 이미지도 같은 판이어야 한다.
 - **macOS 노드**는 권한 내림·sandbox·scope가 없다(개발용).
 - 실행 중인 VM의 디스크·스냅샷·복제본 찾아보기, 세션 공유, 내려받기 대역폭 제한, 더 빠른 부팅(따뜻한 도우미)은 다음 계획이다.
 
@@ -1369,7 +1369,7 @@ orbivisorctl import delete web01                # 가져오기와 남은 원본 
 VMFS·flat VMDK(디스크립터 + `-flat.vmdk`)여야 한다. 아래의 제안·네트워크 매핑·MAC·상태 등은 OVA와 같다.
 
 ```bash
-export OPL_ESXI_PASSWORD='…'                    # 또는 --password-file, 둘 다 없으면 터미널에서 묻는다(인자로는 받지 않는다)
+export ORBIVISOR_ESXI_PASSWORD='…'                    # 또는 --password-file, 둘 다 없으면 터미널에서 묻는다(인자로는 받지 않는다)
 orbivisorctl import esxi-browse --host esx1.example.com --user root
 # error: the ESXi certificate fingerprint is AB:CD:…; check it and rerun with --fingerprint AB:CD:…
 orbivisorctl import esxi-browse --host esx1.example.com --user root --fingerprint AB:CD:…
@@ -1490,7 +1490,7 @@ orbivisorctl import run web01 --name web --pool local --net lan  # 디스크를 
 
 ```bash
 # 1. 원본 연결(admin). 지문 없이 주면 서버 인증서 지문을 알려 준다(비밀번호는 보내지 않는다).
-export OPL_VMWARE_PASSWORD='…'                          # 또는 --password-file, 둘 다 없으면 터미널에서 묻는다
+export ORBIVISOR_VMWARE_PASSWORD='…'                          # 또는 --password-file, 둘 다 없으면 터미널에서 묻는다
 orbivisorctl vmware source add vc1 --host vcenter.example.com --user migr@vsphere.local
 # error: … fingerprint AB:CD:…; check it and rerun with --fingerprint AB:CD:…
 orbivisorctl vmware source add vc1 --host vcenter.example.com --user migr@vsphere.local --fingerprint AB:CD:…
@@ -1546,7 +1546,7 @@ orbivisorctl vmware vm revert wave1-db01 --confirm db01 --wait   # 대상 VM을 
    Power On" back on …, then power on … in vCenter")을 남기고, `retry`가 되돌림을 다시 한다(전환과 같은 권한, 겹친 다시 하기는
    409 `migration_busy`). 할당량·용량을 넘으면 VM 만들기에서 막혀 같은 되돌림을 한다. 대상 VM을 **켠 뒤**(`starting-vm`) 되돌린
    따뜻한 이전은 그 게스트가 대상 디스크에 썼을 수 있어 대상 내용을 버리고 `copying`(처음부터 전체 복사)으로 돌아간다. 이 자동
-   되돌림은 전환 Task가 처음 켜다 `running`을 보기 전에 실패했을 때만이다: 대상 VM이 켜졌거나 켜졌을 수 있으면(opld가 다시 떠
+   되돌림은 전환 Task가 처음 켜다 `running`을 보기 전에 실패했을 때만이다: 대상 VM이 켜졌거나 켜졌을 수 있으면(orbivisord가 다시 떠
    `starting-vm`부터 잇는 등) 절대 자동으로 되돌리지 않고 — 이때는 vCenter에 연결하지도 않는다 — 켜지 못해도 `done`에 오류를 남기고
    VM·디스크를 둔다. 그 뒤 돌아갈 길은 `revert`뿐이다.
 5. 새 VM이 잘 돌면 `finalize`(우리 스냅샷·우리가 켠 CBT를 지움, 원본 보호는 남김 — 실패하면 `done`에 오류를 남기고 다시
@@ -1578,7 +1578,7 @@ VDDK는 VMware 독점 라이브러리라 Orbivisor가 넣지 않는다: 운영�
 Broadcom 사이트에서 받은 VDDK를 `/opt/vmware-vix-disklib-distrib`에 풀어 노드 설정에 적는다.
 
 ```toml
-# /etc/opl/opld.toml
+# /etc/orbivisor/orbivisord.toml
 [vmware]
 nbdkit = "/usr/sbin/nbdkit"
 vddk_libdir = "/opt/vmware-vix-disklib-distrib"   # 원본의 --vddk-libdir가 먼저

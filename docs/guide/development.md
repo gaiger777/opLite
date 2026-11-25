@@ -161,7 +161,7 @@ cargo run -p orbivisor-api --features fake-vsphere --bin fake-vsphere -- --port 
 vcsim -l 127.0.0.1:8989 -username user -password pass &
 ORBIVISOR_TEST_VCSIM=127.0.0.1:8989 ORBIVISOR_TEST_VCSIM_USER=user ORBIVISOR_TEST_VCSIM_PASSWORD=pass ORBIVISOR_TEST_NBDKIT=$(command -v nbdkit) \
   cargo test -p orbivisor-api --features vcsim-it --test vcsim -- --nocapture --test-threads=1
-# 실제 opld(QEMU·qemu-img·qemu-nbd): 따뜻한 이전(회차 사이 쓰기·델타 둘·전환·볼륨 바이트 같음·원본 꺼짐·NIC 끊김·revert), 차가운 한 대·
+# 실제 orbivisord(QEMU·qemu-img·qemu-nbd): 따뜻한 이전(회차 사이 쓰기·델타 둘·전환·볼륨 바이트 같음·원본 꺼짐·NIC 끊김·revert), 차가운 한 대·
 # 마무리, 내보내기 → 내려받은 OVA(ustar) → OVA 가져오기 왕복. `[test] vmware_tick_ms`·`vmware_sync_secs`로 스케줄러·델타 주기를 줄인다.
 cargo test -p orbivisord --features qemu-it,fake-vsphere --test vmware_migration
 pnpm -C web test src/vmware src/exports                             # 원본 지문 흐름·비밀번호가 저장소에 없음, 나무·찾기, 마법사, 상세·서랍·전환·되돌리기, 내보내기(msw, axe)
@@ -216,14 +216,14 @@ sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target ORBIVISOR_TEST_ZF
 # Linux, root: 실제 Ceph RBD 풀. 테스트가 이미지를 만들고 지워도 되는 Ceph 풀과 ceph-common, qemu-block-extra, qemu-io,
 # client.admin으로 접속할 수 있는 /etc/ceph/ceph.conf·키링이 필요하다. 제한된 사용자 시험은 아래 세 변수가 있을 때만 돈다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target ORBIVISOR_TEST_RBD=rbd \
-  ORBIVISOR_TEST_RBD_USER=opltest ORBIVISOR_TEST_RBD_NAMESPACE=opl ORBIVISOR_TEST_RBD_CONF=/etc/opl-ceph/ceph.conf \
+  ORBIVISOR_TEST_RBD_USER=opltest ORBIVISOR_TEST_RBD_NAMESPACE=opl ORBIVISOR_TEST_RBD_CONF=/etc/orbivisor-ceph/ceph.conf \
   cargo test -p orbivisor-driver --features rbd-it --test rbd_storage
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target ORBIVISOR_TEST_RBD=rbd cargo test -p orbivisord --features rbd-it --test rbd
 # Linux(Ubuntu 24.04), root, Ceph가 없는 버려도 되는 기계: orbivisord가 apt로 Ceph를 설치하고 노드 하나에 mon·mgr, 시험이 만든
 # 루프 장치에 OSD, 풀 등록, 그 풀의 디스크로 VM 켜기(Ceph 꾸러미와 데몬이 남는다 — CI `ceph` 작업)
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target cargo test -p orbivisord --features ceph-it,qemu-it --test ceph -- --nocapture
 # Linux, root: 실제 공유 LVM 풀. 테스트가 LV를 만들고 지워도 되는, 잠금을 시작한 공유(lvmlockd) VG와 lvm2-lockd, sanlock,
-# qemu-io가 필요하다. ORBIVISOR_TEST_ISCSI(포털,타깃)가 있으면 opld 시험은 VG가 그 타깃의 LUN 위에 있다고 본다.
+# qemu-io가 필요하다. ORBIVISOR_TEST_ISCSI(포털,타깃)가 있으면 orbivisord 시험은 VG가 그 타깃의 LUN 위에 있다고 본다.
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target ORBIVISOR_TEST_LVM_SHARED=oplshared \
   cargo test -p orbivisor-driver --features lvm-shared-it --test lvm_shared_storage
 sudo -E env "PATH=$PATH" CARGO_TARGET_DIR=/tmp/opl-root-target ORBIVISOR_TEST_LVM_SHARED=oplshared \
@@ -254,7 +254,7 @@ cargo test -p orbivisor-api --features ldap-it --test ldap_it
 때문에 첫 실행이 느릴 수 있다.
 
 `lvm-it` 시험은 `ORBIVISOR_TEST_LVM`의 thin pool에 `opl-` LV를 만들고 지운다. 드라이버 시험은 만들기·가져오기·스냅샷·
-되돌리기·복사·지우기를, opld 시험은 LVM 디스크로 VM을 띄워 실행 중 스냅샷, 멈춘 뒤 되돌리기, 디렉터리 풀로 복제,
+되돌리기·복사·지우기를, orbivisord 시험은 LVM 디스크로 VM을 띄워 실행 중 스냅샷, 멈춘 뒤 되돌리기, 디렉터리 풀로 복제,
 지우기를 본다. **버려도 되는 VG**를 쓴다. CI `linux-kvm` 작업은 루프 장치 위에 VG `opltest`와 thin pool `tp`를 둔다:
 
 ```bash
@@ -265,7 +265,7 @@ sudo pvcreate -y "$LOOP" && sudo vgcreate opltest "$LOOP" && sudo lvcreate -y -T
 ```
 
 `zfs-it` 시험은 `ORBIVISOR_TEST_ZFS`의 데이터셋에 `opl-` zvol을 만들고 지운다. 드라이버 시험은 만들기·정보·크기·
-가져오기·스냅샷(가장 최근으로만 되돌리기, 여러 볼륨을 한 명령으로)·복사·지우기를, opld 시험은 ZFS 디스크로 VM을
+가져오기·스냅샷(가장 최근으로만 되돌리기, 여러 볼륨을 한 명령으로)·복사·지우기를, orbivisord 시험은 ZFS 디스크로 VM을
 띄워 실행 중 스냅샷, 최근이 아닌 스냅샷 되돌리기의 409, 멈춘 뒤 최근 스냅샷으로 되돌리기, 디렉터리 풀로 복제,
 지우기를 본다. **버려도 되는 데이터셋**을 쓴다. CI `linux-kvm` 작업은 파일 위에 zpool `opltestz`와 데이터셋
 `opltestz/opl`을 둔다:
@@ -279,7 +279,7 @@ sudo zpool create opltestz /tmp/opltestz.img && sudo zfs create opltestz/opl
 
 `rbd-it` 시험은 `ORBIVISOR_TEST_RBD`의 Ceph 풀에 `opl-` 이미지를 만들고 지운다. 드라이버 시험은 만들기·정보·크기·
 가져오기·스냅샷(더 오래된 스냅샷으로 되돌리기)·백엔드 안팎의 복사·지우기와 제한된 사용자·네임스페이스·명시적
-conf로 접속하기를, opld 시험은 RBD 디스크로 VM을 띄워
+conf로 접속하기를, orbivisord 시험은 RBD 디스크로 VM을 띄워
 실행 중 스냅샷, 메모리 스냅샷의 409, 멈춘 뒤 앞 스냅샷으로 되돌렸다가 다시 최근 스냅샷으로 되돌리기, 디렉터리
 풀로 복제, 지우기를 본다. **버려도 되는 Ceph 풀**을 쓴다. CI `linux-kvm` 작업은 microceph로 노드 하나짜리 Ceph를
 띄우고 풀 `rbd`를 둔다(준비에 1–2분):
@@ -287,7 +287,7 @@ conf로 접속하기를, opld 시험은 RBD 디스크로 VM을 띄워
 ```bash
 sudo apt install ceph-common qemu-block-extra
 sudo snap install microceph --channel squid/stable && sudo microceph cluster bootstrap
-sudo snap unalias microceph                          # 별칭(/snap/bin/rbd 등)은 snap에 갇혀 /etc/opl-ceph·/tmp를 못 본다
+sudo snap unalias microceph                          # 별칭(/snap/bin/rbd 등)은 snap에 갇혀 /etc/orbivisor-ceph·/tmp를 못 본다
 sudo mkdir -p /etc/ceph && sudo ln -sf /var/snap/microceph/current/conf/ceph.conf /etc/ceph/ceph.conf
 sudo sh -c 'ln -sf /var/snap/microceph/current/conf/*.keyring /etc/ceph/'
 sudo ceph config set global mon_allow_pool_size_one true && sudo ceph config set global osd_pool_default_size 1
@@ -295,17 +295,17 @@ sudo microceph disk add loop,4G,1                     # OSD가 올라올 때까�
 sudo ceph osd pool create rbd 32 && sudo ceph osd pool set rbd size 1 --yes-i-really-mean-it
 sudo rbd pool init rbd                                # PG가 active가 된 뒤(sudo ceph -s)
 # 제한된 사용자 시험: 네임스페이스와 사용자, 그 키링만 가리키는 conf
-sudo rbd namespace create rbd/opl && sudo mkdir -p /etc/opl-ceph
+sudo rbd namespace create rbd/opl && sudo mkdir -p /etc/orbivisor-ceph
 sudo ceph auth get-or-create client.opltest mon 'profile rbd' osd 'profile rbd pool=rbd' mgr 'profile rbd pool=rbd' \
-  | sudo tee /etc/opl-ceph/opltest.keyring >/dev/null
-{ sudo cat /etc/ceph/ceph.conf; printf '\n[client.opltest]\nkeyring = /etc/opl-ceph/opltest.keyring\n'; } \
-  | sudo tee /etc/opl-ceph/ceph.conf >/dev/null
+  | sudo tee /etc/orbivisor-ceph/opltest.keyring >/dev/null
+{ sudo cat /etc/ceph/ceph.conf; printf '\n[client.opltest]\nkeyring = /etc/orbivisor-ceph/opltest.keyring\n'; } \
+  | sudo tee /etc/orbivisor-ceph/ceph.conf >/dev/null
 # 끝나면: sudo snap remove --purge microceph
 ```
 
 `lvm-shared-it` 시험은 `ORBIVISOR_TEST_LVM_SHARED`의 공유 VG에 `opl-` LV를 만들고 지운다. 드라이버 시험은 만들기(0
 채우기)·배타 활성화와 끄기·연 장치는 끌 수 없음·크기(늘린 부분의 0 채우기)·가져오기와 실패한 가져오기 정리·백엔드 안팎의 복사·지우기를,
-opld 시험은 orbivisord가 iSCSI 로그인과 잠금 시작부터 해서 풀을 준비하는지(`ORBIVISOR_TEST_ISCSI`가 있으면 시험이 먼저 잠금을
+orbivisord 시험은 orbivisord가 iSCSI 로그인과 잠금 시작부터 해서 풀을 준비하는지(`ORBIVISOR_TEST_ISCSI`가 있으면 시험이 먼저 잠금을
 멈추고 로그아웃한다), 공유 LVM 디스크로 VM을 켜면 LV가 켜지고 멈추면 꺼지는지, 스냅샷의 409, orbivisord가 다시 뜰 때 남은
 활성화 정리(실행 중인 VM의 LV는 그대로), 디렉터리 풀과 같은 풀로 복제, 지우기를 본다. **버려도 되는 VG**를 쓴다. CI
 `linux-kvm` 작업은 targetcli(LIO)로 루프백 iSCSI 타깃을 만들어 로그인하고 그 LUN 위에 공유 VG `oplshared`를 둔다
@@ -334,11 +334,11 @@ sudo vgcreate --shared oplshared "/dev/disk/by-path/ip-127.0.0.1:3260-iscsi-$IQN
 
 `sdn-it` 시험(`crates/orbivisord/tests/sdn.rs`, 계획 65)은 **OVN이 깔린 적 없는 기계**에서 root로 돈다. orbivisord가 `sdn init`·
 `sdn chassis install`(API와 orbivisorctl)로 `ovn-central`·`ovn-host`·`openvswitch-switch`를 apt로 깔고, 배포판 중앙 단위를 끄고
-가린 뒤 Orbivisor 단위(`opl-ovn-nb`·`-sb`·`-northd`)를 띄운다. 시험은 NB·SB가 노드 주소의 `pssl`에만 듣는지(`ss -ltn`),
+가린 뒤 Orbivisor 단위(`orbivisor-ovn-nb`·`-sb`·`-northd`)를 띄운다. 시험은 NB·SB가 노드 주소의 `pssl`에만 듣는지(`ss -ltn`),
 클러스터 CA 인증서로만 붙는지, SB `Chassis`가 노드 UUID·Geneve·underlay인지, 127.0.0.2의 `ovsdb-server` 한 쌍의 합류·떠나기,
 리더 OvnSync의 NB 행·펜싱·다시 맞추기·지운 노드의 SB chassis 청소, IPAM 주소와 OVN DHCP(이름공간 둘의 OVS 내부 포트에서
 busybox `udhcpc`, 서로 ping, 위조 주소는 막힘), SDN NIC VM의 `br-int` tap·`ovn-installed`·SB 바인딩, `network ips`의 포트 상태,
-opld 다시 띄우기를 본다. 시험은 **호스트에 OVN 꾸러미·데몬·`/var/lib/opl/ovn`을 남긴다** — 그래서 GitHub의 깨끗한 Ubuntu
+orbivisord 다시 띄우기를 본다. 시험은 **호스트에 OVN 꾸러미·데몬·`/var/lib/orbivisor/ovn`을 남긴다** — 그래서 GitHub의 깨끗한 Ubuntu
 24.04 러너에서만 돌린다. CI `ovn` 작업은 QEMU·OVMF·busybox만 미리 깔고 `/etc/ovn`·`/etc/openvswitch`와 OVN 꾸러미가 없는지
 확인한 뒤(OVN은 orbivisord가 설치), Ubuntu 24.04 클라우드 이미지를 받아 `ORBIVISOR_TEST_CLOUD_IMAGE`로 넘기고
 `cargo test --features orbivisord/sdn-it -p orbivisord --test sdn`을 root로 돌린다(빌드 2분쯤, 시험 2~3분). 러너 하나는 OVS 하나라 chassis
@@ -398,7 +398,7 @@ remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 
 
 **파일 단위 복원 시험**(계획 69)은 실제 도우미 이미지와 고정물 디스크가 있어야 돈다 — `ORBIVISOR_RESTORE_IMAGE_DIR`(그 아래
 `<arch>/manifest.json`, `packaging/restore-image/build.sh`가 만듦)와 `ORBIVISOR_RESTORE_FIXTURES`(`make-disks.sh`가 만든 이미지·`expected.sha256`)가
-없으면 건너뛴다. 이미지 판은 시험 빌드의 opld 판과 같아야 하므로 같은 소스 트리에서 만든다. `crates/orbivisor-driver/tests/restore_helper.rs`
+없으면 건너뛴다. 이미지 판은 시험 빌드의 orbivisord 판과 같아야 하므로 같은 소스 트리에서 만든다. `crates/orbivisor-driver/tests/restore_helper.rs`
 (`restore-it` = `qemu-it`)는 도우미를 직접 띄워 고정물 11개(ext4는 orbivisor-store NBD 서버 원본, 나머지 qcow2 원본)의 탐지 표·파일마다 SHA-256·
 더러운 ext4·XFS 저널 재생·같은 UUID XFS 둘·MBR·GPT·LUKS "not supported"·LVM 선형·씬, 덮개 한도, `kill -9`, 버려 둔 도우미의 치우기를 보고,
 부팅 시간·흘리기 MB/s를 `PROBE` 줄로 찍는다. 고르는 것: `ORBIVISOR_RESTORE_QEMU`·`ORBIVISOR_RESTORE_QEMU_IMG`(바이너리), `ORBIVISOR_RESTORE_ACCEL=tcg`(가속
@@ -406,7 +406,7 @@ remove-node` 뒤 c2 인증서가 c1·c3의 6641·6642에 붙지 못하기까지 
 뒤 QEMU uid와 seccomp도 본다. XFS 더러운 로그 고정물(`xfs-dirty.img`)은 root가 만든다(CI `file-restore` 작업의 "Fixture disks" 걸음 —
 루프 마운트, 파일 쓰기·fsync, `xfs_io -x -c shutdown`). `crates/orbivisord/tests/file_restore.rs`(`restore-it` = `backup-it`, unzip·tar 필요)는
 orbivisorctl `backup files`로 (1) 고정물 ext4 VM의 암호화 로컬 저장소 백업 — 나열·raw·zip·tar.gz를 고정물과 견주고 닫은 뒤 도우미·세션
-디렉터리가 남지 않음, (2) 옛 풀 전체 → 더러운 저널 증분 체인, (3) 도우미 `kill -9`, (4) 세션이 열린 채 opld `SIGKILL` 뒤 치우기, (5) 실제
+디렉터리가 남지 않음, (2) 옛 풀 전체 → 더러운 저널 증분 체인, (3) 도우미 `kill -9`, (4) 세션이 열린 채 orbivisord `SIGKILL` 뒤 치우기, (5) 실제
 게스트 에이전트로 되돌려 쓰기를 본다. (5)는 `build.sh --test-guest --out <dir>`(같은 커널에 Debian `qemu-guest-agent`·정적 busybox,
 `test-guest.lock`)로 만든 시험 게스트를 `ORBIVISOR_RESTORE_TEST_GUEST`로 주면 돈다 — 시험이 QEMU 감싸개로 그 VM에만 `-kernel`·`-initrd`를 더한다.
 QEMU가 PATH 밖이면(svc01의 `/opt/qemu`) `ORBIVISOR_TEST_QEMU`·`ORBIVISOR_TEST_ACCEL`(기본 `tcg`)로, systemd scope는 `ORBIVISOR_TEST_SYSTEMD=1`로, 배포판
@@ -415,7 +415,7 @@ macOS 유닉스 소켓 경로는 104바이트 안이어야 하므로 이미지·
 (`web/e2e/file-restore.spec.ts`)도 같은 두 변수가 있을 때만 돌고, `ORBIVISOR_SCREENSHOTS=<디렉터리>`면 화면 `file-restore.png`를 남긴다.
 CI **`file-restore`** 작업(Ubuntu 24.04 러너, KVM, root, `timeout-minutes: 60`)은 도구를 깔고 x86_64 이미지를 **두 번** 빌드해 세 파일의
 해시가 같은지 보고(재현), aarch64 이미지는 빌드만(부팅은 svc01), x86_64 시험 게스트를 만든 뒤, 고정물 전체(btrfs·ntfs·LVM·XFS 더러운 로그)를
-root로 만들고, root로 `restore_helper`(`ORBIVISOR_RESTORE_SCOPE=1`)와 opld E2E (1)~(5)를, 마지막에 `ORBIVISOR_RESTORE_ACCEL=tcg`로 도우미 시험을 한 번
+root로 만들고, root로 `restore_helper`(`ORBIVISOR_RESTORE_SCOPE=1`)와 orbivisord E2E (1)~(5)를, 마지막에 `ORBIVISOR_RESTORE_ACCEL=tcg`로 도우미 시험을 한 번
 더 돌린다. `check (ubuntu)`는 musl 두 타깃의 `cargo tree -p orbivisor-restore`에 C 빌드 스크립트(`cc`·`ring`·`openssl-sys`)가 없는지와
 `archive_tools`를, `shell`은 `restore-image-test.sh`를, `package`는 `orbivisor-restore-image` deb 빌드·설치를 본다.
 

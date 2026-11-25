@@ -47,7 +47,7 @@ Node `status.ha`(`{"fencing": "watchdog"|"process", "recover_after_secs": …, "
 `on-failure`를 권한다). 리스는 관리 네트워크만 본다 — 스토리지·VM 네트워크·본딩 포트의 장애는 아래 "HA 상태 검사"다.
 
 ```toml
-# /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
+# /etc/orbivisor/orbivisord.toml (노드마다, 생략하면 아래 기본값)
 [ha]
 fencing = "watchdog"              # watchdog | process | off (기본: Linux watchdog, macOS off)
 profile = "fast"                  # fast(10·10초) | safe(30·30초, 계획 51 전의 값)
@@ -285,8 +285,8 @@ control의 백분율 방식).
 ```bash
 sudo modprobe -r softdog; sudo modprobe softdog soft_noboot=1   # 이미 올라와 있으면 내렸다가 다시
 cat /sys/class/watchdog/watchdog0/identity                      # Software Watchdog
-# opld.toml: [ha] fencing = "watchdog", watchdog_timeout_secs = 10, fence_after_secs = 10
-sudo orbivisord --config /etc/opl/opld.toml &
+# orbivisord.toml: [ha] fencing = "watchdog", watchdog_timeout_secs = 10, fence_after_secs = 10
+sudo orbivisord --config /etc/orbivisor/orbivisord.toml &
 orbivisorctl vm create hatest --memory 256 --ha --start
 cat /sys/class/watchdog/watchdog0/state                         # active (orbivisord가 열었다)
 # 1) orbivisord가 멈춰 서면: 쓰다듬기가 멈춰 약 10초 뒤 "Triggered - Reboot ignored"
@@ -294,7 +294,7 @@ sudo kill -STOP "$(pidof orbivisord)"; sleep 15; sudo dmesg | grep softdog; sudo
 # 2) HA VM이 돌 때 정상 종료: 경고 로그와 "watchdog did not stop!", 약 10초 뒤 Triggered
 sudo kill -TERM "$(pidof orbivisord)"; sleep 15; sudo dmesg | tail
 # 3) HA VM이 없을 때 정상 종료: magic close로 state가 inactive, Triggered가 없다
-sudo orbivisord --config /etc/opl/opld.toml &                   # 다시 띄우면 도는 hatest에 붙어 장치를 다시 연다
+sudo orbivisord --config /etc/orbivisor/orbivisord.toml &                   # 다시 띄우면 도는 hatest에 붙어 장치를 다시 연다
 orbivisorctl vm stop hatest; orbivisorctl vm list               # PHASE stopped를 확인한 뒤
 sudo kill -TERM "$(pidof orbivisord)"; sleep 15; cat /sys/class/watchdog/watchdog0/state
 # 4) (셋 이상의 클러스터) 이 노드와 다른 멤버 사이의 cluster_listen(8007)을 막으면 약 10초 뒤 HA VM이
@@ -309,12 +309,12 @@ sudo modprobe -r softdog                                        # 끝나면
 셋이므로 어느 한 노드가 죽어도 클러스터가 계속 돈다. QEMU가 필요 없으므로 작은 기계나 VM(이 클러스터 밖)에 둔다.
 
 ```bash
-sudo tee /etc/opl/opld.toml >/dev/null <<'TOML'
+sudo tee /etc/orbivisor/orbivisord.toml >/dev/null <<'TOML'
 name = "wit"
 address = "10.0.0.13"
 witness = true
 TOML
-sudo orbivisord --config /etc/opl/opld.toml &
+sudo orbivisord --config /etc/orbivisor/orbivisord.toml &
 orbivisorctl cluster join-token                  # 일반 노드의 API에 로그인한 곳에서
 sudo orbivisorctl cluster join 'opl-join://…'    # 위트니스에서
 orbivisorctl cluster status                      # WITNESS 열이 true, 경고 없음
@@ -323,7 +323,7 @@ orbivisorctl cluster status                      # WITNESS 열이 true, 경고 �
 - **합류만 된다.** 위트니스에서 `cluster init`은 거절된다("a witness cannot start a cluster; join an existing
   cluster instead"). 역할은 합류할 때 정해지고 바뀌지 않는다. 바꾸려면 `cluster leave` 뒤 설정을 고치고 orbivisord를
   다시 띄워 다시 합류한다. 멤버인 채 `witness` 값만 바꿔 다시 띄우면 orbivisord는 시작하지 않는다("this node joined
-  as a witness but opld.toml says witness = false; leave the cluster and join again to change the role", 반대도
+  as a witness but orbivisord.toml says witness = false; leave the cluster and join again to change the role", 반대도
   같다).
 - **탈퇴.** 탈퇴·`remove-node`는 일반 노드와 같다. 다만 빠진 뒤 남는 투표 멤버가 모두 위트니스면 위트니스는
   리더가 될 수 없어 클러스터가 멈추므로 `cluster leave`를 거절한다("the remaining voting members are all
@@ -456,7 +456,7 @@ HA VM과 이 버전 전의 VM은 바이트까지 옛 모양이고, `--ha`/`--no-
   옮긴 VM을 다음 VM의 규칙·메모리에 센다(affinity 상대는 첫 VM을 따라간다).
 
 **노드 정상 종료 정책.** 클러스터 설정 `shutdown_policy`(기본 `conditional`)는 **호스트가 꺼지는 중(재부팅·전원 끄기)일
-때만** 움직인다. `systemctl stop opld`·업그레이드 재시작은 지금 그대로(VM 계속 돎, 위 watchdog 경고)다.
+때만** 움직인다. `systemctl stop orbivisord`·업그레이드 재시작은 지금 그대로(VM 계속 돎, 위 watchdog 경고)다.
 
 - **판별.** orbivisord가 SIGTERM을 받으면 `systemctl list-jobs`를 보아 `reboot.target`·`kexec.target`·`soft-reboot.target`의
   시작 작업이면 재부팅, `poweroff.target`·`halt.target`(또는 `shutdown.target`만)이면 끄기, 없거나 명령이 실패하면(macOS 포함)
@@ -472,7 +472,7 @@ HA VM과 이 버전 전의 VM은 바이트까지 옛 모양이고, `--ha`/`--no-
   켰어도 표시가 `migrate`가 유지보수를 켠 것이면 등록이 끄므로, 계속 유지보수로 두려면 돌아온 뒤 다시 켠다. 돌아오지 않을 얼린 노드는
   `orbivisorctl node unfreeze`(웹 "얼림 풀기", admin, 오프라인일 때만 — 아니면 **409** `node_online`)로 표시를 지우면 리더가
   죽은 노드처럼 복구한다.
-- **systemd.** 정책이 VM이 살아 있을 때 돌도록 QEMU 스코프가 `Before=opld.service`를 갖고(멈출 때는 역순이라 orbivisord가 먼저
+- **systemd.** 정책이 VM이 살아 있을 때 돌도록 QEMU 스코프가 `Before=orbivisord.service`를 갖고(멈출 때는 역순이라 orbivisord가 먼저
   끝난다) 망·원격 파일시스템보다는 먼저 멈추도록 `After=network-online.target remote-fs.target`도 갖는다. 유닛은
   `TimeoutStopSec=15min`이다 — 이 한도는 보통의 `systemctl stop`·`restart`에도 적용되어, 멈추지 않는 orbivisord를 systemd가
   강제로 끝내기까지 기다리는 시간도 15분이다. **이 버전 전에 켠 VM의 스코프에는 이 순서가 없으므로** 호스트 종료 때 orbivisord와
@@ -819,8 +819,8 @@ orbivisorctl vm get web                                                 # 표준
   깬다). 플리싱 이미지는 `{data_dir}`에 놓이고 회차 동안 게스트가 처음 덮어쓰는 블록만큼, 최악에는 **디스크 크기까지** 자라므로
   그 파일 시스템에 여유를 둔다. 그 디렉터리의 남은 공간이 복제할 디스크 크기 합의 10%보다 적으면 회차를 시작하지 않고("not
   enough space in … for the fleecing images"), 보내는 동안에도 남은 공간이 1 GiB와 그 파일 시스템 크기의 5% 가운데 큰 쪽보다
-  줄면 회차를 멈춘다("not enough space left in … for the fleecing images" — 플리싱을 떼고 지운다). 실패하거나 opld가 다시 시작해
-  끊긴 회차의 플리싱은 그 Task의 정리와 opld가 도는 VM에 다시 붙을 때 뗀다. VM이 그 노드에서 돌지 않게 된 뒤(옮겨 갔거나 꺼짐)
+  줄면 회차를 멈춘다("not enough space left in … for the fleecing images" — 플리싱을 떼고 지운다). 실패하거나 orbivisord가 다시 시작해
+  끊긴 회차의 플리싱은 그 Task의 정리와 orbivisord가 도는 VM에 다시 붙을 때 뗀다. VM이 그 노드에서 돌지 않게 된 뒤(옮겨 갔거나 꺼짐)
   시작한 회차는 실패가 아니라 건너뛴다(Task는 성공이되 경고 "replication run skipped: the VM is not running on this node"를
   남기고 `vm replicate`가 그 경고를 알린다 — 스케줄러가 VM이 도는 노드에서 다시 만든다). 대상 노드는 회차마다 짧은 받기
   QEMU(`-machine none`)를 `[migration] ports`의 포트 하나로 띄우므로 **노드 사이에 그 포트 범위를 연다**(마이그레이션과 나눠
@@ -872,7 +872,7 @@ orbivisorctl vm get web                                                 # 표준
   비트맵은 따라간다). 복제 Task와 마이그레이션은 VM 줄에서 차례로 돈다. 따라잡기도 복제 회차처럼 플리싱으로 보내 대상이 끊겨도
   게스트 쓰기는 실패하지 않는다(그 패스와 마이그레이션만 되돌려진다). 따라잡기는 `[migration] disk_timeout`(기본 12h) 안에
   끝나야 하고, 넘기면 작업을 취소하고 플리싱을 뗀 뒤 되돌린다(되돌리기도 남은 플리싱을 치운다). 옛 원본은 확정하기 전에 남길 디스크를 자기 기록에 적어 두므로
-  확정 뒤 opld가 죽어도 그 디스크는 옛 복제본으로 알아보고 다음 역방향 회차가 그 위에 보낸다.
+  확정 뒤 orbivisord가 죽어도 그 디스크는 옛 복제본으로 알아보고 다음 역방향 회차가 그 위에 보낸다.
 - **배치.** 균형 조정기는 복제가 있는 로컬 디스크 VM을 옮길 수 있고 그 대상은 복제본이 준비된 노드뿐이다. 비우기는 로컬 디스크
   VM을 점수가 같으면 복제본 노드로 먼저 옮기고(그러면 바뀐 것만 보낸다), HA 되돌아가기(failback)도 복제본이 준비된 노드로만
   한다.
@@ -896,7 +896,7 @@ orbivisorctl vm get web                                                 # 표준
   생략, **202** Task, 운영자 권한, **409** `vm_busy` "VM \"web\" is already being replicated to node \"node2\" (task …)",
   **400** "node \"node3\" is not a replication target of VM \"web\""·"VM \"web\" has several replication targets; choose one
   with node")다. 실패한 회차의 까닭은 그 대상의 `error`에 남고 다음 성공 때 지워진다.
-- **설정.** `opld.toml`의 `[replication]`: `tick_secs`(60), `max_concurrent`(2), `bandwidth_mib`(0). 리더가 바뀌어도
+- **설정.** `orbivisord.toml`의 `[replication]`: `tick_secs`(60), `max_concurrent`(2), `bandwidth_mib`(0). 리더가 바뀌어도
   `last_try`·`synced_at`이 클러스터 기록에 있어 일정이 이어진다.
 - **업그레이드.** 모든 노드가 `node-replication`을 알아야 복제를 켤 수 있고(아니면 **409** `cluster_upgrading`) 복제 Task·
   복제본 승격·따라잡기 마이그레이션을 한다. 받은 백업·복제(clone)·복원·가져오기로 만든 VM은 `replication`을 비운다.

@@ -44,7 +44,7 @@ orbivisorctl iso delete alpine
   `Environment=`로). **볼륨 쓰기 권한(operator 이상)을 가진 사용자만** 받기를 쓸 수 있고, 노드는 기본으로 루프백·링크 로컬
   (클라우드 메타데이터 169.254.169.254 포함)·사설망·공유(100.64/10)·`0.0.0.0/8`·시험망(198.18/15)·예약(240/4)·멀티캐스트
   주소에서는 받지 않는다(이름이 그런 주소로 풀려도, 리디렉션의 어느 단계여도, IPv4를 담은 IPv6 — `::ffff:a.b.c.d`·`::a.b.c.d`·
-  NAT64 `64:ff9b::/96`·6to4 `2002::/16` — 여도 — `address 10.0.0.9 is loopback, link-local or private`). 사내 미러가 사설 주소면 opld 설정 `[download]`의
+  NAT64 `64:ff9b::/96`·6to4 `2002::/16` — 여도 — `address 10.0.0.9 is loopback, link-local or private`). 사내 미러가 사설 주소면 orbivisord 설정 `[download]`의
   `allow_private = true`로 켠다. 프록시를 쓰면 대상 주소는 프록시가 푼다.
   URL의 `user:password@`는 `***@`로, 쿼리 문자열(서명·토큰)은 `?***`로 감사 기록·오류 문구·Task 응답(`GET /tasks`, watch)에서
   가린다(저장소의 Task에는 원래 URL이 남는다 — 아래 한계).
@@ -346,7 +346,7 @@ orbivisorctl template deploy debian-tmpl --name 'app-{n}' --count 3 --start
   때만 늘림, `--ci-user`·`--ci-ssh-key`·`--ci-password-*`)이면 가져오기가 끝난 뒤 템플릿 VM을 만든다: 아키텍처로
   `q35`/`virt`, 항목의 펌웨어, `virtio-blk` 디스크 하나(부팅 1), NIC 하나, cloud-init. 호스트 이름·정적 IP는 400이다
   (배포 때 준다). API가 VM 만들기와 같은 검사를 미리 한다(이름 **409** `name_taken`, 아키텍처가 맞는 노드가 없으면 **400**
-  `machine_arch_mismatch`). 템플릿 단계가 실패하면(그새 이름이 쓰였거나 opld가 재시작) **받은 볼륨은 지우지 않고**
+  `machine_arch_mismatch`). 템플릿 단계가 실패하면(그새 이름이 쓰였거나 orbivisord가 재시작) **받은 볼륨은 지우지 않고**
   `…; volume "ubuntu-24-04" is ready; create the template from it with vm create and template convert`로 알린다.
   가져오기 전 실패(체크섬 등)는 볼륨을 지운다. 웹은 가상 머신 › 이미지·ISO › 이미지 라이브러리 보기(아키텍처 거름, 항목별 "받기"·"받은 뒤 템플릿
   만들기", 진행률, 관리자 항목 더하기·지우기).
@@ -418,19 +418,19 @@ LUKS의 TPM 봉인, 서명된 부트로더만 켜기에 쓴다(Proxmox VE의 `tp
   with Secure Boot keys)`). 능력을 알리지 않은 노드(옛 노드)는 능력 없음이다. `node list`의 `TPM`·`SB` 열, `node get`
   stderr의 `firmware: tpm yes, secure boot no`, 웹 노드 목록의 "펌웨어" 열로 본다.
 - **AppArmor**: Ubuntu·Debian의 swtpm은 AppArmor 프로필(`/usr/bin/swtpm`)에 묶여 있다. 패키지는 기본 경로(`data_dir =
-  /var/lib/opl`, `run_dir = /run/opl`)의 규칙 `/etc/apparmor.d/abstractions/orbivisor-swtpm`(conffile)을 싣고, postinst가
+  /var/lib/orbivisor`, `run_dir = /run/orbivisor`)의 규칙 `/etc/apparmor.d/abstractions/orbivisor-swtpm`(conffile)을 싣고, postinst가
   `/etc/apparmor.d/local/usr.bin.swtpm`에 `include <abstractions/orbivisor-swtpm>`을 한 번 더한 뒤 프로필을 다시 읽힌다
   (purge는 그 줄만 뺀다). **`data_dir`·`run_dir`을 바꿨으면** 그 경로로 같은 규칙을 local 파일에 더하고 다시 읽힌 뒤
   orbivisord를 다시 시작한다. 막히면 VM 켜기가 실패하는 대신 노드가 `TPM no`를 알린다(위 경고).
 
   ```
-  # /etc/apparmor.d/local/usr.bin.swtpm (data_dir = /srv/opl, run_dir = /run/opl일 때)
-  /srv/opl/vm/*/tpm/ rw,
-  /srv/opl/vm/*/tpm/** rwk,
-  /run/opl/vm/*/ r,
-  /run/opl/vm/*/tpm.sock rw,
-  /run/opl/vm/*/swtpm.pid rw,
-  /run/opl/vm/*/swtpm.log rw,
+  # /etc/apparmor.d/local/usr.bin.swtpm (data_dir = /srv/orbivisor, run_dir = /run/orbivisor일 때)
+  /srv/orbivisor/vm/*/tpm/ rw,
+  /srv/orbivisor/vm/*/tpm/** rwk,
+  /run/orbivisor/vm/*/ r,
+  /run/orbivisor/vm/*/tpm.sock rw,
+  /run/orbivisor/vm/*/swtpm.pid rw,
+  /run/orbivisor/vm/*/swtpm.log rw,
   ```
 
   ```bash
@@ -1117,7 +1117,7 @@ orbivisorctl vm list                     # 옮기는 동안 PHASE migrating, NOD
 작업)다.
 
 ```toml
-# /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
+# /etc/orbivisor/orbivisord.toml (노드마다, 생략하면 아래 기본값)
 [migration]
 ports = "60000-60099"     # 받는 쪽 QEMU가 듣는 TCP 포트 범위(둘 다 포함)
 bandwidth_mib = 0         # 보내는 대역폭 상한(MiB/s), 0이면 QEMU 기본값. 로컬 디스크 복사에도 디스크 수로 나눠 쓴다
@@ -1133,7 +1133,7 @@ disk_timeout = "12h"      # 로컬 디스크 복사가 따라잡기(ready)까지
   범위의 빈 포트를 고르고(모두 쓰는 중이면 "no free migration port in …"으로 실패한다), 원본은 대상의 `address`로
   접속한다. 로컬 디스크를 복사하면 범위에서 포트를 둘 쓴다(디스크 복사의 NBD와 메모리).
 - **TLS.** orbivisord가 시작할 때 노드 인증서·키와 클러스터 CA를 `{data_dir}/migration-tls/`(기본
-  `/var/lib/opl/migration-tls`, 0700, 키 0600)에 쓰고 QEMU가 그것으로 서로를 확인한다. 이 기능 전에 클러스터에
+  `/var/lib/orbivisor/migration-tls`, 0700, 키 0600)에 쓰고 QEMU가 그것으로 서로를 확인한다. 이 기능 전에 클러스터에
   들어온 노드의 인증서는 키 용도에 keyEncipherment가 없어 QEMU 8.2 이하에서 TLS가 실패한다(orbivisord가 시작할 때
   경고한다). 그 노드를 클러스터에서 뺐다가 다시 합류시켜 새 인증서를 받는다.
 - **거절(409).** 실행 중이 아님 `vm_not_running`, 로컬 디스크가 있는데 VM에 스냅샷이 있거나 macOS 노드

@@ -313,14 +313,14 @@ terraform {
 }
 
 provider "orbivisor" {
-  endpoint       = "https://node1.example.net:8006"   # 또는 OPL_SERVER
-  api_token      = var.orbivisor_token                # 또는 OPL_TOKEN (orbivisorctl token create)
-  ca_fingerprint = "sha256:3f1c…"                     # 또는 ca_pem = file("cluster-ca.pem") / OPL_CA_PEM / OPL_CA_FINGERPRINT
+  endpoint       = "https://node1.example.net:8006"   # 또는 ORBIVISOR_SERVER
+  api_token      = var.orbivisor_token                # 또는 ORBIVISOR_TOKEN (orbivisorctl token create)
+  ca_fingerprint = "sha256:3f1c…"                     # 또는 ca_pem = file("cluster-ca.pem") / ORBIVISOR_CA_PEM / ORBIVISOR_CA_FINGERPRINT
 }
 ```
 
-- **공급자 칸.** `endpoint`(`OPL_SERVER`), `api_token`(`OPL_TOKEN`), `ca_pem`(`OPL_CA_PEM` — 클러스터 CA, 비우면 시스템 루트: ACME
-  인증서일 때), `ca_fingerprint`(`OPL_CA_FINGERPRINT` — `ca_pem` 없이 서버의 CA를 받아 이 지문일 때만 믿는다 — 그때 CA는 인증서 하나여야 한다), `timeout`(적용·지우기
+- **공급자 칸.** `endpoint`(`ORBIVISOR_SERVER`), `api_token`(`ORBIVISOR_TOKEN`), `ca_pem`(`ORBIVISOR_CA_PEM` — 클러스터 CA, 비우면 시스템 루트: ACME
+  인증서일 때), `ca_fingerprint`(`ORBIVISOR_CA_FINGERPRINT` — `ca_pem` 없이 서버의 CA를 받아 이 지문일 때만 믿는다 — 그때 CA는 인증서 하나여야 한다), `timeout`(적용·지우기
   하나의 Task를 기다리는 한도, Go 기간, 기본 `20m`), `force_conflicts`(적용 묶음이 관리하는 객체를 넘겨받음 — 아니면
   `managed_elsewhere` 오류). 머리 `Orbivisor-Client: terraform/{판}`이라 설정 기록의 출처가 `terraform`이다.
 - **리소스 열다섯.** `orbivisor_folder`, `orbivisor_network`, `orbivisor_router`, `orbivisor_floating_ip`, `orbivisor_security_group`,
@@ -408,6 +408,6 @@ resource "orbivisor_vm" "web01" {
 - `apply --plan FILE`의 `--reason`은 기록되지 않는다: 사유는 계획을 세울 때 담기는데 `plan`에는 `--reason`이 없다.
 - `apply_set_drift`·인증서 경보 조건은 CLI 경보 규칙 명령과 웹 폼에 아직 없다(API·매니페스트로).
 - 웹에는 YAML 편집기(붙여 넣어 적용)와 목록에서 여럿 골라 내보내기가 없다(선언 묶음 상세의 "YAML로 내보내기"가 묶음 전체를 낸다).
-- 수백 노드에서 기록 읽기·스냅샷 크기의 부하는 재지 않았다. 관찰 노드 끝까지(opld 여러 노드)의 기록 읽기는 RPC 시험만 있다.
+- 수백 노드에서 기록 읽기·스냅샷 크기의 부하는 재지 않았다. 관찰 노드 끝까지(orbivisord 여러 노드)의 기록 읽기는 RPC 시험만 있다.
 - Terraform 공급자는 레지스트리에 없다(`dev_overrides`). 리소스 열다섯 밖의 종류(realm·원격·알림·설정·ACME 계정·DNS 공급자 등)는
   공급자에 없다 — `orbivisorctl apply`로 다룬다.

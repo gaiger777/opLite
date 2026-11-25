@@ -32,7 +32,7 @@ data_dir = "/tmp/opl/node1"
 run_dir = "/tmp/opl/run1"
 TOML
 cargo run -p orbivisord -- --config /tmp/opl/node1.toml &
-cargo run -p orbivisorctl -- cluster init --name dev --socket /tmp/opl/run1/opld.sock
+cargo run -p orbivisorctl -- cluster init --name dev --socket /tmp/opl/run1/orbivisord.sock
 # 출력된 admin 비밀번호와 CA 지문으로 로그인한다(API·웹: https://127.0.0.1:8006).
 cargo run -p orbivisorctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sha256:...
 ```

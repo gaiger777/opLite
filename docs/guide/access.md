@@ -178,7 +178,7 @@ orbivisorctl login --server https://10.0.0.11:8006 --realm corp --user alice  # 
   있다(시험 동작은 기다리지 않는다).
 - **오류.** 없는 사용자, 여러 항목, 틀린 비밀번호(LDAP 결과 49)는 모두 로컬과 같은 **401** `invalid_credentials`다.
   연결·TLS 실패, 믿지 않는 인증서, 서비스 계정 바인드·검색 실패, 사용자 바인드의 49가 아닌 실패는 **503**
-  `realm_unavailable`("the directory of realm corp is unavailable")이고 원인은 orbivisord 로그(`journalctl -u opld`)에 경고로
+  `realm_unavailable`("the directory of realm corp is unavailable")이고 원인은 orbivisord 로그(`journalctl -u orbivisord`)에 경고로
   남는다. 모르는 영역은 **400** `invalid_request`, 매핑되는 역할이 없으면 **403** `no_role`이다. 롤링 업그레이드 중(옛 orbivisord
   노드가 있을 때) 영역 로그인과 영역 쓰기는 **409** `cluster_upgrading`이다(로컬 로그인은 된다).
 - **시도 제한.** 로컬 로그인과 같은 기록이고 키는 외부 사용자 이름(`alice@corp`)과 IP다. **401뿐 아니라 403 `no_role`과
@@ -342,13 +342,13 @@ orbivisorctl realm set-oidc kc --clear-ca --clear-default-role --clear-groups
 - **IdP 요청.** discovery·JWKS를 받지 못하면 그 실패를 같은 영역(같은 revision)에서 15초 동안 기억해 다시 받지 않고 같은
   오류를 낸다(막힌 IdP로 요청을 쏟지 않게). 같은 영역을 동시에 여러 로그인이 물어도 한 번만 받는다. IdP 응답 본문은 1 MiB까지만
   읽는다(넘으면 실패).
-- **쿠키.** 로그인 상태 쿠키 `opl_oidc`의 값은 `{영역, state, nonce, PKCE 검증자, 리디렉트 URI, 만든 시각}` JSON의 base64url과 그 HMAC-SHA256
+- **쿠키.** 로그인 상태 쿠키 `orbivisor_oidc`(옛 이름 `opl_oidc`도 같은 값으로 — "이름 바꾸기 2")의 값은 `{영역, state, nonce, PKCE 검증자, 리디렉트 URI, 만든 시각}` JSON의 base64url과 그 HMAC-SHA256
   이다. HMAC 키는 클러스터 CA 비밀 키(모든 노드에 있음)에서 HKDF-SHA256(정보 `opl-oidc-state`)으로 만들므로 새로 저장하는
   값 없이 어느 노드나 같은 키를 얻는다. 속성은 `HttpOnly; Secure; SameSite=Lax; Path=/api/v1/auth/oidc; Max-Age=600`이다
   (IdP에서 돌아오는 최상위 이동에 쿠키가 가도록 `Lax`). 콜백은 성공·실패 모두 이 쿠키를 지운다. 브라우저가 쿠키를 막으면
   SSO 로그인은 늘 실패한다.
 - **오류.** 실패하면 `/login?error=<코드>`로 돌아가고 로그인 화면이 문구를 보인다. 원인은 orbivisord 로그에 경고("an OIDC login
-  failed" 또는 "cannot start an OIDC login", `journalctl -u opld`)로 남는다.
+  failed" 또는 "cannot start an OIDC login", `journalctl -u orbivisord`)로 남는다.
   - `sso_failed`: 쿠키 없음·서명이 틀림·10분 지남·`state` 다름, IdP가 `error`로 돌려보냄(사용자가 거절 등), 인가 응답의
     `iss`가 다르거나(지원한다는 IdP인데) 없음, 토큰 끝점이 코드를 거절함(4xx `invalid_grant` — 코드가 틀렸거나 이미 썼거나
     만료), ID 토큰 확인 실패, userinfo가 액세스 토큰을 거절함(401·403), 이름 클레임이 없거나 글이 아니거나 이름 규칙에 맞지
@@ -445,7 +445,7 @@ orbivisorctl -o json audit --since 7d            # 응답 그대로(항목의 �
   `username=<invalid>` — 비밀번호를 이름 칸에 넣었을 수 있다, 영역 로그인은 뒤에 ` realm=<영역>`), OIDC 콜백은 `realm=<영역> username=<이름>` 또는 `realm=<영역> error=<코드>`, 원격 클러스터 중계는 `remote=<이름> <메서드> /<경로>`, 구독 키 넣기는 `id=<키 id>`. 비밀번호·키·토큰은
   어디에도 넣지 않는다. 로그인에 성공하면 그 사용자, 로그아웃은 세션의 사용자가 `user`다. `path`·`target.key`·
   `detail`·`user`는 512바이트까지만 적는다(넘으면 글자 경계에서 잘라 끝에 `…`).
-- **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/opl/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
+- **파일.** `{data_dir}/audit/audit.log`(패키지는 `/var/lib/orbivisor/audit/audit.log`). 디렉터리는 0700, 파일은 0600이다.
   요청은 디스크를 기다리지 않는다: 쓰기 스레드가 덧붙이고 1초마다 묶어 `fsync`한다. 줄을 더하면 `max_file_mib`를
   넘을 때 `audit.log` → `audit.log.1` → `.2` …로 밀고, 지금 파일을 포함해 `max_files`개를 넘는 가장 오래된 것을 지운다.
   쓰기가 밀려 대기열(1만 개)이 차면 항목을 버리고, 다음 항목 앞에 `"action":"audit.dropped"`, `"detail":"<N> entries
@@ -456,7 +456,7 @@ orbivisorctl -o json audit --since 7d            # 응답 그대로(항목의 �
   수를 바로 적고 버린다). 인증된 요청은 한도가 없다. orbivisord가 열 때 디렉터리는 0700, 파일은 0600으로 다시 맞추고,
   `audit.log`가 심볼릭 링크면 열지 않으며(orbivisord가 시작하지 않음), `max_files`를 줄였으면 넘는 옛 파일을 지운다.
 - **journald.** 같은 JSON을 tracing 대상 `opl_audit`(INFO)로도 내보낸다. 패키지의 orbivisord는 systemd 서비스라 journald에
-  `… INFO opl_audit: {"id":…}` 줄로 남는다(`journalctl -u opld -g opl_audit`). `RUST_LOG`를 바꿀 때는 `opl_audit=info`가
+  `… INFO opl_audit: {"id":…}` 줄로 남는다(`journalctl -u orbivisord -g opl_audit`). `RUST_LOG`를 바꿀 때는 `opl_audit=info`가
   남게 한다(파일은 `RUST_LOG`와 상관없다). orbivisord는 로그가 터미널로 갈 때만 색 코드를 넣으므로 journald 줄에는 색 코드가
   없다(`NO_COLOR`를 따로 줄 필요가 없다). 밖으로 보내려면 rsyslog로 전달한다. Debian 13은 rsyslog가 기본으로 없다
   (`apt install rsyslog`):
@@ -465,7 +465,7 @@ orbivisorctl -o json audit --since 7d            # 응답 그대로(항목의 �
   # /etc/rsyslog.d/60-opl-audit.conf
   # rsyslog가 이미 journald에서 받으면(/var/log/syslog에 orbivisord 줄이 보이면) 다음 module 줄은 뺀다.
   module(load="imjournal" StateFile="imjournal.state")
-  # 이름 바꾸기(Orbivisor) 전 판의 노드는 프로그램 이름이 opld다.
+  # 이름 바꾸기(Orbivisor) 전 판의 노드는 프로그램 이름이 orbivisord다.
   if ($programname == 'orbivisord' or $programname == 'opld') and $msg contains 'opl_audit:' then {
       action(type="omfwd" target="siem.example.com" port="514" protocol="tcp")
   }

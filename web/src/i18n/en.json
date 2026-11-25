@@ -1942,7 +1942,7 @@
     "issuedDescription": "Run this on the new node before {{time}}. It cannot be shown again.",
     "command": "Command",
     "copyCommand": "Copy the command",
-    "commandNote": "Add --socket if orbivisord on the new node does not use /run/opl/opld.sock.",
+    "commandNote": "Add --socket if orbivisord on the new node does not use /run/orbivisor/orbivisord.sock.",
     "switch": "Switch cluster (now {{name}})",
     "thisCluster": "This cluster",
     "noRemotes": "No remote clusters.",

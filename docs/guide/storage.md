@@ -39,7 +39,7 @@ orbivisorctl pool get nas                            # 노드별 준비·용량�
   풀을 지우면(볼륨이 남아 있으면 지금처럼 409) 각 노드가 언마운트하고 마운트 지점을 지운다. 그 풀의 디스크를 쓰는
   VM이 그 노드에서 돌고 있으면 VM이 멈출 때까지 미룬다(`umount -f`는 쓰지 않는다). 풀을 쓸 노드는 만들 때 `--node`로
   정한다(생략하면 모든 노드).
-- **주의: `{data_dir}`를 통째로 지우지 않는다.** 마운트된 NFS 풀이 있는 채로 `rm -rf /var/lib/opl`을 하면 마운트를
+- **주의: `{data_dir}`를 통째로 지우지 않는다.** 마운트된 NFS 풀이 있는 채로 `rm -rf /var/lib/orbivisor`를 하면 마운트를
   따라 들어가 NFS 내보내기의 볼륨 파일까지 지운다. 노드를 클러스터에서 빼거나 Orbivisor를 지워도 `{data_dir}/pools` 아래의
   NFS 마운트는 그대로 남는다. 먼저 orbivisord를 멈추고 `{data_dir}/pools` 아래를 `umount`한 뒤 지운다.
 - **NFS 풀은 늘 공유 풀이다.** API에서 `shared`를 적지 않으면 `true`가 되고, `false`면 **400** `invalid_request`다.
@@ -298,8 +298,8 @@ Orbivisor 풀 링크, admin의 더하기·만들기 단추)를 10초마다 새�
 - **비밀.** Ceph 키(mon·admin·bootstrap-osd·클라이언트)는 API가 만들어 **Raft에 둔다**(펜싱 BMC 비밀번호와 같다 — Raft 저장소와 그
   백업에 키가 있다). API 응답·watch에는 나가지 않는다. 노드의 클라이언트 키 `client.orbivisor`는 `profile rbd`(mon·osd·mgr)뿐이고
   admin 키는 mon·mgr 노드에만 둔다. Ceph 설정을 쓰는 것은 admin뿐이고 상태 읽기는 모든 역할이다.
-- **파일 위치.** 모든 비위트니스 노드에 클라이언트 설정 `/etc/opl/ceph/ceph.conf`와 `ceph.client.orbivisor.keyring`(0600,
-  `[ceph] client_dir`)을 쓰고 mon이 바뀌면 고친다. 등록하는 RBD 풀은 사용자 `orbivisor`, conf `/etc/opl/ceph/ceph.conf`라 **`/etc/ceph`를
+- **파일 위치.** 모든 비위트니스 노드에 클라이언트 설정 `/etc/orbivisor/ceph/ceph.conf`와 `ceph.client.orbivisor.keyring`(0600,
+  `[ceph] client_dir`)을 쓰고 mon이 바뀌면 고친다. 등록하는 RBD 풀은 사용자 `orbivisor`, conf `/etc/orbivisor/ceph/ceph.conf`라 **`/etc/ceph`를
   쓰는 바깥 Ceph RBD 풀과 같은 노드에서 함께 쓸 수 있다.** 풀의 conf 경로는 풀 Task를 돈 노드의 `{client_dir}/ceph.conf`이고 모든 노드가
   그 경로로 붙으므로 **`[ceph] client_dir`은 모든 노드에서 같아야 한다.** `/etc/ceph/ceph.conf`(첫 줄 `# managed by orbivisord; edits are
   overwritten`)는 mon·mgr·OSD 노드에만, admin 키링은 mon·mgr 노드에만 쓴다(OSD만 있는 노드는 OSD가 up인지를 `client.orbivisor`로 본다).

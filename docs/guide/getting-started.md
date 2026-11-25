@@ -1,12 +1,13 @@
 # 시작하기
 
-macOS·Linux에서 실행, 설치 ISO와 패키지, 업데이트, 이름 바꾸기. 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
+macOS·Linux에서 실행, 설치 ISO와 패키지, 업데이트, 이름 바꾸기(계획 43·74). 처음 보는 사람은 [README](../../README.md)의 빠른 시작부터.
 
 - [실행 (macOS, Apple Silicon)](#실행-macos-apple-silicon)
 - [실행 (Linux, KVM)](#실행-linux-kvm)
 - [설치 (ISO와 패키지)](#설치-iso와-패키지)
 - [업데이트](#업데이트)
 - [이름 바꾸기 (opLite → Orbivisor)](#이름-바꾸기-oplite--orbivisor)
+- [이름 바꾸기 2 (계획 74)](#이름-바꾸기-2-계획-74)
 
 ## 실행 (macOS, Apple Silicon)
 
@@ -19,8 +20,8 @@ address = "127.0.0.1"          # 다른 노드와 클라이언트가 이 노드�
 data_dir = "/tmp/opl/node1"
 run_dir = "/tmp/opl/run1"
 TOML
-cargo run -p orbivisord -- --config /tmp/opl/node1.toml &       # 제어 소켓: /tmp/opl/run1/opld.sock
-cargo run -p orbivisorctl -- cluster init --name dev --socket /tmp/opl/run1/opld.sock
+cargo run -p orbivisord -- --config /tmp/opl/node1.toml &       # 제어 소켓: /tmp/opl/run1/orbivisord.sock
+cargo run -p orbivisorctl -- cluster init --name dev --socket /tmp/opl/run1/orbivisord.sock
 # 출력된 admin 비밀번호와 CA 지문으로 로그인한다(API: https://127.0.0.1:8006).
 cargo run -p orbivisorctl -- login --server https://127.0.0.1:8006 --ca-fingerprint sha256:...
 mkdir -p /tmp/opl/pool
@@ -55,7 +56,7 @@ run_dir = "/tmp/opl/run2"
 TOML
 cargo run -p orbivisord -- --config /tmp/opl/node2.toml &
 cargo run -p orbivisorctl -- cluster join "$(cargo run -q -p orbivisorctl -- cluster join-token)" \
-    --socket /tmp/opl/run2/opld.sock
+    --socket /tmp/opl/run2/orbivisord.sock
 cargo run -p orbivisorctl -- cluster status
 ```
 
@@ -71,8 +72,8 @@ sudo apt install qemu-system ovmf qemu-efi-aarch64 qemu-utils iproute2 nftables 
 # 브리지는 관리자가 미리 만든다. VLAN 태그를 쓰려면 VLAN-aware여야 한다.
 sudo ip link add vmbr0 type bridge vlan_filtering 1
 sudo ip link set eth1 master vmbr0 && sudo ip link set vmbr0 up
-sudo mkdir -p /etc/opl
-sudo tee /etc/opl/opld.toml >/dev/null <<'TOML'
+sudo mkdir -p /etc/orbivisor
+sudo tee /etc/orbivisor/orbivisord.toml >/dev/null <<'TOML'
 name = "node1"
 address = "10.0.0.11"
 # [hypervisor]
@@ -90,11 +91,11 @@ address = "10.0.0.11"
 # api_threads = 4           # API 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
 # work_threads = 4          # VM·작업 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
 TOML
-sudo orbivisord --config /etc/opl/opld.toml &
+sudo orbivisord --config /etc/orbivisor/orbivisord.toml &
 sudo orbivisorctl cluster init --name prod
 orbivisorctl login --server https://10.0.0.11:8006 --ca-fingerprint sha256:...
 orbivisorctl network create lan --bridge vmbr0 --vlan 10  # VLAN 10을 태그 없이 주고받는 NIC
-# 풀과 볼륨은 macOS와 같다(/var/lib/opl/pool 등).
+# 풀과 볼륨은 macOS와 같다(/var/lib/orbivisor/pool 등).
 orbivisorctl vm create web --memory 1024 --disk root --nic lan --start
 ```
 
@@ -110,9 +111,9 @@ preseed를 더한 것이다. 만들기는 Linux(amd64)에서 한다(`dpkg-deb`, 
 sudo apt install xorriso libssl-dev pkg-config     # 그리고 Rust, Node.js 22와 pnpm
 # 1. 패키지. 버전은 바이너리(--version)와 패키지에 같은 값을 쓴다(다르면 build-deb.sh가 멈춘다).
 pnpm -C web install --frozen-lockfile && pnpm -C web build
-#    구독 공개 키(OPL_LICENSE_KEYS) 없이 빌드하면 저장소의 개발 키를 믿는 개발 패키지다("구독과 텔레메트리").
-OPL_VERSION=0.1.0 cargo build --release -p orbivisord --features web-ui -p orbivisorctl
-OPL_DEV_LICENSE=1 packaging/deb/build-deb.sh 0.1.0 dist   # dist/orbivisor_0.1.0_amd64.deb와 전환 패키지("이름 바꾸기")
+#    구독 공개 키(ORBIVISOR_LICENSE_KEYS) 없이 빌드하면 저장소의 개발 키를 믿는 개발 패키지다("구독과 텔레메트리").
+ORBIVISOR_VERSION=0.1.0 cargo build --release -p orbivisord --features web-ui -p orbivisorctl
+ORBIVISOR_DEV_LICENSE=1 packaging/deb/build-deb.sh 0.1.0 dist   # dist/orbivisor_0.1.0_amd64.deb와 전환 패키지("이름 바꾸기")
 # 2. netinst. 판과 SHA-256은 packaging/iso/debian.lock에 있고, build-iso.sh가 해시를 확인한다.
 #    그 판보다 새 판이 나와 URL이 404면 같은 파일을 cdimage/archive/<판>/amd64/iso-cd/에서 받는다.
 . packaging/iso/debian.lock && curl -fLo netinst.iso "$DEBIAN_NETINST_URL"
@@ -134,12 +135,12 @@ packaging/iso/build-iso.sh --netinst netinst.iso --deb dist/orbivisor_0.1.0_amd6
   주소·게이트웨이·DNS는 `vmbr0`으로 가고, NIC는 `iface <nic> inet manual`로 `bridge-ports`가 된다(`bridge-vids 2-4094`).
   설치 프로그램이 쓴 `/etc/network/interfaces`를 바꿔 설치 환경과 대상 시스템 두 곳에 쓴다(설치 프로그램은 이 파일을
   나중에 대상으로 복사한다). 인터페이스를 찾지 못하면 바꾸지 않는다.
-- `/etc/opl/opld.toml`에 `name`(호스트 이름을 소문자로)과 `address`(`vmbr0`의 주소)를 쓴다. 호스트 이름이 노드 이름
+- `/etc/orbivisor/orbivisord.toml`에 `name`(호스트 이름을 소문자로)과 `address`(`vmbr0`의 주소)를 쓴다. 호스트 이름이 노드 이름
   규칙(소문자·숫자·`-`, 1~63자)에 맞지 않거나 주소를 찾지 못하면 그 줄을 주석으로 둔다. 그때 orbivisord는 설정 오류로
-  시작하지 못하므로(`journalctl -u opld`) 값을 채우고 `systemctl restart opld`를 한다. 다른 설정은
-  `/usr/share/orbivisor/opld.toml.example`을 본다.
-- 콘솔 로그인 화면에 웹 UI 주소와 init·join 명령을 영어로 보인다(`/etc/issue.d/orbivisor.issue`). `opld.toml`의 주석도 영어다.
-- `opld.service`를 켠다. 다시 부팅하면 orbivisord가 돈다(`systemctl status opld`, `journalctl -u opld`).
+  시작하지 못하므로(`journalctl -u orbivisord`) 값을 채우고 `systemctl restart orbivisord`를 한다. 다른 설정은
+  `/usr/share/orbivisor/orbivisord.toml.example`을 본다.
+- 콘솔 로그인 화면에 웹 UI 주소와 init·join 명령을 영어로 보인다(`/etc/issue.d/orbivisor.issue`). `orbivisord.toml`의 주석도 영어다.
+- `orbivisord.service`를 켠다. 다시 부팅하면 orbivisord가 돈다(`systemctl status orbivisord`, `journalctl -u orbivisord`).
 
 설치한 시스템의 root는 SSH로 비밀번호 로그인을 할 수 없다(Debian 기본 `PermitRootLogin prohibit-password`).
 콘솔에서 root로 로그인해 `adduser <이름>`으로 일반 사용자를 만들거나 `/root/.ssh/authorized_keys`에 공개 키를 넣는다.
@@ -160,28 +161,28 @@ orbivisorctl cluster join 'opl-join://…'
 **DHCP 주소.** 설치를 DHCP로 하면 `address`는 설치할 때 받은 주소이고 파일에 그렇다는 주석이 붙는다. 다른 노드와
 클라이언트가 이 주소로 노드에 닿고, 노드가 클러스터에 들어간 뒤에는 주소를 바꿀 수 없다(노드 인증서에 들어 있다).
 DHCP 서버에서 주소를 예약하거나 고정 주소를 쓴다. `cluster init`·`join` 전이라면 `/etc/network/interfaces`의
-`vmbr0`과 `opld.toml`의 `address`를 고치고 `systemctl restart opld`를 해도 된다.
+`vmbr0`과 `orbivisord.toml`의 `address`를 고치고 `systemctl restart orbivisord`를 해도 된다.
 
 **패키지만 설치하기.** Debian 13(amd64)이 이미 있으면 패키지만 넣는다. 브리지는 관리자가 만든다("실행 (Linux, KVM)").
 
 ```bash
 sudo apt install ./orbivisor_0.1.0_amd64.deb   # 의존 패키지(QEMU, OVMF, nftables 등)도 받는다
-sudo mkdir -p /etc/opl
-sudo cp /usr/share/orbivisor/opld.toml.example /etc/opl/opld.toml  # name·address를 고친다
-sudo systemctl start opld                         # 설정이 없으면 유닛은 시작하지 않고 건너뛴다
+sudo mkdir -p /etc/orbivisor
+sudo cp /usr/share/orbivisor/orbivisord.toml.example /etc/orbivisor/orbivisord.toml  # name·address를 고친다
+sudo systemctl start orbivisord                         # 설정이 없으면 유닛은 시작하지 않고 건너뛴다
 ```
 
 패키지는 `/usr/bin/orbivisord`·`orbivisorctl`(웹 UI 포함)과 옛 이름의 링크 `opld`·`oplctl`,
-`/usr/lib/systemd/system/opld.service`와 별칭 `orbivisord.service`, `/usr/share/orbivisor/opld.toml.example`을
-설치한다. 유닛 이름은 `opld`다(`systemctl status orbivisord`도 되지만 로그는 `journalctl -u opld` — "이름 바꾸기"). 업그레이드(`apt install`로 새 판)는 orbivisord가 enable돼 있으면 다시 시작한다.
+`/usr/lib/systemd/system/orbivisord.service`와 별칭 `opld.service`, `/usr/share/orbivisor/orbivisord.toml.example`을
+설치한다. 유닛 이름은 `orbivisord`다(옛 이름 `systemctl … opld`도 별칭으로 된다 — "이름 바꾸기 2"). 업그레이드(`apt install`로 새 판)는 orbivisord가 enable돼 있으면 다시 시작한다.
 옛 이름의 패키지가 설치된 노드를 deb 파일로 옮길 때는 전환 패키지도 함께 설치한다
 (`sudo apt install ./orbivisor_0.1.0_amd64.deb ./oplite_0.1.0_amd64.deb` — "이름 바꾸기").
 옛 패키지가 `rc`(지워졌지만 설정이 남음)로 남아 있으면(`dpkg -l oplite`) 그것을 purge하지 않는다 — 옛 postrm이
-opld를 disable해 다음 재부팅에 orbivisord가 시작하지 않는다. purge했다면 `sudo systemctl enable opld`("이름 바꾸기").
+opld(이제 `orbivisord`의 별칭)를 disable해 다음 재부팅에 orbivisord가 시작하지 않는다. purge했다면 `sudo systemctl enable orbivisord`("이름 바꾸기").
 VM의 QEMU는 VM마다 자기 scope에 있어 orbivisord가 멈추거나 다시 시작해도 꺼지지 않는다.
 
 **지우기.** `apt remove orbivisor`는 orbivisord를 멈추고, `apt purge orbivisor`는 서비스 링크까지 지운다. 어느 쪽도
-`/var/lib/opl`(클러스터 데이터, 풀, 볼륨)과 `/etc/opl`을 지우지 않는다. 데이터를 지우는 것은 관리자의 일이다.
+`/var/lib/orbivisor`(클러스터 데이터, 풀, 볼륨)와 `/etc/orbivisor`를 지우지 않는다. 데이터를 지우는 것은 관리자의 일이다.
 
 한계:
 
@@ -209,7 +210,7 @@ orbivisorctl cluster status                      # 버전이 섞여 있으면 �
 - **채널.** 설정은 클러스터에 하나뿐인 `Settings` 리소스(이름 `cluster`)다. `GET /api/v1/settings`는 로그인한 누구나,
   `PATCH /api/v1/settings`(`{"updates":{"channel":"testing"}}`, 다른 패치 API처럼 `If-Match`를 받는다)는 admin만
   한다. 한 번도 바꾸지 않았으면 기본값(`stable`)이다. 웹은 설정 › 일반 탭(admin만 저장, 그 밖은 읽기만).
-- **소스 파일.** 저장소 주소는 orbivisord 설정 `[updates] apt_url`이고, 비면 빌드할 때 넣은 `OPL_APT_URL`이다. 둘 다 비면
+- **소스 파일.** 저장소 주소는 orbivisord 설정 `[updates] apt_url`이고, 비면 빌드할 때 넣은 `ORBIVISOR_APT_URL`이다. 둘 다 비면
   orbivisord는 소스 파일을 쓰지 않는다(관리자가 apt 소스를 직접 둔다). 주소가 있으면 orbivisord가 시작할 때와 채널이 바뀔 때
   `/etc/apt/sources.list.d/oplite.sources`를 쓴다:
 
@@ -235,9 +236,9 @@ orbivisorctl cluster status                      # 버전이 섞여 있으면 �
   끝난다). 채널을 바꿔 소스 파일이 바뀌면 다음 주기를 기다리지 않고 곧 확인한다. 업그레이드 중에는 주기 확인을
   건너뛰고 다시 확인은 **409** `upgrade_in_progress`다(업그레이드가 apt 잠금을 잡고 있다).
 - **업그레이드.** `node upgrade`(admin)는 그 노드에서 작업 `node-upgrade`를 돌린다. 작업은 orbivisord 밖의 systemd 유닛
-  `opl-upgrade-<작업 ID 32자(하이픈 없이)>`(`systemd-run`)에서 `apt-get update`와 `apt-get dist-upgrade`(바뀐 설정
+  `orbivisor-upgrade-<작업 ID 32자(하이픈 없이)>`(`systemd-run`)에서 `apt-get update`와 `apt-get dist-upgrade`(바뀐 설정
   파일은 지금 것을 둔다. 무인 업그레이드 같은 다른 apt의 잠금은 `DPkg::Lock::Timeout=600`초까지 기다린다)를 돌리고
-  유닛을 지켜본다. 로그는 `/var/log/opl/upgrade-<작업 ID>.log`이고 처음에 `opl-upgrade: start`, 끝에
+  유닛을 지켜본다. 로그는 `/var/log/orbivisor/upgrade-<작업 ID>.log`이고 처음에 `opl-upgrade: start`, 끝에
   `opl-upgrade: exit <코드>` 줄이 있다. Orbivisor 패키지가 바뀌면 postinst가 orbivisord를 다시 시작하고, 다시 시작한 orbivisord가
   같은 유닛을 이어 지켜본다. VM은 자기 scope에 있어 계속 돈다. 실패하면 작업 오류에 로그 끝 20줄이 있다. 유닛이
   끝나고 치워졌으면 로그로 판단한다: 종료 줄이 있으면 그 코드, 시작 줄만 있으면(도중에 노드가 꺼짐) dpkg가 반쯤
@@ -283,13 +284,13 @@ the upgrade on every node" 경고가 보인다. 웹은 노드 표의 업데이�
 # enabled = true                 # 없으면 apt_get이 있을 때(Debian) 켜진다. macOS는 꺼진다
 check_interval = "24h"           # 업데이트 확인 간격
 first_check = "1m"               # orbivisord가 시작하고 첫 확인까지
-apt_url = ""                     # 비면 빌드 값 OPL_APT_URL. 그것도 비면 소스 파일을 쓰지 않는다
+apt_url = ""                     # 비면 빌드 값 ORBIVISOR_APT_URL. 그것도 비면 소스 파일을 쓰지 않는다
 sources_file = "/etc/apt/sources.list.d/oplite.sources"
 apt_get = "/usr/bin/apt-get"
 systemd_run = "/usr/bin/systemd-run"
 systemctl = "/usr/bin/systemctl"
 dpkg = "/usr/bin/dpkg"
-log_dir = "/var/log/opl"         # 업그레이드 로그
+log_dir = "/var/log/orbivisor"         # 업그레이드 로그
 poll = "2s"                      # 업그레이드 유닛을 다시 보는 간격
 ```
 
@@ -302,20 +303,20 @@ gpg --quick-generate-key 'Orbivisor archive <apt@example.com>' ed25519 sign neve
 KEY_ID=$(gpg --with-colons --list-secret-keys | awk -F: '$1 == "fpr" { print $10; exit }')
 gpg --export "$KEY_ID" > oplite-archive-keyring.gpg
 # 패키지: 저장소 주소(바이너리에)와 공개 키(/usr/share/keyrings/oplite-archive-keyring.gpg).
-# 구독 공개 키 OPL_LICENSE_KEYS는 바이너리와 build-deb.sh에 함께 준다("구독과 텔레메트리"). export하지 않고
+# 구독 공개 키 ORBIVISOR_LICENSE_KEYS는 바이너리와 build-deb.sh에 함께 준다("구독과 텔레메트리"). export하지 않고
 # 두 명령 앞에만 준다: 같은 셸의 cargo test가 개발 키로 서명한 시험 키를 풀지 못해 실패한다.
 KEYS=<orbivisor-license keygen이 출력한 공개 키>
-OPL_LICENSE_KEYS=$KEYS OPL_VERSION=0.2.0 OPL_APT_URL=https://apt.example.com/oplite \
+ORBIVISOR_LICENSE_KEYS=$KEYS ORBIVISOR_VERSION=0.2.0 ORBIVISOR_APT_URL=https://apt.example.com/oplite \
     cargo build --release -p orbivisord --features web-ui -p orbivisorctl
-# 파일 복원 도우미 이미지(백업 "파일 단위 복원"): OPL_RESTORE_IMAGE_DIR을 주면 build-deb.sh가 셋째 패키지
+# 파일 복원 도우미 이미지(백업 "파일 단위 복원"): ORBIVISOR_RESTORE_IMAGE_DIR을 주면 build-deb.sh가 셋째 패키지
 # orbivisor-restore-image(같은 판)도 만든다.
 packaging/restore-image/build.sh --arch x86_64 --version 0.2.0 --out dist/restore-image/x86_64
-OPL_LICENSE_KEYS=$KEYS OPL_APT_KEY=oplite-archive-keyring.gpg OPL_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 \
+ORBIVISOR_LICENSE_KEYS=$KEYS ORBIVISOR_APT_KEY=oplite-archive-keyring.gpg ORBIVISOR_RESTORE_IMAGE_DIR=dist/restore-image/x86_64 \
     packaging/deb/build-deb.sh 0.2.0 dist
 # 저장소: 채널(stable|testing|enterprise)에 패키지를 더하고 색인을 다시 만들어 서명한다(apt-ftparchive, apt-utils)
-OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo testing dist/*_0.2.0_amd64.deb   # orbivisor·전환 패키지·이미지 셋
+ORBIVISOR_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo testing dist/*_0.2.0_amd64.deb   # orbivisor·전환 패키지·이미지 셋
 # testing에서 확인한 뒤 같은 패키지를 stable에도
-OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo stable dist/*_0.2.0_amd64.deb
+ORBIVISOR_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo stable dist/*_0.2.0_amd64.deb
 ```
 
 레이아웃: `pool/<채널>/*.deb`, `dists/trixie/<채널>/binary-amd64/Packages(.gz)`, `dists/trixie/Release`
@@ -327,7 +328,7 @@ OPL_REPO_GPG_KEY_ID=$KEY_ID packaging/repo/build-repo.sh repo stable dist/*_0.2.
 멈춘다. `repo-test.sh`(CI `package`)가 셋을 한 채널에 올리고 다음 판으로 함께 올라가는지 본다. 이미 올린 이름에 내용이 다른 deb는 거절한다("version already
 published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새 색인과 Release는 옆 디렉터리에서 만들어 두 서명이 다
 끝난 뒤에 옮기므로(`InRelease`가 마지막) 서명이 실패해도 저장소는 옛 색인 그대로다. 웹 서버에 올릴 때도 같은 순서로
-`pool/`과 `Packages`를 먼저, `Release`·`Release.gpg`를 다음, `InRelease`를 마지막에 올린다. `OPL_APT_KEY`는
+`pool/`과 `Packages`를 먼저, `Release`·`Release.gpg`를 다음, `InRelease`를 마지막에 올린다. `ORBIVISOR_APT_KEY`는
 `gpg --export`의 바이너리 키링이어야 한다(armor면 `build-deb.sh`가 거절한다). Release에 `Valid-Until`은 넣지 않는다:
 넣으면 저장소를 주기적으로 다시 서명해야 하고, 그러지 못하면 모든 노드의 확인이 실패한다. `enterprise` 채널은
 구독이 있는 클러스터가 쓴다(아래).
@@ -337,6 +338,8 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
 제품 이름이 계획 43에서 Orbivisor로 바뀌었다. 바뀐 것은 사람이 보는 이름(패키지, 바이너리, 웹, ISO, CLI 도움말과
 메시지)뿐이고, 노드에 저장된 상태와 노드 사이에 주고받는 이름은 그대로다. 그래서 이미 설치한 노드도 보통의 업그레이드
 (`orbivisorctl node upgrade`, 웹 "업그레이드" — 위 "업데이트")로 한 노드씩 넘어가고, 버전이 섞인 채로도 돈다.
+이 절은 계획 43 때의 기록이다. 그 뒤 계획 74가 유닛·경로·환경 변수·쿠키·크레이트 이름도 바꿨다 — 아래 표의 유닛·예시 설정과
+"유닛 이름은 `opld`다", "그대로 둔 내부 이름"의 경로·쿠키·업그레이드 유닛은 [이름 바꾸기 2](#이름-바꾸기-2-계획-74)가 대신한다.
 
 | 무엇 | 옛 이름 | 지금 |
 |---|---|---|
@@ -385,3 +388,59 @@ published") — 같은 버전을 다시 빌드했으면 버전을 올린다. 새
   `oplj_`, `opl1.`, `opl-join://`, 로그인 토큰 이름 `oplctl-`), 감사 로그 대상 `opl_audit`, 지금 클러스터 CA의 CN
   ("opLite cluster X CA" — 새로 만드는 클러스터만 "Orbivisor cluster X CA"). 롤링 업그레이드 중에는 옛 노드의 오류
   문구가 옛 이름으로 보일 수 있다.
+
+## 이름 바꾸기 2 (계획 74)
+
+계획 43은 사람이 보는 이름만 바꾸고 노드 위의 이름(유닛 `opld.service`, `/etc/opl/opld.toml`, `OPL_*`, 로그의 `opl_api::…`)을
+그대로 두었다. 계획 74는 **운영자가 노드에서 만나는 이름**을 orbivisor로 맞춘다. 넘어가기는 보통의 업그레이드(위 "업데이트",
+`apt-get dist-upgrade` 한 번)로 끝나고, 도는 VM은 멈추지 않으며, 버전이 섞인 클러스터에서도 돈다.
+
+| 무엇 | 옛 이름 | 지금 | 옛 이름은 |
+|---|---|---|---|
+| 데몬 유닛 | `opld.service` | `orbivisord.service` | 정적 별칭 링크(계속) |
+| OVN 중앙 유닛 | `opl-ovn-{nb,sb,northd}.service` | `orbivisor-ovn-{nb,sb,northd}.service` | 새 이름으로의 링크(계속) |
+| 설정 | `/etc/opl/opld.toml` | `/etc/orbivisor/orbivisord.toml` | 디렉터리·파일 링크(계속) |
+| 데이터·런타임·로그 | `/var/lib/opl`, `/run/opl`, `/var/log/opl` | `/var/lib/orbivisor`, `/run/orbivisor`, `/var/log/orbivisor` | 디렉터리 링크(계속) |
+| 제어 소켓 | `/run/opl/opld.sock` | `/run/orbivisor/orbivisord.sock` | 링크 `opld.sock`(계속) |
+| 예시 설정 | `/usr/share/orbivisor/opld.toml.example` | `/usr/share/orbivisor/orbivisord.toml.example` | 없음 |
+| CLI 로그인 정보 | `~/.config/opl/oplctl.json` | `~/.config/orbivisor/orbivisorctl.json` | 새 파일이 없으면 읽음(한 릴리스) |
+| 환경 변수 | `OPL_*` | `ORBIVISOR_*` | 실행 때 읽는 것만 받고 경고(한 릴리스) |
+| 웹 쿠키 | `opl_session`, `opl_oidc` | `orbivisor_session`, `orbivisor_oidc` | 둘 다 씀, 새 것 먼저 읽음(한 릴리스) |
+| 일시 유닛 | `opl-upgrade-*`, `opl-bkserve-*`, `opl-fr-*` | `orbivisor-upgrade-*`, `orbivisor-bkserve-*`, `orbivisor-fr-*` | 찾기·치우기는 두 접두사(한 릴리스) |
+| 크레이트·로그 대상 | `opl-*`, `opld`, `oplctl`(`opl_api::…`) | `orbivisor-*`, `orbivisord`, `orbivisorctl`(`orbivisor_api::…`) | 없음 |
+
+- **업그레이드에서 저절로 되는 것.**
+  - postinst가 옛 enable 링크(`multi-user.target.wants/opld.service`)를 `orbivisord.service`로 옮기고, 덮어쓰기 디렉터리
+    `/etc/systemd/system/opld.service.d/`를 `orbivisord.service.d/`로 옮긴 뒤 옛 이름을 링크로 남긴다. `daemon-reload`에서
+    돌고 있는 `opld.service`가 별칭으로 `orbivisord.service`에 합쳐지고(MainPID 그대로) 다시 시작된다. chroot(systemd가 돌지
+    않음)에서는 링크만 옮긴다.
+  - 새 orbivisord는 설정을 읽기 전에(root이고 `--config`가 없거나 기본 두 경로 중 하나일 때) 옛 디렉터리를 새 이름으로
+    **맞바꾼다**(`renameat2(RENAME_EXCHANGE)` — 옛 경로가 풀리지 않는 순간이 없어 도는 QEMU·swtpm·ovsdb가 옛 경로로 열어도
+    된다). 결과는 새 이름이 진짜 디렉터리, 옛 이름이 그것을 가리키는 링크다. 같은 방식으로 `opld.toml`을 `orbivisord.toml`로
+    바꾸고 링크를 남긴다. 시작 로그에 `moved /var/lib/opl to /var/lib/orbivisor and left /var/lib/opl as a link`처럼 남는다.
+    새로 설치한 노드에도 옛 이름 링크를 만든다. 옛 이름과 새 이름이 둘 다 진짜 디렉터리면 손대지 않고 경고한다(손으로 하나로
+    합치고 옛 이름을 링크로 만든다). 맞바꿈을 못 하는 파일 시스템이면 그대로 두고 경고한다.
+  - 설정 파일에 옛 경로(`data_dir = "/var/lib/opl"` 등)가 적혀 있어도 링크라 그대로 돈다(시작 로그에 한 번 안내). 다른 노드가 여는
+    경로(RBD 풀의 conf 등)는 모든 노드가 새 판(기능 `orbivisor-layout`)일 때까지 옛 이름으로 적는다. 이름 바꾸기 앞에 저장한
+    ACME 훅 경로(`/etc/opl/acme-hooks/…`)도 받는다(같은 곳이다).
+  - OVN 중앙 노드는 orbivisord가 `opl-ovn-*.service`(Orbivisor 표시가 있는 파일)를 새 이름 파일로 옮기고 옛 이름을 링크로 바꾼다
+    — 도는 ovsdb·northd는 멈추지 않는다.
+  - 웹 로그인은 두 이름의 쿠키를 함께 받으므로 VIP·프록시 뒤에서 옛 노드와 새 노드를 번갈아 만나도 세션이 이어진다. 로그아웃은
+    넷 다 지운다.
+- **옛 이름은 언제까지.** 경로 링크, `opld.service` 별칭, `opld.sock` 링크, OVN 유닛 링크는 없애지 않는다(저장된 경로와 운영
+  스크립트가 쓴다). 실행 때 읽는 환경 변수의 옛 이름(`OPL_CONFIG`, `OPL_SOCKET`, `OPL_SERVER`, `OPL_TOKEN`, `OPL_CA_PEM`,
+  `OPL_CA_FINGERPRINT`, `OPL_ACME_DNS_SECRET`, `OPL_ACME_EAB_HMAC`, `OPL_ESXI_PASSWORD`, `OPL_VMWARE_PASSWORD`, `OPL_LOG`,
+  `OPL_QEMU_SHARE` — orbivisorctl, Terraform 공급자는 그중 넷)은 "warning: environment variable OPL_SERVER is deprecated; use
+  ORBIVISOR_SERVER"처럼 경고하고 받는다. 둘 다 있으면 새 것이다. 빌드 변수(`ORBIVISOR_VERSION` 등)도 옛 이름으로 빌드한 파이프라인이
+  값을 잃지 않게 옛 이름을 받는다. 옛 이름 받기(환경 변수, 쿠키, CLI 로그인 파일, 일시 유닛 옛 접두사)는 **다음 판에서 뺀다** —
+  스크립트·CI는 지금 `ORBIVISOR_*`로 바꾼다.
+- **로그.** 유닛의 원래 이름이 바뀌었으므로 `journalctl -u opld`는 **바꾸기 앞의 로그만** 보인다. 새 로그는
+  `journalctl -u orbivisord`다(OVN은 `-u orbivisor-ovn-nb` 등). `RUST_LOG`의 대상도 크레이트 이름을 따라 `opl_api=debug`가
+  아니라 `orbivisor_api=debug`다.
+- **그대로 둔 이름과 까닭.** 노드와 클러스터에 이미 만들어져 저장된 이름이라 바꾸면 도는 VM·디스크·네트워크를 다시 만들어야
+  한다: VM 스코프 `opl-vm-<id>.scope`(도는 QEMU가 그 안에 있다)와 swtpm `opl-tpm-<id>.scope`, 브리지·VXLAN `oplv<VNI>`·
+  `oplx<VNI>`(장치 이름 15자 한도), nft 테이블 `opl_<태그>`, LV·zvol·RBD 이름 `opl-…`, 백업 비트맵·QMP 노드 이름, OVN 행 이름
+  (`opl-r-…` 등), API 토큰 형식 `opl_<id>_<secret>`(저장된 비밀과 밖의 도구가 들고 있다), 가입 토큰 `opl-join://`, 로그인 토큰
+  이름 `oplctl-…`(옛 CLI가 만든 토큰을 `logout`이 알아봐야 한다), APT 파일 이름과 Release `Origin`(위 "이름 바꾸기" — 바꾸면
+  `apt-get update`가 실패한다), 소스 파일의 표시 `# managed by opld`, 업그레이드 로그의 `opl-upgrade: start`·`exit` 줄, 감사
+  로그 대상 `opl_audit`. 그래서 노드 위에 `opl`로 시작하는 이름(위 목록과 옛 경로 링크)은 남는다.

@@ -29,7 +29,7 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
 | OS 스레드 | `orbivisor-notify` | 실행기 확인과 systemd 알림 |
 
 ```toml
-# /etc/opl/opld.toml (노드마다, 생략하면 아래 기본값)
+# /etc/orbivisor/orbivisord.toml (노드마다, 생략하면 아래 기본값)
 [runtime]
 # api_threads = 4     # api 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
 # work_threads = 4    # work 실행기의 작업자 수(기본: CPU 수의 절반, 최소 2)
@@ -41,7 +41,7 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
   노드로 가는 연결은 둘로 나눈다: Raft·리스 갱신·리더 전달·생존 확인은 `core`의 연결, 콘솔·마이그레이션 보내기·UEFI
   변수·감사 로그·지표 읽기는 `work`의 연결이다(처음 연 쪽 실행기와 관계없이). 노드 간 연결을 여러 망으로 잇는
   것은 아래 [클러스터 통신 다중 링크](#클러스터-통신-다중-링크)(계획 49)다. 대량 전송용 포트를 따로 두는 것은 아직 없다.
-- **systemd watchdog.** 유닛(`opld.service`)은 `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`,
+- **systemd watchdog.** 유닛(`orbivisord.service`)은 `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`,
   `WatchdogSignal=SIGKILL`이다. orbivisord는 시작이 끝나면 `READY=1`을 보낸다(클러스터에 속하지 않은 노드는 제어
   소켓을 열었을 때, 멤버는 작업 실행기가 이전 프로세스의 고아를 정리하기 직전과 API가 듣기 시작했을 때, 위트니스는
   노드 간 서버가 떴을 때). 고아 정리는 정족수가 없으면 지우기마다 10초까지 기다리므로, 클러스터 전체를 다시 켤 때
@@ -53,7 +53,7 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
   막히면 쓰다듬기가 30초 넘게 끊겨 systemd가 orbivisord를 SIGKILL로 끝내고(코어 덤프로 늦어지지 않게, 진단은 경고
   로그로) 2초 뒤 다시 띄운다(`Restart=on-failure`, `RestartSec=2`. 60초에 10번까지 — `StartLimitIntervalSec=60`·
   `StartLimitBurst=10`). `KillMode=process`라 VM은 그대로 돌고, 다시 뜬 orbivisord가 VM에
-  다시 붙는다. `systemctl status opld`가 `activating`에 머물면 `READY=1`이 아직 오지 않은 것이다(로그를 본다).
+  다시 붙는다. `systemctl status orbivisord`가 `activating`에 머물면 `READY=1`이 아직 오지 않은 것이다(로그를 본다).
 - **HA watchdog과의 관계.** HA watchdog 장치(노드 재시작)는 HA VM이 도는데 리스를 잃었을 때의 것이고, systemd
   watchdog(데몬 재시작)은 데몬이 멈췄을 때의 것이다. 데몬이 다시 시작되는 동안 HA VM이 있으면 장치 쓰다듬기도
   멈춘다(죽은 프로세스가 닫은 장치의 타이머는 그대로 돈다). 새 프로세스가 장치를 다시 열면(arm) Linux 드라이버가
@@ -73,9 +73,9 @@ API·작업·느린 디스크가 Raft 하트비트와 HA 리스 갱신을 늦춰
   팔로어면 그 노드만 멈칫하고(선거를 시작할 수 있다) 다른 노드는 영향을 받지 않는다. 그 노드가 **리더**면 리더의
   Raft 루프가 멈춰 리스 갱신에 필요한 리더 확인(`confirm_leader`)이 실패하므로 **모든 노드의 리스 갱신이 실패**하고,
   다른 노드가 선거로 리더가 된 뒤에 회복한다.
-- **끄기.** 장애를 조사하느라 systemd watchdog을 잠시 끄려면 `systemctl edit opld`로 `[Service]`에 `WatchdogSec=0`을
+- **끄기.** 장애를 조사하느라 systemd watchdog을 잠시 끄려면 `systemctl edit orbivisord`로 `[Service]`에 `WatchdogSec=0`을
   둔다.
-- **시험.** `cargo test -p orbivisord --features starve-it --test starve`가 opld 셋의 리더의 `api` 실행기를 15초 동안 막고
+- **시험.** `cargo test -p orbivisord --features starve-it --test starve`가 orbivisord 셋의 리더의 `api` 실행기를 15초 동안 막고
   그동안 리더·임기가 그대로이고 모든 노드의 리스 나이가 3초 미만이며 `WATCHDOG=1`이 멈추는지 본다. `starve-it`
   기능은 시험 빌드에만 있는 고리(`[test] block_api_ms`, 제어 소켓의 `/v1/test/…`)를 넣으므로 배포 빌드에 켜지 않는다.
 
@@ -153,7 +153,7 @@ IP마다 센다. 막힌 IP의 로그아웃은 표시 없이 쿠키만 지운다(
 `X-Forwarded-Proto`(같은 출처 검사, OIDC 콜백 주소)를 믿는다. 적지 않으면 아무 헤더도 믿지 않는다.
 
 ```toml
-# /etc/opl/opld.toml (API 노드마다)
+# /etc/orbivisor/orbivisord.toml (API 노드마다)
 [api]
 trusted_proxies = ["10.0.0.0/24", "192.0.2.10"]
 ```
@@ -191,15 +191,15 @@ orbivisorctl settings set api_names=            # 노드 인증서로 돌아감
 관리자 인증서(공인·사내 CA)를 둔다.
 
 ```toml
-# /etc/opl/opld.toml (API 노드마다)
+# /etc/orbivisor/orbivisord.toml (API 노드마다)
 [api]
-tls_cert = "/etc/opl/api.crt"   # PEM, 중간 인증서를 이어 붙여도 된다
-tls_key = "/etc/opl/api.key"    # 둘 다 있어야 한다
+tls_cert = "/etc/orbivisor/api.crt"   # PEM, 중간 인증서를 이어 붙여도 된다
+tls_key = "/etc/orbivisor/api.key"    # 둘 다 있어야 한다
 ```
 
 관리자 인증서가 있으면 API 리스너가 그것을 쓰고 `api_names`로 다시 발급하지 않으며 ACME 인증서도 끼우지 않는다(파일을 읽지 못하면 시작하지 못한다). 공인 인증서를 자동으로 받으려면 아래 [API 인증서(ACME)](#api-인증서acme)를 쓴다.
-파일은 시작할 때만 읽는다. 인증서를 갱신하면(certbot 등) `systemctl restart opld`로 다시 읽게 한다(VM은 그대로 돈다,
-갱신 훅 예: certbot `--deploy-hook "systemctl restart opld"`).
+파일은 시작할 때만 읽는다. 인증서를 갱신하면(certbot 등) `systemctl restart orbivisord`로 다시 읽게 한다(VM은 그대로 돈다,
+갱신 훅 예: certbot `--deploy-hook "systemctl restart orbivisord"`).
 
 `orbivisorctl`은 처음 로그인할 때 클러스터 CA를 받아 핀으로 둔다. 관리자 인증서를 둔 노드(또는 공인 인증서로 끝내는
 프록시)에는 `--system-ca`로 로그인한다. 그러면 클러스터 CA 대신 OS 신뢰 저장소로 서버를 확인하고, 그 방식을 설정 파일에
@@ -214,7 +214,7 @@ orbivisorctl login --server https://orbivisor.example.com --system-ca
 로드 밸런서 없이 VIP 하나(또는 여럿)를 API 노드 사이로 옮겨 다니게 한다. 같은 L2 서브넷 안에서만 된다.
 
 ```toml
-# /etc/opl/opld.toml (VIP를 가질 API 노드마다 같게)
+# /etc/orbivisor/orbivisord.toml (VIP를 가질 API 노드마다 같게)
 [vip]
 addresses = ["192.168.0.200/24"]   # 여럿이면 VIP마다 다른 노드가 갖는다(DNS에 모두 적어 짐을 나눈다)
 interface = "vmbr0"                # VIP를 붙일 인터페이스
@@ -230,9 +230,9 @@ interface = "vmbr0"                # VIP를 붙일 인터페이스
   갱신하기 전에 먼저 뗀다). 리더는 리스가 끝난 뒤에야(리더 시계) 다른 노드에 주므로 **orbivisord가 도는 동안에는** 두
   노드가 같은 VIP를 갖지 않는다(겹칠 수 있는 경우는 아래 알려진 한계). 주인이 죽으면 약 3~4초 뒤 옮겨 간다.
 - 주인이 살아 있으면 리더가 바뀌거나 노드가 더해져도 옮기지 않는다. 새 리더는 리더가 된 뒤 3초 동안 옮기지 않는다.
-- 붙인 VIP는 `/var/lib/opl/vips`(`data_dir`)에 적어 둔다. `systemctl stop`은 VIP를 먼저 뗀다. orbivisord가 kill -9·
+- 붙인 VIP는 `/var/lib/orbivisor/vips`(`data_dir`)에 적어 둔다. `systemctl stop`은 VIP를 먼저 뗀다. orbivisord가 kill -9·
   watchdog SIGKILL 등으로 죽으면 VIP가 인터페이스에 남고, systemd의 `ExecStopPost=/usr/bin/orbivisord --config
-  /etc/opl/opld.toml --release-vips`가 기록한 VIP를 뗀다(다시 시작할 때도 리스를 받기 전에 지금 설정과 관계없이 뗀다).
+  /etc/orbivisor/orbivisord.toml --release-vips`가 기록한 VIP를 뗀다(다시 시작할 때도 리스를 받기 전에 지금 설정과 관계없이 뗀다).
   `--release-vips`는 데이터 디렉터리 잠금을 쥔 orbivisord가 돌고 있으면 아무것도 떼지 않는다. 인터페이스가 없어져 뗄 수
   없는 기록은 경고하고 지운다.
 - 모든 노드(위트니스 포함)가 이 판 이상이어야 VIP를 쓴다(옛 노드는 VIP 주인 기록을 읽지 못한다). 업그레이드 중에는
@@ -306,7 +306,7 @@ backend orbivisor_api
 # /etc/keepalived/keepalived.conf (API 노드마다, priority만 다르게)
 vrrp_script orbivisor_ready {
     # 노드 인증서에는 127.0.0.1도 들어 있다. listen을 바꿨으면 그 주소로 부른다.
-    script "/usr/bin/curl -sf --max-time 2 --cacert /var/lib/opl/pki/ca.crt https://127.0.0.1:8006/api/v1/health"
+    script "/usr/bin/curl -sf --max-time 2 --cacert /var/lib/orbivisor/pki/ca.crt https://127.0.0.1:8006/api/v1/health"
     interval 2
     fall 2
     rise 2
@@ -385,7 +385,7 @@ backend orbivisor_portal
 ```bash
 orbivisorctl cert account add le --directory letsencrypt --email ops@example.com --agree-tos   # 곧 CA에 등록한다
 orbivisorctl cert account add zs --directory zerossl --email ops@example.com --agree-tos \
-  --eab-kid KID --eab-hmac-file eab-hmac.txt        # EAB: 파일(base64url, `-`면 OPL_ACME_EAB_HMAC)
+  --eab-kid KID --eab-hmac-file eab-hmac.txt        # EAB: 파일(base64url, `-`면 ORBIVISOR_ACME_EAB_HMAC)
 orbivisorctl cert account add corp --directory https://ca.corp.example/acme/acme/directory --agree-tos \
   --ca-bundle corp-root.pem                         # 사내 ACME: 그 루트만 믿는다
 orbivisorctl cert account list
@@ -438,7 +438,7 @@ orbivisorctl cert delete vip
 ### HTTP-01
 
 ```toml
-# /etc/opl/opld.toml (HTTP-01로 받을 노드마다 — 공유 인증서면 모든 노드)
+# /etc/orbivisor/orbivisord.toml (HTTP-01로 받을 노드마다 — 공유 인증서면 모든 노드)
 [api]
 http_listen = "0.0.0.0:80"     # listen·cluster_listen과 다른 포트
 ```
@@ -466,20 +466,20 @@ orbivisorctl cert dns add r53 --provider route53 --access-key-id AKIA… --secre
 orbivisorctl cert dns add ns1 --provider rfc2136 --server 192.0.2.53:53 --key-name acme-key \
   --algorithm hmac-sha256 --secret-file tsig.b64 --zone example.com                 # DNS UPDATE + TSIG(TCP 53)
 orbivisorctl cert dns add pdns --provider pdns --url https://pdns.example.com:8081 --secret-file pdns-key.txt
-orbivisorctl cert dns add lego --provider hook --path /etc/opl/acme-hooks/nsupdate.sh
+orbivisorctl cert dns add lego --provider hook --path /etc/orbivisor/acme-hooks/nsupdate.sh
 orbivisorctl cert dns list
 orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으면 409 dns_in_use
 ```
 
 - 비밀(Cloudflare 토큰·Route 53 비밀 키·TSIG 비밀(base64)·PowerDNS API 키)은 인자로 받지 않는다: `--secret-file` > 환경 변수
-  `OPL_ACME_DNS_SECRET` > 터미널에서 묻기. 저장한 뒤 다시 보이지 않는다. Cloudflare `--zone-id`·Route 53 `--hosted-zone-id`·RFC 2136
+  `ORBIVISOR_ACME_DNS_SECRET` > 터미널에서 묻기. 저장한 뒤 다시 보이지 않는다. Cloudflare `--zone-id`·Route 53 `--hosted-zone-id`·RFC 2136
   `--zone`은 없으면 이름으로 찾는다. PowerDNS `--server-id` 기본은 `localhost`. API 꼴의 공급자 이름은 `cloudflare`·`route53`·
   `rfc2136`·`power_dns`·`hook`이다.
 - **전파 확인.** 도전을 알리기 전에 영역의 권한 서버(NS)들에 직접 TXT를 묻고 모두 보일 때까지 기다린다(기본 180초 —
   `--propagation-timeout`, 끄려면 `--no-propagation-check`). 사내·분리 DNS면 노드 설정으로 물을 서버를 정한다:
 
   ```toml
-  # /etc/opl/opld.toml
+  # /etc/orbivisor/orbivisord.toml
   [acme]
   dns_resolver = "10.0.0.53:53"   # 이 서버만 권한 서버로 보고 묻는다(없으면 SOA → NS → A를 찾아 모두)
   ```
@@ -493,7 +493,7 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
   인증서에 모든 노드가 같은 이름을 넣은 경우). `cert renew`는 노드마다 Task를 한꺼번에 만들므로 이 경우 한 노드의 검증이 실패할 수
   있다 — 5분 물러서기 뒤 리더가 하나씩 다시 한다. 클러스터 밖의 다른 ACME 클라이언트와의 겹침은 막지 못한다.
 - **훅.** `{path} add|remove {fqdn} {value}`(예: `add _acme-challenge.example.com Abc…`)를 **주문을 도는 노드에서** 부른다(노드마다
-  인증서는 각 노드, 공유는 고른 노드 — 그러니 모든 노드에 같은 파일을 둔다). 경로는 `/etc/opl/acme-hooks/` 아래 파일만(`..` 없음 —
+  인증서는 각 노드, 공유는 고른 노드 — 그러니 모든 노드에 같은 파일을 둔다). 경로는 `/etc/orbivisor/acme-hooks/` 아래 파일만(`..` 없음 —
   만들 때 검사), 주인은 root(또는 orbivisord를 돌리는 사용자), 그룹·다른 사용자가 쓸 수 없고 실행할 수 있어야 한다(부를 때마다 검사).
   환경은 비우고 `PATH`만 주며 60초 한도, 표준 출력·오류는 4 KiB까지만 이 노드 로그(debug)에 남는다. 실패하면 끝 상태와 표준 오류
   **첫 줄**(200자까지)이 인증서 status `error`에 실린다 — `cluster.read` 사용자와 경보 알림이 보므로 첫 줄에 비밀을 찍지 않는다. 그래서
@@ -502,7 +502,7 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
 
   ```sh
   #!/bin/sh
-  # /etc/opl/acme-hooks/nsupdate.sh — root:root 0755, 모든 노드에. 키 파일은 root 0600
+  # /etc/orbivisor/acme-hooks/nsupdate.sh — root:root 0755, 모든 노드에. 키 파일은 root 0600
   set -eu
   action=$1 fqdn=$2 value=$3
   case "$action" in
@@ -510,7 +510,7 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
     remove) line="update delete $fqdn. TXT \"$value\"" ;;
     *)      exit 2 ;;
   esac
-  nsupdate -k /etc/opl/acme-hooks/tsig.key <<EOT
+  nsupdate -k /etc/orbivisor/acme-hooks/tsig.key <<EOT
   server 192.0.2.53
   $line
   send
@@ -529,7 +529,7 @@ orbivisorctl cert dns delete cf                     # 쓰는 인증서가 있으
 `orbivisorctl alert rule create`와 웹 규칙 폼에는 아직 없다. API나 `AlertRule` 매니페스트로 만든다:
 
 ```bash
-curl --cacert cluster-ca.pem -H "Authorization: Bearer $OPL_TOKEN" -H 'Content-Type: application/json' \
+curl --cacert cluster-ca.pem -H "Authorization: Bearer $ORBIVISOR_TOKEN" -H 'Content-Type: application/json' \
   https://node1:8006/api/v1/alert-rules -d '{"name":"cert-expiry","spec":{"condition":
   {"kind":"certificate_expiring","days":21},"severity":"critical","targets":["ops-mail"]}}'
 ```
@@ -549,14 +549,14 @@ CI는 Pebble·pebble-challtestsrv·BIND로만 시험한다(아래 한계). 실�
 확인하지 않았다):
 
 1. 노드 이름 `node1.example.com`의 공인 A(또는 AAAA) 레코드가 그 노드를 가리키고 밖에서 포트 80이 닿게 한다. `[api] http_listen =
-   "0.0.0.0:80"`을 넣고 `systemctl restart opld`, `orbivisorctl -o json node get node1`의 `features`에 `http01`이 있는지 본다.
+   "0.0.0.0:80"`을 넣고 `systemctl restart orbivisord`, `orbivisorctl -o json node get node1`의 `features`에 `http01`이 있는지 본다.
 2. `orbivisorctl cert account add stg --directory letsencrypt-staging --email ops@example.com --agree-tos`.
 3. HTTP-01: `orbivisorctl cert add stg-http --account stg --name node1.example.com --node <node1 id>` → `orbivisorctl cert renew stg-http
    --wait` → `cert list`에 일련번호·만료가 보이고 오류가 없다. `openssl s_client -connect node1.example.com:8006 -servername
    node1.example.com </dev/null | openssl x509 -noout -issuer -dates`의 발급자가 `(STAGING)`으로 시작한다(스테이징 루트는 브라우저가 믿지
    않는다 — 맞는 동작).
 4. DNS-01 훅: 위 `nsupdate.sh`(또는 쓰는 DNS의 훅)를 노드에 두고 `orbivisorctl cert dns add hook --provider hook --path
-   /etc/opl/acme-hooks/nsupdate.sh` → `orbivisorctl cert add stg-dns --account stg --name '*.example.com' --shared --dns01 hook` →
+   /etc/orbivisor/acme-hooks/nsupdate.sh` → `orbivisorctl cert add stg-dns --account stg --name '*.example.com' --shared --dns01 hook` →
    `cert renew stg-dns --wait` → `openssl s_client -servername x.example.com …`가 와일드카드 인증서를 받는다.
 5. `orbivisorctl cert renew stg-http --wait`를 한 번 더 해 새 일련번호가 끼워지는지(열린 연결은 그대로) 본다.
 6. 치우기: `cert delete stg-http`·`cert delete stg-dns`·`cert dns delete hook`·`cert account delete stg`, `http_listen` 줄을 지운다
@@ -584,7 +584,7 @@ orbivisorctl cluster status          # ROLE 열: voter | learner | observer
 ```
 
 ```toml
-# /etc/opl/opld.toml (노드마다, 선택)
+# /etc/orbivisor/orbivisord.toml (노드마다, 선택)
 [node]
 zone = "rack-a"   # 장애 영역(랙·전원·방). 노드 레이블 zone으로 등록된다
 ```
@@ -649,7 +649,7 @@ zone = "rack-a"   # 장애 영역(랙·전원·방). 노드 레이블 zone으로
   제한 시간 1~2초를 기다린다). 리스 갱신을 투표 멤버가 묶어 리더에 전달하는 것과 처음부터 관찰 노드로 합류하는 것은
   나중이다.
 - **규모 시험.** `cargo test -p orbivisor-cluster --features scale-it --test scale -- --nocapture`가 한 프로세스에 노드
-  300개(투표 5, 대기 learner 2, 나머지 관찰 노드, `OPL_SCALE_NODES`로 바꿈(20 이상), CI는 100)를 띄우고 모든 노드가 리스를
+  300개(투표 5, 대기 learner 2, 나머지 관찰 노드, `ORBIVISOR_SCALE_NODES`로 바꿈(20 이상), CI는 100)를 띄우고 모든 노드가 리스를
   갱신하며 `VoterKeeper`·`RoleKeeper`를 띄운 채로 잰다. 관찰 노드는 learner로 따라잡지 않고 빈 저장소로 바로 관찰 노드로
   연다(시작 시간을 줄임). 저장소는 메모리에 둔다(한 디스크에 수백 노드의 fsync가 몰리지 않게). 기준과 잰 값(Apple
   Silicon 10코어, 시험 빌드, 두 번):
@@ -659,17 +659,17 @@ zone = "rack-a"   # 장애 영역(랙·전원·방). 노드 레이블 zone으로
   | 리더의 초당 RPC(하트비트·리스 갱신과 그 확인, 아래 지연을 넣고) | 35 + 노드당 4.5 미만(계획 47은 노드당 10) | 93(노드당 3.1) | 254~255(2.5) | 352~355(1.2) |
   | 그 가운데 비투표 구성원(대기 learner 둘)에게 | 15 미만(노드 수와 관계없이) | 7 | 7 | 7 |
   | 그 가운데 투표 멤버에게(묶지 않은 최악 = 하트비트 + 갱신 수 × 2 × 투표 멤버 수) | 최악의 0.6 미만 | 72(최악 171, 0.42) | 198(최악 523~525, 0.38) | 200~201(최악 1,479~1,499, 0.13~0.14) |
-  | 쓰기 지연 p99(리더에서 하나씩) | 50 ms 미만(`OPL_SCALE_P99_MS`, CI 200 ms) | 1.7~1.8 ms | 4.2~4.4 ms | 11.7~12.6 ms |
+  | 쓰기 지연 p99(리더에서 하나씩) | 50 ms 미만(`ORBIVISOR_SCALE_P99_MS`, CI 200 ms) | 1.7~1.8 ms | 4.2~4.4 ms | 11.7~12.6 ms |
   | 관찰 노드의 뒤처짐 p99(리더가 쓰기를 마친 뒤 관찰 노드마다 적용하기까지) | 500 ms 미만 | 0.8~0.9 ms | 2.3~2.4 ms | 6.8~7.1 ms |
   | 노드 하나 추가(learner로 따라잡기까지) | 2초 미만 | 1 ms | 3 ms | 5~8 ms |
   | 투표 멤버 장애 뒤 모든 관찰 노드가 다시 붙어 새 쓰기를 받기까지 | 5초 미만 | 0.2초(10개가 붙어 있었음) | 1.2초(24개) | 1.2초(82개) |
-  | 리더 장애 뒤 새 리더 | 5초 미만(설계 3초, `OPL_SCALE_FAILOVER_MS`, §14; 10초면 그 자리에서 실패) | 3.2초 | 3.3~3.6초 | 3.4~3.6초 |
+  | 리더 장애 뒤 새 리더 | 5초 미만(설계 3초, `ORBIVISOR_SCALE_FAILOVER_MS`, §14; 10초면 그 자리에서 실패) | 3.2초 | 3.3~3.6초 | 3.4~3.6초 |
 
   계획 47(나머지가 learner)의 같은 구간 리더 RPC는 노드 100에서 570, 노드 300에서 1,320이었고 그 3분의 2가 learner
   하트비트였다. 지금 노드 수에 따라 느는 것은 전달받은 리스 갱신(노드당 0.5)과 그 리더 확인뿐이다.
 
   CI 러너(코어 3~4개)는 노드 100개를 한 프로세스에서 돌리므로 쓰기 지연이 CPU에 묶여 흔들린다. 그래서 CI는 쓰기 p99
-  기준만 `OPL_SCALE_P99_MS=200`으로 둔다(쓰기가 멈추거나 노드 수에 따라 크게 느려지는 것만 잡는다). 다른 기준은 CI의
+  기준만 `ORBIVISOR_SCALE_P99_MS=200`으로 둔다(쓰기가 멈추거나 노드 수에 따라 크게 느려지는 것만 잡는다). 다른 기준은 CI의
   노드 100에서도 같게 검사한다.
 
   리더 RPC를 재는 5초 동안은 투표 멤버로 가는 `append_entries`(하트비트·리더 확인)에 지연(2초/노드 수, 20 ms 이상 —
@@ -692,7 +692,7 @@ zone = "rack-a"   # 장애 영역(랙·전원·방). 노드 레이블 zone으로
 §7·§16).
 
 ```toml
-# /etc/opl/opld.toml (노드마다)
+# /etc/orbivisor/orbivisord.toml (노드마다)
 address = "10.0.0.11"                           # API 주소와 인증서 이름(그대로)
 cluster_listen = "0.0.0.0:8007"                 # 모든 링크에서 받게
 cluster_addresses = ["10.0.0.11", "10.1.0.11"]  # 앞이 우선 링크. 호스트만(IP나 DNS 이름), 포트는 cluster_listen의 것
@@ -942,7 +942,7 @@ CPU를 어떻게 나눌지와 hugepages를 얼마나 예약할지다. **Orbiviso
 - 예약이 있으면 orbivisord가 자기 모든 스레드의 친화를 예약 CPU로 둔다(시작할 때와 바뀔 때, 빼면 orbivisord가 뜰 때의 친화로
   되돌림). QEMU·swtpm은 띄울 때 공유 집합(전용 VM은 에뮬레이터 집합)으로 다시 걸므로 예약 CPU에 갇히지 않는다.
 - 노드 설정이 없으면 Orbivisor는 VM 스레드의 친화를 건드리지 않는다: QEMU는 orbivisord의 친화를 물려받고, 검사 루프는 고정한 적
-  없는 VM을 보지 않는다. 관리자가 `opld.service`의 `CPUAffinity=`나 `taskset`, 컨테이너 cpuset으로 VM을 좁혀 둔 것은 그대로다.
+  없는 VM을 보지 않는다. 관리자가 `orbivisord.service`의 `CPUAffinity=`나 `taskset`, 컨테이너 cpuset으로 VM을 좁혀 둔 것은 그대로다.
   설정을 지우면 Orbivisor가 고정했던 VM만 한 번 orbivisord가 뜰 때의 친화로 풀고 그 뒤로는 손대지 않는다. cgroup cpuset(컨테이너,
   슬라이스 `AllowedCPUs`)이 자른 친화는 맞은 것으로 본다.
 - 공유 집합이 바뀌면 검사 루프가 도는 공유 VM의 스레드 친화와 스코프 `AllowedCPUs`를 곧바로 다시 건다(swtpm은 켤 때의 집합에
@@ -1009,7 +1009,7 @@ Orbivisor VM은 hugepages를 memfd hugetlb로 쓰므로 **hugetlbfs 마운트는
 - **"전용 CPU가 하는 일"과 SMT.** 한 코어의 두 스레드는 실행 장치를 나눠 쓴다. 전용 집합은 형제 짝을 통째로 넣는다(나누면 경고).
   같은 코어의 형제를 다른 VM과도 나누기 싫으면 VM에 `--cpu-threads isolate`(vCPU마다 코어 하나, 형제는 비워 둠)를 준다.
 
-### opld가 보이는 경고
+### orbivisord가 보이는 경고
 
 `node topology`의 `warning:` 줄, 노드 상세의 경고 띠에 그대로 보인다. 노드 설정이 있을 때만 셈한다.
 
@@ -1019,7 +1019,7 @@ Orbivisor VM은 hugepages를 memfd hugetlb로 쓰므로 **hugetlbfs 마운트는
 | `dedicated CPUs 7 are offline` (예약도 같은 꼴) | 설정의 CPU가 오프라인이다. 켜거나 설정에서 뺀다 |
 | `the dedicated CPUs split SMT sibling groups 0,32 1,33` | 전용 집합이 코어의 형제 짝을 나눈다. 짝을 함께 넣거나 함께 뺀다 |
 | `node 0: 2M hugepages 4096 wanted, 3900 reserved` | 실행 중 예약이 모자란다(조각). 수를 줄이거나 부팅 때 예약한다 |
-| `nr_hugepages`를 쓰지 못한 까닭, opld 친화를 걸지 못한 까닭 | 권한·커널 문제. 로그와 함께 본다 |
+| `nr_hugepages`를 쓰지 못한 까닭, orbivisord 친화를 걸지 못한 까닭 | 권한·커널 문제. 로그와 함께 본다 |
 | (`--live`) `live: orbivisord does not run on the reserved CPUs` | orbivisord의 친화가 예약 CPU와 다르다(웹 "orbivisord가 아직 예약 CPU에서 돌지 않습니다") |
 
 ### 예: 2소켓 호스트
@@ -1179,7 +1179,7 @@ orbivisorctl -o json node stats --watch  # 회차마다 응답 한 줄(JSON Line
 - **형식 버전.** 머리에 형식 버전과 칸 목록이 있어, 다음 버전이 칸을 더하면 열 때 새 배치로 옮긴다(같은 칸은 그대로).
   더 새 형식의 파일(orbivisord를 내려 깐 경우)은 `{name}.rrd.v{n}`으로 옮기고 새로 시작한다 — 내려 깔면 기록을 잃는다.
 
-**설정.** `/etc/opl/opld.toml`(노드마다):
+**설정.** `/etc/orbivisor/orbivisord.toml`(노드마다):
 
 ```toml
 [metrics]
