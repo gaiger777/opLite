@@ -96,10 +96,21 @@ async fn web_edit_vm(d: &Daemon, password: &str, vm: &str, edit: impl FnOnce(&mu
 }
 
 async fn wait_phase(d: &Daemon, vm: &str, phase: &str) {
-    common::eventually(&format!("vm {vm} {phase}"), || async {
-        d.ctl_json(&["vm", "get", vm]).await["status"]["phase"] == phase
-    })
-    .await;
+    // TCG(svc01 aarch64)에서는 두 VM이 함께 켜지는 데 30초를 넘길 수 있다 — VMware 실제 시험처럼 넉넉히 두고,
+    // 시간이 지나면 마지막 상태를 보인다.
+    let deadline = Instant::now() + Duration::from_secs(180);
+    loop {
+        let got = d.ctl_json(&["vm", "get", vm]).await;
+        if got["status"]["phase"] == phase {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for vm {vm} {phase}: {}",
+            got["status"]
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 /// 묶음 `set`의 드리프트 보고가 `ok`를 만족할 때까지 기다린다(보고를 돌려준다).
