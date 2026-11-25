@@ -19,6 +19,7 @@ use orbivisor_types::ceph::{
     CephPending, CephPhase, CephPoolRequest, CephReport, CephSpec, CephStatus, CephStatusView,
     CephView, DiskState, MAX_MONS, NodeDisk, default_public_network, encode_key, mon_addr,
 };
+use orbivisor_types::layout;
 use orbivisor_types::node::{CEPH_SETUP, Node, NodeSpec};
 use orbivisor_types::resource::{Kind, Resource, ResourceSpec};
 use orbivisor_types::security_group::Cidr;
@@ -300,13 +301,24 @@ fn new_key() -> String {
     encode_key(&secret, now.as_secs() as u32, now.subsec_nanos())
 }
 
-/// 노드가 관리 Ceph에 붙는 클라이언트 conf(`[ceph] client_dir`)
+/// 노드가 관리 Ceph에 붙는 클라이언트 conf(`[ceph] client_dir`) — RBD 풀 spec에 적는 값([`stored_conf`])
 fn managed_conf(state: &AppState) -> String {
     let path = match &state.ceph {
         Some(host) => host.client_conf(),
         None => CephPaths::default().client_dir.join("ceph.conf"),
     };
-    path.to_string_lossy().into_owned()
+    stored_conf(&state.cluster, &path)
+}
+
+/// RBD 풀 spec에 적는 관리 conf(`conf`는 이 노드의 `{client_dir}/ceph.conf`). 모든 노드가 이 경로를 연다 — 모든 노드가
+/// 새 배치(기능 `orbivisor-layout`)를 알릴 때까지는 옛 이름(`/etc/opl/…`)으로 적는다. 옛 판 노드에는 새 이름이 없고,
+/// 새 판 노드에는 옛 이름 링크가 늘 있다(계획 74 설계 §3.4).
+pub(crate) fn stored_conf(cluster: &Cluster, conf: &std::path::Path) -> String {
+    let nodes = cluster
+        .list::<NodeSpec>()
+        .map(|(_, nodes)| nodes)
+        .unwrap_or_default();
+    layout::stored(&conf.to_string_lossy(), &nodes).into_owned()
 }
 
 /// 노드 `node`가 쓰는 Orbivisor LVM 풀(LVM-thin·공유 LVM)의 (VG, 풀 이름). 그 PV는 OSD로 쓰지 않는다.
@@ -357,7 +369,7 @@ async fn local_report(
                 pool,
                 conf: Some(c),
                 ..
-            } if c == conf => Some((p.name, pool)),
+            } if layout::same_path(&c, &conf) => Some((p.name, pool)),
             _ => None,
         })
         .collect();

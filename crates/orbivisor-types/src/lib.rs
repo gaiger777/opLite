@@ -28,6 +28,7 @@ pub mod host;
 pub mod hotplug;
 pub mod image_catalog;
 pub mod ipam;
+pub mod layout;
 pub mod legacy;
 pub mod load_balancer;
 pub mod manifest;

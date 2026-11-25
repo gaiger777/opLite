@@ -10,6 +10,7 @@ import {
   percentOf,
   pgSummary,
   publicNetworkFor,
+  sameNodePath,
   sizeWarning,
 } from "@/ceph/ceph";
 import { CEPH, CEPH_STATUS, DISKS, NET_NODE, NODE, pool } from "@/test/fixtures";
@@ -110,7 +111,18 @@ it("knows the storage pools of the managed Ceph by their configuration", () => {
     backend: { kind: "rbd", pool: "vmpool", user: "orbivisor", conf: "/etc/opl/ceph/ceph.conf" },
   });
   const outside = pool("ext", { backend: { kind: "rbd", pool: "rbd" } });
+  // 이름 바꾸기 앞에 저장된 풀(옛 /etc/opl)도, 새 이름의 풀도 관리 풀이다.
   expect(isManagedPool(managed, CEPH)).toBe(true);
+  const renamed = pool("vms2", {
+    backend: {
+      kind: "rbd",
+      pool: "vmpool",
+      user: "orbivisor",
+      conf: "/etc/orbivisor/ceph/ceph.conf",
+    },
+  });
+  expect(isManagedPool(renamed, CEPH)).toBe(true);
+  expect(sameNodePath("/etc/opl-ceph/x", "/etc/orbivisor-ceph/x")).toBe(false);
   expect(isManagedPool(outside, CEPH)).toBe(false);
   expect(isManagedPool(managed, null)).toBe(false);
   expect(isManagedPool(pool("local"), CEPH)).toBe(false);

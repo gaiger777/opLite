@@ -208,10 +208,30 @@ export function cephRoles(ceph: CephView | null | undefined, node: string): stri
   ].filter((r): r is string => r !== false);
 }
 
+/** 노드 디렉터리의 옛 이름(`/etc/opl` 등)을 새 이름으로(계획 74 — 이름 바꾸기 앞에 저장된 풀의 conf) */
+const NODE_DIRS: [string, string][] = [
+  ["/etc/opl", "/etc/orbivisor"],
+  ["/var/lib/opl", "/var/lib/orbivisor"],
+  ["/run/opl", "/run/orbivisor"],
+  ["/var/log/opl", "/var/log/orbivisor"],
+];
+
+function currentNodePath(path: string): string {
+  for (const [old, now] of NODE_DIRS) {
+    if (path === old || path.startsWith(`${old}/`)) return now + path.slice(old.length);
+  }
+  return path;
+}
+
+/** 두 노드 경로가 옛 이름·새 이름을 빼면 같은지 */
+export function sameNodePath(a: string, b: string): boolean {
+  return currentNodePath(a) === currentNodePath(b);
+}
+
 /** Orbivisor가 관리하는 Ceph의 RBD 풀인지(관리 클라이언트 conf를 쓰는 풀) */
 export function isManagedPool(pool: StoragePool, ceph: CephView | null | undefined): boolean {
   const b = pool.spec.backend;
-  return !!ceph && b.kind === "rbd" && b.conf === ceph.managed_conf;
+  return !!ceph && b.kind === "rbd" && !!b.conf && sameNodePath(b.conf, ceph.managed_conf);
 }
 
 /** 사용률(0~100, 소수 한 자리). 전체가 0이면 0 */

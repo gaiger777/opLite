@@ -426,7 +426,13 @@ pub const FEATURES: &[&str] = &[
     DECLARATIVE,
     CONFIG_HISTORY,
     ACME,
+    ORBIVISOR_LAYOUT,
 ];
+
+/// 디렉터리 배치 이름 바꾸기(계획 74): 이 노드에는 `/etc/orbivisor` 등 새 이름의 디렉터리가 있다(옛 이름은 링크).
+/// 다른 노드가 여는 경로(RBD 풀의 관리 conf)를 새 이름으로 적고 ACME 훅 경로에 새 디렉터리를 받는 것은 모든 노드가
+/// 알릴 때만이다(그 전에는 옛 이름 — [`crate::layout::to_legacy`]).
+pub const ORBIVISOR_LAYOUT: &str = "orbivisor-layout";
 
 /// 배치 규칙·HA 그룹·HA 정책 객체·종료 정책(계획 50). 모든 노드가 알릴 때만 쓴다.
 pub const HA_PLACEMENT: &str = "ha-placement";
@@ -1045,7 +1051,8 @@ mod tests {
                 "vm-export",
                 "declarative",
                 "config-history",
-                "acme"
+                "acme",
+                "orbivisor-layout"
             ])
         );
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
@@ -1264,7 +1271,7 @@ mod tests {
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["sdn"], serde_json::json!({ "chassis": "configuring" }));
         assert_eq!(serde_json::from_value::<NodeStatus>(json).unwrap(), status);
-        assert_eq!(FEATURES.last(), Some(&ACME));
+        assert_eq!(FEATURES.last(), Some(&ORBIVISOR_LAYOUT));
     }
 
     /// 계획 69: 파일 복원 도우미가 없으면(옛 노드·이미지 없음) 쓰지 않아 옛 노드 상태 JSON이 바이트까지 같다.

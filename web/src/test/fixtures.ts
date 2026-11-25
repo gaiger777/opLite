@@ -605,7 +605,7 @@ export const CEPH: CephView = {
   osd_nodes: ["n1", "n2"],
   release: "19.2.3 squid",
   init_node: "n1",
-  managed_conf: "/etc/opl/ceph/ceph.conf",
+  managed_conf: "/etc/orbivisor/ceph/ceph.conf",
   tasks: [],
 };
 

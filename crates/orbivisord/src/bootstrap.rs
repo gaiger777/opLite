@@ -953,7 +953,8 @@ pub(crate) mod tests {
                 "vm-export",
                 "declarative",
                 "config-history",
-                "acme"
+                "acme",
+                "orbivisor-layout"
             ]
         );
         update_node_status(&cluster, |status| {
@@ -1007,7 +1008,8 @@ pub(crate) mod tests {
                 "vm-export",
                 "declarative",
                 "config-history",
-                "acme"
+                "acme",
+                "orbivisor-layout"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1080,7 +1082,8 @@ pub(crate) mod tests {
                 "vm-export",
                 "declarative",
                 "config-history",
-                "acme"
+                "acme",
+                "orbivisor-layout"
             ]
         );
         cluster.shutdown().await.unwrap();
@@ -1328,6 +1331,7 @@ pub(crate) mod tests {
                     "declarative".into(),
                     "config-history".into(),
                     "acme".into(),
+                    "orbivisor-layout".into(),
                 ],
                 cluster_addresses: vec!["10.0.0.9:8007".into()],
                 ..NodeStatus::default()

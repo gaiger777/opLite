@@ -13,7 +13,7 @@ use orbivisor_types::acme::{
     CertificateStatus, ChallengeKind, DnsProvider, ExternalAccountBinding, Propagation,
     RenewPolicy, Secret, redact_account_json, redact_certificate_status_json, redact_dns_json,
 };
-use orbivisor_types::node::{ACME, HTTP01, NodeSpec};
+use orbivisor_types::node::{ACME, HTTP01, NodeSpec, ORBIVISOR_LAYOUT};
 use orbivisor_types::resource::{Kind, Resource};
 use orbivisor_types::task::{Task, TaskOp, TaskSpec};
 use serde::{Deserialize, Serialize};
@@ -379,6 +379,12 @@ fn provider_kind(p: &DnsProvider) -> &'static str {
 /// 이 노드에서 만들 수 있는지까지 본다(TSIG base64·서버 주소 꼴).
 pub(crate) fn check_dns(state: &AppState, spec: &AcmeDnsSpec) -> Result<(), ApiError> {
     spec.validate().map_err(invalid)?;
+    // 새 훅 디렉터리는 옛 판 노드에 없다(옛 판은 `/etc/opl/acme-hooks/`만 받는다) — 모든 노드가 새 배치일 때만.
+    if let DnsProvider::Hook { path } = &spec.provider
+        && path.starts_with(orbivisor_types::acme::HOOK_DIR)
+    {
+        require_feature(&state.cluster, ORBIVISOR_LAYOUT)?;
+    }
     super::dns::Provider::new(spec, &state.acme)
         .map(drop)
         .map_err(invalid)

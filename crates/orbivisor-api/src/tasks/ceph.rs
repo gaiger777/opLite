@@ -438,7 +438,10 @@ impl Run<'_> {
                 pool: pool.to_string(),
                 namespace: None,
                 user: Some(CLIENT_ID.to_string()),
-                conf: Some(self.host.client_conf().to_string_lossy().into_owned()),
+                conf: Some(crate::ceph::stored_conf(
+                    &self.ctx.cluster,
+                    &self.host.client_conf(),
+                )),
             },
             nodes: Vec::new(),
             shared: true,

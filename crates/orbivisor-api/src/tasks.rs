@@ -217,7 +217,7 @@ pub struct TaskRunnerConfig {
     /// 라이브 복원이 저장소 백업을 내보내는 `backup-serve` 헬퍼의 실행 파일(opld 자신). 없으면 opld 안에서 내보낸다
     /// (시험 — opld가 다시 뜨면 Task가 다시 띄운다).
     pub backup_serve_exe: Option<PathBuf>,
-    /// 헬퍼를 systemd scope(`opl-bkserve-<id>`)로 감싸 opld가 다시 떠도 살게 한다(systemd가 있는 Linux).
+    /// 헬퍼를 systemd scope(`orbivisor-bkserve-<id>`)로 감싸 opld가 다시 떠도 살게 한다(systemd가 있는 Linux).
     pub backup_serve_scope: bool,
     /// VMware 이전 동기화(계획 72): 읽기·쓰기 한 조각이 이만큼 끝나지 않으면 회차가 실패한다(바이트가 늘지 않음).
     pub vmware_stall: Duration,
@@ -2006,7 +2006,11 @@ async fn sweep_orphans(ctx: &Ctx, revision: u64, tasks: &[Task]) -> Vec<Uuid> {
             continue;
         }
         let wanted = unfinished.iter().any(|t| match &t.spec.op {
-            TaskOp::VolumeImport { source, .. } => *source == path,
+            // 이름 바꾸기(계획 74) 앞에 쌓인 Task는 옛 경로(`/var/lib/opl/uploads/…`)를 들고 있다 — 같은 파일이다.
+            TaskOp::VolumeImport { source, .. } => orbivisor_types::layout::same_path(
+                &source.to_string_lossy(),
+                &path.to_string_lossy(),
+            ),
             TaskOp::VolumeDownload { .. } => download::path(dir, t.spec.target) == path,
             _ => false,
         });
