@@ -1,0 +1,54 @@
+{
+  "vmExports": {
+    "pageHint": "풀에 쓴 OVF 패키지입니다. vSphere·Workstation·VirtualBox용 OVA 하나로 내려받습니다. 내보내기는 꺼진 VM의 메뉴에서 시작합니다.",
+    "empty": "내보내기가 없습니다",
+    "emptyHint": "꺼진 VM의 메뉴에서 \"OVA로 내보내기…\"를 고르세요.",
+    "vm": "VM",
+    "vmGone": "지워짐",
+    "pool": "풀",
+    "size": "OVA 크기",
+    "created": "만든 때",
+    "phase": {
+      "pending": "기다림",
+      "writing": "쓰는 중",
+      "ready": "준비됨",
+      "failed": "실패"
+    },
+    "warnings_one": "경고 {{count}}개",
+    "warnings_other": "경고 {{count}}개",
+    "downloadNamed": "{{name}} 내려받기",
+    "downloadStarted": "{{name}}.ova를 내려받습니다.",
+    "deleteTitle": "{{name}}을(를) 지울까요?",
+    "deleteDescription": "풀에서 OVF 파일을 지웁니다. VM은 남습니다.",
+    "dialog": {
+      "title": "{{name}}을(를) OVA로 내보내기",
+      "description": "디스크를 streamOptimized VMDK로, OVF 서술자와 SHA-256 매니페스트를 함께 씁니다. 다 쓸 때까지 VM은 꺼진 채여야 합니다.",
+      "submit": "내보내기",
+      "pool": "풀",
+      "poolHint": "디스크가 들어갈 자리가 있는 디렉터리·NFS 풀.",
+      "noPool": "디렉터리·NFS 풀이 없음",
+      "name": "이름",
+      "nameHint": "비우면 VM 이름과 시각입니다.",
+      "guestOs": "VMware 게스트 OS",
+      "guestOsHint": "VMware guestId. 비우면 가져온 VM의 원본 값, 없으면 otherGuest64입니다.",
+      "hwVersion": "하드웨어 버전",
+      "hwVersionHint": "vmx-7부터 vmx-21까지. 14는 ESXi 6.7 이상에서 돕니다.",
+      "keepMacs": "MAC 주소 그대로",
+      "keepMacsHint": "끄면 받는 제품이 새 MAC을 정합니다.",
+      "started": "{{name}}을(를) 내보냅니다.",
+      "errors": {
+        "pool": "풀을 고르세요.",
+        "hwVersion": "7에서 21 사이의 수를 넣으세요."
+      }
+    },
+    "errors": {
+      "vm_running": "내보내기 전에 VM을 끄세요.",
+      "pool_not_file": "디렉터리나 NFS 풀을 고르세요.",
+      "insufficient_storage": "풀에 디스크가 들어갈 자리가 없습니다: {{message}}",
+      "vm_exporting": "VM을 내보내는 중입니다.",
+      "export_busy": "다른 Task가 이 내보내기를 다루는 중입니다.",
+      "export_not_ready": "내보내기가 아직 끝나지 않았습니다.",
+      "link_expired": "내려받기 링크가 지났습니다. 다시 해 보세요."
+    }
+  }
+}

@@ -21,6 +21,16 @@ it("mirrors the server's builtin roles and kind privileges", () => {
   expect(kindPrivilege("read", "folder")).toBe("system.read");
   expect(kindPrivilege("read", "group")).toBe("cluster.admin");
   expect(kindPrivilege("read", "node")).toBe("cluster.read");
+  // VMware 이전·VM 내보내기(계획 72): vm.export는 마지막이고 operator에 없다.
+  expect(PRIVILEGES.at(-1)).toBe("vm.export");
+  expect(builtinPrivileges("operator")).not.toContain("vm.export");
+  expect(kindPrivilege("read", "vmware-source")).toBe("cluster.read");
+  expect(kindPrivilege("write", "vmware-source")).toBe("cluster.admin");
+  expect(kindPrivilege("read", "vmware-migration")).toBe("system.read");
+  expect(kindPrivilege("read", "vmware-vm")).toBe("system.read");
+  expect(kindPrivilege("read", "vm-export")).toBe("system.read");
+  expect(kindPrivilege("write", "vm-export")).toBe("vm.export");
+  expect(kindPrivilege("operate", "vm-export")).toBe("vm.export");
 });
 
 it("answers per folder and per object from /permissions/mine", () => {

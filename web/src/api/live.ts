@@ -33,6 +33,10 @@ export const VIEW_KINDS = [
   "network-migration",
   // 백업 저장소(계획 68): 비밀을 뺀 보기라 사건이 오면 목록을 다시 읽는다.
   "backup-store",
+  // VMware 이전(계획 72): 원본 연결은 비밀번호를 뺀 보기, 계획·항목은 화면이 계획마다 따로 읽는다.
+  "vmware-source",
+  "vmware-migration",
+  "vmware-vm",
 ] as const;
 export type ViewKind = (typeof VIEW_KINDS)[number];
 
@@ -52,6 +56,11 @@ export const REFRESH_ON: Partial<Record<ViewKind | WatchKind, readonly (readonly
   "load-balancer": [["load-balancers"], ["network-ips"], ["network-topology"]],
   "network-migration": [["network-migrations"], ["network-topology"]],
   "backup-store": [["backup-stores"]],
+  "vmware-source": [["vmware-sources"]],
+  "vmware-migration": [["vmware-migrations"]],
+  "vmware-vm": [["vmware-vms"]],
+  // VM 내보내기(계획 72)는 watch 종류가 아니다 — 내보내기·지우기 Task가 바뀌면 목록을 다시 읽는다.
+  task: [["vm-exports"]],
   network: [["network-topology"], ["load-balancers"]],
   vm: [["network-topology"], ["floating-ips"]],
 };

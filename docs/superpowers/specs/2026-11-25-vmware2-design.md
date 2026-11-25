@@ -656,3 +656,50 @@ For stage 7 (web): API = `POST /vms/{key}/export` body `ExportVmRequest`, 202 `V
 For stage 8: docs (vms.md export section, access.md vm.export, development.md test commands incl. storage-it round trip), real test
   in opld `qemu-it` can reuse the `an_exported_ova_imports_back_with_the_same_disk` flow; guide must say MAC/addressType and vSphere
   import are unverified on real vSphere.
+
+### 스테이지 7
+
+- **스테이지 5 끝점**: 웹을 스테이지 5와 함께 짜서 `schema.d.ts`에 `POST /vmware-vms/{key}/{cutover|revert|finalize}`가 아직 없다.
+  `web/src/vmware/api5.ts`가 설계대로 손으로 적은 경로 타입(응답은 `retry`·`cancel`과 같은 `ItemAction`으로 가정, `revert` 본문
+  `{confirm: "<대상 VM 이름>"}`)으로 같은 `api` 클라이언트(401·연결 오류 처리 그대로)를 부른다. 스테이지 5를 합치고 `gen:api`
+  하면 이 파일을 지우고 `api.POST`를 바로 쓴다(응답 모양이 다르면 그때 맞춘다). 시험은 msw.
+- **watch**: `vmware-source`·`vmware-migration`·`vmware-vm`은 `VIEW_KINDS`(사건이 오면 `["vmware-sources"]`·`["vmware-migrations"]`·
+  `["vmware-vms"]` 질의를 다시 읽음 — 원본은 비밀번호를 뺀 보기, 항목은 계획마다 `GET /vmware-vms?migration=`). `vm-export`는 watch
+  종류가 아니라서 Task 사건마다 `["vm-exports"]`를 다시 읽는다(`REFRESH_ON.task`, 보는 화면이 있을 때만).
+- **VM 메뉴의 내보내기**: VM 상세 ⋯의 "OVA로 내보내기…"(꺼진 VM·템플릿, 그 VM의 `vm.export` — 켜져 있으면 막힌 항목과 까닭)는
+  대화상자를 그 자리에서 열지 않고 **내보내기 보기 `/vm-exports?export=<VM>`** 로 가서 연다. 메뉴(첫 화면 묶음의 `VmMenu` 조각)가
+  내보내기 조각을 늦게 읽으면 그 `import()`와 미리 받기 목록만으로 +550 B였다. 내보내기의 진행·내려받기가 그 보기에 있어 흐름도
+  짧다. 목록 행의 ⋯에는 넣지 않았다(설계 §13대로 상세만).
+- **조각**: VMware 보기 넷은 한 조각 `vmware/pages`(gzip 15.2 KB — 경로마다 나누면 Radix 공용 조각이 갈라져 첫 화면이 +550 B),
+  내보내기 보기와 대화상자는 `exports/pages`(3.1 KB). 문구는 늦게 받는 묶음 `vmware/i18n`(en 4.5 KB·ko 5.0 KB)·`exports/i18n`
+  (0.96·1.19 KB) — 맨 위 키 하나(`vmware`·`vmExports`). 오류 문구도 그 안(`vmware.errors.<code>`·`vmExports.errors.<code>`)이라
+  대화상자에 던지기 전에 `localized()`가 문장으로 바꾼다(코드에 `vmware:` 머리를 붙여 공통 `errors.<code>`를 건너뜀).
+- **첫 화면 묶음**: 479,456 B → **480,433 B(+977 B, 1 KB 밑)** — 보기 이름·팔레트 낱말·Task 이름 여섯·`vms.action.export`·
+  `errors.vm_exporting`(VM 켜기가 낼 수 있음)·권한·watch 종류·경로 표. 지키느라: 조각 둘로 묶음, 메뉴는 주소로 감, 새 Tailwind
+  유틸 대신 이미 있는 것(CSS 0 B), 나무 보기 전환은 공용 `ToggleGroup` 대신 단추 둘.
+- **마법사**: ⑤ 확인 단계에 들어갈 때 `draft` 계획을 만든다(그래야 서버 미리 확인을 부를 수 있다). 뒤로 갔다 오면 새로 만들지 않고
+  `PATCH`(규칙·한도·주기·전환 정책 + `add_vms`·`remove_vms`)로 맞춘 뒤 다시 확인한다 — 초안이 생긴 뒤 이름·원본·방식은 잠근다.
+  "막힌 VM은 빼고 시작"은 시작 전에 막힌 항목을 `remove_vms`로 **계획에서 뺀다**(서버 `start`는 막힌 항목을 `failed`로 남기지만,
+  빼면 다른 계획에 넣을 수 있다). "초안으로 두기"는 상세로 간다(상세의 "확인"·"시작"). 매핑 단계는 디스크를 둘 풀(데이터스토어마다
+  또는 기본 풀)만 요구하고, 네트워크는 같은 이름을 미리 고르되 비워도 된다(미리 확인이 `network_unmapped`로 알림). 규칙에는 고른
+  VM이 쓰는 네트워크·데이터스토어의 매핑만 넣고, 비운 칸(`bandwidth_mib_s`·`at`·`max_final_delta_gib`·`default_pool`·`node`·
+  `devices`·`driver_iso`)은 보내지 않는다(서버 기본값). `cutover.at`은 브라우저 지역 시각 → 유닉스 초.
+- **나무**: "VM과 폴더"(데이터센터 › VM 폴더 — `vm` 폴더는 데이터센터와 같게) | "호스트와 클러스터"(데이터센터 › 클러스터 › 호스트,
+  클러스터 없는 호스트는 데이터센터 바로 아래) 두 보기, 마디마다 VM 수, 고른 마디 아래만 표에. ARIA `tree`가 아니라 `aria-pressed`
+  단추 목록이다(키보드는 Tab — 수백 VM이면 찾기 칸이 주 길). 찾기는 이름·경로·OS·호스트·Tools IP, 전원 거르기, 이미 끝나지 않은
+  계획에 든 VM(`migrating`)은 흐리게·고를 수 없음·까닭을 설명으로. 사용자 스냅샷 수는 우리 이름(`orbivisor-migration-`)을 뺀다.
+- **권한(단추)**: 계획 동작·다시 하기·취소는 루트 `vm.create`, 전환·되돌리기·마무리는 대상 폴더(덮어쓰기 `folder` > 규칙
+  `into`/`under`)의 `vm.create` + `vm.power`, 원본 바꾸기는 루트 `cluster.admin`, 내보내기·내려받기·지우기는 그 VM의 `vm.export`
+  (VM을 지웠으면 루트). 보기 "VMware 원본"은 루트 `cluster.read`, "VMware 이전"은 루트 `system.read`가 있어야 보인다.
+- **전환 대화상자**: 고른 항목마다 예상 내릴 시간(`estimate_s`)·마지막 델타, 여럿이면 합, 원본 처리(게스트 종료와 기다림·전원 끄기,
+  `protect_source`면 NIC 끊김, `start_after`)를 보이고 항목마다 차례로 요청한다(일부 실패는 알림, 모두 실패면 대화상자 오류).
+  되돌리기는 대상 VM 이름을 그대로 적어야 진행한다(공용 `ConfirmDialog` `typeToConfirm`).
+- **원본 대화상자**: 계획 30 `EsxiImportDialog`와 같은 흐름 — 지문 없이 보내 409 `untrusted_certificate`면 SHA-256 지문과 SHA-1
+  썸프린트(VDDK)를 보이고 "믿고 연결"로 다시 보낸다. 고치기는 바뀐 칸만 `PATCH`(비밀번호는 비우면 그대로). 비밀번호는 컴포넌트
+  상태와 요청 본문에만 — 시험이 `localStorage`·`sessionStorage`·질의 캐시에 없음을 본다.
+- **휴대폰 폭·대비**: jsdom은 배치를 재지 못해 390 px 가로 넘침은 브라우저 E2E(`builder.spec.ts`의 새 시험 — 네 보기를 밝은·어둠
+  테마로)에서 본다. 그 시험이 셸의 보기 전환(`AreaTabs` `ViewSwitch`, 보기 넷이면 약 440 px)이 문서를 가로로 넘기는 것을 잡아,
+  보기 전환 줄만 가로로 넘기게(`max-w-full overflow-x-auto`) 고쳤다(네트워크 탭의 보기 일곱도 같은 문제였다). 새 색 토큰은 없다(상태 칩·`Badge` 기존 토큰 — `tokens.test.ts`가 대비를 본다). axe는 화면 시험마다.
+- **스테이지 8이 할 것**: 스테이지 5 합친 뒤 `gen:api` → `api5.ts` 지우기, `web/e2e/vmware.spec.ts`(가짜 vSphere로 원본 더하기 →
+  마법사 → `Ready` → 전환 → VM 링크, 내보내기 → 내려받기), `docs/guide/web-ui.md`(가져오기 탭 보기 넷·VM 메뉴의 내보내기가 내보내기
+  보기로 감).

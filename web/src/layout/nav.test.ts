@@ -12,6 +12,7 @@ import {
   LEGACY_REDIRECTS,
   lastTab,
   rememberTab,
+  viewVisible,
   visibleAreas,
   visibleTabs,
 } from "@/layout/nav";
@@ -74,6 +75,10 @@ it.each([
   ["/vms/web/console", "vms", "/vms"],
   ["/isos", "vms", "/images"],
   ["/imports/esxi-1", "vms", "/imports"],
+  ["/vmware-migrations/wave1", "vms", "/imports"],
+  ["/vmware-migrations/-new", "vms", "/imports"],
+  ["/vmware-sources", "vms", "/imports"],
+  ["/vm-exports", "vms", "/imports"],
   ["/nodes/node-a", "infra", "/nodes"],
   ["/cluster", "infra", "/nodes"],
   ["/cluster/map", "infra", "/nodes"],
@@ -228,6 +233,41 @@ it("does not restore a remembered view the user can no longer read", () => {
     objects: [],
   });
   expect(lastTab(area("infra"), { user: U1, gate: folderOnly })).toBe("/networks");
+});
+
+it("puts VMware migrations, sources and exports in the Imports tab (plan 72)", () => {
+  const imports = area("vms").tabs.find((tab) => tab.to === "/imports")!;
+  expect(imports.views?.map((v) => v.to)).toEqual([
+    "/imports",
+    "/vmware-migrations",
+    "/vmware-sources",
+    "/vm-exports",
+  ]);
+  // 사이드바(영역)는 그대로, 탭도 그대로다.
+  expect(area("vms").tabs.map((tab) => tab.to)).toEqual([
+    "/vms",
+    "/templates",
+    "/images",
+    "/imports",
+  ]);
+  expect(areaOf("/vmware-migrations/wave1")?.view?.to).toBe("/vmware-migrations");
+  // 원본 보기는 원본을 읽을 수 있는(루트 cluster.read) 사용자에게만
+  const sources = imports.views!.find((v) => v.to === "/vmware-sources")!;
+  const folderOnly = new Permissions({
+    all: false,
+    root: [],
+    root_contents: [],
+    folders: {},
+    contents: { "00000000-0000-0000-0000-0000000000f1": ["system.read", "vm.create"] },
+    objects: [],
+  });
+  expect(viewVisible(sources, folderOnly)).toBe(false);
+  expect(viewVisible(sources, as("viewer").gate)).toBe(true);
+  // 팔레트가 VMware·OVA 낱말로도 찾는다
+  expect(t(imports.views![1]!.keywords!)).toContain("vcenter");
+  expect(t(imports.views![3]!.keywords!)).toContain("ova");
+  rememberTab(U1, "/vmware-migrations/wave1", "");
+  expect(lastTab(area("vms"), as("admin"))).toBe("/vmware-migrations");
 });
 
 it("puts the cluster map between the node table and the cluster view (plan 70)", () => {

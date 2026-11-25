@@ -9,6 +9,10 @@ import i18n from "@/i18n";
 import ko from "@/i18n/ko.json";
 import builderEn from "@/vmBuilder/i18n/en.json";
 import builderKo from "@/vmBuilder/i18n/ko.json";
+import exportsEn from "@/exports/i18n/en.json";
+import exportsKo from "@/exports/i18n/ko.json";
+import vmwareEn from "@/vmware/i18n/en.json";
+import vmwareKo from "@/vmware/i18n/ko.json";
 
 function keys(value: unknown, prefix = ""): string[] {
   if (typeof value !== "object" || value === null) {
@@ -30,6 +34,13 @@ it("has the same keys in every language", () => {
   expect(Object.keys(builderEn)).toEqual(["vmBuilder"]);
   expect(Object.keys(en)).not.toContain("dnd");
   expect(Object.keys(en)).not.toContain("vmBuilder");
+  // VMware 이전(`vmware/strings.ts`)과 VM 내보내기(`exports/strings.ts`) 문구도(계획 72)
+  expect(keys(vmwareKo).sort()).toEqual(keys(vmwareEn).sort());
+  expect(keys(exportsKo).sort()).toEqual(keys(exportsEn).sort());
+  expect(Object.keys(vmwareEn)).toEqual(["vmware"]);
+  expect(Object.keys(exportsEn)).toEqual(["vmExports"]);
+  expect(Object.keys(en)).not.toContain("vmware");
+  expect(Object.keys(en)).not.toContain("vmExports");
 });
 
 // `common.*`으로 옮긴 키. 같은 뜻의 개별 키를 다시 만들지 않는다.

@@ -178,7 +178,8 @@
     "invalid_backup_store": "{{message}}",
     "vm_restoring": "VM을 라이브 복원하는 중입니다. 복원을 기다리거나 취소하세요.",
     "vm_not_restoring": "VM을 라이브 복원하는 중이 아닙니다.",
-    "backup_exists": "그 저장소에 이미 이 백업의 사본이 있습니다."
+    "backup_exists": "그 저장소에 이미 이 백업의 사본이 있습니다.",
+    "vm_exporting": "VM을 내보내는 중입니다. 내보내기가 끝날 때까지 기다리세요."
   },
   "nav": {
     "noTabs": "이 영역에는 지금 역할로 볼 수 있는 화면이 없습니다.",
@@ -248,7 +249,13 @@
     "topology": "토폴로지",
     "backupStores": "백업 저장소",
     "clusterMap": "지도",
-    "clusterMapKeywords": "지도, 클러스터 보기, 3d, map"
+    "clusterMapKeywords": "지도, 클러스터 보기, 3d, map",
+    "vmwareMigrations": "VMware 이전",
+    "vmwareSources": "VMware 원본",
+    "vmExports": "내보내기",
+    "vmwareMigrationsKeywords": "vmware, vcenter, esxi, 이전, 마이그레이션, 따뜻한, 전환",
+    "vmwareSourcesKeywords": "vmware, vcenter, esxi, 연결",
+    "vmExportsKeywords": "내보내기, export, ova, ovf, vmdk"
   },
   "header": {
     "language": "언어",
@@ -386,7 +393,13 @@
       "backup-copy": "백업 {{target}}을(를) 저장소 {{store}}(으)로 복사",
       "backup-live-restore": "백업을 {{target}}(으)로 라이브 복원",
       "file-restore-session": "백업 {{target}}의 파일 찾아보기",
-      "file-restore-to-guest": "백업의 파일을 {{target}}에 되돌려 쓰기"
+      "file-restore-to-guest": "백업의 파일을 {{target}}에 되돌려 쓰기",
+      "vmware-sync": "VMware VM {{target}} 동기화",
+      "vmware-cutover": "VMware VM {{target}} 전환",
+      "vmware-revert": "VMware VM {{target}} 되돌리기",
+      "vmware-cleanup": "VMware VM {{target}} 정리",
+      "vm-export": "VM {{target}} 내보내기",
+      "vm-export-delete": "내보내기 {{target}} 삭제"
     },
     "progress": {
       "copyingDisks": "디스크 복사 {{percent}}% ({{done}}/{{total}} GiB)",
@@ -516,7 +529,8 @@
       "delete": "삭제",
       "edit": "편집",
       "clone": "복제",
-      "migrate": "마이그레이션"
+      "migrate": "마이그레이션",
+      "export": "OVA로 내보내기…"
     },
     "notFound": "{{name}} VM이 없습니다",
     "backToList": "가상 머신 목록으로",

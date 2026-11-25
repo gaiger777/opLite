@@ -258,3 +258,29 @@ test("builds a VM at phone width from the parts drawer", async ({ page }) => {
   await create(page).click();
   await created(page, "b3");
 });
+
+// 계획 72: 가져오기 탭의 새 보기(VMware 이전·원본·내보내기)와 새 계획 마법사가 휴대폰 폭에서 가로로 넘치지 않는다(어둠
+// 테마도). 원본이 없는 클러스터라 빈 보기다 — 원본·마법사의 흐름은 계획 72 스테이지 8의 `vmware.spec.ts`가 본다.
+test("opens the VMware and export views at phone width", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await signIn(page);
+  for (const [path, heading] of [
+    ["/vmware-migrations", "VMware migrations"],
+    ["/vmware-sources", "VMware sources"],
+    ["/vm-exports", "Exports"],
+    ["/vmware-migrations/-new", "New VMware migration"],
+  ] as const) {
+    for (const colorScheme of ["light", "dark"] as const) {
+      await page.emulateMedia({ colorScheme });
+      await page.goto(path);
+      await expect(page.getByRole("heading", { level: 1, name: heading })).toBeVisible();
+      expect(
+        await page.evaluate(
+          () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
+        ),
+        `${path} (${colorScheme}) scrolls sideways`,
+      ).toBe(true);
+    }
+  }
+  await page.emulateMedia({ colorScheme: null });
+});

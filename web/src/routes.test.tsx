@@ -178,6 +178,34 @@ it.each(OLD_NAV_PATHS)("still opens %s", async (path) => {
   expect(heading).not.toHaveTextContent("Page not found");
 });
 
+// VMware 이전·원본·내보내기(계획 72): 가져오기 탭의 보기가 늦게 받는 화면과 문구로 열린다.
+it.each([
+  ["/vmware-migrations", "VMware migrations"],
+  ["/vmware-migrations/-new", "New VMware migration"],
+  ["/vmware-sources", "VMware sources"],
+  ["/vm-exports", "Exports"],
+])("opens %s as a view of the Imports tab", async (path, title) => {
+  server.use(
+    ...["/vmware-migrations", "/vmware-sources", "/vm-exports"].map((p) =>
+      http.get(apiUrl(p), () => HttpResponse.json({ revision: 1, items: [] })),
+    ),
+  );
+  renderApp(path);
+  expect(
+    await screen.findByRole("heading", { level: 1, name: title }, { timeout: 3000 }),
+  ).toBeInTheDocument();
+  // 상세(새 계획)에는 보기 전환이 없다 — 목록 보기에만
+  if (path.endsWith("-new")) {
+    return;
+  }
+  const views = screen.getByRole("navigation", { name: "Imports views" });
+  expect(
+    within(views)
+      .getAllByRole("link")
+      .map((l) => l.textContent),
+  ).toEqual(["Imports", "VMware migrations", "VMware sources", "Exports"]);
+});
+
 it.each([
   ["/infra", "/nodes"],
   ["/protect", "/backups"],

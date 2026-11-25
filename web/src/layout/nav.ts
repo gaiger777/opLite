@@ -62,7 +62,27 @@ export const AREAS: NavArea[] = [
           { to: "/isos", key: "nav.isos" },
         ],
       },
-      { to: "/imports", key: "nav.imports" },
+      {
+        to: "/imports",
+        key: "nav.imports",
+        // VMware 이전·원본 연결과 VM 내보내기(계획 72)도 사이드바 항목이 아니라 가져오기 탭의 보기다.
+        views: [
+          { to: "/imports", key: "nav.imports" },
+          {
+            to: "/vmware-migrations",
+            key: "nav.vmwareMigrations",
+            kind: "vmware-migration",
+            keywords: "nav.vmwareMigrationsKeywords",
+          },
+          {
+            to: "/vmware-sources",
+            key: "nav.vmwareSources",
+            kind: "vmware-source",
+            keywords: "nav.vmwareSourcesKeywords",
+          },
+          { to: "/vm-exports", key: "nav.vmExports", keywords: "nav.vmExportsKeywords" },
+        ],
+      },
     ],
   },
   {

@@ -41,6 +41,7 @@ import { formatBytes, formatMib, formatTime, uuidTime } from "@/lib/format";
 import { describeProgress, trackTask } from "@/tasks/tasks";
 import { newestFirst, TASK_PAGE_SIZE, TaskTable } from "@/tasks/TasksPage";
 import { diskVolumes, isTemplate, linkedClones } from "@/templates/templates";
+import { exportReason } from "@/exports/exports";
 import { availability, useVmActions, type VmAction, type VmOperation } from "@/vms/actions";
 import { bootList, deviceName } from "@/vms/boot";
 import { cloudInitSummary } from "@/vms/cloudInit";
@@ -269,7 +270,8 @@ function VmHeader({ vm }: { vm: Vm }) {
     [net.ipv4, net.ipv6].flatMap((c) => (c?.mode === "static" ? [c.address] : [])),
   );
   // 주 동작(시작·정지·콘솔·옮기기)은 단추, 나머지는 케밥이다(설계 §5.3).
-  const menu = (operate || write || can("vm.clone") || can("vm.delete")) && (
+  const exportable = can("vm.export");
+  const menu = (operate || write || exportable || can("vm.clone") || can("vm.delete")) && (
     <>
       {operate &&
         SECONDARY.map((action) => (
@@ -301,6 +303,16 @@ function VmHeader({ vm }: { vm: Vm }) {
           onSelect={() => setConfirm(template ? "untemplate" : "template")}
         >
           {template ? t("templates.revert") : t("templates.convert")}
+        </ReasonMenuItem>
+      )}
+      {/* OVA로 내보내기(계획 72): 꺼진 VM(템플릿도), 그 VM의 vm.export. 대화상자는 내보내기 보기가 연다(진행과
+          내려받기가 거기 있다 — 이 메뉴가 내보내기 조각을 읽지 않아 첫 화면 묶음이 커지지 않는다). */}
+      {exportable && (
+        <ReasonMenuItem
+          reason={exportReason(vm)}
+          onSelect={() => void navigate(`/vm-exports?export=${encodeURIComponent(vm.name)}`)}
+        >
+          {t("vms.action.export")}
         </ReasonMenuItem>
       )}
       {can("vm.delete") && (

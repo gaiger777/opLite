@@ -30,6 +30,17 @@ function page<M, K extends keyof M>(load: () => Promise<M>, name: K) {
   return async () => ({ Component: (await load())[name] as React.ComponentType });
 }
 
+/**
+ * VMware 이전(계획 72)의 보기 하나. 네 보기는 한 조각(`vmware/pages`)이고 문구(첫 화면 묶음 밖)를 더한 뒤 그린다.
+ */
+function vmwarePage(name: "MigrationsPage" | "MigrationWizard" | "MigrationPage" | "SourcesPage") {
+  return async () => {
+    const m = await import("@/vmware/pages");
+    await m.loadVmwareStrings();
+    return { Component: m[name] };
+  };
+}
+
 /** 앱의 경로 표. 넘기기 시험(`routes.test.tsx`)이 같은 표로 메모리 라우터를 만든다. */
 export const appRoutes: RouteObject[] = [
   { path: "/login", element: <LoginPage /> },
@@ -102,6 +113,31 @@ export const appRoutes: RouteObject[] = [
               {
                 path: "imports/:name",
                 lazy: page(() => import("@/imports/ImportPage"), "ImportPage"),
+              },
+              // VMware 이전·원본·VM 내보내기(계획 72): 문구는 첫 화면 묶음 밖이라 화면과 함께 받는다.
+              {
+                path: "vmware-migrations",
+                lazy: vmwarePage("MigrationsPage"),
+              },
+              {
+                path: "vmware-migrations/-new",
+                lazy: vmwarePage("MigrationWizard"),
+              },
+              {
+                path: "vmware-migrations/:name",
+                lazy: vmwarePage("MigrationPage"),
+              },
+              {
+                path: "vmware-sources",
+                lazy: vmwarePage("SourcesPage"),
+              },
+              {
+                path: "vm-exports",
+                lazy: async () => {
+                  const m = await import("@/exports/pages");
+                  await m.loadExportStrings();
+                  return { Component: m.ExportsPage };
+                },
               },
               { path: "volumes", lazy: page(() => import("@/storage/VolumesPage"), "VolumesPage") },
               { path: "isos", lazy: page(() => import("@/isos/IsosPage"), "IsosPage") },

@@ -28,7 +28,13 @@ export type Kind =
   | "load-balancer"
   | "network-migration"
   // 백업 저장소(계획 68, 루트 — 읽기 `system.read`, 쓰기 `storage.config`). watch로는 사건만 받아 목록을 다시 읽는다.
-  | "backup-store";
+  | "backup-store"
+  // VMware 이전(계획 72): 원본 연결(루트 — 읽기 `cluster.read`, 쓰기 `cluster.admin`), 이전 계획·VM 항목(루트 — 읽기
+  // `system.read`). watch로는 사건만 받아 보기를 다시 읽는다. VM 내보내기는 내보낸 VM을 따라 객체마다 거른다.
+  | "vmware-source"
+  | "vmware-migration"
+  | "vmware-vm"
+  | "vm-export";
 
 /** 권한(계획 62 설계 §6.2). 이름은 서버의 `Privilege`와 같다. */
 export const PRIVILEGES = [
@@ -61,6 +67,8 @@ export const PRIVILEGES = [
   "cluster.admin",
   // 백업 안 파일 찾아보기·내려받기·되돌려 쓰기(계획 69). 서버 차례대로 마지막이고, 내장 operator에는 없다.
   "backup.file_restore",
+  // VM을 OVA/OVF로 내보내기·내려받기(계획 72). 디스크 전체가 클러스터 밖으로 나가므로 내장 operator에는 없다.
+  "vm.export",
 ] as const;
 export type Privilege = (typeof PRIVILEGES)[number];
 
@@ -90,6 +98,7 @@ const FOLDER_KINDS: ReadonlySet<Kind> = new Set([
   "storage-pool",
   "task",
   "folder",
+  "vm-export",
 ]);
 
 /** 이 종류의 목록·watch를 객체마다 거르는지(루트 권한 없이도 볼 것이 있을 수 있다) */
@@ -106,7 +115,10 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
     case "read":
       return kind === "alert-rule"
         ? "alert.read"
-        : FOLDER_KINDS.has(kind) || kind === "backup-store"
+        : FOLDER_KINDS.has(kind) ||
+            kind === "backup-store" ||
+            kind === "vmware-migration" ||
+            kind === "vmware-vm"
           ? "system.read"
           : "cluster.read";
     case "write":
@@ -135,6 +147,8 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
           return "alert.manage";
         case "folder":
           return "inventory.folder";
+        case "vm-export":
+          return "vm.export";
         default:
           return "cluster.admin";
       }
@@ -152,6 +166,8 @@ export function kindPrivilege(action: Action, kind: Kind): Privilege {
           return "backup.job";
         case "backup-store":
           return "storage.config";
+        case "vm-export":
+          return "vm.export";
         default:
           return "cluster.admin";
       }

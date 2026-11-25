@@ -1,0 +1,54 @@
+{
+  "vmExports": {
+    "pageHint": "OVF packages written to a pool. Download one as a single OVA for vSphere, Workstation or VirtualBox. Start an export from a stopped VM's menu.",
+    "empty": "No exports",
+    "emptyHint": "Choose \"Export as OVA…\" in a stopped VM's menu.",
+    "vm": "VM",
+    "vmGone": "Deleted",
+    "pool": "Pool",
+    "size": "OVA size",
+    "created": "Created",
+    "phase": {
+      "pending": "Waiting",
+      "writing": "Writing",
+      "ready": "Ready",
+      "failed": "Failed"
+    },
+    "warnings_one": "{{count}} warning",
+    "warnings_other": "{{count}} warnings",
+    "downloadNamed": "Download {{name}}",
+    "downloadStarted": "Downloading {{name}}.ova.",
+    "deleteTitle": "Delete {{name}}?",
+    "deleteDescription": "The OVF files are removed from the pool. The VM stays.",
+    "dialog": {
+      "title": "Export {{name}} as OVA",
+      "description": "The disks are written as stream-optimized VMDK with an OVF descriptor and SHA-256 manifest. The VM must stay off until the export is done.",
+      "submit": "Export",
+      "pool": "Pool",
+      "poolHint": "A directory or NFS pool with room for the disks.",
+      "noPool": "No directory or NFS pool",
+      "name": "Name",
+      "nameHint": "Empty uses the VM name and the time.",
+      "guestOs": "VMware guest OS",
+      "guestOsHint": "VMware guestId. Empty uses the original value of an imported VM, else otherGuest64.",
+      "hwVersion": "Hardware version",
+      "hwVersionHint": "vmx-7 to vmx-21. 14 runs on ESXi 6.7 and later.",
+      "keepMacs": "Keep MAC addresses",
+      "keepMacsHint": "Without it the importing product picks new MACs.",
+      "started": "Exporting {{name}}.",
+      "errors": {
+        "pool": "Choose a pool.",
+        "hwVersion": "Enter a number from 7 to 21."
+      }
+    },
+    "errors": {
+      "vm_running": "Stop the VM before exporting it.",
+      "pool_not_file": "Choose a directory or NFS pool.",
+      "insufficient_storage": "The pool does not have room for the disks: {{message}}",
+      "vm_exporting": "The VM is being exported.",
+      "export_busy": "Another task is working on this export.",
+      "export_not_ready": "The export is not finished yet.",
+      "link_expired": "The download link expired. Try again."
+    }
+  }
+}

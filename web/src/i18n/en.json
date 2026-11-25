@@ -178,7 +178,8 @@
     "invalid_backup_store": "{{message}}",
     "vm_restoring": "The VM is being live-restored. Wait for the restore or cancel it.",
     "vm_not_restoring": "The VM is not being live-restored.",
-    "backup_exists": "That store already has a copy of this backup."
+    "backup_exists": "That store already has a copy of this backup.",
+    "vm_exporting": "The VM is being exported. Wait until the export is done."
   },
   "nav": {
     "noTabs": "Nothing in this area is available to your role.",
@@ -248,7 +249,13 @@
     "topology": "Topology",
     "backupStores": "Backup stores",
     "clusterMap": "Map",
-    "clusterMapKeywords": "map, topology, 3d, cluster view"
+    "clusterMapKeywords": "map, topology, 3d, cluster view",
+    "vmwareMigrations": "VMware migrations",
+    "vmwareSources": "VMware sources",
+    "vmExports": "Exports",
+    "vmwareMigrationsKeywords": "vmware, vcenter, esxi, migrate, warm, cutover, wave",
+    "vmwareSourcesKeywords": "vmware, vcenter, esxi, connection",
+    "vmExportsKeywords": "export, ova, ovf, vmdk"
   },
   "header": {
     "language": "Language",
@@ -386,7 +393,13 @@
       "backup-copy": "Copy backup {{target}} to store {{store}}",
       "backup-live-restore": "Live restore a backup as {{target}}",
       "file-restore-session": "Browse files of backup {{target}}",
-      "file-restore-to-guest": "Restore files from a backup into {{target}}"
+      "file-restore-to-guest": "Restore files from a backup into {{target}}",
+      "vmware-sync": "Sync VMware VM {{target}}",
+      "vmware-cutover": "Cut over VMware VM {{target}}",
+      "vmware-revert": "Revert VMware VM {{target}}",
+      "vmware-cleanup": "Clean up VMware VM {{target}}",
+      "vm-export": "Export VM {{target}}",
+      "vm-export-delete": "Delete export {{target}}"
     },
     "progress": {
       "copyingDisks": "Copying disks {{percent}}% ({{done}}/{{total}} GiB)",
@@ -516,7 +529,8 @@
       "delete": "Delete",
       "edit": "Edit",
       "clone": "Clone",
-      "migrate": "Migrate"
+      "migrate": "Migrate",
+      "export": "Export as OVA…"
     },
     "notFound": "There is no VM {{name}}",
     "backToList": "Back to virtual machines",

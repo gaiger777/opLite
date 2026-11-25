@@ -57,7 +57,11 @@ export function ViewSwitch() {
     return null;
   }
   return (
-    <nav aria-label={t("nav.viewMenu", { tab: t(hit.tab.key) })}>
+    // 보기가 많으면(가져오기 탭 넷, 네트워크 탭 일곱) 휴대폰 폭에서 문서가 아니라 이 줄만 가로로 넘긴다(계획 72).
+    <nav
+      aria-label={t("nav.viewMenu", { tab: t(hit.tab.key) })}
+      className="max-w-full overflow-x-auto"
+    >
       <ul className="inline-flex rounded-md bg-muted p-0.5">
         {views.map((view) => (
           <li key={view.to}>

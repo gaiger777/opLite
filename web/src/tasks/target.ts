@@ -81,6 +81,13 @@ export function taskTarget(task: Task, lookup: TargetLookup): TaskTarget {
   if (op.kind.startsWith("backup-store-")) {
     return { name, href: `/backup-stores?open=${enc(task.spec.target)}` };
   }
+  // VMware 이전 Task(계획 72)의 대상은 이전 항목, 내보내기 지우기는 내보내기다.
+  if (op.kind.startsWith("vmware-")) {
+    return { name, href: "/vmware-migrations" };
+  }
+  if (op.kind === "vm-export-delete") {
+    return { name, href: "/vm-exports" };
+  }
   return op.kind.startsWith("ceph-")
     ? { name, href: "/ceph" }
     : op.kind.startsWith("sdn-")
